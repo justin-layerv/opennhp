@@ -8,8 +8,7 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as cr from 'aws-cdk-lib/custom-resources';
-import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
-import * as cw_actions from 'aws-cdk-lib/aws-cloudwatch-actions';
+import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
 import { Construct } from 'constructs';
 import { DataStack } from './data-stack';
 
@@ -32,21 +31,23 @@ export interface ComputeStackProps extends cdk.StackProps {
  * Deploys the NHP Server compute infrastructure:
  * - Auto Scaling Group with NHP Server instances
  * - Network Load Balancer for UDP traffic
- * - CloudWatch-based health monitoring (no HTTP endpoints)
+ * - Cloud Map service discovery with Route 53
  * - Proper Curve25519 key generation
  *
  * Health Monitoring Strategy (NHP-compliant):
  * - NO exposed HTTP health check ports
- * - CloudWatch agent monitors NHP server process
- * - Custom metrics published from within the instance
+ * - Cloud Map with custom health checks (instance self-reports)
+ * - Instances register/deregister via API on boot/shutdown
  * - ASG uses EC2 status checks, not ELB health checks
- * - CloudWatch alarms trigger instance replacement
+ * - Route 53 DNS automatically updated via Cloud Map
  */
 export class ComputeStack extends cdk.Stack {
   public readonly nlb: elbv2.NetworkLoadBalancer;
   public readonly asg: autoscaling.AutoScalingGroup;
   public readonly serverLogGroup: logs.ILogGroup;
   public readonly serverSecret: secretsmanager.ISecret;
+  public readonly cloudMapNamespace: servicediscovery.PrivateDnsNamespace;
+  public readonly cloudMapService: servicediscovery.Service;
 
   constructor(scope: Construct, id: string, props: ComputeStackProps) {
     super(scope, id, props);
@@ -187,6 +188,28 @@ exports.handler = async (event) => {
         : cdk.RemovalPolicy.DESTROY,
     });
 
+    // Cloud Map namespace for service discovery (NHP-compliant - no inbound health checks)
+    this.cloudMapNamespace = new servicediscovery.PrivateDnsNamespace(this, 'CloudMapNamespace', {
+      name: `nhp.${config.environment}.layerv.internal`,
+      vpc,
+      description: 'Private DNS namespace for NHP service discovery',
+    });
+
+    // Cloud Map service with custom health checks (instance self-reports)
+    this.cloudMapService = new servicediscovery.Service(this, 'CloudMapService', {
+      namespace: this.cloudMapNamespace,
+      name: 'server',
+      description: 'NHP Server instances',
+      // Custom health check - instances report their own health via API
+      // No inbound connections required - fully NHP compliant
+      customHealthCheck: {
+        failureThreshold: 1,
+      },
+      // Enable DNS routing
+      dnsRecordType: servicediscovery.DnsRecordType.A,
+      dnsTtl: cdk.Duration.seconds(30),
+    });
+
     // IAM Role for NHP Server instances
     const serverRole = new iam.Role(this, 'ServerRole', {
       roleName: `layerv-nhp-server-${config.environment}`,
@@ -208,15 +231,25 @@ exports.handler = async (event) => {
     // Allow server to pull from ECR
     serverRepo.grantPull(serverRole);
 
-    // Allow server to publish custom metrics
+    // Allow server to register/deregister with Cloud Map
     serverRole.addToPolicy(new iam.PolicyStatement({
-      actions: ['cloudwatch:PutMetricData'],
+      actions: [
+        'servicediscovery:RegisterInstance',
+        'servicediscovery:DeregisterInstance',
+        'servicediscovery:UpdateInstanceCustomHealthStatus',
+        'servicediscovery:GetInstance',
+      ],
+      resources: [this.cloudMapService.serviceArn],
+    }));
+
+    // Allow server to discover the service
+    serverRole.addToPolicy(new iam.PolicyStatement({
+      actions: [
+        'servicediscovery:DiscoverInstances',
+        'servicediscovery:GetNamespace',
+        'servicediscovery:GetService',
+      ],
       resources: ['*'],
-      conditions: {
-        StringEquals: {
-          'cloudwatch:namespace': 'LayerV/NHP',
-        },
-      },
     }));
 
     // Security Group for servers - ONLY UDP 62206, no HTTP health check port
@@ -259,10 +292,6 @@ REMOTEEOF
       'export DEBIAN_FRONTEND=noninteractive',
       'apt-get update -y',
       'apt-get install -y awscli jq docker.io curl',
-      '',
-      '# Install CloudWatch agent for process monitoring',
-      'wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb',
-      'dpkg -i amazon-cloudwatch-agent.deb || apt-get install -f -y',
       '',
       '# Enable and start Docker',
       'systemctl enable docker',
@@ -308,82 +337,80 @@ REMOTEEOF
       '',
       etcdConfigSection,
       '',
-      '# Configure CloudWatch agent for process monitoring (NHP-compliant - no HTTP)',
-      'cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << \'CWEOF\'',
-      '{',
-      '  "agent": {',
-      '    "metrics_collection_interval": 60,',
-      '    "run_as_user": "root"',
-      '  },',
-      '  "metrics": {',
-      '    "namespace": "LayerV/NHP",',
-      '    "append_dimensions": {',
-      `      "Environment": "${config.environment}",`,
-      '      "InstanceId": "${aws:InstanceId}"',
-      '    },',
-      '    "metrics_collected": {',
-      '      "procstat": [',
-      '        {',
-      '          "pattern": "nhp-server",',
-      '          "measurement": [',
-      '            "pid_count",',
-      '            "cpu_usage",',
-      '            "memory_rss"',
-      '          ]',
-      '        }',
-      '      ],',
-      '      "mem": {',
-      '        "measurement": ["mem_used_percent"]',
-      '      },',
-      '      "cpu": {',
-      '        "measurement": ["cpu_usage_active"]',
-      '      }',
-      '    }',
-      '  },',
-      '  "logs": {',
-      '    "logs_collected": {',
-      '      "files": {',
-      '        "collect_list": [',
-      '          {',
-      `            "file_path": "/opt/layerv/nhp-server/log/*.log",`,
-      `            "log_group_name": "${this.serverLogGroup.logGroupName}",`,
-      '            "log_stream_name": "{instance_id}/nhp-server"',
-      '          }',
-      '        ]',
-      '      }',
-      '    }',
-      '  }',
-      '}',
-      'CWEOF',
+      '# Cloud Map service discovery configuration',
+      `CLOUDMAP_SERVICE_ID="${this.cloudMapService.serviceId}"`,
+      `CLOUDMAP_NAMESPACE="${this.cloudMapNamespace.namespaceName}"`,
       '',
-      '# Start CloudWatch agent',
-      '/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json',
+      '# Create Cloud Map registration script (NHP-compliant - no inbound connections)',
+      'cat > /opt/layerv/nhp-server/cloudmap-register.sh << \'CMEOF\'',
+      '#!/bin/bash',
+      '# Register this instance with Cloud Map',
+      'set -e',
       '',
-      '# Create health monitoring script (reports to CloudWatch, no HTTP)',
+      'TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")',
+      'INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)',
+      'LOCAL_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)',
+      'REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)',
+      'AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)',
+      '',
+      'echo "Registering instance $INSTANCE_ID ($LOCAL_IP) with Cloud Map"',
+      '',
+      'aws servicediscovery register-instance \\',
+      '  --service-id "$CLOUDMAP_SERVICE_ID" \\',
+      '  --instance-id "$INSTANCE_ID" \\',
+      '  --attributes "AWS_INSTANCE_IPV4=$LOCAL_IP,AVAILABILITY_ZONE=$AZ,NHP_PORT=62206" \\',
+      '  --region "$REGION"',
+      '',
+      'echo "Instance registered successfully"',
+      'CMEOF',
+      'chmod +x /opt/layerv/nhp-server/cloudmap-register.sh',
+      '',
+      '# Create Cloud Map deregistration script',
+      'cat > /opt/layerv/nhp-server/cloudmap-deregister.sh << \'CMEOF\'',
+      '#!/bin/bash',
+      '# Deregister this instance from Cloud Map',
+      'set -e',
+      '',
+      'TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")',
+      'INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)',
+      'REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)',
+      '',
+      'echo "Deregistering instance $INSTANCE_ID from Cloud Map"',
+      '',
+      'aws servicediscovery deregister-instance \\',
+      '  --service-id "$CLOUDMAP_SERVICE_ID" \\',
+      '  --instance-id "$INSTANCE_ID" \\',
+      '  --region "$REGION" || true',
+      '',
+      'echo "Instance deregistered"',
+      'CMEOF',
+      'chmod +x /opt/layerv/nhp-server/cloudmap-deregister.sh',
+      '',
+      '# Create health monitoring script (reports to Cloud Map, no inbound HTTP)',
       'cat > /opt/layerv/nhp-server/health-monitor.sh << \'HEALTHEOF\'',
       '#!/bin/bash',
-      '# NHP-compliant health monitoring - publishes to CloudWatch only',
+      '# NHP-compliant health monitoring - updates Cloud Map custom health status',
       '',
-      'REGION=$(curl -s -H "X-aws-ec2-metadata-token: $(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600)" http://169.254.169.254/latest/meta-data/placement/region)',
-      'INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600)" http://169.254.169.254/latest/meta-data/instance-id)',
+      'TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")',
+      'INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)',
+      'REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)',
       '',
       'while true; do',
       '  # Check if NHP server container is running',
       '  if docker ps | grep -q nhp-server; then',
-      '    HEALTH=1',
+      '    HEALTH_STATUS="HEALTHY"',
       '  else',
-      '    HEALTH=0',
+      '    HEALTH_STATUS="UNHEALTHY"',
       '  fi',
       '',
-      '  # Publish health metric to CloudWatch',
-      '  aws cloudwatch put-metric-data \\',
-      '    --namespace "LayerV/NHP" \\',
-      '    --metric-name "ServerHealth" \\',
-      '    --value $HEALTH \\',
-      `    --dimensions "Environment=${config.environment},InstanceId=$INSTANCE_ID" \\`,
-      '    --region "$REGION"',
+      '  # Update Cloud Map custom health status',
+      '  aws servicediscovery update-instance-custom-health-status \\',
+      '    --service-id "$CLOUDMAP_SERVICE_ID" \\',
+      '    --instance-id "$INSTANCE_ID" \\',
+      '    --status "$HEALTH_STATUS" \\',
+      '    --region "$REGION" 2>/dev/null || true',
       '',
-      '  sleep 60',
+      '  sleep 30',
       'done',
       'HEALTHEOF',
       'chmod +x /opt/layerv/nhp-server/health-monitor.sh',
@@ -391,14 +418,33 @@ REMOTEEOF
       '# Create systemd service for health monitor',
       'cat > /etc/systemd/system/nhp-health-monitor.service << \'SVCEOF\'',
       '[Unit]',
-      'Description=NHP Health Monitor (CloudWatch)',
-      'After=network.target docker.service',
+      'Description=NHP Health Monitor (Cloud Map)',
+      'After=network.target docker.service nhp-cloudmap-register.service',
       '',
       '[Service]',
       'Type=simple',
+      `Environment="CLOUDMAP_SERVICE_ID=${this.cloudMapService.serviceId}"`,
       'ExecStart=/opt/layerv/nhp-server/health-monitor.sh',
       'Restart=always',
       'RestartSec=10',
+      '',
+      '[Install]',
+      'WantedBy=multi-user.target',
+      'SVCEOF',
+      '',
+      '# Create systemd service for Cloud Map registration',
+      'cat > /etc/systemd/system/nhp-cloudmap-register.service << \'SVCEOF\'',
+      '[Unit]',
+      'Description=Register NHP Server with Cloud Map',
+      'After=network-online.target',
+      'Wants=network-online.target',
+      '',
+      '[Service]',
+      'Type=oneshot',
+      `Environment="CLOUDMAP_SERVICE_ID=${this.cloudMapService.serviceId}"`,
+      'ExecStart=/opt/layerv/nhp-server/cloudmap-register.sh',
+      'RemainAfterExit=yes',
+      `ExecStop=/opt/layerv/nhp-server/cloudmap-deregister.sh`,
       '',
       '[Install]',
       'WantedBy=multi-user.target',
@@ -437,14 +483,16 @@ REMOTEEOF
       '',
       '# Start services',
       'systemctl daemon-reload',
-      'systemctl enable nhp-health-monitor nhp-server',
+      'systemctl enable nhp-cloudmap-register nhp-health-monitor nhp-server',
+      '',
+      '# Register with Cloud Map first',
+      'systemctl start nhp-cloudmap-register',
+      '',
+      '# Start health monitor',
       'systemctl start nhp-health-monitor',
       '',
       '# Try to start NHP server (may fail if image not available yet)',
       'systemctl start nhp-server || echo "NHP server start deferred - image may not be available"',
-      '',
-      '# Send boot metric',
-      `aws cloudwatch put-metric-data --namespace "LayerV/NHP" --metric-name "InstanceBoot" --value 1 --dimensions "Environment=${config.environment},InstanceId=$INSTANCE_ID" --region "$REGION"`,
       '',
       'echo "NHP Server installation complete at $(date)"',
     );
@@ -513,7 +561,7 @@ REMOTEEOF
 
     // UDP Target Group - health checks disabled via high thresholds
     // NLB requires health checks, but we make them very permissive
-    // Real health monitoring is done via CloudWatch
+    // Real health monitoring is done via Cloud Map service discovery
     const udpTargetGroup = new elbv2.NetworkTargetGroup(this, 'UdpTargetGroup', {
       targetGroupName: `nhp-udp-${config.environment}`,
       vpc,
@@ -544,23 +592,6 @@ REMOTEEOF
       defaultTargetGroups: [udpTargetGroup],
     });
 
-    // CloudWatch alarm for unhealthy instances - replaces HTTP health checks
-    const unhealthyAlarm = new cloudwatch.Alarm(this, 'UnhealthyInstanceAlarm', {
-      alarmName: `layerv-nhp-unhealthy-${config.environment}`,
-      alarmDescription: 'NHP Server instance health check failed (CloudWatch-based)',
-      metric: new cloudwatch.Metric({
-        namespace: 'LayerV/NHP',
-        metricName: 'ServerHealth',
-        dimensionsMap: { Environment: config.environment },
-        statistic: 'Minimum',
-        period: cdk.Duration.minutes(5),
-      }),
-      threshold: 1,
-      evaluationPeriods: 3,
-      comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
-      treatMissingData: cloudwatch.TreatMissingData.BREACHING,
-    });
-
     // Outputs
     new cdk.CfnOutput(this, 'NlbDnsName', {
       value: this.nlb.loadBalancerDnsName,
@@ -580,8 +611,26 @@ REMOTEEOF
       exportName: `${this.stackName}-ServerSecretArn`,
     });
 
+    new cdk.CfnOutput(this, 'CloudMapNamespaceArn', {
+      value: this.cloudMapNamespace.namespaceArn,
+      description: 'Cloud Map namespace ARN',
+      exportName: `${this.stackName}-CloudMapNamespaceArn`,
+    });
+
+    new cdk.CfnOutput(this, 'CloudMapServiceArn', {
+      value: this.cloudMapService.serviceArn,
+      description: 'Cloud Map service ARN',
+      exportName: `${this.stackName}-CloudMapServiceArn`,
+    });
+
+    new cdk.CfnOutput(this, 'CloudMapDnsName', {
+      value: `server.${this.cloudMapNamespace.namespaceName}`,
+      description: 'Cloud Map DNS name for service discovery',
+      exportName: `${this.stackName}-CloudMapDnsName`,
+    });
+
     new cdk.CfnOutput(this, 'HealthMonitoringNote', {
-      value: 'Health monitoring via CloudWatch metrics (LayerV/NHP namespace) - no HTTP endpoints exposed',
+      value: 'Health monitoring via Cloud Map service discovery with Route 53 - no HTTP endpoints exposed',
       description: 'NHP-compliant health monitoring approach',
     });
   }

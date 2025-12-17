@@ -180,7 +180,6 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
-        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
       Policies:
         - PolicyName: ACSecretsAccess
           PolicyDocument:
@@ -191,17 +190,6 @@ Resources:
                   - secretsmanager:GetSecretValue
                   - secretsmanager:PutSecretValue
                 Resource: !Ref ACSecret
-        - PolicyName: ACCustomMetrics
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - cloudwatch:PutMetricData
-                Resource: '*'
-                Condition:
-                  StringEquals:
-                    cloudwatch:namespace: LayerV/NHP
         - PolicyName: ECRPull
           PolicyDocument:
             Version: '2012-10-17'
@@ -295,10 +283,6 @@ Resources:
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -y
           apt-get install -y awscli jq docker.io iptables ipset curl python3-pip
-
-          # Install CloudWatch agent for NHP-compliant health monitoring (no HTTP)
-          wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
-          dpkg -i amazon-cloudwatch-agent.deb || apt-get install -f -y
 
           # Enable and start Docker
           systemctl enable docker
@@ -425,78 +409,6 @@ Resources:
           # Run iptables setup
           /opt/layerv/nhp-ac/iptables_setup.sh
 
-          # Configure CloudWatch agent for NHP-compliant health monitoring (no HTTP endpoints)
-          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWEOF'
-          {
-            "agent": {
-              "metrics_collection_interval": 60,
-              "run_as_user": "root"
-            },
-            "metrics": {
-              "namespace": "LayerV/NHP",
-              "append_dimensions": {
-                "InstanceId": "${!aws:InstanceId}"
-              },
-              "metrics_collected": {
-                "procstat": [
-                  {
-                    "pattern": "nhp-ac",
-                    "measurement": ["pid_count", "cpu_usage", "memory_rss"]
-                  }
-                ],
-                "mem": {
-                  "measurement": ["mem_used_percent"]
-                }
-              }
-            }
-          }
-          CWEOF
-
-          # Start CloudWatch agent
-          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
-
-          # Create health monitoring script (CloudWatch only, no HTTP)
-          cat > /opt/layerv/nhp-ac/health-monitor.sh << 'HEALTHEOF'
-          #!/bin/bash
-          # NHP-compliant health monitoring - publishes to CloudWatch only, no exposed ports
-          REGION=$(curl -s -H "X-aws-ec2-metadata-token: $(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600)" http://169.254.169.254/latest/meta-data/placement/region)
-          INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600)" http://169.254.169.254/latest/meta-data/instance-id)
-
-          while true; do
-            if docker ps | grep -q nhp-ac; then
-              HEALTH=1
-            else
-              HEALTH=0
-            fi
-
-            aws cloudwatch put-metric-data \
-              --namespace "LayerV/NHP" \
-              --metric-name "ACHealth" \
-              --value $HEALTH \
-              --dimensions "InstanceId=$INSTANCE_ID" \
-              --region "$REGION"
-
-            sleep 60
-          done
-          HEALTHEOF
-          chmod +x /opt/layerv/nhp-ac/health-monitor.sh
-
-          # Create systemd service for health monitor (CloudWatch-based)
-          cat > /etc/systemd/system/nhp-health-monitor.service << 'SVCEOF'
-          [Unit]
-          Description=NHP Health Monitor (CloudWatch)
-          After=network.target docker.service
-
-          [Service]
-          Type=simple
-          ExecStart=/opt/layerv/nhp-ac/health-monitor.sh
-          Restart=always
-          RestartSec=10
-
-          [Install]
-          WantedBy=multi-user.target
-          SVCEOF
-
           # Create systemd service for NHP-AC container
           cat > /etc/systemd/system/nhp-ac.service << 'SVCEOF'
           [Unit]
@@ -527,19 +439,8 @@ Resources:
 
           # Start services
           systemctl daemon-reload
-          systemctl enable nhp-health-monitor nhp-ac
-          systemctl start nhp-health-monitor
-
-          # Try to start NHP-AC (may fail if image not available)
+          systemctl enable nhp-ac
           systemctl start nhp-ac || echo "NHP-AC start deferred - image may not be available"
-
-          # Send custom metric for successful boot
-          aws cloudwatch put-metric-data \
-            --namespace "LayerV/NHP" \
-            --metric-name "ACInstanceBoot" \
-            --value 1 \
-            --dimensions "OrganizationId=$ORG_ID,InstanceId=$INSTANCE_ID" \
-            --region "$REGION"
 
           # Signal CloudFormation
           /opt/aws/bin/cfn-signal -e $? \
@@ -619,4 +520,4 @@ Outputs:
       2. Check /var/log/user-data.log for setup details
       3. The AC's private key is stored in Secrets Manager
       4. Deploy the NHP-AC container image to complete setup
-      5. Monitor health via CloudWatch alarm
+      5. Monitor health via EC2 status checks (no CloudWatch required)
