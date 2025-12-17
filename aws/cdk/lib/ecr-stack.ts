@@ -7,6 +7,8 @@ export interface EcrStackProps extends cdk.StackProps {
   config: {
     environment: string;
   };
+  githubOrg?: string;
+  githubRepo?: string;
 }
 
 /**
@@ -22,11 +24,12 @@ export interface EcrStackProps extends cdk.StackProps {
 export class EcrStack extends cdk.Stack {
   public readonly serverRepo: ecr.IRepository;
   public readonly acRepo: ecr.IRepository;
+  public readonly githubActionsRole: iam.IRole;
 
   constructor(scope: Construct, id: string, props: EcrStackProps) {
     super(scope, id, props);
 
-    const { config } = props;
+    const { config, githubOrg = 'layervai', githubRepo = 'nhp' } = props;
 
     // NHP Server repository (internal use only)
     this.serverRepo = new ecr.Repository(this, 'ServerRepo', {
@@ -78,6 +81,72 @@ export class EcrStack extends cdk.Stack {
       },
     }));
 
+    // GitHub Actions OIDC provider (already exists in account)
+    const githubOidcProvider = iam.OpenIdConnectProvider.fromOpenIdConnectProviderArn(
+      this,
+      'GitHubOidcProvider',
+      `arn:aws:iam::${this.account}:oidc-provider/token.actions.githubusercontent.com`
+    );
+
+    // GitHub Actions role for CI/CD
+    this.githubActionsRole = new iam.Role(this, 'GitHubActionsRole', {
+      roleName: 'nhp-github-actions',
+      description: `GitHub Actions role for ${githubOrg}/${githubRepo}`,
+      assumedBy: new iam.FederatedPrincipal(
+        githubOidcProvider.openIdConnectProviderArn,
+        {
+          StringEquals: {
+            'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
+          },
+          StringLike: {
+            'token.actions.githubusercontent.com:sub': `repo:${githubOrg}/${githubRepo}:*`,
+          },
+        },
+        'sts:AssumeRoleWithWebIdentity'
+      ),
+      inlinePolicies: {
+        'ecr-push': new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              sid: 'ECRAuth',
+              effect: iam.Effect.ALLOW,
+              actions: ['ecr:GetAuthorizationToken'],
+              resources: ['*'],
+            }),
+            new iam.PolicyStatement({
+              sid: 'ECRPush',
+              effect: iam.Effect.ALLOW,
+              actions: [
+                'ecr:BatchCheckLayerAvailability',
+                'ecr:GetDownloadUrlForLayer',
+                'ecr:BatchGetImage',
+                'ecr:PutImage',
+                'ecr:InitiateLayerUpload',
+                'ecr:UploadLayerPart',
+                'ecr:CompleteLayerUpload',
+                'ecr:DescribeRepositories',
+                'ecr:DescribeImages',
+              ],
+              resources: [
+                this.serverRepo.repositoryArn,
+                this.acRepo.repositoryArn,
+              ],
+            }),
+          ],
+        }),
+        'cdk-deploy': new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              sid: 'CDKAssumeRole',
+              effect: iam.Effect.ALLOW,
+              actions: ['sts:AssumeRole'],
+              resources: [`arn:aws:iam::${this.account}:role/cdk-*`],
+            }),
+          ],
+        }),
+      },
+    });
+
     // Outputs
     new cdk.CfnOutput(this, 'ServerRepoUri', {
       value: this.serverRepo.repositoryUri,
@@ -89,6 +158,12 @@ export class EcrStack extends cdk.Stack {
       value: this.acRepo.repositoryUri,
       description: 'NHP AC ECR Repository URI',
       exportName: `${this.stackName}-AcRepoUri`,
+    });
+
+    new cdk.CfnOutput(this, 'GitHubActionsRoleArn', {
+      value: this.githubActionsRole.roleArn,
+      description: 'GitHub Actions Role ARN (add to GitHub secrets as AWS_ROLE_ARN)',
+      exportName: `${this.stackName}-GitHubActionsRoleArn`,
     });
   }
 }
