@@ -133,7 +133,8 @@ export class DataStack extends cdk.Stack {
       performanceMode: efs.PerformanceMode.GENERAL_PURPOSE,
       throughputMode: efs.ThroughputMode.BURSTING,
       removalPolicy: isProd ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY,
-      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+      // Use private subnets with egress for NAT access (needed to pull etcd image from quay.io)
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroup: etcdSecurityGroup,
     });
 
@@ -258,7 +259,8 @@ export class DataStack extends cdk.Stack {
       minHealthyPercent: 0, // Allow 0 during updates for single node
       maxHealthyPercent: 100,
       securityGroups: [etcdSecurityGroup],
-      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+      // Use private subnets with egress for NAT access (needed to pull etcd image from quay.io)
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       cloudMapOptions: {
         name: 'etcd',
         cloudMapNamespace: this.namespace,
