@@ -56,15 +56,12 @@ jobs:
             nhp/go.sum
             endpoints/go.sum
 
-      # TODO: Fix test suite for CI environment
-      # - nhp/test requires iptables (privileged container)
-      # - nhp/core/wasm/policy has stub functions
-      # - endpoints/test has timeout issues with viper config watcher
-      # Skipping tests for now to unblock CI; run locally before pushing
-      - name: Run tests (skipped - see TODO above)
+      - name: Run tests
+        env:
+          KBS_SKIP_INIT: "1"
         run: |
-          echo "Tests temporarily skipped in CI due to environment requirements"
-          echo "Run 'make test' locally before pushing changes"
+          cd nhp && go test ./... -v -timeout 5m
+          cd ../endpoints && go test ./... -v -timeout 5m
 
       - name: Configure AWS credentials
         if: github.event_name != 'pull_request'

@@ -1,3 +1,5 @@
+//go:build wasip1
+
 // this package is used to import host function
 
 package policy

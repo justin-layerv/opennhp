@@ -1,3 +1,5 @@
+//go:build wasip1
+
 // This file contains the concrete implementation of the policy interface.
 // User should focus on implementing the Policy interface methods in this package
 // to define their specific policy logic.

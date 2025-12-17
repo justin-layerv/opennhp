@@ -1,22 +1,25 @@
 package test
 
 import (
+	"os"
 	"testing"
-	"time"
 
 	log "github.com/OpenNHP/opennhp/nhp/log"
 )
 
 func TestLog(t *testing.T) {
-	// init logger
-	//tlog := log.NewLogger("NHP-LogTest", log.LogLevelDebug, "", "logtest")
-	//log.SetGlobalLogger(tlog)
-
-	for i := 0; i < 3; i++ {
-		log.Info("Info log test")
-		//log.Debug("Debug log test")
-		//log.Critical("Critical log test")
-		time.Sleep(5 * time.Second)
+	// Create temp directory for log files
+	tmpDir, err := os.MkdirTemp("", "nhp-log-test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
 	}
+	defer os.RemoveAll(tmpDir)
+
+	// init logger with temp directory
+	tlog := log.NewLogger("NHP-LogTest", log.LogLevelDebug, tmpDir, "logtest")
+	log.SetGlobalLogger(tlog)
+
+	log.Info("Info log test")
+	log.Debug("Debug log test")
 	log.Close()
 }

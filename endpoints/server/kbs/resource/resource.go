@@ -27,10 +27,22 @@ import (
 )
 
 var (
-	baseDir = "/opt/confidential-containers/kbs/repository"
+	baseDir = getBaseDir()
 )
 
+func getBaseDir() string {
+	if dir := os.Getenv("KBS_REPOSITORY_DIR"); dir != "" {
+		return dir
+	}
+	return "/opt/confidential-containers/kbs/repository"
+}
+
 func init() {
+	// Skip initialization if KBS_SKIP_INIT is set (for testing)
+	if os.Getenv("KBS_SKIP_INIT") != "" {
+		return
+	}
+
 	err := generateCosignKeyPair(
 		filepath.Join(baseDir, "cosign.key"),
 		filepath.Join(baseDir, "/default/cosign-key/pub"),

@@ -3,7 +3,6 @@ package test
 import (
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/OpenNHP/opennhp/endpoints/ac"
 	common "github.com/OpenNHP/opennhp/nhp/common"
@@ -81,12 +80,6 @@ func TestTomlViperHandling(t *testing.T) {
 	}
 	viper.OnConfigChange(func(in fsnotify.Event) {
 		fmt.Printf("file changed: %s\n", in.Name)
-		// content, err := os.ReadFile(in.Name)
-		// if err != nil {
-		// 	fmt.Printf("Failed to read config file: %v\n", err)
-		// 	return
-		// }
-		// err = toml.Unmarshal(content, &config)
 		err = viper.Unmarshal(&config)
 		if err != nil {
 			fmt.Printf("Failed to unmarshal config file: %v\n", err)
@@ -96,8 +89,6 @@ func TestTomlViperHandling(t *testing.T) {
 	})
 	viper.WatchConfig()
 
-	//content, err := os.ReadFile(filepath.Join(configDir, "config.toml"))
-	//err = toml.Unmarshal(content, &config)
 	err = viper.Unmarshal(&config)
 	if err != nil {
 		fmt.Printf("Failed to unmarshal config file: %v\n", err)
@@ -105,9 +96,8 @@ func TestTomlViperHandling(t *testing.T) {
 	}
 	fmt.Printf("config: %+v\n", config)
 
-	for {
-		time.Sleep(5 * time.Second)
-	}
+	// Test completes after verifying config loads correctly
+	// The infinite loop was removed - this is now a proper unit test
 }
 
 func TestWxwebTomlViperHandling(t *testing.T) {
@@ -137,12 +127,6 @@ func TestWxwebTomlViperHandling(t *testing.T) {
 
 	viper.OnConfigChange(func(in fsnotify.Event) {
 		fmt.Printf("file changed: %s\n", in.Name)
-		// content, err := os.ReadFile(in.Name)
-		// if err != nil {
-		// 	fmt.Printf("Failed to read config file: %v\n", err)
-		// 	return
-		// }
-		// err = toml.Unmarshal(content, &config)
 		err = viper.Unmarshal(&resources)
 		if err != nil {
 			fmt.Printf("Failed to unmarshal config file: %v\n", err)
@@ -154,9 +138,8 @@ func TestWxwebTomlViperHandling(t *testing.T) {
 	})
 	viper.WatchConfig()
 
-	for {
-		time.Sleep(5 * time.Second)
-	}
+	// Test completes after verifying config loads correctly
+	// The infinite loop was removed - this is now a proper unit test
 }
 
 func TestUdpServerTomlViperHandling(t *testing.T) {
@@ -186,12 +169,6 @@ func TestUdpServerTomlViperHandling(t *testing.T) {
 
 	viper.OnConfigChange(func(in fsnotify.Event) {
 		fmt.Printf("file changed: %s\n", in.Name)
-		// content, err := os.ReadFile(in.Name)
-		// if err != nil {
-		// 	fmt.Printf("Failed to read config file: %v\n", err)
-		// 	return
-		// }
-		// err = toml.Unmarshal(content, &config)
 		err = viper.Unmarshal(&peers)
 		if err != nil {
 			fmt.Printf("Failed to unmarshal config file: %v\n", err)
@@ -203,7 +180,6 @@ func TestUdpServerTomlViperHandling(t *testing.T) {
 	})
 	viper.WatchConfig()
 
-	for {
-		time.Sleep(5 * time.Second)
-	}
+	// Test completes after verifying config loads correctly
+	// The infinite loop was removed - this is now a proper unit test
 }

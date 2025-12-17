@@ -4,7 +4,12 @@
 *.dll
 *.so
 *.dylib
+
+# Hidden files (but not .github or .gitignore)
 .*
+!.github
+!.gitignore
+
 # Test binary, build with `go test -c`
 *.test
 

@@ -31,6 +31,13 @@ func TestGenerateUUIDv4(t *testing.T) {
 }
 
 func TestIPTables(t *testing.T) {
+	// Skip if iptables is not available (e.g., in CI environments)
+	if _, err := os.Stat("/sbin/iptables"); os.IsNotExist(err) {
+		if _, err := os.Stat("/usr/sbin/iptables"); os.IsNotExist(err) {
+			t.Skip("iptables not available, skipping test")
+		}
+	}
+
 	iptables, err := utils.NewIPTables()
 
 	if err != nil {
@@ -41,8 +48,16 @@ func TestIPTables(t *testing.T) {
 }
 
 func TestPanicCatch(t *testing.T) {
-	tlog := log.NewLogger("NHP-LogTest", log.LogLevelDebug, "", "logtest")
+	// Create temp directory for log files
+	tmpDir, err := os.MkdirTemp("", "nhp-panic-test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	tlog := log.NewLogger("NHP-LogTest", log.LogLevelDebug, tmpDir, "logtest")
 	log.SetGlobalLogger(tlog)
+	defer log.Close()
 
 	func() {
 		defer func() {
