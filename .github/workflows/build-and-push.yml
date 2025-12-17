@@ -56,11 +56,20 @@ jobs:
             nhp/go.sum
             endpoints/go.sum
 
-      - name: Run tests
+      - name: Run tests (privileged container for iptables)
         run: |
-          # Exclude WASM policy packages (have stub functions for WASM compilation)
-          cd nhp && go test $(go list ./... | grep -v 'wasm/policy')
-          cd ../endpoints && go test ./...
+          # Run tests in privileged container to allow iptables access
+          docker run --rm \
+            --privileged \
+            --cap-add=NET_ADMIN \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            golang:1.24-bookworm \
+            bash -c "
+              apt-get update && apt-get install -y iptables ipset >/dev/null 2>&1
+              cd nhp && go test \$(go list ./... | grep -v 'wasm/policy')
+              cd ../endpoints && go test ./...
+            "
 
       - name: Configure AWS credentials
         if: github.event_name != 'pull_request'
