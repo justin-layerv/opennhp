@@ -104,6 +104,10 @@ export class MonitoringStack extends cdk.Stack {
     );
 
     // Row 3: NHP Protocol Metrics (custom metrics from server)
+    // NOTE: These metrics must be published by the NHP server application.
+    // The server should emit metrics to CloudWatch using the AWS SDK or
+    // CloudWatch agent with the namespace 'LayerV/NHP'.
+    // See: endpoints/server/metrics/ for implementation details.
     this.dashboard.addWidgets(
       new cloudwatch.GraphWidget({
         title: 'NHP - Knock Requests',

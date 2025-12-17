@@ -1,5 +1,6 @@
 import * as cdk from 'aws-cdk-lib';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 
 export interface EcrStackProps extends cdk.StackProps {
@@ -14,6 +15,9 @@ export interface EcrStackProps extends cdk.StackProps {
  * Creates ECR repositories for NHP container images.
  * These are created in a separate stack so they persist
  * across compute stack updates.
+ *
+ * The AC repository has a cross-account pull policy allowing
+ * any authenticated AWS account to pull images (for customer deployments).
  */
 export class EcrStack extends cdk.Stack {
   public readonly serverRepo: ecr.IRepository;
@@ -24,7 +28,7 @@ export class EcrStack extends cdk.Stack {
 
     const { config } = props;
 
-    // NHP Server repository
+    // NHP Server repository (internal use only)
     this.serverRepo = new ecr.Repository(this, 'ServerRepo', {
       repositoryName: `layerv/nhp-server`,
       imageScanOnPush: true,
@@ -55,6 +59,24 @@ export class EcrStack extends cdk.Stack {
       ],
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
+
+    // Allow any authenticated AWS account to pull AC images
+    // This enables customer CloudFormation deployments to pull from our ECR
+    this.acRepo.addToResourcePolicy(new iam.PolicyStatement({
+      sid: 'AllowCrossAccountPull',
+      effect: iam.Effect.ALLOW,
+      principals: [new iam.AnyPrincipal()],
+      actions: [
+        'ecr:GetDownloadUrlForLayer',
+        'ecr:BatchGetImage',
+        'ecr:BatchCheckLayerAvailability',
+      ],
+      conditions: {
+        StringEquals: {
+          'aws:PrincipalType': 'AssumedRole',
+        },
+      },
+    }));
 
     // Outputs
     new cdk.CfnOutput(this, 'ServerRepoUri', {

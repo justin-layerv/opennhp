@@ -19,11 +19,12 @@ export interface NetworkStackProps extends cdk.StackProps {
  * - Isolated subnets (for databases)
  * - NAT Gateways for outbound access
  * - VPC Endpoints for AWS services
+ *
+ * Note: Security groups for compute resources are created in ComputeStack
+ * to keep network concerns separate from compute configuration.
  */
 export class NetworkStack extends cdk.Stack {
   public readonly vpc: ec2.IVpc;
-  public readonly nlbSecurityGroup: ec2.ISecurityGroup;
-  public readonly serverSecurityGroup: ec2.ISecurityGroup;
   public readonly dataSecurityGroup: ec2.ISecurityGroup;
 
   constructor(scope: Construct, id: string, props: NetworkStackProps) {
@@ -67,44 +68,8 @@ export class NetworkStack extends cdk.Stack {
       },
     });
 
-    // Security Group for Network Load Balancer
-    this.nlbSecurityGroup = new ec2.SecurityGroup(this, 'NlbSecurityGroup', {
-      vpc: this.vpc,
-      securityGroupName: `layerv-nhp-nlb-${config.environment}`,
-      description: 'Security group for NHP Network Load Balancer',
-      allowAllOutbound: true,
-    });
-
-    // Allow NHP protocol from anywhere (UDP 62206)
-    this.nlbSecurityGroup.addIngressRule(
-      ec2.Peer.anyIpv4(),
-      ec2.Port.udp(62206),
-      'NHP Protocol from agents and ACs'
-    );
-
-    // Security Group for NHP Servers
-    this.serverSecurityGroup = new ec2.SecurityGroup(this, 'ServerSecurityGroup', {
-      vpc: this.vpc,
-      securityGroupName: `layerv-nhp-server-${config.environment}`,
-      description: 'Security group for NHP Server instances',
-      allowAllOutbound: true,
-    });
-
-    // Allow NHP from NLB
-    this.serverSecurityGroup.addIngressRule(
-      this.nlbSecurityGroup,
-      ec2.Port.udp(62206),
-      'NHP Protocol from NLB'
-    );
-
-    // Allow HTTPS for HTTP API (if enabled)
-    this.serverSecurityGroup.addIngressRule(
-      this.nlbSecurityGroup,
-      ec2.Port.tcp(443),
-      'HTTPS from NLB'
-    );
-
     // Security Group for Data Layer (etcd, DB)
+    // Note: Server security groups are created in ComputeStack
     this.dataSecurityGroup = new ec2.SecurityGroup(this, 'DataSecurityGroup', {
       vpc: this.vpc,
       securityGroupName: `layerv-nhp-data-${config.environment}`,
@@ -112,11 +77,11 @@ export class NetworkStack extends cdk.Stack {
       allowAllOutbound: false,
     });
 
-    // Allow etcd from servers
+    // Allow etcd client access from private subnets (servers)
     this.dataSecurityGroup.addIngressRule(
-      this.serverSecurityGroup,
+      ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
       ec2.Port.tcp(2379),
-      'etcd client port from servers'
+      'etcd client port from VPC'
     );
 
     // Allow etcd peer communication
@@ -126,7 +91,21 @@ export class NetworkStack extends cdk.Stack {
       'etcd peer port'
     );
 
-    // VPC Endpoints for AWS services (reduces NAT costs)
+    // Allow outbound to VPC for etcd peer communication
+    this.dataSecurityGroup.addEgressRule(
+      ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
+      ec2.Port.tcp(2380),
+      'etcd peer outbound'
+    );
+
+    // Allow HTTPS outbound for AWS APIs
+    this.dataSecurityGroup.addEgressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(443),
+      'HTTPS for AWS APIs'
+    );
+
+    // VPC Endpoints for AWS services (reduces NAT costs and enables private subnet access)
     // S3 Gateway Endpoint (free)
     this.vpc.addGatewayEndpoint('S3Endpoint', {
       service: ec2.GatewayVpcEndpointAwsService.S3,
@@ -155,6 +134,13 @@ export class NetworkStack extends cdk.Stack {
     // Secrets Manager endpoint
     this.vpc.addInterfaceEndpoint('SecretsManagerEndpoint', {
       service: ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
+      privateDnsEnabled: true,
+      subnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+    });
+
+    // Cloud Map / Service Discovery endpoint (for Cloud Map API calls)
+    this.vpc.addInterfaceEndpoint('ServiceDiscoveryEndpoint', {
+      service: ec2.InterfaceVpcEndpointAwsService.CLOUD_MAP_SERVICE_DISCOVERY,
       privateDnsEnabled: true,
       subnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
     });

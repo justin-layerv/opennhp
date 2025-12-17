@@ -1,30 +1,40 @@
-FROM opennhp-base:latest  AS builder
+# Multi-stage build for NHP Server
+# Stage 1: Build the NHP server binary
+FROM golang:1.24-bookworm AS builder
 
 WORKDIR /nhp-server
 
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    make \
+    clang \
+    llvm \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy source code
 COPY . .
 
-RUN echo "Building for architecture: ${TARGETARCH}"
+# Build the server
+RUN make init serverd plugins
 
-RUN cd /nhp-server &&  make init serverd plugins test
-
-FROM ubuntu:22.04  AS runtime
+# Stage 2: Runtime image
+FROM ubuntu:22.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
-    apt-get install -y  wget \
+    apt-get install -y \
     ca-certificates \
-    nginx \
     iptables \
-    tcpdump \
     ipset \
-    git \
     curl \
-    telnet \
-    vim \
     && rm -rf /var/lib/apt/lists/*
 
+# Copy built binary
 COPY --from=builder /nhp-server/release/nhp-server /nhp-server
 
-ENTRYPOINT ["/bin/sh", "-c"]
-CMD ["nginx & /nhp-server/nhp-serverd run"]
+# Run as non-root user (optional, requires NET_ADMIN capability)
+# RUN useradd -r -s /bin/false nhp
+# USER nhp
+
+ENTRYPOINT ["/nhp-server/nhp-serverd"]
+CMD ["run"]

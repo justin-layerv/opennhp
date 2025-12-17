@@ -88,7 +88,7 @@ jobs:
           ENV_TAG: ${{ steps.env.outputs.environment }}
         run: |
           docker build \
-            -f aws/docker/Dockerfile.server \
+            -f docker/Dockerfile.server \
             -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
             -t $ECR_REGISTRY/$ECR_REPOSITORY:$ENV_TAG \
             -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
@@ -179,11 +179,12 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$ENV_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-  deploy-cdk:
-    name: Deploy CDK Infrastructure
-    needs: [build-server]
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [build-server, build-ac]
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    environment: staging
     permissions:
       id-token: write
       contents: read
@@ -210,21 +211,54 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Set environment
-        id: env
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
-          else
-            echo "environment=prod" >> $GITHUB_OUTPUT
-          fi
-
-      - name: CDK Diff
+      - name: CDK Diff (Staging)
         run: |
           cd aws/cdk
-          npx cdk diff --all -c environment=${{ steps.env.outputs.environment }}
+          npx cdk diff --all -c environment=staging
 
-      - name: CDK Deploy
+      - name: CDK Deploy (Staging)
         run: |
           cd aws/cdk
-          npx cdk deploy --all --require-approval never -c environment=${{ steps.env.outputs.environment }}
+          npx cdk deploy --all --require-approval never -c environment=staging
+
+  deploy-prod:
+    name: Deploy to Production
+    needs: [deploy-staging]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production  # Requires manual approval in GitHub settings
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: aws/cdk/package-lock.json
+
+      - name: Install CDK dependencies
+        run: |
+          cd aws/cdk
+          npm ci
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: CDK Diff (Production)
+        run: |
+          cd aws/cdk
+          npx cdk diff --all -c environment=prod
+
+      - name: CDK Deploy (Production)
+        run: |
+          cd aws/cdk
+          npx cdk deploy --all --require-approval never -c environment=prod

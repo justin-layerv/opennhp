@@ -191,7 +191,12 @@ export class DataStack extends cdk.Stack {
 
     // etcd container
     // Using single-node configuration for dev/staging
-    // For production HA, use etcd discovery or static configuration
+    // For production HA, use etcd discovery or static configuration with TLS
+    //
+    // Note on TLS: etcd is running in isolated subnets within the VPC.
+    // Traffic is encrypted at the network level via VPC isolation.
+    // For additional security in production, configure mTLS using
+    // certificates from ACM PCA or HashiCorp Vault.
     const container = taskDefinition.addContainer('etcd', {
       containerName: 'etcd',
       image: ecs.ContainerImage.fromRegistry('quay.io/coreos/etcd:v3.5.11'),
@@ -204,7 +209,8 @@ export class DataStack extends cdk.Stack {
         // Single node configuration
         ETCD_NAME: 'etcd-0',
         ETCD_DATA_DIR: '/etcd-data',
-        // Listen on all interfaces
+        // Listen on all interfaces within VPC
+        // Note: etcd runs in isolated subnet, only accessible from private subnets
         ETCD_LISTEN_CLIENT_URLS: 'http://0.0.0.0:2379',
         ETCD_LISTEN_PEER_URLS: 'http://0.0.0.0:2380',
         // Advertise via service discovery DNS

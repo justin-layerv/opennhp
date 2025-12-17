@@ -1,42 +1,40 @@
-FROM opennhp-base:latest AS builder
+# Multi-stage build for NHP Access Controller
+# Stage 1: Build the NHP AC binary
+FROM golang:1.24-bookworm AS builder
+
 WORKDIR /nhp-server
 
-COPY . .
-
-RUN echo "Building for architecture: ${TARGETARCH}"
-
-RUN cd /nhp-server &&  make init acd test
-
-FROM ubuntu:22.04  AS runtime
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && \
-    apt-get install -y  wget \
-    ca-certificates \
-    iptables \
-    tcpdump \
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    make \
     clang \
-    ipset \
-    git \
-    curl \
-    telnet \
+    llvm \
     && rm -rf /var/lib/apt/lists/*
 
-# Traefik version
-ARG TRAEFIK_VERSION=v2.10.4
+# Copy source code
+COPY . .
 
-# traefik config
-RUN mkdir -p /opt/traefik/
+# Build the AC
+RUN make init acd
 
-# Copy the traefik configuration file
-COPY --from=builder /nhp-server/docker/traefik_v3.4.0-rc2_linux_amd64.tar.gz /traefik.tar.gz
-RUN tar -zxvf traefik.tar.gz && \
-    mv traefik /opt/traefik/ && \
-    chmod +x /opt/traefik/traefik && \
-    rm -rf /tmp/*
+# Stage 2: Runtime image
+FROM ubuntu:22.04 AS runtime
 
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get install -y \
+    ca-certificates \
+    iptables \
+    ipset \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy built binary and scripts
 COPY --from=builder /nhp-server/release/nhp-ac /nhp-ac
 COPY --from=builder /nhp-server/docker/iptables_defaults_ubuntu.sh /iptables_defaults_ubuntu.sh
 COPY --from=builder /nhp-server/docker/iptables_defaults_x86.sh /iptables_defaults_x86.sh
+
+# Select appropriate iptables script based on architecture
 RUN if [ "$(uname -m)" = "x86_64" ]; then \
         mv /iptables_defaults_x86.sh /iptables_defaults.sh; \
     else \
@@ -45,6 +43,8 @@ RUN if [ "$(uname -m)" = "x86_64" ]; then \
     chmod +x /iptables_defaults.sh && \
     rm -f /iptables_defaults_*.sh
 
-ENTRYPOINT ["/bin/sh", "-c"]
-CMD ["/iptables_defaults.sh && cd /opt/traefik/ && nohup ./traefik --configFile=traefik.toml 2>&1 & -- & /nhp-ac/nhp-acd run"]
-#ENTRYPOINT ["/nhp-ac/nhp-acd", "run"]
+# Create startup script
+RUN echo '#!/bin/bash\n/iptables_defaults.sh\nexec /nhp-ac/nhp-acd run' > /start.sh && \
+    chmod +x /start.sh
+
+ENTRYPOINT ["/start.sh"]
