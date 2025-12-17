@@ -8,7 +8,7 @@ on:
     paths:
       - 'nhp/**'
       - 'endpoints/**'
-      - 'aws/docker/**'
+      - 'docker/**'
       - '.github/workflows/build-and-push.yml'
   pull_request:
     branches:
@@ -16,18 +16,22 @@ on:
     paths:
       - 'nhp/**'
       - 'endpoints/**'
-      - 'aws/docker/**'
+      - 'docker/**'
   workflow_dispatch:
     inputs:
       environment:
         description: 'Target environment'
         required: true
-        default: 'dev'
+        default: 'staging'
         type: choice
         options:
-          - dev
           - staging
           - prod
+      deploy:
+        description: 'Deploy after build?'
+        required: true
+        default: true
+        type: boolean
 
 env:
   AWS_REGION: us-east-1
@@ -182,7 +186,10 @@ jobs:
   deploy-staging:
     name: Deploy to Staging
     needs: [build-server, build-ac]
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    # Auto-deploy to staging on push to main, or manual trigger with staging selected
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'staging')
     runs-on: ubuntu-latest
     environment: staging
     permissions:
@@ -223,10 +230,12 @@ jobs:
 
   deploy-prod:
     name: Deploy to Production
-    needs: [deploy-staging]
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: [build-server, build-ac]
+    # Production ONLY deploys via manual workflow_dispatch with environment=prod
+    # This is the free-plan alternative to environment protection rules
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'prod'
     runs-on: ubuntu-latest
-    environment: production  # Requires manual approval in GitHub settings
+    environment: production
     permissions:
       id-token: write
       contents: read
