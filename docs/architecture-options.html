@@ -1,0 +1,884 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NHP Architecture Options: AC Placement</title>
+    <style>
+        :root {
+            --primary: #1a56db;
+            --primary-dark: #1e40af;
+            --secondary: #059669;
+            --warning: #d97706;
+            --danger: #dc2626;
+            --purple: #7c3aed;
+            --gray-50: #f9fafb;
+            --gray-100: #f3f4f6;
+            --gray-200: #e5e7eb;
+            --gray-300: #d1d5db;
+            --gray-600: #4b5563;
+            --gray-700: #374151;
+            --gray-800: #1f2937;
+            --gray-900: #111827;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: var(--gray-800);
+            background: var(--gray-50);
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        header {
+            background: linear-gradient(135deg, var(--purple) 0%, var(--primary-dark) 100%);
+            color: white;
+            padding: 3rem 2rem;
+            margin-bottom: 2rem;
+        }
+
+        header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        header .subtitle {
+            font-size: 1.25rem;
+            opacity: 0.9;
+        }
+
+        header .meta {
+            margin-top: 1rem;
+            font-size: 0.875rem;
+            opacity: 0.8;
+        }
+
+        section {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            padding: 2rem;
+            margin-bottom: 2rem;
+        }
+
+        h2 {
+            color: var(--primary);
+            font-size: 1.75rem;
+            margin-bottom: 1.5rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid var(--gray-200);
+        }
+
+        h3 {
+            color: var(--gray-800);
+            font-size: 1.25rem;
+            margin: 1.5rem 0 1rem;
+        }
+
+        h4 {
+            color: var(--gray-700);
+            font-size: 1rem;
+            margin: 1rem 0 0.5rem;
+        }
+
+        p {
+            margin-bottom: 1rem;
+            color: var(--gray-600);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1rem 0;
+            font-size: 0.9rem;
+        }
+
+        th, td {
+            padding: 0.75rem 1rem;
+            text-align: left;
+            border-bottom: 1px solid var(--gray-200);
+        }
+
+        th {
+            background: var(--gray-100);
+            font-weight: 600;
+            color: var(--gray-700);
+        }
+
+        tr:hover {
+            background: var(--gray-50);
+        }
+
+        .diagram {
+            background: var(--gray-900);
+            color: #10b981;
+            padding: 1.5rem;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 0.75rem;
+            line-height: 1.4;
+            margin: 1rem 0;
+        }
+
+        .callout {
+            padding: 1rem 1.5rem;
+            border-radius: 6px;
+            margin: 1rem 0;
+        }
+
+        .callout-info {
+            background: #dbeafe;
+            border-left: 4px solid var(--primary);
+        }
+
+        .callout-success {
+            background: #d1fae5;
+            border-left: 4px solid var(--secondary);
+        }
+
+        .callout-warning {
+            background: #fef3c7;
+            border-left: 4px solid var(--warning);
+        }
+
+        .callout-danger {
+            background: #fee2e2;
+            border-left: 4px solid var(--danger);
+        }
+
+        .callout-purple {
+            background: #ede9fe;
+            border-left: 4px solid var(--purple);
+        }
+
+        .option-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 1.5rem;
+            margin: 1.5rem 0;
+        }
+
+        .option-card {
+            border: 2px solid var(--gray-200);
+            border-radius: 8px;
+            padding: 1.5rem;
+            position: relative;
+        }
+
+        .option-card.current {
+            border-color: var(--primary);
+            background: linear-gradient(to bottom, #eff6ff, white);
+        }
+
+        .option-card.proposed {
+            border-color: var(--purple);
+            background: linear-gradient(to bottom, #f5f3ff, white);
+        }
+
+        .option-card h3 {
+            margin-top: 0;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .badge-current {
+            background: var(--primary);
+            color: white;
+        }
+
+        .badge-proposed {
+            background: var(--purple);
+            color: white;
+        }
+
+        .badge-success {
+            background: var(--secondary);
+            color: white;
+        }
+
+        .badge-warning {
+            background: var(--warning);
+            color: white;
+        }
+
+        .badge-danger {
+            background: var(--danger);
+            color: white;
+        }
+
+        .pro-con {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+
+        .pros, .cons {
+            padding: 1rem;
+            border-radius: 6px;
+        }
+
+        .pros {
+            background: #d1fae5;
+        }
+
+        .cons {
+            background: #fee2e2;
+        }
+
+        .pros h4, .cons h4 {
+            margin: 0 0 0.5rem 0;
+            font-size: 0.875rem;
+            text-transform: uppercase;
+        }
+
+        .pros h4 {
+            color: var(--secondary);
+        }
+
+        .cons h4 {
+            color: var(--danger);
+        }
+
+        .pros ul, .cons ul {
+            margin: 0;
+            padding-left: 1.25rem;
+            font-size: 0.875rem;
+        }
+
+        .pros li {
+            color: #065f46;
+        }
+
+        .cons li {
+            color: #991b1b;
+        }
+
+        ul, ol {
+            margin: 1rem 0 1rem 1.5rem;
+            color: var(--gray-600);
+        }
+
+        li {
+            margin-bottom: 0.5rem;
+        }
+
+        .decision-matrix {
+            margin: 1.5rem 0;
+        }
+
+        .decision-matrix th {
+            text-align: center;
+        }
+
+        .decision-matrix td:not(:first-child) {
+            text-align: center;
+        }
+
+        .check {
+            color: var(--secondary);
+            font-weight: bold;
+        }
+
+        .cross {
+            color: var(--danger);
+            font-weight: bold;
+        }
+
+        .partial {
+            color: var(--warning);
+            font-weight: bold;
+        }
+
+        .question-box {
+            background: var(--gray-100);
+            border: 2px dashed var(--gray-300);
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin: 1.5rem 0;
+        }
+
+        .question-box h4 {
+            color: var(--purple);
+            margin: 0 0 1rem 0;
+        }
+
+        .question-box ol {
+            margin-bottom: 0;
+        }
+
+        .flow-comparison {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+            margin: 1.5rem 0;
+        }
+
+        .flow-box {
+            background: var(--gray-50);
+            border-radius: 8px;
+            padding: 1.5rem;
+        }
+
+        .flow-box h4 {
+            text-align: center;
+            margin-bottom: 1rem;
+        }
+
+        .architecture-variant {
+            background: white;
+            border: 1px solid var(--gray-200);
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin: 1rem 0;
+        }
+
+        .architecture-variant h4 {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-top: 0;
+        }
+
+        code {
+            background: var(--gray-100);
+            padding: 0.2rem 0.4rem;
+            border-radius: 4px;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 0.875rem;
+        }
+
+        pre {
+            background: var(--gray-900);
+            color: #e5e7eb;
+            padding: 1rem;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 0.8rem;
+            margin: 1rem 0;
+        }
+
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1rem;
+            margin: 1.5rem 0;
+        }
+
+        .summary-card {
+            background: var(--gray-50);
+            border: 1px solid var(--gray-200);
+            border-radius: 8px;
+            padding: 1rem;
+            text-align: center;
+        }
+
+        .summary-card .label {
+            font-size: 0.75rem;
+            color: var(--gray-600);
+            text-transform: uppercase;
+            margin-bottom: 0.5rem;
+        }
+
+        .summary-card .value {
+            font-size: 1.25rem;
+            font-weight: 700;
+        }
+
+        @media print {
+            body {
+                background: white;
+            }
+            section {
+                box-shadow: none;
+                border: 1px solid var(--gray-200);
+                break-inside: avoid;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .option-grid, .flow-comparison, .pro-con, .summary-grid {
+                grid-template-columns: 1fr;
+            }
+            header h1 {
+                font-size: 1.75rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>NHP Architecture Options</h1>
+            <div class="subtitle">Where Should the Access Controller (AC) Live?</div>
+            <div class="meta">Architecture Discussion Document | December 2024</div>
+        </div>
+    </header>
+
+    <div class="container">
+
+        <!-- The Question -->
+        <section>
+            <h2>The Core Question</h2>
+
+            <div class="question-box">
+                <h4>Decision Required</h4>
+                <p style="margin-bottom: 1rem; font-size: 1.1rem; color: var(--gray-800);">
+                    Should the NHP Access Controller (AC) be deployed in:
+                </p>
+                <ol style="font-size: 1.1rem; color: var(--gray-800);">
+                    <li><strong>Customer VPC</strong> - Customer deploys and manages AC</li>
+                    <li><strong>LayerV VPC</strong> - We manage AC, customer just whitelists our IPs</li>
+                </ol>
+            </div>
+
+            <p>This decision fundamentally changes:</p>
+            <ul>
+                <li>Customer onboarding complexity</li>
+                <li>Data plane traffic flow</li>
+                <li>Security and compliance posture</li>
+                <li>Operational responsibility</li>
+                <li>Cost structure</li>
+            </ul>
+        </section>
+
+        <!-- Current Architecture -->
+        <section>
+            <h2>Option A: AC in Customer VPC <span class="badge badge-current">Current Design</span></h2>
+
+            <div class="diagram">
+<pre>
+┌───────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                       │
+│   ┌──────────┐         ┌─────────────────────┐         ┌──────────────────────────┐  │
+│   │          │         │     LAYERV VPC      │         │      CUSTOMER VPC        │  │
+│   │  Agent   │         │                     │         │                          │  │
+│   │  (User)  │         │  ┌──────────────┐   │         │  ┌────────┐  ┌────────┐  │  │
+│   │          │         │  │  NHP Server  │   │         │  │ NHP-AC │  │Resource│  │  │
+│   └────┬─────┘         │  │              │   │         │  │        │  │        │  │  │
+│        │               │  └───────┬──────┘   │         │  └───┬────┘  └───┬────┘  │  │
+│        │               │          │          │         │      │          │        │  │
+│        │               └──────────┼──────────┘         │      │          │        │  │
+│        │                          │                    │      │          │        │  │
+│        │  1. Knock (UDP)          │                    │      │          │        │  │
+│        │ ─────────────────────────>                    │      │          │        │  │
+│        │                          │                    │      │          │        │  │
+│        │                          │  2. Authorize AC   │      │          │        │  │
+│        │                          │ ───────────────────────────>          │        │  │
+│        │                          │                    │      │          │        │  │
+│        │                          │                    │  3. Open        │        │  │
+│        │                          │                    │  iptables ──────>        │  │
+│        │                          │                    │      │          │        │  │
+│        │  4. ACK                  │                    │      │          │        │  │
+│        │ <─────────────────────────                    │      │          │        │  │
+│        │                          │                    │      │          │        │  │
+│        │  5. Direct Connection (DATA PLANE)            │      │          │        │  │
+│        │ ─────────────────────────────────────────────────────────────────>        │  │
+│        │                          │                    │                          │  │
+│                                                        │                          │  │
+│   Control Plane: Agent ──> LayerV ──> AC              │  Data Plane: Agent ──> Resource
+│                                                        │  (Stays in Customer VPC)
+│                                                        │                          │  │
+└───────────────────────────────────────────────────────────────────────────────────────┘
+</pre>
+            </div>
+
+            <div class="flow-comparison">
+                <div class="flow-box">
+                    <h4>Control Plane</h4>
+                    <p><code>Agent → LayerV Server → Customer AC</code></p>
+                    <p style="font-size: 0.875rem; color: var(--gray-600);">Authentication, authorization, policy decisions</p>
+                </div>
+                <div class="flow-box">
+                    <h4>Data Plane</h4>
+                    <p><code>Agent → Customer Resource</code></p>
+                    <p style="font-size: 0.875rem; color: var(--gray-600);">Direct connection, never touches LayerV</p>
+                </div>
+            </div>
+
+            <h3>How AC Works</h3>
+            <p>The AC doesn't proxy traffic. It controls access by dynamically managing firewall rules:</p>
+            <pre># When user is authorized, AC runs:
+iptables -A INPUT -s {agent_ip} -d {resource_ip} -p tcp --dport 5432 -j ACCEPT
+
+# When session expires:
+iptables -D INPUT -s {agent_ip} -d {resource_ip} -p tcp --dport 5432 -j ACCEPT</pre>
+
+            <div class="pro-con">
+                <div class="pros">
+                    <h4>Pros</h4>
+                    <ul>
+                        <li>Data never leaves customer VPC</li>
+                        <li>Full compliance (HIPAA, PCI, etc.)</li>
+                        <li>Low latency (direct connection)</li>
+                        <li>Customer pays bandwidth</li>
+                        <li>Resources stay truly private</li>
+                        <li>No IP whitelist management</li>
+                    </ul>
+                </div>
+                <div class="cons">
+                    <h4>Cons</h4>
+                    <ul>
+                        <li>Customer must deploy AC</li>
+                        <li>More complex onboarding</li>
+                        <li>Customer manages AC updates</li>
+                        <li>Need CloudFormation/Terraform</li>
+                        <li>Customer needs AWS expertise</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <!-- Proposed Architecture -->
+        <section>
+            <h2>Option B: AC in LayerV VPC <span class="badge badge-proposed">Proposed</span></h2>
+
+            <div class="callout callout-purple">
+                <strong>Key Change:</strong> AC becomes a proxy/gateway, not a firewall controller. Customer exposes resources with IP whitelist.
+            </div>
+
+            <div class="diagram">
+<pre>
+┌───────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                       │
+│   ┌──────────┐         ┌─────────────────────────────────┐      ┌────────────────┐   │
+│   │          │         │          LAYERV VPC             │      │  CUSTOMER VPC  │   │
+│   │  Agent   │         │                                 │      │                │   │
+│   │  (User)  │         │  ┌──────────┐    ┌──────────┐   │      │  ┌──────────┐  │   │
+│   │          │         │  │NHP Server│    │  NHP-AC  │   │      │  │ Resource │  │   │
+│   └────┬─────┘         │  │          │    │ (Proxy)  │   │      │  │          │  │   │
+│        │               │  └─────┬────┘    └─────┬────┘   │      │  └────┬─────┘  │   │
+│        │               │        │               │        │      │       │        │   │
+│        │               └────────┼───────────────┼────────┘      │       │        │   │
+│        │                        │               │               │       │        │   │
+│        │  1. Knock              │               │               │       │        │   │
+│        │ ───────────────────────>               │               │       │        │   │
+│        │                        │               │               │       │        │   │
+│        │                   2. Auth              │               │       │        │   │
+│        │                        │ ─────────────>│               │       │        │   │
+│        │                        │               │               │       │        │   │
+│        │  3. ACK                │               │               │       │        │   │
+│        │ <───────────────────────               │               │       │        │   │
+│        │                        │               │               │       │        │   │
+│        │  4. Connect to AC (DATA PLANE)         │               │       │        │   │
+│        │ ───────────────────────────────────────>               │       │        │   │
+│        │                        │               │               │       │        │   │
+│        │                        │          5. Forward to Resource       │        │   │
+│        │                        │               │ ──────────────────────>        │   │
+│        │                        │               │               │                │   │
+│                                                                                       │
+│   Control Plane: Agent ──> LayerV Server ──> AC                                      │
+│   Data Plane:    Agent ──> LayerV AC ──> Customer Resource                           │
+│                            (Transits LayerV)                                         │
+│                                                                                       │
+└───────────────────────────────────────────────────────────────────────────────────────┘
+</pre>
+            </div>
+
+            <div class="flow-comparison">
+                <div class="flow-box">
+                    <h4>Control Plane</h4>
+                    <p><code>Agent → LayerV Server → LayerV AC</code></p>
+                    <p style="font-size: 0.875rem; color: var(--gray-600);">Same as before</p>
+                </div>
+                <div class="flow-box" style="background: #fef3c7;">
+                    <h4>Data Plane <span class="badge badge-warning">Changed</span></h4>
+                    <p><code>Agent → LayerV AC → Customer Resource</code></p>
+                    <p style="font-size: 0.875rem; color: var(--gray-600);">Traffic flows through LayerV</p>
+                </div>
+            </div>
+
+            <h3>Customer Requirements</h3>
+            <pre># Customer must whitelist LayerV AC IPs:
+# AWS Security Group or iptables:
+Allow 52.1.2.3/32 → Resource:5432
+Allow 52.1.2.4/32 → Resource:5432
+
+# Resource needs to be reachable from internet (public IP or NAT)</pre>
+
+            <div class="pro-con">
+                <div class="pros">
+                    <h4>Pros</h4>
+                    <ul>
+                        <li>Zero customer deployment</li>
+                        <li>Simplest onboarding</li>
+                        <li>LayerV controls all updates</li>
+                        <li>No AWS expertise needed</li>
+                        <li>Works with any cloud/on-prem</li>
+                    </ul>
+                </div>
+                <div class="cons">
+                    <h4>Cons</h4>
+                    <ul>
+                        <li>Data transits LayerV (compliance issue)</li>
+                        <li>Resource must be publicly reachable</li>
+                        <li>Higher latency (extra hop)</li>
+                        <li>LayerV pays bandwidth</li>
+                        <li>IP whitelist management</li>
+                        <li>"Expose to internet" = security concern</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <!-- Hybrid Options -->
+        <section>
+            <h2>Hybrid Options</h2>
+
+            <div class="architecture-variant">
+                <h4><span class="badge badge-success">C</span> Connector Pattern (Cloudflare/Zscaler Model)</h4>
+                <p>Customer deploys a lightweight "connector" that dials OUT to LayerV. No inbound firewall rules needed.</p>
+
+                <div class="diagram">
+<pre>
+┌──────────┐      ┌─────────────────────┐      ┌─────────────────────────────────┐
+│  Agent   │      │     LAYERV VPC      │      │         CUSTOMER VPC            │
+│          │      │  ┌──────────────┐   │      │                                 │
+│          │      │  │   NHP-AC     │<──┼──────┼───┐  ┌────────────┐             │
+│          │ ────>│  │   (Relay)    │   │Tunnel│   │  │ Connector  │ (dials out) │
+│          │      │  └──────────────┘───┼──────┼───│──│ (no inbound│             │
+│          │      │                     │      │   │  │  ports)    │             │
+│          │      └─────────────────────┘      │   │  └─────┬──────┘             │
+│          │                                   │   │        │                    │
+│          │                                   │   │        ▼                    │
+│          │                                   │   │  ┌──────────┐               │
+│          │                                   │   └─>│ Resource │               │
+│          │                                   │      └──────────┘               │
+└──────────┘                                   └─────────────────────────────────┘
+</pre>
+                </div>
+                <p><strong>Examples:</strong> Cloudflare Tunnel, Zscaler App Connector, Tailscale</p>
+                <p><strong>Customer deploys:</strong> Lightweight agent (outbound only, ~10MB binary)</p>
+            </div>
+
+            <div class="architecture-variant">
+                <h4><span class="badge badge-success">D</span> PrivateLink (Enterprise)</h4>
+                <p>Private connectivity between customer VPC and LayerV without public internet.</p>
+
+                <div class="diagram">
+<pre>
+┌─────────────────────────────────┐              ┌─────────────────────────────────┐
+│         CUSTOMER VPC            │              │          LAYERV VPC             │
+│                                 │              │                                 │
+│  ┌─────────┐    ┌───────────┐   │              │   ┌───────────┐   ┌──────────┐  │
+│  │ NHP-AC  │───>│    VPC    │───┼── ── ── ── ──┼──>│  Endpoint │──>│NHP Server│  │
+│  └─────────┘    │ Interface │   │ AWS Private  │   │  Service  │   └──────────┘  │
+│                 │ Endpoint  │   │   Backbone   │   └───────────┘                 │
+│                 └───────────┘   │(Never public)│                                 │
+│                                 │              │                                 │
+└─────────────────────────────────┘              └─────────────────────────────────┘
+</pre>
+                </div>
+                <p><strong>Best for:</strong> Enterprises with "no internet egress" policies</p>
+                <p><strong>Additional cost:</strong> ~$15/mo per customer</p>
+            </div>
+        </section>
+
+        <!-- Decision Matrix -->
+        <section>
+            <h2>Decision Matrix</h2>
+
+            <table class="decision-matrix">
+                <thead>
+                    <tr>
+                        <th>Criteria</th>
+                        <th>A: AC in Customer VPC</th>
+                        <th>B: AC in LayerV VPC</th>
+                        <th>C: Connector</th>
+                        <th>D: PrivateLink</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Customer deployment</strong></td>
+                        <td><span class="cross">AC instance</span></td>
+                        <td><span class="check">Nothing</span></td>
+                        <td><span class="partial">Lightweight agent</span></td>
+                        <td><span class="cross">AC + Endpoint</span></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Onboarding complexity</strong></td>
+                        <td><span class="partial">Medium</span></td>
+                        <td><span class="check">Low</span></td>
+                        <td><span class="check">Low</span></td>
+                        <td><span class="cross">High</span></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Data stays in customer VPC</strong></td>
+                        <td><span class="check">Yes</span></td>
+                        <td><span class="cross">No</span></td>
+                        <td><span class="cross">No</span></td>
+                        <td><span class="check">Yes</span></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Resource stays private</strong></td>
+                        <td><span class="check">Yes</span></td>
+                        <td><span class="cross">No (needs public IP)</span></td>
+                        <td><span class="check">Yes</span></td>
+                        <td><span class="check">Yes</span></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Compliance (HIPAA/PCI)</strong></td>
+                        <td><span class="check">Easy</span></td>
+                        <td><span class="cross">Hard</span></td>
+                        <td><span class="partial">Depends</span></td>
+                        <td><span class="check">Easy</span></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Latency</strong></td>
+                        <td><span class="check">Low (direct)</span></td>
+                        <td><span class="cross">High (extra hop)</span></td>
+                        <td><span class="partial">Medium</span></td>
+                        <td><span class="check">Low</span></td>
+                    </tr>
+                    <tr>
+                        <td><strong>LayerV bandwidth cost</strong></td>
+                        <td><span class="check">None</span></td>
+                        <td><span class="cross">High</span></td>
+                        <td><span class="cross">High</span></td>
+                        <td><span class="check">Low</span></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Works with on-prem</strong></td>
+                        <td><span class="partial">With VPN</span></td>
+                        <td><span class="check">Yes (if routable)</span></td>
+                        <td><span class="check">Yes</span></td>
+                        <td><span class="cross">AWS only</span></td>
+                    </tr>
+                    <tr>
+                        <td><strong>IP whitelist required</strong></td>
+                        <td><span class="check">No</span></td>
+                        <td><span class="cross">Yes</span></td>
+                        <td><span class="check">No</span></td>
+                        <td><span class="check">No</span></td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- The Hard Truth -->
+        <section>
+            <h2>The Hard Truth</h2>
+
+            <div class="callout callout-danger">
+                <strong>Option B (AC in LayerV VPC) requires customers to expose resources to the internet.</strong>
+                <p style="margin-top: 0.5rem; margin-bottom: 0;">Even with IP whitelisting, security teams often reject this. "Publicly reachable" is a red flag in audits.</p>
+            </div>
+
+            <h3>What We're Really Asking</h3>
+
+            <div class="option-grid">
+                <div class="option-card">
+                    <h4>Option A/D: "Deploy our software"</h4>
+                    <p>Customer runs AC in their VPC. Resources stay private. Data never leaves.</p>
+                    <p style="font-size: 0.875rem;"><strong>Customer reaction:</strong> "Makes sense for Zero Trust"</p>
+                </div>
+                <div class="option-card">
+                    <h4>Option B: "Expose your database to the internet"</h4>
+                    <p>Put a public IP on your database. Whitelist our IPs. Trust us.</p>
+                    <p style="font-size: 0.875rem;"><strong>Customer reaction:</strong> "Absolutely not"</p>
+                </div>
+            </div>
+
+            <h3>Why Connector (Option C) is the Compromise</h3>
+            <p>If we want minimal customer deployment WITHOUT exposing resources:</p>
+            <ul>
+                <li>Customer runs a tiny connector (outbound-only, no firewall changes)</li>
+                <li>Connector establishes tunnel to LayerV</li>
+                <li>Traffic flows through tunnel, resources stay private</li>
+                <li>This is exactly what Cloudflare, Zscaler, and Tailscale do</li>
+            </ul>
+
+            <div class="callout callout-info">
+                <strong>Trade-off:</strong> "Nothing to deploy" (Option B) only works if customers accept public exposure. Most won't. The realistic "simple" option is a lightweight connector (Option C).
+            </div>
+        </section>
+
+        <!-- Recommendation -->
+        <section>
+            <h2>Recommendation</h2>
+
+            <div class="summary-grid">
+                <div class="summary-card" style="border: 2px solid var(--primary);">
+                    <div class="label">SMB / Startup</div>
+                    <div class="value" style="color: var(--primary);">Option A</div>
+                    <p style="font-size: 0.75rem; margin: 0.5rem 0 0 0;">CloudFormation one-click</p>
+                </div>
+                <div class="summary-card" style="border: 2px solid var(--secondary);">
+                    <div class="label">Mid-Market</div>
+                    <div class="value" style="color: var(--secondary);">Option C</div>
+                    <p style="font-size: 0.75rem; margin: 0.5rem 0 0 0;">Connector pattern</p>
+                </div>
+                <div class="summary-card" style="border: 2px solid var(--purple);">
+                    <div class="label">Enterprise</div>
+                    <div class="value" style="color: var(--purple);">Option D</div>
+                    <p style="font-size: 0.75rem; margin: 0.5rem 0 0 0;">PrivateLink</p>
+                </div>
+                <div class="summary-card" style="border: 2px solid var(--danger);">
+                    <div class="label">Option B</div>
+                    <div class="value" style="color: var(--danger);">Avoid</div>
+                    <p style="font-size: 0.75rem; margin: 0.5rem 0 0 0;">Security teams will reject</p>
+                </div>
+            </div>
+
+            <h3>Suggested Path Forward</h3>
+            <ol>
+                <li><strong>Launch with Option A</strong> (AC in customer VPC via CloudFormation) - already built</li>
+                <li><strong>Add Option C</strong> (Connector) for customers who want simpler deployment</li>
+                <li><strong>Add Option D</strong> (PrivateLink) for enterprise tier</li>
+                <li><strong>Skip Option B</strong> - the "no deployment" benefit doesn't outweigh the security objections</li>
+            </ol>
+        </section>
+
+        <!-- Discussion Questions -->
+        <section>
+            <h2>Discussion Questions</h2>
+
+            <div class="question-box">
+                <h4>For the Architecture Team</h4>
+                <ol>
+                    <li>Are we comfortable with data plane traffic transiting LayerV infrastructure? (Options B, C)</li>
+                    <li>What's our bandwidth cost tolerance if traffic flows through us?</li>
+                    <li>Do we want to build a Connector pattern (Option C), or focus on CloudFormation/Terraform for Option A?</li>
+                    <li>Which customer segments are we targeting first? (This drives priority)</li>
+                    <li>Is the "zero deployment" goal worth the security objections it will raise?</li>
+                </ol>
+            </div>
+
+            <div class="question-box">
+                <h4>Technical Questions</h4>
+                <ol>
+                    <li>If we go with Connector (Option C), what protocol? WireGuard? WebSocket? QUIC?</li>
+                    <li>How do we handle connector HA/failover?</li>
+                    <li>What's the minimum connector footprint? (Docker? Single binary?)</li>
+                    <li>Can we make Option A simpler with a one-line install script?</li>
+                </ol>
+            </div>
+        </section>
+
+    </div>
+</body>
+</html>

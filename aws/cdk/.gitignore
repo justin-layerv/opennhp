@@ -1,0 +1,20 @@
+# CDK build artifacts
+cdk.out/
+dist/
+
+# Dependencies
+node_modules/
+
+# CDK context (contains account-specific info)
+cdk.context.json
+
+# TypeScript build info
+*.tsbuildinfo
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store

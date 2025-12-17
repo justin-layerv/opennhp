@@ -1,0 +1,1024 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LayerV NHP: AWS Marketplace Integration</title>
+    <style>
+        :root {
+            --primary: #1a56db;
+            --primary-dark: #1e40af;
+            --secondary: #059669;
+            --warning: #d97706;
+            --danger: #dc2626;
+            --gray-50: #f9fafb;
+            --gray-100: #f3f4f6;
+            --gray-200: #e5e7eb;
+            --gray-300: #d1d5db;
+            --gray-600: #4b5563;
+            --gray-700: #374151;
+            --gray-800: #1f2937;
+            --gray-900: #111827;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: var(--gray-800);
+            background: var(--gray-50);
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        header {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+            color: white;
+            padding: 3rem 2rem;
+            margin-bottom: 2rem;
+        }
+
+        header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        header .subtitle {
+            font-size: 1.25rem;
+            opacity: 0.9;
+        }
+
+        header .meta {
+            margin-top: 1rem;
+            font-size: 0.875rem;
+            opacity: 0.8;
+        }
+
+        section {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            padding: 2rem;
+            margin-bottom: 2rem;
+        }
+
+        h2 {
+            color: var(--primary);
+            font-size: 1.75rem;
+            margin-bottom: 1.5rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid var(--gray-200);
+        }
+
+        h3 {
+            color: var(--gray-800);
+            font-size: 1.25rem;
+            margin: 1.5rem 0 1rem;
+        }
+
+        h4 {
+            color: var(--gray-700);
+            font-size: 1rem;
+            margin: 1rem 0 0.5rem;
+        }
+
+        p {
+            margin-bottom: 1rem;
+            color: var(--gray-600);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1rem 0;
+            font-size: 0.9rem;
+        }
+
+        th, td {
+            padding: 0.75rem 1rem;
+            text-align: left;
+            border-bottom: 1px solid var(--gray-200);
+        }
+
+        th {
+            background: var(--gray-100);
+            font-weight: 600;
+            color: var(--gray-700);
+        }
+
+        tr:hover {
+            background: var(--gray-50);
+        }
+
+        .highlight-row {
+            background: #fef3c7 !important;
+            font-weight: 600;
+        }
+
+        .cost-savings {
+            color: var(--secondary);
+            font-weight: 600;
+        }
+
+        .cost-high {
+            color: var(--danger);
+            font-weight: 600;
+        }
+
+        pre {
+            background: var(--gray-900);
+            color: #e5e7eb;
+            padding: 1.5rem;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 0.8rem;
+            line-height: 1.5;
+            margin: 1rem 0;
+        }
+
+        code {
+            background: var(--gray-100);
+            padding: 0.2rem 0.4rem;
+            border-radius: 4px;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 0.875rem;
+        }
+
+        pre code {
+            background: none;
+            padding: 0;
+        }
+
+        .diagram {
+            background: var(--gray-800);
+            color: #10b981;
+            padding: 1.5rem;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 0.7rem;
+            line-height: 1.4;
+            margin: 1rem 0;
+        }
+
+        .callout {
+            padding: 1rem 1.5rem;
+            border-radius: 6px;
+            margin: 1rem 0;
+        }
+
+        .callout-info {
+            background: #dbeafe;
+            border-left: 4px solid var(--primary);
+        }
+
+        .callout-success {
+            background: #d1fae5;
+            border-left: 4px solid var(--secondary);
+        }
+
+        .callout-warning {
+            background: #fef3c7;
+            border-left: 4px solid var(--warning);
+        }
+
+        .callout-danger {
+            background: #fee2e2;
+            border-left: 4px solid var(--danger);
+        }
+
+        .summary-box {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.5rem;
+            margin: 1.5rem 0;
+        }
+
+        .summary-card {
+            background: var(--gray-50);
+            border: 1px solid var(--gray-200);
+            border-radius: 8px;
+            padding: 1.5rem;
+        }
+
+        .summary-card h4 {
+            margin-top: 0;
+            color: var(--gray-600);
+            font-size: 0.875rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .summary-card .value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--gray-900);
+        }
+
+        .summary-card .value.savings {
+            color: var(--secondary);
+        }
+
+        .summary-card .value.cost {
+            color: var(--danger);
+        }
+
+        .summary-card .detail {
+            font-size: 0.875rem;
+            color: var(--gray-600);
+            margin-top: 0.5rem;
+        }
+
+        .comparison-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1.5rem;
+            margin: 1.5rem 0;
+        }
+
+        .comparison-card {
+            border: 2px solid var(--gray-200);
+            border-radius: 8px;
+            padding: 1.5rem;
+        }
+
+        .comparison-card.recommended {
+            border-color: var(--secondary);
+            background: linear-gradient(to bottom, #ecfdf5, white);
+        }
+
+        .comparison-card h4 {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .badge-success {
+            background: var(--secondary);
+            color: white;
+        }
+
+        .badge-warning {
+            background: var(--warning);
+            color: white;
+        }
+
+        ul, ol {
+            margin: 1rem 0 1rem 1.5rem;
+            color: var(--gray-600);
+        }
+
+        li {
+            margin-bottom: 0.5rem;
+        }
+
+        .timeline {
+            position: relative;
+            padding-left: 2rem;
+        }
+
+        .timeline::before {
+            content: '';
+            position: absolute;
+            left: 0.5rem;
+            top: 0;
+            bottom: 0;
+            width: 2px;
+            background: var(--gray-200);
+        }
+
+        .timeline-item {
+            position: relative;
+            margin-bottom: 1.5rem;
+        }
+
+        .timeline-item::before {
+            content: '';
+            position: absolute;
+            left: -1.5rem;
+            top: 0.5rem;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: var(--primary);
+        }
+
+        .timeline-item h4 {
+            margin: 0;
+            color: var(--primary);
+        }
+
+        .flow-diagram {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin: 1.5rem 0;
+            padding: 1rem;
+            background: var(--gray-50);
+            border-radius: 8px;
+        }
+
+        .flow-step {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: center;
+            padding: 1rem;
+            background: white;
+            border-radius: 8px;
+            border: 1px solid var(--gray-200);
+            min-width: 120px;
+        }
+
+        .flow-step .number {
+            width: 2rem;
+            height: 2rem;
+            border-radius: 50%;
+            background: var(--primary);
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
+
+        .flow-arrow {
+            font-size: 1.5rem;
+            color: var(--gray-400);
+        }
+
+        @media print {
+            body {
+                background: white;
+            }
+
+            section {
+                box-shadow: none;
+                border: 1px solid var(--gray-200);
+                break-inside: avoid;
+            }
+
+            .diagram, pre {
+                break-inside: avoid;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .comparison-grid {
+                grid-template-columns: 1fr;
+            }
+
+            header h1 {
+                font-size: 1.75rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>LayerV NHP: AWS Marketplace Integration</h1>
+            <div class="subtitle">Technical Architecture Proposal</div>
+            <div class="meta">December 2024 | Status: Draft for Review</div>
+        </div>
+    </header>
+
+    <div class="container">
+        <!-- Executive Summary -->
+        <section>
+            <h2>Executive Summary</h2>
+            <p>This document outlines the technical architecture for integrating LayerV NHP into the AWS Marketplace. At 1,000 projected customers in Year 1, the deployment model choice has significant cost implications.</p>
+
+            <div class="summary-box">
+                <div class="summary-card">
+                    <h4>Single-Tenant Cost</h4>
+                    <div class="value cost">$850K - $1M</div>
+                    <div class="detail">Annual infrastructure cost</div>
+                </div>
+                <div class="summary-card">
+                    <h4>Multi-Tenant Cost</h4>
+                    <div class="value savings">$15K - $30K</div>
+                    <div class="detail">Annual infrastructure cost</div>
+                </div>
+                <div class="summary-card">
+                    <h4>Annual Savings</h4>
+                    <div class="value savings">~$1M</div>
+                    <div class="detail">98% cost reduction</div>
+                </div>
+                <div class="summary-card">
+                    <h4>Payback Period</h4>
+                    <div class="value">~5 weeks</div>
+                    <div class="detail">Engineering investment ROI</div>
+                </div>
+            </div>
+
+            <div class="callout callout-success">
+                <strong>Recommendation:</strong> Invest in multi-tenant architecture. Engineering cost (~$100K one-time) pays back in less than 2 months.
+            </div>
+        </section>
+
+        <!-- Deployment Architecture -->
+        <section>
+            <h2>1. Deployment Architecture</h2>
+
+            <h3>1.1 Component Distribution</h3>
+            <div class="diagram">
+<pre>
+ LAYERV AWS ACCOUNT
+
+   SHARED CONTROL PLANE VPC
+
+    +-------------+  +-------------+  +-------------+
+    | NHP Server  |  | NHP Server  |  | NHP Server  |  (Auto-scaled)
+    |   (AZ-a)    |  |   (AZ-b)    |  |   (AZ-c)    |
+    +------+------+  +------+------+  +------+------+
+           |                |                |
+           +----------------+----------------+
+                            |
+                     +------+------+
+                     |     NLB     |  UDP 62206
+                     |  (Network)  |
+                     +------+------+
+                            |
+    +-------------+  +------+------+  +-------------+
+    |   NHP-DB    |  | NAT Gateway |  |  Config DB  |
+    |  (Primary)  |  |  (Shared)   |  |   (etcd)    |
+    +-------------+  +-------------+  +-------------+
+                            |
+                            | UDP 62206 (NHP Protocol)
+                            v
+ CUSTOMER AWS ACCOUNT
+
+   CUSTOMER VPC
+
+    +-------------+           +-----------------------------+
+    |   NHP-AC    |           |     PROTECTED RESOURCES     |
+    |  (Access    | --------> |  * Internal APIs            |
+    |  Controller)|           |  * Databases                |
+    |             |           |  * Admin Panels             |
+    | iptables/   |           |  * SSH/RDP                  |
+    | eBPF filter |           +-----------------------------+
+    +-------------+
+
+    Deployed via: AWS Marketplace AMI or ECS Container
+</pre>
+            </div>
+
+            <h3>1.2 Component Responsibilities</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Component</th>
+                        <th>Hosted By</th>
+                        <th>Function</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>NHP Server</strong></td>
+                        <td>LayerV</td>
+                        <td>Receives knocks, authenticates via IdP, authorizes access, instructs ACs</td>
+                    </tr>
+                    <tr>
+                        <td><strong>NHP-DB</strong></td>
+                        <td>LayerV</td>
+                        <td>Stores policies, user mappings, audit logs</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Config Store</strong></td>
+                        <td>LayerV</td>
+                        <td>etcd cluster for tenant configurations (multi-tenant mode)</td>
+                    </tr>
+                    <tr>
+                        <td><strong>NHP-AC</strong></td>
+                        <td>Customer</td>
+                        <td>Enforces access rules via iptables/eBPF, deployed in customer VPC</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Agent</strong></td>
+                        <td>End User</td>
+                        <td>Initiates NHP knock from user device (laptop, mobile)</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>1.3 Authentication Flow</h3>
+            <div class="flow-diagram">
+                <div class="flow-step">
+                    <div class="number">1</div>
+                    <div>Agent</div>
+                    <div style="font-size: 0.75rem; color: var(--gray-600);">Knock (UDP)</div>
+                </div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step">
+                    <div class="number">2</div>
+                    <div>NHP Server</div>
+                    <div style="font-size: 0.75rem; color: var(--gray-600);">Validate</div>
+                </div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step">
+                    <div class="number">3</div>
+                    <div>IdP (Okta)</div>
+                    <div style="font-size: 0.75rem; color: var(--gray-600);">OAuth/OIDC</div>
+                </div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step">
+                    <div class="number">4</div>
+                    <div>NHP-AC</div>
+                    <div style="font-size: 0.75rem; color: var(--gray-600);">Open Access</div>
+                </div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step">
+                    <div class="number">5</div>
+                    <div>Resource</div>
+                    <div style="font-size: 0.75rem; color: var(--gray-600);">Protected</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Multi-Tenancy Requirements -->
+        <section>
+            <h2>2. Multi-Tenancy Requirements</h2>
+
+            <h3>2.1 Current State</h3>
+            <div class="callout callout-warning">
+                <strong>Current limitation:</strong> NHP Server operates in a flat namespace. <code>OrganizationId</code> exists in the protocol but is metadata only - not used for routing or isolation.
+            </div>
+
+            <h3>2.2 Required Changes</h3>
+
+            <h4>Tenant Router (New Component)</h4>
+            <pre><code>type TenantRouter struct {
+    configStore  ConfigStore           // etcd or similar
+    tenantCache  map[string]*TenantConfig
+    cacheMutex   sync.RWMutex
+}
+
+func (r *TenantRouter) GetTenantConfig(orgId string) (*TenantConfig, error) {
+    // 1. Check cache
+    // 2. If miss, fetch from configStore
+    // 3. Validate tenant is active
+    // 4. Return tenant-specific config
+}</code></pre>
+
+            <h4>Files Requiring Modification</h4>
+            <table>
+                <thead>
+                    <tr>
+                        <th>File</th>
+                        <th>Changes Required</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>endpoints/server/config.go</code></td>
+                        <td>Add TenantRouter, ConfigStore interface</td>
+                    </tr>
+                    <tr>
+                        <td><code>endpoints/server/udpserver.go</code></td>
+                        <td>Route by OrganizationId before processing</td>
+                    </tr>
+                    <tr>
+                        <td><code>endpoints/server/msghandler.go</code></td>
+                        <td>Pass tenant context through handlers</td>
+                    </tr>
+                    <tr>
+                        <td><code>endpoints/server/tokenstore.go</code></td>
+                        <td>Namespace tokens by tenant</td>
+                    </tr>
+                    <tr>
+                        <td><code>New: tenant.go</code></td>
+                        <td>TenantRouter, TenantConfig, TenantCache</td>
+                    </tr>
+                    <tr>
+                        <td><code>New: configstore.go</code></td>
+                        <td>ConfigStore interface, etcd implementation</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>2.3 Engineering Estimate</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Task</th>
+                        <th>Complexity</th>
+                        <th>Estimate</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>TenantRouter + ConfigStore</td>
+                        <td>Medium</td>
+                        <td>2-3 weeks</td>
+                    </tr>
+                    <tr>
+                        <td>etcd integration</td>
+                        <td>Medium</td>
+                        <td>1-2 weeks</td>
+                    </tr>
+                    <tr>
+                        <td>Request path changes</td>
+                        <td>Medium</td>
+                        <td>2-3 weeks</td>
+                    </tr>
+                    <tr>
+                        <td>Per-tenant rate limiting</td>
+                        <td>Low</td>
+                        <td>1 week</td>
+                    </tr>
+                    <tr>
+                        <td>Tenant provisioning API</td>
+                        <td>Medium</td>
+                        <td>2 weeks</td>
+                    </tr>
+                    <tr>
+                        <td>Testing + hardening</td>
+                        <td>High</td>
+                        <td>2-3 weeks</td>
+                    </tr>
+                    <tr class="highlight-row">
+                        <td><strong>Total</strong></td>
+                        <td></td>
+                        <td><strong>10-14 weeks</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- Cost Analysis -->
+        <section>
+            <h2>3. Cost Analysis</h2>
+
+            <h3>3.1 Traffic Profile</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Traffic Type</th>
+                        <th>Per Authentication</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>NHP Protocol (knock + ack + AC ops)</td>
+                        <td>~1.8 KB</td>
+                    </tr>
+                    <tr>
+                        <td>OAuth/OIDC (IdP calls)</td>
+                        <td>~10 KB (first), ~2 KB (cached)</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>3.2 Usage Assumptions (1,000 Customers)</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Metric</th>
+                        <th>Value</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Users per customer (avg)</td>
+                        <td>100</td>
+                    </tr>
+                    <tr>
+                        <td>Knocks per user/day</td>
+                        <td>10</td>
+                    </tr>
+                    <tr>
+                        <td>Working days/month</td>
+                        <td>22</td>
+                    </tr>
+                    <tr class="highlight-row">
+                        <td><strong>Total knocks/month</strong></td>
+                        <td><strong>22 million</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>3.3 Cost Comparison</h3>
+            <div class="comparison-grid">
+                <div class="comparison-card">
+                    <h4>Single-Tenant (1 VPC per customer) <span class="badge badge-warning">Not Recommended</span></h4>
+                    <table>
+                        <tbody>
+                            <tr>
+                                <td>EC2 (t3.medium × 1000)</td>
+                                <td class="cost-high">$30,000/mo</td>
+                            </tr>
+                            <tr>
+                                <td>NAT Gateway (1000 × $33)</td>
+                                <td class="cost-high">$33,000/mo</td>
+                            </tr>
+                            <tr>
+                                <td>EBS Storage</td>
+                                <td>$4,000/mo</td>
+                            </tr>
+                            <tr>
+                                <td>CloudWatch</td>
+                                <td>$5,000/mo</td>
+                            </tr>
+                            <tr class="highlight-row">
+                                <td><strong>Monthly Total</strong></td>
+                                <td class="cost-high"><strong>~$72,000</strong></td>
+                            </tr>
+                            <tr class="highlight-row">
+                                <td><strong>Annual Total</strong></td>
+                                <td class="cost-high"><strong>~$864,000</strong></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                    <p style="margin-top: 1rem; font-size: 0.875rem;"><strong>NAT Gateway alone is 46% of total cost</strong></p>
+                </div>
+                <div class="comparison-card recommended">
+                    <h4>Multi-Tenant (Shared Control Plane) <span class="badge badge-success">Recommended</span></h4>
+                    <table>
+                        <tbody>
+                            <tr>
+                                <td>EC2 (c6i.2xlarge × 4 HA)</td>
+                                <td>$980/mo</td>
+                            </tr>
+                            <tr>
+                                <td>NAT Gateway (1 shared)</td>
+                                <td class="cost-savings">$33/mo</td>
+                            </tr>
+                            <tr>
+                                <td>etcd cluster (t3.medium × 3)</td>
+                                <td>$91/mo</td>
+                            </tr>
+                            <tr>
+                                <td>NLB + Storage + Monitoring</td>
+                                <td>$390/mo</td>
+                            </tr>
+                            <tr class="highlight-row">
+                                <td><strong>Monthly Total</strong></td>
+                                <td class="cost-savings"><strong>~$1,500</strong></td>
+                            </tr>
+                            <tr class="highlight-row">
+                                <td><strong>Annual Total</strong></td>
+                                <td class="cost-savings"><strong>~$18,000</strong></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                    <p style="margin-top: 1rem; font-size: 0.875rem;"><strong>98% cost reduction vs single-tenant</strong></p>
+                </div>
+            </div>
+
+            <h3>3.4 Break-Even Analysis</h3>
+            <div class="callout callout-info">
+                <p><strong>Multi-tenant engineering investment:</strong> ~$100,000 (14 weeks × 40 hrs × $150/hr)</p>
+                <p><strong>Monthly savings:</strong> $70,500</p>
+                <p><strong>Break-even:</strong> $100,000 / $70,500 = <strong>1.4 months (~5 weeks)</strong></p>
+            </div>
+        </section>
+
+        <!-- AWS Marketplace Integration -->
+        <section>
+            <h2>4. AWS Marketplace Integration</h2>
+
+            <h3>4.1 Product Listings</h3>
+            <div class="comparison-grid">
+                <div class="comparison-card">
+                    <h4>LayerV NHP Control Plane</h4>
+                    <table>
+                        <tbody>
+                            <tr><td>Product Type</td><td><strong>SaaS</strong></td></tr>
+                            <tr><td>Fulfillment</td><td>SaaS Contract + Registration</td></tr>
+                            <tr><td>Pricing</td><td>Per-user/month subscription</td></tr>
+                        </tbody>
+                    </table>
+                    <p style="margin-top: 1rem; font-size: 0.875rem;">Customer subscribes and receives OrganizationId + API key</p>
+                </div>
+                <div class="comparison-card">
+                    <h4>LayerV NHP Access Controller</h4>
+                    <table>
+                        <tbody>
+                            <tr><td>Product Type</td><td><strong>AMI / Container</strong></td></tr>
+                            <tr><td>Fulfillment</td><td>CloudFormation Quick Launch</td></tr>
+                            <tr><td>Pricing</td><td>Free (bundled with SaaS)</td></tr>
+                        </tbody>
+                    </table>
+                    <p style="margin-top: 1rem; font-size: 0.875rem;">One-click deployment into customer VPC</p>
+                </div>
+            </div>
+
+            <h3>4.2 Customer Onboarding Flow</h3>
+            <div class="timeline">
+                <div class="timeline-item">
+                    <h4>1. Subscribe to SaaS</h4>
+                    <p>Customer subscribes to LayerV NHP on AWS Marketplace</p>
+                </div>
+                <div class="timeline-item">
+                    <h4>2. Tenant Provisioned</h4>
+                    <p>LayerV auto-provisions: OrganizationId, API key, tenant config in etcd</p>
+                </div>
+                <div class="timeline-item">
+                    <h4>3. Deploy AC</h4>
+                    <p>Customer launches CloudFormation with OrganizationId + API key</p>
+                </div>
+                <div class="timeline-item">
+                    <h4>4. Configure Resources</h4>
+                    <p>Customer defines protected resources via LayerV console</p>
+                </div>
+                <div class="timeline-item">
+                    <h4>5. Deploy Agents</h4>
+                    <p>End users install agents from LayerV portal (Windows, macOS, Linux, iOS, Android)</p>
+                </div>
+            </div>
+
+            <h3>4.3 Pricing Tiers</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Tier</th>
+                        <th>Users</th>
+                        <th>Features</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Starter</strong></td>
+                        <td>1-25</td>
+                        <td>Basic access control, email support</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Team</strong></td>
+                        <td>26-100</td>
+                        <td>+ SSO integration, audit logs</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Business</strong></td>
+                        <td>101-500</td>
+                        <td>+ Custom policies, priority support</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Enterprise</strong></td>
+                        <td>500+</td>
+                        <td>+ PrivateLink, dedicated support, SLA</td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- PrivateLink -->
+        <section>
+            <h2>5. PrivateLink Support (Future)</h2>
+
+            <div class="callout callout-info">
+                <strong>Enterprise Feature:</strong> PrivateLink enables private connectivity between customer VPC and LayerV control plane without traversing the public internet.
+            </div>
+
+            <h3>Architecture</h3>
+            <div class="diagram">
+<pre>
+LAYERV VPC                                              CUSTOMER VPC
+
++------------------------+                    +------------------------+
+|                        |                    |                        |
+|  +------------------+  |                    |  +------------------+  |
+|  | NHP Servers      |  |                    |  | VPC Interface    |  |
+|  +--------+---------+  |                    |  | Endpoint         |  |
+|           |            |                    |  +--------+---------+  |
+|  +--------+---------+  |   AWS PrivateLink  |           |            |
+|  | Network Load     |  | <================> |  +--------+---------+  |
+|  | Balancer         |  |                    |  |      NHP-AC      |  |
+|  +--------+---------+  |  (Private)         |  +------------------+  |
+|           |            |                    |                        |
+|  +--------+---------+  |                    +------------------------+
+|  | VPC Endpoint     |  |
+|  | Service          |  |
+|  +------------------+  |
+|                        |
++------------------------+
+</pre>
+            </div>
+
+            <h3>Additional Cost</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Resource</th>
+                        <th>Monthly Cost</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>VPC Endpoint Service (LayerV side)</td>
+                        <td>$7.30</td>
+                    </tr>
+                    <tr>
+                        <td>Data processed</td>
+                        <td>$0.01/GB</td>
+                    </tr>
+                    <tr class="highlight-row">
+                        <td><strong>Per customer (Enterprise tier)</strong></td>
+                        <td><strong>~$8-10/mo</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- Recommendations -->
+        <section>
+            <h2>6. Recommendations & Timeline</h2>
+
+            <div class="comparison-grid">
+                <div class="comparison-card">
+                    <h4>Immediate (0-3 months)</h4>
+                    <ul>
+                        <li>Commit to multi-tenant architecture</li>
+                        <li>Begin multi-tenant development</li>
+                        <li>Create AWS Seller account</li>
+                        <li>Build AC CloudFormation template</li>
+                    </ul>
+                </div>
+                <div class="comparison-card">
+                    <h4>Short-term (3-6 months)</h4>
+                    <ul>
+                        <li>Launch SaaS listing (control plane)</li>
+                        <li>Launch AMI/Container listing (AC)</li>
+                        <li>Build customer console</li>
+                        <li>Implement AWS Metering Service</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="comparison-grid">
+                <div class="comparison-card">
+                    <h4>Medium-term (6-12 months)</h4>
+                    <ul>
+                        <li>Add PrivateLink support</li>
+                        <li>Multi-region deployment (US, EU, APAC)</li>
+                        <li>SOC 2 / ISO 27001 certification</li>
+                        <li>Advanced features (per-tenant keys)</li>
+                    </ul>
+                </div>
+                <div class="comparison-card">
+                    <h4>Open Questions</h4>
+                    <ul>
+                        <li>Final pricing model (per-user vs hybrid)?</li>
+                        <li>Free tier for evaluation?</li>
+                        <li>Support SLA per tier?</li>
+                        <li>Compliance requirements (FedRAMP, HIPAA)?</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <!-- Summary -->
+        <section>
+            <h2>Summary</h2>
+
+            <div class="summary-box">
+                <div class="summary-card">
+                    <h4>Investment Required</h4>
+                    <div class="value">~$100K</div>
+                    <div class="detail">Multi-tenant engineering (10-14 weeks)</div>
+                </div>
+                <div class="summary-card">
+                    <h4>Annual Savings</h4>
+                    <div class="value savings">~$850K</div>
+                    <div class="detail">At 1,000 customers</div>
+                </div>
+                <div class="summary-card">
+                    <h4>Cost per Customer</h4>
+                    <div class="value savings">$1.50/mo</div>
+                    <div class="detail">vs $87/mo single-tenant</div>
+                </div>
+                <div class="summary-card">
+                    <h4>ROI</h4>
+                    <div class="value savings">850%</div>
+                    <div class="detail">First year return</div>
+                </div>
+            </div>
+
+            <div class="callout callout-success">
+                <strong>Bottom Line:</strong> Multi-tenant architecture is essential for AWS Marketplace success at scale. The investment pays for itself within 5 weeks and enables a competitive cost structure for customers.
+            </div>
+        </section>
+    </div>
+</body>
+</html>
