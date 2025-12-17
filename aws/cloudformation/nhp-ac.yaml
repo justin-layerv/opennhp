@@ -87,8 +87,8 @@ Parameters:
       - c6i.xlarge
 
   KeyPairName:
-    Type: AWS::EC2::KeyPair::KeyName
-    Description: EC2 Key Pair for SSH access (optional)
+    Type: String
+    Description: EC2 Key Pair for SSH access (optional, leave empty to skip)
     Default: ""
 
   # Protected Resources
@@ -143,6 +143,12 @@ Resources:
           ToPort: 62206
           CidrIp: 0.0.0.0/0
           Description: NHP Protocol from LayerV Server
+        # Health check endpoint
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 10.0.0.0/8
+          Description: Health check endpoint
         # SSH for management (optional, restrict in production)
         - IpProtocol: tcp
           FromPort: 22
@@ -195,7 +201,34 @@ Resources:
               - Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
                 Resource: !Ref ACSecret
+        - PolicyName: ACCustomMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: LayerV/NHP
+        - PolicyName: ECRPull
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource:
+                  - !Sub arn:aws:ecr:${AWS::Region}:*:repository/layerv/*
       Tags:
         - Key: layerv:organization
           Value: !Ref OrganizationId
@@ -207,18 +240,20 @@ Resources:
       Roles:
         - !Ref ACInstanceRole
 
-  # Secrets Manager for API Key
+  # Secrets Manager for API Key and generated keys
   ACSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub layerv-nhp-ac-${AWS::StackName}
-      Description: LayerV NHP AC credentials
+      Description: LayerV NHP AC credentials and keys
       SecretString: !Sub |
         {
           "organization_id": "${OrganizationId}",
           "api_key": "${ACApiKey}",
           "server_endpoint": "${LayerVServerEndpoint}",
-          "server_public_key": "${LayerVServerPublicKey}"
+          "server_public_key": "${LayerVServerPublicKey}",
+          "ac_private_key": "",
+          "ac_public_key": ""
         }
       Tags:
         - Key: layerv:organization
@@ -262,45 +297,77 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          set -e
+          set -ex
 
-          # Log everything
-          exec > >(tee /var/log/user-data.log) 2>&1
-          echo "Starting LayerV NHP-AC installation..."
+          # Log everything to file and console
+          exec > >(tee /var/log/user-data.log | logger -t user-data) 2>&1
+          echo "Starting LayerV NHP-AC installation at $(date)"
 
-          # Update system
-          apt-get update
-          apt-get install -y awscli jq docker.io iptables ipset
+          # Install dependencies
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y awscli jq docker.io iptables ipset socat curl python3-pip
 
-          # Enable Docker
+          # Enable and start Docker
           systemctl enable docker
           systemctl start docker
 
+          # Wait for Docker to be ready
+          for i in {1..30}; do docker info && break || sleep 2; done
+
           # Get secrets from Secrets Manager
+          SECRET_ARN="${ACSecret}"
+          REGION="${AWS::Region}"
           SECRET=$(aws secretsmanager get-secret-value \
-            --secret-id ${ACSecret} \
-            --region ${AWS::Region} \
+            --secret-id "$SECRET_ARN" \
+            --region "$REGION" \
             --query SecretString \
             --output text)
 
-          ORG_ID=$(echo $SECRET | jq -r '.organization_id')
-          API_KEY=$(echo $SECRET | jq -r '.api_key')
-          SERVER_ENDPOINT=$(echo $SECRET | jq -r '.server_endpoint')
-          SERVER_PUBKEY=$(echo $SECRET | jq -r '.server_public_key')
+          ORG_ID=$(echo "$SECRET" | jq -r '.organization_id')
+          API_KEY=$(echo "$SECRET" | jq -r '.api_key')
+          SERVER_ENDPOINT=$(echo "$SECRET" | jq -r '.server_endpoint')
+          SERVER_PUBKEY=$(echo "$SECRET" | jq -r '.server_public_key')
+          EXISTING_PRIVKEY=$(echo "$SECRET" | jq -r '.ac_private_key // empty')
+
+          # Get instance metadata using IMDSv2
+          TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+          INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+          LOCAL_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+          AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
 
           # Create config directory
           mkdir -p /opt/layerv/nhp-ac/etc
+          mkdir -p /opt/layerv/nhp-ac/log
 
-          # Generate AC keypair (using openssl for ed25519)
-          AC_PRIVKEY=$(openssl genpkey -algorithm ED25519 2>/dev/null | openssl pkey -outform DER 2>/dev/null | tail -c 32 | base64)
-          AC_PUBKEY=$(openssl pkey -pubout -outform DER 2>/dev/null | tail -c 32 | base64)
+          # Generate Curve25519 keypair (only if not already generated)
+          if [ -z "$EXISTING_PRIVKEY" ] || [ "$EXISTING_PRIVKEY" = "null" ]; then
+            echo "Generating new Curve25519 keypair..."
+            # Generate 32 random bytes with proper clamping for Curve25519
+            AC_PRIVKEY=$(python3 -c '
+          import os, base64
+          key = bytearray(os.urandom(32))
+          # Apply Curve25519 clamping
+          key[0] &= 248
+          key[31] = (key[31] & 127) | 64
+          print(base64.b64encode(bytes(key)).decode())
+          ')
 
-          # Get instance metadata
-          INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
-          LOCAL_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+            # Update secret with generated key
+            UPDATED_SECRET=$(echo "$SECRET" | jq --arg pk "$AC_PRIVKEY" '.ac_private_key = $pk')
+            aws secretsmanager put-secret-value \
+              --secret-id "$SECRET_ARN" \
+              --secret-string "$UPDATED_SECRET" \
+              --region "$REGION"
+
+            echo "Generated and stored new private key"
+          else
+            AC_PRIVKEY="$EXISTING_PRIVKEY"
+            echo "Using existing private key from secrets"
+          fi
 
           # Create config.toml
-          cat > /opt/layerv/nhp-ac/etc/config.toml << EOF
+          cat > /opt/layerv/nhp-ac/etc/config.toml << CONFIGEOF
           # LayerV NHP-AC Configuration
           # Auto-generated by CloudFormation
 
@@ -313,10 +380,10 @@ Resources:
           AuthServiceId = "$ORG_ID"
           ResourceIds = ["default"]
           FilterMode = 0
-          EOF
+          CONFIGEOF
 
           # Create server.toml
-          cat > /opt/layerv/nhp-ac/etc/server.toml << EOF
+          cat > /opt/layerv/nhp-ac/etc/server.toml << SERVEREOF
           # LayerV NHP Server Connection
 
           [[Servers]]
@@ -325,19 +392,19 @@ Resources:
           Port = 62206
           PubKeyBase64 = "$SERVER_PUBKEY"
           ExpireTime = 1924991999
-          EOF
+          SERVEREOF
 
           # Create resource.toml
-          cat > /opt/layerv/nhp-ac/etc/resource.toml << EOF
+          cat > /opt/layerv/nhp-ac/etc/resource.toml << RESOURCEEOF
           # Protected Resources
 
           [[Resources]]
           AuthServiceId = "$ORG_ID"
           ResourceId = "default"
           ServerAddr = "$SERVER_ENDPOINT"
-          EOF
+          RESOURCEEOF
 
-          # Set up iptables defaults
+          # Set up iptables
           cat > /opt/layerv/nhp-ac/iptables_setup.sh << 'IPTABLES_EOF'
           #!/bin/bash
           # LayerV NHP-AC iptables setup
@@ -353,7 +420,8 @@ Resources:
           iptables -A NHP_FILTER -j DROP
 
           # Apply to protected ports
-          for port in ${ProtectedPorts}; do
+          PROTECTED_PORTS="${ProtectedPorts}"
+          for port in $(echo $PROTECTED_PORTS | tr ',' ' '); do
             iptables -C INPUT -p tcp --dport $port -j NHP_FILTER 2>/dev/null || \
             iptables -I INPUT -p tcp --dport $port -j NHP_FILTER
           done
@@ -365,37 +433,96 @@ Resources:
           # Run iptables setup
           /opt/layerv/nhp-ac/iptables_setup.sh
 
-          # Pull and run NHP-AC container
-          # TODO: Replace with actual LayerV container registry
-          # docker pull layerv/nhp-ac:latest
-          # docker run -d \
-          #   --name nhp-ac \
-          #   --net=host \
-          #   --cap-add=NET_ADMIN \
-          #   -v /opt/layerv/nhp-ac/etc:/nhp-ac/etc \
-          #   layerv/nhp-ac:latest
+          # Create health check script
+          cat > /opt/layerv/nhp-ac/healthcheck.sh << 'HEALTHEOF'
+          #!/bin/bash
+          # Health check - verify NHP AC process is running
+          if docker ps | grep -q nhp-ac; then
+            echo "healthy"
+            exit 0
+          elif pgrep -f nhp-acd > /dev/null; then
+            echo "healthy"
+            exit 0
+          else
+            echo "unhealthy"
+            exit 1
+          fi
+          HEALTHEOF
+          chmod +x /opt/layerv/nhp-ac/healthcheck.sh
 
-          # For now, create systemd service for binary
-          cat > /etc/systemd/system/nhp-ac.service << 'SERVICE_EOF'
+          # Create health check HTTP server
+          cat > /opt/layerv/nhp-ac/health-server.sh << 'SERVEREOF'
+          #!/bin/bash
+          while true; do
+            if /opt/layerv/nhp-ac/healthcheck.sh > /dev/null 2>&1; then
+              RESPONSE="HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok"
+            else
+              RESPONSE="HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nerror"
+            fi
+            echo -e "$RESPONSE" | socat - TCP-LISTEN:8080,reuseaddr
+          done
+          SERVEREOF
+          chmod +x /opt/layerv/nhp-ac/health-server.sh
+
+          # Create systemd service for health check
+          cat > /etc/systemd/system/nhp-health.service << 'SVCEOF'
           [Unit]
-          Description=LayerV NHP Access Controller
+          Description=NHP Health Check Server
           After=network.target
 
           [Service]
           Type=simple
-          ExecStart=/opt/layerv/nhp-ac/nhp-acd run
+          ExecStart=/opt/layerv/nhp-ac/health-server.sh
           Restart=always
           RestartSec=5
-          WorkingDirectory=/opt/layerv/nhp-ac
-          Environment=NHP_CONFIG_PATH=/opt/layerv/nhp-ac/etc
 
           [Install]
           WantedBy=multi-user.target
-          SERVICE_EOF
+          SVCEOF
 
-          # Enable service (will start when binary is deployed)
+          # Create systemd service for NHP-AC container
+          cat > /etc/systemd/system/nhp-ac.service << 'SVCEOF'
+          [Unit]
+          Description=LayerV NHP Access Controller
+          After=network.target docker.service
+          Requires=docker.service
+
+          [Service]
+          Type=simple
+          Restart=always
+          RestartSec=10
+          ExecStartPre=-/usr/bin/docker stop nhp-ac
+          ExecStartPre=-/usr/bin/docker rm nhp-ac
+          # Try ECR first, fall back to public registry
+          ExecStartPre=/bin/bash -c 'aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin 084375564552.dkr.ecr.${AWS::Region}.amazonaws.com || true'
+          ExecStartPre=/bin/bash -c 'docker pull 084375564552.dkr.ecr.${AWS::Region}.amazonaws.com/layerv/nhp-ac:latest || docker pull layerv/nhp-ac:latest || true'
+          ExecStart=/usr/bin/docker run --rm --name nhp-ac \
+            --net=host \
+            --cap-add=NET_ADMIN \
+            -v /opt/layerv/nhp-ac/etc:/etc/nhp:ro \
+            -v /opt/layerv/nhp-ac/log:/var/log/nhp \
+            layerv/nhp-ac:latest
+          ExecStop=/usr/bin/docker stop nhp-ac
+
+          [Install]
+          WantedBy=multi-user.target
+          SVCEOF
+
+          # Start services
           systemctl daemon-reload
-          systemctl enable nhp-ac
+          systemctl enable nhp-health nhp-ac
+          systemctl start nhp-health
+
+          # Try to start NHP-AC (may fail if image not available)
+          systemctl start nhp-ac || echo "NHP-AC start deferred - image may not be available"
+
+          # Send custom metric for successful boot
+          aws cloudwatch put-metric-data \
+            --namespace "LayerV/NHP" \
+            --metric-name "ACInstanceBoot" \
+            --value 1 \
+            --dimensions "OrganizationId=$ORG_ID,InstanceId=$INSTANCE_ID" \
+            --region "$REGION"
 
           # Signal CloudFormation
           /opt/aws/bin/cfn-signal -e $? \
@@ -403,9 +530,9 @@ Resources:
             --resource ACInstance \
             --region ${AWS::Region}
 
-          echo "LayerV NHP-AC installation complete"
-          echo "AC Public Key: $AC_PUBKEY"
-          echo "Please register this AC with LayerV using the public key above"
+          echo "LayerV NHP-AC installation complete at $(date)"
+          echo "Instance ID: $INSTANCE_ID"
+          echo "Organization: $ORG_ID"
 
       Tags:
         - Key: Name
@@ -417,7 +544,7 @@ Resources:
 
     CreationPolicy:
       ResourceSignal:
-        Timeout: PT10M
+        Timeout: PT15M
 
   # CloudWatch Alarm for AC health
   ACHealthAlarm:
@@ -462,11 +589,17 @@ Outputs:
     Export:
       Name: !Sub ${AWS::StackName}-ACLogGroupName
 
+  ACSecretArn:
+    Description: ARN of the secret containing AC credentials
+    Value: !Ref ACSecret
+    Export:
+      Name: !Sub ${AWS::StackName}-ACSecretArn
+
   NextSteps:
     Description: Next steps after deployment
     Value: |
-      1. Note the AC Instance ID and Private IP from outputs above
-      2. The AC will auto-register with LayerV using your Organization ID
-      3. Configure protected resources in the LayerV console
-      4. Deploy agents to your users
-      5. Check /var/log/user-data.log on the instance for setup details
+      1. The AC has been deployed and configured
+      2. Check /var/log/user-data.log for setup details
+      3. The AC's private key is stored in Secrets Manager
+      4. Deploy the NHP-AC container image to complete setup
+      5. Monitor health via CloudWatch alarm
