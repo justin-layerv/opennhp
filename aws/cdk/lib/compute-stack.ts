@@ -46,7 +46,6 @@ export class ComputeStack extends cdk.Stack {
   public readonly asg: autoscaling.AutoScalingGroup;
   public readonly serverLogGroup: logs.ILogGroup;
   public readonly serverSecret: secretsmanager.ISecret;
-  public readonly cloudMapNamespace: servicediscovery.PrivateDnsNamespace;
   public readonly cloudMapService: servicediscovery.Service;
 
   constructor(scope: Construct, id: string, props: ComputeStackProps) {
@@ -64,7 +63,8 @@ export class ComputeStack extends cdk.Stack {
 const crypto = require('crypto');
 
 exports.handler = async (event) => {
-  console.log('Event:', JSON.stringify(event));
+  // DO NOT log the full event - it may contain sensitive data
+  console.log('RequestType:', event.RequestType);
 
   if (event.RequestType === 'Delete') {
     return { PhysicalResourceId: event.PhysicalResourceId };
@@ -118,7 +118,8 @@ exports.handler = async (event) => {
 const { SecretsManagerClient, PutSecretValueCommand, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
 
 exports.handler = async (event) => {
-  console.log('Event:', JSON.stringify(event));
+  // DO NOT log the full event - it contains private keys
+  console.log('RequestType:', event.RequestType, 'SecretId:', event.ResourceProperties?.SecretId);
 
   if (event.RequestType === 'Delete') {
     return { PhysicalResourceId: event.PhysicalResourceId };
@@ -188,16 +189,10 @@ exports.handler = async (event) => {
         : cdk.RemovalPolicy.DESTROY,
     });
 
-    // Cloud Map namespace for service discovery (NHP-compliant - no inbound health checks)
-    this.cloudMapNamespace = new servicediscovery.PrivateDnsNamespace(this, 'CloudMapNamespace', {
-      name: `nhp.${config.environment}.layerv.internal`,
-      vpc,
-      description: 'Private DNS namespace for NHP service discovery',
-    });
-
     // Cloud Map service with custom health checks (instance self-reports)
+    // Uses the namespace created in DataStack for consolidated service discovery
     this.cloudMapService = new servicediscovery.Service(this, 'CloudMapService', {
-      namespace: this.cloudMapNamespace,
+      namespace: dataStack.namespace,
       name: 'server',
       description: 'NHP Server instances',
       // Custom health check - instances report their own health via API
@@ -216,7 +211,6 @@ exports.handler = async (event) => {
       assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
       managedPolicies: [
         iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore'),
-        iam.ManagedPolicy.fromAwsManagedPolicyName('CloudWatchAgentServerPolicy'),
       ],
     });
 
@@ -260,11 +254,19 @@ exports.handler = async (event) => {
       allowAllOutbound: true,
     });
 
-    // Allow NHP protocol (UDP 62206) - the ONLY inbound port
+    // Allow NHP protocol (UDP 62206) - the ONLY publicly exposed port
     serverSecurityGroup.addIngressRule(
       ec2.Peer.anyIpv4(),
       ec2.Port.udp(62206),
       'NHP Protocol - only exposed port'
+    );
+
+    // Allow TCP 22 from NLB for health checks ONLY (not exposed to internet)
+    // NLB health checks come from within the VPC, this is internal only
+    serverSecurityGroup.addIngressRule(
+      ec2.Peer.ipv4(vpc.vpcCidrBlock),
+      ec2.Port.tcp(22),
+      'NLB health check via SSH (internal only)'
     );
 
     // User data script for NHP Server - NO HTTP health check
@@ -339,13 +341,14 @@ REMOTEEOF
       '',
       '# Cloud Map service discovery configuration',
       `CLOUDMAP_SERVICE_ID="${this.cloudMapService.serviceId}"`,
-      `CLOUDMAP_NAMESPACE="${this.cloudMapNamespace.namespaceName}"`,
       '',
       '# Create Cloud Map registration script (NHP-compliant - no inbound connections)',
-      'cat > /opt/layerv/nhp-server/cloudmap-register.sh << \'CMEOF\'',
+      `cat > /opt/layerv/nhp-server/cloudmap-register.sh << 'CMEOF'`,
       '#!/bin/bash',
       '# Register this instance with Cloud Map',
       'set -e',
+      '',
+      `SERVICE_ID="${this.cloudMapService.serviceId}"`,
       '',
       'TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")',
       'INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)',
@@ -353,10 +356,10 @@ REMOTEEOF
       'REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)',
       'AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)',
       '',
-      'echo "Registering instance $INSTANCE_ID ($LOCAL_IP) with Cloud Map"',
+      'echo "Registering instance $INSTANCE_ID ($LOCAL_IP) with Cloud Map service $SERVICE_ID"',
       '',
       'aws servicediscovery register-instance \\',
-      '  --service-id "$CLOUDMAP_SERVICE_ID" \\',
+      '  --service-id "$SERVICE_ID" \\',
       '  --instance-id "$INSTANCE_ID" \\',
       '  --attributes "AWS_INSTANCE_IPV4=$LOCAL_IP,AVAILABILITY_ZONE=$AZ,NHP_PORT=62206" \\',
       '  --region "$REGION"',
@@ -366,19 +369,21 @@ REMOTEEOF
       'chmod +x /opt/layerv/nhp-server/cloudmap-register.sh',
       '',
       '# Create Cloud Map deregistration script',
-      'cat > /opt/layerv/nhp-server/cloudmap-deregister.sh << \'CMEOF\'',
+      `cat > /opt/layerv/nhp-server/cloudmap-deregister.sh << 'CMEOF'`,
       '#!/bin/bash',
       '# Deregister this instance from Cloud Map',
       'set -e',
+      '',
+      `SERVICE_ID="${this.cloudMapService.serviceId}"`,
       '',
       'TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")',
       'INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)',
       'REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)',
       '',
-      'echo "Deregistering instance $INSTANCE_ID from Cloud Map"',
+      'echo "Deregistering instance $INSTANCE_ID from Cloud Map service $SERVICE_ID"',
       '',
       'aws servicediscovery deregister-instance \\',
-      '  --service-id "$CLOUDMAP_SERVICE_ID" \\',
+      '  --service-id "$SERVICE_ID" \\',
       '  --instance-id "$INSTANCE_ID" \\',
       '  --region "$REGION" || true',
       '',
@@ -387,9 +392,11 @@ REMOTEEOF
       'chmod +x /opt/layerv/nhp-server/cloudmap-deregister.sh',
       '',
       '# Create health monitoring script (reports to Cloud Map, no inbound HTTP)',
-      'cat > /opt/layerv/nhp-server/health-monitor.sh << \'HEALTHEOF\'',
+      `cat > /opt/layerv/nhp-server/health-monitor.sh << 'HEALTHEOF'`,
       '#!/bin/bash',
       '# NHP-compliant health monitoring - updates Cloud Map custom health status',
+      '',
+      `SERVICE_ID="${this.cloudMapService.serviceId}"`,
       '',
       'TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")',
       'INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)',
@@ -405,7 +412,7 @@ REMOTEEOF
       '',
       '  # Update Cloud Map custom health status',
       '  aws servicediscovery update-instance-custom-health-status \\',
-      '    --service-id "$CLOUDMAP_SERVICE_ID" \\',
+      '    --service-id "$SERVICE_ID" \\',
       '    --instance-id "$INSTANCE_ID" \\',
       '    --status "$HEALTH_STATUS" \\',
       '    --region "$REGION" 2>/dev/null || true',
@@ -416,14 +423,13 @@ REMOTEEOF
       'chmod +x /opt/layerv/nhp-server/health-monitor.sh',
       '',
       '# Create systemd service for health monitor',
-      'cat > /etc/systemd/system/nhp-health-monitor.service << \'SVCEOF\'',
+      'cat > /etc/systemd/system/nhp-health-monitor.service << SVCEOF',
       '[Unit]',
       'Description=NHP Health Monitor (Cloud Map)',
       'After=network.target docker.service nhp-cloudmap-register.service',
       '',
       '[Service]',
       'Type=simple',
-      `Environment="CLOUDMAP_SERVICE_ID=${this.cloudMapService.serviceId}"`,
       'ExecStart=/opt/layerv/nhp-server/health-monitor.sh',
       'Restart=always',
       'RestartSec=10',
@@ -433,7 +439,7 @@ REMOTEEOF
       'SVCEOF',
       '',
       '# Create systemd service for Cloud Map registration',
-      'cat > /etc/systemd/system/nhp-cloudmap-register.service << \'SVCEOF\'',
+      'cat > /etc/systemd/system/nhp-cloudmap-register.service << SVCEOF',
       '[Unit]',
       'Description=Register NHP Server with Cloud Map',
       'After=network-online.target',
@@ -441,10 +447,9 @@ REMOTEEOF
       '',
       '[Service]',
       'Type=oneshot',
-      `Environment="CLOUDMAP_SERVICE_ID=${this.cloudMapService.serviceId}"`,
       'ExecStart=/opt/layerv/nhp-server/cloudmap-register.sh',
       'RemainAfterExit=yes',
-      `ExecStop=/opt/layerv/nhp-server/cloudmap-deregister.sh`,
+      'ExecStop=/opt/layerv/nhp-server/cloudmap-deregister.sh',
       '',
       '[Install]',
       'WantedBy=multi-user.target',
@@ -559,25 +564,23 @@ REMOTEEOF
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
     });
 
-    // UDP Target Group - health checks disabled via high thresholds
-    // NLB requires health checks, but we make them very permissive
-    // Real health monitoring is done via Cloud Map service discovery
+    // UDP Target Group with TCP health check on SSH port
+    // NLB requires health checks for UDP targets - we use SSH (port 22) which is
+    // available on all Ubuntu instances. This is VPC-internal only, not exposed to internet.
+    // Real health monitoring is done via Cloud Map service discovery.
     const udpTargetGroup = new elbv2.NetworkTargetGroup(this, 'UdpTargetGroup', {
       targetGroupName: `nhp-udp-${config.environment}`,
       vpc,
       port: 62206,
       protocol: elbv2.Protocol.UDP,
       targetType: elbv2.TargetType.INSTANCE,
-      // For UDP, NLB requires TCP/HTTP health checks on a different port
-      // Since we don't expose any TCP ports, we disable effective health checking
-      // by setting very high thresholds - instances stay healthy unless EC2 fails
       healthCheck: {
         enabled: true,
         protocol: elbv2.Protocol.TCP,
-        port: '62206', // This will fail (UDP port), but with high thresholds it won't matter
+        port: '22', // SSH - available on Ubuntu, VPC-internal health check only
         interval: cdk.Duration.seconds(30),
         healthyThresholdCount: 2,
-        unhealthyThresholdCount: 10, // Very high - effectively disabled
+        unhealthyThresholdCount: 3,
       },
       deregistrationDelay: cdk.Duration.seconds(30),
     });
@@ -611,12 +614,6 @@ REMOTEEOF
       exportName: `${this.stackName}-ServerSecretArn`,
     });
 
-    new cdk.CfnOutput(this, 'CloudMapNamespaceArn', {
-      value: this.cloudMapNamespace.namespaceArn,
-      description: 'Cloud Map namespace ARN',
-      exportName: `${this.stackName}-CloudMapNamespaceArn`,
-    });
-
     new cdk.CfnOutput(this, 'CloudMapServiceArn', {
       value: this.cloudMapService.serviceArn,
       description: 'Cloud Map service ARN',
@@ -624,7 +621,7 @@ REMOTEEOF
     });
 
     new cdk.CfnOutput(this, 'CloudMapDnsName', {
-      value: `server.${this.cloudMapNamespace.namespaceName}`,
+      value: `server.${dataStack.namespace.namespaceName}`,
       description: 'Cloud Map DNS name for service discovery',
       exportName: `${this.stackName}-CloudMapDnsName`,
     });
