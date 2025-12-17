@@ -124,6 +124,19 @@ export class DataStack extends cdk.Stack {
       'HTTPS for AWS APIs'
     );
 
+    // NFS port for EFS access (within security group)
+    etcdSecurityGroup.addIngressRule(
+      etcdSecurityGroup,
+      ec2.Port.tcp(2049),
+      'NFS for EFS access'
+    );
+
+    etcdSecurityGroup.addEgressRule(
+      etcdSecurityGroup,
+      ec2.Port.tcp(2049),
+      'NFS outbound for EFS access'
+    );
+
     // EFS for persistent etcd data
     const fileSystem = new efs.FileSystem(this, 'EtcdEfs', {
       vpc,
