@@ -1,170 +1,143 @@
-# LayerV NHP - AWS Deployment
+# LayerV NHP Server - AWS Infrastructure
 
-This directory contains AWS deployment artifacts for LayerV NHP.
+This directory contains AWS CDK infrastructure for the LayerV NHP Server control plane.
+
+> **Note**: AC deployment infrastructure has moved to the [traefik-plugins](https://github.com/layerv/traefik-plugins) repository.
 
 ## Directory Structure
 
 ```
 aws/
-├── cloudformation/
-│   └── nhp-ac.yaml          # CloudFormation template for AC deployment
-├── scripts/
-│   └── deploy-ac.sh         # Quick-start deployment script
-├── configs/
-│   └── onboarding-template.yaml  # Customer onboarding form
+├── cdk/                    # AWS CDK infrastructure
+│   ├── lib/
+│   │   ├── compute-stack.ts    # NHP Server ASG, NLB, Cloud Map
+│   │   ├── data-stack.ts       # etcd, Secrets Manager
+│   │   ├── network-stack.ts    # VPC, subnets, security groups
+│   │   ├── ecr-stack.ts        # ECR repositories
+│   │   ├── dns-stack.ts        # Route 53
+│   │   └── monitoring-stack.ts # CloudWatch (optional)
+│   ├── bin/app.ts              # CDK app entry point
+│   └── package.json
+├── docker/
+│   └── Dockerfile.server       # NHP Server container image
 └── README.md
 ```
 
+## Prerequisites
+
+1. Node.js 18+ and npm
+2. AWS CLI configured with appropriate credentials
+3. AWS CDK CLI: `npm install -g aws-cdk`
+
 ## Quick Start
 
-### Prerequisites
-
-1. AWS CLI installed and configured (`aws configure`)
-2. LayerV Organization ID and API Key (from subscription)
-3. Target VPC and Subnet IDs
-
-### Deploy NHP-AC
-
 ```bash
-./scripts/deploy-ac.sh \
-  --org-id your-organization-id \
-  --api-key your-api-key \
-  --vpc-id vpc-0123456789abcdef0 \
-  --subnet-id subnet-0123456789abcdef0
+cd cdk
+npm install
+npx cdk bootstrap  # First time only
+
+# Deploy all stacks
+npx cdk deploy --all -c environment=dev
+
+# Deploy specific stack
+npx cdk deploy LayerV-NHP-Compute-dev -c environment=dev
 ```
 
-### Full Options
+## Stacks
 
-```bash
-./scripts/deploy-ac.sh \
-  --org-id acme-corp \
-  --api-key sk_live_xxxxxxxxxxxx \
-  --vpc-id vpc-0123456789abcdef0 \
-  --subnet-id subnet-0123456789abcdef0 \
-  --stack-name my-nhp-ac \
-  --instance-type t3.medium \
-  --region us-east-1 \
-  --key-pair my-keypair \
-  --protected-cidrs "10.0.0.0/8,172.16.0.0/12" \
-  --protected-ports "22,443,3306,5432"
-```
+### EcrStack
+ECR repositories for container images:
+- `layerv/nhp-server` - NHP Server image
+- `layerv/nhp-ac` - AC image (pulled by customers)
 
-## CloudFormation Template
+### NetworkStack
+VPC infrastructure:
+- Multi-AZ VPC (10.100.0.0/16)
+- Public, private, and isolated subnets
+- NAT Gateways for outbound access
 
-The `cloudformation/nhp-ac.yaml` template creates:
+### DataStack
+Data layer:
+- etcd cluster for multi-tenant configuration
+- Secrets Manager for keys
+- EFS for persistent storage
 
-- EC2 instance running NHP-AC
-- Security Group with NHP protocol rules
-- IAM Role with minimal permissions
-- Secrets Manager secret for credentials
-- CloudWatch Log Group for AC logs
-- CloudWatch Alarm for instance health
+### ComputeStack
+NHP Server compute:
+- Auto Scaling Group with Launch Template
+- Network Load Balancer (UDP 62206)
+- Cloud Map service discovery
+- Route 53 DNS integration
 
-### Parameters
-
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| OrganizationId | Yes | LayerV Organization ID |
-| ACApiKey | Yes | LayerV API Key |
-| VpcId | Yes | VPC for deployment |
-| SubnetId | Yes | Subnet for AC instance |
-| InstanceType | No | EC2 instance type (default: t3.medium) |
-| KeyPairName | No | SSH key pair |
-| ProtectedCIDRs | No | CIDRs of protected resources |
-| ProtectedPorts | No | Ports to protect |
-
-### Deploy via AWS Console
-
-1. Go to CloudFormation in AWS Console
-2. Create Stack → Upload template
-3. Upload `cloudformation/nhp-ac.yaml`
-4. Fill in parameters
-5. Acknowledge IAM capabilities
-6. Create Stack
-
-## Customer Onboarding
-
-Use `configs/onboarding-template.yaml` to collect customer information:
-
-1. Send template to customer
-2. Customer fills out and returns
-3. Provision customer in LayerV backend
-4. Provide Organization ID and API Key
-5. Customer runs deployment script
+### DnsStack
+DNS configuration:
+- Route 53 hosted zone
+- NLB alias records
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                      CUSTOMER AWS ACCOUNT                       │
-│                                                                 │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │                      Customer VPC                         │  │
-│  │                                                           │  │
-│  │  ┌─────────────┐                 ┌─────────────────────┐  │  │
-│  │  │   NHP-AC    │                 │ Protected Resources │  │  │
-│  │  │  (EC2)      │ ──────────────> │  - Databases        │  │  │
-│  │  │             │  Opens access   │  - APIs             │  │  │
-│  │  │ iptables/   │  via iptables   │  - SSH/RDP          │  │  │
-│  │  │ ipset       │                 │                     │  │  │
-│  │  └──────┬──────┘                 └─────────────────────┘  │  │
-│  │         │                                                 │  │
-│  └─────────┼─────────────────────────────────────────────────┘  │
-│            │ UDP 62206                                          │
-└────────────┼────────────────────────────────────────────────────┘
-             │
-             ▼
-┌────────────────────────────────────────┐
-│           LayerV Cloud                 │
-│  ┌──────────────────────────────────┐  │
-│  │         NHP Server               │  │
-│  │   (Authentication & Policy)      │  │
-│  └──────────────────────────────────┘  │
-└────────────────────────────────────────┘
+                    Internet
+                        │
+                        ▼
+              ┌─────────────────┐
+              │  Network Load   │
+              │   Balancer      │
+              │  (UDP 62206)    │
+              └────────┬────────┘
+                       │
+        ┌──────────────┼──────────────┐
+        │              │              │
+        ▼              ▼              ▼
+   ┌─────────┐   ┌─────────┐   ┌─────────┐
+   │   NHP   │   │   NHP   │   │   NHP   │
+   │ Server  │   │ Server  │   │ Server  │
+   │  (AZ-a) │   │  (AZ-b) │   │  (AZ-c) │
+   └────┬────┘   └────┬────┘   └────┬────┘
+        │             │             │
+        └─────────────┼─────────────┘
+                      │
+              ┌───────┴───────┐
+              │   Cloud Map   │
+              │   (Route 53)  │
+              └───────────────┘
 ```
 
-## Troubleshooting
+## Health Monitoring
 
-### Check AC Status
+Health monitoring is NHP-compliant (no exposed HTTP ports):
+- Cloud Map with custom health checks
+- Instances self-register on boot
+- Health status reported via AWS API
+- Route 53 DNS updated automatically
+
+## Configuration
+
+Environment-specific configuration via CDK context:
 
 ```bash
-# SSH to instance (if key pair provided)
-ssh -i your-key.pem ubuntu@<instance-ip>
+# Development
+npx cdk deploy --all -c environment=dev
 
-# Check service status
-sudo systemctl status nhp-ac
-
-# Check logs
-sudo journalctl -u nhp-ac -f
-
-# Check user-data log
-cat /var/log/user-data.log
+# Production
+npx cdk deploy --all -c environment=prod
 ```
 
-### CloudWatch Logs
+## Docker Image
+
+Build and push the server image:
 
 ```bash
-aws logs tail /layerv/nhp-ac/<stack-name> --follow --region <region>
+# Build locally
+docker build -f docker/Dockerfile.server -t layerv/nhp-server .
+
+# Push to ECR (after CDK deploy)
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account>.dkr.ecr.us-east-1.amazonaws.com
+docker tag layerv/nhp-server:latest <account>.dkr.ecr.us-east-1.amazonaws.com/layerv/nhp-server:latest
+docker push <account>.dkr.ecr.us-east-1.amazonaws.com/layerv/nhp-server:latest
 ```
-
-### Common Issues
-
-1. **AC not connecting to LayerV Server**
-   - Check Security Group allows UDP 62206 outbound
-   - Verify NAT Gateway or public IP for outbound access
-   - Check `/var/log/user-data.log` for errors
-
-2. **Protected resources not accessible**
-   - Verify resource CIDR is in ProtectedCIDRs
-   - Check iptables rules: `sudo iptables -L -n`
-   - Check ipset: `sudo ipset list`
-
-3. **Stack creation failed**
-   - Check CloudFormation events in AWS Console
-   - Common: AMI not available in region, IAM permissions
 
 ## Support
 
 - Documentation: https://docs.layerv.ai
 - Support: support@layerv.ai
-- Status: https://status.layerv.ai
