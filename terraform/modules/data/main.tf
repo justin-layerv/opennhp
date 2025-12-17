@@ -337,11 +337,11 @@ resource "aws_ecs_task_definition" "etcd" {
     }]
 
     healthCheck = {
-      command     = ["CMD-SHELL", "etcdctl endpoint health --endpoints=http://localhost:2379 || exit 1"]
+      command     = ["CMD-SHELL", "ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint health || exit 1"]
       interval    = 30
-      timeout     = 5
-      retries     = 3
-      startPeriod = 60
+      timeout     = 10
+      retries     = 5
+      startPeriod = 120
     }
 
     logConfiguration = {
