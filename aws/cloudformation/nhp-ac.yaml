@@ -137,24 +137,12 @@ Resources:
       GroupDescription: Security group for LayerV NHP Access Controller
       VpcId: !Ref VpcId
       SecurityGroupIngress:
-        # NHP Protocol (UDP) - from LayerV servers
+        # NHP Protocol (UDP) - the ONLY exposed port (NHP-compliant)
         - IpProtocol: udp
           FromPort: 62206
           ToPort: 62206
           CidrIp: 0.0.0.0/0
-          Description: NHP Protocol from LayerV Server
-        # Health check endpoint
-        - IpProtocol: tcp
-          FromPort: 8080
-          ToPort: 8080
-          CidrIp: 10.0.0.0/8
-          Description: Health check endpoint
-        # SSH for management (optional, restrict in production)
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: 10.0.0.0/8
-          Description: SSH from internal network
+          Description: NHP Protocol from LayerV Server - only exposed port
       SecurityGroupEgress:
         # NHP Protocol to LayerV Server
         - IpProtocol: udp
@@ -306,7 +294,11 @@ Resources:
           # Install dependencies
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -y
-          apt-get install -y awscli jq docker.io iptables ipset socat curl python3-pip
+          apt-get install -y awscli jq docker.io iptables ipset curl python3-pip
+
+          # Install CloudWatch agent for NHP-compliant health monitoring (no HTTP)
+          wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+          dpkg -i amazon-cloudwatch-agent.deb || apt-get install -f -y
 
           # Enable and start Docker
           systemctl enable docker
@@ -433,48 +425,73 @@ Resources:
           # Run iptables setup
           /opt/layerv/nhp-ac/iptables_setup.sh
 
-          # Create health check script
-          cat > /opt/layerv/nhp-ac/healthcheck.sh << 'HEALTHEOF'
-          #!/bin/bash
-          # Health check - verify NHP AC process is running
-          if docker ps | grep -q nhp-ac; then
-            echo "healthy"
-            exit 0
-          elif pgrep -f nhp-acd > /dev/null; then
-            echo "healthy"
-            exit 0
-          else
-            echo "unhealthy"
-            exit 1
-          fi
-          HEALTHEOF
-          chmod +x /opt/layerv/nhp-ac/healthcheck.sh
+          # Configure CloudWatch agent for NHP-compliant health monitoring (no HTTP endpoints)
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWEOF'
+          {
+            "agent": {
+              "metrics_collection_interval": 60,
+              "run_as_user": "root"
+            },
+            "metrics": {
+              "namespace": "LayerV/NHP",
+              "append_dimensions": {
+                "InstanceId": "${!aws:InstanceId}"
+              },
+              "metrics_collected": {
+                "procstat": [
+                  {
+                    "pattern": "nhp-ac",
+                    "measurement": ["pid_count", "cpu_usage", "memory_rss"]
+                  }
+                ],
+                "mem": {
+                  "measurement": ["mem_used_percent"]
+                }
+              }
+            }
+          }
+          CWEOF
 
-          # Create health check HTTP server
-          cat > /opt/layerv/nhp-ac/health-server.sh << 'SERVEREOF'
+          # Start CloudWatch agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+          # Create health monitoring script (CloudWatch only, no HTTP)
+          cat > /opt/layerv/nhp-ac/health-monitor.sh << 'HEALTHEOF'
           #!/bin/bash
+          # NHP-compliant health monitoring - publishes to CloudWatch only, no exposed ports
+          REGION=$(curl -s -H "X-aws-ec2-metadata-token: $(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600)" http://169.254.169.254/latest/meta-data/placement/region)
+          INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600)" http://169.254.169.254/latest/meta-data/instance-id)
+
           while true; do
-            if /opt/layerv/nhp-ac/healthcheck.sh > /dev/null 2>&1; then
-              RESPONSE="HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok"
+            if docker ps | grep -q nhp-ac; then
+              HEALTH=1
             else
-              RESPONSE="HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nerror"
+              HEALTH=0
             fi
-            echo -e "$RESPONSE" | socat - TCP-LISTEN:8080,reuseaddr
-          done
-          SERVEREOF
-          chmod +x /opt/layerv/nhp-ac/health-server.sh
 
-          # Create systemd service for health check
-          cat > /etc/systemd/system/nhp-health.service << 'SVCEOF'
+            aws cloudwatch put-metric-data \
+              --namespace "LayerV/NHP" \
+              --metric-name "ACHealth" \
+              --value $HEALTH \
+              --dimensions "InstanceId=$INSTANCE_ID" \
+              --region "$REGION"
+
+            sleep 60
+          done
+          HEALTHEOF
+          chmod +x /opt/layerv/nhp-ac/health-monitor.sh
+
+          # Create systemd service for health monitor (CloudWatch-based)
+          cat > /etc/systemd/system/nhp-health-monitor.service << 'SVCEOF'
           [Unit]
-          Description=NHP Health Check Server
-          After=network.target
+          Description=NHP Health Monitor (CloudWatch)
+          After=network.target docker.service
 
           [Service]
           Type=simple
-          ExecStart=/opt/layerv/nhp-ac/health-server.sh
+          ExecStart=/opt/layerv/nhp-ac/health-monitor.sh
           Restart=always
-          RestartSec=5
+          RestartSec=10
 
           [Install]
           WantedBy=multi-user.target
@@ -510,8 +527,8 @@ Resources:
 
           # Start services
           systemctl daemon-reload
-          systemctl enable nhp-health nhp-ac
-          systemctl start nhp-health
+          systemctl enable nhp-health-monitor nhp-ac
+          systemctl start nhp-health-monitor
 
           # Try to start NHP-AC (may fail if image not available)
           systemctl start nhp-ac || echo "NHP-AC start deferred - image may not be available"
