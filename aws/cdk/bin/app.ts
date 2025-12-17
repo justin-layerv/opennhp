@@ -22,78 +22,89 @@ import { DnsStack } from '../lib/dns-stack';
 
 const app = new cdk.App();
 
-// Environment configuration
-const env = {
-  account: process.env.CDK_DEFAULT_ACCOUNT || process.env.AWS_ACCOUNT_ID,
-  region: process.env.CDK_DEFAULT_REGION || process.env.AWS_REGION || 'us-east-1',
-};
+// Account configuration
+const account = process.env.CDK_DEFAULT_ACCOUNT || process.env.AWS_ACCOUNT_ID;
+
+// Multi-region deployment configuration
+// Deploy to us-east-2 (primary) and us-west-2 (secondary) for HA
+const regions = ['us-east-2', 'us-west-2'];
+const primaryRegion = regions[0];
 
 // Configuration from context or environment
 const config = {
   environment: app.node.tryGetContext('environment') || 'dev',
   domainName: app.node.tryGetContext('domainName') || 'nhp.layerv.ai',
   multiTenant: app.node.tryGetContext('multiTenant') !== 'false',
-  minCapacity: parseInt(app.node.tryGetContext('minCapacity') || '2'),
+  // 3 instances minimum = 1 per AZ for HA
+  minCapacity: parseInt(app.node.tryGetContext('minCapacity') || '3'),
   maxCapacity: parseInt(app.node.tryGetContext('maxCapacity') || '10'),
   // Optional: Route 53 hosted zone configuration
   hostedZoneId: app.node.tryGetContext('hostedZoneId'),
   hostedZoneName: app.node.tryGetContext('hostedZoneName'),
 };
 
-const stackPrefix = `LayerV-NHP-${config.environment}`;
-
-// ECR Stack - Container registries (deploy first, persist across updates)
+// ECR Stack - Container registries (primary region only, cross-region pull supported)
 const ecrStack = new EcrStack(app, `LayerV-NHP-ECR`, {
-  env,
+  env: { account, region: primaryRegion },
   description: 'LayerV NHP - ECR Repositories',
   config,
 });
 
-// Network Stack - VPC, Subnets, NAT, etc.
-const networkStack = new NetworkStack(app, `${stackPrefix}-Network`, {
-  env,
-  description: 'LayerV NHP Control Plane - Network Infrastructure',
-  config,
-});
+// Deploy infrastructure to each region
+const regionalStacks: { [region: string]: { computeStack: ComputeStack } } = {};
 
-// Data Stack - etcd, databases
-const dataStack = new DataStack(app, `${stackPrefix}-Data`, {
-  env,
-  description: 'LayerV NHP Control Plane - Data Layer',
-  vpc: networkStack.vpc,
-  config,
-});
-dataStack.addDependency(networkStack);
+for (const region of regions) {
+  const env = { account, region };
+  const stackPrefix = `LayerV-NHP-${config.environment}-${region}`;
 
-// Compute Stack - NHP Servers, Load Balancer
-const computeStack = new ComputeStack(app, `${stackPrefix}-Compute`, {
-  env,
-  description: 'LayerV NHP Control Plane - Compute Layer',
-  vpc: networkStack.vpc,
-  dataStack,
-  serverRepo: ecrStack.serverRepo,
-  config,
-});
-computeStack.addDependency(dataStack);
-computeStack.addDependency(ecrStack);
+  // Network Stack - VPC, Subnets, NAT, etc.
+  const networkStack = new NetworkStack(app, `${stackPrefix}-Network`, {
+    env,
+    description: `LayerV NHP Control Plane - Network Infrastructure (${region})`,
+    config,
+  });
 
-// DNS Stack - Route 53 records (optional)
-const dnsStack = new DnsStack(app, `${stackPrefix}-DNS`, {
-  env,
-  description: 'LayerV NHP Control Plane - DNS',
-  nlb: computeStack.nlb,
-  config,
-});
-dnsStack.addDependency(computeStack);
+  // Data Stack - etcd, databases
+  const dataStack = new DataStack(app, `${stackPrefix}-Data`, {
+    env,
+    description: `LayerV NHP Control Plane - Data Layer (${region})`,
+    vpc: networkStack.vpc,
+    config,
+  });
+  dataStack.addDependency(networkStack);
 
-// Monitoring Stack - CloudWatch, Alarms
-const monitoringStack = new MonitoringStack(app, `${stackPrefix}-Monitoring`, {
-  env,
-  description: 'LayerV NHP Control Plane - Monitoring',
-  computeStack,
-  config,
-});
-monitoringStack.addDependency(computeStack);
+  // Compute Stack - NHP Servers, Load Balancer
+  const computeStack = new ComputeStack(app, `${stackPrefix}-Compute`, {
+    env,
+    description: `LayerV NHP Control Plane - Compute Layer (${region})`,
+    vpc: networkStack.vpc,
+    dataStack,
+    serverRepo: ecrStack.serverRepo,
+    config,
+  });
+  computeStack.addDependency(dataStack);
+  computeStack.addDependency(ecrStack);
+
+  // DNS Stack - Route 53 records (optional)
+  const dnsStack = new DnsStack(app, `${stackPrefix}-DNS`, {
+    env,
+    description: `LayerV NHP Control Plane - DNS (${region})`,
+    nlb: computeStack.nlb,
+    config,
+  });
+  dnsStack.addDependency(computeStack);
+
+  // Monitoring Stack - CloudWatch, Alarms
+  const monitoringStack = new MonitoringStack(app, `${stackPrefix}-Monitoring`, {
+    env,
+    description: `LayerV NHP Control Plane - Monitoring (${region})`,
+    computeStack,
+    config,
+  });
+  monitoringStack.addDependency(computeStack);
+
+  regionalStacks[region] = { computeStack };
+}
 
 // Tags for all resources
 cdk.Tags.of(app).add('Project', 'LayerV-NHP');
