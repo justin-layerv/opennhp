@@ -271,3 +271,113 @@ jobs:
         run: |
           cd aws/cdk
           npx cdk deploy --all --require-approval never -c environment=prod
+
+  notify:
+    name: Notify Slack
+    needs: [build-server, build-ac, deploy-staging, deploy-prod]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Notify Slack
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          BUILD_SERVER_RESULT: ${{ needs.build-server.result }}
+          BUILD_AC_RESULT: ${{ needs.build-ac.result }}
+          DEPLOY_STAGING_RESULT: ${{ needs.deploy-staging.result }}
+          DEPLOY_PROD_RESULT: ${{ needs.deploy-prod.result }}
+        run: |
+          if [[ -z "$SLACK_WEBHOOK" ]]; then
+            echo "SLACK_WEBHOOK_URL not configured, skipping notification"
+            exit 0
+          fi
+
+          WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SHORT_SHA="${{ github.sha }}"
+          SHORT_SHA="${SHORT_SHA:0:7}"
+
+          # Determine overall status
+          if [[ "$BUILD_SERVER_RESULT" == "success" && "$BUILD_AC_RESULT" == "success" ]]; then
+            if [[ "$DEPLOY_STAGING_RESULT" == "success" || "$DEPLOY_PROD_RESULT" == "success" ]]; then
+              COLOR="#36a64f"
+              EMOJI="✅"
+              STATUS="successful"
+              DETAILS="Build and deploy completed"
+            elif [[ "$DEPLOY_STAGING_RESULT" == "skipped" && "$DEPLOY_PROD_RESULT" == "skipped" ]]; then
+              COLOR="#36a64f"
+              EMOJI="✅"
+              STATUS="successful"
+              DETAILS="Build completed (deploy skipped)"
+            else
+              COLOR="#dc3545"
+              EMOJI="❌"
+              STATUS="failed"
+              DETAILS="Build succeeded but deploy failed"
+            fi
+          elif [[ "$BUILD_SERVER_RESULT" == "failure" || "$BUILD_AC_RESULT" == "failure" ]]; then
+            COLOR="#dc3545"
+            EMOJI="❌"
+            STATUS="failed"
+            DETAILS="Build failed"
+          else
+            COLOR="#ffc107"
+            EMOJI="⚠️"
+            STATUS="incomplete"
+            DETAILS="Check workflow logs"
+          fi
+
+          # Determine environment
+          if [[ "$DEPLOY_PROD_RESULT" == "success" ]]; then
+            ENVIRONMENT="production"
+          elif [[ "$DEPLOY_STAGING_RESULT" == "success" ]]; then
+            ENVIRONMENT="staging"
+          else
+            ENVIRONMENT="build-only"
+          fi
+
+          curl -sfS -X POST "$SLACK_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"attachments\": [{
+                \"color\": \"$COLOR\",
+                \"blocks\": [
+                  {
+                    \"type\": \"section\",
+                    \"text\": {
+                      \"type\": \"mrkdwn\",
+                      \"text\": \"$EMOJI *NHP* build $STATUS\"
+                    }
+                  },
+                  {
+                    \"type\": \"section\",
+                    \"fields\": [
+                      {
+                        \"type\": \"mrkdwn\",
+                        \"text\": \"*Environment:*\n$ENVIRONMENT\"
+                      },
+                      {
+                        \"type\": \"mrkdwn\",
+                        \"text\": \"*Branch:*\n${{ github.ref_name }}\"
+                      },
+                      {
+                        \"type\": \"mrkdwn\",
+                        \"text\": \"*Server:*\n$BUILD_SERVER_RESULT\"
+                      },
+                      {
+                        \"type\": \"mrkdwn\",
+                        \"text\": \"*AC:*\n$BUILD_AC_RESULT\"
+                      }
+                    ]
+                  },
+                  {
+                    \"type\": \"context\",
+                    \"elements\": [
+                      {
+                        \"type\": \"mrkdwn\",
+                        \"text\": \"$DETAILS | <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|$SHORT_SHA> | <$WORKFLOW_URL|View workflow>\"
+                      }
+                    ]
+                  }
+                ]
+              }]
+            }"
