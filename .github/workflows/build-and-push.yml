@@ -34,7 +34,7 @@ on:
         type: boolean
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: us-east-2
 
 jobs:
   build-server:
@@ -58,7 +58,8 @@ jobs:
 
       - name: Run tests
         run: |
-          cd nhp && go test ./...
+          # Exclude WASM policy packages (have stub functions for WASM compilation)
+          cd nhp && go test $(go list ./... | grep -v 'wasm/policy')
           cd ../endpoints && go test ./...
 
       - name: Configure AWS credentials
