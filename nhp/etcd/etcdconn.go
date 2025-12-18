@@ -40,8 +40,14 @@ func (conn *EtcdConn) InitClient() error {
 	if err != nil {
 		return err
 	}
-	conn.ctx, _ = context.WithTimeout(context.Background(), 3*time.Second)
-	_, err = conn.client.Status(conn.ctx, conn.Endpoints[0])
+
+	// Use background context for connection lifetime
+	conn.ctx = context.Background()
+
+	// Verify connectivity with a timeout
+	statusCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err = conn.client.Status(statusCtx, conn.Endpoints[0])
 	if err != nil {
 		return err
 	}
