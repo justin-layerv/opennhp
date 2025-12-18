@@ -41,12 +41,28 @@ Enable = false
 CONFIGEOF
 
 %{ if multi_tenant && etcd_endpoint != null }
-# Configure etcd connection for multi-tenant
+# Configure etcd connection for multi-tenant with TLS
+echo "Configuring etcd connection with TLS..."
+mkdir -p /opt/layerv/nhp-server/etc/tls
+
+# Fetch etcd TLS CA certificate from Secrets Manager
+%{ if etcd_tls_secret_arn != null }
+ETCD_TLS_SECRET=$(aws secretsmanager get-secret-value --secret-id "${etcd_tls_secret_arn}" --region "$REGION" --query SecretString --output text)
+echo "$ETCD_TLS_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['caCert'])" > /opt/layerv/nhp-server/etc/tls/ca.crt
+chmod 644 /opt/layerv/nhp-server/etc/tls/ca.crt
+echo "etcd CA certificate installed"
+%{ endif }
+
 cat > /opt/layerv/nhp-server/etc/remote.toml << 'REMOTEEOF'
 Provider = "etcd"
 Key = "/nhp/config"
 Endpoints = ["${etcd_endpoint}"]
+%{ if etcd_tls_secret_arn != null }
+TLS = true
+CACert = "/opt/layerv/nhp-server/etc/tls/ca.crt"
+%{ endif }
 REMOTEEOF
+echo "Configured etcd endpoint: ${etcd_endpoint} (TLS enabled)"
 %{ else }
 # Single-tenant mode: configure HTTP server locally
 cat > /opt/layerv/nhp-server/etc/http.toml << 'HTTPEOF'

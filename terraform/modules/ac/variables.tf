@@ -63,6 +63,12 @@ variable "etcd_secret_arn" {
   default     = null
 }
 
+variable "etcd_tls_secret_arn" {
+  description = "etcd TLS certificates secret ARN"
+  type        = string
+  default     = null
+}
+
 variable "namespace_id" {
   description = "Cloud Map namespace ID"
   type        = string

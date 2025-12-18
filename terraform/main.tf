@@ -130,12 +130,13 @@ module "compute" {
   private_subnet_ids = module.networking.private_subnet_ids
   server_repo_url    = module.ecr.server_repo_url
   server_repo_arn    = module.ecr.server_repo_arn
-  etcd_endpoint      = module.data.etcd_endpoint
-  etcd_secret_arn    = module.data.etcd_secret_arn
-  namespace_id       = module.data.namespace_id
-  namespace_name     = module.data.namespace_name
-  name_prefix        = local.name_prefix
-  tags               = local.common_tags
+  etcd_endpoint       = module.data.etcd_endpoint
+  etcd_secret_arn     = module.data.etcd_secret_arn
+  etcd_tls_secret_arn = module.data.etcd_ca_cert_arn
+  namespace_id        = module.data.namespace_id
+  namespace_name      = module.data.namespace_name
+  name_prefix         = local.name_prefix
+  tags                = local.common_tags
 
   # KMS encryption keys
   ebs_kms_key_arn     = module.kms.ebs_key_arn
@@ -213,12 +214,13 @@ module "ac" {
   private_subnet_ids = module.networking.private_subnet_ids
   ac_repo_url        = module.ecr.ac_repo_url
   ac_repo_arn        = module.ecr.ac_repo_arn
-  etcd_endpoint      = module.data.etcd_endpoint
-  etcd_secret_arn    = module.data.etcd_secret_arn
-  namespace_id       = module.data.namespace_id
-  namespace_name     = module.data.namespace_name
-  name_prefix        = local.name_prefix
-  tags               = local.common_tags
+  etcd_endpoint       = module.data.etcd_endpoint
+  etcd_secret_arn     = module.data.etcd_secret_arn
+  etcd_tls_secret_arn = module.data.etcd_ca_cert_arn
+  namespace_id        = module.data.namespace_id
+  namespace_name      = module.data.namespace_name
+  name_prefix         = local.name_prefix
+  tags                = local.common_tags
 
   # KMS encryption keys
   logs_kms_key_arn = module.kms.logs_key_arn

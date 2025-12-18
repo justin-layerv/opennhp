@@ -75,14 +75,29 @@ docker rm "$CONTAINER_ID"
 
 echo "Binaries extracted successfully"
 
-# Configure etcd connection for multi-tenant
+# Configure etcd connection for multi-tenant with TLS
 %{ if etcd_endpoint != null }
+echo "Fetching etcd TLS certificates..."
+mkdir -p /opt/layerv/nhp-ac/etc/tls
+
+# Fetch etcd TLS CA certificate from Secrets Manager
+%{ if etcd_tls_secret_arn != null }
+ETCD_TLS_SECRET=$(aws secretsmanager get-secret-value --secret-id "${etcd_tls_secret_arn}" --region "$REGION" --query SecretString --output text)
+echo "$ETCD_TLS_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['caCert'])" > /opt/layerv/nhp-ac/etc/tls/ca.crt
+chmod 644 /opt/layerv/nhp-ac/etc/tls/ca.crt
+echo "etcd CA certificate installed"
+%{ endif }
+
 cat > /opt/layerv/nhp-ac/etc/remote.toml << 'REMOTEEOF'
 Provider = "etcd"
 Key = "/nhp/config"
 Endpoints = ["${etcd_endpoint}"]
+%{ if etcd_tls_secret_arn != null }
+TLS = true
+CACert = "/opt/layerv/nhp-ac/etc/tls/ca.crt"
+%{ endif }
 REMOTEEOF
-echo "Configured etcd endpoint: ${etcd_endpoint}"
+echo "Configured etcd endpoint: ${etcd_endpoint} (TLS enabled)"
 %{ endif }
 
 # Traefik configuration for this environment

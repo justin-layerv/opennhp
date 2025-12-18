@@ -4,6 +4,7 @@
 # ==================== Data Sources ====================
 
 data "aws_region" "current" {}
+data "aws_caller_identity" "current" {}
 
 # ==================== Locals ====================
 
@@ -12,17 +13,28 @@ locals {
   etcd_cluster_size  = local.is_prod ? 3 : 1
   etcd_cluster_token = "${var.name_prefix}-cluster"
 
-  # Protocol for etcd communication
-  # TODO: Enable HTTPS once TLS certificates are properly configured
-  # For production, use cfssl or ACM Private CA to generate proper X509 certificates
-  etcd_protocol = "http"
+  # Protocol for etcd communication - HTTPS with TLS
+  etcd_protocol = "https"
+
+  # Etcd service DNS name based on cluster size:
+  # - Single-node (staging): Use shared 'etcd' service for simplicity
+  # - Multi-node (prod): Use member-specific 'etcd-N' services for peer discovery
+  etcd_service_name = local.etcd_cluster_size == 1 ? "etcd" : "etcd-0"
 
   # Generate etcd cluster member names and URLs for initial cluster formation
-  # Hostname format: etcd-0.nhp.staging.internal (service-name.namespace)
-  etcd_initial_cluster = join(",", [
-    for i in range(local.etcd_cluster_size) :
-    "etcd-${i}=${local.etcd_protocol}://etcd-${i}.nhp.${var.environment}.internal:2380"
-  ])
+  # Single-node: Uses 'etcd' as the DNS name
+  # Multi-node: Uses 'etcd-N' for each member for proper peer discovery
+  etcd_initial_cluster = local.etcd_cluster_size == 1 ? (
+    "etcd-0=${local.etcd_protocol}://etcd.nhp.${var.environment}.internal:2380"
+  ) : (
+    join(",", [
+      for i in range(local.etcd_cluster_size) :
+      "etcd-${i}=${local.etcd_protocol}://etcd-${i}.nhp.${var.environment}.internal:2380"
+    ])
+  )
+
+  # Certificate paths inside container
+  etcd_cert_dir = "/etc/etcd/tls"
 }
 
 # Private DNS Namespace for Service Discovery
@@ -75,7 +87,7 @@ resource "aws_secretsmanager_secret" "etcd_tls" {
   tags = var.tags
 }
 
-# TLS certificate generation Lambda
+# TLS certificate generation Lambda (Python with cryptography library)
 resource "aws_iam_role" "etcd_tls_lambda" {
   count = var.multi_tenant ? 1 : 0
   name  = "${var.name_prefix}-etcd-tls-lambda"
@@ -128,125 +140,176 @@ resource "aws_iam_role_policy" "etcd_tls_lambda_secrets" {
   })
 }
 
-# Lambda to generate self-signed TLS certificates
+# Lambda to generate proper self-signed TLS certificates using Python cryptography
 data "archive_file" "etcd_tls_lambda" {
   count       = var.multi_tenant ? 1 : 0
   type        = "zip"
   output_path = "${path.module}/etcd_tls_lambda.zip"
 
   source {
-    content  = <<-EOF
-const crypto = require('crypto');
-const { SecretsManagerClient, GetSecretValueCommand, PutSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
+    content  = <<-PYTHON
+import json
+import boto3
+from datetime import datetime, timedelta
+import ipaddress
 
-// Generate self-signed CA and server certificate
-function generateCertificates(dnsNames) {
-  const { generateKeyPairSync, createSign, createHash } = crypto;
+# Use cryptography library (available in Lambda Python runtime)
+from cryptography import x509
+from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.backends import default_backend
 
-  // Generate CA key pair
-  const caKeys = generateKeyPairSync('rsa', { modulusLength: 2048 });
+def generate_certificates(dns_names, ip_addresses):
+    """Generate CA and server certificates for etcd TLS."""
 
-  // Generate server key pair
-  const serverKeys = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    # Generate CA private key
+    ca_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+        backend=default_backend()
+    )
 
-  // Create CA certificate (self-signed)
-  const caCert = createSelfSignedCert(caKeys, {
-    subject: '/CN=etcd-ca/O=LayerV',
-    isCA: true,
-    validDays: 3650
-  });
+    # CA certificate (self-signed, valid 10 years)
+    ca_name = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "etcd-ca"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "LayerV"),
+    ])
 
-  // Create server certificate signed by CA
-  const serverCert = createSignedCert(serverKeys, caKeys, caCert, {
-    subject: '/CN=etcd-server/O=LayerV',
-    dnsNames: dnsNames,
-    validDays: 365
-  });
+    ca_cert = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.utcnow())
+        .not_valid_after(datetime.utcnow() + timedelta(days=3650))
+        .add_extension(
+            x509.BasicConstraints(ca=True, path_length=0),
+            critical=True,
+        )
+        .add_extension(
+            x509.KeyUsage(
+                key_cert_sign=True,
+                crl_sign=True,
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(ca_key, hashes.SHA256(), default_backend())
+    )
 
-  return {
-    caCert: caCert,
-    caKey: exportPrivateKey(caKeys.privateKey),
-    serverCert: serverCert,
-    serverKey: exportPrivateKey(serverKeys.privateKey)
-  };
-}
+    # Generate server private key
+    server_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+        backend=default_backend()
+    )
 
-function createSelfSignedCert(keys, options) {
-  // Simplified certificate generation - in production use a proper X509 library
-  // This creates a basic structure that etcd can use
-  const now = new Date();
-  const notBefore = now.toISOString();
-  const notAfter = new Date(now.getTime() + options.validDays * 24 * 60 * 60 * 1000).toISOString();
+    # Build Subject Alternative Names (DNS and IP)
+    san_list = [x509.DNSName(name) for name in dns_names]
+    for ip in ip_addresses:
+        san_list.append(x509.IPAddress(ipaddress.ip_address(ip)))
 
-  const pubKeyDer = keys.publicKey.export({ type: 'spki', format: 'der' });
-  const pubKeyPem = keys.publicKey.export({ type: 'spki', format: 'pem' });
+    # Server certificate (valid 1 year)
+    server_cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "etcd-server"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "LayerV"),
+        ]))
+        .issuer_name(ca_name)
+        .public_key(server_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.utcnow())
+        .not_valid_after(datetime.utcnow() + timedelta(days=365))
+        .add_extension(
+            x509.BasicConstraints(ca=False, path_length=None),
+            critical=True,
+        )
+        .add_extension(
+            x509.SubjectAlternativeName(san_list),
+            critical=False,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([
+                ExtendedKeyUsageOID.SERVER_AUTH,
+                ExtendedKeyUsageOID.CLIENT_AUTH,
+            ]),
+            critical=False,
+        )
+        .sign(ca_key, hashes.SHA256(), default_backend())
+    )
 
-  // For a real implementation, use node-forge or similar
-  // This is a placeholder that returns a valid PEM structure
-  return pubKeyPem.replace('PUBLIC KEY', 'CERTIFICATE');
-}
-
-function createSignedCert(serverKeys, caKeys, caCert, options) {
-  const pubKeyPem = serverKeys.publicKey.export({ type: 'spki', format: 'pem' });
-  return pubKeyPem.replace('PUBLIC KEY', 'CERTIFICATE');
-}
-
-function exportPrivateKey(privateKey) {
-  return privateKey.export({ type: 'pkcs8', format: 'pem' });
-}
-
-exports.handler = async (event) => {
-  console.log('TLS cert generation event:', JSON.stringify(event));
-
-  if (event.RequestType === 'Delete') {
-    return { PhysicalResourceId: event.PhysicalResourceId };
-  }
-
-  const client = new SecretsManagerClient({});
-  const secretId = event.ResourceProperties.SecretId;
-  const clusterSize = parseInt(event.ResourceProperties.ClusterSize) || 3;
-  const environment = event.ResourceProperties.Environment;
-
-  // Check if secret already has valid certs
-  try {
-    const existing = await client.send(new GetSecretValueCommand({ SecretId: secretId }));
-    if (existing.SecretString) {
-      const parsed = JSON.parse(existing.SecretString);
-      if (parsed.caCert && parsed.serverCert && parsed.serverKey) {
-        console.log('TLS certs already exist, not regenerating');
-        return { PhysicalResourceId: event.PhysicalResourceId || secretId };
-      }
+    return {
+        'caCert': ca_cert.public_bytes(serialization.Encoding.PEM).decode(),
+        'caKey': ca_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption()
+        ).decode(),
+        'serverCert': server_cert.public_bytes(serialization.Encoding.PEM).decode(),
+        'serverKey': server_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption()
+        ).decode(),
     }
-  } catch (e) {
-    console.log('No existing TLS certs, will generate new ones');
-  }
 
-  // Generate DNS names for etcd members
-  const dnsNames = [];
-  for (let i = 0; i < clusterSize; i++) {
-    dnsNames.push('etcd-' + i + '.nhp.' + environment + '.internal');
-  }
-  dnsNames.push('etcd.nhp.' + environment + '.internal');
-  dnsNames.push('localhost');
-  dnsNames.push('127.0.0.1');
+def handler(event, context):
+    print(f"TLS cert generation event: {json.dumps(event)}")
 
-  const certs = generateCertificates(dnsNames);
+    if event.get('RequestType') == 'Delete':
+        return {'PhysicalResourceId': event.get('PhysicalResourceId')}
 
-  await client.send(new PutSecretValueCommand({
-    SecretId: secretId,
-    SecretString: JSON.stringify({
-      caCert: certs.caCert,
-      caKey: certs.caKey,
-      serverCert: certs.serverCert,
-      serverKey: certs.serverKey,
-      dnsNames: dnsNames
-    })
-  }));
+    secrets_client = boto3.client('secretsmanager')
+    secret_id = event['ResourceProperties']['SecretId']
+    cluster_size = int(event['ResourceProperties'].get('ClusterSize', 1))
+    environment = event['ResourceProperties']['Environment']
+    force_regenerate = event['ResourceProperties'].get('ForceRegenerate', False)
 
-  return { PhysicalResourceId: event.PhysicalResourceId || secretId };
-};
-EOF
-    filename = "index.js"
+    # Check if valid certs already exist (unless forced)
+    if not force_regenerate:
+        try:
+            existing = secrets_client.get_secret_value(SecretId=secret_id)
+            if existing.get('SecretString'):
+                parsed = json.loads(existing['SecretString'])
+                # Validate cert format (should start with proper PEM header)
+                if (parsed.get('caCert', '').startswith('-----BEGIN CERTIFICATE-----') and
+                    parsed.get('serverCert', '').startswith('-----BEGIN CERTIFICATE-----') and
+                    parsed.get('serverKey', '').startswith('-----BEGIN RSA PRIVATE KEY-----')):
+                    print("Valid TLS certs already exist, not regenerating")
+                    return {'PhysicalResourceId': event.get('PhysicalResourceId') or secret_id}
+                print("Existing certs are invalid, regenerating")
+        except Exception as e:
+            print(f"No existing certs or error reading: {e}")
+
+    # Generate DNS names for etcd members
+    dns_names = ['localhost']
+    dns_names.append(f'etcd.nhp.{environment}.internal')
+    for i in range(cluster_size):
+        dns_names.append(f'etcd-{i}.nhp.{environment}.internal')
+
+    print(f"Generating certs for DNS names: {dns_names}")
+    certs = generate_certificates(dns_names, ['127.0.0.1'])
+    certs['dnsNames'] = dns_names
+    certs['generatedAt'] = datetime.utcnow().isoformat()
+
+    secrets_client.put_secret_value(
+        SecretId=secret_id,
+        SecretString=json.dumps(certs)
+    )
+
+    print("TLS certificates generated and stored successfully")
+    return {'PhysicalResourceId': event.get('PhysicalResourceId') or secret_id}
+PYTHON
+    filename = "lambda_function.py"
   }
 }
 
@@ -254,8 +317,8 @@ resource "aws_lambda_function" "etcd_tls" {
   count            = var.multi_tenant ? 1 : 0
   function_name    = "${var.name_prefix}-etcd-tls-gen"
   role             = aws_iam_role.etcd_tls_lambda[0].arn
-  handler          = "index.handler"
-  runtime          = "nodejs20.x"
+  handler          = "lambda_function.handler"
+  runtime          = "python3.11"
   timeout          = 60
   filename         = data.archive_file.etcd_tls_lambda[0].output_path
   source_code_hash = data.archive_file.etcd_tls_lambda[0].output_base64sha256
@@ -263,7 +326,7 @@ resource "aws_lambda_function" "etcd_tls" {
   tags = var.tags
 }
 
-# Invoke Lambda to generate TLS certs
+# Invoke Lambda to generate TLS certs (force regenerate to fix invalid certs)
 resource "aws_lambda_invocation" "etcd_tls" {
   count         = var.multi_tenant ? 1 : 0
   function_name = aws_lambda_function.etcd_tls[0].function_name
@@ -271,9 +334,10 @@ resource "aws_lambda_invocation" "etcd_tls" {
   input = jsonencode({
     RequestType = "Create"
     ResourceProperties = {
-      SecretId    = aws_secretsmanager_secret.etcd_tls[0].id
-      ClusterSize = local.etcd_cluster_size
-      Environment = var.environment
+      SecretId        = aws_secretsmanager_secret.etcd_tls[0].id
+      ClusterSize     = local.etcd_cluster_size
+      Environment     = var.environment
+      ForceRegenerate = true # Regenerate to fix invalid placeholder certs
     }
   })
 
@@ -537,8 +601,12 @@ resource "aws_lambda_function" "secrets_rotation" {
 
   environment {
     variables = {
-      # Use etcd-0 as the primary endpoint for secrets rotation
-      ETCD_ENDPOINT = "http://etcd-0.${aws_service_discovery_private_dns_namespace.main.name}:2379"
+      # Use shared etcd service for single-node, first member for multi-node
+      ETCD_ENDPOINT = local.etcd_cluster_size == 1 ? (
+        "http://etcd.${aws_service_discovery_private_dns_namespace.main.name}:2379"
+      ) : (
+        "http://etcd-0.${aws_service_discovery_private_dns_namespace.main.name}:2379"
+      )
     }
   }
 
@@ -781,6 +849,35 @@ resource "aws_iam_role_policy_attachment" "etcd_execution" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+# ECS Execution Role - Secrets access for native secrets injection
+resource "aws_iam_role_policy" "etcd_execution_secrets" {
+  count = var.multi_tenant ? 1 : 0
+  name  = "secrets-access"
+  role  = aws_iam_role.etcd_execution[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = [
+          aws_secretsmanager_secret.etcd_tls[0].arn
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt"
+        ]
+        Resource = var.secrets_kms_key_arn
+      }
+    ]
+  })
+}
+
 # ECS Task Role
 resource "aws_iam_role" "etcd_task" {
   count = var.multi_tenant ? 1 : 0
@@ -821,6 +918,13 @@ resource "aws_iam_role_policy" "etcd_task" {
       {
         Effect = "Allow"
         Action = [
+          "kms:Decrypt"
+        ]
+        Resource = var.secrets_kms_key_arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
           "elasticfilesystem:ClientMount",
           "elasticfilesystem:ClientWrite",
           "elasticfilesystem:ClientRootAccess"
@@ -846,7 +950,7 @@ resource "aws_iam_role_policy" "etcd_task" {
   })
 }
 
-# ECS Task Definition - one per cluster member
+# ECS Task Definition - one per cluster member with TLS and auth support
 resource "aws_ecs_task_definition" "etcd" {
   for_each                 = var.multi_tenant ? toset([for i in range(local.etcd_cluster_size) : tostring(i)]) : []
   family                   = "${var.name_prefix}-etcd-${each.key}"
@@ -857,54 +961,143 @@ resource "aws_ecs_task_definition" "etcd" {
   execution_role_arn       = aws_iam_role.etcd_execution[0].arn
   task_role_arn            = aws_iam_role.etcd_task[0].arn
 
-  container_definitions = jsonencode([{
-    name      = "etcd"
-    image     = "quay.io/coreos/etcd:v3.5.11"
-    essential = true
+  container_definitions = jsonencode([
+    # Init container: Write TLS certificates to shared volume
+    # ECS natively injects secrets as environment variables - no aws-cli or JSON parsing needed
+    {
+      name      = "tls-init"
+      image     = "public.ecr.aws/docker/library/alpine:3.19"
+      essential = false
 
-    portMappings = [
-      { containerPort = 2379, protocol = "tcp" },
-      { containerPort = 2380, protocol = "tcp" }
-    ]
+      # ECS injects these from Secrets Manager automatically
+      secrets = [
+        {
+          name      = "ETCD_CA_CERT"
+          valueFrom = "${aws_secretsmanager_secret.etcd_tls[0].arn}:caCert::"
+        },
+        {
+          name      = "ETCD_SERVER_CERT"
+          valueFrom = "${aws_secretsmanager_secret.etcd_tls[0].arn}:serverCert::"
+        },
+        {
+          name      = "ETCD_SERVER_KEY"
+          valueFrom = "${aws_secretsmanager_secret.etcd_tls[0].arn}:serverKey::"
+        }
+      ]
 
-    environment = [
-      { name = "ETCD_NAME", value = "etcd-${each.key}" },
-      { name = "ETCD_DATA_DIR", value = "/etcd-data" },
-      { name = "ETCD_LISTEN_CLIENT_URLS", value = "http://0.0.0.0:2379" },
-      { name = "ETCD_LISTEN_PEER_URLS", value = "http://0.0.0.0:2380" },
-      { name = "ETCD_ADVERTISE_CLIENT_URLS", value = "http://etcd-${each.key}.nhp.${var.environment}.internal:2379" },
-      { name = "ETCD_INITIAL_ADVERTISE_PEER_URLS", value = "http://etcd-${each.key}.nhp.${var.environment}.internal:2380" },
-      { name = "ETCD_INITIAL_CLUSTER", value = local.etcd_initial_cluster },
-      { name = "ETCD_INITIAL_CLUSTER_STATE", value = "new" },
-      { name = "ETCD_INITIAL_CLUSTER_TOKEN", value = local.etcd_cluster_token },
-      { name = "ETCD_AUTO_COMPACTION_RETENTION", value = "1" },
-      { name = "ETCD_AUTO_COMPACTION_MODE", value = "periodic" },
-      { name = "ETCD_QUOTA_BACKEND_BYTES", value = "1073741824" }
-    ]
+      entryPoint = ["sh", "-c"]
+      command = [
+        join(" && ", [
+          "set -e",
+          "echo 'Writing TLS certificates from environment variables'",
+          "mkdir -p ${local.etcd_cert_dir}",
+          "printf '%s' \"$ETCD_CA_CERT\" > ${local.etcd_cert_dir}/ca.crt",
+          "printf '%s' \"$ETCD_SERVER_CERT\" > ${local.etcd_cert_dir}/server.crt",
+          "printf '%s' \"$ETCD_SERVER_KEY\" > ${local.etcd_cert_dir}/server.key",
+          "chmod 644 ${local.etcd_cert_dir}/ca.crt ${local.etcd_cert_dir}/server.crt",
+          "chmod 600 ${local.etcd_cert_dir}/server.key",
+          "echo 'TLS certificates written successfully'",
+          "ls -la ${local.etcd_cert_dir}/"
+        ])
+      ]
 
-    mountPoints = [{
-      sourceVolume  = "etcd-data"
-      containerPath = "/etcd-data"
-      readOnly      = false
-    }]
+      mountPoints = [{
+        sourceVolume  = "tls-certs"
+        containerPath = local.etcd_cert_dir
+        readOnly      = false
+      }]
 
-    healthCheck = {
-      command     = ["CMD-SHELL", "ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint health || exit 1"]
-      interval    = 30
-      timeout     = 10
-      retries     = 5
-      startPeriod = 120
-    }
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.etcd[0].name
+          "awslogs-region"        = data.aws_region.current.name
+          "awslogs-stream-prefix" = "etcd-${each.key}-tls-init"
+        }
+      }
+    },
+    # Main etcd container with TLS enabled
+    {
+      name      = "etcd"
+      image     = "quay.io/coreos/etcd:v3.5.11"
+      essential = true
 
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.etcd[0].name
-        "awslogs-region"        = data.aws_region.current.name
-        "awslogs-stream-prefix" = "etcd-${each.key}"
+      dependsOn = [{
+        containerName = "tls-init"
+        condition     = "SUCCESS"
+      }]
+
+      portMappings = [
+        { containerPort = 2379, protocol = "tcp" },
+        { containerPort = 2380, protocol = "tcp" }
+      ]
+
+      environment = [
+        { name = "ETCD_NAME", value = "etcd-${each.key}" },
+        { name = "ETCD_DATA_DIR", value = "/etcd-data" },
+        # Client TLS configuration
+        { name = "ETCD_LISTEN_CLIENT_URLS", value = "https://0.0.0.0:2379" },
+        { name = "ETCD_CERT_FILE", value = "${local.etcd_cert_dir}/server.crt" },
+        { name = "ETCD_KEY_FILE", value = "${local.etcd_cert_dir}/server.key" },
+        { name = "ETCD_TRUSTED_CA_FILE", value = "${local.etcd_cert_dir}/ca.crt" },
+        # Peer TLS configuration
+        { name = "ETCD_LISTEN_PEER_URLS", value = "https://0.0.0.0:2380" },
+        { name = "ETCD_PEER_CERT_FILE", value = "${local.etcd_cert_dir}/server.crt" },
+        { name = "ETCD_PEER_KEY_FILE", value = "${local.etcd_cert_dir}/server.key" },
+        { name = "ETCD_PEER_TRUSTED_CA_FILE", value = "${local.etcd_cert_dir}/ca.crt" },
+        # Single-node uses shared 'etcd' service; multi-node uses member-specific 'etcd-N'
+        { name = "ETCD_ADVERTISE_CLIENT_URLS", value = local.etcd_cluster_size == 1 ? (
+          "${local.etcd_protocol}://etcd.nhp.${var.environment}.internal:2379"
+        ) : (
+          "${local.etcd_protocol}://etcd-${each.key}.nhp.${var.environment}.internal:2379"
+        ) },
+        { name = "ETCD_INITIAL_ADVERTISE_PEER_URLS", value = local.etcd_cluster_size == 1 ? (
+          "${local.etcd_protocol}://etcd.nhp.${var.environment}.internal:2380"
+        ) : (
+          "${local.etcd_protocol}://etcd-${each.key}.nhp.${var.environment}.internal:2380"
+        ) },
+        { name = "ETCD_INITIAL_CLUSTER", value = local.etcd_initial_cluster },
+        { name = "ETCD_INITIAL_CLUSTER_STATE", value = "new" },
+        { name = "ETCD_INITIAL_CLUSTER_TOKEN", value = local.etcd_cluster_token },
+        { name = "ETCD_AUTO_COMPACTION_RETENTION", value = "1" },
+        { name = "ETCD_AUTO_COMPACTION_MODE", value = "periodic" },
+        { name = "ETCD_QUOTA_BACKEND_BYTES", value = "1073741824" }
+      ]
+
+      mountPoints = [
+        {
+          sourceVolume  = "etcd-data"
+          containerPath = "/etcd-data"
+          readOnly      = false
+        },
+        {
+          sourceVolume  = "tls-certs"
+          containerPath = local.etcd_cert_dir
+          readOnly      = true
+        }
+      ]
+
+      healthCheck = {
+        command = [
+          "CMD-SHELL",
+          "ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 --cacert=${local.etcd_cert_dir}/ca.crt --cert=${local.etcd_cert_dir}/server.crt --key=${local.etcd_cert_dir}/server.key endpoint health || exit 1"
+        ]
+        interval    = 30
+        timeout     = 10
+        retries     = 5
+        startPeriod = 180
+      }
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.etcd[0].name
+          "awslogs-region"        = data.aws_region.current.name
+          "awslogs-stream-prefix" = "etcd-${each.key}"
+        }
       }
     }
-  }])
+  ])
 
   volume {
     name = "etcd-data"
@@ -917,6 +1110,11 @@ resource "aws_ecs_task_definition" "etcd" {
         iam             = "ENABLED"
       }
     }
+  }
+
+  # Shared volume for TLS certificates (between init and main container)
+  volume {
+    name = "tls-certs"
   }
 
   tags = var.tags
@@ -985,9 +1183,15 @@ resource "aws_ecs_service" "etcd" {
     assign_public_ip = false
   }
 
-  # Register to member-specific Cloud Map service for peer discovery
+  # Register to Cloud Map service:
+  # - Single-node: Use shared 'etcd' service for client simplicity
+  # - Multi-node: Use member-specific 'etcd-N' services for peer discovery
   service_registries {
-    registry_arn = aws_service_discovery_service.etcd["etcd-${each.key}"].arn
+    registry_arn = local.etcd_cluster_size == 1 ? (
+      aws_service_discovery_service.etcd_client[0].arn
+    ) : (
+      aws_service_discovery_service.etcd["etcd-${each.key}"].arn
+    )
   }
 
   deployment_minimum_healthy_percent = 0

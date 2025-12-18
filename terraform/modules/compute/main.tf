@@ -230,10 +230,11 @@ resource "aws_iam_role_policy" "server" {
       {
         Effect = "Allow"
         Action = ["secretsmanager:GetSecretValue"]
-        Resource = concat(
+        Resource = compact(concat(
           [aws_secretsmanager_secret.server.arn],
-          var.etcd_secret_arn != null ? [var.etcd_secret_arn] : []
-        )
+          [var.etcd_secret_arn],
+          [var.etcd_tls_secret_arn]
+        ))
       },
       {
         Effect = "Allow"
@@ -351,6 +352,7 @@ locals {
     environment         = var.environment
     multi_tenant        = var.multi_tenant
     etcd_endpoint       = var.etcd_endpoint
+    etcd_tls_secret_arn = var.etcd_tls_secret_arn
   })
 }
 

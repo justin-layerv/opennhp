@@ -219,12 +219,12 @@ resource "aws_iam_role_policy" "ac" {
         ]
         Resource = var.ac_repo_arn
       },
-      # Secrets Manager for etcd credentials
+      # Secrets Manager for etcd credentials and TLS certificates
       {
         Sid      = "SecretsAccess"
         Effect   = "Allow"
         Action   = ["secretsmanager:GetSecretValue"]
-        Resource = var.etcd_secret_arn != null ? [var.etcd_secret_arn] : []
+        Resource = compact([var.etcd_secret_arn, var.etcd_tls_secret_arn])
       },
       # Cloud Map registration
       {
@@ -303,6 +303,7 @@ locals {
     acme_email          = var.acme_email
     acme_ca_server      = local.is_prod ? "https://acme-v02.api.letsencrypt.org/directory" : "https://acme-staging-v02.api.letsencrypt.org/directory"
     etcd_endpoint       = var.etcd_endpoint
+    etcd_tls_secret_arn = var.etcd_tls_secret_arn
     cloudmap_service_id = aws_service_discovery_service.ac.id
     namespace_name      = var.namespace_name
   })
