@@ -181,10 +181,14 @@ resource "aws_iam_role" "github_actions" {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
         }
-        # Restrict to main branch only for security
-        # This role has ECR push and Terraform state access
+        # Allow main branch and environment-based deployments
+        # Environment-based: used by deploy jobs with `environment: staging/production`
         StringLike = {
-          "token.actions.githubusercontent.com:sub" = "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main"
+          "token.actions.githubusercontent.com:sub" = [
+            "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main",
+            "repo:${var.github_org}/${var.github_repo}:environment:staging",
+            "repo:${var.github_org}/${var.github_repo}:environment:production"
+          ]
         }
       }
     }]
