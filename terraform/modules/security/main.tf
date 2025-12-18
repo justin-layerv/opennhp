@@ -750,4 +750,9 @@ resource "aws_cloudtrail" "main" {
   tags = var.tags
 
   depends_on = [aws_s3_bucket_policy.cloudtrail]
+
+  # Ignore kms_key_id changes when SCP blocks CloudTrail updates
+  lifecycle {
+    ignore_changes = [kms_key_id]
+  }
 }
