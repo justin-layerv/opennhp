@@ -203,6 +203,18 @@ variable "enable_cloudfront" {
   default     = false
 }
 
+variable "ac_auth_service_id" {
+  description = "Authentication service ID for the Access Controller"
+  type        = string
+  default     = "layerv"
+}
+
+variable "ac_resource_ids" {
+  description = "List of resource IDs that the Access Controller protects"
+  type        = list(string)
+  default     = ["default"]
+}
+
 # ==================== Terraform State Configuration ====================
 
 variable "terraform_state_bucket" {

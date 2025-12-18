@@ -307,6 +307,10 @@ locals {
     cloudmap_service_id = aws_service_discovery_service.ac.id
     namespace_name      = var.namespace_name
     vpc_cidr            = var.vpc_cidr
+    # AC configuration options
+    auth_service_id = var.auth_service_id
+    resource_ids    = jsonencode(var.resource_ids)
+    server_nlb_dns  = var.server_nlb_dns
   })
 }
 

@@ -107,3 +107,26 @@ variable "enable_cloudfront" {
   type        = bool
   default     = false
 }
+
+# ============================================================================
+# NHP AC Configuration Options
+# These options control the AC daemon's behavior
+# ============================================================================
+
+variable "auth_service_id" {
+  description = "Authentication service ID for the AC"
+  type        = string
+  default     = "layerv"
+}
+
+variable "resource_ids" {
+  description = "List of resource IDs that this AC protects"
+  type        = list(string)
+  default     = ["default"]
+}
+
+variable "server_nlb_dns" {
+  description = "NLB DNS name for NHP server (fallback for server discovery)"
+  type        = string
+  default     = ""
+}

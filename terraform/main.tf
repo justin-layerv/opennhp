@@ -235,4 +235,9 @@ module "ac" {
 
   # CloudFront + WAF (optional)
   enable_cloudfront = var.enable_cloudfront
+
+  # AC configuration options
+  auth_service_id = var.ac_auth_service_id
+  resource_ids    = var.ac_resource_ids
+  server_nlb_dns  = module.compute.nlb_dns_name
 }
