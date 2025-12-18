@@ -75,6 +75,16 @@ docker rm "$CONTAINER_ID"
 
 echo "Binaries extracted successfully"
 
+# Configure etcd connection for multi-tenant
+%{ if etcd_endpoint != null }
+cat > /opt/layerv/nhp-ac/etc/remote.toml << 'REMOTEEOF'
+Provider = "etcd"
+Key = "/nhp/config"
+Endpoints = ["${etcd_endpoint}"]
+REMOTEEOF
+echo "Configured etcd endpoint: ${etcd_endpoint}"
+%{ endif }
+
 # Traefik configuration for this environment
 # Note: traefik-plugins repo deploys plugins to /home/ubuntu/traefik/plugins-local via SSM
 cat > /home/ubuntu/traefik/traefik.toml << 'TRAEFIKEOF'
@@ -120,8 +130,8 @@ cat > /home/ubuntu/traefik/traefik.toml << 'TRAEFIKEOF'
   directory = "/home/ubuntu/traefik/"
   watch = true
 
-# Local plugins directory - managed by traefik-plugins repo via SSM
-[experimental.localPlugins]
+# NOTE: [experimental.localPlugins] section is managed by traefik-plugins repo via SSM
+# The traefik-plugins deployment will add this section with plugin definitions
 TRAEFIKEOF
 
 # Create Traefik dynamic configuration (routes to nhp-acd)

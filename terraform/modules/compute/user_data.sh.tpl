@@ -166,7 +166,7 @@ ExecStartPre=-/usr/bin/docker stop nhp-server
 ExecStartPre=-/usr/bin/docker rm nhp-server
 ExecStart=/usr/bin/docker run --rm --name nhp-server \
   --net=host \
-  -v /opt/layerv/nhp-server/etc:/etc/nhp:ro \
+  -v /opt/layerv/nhp-server/etc:/nhp-server/etc:ro \
   -v /opt/layerv/nhp-server/log:/var/log/nhp \
   ${server_repo_url}:latest
 ExecStop=/usr/bin/docker stop nhp-server
