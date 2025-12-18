@@ -9,8 +9,16 @@ output "namespace_name" {
 }
 
 output "etcd_endpoint" {
-  description = "etcd endpoint"
-  value       = var.multi_tenant ? "etcd.${aws_service_discovery_private_dns_namespace.main.name}:2379" : null
+  description = "etcd client endpoint (first member for simple configs)"
+  value       = var.multi_tenant ? "etcd-0.${aws_service_discovery_private_dns_namespace.main.name}:2379" : null
+}
+
+output "etcd_endpoints" {
+  description = "All etcd member endpoints for client configuration"
+  value = var.multi_tenant ? [
+    for i in range(local.etcd_cluster_size) :
+    "etcd-${i}.${aws_service_discovery_private_dns_namespace.main.name}:2379"
+  ] : []
 }
 
 output "etcd_secret_arn" {

@@ -537,7 +537,8 @@ resource "aws_lambda_function" "secrets_rotation" {
 
   environment {
     variables = {
-      ETCD_ENDPOINT = "http://etcd.${aws_service_discovery_private_dns_namespace.main.name}:2379"
+      # Use etcd-0 as the primary endpoint for secrets rotation
+      ETCD_ENDPOINT = "http://etcd-0.${aws_service_discovery_private_dns_namespace.main.name}:2379"
     }
   }
 

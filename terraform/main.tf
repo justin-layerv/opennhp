@@ -10,8 +10,9 @@ terraform {
 
   required_providers {
     aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
+      source                = "hashicorp/aws"
+      version               = "~> 5.0"
+      configuration_aliases = [aws.us_east_1]
     }
     random = {
       source  = "hashicorp/random"
@@ -28,11 +29,8 @@ terraform {
   }
 }
 
-# Provider for us-east-1 (required for CloudFront WAF and ACM)
-provider "aws" {
-  alias  = "us_east_1"
-  region = "us-east-1"
-}
+# Note: Provider configurations are defined in environments/*/backend.tf
+# This module expects to receive aws and aws.us_east_1 providers from the caller
 
 # ==================== Data Sources ====================
 

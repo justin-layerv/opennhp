@@ -4,6 +4,11 @@
 module "nhp" {
   source = "../.."
 
+  providers = {
+    aws           = aws
+    aws.us_east_1 = aws.us_east_1
+  }
+
   environment            = var.environment
   aws_region             = var.aws_region
   aws_account_id         = var.aws_account_id
