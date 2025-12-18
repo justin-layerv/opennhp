@@ -74,17 +74,32 @@ jobs:
             nhp/go.sum
             endpoints/go.sum
 
-      - name: Run tests
-        env:
-          KBS_SKIP_INIT: "1"
+      - name: Run tests (privileged container for iptables)
         run: |
-          echo "::group::NHP Core Tests"
-          cd nhp && go test ./... -v -timeout 5m -race
-          echo "::endgroup::"
+          # Run tests in privileged container to allow iptables access
+          # This is required for NHP tests that manipulate firewall rules
+          docker run --rm \
+            --privileged \
+            --cap-add=NET_ADMIN \
+            --cap-add=NET_RAW \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e KBS_SKIP_INIT=1 \
+            golang:${{ env.GO_VERSION }}-bookworm \
+            bash -c "
+              set -e
+              echo '::group::Installing iptables and ipset'
+              apt-get update && apt-get install -y iptables ipset >/dev/null 2>&1
+              echo '::endgroup::'
 
-          echo "::group::Endpoints Tests"
-          cd ../endpoints && go test ./... -v -timeout 5m -race
-          echo "::endgroup::"
+              echo '::group::NHP Core Tests'
+              cd nhp && go test ./... -v -timeout 5m -race
+              echo '::endgroup::'
+
+              echo '::group::Endpoints Tests'
+              cd ../endpoints && go test ./... -v -timeout 5m -race
+              echo '::endgroup::'
+            "
 
       - name: Go vet
         run: |
