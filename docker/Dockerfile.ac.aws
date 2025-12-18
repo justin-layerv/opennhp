@@ -2,7 +2,8 @@
 # For AWS deployment with Let's Encrypt DNS-01 challenge via Route53
 #
 # Stage 1: Build the NHP AC binary
-FROM golang:1.24-bookworm AS builder
+ARG GO_VERSION=1.24
+FROM golang:${GO_VERSION}-bookworm AS builder
 
 WORKDIR /nhp-server
 
@@ -12,6 +13,14 @@ RUN apt-get update && apt-get install -y \
     clang \
     llvm \
     && rm -rf /var/lib/apt/lists/*
+
+# Copy dependency files first (better layer caching)
+COPY nhp/go.mod nhp/go.sum ./nhp/
+COPY endpoints/go.mod endpoints/go.sum ./endpoints/
+
+# Download dependencies (cached unless go.mod/go.sum change)
+RUN cd nhp && go mod download
+RUN cd endpoints && go mod download
 
 # Copy source code
 COPY . .
