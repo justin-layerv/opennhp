@@ -29,6 +29,11 @@ variable "domain_name" {
   type = string
 }
 
+variable "hosted_zone" {
+  type    = string
+  default = null
+}
+
 variable "multi_tenant" {
   type = bool
 }
@@ -67,4 +72,24 @@ variable "github_org" {
 variable "github_repo" {
   type    = string
   default = "nhp"
+}
+
+variable "deploy_ac" {
+  type    = bool
+  default = true
+}
+
+variable "acme_email" {
+  type    = string
+  default = ""
+}
+
+variable "terraform_state_bucket" {
+  type    = string
+  default = ""
+}
+
+variable "terraform_lock_table" {
+  type    = string
+  default = "terraform-state-lock"
 }

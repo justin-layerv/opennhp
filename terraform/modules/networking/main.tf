@@ -1,12 +1,30 @@
 # Networking Module
 # VPC, Subnets, Security Groups, VPC Endpoints
 
+# ==================== Data Sources ====================
+
 data "aws_availability_zones" "available" {
   state = "available"
 }
 
+data "aws_region" "current" {}
+
+# ==================== Locals ====================
+
 locals {
-  azs = slice(data.aws_availability_zones.available.names, 0, 3)
+  azs     = slice(data.aws_availability_zones.available.names, 0, 3)
+  is_prod = var.environment == "prod"
+
+  # Interface VPC endpoints to create
+  interface_endpoints = {
+    "ecr-api"          = "ecr.api"
+    "ecr-dkr"          = "ecr.dkr"
+    "logs"             = "logs"
+    "secretsmanager"   = "secretsmanager"
+    "servicediscovery" = "servicediscovery"
+    "ssm"              = "ssm"
+    "ssmmessages"      = "ssmmessages"
+  }
 }
 
 # VPC
@@ -71,7 +89,7 @@ resource "aws_subnet" "isolated" {
 
 # Elastic IPs for NAT Gateways
 resource "aws_eip" "nat" {
-  count  = var.environment == "prod" ? 3 : 1
+  count  = local.is_prod ? 3 : 1
   domain = "vpc"
 
   tags = merge(var.tags, {
@@ -81,7 +99,7 @@ resource "aws_eip" "nat" {
 
 # NAT Gateways
 resource "aws_nat_gateway" "main" {
-  count         = var.environment == "prod" ? 3 : 1
+  count         = local.is_prod ? 3 : 1
   allocation_id = aws_eip.nat[count.index].id
   subnet_id     = aws_subnet.public[count.index].id
 
@@ -108,7 +126,7 @@ resource "aws_route_table" "public" {
 
 # Private Route Tables (one per AZ for prod, shared for dev/staging)
 resource "aws_route_table" "private" {
-  count  = var.environment == "prod" ? 3 : 1
+  count  = local.is_prod ? 3 : 1
   vpc_id = aws_vpc.main.id
 
   route {
@@ -141,7 +159,7 @@ resource "aws_route_table_association" "public" {
 resource "aws_route_table_association" "private" {
   count          = 3
   subnet_id      = aws_subnet.private[count.index].id
-  route_table_id = aws_route_table.private[var.environment == "prod" ? count.index : 0].id
+  route_table_id = aws_route_table.private[local.is_prod ? count.index : 0].id
 }
 
 # Route Table Associations - Isolated
@@ -154,7 +172,7 @@ resource "aws_route_table_association" "isolated" {
 # VPC Flow Logs
 resource "aws_cloudwatch_log_group" "flow_logs" {
   name              = "/vpc/${var.name_prefix}/flow-logs"
-  retention_in_days = var.environment == "prod" ? 365 : 30
+  retention_in_days = local.is_prod ? 365 : 30
 
   tags = var.tags
 }
@@ -208,75 +226,6 @@ resource "aws_flow_log" "main" {
   })
 }
 
-# Security Group for Data Layer
-resource "aws_security_group" "data" {
-  name_prefix = "${var.name_prefix}-data-"
-  vpc_id      = aws_vpc.main.id
-  description = "Security group for NHP data layer"
-
-  # etcd client port from VPC
-  ingress {
-    from_port   = 2379
-    to_port     = 2379
-    protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-    description = "etcd client port from VPC"
-  }
-
-  # etcd peer port (self)
-  ingress {
-    from_port   = 2380
-    to_port     = 2380
-    protocol    = "tcp"
-    self        = true
-    description = "etcd peer port"
-  }
-
-  # NFS for EFS (self)
-  ingress {
-    from_port   = 2049
-    to_port     = 2049
-    protocol    = "tcp"
-    self        = true
-    description = "NFS for EFS access"
-  }
-
-  # etcd peer outbound
-  egress {
-    from_port   = 2380
-    to_port     = 2380
-    protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-    description = "etcd peer outbound"
-  }
-
-  # NFS outbound
-  egress {
-    from_port   = 2049
-    to_port     = 2049
-    protocol    = "tcp"
-    self        = true
-    description = "NFS outbound for EFS"
-  }
-
-  # HTTPS for AWS APIs
-  egress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "HTTPS for AWS APIs"
-  }
-
-  tags = merge(var.tags, {
-    Name = "${var.name_prefix}-data"
-  })
-
-  lifecycle {
-    create_before_destroy = true
-  }
-}
-
 # VPC Endpoints
 resource "aws_vpc_endpoint" "s3" {
   vpc_id            = aws_vpc.main.id
@@ -306,12 +255,13 @@ resource "aws_security_group" "vpc_endpoints" {
     description = "HTTPS from VPC"
   }
 
+  # VPC endpoints only need to respond to VPC traffic, not initiate external connections
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "All outbound"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+    description = "HTTPS responses to VPC"
   }
 
   tags = merge(var.tags, {
@@ -323,69 +273,221 @@ resource "aws_security_group" "vpc_endpoints" {
   }
 }
 
-resource "aws_vpc_endpoint" "ecr_api" {
+# Interface VPC Endpoints - consolidated with for_each
+resource "aws_vpc_endpoint" "interface" {
+  for_each = local.interface_endpoints
+
   vpc_id              = aws_vpc.main.id
-  service_name        = "com.amazonaws.${data.aws_region.current.name}.ecr.api"
+  service_name        = "com.amazonaws.${data.aws_region.current.name}.${each.value}"
   vpc_endpoint_type   = "Interface"
   subnet_ids          = aws_subnet.private[*].id
   security_group_ids  = [aws_security_group.vpc_endpoints.id]
   private_dns_enabled = true
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-ecr-api"
+    Name = "${var.name_prefix}-${each.key}"
   })
 }
 
-resource "aws_vpc_endpoint" "ecr_dkr" {
-  vpc_id              = aws_vpc.main.id
-  service_name        = "com.amazonaws.${data.aws_region.current.name}.ecr.dkr"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = aws_subnet.private[*].id
-  security_group_ids  = [aws_security_group.vpc_endpoints.id]
-  private_dns_enabled = true
+# ==================== Network ACLs ====================
+# Stateless firewall rules for defense-in-depth
+# NACLs complement Security Groups with subnet-level protection
+
+# Public Subnet NACL
+resource "aws_network_acl" "public" {
+  vpc_id     = aws_vpc.main.id
+  subnet_ids = aws_subnet.public[*].id
+
+  # Inbound: Allow HTTPS
+  ingress {
+    protocol   = "tcp"
+    rule_no    = 100
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 443
+    to_port    = 443
+  }
+
+  # Inbound: Allow HTTP (for redirects and ACME)
+  ingress {
+    protocol   = "tcp"
+    rule_no    = 110
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 80
+    to_port    = 80
+  }
+
+  # Inbound: Allow NHP UDP knock packets
+  ingress {
+    protocol   = "udp"
+    rule_no    = 120
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 62206
+    to_port    = 62206
+  }
+
+  # Inbound: Allow NHP TCP connector
+  ingress {
+    protocol   = "tcp"
+    rule_no    = 130
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 4732
+    to_port    = 4732
+  }
+
+  # Inbound: Allow Portal service
+  ingress {
+    protocol   = "tcp"
+    rule_no    = 140
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 8888
+    to_port    = 8888
+  }
+
+  # Inbound: Allow ephemeral ports (return traffic)
+  ingress {
+    protocol   = "tcp"
+    rule_no    = 200
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 1024
+    to_port    = 65535
+  }
+
+  ingress {
+    protocol   = "udp"
+    rule_no    = 210
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 1024
+    to_port    = 65535
+  }
+
+  # Inbound: Allow from VPC (all traffic)
+  ingress {
+    protocol   = -1
+    rule_no    = 300
+    action     = "allow"
+    cidr_block = var.vpc_cidr
+    from_port  = 0
+    to_port    = 0
+  }
+
+  # Outbound: Allow all
+  egress {
+    protocol   = -1
+    rule_no    = 100
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 0
+    to_port    = 0
+  }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-ecr-dkr"
+    Name = "${var.name_prefix}-public"
   })
 }
 
-resource "aws_vpc_endpoint" "logs" {
-  vpc_id              = aws_vpc.main.id
-  service_name        = "com.amazonaws.${data.aws_region.current.name}.logs"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = aws_subnet.private[*].id
-  security_group_ids  = [aws_security_group.vpc_endpoints.id]
-  private_dns_enabled = true
+# Private Subnet NACL
+resource "aws_network_acl" "private" {
+  vpc_id     = aws_vpc.main.id
+  subnet_ids = aws_subnet.private[*].id
+
+  # Inbound: Allow from VPC (all traffic)
+  ingress {
+    protocol   = -1
+    rule_no    = 100
+    action     = "allow"
+    cidr_block = var.vpc_cidr
+    from_port  = 0
+    to_port    = 0
+  }
+
+  # Inbound: Allow ephemeral ports (return traffic from internet via NAT)
+  ingress {
+    protocol   = "tcp"
+    rule_no    = 200
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 1024
+    to_port    = 65535
+  }
+
+  # Outbound: Allow all to VPC
+  egress {
+    protocol   = -1
+    rule_no    = 100
+    action     = "allow"
+    cidr_block = var.vpc_cidr
+    from_port  = 0
+    to_port    = 0
+  }
+
+  # Outbound: Allow HTTPS to internet (via NAT)
+  egress {
+    protocol   = "tcp"
+    rule_no    = 200
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 443
+    to_port    = 443
+  }
+
+  # Outbound: Allow HTTP (for package updates)
+  egress {
+    protocol   = "tcp"
+    rule_no    = 210
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 80
+    to_port    = 80
+  }
+
+  # Outbound: Allow ephemeral ports (for return traffic)
+  egress {
+    protocol   = "tcp"
+    rule_no    = 300
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 1024
+    to_port    = 65535
+  }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-logs"
+    Name = "${var.name_prefix}-private"
   })
 }
 
-resource "aws_vpc_endpoint" "secretsmanager" {
-  vpc_id              = aws_vpc.main.id
-  service_name        = "com.amazonaws.${data.aws_region.current.name}.secretsmanager"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = aws_subnet.private[*].id
-  security_group_ids  = [aws_security_group.vpc_endpoints.id]
-  private_dns_enabled = true
+# Isolated Subnet NACL (most restrictive)
+resource "aws_network_acl" "isolated" {
+  vpc_id     = aws_vpc.main.id
+  subnet_ids = aws_subnet.isolated[*].id
+
+  # Inbound: Allow from VPC only
+  ingress {
+    protocol   = -1
+    rule_no    = 100
+    action     = "allow"
+    cidr_block = var.vpc_cidr
+    from_port  = 0
+    to_port    = 0
+  }
+
+  # Outbound: Allow to VPC only
+  egress {
+    protocol   = -1
+    rule_no    = 100
+    action     = "allow"
+    cidr_block = var.vpc_cidr
+    from_port  = 0
+    to_port    = 0
+  }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-secretsmanager"
+    Name = "${var.name_prefix}-isolated"
   })
 }
-
-resource "aws_vpc_endpoint" "servicediscovery" {
-  vpc_id              = aws_vpc.main.id
-  service_name        = "com.amazonaws.${data.aws_region.current.name}.servicediscovery"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = aws_subnet.private[*].id
-  security_group_ids  = [aws_security_group.vpc_endpoints.id]
-  private_dns_enabled = true
-
-  tags = merge(var.tags, {
-    Name = "${var.name_prefix}-servicediscovery"
-  })
-}
-
-data "aws_region" "current" {}

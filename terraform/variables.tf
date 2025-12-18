@@ -55,6 +55,17 @@ variable "primary_account_id" {
   }
 }
 
+variable "secondary_account_ids" {
+  description = "List of AWS account IDs that can pull from ECR (only used in primary account)"
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for id in var.secondary_account_ids : can(regex("^[0-9]{12}$", id))])
+    error_message = "All secondary account IDs must be exactly 12 digits."
+  }
+}
+
 # ==================== NHP Configuration ====================
 
 variable "domain_name" {
@@ -118,6 +129,81 @@ variable "github_repo" {
   description = "GitHub repository name"
   type        = string
   default     = "nhp"
+}
+
+# ==================== DNS Configuration ====================
+
+variable "hosted_zone" {
+  description = "Route 53 hosted zone name (e.g., 'layerv.xyz')"
+  type        = string
+  default     = null
+}
+
+# ==================== AC Configuration ====================
+
+variable "deploy_ac" {
+  description = "Deploy the Access Controller (AC) with embedded Traefik for TLS termination"
+  type        = bool
+  default     = true
+}
+
+variable "acme_email" {
+  description = "Email address for Let's Encrypt certificate registration (used by AC's Traefik)"
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.acme_email == "" || can(regex("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$", var.acme_email))
+    error_message = "ACME email must be a valid email address."
+  }
+}
+
+variable "enable_cloudfront" {
+  description = "Enable CloudFront + WAF in front of AC for DDoS protection. Recommended for production."
+  type        = bool
+  default     = false
+}
+
+# ==================== Terraform State Configuration ====================
+
+variable "terraform_state_bucket" {
+  description = "S3 bucket name for Terraform state (enables GitHub Actions Terraform permissions)"
+  type        = string
+  default     = ""
+}
+
+variable "terraform_lock_table" {
+  description = "DynamoDB table name for Terraform state locking"
+  type        = string
+  default     = "terraform-state-lock"
+}
+
+# ==================== Security Services ====================
+
+variable "enable_cloudtrail" {
+  description = "Enable AWS CloudTrail for API audit logging. May be blocked by SCPs in some accounts."
+  type        = bool
+  default     = true
+}
+
+# ==================== Monitoring & Alerting ====================
+
+variable "enable_slack_notifications" {
+  description = "Enable Slack notifications via AWS Chatbot"
+  type        = bool
+  default     = false
+}
+
+variable "slack_workspace_id" {
+  description = "Slack workspace ID for AWS Chatbot (get from AWS Chatbot console after authorizing)"
+  type        = string
+  default     = ""
+}
+
+variable "slack_channel_id" {
+  description = "Slack channel ID for alerts (e.g., C01234567 - get from channel details in Slack)"
+  type        = string
+  default     = ""
 }
 
 # ==================== Common Tags ====================

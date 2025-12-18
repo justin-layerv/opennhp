@@ -18,6 +18,11 @@ output "etcd_secret_arn" {
   value       = var.multi_tenant ? aws_secretsmanager_secret.etcd[0].arn : null
 }
 
+output "etcd_tls_secret_arn" {
+  description = "etcd TLS certificates secret ARN"
+  value       = var.multi_tenant ? aws_secretsmanager_secret.etcd_tls[0].arn : null
+}
+
 output "etcd_security_group_id" {
   description = "etcd security group ID"
   value       = var.multi_tenant ? aws_security_group.etcd[0].id : null

@@ -28,3 +28,22 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+# Slack integration variables
+variable "slack_workspace_id" {
+  description = "Slack workspace ID for AWS Chatbot (get from AWS Chatbot console after authorizing)"
+  type        = string
+  default     = ""
+}
+
+variable "slack_channel_id" {
+  description = "Slack channel ID for alerts (e.g., C01234567 - get from channel details in Slack)"
+  type        = string
+  default     = ""
+}
+
+variable "enable_slack_notifications" {
+  description = "Enable Slack notifications via AWS Chatbot"
+  type        = bool
+  default     = false
+}

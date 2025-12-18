@@ -1,0 +1,58 @@
+{
+  "http": {
+    "EnableHttp": true,
+    "EnableTLS": false,
+    "HttpListenIp": "",
+    "HttpListenPort": 62206
+  },
+  "acs": {
+    "_comment": "Access Controllers - add your ACs here",
+    "_example": {
+      "ac-1": {
+        "Name": "example-ac",
+        "PublicKeyBase64": "BASE64_PUBLIC_KEY_HERE",
+        "ExpireTime": 0,
+        "RedirectUrl": "",
+        "ResourceIds": ["resource-1"]
+      }
+    }
+  },
+  "agents": {
+    "_comment": "Agent configurations - add your agents here",
+    "_example": {
+      "agent-1": {
+        "Name": "example-agent",
+        "PublicKeyBase64": "BASE64_PUBLIC_KEY_HERE",
+        "ExpireTime": 0,
+        "ACIds": ["ac-1"]
+      }
+    }
+  },
+  "resources": {
+    "_comment": "Protected resources - add your resources here",
+    "_example": {
+      "resource-1": {
+        "Name": "example-app",
+        "Description": "Example protected application",
+        "Addresses": ["10.0.0.1:443"],
+        "Protocol": "tcp",
+        "AuthRequired": true
+      }
+    }
+  },
+  "authservices": {
+    "_comment": "Authentication services - add your auth providers here",
+    "_example": {
+      "auth-1": {
+        "Type": "oauth2",
+        "Name": "example-oauth",
+        "Config": {
+          "ClientId": "YOUR_CLIENT_ID",
+          "ClientSecret": "YOUR_CLIENT_SECRET",
+          "AuthUrl": "https://auth.example.com/authorize",
+          "TokenUrl": "https://auth.example.com/token"
+        }
+      }
+    }
+  }
+}

@@ -2,6 +2,8 @@
 # Creates ECR repositories in primary account (staging)
 # For prod account, references cross-account ECR
 
+# ==================== Variables ====================
+
 variable "name_prefix" {
   description = "Prefix for resource names"
   type        = string
@@ -37,21 +39,82 @@ variable "primary_account_id" {
   default     = ""
 }
 
+variable "terraform_state_bucket" {
+  description = "S3 bucket name for Terraform state (for GitHub Actions permissions)"
+  type        = string
+  default     = ""
+}
+
+variable "terraform_lock_table" {
+  description = "DynamoDB table name for Terraform state locking"
+  type        = string
+  default     = "terraform-state-lock"
+}
+
+variable "secondary_account_ids" {
+  description = "List of AWS account IDs that can pull from ECR (for cross-account access)"
+  type        = list(string)
+  default     = []
+}
+
+# ==================== Data Sources ====================
+
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
+
+# ==================== Locals ====================
 
 locals {
   account_id = data.aws_caller_identity.current.account_id
   region     = data.aws_region.current.name
+
+  # ECR repository names
+  ecr_repos = ["nhp-server", "nhp-ac"]
+
+  # ECR lifecycle policy (shared across repos)
+  ecr_lifecycle_policy = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "Keep last 10 images"
+      selection = {
+        tagStatus   = "any"
+        countType   = "imageCountMoreThan"
+        countNumber = 10
+      }
+      action = {
+        type = "expire"
+      }
+    }]
+  })
+
+  # Cross-account ECR policy (shared across repos)
+  # Note: secondary_account_ids should be passed from tfvars for cross-account pull
+  ecr_cross_account_policy = length(var.secondary_account_ids) > 0 ? jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "AllowCrossAccountPull"
+      Effect = "Allow"
+      Principal = {
+        AWS = [for account_id in var.secondary_account_ids : "arn:aws:iam::${account_id}:root"]
+      }
+      Action = [
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage",
+        "ecr:BatchCheckLayerAvailability"
+      ]
+    }]
+  }) : null
 }
 
 # ============================================================================
 # PRIMARY ACCOUNT RESOURCES (staging/sandbox - owns ECR)
 # ============================================================================
 
-resource "aws_ecr_repository" "server" {
-  count                = var.is_primary_account ? 1 : 0
-  name                 = "layerv/nhp-server"
+# ECR Repositories - consolidated with for_each
+resource "aws_ecr_repository" "main" {
+  for_each = var.is_primary_account ? toset(local.ecr_repos) : []
+
+  name                 = "layerv/${each.key}"
   image_tag_mutability = "MUTABLE"
 
   image_scanning_configuration {
@@ -59,7 +122,7 @@ resource "aws_ecr_repository" "server" {
   }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-server"
+    Name = "${var.name_prefix}-${each.key}"
   })
 
   lifecycle {
@@ -67,111 +130,20 @@ resource "aws_ecr_repository" "server" {
   }
 }
 
-resource "aws_ecr_lifecycle_policy" "server" {
-  count      = var.is_primary_account ? 1 : 0
-  repository = aws_ecr_repository.server[0].name
+resource "aws_ecr_lifecycle_policy" "main" {
+  for_each = var.is_primary_account ? toset(local.ecr_repos) : []
 
-  policy = jsonencode({
-    rules = [{
-      rulePriority = 1
-      description  = "Keep last 10 images"
-      selection = {
-        tagStatus   = "any"
-        countType   = "imageCountMoreThan"
-        countNumber = 10
-      }
-      action = {
-        type = "expire"
-      }
-    }]
-  })
+  repository = aws_ecr_repository.main[each.key].name
+  policy     = local.ecr_lifecycle_policy
 }
 
-resource "aws_ecr_repository" "ac" {
-  count                = var.is_primary_account ? 1 : 0
-  name                 = "layerv/nhp-ac"
-  image_tag_mutability = "MUTABLE"
+# Cross-account pull policy (allows specific accounts to pull)
+# Only created when secondary_account_ids is provided
+resource "aws_ecr_repository_policy" "cross_account" {
+  for_each = var.is_primary_account && length(var.secondary_account_ids) > 0 ? toset(local.ecr_repos) : []
 
-  image_scanning_configuration {
-    scan_on_push = true
-  }
-
-  tags = merge(var.tags, {
-    Name = "${var.name_prefix}-ac"
-  })
-
-  lifecycle {
-    prevent_destroy = true
-  }
-}
-
-resource "aws_ecr_lifecycle_policy" "ac" {
-  count      = var.is_primary_account ? 1 : 0
-  repository = aws_ecr_repository.ac[0].name
-
-  policy = jsonencode({
-    rules = [{
-      rulePriority = 1
-      description  = "Keep last 10 images"
-      selection = {
-        tagStatus   = "any"
-        countType   = "imageCountMoreThan"
-        countNumber = 10
-      }
-      action = {
-        type = "expire"
-      }
-    }]
-  })
-}
-
-# Cross-account pull policy (allows prod account to pull)
-resource "aws_ecr_repository_policy" "server_cross_account" {
-  count      = var.is_primary_account ? 1 : 0
-  repository = aws_ecr_repository.server[0].name
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Sid       = "AllowCrossAccountPull"
-      Effect    = "Allow"
-      Principal = "*"
-      Action = [
-        "ecr:GetDownloadUrlForLayer",
-        "ecr:BatchGetImage",
-        "ecr:BatchCheckLayerAvailability"
-      ]
-      Condition = {
-        StringLike = {
-          "aws:PrincipalArn" = "arn:aws:iam::*:role/*"
-        }
-      }
-    }]
-  })
-}
-
-resource "aws_ecr_repository_policy" "ac_cross_account" {
-  count      = var.is_primary_account ? 1 : 0
-  repository = aws_ecr_repository.ac[0].name
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Sid       = "AllowCrossAccountPull"
-      Effect    = "Allow"
-      Principal = "*"
-      Action = [
-        "ecr:GetDownloadUrlForLayer",
-        "ecr:BatchGetImage",
-        "ecr:BatchCheckLayerAvailability"
-      ]
-      Condition = {
-        StringLike = {
-          "aws:PrincipalArn" = "arn:aws:iam::*:role/*"
-        }
-      }
-    }]
-  })
+  repository = aws_ecr_repository.main[each.key].name
+  policy     = local.ecr_cross_account_policy
 }
 
 # ============================================================================
@@ -209,8 +181,10 @@ resource "aws_iam_role" "github_actions" {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
         }
+        # Restrict to main branch only for security
+        # This role has ECR push and Terraform state access
         StringLike = {
-          "token.actions.githubusercontent.com:sub" = "repo:${var.github_org}/${var.github_repo}:*"
+          "token.actions.githubusercontent.com:sub" = "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main"
         }
       }
     }]
@@ -249,13 +223,10 @@ resource "aws_iam_role_policy" "ecr_push" {
           "ecr:DescribeRepositories",
           "ecr:DescribeImages"
         ]
-        Resource = [
-          aws_ecr_repository.server[0].arn,
-          aws_ecr_repository.ac[0].arn
-        ]
+        Resource = [for repo in local.ecr_repos : aws_ecr_repository.main[repo].arn]
       }
     ]
-  }) : jsonencode({
+    }) : jsonencode({
     # Secondary account - cross-account ECR pull only
     Version = "2012-10-17"
     Statement = [
@@ -275,16 +246,51 @@ resource "aws_iam_role_policy" "ecr_push" {
           "ecr:DescribeRepositories",
           "ecr:DescribeImages"
         ]
-        Resource = [
-          "arn:aws:ecr:${local.region}:${var.primary_account_id}:repository/layerv/nhp-server",
-          "arn:aws:ecr:${local.region}:${var.primary_account_id}:repository/layerv/nhp-ac"
-        ]
+        Resource = [for repo in local.ecr_repos : "arn:aws:ecr:${local.region}:${var.primary_account_id}:repository/layerv/${repo}"]
       }
     ]
   })
 }
 
-# Context Lookups Policy (for CDK/Terraform plan)
+# Terraform state permissions for GitHub Actions
+resource "aws_iam_role_policy" "terraform_state" {
+  count = var.terraform_state_bucket != "" ? 1 : 0
+
+  name = "terraform-state"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "S3StateAccess"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          "arn:aws:s3:::${var.terraform_state_bucket}",
+          "arn:aws:s3:::${var.terraform_state_bucket}/*"
+        ]
+      },
+      {
+        Sid    = "DynamoDBLock"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:DeleteItem"
+        ]
+        Resource = "arn:aws:dynamodb:${local.region}:${local.account_id}:table/${var.terraform_lock_table}"
+      }
+    ]
+  })
+}
+
+# Context Lookups and Terraform Apply Policy
 resource "aws_iam_role_policy" "context_lookups" {
   name = "context-lookups"
   role = aws_iam_role.github_actions.id
@@ -304,11 +310,41 @@ resource "aws_iam_role_policy" "context_lookups" {
           "ec2:DescribeVpcEndpoints",
           "ec2:DescribeInternetGateways",
           "ec2:DescribeNatGateways",
+          "ec2:DescribeInstances",
+          "ec2:DescribeTags",
           "ssm:GetParameter",
           "route53:ListHostedZones",
           "route53:ListHostedZonesByName"
         ]
         Resource = "*"
+      },
+      {
+        Sid    = "ASGRefreshDescribe"
+        Effect = "Allow"
+        Action = [
+          "autoscaling:DescribeInstanceRefreshes",
+          "autoscaling:DescribeAutoScalingGroups"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid      = "ASGRefreshStart"
+        Effect   = "Allow"
+        Action   = ["autoscaling:StartInstanceRefresh"]
+        Resource = "arn:aws:autoscaling:${local.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/layerv-nhp-*"
+      },
+      {
+        Sid    = "SSMHealthCheck"
+        Effect = "Allow"
+        Action = [
+          "ssm:SendCommand",
+          "ssm:GetCommandInvocation"
+        ]
+        Resource = [
+          "arn:aws:ec2:${local.region}:${local.account_id}:instance/*",
+          "arn:aws:ssm:${local.region}::document/AWS-RunShellScript",
+          "arn:aws:ssm:${local.region}:${local.account_id}:document/AWS-RunShellScript"
+        ]
       }
     ]
   })
@@ -318,32 +354,24 @@ resource "aws_iam_role_policy" "context_lookups" {
 # OUTPUTS - Unified interface regardless of primary/secondary account
 # ============================================================================
 
-locals {
-  # ECR URLs - either from our resources or cross-account reference
-  server_repo_url = var.is_primary_account ? aws_ecr_repository.server[0].repository_url : "${var.primary_account_id}.dkr.ecr.${local.region}.amazonaws.com/layerv/nhp-server"
-  ac_repo_url     = var.is_primary_account ? aws_ecr_repository.ac[0].repository_url : "${var.primary_account_id}.dkr.ecr.${local.region}.amazonaws.com/layerv/nhp-ac"
-  server_repo_arn = var.is_primary_account ? aws_ecr_repository.server[0].arn : "arn:aws:ecr:${local.region}:${var.primary_account_id}:repository/layerv/nhp-server"
-  ac_repo_arn     = var.is_primary_account ? aws_ecr_repository.ac[0].arn : "arn:aws:ecr:${local.region}:${var.primary_account_id}:repository/layerv/nhp-ac"
-}
-
 output "server_repo_url" {
   description = "NHP Server ECR repository URL"
-  value       = local.server_repo_url
+  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-server"].repository_url : "${var.primary_account_id}.dkr.ecr.${local.region}.amazonaws.com/layerv/nhp-server"
 }
 
 output "server_repo_arn" {
   description = "NHP Server ECR repository ARN"
-  value       = local.server_repo_arn
+  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-server"].arn : "arn:aws:ecr:${local.region}:${var.primary_account_id}:repository/layerv/nhp-server"
 }
 
 output "ac_repo_url" {
   description = "NHP AC ECR repository URL"
-  value       = local.ac_repo_url
+  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-ac"].repository_url : "${var.primary_account_id}.dkr.ecr.${local.region}.amazonaws.com/layerv/nhp-ac"
 }
 
 output "ac_repo_arn" {
   description = "NHP AC ECR repository ARN"
-  value       = local.ac_repo_arn
+  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-ac"].arn : "arn:aws:ecr:${local.region}:${var.primary_account_id}:repository/layerv/nhp-ac"
 }
 
 output "github_actions_role_arn" {

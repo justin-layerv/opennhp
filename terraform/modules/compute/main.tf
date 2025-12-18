@@ -1,12 +1,16 @@
 # Compute Module
 # ASG, NLB, Launch Template, Cloud Map Service
 
+# ==================== Data Sources ====================
+
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
 data "aws_ssm_parameter" "ubuntu_ami" {
   name = "/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id"
 }
+
+# ==================== Locals ====================
 
 locals {
   is_prod = var.environment == "prod"
@@ -136,6 +140,7 @@ resource "aws_secretsmanager_secret" "server" {
   name                    = "${var.name_prefix}-server"
   description             = "NHP Server private key and configuration"
   recovery_window_in_days = local.is_prod ? 30 : 0
+  kms_key_id              = var.secrets_kms_key_arn
 
   tags = var.tags
 }
@@ -164,6 +169,7 @@ resource "aws_lambda_invocation" "keygen" {
 resource "aws_cloudwatch_log_group" "server" {
   name              = "/layerv/nhp-server/${var.environment}"
   retention_in_days = local.is_prod ? 365 : 30
+  kms_key_id        = var.logs_kms_key_arn
 
   tags = var.tags
 }
@@ -287,15 +293,24 @@ resource "aws_iam_instance_profile" "server" {
 resource "aws_security_group" "server" {
   name_prefix = "${var.name_prefix}-server-"
   vpc_id      = var.vpc_id
-  description = "Security group for NHP Server instances - UDP only"
+  description = "Security group for NHP Server instances"
 
-  # NHP Protocol (UDP 62206) - only exposed port
+  # NHP Protocol (UDP 62206) - from NLB
   ingress {
     from_port   = 62206
     to_port     = 62206
     protocol    = "udp"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "NHP Protocol - only exposed port"
+    description = "NHP Protocol from NLB"
+  }
+
+  # HTTP (TCP 62206) - from VPC (Traefik proxies here)
+  ingress {
+    from_port   = 62206
+    to_port     = 62206
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+    description = "HTTP from Traefik"
   }
 
   # SSH from VPC for NLB health checks (internal only)
@@ -360,6 +375,7 @@ resource "aws_launch_template" "server" {
       volume_size           = 50
       volume_type           = "gp3"
       encrypted             = true
+      kms_key_id            = var.ebs_kms_key_arn
       delete_on_termination = true
     }
   }

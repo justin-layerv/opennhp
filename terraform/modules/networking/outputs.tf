@@ -22,8 +22,3 @@ output "isolated_subnet_ids" {
   description = "Isolated subnet IDs"
   value       = aws_subnet.isolated[*].id
 }
-
-output "data_security_group_id" {
-  description = "Data layer security group ID"
-  value       = aws_security_group.data.id
-}

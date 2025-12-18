@@ -47,6 +47,14 @@ Provider = "etcd"
 Key = "/nhp/config"
 Endpoints = ["${etcd_endpoint}"]
 REMOTEEOF
+%{ else }
+# Single-tenant mode: configure HTTP server locally
+cat > /opt/layerv/nhp-server/etc/http.toml << 'HTTPEOF'
+EnableHttp = true
+EnableTLS = false
+HttpListenIp = ""
+HttpListenPort = 62206
+HTTPEOF
 %{ endif }
 
 CLOUDMAP_SERVICE_ID="${cloudmap_service_id}"

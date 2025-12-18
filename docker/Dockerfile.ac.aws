@@ -1,0 +1,197 @@
+# Multi-stage build for NHP Access Controller with embedded Traefik
+# For AWS deployment with Let's Encrypt DNS-01 challenge via Route53
+#
+# Stage 1: Build the NHP AC binary
+FROM golang:1.24-bookworm AS builder
+
+WORKDIR /nhp-server
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    make \
+    clang \
+    llvm \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy source code
+COPY . .
+
+# Build the AC
+RUN make init acd
+
+# Stage 2: Runtime image with Traefik
+FROM ubuntu:22.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y \
+    ca-certificates \
+    iptables \
+    ipset \
+    curl \
+    supervisor \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Traefik v3
+ARG TRAEFIK_VERSION=3.2.3
+RUN curl -L "https://github.com/traefik/traefik/releases/download/v${TRAEFIK_VERSION}/traefik_v${TRAEFIK_VERSION}_linux_amd64.tar.gz" \
+    | tar xz -C /usr/local/bin traefik \
+    && chmod +x /usr/local/bin/traefik
+
+# Copy built AC binary and scripts
+COPY --from=builder /nhp-server/release/nhp-ac /nhp-ac
+COPY --from=builder /nhp-server/docker/iptables_defaults_ubuntu.sh /iptables_defaults_ubuntu.sh
+COPY --from=builder /nhp-server/docker/iptables_defaults_x86.sh /iptables_defaults_x86.sh
+
+# Select appropriate iptables script based on architecture
+RUN if [ "$(uname -m)" = "x86_64" ]; then \
+        mv /iptables_defaults_x86.sh /iptables_defaults.sh; \
+    else \
+        mv /iptables_defaults_ubuntu.sh /iptables_defaults.sh; \
+    fi && \
+    chmod +x /iptables_defaults.sh && \
+    rm -f /iptables_defaults_*.sh
+
+# Create directories
+RUN mkdir -p /etc/traefik /acme /var/log/traefik /var/log/nhp-ac
+
+# Create Traefik static configuration for AWS (Let's Encrypt DNS-01)
+RUN cat > /etc/traefik/traefik.toml <<'EOF'
+# Traefik Static Configuration for NHP AC
+# TLS termination with Let's Encrypt DNS-01 via Route53
+
+[global]
+  checkNewVersion = false
+  sendAnonymousUsage = false
+
+[log]
+  level = "INFO"
+  filePath = "/var/log/traefik/traefik.log"
+
+[accessLog]
+  filePath = "/var/log/traefik/access.log"
+
+[api]
+  dashboard = true
+  insecure = true
+
+[ping]
+  entryPoint = "traefik"
+
+[entryPoints]
+  [entryPoints.https]
+    address = ":443"
+    [entryPoints.https.http.tls]
+      certResolver = "letsencrypt"
+  [entryPoints.traefik]
+    address = ":8080"
+
+[certificatesResolvers.letsencrypt.acme]
+  email = "${ACME_EMAIL}"
+  storage = "/acme/acme.json"
+  caServer = "${ACME_CA_SERVER}"
+  [certificatesResolvers.letsencrypt.acme.dnsChallenge]
+    provider = "route53"
+    delayBeforeCheck = 10
+    resolvers = ["1.1.1.1:53", "8.8.8.8:53"]
+
+[providers.file]
+  filename = "/etc/traefik/dynamic.toml"
+  watch = true
+EOF
+
+# Create Traefik dynamic configuration (routes to NHP AC)
+RUN cat > /etc/traefik/dynamic.toml <<'EOF'
+# Traefik Dynamic Configuration
+# Routes to NHP Access Controller
+
+[http.routers]
+  [http.routers.nhp-ac]
+    rule = "PathPrefix(`/`)"
+    service = "nhp-ac"
+    entryPoints = ["https"]
+    [http.routers.nhp-ac.tls]
+      certResolver = "letsencrypt"
+      [[http.routers.nhp-ac.tls.domains]]
+        main = "${NHP_DOMAIN}"
+        sans = ["*.${NHP_DOMAIN}"]
+
+[http.services]
+  [http.services.nhp-ac.loadBalancer]
+    [[http.services.nhp-ac.loadBalancer.servers]]
+      url = "http://127.0.0.1:8888"
+EOF
+
+# Create supervisord configuration
+RUN cat > /etc/supervisor/conf.d/nhp-ac.conf <<'EOF'
+[supervisord]
+nodaemon=true
+logfile=/var/log/supervisor/supervisord.log
+pidfile=/var/run/supervisord.pid
+
+[program:iptables-init]
+command=/iptables_defaults.sh
+autostart=true
+autorestart=false
+startsecs=0
+priority=1
+stdout_logfile=/var/log/supervisor/iptables-init.log
+stderr_logfile=/var/log/supervisor/iptables-init-err.log
+
+[program:traefik]
+command=/usr/local/bin/traefik --configFile=/etc/traefik/traefik.toml
+autostart=true
+autorestart=true
+priority=10
+stdout_logfile=/var/log/supervisor/traefik.log
+stderr_logfile=/var/log/supervisor/traefik-err.log
+environment=ACME_EMAIL="%(ENV_ACME_EMAIL)s",ACME_CA_SERVER="%(ENV_ACME_CA_SERVER)s",NHP_DOMAIN="%(ENV_NHP_DOMAIN)s",AWS_REGION="%(ENV_AWS_REGION)s"
+
+[program:nhp-ac]
+command=/nhp-ac/nhp-acd run
+autostart=true
+autorestart=true
+priority=20
+stdout_logfile=/var/log/supervisor/nhp-ac.log
+stderr_logfile=/var/log/supervisor/nhp-ac-err.log
+directory=/nhp-ac
+EOF
+
+# Create entrypoint that processes environment variables
+RUN cat > /entrypoint.sh <<'ENTRYPOINT'
+#!/bin/bash
+set -e
+
+# Substitute environment variables in Traefik config
+envsubst < /etc/traefik/traefik.toml > /tmp/traefik.toml && mv /tmp/traefik.toml /etc/traefik/traefik.toml
+envsubst < /etc/traefik/dynamic.toml > /tmp/dynamic.toml && mv /tmp/dynamic.toml /etc/traefik/dynamic.toml
+
+# Create ACME storage file if it doesn't exist
+if [ ! -f /acme/acme.json ]; then
+    touch /acme/acme.json
+fi
+chmod 600 /acme/acme.json
+
+# Run supervisord
+exec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
+ENTRYPOINT
+RUN chmod +x /entrypoint.sh
+
+# Install envsubst
+RUN apt-get update && apt-get install -y gettext-base && rm -rf /var/lib/apt/lists/*
+
+# Expose ports
+# 443: HTTPS (Traefik TLS termination)
+# 8888: NHP AC API (internal)
+# 8080: Traefik dashboard/health (internal)
+EXPOSE 443 8888 8080
+
+# Health check on Traefik ping endpoint
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -sf http://localhost:8080/ping || exit 1
+
+# Volume for Let's Encrypt certificates
+VOLUME ["/acme"]
+
+ENTRYPOINT ["/entrypoint.sh"]

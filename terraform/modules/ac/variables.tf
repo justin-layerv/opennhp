@@ -1,26 +1,24 @@
+# AC Module Variables
+# Access Controller with embedded Traefik for TLS termination
+
 variable "environment" {
   description = "Environment name"
   type        = string
 }
 
 variable "domain_name" {
-  description = "Domain name for NHP server"
+  description = "Domain name for the AC (e.g., nhp.layerv.xyz)"
   type        = string
 }
 
-variable "multi_tenant" {
-  description = "Enable multi-tenant mode"
-  type        = bool
+variable "hosted_zone" {
+  description = "Route 53 hosted zone name (e.g., layerv.xyz)"
+  type        = string
 }
 
-variable "min_capacity" {
-  description = "Minimum ASG capacity"
-  type        = number
-}
-
-variable "max_capacity" {
-  description = "Maximum ASG capacity"
-  type        = number
+variable "acme_email" {
+  description = "Email for Let's Encrypt certificate registration"
+  type        = string
 }
 
 variable "vpc_id" {
@@ -39,57 +37,51 @@ variable "public_subnet_ids" {
 }
 
 variable "private_subnet_ids" {
-  description = "Private subnet IDs for ASG"
+  description = "Private subnet IDs for ECS tasks"
   type        = list(string)
 }
 
-variable "server_repo_url" {
-  description = "ECR repository URL for NHP server"
+variable "ac_repo_url" {
+  description = "ECR repository URL for AC image"
   type        = string
 }
 
-variable "server_repo_arn" {
-  description = "ECR repository ARN for NHP server"
+variable "ac_repo_arn" {
+  description = "ECR repository ARN for AC image"
   type        = string
 }
 
 variable "etcd_endpoint" {
-  description = "etcd endpoint"
+  description = "etcd endpoint for configuration"
   type        = string
   default     = null
 }
 
 variable "etcd_secret_arn" {
-  description = "etcd secret ARN"
+  description = "etcd credentials secret ARN"
   type        = string
   default     = null
 }
 
 variable "namespace_id" {
-  description = "Service Discovery namespace ID"
+  description = "Cloud Map namespace ID"
   type        = string
 }
 
 variable "namespace_name" {
-  description = "Service Discovery namespace name"
+  description = "Cloud Map namespace name"
   type        = string
 }
 
 variable "name_prefix" {
-  description = "Name prefix for resources"
+  description = "Prefix for resource names"
   type        = string
 }
 
 variable "tags" {
-  description = "Tags for resources"
+  description = "Tags to apply to resources"
   type        = map(string)
   default     = {}
-}
-
-variable "ebs_kms_key_arn" {
-  description = "KMS key ARN for EBS encryption"
-  type        = string
-  default     = null
 }
 
 variable "logs_kms_key_arn" {
@@ -98,8 +90,14 @@ variable "logs_kms_key_arn" {
   default     = null
 }
 
-variable "secrets_kms_key_arn" {
-  description = "KMS key ARN for Secrets Manager encryption"
+variable "ebs_kms_key_arn" {
+  description = "KMS key ARN for EBS encryption"
   type        = string
   default     = null
+}
+
+variable "enable_cloudfront" {
+  description = "Enable CloudFront + WAF in front of NLB for DDoS protection"
+  type        = bool
+  default     = false
 }

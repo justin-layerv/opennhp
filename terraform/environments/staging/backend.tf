@@ -24,3 +24,18 @@ provider "aws" {
     }
   }
 }
+
+# Provider for us-east-1 (required for CloudFront WAF and ACM)
+provider "aws" {
+  alias   = "us_east_1"
+  region  = "us-east-1"
+  profile = "layerv"
+
+  default_tags {
+    tags = {
+      Project     = "LayerV-NHP"
+      Environment = var.environment
+      ManagedBy   = "terraform"
+    }
+  }
+}

@@ -33,3 +33,21 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "efs_kms_key_arn" {
+  description = "KMS key ARN for EFS encryption"
+  type        = string
+  default     = null
+}
+
+variable "secrets_kms_key_arn" {
+  description = "KMS key ARN for Secrets Manager encryption"
+  type        = string
+  default     = null
+}
+
+variable "logs_kms_key_arn" {
+  description = "KMS key ARN for CloudWatch Logs encryption"
+  type        = string
+  default     = null
+}

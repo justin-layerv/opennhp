@@ -6,7 +6,7 @@
 
 terraform {
   backend "s3" {
-    bucket         = "layerv-terraform-state-PROD_ACCOUNT_ID"  # TODO: Replace with actual prod account ID
+    bucket         = "layerv-terraform-state-PROD_ACCOUNT_ID" # TODO: Replace with actual prod account ID
     key            = "nhp/prod/terraform.tfstate"
     region         = "us-east-2"
     dynamodb_table = "terraform-state-lock"
