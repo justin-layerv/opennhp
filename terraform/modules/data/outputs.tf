@@ -13,7 +13,7 @@ output "etcd_endpoint" {
   value = var.multi_tenant ? (
     local.etcd_cluster_size == 1 ? (
       "https://etcd.${aws_service_discovery_private_dns_namespace.main.name}:2379"
-    ) : (
+      ) : (
       "https://etcd-0.${aws_service_discovery_private_dns_namespace.main.name}:2379"
     )
   ) : null
@@ -24,7 +24,7 @@ output "etcd_endpoints" {
   value = var.multi_tenant ? (
     local.etcd_cluster_size == 1 ? (
       ["https://etcd.${aws_service_discovery_private_dns_namespace.main.name}:2379"]
-    ) : (
+      ) : (
       [for i in range(local.etcd_cluster_size) :
         "https://etcd-${i}.${aws_service_discovery_private_dns_namespace.main.name}:2379"
       ]

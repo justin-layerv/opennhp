@@ -35,6 +35,21 @@ ListenPort = 62206
 Hostname = "$HOSTNAME"
 LogLevel = 3
 DisableAgentValidation = false
+%{ if dev_mode }
+Dev = true
+%{ endif }
+%{ if resource_mode == "api" }
+ResourceMode = "api"
+%{ if auth_url != null }
+AuthUrl = "${auth_url}"
+%{ endif }
+%{ if auth_signing_key != null }
+SigningKey = "${auth_signing_key}"
+%{ endif }
+%{ if auth_aes_key != null }
+AesKey = "${auth_aes_key}"
+%{ endif }
+%{ endif }
 
 [webrtc]
 Enable = false

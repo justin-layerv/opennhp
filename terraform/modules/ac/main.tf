@@ -306,6 +306,7 @@ locals {
     etcd_tls_secret_arn = var.etcd_tls_secret_arn
     cloudmap_service_id = aws_service_discovery_service.ac.id
     namespace_name      = var.namespace_name
+    vpc_cidr            = var.vpc_cidr
   })
 }
 

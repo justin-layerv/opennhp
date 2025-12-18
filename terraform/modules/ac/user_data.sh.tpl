@@ -75,6 +75,120 @@ docker rm "$CONTAINER_ID"
 
 echo "Binaries extracted successfully"
 
+# ============================================================================
+# NHP Firewall Setup - ipset and iptables rules for zero-trust access control
+# This creates the firewall infrastructure that nhp-acd uses to dynamically
+# allow/deny traffic based on successful NHP knocks.
+# ============================================================================
+echo "Setting up NHP firewall with ipset and iptables..."
+
+# Create ipsets for NHP traffic control
+# - tempset: temporary entries for initial knock (5s timeout)
+# - defaultset: active sessions after successful knock (120s timeout)
+# - defaultset_down: downstream tracking (121s timeout)
+ipset -exist create defaultset hash:ip,port,ip counters maxelem 1000000 timeout 120
+ipset -exist create defaultset_down hash:ip,port,ip counters maxelem 1000000 timeout 121
+ipset -exist create tempset hash:net,port counters maxelem 1000000 timeout 5
+
+echo "ipsets created successfully"
+
+# Create NHP_DENY chain for logging and dropping unauthorized traffic
+iptables -N NHP_DENY 2>/dev/null || true
+iptables -C NHP_DENY -d "$LOCAL_IP" -j LOG --log-prefix "[NHP-DENY] " --log-level 6 --log-ip-options 2>/dev/null || \
+    iptables -A NHP_DENY -d "$LOCAL_IP" -j LOG --log-prefix "[NHP-DENY] " --log-level 6 --log-ip-options
+iptables -C NHP_DENY -d "$LOCAL_IP" -j DROP 2>/dev/null || \
+    iptables -A NHP_DENY -d "$LOCAL_IP" -j DROP
+
+# Setup INPUT chain rules
+echo "Configuring INPUT chain..."
+
+# ipset rules: tempset -> defaultset promotion, then accept
+iptables -C INPUT -m set --match-set tempset src,dst -j SET --add-set defaultset src,dst,dst 2>/dev/null || \
+    iptables -A INPUT -m set --match-set tempset src,dst -j SET --add-set defaultset src,dst,dst
+iptables -C INPUT -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst 2>/dev/null || \
+    iptables -A INPUT -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst
+iptables -C INPUT -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT] " --log-level 6 --log-ip-options 2>/dev/null || \
+    iptables -A INPUT -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT] " --log-level 6 --log-ip-options
+iptables -C INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT 2>/dev/null || \
+    iptables -A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT
+iptables -C INPUT -m set --match-set tempset src,dst -j ACCEPT 2>/dev/null || \
+    iptables -A INPUT -m set --match-set tempset src,dst -j ACCEPT
+
+# Allow loopback
+iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || iptables -I INPUT -i lo -j ACCEPT
+
+# Allow SSH from VPC (for management/debugging)
+iptables -C INPUT -p tcp -s "${vpc_cidr}" --dport 22 -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -p tcp -s "${vpc_cidr}" --dport 22 -j ACCEPT
+
+# Allow HTTPS (443) from VPC for health checks and internal traffic
+iptables -C INPUT -p tcp -s "${vpc_cidr}" --dport 443 -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -p tcp -s "${vpc_cidr}" --dport 443 -j ACCEPT
+
+# Allow HTTP (80) from VPC for ACME challenge and redirects
+iptables -C INPUT -p tcp -s "${vpc_cidr}" --dport 80 -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -p tcp -s "${vpc_cidr}" --dport 80 -j ACCEPT
+
+# Allow portal (8888) from VPC
+iptables -C INPUT -p tcp -s "${vpc_cidr}" --dport 8888 -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -p tcp -s "${vpc_cidr}" --dport 8888 -j ACCEPT
+
+# Allow established connections
+iptables -C INPUT -m state --state ESTABLISHED -j ACCEPT 2>/dev/null || \
+    iptables -A INPUT -m state --state ESTABLISHED -j ACCEPT
+
+# Default deny for INPUT (jump to NHP_DENY for logging)
+iptables -C INPUT -j NHP_DENY 2>/dev/null || iptables -A INPUT -j NHP_DENY
+
+# Setup FORWARD chain rules
+echo "Configuring FORWARD chain..."
+
+iptables -C FORWARD -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst 2>/dev/null || \
+    iptables -A FORWARD -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst
+iptables -C FORWARD -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-FORWARD] " --log-level 6 --log-ip-options 2>/dev/null || \
+    iptables -A FORWARD -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-FORWARD] " --log-level 6 --log-ip-options
+iptables -C FORWARD -m set --match-set defaultset src,dst,dst -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -m set --match-set defaultset src,dst,dst -j ACCEPT
+iptables -C FORWARD -m state --state ESTABLISHED -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -m state --state ESTABLISHED -j ACCEPT
+iptables -C FORWARD -j NHP_DENY 2>/dev/null || iptables -A FORWARD -j NHP_DENY
+
+# Set chain policies
+iptables -P INPUT DROP
+iptables -P OUTPUT ACCEPT
+iptables -P FORWARD DROP
+
+echo "NHP firewall setup complete"
+
+# ============================================================================
+# rsyslog configuration for NHP logging
+# Routes NHP firewall logs to dedicated log files for monitoring
+# ============================================================================
+echo "Configuring rsyslog for NHP logging..."
+
+mkdir -p /opt/layerv/nhp-ac/logs
+chmod 755 /opt/layerv/nhp-ac/logs
+
+if [ -d /etc/rsyslog.d ]; then
+    cat > /etc/rsyslog.d/10-nhplog.conf << RSYSLOGEOF
+# NHP Firewall Logging Configuration
+template(name="NHPFormat" type="string" string="%timegenerated:8:19% $LOCAL_IP %syslogtag% %msg:::drop-last-lf%\n")
+template(name="NHPAcceptFile" type="string" string="/opt/layerv/nhp-ac/logs/nhp_accept-%\$YEAR%-%\$MONTH%-%\$DAY%.log")
+template(name="NHPForwardFile" type="string" string="/opt/layerv/nhp-ac/logs/nhp_forward-%\$YEAR%-%\$MONTH%-%\$DAY%.log")
+template(name="NHPDenyFile" type="string" string="/opt/layerv/nhp-ac/logs/nhp_deny-%\$YEAR%-%\$MONTH%-%\$DAY%.log")
+
+:msg,contains,"[NHP-ACCEPT]" ?NHPAcceptFile;NHPFormat
+& stop
+:msg,contains,"[NHP-FORWARD]" ?NHPForwardFile;NHPFormat
+& stop
+:msg,contains,"[NHP-DENY]" ?NHPDenyFile;NHPFormat
+& stop
+RSYSLOGEOF
+
+    systemctl restart rsyslog || true
+    echo "rsyslog configured for NHP logging"
+fi
+
 # Configure etcd connection for multi-tenant with TLS
 %{ if etcd_endpoint != null }
 echo "Fetching etcd TLS certificates..."
@@ -99,6 +213,20 @@ CACert = "/opt/layerv/nhp-ac/etc/tls/ca.crt"
 REMOTEEOF
 echo "Configured etcd endpoint: ${etcd_endpoint} (TLS enabled)"
 %{ endif }
+
+# ============================================================================
+# NHP-ACD HTTP Server Configuration
+# This enables the NHP protocol's HTTP interface for knock handling
+# ============================================================================
+cat > /opt/layerv/nhp-ac/etc/http.toml << 'HTTPEOF'
+# HTTP server config for NHP-ACD
+# This is the NHP protocol's HTTP interface, not Traefik's HTTPS
+EnableHttp = true
+EnableTLS = false
+HttpListenIp = "127.0.0.1"
+HttpListenPort = 8888
+HTTPEOF
+echo "NHP-ACD HTTP config created"
 
 # Traefik configuration for this environment
 # Note: traefik-plugins repo deploys plugins to /home/ubuntu/traefik/plugins-local via SSM

@@ -109,3 +109,44 @@ variable "secrets_kms_key_arn" {
   type        = string
   default     = null
 }
+
+# ============================================================================
+# NHP Server Configuration Options
+# These options control the server's authentication and resource management
+# ============================================================================
+
+variable "dev_mode" {
+  description = "Enable development mode for the NHP server"
+  type        = bool
+  default     = false
+}
+
+variable "resource_mode" {
+  description = "Resource management mode: 'local' (config file) or 'api' (external auth service)"
+  type        = string
+  default     = "local"
+  validation {
+    condition     = contains(["local", "api"], var.resource_mode)
+    error_message = "resource_mode must be either 'local' or 'api'"
+  }
+}
+
+variable "auth_url" {
+  description = "URL of the external authentication service (required when resource_mode is 'api')"
+  type        = string
+  default     = null
+}
+
+variable "auth_signing_key" {
+  description = "Signing key for authentication tokens (required when resource_mode is 'api')"
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "auth_aes_key" {
+  description = "AES encryption key for authentication (required when resource_mode is 'api')"
+  type        = string
+  default     = null
+  sensitive   = true
+}

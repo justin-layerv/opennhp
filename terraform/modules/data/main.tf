@@ -26,7 +26,7 @@ locals {
   # Multi-node: Uses 'etcd-N' for each member for proper peer discovery
   etcd_initial_cluster = local.etcd_cluster_size == 1 ? (
     "etcd-0=${local.etcd_protocol}://etcd.nhp.${var.environment}.internal:2380"
-  ) : (
+    ) : (
     join(",", [
       for i in range(local.etcd_cluster_size) :
       "etcd-${i}=${local.etcd_protocol}://etcd-${i}.nhp.${var.environment}.internal:2380"
@@ -604,7 +604,7 @@ resource "aws_lambda_function" "secrets_rotation" {
       # Use shared etcd service for single-node, first member for multi-node
       ETCD_ENDPOINT = local.etcd_cluster_size == 1 ? (
         "http://etcd.${aws_service_discovery_private_dns_namespace.main.name}:2379"
-      ) : (
+        ) : (
         "http://etcd-0.${aws_service_discovery_private_dns_namespace.main.name}:2379"
       )
     }
@@ -1048,12 +1048,12 @@ resource "aws_ecs_task_definition" "etcd" {
         # Single-node uses shared 'etcd' service; multi-node uses member-specific 'etcd-N'
         { name = "ETCD_ADVERTISE_CLIENT_URLS", value = local.etcd_cluster_size == 1 ? (
           "${local.etcd_protocol}://etcd.nhp.${var.environment}.internal:2379"
-        ) : (
+          ) : (
           "${local.etcd_protocol}://etcd-${each.key}.nhp.${var.environment}.internal:2379"
         ) },
         { name = "ETCD_INITIAL_ADVERTISE_PEER_URLS", value = local.etcd_cluster_size == 1 ? (
           "${local.etcd_protocol}://etcd.nhp.${var.environment}.internal:2380"
-        ) : (
+          ) : (
           "${local.etcd_protocol}://etcd-${each.key}.nhp.${var.environment}.internal:2380"
         ) },
         { name = "ETCD_INITIAL_CLUSTER", value = local.etcd_initial_cluster },
@@ -1189,7 +1189,7 @@ resource "aws_ecs_service" "etcd" {
   service_registries {
     registry_arn = local.etcd_cluster_size == 1 ? (
       aws_service_discovery_service.etcd_client[0].arn
-    ) : (
+      ) : (
       aws_service_discovery_service.etcd["etcd-${each.key}"].arn
     )
   }

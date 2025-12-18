@@ -353,6 +353,12 @@ locals {
     multi_tenant        = var.multi_tenant
     etcd_endpoint       = var.etcd_endpoint
     etcd_tls_secret_arn = var.etcd_tls_secret_arn
+    # Server configuration options
+    dev_mode         = var.dev_mode
+    resource_mode    = var.resource_mode
+    auth_url         = var.auth_url
+    auth_signing_key = var.auth_signing_key
+    auth_aes_key     = var.auth_aes_key
   })
 }
 

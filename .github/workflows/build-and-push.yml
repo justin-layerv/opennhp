@@ -351,6 +351,10 @@ jobs:
       - name: Terraform Plan
         id: plan
         working-directory: terraform/environments/${{ matrix.environment }}
+        env:
+          # Sensitive variables passed via TF_VAR_ environment variables
+          TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
+          TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
         run: |
           terraform plan -out=tfplan -no-color 2>&1 | tee plan.txt
 
@@ -416,6 +420,10 @@ jobs:
 
       - name: Terraform Apply
         working-directory: terraform/environments/staging
+        env:
+          # Sensitive variables passed via TF_VAR_ environment variables
+          TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
+          TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
         run: terraform apply tfplan
 
       - name: Get ASG Names from Terraform
@@ -655,6 +663,10 @@ jobs:
 
       - name: Terraform Apply
         working-directory: terraform/environments/prod
+        env:
+          # Sensitive variables passed via TF_VAR_ environment variables
+          TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
+          TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
         run: terraform apply tfplan
 
       - name: Get ASG Names from Terraform

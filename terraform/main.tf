@@ -119,17 +119,17 @@ module "data" {
 module "compute" {
   source = "./modules/compute"
 
-  environment        = var.environment
-  domain_name        = var.domain_name
-  multi_tenant       = var.multi_tenant
-  min_capacity       = var.min_capacity
-  max_capacity       = var.max_capacity
-  vpc_id             = module.networking.vpc_id
-  vpc_cidr           = var.vpc_cidr
-  public_subnet_ids  = module.networking.public_subnet_ids
-  private_subnet_ids = module.networking.private_subnet_ids
-  server_repo_url    = module.ecr.server_repo_url
-  server_repo_arn    = module.ecr.server_repo_arn
+  environment         = var.environment
+  domain_name         = var.domain_name
+  multi_tenant        = var.multi_tenant
+  min_capacity        = var.min_capacity
+  max_capacity        = var.max_capacity
+  vpc_id              = module.networking.vpc_id
+  vpc_cidr            = var.vpc_cidr
+  public_subnet_ids   = module.networking.public_subnet_ids
+  private_subnet_ids  = module.networking.private_subnet_ids
+  server_repo_url     = module.ecr.server_repo_url
+  server_repo_arn     = module.ecr.server_repo_arn
   etcd_endpoint       = module.data.etcd_endpoint
   etcd_secret_arn     = module.data.etcd_secret_arn
   etcd_tls_secret_arn = module.data.etcd_ca_cert_arn
@@ -142,6 +142,13 @@ module "compute" {
   ebs_kms_key_arn     = module.kms.ebs_key_arn
   logs_kms_key_arn    = module.kms.logs_key_arn
   secrets_kms_key_arn = module.kms.secrets_key_arn
+
+  # Server configuration options
+  dev_mode         = var.dev_mode
+  resource_mode    = var.resource_mode
+  auth_url         = var.auth_url
+  auth_signing_key = var.auth_signing_key
+  auth_aes_key     = var.auth_aes_key
 }
 
 # Monitoring Module - CloudWatch Dashboard, Alarms, Slack Notifications
@@ -204,16 +211,16 @@ module "ac" {
     aws.us_east_1 = aws.us_east_1
   }
 
-  environment        = var.environment
-  domain_name        = var.domain_name
-  hosted_zone        = var.hosted_zone
-  acme_email         = var.acme_email
-  vpc_id             = module.networking.vpc_id
-  vpc_cidr           = var.vpc_cidr
-  public_subnet_ids  = module.networking.public_subnet_ids
-  private_subnet_ids = module.networking.private_subnet_ids
-  ac_repo_url        = module.ecr.ac_repo_url
-  ac_repo_arn        = module.ecr.ac_repo_arn
+  environment         = var.environment
+  domain_name         = var.domain_name
+  hosted_zone         = var.hosted_zone
+  acme_email          = var.acme_email
+  vpc_id              = module.networking.vpc_id
+  vpc_cidr            = var.vpc_cidr
+  public_subnet_ids   = module.networking.public_subnet_ids
+  private_subnet_ids  = module.networking.private_subnet_ids
+  ac_repo_url         = module.ecr.ac_repo_url
+  ac_repo_arn         = module.ecr.ac_repo_arn
   etcd_endpoint       = module.data.etcd_endpoint
   etcd_secret_arn     = module.data.etcd_secret_arn
   etcd_tls_secret_arn = module.data.etcd_ca_cert_arn
