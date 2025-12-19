@@ -359,6 +359,7 @@ cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
     rule = "PathPrefix(\`/\`)"
     service = "nhp-ac"
     entryPoints = ["https"]
+    priority = 1
     [http.routers.nhp-ac.tls]
       certResolver = "letsencrypt"
       [[http.routers.nhp-ac.tls.domains]]
@@ -371,6 +372,26 @@ cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
       url = "http://127.0.0.1:8888"
 DYNAMICEOF
 
+# Add production domain routers if configured
+%{ if length(production_domains) > 0 }
+cat >> /home/ubuntu/traefik/dynamic.toml << 'PRODDYNAMICEOF'
+
+# Production domain routers (certificates via cross-account ACME)
+%{ for idx, domain in production_domains ~}
+  [http.routers.prod-${idx}]
+    rule = "HostRegexp(\`^.+\\.${domain}$$\`) || Host(\`${domain}\`)"
+    service = "nhp-ac"
+    entryPoints = ["https"]
+    priority = 10
+    [http.routers.prod-${idx}.tls]
+      certResolver = "letsencrypt"
+      [[http.routers.prod-${idx}.tls.domains]]
+        main = "${domain}"
+        sans = ["*.${domain}"]
+%{ endfor ~}
+PRODDYNAMICEOF
+%{ endif }
+
 # Create ACME storage
 touch /home/ubuntu/traefik/acme.json
 chmod 600 /home/ubuntu/traefik/acme.json
@@ -381,6 +402,12 @@ chown -R ubuntu:ubuntu /home/ubuntu/traefik
 # ============================================================================
 
 # Traefik systemd service
+# Note: When cross_account_route53_role_arn is set, Traefik will use that role for
+# ALL Route 53 operations. This means:
+# - Production domains (qurl.site, qurl.link) in layerv-mgmt will work
+# - Local domains (nhp.layerv.xyz) in layerv account will NOT work unless the
+#   cross-account role also has access to those zones
+# For mixed-domain scenarios, consider running separate AC instances.
 cat > /etc/systemd/system/traefik.service << SVCEOF
 [Unit]
 Description=Traefik HTTPS Proxy
@@ -395,6 +422,9 @@ ExecStart=/usr/local/bin/traefik --configFile=/home/ubuntu/traefik/traefik.toml
 Restart=always
 RestartSec=5
 Environment="AWS_REGION=${region}"
+%{ if cross_account_route53_role_arn != null ~}
+Environment="AWS_ASSUME_ROLE_ARN=${cross_account_route53_role_arn}"
+%{ endif ~}
 
 [Install]
 WantedBy=multi-user.target

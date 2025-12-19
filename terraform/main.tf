@@ -240,4 +240,8 @@ module "ac" {
   auth_service_id = var.ac_auth_service_id
   resource_ids    = var.ac_resource_ids
   server_nlb_dns  = module.compute.nlb_dns_name
+
+  # Production domains (cross-account ACME for qurl.site, qurl.link, etc.)
+  cross_account_route53_role_arn = var.cross_account_route53_role_arn
+  production_domains             = var.production_domains
 }

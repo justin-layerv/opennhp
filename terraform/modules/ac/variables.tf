@@ -130,3 +130,15 @@ variable "server_nlb_dns" {
   type        = string
   default     = ""
 }
+
+variable "cross_account_route53_role_arn" {
+  description = "IAM role ARN in management account for cross-account Route 53 access (ACME DNS challenges for production domains)"
+  type        = string
+  default     = null
+}
+
+variable "production_domains" {
+  description = "List of production domains for ACME certificate generation (requires cross_account_route53_role_arn)"
+  type        = list(string)
+  default     = []
+}

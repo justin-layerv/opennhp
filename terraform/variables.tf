@@ -215,6 +215,18 @@ variable "ac_resource_ids" {
   default     = ["default"]
 }
 
+variable "cross_account_route53_role_arn" {
+  description = "IAM role ARN in management account for cross-account Route 53 access (for ACME DNS challenges on production domains like qurl.site)"
+  type        = string
+  default     = null
+}
+
+variable "production_domains" {
+  description = "List of production domains for ACME certificate generation via cross-account Route 53 (e.g., qurl.site, qurl.link)"
+  type        = list(string)
+  default     = []
+}
+
 # ==================== Terraform State Configuration ====================
 
 variable "terraform_state_bucket" {

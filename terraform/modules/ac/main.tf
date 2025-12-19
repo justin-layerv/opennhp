@@ -262,6 +262,24 @@ resource "aws_iam_role_policy" "ac" {
   })
 }
 
+# Cross-account Route 53 access for production domains
+resource "aws_iam_role_policy" "ac_cross_account_route53" {
+  count = var.cross_account_route53_role_arn != null ? 1 : 0
+
+  name = "cross-account-route53"
+  role = aws_iam_role.ac.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "AssumeRoute53Role"
+      Effect   = "Allow"
+      Action   = "sts:AssumeRole"
+      Resource = var.cross_account_route53_role_arn
+    }]
+  })
+}
+
 resource "aws_iam_instance_profile" "ac" {
   name = "${var.name_prefix}-ac"
   role = aws_iam_role.ac.name
@@ -311,6 +329,9 @@ locals {
     auth_service_id = var.auth_service_id
     resource_ids    = jsonencode(var.resource_ids)
     server_nlb_dns  = var.server_nlb_dns
+    # Production domains (cross-account ACME)
+    cross_account_route53_role_arn = var.cross_account_route53_role_arn
+    production_domains             = var.production_domains
   })
 }
 
