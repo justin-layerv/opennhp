@@ -702,6 +702,7 @@ resource "aws_iam_role_policy" "terraform_apply_iam" {
           "iam:CreateRole",
           "iam:DeleteRole",
           "iam:UpdateRole",
+          "iam:UpdateAssumeRolePolicy",
           "iam:TagRole",
           "iam:UntagRole",
           "iam:PutRolePolicy",
@@ -716,6 +717,7 @@ resource "aws_iam_role_policy" "terraform_apply_iam" {
         ]
         Resource = [
           "arn:aws:iam::${local.account_id}:role/layerv-nhp-*",
+          "arn:aws:iam::${local.account_id}:role/nhp-github-actions",
           "arn:aws:iam::${local.account_id}:instance-profile/layerv-nhp-*"
         ]
       },
@@ -899,6 +901,21 @@ resource "aws_iam_role_policy" "terraform_apply_services" {
           "cloudtrail:PutEventSelectors"
         ]
         Resource = "*"
+      },
+      {
+        Sid    = "S3Buckets"
+        Effect = "Allow"
+        Action = [
+          "s3:CreateBucket",
+          "s3:DeleteBucket",
+          "s3:PutBucketVersioning",
+          "s3:PutBucketEncryption",
+          "s3:PutBucketPublicAccessBlock",
+          "s3:PutBucketTagging",
+          "s3:PutBucketPolicy",
+          "s3:DeleteBucketPolicy"
+        ]
+        Resource = "arn:aws:s3:::layerv-nhp-*"
       }
     ]
   })
