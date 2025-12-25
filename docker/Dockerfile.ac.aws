@@ -44,7 +44,7 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Traefik v3 with retry logic for GitHub rate limits
-ARG TRAEFIK_VERSION=3.2.3
+ARG TRAEFIK_VERSION=3.6.5
 RUN set -ex && \
     for i in 1 2 3 4 5; do \
         curl -fsSL --retry 3 --retry-delay 5 \

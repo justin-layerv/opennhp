@@ -26,3 +26,6 @@ CVE-2024-56433
 
 # tar - waiting for Ubuntu patches
 CVE-2025-45582
+
+# sigstore/timestamp-authority - no fix available yet (v1.2.9 is latest)
+CVE-2025-66564
