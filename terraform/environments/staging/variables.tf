@@ -81,3 +81,52 @@ variable "terraform_lock_table" {
   type    = string
   default = "terraform-state-lock"
 }
+
+# AC configuration
+variable "ac_auth_service_id" {
+  type    = string
+  default = "layerv"
+}
+
+variable "ac_resource_ids" {
+  type    = list(string)
+  default = ["default"]
+}
+
+# Security services
+variable "enable_cloudtrail" {
+  type    = bool
+  default = true
+}
+
+# Server configuration
+variable "dev_mode" {
+  type    = bool
+  default = false
+}
+
+variable "resource_mode" {
+  type    = string
+  default = "local"
+}
+
+variable "auth_url" {
+  type    = string
+  default = null
+}
+
+# Monitoring
+variable "enable_slack_notifications" {
+  type    = bool
+  default = false
+}
+
+variable "slack_workspace_id" {
+  type    = string
+  default = ""
+}
+
+variable "slack_channel_id" {
+  type    = string
+  default = ""
+}

@@ -27,6 +27,23 @@ module "nhp" {
   acme_email             = var.acme_email
   terraform_state_bucket = var.terraform_state_bucket
   terraform_lock_table   = var.terraform_lock_table
+
+  # AC configuration
+  ac_auth_service_id = var.ac_auth_service_id
+  ac_resource_ids    = var.ac_resource_ids
+
+  # Security services
+  enable_cloudtrail = var.enable_cloudtrail
+
+  # Server configuration
+  dev_mode      = var.dev_mode
+  resource_mode = var.resource_mode
+  auth_url      = var.auth_url
+
+  # Monitoring
+  enable_slack_notifications = var.enable_slack_notifications
+  slack_workspace_id         = var.slack_workspace_id
+  slack_channel_id           = var.slack_channel_id
 }
 
 # Re-export outputs
