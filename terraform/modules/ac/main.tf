@@ -361,7 +361,8 @@ resource "aws_launch_template" "ac" {
     }
   }
 
-  user_data = base64encode(local.user_data)
+  # Gzip compress user data to stay under 16KB limit (AWS auto-decompresses)
+  user_data = base64gzip(local.user_data)
 
   monitoring {
     enabled = true
