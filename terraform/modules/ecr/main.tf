@@ -713,12 +713,15 @@ resource "aws_iam_role_policy" "terraform_apply_iam" {
           "iam:DeleteInstanceProfile",
           "iam:AddRoleToInstanceProfile",
           "iam:RemoveRoleFromInstanceProfile",
-          "iam:PassRole"
+          "iam:PassRole",
+          "iam:TagOpenIDConnectProvider",
+          "iam:UntagOpenIDConnectProvider"
         ]
         Resource = [
           "arn:aws:iam::${local.account_id}:role/layerv-nhp-*",
           "arn:aws:iam::${local.account_id}:role/nhp-github-actions",
-          "arn:aws:iam::${local.account_id}:instance-profile/layerv-nhp-*"
+          "arn:aws:iam::${local.account_id}:instance-profile/layerv-nhp-*",
+          "arn:aws:iam::${local.account_id}:oidc-provider/*"
         ]
       },
       {
