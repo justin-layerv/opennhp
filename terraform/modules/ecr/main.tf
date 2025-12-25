@@ -354,12 +354,216 @@ resource "aws_iam_role_policy" "context_lookups" {
   })
 }
 
-# AWS Managed ReadOnlyAccess policy - gives Terraform all read permissions it needs
-# This prevents the chicken-and-egg problem where CI needs new read permissions
-# but can't grant them to itself because it doesn't have them yet
-resource "aws_iam_role_policy_attachment" "readonly_access" {
+# Custom managed policy for Terraform read permissions
+# This avoids the chicken-and-egg problem (CI can't add permissions it doesn't have)
+# while following least privilege (only read access to services we use)
+resource "aws_iam_policy" "terraform_read" {
+  name        = "nhp-github-actions-terraform-read"
+  description = "Read-only permissions for Terraform to read resource state"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "EC2Read"
+        Effect = "Allow"
+        Action = [
+          "ec2:Describe*",
+          "ec2:Get*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "S3Read"
+        Effect = "Allow"
+        Action = [
+          "s3:Get*",
+          "s3:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "IAMRead"
+        Effect = "Allow"
+        Action = [
+          "iam:Get*",
+          "iam:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "Route53Read"
+        Effect = "Allow"
+        Action = [
+          "route53:Get*",
+          "route53:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "CloudWatchRead"
+        Effect = "Allow"
+        Action = [
+          "cloudwatch:Describe*",
+          "cloudwatch:Get*",
+          "cloudwatch:List*",
+          "logs:Describe*",
+          "logs:Get*",
+          "logs:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "EFSRead"
+        Effect = "Allow"
+        Action = [
+          "elasticfilesystem:Describe*",
+          "elasticfilesystem:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "LambdaRead"
+        Effect = "Allow"
+        Action = [
+          "lambda:Get*",
+          "lambda:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "AutoScalingRead"
+        Effect = "Allow"
+        Action = [
+          "autoscaling:Describe*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ELBRead"
+        Effect = "Allow"
+        Action = [
+          "elasticloadbalancing:Describe*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "SSMRead"
+        Effect = "Allow"
+        Action = [
+          "ssm:Describe*",
+          "ssm:Get*",
+          "ssm:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "CloudTrailRead"
+        Effect = "Allow"
+        Action = [
+          "cloudtrail:Describe*",
+          "cloudtrail:Get*",
+          "cloudtrail:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "SecurityServicesRead"
+        Effect = "Allow"
+        Action = [
+          "guardduty:Get*",
+          "guardduty:List*",
+          "securityhub:Describe*",
+          "securityhub:Get*",
+          "securityhub:List*",
+          "config:Describe*",
+          "config:Get*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "KMSRead"
+        Effect = "Allow"
+        Action = [
+          "kms:Describe*",
+          "kms:Get*",
+          "kms:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "SNSRead"
+        Effect = "Allow"
+        Action = [
+          "sns:Get*",
+          "sns:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ACMRead"
+        Effect = "Allow"
+        Action = [
+          "acm:Describe*",
+          "acm:Get*",
+          "acm:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ServiceDiscoveryRead"
+        Effect = "Allow"
+        Action = [
+          "servicediscovery:Get*",
+          "servicediscovery:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "SecretsManagerRead"
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:Describe*",
+          "secretsmanager:Get*",
+          "secretsmanager:List*"
+        ]
+        Resource = "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:layerv-nhp-*"
+      },
+      {
+        Sid    = "WAFRead"
+        Effect = "Allow"
+        Action = [
+          "wafv2:Get*",
+          "wafv2:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ECRRead"
+        Effect = "Allow"
+        Action = [
+          "ecr:Describe*",
+          "ecr:Get*",
+          "ecr:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ECSRead"
+        Effect = "Allow"
+        Action = [
+          "ecs:Describe*",
+          "ecs:List*"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "terraform_read" {
   role       = aws_iam_role.github_actions.name
-  policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+  policy_arn = aws_iam_policy.terraform_read.arn
 }
 
 # ============================================================================
