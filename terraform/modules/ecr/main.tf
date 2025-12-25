@@ -482,6 +482,7 @@ resource "aws_iam_role_policy" "terraform_read" {
           "guardduty:ListTagsForResource",
           "securityhub:DescribeHub",
           "securityhub:GetEnabledStandards",
+          "securityhub:ListEnabledProductsForImport",
           "config:DescribeConfigurationRecorders",
           "config:DescribeConfigurationRecorderStatus",
           "config:DescribeDeliveryChannels",
@@ -506,6 +507,11 @@ resource "aws_iam_role_policy" "terraform_read" {
           "s3:GetBucketTagging",
           "s3:GetBucketLocation",
           "s3:GetBucketAcl",
+          "s3:GetBucketCORS",
+          "s3:GetBucketWebsite",
+          "s3:GetBucketNotification",
+          "s3:GetReplicationConfiguration",
+          "s3:GetBucketObjectLockConfiguration",
           "s3:ListBucket"
         ]
         Resource = "*"
@@ -584,7 +590,9 @@ resource "aws_iam_role_policy" "terraform_read" {
         Effect = "Allow"
         Action = [
           "cloudwatch:DescribeAlarms",
-          "cloudwatch:ListTagsForResource"
+          "cloudwatch:ListTagsForResource",
+          "cloudwatch:GetDashboard",
+          "cloudwatch:ListDashboards"
         ]
         Resource = "*"
       },
