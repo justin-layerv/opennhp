@@ -477,7 +477,8 @@ resource "aws_iam_policy" "terraform_read" {
           "securityhub:Get*",
           "securityhub:List*",
           "config:Describe*",
-          "config:Get*"
+          "config:Get*",
+          "config:List*"
         ]
         Resource = "*"
       },
