@@ -297,6 +297,18 @@ resource "aws_iam_role_policy" "ac" {
         ]
         Resource = "${aws_cloudwatch_log_group.ac.arn}:*"
       },
+      # CloudWatch Metrics (for disk monitoring)
+      {
+        Sid      = "CloudWatchMetrics"
+        Effect   = "Allow"
+        Action   = ["cloudwatch:PutMetricData"]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "cloudwatch:namespace" = "NHP/AC"
+          }
+        }
+      },
       # S3 access for Traefik plugins
       # AC instances fetch plugins from S3 on boot
       {

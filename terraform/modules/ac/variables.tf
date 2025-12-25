@@ -142,3 +142,56 @@ variable "production_domains" {
   type        = list(string)
   default     = []
 }
+
+# ============================================================================
+# SSM and Monitoring Configuration
+# These control automated maintenance and observability for AC instances
+# ============================================================================
+
+variable "enable_ssm_maintenance" {
+  description = "Enable SSM-based maintenance (log rotation, disk monitoring)"
+  type        = bool
+  default     = true
+}
+
+variable "ac_instance_tag" {
+  description = "Tag value used to identify AC instances (Name tag)"
+  type        = string
+  default     = "nhp_ac"
+}
+
+variable "log_rotation_schedule" {
+  description = "Cron expression for log rotation (UTC)"
+  type        = string
+  default     = "cron(0 3 * * ? *)" # Daily at 3 AM UTC
+}
+
+variable "journal_max_size_mb" {
+  description = "Maximum size for systemd journal in MB"
+  type        = number
+  default     = 100
+}
+
+variable "log_retention_days" {
+  description = "Days to retain rotated log files"
+  type        = number
+  default     = 7
+}
+
+variable "enable_cloudwatch_alarms" {
+  description = "Enable CloudWatch alarms for AC monitoring"
+  type        = bool
+  default     = true
+}
+
+variable "disk_usage_threshold_percent" {
+  description = "Disk usage percentage threshold for alarms"
+  type        = number
+  default     = 85
+}
+
+variable "alarm_sns_topic_arn" {
+  description = "SNS topic ARN for alarm notifications (optional)"
+  type        = string
+  default     = ""
+}
