@@ -1,5 +1,5 @@
-# Staging Environment
-# Sources the root module with staging-specific configuration
+# Sandbox Environment
+# Sources the root module with sandbox-specific configuration
 
 module "nhp" {
   source = "../.."

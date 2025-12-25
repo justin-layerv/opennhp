@@ -23,10 +23,10 @@ on:
       environment:
         description: 'Target environment'
         required: true
-        default: 'staging'
+        default: 'sandbox'
         type: choice
         options:
-          - staging
+          - sandbox
           - prod
       deploy:
         description: 'Deploy after build?'
@@ -45,7 +45,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: nhp-${{ github.event.inputs.environment || 'staging' }}-${{ github.ref_name }}
+  group: nhp-${{ github.event.inputs.environment || 'sandbox' }}-${{ github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -71,7 +71,7 @@ jobs:
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
           elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            echo "environment=staging" >> $GITHUB_OUTPUT
+            echo "environment=sandbox" >> $GITHUB_OUTPUT
           else
             echo "environment=dev" >> $GITHUB_OUTPUT
           fi
@@ -252,11 +252,11 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Terraform Format Check
-        working-directory: terraform/environments/staging
+        working-directory: terraform/environments/sandbox
         run: terraform fmt -check -recursive ../../
 
       - name: Terraform Init
-        working-directory: terraform/environments/staging
+        working-directory: terraform/environments/sandbox
         env:
           TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
         run: |
@@ -264,12 +264,12 @@ jobs:
           terraform init
 
       - name: Terraform Validate
-        working-directory: terraform/environments/staging
+        working-directory: terraform/environments/sandbox
         run: terraform validate
 
       - name: Terraform Plan
         id: plan
-        working-directory: terraform/environments/staging
+        working-directory: terraform/environments/sandbox
         run: |
           terraform plan -no-color 2>&1 | tee plan.txt
           echo "## Terraform Plan" >> $GITHUB_STEP_SUMMARY
@@ -283,7 +283,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const plan = fs.readFileSync('terraform/environments/staging/plan.txt', 'utf8');
+            const plan = fs.readFileSync('terraform/environments/sandbox/plan.txt', 'utf8');
             const lines = plan.split('\n');
             const summary = lines.slice(-30).join('\n');
 
@@ -291,7 +291,7 @@ jobs:
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `## Terraform Plan (staging)\n\`\`\`\n${summary}\n\`\`\``
+              body: `## Terraform Plan (sandbox)\n\`\`\`\n${summary}\n\`\`\``
             });
 
   # ============================================================================
@@ -310,7 +310,7 @@ jobs:
     timeout-minutes: 10
     strategy:
       matrix:
-        environment: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', github.event.inputs.environment)) || fromJSON('["staging"]') }}
+        environment: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', github.event.inputs.environment)) || fromJSON('["sandbox"]') }}
     outputs:
       has_changes: ${{ steps.plan.outputs.has_changes }}
     steps:
@@ -385,10 +385,10 @@ jobs:
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================================
-  # DEPLOY STAGING - Waits for all parallel jobs to complete
+  # DEPLOY SANDBOX - Waits for all parallel jobs to complete
   # ============================================================================
-  deploy-staging:
-    name: Deploy to Staging
+  deploy-sandbox:
+    name: Deploy to Sandbox
     needs: [setup, test, build, terraform-plan]  # Waits for all parallel jobs
     if: |
       always() &&
@@ -397,10 +397,10 @@ jobs:
       needs.terraform-plan.result == 'success' &&
       (
         (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
-        (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'staging')
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'sandbox')
       )
     runs-on: ubuntu-latest
-    environment: staging
+    environment: sandbox
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -427,11 +427,11 @@ jobs:
       - name: Download Plan Artifact
         uses: actions/download-artifact@v4
         with:
-          name: tfplan-staging-${{ github.sha }}
-          path: terraform/environments/staging
+          name: tfplan-sandbox-${{ github.sha }}
+          path: terraform/environments/sandbox
 
       - name: Terraform Init
-        working-directory: terraform/environments/staging
+        working-directory: terraform/environments/sandbox
         env:
           TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
         run: |
@@ -439,7 +439,7 @@ jobs:
           terraform init
 
       - name: Terraform Apply
-        working-directory: terraform/environments/staging
+        working-directory: terraform/environments/sandbox
         env:
           # Sensitive variables passed via TF_VAR_ environment variables
           TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
@@ -448,7 +448,7 @@ jobs:
 
       - name: Get ASG Names from Terraform
         id: outputs
-        working-directory: terraform/environments/staging
+        working-directory: terraform/environments/sandbox
         run: |
           echo "server_asg=$(terraform output -raw asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
           echo "ac_asg=$(terraform output -raw ac_asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
@@ -637,7 +637,7 @@ jobs:
 
       - name: Deployment Summary
         run: |
-          echo "## Staging Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "## Sandbox Deployment Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Component | ASG | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-----------|-----|--------|" >> $GITHUB_STEP_SUMMARY
@@ -816,7 +816,7 @@ jobs:
   # ============================================================================
   notify:
     name: Notify
-    needs: [setup, test, build, deploy-staging, deploy-prod]
+    needs: [setup, test, build, deploy-sandbox, deploy-prod]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -826,7 +826,7 @@ jobs:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
           TEST_RESULT: ${{ needs.test.result }}
           BUILD_RESULT: ${{ needs.build.result }}
-          DEPLOY_STAGING_RESULT: ${{ needs.deploy-staging.result }}
+          DEPLOY_SANDBOX_RESULT: ${{ needs.deploy-sandbox.result }}
           DEPLOY_PROD_RESULT: ${{ needs.deploy-prod.result }}
           IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
           ENVIRONMENT: ${{ needs.setup.outputs.environment }}
@@ -842,12 +842,12 @@ jobs:
 
           # Determine overall status
           if [[ "$BUILD_RESULT" == "success" ]]; then
-            if [[ "$DEPLOY_STAGING_RESULT" == "success" || "$DEPLOY_PROD_RESULT" == "success" ]]; then
+            if [[ "$DEPLOY_SANDBOX_RESULT" == "success" || "$DEPLOY_PROD_RESULT" == "success" ]]; then
               COLOR="#36a64f"
               EMOJI="ok"
               STATUS="successful"
               DETAILS="Build and deploy completed"
-            elif [[ "$DEPLOY_STAGING_RESULT" == "skipped" && "$DEPLOY_PROD_RESULT" == "skipped" ]]; then
+            elif [[ "$DEPLOY_SANDBOX_RESULT" == "skipped" && "$DEPLOY_PROD_RESULT" == "skipped" ]]; then
               COLOR="#36a64f"
               EMOJI="ok"
               STATUS="successful"
@@ -873,8 +873,8 @@ jobs:
           # Determine environment
           if [[ "$DEPLOY_PROD_RESULT" == "success" ]]; then
             DEPLOY_ENV="production"
-          elif [[ "$DEPLOY_STAGING_RESULT" == "success" ]]; then
-            DEPLOY_ENV="staging"
+          elif [[ "$DEPLOY_SANDBOX_RESULT" == "success" ]]; then
+            DEPLOY_ENV="sandbox"
           else
             DEPLOY_ENV="build-only"
           fi

@@ -10,7 +10,7 @@ terraform/
 ├── variables.tf         # Input variables
 ├── outputs.tf           # Output values
 ├── environments/        # Environment-specific configurations
-│   ├── staging/         # Staging environment (primary account)
+│   ├── sandbox/         # Sandbox environment (primary account)
 │   └── prod/            # Production environment
 ├── modules/             # Reusable Terraform modules
 │   ├── ac/              # Access Controller (Traefik + NHP-AC)
@@ -74,10 +74,10 @@ The ECR module creates IAM roles for GitHub Actions CI/CD:
 
 ## Usage
 
-### Deploy Staging
+### Deploy Sandbox
 
 ```bash
-cd environments/staging
+cd environments/sandbox
 terraform init
 terraform plan
 terraform apply
@@ -97,7 +97,7 @@ terraform output github_actions_role_arn
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `environment` | Environment name (staging/prod) | - |
+| `environment` | Environment name (sandbox/prod) | - |
 | `aws_region` | AWS region | us-east-2 |
 | `domain_name` | Domain for NHP server | - |
 | `deploy_ac` | Deploy Access Controller | true |

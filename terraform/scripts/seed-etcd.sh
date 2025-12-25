@@ -6,7 +6,7 @@
 #   ./seed-etcd.sh <environment> [config-file]
 #
 # Examples:
-#   ./seed-etcd.sh staging
+#   ./seed-etcd.sh sandbox
 #   ./seed-etcd.sh prod /path/to/custom-config.json
 #
 # Prerequisites:
@@ -16,10 +16,10 @@
 
 set -euo pipefail
 
-ENVIRONMENT="${1:-staging}"
+ENVIRONMENT="${1:-sandbox}"
 CONFIG_FILE="${2:-$(dirname "$0")/etcd-seed-config.json}"
 AWS_REGION="${AWS_REGION:-us-east-2}"
-AWS_PROFILE="${AWS_PROFILE:-layerv}"
+AWS_PROFILE="${AWS_PROFILE:-layerv-sandbox}"
 
 echo "Seeding etcd for environment: $ENVIRONMENT"
 echo "Config file: $CONFIG_FILE"

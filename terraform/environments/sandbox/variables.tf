@@ -1,4 +1,4 @@
-# Variables for staging environment
+# Variables for sandbox environment
 # Values are set in terraform.tfvars
 
 variable "environment" {
