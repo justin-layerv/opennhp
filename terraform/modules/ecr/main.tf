@@ -567,6 +567,308 @@ resource "aws_iam_role_policy_attachment" "terraform_read" {
   policy_arn = aws_iam_policy.terraform_read.arn
 }
 
+# Terraform apply permissions - split into inline policies due to size limits
+# Part 1: EC2 and Networking
+resource "aws_iam_role_policy" "terraform_apply_ec2" {
+  name = "terraform-apply-ec2"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "EC2Write"
+        Effect = "Allow"
+        Action = [
+          "ec2:CreateLaunchTemplate",
+          "ec2:CreateLaunchTemplateVersion",
+          "ec2:ModifyLaunchTemplate",
+          "ec2:DeleteLaunchTemplate",
+          "ec2:DeleteLaunchTemplateVersions",
+          "ec2:CreateSecurityGroup",
+          "ec2:DeleteSecurityGroup",
+          "ec2:AuthorizeSecurityGroup*",
+          "ec2:RevokeSecurityGroup*",
+          "ec2:ModifySecurityGroupRules",
+          "ec2:CreateVpc",
+          "ec2:DeleteVpc",
+          "ec2:ModifyVpcAttribute",
+          "ec2:CreateSubnet",
+          "ec2:DeleteSubnet",
+          "ec2:ModifySubnetAttribute",
+          "ec2:CreateRouteTable",
+          "ec2:DeleteRouteTable",
+          "ec2:CreateRoute",
+          "ec2:DeleteRoute",
+          "ec2:AssociateRouteTable",
+          "ec2:DisassociateRouteTable",
+          "ec2:CreateInternetGateway",
+          "ec2:DeleteInternetGateway",
+          "ec2:AttachInternetGateway",
+          "ec2:DetachInternetGateway",
+          "ec2:AllocateAddress",
+          "ec2:ReleaseAddress",
+          "ec2:CreateNatGateway",
+          "ec2:DeleteNatGateway",
+          "ec2:CreateVpcEndpoint",
+          "ec2:DeleteVpcEndpoints",
+          "ec2:ModifyVpcEndpoint",
+          "ec2:CreateTags",
+          "ec2:DeleteTags"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ELB"
+        Effect = "Allow"
+        Action = [
+          "elasticloadbalancing:Create*",
+          "elasticloadbalancing:Delete*",
+          "elasticloadbalancing:Modify*",
+          "elasticloadbalancing:Set*",
+          "elasticloadbalancing:Register*",
+          "elasticloadbalancing:Deregister*",
+          "elasticloadbalancing:AddTags",
+          "elasticloadbalancing:RemoveTags"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "AutoScaling"
+        Effect = "Allow"
+        Action = [
+          "autoscaling:CreateAutoScalingGroup",
+          "autoscaling:UpdateAutoScalingGroup",
+          "autoscaling:DeleteAutoScalingGroup",
+          "autoscaling:SetDesiredCapacity",
+          "autoscaling:PutScalingPolicy",
+          "autoscaling:DeletePolicy",
+          "autoscaling:CreateOrUpdateTags",
+          "autoscaling:DeleteTags"
+        ]
+        Resource = "arn:aws:autoscaling:${local.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/layerv-nhp-*"
+      }
+    ]
+  })
+}
+
+# Part 2: IAM and Security
+resource "aws_iam_role_policy" "terraform_apply_iam" {
+  name = "terraform-apply-iam"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "IAMRoles"
+        Effect = "Allow"
+        Action = [
+          "iam:CreateRole",
+          "iam:DeleteRole",
+          "iam:UpdateRole",
+          "iam:TagRole",
+          "iam:UntagRole",
+          "iam:PutRolePolicy",
+          "iam:DeleteRolePolicy",
+          "iam:AttachRolePolicy",
+          "iam:DetachRolePolicy",
+          "iam:CreateInstanceProfile",
+          "iam:DeleteInstanceProfile",
+          "iam:AddRoleToInstanceProfile",
+          "iam:RemoveRoleFromInstanceProfile",
+          "iam:PassRole"
+        ]
+        Resource = [
+          "arn:aws:iam::${local.account_id}:role/layerv-nhp-*",
+          "arn:aws:iam::${local.account_id}:instance-profile/layerv-nhp-*"
+        ]
+      },
+      {
+        Sid    = "IAMPolicies"
+        Effect = "Allow"
+        Action = [
+          "iam:CreatePolicy",
+          "iam:DeletePolicy",
+          "iam:CreatePolicyVersion",
+          "iam:DeletePolicyVersion",
+          "iam:SetDefaultPolicyVersion"
+        ]
+        Resource = "arn:aws:iam::${local.account_id}:policy/nhp-*"
+      },
+      {
+        Sid    = "SecurityServices"
+        Effect = "Allow"
+        Action = [
+          "guardduty:CreateDetector",
+          "guardduty:DeleteDetector",
+          "guardduty:UpdateDetector",
+          "securityhub:EnableSecurityHub",
+          "securityhub:DisableSecurityHub",
+          "securityhub:EnableImportFindingsForProduct",
+          "securityhub:DisableImportFindingsForProduct",
+          "config:Put*",
+          "config:Delete*",
+          "config:Start*",
+          "config:Stop*",
+          "config:TagResource",
+          "config:UntagResource"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "KMS"
+        Effect = "Allow"
+        Action = [
+          "kms:CreateKey",
+          "kms:ScheduleKeyDeletion",
+          "kms:CreateAlias",
+          "kms:DeleteAlias",
+          "kms:UpdateAlias",
+          "kms:TagResource",
+          "kms:UntagResource",
+          "kms:PutKeyPolicy"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# Part 3: Application Services
+resource "aws_iam_role_policy" "terraform_apply_services" {
+  name = "terraform-apply-services"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "Route53"
+        Effect = "Allow"
+        Action = [
+          "route53:ChangeResourceRecordSets",
+          "route53:CreateHostedZone",
+          "route53:DeleteHostedZone",
+          "route53:ChangeTagsForResource"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "CloudWatch"
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:DeleteLogGroup",
+          "logs:PutRetentionPolicy",
+          "logs:TagLogGroup",
+          "logs:UntagLogGroup",
+          "cloudwatch:PutMetricAlarm",
+          "cloudwatch:DeleteAlarms",
+          "cloudwatch:PutDashboard",
+          "cloudwatch:DeleteDashboards",
+          "cloudwatch:TagResource",
+          "cloudwatch:UntagResource"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "SNSChatbot"
+        Effect = "Allow"
+        Action = [
+          "sns:CreateTopic",
+          "sns:DeleteTopic",
+          "sns:SetTopicAttributes",
+          "sns:TagResource",
+          "sns:UntagResource",
+          "sns:Subscribe",
+          "sns:Unsubscribe",
+          "chatbot:CreateSlackChannelConfiguration",
+          "chatbot:UpdateSlackChannelConfiguration",
+          "chatbot:DeleteSlackChannelConfiguration",
+          "chatbot:TagResource",
+          "chatbot:UntagResource"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "SecretsManager"
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:CreateSecret",
+          "secretsmanager:DeleteSecret",
+          "secretsmanager:UpdateSecret",
+          "secretsmanager:PutSecretValue",
+          "secretsmanager:TagResource",
+          "secretsmanager:UntagResource"
+        ]
+        Resource = "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:layerv-nhp-*"
+      },
+      {
+        Sid    = "EFS"
+        Effect = "Allow"
+        Action = [
+          "elasticfilesystem:CreateFileSystem",
+          "elasticfilesystem:DeleteFileSystem",
+          "elasticfilesystem:CreateMountTarget",
+          "elasticfilesystem:DeleteMountTarget",
+          "elasticfilesystem:CreateAccessPoint",
+          "elasticfilesystem:DeleteAccessPoint",
+          "elasticfilesystem:Put*",
+          "elasticfilesystem:TagResource",
+          "elasticfilesystem:UntagResource"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ServiceDiscovery"
+        Effect = "Allow"
+        Action = [
+          "servicediscovery:CreatePrivateDnsNamespace",
+          "servicediscovery:DeleteNamespace",
+          "servicediscovery:CreateService",
+          "servicediscovery:DeleteService",
+          "servicediscovery:UpdateService",
+          "servicediscovery:TagResource",
+          "servicediscovery:UntagResource"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "SSMACMLambda"
+        Effect = "Allow"
+        Action = [
+          "ssm:PutParameter",
+          "ssm:DeleteParameter",
+          "ssm:AddTagsToResource",
+          "ssm:RemoveTagsFromResource",
+          "acm:RequestCertificate",
+          "acm:DeleteCertificate",
+          "acm:AddTagsToCertificate",
+          "acm:RemoveTagsFromCertificate",
+          "lambda:CreateFunction",
+          "lambda:DeleteFunction",
+          "lambda:UpdateFunctionCode",
+          "lambda:UpdateFunctionConfiguration",
+          "lambda:AddPermission",
+          "lambda:RemovePermission",
+          "lambda:TagResource",
+          "lambda:UntagResource",
+          "cloudtrail:CreateTrail",
+          "cloudtrail:DeleteTrail",
+          "cloudtrail:UpdateTrail",
+          "cloudtrail:StartLogging",
+          "cloudtrail:StopLogging",
+          "cloudtrail:AddTags",
+          "cloudtrail:RemoveTags",
+          "cloudtrail:PutEventSelectors"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
 # ============================================================================
 # OUTPUTS - Unified interface regardless of primary/secondary account
 # ============================================================================
