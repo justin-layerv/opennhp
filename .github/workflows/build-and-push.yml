@@ -55,7 +55,30 @@ env:
 
 jobs:
   # ============================================================================
-  # TEST
+  # SETUP - Quick metadata job (runs first, enables parallelism)
+  # ============================================================================
+  setup:
+    name: Setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      environment: ${{ steps.meta.outputs.environment }}
+    steps:
+      - name: Set metadata
+        id: meta
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          fi
+          echo "image_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  # ============================================================================
+  # TEST - Runs in parallel with build and terraform-plan
   # ============================================================================
   test:
     name: Test
@@ -65,12 +88,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: false  # Tests run in Docker, caching not needed
 
       - name: Run tests (privileged container for iptables)
         run: |
@@ -101,36 +118,33 @@ jobs:
 
       - name: Go vet
         run: |
-          cd nhp && go vet ./...
-          cd ../endpoints && go vet ./...
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            golang:${{ env.GO_VERSION }}-bookworm \
+            bash -c "cd nhp && go vet ./... && cd ../endpoints && go vet ./..."
 
   # ============================================================================
-  # BUILD
+  # BUILD - Parallel matrix builds (runs in parallel with test and terraform-plan)
   # ============================================================================
   build:
-    name: Build Images
-    needs: [test]
-    if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    name: Build ${{ matrix.image }}
+    needs: [setup]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    outputs:
-      image_tag: ${{ steps.meta.outputs.image_tag }}
-      environment: ${{ steps.meta.outputs.environment }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: server
+            dockerfile: docker/Dockerfile.server
+            repo: layerv/nhp-server
+          - image: ac
+            dockerfile: docker/Dockerfile.ac.aws
+            repo: layerv/nhp-ac
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set metadata
-        id: meta
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            echo "environment=staging" >> $GITHUB_OUTPUT
-          else
-            echo "environment=dev" >> $GITHUB_OUTPUT
-          fi
-          echo "image_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
 
       - name: Configure AWS credentials
         if: github.event_name != 'pull_request'
@@ -147,72 +161,42 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build NHP Server image
+      - name: Build image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/Dockerfile.server
+          file: ${{ matrix.dockerfile }}
           push: false
           load: true
           tags: |
-            ${{ steps.login-ecr.outputs.registry && format('{0}/layerv/nhp-server:{1}', steps.login-ecr.outputs.registry, steps.meta.outputs.image_tag) || format('local/layerv/nhp-server:{0}', steps.meta.outputs.image_tag) }}
-            ${{ steps.login-ecr.outputs.registry && format('{0}/layerv/nhp-server:{1}', steps.login-ecr.outputs.registry, steps.meta.outputs.environment) || format('local/layerv/nhp-server:{0}', steps.meta.outputs.environment) }}
-            ${{ steps.login-ecr.outputs.registry && format('{0}/layerv/nhp-server:latest', steps.login-ecr.outputs.registry) || 'local/layerv/nhp-server:latest' }}
+            ${{ steps.login-ecr.outputs.registry && format('{0}/{1}:{2}', steps.login-ecr.outputs.registry, matrix.repo, needs.setup.outputs.image_tag) || format('local/{0}:{1}', matrix.repo, needs.setup.outputs.image_tag) }}
+            ${{ steps.login-ecr.outputs.registry && format('{0}/{1}:{2}', steps.login-ecr.outputs.registry, matrix.repo, needs.setup.outputs.environment) || format('local/{0}:{1}', matrix.repo, needs.setup.outputs.environment) }}
+            ${{ steps.login-ecr.outputs.registry && format('{0}/{1}:latest', steps.login-ecr.outputs.registry, matrix.repo) || format('local/{0}:latest', matrix.repo) }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           build-args: |
             GO_VERSION=${{ env.GO_VERSION }}
-          cache-from: type=gha,scope=nhp-server
-          cache-to: type=gha,mode=max,scope=nhp-server
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
-      - name: Build NHP AC image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile.ac.aws
-          push: false
-          load: true
-          tags: |
-            ${{ steps.login-ecr.outputs.registry && format('{0}/layerv/nhp-ac:{1}', steps.login-ecr.outputs.registry, steps.meta.outputs.image_tag) || format('local/layerv/nhp-ac:{0}', steps.meta.outputs.image_tag) }}
-            ${{ steps.login-ecr.outputs.registry && format('{0}/layerv/nhp-ac:{1}', steps.login-ecr.outputs.registry, steps.meta.outputs.environment) || format('local/layerv/nhp-ac:{0}', steps.meta.outputs.environment) }}
-            ${{ steps.login-ecr.outputs.registry && format('{0}/layerv/nhp-ac:latest', steps.login-ecr.outputs.registry) || 'local/layerv/nhp-ac:latest' }}
-          labels: |
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-          build-args: |
-            GO_VERSION=${{ env.GO_VERSION }}
-          cache-from: type=gha,scope=nhp-ac
-          cache-to: type=gha,mode=max,scope=nhp-ac
-
-      - name: Set image names for scanning
+      - name: Set image name for scanning
+        id: image
         run: |
           ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
-          IMAGE_TAG="${{ steps.meta.outputs.image_tag }}"
+          IMAGE_TAG="${{ needs.setup.outputs.image_tag }}"
           if [[ -n "$ECR_REGISTRY" ]]; then
-            echo "SERVER_IMAGE=$ECR_REGISTRY/layerv/nhp-server:$IMAGE_TAG" >> $GITHUB_ENV
-            echo "AC_IMAGE=$ECR_REGISTRY/layerv/nhp-ac:$IMAGE_TAG" >> $GITHUB_ENV
+            echo "name=$ECR_REGISTRY/${{ matrix.repo }}:$IMAGE_TAG" >> $GITHUB_OUTPUT
           else
-            echo "SERVER_IMAGE=local/layerv/nhp-server:$IMAGE_TAG" >> $GITHUB_ENV
-            echo "AC_IMAGE=local/layerv/nhp-ac:$IMAGE_TAG" >> $GITHUB_ENV
+            echo "name=local/${{ matrix.repo }}:$IMAGE_TAG" >> $GITHUB_OUTPUT
           fi
 
-      - name: Scan NHP Server image
+      - name: Scan image
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ env.SERVER_IMAGE }}
+          image-ref: ${{ steps.image.outputs.name }}
           format: 'sarif'
-          output: 'server-trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
-          exit-code: '1'
-          trivyignores: '.trivyignore'
-
-      - name: Scan NHP AC image
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ env.AC_IMAGE }}
-          format: 'sarif'
-          output: 'ac-trivy-results.sarif'
+          output: '${{ matrix.image }}-trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
           exit-code: '1'
           trivyignores: '.trivyignore'
@@ -221,26 +205,21 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: trivy-results
-          path: '*-trivy-results.sarif'
+          name: trivy-results-${{ matrix.image }}
+          path: '${{ matrix.image }}-trivy-results.sarif'
           retention-days: 30
 
       - name: Push to ECR
         if: github.event_name != 'pull_request'
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
-          ENV_TAG: ${{ steps.meta.outputs.environment }}
+          IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
+          ENV_TAG: ${{ needs.setup.outputs.environment }}
         run: |
-          docker push $ECR_REGISTRY/layerv/nhp-server:$IMAGE_TAG
-          docker push $ECR_REGISTRY/layerv/nhp-server:$ENV_TAG
-          docker push $ECR_REGISTRY/layerv/nhp-server:latest
-
-          docker push $ECR_REGISTRY/layerv/nhp-ac:$IMAGE_TAG
-          docker push $ECR_REGISTRY/layerv/nhp-ac:$ENV_TAG
-          docker push $ECR_REGISTRY/layerv/nhp-ac:latest
-
-          echo "::notice::Images pushed: $ECR_REGISTRY/layerv/nhp-server:$IMAGE_TAG, $ECR_REGISTRY/layerv/nhp-ac:$IMAGE_TAG"
+          docker push $ECR_REGISTRY/${{ matrix.repo }}:$IMAGE_TAG
+          docker push $ECR_REGISTRY/${{ matrix.repo }}:$ENV_TAG
+          docker push $ECR_REGISTRY/${{ matrix.repo }}:latest
+          echo "::notice::Image pushed: $ECR_REGISTRY/${{ matrix.repo }}:$IMAGE_TAG"
 
   # ============================================================================
   # TERRAFORM VALIDATE (PR only - fast feedback)
@@ -259,6 +238,13 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
+      - name: Cache Terraform plugins
+        uses: actions/cache@v4
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
+          restore-keys: terraform-plugins-
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -271,7 +257,11 @@ jobs:
 
       - name: Terraform Init
         working-directory: terraform/environments/staging
-        run: terraform init
+        env:
+          TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
+        run: |
+          mkdir -p ~/.terraform.d/plugin-cache
+          terraform init
 
       - name: Terraform Validate
         working-directory: terraform/environments/staging
@@ -301,15 +291,15 @@ jobs:
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `## 🏗️ Terraform Plan (staging)\n\`\`\`\n${summary}\n\`\`\``
+              body: `## Terraform Plan (staging)\n\`\`\`\n${summary}\n\`\`\``
             });
 
   # ============================================================================
-  # TERRAFORM PLAN (Deploy path - after build)
+  # TERRAFORM PLAN - Runs in parallel with test and build
   # ============================================================================
   terraform-plan:
     name: Terraform Plan (${{ matrix.environment }})
-    needs: [build]
+    needs: [setup]  # Only needs metadata, runs in parallel with test/build
     if: |
       github.event_name != 'pull_request' &&
       (
@@ -332,6 +322,13 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
+      - name: Cache Terraform plugins
+        uses: actions/cache@v4
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
+          restore-keys: terraform-plugins-
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -340,7 +337,11 @@ jobs:
 
       - name: Terraform Init
         working-directory: terraform/environments/${{ matrix.environment }}
-        run: terraform init
+        env:
+          TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
+        run: |
+          mkdir -p ~/.terraform.d/plugin-cache
+          terraform init
 
       - name: Terraform Format Check
         working-directory: terraform/environments/${{ matrix.environment }}
@@ -377,21 +378,27 @@ jobs:
 
       - name: Plan Summary
         run: |
-          echo "## 📋 Terraform Plan (${{ matrix.environment }})" >> $GITHUB_STEP_SUMMARY
+          echo "## Terraform Plan (${{ matrix.environment }})" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           head -100 terraform/environments/${{ matrix.environment }}/plan.txt >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================================
-  # DEPLOY STAGING
+  # DEPLOY STAGING - Waits for all parallel jobs to complete
   # ============================================================================
   deploy-staging:
     name: Deploy to Staging
-    needs: [build, terraform-plan]
+    needs: [setup, test, build, terraform-plan]  # Waits for all parallel jobs
     if: |
-      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'staging')
+      always() &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      needs.build.result == 'success' &&
+      needs.terraform-plan.result == 'success' &&
+      (
+        (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'staging')
+      )
     runs-on: ubuntu-latest
     environment: staging
     timeout-minutes: 30
@@ -403,6 +410,13 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Cache Terraform plugins
+        uses: actions/cache@v4
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
+          restore-keys: terraform-plugins-
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -418,7 +432,11 @@ jobs:
 
       - name: Terraform Init
         working-directory: terraform/environments/staging
-        run: terraform init
+        env:
+          TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
+        run: |
+          mkdir -p ~/.terraform.d/plugin-cache
+          terraform init
 
       - name: Terraform Apply
         working-directory: terraform/environments/staging
@@ -441,7 +459,7 @@ jobs:
           ASG_NAME: ${{ steps.outputs.outputs.server_asg }}
         run: |
           echo "============================================"
-          echo "🐤 CANARY DEPLOYMENT - NHP Server"
+          echo "CANARY DEPLOYMENT - NHP Server"
           echo "============================================"
 
           # Start instance refresh with canary settings (1 instance at a time)
@@ -459,7 +477,7 @@ jobs:
           echo "Instance Refresh ID: $REFRESH_ID"
 
           # Wait for first instance to be replaced (canary)
-          echo "⏳ Waiting for canary instance..."
+          echo "Waiting for canary instance..."
           for i in {1..60}; do
             sleep 10
 
@@ -479,17 +497,17 @@ jobs:
 
             case "$STATUS" in
               "Successful")
-                echo "✅ Instance refresh completed successfully"
+                echo "Instance refresh completed successfully"
                 break
                 ;;
               "Failed"|"Cancelled")
-                echo "❌ Instance refresh failed: $STATUS"
+                echo "Instance refresh failed: $STATUS"
                 exit 1
                 ;;
               "InProgress")
                 # Check if at least one instance is done (canary)
                 if [[ "$PERCENTAGE" -gt 0 ]]; then
-                  echo "✅ Canary instance replaced, verifying health..."
+                  echo "Canary instance replaced, verifying health..."
 
                   # Verify via SSM
                   INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
@@ -516,9 +534,9 @@ jobs:
                         --output text 2>/dev/null || echo "Unknown")
 
                       if [[ "$SSM_STATUS" == "Success" ]]; then
-                        echo "✅ Canary health check passed"
+                        echo "Canary health check passed"
                       else
-                        echo "⚠️ Canary health check: $SSM_STATUS (continuing...)"
+                        echo "Canary health check: $SSM_STATUS (continuing...)"
                       fi
                     fi
                   fi
@@ -533,7 +551,7 @@ jobs:
           ASG_NAME: ${{ steps.outputs.outputs.ac_asg }}
         run: |
           echo "============================================"
-          echo "🐤 CANARY DEPLOYMENT - Access Controller"
+          echo "CANARY DEPLOYMENT - Access Controller"
           echo "============================================"
 
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
@@ -550,7 +568,7 @@ jobs:
           echo "Instance Refresh ID: $REFRESH_ID"
 
           # Wait for completion
-          echo "⏳ Waiting for instance refresh..."
+          echo "Waiting for instance refresh..."
           for i in {1..60}; do
             sleep 10
 
@@ -570,16 +588,16 @@ jobs:
 
             case "$STATUS" in
               "Successful")
-                echo "✅ Instance refresh completed successfully"
+                echo "Instance refresh completed successfully"
                 break
                 ;;
               "Failed"|"Cancelled")
-                echo "❌ Instance refresh failed: $STATUS"
+                echo "Instance refresh failed: $STATUS"
                 exit 1
                 ;;
               "InProgress")
                 if [[ "$PERCENTAGE" -gt 0 ]]; then
-                  echo "✅ Canary instance replaced, verifying health..."
+                  echo "Canary instance replaced, verifying health..."
 
                   INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
                     --auto-scaling-group-names "$ASG_NAME" \
@@ -606,9 +624,9 @@ jobs:
                         --output text 2>/dev/null || echo "Unknown")
 
                       if [[ "$SSM_STATUS" == "Success" ]]; then
-                        echo "✅ Canary health check passed (traefik + nhp-acd active)"
+                        echo "Canary health check passed (traefik + nhp-acd active)"
                       else
-                        echo "⚠️ Canary health check: $SSM_STATUS (continuing...)"
+                        echo "Canary health check: $SSM_STATUS (continuing...)"
                       fi
                     fi
                   fi
@@ -619,22 +637,27 @@ jobs:
 
       - name: Deployment Summary
         run: |
-          echo "## 🚀 Staging Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "## Staging Deployment Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Component | ASG | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-----------|-----|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| NHP Server | ${{ steps.outputs.outputs.server_asg }} | ✅ |" >> $GITHUB_STEP_SUMMARY
-          echo "| AC | ${{ steps.outputs.outputs.ac_asg }} | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| NHP Server | ${{ steps.outputs.outputs.server_asg }} | Done |" >> $GITHUB_STEP_SUMMARY
+          echo "| AC | ${{ steps.outputs.outputs.ac_asg }} | Done |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Image Tag:** \`${{ needs.build.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Image Tag:** \`${{ needs.setup.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================================
   # DEPLOY PROD
   # ============================================================================
   deploy-prod:
     name: Deploy to Production
-    needs: [build, terraform-plan]
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'prod'
+    needs: [setup, test, build, terraform-plan]
+    if: |
+      always() &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      needs.build.result == 'success' &&
+      needs.terraform-plan.result == 'success' &&
+      github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'prod'
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 30
@@ -646,6 +669,13 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Cache Terraform plugins
+        uses: actions/cache@v4
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
+          restore-keys: terraform-plugins-
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -661,7 +691,11 @@ jobs:
 
       - name: Terraform Init
         working-directory: terraform/environments/prod
-        run: terraform init
+        env:
+          TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
+        run: |
+          mkdir -p ~/.terraform.d/plugin-cache
+          terraform init
 
       - name: Terraform Apply
         working-directory: terraform/environments/prod
@@ -684,7 +718,7 @@ jobs:
           ASG_NAME: ${{ steps.outputs.outputs.server_asg }}
         run: |
           echo "============================================"
-          echo "🐤 CANARY DEPLOYMENT - NHP Server (PROD)"
+          echo "CANARY DEPLOYMENT - NHP Server (PROD)"
           echo "============================================"
 
           # Production: more conservative settings
@@ -700,7 +734,7 @@ jobs:
             --output text)
 
           echo "Instance Refresh ID: $REFRESH_ID"
-          echo "⏳ Waiting for production instance refresh..."
+          echo "Waiting for production instance refresh..."
 
           for i in {1..90}; do
             sleep 10
@@ -720,10 +754,10 @@ jobs:
             echo "Status: $STATUS, Progress: ${PERCENTAGE}%"
 
             if [[ "$STATUS" == "Successful" ]]; then
-              echo "✅ Production instance refresh completed"
+              echo "Production instance refresh completed"
               break
             elif [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" ]]; then
-              echo "❌ Production instance refresh failed: $STATUS"
+              echo "Production instance refresh failed: $STATUS"
               exit 1
             fi
           done
@@ -734,7 +768,7 @@ jobs:
           ASG_NAME: ${{ steps.outputs.outputs.ac_asg }}
         run: |
           echo "============================================"
-          echo "🐤 CANARY DEPLOYMENT - AC (PROD)"
+          echo "CANARY DEPLOYMENT - AC (PROD)"
           echo "============================================"
 
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
@@ -749,7 +783,7 @@ jobs:
             --output text)
 
           echo "Instance Refresh ID: $REFRESH_ID"
-          echo "⏳ Waiting for production instance refresh..."
+          echo "Waiting for production instance refresh..."
 
           for i in {1..90}; do
             sleep 10
@@ -769,10 +803,10 @@ jobs:
             echo "Status: $STATUS, Progress: ${PERCENTAGE}%"
 
             if [[ "$STATUS" == "Successful" ]]; then
-              echo "✅ Production instance refresh completed"
+              echo "Production instance refresh completed"
               break
             elif [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" ]]; then
-              echo "❌ Production instance refresh failed: $STATUS"
+              echo "Production instance refresh failed: $STATUS"
               exit 1
             fi
           done
@@ -782,7 +816,7 @@ jobs:
   # ============================================================================
   notify:
     name: Notify
-    needs: [test, build, deploy-staging, deploy-prod]
+    needs: [setup, test, build, deploy-staging, deploy-prod]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -794,8 +828,8 @@ jobs:
           BUILD_RESULT: ${{ needs.build.result }}
           DEPLOY_STAGING_RESULT: ${{ needs.deploy-staging.result }}
           DEPLOY_PROD_RESULT: ${{ needs.deploy-prod.result }}
-          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
-          ENVIRONMENT: ${{ needs.build.outputs.environment }}
+          IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
+          ENVIRONMENT: ${{ needs.setup.outputs.environment }}
         run: |
           if [[ -z "$SLACK_WEBHOOK" ]]; then
             echo "SLACK_WEBHOOK_URL not configured, skipping notification"
@@ -810,28 +844,28 @@ jobs:
           if [[ "$BUILD_RESULT" == "success" ]]; then
             if [[ "$DEPLOY_STAGING_RESULT" == "success" || "$DEPLOY_PROD_RESULT" == "success" ]]; then
               COLOR="#36a64f"
-              EMOJI="✅"
+              EMOJI="ok"
               STATUS="successful"
               DETAILS="Build and deploy completed"
             elif [[ "$DEPLOY_STAGING_RESULT" == "skipped" && "$DEPLOY_PROD_RESULT" == "skipped" ]]; then
               COLOR="#36a64f"
-              EMOJI="✅"
+              EMOJI="ok"
               STATUS="successful"
               DETAILS="Build completed (deploy skipped)"
             else
               COLOR="#dc3545"
-              EMOJI="❌"
+              EMOJI="error"
               STATUS="failed"
               DETAILS="Build succeeded but deploy failed"
             fi
           elif [[ "$BUILD_RESULT" == "failure" || "$TEST_RESULT" == "failure" ]]; then
             COLOR="#dc3545"
-            EMOJI="❌"
+            EMOJI="error"
             STATUS="failed"
             DETAILS="Build or tests failed"
           else
             COLOR="#ffc107"
-            EMOJI="⚠️"
+            EMOJI="warning"
             STATUS="incomplete"
             DETAILS="Check workflow logs"
           fi
