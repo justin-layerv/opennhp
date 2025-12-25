@@ -69,6 +69,12 @@ variable "plugin_bucket_arn" {
   default     = ""
 }
 
+variable "enable_plugin_bucket_policy" {
+  description = "Whether to create the plugin bucket write policy (set to true when AC module is deployed)"
+  type        = bool
+  default     = false
+}
+
 # ==================== Data Sources ====================
 
 data "aws_caller_identity" "current" {}
@@ -901,7 +907,7 @@ resource "aws_iam_role_policy" "terraform_apply_services" {
 # S3 write permissions for Traefik plugins bucket
 # Allows traefik-plugins repo to upload plugins to S3
 resource "aws_iam_role_policy" "plugin_bucket_write" {
-  count = var.plugin_bucket_arn != "" ? 1 : 0
+  count = var.enable_plugin_bucket_policy ? 1 : 0
 
   name = "plugin-bucket-write"
   role = aws_iam_role.github_actions.id

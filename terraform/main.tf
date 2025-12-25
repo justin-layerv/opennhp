@@ -88,6 +88,7 @@ module "ecr" {
 
   # Traefik plugins bucket (from AC module)
   # Allows traefik-plugins repo to upload plugins to S3
+  enable_plugin_bucket_policy = var.deploy_ac
   plugin_bucket_arn           = var.deploy_ac ? module.ac[0].plugin_bucket_arn : ""
   traefik_plugins_github_repo = var.traefik_plugins_github_repo
 }
