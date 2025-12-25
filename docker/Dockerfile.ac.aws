@@ -39,14 +39,23 @@ RUN apt-get update && \
     iptables \
     ipset \
     curl \
+    file \
     supervisor \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Traefik v3
+# Install Traefik v3 with retry logic for GitHub rate limits
 ARG TRAEFIK_VERSION=3.2.3
-RUN curl -L "https://github.com/traefik/traefik/releases/download/v${TRAEFIK_VERSION}/traefik_v${TRAEFIK_VERSION}_linux_amd64.tar.gz" \
-    | tar xz -C /usr/local/bin traefik \
-    && chmod +x /usr/local/bin/traefik
+RUN set -ex && \
+    for i in 1 2 3 4 5; do \
+        curl -fsSL --retry 3 --retry-delay 5 \
+            "https://github.com/traefik/traefik/releases/download/v${TRAEFIK_VERSION}/traefik_v${TRAEFIK_VERSION}_linux_amd64.tar.gz" \
+            -o /tmp/traefik.tar.gz && \
+        file /tmp/traefik.tar.gz | grep -q gzip && break || \
+        (echo "Attempt $i failed, retrying..." && sleep 10); \
+    done && \
+    tar xzf /tmp/traefik.tar.gz -C /usr/local/bin traefik && \
+    chmod +x /usr/local/bin/traefik && \
+    rm /tmp/traefik.tar.gz
 
 # Copy built AC binary and scripts
 COPY --from=builder /nhp-server/release/nhp-ac /nhp-ac
