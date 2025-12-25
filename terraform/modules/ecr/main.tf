@@ -385,7 +385,8 @@ resource "aws_iam_role_policy" "terraform_read" {
         Action = [
           "route53:GetHostedZone",
           "route53:ListResourceRecordSets",
-          "route53:GetHealthCheck"
+          "route53:GetHealthCheck",
+          "route53:ListTagsForResource"
         ]
         Resource = "*"
       },
@@ -406,7 +407,8 @@ resource "aws_iam_role_policy" "terraform_read" {
         Effect = "Allow"
         Action = [
           "ecr:ListTagsForResource",
-          "ecr:DescribeRepositories"
+          "ecr:DescribeRepositories",
+          "ecr:GetLifecyclePolicy"
         ]
         Resource = "*"
       },
@@ -417,7 +419,8 @@ resource "aws_iam_role_policy" "terraform_read" {
           "kms:DescribeKey",
           "kms:GetKeyPolicy",
           "kms:GetKeyRotationStatus",
-          "kms:ListResourceTags"
+          "kms:ListResourceTags",
+          "kms:ListAliases"
         ]
         Resource = "*"
       },
@@ -443,7 +446,10 @@ resource "aws_iam_role_policy" "terraform_read" {
           "ec2:DescribeNetworkInterfaces",
           "ec2:DescribeVolumes",
           "ec2:DescribeImages",
-          "ec2:DescribeKeyPairs"
+          "ec2:DescribeKeyPairs",
+          "ec2:DescribePrefixLists",
+          "ec2:DescribeNetworkAcls",
+          "ec2:DescribeManagedPrefixLists"
         ]
         Resource = "*"
       },
@@ -453,7 +459,8 @@ resource "aws_iam_role_policy" "terraform_read" {
         Action = [
           "logs:DescribeLogGroups",
           "logs:DescribeLogStreams",
-          "logs:ListTagsLogGroup"
+          "logs:ListTagsLogGroup",
+          "logs:ListTagsForResource"
         ]
         Resource = "*"
       },
@@ -511,7 +518,8 @@ resource "aws_iam_role_policy" "terraform_read" {
           "lambda:GetFunctionConfiguration",
           "lambda:ListVersionsByFunction",
           "lambda:GetPolicy",
-          "lambda:ListTags"
+          "lambda:ListTags",
+          "lambda:GetFunctionCodeSigningConfig"
         ]
         Resource = "*"
       },
@@ -525,7 +533,8 @@ resource "aws_iam_role_policy" "terraform_read" {
           "elasticfilesystem:DescribeAccessPoints",
           "elasticfilesystem:DescribeLifecycleConfiguration",
           "elasticfilesystem:DescribeFileSystemPolicy",
-          "elasticfilesystem:ListTagsForResource"
+          "elasticfilesystem:ListTagsForResource",
+          "elasticfilesystem:DescribeBackupPolicy"
         ]
         Resource = "*"
       },
@@ -565,7 +574,8 @@ resource "aws_iam_role_policy" "terraform_read" {
         Action = [
           "secretsmanager:DescribeSecret",
           "secretsmanager:GetResourcePolicy",
-          "secretsmanager:ListSecretVersionIds"
+          "secretsmanager:ListSecretVersionIds",
+          "secretsmanager:GetSecretValue"
         ]
         Resource = "*"
       },
@@ -588,6 +598,7 @@ resource "aws_iam_role_policy" "terraform_read" {
           "elasticloadbalancing:DescribeTargetGroupAttributes",
           "elasticloadbalancing:DescribeListeners",
           "elasticloadbalancing:DescribeListenerCertificates",
+          "elasticloadbalancing:DescribeListenerAttributes",
           "elasticloadbalancing:DescribeRules",
           "elasticloadbalancing:DescribeTags",
           "elasticloadbalancing:DescribeTargetHealth"
