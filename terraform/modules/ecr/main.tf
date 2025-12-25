@@ -557,6 +557,16 @@ resource "aws_iam_policy" "terraform_read" {
           "ecs:List*"
         ]
         Resource = "*"
+      },
+      {
+        Sid    = "ChatbotRead"
+        Effect = "Allow"
+        Action = [
+          "chatbot:Describe*",
+          "chatbot:Get*",
+          "chatbot:List*"
+        ]
+        Resource = "*"
       }
     ]
   })
