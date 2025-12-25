@@ -210,6 +210,7 @@ resource "aws_iam_role" "github_actions" {
             ],
             var.traefik_plugins_github_repo != "" ? [
               "repo:${var.github_org}/${var.traefik_plugins_github_repo}:ref:refs/heads/main",
+              "repo:${var.github_org}/${var.traefik_plugins_github_repo}:environment:sandbox",
               "repo:${var.github_org}/${var.traefik_plugins_github_repo}:environment:staging",
               "repo:${var.github_org}/${var.traefik_plugins_github_repo}:environment:production"
             ] : []
