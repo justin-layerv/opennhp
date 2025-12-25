@@ -1,0 +1,28 @@
+# Trivy ignore file for vulnerabilities without available fixes
+# These are OS-level vulnerabilities in Ubuntu 24.04 that don't have patches yet
+
+# coreutils - low severity, very old CVE
+CVE-2016-2781
+
+# curl vulnerabilities - waiting for Ubuntu patches
+CVE-2025-0167
+CVE-2025-10148
+CVE-2025-9086
+
+# gpgv - low priority
+CVE-2022-3219
+
+# libgcrypt20 - waiting for Ubuntu patches
+CVE-2024-2236
+
+# libpam - waiting for Ubuntu patches
+CVE-2025-8941
+
+# openssl/libssl3t64 - waiting for Ubuntu patches
+CVE-2024-41996
+
+# login/passwd - waiting for Ubuntu patches
+CVE-2024-56433
+
+# tar - waiting for Ubuntu patches
+CVE-2025-45582
