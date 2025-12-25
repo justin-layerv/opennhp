@@ -29,7 +29,7 @@ COPY . .
 RUN make init acd
 
 # Stage 2: Runtime image with Traefik
-FROM ubuntu:22.04 AS runtime
+FROM ubuntu:24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
