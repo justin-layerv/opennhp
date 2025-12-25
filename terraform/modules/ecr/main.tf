@@ -57,6 +57,18 @@ variable "secondary_account_ids" {
   default     = []
 }
 
+variable "traefik_plugins_github_repo" {
+  description = "GitHub repository for traefik-plugins (e.g., 'traefik-plugins')"
+  type        = string
+  default     = "traefik-plugins"
+}
+
+variable "plugin_bucket_arn" {
+  description = "ARN of the S3 bucket for Traefik plugins (from AC module)"
+  type        = string
+  default     = ""
+}
+
 # ==================== Data Sources ====================
 
 data "aws_caller_identity" "current" {}
@@ -181,14 +193,21 @@ resource "aws_iam_role" "github_actions" {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
         }
-        # Allow main branch and environment-based deployments
+        # Allow main branch and environment-based deployments for nhp and traefik-plugins repos
         # Environment-based: used by deploy jobs with `environment: staging/production`
         StringLike = {
-          "token.actions.githubusercontent.com:sub" = [
-            "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main",
-            "repo:${var.github_org}/${var.github_repo}:environment:staging",
-            "repo:${var.github_org}/${var.github_repo}:environment:production"
-          ]
+          "token.actions.githubusercontent.com:sub" = concat(
+            [
+              "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main",
+              "repo:${var.github_org}/${var.github_repo}:environment:staging",
+              "repo:${var.github_org}/${var.github_repo}:environment:production"
+            ],
+            var.traefik_plugins_github_repo != "" ? [
+              "repo:${var.github_org}/${var.traefik_plugins_github_repo}:ref:refs/heads/main",
+              "repo:${var.github_org}/${var.traefik_plugins_github_repo}:environment:staging",
+              "repo:${var.github_org}/${var.traefik_plugins_github_repo}:environment:production"
+            ] : []
+          )
         }
       }
     }]
@@ -874,6 +893,35 @@ resource "aws_iam_role_policy" "terraform_apply_services" {
           "cloudtrail:PutEventSelectors"
         ]
         Resource = "*"
+      }
+    ]
+  })
+}
+
+# S3 write permissions for Traefik plugins bucket
+# Allows traefik-plugins repo to upload plugins to S3
+resource "aws_iam_role_policy" "plugin_bucket_write" {
+  count = var.plugin_bucket_arn != "" ? 1 : 0
+
+  name = "plugin-bucket-write"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "PluginBucketWrite"
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:GetObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          var.plugin_bucket_arn,
+          "${var.plugin_bucket_arn}/*"
+        ]
       }
     ]
   })

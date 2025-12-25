@@ -58,3 +58,14 @@ output "ac_asg_name" {
   description = "AC Auto Scaling Group name"
   value       = var.deploy_ac ? module.ac[0].asg_name : null
 }
+
+# Traefik plugins bucket (for traefik-plugins repo)
+output "plugin_bucket_name" {
+  description = "S3 bucket name for Traefik plugins"
+  value       = var.deploy_ac ? module.ac[0].plugin_bucket_name : null
+}
+
+output "plugin_bucket_arn" {
+  description = "S3 bucket ARN for Traefik plugins"
+  value       = var.deploy_ac ? module.ac[0].plugin_bucket_arn : null
+}

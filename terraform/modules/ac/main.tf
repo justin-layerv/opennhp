@@ -152,6 +152,45 @@ resource "aws_cloudwatch_log_group" "ac" {
   tags = var.tags
 }
 
+# ==================== S3 Bucket for Traefik Plugins ====================
+# This bucket stores Traefik plugins that are deployed by the traefik-plugins repo.
+# AC instances fetch plugins from this bucket on boot, ensuring new instances
+# have plugins immediately available (not just via SSM to running instances).
+
+resource "aws_s3_bucket" "plugins" {
+  bucket = "${var.name_prefix}-traefik-plugins"
+
+  tags = merge(var.tags, {
+    Purpose = "Traefik plugins storage"
+  })
+}
+
+resource "aws_s3_bucket_versioning" "plugins" {
+  bucket = aws_s3_bucket.plugins.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "plugins" {
+  bucket = aws_s3_bucket.plugins.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "plugins" {
+  bucket = aws_s3_bucket.plugins.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
 # IAM Role for AC instances
 resource "aws_iam_role" "ac" {
   name = "${var.name_prefix}-ac"
@@ -257,6 +296,21 @@ resource "aws_iam_role_policy" "ac" {
           "logs:PutLogEvents"
         ]
         Resource = "${aws_cloudwatch_log_group.ac.arn}:*"
+      },
+      # S3 access for Traefik plugins
+      # AC instances fetch plugins from S3 on boot
+      {
+        Sid    = "PluginBucketRead"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectVersion",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          aws_s3_bucket.plugins.arn,
+          "${aws_s3_bucket.plugins.arn}/*"
+        ]
       }
     ]
   })
@@ -332,6 +386,8 @@ locals {
     # Production domains (cross-account ACME)
     cross_account_route53_role_arn = var.cross_account_route53_role_arn
     production_domains             = var.production_domains
+    # Traefik plugins bucket
+    plugin_bucket = aws_s3_bucket.plugins.id
   })
 }
 

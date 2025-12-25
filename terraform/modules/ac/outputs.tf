@@ -54,3 +54,13 @@ output "instance_role_arn" {
   description = "AC instance IAM role ARN"
   value       = aws_iam_role.ac.arn
 }
+
+output "plugin_bucket_arn" {
+  description = "S3 bucket ARN for Traefik plugins"
+  value       = aws_s3_bucket.plugins.arn
+}
+
+output "plugin_bucket_name" {
+  description = "S3 bucket name for Traefik plugins"
+  value       = aws_s3_bucket.plugins.id
+}

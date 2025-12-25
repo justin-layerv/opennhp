@@ -85,6 +85,11 @@ module "ecr" {
   github_repo            = var.github_repo
   terraform_state_bucket = var.terraform_state_bucket
   terraform_lock_table   = var.terraform_lock_table
+
+  # Traefik plugins bucket (from AC module)
+  # Allows traefik-plugins repo to upload plugins to S3
+  plugin_bucket_arn           = var.deploy_ac ? module.ac[0].plugin_bucket_arn : ""
+  traefik_plugins_github_repo = var.traefik_plugins_github_repo
 }
 
 # Networking Module - VPC, Subnets, Security Groups

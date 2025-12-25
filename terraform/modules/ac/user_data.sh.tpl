@@ -547,6 +547,23 @@ RestartSec=10
 WantedBy=multi-user.target
 SVCEOF
 
+# ============================================================================
+# Fetch Traefik Plugins from S3
+# Plugins are uploaded by traefik-plugins repo, fetched here on boot.
+# This ensures plugins persist across ASG instance refreshes.
+# ============================================================================
+echo "Fetching Traefik plugins from S3..."
+PLUGIN_BUCKET="${plugin_bucket}"
+if [ -n "$PLUGIN_BUCKET" ]; then
+  aws s3 sync "s3://$PLUGIN_BUCKET/" /home/ubuntu/traefik/plugins-local/ --region "$REGION" || {
+    echo "Warning: Could not sync plugins from S3 (bucket may be empty or inaccessible)"
+  }
+  chown -R ubuntu:ubuntu /home/ubuntu/traefik/plugins-local
+  echo "Traefik plugins synced from S3"
+else
+  echo "No plugin bucket configured, skipping S3 sync"
+fi
+
 # Reload systemd and enable/start all services
 systemctl daemon-reload
 systemctl enable traefik nhp-acd nhp-cloudmap-register nhp-health-monitor

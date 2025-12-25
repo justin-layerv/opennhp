@@ -170,6 +170,12 @@ variable "github_repo" {
   default     = "nhp"
 }
 
+variable "traefik_plugins_github_repo" {
+  description = "GitHub repository name for traefik-plugins (for S3 plugin upload permissions)"
+  type        = string
+  default     = "traefik-plugins"
+}
+
 # ==================== DNS Configuration ====================
 
 variable "hosted_zone" {

@@ -95,3 +95,11 @@ output "asg_name" {
 output "ac_asg_name" {
   value = module.nhp.ac_asg_name
 }
+
+output "plugin_bucket_name" {
+  value = module.nhp.plugin_bucket_name
+}
+
+output "plugin_bucket_arn" {
+  value = module.nhp.plugin_bucket_arn
+}
