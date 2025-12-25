@@ -504,6 +504,7 @@ resource "aws_iam_role_policy" "terraform_read" {
           "s3:GetBucketPolicyStatus",
           "s3:GetBucketLogging",
           "s3:GetBucketLifecycleConfiguration",
+          "s3:GetLifecycleConfiguration",
           "s3:GetBucketTagging",
           "s3:GetBucketLocation",
           "s3:GetBucketAcl",
