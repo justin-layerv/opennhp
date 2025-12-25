@@ -512,6 +512,8 @@ resource "aws_iam_role_policy" "terraform_read" {
           "s3:GetBucketNotification",
           "s3:GetReplicationConfiguration",
           "s3:GetBucketObjectLockConfiguration",
+          "s3:GetAccelerateConfiguration",
+          "s3:GetBucketRequestPayment",
           "s3:ListBucket"
         ]
         Resource = "*"
