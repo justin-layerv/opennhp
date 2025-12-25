@@ -8,13 +8,13 @@ terraform {
     region         = "us-east-2"
     dynamodb_table = "terraform-state-lock"
     encrypt        = true
-    profile        = "layerv"
+    # Note: Uses AWS_PROFILE env var locally, or IAM role in CI/CD
   }
 }
 
 provider "aws" {
-  region  = var.aws_region
-  profile = "layerv"
+  region = var.aws_region
+  # Note: Uses AWS_PROFILE env var locally, or IAM role in CI/CD
 
   default_tags {
     tags = {
@@ -27,9 +27,9 @@ provider "aws" {
 
 # Provider for us-east-1 (required for CloudFront WAF and ACM)
 provider "aws" {
-  alias   = "us_east_1"
-  region  = "us-east-1"
-  profile = "layerv"
+  alias  = "us_east_1"
+  region = "us-east-1"
+  # Note: Uses AWS_PROFILE env var locally, or IAM role in CI/CD
 
   default_tags {
     tags = {
