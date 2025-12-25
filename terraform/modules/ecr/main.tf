@@ -200,12 +200,12 @@ resource "aws_iam_role" "github_actions" {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
         }
         # Allow main branch and environment-based deployments for nhp and traefik-plugins repos
-        # Environment-based: used by deploy jobs with `environment: staging/production`
+        # Environment-based: used by deploy jobs with `environment: sandbox/production`
         StringLike = {
           "token.actions.githubusercontent.com:sub" = concat(
             [
               "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main",
-              "repo:${var.github_org}/${var.github_repo}:environment:staging",
+              "repo:${var.github_org}/${var.github_repo}:environment:sandbox",
               "repo:${var.github_org}/${var.github_repo}:environment:production"
             ],
             var.traefik_plugins_github_repo != "" ? [
