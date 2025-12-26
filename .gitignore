@@ -9,6 +9,14 @@
 *.so
 *.dylib
 
+# NHP binaries (compiled without extension on Unix)
+nhp-server
+nhp-acd
+nhp-agent
+endpoints/nhp-acd
+endpoints/nhp-server
+endpoints/nhp-agent
+
 # Test binaries
 *.test
 
