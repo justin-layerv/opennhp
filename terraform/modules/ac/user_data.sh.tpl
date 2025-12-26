@@ -239,7 +239,32 @@ echo "Configured etcd endpoint: ${etcd_endpoint} (mTLS enabled)"
 # This ensures new environments are properly bootstrapped without manual steps
 # NOTE: The private key MUST be included in etcd config because the AC code
 # loads BaseConfig from etcd, and an empty PrivateKeyBase64 will cause a crash.
+# NOTE: This bootstrap is non-fatal - AC can start with local config if etcd
+# is unavailable. The bootstrap will be retried on subsequent instance launches.
 # ============================================================================
+
+# Function to wait for DNS resolution with retries
+wait_for_dns() {
+  local hostname="$1"
+  local max_attempts=30
+  local attempt=1
+  echo "Waiting for DNS resolution of $hostname..."
+  while [ $attempt -le $max_attempts ]; do
+    if getent hosts "$hostname" > /dev/null 2>&1; then
+      echo "DNS resolution successful for $hostname"
+      return 0
+    fi
+    echo "DNS not ready (attempt $attempt/$max_attempts), waiting 10s..."
+    sleep 10
+    attempt=$((attempt + 1))
+  done
+  echo "WARNING: DNS resolution failed for $hostname after $max_attempts attempts"
+  return 1
+}
+
+# Extract hostname from etcd endpoint for DNS check
+ETCD_HOST=$(echo "${etcd_endpoint}" | sed 's|https://||' | sed 's|:.*||')
+
 echo "Checking and bootstrapping etcd configuration..."
 
 # Install etcdctl
@@ -259,15 +284,18 @@ export ETCDCTL_CERT="/opt/layerv/nhp-ac/etc/tls/client.crt"
 export ETCDCTL_KEY="/opt/layerv/nhp-ac/etc/tls/client.key"
 %{ endif }
 
-# Check if the /nhp/config key exists and has a valid private key
-# Note: The Go code prepends "/" to the key, so we must use /nhp/config (with leading slash)
-EXISTING_KEY=$(etcdctl get /nhp/config --print-value-only 2>/dev/null | grep -o "PrivateKeyBase64 = \"[^\"]*\"" | grep -v '""' || true)
-if [ -z "$EXISTING_KEY" ]; then
-  echo "etcd key '/nhp/config' not found or has empty private key, bootstrapping initial configuration..."
+# Wait for etcd DNS to be resolvable, but don't fail if it times out
+# The AC can still start with local config
+if wait_for_dns "$ETCD_HOST"; then
+  # Check if the /nhp/config key exists and has a valid private key
+  # Note: The Go code prepends "/" to the key, so we must use /nhp/config (with leading slash)
+  EXISTING_KEY=$(etcdctl get /nhp/config --print-value-only 2>/dev/null | grep -o "PrivateKeyBase64 = \"[^\"]*\"" | grep -v '""' || true)
+  if [ -z "$EXISTING_KEY" ]; then
+    echo "etcd key '/nhp/config' not found or has empty private key, bootstrapping initial configuration..."
 
-  # Create initial etcd config for AC with the private key
-  # This is TOML format matching ACEtcdConfig struct in endpoints/ac/config.go
-  cat > /tmp/etcd-init-config.toml << ETCDINITEOF
+    # Create initial etcd config for AC with the private key
+    # This is TOML format matching ACEtcdConfig struct in endpoints/ac/config.go
+    cat > /tmp/etcd-init-config.toml << ETCDINITEOF
 # NHP AC etcd configuration (infrastructure-managed bootstrap)
 # This config is loaded by AC on startup and can be updated dynamically
 
@@ -296,14 +324,19 @@ HttpListenPort = 8888
 # PubKeyBase64 = ""
 ETCDINITEOF
 
-  # Write the initial config to etcd
-  # Use /nhp/config (with leading slash) to match what the Go code expects
-  etcdctl put /nhp/config -- "$(cat /tmp/etcd-init-config.toml)"
-  rm /tmp/etcd-init-config.toml
-
-  echo "etcd bootstrap complete - initial configuration written to /nhp/config"
+    # Write the initial config to etcd (non-fatal if it fails)
+    # Use /nhp/config (with leading slash) to match what the Go code expects
+    if etcdctl put /nhp/config -- "$(cat /tmp/etcd-init-config.toml)"; then
+      echo "etcd bootstrap complete - initial configuration written to /nhp/config"
+    else
+      echo "WARNING: Failed to write etcd config, AC will use local config"
+    fi
+    rm -f /tmp/etcd-init-config.toml
+  else
+    echo "etcd key '/nhp/config' exists with valid private key, skipping bootstrap"
+  fi
 else
-  echo "etcd key '/nhp/config' exists with valid private key, skipping bootstrap"
+  echo "WARNING: etcd DNS not resolvable, skipping etcd bootstrap. AC will use local config."
 fi
 %{ endif }
 
@@ -468,12 +501,12 @@ DYNAMICEOF
 
 # Add production domain routers if configured
 %{ if length(production_domains) > 0 }
-cat >> /home/ubuntu/traefik/dynamic.toml << 'PRODDYNAMICEOF'
+cat >> /home/ubuntu/traefik/dynamic.toml << PRODDYNAMICEOF
 
 # Production domain routers (certificates via cross-account ACME)
 %{ for idx, domain in production_domains ~}
   [http.routers.prod-${idx}]
-    rule = "HostRegexp(\`^.+\\.${domain}$$\`) || Host(\`${domain}\`)"
+    rule = "HostRegexp(\`^.+\\\\.${domain}\$\`) || Host(\`${domain}\`)"
     service = "nhp-ac"
     entryPoints = ["https"]
     priority = 10
