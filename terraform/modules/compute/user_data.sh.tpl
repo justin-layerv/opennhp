@@ -60,12 +60,15 @@ CONFIGEOF
 echo "Configuring etcd connection with TLS..."
 mkdir -p /opt/layerv/nhp-server/etc/tls
 
-# Fetch etcd TLS CA certificate from Secrets Manager
+# Fetch etcd TLS certificates from Secrets Manager (CA + client certs for mTLS)
 %{ if etcd_tls_secret_arn != null }
 ETCD_TLS_SECRET=$(aws secretsmanager get-secret-value --secret-id "${etcd_tls_secret_arn}" --region "$REGION" --query SecretString --output text)
 echo "$ETCD_TLS_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['caCert'])" > /opt/layerv/nhp-server/etc/tls/ca.crt
-chmod 644 /opt/layerv/nhp-server/etc/tls/ca.crt
-echo "etcd CA certificate installed"
+echo "$ETCD_TLS_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['clientCert'])" > /opt/layerv/nhp-server/etc/tls/client.crt
+echo "$ETCD_TLS_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['clientKey'])" > /opt/layerv/nhp-server/etc/tls/client.key
+chmod 644 /opt/layerv/nhp-server/etc/tls/ca.crt /opt/layerv/nhp-server/etc/tls/client.crt
+chmod 600 /opt/layerv/nhp-server/etc/tls/client.key
+echo "etcd TLS certificates installed (CA + client)"
 %{ endif }
 
 cat > /opt/layerv/nhp-server/etc/remote.toml << 'REMOTEEOF'
@@ -75,6 +78,8 @@ Endpoints = ["${etcd_endpoint}"]
 %{ if etcd_tls_secret_arn != null }
 TLS = true
 CACert = "/nhp-server/etc/tls/ca.crt"
+ClientCert = "/nhp-server/etc/tls/client.crt"
+ClientKey = "/nhp-server/etc/tls/client.key"
 %{ endif }
 REMOTEEOF
 echo "Configured etcd endpoint: ${etcd_endpoint} (TLS enabled)"
