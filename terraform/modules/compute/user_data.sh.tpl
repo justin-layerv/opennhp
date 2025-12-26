@@ -13,6 +13,17 @@ systemctl start docker
 
 for i in {1..30}; do docker info && break || sleep 2; done
 
+# Fix DNS for Go's pure resolver (doesn't work with systemd-resolved stub)
+# Disable stub listener and point to real VPC DNS resolver
+mkdir -p /etc/systemd/resolved.conf.d
+cat > /etc/systemd/resolved.conf.d/disable-stub.conf << 'DNSEOF'
+[Resolve]
+DNSStubListener=no
+DNSEOF
+ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+systemctl restart systemd-resolved
+echo "DNS configured to use VPC resolver directly"
+
 SECRET_ARN="${secret_arn}"
 REGION="${region}"
 SECRET=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --region "$REGION" --query SecretString --output text)
@@ -55,43 +66,14 @@ AesKey = "${auth_aes_key}"
 Enable = false
 CONFIGEOF
 
-%{ if multi_tenant && etcd_endpoint != null }
-# Configure etcd connection for multi-tenant with TLS
-echo "Configuring etcd connection with TLS..."
-mkdir -p /opt/layerv/nhp-server/etc/tls
-
-# Fetch etcd TLS certificates from Secrets Manager (CA + client certs for mTLS)
-%{ if etcd_tls_secret_arn != null }
-ETCD_TLS_SECRET=$(aws secretsmanager get-secret-value --secret-id "${etcd_tls_secret_arn}" --region "$REGION" --query SecretString --output text)
-echo "$ETCD_TLS_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['caCert'])" > /opt/layerv/nhp-server/etc/tls/ca.crt
-echo "$ETCD_TLS_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['clientCert'])" > /opt/layerv/nhp-server/etc/tls/client.crt
-echo "$ETCD_TLS_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['clientKey'])" > /opt/layerv/nhp-server/etc/tls/client.key
-chmod 644 /opt/layerv/nhp-server/etc/tls/ca.crt /opt/layerv/nhp-server/etc/tls/client.crt
-chmod 600 /opt/layerv/nhp-server/etc/tls/client.key
-echo "etcd TLS certificates installed (CA + client)"
-%{ endif }
-
-cat > /opt/layerv/nhp-server/etc/remote.toml << 'REMOTEEOF'
-Provider = "etcd"
-Key = "nhp/config"
-Endpoints = ["${etcd_endpoint}"]
-%{ if etcd_tls_secret_arn != null }
-TLS = true
-CACert = "/nhp-server/etc/tls/ca.crt"
-ClientCert = "/nhp-server/etc/tls/client.crt"
-ClientKey = "/nhp-server/etc/tls/client.key"
-%{ endif }
-REMOTEEOF
-echo "Configured etcd endpoint: ${etcd_endpoint} (TLS enabled)"
-%{ else }
-# Single-tenant mode: configure HTTP server locally
+# NHP Server uses local config.toml for base config (UDP port 62206)
+# Configure HTTP server for admin/health endpoints
 cat > /opt/layerv/nhp-server/etc/http.toml << 'HTTPEOF'
-EnableHttp = true
+EnableHttp = false
 EnableTLS = false
 HttpListenIp = ""
-HttpListenPort = 62206
+HttpListenPort = 8080
 HTTPEOF
-%{ endif }
 
 CLOUDMAP_SERVICE_ID="${cloudmap_service_id}"
 
