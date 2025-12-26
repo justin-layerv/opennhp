@@ -44,6 +44,17 @@ module "nhp" {
   enable_slack_notifications = var.enable_slack_notifications
   slack_workspace_id         = var.slack_workspace_id
   slack_channel_id           = var.slack_channel_id
+
+  # RDS
+  deploy_rds              = var.deploy_rds
+  rds_database_name       = var.rds_database_name
+  rds_min_capacity        = var.rds_min_capacity
+  rds_max_capacity        = var.rds_max_capacity
+  rds_deletion_protection = var.rds_deletion_protection
+
+  # Production domains (qurl.site, qurl.link)
+  production_domains  = var.production_domains
+  production_zone_ids = var.production_zone_ids
 }
 
 # Re-export outputs
@@ -102,4 +113,17 @@ output "plugin_bucket_name" {
 
 output "plugin_bucket_arn" {
   value = module.nhp.plugin_bucket_arn
+}
+
+# RDS outputs
+output "rds_endpoint" {
+  value = module.nhp.rds_endpoint
+}
+
+output "rds_secret_arn" {
+  value = module.nhp.rds_secret_arn
+}
+
+output "rds_database_name" {
+  value = module.nhp.rds_database_name
 }

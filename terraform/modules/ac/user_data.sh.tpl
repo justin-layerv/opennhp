@@ -121,13 +121,13 @@ iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || iptables -I INPUT -i lo -j ACCE
 iptables -C INPUT -p tcp -s "${vpc_cidr}" --dport 22 -j ACCEPT 2>/dev/null || \
     iptables -I INPUT -p tcp -s "${vpc_cidr}" --dport 22 -j ACCEPT
 
-# Allow HTTPS (443) from VPC for health checks and internal traffic
-iptables -C INPUT -p tcp -s "${vpc_cidr}" --dport 443 -j ACCEPT 2>/dev/null || \
-    iptables -I INPUT -p tcp -s "${vpc_cidr}" --dport 443 -j ACCEPT
+# Allow HTTPS (443) from anywhere - NLB preserves client IP, security at app layer
+iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -p tcp --dport 443 -j ACCEPT
 
-# Allow HTTP (80) from VPC for ACME challenge and redirects
-iptables -C INPUT -p tcp -s "${vpc_cidr}" --dport 80 -j ACCEPT 2>/dev/null || \
-    iptables -I INPUT -p tcp -s "${vpc_cidr}" --dport 80 -j ACCEPT
+# Allow HTTP (80) from anywhere - for ACME challenge and redirects to HTTPS
+iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -p tcp --dport 80 -j ACCEPT
 
 # Allow portal (8888) from VPC
 iptables -C INPUT -p tcp -s "${vpc_cidr}" --dport 8888 -j ACCEPT 2>/dev/null || \
@@ -189,34 +189,128 @@ RSYSLOGEOF
     echo "rsyslog configured for NHP logging"
 fi
 
+# ============================================================================
+# Fetch AC Private Key - needed for both etcd bootstrap and local config
+# ============================================================================
+echo "Fetching AC private key from Secrets Manager..."
+AC_SECRET=$(aws secretsmanager get-secret-value --secret-id "${ac_secret_arn}" --region "$REGION" --query SecretString --output text)
+PRIVATE_KEY=$(echo "$AC_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['privateKey'])")
+echo "AC private key retrieved"
+
 # Configure etcd connection for multi-tenant with TLS
 %{ if etcd_endpoint != null }
 echo "Fetching etcd TLS certificates..."
 mkdir -p /opt/layerv/nhp-ac/etc/tls
 
-# Fetch etcd TLS CA certificate from Secrets Manager
+# Fetch etcd TLS certificates from Secrets Manager (CA + client certs for mTLS)
 %{ if etcd_tls_secret_arn != null }
 ETCD_TLS_SECRET=$(aws secretsmanager get-secret-value --secret-id "${etcd_tls_secret_arn}" --region "$REGION" --query SecretString --output text)
+# Extract CA certificate
 echo "$ETCD_TLS_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['caCert'])" > /opt/layerv/nhp-ac/etc/tls/ca.crt
 chmod 644 /opt/layerv/nhp-ac/etc/tls/ca.crt
 echo "etcd CA certificate installed"
+# Extract client certificate and key for mTLS authentication
+echo "$ETCD_TLS_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['clientCert'])" > /opt/layerv/nhp-ac/etc/tls/client.crt
+chmod 644 /opt/layerv/nhp-ac/etc/tls/client.crt
+echo "$ETCD_TLS_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['clientKey'])" > /opt/layerv/nhp-ac/etc/tls/client.key
+chmod 600 /opt/layerv/nhp-ac/etc/tls/client.key
+echo "etcd client certificate and key installed for mTLS"
+# Add etcd CA to system trust store for Go's default TLS verification
+cp /opt/layerv/nhp-ac/etc/tls/ca.crt /usr/local/share/ca-certificates/etcd-ca.crt
+update-ca-certificates
+echo "etcd CA added to system trust store"
 %{ endif }
 
 cat > /opt/layerv/nhp-ac/etc/remote.toml << 'REMOTEEOF'
 Provider = "etcd"
-Key = "/nhp/config"
+Key = "nhp/config"
 Endpoints = ["${etcd_endpoint}"]
 %{ if etcd_tls_secret_arn != null }
 TLS = true
 CACert = "/opt/layerv/nhp-ac/etc/tls/ca.crt"
+ClientCert = "/opt/layerv/nhp-ac/etc/tls/client.crt"
+ClientKey = "/opt/layerv/nhp-ac/etc/tls/client.key"
 %{ endif }
 REMOTEEOF
-echo "Configured etcd endpoint: ${etcd_endpoint} (TLS enabled)"
+echo "Configured etcd endpoint: ${etcd_endpoint} (mTLS enabled)"
+
+# ============================================================================
+# etcd Bootstrap - Initialize config key if not exists
+# This ensures new environments are properly bootstrapped without manual steps
+# NOTE: The private key MUST be included in etcd config because the AC code
+# loads BaseConfig from etcd, and an empty PrivateKeyBase64 will cause a crash.
+# ============================================================================
+echo "Checking and bootstrapping etcd configuration..."
+
+# Install etcdctl
+ETCD_VERSION="v3.5.17"
+curl -L https://github.com/etcd-io/etcd/releases/download/$ETCD_VERSION/etcd-$ETCD_VERSION-linux-amd64.tar.gz -o /tmp/etcd.tar.gz
+tar -xzf /tmp/etcd.tar.gz -C /tmp
+cp /tmp/etcd-$ETCD_VERSION-linux-amd64/etcdctl /usr/local/bin/
+chmod +x /usr/local/bin/etcdctl
+rm -rf /tmp/etcd*
+
+# Set etcdctl environment for mTLS
+export ETCDCTL_API=3
+export ETCDCTL_ENDPOINTS="${etcd_endpoint}"
+%{ if etcd_tls_secret_arn != null }
+export ETCDCTL_CACERT="/opt/layerv/nhp-ac/etc/tls/ca.crt"
+export ETCDCTL_CERT="/opt/layerv/nhp-ac/etc/tls/client.crt"
+export ETCDCTL_KEY="/opt/layerv/nhp-ac/etc/tls/client.key"
+%{ endif }
+
+# Check if the /nhp/config key exists and has a valid private key
+# Note: The Go code prepends "/" to the key, so we must use /nhp/config (with leading slash)
+EXISTING_KEY=$(etcdctl get /nhp/config --print-value-only 2>/dev/null | grep -o "PrivateKeyBase64 = \"[^\"]*\"" | grep -v '""' || true)
+if [ -z "$EXISTING_KEY" ]; then
+  echo "etcd key '/nhp/config' not found or has empty private key, bootstrapping initial configuration..."
+
+  # Create initial etcd config for AC with the private key
+  # This is TOML format matching ACEtcdConfig struct in endpoints/ac/config.go
+  cat > /tmp/etcd-init-config.toml << ETCDINITEOF
+# NHP AC etcd configuration (infrastructure-managed bootstrap)
+# This config is loaded by AC on startup and can be updated dynamically
+
+[BaseConfig]
+PrivateKeyBase64 = "$PRIVATE_KEY"
+ACId = "${environment}-ac"
+DefaultIp = ""
+AuthServiceId = "${auth_service_id}"
+ResourceIds = ${resource_ids}
+DefaultCipherScheme = 0
+IpPassMode = 0
+LogLevel = 4
+FilterMode = 0
+
+[HttpConfig]
+EnableHttp = true
+EnableTLS = false
+HttpListenPort = 8888
+
+# Server peers - initially empty, discovered via Cloud Map
+# Can add static servers here for multi-region setups
+# [[Servers]]
+# Hostname = "server.nhp.layerv.xyz"
+# Ip = ""
+# Port = 62206
+# PubKeyBase64 = ""
+ETCDINITEOF
+
+  # Write the initial config to etcd
+  # Use /nhp/config (with leading slash) to match what the Go code expects
+  etcdctl put /nhp/config -- "$(cat /tmp/etcd-init-config.toml)"
+  rm /tmp/etcd-init-config.toml
+
+  echo "etcd bootstrap complete - initial configuration written to /nhp/config"
+else
+  echo "etcd key '/nhp/config' exists with valid private key, skipping bootstrap"
+fi
 %{ endif }
 
 # ============================================================================
 # NHP-ACD Configuration Files
 # Generate all config files for the AC daemon
+# (Private key was already fetched above for etcd bootstrap)
 # ============================================================================
 
 # Generate AC config.toml with environment-specific values
@@ -226,7 +320,7 @@ cat > /opt/layerv/nhp-ac/etc/config.toml << CONFIGEOF
 
 ACId = "${environment}-ac-$INSTANCE_ID"
 DefaultIp = "$LOCAL_IP"
-PrivateKeyBase64 = ""
+PrivateKeyBase64 = "$PRIVATE_KEY"
 DefaultCipherScheme = 0
 IpPassMode = 0
 LogLevel = 4

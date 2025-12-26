@@ -140,7 +140,20 @@ resource "aws_iam_role_policy" "etcd_tls_lambda_secrets" {
   })
 }
 
-# Lambda to generate proper self-signed TLS certificates using Python cryptography
+# Lambda layer for cryptography library
+# NOTE: The layer zip must be pre-built before running terraform apply.
+# Build using: docker run --rm -v "/tmp/lambda-layer-build:/output" public.ecr.aws/lambda/python:3.11 \
+#   sh -c "pip install cryptography -t /output/python --no-cache-dir && cd /output && zip -r cryptography-layer.zip python/"
+resource "aws_lambda_layer_version" "cryptography" {
+  count               = var.multi_tenant ? 1 : 0
+  layer_name          = "${var.name_prefix}-cryptography"
+  description         = "Python cryptography library for Lambda"
+  filename            = "/tmp/lambda-layer-build/cryptography-layer.zip"
+  source_code_hash    = filebase64sha256("/tmp/lambda-layer-build/cryptography-layer.zip")
+  compatible_runtimes = ["python3.11"]
+}
+
+# Lambda to generate TLS certificates using cryptography library
 data "archive_file" "etcd_tls_lambda" {
   count       = var.multi_tenant ? 1 : 0
   type        = "zip"
@@ -151,98 +164,112 @@ data "archive_file" "etcd_tls_lambda" {
 import json
 import boto3
 from datetime import datetime, timedelta
-import ipaddress
-
-# Use cryptography library (available in Lambda Python runtime)
 from cryptography import x509
 from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.backends import default_backend
+import ipaddress
 
 def generate_certificates(dns_names, ip_addresses):
-    """Generate CA and server certificates for etcd TLS."""
+    """Generate CA, server, and client certificates for etcd mTLS."""
 
-    # Generate CA private key
+    # Generate CA key pair
     ca_key = rsa.generate_private_key(
         public_exponent=65537,
         key_size=2048,
         backend=default_backend()
     )
 
-    # CA certificate (self-signed, valid 10 years)
-    ca_name = x509.Name([
+    # Generate CA certificate (10 years)
+    ca_subject = x509.Name([
         x509.NameAttribute(NameOID.COMMON_NAME, "etcd-ca"),
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "LayerV"),
     ])
-
     ca_cert = (
         x509.CertificateBuilder()
-        .subject_name(ca_name)
-        .issuer_name(ca_name)
+        .subject_name(ca_subject)
+        .issuer_name(ca_subject)
         .public_key(ca_key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(datetime.utcnow())
         .not_valid_after(datetime.utcnow() + timedelta(days=3650))
         .add_extension(
             x509.BasicConstraints(ca=True, path_length=0),
-            critical=True,
-        )
-        .add_extension(
-            x509.KeyUsage(
-                key_cert_sign=True,
-                crl_sign=True,
-                digital_signature=False,
-                content_commitment=False,
-                key_encipherment=False,
-                data_encipherment=False,
-                key_agreement=False,
-                encipher_only=False,
-                decipher_only=False,
-            ),
-            critical=True,
+            critical=True
         )
         .sign(ca_key, hashes.SHA256(), default_backend())
     )
 
-    # Generate server private key
+    # Generate server key pair
     server_key = rsa.generate_private_key(
         public_exponent=65537,
         key_size=2048,
         backend=default_backend()
     )
 
-    # Build Subject Alternative Names (DNS and IP)
+    # Build SANs for server certificate
     san_list = [x509.DNSName(name) for name in dns_names]
-    for ip in ip_addresses:
-        san_list.append(x509.IPAddress(ipaddress.ip_address(ip)))
+    san_list.extend([x509.IPAddress(ipaddress.ip_address(ip)) for ip in ip_addresses])
 
-    # Server certificate (valid 1 year)
+    # Generate server certificate (1 year)
+    server_subject = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "etcd-server"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "LayerV"),
+    ])
     server_cert = (
         x509.CertificateBuilder()
-        .subject_name(x509.Name([
-            x509.NameAttribute(NameOID.COMMON_NAME, "etcd-server"),
-            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "LayerV"),
-        ]))
-        .issuer_name(ca_name)
+        .subject_name(server_subject)
+        .issuer_name(ca_subject)
         .public_key(server_key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(datetime.utcnow())
         .not_valid_after(datetime.utcnow() + timedelta(days=365))
         .add_extension(
             x509.BasicConstraints(ca=False, path_length=None),
-            critical=True,
+            critical=True
         )
         .add_extension(
             x509.SubjectAlternativeName(san_list),
-            critical=False,
+            critical=False
         )
         .add_extension(
             x509.ExtendedKeyUsage([
                 ExtendedKeyUsageOID.SERVER_AUTH,
-                ExtendedKeyUsageOID.CLIENT_AUTH,
+                ExtendedKeyUsageOID.CLIENT_AUTH
             ]),
-            critical=False,
+            critical=False
+        )
+        .sign(ca_key, hashes.SHA256(), default_backend())
+    )
+
+    # Generate client key pair
+    client_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+        backend=default_backend()
+    )
+
+    # Generate client certificate (1 year)
+    client_subject = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "etcd-client"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "LayerV"),
+    ])
+    client_cert = (
+        x509.CertificateBuilder()
+        .subject_name(client_subject)
+        .issuer_name(ca_subject)
+        .public_key(client_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.utcnow())
+        .not_valid_after(datetime.utcnow() + timedelta(days=365))
+        .add_extension(
+            x509.BasicConstraints(ca=False, path_length=None),
+            critical=True
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]),
+            critical=False
         )
         .sign(ca_key, hashes.SHA256(), default_backend())
     )
@@ -250,15 +277,21 @@ def generate_certificates(dns_names, ip_addresses):
     return {
         'caCert': ca_cert.public_bytes(serialization.Encoding.PEM).decode(),
         'caKey': ca_key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.TraditionalOpenSSL,
-            serialization.NoEncryption()
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption()
         ).decode(),
         'serverCert': server_cert.public_bytes(serialization.Encoding.PEM).decode(),
         'serverKey': server_key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.TraditionalOpenSSL,
-            serialization.NoEncryption()
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption()
+        ).decode(),
+        'clientCert': client_cert.public_bytes(serialization.Encoding.PEM).decode(),
+        'clientKey': client_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption()
         ).decode(),
     }
 
@@ -281,12 +314,15 @@ def handler(event, context):
             if existing.get('SecretString'):
                 parsed = json.loads(existing['SecretString'])
                 # Validate cert format (should start with proper PEM header)
+                # Include clientCert check for mTLS support
                 if (parsed.get('caCert', '').startswith('-----BEGIN CERTIFICATE-----') and
                     parsed.get('serverCert', '').startswith('-----BEGIN CERTIFICATE-----') and
-                    parsed.get('serverKey', '').startswith('-----BEGIN RSA PRIVATE KEY-----')):
-                    print("Valid TLS certs already exist, not regenerating")
+                    parsed.get('serverKey', '').startswith('-----BEGIN') and
+                    parsed.get('clientCert', '').startswith('-----BEGIN CERTIFICATE-----') and
+                    parsed.get('clientKey', '').startswith('-----BEGIN')):
+                    print("Valid TLS certs (including client cert) already exist, not regenerating")
                     return {'PhysicalResourceId': event.get('PhysicalResourceId') or secret_id}
-                print("Existing certs are invalid, regenerating")
+                print("Existing certs are invalid or missing client cert, regenerating")
         except Exception as e:
             print(f"No existing certs or error reading: {e}")
 
@@ -323,7 +359,12 @@ resource "aws_lambda_function" "etcd_tls" {
   filename         = data.archive_file.etcd_tls_lambda[0].output_path
   source_code_hash = data.archive_file.etcd_tls_lambda[0].output_base64sha256
 
+  # Attach cryptography layer for certificate generation
+  layers = [aws_lambda_layer_version.cryptography[0].arn]
+
   tags = var.tags
+
+  depends_on = [aws_lambda_layer_version.cryptography]
 }
 
 # Invoke Lambda to generate TLS certs (force regenerate to fix invalid certs)
@@ -1061,7 +1102,9 @@ resource "aws_ecs_task_definition" "etcd" {
         { name = "ETCD_INITIAL_CLUSTER_TOKEN", value = local.etcd_cluster_token },
         { name = "ETCD_AUTO_COMPACTION_RETENTION", value = "1" },
         { name = "ETCD_AUTO_COMPACTION_MODE", value = "periodic" },
-        { name = "ETCD_QUOTA_BACKEND_BYTES", value = "1073741824" }
+        { name = "ETCD_QUOTA_BACKEND_BYTES", value = "1073741824" },
+        # Require client certificate authentication for mTLS security
+        { name = "ETCD_CLIENT_CERT_AUTH", value = "true" }
       ]
 
       mountPoints = [

@@ -228,7 +228,13 @@ variable "cross_account_route53_role_arn" {
 }
 
 variable "production_domains" {
-  description = "List of production domains for ACME certificate generation via cross-account Route 53 (e.g., qurl.site, qurl.link)"
+  description = "List of production domains for ACME certificate generation (e.g., qurl.site, qurl.link)"
+  type        = list(string)
+  default     = []
+}
+
+variable "production_zone_ids" {
+  description = "Route 53 hosted zone IDs for production domains (for same-account ACME challenges)"
   type        = list(string)
   default     = []
 }
@@ -273,6 +279,64 @@ variable "slack_channel_id" {
   description = "Slack channel ID for alerts (e.g., C01234567 - get from channel details in Slack)"
   type        = string
   default     = ""
+}
+
+# ==================== RDS Configuration ====================
+
+variable "deploy_rds" {
+  description = "Deploy Aurora PostgreSQL Serverless for console application"
+  type        = bool
+  default     = false
+}
+
+variable "rds_database_name" {
+  description = "Name of the default database to create"
+  type        = string
+  default     = "portal"
+}
+
+variable "rds_min_capacity" {
+  description = "Minimum Aurora Serverless v2 capacity (ACUs)"
+  type        = number
+  default     = 0.5
+}
+
+variable "rds_max_capacity" {
+  description = "Maximum Aurora Serverless v2 capacity (ACUs)"
+  type        = number
+  default     = 4
+}
+
+variable "rds_deletion_protection" {
+  description = "Enable deletion protection for RDS"
+  type        = bool
+  default     = true
+}
+
+# ==================== Console Configuration ====================
+
+variable "deploy_console" {
+  description = "Deploy the Console application as ECS Fargate service"
+  type        = bool
+  default     = false
+}
+
+variable "console_domain" {
+  description = "Domain name for console (e.g., console.layerv.xyz)"
+  type        = string
+  default     = null
+}
+
+variable "console_acm_certificate_arn" {
+  description = "ACM certificate ARN for console HTTPS"
+  type        = string
+  default     = null
+}
+
+variable "console_cookie_domain" {
+  description = "Cookie domain for console portal sites"
+  type        = string
+  default     = ".layerv.ai"
 }
 
 # ==================== Common Tags ====================

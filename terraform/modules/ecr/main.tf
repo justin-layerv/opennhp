@@ -87,7 +87,7 @@ locals {
   region     = data.aws_region.current.name
 
   # ECR repository names
-  ecr_repos = ["nhp-server", "nhp-ac"]
+  ecr_repos = ["nhp-server", "nhp-ac", "nhp-console"]
 
   # ECR lifecycle policy (shared across repos)
   ecr_lifecycle_policy = jsonencode({
@@ -977,6 +977,16 @@ output "ac_repo_url" {
 output "ac_repo_arn" {
   description = "NHP AC ECR repository ARN"
   value       = var.is_primary_account ? aws_ecr_repository.main["nhp-ac"].arn : "arn:aws:ecr:${local.region}:${var.primary_account_id}:repository/layerv/nhp-ac"
+}
+
+output "console_repo_url" {
+  description = "Console ECR repository URL"
+  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-console"].repository_url : "${var.primary_account_id}.dkr.ecr.${local.region}.amazonaws.com/layerv/nhp-console"
+}
+
+output "console_repo_arn" {
+  description = "Console ECR repository ARN"
+  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-console"].arn : "arn:aws:ecr:${local.region}:${var.primary_account_id}:repository/layerv/nhp-console"
 }
 
 output "github_actions_role_arn" {

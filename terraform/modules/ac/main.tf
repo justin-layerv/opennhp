@@ -28,6 +28,138 @@ terraform {
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
+# ==================== AC Secret (Private Key) ====================
+# The AC needs a Curve25519 private key to operate.
+# We generate this using a Lambda similar to the server module.
+
+resource "aws_iam_role" "keygen_lambda" {
+  name = "${var.name_prefix}-ac-keygen-lambda"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+    }]
+  })
+
+  tags = var.tags
+}
+
+resource "aws_iam_role_policy_attachment" "keygen_lambda_basic" {
+  role       = aws_iam_role.keygen_lambda.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_iam_role_policy" "keygen_lambda_secrets" {
+  name = "secrets-access"
+  role = aws_iam_role.keygen_lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:PutSecretValue"
+        ]
+        Resource = aws_secretsmanager_secret.ac.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey"]
+        Resource = var.secrets_kms_key_arn != null ? [var.secrets_kms_key_arn] : []
+      }
+    ]
+  })
+}
+
+# Lambda function to generate Curve25519 keys for AC
+resource "aws_lambda_function" "keygen" {
+  function_name = "${var.name_prefix}-ac-keygen"
+  role          = aws_iam_role.keygen_lambda.arn
+  handler       = "index.handler"
+  runtime       = "nodejs20.x"
+  timeout       = 30
+
+  filename         = data.archive_file.keygen_lambda.output_path
+  source_code_hash = data.archive_file.keygen_lambda.output_base64sha256
+
+  tags = var.tags
+}
+
+data "archive_file" "keygen_lambda" {
+  type        = "zip"
+  output_path = "${path.module}/keygen_lambda.zip"
+
+  source {
+    content = <<-EOF
+const { SecretsManagerClient, PutSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
+const crypto = require('crypto');
+
+exports.handler = async (event) => {
+  const { SecretId, ACId, Environment } = event.ResourceProperties || event;
+
+  // Generate a random 32-byte private key (Curve25519)
+  const privateKey = crypto.randomBytes(32);
+  const privateKeyBase64 = privateKey.toString('base64');
+
+  const client = new SecretsManagerClient();
+
+  const secretValue = JSON.stringify({
+    privateKey: privateKeyBase64,
+    acId: ACId || 'ac-' + Environment,
+    environment: Environment,
+  });
+
+  await client.send(new PutSecretValueCommand({
+    SecretId: SecretId,
+    SecretString: secretValue,
+  }));
+
+  return {
+    PhysicalResourceId: event.PhysicalResourceId || SecretId,
+  };
+};
+EOF
+    filename = "index.js"
+  }
+}
+
+# Store AC configuration in Secrets Manager
+resource "aws_secretsmanager_secret" "ac" {
+  name                    = "${var.name_prefix}-ac"
+  description             = "NHP AC private key and configuration"
+  recovery_window_in_days = local.is_prod ? 30 : 0
+  kms_key_id              = var.secrets_kms_key_arn
+
+  tags = var.tags
+}
+
+# Custom resource to invoke Lambda for key generation
+resource "aws_lambda_invocation" "keygen" {
+  function_name = aws_lambda_function.keygen.function_name
+
+  input = jsonencode({
+    RequestType = "Create"
+    ResourceProperties = {
+      SecretId    = aws_secretsmanager_secret.ac.id
+      ACId        = "${var.environment}-ac"
+      Environment = var.environment
+    }
+  })
+
+  depends_on = [aws_iam_role_policy.keygen_lambda_secrets]
+
+  lifecycle {
+    ignore_changes = [input]
+  }
+}
+
 data "aws_ssm_parameter" "ubuntu_ami" {
   name = "/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id"
 }
@@ -230,10 +362,10 @@ resource "aws_iam_role_policy" "ac" {
           "route53:ChangeResourceRecordSets",
           "route53:ListResourceRecordSets"
         ]
-        Resource = [
-          data.aws_route53_zone.main.arn,
-          "arn:aws:route53:::change/*"
-        ]
+        Resource = concat(
+          [data.aws_route53_zone.main.arn, "arn:aws:route53:::change/*"],
+          [for zone_id in var.production_zone_ids : "arn:aws:route53:::hostedzone/${zone_id}"]
+        )
       },
       {
         Sid      = "Route53ListZones"
@@ -258,12 +390,19 @@ resource "aws_iam_role_policy" "ac" {
         ]
         Resource = var.ac_repo_arn
       },
-      # Secrets Manager for etcd credentials and TLS certificates
+      # Secrets Manager for AC private key, etcd credentials, and TLS certificates
       {
         Sid      = "SecretsAccess"
         Effect   = "Allow"
         Action   = ["secretsmanager:GetSecretValue"]
-        Resource = compact([var.etcd_secret_arn, var.etcd_tls_secret_arn])
+        Resource = compact([aws_secretsmanager_secret.ac.arn, var.etcd_secret_arn, var.etcd_tls_secret_arn])
+      },
+      # KMS decrypt for Secrets Manager (secrets are KMS-encrypted)
+      {
+        Sid      = "KMSDecrypt"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = var.secrets_kms_key_arn != null ? [var.secrets_kms_key_arn] : []
       },
       # Cloud Map registration
       {
@@ -388,6 +527,7 @@ locals {
     acme_ca_server      = local.is_prod ? "https://acme-v02.api.letsencrypt.org/directory" : "https://acme-staging-v02.api.letsencrypt.org/directory"
     etcd_endpoint       = var.etcd_endpoint
     etcd_tls_secret_arn = var.etcd_tls_secret_arn
+    ac_secret_arn       = aws_secretsmanager_secret.ac.arn
     cloudmap_service_id = aws_service_discovery_service.ac.id
     namespace_name      = var.namespace_name
     vpc_cidr            = var.vpc_cidr

@@ -64,3 +64,8 @@ output "plugin_bucket_name" {
   description = "S3 bucket name for Traefik plugins"
   value       = aws_s3_bucket.plugins.id
 }
+
+output "ac_secret_arn" {
+  description = "ARN of the AC secret containing the private key"
+  value       = aws_secretsmanager_secret.ac.arn
+}

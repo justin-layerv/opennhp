@@ -130,3 +130,40 @@ variable "slack_channel_id" {
   type    = string
   default = ""
 }
+
+# RDS configuration
+variable "deploy_rds" {
+  type    = bool
+  default = false
+}
+
+variable "rds_database_name" {
+  type    = string
+  default = "portal"
+}
+
+variable "rds_min_capacity" {
+  type    = number
+  default = 0.5
+}
+
+variable "rds_max_capacity" {
+  type    = number
+  default = 4
+}
+
+variable "rds_deletion_protection" {
+  type    = bool
+  default = false # Allow deletion in sandbox
+}
+
+# Production domains
+variable "production_domains" {
+  type    = list(string)
+  default = []
+}
+
+variable "production_zone_ids" {
+  type    = list(string)
+  default = []
+}

@@ -51,3 +51,9 @@ variable "logs_kms_key_arn" {
   type        = string
   default     = null
 }
+
+variable "terraform_state_bucket" {
+  description = "S3 bucket for Terraform state (used for Lambda layer storage)"
+  type        = string
+  default     = null
+}

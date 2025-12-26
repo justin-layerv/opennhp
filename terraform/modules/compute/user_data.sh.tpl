@@ -70,7 +70,7 @@ echo "etcd CA certificate installed"
 
 cat > /opt/layerv/nhp-server/etc/remote.toml << 'REMOTEEOF'
 Provider = "etcd"
-Key = "/nhp/config"
+Key = "nhp/config"
 Endpoints = ["${etcd_endpoint}"]
 %{ if etcd_tls_secret_arn != null }
 TLS = true

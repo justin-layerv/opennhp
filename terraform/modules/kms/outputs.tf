@@ -37,3 +37,13 @@ output "logs_key_id" {
   description = "ID of KMS key for CloudWatch Logs encryption"
   value       = aws_kms_key.logs.key_id
 }
+
+output "rds_key_arn" {
+  description = "ARN of KMS key for RDS encryption"
+  value       = aws_kms_key.rds.arn
+}
+
+output "rds_key_id" {
+  description = "ID of KMS key for RDS encryption"
+  value       = aws_kms_key.rds.key_id
+}

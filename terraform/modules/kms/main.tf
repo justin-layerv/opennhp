@@ -269,3 +269,55 @@ resource "aws_kms_alias" "logs" {
   name          = "alias/${var.name_prefix}-logs"
   target_key_id = aws_kms_key.logs.key_id
 }
+
+# KMS Key for RDS storage encryption
+resource "aws_kms_key" "rds" {
+  description             = "KMS key for RDS storage encryption"
+  deletion_window_in_days = local.is_prod ? 30 : 7
+  enable_key_rotation     = true
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "EnableRootAccount"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        }
+        Action   = "kms:*"
+        Resource = "*"
+      },
+      {
+        Sid    = "AllowRDSService"
+        Effect = "Allow"
+        Principal = {
+          Service = "rds.amazonaws.com"
+        }
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey",
+          "kms:CreateGrant"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "kms:CallerAccount" = data.aws_caller_identity.current.account_id
+          }
+        }
+      }
+    ]
+  })
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-rds"
+  })
+}
+
+resource "aws_kms_alias" "rds" {
+  name          = "alias/${var.name_prefix}-rds"
+  target_key_id = aws_kms_key.rds.key_id
+}

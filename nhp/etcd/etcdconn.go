@@ -1,10 +1,15 @@
 package etcd
+
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"os"
+	"time"
+
 	"github.com/OpenNHP/opennhp/nhp/log"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"time"
 )
 
 type EtcdConfig struct {
@@ -15,26 +20,42 @@ type EtcdConfig struct {
 }
 
 type EtcdConn struct {
-	Endpoints []string
-	Username  string
-	Password  string
-	Key       string
-	client    *clientv3.Client
-	ctx       context.Context
-	watcher   clientv3.Watcher
-	signals   struct {
+	Endpoints  []string
+	Username   string
+	Password   string
+	Key        string
+	TLS        bool
+	CACert     string
+	ClientCert string
+	ClientKey  string
+	client     *clientv3.Client
+	ctx        context.Context
+	watcher    clientv3.Watcher
+	signals    struct {
 		stop chan struct{}
 	}
 }
 
 func (conn *EtcdConn) InitClient() error {
 	var err error
-	conn.client, err = clientv3.New(clientv3.Config{
+
+	cfg := clientv3.Config{
 		Endpoints:   conn.Endpoints,
 		DialTimeout: 5 * time.Second,
 		Username:    conn.Username,
 		Password:    conn.Password,
-	})
+	}
+
+	// Configure TLS if enabled
+	if conn.TLS {
+		tlsConfig, err := conn.loadTLSConfig()
+		if err != nil {
+			return err
+		}
+		cfg.TLS = tlsConfig
+	}
+
+	conn.client, err = clientv3.New(cfg)
 
 	conn.Key = "/" + conn.Key
 	if err != nil {
@@ -107,5 +128,36 @@ func (conn *EtcdConn) Close() {
 		close(conn.signals.stop)
 		conn.client.Close()
 	}
+}
+
+// loadTLSConfig creates a TLS configuration for etcd mTLS
+func (conn *EtcdConn) loadTLSConfig() (*tls.Config, error) {
+	tlsConfig := &tls.Config{}
+
+	// Load CA certificate if provided
+	if conn.CACert != "" {
+		caCert, err := os.ReadFile(conn.CACert)
+		if err != nil {
+			return nil, errors.New("failed to read CA certificate: " + err.Error())
+		}
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, errors.New("failed to parse CA certificate")
+		}
+		tlsConfig.RootCAs = caCertPool
+		log.Info("etcd TLS: loaded CA certificate from %s", conn.CACert)
+	}
+
+	// Load client certificate and key if provided (for mTLS)
+	if conn.ClientCert != "" && conn.ClientKey != "" {
+		cert, err := tls.LoadX509KeyPair(conn.ClientCert, conn.ClientKey)
+		if err != nil {
+			return nil, errors.New("failed to load client certificate: " + err.Error())
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
+		log.Info("etcd TLS: loaded client certificate from %s", conn.ClientCert)
+	}
+
+	return tlsConfig, nil
 }
 

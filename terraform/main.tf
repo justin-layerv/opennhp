@@ -119,6 +119,9 @@ module "data" {
   efs_kms_key_arn     = module.kms.efs_key_arn
   secrets_kms_key_arn = module.kms.secrets_key_arn
   logs_kms_key_arn    = module.kms.logs_key_arn
+
+  # S3 bucket for Lambda layer storage
+  terraform_state_bucket = var.terraform_state_bucket
 }
 
 # Compute Module - ASG, NLB, Launch Template
@@ -206,6 +209,73 @@ module "security" {
   tags                = local.common_tags
 }
 
+# RDS Module - Aurora PostgreSQL Serverless for console application
+module "rds" {
+  source = "./modules/rds"
+  count  = var.deploy_rds ? 1 : 0
+
+  environment        = var.environment
+  name_prefix        = local.name_prefix
+  vpc_id             = module.networking.vpc_id
+  vpc_cidr           = var.vpc_cidr
+  private_subnet_ids = module.networking.private_subnet_ids
+
+  database_name       = var.rds_database_name
+  min_capacity        = var.rds_min_capacity
+  max_capacity        = var.rds_max_capacity
+  deletion_protection = var.rds_deletion_protection
+  skip_final_snapshot = var.environment != "prod"
+
+  # KMS encryption
+  secrets_kms_key_arn = module.kms.secrets_key_arn
+  storage_kms_key_arn = module.kms.rds_key_arn
+
+  tags = local.common_tags
+}
+
+# Console Module - Portal management application
+module "console" {
+  source = "./modules/console"
+  count  = var.deploy_console && var.deploy_rds ? 1 : 0
+
+  environment        = var.environment
+  name_prefix        = local.name_prefix
+  vpc_id             = module.networking.vpc_id
+  vpc_cidr           = var.vpc_cidr
+  public_subnet_ids  = module.networking.public_subnet_ids
+  private_subnet_ids = module.networking.private_subnet_ids
+
+  console_image = "${module.ecr.console_repo_url}:latest"
+
+  # RDS configuration
+  rds_endpoint          = module.rds[0].cluster_endpoint
+  rds_port              = module.rds[0].cluster_port
+  rds_database_name     = module.rds[0].database_name
+  rds_secret_arn        = module.rds[0].secret_arn
+  rds_security_group_id = module.rds[0].security_group_id
+
+  # AC configuration - use Terraform-managed AC IPs
+  ac_configs = var.deploy_ac ? [
+    {
+      id       = "layerv-ac-tf"
+      ip       = "10.100.0.248" # TODO: Get from AC module output
+      port     = 443
+      protocol = "tcp"
+    }
+  ] : []
+
+  # Domain configuration
+  domain_name         = var.console_domain
+  hosted_zone         = var.hosted_zone
+  acm_certificate_arn = var.console_acm_certificate_arn
+  cookie_domain       = var.console_cookie_domain
+
+  # KMS
+  logs_kms_key_arn = module.kms.logs_key_arn
+
+  tags = local.common_tags
+}
+
 # AC Module - Access Controller with embedded Traefik for TLS termination
 # Note: Traefik plugins are managed separately by the traefik-plugins project
 module "ac" {
@@ -236,8 +306,9 @@ module "ac" {
   tags                = local.common_tags
 
   # KMS encryption keys
-  logs_kms_key_arn = module.kms.logs_key_arn
-  ebs_kms_key_arn  = module.kms.ebs_key_arn
+  logs_kms_key_arn    = module.kms.logs_key_arn
+  ebs_kms_key_arn     = module.kms.ebs_key_arn
+  secrets_kms_key_arn = module.kms.secrets_key_arn
 
   # CloudFront + WAF (optional)
   enable_cloudfront = var.enable_cloudfront
@@ -247,7 +318,8 @@ module "ac" {
   resource_ids    = var.ac_resource_ids
   server_nlb_dns  = module.compute.nlb_dns_name
 
-  # Production domains (cross-account ACME for qurl.site, qurl.link, etc.)
+  # Production domains (ACME for qurl.site, qurl.link, etc.)
   cross_account_route53_role_arn = var.cross_account_route53_role_arn
   production_domains             = var.production_domains
+  production_zone_ids            = var.production_zone_ids
 }

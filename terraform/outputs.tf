@@ -69,3 +69,50 @@ output "plugin_bucket_arn" {
   description = "S3 bucket ARN for Traefik plugins"
   value       = var.deploy_ac ? module.ac[0].plugin_bucket_arn : null
 }
+
+# RDS outputs
+output "rds_endpoint" {
+  description = "RDS Aurora cluster endpoint"
+  value       = var.deploy_rds ? module.rds[0].cluster_endpoint : null
+}
+
+output "rds_reader_endpoint" {
+  description = "RDS Aurora cluster reader endpoint"
+  value       = var.deploy_rds ? module.rds[0].cluster_reader_endpoint : null
+}
+
+output "rds_port" {
+  description = "RDS Aurora cluster port"
+  value       = var.deploy_rds ? module.rds[0].cluster_port : null
+}
+
+output "rds_database_name" {
+  description = "RDS database name"
+  value       = var.deploy_rds ? module.rds[0].database_name : null
+}
+
+output "rds_secret_arn" {
+  description = "Secrets Manager ARN for RDS credentials"
+  value       = var.deploy_rds ? module.rds[0].secret_arn : null
+}
+
+output "rds_security_group_id" {
+  description = "Security group ID for RDS access"
+  value       = var.deploy_rds ? module.rds[0].security_group_id : null
+}
+
+# Console outputs
+output "console_url" {
+  description = "Console application URL"
+  value       = var.deploy_console && var.deploy_rds ? module.console[0].console_url : null
+}
+
+output "console_alb_dns" {
+  description = "Console ALB DNS name"
+  value       = var.deploy_console && var.deploy_rds ? module.console[0].alb_dns_name : null
+}
+
+output "console_repo_url" {
+  description = "ECR repository URL for Console"
+  value       = module.ecr.console_repo_url
+}

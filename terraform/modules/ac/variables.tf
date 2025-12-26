@@ -102,6 +102,12 @@ variable "ebs_kms_key_arn" {
   default     = null
 }
 
+variable "secrets_kms_key_arn" {
+  description = "KMS key ARN for Secrets Manager encryption"
+  type        = string
+  default     = null
+}
+
 variable "enable_cloudfront" {
   description = "Enable CloudFront + WAF in front of NLB for DDoS protection"
   type        = bool
@@ -138,7 +144,13 @@ variable "cross_account_route53_role_arn" {
 }
 
 variable "production_domains" {
-  description = "List of production domains for ACME certificate generation (requires cross_account_route53_role_arn)"
+  description = "List of production domains for ACME certificate generation"
+  type        = list(string)
+  default     = []
+}
+
+variable "production_zone_ids" {
+  description = "Route 53 hosted zone IDs for production domains (for same-account ACME challenges)"
   type        = list(string)
   default     = []
 }
