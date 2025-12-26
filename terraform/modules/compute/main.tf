@@ -278,6 +278,11 @@ resource "aws_iam_role_policy" "server" {
           "logs:PutLogEvents"
         ]
         Resource = "${aws_cloudwatch_log_group.server.arn}:*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = var.secrets_kms_key_arn != null ? [var.secrets_kms_key_arn] : []
       }
     ]
   })
