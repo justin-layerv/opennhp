@@ -654,12 +654,14 @@ resource "aws_lb" "ac" {
 }
 
 # HTTPS Target Group (TCP passthrough to Traefik)
+# Proxy Protocol v2 enabled to preserve client IP for NHP firewall rules
 resource "aws_lb_target_group" "https" {
-  name        = replace("${var.name_prefix}-ac-https", "_", "-")
-  port        = 443
-  protocol    = "TCP"
-  vpc_id      = var.vpc_id
-  target_type = "instance"
+  name             = replace("${var.name_prefix}-ac-https", "_", "-")
+  port             = 443
+  protocol         = "TCP"
+  vpc_id           = var.vpc_id
+  target_type      = "instance"
+  proxy_protocol_v2 = true
 
   health_check {
     enabled             = true

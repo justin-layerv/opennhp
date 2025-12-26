@@ -479,7 +479,9 @@ cat > /home/ubuntu/traefik/traefik.toml << TRAEFIKEOF
   caServer = "${acme_ca_server}"
   [certificatesResolvers.letsencrypt.acme.dnsChallenge]
     provider = "route53"
-    delayBeforeCheck = 10
+    delayBeforeCheck = 30
+    # Route 53 DNS propagation can take up to 60 seconds
+    # Use public resolvers to verify propagation before ACME server checks
     resolvers = ["1.1.1.1:53", "8.8.8.8:53"]
 
 [providers.file]
