@@ -97,7 +97,7 @@ data "archive_file" "keygen_lambda" {
   output_path = "${path.module}/keygen_lambda.zip"
 
   source {
-    content = <<-EOF
+    content  = <<-EOF
 const { SecretsManagerClient, PutSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
 const crypto = require('crypto');
 

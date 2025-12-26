@@ -45,13 +45,13 @@ deploy_rds              = true
 rds_database_name       = "portal"
 rds_min_capacity        = 0.5
 rds_max_capacity        = 4
-rds_deletion_protection = false  # Allow deletion in sandbox
+rds_deletion_protection = false # Allow deletion in sandbox
 
 # Production domains - enables ACME certs for qurl.site and qurl.link
 production_domains = ["qurl.site", "qurl.link"]
 production_zone_ids = [
-  "Z09870522JYXPU8N4YJHY",  # qurl.site
-  "Z05359673USNEY6PIOTJA"   # qurl.link
+  "Z09870522JYXPU8N4YJHY", # qurl.site
+  "Z05359673USNEY6PIOTJA"  # qurl.link
 ]
 
 tags = {
