@@ -390,12 +390,12 @@ resource "aws_iam_role_policy" "ac" {
         ]
         Resource = var.ac_repo_arn
       },
-      # Secrets Manager for AC private key, etcd credentials, and TLS certificates
+      # Secrets Manager for AC private key, etcd credentials, TLS certificates, and server public key
       {
         Sid      = "SecretsAccess"
         Effect   = "Allow"
         Action   = ["secretsmanager:GetSecretValue"]
-        Resource = compact([aws_secretsmanager_secret.ac.arn, var.etcd_secret_arn, var.etcd_tls_secret_arn])
+        Resource = compact([aws_secretsmanager_secret.ac.arn, var.etcd_secret_arn, var.etcd_tls_secret_arn, var.server_secret_arn])
       },
       # KMS decrypt for Secrets Manager (secrets are KMS-encrypted)
       {
@@ -532,9 +532,10 @@ locals {
     namespace_name      = var.namespace_name
     vpc_cidr            = var.vpc_cidr
     # AC configuration options
-    auth_service_id = var.auth_service_id
-    resource_ids    = jsonencode(var.resource_ids)
-    server_nlb_dns  = var.server_nlb_dns
+    auth_service_id   = var.auth_service_id
+    resource_ids      = jsonencode(var.resource_ids)
+    server_nlb_dns    = var.server_nlb_dns
+    server_secret_arn = var.server_secret_arn
     # Production domains (cross-account ACME)
     cross_account_route53_role_arn = var.cross_account_route53_role_arn
     production_domains             = var.production_domains

@@ -374,6 +374,20 @@ HttpListenPort = 8888
 HTTPEOF
 echo "NHP-ACD HTTP config created"
 
+# Fetch NHP Server's public key from Secrets Manager
+%{ if server_secret_arn != "" }
+echo "Fetching NHP Server public key from Secrets Manager..."
+SERVER_SECRET=$(aws secretsmanager get-secret-value --secret-id "${server_secret_arn}" --region "$REGION" --query SecretString --output text 2>/dev/null || echo "{}")
+SERVER_PUBLIC_KEY=$(echo "$SERVER_SECRET" | python3 -c "import sys,json; data=json.load(sys.stdin); print(data.get('publicKey', ''))" 2>/dev/null || echo "")
+if [ -n "$SERVER_PUBLIC_KEY" ]; then
+  echo "Server public key retrieved successfully"
+else
+  echo "WARNING: Could not retrieve server public key"
+fi
+%{ else }
+SERVER_PUBLIC_KEY=""
+%{ endif }
+
 # Generate server.toml with NHP server peer discovery via Cloud Map
 # This allows the AC to communicate with NHP servers in the same namespace
 cat > /opt/layerv/nhp-ac/etc/server.toml << 'SERVEREOF'
@@ -402,10 +416,10 @@ if [ -n "$SERVERS" ]; then
 Hostname = ""
 Ip = "$SERVER_IP"
 Port = 62206
-PubKeyBase64 = ""
+PubKeyBase64 = "$SERVER_PUBLIC_KEY"
 ExpireTime = 1924991999
 SERVERENTRY
-      echo "Added NHP server: $SERVER_IP"
+      echo "Added NHP server: $SERVER_IP (with public key)"
     fi
   done
 else
@@ -416,7 +430,7 @@ else
 Hostname = "${server_nlb_dns}"
 Ip = ""
 Port = 62206
-PubKeyBase64 = ""
+PubKeyBase64 = "$SERVER_PUBLIC_KEY"
 ExpireTime = 1924991999
 SERVERENTRY
 fi

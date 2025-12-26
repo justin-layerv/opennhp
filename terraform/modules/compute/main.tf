@@ -91,13 +91,13 @@ exports.handler = async (event) => {
   const hostname = event.ResourceProperties.Hostname;
   const environment = event.ResourceProperties.Environment;
 
-  // Check if secret already has a valid key
+  // Check if secret already has a valid key pair
   try {
     const existing = await client.send(new GetSecretValueCommand({ SecretId: secretId }));
     if (existing.SecretString) {
       const parsed = JSON.parse(existing.SecretString);
-      if (parsed.privateKey && parsed.privateKey.length === 44) {
-        console.log('Secret already has a valid key, not overwriting');
+      if (parsed.privateKey && parsed.privateKey.length === 44 && parsed.publicKey && parsed.publicKey.length === 44) {
+        console.log('Secret already has valid key pair, not overwriting');
         return { PhysicalResourceId: event.PhysicalResourceId || secretId };
       }
     }
@@ -105,18 +105,25 @@ exports.handler = async (event) => {
     console.log('No existing secret value, will create new');
   }
 
-  // Generate 32 random bytes for Curve25519 private key
-  const privateKey = crypto.randomBytes(32);
+  // Generate X25519 key pair using Node.js crypto
+  const keyPair = crypto.generateKeyPairSync('x25519');
 
-  // Apply Curve25519 clamping
-  privateKey[0] &= 248;
-  privateKey[31] = (privateKey[31] & 127) | 64;
+  // Export keys in raw format and base64 encode
+  const privateKeyRaw = keyPair.privateKey.export({ type: 'pkcs8', format: 'der' });
+  const publicKeyRaw = keyPair.publicKey.export({ type: 'spki', format: 'der' });
 
-  // Base64 encode
+  // Extract the 32-byte keys from DER format (skip the header bytes)
+  // PKCS8 X25519 private key: 48 bytes, last 32 are the key
+  // SPKI X25519 public key: 44 bytes, last 32 are the key
+  const privateKey = privateKeyRaw.slice(-32);
+  const publicKey = publicKeyRaw.slice(-32);
+
   const privateKeyBase64 = privateKey.toString('base64');
+  const publicKeyBase64 = publicKey.toString('base64');
 
   const secretValue = JSON.stringify({
     privateKey: privateKeyBase64,
+    publicKey: publicKeyBase64,
     hostname: hostname,
     environment: environment,
   });
@@ -125,6 +132,8 @@ exports.handler = async (event) => {
     SecretId: secretId,
     SecretString: secretValue,
   }));
+
+  console.log('Generated new key pair, publicKey:', publicKeyBase64);
 
   return {
     PhysicalResourceId: event.PhysicalResourceId || secretId,

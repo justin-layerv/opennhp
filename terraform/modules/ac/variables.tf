@@ -137,6 +137,12 @@ variable "server_nlb_dns" {
   default     = ""
 }
 
+variable "server_secret_arn" {
+  description = "ARN of the NHP Server's secret containing public key"
+  type        = string
+  default     = ""
+}
+
 variable "cross_account_route53_role_arn" {
   description = "IAM role ARN in management account for cross-account Route 53 access (ACME DNS challenges for production domains)"
   type        = string

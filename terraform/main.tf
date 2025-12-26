@@ -314,9 +314,10 @@ module "ac" {
   enable_cloudfront = var.enable_cloudfront
 
   # AC configuration options
-  auth_service_id = var.ac_auth_service_id
-  resource_ids    = var.ac_resource_ids
-  server_nlb_dns  = module.compute.nlb_dns_name
+  auth_service_id   = var.ac_auth_service_id
+  resource_ids      = var.ac_resource_ids
+  server_nlb_dns    = module.compute.nlb_dns_name
+  server_secret_arn = module.compute.server_secret_arn
 
   # Production domains (ACME for qurl.site, qurl.link, etc.)
   cross_account_route53_role_arn = var.cross_account_route53_role_arn
