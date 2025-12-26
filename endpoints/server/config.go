@@ -59,11 +59,15 @@ type Config struct {
 }
 
 type RemoteConfig struct {
-	Provider  string
-	Key       string
-	Endpoints []string
-	Username  string
-	Password  string
+	Provider   string
+	Key        string
+	Endpoints  []string
+	Username   string
+	Password   string
+	TLS        bool
+	CACert     string
+	ClientCert string
+	ClientKey  string
 }
 
 type HttpConfig struct {
@@ -324,10 +328,14 @@ func (s *UdpServer) initRemoteConn() error {
 		}
 
 		s.etcdConn = &etcd.EtcdConn{
-			Endpoints: conf.Endpoints,
-			Username:  conf.Username,
-			Password:  conf.Password,
-			Key:       conf.Key,
+			Endpoints:  conf.Endpoints,
+			Username:   conf.Username,
+			Password:   conf.Password,
+			Key:        conf.Key,
+			TLS:        conf.TLS,
+			CACert:     conf.CACert,
+			ClientCert: conf.ClientCert,
+			ClientKey:  conf.ClientKey,
 		}
 
 		err = s.etcdConn.InitClient()
