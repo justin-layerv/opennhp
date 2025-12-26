@@ -74,7 +74,7 @@ Key = "nhp/config"
 Endpoints = ["${etcd_endpoint}"]
 %{ if etcd_tls_secret_arn != null }
 TLS = true
-CACert = "/opt/layerv/nhp-server/etc/tls/ca.crt"
+CACert = "/nhp-server/etc/tls/ca.crt"
 %{ endif }
 REMOTEEOF
 echo "Configured etcd endpoint: ${etcd_endpoint} (TLS enabled)"
