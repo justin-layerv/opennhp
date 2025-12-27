@@ -687,6 +687,29 @@ jobs:
             echo "::warning::Some integration tests failed or skipped"
           }
 
+      - name: Run E2E Tests (Demo Flow)
+        env:
+          CONSOLE_API_URL: "https://home.secure.layerv.xyz"
+          LOGIN_PORTAL_DOMAIN: "qurl.link"
+          APPS_DOMAIN: "qurl.site"
+        run: |
+          echo "============================================"
+          echo "E2E TESTS - DEMO FLOW"
+          echo "============================================"
+          echo "Console API: $CONSOLE_API_URL"
+          echo "Login Portal: $LOGIN_PORTAL_DOMAIN"
+          echo "Apps Domain: $APPS_DOMAIN"
+          echo ""
+
+          # E2E tests verify the actual demo flow works end-to-end
+          # These test public endpoints and don't require VPC access
+          cd tests/e2e
+
+          # Run E2E tests with verbose output
+          go test -v -tags=e2e -timeout 5m ./... 2>&1 || {
+            echo "::warning::Some E2E tests failed - see output above"
+          }
+
       - name: Deployment Summary
         run: |
           echo "## Sandbox Deployment Complete" >> $GITHUB_STEP_SUMMARY
@@ -706,6 +729,7 @@ jobs:
           echo "### Validation" >> $GITHUB_STEP_SUMMARY
           echo "- Post-deployment validation script executed" >> $GITHUB_STEP_SUMMARY
           echo "- Integration tests completed (etcd tests skipped without mTLS certs)" >> $GITHUB_STEP_SUMMARY
+          echo "- E2E demo flow tests executed" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================================
   # DEPLOY PROD
@@ -913,6 +937,24 @@ jobs:
             echo "::warning::Some production integration tests failed or skipped"
           }
 
+      - name: Run E2E Tests (Production Demo Flow)
+        env:
+          # Production uses different domains
+          CONSOLE_API_URL: "https://home.secure.layerv.ai"
+          LOGIN_PORTAL_DOMAIN: "qurl.link"
+          APPS_DOMAIN: "qurl.site"
+        run: |
+          echo "============================================"
+          echo "E2E TESTS - PRODUCTION DEMO FLOW"
+          echo "============================================"
+          echo "Console API: $CONSOLE_API_URL"
+          echo ""
+
+          cd tests/e2e
+          go test -v -tags=e2e -timeout 5m ./... 2>&1 || {
+            echo "::warning::Some production E2E tests failed"
+          }
+
       - name: Production Deployment Summary
         run: |
           echo "## Production Deployment Complete" >> $GITHUB_STEP_SUMMARY
@@ -932,6 +974,7 @@ jobs:
           echo "### Validation" >> $GITHUB_STEP_SUMMARY
           echo "- Post-deployment validation script executed" >> $GITHUB_STEP_SUMMARY
           echo "- Integration tests completed" >> $GITHUB_STEP_SUMMARY
+          echo "- E2E demo flow tests executed" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================================
   # NOTIFY
