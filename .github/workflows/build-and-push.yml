@@ -446,12 +446,14 @@ jobs:
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
         run: terraform apply tfplan
 
-      - name: Get ASG Names from Terraform
+      - name: Get Terraform Outputs
         id: outputs
         working-directory: terraform/environments/sandbox
         run: |
           echo "server_asg=$(terraform output -raw asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
           echo "ac_asg=$(terraform output -raw ac_asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+          echo "nlb_dns=$(terraform output -raw nlb_dns_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+          echo "etcd_endpoint=$(terraform output -raw etcd_endpoint 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
 
       - name: Canary Deploy - NHP Server
         if: steps.outputs.outputs.server_asg != ''
@@ -635,16 +637,71 @@ jobs:
             esac
           done
 
+      - name: Post-Deployment Validation
+        run: |
+          echo "============================================"
+          echo "POST-DEPLOYMENT VALIDATION"
+          echo "============================================"
+
+          # Make script executable and run
+          chmod +x scripts/validate-deployment.sh
+
+          # Run validation (continue on failure to collect all results)
+          ./scripts/validate-deployment.sh sandbox || VALIDATION_FAILED=1
+
+          if [ "${VALIDATION_FAILED:-0}" -eq 1 ]; then
+            echo "::warning::Some validation checks failed - see output above"
+          fi
+
+      - name: Setup Go for Integration Tests
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: |
+            nhp/go.sum
+            endpoints/go.sum
+
+      - name: Run Integration Tests
+        env:
+          NHP_SERVER_ENDPOINT: "${{ steps.outputs.outputs.nlb_dns }}:62206"
+          ETCD_ENDPOINTS: ${{ steps.outputs.outputs.etcd_endpoint }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          echo "============================================"
+          echo "INTEGRATION TESTS"
+          echo "============================================"
+          echo "NHP Server: $NHP_SERVER_ENDPOINT"
+          echo "etcd: $ETCD_ENDPOINTS"
+          echo ""
+
+          # Run integration tests (skip etcd tests if no certs configured)
+          cd tests/integration
+
+          # Note: etcd tests will skip via t.Skip() if ETCD_CA_CERT is not set
+          # This is expected in CI until we add etcd mTLS cert handling
+          go test -v -tags=integration -timeout 5m ./... 2>&1 || {
+            echo "::warning::Some integration tests failed or skipped"
+          }
+
       - name: Deployment Summary
         run: |
           echo "## Sandbox Deployment Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Infrastructure" >> $GITHUB_STEP_SUMMARY
           echo "| Component | ASG | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-----------|-----|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| NHP Server | ${{ steps.outputs.outputs.server_asg }} | Done |" >> $GITHUB_STEP_SUMMARY
-          echo "| AC | ${{ steps.outputs.outputs.ac_asg }} | Done |" >> $GITHUB_STEP_SUMMARY
+          echo "| NHP Server | ${{ steps.outputs.outputs.server_asg }} | Deployed |" >> $GITHUB_STEP_SUMMARY
+          echo "| AC | ${{ steps.outputs.outputs.ac_asg }} | Deployed |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Endpoints" >> $GITHUB_STEP_SUMMARY
+          echo "- **NHP NLB:** \`${{ steps.outputs.outputs.nlb_dns }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **etcd:** \`${{ steps.outputs.outputs.etcd_endpoint }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Image Tag:** \`${{ needs.setup.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Validation" >> $GITHUB_STEP_SUMMARY
+          echo "- Post-deployment validation script executed" >> $GITHUB_STEP_SUMMARY
+          echo "- Integration tests completed (etcd tests skipped without mTLS certs)" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================================
   # DEPLOY PROD
@@ -705,12 +762,14 @@ jobs:
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
         run: terraform apply tfplan
 
-      - name: Get ASG Names from Terraform
+      - name: Get Terraform Outputs
         id: outputs
         working-directory: terraform/environments/prod
         run: |
           echo "server_asg=$(terraform output -raw asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
           echo "ac_asg=$(terraform output -raw ac_asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+          echo "nlb_dns=$(terraform output -raw nlb_dns_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+          echo "etcd_endpoint=$(terraform output -raw etcd_endpoint 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
 
       - name: Canary Deploy - NHP Server (Production)
         if: steps.outputs.outputs.server_asg != ''
@@ -810,6 +869,65 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Post-Deployment Validation (Production)
+        run: |
+          echo "============================================"
+          echo "POST-DEPLOYMENT VALIDATION (PRODUCTION)"
+          echo "============================================"
+
+          chmod +x scripts/validate-deployment.sh
+          ./scripts/validate-deployment.sh prod || VALIDATION_FAILED=1
+
+          if [ "${VALIDATION_FAILED:-0}" -eq 1 ]; then
+            echo "::warning::Some production validation checks failed - see output above"
+          fi
+
+      - name: Setup Go for Integration Tests
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: |
+            nhp/go.sum
+            endpoints/go.sum
+
+      - name: Run Integration Tests (Production)
+        env:
+          NHP_SERVER_ENDPOINT: "${{ steps.outputs.outputs.nlb_dns }}:62206"
+          ETCD_ENDPOINTS: ${{ steps.outputs.outputs.etcd_endpoint }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          echo "============================================"
+          echo "INTEGRATION TESTS (PRODUCTION)"
+          echo "============================================"
+          echo "NHP Server: $NHP_SERVER_ENDPOINT"
+          echo "etcd: $ETCD_ENDPOINTS"
+          echo ""
+
+          cd tests/integration
+          go test -v -tags=integration -timeout 5m ./... 2>&1 || {
+            echo "::warning::Some production integration tests failed or skipped"
+          }
+
+      - name: Production Deployment Summary
+        run: |
+          echo "## Production Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Infrastructure" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | ASG | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| NHP Server | ${{ steps.outputs.outputs.server_asg }} | Deployed |" >> $GITHUB_STEP_SUMMARY
+          echo "| AC | ${{ steps.outputs.outputs.ac_asg }} | Deployed |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Endpoints" >> $GITHUB_STEP_SUMMARY
+          echo "- **NHP NLB:** \`${{ steps.outputs.outputs.nlb_dns }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **etcd:** \`${{ steps.outputs.outputs.etcd_endpoint }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image Tag:** \`${{ needs.setup.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Validation" >> $GITHUB_STEP_SUMMARY
+          echo "- Post-deployment validation script executed" >> $GITHUB_STEP_SUMMARY
+          echo "- Integration tests completed" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================================
   # NOTIFY
