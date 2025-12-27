@@ -12,7 +12,18 @@
 set -euo pipefail
 
 ENV="${1:-sandbox}"
-AWS_PROFILE="${AWS_PROFILE:-layerv}"
+
+# Detect if running in CI (AWS credentials via env vars) or locally (AWS profile)
+if [[ -n "${AWS_ACCESS_KEY_ID:-}" ]]; then
+    # CI environment - credentials are in env vars, no profile needed
+    run_aws() { aws "$@"; }
+    AWS_PROFILE_PREFIX=""
+else
+    # Local environment - use profile
+    AWS_PROFILE="${AWS_PROFILE:-layerv}"
+    run_aws() { AWS_PROFILE=$AWS_PROFILE aws "$@"; }
+    AWS_PROFILE_PREFIX="AWS_PROFILE=$AWS_PROFILE "
+fi
 
 echo "==========================================="
 echo "NHP Deployment Validation - ${ENV}"
@@ -47,8 +58,8 @@ FAILED=0
 # 1. Check AWS connectivity
 echo "1. AWS Connectivity"
 echo "-------------------"
-if AWS_PROFILE=$AWS_PROFILE aws sts get-caller-identity &>/dev/null; then
-    ACCOUNT=$(AWS_PROFILE=$AWS_PROFILE aws sts get-caller-identity --query Account --output text)
+if run_aws sts get-caller-identity &>/dev/null; then
+    ACCOUNT=$(run_aws sts get-caller-identity --query Account --output text)
     pass "AWS credentials valid (account: $ACCOUNT)"
 else
     fail "AWS credentials invalid or expired"
@@ -58,7 +69,7 @@ echo ""
 # 2. Check NHP Server
 echo "2. NHP Server"
 echo "-------------"
-NHP_NLB=$(AWS_PROFILE=$AWS_PROFILE aws elbv2 describe-load-balancers \
+NHP_NLB=$(run_aws elbv2 describe-load-balancers \
     --query "LoadBalancers[?contains(LoadBalancerName, 'nhp-${ENV}')].DNSName" \
     --output text 2>/dev/null | head -1)
 
@@ -86,7 +97,7 @@ echo ""
 # 3. Check AC Instances
 echo "3. AC Instances"
 echo "---------------"
-AC_INSTANCES=$(AWS_PROFILE=$AWS_PROFILE aws ec2 describe-instances \
+AC_INSTANCES=$(run_aws ec2 describe-instances \
     --filters "Name=tag:Name,Values=*nhp*ac*${ENV}*" "Name=instance-state-name,Values=running" \
     --query 'Reservations[*].Instances[*].[InstanceId,PrivateIpAddress,State.Name]' \
     --output text 2>/dev/null)
@@ -138,7 +149,7 @@ echo ""
 # 5. Check Secrets Manager
 echo "5. Secrets Manager"
 echo "------------------"
-NHP_SERVER_KEY=$(AWS_PROFILE=$AWS_PROFILE aws secretsmanager list-secrets \
+NHP_SERVER_KEY=$(run_aws secretsmanager list-secrets \
     --query "SecretList[?contains(Name, 'nhp-${ENV}-server')].Name" \
     --output text 2>/dev/null | head -1)
 
@@ -149,7 +160,7 @@ else
 fi
 
 # Check for AC private keys
-AC_KEYS=$(AWS_PROFILE=$AWS_PROFILE aws secretsmanager list-secrets \
+AC_KEYS=$(run_aws secretsmanager list-secrets \
     --query "SecretList[?contains(Name, 'nhp-${ENV}-ac-')].Name" \
     --output text 2>/dev/null | wc -l | tr -d ' ')
 info "$AC_KEYS AC private key(s) in Secrets Manager"
@@ -158,7 +169,7 @@ echo ""
 # 6. Check CloudWatch Logs
 echo "6. CloudWatch Logs"
 echo "------------------"
-LOG_GROUPS=$(AWS_PROFILE=$AWS_PROFILE aws logs describe-log-groups \
+LOG_GROUPS=$(run_aws logs describe-log-groups \
     --query "logGroups[?contains(logGroupName, 'nhp')].logGroupName" \
     --output text 2>/dev/null)
 
@@ -176,7 +187,7 @@ echo ""
 # 7. Certificate Validation
 echo "7. AWS RSA-2048 Certificates"
 echo "---------------------------"
-REGION=$(AWS_PROFILE=$AWS_PROFILE aws configure get region 2>/dev/null || echo "us-east-2")
+REGION=$(run_aws configure get region 2>/dev/null || echo "us-east-2")
 info "Current region: $REGION"
 
 # The certificate validation is done in Go tests (aws_certs_test.go)
@@ -195,13 +206,13 @@ echo "==========================================="
 echo ""
 echo "Next steps:"
 echo "  1. Run Go integration tests:"
-echo "     cd /Users/posey/code/layerv/nhp && KBS_SKIP_INIT=1 go test -v ./server -run 'AWS'"
+echo "     cd nhp && KBS_SKIP_INIT=1 go test -v ./server -run 'AWS'"
 echo ""
 echo "  2. Check AC logs:"
-echo "     AWS_PROFILE=$AWS_PROFILE aws logs tail /aws/ec2/nhp-ac-${ENV} --follow"
+echo "     ${AWS_PROFILE_PREFIX}aws logs tail /aws/ec2/nhp-ac-${ENV} --follow"
 echo ""
 echo "  3. Check server logs:"
-echo "     AWS_PROFILE=$AWS_PROFILE aws logs tail /aws/ec2/nhp-server-${ENV} --follow"
+echo "     ${AWS_PROFILE_PREFIX}aws logs tail /aws/ec2/nhp-server-${ENV} --follow"
 echo ""
 
 exit $FAILED
