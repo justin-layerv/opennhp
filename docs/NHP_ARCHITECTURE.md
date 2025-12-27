@@ -78,9 +78,126 @@ between NHP components.
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## HTTP Refresh Flow (Alternative to UDP knock)
+## HTTP Authentication Flows
 
-For web-based demos, the `/refresh` endpoint provides HTTP-based access:
+NHP supports multiple HTTP-based authentication methods via plugins. The NHP Server
+exposes HTTP endpoints on port 443 (via Traefik on AC instances) for browser-based flows.
+
+### Website Demo Flow (Passcode Plugin)
+
+The marketing website (layerv.ai) uses this flow for the "Cloak URL" demo:
+
+```
+┌─────────────┐    POST /api/ps/createPortalSitesByURL    ┌─────────────┐
+│   Website   │ ─────────────────────────────────────────►│   Console   │
+│ (layerv.ai) │    Body: { url: "https://example.com" }   │    API      │
+└─────────────┘                                           └──────┬──────┘
+                                                                 │
+                        Response: { appId, passcode }            │
+                        ◄────────────────────────────────────────┘
+                                         │
+                                         ▼
+┌─────────────┐  GET qurl.link/{appId}?passcode={passcode}  ┌─────────────┐
+│    User     │ ───────────────────────────────────────────►│ NHP Server  │
+│   Browser   │                                             │ (passcode   │
+└─────────────┘                                             │  plugin)    │
+       │                                                    └──────┬──────┘
+       │                                                           │
+       │                                                           │ 1. Validate passcode
+       │                                                           │ 2. Request AC operation
+       │                                                           │
+       │                                                    ┌──────▼──────┐
+       │                                                    │   NHP AC    │
+       │                                                    │ (ipset add) │
+       │                                                    └──────┬──────┘
+       │                                                           │
+       │    Set-Cookie: nhp_token, nhp_refresh_token               │
+       │    Redirect: https://{appId}.qurl.site/                   │
+       │◄──────────────────────────────────────────────────────────┘
+       │
+       │  GET https://{appId}.qurl.site/
+       ▼
+┌─────────────┐     Validate nhp_token      ┌─────────────┐
+│   Traefik   │ ───────────────────────────►│ Traefik NHP │
+│             │                              │ Middleware  │
+└──────┬──────┘                              └─────────────┘
+       │
+       │  iptables allows (srcIP in ipset)
+       ▼
+┌─────────────┐
+│  Protected  │
+│  Resource   │
+└─────────────┘
+```
+
+**Key Endpoints:**
+- `POST home.secure.layerv.xyz/api/ps/createPortalSitesByURL` - Create cloaked URL
+- `GET qurl.link/{appId}?passcode={passcode}` - Authenticate with passcode
+- `GET qurl.link/{appId}` - Login page (if no passcode)
+- `GET {appId}.qurl.site/` - Access protected resource
+
+**Protected Server URL** (`{appId}.qurl.site`):
+- All ports filtered (DROP) by default
+- Traefik validates nhp_token cookie
+- Only authenticated IPs in ipset can connect
+
+### OIDC/Okta Demo Flow (Okta Plugin)
+
+For enterprise SSO integration demos:
+
+```
+┌─────────────┐  Visit demo-login.secure.layerv.xyz   ┌─────────────┐
+│    User     │ ─────────────────────────────────────►│ Demo Login  │
+│   Browser   │                                        │    Page     │
+└──────┬──────┘                                        └─────────────┘
+       │
+       │ Click "Login with Okta"
+       │ GET oa.secure.layerv.ai/plugins/oktaoidc?resid=demo-app&action=oauth
+       ▼
+┌─────────────┐                              ┌─────────────┐
+│ NHP Server  │  Initialize Authenticator   │  Okta OIDC  │
+│             │ ────────────────────────────►│   Plugin    │
+└──────┬──────┘                              └─────────────┘
+       │
+       │ Redirect to Okta authorization URL
+       ▼
+┌─────────────┐    OAuth Authorization    ┌─────────────┐
+│    Okta     │ ◄────────────────────────►│    User     │
+│             │                            │   Browser   │
+└──────┬──────┘                            └─────────────┘
+       │
+       │ Callback with authorization code
+       ▼
+┌─────────────┐   Exchange code for token   ┌─────────────┐
+│ NHP Server  │ ───────────────────────────►│    Okta     │
+│             │                              │             │
+└──────┬──────┘                              └─────────────┘
+       │
+       │ Verify ID token, request AC operation
+       ▼
+┌─────────────┐
+│   NHP AC    │  Open iptables for srcIp
+└──────┬──────┘
+       │
+       │ Set-Cookie: nhp-token
+       │ Redirect to protected resource
+       ▼
+┌─────────────┐
+│  Protected  │
+│  Resource   │
+└─────────────┘
+```
+
+**Plugin Actions:**
+| Action | URL Parameter | Description |
+|--------|---------------|-------------|
+| `oauth` | `?action=oauth` | Initiate OAuth flow, redirect to Okta |
+| `valid` | `?action=valid` | Validate after OAuth callback |
+| `login` | `?action=login` | Show login page |
+
+### HTTP Refresh Flow (Token Refresh)
+
+For maintaining access when IP changes:
 
 ```
 ┌─────────┐     HTTPS 443       ┌──────────┐     HTTP 8888      ┌─────────┐
@@ -89,7 +206,7 @@ For web-based demos, the `/refresh` endpoint provides HTTP-based access:
 └─────────┘                     └──────────┘                    └────┬────┘
                                                                      │
                                                                      │ Validate token
-                                                                     │ Add to ipset
+                                                                     │ Add new srcIP to ipset
                                                                      ▼
                                                               ┌─────────────┐
                                                               │  Firewall   │
@@ -220,3 +337,40 @@ and will fall back to "accept all" mode (failopen).
 - **Server SG**: Allow UDP 62206 from 0.0.0.0/0 (for agent knocks via NLB)
 - **AC SG**: Allow UDP 62206 from VPC CIDR (for server-to-AC communication, though AC dials out)
 - **AC SG**: Allow TCP 443, 80 from 0.0.0.0/0 (for HTTPS via NLB)
+
+## Testing
+
+### E2E Test Endpoints
+
+To verify the demo flow is working:
+
+```bash
+# 1. Create a cloaked URL
+curl -X POST https://home.secure.layerv.xyz/api/ps/createPortalSitesByURL \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://httpbin.org"}'
+# Response: {"code":0,"data":{"appId":"abc123","passcode":"secret"}}
+
+# 2. Verify protected server is blocked (should timeout or get auth page)
+curl -I https://abc123.qurl.site/
+# Expected: 401/403 or redirect to login
+
+# 3. Authenticate with passcode
+curl -c cookies.txt -L "https://qurl.link/abc123?passcode=secret"
+# Expected: 200 with httpbin.org content
+
+# 4. Verify port scan shows nothing
+nmap -Pn -p 80,443 abc123.qurl.site
+# Expected: All ports filtered
+```
+
+### Integration Test Files
+
+- `tests/integration/deployment_test.go` - Post-deployment validation
+- Build tag: `//go:build integration`
+- Run with: `go test -tags=integration ./tests/integration/...`
+
+### Related Documentation
+
+- [LAYERV_SYSTEM_ARCHITECTURE.md](./LAYERV_SYSTEM_ARCHITECTURE.md) - Full system overview including all repositories
+- [../CLAUDE.md](../CLAUDE.md) - Development guide for this repository
