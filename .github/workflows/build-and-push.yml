@@ -257,9 +257,9 @@ jobs:
 
       - name: Build Lambda Layer (required for Terraform)
         run: |
-          mkdir -p /tmp/lambda-layer-build
-          docker run --rm -v "/tmp/lambda-layer-build:/output" public.ecr.aws/lambda/python:3.11 \
-            sh -c "pip install cryptography -t /output/python --no-cache-dir && cd /output && zip -r cryptography-layer.zip python/"
+          mkdir -p /tmp/lambda-layer-build/python
+          pip install cryptography -t /tmp/lambda-layer-build/python --no-cache-dir
+          cd /tmp/lambda-layer-build && zip -r cryptography-layer.zip python/
           ls -la /tmp/lambda-layer-build/
 
       - name: Terraform Init
@@ -344,9 +344,9 @@ jobs:
 
       - name: Build Lambda Layer (required for Terraform)
         run: |
-          mkdir -p /tmp/lambda-layer-build
-          docker run --rm -v "/tmp/lambda-layer-build:/output" public.ecr.aws/lambda/python:3.11 \
-            sh -c "pip install cryptography -t /output/python --no-cache-dir && cd /output && zip -r cryptography-layer.zip python/"
+          mkdir -p /tmp/lambda-layer-build/python
+          pip install cryptography -t /tmp/lambda-layer-build/python --no-cache-dir
+          cd /tmp/lambda-layer-build && zip -r cryptography-layer.zip python/
           ls -la /tmp/lambda-layer-build/
 
       - name: Terraform Init
