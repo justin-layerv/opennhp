@@ -361,7 +361,7 @@ func TestDeployment_Summary(t *testing.T) {
 	fmt.Printf("etcd endpoints: %v\n", cfg.etcdEndpoints)
 	fmt.Printf("NHP server:     %s\n", cfg.nhpServer)
 	fmt.Printf("AWS region:     %s\n", cfg.awsRegion)
-	fmt.Println("==========================================\n")
+	fmt.Println("==========================================")
 
 	t.Log("Run all tests with: go test -v -tags=integration ./tests/integration/...")
 }
