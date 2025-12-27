@@ -444,6 +444,12 @@ jobs:
           name: tfplan-sandbox-${{ github.sha }}
           path: terraform/environments/sandbox
 
+      - name: Build Lambda Layer (required for Terraform)
+        run: |
+          mkdir -p /tmp/lambda-layer-build/python
+          pip install cryptography -t /tmp/lambda-layer-build/python --no-cache-dir
+          cd /tmp/lambda-layer-build && zip -r cryptography-layer.zip python/
+
       - name: Terraform Init
         working-directory: terraform/environments/sandbox
         env:
@@ -702,6 +708,12 @@ jobs:
         with:
           name: tfplan-prod-${{ github.sha }}
           path: terraform/environments/prod
+
+      - name: Build Lambda Layer (required for Terraform)
+        run: |
+          mkdir -p /tmp/lambda-layer-build/python
+          pip install cryptography -t /tmp/lambda-layer-build/python --no-cache-dir
+          cd /tmp/lambda-layer-build && zip -r cryptography-layer.zip python/
 
       - name: Terraform Init
         working-directory: terraform/environments/prod
