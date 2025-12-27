@@ -9,6 +9,8 @@ on:
       - 'endpoints/**'
       - 'docker/**'
       - 'terraform/**'
+      - 'scripts/**'
+      - 'tests/**'
       - '.github/workflows/build-and-push.yml'
   pull_request:
     branches:
@@ -18,6 +20,8 @@ on:
       - 'endpoints/**'
       - 'docker/**'
       - 'terraform/**'
+      - 'scripts/**'
+      - 'tests/**'
   workflow_dispatch:
     inputs:
       environment:
