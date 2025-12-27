@@ -285,20 +285,25 @@ type Peers struct {
 }
 
 func (s *UdpServer) loadBaseConfig() error {
-	// config.toml
+	// config.toml - REQUIRED for server to start
 	fileName := filepath.Join(ExeDirPath, "etc", "config.toml")
 	content, err := s.loadConfigFile(fileName)
 	if err != nil {
-		log.Error("load base config err: %v", err)
-		return err
+		return fmt.Errorf("failed to read base config %s: %w", fileName, err)
 	}
+
 	var config Config
 	if err := toml.Unmarshal(content, &config); err != nil {
-		log.Error("failed to unmarshal base config: %v", err)
+		return fmt.Errorf("failed to parse base config %s: %w", fileName, err)
 	}
+
+	// Validate required fields
+	if config.PrivateKeyBase64 == "" {
+		return fmt.Errorf("PrivateKeyBase64 is required in %s", fileName)
+	}
+
 	if err = s.updateBaseConfig(config); err != nil {
-		// report base config error
-		return err
+		return fmt.Errorf("failed to apply base config: %w", err)
 	}
 
 	baseConfigWatch = utils.WatchFile(fileName, func() {
@@ -314,20 +319,24 @@ func (s *UdpServer) loadBaseConfig() error {
 }
 
 func (s *UdpServer) loadHttpConfig() error {
-	// http.toml
+	// http.toml - optional, enables HTTP endpoint
 	fileName := filepath.Join(ExeDirPath, "etc", "http.toml")
 	content, err := s.loadConfigFile(fileName)
 	if err != nil {
-		log.Error("load http config err: %v", err)
-		return err
+		if os.IsNotExist(err) {
+			log.Info("http.toml not found, HTTP endpoint disabled")
+			return nil
+		}
+		return fmt.Errorf("failed to read http config %s: %w", fileName, err)
 	}
+
 	var httpConf HttpConfig
 	if err := toml.Unmarshal(content, &httpConf); err != nil {
-		log.Error("failed to unmarshal http config: %v", err)
+		return fmt.Errorf("failed to parse http config %s: %w", fileName, err)
 	}
+
 	if err = s.updateHttpConfig(httpConf); err != nil {
-		// ignore error
-		_ = err
+		return fmt.Errorf("failed to apply http config: %w", err)
 	}
 
 	httpConfigWatch = utils.WatchFile(fileName, func() {
@@ -337,87 +346,88 @@ func (s *UdpServer) loadHttpConfig() error {
 				s.updateHttpConfig(httpConf)
 			}
 		}
-
 	})
 	return nil
 }
 
 func (s *UdpServer) loadPeers() error {
-	// ac.toml
+	// ac.toml - optional, contains AC peer configurations
 	fileNameAC := filepath.Join(ExeDirPath, "etc", "ac.toml")
-
 	contentAC, err := s.loadConfigFile(fileNameAC)
 	if err != nil {
-		log.Error("load ac peer config err: %v", err)
-		return err
-	}
-	var acPeers Peers
-	if err := toml.Unmarshal(contentAC, &acPeers); err != nil {
-		log.Error("failed to unmarshal ac peers config: %v", err)
-	}
-
-	if err := s.updateACPeers(acPeers.ACs); err != nil {
-		// ignore error
-		_ = err
-	}
-
-	acConfigWatch = utils.WatchFile(fileNameAC, func() {
-		log.Info("ac peer config: %s has been updated", fileNameAC)
-		if contentAC, err = s.loadConfigFile(fileNameAC); err == nil {
-			if err = toml.Unmarshal(contentAC, &acPeers); err == nil {
-				s.updateACPeers(acPeers.ACs)
-			}
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("failed to read AC peer config %s: %w", fileNameAC, err)
 		}
-	})
+		log.Info("ac.toml not found, no AC peers configured")
+	} else {
+		var acPeers Peers
+		if err := toml.Unmarshal(contentAC, &acPeers); err != nil {
+			return fmt.Errorf("failed to parse AC peer config %s: %w", fileNameAC, err)
+		}
+		if err := s.updateACPeers(acPeers.ACs); err != nil {
+			return fmt.Errorf("failed to apply AC peers: %w", err)
+		}
+		acConfigWatch = utils.WatchFile(fileNameAC, func() {
+			log.Info("ac peer config: %s has been updated", fileNameAC)
+			if contentAC, err = s.loadConfigFile(fileNameAC); err == nil {
+				if err = toml.Unmarshal(contentAC, &acPeers); err == nil {
+					s.updateACPeers(acPeers.ACs)
+				}
+			}
+		})
+	}
 
-	// agent.toml
+	// agent.toml - optional, contains agent peer configurations
 	fileNameAgent := filepath.Join(ExeDirPath, "etc", "agent.toml")
 	contentAgent, err := s.loadConfigFile(fileNameAgent)
 	if err != nil {
-		log.Error("load agent peer config err: %v", err)
-		return err
-	}
-	var agentPeers Peers
-	if err := toml.Unmarshal(contentAgent, &agentPeers); err != nil {
-		log.Error("failed to unmarshal agent peers config: %v", err)
-	}
-	if err := s.updateAgentPeers(agentPeers.Agents); err != nil {
-		// ignore error
-		_ = err
-	}
-
-	agentConfigWatch = utils.WatchFile(fileNameAgent, func() {
-		log.Info("agent peer config: %s has been updated", fileNameAgent)
-		if contentAgent, err = s.loadConfigFile(fileNameAgent); err == nil {
-			if err = toml.Unmarshal(contentAgent, &agentPeers); err == nil {
-				s.updateAgentPeers(agentPeers.Agents)
-			}
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("failed to read agent peer config %s: %w", fileNameAgent, err)
 		}
-	})
+		log.Info("agent.toml not found, no agent peers configured")
+	} else {
+		var agentPeers Peers
+		if err := toml.Unmarshal(contentAgent, &agentPeers); err != nil {
+			return fmt.Errorf("failed to parse agent peer config %s: %w", fileNameAgent, err)
+		}
+		if err := s.updateAgentPeers(agentPeers.Agents); err != nil {
+			return fmt.Errorf("failed to apply agent peers: %w", err)
+		}
+		agentConfigWatch = utils.WatchFile(fileNameAgent, func() {
+			log.Info("agent peer config: %s has been updated", fileNameAgent)
+			if contentAgent, err = s.loadConfigFile(fileNameAgent); err == nil {
+				if err = toml.Unmarshal(contentAgent, &agentPeers); err == nil {
+					s.updateAgentPeers(agentPeers.Agents)
+				}
+			}
+		})
+	}
 
-	//db.toml
+	// db.toml - optional, contains DB peer configurations
 	fileNameDE := filepath.Join(ExeDirPath, "etc", "db.toml")
 	contentDE, err := s.loadConfigFile(fileNameDE)
 	if err != nil {
-		log.Error("load db peer config err: %v", err)
-		return err
-	}
-	var dePeers Peers
-	if err := toml.Unmarshal(contentDE, &dePeers); err != nil {
-		log.Error("failed to unmarshal db peers config: %v", err)
-	}
-	if err := s.updateDePeers(dePeers.DBs); err != nil {
-		// ignore error
-		_ = err
-	}
-	dbConfigWatch = utils.WatchFile(fileNameDE, func() {
-		log.Info("device peer config: %s has been updated", fileNameDE)
-		if contentDE, err = s.loadConfigFile(fileNameDE); err == nil {
-			if err = toml.Unmarshal(contentDE, &dePeers); err == nil {
-				s.updateDePeers(dePeers.DBs)
-			}
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("failed to read DB peer config %s: %w", fileNameDE, err)
 		}
-	})
+		log.Info("db.toml not found, no DB peers configured")
+	} else {
+		var dePeers Peers
+		if err := toml.Unmarshal(contentDE, &dePeers); err != nil {
+			return fmt.Errorf("failed to parse DB peer config %s: %w", fileNameDE, err)
+		}
+		if err := s.updateDePeers(dePeers.DBs); err != nil {
+			return fmt.Errorf("failed to apply DB peers: %w", err)
+		}
+		dbConfigWatch = utils.WatchFile(fileNameDE, func() {
+			log.Info("device peer config: %s has been updated", fileNameDE)
+			if contentDE, err = s.loadConfigFile(fileNameDE); err == nil {
+				if err = toml.Unmarshal(contentDE, &dePeers); err == nil {
+					s.updateDePeers(dePeers.DBs)
+				}
+			}
+		})
+	}
 
 	// tee.toml
 	fileNameTee := filepath.Join(ExeDirPath, "etc", "tee.toml")

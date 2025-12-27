@@ -72,20 +72,25 @@ type Peers struct {
 }
 
 func (a *UdpAC) loadBaseConfig() error {
-	// config.toml
+	// config.toml - REQUIRED for AC to start
 	fileName := filepath.Join(ExeDirPath, "etc", "config.toml")
 	content, err := os.ReadFile(fileName)
 	if err != nil {
-		log.Error("failed to read base config: %v", err)
+		return fmt.Errorf("failed to read base config %s: %w", fileName, err)
 	}
 
 	var conf Config
 	if err := toml.Unmarshal(content, &conf); err != nil {
-		log.Error("failed to unmarshal base config: %v", err)
+		return fmt.Errorf("failed to parse base config %s: %w", fileName, err)
 	}
+
+	// Validate required fields before proceeding
+	if conf.PrivateKeyBase64 == "" {
+		return fmt.Errorf("PrivateKeyBase64 is required in %s", fileName)
+	}
+
 	if err := a.updateBaseConfig(conf); err != nil {
-		// report base config error
-		return err
+		return fmt.Errorf("failed to apply base config: %w", err)
 	}
 
 	baseConfigWatch = utils.WatchFile(fileName, func() {
@@ -101,20 +106,24 @@ func (a *UdpAC) loadBaseConfig() error {
 }
 
 func (a *UdpAC) loadHttpConfig() error {
-	// http.toml
+	// http.toml - optional, enables HTTP endpoint
 	fileName := filepath.Join(ExeDirPath, "etc", "http.toml")
 	content, err := os.ReadFile(fileName)
 	if err != nil {
-		log.Error("failed to read http config: %v", err)
+		if os.IsNotExist(err) {
+			log.Info("http.toml not found, HTTP endpoint disabled")
+			return nil
+		}
+		return fmt.Errorf("failed to read http config %s: %w", fileName, err)
 	}
 
 	var httpConf HttpConfig
 	if err := toml.Unmarshal(content, &httpConf); err != nil {
-		log.Error("failed to unmarshal http config: %v", err)
+		return fmt.Errorf("failed to parse http config %s: %w", fileName, err)
 	}
+
 	if err := a.updateHttpConfig(httpConf); err != nil {
-		// ignore error
-		_ = err
+		return fmt.Errorf("failed to apply http config: %w", err)
 	}
 
 	httpConfigWatch = utils.WatchFile(fileName, func() {
@@ -129,21 +138,24 @@ func (a *UdpAC) loadHttpConfig() error {
 }
 
 func (a *UdpAC) loadPeers() error {
-	// server.toml
+	// server.toml - contains NHP server peer configurations
 	fileName := filepath.Join(ExeDirPath, "etc", "server.toml")
 	content, err := os.ReadFile(fileName)
 	if err != nil {
-		log.Error("failed to read server peer config: %v", err)
+		if os.IsNotExist(err) {
+			log.Info("server.toml not found, no server peers configured")
+			return nil
+		}
+		return fmt.Errorf("failed to read server peer config %s: %w", fileName, err)
 	}
 
-	// update
 	var peers Peers
 	if err := toml.Unmarshal(content, &peers); err != nil {
-		log.Error("failed to unmarshal server peer config: %v", err)
+		return fmt.Errorf("failed to parse server peer config %s: %w", fileName, err)
 	}
+
 	if err := a.updateServerPeers(peers.Servers); err != nil {
-		// ignore error
-		_ = err
+		return fmt.Errorf("failed to apply server peers: %w", err)
 	}
 
 	serverPeerWatch = utils.WatchFile(fileName, func() {
