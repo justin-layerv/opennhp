@@ -255,6 +255,13 @@ jobs:
         working-directory: terraform/environments/sandbox
         run: terraform fmt -check -recursive ../../
 
+      - name: Build Lambda Layer (required for Terraform)
+        run: |
+          mkdir -p /tmp/lambda-layer-build
+          docker run --rm -v "/tmp/lambda-layer-build:/output" public.ecr.aws/lambda/python:3.11 \
+            sh -c "pip install cryptography -t /output/python --no-cache-dir && cd /output && zip -r cryptography-layer.zip python/"
+          ls -la /tmp/lambda-layer-build/
+
       - name: Terraform Init
         working-directory: terraform/environments/sandbox
         env:
@@ -334,6 +341,13 @@ jobs:
         with:
           role-to-assume: ${{ matrix.environment == 'prod' && secrets.AWS_PROD_ROLE_ARN || secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build Lambda Layer (required for Terraform)
+        run: |
+          mkdir -p /tmp/lambda-layer-build
+          docker run --rm -v "/tmp/lambda-layer-build:/output" public.ecr.aws/lambda/python:3.11 \
+            sh -c "pip install cryptography -t /output/python --no-cache-dir && cd /output && zip -r cryptography-layer.zip python/"
+          ls -la /tmp/lambda-layer-build/
 
       - name: Terraform Init
         working-directory: terraform/environments/${{ matrix.environment }}
