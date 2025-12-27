@@ -297,21 +297,6 @@ fi
 echo "AC keypair ready (public key: $${PUBLIC_KEY:0:20}...)"
 
 # ============================================================================
-# Fetch AWS Instance Identity Document with RSA-2048 Signature
-# Used for cryptographic proof of instance identity when registering with etcd.
-# We use the RSA-2048 signature endpoint which is verified using region-specific
-# AWS RSA-2048 certificates (valid until 2195+).
-# See: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/verify-rsa2048.html
-# ============================================================================
-echo "Fetching AWS Instance Identity Document..."
-IDENTITY_DOCUMENT=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/document)
-# Use RSA-2048 signature (not the old base64 DSA signature)
-IDENTITY_RSA2048=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/rsa2048)
-IDENTITY_DOCUMENT_B64=$(echo "$IDENTITY_DOCUMENT" | base64 -w0)
-# The RSA-2048 signature is already in PEM format, extract just the base64 content
-IDENTITY_SIGNATURE=$(echo "$IDENTITY_RSA2048" | grep -v "^-----" | tr -d '\n')
-echo "Instance identity document retrieved (RSA-2048 signature)"
-
 # Configure etcd connection for multi-tenant with TLS
 %{ if etcd_endpoint != null }
 echo "Fetching etcd TLS certificates..."
@@ -401,8 +386,6 @@ etcd_endpoint = "${etcd_endpoint}"
 instance_id = "$INSTANCE_ID"
 public_key = "$PUBLIC_KEY"
 local_ip = "$LOCAL_IP"
-identity_document = """$IDENTITY_DOCUMENT"""
-identity_signature = """$IDENTITY_SIGNATURE"""
 
 # TLS certificate paths
 ca_path = "/opt/layerv/nhp-ac/etc/tls/ca.crt"
@@ -417,8 +400,6 @@ InstanceId = "{instance_id}"
 Ip = "{local_ip}"
 Port = 62206
 RegisteredAt = {registered_at}
-IdentityDocument = "{base64.b64encode(identity_document.encode()).decode()}"
-IdentitySignature = "{identity_signature}"
 '''
 
 # Create SSL context with client cert
@@ -500,7 +481,7 @@ cat > /opt/layerv/nhp-ac/etc/config.toml << CONFIGEOF
 ACId = "${environment}-ac-$INSTANCE_ID"
 DefaultIp = "$LOCAL_IP"
 PrivateKeyBase64 = "$PRIVATE_KEY"
-DefaultCipherScheme = 0
+DefaultCipherScheme = 1
 IpPassMode = 0
 LogLevel = 4
 AuthServiceId = "${auth_service_id}"

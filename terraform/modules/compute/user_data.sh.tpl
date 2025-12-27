@@ -86,6 +86,54 @@ HttpListenIp = ""
 HttpListenPort = 8080
 HTTPEOF
 
+# ============================================================================
+# etcd Configuration for AC Registry Discovery
+# Server watches /nhp/ac-registry/ prefix to dynamically discover ACs.
+# Each AC registers its public key and AWS identity when it starts.
+# This enables per-AC keypairs and dynamic scaling without static ac.toml.
+# ============================================================================
+%{ if multi_tenant && etcd_endpoint != "" }
+echo "Configuring etcd connection for AC registry discovery..."
+mkdir -p /opt/layerv/nhp-server/etc/tls
+
+# Fetch etcd TLS certificates from Secrets Manager (CA + client certs for mTLS)
+%{ if etcd_tls_secret_arn != "" }
+echo "Fetching etcd TLS certificates..."
+ETCD_TLS_SECRET=$(aws secretsmanager get-secret-value --secret-id "${etcd_tls_secret_arn}" --region "$REGION" --query SecretString --output text)
+
+# Extract CA certificate
+echo "$ETCD_TLS_SECRET" | jq -r '.caCert' > /opt/layerv/nhp-server/etc/tls/ca.crt
+chmod 644 /opt/layerv/nhp-server/etc/tls/ca.crt
+echo "etcd CA certificate installed"
+
+# Extract client certificate and key for mTLS authentication
+echo "$ETCD_TLS_SECRET" | jq -r '.clientCert' > /opt/layerv/nhp-server/etc/tls/client.crt
+chmod 644 /opt/layerv/nhp-server/etc/tls/client.crt
+echo "$ETCD_TLS_SECRET" | jq -r '.clientKey' > /opt/layerv/nhp-server/etc/tls/client.key
+chmod 600 /opt/layerv/nhp-server/etc/tls/client.key
+echo "etcd client certificate and key installed for mTLS"
+%{ endif }
+
+# Create remote.toml for etcd connection
+# Server uses this to:
+# 1. Watch /nhp/ac-registry/ prefix for AC registrations
+# 2. Load shared config from /nhp/config (if seeded)
+cat > /opt/layerv/nhp-server/etc/remote.toml << 'REMOTEEOF'
+Provider = "etcd"
+Key = "nhp/config"
+Endpoints = ["${etcd_endpoint}"]
+%{ if etcd_tls_secret_arn != "" }
+TLS = true
+CACert = "/nhp-server/etc/tls/ca.crt"
+ClientCert = "/nhp-server/etc/tls/client.crt"
+ClientKey = "/nhp-server/etc/tls/client.key"
+%{ endif }
+REMOTEEOF
+echo "etcd remote.toml configured: ${etcd_endpoint}"
+%{ else }
+echo "etcd not configured (multi_tenant=${multi_tenant}), using local config only"
+%{ endif }
+
 CLOUDMAP_SERVICE_ID="${cloudmap_service_id}"
 
 cat > /opt/layerv/nhp-server/cloudmap-register.sh << 'CMEOF'

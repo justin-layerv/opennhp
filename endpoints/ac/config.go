@@ -140,19 +140,22 @@ func (a *UdpAC) loadHttpConfig() error {
 func (a *UdpAC) loadPeers() error {
 	// server.toml - contains NHP server peer configurations
 	fileName := filepath.Join(ExeDirPath, "etc", "server.toml")
+	log.Info("loading server peers from: %s (ExeDirPath=%s)", fileName, ExeDirPath)
 	content, err := os.ReadFile(fileName)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Info("server.toml not found, no server peers configured")
+			log.Info("server.toml not found at %s, no server peers configured", fileName)
 			return nil
 		}
 		return fmt.Errorf("failed to read server peer config %s: %w", fileName, err)
 	}
 
+	log.Debug("loaded server.toml content (%d bytes): %s", len(content), string(content))
 	var peers Peers
 	if err := toml.Unmarshal(content, &peers); err != nil {
 		return fmt.Errorf("failed to parse server peer config %s: %w", fileName, err)
 	}
+	log.Info("parsed %d server peers from server.toml", len(peers.Servers))
 
 	if err := a.updateServerPeers(peers.Servers); err != nil {
 		return fmt.Errorf("failed to apply server peers: %w", err)
@@ -243,8 +246,11 @@ func (a *UdpAC) updateServerPeers(peers []*core.UdpPeer) (err error) {
 		err = errLoadConfig
 	})
 
+	log.Info("updating server peers: count=%d", len(peers))
 	serverPeerMap := make(map[string]*core.UdpPeer)
 	for _, p := range peers {
+		log.Debug("loading server peer: host=%s, ip=%s, port=%d, pubKeyBase64=%q, pubKeyLen=%d",
+			p.Hostname, p.Ip, p.Port, p.PubKeyBase64, len(p.PublicKey()))
 		p.Type = core.NHP_SERVER
 		a.device.AddPeer(p)
 		serverPeerMap[p.PublicKeyBase64()] = p
@@ -276,12 +282,14 @@ func (a *UdpAC) loadConfigFile(file string) (content []byte, err error) {
 func (a *UdpAC) initRemoteConn() error {
 	// remote.toml
 	fileName := filepath.Join(ExeDirPath, "etc", "remote.toml")
+	log.Info("checking for remote.toml at: %s", fileName)
 
 	_, e := os.Stat(fileName)
 	if os.IsNotExist(e) {
-		//remote.toml file not found,use local config
+		log.Info("remote.toml not found, using local config only (no etcd)")
 		return nil
 	}
+	log.Info("remote.toml EXISTS - will connect to etcd and load remote config")
 
 	content, err := os.ReadFile(fileName)
 	if err != nil {
@@ -364,10 +372,16 @@ func (a *UdpAC) loadRemoteBaseConfig() error {
 }
 
 func (a *UdpAC) updateEtcdConfig(content []byte, baseLoad bool) (err error) {
+	log.Debug("updateEtcdConfig: loading config from etcd (%d bytes): %s", len(content), string(content))
 	var acEtcdConfig ACEtcdConfig
 	if err = toml.Unmarshal(content, &acEtcdConfig); err != nil {
 		log.Error("failed to unmarshal remote config: %v", err)
 		return err
+	}
+	log.Debug("updateEtcdConfig: parsed %d server peers from etcd", len(acEtcdConfig.Servers))
+	for i, s := range acEtcdConfig.Servers {
+		log.Debug("updateEtcdConfig: etcd server[%d]: host=%s, ip=%s, port=%d, pubKeyBase64=%q",
+			i, s.Hostname, s.Ip, s.Port, s.PubKeyBase64)
 	}
 
 	// SECURITY: Never update base config from etcd.

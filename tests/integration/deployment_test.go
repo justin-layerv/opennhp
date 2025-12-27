@@ -194,13 +194,11 @@ func TestEtcd_ACRegistry(t *testing.T) {
 		instanceId := strings.TrimPrefix(key, "/nhp/ac-registry/")
 
 		var entry struct {
-			PublicKey         string
-			InstanceId        string
-			Ip                string
-			Port              int
-			RegisteredAt      int64
-			IdentityDocument  string
-			IdentitySignature string
+			PublicKey    string
+			InstanceId   string
+			Ip           string
+			Port         int
+			RegisteredAt int64
 		}
 
 		if err := toml.Unmarshal(kv.Value, &entry); err != nil {
@@ -214,12 +212,6 @@ func TestEtcd_ACRegistry(t *testing.T) {
 		}
 		if entry.Ip == "" {
 			t.Errorf("AC %s: missing IP address", instanceId)
-		}
-		if entry.IdentityDocument == "" {
-			t.Errorf("AC %s: missing identity document", instanceId)
-		}
-		if entry.IdentitySignature == "" {
-			t.Errorf("AC %s: missing identity signature", instanceId)
 		}
 
 		t.Logf("AC %s: ip=%s, registered=%d", instanceId, entry.Ip, entry.RegisteredAt)

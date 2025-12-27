@@ -29,7 +29,7 @@ type MsgData struct {
 	TransactionId  uint64
 	HeaderType     int
 	Compress       bool
-	ClPkc          bool              // 0: non-CL-PKC extented, 1: CL-PKC extended
+	ClPkc          bool // 0: non-CL-PKC extented, 1: CL-PKC extended
 	ExternalPacket *Packet
 	ExternalCookie *[CookieSize]byte
 	Message        []byte
@@ -88,6 +88,8 @@ type MsgAssemblerData struct {
 }
 
 func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err error) {
+	log.Debug("createMsgAssemblerData: PeerPk len=%d, CipherScheme=%d, HeaderType=%d",
+		len(md.PeerPk), md.CipherScheme, md.HeaderType)
 	if md.PrevParserData != nil {
 		// continue from previous received packet to form one transaction
 		mad = md.PrevParserData.deriveMsgAssemblerData(md.HeaderType, md.Compress, md.Message)
@@ -226,24 +228,31 @@ func (mad *MsgAssemblerData) setPeerPublicKey(peerPk []byte) (err error) {
 	}
 
 	lenMismatch := false
+	log.Debug("setPeerPublicKey: checking key length: RemotePubKey len=%d, CipherScheme=%d, PublicKeySize=%d, PublicKeySizeEx=%d",
+		len(mad.RemotePubKey), mad.CipherScheme, PublicKeySize, PublicKeySizeEx)
 	switch mad.CipherScheme {
 	case common.CIPHER_SCHEME_CURVE:
+		log.Debug("setPeerPublicKey: CURVE scheme, comparing %d != %d", len(mad.RemotePubKey), PublicKeySize)
 		if len(mad.RemotePubKey) != PublicKeySize {
+			log.Error("remote peer public key length does not match cipher scheme: got %d bytes, expected %d for scheme %d, key=%x",
+				len(mad.RemotePubKey), PublicKeySize, mad.CipherScheme, mad.RemotePubKey)
 			lenMismatch = true
 		}
 
 	case common.CIPHER_SCHEME_GMSM:
+		log.Debug("setPeerPublicKey: GMSM scheme, comparing %d != %d", len(mad.RemotePubKey), PublicKeySizeEx)
 		if len(mad.RemotePubKey) != PublicKeySizeEx {
+			log.Error("remote peer public key length does not match cipher scheme: got %d bytes, expected %d for scheme %d, key=%x",
+				len(mad.RemotePubKey), PublicKeySizeEx, mad.CipherScheme, mad.RemotePubKey)
 			lenMismatch = true
 		}
 	default:
-		log.Error("cipher scheme not implemented") // should never get here
+		log.Error("cipher scheme not implemented: %d", mad.CipherScheme)
 		err = ErrDeviceECDHPeerFailed
 		return err
 	}
 
 	if lenMismatch {
-		log.Error("remote peer public key length does not match cipher scheme")
 		err = ErrDeviceECDHPeerFailed
 		return err
 	}

@@ -163,15 +163,17 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	log.Info("=== RELEASE %s                       ===", version.BuildTime)
 	log.Info("=========================================================")
 
-	// load remote config,init etcd client
+	// Initialize etcd connection for AC registry discovery (if configured)
+	// This does NOT affect base config loading - private key always comes from local config.toml
 	err = s.initRemoteConn()
-	if err == nil && s.etcdConn == nil {
-		// init config
-		err = s.loadBaseConfig()
-	} else {
-		// nhp server base config must be loaded first.
-		err = s.loadRemoteBaseConfig()
+	if err != nil {
+		// Log warning but continue - etcd is optional for config, required only for AC discovery
+		log.Warning("initRemoteConn failed: %v (AC registry discovery disabled)", err)
 	}
+
+	// Always load base config from local config.toml first
+	// The private key is per-server and stored in Secrets Manager, not shared etcd
+	err = s.loadBaseConfig()
 	if err != nil {
 		return err
 	}
@@ -232,14 +234,24 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	// load asp resources and plugins
 	s.pluginHandlerMap = make(map[string]plugins.PluginHandler)
 	if s.etcdConn != nil {
-		// load nhp server config from etcd
-		s.loadRemoteConfig()
+		// Try to load additional config from etcd (optional)
+		// This loads HTTP config, agent peers, resources, etc. from /nhp/config key
+		// Note: The key may not exist if etcd is used only for AC registry
+		if err := s.loadRemoteConfig(); err != nil {
+			log.Info("Remote config not loaded from etcd (key may not exist): %v", err)
+			// Fall back to local config files for HTTP, peers, resources
+			s.loadPeers()
+			s.loadHttpConfig()
+			s.loadSourceIps()
+			s.loadResources()
+		}
 
 		// Load AC registry - per-instance AC keys registered dynamically
 		// This watches /nhp/ac-registry/ prefix for AC registrations
+		// ACs register themselves with their public keys on startup
 		if err := s.loadACRegistry(); err != nil {
 			log.Error("Failed to load AC registry: %v", err)
-			// Continue anyway - ACs from etcd config will still work
+			// Continue anyway - will use ACs from local ac.toml if present
 		}
 	} else {
 		// load peers

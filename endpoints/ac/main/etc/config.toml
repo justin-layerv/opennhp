@@ -16,7 +16,7 @@
 ACId = "testAC-346"
 DefaultIp = "172.16.3.46"
 PrivateKeyBase64 = "6++hr1lJkvbCVBCbTm4OpXusFJI0wmDi/RR3WpTz3tk="
-DefaultCipherScheme = 0
+DefaultCipherScheme = 1
 IpPassMode = 0
 LogLevel = 4
 AuthServiceId = "example"

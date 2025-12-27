@@ -539,8 +539,6 @@ InstanceId = "i-1234567890abcdef0"
 Ip = "10.0.0.100"
 Port = 62206
 RegisteredAt = 1703980800
-IdentityDocument = "base64-encoded-aws-identity-document"
-IdentitySignature = "base64-encoded-rsa2048-signature"
 ```
 
 ### Per-AC Key Architecture (Security)
@@ -548,15 +546,14 @@ IdentitySignature = "base64-encoded-rsa2048-signature"
 **Private keys are NEVER stored in etcd.** Each AC instance:
 1. Generates Curve25519 keypair on first boot
 2. Stores private key in AWS Secrets Manager (`{prefix}-ac-{instance-id}`)
-3. Registers only the public key + AWS identity in etcd
+3. Registers only the public key in etcd
 
 ### AC Startup Flow
 
 1. AC instance starts
 2. Generates Curve25519 keypair (or retrieves from Secrets Manager if reboot)
 3. Stores private key in Secrets Manager
-4. Fetches AWS Instance Identity Document with RSA-2048 signature
-5. Registers public key + identity in etcd at `/nhp/ac-registry/{instance-id}`
+4. Registers public key in etcd at `/nhp/ac-registry/{instance-id}`
 6. Loads local `config.toml` (with private key reference)
 7. Connects to etcd, loads server peers from `/nhp/config`
 8. Dials out to NHP servers
@@ -566,14 +563,12 @@ IdentitySignature = "base64-encoded-rsa2048-signature"
 The NHP server dynamically discovers ACs by watching `/nhp/ac-registry/` prefix:
 
 1. On startup, loads all existing registry entries
-2. If running in AWS, verifies each AC's AWS Instance Identity Document
-3. Adds verified ACs as trusted peers
-4. Watches for new registrations/deletions and reconciles
+2. Adds ACs as trusted peers based on their public key
+3. Watches for new registrations/deletions and reconciles
 
-**AWS Identity Verification** (when server runs in AWS):
-- Verifies RSA-2048 signature using AWS region-specific certificates
-- Validates instance ID and private IP match the registration
-- Validates AWS account ID matches expected value
+**Security**: etcd access is protected by mTLS client certificates. Only instances with valid
+certificates (provisioned by Terraform) can register. The server trusts AC public keys registered
+in etcd because etcd access itself is authenticated.
 
 ### Secrets Manager
 
@@ -706,36 +701,236 @@ the request—they create new portal sites, so they verify current behavior.
 
 ## Debugging & Operations
 
+### Component Dependency Chain
+
+Understanding the startup dependencies helps diagnose failures:
+
+```
+etcd cluster running
+    ↓
+AC starts, generates keypair, registers in etcd (/nhp/ac-registry/{instance-id})
+    ↓
+Server watches etcd, discovers AC, adds to trusted peers
+    ↓
+AC dials out to Server (UDP 62206)
+    ↓
+Server recognizes AC's public key → NHP-AOL/NHP-AAK handshake succeeds
+    ↓
+System operational: Server can send NHP-AOP to AC on knock requests
+```
+
+**If any step fails, the chain breaks.** Common failure points:
+- etcd not running → AC can't register → Server doesn't know about AC
+- AC missing etcd certs → AC can't connect to etcd
+- Key mismatch → ECDH handshake fails
+
 ### Log Locations
 
-**AC Logs (on instance):**
+**AC runs as a native binary** with file-based logs.
+**Server runs in Docker** with logs written to files INSIDE the container (not stdout).
+
+**IMPORTANT:** Server logs are NOT available via `docker logs`. The NHP logging library writes to
+files at `/nhp-server/logs/server-{date}.log` inside the container. Use `docker exec` to read them.
+
+**Via SSM (recommended for remote diagnosis):**
 ```bash
-/opt/layerv/nhp-ac/logs/ac*.log
+# AC logs - file-based (instance ID from ASG)
+AWS_PROFILE=layerv aws ssm send-command \
+  --instance-ids i-XXXXXXXXX \
+  --document-name "AWS-RunShellScript" \
+  --parameters 'commands=["tail -100 /opt/layerv/nhp-ac/logs/*.log"]' \
+  --output json | jq -r '.Command.CommandId'
+
+# Then get output:
+AWS_PROFILE=layerv aws ssm get-command-invocation \
+  --command-id XXXXXXXX \
+  --instance-id i-XXXXXXXXX \
+  --output json | jq -r '.StandardOutputContent'
+
+# Server logs - INSIDE Docker container (NOT docker logs!)
+AWS_PROFILE=layerv aws ssm send-command \
+  --instance-ids i-XXXXXXXXX \
+  --document-name "AWS-RunShellScript" \
+  --parameters 'commands=["docker exec nhp-server cat /nhp-server/logs/server-$(date +%Y-%m-%d).log | tail -100"]'
 ```
 
-**CloudWatch:**
+**Directly on instance (if SSH/SSM shell access):**
 ```bash
-# AC logs
-AWS_PROFILE=layerv aws logs tail /aws/ec2/nhp-ac-sandbox --follow
+# AC logs (native binary, file-based)
+tail -f /opt/layerv/nhp-ac/logs/*.log
 
-# Server logs
-AWS_PROFILE=layerv aws logs tail /aws/ec2/nhp-server-sandbox --follow
+# Server logs - MUST use docker exec (logs are inside container, not stdout)
+docker exec nhp-server tail -f /nhp-server/logs/server-$(date +%Y-%m-%d).log
+
+# Also check evaluate and audit logs
+docker exec nhp-server ls -la /nhp-server/logs/
+
+# Check if services are running
+systemctl status nhp-acd    # AC runs via systemd as native binary
+systemctl status nhp-server # Server runs via systemd managing Docker
+docker ps | grep nhp        # Only shows nhp-server, AC is not containerized
 ```
 
-**Docker (if containerized):**
-```bash
-docker logs nhp-server
-docker logs nhp-ac
-```
+**File locations on instances:**
+| Component | Runtime | Config Dir | Log Location |
+|-----------|---------|------------|--------------|
+| AC | Native binary | `/opt/layerv/nhp-ac/etc/` | `/opt/layerv/nhp-ac/logs/*.log` |
+| Server | Docker container | `/opt/layerv/nhp-server/etc/` | `/nhp-server/logs/server-{date}.log` (inside container) |
+| Server etcd certs | Docker container | `/opt/layerv/nhp-server/etc/tls/` | N/A |
+| AC etcd certs | Native binary | `/opt/layerv/nhp-ac/etc/tls/` | N/A |
 
 ### Common Issues
 
 | Symptom | Likely Cause | Check |
 |---------|--------------|-------|
 | AC logs "accept iptables input" | Cannot reach any server | Server NLB DNS, security groups |
+| AC logs "device ECDH failed with peer" | Key mismatch between AC and Server | See "ECDH Key Mismatch" below |
 | Knock succeeds but can't access | AC not receiving AOP | AC-Server connection, key mismatch |
 | Protected site shows login | Token expired or IP changed | Cookie expiry, refresh flow |
 | 502 on protected resource | Upstream unreachable | Traefik config, target health |
+| AC can't connect to etcd | Missing certs or etcd down | See "etcd Troubleshooting" below |
+| Server logs "Reconciling AC peers: 0 entries" | No ACs in etcd registry | Check AC registration in etcd |
+| Server no `remote.toml` | Server can't discover ACs via etcd | See "Server etcd Configuration" below |
+
+### ECDH Key Mismatch
+
+**Error:** `[NHP-AOL] message randomization failed: device ECDH failed with peer`
+
+This means the AC's cryptographic handshake with the Server failed. Causes:
+
+1. **Server doesn't know about AC** - No `ac.toml` or AC not in etcd registry
+2. **Key mismatch** - AC's public key doesn't match what Server expects
+3. **etcd not working** - AC can't register, Server can't discover ACs
+
+**Diagnosis:**
+```bash
+# On Server: Check if ac.toml exists and has entries
+cat /opt/layerv/nhp-server/etc/ac.toml
+
+# On AC: Check server.toml has correct server public key
+cat /opt/layerv/nhp-ac/etc/server.toml
+
+# Check etcd AC registry (from any instance with etcdctl)
+ETCDCTL_API=3 etcdctl --endpoints=https://etcd.nhp.sandbox.internal:2379 \
+  --cacert=/path/to/ca.crt --cert=/path/to/client.crt --key=/path/to/client.key \
+  get /nhp/ac-registry/ --prefix --keys-only
+```
+
+### etcd Troubleshooting
+
+**Check if etcd is reachable:**
+```bash
+# DNS resolution
+nslookup etcd.nhp.sandbox.internal
+
+# Check if anything is listening (from AC/Server instance)
+curl -v --cacert /opt/layerv/etcd/certs/ca.crt \
+  --cert /opt/layerv/etcd/certs/client.crt \
+  --key /opt/layerv/etcd/certs/client.key \
+  https://etcd.nhp.sandbox.internal:2379/health
+
+# Check etcd instances exist
+AWS_PROFILE=layerv aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=*etcd*" "Name=instance-state-name,Values=running" \
+  --query 'Reservations[*].Instances[*].{Id:InstanceId,IP:PrivateIpAddress}' --output table
+
+# Check etcd ASG
+AWS_PROFILE=layerv aws autoscaling describe-auto-scaling-groups \
+  --query 'AutoScalingGroups[?contains(AutoScalingGroupName, `etcd`)].{Name:AutoScalingGroupName,Desired:DesiredCapacity}'
+```
+
+**Common etcd issues:**
+- No etcd instances running → Check ASG, launch template
+- DNS resolves but connection fails → etcd crashed, check etcd logs
+- Cert errors → Missing `/opt/layerv/etcd/certs/` on AC, check Terraform/user-data
+
+### Server etcd Configuration
+
+**Error:** Server logs "AC registry discovery disabled" or Server has no ACs.
+
+The Server needs `remote.toml` to connect to etcd and discover ACs dynamically. Without it, the Server cannot watch `/nhp/ac-registry/` and will have zero trusted ACs.
+
+**Required files on Server (`/opt/layerv/nhp-server/etc/`):**
+```
+config.toml       # Base config (always required)
+http.toml         # HTTP server settings
+remote.toml       # etcd connection (required for AC registry)
+tls/ca.crt        # etcd CA certificate
+tls/client.crt    # etcd client certificate (mTLS)
+tls/client.key    # etcd client key (mTLS)
+```
+
+**Verify Server has etcd config:**
+```bash
+# Check if remote.toml exists
+docker exec nhp-server cat /nhp-server/etc/remote.toml
+
+# Check if TLS certs exist
+docker exec nhp-server ls -la /nhp-server/etc/tls/
+
+# Check Server logs for etcd connection
+docker exec nhp-server cat /nhp-server/logs/server-$(date +%Y-%m-%d).log | grep -i etcd
+```
+
+**If missing:** The Terraform user_data template should create `remote.toml` when `multi_tenant=true`
+and `etcd_endpoint` is configured. Check `terraform/modules/compute/user_data.sh.tpl`.
+
+### SSM Diagnostic Commands
+
+Quick health check script (run via SSM):
+```bash
+# Find instances
+AWS_PROFILE=layerv aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=*sandbox*" "Name=instance-state-name,Values=running" \
+  --query 'Reservations[*].Instances[*].{Id:InstanceId,Name:Tags[?Key==`Name`]|[0].Value,IP:PrivateIpAddress}' \
+  --output table
+
+# AC health check
+AWS_PROFILE=layerv aws ssm send-command --instance-ids i-XXXXX \
+  --document-name "AWS-RunShellScript" \
+  --parameters 'commands=[
+    "echo === Process Status ===",
+    "ps aux | grep nhp-ac | grep -v grep || echo AC not running",
+    "echo",
+    "echo === Recent Logs ===",
+    "tail -20 /opt/layerv/nhp-ac/logs/*.log 2>/dev/null || echo No logs",
+    "echo",
+    "echo === etcd Connectivity ===",
+    "curl -s --max-time 5 --cacert /opt/layerv/etcd/certs/ca.crt --cert /opt/layerv/etcd/certs/client.crt --key /opt/layerv/etcd/certs/client.key https://etcd.nhp.sandbox.internal:2379/health 2>&1 || echo etcd unreachable",
+    "echo",
+    "echo === Config Files ===",
+    "ls -la /opt/layerv/nhp-ac/etc/"
+  ]'
+
+# Server health check
+AWS_PROFILE=layerv aws ssm send-command --instance-ids i-XXXXX \
+  --document-name "AWS-RunShellScript" \
+  --parameters 'commands=[
+    "echo === Docker Status ===",
+    "docker ps | grep nhp-server || echo Server container not running",
+    "echo",
+    "echo === Listening Ports ===",
+    "ss -tuln | grep -E \"(62206|8888)\"",
+    "echo",
+    "echo === Config Files ===",
+    "ls -la /opt/layerv/nhp-server/etc/",
+    "echo",
+    "echo === AC Config (known ACs) ===",
+    "cat /opt/layerv/nhp-server/etc/ac.toml 2>/dev/null || echo No ac.toml - Server has no known ACs!"
+  ]'
+```
+
+### Target Group Health
+
+```bash
+# Find AC target group
+AWS_PROFILE=layerv aws elbv2 describe-target-groups \
+  --query 'TargetGroups[?contains(TargetGroupName, `sandbox-ac`)].{Name:TargetGroupName,ARN:TargetGroupArn}' --output json
+
+# Check target health
+AWS_PROFILE=layerv aws elbv2 describe-target-health \
+  --target-group-arn "arn:aws:elasticloadbalancing:..." --output table
+```
 
 ### Verification Commands
 
@@ -813,7 +1008,7 @@ nmap -Pn -p 80,443 abc123.qurl.site
 | File | Location | Purpose |
 |------|----------|---------|
 | `config.toml` | Server/AC | Base configuration |
-| `ac.toml` | Server | AC peer definitions |
+| `ac.toml` | Server | AC peer definitions (static, not used with etcd registry) |
 | `server.toml` | AC | Server peer definitions |
 | `http.toml` | Server | HTTP server settings |
-| `remote.toml` | AC | etcd connection settings |
+| `remote.toml` | Server/AC | etcd connection settings (required for AC registry) |

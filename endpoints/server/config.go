@@ -1,19 +1,13 @@
 package server
 
 import (
-	"crypto/x509"
-	"encoding/base64"
-	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/etcd"
 
@@ -43,190 +37,15 @@ var (
 const ACRegistryPrefix = "/nhp/ac-registry/"
 
 // ACRegistryEntry represents an AC registration in etcd
-// ACs register themselves with their public key and AWS identity
+// ACs register themselves with their public key
 type ACRegistryEntry struct {
-	PublicKey         string `toml:"PublicKey"`
-	InstanceId        string `toml:"InstanceId"`
-	Ip                string `toml:"Ip"`
-	Port              int    `toml:"Port"`
-	RegisteredAt      int64  `toml:"RegisteredAt"`
-	IdentityDocument  string `toml:"IdentityDocument"`  // base64 encoded
-	IdentitySignature string `toml:"IdentitySignature"` // base64 encoded
+	PublicKey    string `toml:"PublicKey"`
+	InstanceId   string `toml:"InstanceId"`
+	Ip           string `toml:"Ip"`
+	Port         int    `toml:"Port"`
+	RegisteredAt int64  `toml:"RegisteredAt"`
 }
 
-// AWSIdentityDocument represents the parsed AWS Instance Identity Document
-type AWSIdentityDocument struct {
-	AccountId        string `json:"accountId"`
-	Architecture     string `json:"architecture"`
-	AvailabilityZone string `json:"availabilityZone"`
-	ImageId          string `json:"imageId"`
-	InstanceId       string `json:"instanceId"`
-	InstanceType     string `json:"instanceType"`
-	PrivateIp        string `json:"privateIp"`
-	Region           string `json:"region"`
-	Version          string `json:"version"`
-}
-
-// awsIdentityVerificationEnabled controls whether AWS identity verification is performed
-// This is auto-detected based on environment but can be overridden
-var awsIdentityVerificationEnabled = false
-
-// expectedAWSAccountId is the AWS account ID that ACs must belong to
-// Set via environment variable NHP_AWS_ACCOUNT_ID or auto-detected
-var expectedAWSAccountId = ""
-
-// initAWSIdentityVerification initializes AWS identity verification if running in AWS
-func initAWSIdentityVerification() {
-	// Check if explicitly disabled
-	if os.Getenv("NHP_DISABLE_AWS_IDENTITY") == "true" {
-		log.Info("AWS identity verification explicitly disabled")
-		return
-	}
-
-	// Check if we're in AWS by trying to reach the metadata service
-	if isRunningInAWS() {
-		awsIdentityVerificationEnabled = true
-
-		// Get expected account ID from environment or auto-detect
-		expectedAWSAccountId = os.Getenv("NHP_AWS_ACCOUNT_ID")
-		if expectedAWSAccountId == "" {
-			// Try to auto-detect from our own identity
-			if doc, err := getOwnAWSIdentity(); err == nil {
-				expectedAWSAccountId = doc.AccountId
-				log.Info("Auto-detected AWS account ID: %s", expectedAWSAccountId)
-			}
-		}
-
-		log.Info("AWS identity verification enabled (account: %s)", expectedAWSAccountId)
-	} else {
-		log.Info("Not running in AWS, identity verification disabled")
-	}
-}
-
-// isRunningInAWS checks if we're running in an AWS environment
-func isRunningInAWS() bool {
-	// Try to reach the EC2 metadata service with a short timeout
-	client := &http.Client{Timeout: 1 * time.Second}
-
-	// First get a token (IMDSv2)
-	req, err := http.NewRequest("PUT", "http://169.254.169.254/latest/api/token", nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", "60")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-
-	return resp.StatusCode == 200
-}
-
-// getOwnAWSIdentity gets this instance's AWS identity document
-func getOwnAWSIdentity() (*AWSIdentityDocument, error) {
-	client := &http.Client{Timeout: 2 * time.Second}
-
-	// Get token
-	tokenReq, _ := http.NewRequest("PUT", "http://169.254.169.254/latest/api/token", nil)
-	tokenReq.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", "60")
-	tokenResp, err := client.Do(tokenReq)
-	if err != nil {
-		return nil, err
-	}
-	defer tokenResp.Body.Close()
-	tokenBytes, _ := io.ReadAll(tokenResp.Body)
-	token := string(tokenBytes)
-
-	// Get identity document
-	docReq, _ := http.NewRequest("GET", "http://169.254.169.254/latest/dynamic/instance-identity/document", nil)
-	docReq.Header.Set("X-aws-ec2-metadata-token", token)
-	docResp, err := client.Do(docReq)
-	if err != nil {
-		return nil, err
-	}
-	defer docResp.Body.Close()
-
-	var doc AWSIdentityDocument
-	if err := json.NewDecoder(docResp.Body).Decode(&doc); err != nil {
-		return nil, err
-	}
-
-	return &doc, nil
-}
-
-// AWS certificates are defined in aws_certs.go
-// Use AWSRegionCertificates or GetAWSCertificate(region) to access them
-
-// verifyAWSIdentity verifies an AC's AWS Instance Identity Document
-// Returns the parsed document if valid, error if invalid
-func verifyAWSIdentity(entry *ACRegistryEntry) (*AWSIdentityDocument, error) {
-	if entry.IdentityDocument == "" || entry.IdentitySignature == "" {
-		return nil, errors.New("missing identity document or signature")
-	}
-
-	// Decode base64 document and signature
-	docBytes, err := base64.StdEncoding.DecodeString(entry.IdentityDocument)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode identity document: %w", err)
-	}
-
-	sigBytes, err := base64.StdEncoding.DecodeString(entry.IdentitySignature)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode identity signature: %w", err)
-	}
-
-	// Parse the document
-	var doc AWSIdentityDocument
-	if err := json.Unmarshal(docBytes, &doc); err != nil {
-		return nil, fmt.Errorf("failed to parse identity document: %w", err)
-	}
-
-	// Verify instance ID matches
-	if doc.InstanceId != entry.InstanceId {
-		return nil, fmt.Errorf("instance ID mismatch: document=%s, entry=%s", doc.InstanceId, entry.InstanceId)
-	}
-
-	// Verify IP matches
-	if doc.PrivateIp != entry.Ip {
-		return nil, fmt.Errorf("IP mismatch: document=%s, entry=%s", doc.PrivateIp, entry.Ip)
-	}
-
-	// Verify account ID if configured
-	if expectedAWSAccountId != "" && doc.AccountId != expectedAWSAccountId {
-		return nil, fmt.Errorf("account ID mismatch: document=%s, expected=%s", doc.AccountId, expectedAWSAccountId)
-	}
-
-	// Get region-specific certificate from aws_certs.go
-	certPEM := GetAWSCertificate(doc.Region)
-	if certPEM == "" {
-		return nil, fmt.Errorf("no AWS certificate configured for region: %s (supported: %v)", doc.Region, SupportedAWSRegions())
-	}
-
-	// Verify signature using AWS public certificate
-	block, _ := pem.Decode([]byte(certPEM))
-	if block == nil {
-		return nil, errors.New("failed to parse AWS certificate PEM")
-	}
-
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse AWS certificate: %w", err)
-	}
-
-	// Verify the signature (AWS uses PKCS1v15 with SHA256)
-	err = cert.CheckSignature(x509.SHA256WithRSA, docBytes, sigBytes)
-	if err != nil {
-		// Try SHA1 for older signatures
-		err = cert.CheckSignature(x509.SHA1WithRSA, docBytes, sigBytes)
-		if err != nil {
-			return nil, fmt.Errorf("signature verification failed: %w", err)
-		}
-	}
-
-	return &doc, nil
-}
 
 type ServerEtcdConfig struct {
 	BaseConfig    Config
@@ -947,9 +766,6 @@ func (s *UdpServer) loadACRegistry() error {
 		return nil
 	}
 
-	// Initialize AWS identity verification (auto-detects if in AWS)
-	initAWSIdentityVerification()
-
 	// Load existing AC registrations
 	entries, err := s.etcdConn.GetPrefix(ACRegistryPrefix)
 	if err != nil {
@@ -968,18 +784,13 @@ func (s *UdpServer) loadACRegistry() error {
 			continue
 		}
 
-		// Verify AWS identity if enabled
-		if awsIdentityVerificationEnabled {
-			if _, err := verifyAWSIdentity(entry); err != nil {
-				log.Error("AWS identity verification failed for %s: %v", entry.InstanceId, err)
-				continue // Skip this AC
-			}
-			log.Info("AWS identity verified for instance %s", entry.InstanceId)
-		}
-
 		acRegistryMap[entry.InstanceId] = entry
+		pubKeyPreview := entry.PublicKey
+		if len(pubKeyPreview) > 20 {
+			pubKeyPreview = pubKeyPreview[:20]
+		}
 		log.Info("Loaded AC registration: instance=%s, ip=%s, pubkey=%s...",
-			entry.InstanceId, entry.Ip, entry.PublicKey[:20])
+			entry.InstanceId, entry.Ip, pubKeyPreview)
 	}
 	acRegistryMapMutex.Unlock()
 
@@ -1014,15 +825,6 @@ func (s *UdpServer) watchACRegistry() {
 			}
 
 			log.Info("AC registry PUT: instance=%s, ip=%s", entry.InstanceId, entry.Ip)
-
-			// Verify AWS Instance Identity if running in AWS
-			if awsIdentityVerificationEnabled {
-				if _, err := verifyAWSIdentity(entry); err != nil {
-					log.Error("AWS identity verification failed for %s: %v", entry.InstanceId, err)
-					return // Reject this AC registration
-				}
-				log.Info("AWS identity verified for instance %s", entry.InstanceId)
-			}
 
 			acRegistryMapMutex.Lock()
 			acRegistryMap[entry.InstanceId] = entry

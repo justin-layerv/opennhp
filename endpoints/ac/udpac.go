@@ -623,6 +623,8 @@ func (a *UdpAC) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sync.W
 
 		currTime := time.Now().UnixNano()
 		peerPbk := server.PublicKey()
+		log.Debug("serverDiscovery: server=%s, peerPbk len=%d, base64=%s",
+			server.Hostname, len(peerPbk), server.PublicKeyBase64())
 
 		// when a server is not connected, try to connect in every ACLocalTransactionResponseTimeoutMs
 		// when a server is connected when ServerConnectionInterval is reached since last receive, try resend NHP_AOL for maintaining server connection

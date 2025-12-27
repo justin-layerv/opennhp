@@ -19,7 +19,7 @@ DefaultIp = "10.0.0.1"
 AuthServiceId = "layerv"
 ResourceIds = ["demo", "test"]
 LogLevel = 4
-DefaultCipherScheme = 0
+DefaultCipherScheme = 1
 
 [HttpConfig]
 EnableHttp = true
@@ -113,7 +113,7 @@ func TestConfig_LocalFile(t *testing.T) {
 ACId = "sandbox-ac-i-1234567890"
 DefaultIp = "10.0.0.100"
 PrivateKeyBase64 = "cHJpdmF0ZWtleWJhc2U2NA=="
-DefaultCipherScheme = 0
+DefaultCipherScheme = 1
 IpPassMode = 0
 LogLevel = 4
 AuthServiceId = "layerv"

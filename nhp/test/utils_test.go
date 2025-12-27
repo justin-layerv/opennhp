@@ -95,7 +95,7 @@ func TestUpdateTomlConfig(t *testing.T) {
 # OrganizationId: specify the organization id this agent represents.
 # LogLevel: 0: silent, 1: error, 2: info, 3: audit, 4: debug, 5: trace.
 PrivateKeyBase64 = "lDaE1EKKyIJG4A28IZup/GDBZWYWEPZqGFaoV4Rlnn0="
-DefaultCipherScheme = 0
+DefaultCipherScheme = 1
 UserId = "agent-0"
 OrganizationId = "opennhp.org"
 LogLevel = 4

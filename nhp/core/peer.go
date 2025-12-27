@@ -6,6 +6,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	log "github.com/OpenNHP/opennhp/nhp/log"
 )
 
 type Peer interface {
@@ -62,7 +64,13 @@ func (p *UdpPeer) PublicKey() []byte {
 	defer p.Unlock()
 
 	if p.pubKey == nil {
-		p.pubKey, _ = base64.StdEncoding.DecodeString(p.PubKeyBase64)
+		var err error
+		p.pubKey, err = base64.StdEncoding.DecodeString(p.PubKeyBase64)
+		if err != nil {
+			log.Error("failed to decode peer public key base64: %v, input=%q", err, p.PubKeyBase64)
+		} else {
+			log.Debug("decoded peer public key: input=%q, len=%d", p.PubKeyBase64, len(p.pubKey))
+		}
 	}
 	return p.pubKey
 }
