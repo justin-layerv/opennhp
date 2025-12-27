@@ -596,7 +596,26 @@ resource "aws_iam_policy" "terraform_read" {
         Action = [
           "kms:Describe*",
           "kms:Get*",
-          "kms:List*"
+          "kms:List*",
+          "kms:Decrypt"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "EventBridgeRead"
+        Effect = "Allow"
+        Action = [
+          "events:Describe*",
+          "events:List*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "RDSRead"
+        Effect = "Allow"
+        Action = [
+          "rds:Describe*",
+          "rds:List*"
         ]
         Resource = "*"
       },
@@ -1003,6 +1022,60 @@ resource "aws_iam_role_policy" "terraform_apply_services" {
           "s3:DeleteBucketPolicy"
         ]
         Resource = "arn:aws:s3:::layerv-nhp-*"
+      },
+      {
+        Sid    = "EventBridge"
+        Effect = "Allow"
+        Action = [
+          "events:PutRule",
+          "events:DeleteRule",
+          "events:PutTargets",
+          "events:RemoveTargets",
+          "events:EnableRule",
+          "events:DisableRule",
+          "events:TagResource",
+          "events:UntagResource"
+        ]
+        Resource = "arn:aws:events:${local.region}:${local.account_id}:rule/layerv-nhp-*"
+      },
+      {
+        Sid    = "RDS"
+        Effect = "Allow"
+        Action = [
+          "rds:CreateDBSubnetGroup",
+          "rds:DeleteDBSubnetGroup",
+          "rds:ModifyDBSubnetGroup",
+          "rds:CreateDBClusterParameterGroup",
+          "rds:DeleteDBClusterParameterGroup",
+          "rds:ModifyDBClusterParameterGroup",
+          "rds:CreateDBParameterGroup",
+          "rds:DeleteDBParameterGroup",
+          "rds:ModifyDBParameterGroup",
+          "rds:CreateDBCluster",
+          "rds:DeleteDBCluster",
+          "rds:ModifyDBCluster",
+          "rds:CreateDBInstance",
+          "rds:DeleteDBInstance",
+          "rds:ModifyDBInstance",
+          "rds:AddTagsToResource",
+          "rds:RemoveTagsFromResource"
+        ]
+        Resource = [
+          "arn:aws:rds:${local.region}:${local.account_id}:subgrp:layerv-nhp-*",
+          "arn:aws:rds:${local.region}:${local.account_id}:cluster-pg:layerv-nhp-*",
+          "arn:aws:rds:${local.region}:${local.account_id}:pg:layerv-nhp-*",
+          "arn:aws:rds:${local.region}:${local.account_id}:cluster:layerv-nhp-*",
+          "arn:aws:rds:${local.region}:${local.account_id}:db:layerv-nhp-*"
+        ]
+      },
+      {
+        Sid    = "LambdaLayer"
+        Effect = "Allow"
+        Action = [
+          "lambda:PublishLayerVersion",
+          "lambda:DeleteLayerVersion"
+        ]
+        Resource = "arn:aws:lambda:${local.region}:${local.account_id}:layer:layerv-nhp-*"
       }
     ]
   })
