@@ -160,8 +160,9 @@ resource "aws_lambda_invocation" "keygen" {
   }
 }
 
+# Ubuntu 24.04 LTS (Noble Numbat) - latest LTS with updated python3-cryptography
 data "aws_ssm_parameter" "ubuntu_ami" {
-  name = "/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id"
+  name = "/aws/service/canonical/ubuntu/server/noble/stable/current/amd64/hvm/ebs-gp3/ami-id"
 }
 
 # ==================== Locals ====================
@@ -267,7 +268,8 @@ resource "aws_security_group" "ac" {
   }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-ac"
+    Name      = "${var.name_prefix}-sg-ac"
+    Component = "ac"
   })
 
   lifecycle {
@@ -277,11 +279,14 @@ resource "aws_security_group" "ac" {
 
 # CloudWatch Log Group
 resource "aws_cloudwatch_log_group" "ac" {
-  name              = "/layerv/nhp-ac/${var.environment}"
+  name              = "/layerv/nhp/${var.environment}/ac"
   retention_in_days = local.is_prod ? 365 : 30
   kms_key_id        = var.logs_kms_key_arn
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-logs-ac"
+    Component = "ac"
+  })
 }
 
 # ==================== S3 Bucket for Traefik Plugins ====================
@@ -390,18 +395,32 @@ resource "aws_iam_role_policy" "ac" {
         ]
         Resource = var.ac_repo_arn
       },
-      # Secrets Manager for AC private key, etcd credentials, TLS certificates, and server public key
+      # Secrets Manager - read shared secrets (etcd TLS, server public key)
       {
-        Sid      = "SecretsAccess"
+        Sid      = "SecretsReadShared"
         Effect   = "Allow"
         Action   = ["secretsmanager:GetSecretValue"]
-        Resource = compact([aws_secretsmanager_secret.ac.arn, var.etcd_secret_arn, var.etcd_tls_secret_arn, var.server_secret_arn])
+        Resource = compact([var.etcd_tls_secret_arn, var.server_secret_arn])
       },
-      # KMS decrypt for Secrets Manager (secrets are KMS-encrypted)
+      # Secrets Manager - create and manage per-instance AC secrets
+      # Each AC creates {prefix}-ac-{instance-id} for its private key
       {
-        Sid      = "KMSDecrypt"
+        Sid    = "SecretsCreatePerInstance"
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:CreateSecret",
+          "secretsmanager:PutSecretValue",
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:TagResource",
+          "secretsmanager:DescribeSecret"
+        ]
+        Resource = "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:${var.name_prefix}-ac-i-*"
+      },
+      # KMS for Secrets Manager (encrypt for create, decrypt for read)
+      {
+        Sid      = "KMSForSecrets"
         Effect   = "Allow"
-        Action   = ["kms:Decrypt"]
+        Action   = ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"]
         Resource = var.secrets_kms_key_arn != null ? [var.secrets_kms_key_arn] : []
       },
       # Cloud Map registration
@@ -527,10 +546,12 @@ locals {
     acme_ca_server      = local.is_prod ? "https://acme-v02.api.letsencrypt.org/directory" : "https://acme-staging-v02.api.letsencrypt.org/directory"
     etcd_endpoint       = var.etcd_endpoint
     etcd_tls_secret_arn = var.etcd_tls_secret_arn
-    ac_secret_arn       = aws_secretsmanager_secret.ac.arn
     cloudmap_service_id = aws_service_discovery_service.ac.id
     namespace_name      = var.namespace_name
     vpc_cidr            = var.vpc_cidr
+    # Per-instance key generation
+    name_prefix         = var.name_prefix
+    secrets_kms_key_arn = var.secrets_kms_key_arn != null ? var.secrets_kms_key_arn : ""
     # AC configuration options
     auth_service_id   = var.auth_service_id
     resource_ids      = jsonencode(var.resource_ids)
@@ -588,7 +609,8 @@ resource "aws_launch_template" "ac" {
   tag_specifications {
     resource_type = "instance"
     tags = merge(var.tags, {
-      Name = "${var.name_prefix}-ac"
+      Name      = "${var.name_prefix}-ac"
+      Component = "ac"
     })
   }
 
@@ -656,11 +678,11 @@ resource "aws_lb" "ac" {
 # HTTPS Target Group (TCP passthrough to Traefik)
 # Proxy Protocol v2 enabled to preserve client IP for NHP firewall rules
 resource "aws_lb_target_group" "https" {
-  name             = replace("${var.name_prefix}-ac-https", "_", "-")
-  port             = 443
-  protocol         = "TCP"
-  vpc_id           = var.vpc_id
-  target_type      = "instance"
+  name              = replace("${var.name_prefix}-ac-https", "_", "-")
+  port              = 443
+  protocol          = "TCP"
+  vpc_id            = var.vpc_id
+  target_type       = "instance"
   proxy_protocol_v2 = true
 
   health_check {
@@ -955,4 +977,775 @@ resource "aws_route53_record" "ac_cloudfront" {
     zone_id                = aws_cloudfront_distribution.ac[0].hosted_zone_id
     evaluate_target_health = false
   }
+}
+
+# ==================== Per-AC Key Infrastructure ====================
+# This section implements per-instance AC keys with AWS Instance Identity
+# verification. Each AC generates its own keypair and registers with etcd.
+#
+# Components:
+# 1. etcd config seeder - writes /nhp/config (server peers, no private keys)
+# 2. AC cleanup Lambda - removes registry entries on termination
+# 3. ASG lifecycle hook - triggers cleanup on instance termination
+# 4. Security group for Lambda VPC access
+
+# Security group for Lambdas that need etcd access
+resource "aws_security_group" "lambda_etcd" {
+  count       = var.etcd_endpoint != null ? 1 : 0
+  name_prefix = "${var.name_prefix}-lambda-etcd-"
+  vpc_id      = var.vpc_id
+  description = "Security group for Lambdas accessing etcd"
+
+  # etcd client port outbound
+  egress {
+    from_port   = 2379
+    to_port     = 2379
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+    description = "etcd client port"
+  }
+
+  # HTTPS for AWS APIs
+  egress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "HTTPS for AWS APIs"
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-sg-lambda-etcd"
+    Component = "ac"
+  })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# ==================== etcd Config Seeder ====================
+# Seeds /nhp/config with server peers and HTTP config (no private keys)
+
+resource "aws_iam_role" "etcd_seeder" {
+  count = var.etcd_endpoint != null ? 1 : 0
+  name  = "${var.name_prefix}-etcd-seeder"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+    }]
+  })
+
+  tags = var.tags
+}
+
+resource "aws_iam_role_policy_attachment" "etcd_seeder_basic" {
+  count      = var.etcd_endpoint != null ? 1 : 0
+  role       = aws_iam_role.etcd_seeder[0].name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_iam_role_policy_attachment" "etcd_seeder_vpc" {
+  count      = var.etcd_endpoint != null ? 1 : 0
+  role       = aws_iam_role.etcd_seeder[0].name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+resource "aws_iam_role_policy" "etcd_seeder" {
+  count = var.etcd_endpoint != null ? 1 : 0
+  name  = "etcd-seeder"
+  role  = aws_iam_role.etcd_seeder[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = ["secretsmanager:GetSecretValue"]
+        Resource = compact([
+          var.etcd_tls_secret_arn,
+          var.server_secret_arn
+        ])
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = var.secrets_kms_key_arn != null ? [var.secrets_kms_key_arn] : []
+      }
+    ]
+  })
+}
+
+data "archive_file" "etcd_seeder" {
+  count       = var.etcd_endpoint != null ? 1 : 0
+  type        = "zip"
+  output_path = "${path.module}/etcd_seeder.zip"
+
+  source {
+    content  = <<-PYTHON
+import json
+import os
+import ssl
+import tempfile
+import urllib.request
+import urllib.error
+import base64
+import boto3
+
+def handler(event, context):
+    """
+    Seeds etcd with NHP config (server peers, HTTP config).
+    Does NOT write any private keys to etcd.
+    """
+    print(f"etcd seeder event: {json.dumps(event)}")
+
+    if event.get('RequestType') == 'Delete':
+        return {'PhysicalResourceId': event.get('PhysicalResourceId', 'etcd-config')}
+
+    props = event.get('ResourceProperties', event)
+    etcd_endpoint = props['EtcdEndpoint']
+    tls_secret_arn = props['TlsSecretArn']
+    server_secret_arn = props.get('ServerSecretArn', '')
+    server_nlb_dns = props.get('ServerNlbDns', '')
+    auth_service_id = props.get('AuthServiceId', 'layerv')
+    resource_ids = props.get('ResourceIds', ['default'])
+    environment = props.get('Environment', 'sandbox')
+
+    secrets = boto3.client('secretsmanager')
+
+    # Get TLS certs
+    tls_secret = json.loads(secrets.get_secret_value(SecretId=tls_secret_arn)['SecretString'])
+    ca_cert = tls_secret['caCert']
+    client_cert = tls_secret['clientCert']
+    client_key = tls_secret['clientKey']
+
+    # Get server public key
+    server_public_key = ''
+    if server_secret_arn:
+        try:
+            server_secret = json.loads(secrets.get_secret_value(SecretId=server_secret_arn)['SecretString'])
+            server_public_key = server_secret.get('publicKey', '')
+        except Exception as e:
+            print(f"Warning: Could not get server public key: {e}")
+
+    # Build TOML config (no private keys!)
+    config_toml = f'''# NHP AC Configuration (seeded by Terraform)
+# This config is read by ACs on startup.
+# Private keys are stored in per-instance Secrets Manager secrets.
+
+[HttpConfig]
+EnableHttp = true
+EnableTLS = false
+HttpListenPort = 8888
+
+# Server peers - ACs dial OUT to these servers
+[[Servers]]
+Hostname = "{server_nlb_dns}"
+Ip = ""
+Port = 62206
+PubKeyBase64 = "{server_public_key}"
+ExpireTime = 1924991999
+'''
+
+    # Write to etcd using HTTPS API
+    # etcd v3 uses gRPC, but also exposes a JSON gateway
+    # For simplicity, we use the etcdctl approach via subprocess or direct API
+
+    # Create temp files for TLS
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.crt', delete=False) as f:
+        f.write(ca_cert)
+        ca_path = f.name
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.crt', delete=False) as f:
+        f.write(client_cert)
+        cert_path = f.name
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.key', delete=False) as f:
+        f.write(client_key)
+        key_path = f.name
+
+    try:
+        # Create SSL context with client cert
+        ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        ssl_context.load_verify_locations(ca_path)
+        ssl_context.load_cert_chain(cert_path, key_path)
+
+        # etcd v3 JSON gateway for PUT
+        # PUT /v3/kv/put with JSON body
+        url = f"{etcd_endpoint}/v3/kv/put"
+
+        # etcd v3 API expects base64-encoded key and value
+        key_b64 = base64.b64encode(b'/nhp/config').decode()
+        value_b64 = base64.b64encode(config_toml.encode()).decode()
+
+        data = json.dumps({
+            'key': key_b64,
+            'value': value_b64
+        }).encode()
+
+        req = urllib.request.Request(url, data=data, method='POST')
+        req.add_header('Content-Type', 'application/json')
+
+        with urllib.request.urlopen(req, context=ssl_context, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+            print(f"etcd put result: {result}")
+
+        print("Successfully seeded /nhp/config in etcd")
+
+    finally:
+        # Cleanup temp files
+        import os
+        os.unlink(ca_path)
+        os.unlink(cert_path)
+        os.unlink(key_path)
+
+    return {'PhysicalResourceId': event.get('PhysicalResourceId', 'etcd-config')}
+PYTHON
+    filename = "lambda_function.py"
+  }
+}
+
+resource "aws_lambda_function" "etcd_seeder" {
+  count            = var.etcd_endpoint != null ? 1 : 0
+  function_name    = "${var.name_prefix}-etcd-seeder"
+  role             = aws_iam_role.etcd_seeder[0].arn
+  handler          = "lambda_function.handler"
+  runtime          = "python3.11"
+  timeout          = 60
+  filename         = data.archive_file.etcd_seeder[0].output_path
+  source_code_hash = data.archive_file.etcd_seeder[0].output_base64sha256
+
+  vpc_config {
+    subnet_ids         = var.private_subnet_ids
+    security_group_ids = [aws_security_group.lambda_etcd[0].id]
+  }
+
+  tags = var.tags
+}
+
+resource "aws_lambda_invocation" "etcd_seeder" {
+  count         = var.etcd_endpoint != null ? 1 : 0
+  function_name = aws_lambda_function.etcd_seeder[0].function_name
+
+  input = jsonencode({
+    RequestType = "Create"
+    ResourceProperties = {
+      EtcdEndpoint    = var.etcd_endpoint
+      TlsSecretArn    = var.etcd_tls_secret_arn
+      ServerSecretArn = var.server_secret_arn
+      ServerNlbDns    = var.server_nlb_dns
+      AuthServiceId   = var.auth_service_id
+      ResourceIds     = var.resource_ids
+      Environment     = var.environment
+    }
+  })
+
+  triggers = {
+    # Re-seed when config changes
+    server_nlb_dns  = var.server_nlb_dns
+    auth_service_id = var.auth_service_id
+    resource_ids    = jsonencode(var.resource_ids)
+  }
+
+  depends_on = [aws_iam_role_policy.etcd_seeder]
+}
+
+# ==================== AC Cleanup Lambda ====================
+# Cleans up AC registry entries and secrets on instance termination
+
+resource "aws_iam_role" "ac_cleanup" {
+  count = var.etcd_endpoint != null ? 1 : 0
+  name  = "${var.name_prefix}-ac-cleanup"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+    }]
+  })
+
+  tags = var.tags
+}
+
+resource "aws_iam_role_policy_attachment" "ac_cleanup_basic" {
+  count      = var.etcd_endpoint != null ? 1 : 0
+  role       = aws_iam_role.ac_cleanup[0].name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_iam_role_policy_attachment" "ac_cleanup_vpc" {
+  count      = var.etcd_endpoint != null ? 1 : 0
+  role       = aws_iam_role.ac_cleanup[0].name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+resource "aws_iam_role_policy" "ac_cleanup" {
+  count = var.etcd_endpoint != null ? 1 : 0
+  name  = "ac-cleanup"
+  role  = aws_iam_role.ac_cleanup[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = [var.etcd_tls_secret_arn]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:DeleteSecret"]
+        Resource = "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:${var.name_prefix}-ac-i-*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = var.secrets_kms_key_arn != null ? [var.secrets_kms_key_arn] : []
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["autoscaling:CompleteLifecycleAction"]
+        Resource = aws_autoscaling_group.ac.arn
+      },
+      {
+        # Required by audit Lambda to compare registry against running instances
+        Effect   = "Allow"
+        Action   = ["ec2:DescribeInstances"]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+data "archive_file" "ac_cleanup" {
+  count       = var.etcd_endpoint != null ? 1 : 0
+  type        = "zip"
+  output_path = "${path.module}/ac_cleanup.zip"
+
+  source {
+    content  = <<-PYTHON
+import json
+import os
+import ssl
+import tempfile
+import urllib.request
+import base64
+import boto3
+
+def handler(event, context):
+    """
+    Cleans up AC registry entry and secrets when instance terminates.
+    Triggered by ASG lifecycle hook via SNS.
+    """
+    print(f"AC cleanup event: {json.dumps(event)}")
+
+    secrets = boto3.client('secretsmanager')
+    autoscaling = boto3.client('autoscaling')
+
+    # Parse SNS message
+    for record in event.get('Records', []):
+        message = json.loads(record['Sns']['Message'])
+
+        lifecycle_hook = message.get('LifecycleHookName')
+        asg_name = message.get('AutoScalingGroupName')
+        instance_id = message.get('EC2InstanceId')
+        lifecycle_token = message.get('LifecycleActionToken')
+
+        if not instance_id:
+            print("No instance ID in message, skipping")
+            continue
+
+        print(f"Cleaning up instance: {instance_id}")
+
+        # Get etcd TLS certs
+        tls_secret_arn = os.environ['TLS_SECRET_ARN']
+        etcd_endpoint = os.environ['ETCD_ENDPOINT']
+        name_prefix = os.environ['NAME_PREFIX']
+
+        try:
+            tls_secret = json.loads(secrets.get_secret_value(SecretId=tls_secret_arn)['SecretString'])
+            ca_cert = tls_secret['caCert']
+            client_cert = tls_secret['clientCert']
+            client_key = tls_secret['clientKey']
+
+            # Create temp files for TLS
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.crt', delete=False) as f:
+                f.write(ca_cert)
+                ca_path = f.name
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.crt', delete=False) as f:
+                f.write(client_cert)
+                cert_path = f.name
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.key', delete=False) as f:
+                f.write(client_key)
+                key_path = f.name
+
+            # Create SSL context
+            ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+            ssl_context.load_verify_locations(ca_path)
+            ssl_context.load_cert_chain(cert_path, key_path)
+
+            # Delete from etcd registry
+            url = f"{etcd_endpoint}/v3/kv/deleterange"
+            key = f"/nhp/ac-registry/{instance_id}"
+            key_b64 = base64.b64encode(key.encode()).decode()
+
+            data = json.dumps({
+                'key': key_b64
+            }).encode()
+
+            req = urllib.request.Request(url, data=data, method='POST')
+            req.add_header('Content-Type', 'application/json')
+
+            try:
+                with urllib.request.urlopen(req, context=ssl_context, timeout=30) as resp:
+                    result = json.loads(resp.read().decode())
+                    print(f"etcd delete result: {result}")
+            except Exception as e:
+                print(f"Warning: Failed to delete etcd entry: {e}")
+
+            # Cleanup temp files
+            os.unlink(ca_path)
+            os.unlink(cert_path)
+            os.unlink(key_path)
+
+        except Exception as e:
+            print(f"Warning: etcd cleanup failed: {e}")
+
+        # Delete Secrets Manager secret
+        secret_name = f"{name_prefix}-ac-{instance_id}"
+        try:
+            secrets.delete_secret(
+                SecretId=secret_name,
+                ForceDeleteWithoutRecovery=True
+            )
+            print(f"Deleted secret: {secret_name}")
+        except secrets.exceptions.ResourceNotFoundException:
+            print(f"Secret not found (already deleted?): {secret_name}")
+        except Exception as e:
+            print(f"Warning: Failed to delete secret: {e}")
+
+        # Complete lifecycle action
+        if lifecycle_hook and asg_name and lifecycle_token:
+            try:
+                autoscaling.complete_lifecycle_action(
+                    LifecycleHookName=lifecycle_hook,
+                    AutoScalingGroupName=asg_name,
+                    LifecycleActionToken=lifecycle_token,
+                    LifecycleActionResult='CONTINUE'
+                )
+                print(f"Completed lifecycle action for {instance_id}")
+            except Exception as e:
+                print(f"Warning: Failed to complete lifecycle action: {e}")
+
+    return {'statusCode': 200}
+PYTHON
+    filename = "lambda_function.py"
+  }
+}
+
+resource "aws_lambda_function" "ac_cleanup" {
+  count            = var.etcd_endpoint != null ? 1 : 0
+  function_name    = "${var.name_prefix}-ac-cleanup"
+  role             = aws_iam_role.ac_cleanup[0].arn
+  handler          = "lambda_function.handler"
+  runtime          = "python3.11"
+  timeout          = 120
+  filename         = data.archive_file.ac_cleanup[0].output_path
+  source_code_hash = data.archive_file.ac_cleanup[0].output_base64sha256
+
+  environment {
+    variables = {
+      TLS_SECRET_ARN = var.etcd_tls_secret_arn
+      ETCD_ENDPOINT  = var.etcd_endpoint
+      NAME_PREFIX    = var.name_prefix
+    }
+  }
+
+  vpc_config {
+    subnet_ids         = var.private_subnet_ids
+    security_group_ids = [aws_security_group.lambda_etcd[0].id]
+  }
+
+  tags = var.tags
+}
+
+# SNS topic for lifecycle hook
+resource "aws_sns_topic" "ac_lifecycle" {
+  count = var.etcd_endpoint != null ? 1 : 0
+  name  = "${var.name_prefix}-ac-lifecycle"
+
+  tags = var.tags
+}
+
+resource "aws_sns_topic_subscription" "ac_cleanup" {
+  count     = var.etcd_endpoint != null ? 1 : 0
+  topic_arn = aws_sns_topic.ac_lifecycle[0].arn
+  protocol  = "lambda"
+  endpoint  = aws_lambda_function.ac_cleanup[0].arn
+}
+
+resource "aws_lambda_permission" "ac_cleanup_sns" {
+  count         = var.etcd_endpoint != null ? 1 : 0
+  statement_id  = "AllowSNSInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.ac_cleanup[0].function_name
+  principal     = "sns.amazonaws.com"
+  source_arn    = aws_sns_topic.ac_lifecycle[0].arn
+}
+
+# IAM role for ASG lifecycle hook to publish to SNS
+resource "aws_iam_role" "asg_lifecycle" {
+  count = var.etcd_endpoint != null ? 1 : 0
+  name  = "${var.name_prefix}-asg-lifecycle"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "autoscaling.amazonaws.com"
+      }
+    }]
+  })
+
+  tags = var.tags
+}
+
+resource "aws_iam_role_policy" "asg_lifecycle" {
+  count = var.etcd_endpoint != null ? 1 : 0
+  name  = "sns-publish"
+  role  = aws_iam_role.asg_lifecycle[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "sns:Publish"
+      Resource = aws_sns_topic.ac_lifecycle[0].arn
+    }]
+  })
+}
+
+# ASG lifecycle hook for instance termination
+resource "aws_autoscaling_lifecycle_hook" "ac_termination" {
+  count                  = var.etcd_endpoint != null ? 1 : 0
+  name                   = "${var.name_prefix}-ac-termination"
+  autoscaling_group_name = aws_autoscaling_group.ac.name
+  lifecycle_transition   = "autoscaling:EC2_INSTANCE_TERMINATING"
+  default_result         = "CONTINUE"
+  heartbeat_timeout      = 300
+
+  notification_target_arn = aws_sns_topic.ac_lifecycle[0].arn
+  role_arn                = aws_iam_role.asg_lifecycle[0].arn
+}
+
+# ==================== Weekly Audit Lambda ====================
+# Cleans up orphaned AC registry entries and secrets where the instance no longer exists
+
+data "archive_file" "ac_audit" {
+  count       = var.etcd_endpoint != null ? 1 : 0
+  type        = "zip"
+  output_path = "${path.module}/.terraform/ac_audit.zip"
+
+  source {
+    content  = <<-PYTHON
+import json
+import boto3
+import ssl
+import tempfile
+import urllib.request
+import base64
+import os
+
+def handler(event, context):
+    """
+    Weekly audit to clean up orphaned AC registry entries and secrets.
+    Compares etcd registry entries with running EC2 instances.
+    """
+    print("Starting AC registry audit")
+
+    # Get configuration from environment
+    etcd_endpoint = os.environ['ETCD_ENDPOINT']
+    tls_secret_arn = os.environ['TLS_SECRET_ARN']
+    name_prefix = os.environ['NAME_PREFIX']
+    region = os.environ.get('AWS_REGION', 'us-east-2')
+
+    secrets = boto3.client('secretsmanager')
+    ec2 = boto3.client('ec2')
+
+    # Get TLS certs
+    tls_secret = json.loads(secrets.get_secret_value(SecretId=tls_secret_arn)['SecretString'])
+    ca_cert = tls_secret['caCert']
+    client_cert = tls_secret['clientCert']
+    client_key = tls_secret['clientKey']
+
+    # Create temp files for TLS
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.crt', delete=False) as f:
+        f.write(ca_cert)
+        ca_path = f.name
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.crt', delete=False) as f:
+        f.write(client_cert)
+        cert_path = f.name
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.key', delete=False) as f:
+        f.write(client_key)
+        key_path = f.name
+
+    try:
+        # Create SSL context
+        ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        ssl_context.load_verify_locations(ca_path)
+        ssl_context.load_cert_chain(cert_path, key_path)
+
+        # Get all AC registry entries from etcd
+        url = f"{etcd_endpoint}/v3/kv/range"
+        prefix = "/nhp/ac-registry/"
+        prefix_b64 = base64.b64encode(prefix.encode()).decode()
+        # Range end is prefix with last byte incremented
+        range_end = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+        range_end_b64 = base64.b64encode(range_end.encode()).decode()
+
+        data = json.dumps({
+            'key': prefix_b64,
+            'range_end': range_end_b64
+        }).encode()
+
+        req = urllib.request.Request(url, data=data, method='POST')
+        req.add_header('Content-Type', 'application/json')
+
+        registry_entries = {}
+        with urllib.request.urlopen(req, context=ssl_context, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+            for kv in result.get('kvs', []):
+                key = base64.b64decode(kv['key']).decode()
+                instance_id = key.replace(prefix, '')
+                registry_entries[instance_id] = key
+
+        print(f"Found {len(registry_entries)} registry entries")
+
+        if not registry_entries:
+            print("No registry entries to audit")
+            return {'orphans_cleaned': 0}
+
+        # Get running instances with our name prefix
+        response = ec2.describe_instances(
+            Filters=[
+                {'Name': 'instance-state-name', 'Values': ['running', 'pending']},
+                {'Name': 'tag:Name', 'Values': [f'{name_prefix}*']}
+            ]
+        )
+
+        running_instances = set()
+        for reservation in response['Reservations']:
+            for instance in reservation['Instances']:
+                running_instances.add(instance['InstanceId'])
+
+        print(f"Found {len(running_instances)} running instances")
+
+        # Find orphaned entries (in registry but not running)
+        orphaned = set(registry_entries.keys()) - running_instances
+        print(f"Found {len(orphaned)} orphaned entries")
+
+        # Clean up orphaned entries
+        cleaned = 0
+        for instance_id in orphaned:
+            print(f"Cleaning up orphaned entry: {instance_id}")
+
+            # Delete from etcd
+            key = registry_entries[instance_id]
+            key_b64 = base64.b64encode(key.encode()).decode()
+            delete_url = f"{etcd_endpoint}/v3/kv/deleterange"
+            delete_data = json.dumps({'key': key_b64}).encode()
+            delete_req = urllib.request.Request(delete_url, data=delete_data, method='POST')
+            delete_req.add_header('Content-Type', 'application/json')
+
+            try:
+                with urllib.request.urlopen(delete_req, context=ssl_context, timeout=30) as resp:
+                    print(f"Deleted etcd entry for {instance_id}")
+            except Exception as e:
+                print(f"Failed to delete etcd entry for {instance_id}: {e}")
+
+            # Delete secret
+            secret_name = f"{name_prefix}-ac-{instance_id}"
+            try:
+                secrets.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
+                print(f"Deleted secret for {instance_id}")
+            except secrets.exceptions.ResourceNotFoundException:
+                print(f"Secret not found for {instance_id} (already deleted)")
+            except Exception as e:
+                print(f"Failed to delete secret for {instance_id}: {e}")
+
+            cleaned += 1
+
+        print(f"Audit complete: cleaned {cleaned} orphaned entries")
+        return {'orphans_cleaned': cleaned}
+
+    finally:
+        # Cleanup temp files
+        os.unlink(ca_path)
+        os.unlink(cert_path)
+        os.unlink(key_path)
+PYTHON
+    filename = "lambda_function.py"
+  }
+}
+
+resource "aws_lambda_function" "ac_audit" {
+  count            = var.etcd_endpoint != null ? 1 : 0
+  function_name    = "${var.name_prefix}-ac-audit"
+  role             = aws_iam_role.ac_cleanup[0].arn # Reuse cleanup role
+  handler          = "lambda_function.handler"
+  runtime          = "python3.11"
+  timeout          = 300
+  filename         = data.archive_file.ac_audit[0].output_path
+  source_code_hash = data.archive_file.ac_audit[0].output_base64sha256
+
+  vpc_config {
+    subnet_ids         = var.private_subnet_ids
+    security_group_ids = [aws_security_group.lambda_etcd[0].id]
+  }
+
+  environment {
+    variables = {
+      ETCD_ENDPOINT  = var.etcd_endpoint
+      TLS_SECRET_ARN = var.etcd_tls_secret_arn
+      NAME_PREFIX    = var.name_prefix
+    }
+  }
+
+  tags = var.tags
+}
+
+# CloudWatch Event Rule for weekly audit (every Sunday at 3 AM UTC)
+resource "aws_cloudwatch_event_rule" "ac_audit_schedule" {
+  count               = var.etcd_endpoint != null ? 1 : 0
+  name                = "${var.name_prefix}-ac-audit-schedule"
+  description         = "Weekly AC registry audit"
+  schedule_expression = "cron(0 3 ? * SUN *)"
+
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_event_target" "ac_audit" {
+  count     = var.etcd_endpoint != null ? 1 : 0
+  rule      = aws_cloudwatch_event_rule.ac_audit_schedule[0].name
+  target_id = "ac-audit-lambda"
+  arn       = aws_lambda_function.ac_audit[0].arn
+}
+
+resource "aws_lambda_permission" "ac_audit_cloudwatch" {
+  count         = var.etcd_endpoint != null ? 1 : 0
+  statement_id  = "AllowCloudWatchInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.ac_audit[0].function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.ac_audit_schedule[0].arn
 }

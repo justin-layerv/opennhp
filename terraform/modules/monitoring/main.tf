@@ -6,13 +6,25 @@ data "aws_caller_identity" "current" {}
 
 locals {
   enable_slack = var.enable_slack_notifications && var.slack_workspace_id != "" && var.slack_channel_id != ""
+
+  # Alarm behavior for missing data:
+  # - prod: default to "breaching" (alert when metrics stop)
+  # - non-prod: default to "notBreaching" (quiet during deploys)
+  # Can be overridden via var.alarm_on_missing_data
+  alarm_missing_data = var.alarm_on_missing_data != null ? (
+    var.alarm_on_missing_data ? "breaching" : "notBreaching"
+  ) : (var.environment == "prod" ? "breaching" : "notBreaching")
 }
 
 # SNS Topic for Alerts
 resource "aws_sns_topic" "alerts" {
-  name = "${var.name_prefix}-alerts"
+  name         = "${var.name_prefix}-alerts"
+  display_name = "NHP ${var.environment} Infrastructure Alerts"
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-alerts"
+    Component = "monitoring"
+  })
 }
 
 # AWS Chatbot IAM Role for Slack integration
@@ -31,7 +43,10 @@ resource "aws_iam_role" "chatbot" {
     }]
   })
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-chatbot"
+    Component = "monitoring"
+  })
 }
 
 resource "aws_iam_role_policy" "chatbot" {
@@ -67,7 +82,10 @@ resource "aws_chatbot_slack_channel_configuration" "alerts" {
   guardrail_policy_arns = ["arn:aws:iam::aws:policy/ReadOnlyAccess"]
   logging_level         = "INFO"
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-slack-alerts"
+    Component = "monitoring"
+  })
 }
 
 # CloudWatch Dashboard
@@ -258,7 +276,7 @@ resource "aws_cloudwatch_metric_alarm" "no_healthy_hosts" {
   alarm_description   = "CRITICAL: No healthy hosts available"
   alarm_actions       = [aws_sns_topic.alerts.arn]
   ok_actions          = [aws_sns_topic.alerts.arn]
-  treat_missing_data  = "breaching"
+  treat_missing_data  = local.alarm_missing_data
 
   dimensions = {
     LoadBalancer = var.nlb_arn_suffix
@@ -304,7 +322,7 @@ resource "aws_cloudwatch_metric_alarm" "low_instance_count" {
   alarm_description   = "ASG has fewer than expected in-service instances"
   alarm_actions       = [aws_sns_topic.alerts.arn]
   ok_actions          = [aws_sns_topic.alerts.arn]
-  treat_missing_data  = "breaching"
+  treat_missing_data  = local.alarm_missing_data
 
   dimensions = {
     AutoScalingGroupName = var.asg_name

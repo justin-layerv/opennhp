@@ -47,3 +47,16 @@ variable "enable_slack_notifications" {
   type        = bool
   default     = false
 }
+
+variable "alarm_on_missing_data" {
+  description = <<-EOT
+    How to treat missing metric data for availability alarms.
+
+    - true:  "breaching" - missing data triggers alarm (recommended for prod)
+    - false: "notBreaching" - missing data is OK (quieter during deploys)
+
+    Affects: no-healthy-hosts, low-instances alarms
+  EOT
+  type        = bool
+  default     = null # If null, defaults to true for prod, false otherwise
+}

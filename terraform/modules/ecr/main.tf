@@ -1,6 +1,23 @@
 # ECR Module
-# Creates ECR repositories in primary account (staging)
+# Creates ECR repositories in primary account (sandbox)
 # For prod account, references cross-account ECR
+#
+# ==================== Organization-Managed Resources ====================
+#
+# Some organizations manage certain IAM resources centrally via Service Control
+# Policies (SCPs). This module supports both self-managed and org-managed scenarios:
+#
+# 1. OIDC Provider (GitHub Actions):
+#    - Set `create_oidc_provider = false` if your organization manages the
+#      GitHub OIDC provider centrally or if SCP blocks iam:CreateOpenIDConnectProvider
+#    - When false, the module uses a data source to reference the existing provider
+#
+# 2. GitHub Actions IAM Role:
+#    - Named `nhp-${environment}-github-actions` to support multiple environments
+#    - Each environment gets its own role with appropriate permissions
+#
+# See terraform.tfvars for environment-specific settings.
+# ============================================================================
 
 # ==================== Variables ====================
 
@@ -75,16 +92,48 @@ variable "enable_plugin_bucket_policy" {
   default     = false
 }
 
+variable "environment" {
+  description = "Environment name (sandbox, prod) - used to namespace IAM resources"
+  type        = string
+  default     = "sandbox"
+}
+
+variable "create_oidc_provider" {
+  description = <<-EOT
+    Whether to create the GitHub OIDC provider.
+
+    Set to `false` if:
+    - Your organization manages the OIDC provider centrally
+    - SCP blocks iam:CreateOpenIDConnectProvider
+    - The provider already exists from another deployment
+
+    When false, the module uses a data source to reference the existing provider.
+  EOT
+  type        = bool
+  default     = true
+}
+
 # ==================== Data Sources ====================
 
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
+
+# Data source for existing OIDC provider (used when create_oidc_provider = false)
+# This allows referencing an org-managed or pre-existing OIDC provider
+data "aws_iam_openid_connect_provider" "github" {
+  count = var.create_oidc_provider ? 0 : 1
+  url   = "https://token.actions.githubusercontent.com"
+}
 
 # ==================== Locals ====================
 
 locals {
   account_id = data.aws_caller_identity.current.account_id
   region     = data.aws_region.current.name
+
+  # OIDC Provider ARN - either from created resource or existing data source
+  # This abstraction allows the module to work in both self-managed and org-managed scenarios
+  oidc_provider_arn = var.create_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : data.aws_iam_openid_connect_provider.github[0].arn
 
   # ECR repository names
   ecr_repos = ["nhp-server", "nhp-ac", "nhp-console"]
@@ -125,7 +174,7 @@ locals {
 }
 
 # ============================================================================
-# PRIMARY ACCOUNT RESOURCES (staging/sandbox - owns ECR)
+# PRIMARY ACCOUNT RESOURCES (sandbox - owns ECR)
 # ============================================================================
 
 # ECR Repositories - consolidated with for_each
@@ -140,7 +189,8 @@ resource "aws_ecr_repository" "main" {
   }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-${each.key}"
+    Name      = "${var.name_prefix}-ecr-${each.key}"
+    Component = "ecr"
   })
 
   lifecycle {
@@ -165,16 +215,32 @@ resource "aws_ecr_repository_policy" "cross_account" {
 }
 
 # ============================================================================
-# GITHUB OIDC - Created in EACH account
+# GITHUB OIDC PROVIDER
+# ============================================================================
+#
+# The OIDC provider enables GitHub Actions to authenticate with AWS using
+# OpenID Connect, eliminating the need for long-lived credentials.
+#
+# This resource is CONDITIONAL based on `create_oidc_provider`:
+# - true (default): Creates the OIDC provider in this account
+# - false: Uses data source to reference existing provider (org-managed or pre-existing)
+#
+# Set create_oidc_provider = false when:
+# - Organization SCP blocks iam:CreateOpenIDConnectProvider
+# - OIDC provider is managed centrally by platform team
+# - Provider already exists from another terraform workspace
 # ============================================================================
 
 resource "aws_iam_openid_connect_provider" "github" {
+  count = var.create_oidc_provider ? 1 : 0
+
   url             = "https://token.actions.githubusercontent.com"
   client_id_list  = ["sts.amazonaws.com"]
   thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1", "1c58a3a8518e8759bf075b76b750d4f2df264fcd"]
 
   tags = merge(var.tags, {
-    Name = "github-actions"
+    Name      = "${var.name_prefix}-oidc-github"
+    Component = "ecr"
   })
 
   lifecycle {
@@ -183,16 +249,31 @@ resource "aws_iam_openid_connect_provider" "github" {
   }
 }
 
+# ============================================================================
+# GITHUB ACTIONS IAM ROLE
+# ============================================================================
+#
+# Per-environment IAM role for GitHub Actions CI/CD.
+# Named `nhp-${environment}-github-actions` to support parallel environments.
+#
+# Trust Policy:
+# - Allows GitHub Actions from specified org/repo to assume this role
+# - Restricts to main branch and named environments (sandbox, production)
+# - Supports both nhp and traefik-plugins repositories
+#
+# Permissions are split across multiple inline policies due to IAM size limits.
+# ============================================================================
+
 resource "aws_iam_role" "github_actions" {
-  name        = "nhp-github-actions"
-  description = "GitHub Actions role for ${var.github_org}/${var.github_repo}"
+  name        = "nhp-${var.environment}-github-actions"
+  description = "GitHub Actions role for ${var.github_org}/${var.github_repo} (${var.environment})"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Effect = "Allow"
       Principal = {
-        Federated = aws_iam_openid_connect_provider.github.arn
+        Federated = local.oidc_provider_arn
       }
       Action = "sts:AssumeRoleWithWebIdentity"
       Condition = {
@@ -221,7 +302,8 @@ resource "aws_iam_role" "github_actions" {
   })
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-github-actions"
+    Name      = "${var.name_prefix}-github-actions"
+    Component = "ecr"
   })
 }
 
@@ -384,8 +466,8 @@ resource "aws_iam_role_policy" "context_lookups" {
 # This avoids the chicken-and-egg problem (CI can't add permissions it doesn't have)
 # while following least privilege (only read access to services we use)
 resource "aws_iam_policy" "terraform_read" {
-  name        = "nhp-github-actions-terraform-read"
-  description = "Read-only permissions for Terraform to read resource state"
+  name        = "nhp-${var.environment}-github-actions-terraform-read"
+  description = "Read-only permissions for Terraform to read resource state (${var.environment})"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -720,7 +802,7 @@ resource "aws_iam_role_policy" "terraform_apply_iam" {
         ]
         Resource = [
           "arn:aws:iam::${local.account_id}:role/layerv-nhp-*",
-          "arn:aws:iam::${local.account_id}:role/nhp-github-actions",
+          "arn:aws:iam::${local.account_id}:role/nhp-*-github-actions",
           "arn:aws:iam::${local.account_id}:instance-profile/layerv-nhp-*",
           "arn:aws:iam::${local.account_id}:oidc-provider/*"
         ]
@@ -995,6 +1077,6 @@ output "github_actions_role_arn" {
 }
 
 output "github_oidc_provider_arn" {
-  description = "GitHub OIDC provider ARN"
-  value       = aws_iam_openid_connect_provider.github.arn
+  description = "GitHub OIDC provider ARN (created or referenced from existing)"
+  value       = local.oidc_provider_arn
 }

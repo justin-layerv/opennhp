@@ -4,12 +4,12 @@
 # ==================== Environment ====================
 
 variable "environment" {
-  description = "Environment name (staging, prod)"
+  description = "Environment name (sandbox, prod)"
   type        = string
 
   validation {
-    condition     = contains(["staging", "prod"], var.environment)
-    error_message = "Environment must be 'staging' or 'prod'."
+    condition     = contains(["sandbox", "prod"], var.environment)
+    error_message = "Environment must be 'sandbox' or 'prod'."
   }
 }
 
@@ -39,13 +39,13 @@ variable "aws_account_id" {
 # ==================== Multi-Account Configuration ====================
 
 variable "is_primary_account" {
-  description = "Whether this is the primary account that owns ECR repositories (staging = true, prod = false)"
+  description = "Whether this is the primary account that owns ECR repositories (sandbox = true, prod = false)"
   type        = bool
   default     = true
 }
 
 variable "primary_account_id" {
-  description = "AWS account ID of the primary account (staging). Required if is_primary_account = false"
+  description = "AWS account ID of the primary account (sandbox). Required if is_primary_account = false"
   type        = string
   default     = ""
 
@@ -174,6 +174,22 @@ variable "traefik_plugins_github_repo" {
   description = "GitHub repository name for traefik-plugins (for S3 plugin upload permissions)"
   type        = string
   default     = "traefik-plugins"
+}
+
+variable "create_oidc_provider" {
+  description = <<-EOT
+    Whether to create the GitHub OIDC provider in this account.
+
+    Set to `false` if:
+    - Your organization manages the OIDC provider centrally
+    - SCP blocks iam:CreateOpenIDConnectProvider
+    - The OIDC provider already exists from another deployment
+
+    When false, the module uses a data source to reference the existing provider.
+    The GitHub Actions role will still be created and will reference the existing OIDC provider.
+  EOT
+  type        = bool
+  default     = true
 }
 
 # ==================== DNS Configuration ====================

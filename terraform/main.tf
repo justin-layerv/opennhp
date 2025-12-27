@@ -2,8 +2,8 @@
 # Consistent with layerv/traefik-plugins terraform patterns
 #
 # Multi-account architecture:
-# - Staging (layerv): Primary account, owns ECR repositories
-# - Production (layerv-prod): Secondary account, pulls from staging ECR cross-account
+# - Sandbox (layerv): Primary account, owns ECR repositories
+# - Production (layerv-prod): Secondary account, pulls from sandbox ECR cross-account
 
 terraform {
   required_version = ">= 1.0"
@@ -76,6 +76,7 @@ module "kms" {
 module "ecr" {
   source = "./modules/ecr"
 
+  environment            = var.environment
   name_prefix            = local.name_prefix
   tags                   = local.common_tags
   is_primary_account     = var.is_primary_account
@@ -85,6 +86,9 @@ module "ecr" {
   github_repo            = var.github_repo
   terraform_state_bucket = var.terraform_state_bucket
   terraform_lock_table   = var.terraform_lock_table
+
+  # OIDC Provider - set to false if org manages centrally or SCP blocks creation
+  create_oidc_provider = var.create_oidc_provider
 
   # Traefik plugins bucket (from AC module)
   # Allows traefik-plugins repo to upload plugins to S3

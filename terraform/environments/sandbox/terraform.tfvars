@@ -1,7 +1,7 @@
-# Staging environment configuration
+# Sandbox environment configuration
 # Consistent with layerv/traefik-plugins terraform patterns
 
-environment    = "staging"
+environment    = "sandbox"
 aws_region     = "us-east-2"
 aws_account_id = "767397897469"
 domain_name    = "nhp.layerv.xyz"
@@ -11,7 +11,7 @@ min_capacity   = 1
 max_capacity   = 10
 vpc_cidr       = "10.100.0.0/16"
 
-# Multi-account config: staging owns ECR repositories
+# Multi-account config: sandbox owns ECR repositories
 is_primary_account = true
 # secondary_account_ids = ["PROD_ACCOUNT_ID"]  # TODO: Add prod account ID when created
 
@@ -25,11 +25,22 @@ ac_resource_ids    = ["demo", "mini-app-demo"]
 terraform_state_bucket = "layerv-terraform-state-767397897469"
 terraform_lock_table   = "terraform-state-lock"
 
-# Security services
-enable_cloudtrail = true
+# ==============================================================================
+# Organization-Managed Resources
+# ==============================================================================
+# Some resources are managed centrally by the organization or blocked by SCPs.
+# These settings ensure terraform works with pre-existing resources.
+
+# OIDC Provider: Already exists in account, SCP blocks iam:CreateOpenIDConnectProvider
+# Set to false to reference existing provider via data source
+create_oidc_provider = false
+
+# CloudTrail: SCP blocks cloudtrail:CreateTrail and cloudtrail:DeleteTrail
+# The existing trail was created before SCP was applied and continues to work
+enable_cloudtrail = false
 
 # NHP Server configuration
-# Set to true for staging to enable debug features
+# Set to true for sandbox to enable debug features
 dev_mode      = true
 resource_mode = "api"
 auth_url      = "http://127.0.0.1:8888" # Internal AC auth endpoint

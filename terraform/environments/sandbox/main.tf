@@ -35,6 +35,9 @@ module "nhp" {
   # Security services
   enable_cloudtrail = var.enable_cloudtrail
 
+  # GitHub OIDC - set to false if org manages centrally or SCP blocks creation
+  create_oidc_provider = var.create_oidc_provider
+
   # Server configuration
   dev_mode      = var.dev_mode
   resource_mode = var.resource_mode

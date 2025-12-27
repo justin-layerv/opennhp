@@ -6,7 +6,18 @@ echo "Starting NHP Server installation at $(date)"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y awscli jq docker.io curl
+# Note: awscli package deprecated in Ubuntu 24.04, using unzip + curl for AWS CLI v2
+apt-get install -y jq docker.io curl unzip
+
+# Install AWS CLI v2 (works on all Ubuntu versions)
+if ! command -v aws &> /dev/null; then
+  echo "Installing AWS CLI v2..."
+  curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+  unzip -q /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install
+  rm -rf /tmp/aws /tmp/awscliv2.zip
+fi
+aws --version
 
 systemctl enable docker
 systemctl start docker

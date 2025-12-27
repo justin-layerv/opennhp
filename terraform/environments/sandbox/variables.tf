@@ -95,8 +95,16 @@ variable "ac_resource_ids" {
 
 # Security services
 variable "enable_cloudtrail" {
-  type    = bool
-  default = true
+  description = "Enable AWS CloudTrail. Set to false if SCP blocks cloudtrail operations."
+  type        = bool
+  default     = true
+}
+
+# GitHub OIDC
+variable "create_oidc_provider" {
+  description = "Create GitHub OIDC provider. Set to false if org manages centrally or SCP blocks creation."
+  type        = bool
+  default     = true
 }
 
 # Server configuration

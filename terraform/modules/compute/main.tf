@@ -6,8 +6,9 @@
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
+# Ubuntu 24.04 LTS (Noble Numbat) - latest LTS
 data "aws_ssm_parameter" "ubuntu_ami" {
-  name = "/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id"
+  name = "/aws/service/canonical/ubuntu/server/noble/stable/current/amd64/hvm/ebs-gp3/ami-id"
 }
 
 # ==================== Locals ====================
@@ -45,14 +46,21 @@ resource "aws_iam_role_policy" "keygen_lambda_secrets" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "secretsmanager:GetSecretValue",
-        "secretsmanager:PutSecretValue"
-      ]
-      Resource = aws_secretsmanager_secret.server.arn
-    }]
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:PutSecretValue"
+        ]
+        Resource = aws_secretsmanager_secret.server.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey"]
+        Resource = var.secrets_kms_key_arn != null ? [var.secrets_kms_key_arn] : []
+      }
+    ]
   })
 }
 
@@ -176,11 +184,14 @@ resource "aws_lambda_invocation" "keygen" {
 
 # CloudWatch Log Group for servers
 resource "aws_cloudwatch_log_group" "server" {
-  name              = "/layerv/nhp-server/${var.environment}"
+  name              = "/layerv/nhp/${var.environment}/server"
   retention_in_days = local.is_prod ? 365 : 30
   kms_key_id        = var.logs_kms_key_arn
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-logs-server"
+    Component = "compute"
+  })
 }
 
 # Cloud Map Service for NHP servers
@@ -347,7 +358,8 @@ resource "aws_security_group" "server" {
   }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-server"
+    Name      = "${var.name_prefix}-sg-server"
+    Component = "compute"
   })
 
   lifecycle {
@@ -419,7 +431,8 @@ resource "aws_launch_template" "server" {
   tag_specifications {
     resource_type = "instance"
     tags = merge(var.tags, {
-      Name = "${var.name_prefix}-server"
+      Name      = "${var.name_prefix}-server"
+      Component = "compute"
     })
   }
 

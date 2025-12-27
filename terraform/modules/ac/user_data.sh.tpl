@@ -6,7 +6,18 @@ echo "Starting NHP AC installation at $(date)"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y awscli jq curl docker.io gettext-base iptables ipset
+# Note: awscli package deprecated in Ubuntu 24.04, using unzip + curl for AWS CLI v2
+apt-get install -y jq curl docker.io gettext-base iptables ipset unzip
+
+# Install AWS CLI v2 (works on all Ubuntu versions)
+if ! command -v aws &> /dev/null; then
+  echo "Installing AWS CLI v2..."
+  curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+  unzip -q /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install
+  rm -rf /tmp/aws /tmp/awscliv2.zip
+fi
+aws --version
 
 # Enable and start Docker
 systemctl enable docker
@@ -190,12 +201,116 @@ RSYSLOGEOF
 fi
 
 # ============================================================================
-# Fetch AC Private Key - needed for both etcd bootstrap and local config
+# Per-Instance AC Key Generation and Registration
+# Each AC instance generates its own Curve25519 keypair and registers with etcd.
+# This provides per-instance isolation and revocation capability.
 # ============================================================================
-echo "Fetching AC private key from Secrets Manager..."
-AC_SECRET=$(aws secretsmanager get-secret-value --secret-id "${ac_secret_arn}" --region "$REGION" --query SecretString --output text)
-PRIVATE_KEY=$(echo "$AC_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['privateKey'])")
-echo "AC private key retrieved"
+
+# Install cryptography library for key generation
+apt-get install -y python3-cryptography
+
+# Per-instance secret name
+AC_SECRET_NAME="${name_prefix}-ac-$INSTANCE_ID"
+
+echo "Checking for existing AC keypair in Secrets Manager..."
+
+# Try to get existing secret for this instance
+EXISTING_SECRET=$(aws secretsmanager get-secret-value --secret-id "$AC_SECRET_NAME" --region "$REGION" --query SecretString --output text 2>/dev/null || echo "")
+
+if [ -n "$EXISTING_SECRET" ]; then
+  echo "Found existing keypair for this instance"
+  PRIVATE_KEY=$(echo "$EXISTING_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['privateKey'])")
+  PUBLIC_KEY=$(echo "$EXISTING_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['publicKey'])")
+else
+  echo "Generating new Curve25519 keypair for this instance..."
+
+  # Generate keypair using Python cryptography library
+  # Note: Using serialization API for compatibility with Ubuntu 22.04's python3-cryptography 3.4.8
+  KEYPAIR=$(python3 << 'KEYGEN_EOF'
+import json
+import base64
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+
+# Generate new X25519 keypair
+private_key = X25519PrivateKey.generate()
+
+# Get raw bytes using serialization API (compatible with cryptography 3.4+)
+private_bytes = private_key.private_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PrivateFormat.Raw,
+    encryption_algorithm=serialization.NoEncryption()
+)
+public_bytes = private_key.public_key().public_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PublicFormat.Raw
+)
+
+# Encode as base64
+result = {
+    'privateKey': base64.b64encode(private_bytes).decode(),
+    'publicKey': base64.b64encode(public_bytes).decode()
+}
+
+print(json.dumps(result))
+KEYGEN_EOF
+)
+
+  PRIVATE_KEY=$(echo "$KEYPAIR" | python3 -c "import sys,json; print(json.load(sys.stdin)['privateKey'])")
+  PUBLIC_KEY=$(echo "$KEYPAIR" | python3 -c "import sys,json; print(json.load(sys.stdin)['publicKey'])")
+
+  echo "Storing keypair in Secrets Manager..."
+
+  # Create the secret with the keypair
+  SECRET_VALUE=$(cat << SECRETEOF
+{
+  "privateKey": "$PRIVATE_KEY",
+  "publicKey": "$PUBLIC_KEY",
+  "instanceId": "$INSTANCE_ID",
+  "createdAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+SECRETEOF
+)
+
+  # Create or update the secret
+  KMS_ARG=""
+%{ if secrets_kms_key_arn != "" }
+  KMS_ARG="--kms-key-id ${secrets_kms_key_arn}"
+%{ endif }
+  if aws secretsmanager create-secret \
+    --name "$AC_SECRET_NAME" \
+    --secret-string "$SECRET_VALUE" \
+    $KMS_ARG \
+    --tags "Key=Environment,Value=${environment}" "Key=InstanceId,Value=$INSTANCE_ID" \
+    --region "$REGION" 2>/dev/null; then
+    echo "Created new secret: $AC_SECRET_NAME"
+  else
+    # Secret might already exist (from previous failed boot), update it
+    aws secretsmanager put-secret-value \
+      --secret-id "$AC_SECRET_NAME" \
+      --secret-string "$SECRET_VALUE" \
+      --region "$REGION"
+    echo "Updated existing secret: $AC_SECRET_NAME"
+  fi
+fi
+
+echo "AC keypair ready (public key: $${PUBLIC_KEY:0:20}...)"
+
+# ============================================================================
+# Fetch AWS Instance Identity Document with RSA-2048 Signature
+# Used for cryptographic proof of instance identity when registering with etcd.
+# We use the RSA-2048 signature endpoint which is verified using region-specific
+# AWS RSA-2048 certificates (valid until 2195+).
+# See: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/verify-rsa2048.html
+# ============================================================================
+echo "Fetching AWS Instance Identity Document..."
+IDENTITY_DOCUMENT=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/document)
+# Use RSA-2048 signature (not the old base64 DSA signature)
+IDENTITY_RSA2048=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/rsa2048)
+IDENTITY_DOCUMENT_B64=$(echo "$IDENTITY_DOCUMENT" | base64 -w0)
+# The RSA-2048 signature is already in PEM format, extract just the base64 content
+IDENTITY_SIGNATURE=$(echo "$IDENTITY_RSA2048" | grep -v "^-----" | tr -d '\n')
+echo "Instance identity document retrieved (RSA-2048 signature)"
 
 # Configure etcd connection for multi-tenant with TLS
 %{ if etcd_endpoint != null }
@@ -235,12 +350,10 @@ REMOTEEOF
 echo "Configured etcd endpoint: ${etcd_endpoint} (mTLS enabled)"
 
 # ============================================================================
-# etcd Bootstrap - Initialize config key if not exists
-# This ensures new environments are properly bootstrapped without manual steps
-# NOTE: The private key MUST be included in etcd config because the AC code
-# loads BaseConfig from etcd, and an empty PrivateKeyBase64 will cause a crash.
-# NOTE: This bootstrap is non-fatal - AC can start with local config if etcd
-# is unavailable. The bootstrap will be retried on subsequent instance launches.
+# AC Registration with etcd
+# Register this AC's public key and identity document with etcd.
+# The server will read this registry to know which ACs to trust.
+# Config (/nhp/config) is seeded by Terraform Lambda, not by ACs.
 # ============================================================================
 
 # Function to wait for DNS resolution with retries
@@ -258,95 +371,128 @@ wait_for_dns() {
     sleep 10
     attempt=$((attempt + 1))
   done
-  echo "WARNING: DNS resolution failed for $hostname after $max_attempts attempts"
+  echo "ERROR: DNS resolution failed for $hostname after $max_attempts attempts"
   return 1
 }
 
 # Extract hostname from etcd endpoint for DNS check
 ETCD_HOST=$(echo "${etcd_endpoint}" | sed 's|https://||' | sed 's|:.*||')
 
-echo "Checking and bootstrapping etcd configuration..."
+echo "Registering AC with etcd..."
 
-# Install etcdctl
-ETCD_VERSION="v3.5.17"
-curl -L https://github.com/etcd-io/etcd/releases/download/$ETCD_VERSION/etcd-$ETCD_VERSION-linux-amd64.tar.gz -o /tmp/etcd.tar.gz
-tar -xzf /tmp/etcd.tar.gz -C /tmp
-cp /tmp/etcd-$ETCD_VERSION-linux-amd64/etcdctl /usr/local/bin/
-chmod +x /usr/local/bin/etcdctl
-rm -rf /tmp/etcd*
+# Wait for etcd DNS - FAIL if not available (fail fast)
+if ! wait_for_dns "$ETCD_HOST"; then
+  echo "FATAL: Cannot reach etcd, aborting AC startup"
+  exit 1
+fi
 
-# Set etcdctl environment for mTLS
-export ETCDCTL_API=3
-export ETCDCTL_ENDPOINTS="${etcd_endpoint}"
-%{ if etcd_tls_secret_arn != null }
-export ETCDCTL_CACERT="/opt/layerv/nhp-ac/etc/tls/ca.crt"
-export ETCDCTL_CERT="/opt/layerv/nhp-ac/etc/tls/client.crt"
-export ETCDCTL_KEY="/opt/layerv/nhp-ac/etc/tls/client.key"
+# Register this AC in etcd using Python (for proper JSON/base64 handling)
+REGISTRATION_RESULT=$(python3 << REGISTER_EOF
+import json
+import ssl
+import tempfile
+import urllib.request
+import base64
+import sys
+import time
+
+# Configuration
+etcd_endpoint = "${etcd_endpoint}"
+instance_id = "$INSTANCE_ID"
+public_key = "$PUBLIC_KEY"
+local_ip = "$LOCAL_IP"
+identity_document = """$IDENTITY_DOCUMENT"""
+identity_signature = """$IDENTITY_SIGNATURE"""
+
+# TLS certificate paths
+ca_path = "/opt/layerv/nhp-ac/etc/tls/ca.crt"
+cert_path = "/opt/layerv/nhp-ac/etc/tls/client.crt"
+key_path = "/opt/layerv/nhp-ac/etc/tls/client.key"
+
+# Build registration entry (TOML format for consistency)
+registered_at = int(time.time())
+registry_value = f'''# AC Registry Entry (auto-registered by instance)
+PublicKey = "{public_key}"
+InstanceId = "{instance_id}"
+Ip = "{local_ip}"
+Port = 62206
+RegisteredAt = {registered_at}
+IdentityDocument = "{base64.b64encode(identity_document.encode()).decode()}"
+IdentitySignature = "{identity_signature}"
+'''
+
+# Create SSL context with client cert
+ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+ssl_context.load_verify_locations(ca_path)
+ssl_context.load_cert_chain(cert_path, key_path)
+
+# Register with retry
+max_retries = 5
+for attempt in range(1, max_retries + 1):
+    try:
+        url = f"{etcd_endpoint}/v3/kv/put"
+        key = f"/nhp/ac-registry/{instance_id}"
+        key_b64 = base64.b64encode(key.encode()).decode()
+        value_b64 = base64.b64encode(registry_value.encode()).decode()
+
+        data = json.dumps({
+            'key': key_b64,
+            'value': value_b64
+        }).encode()
+
+        req = urllib.request.Request(url, data=data, method='POST')
+        req.add_header('Content-Type', 'application/json')
+
+        with urllib.request.urlopen(req, context=ssl_context, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+            print(json.dumps({"success": True, "attempt": attempt}))
+            sys.exit(0)
+
+    except Exception as e:
+        print(f"Attempt {attempt}/{max_retries} failed: {e}", file=sys.stderr)
+        if attempt < max_retries:
+            time.sleep(2 ** attempt)  # Exponential backoff
+        else:
+            print(json.dumps({"success": False, "error": str(e)}))
+            sys.exit(1)
+REGISTER_EOF
+)
+
+# Check registration result
+if echo "$REGISTRATION_RESULT" | python3 -c "import sys,json; result=json.load(sys.stdin); sys.exit(0 if result.get('success') else 1)"; then
+  echo "Successfully registered AC in etcd"
+else
+  echo "FATAL: Failed to register AC in etcd"
+  echo "$REGISTRATION_RESULT"
+  exit 1
+fi
 %{ endif }
 
-# Wait for etcd DNS to be resolvable, but don't fail if it times out
-# The AC can still start with local config
-if wait_for_dns "$ETCD_HOST"; then
-  # Check if the /nhp/config key exists and has a valid private key
-  # Note: The Go code prepends "/" to the key, so we must use /nhp/config (with leading slash)
-  EXISTING_KEY=$(etcdctl get /nhp/config --print-value-only 2>/dev/null | grep -o "PrivateKeyBase64 = \"[^\"]*\"" | grep -v '""' || true)
-  if [ -z "$EXISTING_KEY" ]; then
-    echo "etcd key '/nhp/config' not found or has empty private key, bootstrapping initial configuration..."
-
-    # Create initial etcd config for AC with the private key
-    # This is TOML format matching ACEtcdConfig struct in endpoints/ac/config.go
-    cat > /tmp/etcd-init-config.toml << ETCDINITEOF
-# NHP AC etcd configuration (infrastructure-managed bootstrap)
-# This config is loaded by AC on startup and can be updated dynamically
-
-[BaseConfig]
-PrivateKeyBase64 = "$PRIVATE_KEY"
-ACId = "${environment}-ac"
-DefaultIp = ""
-AuthServiceId = "${auth_service_id}"
-ResourceIds = ${resource_ids}
-DefaultCipherScheme = 0
-IpPassMode = 0
-LogLevel = 4
-FilterMode = 0
-
-[HttpConfig]
-EnableHttp = true
-EnableTLS = false
-HttpListenPort = 8888
-
-# Server peers - initially empty, discovered via Cloud Map
-# Can add static servers here for multi-region setups
-# [[Servers]]
-# Hostname = "server.nhp.layerv.xyz"
-# Ip = ""
-# Port = 62206
-# PubKeyBase64 = ""
-ETCDINITEOF
-
-    # Write the initial config to etcd (non-fatal if it fails)
-    # Use /nhp/config (with leading slash) to match what the Go code expects
-    if etcdctl put /nhp/config -- "$(cat /tmp/etcd-init-config.toml)"; then
-      echo "etcd bootstrap complete - initial configuration written to /nhp/config"
-    else
-      echo "WARNING: Failed to write etcd config, AC will use local config"
-    fi
-    rm -f /tmp/etcd-init-config.toml
-  else
-    echo "etcd key '/nhp/config' exists with valid private key, skipping bootstrap"
-  fi
-else
-  echo "WARNING: etcd DNS not resolvable, skipping etcd bootstrap. AC will use local config."
+# ============================================================================
+# Fetch NHP Server Public Key
+# Required for AC to communicate with NHP servers
+# ============================================================================
+%{ if server_secret_arn != "" }
+echo "Fetching NHP Server public key from Secrets Manager..."
+SERVER_SECRET=$(aws secretsmanager get-secret-value --secret-id "${server_secret_arn}" --region "$REGION" --query SecretString --output text)
+SERVER_PUBLIC_KEY=$(echo "$SERVER_SECRET" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('publicKey', d.get('PubKeyBase64', '')))" 2>/dev/null || echo "")
+if [ -z "$SERVER_PUBLIC_KEY" ]; then
+  echo "FATAL: Could not extract server public key from secret"
+  exit 1
 fi
+echo "Server public key retrieved: $${SERVER_PUBLIC_KEY:0:20}..."
+%{ else }
+echo "WARNING: No server_secret_arn configured, server communication may fail"
+SERVER_PUBLIC_KEY=""
 %{ endif }
 
 # ============================================================================
 # NHP-ACD Configuration Files
 # Generate all config files for the AC daemon
-# (Private key was already fetched above for etcd bootstrap)
 # ============================================================================
 
 # Generate AC config.toml with environment-specific values
+# Note: AC dials OUT to servers (doesn't listen). Server peers are in server.toml.
 cat > /opt/layerv/nhp-ac/etc/config.toml << CONFIGEOF
 # NHP-AC base config (infrastructure-managed)
 # Generated by Terraform user_data
@@ -374,21 +520,8 @@ HttpListenPort = 8888
 HTTPEOF
 echo "NHP-ACD HTTP config created"
 
-# Fetch NHP Server's public key from Secrets Manager
-%{ if server_secret_arn != "" }
-echo "Fetching NHP Server public key from Secrets Manager..."
-SERVER_SECRET=$(aws secretsmanager get-secret-value --secret-id "${server_secret_arn}" --region "$REGION" --query SecretString --output text 2>/dev/null || echo "{}")
-SERVER_PUBLIC_KEY=$(echo "$SERVER_SECRET" | python3 -c "import sys,json; data=json.load(sys.stdin); print(data.get('publicKey', ''))" 2>/dev/null || echo "")
-if [ -n "$SERVER_PUBLIC_KEY" ]; then
-  echo "Server public key retrieved successfully"
-else
-  echo "WARNING: Could not retrieve server public key"
-fi
-%{ else }
-SERVER_PUBLIC_KEY=""
-%{ endif }
-
 # Generate server.toml with NHP server peer discovery via Cloud Map
+# Note: SERVER_PUBLIC_KEY was fetched earlier in the script
 # This allows the AC to communicate with NHP servers in the same namespace
 cat > /opt/layerv/nhp-ac/etc/server.toml << 'SERVEREOF'
 # NHP Server peers configuration
