@@ -255,13 +255,6 @@ jobs:
         working-directory: terraform/environments/sandbox
         run: terraform fmt -check -recursive ../../
 
-      - name: Build Lambda Layer (required for Terraform)
-        run: |
-          mkdir -p /tmp/lambda-layer-build/python
-          pip install cryptography -t /tmp/lambda-layer-build/python --no-cache-dir
-          cd /tmp/lambda-layer-build && zip -r cryptography-layer.zip python/
-          ls -la /tmp/lambda-layer-build/
-
       - name: Terraform Init
         working-directory: terraform/environments/sandbox
         env:
@@ -341,13 +334,6 @@ jobs:
         with:
           role-to-assume: ${{ matrix.environment == 'prod' && secrets.AWS_PROD_ROLE_ARN || secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: Build Lambda Layer (required for Terraform)
-        run: |
-          mkdir -p /tmp/lambda-layer-build/python
-          pip install cryptography -t /tmp/lambda-layer-build/python --no-cache-dir
-          cd /tmp/lambda-layer-build && zip -r cryptography-layer.zip python/
-          ls -la /tmp/lambda-layer-build/
 
       - name: Terraform Init
         working-directory: terraform/environments/${{ matrix.environment }}
@@ -443,12 +429,6 @@ jobs:
         with:
           name: tfplan-sandbox-${{ github.sha }}
           path: terraform/environments/sandbox
-
-      - name: Build Lambda Layer (required for Terraform)
-        run: |
-          mkdir -p /tmp/lambda-layer-build/python
-          pip install cryptography -t /tmp/lambda-layer-build/python --no-cache-dir
-          cd /tmp/lambda-layer-build && zip -r cryptography-layer.zip python/
 
       - name: Terraform Init
         working-directory: terraform/environments/sandbox
@@ -708,12 +688,6 @@ jobs:
         with:
           name: tfplan-prod-${{ github.sha }}
           path: terraform/environments/prod
-
-      - name: Build Lambda Layer (required for Terraform)
-        run: |
-          mkdir -p /tmp/lambda-layer-build/python
-          pip install cryptography -t /tmp/lambda-layer-build/python --no-cache-dir
-          cd /tmp/lambda-layer-build && zip -r cryptography-layer.zip python/
 
       - name: Terraform Init
         working-directory: terraform/environments/prod

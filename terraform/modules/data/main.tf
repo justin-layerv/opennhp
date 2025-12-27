@@ -152,16 +152,25 @@ resource "aws_iam_role_policy" "etcd_tls_lambda_secrets" {
   })
 }
 
-# Lambda layer for cryptography library
-# NOTE: The layer zip must be pre-built before running terraform apply.
-# Build using: docker run --rm -v "/tmp/lambda-layer-build:/output" public.ecr.aws/lambda/python:3.11 \
-#   sh -c "pip install cryptography -t /output/python --no-cache-dir && cd /output && zip -r cryptography-layer.zip python/"
+# Lambda layer for cryptography library (stored in S3 for reproducibility)
+# To update: rebuild with Docker and upload to S3:
+#   docker run --rm --platform linux/amd64 --entrypoint "" -v "/tmp/lambda-layer:/output" \
+#     public.ecr.aws/lambda/python:3.11 sh -c "pip install --upgrade pip && pip install cryptography -t /output/python --no-cache-dir"
+#   cd /tmp/lambda-layer && zip -r cryptography-layer.zip python/
+#   aws s3 cp cryptography-layer.zip s3://layerv-terraform-state-767397897469/lambda-layers/
+data "aws_s3_object" "cryptography_layer" {
+  count  = var.multi_tenant ? 1 : 0
+  bucket = "layerv-terraform-state-767397897469"
+  key    = "lambda-layers/cryptography-layer.zip"
+}
+
 resource "aws_lambda_layer_version" "cryptography" {
   count               = var.multi_tenant ? 1 : 0
   layer_name          = "${var.name_prefix}-cryptography"
-  description         = "Python cryptography library for Lambda"
-  filename            = "/tmp/lambda-layer-build/cryptography-layer.zip"
-  source_code_hash    = filebase64sha256("/tmp/lambda-layer-build/cryptography-layer.zip")
+  description         = "Python cryptography library for Lambda (v46.0.3)"
+  s3_bucket           = data.aws_s3_object.cryptography_layer[0].bucket
+  s3_key              = data.aws_s3_object.cryptography_layer[0].key
+  source_code_hash    = data.aws_s3_object.cryptography_layer[0].etag
   compatible_runtimes = ["python3.11"]
 }
 
