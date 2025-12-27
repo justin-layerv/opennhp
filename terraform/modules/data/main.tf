@@ -17,7 +17,7 @@ locals {
   etcd_protocol = "https"
 
   # Etcd service DNS name based on cluster size:
-  # - Single-node (staging): Use shared 'etcd' service for simplicity
+  # - Single-node (sandbox): Use shared 'etcd' service for simplicity
   # - Multi-node (prod): Use member-specific 'etcd-N' services for peer discovery
   etcd_service_name = local.etcd_cluster_size == 1 ? "etcd" : "etcd-0"
 
@@ -41,9 +41,12 @@ locals {
 resource "aws_service_discovery_private_dns_namespace" "main" {
   name        = "nhp.${var.environment}.internal"
   vpc         = var.vpc_id
-  description = "LayerV NHP internal service discovery"
+  description = "LayerV NHP ${var.environment} internal service discovery"
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-namespace"
+    Component = "data"
+  })
 }
 
 # etcd credentials and TLS certificates
@@ -55,12 +58,15 @@ resource "random_password" "etcd" {
 
 resource "aws_secretsmanager_secret" "etcd" {
   count                   = var.multi_tenant ? 1 : 0
-  name                    = "${var.name_prefix}-etcd"
-  description             = "etcd authentication credentials"
+  name                    = "${var.name_prefix}-etcd-credentials"
+  description             = "etcd authentication credentials for NHP ${var.environment}"
   recovery_window_in_days = local.is_prod ? 30 : 0
   kms_key_id              = var.secrets_kms_key_arn
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-etcd-credentials"
+    Component = "data"
+  })
 }
 
 resource "aws_secretsmanager_secret_version" "etcd" {
@@ -80,11 +86,14 @@ resource "aws_secretsmanager_secret_version" "etcd" {
 resource "aws_secretsmanager_secret" "etcd_tls" {
   count                   = var.multi_tenant ? 1 : 0
   name                    = "${var.name_prefix}-etcd-tls"
-  description             = "etcd TLS certificates (CA, server cert, server key)"
+  description             = "etcd mTLS certificates (CA, server, client) for NHP ${var.environment}"
   recovery_window_in_days = local.is_prod ? 30 : 0
   kms_key_id              = var.secrets_kms_key_arn
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-etcd-tls"
+    Component = "data"
+  })
 }
 
 # TLS certificate generation Lambda (Python with cryptography library)
@@ -103,7 +112,10 @@ resource "aws_iam_role" "etcd_tls_lambda" {
     }]
   })
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-etcd-tls-lambda"
+    Component = "data"
+  })
 }
 
 resource "aws_iam_role_policy_attachment" "etcd_tls_lambda_basic" {
@@ -362,12 +374,16 @@ resource "aws_lambda_function" "etcd_tls" {
   # Attach cryptography layer for certificate generation
   layers = [aws_lambda_layer_version.cryptography[0].arn]
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-etcd-tls-gen"
+    Component = "data"
+  })
 
   depends_on = [aws_lambda_layer_version.cryptography]
 }
 
-# Invoke Lambda to generate TLS certs (force regenerate to fix invalid certs)
+# Invoke Lambda to generate TLS certs
+# Uses triggers to force regeneration when Lambda code changes or manually triggered
 resource "aws_lambda_invocation" "etcd_tls" {
   count         = var.multi_tenant ? 1 : 0
   function_name = aws_lambda_function.etcd_tls[0].function_name
@@ -378,15 +394,18 @@ resource "aws_lambda_invocation" "etcd_tls" {
       SecretId        = aws_secretsmanager_secret.etcd_tls[0].id
       ClusterSize     = local.etcd_cluster_size
       Environment     = var.environment
-      ForceRegenerate = true # Regenerate to fix invalid placeholder certs
+      ForceRegenerate = true
     }
   })
 
-  depends_on = [aws_iam_role_policy.etcd_tls_lambda_secrets]
-
-  lifecycle {
-    ignore_changes = [input]
+  triggers = {
+    # Regenerate when Lambda code changes (includes SAN configuration)
+    lambda_hash = aws_lambda_function.etcd_tls[0].source_code_hash
+    # Increment to force regeneration: v2 = add DNS SANs for etcd.nhp.{env}.internal
+    force_regen = "2"
   }
+
+  depends_on = [aws_iam_role_policy.etcd_tls_lambda_secrets]
 }
 
 # Secrets rotation for etcd credentials (production only)
@@ -706,7 +725,8 @@ resource "aws_security_group" "efs" {
   }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-efs"
+    Name      = "${var.name_prefix}-sg-efs"
+    Component = "data"
   })
 
   lifecycle {
@@ -767,7 +787,8 @@ resource "aws_security_group" "etcd" {
   }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-etcd"
+    Name      = "${var.name_prefix}-sg-etcd"
+    Component = "data"
   })
 
   lifecycle {
@@ -790,7 +811,8 @@ resource "aws_efs_file_system" "etcd" {
   }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-etcd"
+    Name      = "${var.name_prefix}-efs-etcd"
+    Component = "data"
   })
 
   # Prevent recreation of EFS with existing data due to KMS key changes
@@ -838,7 +860,8 @@ resource "aws_efs_access_point" "etcd" {
   }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-etcd-${each.key}"
+    Name      = "${var.name_prefix}-efs-ap-etcd-${each.key}"
+    Component = "data"
   })
 }
 
@@ -852,17 +875,23 @@ resource "aws_ecs_cluster" "etcd" {
     value = "enabled"
   }
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-ecs-etcd"
+    Component = "data"
+  })
 }
 
 # CloudWatch Log Group for etcd
 resource "aws_cloudwatch_log_group" "etcd" {
   count             = var.multi_tenant ? 1 : 0
-  name              = "/layerv/etcd/${var.environment}"
+  name              = "/layerv/nhp/${var.environment}/etcd"
   retention_in_days = 30
   kms_key_id        = var.logs_kms_key_arn
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-logs-etcd"
+    Component = "data"
+  })
 }
 
 # ECS Task Execution Role

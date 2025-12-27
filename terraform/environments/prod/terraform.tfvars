@@ -11,11 +11,11 @@ hosted_zone    = "layerv.ai" # Hosted in layerv-mgmt account - requires cross-ac
 multi_tenant   = true
 min_capacity   = 3
 max_capacity   = 10
-vpc_cidr       = "10.200.0.0/16" # Different CIDR from staging
+vpc_cidr       = "10.200.0.0/16" # Different CIDR from sandbox
 
-# Multi-account config: prod pulls images from staging account's ECR
+# Multi-account config: prod pulls images from sandbox account's ECR
 is_primary_account = false
-primary_account_id = "767397897469" # Staging (layerv) account ID
+primary_account_id = "767397897469" # Sandbox (layerv) account ID
 
 # AC configuration (Traefik with Let's Encrypt for TLS)
 deploy_ac  = true

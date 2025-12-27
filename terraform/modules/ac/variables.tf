@@ -69,6 +69,12 @@ variable "etcd_tls_secret_arn" {
   default     = null
 }
 
+variable "etcd_security_group_id" {
+  description = "etcd security group ID (for Lambda VPC access)"
+  type        = string
+  default     = null
+}
+
 variable "namespace_id" {
   description = "Cloud Map namespace ID"
   type        = string

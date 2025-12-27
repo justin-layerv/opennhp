@@ -10,7 +10,7 @@ locals {
 
 # KMS Key for EBS volumes
 resource "aws_kms_key" "ebs" {
-  description             = "KMS key for EBS volume encryption"
+  description             = "NHP ${var.environment} - KMS key for EBS volume encryption"
   deletion_window_in_days = local.is_prod ? 30 : 7
   enable_key_rotation     = true
 
@@ -82,7 +82,8 @@ resource "aws_kms_key" "ebs" {
   })
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-ebs"
+    Name      = "${var.name_prefix}-kms-ebs"
+    Component = "kms"
   })
 }
 
@@ -93,7 +94,7 @@ resource "aws_kms_alias" "ebs" {
 
 # KMS Key for EFS
 resource "aws_kms_key" "efs" {
-  description             = "KMS key for EFS encryption"
+  description             = "NHP ${var.environment} - KMS key for EFS encryption"
   deletion_window_in_days = local.is_prod ? 30 : 7
   enable_key_rotation     = true
 
@@ -128,7 +129,8 @@ resource "aws_kms_key" "efs" {
   })
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-efs"
+    Name      = "${var.name_prefix}-kms-efs"
+    Component = "kms"
   })
 }
 
@@ -139,7 +141,7 @@ resource "aws_kms_alias" "efs" {
 
 # KMS Key for Secrets Manager
 resource "aws_kms_key" "secrets" {
-  description             = "KMS key for Secrets Manager encryption"
+  description             = "NHP ${var.environment} - KMS key for Secrets Manager encryption"
   deletion_window_in_days = local.is_prod ? 30 : 7
   enable_key_rotation     = true
 
@@ -179,7 +181,8 @@ resource "aws_kms_key" "secrets" {
   })
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-secrets"
+    Name      = "${var.name_prefix}-kms-secrets"
+    Component = "kms"
   })
 }
 
@@ -190,7 +193,7 @@ resource "aws_kms_alias" "secrets" {
 
 # KMS Key for CloudWatch Logs and CloudTrail
 resource "aws_kms_key" "logs" {
-  description             = "KMS key for CloudWatch Logs and CloudTrail encryption"
+  description             = "NHP ${var.environment} - KMS key for CloudWatch Logs and CloudTrail"
   deletion_window_in_days = local.is_prod ? 30 : 7
   enable_key_rotation     = true
 
@@ -261,7 +264,8 @@ resource "aws_kms_key" "logs" {
   })
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-logs"
+    Name      = "${var.name_prefix}-kms-logs"
+    Component = "kms"
   })
 }
 
@@ -272,7 +276,7 @@ resource "aws_kms_alias" "logs" {
 
 # KMS Key for RDS storage encryption
 resource "aws_kms_key" "rds" {
-  description             = "KMS key for RDS storage encryption"
+  description             = "NHP ${var.environment} - KMS key for RDS storage encryption"
   deletion_window_in_days = local.is_prod ? 30 : 7
   enable_key_rotation     = true
 
@@ -313,7 +317,8 @@ resource "aws_kms_key" "rds" {
   })
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-rds"
+    Name      = "${var.name_prefix}-kms-rds"
+    Component = "kms"
   })
 }
 

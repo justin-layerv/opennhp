@@ -3,7 +3,7 @@
 # Generate TLS certificates for etcd and store in AWS Secrets Manager
 #
 # Usage:
-#   ./scripts/generate-etcd-certs.sh staging
+#   ./scripts/generate-etcd-certs.sh sandbox
 #   ./scripts/generate-etcd-certs.sh prod
 #
 # Prerequisites:
@@ -27,12 +27,12 @@ NC='\033[0m' # No Color
 ENVIRONMENT="${1:-}"
 if [[ -z "$ENVIRONMENT" ]]; then
     echo -e "${RED}Error: Environment required${NC}"
-    echo "Usage: $0 <staging|prod>"
+    echo "Usage: $0 <sandbox|prod>"
     exit 1
 fi
 
-if [[ "$ENVIRONMENT" != "staging" && "$ENVIRONMENT" != "prod" ]]; then
-    echo -e "${RED}Error: Environment must be 'staging' or 'prod'${NC}"
+if [[ "$ENVIRONMENT" != "sandbox" && "$ENVIRONMENT" != "prod" ]]; then
+    echo -e "${RED}Error: Environment must be 'sandbox' or 'prod'${NC}"
     exit 1
 fi
 

@@ -12,11 +12,13 @@ resource "random_password" "master" {
 # ==================== Secrets Manager ====================
 
 resource "aws_secretsmanager_secret" "rds" {
-  name       = "${var.name_prefix}-rds-credentials"
-  kms_key_id = var.secrets_kms_key_arn
+  name        = "${var.name_prefix}-rds-credentials"
+  description = "NHP ${var.environment} Aurora PostgreSQL credentials"
+  kms_key_id  = var.secrets_kms_key_arn
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-rds-credentials"
+    Name      = "${var.name_prefix}-rds-credentials"
+    Component = "rds"
   })
 }
 
@@ -40,11 +42,12 @@ resource "aws_secretsmanager_secret_version" "rds" {
 
 resource "aws_security_group" "rds" {
   name        = "${var.name_prefix}-rds"
-  description = "Security group for Aurora PostgreSQL"
+  description = "Security group for NHP Aurora PostgreSQL"
   vpc_id      = var.vpc_id
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-rds"
+    Name      = "${var.name_prefix}-sg-rds"
+    Component = "rds"
   })
 }
 
@@ -94,7 +97,8 @@ resource "aws_db_subnet_group" "main" {
   subnet_ids = var.private_subnet_ids
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-rds"
+    Name      = "${var.name_prefix}-rds-subnet-group"
+    Component = "rds"
   })
 }
 
@@ -117,7 +121,8 @@ resource "aws_rds_cluster_parameter_group" "main" {
   }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-aurora-pg16"
+    Name      = "${var.name_prefix}-aurora-pg16"
+    Component = "rds"
   })
 }
 
@@ -162,7 +167,8 @@ resource "aws_rds_cluster" "main" {
   enabled_cloudwatch_logs_exports = ["postgresql"]
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-aurora"
+    Name      = "${var.name_prefix}-aurora-cluster"
+    Component = "rds"
   })
 
   lifecycle {
@@ -192,7 +198,8 @@ resource "aws_rds_cluster_instance" "main" {
   apply_immediately = var.environment != "prod"
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-aurora-instance-1"
+    Name      = "${var.name_prefix}-aurora-instance-1"
+    Component = "rds"
   })
 }
 
@@ -215,7 +222,8 @@ resource "aws_iam_role" "rds_monitoring" {
   })
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-rds-monitoring"
+    Name      = "${var.name_prefix}-rds-monitoring"
+    Component = "rds"
   })
 }
 

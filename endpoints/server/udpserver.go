@@ -232,8 +232,15 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	// load asp resources and plugins
 	s.pluginHandlerMap = make(map[string]plugins.PluginHandler)
 	if s.etcdConn != nil {
-		// load nhp server
+		// load nhp server config from etcd
 		s.loadRemoteConfig()
+
+		// Load AC registry - per-instance AC keys registered dynamically
+		// This watches /nhp/ac-registry/ prefix for AC registrations
+		if err := s.loadACRegistry(); err != nil {
+			log.Error("Failed to load AC registry: %v", err)
+			// Continue anyway - ACs from etcd config will still work
+		}
 	} else {
 		// load peers
 		s.loadPeers()

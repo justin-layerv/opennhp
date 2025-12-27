@@ -95,17 +95,17 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	log.Info("=== RELEASE %s                       ===", version.BuildTime)
 	log.Info("=========================================================")
 
-	// load remote config,init etcd client
-	err = a.initRemoteConn()
-	if err == nil && a.etcdConn == nil {
-		// init config
-		err = a.loadBaseConfig()
-	} else {
-		// nhp ac base config must be loaded first.
-		err = a.loadRemoteBaseConfig()
-	}
+	// ALWAYS load local base config first (private key must come from local file)
+	err = a.loadBaseConfig()
 	if err != nil {
 		return err
+	}
+
+	// Init etcd client if remote.toml exists
+	err = a.initRemoteConn()
+	if err != nil {
+		log.Error("failed to initialize etcd connection: %v", err)
+		// Continue with local config if etcd init fails
 	}
 
 	switch a.config.FilterMode {

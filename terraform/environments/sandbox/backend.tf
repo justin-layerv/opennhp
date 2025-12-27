@@ -1,15 +1,10 @@
 # Remote state backend configuration
 # Consistent with layerv/traefik-plugins terraform patterns
-#
-# NOTE: State key uses "staging" for backwards compatibility with existing
-# resources. Resource names also use "staging" (layerv-nhp-staging-*) to
-# avoid destructive recreates. "sandbox" and "staging" refer to the same
-# environment at LayerV.
 
 terraform {
   backend "s3" {
     bucket         = "layerv-terraform-state-767397897469"
-    key            = "nhp/staging/terraform.tfstate"
+    key            = "nhp/sandbox/terraform.tfstate"
     region         = "us-east-2"
     dynamodb_table = "terraform-state-lock"
     encrypt        = true

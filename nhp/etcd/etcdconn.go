@@ -76,6 +76,9 @@ func (conn *EtcdConn) InitClient() error {
 }
 
 func (conn *EtcdConn) GetValue() ([]byte, error) {
+	if conn.client == nil {
+		return nil, errors.New("etcd client not initialized")
+	}
 	val, err := conn.client.Get(conn.ctx, conn.Key)
 	if err != nil {
 		return nil, err
@@ -127,6 +130,63 @@ func (conn *EtcdConn) Close() {
 		// stop the etcd watcher
 		close(conn.signals.stop)
 		conn.client.Close()
+	}
+}
+
+// GetPrefix retrieves all key-value pairs with the given prefix
+func (conn *EtcdConn) GetPrefix(prefix string) (map[string][]byte, error) {
+	if conn.client == nil {
+		return nil, errors.New("etcd client not initialized")
+	}
+	resp, err := conn.client.Get(conn.ctx, prefix, clientv3.WithPrefix())
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string][]byte)
+	for _, kv := range resp.Kvs {
+		result[string(kv.Key)] = kv.Value
+	}
+	return result, nil
+}
+
+// WatchPrefixCallbacks defines callbacks for prefix watching
+type WatchPrefixCallbacks struct {
+	OnPut    func(key string, value []byte)
+	OnDelete func(key string)
+}
+
+// WatchPrefix watches all keys with the given prefix for changes
+// This is used for dynamic AC registry watching
+func (conn *EtcdConn) WatchPrefix(prefix string, callbacks WatchPrefixCallbacks) {
+	if conn.client == nil {
+		log.Error("etcd client not initialized, cannot watch prefix")
+		return
+	}
+	watcher := clientv3.NewWatcher(conn.client)
+
+	watchChan := watcher.Watch(context.Background(), prefix, clientv3.WithPrefix())
+
+	for {
+		select {
+		case resp := <-watchChan:
+			for _, ev := range resp.Events {
+				key := string(ev.Kv.Key)
+				switch ev.Type {
+				case clientv3.EventTypePut:
+					if callbacks.OnPut != nil {
+						callbacks.OnPut(key, ev.Kv.Value)
+					}
+				case clientv3.EventTypeDelete:
+					if callbacks.OnDelete != nil {
+						callbacks.OnDelete(key)
+					}
+				}
+			}
+		case <-conn.signals.stop:
+			watcher.Close()
+			return
+		}
 	}
 }
 

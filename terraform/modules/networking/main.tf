@@ -34,7 +34,8 @@ resource "aws_vpc" "main" {
   enable_dns_support   = true
 
   tags = merge(var.tags, {
-    Name = var.name_prefix
+    Name      = "${var.name_prefix}-vpc"
+    Component = "networking"
   })
 }
 
@@ -43,7 +44,8 @@ resource "aws_internet_gateway" "main" {
   vpc_id = aws_vpc.main.id
 
   tags = merge(var.tags, {
-    Name = var.name_prefix
+    Name      = "${var.name_prefix}-igw"
+    Component = "networking"
   })
 }
 
@@ -56,8 +58,9 @@ resource "aws_subnet" "public" {
   map_public_ip_on_launch = true
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-public-${local.azs[count.index]}"
-    Type = "public"
+    Name      = "${var.name_prefix}-public-${local.azs[count.index]}"
+    Type      = "public"
+    Component = "networking"
   })
 }
 
@@ -69,8 +72,9 @@ resource "aws_subnet" "private" {
   availability_zone = local.azs[count.index]
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-private-${local.azs[count.index]}"
-    Type = "private"
+    Name      = "${var.name_prefix}-private-${local.azs[count.index]}"
+    Type      = "private"
+    Component = "networking"
   })
 }
 
@@ -82,8 +86,9 @@ resource "aws_subnet" "isolated" {
   availability_zone = local.azs[count.index]
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-isolated-${local.azs[count.index]}"
-    Type = "isolated"
+    Name      = "${var.name_prefix}-isolated-${local.azs[count.index]}"
+    Type      = "isolated"
+    Component = "networking"
   })
 }
 
@@ -93,7 +98,8 @@ resource "aws_eip" "nat" {
   domain = "vpc"
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-nat-${count.index}"
+    Name      = "${var.name_prefix}-nat-eip-${count.index}"
+    Component = "networking"
   })
 }
 
@@ -104,7 +110,8 @@ resource "aws_nat_gateway" "main" {
   subnet_id     = aws_subnet.public[count.index].id
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-nat-${count.index}"
+    Name      = "${var.name_prefix}-nat-gw-${count.index}"
+    Component = "networking"
   })
 
   depends_on = [aws_internet_gateway.main]
@@ -120,11 +127,12 @@ resource "aws_route_table" "public" {
   }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-public"
+    Name      = "${var.name_prefix}-rtb-public"
+    Component = "networking"
   })
 }
 
-# Private Route Tables (one per AZ for prod, shared for dev/staging)
+# Private Route Tables (one per AZ for prod, shared for dev/sandbox)
 resource "aws_route_table" "private" {
   count  = local.is_prod ? 3 : 1
   vpc_id = aws_vpc.main.id
@@ -135,7 +143,8 @@ resource "aws_route_table" "private" {
   }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-private-${count.index}"
+    Name      = "${var.name_prefix}-rtb-private-${count.index}"
+    Component = "networking"
   })
 }
 
@@ -144,7 +153,8 @@ resource "aws_route_table" "isolated" {
   vpc_id = aws_vpc.main.id
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-isolated"
+    Name      = "${var.name_prefix}-rtb-isolated"
+    Component = "networking"
   })
 }
 
@@ -171,14 +181,17 @@ resource "aws_route_table_association" "isolated" {
 
 # VPC Flow Logs
 resource "aws_cloudwatch_log_group" "flow_logs" {
-  name              = "/vpc/${var.name_prefix}/flow-logs"
+  name              = "/layerv/nhp/${var.environment}/vpc-flow-logs"
   retention_in_days = local.is_prod ? 365 : 30
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-vpc-flow-logs"
+    Component = "networking"
+  })
 }
 
 resource "aws_iam_role" "flow_logs" {
-  name = "${var.name_prefix}-flow-logs"
+  name = "${var.name_prefix}-vpc-flow-logs"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -191,7 +204,10 @@ resource "aws_iam_role" "flow_logs" {
     }]
   })
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-vpc-flow-logs"
+    Component = "networking"
+  })
 }
 
 resource "aws_iam_role_policy" "flow_logs" {
@@ -222,7 +238,8 @@ resource "aws_flow_log" "main" {
   max_aggregation_interval = 60
 
   tags = merge(var.tags, {
-    Name = var.name_prefix
+    Name      = "${var.name_prefix}-vpc-flow-log"
+    Component = "networking"
   })
 }
 
@@ -238,14 +255,15 @@ resource "aws_vpc_endpoint" "s3" {
   )
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-s3"
+    Name      = "${var.name_prefix}-vpce-s3"
+    Component = "networking"
   })
 }
 
 resource "aws_security_group" "vpc_endpoints" {
   name_prefix = "${var.name_prefix}-vpce-"
   vpc_id      = aws_vpc.main.id
-  description = "Security group for VPC endpoints"
+  description = "Security group for VPC interface endpoints"
 
   ingress {
     from_port   = 443
@@ -265,7 +283,8 @@ resource "aws_security_group" "vpc_endpoints" {
   }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-vpc-endpoints"
+    Name      = "${var.name_prefix}-sg-vpce"
+    Component = "networking"
   })
 
   lifecycle {
@@ -285,7 +304,8 @@ resource "aws_vpc_endpoint" "interface" {
   private_dns_enabled = true
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-${each.key}"
+    Name      = "${var.name_prefix}-vpce-${each.key}"
+    Component = "networking"
   })
 }
 
@@ -388,7 +408,8 @@ resource "aws_network_acl" "public" {
   }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-public"
+    Name      = "${var.name_prefix}-nacl-public"
+    Component = "networking"
   })
 }
 
@@ -458,7 +479,8 @@ resource "aws_network_acl" "private" {
   }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-private"
+    Name      = "${var.name_prefix}-nacl-private"
+    Component = "networking"
   })
 }
 
@@ -488,6 +510,7 @@ resource "aws_network_acl" "isolated" {
   }
 
   tags = merge(var.tags, {
-    Name = "${var.name_prefix}-isolated"
+    Name      = "${var.name_prefix}-nacl-isolated"
+    Component = "networking"
   })
 }

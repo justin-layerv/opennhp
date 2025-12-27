@@ -223,7 +223,7 @@ Traffic Flows:
 **WAF Rules**:
 | Rule | Priority | Action |
 |------|----------|--------|
-| Rate Limiting | 1 | Block (5000 req/5min prod, 2000 staging) |
+| Rate Limiting | 1 | Block (5000 req/5min prod, 2000 sandbox) |
 | AWS Common Rule Set | 2 | Block malicious requests |
 | Known Bad Inputs | 3 | Block known attack patterns |
 | IP Reputation List | 4 | Block known malicious IPs |
@@ -338,8 +338,8 @@ The `traefik-plugins` repository is responsible for:
 │  2. Build Docker images:                                                    │
 │     - layerv/nhp-server (Dockerfile.server)                                 │
 │     - layerv/nhp-ac (Dockerfile.ac.aws)                                     │
-│  3. Push to ECR (staging account)                                           │
-│  4. Terraform plan/apply (staging)                                          │
+│  3. Push to ECR (sandbox account)                                           │
+│  4. Terraform plan/apply (sandbox)                                          │
 │  5. Trigger NHP Server ASG instance refresh                                 │
 │  6. Trigger AC ASG instance refresh                                         │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -372,11 +372,11 @@ The `traefik-plugins` repository is responsible for:
 
 | Account | Environment | Role | ECR Access |
 |---------|-------------|------|------------|
-| layerv (767397897469) | Staging | Primary - owns ECR repositories | Push + Pull |
-| layerv-prod (TBD) | Production | Secondary - pulls from staging ECR | Pull only |
+| layerv (767397897469) | Sandbox | Primary - owns ECR repositories | Push + Pull |
+| layerv-prod (TBD) | Production | Secondary - pulls from sandbox ECR | Pull only |
 
 **Cross-Account ECR Access**:
-- Configured via `secondary_account_ids` variable in staging
+- Configured via `secondary_account_ids` variable in sandbox
 - Uses explicit account principals (not `Principal: "*"`)
 - Only allows `GetDownloadUrlForLayer`, `BatchGetImage`, `BatchCheckLayerAvailability`
 
@@ -388,7 +388,7 @@ The `traefik-plugins` repository is responsible for:
 - `ETCD_ENDPOINT` - etcd connection string
 
 ### Access Controller
-- `NHP_ENVIRONMENT` - Environment name (staging/prod)
+- `NHP_ENVIRONMENT` - Environment name (sandbox/prod)
 - `NHP_DOMAIN` - Domain for TLS certificate
 - `ACME_EMAIL` - Let's Encrypt registration email
 - `ACME_CA_SERVER` - Let's Encrypt server URL

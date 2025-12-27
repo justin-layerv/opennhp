@@ -332,6 +332,10 @@ func (a *UdpAC) loadRemoteConfig() error {
 	return nil
 }
 
+// loadRemoteBaseConfig is DEPRECATED.
+// Private keys should ALWAYS come from local config.toml, never from etcd.
+// This function is kept for backwards compatibility but should not be used.
+// Use loadBaseConfig() for private key, then loadRemoteConfig() for server peers.
 func (a *UdpAC) loadRemoteBaseConfig() error {
 	var acEtcdConfig ACEtcdConfig
 	value, err := a.etcdConn.GetValue()
@@ -354,9 +358,13 @@ func (a *UdpAC) updateEtcdConfig(content []byte, baseLoad bool) (err error) {
 		return err
 	}
 
-	if baseLoad {
-		a.updateBaseConfig(acEtcdConfig.BaseConfig)
-	}
+	// SECURITY: Never update base config from etcd.
+	// Private keys and base config MUST come from local config.toml.
+	// The baseLoad parameter is ignored for security - etcd should only provide:
+	// - Server peers (for connecting to NHP servers)
+	// - HTTP config (for enabling HTTP endpoint)
+	// The local config.toml contains the per-instance private key generated on boot.
+	_ = baseLoad // Explicitly ignore - base config always from local
 
 	a.updateHttpConfig(acEtcdConfig.HttpConfig)
 	a.updateServerPeers(acEtcdConfig.Servers)
