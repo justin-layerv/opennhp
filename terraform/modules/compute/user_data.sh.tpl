@@ -244,7 +244,7 @@ ExecStartPre=-/usr/bin/docker rm nhp-server
 ExecStart=/usr/bin/docker run --rm --name nhp-server \
   --net=host \
   -v /opt/layerv/nhp-server/etc:/nhp-server/etc:ro \
-  -v /opt/layerv/nhp-server/log:/var/log/nhp \
+  -v /opt/layerv/nhp-server/log:/nhp-server/logs \
   ${server_repo_url}:${image_tag}
 ExecStop=/usr/bin/docker stop nhp-server
 
