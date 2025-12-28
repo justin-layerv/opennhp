@@ -58,6 +58,16 @@ rds_min_capacity        = 0.5
 rds_max_capacity        = 4
 rds_deletion_protection = false # Allow deletion in sandbox
 
+# Traefik plugins - sandbox uses "latest" for automatic updates
+# When traefik-plugins repo deploys, it updates the "latest" version in S3
+# AC instances will pick up the latest plugins on next boot/refresh
+traefik_plugins = {
+  hqdatamiddleware = {
+    version = "latest"
+    config  = {}
+  }
+}
+
 # Production domains - disabled in sandbox
 # qurl.site/qurl.link zones are in layerv-mgmt, requiring cross-account Route 53 access
 # which conflicts with nhp.layerv.xyz in layerv account. Enable in prod environment only.
