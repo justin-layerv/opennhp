@@ -150,3 +150,13 @@ variable "auth_aes_key" {
   default     = null
   sensitive   = true
 }
+
+# ============================================================================
+# Deployment Configuration
+# ============================================================================
+
+variable "image_tag" {
+  description = "Docker image tag to deploy (defaults to 'latest', set to commit SHA for immutable deployments)"
+  type        = string
+  default     = "latest"
+}

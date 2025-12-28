@@ -362,6 +362,8 @@ jobs:
           # Sensitive variables passed via TF_VAR_ environment variables
           TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
+          # Deployment configuration - use commit SHA for immutable deployments
+          TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         run: |
           terraform plan -out=tfplan -no-color 2>&1 | tee plan.txt
 
@@ -448,6 +450,8 @@ jobs:
           # Sensitive variables passed via TF_VAR_ environment variables
           TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
+          # Deployment configuration - use commit SHA for immutable deployments
+          TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         run: terraform apply tfplan
 
       - name: Get Terraform Outputs
@@ -788,6 +792,8 @@ jobs:
           # Sensitive variables passed via TF_VAR_ environment variables
           TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
+          # Deployment configuration - use commit SHA for immutable deployments
+          TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         run: terraform apply tfplan
 
       - name: Get Terraform Outputs

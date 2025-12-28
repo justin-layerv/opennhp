@@ -58,14 +58,14 @@ ECR_REPO="${ac_repo_url}"
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${account_id}.dkr.ecr.${region}.amazonaws.com"
 
 echo "Pulling AC image from ECR..."
-docker pull "$ECR_REPO:latest" || docker pull "$ECR_REPO:${environment}" || {
+docker pull "$ECR_REPO:${image_tag}" || docker pull "$ECR_REPO:${environment}" || {
   echo "ERROR: Could not pull AC image from ECR"
   exit 1
 }
 
 # Extract binaries from Docker image
 echo "Extracting binaries from AC image..."
-CONTAINER_ID=$(docker create "$ECR_REPO:latest")
+CONTAINER_ID=$(docker create "$ECR_REPO:${image_tag}")
 
 # Extract Traefik binary
 docker cp "$CONTAINER_ID:/usr/local/bin/traefik" /usr/local/bin/traefik

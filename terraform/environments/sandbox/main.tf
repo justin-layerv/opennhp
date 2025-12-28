@@ -58,6 +58,9 @@ module "nhp" {
   # Production domains (qurl.site, qurl.link)
   production_domains  = var.production_domains
   production_zone_ids = var.production_zone_ids
+
+  # Deployment configuration
+  image_tag = var.image_tag
 }
 
 # Re-export outputs

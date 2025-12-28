@@ -175,3 +175,10 @@ variable "production_zone_ids" {
   type    = list(string)
   default = []
 }
+
+# Deployment configuration
+variable "image_tag" {
+  description = "Docker image tag for NHP server and AC"
+  type        = string
+  default     = "latest"
+}

@@ -219,3 +219,13 @@ variable "alarm_sns_topic_arn" {
   type        = string
   default     = ""
 }
+
+# ============================================================================
+# Deployment Configuration
+# ============================================================================
+
+variable "image_tag" {
+  description = "Docker image tag to deploy (defaults to 'latest', set to commit SHA for immutable deployments)"
+  type        = string
+  default     = "latest"
+}

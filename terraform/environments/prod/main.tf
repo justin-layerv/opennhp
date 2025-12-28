@@ -27,6 +27,9 @@ module "nhp" {
   acme_email             = var.acme_email
   terraform_state_bucket = var.terraform_state_bucket
   terraform_lock_table   = var.terraform_lock_table
+
+  # Deployment configuration
+  image_tag = var.image_tag
 }
 
 # Re-export outputs

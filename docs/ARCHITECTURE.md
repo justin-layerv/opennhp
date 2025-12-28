@@ -467,7 +467,7 @@ qurl.link ──────────► NLB (us-east-2) ─┬─► NHP Ser
 | Region | us-east-2 | us-east-2 |
 | Server ASG | `layerv-nhp-sandbox-server-asg` | `layerv-nhp-prod-server-asg` |
 | AC ASG | `layerv-nhp-sandbox-ac-asg` | `layerv-nhp-prod-ac-asg` |
-| etcd | `etcd.nhp.sandbox.internal:2379` | `etcd.nhp.prod.internal:2379` |
+| etcd (ECS) | `etcd.nhp.sandbox.internal:2379` | `etcd.nhp.prod.internal:2379` |
 
 ### Network Architecture
 
@@ -496,7 +496,7 @@ qurl.link ──────────► NLB (us-east-2) ─┬─► NHP Ser
                                   ▼
                           ┌─────────────────┐
                           │   etcd Cluster  │
-                          │   (internal)    │
+                          │   (ECS Fargate) │
                           └─────────────────┘
 ```
 
@@ -690,6 +690,16 @@ go test -v -tags=e2e -timeout 5m ./tests/e2e/...
    └── Slack notification
 ```
 
+### Immutable Deployments
+
+Docker images are tagged with the commit SHA (`TF_VAR_image_tag`), not just `latest`. This ensures:
+- Each deployment creates a new launch template version (because user_data changes)
+- Instance refresh correctly detects which instances need replacement
+- Rollbacks are straightforward—just deploy a previous commit SHA
+
+The workflow passes `TF_VAR_image_tag=${{ github.sha }}` to Terraform, which flows through
+to the user_data scripts that pull the specific image version.
+
 ### Known Issues
 
 **Canary Timing:**
@@ -829,18 +839,22 @@ curl -v --cacert /opt/layerv/etcd/certs/ca.crt \
   --key /opt/layerv/etcd/certs/client.key \
   https://etcd.nhp.sandbox.internal:2379/health
 
-# Check etcd instances exist
-AWS_PROFILE=layerv aws ec2 describe-instances \
-  --filters "Name=tag:Name,Values=*etcd*" "Name=instance-state-name,Values=running" \
-  --query 'Reservations[*].Instances[*].{Id:InstanceId,IP:PrivateIpAddress}' --output table
+# Check etcd ECS task (etcd runs in ECS, NOT EC2)
+AWS_PROFILE=layerv aws ecs list-tasks --cluster layerv-nhp-sandbox-etcd \
+  --query 'taskArns' --output text
 
-# Check etcd ASG
-AWS_PROFILE=layerv aws autoscaling describe-auto-scaling-groups \
-  --query 'AutoScalingGroups[?contains(AutoScalingGroupName, `etcd`)].{Name:AutoScalingGroupName,Desired:DesiredCapacity}'
+# Get etcd task details
+AWS_PROFILE=layerv aws ecs describe-tasks --cluster layerv-nhp-sandbox-etcd \
+  --tasks $(aws ecs list-tasks --cluster layerv-nhp-sandbox-etcd --query 'taskArns[0]' --output text) \
+  --query 'tasks[*].{Status:lastStatus,IP:attachments[0].details[?name==`privateIPv4Address`].value|[0]}' --output table
+
+# Check etcd ECS service
+AWS_PROFILE=layerv aws ecs describe-services --cluster layerv-nhp-sandbox-etcd \
+  --services etcd --query 'services[*].{Name:serviceName,Desired:desiredCount,Running:runningCount}'
 ```
 
 **Common etcd issues:**
-- No etcd instances running → Check ASG, launch template
+- No etcd tasks running → Check ECS service, task definition
 - DNS resolves but connection fails → etcd crashed, check etcd logs
 - Cert errors → Missing `/opt/layerv/etcd/certs/` on AC, check Terraform/user-data
 

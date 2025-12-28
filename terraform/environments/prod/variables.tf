@@ -93,3 +93,10 @@ variable "terraform_lock_table" {
   type    = string
   default = "terraform-state-lock"
 }
+
+# Deployment configuration
+variable "image_tag" {
+  description = "Docker image tag for NHP server and AC"
+  type        = string
+  default     = "latest"
+}

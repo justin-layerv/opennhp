@@ -385,6 +385,8 @@ locals {
     auth_url         = var.auth_url
     auth_signing_key = var.auth_signing_key
     auth_aes_key     = var.auth_aes_key
+    # Deployment configuration
+    image_tag = var.image_tag
   })
 }
 

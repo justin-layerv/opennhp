@@ -562,6 +562,8 @@ locals {
     production_domains             = var.production_domains
     # Traefik plugins bucket
     plugin_bucket = aws_s3_bucket.plugins.id
+    # Deployment configuration
+    image_tag = var.image_tag
   })
 }
 

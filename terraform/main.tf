@@ -162,6 +162,9 @@ module "compute" {
   auth_url         = var.auth_url
   auth_signing_key = var.auth_signing_key
   auth_aes_key     = var.auth_aes_key
+
+  # Deployment configuration
+  image_tag = var.image_tag
 }
 
 # Monitoring Module - CloudWatch Dashboard, Alarms, Slack Notifications
@@ -327,4 +330,7 @@ module "ac" {
   cross_account_route53_role_arn = var.cross_account_route53_role_arn
   production_domains             = var.production_domains
   production_zone_ids            = var.production_zone_ids
+
+  # Deployment configuration
+  image_tag = var.image_tag
 }

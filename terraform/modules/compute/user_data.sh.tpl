@@ -227,7 +227,7 @@ SVCEOF
 ECR_REPO="${server_repo_url}"
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${account_id}.dkr.ecr.${region}.amazonaws.com"
 
-docker pull "$ECR_REPO:latest" || docker pull "$ECR_REPO:${environment}" || echo "Warning: Could not pull image"
+docker pull "$ECR_REPO:${image_tag}" || docker pull "$ECR_REPO:${environment}" || echo "Warning: Could not pull image"
 
 cat > /etc/systemd/system/nhp-server.service << SVCEOF
 [Unit]
@@ -245,7 +245,7 @@ ExecStart=/usr/bin/docker run --rm --name nhp-server \
   --net=host \
   -v /opt/layerv/nhp-server/etc:/nhp-server/etc:ro \
   -v /opt/layerv/nhp-server/log:/var/log/nhp \
-  ${server_repo_url}:latest
+  ${server_repo_url}:${image_tag}
 ExecStop=/usr/bin/docker stop nhp-server
 
 [Install]

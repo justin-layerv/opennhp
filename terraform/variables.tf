@@ -355,6 +355,14 @@ variable "console_cookie_domain" {
   default     = ".layerv.ai"
 }
 
+# ==================== Deployment Configuration ====================
+
+variable "image_tag" {
+  description = "Docker image tag for NHP server and AC. Set to git commit SHA for immutable deployments."
+  type        = string
+  default     = "latest"
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {
