@@ -61,6 +61,9 @@ module "nhp" {
 
   # Deployment configuration
   image_tag = var.image_tag
+
+  # Traefik plugins
+  traefik_plugins = var.traefik_plugins
 }
 
 # Re-export outputs

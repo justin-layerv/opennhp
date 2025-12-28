@@ -182,3 +182,13 @@ variable "image_tag" {
   type        = string
   default     = "latest"
 }
+
+# Traefik plugins
+variable "traefik_plugins" {
+  description = "Map of Traefik plugins to deploy"
+  type = map(object({
+    version = string
+    config  = optional(map(string), {})
+  }))
+  default = {}
+}
