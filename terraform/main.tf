@@ -72,6 +72,23 @@ module "kms" {
   tags        = local.common_tags
 }
 
+# Plugins Module - Unified S3 bucket for NHP Server and Traefik plugins
+module "plugins" {
+  source = "./modules/plugins"
+
+  environment = var.environment
+  name_prefix = local.name_prefix
+  tags        = local.common_tags
+
+  # Plugin configurations
+  server_plugins  = var.server_plugins
+  traefik_plugins = var.traefik_plugins
+
+  # GitHub repos that can upload plugins
+  github_org   = var.github_org
+  plugin_repos = var.plugin_repos
+}
+
 # ECR Module - Creates ECR in primary account, references cross-account in secondary
 module "ecr" {
   source = "./modules/ecr"
@@ -90,10 +107,10 @@ module "ecr" {
   # OIDC Provider - set to false if org manages centrally or SCP blocks creation
   create_oidc_provider = var.create_oidc_provider
 
-  # Traefik plugins bucket (from AC module)
-  # Allows traefik-plugins repo to upload plugins to S3
-  enable_plugin_bucket_policy = var.deploy_ac
-  plugin_bucket_arn           = var.deploy_ac ? module.ac[0].plugin_bucket_arn : ""
+  # Plugin bucket (from plugins module)
+  # Allows plugin repos to upload binaries to S3
+  enable_plugin_bucket_policy = true
+  plugin_bucket_arn           = module.plugins.bucket_arn
   traefik_plugins_github_repo = var.traefik_plugins_github_repo
 }
 
@@ -165,6 +182,12 @@ module "compute" {
 
   # Deployment configuration
   image_tag = var.image_tag
+
+  # Plugin configuration (from plugins module)
+  plugin_bucket_name         = module.plugins.bucket_name
+  plugin_bucket_arn          = module.plugins.bucket_arn
+  plugin_download_policy_arn = module.plugins.download_policy_arn
+  server_plugins             = module.plugins.server_plugins
 }
 
 # Monitoring Module - CloudWatch Dashboard, Alarms, Slack Notifications
@@ -333,4 +356,10 @@ module "ac" {
 
   # Deployment configuration
   image_tag = var.image_tag
+
+  # Plugin configuration (from plugins module)
+  plugin_bucket_name         = module.plugins.bucket_name
+  plugin_bucket_arn          = module.plugins.bucket_arn
+  plugin_download_policy_arn = module.plugins.download_policy_arn
+  traefik_plugins            = module.plugins.traefik_plugins
 }

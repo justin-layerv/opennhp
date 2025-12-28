@@ -59,15 +59,25 @@ output "ac_asg_name" {
   value       = var.deploy_ac ? module.ac[0].asg_name : null
 }
 
-# Traefik plugins bucket (for traefik-plugins repo)
+# Plugin bucket (unified for all plugins)
 output "plugin_bucket_name" {
-  description = "S3 bucket name for Traefik plugins"
-  value       = var.deploy_ac ? module.ac[0].plugin_bucket_name : null
+  description = "S3 bucket name for plugins (NHP Server and Traefik)"
+  value       = module.plugins.bucket_name
 }
 
 output "plugin_bucket_arn" {
-  description = "S3 bucket ARN for Traefik plugins"
-  value       = var.deploy_ac ? module.ac[0].plugin_bucket_arn : null
+  description = "S3 bucket ARN for plugins"
+  value       = module.plugins.bucket_arn
+}
+
+output "plugin_upload_policy_arn" {
+  description = "IAM policy ARN for uploading plugins (attach to GitHub Actions role)"
+  value       = module.plugins.upload_policy_arn
+}
+
+output "plugin_download_policy_arn" {
+  description = "IAM policy ARN for downloading plugins (attached to EC2 instance roles)"
+  value       = module.plugins.download_policy_arn
 }
 
 # RDS outputs

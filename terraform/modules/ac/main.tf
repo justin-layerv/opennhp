@@ -289,44 +289,13 @@ resource "aws_cloudwatch_log_group" "ac" {
   })
 }
 
-# ==================== S3 Bucket for Traefik Plugins ====================
-# This bucket stores Traefik plugins that are deployed by the traefik-plugins repo.
-# AC instances fetch plugins from this bucket on boot, ensuring new instances
-# have plugins immediately available (not just via SSM to running instances).
-
-resource "aws_s3_bucket" "plugins" {
-  bucket = "${var.name_prefix}-traefik-plugins"
-
-  tags = merge(var.tags, {
-    Purpose = "Traefik plugins storage"
-  })
-}
-
-resource "aws_s3_bucket_versioning" "plugins" {
-  bucket = aws_s3_bucket.plugins.id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "plugins" {
-  bucket = aws_s3_bucket.plugins.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
-  }
-}
-
-resource "aws_s3_bucket_public_access_block" "plugins" {
-  bucket = aws_s3_bucket.plugins.id
-
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
+# ==================== Plugin Configuration ====================
+# Traefik plugins are now managed by the unified plugins module.
+# This module receives plugin_bucket_name from the plugins module and uses
+# it to download plugins at boot time.
+#
+# Migration note: The old ${var.name_prefix}-traefik-plugins bucket has been
+# replaced by the unified ${var.name_prefix}-plugins bucket from the plugins module.
 
 # IAM Role for AC instances
 resource "aws_iam_role" "ac" {
@@ -349,6 +318,13 @@ resource "aws_iam_role" "ac" {
 resource "aws_iam_role_policy_attachment" "ac_ssm" {
   role       = aws_iam_role.ac.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+# Attach plugin download policy (from plugins module)
+resource "aws_iam_role_policy_attachment" "ac_plugins" {
+  count      = length(var.traefik_plugins) > 0 ? 1 : 0
+  role       = aws_iam_role.ac.name
+  policy_arn = var.plugin_download_policy_arn
 }
 
 resource "aws_iam_role_policy" "ac" {
@@ -479,21 +455,8 @@ resource "aws_iam_role_policy" "ac" {
           }
         }
       },
-      # S3 access for Traefik plugins
-      # AC instances fetch plugins from S3 on boot
-      {
-        Sid    = "PluginBucketRead"
-        Effect = "Allow"
-        Action = [
-          "s3:GetObject",
-          "s3:GetObjectVersion",
-          "s3:ListBucket"
-        ]
-        Resource = [
-          aws_s3_bucket.plugins.arn,
-          "${aws_s3_bucket.plugins.arn}/*"
-        ]
-      }
+      # Note: S3 plugin access is now handled via plugin_download_policy_arn
+      # from the plugins module (attached separately below)
     ]
   })
 }
@@ -572,8 +535,9 @@ locals {
     # Production domains (cross-account ACME)
     cross_account_route53_role_arn = var.cross_account_route53_role_arn
     production_domains             = var.production_domains
-    # Traefik plugins bucket
-    plugin_bucket = aws_s3_bucket.plugins.id
+    # Traefik plugins (from unified plugins module)
+    plugin_bucket_name = var.plugin_bucket_name
+    traefik_plugins    = var.traefik_plugins
     # Deployment configuration
     image_tag = var.image_tag
   })

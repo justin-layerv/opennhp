@@ -363,6 +363,63 @@ variable "image_tag" {
   default     = "latest"
 }
 
+# ==================== Plugin Configuration ====================
+
+variable "server_plugins" {
+  description = <<-EOT
+    Map of NHP Server plugins to deploy.
+    Each plugin specifies:
+    - version: S3 key prefix for plugin binary (e.g., "v1.0.0" or "latest")
+    - config: Map of configuration values rendered to plugin's config.toml
+
+    Example:
+    server_plugins = {
+      passcode = {
+        version = "v1.0.0"
+        config = {
+          ResourceMode = "api"
+          AuthUrl      = "http://console:8888"
+          SigningKey   = "secret-key"
+          AesKey       = "aes-key"
+        }
+      }
+    }
+  EOT
+  type = map(object({
+    version = string
+    config  = map(string)
+  }))
+  default = {}
+}
+
+variable "traefik_plugins" {
+  description = <<-EOT
+    Map of Traefik plugins to deploy.
+    Each plugin specifies:
+    - version: S3 key prefix for plugin files (e.g., "v1.0.0" or "latest")
+    - config: Optional map of configuration values
+
+    Example:
+    traefik_plugins = {
+      nhp-token-validator = {
+        version = "v1.0.0"
+        config  = {}
+      }
+    }
+  EOT
+  type = map(object({
+    version = string
+    config  = optional(map(string), {})
+  }))
+  default = {}
+}
+
+variable "plugin_repos" {
+  description = "List of GitHub repository names that can upload plugins to S3"
+  type        = list(string)
+  default     = ["nhp-plugins-passcode", "nhp-plugins-oidc", "traefik-plugins"]
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {

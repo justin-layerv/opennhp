@@ -1,0 +1,156 @@
+# Example GitHub Actions workflow for Traefik plugins
+# Copy this to .github/workflows/build-and-deploy.yml in your traefik-plugins repo
+#
+# Prerequisites:
+# 1. Terraform must have deployed the plugins module (creates S3 bucket)
+# 2. The traefik-plugins repo must be listed in the plugin_repos variable
+# 3. GitHub OIDC must be configured (ecr module creates the role)
+#
+# S3 Structure:
+# s3://layerv-nhp-{env}-plugins/
+# └── traefik/
+#     └── {plugin-name}/
+#         ├── v1.0.0/
+#         │   ├── .traefik.yml
+#         │   ├── go.mod
+#         │   └── *.go
+#         └── latest/
+#             └── ...
+
+name: Build and Deploy Traefik Plugin
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # Update these for your plugin
+  PLUGIN_NAME: nhp-token-validator
+  GO_VERSION: '1.22'
+  AWS_REGION: us-east-2
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Validate plugin structure
+        run: |
+          # Traefik plugins require specific files
+          if [ ! -f ".traefik.yml" ]; then
+            echo "ERROR: Missing .traefik.yml"
+            exit 1
+          fi
+          if [ ! -f "go.mod" ]; then
+            echo "ERROR: Missing go.mod"
+            exit 1
+          fi
+          echo "Plugin structure validated"
+
+      - name: Run tests
+        run: go test -v ./...
+
+      - name: Create plugin archive
+        run: |
+          # Create archive with all plugin files
+          mkdir -p dist
+          cp -r .traefik.yml go.mod go.sum *.go dist/ 2>/dev/null || true
+          ls -la dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-${{ env.PLUGIN_NAME }}
+          path: dist/
+          retention-days: 7
+
+  deploy-sandbox:
+    needs: build
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: sandbox
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-${{ env.PLUGIN_NAME }}
+          path: plugin
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/nhp-github-actions
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="latest"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Upload to S3 (sandbox)
+        run: |
+          BUCKET="layerv-nhp-sandbox-plugins"
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # Upload all plugin files
+          aws s3 sync plugin/ "s3://$BUCKET/traefik/${{ env.PLUGIN_NAME }}/$VERSION/"
+
+          # Also update 'latest'
+          aws s3 sync plugin/ "s3://$BUCKET/traefik/${{ env.PLUGIN_NAME }}/latest/"
+
+          echo "Uploaded to s3://$BUCKET/traefik/${{ env.PLUGIN_NAME }}/$VERSION/"
+
+  deploy-prod:
+    needs: deploy-sandbox
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-${{ env.PLUGIN_NAME }}
+          path: plugin
+
+      - name: Configure AWS credentials (prod)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID_PROD }}:role/nhp-github-actions
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload to S3 (prod)
+        run: |
+          BUCKET="layerv-nhp-prod-plugins"
+          VERSION="${GITHUB_REF#refs/tags/}"
+
+          aws s3 sync plugin/ "s3://$BUCKET/traefik/${{ env.PLUGIN_NAME }}/$VERSION/"
+          aws s3 sync plugin/ "s3://$BUCKET/traefik/${{ env.PLUGIN_NAME }}/latest/"
+
+          echo "Uploaded to s3://$BUCKET/traefik/${{ env.PLUGIN_NAME }}/$VERSION/"

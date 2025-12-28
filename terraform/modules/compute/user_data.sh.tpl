@@ -229,6 +229,44 @@ aws ecr get-login-password --region "$REGION" | docker login --username AWS --pa
 
 docker pull "$ECR_REPO:${image_tag}" || docker pull "$ECR_REPO:${environment}" || echo "Warning: Could not pull image"
 
+# ============================================================================
+# Download NHP Server Plugins from S3
+# Plugins are uploaded by plugin repo CI/CD, configs rendered by Terraform.
+# ============================================================================
+%{ if plugin_bucket_name != null && length(server_plugins) > 0 }
+echo "Downloading NHP Server plugins from S3..."
+PLUGIN_BUCKET="${plugin_bucket_name}"
+
+%{ for plugin_name, plugin in server_plugins ~}
+echo "Downloading plugin: ${plugin_name} (version: ${plugin.version})"
+mkdir -p /opt/layerv/nhp-server/plugins/${plugin_name}/etc
+
+# Download plugin binary
+aws s3 cp "s3://$PLUGIN_BUCKET/${plugin.binary_key}" \
+  /opt/layerv/nhp-server/plugins/${plugin_name}/main.so \
+  --region "$REGION" || {
+    echo "Warning: Could not download ${plugin_name} plugin binary"
+  }
+
+# Download plugin config (rendered by Terraform)
+aws s3 cp "s3://$PLUGIN_BUCKET/${plugin.config_key}" \
+  /opt/layerv/nhp-server/plugins/${plugin_name}/etc/config.toml \
+  --region "$REGION" || {
+    echo "Warning: Could not download ${plugin_name} plugin config"
+  }
+
+# Set permissions
+chmod 755 /opt/layerv/nhp-server/plugins/${plugin_name}/main.so 2>/dev/null || true
+chmod 644 /opt/layerv/nhp-server/plugins/${plugin_name}/etc/config.toml 2>/dev/null || true
+
+echo "Plugin ${plugin_name} installed"
+%{ endfor ~}
+
+echo "All plugins downloaded from S3"
+%{ else }
+echo "No plugins configured, skipping S3 download"
+%{ endif }
+
 cat > /etc/systemd/system/nhp-server.service << SVCEOF
 [Unit]
 Description=LayerV NHP Server
@@ -245,6 +283,7 @@ ExecStart=/usr/bin/docker run --rm --name nhp-server \
   --net=host \
   -v /opt/layerv/nhp-server/etc:/nhp-server/etc:ro \
   -v /opt/layerv/nhp-server/log:/nhp-server/logs \
+  -v /opt/layerv/nhp-server/plugins:/nhp-server/plugins:ro \
   ${server_repo_url}:${image_tag}
 ExecStop=/usr/bin/docker stop nhp-server
 

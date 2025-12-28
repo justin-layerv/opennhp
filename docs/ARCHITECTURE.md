@@ -131,6 +131,11 @@ Plugins handle different authentication methods. They run inside the NHP Server 
 
 Handles passcode-based authentication for the demo flow.
 
+**⚠️ IMPORTANT: Portal Sites are ONE-TIME USE**
+
+Each passcode can only be used ONCE. After successful validation, the passcode is consumed
+and cannot be reused. Testing requires creating a fresh portal site for each attempt.
+
 **Actions:**
 | Action | URL Parameter | Description |
 |--------|---------------|-------------|
@@ -141,6 +146,55 @@ Handles passcode-based authentication for the demo flow.
 | `access` | `?action=access` | RaaS IAM integration |
 | `auth_code` | `?action=auth_code` | OAuth code exchange |
 | `hmac_auth` | `?action=hmac_auth` | HMAC signature auth |
+
+**Configuration (Manually Provisioned):**
+
+Location: `/home/ubuntu/nhp-server/plugins/passcode/etc/config.toml`
+```toml
+ResourceMode = "api"
+AuthUrl = "http://172.31.26.100:8888"  # Console API on single AC
+```
+
+The plugin calls the Console API to validate passcodes and retrieve target URLs.
+
+**nginx Configuration (Manually Provisioned):**
+
+The qurl.link nginx config on NHP Servers handles initial URL routing:
+
+`/etc/nginx/sites-enabled/qurl.link`:
+```nginx
+server {
+    listen 443 ssl proxy_protocol;
+    server_name qurl.link www.qurl.link;
+
+    # Route /{appId} to passcode plugin with action=login
+    location ~ ^/(?<resid>[^/]+)/?$ {
+        proxy_pass http://127.0.0.1:62206/plugins/passcode?resid=$resid&action=login;
+        # NOTE: Original query params (like ?passcode=) are NOT forwarded
+    }
+
+    location = / { return 404; }
+}
+```
+
+**⚠️ Query Parameter Behavior:**
+
+When nginx specifies a URI in `proxy_pass` (e.g., `/plugins/passcode?resid=$resid&action=login`),
+the original query parameters from the request are **dropped**. This means:
+- `qurl.link/abc123?passcode=secret` → plugin receives only `?resid=abc123&action=login`
+- The passcode is NOT automatically passed to the plugin
+
+**Login Page Flow:**
+
+The passcode plugin's `action=login` returns an HTML login page. When the user submits the form:
+
+1. JavaScript extracts the passcode from the input field
+2. Constructs validation URL: `https://{appId}.secure.layerv.xyz/plugins/passcode?resid={appId}&action=valid&format=json&passcode={passcode}`
+3. Submits to `*.secure.layerv.xyz` (NOT qurl.link)
+4. The `*.secure.layerv.xyz` nginx config has a catch-all `location /` that proxies all paths
+
+This is why the `*.secure.layerv.xyz` nginx config works while qurl.link's specific location doesn't
+need to handle `/plugins/passcode` POST requests.
 
 #### OIDC/Okta Plugin (`nhp-plugins-oidc/`, `endpoints/server/plugins/okta/`)
 
@@ -160,8 +214,9 @@ Handles OAuth2/OIDC authentication with identity providers.
 Traefik runs on AC instances as the reverse proxy with NHP middleware.
 
 **Configuration Locations:**
-- `docker/traefik/` - Container configuration
-- AC instance `/etc/traefik/` - Dynamic config
+- AC instance `/home/ubuntu/traefik/traefik.toml` - Main config
+- AC instance `/home/ubuntu/traefik/dynamic/` - Dynamic config
+- Traefik runs as a **native binary** (`/usr/local/bin/traefik`), NOT in Docker
 
 **NHP Middleware (`traefik-plugins/`):**
 - Validates `nhp_token` cookie on protected requests
@@ -171,6 +226,172 @@ Traefik runs on AC instances as the reverse proxy with NHP middleware.
 **Listens On:**
 - TCP 443 (HTTPS) - TLS termination
 - TCP 80 (HTTP) - Redirect to HTTPS
+
+---
+
+## Plugin Deployment System
+
+The plugin deployment system provides a unified approach for managing NHP Server plugins (Go .so files)
+and Traefik plugins (source files) across all deployment models.
+
+### Deployment Models
+
+| Model | Use Case | Plugin Source |
+|-------|----------|---------------|
+| **Dynamic (S3)** | Terraform-managed infrastructure | Downloaded from S3 at boot |
+| **Static (AMI)** | AWS Marketplace (AC only), air-gapped | Baked into AMI via Packer |
+
+**Note:** Only the AC AMI is distributed via AWS Marketplace. Customers connect to LayerV-managed NHP Servers.
+
+### Architecture
+
+```
+Plugin Repos                    S3 Bucket                    EC2 Instances
+┌──────────────────┐           ┌────────────────────────┐   ┌────────────────┐
+│ nhp-plugins-     │──build───►│ layerv-nhp-{env}-      │   │                │
+│ passcode         │  upload   │ plugins/               │   │ NHP Server     │
+└──────────────────┘           │ ├── nhp-server/        │◄──│ (downloads     │
+                               │ │   ├── passcode/      │   │  at boot)      │
+┌──────────────────┐           │ │   │   └── v1.0.0/    │   │                │
+│ nhp-plugins-     │──build───►│ │   │       └── main.so│   └────────────────┘
+│ oidc             │  upload   │ │   └── oidc/          │
+└──────────────────┘           │ │       └── v1.0.0/    │   ┌────────────────┐
+                               │ ├── traefik/           │   │                │
+┌──────────────────┐           │ │   └── nhp-token-     │◄──│ AC / Traefik   │
+│ traefik-plugins  │──build───►│ │       validator/     │   │ (downloads     │
+│                  │  upload   │ │       └── v1.0.0/    │   │  at boot)      │
+└──────────────────┘           │ └── configs/           │   │                │
+                               │     └── (Terraform-    │   └────────────────┘
+Terraform                      │         rendered)      │
+┌──────────────────┐           └────────────────────────┘
+│ plugins module   │──renders──►configs/*.toml
+│ (version pins)   │
+└──────────────────┘
+```
+
+### S3 Bucket Structure
+
+```
+s3://layerv-nhp-{env}-plugins/
+├── nhp-server/                    # NHP Server Go plugins
+│   ├── passcode/
+│   │   ├── v1.0.0/main.so
+│   │   └── latest/main.so
+│   └── oidc/
+│       └── v1.0.0/main.so
+├── traefik/                       # Traefik source plugins
+│   └── nhp-token-validator/
+│       └── v1.0.0/
+│           ├── .traefik.yml
+│           ├── go.mod
+│           └── *.go
+├── configs/                       # Terraform-rendered configs
+│   ├── nhp-server/
+│   │   ├── passcode/config.toml
+│   │   └── oidc/config.toml
+│   └── traefik/
+│       └── nhp-token-validator/config.toml
+└── manifest.json                  # Plugin versions and S3 keys
+```
+
+### Terraform Configuration
+
+```hcl
+# terraform.tfvars
+server_plugins = {
+  passcode = {
+    version = "v1.0.0"
+    config = {
+      ResourceMode = "api"
+      AuthUrl      = "http://console:8888"
+      SigningKey   = "secret-key"
+      AesKey       = "aes-key"
+    }
+  }
+  oidc = {
+    version = "v2.0.1"
+    config = {
+      ResourceMode       = "api"
+      AuthUrl            = "http://console:8888"
+      AUTH0_DOMAIN       = "dev-xyz.auth0.com"
+      OIDC_CLIENTID      = "client-id"
+      OIDC_CLIENTSECRET  = "client-secret"
+      AUTH0_CALLBACK_URL = "https://example.com/callback"
+    }
+  }
+}
+
+traefik_plugins = {
+  nhp-token-validator = {
+    version = "v1.0.0"
+    config  = {}
+  }
+}
+```
+
+### Plugin CI/CD
+
+Plugin repositories use GitHub Actions with OIDC authentication to upload binaries to S3:
+
+1. **On push to main**: Uploads to `{plugin}/latest/`
+2. **On tag (v1.x.x)**: Uploads to both `{plugin}/{version}/` and `{plugin}/latest/`
+
+The Terraform `plugins` module creates an IAM policy allowing GitHub Actions to upload.
+
+### Packer Templates
+
+Packer templates build AMIs with plugins pre-installed:
+
+| Template | Purpose | Distribution |
+|----------|---------|--------------|
+| `nhp-ac.pkr.hcl` | AC with Traefik plugins | **AWS Marketplace** |
+| `nhp-server.pkr.hcl` | NHP Server | Internal only |
+
+```bash
+# Build AC AMI for Marketplace
+cd packer
+packer init nhp-ac.pkr.hcl
+packer build \
+  -var 'marketplace=true' \
+  -var 'product_version=1.0.0' \
+  -var 'image_tag=v1.0.0' \
+  -var 'plugin_bucket=layerv-nhp-prod-plugins' \
+  -var 'plugin_version=v1.0.0' \
+  nhp-ac.pkr.hcl
+```
+
+**Marketplace AC AMI Features:**
+- Native binaries only (no Docker at runtime)
+- EBS encryption enabled
+- SSH host keys removed (regenerated on boot)
+- No cached credentials
+- First-boot configuration script for customer customization
+
+**Runtime Architecture:**
+AMIs extract binaries from Docker images at build time but run as native systemd services:
+```
+Build Time:  ECR Image → docker cp → /opt/layerv/{component}/binary
+Runtime:     systemd → native binary (no Docker)
+```
+
+### Plugin Testing
+
+Integration tests verify the plugin system after deployment:
+
+```bash
+PLUGIN_BUCKET=layerv-nhp-sandbox-plugins \
+AWS_REGION=us-east-2 \
+go test -v -tags=integration ./tests/integration/... -run TestPlugins
+```
+
+**Tests:**
+| Test | Purpose |
+|------|---------|
+| `TestPlugins_BucketExists` | Verify S3 bucket is accessible |
+| `TestPlugins_ManifestExists` | Verify manifest.json exists and is valid |
+| `TestPlugins_ServerPluginBinariesExist` | Verify .so files are uploaded |
+| `TestPlugins_ServerPluginConfigsExist` | Verify Terraform-rendered configs |
+| `TestPlugins_TraefikPluginsExist` | Verify Traefik plugin files |
 
 ---
 
@@ -304,6 +525,8 @@ If server has wrong AC IP/port or keys don't match:
 
 The marketing website (layerv.ai) uses this flow for the "Cloak URL" demo.
 
+**⚠️ This flow uses the Manually Provisioned infrastructure, NOT Terraform-managed.**
+
 ```
 ┌─────────────┐    POST /api/ps/createPortalSitesByURL    ┌─────────────┐
 │   Website   │ ─────────────────────────────────────────►│   Console   │
@@ -347,16 +570,33 @@ The marketing website (layerv.ai) uses this flow for the "Cloak URL" demo.
 └─────────────┘
 ```
 
-**Key Endpoints:**
-- `POST home.secure.layerv.xyz/api/ps/createPortalSitesByURL` - Create cloaked URL
-- `GET qurl.link/{appId}?passcode={passcode}` - Authenticate with passcode
-- `GET qurl.link/{appId}` - Login page (if no passcode)
+**Key Endpoints (Manually Provisioned):**
+- `POST home.secure.layerv.xyz/api/ps/createPortalSitesByURL` - Create cloaked URL (Console API on 172.31.26.100)
+- `GET qurl.link/{appId}` - Shows login page (⚠️ ?passcode= query param is DROPPED by nginx)
+- `POST {appId}.secure.layerv.xyz/plugins/passcode?action=valid` - Login page JS submits here to validate passcode
 - `GET {appId}.qurl.site/` - Access protected resource
+
+**Detailed Flow:**
+1. **Create Portal Site**: Website calls Console API, receives appId + passcode
+2. **Show Login Page**: User visits qurl.link/{appId}, nginx proxies to plugin with `action=login`, returns HTML form
+3. **Validate Passcode**: Login page JavaScript submits to `{appId}.secure.layerv.xyz` (NOT qurl.link!) with `action=valid`
+4. **Authenticate**: Plugin validates passcode with Console API (ONE-TIME USE - passcode is consumed)
+5. **Open Firewall**: On success, NHP Server sends NHP_AOP to AC to add user's srcIP to ipset
+6. **Set Cookie & Redirect**: Plugin sets nhp_token cookie, redirects to {appId}.qurl.site
+7. **Access Resource**: Traefik validates token, iptables allows srcIP, user sees protected content
 
 **Protected Server Behavior** (`{appId}.qurl.site`):
 - All ports filtered (DROP) by default via iptables
 - Traefik validates `nhp_token` cookie
 - Only authenticated IPs in ipset can connect
+
+**Known Issues (Manually Provisioned Demo):**
+
+| Issue | Status | Description |
+|-------|--------|-------------|
+| Intermittent 404 on first use | Investigating | Fresh passcodes occasionally return nginx 404 on first request |
+| Query params dropped by nginx | By design | nginx qurl.link config drops ?passcode=; login page JS handles submission to different domain |
+| Single Console API instance | Limitation | Console API runs only on AC at 172.31.26.100 - no redundancy |
 
 ---
 
@@ -459,17 +699,87 @@ qurl.link ──────────► NLB (us-east-2) ─┬─► NHP Ser
 
 ## Infrastructure (AWS)
 
-### Environments
+**IMPORTANT:** LayerV has TWO distinct infrastructure setups that must not be confused:
+
+1. **Manually Provisioned (Legacy)** - EC2 instances created manually, used by current production demo
+2. **Terraform-Managed (infra/)** - IaC-managed infrastructure with ASGs, etcd, proper CI/CD
+
+The website demo at `layerv.ai/demo` currently uses the **manually provisioned** infrastructure.
+
+---
+
+### Manually Provisioned Infrastructure (Current Demo)
+
+This legacy setup powers the live demo at https://layerv.ai/demo. It was created manually before
+Terraform was adopted and has different conventions than the Terraform-managed infrastructure.
+
+**Components:**
+
+| Component | Instance IDs | Count |
+|-----------|-------------|-------|
+| NHP Servers | i-0d95881613f4dc5d9, i-00a8e903787a30358, i-0b2cb267606dfcec0 | 3 |
+| NHP ACs | i-00c3328ca9bdb6c8b, i-0c54485f3227b0dcd, i-0eaa92076a0c6481c | 3 |
+| Console API | Runs on AC at 172.31.26.100:8888 | 1 |
+
+**Load Balancers:**
+
+| NLB Name | DNS | Handles |
+|----------|-----|---------|
+| `nlb-secure-layerv-xyz` | - | qurl.link, home.secure.layerv.xyz → NHP Servers |
+| `nlb-apps-layerv-xyz` | - | *.qurl.site → NHP ACs (Traefik) |
+
+**Directory Structure (Manually Provisioned):**
+```
+/home/ubuntu/nhp-server/          # NHP Server installation
+/home/ubuntu/nhp-server/plugins/  # Plugin directories (passcode, etc.)
+/home/ubuntu/nhp-server/logs/     # Server logs
+/etc/nginx/sites-enabled/         # nginx configs (qurl.link, *.secure.layerv.xyz)
+```
+
+**Key Differences from Terraform-managed:**
+- No etcd - configuration is static files
+- No ASG - fixed EC2 instances
+- Console API runs on ONE AC instance only (172.31.26.100)
+- nginx runs on NHP Servers (not Traefik)
+- Different directory paths (/home/ubuntu vs /opt/layerv)
+
+---
+
+### Terraform-Managed Infrastructure (infra/)
+
+Modern IaC-managed infrastructure with proper scaling, etcd for dynamic config, and CI/CD integration.
+
+**Environments:**
 
 | Property | Sandbox | Production |
 |----------|---------|------------|
 | AWS Account | 767397897469 | (different) |
 | Region | us-east-2 | us-east-2 |
+| VPC CIDR | 10.100.0.0/16 | (different) |
 | Server ASG | `layerv-nhp-sandbox-server-asg` | `layerv-nhp-prod-server-asg` |
 | AC ASG | `layerv-nhp-sandbox-ac-asg` | `layerv-nhp-prod-ac-asg` |
 | etcd (ECS) | `etcd.nhp.sandbox.internal:2379` | `etcd.nhp.prod.internal:2379` |
+| NLB | `layerv-nhp-sandbox-nlb` | `layerv-nhp-prod-nlb` |
 
-### Network Architecture
+**Directory Structure (Terraform-managed):**
+```
+/opt/layerv/nhp-server/etc/       # Server config
+/opt/layerv/nhp-server/etc/tls/   # etcd TLS certs
+/opt/layerv/nhp-ac/etc/           # AC config
+/opt/layerv/nhp-ac/logs/          # AC logs
+/opt/layerv/etcd/certs/           # etcd certs (alternative location)
+```
+
+**Key Features:**
+- etcd for dynamic AC registration and configuration
+- ASGs with launch templates for scaling
+- Immutable deployments via Docker image tags
+- CI/CD pipeline with canary deployments
+- Per-AC cryptographic keys stored in Secrets Manager
+
+---
+
+### Network Architecture (Terraform-managed)
 
 ```
                     Internet
@@ -748,7 +1058,7 @@ files at `/nhp-server/logs/server-{date}.log` inside the container. Use `docker 
 AWS_PROFILE=layerv aws ssm send-command \
   --instance-ids i-XXXXXXXXX \
   --document-name "AWS-RunShellScript" \
-  --parameters 'commands=["tail -100 /opt/layerv/nhp-ac/logs/*.log"]' \
+  --parameters 'commands=["tail -100 /opt/layerv/nhp-ac/logs/ac-$(date +%Y-%m-%d).log"]' \
   --output json | jq -r '.Command.CommandId'
 
 # Then get output:
@@ -767,7 +1077,9 @@ AWS_PROFILE=layerv aws ssm send-command \
 **Directly on instance (if SSH/SSM shell access):**
 ```bash
 # AC logs (native binary, file-based)
-tail -f /opt/layerv/nhp-ac/logs/*.log
+tail -f /opt/layerv/nhp-ac/logs/ac-$(date +%Y-%m-%d).log
+# Also check evaluate logs
+tail -f /opt/layerv/nhp-ac/logs/ac-evaluate-$(date +%Y-%m-%d).log
 
 # Server logs - MUST use docker exec (logs are inside container, not stdout)
 docker exec nhp-server tail -f /nhp-server/logs/server-$(date +%Y-%m-%d).log
@@ -784,7 +1096,8 @@ docker ps | grep nhp        # Only shows nhp-server, AC is not containerized
 **File locations on instances:**
 | Component | Runtime | Config Dir | Log Location |
 |-----------|---------|------------|--------------|
-| AC | Native binary | `/opt/layerv/nhp-ac/etc/` | `/opt/layerv/nhp-ac/logs/*.log` |
+| AC | Native binary | `/opt/layerv/nhp-ac/etc/` | `/opt/layerv/nhp-ac/logs/ac-{date}.log` |
+| Traefik | Native binary | `/home/ubuntu/traefik/` | N/A (uses stdout/journald) |
 | Server | Docker container | `/opt/layerv/nhp-server/etc/` | `/nhp-server/logs/server-{date}.log` (inside container) |
 | Server etcd certs | Docker container | `/opt/layerv/nhp-server/etc/tls/` | N/A |
 | AC etcd certs | Native binary | `/opt/layerv/nhp-ac/etc/tls/` | N/A |

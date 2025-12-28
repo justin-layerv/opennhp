@@ -229,3 +229,46 @@ variable "image_tag" {
   type        = string
   default     = "latest"
 }
+
+# ============================================================================
+# Plugin Configuration
+# Traefik plugins are deployed via the unified plugins S3 bucket.
+# ============================================================================
+
+variable "plugin_bucket_name" {
+  description = "Name of the S3 bucket containing plugins (from plugins module)"
+  type        = string
+  default     = null
+}
+
+variable "plugin_bucket_arn" {
+  description = "ARN of the S3 bucket containing plugins (from plugins module)"
+  type        = string
+  default     = null
+}
+
+variable "plugin_download_policy_arn" {
+  description = "ARN of the IAM policy for downloading plugins (from plugins module)"
+  type        = string
+  default     = null
+}
+
+variable "traefik_plugins" {
+  description = <<-EOT
+    Map of Traefik plugins with their S3 keys (from plugins module output).
+    Example:
+    traefik_plugins = {
+      nhp-token-validator = {
+        version    = "v1.0.0"
+        plugin_key = "traefik/nhp-token-validator/v1.0.0/"
+        config_key = null
+      }
+    }
+  EOT
+  type = map(object({
+    version    = string
+    plugin_key = string
+    config_key = optional(string)
+  }))
+  default = {}
+}

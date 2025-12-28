@@ -240,6 +240,13 @@ resource "aws_iam_role_policy_attachment" "server_ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+# Attach plugin download policy (from plugins module)
+resource "aws_iam_role_policy_attachment" "server_plugins" {
+  count      = length(var.server_plugins) > 0 ? 1 : 0
+  role       = aws_iam_role.server.name
+  policy_arn = var.plugin_download_policy_arn
+}
+
 resource "aws_iam_role_policy" "server" {
   name = "server-permissions"
   role = aws_iam_role.server.id
@@ -398,6 +405,9 @@ locals {
     auth_aes_key     = var.auth_aes_key
     # Deployment configuration
     image_tag = var.image_tag
+    # Plugin configuration
+    plugin_bucket_name = var.plugin_bucket_name
+    server_plugins     = var.server_plugins
   })
 }
 

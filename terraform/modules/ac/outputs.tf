@@ -55,15 +55,7 @@ output "instance_role_arn" {
   value       = aws_iam_role.ac.arn
 }
 
-output "plugin_bucket_arn" {
-  description = "S3 bucket ARN for Traefik plugins"
-  value       = aws_s3_bucket.plugins.arn
-}
-
-output "plugin_bucket_name" {
-  description = "S3 bucket name for Traefik plugins"
-  value       = aws_s3_bucket.plugins.id
-}
+# Note: plugin_bucket outputs removed - plugins now managed by unified plugins module
 
 output "ac_secret_arn" {
   description = "ARN of the AC secret containing the private key"

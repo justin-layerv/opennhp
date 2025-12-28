@@ -806,20 +806,41 @@ SVCEOF
 
 # ============================================================================
 # Fetch Traefik Plugins from S3
-# Plugins are uploaded by traefik-plugins repo, fetched here on boot.
+# Plugins are uploaded by traefik-plugins repo, configs rendered by Terraform.
 # This ensures plugins persist across ASG instance refreshes.
 # ============================================================================
-echo "Fetching Traefik plugins from S3..."
-PLUGIN_BUCKET="${plugin_bucket}"
-if [ -n "$PLUGIN_BUCKET" ]; then
-  aws s3 sync "s3://$PLUGIN_BUCKET/" /home/ubuntu/traefik/plugins-local/ --region "$REGION" || {
-    echo "Warning: Could not sync plugins from S3 (bucket may be empty or inaccessible)"
+%{ if plugin_bucket_name != null && length(traefik_plugins) > 0 }
+echo "Downloading Traefik plugins from S3..."
+PLUGIN_BUCKET="${plugin_bucket_name}"
+
+%{ for plugin_name, plugin in traefik_plugins ~}
+echo "Downloading Traefik plugin: ${plugin_name} (version: ${plugin.version})"
+mkdir -p /home/ubuntu/traefik/plugins-local/src/${plugin_name}
+
+# Download plugin files
+aws s3 sync "s3://$PLUGIN_BUCKET/${plugin.plugin_key}" \
+  /home/ubuntu/traefik/plugins-local/src/${plugin_name}/ \
+  --region "$REGION" || {
+    echo "Warning: Could not download ${plugin_name} Traefik plugin"
   }
-  chown -R ubuntu:ubuntu /home/ubuntu/traefik/plugins-local
-  echo "Traefik plugins synced from S3"
-else
-  echo "No plugin bucket configured, skipping S3 sync"
-fi
+
+%{ if plugin.config_key != null ~}
+# Download plugin config (rendered by Terraform)
+aws s3 cp "s3://$PLUGIN_BUCKET/${plugin.config_key}" \
+  /home/ubuntu/traefik/plugins-local/src/${plugin_name}/config.toml \
+  --region "$REGION" || {
+    echo "Warning: Could not download ${plugin_name} plugin config"
+  }
+%{ endif ~}
+
+echo "Traefik plugin ${plugin_name} installed"
+%{ endfor ~}
+
+chown -R ubuntu:ubuntu /home/ubuntu/traefik/plugins-local
+echo "All Traefik plugins downloaded from S3"
+%{ else }
+echo "No Traefik plugins configured, skipping S3 download"
+%{ endif }
 
 # Reload systemd and enable/start all services
 systemctl daemon-reload
