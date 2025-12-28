@@ -282,6 +282,17 @@ resource "aws_iam_role_policy" "server" {
         ]
         Resource = aws_service_discovery_service.server.arn
       },
+      # Route 53 permissions required for Cloud Map DNS integration with custom health checks
+      {
+        Effect = "Allow"
+        Action = [
+          "route53:CreateHealthCheck",
+          "route53:DeleteHealthCheck",
+          "route53:UpdateHealthCheck",
+          "route53:GetHealthCheck"
+        ]
+        Resource = "*"
+      },
       {
         Effect = "Allow"
         Action = [
@@ -446,9 +457,14 @@ resource "aws_launch_template" "server" {
 }
 
 # Auto Scaling Group
+# NHP servers are deployed in PUBLIC subnets because:
+# 1. NHP is a public-facing knock protocol - servers must be reachable from the internet
+# 2. With NLB preserve_client_ip=true, servers must be able to respond directly to clients
+# 3. Security is enforced by the NHP cryptographic protocol, not network isolation
+# 4. Security group restricts access to only UDP 62206 (NHP) and TCP 22 (SSH from VPC)
 resource "aws_autoscaling_group" "server" {
   name                = "${var.name_prefix}-server"
-  vpc_zone_identifier = var.private_subnet_ids
+  vpc_zone_identifier = var.public_subnet_ids
   min_size            = var.min_capacity
   max_size            = var.max_capacity
   desired_capacity    = var.min_capacity
