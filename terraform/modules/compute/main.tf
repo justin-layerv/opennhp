@@ -411,8 +411,10 @@ resource "aws_launch_template" "server" {
     arn = aws_iam_instance_profile.server.arn
   }
 
+  # NHP servers need public IPs for internet access (apt, ECR, etc.)
+  # Security is enforced by security group (only UDP 62206 + SSH from VPC)
   network_interfaces {
-    associate_public_ip_address = false
+    associate_public_ip_address = true
     security_groups             = [aws_security_group.server.id]
   }
 
