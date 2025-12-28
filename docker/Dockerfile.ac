@@ -1,6 +1,7 @@
 # Multi-stage build for NHP Access Controller
 # Stage 1: Build the NHP AC binary
-FROM golang:1.24-bookworm AS builder
+ARG GO_VERSION=1.24
+FROM golang:${GO_VERSION}-bookworm AS builder
 
 WORKDIR /nhp-server
 
@@ -13,6 +14,8 @@ RUN apt-get update && apt-get install -y \
 
 # Copy source code
 COPY . .
+
+RUN echo "Building for architecture: ${TARGETARCH}"
 
 # Build the AC
 RUN make init acd

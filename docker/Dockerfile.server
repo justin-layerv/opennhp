@@ -23,6 +23,8 @@ RUN cd endpoints && go mod download
 # Copy source code
 COPY . .
 
+RUN echo "Building for architecture: ${TARGETARCH}"
+
 # Build the server
 RUN make init serverd plugins
 
