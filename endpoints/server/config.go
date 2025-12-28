@@ -371,6 +371,10 @@ func (s *UdpServer) initRemoteConn() error {
 
 }
 
+// loadRemoteBaseConfig is DEPRECATED.
+// Private keys and base config should ALWAYS come from local config.toml, never from etcd.
+// This function is kept for backwards compatibility but should not be used.
+// Use loadBaseConfig() for private key/LogLevel, then loadRemoteConfig() for server peers.
 func (s *UdpServer) loadRemoteBaseConfig() error {
 	var serverEtcdConfig ServerEtcdConfig
 	value, err := s.etcdConn.GetValue()
@@ -415,9 +419,14 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 		log.Error("failed to unmarshal remote config: %v", err)
 		return err
 	}
-	if baseLoad {
-		s.updateBaseConfig(serverEtcdConfig.BaseConfig)
-	}
+
+	// SECURITY: Never update base config from etcd.
+	// Private keys, LogLevel, and base config MUST come from local config.toml.
+	// The etcd config typically doesn't have BaseConfig fields, so TOML unmarshaling
+	// defaults them to Go's zero values (LogLevel=0, etc.) which would override local settings.
+	// The local config.toml contains the per-instance private key and operational settings.
+	_ = baseLoad // Explicitly ignore - base config always from local
+
 	s.updateHttpConfig(serverEtcdConfig.HttpConfig)
 	s.updateACPeers(serverEtcdConfig.ACs)
 	s.updateAgentPeers(serverEtcdConfig.Agents)
