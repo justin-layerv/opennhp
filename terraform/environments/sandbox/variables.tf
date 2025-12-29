@@ -202,3 +202,60 @@ variable "traefik_plugins" {
   }))
   default = {}
 }
+
+# Plugin repos - repos that can assume the GitHub Actions role
+variable "plugin_repos" {
+  description = "Additional GitHub repos that can assume the GitHub Actions role"
+  type        = list(string)
+  default     = []
+}
+
+# Demo Gateway configuration
+variable "deploy_demo_gateway" {
+  description = "Deploy the Demo Gateway for qurl.link routing"
+  type        = bool
+  default     = false
+}
+
+variable "demo_gateway_domain" {
+  description = "Domain name for Demo Gateway (e.g., qurl.link)"
+  type        = string
+  default     = null
+}
+
+variable "demo_gateway_hosted_zone_id" {
+  description = "Route 53 hosted zone ID for Demo Gateway domain"
+  type        = string
+  default     = null
+}
+
+variable "demo_gateway_fallback_url" {
+  description = "URL to redirect to when no appId is provided"
+  type        = string
+  default     = "https://layerv.ai/demo"
+}
+
+variable "cross_account_route53_role_arn" {
+  description = "IAM role ARN for cross-account Route 53 access"
+  type        = string
+  default     = null
+}
+
+# Console EC2 configuration
+variable "deploy_console_ec2" {
+  description = "Deploy Console on EC2"
+  type        = bool
+  default     = false
+}
+
+variable "console_ec2_domain" {
+  description = "Domain name for Console EC2 (e.g., console.nhp.layerv.xyz)"
+  type        = string
+  default     = null
+}
+
+variable "console_cookie_domain" {
+  description = "Cookie domain for Console (e.g., .layerv.xyz)"
+  type        = string
+  default     = null
+}

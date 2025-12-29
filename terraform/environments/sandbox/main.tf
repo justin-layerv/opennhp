@@ -67,6 +67,21 @@ module "nhp" {
 
   # Traefik plugins
   traefik_plugins = var.traefik_plugins
+
+  # Plugin repos - repos that can assume the GitHub Actions role
+  plugin_repos = var.plugin_repos
+
+  # Demo Gateway
+  deploy_demo_gateway            = var.deploy_demo_gateway
+  demo_gateway_domain            = var.demo_gateway_domain
+  demo_gateway_hosted_zone_id    = var.demo_gateway_hosted_zone_id
+  demo_gateway_fallback_url      = var.demo_gateway_fallback_url
+  cross_account_route53_role_arn = var.cross_account_route53_role_arn
+
+  # Console EC2
+  deploy_console_ec2 = var.deploy_console_ec2
+  console_ec2_domain = var.console_ec2_domain
+  console_cookie_domain = var.console_cookie_domain
 }
 
 # Re-export outputs
@@ -138,4 +153,35 @@ output "rds_secret_arn" {
 
 output "rds_database_name" {
   value = module.nhp.rds_database_name
+}
+
+# Console EC2 outputs
+output "console_ec2_nlb_dns" {
+  value = module.nhp.console_ec2_nlb_dns
+}
+
+output "console_ec2_api_endpoint" {
+  value = module.nhp.console_ec2_api_endpoint
+}
+
+output "console_ec2_asg_name" {
+  value = module.nhp.console_ec2_asg_name
+}
+
+# Demo Gateway outputs
+output "demo_gateway_nlb_dns" {
+  value = module.nhp.demo_gateway_nlb_dns
+}
+
+output "demo_gateway_fqdn" {
+  value = module.nhp.demo_gateway_fqdn
+}
+
+output "demo_gateway_asg_name" {
+  value = module.nhp.demo_gateway_asg_name
+}
+
+# Console repo
+output "console_repo_url" {
+  value = module.nhp.console_repo_url
 }
