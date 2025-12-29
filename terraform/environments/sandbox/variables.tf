@@ -183,14 +183,11 @@ variable "image_tag" {
   default     = "latest"
 }
 
-# NHP Server plugins
+# NHP Server plugins - statically compiled into server binary
 variable "server_plugins" {
-  description = "Map of NHP Server plugins to deploy (passcode, oidc)"
-  type = map(object({
-    version = string
-    config  = map(string)
-  }))
-  default = {}
+  description = "List of NHP Server plugins to enable (plugins are compiled into the server)"
+  type        = list(string)
+  default     = []
 }
 
 # Traefik plugins

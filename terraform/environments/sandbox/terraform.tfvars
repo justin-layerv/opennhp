@@ -58,31 +58,11 @@ rds_min_capacity        = 0.5
 rds_max_capacity        = 4
 rds_deletion_protection = false # Allow deletion in sandbox
 
-# NHP Server plugins - sandbox uses "latest" for automatic updates
-# When plugin repos deploy, they update the "latest" version in S3
-# Server instances will pick up the latest plugins on next boot/instance refresh
-#
-# NOTE: Sensitive config values (SigningKey, AesKey) should be passed via:
-#   TF_VAR_auth_signing_key and TF_VAR_auth_aes_key GitHub Secrets
-#
-# Plugins will be downloaded from: s3://layerv-nhp-sandbox-plugins/nhp-server/{plugin}/latest/main.so
-server_plugins = {
-  passcode = {
-    version = "latest"
-    config = {
-      ResourceMode = "api"
-      # AuthUrl is set at server level (auth_url variable)
-      # SigningKey and AesKey are passed via TF_VAR_ secrets
-    }
-  }
-  # oidc plugin - uncomment when needed
-  # oidc = {
-  #   version = "latest"
-  #   config = {
-  #     ResourceMode = "api"
-  #   }
-  # }
-}
+# NHP Server plugins - statically compiled into server binary
+# This list specifies which AuthSvcIds are valid for authentication
+# Plugins are compiled in at build time - no S3 download needed
+server_plugins = ["passcode"]
+# Add "oktaoidc" when OIDC authentication is needed
 
 # Traefik plugins - sandbox uses "latest" for automatic updates
 # When traefik-plugins repo deploys, it updates the "latest" version in S3
@@ -95,8 +75,8 @@ traefik_plugins = {
 }
 
 # Repos that can assume the GitHub Actions IAM role
-# Includes plugin repos AND console for Docker builds
-plugin_repos = ["nhp-plugins-passcode", "nhp-plugins-oidc", "traefik-plugins", "console"]
+# NHP server plugins are now compiled in - only Traefik plugins use S3
+plugin_repos = ["traefik-plugins", "console"]
 
 # Production domains - disabled in sandbox
 # qurl.site/qurl.link zones are in layerv-mgmt, requiring cross-account Route 53 access

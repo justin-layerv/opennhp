@@ -18,14 +18,15 @@ LayerV spans multiple repositories:
 
 | Repository | Purpose | Key Components |
 |------------|---------|----------------|
-| `nhp` | Core NHP infrastructure | AC, Server, Terraform, CI/CD |
+| `nhp` | Core NHP infrastructure | AC, Server, Terraform, CI/CD, Server Plugins |
 | `console` | Management UI & API | Portal Sites API, User management |
 | `website` | Marketing site (layerv.ai) | Demo UI (CloakDemo component) |
 | `demo` | Demo applications | OIDC demo, login page |
-| `nhp-plugins-passcode` | Passcode auth plugin | URL validation, token generation |
-| `nhp-plugins-oidc` | OIDC auth plugin | Okta integration |
 | `traefik-plugins` | Traefik middleware | NHP token validation |
 | `StealthDNS` | DNS-level protection | (separate system) |
+
+> **Note:** Server plugins (passcode, oidc) are now statically compiled into the NHP Server binary.
+> The `nhp-plugins-passcode` and `nhp-plugins-oidc` repos are deprecated.
 
 ---
 
@@ -133,9 +134,12 @@ GET  /api/ps/findSiteByApplicationId - Get site by app ID
 
 ### 4. Authentication Plugins
 
-Plugins handle different authentication methods. They run inside the NHP Server process.
+Plugins handle different authentication methods. They run inside the NHP Server process as statically compiled modules.
 
-#### Passcode Plugin (`nhp-plugins-passcode/`)
+> **Note:** Server plugins are now part of the main `nhp` repository at `endpoints/server/plugins/`.
+> They are statically compiled into the server binary—no dynamic loading or `.so` files.
+
+#### Passcode Plugin (`endpoints/server/plugins/passcode/`)
 
 Handles passcode-based authentication for the demo flow.
 
@@ -204,7 +208,7 @@ The passcode plugin's `action=login` returns an HTML login page. When the user s
 This is why the `*.secure.layerv.xyz` nginx config works while qurl.link's specific location doesn't
 need to handle `/plugins/passcode` POST requests.
 
-#### OIDC/Okta Plugin (`nhp-plugins-oidc/`, `endpoints/server/plugins/okta/`)
+#### OIDC/Okta Plugin (`endpoints/server/plugins/oidc/`)
 
 Handles OAuth2/OIDC authentication with identity providers.
 
@@ -243,46 +247,56 @@ NHP uses two types of plugins with different deployment strategies:
 
 | Plugin Type | Deployment | Reason |
 |------------|------------|--------|
-| **NHP Server plugins** | Baked into Docker image | Go plugins require exact version match with host binary |
-| **Traefik plugins** | Downloaded from S3 at boot | Source-based, no binary compatibility issues |
+| **NHP Server plugins** | Statically compiled into server binary | No CGO/dynamic loading needed, simpler deployment |
+| **Traefik plugins** | Downloaded from S3 at boot | Source-based, compiled by Traefik at runtime |
 
-### NHP Server Plugins (Docker-embedded)
+### NHP Server Plugins (Statically Compiled)
 
-Go plugins (`.so` files) are extremely sensitive to Go version mismatches. Even minor differences
-between the plugin and host binary cause runtime errors. To guarantee compatibility, plugins are
-built inside the same Docker image as the NHP Server.
+Server plugins (passcode, oidc, etc.) are statically compiled into the NHP Server binary. This
+eliminates the need for CGO and dynamic plugin loading (`.so` files), resulting in simpler
+cross-compilation and deployment.
 
-**Architecture:**
+**Plugin Registry Architecture:**
 ```
-GitHub Actions                      ECR                         EC2
-┌──────────────────┐               ┌────────────────┐          ┌────────────────┐
-│ nhp repo         │               │ layerv/        │          │                │
-│ build-and-push   │──────────────►│ nhp-server     │─────────►│ NHP Server     │
-│ workflow         │               │ :latest        │ docker   │ (plugins       │
-│                  │               │                │ pull     │  included)     │
-│ ┌──────────────┐ │               │ Contains:      │          │                │
-│ │Dockerfile.   │ │               │ - nhp-serverd  │          └────────────────┘
-│ │server        │ │               │ - passcode.so  │
-│ │              │ │               │ - oidc.so      │
-│ │ builds both  │ │               └────────────────┘
-│ │ server AND   │ │
-│ │ plugins      │ │
-│ └──────────────┘ │
-└──────────────────┘
+endpoints/server/plugins/
+├── registry.go         # Plugin registry (maps IDs to factories)
+├── passcode/           # Passcode authentication plugin
+│   ├── main.go         # Plugin entry, init() registers with registry
+│   └── ...
+└── oidc/               # OIDC/OAuth2 authentication plugin
+    ├── main.go         # Plugin entry, init() registers with registry
+    └── ...
 ```
+
+**How It Works:**
+
+1. Each plugin has an `init()` function that registers itself with the plugin registry:
+   ```go
+   func init() {
+       plugins.RegisterPlugin("passcode", New)
+   }
+   ```
+
+2. The server `main.go` imports plugins with blank imports to trigger registration:
+   ```go
+   import (
+       _ "github.com/OpenNHP/opennhp/endpoints/server/plugins/oidc"
+       _ "github.com/OpenNHP/opennhp/endpoints/server/plugins/passcode"
+   )
+   ```
+
+3. At runtime, the server looks up plugins by `AuthSvcId` from the registry:
+   ```go
+   h := plugins.GetPluginHandler(aspId, "")
+   ```
 
 **Adding a new NHP Server plugin:**
-1. Add git clone + build to `docker/Dockerfile.server`
-2. Add plugin name to `server_plugins` list in terraform.tfvars
-3. Push to trigger CI build and deploy
-
-**Example Dockerfile.server:**
-```dockerfile
-# Build external plugins (same Go environment guarantees compatibility)
-RUN git clone --depth 1 https://github.com/layervai/nhp-plugins-passcode.git /tmp/passcode && \
-    cd /tmp/passcode && \
-    CGO_ENABLED=1 go build -buildmode=plugin -o /nhp-server/release/nhp-server/plugins/passcode/main.so .
-```
+1. Create new directory under `endpoints/server/plugins/{plugin-name}/`
+2. Implement the `PluginHandler` interface
+3. Register the plugin in `init()` using `plugins.RegisterPlugin()`
+4. Add blank import in `endpoints/server/main/main.go`
+5. Add plugin name to `server_plugins` list in terraform.tfvars
+6. Build and deploy
 
 ### Traefik Plugins (S3-based)
 
@@ -307,45 +321,34 @@ s3://layerv-nhp-{env}-plugins/
 
 ```hcl
 # terraform.tfvars
-# NHP Server plugins - just names (binaries baked into Docker image)
-server_plugins = {
-  passcode = { version = "latest", config = {} }
-}
+# NHP Server plugins - list of enabled plugin names (statically compiled)
+server_plugins = ["passcode"]
 
 # Traefik plugins - downloaded from S3
 traefik_plugins = {
-  hqdatamiddleware = { version = "latest", config = {} }
+  nhp-token-validator = { version = "latest", config = {} }
 }
 ```
+
+The `server_plugins` list controls which `AuthSvcId` values are valid for authentication.
+These plugin names map to the statically compiled plugins in the server binary.
 
 ### Plugin CI/CD
 
 | Repo | Plugin Type | Deployment |
 |------|-------------|------------|
-| `nhp` | NHP Server plugins | Built into Docker image via `docker/Dockerfile.server` |
+| `nhp` | NHP Server plugins | Statically compiled into server binary |
 | `traefik-plugins` | Traefik middleware | Uploaded to S3, downloaded by AC at boot |
 
 ```bash
-# Deploy plugin update to running instances
+# Deploy plugin update to running instances (server binary includes all plugins)
 aws autoscaling start-instance-refresh \
   --auto-scaling-group-name layerv-nhp-sandbox-server
 ```
 
 **IAM Trust Policy:**
-The `nhp-{env}-github-actions` IAM role trusts plugin repos via GitHub OIDC.
-Plugin repos are configured in `plugin_repos` variable (passed to ECR module).
-
-### Fail-Fast Plugin Loading
-
-NHP Server instances **fail to start** if a configured plugin cannot be downloaded from S3.
-This ensures instances don't run in a broken state with missing auth plugins.
-
-```bash
-# Error in user_data if plugin missing:
-# "FATAL: One or more plugin downloads failed. Aborting instance startup."
-```
-
-**To fix:** Ensure plugin CI/CD has run and uploaded binaries before deploying instances.
+The `nhp-{env}-github-actions` IAM role trusts repos via GitHub OIDC.
+Plugin repos (for Traefik plugins) are configured in `plugin_repos` variable.
 
 ### Packer Templates
 
@@ -398,9 +401,9 @@ go test -v -tags=integration ./tests/integration/... -run TestPlugins
 |------|---------|
 | `TestPlugins_BucketExists` | Verify S3 bucket is accessible |
 | `TestPlugins_ManifestExists` | Verify manifest.json exists and is valid |
-| `TestPlugins_ServerPluginBinariesExist` | Verify .so files are uploaded |
-| `TestPlugins_ServerPluginConfigsExist` | Verify Terraform-rendered configs |
 | `TestPlugins_TraefikPluginsExist` | Verify Traefik plugin files |
+
+> **Note:** Server plugins are statically compiled—no S3 tests needed for them.
 
 ---
 

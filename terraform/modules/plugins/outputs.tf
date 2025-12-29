@@ -29,16 +29,8 @@ output "download_policy_arn" {
 
 # Plugin Information
 
-output "server_plugins" {
-  description = "Map of configured NHP Server plugins with S3 keys"
-  value = {
-    for k, v in var.server_plugins : k => {
-      version    = v.version
-      binary_key = "nhp-server/${k}/${v.version}/main.so"
-      config_key = "configs/nhp-server/${k}/config.toml"
-    }
-  }
-}
+# Note: NHP Server plugins are now statically compiled into the server binary.
+# No S3 output needed - they're built into the Docker image.
 
 output "traefik_plugins" {
   description = "Map of configured Traefik plugins with S3 keys"

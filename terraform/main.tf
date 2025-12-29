@@ -189,7 +189,7 @@ module "compute" {
   image_tag = var.image_tag
 
   # Plugin configuration (plugins baked into Docker image, just need names for etcd seeding)
-  server_plugins  = keys(var.server_plugins)
+  server_plugins  = var.server_plugins
   auth_service_id = var.ac_auth_service_id
 }
 

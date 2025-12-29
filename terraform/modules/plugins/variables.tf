@@ -19,45 +19,18 @@ variable "tags" {
 
 # ============================================================================
 # NHP Server Plugins (passcode, oidc, etc.)
-# These are Go plugins (.so files) loaded by NHP Server at runtime.
+# These plugins are now statically compiled into the server binary.
+# No S3 storage needed - this variable is kept for compatibility but unused.
 # ============================================================================
 
 variable "server_plugins" {
   description = <<-EOT
-    Map of NHP Server plugins to deploy.
-    Each plugin specifies:
-    - version: S3 key prefix for plugin binary (e.g., "v1.0.0" or "latest")
-    - config: Map of configuration values rendered to plugin's config.toml
-
-    Example:
-    server_plugins = {
-      passcode = {
-        version = "v1.0.0"
-        config = {
-          ResourceMode = "api"
-          AuthUrl      = "http://console:8888"
-          SigningKey   = "secret-key"
-          AesKey       = "aes-key"
-        }
-      }
-      oidc = {
-        version = "v2.0.1"
-        config = {
-          ResourceMode      = "api"
-          AuthUrl           = "http://console:8888"
-          AUTH0_DOMAIN      = "dev-xyz.auth0.com"
-          OIDC_CLIENTID     = "client-id"
-          OIDC_CLIENTSECRET = "client-secret"
-          AUTH0_CALLBACK_URL = "https://example.com/callback"
-        }
-      }
-    }
+    DEPRECATED: NHP Server plugins are now statically compiled.
+    This variable is kept for backwards compatibility but is no longer used.
+    Plugin configuration is handled by the compute module's server_plugins list.
   EOT
-  type = map(object({
-    version = string
-    config  = map(string)
-  }))
-  default = {}
+  type        = any
+  default     = {}
 }
 
 # ============================================================================
@@ -102,11 +75,12 @@ variable "plugin_repos" {
   description = <<-EOT
     List of GitHub repository names that can upload plugins.
     These repos will be granted S3 write access via OIDC.
+    NHP server plugins are now compiled in - only Traefik plugins use S3.
 
-    Example: ["nhp-plugins-passcode", "nhp-plugins-oidc", "traefik-plugins"]
+    Example: ["traefik-plugins"]
   EOT
   type        = list(string)
-  default     = ["nhp-plugins-passcode", "nhp-plugins-oidc", "traefik-plugins"]
+  default     = ["traefik-plugins"]
 }
 
 variable "github_actions_role_arn" {

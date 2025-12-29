@@ -89,25 +89,8 @@ resource "aws_s3_bucket_lifecycle_configuration" "plugins" {
 
 # ==================== Plugin Configs (Rendered by Terraform) ====================
 
-# NHP Server plugin configs
-resource "aws_s3_object" "server_plugin_configs" {
-  for_each = var.server_plugins
-
-  bucket       = aws_s3_bucket.plugins.id
-  key          = "configs/nhp-server/${each.key}/config.toml"
-  content_type = "text/plain"
-
-  # Render config as TOML
-  content = join("\n", concat(
-    ["# ${each.key} plugin configuration", "# Managed by Terraform - do not edit manually", ""],
-    [for k, v in each.value.config : "${k} = \"${v}\""]
-  ))
-
-  tags = merge(var.tags, {
-    Plugin = each.key
-    Type   = "config"
-  })
-}
+# Note: NHP Server plugins are now statically compiled into the server binary.
+# No S3 storage or config files needed for server plugins.
 
 # Traefik plugin configs (if any)
 resource "aws_s3_object" "traefik_plugin_configs" {
@@ -193,8 +176,8 @@ resource "aws_iam_policy" "plugin_download" {
 
 # ==================== Plugin Manifest ====================
 
-# Create a manifest file that lists all configured plugins and versions
-# This is useful for instances to know what to download
+# Create a manifest file that lists all configured Traefik plugins
+# Note: NHP Server plugins are now statically compiled - not in manifest
 resource "aws_s3_object" "manifest" {
   bucket       = aws_s3_bucket.plugins.id
   key          = "manifest.json"
@@ -203,13 +186,8 @@ resource "aws_s3_object" "manifest" {
   content = jsonencode({
     generated_at = timestamp()
     environment  = var.environment
-    server_plugins = {
-      for k, v in var.server_plugins : k => {
-        version    = v.version
-        binary_key = "nhp-server/${k}/${v.version}/main.so"
-        config_key = "configs/nhp-server/${k}/config.toml"
-      }
-    }
+    # NHP Server plugins are now statically compiled into the server binary
+    # No S3 download needed - they're built into the Docker image
     traefik_plugins = {
       for k, v in var.traefik_plugins : k => {
         version    = v.version

@@ -177,13 +177,25 @@ For example, the main functionality to be implemented by the "example" plugin is
 
 The steps for developing the plugin for the NHP server are as follows:
 
-1. Create a new directory for your plugin under NHP/server/plugins. The directory name should be the name of your plugin.
+1. Create a new directory for your plugin under `endpoints/server/plugins/`. The directory name should be the name of your plugin.
 
 2. In the plugin directory, create a new Go file. The file name should be the same as the directory name. For example, for a plugin named myplugin, you would create a file named myplugin.go.
 
-3. Define your plugin functions. Your plugin should have at least one main function that executes the core functionality of the plugin. You can also define auxiliary functions as needed.
+3. Implement the `PluginHandler` interface which requires an `AuthWithHttp` method.
 
-4. Import your plugin in the main application. In the main application file (main.go), import your plugin package and call your plugin functions as needed.
+4. Register your plugin in an `init()` function:
+   ```go
+   func init() {
+       plugins.RegisterPlugin("myplugin", New)
+   }
+   ```
+
+5. Import your plugin in the main application with a blank import. In `endpoints/server/main/main.go`, add:
+   ```go
+   import (
+       _ "github.com/OpenNHP/opennhp/endpoints/server/plugins/myplugin"
+   )
+   ```
 
 Refer to the plug-in function design for code development. Taking the "example" plug-in as an example, the AuthWithHttp function is designed to receive and process HTTP requests, the authRegular function verifies the user name and password and knocks on the door, the authAndShowLogin function loads login page resources, etc., and verification auxiliary functions need to be designed to implement the functions. Expansion and development can be carried out according to specific functional requirements.
 
@@ -197,37 +209,47 @@ Refer to the plug-in function design for code development. Taking the "example" 
 
 ## 3.5 Plugin Compilation Testing and Deployment
 
-Testing and deployment of the plugin are crucial steps to ensure the completeness and stability of plugin functionality. Through local environment testing and optimization, developers can deploy the plugin in a way that ensures the correctness of its functionality. In the production environment, the plugin must be accurately configured, combined with security and operation strategies, to ensure that it meets business needs and runs stably in real applications. The specific steps are as follows:
+Testing and deployment of the plugin are crucial steps to ensure the completeness and stability of plugin functionality. Through local environment testing and optimization, developers can deploy the plugin in a way that ensures the correctness of its functionality.
 
 **1. Plugin Compilation**
 
-The compilation process ensures that the plugin's code is consistent with the main project, while the task dependencies in the Makefile ensure that the plugin's build process is closely integrated with the main system's compilation, achieving an integrated build and release process. The specific steps are as follows:
+NHP Server plugins are **statically compiled** into the server binary. This means there are no separate `.so` plugin files—plugins are part of the main server executable.
 
-***Define Plugin Directory***: At the top of the Makefile, we can see a line of code defining the plugin directory, as shown in the image below:
+**Plugin Registration Pattern:**
 
-![Define Plugin Directory](/images/plugin_image11.png) 
+Each plugin uses Go's `init()` function to register itself with a central plugin registry:
 
-***Figure 7 Define Plugin Directory***
+```go
+package myplugin
 
-This line of code specifies the storage location of the plugin, which is the server/plugins directory. All plugin source codes and configuration files will be placed in this directory. When starting the NHP service, to ensure the plugin loads correctly, the plugin file path needs to be configured in the NHP-Server's etc/resource.toml configuration file.
+import "github.com/OpenNHP/opennhp/endpoints/server/plugins"
 
-![Plugin File Path Configuration](/images/plugin_image12.png) 
+const PluginID = "myplugin"
 
-***Figure 8 Plugin File Path Configuration***
+func init() {
+    plugins.RegisterPlugin(PluginID, New)
+}
 
-***Generate Version Information and Start Build***: The generate-version-and-build task includes a series of steps to generate version numbers, commit IDs, build times, and other information. This information is helpful for tracking the version and build status of the plugin.
+func New(params map[string]string) plugins.PluginHandler {
+    return &MyPlugin{...}
+}
+```
 
-***Plugin Compilation Logic***: In the Makefile, the plugins: task is responsible for executing the plugin compilation, as shown in the image below:
+**Blank Imports:**
 
-![Plugin Compilation Task plugins](/images/plugin_image13.png) 
+The server's `main.go` imports plugins using blank imports to trigger their `init()` functions:
 
-***Figure 9 Plugin Compilation Task plugins***
+```go
+import (
+    _ "github.com/OpenNHP/opennhp/endpoints/server/plugins/passcode"
+    _ "github.com/OpenNHP/opennhp/endpoints/server/plugins/oidc"
+    _ "github.com/OpenNHP/opennhp/endpoints/server/plugins/myplugin"  // Add your plugin
+)
+```
 
-Plugin Directory Check: test -d $(NHP_SERVER_PLUGINS) checks if the defined plugin directory (server/plugins) exists.
+**Build Process:**
 
-Execute Compilation: If the plugin directory exists, $(MAKE) -C $(NHP_SERVER_PLUGINS) enters that directory and executes the Makefile within it, performing the compilation operation for the plugin.
-
-***Overall Compilation Process***: During the overall project build process (Linux and macOS: run the script make in the root directory; Windows: run the BAT file build.bat in the root directory), the plugins task in the Makefile will be called. If the plugin directory exists and is valid, the plugin's Makefile will be executed to complete the plugin's build. During compilation, plugin binary files or other forms of output files may be generated for use by the NHP server.
+Simply build the server with `make serverd` or `CGO_ENABLED=0 go build`. Your plugin code is compiled directly into the server binary—no separate plugin compilation step needed.
 
 **2. Local Environment Function Testing**
 
@@ -249,15 +271,24 @@ After local environment testing passes, developers need to confirm and optimize 
 
 **4. Configuration and Deployment in Actual Application Scenarios**
 
-Once local testing and optimization are complete, the plugin can proceed to the deployment phase in actual application scenarios. To deploy your plugin, simply build and run the main application. Your plugin will be included in the build and will be available when the server runs. During plugin deployment, it is usually necessary to configure according to the specific needs of the application scenario. The specific steps are as follows:
+Once local testing and optimization are complete, the plugin can proceed to the deployment phase. Since plugins are statically compiled into the server binary, deployment is straightforward:
 
-***Deployment Environment Preparation***: Ensure that the server configuration in the production environment is consistent or close to that of the local testing environment, including the operating system, network configuration, dependency libraries, etc.
+***Build and Deploy***:
+1. Add your plugin's blank import to `endpoints/server/main/main.go`
+2. Build the server: `make serverd` or `CGO_ENABLED=0 go build`
+3. Deploy the new server binary (Docker image or native binary)
 
-***Plugin Installation and Configuration***: Deploy the tested plugin code to the production server, configuring it according to the requirements of the actual application scenario, including plugin paths, interface addresses, access control server addresses, authentication mechanisms, etc.
+***Terraform Configuration***:
+Add your plugin to the `server_plugins` list in `terraform.tfvars`:
+```hcl
+server_plugins = ["passcode", "oidc", "myplugin"]
+```
+
+This list defines which `AuthSvcId` values are valid for authentication.
 
 ***Logging and Monitoring Setup***: After deployment, improve log level configuration to facilitate timely detection and resolution of issues during actual application.
 
-***Start NHP Service to Check Plugin Loading Status***: Start the NHP service according to the NHP service startup process, check the plugin loading status based on the log files in the log directory, and verify whether the plugin functions normally according to the local plugin testing process.
+***Verify Plugin Loading***: Check server logs for plugin registration messages. The plugin registry logs which plugins are registered at startup.
 
 **5. Production Environment Validation and Maintenance**
 

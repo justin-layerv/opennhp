@@ -367,29 +367,15 @@ variable "image_tag" {
 
 variable "server_plugins" {
   description = <<-EOT
-    Map of NHP Server plugins to deploy.
-    Each plugin specifies:
-    - version: S3 key prefix for plugin binary (e.g., "v1.0.0" or "latest")
-    - config: Map of configuration values rendered to plugin's config.toml
+    List of NHP Server plugins to enable.
+    Plugins are statically compiled into the server binary.
+    This list specifies which AuthSvcIds are valid for authentication.
 
     Example:
-    server_plugins = {
-      passcode = {
-        version = "v1.0.0"
-        config = {
-          ResourceMode = "api"
-          AuthUrl      = "http://console:8888"
-          SigningKey   = "secret-key"
-          AesKey       = "aes-key"
-        }
-      }
-    }
+    server_plugins = ["passcode", "oktaoidc"]
   EOT
-  type = map(object({
-    version = string
-    config  = map(string)
-  }))
-  default = {}
+  type        = list(string)
+  default     = []
 }
 
 variable "traefik_plugins" {
@@ -415,9 +401,9 @@ variable "traefik_plugins" {
 }
 
 variable "plugin_repos" {
-  description = "List of GitHub repository names that can upload plugins to S3"
+  description = "List of GitHub repository names that can upload plugins to S3 (Traefik plugins only - NHP server plugins are now compiled in)"
   type        = list(string)
-  default     = ["nhp-plugins-passcode", "nhp-plugins-oidc", "traefik-plugins"]
+  default     = ["traefik-plugins"]
 }
 
 # ==================== Demo Gateway Configuration ====================
