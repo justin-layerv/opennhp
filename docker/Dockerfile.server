@@ -5,11 +5,9 @@ FROM golang:${GO_VERSION}-bookworm AS builder
 
 WORKDIR /nhp-server
 
-# Install build dependencies
+# Install build dependencies (minimal - no CGO needed)
 RUN apt-get update && apt-get install -y \
     make \
-    clang \
-    llvm \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy dependency files first (better layer caching)
@@ -25,26 +23,10 @@ COPY . .
 
 RUN echo "Building for architecture: ${TARGETARCH}"
 
-# Build the server (CGO not required - error codes are pure Go constants)
-RUN make init serverd plugins
-
-# Build external plugins (same Go environment guarantees compatibility)
-# Clone and build passcode plugin
-# Uses BuildKit secret mount - token never stored in image layers
-RUN --mount=type=secret,id=github_token \
-    GITHUB_TOKEN=$(cat /run/secrets/github_token 2>/dev/null || echo "") && \
-    if [ -n "$GITHUB_TOKEN" ]; then \
-      git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"; \
-    fi && \
-    git clone --depth 1 https://github.com/layervai/nhp-plugins-passcode.git /tmp/passcode && \
-    cd /tmp/passcode && \
-    mkdir -p /nhp-server/release/nhp-server/plugins/passcode/etc && \
-    mkdir -p /nhp-server/release/nhp-server/templates/passcode && \
-    CGO_ENABLED=1 go build -buildmode=plugin -o /nhp-server/release/nhp-server/plugins/passcode/main.so . && \
-    cp -r etc/* /nhp-server/release/nhp-server/plugins/passcode/etc/ 2>/dev/null || true && \
-    cp -r templates/* /nhp-server/release/nhp-server/templates/passcode/ 2>/dev/null || true && \
-    rm -rf /tmp/passcode && \
-    git config --global --unset-all url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf 2>/dev/null || true
+# Build the server with CGO disabled
+# Plugins are now statically compiled into the server binary
+ENV CGO_ENABLED=0
+RUN make init serverd
 
 # Stage 2: Runtime image
 FROM ubuntu:24.04 AS runtime

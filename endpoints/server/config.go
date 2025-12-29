@@ -622,17 +622,15 @@ func (s *UdpServer) updateResources(aspMap common.AuthSvcProviderMap) (err error
 
 	for aspId, aspData := range aspMap {
 		aspData.AuthSvcId = aspId
-		if len(aspData.PluginPath) > 0 {
-			log.Debug("Loading plugin for AuthServiceId %q from path %q", aspId, aspData.PluginPath)
-			h := plugins.ReadPluginHandler(aspData.PluginPath)
-			if h != nil {
-				s.LoadPlugin(aspId, h)
-				log.Info("Loaded plugin for AuthServiceId %q", aspId)
-			} else {
-				log.Error("Failed to load plugin for AuthServiceId %q from path %q", aspId, aspData.PluginPath)
-			}
+		// Try to load plugin from static registry first, then fall back to dynamic loading
+		h := plugins.GetPluginHandler(aspId, aspData.PluginPath)
+		if h != nil {
+			s.LoadPlugin(aspId, h)
+			log.Info("Loaded plugin for AuthServiceId %q", aspId)
+		} else if len(aspData.PluginPath) > 0 {
+			log.Error("Failed to load plugin for AuthServiceId %q from path %q", aspId, aspData.PluginPath)
 		} else {
-			log.Debug("AuthServiceId %q has no PluginPath configured", aspId)
+			log.Debug("AuthServiceId %q has no plugin configured", aspId)
 		}
 
 		for resId, res := range aspData.ResourceGroups {

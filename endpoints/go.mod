@@ -9,9 +9,11 @@ require (
 	github.com/cilium/ebpf v0.18.0
 	github.com/coreos/go-oidc/v3 v3.14.1
 	github.com/emmansun/gmsm v0.24.1
+	github.com/fengyily/nhp-plugins-sdk v0.1.30
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gin-contrib/sessions v1.0.4
 	github.com/gin-gonic/gin v1.10.1
+	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/google/uuid v1.6.0
 	github.com/mark3labs/mcp-go v0.33.0

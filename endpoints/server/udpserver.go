@@ -792,13 +792,12 @@ func (s *UdpServer) AddAuthService(aspData *common.AuthServiceProviderData) erro
 	s.authServiceMap[aspData.AuthSvcId] = aspData
 	s.authServiceMapMutex.Unlock()
 
-	if len(aspData.PluginPath) > 0 {
-		h := plugins.ReadPluginHandler(aspData.PluginPath)
-		if h != nil {
-			err := s.LoadPlugin(aspData.AuthSvcId, h)
-			if err != nil {
-				return err
-			}
+	// Try to load plugin from static registry first, then fall back to dynamic loading
+	h := plugins.GetPluginHandler(aspData.AuthSvcId, aspData.PluginPath)
+	if h != nil {
+		err := s.LoadPlugin(aspData.AuthSvcId, h)
+		if err != nil {
+			return err
 		}
 	}
 

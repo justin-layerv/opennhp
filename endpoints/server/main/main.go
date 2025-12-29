@@ -12,6 +12,10 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/version"
 	"github.com/urfave/cli/v2"
+
+	// Import plugins to trigger their init() registration with the plugin registry
+	_ "github.com/OpenNHP/opennhp/endpoints/server/plugins/oidc"
+	_ "github.com/OpenNHP/opennhp/endpoints/server/plugins/passcode"
 )
 
 func main() {
