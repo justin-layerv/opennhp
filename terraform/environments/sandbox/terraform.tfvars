@@ -119,8 +119,9 @@ deploy_demo_gateway = false
 # Console API for portal site management (alternative to Fargate - more cost effective)
 # ==============================================================================
 # Set to true to deploy Console on EC2 instead of ECS Fargate
-deploy_console_ec2 = false
+deploy_console_ec2 = true
 console_ec2_domain = "console.nhp.layerv.xyz"
+console_cookie_domain = ".layerv.xyz"
 
 tags = {
   Organization = "LayerV"

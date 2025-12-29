@@ -6,7 +6,7 @@ echo "Starting Console EC2 installation at $(date)"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y nginx certbot python3-certbot-nginx docker.io curl jq unzip
+apt-get install -y nginx certbot python3-certbot-nginx python3-certbot-dns-route53 docker.io curl jq unzip
 
 # Install AWS CLI v2
 if ! command -v aws &> /dev/null; then
