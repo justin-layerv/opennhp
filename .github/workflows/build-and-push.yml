@@ -182,7 +182,7 @@ jobs:
           build-args: |
             GO_VERSION=${{ env.GO_VERSION }}
           secrets: |
-            github_token=${{ secrets.GITHUB_TOKEN }}
+            github_token=${{ secrets.PLUGIN_REPO_TOKEN }}
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
