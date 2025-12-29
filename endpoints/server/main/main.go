@@ -13,9 +13,11 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/version"
 	"github.com/urfave/cli/v2"
 
-	// Import plugins to trigger their init() registration with the plugin registry
-	_ "github.com/OpenNHP/opennhp/endpoints/server/plugins/oidc"
-	_ "github.com/OpenNHP/opennhp/endpoints/server/plugins/passcode"
+	// Import statically compiled plugins to trigger their init() registration
+	// These are in staticplugins/ (not plugins/) because they're compiled into the binary,
+	// not built as .so files by the plugins Makefile
+	_ "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/oidc"
+	_ "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/passcode"
 )
 
 func main() {
