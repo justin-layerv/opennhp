@@ -1081,8 +1081,9 @@ import boto3
 
 def handler(event, context):
     """
-    Seeds etcd with NHP config (server peers, HTTP config).
+    Seeds etcd with NHP config for ACs (server peers only).
     Does NOT write any private keys to etcd.
+    HttpConfig/plugins are local files on each server.
     """
     print(f"etcd seeder event: {json.dumps(event)}")
 
@@ -1115,15 +1116,12 @@ def handler(event, context):
         except Exception as e:
             print(f"Warning: Could not get server public key: {e}")
 
-    # Build TOML config (no private keys!)
+    # Build TOML config for ACs (no private keys, no static server config)
+    # Only contains [[Servers]] - ACs need to know where to connect
+    # HttpConfig/plugins are local files on each server, not in etcd
     config_toml = f'''# NHP AC Configuration (seeded by Terraform)
 # This config is read by ACs on startup.
 # Private keys are stored in per-instance Secrets Manager secrets.
-
-[HttpConfig]
-EnableHttp = true
-EnableTLS = false
-HttpListenPort = 8888
 
 # Server peers - ACs dial OUT to these servers
 [[Servers]]

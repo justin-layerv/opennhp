@@ -429,21 +429,32 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 	// The local config.toml contains the per-instance private key and operational settings.
 	_ = baseLoad // Explicitly ignore - base config always from local
 
-	s.updateHttpConfig(serverEtcdConfig.HttpConfig)
+	// Only update HttpConfig from etcd if it's explicitly set
+	// (non-zero port or EnableHttp=true). Otherwise keep local http.toml config.
+	// This allows etcd to be used purely for AC registry without requiring HttpConfig.
+	if serverEtcdConfig.HttpConfig.EnableHttp || serverEtcdConfig.HttpConfig.HttpListenPort > 0 {
+		s.updateHttpConfig(serverEtcdConfig.HttpConfig)
+	}
 	s.updateACPeers(serverEtcdConfig.ACs)
 	s.updateAgentPeers(serverEtcdConfig.Agents)
 	s.updateDePeers(serverEtcdConfig.DBs)
 
-	aspMap := make(common.AuthSvcProviderMap)
-	for _, aspData := range serverEtcdConfig.AuthServiceId {
-		aspId := aspData.AuthSvcId
-		aspMap[aspId] = aspData
+	// Only update resources from etcd if AuthServiceId is explicitly configured.
+	// Otherwise, keep the local resource.toml config (plugins are statically compiled).
+	if len(serverEtcdConfig.AuthServiceId) > 0 {
+		aspMap := make(common.AuthSvcProviderMap)
+		for _, aspData := range serverEtcdConfig.AuthServiceId {
+			aspId := aspData.AuthSvcId
+			aspMap[aspId] = aspData
+		}
+		log.Info("Parsed %d AuthServiceId entries from etcd config", len(aspMap))
+		for aspId, aspData := range aspMap {
+			log.Debug("  AuthServiceId[%s]: PluginPath=%q", aspId, aspData.PluginPath)
+		}
+		s.updateResources(aspMap)
+	} else {
+		log.Info("No AuthServiceId in etcd config, using local resource.toml")
 	}
-	log.Info("Parsed %d AuthServiceId entries from etcd config", len(aspMap))
-	for aspId, aspData := range aspMap {
-		log.Debug("  AuthServiceId[%s]: PluginPath=%q", aspId, aspData.PluginPath)
-	}
-	s.updateResources(aspMap)
 
 	srcIpMap := make(map[string][]*common.NetAddress)
 	for _, srcIp := range serverEtcdConfig.SrcIps {

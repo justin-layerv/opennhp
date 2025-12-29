@@ -80,11 +80,12 @@ CONFIGEOF
 # NHP Server uses local config.toml for base config (UDP port 62206)
 # Configure HTTP server for plugin endpoints (passcode login, OIDC, etc.)
 # Demo Gateway routes qurl.link/{appId} to this endpoint
+# Note: Port 8888 is used consistently (matches etcd config and AC Traefik routing)
 cat > /opt/layerv/nhp-server/etc/http.toml << 'HTTPEOF'
 EnableHttp = true
 EnableTLS = false
 HttpListenIp = ""
-HttpListenPort = 8080
+HttpListenPort = 8888
 HTTPEOF
 
 # ============================================================================
@@ -133,65 +134,10 @@ REMOTEEOF
 echo "etcd remote.toml configured: ${etcd_endpoint}"
 
 # ============================================================================
-# Seed etcd with plugin configuration (idempotent)
-# First NHP Server to boot seeds the shared config, others find it ready
+# etcd is used ONLY for AC registry discovery (dynamic)
+# Static config (HttpConfig, plugins) comes from local files
 # ============================================================================
-%{ if length(server_plugins) > 0 }
-echo "Seeding etcd with plugin configuration..."
-
-# Get VPC DNS resolver from resolv.conf (needed for Docker DNS resolution)
-VPC_DNS=$(grep nameserver /etc/resolv.conf | head -1 | awk '{print $2}')
-echo "Using VPC DNS: $VPC_DNS"
-
-# Common etcdctl args (run via Docker since etcd image has etcdctl)
-# Note: --dns flag needed because distroless etcd image doesn't inherit host DNS properly
-ETCD_DOCKER="docker run --rm --net=host --dns=$VPC_DNS -v /opt/layerv/nhp-server/etc/tls:/tls:ro -e ETCDCTL_API=3 quay.io/coreos/etcd:v3.5.11"
-ETCD_ARGS="--endpoints=${etcd_endpoint} --cacert=/tls/ca.crt --cert=/tls/client.crt --key=/tls/client.key"
-
-# IMPORTANT: EtcdConn.InitClient() prepends "/" to the key from remote.toml
-# So we must use "/nhp/config" (with leading slash) to match what the server reads
-ETCD_KEY="/nhp/config"
-
-# Check if config already has AuthServiceId
-EXISTING_CONFIG=$($ETCD_DOCKER etcdctl $ETCD_ARGS get "$ETCD_KEY" --print-value-only 2>/dev/null || echo "")
-
-if echo "$EXISTING_CONFIG" | grep -q AuthServiceId; then
-  echo "etcd $ETCD_KEY already has AuthServiceId, skipping seed"
-else
-  echo "Seeding etcd $ETCD_KEY with plugin configuration..."
-
-  # Build the AuthServiceId section to append
-  # Note: PluginPath is no longer needed - plugins are statically compiled
-  # The server uses AuthSvcId to look up plugins in the registry
-  PLUGIN_SECTION='
-%{ for plugin_name in server_plugins ~}
-[[AuthServiceId]]
-AuthSvcId = "${plugin_name}"
-
-%{ endfor ~}'
-
-  # Merge with existing config (preserve HttpConfig from Lambda seeder)
-  if [ -n "$EXISTING_CONFIG" ]; then
-    echo "Merging with existing config..."
-    MERGED_CONFIG="$EXISTING_CONFIG
-$PLUGIN_SECTION"
-  else
-    # No existing config, create minimal one with plugins
-    MERGED_CONFIG="# NHP Server Plugin Configuration
-$PLUGIN_SECTION"
-  fi
-
-  echo "Merged config:"
-  echo "$MERGED_CONFIG"
-
-  # Put the merged config to etcd
-  $ETCD_DOCKER etcdctl $ETCD_ARGS put "$ETCD_KEY" "$MERGED_CONFIG" && \
-    echo "etcd seed complete" || \
-    echo "WARNING: etcd put failed"
-fi
-%{ else }
-echo "No plugins configured, skipping etcd seeding"
-%{ endif }
+echo "etcd configured for AC registry only (no static config seeding needed)"
 %{ else }
 echo "etcd not configured (multi_tenant=${multi_tenant}), using local config only"
 %{ endif }

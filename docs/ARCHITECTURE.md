@@ -61,8 +61,7 @@ GET /plugins/:aspid/:resid/valid - Legacy validation endpoint
 **Listens On:**
 - UDP 62206 (via NLB) - NHP protocol knocks
 - TCP 8888 (HTTP) - Plugin endpoints (passcode login, auth validation)
-  - **IMPORTANT:** Despite `http.toml` configuring `HttpListenPort = 8080`, the server actually listens on 8888
-  - This is accessed via AC Traefik (`/plugins/*` routes) or Demo Gateway nginx
+  - Accessed via AC Traefik (`/plugins/*` routes) or Demo Gateway nginx
 
 **HTTP Access Paths:**
 1. **Via AC Traefik** (primary for terraform): `{resid}.nhp.layerv.xyz/plugins/passcode?action=login`
@@ -1388,11 +1387,9 @@ AWS_PROFILE=layerv aws ssm send-command --instance-ids i-XXXXX \
   --parameters 'commands=["ss -tlnp | grep -E \"8080|8888\""]'
 ```
 
-**IMPORTANT PORT NOTE:**
-- `http.toml` configures `HttpListenPort = 8080`
-- **BUT** the server actually listens on **port 8888** (bug or config not read)
-- Always use port 8888 when routing to NHP Server HTTP
-- Check logs: `docker exec nhp-server grep "Listening http" /nhp-server/logs/server-$(date +%Y-%m-%d).log`
+**Port Configuration:**
+- NHP Server HTTP listens on port 8888 (configured in both http.toml and etcd)
+- AC Traefik routes `/plugins/*` to `http://server.nhp.sandbox.internal:8888`
 
 **2. Check security group allows port 8888:**
 ```bash
