@@ -433,12 +433,6 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Download Plan Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: tfplan-sandbox-${{ github.sha }}
-          path: terraform/environments/sandbox
-
       - name: Terraform Init
         working-directory: terraform/environments/sandbox
         env:
@@ -455,7 +449,9 @@ jobs:
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
           # Deployment configuration - use commit SHA for immutable deployments
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
-        run: terraform apply tfplan
+        # Run plan+apply together - avoids archive_file artifact issues
+        # Plan output is already available in terraform-plan job for review
+        run: terraform apply -auto-approve
 
       - name: Get Terraform Outputs
         id: outputs
@@ -775,12 +771,6 @@ jobs:
           role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Download Plan Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: tfplan-prod-${{ github.sha }}
-          path: terraform/environments/prod
-
       - name: Terraform Init
         working-directory: terraform/environments/prod
         env:
@@ -797,7 +787,10 @@ jobs:
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
           # Deployment configuration - use commit SHA for immutable deployments
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
-        run: terraform apply tfplan
+        # Run plan+apply together - avoids archive_file artifact issues
+        # Manual approval is handled by GitHub environment protection rules
+        # Plan output is available in terraform-plan job for review before approval
+        run: terraform apply -auto-approve
 
       - name: Get Terraform Outputs
         id: outputs
