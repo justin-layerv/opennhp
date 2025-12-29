@@ -25,8 +25,9 @@ COPY . .
 
 RUN echo "Building for architecture: ${TARGETARCH}"
 
-# Build the server
-RUN make init serverd plugins
+# Build the server with CGO enabled (required for plugin compatibility)
+# Both server and plugins MUST be built with the same CGO setting
+RUN CGO_ENABLED=1 make init serverd plugins
 
 # Build external plugins (same Go environment guarantees compatibility)
 # Clone and build passcode plugin
