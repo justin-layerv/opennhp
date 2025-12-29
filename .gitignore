@@ -247,6 +247,6 @@ report.xml
 *.a
 *.lib
 
-# Core dumps
-core
-core.*
+# Core dumps (use /core to avoid matching nhp/core/ directory)
+/core
+/core.*
