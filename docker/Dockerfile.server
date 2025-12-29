@@ -28,6 +28,17 @@ RUN echo "Building for architecture: ${TARGETARCH}"
 # Build the server
 RUN make init serverd plugins
 
+# Build external plugins (same Go environment guarantees compatibility)
+# Clone and build passcode plugin
+RUN git clone --depth 1 https://github.com/layervai/nhp-plugins-passcode.git /tmp/passcode && \
+    cd /tmp/passcode && \
+    mkdir -p /nhp-server/release/nhp-server/plugins/passcode/etc && \
+    mkdir -p /nhp-server/release/nhp-server/templates/passcode && \
+    CGO_ENABLED=1 go build -buildmode=plugin -o /nhp-server/release/nhp-server/plugins/passcode/main.so . && \
+    cp -r etc/* /nhp-server/release/nhp-server/plugins/passcode/etc/ 2>/dev/null || true && \
+    cp -r templates/* /nhp-server/release/nhp-server/templates/passcode/ 2>/dev/null || true && \
+    rm -rf /tmp/passcode
+
 # Stage 2: Runtime image
 FROM ubuntu:24.04 AS runtime
 
