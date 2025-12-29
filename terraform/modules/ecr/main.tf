@@ -80,6 +80,12 @@ variable "traefik_plugins_github_repo" {
   default     = "traefik-plugins"
 }
 
+variable "plugin_repos" {
+  description = "List of GitHub repository names that can assume the GitHub Actions role to upload plugins"
+  type        = list(string)
+  default     = []
+}
+
 variable "plugin_bucket_arn" {
   description = "ARN of the S3 bucket for Traefik plugins (from AC module)"
   type        = string
@@ -280,21 +286,34 @@ resource "aws_iam_role" "github_actions" {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
         }
-        # Allow main branch and environment-based deployments for nhp and traefik-plugins repos
+        # Allow main branch and environment-based deployments for:
+        # - Main NHP repo
+        # - Traefik plugins repo
+        # - NHP server plugin repos (nhp-plugins-passcode, nhp-plugins-oidc, etc.)
         # Environment-based: used by deploy jobs with `environment: sandbox/production`
         StringLike = {
           "token.actions.githubusercontent.com:sub" = concat(
+            # Main NHP repo
             [
               "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main",
               "repo:${var.github_org}/${var.github_repo}:environment:sandbox",
               "repo:${var.github_org}/${var.github_repo}:environment:production"
             ],
+            # Traefik plugins repo
             var.traefik_plugins_github_repo != "" ? [
               "repo:${var.github_org}/${var.traefik_plugins_github_repo}:ref:refs/heads/main",
               "repo:${var.github_org}/${var.traefik_plugins_github_repo}:environment:sandbox",
               "repo:${var.github_org}/${var.traefik_plugins_github_repo}:environment:staging",
               "repo:${var.github_org}/${var.traefik_plugins_github_repo}:environment:production"
-            ] : []
+            ] : [],
+            # NHP Server plugin repos (passcode, oidc, etc.)
+            flatten([
+              for repo in var.plugin_repos : [
+                "repo:${var.github_org}/${repo}:ref:refs/heads/main",
+                "repo:${var.github_org}/${repo}:environment:sandbox",
+                "repo:${var.github_org}/${repo}:environment:production"
+              ]
+            ])
           )
         }
       }

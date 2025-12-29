@@ -112,6 +112,9 @@ module "ecr" {
   enable_plugin_bucket_policy = true
   plugin_bucket_arn           = module.plugins.bucket_arn
   traefik_plugins_github_repo = var.traefik_plugins_github_repo
+
+  # NHP Server plugin repos (for IAM trust policy)
+  plugin_repos = var.plugin_repos
 }
 
 # Networking Module - VPC, Subnets, Security Groups

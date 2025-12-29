@@ -58,6 +58,32 @@ rds_min_capacity        = 0.5
 rds_max_capacity        = 4
 rds_deletion_protection = false # Allow deletion in sandbox
 
+# NHP Server plugins - sandbox uses "latest" for automatic updates
+# When plugin repos deploy, they update the "latest" version in S3
+# Server instances will pick up the latest plugins on next boot/instance refresh
+#
+# NOTE: Sensitive config values (SigningKey, AesKey) should be passed via:
+#   TF_VAR_auth_signing_key and TF_VAR_auth_aes_key GitHub Secrets
+#
+# Plugins will be downloaded from: s3://layerv-nhp-sandbox-plugins/nhp-server/{plugin}/latest/main.so
+server_plugins = {
+  passcode = {
+    version = "latest"
+    config = {
+      ResourceMode = "api"
+      # AuthUrl is set at server level (auth_url variable)
+      # SigningKey and AesKey are passed via TF_VAR_ secrets
+    }
+  }
+  # oidc plugin - uncomment when needed
+  # oidc = {
+  #   version = "latest"
+  #   config = {
+  #     ResourceMode = "api"
+  #   }
+  # }
+}
+
 # Traefik plugins - sandbox uses "latest" for automatic updates
 # When traefik-plugins repo deploys, it updates the "latest" version in S3
 # AC instances will pick up the latest plugins on next boot/refresh

@@ -232,27 +232,30 @@ docker pull "$ECR_REPO:${image_tag}" || docker pull "$ECR_REPO:${environment}" |
 # ============================================================================
 # Download NHP Server Plugins from S3
 # Plugins are uploaded by plugin repo CI/CD, configs rendered by Terraform.
+# FAIL-FAST: Instance will not start if plugin download fails.
 # ============================================================================
 %{ if plugin_bucket_name != null && length(server_plugins) > 0 }
 echo "Downloading NHP Server plugins from S3..."
 PLUGIN_BUCKET="${plugin_bucket_name}"
+PLUGIN_DOWNLOAD_FAILED=false
 
 %{ for plugin_name, plugin in server_plugins ~}
 echo "Downloading plugin: ${plugin_name} (version: ${plugin.version})"
 mkdir -p /opt/layerv/nhp-server/plugins/${plugin_name}/etc
 
-# Download plugin binary
-aws s3 cp "s3://$PLUGIN_BUCKET/${plugin.binary_key}" \
+# Download plugin binary (REQUIRED - fail if missing)
+if ! aws s3 cp "s3://$PLUGIN_BUCKET/${plugin.binary_key}" \
   /opt/layerv/nhp-server/plugins/${plugin_name}/main.so \
-  --region "$REGION" || {
-    echo "Warning: Could not download ${plugin_name} plugin binary"
-  }
+  --region "$REGION"; then
+    echo "ERROR: Failed to download ${plugin_name} plugin binary from s3://$PLUGIN_BUCKET/${plugin.binary_key}"
+    PLUGIN_DOWNLOAD_FAILED=true
+fi
 
-# Download plugin config (rendered by Terraform)
+# Download plugin config (rendered by Terraform) - optional, may not exist
 aws s3 cp "s3://$PLUGIN_BUCKET/${plugin.config_key}" \
   /opt/layerv/nhp-server/plugins/${plugin_name}/etc/config.toml \
-  --region "$REGION" || {
-    echo "Warning: Could not download ${plugin_name} plugin config"
+  --region "$REGION" 2>/dev/null || {
+    echo "Note: No config found for ${plugin_name} plugin (this may be expected)"
   }
 
 # Set permissions
@@ -261,6 +264,15 @@ chmod 644 /opt/layerv/nhp-server/plugins/${plugin_name}/etc/config.toml 2>/dev/n
 
 echo "Plugin ${plugin_name} installed"
 %{ endfor ~}
+
+# Fail-fast if any plugin download failed
+if [ "$PLUGIN_DOWNLOAD_FAILED" = true ]; then
+    echo "FATAL: One or more plugin downloads failed. Aborting instance startup."
+    echo "Check that plugins have been built and uploaded to S3:"
+    echo "  - Run the plugin CI/CD workflow (push to main branch)"
+    echo "  - Or manually upload: aws s3 cp main.so s3://$PLUGIN_BUCKET/nhp-server/{plugin}/latest/main.so"
+    exit 1
+fi
 
 echo "All plugins downloaded from S3"
 %{ else }

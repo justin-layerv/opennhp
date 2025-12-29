@@ -183,6 +183,16 @@ variable "image_tag" {
   default     = "latest"
 }
 
+# NHP Server plugins
+variable "server_plugins" {
+  description = "Map of NHP Server plugins to deploy (passcode, oidc)"
+  type = map(object({
+    version = string
+    config  = map(string)
+  }))
+  default = {}
+}
+
 # Traefik plugins
 variable "traefik_plugins" {
   description = "Map of Traefik plugins to deploy"

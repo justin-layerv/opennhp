@@ -62,6 +62,9 @@ module "nhp" {
   # Deployment configuration
   image_tag = var.image_tag
 
+  # NHP Server plugins
+  server_plugins = var.server_plugins
+
   # Traefik plugins
   traefik_plugins = var.traefik_plugins
 }
