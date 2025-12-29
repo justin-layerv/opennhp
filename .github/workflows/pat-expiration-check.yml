@@ -1,0 +1,88 @@
+name: PAT Expiration Check
+
+on:
+  schedule:
+    # Run weekly on Monday at 9am UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch: # Allow manual trigger
+
+env:
+  # Update this date when you renew the PLUGIN_REPO_TOKEN
+  # Format: YYYY-MM-DD
+  PAT_EXPIRATION_DATE: '2025-10-25'
+  DAYS_BEFORE_WARNING: 30
+
+jobs:
+  check-expiration:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PAT expiration
+        id: check
+        run: |
+          EXPIRY=$(date -d "$PAT_EXPIRATION_DATE" +%s)
+          NOW=$(date +%s)
+          DAYS_LEFT=$(( (EXPIRY - NOW) / 86400 ))
+
+          echo "days_left=$DAYS_LEFT" >> $GITHUB_OUTPUT
+          echo "PAT expires in $DAYS_LEFT days ($PAT_EXPIRATION_DATE)"
+
+          if [ $DAYS_LEFT -lt 0 ]; then
+            echo "status=expired" >> $GITHUB_OUTPUT
+          elif [ $DAYS_LEFT -lt $DAYS_BEFORE_WARNING ]; then
+            echo "status=warning" >> $GITHUB_OUTPUT
+          else
+            echo "status=ok" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Verify token still works
+        id: verify
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PLUGIN_REPO_TOKEN }}
+        run: |
+          # Try to access the plugin repo
+          if gh api repos/layervai/nhp-plugins-passcode --silent; then
+            echo "token_valid=true" >> $GITHUB_OUTPUT
+          else
+            echo "token_valid=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create issue if expiring soon or invalid
+        if: steps.check.outputs.status != 'ok' || steps.verify.outputs.token_valid == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="Action Required: PLUGIN_REPO_TOKEN"
+
+          if [ "${{ steps.verify.outputs.token_valid }}" == "false" ]; then
+            TITLE="$TITLE is invalid/expired"
+            BODY="The PLUGIN_REPO_TOKEN secret is no longer working. Docker builds will fail.
+
+          **Action needed:**
+          1. Create a new fine-grained PAT at https://github.com/settings/tokens?type=beta
+             - Resource owner: layervai
+             - Repository: layervai/nhp-plugins-passcode
+             - Permissions: Contents (read-only)
+          2. Update the secret in this repo: Settings → Secrets → Actions → PLUGIN_REPO_TOKEN
+          3. Update PAT_EXPIRATION_DATE in .github/workflows/pat-expiration-check.yml"
+          else
+            TITLE="$TITLE expires in ${{ steps.check.outputs.days_left }} days"
+            BODY="The PLUGIN_REPO_TOKEN secret expires on $PAT_EXPIRATION_DATE (${{ steps.check.outputs.days_left }} days).
+
+          **Action needed before expiration:**
+          1. Create a new fine-grained PAT at https://github.com/settings/tokens?type=beta
+             - Resource owner: layervai
+             - Repository: layervai/nhp-plugins-passcode
+             - Permissions: Contents (read-only)
+          2. Update the secret in this repo: Settings → Secrets → Actions → PLUGIN_REPO_TOKEN
+          3. Update PAT_EXPIRATION_DATE in .github/workflows/pat-expiration-check.yml"
+          fi
+
+          # Check if similar issue already exists
+          EXISTING=$(gh issue list --search "$TITLE in:title" --state open --json number --jq '.[0].number')
+
+          if [ -z "$EXISTING" ]; then
+            gh issue create --title "$TITLE" --body "$BODY" --label "maintenance"
+          else
+            echo "Issue #$EXISTING already exists"
+          fi
