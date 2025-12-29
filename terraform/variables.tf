@@ -460,6 +460,12 @@ variable "console_ec2_domain" {
   default     = null
 }
 
+variable "console_internal_only" {
+  description = "Make Console internal-only (NHP-protected via AC). When true, Console is only accessible through AC after NHP authentication."
+  type        = bool
+  default     = false
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {

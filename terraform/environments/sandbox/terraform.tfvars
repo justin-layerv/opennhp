@@ -19,7 +19,7 @@ is_primary_account = true
 deploy_ac          = true
 acme_email         = "admin@layerv.xyz"
 ac_auth_service_id = "layerv"
-ac_resource_ids    = ["demo", "mini-app-demo"]
+ac_resource_ids    = ["demo", "mini-app-demo", "console"]
 
 # Terraform state bucket for GitHub Actions permissions
 terraform_state_bucket = "layerv-terraform-state-767397897469"
@@ -43,7 +43,7 @@ enable_cloudtrail = false
 # Set to true for sandbox to enable debug features
 dev_mode      = true
 resource_mode = "api"
-auth_url      = "http://127.0.0.1:8888" # Internal AC auth endpoint
+# auth_url is set dynamically in main.tf to Console EC2 internal NLB endpoint
 # auth_signing_key and auth_aes_key are passed via GitHub Secrets (TF_VAR_auth_signing_key, TF_VAR_auth_aes_key)
 
 # Slack notifications via AWS Chatbot
@@ -119,9 +119,13 @@ deploy_demo_gateway = false
 # Console API for portal site management (alternative to Fargate - more cost effective)
 # ==============================================================================
 # Set to true to deploy Console on EC2 instead of ECS Fargate
-deploy_console_ec2 = true
-console_ec2_domain = "console.nhp.layerv.xyz"
+deploy_console_ec2    = true
+console_ec2_domain    = "console.nhp.layerv.xyz"
 console_cookie_domain = ".layerv.xyz"
+# Set to true to make Console internal-only (NHP-protected via AC)
+# When enabled: Console runs on private subnets, accessed via AC NLB after NHP auth
+# Traffic flow: Internet → AC NLB → Traefik → nhp-acd → Console internal NLB
+console_internal_only = true
 
 tags = {
   Organization = "LayerV"

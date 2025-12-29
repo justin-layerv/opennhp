@@ -606,12 +606,27 @@ cat > /home/ubuntu/traefik/traefik.toml << TRAEFIKEOF
 # The traefik-plugins deployment will add this section with plugin definitions
 TRAEFIKEOF
 
-# Create Traefik dynamic configuration (routes to nhp-acd)
+# Create Traefik dynamic configuration (routes to nhp-acd and NHP Server)
 cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
 # Traefik Dynamic Configuration
-# Routes HTTPS traffic to nhp-acd
+# Routes:
+# - /plugins/* → NHP Server HTTP (passcode login, auth endpoints)
+# - /* → nhp-acd (protected resource access, refresh)
 
 [http.routers]
+  # Route /plugins to NHP Server for passcode login and auth
+  [http.routers.nhp-plugins]
+    rule = "PathPrefix(\`/plugins\`)"
+    service = "nhp-server"
+    entryPoints = ["https"]
+    priority = 10
+    [http.routers.nhp-plugins.tls]
+      certResolver = "letsencrypt"
+      [[http.routers.nhp-plugins.tls.domains]]
+        main = "${domain_name}"
+        sans = ["*.${domain_name}"]
+
+  # Default route to nhp-acd for protected resource access
   [http.routers.nhp-ac]
     rule = "PathPrefix(\`/\`)"
     service = "nhp-ac"
@@ -624,6 +639,13 @@ cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
         sans = ["*.${domain_name}"]
 
 [http.services]
+  # NHP Server HTTP for plugin endpoints (passcode login, auth)
+  # Note: NHP Server HTTP listens on 8888 (same port as nhp-acd uses for internal comms)
+  [http.services.nhp-server.loadBalancer]
+    [[http.services.nhp-server.loadBalancer.servers]]
+      url = "http://server.${namespace_name}:8888"
+
+  # nhp-acd for protected resource routing
   [http.services.nhp-ac.loadBalancer]
     [[http.services.nhp-ac.loadBalancer.servers]]
       url = "http://127.0.0.1:8888"

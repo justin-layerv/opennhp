@@ -540,6 +540,9 @@ locals {
     traefik_plugins    = var.traefik_plugins
     # Deployment configuration
     image_tag = var.image_tag
+    # Console backend routing (for NHP-protected Console)
+    console_backend_url = var.console_backend_url
+    console_domain      = var.console_domain
   })
 }
 

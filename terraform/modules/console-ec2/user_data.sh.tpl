@@ -3,10 +3,18 @@ set -ex
 
 exec > >(tee /var/log/user-data.log | logger -t user-data) 2>&1
 echo "Starting Console EC2 installation at $(date)"
+echo "Mode: ${internal_only ? "INTERNAL (behind AC/NHP)" : "EXTERNAL (public)"}"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
+
+%{ if internal_only }
+# Internal mode: minimal packages (no TLS/certbot needed)
+apt-get install -y nginx docker.io curl jq unzip
+%{ else }
+# External mode: full packages including certbot for TLS
 apt-get install -y nginx certbot python3-certbot-nginx python3-certbot-dns-route53 docker.io curl jq unzip
+%{ endif }
 
 # Install AWS CLI v2
 if ! command -v aws &> /dev/null; then
@@ -37,8 +45,75 @@ RDS_PASSWORD=$(echo "$RDS_SECRET" | jq -r '.password')
 
 echo "RDS credentials retrieved"
 
+%{ if internal_only }
 # ============================================================================
-# Configure nginx - Initial HTTP-only config for certbot
+# Internal Mode: Configure nginx for HTTP-only (AC handles TLS)
+# ============================================================================
+
+echo "Configuring nginx for internal mode (HTTP-only on port ${console_port})..."
+
+cat > /etc/nginx/sites-available/console << 'NGINXEOF'
+# Console API - Internal Mode nginx configuration
+# Proxies HTTP from AC to Console Docker container
+# TLS termination is handled by AC's Traefik
+#
+# Port mapping:
+# - External (NLB): ${console_port} (8888)
+# - Internal (Docker): 8080
+
+upstream console_backend {
+    server 127.0.0.1:8080;
+    keepalive 32;
+}
+
+server {
+    listen ${console_port};
+    server_name ${domain_name} _;
+
+    # Logging
+    access_log /var/log/nginx/console-access.log;
+    error_log /var/log/nginx/console-error.log;
+
+    # Health check endpoint (for NLB health checks)
+    location /health {
+        access_log off;
+        return 200 'OK';
+        add_header Content-Type text/plain;
+    }
+
+    # Proxy all requests to Console
+    location / {
+        proxy_pass http://console_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+
+        # Timeouts
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+
+        # For file uploads
+        client_max_body_size 50M;
+    }
+}
+NGINXEOF
+
+rm -f /etc/nginx/sites-enabled/default
+ln -sf /etc/nginx/sites-available/console /etc/nginx/sites-enabled/
+
+nginx -t
+systemctl enable nginx
+systemctl restart nginx
+
+echo "nginx configured for internal mode (HTTP on port ${console_port})"
+
+%{ else }
+# ============================================================================
+# External Mode: Configure nginx with TLS via Let's Encrypt
 # ============================================================================
 
 echo "Configuring nginx (initial HTTP config for certbot)..."
@@ -109,6 +184,7 @@ if [ ! -f "/etc/letsencrypt/live/${domain_name}/fullchain.pem" ]; then
 fi
 
 echo "Certificate obtained"
+%{ endif }
 
 # ============================================================================
 # Pull and Run Console Docker Container
@@ -120,11 +196,19 @@ aws ecr get-login-password --region "$REGION" | docker login --username AWS --pa
 docker pull "$CONSOLE_IMAGE"
 
 echo "Starting Console container..."
+# Internal mode: bind to 8080 (nginx proxies from ${console_port})
+# External mode: bind to ${console_port} directly
+%{ if internal_only ~}
+DOCKER_PORT=8080
+%{ else ~}
+DOCKER_PORT=${console_port}
+%{ endif ~}
+
 docker run -d \
     --name console \
     --restart always \
-    -p 127.0.0.1:${console_port}:${console_port} \
-    -e "GVA_CONFIG_SYSTEM_ADDR=${console_port}" \
+    -p 127.0.0.1:$DOCKER_PORT:$DOCKER_PORT \
+    -e "GVA_CONFIG_SYSTEM_ADDR=$DOCKER_PORT" \
     -e "GVA_CONFIG_SYSTEM_DBTYPE=pgsql" \
     -e "GVA_CONFIG_SYSTEM_COOKIEDOMAIN=${cookie_domain}" \
     -e "GVA_CONFIG_PGSQL_PATH=${rds_endpoint}" \
@@ -139,15 +223,16 @@ docker run -d \
 # Wait for console to be healthy
 echo "Waiting for Console to be healthy..."
 for i in {1..30}; do
-    if curl -s http://127.0.0.1:${console_port}/api/health | grep -q "ok"; then
+    if curl -s http://127.0.0.1:$DOCKER_PORT/api/health | grep -q "ok"; then
         echo "Console is healthy"
         break
     fi
     sleep 5
 done
 
+%{ if !internal_only }
 # ============================================================================
-# Configure nginx - Final HTTPS config
+# External Mode: Configure nginx with HTTPS (final config)
 # ============================================================================
 
 echo "Configuring nginx with HTTPS..."
@@ -241,6 +326,7 @@ chmod +x /etc/letsencrypt/renewal-hooks/deploy/nginx-reload.sh
 
 systemctl enable certbot.timer
 systemctl start certbot.timer
+%{ endif }
 
 # ============================================================================
 # Create Console Health Check Service
@@ -265,6 +351,78 @@ systemctl daemon-reload
 systemctl enable console-health
 systemctl start console-health
 
+%{ if seed_console_resource }
+# ============================================================================
+# Seed Console Resource in RDS (for NHP protection)
+# ============================================================================
+
+echo "Seeding Console resource in RDS for NHP protection..."
+
+# Install PostgreSQL client
+apt-get install -y postgresql-client
+
+# Build the SQL to insert Console portal site (idempotent - only if not exists)
+# This creates the Console as a protected resource that AC/NHP Server can route to
+CONSOLE_APP_ID="${console_app_id}"
+CONSOLE_SITE_NAME="LayerV Console"
+CONSOLE_SITE_URL="https://${console_app_id}${ac_domain}/"
+CONSOLE_HOSTNAME="${console_app_id}${ac_domain}"
+CONSOLE_INTERNAL_NLB="${console_internal_nlb}"
+CONSOLE_PORT="${console_port}"
+AC_NLB_DNS="${ac_nlb_dns}"
+COOKIE_DOMAIN="${cookie_domain}"
+JWT_SECRET="$CONSOLE_APP_ID"
+OPENTIME=3600
+TOKEN_EXPIRE=86400
+
+# Build ServiceInfo JSON (backend target)
+SERVICE_INFO=$(cat <<SRVEOF
+{"ip": "$CONSOLE_INTERNAL_NLB", "port": $CONSOLE_PORT, "scheme": "http", "path": "/"}
+SRVEOF
+)
+
+# Build Resources JSON (AC routing config)
+RESOURCES=$(cat <<RESEOF
+[{"ac_id": "layerv-ac-tf", "hostname": "$CONSOLE_HOSTNAME", "ip": "$AC_NLB_DNS", "port": 443, "maskhost": true, "protocol": "tcp"}]
+RESEOF
+)
+
+# Run the seed SQL
+PGPASSWORD="$RDS_PASSWORD" psql -h "${rds_endpoint}" -p ${rds_port} -U "$RDS_USERNAME" -d "${rds_database_name}" <<SQLEOF
+-- Insert Console portal site if not exists
+INSERT INTO portal_sites (
+    created_at, updated_at, site_name, site_url, app_id, jwt_secret,
+    cookie_domain, opentime, skip_auth, is_private, organization,
+    service_info, resources, ext_info, grant_users, grant_groups, main_app_config,
+    token_expire, status, category
+)
+SELECT
+    NOW(), NOW(), '$CONSOLE_SITE_NAME', '$CONSOLE_SITE_URL', '$CONSOLE_APP_ID', '$JWT_SECRET',
+    '$COOKIE_DOMAIN', $OPENTIME, false, false, 'LayerV',
+    '$SERVICE_INFO'::jsonb, '$RESOURCES'::jsonb, '{}'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb,
+    $TOKEN_EXPIRE, 'active', 'system'
+WHERE NOT EXISTS (
+    SELECT 1 FROM portal_sites WHERE app_id = '$CONSOLE_APP_ID'
+);
+
+-- Log the result
+DO \$\$
+BEGIN
+    IF EXISTS (SELECT 1 FROM portal_sites WHERE app_id = '$CONSOLE_APP_ID') THEN
+        RAISE NOTICE 'Console resource exists in portal_sites (app_id: %)', '$CONSOLE_APP_ID';
+    ELSE
+        RAISE NOTICE 'Failed to create Console resource';
+    END IF;
+END \$\$;
+SQLEOF
+
+if [ $? -eq 0 ]; then
+    echo "Console resource seeded successfully in RDS"
+else
+    echo "WARNING: Failed to seed Console resource in RDS (may already exist or DB not ready)"
+fi
+%{ endif }
+
 # ============================================================================
 # Final Checks
 # ============================================================================
@@ -274,4 +432,10 @@ systemctl status nginx --no-pager
 docker ps
 
 echo "Console EC2 installation complete at $(date)"
+%{ if internal_only }
+echo "Mode: Internal (NHP-protected via AC)"
+echo "Internal endpoint: http://${domain_name}:${console_port}"
+%{ else }
+echo "Mode: External (public access)"
 echo "API Endpoint: https://${domain_name}"
+%{ endif }

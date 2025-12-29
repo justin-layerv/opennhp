@@ -17,12 +17,17 @@ output "nlb_zone_id" {
 
 output "fqdn" {
   description = "Console fully qualified domain name"
-  value       = var.hosted_zone_id != null ? aws_route53_record.console[0].fqdn : var.domain_name
+  value       = var.hosted_zone_id != null && !var.internal_only ? aws_route53_record.console[0].fqdn : var.domain_name
 }
 
 output "api_endpoint" {
-  description = "Console API endpoint URL"
-  value       = "https://${var.domain_name}"
+  description = "Console API endpoint URL (HTTPS for external, HTTP for internal)"
+  value       = var.internal_only ? "http://${aws_lb.console.dns_name}:${var.console_port}" : "https://${var.domain_name}"
+}
+
+output "internal_endpoint" {
+  description = "Console internal endpoint for AC routing (HTTP URL)"
+  value       = "http://${aws_lb.console.dns_name}:${var.console_port}"
 }
 
 output "asg_name" {
@@ -43,4 +48,14 @@ output "log_group_name" {
 output "instance_role_arn" {
   description = "Console instance IAM role ARN"
   value       = aws_iam_role.console.arn
+}
+
+output "internal_only" {
+  description = "Whether Console is in internal-only mode (behind AC/NHP)"
+  value       = var.internal_only
+}
+
+output "console_port" {
+  description = "Console port number"
+  value       = var.console_port
 }

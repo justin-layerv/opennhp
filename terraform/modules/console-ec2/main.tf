@@ -146,22 +146,52 @@ resource "aws_security_group" "console" {
   vpc_id      = var.vpc_id
   description = "Security group for Console EC2"
 
-  # HTTPS from NLB
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "HTTPS from NLB"
+  # Internal mode: HTTP from AC only
+  # External mode: HTTPS/HTTP from anywhere
+  dynamic "ingress" {
+    for_each = var.internal_only ? [] : [1]
+    content {
+      from_port   = 443
+      to_port     = 443
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+      description = "HTTPS from NLB (external mode)"
+    }
   }
 
-  # HTTP for Let's Encrypt and redirect
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "HTTP for ACME and redirect"
+  dynamic "ingress" {
+    for_each = var.internal_only ? [] : [1]
+    content {
+      from_port   = 80
+      to_port     = 80
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+      description = "HTTP for ACME and redirect (external mode)"
+    }
+  }
+
+  # Internal mode: Allow HTTP from AC security group
+  dynamic "ingress" {
+    for_each = var.internal_only && var.ac_security_group_id != null ? [1] : []
+    content {
+      from_port       = var.console_port
+      to_port         = var.console_port
+      protocol        = "tcp"
+      security_groups = [var.ac_security_group_id]
+      description     = "HTTP from AC (internal mode)"
+    }
+  }
+
+  # Internal mode: Allow HTTP from VPC (for NLB health checks and Traefik)
+  dynamic "ingress" {
+    for_each = var.internal_only ? [1] : []
+    content {
+      from_port   = var.console_port
+      to_port     = var.console_port
+      protocol    = "tcp"
+      cidr_blocks = [var.vpc_cidr]
+      description = "HTTP from VPC (internal mode)"
+    }
   }
 
   # SSH from VPC
@@ -223,6 +253,13 @@ locals {
     region            = data.aws_region.current.name
     account_id        = data.aws_caller_identity.current.account_id
     hosted_zone_id    = var.hosted_zone_id
+    internal_only     = var.internal_only
+    # RDS seeding for NHP Console resource
+    seed_console_resource = var.seed_console_resource
+    console_app_id        = var.console_app_id
+    ac_nlb_dns            = var.ac_nlb_dns
+    ac_domain             = var.ac_domain
+    console_internal_nlb  = aws_lb.console.dns_name
   })
 }
 
@@ -238,7 +275,8 @@ resource "aws_launch_template" "console" {
   }
 
   network_interfaces {
-    associate_public_ip_address = true
+    # No public IP in internal mode (behind AC/NHP)
+    associate_public_ip_address = var.internal_only ? false : true
     security_groups             = [aws_security_group.console.id]
   }
 
@@ -283,8 +321,9 @@ resource "aws_launch_template" "console" {
 # ==================== Auto Scaling Group ====================
 
 resource "aws_autoscaling_group" "console" {
-  name                = local.console_name
-  vpc_zone_identifier = var.public_subnet_ids
+  name = local.console_name
+  # Use private subnets in internal mode (behind AC/NHP)
+  vpc_zone_identifier = var.internal_only ? var.private_subnet_ids : var.public_subnet_ids
   min_size            = 1
   max_size            = 2
   desired_capacity    = 1
@@ -297,9 +336,12 @@ resource "aws_autoscaling_group" "console" {
   health_check_type         = "EC2"
   health_check_grace_period = 300
 
-  target_group_arns = [
-    aws_lb_target_group.https.arn,
-    aws_lb_target_group.http.arn
+  # Internal mode: single HTTP target group; External mode: HTTPS + HTTP
+  target_group_arns = var.internal_only ? [
+    aws_lb_target_group.internal[0].arn
+    ] : [
+    aws_lb_target_group.https[0].arn,
+    aws_lb_target_group.http[0].arn
   ]
 
   instance_refresh {
@@ -334,17 +376,22 @@ resource "aws_autoscaling_group" "console" {
 
 resource "aws_lb" "console" {
   name               = replace(local.console_name, "_", "-")
-  internal           = false
+  internal           = var.internal_only
   load_balancer_type = "network"
-  subnets            = var.public_subnet_ids
+  # Internal mode: private subnets; External mode: public subnets
+  subnets = var.internal_only ? var.private_subnet_ids : var.public_subnet_ids
 
   enable_cross_zone_load_balancing = true
 
   tags = var.tags
 }
 
-# HTTPS Target Group
+# ==================== External Mode Target Groups (TLS on nginx) ====================
+
+# HTTPS Target Group (external mode only)
 resource "aws_lb_target_group" "https" {
+  count = var.internal_only ? 0 : 1
+
   name        = replace("${var.name_prefix}-con-https", "_", "-")
   port        = 443
   protocol    = "TCP"
@@ -365,8 +412,10 @@ resource "aws_lb_target_group" "https" {
   tags = var.tags
 }
 
-# HTTP Target Group
+# HTTP Target Group (external mode only)
 resource "aws_lb_target_group" "http" {
+  count = var.internal_only ? 0 : 1
+
   name        = replace("${var.name_prefix}-con-http", "_", "-")
   port        = 80
   protocol    = "TCP"
@@ -387,29 +436,76 @@ resource "aws_lb_target_group" "http" {
   tags = var.tags
 }
 
-# HTTPS Listener
+# HTTPS Listener (external mode only)
 resource "aws_lb_listener" "https" {
+  count = var.internal_only ? 0 : 1
+
   load_balancer_arn = aws_lb.console.arn
   port              = 443
   protocol          = "TCP"
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.https.arn
+    target_group_arn = aws_lb_target_group.https[0].arn
   }
 
   tags = var.tags
 }
 
-# HTTP Listener
+# HTTP Listener (external mode only)
 resource "aws_lb_listener" "http" {
+  count = var.internal_only ? 0 : 1
+
   load_balancer_arn = aws_lb.console.arn
   port              = 80
   protocol          = "TCP"
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.http.arn
+    target_group_arn = aws_lb_target_group.http[0].arn
+  }
+
+  tags = var.tags
+}
+
+# ==================== Internal Mode Target Group (HTTP from AC) ====================
+
+# Internal HTTP Target Group (internal mode only)
+resource "aws_lb_target_group" "internal" {
+  count = var.internal_only ? 1 : 0
+
+  name        = replace("${var.name_prefix}-con-int", "_", "-")
+  port        = var.console_port
+  protocol    = "TCP"
+  vpc_id      = var.vpc_id
+  target_type = "instance"
+
+  health_check {
+    enabled             = true
+    protocol            = "HTTP"
+    path                = "/health"
+    port                = tostring(var.console_port)
+    interval            = 30
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+
+  deregistration_delay = 30
+
+  tags = var.tags
+}
+
+# Internal HTTP Listener (internal mode only)
+resource "aws_lb_listener" "internal" {
+  count = var.internal_only ? 1 : 0
+
+  load_balancer_arn = aws_lb.console.arn
+  port              = var.console_port
+  protocol          = "TCP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.internal[0].arn
   }
 
   tags = var.tags
@@ -417,8 +513,10 @@ resource "aws_lb_listener" "http" {
 
 # ==================== Route 53 Record ====================
 
+# External mode: Create Route 53 record pointing to Console NLB
+# Internal mode: DNS record is created separately to point to AC NLB
 resource "aws_route53_record" "console" {
-  count = var.hosted_zone_id != null ? 1 : 0
+  count = var.hosted_zone_id != null && !var.internal_only ? 1 : 0
 
   zone_id = var.hosted_zone_id
   name    = var.domain_name

@@ -272,3 +272,20 @@ variable "traefik_plugins" {
   }))
   default = {}
 }
+
+# ============================================================================
+# Console Backend Configuration (for NHP-protected Console)
+# When Console is in internal_only mode, AC routes traffic to Console
+# ============================================================================
+
+variable "console_backend_url" {
+  description = "Console internal endpoint URL for AC to proxy to (e.g., http://nlb-dns:8888)"
+  type        = string
+  default     = null
+}
+
+variable "console_domain" {
+  description = "Console domain that AC should route to Console backend (e.g., console.nhp.layerv.xyz)"
+  type        = string
+  default     = null
+}

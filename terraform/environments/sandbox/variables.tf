@@ -259,3 +259,9 @@ variable "console_cookie_domain" {
   type        = string
   default     = null
 }
+
+variable "console_internal_only" {
+  description = "Make Console internal-only (NHP-protected via AC)"
+  type        = bool
+  default     = false
+}

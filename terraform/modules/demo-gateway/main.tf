@@ -2,7 +2,7 @@
 # nginx + certbot for qurl.link routing to NHP Server HTTP plugins
 #
 # Architecture:
-# Internet → NLB (TCP 443) → nginx (TLS termination) → NHP Server HTTP (port 8080)
+# Internet → NLB (TCP 443) → nginx (TLS termination) → NHP Server HTTP (port 8888)
 #
 # Routes:
 # - qurl.link/{appId} → /plugins/passcode?resid={appId}&action=login

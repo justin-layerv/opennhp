@@ -98,6 +98,46 @@ variable "ac_configs" {
 }
 
 # ============================================================================
+# NHP Protection Configuration
+# ============================================================================
+
+variable "internal_only" {
+  description = "Make Console internal-only (behind AC/NHP protection). When true, uses internal NLB, private subnets, HTTP-only mode."
+  type        = bool
+  default     = false
+}
+
+variable "ac_security_group_id" {
+  description = "Security group ID of AC instances (required when internal_only=true)"
+  type        = string
+  default     = null
+}
+
+variable "seed_console_resource" {
+  description = "Seed the Console as a portal site in RDS for NHP protection"
+  type        = bool
+  default     = false
+}
+
+variable "console_app_id" {
+  description = "App ID for Console resource in NHP (e.g., 'console')"
+  type        = string
+  default     = "console"
+}
+
+variable "ac_nlb_dns" {
+  description = "AC NLB DNS name for resource routing (required when seed_console_resource=true)"
+  type        = string
+  default     = null
+}
+
+variable "ac_domain" {
+  description = "AC domain suffix (e.g., '.nhp.layerv.xyz')"
+  type        = string
+  default     = ".nhp.layerv.xyz"
+}
+
+# ============================================================================
 # Domain and TLS Configuration
 # ============================================================================
 

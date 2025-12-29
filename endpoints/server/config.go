@@ -414,11 +414,13 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 		err = errLoadConfig
 	})
 
+	log.Info("Parsing etcd config (%d bytes): %q", len(content), string(content))
 	var serverEtcdConfig ServerEtcdConfig
 	if err = toml.Unmarshal(content, &serverEtcdConfig); err != nil {
 		log.Error("failed to unmarshal remote config: %v", err)
 		return err
 	}
+	log.Info("Unmarshaled serverEtcdConfig.AuthServiceId has %d entries", len(serverEtcdConfig.AuthServiceId))
 
 	// SECURITY: Never update base config from etcd.
 	// Private keys, LogLevel, and base config MUST come from local config.toml.
@@ -436,6 +438,10 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 	for _, aspData := range serverEtcdConfig.AuthServiceId {
 		aspId := aspData.AuthSvcId
 		aspMap[aspId] = aspData
+	}
+	log.Info("Parsed %d AuthServiceId entries from etcd config", len(aspMap))
+	for aspId, aspData := range aspMap {
+		log.Debug("  AuthServiceId[%s]: PluginPath=%q", aspId, aspData.PluginPath)
 	}
 	s.updateResources(aspMap)
 
@@ -617,10 +623,16 @@ func (s *UdpServer) updateResources(aspMap common.AuthSvcProviderMap) (err error
 	for aspId, aspData := range aspMap {
 		aspData.AuthSvcId = aspId
 		if len(aspData.PluginPath) > 0 {
+			log.Debug("Loading plugin for AuthServiceId %q from path %q", aspId, aspData.PluginPath)
 			h := plugins.ReadPluginHandler(aspData.PluginPath)
 			if h != nil {
 				s.LoadPlugin(aspId, h)
+				log.Info("Loaded plugin for AuthServiceId %q", aspId)
+			} else {
+				log.Error("Failed to load plugin for AuthServiceId %q from path %q", aspId, aspData.PluginPath)
 			}
+		} else {
+			log.Debug("AuthServiceId %q has no PluginPath configured", aspId)
 		}
 
 		for resId, res := range aspData.ResourceGroups {

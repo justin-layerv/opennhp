@@ -59,7 +59,15 @@ GET /plugins/:aspid/:resid/valid - Legacy validation endpoint
 
 **Listens On:**
 - UDP 62206 (via NLB) - NHP protocol knocks
-- TCP 443 (via Traefik) - HTTP auth flows
+- TCP 8888 (HTTP) - Plugin endpoints (passcode login, auth validation)
+  - **IMPORTANT:** Despite `http.toml` configuring `HttpListenPort = 8080`, the server actually listens on 8888
+  - This is accessed via AC Traefik (`/plugins/*` routes) or Demo Gateway nginx
+
+**HTTP Access Paths:**
+1. **Via AC Traefik** (primary for terraform): `{resid}.nhp.layerv.xyz/plugins/passcode?action=login`
+   - Traefik routes `/plugins/*` to `http://server.nhp.sandbox.internal:8888`
+2. **Via Demo Gateway** (for qurl.link): `qurl.link/{appId}`
+   - nginx routes to `http://server.nhp.sandbox.internal:8888/plugins/passcode?resid={appId}&action=login`
 
 ---
 
@@ -231,118 +239,91 @@ Traefik runs on AC instances as the reverse proxy with NHP middleware.
 
 ## Plugin Deployment System
 
-The plugin deployment system provides a unified approach for managing NHP Server plugins (Go .so files)
-and Traefik plugins (source files) across all deployment models.
+NHP uses two types of plugins with different deployment strategies:
 
-### Deployment Models
+| Plugin Type | Deployment | Reason |
+|------------|------------|--------|
+| **NHP Server plugins** | Baked into Docker image | Go plugins require exact version match with host binary |
+| **Traefik plugins** | Downloaded from S3 at boot | Source-based, no binary compatibility issues |
 
-| Model | Use Case | Plugin Source |
-|-------|----------|---------------|
-| **Dynamic (S3)** | Terraform-managed infrastructure | Downloaded from S3 at boot |
-| **Static (AMI)** | AWS Marketplace (AC only), air-gapped | Baked into AMI via Packer |
+### NHP Server Plugins (Docker-embedded)
 
-**Note:** Only the AC AMI is distributed via AWS Marketplace. Customers connect to LayerV-managed NHP Servers.
+Go plugins (`.so` files) are extremely sensitive to Go version mismatches. Even minor differences
+between the plugin and host binary cause runtime errors. To guarantee compatibility, plugins are
+built inside the same Docker image as the NHP Server.
 
-### Architecture
-
+**Architecture:**
 ```
-Plugin Repos                    S3 Bucket                    EC2 Instances
-┌──────────────────┐           ┌────────────────────────┐   ┌────────────────┐
-│ nhp-plugins-     │──build───►│ layerv-nhp-{env}-      │   │                │
-│ passcode         │  upload   │ plugins/               │   │ NHP Server     │
-└──────────────────┘           │ ├── nhp-server/        │◄──│ (downloads     │
-                               │ │   ├── passcode/      │   │  at boot)      │
-┌──────────────────┐           │ │   │   └── v1.0.0/    │   │                │
-│ nhp-plugins-     │──build───►│ │   │       └── main.so│   └────────────────┘
-│ oidc             │  upload   │ │   └── oidc/          │
-└──────────────────┘           │ │       └── v1.0.0/    │   ┌────────────────┐
-                               │ ├── traefik/           │   │                │
-┌──────────────────┐           │ │   └── nhp-token-     │◄──│ AC / Traefik   │
-│ traefik-plugins  │──build───►│ │       validator/     │   │ (downloads     │
-│                  │  upload   │ │       └── v1.0.0/    │   │  at boot)      │
-└──────────────────┘           │ └── configs/           │   │                │
-                               │     └── (Terraform-    │   └────────────────┘
-Terraform                      │         rendered)      │
-┌──────────────────┐           └────────────────────────┘
-│ plugins module   │──renders──►configs/*.toml
-│ (version pins)   │
+GitHub Actions                      ECR                         EC2
+┌──────────────────┐               ┌────────────────┐          ┌────────────────┐
+│ nhp repo         │               │ layerv/        │          │                │
+│ build-and-push   │──────────────►│ nhp-server     │─────────►│ NHP Server     │
+│ workflow         │               │ :latest        │ docker   │ (plugins       │
+│                  │               │                │ pull     │  included)     │
+│ ┌──────────────┐ │               │ Contains:      │          │                │
+│ │Dockerfile.   │ │               │ - nhp-serverd  │          └────────────────┘
+│ │server        │ │               │ - passcode.so  │
+│ │              │ │               │ - oidc.so      │
+│ │ builds both  │ │               └────────────────┘
+│ │ server AND   │ │
+│ │ plugins      │ │
+│ └──────────────┘ │
 └──────────────────┘
 ```
 
-### S3 Bucket Structure
+**Adding a new NHP Server plugin:**
+1. Add git clone + build to `docker/Dockerfile.server`
+2. Add plugin name to `server_plugins` list in terraform.tfvars
+3. Push to trigger CI build and deploy
 
+**Example Dockerfile.server:**
+```dockerfile
+# Build external plugins (same Go environment guarantees compatibility)
+RUN git clone --depth 1 https://github.com/layervai/nhp-plugins-passcode.git /tmp/passcode && \
+    cd /tmp/passcode && \
+    CGO_ENABLED=1 go build -buildmode=plugin -o /nhp-server/release/nhp-server/plugins/passcode/main.so .
+```
+
+### Traefik Plugins (S3-based)
+
+Traefik plugins are Go source files compiled by Traefik at runtime. They don't have binary
+compatibility issues, so they're downloaded from S3 at boot time.
+
+**S3 Structure:**
 ```
 s3://layerv-nhp-{env}-plugins/
-├── nhp-server/                    # NHP Server Go plugins
-│   ├── passcode/
-│   │   ├── v1.0.0/main.so
-│   │   └── latest/main.so
-│   └── oidc/
-│       └── v1.0.0/main.so
-├── traefik/                       # Traefik source plugins
+├── traefik/
 │   └── nhp-token-validator/
 │       └── v1.0.0/
 │           ├── .traefik.yml
 │           ├── go.mod
 │           └── *.go
-├── configs/                       # Terraform-rendered configs
-│   ├── nhp-server/
-│   │   ├── passcode/config.toml
-│   │   └── oidc/config.toml
-│   └── traefik/
-│       └── nhp-token-validator/config.toml
-└── manifest.json                  # Plugin versions and S3 keys
+└── configs/
+    └── traefik/
+        └── nhp-token-validator/config.toml
 ```
 
 ### Terraform Configuration
 
 ```hcl
-# terraform.tfvars (sandbox - uses "latest" for auto-updates)
+# terraform.tfvars
+# NHP Server plugins - just names (binaries baked into Docker image)
 server_plugins = {
-  passcode = {
-    version = "latest"  # Sandbox auto-picks up latest on instance refresh
-    config = {
-      ResourceMode = "api"
-      # SigningKey and AesKey passed via TF_VAR_ secrets
-    }
-  }
-  # oidc = {
-  #   version = "latest"
-  #   config = { ResourceMode = "api" }
-  # }
+  passcode = { version = "latest", config = {} }
 }
 
+# Traefik plugins - downloaded from S3
 traefik_plugins = {
-  hqdatamiddleware = {
-    version = "latest"
-    config  = {}
-  }
-}
-
-# terraform.tfvars (production - uses pinned versions)
-server_plugins = {
-  passcode = {
-    version = "v1.0.0"  # Pinned version for stability
-    config = { ... }
-  }
+  hqdatamiddleware = { version = "latest", config = {} }
 }
 ```
 
 ### Plugin CI/CD
 
-Plugin repositories use GitHub Actions with OIDC authentication to upload binaries to S3.
-
-**Plugin Repos:**
-| Repo | Plugin Type | Workflow |
-|------|-------------|----------|
-| `nhp-plugins-passcode` | NHP Server (.so) | `.github/workflows/build-and-deploy.yml` |
-| `nhp-plugins-oidc` | NHP Server (.so) | `.github/workflows/build-and-deploy.yml` |
-| `traefik-plugins` | Traefik (source) | `.github/workflows/deploy.yml` |
-
-**Deployment Flow:**
-1. **On push to main**: Builds plugin, uploads to `{plugin}/latest/`
-2. **On tag (v1.x.x)**: Uploads to both `{plugin}/{version}/` and `{plugin}/latest/`
-3. **To deploy**: Trigger ASG instance refresh to pick up new plugins
+| Repo | Plugin Type | Deployment |
+|------|-------------|------------|
+| `nhp` | NHP Server plugins | Built into Docker image via `docker/Dockerfile.server` |
+| `traefik-plugins` | Traefik middleware | Uploaded to S3, downloaded by AC at boot |
 
 ```bash
 # Deploy plugin update to running instances
@@ -752,15 +733,16 @@ Internet
 │                        Demo Gateway EC2 (Terraform module: demo-gateway)│
 │   NLB (TCP 443) → nginx (TLS termination via certbot)                   │
 │   Domain: qurl.link                                                     │
-│   Routes: /{appId} → NHP Server HTTP (port 8080)                        │
+│   Routes: /{appId} → NHP Server HTTP (port 8888)                        │
 └─────────────────────────────────────────────────────────────────────────┘
     │
-    ▼ (VPC internal, HTTP port 8080)
+    ▼ (VPC internal, HTTP port 8888)
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                        NHP Server (Terraform module: compute)            │
 │   NLB (UDP 62206) - knock packets                                       │
-│   HTTP 8080 - passcode plugin endpoint (EnableHttp = true)              │
+│   HTTP 8888 - passcode plugin endpoint (EnableHttp = true)              │
 │   Cloud Map: server.nhp.{env}.internal                                  │
+│   NOTE: HTTP listens on 8888 despite http.toml saying 8080              │
 └─────────────────────────────────────────────────────────────────────────┘
     │
     ▼ (NHP protocol - opens firewall via AC)
@@ -786,7 +768,7 @@ The Demo Gateway nginx routes requests to NHP Server's HTTP plugin endpoint:
 ```nginx
 # Route /{appId} to passcode plugin login page
 location ~ ^/(?<resid>[a-zA-Z0-9_-]+)/?$ {
-    proxy_pass http://server.nhp.sandbox.internal:8080/plugins/passcode?resid=$resid&action=login;
+    proxy_pass http://server.nhp.sandbox.internal:8888/plugins/passcode?resid=$resid&action=login;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -795,7 +777,7 @@ location ~ ^/(?<resid>[a-zA-Z0-9_-]+)/?$ {
 
 # Proxy all /plugins/* requests to NHP Server
 location /plugins/ {
-    proxy_pass http://server.nhp.sandbox.internal:8080;
+    proxy_pass http://server.nhp.sandbox.internal:8888;
     # ... headers
 }
 ```
@@ -807,8 +789,9 @@ location /plugins/ {
 | Console API | On AC at 172.31.26.100:8888 | Dedicated EC2 (console-ec2 module) |
 | qurl.link routing | nginx on NHP Servers | Demo Gateway EC2 (demo-gateway module) |
 | TLS for qurl.link | Manual cert management | certbot auto-renewal |
-| NHP Server HTTP | nginx proxy on 443 | Direct HTTP on port 8080 |
+| NHP Server HTTP | nginx proxy on 443 | Direct HTTP on port 8888 |
 | Service discovery | Static IPs | Cloud Map DNS |
+| /plugins routing | nginx on AC | Traefik on AC routes to NHP Server |
 
 ### Terraform Module Configuration
 
@@ -822,6 +805,48 @@ cross_account_route53_role_arn = "arn:aws:iam::165115313779:role/nhp-route53-acc
 # Enable Console EC2 (instead of Fargate)
 deploy_console_ec2 = true
 console_ec2_domain = "console.nhp.layerv.xyz"
+console_internal_only = true  # NHP-protected mode
+```
+
+### Console EC2 NHP Protection
+
+When `console_internal_only = true`, Console EC2 is protected by NHP:
+
+**Architecture:**
+```
+Internet → console.nhp.layerv.xyz (Route 53)
+    │
+    ▼
+AC NLB (TCP 443) → Traefik
+    │
+    ├── /plugins/* → NHP Server HTTP (port 8888) [login page, auth]
+    │
+    └── /* → nhp-acd (port 8888) [validates nhp_token, routes to Console]
+            │
+            ▼
+        Console internal NLB (port 8888) → Console EC2
+```
+
+**Login Flow:**
+1. User visits `console.nhp.layerv.xyz/plugins/passcode?resid=console&action=login`
+2. AC Traefik routes `/plugins/*` to NHP Server HTTP at `server.nhp.sandbox.internal:8888`
+3. NHP Server passcode plugin serves login page (from `passcode_login.html` template)
+4. User enters passcode, login page JS calls `action=auth` or `action=auth_code`
+5. NHP Server validates passcode with Console API, sets `nhp_token` cookie
+6. NHP Server sends NHP_AOP to AC to add user's srcIP to ipset
+7. User redirected to `console.nhp.layerv.xyz` - now accessible
+
+**Key Configuration:**
+- Console NLB: **internal** (not internet-facing)
+- Console EC2: runs in **private subnets**
+- Route 53: `console.nhp.layerv.xyz` → AC NLB (not Console NLB)
+- AC Traefik: routes authenticated requests to Console via nhp-acd
+
+**Terraform Variables:**
+```hcl
+console_internal_only = true   # Enable NHP protection
+console_ec2_domain = "console.nhp.layerv.xyz"
+ac_resource_ids = ["demo", "mini-app-demo", "console"]  # Include console
 ```
 
 ### Cross-Account Route 53
@@ -1249,6 +1274,7 @@ docker ps | grep nhp        # Only shows nhp-server, AC is not containerized
 | Knock succeeds but can't access | AC not receiving AOP | AC-Server connection, key mismatch |
 | Protected site shows login | Token expired or IP changed | Cookie expiry, refresh flow |
 | 502 on protected resource | Upstream unreachable | Traefik config, target health |
+| 502 on /plugins/* | NHP Server HTTP unreachable | See "NHP Server HTTP Troubleshooting" below |
 | AC can't connect to etcd | Missing certs or etcd down | See "etcd Troubleshooting" below |
 | Server logs "Reconciling AC peers: 0 entries" | No ACs in etcd registry | Check AC registration in etcd |
 | Server no `remote.toml` | Server can't discover ACs via etcd | See "Server etcd Configuration" below |
@@ -1339,6 +1365,53 @@ docker exec nhp-server cat /nhp-server/logs/server-$(date +%Y-%m-%d).log | grep 
 
 **If missing:** The Terraform user_data template should create `remote.toml` when `multi_tenant=true`
 and `etcd_endpoint` is configured. Check `terraform/modules/compute/user_data.sh.tpl`.
+
+### NHP Server HTTP Troubleshooting
+
+**Error:** 502 Bad Gateway when accessing `/plugins/*` on AC.
+
+The AC Traefik routes `/plugins/*` to NHP Server HTTP. If this fails, check:
+
+**1. Verify NHP Server HTTP is listening:**
+```bash
+# Find NHP Server instance
+AWS_PROFILE=layerv aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-name layerv-nhp-sandbox-server \
+  --query "AutoScalingGroups[0].Instances[0].InstanceId" --output text
+
+# Check what port HTTP is listening on (via SSM)
+AWS_PROFILE=layerv aws ssm send-command --instance-ids i-XXXXX \
+  --document-name "AWS-RunShellScript" \
+  --parameters 'commands=["ss -tlnp | grep -E \"8080|8888\""]'
+```
+
+**IMPORTANT PORT NOTE:**
+- `http.toml` configures `HttpListenPort = 8080`
+- **BUT** the server actually listens on **port 8888** (bug or config not read)
+- Always use port 8888 when routing to NHP Server HTTP
+- Check logs: `docker exec nhp-server grep "Listening http" /nhp-server/logs/server-$(date +%Y-%m-%d).log`
+
+**2. Check security group allows port 8888:**
+```bash
+# NHP Server SG should allow TCP 8888 from VPC CIDR
+AWS_PROFILE=layerv aws ec2 describe-security-groups \
+  --filters "Name=group-name,Values=*nhp*server*" \
+  --query "SecurityGroups[0].IpPermissions[?FromPort==\`8888\`]"
+```
+
+**3. Check AC Traefik config:**
+```bash
+# On AC instance - verify /plugins route exists
+cat /home/ubuntu/traefik/dynamic.toml | grep -A5 "nhp-plugins"
+# Should show: url = "http://server.nhp.sandbox.internal:8888"
+```
+
+**4. Test connectivity from AC to NHP Server:**
+```bash
+# On AC instance
+curl -s http://server.nhp.sandbox.internal:8888/health
+# 404 is OK (means HTTP is responding), timeout/connection refused is bad
+```
 
 ### SSM Diagnostic Commands
 

@@ -240,12 +240,7 @@ resource "aws_iam_role_policy_attachment" "server_ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# Attach plugin download policy (from plugins module)
-resource "aws_iam_role_policy_attachment" "server_plugins" {
-  count      = length(var.server_plugins) > 0 ? 1 : 0
-  role       = aws_iam_role.server.name
-  policy_arn = var.plugin_download_policy_arn
-}
+# Note: Plugins are now baked into the Docker image - no S3 IAM policy needed
 
 resource "aws_iam_role_policy" "server" {
   name = "server-permissions"
@@ -366,14 +361,14 @@ resource "aws_security_group" "server" {
     description = "NLB health check via SSH (internal only)"
   }
 
-  # HTTP for plugin endpoints (Demo Gateway routes here)
-  # Used by passcode, OIDC, and other authentication plugins
+  # HTTP for plugin endpoints (AC Traefik and Demo Gateway route here)
+  # NHP Server HTTP listens on 8888 for passcode, OIDC, and other authentication plugins
   ingress {
-    from_port   = 8080
-    to_port     = 8080
+    from_port   = 8888
+    to_port     = 8888
     protocol    = "tcp"
     cidr_blocks = [var.vpc_cidr]
-    description = "HTTP plugin endpoints from Demo Gateway"
+    description = "HTTP plugin endpoints from AC and Demo Gateway"
   }
 
   # All outbound
@@ -415,9 +410,9 @@ locals {
     auth_aes_key     = var.auth_aes_key
     # Deployment configuration
     image_tag = var.image_tag
-    # Plugin configuration
-    plugin_bucket_name = var.plugin_bucket_name
-    server_plugins     = var.server_plugins
+    # Plugin configuration (plugins are baked into Docker image)
+    server_plugins  = var.server_plugins
+    auth_service_id = var.auth_service_id
   })
 }
 

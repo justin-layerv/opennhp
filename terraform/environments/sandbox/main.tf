@@ -79,9 +79,10 @@ module "nhp" {
   cross_account_route53_role_arn = var.cross_account_route53_role_arn
 
   # Console EC2
-  deploy_console_ec2 = var.deploy_console_ec2
-  console_ec2_domain = var.console_ec2_domain
+  deploy_console_ec2    = var.deploy_console_ec2
+  console_ec2_domain    = var.console_ec2_domain
   console_cookie_domain = var.console_cookie_domain
+  console_internal_only = var.console_internal_only
 }
 
 # Re-export outputs

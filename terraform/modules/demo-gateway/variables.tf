@@ -54,7 +54,7 @@ variable "nhp_server_endpoint" {
 variable "nhp_server_port" {
   description = "NHP Server HTTP port for plugin requests"
   type        = number
-  default     = 8080
+  default     = 8888
 }
 
 # ============================================================================

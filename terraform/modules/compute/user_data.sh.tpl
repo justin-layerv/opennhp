@@ -162,7 +162,7 @@ else
 
   # Build the AuthServiceId section to append
   PLUGIN_SECTION='
-%{ for plugin_name, plugin in server_plugins ~}
+%{ for plugin_name in server_plugins ~}
 [[AuthServiceId]]
 AuthSvcId = "${plugin_name}"
 PluginPath = "${plugin_name}/main.so"

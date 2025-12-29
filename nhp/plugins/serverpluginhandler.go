@@ -133,11 +133,14 @@ func (s *PluginHandlerSymbol) AuthWithHttp(ctx *gin.Context, req *common.HttpKno
 }
 
 func ReadPluginHandler(pluginPath string) PluginHandler {
-	p, err := plugin.Open(filepath.Join(ExeDirPath, "plugins", pluginPath))
+	fullPath := filepath.Join(ExeDirPath, "plugins", pluginPath)
+	log.Debug("Opening plugin: %s (ExeDirPath=%s)", fullPath, ExeDirPath)
+	p, err := plugin.Open(fullPath)
 	if err != nil {
-		log.Error("open plugin %s failed: %v", pluginPath, err)
+		log.Error("open plugin %s failed: %v", fullPath, err)
 		return nil
 	}
+	log.Debug("Plugin opened successfully: %s", fullPath)
 	s := &PluginHandlerSymbol{}
 	s.sVersion, _ = p.Lookup("Version")
 	s.sSignature, _ = p.Lookup("Signature")

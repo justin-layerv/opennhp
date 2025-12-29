@@ -177,20 +177,20 @@ module "compute" {
   secrets_kms_key_arn = module.kms.secrets_key_arn
 
   # Server configuration options
-  dev_mode         = var.dev_mode
-  resource_mode    = var.resource_mode
-  auth_url         = var.auth_url
+  dev_mode      = var.dev_mode
+  resource_mode = var.resource_mode
+  # auth_url: Point to Console API for passcode validation
+  # Uses Console EC2 internal endpoint when deployed, otherwise falls back to var.auth_url
+  auth_url         = var.deploy_console_ec2 && var.deploy_rds ? module.console_ec2[0].internal_endpoint : var.auth_url
   auth_signing_key = var.auth_signing_key
   auth_aes_key     = var.auth_aes_key
 
   # Deployment configuration
   image_tag = var.image_tag
 
-  # Plugin configuration (from plugins module)
-  plugin_bucket_name         = module.plugins.bucket_name
-  plugin_bucket_arn          = module.plugins.bucket_arn
-  plugin_download_policy_arn = module.plugins.download_policy_arn
-  server_plugins             = module.plugins.server_plugins
+  # Plugin configuration (plugins baked into Docker image, just need names for etcd seeding)
+  server_plugins  = keys(var.server_plugins)
+  auth_service_id = var.ac_auth_service_id
 }
 
 # Monitoring Module - CloudWatch Dashboard, Alarms, Slack Notifications
@@ -385,7 +385,7 @@ module "demo_gateway" {
   # NHP Server endpoint for plugin HTTP requests
   # Uses Cloud Map DNS for service discovery within VPC
   nhp_server_endpoint = "server.${module.data.namespace_name}"
-  nhp_server_port     = 8080
+  nhp_server_port     = 8888
 
   # Route 53 for DNS and ACME challenges
   # For cross-account zones (e.g., qurl.link in layerv-mgmt), use cross_account_route53_role_arn
@@ -402,6 +402,7 @@ module "demo_gateway" {
 
 # Console EC2 Module - Console API on EC2 with nginx + Docker
 # Serves the Console API for portal site management (createPortalSitesByURL, etc.)
+# When console_internal_only=true, Console is NHP-protected (traffic routed through AC)
 module "console_ec2" {
   source = "./modules/console-ec2"
   count  = var.deploy_console_ec2 && var.deploy_rds ? 1 : 0
@@ -420,6 +421,18 @@ module "console_ec2" {
   acme_email    = var.acme_email
   cookie_domain = var.console_cookie_domain
 
+  # NHP Protection: When enabled, Console is internal-only (behind AC)
+  # Traffic flows: Internet → AC NLB → Traefik → Console internal NLB
+  internal_only        = var.console_internal_only
+  ac_security_group_id = var.deploy_ac && var.console_internal_only ? module.ac[0].security_group_id : null
+
+  # RDS seeding for NHP Console resource
+  # Seeds the portal_sites table with Console config so NHP Server/AC know how to route
+  seed_console_resource = var.console_internal_only && var.deploy_ac
+  console_app_id        = "console"
+  ac_nlb_dns            = var.deploy_ac ? module.ac[0].nlb_dns_name : null
+  ac_domain             = ".${var.domain_name}"
+
   # RDS configuration
   rds_endpoint          = module.rds[0].cluster_endpoint
   rds_port              = module.rds[0].cluster_port
@@ -437,7 +450,7 @@ module "console_ec2" {
     }
   ] : []
 
-  # Route 53 for DNS
+  # Route 53 for DNS (only used in external mode; internal mode DNS points to AC)
   hosted_zone_id = var.hosted_zone != null ? data.aws_route53_zone.main[0].zone_id : null
 
   # ECR for pulling console image
@@ -453,4 +466,20 @@ module "console_ec2" {
 data "aws_route53_zone" "main" {
   count = var.hosted_zone != null ? 1 : 0
   name  = var.hosted_zone
+}
+
+# Route 53 record for Console domain pointing to AC NLB (internal mode only)
+# When Console is NHP-protected, DNS should point to AC, not Console NLB
+resource "aws_route53_record" "console_via_ac" {
+  count = var.deploy_console_ec2 && var.console_internal_only && var.deploy_ac && var.hosted_zone != null ? 1 : 0
+
+  zone_id = data.aws_route53_zone.main[0].zone_id
+  name    = var.console_ec2_domain
+  type    = "A"
+
+  alias {
+    name                   = module.ac[0].nlb_dns_name
+    zone_id                = module.ac[0].nlb_zone_id
+    evaluate_target_health = true
+  }
 }

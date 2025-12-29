@@ -163,44 +163,24 @@ variable "image_tag" {
 
 # ============================================================================
 # Plugin Configuration
-# NHP Server plugins (passcode, oidc, etc.) are deployed via S3.
-# The plugins module manages the S3 bucket and config rendering.
+# NHP Server plugins (passcode, oidc, etc.) are baked into the Docker image.
+# This ensures Go version compatibility between server and plugins.
+# See docker/Dockerfile.server for plugin build configuration.
 # ============================================================================
-
-variable "plugin_bucket_name" {
-  description = "Name of the S3 bucket containing plugins (from plugins module)"
-  type        = string
-  default     = null
-}
-
-variable "plugin_bucket_arn" {
-  description = "ARN of the S3 bucket containing plugins (from plugins module)"
-  type        = string
-  default     = null
-}
-
-variable "plugin_download_policy_arn" {
-  description = "ARN of the IAM policy for downloading plugins (from plugins module)"
-  type        = string
-  default     = null
-}
 
 variable "server_plugins" {
   description = <<-EOT
-    Map of NHP Server plugins with their S3 keys (from plugins module output).
-    Example:
-    server_plugins = {
-      passcode = {
-        version    = "v1.0.0"
-        binary_key = "nhp-server/passcode/v1.0.0/main.so"
-        config_key = "configs/nhp-server/passcode/config.toml"
-      }
-    }
+    List of NHP Server plugin names that are baked into the Docker image.
+    These are used for etcd seeding (AuthServiceId configuration).
+    The actual plugin binaries are built into the Docker image at build time.
+    Example: ["passcode", "oidc"]
   EOT
-  type = map(object({
-    version    = string
-    binary_key = string
-    config_key = string
-  }))
-  default = {}
+  type        = list(string)
+  default     = []
+}
+
+variable "auth_service_id" {
+  description = "Auth Service Provider ID for resource.toml (maps aspId to plugin paths)"
+  type        = string
+  default     = ""
 }
