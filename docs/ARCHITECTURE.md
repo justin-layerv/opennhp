@@ -297,46 +297,74 @@ s3://layerv-nhp-{env}-plugins/
 ### Terraform Configuration
 
 ```hcl
-# terraform.tfvars
+# terraform.tfvars (sandbox - uses "latest" for auto-updates)
 server_plugins = {
   passcode = {
-    version = "v1.0.0"
+    version = "latest"  # Sandbox auto-picks up latest on instance refresh
     config = {
       ResourceMode = "api"
-      AuthUrl      = "http://console:8888"
-      SigningKey   = "secret-key"
-      AesKey       = "aes-key"
+      # SigningKey and AesKey passed via TF_VAR_ secrets
     }
   }
-  oidc = {
-    version = "v2.0.1"
-    config = {
-      ResourceMode       = "api"
-      AuthUrl            = "http://console:8888"
-      AUTH0_DOMAIN       = "dev-xyz.auth0.com"
-      OIDC_CLIENTID      = "client-id"
-      OIDC_CLIENTSECRET  = "client-secret"
-      AUTH0_CALLBACK_URL = "https://example.com/callback"
-    }
-  }
+  # oidc = {
+  #   version = "latest"
+  #   config = { ResourceMode = "api" }
+  # }
 }
 
 traefik_plugins = {
-  nhp-token-validator = {
-    version = "v1.0.0"
+  hqdatamiddleware = {
+    version = "latest"
     config  = {}
+  }
+}
+
+# terraform.tfvars (production - uses pinned versions)
+server_plugins = {
+  passcode = {
+    version = "v1.0.0"  # Pinned version for stability
+    config = { ... }
   }
 }
 ```
 
 ### Plugin CI/CD
 
-Plugin repositories use GitHub Actions with OIDC authentication to upload binaries to S3:
+Plugin repositories use GitHub Actions with OIDC authentication to upload binaries to S3.
 
-1. **On push to main**: Uploads to `{plugin}/latest/`
+**Plugin Repos:**
+| Repo | Plugin Type | Workflow |
+|------|-------------|----------|
+| `nhp-plugins-passcode` | NHP Server (.so) | `.github/workflows/build-and-deploy.yml` |
+| `nhp-plugins-oidc` | NHP Server (.so) | `.github/workflows/build-and-deploy.yml` |
+| `traefik-plugins` | Traefik (source) | `.github/workflows/deploy.yml` |
+
+**Deployment Flow:**
+1. **On push to main**: Builds plugin, uploads to `{plugin}/latest/`
 2. **On tag (v1.x.x)**: Uploads to both `{plugin}/{version}/` and `{plugin}/latest/`
+3. **To deploy**: Trigger ASG instance refresh to pick up new plugins
 
-The Terraform `plugins` module creates an IAM policy allowing GitHub Actions to upload.
+```bash
+# Deploy plugin update to running instances
+aws autoscaling start-instance-refresh \
+  --auto-scaling-group-name layerv-nhp-sandbox-server
+```
+
+**IAM Trust Policy:**
+The `nhp-{env}-github-actions` IAM role trusts plugin repos via GitHub OIDC.
+Plugin repos are configured in `plugin_repos` variable (passed to ECR module).
+
+### Fail-Fast Plugin Loading
+
+NHP Server instances **fail to start** if a configured plugin cannot be downloaded from S3.
+This ensures instances don't run in a broken state with missing auth plugins.
+
+```bash
+# Error in user_data if plugin missing:
+# "FATAL: One or more plugin downloads failed. Aborting instance startup."
+```
+
+**To fix:** Ensure plugin CI/CD has run and uploaded binaries before deploying instances.
 
 ### Packer Templates
 
