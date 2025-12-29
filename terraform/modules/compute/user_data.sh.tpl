@@ -78,9 +78,10 @@ Enable = false
 CONFIGEOF
 
 # NHP Server uses local config.toml for base config (UDP port 62206)
-# Configure HTTP server for admin/health endpoints
+# Configure HTTP server for plugin endpoints (passcode login, OIDC, etc.)
+# Demo Gateway routes qurl.link/{appId} to this endpoint
 cat > /opt/layerv/nhp-server/etc/http.toml << 'HTTPEOF'
-EnableHttp = false
+EnableHttp = true
 EnableTLS = false
 HttpListenIp = ""
 HttpListenPort = 8080

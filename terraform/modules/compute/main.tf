@@ -366,6 +366,16 @@ resource "aws_security_group" "server" {
     description = "NLB health check via SSH (internal only)"
   }
 
+  # HTTP for plugin endpoints (Demo Gateway routes here)
+  # Used by passcode, OIDC, and other authentication plugins
+  ingress {
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+    description = "HTTP plugin endpoints from Demo Gateway"
+  }
+
   # All outbound
   egress {
     from_port   = 0

@@ -725,6 +725,116 @@ qurl.link ──────────► NLB (us-east-2) ─┬─► NHP Ser
 
 ---
 
+## Demo Gateway Architecture
+
+The Demo Gateway provides TLS termination and routing for the demo flow, bridging qurl.link traffic
+to the NHP Server's HTTP plugin endpoints.
+
+### Architecture Overview
+
+```
+Internet
+    │
+    ├─────────────────────────────────────────────────────────────────────┐
+    ▼                                                                     │
+┌─────────────────────────────────────────────────────────────────────────┤
+│                        Console EC2 (Terraform module: console-ec2)      │
+│   NLB (TCP 443) → nginx (TLS) → Console API (Docker, port 8888)         │
+│   Domain: console.nhp.layerv.xyz                                        │
+│   API: createPortalSitesByURL, portal site management                   │
+└─────────────────────────────────────────────────────────────────────────┘
+    │
+    │ (website calls createPortalSitesByURL, returns appId + passcode)
+    │
+    ├─────────────────────────────────────────────────────────────────────┐
+    ▼                                                                     │
+┌─────────────────────────────────────────────────────────────────────────┤
+│                        Demo Gateway EC2 (Terraform module: demo-gateway)│
+│   NLB (TCP 443) → nginx (TLS termination via certbot)                   │
+│   Domain: qurl.link                                                     │
+│   Routes: /{appId} → NHP Server HTTP (port 8080)                        │
+└─────────────────────────────────────────────────────────────────────────┘
+    │
+    ▼ (VPC internal, HTTP port 8080)
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        NHP Server (Terraform module: compute)            │
+│   NLB (UDP 62206) - knock packets                                       │
+│   HTTP 8080 - passcode plugin endpoint (EnableHttp = true)              │
+│   Cloud Map: server.nhp.{env}.internal                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+    │
+    ▼ (NHP protocol - opens firewall via AC)
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        AC (Terraform module: ac)                         │
+│   NLB (TCP 443) → Traefik → protected resources                         │
+│   Domain: *.qurl.site, *.nhp.layerv.xyz                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Demo Flow (Terraform-Managed)
+
+1. **Create Portal Site**: Website → Console EC2 API (`console.nhp.layerv.xyz/api/ps/createPortalSitesByURL`)
+2. **Show Login Page**: User → `qurl.link/{appId}` → Demo Gateway nginx → NHP Server HTTP (`/plugins/passcode?action=login`)
+3. **Validate Passcode**: Login page JS → `{appId}.secure.layerv.xyz/plugins/passcode?action=valid` → NHP Server
+4. **Open Firewall**: NHP Server → AC (NHP_AOP message) → iptables updated
+5. **Access Resource**: Redirect → `{appId}.qurl.site` → AC Traefik → protected upstream
+
+### nginx Configuration (Demo Gateway)
+
+The Demo Gateway nginx routes requests to NHP Server's HTTP plugin endpoint:
+
+```nginx
+# Route /{appId} to passcode plugin login page
+location ~ ^/(?<resid>[a-zA-Z0-9_-]+)/?$ {
+    proxy_pass http://server.nhp.sandbox.internal:8080/plugins/passcode?resid=$resid&action=login;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+
+# Proxy all /plugins/* requests to NHP Server
+location /plugins/ {
+    proxy_pass http://server.nhp.sandbox.internal:8080;
+    # ... headers
+}
+```
+
+### Key Differences from Manual Infrastructure
+
+| Aspect | Manual (Legacy) | Terraform (New) |
+|--------|-----------------|-----------------|
+| Console API | On AC at 172.31.26.100:8888 | Dedicated EC2 (console-ec2 module) |
+| qurl.link routing | nginx on NHP Servers | Demo Gateway EC2 (demo-gateway module) |
+| TLS for qurl.link | Manual cert management | certbot auto-renewal |
+| NHP Server HTTP | nginx proxy on 443 | Direct HTTP on port 8080 |
+| Service discovery | Static IPs | Cloud Map DNS |
+
+### Terraform Module Configuration
+
+```hcl
+# Enable Demo Gateway
+deploy_demo_gateway = true
+demo_gateway_domain = "qurl.link"
+demo_gateway_hosted_zone_id = "Z..." # qurl.link zone in layerv-mgmt
+cross_account_route53_role_arn = "arn:aws:iam::165115313779:role/nhp-route53-access"
+
+# Enable Console EC2 (instead of Fargate)
+deploy_console_ec2 = true
+console_ec2_domain = "console.nhp.layerv.xyz"
+```
+
+### Cross-Account Route 53
+
+The `qurl.link` and `qurl.site` zones are in the layerv-mgmt account (165115313779).
+For ACME DNS-01 challenges and DNS record management:
+
+1. Demo Gateway and Console EC2 instances assume `cross_account_route53_role_arn`
+2. This role grants `route53:ChangeResourceRecordSets` on the target zones
+3. certbot uses the role for DNS-01 challenges
+
+---
+
 ## Infrastructure (AWS)
 
 **IMPORTANT:** LayerV has TWO distinct infrastructure setups that must not be confused:

@@ -420,6 +420,46 @@ variable "plugin_repos" {
   default     = ["nhp-plugins-passcode", "nhp-plugins-oidc", "traefik-plugins"]
 }
 
+# ==================== Demo Gateway Configuration ====================
+
+variable "deploy_demo_gateway" {
+  description = "Deploy the Demo Gateway for qurl.link routing to NHP Server plugins"
+  type        = bool
+  default     = false
+}
+
+variable "demo_gateway_domain" {
+  description = "Domain for Demo Gateway (e.g., qurl.link)"
+  type        = string
+  default     = null
+}
+
+variable "demo_gateway_hosted_zone_id" {
+  description = "Route 53 hosted zone ID for Demo Gateway domain (if in different zone than main hosted_zone)"
+  type        = string
+  default     = null
+}
+
+variable "demo_gateway_fallback_url" {
+  description = "URL to redirect when accessing Demo Gateway root path"
+  type        = string
+  default     = "https://layerv.ai/demo"
+}
+
+# ==================== Console EC2 Configuration ====================
+
+variable "deploy_console_ec2" {
+  description = "Deploy the Console API on EC2 (alternative to ECS Fargate console)"
+  type        = bool
+  default     = false
+}
+
+variable "console_ec2_domain" {
+  description = "Domain for Console EC2 API (e.g., console.nhp.layerv.xyz)"
+  type        = string
+  default     = null
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {

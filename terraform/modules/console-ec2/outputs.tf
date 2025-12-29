@@ -1,0 +1,46 @@
+# Console EC2 Module Outputs
+
+output "nlb_dns_name" {
+  description = "Console NLB DNS name"
+  value       = aws_lb.console.dns_name
+}
+
+output "nlb_arn" {
+  description = "Console NLB ARN"
+  value       = aws_lb.console.arn
+}
+
+output "nlb_zone_id" {
+  description = "Console NLB zone ID for Route 53"
+  value       = aws_lb.console.zone_id
+}
+
+output "fqdn" {
+  description = "Console fully qualified domain name"
+  value       = var.hosted_zone_id != null ? aws_route53_record.console[0].fqdn : var.domain_name
+}
+
+output "api_endpoint" {
+  description = "Console API endpoint URL"
+  value       = "https://${var.domain_name}"
+}
+
+output "asg_name" {
+  description = "Auto Scaling Group name"
+  value       = aws_autoscaling_group.console.name
+}
+
+output "security_group_id" {
+  description = "Console security group ID"
+  value       = aws_security_group.console.id
+}
+
+output "log_group_name" {
+  description = "CloudWatch log group name"
+  value       = aws_cloudwatch_log_group.console.name
+}
+
+output "instance_role_arn" {
+  description = "Console instance IAM role ARN"
+  value       = aws_iam_role.console.arn
+}

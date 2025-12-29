@@ -366,3 +366,91 @@ module "ac" {
   plugin_download_policy_arn = module.plugins.download_policy_arn
   traefik_plugins            = module.plugins.traefik_plugins
 }
+
+# Demo Gateway Module - nginx + certbot for qurl.link routing to NHP Server plugins
+# Routes qurl.link/{appId} to NHP Server HTTP passcode plugin
+module "demo_gateway" {
+  source = "./modules/demo-gateway"
+  count  = var.deploy_demo_gateway ? 1 : 0
+
+  environment       = var.environment
+  domain_name       = var.demo_gateway_domain
+  acme_email        = var.acme_email
+  vpc_id            = module.networking.vpc_id
+  vpc_cidr          = var.vpc_cidr
+  public_subnet_ids = module.networking.public_subnet_ids
+  name_prefix       = local.name_prefix
+  tags              = local.common_tags
+
+  # NHP Server endpoint for plugin HTTP requests
+  # Uses Cloud Map DNS for service discovery within VPC
+  nhp_server_endpoint = "server.${module.data.namespace_name}"
+  nhp_server_port     = 8080
+
+  # Route 53 for DNS and ACME challenges
+  # For cross-account zones (e.g., qurl.link in layerv-mgmt), use cross_account_route53_role_arn
+  cross_account_route53_role_arn = var.cross_account_route53_role_arn
+  hosted_zone_id                 = var.demo_gateway_hosted_zone_id
+
+  # KMS encryption
+  ebs_kms_key_arn  = module.kms.ebs_key_arn
+  logs_kms_key_arn = module.kms.logs_key_arn
+
+  # Fallback redirect
+  fallback_url = var.demo_gateway_fallback_url
+}
+
+# Console EC2 Module - Console API on EC2 with nginx + Docker
+# Serves the Console API for portal site management (createPortalSitesByURL, etc.)
+module "console_ec2" {
+  source = "./modules/console-ec2"
+  count  = var.deploy_console_ec2 && var.deploy_rds ? 1 : 0
+
+  environment        = var.environment
+  name_prefix        = local.name_prefix
+  vpc_id             = module.networking.vpc_id
+  vpc_cidr           = var.vpc_cidr
+  public_subnet_ids  = module.networking.public_subnet_ids
+  private_subnet_ids = module.networking.private_subnet_ids
+  tags               = local.common_tags
+
+  # Console application
+  console_image = "${module.ecr.console_repo_url}:latest"
+  domain_name   = var.console_ec2_domain
+  acme_email    = var.acme_email
+  cookie_domain = var.console_cookie_domain
+
+  # RDS configuration
+  rds_endpoint          = module.rds[0].cluster_endpoint
+  rds_port              = module.rds[0].cluster_port
+  rds_database_name     = module.rds[0].database_name
+  rds_secret_arn        = module.rds[0].secret_arn
+  rds_security_group_id = module.rds[0].security_group_id
+
+  # AC configuration - use Terraform-managed AC
+  ac_configs = var.deploy_ac ? [
+    {
+      id       = "layerv-ac-tf"
+      ip       = module.ac[0].nlb_dns_name
+      port     = 443
+      protocol = "tcp"
+    }
+  ] : []
+
+  # Route 53 for DNS
+  hosted_zone_id = var.hosted_zone != null ? data.aws_route53_zone.main[0].zone_id : null
+
+  # ECR for pulling console image
+  ecr_repo_arn = module.ecr.console_repo_arn
+
+  # KMS encryption
+  ebs_kms_key_arn     = module.kms.ebs_key_arn
+  logs_kms_key_arn    = module.kms.logs_key_arn
+  secrets_kms_key_arn = module.kms.secrets_key_arn
+}
+
+# Data source for hosted zone (used by console_ec2)
+data "aws_route53_zone" "main" {
+  count = var.hosted_zone != null ? 1 : 0
+  name  = var.hosted_zone
+}

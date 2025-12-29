@@ -94,11 +94,33 @@ traefik_plugins = {
   }
 }
 
+# Repos that can assume the GitHub Actions IAM role
+# Includes plugin repos AND console for Docker builds
+plugin_repos = ["nhp-plugins-passcode", "nhp-plugins-oidc", "traefik-plugins", "console"]
+
 # Production domains - disabled in sandbox
 # qurl.site/qurl.link zones are in layerv-mgmt, requiring cross-account Route 53 access
 # which conflicts with nhp.layerv.xyz in layerv account. Enable in prod environment only.
 # production_domains = ["qurl.site", "qurl.link"]
 # cross_account_route53_role_arn = "arn:aws:iam::165115313779:role/nhp-ac-route53-access"
+
+# ==============================================================================
+# Demo Gateway Configuration
+# Routes qurl.link/{appId} to NHP Server passcode plugin for demo flow
+# ==============================================================================
+# Set to true to deploy Demo Gateway (nginx + certbot for TLS)
+# Requires cross_account_route53_role_arn for qurl.link ACME challenges
+deploy_demo_gateway = false
+# demo_gateway_domain = "qurl.link"
+# demo_gateway_hosted_zone_id = "Z..." # qurl.link zone ID in layerv-mgmt
+
+# ==============================================================================
+# Console EC2 Configuration
+# Console API for portal site management (alternative to Fargate - more cost effective)
+# ==============================================================================
+# Set to true to deploy Console on EC2 instead of ECS Fargate
+deploy_console_ec2 = false
+console_ec2_domain = "console.nhp.layerv.xyz"
 
 tags = {
   Organization = "LayerV"
