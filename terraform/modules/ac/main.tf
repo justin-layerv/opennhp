@@ -1250,7 +1250,7 @@ resource "aws_lambda_invocation" "etcd_seeder" {
     auth_service_id   = var.auth_service_id
     resource_ids      = jsonencode(var.resource_ids)
     # Force re-seed when Lambda code changes (catches validation improvements)
-    lambda_hash       = data.archive_file.etcd_seeder[0].output_base64sha256
+    lambda_hash = data.archive_file.etcd_seeder[0].output_base64sha256
   }
 
   depends_on = [aws_iam_role_policy.etcd_seeder]
