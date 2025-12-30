@@ -123,6 +123,20 @@ variable "auth_url" {
   default = null
 }
 
+variable "auth_signing_key" {
+  description = "Signing key for authentication tokens (required when resource_mode is 'api')"
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "auth_aes_key" {
+  description = "AES encryption key for authentication (required when resource_mode is 'api')"
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
 # Monitoring
 variable "enable_slack_notifications" {
   type    = bool

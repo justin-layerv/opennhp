@@ -279,8 +279,12 @@ ResourceMode = "${resource_mode}"
 # AuthUrl: Console internal NLB for API mode
 AuthUrl = "${auth_url}"
 # JWT/Encryption settings (optional, Console provides these)
+%{ if auth_signing_key != null ~}
 SigningKey = "${auth_signing_key}"
+%{ endif ~}
+%{ if auth_aes_key != null ~}
 AesKey = "${auth_aes_key}"
+%{ endif ~}
 PLUGINEOF
 echo "Created passcode plugin config"
 %{ endif ~}
