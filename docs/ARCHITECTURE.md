@@ -135,10 +135,11 @@ GET  /api/ps/findSiteByApplicationId - Get site by app ID
 
 Plugins handle different authentication methods. They run inside the NHP Server process as statically compiled modules.
 
-> **Note:** Server plugins are now part of the main `nhp` repository at `endpoints/server/plugins/`.
+> **Note:** Server plugins are in `endpoints/server/staticplugins/` (not `plugins/`).
 > They are statically compiled into the server binary—no dynamic loading or `.so` files.
+> The `plugins/` directory is for upstream OpenNHP dynamic plugins (example, okta) with Makefiles.
 
-#### Passcode Plugin (`endpoints/server/plugins/passcode/`)
+#### Passcode Plugin (`endpoints/server/staticplugins/passcode/`)
 
 Handles passcode-based authentication for the demo flow.
 
@@ -207,7 +208,7 @@ The passcode plugin's `action=login` returns an HTML login page. When the user s
 This is why the `*.secure.layerv.xyz` nginx config works while qurl.link's specific location doesn't
 need to handle `/plugins/passcode` POST requests.
 
-#### OIDC/Okta Plugin (`endpoints/server/plugins/oidc/`)
+#### OIDC/Okta Plugin (`endpoints/server/staticplugins/oidc/`)
 
 Handles OAuth2/OIDC authentication with identity providers.
 
@@ -257,14 +258,20 @@ cross-compilation and deployment.
 
 **Plugin Registry Architecture:**
 ```
-endpoints/server/plugins/
-├── registry.go         # Plugin registry (maps IDs to factories)
-├── passcode/           # Passcode authentication plugin
-│   ├── main.go         # Plugin entry, init() registers with registry
+nhp/plugins/
+└── registry.go             # Plugin registry (maps IDs to factories)
+
+endpoints/server/staticplugins/   # Statically compiled plugins
+├── passcode/                     # Passcode authentication plugin
+│   ├── main.go                   # Plugin entry, init() registers with registry
 │   └── ...
-└── oidc/               # OIDC/OAuth2 authentication plugin
-    ├── main.go         # Plugin entry, init() registers with registry
+└── oidc/                         # OIDC/OAuth2 authentication plugin
+    ├── main.go                   # Plugin entry, init() registers with registry
     └── ...
+
+endpoints/server/plugins/         # Upstream OpenNHP dynamic plugins (with Makefiles)
+├── example/
+└── okta/
 ```
 
 **How It Works:**
@@ -279,8 +286,8 @@ endpoints/server/plugins/
 2. The server `main.go` imports plugins with blank imports to trigger registration:
    ```go
    import (
-       _ "github.com/OpenNHP/opennhp/endpoints/server/plugins/oidc"
-       _ "github.com/OpenNHP/opennhp/endpoints/server/plugins/passcode"
+       _ "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/oidc"
+       _ "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/passcode"
    )
    ```
 
@@ -290,7 +297,7 @@ endpoints/server/plugins/
    ```
 
 **Adding a new NHP Server plugin:**
-1. Create new directory under `endpoints/server/plugins/{plugin-name}/`
+1. Create new directory under `endpoints/server/staticplugins/{plugin-name}/`
 2. Implement the `PluginHandler` interface
 3. Register the plugin in `init()` using `plugins.RegisterPlugin()`
 4. Add blank import in `endpoints/server/main/main.go`
