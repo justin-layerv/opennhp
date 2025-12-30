@@ -385,6 +385,14 @@ RESOURCES=$(cat <<RESEOF
 RESEOF
 )
 
+# Build ExtInfo JSON (required by passcode plugin for login page)
+# Generate a random app secret for passcode authentication
+APP_SECRET=$(openssl rand -hex 32)
+EXT_INFO=$(cat <<EXTEOF
+{"Title": "LayerV Console", "JWTSecret": "$JWT_SECRET", "AppSecret": ["$APP_SECRET"]}
+EXTEOF
+)
+
 # Run the seed SQL
 PGPASSWORD="$RDS_PASSWORD" psql -h "${rds_endpoint}" -p ${rds_port} -U "$RDS_USERNAME" -d "${rds_database_name}" <<SQLEOF
 -- Insert Console portal site if not exists
@@ -397,7 +405,7 @@ INSERT INTO portal_sites (
 SELECT
     NOW(), NOW(), '$CONSOLE_SITE_NAME', '$CONSOLE_SITE_URL', '$CONSOLE_APP_ID', '$JWT_SECRET',
     '$COOKIE_DOMAIN', $OPENTIME, false, false, 'LayerV',
-    '$SERVICE_INFO'::jsonb, '$RESOURCES'::jsonb, '{}'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb,
+    '$SERVICE_INFO'::jsonb, '$RESOURCES'::jsonb, '$EXT_INFO'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb,
     $TOKEN_EXPIRE, 'active', 'system'
 WHERE NOT EXISTS (
     SELECT 1 FROM portal_sites WHERE app_id = '$CONSOLE_APP_ID'
