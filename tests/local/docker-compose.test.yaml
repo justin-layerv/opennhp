@@ -1,0 +1,58 @@
+# Local e2e test environment for NHP
+#
+# Quick start (etcd only - for AC registry tests):
+#   docker compose -f tests/local/docker-compose.test.yaml up -d etcd
+#   cd tests/local && go test -v -tags=local ./...
+#   docker compose -f tests/local/docker-compose.test.yaml down
+#
+# Full stack (requires building images):
+#   docker compose -f tests/local/docker-compose.test.yaml up -d
+#   docker compose -f tests/local/docker-compose.test.yaml logs -f
+
+networks:
+  nhp-test:
+    driver: bridge
+
+services:
+  # etcd for AC registry and config storage
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.11
+    container_name: nhp-test-etcd
+    command:
+      - etcd
+      - --name=etcd0
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-cluster=etcd0=http://etcd:2380
+      - --log-level=warn
+    ports:
+      - "2379:2379"
+    networks:
+      - nhp-test
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Optional: NHP Server for full stack testing
+  # Uncomment and build with: docker compose build nhp-server
+  # nhp-server:
+  #   image: opennhp-server:test
+  #   build:
+  #     context: ../..
+  #     dockerfile: ./docker/Dockerfile.server
+  #   container_name: nhp-test-server
+  #   depends_on:
+  #     etcd:
+  #       condition: service_healthy
+  #   environment:
+  #     - ETCD_ENDPOINTS=http://etcd:2379
+  #   volumes:
+  #     - ./config/server:/nhp-server/etc:ro
+  #   ports:
+  #     - "62206:62206/udp"
+  #   networks:
+  #     - nhp-test

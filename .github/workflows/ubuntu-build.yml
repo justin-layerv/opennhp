@@ -24,5 +24,23 @@ jobs:
     - name: Build
       run: make
 
-    - name: Test
+    - name: Run Unit Tests
       run: make test
+
+  test-e2e:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.22'
+
+    - name: Install test dependencies
+      run: cd tests/local && go mod tidy
+
+    - name: Run Local E2E Tests
+      run: make test-local
+      # testcontainers-go automatically manages the etcd container lifecycle

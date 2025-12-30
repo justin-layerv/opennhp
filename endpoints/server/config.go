@@ -435,9 +435,29 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 	if serverEtcdConfig.HttpConfig.EnableHttp || serverEtcdConfig.HttpConfig.HttpListenPort > 0 {
 		s.updateHttpConfig(serverEtcdConfig.HttpConfig)
 	}
-	s.updateACPeers(serverEtcdConfig.ACs)
-	s.updateAgentPeers(serverEtcdConfig.Agents)
-	s.updateDePeers(serverEtcdConfig.DBs)
+
+	// Only update AC/Agent/DB peers from etcd config if they are explicitly defined.
+	// When using AC registry (/nhp/ac-registry/), ACs register dynamically and are
+	// managed by reconcileACPeersFromRegistry(). We must NOT wipe those peers when
+	// the etcd config is updated without [[ACs]] section.
+	if len(serverEtcdConfig.ACs) > 0 {
+		log.Info("Updating %d AC peers from etcd config", len(serverEtcdConfig.ACs))
+		s.updateACPeers(serverEtcdConfig.ACs)
+	} else {
+		log.Debug("No [[ACs]] in etcd config, preserving existing AC peers (registry mode)")
+	}
+	if len(serverEtcdConfig.Agents) > 0 {
+		log.Info("Updating %d Agent peers from etcd config", len(serverEtcdConfig.Agents))
+		s.updateAgentPeers(serverEtcdConfig.Agents)
+	} else {
+		log.Debug("No [[Agents]] in etcd config, preserving existing Agent peers")
+	}
+	if len(serverEtcdConfig.DBs) > 0 {
+		log.Info("Updating %d DB peers from etcd config", len(serverEtcdConfig.DBs))
+		s.updateDePeers(serverEtcdConfig.DBs)
+	} else {
+		log.Debug("No [[DBs]] in etcd config, preserving existing DB peers")
+	}
 
 	// Only update resources from etcd if AuthServiceId is explicitly configured.
 	// Otherwise, keep the local resource.toml config (plugins are statically compiled).

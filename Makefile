@@ -199,12 +199,20 @@ plugins:
 	@if test -d $(NHP_SERVER_PLUGINS); then $(MAKE) -C $(NHP_SERVER_PLUGINS); fi
 
 test:
-	@echo "[OpenNHP] Runing Tests for the Output Binaries ..."
-	@echo "$(COLOUR_GREEN)[OpenNHP] All Tests Are Done!$(END_COLOUR)"
+	@echo "[OpenNHP] Running Unit Tests..."
+	cd endpoints && KBS_SKIP_INIT=1 go test -v ./server/... -run "Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry"
+	@echo "$(COLOUR_GREEN)[OpenNHP] Unit Tests Done!$(END_COLOUR)"
+
+test-local: ## Run local e2e tests (requires: docker compose -f tests/local/docker-compose.test.yaml up -d etcd)
+	@echo "[OpenNHP] Running Local E2E Tests..."
+	cd tests/local && go test -v -tags=local ./...
+	@echo "$(COLOUR_GREEN)[OpenNHP] Local E2E Tests Done!$(END_COLOUR)"
+
+test-all: test test-local ## Run all tests
 
 archive:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Start archiving... $(END_COLOUR)"
 	@cd release && mkdir -p archive && tar -czvf ./archive/$(PACKAGE_FILE) nhp-agent nhp-ac nhp-db nhp-server
 	@echo "$(COLOUR_GREEN)[OpenNHP] Package ${PACKAGE_FILE} archived!$(END_COLOUR)"
 
-.PHONY: all generate-version-and-build init agentd acd serverd db linuxagentsdk androidagentsdk macosagentsdk iosagentsdk devicesdk plugins test archive ebpf clean_ebpf
+.PHONY: all generate-version-and-build init agentd acd serverd db linuxagentsdk androidagentsdk macosagentsdk iosagentsdk devicesdk plugins test test-local test-all archive ebpf clean_ebpf
