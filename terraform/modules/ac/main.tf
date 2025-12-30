@@ -1107,21 +1107,41 @@ def handler(event, context):
     client_cert = tls_secret['clientCert']
     client_key = tls_secret['clientKey']
 
-    # Get server public key
-    server_public_key = ''
-    if server_secret_arn:
-        try:
-            server_secret = json.loads(secrets.get_secret_value(SecretId=server_secret_arn)['SecretString'])
-            server_public_key = server_secret.get('publicKey', '')
-        except Exception as e:
-            print(f"Warning: Could not get server public key: {e}")
+    # Get server public key - REQUIRED for AC-Server communication
+    # Fail loudly if we can't get it to prevent writing broken config
+    if not server_secret_arn:
+        raise ValueError("ServerSecretArn is required - cannot seed etcd without server public key")
 
-    # Build TOML config for ACs (no private keys, no static server config)
-    # Only contains [[Servers]] - ACs need to know where to connect
-    # HttpConfig/plugins are local files on each server, not in etcd
-    config_toml = f'''# NHP AC Configuration (seeded by Terraform)
-# This config is read by ACs on startup.
+    try:
+        server_secret = json.loads(secrets.get_secret_value(SecretId=server_secret_arn)['SecretString'])
+        server_public_key = server_secret.get('publicKey', '')
+    except Exception as e:
+        raise RuntimeError(f"FATAL: Could not get server public key from {server_secret_arn}: {e}. "
+                          "Refusing to write broken config to etcd.")
+
+    if not server_public_key:
+        raise ValueError(f"Server secret {server_secret_arn} exists but has no 'publicKey' field. "
+                        "Refusing to write broken config to etcd.")
+
+    # Build TOML config for NHP components (no private keys)
+    # Contains: HttpConfig, AuthServiceId (plugins), [[Servers]] for ACs
+    # Private keys are stored in per-instance Secrets Manager secrets.
+    config_toml = f'''# NHP Configuration (seeded by Terraform)
+# This config is read by both NHP Server and ACs on startup.
 # Private keys are stored in per-instance Secrets Manager secrets.
+
+# HTTP server configuration for NHP Server
+# This enables the plugin endpoints (passcode login, etc.)
+[HttpConfig]
+EnableHttp = true
+EnableTLS = false
+HttpListenIp = ""
+HttpListenPort = 8888
+
+# Auth Service Provider - passcode plugin (statically compiled)
+# This triggers updateResources() to load the plugin handler
+[[AuthServiceId]]
+AuthSvcId = "passcode"
 
 # Server peers - ACs dial OUT to these servers
 [[Servers]]
@@ -1225,9 +1245,12 @@ resource "aws_lambda_invocation" "etcd_seeder" {
 
   triggers = {
     # Re-seed when config changes
-    server_nlb_dns  = var.server_nlb_dns
-    auth_service_id = var.auth_service_id
-    resource_ids    = jsonencode(var.resource_ids)
+    server_nlb_dns    = var.server_nlb_dns
+    server_secret_arn = var.server_secret_arn
+    auth_service_id   = var.auth_service_id
+    resource_ids      = jsonencode(var.resource_ids)
+    # Force re-seed when Lambda code changes (catches validation improvements)
+    lambda_hash       = data.archive_file.etcd_seeder[0].output_base64sha256
   }
 
   depends_on = [aws_iam_role_policy.etcd_seeder]

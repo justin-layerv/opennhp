@@ -196,19 +196,17 @@ aws ecr get-login-password --region "$REGION" | docker login --username AWS --pa
 docker pull "$CONSOLE_IMAGE"
 
 echo "Starting Console container..."
-# Internal mode: bind to 8080 (nginx proxies from ${console_port})
-# External mode: bind to ${console_port} directly
-%{ if internal_only ~}
-DOCKER_PORT=8080
-%{ else ~}
-DOCKER_PORT=${console_port}
-%{ endif ~}
+# Console app listens on port 8888 inside the container (from config.docker.yaml)
+# Internal mode: nginx on host proxies from 8888 to container via host port 8080
+# External mode: nginx proxies from ${console_port} to container via host port 8080
+CONTAINER_PORT=8888
+HOST_PORT=8080
 
 docker run -d \
     --name console \
     --restart always \
-    -p 127.0.0.1:$DOCKER_PORT:$DOCKER_PORT \
-    -e "GVA_CONFIG_SYSTEM_ADDR=$DOCKER_PORT" \
+    -p 127.0.0.1:$HOST_PORT:$CONTAINER_PORT \
+    -e "GVA_CONFIG_SYSTEM_ADDR=$CONTAINER_PORT" \
     -e "GVA_CONFIG_SYSTEM_DBTYPE=pgsql" \
     -e "GVA_CONFIG_SYSTEM_COOKIEDOMAIN=${cookie_domain}" \
     -e "GVA_CONFIG_PGSQL_PATH=${rds_endpoint}" \
@@ -223,7 +221,7 @@ docker run -d \
 # Wait for console to be healthy
 echo "Waiting for Console to be healthy..."
 for i in {1..30}; do
-    if curl -s http://127.0.0.1:$DOCKER_PORT/api/health | grep -q "ok"; then
+    if curl -s http://127.0.0.1:$HOST_PORT/health | grep -q "ok"; then
         echo "Console is healthy"
         break
     fi
@@ -242,7 +240,7 @@ cat > /etc/nginx/sites-available/console << 'NGINXEOF'
 # Proxies HTTPS to Console Docker container
 
 upstream console_backend {
-    server 127.0.0.1:${console_port};
+    server 127.0.0.1:8080;
     keepalive 32;
 }
 

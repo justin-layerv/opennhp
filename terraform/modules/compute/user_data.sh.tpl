@@ -264,6 +264,26 @@ cat > /opt/layerv/nhp-server/etc/resource.toml << 'RESEOF'
 %{ endfor ~}
 RESEOF
 echo "resource.toml created for plugins: ${join(", ", server_plugins)}"
+
+# Create plugin config directories and configs
+%{ for plugin_name in server_plugins ~}
+mkdir -p /opt/layerv/nhp-server/plugins/${plugin_name}/etc
+%{ endfor ~}
+
+# Passcode plugin config (uses API mode with Console as auth backend)
+%{ if contains(server_plugins, "passcode") ~}
+cat > /opt/layerv/nhp-server/plugins/passcode/etc/config.toml << PLUGINEOF
+# Passcode plugin configuration
+# ResourceMode: "api" uses Console API, "file" uses local resource.toml
+ResourceMode = "${resource_mode}"
+# AuthUrl: Console internal NLB for API mode
+AuthUrl = "${auth_url}"
+# JWT/Encryption settings (optional, Console provides these)
+SigningKey = "${auth_signing_key}"
+AesKey = "${auth_aes_key}"
+PLUGINEOF
+echo "Created passcode plugin config"
+%{ endif ~}
 %{ else ~}
 echo "No plugins configured, skipping resource.toml creation"
 %{ endif ~}
@@ -284,6 +304,7 @@ ExecStart=/usr/bin/docker run --rm --name nhp-server \
   --net=host \
   -v /opt/layerv/nhp-server/etc:/nhp-server/etc:ro \
   -v /opt/layerv/nhp-server/log:/nhp-server/logs \
+  -v /opt/layerv/nhp-server/plugins:/nhp-server/plugins:ro \
   ${server_repo_url}:${image_tag}
 ExecStop=/usr/bin/docker stop nhp-server
 
