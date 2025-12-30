@@ -232,7 +232,8 @@ jobs:
   # ============================================================================
   terraform-validate:
     name: Terraform Validate (PR)
-    if: github.event_name == 'pull_request'
+    # Skip for Dependabot PRs - they can't assume AWS OIDC role and typically only update dependencies
+    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
