@@ -1015,6 +1015,7 @@ resource "aws_iam_role_policy" "terraform_apply_services" {
           "lambda:RemovePermission",
           "lambda:TagResource",
           "lambda:UntagResource",
+          "lambda:InvokeFunction",
           "cloudtrail:CreateTrail",
           "cloudtrail:DeleteTrail",
           "cloudtrail:UpdateTrail",
