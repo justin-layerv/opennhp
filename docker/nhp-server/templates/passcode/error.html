@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Error Page</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #f5f5f5;
+            color: #333;
+        }
+        .error-container {
+            text-align: center;
+            padding: 30px;
+            border-radius: 8px;
+            background-color: white;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            max-width: 500px;
+            width: 90%;
+        }
+        h1 {
+            color: #d32f2f;
+            margin-bottom: 20px;
+        }
+        .error-code {
+            font-size: 24px;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        .error-message {
+            margin-bottom: 20px;
+            line-height: 1.6;
+        }
+        .home-link {
+            display: inline-block;
+            padding: 8px 16px;
+            background-color: #1976d2;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+            transition: background-color 0.3s;
+        }
+        .home-link:hover {
+            background-color: #1565c0;
+        }
+    </style>
+</head>
+<body>
+    <div class="error-container">
+        <h1>Error Occurred</h1>
+        <div class="error-code">Error Code: <span id="errorId"></span></div>
+        <div class="error-message" id="errorMessage"></div>
+        <a id="customLink" class="home-link">Go Back</a>
+    </div>
+
+    <script>
+        // Get error ID parameter from URL
+        const urlParams = new URLSearchParams(window.location.search);
+        const errorId = urlParams.get('id') || 'unknown';
+        
+        // Define error messages for each error ID (redirectURL, resource host)
+        const errorMessages = {
+            '400': 'Passcode has expired, please contact administrator.',
+            '401': 'AuthUrl not provided, please contact administrator.',                 
+            '402': 'Passcode not provided, please contact administrator.',  
+            '403': 'AuthUrl is invalid, please contact administrator.',
+            '404': 'AuthUrl parsing failed, please contact administrator.',
+            '405': 'HTTP request creation failed, please contact administrator.',
+            '406': 'HTTP request sending failed, please contact administrator.',
+            '407': 'HTTP response reading failed, please contact administrator.',
+            '408': 'HTTP status code error, please contact administrator.',
+            '409': 'HTTP response JSON parsing failed, please contact administrator.',
+            '410': 'Token generation failed, please contact administrator.',
+            '411': 'RedirectURL parsing failed, please contact administrator.',
+            '412': 'Resource host retrieval failed, please contact administrator.',
+            '600': 'Request missing helper info, please contact administrator.',
+            '601': 'App ID not provided, please contact administrator.',
+            '602': 'Authorization not provided, please contact administrator.',
+            '603': 'HTTP request creation failed, please contact administrator.',
+            '604': 'HTTP request sending failed, please contact administrator.',
+            '605': 'HTTP response reading failed, please contact administrator.',
+            '606': 'HTTP status code error, please contact administrator.',
+            'unknown': 'Unknown error occurred, please contact administrator.'
+        };
+        // Display error message
+        document.getElementById('errorId').textContent = errorId;
+        document.getElementById('errorMessage').textContent = 
+            errorMessages[errorId] || errorMessages['unknown'];
+
+  document.getElementById('customLink').addEventListener('click', function(e) {
+    e.preventDefault(); // Prevent default navigation
+    
+    const urlParams = new URLSearchParams(window.location.search);
+    const resid = urlParams.get('resid');
+    
+    if (resid) {
+      window.location.href = `/plugins/passcode?action=login&resid=${resid}`;
+    }
+  });
+    </script>
+</body>
+</html>

@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+    <script>
+        /**
+         * Cross-domain Token Refresh Manager
+         */
+        class CrossDomainTokenRefresher {
+            constructor(options = {}) {
+                this.refreshInterval = null;
+                this.refreshIntervalTime = options.interval || 10000; // Default 10s
+                this.tokenName = options.tokenName || "nhp_token";
+                this.refreshTokenName = options.refreshTokenName || "nhp_refresh_token";
+                this.apiEndpoint = options.apiEndpoint || "/plugins/{{ .aspId }}?resid={{ .resId }}&action=refresh";
+                this.withCredentials = options.withCredentials || true;
+                this.corsOptions = {
+                    mode: "cors",
+                    credentials: this.withCredentials ? "include" : "same-origin"
+                };
+                this.logFunction = options.log || console.log;
+            }
+
+            log(message) {
+                const timestamp = new Date().toLocaleTimeString();
+                const logMessage = `[${timestamp}] ${message}`;
+                this.logFunction(logMessage);
+            }
+            async refreshToken() {
+                try {
+                    this.log("Refreshing Token...");
+                    const response = await fetch(this.apiEndpoint, {
+                        method: "GET",
+                        headers: {
+                            "Content-Type": "application/json",
+                        },
+                        ...this.corsOptions
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`Request failed: ${response.status}`);
+                    }
+
+                    const data = await response.json();
+                    if (data.errCode == "52005") {
+                        this.stop();
+                        this.log("Token refresh failed:"+data.errMsg);
+                        return;
+                    }
+                    if (data.nhp_token) {
+                        this.log("Token refresh succeeded"+data.nhp_token);
+                    } else {
+                        this.log("Token refresh failed:"+data.errMsg);
+                    }
+                    
+                } catch (error) {
+                    this.log(`Refresh failed: ${error.message}`);
+                    this.handleRefreshError(error);
+                }
+            }
+
+            handleRefreshError(error) {
+                if (error.message.includes("401")) {
+                    this.stop();
+                } else if (error.message.includes("network")) {
+                    setTimeout(() => this.refreshToken(), 30000);
+                }
+            }
+
+            start() {
+                this.refreshToken();
+                this.refreshInterval = setInterval(
+                    () => this.refreshToken(),
+                    this.refreshIntervalTime
+                );
+                this.log(`Token refresh started, interval: ${this.refreshIntervalTime/1000} seconds`);
+            }
+
+            stop() {
+                if (this.refreshInterval) {
+                    clearInterval(this.refreshInterval);
+                    this.refreshInterval = null;
+                }
+                this.log("Token refresh stopped");
+            }
+        }
+
+        // Initialize after page load
+        document.addEventListener("DOMContentLoaded", () => {
+            // Initialize refresher
+            const refresher = new CrossDomainTokenRefresher({
+                apiEndpoint: "",
+                withCredentials: true,
+                interval: 10000, // 10 seconds for demo
+            });
+
+            refresher.start();
+        });
+    </script>
+</body>
+</html>

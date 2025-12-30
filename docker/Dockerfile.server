@@ -43,6 +43,9 @@ RUN apt-get update && \
 # Copy built binary
 COPY --from=builder /nhp-server/release/nhp-server /nhp-server
 
+# Copy templates for plugins (passcode login pages, etc.)
+COPY docker/nhp-server/templates /nhp-server/templates
+
 # Run as non-root user (optional, requires NET_ADMIN capability)
 # RUN useradd -r -s /bin/false nhp
 # USER nhp

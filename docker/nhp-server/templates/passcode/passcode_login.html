@@ -1,0 +1,1007 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ .title }}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            /* Brand Colors - Dark Tech Theme */
+            --bg-dark: #0a0a0f;
+            --bg-darker: #050508;
+            --bg-card: rgba(15, 15, 25, 0.8);
+            --bg-card-hover: rgba(25, 25, 40, 0.9);
+            --bg-gradient: linear-gradient(135deg, #0a0a0f 0%, #0d1117 50%, #0a0a0f 100%);
+            
+            /* Accent Colors */
+            --accent-cyan: #00d4ff;
+            --accent-blue: #3b82f6;
+            --accent-purple: #8b5cf6;
+            --accent-green: #10b981;
+            --accent-red: #ef4444;
+            --accent-gradient: linear-gradient(135deg, #00d4ff 0%, #3b82f6 50%, #8b5cf6 100%);
+            --glow-cyan: rgba(0, 212, 255, 0.3);
+            --glow-blue: rgba(59, 130, 246, 0.3);
+            
+            /* Text Colors */
+            --text-primary: #ffffff;
+            --text-secondary: #a0aec0;
+            --text-muted: #64748b;
+            
+            /* Borders */
+            --border-subtle: rgba(255, 255, 255, 0.08);
+            --border-accent: rgba(0, 212, 255, 0.3);
+            
+            /* Typography */
+            --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+            
+            /* Transitions */
+            --transition-fast: 0.15s ease;
+            --transition-normal: 0.3s ease;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: var(--font-sans);
+        }
+        
+        body {
+            background: var(--bg-gradient);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            color: var(--text-primary);
+        }
+        
+        .container {
+            background: var(--bg-card);
+            border: 1px solid var(--border-accent);
+            border-radius: 16px;
+            box-shadow: 0 8px 40px rgba(0, 212, 255, 0.15);
+            padding: 40px;
+            width: 100%;
+            max-width: 700px;
+            text-align: center;
+            position: relative;
+            backdrop-filter: blur(10px);
+        }
+        
+        .language-selector {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+        }
+        
+        .language-selector select {
+            padding: 8px 12px;
+            border: 1px solid var(--border-subtle);
+            border-radius: 6px;
+            background: rgba(0, 0, 0, 0.3);
+            color: var(--text-secondary);
+            font-size: 14px;
+            cursor: pointer;
+            transition: var(--transition-fast);
+        }
+        
+        .language-selector select:hover {
+            border-color: var(--accent-cyan);
+        }
+        
+        .language-selector select:focus {
+            outline: none;
+            border-color: var(--accent-cyan);
+        }
+        
+        h1 {
+            color: var(--text-primary);
+            margin-bottom: 24px;
+            font-weight: 700;
+            font-size: 1.75rem;
+            background: var(--accent-gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .description {
+            color: var(--text-secondary);
+            margin-bottom: 30px;
+            line-height: 1.6;
+            font-size: 15px;
+        }
+        
+        .form-group {
+            margin-bottom: 25px;
+            text-align: left;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: var(--text-muted);
+            font-weight: 600;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        
+        .input-wrapper {
+            position: relative;
+            display: flex;
+            align-items: center;
+        }
+        
+        input[type="password"],
+        input[type="text"] {
+            width: 100%;
+            padding: 14px 50px 14px 16px;
+            border: 1px solid var(--border-subtle);
+            border-radius: 8px;
+            font-size: 15px;
+            background: rgba(0, 0, 0, 0.3);
+            color: var(--text-primary);
+            font-family: var(--font-mono);
+            transition: var(--transition-normal);
+        }
+        
+        input:focus {
+            outline: none;
+            border-color: var(--accent-cyan);
+            box-shadow: 0 0 0 3px var(--glow-cyan);
+        }
+        
+        input::placeholder {
+            color: var(--text-muted);
+        }
+        
+        .toggle-password {
+            position: absolute;
+            right: 12px;
+            background: transparent;
+            border: none;
+            cursor: pointer;
+            padding: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+            transition: var(--transition-fast);
+        }
+        
+        .toggle-password:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+        
+        .toggle-password svg {
+            width: 22px;
+            height: 22px;
+            color: var(--text-secondary);
+        }
+        
+        button[type="submit"] {
+            background: linear-gradient(135deg, var(--accent-cyan) 0%, var(--accent-blue) 100%);
+            color: var(--bg-dark);
+            border: none;
+            border-radius: 8px;
+            padding: 14px 24px;
+            width: 100%;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: var(--transition-normal);
+            box-shadow: 0 4px 15px var(--glow-cyan);
+        }
+        
+        button[type="submit"]:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 25px var(--glow-cyan);
+        }
+        
+        .message {
+            margin-top: 20px;
+            padding: 14px;
+            border-radius: 8px;
+            display: none;
+            font-size: 14px;
+        }
+        
+        .error {
+            background: rgba(239, 68, 68, 0.15);
+            color: var(--accent-red);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+        }
+        
+        .success {
+            background: rgba(16, 185, 129, 0.15);
+            color: var(--accent-green);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+        }
+
+        .status {
+            margin-bottom: 1.5rem;
+            border-bottom: 1px solid var(--border-subtle);
+            padding-bottom: 1.5rem;
+        }
+
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 0.75rem;
+            font-size: 0.9rem;
+        }
+
+        .status-label {
+            font-weight: 600;
+            color: var(--text-secondary);
+            padding-right: 0.5rem;
+        }
+
+        .status-value {
+            color: var(--text-muted);
+        }
+
+        .note {
+            text-align: center;
+            margin-bottom: 1rem;
+            font-size: 0.95rem;
+            color: var(--text-secondary);
+        }
+        
+        .note a {
+            color: var(--accent-cyan);
+            text-decoration: none;
+            transition: var(--transition-fast);
+        }
+        
+        .note a:hover {
+            color: var(--text-primary);
+            text-decoration: underline;
+        }
+        
+        /* 模态对话框样式 */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: rgba(0, 0, 0, 0.7);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+            display: none;
+            backdrop-filter: blur(4px);
+        }
+        
+        .modal {
+            background: var(--bg-card);
+            border: 1px solid var(--border-accent);
+            border-radius: 16px;
+            box-shadow: 0 8px 40px rgba(0, 212, 255, 0.2);
+            width: 90%;
+            max-width: 500px;
+            padding: 30px;
+        }
+        
+        .modal-header {
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .modal-title {
+            font-size: 18px;
+            font-weight: 700;
+            color: var(--accent-red);
+        }
+        
+        .modal-close {
+            background: none;
+            border: none;
+            font-size: 28px;
+            cursor: pointer;
+            color: var(--text-muted);
+            width: auto;
+            padding: 0;
+            line-height: 1;
+            transition: var(--transition-fast);
+        }
+        
+        .modal-close:hover {
+            color: var(--text-primary);
+        }
+        
+        .modal-body {
+            margin-bottom: 25px;
+            color: var(--text-secondary);
+            line-height: 1.7;
+            font-size: 0.95rem;
+        }
+        
+        .warning-text {
+            color: var(--accent-red);
+            font-weight: 500;
+            margin-bottom: 15px;
+        }
+        
+        .modal-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+        }
+        
+        .modal-button {
+            width: auto;
+            padding: 10px 20px;
+            font-size: 14px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: var(--transition-normal);
+        }
+        
+        .modal-button-secondary {
+            background: rgba(255, 255, 255, 0.1);
+            color: var(--text-secondary);
+            border: 1px solid var(--border-subtle);
+        }
+        
+        .modal-button-secondary:hover {
+            background: rgba(255, 255, 255, 0.15);
+            color: var(--text-primary);
+        }
+        
+        .modal-button-primary {
+            background: linear-gradient(135deg, var(--accent-cyan) 0%, var(--accent-blue) 100%);
+            color: var(--bg-dark);
+            border: none;
+        }
+        
+        .modal-button-primary:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 15px var(--glow-cyan);
+        }
+        
+        .remember-checkbox {
+            display: flex;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        
+        .remember-checkbox input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            margin-right: 10px;
+            accent-color: var(--accent-cyan);
+            cursor: pointer;
+        }
+        
+        .remember-checkbox label {
+            margin-bottom: 0;
+            font-weight: normal;
+            text-transform: none;
+            letter-spacing: 0;
+            color: var(--text-secondary);
+            cursor: pointer;
+        }
+        
+        /* Okta按钮样式 */
+        .okta-button {
+            background: linear-gradient(135deg, var(--accent-purple) 0%, var(--accent-blue) 100%);
+            color: var(--text-primary);
+            margin-top: 15px;
+            box-shadow: 0 4px 15px rgba(139, 92, 246, 0.3);
+        }
+        
+        .okta-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(139, 92, 246, 0.4);
+        }
+        
+        .divider {
+            display: flex;
+            align-items: center;
+            margin: 25px 0;
+        }
+        
+        .divider::before,
+        .divider::after {
+            content: "";
+            flex: 1;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+        
+        .divider-text {
+            padding: 0 15px;
+            color: var(--text-muted);
+            font-size: 14px;
+        }
+        
+        .hidden {
+            display: none !important;
+        }
+        
+        .auto-fill-notice {
+            background: rgba(16, 185, 129, 0.15);
+            color: var(--accent-green);
+            padding: 10px 14px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 14px;
+            display: none;
+            border: 1px solid rgba(16, 185, 129, 0.3);
+        }
+        
+        /* Invalid passcode modal styles */
+        .error-title {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .error-icon {
+            width: 24px;
+            height: 24px;
+            color: var(--accent-red);
+        }
+        
+        .invalid-passcode-text {
+            color: var(--text-primary);
+            font-size: 1rem;
+            margin-bottom: 12px;
+        }
+        
+        .invalid-passcode-hint {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+        }
+        
+        /* Logo styles */
+        .logo-container {
+            margin-bottom: 24px;
+        }
+        
+        .logo-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            text-decoration: none;
+            transition: var(--transition-fast);
+        }
+        
+        .logo-link:hover {
+            opacity: 0.85;
+        }
+        
+        .logo-img {
+            width: 48px;
+            height: 48px;
+            object-fit: contain;
+        }
+        
+        .logo-text {
+            font-size: 1.75rem;
+            font-weight: 700;
+            color: var(--text-primary);
+            letter-spacing: -0.02em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="language-selector">
+            <select id="languageSelect">
+                <option value="en-US">English</option>
+                <option value="zh-CN">中文</option>
+                <option value="ja-JP">日本語</option>
+                <option value="ko-KR">한국어</option>
+            </select>
+        </div>
+        
+        <div class="logo-container">
+            <a href="https://layerv.ai" target="_blank" class="logo-link">
+                <svg width="40" height="40" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs><linearGradient id="mantisGradient" x1="20" y1="0" x2="20" y2="40" gradientUnits="userSpaceOnUse"><stop stop-color="#0099FF"></stop><stop offset="1" stop-color="#0f172a"></stop></linearGradient><linearGradient id="mantisStroke" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse"><stop offset="0%" stop-color="#0099FF"></stop><stop offset="40%" stop-color="#D406B9"></stop><stop offset="70%" stop-color="purple"></stop><stop offset="100%" stop-color="purple"></stop></linearGradient></defs><path d="M15 6 L9 0 M25 6 L31 0" stroke="url(#mantisStroke)" stroke-width="1.5" stroke-linecap="round" opacity="0.8"></path><path d="M20 38 L2 11 L14 6 L26 6 L38 11 Z" fill="url(#mantisGradient)" fill-opacity="0.2"></path><path d="M20 38 L2 11 L14 6 L26 6 L38 11 Z" stroke="url(#mantisStroke)" stroke-width="2" stroke-linejoin="round"></path><path d="M17 33 L20 38 L23 33" stroke="#0099FF" stroke-width="1.5" fill="none"></path><ellipse cx="5" cy="11" rx="3" ry="5" fill="#0099FF"></ellipse><ellipse cx="35" cy="11" rx="3" ry="5" fill="#0099FF"></ellipse><path d="M20 18 L20 33" stroke="#0099FF" stroke-width="1" stroke-opacity="0.3"></path><path d="M20 18 L14 6 M20 18 L26 6" stroke="#0099FF" stroke-width="1" stroke-opacity="0.3"></path></svg>
+                <span class="logo-text">LayerV</span>
+            </a>
+        </div>
+        
+        <h1 id="pageTitle">{{ .title }}</h1>
+        
+        <div class="status">
+            <p class="note">
+                <span id="protectedServerText">The protected server is</span> 
+                <a href="{{.redirectUrl}}" target="_blank">{{.redirectUrl}}</a>. 
+                (<a href="https://dnschecker.org/port-scanner.php?query={{.redirectUrl}}&ptype=server" target="_blank" id="scanPortsText">Port Scan >> </a>)
+            </p>
+            <br/>
+            <div class="status-item">
+                <span class="status-label" id="beforeLoginText">Before Authorization: </span>
+                <span class="status-value timeout" id="timeoutStatusText">Connection to the protected server should be <strong>timeout. ❌</strong></span>
+            </div>
+            <div class="status-item">
+                <span class="status-label" id="afterLoginText">After Authorization: </span>
+                <span class="status-value success" id="successStatusText">Connection to the protected server should be <strong>successful. ✅</strong></span>
+            </div>
+        </div>     
+        <p class="description" id="descriptionText">Please enter NHP access passcode to continue</p>
+        
+        <div class="auto-fill-notice" id="autoFillNotice">
+            Passcode has been automatically filled from URL parameter
+        </div>
+        
+        <form id="passcodeForm">
+            <div class="form-group">
+                <label for="passcode" id="passcodeLabel">Passcode</label>
+                <div class="input-wrapper">
+                    <input type="password" id="passcode" name="passcode" placeholder="Please enter NHP access passcode" required>
+                    <button type="button" class="toggle-password" onclick="togglePassword()" title="Show/Hide Passcode">
+                        <svg id="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                            <circle cx="12" cy="12" r="3"></circle>
+                        </svg>
+                        <svg id="eye-closed" style="display:none;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path>
+                            <line x1="1" y1="1" x2="23" y2="23"></line>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+            <div class="remember-checkbox">
+                <input type="checkbox" id="rememberPasscode">
+                <label for="rememberPasscode" id="rememberPasscodeLabel">Remember passcode</label>
+            </div>
+            <button type="submit" id="submitButton">Login</button>
+        </form>
+        
+        <div class="divider" id="dividerContainer">
+            <span class="divider-text" id="dividerText">or</span>
+        </div>
+        
+        <button id="oktaLogin" class="okta-button">Okta Login</button>
+        
+        <div id="message" class="message"></div>
+    </div>
+
+    <!-- 风险提示模态对话框 -->
+    <div class="modal-overlay" id="riskModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 class="modal-title" id="modalTitle">Security Risk Warning</h3>
+                <button class="modal-close" id="closeModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="warning-text" id="warningText">You have chosen to remember the access passcode on this device. This provides convenience, but please note:</p>
+                <p id="modalBodyText1">Anyone who can use your current device may use your access passcode for login authentication.</p>
+                <p id="modalBodyText2">It is strongly recommended to use this feature only on your personal, trusted, and password-protected devices.</p>
+            </div>
+            <div class="modal-footer">
+                <button class="modal-button modal-button-secondary" id="cancelRemember">Cancel</button>
+                <button class="modal-button modal-button-primary" id="confirmRemember">I understand the risks and continue</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 无效密钥提示模态对话框 -->
+    <div class="modal-overlay" id="invalidPasscodeModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 class="modal-title error-title" id="invalidPasscodeTitle">
+                    <svg class="error-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <line x1="15" y1="9" x2="9" y2="15"></line>
+                        <line x1="9" y1="9" x2="15" y2="15"></line>
+                    </svg>
+                    Invalid Passcode
+                </h3>
+                <button class="modal-close" id="closeInvalidModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="invalid-passcode-text" id="invalidPasscodeText">The passcode you entered is invalid or has expired. Please check and try again.</p>
+                <p class="invalid-passcode-hint" id="invalidPasscodeHint">If you continue to experience issues, please contact your administrator.</p>
+            </div>
+            <div class="modal-footer">
+                <button class="modal-button modal-button-primary" id="closeInvalidBtn">OK</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Toggle password visibility
+        function togglePassword() {
+            const passcodeInput = document.getElementById('passcode');
+            const eyeOpen = document.getElementById('eye-open');
+            const eyeClosed = document.getElementById('eye-closed');
+            
+            if (passcodeInput.type === 'password') {
+                passcodeInput.type = 'text';
+                eyeOpen.style.display = 'none';
+                eyeClosed.style.display = 'block';
+            } else {
+                passcodeInput.type = 'password';
+                eyeOpen.style.display = 'block';
+                eyeClosed.style.display = 'none';
+            }
+        }
+        
+        // 多语言资源
+        const resources = {
+            'zh-CN': {
+                title: 'NHP 访问认证',
+                protectedServer: '受保护的服务器是',
+                scanPorts: '端口扫描 >>',
+                beforeLogin: '授权前: ',
+                timeoutStatus: '与受保护服务器的连接应为 <strong>超时. ❌</strong>',
+                afterLogin: '授权后: ',
+                successStatus: '与受保护服务器的连接应该 <strong>成功. ✅</strong>',
+                description: '请输入NHP访问密钥以继续操作',
+                passcodePlaceholder: '请输入NHP访问密钥',
+                passcodeLabel: '密钥',
+                rememberPasscode: '记住密钥',
+                submit: '登 录',
+                divider: '或',
+                oktaLogin: 'Okta Login',
+                modalTitle: '安全风险提示',
+                warningText: '您选择在本地设备上记住访问密钥。这将带来便利，但请注意：',
+                modalBodyText1: '任何能使用您当前设备的人都可能使用你的访问密钥进行登录验证。',
+                modalBodyText2: '强烈建议仅在您个人的、受信任的且受密码保护的设备上使用此功能。',
+                cancel: '取消',
+                confirm: '我知悉上述风险并继续',
+                enterPasscode: '请输入访问密钥',
+                networkError: '网络错误，请稍后重试',
+                autoFillNotice: '已从URL参数自动填充访问密钥',
+                invalidPasscodeTitle: '密钥无效',
+                invalidPasscodeText: '您输入的密钥无效或已过期，请检查后重试。',
+                invalidPasscodeHint: '如果问题持续存在，请联系您的管理员。',
+                ok: '确定'
+            },
+            'en-US': {
+                title: 'NHP Access Authentication',
+                protectedServer: 'The protected server is',
+                scanPorts: 'Port Scan >>',
+                beforeLogin: 'Before Authorization: ',
+                timeoutStatus: 'Connection to the protected server should be <strong>timeout. ❌</strong>',
+                afterLogin: 'After Authorization: ',
+                successStatus: 'Connection to the protected server should be <strong>successful. ✅</strong>',
+                description: 'Please enter NHP access passcode to continue',
+                passcodePlaceholder: 'Please enter NHP access passcode',
+                passcodeLabel: 'Passcode',
+                rememberPasscode: 'Remember passcode',
+                submit: 'Login',
+                divider: 'or',
+                oktaLogin: 'Okta Login',
+                modalTitle: 'Security Risk Warning',
+                warningText: 'You have chosen to remember the access passcode on this device. This provides convenience, but please note:',
+                modalBodyText1: 'Anyone who can use your current device may use your access passcode for login authentication.',
+                modalBodyText2: 'It is strongly recommended to use this feature only on your personal, trusted, and password-protected devices.',
+                cancel: 'Cancel',
+                confirm: 'I understand the risks and continue',
+                enterPasscode: 'Please enter access passcode',
+                networkError: 'Network error, please try again later',
+                autoFillNotice: 'Passcode has been automatically filled from URL parameter',
+                invalidPasscodeTitle: 'Invalid Passcode',
+                invalidPasscodeText: 'The passcode you entered is invalid or has expired. Please check and try again.',
+                invalidPasscodeHint: 'If you continue to experience issues, please contact your administrator.',
+                ok: 'OK'
+            },
+            'ja-JP': {
+                title: 'NHP アクセス認証',
+                protectedServer: '保護されたサーバーは',
+                scanPorts: 'ポートスキャン >>',
+                beforeLogin: '認証前: ',
+                timeoutStatus: '保護されたサーバーへの接続は<strong>タイムアウトするはずです. ❌</strong>',
+                afterLogin: '認証後: ',
+                successStatus: '保護されたサーバーへの接続は<strong>成功するはずです. ✅</strong>',
+                description: '続行するにはNHPアクセスパスコードを入力してください',
+                passcodePlaceholder: 'NHPアクセスパスコードを入力してください',
+                passcodeLabel: 'パスコード',
+                rememberPasscode: 'パスコードを記憶する',
+                submit: '送信',
+                divider: 'または',
+                oktaLogin: 'Okta ログイン',
+                modalTitle: 'セキュリティリスク警告',
+                warningText: 'このデバイスにアクセスパスコードを記憶することを選択しました。これは便利ですが、以下の点に注意してください:',
+                modalBodyText1: '現在のデバイスを使用できる人は誰でも、ログイン認証にあなたのアクセスパスコードを使用する可能性があります。',
+                modalBodyText2: 'この機能は、個人の、信頼できる、パスワードで保護されたデバイスでのみ使用することを強くお勧めします。',
+                cancel: 'キャンセル',
+                confirm: 'リスクを理解して続行します',
+                enterPasscode: 'アクセスパスコードを入力してください',
+                networkError: 'ネットワークエラー、後でもう一度お試しください',
+                autoFillNotice: 'URLパラメータからパスコードが自動的に入力されました',
+                invalidPasscodeTitle: 'パスコードが無効です',
+                invalidPasscodeText: '入力されたパスコードが無効または期限切れです。確認してもう一度お試しください。',
+                invalidPasscodeHint: '問題が解決しない場合は、管理者にお問い合わせください。',
+                ok: 'OK'
+            },
+            'ko-KR': {
+                title: 'NHP 접근 인증',
+                protectedServer: '보호된 서버는',
+                scanPorts: '포트 스캔 >>',
+                beforeLogin: '인증 전: ',
+                timeoutStatus: '보호된 서버에 대한 연결은 <strong>시간 초과되어야 합니다. ❌</strong>',
+                afterLogin: '인증 후: ',
+                successStatus: '보호된 서버에 대한 연결은 <strong>성공해야 합니다. ✅</strong>',
+                description: '계속하려면 NHP 액세스 패스코드를 입력하십시오',
+                passcodePlaceholder: 'NHP 액세스 패스코드를 입력하십시오',
+                passcodeLabel: '패스코드',
+                rememberPasscode: '패스코드 기억',
+                submit: '제출',
+                divider: '또는',
+                oktaLogin: 'Okta 로그인',
+                modalTitle: '보안 위험 경고',
+                warningText: '이 기기에 액세스 패스코드를 저장하기로 선택했습니다. 이는 편리하지만 다음 사항에 유의하십시오:',
+                modalBodyText1: '현재 기기를 사용할 수 있는 사람은 누구나 로그인 인증에 귀하의 액세스 패스코드를 사용할 수 있습니다.',
+                modalBodyText2: '개인적이고 신뢰할 수 있으며 암호로 보호된 기기에서만 이 기능을 사용하는 것이 좋습니다.',
+                cancel: '취소',
+                confirm: '위험을 이해하고 계속합니다',
+                enterPasscode: '액세스 패스코드를 입력하십시오',
+                networkError: '네트워크 오류, 나중에 다시 시도하십시오',
+                autoFillNotice: 'URL 매개변수에서 패스코드가 자동으로 채워졌습니다',
+                invalidPasscodeTitle: '패스코드가 유효하지 않습니다',
+                invalidPasscodeText: '입력하신 패스코드가 유효하지 않거나 만료되었습니다. 확인 후 다시 시도하십시오.',
+                invalidPasscodeHint: '문제가 계속되면 관리자에게 문의하십시오.',
+                ok: '확인'
+            }
+        };
+
+        // 获取URL参数函数
+        function getUrlParameter(name) {
+            const urlParams = new URLSearchParams(window.location.search);
+            return urlParams.get(name);
+        }
+
+        // 设置Cookie函数
+        function setCookie(name, value, expiresDays = null, path = '/', domain = '', secure = false) {
+            let cookieString = `${name}=${encodeURIComponent(value)}`;
+            if (expiresDays) {
+                const date = new Date();
+                date.setTime(date.getTime() + (expiresDays * 24 * 60 * 60 * 1000));
+                cookieString += `; expires=${date.toUTCString()}`;
+            }
+            cookieString += `; path=${path}`;
+            if (domain) {
+                cookieString += `; domain=${domain}`;
+            }
+            if (secure) {
+                cookieString += '; Secure';
+            }
+            document.cookie = cookieString;
+        }
+
+        // 获取当前语言
+        function getCurrentLanguage() {
+            return localStorage.getItem('preferredLanguage') || 'en-US';
+        }
+
+        // 设置语言
+        function setLanguage(lang) {
+            localStorage.setItem('preferredLanguage', lang);
+            document.documentElement.lang = lang;
+            updateTextContent(lang);
+        }
+
+        // 更新页面文本内容
+        function updateTextContent(lang) {
+            const resource = resources[lang];
+            
+            // 更新所有文本元素
+            document.getElementById('pageTitle').textContent = resource.title;
+            document.getElementById('protectedServerText').textContent = resource.protectedServer;
+            document.getElementById('scanPortsText').textContent = resource.scanPorts;
+            document.getElementById('beforeLoginText').textContent = resource.beforeLogin;
+            document.getElementById('timeoutStatusText').innerHTML = resource.timeoutStatus;
+            document.getElementById('afterLoginText').textContent = resource.afterLogin;
+            document.getElementById('successStatusText').innerHTML = resource.successStatus;
+            document.getElementById('descriptionText').textContent = resource.description;
+            document.getElementById('passcode').placeholder = resource.passcodePlaceholder;
+            document.getElementById('passcodeLabel').textContent = resource.passcodeLabel;
+            document.getElementById('rememberPasscodeLabel').textContent = resource.rememberPasscode;
+            document.getElementById('submitButton').textContent = resource.submit;
+            document.getElementById('dividerText').textContent = resource.divider;
+            document.getElementById('oktaLogin').textContent = resource.oktaLogin;
+            document.getElementById('modalTitle').textContent = resource.modalTitle;
+            document.getElementById('warningText').textContent = resource.warningText;
+            document.getElementById('modalBodyText1').textContent = resource.modalBodyText1;
+            document.getElementById('modalBodyText2').textContent = resource.modalBodyText2;
+            document.getElementById('cancelRemember').textContent = resource.cancel;
+            document.getElementById('confirmRemember').textContent = resource.confirm;
+            document.getElementById('autoFillNotice').textContent = resource.autoFillNotice;
+            
+            // Update invalid passcode modal text
+            document.getElementById('invalidPasscodeTitle').innerHTML = 
+                '<svg class="error-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>' + 
+                resource.invalidPasscodeTitle;
+            document.getElementById('invalidPasscodeText').textContent = resource.invalidPasscodeText;
+            document.getElementById('invalidPasscodeHint').textContent = resource.invalidPasscodeHint;
+            document.getElementById('closeInvalidBtn').textContent = resource.ok;
+        }
+        
+        // Show invalid passcode modal
+        function showInvalidPasscodeModal() {
+            const modal = document.getElementById('invalidPasscodeModal');
+            modal.style.display = 'flex';
+        }
+        
+        // Close invalid passcode modal
+        function closeInvalidPasscodeModal() {
+            const modal = document.getElementById('invalidPasscodeModal');
+            modal.style.display = 'none';
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            const passcodeInput = document.getElementById('passcode');
+            const rememberCheckbox = document.getElementById('rememberPasscode');
+            const riskModal = document.getElementById('riskModal');
+            const closeModal = document.getElementById('closeModal');
+            const cancelRemember = document.getElementById('cancelRemember');
+            const confirmRemember = document.getElementById('confirmRemember');
+            const passcodeForm = document.getElementById('passcodeForm');
+            const oktaLoginButton = document.getElementById('oktaLogin');
+            const languageSelect = document.getElementById('languageSelect');
+            const dividerContainer = document.getElementById('dividerContainer');
+            const autoFillNotice = document.getElementById('autoFillNotice');
+            
+            // 初始化语言
+            const currentLang = getCurrentLanguage();
+            languageSelect.value = currentLang;
+            setLanguage(currentLang);
+            
+            // 根据oidc参数控制Okta Login按钮显示
+            const oidcEnabled = getUrlParameter('oidc') === 'true';
+            if (!oidcEnabled) {
+                dividerContainer.classList.add('hidden');
+                oktaLoginButton.classList.add('hidden');
+            }
+             
+            // 检查URL参数中的passcode
+            const urlPasscode = getUrlParameter('passcode');
+            if (urlPasscode) {
+                passcodeInput.value = urlPasscode;
+                autoFillNotice.style.display = 'block';
+                
+                // 自动提交表单（可选）
+                // setTimeout(() => {
+                //     submitForm();
+                // }, 500);
+            }
+            
+            // 语言切换事件
+            languageSelect.addEventListener('change', function() {
+                setLanguage(this.value);
+            });
+            
+            // 检查是否有保存的密码
+            const savedPasscode = localStorage.getItem('nhp_passcode');
+            if (savedPasscode) {
+                passcodeInput.value = savedPasscode;
+                rememberCheckbox.checked = true;
+            }
+            
+            // 关闭模态对话框
+            function closeRiskModal() {
+                riskModal.style.display = 'none';
+            }
+            
+            // 绑定关闭事件
+            closeModal.addEventListener('click', closeRiskModal);
+            cancelRemember.addEventListener('click', closeRiskModal);
+            
+            // 绑定无效密钥模态框关闭事件
+            document.getElementById('closeInvalidModal').addEventListener('click', closeInvalidPasscodeModal);
+            document.getElementById('closeInvalidBtn').addEventListener('click', closeInvalidPasscodeModal);
+            
+            // 确认记住密钥
+            confirmRemember.addEventListener('click', function() {
+                // 设置记住标志并提交表单
+                localStorage.setItem('nhp_passcode', passcodeInput.value);
+                closeRiskModal();
+                submitForm();
+            });
+            
+            // 表单提交事件
+            passcodeForm.addEventListener('submit', async function(e) {
+                e.preventDefault();
+                
+                const passcode = passcodeInput.value;
+                const currentLang = getCurrentLanguage();
+                
+                if (!passcode) {
+                    showMessage(resources[currentLang].enterPasscode, 'error');
+                    return;
+                }
+                
+                // 如果用户选择了记住密钥但之前没有保存过，显示风险提示
+                if (rememberCheckbox.checked && !savedPasscode) {
+                    riskModal.style.display = 'flex';
+                } else {
+                    // 否则直接提交表单
+                    submitForm();
+                }
+            });
+            
+            // Okta登录按钮点击事件
+            oktaLoginButton.addEventListener('click', function() {
+                    window.location.href = `https://{{.resId}}.secure.layerv.xyz/plugins/oktaoidc?resid={{.resId}}&action=oauth`;
+            });
+            
+            // 显示消息
+            function showMessage(text, type) {
+                const messageEl = document.getElementById('message');
+                messageEl.textContent = text;
+                messageEl.className = 'message ' + type;
+                messageEl.style.display = 'block';
+            }
+            
+            // 提交表单的函数
+            function submitForm() {
+                const passcode = passcodeInput.value;
+                const currentLang = getCurrentLanguage();
+                
+                if (!rememberCheckbox.checked) {
+                    localStorage.removeItem('nhp_passcode'); // 清除存储
+                }
+                
+                // 清除之前的状态
+                const messageEl = document.getElementById('message');
+                messageEl.style.display = 'none';
+                messageEl.className = 'message';
+                
+                try {
+                    const nhpValidUrl = "https://{{.resId}}.secure.layerv.xyz/plugins/{{ .aspId }}?resid={{ .resId }}&action=valid" + 
+                        "&format=json&passcode=" + encodeURIComponent(passcode);
+                    
+                    fetch(nhpValidUrl)
+                    .then(function(response) {
+                        return response.json();
+                    }).then(function(result) {
+                        console.log(result);
+                        
+                        // Check if errCode exists (invalid passcode)
+                        if (result.errCode && result.errCode !== '') {
+                            showInvalidPasscodeModal();
+                            return;
+                        }
+                        
+                        if (result.nhpToken) {
+                            setCookie("nhp_token", result.nhpToken, 1, "/", result.cookieDomain, true)
+                            setCookie("nhp_refresh_token", result.nhpRefreshToken, 1, "/", result.cookieDomain, true)
+                            if (result && result.redirectUrl) {
+                                window.location.replace(result.redirectUrl);
+                            } else {
+                                if (result.errMsg) {
+                                    showInvalidPasscodeModal();
+                                } else {
+                                    showInvalidPasscodeModal();
+                                }
+                            }
+                        } else {
+                            setCookie("nhp_token", "", 0, "/", result.cookieDomain, true)
+                            setCookie("nhp_refresh_token", "", 0, "/", result.cookieDomain, true)
+                            if (result && result.redirectUrl) {
+                                window.location.replace(result.redirectUrl);
+                            } else {
+                                showInvalidPasscodeModal();
+                            }
+                        }
+                    }).catch(function(error) {
+                        showMessage(resources[currentLang].networkError, 'error');
+                        console.error('Error:', error);
+                    });
+                } catch (error) {
+                    showMessage(resources[currentLang].networkError, 'error');
+                    console.error('Error:', error);
+                }
+            }
+        });
+    </script>
+</body>
+</html>
