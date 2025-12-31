@@ -415,15 +415,18 @@ RESOURCES=$(cat <<RESEOF
 RESEOF
 )
 
-# Build ExtInfo JSON (required by passcode plugin for login page)
-# Generate a random app secret for passcode authentication
-APP_SECRET=$(openssl rand -hex 32)
+# Build ExtInfo JSON (required by passcode plugin for auth_code flow)
+# AuthUrl: Console's token validation endpoint called by NHP Server
+# AppSecret: Must match the hardcoded value in Console's /ps/custom_auth_api endpoint
+# Method: HTTP method for AuthUrl call
+AUTH_URL="http://$CONSOLE_INTERNAL_NLB:$CONSOLE_PORT/ps/custom_auth_api"
+APP_SECRET="layerv_secret_2025"
 EXT_INFO=$(cat <<EXTEOF
-{"Title": "LayerV Console", "JWTSecret": "$JWT_SECRET", "AppSecret": ["$APP_SECRET"]}
+{"Title": "LayerV Console", "JWTSecret": "$JWT_SECRET", "AuthUrl": "$AUTH_URL", "AppSecret": "$APP_SECRET", "Method": "GET"}
 EXTEOF
 )
 
-# Run the seed SQL
+# Run the seed SQL (upsert pattern - insert if not exists, update if exists)
 PGPASSWORD="$RDS_PASSWORD" psql -h "${rds_endpoint}" -p ${rds_port} -U "$RDS_USERNAME" -d "${rds_database_name}" <<SQLEOF
 -- Insert Console portal site if not exists
 INSERT INTO portal_sites (
@@ -440,6 +443,17 @@ SELECT
 WHERE NOT EXISTS (
     SELECT 1 FROM portal_sites WHERE app_id = '$CONSOLE_APP_ID'
 );
+
+-- Update existing Console portal site with correct ext_info (for existing deployments)
+-- This ensures AuthUrl is set correctly for the auth_code flow
+UPDATE portal_sites
+SET
+    updated_at = NOW(),
+    ext_info = '$EXT_INFO'::jsonb,
+    service_info = '$SERVICE_INFO'::jsonb,
+    resources = '$RESOURCES'::jsonb,
+    jwt_secret = '$JWT_SECRET'
+WHERE app_id = '$CONSOLE_APP_ID';
 
 -- Log the result
 DO \$\$

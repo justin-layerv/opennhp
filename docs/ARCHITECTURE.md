@@ -997,8 +997,59 @@ Console Startup
           └── Create admin user with GVA_ADMIN_PASSWORD
 ```
 
-**Note:** The portal_sites seeding (for NHP protection) happens separately in user_data.sh.tpl
-after the Console container is healthy. This seeds the Console as a protected resource in NHP.
+#### Two-Part Database Seeding
+
+Console uses a two-part seeding approach:
+
+1. **auto_init.go** (Go code, runs at Console startup):
+   - Creates admin user, authorities, and links them
+   - Triggered by `GVA_AUTO_INIT=true` environment variable
+   - Idempotent - skips if admin user already exists
+
+2. **user_data.sh.tpl** (Terraform, runs at EC2 boot):
+   - Seeds the "console" resource in `portal_sites` table
+   - Required for NHP `auth_code` flow after Console login
+   - Runs after Console container is healthy
+
+**Why Two Parts?**
+- auto_init.go doesn't know the Console's internal URL (needed for `AuthUrl` in portal_sites)
+- Terraform knows the infrastructure details (internal NLB endpoint, domain, etc.)
+- Separating concerns: Go handles app-level seeding, Terraform handles infra-aware seeding
+
+#### Console auth_code Flow (NHP Integration)
+
+After a user logs into Console, the frontend calls NHP Server to acquire NHP tokens:
+
+```
+1. User logs in → Console API returns JWT token (x-token)
+2. Frontend calls: /plugins/passcode?resid=console&action=auth_code&code={jwt}
+3. NHP Server passcode plugin:
+   a. Calls Console API to get "console" resource from portal_sites
+   b. Gets AuthUrl from resource's ext_info
+   c. Calls AuthUrl (Console's /ps/custom_auth_api) with JWT to validate
+   d. If valid, performs NHP knock and returns nhp_token cookies
+4. Frontend redirects to protected resource with nhp_token
+```
+
+**portal_sites "console" Resource Configuration:**
+
+| Field | Value | Description |
+|-------|-------|-------------|
+| `app_id` | `console` | Resource ID used in `resid=console` |
+| `jwt_secret` | Console's signing key | Must match `jwt.signing-key` in config.yaml |
+| `ext_info.AuthUrl` | `http://{console-internal}/ps/custom_auth_api` | Token validation endpoint |
+| `ext_info.AppSecret` | Random secret | Shared secret for validation |
+| `ext_info.Method` | `GET` | HTTP method for AuthUrl call |
+
+**The `/ps/custom_auth_api` Endpoint:**
+
+Console has a public endpoint at `/ps/custom_auth_api` that validates JWT tokens:
+- Accepts: `?code={jwt}&secret={app_secret}&state={optional}`
+- Validates the secret matches configured AppSecret
+- Parses and validates the JWT using Console's signing key
+- Returns: `{code: 0, message: "username"}` on success
+
+This endpoint is defined in `console/server/router/portals/sys_portal_sites.go`.
 
 ### Cross-Account Route 53
 
