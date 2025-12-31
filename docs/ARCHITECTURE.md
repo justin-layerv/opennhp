@@ -867,25 +867,35 @@ Internet → console.nhp.layerv.xyz (Route 53)
     ▼
 AC NLB (TCP 443) → Traefik
     │
-    ├── /plugins/* → NHP Server HTTP (port 8888) [for auth_code action]
-    │
     └── Host(`console.nhp.layerv.xyz`) → Console internal NLB (port 8888)
             │                            [BYPASSES nhp-acd!]
             ▼
-        Console EC2 (Vue app + API)
+        Console EC2 nginx (port 8888)
+            │
+            ├── /plugins/* → NHP Server HTTP (server.nhp.sandbox.internal:8888)
+            │                [for auth_code action after login]
+            ├── /api/*     → Console Docker (port 8080)
+            └── /*         → Console Docker (Vue app)
 ```
 
 **⚠️ DO NOT route Console through nhp-acd** - this blocks the login page from loading.
 
+**Console EC2 nginx routes `/plugins/*` to NHP Server** for post-login NHP authentication.
+This is configured via the `nhp_server_endpoint` variable in the console-ec2 Terraform module.
+
 **Terraform Configuration:**
 
 The AC module accepts `console_backend_url` and `console_domain` variables to configure
-Console-specific routing that bypasses nhp-acd:
+Console-specific routing that bypasses nhp-acd. The console-ec2 module accepts
+`nhp_server_endpoint` to route `/plugins/*` to NHP Server:
 
 ```hcl
 # In root main.tf, pass to AC module:
 console_backend_url = module.console_ec2[0].internal_endpoint  # http://nlb:8888
 console_domain      = var.console_ec2_domain                   # console.nhp.layerv.xyz
+
+# In root main.tf, pass to console_ec2 module:
+nhp_server_endpoint = "server.${module.data.namespace_name}:8888"  # NHP Server Cloud Map
 
 # In terraform.tfvars:
 console_internal_only = true
@@ -897,17 +907,12 @@ console_ec2_domain = "console.nhp.layerv.xyz"
 ```toml
 [http.routers]
   # Console-specific route - BYPASSES nhp-acd
+  # All Console traffic (including /plugins/*) goes to Console EC2
   [http.routers.console]
     rule = "Host(`console.nhp.layerv.xyz`)"
     service = "console"
     entryPoints = ["https"]
     priority = 20  # Higher than nhp-ac
-
-  # /plugins to NHP Server (for auth_code after login)
-  [http.routers.nhp-plugins]
-    rule = "PathPrefix(`/plugins`)"
-    service = "nhp-server"
-    priority = 10
 
   # Default route to nhp-acd (for other resources)
   [http.routers.nhp-ac]
@@ -921,6 +926,8 @@ console_ec2_domain = "console.nhp.layerv.xyz"
       url = "http://console-internal-nlb:8888"
 ```
 
+**Note:** Console EC2 nginx handles `/plugins/*` routing internally (see architecture diagram above).
+
 #### Console Cookie Configuration
 
 Console uses cross-domain cookies for SSO:
@@ -928,12 +935,19 @@ Console uses cross-domain cookies for SSO:
 ```javascript
 // From console/web/src/pinia/modules/user.js
 const cookieDomain = import.meta.env.VITE_COOKIE_DOMAIN || '.layerv.ai'
-// Sets x-token cookie with domain=.layerv.ai for cross-subdomain access
+// Sets x-token cookie with domain for cross-subdomain access
 ```
 
-**Environment Variables:**
-- `VITE_LOGIN_URL`: Console login URL (default: `https://console-login.secure.layerv.xyz`)
-- `VITE_COOKIE_DOMAIN`: Cookie domain for cross-subdomain SSO (default: `.layerv.ai`)
+**Environment Variables (web/.env.production):**
+
+| Variable | Old Console | New Console | Description |
+|----------|-------------|-------------|-------------|
+| `VITE_LOGIN_URL` | `https://console-login.secure.layerv.ai` | *(empty)* | NHP auth URL. Empty = same origin |
+| `VITE_COOKIE_DOMAIN` | `.layerv.ai` | `.layerv.xyz` | Cookie domain for SSO |
+| `VITE_BASE_PATH` | `https://console-login.secure.layerv.ai` | `https://console.nhp.layerv.xyz` | Base URL |
+
+**Note:** When `VITE_LOGIN_URL` is empty, the Vue app uses the same origin for `/plugins/passcode`
+requests, which are routed by Console EC2 nginx to the NHP Server.
 
 ### Cross-Account Route 53
 
