@@ -144,6 +144,23 @@ variable "nhp_server_endpoint" {
 }
 
 # ============================================================================
+# Database Auto-Initialization Configuration
+# ============================================================================
+
+variable "auto_init" {
+  description = "Enable automatic database initialization on first deployment. Creates admin user and seeds initial data."
+  type        = bool
+  default     = true
+}
+
+variable "admin_password" {
+  description = "Admin user password for Console. If not provided, a random password will be generated and logged."
+  type        = string
+  sensitive   = true
+  default     = null
+}
+
+# ============================================================================
 # Domain and TLS Configuration
 # ============================================================================
 

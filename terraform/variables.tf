@@ -355,6 +355,13 @@ variable "console_cookie_domain" {
   default     = ".layerv.ai"
 }
 
+variable "console_admin_password" {
+  description = "Admin user password for Console. If not provided, a random password will be generated and logged on first deployment."
+  type        = string
+  sensitive   = true
+  default     = null
+}
+
 # ==================== Deployment Configuration ====================
 
 variable "image_tag" {

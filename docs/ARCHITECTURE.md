@@ -900,6 +900,7 @@ nhp_server_endpoint = "server.${module.data.namespace_name}:8888"  # NHP Server 
 # In terraform.tfvars:
 console_internal_only = true
 console_ec2_domain = "console.nhp.layerv.xyz"
+# console_admin_password = "your-secure-password"  # Optional, set via TF_VAR for security
 ```
 
 **AC Traefik Dynamic Config (user_data.sh.tpl):**
@@ -948,6 +949,56 @@ const cookieDomain = import.meta.env.VITE_COOKIE_DOMAIN || '.layerv.ai'
 
 **Note:** When `VITE_LOGIN_URL` is empty, the Vue app uses the same origin for `/plugins/passcode`
 requests, which are routed by Console EC2 nginx to the NHP Server.
+
+#### Console Database Auto-Initialization
+
+Console uses **automatic database initialization** on first deployment. This eliminates the need
+for manual `/init/initdb` API calls that were previously required by the gin-vue-admin framework.
+
+**How it works:**
+
+1. On startup, Console checks if `GVA_AUTO_INIT=true` environment variable is set
+2. If enabled, checks if database is already initialized (admin user exists)
+3. If not initialized, runs the full init flow programmatically:
+   - Creates all database tables (AutoMigrate)
+   - Seeds initial data (admin user, menus, APIs, authorities, etc.)
+   - Uses `GVA_ADMIN_PASSWORD` for admin password (or generates random if not set)
+
+**Environment Variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GVA_AUTO_INIT` | `false` | Enable auto-initialization on startup |
+| `GVA_ADMIN_PASSWORD` | *(generated)* | Admin user password. If not set, generates random and logs it |
+
+**Terraform Configuration:**
+
+```hcl
+# In terraform.tfvars or via TF_VAR_console_admin_password
+console_admin_password = "your-secure-password"  # Optional, recommended for production
+
+# The console-ec2 module sets auto_init=true by default
+```
+
+**Initialization Flow:**
+
+```
+Console Startup
+      │
+      ├── GVA_AUTO_INIT != "true"? → Skip, use manual /init/initdb
+      │
+      ├── Database not connected? → Skip, no DB config
+      │
+      ├── Admin user exists? → Skip, already initialized
+      │
+      └── Initialize:
+          ├── Create tables (AutoMigrate)
+          ├── Seed system data (menus, APIs, authorities)
+          └── Create admin user with GVA_ADMIN_PASSWORD
+```
+
+**Note:** The portal_sites seeding (for NHP protection) happens separately in user_data.sh.tpl
+after the Console container is healthy. This seeds the Console as a protected resource in NHP.
 
 ### Cross-Account Route 53
 

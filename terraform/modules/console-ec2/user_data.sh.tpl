@@ -242,6 +242,10 @@ docker run -d \
     -e "GVA_CONFIG_PGSQL_PASSWORD=$RDS_PASSWORD" \
     -e "GVA_CONFIG_PGSQL_CONFIG=sslmode=require TimeZone=UTC" \
     -e "GVA_CONFIG_ACCESSCONTROLLERS=${ac_config_json}" \
+    -e "GVA_AUTO_INIT=${auto_init}" \
+%{ if admin_password != null ~}
+    -e "GVA_ADMIN_PASSWORD=${admin_password}" \
+%{ endif ~}
     "$CONSOLE_IMAGE"
 
 # Wait for console to be healthy
