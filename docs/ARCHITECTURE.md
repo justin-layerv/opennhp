@@ -817,46 +817,123 @@ console_ec2_domain = "console.nhp.layerv.xyz"
 console_internal_only = true  # NHP-protected mode
 ```
 
-### Console EC2 NHP Protection
+### Console NHP Integration
 
-When `console_internal_only = true`, Console EC2 is protected by NHP:
+**IMPORTANT:** Console does NOT use nhp-acd for access control. Instead, Console has its own
+username/password authentication, and NHP integration happens **client-side after login**.
 
-**Architecture:**
+#### Old Console Architecture (console-login.secure.layerv.xyz)
+
+The old Console serves the Vue app directly - NOT behind nhp-acd:
+
+```
+Internet → console-login.secure.layerv.xyz
+    │
+    ▼
+nginx/Traefik (TLS termination)
+    │
+    ├── /plugins/* → NHP Server HTTP (port 8888) [for auth_code action]
+    ├── /api/*     → Console API (gin backend, port 8888)
+    └── /*         → Console Vue app (static files)
+```
+
+**Login Flow (client-side NHP integration):**
+
+1. User visits `console-login.secure.layerv.xyz` → Vue app loads directly (no NHP blocking)
+2. User logs in with **username/password** → Console API validates, returns JWT token (`x-token`)
+3. **After successful login**, Vue app JavaScript calls NHP Server:
+   ```javascript
+   // From console/web/src/pinia/modules/user.js (lines 95-131)
+   const authApiUrl = `${loginUrl}/plugins/passcode?resid=console&action=auth_code&code=${token}`
+   const authResponse = await fetch(authApiUrl)
+   // NHP Server validates JWT with Console API, performs knock, sets nhp_token cookie
+   window.location.href = authData.redirect_url  // Redirect to NHP-protected resource
+   ```
+4. NHP Server validates JWT token with Console API
+5. NHP Server performs knock (sends NHP_AOP to AC to add srcIP to ipset)
+6. NHP Server sets `nhp_token` and `nhp_refresh_token` cookies
+7. User redirected to `redirect_url` (now accessible because knock succeeded)
+
+**Key Insight:** Console login page is accessible WITHOUT nhp_token. NHP tokens are acquired
+**after** Console's own authentication succeeds, via client-side JavaScript.
+
+#### New Console Architecture (console.nhp.layerv.xyz)
+
+For new Console to work like old Console, traffic must bypass nhp-acd:
+
 ```
 Internet → console.nhp.layerv.xyz (Route 53)
     │
     ▼
 AC NLB (TCP 443) → Traefik
     │
-    ├── /plugins/* → NHP Server HTTP (port 8888) [login page, auth]
+    ├── /plugins/* → NHP Server HTTP (port 8888) [for auth_code action]
     │
-    └── /* → nhp-acd (port 8888) [validates nhp_token, routes to Console]
-            │
+    └── Host(`console.nhp.layerv.xyz`) → Console internal NLB (port 8888)
+            │                            [BYPASSES nhp-acd!]
             ▼
-        Console internal NLB (port 8888) → Console EC2
+        Console EC2 (Vue app + API)
 ```
 
-**Login Flow:**
-1. User visits `console.nhp.layerv.xyz/plugins/passcode?resid=console&action=login`
-2. AC Traefik routes `/plugins/*` to NHP Server HTTP at `server.nhp.sandbox.internal:8888`
-3. NHP Server passcode plugin serves login page (from `passcode_login.html` template)
-4. User enters passcode, login page JS calls `action=auth` or `action=auth_code`
-5. NHP Server validates passcode with Console API, sets `nhp_token` cookie
-6. NHP Server sends NHP_AOP to AC to add user's srcIP to ipset
-7. User redirected to `console.nhp.layerv.xyz` - now accessible
+**⚠️ DO NOT route Console through nhp-acd** - this blocks the login page from loading.
 
-**Key Configuration:**
-- Console NLB: **internal** (not internet-facing)
-- Console EC2: runs in **private subnets**
-- Route 53: `console.nhp.layerv.xyz` → AC NLB (not Console NLB)
-- AC Traefik: routes authenticated requests to Console via nhp-acd
+**Terraform Configuration:**
 
-**Terraform Variables:**
+The AC module accepts `console_backend_url` and `console_domain` variables to configure
+Console-specific routing that bypasses nhp-acd:
+
 ```hcl
-console_internal_only = true   # Enable NHP protection
+# In root main.tf, pass to AC module:
+console_backend_url = module.console_ec2[0].internal_endpoint  # http://nlb:8888
+console_domain      = var.console_ec2_domain                   # console.nhp.layerv.xyz
+
+# In terraform.tfvars:
+console_internal_only = true
 console_ec2_domain = "console.nhp.layerv.xyz"
-ac_resource_ids = ["demo", "mini-app-demo", "console"]  # Include console
 ```
+
+**AC Traefik Dynamic Config (user_data.sh.tpl):**
+
+```toml
+[http.routers]
+  # Console-specific route - BYPASSES nhp-acd
+  [http.routers.console]
+    rule = "Host(`console.nhp.layerv.xyz`)"
+    service = "console"
+    entryPoints = ["https"]
+    priority = 20  # Higher than nhp-ac
+
+  # /plugins to NHP Server (for auth_code after login)
+  [http.routers.nhp-plugins]
+    rule = "PathPrefix(`/plugins`)"
+    service = "nhp-server"
+    priority = 10
+
+  # Default route to nhp-acd (for other resources)
+  [http.routers.nhp-ac]
+    rule = "PathPrefix(`/`)"
+    service = "nhp-ac"
+    priority = 1
+
+[http.services]
+  [http.services.console.loadBalancer]
+    [[http.services.console.loadBalancer.servers]]
+      url = "http://console-internal-nlb:8888"
+```
+
+#### Console Cookie Configuration
+
+Console uses cross-domain cookies for SSO:
+
+```javascript
+// From console/web/src/pinia/modules/user.js
+const cookieDomain = import.meta.env.VITE_COOKIE_DOMAIN || '.layerv.ai'
+// Sets x-token cookie with domain=.layerv.ai for cross-subdomain access
+```
+
+**Environment Variables:**
+- `VITE_LOGIN_URL`: Console login URL (default: `https://console-login.secure.layerv.xyz`)
+- `VITE_COOKIE_DOMAIN`: Cookie domain for cross-subdomain SSO (default: `.layerv.ai`)
 
 ### Cross-Account Route 53
 
