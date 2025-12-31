@@ -260,6 +260,8 @@ locals {
     ac_nlb_dns            = var.ac_nlb_dns
     ac_domain             = var.ac_domain
     console_internal_nlb  = aws_lb.console.dns_name
+    # NHP Server endpoint for /plugins/* routing
+    nhp_server_endpoint = var.nhp_server_endpoint
   })
 }
 

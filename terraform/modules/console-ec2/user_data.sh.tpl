@@ -66,6 +66,13 @@ upstream console_backend {
     keepalive 32;
 }
 
+%{ if nhp_server_endpoint != null ~}
+upstream nhp_server {
+    server ${nhp_server_endpoint};
+    keepalive 16;
+}
+%{ endif ~}
+
 server {
     listen ${console_port};
     server_name ${domain_name} _;
@@ -81,7 +88,26 @@ server {
         add_header Content-Type text/plain;
     }
 
-    # Proxy all requests to Console
+%{ if nhp_server_endpoint != null ~}
+    # NHP Server plugins endpoint (for auth_code action after Console login)
+    # Routes /plugins/* to NHP Server HTTP endpoint
+    location /plugins/ {
+        proxy_pass http://nhp_server;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Connection "";
+
+        # Timeouts
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+%{ endif ~}
+
+    # Proxy all other requests to Console
     location / {
         proxy_pass http://console_backend;
         proxy_http_version 1.1;

@@ -137,6 +137,12 @@ variable "ac_domain" {
   default     = ".nhp.layerv.xyz"
 }
 
+variable "nhp_server_endpoint" {
+  description = "NHP Server HTTP endpoint for /plugins/* routing (e.g., server.nhp.sandbox.internal:8888)"
+  type        = string
+  default     = null
+}
+
 # ============================================================================
 # Domain and TLS Configuration
 # ============================================================================

@@ -431,6 +431,10 @@ module "console_ec2" {
   internal_only        = var.console_internal_only
   ac_security_group_id = var.deploy_ac && var.console_internal_only ? module.ac[0].security_group_id : null
 
+  # NHP Server endpoint for /plugins/* routing (required for post-login NHP auth)
+  # When Console is internal-only, nginx routes /plugins/* to NHP Server
+  nhp_server_endpoint = var.console_internal_only ? "server.${module.data.namespace_name}:8888" : null
+
   # RDS seeding for NHP Console resource
   # Seeds the portal_sites table with Console config so NHP Server/AC know how to route
   seed_console_resource = var.console_internal_only && var.deploy_ac
