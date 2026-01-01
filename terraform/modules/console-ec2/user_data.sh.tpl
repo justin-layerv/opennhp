@@ -10,10 +10,10 @@ apt-get update -y
 
 %{ if internal_only }
 # Internal mode: minimal packages (no TLS/certbot needed)
-apt-get install -y nginx docker.io curl jq unzip
+apt-get install -y nginx docker.io curl jq unzip dnsutils
 %{ else }
 # External mode: full packages including certbot for TLS
-apt-get install -y nginx certbot python3-certbot-nginx python3-certbot-dns-route53 docker.io curl jq unzip
+apt-get install -y nginx certbot python3-certbot-nginx python3-certbot-dns-route53 docker.io curl jq unzip dnsutils
 %{ endif }
 
 # Install AWS CLI v2
@@ -399,6 +399,15 @@ CONSOLE_INTERNAL_NLB="${console_internal_nlb}"
 CONSOLE_PORT="${console_port}"
 AC_NLB_DNS="${ac_nlb_dns}"
 COOKIE_DOMAIN="${cookie_domain}"
+
+# Resolve AC NLB DNS to an IP address for ipset rules
+# ipset requires IP addresses, not hostnames
+AC_NLB_IP=$(dig +short "$AC_NLB_DNS" | head -1)
+if [ -z "$AC_NLB_IP" ]; then
+    echo "ERROR: Failed to resolve AC NLB DNS '$AC_NLB_DNS' to IP address"
+    exit 1
+fi
+echo "AC NLB DNS: $AC_NLB_DNS -> IP: $AC_NLB_IP"
 %{ if auth_signing_key != null ~}
 JWT_SECRET="${auth_signing_key}"
 %{ else ~}
@@ -415,8 +424,9 @@ SRVEOF
 
 # Build Resources JSON (AC routing config)
 # ac_id must match the AC module's ac_id for knock routing to work
+# ip must be an actual IP address (not DNS) because AC uses it in ipset rules
 RESOURCES=$(cat <<RESEOF
-[{"ac_id": "${ac_id}", "hostname": "$CONSOLE_HOSTNAME", "ip": "$AC_NLB_DNS", "port": 443, "maskhost": true, "protocol": "tcp"}]
+[{"ac_id": "${ac_id}", "hostname": "$CONSOLE_HOSTNAME", "ip": "$AC_NLB_IP", "port": 443, "maskhost": true, "protocol": "tcp"}]
 RESEOF
 )
 
