@@ -131,6 +131,12 @@ variable "auth_service_id" {
   default     = "layerv"
 }
 
+variable "ac_id" {
+  description = "AC identifier used for knock routing. All ACs in the same group should share this ID so resources can reference them."
+  type        = string
+  default     = "layerv-ac-tf"
+}
+
 variable "resource_ids" {
   description = "List of resource IDs that this AC protects"
   type        = list(string)

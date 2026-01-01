@@ -399,7 +399,11 @@ CONSOLE_INTERNAL_NLB="${console_internal_nlb}"
 CONSOLE_PORT="${console_port}"
 AC_NLB_DNS="${ac_nlb_dns}"
 COOKIE_DOMAIN="${cookie_domain}"
+%{ if auth_signing_key != null ~}
+JWT_SECRET="${auth_signing_key}"
+%{ else ~}
 JWT_SECRET="$CONSOLE_APP_ID"
+%{ endif ~}
 OPENTIME=3600
 TOKEN_EXPIRE=86400
 
@@ -410,8 +414,9 @@ SRVEOF
 )
 
 # Build Resources JSON (AC routing config)
+# ac_id must match the AC module's ac_id for knock routing to work
 RESOURCES=$(cat <<RESEOF
-[{"ac_id": "layerv-ac-tf", "hostname": "$CONSOLE_HOSTNAME", "ip": "$AC_NLB_DNS", "port": 443, "maskhost": true, "protocol": "tcp"}]
+[{"ac_id": "${ac_id}", "hostname": "$CONSOLE_HOSTNAME", "ip": "$AC_NLB_DNS", "port": 443, "maskhost": true, "protocol": "tcp"}]
 RESEOF
 )
 

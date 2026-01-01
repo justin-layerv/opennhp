@@ -263,8 +263,11 @@ locals {
     # NHP Server endpoint for /plugins/* routing
     nhp_server_endpoint = var.nhp_server_endpoint
     # Auto-initialization configuration
-    auto_init      = var.auto_init ? "true" : "false"
-    admin_password = var.admin_password
+    auto_init        = var.auto_init ? "true" : "false"
+    admin_password   = var.admin_password
+    auth_signing_key = var.auth_signing_key
+    # AC ID for knock routing (must match AC module's ac_id)
+    ac_id = var.ac_id
   })
 }
 

@@ -160,6 +160,19 @@ variable "admin_password" {
   default     = null
 }
 
+variable "auth_signing_key" {
+  description = "JWT signing key for Console authentication. Must match Console's jwt.signing-key in config.yaml."
+  type        = string
+  sensitive   = true
+  default     = null
+}
+
+variable "ac_id" {
+  description = "AC identifier for knock routing. Must match the ac_id configured in the AC module."
+  type        = string
+  default     = "layerv-ac-tf"
+}
+
 # ============================================================================
 # Domain and TLS Configuration
 # ============================================================================

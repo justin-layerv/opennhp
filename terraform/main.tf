@@ -471,8 +471,9 @@ module "console_ec2" {
   secrets_kms_key_arn = module.kms.secrets_key_arn
 
   # Auto-initialization (creates admin user on first deployment)
-  auto_init      = true
-  admin_password = var.console_admin_password
+  auto_init        = true
+  admin_password   = var.console_admin_password
+  auth_signing_key = var.auth_signing_key
 }
 
 # Data source for hosted zone (used by console_ec2)
