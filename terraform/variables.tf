@@ -459,6 +459,12 @@ variable "console_internal_only" {
   default     = false
 }
 
+variable "console_protected_hostname" {
+  description = "NHP-protected Console hostname (e.g., 'console2.apps.layerv.xyz'). Required when console_internal_only=true. This is where users are redirected after successful auth_code knock."
+  type        = string
+  default     = null
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {

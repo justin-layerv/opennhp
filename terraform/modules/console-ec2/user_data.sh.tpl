@@ -66,16 +66,13 @@ upstream console_backend {
     keepalive 32;
 }
 
-%{ if nhp_server_endpoint != null ~}
-upstream nhp_server {
-    server ${nhp_server_endpoint};
-    keepalive 16;
-}
-%{ endif ~}
-
 server {
     listen ${console_port};
     server_name ${domain_name} _;
+
+    # Use VPC DNS resolver with 30s TTL to handle Cloud Map DNS changes
+    # This prevents stale DNS cache when NHP Server instances are replaced
+    resolver 169.254.169.253 valid=30s ipv6=off;
 
     # Logging
     access_log /var/log/nginx/console-access.log;
@@ -91,8 +88,10 @@ server {
 %{ if nhp_server_endpoint != null ~}
     # NHP Server plugins endpoint (for auth_code action after Console login)
     # Routes /plugins/* to NHP Server HTTP endpoint
+    # Uses variable to force DNS re-resolution on each request
     location /plugins/ {
-        proxy_pass http://nhp_server;
+        set $nhp_server_upstream http://${nhp_server_endpoint};
+        proxy_pass $nhp_server_upstream;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -393,8 +392,17 @@ apt-get install -y postgresql-client
 # This creates the Console as a protected resource that AC/NHP Server can route to
 CONSOLE_APP_ID="${console_app_id}"
 CONSOLE_SITE_NAME="LayerV Console"
+%{ if protected_hostname != null ~}
+# Two-domain architecture: login domain vs protected domain
+# Login domain (domain_name): console.nhp.layerv.xyz - Traefik bypass for login page
+# Protected domain (protected_hostname): console2.apps.layerv.xyz - NHP-protected Console app
+# NOTE: site_url column is what NHP SDK uses for redirect_url, NOT ext_info.RedirectUrl
+CONSOLE_SITE_URL="https://${protected_hostname}/"
+CONSOLE_HOSTNAME="${protected_hostname}"
+%{ else ~}
 CONSOLE_SITE_URL="https://${console_app_id}${ac_domain}/"
 CONSOLE_HOSTNAME="${console_app_id}${ac_domain}"
+%{ endif ~}
 CONSOLE_INTERNAL_NLB="${console_internal_nlb}"
 CONSOLE_PORT="${console_port}"
 AC_NLB_DNS="${ac_nlb_dns}"
@@ -434,6 +442,7 @@ RESEOF
 # AuthUrl: Console's token validation endpoint called by NHP Server
 # AppSecret: Must match the hardcoded value in Console's /ps/custom_auth_api endpoint
 # Method: HTTP method for AuthUrl call
+# NOTE: redirect_url comes from site_url column, NOT ext_info
 AUTH_URL="http://$CONSOLE_INTERNAL_NLB:$CONSOLE_PORT/ps/custom_auth_api"
 APP_SECRET="layerv_secret_2025"
 EXT_INFO=$(cat <<EXTEOF
@@ -459,11 +468,12 @@ WHERE NOT EXISTS (
     SELECT 1 FROM portal_sites WHERE app_id = '$CONSOLE_APP_ID'
 );
 
--- Update existing Console portal site with correct ext_info (for existing deployments)
--- This ensures AuthUrl is set correctly for the auth_code flow
+-- Update existing Console portal site with correct config (for existing deployments)
+-- This ensures site_url, ext_info, etc. are set correctly for the auth_code flow
 UPDATE portal_sites
 SET
     updated_at = NOW(),
+    site_url = '$CONSOLE_SITE_URL',
     ext_info = '$EXT_INFO'::jsonb,
     service_info = '$SERVICE_INFO'::jsonb,
     resources = '$RESOURCES'::jsonb,

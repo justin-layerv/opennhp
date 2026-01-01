@@ -276,3 +276,9 @@ variable "console_internal_only" {
   type        = bool
   default     = false
 }
+
+variable "console_protected_hostname" {
+  description = "NHP-protected Console hostname (e.g., 'console2.apps.layerv.xyz'). Where users redirect after auth_code knock."
+  type        = string
+  default     = null
+}

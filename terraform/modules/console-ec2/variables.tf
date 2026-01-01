@@ -137,6 +137,12 @@ variable "ac_domain" {
   default     = ".nhp.layerv.xyz"
 }
 
+variable "protected_hostname" {
+  description = "NHP-protected Console hostname (e.g., 'console2.apps.layerv.xyz'). This is where users are redirected after auth_code knock."
+  type        = string
+  default     = null
+}
+
 variable "nhp_server_endpoint" {
   description = "NHP Server HTTP endpoint for /plugins/* routing (e.g., server.nhp.sandbox.internal:8888)"
   type        = string

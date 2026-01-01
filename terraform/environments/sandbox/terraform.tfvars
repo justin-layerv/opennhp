@@ -106,6 +106,10 @@ console_cookie_domain = ".layerv.xyz"
 # When enabled: Console runs on private subnets, accessed via AC NLB after NHP auth
 # Traffic flow: Internet → AC NLB → Traefik → nhp-acd → Console internal NLB
 console_internal_only = true
+# Two-domain architecture for NHP Console:
+# - Login domain: console.nhp.layerv.xyz (Traefik bypass, unprotected)
+# - Protected domain: console2.apps.layerv.xyz (NHP-protected, where users land after auth)
+console_protected_hostname = "console2.apps.layerv.xyz"
 
 tags = {
   Organization = "LayerV"

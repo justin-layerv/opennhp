@@ -259,6 +259,7 @@ locals {
     console_app_id        = var.console_app_id
     ac_nlb_dns            = var.ac_nlb_dns
     ac_domain             = var.ac_domain
+    protected_hostname    = var.protected_hostname
     console_internal_nlb  = aws_lb.console.dns_name
     # NHP Server endpoint for /plugins/* routing
     nhp_server_endpoint = var.nhp_server_endpoint

@@ -441,6 +441,10 @@ module "console_ec2" {
   console_app_id        = "console"
   ac_nlb_dns            = var.deploy_ac ? module.ac[0].nlb_dns_name : null
   ac_domain             = ".${var.domain_name}"
+  # Two-domain architecture: protected_hostname is where users are redirected after auth_code knock
+  # Login domain (console.nhp.layerv.xyz) is unprotected via Traefik bypass
+  # Protected domain (console2.apps.layerv.xyz) is NHP-protected via AC
+  protected_hostname = var.console_protected_hostname
 
   # RDS configuration
   rds_endpoint          = module.rds[0].cluster_endpoint
