@@ -533,3 +533,17 @@ resource "aws_route53_record" "console" {
     evaluate_target_health = true
   }
 }
+
+# ==================== SSM Parameters for CI/CD ====================
+
+# Store console public URL for GitHub Actions to use during Docker builds
+resource "aws_ssm_parameter" "console_public_url" {
+  name        = "/layerv/nhp/${var.environment}/console/public_url"
+  description = "Console public URL for VITE_LOGIN_URL (used by GitHub Actions)"
+  type        = "String"
+  value       = var.internal_only ? "https://${var.console_app_id}${var.ac_domain}" : "https://${var.domain_name}"
+
+  tags = merge(var.tags, {
+    Component = "console"
+  })
+}

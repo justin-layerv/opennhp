@@ -59,3 +59,13 @@ output "console_port" {
   description = "Console port number"
   value       = var.console_port
 }
+
+output "public_url" {
+  description = "Console public URL (for frontend VITE_LOGIN_URL)"
+  value       = var.internal_only ? "https://${var.console_app_id}${var.ac_domain}" : "https://${var.domain_name}"
+}
+
+output "public_url_ssm_parameter" {
+  description = "SSM parameter name storing console public URL"
+  value       = aws_ssm_parameter.console_public_url.name
+}

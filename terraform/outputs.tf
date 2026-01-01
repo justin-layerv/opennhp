@@ -158,3 +158,8 @@ output "console_ec2_asg_name" {
   description = "Console EC2 Auto Scaling Group name"
   value       = var.deploy_console_ec2 && var.deploy_rds ? module.console_ec2[0].asg_name : null
 }
+
+output "console_ec2_public_url" {
+  description = "Console EC2 public URL (for frontend builds)"
+  value       = var.deploy_console_ec2 && var.deploy_rds ? module.console_ec2[0].public_url : null
+}

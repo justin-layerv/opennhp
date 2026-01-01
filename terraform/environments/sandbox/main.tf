@@ -171,6 +171,10 @@ output "console_ec2_asg_name" {
   value = module.nhp.console_ec2_asg_name
 }
 
+output "console_ec2_public_url" {
+  value = module.nhp.console_ec2_public_url
+}
+
 # Demo Gateway outputs
 output "demo_gateway_nlb_dns" {
   value = module.nhp.demo_gateway_nlb_dns
