@@ -255,6 +255,12 @@ variable "production_zone_ids" {
   default     = []
 }
 
+variable "additional_tls_domains" {
+  description = "Additional domains for TLS certificates in same account (e.g., apps.layerv.xyz for console2.apps.layerv.xyz)"
+  type        = list(string)
+  default     = []
+}
+
 # ==================== Terraform State Configuration ====================
 
 variable "terraform_state_bucket" {

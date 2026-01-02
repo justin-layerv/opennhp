@@ -536,6 +536,7 @@ locals {
     # Production domains (cross-account ACME)
     cross_account_route53_role_arn = var.cross_account_route53_role_arn
     production_domains             = var.production_domains
+    additional_tls_domains         = var.additional_tls_domains
     # Traefik plugins (from unified plugins module)
     plugin_bucket_name = var.plugin_bucket_name
     traefik_plugins    = var.traefik_plugins

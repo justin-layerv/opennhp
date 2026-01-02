@@ -84,6 +84,10 @@ plugin_repos = ["traefik-plugins", "console"]
 # production_domains = ["qurl.site", "qurl.link"]
 # cross_account_route53_role_arn = "arn:aws:iam::165115313779:role/nhp-ac-route53-access"
 
+# Additional domains for TLS certificates (same account, layerv.xyz zone)
+# apps.layerv.xyz is needed for console2.apps.layerv.xyz (NHP-protected Console)
+additional_tls_domains = ["apps.layerv.xyz"]
+
 # ==============================================================================
 # Demo Gateway Configuration
 # Routes qurl.link/{appId} to NHP Server passcode plugin for demo flow

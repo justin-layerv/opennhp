@@ -697,6 +697,26 @@ cat >> /home/ubuntu/traefik/dynamic.toml << PRODDYNAMICEOF
 PRODDYNAMICEOF
 %{ endif }
 
+# Add additional TLS domain routers (same account, uses standard ACME)
+%{ if length(additional_tls_domains) > 0 }
+cat >> /home/ubuntu/traefik/dynamic.toml << ADDTLSEOF
+
+# Additional TLS domain routers (same account ACME)
+%{ for idx, domain in additional_tls_domains ~}
+  [http.routers.addtls-${idx}]
+    rule = "HostRegexp(\`^.+\\\\.${domain}\$\`) || Host(\`${domain}\`)"
+    service = "nhp-ac"
+    entryPoints = ["https"]
+    priority = 10
+    [http.routers.addtls-${idx}.tls]
+      certResolver = "letsencrypt"
+      [[http.routers.addtls-${idx}.tls.domains]]
+        main = "${domain}"
+        sans = ["*.${domain}"]
+%{ endfor ~}
+ADDTLSEOF
+%{ endif }
+
 # Create ACME storage
 touch /home/ubuntu/traefik/acme.json
 chmod 600 /home/ubuntu/traefik/acme.json

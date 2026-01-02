@@ -173,6 +173,12 @@ variable "production_zone_ids" {
   default     = []
 }
 
+variable "additional_tls_domains" {
+  description = "Additional domains for TLS certificates in same account (uses standard ACME DNS challenge)"
+  type        = list(string)
+  default     = []
+}
+
 # ============================================================================
 # SSM and Monitoring Configuration
 # These control automated maintenance and observability for AC instances
