@@ -460,6 +460,7 @@ jobs:
         run: |
           echo "server_asg=$(terraform output -raw asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
           echo "ac_asg=$(terraform output -raw ac_asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+          echo "console_ec2_asg=$(terraform output -raw console_ec2_asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
           echo "nlb_dns=$(terraform output -raw nlb_dns_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
           echo "etcd_endpoint=$(terraform output -raw etcd_endpoint 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
 
@@ -645,6 +646,59 @@ jobs:
             esac
           done
 
+      - name: Canary Deploy - Console EC2
+        if: steps.outputs.outputs.console_ec2_asg != ''
+        env:
+          ASG_NAME: ${{ steps.outputs.outputs.console_ec2_asg }}
+        run: |
+          echo "============================================"
+          echo "CANARY DEPLOYMENT - Console EC2"
+          echo "============================================"
+
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --preferences '{
+              "MinHealthyPercentage": 50,
+              "InstanceWarmup": 300,
+              "MaxHealthyPercentage": 110,
+              "SkipMatching": true
+            }' \
+            --query "InstanceRefreshId" \
+            --output text)
+
+          echo "Instance Refresh ID: $REFRESH_ID"
+
+          # Wait for completion
+          echo "Waiting for instance refresh..."
+          for i in {1..60}; do
+            sleep 10
+
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query "InstanceRefreshes[0].Status" \
+              --output text)
+
+            PERCENTAGE=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query "InstanceRefreshes[0].PercentageComplete" \
+              --output text)
+
+            echo "Status: $STATUS, Progress: ${PERCENTAGE}%"
+
+            case "$STATUS" in
+              "Successful")
+                echo "Instance refresh completed successfully"
+                break
+                ;;
+              "Failed"|"Cancelled")
+                echo "Instance refresh failed: $STATUS"
+                exit 1
+                ;;
+            esac
+          done
+
       - name: Post-Deployment Validation
         run: |
           echo "============================================"
@@ -723,6 +777,7 @@ jobs:
           echo "|-----------|-----|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| NHP Server | ${{ steps.outputs.outputs.server_asg }} | Deployed |" >> $GITHUB_STEP_SUMMARY
           echo "| AC | ${{ steps.outputs.outputs.ac_asg }} | Deployed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Console EC2 | ${{ steps.outputs.outputs.console_ec2_asg || 'N/A' }} | ${{ steps.outputs.outputs.console_ec2_asg && 'Deployed' || 'Skipped' }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Endpoints" >> $GITHUB_STEP_SUMMARY
           echo "- **NHP NLB:** \`${{ steps.outputs.outputs.nlb_dns }}\`" >> $GITHUB_STEP_SUMMARY
