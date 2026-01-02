@@ -434,7 +434,7 @@ SRVEOF
 # ac_id must match the AC module's ac_id for knock routing to work
 # ip must be an actual IP address (not DNS) because AC uses it in ipset rules
 RESOURCES=$(cat <<RESEOF
-[{"ac_id": "${ac_id}", "hostname": "$CONSOLE_HOSTNAME", "ip": "$AC_NLB_IP", "port": 443, "maskhost": true, "protocol": "tcp"}]
+[{"ac_id": "${ac_id}", "hostname": "$CONSOLE_HOSTNAME", "ip": "$AC_NLB_IP", "port": 443, "maskhost": false, "protocol": "tcp"}]
 RESEOF
 )
 
