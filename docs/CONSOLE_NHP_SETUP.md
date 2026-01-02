@@ -24,7 +24,9 @@ The "console" resource in portal_sites needs:
 site_url = 'https://console2.apps.layerv.xyz/'
 
 -- resources JSON (for knock routing)
-resources = '[{"ac_id": "layerv-ac-tf", "hostname": "console2.apps.layerv.xyz", "ip": "<AC_NLB_IP>", "port": 443, "maskhost": true, "protocol": "tcp"}]'
+-- IMPORTANT: maskhost must be FALSE for auth_code redirect_url to work
+-- When maskhost=true, DestHost() returns empty, breaking redirect_url construction
+resources = '[{"ac_id": "layerv-ac-tf", "hostname": "console2.apps.layerv.xyz", "ip": "<AC_NLB_IP>", "port": 443, "maskhost": false, "protocol": "tcp"}]'
 
 -- ext_info JSON (for auth_code flow)
 ext_info = '{
@@ -72,6 +74,7 @@ The `*.apps.layerv.xyz` wildcard points to old infra, so we override with a spec
 2. **IP not DNS in resources**: The `ip` field in resources must be an actual IP (ipset fails with hostnames)
 3. **DNS wildcard**: `*.apps.layerv.xyz` should point to AC NLB for protected resources
 4. **Traefik bypass**: `console.nhp.layerv.xyz` has priority 20 bypass route to Console EC2
+5. **maskhost must be FALSE**: For auth_code flow to return `redirect_url`, `maskhost` in resources must be `false`. When `true`, the NHP Server's `DestHost()` returns empty to hide the hostname, but the SDK needs it to construct the redirect URL
 
 ## Debugging
 
