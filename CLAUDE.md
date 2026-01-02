@@ -37,10 +37,7 @@ type(scope): message
 
 Examples: `fix(console-ec2): Set maskhost=false`, `feat(ac): Add TLS domains`
 
-**GPG Signing Required:** All commits must be signed. Use:
-```bash
-git -c gpg.format=openpgp -c user.signingkey=38FC0256BE29E308641F353D569BE9C92D37E4D3 commit --amend --no-edit -S
-```
+**GPG Signing Required:** All commits must be signed with the openpgp key.
 
 ## Common Commands
 
