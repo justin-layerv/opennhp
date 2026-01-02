@@ -282,3 +282,16 @@ variable "console_protected_hostname" {
   type        = string
   default     = null
 }
+
+# TLS certificate configuration
+variable "additional_tls_domains" {
+  description = "Additional domains for TLS certificates in same account"
+  type        = list(string)
+  default     = []
+}
+
+variable "use_production_acme" {
+  description = "Use production Let's Encrypt (true) or staging (false)"
+  type        = bool
+  default     = null
+}

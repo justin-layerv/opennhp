@@ -58,8 +58,10 @@ module "nhp" {
   rds_deletion_protection = var.rds_deletion_protection
 
   # Production domains (qurl.site, qurl.link)
-  production_domains  = var.production_domains
-  production_zone_ids = var.production_zone_ids
+  production_domains     = var.production_domains
+  production_zone_ids    = var.production_zone_ids
+  additional_tls_domains = var.additional_tls_domains
+  use_production_acme    = var.use_production_acme
 
   # Deployment configuration
   image_tag = var.image_tag
