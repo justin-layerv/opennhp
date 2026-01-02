@@ -45,6 +45,7 @@ dev_mode      = true
 resource_mode = "api"
 # auth_url is set dynamically in main.tf to Console EC2 internal NLB endpoint
 # auth_signing_key and auth_aes_key are passed via GitHub Secrets (TF_VAR_auth_signing_key, TF_VAR_auth_aes_key)
+# IMPORTANT: auth_signing_key must match Console's jwt.signing-key in config.yaml
 
 # Slack notifications via AWS Chatbot
 enable_slack_notifications = true
@@ -87,6 +88,10 @@ plugin_repos = ["traefik-plugins", "console"]
 # Additional domains for TLS certificates (same account, layerv.xyz zone)
 # apps.layerv.xyz is needed for console2.apps.layerv.xyz (NHP-protected Console)
 additional_tls_domains = ["apps.layerv.xyz"]
+
+# Use production Let's Encrypt for valid browser-trusted certificates
+# (Staging certs are not trusted by browsers)
+use_production_acme = true
 
 # ==============================================================================
 # Demo Gateway Configuration

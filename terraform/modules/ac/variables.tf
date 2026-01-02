@@ -179,6 +179,12 @@ variable "additional_tls_domains" {
   default     = []
 }
 
+variable "use_production_acme" {
+  description = "Use production Let's Encrypt (true) or staging (false). Staging certs are not trusted by browsers."
+  type        = bool
+  default     = null # null means auto-detect based on environment (prod=true, else=false)
+}
+
 # ============================================================================
 # SSM and Monitoring Configuration
 # These control automated maintenance and observability for AC instances

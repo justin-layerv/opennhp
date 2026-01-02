@@ -261,6 +261,12 @@ variable "additional_tls_domains" {
   default     = []
 }
 
+variable "use_production_acme" {
+  description = "Use production Let's Encrypt (true) or staging (false). Staging certs are not trusted by browsers. Default: auto-detect based on environment."
+  type        = bool
+  default     = null
+}
+
 # ==================== Terraform State Configuration ====================
 
 variable "terraform_state_bucket" {

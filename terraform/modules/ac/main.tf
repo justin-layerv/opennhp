@@ -518,7 +518,7 @@ locals {
     environment         = var.environment
     domain_name         = var.domain_name
     acme_email          = var.acme_email
-    acme_ca_server      = local.is_prod ? "https://acme-v02.api.letsencrypt.org/directory" : "https://acme-staging-v02.api.letsencrypt.org/directory"
+    acme_ca_server      = coalesce(var.use_production_acme, local.is_prod) ? "https://acme-v02.api.letsencrypt.org/directory" : "https://acme-staging-v02.api.letsencrypt.org/directory"
     etcd_endpoint       = var.etcd_endpoint
     etcd_tls_secret_arn = var.etcd_tls_secret_arn
     cloudmap_service_id = aws_service_discovery_service.ac.id
