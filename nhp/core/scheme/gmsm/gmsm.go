@@ -161,7 +161,7 @@ func GenerateSM2ECDSAKeypair() (*sm2.PrivateKey, string, string) {
 	var err error
 	var pubKeyBytes [64]byte
 	var privKeyBytes [32]byte
-	privKey := new(sm2.PrivateKey)
+	var privKey *sm2.PrivateKey
 
 	for {
 		privKey, err = sm2.GenerateKey(rand.Reader)

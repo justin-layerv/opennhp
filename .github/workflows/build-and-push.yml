@@ -232,20 +232,41 @@ jobs:
   # ============================================================================
   terraform-validate:
     name: Terraform Validate (PR)
-    # Skip for Dependabot PRs - they can't assume AWS OIDC role and typically only update dependencies
+    # Skip for Dependabot PRs and when no terraform files changed
+    # External PRs (from forks or automated tools) can't assume AWS OIDC role
     if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for Terraform changes
+        id: changes
+        run: |
+          # Get the base branch
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          # Check if any terraform files changed
+          if git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -q '^terraform/'; then
+            echo "terraform_changed=true" >> $GITHUB_OUTPUT
+            echo "Terraform files changed - running validation"
+          else
+            echo "terraform_changed=false" >> $GITHUB_OUTPUT
+            echo "No terraform files changed - skipping validation"
+          fi
 
       - name: Setup Terraform
+        if: steps.changes.outputs.terraform_changed == 'true'
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
       - name: Cache Terraform plugins
+        if: steps.changes.outputs.terraform_changed == 'true'
         uses: actions/cache@v4
         with:
           path: ~/.terraform.d/plugin-cache
@@ -253,6 +274,7 @@ jobs:
           restore-keys: terraform-plugins-
 
       - name: Configure AWS credentials
+        if: steps.changes.outputs.terraform_changed == 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           # Hardcoded for dependabot PRs (secrets not available)
@@ -260,10 +282,12 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Terraform Format Check
+        if: steps.changes.outputs.terraform_changed == 'true'
         working-directory: terraform/environments/sandbox
         run: terraform fmt -check -recursive ../../
 
       - name: Terraform Init
+        if: steps.changes.outputs.terraform_changed == 'true'
         working-directory: terraform/environments/sandbox
         env:
           TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
@@ -272,11 +296,13 @@ jobs:
           terraform init
 
       - name: Terraform Validate
+        if: steps.changes.outputs.terraform_changed == 'true'
         working-directory: terraform/environments/sandbox
         run: terraform validate
 
       - name: Terraform Plan
         id: plan
+        if: steps.changes.outputs.terraform_changed == 'true'
         working-directory: terraform/environments/sandbox
         run: |
           terraform plan -no-color 2>&1 | tee plan.txt
@@ -287,7 +313,7 @@ jobs:
 
       - name: Comment PR with Plan
         uses: actions/github-script@v7
-        if: github.event_name == 'pull_request'
+        if: steps.changes.outputs.terraform_changed == 'true'
         with:
           script: |
             const fs = require('fs');
@@ -301,6 +327,12 @@ jobs:
               repo: context.repo.repo,
               body: `## Terraform Plan (sandbox)\n\`\`\`\n${summary}\n\`\`\``
             });
+
+      - name: Skip Notice
+        if: steps.changes.outputs.terraform_changed != 'true'
+        run: |
+          echo "## Terraform Validation Skipped" >> $GITHUB_STEP_SUMMARY
+          echo "No terraform files changed in this PR." >> $GITHUB_STEP_SUMMARY
 
   # ============================================================================
   # TERRAFORM PLAN - Runs in parallel with test and build
