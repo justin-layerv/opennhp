@@ -8,6 +8,8 @@
 *.dll
 *.so
 *.dylib
+.*
+!.github/
 
 # NHP binaries (compiled without extension on Unix)
 nhp-server
@@ -17,7 +19,7 @@ endpoints/nhp-acd
 endpoints/nhp-server
 endpoints/nhp-agent
 
-# Test binaries
+# Test binary, build with `go test -c`
 *.test
 
 # Coverage

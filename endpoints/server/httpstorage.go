@@ -187,17 +187,40 @@ func (hs *HttpServer) initStorageRouter() {
 	g.GET("/download/:uuid/:filename", func(c *gin.Context) {
 		uuid := c.Param("uuid")
 		filename := c.Param("filename")
+
+		// validate that uuid and filename are single path components
+		if uuid == "" || strings.Contains(uuid, "/") || strings.Contains(uuid, "\\") || strings.Contains(uuid, "..") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file name"})
+			return
+		}
+		if filename == "" || strings.Contains(filename, "/") || strings.Contains(filename, "\\") || strings.Contains(filename, "..") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file name"})
+			return
+		}
+
 		filePath := filepath.Join(ExeDirPath, uploadDir, uuid, filename)
 
 		safeDir := filepath.Join(ExeDirPath, uploadDir)
+		safeDirAbs, err := filepath.Abs(safeDir)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+			return
+		}
+
 		absPath, err := filepath.Abs(filePath)
-		if err != nil || !strings.HasPrefix(absPath, safeDir) {
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file name"})
+			return
+		}
+
+		// ensure that the resolved path is within the safe directory
+		if !strings.HasPrefix(absPath, safeDirAbs+string(os.PathSeparator)) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file name"})
 			return
 		}
 
 		// check file exists
-		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		if _, err := os.Stat(absPath); os.IsNotExist(err) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "file not exists"})
 			return
 		}
@@ -206,7 +229,7 @@ func (hs *HttpServer) initStorageRouter() {
 		c.Header("Content-Description", "File Transfer")
 		c.Header("Content-Disposition", "attachment; filename="+filename)
 		c.Header("Content-Type", "application/octet-stream")
-		c.File(filePath)
+		c.File(absPath)
 	})
 
 	// get file metadata
@@ -276,11 +299,15 @@ func loadMetadata(uuid string) (FileMetadata, error) {
 	}
 
 	safeDir := filepath.Join(ExeDirPath, metadataDir)
-	if !strings.HasPrefix(absPath, safeDir) {
+	safeDirAbs, err := filepath.Abs(safeDir)
+	if err != nil {
+		return metadata, err
+	}
+	if !strings.HasPrefix(absPath, safeDirAbs) {
 		return metadata, fmt.Errorf("invalid file name")
 	}
 
-	file, err := os.Open(metadataPath)
+	file, err := os.Open(absPath)
 	if err != nil {
 		return metadata, err
 	}

@@ -58,7 +58,7 @@ Once you click the "Login" button, authentication is completed successfully, and
 
 ## Quick Start: Build and Test OpenNHP
 
-Follow our [quick start tutorial](https://opennhp.org/nhp_quick_start/) to build the OpenNHP source code and test it in a Docker environment. You will get your own OpenNHP environment up, simulate the “invisible” network hiding behavior and test authentication workflows.
+Follow our [quick start tutorial](https://docs.opennhp.org/nhp_quick_start/) to build the OpenNHP source code and test it in a Docker environment. You will get your own OpenNHP environment up, simulate the “invisible” network hiding behavior and test authentication workflows.
 
 ---
 
@@ -110,7 +110,7 @@ The OpenNHP architecture is inspired by the [NIST Zero Trust Architecture standa
 
 ![OpenNHP architecture](docs/images/OpenNHP_Arch.png)
 
-> Please refer to the [OpenNHP Documentation](https://opennhp.org/) for detailed information about architecture and workflow.
+> Please refer to the [OpenNHP Documentation](https://docs.opennhp.org/) for detailed information about architecture and workflow.
 
 ## Core: Cryptographic Algorithms
 
@@ -142,7 +142,7 @@ Cryptography is at the heart of OpenNHP, providing robust security, excellent pe
 
 Further reading:
 
-> Please refer to the [OpenNHP Documentation](https://opennhp.org/cryptography/) for detailed explanation of cryptographic algorithms used in OpenNHP.
+> Please refer to the [OpenNHP Documentation](https://docs.opennhp.org/cryptography/) for detailed explanation of cryptographic algorithms used in OpenNHP.
 
 ## Key Features
 
@@ -181,7 +181,7 @@ OpenNHP supports multiple deployment models to suit different use cases:
 - Server-to-Server: Secures communication between backend services
 - Gateway-to-Gateway: Secures site-to-site connections
 
-> Please refer to the [OpenNHP Documentation](https://opennhp.org/deploy/) for detailed deployment instructions.
+> Please refer to the [OpenNHP Documentation](https://docs.opennhp.org/deploy/) for detailed deployment instructions.
 
 ## Comparison between SPA and NHP
 The Single Packet Authorization (SPA) protocol is included in the [Software Defined Perimeter (SDP) specification](https://cloudsecurityalliance.org/artifacts/software-defined-perimeter-zero-trust-specification-v2) released by the [Cloud Security Alliance (CSA)](https://cloudsecurityalliance.org/). NHP improves security, reliability, scalability, and extensibility through a modern cryptographic framework and architecture, as demonstrated in the [AHAC research paper](https://www.mdpi.com/2076-3417/14/13/5593).
@@ -211,7 +211,11 @@ We welcome contributions to OpenNHP! Please see our [Contributing Guidelines](CO
 
 ## Sponsors
 
-<a href="https://layerv.ai"><img src="docs/images/layerv_logo.png" width="200" alt="LayerV.ai"></a>
+<a href="https://layerv.ai">
+  <img src="docs/images/layerv_logo.png" width="80" alt="LayerV.ai">
+  <br>
+  <img src="docs/images/layerv_text.svg" width="120" alt="LayerV.ai">
+</a>
 
 ## License
 
@@ -222,7 +226,7 @@ OpenNHP is released under the [Apache 2.0 License](LICENSE).
 
 - Project Website: [https://github.com/OpenNHP/opennhp](https://github.com/OpenNHP/opennhp)
 - Email: [support@opennhp.org](mailto:support@opennhp.org)
-- Slack Channel: [Join our Slack](https://opennhp.slack.com/)
+- Discord: [Join our Discord](https://discord.gg/CpyVmspx5x)
 
 For more detailed documentation, please visit our [Official Documentation](https://docs.opennhp.org).
 

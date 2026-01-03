@@ -53,7 +53,7 @@ OpenNHP 支持多种身份验证方法，如 OAuth、SAML、二维码等。为�
 
 ## 快速开始: 构建和测试 OpenNHP
 
-按照我们的[快速入门教程](https://opennhp.org/zh-cn/nhp_quick_start/) 构建 OpenNHP 源代码，并在 Docker 环境中进行测试。您将启动自己的 OpenNHP 调试环境，模拟“不可见”的网络隐藏行为并测试身份验证工作流。
+按照我们的[快速入门教程](https://docs.opennhp.org/zh-cn/nhp_quick_start/) 构建 OpenNHP 源代码，并在 Docker 环境中进行测试。您将启动自己的 OpenNHP 调试环境，模拟“不可见”的网络隐藏行为并测试身份验证工作流。
 
 ---
 
@@ -105,7 +105,7 @@ OpenNHP 的架构受 [NIST 零信任架构标准](https://www.nist.gov/publicati
 
 ![OpenNHP architecture](docs/images/OpenNHP_Arch.png)
 
-> 有关架构和工作流程的详细信息，请参阅 [OpenNHP 文档](https://opennhp.org/)。
+> 有关架构和工作流程的详细信息，请参阅 [OpenNHP 文档](https://docs.opennhp.org/)。
 
 ## 核心：加密算法
 
@@ -137,7 +137,7 @@ OpenNHP 的架构受 [NIST 零信任架构标准](https://www.nist.gov/publicati
 
 更多阅读：
 
-> 有关 OpenNHP 中使用的加密算法的详细说明，请参阅 [OpenNHP 文档](https://opennhp.org/cryptography/)。
+> 有关 OpenNHP 中使用的加密算法的详细说明，请参阅 [OpenNHP 文档](https://docs.opennhp.org/cryptography/)。
 
 ## 主要特性
 
@@ -176,7 +176,7 @@ OpenNHP 支持多种部署模型，以适应不同的使用场景：
 - 服务器到服务器：保护后端服务之间的通信
 - 网关到网关：保护站点到站点的连接
 
-> 有关详细部署说明，请参阅 [OpenNHP 文档](https://opennhp.org/deploy/)。
+> 有关详细部署说明，请参阅 [OpenNHP 文档](https://docs.opennhp.org/deploy/)。
 
 ## SPA 和 NHP 的比较
 单包认证（SPA）协议被包含在 [软件定义边界（SDP）规范](https://cloudsecurityalliance.org/artifacts/software-defined-perimeter-zero-trust-specification-v2) 中，由 [云安全联盟（CSA）](https://cloudsecurityalliance.org/) 发布。NHP 通过现代加密框架和架构在安全性、可靠性、可扩展性和可扩展性方面进行了改进，这一点在 [AHAC 研究论文](https://www.mdpi.com/2076-3417/14/13/5593) 中得到了验证。
@@ -202,7 +202,7 @@ OpenNHP 遵循 [Apache 2.0 许可协议](LICENSE)。
 
 - 项目网站：[https://github.com/OpenNHP/opennhp](https://github.com/OpenNHP/opennhp)
 - 电子邮件：[opennhp@gmail.com](mailto:opennhp@gmail.com)
-- Slack 频道：[加入我们的 Slack](https://slack.opennhp.org)
+- Discord：[加入我们的 Discord](https://discord.gg/CpyVmspx5x)
 
 有关更详细的文档，请访问我们的[官方网站](https://opennhp.org)。
 
