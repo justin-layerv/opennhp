@@ -81,7 +81,6 @@ generate-version-and-build:
 	@$(MAKE) acd
 	@$(MAKE) serverd
 	@$(MAKE) db
-	@$(MAKE) kgc
 	@$(MAKE) linuxagentsdk
 	@$(MAKE) androidagentsdk
 	@$(MAKE) macosagentsdk
@@ -124,13 +123,6 @@ db:
 	go build -trimpath -ldflags ${LD_FLAGS} -v -o ../release/nhp-db/nhp-db ./db/main/main.go && \
 	mkdir -p ../release/nhp-db/etc; \
 	cp ./db/main/etc/*.toml ../release/nhp-db/etc/
-
-kgc:
-	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-kgc... $(END_COLOUR)"
-	cd endpoints && \
-	go build -trimpath -ldflags ${LD_FLAGS} -v -o ../release/nhp-kgc/nhp-kgc ./kgc/main/main.go && \
-	mkdir -p ../release/nhp-kgc/etc; \
-	cp ./kgc/main/etc/*.toml ../release/nhp-kgc/etc/
 
 linuxagentsdk:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building Linux agent SDK... $(END_COLOUR)"

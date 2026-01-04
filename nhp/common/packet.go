@@ -4,7 +4,6 @@ package common
 const (
 	NHP_FLAG_EXTENDEDLENGTH = 1 << iota
 	NHP_FLAG_COMPRESS
-	NHP_FLAG_CL_PKC
 )
 
 // cipher scheme combination (bit 11 - bit 15)

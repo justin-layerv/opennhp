@@ -11,7 +11,7 @@ Quick reference for the LayerV NHP (Network Hiding Protocol) infrastructure proj
 
 ```
 nhp/                 # Core NHP protocol (Go)
-endpoints/           # Services: server, ac, agent, db, kgc
+endpoints/           # Services: server, ac, agent, db
 terraform/           # IaC with modules and environments (sandbox, prod)
 docker/              # Dockerfile.server, Dockerfile.ac.aws
 tests/               # local/, integration/, e2e/

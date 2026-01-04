@@ -29,7 +29,6 @@ type MsgData struct {
 	TransactionId  uint64
 	HeaderType     int
 	Compress       bool
-	ClPkc          bool // 0: non-CL-PKC extented, 1: CL-PKC extended
 	ExternalPacket *Packet
 	ExternalCookie *[CookieSize]byte
 	Message        []byte
@@ -74,9 +73,8 @@ type MsgAssemblerData struct {
 	CipherScheme  int
 	HeaderType    int
 	BodySize      int
-	HeaderFlag    uint16
-	BodyCompress  bool
-	ClPkc         bool
+	HeaderFlag   uint16
+	BodyCompress bool
 
 	ExternalCookie *[CookieSize]byte
 	RemotePubKey   []byte
@@ -100,7 +98,6 @@ func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err
 		mad.HeaderType = md.HeaderType
 		mad.RemotePubKey = md.PeerPk
 		mad.BodyCompress = md.Compress
-		mad.ClPkc = md.ClPkc
 		mad.bodyMessage = md.Message
 		mad.TransactionId = md.TransactionId
 		mad.connData = md.ConnData
@@ -380,10 +377,6 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 		// no compress
 		body = mad.bodyMessage
 		mad.BodySize = len(mad.bodyMessage) + GCMTagSize
-	}
-
-	if mad.ClPkc {
-		mad.HeaderFlag |= common.NHP_FLAG_CL_PKC
 	}
 
 	if mad.BodySize > PacketBufferSize-mad.header.Size() {

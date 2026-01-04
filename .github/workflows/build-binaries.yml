@@ -90,7 +90,6 @@ jobs:
           mkdir -p output/nhp-ac/etc
           mkdir -p output/nhp-server/etc
           mkdir -p output/nhp-db/etc
-          mkdir -p output/nhp-kgc/etc
 
       - name: Build nhp-agent
         shell: bash
@@ -121,13 +120,6 @@ jobs:
           go build -trimpath -ldflags "${{ steps.ldflags.outputs.ldflags }}" -v -o ../output/nhp-db/nhp-db${{ matrix.ext }} ./db/main/main.go
           cp ./db/main/etc/*.toml ../output/nhp-db/etc/
 
-      - name: Build nhp-kgc
-        shell: bash
-        run: |
-          cd endpoints
-          go build -trimpath -ldflags "${{ steps.ldflags.outputs.ldflags }}" -v -o ../output/nhp-kgc/nhp-kgc${{ matrix.ext }} ./kgc/main/main.go
-          cp ./kgc/main/etc/*.toml ../output/nhp-kgc/etc/
-
       # Upload each module as independent artifact
       - name: Upload nhp-agent artifact
         uses: actions/upload-artifact@v4
@@ -157,27 +149,20 @@ jobs:
           path: output/nhp-db/
           retention-days: 30
 
-      - name: Upload nhp-kgc artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: nhp-kgc-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: output/nhp-kgc/
-          retention-days: 30
-
       # Create complete package artifact
       - name: Create archive (Unix)
         if: matrix.os != 'windows-latest'
         shell: bash
         run: |
           cd output
-          tar -czvf opennhp-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz nhp-agent nhp-ac nhp-db nhp-server nhp-kgc
+          tar -czvf opennhp-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz nhp-agent nhp-ac nhp-db nhp-server
 
       - name: Create archive (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           cd output
-          Compress-Archive -Path nhp-agent, nhp-ac, nhp-db, nhp-server, nhp-kgc -DestinationPath "opennhp-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}.zip"
+          Compress-Archive -Path nhp-agent, nhp-ac, nhp-db, nhp-server -DestinationPath "opennhp-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}.zip"
 
       - name: Upload full package artifact
         uses: actions/upload-artifact@v4
