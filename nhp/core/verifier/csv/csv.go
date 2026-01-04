@@ -145,16 +145,16 @@ func ReverseBytes(b []byte) []byte {
 }
 
 func buildIDMsg(id []byte, idLen int, ecKeyHex string, pubkeyHex string) []byte {
-	// 计算 (id_len * 8) >> 8 % 256 和 (id_len * 8) % 256
+	// Calculate (id_len * 8) >> 8 % 256 and (id_len * 8) % 256
 	idLenBits := idLen * 8
 	firstByte := byte((idLenBits >> 8) % 256)
 	secondByte := byte(idLenBits % 256)
 
-	// 转换十六进制字符串为字节
+	// Convert hex strings to bytes
 	ecKeyBytes, _ := hex.DecodeString(ecKeyHex)
 	pubkeyBytes, _ := hex.DecodeString(pubkeyHex)
 
-	// 拼接所有字节切片
+	// Concatenate all byte slices
 	var result []byte
 	result = append(result, firstByte)
 	result = append(result, secondByte)
