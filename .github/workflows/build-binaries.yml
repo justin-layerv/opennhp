@@ -217,27 +217,25 @@ jobs:
           find release-artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release-files/ \;
           ls -la release-files/
 
-      - name: Delete existing latest release
+      - name: Create latest release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete latest --repo ${{ github.repository }} --yes --cleanup-tag || true
+          # Delete existing release if it exists
+          gh release delete latest --repo ${{ github.repository }} --yes --cleanup-tag 2>/dev/null || true
 
-      - name: Update latest release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest
-          name: Latest Build
-          body: |
-            **Latest Build Artifacts**
+          # Create new release with artifacts
+          gh release create latest \
+            --repo ${{ github.repository }} \
+            --title "Latest Build" \
+            --notes "**Latest Build Artifacts**
 
-            This release is automatically updated after each build with the latest binaries.
+          This release is automatically updated after each build with the latest binaries.
 
-            Build Time: ${{ github.event.head_commit.timestamp }}
-            Commit: ${{ github.sha }}
-          files: release-files/*
-          prerelease: true
-          make_latest: false
+          Build Time: ${{ github.event.head_commit.timestamp }}
+          Commit: ${{ github.sha }}" \
+            --prerelease \
+            release-files/*
 
   # Create official release when a tag is pushed
   release:
