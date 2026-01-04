@@ -2,6 +2,8 @@
 
 Quick reference for the LayerV NHP (Network Hiding Protocol) infrastructure project.
 
+> **Note:** This is a fork of [OpenNHP](https://github.com/OpenNHP/opennhp). Periodically sync upstream changes via `git fetch upstream && git merge upstream/main`.
+
 **For detailed documentation, see:**
 - `docs/ARCHITECTURE.md` - Complete system architecture, auth flows, debugging
 - `docs/TESTING.md` - Test categories, build tags, running tests
@@ -10,12 +12,16 @@ Quick reference for the LayerV NHP (Network Hiding Protocol) infrastructure proj
 ## Project Structure
 
 ```
-nhp/                 # Core NHP protocol (Go)
-endpoints/           # Services: server, ac, agent, db
+nhp/                 # Core NHP protocol library (Go module)
+endpoints/           # Services: server, ac, agent, db (Go module)
+examples/            # Example plugins (Go module)
 terraform/           # IaC with modules and environments (sandbox, prod)
 docker/              # Dockerfile.server, Dockerfile.ac.aws
 tests/               # local/, integration/, e2e/
+release/             # Build output (gitignored)
 ```
+
+**Multi-Module Workspace:** Three Go modules with `replace` directives pointing to local paths. Always run `go mod tidy` in all three when updating dependencies.
 
 **Related Repos:** `console` (UI/API), `website` (layerv.ai), `traefik-plugins` (middleware)
 
@@ -26,22 +32,115 @@ AWS_PROFILE=layerv          # Sandbox operations
 AWS_PROFILE=layerv-mgmt     # Management/Org operations
 ```
 
-## Commit Convention
+## Commit Convention (Release Please)
+
+This repository uses [Release Please](https://github.com/googleapis/release-please) for automated releases. Commits **must** follow [Conventional Commits](https://www.conventionalcommits.org/) format.
+
+### GPG Signing Requirement
+
+**All commits must be GPG signed.** Configure git to sign automatically:
+
+```bash
+git config commit.gpgsign true
+git config user.signingkey YOUR_KEY_ID
+```
+
+### Format
 
 ```
-type(scope): message
+type(scope): description
 
-# Types: fix, feat, refactor, docs, test, style, build
-# Scopes: ac, console-ec2, sandbox, security
+[optional body]
+
+[optional footer(s)]
 ```
 
-Examples: `fix(console-ec2): Set maskhost=false`, `feat(ac): Add TLS domains`
+### Commit Types and Version Impact
 
-**GPG Signing Required:** All commits must be signed with the openpgp key.
+| Type | Description | Version Bump |
+|------|-------------|--------------|
+| `feat` | New feature | **Minor** (0.X.0) |
+| `fix` | Bug fix | **Patch** (0.0.X) |
+| `docs` | Documentation only | None |
+| `style` | Code style (formatting, semicolons) | None |
+| `refactor` | Code change that neither fixes nor adds | None |
+| `perf` | Performance improvement | **Patch** |
+| `test` | Adding or updating tests | None |
+| `build` | Build system or dependencies | None |
+| `ci` | CI configuration | None |
+| `chore` | Maintenance tasks | None |
+
+### Breaking Changes (Major Version)
+
+Use `!` after the type or add `BREAKING CHANGE:` in the footer:
+
+```bash
+feat(api)!: remove deprecated endpoints
+
+# Or with footer:
+feat(api): redesign authentication flow
+
+BREAKING CHANGE: JWT tokens now require audience claim
+```
+
+### Scopes
+
+| Scope | Component |
+|-------|-----------|
+| `ac` | Access Controller |
+| `server` | NHP Server |
+| `agent` | NHP Agent |
+| `db` | Database service |
+| `nhp` | Core protocol library |
+| `terraform` | Infrastructure |
+| `docker` | Container configuration |
+| `ci` | GitHub Actions workflows |
+
+### Examples
+
+```bash
+feat(ac): add IPv6 support for iptables rules
+fix(server): prevent panic on nil knock packet
+docs(readme): update installation instructions
+refactor(nhp): extract crypto utilities to separate package
+feat(api)!: require authentication for all plugin endpoints
+chore: sync with upstream OpenNHP
+```
+
+### Release Please Behavior
+
+1. **On merge to main**: Release Please creates/updates a release PR
+2. **Release PR**: Accumulates changes, updates CHANGELOG.md, bumps version
+3. **Merge release PR**: Creates GitHub release with tag and artifacts
 
 ## Common Commands
 
+### Build (Makefile)
+
+```bash
+make all              # Full build: all binaries, SDKs, plugins, archive
+make init             # Clean and go mod tidy all modules
+make test             # Run unit tests
+make test-local       # Run local e2e tests (requires etcd container)
+make fuzz-quick       # Run fuzz tests (10s each, for CI)
+make fuzz             # Run fuzz tests (60s each)
+```
+
+### Go (Manual)
+
+```bash
+# Run go mod tidy on all modules
+cd nhp && go mod tidy && cd ../endpoints && go mod tidy && cd ../examples/server_plugin && go mod tidy
+
+# Tests (KBS_SKIP_INIT prevents private key dir creation)
+KBS_SKIP_INIT=1 go test ./... -v -race
+
+# Build single binary (static, no CGO)
+cd endpoints && CGO_ENABLED=0 go build -o ../release/nhp-server/nhp-serverd ./server/main/main.go
+```
+
 ### Terraform
+
 ```bash
 # Always format before committing
 terraform fmt -recursive terraform/
@@ -56,19 +155,8 @@ AWS_PROFILE=layerv terraform state list
 AWS_PROFILE=layerv terraform state show 'module.ac.resource'
 ```
 
-### Go
-```bash
-# Build (static, no CGO)
-CGO_ENABLED=0 go build -o bin/nhp-server ./endpoints/server
-
-# Tests (KBS_SKIP_INIT prevents private key dir creation)
-KBS_SKIP_INIT=1 go test ./... -v -race
-
-# Local e2e (auto-starts etcd container)
-make test-local
-```
-
 ### Docker
+
 ```bash
 docker buildx build -f docker/Dockerfile.server -t nhp-server .
 docker buildx build -f docker/Dockerfile.ac.aws -t nhp-ac .
@@ -76,10 +164,11 @@ trivy image nhp-server --severity HIGH,CRITICAL
 ```
 
 ### GitHub CLI
+
 ```bash
 gh run list --limit 10
 gh run watch
-gh pr create --title "feat: description" --body "..."
+gh pr create --title "feat(scope): description" --body "..."
 ```
 
 ## Key Ports
@@ -93,6 +182,7 @@ gh pr create --title "feat: description" --body "..."
 ## Quick Debugging
 
 ### Instance Access
+
 ```bash
 # Find instances
 AWS_PROFILE=layerv aws ec2 describe-instances \
@@ -104,6 +194,7 @@ AWS_PROFILE=layerv aws ssm start-session --target i-XXXXX
 ```
 
 ### Logs
+
 ```bash
 # AC logs (native binary)
 tail -100 /opt/layerv/nhp-ac/logs/ac-$(date +%Y-%m-%d).log
@@ -113,6 +204,7 @@ docker exec nhp-server cat /nhp-server/logs/server-$(date +%Y-%m-%d).log | tail 
 ```
 
 ### ASG Operations
+
 ```bash
 # Start instance refresh
 AWS_PROFILE=layerv aws autoscaling start-instance-refresh \
@@ -132,6 +224,7 @@ AWS_PROFILE=layerv aws autoscaling cancel-instance-refresh \
 | 502 on /plugins/* | Server HTTP down | Check port 8888, security groups |
 | Server "0 AC peers" | No ACs in etcd | Check AC registration |
 | Test panic "private key" | Missing env var | Set `KBS_SKIP_INIT=1` |
+| Push rejected "unsigned" | Missing GPG signature | Configure `git config commit.gpgsign true` |
 
 ## Cloud Map DNS (Internal)
 
@@ -162,3 +255,4 @@ etcd.nhp.sandbox.internal:2379  # etcd cluster
 - All storage encrypted with KMS CMKs
 - IMDSv2 required on EC2
 - AC private keys NEVER in etcd - only Secrets Manager
+- All commits must be GPG signed
