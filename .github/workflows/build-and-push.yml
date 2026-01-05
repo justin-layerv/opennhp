@@ -115,14 +115,22 @@ jobs:
     name: Test
     needs: [changes]
     runs-on: ubuntu-latest
-    # Skip if no code changes (doc-only PRs) or if skip_tests requested
-    if: needs.changes.outputs.code == 'true' && github.event.inputs.skip_tests != 'true'
     timeout-minutes: 15
     steps:
+      # Skip at step level (not job level) so the check name is always created
+      # This is required for branch protection to see the check as successful
+      - name: Skip notice
+        if: needs.changes.outputs.code != 'true' || github.event.inputs.skip_tests == 'true'
+        run: |
+          echo "::notice::Skipping tests - no code changes detected or skip requested"
+          echo "This job reports success to satisfy branch protection requirements."
+
       - name: Checkout code
-        uses: actions/checkout@v6
+        if: needs.changes.outputs.code == 'true' && github.event.inputs.skip_tests != 'true'
+        uses: actions/checkout@v4
 
       - name: Run tests (privileged container for iptables)
+        if: needs.changes.outputs.code == 'true' && github.event.inputs.skip_tests != 'true'
         run: |
           # Run tests in privileged container to allow iptables access
           # This is required for NHP tests that manipulate firewall rules
@@ -150,6 +158,7 @@ jobs:
             "
 
       - name: Go vet
+        if: needs.changes.outputs.code == 'true' && github.event.inputs.skip_tests != 'true'
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
@@ -164,8 +173,8 @@ jobs:
     name: Build ${{ matrix.image }}
     needs: [changes, setup]
     runs-on: ubuntu-latest
-    # Skip if no code changes (doc-only PRs like Release Please)
-    if: needs.changes.outputs.code == 'true'
+    # Note: No job-level 'if' - we skip at step level to ensure matrix expands
+    # and check names (Build server, Build ac) are created for branch protection
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -178,25 +187,35 @@ jobs:
             dockerfile: docker/Dockerfile.ac.aws
             repo: layerv/nhp-ac
     steps:
+      # Skip at step level (not job level) so matrix expands and check names are created
+      - name: Skip notice
+        if: needs.changes.outputs.code != 'true'
+        run: |
+          echo "::notice::Skipping build - no code changes detected"
+          echo "This job reports success to satisfy branch protection requirements."
+
       - name: Checkout code
-        uses: actions/checkout@v6
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials
-        if: github.event_name != 'pull_request'
-        uses: aws-actions/configure-aws-credentials@v5
+        if: needs.changes.outputs.code == 'true' && github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        if: github.event_name != 'pull_request'
+        if: needs.changes.outputs.code == 'true' && github.event_name != 'pull_request'
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Set up Docker Buildx
+        if: needs.changes.outputs.code == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Build image
+        if: needs.changes.outputs.code == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -218,6 +237,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
       - name: Set image name for scanning
+        if: needs.changes.outputs.code == 'true'
         id: image
         run: |
           ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
@@ -229,6 +249,7 @@ jobs:
           fi
 
       - name: Scan image
+        if: needs.changes.outputs.code == 'true'
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ steps.image.outputs.name }}
@@ -239,15 +260,15 @@ jobs:
           trivyignores: '.trivyignore'
 
       - name: Upload scan results
-        uses: actions/upload-artifact@v6
-        if: always()
+        uses: actions/upload-artifact@v4
+        if: always() && needs.changes.outputs.code == 'true'
         with:
           name: trivy-results-${{ matrix.image }}
           path: '${{ matrix.image }}-trivy-results.sarif'
           retention-days: 30
 
       - name: Push to ECR
-        if: github.event_name != 'pull_request'
+        if: needs.changes.outputs.code == 'true' && github.event_name != 'pull_request'
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
