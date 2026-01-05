@@ -286,18 +286,20 @@ resource "aws_iam_role" "github_actions" {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
         }
-        # Allow main branch and environment-based deployments for:
+        # Allow main branch, environment-based deployments, and pull requests for:
         # - Main NHP repo
         # - Traefik plugins repo
         # - NHP server plugin repos (nhp-plugins-passcode, nhp-plugins-oidc, etc.)
         # Environment-based: used by deploy jobs with `environment: sandbox/production`
+        # Pull requests: used by terraform-validate job for PR validation
         StringLike = {
           "token.actions.githubusercontent.com:sub" = concat(
             # Main NHP repo
             [
               "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main",
               "repo:${var.github_org}/${var.github_repo}:environment:sandbox",
-              "repo:${var.github_org}/${var.github_repo}:environment:production"
+              "repo:${var.github_org}/${var.github_repo}:environment:production",
+              "repo:${var.github_org}/${var.github_repo}:pull_request"
             ],
             # Traefik plugins repo
             var.traefik_plugins_github_repo != "" ? [
