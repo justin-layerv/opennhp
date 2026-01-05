@@ -6,31 +6,21 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"fmt"
 	"hash"
 	"io"
-	"log"
-	"os"
 
-	"github.com/emmansun/gmsm/padding"
-	"github.com/emmansun/gmsm/sm2"
-	"github.com/emmansun/gmsm/sm3"
-	"github.com/emmansun/gmsm/sm4"
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core/scheme/curve"
-	"github.com/OpenNHP/opennhp/nhp/core/scheme/gmsm"
 )
 
 type HashTypeEnum int
 
 const (
 	HASH_BLAKE2S HashTypeEnum = iota
-	HASH_SM3
 	HASH_SHA256
 )
 
@@ -38,15 +28,12 @@ type EccTypeEnum int
 
 const (
 	ECC_CURVE25519 EccTypeEnum = iota
-	ECC_SM2
-	ECC_UMI
 )
 
 type GcmTypeEnum int
 
 const (
 	GCM_AES256 GcmTypeEnum = iota
-	GCM_SM4
 	GCM_CHACHA20POLY1305
 )
 
@@ -58,37 +45,19 @@ type CipherSuite struct {
 }
 
 // init cipher suite
-func NewCipherSuite(scheme int) (ciphers *CipherSuite) {
-	// init cipher suite
-	switch scheme {
-	case common.CIPHER_SCHEME_GMSM:
-		ciphers = &CipherSuite{
-			Scheme:   common.CIPHER_SCHEME_GMSM,
-			HashType: HASH_SM3,
-			EccType:  ECC_SM2,
-			GcmType:  GCM_SM4,
-		}
-
-	case common.CIPHER_SCHEME_CURVE:
-		fallthrough
-	default:
-		ciphers = &CipherSuite{
-			Scheme:   common.CIPHER_SCHEME_CURVE,
-			HashType: HASH_BLAKE2S,
-			EccType:  ECC_CURVE25519,
-			GcmType:  GCM_AES256,
-		}
+func NewCipherSuite() (ciphers *CipherSuite) {
+	return &CipherSuite{
+		Scheme:   common.CIPHER_SCHEME_CURVE,
+		HashType: HASH_BLAKE2S,
+		EccType:  ECC_CURVE25519,
+		GcmType:  GCM_AES256,
 	}
-	return
 }
 
 func NewHash(t HashTypeEnum) (h hash.Hash) {
 	switch t {
 	case HASH_BLAKE2S:
 		h, _ = blake2s.New256(nil)
-
-	case HASH_SM3:
-		h = sm3.New()
 
 	case HASH_SHA256:
 		h = sha256.New()
@@ -118,14 +87,6 @@ func ECDHFromKey(t EccTypeEnum, prk []byte) (e Ecdh) {
 			return nil
 		}
 		e = &c
-
-	case ECC_SM2:
-		var s gmsm.SM2ECDH
-		err := s.SetPrivateKey(prk)
-		if err != nil {
-			return nil
-		}
-		e = &s
 	}
 
 	return e
@@ -135,9 +96,6 @@ func NewECDH(t EccTypeEnum) (e Ecdh) {
 	switch t {
 	case ECC_CURVE25519:
 		e = curve.NewECDH()
-
-	case ECC_SM2:
-		e = gmsm.NewECDH()
 	}
 
 	return e
@@ -148,10 +106,6 @@ func AeadFromKey(t GcmTypeEnum, key *[SymmetricKeySize]byte) (aead cipher.AEAD) 
 	case GCM_AES256:
 		aesBlock, _ := aes.NewCipher(key[:])
 		aead, _ = cipher.NewGCM(aesBlock)
-
-	case GCM_SM4:
-		sm4Block, _ := sm4.NewCipher(key[:16])
-		aead, _ = cipher.NewGCM(sm4Block)
 
 	case GCM_CHACHA20POLY1305:
 		aead, _ = chacha20poly1305.New(key[:])
@@ -168,10 +122,6 @@ func CBCEncryption(t GcmTypeEnum, key *[SymmetricKeySize]byte, plaintext []byte,
 		block, _ = aes.NewCipher(key[:])
 		iv = key[8:24]
 
-	case GCM_SM4:
-		block, _ = sm4.NewCipher(key[:16])
-		iv = key[16:]
-
 	case GCM_CHACHA20POLY1305:
 		return nil, ErrNotApplicable
 	}
@@ -181,8 +131,7 @@ func CBCEncryption(t GcmTypeEnum, key *[SymmetricKeySize]byte, plaintext []byte,
 		// skip padding
 		paddedPlainText = plaintext
 	} else {
-		pkcs7 := padding.NewPKCS7Padding(uint(block.BlockSize()))
-		paddedPlainText = pkcs7.Pad(plaintext)
+		paddedPlainText = pad(plaintext, block.BlockSize())
 	}
 
 	var ciphertext []byte
@@ -202,15 +151,10 @@ func CBCEncryption(t GcmTypeEnum, key *[SymmetricKeySize]byte, plaintext []byte,
 func CBCDecryption(t GcmTypeEnum, key *[SymmetricKeySize]byte, ciphertext []byte, inPlace bool) ([]byte, error) {
 	var block cipher.Block
 	var iv []byte
-	var err error
 	switch t {
 	case GCM_AES256:
 		block, _ = aes.NewCipher(key[:])
 		iv = key[8:24]
-
-	case GCM_SM4:
-		block, _ = sm4.NewCipher(key[:16])
-		iv = key[16:]
 
 	case GCM_CHACHA20POLY1305:
 		return nil, ErrNotApplicable
@@ -235,57 +179,10 @@ func CBCDecryption(t GcmTypeEnum, key *[SymmetricKeySize]byte, ciphertext []byte
 		// skip unpadding
 	} else {
 		// Unpad plaintext
-		pkcs7 := padding.NewPKCS7Padding(uint(block.BlockSize()))
-		plaintext, err = pkcs7.Unpad(plaintext)
-		if err != nil {
-			return nil, err
-		}
+		plaintext = unpad(plaintext, block.BlockSize())
 	}
 
 	return plaintext, nil
-}
-
-func SM2Encrypt(pubKeyBase64 string, message string) (string, error) {
-	//ASN.1
-
-	// real public key should be from cert or public key pem file
-	sm2PublicKey, err := gmsm.Base64DecodeSM2ECDSAPublicKey(pubKeyBase64)
-
-	secretMessage := []byte(message)
-	// crypto/rand.Reader is a good source of entropy for randomizing the
-	// encryption function.
-	rng := rand.Reader
-
-	ciphertext, err := sm2.EncryptASN1(rng, sm2PublicKey, secretMessage)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error from encryption: %s\n", err)
-		return "", err
-	}
-	// Since encryption is a randomized function, ciphertext will be
-	// different each time.
-	fmt.Printf("Ciphertext: %x\n", ciphertext)
-	return hex.EncodeToString(ciphertext), err
-}
-
-func SM2Decrypt(privateKeyBase64 string, message string) (string, error) {
-	//ASN.1
-	ciphertext, err := hex.DecodeString(message)
-	privKeyBytes, err := base64.StdEncoding.DecodeString(privateKeyBase64)
-	if err != nil {
-		return "", fmt.Errorf("size incorrect")
-	}
-
-	testkey, err := sm2.NewPrivateKey(privKeyBytes)
-	if err != nil {
-		log.Fatalf("fail to new private key %v", err)
-	}
-
-	sourceText, err := testkey.Decrypt(nil, ciphertext, nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error from decryption: %s\n", err)
-		return "", err
-	}
-	return string(sourceText), err
 }
 
 // AESEncryption Function
@@ -344,9 +241,6 @@ func AESDecrypt(cipherText []byte, key []byte) ([]byte, error) {
 }
 func unpad(padded []byte, blockSize int) []byte {
 	length := len(padded)
-	if length == 0 {
-		return nil
-	}
 	unpadLen := int(padded[length-1])
 	if unpadLen > blockSize || unpadLen > length {
 		return nil

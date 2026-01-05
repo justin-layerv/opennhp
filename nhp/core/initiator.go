@@ -25,7 +25,7 @@ type MsgData struct {
 	RemoteAddr     *net.UDPAddr      // used by agent and ac create a new connection or pick an existing connection for msg sending
 	ConnData       *ConnectionData   // used by server to pick an existing connection for msg sending
 	PrevParserData *PacketParserData // when PrevParserData is set, CipherScheme, RemoteAddr, ConnData, TransactionId and PeerPk will be overridden
-	CipherScheme   int               // 0: sm2/sm4/sm3, 1: curve25519/chacha20/blake2s
+	CipherScheme   int               // 0: curve25519/chacha20/blake2s
 	TransactionId  uint64
 	HeaderType     int
 	Compress       bool
@@ -73,8 +73,8 @@ type MsgAssemblerData struct {
 	CipherScheme  int
 	HeaderType    int
 	BodySize      int
-	HeaderFlag   uint16
-	BodyCompress bool
+	HeaderFlag    uint16
+	BodyCompress  bool
 
 	ExternalCookie *[CookieSize]byte
 	RemotePubKey   []byte
@@ -117,9 +117,9 @@ func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err
 		}
 
 		// create header and init device ecdh
-		log.Info("start encryption using CIPHER_SCHEME_%d(0: CURVE; 1: GMSM.)", mad.CipherScheme)
+		log.Info("start encryption using CIPHER_SCHEME_CURVE")
 		mad.header = mad.BasePacket.HeaderWithCipherScheme(mad.CipherScheme)
-		mad.ciphers = NewCipherSuite(mad.CipherScheme)
+		mad.ciphers = NewCipherSuite()
 		mad.deviceEcdh = d.GetEcdhByCipherScheme(mad.CipherScheme)
 
 		// init version
@@ -167,7 +167,7 @@ func (mad *MsgAssemblerData) derivePacketParserData(pkt *Packet, initTime int64)
 	// init header and init device ecdh
 	ppd.HeaderFlag = ppd.basePacket.Flag()
 	ppd.header = ppd.basePacket.HeaderWithCipherScheme(ppd.CipherScheme)
-	ppd.Ciphers = NewCipherSuite(ppd.CipherScheme)
+	ppd.Ciphers = NewCipherSuite()
 	ppd.deviceEcdh = ppd.device.GetEcdhByCipherScheme(ppd.CipherScheme)
 
 	// init chain hash -> ChainHash0
@@ -224,32 +224,11 @@ func (mad *MsgAssemblerData) setPeerPublicKey(peerPk []byte) (err error) {
 		return err
 	}
 
-	lenMismatch := false
-	log.Debug("setPeerPublicKey: checking key length: RemotePubKey len=%d, CipherScheme=%d, PublicKeySize=%d, PublicKeySizeEx=%d",
-		len(mad.RemotePubKey), mad.CipherScheme, PublicKeySize, PublicKeySizeEx)
-	switch mad.CipherScheme {
-	case common.CIPHER_SCHEME_CURVE:
-		log.Debug("setPeerPublicKey: CURVE scheme, comparing %d != %d", len(mad.RemotePubKey), PublicKeySize)
-		if len(mad.RemotePubKey) != PublicKeySize {
-			log.Error("remote peer public key length does not match cipher scheme: got %d bytes, expected %d for scheme %d, key=%x",
-				len(mad.RemotePubKey), PublicKeySize, mad.CipherScheme, mad.RemotePubKey)
-			lenMismatch = true
-		}
-
-	case common.CIPHER_SCHEME_GMSM:
-		log.Debug("setPeerPublicKey: GMSM scheme, comparing %d != %d", len(mad.RemotePubKey), PublicKeySizeEx)
-		if len(mad.RemotePubKey) != PublicKeySizeEx {
-			log.Error("remote peer public key length does not match cipher scheme: got %d bytes, expected %d for scheme %d, key=%x",
-				len(mad.RemotePubKey), PublicKeySizeEx, mad.CipherScheme, mad.RemotePubKey)
-			lenMismatch = true
-		}
-	default:
-		log.Error("cipher scheme not implemented: %d", mad.CipherScheme)
-		err = ErrDeviceECDHPeerFailed
-		return err
-	}
-
-	if lenMismatch {
+	log.Debug("setPeerPublicKey: checking key length: RemotePubKey len=%d, PublicKeySize=%d",
+		len(mad.RemotePubKey), PublicKeySize)
+	if len(mad.RemotePubKey) != PublicKeySize {
+		log.Error("remote peer public key length mismatch: got %d bytes, expected %d, key=%x",
+			len(mad.RemotePubKey), PublicKeySize, mad.RemotePubKey)
 		err = ErrDeviceECDHPeerFailed
 		return err
 	}
@@ -279,18 +258,9 @@ func (mad *MsgAssemblerData) setPeerPublicKey(peerPk []byte) (err error) {
 	mad.noise.KeyGen2(&mad.chainKey, &key, mad.chainKey[:], ess[:])
 	SetZero(ess[:])
 
-	var aead cipher.AEAD
-	var static []byte
 	// encrypt initiator's public key and evolve chainhash with the ciphertext
-	switch mad.CipherScheme {
-	case common.CIPHER_SCHEME_CURVE:
-		fallthrough
-	case common.CIPHER_SCHEME_GMSM:
-		fallthrough
-	default:
-		aead = AeadFromKey(mad.ciphers.GcmType, &key)
-		static = aead.Seal(mad.header.StaticBytes()[:0], mad.header.NonceBytes(), mad.deviceEcdh.PublicKey(), mad.chainHash.Sum(nil))
-	}
+	aead := AeadFromKey(mad.ciphers.GcmType, &key)
+	static := aead.Seal(mad.header.StaticBytes()[:0], mad.header.NonceBytes(), mad.deviceEcdh.PublicKey(), mad.chainHash.Sum(nil))
 
 	//log.Debug("encrypted pubkey: %v, output: %v", mad.deviceEcdh.PublicKey(), static)
 
@@ -310,18 +280,9 @@ func (mad *MsgAssemblerData) setPeerPublicKey(peerPk []byte) (err error) {
 	SetZero(ss[:])
 
 	var tsBytes [TimestampSize]byte
-	var ts []byte
 	binary.BigEndian.PutUint64(tsBytes[:], uint64(mad.LocalInitTime))
-
-	switch mad.CipherScheme {
-	case common.CIPHER_SCHEME_CURVE:
-		fallthrough
-	case common.CIPHER_SCHEME_GMSM:
-		fallthrough
-	default:
-		aead = AeadFromKey(mad.ciphers.GcmType, &key)
-		ts = aead.Seal(mad.header.TimestampBytes()[:0], mad.header.NonceBytes(), tsBytes[:], mad.chainHash.Sum(nil))
-	}
+	aead = AeadFromKey(mad.ciphers.GcmType, &key)
+	ts := aead.Seal(mad.header.TimestampBytes()[:0], mad.header.NonceBytes(), tsBytes[:], mad.chainHash.Sum(nil))
 
 	// evolve chainhash ChainHash2 -> ChainHash3
 	mad.chainHash.Write(ts)

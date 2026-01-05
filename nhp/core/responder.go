@@ -106,8 +106,8 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 		ppd.HeaderFlag = ppd.basePacket.Flag()
 		ppd.header = ppd.basePacket.Header()
 		ppd.CipherScheme = ppd.header.CipherScheme()
-		log.Info("start decryption using CIPHER_SCHEME_%d(0: CURVE; 1: GMSM.)", ppd.CipherScheme)
-		ppd.Ciphers = NewCipherSuite(ppd.CipherScheme)
+		log.Info("start decryption using CIPHER_SCHEME_CURVE")
+		ppd.Ciphers = NewCipherSuite()
 		ppd.deviceEcdh = d.GetEcdhByCipherScheme(ppd.CipherScheme)
 
 		// init chain hash -> ChainHash0
@@ -235,25 +235,14 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 	// generate gcm key and decrypt device pubkey ChainKey1 -> ChainKey2 (ChainKey5 -> ChainKey6)
 	ppd.noise.KeyGen2(&ppd.chainKey, &key, ppd.chainKey[:], ess[:])
 	SetZero(ess[:])
-	peerPk := make([]byte, PublicKeySizeEx)
-	switch ppd.CipherScheme {
-	case common.CIPHER_SCHEME_CURVE:
-		fallthrough
-	case common.CIPHER_SCHEME_GMSM:
-		fallthrough
-	default:
-		KeyByteSlice := key[:]
-		log.Debug("ppd.Ciphers.GcmType:%d,&key:%s,NonceBytes:%s,StaticBytes:%s", ppd.Ciphers.GcmType, base64.StdEncoding.EncodeToString(KeyByteSlice), base64.StdEncoding.EncodeToString(ppd.header.NonceBytes()), base64.StdEncoding.EncodeToString(ppd.header.StaticBytes()))
-		aead = AeadFromKey(ppd.Ciphers.GcmType, &key)
-		_, err = aead.Open(peerPk[:0], ppd.header.NonceBytes(), ppd.header.StaticBytes(), ppd.chainHash.Sum(nil))
-		if err != nil {
-			log.Error("failed to decrypt peer pubkey")
-			return err
-		}
-	}
-
-	if ppd.CipherScheme == common.CIPHER_SCHEME_CURVE {
-		peerPk = peerPk[:PublicKeySize]
+	peerPk := make([]byte, PublicKeySize)
+	KeyByteSlice := key[:]
+	log.Debug("ppd.Ciphers.GcmType:%d,&key:%s,NonceBytes:%s,StaticBytes:%s", ppd.Ciphers.GcmType, base64.StdEncoding.EncodeToString(KeyByteSlice), base64.StdEncoding.EncodeToString(ppd.header.NonceBytes()), base64.StdEncoding.EncodeToString(ppd.header.StaticBytes()))
+	aead = AeadFromKey(ppd.Ciphers.GcmType, &key)
+	_, err = aead.Open(peerPk[:0], ppd.header.NonceBytes(), ppd.header.StaticBytes(), ppd.chainHash.Sum(nil))
+	if err != nil {
+		log.Error("failed to decrypt peer pubkey")
+		return err
 	}
 
 	//log.Debug("decrypted pubkey: %v, input: %v", peerPk, ppd.header.StaticBytes())
@@ -332,18 +321,11 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 	SetZero(ss[:])
 
 	var tsBytes [TimestampSize]byte
-	switch ppd.CipherScheme {
-	case common.CIPHER_SCHEME_CURVE:
-		fallthrough
-	case common.CIPHER_SCHEME_GMSM:
-		fallthrough
-	default:
-		aead = AeadFromKey(ppd.Ciphers.GcmType, &key)
-		_, err = aead.Open(tsBytes[:0], ppd.header.NonceBytes(), ppd.header.TimestampBytes(), ppd.chainHash.Sum(nil))
-		if err != nil {
-			log.Error("failed to decrypt timestamp")
-			return err
-		}
+	aead = AeadFromKey(ppd.Ciphers.GcmType, &key)
+	_, err = aead.Open(tsBytes[:0], ppd.header.NonceBytes(), ppd.header.TimestampBytes(), ppd.chainHash.Sum(nil))
+	if err != nil {
+		log.Error("failed to decrypt timestamp")
+		return err
 	}
 
 	remoteSendTime := int64(binary.BigEndian.Uint64(tsBytes[:]))
@@ -402,18 +384,9 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 
 	// handle knock packet at overload before going into body decryption
 	if ppd.device.deviceType == NHP_SERVER && ppd.Overload && (ppd.HeaderType == NHP_KNK || ppd.HeaderType == DHP_KNK) {
-		switch ppd.CipherScheme {
-		case common.CIPHER_SCHEME_CURVE:
-			fallthrough
-		case common.CIPHER_SCHEME_GMSM:
-			fallthrough
-		default:
-			ppd.generateCookie()
-			ppd.sendCookie()
-			err = ErrServerRejectWithCookie
-		}
-
-		return err
+		ppd.generateCookie()
+		ppd.sendCookie()
+		return ErrServerRejectWithCookie
 	}
 
 	// evolve chainhash ChainHash2 -> ChainHash3
@@ -538,31 +511,23 @@ func (ppd *PacketParserData) checkHMAC(sumCookie bool) bool {
 	ppd.hmacHash.Write(ppd.header.Bytes()[0:len])
 
 	if sumCookie {
-		switch ppd.CipherScheme {
-		case common.CIPHER_SCHEME_CURVE:
-			fallthrough
-		case common.CIPHER_SCHEME_GMSM:
-			fallthrough
-		default:
-			ppd.ConnData.Lock()
-			defer ppd.ConnData.Unlock()
+		ppd.ConnData.Lock()
+		defer ppd.ConnData.Unlock()
 
-			if ppd.LocalInitTime < ppd.ConnData.CookieStore.LastCookieTime+CookieRoundTripTimeMs*int64(time.Millisecond) {
-				// cookie has already or nearly been updated, use previous cookie
-				ppd.hmacHash.Write(ppd.ConnData.CookieStore.PrevCookie[:])
-				prevCookieHmac := ppd.hmacHash.Sum(nil)
-				return bytes.Equal(prevCookieHmac, ppd.header.HMACBytes())
-			} else {
-				// use current cookie
-				ppd.hmacHash.Write(ppd.ConnData.CookieStore.CurrCookie[:])
-				cookieHmac := ppd.hmacHash.Sum(nil)
-				return bytes.Equal(cookieHmac, ppd.header.HMACBytes())
-			}
+		if ppd.LocalInitTime < ppd.ConnData.CookieStore.LastCookieTime+CookieRoundTripTimeMs*int64(time.Millisecond) {
+			// cookie has already or nearly been updated, use previous cookie
+			ppd.hmacHash.Write(ppd.ConnData.CookieStore.PrevCookie[:])
+			prevCookieHmac := ppd.hmacHash.Sum(nil)
+			return bytes.Equal(prevCookieHmac, ppd.header.HMACBytes())
 		}
-	} else {
-		calculatedHmac := ppd.hmacHash.Sum(nil)
-		return bytes.Equal(calculatedHmac, ppd.header.HMACBytes())
+		// use current cookie
+		ppd.hmacHash.Write(ppd.ConnData.CookieStore.CurrCookie[:])
+		cookieHmac := ppd.hmacHash.Sum(nil)
+		return bytes.Equal(cookieHmac, ppd.header.HMACBytes())
 	}
+
+	calculatedHmac := ppd.hmacHash.Sum(nil)
+	return bytes.Equal(calculatedHmac, ppd.header.HMACBytes())
 }
 
 func (ppd *PacketParserData) Destroy() {

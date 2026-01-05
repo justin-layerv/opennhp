@@ -7,7 +7,6 @@ import "C"
 
 import (
 	"encoding/base64"
-	"fmt"
 	"unsafe"
 
 	core "github.com/OpenNHP/opennhp/nhp/core"
@@ -261,80 +260,3 @@ func nhp_device_set_overload(handle uintptr, overload bool) *C.NhpResult {
 	return resultPtr
 }
 
-// Perform SM4 AEAD encryption
-//
-// Input:
-// key: Key buffer
-// keyLen: Key length (the first 16 bytes are used)
-// nonce: Counter value buffer
-// nonceLen: Counter value length (must be 12 bytes)
-// plain: Plain text data
-// plainLen: Plain text length
-// additionalData: Additional authenticated data
-// additionalDataLen: Length of additional authenticated data
-//
-// Return:
-// Pointer to NhpEncryptResult, with the ciphertext represented by packet and packetLen
-//
-// Caller: After the function call, release the returned data, refer to the nhp_free_NhpEncryptResult function
-//
-//export nhp_sm4_aead_encrypt
-func nhp_sm4_aead_encrypt(key *C.uchar, keyLen C.int, nonce *C.uchar, nonceLen C.int, plain *C.uchar, plainLen C.int, additionalData *C.uchar, additionalDataLen C.int) *C.NhpEncryptResult {
-	resultPtr := (*C.NhpEncryptResult)(C.malloc(C.sizeof_NhpEncryptResult))
-	C.memset(unsafe.Pointer(resultPtr), 0, C.sizeof_NhpEncryptResult)
-
-	var aeadKey [core.SymmetricKeySize]byte
-	buf := make([]byte, plainLen+16)
-	copy(aeadKey[:], C.GoBytes(unsafe.Pointer(key), keyLen))
-
-	aead := core.AeadFromKey(core.GCM_SM4, &aeadKey)
-	cipher := aead.Seal(buf[:0], C.GoBytes(unsafe.Pointer(nonce), nonceLen), C.GoBytes(unsafe.Pointer(plain), plainLen), C.GoBytes(unsafe.Pointer(additionalData), additionalDataLen))
-	if cipher == nil {
-		resultPtr.errCode = 1
-		resultPtr.errMsg = C.CString("GCM encryption failed")
-		return resultPtr
-	}
-
-	resultPtr.packet = (*C.uchar)(C.CBytes(cipher))
-	resultPtr.packetLen = C.int(len(cipher))
-	return resultPtr
-}
-
-// Perform SM4 AEAD decryption
-//
-// Input:
-// key: Key buffer
-// keyLen: Key length (the first 16 bytes)
-// nonce: Counter value buffer (must be the same as the counter value during encryption)
-// nonceLen: Counter value length (must be 12 bytes)
-// cipher: Ciphertext data
-// cipherLen: Ciphertext length
-// additionalData: Additional verification data
-// additionalDataLen: Length of additional verification data
-//
-// Return:
-// Pointer to NhpDecryptResult, plaintext is represented by data and dataLen
-//
-// Caller: Release the returned data after the call is complete, refer to the nhp_free_NhpEncryptResult function
-//
-//export nhp_sm4_aead_decrypt
-func nhp_sm4_aead_decrypt(key *C.uchar, keyLen C.int, nonce *C.uchar, nonceLen C.int, cipher *C.uchar, cipherLen C.int, additionalData *C.uchar, additionalDataLen C.int) *C.NhpDecryptResult {
-	resultPtr := (*C.NhpDecryptResult)(C.malloc(C.sizeof_NhpDecryptResult))
-	C.memset(unsafe.Pointer(resultPtr), 0, C.sizeof_NhpDecryptResult)
-
-	var aeadKey [core.SymmetricKeySize]byte
-	buf := make([]byte, cipherLen)
-	copy(aeadKey[:], C.GoBytes(unsafe.Pointer(key), keyLen))
-
-	aead := core.AeadFromKey(core.GCM_SM4, &aeadKey)
-	plain, err := aead.Open(buf[:0], C.GoBytes(unsafe.Pointer(nonce), nonceLen), C.GoBytes(unsafe.Pointer(cipher), cipherLen), C.GoBytes(unsafe.Pointer(additionalData), additionalDataLen))
-	if err != nil {
-		resultPtr.errCode = 1
-		resultPtr.errMsg = C.CString(fmt.Sprintf("GCM decryption failed: %s", err))
-		return resultPtr
-	}
-
-	resultPtr.data = (*C.uchar)(C.CBytes(plain))
-	resultPtr.dataLen = C.int(len(plain))
-	return resultPtr
-}

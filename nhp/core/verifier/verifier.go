@@ -7,8 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-
-	"github.com/OpenNHP/opennhp/nhp/core/verifier/csv"
 )
 
 type Verifier interface {
@@ -69,24 +67,10 @@ func NewVerifier(compressedEvienceBase64 string) (Verifier, error) {
 		return nil, fmt.Errorf("failed to read evidence: %v", err)
 	}
 
-	var evidence map[string]any
-
-	err = json.Unmarshal(evidenceBytes, &evidence)
+	verifier, err := NewFallbackVerifier(evidenceBytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal evidence: %v", err)
+		return nil, fmt.Errorf("failed to create verifier: %v", err)
 	}
 
-	var verifier Verifier
-
-	if _, ok := evidence["test_purpose"]; ok {
-		verifier, err = NewFallbackVerifier(evidenceBytes)
-	} else {
-		verifier, err = csv.NewAttestation(string(evidenceBytes))
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to create csv verifier: %v", err)
-	} else {
-		return verifier, nil
-	}
+	return verifier, nil
 }

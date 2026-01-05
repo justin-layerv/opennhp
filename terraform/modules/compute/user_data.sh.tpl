@@ -51,7 +51,7 @@ mkdir -p /opt/layerv/nhp-server/log
 
 cat > /opt/layerv/nhp-server/etc/config.toml << CONFIGEOF
 PrivateKeyBase64 = "$PRIVATE_KEY"
-DefaultCipherScheme = 1
+DefaultCipherScheme = 0
 ListenIp = ""
 ListenPort = 62206
 Hostname = "$HOSTNAME"

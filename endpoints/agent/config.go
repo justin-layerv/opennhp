@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
 	"github.com/OpenNHP/opennhp/nhp/utils"
@@ -38,29 +37,17 @@ type DHPConfig struct {
 }
 
 func (c *Config) GetAgentEcdh() core.Ecdh {
-	eccType := core.ECC_SM2
-	if c.DefaultCipherScheme == common.CIPHER_SCHEME_CURVE {
-		eccType = core.ECC_CURVE25519
-	}
 	teePrk, _ := base64.StdEncoding.DecodeString(c.PrivateKeyBase64)
-	return core.ECDHFromKey(eccType, teePrk)
+	return core.ECDHFromKey(core.ECC_CURVE25519, teePrk)
 }
 
 func (c *Config) GetTeeEcdh() core.Ecdh {
-	eccType := core.ECC_SM2
-	if c.DefaultCipherScheme == common.CIPHER_SCHEME_CURVE {
-		eccType = core.ECC_CURVE25519
-	}
 	teePrk, _ := base64.StdEncoding.DecodeString(c.TEEPrivateKeyBase64)
-	return core.ECDHFromKey(eccType, teePrk)
+	return core.ECDHFromKey(core.ECC_CURVE25519, teePrk)
 }
 
 func (c *Config) GetEccType() core.EccTypeEnum {
-	eccType := core.ECC_SM2
-	if c.DefaultCipherScheme == common.CIPHER_SCHEME_CURVE {
-		eccType = core.ECC_CURVE25519
-	}
-	return eccType
+	return core.ECC_CURVE25519
 }
 
 type Peers struct {

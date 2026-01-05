@@ -19,7 +19,6 @@ typedef enum _NhpDeviceType {
 
 typedef enum _NhpCipherScheme {
     NHP_CIPHER_SCHEME_CURVE,
-    NHP_CIPHER_SCHEME_GMSM,
 } NhpCipherScheme;
 
 typedef enum _NhpMsgType {
@@ -50,8 +49,7 @@ typedef struct _NhpResult {
 
 typedef struct _NhpEncryptParams {
     // Specifies the encryption scheme used for the message:
-    // 0: curve25519/chacha20poly1305/blake2s
-    // 1: sm2/sm4/sm3
+    // 0: curve25519/chacha20poly1305/blake2s (only supported scheme)
     unsigned char cipherScheme;
     // true: Use zlib to compress the plaintext message
     unsigned char compress;

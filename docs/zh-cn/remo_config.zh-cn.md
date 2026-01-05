@@ -96,7 +96,7 @@ nhp server远端配置内容分为如下七部分：
 # field with (-) does not support dynamic update
 
 # PrivateKeyBase64 (-): server private key in base64 format.
-# DefaultCipherScheme: 0: gmsm, 1: curve25519.
+# DefaultCipherScheme: 0: curve25519 (only supported scheme).
 # ListenIp (-): udp listening address.
 # ListenPort (-): udp listening port.
 # Hostname (-): server domain name.
@@ -212,7 +212,7 @@ nhp ac远端配置内容分为如下三部分：
 
 # ACId (-): specify the id of this AC.
 # PrivateKeyBase64 (-): AC private key in base64 format.
-# DefaultCipherScheme: 0: gmsm, 1: curve25519.
+# DefaultCipherScheme: 0: curve25519 (only supported scheme).
 # IpPassMode:
 #  0: (default) immediately pass traffic with the agent source ip,
 #  2: process pre-access to determine actual agent source ip then pass.

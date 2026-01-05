@@ -126,17 +126,8 @@ func initApp() {
 	keygenCmd := &cli.Command{
 		Name:  "keygen",
 		Usage: "generate key pairs for NHP devices",
-		Flags: []cli.Flag{
-			&cli.BoolFlag{Name: "curve", Value: false, DisableDefaultText: true, Usage: "generate curve25519 keys"},
-			&cli.BoolFlag{Name: "sm2", Value: false, DisableDefaultText: true, Usage: "generate sm2 keys"},
-		},
 		Action: func(c *cli.Context) error {
-			var e core.Ecdh
-			eccType := core.ECC_SM2
-			if c.Bool("curve") {
-				eccType = core.ECC_CURVE25519
-			}
-			e = core.NewECDH(eccType)
+			e := core.NewECDH(core.ECC_CURVE25519)
 			pub := e.PublicKeyBase64()
 			priv := e.PrivateKeyBase64()
 			fmt.Println("Private key: ", priv)
@@ -148,20 +139,12 @@ func initApp() {
 	pubkeyCmd := &cli.Command{
 		Name:  "pubkey",
 		Usage: "get public key from private key",
-		Flags: []cli.Flag{
-			&cli.BoolFlag{Name: "curve", Value: false, DisableDefaultText: true, Usage: "get curve25519 key"},
-			&cli.BoolFlag{Name: "sm2", Value: false, DisableDefaultText: true, Usage: "get sm2 key"},
-		},
 		Action: func(c *cli.Context) error {
 			privKey, err := base64.StdEncoding.DecodeString(c.Args().First())
 			if err != nil {
 				return err
 			}
-			cipherType := core.ECC_SM2
-			if c.Bool("curve") {
-				cipherType = core.ECC_CURVE25519
-			}
-			e := core.ECDHFromKey(cipherType, privKey)
+			e := core.ECDHFromKey(core.ECC_CURVE25519, privKey)
 			if e == nil {
 				return fmt.Errorf("invalid input key")
 			}
@@ -215,9 +198,6 @@ func runApp(params db.AppParams) error {
 	}
 
 	dataKeyPairEccMode := ztdolib.CURVE25519
-	if a.GetCipherSchema() == 0 {
-		dataKeyPairEccMode = ztdolib.SM2
-	}
 
 	switch params.Mode {
 	case "encrypt":

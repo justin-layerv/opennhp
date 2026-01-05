@@ -795,12 +795,7 @@ func (a *UdpDevice) GetDataBrokerId() string {
 
 func (a *UdpDevice) GetOwnEcdh() core.Ecdh {
 	prk, _ := base64.StdEncoding.DecodeString(a.config.PrivateKeyBase64)
-	eccMode := core.ECC_CURVE25519
-	if a.config.DefaultCipherScheme == 0 {
-		eccMode = core.ECC_SM2
-	}
-
-	return core.ECDHFromKey(eccMode, prk)
+	return core.ECDHFromKey(core.ECC_CURVE25519, prk)
 }
 
 func (a *UdpDevice) isTEEAuthorized(teePbkBase64 string) bool {
@@ -835,10 +830,7 @@ func (a *UdpDevice) HandleUdpDataKeyWrappingOperations(ppd *core.PacketParserDat
 				dwaMsg.ErrCode = errCode
 				dwaMsg.ErrMsg = common.ErrDataPrivateKeyStore.Error()
 			} else {
-				dataKeyPairEccMode := ztdolib.SM2
-				if a.config.DefaultCipherScheme == common.CIPHER_SCHEME_CURVE {
-					dataKeyPairEccMode = ztdolib.CURVE25519
-				}
+				dataKeyPairEccMode := ztdolib.CURVE25519
 
 				teePbk, _ := base64.StdEncoding.DecodeString(dwrMsg.TeePublicKey)
 				consumerEPbk, _ := base64.StdEncoding.DecodeString(dwrMsg.ConsumerEphemeralPublicKey)

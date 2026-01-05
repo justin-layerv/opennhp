@@ -90,12 +90,12 @@ func TestUpdateTomlConfig(t *testing.T) {
 
 # PrivateKeyBase64 (-): agent private key in base64 format.
 # TEEPrivateKeyBase64 (-): TEE private key in base64 format.
-# DefaultCipherScheme: 0: curve25519, 1: gmsm.
+# DefaultCipherScheme: 0: curve25519 (only supported scheme).
 # UserId: specify the user id this agent represents.
 # OrganizationId: specify the organization id this agent represents.
 # LogLevel: 0: silent, 1: error, 2: info, 3: audit, 4: debug, 5: trace.
 PrivateKeyBase64 = "lDaE1EKKyIJG4A28IZup/GDBZWYWEPZqGFaoV4Rlnn0="
-DefaultCipherScheme = 1
+DefaultCipherScheme = 0
 UserId = "agent-0"
 OrganizationId = "opennhp.org"
 LogLevel = 4

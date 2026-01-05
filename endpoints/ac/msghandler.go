@@ -558,7 +558,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 		}
 		artMsg.PreAccessAction = &common.PreAccessInfo{
 			AccessPort:     strconv.Itoa(pickedPort),
-			ACPubKey:       a.device.PublicKeyExBase64(),
+			ACPubKey:       a.device.PublicKeyBase64(),
 			ACToken:        a.GenerateAccessToken(tempEntry),
 			ACCipherScheme: a.config.DefaultCipherScheme,
 		}

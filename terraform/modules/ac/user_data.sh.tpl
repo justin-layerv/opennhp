@@ -481,7 +481,7 @@ cat > /opt/layerv/nhp-ac/etc/config.toml << CONFIGEOF
 ACId = "${ac_id}"
 DefaultIp = "$LOCAL_IP"
 PrivateKeyBase64 = "$PRIVATE_KEY"
-DefaultCipherScheme = 1
+DefaultCipherScheme = 0
 IpPassMode = 0
 LogLevel = 4
 AuthServiceId = "${auth_service_id}"

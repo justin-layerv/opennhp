@@ -7,8 +7,6 @@ import (
 	"encoding/base64"
 	"fmt"
 
-	"github.com/emmansun/gmsm/sm4"
-
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
 
@@ -25,18 +23,16 @@ type DataKeyPairGenerator interface {
 	Generate(mode DataKeyPairECCMode) (privateKey []byte)
 }
 
-// Symmetric cipher mode provides symmetric encryption and decryption and supports Chinese standards and International standards.
+// Symmetric cipher mode provides symmetric encryption and decryption.
 type SymmetricCipherMode uint8
 
 const (
-	AES256GCM64Tag SymmetricCipherMode = iota  // 0x00
-	AES256GCM96Tag                       // 0x01
-	AES256GCM104Tag                      // 0x02
-	AES256GCM112Tag                      // 0x03
-	AES256GCM120Tag                      // 0x04
-	AES256GCM128Tag                      // 0x05
-	SM4GCM64Tag                          // 0x06
-	SM4GCM128Tag                         // 0x07
+	AES256GCM64Tag SymmetricCipherMode = iota // 0x00
+	AES256GCM96Tag                            // 0x01
+	AES256GCM104Tag                           // 0x02
+	AES256GCM112Tag                           // 0x03
+	AES256GCM120Tag                           // 0x04
+	AES256GCM128Tag                           // 0x05
 )
 
 func (m SymmetricCipherMode) String() string {
@@ -53,10 +49,6 @@ func (m SymmetricCipherMode) String() string {
 		return "AES-256-GCM-120"
 	case AES256GCM128Tag:
 		return "AES-256-GCM-128"
-	case SM4GCM64Tag:
-		return "SM4-GCM-64"
-	case SM4GCM128Tag:
-		return "SM4-GCM-128"
 	default:
 		return "Unknown"
 	}
@@ -64,7 +56,7 @@ func (m SymmetricCipherMode) String() string {
 
 func (m SymmetricCipherMode) TagSize() int {
 	switch m {
-	case AES256GCM64Tag, SM4GCM64Tag:
+	case AES256GCM64Tag:
 		return 8
 	case AES256GCM96Tag:
 		return 12
@@ -74,7 +66,7 @@ func (m SymmetricCipherMode) TagSize() int {
 		return 14
 	case AES256GCM120Tag:
 		return 15
-	case AES256GCM128Tag, SM4GCM128Tag:
+	case AES256GCM128Tag:
 		return 16
 	default:
 		return 0
@@ -95,10 +87,6 @@ func NewSymmetricCipherMode(mode string) (SymmetricCipherMode, error) {
 		return AES256GCM120Tag, nil
 	case "AES-256-GCM-128":
 		return AES256GCM128Tag, nil
-	case "SM4-GCM-64":
-		return SM4GCM64Tag, nil
-	case "SM4-GCM-128":
-		return SM4GCM128Tag, nil
 	default:
 		return 0, fmt.Errorf("unknown symmetric mode name: %s", mode)
 	}
@@ -111,13 +99,6 @@ func (mode SymmetricCipherMode) newCipherBlock(key []byte) (cipher.Block, error)
 			return nil, fmt.Errorf("invalid key length for AES-256-GCM")
 		}
 		return aes.NewCipher(key)
-	case SM4GCM64Tag, SM4GCM128Tag:
-		if len(key) < 16 {
-			return nil, fmt.Errorf("invalid key length for SM4-GCM")
-		} else {
-			key = key[:16]
-		}
-		return sm4.NewCipher(key)
 	default:
 		return nil, fmt.Errorf("unsupported mode: %v", mode)
 	}
@@ -167,49 +148,29 @@ type DataKeyPairECCMode uint8
 
 const (
 	CURVE25519 DataKeyPairECCMode = iota
-	SM2
-	UNKNOWN
 )
 
 func (d DataKeyPairECCMode) String() string {
 	switch d {
 	case CURVE25519:
 		return "CURVE25519"
-	case SM2:
-		return "SM2"
 	default:
 		return "UNKNOWN"
 	}
 }
 
 func (d DataKeyPairECCMode) ToEccType() core.EccTypeEnum {
-	switch d {
-	case CURVE25519:
-		return core.ECC_CURVE25519
-	case SM2:
-		return core.ECC_SM2
-	default:
-		return core.ECC_UMI
-	}
+	return core.ECC_CURVE25519
 }
 
 func (d DataKeyPairECCMode) ToHashType() core.HashTypeEnum {
-	switch d {
-	case CURVE25519:
-		return core.HASH_SHA256
-	case SM2:
-		return core.HASH_SM3
-	default:
-		return core.HASH_SHA256
-	}
+	return core.HASH_SHA256
 }
 
 func NewDataKeyPairECCModeWithName(mode string) (DataKeyPairECCMode, error) {
 	switch mode {
 	case "CURVE25519":
 		return CURVE25519, nil
-	case "SM2":
-		return SM2, nil
 	default:
 		return 0, fmt.Errorf("unknown mode: %s", mode)
 	}
@@ -219,8 +180,6 @@ func NewDataKeyPairECCMode(eccMode core.EccTypeEnum) (DataKeyPairECCMode, error)
 	switch eccMode {
 	case core.ECC_CURVE25519:
 		return CURVE25519, nil
-	case core.ECC_SM2:
-		return SM2, nil
 	default:
 		return 0, fmt.Errorf("unknown mode: %d", eccMode)
 	}

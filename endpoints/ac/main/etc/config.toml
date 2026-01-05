@@ -3,8 +3,7 @@
 
 # ACId (-): specify the id of this AC.
 # PrivateKeyBase64 (-): AC private key in base64 format.
-# DefaultCipherScheme: 0: curve25519, 1: gmsm.
-# MIGRATION: Values changed in v2.x. If upgrading: old 0(gmsm)->new 1, old 1(curve)->new 0.
+# DefaultCipherScheme: 0: curve25519 (only supported scheme).
 # IpPassMode:
 #  0: (default) immediately pass traffic with the agent source ip,
 #  1: process pre-access to determine actual agent source ip then pass.
@@ -17,7 +16,7 @@
 ACId = "testAC-346"
 DefaultIp = "172.16.3.46"
 PrivateKeyBase64 = "6++hr1lJkvbCVBCbTm4OpXusFJI0wmDi/RR3WpTz3tk="
-DefaultCipherScheme = 1
+DefaultCipherScheme = 0
 IpPassMode = 0
 LogLevel = 4
 AuthServiceId = "example"

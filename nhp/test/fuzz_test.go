@@ -9,26 +9,16 @@ import (
 // FuzzECDHFromKey tests ECDH key creation with random inputs.
 // This is important for security as malformed keys should be handled gracefully.
 func FuzzECDHFromKey(f *testing.F) {
-	// Seed corpus with valid key sizes
-	f.Add([]byte{}, int(core.ECC_CURVE25519))
-	f.Add(make([]byte, 32), int(core.ECC_CURVE25519))
-	f.Add(make([]byte, 64), int(core.ECC_SM2))
-	f.Add(make([]byte, 16), int(core.ECC_CURVE25519))
-	f.Add(make([]byte, 48), int(core.ECC_SM2))
+	// Seed corpus with valid key sizes for Curve25519
+	f.Add([]byte{})
+	f.Add(make([]byte, 32))
+	f.Add(make([]byte, 16))
+	f.Add(make([]byte, 64))
 
-	f.Fuzz(func(t *testing.T, data []byte, eccType int) {
-		// Normalize eccType to valid range
-		var eType core.EccTypeEnum
-		switch eccType % 2 {
-		case 0:
-			eType = core.ECC_CURVE25519
-		case 1:
-			eType = core.ECC_SM2
-		}
-
+	f.Fuzz(func(t *testing.T, data []byte) {
 		// ECDHFromKey should not panic on any input
 		// It should return nil for invalid keys
-		e := core.ECDHFromKey(eType, data)
+		e := core.ECDHFromKey(core.ECC_CURVE25519, data)
 		if e != nil {
 			// If key was accepted, verify basic operations don't panic
 			_ = e.PublicKey()

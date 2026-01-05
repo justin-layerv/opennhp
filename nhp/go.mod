@@ -7,7 +7,6 @@ toolchain go1.24.11
 require (
 	github.com/cilium/ebpf v0.20.0
 	github.com/coocood/freecache v1.2.4
-	github.com/emmansun/gmsm v0.40.0
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gin-gonic/gin v1.11.0
 	github.com/google/uuid v1.6.0

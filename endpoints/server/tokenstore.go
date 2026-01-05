@@ -1,13 +1,13 @@
 package server
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/log"
-	"github.com/emmansun/gmsm/sm3"
 )
 
 type ACTokenEntry struct {
@@ -25,7 +25,7 @@ func (s *UdpServer) GenerateAccessToken(entry *ACTokenEntry) string {
 	var tsBytes [8]byte
 	currTime := time.Now().UnixNano()
 
-	hash := sm3.New()
+	hash := sha256.New()
 	binary.BigEndian.PutUint64(tsBytes[:], uint64(currTime))
 	au := entry.User
 	hash.Write([]byte(s.config.Hostname + au.UserId + au.DeviceId + au.OrganizationId + au.AuthServiceId))

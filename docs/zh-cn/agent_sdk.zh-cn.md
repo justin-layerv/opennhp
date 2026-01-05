@@ -418,21 +418,12 @@ func nhp_agent_exit_resource(aspId *C.char, resId *C.char, serverIp *C.char, ser
 	return err == nil
 }
 
-// cipherType: 0-curve25519; 1-sm2
 // result: "privatekey"|"publickey"
 // caller is responsible to free the returned char* pointer
 //
 //export nhp_generate_keys
-func nhp_generate_keys(cipherType C.int) *C.char {
-	var e core.Ecdh
-	switch core.EccTypeEnum(cipherType) {
-	case core.ECC_SM2:
-		e = core.NewECDH(core.ECC_SM2)
-	case core.ECC_CURVE25519:
-		fallthrough
-	default:
-		e = core.NewECDH(core.ECC_CURVE25519)
-	}
+func nhp_generate_keys() *C.char {
+	e := core.NewECDH(core.ECC_CURVE25519)
 	pub := e.PublicKeyBase64()
 	priv := e.PrivateKeyBase64()
 
@@ -442,20 +433,19 @@ func nhp_generate_keys(cipherType C.int) *C.char {
 	return pRes
 }
 
-// cipherType: 0-curve25519; 1-sm2
 // privateBase64: private key in base64 format
 // result: "publickey"
 // caller is responsible to free the returned char* pointer
 //
 //export nhp_privkey_to_pubkey
-func nhp_privkey_to_pubkey(cipherType C.int, privateBase64 *C.char) *C.char {
+func nhp_privkey_to_pubkey(privateBase64 *C.char) *C.char {
 	privKey := deepCopyCString(privateBase64)
 	privKeyBytes, err := base64.StdEncoding.DecodeString(privKey)
 	if err != nil {
 		return nil
 	}
 
-	e := core.ECDHFromKey(core.EccTypeEnum(cipherType), privKeyBytes)
+	e := core.ECDHFromKey(core.ECC_CURVE25519, privKeyBytes)
 	if e == nil {
 		return nil
 	}
@@ -1411,21 +1401,11 @@ func NhpAgentExitResource(aspId string, resId string, serverIp string, serverHos
 	return err == nil
 }
 
-// cipherType: 0-curve25519; 1-sm2
 // result: "privatekey"|"publickey"
-// caller is responsible to free the returned char* pointer
 //
 //export NhpGenerateKeys
-func NhpGenerateKeys(cipherType int) string {
-	var e core.Ecdh
-	switch core.EccTypeEnum(cipherType) {
-	case core.ECC_SM2:
-		e = core.NewECDH(core.ECC_SM2)
-	case core.ECC_CURVE25519:
-		fallthrough
-	default:
-		e = core.NewECDH(core.ECC_CURVE25519)
-	}
+func NhpGenerateKeys() string {
+	e := core.NewECDH(core.ECC_CURVE25519)
 	pub := e.PublicKeyBase64()
 	priv := e.PrivateKeyBase64()
 
@@ -1434,20 +1414,18 @@ func NhpGenerateKeys(cipherType int) string {
 	return res
 }
 
-// cipherType: 0-curve25519; 1-sm2
 // privateBase64: private key in base64 format
 // result: "publickey"
-// caller is responsible to free the returned char* pointer
 //
 //export NhpPrivkeyToPubkey
-func NhpPrivkeyToPubkey(cipherType int, privateBase64 string) string {
+func NhpPrivkeyToPubkey(privateBase64 string) string {
 	privKey := privateBase64
 	privKeyBytes, err := base64.StdEncoding.DecodeString(privKey)
 	if err != nil {
 		return ""
 	}
 
-	e := core.ECDHFromKey(core.EccTypeEnum(cipherType), privKeyBytes)
+	e := core.ECDHFromKey(core.ECC_CURVE25519, privKeyBytes)
 	if e == nil {
 		return ""
 	}

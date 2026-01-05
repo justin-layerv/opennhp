@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/OpenNHP/opennhp/nhp/common"
 	log "github.com/OpenNHP/opennhp/nhp/log"
 )
 
@@ -57,10 +56,9 @@ type Device struct {
 	optionMutex sync.Mutex
 	option      DeviceOptions
 
-	counterIndex    uint64
-	deviceType      int
-	staticEcdhCurve Ecdh // for cipherscheme curve
-	staticEcdhGmsm  Ecdh // for cipherscheme gmsm
+	counterIndex uint64
+	deviceType   int
+	staticEcdh   Ecdh
 
 	peerMapMutex sync.Mutex
 	peerMap      map[string]Peer
@@ -92,14 +90,9 @@ func NewDevice(t int, prk []byte, option *DeviceOptions) *Device {
 		d.option = defaultDeviceOptions(t)
 	}
 
-	d.staticEcdhCurve = ECDHFromKey(ECC_CURVE25519, prk)
-	if d.staticEcdhCurve == nil {
+	d.staticEcdh = ECDHFromKey(ECC_CURVE25519, prk)
+	if d.staticEcdh == nil {
 		log.Critical("Failed to set private key")
-		return nil
-	}
-	d.staticEcdhGmsm = ECDHFromKey(ECC_SM2, prk)
-	if d.staticEcdhGmsm == nil {
-		log.Critical("Failed to set private key ex")
 		return nil
 	}
 
@@ -142,11 +135,7 @@ func (d *Device) Stop() {
 }
 
 func (d *Device) PublicKeyBase64() string {
-	return d.staticEcdhCurve.PublicKeyBase64()
-}
-
-func (d *Device) PublicKeyExBase64() string {
-	return d.staticEcdhGmsm.PublicKeyBase64()
+	return d.staticEcdh.PublicKeyBase64()
 }
 
 func (d *Device) NextCounterIndex() uint64 {
@@ -530,12 +519,5 @@ func (d *Device) SetOverload(overloaded bool) {
 }
 
 func (d *Device) GetEcdhByCipherScheme(cipherScheme int) Ecdh {
-	switch cipherScheme {
-	case common.CIPHER_SCHEME_GMSM:
-		return d.staticEcdhGmsm
-	case common.CIPHER_SCHEME_CURVE:
-		fallthrough
-	default:
-		return d.staticEcdhCurve
-	}
+	return d.staticEcdh
 }
