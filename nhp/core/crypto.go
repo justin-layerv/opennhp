@@ -320,12 +320,17 @@ func AESDecrypt(cipherText []byte, key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// IV，IV cipherText left 16
+	// Need at least IV (16 bytes) + one block of data (16 bytes)
 	if len(cipherText) < aes.BlockSize {
 		return nil, fmt.Errorf("cipherText too short")
 	}
 	iv := cipherText[:aes.BlockSize]
 	cipherText = cipherText[aes.BlockSize:]
+
+	// CBC requires ciphertext to be a multiple of block size
+	if len(cipherText) == 0 || len(cipherText)%aes.BlockSize != 0 {
+		return nil, fmt.Errorf("cipherText length must be a multiple of block size")
+	}
 
 	// Decrypt
 	mode := cipher.NewCBCDecrypter(block, iv)
