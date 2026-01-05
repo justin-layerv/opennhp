@@ -15,13 +15,8 @@ on:
   pull_request:
     branches:
       - main
-    paths:
-      - 'nhp/**'
-      - 'endpoints/**'
-      - 'docker/**'
-      - 'terraform/**'
-      - 'scripts/**'
-      - 'tests/**'
+    # No path filters - workflow must run for all PRs so required checks report status
+    # Path filtering happens at job level via the 'changes' job
   workflow_dispatch:
     inputs:
       environment:
@@ -59,6 +54,38 @@ env:
 
 jobs:
   # ============================================================================
+  # CHANGES - Detect what files changed (enables skipping jobs for doc-only PRs)
+  # ============================================================================
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect code changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'nhp/**'
+              - 'endpoints/**'
+              - 'docker/**'
+              - 'terraform/**'
+              - 'scripts/**'
+              - 'tests/**'
+              - '.github/workflows/**'
+
+      - name: Annotate skipped jobs
+        if: steps.filter.outputs.code == 'false'
+        run: |
+          echo "::notice title=Jobs Skipped::No code changes detected (only docs/changelog). Test and Build jobs will be skipped but report success for branch protection."
+
+  # ============================================================================
   # SETUP - Quick metadata job (runs first, enables parallelism)
   # ============================================================================
   setup:
@@ -86,8 +113,10 @@ jobs:
   # ============================================================================
   test:
     name: Test
+    needs: [changes]
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.skip_tests != 'true' }}
+    # Skip if no code changes (doc-only PRs) or if skip_tests requested
+    if: needs.changes.outputs.code == 'true' && github.event.inputs.skip_tests != 'true'
     timeout-minutes: 15
     steps:
       - name: Checkout code
@@ -133,8 +162,10 @@ jobs:
   # ============================================================================
   build:
     name: Build ${{ matrix.image }}
-    needs: [setup]
+    needs: [changes, setup]
     runs-on: ubuntu-latest
+    # Skip if no code changes (doc-only PRs like Release Please)
+    if: needs.changes.outputs.code == 'true'
     timeout-minutes: 15
     strategy:
       fail-fast: false
