@@ -61,22 +61,22 @@ type CipherSuite struct {
 func NewCipherSuite(scheme int) (ciphers *CipherSuite) {
 	// init cipher suite
 	switch scheme {
-	case common.CIPHER_SCHEME_CURVE:
-		ciphers = &CipherSuite{
-			Scheme:   common.CIPHER_SCHEME_CURVE,
-			HashType: HASH_BLAKE2S,
-			EccType:  ECC_CURVE25519,
-			GcmType:  GCM_AES256,
-		}
-
 	case common.CIPHER_SCHEME_GMSM:
-		fallthrough
-	default:
 		ciphers = &CipherSuite{
 			Scheme:   common.CIPHER_SCHEME_GMSM,
 			HashType: HASH_SM3,
 			EccType:  ECC_SM2,
 			GcmType:  GCM_SM4,
+		}
+
+	case common.CIPHER_SCHEME_CURVE:
+		fallthrough
+	default:
+		ciphers = &CipherSuite{
+			Scheme:   common.CIPHER_SCHEME_CURVE,
+			HashType: HASH_BLAKE2S,
+			EccType:  ECC_CURVE25519,
+			GcmType:  GCM_AES256,
 		}
 	}
 	return
@@ -339,6 +339,9 @@ func AESDecrypt(cipherText []byte, key []byte) ([]byte, error) {
 }
 func unpad(padded []byte, blockSize int) []byte {
 	length := len(padded)
+	if length == 0 {
+		return nil
+	}
 	unpadLen := int(padded[length-1])
 	if unpadLen > blockSize || unpadLen > length {
 		return nil

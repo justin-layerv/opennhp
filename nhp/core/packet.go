@@ -76,7 +76,7 @@ var nhpHeaderTypeStrings []string = []string{
 }
 
 func HeaderTypeToString(t int) string {
-	if t < len(nhpHeaderTypeStrings) {
+	if t >= 0 && t < len(nhpHeaderTypeStrings) {
 		return nhpHeaderTypeStrings[t]
 	}
 	return "UNKNOWN"
@@ -171,12 +171,12 @@ func (pkt *Packet) Header() Header {
 
 func (pkt *Packet) HeaderWithCipherScheme(cipherScheme int) Header {
 	switch cipherScheme {
-	case common.CIPHER_SCHEME_CURVE:
-		return (*curve.HeaderCurve)(unsafe.Pointer(&pkt.Content[0]))
 	case common.CIPHER_SCHEME_GMSM:
+		return (*gmsm.HeaderGmsm)(unsafe.Pointer(&pkt.Content[0]))
+	case common.CIPHER_SCHEME_CURVE:
 		fallthrough
 	default:
-		return (*gmsm.HeaderGmsm)(unsafe.Pointer(&pkt.Content[0]))
+		return (*curve.HeaderCurve)(unsafe.Pointer(&pkt.Content[0]))
 	}
 }
 
