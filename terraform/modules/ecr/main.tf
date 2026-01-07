@@ -1080,7 +1080,9 @@ resource "aws_iam_role_policy" "terraform_apply_services" {
           "rds:DeleteDBInstance",
           "rds:ModifyDBInstance",
           "rds:AddTagsToResource",
-          "rds:RemoveTagsFromResource"
+          "rds:RemoveTagsFromResource",
+          "rds:EnableHttpEndpoint",
+          "rds:DisableHttpEndpoint"
         ]
         Resource = [
           "arn:aws:rds:${local.region}:${local.account_id}:subgrp:layerv-nhp-*",
