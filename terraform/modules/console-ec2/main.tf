@@ -263,8 +263,7 @@ locals {
     console_internal_nlb  = aws_lb.console.dns_name
     # NHP Server endpoint for /plugins/* routing
     nhp_server_endpoint = var.nhp_server_endpoint
-    # Auto-initialization configuration
-    auto_init        = var.auto_init ? "true" : "false"
+    # Admin password (passed to GVA_ADMIN_PASSWORD for initial setup if needed)
     admin_password   = var.admin_password
     auth_signing_key = var.auth_signing_key
     # AC ID for knock routing (must match AC module's ac_id)

@@ -240,8 +240,9 @@ docker run -d \
     -e "GVA_CONFIG_PGSQL_USERNAME=$RDS_USERNAME" \
     -e "GVA_CONFIG_PGSQL_PASSWORD=$RDS_PASSWORD" \
     -e "GVA_CONFIG_PGSQL_CONFIG=sslmode=require TimeZone=UTC" \
+    -e "GVA_CONFIG_PGSQL_SSLMODE=require" \
     -e "GVA_CONFIG_ACCESSCONTROLLERS=${ac_config_json}" \
-    -e "GVA_AUTO_INIT=${auto_init}" \
+    -e "GVA_AUTO_INIT=false" \
 %{ if admin_password != null ~}
     -e "GVA_ADMIN_PASSWORD=${admin_password}" \
 %{ endif ~}
@@ -385,7 +386,7 @@ systemctl start console-health
 
 echo "Seeding Console resource in RDS for NHP protection..."
 
-# Install PostgreSQL client
+# Install PostgreSQL client for seeding Console resource
 apt-get install -y postgresql-client
 
 # Build the SQL to insert Console portal site (idempotent - only if not exists)
