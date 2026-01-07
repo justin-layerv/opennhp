@@ -45,6 +45,601 @@ RDS_PASSWORD=$(echo "$RDS_SECRET" | jq -r '.password')
 
 echo "RDS credentials retrieved"
 
+%{ if enable_nhp_protection }
+# ============================================================================
+# NHP Protection: Install nhp-acd and Configure iptables
+# This provides true network-level hiding - port 443 is DROP'd by default
+# and only opened after successful NHP knock adds user IP to ipset.
+# ============================================================================
+
+echo "Setting up NHP Protection (true network-level hiding)..."
+
+# Install iptables and ipset for firewall rules
+apt-get install -y iptables ipset python3-cryptography
+
+# ============================================================================
+# NHP Firewall Setup - ipset and iptables rules for zero-trust access control
+# ============================================================================
+echo "Setting up NHP firewall with ipset and iptables..."
+
+# Get instance metadata
+TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+LOCAL_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 || echo "")
+
+echo "Instance ID: $INSTANCE_ID"
+echo "Local IP: $LOCAL_IP"
+echo "Public IP: $PUBLIC_IP"
+
+# Create ipsets for NHP traffic control
+# - defaultset: active sessions after successful knock (120s timeout)
+# - tempset: temporary entries for initial knock (5s timeout)
+ipset -exist create defaultset hash:ip,port,ip counters maxelem 1000000 timeout 120
+ipset -exist create defaultset_down hash:ip,port,ip counters maxelem 1000000 timeout 121
+ipset -exist create tempset hash:net,port counters maxelem 1000000 timeout 5
+
+echo "ipsets created successfully"
+
+# Create NHP_DENY chain for logging and dropping unauthorized traffic
+iptables -N NHP_DENY 2>/dev/null || true
+iptables -F NHP_DENY
+iptables -A NHP_DENY -j LOG --log-prefix "[NHP-DENY] " --log-level 6 --log-ip-options
+iptables -A NHP_DENY -j DROP
+
+# Clear existing rules to avoid duplicates
+iptables -F INPUT
+
+# Setup INPUT chain rules
+echo "Configuring INPUT chain..."
+
+# Allow loopback
+iptables -A INPUT -i lo -j ACCEPT
+
+# Allow SSH from VPC (for management/debugging)
+iptables -A INPUT -p tcp -s "${vpc_cidr}" --dport 22 -j ACCEPT
+
+# Allow Console port from VPC (for internal NLB traffic from AC)
+iptables -A INPUT -p tcp -s "${vpc_cidr}" --dport ${console_port} -j ACCEPT
+
+# Allow NHP knock port from VPC (NHP Server sends knocks here)
+iptables -A INPUT -p udp -s "${vpc_cidr}" --dport 62206 -j ACCEPT
+
+# Allow established connections
+iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# ipset rules: tempset -> defaultset promotion, then accept
+iptables -A INPUT -m set --match-set tempset src,dst -j SET --add-set defaultset src,dst,dst
+iptables -A INPUT -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst
+iptables -A INPUT -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT] " --log-level 6 --log-ip-options
+iptables -A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT
+iptables -A INPUT -m set --match-set tempset src,dst -j ACCEPT
+
+# Port 443 (protected) - DROP unless in ipset (handled by NHP_DENY)
+# Traffic must pass ipset check above to reach port 443
+iptables -A INPUT -p tcp --dport 443 -j NHP_DENY
+
+# Default policy
+iptables -P INPUT DROP
+iptables -P OUTPUT ACCEPT
+iptables -P FORWARD DROP
+
+echo "NHP firewall setup complete - port 443 is DROP'd by default"
+
+# ============================================================================
+# rsyslog configuration for NHP logging
+# ============================================================================
+echo "Configuring rsyslog for NHP logging..."
+
+mkdir -p /opt/layerv/nhp-ac/logs
+chmod 755 /opt/layerv/nhp-ac/logs
+
+if [ -d /etc/rsyslog.d ]; then
+    cat > /etc/rsyslog.d/10-nhplog.conf << RSYSLOGEOF
+# NHP Firewall Logging Configuration
+template(name="NHPFormat" type="string" string="%timegenerated:8:19% $LOCAL_IP %syslogtag% %msg:::drop-last-lf%\n")
+template(name="NHPAcceptFile" type="string" string="/opt/layerv/nhp-ac/logs/nhp_accept-%\$YEAR%-%\$MONTH%-%\$DAY%.log")
+template(name="NHPDenyFile" type="string" string="/opt/layerv/nhp-ac/logs/nhp_deny-%\$YEAR%-%\$MONTH%-%\$DAY%.log")
+
+:msg,contains,"[NHP-ACCEPT]" ?NHPAcceptFile;NHPFormat
+& stop
+:msg,contains,"[NHP-DENY]" ?NHPDenyFile;NHPFormat
+& stop
+RSYSLOGEOF
+
+    systemctl restart rsyslog || true
+    echo "rsyslog configured for NHP logging"
+fi
+
+# ============================================================================
+# Fetch NHP Server Public Key and Generate Console AC Keypair
+# ============================================================================
+
+%{ if nhp_server_secret_arn != null ~}
+echo "Fetching NHP Server public key from Secrets Manager..."
+SERVER_SECRET=$(aws secretsmanager get-secret-value --secret-id "${nhp_server_secret_arn}" --region "$REGION" --query SecretString --output text)
+SERVER_PUBLIC_KEY=$(echo "$SERVER_SECRET" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('publicKey', d.get('PubKeyBase64', '')))" 2>/dev/null || echo "")
+if [ -z "$SERVER_PUBLIC_KEY" ]; then
+  echo "FATAL: Could not extract server public key from secret"
+  echo "NHP protection requires the server public key for ECDH handshake"
+  exit 1
+fi
+echo "Server public key retrieved: $${SERVER_PUBLIC_KEY:0:20}..."
+%{ else ~}
+echo "FATAL: No NHP server secret ARN configured but enable_nhp_protection=true"
+exit 1
+%{ endif ~}
+
+# Generate Curve25519 keypair for Console AC
+echo "Generating Curve25519 keypair for Console AC..."
+
+CONSOLE_AC_SECRET_NAME="${name_prefix}-console-ac-$INSTANCE_ID"
+
+# Check for existing keypair
+EXISTING_SECRET=$(aws secretsmanager get-secret-value --secret-id "$CONSOLE_AC_SECRET_NAME" --region "$REGION" --query SecretString --output text 2>/dev/null || echo "")
+
+if [ -n "$EXISTING_SECRET" ]; then
+  echo "Found existing keypair for this instance"
+  PRIVATE_KEY=$(echo "$EXISTING_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['privateKey'])")
+  PUBLIC_KEY=$(echo "$EXISTING_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['publicKey'])")
+else
+  echo "Generating new Curve25519 keypair..."
+
+  KEYPAIR=$(python3 << 'KEYGEN_EOF'
+import json
+import base64
+import sys
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+
+# Generate new X25519 keypair
+private_key = X25519PrivateKey.generate()
+
+# Get raw bytes
+private_bytes = private_key.private_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PrivateFormat.Raw,
+    encryption_algorithm=serialization.NoEncryption()
+)
+public_bytes = private_key.public_key().public_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PublicFormat.Raw
+)
+
+# Validate key lengths (X25519 keys are always 32 bytes)
+if len(private_bytes) != 32 or len(public_bytes) != 32:
+    print(json.dumps({"error": f"Invalid key lengths: private={len(private_bytes)}, public={len(public_bytes)}"}), file=sys.stderr)
+    sys.exit(1)
+
+# Encode as base64
+result = {
+    'privateKey': base64.b64encode(private_bytes).decode(),
+    'publicKey': base64.b64encode(public_bytes).decode()
+}
+
+print(json.dumps(result))
+KEYGEN_EOF
+)
+
+  # Validate keypair generation succeeded
+  if [ -z "$KEYPAIR" ]; then
+    echo "FATAL: Keypair generation produced no output"
+    exit 1
+  fi
+
+  if ! echo "$KEYPAIR" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'privateKey' in d and 'publicKey' in d" 2>/dev/null; then
+    echo "FATAL: Keypair generation failed - missing keys"
+    echo "$KEYPAIR"
+    exit 1
+  fi
+
+  PRIVATE_KEY=$(echo "$KEYPAIR" | python3 -c "import sys,json; print(json.load(sys.stdin)['privateKey'])")
+  PUBLIC_KEY=$(echo "$KEYPAIR" | python3 -c "import sys,json; print(json.load(sys.stdin)['publicKey'])")
+
+  # Store keypair in Secrets Manager
+  SECRET_VALUE=$(cat << SECRETEOF
+{
+  "privateKey": "$PRIVATE_KEY",
+  "publicKey": "$PUBLIC_KEY",
+  "instanceId": "$INSTANCE_ID",
+  "createdAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+SECRETEOF
+)
+
+  KMS_ARG=""
+%{ if secrets_kms_key_arn != "" ~}
+  KMS_ARG="--kms-key-id ${secrets_kms_key_arn}"
+%{ endif ~}
+  if aws secretsmanager create-secret \
+    --name "$CONSOLE_AC_SECRET_NAME" \
+    --secret-string "$SECRET_VALUE" \
+    $KMS_ARG \
+    --tags "Key=Environment,Value=${internal_only ? "internal" : "external"}" "Key=InstanceId,Value=$INSTANCE_ID" \
+    --region "$REGION" 2>/dev/null; then
+    echo "Created new secret: $CONSOLE_AC_SECRET_NAME"
+  else
+    aws secretsmanager put-secret-value \
+      --secret-id "$CONSOLE_AC_SECRET_NAME" \
+      --secret-string "$SECRET_VALUE" \
+      --region "$REGION"
+    echo "Updated existing secret: $CONSOLE_AC_SECRET_NAME"
+  fi
+fi
+
+echo "Console AC keypair ready (public key: $${PUBLIC_KEY:0:20}...)"
+
+# ============================================================================
+# Fetch etcd TLS Certificates for AC Registration
+# ============================================================================
+
+%{ if etcd_endpoint != null && etcd_tls_secret_arn != null ~}
+echo "Fetching etcd TLS certificates for Console AC registration..."
+mkdir -p /opt/layerv/nhp-ac/etc/tls
+
+ETCD_TLS_SECRET=$(aws secretsmanager get-secret-value \
+  --secret-id "${etcd_tls_secret_arn}" \
+  --region "$REGION" \
+  --query SecretString --output text)
+
+# Extract CA certificate
+echo "$ETCD_TLS_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['caCert'])" \
+  > /opt/layerv/nhp-ac/etc/tls/ca.crt
+chmod 644 /opt/layerv/nhp-ac/etc/tls/ca.crt
+
+# Extract client certificate and key for mTLS
+echo "$ETCD_TLS_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['clientCert'])" \
+  > /opt/layerv/nhp-ac/etc/tls/client.crt
+chmod 644 /opt/layerv/nhp-ac/etc/tls/client.crt
+
+echo "$ETCD_TLS_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['clientKey'])" \
+  > /opt/layerv/nhp-ac/etc/tls/client.key
+chmod 600 /opt/layerv/nhp-ac/etc/tls/client.key
+
+echo "etcd TLS certificates installed for Console AC"
+
+# ============================================================================
+# Register Console AC in etcd
+# Server watches /nhp/ac-registry/* and trusts ACs listed there
+# ============================================================================
+
+echo "Registering Console AC in etcd..."
+
+# Console AC ID includes instance ID for uniqueness
+CONSOLE_AC_ID="console-ac-$INSTANCE_ID"
+export CONSOLE_AC_ID
+
+# Wait for etcd DNS
+ETCD_HOST=$(echo "${etcd_endpoint}" | sed 's|https://||' | sed 's|:.*||')
+MAX_DNS_ATTEMPTS=30
+DNS_ATTEMPT=1
+while [ $DNS_ATTEMPT -le $MAX_DNS_ATTEMPTS ]; do
+  if getent hosts "$ETCD_HOST" > /dev/null 2>&1; then
+    echo "etcd DNS resolved: $ETCD_HOST"
+    break
+  fi
+  echo "Waiting for etcd DNS (attempt $DNS_ATTEMPT/$MAX_DNS_ATTEMPTS)..."
+  sleep 10
+  DNS_ATTEMPT=$((DNS_ATTEMPT + 1))
+done
+
+if [ $DNS_ATTEMPT -gt $MAX_DNS_ATTEMPTS ]; then
+  echo "FATAL: etcd DNS resolution failed for $ETCD_HOST"
+  exit 1
+fi
+
+# Register using Python (same pattern as regular AC module)
+# NOTE: Heredoc without quotes allows Terraform and shell variable interpolation
+REGISTRATION_RESULT=$(python3 << REGISTER_CONSOLE_AC_EOF
+import json
+import ssl
+import urllib.request
+import base64
+import sys
+import time
+
+# Configuration - shell/Terraform interpolated at runtime
+etcd_endpoint = "${etcd_endpoint}"
+instance_id = "$INSTANCE_ID"
+public_key = "$PUBLIC_KEY"
+local_ip = "$LOCAL_IP"
+console_ac_id = "$CONSOLE_AC_ID"
+
+# TLS certificate paths
+ca_path = "/opt/layerv/nhp-ac/etc/tls/ca.crt"
+cert_path = "/opt/layerv/nhp-ac/etc/tls/client.crt"
+key_path = "/opt/layerv/nhp-ac/etc/tls/client.key"
+
+# Build registration entry (TOML format for consistency with regular ACs)
+registered_at = int(time.time())
+registry_value = f'''# Console AC Registry Entry (auto-registered by Console EC2)
+PublicKey = "{public_key}"
+InstanceId = "{instance_id}"
+Ip = "{local_ip}"
+Port = 62206
+RegisteredAt = {registered_at}
+ACId = "{console_ac_id}"
+'''
+
+# Create SSL context with client cert
+ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+ssl_context.load_verify_locations(ca_path)
+ssl_context.load_cert_chain(cert_path, key_path)
+
+# Register with retry
+max_retries = 5
+for attempt in range(1, max_retries + 1):
+    try:
+        url = f"{etcd_endpoint}/v3/kv/put"
+        key = f"/nhp/ac-registry/{console_ac_id}"
+        key_b64 = base64.b64encode(key.encode()).decode()
+        value_b64 = base64.b64encode(registry_value.encode()).decode()
+
+        data = json.dumps({
+            'key': key_b64,
+            'value': value_b64
+        }).encode()
+
+        req = urllib.request.Request(url, data=data, method='POST')
+        req.add_header('Content-Type', 'application/json')
+
+        with urllib.request.urlopen(req, context=ssl_context, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+            print(json.dumps({"success": True, "ac_id": console_ac_id, "attempt": attempt}))
+            sys.exit(0)
+
+    except Exception as e:
+        print(f"Attempt {attempt}/{max_retries} failed: {e}", file=sys.stderr)
+        if attempt < max_retries:
+            time.sleep(2 ** attempt)
+        else:
+            print(json.dumps({"success": False, "error": str(e)}))
+            sys.exit(1)
+REGISTER_CONSOLE_AC_EOF
+)
+
+# Check registration result
+if echo "$REGISTRATION_RESULT" | python3 -c "import sys,json; result=json.load(sys.stdin); sys.exit(0 if result.get('success') else 1)"; then
+  echo "Successfully registered Console AC in etcd: $CONSOLE_AC_ID"
+else
+  echo "FATAL: Failed to register Console AC in etcd"
+  echo "$REGISTRATION_RESULT"
+  exit 1
+fi
+%{ else ~}
+# etcd registration not configured - Console AC won't be trusted by Server
+CONSOLE_AC_ID=""
+%{ endif ~}
+
+# ============================================================================
+# Install nhp-acd Binary from AC ECR Image
+# ============================================================================
+
+%{ if nhp_ac_repo_url != null ~}
+echo "Extracting nhp-acd binary from AC image..."
+
+aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${account_id}.dkr.ecr.${region}.amazonaws.com"
+
+# Pull AC image and extract nhp-acd binary
+docker pull "${nhp_ac_repo_url}:latest" || docker pull "${nhp_ac_repo_url}:${internal_only ? "internal" : "external"}" || {
+  echo "WARNING: Could not pull AC image, nhp-acd will not be available"
+}
+
+if docker images | grep -q "nhp-ac"; then
+  CONTAINER_ID=$(docker create "${nhp_ac_repo_url}:latest")
+
+  mkdir -p /opt/layerv/nhp-ac/etc
+
+  # Extract nhp-acd binary
+  docker cp "$CONTAINER_ID:/nhp-ac/nhp-acd" /opt/layerv/nhp-ac/nhp-acd || \
+  docker cp "$CONTAINER_ID:/opt/layerv/nhp-ac/nhp-acd" /opt/layerv/nhp-ac/nhp-acd || {
+    echo "WARNING: Could not extract nhp-acd binary"
+  }
+
+  chmod +x /opt/layerv/nhp-ac/nhp-acd 2>/dev/null || true
+
+  docker rm "$CONTAINER_ID"
+  echo "nhp-acd binary extracted"
+fi
+%{ endif ~}
+
+# ============================================================================
+# Configure nhp-acd
+# ============================================================================
+
+if [ -f "/opt/layerv/nhp-ac/nhp-acd" ]; then
+  echo "Configuring nhp-acd..."
+
+  # Create nhp-acd config
+  cat > /opt/layerv/nhp-ac/etc/config.toml << CONFIGEOF
+# NHP-AC Configuration for Console (infrastructure-managed)
+# This AC protects the Console's port 443 via iptables/ipset
+
+ACId = "console-ac-$INSTANCE_ID"
+DefaultIp = "$LOCAL_IP"
+PrivateKeyBase64 = "$PRIVATE_KEY"
+DefaultCipherScheme = 0
+IpPassMode = 0
+LogLevel = 4
+AuthServiceId = "passcode"
+ResourceIds = ["${console_app_id}"]
+FilterMode = 0
+CONFIGEOF
+
+  # Create server.toml with NHP Server peer
+  cat > /opt/layerv/nhp-ac/etc/server.toml << SERVEREOF
+# NHP Server peers configuration
+# Console AC connects to NHP Server for knock validation
+
+[[Servers]]
+Hostname = "${nhp_server_hostname}"
+Ip = ""
+Port = 62206
+PubKeyBase64 = "$SERVER_PUBLIC_KEY"
+ExpireTime = 1924991999
+SERVEREOF
+
+  # Create nhp-acd systemd service
+  cat > /etc/systemd/system/nhp-acd.service << SVCEOF
+[Unit]
+Description=NHP Access Controller Daemon (Console)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/layerv/nhp-ac
+ExecStart=/opt/layerv/nhp-ac/nhp-acd run
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+  systemctl daemon-reload
+  systemctl enable nhp-acd
+  systemctl start nhp-acd
+
+  echo "nhp-acd service started"
+else
+  echo "WARNING: nhp-acd binary not available, iptables protection is in place but knocks won't work"
+fi
+
+echo "NHP Protection setup complete"
+
+# ============================================================================
+# NHP Protection: Configure nginx for HTTPS on port 443 (protected domain)
+# This is for direct access via the protected NLB after NHP knock
+# ============================================================================
+
+echo "Installing certbot for protected domain TLS..."
+apt-get install -y certbot python3-certbot-nginx python3-certbot-dns-route53 || true
+
+echo "Configuring nginx for protected domain (HTTPS on port 443)..."
+
+# Create nginx config for protected domain with TLS
+# This runs alongside the internal mode config (if enabled)
+# Note: Using heredoc WITHOUT quotes so Terraform variables are interpolated
+# nginx variables ($host, $remote_addr, etc.) use \$ to escape
+cat > /etc/nginx/sites-available/console-protected << PROTECTEDEOF
+# Console API - NHP-Protected Domain nginx configuration
+# Proxies HTTPS from public NLB to Console Docker container (after NHP knock)
+# TLS termination happens on nginx
+
+upstream console_backend_protected {
+    server 127.0.0.1:8080;
+    keepalive 32;
+}
+
+# HTTPS - Protected domain server (no HTTP redirect - port 80 is blocked by iptables)
+server {
+    listen 443 ssl http2;
+    server_name ${protected_hostname} _;
+
+    # TLS certificates (certbot or self-signed)
+    ssl_certificate /etc/letsencrypt/live/${protected_hostname}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${protected_hostname}/privkey.pem;
+
+    # SSL configuration
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:50m;
+    ssl_session_tickets off;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+
+    # Logging
+    access_log /var/log/nginx/console-protected-access.log;
+    error_log /var/log/nginx/console-protected-error.log;
+
+    # Health check (for debugging - iptables blocks until knock anyway)
+    location /health {
+        access_log off;
+        return 200 'OK - NHP Protected';
+        add_header Content-Type text/plain;
+    }
+
+    # Proxy all requests to Console
+    location / {
+        proxy_pass http://console_backend_protected;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Connection "";
+
+        # Timeouts
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+
+        # For file uploads
+        client_max_body_size 50M;
+    }
+}
+PROTECTEDEOF
+
+# Enable the protected domain config
+ln -sf /etc/nginx/sites-available/console-protected /etc/nginx/sites-enabled/console-protected
+
+# Create web root for ACME challenges
+mkdir -p /var/www/html
+
+# Obtain TLS certificate for protected domain
+echo "Obtaining Let's Encrypt certificate for ${protected_hostname}..."
+
+%{ if hosted_zone_id != null }
+# Use DNS-01 challenge with Route 53
+certbot certonly \
+    --dns-route53 \
+    --dns-route53-propagation-seconds 60 \
+    -d "${protected_hostname}" \
+    --email "${acme_email}" \
+    --agree-tos \
+    --non-interactive \
+    --keep-until-expiring || {
+    echo "WARNING: DNS-01 certbot failed, trying HTTP-01..."
+    # Fallback to HTTP-01 (may fail if iptables blocks 80)
+    certbot certonly \
+        --webroot \
+        --webroot-path /var/www/html \
+        -d "${protected_hostname}" \
+        --email "${acme_email}" \
+        --agree-tos \
+        --non-interactive \
+        --keep-until-expiring || true
+}
+%{ else }
+# Use HTTP-01 challenge (may fail if iptables blocks 80)
+certbot certonly \
+    --webroot \
+    --webroot-path /var/www/html \
+    -d "${protected_hostname}" \
+    --email "${acme_email}" \
+    --agree-tos \
+    --non-interactive \
+    --keep-until-expiring || true
+%{ endif }
+
+# Fallback to self-signed if certbot fails
+if [ ! -f "/etc/letsencrypt/live/${protected_hostname}/fullchain.pem" ]; then
+    echo "WARNING: Failed to obtain Let's Encrypt certificate, using self-signed"
+    mkdir -p /etc/letsencrypt/live/${protected_hostname}
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout /etc/letsencrypt/live/${protected_hostname}/privkey.pem \
+        -out /etc/letsencrypt/live/${protected_hostname}/fullchain.pem \
+        -subj "/CN=${protected_hostname}"
+fi
+
+# Test and reload nginx
+nginx -t && systemctl reload nginx
+
+echo "nginx configured for protected domain (HTTPS on port 443)"
+%{ endif }
+
 %{ if internal_only }
 # ============================================================================
 # Internal Mode: Configure nginx for HTTP-only (AC handles TLS)
@@ -432,12 +1027,23 @@ SRVEOF
 )
 
 # Build Resources JSON (AC routing config)
-# ac_id must match the AC module's ac_id for knock routing to work
+# ac_id determines which AC receives NHP_AOP message from Server
 # ip must be an actual IP address (not DNS) because AC uses it in ipset rules
+%{ if enable_nhp_protection ~}
+# When NHP protection is enabled, route knocks to Console's own AC
+# CONSOLE_AC_ID was set during etcd registration above
+# Use LOCAL_IP since Console AC runs on this same instance
+RESOURCES=$(cat <<RESEOF
+[{"ac_id": "$CONSOLE_AC_ID", "hostname": "$CONSOLE_HOSTNAME", "ip": "$LOCAL_IP", "port": 443, "maskhost": false, "protocol": "tcp"}]
+RESEOF
+)
+%{ else ~}
+# Route knocks to the shared AC pool
 RESOURCES=$(cat <<RESEOF
 [{"ac_id": "${ac_id}", "hostname": "$CONSOLE_HOSTNAME", "ip": "$AC_NLB_IP", "port": 443, "maskhost": false, "protocol": "tcp"}]
 RESEOF
 )
+%{ endif ~}
 
 # Build ExtInfo JSON (required by passcode plugin for auth_code flow)
 # AuthUrl: Console's token validation endpoint called by NHP Server

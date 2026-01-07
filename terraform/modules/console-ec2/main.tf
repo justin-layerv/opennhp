@@ -8,6 +8,35 @@
 # - createPortalSitesByURL - creates portal sites for demo
 # - Other portal management endpoints
 
+# ==================== Validation ====================
+
+# Validate required variables when NHP protection is enabled
+check "nhp_protection_requirements" {
+  assert {
+    condition = !var.enable_nhp_protection || (
+      var.nhp_server_secret_arn != null &&
+      var.nhp_ac_repo_url != null &&
+      var.nhp_ac_ecr_repo_arn != null &&
+      var.nhp_server_hostname != null &&
+      var.protected_hostname != null &&
+      var.protected_hosted_zone_id != null &&
+      var.etcd_endpoint != null &&
+      var.etcd_tls_secret_arn != null
+    )
+    error_message = <<-EOT
+      When enable_nhp_protection=true, the following variables are required:
+        - nhp_server_secret_arn
+        - nhp_ac_repo_url
+        - nhp_ac_ecr_repo_arn
+        - nhp_server_hostname
+        - protected_hostname
+        - protected_hosted_zone_id
+        - etcd_endpoint
+        - etcd_tls_secret_arn
+    EOT
+  }
+}
+
 # ==================== Data Sources ====================
 
 data "aws_region" "current" {}
@@ -84,19 +113,31 @@ resource "aws_iam_role_policy" "console" {
         ]
         Resource = "${aws_cloudwatch_log_group.console.arn}:*"
       },
-      # Secrets Manager - RDS credentials
+      # Secrets Manager - RDS credentials, NHP Server secret, and etcd TLS certs
       {
         Effect   = "Allow"
         Action   = ["secretsmanager:GetSecretValue"]
-        Resource = [var.rds_secret_arn]
+        Resource = compact([var.rds_secret_arn, var.nhp_server_secret_arn, var.etcd_tls_secret_arn])
       },
-      # KMS for secrets decryption
+      # Secrets Manager - Create per-instance AC secret (when NHP protection enabled)
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:CreateSecret",
+          "secretsmanager:PutSecretValue",
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:TagResource",
+          "secretsmanager:DescribeSecret"
+        ]
+        Resource = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}-console-ac-*"
+      },
+      # KMS for secrets encryption/decryption
       {
         Effect   = "Allow"
-        Action   = ["kms:Decrypt"]
+        Action   = ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"]
         Resource = var.secrets_kms_key_arn != null ? [var.secrets_kms_key_arn] : []
       },
-      # ECR - pull console image
+      # ECR - pull console image (and AC image when NHP protection enabled)
       {
         Effect   = "Allow"
         Action   = ["ecr:GetAuthorizationToken"]
@@ -109,7 +150,7 @@ resource "aws_iam_role_policy" "console" {
           "ecr:GetDownloadUrlForLayer",
           "ecr:BatchGetImage"
         ]
-        Resource = var.ecr_repo_arn
+        Resource = compact([var.ecr_repo_arn, var.nhp_ac_ecr_repo_arn])
       },
       # Route 53 for certbot DNS-01 challenge
       {
@@ -194,6 +235,33 @@ resource "aws_security_group" "console" {
     }
   }
 
+  # NHP Protection mode: Allow port 443 from anywhere (iptables DROP until knock)
+  # Security group allows the traffic, but iptables on the instance will DROP it
+  # until nhp-acd adds the client IP to ipset after successful NHP knock.
+  dynamic "ingress" {
+    for_each = var.enable_nhp_protection ? [1] : []
+    content {
+      from_port   = 443
+      to_port     = 443
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+      description = "HTTPS from anywhere (iptables-protected via NHP)"
+    }
+  }
+
+  # NHP Protection mode: Allow NHP knock port (UDP 62206) from NHP Server
+  # nhp-acd needs to receive knocks from NHP Server
+  dynamic "ingress" {
+    for_each = var.enable_nhp_protection ? [1] : []
+    content {
+      from_port   = 62206
+      to_port     = 62206
+      protocol    = "udp"
+      cidr_blocks = [var.vpc_cidr]
+      description = "NHP knock packets from NHP Server"
+    }
+  }
+
   # SSH from VPC
   ingress {
     from_port   = 22
@@ -268,6 +336,17 @@ locals {
     auth_signing_key = var.auth_signing_key
     # AC ID for knock routing (must match AC module's ac_id)
     ac_id = var.ac_id
+    # NHP Protection (true network hiding)
+    enable_nhp_protection = var.enable_nhp_protection
+    nhp_server_secret_arn = var.nhp_server_secret_arn
+    nhp_ac_repo_url       = var.nhp_ac_repo_url
+    nhp_server_hostname   = var.nhp_server_hostname
+    vpc_cidr              = var.vpc_cidr
+    name_prefix           = var.name_prefix
+    secrets_kms_key_arn   = var.secrets_kms_key_arn != null ? var.secrets_kms_key_arn : ""
+    # etcd for Console AC registration
+    etcd_endpoint       = var.etcd_endpoint
+    etcd_tls_secret_arn = var.etcd_tls_secret_arn
   })
 }
 
@@ -533,6 +612,96 @@ resource "aws_route53_record" "console" {
   alias {
     name                   = aws_lb.console.dns_name
     zone_id                = aws_lb.console.zone_id
+    evaluate_target_health = true
+  }
+}
+
+# ==================== NHP Protected NLB (True Network Hiding) ====================
+# When enable_nhp_protection=true, this public NLB routes protected traffic to Console.
+# Console's iptables DROP all port 443 traffic until NHP knock adds user IP to ipset.
+
+resource "aws_lb" "protected" {
+  count = var.enable_nhp_protection ? 1 : 0
+
+  name               = replace("${local.console_name}-prot", "_", "-")
+  internal           = false # Internet-facing for protected access
+  load_balancer_type = "network"
+  subnets            = var.public_subnet_ids
+
+  enable_cross_zone_load_balancing = true
+
+  tags = merge(var.tags, {
+    Name      = "${local.console_name}-protected-nlb"
+    Component = "console"
+    Purpose   = "NHP-protected access"
+  })
+}
+
+resource "aws_lb_target_group" "protected" {
+  count = var.enable_nhp_protection ? 1 : 0
+
+  name        = replace("${var.name_prefix}-con-prot", "_", "-")
+  port        = 443
+  protocol    = "TCP"
+  vpc_id      = var.vpc_id
+  target_type = "instance"
+
+  # Health check on SSH (port 22) instead of port 443 because:
+  # - iptables DROP policy blocks port 443 until NHP knock succeeds
+  # - NLB health checks would always fail on port 443
+  # - SSH from VPC CIDR is allowed in iptables rules for management access
+  # - This verifies the instance is running, even if app health isn't directly checked
+  # Trade-off: Instance can be "healthy" even if nginx/Console is down, but this is
+  # acceptable since NHP protection is the primary concern and Console has its own
+  # health monitor service (console-health.service) that auto-restarts Docker.
+  health_check {
+    enabled             = true
+    protocol            = "TCP"
+    port                = "22"
+    interval            = 30
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+
+  deregistration_delay = 30
+
+  tags = var.tags
+}
+
+resource "aws_lb_listener" "protected" {
+  count = var.enable_nhp_protection ? 1 : 0
+
+  load_balancer_arn = aws_lb.protected[0].arn
+  port              = 443
+  protocol          = "TCP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.protected[0].arn
+  }
+
+  tags = var.tags
+}
+
+# Attach ASG to protected target group when NHP protection is enabled
+resource "aws_autoscaling_attachment" "protected" {
+  count = var.enable_nhp_protection ? 1 : 0
+
+  autoscaling_group_name = aws_autoscaling_group.console.name
+  lb_target_group_arn    = aws_lb_target_group.protected[0].arn
+}
+
+# Route 53 record for protected domain (e.g., console2.apps.layerv.xyz)
+resource "aws_route53_record" "protected" {
+  count = var.enable_nhp_protection && var.protected_hosted_zone_id != null && var.protected_hostname != null ? 1 : 0
+
+  zone_id = var.protected_hosted_zone_id
+  name    = var.protected_hostname
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.protected[0].dns_name
+    zone_id                = aws_lb.protected[0].zone_id
     evaluate_target_health = true
   }
 }

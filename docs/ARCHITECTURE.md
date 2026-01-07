@@ -954,6 +954,83 @@ New Console uses a two-domain architecture for NHP protection:
 3. Frontend does NHP knock via `/plugins/passcode?action=auth_code`
 4. User redirected to `console2.apps.layerv.xyz` (protected domain)
 
+#### True Network-Level Protection (Optional)
+
+For deployments requiring **true network-level hiding** (not just application-level token validation),
+Console EC2 can run its own nhp-acd instance with iptables DROP by default.
+
+**Architecture with `enable_nhp_protection=true`:**
+
+```
+[Internet]
+    │
+    ├── (Login Flow - via AC Traefik, bypasses nhp-acd)
+    │   console.nhp.layerv.xyz → AC NLB → Traefik → Console internal NLB → Console EC2
+    │
+    └── (Protected Flow - direct to Console, iptables protected)
+        console2.apps.layerv.xyz → Console public NLB → Console EC2
+                                                            │
+                                                            ├── [nhp-acd] ← receives NHP knock
+                                                            │       └── Adds user IP to ipset
+                                                            ├── [iptables] ← DROP port 443 by default
+                                                            │       └── ACCEPT if IP in ipset
+                                                            └── [nginx :443] ← serves protected content
+```
+
+**Key Differences:**
+
+| Feature | Application-Level (default) | Network-Level (`enable_nhp_protection=true`) |
+|---------|----------------------------|---------------------------------------------|
+| Protection | Traefik middleware validates nhp_token | iptables DROP until NHP knock |
+| Port 443 without token | Returns 401/redirect | No response (filtered) |
+| Console runs nhp-acd | No | Yes |
+| Protected domain NLB | Routes via AC | Direct to Console (public NLB) |
+
+**Terraform Configuration:**
+
+```hcl
+module "console" {
+  # ... existing config ...
+
+  # Enable true network-level hiding
+  enable_nhp_protection    = true
+  nhp_server_secret_arn    = module.server.secret_arn
+  nhp_ac_repo_url          = var.nhp_ac_ecr_repo_url
+  nhp_server_hostname      = "server.nhp.sandbox.internal"
+  protected_hostname       = "console2.apps.layerv.xyz"
+  protected_hosted_zone_id = data.aws_route53_zone.apps.zone_id
+
+  # etcd for Console AC registration (so Server trusts Console AC)
+  etcd_endpoint       = "https://etcd.nhp.sandbox.internal:2379"
+  etcd_tls_secret_arn = module.etcd.tls_secret_arn
+}
+```
+
+**Console AC Registration:**
+
+When `enable_nhp_protection=true`, Console EC2 automatically:
+1. Generates a Curve25519 keypair (stored in Secrets Manager)
+2. Fetches etcd TLS certificates from Secrets Manager
+3. Registers itself in etcd at `/nhp/ac-registry/console-ac-{instance-id}`
+4. Updates `portal_sites.resources[0].ac_id` to point to itself
+5. Starts nhp-acd with iptables DROP by default
+
+The Server watches etcd, discovers the Console AC, and trusts its public key. When users
+authenticate, the knock is routed to Console's AC (not the shared AC pool), which opens
+the firewall for that user's IP.
+
+**Verification:**
+
+```bash
+# Before NHP knock - port appears filtered (no response)
+timeout 5 curl -v https://console2.apps.layerv.xyz/
+# curl: (28) Connection timed out
+
+# After login + NHP knock - content accessible
+curl -v https://console2.apps.layerv.xyz/
+# 200 OK
+```
+
 **Environment Variables (web/.env.production):**
 
 | Variable | Old Console | New Console | Description |

@@ -69,3 +69,37 @@ output "public_url_ssm_parameter" {
   description = "SSM parameter name storing console public URL"
   value       = aws_ssm_parameter.console_public_url.name
 }
+
+# ============================================================================
+# NHP Protection Outputs
+# ============================================================================
+
+output "protected_nlb_dns_name" {
+  description = "NHP-protected Console NLB DNS name (null if NHP protection disabled)"
+  value       = var.enable_nhp_protection ? aws_lb.protected[0].dns_name : null
+}
+
+output "protected_nlb_arn" {
+  description = "NHP-protected Console NLB ARN (null if NHP protection disabled)"
+  value       = var.enable_nhp_protection ? aws_lb.protected[0].arn : null
+}
+
+output "protected_nlb_zone_id" {
+  description = "NHP-protected Console NLB zone ID for Route 53 (null if NHP protection disabled)"
+  value       = var.enable_nhp_protection ? aws_lb.protected[0].zone_id : null
+}
+
+output "protected_fqdn" {
+  description = "NHP-protected Console FQDN (null if NHP protection disabled)"
+  value       = var.enable_nhp_protection && var.protected_hostname != null ? var.protected_hostname : null
+}
+
+output "protected_endpoint" {
+  description = "NHP-protected Console endpoint URL (null if NHP protection disabled)"
+  value       = var.enable_nhp_protection && var.protected_hostname != null ? "https://${var.protected_hostname}" : null
+}
+
+output "nhp_protection_enabled" {
+  description = "Whether NHP network-level protection is enabled"
+  value       = var.enable_nhp_protection
+}

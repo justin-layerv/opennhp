@@ -107,6 +107,58 @@ variable "internal_only" {
   default     = false
 }
 
+variable "enable_nhp_protection" {
+  description = <<-EOT
+    Enable true NHP network-level protection. When true, Console EC2 runs nhp-acd
+    with iptables DROP by default. Port 443 is only accessible after NHP knock succeeds.
+
+    Console AC automatically registers itself in etcd so NHP Server trusts it.
+    portal_sites.resources is updated to route knocks to Console's AC.
+
+    Required variables when enabled:
+    - nhp_server_secret_arn
+    - nhp_ac_repo_url
+    - nhp_ac_ecr_repo_arn
+    - nhp_server_hostname
+    - protected_hostname
+    - protected_hosted_zone_id
+    - etcd_endpoint
+    - etcd_tls_secret_arn
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "nhp_server_secret_arn" {
+  description = "ARN of NHP Server secret in Secrets Manager (for public key). Required when enable_nhp_protection=true."
+  type        = string
+  default     = null
+}
+
+variable "nhp_ac_repo_url" {
+  description = "ECR URL for nhp-ac image (to extract nhp-acd binary). Required when enable_nhp_protection=true."
+  type        = string
+  default     = null
+}
+
+variable "nhp_ac_ecr_repo_arn" {
+  description = "ECR repository ARN for nhp-ac image (for IAM permissions). Required when enable_nhp_protection=true."
+  type        = string
+  default     = null
+}
+
+variable "protected_hosted_zone_id" {
+  description = "Route 53 hosted zone ID for the protected domain (e.g., apps.layerv.xyz zone). Required when enable_nhp_protection=true."
+  type        = string
+  default     = null
+}
+
+variable "nhp_server_hostname" {
+  description = "NHP Server hostname for AC to connect to (e.g., server.nhp.sandbox.internal). Required when enable_nhp_protection=true."
+  type        = string
+  default     = null
+}
+
 variable "ac_security_group_id" {
   description = "Security group ID of AC instances (required when internal_only=true)"
   type        = string
@@ -145,6 +197,18 @@ variable "protected_hostname" {
 
 variable "nhp_server_endpoint" {
   description = "NHP Server HTTP endpoint for /plugins/* routing (e.g., server.nhp.sandbox.internal:8888)"
+  type        = string
+  default     = null
+}
+
+variable "etcd_endpoint" {
+  description = "etcd endpoint URL for AC registration (e.g., https://etcd.nhp.sandbox.internal:2379). Required when enable_nhp_protection=true."
+  type        = string
+  default     = null
+}
+
+variable "etcd_tls_secret_arn" {
+  description = "ARN of Secrets Manager secret containing etcd TLS certs (caCert, clientCert, clientKey). Required when enable_nhp_protection=true."
   type        = string
   default     = null
 }
