@@ -64,7 +64,7 @@ jobs:
       code: ${{ steps.filter.outputs.code }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Detect code changes
         uses: dorny/paths-filter@v3
@@ -127,7 +127,7 @@ jobs:
 
       - name: Checkout code
         if: needs.changes.outputs.code == 'true' && github.event.inputs.skip_tests != 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run tests (privileged container for iptables)
         if: needs.changes.outputs.code == 'true' && github.event.inputs.skip_tests != 'true'
@@ -196,7 +196,7 @@ jobs:
 
       - name: Checkout code
         if: needs.changes.outputs.code == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Configure AWS credentials
         if: needs.changes.outputs.code == 'true' && github.event_name != 'pull_request'
