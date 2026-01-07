@@ -18,3 +18,9 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "allow_private_ingress_443" {
+  description = "Allow port 443 from internet on private subnets (for NHP-protected resources behind NLB)"
+  type        = bool
+  default     = false
+}

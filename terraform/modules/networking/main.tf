@@ -428,6 +428,26 @@ resource "aws_network_acl" "private" {
     to_port    = 0
   }
 
+  # Inbound: Allow HTTPS from internet (for NHP-protected resources behind public NLB)
+  # This is needed when enable_console_nhp_protection=true, where internet traffic
+  # is routed directly to Console EC2 in private subnets via the protected NLB.
+  #
+  # SCOPE: This rule applies to ALL private subnets in the VPC, not just Console.
+  # Other services (etcd, RDS, etc.) are protected by their security groups which
+  # don't allow port 443 from internet sources. iptables on Console EC2 handles
+  # DROP until NHP knock succeeds - this NACL rule just enables network reachability.
+  dynamic "ingress" {
+    for_each = var.allow_private_ingress_443 ? [1] : []
+    content {
+      protocol   = "tcp"
+      rule_no    = 150
+      action     = "allow"
+      cidr_block = "0.0.0.0/0"
+      from_port  = 443
+      to_port    = 443
+    }
+  }
+
   # Inbound: Allow ephemeral ports (return traffic from internet via NAT)
   ingress {
     protocol   = "tcp"

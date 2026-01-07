@@ -146,6 +146,10 @@ module "networking" {
   vpc_cidr    = var.vpc_cidr
   name_prefix = local.name_prefix
   tags        = local.common_tags
+
+  # When Console NHP protection is enabled, we need NACL to allow port 443
+  # from internet so NLB can route to private subnets (iptables enforces access)
+  allow_private_ingress_443 = var.enable_console_nhp_protection
 }
 
 # Data Module - etcd, EFS, Secrets, Service Discovery
