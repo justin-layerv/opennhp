@@ -1,5 +1,9 @@
 # Claude Code Configuration for NHP
 
+## CRITICAL RULES - NEVER VIOLATE
+
+> **NEVER push directly to `main` branch.** All changes MUST go through a Pull Request, no exceptions. This applies even for "quick fixes" or "urgent" changes. Create a branch, open a PR, and let CI run.
+
 Quick reference for the LayerV NHP (Network Hiding Protocol) infrastructure project.
 
 > **Note:** This is a fork of [OpenNHP](https://github.com/OpenNHP/opennhp). Periodically sync upstream changes via `git fetch upstream && git merge upstream/main`.
