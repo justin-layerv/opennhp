@@ -939,63 +939,86 @@ const cookieDomain = import.meta.env.VITE_COOKIE_DOMAIN || '.layerv.ai'
 // Sets x-token cookie with domain for cross-subdomain access
 ```
 
+**Two-Domain Architecture:**
+
+New Console uses a two-domain architecture for NHP protection:
+
+| Domain | Purpose | NHP Protection |
+|--------|---------|----------------|
+| `console.nhp.layerv.xyz` | Login domain | Bypasses nhp-acd (login page accessible) |
+| `console2.apps.layerv.xyz` | Protected domain | NHP-protected (requires nhp_token) |
+
+**Login Flow:**
+1. User visits `console.nhp.layerv.xyz` (login domain)
+2. User logs in with username/password
+3. Frontend does NHP knock via `/plugins/passcode?action=auth_code`
+4. User redirected to `console2.apps.layerv.xyz` (protected domain)
+
 **Environment Variables (web/.env.production):**
 
 | Variable | Old Console | New Console | Description |
 |----------|-------------|-------------|-------------|
-| `VITE_LOGIN_URL` | `https://console-login.secure.layerv.ai` | *(empty)* | NHP auth URL. Empty = same origin |
+| `VITE_LOGIN_URL` | `https://console-login.secure.layerv.ai` | `https://console.nhp.layerv.xyz` | Login domain URL (set via Docker build-arg from SSM) |
 | `VITE_COOKIE_DOMAIN` | `.layerv.ai` | `.layerv.xyz` | Cookie domain for SSO |
 | `VITE_BASE_PATH` | `https://console-login.secure.layerv.ai` | `https://console.nhp.layerv.xyz` | Base URL |
 
-**Note:** When `VITE_LOGIN_URL` is empty, the Vue app uses the same origin for `/plugins/passcode`
-requests, which are routed by Console EC2 nginx to the NHP Server.
+**VITE_LOGIN_URL Behavior:**
+- **Set to login domain URL**: NHP knock only when `window.location.host` matches this URL's host
+- **Empty/not set**: NHP auth skipped entirely (Console without NHP integration)
+- **localhost**: NHP auth skipped (development mode)
 
-#### Console Database Auto-Initialization
+The `VITE_LOGIN_URL` value is stored in SSM parameter `/layerv/nhp/{env}/console/public_url` by
+Terraform and read by GitHub Actions during Docker build.
 
-Console uses **automatic database initialization** on first deployment. This eliminates the need
-for manual `/init/initdb` API calls that were previously required by the gin-vue-admin framework.
+#### Console Database Migrations
+
+Console uses **Docker entrypoint-based migrations** using golang-migrate. Migrations run
+automatically on container startup before the Console server starts.
 
 **How it works:**
 
-1. On startup, Console checks if `GVA_AUTO_INIT=true` environment variable is set
-2. If enabled, checks if database is already initialized (admin user exists)
-3. If not initialized, runs the full init flow programmatically:
-   - Creates all database tables (AutoMigrate)
-   - Seeds initial data (admin user, menus, APIs, authorities, etc.)
-   - Uses `GVA_ADMIN_PASSWORD` for admin password (or generates random if not set)
+1. Container starts, `entrypoint.sh` runs
+2. Validates required PostgreSQL environment variables (fail-fast)
+3. URL-encodes credentials to handle special characters in passwords
+4. Runs `portal-migrate up` with PostgreSQL advisory locking
+5. golang-migrate tracks applied versions in `schema_migrations` table
+6. Console server starts after migrations complete
 
 **Environment Variables:**
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GVA_AUTO_INIT` | `false` | Enable auto-initialization on startup |
-| `GVA_ADMIN_PASSWORD` | *(generated)* | Admin user password. If not set, generates random and logs it |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `GVA_CONFIG_PGSQL_PATH` | Yes | PostgreSQL host |
+| `GVA_CONFIG_PGSQL_PORT` | No | PostgreSQL port (default: 5432) |
+| `GVA_CONFIG_PGSQL_USERNAME` | Yes | Database username |
+| `GVA_CONFIG_PGSQL_PASSWORD` | Yes | Database password |
+| `GVA_CONFIG_PGSQL_DBNAME` | Yes | Database name |
+| `GVA_CONFIG_PGSQL_SSLMODE` | No | SSL mode (default: require) |
+| `SKIP_MIGRATIONS` | No | Set to "true" to bypass migrations (debugging only) |
+| `GVA_ADMIN_PASSWORD` | No | Admin user password for initial seeding |
 
-**Terraform Configuration:**
-
-```hcl
-# In terraform.tfvars or via TF_VAR_console_admin_password
-console_admin_password = "your-secure-password"  # Optional, recommended for production
-
-# The console-ec2 module sets auto_init=true by default
-```
-
-**Initialization Flow:**
+**Migration Flow:**
 
 ```
-Console Startup
+Container Start
       │
-      ├── GVA_AUTO_INIT != "true"? → Skip, use manual /init/initdb
+      ▼
+entrypoint.sh
       │
-      ├── Database not connected? → Skip, no DB config
+      ├── Validate required env vars (fail fast if missing)
+      ├── Build DB connection URL (with URL-encoded credentials)
+      ├── Run: portal-migrate up
+      │      └── golang-migrate handles locking + versioning
       │
-      ├── Admin user exists? → Skip, already initialized
-      │
-      └── Initialize:
-          ├── Create tables (AutoMigrate)
-          ├── Seed system data (menus, APIs, authorities)
-          └── Create admin user with GVA_ADMIN_PASSWORD
+      ▼
+Start Console server
 ```
+
+**Key Features:**
+- **Idempotent**: Safe to run multiple times (skips already-applied migrations)
+- **Concurrent-safe**: PostgreSQL advisory locking prevents race conditions
+- **Version tracking**: `schema_migrations` table tracks applied versions
+- **Security**: URL-encoding handles special characters, backticks encoded to prevent injection
 
 #### Two-Part Database Seeding
 
