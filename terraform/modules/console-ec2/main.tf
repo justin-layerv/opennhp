@@ -167,7 +167,12 @@ resource "aws_iam_role_policy" "console" {
           "route53:ChangeResourceRecordSets",
           "route53:ListResourceRecordSets"
         ]
-        Resource = var.hosted_zone_id != null ? ["arn:aws:route53:::hostedzone/${var.hosted_zone_id}"] : []
+        # Include both hosted_zone_id (for main domain) and protected_hosted_zone_id (for NHP protected domain)
+        # In practice these are often the same zone, but compact() handles duplicates and nulls
+        Resource = compact(distinct([
+          var.hosted_zone_id != null ? "arn:aws:route53:::hostedzone/${var.hosted_zone_id}" : "",
+          var.protected_hosted_zone_id != null ? "arn:aws:route53:::hostedzone/${var.protected_hosted_zone_id}" : ""
+        ]))
       }
     ]
   })
@@ -378,7 +383,8 @@ resource "aws_launch_template" "console" {
     }
   }
 
-  user_data = base64encode(local.user_data)
+  # Gzip user_data to stay under 16KB limit (especially with NHP protection enabled)
+  user_data = base64gzip(local.user_data)
 
   monitoring {
     enabled = true
@@ -623,7 +629,7 @@ resource "aws_route53_record" "console" {
 resource "aws_lb" "protected" {
   count = var.enable_nhp_protection ? 1 : 0
 
-  name               = replace("${local.console_name}-prot", "_", "-")
+  name               = replace("${var.name_prefix}-con-prot", "_", "-")
   internal           = false # Internet-facing for protected access
   load_balancer_type = "network"
   subnets            = var.public_subnet_ids

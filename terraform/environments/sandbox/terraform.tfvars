@@ -120,6 +120,11 @@ console_internal_only = true
 # - Protected domain: console2.apps.layerv.xyz (NHP-protected, where users land after auth)
 console_protected_hostname = "console2.apps.layerv.xyz"
 
+# Enable true network-level NHP protection for Console
+# When enabled, Console EC2 runs its own nhp-acd with iptables DROP by default.
+# Port 443 is only accessible after NHP knock adds the user's IP to ipset.
+enable_console_nhp_protection = true
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"
