@@ -802,7 +802,9 @@ resource "aws_iam_role_policy" "terraform_apply_ec2" {
           "autoscaling:PutScalingPolicy",
           "autoscaling:DeletePolicy",
           "autoscaling:CreateOrUpdateTags",
-          "autoscaling:DeleteTags"
+          "autoscaling:DeleteTags",
+          "autoscaling:AttachLoadBalancerTargetGroups",
+          "autoscaling:DetachLoadBalancerTargetGroups"
         ]
         Resource = "arn:aws:autoscaling:${local.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/layerv-nhp-*"
       }
