@@ -1159,6 +1159,12 @@ jobs:
               EMOJI="ok"
               STATUS="successful"
               DETAILS="Build completed (deploy skipped)"
+            elif [[ "$DEPLOY_SANDBOX_RESULT" == "cancelled" || "$DEPLOY_PROD_RESULT" == "cancelled" ]]; then
+              # Cancelled is not a failure - usually means a newer run superseded this one
+              COLOR="#ffc107"
+              EMOJI="warning"
+              STATUS="cancelled"
+              DETAILS="Build succeeded, deploy cancelled (superseded by newer run)"
             else
               COLOR="#dc3545"
               EMOJI="error"
@@ -1170,6 +1176,11 @@ jobs:
             EMOJI="error"
             STATUS="failed"
             DETAILS="Build or tests failed"
+          elif [[ "$BUILD_RESULT" == "cancelled" ]]; then
+            COLOR="#ffc107"
+            EMOJI="warning"
+            STATUS="cancelled"
+            DETAILS="Build was cancelled"
           else
             COLOR="#ffc107"
             EMOJI="warning"
