@@ -648,9 +648,12 @@ echo "nginx configured for protected domain (HTTPS on port 443)"
 echo "Configuring nginx for internal mode (HTTP-only on port ${console_port})..."
 
 cat > /etc/nginx/sites-available/console << 'NGINXEOF'
-# Console API - Internal Mode nginx configuration
-# Proxies HTTP from AC to Console Docker container
-# TLS termination is handled by AC's Traefik
+# Console API - Internal Mode (Portal Domain) nginx configuration
+# This is the LOGIN PORTAL - only login-related paths are allowed.
+# After login, users are redirected to the protected domain.
+#
+# SECURITY: All paths except login-related ones return 403.
+# This prevents accessing authenticated APIs on the portal domain.
 #
 # Port mapping:
 # - External (NLB): ${console_port} (8888)
@@ -666,12 +669,15 @@ server {
     server_name ${domain_name} _;
 
     # Use VPC DNS resolver with 30s TTL to handle Cloud Map DNS changes
-    # This prevents stale DNS cache when NHP Server instances are replaced
     resolver 169.254.169.253 valid=30s ipv6=off;
 
     # Logging
     access_log /var/log/nginx/console-access.log;
     error_log /var/log/nginx/console-error.log;
+
+    # ===========================================================================
+    # WHITELISTED PATHS - Only these are allowed on the portal domain
+    # ===========================================================================
 
     # Health check endpoint (for NLB health checks)
     location /health {
@@ -682,8 +688,6 @@ server {
 
 %{ if nhp_server_endpoint != null ~}
     # NHP Server plugins endpoint (for auth_code action after Console login)
-    # Routes /plugins/* to NHP Server HTTP endpoint
-    # Uses variable to force DNS re-resolution on each request
     location /plugins/ {
         set $nhp_server_upstream http://${nhp_server_endpoint};
         proxy_pass $nhp_server_upstream;
@@ -693,31 +697,120 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
         proxy_set_header Connection "";
-
-        # Timeouts
         proxy_connect_timeout 30s;
         proxy_send_timeout 60s;
         proxy_read_timeout 60s;
     }
 %{ endif ~}
 
-    # Proxy all other requests to Console
-    location / {
+    # Static assets (JS, CSS, images for login page)
+    location /assets/ {
+        proxy_pass http://console_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Connection "";
+    }
+
+    # Login APIs (captcha, login)
+    location /base/ {
         proxy_pass http://console_backend;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Proto https;
         proxy_set_header Connection "";
-
-        # Timeouts
         proxy_connect_timeout 30s;
         proxy_send_timeout 60s;
         proxy_read_timeout 60s;
+    }
 
-        # For file uploads
+    # Tenant login/registration
+    location /TT/ {
+        proxy_pass http://console_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+
+    # =======================================================================
+    # Portal public APIs - explicit location blocks (safer than nginx `if`)
+    # =======================================================================
+
+    # Portal Sites public endpoints
+    location = /ps/getPortalSitesPublic { proxy_pass http://console_backend; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
+    location = /ps/FindSiteByApplicationId { proxy_pass http://console_backend; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
+    location = /ps/registerByApp { proxy_pass http://console_backend; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
+    location = /ps/createPortalSitesByURL { proxy_pass http://console_backend; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
+    location = /ps/custom_auth_api { proxy_pass http://console_backend; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
+    location /ps/ { return 403; }  # Block all other /ps/ endpoints
+
+    # PassCode endpoints (all public)
+    location /PC/ {
+        proxy_pass http://console_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Connection "";
+    }
+
+    # Portal App Categories public endpoints
+    location = /PACs/getPortalAppCategrayPublic { proxy_pass http://console_backend; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
+    location = /pacs/getPortalACsPublic { proxy_pass http://console_backend; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
+    location /PACs/ { return 403; }
+    location /pacs/ { return 403; }
+
+    # NHP public endpoints
+    location = /pnhps/getPortalNHPServerPublic { proxy_pass http://console_backend; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
+    location = /nc/getPortalNHPConnectorPublic { proxy_pass http://console_backend; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
+    location /pnhps/ { return 403; }
+    location /nc/ { return 403; }
+
+    # Public info endpoints
+    location = /info/getInfoPublic { proxy_pass http://console_backend; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
+    location = /info/getInfoDataSource { proxy_pass http://console_backend; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
+    location /info/ { return 403; }
+
+    # File uploads (needed for some portal features)
+    location /uploads/ {
         client_max_body_size 50M;
+        proxy_pass http://console_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Connection "";
+    }
+
+    # Favicon and logos
+    location ~ ^/(favicon\.ico|logo.*\.png)$ {
+        proxy_pass http://console_backend;
+        proxy_set_header Host $host;
+    }
+
+    # Root path - serve index.html only (login page entry point)
+    location = / {
+        proxy_pass http://console_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Connection "";
+    }
+
+    # ===========================================================================
+    # CATCH-ALL: Block everything else with 403 Forbidden
+    # ===========================================================================
+    location / {
+        return 403 '{"error": "Access denied. Use the protected domain after login."}';
+        add_header Content-Type application/json;
     }
 }
 NGINXEOF
