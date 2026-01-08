@@ -232,11 +232,21 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 	resp := &nhpplugins.RefreshResponse{}
 	// interact with udp server for ac operation
 	ackMsg, err := helper.AuthWithHttpCallbackFunc(req, res)
+	if err != nil {
+		log.Error("AuthWithHttpCallbackFunc failed: %v", err)
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": fmt.Sprintf("auth callback failed: %v", err)})
+		return nil, err
+	}
+	if ackMsg == nil {
+		log.Error("AuthWithHttpCallbackFunc returned nil ackMsg")
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": "internal error: nil response"})
+		return nil, fmt.Errorf("nil ackMsg from AuthWithHttpCallbackFunc")
+	}
 
 	if ackMsg.ErrCode != common.ErrSuccess.ErrorCode() {
 		log.Error("knock failed. %v", ackMsg.ErrMsg)
-		ctx.String(http.StatusOK, "{\"errMsg\": \"knock failed: %v\"}", ackMsg.ErrMsg)
-		return nil, err
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": fmt.Sprintf("knock failed: %s", ackMsg.ErrMsg)})
+		return nil, fmt.Errorf("knock failed: %s", ackMsg.ErrMsg)
 	}
 
 	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(ackMsg, res, resourceHander.GetConfig(), "oidc", "")

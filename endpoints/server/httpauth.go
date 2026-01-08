@@ -14,9 +14,9 @@ func (hs *HttpServer) authWithAspPlugin(c *gin.Context, req *common.HttpKnockReq
 
 	handler := hs.FindPluginHandler(aspId)
 	if handler == nil {
-		err = common.ErrAuthHandlerNotFound
+		// Note: err not used here since we return immediately
 		log.Error("no auth handler provided")
-		c.String(http.StatusOK, "{\"errMsg\": \"no auth handler provided\"}")
+		c.JSON(http.StatusOK, gin.H{"errMsg": "no auth handler provided"})
 		return
 	}
 
