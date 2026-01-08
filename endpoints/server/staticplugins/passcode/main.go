@@ -747,7 +747,14 @@ func getSharingLinkRedirectUrl(passcode string, resourceHost map[string]string) 
 		return ""
 	}
 
-	// Try to parse passcode as JWT
+	// Try to parse passcode as JWT to check if it's a sharing link.
+	//
+	// FALSE POSITIVE: go/missing-jwt-signature-check
+	// ParseUnverified is intentional here - we're only checking if the passcode
+	// is a sharing link JWT for routing purposes, not for authentication.
+	// Actual authentication happens via jwt.Validate() in AuthWithHttpRefresh().
+	// This is safe because we're just extracting claims to determine redirect
+	// behavior, not granting access based on these claims.
 	claims := jwt.MapClaims{}
 	parser := new(jwt.Parser)
 	_, _, err := parser.ParseUnverified(passcode, claims)
@@ -825,7 +832,14 @@ func GetUserFromAuthHeader(authHeader string) string {
 	return "anonymous"
 }
 
-// parseUserFromJWT parses user info from JWT, using generic claims structure
+// parseUserFromJWT parses user info from JWT, using generic claims structure.
+//
+// FALSE POSITIVE: go/missing-jwt-signature-check
+// ParseUnverified is intentional here - we're only extracting the username for
+// logging/audit purposes, not for authentication. The Authorization header is
+// validated against the IAM service separately in authAccessFromRaaS(). This is
+// safe because the extracted name is only used for informational purposes and
+// doesn't affect access control decisions.
 func parseUserFromJWT(tokenString string) (string, error) {
 	// Use MapClaims to parse arbitrary JWT structure
 	claims := jwt.MapClaims{}
