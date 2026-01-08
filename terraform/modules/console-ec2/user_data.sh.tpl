@@ -749,7 +749,9 @@ server {
     location = /ps/FindSiteByApplicationId { proxy_pass http://console_backend; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
     location = /ps/registerByApp { proxy_pass http://console_backend; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
     location = /ps/createPortalSitesByURL { proxy_pass http://console_backend; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
+    # custom_auth_api: Both variants needed - NHP SDK adds trailing slash in server-to-server calls
     location = /ps/custom_auth_api { proxy_pass http://console_backend; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
+    location = /ps/custom_auth_api/ { proxy_pass http://console_backend; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
     location /ps/ { return 403; }  # Block all other /ps/ endpoints
 
     # PassCode endpoints (all public)
