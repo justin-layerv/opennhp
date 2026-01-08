@@ -586,20 +586,52 @@ func (a *UdpAC) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sync.W
 	defer discoveryRoutineWg.Done()
 
 	acId := a.config.ACId
-	sendAddr := server.SendAddr()
-	if sendAddr == nil {
-		log.Error("Cannot connect to nil server address")
-		return
-	}
+	var lastAddrStr string // Track previous address to detect DNS changes
 
-	addrStr := sendAddr.String()
-
-	defer log.Info("server discovery sub-routine at %s stopped", addrStr)
-	log.Info("server discovery sub-routine at %s started", addrStr)
+	defer func() {
+		if lastAddrStr != "" {
+			log.Info("server discovery sub-routine at %s stopped", lastAddrStr)
+		}
+	}()
+	log.Info("server discovery sub-routine started for %s", server.Hostname)
 
 	var failCount int
 
 	for {
+		// Re-resolve server address each iteration to pick up DNS changes
+		sendAddr := server.SendAddr()
+		if sendAddr == nil {
+			log.Error("Cannot resolve server address for %s, will retry", server.Hostname)
+			select {
+			case <-a.signals.stop:
+				return
+			case <-quit:
+				return
+			case <-time.After(MinialServerDiscoveryInterval * time.Second):
+				continue
+			}
+		}
+		addrStr := sendAddr.String()
+
+		// If address changed, close old connection and reset fail count
+		if lastAddrStr != "" && lastAddrStr != addrStr {
+			log.Info("Server address changed from %s to %s, resetting connection", lastAddrStr, addrStr)
+			var oldConn *UdpConn
+			a.remoteConnectionMutex.Lock()
+			if conn, found := a.remoteConnectionMap[lastAddrStr]; found {
+				oldConn = conn
+				delete(a.remoteConnectionMap, lastAddrStr)
+			}
+			a.remoteConnectionMutex.Unlock()
+			// Close outside lock to avoid blocking other operations, but synchronously
+			// to ensure cleanup completes before we proceed
+			if oldConn != nil {
+				oldConn.Close()
+			}
+			failCount = 0
+			atomic.StoreInt32(serverFailCount, 0)
+		}
+		lastAddrStr = addrStr
 		var lastSendTime int64
 		var lastRecvTime int64
 		var connected bool
@@ -677,9 +709,9 @@ func (a *UdpAC) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sync.W
 							if conn != nil {
 								log.Info("server discovery failed, close local connection: %s", conn.ConnData.LocalAddr.String())
 								delete(a.remoteConnectionMap, addrStr)
+								conn.Close()
 							}
 							a.remoteConnectionMutex.Unlock()
-							conn.Close()
 						}
 						log.Error("ac(%s#%d)[ACOnline] reporting to server %s failed", acId, aolMd.TransactionId, addrStr)
 					}
@@ -709,10 +741,17 @@ func (a *UdpAC) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sync.W
 				failCount = 0
 				atomic.StoreInt32(serverFailCount, 0)
 				a.remoteConnectionMutex.Lock()
-				conn = a.remoteConnectionMap[addrStr] // conn must be available at this point
-				conn.connected.Store(true)
-				conn.externalAddr = aakMsg.ACAddr
+				conn = a.remoteConnectionMap[addrStr]
+				if conn != nil {
+					conn.connected.Store(true)
+					conn.externalAddr = aakMsg.ACAddr
+				}
 				a.remoteConnectionMutex.Unlock()
+				if conn == nil {
+					log.Error("ac(%s#%d)[ACOnline] connection not found in map after successful handshake", acId, aolMd.TransactionId)
+					err = fmt.Errorf("connection not found after handshake")
+					return
+				}
 				log.Info("ac(%s#%d)[ACOnline] succeed. ac external address is %s, replied by server %s", acId, aolMd.TransactionId, aakMsg.ACAddr, addrStr)
 			}()
 
