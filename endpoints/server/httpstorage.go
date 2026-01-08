@@ -69,7 +69,13 @@ func (hs *HttpServer) initStorageRouter() {
 		}
 
 		// create target file
-		filename := header.Filename
+		// Use filepath.Base to sanitize filename and prevent path traversal attacks.
+		// This handles all edge cases including URL-encoded separators, null bytes, etc.
+		filename := filepath.Base(header.Filename)
+		if filename == "" || filename == "." || filename == ".." {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid filename"})
+			return
+		}
 		filePath := filepath.Join(fileDir, filename)
 		out, err := os.Create(filePath)
 		if err != nil {
@@ -185,15 +191,16 @@ func (hs *HttpServer) initStorageRouter() {
 
 	// file download
 	g.GET("/download/:uuid/:filename", func(c *gin.Context) {
-		uuid := c.Param("uuid")
-		filename := c.Param("filename")
+		// Use filepath.Base to sanitize path components and prevent traversal attacks
+		uuid := filepath.Base(c.Param("uuid"))
+		filename := filepath.Base(c.Param("filename"))
 
-		// validate that uuid and filename are single path components
-		if uuid == "" || strings.Contains(uuid, "/") || strings.Contains(uuid, "\\") || strings.Contains(uuid, "..") {
+		// Reject empty or special directory entries
+		if uuid == "" || uuid == "." || uuid == ".." {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file name"})
 			return
 		}
-		if filename == "" || strings.Contains(filename, "/") || strings.Contains(filename, "\\") || strings.Contains(filename, "..") {
+		if filename == "" || filename == "." || filename == ".." {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file name"})
 			return
 		}
@@ -227,7 +234,9 @@ func (hs *HttpServer) initStorageRouter() {
 
 		// provide file download
 		c.Header("Content-Description", "File Transfer")
-		c.Header("Content-Disposition", "attachment; filename="+filename)
+		// Properly quote filename to prevent header injection attacks
+		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"",
+			strings.ReplaceAll(filename, "\"", "\\\"")))
 		c.Header("Content-Type", "application/octet-stream")
 		c.File(absPath)
 	})
@@ -270,13 +279,19 @@ func (pw *ProgressWriter) Write(p []byte) (n int, err error) {
 
 // saveMetadata use to save file metadata
 func saveMetadata(metadata FileMetadata) error {
+	// Validate UUID to prevent path traversal
+	safeUUID := filepath.Base(metadata.UUID)
+	if safeUUID == "" || safeUUID == "." || safeUUID == ".." || safeUUID != metadata.UUID {
+		return fmt.Errorf("invalid UUID format")
+	}
+
 	if _, err := os.Stat(filepath.Join(ExeDirPath, metadataDir)); os.IsNotExist(err) {
 		if err := os.MkdirAll(filepath.Join(ExeDirPath, metadataDir), os.ModePerm); err != nil {
 			return err
 		}
 	}
 
-	metadataPath := filepath.Join(ExeDirPath, metadataDir, metadata.UUID+".json")
+	metadataPath := filepath.Join(ExeDirPath, metadataDir, safeUUID+".json")
 	file, err := os.Create(metadataPath)
 	if err != nil {
 		return err
@@ -303,7 +318,7 @@ func loadMetadata(uuid string) (FileMetadata, error) {
 	if err != nil {
 		return metadata, err
 	}
-	if !strings.HasPrefix(absPath, safeDirAbs) {
+	if !strings.HasPrefix(absPath, safeDirAbs+string(os.PathSeparator)) {
 		return metadata, fmt.Errorf("invalid file name")
 	}
 
@@ -331,7 +346,17 @@ func checkFileExists(md5 string) (FileMetadata, bool) {
 			continue
 		}
 
-		metadata, err := loadMetadata(file.Name()[:len(file.Name())-5]) // remove .json suffix
+		// Skip files that don't end with .json
+		name := file.Name()
+		if !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		uuid := strings.TrimSuffix(name, ".json")
+		if uuid == "" {
+			continue
+		}
+
+		metadata, err := loadMetadata(uuid)
 		if err == nil && metadata.MD5 == md5 {
 			return metadata, true
 		}
