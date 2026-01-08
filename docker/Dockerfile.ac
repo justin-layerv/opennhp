@@ -21,7 +21,7 @@ RUN echo "Building for architecture: ${TARGETARCH}"
 RUN make init acd
 
 # Stage 2: Runtime image
-FROM ubuntu:22.04 AS runtime
+FROM ubuntu:24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
