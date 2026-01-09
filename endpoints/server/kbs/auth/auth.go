@@ -64,14 +64,15 @@ func Auth(c *gin.Context) {
 		return
 	}
 
+	c.SetSameSite(http.SameSiteStrictMode) // Prevent CSRF attacks
 	c.SetCookie(
 		"kbs-session-id",
 		kbsSessionId,
 		3600, // the unit is second
 		"/",
 		"",
-		false,
-		true,
+		true, // Secure: only send over HTTPS
+		true, // HttpOnly: prevent XSS
 	)
 
 	c.JSON(http.StatusOK, AuthResponse{

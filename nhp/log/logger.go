@@ -128,7 +128,7 @@ func (lw *AsyncLogWriter) writeRoutine() {
 				if len(lw.DirPath) > 0 {
 					filename = filepath.Join(lw.DirPath, filename)
 				}
-				file, err = os.OpenFile(filename, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
+				file, err = os.OpenFile(filename, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600)
 				if err != nil {
 					fmt.Printf("Error: AsyncLogWriter cannot open file %s (%v)\n", filename, err)
 					continue
@@ -138,7 +138,7 @@ func (lw *AsyncLogWriter) writeRoutine() {
 			// O_CREATE: create file if it does not exist
 			// O_APPEND: open at the end of file
 			// O_SYNC: sync data right into disk at write. Don't use this flag to reduce file i/o
-			//file, err := os.OpenFile(filename, os.O_WRONLY|os.O_APPEND|os.O_CREATE|os.O_SYNC, 0644)
+			//file, err := os.OpenFile(filename, os.O_WRONLY|os.O_APPEND|os.O_CREATE|os.O_SYNC, 0600)
 			for _, m := range msgArr {
 				_, err := file.Write(m)
 				if err != nil {

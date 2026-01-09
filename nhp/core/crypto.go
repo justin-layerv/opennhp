@@ -117,18 +117,29 @@ func AeadFromKey(t GcmTypeEnum, key *[SymmetricKeySize]byte) (aead cipher.AEAD) 
 func CBCEncryption(t GcmTypeEnum, key *[SymmetricKeySize]byte, plaintext []byte, inPlace bool) ([]byte, error) {
 	var block cipher.Block
 	var iv []byte
+	var err error
 	switch t {
 	case GCM_AES256:
-		block, _ = aes.NewCipher(key[:])
+		block, err = aes.NewCipher(key[:])
+		if err != nil {
+			return nil, fmt.Errorf("failed to create AES cipher: %w", err)
+		}
 		iv = key[8:24]
 
 	case GCM_CHACHA20POLY1305:
 		return nil, ErrNotApplicable
+
+	default:
+		// Guard against future GcmTypeEnum additions - unreachable with current values
+		return nil, fmt.Errorf("unsupported cipher type: %d", t)
 	}
 
 	var paddedPlainText []byte
 	if len(plaintext)%block.BlockSize() == 0 {
-		// skip padding
+		// NOTE: Non-standard PKCS#7 behavior from upstream OpenNHP. Standard PKCS#7
+		// always pads (adding a full block when input is block-aligned). This legacy
+		// behavior skips padding for block-aligned input for compatibility with
+		// existing encrypted data. See CBCDecryption for matching unpadding logic.
 		paddedPlainText = plaintext
 	} else {
 		paddedPlainText = pad(plaintext, block.BlockSize())
@@ -151,13 +162,21 @@ func CBCEncryption(t GcmTypeEnum, key *[SymmetricKeySize]byte, plaintext []byte,
 func CBCDecryption(t GcmTypeEnum, key *[SymmetricKeySize]byte, ciphertext []byte, inPlace bool) ([]byte, error) {
 	var block cipher.Block
 	var iv []byte
+	var err error
 	switch t {
 	case GCM_AES256:
-		block, _ = aes.NewCipher(key[:])
+		block, err = aes.NewCipher(key[:])
+		if err != nil {
+			return nil, fmt.Errorf("failed to create AES cipher: %w", err)
+		}
 		iv = key[8:24]
 
 	case GCM_CHACHA20POLY1305:
 		return nil, ErrNotApplicable
+
+	default:
+		// Guard against future GcmTypeEnum additions - unreachable with current values
+		return nil, fmt.Errorf("unsupported cipher type: %d", t)
 	}
 
 	if len(ciphertext) < block.BlockSize() {
@@ -176,10 +195,16 @@ func CBCDecryption(t GcmTypeEnum, key *[SymmetricKeySize]byte, ciphertext []byte
 	mode.CryptBlocks(plaintext, ciphertext)
 
 	if len(plaintext)%block.BlockSize() == 0 {
-		// skip unpadding
+		// NOTE: Non-standard PKCS#7 behavior from upstream OpenNHP. This matches
+		// the CBCEncryption logic which skips padding for block-aligned input.
+		// Standard PKCS#7 always has padding, but this legacy behavior maintains
+		// compatibility with existing encrypted data.
 	} else {
 		// Unpad plaintext
-		plaintext = unpad(plaintext, block.BlockSize())
+		plaintext, err = unpad(plaintext, block.BlockSize())
+		if err != nil {
+			return nil, fmt.Errorf("failed to unpad plaintext: %w", err)
+		}
 	}
 
 	return plaintext, nil
@@ -217,17 +242,17 @@ func AESDecrypt(cipherText []byte, key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Need at least IV (16 bytes) + one block of data (16 bytes)
-	if len(cipherText) < aes.BlockSize {
-		return nil, fmt.Errorf("cipherText too short")
+	// Validate ciphertext length:
+	// - Must have at least IV (16 bytes) + one encrypted block (16 bytes)
+	// - After IV extraction, remaining must be a multiple of block size
+	if len(cipherText) < aes.BlockSize*2 {
+		return nil, fmt.Errorf("cipherText too short: need at least %d bytes, got %d", aes.BlockSize*2, len(cipherText))
+	}
+	if (len(cipherText)-aes.BlockSize)%aes.BlockSize != 0 {
+		return nil, fmt.Errorf("cipherText length invalid: must be IV + multiple of block size")
 	}
 	iv := cipherText[:aes.BlockSize]
 	cipherText = cipherText[aes.BlockSize:]
-
-	// CBC requires ciphertext to be a multiple of block size
-	if len(cipherText) == 0 || len(cipherText)%aes.BlockSize != 0 {
-		return nil, fmt.Errorf("cipherText length must be a multiple of block size")
-	}
 
 	// Decrypt
 	mode := cipher.NewCBCDecrypter(block, iv)
@@ -235,15 +260,28 @@ func AESDecrypt(cipherText []byte, key []byte) ([]byte, error) {
 	mode.CryptBlocks(decrypted, cipherText)
 
 	// Remove padding
-	decrypted = unpad(decrypted, aes.BlockSize)
+	decrypted, err = unpad(decrypted, aes.BlockSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unpad decrypted data: %w", err)
+	}
 
 	return decrypted, nil
 }
-func unpad(padded []byte, blockSize int) []byte {
+
+func unpad(padded []byte, blockSize int) ([]byte, error) {
 	length := len(padded)
-	unpadLen := int(padded[length-1])
-	if unpadLen > blockSize || unpadLen > length {
-		return nil
+	if length == 0 {
+		return nil, fmt.Errorf("empty padded data")
 	}
-	return padded[:length-unpadLen]
+	unpadLen := int(padded[length-1])
+	if unpadLen == 0 || unpadLen > blockSize || unpadLen > length {
+		return nil, fmt.Errorf("invalid padding length: %d", unpadLen)
+	}
+	// Validate all padding bytes match PKCS#7 requirements
+	for i := length - unpadLen; i < length; i++ {
+		if padded[i] != byte(unpadLen) {
+			return nil, fmt.Errorf("invalid PKCS#7 padding bytes")
+		}
+	}
+	return padded[:length-unpadLen], nil
 }

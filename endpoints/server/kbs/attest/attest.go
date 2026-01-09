@@ -86,11 +86,15 @@ func Attest(c *gin.Context) {
 	teePubKeys.data[token] = teePubKey
 	teePubKeys.Unlock()
 
+	c.SetSameSite(http.SameSiteStrictMode) // Prevent CSRF attacks
 	c.SetCookie(
 		"kbs-session-id",
 		sessionID,
 		3600,
-		"/", "", false, true,
+		"/",
+		"",
+		true, // Secure: only send over HTTPS
+		true, // HttpOnly: prevent XSS
 	)
 
 	c.JSON(http.StatusOK, gin.H{
