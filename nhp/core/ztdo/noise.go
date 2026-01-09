@@ -367,7 +367,9 @@ type DataPrivateKeyWrapping struct {
 func NewDataPrivateKeyWrapping(providerPublicKeyBase64 string, dataPrivateKeyBase64 string, key, ad []byte) *DataPrivateKeyWrapping {
 	symmetricCipherMode := AES256GCM128Tag
 	var Iv [core.GCMNonceSize]byte
-	rand.Read(Iv[:])
+	if _, err := rand.Read(Iv[:]); err != nil {
+		panic("crypto/rand.Read failed: " + err.Error())
+	}
 
 	cipherText, _ := symmetricCipherMode.Encrypt(key, Iv[:], []byte(dataPrivateKeyBase64), ad)
 
