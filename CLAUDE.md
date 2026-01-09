@@ -6,12 +6,13 @@
 
 Quick reference for the LayerV NHP (Network Hiding Protocol) infrastructure project.
 
-> **Note:** This is a fork of [OpenNHP](https://github.com/OpenNHP/opennhp). Periodically sync upstream changes via `git fetch upstream && git merge upstream/main`.
+> **Note:** This is a fork of [OpenNHP](https://github.com/OpenNHP/opennhp). See `docs/UPSTREAM_SYNC.md` for the upstream synchronization process.
 
 **For detailed documentation, see:**
 - `docs/ARCHITECTURE.md` - Complete system architecture, auth flows, debugging
 - `docs/TESTING.md` - Test categories, build tags, running tests
 - `docs/server_plugin.md` - Plugin development guide
+- `docs/UPSTREAM_SYNC.md` - Upstream sync tracking and process
 
 ## Project Structure
 
