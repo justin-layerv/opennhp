@@ -1468,12 +1468,16 @@ go test -v -tags=e2e -timeout 5m ./tests/e2e/...
 ### Immutable Deployments
 
 Docker images are tagged with the commit SHA (`TF_VAR_image_tag`), not just `latest`. This ensures:
-- Each deployment creates a new launch template version (because user_data changes)
-- Instance refresh correctly detects which instances need replacement
+- Each deployment creates a new launch template version (when user_data template changes)
 - Rollbacks are straightforward—just deploy a previous commit SHA
 
 The workflow passes `TF_VAR_image_tag=${{ github.sha }}` to Terraform, which flows through
 to the user_data scripts that pull the specific image version.
+
+**Important:** For components that download binaries at boot (like Console EC2's nhp-acd),
+code changes may NOT update the launch template if only the binary changed. The CI/CD
+workflow sets `SkipMatching: false` for Console EC2 to ensure instance replacement on
+every deploy, regardless of launch template version.
 
 ### Known Issues
 
@@ -1481,6 +1485,12 @@ to the user_data scripts that pull the specific image version.
 When validation runs after canary deploy, NLB can route to any instance (old or new).
 E2E tests mitigate this by testing the live system regardless of which instance handles
 the request—they create new portal sites, so they verify current behavior.
+
+**Console EC2 Binary Updates:**
+Console EC2 downloads its nhp-acd binary at boot via user_data, not baked into the AMI.
+When code changes but user_data template doesn't change, the launch template version
+stays the same. Without `SkipMatching: false`, AWS would skip instance replacement,
+leaving old code running. See PR #94 for the fix.
 
 ---
 

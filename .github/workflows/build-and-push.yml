@@ -743,13 +743,16 @@ jobs:
           echo "CANARY DEPLOYMENT - Console EC2"
           echo "============================================"
 
+          # SkipMatching must be false for Console EC2 because the binary is downloaded
+          # at boot via user_data, not baked into the AMI. When code changes, the launch
+          # template doesn't change, so SkipMatching would incorrectly skip replacement.
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "$ASG_NAME" \
             --preferences '{
               "MinHealthyPercentage": 50,
               "InstanceWarmup": 300,
               "MaxHealthyPercentage": 110,
-              "SkipMatching": true
+              "SkipMatching": false
             }' \
             --query "InstanceRefreshId" \
             --output text)
