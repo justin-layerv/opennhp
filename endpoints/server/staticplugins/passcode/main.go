@@ -7,11 +7,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v4"
+
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/log"
 	"github.com/OpenNHP/opennhp/nhp/plugins"
-	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v4"
 
 	nhpplugins "github.com/fengyily/nhp-plugins-sdk"
 	"github.com/fengyily/nhp-plugins-sdk/resource"

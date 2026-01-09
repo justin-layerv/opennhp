@@ -3,8 +3,9 @@ package plugins
 import (
 	"testing"
 
-	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/gin-gonic/gin"
+
+	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
 // mockPluginHandler implements PluginHandler for testing

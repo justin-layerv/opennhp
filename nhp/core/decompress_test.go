@@ -13,10 +13,10 @@ func TestDecompressionSizeLimit(t *testing.T) {
 	const maxDecompressedSize = 10 * 1024 * 1024 // 10MB - same as responder.go
 
 	tests := []struct {
-		name           string
-		dataSize       int
-		expectError    bool
-		errorContains  string
+		name          string
+		dataSize      int
+		expectError   bool
+		errorContains string
 	}{
 		{
 			name:        "small data within limit",
@@ -34,16 +34,16 @@ func TestDecompressionSizeLimit(t *testing.T) {
 			expectError: false,
 		},
 		{
-			name:           "data exceeds limit by 1 byte",
-			dataSize:       maxDecompressedSize + 1,
-			expectError:    true,
-			errorContains:  "exceeds limit",
+			name:          "data exceeds limit by 1 byte",
+			dataSize:      maxDecompressedSize + 1,
+			expectError:   true,
+			errorContains: "exceeds limit",
 		},
 		{
-			name:           "data significantly exceeds limit",
-			dataSize:       maxDecompressedSize + 1024*1024, // 11MB
-			expectError:    true,
-			errorContains:  "exceeds limit",
+			name:          "data significantly exceeds limit",
+			dataSize:      maxDecompressedSize + 1024*1024, // 11MB
+			expectError:   true,
+			errorContains: "exceeds limit",
 		},
 	}
 

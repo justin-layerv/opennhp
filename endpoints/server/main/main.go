@@ -10,10 +10,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/urfave/cli/v2"
+
 	"github.com/OpenNHP/opennhp/endpoints/server"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/version"
-	"github.com/urfave/cli/v2"
 
 	// Import statically compiled plugins to trigger their init() registration
 	// These are in staticplugins/ (not plugins/) because they're compiled into the binary,
@@ -110,7 +111,7 @@ func printServerInfo(us *server.UdpServer) {
 	fmt.Printf("  %sPlatform:%s   %s/%s\n", colorYellow, colorReset, runtime.GOOS, runtime.GOARCH)
 	fmt.Println()
 	fmt.Printf("  %sUDP Port:%s   %s%d%s\n", colorBlue, colorReset, colorCyan, us.GetListenPort(), colorReset)
-	
+
 	// Display HTTP status
 	httpPort, httpEnabled := us.GetHttpPort()
 	if httpEnabled {
@@ -118,7 +119,7 @@ func printServerInfo(us *server.UdpServer) {
 	} else {
 		fmt.Printf("  %sHTTP:%s       %sdisabled%s\n", colorBlue, colorReset, colorDim, colorReset)
 	}
-	
+
 	fmt.Printf("  %sStarted:%s    %s\n", colorBlue, colorReset, time.Now().Format("2006-01-02 15:04:05"))
 	fmt.Println()
 	fmt.Println(colorGreen + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" + colorReset)

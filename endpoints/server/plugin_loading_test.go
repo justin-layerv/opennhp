@@ -3,8 +3,9 @@ package server
 import (
 	"testing"
 
-	"github.com/OpenNHP/opennhp/nhp/common"
 	toml "github.com/pelletier/go-toml/v2"
+
+	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
 // TestPluginLoadingFromEtcdConfig tests the full flow:

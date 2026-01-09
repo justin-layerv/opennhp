@@ -96,4 +96,3 @@ func TestECCSharedKey(t *testing.T) {
 	//fmt.Printf("Decrypted message:\n%s\n", string(decrypted))
 	fmt.Printf("ECC verify success with %d microseconds.\n", d.Microseconds())
 }
-

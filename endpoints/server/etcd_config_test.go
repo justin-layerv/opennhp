@@ -3,10 +3,11 @@ package server
 import (
 	"testing"
 
+	toml "github.com/pelletier/go-toml/v2"
+
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/etcd"
-	toml "github.com/pelletier/go-toml/v2"
 )
 
 // TestEtcdKeyPrefixFix verifies that the etcd key format is correct

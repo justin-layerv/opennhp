@@ -6,7 +6,6 @@ require (
 	github.com/OpenNHP/opennhp/nhp v0.6.0
 	github.com/cilium/ebpf v0.20.0
 	github.com/coreos/go-oidc/v3 v3.17.0
-	github.com/emmansun/gmsm v0.40.0
 	github.com/fengyily/nhp-plugins-sdk v0.1.30
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gin-contrib/sessions v1.0.4

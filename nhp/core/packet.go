@@ -23,7 +23,7 @@ const (
 	NHP_RKN        // agent sends reknock to server
 	NHP_RLY        // relay sends relayed packet to server
 	NHP_AOL        // ac sends online status to server
-	NHP_AAK        // server sends ack to ac after receving ac's online status
+	NHP_AAK        // server sends ack to ac after receiving ac's online status
 	NHP_OTP        // agent requests server for one-time-password
 	NHP_REG        // agent asks server for registering
 	NHP_RAK        // server sends back ack when agent registers correctly
@@ -55,7 +55,7 @@ var nhpHeaderTypeStrings []string = []string{
 	"NHP-RKN", // agent sends reknock to server
 	"NHP-RLY", // relay sends relayed packet to server
 	"NHP-AOL", // ac sends online status to server
-	"NHP-AAK", // server sends ack to ac after receving ac's online status
+	"NHP-AAK", // server sends ack to ac after receiving ac's online status
 	"NHP-OTP", // agent requests server for one-time-password
 	"NHP-REG", // agent asks server for registering
 	"NHP-RAK", // server sends back ack when agent registers correctly

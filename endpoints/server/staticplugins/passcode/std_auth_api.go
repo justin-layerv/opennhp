@@ -5,12 +5,13 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/OpenNHP/opennhp/nhp/common"
-	"github.com/OpenNHP/opennhp/nhp/log"
-	"github.com/OpenNHP/opennhp/nhp/plugins"
 	nhpplugins "github.com/fengyily/nhp-plugins-sdk"
 	nhpsdkutils "github.com/fengyily/nhp-plugins-sdk/utils"
 	"github.com/gin-gonic/gin"
+
+	"github.com/OpenNHP/opennhp/nhp/common"
+	"github.com/OpenNHP/opennhp/nhp/log"
+	"github.com/OpenNHP/opennhp/nhp/plugins"
 )
 
 type MiniProgramInfo struct {

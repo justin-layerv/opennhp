@@ -46,7 +46,6 @@ type ACRegistryEntry struct {
 	RegisteredAt int64  `toml:"RegisteredAt"`
 }
 
-
 type ServerEtcdConfig struct {
 	BaseConfig    Config
 	HttpConfig    HttpConfig

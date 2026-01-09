@@ -8,8 +8,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/OpenNHP/opennhp/nhp/log"
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
 type EtcdConfig struct {
@@ -101,7 +102,6 @@ func (conn *EtcdConn) SetValue(v string) error {
 func (conn *EtcdConn) WatchValue(callbackFunc func(val []byte)) {
 	// create etcd watcher
 	conn.watcher = clientv3.NewWatcher(conn.client)
-	
 
 	watchChan := conn.watcher.Watch(context.Background(), conn.Key)
 
@@ -192,7 +192,9 @@ func (conn *EtcdConn) WatchPrefix(prefix string, callbacks WatchPrefixCallbacks)
 
 // loadTLSConfig creates a TLS configuration for etcd mTLS
 func (conn *EtcdConn) loadTLSConfig() (*tls.Config, error) {
-	tlsConfig := &tls.Config{}
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
 
 	// Load CA certificate if provided
 	if conn.CACert != "" {
@@ -220,4 +222,3 @@ func (conn *EtcdConn) loadTLSConfig() (*tls.Config, error) {
 
 	return tlsConfig, nil
 }
-

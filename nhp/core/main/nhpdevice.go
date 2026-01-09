@@ -259,4 +259,3 @@ func nhp_device_set_overload(handle uintptr, overload bool) *C.NhpResult {
 	device.SetOverload(overload)
 	return resultPtr
 }
-

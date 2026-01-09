@@ -10,6 +10,7 @@
 *.dylib
 .*
 !.github/
+!.golangci.yml
 
 # NHP binaries (compiled without extension on Unix)
 nhp-server

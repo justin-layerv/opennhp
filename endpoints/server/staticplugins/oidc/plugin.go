@@ -1,9 +1,10 @@
 package oidc
 
 import (
+	"github.com/gin-gonic/gin"
+
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/plugins"
-	"github.com/gin-gonic/gin"
 )
 
 // Plugin implements plugins.PluginHandler interface

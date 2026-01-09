@@ -6,8 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/OpenNHP/opennhp/nhp/log"
 	toml "github.com/pelletier/go-toml/v2"
+
+	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
 func TestACEtcdConfig_Parse(t *testing.T) {
