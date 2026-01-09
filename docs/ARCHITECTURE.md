@@ -1053,6 +1053,29 @@ managed via a separate `aws_autoscaling_attachment` instead of being included in
 it will be removed on subsequent Terraform applies. The fix is to include it in `target_group_arns`
 using `concat()` when `enable_nhp_protection=true`.
 
+**Terraform ASG Attachment Migration Race Condition:**
+
+When migrating from `aws_autoscaling_attachment` to inline `target_group_arns`, Terraform's
+refresh timing can cause a state drift:
+
+1. Terraform refreshes state from AWS
+2. AWS shows ASG has both TGs (because of the existing attachment)
+3. New code says `target_group_arns = [internal, protected]` - matches refreshed state
+4. **No diff detected for ASG** (this is the bug)
+5. Terraform destroys the attachment → removes protected TG from ASG
+6. State says both TGs, but AWS only has internal
+
+**Industry best practice:** Never mix `aws_autoscaling_attachment` with inline `target_group_arns`.
+Pick one approach and stick with it.
+
+**If you must migrate:** Remove attachments from state before apply:
+```bash
+terraform state rm 'module.x.aws_autoscaling_attachment.foo[0]'
+terraform apply
+```
+
+The CI workflow handles this automatically in the "Handle ASG Attachment Migrations" step.
+
 **Environment Variables (web/.env.production):**
 
 | Variable | Old Console | New Console | Description |

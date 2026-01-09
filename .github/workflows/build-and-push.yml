@@ -536,6 +536,57 @@ jobs:
           mkdir -p ~/.terraform.d/plugin-cache
           terraform init
 
+      - name: Handle ASG Attachment Migrations
+        working-directory: terraform/environments/sandbox
+        env:
+          TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
+          TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
+          TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+
+          # Clean up any stale plan files from previous failed runs
+          rm -f tfplan plan.txt
+
+          # When migrating from aws_autoscaling_attachment to inline target_group_arns,
+          # Terraform's refresh timing can cause a race condition:
+          # 1. Refresh sees ASG has TG (from attachment) - matches new inline config
+          # 2. No diff detected for ASG
+          # 3. Attachment destroyed - removes TG from ASG
+          # 4. ASG now missing TG but Terraform thinks it has it
+          #
+          # Fix: Remove attachments from state before apply so Terraform sees the
+          # actual diff and updates the ASG's target_group_arns.
+          #
+          # Why plan twice? The first plan detects attachments to remove. After state
+          # removal, we re-plan to capture the ASG update that Terraform now sees.
+
+          terraform plan -out=tfplan -no-color 2>&1 | tee plan.txt
+
+          # Find any aws_autoscaling_attachment resources being destroyed
+          # Pattern matches both indexed (foo[0]) and non-indexed (foo) resources
+          ATTACHMENTS=$(grep -E "aws_autoscaling_attachment\.[^ ]+ will be destroyed" plan.txt | \
+            sed 's/.*# //' | sed 's/ will be destroyed//' || true)
+
+          # Warn if we found attachment references but failed to parse them (format may have changed)
+          if grep -q "aws_autoscaling_attachment" plan.txt && [[ -z "$ATTACHMENTS" ]]; then
+            echo "::warning::Found aws_autoscaling_attachment in plan but no destructions detected (this is normal if not migrating)"
+          fi
+
+          if [[ -n "$ATTACHMENTS" ]]; then
+            echo "::warning::Detected ASG attachment migration - removing from state to prevent race condition"
+            for att in $ATTACHMENTS; do
+              echo "Removing from state: $att"
+              terraform state rm "$att" || true
+            done
+            # Re-plan after state removal to capture ASG updates
+            rm -f tfplan
+            if ! terraform plan -out=tfplan -no-color; then
+              echo "::error::Re-plan failed after state removal. Manual intervention may be required."
+              exit 1
+            fi
+          fi
+
       - name: Terraform Apply
         working-directory: terraform/environments/sandbox
         env:
@@ -544,9 +595,15 @@ jobs:
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
           # Deployment configuration - use commit SHA for immutable deployments
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
-        # Run plan+apply together - avoids archive_file artifact issues
-        # Plan output is already available in terraform-plan job for review
-        run: terraform apply -auto-approve
+        # Apply the plan generated in previous step (or fresh if no migrations)
+        run: |
+          if [[ -f tfplan ]]; then
+            echo "::notice::Applying saved plan from migration step ($(stat -f%z tfplan 2>/dev/null || stat -c%s tfplan) bytes)"
+            terraform apply -auto-approve tfplan
+          else
+            echo "::notice::No saved plan found, running fresh apply"
+            terraform apply -auto-approve
+          fi
 
       - name: Get Terraform Outputs
         id: outputs
@@ -932,6 +989,43 @@ jobs:
           mkdir -p ~/.terraform.d/plugin-cache
           terraform init
 
+      - name: Handle ASG Attachment Migrations (Prod)
+        working-directory: terraform/environments/prod
+        env:
+          TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
+          TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
+          TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+
+          # Clean up any stale plan files from previous failed runs
+          rm -f tfplan plan.txt
+
+          # See sandbox job for detailed explanation of the race condition
+          terraform plan -out=tfplan -no-color 2>&1 | tee plan.txt
+
+          # Pattern matches both indexed (foo[0]) and non-indexed (foo) resources
+          ATTACHMENTS=$(grep -E "aws_autoscaling_attachment\.[^ ]+ will be destroyed" plan.txt | \
+            sed 's/.*# //' | sed 's/ will be destroyed//' || true)
+
+          # Warn if we found attachment references but failed to parse them (format may have changed)
+          if grep -q "aws_autoscaling_attachment" plan.txt && [[ -z "$ATTACHMENTS" ]]; then
+            echo "::warning::Found aws_autoscaling_attachment in plan but no destructions detected (this is normal if not migrating)"
+          fi
+
+          if [[ -n "$ATTACHMENTS" ]]; then
+            echo "::warning::Detected ASG attachment migration - removing from state to prevent race condition"
+            for att in $ATTACHMENTS; do
+              echo "Removing from state: $att"
+              terraform state rm "$att" || true
+            done
+            rm -f tfplan
+            if ! terraform plan -out=tfplan -no-color; then
+              echo "::error::Re-plan failed after state removal. Manual intervention may be required."
+              exit 1
+            fi
+          fi
+
       - name: Terraform Apply
         working-directory: terraform/environments/prod
         env:
@@ -940,10 +1034,15 @@ jobs:
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
           # Deployment configuration - use commit SHA for immutable deployments
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
-        # Run plan+apply together - avoids archive_file artifact issues
         # Manual approval is handled by GitHub environment protection rules
-        # Plan output is available in terraform-plan job for review before approval
-        run: terraform apply -auto-approve
+        run: |
+          if [[ -f tfplan ]]; then
+            echo "::notice::Applying saved plan from migration step ($(stat -f%z tfplan 2>/dev/null || stat -c%s tfplan) bytes)"
+            terraform apply -auto-approve tfplan
+          else
+            echo "::notice::No saved plan found, running fresh apply"
+            terraform apply -auto-approve
+          fi
 
       - name: Get Terraform Outputs
         id: outputs
