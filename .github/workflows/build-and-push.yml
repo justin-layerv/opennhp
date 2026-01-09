@@ -233,8 +233,14 @@ jobs:
             GO_VERSION=${{ env.GO_VERSION }}
           secrets: |
             github_token=${{ secrets.PLUGIN_REPO_TOKEN }}
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          # Cache strategy:
+          # 1. Primary: scope includes dependency hash - ensures fresh build when deps change
+          # 2. Fallback: scope without hash - faster builds for code-only changes
+          # Only write to the dependency-specific cache to prevent stale layer pollution
+          cache-from: |
+            type=gha,scope=${{ matrix.image }}-deps-${{ hashFiles('nhp/go.mod', 'nhp/go.sum', 'endpoints/go.mod', 'endpoints/go.sum', 'examples/server_plugin/go.mod', 'examples/server_plugin/go.sum') }}
+            type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-deps-${{ hashFiles('nhp/go.mod', 'nhp/go.sum', 'endpoints/go.mod', 'endpoints/go.sum', 'examples/server_plugin/go.mod', 'examples/server_plugin/go.sum') }}
 
       - name: Set image name for scanning
         if: needs.changes.outputs.code == 'true'
