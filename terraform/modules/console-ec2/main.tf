@@ -429,13 +429,16 @@ resource "aws_autoscaling_group" "console" {
   health_check_type         = "EC2"
   health_check_grace_period = 300
 
-  # Internal mode: single HTTP target group; External mode: HTTPS + HTTP
-  target_group_arns = var.internal_only ? [
-    aws_lb_target_group.internal[0].arn
-    ] : [
-    aws_lb_target_group.https[0].arn,
-    aws_lb_target_group.http[0].arn
-  ]
+  # Target groups: internal or external mode, plus protected if NHP enabled
+  # NOTE: Must include protected target group here, not via aws_autoscaling_attachment,
+  # because target_group_arns is declarative and would override any separate attachments.
+  target_group_arns = concat(
+    var.internal_only ? [aws_lb_target_group.internal[0].arn] : [
+      aws_lb_target_group.https[0].arn,
+      aws_lb_target_group.http[0].arn
+    ],
+    var.enable_nhp_protection ? [aws_lb_target_group.protected[0].arn] : []
+  )
 
   instance_refresh {
     strategy = "Rolling"
@@ -689,13 +692,10 @@ resource "aws_lb_listener" "protected" {
   tags = var.tags
 }
 
-# Attach ASG to protected target group when NHP protection is enabled
-resource "aws_autoscaling_attachment" "protected" {
-  count = var.enable_nhp_protection ? 1 : 0
-
-  autoscaling_group_name = aws_autoscaling_group.console.name
-  lb_target_group_arn    = aws_lb_target_group.protected[0].arn
-}
+# NOTE: Protected target group attachment is now included directly in
+# aws_autoscaling_group.console.target_group_arns above. Using a separate
+# aws_autoscaling_attachment would conflict with the declarative target_group_arns,
+# causing the attachment to be removed on subsequent applies.
 
 # Route 53 record for protected domain (e.g., console2.apps.layerv.xyz)
 resource "aws_route53_record" "protected" {

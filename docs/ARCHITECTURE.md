@@ -1031,6 +1031,28 @@ curl -v https://console2.apps.layerv.xyz/
 # 200 OK
 ```
 
+**Troubleshooting: Console2 redirect times out after successful knock:**
+
+If NHP knock succeeds (Server logs show `handleHttpOpenResource succeed`) but redirect to
+`console2.apps.layerv.xyz` times out, check if the protected NLB has targets:
+
+```bash
+# Check protected NLB target group health
+aws elbv2 describe-target-health --target-group-arn \
+  $(aws elbv2 describe-target-groups --query "TargetGroups[?contains(TargetGroupName,'con-prot')].TargetGroupArn" --output text)
+# If empty: ASG not attached to protected target group
+
+# Verify ASG target groups include protected
+aws autoscaling describe-auto-scaling-groups \
+  --query "AutoScalingGroups[?contains(AutoScalingGroupName,'console')].TargetGroupARNs"
+# Should include both 'con-int' (internal) AND 'con-prot' (protected)
+```
+
+Root cause: The ASG's `target_group_arns` is declarative. If the protected target group is
+managed via a separate `aws_autoscaling_attachment` instead of being included in `target_group_arns`,
+it will be removed on subsequent Terraform applies. The fix is to include it in `target_group_arns`
+using `concat()` when `enable_nhp_protection=true`.
+
 **Environment Variables (web/.env.production):**
 
 | Variable | Old Console | New Console | Description |
