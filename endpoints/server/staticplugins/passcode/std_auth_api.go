@@ -138,8 +138,8 @@ func std_auth(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Resour
 		resp.NHPRefreshToken = refreshToken
 		resp.NHPToken = nhpToken
 
-		ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, false)
-		ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, false)
+		ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
+		ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
 		ctx.SetSameSite(http.SameSiteNoneMode)
 
 		log.Info("ackMsg.ResourceHost: %+v", ackMsg.ResourceHost)

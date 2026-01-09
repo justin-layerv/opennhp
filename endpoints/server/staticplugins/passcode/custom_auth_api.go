@@ -103,8 +103,8 @@ func customAuthByHmac(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 		log.Error("RedirectUrl is not provided.")
 	}
 
-	ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, false)
-	ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, false)
+	ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
+	ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
 	ctx.SetSameSite(http.SameSiteNoneMode)
 
 	log.Info("ackMsg.ResourceHost: %+v", ackMsg.ResourceHost)
@@ -221,8 +221,8 @@ func customAuthByCode(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 			log.Error("RedirectUrl is not provided.")
 		}
 
-		ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, false)
-		ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, false)
+		ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
+		ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
 		ctx.SetSameSite(http.SameSiteNoneMode)
 
 		log.Info("ackMsg.ResourceHost: %+v", ackMsg.ResourceHost)

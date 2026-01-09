@@ -80,7 +80,6 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		ctx.String(http.StatusOK, "{\"errMsg\": \"resource error: %v\"}", err)
 		return
 	}
-	// ctx.SetCookie("res_id", resId, 86400, "/", res.CookieDomain, true, false)
 	ctx.SetSameSite(http.SameSiteNoneMode)
 	nhpplugins.CorsMiddleware(ctx)
 
@@ -373,8 +372,8 @@ func refreshToken(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Re
 			log.Info("token: %s", nhpToken)
 
 			ctx.SetSameSite(http.SameSiteNoneMode)
-			ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, false)
-			ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, false)
+			ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
+			ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
 			ackMsg.ErrMsg = ""
 			// assign the redirect url to the ackMsg
 			if len(res.RedirectUrl) == 0 {
@@ -384,8 +383,8 @@ func refreshToken(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Re
 			}
 		} else {
 			ctx.SetSameSite(http.SameSiteNoneMode)
-			ctx.SetCookie("nhp_token", nhpToken, 0, "/", res.CookieDomain, true, false)
-			ctx.SetCookie("nhp_refresh_token", refreshToken, 0, "/", res.CookieDomain, true, false)
+			ctx.SetCookie("nhp_token", nhpToken, 0, "/", res.CookieDomain, true, true)
+			ctx.SetCookie("nhp_refresh_token", refreshToken, 0, "/", res.CookieDomain, true, true)
 			log.Error("knock failed. ackMsg is nil")
 			ackMsg = &common.ServerKnockAckMsg{}
 			ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
@@ -457,8 +456,8 @@ func knockByToken(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Re
 			log.Info("token: %s", nhpToken)
 
 			ctx.SetSameSite(http.SameSiteNoneMode)
-			ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, false)
-			ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, false)
+			ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
+			ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
 
 			ackMsg.ErrMsg = ""
 
@@ -479,8 +478,8 @@ func knockByToken(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Re
 			return ackMsg, nil
 		} else {
 			ctx.SetSameSite(http.SameSiteNoneMode)
-			ctx.SetCookie("nhp_token", nhpToken, 0, "/", res.CookieDomain, true, false)
-			ctx.SetCookie("nhp_refresh_token", refreshToken, 0, "/", res.CookieDomain, true, false)
+			ctx.SetCookie("nhp_token", nhpToken, 0, "/", res.CookieDomain, true, true)
+			ctx.SetCookie("nhp_refresh_token", refreshToken, 0, "/", res.CookieDomain, true, true)
 
 			log.Error("knock failed. ackMsg is nil")
 			ackMsg = &common.ServerKnockAckMsg{}
@@ -619,8 +618,8 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		}
 
 		ctx.SetSameSite(http.SameSiteNoneMode)
-		ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, false)
-		ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, false)
+		ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
+		ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
 
 		resp.CookieDomain = res.CookieDomain
 		resp.ResourceHost = ackMsg.ResourceHost
@@ -724,8 +723,8 @@ func authAccessFromRaaS(ctx *gin.Context, req *common.HttpKnockRequest, res *com
 		}
 
 		ctx.SetSameSite(http.SameSiteNoneMode)
-		ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, false)
-		ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, false)
+		ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
+		ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
 
 		resp.CookieDomain = res.CookieDomain
 		resp.ResourceHost = ackMsg.ResourceHost

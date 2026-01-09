@@ -312,8 +312,8 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		ctx.JSON(http.StatusOK, resp)
 	} else {
 		ctx.SetSameSite(http.SameSiteNoneMode)
-		ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, false)
-		ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, false)
+		ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
+		ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
 		ctx.Redirect(http.StatusFound, resp.RedirectUrl)
 	}
 	return ackMsg, nil
