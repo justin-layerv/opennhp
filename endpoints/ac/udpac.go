@@ -615,18 +615,22 @@ func (a *UdpAC) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sync.W
 
 		// If address changed, close old connection and reset fail count
 		if lastAddrStr != "" && lastAddrStr != addrStr {
-			log.Info("Server address changed from %s to %s, resetting connection", lastAddrStr, addrStr)
+			log.Info("ac(%s)[ServerDiscovery] Server DNS changed: %s -> %s (hostname: %s). Resetting connection state.",
+				acId, lastAddrStr, addrStr, server.Hostname)
 			var oldConn *UdpConn
 			a.remoteConnectionMutex.Lock()
 			if conn, found := a.remoteConnectionMap[lastAddrStr]; found {
 				oldConn = conn
 				delete(a.remoteConnectionMap, lastAddrStr)
+				log.Debug("ac(%s)[ServerDiscovery] Removed old connection entry for %s", acId, lastAddrStr)
 			}
 			a.remoteConnectionMutex.Unlock()
 			// Close outside lock to avoid blocking other operations, but synchronously
 			// to ensure cleanup completes before we proceed
 			if oldConn != nil {
 				oldConn.Close()
+				log.Info("ac(%s)[ServerDiscovery] Closed old connection to %s, will establish new connection to %s",
+					acId, lastAddrStr, addrStr)
 			}
 			failCount = 0
 			atomic.StoreInt32(serverFailCount, 0)
@@ -701,17 +705,32 @@ func (a *UdpAC) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sync.W
 						}
 
 						failCount += 1
+						attemptsUntilInvalidation := ServerDiscoveryRetryBeforeFail - (failCount % ServerDiscoveryRetryBeforeFail)
+						if attemptsUntilInvalidation == ServerDiscoveryRetryBeforeFail {
+							attemptsUntilInvalidation = 0 // We're at the threshold, invalidation happens now
+						}
+						log.Debug("ac(%s)[ServerDiscovery] connection to %s failed (attempt %d, %d more until DNS invalidation)",
+							acId, addrStr, failCount, attemptsUntilInvalidation)
+
 						if failCount%ServerDiscoveryRetryBeforeFail == 0 {
 							atomic.StoreInt32(serverFailCount, 1)
+							log.Warning("ac(%s)[ServerDiscovery] %d consecutive failures to %s, invalidating DNS cache",
+								acId, ServerDiscoveryRetryBeforeFail, addrStr)
+
 							// remove failed connection
 							a.remoteConnectionMutex.Lock()
 							conn = a.remoteConnectionMap[addrStr]
 							if conn != nil {
-								log.Info("server discovery failed, close local connection: %s", conn.ConnData.LocalAddr.String())
+								log.Debug("ac(%s)[ServerDiscovery] closing stale connection to %s (local: %s)",
+									acId, addrStr, conn.ConnData.LocalAddr.String())
 								delete(a.remoteConnectionMap, addrStr)
 								conn.Close()
 							}
 							a.remoteConnectionMutex.Unlock()
+
+							// Invalidate DNS cache to pick up potential IP changes (e.g., after server redeployment).
+							// This is rate-limited by ServerDiscoveryRetryBeforeFail (every 3 failures).
+							server.InvalidateDNSCache()
 						}
 						log.Error("ac(%s#%d)[ACOnline] reporting to server %s failed", acId, aolMd.TransactionId, addrStr)
 					}

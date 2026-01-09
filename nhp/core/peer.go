@@ -22,6 +22,7 @@ type Peer interface {
 	ResolvedIps() []string
 	Host() string
 	SendAddr() net.Addr
+	InvalidateDNSCache() // Force DNS re-resolution on next SendAddr() call
 	LastSendTime() int64
 	UpdateSend(currTime int64)
 
@@ -98,12 +99,25 @@ func (p *UdpPeer) ResolveHost() string {
 	defer p.Unlock()
 
 	currTime := time.Now().UnixNano()
-	if currTime-p.lastNSLookupTime > MinimalNSLookupInterval*int64(time.Second) {
+	timeSinceLastLookup := currTime - p.lastNSLookupTime
+	if timeSinceLastLookup > MinimalNSLookupInterval*int64(time.Second) {
+		oldIp := p.primaryResolvedIp
 		addrs, err := net.LookupHost(p.Hostname)
 		if err == nil {
 			p.lastNSLookupTime = currTime
 			p.resolvedIpArr = addrs
 			p.primaryResolvedIp = addrs[0]
+			if oldIp != "" && oldIp != p.primaryResolvedIp {
+				log.Info("[DNS] Hostname %s resolved to new IP: %s -> %s (after %ds)",
+					p.Hostname, oldIp, p.primaryResolvedIp, timeSinceLastLookup/int64(time.Second))
+			} else if oldIp == "" {
+				log.Debug("[DNS] Hostname %s initial resolution: %s", p.Hostname, p.primaryResolvedIp)
+			} else {
+				log.Debug("[DNS] Hostname %s re-resolved to same IP: %s", p.Hostname, p.primaryResolvedIp)
+			}
+		} else {
+			log.Error("[DNS] Failed to resolve hostname %s: %v (keeping cached IP: %s)",
+				p.Hostname, err, p.primaryResolvedIp)
 		}
 	}
 
@@ -135,6 +149,21 @@ func (p *UdpPeer) SendAddr() net.Addr {
 		IP:   ip,
 		Port: p.Port,
 	}
+}
+
+// InvalidateDNSCache forces DNS re-resolution on the next SendAddr() call.
+// Call this when connection failures occur to pick up DNS changes faster
+// than the normal MinimalNSLookupInterval (5 minutes).
+func (p *UdpPeer) InvalidateDNSCache() {
+	if len(p.Hostname) == 0 {
+		return // No hostname configured, nothing to invalidate
+	}
+	p.Lock()
+	defer p.Unlock()
+	oldCacheAge := time.Duration(time.Now().UnixNano()-p.lastNSLookupTime) * time.Nanosecond
+	p.lastNSLookupTime = 0
+	log.Debug("[DNS] Cache invalidated for %s (was %s old, cached IP: %s)",
+		p.Hostname, oldCacheAge.Round(time.Second), p.primaryResolvedIp)
 }
 
 func (p *UdpPeer) ResolvedIps() []string {
