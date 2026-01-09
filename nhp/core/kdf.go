@@ -10,9 +10,17 @@ type NoiseFactory struct {
 	HashType HashTypeEnum
 }
 
+// HMAC1 performs HMAC with a single input.
+// PANICS if NewHash fails - this indicates a programming error since HashType
+// is set from hardcoded values in the codebase. If this panic occurs, it means
+// the NoiseFactory was misconfigured, which is a bug that should be caught during development.
 func (n *NoiseFactory) HMAC1(dst *[HashSize]byte, key, in0 []byte) {
 	newHash := func() hash.Hash {
-		return NewHash(n.HashType)
+		h, err := NewHash(n.HashType)
+		if err != nil {
+			panic("NewHash failed: " + err.Error())
+		}
+		return h
 	}
 	mac := hmac.New(newHash, key)
 	mac.Write(in0)
@@ -20,9 +28,15 @@ func (n *NoiseFactory) HMAC1(dst *[HashSize]byte, key, in0 []byte) {
 	mac.Reset()
 }
 
+// HMAC2 performs HMAC with two inputs.
+// PANICS if NewHash fails - see HMAC1 for rationale.
 func (n *NoiseFactory) HMAC2(dst *[HashSize]byte, key, in0, in1 []byte) {
 	newHash := func() hash.Hash {
-		return NewHash(n.HashType)
+		h, err := NewHash(n.HashType)
+		if err != nil {
+			panic("NewHash failed: " + err.Error())
+		}
+		return h
 	}
 	mac := hmac.New(newHash, key)
 	mac.Write(in0)
@@ -57,12 +71,17 @@ func (n *NoiseFactory) MixKey(dst *[SymmetricKeySize]byte, key []byte, input []b
 	n.KeyGen1(dst, key, input)
 }
 
+// MixHash combines key and input into a hash output.
+// PANICS if NewHash fails - see HMAC1 for rationale.
 func (n *NoiseFactory) MixHash(dst *[HashSize]byte, key []byte, input []byte) {
-	hash := NewHash(n.HashType)
-	hash.Write(key)
-	hash.Write(input)
-	hash.Sum(dst[:0])
-	hash.Reset()
+	h, err := NewHash(n.HashType)
+	if err != nil {
+		panic("NewHash failed: " + err.Error())
+	}
+	h.Write(key)
+	h.Write(input)
+	h.Sum(dst[:0])
+	h.Reset()
 }
 
 func SetZero(arr []byte) {

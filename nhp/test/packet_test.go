@@ -30,7 +30,10 @@ func TestHMAC(t *testing.T) {
 	ciphers := core.NewCipherSuite()
 	serverEcdh := core.ECDHFromKey(ciphers.EccType, prk)
 
-	hmacHash := core.NewHash(ciphers.HashType)
+	hmacHash, err := core.NewHash(ciphers.HashType)
+	if err != nil {
+		t.Fatalf("NewHash failed: %v", err)
+	}
 	hmacHash.Write([]byte(core.InitialHashString))
 	hmacHash.Write(serverEcdh.PublicKey())
 	hmacHash.Write(buf[0 : header.Size()-core.HashSize])

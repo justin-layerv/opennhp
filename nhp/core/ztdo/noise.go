@@ -263,7 +263,10 @@ func (sa *SymmetricAgreement) AgreeSymmetricKey() (gcmKey [core.SymmetricKeySize
 	ck := [core.SymmetricKeySize]byte{}
 
 	// adHash hashes all the invloved public key, the final value will be used as associated data for AEAD authentication
-	adHash := core.NewHash(sa.eccMode.ToHashType())
+	adHash, err := core.NewHash(sa.eccMode.ToHashType())
+	if err != nil {
+		panic("NewHash failed: " + err.Error())
+	}
 
 	if sa.isPskUsed {
 		adHash.Write(sa.psk)

@@ -90,7 +90,10 @@ func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err
 		len(md.PeerPk), md.CipherScheme, md.HeaderType)
 	if md.PrevParserData != nil {
 		// continue from previous received packet to form one transaction
-		mad = md.PrevParserData.deriveMsgAssemblerData(md.HeaderType, md.Compress, md.Message)
+		mad, err = md.PrevParserData.deriveMsgAssemblerData(md.HeaderType, md.Compress, md.Message)
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		mad = &MsgAssemblerData{}
 		mad.device = d
@@ -129,7 +132,10 @@ func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err
 		mad.header.SetCounter(mad.TransactionId)
 
 		// init chain hash -> ChainHash0
-		mad.chainHash = NewHash(mad.ciphers.HashType)
+		mad.chainHash, err = NewHash(mad.ciphers.HashType)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create chain hash: %w", err)
+		}
 		mad.chainHash.Write([]byte(InitialHashString))
 
 		// init chain key -> ChainKey0
@@ -144,7 +150,10 @@ func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err
 	mad.ResponseMsgCh = md.ResponseMsgCh
 
 	// init hmac hash -> HmacHash0
-	mad.hmacHash = NewHash(mad.ciphers.HashType)
+	mad.hmacHash, err = NewHash(mad.ciphers.HashType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create hmac hash: %w", err)
+	}
 	mad.hmacHash.Write([]byte(InitialHashString))
 
 	// create ephermeral key
@@ -155,7 +164,7 @@ func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err
 	return mad, nil
 }
 
-func (mad *MsgAssemblerData) derivePacketParserData(pkt *Packet, initTime int64) (ppd *PacketParserData) {
+func (mad *MsgAssemblerData) derivePacketParserData(pkt *Packet, initTime int64) (ppd *PacketParserData, err error) {
 	ppd = &PacketParserData{}
 	ppd.device = mad.device
 	ppd.basePacket = pkt
@@ -171,14 +180,17 @@ func (mad *MsgAssemblerData) derivePacketParserData(pkt *Packet, initTime int64)
 	ppd.deviceEcdh = ppd.device.GetEcdhByCipherScheme(ppd.CipherScheme)
 
 	// init chain hash -> ChainHash0
-	ppd.chainHash = NewHash(ppd.Ciphers.HashType)
+	ppd.chainHash, err = NewHash(ppd.Ciphers.HashType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create chain hash: %w", err)
+	}
 	ppd.chainHash.Write([]byte(InitialHashString))
 
 	// continue with initiator's chain key -> ChainKey4
 	ppd.noise.HashType = mad.ciphers.HashType
 	copy(ppd.chainKey[:], mad.chainKey[:])
 
-	return ppd
+	return ppd, nil
 }
 
 func (d *Device) createKeepalivePacket(md *MsgData) (mad *MsgAssemblerData, err error) {
@@ -259,7 +271,10 @@ func (mad *MsgAssemblerData) setPeerPublicKey(peerPk []byte) (err error) {
 	SetZero(ess[:])
 
 	// encrypt initiator's public key and evolve chainhash with the ciphertext
-	aead := AeadFromKey(mad.ciphers.GcmType, &key)
+	aead, err := AeadFromKey(mad.ciphers.GcmType, &key)
+	if err != nil {
+		return fmt.Errorf("failed to create AEAD for static encryption: %w", err)
+	}
 	static := aead.Seal(mad.header.StaticBytes()[:0], mad.header.NonceBytes(), mad.deviceEcdh.PublicKey(), mad.chainHash.Sum(nil))
 
 	//log.Debug("encrypted pubkey: %v, output: %v", mad.deviceEcdh.PublicKey(), static)
@@ -281,7 +296,10 @@ func (mad *MsgAssemblerData) setPeerPublicKey(peerPk []byte) (err error) {
 
 	var tsBytes [TimestampSize]byte
 	binary.BigEndian.PutUint64(tsBytes[:], uint64(mad.LocalInitTime))
-	aead = AeadFromKey(mad.ciphers.GcmType, &key)
+	aead, err = AeadFromKey(mad.ciphers.GcmType, &key)
+	if err != nil {
+		return fmt.Errorf("failed to create AEAD for timestamp encryption: %w", err)
+	}
 	ts := aead.Seal(mad.header.TimestampBytes()[:0], mad.header.NonceBytes(), tsBytes[:], mad.chainHash.Sum(nil))
 
 	// evolve chainhash ChainHash2 -> ChainHash3
@@ -289,9 +307,12 @@ func (mad *MsgAssemblerData) setPeerPublicKey(peerPk []byte) (err error) {
 
 	// generate gcm key for body encryption ChainKey3 -> ChainKey4 (ChainKey7 -> ChainKey8)
 	mad.noise.KeyGen2(&mad.chainKey, &key, mad.chainKey[:], ts[:])
-	mad.bodyAead = AeadFromKey(mad.ciphers.GcmType, &key)
+	mad.bodyAead, err = AeadFromKey(mad.ciphers.GcmType, &key)
+	if err != nil {
+		return fmt.Errorf("failed to create AEAD for body encryption: %w", err)
+	}
 
-	return err
+	return nil
 }
 
 func (mad *MsgAssemblerData) encryptBody() (err error) {

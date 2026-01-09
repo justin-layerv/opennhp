@@ -54,16 +54,15 @@ func NewCipherSuite() (ciphers *CipherSuite) {
 	}
 }
 
-func NewHash(t HashTypeEnum) (h hash.Hash) {
+func NewHash(t HashTypeEnum) (hash.Hash, error) {
 	switch t {
 	case HASH_BLAKE2S:
-		h, _ = blake2s.New256(nil)
-
+		return blake2s.New256(nil)
 	case HASH_SHA256:
-		h = sha256.New()
+		return sha256.New(), nil
+	default:
+		return nil, fmt.Errorf("unsupported hash type: %d", t)
 	}
-
-	return h
 }
 
 type Ecdh interface {
@@ -101,17 +100,19 @@ func NewECDH(t EccTypeEnum) (e Ecdh) {
 	return e
 }
 
-func AeadFromKey(t GcmTypeEnum, key *[SymmetricKeySize]byte) (aead cipher.AEAD) {
+func AeadFromKey(t GcmTypeEnum, key *[SymmetricKeySize]byte) (cipher.AEAD, error) {
 	switch t {
 	case GCM_AES256:
-		aesBlock, _ := aes.NewCipher(key[:])
-		aead, _ = cipher.NewGCM(aesBlock)
-
+		aesBlock, err := aes.NewCipher(key[:])
+		if err != nil {
+			return nil, fmt.Errorf("failed to create AES cipher: %w", err)
+		}
+		return cipher.NewGCM(aesBlock)
 	case GCM_CHACHA20POLY1305:
-		aead, _ = chacha20poly1305.New(key[:])
+		return chacha20poly1305.New(key[:])
+	default:
+		return nil, fmt.Errorf("unsupported GCM type: %d", t)
 	}
-
-	return aead
 }
 
 func CBCEncryption(t GcmTypeEnum, key *[SymmetricKeySize]byte, plaintext []byte, inPlace bool) ([]byte, error) {

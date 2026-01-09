@@ -70,8 +70,14 @@ func TestECCSharedKey(t *testing.T) {
 		hashs.Write(ssc[:])
 		hasheds := hashs.Sum(nil)
 
-		aeadc := core.AeadFromKey(core.GCM_AES256, &sscKey)
-		aeads := core.AeadFromKey(core.GCM_AES256, &sssKey)
+		aeadc, err := core.AeadFromKey(core.GCM_AES256, &sscKey)
+		if err != nil {
+			t.Fatalf("AeadFromKey failed: %v", err)
+		}
+		aeads, err := core.AeadFromKey(core.GCM_AES256, &sssKey)
+		if err != nil {
+			t.Fatalf("AeadFromKey failed: %v", err)
+		}
 
 		var nonceBytes [12]byte
 		aeadCount++
