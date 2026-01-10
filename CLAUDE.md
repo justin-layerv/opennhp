@@ -4,6 +4,42 @@
 
 > **NEVER push directly to `main` branch.** All changes MUST go through a Pull Request, no exceptions. This applies even for "quick fixes" or "urgent" changes. Create a branch, open a PR, and let CI run.
 
+## Code Change Workflow
+
+Follow this process for all code changes:
+
+1. **Switch to main and fetch latest**
+   ```bash
+   git checkout main && git pull origin main
+   ```
+
+2. **Create branch for code change**
+   ```bash
+   git checkout -b <type>/<short-description>
+   ```
+
+3. **Make code changes** - Think deeply about the implementation. Consider edge cases, error handling, and maintainability.
+
+4. **Consider documentation updates** - If the change affects behavior, APIs, or configuration, update relevant docs.
+
+5. **Create a PR**
+   ```bash
+   git push -u origin <branch>
+   gh pr create --title "<type>(scope): description" --body "..."
+   ```
+
+6. **Wait for code review feedback** - CI runs automatically. Review comments will be posted on the PR.
+
+7. **Address review feedback** - Think critically about each suggestion:
+   - Fix what makes sense
+   - For deferred items, create a GitHub issue to track
+
+8. **Update the PR** - Push fixes, update PR description if needed.
+
+9. **Repeat steps 6-8** until feedback requires no further action.
+
+---
+
 Quick reference for the LayerV NHP (Network Hiding Protocol) infrastructure project.
 
 > **Note:** This is a fork of [OpenNHP](https://github.com/OpenNHP/opennhp). See `docs/UPSTREAM_SYNC.md` for the upstream synchronization process.
