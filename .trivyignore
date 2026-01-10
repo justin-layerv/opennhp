@@ -12,6 +12,10 @@ CVE-2025-9086
 # gpgv - low priority
 CVE-2022-3219
 
+# gnupg/gpg - waiting for Ubuntu patches (HIGH severity)
+# https://avd.aquasec.com/nvd/cve-2025-68973
+CVE-2025-68973
+
 # libgcrypt20 - waiting for Ubuntu patches
 CVE-2024-2236
 
