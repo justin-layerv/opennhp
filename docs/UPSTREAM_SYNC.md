@@ -114,26 +114,52 @@ Run this process monthly (or immediately for security fixes).
 > Manual setup: `git remote add upstream https://github.com/OpenNHP/opennhp.git`
 
 ```bash
-# 1. Check for new commits (use the helper script)
+# 1. Check for new commits
 ./scripts/check-upstream.sh
 
-# 2. Quick triage
+# 2. Triage (use Decision Matrix above)
 # - Security? → Sync now
 # - Matches auto-skip? → Ignore
 # - Other? → Quick evaluate
 
-# 3. If syncing, cherry-pick with -x flag
+# 3. Create branch and sync
 git checkout -b sync/upstream-<desc>
 git cherry-pick -x <sha>  # -x adds "(cherry picked from commit ...)"
 
-# 4. Update this file
-# - Change "Last reviewed upstream SHA" to new HEAD
-# - Add sync history entry
-# - Log any non-obvious skip decisions
+# 4. Test before committing
+cd nhp && go build ./... && go test ./...
+cd ../endpoints && go build ./...
 
 # 5. Create PR
 gh pr create --title "chore: sync upstream <category>"
+
+# 6. After PR merges, update this file (see below)
 ```
+
+### When Cherry-Pick Fails
+
+If cherry-pick fails due to fork differences (e.g., GMSM removal):
+
+1. **Adapt manually** - apply the changes by hand
+2. **Document in commit message** - note it was "adapted from" not "cherry-picked from"
+3. **Explain why** - mention what couldn't be cherry-picked (e.g., "GMSM references")
+
+Example commit message:
+```
+chore: sync upstream PKCS7 tests
+
+Adapted from upstream commit 95d5e228. Manual adaptation required
+because original commit references GMSM which was removed from fork.
+```
+
+### Updating This File
+
+**When to update:**
+- Add sync history entry: after PR is created (use actual PR number)
+- Update baseline SHA: only after ALL sync PRs from a batch are merged
+- Update Pending Review: mark items DONE with PR number
+
+**Avoiding conflicts:** If multiple sync PRs are open, only the LAST one should update this file. Or update in a separate `docs/sync-bookkeeping` PR after all syncs merge.
 
 ---
 
