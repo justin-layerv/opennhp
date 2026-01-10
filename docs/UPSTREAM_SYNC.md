@@ -126,9 +126,10 @@ Run this process monthly (or immediately for security fixes).
 git checkout -b sync/upstream-<desc>
 git cherry-pick -x <sha>  # -x adds "(cherry picked from commit ...)"
 
-# 4. Test before committing
-cd nhp && go build ./... && go test ./...
-cd ../endpoints && go build ./...
+# 4. Test before committing (subshells preserve working directory)
+(cd nhp && go build ./... && go test ./...) || exit 1
+(cd endpoints && go build ./... && go test ./...) || exit 1
+(cd examples/server_plugin && go build ./...) || exit 1
 
 # 5. Create PR
 gh pr create --title "chore: sync upstream <category>"
