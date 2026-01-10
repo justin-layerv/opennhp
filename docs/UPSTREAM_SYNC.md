@@ -51,6 +51,15 @@ These are PERMANENTLY skipped. Don't waste time reviewing them:
 
 ## Sync History
 
+### 2026-01-09 - Shared Constants & PKCS7 Tests
+
+- **PRs created:** #106, #107
+- **Commits synced:**
+  - `9d1b7711` - extract shared constants to common package
+  - `95d5e228` - PKCS7 padding consolidation (adapted, not cherry-picked due to GMSM refs)
+- **Commits skipped:**
+  - `ecdsa_test.go` - GMSM-specific (SM2), not applicable to fork
+
 ### 2026-01-09 - Security, IPv6, Crypto Error Handling
 
 - **Reviewed up to:** bd6b7538
@@ -78,10 +87,10 @@ Items identified during 2026-01-09 audit that need future attention:
 
 | SHA | Title | Priority | Notes |
 |-----|-------|----------|-------|
-| c05a0ded | Enable gosec linter | HIGH | Need to add `.golangci.yml` first |
-| 42f39409 | Loop variable capture fix | HIGH | Part of lint PR |
-| 9d1b7711 | Shared constants | MEDIUM | `nhp/common/constants.go` |
-| 95d5e228 | PKCS7 consolidation | LOW | May conflict with fork changes |
+| c05a0ded | Enable gosec linter | DONE | PR #103 |
+| 42f39409 | Loop variable capture fix | DONE | PR #103 |
+| 9d1b7711 | Shared constants | DONE | PR #106 |
+| 95d5e228 | PKCS7 consolidation | DONE | PR #107 (adapted) |
 
 ---
 
