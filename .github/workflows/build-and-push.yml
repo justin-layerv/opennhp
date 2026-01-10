@@ -255,6 +255,7 @@ jobs:
           fi
 
       - name: Scan image
+        id: trivy
         if: needs.changes.outputs.code == 'true'
         # renovate: datasource=github-releases depName=aquasecurity/trivy-action
         uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
@@ -268,6 +269,36 @@ jobs:
           # Required: SARIF includes all severities by default, causing exit-code
           # to trigger on LOW findings. This limits SARIF to match severity filter.
           limit-severities-for-sarif: 'true'
+
+      - name: Show scan failures
+        if: failure() && steps.trivy.outcome == 'failure'
+        run: |
+          echo "::error::Trivy found HIGH/CRITICAL vulnerabilities not in .trivyignore"
+          echo ""
+          SARIF="${{ matrix.image }}-trivy-results.sarif"
+          if [[ ! -f "$SARIF" ]]; then
+            echo "SARIF file not found"
+            exit 0
+          fi
+
+          # Count vulnerabilities by severity
+          HIGH_COUNT=$(jq -r '[.runs[0].tool.driver.rules[]? | select(.properties.tags[-1]? == "HIGH")] | length' "$SARIF" 2>/dev/null || echo 0)
+          CRIT_COUNT=$(jq -r '[.runs[0].tool.driver.rules[]? | select(.properties.tags[-1]? == "CRITICAL")] | length' "$SARIF" 2>/dev/null || echo 0)
+          echo "=== Summary: ${CRIT_COUNT} CRITICAL, ${HIGH_COUNT} HIGH ==="
+          echo ""
+
+          echo "=== Vulnerabilities Found ==="
+          # Extract CVE details: id, severity, package (from help.text), description, and link
+          jq -r '.runs[0].tool.driver.rules[]? |
+            "• \(.id // "unknown") [\(.properties.tags[-1]? // "?")] (\((.help.text? | capture("Package: (?<pkg>[^\\n]+)").pkg) // "unknown"))
+              \(.shortDescription.text? // "No description")
+              \(.helpUri? // "")"' "$SARIF" 2>/dev/null || echo "Could not parse SARIF"
+          echo ""
+          echo "=== To Fix ==="
+          echo "Add unpatched CVEs to .trivyignore with a comment:"
+          echo "  # package - severity, waiting for patch"
+          echo "  # https://avd.aquasec.com/nvd/CVE-XXXX-XXXXX"
+          echo "  CVE-XXXX-XXXXX"
 
       - name: Upload scan results
         uses: actions/upload-artifact@v6
