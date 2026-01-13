@@ -163,3 +163,63 @@ output "console_ec2_public_url" {
   description = "Console EC2 public URL (for frontend builds)"
   value       = var.deploy_console_ec2 && var.deploy_rds ? module.console_ec2[0].public_url : null
 }
+
+# ============================================================================
+# Phase 1: Pluggable Storage Backend Outputs (DynamoDB for cloud, etcd remains for on-prem)
+# DynamoDB and keypair infrastructure for per-AC assignment architecture
+# See docs/design/PLUGGABLE_STORAGE_BACKEND.md for full design.
+# ============================================================================
+
+# DynamoDB Tables - Names
+output "dynamodb_licenses_table_name" {
+  description = "DynamoDB table name for licenses"
+  value       = module.dynamodb.licenses_table_name
+}
+
+output "dynamodb_ac_assignments_table_name" {
+  description = "DynamoDB table name for AC assignments"
+  value       = module.dynamodb.ac_assignments_table_name
+}
+
+output "dynamodb_resources_table_name" {
+  description = "DynamoDB table name for resources"
+  value       = module.dynamodb.resources_table_name
+}
+
+# DynamoDB Tables - ARNs (for cross-stack references, monitoring, backups)
+output "dynamodb_licenses_table_arn" {
+  description = "DynamoDB table ARN for licenses"
+  value       = module.dynamodb.licenses_table_arn
+}
+
+output "dynamodb_ac_assignments_table_arn" {
+  description = "DynamoDB table ARN for AC assignments"
+  value       = module.dynamodb.ac_assignments_table_arn
+}
+
+output "dynamodb_resources_table_arn" {
+  description = "DynamoDB table ARN for resources"
+  value       = module.dynamodb.resources_table_arn
+}
+
+# DynamoDB IAM Policies
+output "dynamodb_read_policy_arn" {
+  description = "IAM policy ARN for DynamoDB read access (for NHP Server)"
+  value       = module.dynamodb.read_policy_arn
+}
+
+output "dynamodb_write_policy_arn" {
+  description = "IAM policy ARN for DynamoDB write access (for Console)"
+  value       = module.dynamodb.write_policy_arn
+}
+
+# NHP Keypair
+output "nhp_registration_public_key" {
+  description = "NHP registration public key (for AC config)"
+  value       = module.nhp_keypair.registration_public_key
+}
+
+output "nhp_keypair_policy_arn" {
+  description = "IAM policy ARN for NHP keypair access"
+  value       = module.nhp_keypair.server_keypair_policy_arn
+}

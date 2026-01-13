@@ -240,6 +240,22 @@ resource "aws_iam_role_policy_attachment" "server_ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+# Phase 1: DynamoDB read access for per-AC assignment architecture
+# Uses boolean variable because Terraform cannot evaluate count based on module outputs at plan time
+# See docs/design/PLUGGABLE_STORAGE_BACKEND.md
+resource "aws_iam_role_policy_attachment" "server_dynamodb" {
+  count      = var.attach_phase1_policies ? 1 : 0
+  role       = aws_iam_role.server.name
+  policy_arn = var.dynamodb_read_policy_arn
+}
+
+# Phase 1: SSM keypair access for Noise K server-to-server forwarding
+resource "aws_iam_role_policy_attachment" "server_keypair" {
+  count      = var.attach_phase1_policies ? 1 : 0
+  role       = aws_iam_role.server.name
+  policy_arn = var.keypair_policy_arn
+}
+
 # Note: Plugins are now baked into the Docker image - no S3 IAM policy needed
 
 resource "aws_iam_role_policy" "server" {

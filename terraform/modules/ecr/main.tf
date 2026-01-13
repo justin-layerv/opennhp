@@ -707,6 +707,15 @@ resource "aws_iam_policy" "terraform_read" {
         Resource = "*"
       },
       {
+        Sid    = "DynamoDBRead"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:Describe*",
+          "dynamodb:List*"
+        ]
+        Resource = "*"
+      },
+      {
         Sid    = "ChatbotRead"
         Effect = "Allow"
         Action = [

@@ -173,6 +173,36 @@ module "data" {
   terraform_state_bucket = var.terraform_state_bucket
 }
 
+# ============================================================================
+# Phase 1: etcd Elimination Infrastructure
+# These modules support the new per-AC server assignment architecture.
+# See docs/design/PLUGGABLE_STORAGE_BACKEND.md for full design.
+# ============================================================================
+
+# DynamoDB Module - Per-AC assignment storage (replaces etcd for cloud)
+module "dynamodb" {
+  source = "./modules/dynamodb"
+
+  environment = var.environment
+  name_prefix = local.name_prefix
+  tags        = local.common_tags
+
+  # KMS encryption
+  kms_key_arn = module.kms.secrets_key_arn
+}
+
+# NHP Keypair Module - Registration keypair for AC initial connection
+module "nhp_keypair" {
+  source = "./modules/nhp-keypair"
+
+  environment = var.environment
+  name_prefix = local.name_prefix
+  tags        = local.common_tags
+
+  # KMS encryption for SSM SecureString
+  kms_key_arn = module.kms.secrets_key_arn
+}
+
 # Compute Module - ASG, NLB, Launch Template
 module "compute" {
   source = "./modules/compute"
@@ -216,6 +246,13 @@ module "compute" {
   # Plugin configuration (plugins baked into Docker image, just need names for etcd seeding)
   server_plugins  = var.server_plugins
   auth_service_id = var.ac_auth_service_id
+
+  # Phase 1: Pluggable storage backend - DynamoDB (cloud default) with etcd feature flag for on-prem
+  # These enable the new per-AC assignment architecture
+  # Note: attach_phase1_policies is required because Terraform cannot evaluate count based on module outputs
+  attach_phase1_policies   = true
+  dynamodb_read_policy_arn = module.dynamodb.read_policy_arn
+  keypair_policy_arn       = module.nhp_keypair.server_keypair_policy_arn
 }
 
 # Monitoring Module - CloudWatch Dashboard, Alarms, Slack Notifications

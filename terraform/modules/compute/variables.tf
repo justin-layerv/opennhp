@@ -184,3 +184,27 @@ variable "auth_service_id" {
   type        = string
   default     = ""
 }
+
+# ============================================================================
+# Phase 1: Pluggable Storage Backend - DynamoDB and SSM Keypair Access
+# These policies enable the new per-AC assignment architecture.
+# See docs/design/PLUGGABLE_STORAGE_BACKEND.md for full architecture.
+# ============================================================================
+
+variable "attach_phase1_policies" {
+  description = "Whether to attach Phase 1 storage backend policies (DynamoDB + keypair). Must be true when dynamodb_read_policy_arn and keypair_policy_arn are provided. This boolean is required because Terraform cannot evaluate count based on module outputs at plan time."
+  type        = bool
+  default     = false
+}
+
+variable "dynamodb_read_policy_arn" {
+  description = "IAM policy ARN for DynamoDB read access (from dynamodb module). Required when attach_phase1_policies is true."
+  type        = string
+  default     = null
+}
+
+variable "keypair_policy_arn" {
+  description = "IAM policy ARN for SSM keypair access (from nhp-keypair module). Required when attach_phase1_policies is true."
+  type        = string
+  default     = null
+}
