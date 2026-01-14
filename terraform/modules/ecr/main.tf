@@ -1087,6 +1087,25 @@ resource "aws_iam_policy" "terraform_apply_data" {
         Resource = "arn:aws:dynamodb:${local.region}:${local.account_id}:table/layerv-nhp-*"
       },
       {
+        # KMS permissions for DynamoDB/RDS encryption with customer-managed keys
+        # CreateGrant is required when creating DynamoDB tables with CMK encryption
+        Sid    = "KMSForEncryption"
+        Effect = "Allow"
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey",
+          "kms:CreateGrant"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "kms:CallerAccount" = local.account_id
+          }
+        }
+      },
+      {
         Sid    = "SSMACMLambda"
         Effect = "Allow"
         Action = [

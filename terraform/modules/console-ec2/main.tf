@@ -103,7 +103,7 @@ resource "aws_iam_role_policy" "console" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       # CloudWatch Logs
       {
         Effect = "Allow"
@@ -130,83 +130,84 @@ resource "aws_iam_role_policy" "console" {
           "secretsmanager:DescribeSecret"
         ]
         Resource = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}-console-ac-*"
-      },
-      # KMS for secrets encryption/decryption
-      {
+      }],
+      # KMS for secrets encryption/decryption (only include when KMS key ARN is provided)
+      var.secrets_kms_key_arn != null ? [{
         Effect   = "Allow"
         Action   = ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"]
-        Resource = var.secrets_kms_key_arn != null ? [var.secrets_kms_key_arn] : []
-      },
-      # ECR - pull console image (and AC image when NHP protection enabled)
-      {
-        Effect   = "Allow"
-        Action   = ["ecr:GetAuthorizationToken"]
-        Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "ecr:BatchCheckLayerAvailability",
-          "ecr:GetDownloadUrlForLayer",
-          "ecr:BatchGetImage"
-        ]
-        Resource = compact([var.ecr_repo_arn, var.nhp_ac_ecr_repo_arn])
-      },
-      # NHP Server Assignment: DynamoDB access for AC assignments
-      {
-        Effect = "Allow"
-        Action = [
-          "dynamodb:GetItem",
-          "dynamodb:PutItem",
-          "dynamodb:UpdateItem",
-          "dynamodb:DeleteItem",
-          "dynamodb:Query",
-          "dynamodb:Scan",
-          "dynamodb:BatchGetItem",
-          "dynamodb:BatchWriteItem"
-        ]
-        # Use wildcards to support environment-specific table names
-        Resource = compact([
-          var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}" : "",
-          var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}/index/*" : "",
-          var.nhp_dynamodb_server_ac_index_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_server_ac_index_table}" : "",
-          var.nhp_dynamodb_server_ac_index_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_server_ac_index_table}/index/*" : ""
-        ])
-      },
-      # NHP Server Assignment: CloudMap for server discovery
-      # Note: DiscoverInstances requires Resource = "*" per AWS IAM documentation.
-      # It's a cross-namespace discovery API that doesn't support resource-level permissions.
-      # Condition keys like servicediscovery:NamespaceName can restrict scope if needed.
-      {
-        Effect = "Allow"
-        Action = [
-          "servicediscovery:DiscoverInstances"
-        ]
-        Resource = "*"
-      },
-      # Route 53 for certbot DNS-01 challenge
-      {
-        Effect = "Allow"
-        Action = [
-          "route53:ListHostedZones",
-          "route53:GetChange"
-        ]
-        Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "route53:ChangeResourceRecordSets",
-          "route53:ListResourceRecordSets"
-        ]
-        # Include both hosted_zone_id (for main domain) and protected_hosted_zone_id (for NHP protected domain)
-        # In practice these are often the same zone, but compact() handles duplicates and nulls
-        Resource = compact(distinct([
-          var.hosted_zone_id != null ? "arn:aws:route53:::hostedzone/${var.hosted_zone_id}" : "",
-          var.protected_hosted_zone_id != null ? "arn:aws:route53:::hostedzone/${var.protected_hosted_zone_id}" : ""
-        ]))
-      }
-    ]
+        Resource = [var.secrets_kms_key_arn]
+      }] : [],
+      [
+        # ECR - pull console image (and AC image when NHP protection enabled)
+        {
+          Effect   = "Allow"
+          Action   = ["ecr:GetAuthorizationToken"]
+          Resource = "*"
+        },
+        {
+          Effect = "Allow"
+          Action = [
+            "ecr:BatchCheckLayerAvailability",
+            "ecr:GetDownloadUrlForLayer",
+            "ecr:BatchGetImage"
+          ]
+          Resource = compact([var.ecr_repo_arn, var.nhp_ac_ecr_repo_arn])
+        },
+        # NHP Server Assignment: DynamoDB access for AC assignments
+        {
+          Effect = "Allow"
+          Action = [
+            "dynamodb:GetItem",
+            "dynamodb:PutItem",
+            "dynamodb:UpdateItem",
+            "dynamodb:DeleteItem",
+            "dynamodb:Query",
+            "dynamodb:Scan",
+            "dynamodb:BatchGetItem",
+            "dynamodb:BatchWriteItem"
+          ]
+          # Use wildcards to support environment-specific table names
+          Resource = compact([
+            var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}" : "",
+            var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}/index/*" : "",
+            var.nhp_dynamodb_server_ac_index_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_server_ac_index_table}" : "",
+            var.nhp_dynamodb_server_ac_index_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_server_ac_index_table}/index/*" : ""
+          ])
+        },
+        # NHP Server Assignment: CloudMap for server discovery
+        # Note: DiscoverInstances requires Resource = "*" per AWS IAM documentation.
+        # It's a cross-namespace discovery API that doesn't support resource-level permissions.
+        # Condition keys like servicediscovery:NamespaceName can restrict scope if needed.
+        {
+          Effect = "Allow"
+          Action = [
+            "servicediscovery:DiscoverInstances"
+          ]
+          Resource = "*"
+        },
+        # Route 53 for certbot DNS-01 challenge
+        {
+          Effect = "Allow"
+          Action = [
+            "route53:ListHostedZones",
+            "route53:GetChange"
+          ]
+          Resource = "*"
+        },
+        {
+          Effect = "Allow"
+          Action = [
+            "route53:ChangeResourceRecordSets",
+            "route53:ListResourceRecordSets"
+          ]
+          # Include both hosted_zone_id (for main domain) and protected_hosted_zone_id (for NHP protected domain)
+          # In practice these are often the same zone, but compact() handles duplicates and nulls
+          Resource = compact(distinct([
+            var.hosted_zone_id != null ? "arn:aws:route53:::hostedzone/${var.hosted_zone_id}" : "",
+            var.protected_hosted_zone_id != null ? "arn:aws:route53:::hostedzone/${var.protected_hosted_zone_id}" : ""
+          ]))
+        }
+    ])
   })
 }
 
