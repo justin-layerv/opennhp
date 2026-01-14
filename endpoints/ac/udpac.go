@@ -62,7 +62,7 @@ type UdpAC struct {
 	etcdConn                *etcd.EtcdConn
 	remoteConfigUpdateMutex sync.Mutex
 
-	// Phase 2: Multi-server connection management
+	// Multi-server connection management
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md section 6.2
 	registration *ACRegistration
 }
@@ -184,11 +184,10 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	// start device routines
 	a.device.Start()
 
-	// Phase 2: Initialize multi-server registration manager
+	// Initialize multi-server registration manager
 	a.registration = NewACRegistration(a)
 	if err := a.registration.Start(); err != nil {
-		log.Warning("Failed to start AC registration manager: %v", err)
-		// Continue - Phase 1 mode with static servers will still work
+		return fmt.Errorf("failed to start AC registration manager: %w", err)
 	}
 
 	// start ac routines
@@ -205,7 +204,7 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 func (ac *UdpAC) Stop() {
 	ac.running.Store(false)
 	close(ac.signals.stop)
-	// Stop Phase 2 registration manager
+	// Stop registration manager
 	if ac.registration != nil {
 		ac.registration.Stop()
 	}
@@ -503,6 +502,11 @@ func (a *UdpAC) recvMessageRoutine() {
 				continue
 			}
 
+			// Update LastSeen for assigned servers on any received message
+			if a.registration != nil && ppd.ConnData != nil && ppd.ConnData.RemoteAddr != nil {
+				a.registration.UpdateServerLastSeenByAddr(ppd.ConnData.RemoteAddr.String())
+			}
+
 			switch ppd.HeaderType {
 			case core.NHP_AOP:
 				// deal with NHP_AOP message
@@ -510,7 +514,7 @@ func (a *UdpAC) recvMessageRoutine() {
 				go a.HandleUdpACOperations(ppd)
 
 			case core.NHP_ARD:
-				// Phase 2: Handle AC redispatch to assigned servers
+				// Handle AC redispatch to assigned servers
 				go a.HandleACRedispatch(ppd)
 			}
 		}
@@ -854,7 +858,7 @@ func (a *UdpAC) GetConfig() *Config {
 }
 
 // ============================================================================
-// Phase 2: AC Redispatch Handler
+// AC Redispatch Handler
 // See docs/design/PLUGGABLE_STORAGE_BACKEND.md section 6.2 for details.
 // ============================================================================
 

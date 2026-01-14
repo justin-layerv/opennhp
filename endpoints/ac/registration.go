@@ -3,8 +3,11 @@ package ac
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/rand"
+	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
@@ -13,10 +16,10 @@ import (
 )
 
 // ============================================================================
-// Multi-Server Connection Management (Phase 2)
+// Multi-Server Connection Management
 // See docs/design/PLUGGABLE_STORAGE_BACKEND.md section 6.2 for details.
 //
-// In Phase 2, each AC connects to 3 assigned servers (in different AZs).
+// Each AC connects to 3 assigned servers (in different AZs).
 // When AC starts, it:
 // 1. Connects to FQDN (via NLB, hits any server)
 // 2. Sends NHP_AOL with credentials
@@ -44,15 +47,56 @@ const (
 
 	// OldServerKeepDuration is how long to keep old connections during reassignment.
 	OldServerKeepDuration = 2 * time.Minute
+
+	// MaxReregistrationAttempts is the max attempts for re-registration after server failure.
+	MaxReregistrationAttempts = 5
 )
 
 // AssignedServer represents a server assigned to this AC.
 type AssignedServer struct {
-	Target      common.RedirectTarget
-	Peer        *core.UdpPeer
-	Connected   bool
-	LastSeen    time.Time
-	FailCount   int
+	mu        sync.RWMutex // Protects mutable fields below
+	Target    common.RedirectTarget
+	Peer      *core.UdpPeer
+	Connected bool
+	LastSeen  time.Time
+	FailCount int
+}
+
+// SetConnected safely sets the Connected field.
+func (s *AssignedServer) SetConnected(connected bool) {
+	s.mu.Lock()
+	s.Connected = connected
+	s.mu.Unlock()
+}
+
+// IsConnected safely gets the Connected field.
+func (s *AssignedServer) IsConnected() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Connected
+}
+
+// UpdateLastSeen safely updates the LastSeen time and resets FailCount.
+func (s *AssignedServer) UpdateLastSeen() {
+	s.mu.Lock()
+	s.LastSeen = time.Now()
+	s.FailCount = 0
+	s.mu.Unlock()
+}
+
+// GetLastSeen safely gets the LastSeen time.
+func (s *AssignedServer) GetLastSeen() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.LastSeen
+}
+
+// IncrementFailCount safely increments the FailCount.
+func (s *AssignedServer) IncrementFailCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.FailCount++
+	return s.FailCount
 }
 
 // ACRegistration manages AC registration with NHP servers.
@@ -67,6 +111,9 @@ type ACRegistration struct {
 	mu            sync.RWMutex
 	stopCh        chan struct{}
 	wg            sync.WaitGroup
+
+	// reregistering prevents concurrent re-registration attempts
+	reregistering atomic.Bool
 }
 
 // NewACRegistration creates a new AC registration manager.
@@ -81,30 +128,38 @@ func NewACRegistration(ac *UdpAC) *ACRegistration {
 
 // Start begins the registration process and keepalive loop.
 func (r *ACRegistration) Start() error {
-	// If we have assigned servers configured, use those
-	// Otherwise, we need to register via FQDN to get assignment
-	if r.ac.config.ResourceFQDN != "" && r.ac.config.CustomerId != "" {
-		log.Info("Phase 2 mode: will register with FQDN %s", r.ac.config.ResourceFQDN)
-		// Start registration in background
-		go r.registrationLoop()
-	} else {
-		log.Info("Phase 1 mode: using static server configuration")
+	// Validate required config
+	if r.ac.config.ResourceFQDN == "" {
+		return errors.New("ResourceFQDN is required")
 	}
+	if r.ac.config.CustomerId == "" {
+		return errors.New("CustomerId is required")
+	}
+
+	log.Info("Starting AC registration with FQDN %s", r.ac.config.ResourceFQDN)
+
+	// Add to wait group BEFORE starting goroutine to prevent race with Stop()
+	r.wg.Add(1)
+	go r.registrationLoop()
 
 	return nil
 }
 
 // Stop stops the registration manager.
 func (r *ACRegistration) Stop() {
+	log.Info("Stopping AC registration manager")
 	close(r.stopCh)
 	r.wg.Wait()
+	log.Debug("AC registration manager stopped")
 }
 
-// GetAssignedServers returns the current assigned servers.
+// GetAssignedServers returns a copy of the current assigned servers slice.
 func (r *ACRegistration) GetAssignedServers() []*AssignedServer {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.assignedServers
+	servers := make([]*AssignedServer, len(r.assignedServers))
+	copy(servers, r.assignedServers)
+	return servers
 }
 
 // HasAssignedServers returns true if AC has assigned servers.
@@ -114,9 +169,43 @@ func (r *ACRegistration) HasAssignedServers() bool {
 	return len(r.assignedServers) > 0
 }
 
+// UpdateServerLastSeen updates the LastSeen time for a server based on its public key.
+// This should be called when any message is received from a server (NHP_AOP, NHP_AAK, etc.).
+func (r *ACRegistration) UpdateServerLastSeen(pubKeyBase64 string) {
+	r.mu.RLock()
+	servers := make([]*AssignedServer, len(r.assignedServers))
+	copy(servers, r.assignedServers)
+	r.mu.RUnlock()
+
+	for _, server := range servers {
+		if server.Target.PubKeyBase64 == pubKeyBase64 {
+			server.UpdateLastSeen()
+			log.Debug("Updated LastSeen for server %s", server.Target.IP)
+			return
+		}
+	}
+}
+
+// UpdateServerLastSeenByAddr updates the LastSeen time for a server based on its address.
+// This is useful when we receive a message but don't have the public key readily available.
+func (r *ACRegistration) UpdateServerLastSeenByAddr(addr string) {
+	r.mu.RLock()
+	servers := make([]*AssignedServer, len(r.assignedServers))
+	copy(servers, r.assignedServers)
+	r.mu.RUnlock()
+
+	for _, server := range servers {
+		serverAddr := fmt.Sprintf("%s:%d", server.Target.IP, server.Target.Port)
+		if serverAddr == addr {
+			server.UpdateLastSeen()
+			log.Debug("Updated LastSeen for server at %s", addr)
+			return
+		}
+	}
+}
+
 // registrationLoop attempts registration and maintains connections.
 func (r *ACRegistration) registrationLoop() {
-	r.wg.Add(1)
 	defer r.wg.Done()
 
 	// Initial registration with exponential backoff and jitter
@@ -151,9 +240,41 @@ func (r *ACRegistration) registrationLoop() {
 	r.keepaliveLoop()
 }
 
+// DefaultServerPort is the default NHP server port.
+const DefaultServerPort = 62206
+
 // register performs initial registration via FQDN.
+// It sends NHP_AOL to the ResourceFQDN and handles NHP_ARD (redispatch) or NHP_AAK response.
 func (r *ACRegistration) register() error {
-	// Create AOL message with Phase 2 credentials
+	// Validate config (ResourceFQDN and CustomerId already validated in Start())
+	if r.ac.config.ServerPubKeyBase64 == "" {
+		return errors.New("ServerPubKeyBase64 is required")
+	}
+
+	// Determine server port (default 62206)
+	serverPort := r.ac.config.ServerPort
+	if serverPort == 0 {
+		serverPort = DefaultServerPort
+	}
+
+	// Create temporary peer for FQDN registration
+	// This uses the shared registration public key (all servers share this for NLB)
+	registrationPeer := &core.UdpPeer{
+		Hostname:     r.ac.config.ResourceFQDN,
+		Port:         serverPort,
+		PubKeyBase64: r.ac.config.ServerPubKeyBase64,
+		Type:         core.NHP_SERVER,
+	}
+
+	// Resolve FQDN to address
+	sendAddr := registrationPeer.SendAddr()
+	if sendAddr == nil {
+		return fmt.Errorf("cannot resolve FQDN %s", r.ac.config.ResourceFQDN)
+	}
+
+	log.Info("Registering AC %s via FQDN %s (resolved to %s)", r.ac.config.ACId, r.ac.config.ResourceFQDN, sendAddr.String())
+
+	// Create AOL message with registration credentials
 	aolMsg := &common.ACOnlineMsg{
 		ACId:          r.ac.config.ACId,
 		AuthServiceId: r.ac.config.AuthServiceId,
@@ -164,13 +285,95 @@ func (r *ACRegistration) register() error {
 		ACVersion:     r.ac.config.ACVersion,
 	}
 
-	log.Info("Registering AC %s with resource FQDN %s", aolMsg.ACId, aolMsg.ResourceFQDN)
+	aolBytes, err := json.Marshal(aolMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal NHP_AOL: %w", err)
+	}
 
-	// TODO: Send NHP_AOL to FQDN and handle NHP_ARD response
-	// For now, return nil to indicate success (will be implemented with server integration)
-	_ = aolMsg
+	// Add peer to device temporarily for encryption
+	r.ac.device.AddPeer(registrationPeer)
+	defer r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
 
-	return nil
+	// Create message data for sending
+	// Use buffered channel (size 1) to prevent sender from blocking if we exit early
+	md := &core.MsgData{
+		RemoteAddr:    sendAddr.(*net.UDPAddr),
+		HeaderType:    core.NHP_AOL,
+		TransactionId: r.ac.device.NextCounterIndex(),
+		Compress:      true,
+		PeerPk:        registrationPeer.PublicKey(),
+		Message:       aolBytes,
+		ResponseMsgCh: make(chan *core.PacketParserData, 1),
+	}
+
+	// Send NHP_AOL
+	if !r.ac.IsRunning() {
+		return errors.New("AC not running")
+	}
+	r.ac.sendMsgCh <- md
+
+	// Wait for response with timeout
+	// Note: We don't close ResponseMsgCh here because the sender (in another goroutine)
+	// may write to it after we exit. The buffered channel (size 1) prevents blocking,
+	// and the channel will be garbage collected when no longer referenced.
+	select {
+	case <-r.stopCh:
+		return errors.New("registration cancelled")
+	case <-time.After(RegistrationTimeout):
+		return errors.New("registration timeout")
+	case ppd := <-md.ResponseMsgCh:
+		return r.handleRegistrationResponse(ppd)
+	}
+}
+
+// handleRegistrationResponse processes the server's response to NHP_AOL.
+// The response can be:
+// - NHP_ARD: Server is not assigned to this AC, contains list of assigned servers
+// - NHP_AAK: Server is assigned to this AC
+func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData) error {
+	if ppd.Error != nil {
+		return fmt.Errorf("registration failed: %w", ppd.Error)
+	}
+
+	switch ppd.HeaderType {
+	case core.NHP_ARD:
+		// Server is not assigned to this AC - parse redispatch message
+		var ardMsg common.ACRedispatchMsg
+		if err := json.Unmarshal(ppd.BodyMessage, &ardMsg); err != nil {
+			return fmt.Errorf("failed to parse NHP_ARD: %w", err)
+		}
+
+		log.Info("Received NHP_ARD with %d assigned servers", len(ardMsg.Targets))
+
+		// Connect to all assigned servers
+		if err := r.HandleRedispatch(&ardMsg); err != nil {
+			return fmt.Errorf("failed to handle redispatch: %w", err)
+		}
+
+		log.Info("Successfully connected to assigned servers")
+		return nil
+
+	case core.NHP_AAK:
+		// Server responded with ACK - this server is assigned to us
+		var aakMsg common.ServerACAckMsg
+		if err := json.Unmarshal(ppd.BodyMessage, &aakMsg); err != nil {
+			return fmt.Errorf("failed to parse NHP_AAK: %w", err)
+		}
+
+		if aakMsg.ErrCode != "" && aakMsg.ErrCode != "SUCCESS" {
+			return fmt.Errorf("registration rejected: %s - %s", aakMsg.ErrCode, aakMsg.ErrMsg)
+		}
+
+		if !aakMsg.Registered {
+			return errors.New("server returned NHP_AAK with Registered=false")
+		}
+
+		log.Info("Received NHP_AAK: ACAddr=%s, Registered=%v", aakMsg.ACAddr, aakMsg.Registered)
+		return nil
+
+	default:
+		return fmt.Errorf("unexpected response type: %s", core.HeaderTypeToString(ppd.HeaderType))
+	}
 }
 
 // HandleRedispatch processes an NHP_ARD message and connects to assigned servers.
@@ -183,7 +386,22 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 		return errors.New("no targets in redispatch message")
 	}
 
-	log.Info("Received NHP_ARD with %d assigned servers", len(ardMsg.Targets))
+	// Validate all targets before proceeding
+	for i, target := range ardMsg.Targets {
+		if target.IP == "" {
+			return fmt.Errorf("target %d has empty IP", i)
+		}
+		if target.Port == 0 {
+			return fmt.Errorf("target %d has invalid port", i)
+		}
+		if target.PubKeyBase64 == "" {
+			return fmt.Errorf("target %d has empty public key", i)
+		}
+		// Validate IP address format
+		if ip := net.ParseIP(target.IP); ip == nil {
+			return fmt.Errorf("target %d has invalid IP address: %s", i, target.IP)
+		}
+	}
 
 	r.mu.Lock()
 	// Move current servers to old servers map for graceful transition.
@@ -242,6 +460,9 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 	return nil
 }
 
+// ConnectionTimeout is the timeout for connecting to an assigned server.
+const ConnectionTimeout = 10 * time.Second
+
 // connectToServer establishes connection to an assigned server.
 func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 	// Create peer for this server
@@ -252,6 +473,12 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 		PubKeyBase64: server.Target.PubKeyBase64,
 		ExpireTime:   0,
 		Type:         core.NHP_SERVER,
+	}
+
+	// Resolve server address
+	sendAddr := peer.SendAddr()
+	if sendAddr == nil {
+		return fmt.Errorf("cannot resolve address for server %s", server.Target.IP)
 	}
 
 	// Add peer to device
@@ -274,25 +501,68 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 		return err
 	}
 
+	// Use buffered channel (size 1) to prevent sender from blocking if we exit early
 	md := &core.MsgData{
-		HeaderType:     core.NHP_AOL,
-		TransactionId:  uint64(time.Now().UnixNano()),
-		Compress:       false,
-		PrevParserData: nil,
-		Message:        msgBytes,
-		PeerPk:         peer.PublicKey(),
+		RemoteAddr:    sendAddr.(*net.UDPAddr),
+		HeaderType:    core.NHP_AOL,
+		TransactionId: r.ac.device.NextCounterIndex(),
+		Compress:      true,
+		PeerPk:        peer.PublicKey(),
+		Message:       msgBytes,
+		ResponseMsgCh: make(chan *core.PacketParserData, 1),
 	}
 
+	if !r.ac.IsRunning() {
+		return errors.New("AC not running")
+	}
 	r.ac.sendMsgCh <- md
 
-	server.Connected = true
-	server.LastSeen = time.Now()
-	log.Info("Connected to assigned server %s:%d", server.Target.IP, server.Target.Port)
+	// Wait for NHP_AAK response with timeout
+	// Note: We don't close ResponseMsgCh here because the sender (in another goroutine)
+	// may write to it after we exit. The buffered channel (size 1) prevents blocking,
+	// and the channel will be garbage collected when no longer referenced.
+	select {
+	case <-r.stopCh:
+		r.ac.device.RemovePeer(peer.PublicKeyBase64())
+		server.Peer = nil
+		return errors.New("connection cancelled")
+	case <-time.After(ConnectionTimeout):
+		r.ac.device.RemovePeer(peer.PublicKeyBase64())
+		server.Peer = nil
+		return fmt.Errorf("connection to %s timed out", server.Target.IP)
+	case ppd := <-md.ResponseMsgCh:
+		if ppd.Error != nil {
+			r.ac.device.RemovePeer(peer.PublicKeyBase64())
+			server.Peer = nil
+			return fmt.Errorf("connection failed: %w", ppd.Error)
+		}
+		if ppd.HeaderType != core.NHP_AAK {
+			r.ac.device.RemovePeer(peer.PublicKeyBase64())
+			server.Peer = nil
+			return fmt.Errorf("unexpected response type: %s", core.HeaderTypeToString(ppd.HeaderType))
+		}
 
-	return nil
+		var aakMsg common.ServerACAckMsg
+		if err := json.Unmarshal(ppd.BodyMessage, &aakMsg); err != nil {
+			r.ac.device.RemovePeer(peer.PublicKeyBase64())
+			server.Peer = nil
+			return fmt.Errorf("failed to parse NHP_AAK: %w", err)
+		}
+
+		if aakMsg.ErrCode != "" && aakMsg.ErrCode != "SUCCESS" {
+			r.ac.device.RemovePeer(peer.PublicKeyBase64())
+			server.Peer = nil
+			return fmt.Errorf("server rejected: %s - %s", aakMsg.ErrCode, aakMsg.ErrMsg)
+		}
+
+		server.SetConnected(true)
+		server.UpdateLastSeen()
+		log.Info("Connected to assigned server %s:%d (ACAddr=%s)", server.Target.IP, server.Target.Port, aakMsg.ACAddr)
+		return nil
+	}
 }
 
-// keepaliveLoop sends keepalives to all assigned servers.
+// keepaliveLoop sends keepalives to all assigned servers and monitors their health.
 func (r *ACRegistration) keepaliveLoop() {
 	ticker := time.NewTicker(KeepaliveInterval)
 	defer ticker.Stop()
@@ -303,6 +573,7 @@ func (r *ACRegistration) keepaliveLoop() {
 			return
 		case <-ticker.C:
 			r.sendKeepalives()
+			r.checkServerHealth()
 		}
 	}
 }
@@ -310,30 +581,60 @@ func (r *ACRegistration) keepaliveLoop() {
 // sendKeepalives sends keepalive to each assigned server.
 func (r *ACRegistration) sendKeepalives() {
 	r.mu.RLock()
-	servers := r.assignedServers
+	servers := make([]*AssignedServer, len(r.assignedServers))
+	copy(servers, r.assignedServers)
 	r.mu.RUnlock()
 
 	for _, server := range servers {
-		if server.Peer == nil {
+		if server.Peer == nil || !server.IsConnected() {
 			continue
 		}
 
-		// TODO: Send NHP_KPL (keepalive) to server
-		// For now, just update last seen
-		server.LastSeen = time.Now()
+		// Get server's send address
+		sendAddr := server.Peer.SendAddr()
+		if sendAddr == nil {
+			log.Warning("Cannot resolve address for server %s", server.Target.IP)
+			continue
+		}
+
+		// Create and send NHP_KPL message
+		md := &core.MsgData{
+			RemoteAddr:    sendAddr.(*net.UDPAddr),
+			HeaderType:    core.NHP_KPL,
+			CipherScheme:  r.ac.config.DefaultCipherScheme,
+			TransactionId: r.ac.device.NextCounterIndex(),
+		}
+
+		if r.ac.IsRunning() {
+			r.ac.sendMsgCh <- md
+			log.Debug("Sent NHP_KPL to assigned server %s:%d", server.Target.IP, server.Target.Port)
+		}
 	}
 }
 
 // checkServerHealth checks if any server is down and triggers re-registration.
 func (r *ACRegistration) checkServerHealth() {
 	r.mu.RLock()
-	servers := r.assignedServers
+	servers := make([]*AssignedServer, len(r.assignedServers))
+	copy(servers, r.assignedServers)
 	r.mu.RUnlock()
 
 	for _, server := range servers {
-		if time.Since(server.LastSeen) > KeepaliveInterval*KeepaliveMaxRetries {
-			log.Warning("Server %s appears down, triggering re-registration", server.Target.IP)
-			go r.handleServerDown(server)
+		// Skip servers that were never connected - they have zero LastSeen
+		// which would always trigger false positives.
+		if !server.IsConnected() {
+			log.Debug("Health check: skipping server %s (never connected)", server.Target.IP)
+			continue
+		}
+
+		if time.Since(server.GetLastSeen()) > KeepaliveInterval*KeepaliveMaxRetries {
+			// Check if already re-registering to prevent concurrent attempts
+			if r.reregistering.CompareAndSwap(false, true) {
+				log.Warning("Server %s appears down, triggering re-registration", server.Target.IP)
+				go r.handleServerDown(server)
+			} else {
+				log.Debug("Server %s appears down but re-registration already in progress", server.Target.IP)
+			}
 			return // Re-register once, not for each down server
 		}
 	}
@@ -342,14 +643,21 @@ func (r *ACRegistration) checkServerHealth() {
 // handleServerDown handles when a server is detected as down.
 // Per design doc: AC re-registers via FQDN on ANY server failure.
 func (r *ACRegistration) handleServerDown(deadServer *AssignedServer) {
+	// Always reset reregistering flag when done
+	defer r.reregistering.Store(false)
+
 	// Add jitter to prevent thundering herd
 	jitter := time.Duration(rand.Intn(int(ReregistrationJitter.Milliseconds()))) * time.Millisecond
-	time.Sleep(jitter)
+	select {
+	case <-r.stopCh:
+		return
+	case <-time.After(jitter):
+	}
 
 	log.Info("Re-registering due to server %s failure", deadServer.Target.IP)
 
 	// Exponential backoff for re-registration attempts
-	for attempt := 1; attempt <= 5; attempt++ {
+	for attempt := 1; attempt <= MaxReregistrationAttempts; attempt++ {
 		select {
 		case <-r.stopCh:
 			return
@@ -358,15 +666,22 @@ func (r *ACRegistration) handleServerDown(deadServer *AssignedServer) {
 
 		err := r.register()
 		if err == nil {
+			log.Info("Re-registration successful after %d attempt(s)", attempt)
 			return
 		}
 
 		backoff := time.Duration(attempt*attempt) * time.Second
 		log.Warning("Re-registration attempt %d failed: %v, retrying in %v", attempt, err, backoff)
-		time.Sleep(backoff + jitter)
+
+		// Interruptible sleep
+		select {
+		case <-r.stopCh:
+			return
+		case <-time.After(backoff + jitter):
+		}
 	}
 
-	log.Error("Re-registration failed after 5 attempts, continuing with remaining servers")
+	log.Error("Re-registration failed after %d attempts, continuing with remaining servers", MaxReregistrationAttempts)
 }
 
 // cleanupOldServers removes old server connections after grace period.
