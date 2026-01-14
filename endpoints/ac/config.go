@@ -1,14 +1,10 @@
 package ac
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
-
-	"github.com/OpenNHP/opennhp/nhp/etcd"
 
 	toml "github.com/pelletier/go-toml/v2"
 
@@ -29,12 +25,6 @@ const (
 	FilterMode_IPTABLES = iota // 0
 	FilterMode_EBPFXDP         // 1
 )
-
-type ACEtcdConfig struct {
-	BaseConfig Config
-	HttpConfig HttpConfig
-	Servers    []*core.UdpPeer
-}
 
 type Config struct {
 	PrivateKeyBase64    string          `json:"privateKey"`
@@ -60,18 +50,6 @@ type Config struct {
 	ACVersion          string `json:"acVersion"`          // AC software version for compatibility
 	ServerPubKeyBase64 string `json:"serverPubKeyBase64"` // Required: Shared registration public key (all servers share this for NLB)
 	ServerPort         int    `json:"serverPort"`         // Server port for initial registration (default: 62206)
-}
-
-type RemoteConfig struct {
-	Provider   string
-	Key        string
-	Endpoints  []string
-	Username   string
-	Password   string
-	TLS        bool
-	CACert     string
-	ClientCert string
-	ClientKey  string
 }
 
 type HttpConfig struct {
@@ -292,123 +270,6 @@ func (a *UdpAC) loadConfigFile(file string) (content []byte, err error) {
 	if err != nil {
 		log.Error("failed to read base config: %v", err)
 	}
-	return
-}
-func (a *UdpAC) initRemoteConn() error {
-	// remote.toml
-	fileName := filepath.Join(ExeDirPath, "etc", "remote.toml")
-	log.Info("checking for remote.toml at: %s", fileName)
-
-	_, e := os.Stat(fileName)
-	if os.IsNotExist(e) {
-		log.Info("remote.toml not found, using local config only (no etcd)")
-		return nil
-	}
-	log.Info("remote.toml EXISTS - will connect to etcd and load remote config")
-
-	content, err := os.ReadFile(fileName)
-	if err != nil {
-		log.Error("failed to read remote config: %v", err)
-		return err
-	}
-
-	var conf RemoteConfig
-	if err = toml.Unmarshal(content, &conf); err != nil {
-		log.Error("failed to unmarshal remote config: %v", err)
-		return err
-	}
-
-	if strings.EqualFold(conf.Provider, "etcd") {
-		if len(conf.Endpoints) == 0 {
-			log.Error("remote config has no endpoints,open nhp server will startup with local configuration")
-			return nil
-		}
-
-		if len(conf.Key) == 0 {
-			log.Error("remote config has no key,open nhp server will startup with local configuration")
-			return nil
-		}
-
-		a.etcdConn = &etcd.EtcdConn{
-			Endpoints:  conf.Endpoints,
-			Username:   conf.Username,
-			Password:   conf.Password,
-			Key:        conf.Key,
-			TLS:        conf.TLS,
-			CACert:     conf.CACert,
-			ClientCert: conf.ClientCert,
-			ClientKey:  conf.ClientKey,
-		}
-
-		err = a.etcdConn.InitClient()
-		return err
-	} else {
-		return errors.New("unknown remote provider")
-	}
-
-}
-
-func (a *UdpAC) loadRemoteConfig() error {
-	value, err := a.etcdConn.GetValue()
-	if err != nil {
-		return err
-	}
-	//base config has been loaded and no secondary loading is required
-	if err = a.updateEtcdConfig(value, false); err != nil {
-		return err
-	}
-
-	go a.etcdConn.WatchValue(func(val []byte) {
-		a.remoteConfigUpdateMutex.Lock()
-		defer a.remoteConfigUpdateMutex.Unlock()
-		a.updateEtcdConfig(val, true)
-	})
-
-	return nil
-}
-
-// loadRemoteBaseConfig is DEPRECATED.
-// Private keys should ALWAYS come from local config.toml, never from etcd.
-// This function is kept for backwards compatibility but should not be used.
-// Use loadBaseConfig() for private key, then loadRemoteConfig() for server peers.
-func (a *UdpAC) loadRemoteBaseConfig() error {
-	var acEtcdConfig ACEtcdConfig
-	value, err := a.etcdConn.GetValue()
-	if err != nil {
-		return err
-	}
-	if err = toml.Unmarshal(value, &acEtcdConfig); err != nil {
-		log.Error("failed to unmarshal remote config: %v", err)
-		return err
-	}
-
-	err = a.updateBaseConfig(acEtcdConfig.BaseConfig)
-	return err
-}
-
-func (a *UdpAC) updateEtcdConfig(content []byte, baseLoad bool) (err error) {
-	log.Debug("updateEtcdConfig: loading config from etcd (%d bytes): %s", len(content), string(content))
-	var acEtcdConfig ACEtcdConfig
-	if err = toml.Unmarshal(content, &acEtcdConfig); err != nil {
-		log.Error("failed to unmarshal remote config: %v", err)
-		return err
-	}
-	log.Debug("updateEtcdConfig: parsed %d server peers from etcd", len(acEtcdConfig.Servers))
-	for i, s := range acEtcdConfig.Servers {
-		log.Debug("updateEtcdConfig: etcd server[%d]: host=%s, ip=%s, port=%d, pubKeyBase64=%q",
-			i, s.Hostname, s.Ip, s.Port, s.PubKeyBase64)
-	}
-
-	// SECURITY: Never update base config from etcd.
-	// Private keys and base config MUST come from local config.toml.
-	// The baseLoad parameter is ignored for security - etcd should only provide:
-	// - Server peers (for connecting to NHP servers)
-	// - HTTP config (for enabling HTTP endpoint)
-	// The local config.toml contains the per-instance private key generated on boot.
-	_ = baseLoad // Explicitly ignore - base config always from local
-
-	a.updateHttpConfig(acEtcdConfig.HttpConfig)
-	a.updateServerPeers(acEtcdConfig.Servers)
 	return
 }
 

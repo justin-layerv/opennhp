@@ -10,8 +10,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/OpenNHP/opennhp/nhp/etcd"
-
 	ebpflocal "github.com/OpenNHP/opennhp/endpoints/ac/ebpf"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
@@ -58,9 +56,6 @@ type UdpAC struct {
 
 	recvMsgCh <-chan *core.PacketParserData
 	sendMsgCh chan *core.MsgData
-	// etcd client
-	etcdConn                *etcd.EtcdConn
-	remoteConfigUpdateMutex sync.Mutex
 
 	// Multi-server connection management
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md section 6.2
@@ -98,17 +93,10 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	log.Info("=== RELEASE %s                       ===", version.BuildTime)
 	log.Info("=========================================================")
 
-	// ALWAYS load local base config first (private key must come from local file)
+	// Load local base config (private key must come from local file)
 	err = a.loadBaseConfig()
 	if err != nil {
 		return err
-	}
-
-	// Init etcd client if remote.toml exists
-	err = a.initRemoteConn()
-	if err != nil {
-		log.Error("failed to initialize etcd connection: %v", err)
-		// Continue with local config if etcd init fails
 	}
 
 	switch a.config.FilterMode {
@@ -150,15 +138,11 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	a.serverPeerMap = make(map[string]*core.UdpPeer)
 	a.tokenStore = common.NewTokenStore[*AccessEntry]()
 
-	if a.etcdConn != nil {
-		a.loadRemoteConfig()
-	} else {
-		// load http config and turn on http server if needed
-		a.loadHttpConfig()
+	// Load http config and turn on http server if needed
+	a.loadHttpConfig()
 
-		// load peers
-		a.loadPeers()
-	}
+	// Load server peers from local config
+	a.loadPeers()
 
 	if a.config.FilterMode == FilterMode_EBPFXDP {
 		for _, server := range a.config.Servers {
@@ -207,9 +191,6 @@ func (ac *UdpAC) Stop() {
 	// Stop registration manager
 	if ac.registration != nil {
 		ac.registration.Stop()
-	}
-	if ac.etcdConn != nil {
-		ac.etcdConn.Close()
 	}
 	ac.device.Stop()
 	ac.StopConfigWatch()
