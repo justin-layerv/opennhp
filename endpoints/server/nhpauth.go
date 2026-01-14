@@ -82,6 +82,7 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 				Ip:   ppd.ConnData.RemoteAddr.IP.String(),
 				Port: ppd.ConnData.RemoteAddr.Port,
 			},
+			OriginalPacket: ppd.BasePacketContent(), // For server-to-server forwarding
 		}
 
 		// perform knock auth and open ip rule from the agent src address and resource dst address

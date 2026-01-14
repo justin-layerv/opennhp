@@ -43,6 +43,33 @@ type AuthServiceProviderData struct {
 }
 type AuthSvcProviderMap map[string]*AuthServiceProviderData
 
+// FindResource returns the first ResourceInfo for a given resource ID.
+// This is used by server-to-server forwarding to find the AC connection.
+// Returns nil if the resource ID is not found or has no resource entries.
+func (asp *AuthServiceProviderData) FindResource(resourceId string) *ResourceInfo {
+	if asp == nil {
+		return nil
+	}
+	resData := asp.ResourceGroups[resourceId]
+	if resData == nil {
+		return nil
+	}
+	// Return first resource info (all entries in a resource group typically use the same AC)
+	for _, info := range resData.Resources {
+		return info
+	}
+	return nil
+}
+
+// GetResourceData returns the ResourceData for a given resource ID.
+// Returns nil if the resource ID is not found.
+func (asp *AuthServiceProviderData) GetResourceData(resourceId string) *ResourceData {
+	if asp == nil {
+		return nil
+	}
+	return asp.ResourceGroups[resourceId]
+}
+
 // requests
 type NhpOTPRequest struct {
 	Msg     *AgentOTPMsg `json:"msg"`
@@ -57,10 +84,11 @@ type NhpRegisterRequest struct {
 }
 
 type NhpAuthRequest struct {
-	Msg       *AgentKnockMsg     `json:"msg"`
-	Ack       *ServerKnockAckMsg `json:"ack"`
-	PublicKey string             `json:"pubKey"`
-	SrcAddr   *NetAddress        `json:"srcAddr"`
+	Msg            *AgentKnockMsg     `json:"msg"`
+	Ack            *ServerKnockAckMsg `json:"ack"`
+	PublicKey      string             `json:"pubKey"`
+	SrcAddr        *NetAddress        `json:"srcAddr"`
+	OriginalPacket []byte             `json:"-"` // Original encrypted knock packet for server-to-server forwarding
 }
 
 type NhpListRequest struct {

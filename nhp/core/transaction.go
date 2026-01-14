@@ -36,7 +36,8 @@ func (d *Device) IsTransactionRequest(t int) bool {
 		}
 	case NHP_SERVER:
 		switch t {
-		case NHP_REG, NHP_LST, NHP_KNK, DHP_KNK, NHP_RKN, NHP_EXT, NHP_AOL, NHP_AOP, NHP_DAK, NHP_DAG, NHP_DSA, NHP_DAR, NHP_DAV, NHP_DRG, NHP_DOL, NHP_DWR:
+		// NHP_FWD: Server-to-server forwarding (Phase 2 - Per-AC Assignment)
+		case NHP_REG, NHP_LST, NHP_KNK, DHP_KNK, NHP_RKN, NHP_EXT, NHP_AOL, NHP_AOP, NHP_DAK, NHP_DAG, NHP_DSA, NHP_DAR, NHP_DAV, NHP_DRG, NHP_DOL, NHP_DWR, NHP_FWD:
 			return true
 		}
 	case NHP_AC:
@@ -90,7 +91,8 @@ func (d *Device) IsTransactionResponse(t int) bool {
 		}
 	case NHP_SERVER:
 		switch t {
-		case NHP_RAK, NHP_LRT, NHP_ACK, NHP_AAK, NHP_ART, NHP_DAK, NHP_DWA:
+		// NHP_FRT: Server-to-server forward result (Phase 2 - Per-AC Assignment)
+		case NHP_RAK, NHP_LRT, NHP_ACK, NHP_AAK, NHP_ART, NHP_DAK, NHP_DWA, NHP_FRT:
 			// note NHP_COK is not handled as transaction for server
 			return true
 		}

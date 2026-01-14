@@ -47,6 +47,17 @@ type Config struct {
 	LogLevel            int             `json:"logLevel"`
 	DefaultCipherScheme int             `json:"defaultCipherScheme"`
 	FilterMode          int             `json:"filterMode"`
+
+	// ============================================================================
+	// Phase 2: Per-AC Server Assignment Configuration
+	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md section 6.2 for details.
+	// These fields enable AC to register with NHP servers and receive
+	// its assigned server list via NHP_ARD (redispatch).
+	// ============================================================================
+	CustomerId   string `json:"customerId"`   // Customer ID for license validation
+	LicenseKey   string `json:"licenseKey"`   // License key for authentication
+	ResourceFQDN string `json:"resourceFqdn"` // Resource FQDN (e.g., "a1b2c3d4.nhp.layerv.ai")
+	ACVersion    string `json:"acVersion"`    // AC software version for compatibility
 }
 
 type RemoteConfig struct {

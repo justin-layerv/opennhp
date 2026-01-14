@@ -140,6 +140,12 @@ type ACOnlineMsg struct {
 	AuthServiceId string   `json:"aspId"`
 	ResourceIds   []string `json:"resIds"`
 	ACId          string   `json:"acId,omitempty"`
+	// Phase 2 - Per-AC Server Assignment fields
+	// These are used for license validation and server assignment lookup
+	CustomerId   string `json:"custId,omitempty"`   // Customer identifier for license lookup
+	LicenseKey   string `json:"licKey,omitempty"`   // License key for validation
+	ResourceFQDN string `json:"resFqdn,omitempty"`  // Resource FQDN (e.g., "a1b2c3d4.nhp.layerv.ai")
+	ACVersion    string `json:"version,omitempty"`  // AC software version
 }
 
 type ACRefreshMsg struct {
@@ -148,9 +154,10 @@ type ACRefreshMsg struct {
 }
 
 type ServerACAckMsg struct {
-	ErrCode string `json:"errCode"`
-	ErrMsg  string `json:"errMsg,omitempty"`
-	ACAddr  string `json:"acAddr"`
+	ErrCode    string `json:"errCode"`
+	ErrMsg     string `json:"errMsg,omitempty"`
+	ACAddr     string `json:"acAddr"`
+	Registered bool   `json:"registered"` // True if AC is registered with this server (Phase 2)
 }
 
 type ResourceInfo struct {
@@ -319,4 +326,54 @@ type ServerDHPKnockAckMsg struct {
 	ErrCode  string `json:"errCode"`
 	ErrMsg   string `json:"errMsg,omitempty"`
 	OpenTime uint32 `json:"opnTime"`
+}
+
+// ============================================================================
+// Per-AC Server Assignment Messages (Phase 2 - Pluggable Storage Backend)
+// See docs/design/PLUGGABLE_STORAGE_BACKEND.md for architecture details.
+// ============================================================================
+
+// ServerForwardMsg is sent from one server to another to forward a knock (NHP_FWD).
+// Used when a knock arrives at a non-assigned server and needs to be forwarded
+// to one of the AC's assigned servers.
+type ServerForwardMsg struct {
+	KnockData     []byte `json:"knockData"`    // Original encrypted knock packet
+	SourceServer  string `json:"sourceServer"` // Server ID that received the knock
+	UserAddr      string `json:"userAddr"`     // User's address for response routing
+	TransactionId uint64 `json:"txId"`         // For response correlation
+	Timestamp     int64  `json:"ts"`           // Unix timestamp - reject if >30s old (replay protection)
+}
+
+// ServerForwardResultMsg is the response to ServerForwardMsg (NHP_FRT).
+// Contains the result of knock handling from the assigned server.
+type ServerForwardResultMsg struct {
+	TransactionId uint64 `json:"txId"`              // Echoes request txId
+	Success       bool   `json:"success"`           // True if AOP was sent to AC
+	ACKData       []byte `json:"ackData,omitempty"` // Response to send to user
+	ErrCode       string `json:"errCode,omitempty"` // Error code if failed
+	ErrMsg        string `json:"errMsg,omitempty"`  // Error message if failed
+}
+
+// RedirectTarget represents an assigned server that the AC should connect to.
+// Used in ACRedispatchMsg to redirect AC to its assigned servers.
+type RedirectTarget struct {
+	IP           string `json:"ip"`             // Server's public IP
+	Port         int    `json:"port"`           // Server's NHP UDP port
+	PubKeyBase64 string `json:"pubKey"`         // Server's public key for NHP_AOL encryption
+	AZ           string `json:"az,omitempty"`   // Availability Zone (for debugging/logging)
+	ServerID     string `json:"srvId,omitempty"` // Server ID (for debugging/logging)
+}
+
+// ACRedispatchMsg redirects an AC to its assigned servers (NHP_ARD).
+// This is an NHP spec message (Type 30) sent in response to NHP_AOL when
+// the AC connects to a non-assigned server via NLB.
+//
+// Protocol rules:
+// 1. Only sent in response to NHP_AOL - unsolicited NHP_ARD is prohibited
+// 2. No redirect chaining - assigned servers MUST respond with NHP_AAK, not NHP_ARD
+// 3. AC should terminate current connection and connect to targets in order
+type ACRedispatchMsg struct {
+	Targets []RedirectTarget `json:"targets"`           // Ordered list of assigned servers (typically 3)
+	ErrCode string           `json:"errCode,omitempty"` // Error code if assignment lookup failed
+	ErrMsg  string           `json:"errMsg,omitempty"`  // Error message if failed
 }

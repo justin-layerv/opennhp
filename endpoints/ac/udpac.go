@@ -61,6 +61,10 @@ type UdpAC struct {
 	// etcd client
 	etcdConn                *etcd.EtcdConn
 	remoteConfigUpdateMutex sync.Mutex
+
+	// Phase 2: Multi-server connection management
+	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md section 6.2
+	registration *ACRegistration
 }
 
 type UdpConn struct {
@@ -180,6 +184,13 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	// start device routines
 	a.device.Start()
 
+	// Phase 2: Initialize multi-server registration manager
+	a.registration = NewACRegistration(a)
+	if err := a.registration.Start(); err != nil {
+		log.Warning("Failed to start AC registration manager: %v", err)
+		// Continue - Phase 1 mode with static servers will still work
+	}
+
 	// start ac routines
 	a.wg.Add(4)
 	go a.tokenStore.RunRefreshRoutine(&a.wg, a.signals.stop, TokenStoreRefreshInterval)
@@ -194,6 +205,10 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 func (ac *UdpAC) Stop() {
 	ac.running.Store(false)
 	close(ac.signals.stop)
+	// Stop Phase 2 registration manager
+	if ac.registration != nil {
+		ac.registration.Stop()
+	}
 	if ac.etcdConn != nil {
 		ac.etcdConn.Close()
 	}
@@ -493,6 +508,10 @@ func (a *UdpAC) recvMessageRoutine() {
 				// deal with NHP_AOP message
 				a.wg.Add(1)
 				go a.HandleUdpACOperations(ppd)
+
+			case core.NHP_ARD:
+				// Phase 2: Handle AC redispatch to assigned servers
+				go a.HandleACRedispatch(ppd)
 			}
 		}
 	}
@@ -832,4 +851,29 @@ func (a *UdpAC) RemoveServerPeer(serverKey string) {
 
 func (a *UdpAC) GetConfig() *Config {
 	return a.config // return  config
+}
+
+// ============================================================================
+// Phase 2: AC Redispatch Handler
+// See docs/design/PLUGGABLE_STORAGE_BACKEND.md section 6.2 for details.
+// ============================================================================
+
+// HandleACRedispatch processes an NHP_ARD message from the server.
+// This redirects the AC to its assigned servers.
+func (a *UdpAC) HandleACRedispatch(ppd *core.PacketParserData) {
+	var ardMsg common.ACRedispatchMsg
+	if err := json.Unmarshal(ppd.BodyMessage, &ardMsg); err != nil {
+		log.Error("ac(%s)[HandleACRedispatch] failed to parse NHP_ARD message: %v", a.config.ACId, err)
+		return
+	}
+
+	log.Info("ac(%s)[HandleACRedispatch] received redispatch with %d targets", a.config.ACId, len(ardMsg.Targets))
+
+	if a.registration != nil {
+		if err := a.registration.HandleRedispatch(&ardMsg); err != nil {
+			log.Error("ac(%s)[HandleACRedispatch] failed to process redispatch: %v", a.config.ACId, err)
+		}
+	} else {
+		log.Warning("ac(%s)[HandleACRedispatch] registration manager not initialized", a.config.ACId)
+	}
 }

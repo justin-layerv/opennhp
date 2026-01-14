@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -212,6 +213,24 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	}
 
 	acId := aolMsg.ACId
+
+	// ============================================================================
+	// Phase 2: Check if AC should be redirected to assigned servers
+	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md section 6.2 for details.
+	// ============================================================================
+	if s.storage != nil && aolMsg.CustomerId != "" && aolMsg.ResourceFQDN != "" {
+		redirected, ardErr := s.handlePhase2ACOnline(ppd, aolMsg, transactionId, addrStr)
+		if ardErr != nil {
+			log.Error("server-ac(%s#%d@%s)[HandleACOnline] Phase 2 handling error: %v", acId, transactionId, addrStr, ardErr)
+			// Fall through to Phase 1 mode on error
+		} else if redirected {
+			// AC was redirected via NHP_ARD, don't proceed with connection registration
+			return nil
+		}
+		// If not redirected, continue with Phase 1 mode (this server is assigned to the AC)
+	}
+
+	// Phase 1 mode: Register AC connection and send NHP_AAK
 	acPubkeyBase64 := base64.StdEncoding.EncodeToString(ppd.RemotePubKey)
 	s.acPeerMapMutex.Lock()
 	acPeer := s.acPeerMap[acPubkeyBase64] // ac peer's recvAddr has already been updated by nhp packet parser
@@ -231,8 +250,9 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	s.acConnectionMapMutex.Unlock()
 
 	aakMsg := &common.ServerACAckMsg{
-		ErrCode: common.ErrSuccess.ErrorCode(),
-		ACAddr:  ppd.ConnData.RemoteAddr.String(),
+		ErrCode:    common.ErrSuccess.ErrorCode(),
+		ACAddr:     ppd.ConnData.RemoteAddr.String(),
+		Registered: true, // This server is handling the AC
 	}
 	aakBytes, _ := json.Marshal(aakMsg)
 
@@ -255,6 +275,86 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	transaction.NextMsgCh <- aakMd
 
 	return nil
+}
+
+// handlePhase2ACOnline handles AC registration in Phase 2 mode (per-AC server assignment).
+// Returns (true, nil) if AC was redirected via NHP_ARD.
+// Returns (false, nil) if this server should handle the AC.
+// Returns (false, error) on error.
+func (s *UdpServer) handlePhase2ACOnline(
+	ppd *core.PacketParserData,
+	aolMsg *common.ACOnlineMsg,
+	transactionId uint64,
+	addrStr string,
+) (redirected bool, err error) {
+	acId := aolMsg.ACId
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Look up AC assignment from storage
+	assignment, err := s.storage.GetACAssignment(ctx, acId)
+	if err != nil {
+		if IsNotFoundError(err) {
+			// AC not found in storage - this is a new AC, fall back to Phase 1 mode
+			log.Info("server-ac(%s#%d@%s)[Phase2] AC not found in storage, using Phase 1 mode", acId, transactionId, addrStr)
+			return false, nil
+		}
+		log.Error("server-ac(%s#%d@%s)[Phase2] storage error looking up AC assignment: %v", acId, transactionId, addrStr, err)
+		return false, err
+	}
+
+	// Check if this server is assigned to the AC
+	serverID := s.config.Hostname // Use hostname as server identifier
+	isAssigned := false
+	for _, srv := range assignment.AssignedServers {
+		if srv.ID == serverID {
+			isAssigned = true
+			break
+		}
+	}
+
+	if isAssigned {
+		log.Info("server-ac(%s#%d@%s)[Phase2] this server (%s) is assigned to AC", acId, transactionId, addrStr, serverID)
+		return false, nil
+	}
+
+	// Not assigned - send NHP_ARD to redirect AC to assigned servers
+	log.Info("server-ac(%s#%d@%s)[Phase2] redirecting AC to %d assigned servers", acId, transactionId, addrStr, len(assignment.AssignedServers))
+
+	targets := make([]common.RedirectTarget, len(assignment.AssignedServers))
+	for i, srv := range assignment.AssignedServers {
+		targets[i] = common.RedirectTarget{
+			IP:           srv.IP,
+			Port:         srv.Port,
+			PubKeyBase64: srv.PubKey,
+			AZ:           srv.AZ,
+			ServerID:     srv.ID,
+		}
+	}
+
+	ardMsg := &common.ACRedispatchMsg{
+		Targets: targets,
+		ErrCode: common.ErrSuccess.ErrorCode(),
+	}
+	ardBytes, _ := json.Marshal(ardMsg)
+
+	ardMd := &core.MsgData{
+		HeaderType:     core.NHP_ARD,
+		TransactionId:  transactionId,
+		Compress:       true,
+		PrevParserData: ppd,
+		Message:        ardBytes,
+	}
+
+	// Forward to the transaction
+	transaction := ppd.ConnData.FindRemoteTransaction(transactionId)
+	if transaction == nil {
+		log.Error("server-ac(%s#%d@%s)[Phase2] transaction not found for NHP_ARD", acId, transactionId, addrStr)
+		return false, common.ErrTransactionIdNotFound
+	}
+
+	transaction.NextMsgCh <- ardMd
+	return true, nil
 }
 
 func (s *UdpServer) HandleDBOnline(ppd *core.PacketParserData) (err error) {

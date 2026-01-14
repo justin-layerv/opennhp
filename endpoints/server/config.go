@@ -924,3 +924,48 @@ func (s *UdpServer) reconcileACPeersFromRegistry() {
 		log.Error("Failed to update AC peers from registry: %v", err)
 	}
 }
+
+// ============================================================================
+// Phase 2: Storage Backend Configuration
+// See docs/design/PLUGGABLE_STORAGE_BACKEND.md for architecture details.
+// ============================================================================
+
+// loadStorageConfig loads storage backend configuration from storage.toml.
+// If no config file exists, returns default configuration (DynamoDB).
+func (s *UdpServer) loadStorageConfig() (*StorageConfig, error) {
+	fileName := filepath.Join(ExeDirPath, "etc", "storage.toml")
+	content, err := s.loadConfigFile(fileName)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Info("storage.toml not found, using default DynamoDB configuration")
+			defaultCfg := DefaultStorageConfig()
+			return &defaultCfg, nil
+		}
+		return nil, fmt.Errorf("failed to read storage config %s: %w", fileName, err)
+	}
+
+	var cfg StorageConfig
+	if err := toml.Unmarshal(content, &cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse storage config %s: %w", fileName, err)
+	}
+
+	// Apply defaults for unset values
+	if cfg.Backend == "" {
+		cfg.Backend = "dynamodb"
+	}
+	if cfg.Cache.MaxEntries == 0 {
+		cfg.Cache.MaxEntries = 10000
+	}
+	if cfg.Cache.DefaultTTL == 0 {
+		cfg.Cache.DefaultTTL = 60
+	}
+	if cfg.Cache.ReassignmentTTL == 0 {
+		cfg.Cache.ReassignmentTTL = 5
+	}
+	if cfg.Cache.ReassignmentWindow == 0 {
+		cfg.Cache.ReassignmentWindow = 300
+	}
+
+	log.Info("Loaded storage configuration: backend=%s", cfg.Backend)
+	return &cfg, nil
+}

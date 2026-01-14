@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -100,6 +101,14 @@ type UdpServer struct {
 	// etcd client
 	etcdConn                *etcd.EtcdConn
 	remoteConfigUpdateMutex sync.Mutex
+
+	// ============================================================================
+	// Phase 2: Pluggable Storage Backend (DynamoDB/etcd)
+	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md for architecture details.
+	// ============================================================================
+	storage       StorageBackend   // DynamoDB (cloud) or etcd (on-prem)
+	storageConfig *StorageConfig
+	forwarder     *ServerForwarder // Server-to-server knock forwarding
 }
 
 type BlockAddr struct {
@@ -178,6 +187,31 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	if err != nil {
 		return err
 	}
+
+	// ============================================================================
+	// Phase 2: Initialize pluggable storage backend (DynamoDB or etcd)
+	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md for architecture details.
+	// ============================================================================
+	s.storageConfig, err = s.loadStorageConfig()
+	if err != nil {
+		log.Warning("Failed to load storage config, storage backend disabled: %v", err)
+		// Continue without storage - fall back to etcd/local config for AC discovery
+	} else if s.storageConfig != nil && s.storageConfig.Backend != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		s.storage, err = CreateStorageBackend(ctx, *s.storageConfig)
+		if err != nil {
+			log.Warning("Failed to create storage backend (%s): %v", s.storageConfig.Backend, err)
+			// Continue without storage - fall back to etcd/local config
+		} else {
+			log.Info("Storage backend initialized: %s", s.storage.Name())
+		}
+	}
+
+	// Initialize server-to-server forwarder (Phase 2)
+	s.forwarder = NewServerForwarder(s)
+	s.forwarder.Start()
 
 	if s.config.WebRTC.Enable {
 		s.webrtcServer = NewWebRTCServer(s, &s.config.WebRTC)
@@ -307,6 +341,14 @@ func (s *UdpServer) Stop() {
 	}
 	if s.webrtcServer != nil {
 		s.webrtcServer.Stop()
+	}
+	// Close storage backend (Phase 2)
+	if s.storage != nil {
+		s.storage.Close()
+	}
+	// Stop forwarder cleanup routine (Phase 2)
+	if s.forwarder != nil {
+		s.forwarder.Stop()
 	}
 	close(s.signals.stop)
 	s.listenConn.Close()
@@ -762,6 +804,12 @@ func (s *UdpServer) recvMessageRoutine() {
 				go s.HandleDHPDRGMessage(ppd)
 			case core.NHP_DAV:
 				go s.HandleDHPDAVMessage(ppd)
+
+			// Phase 2: Server-to-server forwarding
+			case core.NHP_FWD:
+				go s.HandleForwardRequest(ppd)
+			case core.NHP_FRT:
+				go s.HandleForwardResult(ppd)
 			}
 
 		}
@@ -1043,6 +1091,66 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 		}
 	}
 
+	// ============================================================================
+	// Phase 2: Check if we need to forward this knock to another server
+	// If the AC for this resource isn't connected to us, we look up DynamoDB
+	// to find which servers the AC IS connected to, then forward the knock.
+	// ============================================================================
+	needsForwarding := false
+	var forwardACId string
+	for _, resInfo := range res.Resources {
+		if resInfo == nil {
+			continue
+		}
+		s.acConnectionMapMutex.Lock()
+		_, found := s.acConnectionMap[resInfo.ACId]
+		s.acConnectionMapMutex.Unlock()
+		if !found {
+			needsForwarding = true
+			forwardACId = resInfo.ACId
+			break
+		}
+	}
+
+	// Try forwarding if: AC not connected, storage available, original packet available
+	if needsForwarding && s.storage != nil && s.forwarder != nil && len(req.OriginalPacket) > 0 {
+		log.Info("server-agent(%s@%s)[handleNhpOpenResource] AC %s not connected, attempting forward",
+			knkMsg.UserId, addrStr, forwardACId)
+
+		// Look up AC assignment from storage
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		assignment, lookupErr := s.storage.GetACAssignment(ctx, forwardACId)
+		if lookupErr == nil && assignment != nil && len(assignment.AssignedServers) > 0 {
+			// Parse user address for forwarding
+			userAddr, parseErr := net.ResolveUDPAddr("udp", addrStr)
+			if parseErr == nil {
+				// Forward the knock to assigned servers
+				fwdCtx, fwdCancel := context.WithTimeout(context.Background(), ForwardTimeout)
+				defer fwdCancel()
+
+				result, fwdErr := s.forwarder.ForwardKnock(fwdCtx, assignment, req.OriginalPacket, userAddr)
+				if fwdErr == nil && result != nil && result.Success {
+					// Forward succeeded - parse and return the ACK from the assigned server
+					var forwardedAck common.ServerKnockAckMsg
+					if json.Unmarshal(result.ACKData, &forwardedAck) == nil {
+						log.Info("server-agent(%s@%s)[handleNhpOpenResource] forward succeeded via assigned server",
+							knkMsg.UserId, addrStr)
+						return &forwardedAck, nil
+					}
+				} else if fwdErr != nil {
+					log.Warning("server-agent(%s@%s)[handleNhpOpenResource] forward failed: %v",
+						knkMsg.UserId, addrStr, fwdErr)
+				}
+			}
+		} else if lookupErr != nil && !IsNotFoundError(lookupErr) {
+			log.Warning("server-agent(%s@%s)[handleNhpOpenResource] storage lookup failed: %v",
+				knkMsg.UserId, addrStr, lookupErr)
+		}
+		// Fall through to local processing if forwarding failed
+	}
+
 	// PART III: request ac operation for each resource and block for response
 	var acWg sync.WaitGroup
 	var artMsgsMutex sync.Mutex
@@ -1135,6 +1243,41 @@ func (us *UdpServer) FindPluginHandler(aspId string) plugins.PluginHandler {
 	return handler
 }
 
+// ============================================================================
+// Phase 2: Server-to-Server Forwarding Handlers
+// See docs/design/PLUGGABLE_STORAGE_BACKEND.md sections 6.3-6.5 for details.
+// ============================================================================
+
+// HandleForwardRequest processes an incoming NHP_FWD message from another server.
+func (s *UdpServer) HandleForwardRequest(ppd *core.PacketParserData) {
+	var fwdMsg common.ServerForwardMsg
+	if err := json.Unmarshal(ppd.BodyMessage, &fwdMsg); err != nil {
+		log.Error("Failed to parse NHP_FWD message: %v", err)
+		return
+	}
+
+	if s.forwarder != nil {
+		s.forwarder.HandleForwardRequest(ppd, &fwdMsg)
+	} else {
+		log.Warning("Received NHP_FWD but forwarder not initialized")
+	}
+}
+
+// HandleForwardResult processes an incoming NHP_FRT response from another server.
+func (s *UdpServer) HandleForwardResult(ppd *core.PacketParserData) {
+	var resultMsg common.ServerForwardResultMsg
+	if err := json.Unmarshal(ppd.BodyMessage, &resultMsg); err != nil {
+		log.Error("Failed to parse NHP_FRT message: %v", err)
+		return
+	}
+
+	if s.forwarder != nil {
+		s.forwarder.HandleForwardResult(ppd, &resultMsg)
+	} else {
+		log.Warning("Received NHP_FRT but forwarder not initialized")
+	}
+}
+
 // DHP
 func (s *UdpServer) AddDEPeer(device *core.UdpPeer) {
 	if device.DeviceType() == core.NHP_DB {
@@ -1195,4 +1338,71 @@ func (s *UdpServer) ProcessDataPrivateKeyWrapping(dwrMsg *common.DWRMsg, conn *D
 	}
 
 	return dwaMsg, nil
+}
+
+// FindACConnectionForKnock finds the AC connection for a given knock message.
+// This looks up the AC ID from the auth service provider's resource info
+// and returns the corresponding AC connection if found.
+func (s *UdpServer) FindACConnectionForKnock(knkMsg *common.AgentKnockMsg) *ACConn {
+	// Find the auth service provider
+	aspData := s.FindAuthSvcProvider(knkMsg.AuthServiceId)
+	if aspData == nil {
+		log.Debug("FindACConnectionForKnock: ASP not found for %s", knkMsg.AuthServiceId)
+		return nil
+	}
+
+	// Find the resource to get the AC ID
+	resInfo := aspData.FindResource(knkMsg.ResourceId)
+	if resInfo == nil {
+		log.Debug("FindACConnectionForKnock: Resource %s not found in ASP %s", knkMsg.ResourceId, knkMsg.AuthServiceId)
+		return nil
+	}
+
+	acId := resInfo.ACId
+	if acId == "" {
+		log.Debug("FindACConnectionForKnock: Resource %s has no AC ID", knkMsg.ResourceId)
+		return nil
+	}
+
+	// Look up the AC connection
+	s.acConnectionMapMutex.Lock()
+	acConn, found := s.acConnectionMap[acId]
+	s.acConnectionMapMutex.Unlock()
+
+	if !found {
+		log.Debug("FindACConnectionForKnock: AC %s not connected", acId)
+		return nil
+	}
+
+	return acConn
+}
+
+// ============================================================================
+// ForwarderDeps Interface Implementation
+// ============================================================================
+
+// GetHostname returns the server's hostname for use in forward messages.
+func (s *UdpServer) GetHostname() string {
+	return s.config.Hostname
+}
+
+// GetDevice returns the core.Device for Noise protocol operations.
+func (s *UdpServer) GetDevice() *core.Device {
+	return s.device
+}
+
+// SendMessage queues a message for sending via the server's send channel.
+func (s *UdpServer) SendMessage(md *core.MsgData) {
+	s.sendMsgCh <- md
+}
+
+// ProcessACOperation wraps the internal processACOperation method.
+func (s *UdpServer) ProcessACOperation(
+	knkMsg *common.AgentKnockMsg,
+	acConn *ACConn,
+	srcAddr *common.NetAddress,
+	dstAddrs []*common.NetAddress,
+	openTime uint32,
+) (*common.ACOpsResultMsg, error) {
+	return s.processACOperation(knkMsg, acConn, srcAddr, dstAddrs, openTime)
 }

@@ -586,3 +586,17 @@ func (ppd *PacketParserData) IsAllowedAtOverload() bool {
 		return false
 	}
 }
+
+// BasePacketContent returns a copy of the original encrypted packet content.
+// This is used for server-to-server knock forwarding where the receiving server
+// needs to decrypt the original packet using the shared registration keypair.
+// Returns nil if the base packet is not available.
+func (ppd *PacketParserData) BasePacketContent() []byte {
+	if ppd == nil || ppd.basePacket == nil || len(ppd.basePacket.Content) == 0 {
+		return nil
+	}
+	// Return a copy to prevent modification of the original
+	content := make([]byte, len(ppd.basePacket.Content))
+	copy(content, ppd.basePacket.Content)
+	return content
+}

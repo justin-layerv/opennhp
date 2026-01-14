@@ -41,6 +41,14 @@ const (
 	NHP_DOL // DB sends online status to server
 	NHP_DBA // server send ack to db after receiving db's online status
 	DHP_KNK // agent sends dhp knock to server
+
+	// ============================================================================
+	// Per-AC Server Assignment Messages (Phase 2 - Pluggable Storage Backend)
+	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md for architecture details.
+	// ============================================================================
+	NHP_FWD // server forwards knock to assigned server (server-to-server, LayerV extension)
+	NHP_FRT // server returns forward result (server-to-server, LayerV extension)
+	NHP_ARD // server sends AC redispatch with assigned servers (NHP spec message)
 )
 
 var nhpHeaderTypeStrings []string = []string{
@@ -72,6 +80,10 @@ var nhpHeaderTypeStrings []string = []string{
 	"NHP_DOL", //DB sends online status to server
 	"NHP_DBA", //server send ack to db after receiving db's online status
 	"DHP-KNK", //agent sends dhp knock to server
+	// Per-AC Server Assignment Messages (Phase 2)
+	"NHP-FWD", // server forwards knock to assigned server (server-to-server)
+	"NHP-FRT", // server returns forward result (server-to-server)
+	"NHP-ARD", // server sends AC redispatch with assigned servers
 }
 
 func HeaderTypeToString(t int) string {
@@ -85,7 +97,8 @@ func HeaderTypeToDeviceType(t int) int {
 	switch t {
 	case NHP_KNK, NHP_LST, NHP_RKN, NHP_OTP, NHP_REG, NHP_ACC, NHP_EXT:
 		return NHP_AGENT
-	case NHP_ACK, NHP_AOP, NHP_LRT, NHP_COK, NHP_AAK, NHP_RAK, NHP_DAK, NHP_DAG, NHP_DBA, NHP_DWR, NHP_DSA:
+	case NHP_ACK, NHP_AOP, NHP_LRT, NHP_COK, NHP_AAK, NHP_RAK, NHP_DAK, NHP_DAG, NHP_DBA, NHP_DWR, NHP_DSA,
+		NHP_FWD, NHP_FRT, NHP_ARD: // Per-AC Server Assignment Messages (Phase 2)
 		return NHP_SERVER
 
 	case NHP_AOL, NHP_ART:
@@ -192,12 +205,15 @@ func (d *Device) CheckRecvHeaderType(t int) bool {
 		}
 	case NHP_SERVER:
 		switch t {
-		case NHP_REG, NHP_KNK, DHP_KNK, NHP_LST, NHP_RKN, NHP_EXT, NHP_ART, NHP_RLY, NHP_AOL, NHP_OTP, NHP_DRG, NHP_DAR, NHP_DAV, NHP_DOL, NHP_DWA:
+		// NHP_FWD, NHP_FRT: Server-to-server forwarding (Phase 2 - Per-AC Assignment)
+		case NHP_REG, NHP_KNK, DHP_KNK, NHP_LST, NHP_RKN, NHP_EXT, NHP_ART, NHP_RLY, NHP_AOL, NHP_OTP, NHP_DRG, NHP_DAR, NHP_DAV, NHP_DOL, NHP_DWA,
+			NHP_FWD, NHP_FRT:
 			return true
 		}
 	case NHP_AC:
 		switch t {
-		case NHP_AOP, NHP_LRT, NHP_AAK:
+		// NHP_ARD: AC Redispatch - server redirects AC to assigned servers (Phase 2)
+		case NHP_AOP, NHP_LRT, NHP_AAK, NHP_ARD:
 			return true
 		}
 	case NHP_RELAY:
