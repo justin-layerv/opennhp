@@ -734,11 +734,12 @@ resource "aws_iam_role_policy_attachment" "terraform_read" {
   policy_arn = aws_iam_policy.terraform_read.arn
 }
 
-# Terraform apply permissions - split into inline policies due to size limits
+# Terraform apply permissions - split into customer-managed policies
+# Following AWS best practices: use managed policies instead of inline policies
 # Part 1: EC2 and Networking
-resource "aws_iam_role_policy" "terraform_apply_ec2" {
-  name = "terraform-apply-ec2"
-  role = aws_iam_role.github_actions.id
+resource "aws_iam_policy" "terraform_apply_ec2" {
+  name        = "nhp-${var.environment}-github-actions-terraform-apply-ec2"
+  description = "EC2 and networking permissions for Terraform apply (${var.environment})"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -821,10 +822,15 @@ resource "aws_iam_role_policy" "terraform_apply_ec2" {
   })
 }
 
+resource "aws_iam_role_policy_attachment" "terraform_apply_ec2" {
+  role       = aws_iam_role.github_actions.name
+  policy_arn = aws_iam_policy.terraform_apply_ec2.arn
+}
+
 # Part 2: IAM and Security
-resource "aws_iam_role_policy" "terraform_apply_iam" {
-  name = "terraform-apply-iam"
-  role = aws_iam_role.github_actions.id
+resource "aws_iam_policy" "terraform_apply_iam" {
+  name        = "nhp-${var.environment}-github-actions-terraform-apply-iam"
+  description = "IAM and security permissions for Terraform apply (${var.environment})"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -914,10 +920,15 @@ resource "aws_iam_role_policy" "terraform_apply_iam" {
   })
 }
 
+resource "aws_iam_role_policy_attachment" "terraform_apply_iam" {
+  role       = aws_iam_role.github_actions.name
+  policy_arn = aws_iam_policy.terraform_apply_iam.arn
+}
+
 # Part 3: Application Services
-resource "aws_iam_role_policy" "terraform_apply_services" {
-  name = "terraform-apply-services"
-  role = aws_iam_role.github_actions.id
+resource "aws_iam_policy" "terraform_apply_services" {
+  name        = "nhp-${var.environment}-github-actions-terraform-apply-services"
+  description = "Application services permissions for Terraform apply (${var.environment})"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -1014,6 +1025,54 @@ resource "aws_iam_role_policy" "terraform_apply_services" {
         Resource = "*"
       },
       {
+        Sid    = "S3Buckets"
+        Effect = "Allow"
+        Action = [
+          "s3:CreateBucket",
+          "s3:DeleteBucket",
+          "s3:PutBucketVersioning",
+          "s3:PutEncryptionConfiguration",
+          "s3:GetEncryptionConfiguration",
+          "s3:PutBucketPublicAccessBlock",
+          "s3:PutBucketTagging",
+          "s3:PutBucketPolicy",
+          "s3:DeleteBucketPolicy"
+        ]
+        Resource = "arn:aws:s3:::layerv-nhp-*"
+      },
+      {
+        Sid    = "EventBridge"
+        Effect = "Allow"
+        Action = [
+          "events:PutRule",
+          "events:DeleteRule",
+          "events:PutTargets",
+          "events:RemoveTargets",
+          "events:EnableRule",
+          "events:DisableRule",
+          "events:TagResource",
+          "events:UntagResource"
+        ]
+        Resource = "arn:aws:events:${local.region}:${local.account_id}:rule/layerv-nhp-*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "terraform_apply_services" {
+  role       = aws_iam_role.github_actions.name
+  policy_arn = aws_iam_policy.terraform_apply_services.arn
+}
+
+# Part 4: Data Services (DynamoDB, RDS, Lambda, SSM, ACM)
+resource "aws_iam_policy" "terraform_apply_data" {
+  name        = "nhp-${var.environment}-github-actions-terraform-apply-data"
+  description = "Data services permissions for Terraform apply (${var.environment})"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
         Sid    = "DynamoDB"
         Effect = "Allow"
         Action = [
@@ -1060,37 +1119,6 @@ resource "aws_iam_role_policy" "terraform_apply_services" {
         Resource = "*"
       },
       {
-        Sid    = "S3Buckets"
-        Effect = "Allow"
-        Action = [
-          "s3:CreateBucket",
-          "s3:DeleteBucket",
-          "s3:PutBucketVersioning",
-          "s3:PutEncryptionConfiguration",
-          "s3:GetEncryptionConfiguration",
-          "s3:PutBucketPublicAccessBlock",
-          "s3:PutBucketTagging",
-          "s3:PutBucketPolicy",
-          "s3:DeleteBucketPolicy"
-        ]
-        Resource = "arn:aws:s3:::layerv-nhp-*"
-      },
-      {
-        Sid    = "EventBridge"
-        Effect = "Allow"
-        Action = [
-          "events:PutRule",
-          "events:DeleteRule",
-          "events:PutTargets",
-          "events:RemoveTargets",
-          "events:EnableRule",
-          "events:DisableRule",
-          "events:TagResource",
-          "events:UntagResource"
-        ]
-        Resource = "arn:aws:events:${local.region}:${local.account_id}:rule/layerv-nhp-*"
-      },
-      {
         Sid    = "RDS"
         Effect = "Allow"
         Action = [
@@ -1135,13 +1163,18 @@ resource "aws_iam_role_policy" "terraform_apply_services" {
   })
 }
 
+resource "aws_iam_role_policy_attachment" "terraform_apply_data" {
+  role       = aws_iam_role.github_actions.name
+  policy_arn = aws_iam_policy.terraform_apply_data.arn
+}
+
 # S3 write permissions for Traefik plugins bucket
 # Allows traefik-plugins repo to upload plugins to S3
-resource "aws_iam_role_policy" "plugin_bucket_write" {
+resource "aws_iam_policy" "plugin_bucket_write" {
   count = var.enable_plugin_bucket_policy ? 1 : 0
 
-  name = "plugin-bucket-write"
-  role = aws_iam_role.github_actions.id
+  name        = "nhp-${var.environment}-github-actions-plugin-bucket-write"
+  description = "S3 plugin bucket write permissions (${var.environment})"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -1162,6 +1195,13 @@ resource "aws_iam_role_policy" "plugin_bucket_write" {
       }
     ]
   })
+}
+
+resource "aws_iam_role_policy_attachment" "plugin_bucket_write" {
+  count = var.enable_plugin_bucket_policy ? 1 : 0
+
+  role       = aws_iam_role.github_actions.name
+  policy_arn = aws_iam_policy.plugin_bucket_write[0].arn
 }
 
 # ============================================================================
