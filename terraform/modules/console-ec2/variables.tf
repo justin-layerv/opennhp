@@ -98,7 +98,52 @@ variable "ac_configs" {
 }
 
 # ============================================================================
-# NHP Protection Configuration
+# NHP Server Assignment Configuration
+# ============================================================================
+
+variable "nhp_server_assignment_enabled" {
+  description = <<-EOT
+    Enable NHP server assignment for ACs. When enabled, Console automatically
+    assigns NHP servers to ACs using DynamoDB for storage and CloudMap for
+    server discovery. Servers are selected from different availability zones
+    for high availability.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "nhp_region" {
+  description = "AWS region for NHP DynamoDB tables and CloudMap namespace"
+  type        = string
+  default     = "us-east-2"
+}
+
+variable "nhp_dynamodb_ac_assignments_table" {
+  description = "DynamoDB table name for AC server assignments"
+  type        = string
+  default     = null # Uses environment-specific name from dynamodb module
+}
+
+variable "nhp_dynamodb_server_ac_index_table" {
+  description = "DynamoDB table name for server-to-AC index"
+  type        = string
+  default     = null # Uses environment-specific name from dynamodb module
+}
+
+variable "nhp_cloudmap_namespace" {
+  description = "CloudMap namespace for NHP server discovery"
+  type        = string
+  default     = "nhp.internal"
+}
+
+variable "nhp_cloudmap_service_name" {
+  description = "CloudMap service name for NHP servers"
+  type        = string
+  default     = "nhp-servers"
+}
+
+# ============================================================================
+# NHP Protection Configuration (Network-Level Hiding)
 # ============================================================================
 
 variable "internal_only" {

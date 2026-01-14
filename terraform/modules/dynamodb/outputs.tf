@@ -17,6 +17,11 @@ output "resources_table_arn" {
   value       = aws_dynamodb_table.resources.arn
 }
 
+output "server_ac_index_table_arn" {
+  description = "ARN of the server-AC index DynamoDB table"
+  value       = aws_dynamodb_table.server_ac_index.arn
+}
+
 # ==================== Table Names ====================
 
 output "licenses_table_name" {
@@ -32,6 +37,11 @@ output "ac_assignments_table_name" {
 output "resources_table_name" {
   description = "Name of the resources DynamoDB table"
   value       = aws_dynamodb_table.resources.name
+}
+
+output "server_ac_index_table_name" {
+  description = "Name of the server-AC index DynamoDB table"
+  value       = aws_dynamodb_table.server_ac_index.name
 }
 
 # ==================== IAM Policy ARNs ====================

@@ -152,6 +152,38 @@ resource "aws_iam_role_policy" "console" {
         ]
         Resource = compact([var.ecr_repo_arn, var.nhp_ac_ecr_repo_arn])
       },
+      # NHP Server Assignment: DynamoDB access for AC assignments
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:Query",
+          "dynamodb:Scan",
+          "dynamodb:BatchGetItem",
+          "dynamodb:BatchWriteItem"
+        ]
+        # Use wildcards to support environment-specific table names
+        Resource = compact([
+          var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}" : "",
+          var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}/index/*" : "",
+          var.nhp_dynamodb_server_ac_index_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_server_ac_index_table}" : "",
+          var.nhp_dynamodb_server_ac_index_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_server_ac_index_table}/index/*" : ""
+        ])
+      },
+      # NHP Server Assignment: CloudMap for server discovery
+      # Note: DiscoverInstances requires Resource = "*" per AWS IAM documentation.
+      # It's a cross-namespace discovery API that doesn't support resource-level permissions.
+      # Condition keys like servicediscovery:NamespaceName can restrict scope if needed.
+      {
+        Effect = "Allow"
+        Action = [
+          "servicediscovery:DiscoverInstances"
+        ]
+        Resource = "*"
+      },
       # Route 53 for certbot DNS-01 challenge
       {
         Effect = "Allow"
@@ -352,6 +384,13 @@ locals {
     # etcd for Console AC registration
     etcd_endpoint       = var.etcd_endpoint
     etcd_tls_secret_arn = var.etcd_tls_secret_arn
+    # NHP Server Assignment
+    nhp_server_assignment_enabled      = var.nhp_server_assignment_enabled
+    nhp_region                         = var.nhp_region
+    nhp_dynamodb_ac_assignments_table  = var.nhp_dynamodb_ac_assignments_table
+    nhp_dynamodb_server_ac_index_table = var.nhp_dynamodb_server_ac_index_table
+    nhp_cloudmap_namespace             = var.nhp_cloudmap_namespace
+    nhp_cloudmap_service_name          = var.nhp_cloudmap_service_name
   })
 }
 

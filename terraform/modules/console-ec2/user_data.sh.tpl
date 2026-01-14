@@ -936,6 +936,16 @@ docker run -d \
 %{ if admin_password != null ~}
     -e "GVA_ADMIN_PASSWORD=${admin_password}" \
 %{ endif ~}
+    -e "GVA_CONFIG_NHP_ENABLED=${nhp_server_assignment_enabled}" \
+    -e "GVA_CONFIG_NHP_REGION=${nhp_region}" \
+%{ if nhp_dynamodb_ac_assignments_table != null ~}
+    -e "GVA_CONFIG_NHP_DYNAMODB_AC_ASSIGNMENTS_TABLE=${nhp_dynamodb_ac_assignments_table}" \
+%{ endif ~}
+%{ if nhp_dynamodb_server_ac_index_table != null ~}
+    -e "GVA_CONFIG_NHP_DYNAMODB_SERVER_AC_INDEX_TABLE=${nhp_dynamodb_server_ac_index_table}" \
+%{ endif ~}
+    -e "GVA_CONFIG_NHP_CLOUDMAP_NAMESPACE=${nhp_cloudmap_namespace}" \
+    -e "GVA_CONFIG_NHP_CLOUDMAP_SERVICE_NAME=${nhp_cloudmap_service_name}" \
     "$CONSOLE_IMAGE"
 
 # Wait for console to be healthy

@@ -77,10 +77,7 @@ resource "aws_dynamodb_table" "licenses" {
 #             reassigned_at, created_at, last_seen
 #
 # GSIs: resource_fqdn-index, customer_id-index
-# NOTE: server_id-index is mentioned in design doc but deferred to Phase 2.
-#       The assigned_servers attribute is a List type which cannot be indexed
-#       directly. Phase 2 will determine the best approach: separate index table,
-#       DynamoDB Streams, or schema redesign.
+# Note: For server_id lookups, see nhp_server_ac_index table below.
 
 resource "aws_dynamodb_table" "ac_assignments" {
   name         = "${var.name_prefix}-ac-assignments"
@@ -137,6 +134,78 @@ resource "aws_dynamodb_table" "ac_assignments" {
     Name      = "${var.name_prefix}-ac-assignments"
     Component = "dynamodb"
     Purpose   = "AC server assignment"
+  })
+}
+
+# ==================== nhp_server_ac_index Table ====================
+# Inverted index: maps server_id -> ac_id for efficient lookups
+#
+# This table enables efficient queries like "find all ACs assigned to server X"
+# which is needed for health monitoring and reassignment when a server fails.
+#
+# PK: server_id (String) - The NHP server instance ID
+# SK: ac_id (String) - The AC ID assigned to this server
+#
+# Example query (find all ACs assigned to server i-abc123):
+#   aws dynamodb query \
+#     --table-name nhp-sandbox-server-ac-index \
+#     --key-condition-expression "server_id = :sid" \
+#     --expression-attribute-values '{":sid":{"S":"i-abc123"}}'
+#
+# Console writes to this table when:
+# - AC is created (add server_id -> ac_id mappings for each assigned server)
+# - AC is deleted (remove all server_id -> ac_id mappings)
+# - AC is reassigned (remove old mappings, add new mappings)
+#
+# Consistency model: Best-effort with fallback. Console writes to both
+# ac_assignments and server_ac_index separately (not transactionally).
+# If index operations fail, health monitoring falls back to table scan.
+#
+# Note: No GSI needed for reverse lookup (AC -> servers) since that data
+# lives directly in ac_assignments.assigned_servers attribute.
+
+resource "aws_dynamodb_table" "server_ac_index" {
+  name         = "${var.name_prefix}-server-ac-index"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "server_id"
+  range_key    = "ac_id"
+
+  attribute {
+    name = "server_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "ac_id"
+    type = "S"
+  }
+
+  # Enable point-in-time recovery for production
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  # Server-side encryption with KMS
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  # TTL for automatic cleanup of orphaned entries
+  # Console sets TTL to 30 days from creation/update; refreshed on AC reassignment.
+  # If an AC is stable (not reassigned) for >30 days, entries expire. This is intentional:
+  # - Health monitor falls back to table scan if index entries are missing
+  # - Truly idle ACs are rare; server health changes trigger reassignment and TTL refresh
+  # - On next reassignment, entries are recreated with fresh TTL
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-server-ac-index"
+    Component = "dynamodb"
+    Purpose   = "Server to AC inverted index"
   })
 }
 
@@ -218,6 +287,7 @@ resource "aws_iam_policy" "dynamodb_read" {
           "${aws_dynamodb_table.licenses.arn}/index/*",
           aws_dynamodb_table.ac_assignments.arn,
           "${aws_dynamodb_table.ac_assignments.arn}/index/*",
+          aws_dynamodb_table.server_ac_index.arn,
           aws_dynamodb_table.resources.arn,
           "${aws_dynamodb_table.resources.arn}/index/*"
         ]
@@ -262,6 +332,7 @@ resource "aws_iam_policy" "dynamodb_write" {
           "${aws_dynamodb_table.licenses.arn}/index/*",
           aws_dynamodb_table.ac_assignments.arn,
           "${aws_dynamodb_table.ac_assignments.arn}/index/*",
+          aws_dynamodb_table.server_ac_index.arn,
           aws_dynamodb_table.resources.arn,
           "${aws_dynamodb_table.resources.arn}/index/*"
         ]
