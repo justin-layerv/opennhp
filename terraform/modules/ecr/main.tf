@@ -866,9 +866,14 @@ resource "aws_iam_role_policy" "terraform_apply_iam" {
           "iam:DeletePolicy",
           "iam:CreatePolicyVersion",
           "iam:DeletePolicyVersion",
-          "iam:SetDefaultPolicyVersion"
+          "iam:SetDefaultPolicyVersion",
+          "iam:TagPolicy",
+          "iam:UntagPolicy"
         ]
-        Resource = "arn:aws:iam::${local.account_id}:policy/nhp-*"
+        Resource = [
+          "arn:aws:iam::${local.account_id}:policy/nhp-*",
+          "arn:aws:iam::${local.account_id}:policy/layerv-nhp-*"
+        ]
       },
       {
         Sid    = "SecurityServices"
@@ -1007,6 +1012,20 @@ resource "aws_iam_role_policy" "terraform_apply_services" {
           "servicediscovery:UntagResource"
         ]
         Resource = "*"
+      },
+      {
+        Sid    = "DynamoDB"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:CreateTable",
+          "dynamodb:DeleteTable",
+          "dynamodb:UpdateTable",
+          "dynamodb:UpdateTimeToLive",
+          "dynamodb:UpdateContinuousBackups",
+          "dynamodb:TagResource",
+          "dynamodb:UntagResource"
+        ]
+        Resource = "arn:aws:dynamodb:${local.region}:${local.account_id}:table/layerv-nhp-*"
       },
       {
         Sid    = "SSMACMLambda"
