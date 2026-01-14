@@ -107,9 +107,12 @@ variable "nhp_server_assignment_enabled" {
     assigns NHP servers to ACs using DynamoDB for storage and CloudMap for
     server discovery. Servers are selected from different availability zones
     for high availability.
+
+    NOTE: Disabled by default until Console properly supports servers-per-ac
+    env var configuration. See PR #136 for details.
   EOT
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "nhp_region" {

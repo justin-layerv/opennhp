@@ -946,7 +946,7 @@ docker run -d \
 %{ endif ~}
     -e "GVA_CONFIG_NHP_CLOUDMAP_NAMESPACE=${nhp_cloudmap_namespace}" \
     -e "GVA_CONFIG_NHP_CLOUDMAP_SERVICE_NAME=${nhp_cloudmap_service_name}" \
-    -e "GVA_CONFIG_NHP_ASSIGNMENT_SERVERSPERAC=${nhp_assignment_servers_per_ac}" \
+    -e "GVA_CONFIG_NHP_ASSIGNMENT_SERVERS_PER_AC=${nhp_assignment_servers_per_ac}" \
     "$CONSOLE_IMAGE"
 
 # Wait for console to be healthy
