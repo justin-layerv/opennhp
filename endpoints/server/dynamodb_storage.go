@@ -278,8 +278,12 @@ func CreateStorageBackend(ctx context.Context, cfg StorageConfig) (StorageBacken
 
 	case "etcd":
 		// etcd backend (feature flag for on-prem)
-		// TODO: Implement EtcdStorage in etcd_storage.go
-		return nil, fmt.Errorf("etcd storage backend not yet implemented")
+		backend, err := NewEtcdStorage(ctx, cfg.Etcd)
+		if err != nil {
+			return nil, err
+		}
+		// Wrap with cache
+		return NewCachedStorage(backend, cfg.Cache), nil
 
 	default:
 		return nil, fmt.Errorf("unknown storage backend: %s", cfg.Backend)

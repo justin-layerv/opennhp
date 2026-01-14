@@ -186,25 +186,67 @@ variable "auth_service_id" {
 }
 
 # ============================================================================
-# Phase 1: Pluggable Storage Backend - DynamoDB and SSM Keypair Access
-# These policies enable the new per-AC assignment architecture.
+# Phase 4: Pluggable Storage Backend
+# These settings control which storage backend is used for AC assignments,
+# licenses, and resources. DynamoDB is the default for cloud deployments.
+# etcd is available as a feature flag for on-prem deployments.
 # See docs/design/PLUGGABLE_STORAGE_BACKEND.md for full architecture.
 # ============================================================================
 
-variable "attach_phase1_policies" {
-  description = "Whether to attach Phase 1 storage backend policies (DynamoDB + keypair). Must be true when dynamodb_read_policy_arn and keypair_policy_arn are provided. This boolean is required because Terraform cannot evaluate count based on module outputs at plan time."
+variable "storage_backend" {
+  description = <<-EOT
+    Storage backend for AC assignments, licenses, and resources.
+    - "dynamodb" (default): Use AWS DynamoDB for cloud deployments
+    - "etcd": Use etcd for on-prem deployments (feature flag)
+    When set to "dynamodb", attach_storage_policies must be true.
+    When set to "etcd", etcd_endpoint and etcd_tls_secret_arn should be configured.
+  EOT
+  type        = string
+  default     = "dynamodb"
+  validation {
+    condition     = contains(["dynamodb", "etcd"], var.storage_backend)
+    error_message = "storage_backend must be either 'dynamodb' or 'etcd'"
+  }
+}
+
+variable "dynamodb_region" {
+  description = "AWS region for DynamoDB tables (defaults to current region)"
+  type        = string
+  default     = null
+}
+
+variable "dynamodb_licenses_table" {
+  description = "DynamoDB table name for licenses"
+  type        = string
+  default     = null
+}
+
+variable "dynamodb_ac_assignments_table" {
+  description = "DynamoDB table name for AC assignments"
+  type        = string
+  default     = null
+}
+
+variable "dynamodb_resources_table" {
+  description = "DynamoDB table name for resources"
+  type        = string
+  default     = null
+}
+
+variable "attach_storage_policies" {
+  description = "Whether to attach storage backend policies (DynamoDB + keypair). Must be true when storage_backend is 'dynamodb'. This boolean is required because Terraform cannot evaluate count based on module outputs at plan time."
   type        = bool
   default     = false
 }
 
 variable "dynamodb_read_policy_arn" {
-  description = "IAM policy ARN for DynamoDB read access (from dynamodb module). Required when attach_phase1_policies is true."
+  description = "IAM policy ARN for DynamoDB read access (from dynamodb module). Required when attach_storage_policies is true and storage_backend is 'dynamodb'."
   type        = string
   default     = null
 }
 
 variable "keypair_policy_arn" {
-  description = "IAM policy ARN for SSM keypair access (from nhp-keypair module). Required when attach_phase1_policies is true."
+  description = "IAM policy ARN for SSM keypair access (from nhp-keypair module). Required when attach_storage_policies is true."
   type        = string
   default     = null
 }

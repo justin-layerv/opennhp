@@ -174,8 +174,9 @@ module "data" {
 }
 
 # ============================================================================
-# Phase 1: etcd Elimination Infrastructure
-# These modules support the new per-AC server assignment architecture.
+# Pluggable Storage Backend Infrastructure
+# These modules support the per-AC server assignment architecture.
+# DynamoDB is the default for cloud; etcd is available as a feature flag.
 # See docs/design/PLUGGABLE_STORAGE_BACKEND.md for full design.
 # ============================================================================
 
@@ -247,12 +248,19 @@ module "compute" {
   server_plugins  = var.server_plugins
   auth_service_id = var.ac_auth_service_id
 
-  # Phase 1: Pluggable storage backend - DynamoDB (cloud default) with etcd feature flag for on-prem
-  # These enable the new per-AC assignment architecture
-  # Note: attach_phase1_policies is required because Terraform cannot evaluate count based on module outputs
-  attach_phase1_policies   = true
+  # Pluggable storage backend - DynamoDB (cloud default) with etcd feature flag for on-prem
+  # Note: attach_storage_policies is required because Terraform cannot evaluate count based on module outputs
+  attach_storage_policies  = true
   dynamodb_read_policy_arn = module.dynamodb.read_policy_arn
   keypair_policy_arn       = module.nhp_keypair.server_keypair_policy_arn
+
+  # Storage backend configuration
+  # - "dynamodb" (default): Uses AWS DynamoDB for cloud deployments
+  # - "etcd": Uses etcd for on-prem deployments (feature flag)
+  storage_backend               = "dynamodb"
+  dynamodb_licenses_table       = module.dynamodb.licenses_table_name
+  dynamodb_ac_assignments_table = module.dynamodb.ac_assignments_table_name
+  dynamodb_resources_table      = module.dynamodb.resources_table_name
 }
 
 # Monitoring Module - CloudWatch Dashboard, Alarms, Slack Notifications

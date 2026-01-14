@@ -165,7 +165,7 @@ output "console_ec2_public_url" {
 }
 
 # ============================================================================
-# Phase 1: Pluggable Storage Backend Outputs (DynamoDB for cloud, etcd remains for on-prem)
+# Pluggable Storage Backend Outputs (DynamoDB for cloud, etcd for on-prem)
 # DynamoDB and keypair infrastructure for per-AC assignment architecture
 # See docs/design/PLUGGABLE_STORAGE_BACKEND.md for full design.
 # ============================================================================

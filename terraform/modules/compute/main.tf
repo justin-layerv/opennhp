@@ -240,18 +240,18 @@ resource "aws_iam_role_policy_attachment" "server_ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# Phase 1: DynamoDB read access for per-AC assignment architecture
+# DynamoDB read access for per-AC assignment architecture (when storage_backend = "dynamodb")
 # Uses boolean variable because Terraform cannot evaluate count based on module outputs at plan time
 # See docs/design/PLUGGABLE_STORAGE_BACKEND.md
 resource "aws_iam_role_policy_attachment" "server_dynamodb" {
-  count      = var.attach_phase1_policies ? 1 : 0
+  count      = var.attach_storage_policies ? 1 : 0
   role       = aws_iam_role.server.name
   policy_arn = var.dynamodb_read_policy_arn
 }
 
-# Phase 1: SSM keypair access for Noise K server-to-server forwarding
+# SSM keypair access for Noise K server-to-server forwarding
 resource "aws_iam_role_policy_attachment" "server_keypair" {
-  count      = var.attach_phase1_policies ? 1 : 0
+  count      = var.attach_storage_policies ? 1 : 0
   role       = aws_iam_role.server.name
   policy_arn = var.keypair_policy_arn
 }
@@ -429,6 +429,12 @@ locals {
     # Plugin configuration (plugins are baked into Docker image)
     server_plugins  = var.server_plugins
     auth_service_id = var.auth_service_id
+    # Storage backend configuration (Phase 4)
+    storage_backend               = var.storage_backend
+    dynamodb_region               = coalesce(var.dynamodb_region, data.aws_region.current.name)
+    dynamodb_licenses_table       = var.dynamodb_licenses_table
+    dynamodb_ac_assignments_table = var.dynamodb_ac_assignments_table
+    dynamodb_resources_table      = var.dynamodb_resources_table
   })
 }
 

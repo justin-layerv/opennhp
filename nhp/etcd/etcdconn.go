@@ -127,8 +127,10 @@ func (conn *EtcdConn) WatchValue(callbackFunc func(val []byte)) {
 
 func (conn *EtcdConn) Close() {
 	if conn.client != nil {
-		// stop the etcd watcher
-		close(conn.signals.stop)
+		// stop the etcd watcher (only if it was initialized)
+		if conn.signals.stop != nil {
+			close(conn.signals.stop)
+		}
 		conn.client.Close()
 	}
 }

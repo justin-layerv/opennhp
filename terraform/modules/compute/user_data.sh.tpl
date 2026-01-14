@@ -75,6 +75,46 @@ AesKey = "${auth_aes_key}"
 
 [webrtc]
 Enable = false
+
+# ============================================================================
+# Storage Backend Configuration (Phase 4)
+# Controls where AC assignments, licenses, and resources are stored.
+# - "dynamodb" (default): AWS DynamoDB for cloud deployments
+# - "etcd": etcd for on-prem deployments (feature flag)
+# ============================================================================
+[Storage]
+Backend = "${storage_backend}"
+
+%{ if storage_backend == "dynamodb" ~}
+[Storage.DynamoDB]
+Region = "${dynamodb_region}"
+%{ if dynamodb_licenses_table != null ~}
+LicensesTable = "${dynamodb_licenses_table}"
+%{ endif ~}
+%{ if dynamodb_ac_assignments_table != null ~}
+ACAssignmentsTable = "${dynamodb_ac_assignments_table}"
+%{ endif ~}
+%{ if dynamodb_resources_table != null ~}
+ResourcesTable = "${dynamodb_resources_table}"
+%{ endif ~}
+%{ endif ~}
+
+%{ if storage_backend == "etcd" && etcd_endpoint != "" ~}
+[Storage.Etcd]
+Endpoints = ["${etcd_endpoint}"]
+%{ if etcd_tls_secret_arn != "" ~}
+TLS = true
+CACert = "/nhp-server/etc/tls/ca.crt"
+ClientCert = "/nhp-server/etc/tls/client.crt"
+ClientKey = "/nhp-server/etc/tls/client.key"
+%{ endif ~}
+%{ endif ~}
+
+[Storage.Cache]
+MaxEntries = 10000
+DefaultTTL = 60
+ReassignmentTTL = 5
+ReassignmentWindow = 300
 CONFIGEOF
 
 # NHP Server uses local config.toml for base config (UDP port 62206)
