@@ -394,6 +394,7 @@ locals {
     nhp_dynamodb_server_ac_index_table = var.nhp_dynamodb_server_ac_index_table
     nhp_cloudmap_namespace             = var.nhp_cloudmap_namespace
     nhp_cloudmap_service_name          = var.nhp_cloudmap_service_name
+    nhp_assignment_servers_per_ac      = var.nhp_assignment_servers_per_ac
   })
 }
 

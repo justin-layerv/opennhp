@@ -142,6 +142,12 @@ variable "nhp_cloudmap_service_name" {
   default     = "nhp-servers"
 }
 
+variable "nhp_assignment_servers_per_ac" {
+  description = "Number of servers to assign per AC for redundancy (typically 3 for multi-AZ)"
+  type        = number
+  default     = 3
+}
+
 # ============================================================================
 # NHP Protection Configuration (Network-Level Hiding)
 # ============================================================================

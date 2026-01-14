@@ -550,6 +550,11 @@ module "console_ec2" {
   admin_password   = var.console_admin_password
   auth_signing_key = var.auth_signing_key
 
+  # NHP Server Assignment - DynamoDB tables for AC assignments
+  # Required when nhp_server_assignment_enabled=true (the default)
+  nhp_dynamodb_ac_assignments_table  = module.dynamodb.ac_assignments_table_name
+  nhp_dynamodb_server_ac_index_table = module.dynamodb.server_ac_index_table_name
+
   # NHP Network-Level Protection (true network hiding with iptables DROP)
   # When enabled, Console EC2 runs its own nhp-acd with iptables DROP by default.
   # Port 443 is only accessible after NHP knock adds the user's IP to ipset.
