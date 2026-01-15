@@ -814,7 +814,9 @@ resource "aws_iam_policy" "terraform_apply_ec2" {
           "autoscaling:CreateOrUpdateTags",
           "autoscaling:DeleteTags",
           "autoscaling:AttachLoadBalancerTargetGroups",
-          "autoscaling:DetachLoadBalancerTargetGroups"
+          "autoscaling:DetachLoadBalancerTargetGroups",
+          "autoscaling:PutLifecycleHook",
+          "autoscaling:DeleteLifecycleHook"
         ]
         Resource = "arn:aws:autoscaling:${local.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/layerv-nhp-*"
       }
