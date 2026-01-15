@@ -477,22 +477,6 @@ variable "console_protected_hostname" {
   default     = null
 }
 
-variable "enable_console_nhp_protection" {
-  description = <<-EOT
-    Enable true NHP network-level protection for Console EC2.
-    When true, Console EC2 runs its own nhp-acd with iptables DROP by default.
-    Port 443 is only accessible after NHP knock adds the user's IP to ipset.
-
-    Requires:
-    - console_internal_only = true
-    - console_protected_hostname to be set
-    - deploy_ac = true (for etcd and server references)
-    - hosted_zone to be set (for DNS records)
-  EOT
-  type        = bool
-  default     = false
-}
-
 # ==================== Common Tags ====================
 
 variable "tags" {

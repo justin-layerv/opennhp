@@ -10,29 +10,25 @@
 
 # ==================== Validation ====================
 
-# Validate required variables when NHP protection is enabled
+# Validate required variables for NHP protection (always enabled)
 check "nhp_protection_requirements" {
   assert {
-    condition = !var.enable_nhp_protection || (
+    condition = (
       var.nhp_server_secret_arn != null &&
       var.nhp_ac_repo_url != null &&
       var.nhp_ac_ecr_repo_arn != null &&
       var.nhp_server_hostname != null &&
       var.protected_hostname != null &&
-      var.protected_hosted_zone_id != null &&
-      var.etcd_endpoint != null &&
-      var.etcd_tls_secret_arn != null
+      var.protected_hosted_zone_id != null
     )
     error_message = <<-EOT
-      When enable_nhp_protection=true, the following variables are required:
+      NHP protection is always enabled. The following variables are required:
         - nhp_server_secret_arn
         - nhp_ac_repo_url
         - nhp_ac_ecr_repo_arn
         - nhp_server_hostname
         - protected_hostname
         - protected_hosted_zone_id
-        - etcd_endpoint
-        - etcd_tls_secret_arn
     EOT
   }
 }
@@ -227,19 +223,8 @@ resource "aws_security_group" "console" {
   vpc_id      = var.vpc_id
   description = "Security group for Console EC2"
 
-  # Internal mode: HTTP from AC only
-  # External mode: HTTPS/HTTP from anywhere
-  dynamic "ingress" {
-    for_each = var.internal_only ? [] : [1]
-    content {
-      from_port   = 443
-      to_port     = 443
-      protocol    = "tcp"
-      cidr_blocks = ["0.0.0.0/0"]
-      description = "HTTPS from NLB (external mode)"
-    }
-  }
-
+  # External mode: HTTP from anywhere (for ACME challenges and HTTPS redirect)
+  # Note: Port 443 is handled by the unconditional NHP protection rule below
   dynamic "ingress" {
     for_each = var.internal_only ? [] : [1]
     content {
@@ -275,31 +260,25 @@ resource "aws_security_group" "console" {
     }
   }
 
-  # NHP Protection mode: Allow port 443 from anywhere (iptables DROP until knock)
+  # NHP Protection: Allow port 443 from anywhere (iptables DROP until knock)
   # Security group allows the traffic, but iptables on the instance will DROP it
   # until nhp-acd adds the client IP to ipset after successful NHP knock.
-  dynamic "ingress" {
-    for_each = var.enable_nhp_protection ? [1] : []
-    content {
-      from_port   = 443
-      to_port     = 443
-      protocol    = "tcp"
-      cidr_blocks = ["0.0.0.0/0"]
-      description = "HTTPS from anywhere (iptables-protected via NHP)"
-    }
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "HTTPS from anywhere (iptables-protected via NHP)"
   }
 
-  # NHP Protection mode: Allow NHP knock port (UDP 62206) from NHP Server
+  # NHP Protection: Allow NHP knock port (UDP 62206) from NHP Server
   # nhp-acd needs to receive knocks from NHP Server
-  dynamic "ingress" {
-    for_each = var.enable_nhp_protection ? [1] : []
-    content {
-      from_port   = 62206
-      to_port     = 62206
-      protocol    = "udp"
-      cidr_blocks = [var.vpc_cidr]
-      description = "NHP knock packets from NHP Server"
-    }
+  ingress {
+    from_port   = 62206
+    to_port     = 62206
+    protocol    = "udp"
+    cidr_blocks = [var.vpc_cidr]
+    description = "NHP knock packets from NHP Server"
   }
 
   # SSH from VPC
@@ -376,8 +355,7 @@ locals {
     auth_signing_key = var.auth_signing_key
     # AC ID for knock routing (must match AC module's ac_id)
     ac_id = var.ac_id
-    # NHP Protection (true network hiding)
-    enable_nhp_protection = var.enable_nhp_protection
+    # NHP Protection (always enabled)
     nhp_server_secret_arn = var.nhp_server_secret_arn
     nhp_ac_repo_url       = var.nhp_ac_repo_url
     nhp_server_hostname   = var.nhp_server_hostname
@@ -472,7 +450,7 @@ resource "aws_autoscaling_group" "console" {
   health_check_type         = "EC2"
   health_check_grace_period = 300
 
-  # Target groups: internal or external mode, plus protected if NHP enabled
+  # Target groups: internal or external mode, plus protected (always enabled)
   # NOTE: Must include protected target group here, not via aws_autoscaling_attachment,
   # because target_group_arns is declarative and would override any separate attachments.
   target_group_arns = concat(
@@ -480,7 +458,7 @@ resource "aws_autoscaling_group" "console" {
       aws_lb_target_group.https[0].arn,
       aws_lb_target_group.http[0].arn
     ],
-    var.enable_nhp_protection ? [aws_lb_target_group.protected[0].arn] : []
+    [aws_lb_target_group.protected.arn]
   )
 
   instance_refresh {
@@ -669,12 +647,10 @@ resource "aws_route53_record" "console" {
 }
 
 # ==================== NHP Protected NLB (True Network Hiding) ====================
-# When enable_nhp_protection=true, this public NLB routes protected traffic to Console.
+# NHP protection is always enabled. This public NLB routes protected traffic to Console.
 # Console's iptables DROP all port 443 traffic until NHP knock adds user IP to ipset.
 
 resource "aws_lb" "protected" {
-  count = var.enable_nhp_protection ? 1 : 0
-
   name               = replace("${var.name_prefix}-con-prot", "_", "-")
   internal           = false # Internet-facing for protected access
   load_balancer_type = "network"
@@ -690,8 +666,6 @@ resource "aws_lb" "protected" {
 }
 
 resource "aws_lb_target_group" "protected" {
-  count = var.enable_nhp_protection ? 1 : 0
-
   name        = replace("${var.name_prefix}-con-prot", "_", "-")
   port        = 443
   protocol    = "TCP"
@@ -721,15 +695,13 @@ resource "aws_lb_target_group" "protected" {
 }
 
 resource "aws_lb_listener" "protected" {
-  count = var.enable_nhp_protection ? 1 : 0
-
-  load_balancer_arn = aws_lb.protected[0].arn
+  load_balancer_arn = aws_lb.protected.arn
   port              = 443
   protocol          = "TCP"
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.protected[0].arn
+    target_group_arn = aws_lb_target_group.protected.arn
   }
 
   tags = var.tags
@@ -742,17 +714,262 @@ resource "aws_lb_listener" "protected" {
 
 # Route 53 record for protected domain (e.g., console2.apps.layerv.xyz)
 resource "aws_route53_record" "protected" {
-  count = var.enable_nhp_protection && var.protected_hosted_zone_id != null && var.protected_hostname != null ? 1 : 0
+  count = var.protected_hosted_zone_id != null && var.protected_hostname != null ? 1 : 0
 
   zone_id = var.protected_hosted_zone_id
   name    = var.protected_hostname
   type    = "A"
 
   alias {
-    name                   = aws_lb.protected[0].dns_name
-    zone_id                = aws_lb.protected[0].zone_id
+    name                   = aws_lb.protected.dns_name
+    zone_id                = aws_lb.protected.zone_id
     evaluate_target_health = true
   }
+}
+
+# ==================== ASG Lifecycle Hook for Cleanup ====================
+# Cleans up orphaned resources when Console EC2 instances terminate:
+# - AC assignments in DynamoDB
+# - AC keypair secrets in Secrets Manager
+
+# Lambda function to clean up resources on instance termination
+resource "aws_lambda_function" "console_cleanup" {
+  function_name = "${local.console_name}-cleanup"
+  description   = "Cleans up Console AC resources on instance termination"
+  runtime       = "python3.12"
+  handler       = "index.handler"
+  timeout       = 30
+  memory_size   = 128
+
+  role = aws_iam_role.cleanup_lambda.arn
+
+  filename         = data.archive_file.cleanup_lambda.output_path
+  source_code_hash = data.archive_file.cleanup_lambda.output_base64sha256
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE = var.nhp_dynamodb_ac_assignments_table != null ? var.nhp_dynamodb_ac_assignments_table : ""
+      SECRET_PREFIX  = "${var.name_prefix}-console-ac-"
+      AWS_REGION_VAR = data.aws_region.current.name
+    }
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${local.console_name}-cleanup"
+    Component = "console"
+  })
+}
+
+# Lambda source code
+data "archive_file" "cleanup_lambda" {
+  type        = "zip"
+  output_path = "${path.module}/lambda_cleanup.zip"
+
+  source {
+    content  = <<-PYTHON
+import boto3
+import json
+import os
+
+def handler(event, context):
+    """
+    Clean up Console AC resources when an EC2 instance terminates.
+
+    Triggered by ASG lifecycle hook via EventBridge.
+    Deletes:
+    - AC assignment from DynamoDB (console-ac-{instance_id})
+    - AC keypair from Secrets Manager ({prefix}{instance_id})
+    """
+    print(f"Received event: {json.dumps(event)}")
+
+    # Extract instance ID from lifecycle hook event
+    detail = event.get('detail', {})
+    instance_id = detail.get('EC2InstanceId')
+
+    if not instance_id:
+        print("No instance ID found in event, skipping cleanup")
+        return {'statusCode': 200, 'body': 'No instance ID'}
+
+    print(f"Cleaning up resources for instance: {instance_id}")
+
+    region = os.environ.get('AWS_REGION_VAR', os.environ.get('AWS_REGION', 'us-east-2'))
+    dynamodb_table = os.environ.get('DYNAMODB_TABLE', '')
+    secret_prefix = os.environ.get('SECRET_PREFIX', '')
+
+    # Clean up DynamoDB AC assignment
+    if dynamodb_table:
+        try:
+            dynamodb = boto3.client('dynamodb', region_name=region)
+            ac_id = f"console-ac-{instance_id}"
+
+            dynamodb.delete_item(
+                TableName=dynamodb_table,
+                Key={'ac_id': {'S': ac_id}}
+            )
+            print(f"Deleted DynamoDB assignment: {ac_id}")
+        except Exception as e:
+            print(f"Failed to delete DynamoDB assignment: {e}")
+
+    # Clean up Secrets Manager keypair
+    if secret_prefix:
+        try:
+            secrets = boto3.client('secretsmanager', region_name=region)
+            secret_name = f"{secret_prefix}{instance_id}"
+
+            secrets.delete_secret(
+                SecretId=secret_name,
+                ForceDeleteWithoutRecovery=True
+            )
+            print(f"Deleted secret: {secret_name}")
+        except secrets.exceptions.ResourceNotFoundException:
+            print(f"Secret not found (already deleted): {secret_name}")
+        except Exception as e:
+            print(f"Failed to delete secret: {e}")
+
+    # Complete the lifecycle action
+    asg_name = detail.get('AutoScalingGroupName')
+    lifecycle_hook = detail.get('LifecycleHookName')
+    lifecycle_token = detail.get('LifecycleActionToken')
+
+    if asg_name and lifecycle_hook and lifecycle_token:
+        try:
+            asg = boto3.client('autoscaling', region_name=region)
+            asg.complete_lifecycle_action(
+                AutoScalingGroupName=asg_name,
+                LifecycleHookName=lifecycle_hook,
+                LifecycleActionToken=lifecycle_token,
+                LifecycleActionResult='CONTINUE'
+            )
+            print(f"Completed lifecycle action for {instance_id}")
+        except Exception as e:
+            print(f"Failed to complete lifecycle action: {e}")
+
+    return {'statusCode': 200, 'body': f'Cleaned up {instance_id}'}
+PYTHON
+    filename = "index.py"
+  }
+}
+
+# IAM role for cleanup Lambda
+resource "aws_iam_role" "cleanup_lambda" {
+  name = "${local.console_name}-cleanup-lambda"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+    }]
+  })
+
+  tags = merge(var.tags, {
+    Name      = "${local.console_name}-cleanup-lambda"
+    Component = "console"
+  })
+}
+
+# IAM policy for cleanup Lambda
+resource "aws_iam_role_policy" "cleanup_lambda" {
+  name = "cleanup-permissions"
+  role = aws_iam_role.cleanup_lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "CloudWatchLogs"
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.console_name}-cleanup:*"
+      },
+      {
+        Sid    = "DynamoDBCleanup"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:DeleteItem"
+        ]
+        Resource = var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}" : "*"
+      },
+      {
+        Sid    = "SecretsManagerCleanup"
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:DeleteSecret"
+        ]
+        Resource = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}-console-ac-*"
+      },
+      {
+        Sid    = "ASGLifecycleComplete"
+        Effect = "Allow"
+        Action = [
+          "autoscaling:CompleteLifecycleAction"
+        ]
+        Resource = aws_autoscaling_group.console.arn
+      }
+    ]
+  })
+}
+
+# ASG lifecycle hook for termination
+resource "aws_autoscaling_lifecycle_hook" "console_termination" {
+  name                   = "${local.console_name}-termination-cleanup"
+  autoscaling_group_name = aws_autoscaling_group.console.name
+  lifecycle_transition   = "autoscaling:EC2_INSTANCE_TERMINATING"
+  heartbeat_timeout      = 60
+  default_result         = "CONTINUE"
+}
+
+# EventBridge rule to trigger Lambda on lifecycle hook
+resource "aws_cloudwatch_event_rule" "console_termination" {
+  name        = "${local.console_name}-termination"
+  description = "Triggers cleanup Lambda when Console EC2 terminates"
+
+  event_pattern = jsonencode({
+    source      = ["aws.autoscaling"]
+    detail-type = ["EC2 Instance-terminate Lifecycle Action"]
+    detail = {
+      AutoScalingGroupName = [aws_autoscaling_group.console.name]
+    }
+  })
+
+  tags = merge(var.tags, {
+    Name      = "${local.console_name}-termination"
+    Component = "console"
+  })
+}
+
+# EventBridge target - Lambda function
+resource "aws_cloudwatch_event_target" "console_cleanup" {
+  rule      = aws_cloudwatch_event_rule.console_termination.name
+  target_id = "console-cleanup-lambda"
+  arn       = aws_lambda_function.console_cleanup.arn
+}
+
+# Permission for EventBridge to invoke Lambda
+resource "aws_lambda_permission" "eventbridge_cleanup" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.console_cleanup.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.console_termination.arn
+}
+
+# CloudWatch Log Group for cleanup Lambda
+resource "aws_cloudwatch_log_group" "cleanup_lambda" {
+  name              = "/aws/lambda/${local.console_name}-cleanup"
+  retention_in_days = local.is_prod ? 30 : 7
+
+  tags = merge(var.tags, {
+    Name      = "${local.console_name}-cleanup-logs"
+    Component = "console"
+  })
 }
 
 # ==================== SSM Parameters for CI/CD ====================

@@ -31,17 +31,17 @@ terraform {
 
 # ==================== Validation ====================
 
-# Validate NHP protection prerequisites
+# Validate NHP protection prerequisites (always enabled)
 check "nhp_protection_prerequisites" {
   assert {
-    condition = !var.enable_console_nhp_protection || (
+    condition = (
       var.console_internal_only == true &&
       var.console_protected_hostname != null &&
       var.deploy_ac == true &&
       var.hosted_zone != null
     )
     error_message = <<-EOT
-      When enable_console_nhp_protection=true, the following are required:
+      NHP protection is always enabled. The following are required:
         - console_internal_only = true
         - console_protected_hostname must be set
         - deploy_ac = true
@@ -147,9 +147,9 @@ module "networking" {
   name_prefix = local.name_prefix
   tags        = local.common_tags
 
-  # When Console NHP protection is enabled, we need NACL to allow port 443
-  # from internet so NLB can route to private subnets (iptables enforces access)
-  allow_private_ingress_443 = var.enable_console_nhp_protection
+  # NHP protection requires NACL to allow port 443 from internet
+  # so NLB can route to private subnets (iptables enforces access)
+  allow_private_ingress_443 = true
 }
 
 # Data Module - etcd, EFS, Secrets, Service Discovery
@@ -555,18 +555,18 @@ module "console_ec2" {
   nhp_dynamodb_ac_assignments_table  = module.dynamodb.ac_assignments_table_name
   nhp_dynamodb_server_ac_index_table = module.dynamodb.server_ac_index_table_name
 
+  # NHP AC Daemon - Console always needs its own AC for login flow to work
+  # The AC registers with NHP Server and receives knock validations
+  nhp_server_secret_arn = var.deploy_ac ? module.compute.server_secret_arn : null
+  nhp_ac_repo_url       = module.ecr.ac_repo_url
+  nhp_ac_ecr_repo_arn   = module.ecr.ac_repo_arn
+  nhp_server_hostname   = "server.${module.data.namespace_name}"
+
   # NHP Network-Level Protection (true network hiding with iptables DROP)
-  # When enabled, Console EC2 runs its own nhp-acd with iptables DROP by default.
+  # Console EC2 configures iptables DROP by default.
   # Port 443 is only accessible after NHP knock adds the user's IP to ipset.
-  enable_nhp_protection = var.enable_console_nhp_protection
-  nhp_server_secret_arn = var.enable_console_nhp_protection && var.deploy_ac ? module.compute.server_secret_arn : null
-  nhp_ac_repo_url       = var.enable_console_nhp_protection ? module.ecr.ac_repo_url : null
-  nhp_ac_ecr_repo_arn   = var.enable_console_nhp_protection ? module.ecr.ac_repo_arn : null
-  nhp_server_hostname   = var.enable_console_nhp_protection ? "server.${module.data.namespace_name}" : null
   # Reuse main hosted zone - apps.layerv.xyz is a subdomain of layerv.xyz
-  protected_hosted_zone_id = var.enable_console_nhp_protection && length(data.aws_route53_zone.main) > 0 ? data.aws_route53_zone.main[0].zone_id : null
-  etcd_endpoint            = var.enable_console_nhp_protection ? module.data.etcd_endpoint : null
-  etcd_tls_secret_arn      = var.enable_console_nhp_protection ? module.data.etcd_ca_cert_arn : null
+  protected_hosted_zone_id = length(data.aws_route53_zone.main) > 0 ? data.aws_route53_zone.main[0].zone_id : null
 }
 
 # Data source for hosted zone (used by console_ec2)

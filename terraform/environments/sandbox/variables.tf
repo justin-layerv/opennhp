@@ -283,12 +283,6 @@ variable "console_protected_hostname" {
   default     = null
 }
 
-variable "enable_console_nhp_protection" {
-  description = "Enable true NHP network-level protection for Console EC2 (iptables DROP until knock)"
-  type        = bool
-  default     = false
-}
-
 # TLS certificate configuration
 variable "additional_tls_domains" {
   description = "Additional domains for TLS certificates in same account"

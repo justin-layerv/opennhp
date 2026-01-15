@@ -45,9 +45,8 @@ RDS_PASSWORD=$(echo "$RDS_SECRET" | jq -r '.password')
 
 echo "RDS credentials retrieved"
 
-%{ if enable_nhp_protection }
 # ============================================================================
-# NHP Protection: Install nhp-acd and Configure iptables
+# NHP Protection: Install nhp-acd and Configure iptables (always enabled)
 # This provides true network-level hiding - port 443 is DROP'd by default
 # and only opened after successful NHP knock adds user IP to ipset.
 # ============================================================================
@@ -59,6 +58,23 @@ apt-get install -y iptables ipset python3-cryptography
 
 # ============================================================================
 # NHP Firewall Setup - ipset and iptables rules for zero-trust access control
+# ============================================================================
+#
+# SECURITY MODEL: FAIL-CLOSED (Deny by Default)
+# ==============================================
+# This firewall implements a "fail-closed" security posture:
+#
+# 1. Port 443 is DROP'd by default via iptables
+# 2. Only IPs in the 'defaultset' ipset can access port 443
+# 3. IPs are added to 'defaultset' only after successful NHP knock
+# 4. ipset entries have 120-second timeout and require re-knock
+#
+# FAILURE MODES:
+# - If nhp-acd daemon fails: No one can access port 443 (secure)
+# - If NHP Server is unreachable: No new knocks succeed (secure)
+# - If Console crashes: Existing ipset entries still work until timeout
+#
+# This ensures unauthorized access is impossible even if NHP components fail.
 # ============================================================================
 echo "Setting up NHP firewall with ipset and iptables..."
 
@@ -155,7 +171,6 @@ fi
 # Fetch NHP Server Public Key and Generate Console AC Keypair
 # ============================================================================
 
-%{ if nhp_server_secret_arn != null ~}
 echo "Fetching NHP Server public key from Secrets Manager..."
 SERVER_SECRET=$(aws secretsmanager get-secret-value --secret-id "${nhp_server_secret_arn}" --region "$REGION" --query SecretString --output text)
 SERVER_PUBLIC_KEY=$(echo "$SERVER_SECRET" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('publicKey', d.get('PubKeyBase64', '')))" 2>/dev/null || echo "")
@@ -165,10 +180,6 @@ if [ -z "$SERVER_PUBLIC_KEY" ]; then
   exit 1
 fi
 echo "Server public key retrieved: $${SERVER_PUBLIC_KEY:0:20}..."
-%{ else ~}
-echo "FATAL: No NHP server secret ARN configured but enable_nhp_protection=true"
-exit 1
-%{ endif ~}
 
 # Generate Curve25519 keypair for Console AC
 echo "Generating Curve25519 keypair for Console AC..."
@@ -269,6 +280,11 @@ fi
 
 echo "Console AC keypair ready (public key: $${PUBLIC_KEY:0:20}...)"
 
+# Console AC ID - used for both etcd registration and portal_sites config
+# Must be defined before etcd block since it's used regardless of storage backend
+CONSOLE_AC_ID="console-ac-$INSTANCE_ID"
+export CONSOLE_AC_ID
+
 # ============================================================================
 # Fetch etcd TLS Certificates for AC Registration
 # ============================================================================
@@ -305,9 +321,7 @@ echo "etcd TLS certificates installed for Console AC"
 
 echo "Registering Console AC in etcd..."
 
-# Console AC ID includes instance ID for uniqueness
-CONSOLE_AC_ID="console-ac-$INSTANCE_ID"
-export CONSOLE_AC_ID
+# CONSOLE_AC_ID was defined above (before etcd block)
 
 # Wait for etcd DNS
 ETCD_HOST=$(echo "${etcd_endpoint}" | sed 's|https://||' | sed 's|:.*||')
@@ -407,8 +421,10 @@ else
   exit 1
 fi
 %{ else ~}
-# etcd registration not configured - Console AC won't be trusted by Server
-CONSOLE_AC_ID=""
+# etcd not configured - using DynamoDB storage backend
+# Console App will register AC in DynamoDB during InitNHP() (see Console PR #62)
+# CONSOLE_AC_ID is already defined above and will be used in portal_sites config
+echo "etcd not configured - AC registration will be handled by Console App via DynamoDB"
 %{ endif ~}
 
 # ============================================================================
@@ -464,6 +480,14 @@ LogLevel = 4
 AuthServiceId = "passcode"
 ResourceIds = ["${console_app_id}"]
 FilterMode = 0
+
+# Per-AC Server Assignment (required fields)
+ResourceFQDN = "${protected_hostname != null ? protected_hostname : domain_name}"
+CustomerId = "system"
+LicenseKey = ""
+ACVersion = "0.6.0"
+ServerPubKeyBase64 = "$SERVER_PUBLIC_KEY"
+ServerPort = 62206
 CONFIGEOF
 
   # Create server.toml with NHP Server peer
@@ -499,14 +523,15 @@ SVCEOF
 
   systemctl daemon-reload
   systemctl enable nhp-acd
-  systemctl start nhp-acd
+  # NOTE: nhp-acd will be started AFTER Console registers this AC in DynamoDB
+  # See "Start nhp-acd after Console registers AC" section below
 
-  echo "nhp-acd service started"
+  echo "nhp-acd service configured (will start after Console registers AC)"
 else
   echo "WARNING: nhp-acd binary not available, iptables protection is in place but knocks won't work"
 fi
 
-echo "NHP Protection setup complete"
+echo "NHP Protection setup complete (nhp-acd pending Console startup)"
 
 # ============================================================================
 # NHP Protection: Configure nginx for HTTPS on port 443 (protected domain)
@@ -532,7 +557,7 @@ upstream console_backend_protected {
     keepalive 32;
 }
 
-# HTTPS - Protected domain server (no HTTP redirect - port 80 is blocked by iptables)
+# HTTPS - Protected domain server (no HTTP redirect needed - users access via NHP knock)
 server {
     listen 443 ssl http2;
     server_name ${protected_hostname} _;
@@ -602,7 +627,7 @@ certbot certonly \
     --non-interactive \
     --keep-until-expiring || {
     echo "WARNING: DNS-01 certbot failed, trying HTTP-01..."
-    # Fallback to HTTP-01 (may fail if iptables blocks 80)
+    # Fallback to HTTP-01 (port 80 is open for ACME challenges)
     certbot certonly \
         --webroot \
         --webroot-path /var/www/html \
@@ -613,7 +638,7 @@ certbot certonly \
         --keep-until-expiring || true
 }
 %{ else }
-# Use HTTP-01 challenge (may fail if iptables blocks 80)
+# Use HTTP-01 challenge (port 80 is open for ACME challenges)
 certbot certonly \
     --webroot \
     --webroot-path /var/www/html \
@@ -638,7 +663,6 @@ fi
 nginx -t && systemctl reload nginx
 
 echo "nginx configured for protected domain (HTTPS on port 443)"
-%{ endif }
 
 %{ if internal_only }
 # ============================================================================
@@ -947,17 +971,54 @@ docker run -d \
     -e "GVA_CONFIG_NHP_CLOUDMAP_NAMESPACE=${nhp_cloudmap_namespace}" \
     -e "GVA_CONFIG_NHP_CLOUDMAP_SERVICE_NAME=${nhp_cloudmap_service_name}" \
     -e "GVA_CONFIG_NHP_ASSIGNMENT_SERVERS_PER_AC=${nhp_assignment_servers_per_ac}" \
+%{ if nhp_ac_repo_url != null ~}
+    -e "GVA_CONFIG_NHP_CONSOLE_AC_ENABLED=true" \
+    -e "GVA_CONFIG_NHP_CONSOLE_AC_SECRET_PREFIX=${name_prefix}-console-ac-" \
+    -e "GVA_CONFIG_NHP_CONSOLE_AC_RESOURCE_FQDN=${protected_hostname != null ? protected_hostname : domain_name}" \
+%{ endif ~}
     "$CONSOLE_IMAGE"
 
-# Wait for console to be healthy
-echo "Waiting for Console to be healthy..."
+# Wait for console to be healthy (max 150 seconds = 30 * 5s)
+HEALTH_TIMEOUT=150
+HEALTH_CHECK_PASSED=false
+echo "Waiting for Console to be healthy (timeout: $${HEALTH_TIMEOUT}s)..."
 for i in {1..30}; do
-    if curl -s http://127.0.0.1:$HOST_PORT/health | grep -q "ok"; then
-        echo "Console is healthy"
+    if curl -s --max-time 5 http://127.0.0.1:$HOST_PORT/health | grep -q "ok"; then
+        echo "Console is healthy after $((i * 5)) seconds"
+        HEALTH_CHECK_PASSED=true
         break
     fi
+    echo "Health check attempt $i/30 failed, retrying in 5s..."
     sleep 5
 done
+
+if [ "$HEALTH_CHECK_PASSED" != "true" ]; then
+    echo "FATAL: Console health check failed after $${HEALTH_TIMEOUT}s"
+    echo "Console container logs:"
+    docker logs console --tail 50 2>&1 || true
+    echo "Failing instance startup - Console must be healthy before proceeding"
+    exit 1
+fi
+
+# ============================================================================
+# Start nhp-acd after Console registers AC
+# Console registers its AC in DynamoDB during InitNHP() before HTTP server starts.
+# By the time /health returns OK, the AC assignment is already in DynamoDB.
+# ============================================================================
+
+if [ -f "/opt/layerv/nhp-ac/nhp-acd" ] && systemctl is-enabled nhp-acd &>/dev/null; then
+    echo "Starting nhp-acd service (Console has registered AC in DynamoDB)..."
+    systemctl start nhp-acd
+
+    # Verify it started
+    sleep 2
+    if systemctl is-active nhp-acd &>/dev/null; then
+        echo "nhp-acd service started successfully"
+    else
+        echo "WARNING: nhp-acd failed to start"
+        systemctl status nhp-acd --no-pager || true
+    fi
+fi
 
 %{ if !internal_only }
 # ============================================================================
@@ -1135,21 +1196,13 @@ SRVEOF
 # Build Resources JSON (AC routing config)
 # ac_id determines which AC receives NHP_AOP message from Server
 # ip must be an actual IP address (not DNS) because AC uses it in ipset rules
-%{ if enable_nhp_protection ~}
-# When NHP protection is enabled, route knocks to Console's own AC
-# CONSOLE_AC_ID was set during etcd registration above
+# Route knocks to Console's own AC (NHP protection is always enabled)
+# CONSOLE_AC_ID was set after keypair generation (before etcd block)
 # Use LOCAL_IP since Console AC runs on this same instance
 RESOURCES=$(cat <<RESEOF
 [{"ac_id": "$CONSOLE_AC_ID", "hostname": "$CONSOLE_HOSTNAME", "ip": "$LOCAL_IP", "port": 443, "maskhost": false, "protocol": "tcp"}]
 RESEOF
 )
-%{ else ~}
-# Route knocks to the shared AC pool
-RESOURCES=$(cat <<RESEOF
-[{"ac_id": "${ac_id}", "hostname": "$CONSOLE_HOSTNAME", "ip": "$AC_NLB_IP", "port": 443, "maskhost": false, "protocol": "tcp"}]
-RESEOF
-)
-%{ endif ~}
 
 # Build ExtInfo JSON (required by passcode plugin for auth_code flow)
 # AuthUrl: Console's token validation endpoint called by NHP Server

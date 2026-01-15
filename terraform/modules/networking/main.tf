@@ -429,8 +429,8 @@ resource "aws_network_acl" "private" {
   }
 
   # Inbound: Allow HTTPS from internet (for NHP-protected resources behind public NLB)
-  # This is needed when enable_console_nhp_protection=true, where internet traffic
-  # is routed directly to Console EC2 in private subnets via the protected NLB.
+  # NHP protection is always enabled, and internet traffic is routed directly to
+  # Console EC2 in private subnets via the protected NLB.
   #
   # SCOPE: This rule applies to ALL private subnets in the VPC, not just Console.
   # Other services (etcd, RDS, etc.) are protected by their security groups which

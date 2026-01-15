@@ -107,12 +107,9 @@ variable "nhp_server_assignment_enabled" {
     assigns NHP servers to ACs using DynamoDB for storage and CloudMap for
     server discovery. Servers are selected from different availability zones
     for high availability.
-
-    NOTE: Disabled by default until Console properly supports servers-per-ac
-    env var configuration. See PR #136 for details.
   EOT
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "nhp_region" {
@@ -153,6 +150,9 @@ variable "nhp_assignment_servers_per_ac" {
 
 # ============================================================================
 # NHP Protection Configuration (Network-Level Hiding)
+# NHP protection is always enabled on Console EC2. This configures iptables
+# DROP by default, with port 443 only accessible after NHP knock adds the
+# user's IP to ipset.
 # ============================================================================
 
 variable "internal_only" {
@@ -161,54 +161,32 @@ variable "internal_only" {
   default     = false
 }
 
-variable "enable_nhp_protection" {
-  description = <<-EOT
-    Enable true NHP network-level protection. When true, Console EC2 runs nhp-acd
-    with iptables DROP by default. Port 443 is only accessible after NHP knock succeeds.
-
-    Console AC automatically registers itself in etcd so NHP Server trusts it.
-    portal_sites.resources is updated to route knocks to Console's AC.
-
-    Required variables when enabled:
-    - nhp_server_secret_arn
-    - nhp_ac_repo_url
-    - nhp_ac_ecr_repo_arn
-    - nhp_server_hostname
-    - protected_hostname
-    - protected_hosted_zone_id
-    - etcd_endpoint
-    - etcd_tls_secret_arn
-  EOT
-  type        = bool
-  default     = false
-}
-
 variable "nhp_server_secret_arn" {
-  description = "ARN of NHP Server secret in Secrets Manager (for public key). Required when enable_nhp_protection=true."
+  description = "ARN of NHP Server secret in Secrets Manager (for public key). Required for Console login flow."
   type        = string
   default     = null
 }
 
 variable "nhp_ac_repo_url" {
-  description = "ECR URL for nhp-ac image (to extract nhp-acd binary). Required when enable_nhp_protection=true."
+  description = "ECR URL for nhp-ac image (to extract nhp-acd binary). Required for Console login flow."
   type        = string
   default     = null
 }
 
 variable "nhp_ac_ecr_repo_arn" {
-  description = "ECR repository ARN for nhp-ac image (for IAM permissions). Required when enable_nhp_protection=true."
+  description = "ECR repository ARN for nhp-ac image (for IAM permissions). Required for Console login flow."
   type        = string
   default     = null
 }
 
 variable "protected_hosted_zone_id" {
-  description = "Route 53 hosted zone ID for the protected domain (e.g., apps.layerv.xyz zone). Required when enable_nhp_protection=true."
+  description = "Route 53 hosted zone ID for the protected domain (e.g., apps.layerv.xyz zone). Required for NHP protection."
   type        = string
   default     = null
 }
 
 variable "nhp_server_hostname" {
-  description = "NHP Server hostname for AC to connect to (e.g., server.nhp.sandbox.internal). Required when enable_nhp_protection=true."
+  description = "NHP Server hostname for AC to connect to (e.g., server.nhp.sandbox.internal). Required for Console login flow."
   type        = string
   default     = null
 }
@@ -256,13 +234,13 @@ variable "nhp_server_endpoint" {
 }
 
 variable "etcd_endpoint" {
-  description = "etcd endpoint URL for AC registration (e.g., https://etcd.nhp.sandbox.internal:2379). Required when enable_nhp_protection=true."
+  description = "etcd endpoint for on-prem deployments using etcd storage backend (e.g., https://etcd.internal:2379). Required when storage.backend=etcd."
   type        = string
   default     = null
 }
 
 variable "etcd_tls_secret_arn" {
-  description = "ARN of Secrets Manager secret containing etcd TLS certs (caCert, clientCert, clientKey). Required when enable_nhp_protection=true."
+  description = "Secrets Manager ARN containing etcd TLS certificates (caCert, clientCert, clientKey). Required when etcd_endpoint is set."
   type        = string
   default     = null
 }

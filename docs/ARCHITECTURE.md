@@ -41,15 +41,18 @@ The NHP Server receives knock requests and coordinates with ACs to grant access.
 - Receives HTTP knock requests on port 443 (via Traefik)
 - Loads and manages authentication plugins
 - Communicates with AC instances to open firewall rules
-- Watches etcd for AC registrations
+- Reads AC assignments from storage backend (DynamoDB or etcd)
 
 **Key Files:**
 | File | Purpose |
 |------|---------|
 | `main.go` | Entry point |
-| `udpserver.go` | UDP knock handler, AC registry watcher |
+| `udpserver.go` | UDP knock handler |
 | `httpserver.go` | HTTP knock handler, plugin routing |
-| `config.go` | Configuration loading, etcd integration |
+| `config.go` | Configuration loading |
+| `storage.go` | Storage backend interface |
+| `dynamodb_storage.go` | DynamoDB storage implementation |
+| `etcd_storage.go` | etcd storage implementation (on-prem) |
 | `msghandler.go` | NHP message processing |
 
 **HTTP Routes:**
@@ -80,7 +83,9 @@ The AC runs on protected servers and manages iptables/ipset rules.
 - Receives AC operation requests from Server
 - Manages iptables/ipset rules to grant/revoke access
 - Handles HTTP refresh requests for IP address updates
-- Monitors etcd for configuration changes
+
+> **Note:** The AC daemon does NOT interact with storage backends (DynamoDB/etcd).
+> It only connects to NHP Servers listed in its config file. Console manages AC assignments.
 
 **Key Files:**
 | File | Purpose |
@@ -88,7 +93,7 @@ The AC runs on protected servers and manages iptables/ipset rules.
 | `main.go` | Entry point |
 | `udpac.go` | UDP communication with server, connection maintenance |
 | `httpac.go` | HTTP refresh endpoint |
-| `config.go` | Configuration loading, etcd integration |
+| `config.go` | Configuration loading |
 | `msghandler.go` | NHP message processing, iptables updates |
 
 **HTTP Routes (via Traefik on 443):**
@@ -102,13 +107,16 @@ GET /refresh/:token?srcip=X.X.X.X - Refresh access for new IP
 
 ### 3. Console API (`console/server/`)
 
-The Console provides the management API and Portal Sites functionality.
+The Console provides the management API, Portal Sites functionality, and **NHP AC server assignment**.
 
 **Key Responsibilities:**
 - User and organization management
 - Portal Sites CRUD operations
 - `createPortalSitesByURL` - Public API for website demo
 - Resource and policy management
+- **NHP Service** - AC server assignment and management
+
+#### Portal Sites API
 
 **Key API Endpoints:**
 ```
@@ -127,6 +135,59 @@ GET  /api/ps/findSiteByApplicationId - Get site by app ID
     "passcode": "secret123"
   }
 }
+```
+
+#### NHP Service (`console/server/service/nhp/`)
+
+The NHP service manages AC server assignments. When an AC is created, Console:
+1. Discovers healthy NHP servers from AWS Cloud Map
+2. Selects servers from different availability zones for redundancy
+3. Writes the AC assignment to DynamoDB
+4. NHP Server reads this assignment to know which ACs it serves
+
+**Key Files:**
+| File | Purpose |
+|------|---------|
+| `service.go` | Main NHP service, initialization |
+| `assignment.go` | Server selection algorithm (multi-AZ) |
+| `cloudmap.go` | AWS Cloud Map server discovery |
+| `dynamodb.go` | DynamoDB storage operations |
+| `console_ac.go` | Console's own AC self-registration |
+
+**AC Assignment Flow:**
+
+```
+┌─────────────┐    1. Discover      ┌─────────────┐
+│   Console   │ ──────────────────► │  Cloud Map  │
+│             │    NHP servers      │             │
+└──────┬──────┘                     └─────────────┘
+       │
+       │ 2. Select servers (different AZs)
+       │ 3. Write assignment
+       ▼
+┌─────────────┐                     ┌─────────────┐
+│  DynamoDB   │ ◄───────────────────│ NHP Server  │
+│             │    4. Read          │             │
+└─────────────┘    assignments      └─────────────┘
+```
+
+**Console AC Self-Registration:**
+
+When Console EC2 runs an embedded nhp-acd daemon, Console registers its own AC on startup:
+
+1. Console starts, `InitNHP()` runs
+2. If `ConsoleAC.Enabled`:
+   - Read instance ID from EC2 metadata (IMDSv2)
+   - Read AC keypair from Secrets Manager
+   - Call `AssignServersToAC()` to write assignment to DynamoDB
+3. HTTP server starts, `/health` returns OK
+4. user_data starts nhp-acd (which can now find its assignment in DynamoDB)
+
+**Environment Variables (set by Terraform):**
+```bash
+GVA_CONFIG_NHP_CONSOLE_AC_ENABLED=true
+GVA_CONFIG_NHP_CONSOLE_AC_SECRET_PREFIX=nhp-sandbox-console-ac-
+GVA_CONFIG_NHP_CONSOLE_AC_RESOURCE_FQDN=console.apps.layerv.xyz
 ```
 
 ---
@@ -1332,7 +1393,65 @@ Modern IaC-managed infrastructure with proper scaling, etcd for dynamic config, 
 
 ## Configuration Management
 
-### etcd Keys
+### Storage Backend Architecture
+
+NHP Server supports pluggable storage backends for AC assignments and other data. The storage backend
+determines where AC assignment data is stored and retrieved from.
+
+**See `docs/design/PLUGGABLE_STORAGE_BACKEND.md` for detailed design documentation.**
+
+| Mode | Storage Backend | Use Case |
+|------|-----------------|----------|
+| **Cloud (default)** | DynamoDB Global Tables | AWS deployment, LayerV SaaS |
+| **On-prem (feature flag)** | etcd cluster | Self-hosted, air-gapped environments |
+
+**Configuration:**
+
+NHP Server's `storage.toml` determines which backend to use:
+
+```toml
+# Cloud deployment (default)
+Backend = "dynamodb"
+
+# On-prem deployment
+Backend = "etcd"
+```
+
+**Data Flow:**
+
+```
+┌─────────────┐      Write AC         ┌─────────────┐      Read AC        ┌─────────────┐
+│   Console   │ ──────────────────────►│   Storage   │◄────────────────────│ NHP Server  │
+│   (API)     │   assignments to DB    │  (DynamoDB  │   assignments       │             │
+└─────────────┘                        │  or etcd)   │                     └─────────────┘
+                                       └─────────────┘
+                                              │
+                                              │ AC daemon does NOT
+                                              │ read/write storage
+                                              ▼
+                                       ┌─────────────┐
+                                       │   NHP AC    │
+                                       │  (daemon)   │
+                                       └─────────────┘
+```
+
+**Key Points:**
+- **Console writes** AC assignments to the storage backend
+- **NHP Server reads** AC assignments from the storage backend
+- **AC daemon** does NOT interact with storage - it only connects to NHP Servers
+
+**DynamoDB Tables (Cloud Mode):**
+
+| Table | Purpose | Key Schema |
+|-------|---------|------------|
+| `nhp-ac-assignments` | AC-to-server assignments | PK: `ac_id` |
+| `nhp-server-ac-index` | Server-to-AC reverse index | PK: `server_id`, SK: `ac_id` |
+| `nhp-licenses` | License validation | PK: `customer_id`, SK: `resource_fqdn` |
+| `nhp-resources` | Resource definitions | PK: `customer_id`, SK: `resource_id` |
+
+### etcd Keys (On-Prem Mode)
+
+For on-prem deployments using etcd storage backend:
 
 ```
 /nhp/config                    - Shared config (HTTP settings, server peers)
@@ -1363,32 +1482,72 @@ RegisteredAt = 1703980800
 
 ### Per-AC Key Architecture (Security)
 
-**Private keys are NEVER stored in etcd.** Each AC instance:
-1. Generates Curve25519 keypair on first boot
-2. Stores private key in AWS Secrets Manager (`{prefix}-ac-{instance-id}`)
-3. Registers only the public key in etcd
+**Private keys are NEVER stored in the storage backend.** The keypair management flow:
 
-### AC Startup Flow
+1. **Keypair Generation**: Terraform user_data generates Curve25519 keypair on first boot
+2. **Private Key Storage**: Private key stored in AWS Secrets Manager (`{prefix}-ac-{instance-id}`)
+3. **Assignment Registration**: Console writes AC assignment to storage backend (DynamoDB or etcd)
+4. **AC Configuration**: AC loads keypair from local config, connects to NHP Servers
 
-1. AC instance starts
-2. Generates Curve25519 keypair (or retrieves from Secrets Manager if reboot)
-3. Stores private key in Secrets Manager
-4. Registers public key in etcd at `/nhp/ac-registry/{instance-id}`
-6. Loads local `config.toml` (with private key reference)
-7. Connects to etcd, loads server peers from `/nhp/config`
-8. Dials out to NHP servers
+### AC Startup Flow (Cloud Deployments)
+
+For Terraform-managed cloud deployments using DynamoDB:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         AC STARTUP SEQUENCE                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. EC2 instance starts, user_data.sh runs                                  │
+│     └── Generate Curve25519 keypair                                         │
+│     └── Store keypair in Secrets Manager                                    │
+│     └── Write config.toml with private key                                  │
+│                                                                             │
+│  2. Console writes AC assignment to DynamoDB                                │
+│     └── (For Console EC2: happens during InitNHP on startup)                │
+│     └── (For customer ACs: happens when AC created via UI/API)              │
+│                                                                             │
+│  3. nhp-acd daemon starts                                                   │
+│     └── Loads config.toml (private key, server list)                        │
+│     └── Dials OUT to NHP Servers                                            │
+│                                                                             │
+│  4. NHP Server reads AC assignment from DynamoDB                            │
+│     └── Validates AC's public key matches assignment                        │
+│     └── AC is now trusted, can receive NHP_AOP messages                     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Point:** The AC daemon does NOT write to any storage backend. It only:
+- Reads its local config file
+- Connects to NHP Servers listed in config
+- Receives knock validations from Server
+
+### AC Startup Flow (On-Prem Deployments)
+
+For self-hosted deployments using etcd storage backend:
+
+1. AC instance starts, generates keypair
+2. AC registers public key in etcd at `/nhp/ac-registry/{instance-id}`
+3. Loads local `config.toml`, connects to etcd for server peers
+4. Dials out to NHP servers
 
 ### Server-Side AC Trust
 
-The NHP server dynamically discovers ACs by watching `/nhp/ac-registry/` prefix:
+The NHP Server reads AC assignments from the configured storage backend:
 
-1. On startup, loads all existing registry entries
-2. Adds ACs as trusted peers based on their public key
-3. Watches for new registrations/deletions and reconciles
+**DynamoDB (Cloud):**
+1. On startup, Server connects to DynamoDB
+2. Reads AC assignments from `nhp-ac-assignments` table
+3. Trusts ACs based on their assignment records
 
-**Security**: etcd access is protected by mTLS client certificates. Only instances with valid
-certificates (provisioned by Terraform) can register. The server trusts AC public keys registered
-in etcd because etcd access itself is authenticated.
+**etcd (On-Prem):**
+1. On startup, Server watches `/nhp/ac-registry/` prefix
+2. Loads existing registry entries
+3. Watches for new registrations/deletions
+
+**Security**: For cloud deployments, DynamoDB access is controlled by IAM. Console must have
+write permissions; Server only needs read. For on-prem, etcd access is protected by mTLS.
 
 ### Secrets Manager
 
@@ -1402,11 +1561,16 @@ in etcd because etcd access itself is authenticated.
 
 ### Cleanup
 
+**Cloud Deployments (DynamoDB):**
+- **On termination**: ASG lifecycle hook triggers Lambda to delete DynamoDB assignment + Secrets Manager entry
+- **Weekly audit**: Lambda compares assignments to running instances, cleans orphans
+
+**On-Prem Deployments (etcd):**
 - **On termination**: ASG lifecycle hook triggers Lambda to delete etcd entry + secret
 - **Weekly audit**: Lambda compares registry to running instances, cleans orphans
 
-**IMPORTANT**: If etcd has no `[[Servers]]` section, AC has no servers to connect to
-and will fall back to "accept all" mode (failopen).
+**Failopen Behavior:** If AC cannot connect to ANY NHP Server, it falls back to "accept all" mode
+(allows all traffic) to prevent total lockout.
 
 ---
 
