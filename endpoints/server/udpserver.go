@@ -102,10 +102,8 @@ type UdpServer struct {
 	etcdConn                *etcd.EtcdConn
 	remoteConfigUpdateMutex sync.Mutex
 
-	// ============================================================================
-	// Phase 2: Pluggable Storage Backend (DynamoDB/etcd)
+	// Pluggable storage backend (DynamoDB for cloud, etcd for on-prem)
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md for architecture details.
-	// ============================================================================
 	storage       StorageBackend   // DynamoDB (cloud) or etcd (on-prem)
 	storageConfig *StorageConfig
 	forwarder     *ServerForwarder // Server-to-server knock forwarding
@@ -188,10 +186,8 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		return err
 	}
 
-	// ============================================================================
-	// Phase 2: Initialize pluggable storage backend (DynamoDB or etcd)
+	// Initialize pluggable storage backend (DynamoDB or etcd)
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md for architecture details.
-	// ============================================================================
 	s.storageConfig, err = s.loadStorageConfig()
 	if err != nil {
 		log.Warning("Failed to load storage config, storage backend disabled: %v", err)
@@ -209,7 +205,7 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		}
 	}
 
-	// Initialize server-to-server forwarder (Phase 2)
+	// Initialize server-to-server forwarder
 	s.forwarder = NewServerForwarder(s)
 	s.forwarder.Start()
 
@@ -342,11 +338,11 @@ func (s *UdpServer) Stop() {
 	if s.webrtcServer != nil {
 		s.webrtcServer.Stop()
 	}
-	// Close storage backend (Phase 2)
+	// Close storage backend
 	if s.storage != nil {
 		s.storage.Close()
 	}
-	// Stop forwarder cleanup routine (Phase 2)
+	// Stop forwarder cleanup routine
 	if s.forwarder != nil {
 		s.forwarder.Stop()
 	}
@@ -805,7 +801,7 @@ func (s *UdpServer) recvMessageRoutine() {
 			case core.NHP_DAV:
 				go s.HandleDHPDAVMessage(ppd)
 
-			// Phase 2: Server-to-server forwarding
+			// Server-to-server forwarding
 			case core.NHP_FWD:
 				go s.HandleForwardRequest(ppd)
 			case core.NHP_FRT:
@@ -1091,11 +1087,9 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 		}
 	}
 
-	// ============================================================================
-	// Phase 2: Check if we need to forward this knock to another server
+	// Check if we need to forward this knock to another server.
 	// If the AC for this resource isn't connected to us, we look up DynamoDB
 	// to find which servers the AC IS connected to, then forward the knock.
-	// ============================================================================
 	needsForwarding := false
 	var forwardACId string
 	for _, resInfo := range res.Resources {
@@ -1244,7 +1238,7 @@ func (us *UdpServer) FindPluginHandler(aspId string) plugins.PluginHandler {
 }
 
 // ============================================================================
-// Phase 2: Server-to-Server Forwarding Handlers
+// Server-to-Server Forwarding Handlers
 // See docs/design/PLUGGABLE_STORAGE_BACKEND.md sections 6.3-6.5 for details.
 // ============================================================================
 

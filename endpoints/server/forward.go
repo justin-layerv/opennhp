@@ -16,7 +16,7 @@ import (
 )
 
 // ============================================================================
-// Server-to-Server Forwarding (Phase 2)
+// Server-to-Server Forwarding
 // See docs/design/PLUGGABLE_STORAGE_BACKEND.md sections 6.3-6.5 for details.
 //
 // When a knock arrives at a server that doesn't have a connection to the

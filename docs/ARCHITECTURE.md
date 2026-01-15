@@ -103,6 +103,52 @@ GET /refresh/:token?srcip=X.X.X.X - Refresh access for new IP
 
 **Does NOT Listen** for incoming UDP connections—always dials out.
 
+#### AC Registration Flow
+
+ACs must be registered before they can communicate with the NHP Server. Registration has two parts:
+
+1. **Identity Registration (etcd)** - Server must know the AC exists (public key)
+2. **Server Assignment (DynamoDB)** - AC must know which servers to connect to
+
+**LayerV-Managed ACs** (deployed via Terraform):
+
+```
+┌──────────────────┐     1. Write AC entry     ┌─────────────┐
+│  user_data.sh    │ ─────────────────────────►│    etcd     │
+│  (on EC2 boot)   │   /nhp/ac-registry/{id}   │             │
+└──────────────────┘                           └──────┬──────┘
+                                                      │
+                                               2. Watch prefix
+                                                      │
+┌──────────────────┐     3. NHP_AOL            ┌──────▼──────┐
+│     nhp-acd      │ ─────────────────────────►│ NHP Server  │
+│   (AC daemon)    │                           │             │
+│                  │◄─────────────────────────│  (has AC    │
+└──────────────────┘     4. NHP_ARD/NHP_AAK    │  in peer    │
+                         (redirect or ack)     │  map)       │
+                                               └─────────────┘
+```
+
+The AC's `user_data.sh.tpl` writes a TOML entry to etcd containing:
+- Instance ID
+- Public key (Curve25519, base64)
+- IP address and port
+
+The NHP Server watches `/nhp/ac-registry/` prefix and adds recognized ACs to its peer map.
+
+**Console AC** (embedded in Console EC2):
+
+Console's embedded AC uses a different flow because Console writes directly to DynamoDB:
+
+1. Console app calls `RegisterConsoleAC()` → writes assignment to DynamoDB
+2. nhp-acd reads assignment from DynamoDB (no etcd involved)
+3. nhp-acd connects to assigned NHP Servers
+
+**Customer-Deployed ACs** (future):
+
+For ACs deployed in customer environments (not LayerV infrastructure), a Registration Token
+model is planned. See `docs/MULTI_TENANT_REGISTRATION_API.md` for the design (not yet implemented).
+
 ---
 
 ### 3. Console API (`console/server/`)
@@ -177,17 +223,23 @@ When Console EC2 runs an embedded nhp-acd daemon, Console registers its own AC o
 
 1. Console starts, `InitNHP()` runs
 2. If `ConsoleAC.Enabled`:
-   - Read instance ID from EC2 metadata (IMDSv2)
+   - Get instance ID (from config or EC2 IMDS)
    - Read AC keypair from Secrets Manager
    - Call `AssignServersToAC()` to write assignment to DynamoDB
 3. HTTP server starts, `/health` returns OK
 4. user_data starts nhp-acd (which can now find its assignment in DynamoDB)
+
+> **Note:** Docker containers cannot access EC2 IMDS (169.254.169.254) due to bridge networking.
+> The instance ID must be passed via `GVA_CONFIG_NHP_CONSOLE_AC_INSTANCE_ID` environment variable.
+> user_data.sh.tpl fetches the instance ID from IMDS on the host and passes it to Docker.
 
 **Environment Variables (set by Terraform):**
 ```bash
 GVA_CONFIG_NHP_CONSOLE_AC_ENABLED=true
 GVA_CONFIG_NHP_CONSOLE_AC_SECRET_PREFIX=nhp-sandbox-console-ac-
 GVA_CONFIG_NHP_CONSOLE_AC_RESOURCE_FQDN=console.apps.layerv.xyz
+GVA_CONFIG_NHP_CONSOLE_AC_CUSTOMER_ID=layerv
+GVA_CONFIG_NHP_CONSOLE_AC_INSTANCE_ID=$INSTANCE_ID  # Required for Docker
 ```
 
 ---

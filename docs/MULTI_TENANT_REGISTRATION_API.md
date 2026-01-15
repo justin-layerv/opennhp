@@ -1,8 +1,20 @@
 # Multi-Tenant AC Registration API Design
 
 **Version**: 1.0
-**Status**: Ready for Implementation
-**Last Updated**: December 2025
+**Status**: Future Design (Not Yet Implemented)
+**Last Updated**: January 2026
+
+> ⚠️ **FUTURE DESIGN DOCUMENT**
+>
+> This document describes a **planned** Registration Token model for customer-deployed ACs.
+> **Scenario 3 (Customer-Deployed AC)** described in this document is NOT yet implemented.
+>
+> **Current state:**
+> - **Scenario 1 (LayerV-Managed)**: Implemented - ACs register via etcd (`/nhp/ac-registry/`)
+> - **Scenario 2 (Customer-Managed)**: Supported - Same etcd pattern with customer-managed certs
+> - **Scenario 3 (Customer-Deployed AC)**: **NOT IMPLEMENTED** - Registration Token API does not exist yet
+>
+> See `docs/ARCHITECTURE.md` for the current AC registration flow.
 
 ---
 

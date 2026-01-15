@@ -88,6 +88,16 @@ echo "Instance ID: $INSTANCE_ID"
 echo "Local IP: $LOCAL_IP"
 echo "Public IP: $PUBLIC_IP"
 
+# Validate required metadata
+if [ -z "$INSTANCE_ID" ]; then
+    echo "ERROR: Failed to fetch INSTANCE_ID from IMDS"
+    exit 1
+fi
+if [ -z "$LOCAL_IP" ]; then
+    echo "ERROR: Failed to fetch LOCAL_IP from IMDS"
+    exit 1
+fi
+
 # Create ipsets for NHP traffic control
 # - defaultset: active sessions after successful knock (120s timeout)
 # - tempset: temporary entries for initial knock (5s timeout)
@@ -978,6 +988,7 @@ docker run -d \
     -e "GVA_CONFIG_NHP_CONSOLE_AC_SECRET_PREFIX=${name_prefix}-console-ac-" \
     -e "GVA_CONFIG_NHP_CONSOLE_AC_RESOURCE_FQDN=${protected_hostname != null ? protected_hostname : domain_name}" \
     -e "GVA_CONFIG_NHP_CONSOLE_AC_CUSTOMER_ID=${nhp_console_ac_customer_id}" \
+    -e "GVA_CONFIG_NHP_CONSOLE_AC_INSTANCE_ID=$INSTANCE_ID" \
 %{ endif ~}
     "$CONSOLE_IMAGE"
 

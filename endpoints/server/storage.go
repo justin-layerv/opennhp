@@ -9,7 +9,7 @@ import (
 )
 
 // ============================================================================
-// Pluggable Storage Backend Interface (Phase 2)
+// Pluggable Storage Backend Interface
 // See docs/design/PLUGGABLE_STORAGE_BACKEND.md for architecture details.
 //
 // The storage layer is abstracted to support multiple backends:

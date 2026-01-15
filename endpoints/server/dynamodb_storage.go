@@ -21,7 +21,7 @@ const (
 )
 
 // ============================================================================
-// DynamoDB Storage Backend (Phase 2)
+// DynamoDB Storage Backend
 // See docs/design/PLUGGABLE_STORAGE_BACKEND.md for architecture details.
 //
 // Default storage backend for cloud deployments (AWS).

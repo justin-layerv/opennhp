@@ -926,7 +926,7 @@ func (s *UdpServer) reconcileACPeersFromRegistry() {
 }
 
 // ============================================================================
-// Phase 2: Storage Backend Configuration
+// Storage Backend Configuration
 // See docs/design/PLUGGABLE_STORAGE_BACKEND.md for architecture details.
 // ============================================================================
 
