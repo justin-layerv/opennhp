@@ -297,13 +297,13 @@ variable "traefik_plugins" {
 # ============================================================================
 
 variable "console_backend_url" {
-  description = "Console internal endpoint URL for AC to proxy to (e.g., http://nlb-dns:8888)"
+  description = "Console internal endpoint URL for AC to proxy to (e.g., http://nlb-dns:8888). Must be set together with console_domain."
   type        = string
   default     = null
 }
 
 variable "console_domain" {
-  description = "Console domain that AC should route to Console backend (e.g., console.nhp.layerv.xyz)"
+  description = "Console domain that AC should route to Console backend (e.g., console.nhp.layerv.xyz). Must be set together with console_backend_url."
   type        = string
   default     = null
 }

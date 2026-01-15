@@ -610,17 +610,19 @@ TRAEFIKEOF
 cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
 # Traefik Dynamic Configuration
 # Routes:
-%{ if console_domain != null ~}
+%{ if console_domain != null && console_backend_url != null ~}
 # - Host(${console_domain}) → Console EC2 (BYPASSES nhp-acd for login page)
 %{ endif ~}
 # - /plugins/* → NHP Server HTTP (passcode login, auth endpoints)
 # - /* → nhp-acd (protected resource access, refresh)
 
 [http.routers]
-%{ if console_domain != null ~}
+%{ if console_domain != null && console_backend_url != null ~}
   # Console route - BYPASSES nhp-acd for login page access
   # Console handles its own JWT auth, NHP integration is client-side after login
   # See docs/ARCHITECTURE.md "Console NHP Integration" section
+  # NOTE: Both console_domain AND console_backend_url must be set to avoid 502 errors
+  # (a router without a matching service causes Traefik to return 502)
   [http.routers.console]
     rule = "Host(\`${console_domain}\`)"
     service = "console"
@@ -658,8 +660,10 @@ cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
         sans = ["*.${domain_name}"]
 
 [http.services]
-%{ if console_backend_url != null ~}
+%{ if console_domain != null && console_backend_url != null ~}
   # Console backend (bypasses nhp-acd)
+  # NOTE: This service is only created when both console_domain AND console_backend_url are set
+  # to ensure the router and service are always created together (prevents 502 errors)
   [http.services.console.loadBalancer]
     [[http.services.console.loadBalancer.servers]]
       url = "${console_backend_url}"

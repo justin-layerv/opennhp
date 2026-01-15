@@ -171,6 +171,19 @@ locals {
   is_prod    = var.environment == "prod"
   account_id = data.aws_caller_identity.current.account_id
   region     = data.aws_region.current.name
+
+  # Validate that console_domain and console_backend_url are either both set or both null.
+  # A mismatch would cause Traefik to create a router without a matching service (502 error).
+  # This validation fails fast at plan time rather than silently misconfiguring Traefik.
+  _console_routing_valid = (
+    (var.console_domain == null && var.console_backend_url == null) ||
+    (var.console_domain != null && var.console_backend_url != null)
+  )
+  # Use tobool() on a string to force a plan-time error with a custom message.
+  # When valid, returns true; when invalid, tobool("error message") throws.
+  _validate_console_routing = local._console_routing_valid ? true : tobool(
+    "Console routing configuration error: console_domain and console_backend_url must both be set or both be null. This prevents Traefik from creating a router without a matching service (which causes 502 errors). Got: console_domain=${var.console_domain == null ? "null" : "\"${var.console_domain}\""}, console_backend_url=${var.console_backend_url == null ? "null" : "\"${var.console_backend_url}\""}"
+  )
 }
 
 # Route 53 hosted zone lookup for DNS-01 challenge
@@ -510,8 +523,9 @@ resource "aws_service_discovery_service" "ac" {
 }
 
 # User data script
+# Note: Depends on local._validate_console_routing to force validation before template rendering
 locals {
-  user_data = templatefile("${path.module}/user_data.sh.tpl", {
+  user_data = local._validate_console_routing ? templatefile("${path.module}/user_data.sh.tpl", {
     region              = local.region
     account_id          = local.account_id
     ac_repo_url         = var.ac_repo_url
@@ -545,7 +559,7 @@ locals {
     # Console backend routing (for NHP-protected Console)
     console_backend_url = var.console_backend_url
     console_domain      = var.console_domain
-  })
+  }) : null # Validation failed - this branch never executes (tobool throws first)
 }
 
 # Launch Template
