@@ -148,6 +148,28 @@ variable "nhp_assignment_servers_per_ac" {
   default     = 3
 }
 
+variable "nhp_health_monitor_check_interval" {
+  description = "Interval in seconds between NHP health monitor checks. The monitor queries Cloud Map for unhealthy servers and reassigns affected ACs. Must be >= 1."
+  type        = number
+  default     = 60 # Matches Console's DefaultNHPConfig()
+
+  validation {
+    condition     = var.nhp_health_monitor_check_interval >= 1
+    error_message = "nhp_health_monitor_check_interval must be at least 1 second."
+  }
+}
+
+variable "nhp_health_monitor_operation_timeout" {
+  description = "Timeout in seconds for each health monitor operation (e.g., reassigning ACs from an unhealthy server). Must be >= 1."
+  type        = number
+  default     = 30 # Matches Console's DefaultNHPConfig()
+
+  validation {
+    condition     = var.nhp_health_monitor_operation_timeout >= 1
+    error_message = "nhp_health_monitor_operation_timeout must be at least 1 second."
+  }
+}
+
 # ============================================================================
 # NHP Protection Configuration (Network-Level Hiding)
 # NHP protection is always enabled on Console EC2. This configures iptables

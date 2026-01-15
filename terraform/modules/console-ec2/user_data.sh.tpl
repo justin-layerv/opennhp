@@ -971,6 +971,8 @@ docker run -d \
     -e "GVA_CONFIG_NHP_CLOUDMAP_NAMESPACE=${nhp_cloudmap_namespace}" \
     -e "GVA_CONFIG_NHP_CLOUDMAP_SERVICE_NAME=${nhp_cloudmap_service_name}" \
     -e "GVA_CONFIG_NHP_ASSIGNMENT_SERVERS_PER_AC=${nhp_assignment_servers_per_ac}" \
+    -e "GVA_CONFIG_NHP_HEALTH_MONITOR_CHECK_INTERVAL_SECONDS=${nhp_health_monitor_check_interval}" \
+    -e "GVA_CONFIG_NHP_HEALTH_MONITOR_OPERATION_TIMEOUT_SECONDS=${nhp_health_monitor_operation_timeout}" \
 %{ if nhp_ac_repo_url != null ~}
     -e "GVA_CONFIG_NHP_CONSOLE_AC_ENABLED=true" \
     -e "GVA_CONFIG_NHP_CONSOLE_AC_SECRET_PREFIX=${name_prefix}-console-ac-" \

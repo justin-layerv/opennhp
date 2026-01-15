@@ -366,13 +366,15 @@ locals {
     etcd_endpoint       = var.etcd_endpoint
     etcd_tls_secret_arn = var.etcd_tls_secret_arn
     # NHP Server Assignment
-    nhp_server_assignment_enabled      = var.nhp_server_assignment_enabled
-    nhp_region                         = var.nhp_region
-    nhp_dynamodb_ac_assignments_table  = var.nhp_dynamodb_ac_assignments_table
-    nhp_dynamodb_server_ac_index_table = var.nhp_dynamodb_server_ac_index_table
-    nhp_cloudmap_namespace             = var.nhp_cloudmap_namespace
-    nhp_cloudmap_service_name          = var.nhp_cloudmap_service_name
-    nhp_assignment_servers_per_ac      = var.nhp_assignment_servers_per_ac
+    nhp_server_assignment_enabled        = var.nhp_server_assignment_enabled
+    nhp_region                           = var.nhp_region
+    nhp_dynamodb_ac_assignments_table    = var.nhp_dynamodb_ac_assignments_table
+    nhp_dynamodb_server_ac_index_table   = var.nhp_dynamodb_server_ac_index_table
+    nhp_cloudmap_namespace               = var.nhp_cloudmap_namespace
+    nhp_cloudmap_service_name            = var.nhp_cloudmap_service_name
+    nhp_assignment_servers_per_ac        = var.nhp_assignment_servers_per_ac
+    nhp_health_monitor_check_interval    = var.nhp_health_monitor_check_interval
+    nhp_health_monitor_operation_timeout = var.nhp_health_monitor_operation_timeout
   })
 }
 
