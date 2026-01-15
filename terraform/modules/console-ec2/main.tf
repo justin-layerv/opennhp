@@ -375,6 +375,7 @@ locals {
     nhp_assignment_servers_per_ac        = var.nhp_assignment_servers_per_ac
     nhp_health_monitor_check_interval    = var.nhp_health_monitor_check_interval
     nhp_health_monitor_operation_timeout = var.nhp_health_monitor_operation_timeout
+    nhp_console_ac_customer_id           = var.nhp_console_ac_customer_id
   })
 }
 

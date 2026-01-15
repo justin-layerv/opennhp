@@ -977,6 +977,7 @@ docker run -d \
     -e "GVA_CONFIG_NHP_CONSOLE_AC_ENABLED=true" \
     -e "GVA_CONFIG_NHP_CONSOLE_AC_SECRET_PREFIX=${name_prefix}-console-ac-" \
     -e "GVA_CONFIG_NHP_CONSOLE_AC_RESOURCE_FQDN=${protected_hostname != null ? protected_hostname : domain_name}" \
+    -e "GVA_CONFIG_NHP_CONSOLE_AC_CUSTOMER_ID=${nhp_console_ac_customer_id}" \
 %{ endif ~}
     "$CONSOLE_IMAGE"
 

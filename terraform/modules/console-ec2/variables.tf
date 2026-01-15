@@ -170,6 +170,12 @@ variable "nhp_health_monitor_operation_timeout" {
   }
 }
 
+variable "nhp_console_ac_customer_id" {
+  description = "Customer/tenant ID for Console's embedded AC registration. Used in DynamoDB AC assignments. Required when Console AC is enabled."
+  type        = string
+  default     = "layerv"
+}
+
 # ============================================================================
 # NHP Protection Configuration (Network-Level Hiding)
 # NHP protection is always enabled on Console EC2. This configures iptables
