@@ -566,7 +566,7 @@ module "console_ec2" {
   nhp_server_secret_arn = var.deploy_ac ? module.compute.server_secret_arn : null
   nhp_ac_repo_url       = module.ecr.ac_repo_url
   nhp_ac_ecr_repo_arn   = module.ecr.ac_repo_arn
-  nhp_server_hostname   = "server.${module.data.namespace_name}"
+  nhp_server_nlb_dns    = module.compute.nlb_dns_name
 
   # NHP Network-Level Protection (true network hiding with iptables DROP)
   # Console EC2 configures iptables DROP by default.

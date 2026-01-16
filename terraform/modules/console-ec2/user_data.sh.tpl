@@ -507,9 +507,15 @@ AuthServiceId = "passcode"
 ResourceIds = ["${console_app_id}"]
 FilterMode = 0
 
-# Per-AC Server Assignment (required fields)
+# Cloud mode registration (required fields)
 # See docs/design/PLUGGABLE_STORAGE_BACKEND.md Section 6.2 for license validation flow
-ResourceFQDN = "${protected_hostname != null ? protected_hostname : domain_name}"
+#
+# Console AC is unique: ResourceFQDN uses NHP Server NLB DNS because:
+# 1. Customer ACs use per-resource FQDNs (e.g., a1b2c3d4.nhp.layerv.ai) that point to NHP Server NLB
+# 2. Console's protected_hostname (console2.apps.layerv.xyz) points to Console NLB (TCP 443 only)
+# 3. AC registration requires UDP 62206 to NHP Server NLB, so we use the NLB DNS directly
+# 4. DynamoDB license record uses the same value (nhp_server_nlb_dns) for validation
+ResourceFQDN = "${nhp_server_nlb_dns}"
 CustomerId = "${nhp_console_ac_customer_id}"
 LicenseKey = "$CONSOLE_AC_LICENSE_KEY"
 ACVersion = "0.6.0"
@@ -517,18 +523,9 @@ ServerPubKeyBase64 = "$SERVER_PUBLIC_KEY"
 ServerPort = 62206
 CONFIGEOF
 
-  # Create server.toml with NHP Server peer
-  cat > /opt/layerv/nhp-ac/etc/server.toml << SERVEREOF
-# NHP Server peers configuration
-# Console AC connects to NHP Server for knock validation
-
-[[Servers]]
-Hostname = "${nhp_server_hostname}"
-Ip = ""
-Port = 62206
-PubKeyBase64 = "$SERVER_PUBLIC_KEY"
-ExpireTime = 1924991999
-SERVEREOF
+  # Note: server.toml is NOT created for cloud mode
+  # The AC uses ResourceFQDN (NHP Server NLB) for registration instead of static server list
+  # See docs/design/PLUGGABLE_STORAGE_BACKEND.md for cloud mode architecture
 
   # Create nhp-acd systemd service
   cat > /etc/systemd/system/nhp-acd.service << SVCEOF

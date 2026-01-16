@@ -232,8 +232,8 @@ variable "protected_hosted_zone_id" {
   default     = null
 }
 
-variable "nhp_server_hostname" {
-  description = "NHP Server hostname for AC to connect to (e.g., server.nhp.sandbox.internal). Required for Console login flow."
+variable "nhp_server_nlb_dns" {
+  description = "NHP Server NLB DNS name for cloud mode AC registration (e.g., layerv-nhp-sandbox-nlb-xxx.elb.us-east-2.amazonaws.com). Required for cloud mode."
   type        = string
   default     = null
 }

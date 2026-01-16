@@ -17,7 +17,7 @@ check "nhp_protection_requirements" {
       var.nhp_server_secret_arn != null &&
       var.nhp_ac_repo_url != null &&
       var.nhp_ac_ecr_repo_arn != null &&
-      var.nhp_server_hostname != null &&
+      var.nhp_server_nlb_dns != null &&
       var.protected_hostname != null &&
       var.protected_hosted_zone_id != null
     )
@@ -26,7 +26,7 @@ check "nhp_protection_requirements" {
         - nhp_server_secret_arn
         - nhp_ac_repo_url
         - nhp_ac_ecr_repo_arn
-        - nhp_server_hostname
+        - nhp_server_nlb_dns
         - protected_hostname
         - protected_hosted_zone_id
     EOT
@@ -361,7 +361,7 @@ locals {
     # NHP Protection (always enabled)
     nhp_server_secret_arn = var.nhp_server_secret_arn
     nhp_ac_repo_url       = var.nhp_ac_repo_url
-    nhp_server_hostname   = var.nhp_server_hostname
+    nhp_server_nlb_dns    = var.nhp_server_nlb_dns
     vpc_cidr              = var.vpc_cidr
     name_prefix           = var.name_prefix
     secrets_kms_key_arn   = var.secrets_kms_key_arn != null ? var.secrets_kms_key_arn : ""
@@ -1010,7 +1010,7 @@ resource "aws_dynamodb_table_item" "console_ac_license" {
       S = var.nhp_console_ac_customer_id
     }
     resource_fqdn = {
-      S = var.protected_hostname != null ? var.protected_hostname : var.domain_name
+      S = var.nhp_server_nlb_dns # Must match AC's ResourceFQDN for license validation
     }
     license_key_hash = {
       S = var.nhp_console_ac_license_key_hash # Bcrypt hash from generate-console-ac-license.sh
