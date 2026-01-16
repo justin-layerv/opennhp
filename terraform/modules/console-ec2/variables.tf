@@ -183,10 +183,10 @@ variable "nhp_console_ac_customer_id" {
 }
 
 variable "nhp_console_ac_license_key_hash" {
-  description = "Bcrypt hash of the Console AC license key. Stored in DynamoDB for validation. Generate with: terraform/scripts/generate-console-ac-license.sh"
+  description = "Bcrypt hash of the Console AC license key. REQUIRED - AC registration will fail without it. Generate with: terraform/scripts/generate-console-ac-license.sh"
   type        = string
   sensitive   = true
-  default     = "" # Empty = skip license key validation (NOT recommended for production)
+  default     = null
 }
 
 variable "nhp_console_ac_license_secret_arn" {

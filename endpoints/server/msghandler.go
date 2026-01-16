@@ -444,19 +444,22 @@ func (s *UdpServer) validateACLicense(
 		return common.ErrServerACOpsFailed
 	}
 
-	// Validate license key if license record has a hash
-	// If license has no hash, skip key validation (legacy/system ACs)
-	if license.LicenseKeyHash != "" {
-		if aolMsg.LicenseKey == "" {
-			log.Warning("server-ac(%s#%d@%s)[validateACLicense] license key required but not provided for customer=%s",
-				acId, transactionId, addrStr, aolMsg.CustomerId)
-			return common.ErrServerACOpsFailed
-		}
-		if err := bcrypt.CompareHashAndPassword([]byte(license.LicenseKeyHash), []byte(aolMsg.LicenseKey)); err != nil {
-			log.Warning("server-ac(%s#%d@%s)[validateACLicense] license key mismatch for customer=%s",
-				acId, transactionId, addrStr, aolMsg.CustomerId)
-			return common.ErrServerACOpsFailed
-		}
+	// Validate license key - ALWAYS required in cloud mode
+	// A license record without a hash is a misconfiguration that must be rejected
+	if license.LicenseKeyHash == "" {
+		log.Error("server-ac(%s#%d@%s)[validateACLicense] license record has no key hash (misconfiguration) for customer=%s resource=%s",
+			acId, transactionId, addrStr, aolMsg.CustomerId, aolMsg.ResourceFQDN)
+		return common.ErrServerACOpsFailed
+	}
+	if aolMsg.LicenseKey == "" {
+		log.Warning("server-ac(%s#%d@%s)[validateACLicense] license key required but not provided for customer=%s",
+			acId, transactionId, addrStr, aolMsg.CustomerId)
+		return common.ErrServerACOpsFailed
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(license.LicenseKeyHash), []byte(aolMsg.LicenseKey)); err != nil {
+		log.Warning("server-ac(%s#%d@%s)[validateACLicense] license key mismatch for customer=%s",
+			acId, transactionId, addrStr, aolMsg.CustomerId)
+		return common.ErrServerACOpsFailed
 	}
 
 	log.Info("server-ac(%s#%d@%s)[validateACLicense] license validated for customer=%s, tier=%s",

@@ -999,7 +999,9 @@ resource "aws_ssm_parameter" "console_public_url" {
 # See docs/design/PLUGGABLE_STORAGE_BACKEND.md Section 6.2 for details.
 
 resource "aws_dynamodb_table_item" "console_ac_license" {
-  count = var.nhp_dynamodb_licenses_table != null ? 1 : 0
+  # Only create if both DynamoDB table AND license key hash are provided
+  # AC registration will fail without a valid license key hash
+  count = var.nhp_dynamodb_licenses_table != null && var.nhp_console_ac_license_key_hash != null && var.nhp_console_ac_license_key_hash != "" ? 1 : 0
 
   table_name = var.nhp_dynamodb_licenses_table
   hash_key   = "customer_id"
@@ -1013,7 +1015,7 @@ resource "aws_dynamodb_table_item" "console_ac_license" {
       S = var.nhp_server_nlb_dns # Must match AC's ResourceFQDN for license validation
     }
     license_key_hash = {
-      S = var.nhp_console_ac_license_key_hash # Bcrypt hash from generate-console-ac-license.sh
+      S = var.nhp_console_ac_license_key_hash
     }
     tier = {
       S = "system"

@@ -248,32 +248,32 @@ func TestValidateACLicense_EmptyLicenseKey_WithHashInDB(t *testing.T) {
 	}
 }
 
-func TestValidateACLicense_NoHashInDB_AnyKey(t *testing.T) {
+func TestValidateACLicense_NoHashInDB_Rejected(t *testing.T) {
 	storage := NewMemoryStorage()
 	s := testServer(storage)
 
-	// License has no hash (legacy/system AC)
+	// License has no hash - this is a misconfiguration that must be rejected
 	license := &License{
 		CustomerID:     "cust-1",
 		ResourceFQDN:   "console.nhp.test",
 		Active:         true,
 		Tier:           "system",
 		ExpiresAt:      time.Now().Add(24 * time.Hour).Unix(),
-		LicenseKeyHash: "", // No hash - key validation skipped
+		LicenseKeyHash: "", // No hash = misconfiguration
 	}
 	storage.PutLicense(license)
 
-	// AC sends empty key - should be allowed
+	// AC sends key but license has no hash - should be rejected
 	aolMsg := &common.ACOnlineMsg{
 		ACId:         "ac-1",
 		CustomerId:   "cust-1",
 		ResourceFQDN: "console.nhp.test",
-		LicenseKey:   "",
+		LicenseKey:   "some-key",
 	}
 
 	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206")
-	if err != nil {
-		t.Fatalf("Expected success for license without hash, got: %v", err)
+	if err == nil {
+		t.Fatal("Expected failure for license without hash (misconfiguration), got success")
 	}
 }
 

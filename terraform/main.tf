@@ -558,8 +558,9 @@ module "console_ec2" {
 
   # Console AC License - for DynamoDB license validation in cloud mode
   # Generate with: ./terraform/scripts/generate-console-ac-license.sh <environment>
+  # REQUIRED: AC registration will fail without valid license key hash
   nhp_console_ac_license_key_hash   = var.console_ac_license_key_hash
-  nhp_console_ac_license_secret_arn = var.console_ac_license_key_hash != "" ? "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:layerv-nhp-${var.environment}/console-ac-license-key" : null
+  nhp_console_ac_license_secret_arn = var.console_ac_license_key_hash != null && var.console_ac_license_key_hash != "" ? "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:layerv-nhp-${var.environment}/console-ac-license-key" : null
 
   # NHP AC Daemon - Console always needs its own AC for login flow to work
   # The AC registers with NHP Server and receives knock validations
