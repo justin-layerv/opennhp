@@ -283,6 +283,13 @@ variable "console_protected_hostname" {
   default     = null
 }
 
+variable "console_ac_license_key_hash" {
+  description = "Bcrypt hash of Console AC license key for DynamoDB validation. Generate with: ./terraform/scripts/generate-console-ac-license.sh"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 # TLS certificate configuration
 variable "additional_tls_domains" {
   description = "Additional domains for TLS certificates in same account"

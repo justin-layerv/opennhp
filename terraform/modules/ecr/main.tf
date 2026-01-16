@@ -1075,7 +1075,7 @@ resource "aws_iam_policy" "terraform_apply_data" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "DynamoDB"
+        Sid    = "DynamoDBTables"
         Effect = "Allow"
         Action = [
           "dynamodb:CreateTable",
@@ -1085,6 +1085,17 @@ resource "aws_iam_policy" "terraform_apply_data" {
           "dynamodb:UpdateContinuousBackups",
           "dynamodb:TagResource",
           "dynamodb:UntagResource"
+        ]
+        Resource = "arn:aws:dynamodb:${local.region}:${local.account_id}:table/layerv-nhp-*"
+      },
+      {
+        # Item-level permissions for aws_dynamodb_table_item resources (e.g., license seeding)
+        Sid    = "DynamoDBItems"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:DeleteItem"
         ]
         Resource = "arn:aws:dynamodb:${local.region}:${local.account_id}:table/layerv-nhp-*"
       },

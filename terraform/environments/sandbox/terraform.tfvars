@@ -119,6 +119,9 @@ console_internal_only = true
 # - Login domain: console.nhp.layerv.xyz (Traefik bypass, unprotected)
 # - Protected domain: console2.apps.layerv.xyz (NHP-protected, where users land after auth)
 console_protected_hostname = "console2.apps.layerv.xyz"
+# Console AC license key hash for DynamoDB validation
+# Generated with: ./terraform/scripts/generate-console-ac-license.sh sandbox
+console_ac_license_key_hash = "$2b$10$CtI9zvLpcpzt0JNscTwUIOSXL67YvC4sh1dkJsh0/Y6nytM41sWGm"
 
 # NHP network-level protection is always enabled on Console EC2.
 # Console runs its own nhp-acd with iptables DROP by default.
