@@ -716,6 +716,15 @@ resource "aws_iam_policy" "terraform_read" {
         Resource = "*"
       },
       {
+        # GetItem needed for terraform plan to refresh aws_dynamodb_table_item state
+        Sid    = "DynamoDBGetItem"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem"
+        ]
+        Resource = "arn:aws:dynamodb:${local.region}:${local.account_id}:table/layerv-nhp-*"
+      },
+      {
         Sid    = "ChatbotRead"
         Effect = "Allow"
         Action = [
@@ -1084,15 +1093,9 @@ resource "aws_iam_policy" "terraform_apply_data" {
           "dynamodb:UpdateTimeToLive",
           "dynamodb:UpdateContinuousBackups",
           "dynamodb:TagResource",
-          "dynamodb:UntagResource"
-        ]
-        Resource = "arn:aws:dynamodb:${local.region}:${local.account_id}:table/layerv-nhp-*"
-      },
-      {
-        # Item-level permissions for aws_dynamodb_table_item resources (e.g., license seeding)
-        Sid    = "DynamoDBItems"
-        Effect = "Allow"
-        Action = [
+          "dynamodb:UntagResource",
+          # Item-level operations for aws_dynamodb_table_item resources
+          # (e.g., seeding Console AC license in licenses table)
           "dynamodb:GetItem",
           "dynamodb:PutItem",
           "dynamodb:DeleteItem"
