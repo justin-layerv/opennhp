@@ -554,6 +554,12 @@ module "console_ec2" {
   # Required when nhp_server_assignment_enabled=true (the default)
   nhp_dynamodb_ac_assignments_table  = module.dynamodb.ac_assignments_table_name
   nhp_dynamodb_server_ac_index_table = module.dynamodb.server_ac_index_table_name
+  nhp_dynamodb_licenses_table        = module.dynamodb.licenses_table_name
+
+  # Console AC License - for DynamoDB license validation in cloud mode
+  # Generate with: ./terraform/scripts/generate-console-ac-license.sh <environment>
+  nhp_console_ac_license_key_hash   = var.console_ac_license_key_hash
+  nhp_console_ac_license_secret_arn = var.console_ac_license_key_hash != "" ? "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:layerv-nhp-${var.environment}/console-ac-license-key" : null
 
   # NHP AC Daemon - Console always needs its own AC for login flow to work
   # The AC registers with NHP Server and receives knock validations

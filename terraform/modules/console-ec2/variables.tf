@@ -130,6 +130,12 @@ variable "nhp_dynamodb_server_ac_index_table" {
   default     = null # Uses environment-specific name from dynamodb module
 }
 
+variable "nhp_dynamodb_licenses_table" {
+  description = "DynamoDB table name for license validation. Used to seed Console AC license."
+  type        = string
+  default     = null
+}
+
 variable "nhp_cloudmap_namespace" {
   description = "CloudMap namespace for NHP server discovery"
   type        = string
@@ -171,9 +177,22 @@ variable "nhp_health_monitor_operation_timeout" {
 }
 
 variable "nhp_console_ac_customer_id" {
-  description = "Customer/tenant ID for Console's embedded AC registration. Used in DynamoDB AC assignments. Required when Console AC is enabled."
+  description = "Customer/tenant ID for Console's embedded AC registration. Used in DynamoDB license validation and AC assignments."
   type        = string
   default     = "layerv"
+}
+
+variable "nhp_console_ac_license_key_hash" {
+  description = "Bcrypt hash of the Console AC license key. Stored in DynamoDB for validation. Generate with: terraform/scripts/generate-console-ac-license.sh"
+  type        = string
+  sensitive   = true
+  default     = "" # Empty = skip license key validation (NOT recommended for production)
+}
+
+variable "nhp_console_ac_license_secret_arn" {
+  description = "ARN of Secrets Manager secret containing Console AC license key. Console AC reads this at boot."
+  type        = string
+  default     = null
 }
 
 # ============================================================================

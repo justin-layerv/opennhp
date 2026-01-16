@@ -191,6 +191,22 @@ if [ -z "$SERVER_PUBLIC_KEY" ]; then
 fi
 echo "Server public key retrieved: $${SERVER_PUBLIC_KEY:0:20}..."
 
+# Fetch Console AC license key from Secrets Manager (if configured)
+%{ if nhp_console_ac_license_secret_arn != null ~}
+echo "Fetching Console AC license key from Secrets Manager..."
+LICENSE_SECRET=$(aws secretsmanager get-secret-value --secret-id "${nhp_console_ac_license_secret_arn}" --region "$REGION" --query SecretString --output text)
+CONSOLE_AC_LICENSE_KEY=$(echo "$LICENSE_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['key'])" 2>/dev/null || echo "")
+if [ -z "$CONSOLE_AC_LICENSE_KEY" ]; then
+  echo "WARNING: Could not extract license key from secret, continuing without license key"
+  CONSOLE_AC_LICENSE_KEY=""
+else
+  echo "License key retrieved successfully"
+fi
+%{ else ~}
+CONSOLE_AC_LICENSE_KEY=""
+echo "WARNING: No license secret ARN configured, Console AC will use empty license key"
+%{ endif ~}
+
 # Generate Curve25519 keypair for Console AC
 echo "Generating Curve25519 keypair for Console AC..."
 
@@ -492,9 +508,10 @@ ResourceIds = ["${console_app_id}"]
 FilterMode = 0
 
 # Per-AC Server Assignment (required fields)
+# See docs/design/PLUGGABLE_STORAGE_BACKEND.md Section 6.2 for license validation flow
 ResourceFQDN = "${protected_hostname != null ? protected_hostname : domain_name}"
-CustomerId = "system"
-LicenseKey = ""
+CustomerId = "${nhp_console_ac_customer_id}"
+LicenseKey = "$CONSOLE_AC_LICENSE_KEY"
 ACVersion = "0.6.0"
 ServerPubKeyBase64 = "$SERVER_PUBLIC_KEY"
 ServerPort = 62206

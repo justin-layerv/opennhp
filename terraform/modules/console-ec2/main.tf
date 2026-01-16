@@ -95,13 +95,16 @@ resource "aws_iam_role_policy_attachment" "console_ssm" {
 
 locals {
   # Pre-compute resource lists to check for empty arrays
-  secrets_manager_resources = compact([var.rds_secret_arn, var.nhp_server_secret_arn, var.etcd_tls_secret_arn])
-  ecr_repo_resources        = compact([var.ecr_repo_arn, var.nhp_ac_ecr_repo_arn])
+  # Note: License secret ARN uses wildcard suffix because AWS adds random chars to secret ARNs
+  license_secret_arn_pattern = var.nhp_console_ac_license_secret_arn != null ? "${var.nhp_console_ac_license_secret_arn}*" : null
+  secrets_manager_resources  = compact([var.rds_secret_arn, var.nhp_server_secret_arn, var.etcd_tls_secret_arn, local.license_secret_arn_pattern])
+  ecr_repo_resources         = compact([var.ecr_repo_arn, var.nhp_ac_ecr_repo_arn])
   dynamodb_resources = compact([
     var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}" : "",
     var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}/index/*" : "",
     var.nhp_dynamodb_server_ac_index_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_server_ac_index_table}" : "",
-    var.nhp_dynamodb_server_ac_index_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_server_ac_index_table}/index/*" : ""
+    var.nhp_dynamodb_server_ac_index_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_server_ac_index_table}/index/*" : "",
+    var.nhp_dynamodb_licenses_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_licenses_table}" : ""
   ])
   route53_zone_resources = compact(distinct([
     var.hosted_zone_id != null ? "arn:aws:route53:::hostedzone/${var.hosted_zone_id}" : "",
@@ -376,6 +379,7 @@ locals {
     nhp_health_monitor_check_interval    = var.nhp_health_monitor_check_interval
     nhp_health_monitor_operation_timeout = var.nhp_health_monitor_operation_timeout
     nhp_console_ac_customer_id           = var.nhp_console_ac_customer_id
+    nhp_console_ac_license_secret_arn    = var.nhp_console_ac_license_secret_arn
   })
 }
 
@@ -987,4 +991,46 @@ resource "aws_ssm_parameter" "console_public_url" {
   tags = merge(var.tags, {
     Component = "console"
   })
+}
+
+# ==================== Console AC License Seeding ====================
+# Seeds DynamoDB with a license record for Console's embedded AC.
+# This enables license validation in cloud mode (storage_backend=dynamodb).
+# See docs/design/PLUGGABLE_STORAGE_BACKEND.md Section 6.2 for details.
+
+resource "aws_dynamodb_table_item" "console_ac_license" {
+  count = var.nhp_dynamodb_licenses_table != null ? 1 : 0
+
+  table_name = var.nhp_dynamodb_licenses_table
+  hash_key   = "customer_id"
+  range_key  = "resource_fqdn"
+
+  item = jsonencode({
+    customer_id = {
+      S = var.nhp_console_ac_customer_id
+    }
+    resource_fqdn = {
+      S = var.protected_hostname != null ? var.protected_hostname : var.domain_name
+    }
+    license_key_hash = {
+      S = var.nhp_console_ac_license_key_hash # Bcrypt hash from generate-console-ac-license.sh
+    }
+    tier = {
+      S = "system"
+    }
+    max_acs = {
+      N = "1"
+    }
+    expires_at = {
+      N = "0" # Never expires
+    }
+    active = {
+      BOOL = true
+    }
+  })
+
+  lifecycle {
+    # Prevent recreation if item already exists with different attributes
+    ignore_changes = [item]
+  }
 }

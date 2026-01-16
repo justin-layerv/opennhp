@@ -250,8 +250,18 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		return fmt.Errorf("private key parse error %v", err)
 	}
 
+	// In cloud mode (storage_backend = "dynamodb"), disable AC peer pre-validation.
+	// AC authentication will be done via license validation in HandleACOnline
+	// instead of requiring pre-registered public keys from etcd.
+	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md Section 6.2 for details.
+	cloudMode := s.storageConfig != nil && s.storageConfig.Backend == "dynamodb"
+	if cloudMode {
+		log.Info("Cloud mode (storage_backend=dynamodb): AC peer pre-validation disabled, will validate via DynamoDB")
+	}
+
 	option := &core.DeviceOptions{
 		DisableAgentPeerValidation: s.config.DisableAgentValidation,
+		DisableACPeerValidation:    cloudMode,
 	}
 	s.device = core.NewDevice(core.NHP_SERVER, prk, option)
 	if s.device == nil {

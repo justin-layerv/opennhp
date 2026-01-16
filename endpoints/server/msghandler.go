@@ -15,6 +15,7 @@ import (
 	wasmEngine "github.com/OpenNHP/opennhp/nhp/core/wasm/engine"
 	"github.com/OpenNHP/opennhp/nhp/log"
 	utils "github.com/OpenNHP/opennhp/nhp/utils"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // HandleOTPRequest
@@ -235,6 +236,46 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	acPeer := s.acPeerMap[acPubkeyBase64] // ac peer's recvAddr has already been updated by nhp packet parser
 	s.acPeerMapMutex.Unlock()
 
+	// In cloud mode (storage_backend=dynamodb), AC peers are not pre-registered.
+	// We need to validate the AC via license check and create the peer dynamically.
+	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md Section 6.2 for details.
+	cloudMode := s.storageConfig != nil && s.storageConfig.Backend == "dynamodb"
+	if acPeer == nil && cloudMode {
+		// Validate AC license before accepting connection
+		validationErr := s.validateACLicense(ppd, aolMsg, transactionId, addrStr)
+		if validationErr != nil {
+			// Send error response
+			aakMsg := &common.ServerACAckMsg{
+				ErrCode: validationErr.ErrorCode(),
+				ErrMsg:  validationErr.Error(),
+			}
+			aakBytes, _ := json.Marshal(aakMsg)
+			aakMd := &core.MsgData{
+				HeaderType:     core.NHP_AAK,
+				TransactionId:  transactionId,
+				Compress:       true,
+				PrevParserData: ppd,
+				Message:        aakBytes,
+			}
+			if transaction := ppd.ConnData.FindRemoteTransaction(transactionId); transaction != nil {
+				transaction.NextMsgCh <- aakMd
+			}
+			return validationErr
+		}
+
+		// License valid - create peer from packet data and add to peer pool
+		acPeer = &core.UdpPeer{
+			Hostname:     acId,
+			Ip:           ppd.ConnData.RemoteAddr.IP.String(),
+			Port:         ppd.ConnData.RemoteAddr.Port,
+			PubKeyBase64: acPubkeyBase64,
+			ExpireTime:   0, // No expiration - managed via keepalives
+			Type:         core.NHP_AC,
+		}
+		s.AddACPeer(acPeer)
+		log.Info("server-ac(%s#%d@%s)[HandleACOnline] Cloud mode: created AC peer after license validation", acId, transactionId, addrStr)
+	}
+
 	acConn := &ACConn{
 		ConnData:       ppd.ConnData,
 		ACPeer:         acPeer,
@@ -354,6 +395,73 @@ func (s *UdpServer) handleACServerAssignment(
 
 	transaction.NextMsgCh <- ardMd
 	return true, nil
+}
+
+// validateACLicense validates AC credentials against DynamoDB in cloud mode.
+// Returns nil if validation succeeds, or an error if validation fails.
+// See docs/design/PLUGGABLE_STORAGE_BACKEND.md Section 6.2 for the validation flow.
+func (s *UdpServer) validateACLicense(
+	ppd *core.PacketParserData,
+	aolMsg *common.ACOnlineMsg,
+	transactionId uint64,
+	addrStr string,
+) *common.Error {
+	acId := aolMsg.ACId
+
+	// Check if credentials are provided - required in cloud mode
+	if aolMsg.CustomerId == "" || aolMsg.ResourceFQDN == "" {
+		log.Warning("server-ac(%s#%d@%s)[validateACLicense] missing credentials (customerId=%q, resourceFQDN=%q)",
+			acId, transactionId, addrStr, aolMsg.CustomerId, aolMsg.ResourceFQDN)
+		return common.ErrServerACOpsFailed
+	}
+
+	// Look up license from DynamoDB
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	license, err := s.storage.GetLicense(ctx, aolMsg.CustomerId, aolMsg.ResourceFQDN)
+	if err != nil {
+		if IsNotFoundError(err) {
+			log.Warning("server-ac(%s#%d@%s)[validateACLicense] license not found for customer=%s, resource=%s",
+				acId, transactionId, addrStr, aolMsg.CustomerId, aolMsg.ResourceFQDN)
+			return common.ErrServerACOpsFailed
+		}
+		log.Error("server-ac(%s#%d@%s)[validateACLicense] storage error: %v", acId, transactionId, addrStr, err)
+		return common.ErrServerACOpsFailed
+	}
+
+	// Check if license is active
+	if !license.Active {
+		log.Warning("server-ac(%s#%d@%s)[validateACLicense] license inactive for customer=%s",
+			acId, transactionId, addrStr, aolMsg.CustomerId)
+		return common.ErrServerACOpsFailed
+	}
+
+	// Check if license is expired
+	if license.ExpiresAt > 0 && time.Now().Unix() > license.ExpiresAt {
+		log.Warning("server-ac(%s#%d@%s)[validateACLicense] license expired for customer=%s (expired at %d)",
+			acId, transactionId, addrStr, aolMsg.CustomerId, license.ExpiresAt)
+		return common.ErrServerACOpsFailed
+	}
+
+	// Validate license key if license record has a hash
+	// If license has no hash, skip key validation (legacy/system ACs)
+	if license.LicenseKeyHash != "" {
+		if aolMsg.LicenseKey == "" {
+			log.Warning("server-ac(%s#%d@%s)[validateACLicense] license key required but not provided for customer=%s",
+				acId, transactionId, addrStr, aolMsg.CustomerId)
+			return common.ErrServerACOpsFailed
+		}
+		if err := bcrypt.CompareHashAndPassword([]byte(license.LicenseKeyHash), []byte(aolMsg.LicenseKey)); err != nil {
+			log.Warning("server-ac(%s#%d@%s)[validateACLicense] license key mismatch for customer=%s",
+				acId, transactionId, addrStr, aolMsg.CustomerId)
+			return common.ErrServerACOpsFailed
+		}
+	}
+
+	log.Info("server-ac(%s#%d@%s)[validateACLicense] license validated for customer=%s, tier=%s",
+		acId, transactionId, addrStr, aolMsg.CustomerId, license.Tier)
+	return nil
 }
 
 func (s *UdpServer) HandleDBOnline(ppd *core.PacketParserData) (err error) {

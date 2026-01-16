@@ -105,12 +105,34 @@ GET /refresh/:token?srcip=X.X.X.X - Refresh access for new IP
 
 #### AC Registration Flow
 
-ACs must be registered before they can communicate with the NHP Server. Registration has two parts:
+ACs must be trusted by the NHP Server before they can receive NHP_AOP (open port) commands.
+The trust establishment mechanism differs between cloud and on-prem deployments:
 
-1. **Identity Registration (etcd)** - Server must know the AC exists (public key)
-2. **Server Assignment (DynamoDB)** - AC must know which servers to connect to
+**Cloud Mode (DynamoDB storage backend):**
 
-**LayerV-Managed ACs** (deployed via Terraform):
+In cloud deployments, AC trust is established via **license validation**, not pre-registration:
+
+```
+┌──────────────────┐     1. NHP_AOL + license  ┌─────────────┐
+│     nhp-acd      │ ─────────────────────────►│ NHP Server  │
+│   (AC daemon)    │    credentials            │             │
+│                  │                           │   2. Validate
+│                  │                           │   license vs
+│                  │◄─────────────────────────│   DynamoDB
+└──────────────────┘     3. NHP_ARD/NHP_AAK    │             │
+                         (redirect or ack)     │   4. Add to │
+                                               │   peer map  │
+                                               └─────────────┘
+```
+
+The AC sends `CustomerId`, `LicenseKey`, and `ResourceFQDN` in NHP_AOL.
+Server validates against `nhp-licenses` table in DynamoDB. If valid, the AC's
+public key (from the NHP_AOL packet) is added to the peer map dynamically.
+See `docs/design/PLUGGABLE_STORAGE_BACKEND.md` Section 6.2 for details.
+
+**On-Prem Mode (etcd storage backend):**
+
+In on-prem deployments, AC trust is established via **etcd pre-registration**:
 
 ```
 ┌──────────────────┐     1. Write AC entry     ┌─────────────┐
@@ -138,11 +160,11 @@ The NHP Server watches `/nhp/ac-registry/` prefix and adds recognized ACs to its
 
 **Console AC** (embedded in Console EC2):
 
-Console's embedded AC uses a different flow because Console writes directly to DynamoDB:
-
-1. Console app calls `RegisterConsoleAC()` → writes assignment to DynamoDB
-2. nhp-acd reads assignment from DynamoDB (no etcd involved)
-3. nhp-acd connects to assigned NHP Servers
+Console's embedded AC follows the cloud mode flow:
+1. Terraform seeds a license record in DynamoDB for the Console AC
+2. nhp-acd sends NHP_AOL with license credentials
+3. Server validates license, adds AC to peer map
+4. AC receives NHP_AAK acknowledgement
 
 **Customer-Deployed ACs** (future):
 

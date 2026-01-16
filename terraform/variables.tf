@@ -477,6 +477,13 @@ variable "console_protected_hostname" {
   default     = null
 }
 
+variable "console_ac_license_key_hash" {
+  description = "Bcrypt hash of the Console AC license key. Generate with: ./terraform/scripts/generate-console-ac-license.sh <environment>. Required for production deployments."
+  type        = string
+  sensitive   = true
+  default     = "" # Empty = skip license key validation (NOT recommended for production)
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {
