@@ -361,6 +361,7 @@ locals {
     # NHP Protection (always enabled)
     nhp_server_secret_arn   = var.nhp_server_secret_arn
     nhp_ac_repo_url         = var.nhp_ac_repo_url
+    image_tag               = var.image_tag
     nhp_server_cloudmap_dns = var.nhp_server_cloudmap_dns
     vpc_cidr                = var.vpc_cidr
     name_prefix             = var.name_prefix

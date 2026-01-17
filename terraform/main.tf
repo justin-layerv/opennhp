@@ -529,8 +529,8 @@ module "console_ec2" {
   private_subnet_ids = module.networking.private_subnet_ids
   tags               = local.common_tags
 
-  # Console application
-  console_image = "${module.ecr.console_repo_url}:latest"
+  # Console application - use explicit image_tag, not :latest
+  console_image = "${module.ecr.console_repo_url}:${var.image_tag}"
   domain_name   = var.console_ec2_domain
   acme_email    = var.acme_email
   cookie_domain = var.console_cookie_domain
@@ -607,6 +607,7 @@ module "console_ec2" {
   nhp_server_cloudmap_dns = module.compute.cloudmap_service_dns
   nhp_ac_repo_url         = module.ecr.ac_repo_url
   nhp_ac_ecr_repo_arn     = module.ecr.ac_repo_arn
+  image_tag               = var.image_tag
 
   # NHP Network-Level Protection (true network hiding with iptables DROP)
   # Console EC2 configures iptables DROP by default.

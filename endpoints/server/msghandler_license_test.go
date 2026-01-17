@@ -1,6 +1,7 @@
 package server
 
 import (
+	"sort"
 	"testing"
 	"time"
 
@@ -255,60 +256,62 @@ func TestValidateACLicense_StorageError(t *testing.T) {
 // ============================================================================
 // These tests verify that validateACLicense takes approximately the same time
 // regardless of the failure reason, preventing timing-based enumeration attacks.
+//
+// Security context: Without constant-time validation, an attacker could:
+// - Determine if a license key exists by measuring response time
+// - Enumerate valid license keys through timing side-channel
+//
+// The defense: bcrypt comparison dominates timing (~100ms), making all paths
+// take similar time regardless of whether the key exists, is expired, etc.
 
 func TestValidateACLicense_TimingAttackPrevention(t *testing.T) {
-	// This test measures response times for different failure modes.
-	// All failures should take approximately the same time (dominated by bcrypt ~100ms).
-	// We allow a generous tolerance since CI environments may have variable performance.
-
+	// Test configuration designed for reliability in CI while catching real attacks.
+	//
+	// A real timing attack would show 10x+ difference (e.g., 10ms vs 100ms).
+	// We use relative tolerance to catch that while allowing CI variance.
 	const (
-		iterations       = 3                      // Number of iterations to average
-		maxDeviation     = 100 * time.Millisecond // Max allowed deviation from mean
-		minExpectedTime  = 50 * time.Millisecond  // bcrypt should take at least this long
+		warmupRuns      = 2    // Discard first N runs (CPU cache warming)
+		measuredRuns    = 8    // Runs to measure (after warmup)
+		totalRuns       = warmupRuns + measuredRuns
+		trimOutliers    = 1    // Remove N highest/lowest samples
+		maxRelativeDev  = 0.35 // Max 35% deviation from median (catches 10x attacks, allows CI noise)
+		minExpectedTime = 50 * time.Millisecond // bcrypt should take at least this long
 	)
 
 	storage := NewMemoryStorage()
 	s := testServer(storage)
 
-	// Create a valid license for some tests
+	// Create test licenses with different states
 	validKey := "valid-license-key"
-	hash := generateBcryptHash(validKey)
-	license := &License{
+	storage.PutLicenseWithKey(&License{
 		CustomerID:     "cust-1",
 		ResourceID:     "console",
 		Active:         true,
 		Tier:           "pro",
 		ExpiresAt:      time.Now().Add(24 * time.Hour).Unix(),
-		LicenseKeyHash: hash,
-	}
-	storage.PutLicenseWithKey(license, validKey)
+		LicenseKeyHash: generateBcryptHash(validKey),
+	}, validKey)
 
-	// Create an inactive license
 	inactiveKey := "inactive-license-key"
-	inactiveHash := generateBcryptHash(inactiveKey)
-	inactiveLicense := &License{
+	storage.PutLicenseWithKey(&License{
 		CustomerID:     "cust-1",
 		ResourceID:     "console",
-		Active:         false, // Inactive
+		Active:         false,
 		Tier:           "pro",
-		LicenseKeyHash: inactiveHash,
-	}
-	storage.PutLicenseWithKey(inactiveLicense, inactiveKey)
+		LicenseKeyHash: generateBcryptHash(inactiveKey),
+	}, inactiveKey)
 
-	// Create an expired license
 	expiredKey := "expired-license-key"
-	expiredHash := generateBcryptHash(expiredKey)
-	expiredLicense := &License{
+	storage.PutLicenseWithKey(&License{
 		CustomerID:     "cust-1",
 		ResourceID:     "console",
 		Active:         true,
 		Tier:           "pro",
-		ExpiresAt:      time.Now().Add(-1 * time.Hour).Unix(), // Expired
-		LicenseKeyHash: expiredHash,
-	}
-	storage.PutLicenseWithKey(expiredLicense, expiredKey)
+		ExpiresAt:      time.Now().Add(-1 * time.Hour).Unix(),
+		LicenseKeyHash: generateBcryptHash(expiredKey),
+	}, expiredKey)
 
-	// Test cases for timing comparison
+	// Test cases covering all validation paths
 	testCases := []struct {
 		name       string
 		licenseKey string
@@ -319,62 +322,122 @@ func TestValidateACLicense_TimingAttackPrevention(t *testing.T) {
 		{"ValidSuccess", validKey},
 	}
 
-	// Measure average time for each case
-	times := make(map[string]time.Duration)
+	// Collect timing samples for each case
+	samples := make(map[string][]time.Duration)
 	for _, tc := range testCases {
-		var total time.Duration
-		for i := 0; i < iterations; i++ {
+		samples[tc.name] = make([]time.Duration, 0, totalRuns)
+		for i := 0; i < totalRuns; i++ {
 			aolMsg := &common.ACOnlineMsg{
 				ACId:       "ac-1",
 				LicenseKey: tc.licenseKey,
 			}
-
 			start := time.Now()
 			_ = s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206")
 			elapsed := time.Since(start)
-			total += elapsed
-		}
-		times[tc.name] = total / time.Duration(iterations)
-		t.Logf("%s: average time = %v", tc.name, times[tc.name])
-	}
 
-	// Verify all times are above minimum (bcrypt is running)
-	for name, elapsed := range times {
-		if elapsed < minExpectedTime {
-			t.Errorf("%s took only %v, expected at least %v (bcrypt should dominate)",
-				name, elapsed, minExpectedTime)
+			// Skip warmup runs
+			if i >= warmupRuns {
+				samples[tc.name] = append(samples[tc.name], elapsed)
+			}
 		}
 	}
 
-	// Calculate mean time across all failure cases (excluding success for comparison)
-	var totalFailure time.Duration
-	failureCases := []string{"NotFound", "Inactive", "Expired"}
-	for _, name := range failureCases {
-		totalFailure += times[name]
+	// Calculate trimmed median for each case (robust to outliers)
+	medians := make(map[string]time.Duration)
+	for name, durations := range samples {
+		medians[name] = trimmedMedian(durations, trimOutliers)
+		t.Logf("%s: median time = %v (samples: %v)", name, medians[name], formatDurations(durations))
 	}
-	meanFailure := totalFailure / time.Duration(len(failureCases))
 
-	// Verify all failure cases are within tolerance of the mean
-	for _, name := range failureCases {
-		deviation := times[name] - meanFailure
+	// Verify all times are above minimum (bcrypt is actually running)
+	for name, median := range medians {
+		if median < minExpectedTime {
+			t.Errorf("%s median %v is below minimum %v - bcrypt may not be running",
+				name, median, minExpectedTime)
+		}
+	}
+
+	// Calculate overall median across all cases
+	var allMedians []time.Duration
+	for _, m := range medians {
+		allMedians = append(allMedians, m)
+	}
+	overallMedian := trimmedMedian(allMedians, 0)
+
+	// Verify all cases are within relative tolerance of overall median
+	// This catches timing attacks (10x difference) while allowing CI variance (30%)
+	for name, median := range medians {
+		deviation := float64(median-overallMedian) / float64(overallMedian)
 		if deviation < 0 {
 			deviation = -deviation
 		}
-		if deviation > maxDeviation {
-			t.Errorf("%s deviated %v from mean failure time %v (max allowed: %v)",
-				name, deviation, meanFailure, maxDeviation)
+		if deviation > maxRelativeDev {
+			t.Errorf("%s deviated %.1f%% from overall median %v (max allowed: %.0f%%)\n"+
+				"  This could indicate a timing attack vulnerability.\n"+
+				"  Expected: all paths should take similar time due to bcrypt.",
+				name, deviation*100, overallMedian, maxRelativeDev*100)
 		}
 	}
 
-	// Success case should also be similar (bcrypt dominates)
-	successDeviation := times["ValidSuccess"] - meanFailure
-	if successDeviation < 0 {
-		successDeviation = -successDeviation
-	}
-	if successDeviation > maxDeviation {
-		t.Errorf("ValidSuccess deviated %v from mean failure time %v (max allowed: %v)",
-			successDeviation, meanFailure, maxDeviation)
+	t.Logf("Overall median: %v, max relative deviation: %.1f%% (limit: %.0f%%)",
+		overallMedian, maxRelativeDeviation(medians, overallMedian)*100, maxRelativeDev*100)
+}
+
+// trimmedMedian calculates the median after removing N highest and N lowest values.
+// This provides robustness against outliers from CI noise (GC, context switches, etc).
+func trimmedMedian(durations []time.Duration, trim int) time.Duration {
+	if len(durations) == 0 {
+		return 0
 	}
 
-	t.Logf("Mean failure time: %v, all cases within tolerance", meanFailure)
+	// Sort a copy to avoid mutating the original
+	sorted := make([]time.Duration, len(durations))
+	copy(sorted, durations)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+
+	// Trim outliers
+	if trim*2 >= len(sorted) {
+		trim = 0 // Can't trim more than we have
+	}
+	trimmed := sorted[trim : len(sorted)-trim]
+
+	// Calculate median
+	n := len(trimmed)
+	if n == 0 {
+		return sorted[len(sorted)/2]
+	}
+	if n%2 == 0 {
+		return (trimmed[n/2-1] + trimmed[n/2]) / 2
+	}
+	return trimmed[n/2]
+}
+
+// maxRelativeDeviation returns the maximum relative deviation from the reference.
+func maxRelativeDeviation(medians map[string]time.Duration, reference time.Duration) float64 {
+	var maxDev float64
+	for _, m := range medians {
+		dev := float64(m-reference) / float64(reference)
+		if dev < 0 {
+			dev = -dev
+		}
+		if dev > maxDev {
+			maxDev = dev
+		}
+	}
+	return maxDev
+}
+
+// formatDurations formats a slice of durations for logging.
+func formatDurations(durations []time.Duration) string {
+	if len(durations) == 0 {
+		return "[]"
+	}
+	result := "["
+	for i, d := range durations {
+		if i > 0 {
+			result += ", "
+		}
+		result += d.Round(time.Millisecond).String()
+	}
+	return result + "]"
 }

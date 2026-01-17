@@ -471,12 +471,15 @@ echo "Extracting nhp-acd binary from AC image..."
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${account_id}.dkr.ecr.${region}.amazonaws.com"
 
 # Pull AC image and extract nhp-acd binary
-docker pull "${nhp_ac_repo_url}:latest" || docker pull "${nhp_ac_repo_url}:${internal_only ? "internal" : "external"}" || {
-  echo "WARNING: Could not pull AC image, nhp-acd will not be available"
+# Use explicit image_tag to ensure binary version matches Terraform-managed config
+docker pull "${nhp_ac_repo_url}:${image_tag}" || {
+  echo "ERROR: Could not pull AC image with tag ${image_tag}"
+  echo "This likely means the image hasn't been built yet for this commit"
+  exit 1
 }
 
 if docker images | grep -q "nhp-ac"; then
-  CONTAINER_ID=$(docker create "${nhp_ac_repo_url}:latest")
+  CONTAINER_ID=$(docker create "${nhp_ac_repo_url}:${image_tag}")
 
   mkdir -p /opt/layerv/nhp-ac/etc
 

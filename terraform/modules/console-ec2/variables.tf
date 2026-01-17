@@ -36,7 +36,7 @@ variable "private_subnet_ids" {
 # ============================================================================
 
 variable "console_image" {
-  description = "Docker image for console server (ECR URL with tag)"
+  description = "Docker image for console server. Use explicit tag (e.g., ECR_URL:commit-sha), not :latest, to ensure version matches Terraform-managed config."
   type        = string
 }
 
@@ -231,6 +231,11 @@ variable "nhp_ac_ecr_repo_arn" {
   description = "ECR repository ARN for nhp-ac image (for IAM permissions). Required for Console login flow."
   type        = string
   default     = null
+}
+
+variable "image_tag" {
+  description = "Image tag for nhp-ac image. Must match deployed infrastructure to avoid config/binary version mismatches."
+  type        = string
 }
 
 variable "protected_hosted_zone_id" {
