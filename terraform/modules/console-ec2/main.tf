@@ -17,7 +17,7 @@ check "nhp_protection_requirements" {
       var.nhp_server_secret_arn != null &&
       var.nhp_ac_repo_url != null &&
       var.nhp_ac_ecr_repo_arn != null &&
-      var.nhp_server_nlb_dns != null &&
+      var.nhp_server_cloudmap_dns != null &&
       var.protected_hostname != null &&
       var.protected_hosted_zone_id != null
     )
@@ -26,7 +26,7 @@ check "nhp_protection_requirements" {
         - nhp_server_secret_arn
         - nhp_ac_repo_url
         - nhp_ac_ecr_repo_arn
-        - nhp_server_nlb_dns
+        - nhp_server_cloudmap_dns
         - protected_hostname
         - protected_hosted_zone_id
     EOT
@@ -100,11 +100,11 @@ locals {
   secrets_manager_resources  = compact([var.rds_secret_arn, var.nhp_server_secret_arn, var.etcd_tls_secret_arn, local.license_secret_arn_pattern])
   ecr_repo_resources         = compact([var.ecr_repo_arn, var.nhp_ac_ecr_repo_arn])
   dynamodb_resources = compact([
-    var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}" : "",
-    var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}/index/*" : "",
-    var.nhp_dynamodb_server_ac_index_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_server_ac_index_table}" : "",
-    var.nhp_dynamodb_server_ac_index_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_server_ac_index_table}/index/*" : "",
-    var.nhp_dynamodb_licenses_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_licenses_table}" : ""
+    var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}" : "",
+    var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}/index/*" : "",
+    var.nhp_dynamodb_server_ac_index_table != null ? "arn:aws:dynamodb:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_server_ac_index_table}" : "",
+    var.nhp_dynamodb_server_ac_index_table != null ? "arn:aws:dynamodb:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_server_ac_index_table}/index/*" : "",
+    var.nhp_dynamodb_licenses_table != null ? "arn:aws:dynamodb:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_licenses_table}" : ""
   ])
   route53_zone_resources = compact(distinct([
     var.hosted_zone_id != null ? "arn:aws:route53:::hostedzone/${var.hosted_zone_id}" : "",
@@ -144,7 +144,7 @@ resource "aws_iam_role_policy" "console" {
           "secretsmanager:TagResource",
           "secretsmanager:DescribeSecret"
         ]
-        Resource = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}-console-ac-*"
+        Resource = "arn:aws:secretsmanager:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}-console-ac-*"
       }],
       # KMS for secrets encryption/decryption (only when KMS key ARN is provided)
       var.secrets_kms_key_arn != null ? [{
@@ -340,7 +340,7 @@ locals {
     rds_secret_arn    = var.rds_secret_arn
     cookie_domain     = var.cookie_domain
     ac_config_json    = local.ac_config_json
-    region            = data.aws_region.current.name
+    region            = data.aws_region.current.id
     account_id        = data.aws_caller_identity.current.account_id
     hosted_zone_id    = var.hosted_zone_id
     internal_only     = var.internal_only
@@ -359,12 +359,12 @@ locals {
     # AC ID for knock routing (must match AC module's ac_id)
     ac_id = var.ac_id
     # NHP Protection (always enabled)
-    nhp_server_secret_arn = var.nhp_server_secret_arn
-    nhp_ac_repo_url       = var.nhp_ac_repo_url
-    nhp_server_nlb_dns    = var.nhp_server_nlb_dns
-    vpc_cidr              = var.vpc_cidr
-    name_prefix           = var.name_prefix
-    secrets_kms_key_arn   = var.secrets_kms_key_arn != null ? var.secrets_kms_key_arn : ""
+    nhp_server_secret_arn   = var.nhp_server_secret_arn
+    nhp_ac_repo_url         = var.nhp_ac_repo_url
+    nhp_server_cloudmap_dns = var.nhp_server_cloudmap_dns
+    vpc_cidr                = var.vpc_cidr
+    name_prefix             = var.name_prefix
+    secrets_kms_key_arn     = var.secrets_kms_key_arn != null ? var.secrets_kms_key_arn : ""
     # etcd for Console AC registration
     etcd_endpoint       = var.etcd_endpoint
     etcd_tls_secret_arn = var.etcd_tls_secret_arn
@@ -378,8 +378,8 @@ locals {
     nhp_assignment_servers_per_ac        = var.nhp_assignment_servers_per_ac
     nhp_health_monitor_check_interval    = var.nhp_health_monitor_check_interval
     nhp_health_monitor_operation_timeout = var.nhp_health_monitor_operation_timeout
-    nhp_console_ac_customer_id           = var.nhp_console_ac_customer_id
     nhp_console_ac_license_secret_arn    = var.nhp_console_ac_license_secret_arn
+    nhp_console_ac_customer_id           = var.nhp_console_ac_customer_id
   })
 }
 
@@ -757,7 +757,7 @@ resource "aws_lambda_function" "console_cleanup" {
     variables = {
       DYNAMODB_TABLE = var.nhp_dynamodb_ac_assignments_table != null ? var.nhp_dynamodb_ac_assignments_table : ""
       SECRET_PREFIX  = "${var.name_prefix}-console-ac-"
-      AWS_REGION_VAR = data.aws_region.current.name
+      AWS_REGION_VAR = data.aws_region.current.id
     }
   }
 
@@ -894,7 +894,7 @@ resource "aws_iam_role_policy" "cleanup_lambda" {
           "logs:CreateLogStream",
           "logs:PutLogEvents"
         ]
-        Resource = "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.console_name}-cleanup:*"
+        Resource = "arn:aws:logs:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.console_name}-cleanup:*"
       },
       {
         Sid    = "DynamoDBCleanup"
@@ -902,7 +902,7 @@ resource "aws_iam_role_policy" "cleanup_lambda" {
         Action = [
           "dynamodb:DeleteItem"
         ]
-        Resource = var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}" : "*"
+        Resource = var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}" : "*"
       },
       {
         Sid    = "SecretsManagerCleanup"
@@ -910,7 +910,7 @@ resource "aws_iam_role_policy" "cleanup_lambda" {
         Action = [
           "secretsmanager:DeleteSecret"
         ]
-        Resource = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}-console-ac-*"
+        Resource = "arn:aws:secretsmanager:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}-console-ac-*"
       },
       {
         Sid    = "ASGLifecycleComplete"
@@ -996,26 +996,33 @@ resource "aws_ssm_parameter" "console_public_url" {
 # ==================== Console AC License Seeding ====================
 # Seeds DynamoDB with a license record for Console's embedded AC.
 # This enables license validation in cloud mode (storage_backend=dynamodb).
+# License keys are globally unique, so license_key_sha256 is the sole partition key.
 # See docs/design/PLUGGABLE_STORAGE_BACKEND.md Section 6.2 for details.
 
 resource "aws_dynamodb_table_item" "console_ac_license" {
-  # Only create if both DynamoDB table AND license key hash are provided
-  # AC registration will fail without a valid license key hash
-  count = var.nhp_dynamodb_licenses_table != null && var.nhp_console_ac_license_key_hash != null && var.nhp_console_ac_license_key_hash != "" ? 1 : 0
+  # Only create if DynamoDB table AND both license key hashes are provided
+  # AC registration will fail without valid license key hashes
+  count = (
+    var.nhp_dynamodb_licenses_table != null &&
+    var.nhp_console_ac_license_key_hash != null && var.nhp_console_ac_license_key_hash != "" &&
+    var.nhp_console_ac_license_key_sha256 != null && var.nhp_console_ac_license_key_sha256 != ""
+  ) ? 1 : 0
 
   table_name = var.nhp_dynamodb_licenses_table
-  hash_key   = "customer_id"
-  range_key  = "resource_fqdn"
+  hash_key   = "license_key_sha256"
 
   item = jsonencode({
-    customer_id = {
-      S = var.nhp_console_ac_customer_id
-    }
-    resource_fqdn = {
-      S = var.nhp_server_nlb_dns # Must match AC's ResourceFQDN for license validation
+    license_key_sha256 = {
+      S = var.nhp_console_ac_license_key_sha256 # SHA256 of plaintext key (partition key)
     }
     license_key_hash = {
-      S = var.nhp_console_ac_license_key_hash
+      S = var.nhp_console_ac_license_key_hash # bcrypt hash (for validation)
+    }
+    customer_id = {
+      S = var.nhp_console_ac_customer_id # Informational only
+    }
+    resource_id = {
+      S = "console" # Resource identifier (informational)
     }
     tier = {
       S = "system"
@@ -1029,6 +1036,8 @@ resource "aws_dynamodb_table_item" "console_ac_license" {
     active = {
       BOOL = true
     }
+    # Note: created_at and updated_at are set by Console when writing licenses.
+    # For Terraform-seeded licenses, these fields are omitted (system bootstrap).
   })
 
   lifecycle {

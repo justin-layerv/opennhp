@@ -31,9 +31,11 @@ type StorageBackend interface {
 	// Used for server failover and reassignment.
 	GetACsByServer(ctx context.Context, serverID string) ([]ACAssignment, error)
 
-	// GetLicense retrieves license information for a customer/resource combination.
+	// GetLicense retrieves license information using the license key.
+	// The licenseKey is the plaintext key - the implementation computes SHA256 for lookup.
+	// License keys are globally unique, so no customer ID is needed.
 	// Returns ErrNotFound if no license exists.
-	GetLicense(ctx context.Context, customerID, resourceFQDN string) (*License, error)
+	GetLicense(ctx context.Context, licenseKey string) (*License, error)
 
 	// GetResource retrieves resource definition by customer and resource ID.
 	// Returns ErrNotFound if the resource doesn't exist.
@@ -78,14 +80,18 @@ type ServerInfo struct {
 }
 
 // License represents customer license information.
+// License keys are globally unique and serve as the primary lookup key.
 type License struct {
-	CustomerID     string `json:"customer_id"`
-	ResourceFQDN   string `json:"resource_fqdn"`
-	LicenseKeyHash string `json:"license_key_hash"` // bcrypt hash
-	Tier           string `json:"tier"`             // "free", "pro", "enterprise"
-	MaxACs         int    `json:"max_acs"`
-	ExpiresAt      int64  `json:"expires_at"`       // Unix timestamp
-	Active         bool   `json:"active"`
+	LicenseKeySHA256 string `json:"license_key_sha256"` // SHA256 of plaintext key (partition key for lookup)
+	LicenseKeyHash   string `json:"license_key_hash"`   // bcrypt hash for validation
+	CustomerID       string `json:"customer_id"`        // Customer ID (ULID, for GSI queries)
+	ResourceID       string `json:"resource_id"`        // Resource identifier (informational)
+	Tier             string `json:"tier"`               // "free", "pro", "enterprise"
+	MaxACs           int    `json:"max_acs"`
+	ExpiresAt        int64  `json:"expires_at"`  // Unix timestamp (0 = never expires)
+	Active           bool   `json:"active"`
+	CreatedAt        int64  `json:"created_at"`  // Unix timestamp
+	UpdatedAt        int64  `json:"updated_at"`  // Unix timestamp
 }
 
 // Resource represents a protected resource definition.
@@ -266,8 +272,8 @@ func (cs *CachedStorage) GetACsByServer(ctx context.Context, serverID string) ([
 }
 
 // GetLicense retrieves license (not cached, used during registration only).
-func (cs *CachedStorage) GetLicense(ctx context.Context, customerID, resourceFQDN string) (*License, error) {
-	return cs.backend.GetLicense(ctx, customerID, resourceFQDN)
+func (cs *CachedStorage) GetLicense(ctx context.Context, licenseKey string) (*License, error) {
+	return cs.backend.GetLicense(ctx, licenseKey)
 }
 
 // GetResource retrieves resource definition (could be cached in future).

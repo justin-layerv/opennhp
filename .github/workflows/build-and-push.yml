@@ -397,6 +397,9 @@ jobs:
         id: plan
         if: steps.changes.outputs.terraform_changed == 'true'
         working-directory: terraform/environments/sandbox
+        env:
+          # AC license credentials (from GitHub Secrets)
+          TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
         run: |
           set -o pipefail
           terraform plan -no-color 2>&1 | tee plan.txt
@@ -502,6 +505,8 @@ jobs:
           # Sensitive variables passed via TF_VAR_ environment variables
           TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
+          # AC license key (plaintext - stored in Secrets Manager)
+          TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
           # Deployment configuration - use commit SHA for immutable deployments
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         run: |
@@ -584,6 +589,7 @@ jobs:
         env:
           TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
+          TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         run: |
           set -euo pipefail
@@ -636,6 +642,8 @@ jobs:
           # Sensitive variables passed via TF_VAR_ environment variables
           TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
+          # AC license key (plaintext - stored in Secrets Manager)
+          TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
           # Deployment configuration - use commit SHA for immutable deployments
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         # Apply the plan generated in previous step (or fresh if no migrations)
@@ -1037,6 +1045,7 @@ jobs:
         env:
           TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
+          TF_VAR_ac_license_key: ${{ secrets.PROD_AC_LICENSE_KEY }}
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         run: |
           set -euo pipefail
@@ -1075,6 +1084,8 @@ jobs:
           # Sensitive variables passed via TF_VAR_ environment variables
           TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
+          # AC license key (plaintext - stored in Secrets Manager) - prod uses separate secrets
+          TF_VAR_ac_license_key: ${{ secrets.PROD_AC_LICENSE_KEY }}
           # Deployment configuration - use commit SHA for immutable deployments
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         # Manual approval is handled by GitHub environment protection rules

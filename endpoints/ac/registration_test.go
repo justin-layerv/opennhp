@@ -15,9 +15,8 @@ import (
 func TestACRegistration_NewACRegistration(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -53,9 +52,8 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 	// Create a minimal AC with required fields
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 		sendMsgCh: make(chan *core.MsgData, 10), // Buffer to prevent blocking
 	}
@@ -155,9 +153,8 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 func TestACRegistration_UpdateServerLastSeen(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -222,9 +219,8 @@ func TestACRegistration_UpdateServerLastSeen(t *testing.T) {
 func TestACRegistration_HasAssignedServers(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -252,9 +248,8 @@ func TestACRegistration_HasAssignedServers(t *testing.T) {
 func TestACRegistration_ConcurrentAccess(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -320,24 +315,19 @@ func TestConfig_RegistrationFields(t *testing.T) {
 	config := &Config{
 		ACId:               "test-ac",
 		PrivateKeyBase64:   "testprivkey",
-		CustomerId:         "cust-123",
 		LicenseKey:         "lk_abc123",
-		ResourceFQDN:       "test.nhp.layerv.ai",
+		ServerEndpoint:     "server.nhp.test.internal",
 		ACVersion:          "1.0.0",
 		ServerPubKeyBase64: "serverpubkey",
 		ServerPort:         62206,
-	}
-
-	if config.CustomerId != "cust-123" {
-		t.Errorf("CustomerId = %q, want %q", config.CustomerId, "cust-123")
 	}
 
 	if config.LicenseKey != "lk_abc123" {
 		t.Errorf("LicenseKey = %q, want %q", config.LicenseKey, "lk_abc123")
 	}
 
-	if config.ResourceFQDN != "test.nhp.layerv.ai" {
-		t.Errorf("ResourceFQDN = %q, want %q", config.ResourceFQDN, "test.nhp.layerv.ai")
+	if config.ServerEndpoint != "server.nhp.test.internal" {
+		t.Errorf("ServerEndpoint = %q, want %q", config.ServerEndpoint, "server.nhp.test.internal")
 	}
 
 	if config.ACVersion != "1.0.0" {
@@ -357,9 +347,8 @@ func TestConfig_RegistrationFields(t *testing.T) {
 func TestACRegistration_OldServerSetsCleanup(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -454,9 +443,8 @@ func TestAssignedServer_Accessors(t *testing.T) {
 func TestACRegistration_GetAssignedServers(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -484,9 +472,8 @@ func TestACRegistration_GetAssignedServers(t *testing.T) {
 func TestACRegistration_UpdateServerLastSeen_NoMatch(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -520,9 +507,8 @@ func TestACRegistration_UpdateServerLastSeen_NoMatch(t *testing.T) {
 func TestACRegistration_Stop(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -554,9 +540,8 @@ func TestACRegistration_Stop(t *testing.T) {
 func TestACRegistration_ReregisteringGuard(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -584,9 +569,8 @@ func TestACRegistration_ReregisteringGuard(t *testing.T) {
 func TestACRegistration_ServerAssignment(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -651,9 +635,8 @@ func TestACRegistration_ServerAssignment(t *testing.T) {
 func TestACRegistration_CheckServerHealth_SkipsNeverConnected(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -712,9 +695,8 @@ func TestACRegistration_CheckServerHealth_SkipsNeverConnected(t *testing.T) {
 func TestACRegistration_ConcurrentRedispatchAndHealthCheck(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -803,9 +785,8 @@ func TestACRegistration_ConcurrentRedispatchAndHealthCheck(t *testing.T) {
 func TestACRegistration_RapidRedispatchOldServerSets(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -865,9 +846,8 @@ func TestACRegistration_RapidRedispatchOldServerSets(t *testing.T) {
 func TestACRegistration_HandleServerDownRespectStopChannel(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -916,9 +896,8 @@ func TestACRegistration_HandleServerDownRespectStopChannel(t *testing.T) {
 func TestACRegistration_HealthCheckFullFlow(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -998,9 +977,8 @@ func TestACRegistration_HealthCheckFullFlow(t *testing.T) {
 func TestACRegistration_KeepaliveFilteringLogic(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -1076,45 +1054,22 @@ func TestACRegistration_KeepaliveFilteringLogic(t *testing.T) {
 
 // TestACRegistration_Start_MissingConfig tests Start() with missing required config.
 func TestACRegistration_Start_MissingConfig(t *testing.T) {
-	tests := []struct {
-		name        string
-		config      *Config
-		expectError string
-	}{
-		{
-			name: "missing ResourceFQDN",
-			config: &Config{
-				ACId:       "test-ac-001",
-				CustomerId: "test-customer",
-				// ResourceFQDN is empty
-			},
-			expectError: "ResourceFQDN is required",
-		},
-		{
-			name: "missing CustomerId",
-			config: &Config{
-				ACId:         "test-ac-001",
-				ResourceFQDN: "test.nhp.example.com",
-				// CustomerId is empty
-			},
-			expectError: "CustomerId is required",
+	// ServerEndpoint is the only required config for cloud mode registration
+	ac := &UdpAC{
+		config: &Config{
+			ACId: "test-ac-001",
+			// ServerEndpoint is empty
 		},
 	}
+	reg := NewACRegistration(ac)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ac := &UdpAC{config: tt.config}
-			reg := NewACRegistration(ac)
-
-			err := reg.Start()
-			if err == nil {
-				t.Error("expected error but got nil")
-				return
-			}
-			if err.Error() != tt.expectError {
-				t.Errorf("expected error %q, got %q", tt.expectError, err.Error())
-			}
-		})
+	err := reg.Start()
+	if err == nil {
+		t.Error("expected error but got nil")
+		return
+	}
+	if err.Error() != "ServerEndpoint is required" {
+		t.Errorf("expected error %q, got %q", "ServerEndpoint is required", err.Error())
 	}
 }
 
@@ -1122,9 +1077,8 @@ func TestACRegistration_Start_MissingConfig(t *testing.T) {
 func TestACRegistration_HandleRegistrationResponse(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -1223,9 +1177,8 @@ func TestACRegistration_HandleRegistrationResponse(t *testing.T) {
 func TestACRegistration_CheckServerHealth_AlreadyReregistering(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -1273,9 +1226,8 @@ func TestACRegistration_CheckServerHealth_AlreadyReregistering(t *testing.T) {
 func TestACRegistration_CleanupOldServers_NilPeer(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
@@ -1362,8 +1314,7 @@ func TestACRegistration_ServerPortDefault(t *testing.T) {
 	// When ServerPort is 0, register() should use DefaultServerPort
 	config := &Config{
 		ACId:               "test-ac",
-		CustomerId:         "test-customer",
-		ResourceFQDN:       "test.nhp.example.com",
+		ServerEndpoint:     "server.nhp.test.internal",
 		ServerPubKeyBase64: "testpubkey",
 		ServerPort:         0, // Should default to 62206
 	}
@@ -1395,9 +1346,8 @@ func TestACRegistration_HandleRedispatch_PartialSuccess(t *testing.T) {
 
 	ac := &UdpAC{
 		config: &Config{
-			ACId:         "test-ac-001",
-			CustomerId:   "test-customer",
-			ResourceFQDN: "test.nhp.example.com",
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 

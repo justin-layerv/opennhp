@@ -221,7 +221,7 @@ func (m *mockStorageBackend) GetACsByServer(ctx context.Context, serverID string
 	return nil, NewNotFoundError("not implemented")
 }
 
-func (m *mockStorageBackend) GetLicense(ctx context.Context, customerID, resourceFQDN string) (*License, error) {
+func (m *mockStorageBackend) GetLicense(ctx context.Context, licenseKey string) (*License, error) {
 	return nil, NewNotFoundError("not implemented")
 }
 

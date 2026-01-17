@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"sync"
 	"time"
 )
@@ -35,7 +37,7 @@ type MemoryStorage struct {
 
 	// Data stores
 	acAssignments map[string]*ACAssignment // ACID -> Assignment
-	licenses      map[string]*License      // customerID:resourceFQDN -> License
+	licenses      map[string]*License      // licenseKeySHA256 -> License
 	resources     map[string]*Resource     // customerID:resourceID -> Resource
 	resourcesByAC map[string][]Resource    // ACID -> []Resource
 
@@ -133,8 +135,10 @@ func (m *MemoryStorage) GetACsByServer(ctx context.Context, serverID string) ([]
 	return results, nil
 }
 
-// GetLicense retrieves license information.
-func (m *MemoryStorage) GetLicense(ctx context.Context, customerID, resourceFQDN string) (*License, error) {
+// GetLicense retrieves license information using the license key.
+// The license key is hashed with SHA256 for lookup (matching DynamoDB implementation).
+// License keys are globally unique, so no customer ID is needed.
+func (m *MemoryStorage) GetLicense(ctx context.Context, licenseKey string) (*License, error) {
 	m.mu.Lock()
 	m.callCounts["GetLicense"]++
 	m.mu.Unlock()
@@ -146,13 +150,16 @@ func (m *MemoryStorage) GetLicense(ctx context.Context, customerID, resourceFQDN
 		return nil, err
 	}
 
+	// Compute SHA256 of license key for lookup
+	hash := sha256.Sum256([]byte(licenseKey))
+	licenseKeySHA256 := hex.EncodeToString(hash[:])
+
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	key := customerID + ":" + resourceFQDN
-	license, ok := m.licenses[key]
+	license, ok := m.licenses[licenseKeySHA256]
 	if !ok {
-		return nil, NewNotFoundError("license not found: " + key)
+		return nil, NewNotFoundError("license not found")
 	}
 
 	// Return a copy
@@ -260,21 +267,38 @@ func (m *MemoryStorage) DeleteACAssignment(acID string) {
 }
 
 // PutLicense stores a license.
+// The license must have LicenseKeySHA256 already computed (use PutLicenseWithKey helper).
 func (m *MemoryStorage) PutLicense(license *License) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	key := license.CustomerID + ":" + license.ResourceFQDN
 	copy := *license
-	m.licenses[key] = &copy
+	m.licenses[license.LicenseKeySHA256] = &copy
 }
 
-// DeleteLicense removes a license.
-func (m *MemoryStorage) DeleteLicense(customerID, resourceFQDN string) {
+// PutLicenseWithKey stores a license and computes the SHA256 of the license key.
+// This is a convenience method for testing.
+func (m *MemoryStorage) PutLicenseWithKey(license *License, licenseKey string) {
+	// Compute SHA256 of license key
+	hash := sha256.Sum256([]byte(licenseKey))
+	license.LicenseKeySHA256 = hex.EncodeToString(hash[:])
+
+	m.PutLicense(license)
+}
+
+// DeleteLicense removes a license by license key SHA256.
+func (m *MemoryStorage) DeleteLicense(licenseKeySHA256 string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	key := customerID + ":" + resourceFQDN
-	delete(m.licenses, key)
+	delete(m.licenses, licenseKeySHA256)
+}
+
+// DeleteLicenseByKey removes a license using the plaintext license key.
+// This is a convenience method for testing.
+func (m *MemoryStorage) DeleteLicenseByKey(licenseKey string) {
+	hash := sha256.Sum256([]byte(licenseKey))
+	licenseKeySHA256 := hex.EncodeToString(hash[:])
+	m.DeleteLicense(licenseKeySHA256)
 }
 
 // PutResource stores a resource.
@@ -486,16 +510,28 @@ func CreateTestACAssignment(acID string, serverIDs ...string) *ACAssignment {
 }
 
 // CreateTestLicense creates a test license with sensible defaults.
-func CreateTestLicense(customerID, resourceFQDN string) *License {
-	return &License{
-		CustomerID:     customerID,
-		ResourceFQDN:   resourceFQDN,
-		LicenseKeyHash: "$2a$10$testhashedlicensekey",
-		Tier:           "pro",
-		MaxACs:         100,
-		ExpiresAt:      time.Now().Add(365 * 24 * time.Hour).Unix(),
-		Active:         true,
+// The licenseKey parameter is used to compute the SHA256 for lookup.
+func CreateTestLicense(licenseKey string, opts ...func(*License)) *License {
+	// Compute SHA256 of license key for lookup
+	hash := sha256.Sum256([]byte(licenseKey))
+	licenseKeySHA256 := hex.EncodeToString(hash[:])
+
+	license := &License{
+		LicenseKeySHA256: licenseKeySHA256,
+		LicenseKeyHash:   "$2a$10$testhashedlicensekey", // bcrypt hash for validation
+		CustomerID:       "test-customer",
+		ResourceID:       "test-resource",
+		Tier:             "pro",
+		MaxACs:           100,
+		ExpiresAt:        time.Now().Add(365 * 24 * time.Hour).Unix(),
+		Active:           true,
 	}
+
+	for _, opt := range opts {
+		opt(license)
+	}
+
+	return license
 }
 
 // CreateTestResource creates a test resource with sensible defaults.

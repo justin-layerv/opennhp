@@ -138,12 +138,16 @@ func TestMemoryStorage_License_PutAndGet(t *testing.T) {
 	storage := NewMemoryStorage()
 	ctx := context.Background()
 
-	// Put license
-	license := CreateTestLicense("cust-1", "resource.nhp.test")
+	// Put license using the helper that computes SHA256
+	licenseKey := "test-license-key-123"
+	license := CreateTestLicense(licenseKey, func(l *License) {
+		l.CustomerID = "cust-1"
+		l.ResourceID = "console"
+	})
 	storage.PutLicense(license)
 
-	// Get license
-	retrieved, err := storage.GetLicense(ctx, "cust-1", "resource.nhp.test")
+	// Get license using the plaintext license key (storage will compute SHA256)
+	retrieved, err := storage.GetLicense(ctx, licenseKey)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -163,7 +167,7 @@ func TestMemoryStorage_License_NotFound(t *testing.T) {
 	storage := NewMemoryStorage()
 	ctx := context.Background()
 
-	_, err := storage.GetLicense(ctx, "nonexistent", "resource.nhp.test")
+	_, err := storage.GetLicense(ctx, "nonexistent-license-key")
 	if !IsNotFoundError(err) {
 		t.Errorf("Expected NOT_FOUND error, got %v", err)
 	}
@@ -217,7 +221,7 @@ func TestMemoryStorage_Close(t *testing.T) {
 
 	// Add data
 	storage.PutACAssignment(CreateTestACAssignment("ac-1", "srv-1"))
-	storage.PutLicense(CreateTestLicense("cust-1", "res.nhp.test"))
+	storage.PutLicense(CreateTestLicense("license-key-1"))
 
 	// Close
 	err := storage.Close()
@@ -274,8 +278,9 @@ func TestMemoryStorage_ErrorInjection_SpecificMethod(t *testing.T) {
 	ctx := context.Background()
 
 	// Put data
+	licenseKey := "license-key-1"
 	storage.PutACAssignment(CreateTestACAssignment("ac-1", "srv-1"))
-	storage.PutLicense(CreateTestLicense("cust-1", "res.nhp.test"))
+	storage.PutLicense(CreateTestLicense(licenseKey))
 
 	// Set error only for GetLicense
 	storage.SetErrorOnNextCallForMethod("GetLicense", ErrCodeRateLimited, "rate limited")
@@ -287,7 +292,7 @@ func TestMemoryStorage_ErrorInjection_SpecificMethod(t *testing.T) {
 	}
 
 	// GetLicense should fail
-	_, err = storage.GetLicense(ctx, "cust-1", "res.nhp.test")
+	_, err = storage.GetLicense(ctx, licenseKey)
 	if err == nil {
 		t.Fatal("Expected GetLicense to fail")
 	}
@@ -377,8 +382,9 @@ func TestMemoryStorage_DelayInjection_SpecificMethod(t *testing.T) {
 	storage := NewMemoryStorage()
 	ctx := context.Background()
 
+	licenseKey := "license-key-1"
 	storage.PutACAssignment(CreateTestACAssignment("ac-1", "srv-1"))
-	storage.PutLicense(CreateTestLicense("cust-1", "res.nhp.test"))
+	storage.PutLicense(CreateTestLicense(licenseKey))
 
 	// Set delay only for GetLicense
 	storage.SetDelayOnNextCallForMethod("GetLicense", 100*time.Millisecond)
@@ -390,7 +396,7 @@ func TestMemoryStorage_DelayInjection_SpecificMethod(t *testing.T) {
 
 	// GetLicense should be slow
 	start = time.Now()
-	storage.GetLicense(ctx, "cust-1", "res.nhp.test")
+	storage.GetLicense(ctx, licenseKey)
 	licElapsed := time.Since(start)
 
 	if acElapsed > 50*time.Millisecond {
@@ -512,19 +518,35 @@ func TestCreateTestACAssignment(t *testing.T) {
 }
 
 func TestCreateTestLicense(t *testing.T) {
-	license := CreateTestLicense("cust-123", "my.nhp.test")
+	// Test with options
+	license := CreateTestLicense("my-license-key", func(l *License) {
+		l.CustomerID = "cust-123"
+		l.ResourceID = "console"
+	})
 
 	if license.CustomerID != "cust-123" {
 		t.Errorf("Expected CustomerID 'cust-123', got '%s'", license.CustomerID)
 	}
-	if license.ResourceFQDN != "my.nhp.test" {
-		t.Errorf("Expected ResourceFQDN 'my.nhp.test', got '%s'", license.ResourceFQDN)
+	if license.ResourceID != "console" {
+		t.Errorf("Expected ResourceID 'console', got '%s'", license.ResourceID)
+	}
+	if license.LicenseKeySHA256 == "" {
+		t.Error("Expected LicenseKeySHA256 to be computed")
 	}
 	if !license.Active {
 		t.Error("Expected Active to be true")
 	}
 	if license.ExpiresAt <= time.Now().Unix() {
 		t.Error("Expected ExpiresAt to be in the future")
+	}
+
+	// Test without options (uses defaults)
+	licenseDefault := CreateTestLicense("another-key")
+	if licenseDefault.CustomerID != "test-customer" {
+		t.Errorf("Expected default CustomerID 'test-customer', got '%s'", licenseDefault.CustomerID)
+	}
+	if licenseDefault.ResourceID != "test-resource" {
+		t.Errorf("Expected default ResourceID 'test-resource', got '%s'", licenseDefault.ResourceID)
 	}
 }
 

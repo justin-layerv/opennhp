@@ -187,7 +187,7 @@ locals {
     fallback_url                   = var.fallback_url
     cross_account_route53_role_arn = var.cross_account_route53_role_arn
     hosted_zone_id                 = var.hosted_zone_id
-    region                         = data.aws_region.current.name
+    region                         = data.aws_region.current.id
   })
 }
 

@@ -13,6 +13,12 @@ variable "environment" {
   }
 }
 
+variable "cell_id" {
+  description = "Cell identifier for multi-cell deployments (e.g., cell0, cell1). Used for resource naming and tagging."
+  type        = string
+  default     = "cell0"
+}
+
 # ==================== AWS Configuration ====================
 
 variable "aws_region" {
@@ -235,6 +241,36 @@ variable "ac_resource_ids" {
   description = "List of resource IDs that the Access Controller protects"
   type        = list(string)
   default     = ["default"]
+}
+
+# Standalone AC License Credentials (for customer-deployed ACs)
+# These are separate from console_ac_* which is for the Console's embedded AC
+
+variable "ac_customer_id" {
+  description = "Customer ID (ULID format) for standalone AC license"
+  type        = string
+  default     = null
+}
+
+variable "ac_license_key" {
+  description = "License key for standalone AC registration (plaintext, stored in Secrets Manager)"
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "ac_license_key_hash" {
+  description = "Bcrypt hash of standalone AC license key for DynamoDB seeding"
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "ac_license_key_sha256" {
+  description = "SHA256 hash of standalone AC license key for DynamoDB lookup"
+  type        = string
+  default     = null
+  sensitive   = true
 }
 
 variable "cross_account_route53_role_arn" {
@@ -482,6 +518,19 @@ variable "console_ac_license_key_hash" {
   type        = string
   sensitive   = true
   default     = null
+}
+
+variable "console_ac_license_key_sha256" {
+  description = "SHA256 hash of the Console AC license key. Used as DynamoDB partition key for license lookup. Generate with: ./terraform/scripts/generate-console-ac-license.sh <environment>"
+  type        = string
+  sensitive   = true
+  default     = null
+}
+
+variable "console_ac_customer_id" {
+  description = "Customer ID (ULID format) for Console's embedded AC. LayerV system uses nil ULID: 00000000000000000000000000"
+  type        = string
+  default     = "00000000000000000000000000" # Nil ULID for LayerV system customer
 }
 
 # ==================== Common Tags ====================

@@ -1,36 +1,42 @@
 #!/bin/bash
-# generate-console-ac-license.sh
-# Generates a license key for Console AC and stores it securely.
+# generate-ac-license.sh
+# Generates a license key for standalone AC and stores it securely.
 #
 # This script:
 # 1. Generates a random 32-character license key
 # 2. Computes bcrypt hash of the key (for validation)
 # 3. Computes SHA256 hash of the key (for DynamoDB lookup)
 # 4. Stores plaintext key in AWS Secrets Manager
-# 5. Outputs hashes for use in Terraform variables
+# 5. Outputs all values for use in Terraform variables
 #
 # Prerequisites:
 #   - AWS CLI configured with appropriate profile
 #   - Python 3 with bcrypt package (pip install bcrypt)
 #
 # Usage:
-#   ./generate-console-ac-license.sh <environment>
+#   ./generate-ac-license.sh <environment> [customer_id]
 #
 # Example:
-#   AWS_PROFILE=layerv ./generate-console-ac-license.sh sandbox
+#   AWS_PROFILE=layerv ./generate-ac-license.sh sandbox
+#   AWS_PROFILE=layerv ./generate-ac-license.sh sandbox 01HXYZ1234567890ABCDEFGHIJ
 #
-# After running, add the output hashes to your terraform.tfvars:
-#   console_ac_license_key_hash   = "<bcrypt_hash from output>"
-#   console_ac_license_key_sha256 = "<sha256_hash from output>"
+# After running, add the output values to your terraform.tfvars:
+#   ac_customer_id        = "<customer_id from output>"
+#   ac_license_key        = "<license_key from output>"
+#   ac_license_key_hash   = "<bcrypt_hash from output>"
+#   ac_license_key_sha256 = "<sha256_hash from output>"
 
 set -euo pipefail
 
 ENVIRONMENT="${1:-sandbox}"
+# Default to nil ULID for LayerV system customer (26 zeros in Crockford base32)
+CUSTOMER_ID="${2:-00000000000000000000000000}"
 AWS_REGION="${AWS_REGION:-us-east-2}"
-SECRET_NAME="layerv-nhp-${ENVIRONMENT}/console-ac-license-key"
+SECRET_NAME="layerv-nhp-${ENVIRONMENT}/ac-license-key"
 
-echo "=== Console AC License Key Generator ==="
+echo "=== Standalone AC License Key Generator ==="
 echo "Environment: $ENVIRONMENT"
+echo "Customer ID: $CUSTOMER_ID"
 echo "Region: $AWS_REGION"
 echo "Secret name: $SECRET_NAME"
 echo ""
@@ -57,8 +63,8 @@ if [ -n "$EXISTING_SECRET" ]; then
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         echo "Aborted. Existing secret unchanged."
         echo ""
-        echo "To retrieve the existing hash, run:"
-        echo "  aws secretsmanager get-secret-value --secret-id $SECRET_NAME --region $AWS_REGION --query 'SecretString' --output text | jq -r '.hash'"
+        echo "To retrieve the existing values, run:"
+        echo "  aws secretsmanager get-secret-value --secret-id $SECRET_NAME --region $AWS_REGION --query 'SecretString' --output text | jq"
         exit 0
     fi
 fi
@@ -85,12 +91,13 @@ echo "Generated bcrypt hash: ${LICENSE_HASH:0:20}..."
 echo "Generated SHA256 hash: ${LICENSE_SHA256:0:16}..."
 echo ""
 
-# Store in Secrets Manager (key, hashes for reference)
+# Store in Secrets Manager (key, hashes, and customer_id for reference)
 SECRET_VALUE=$(cat <<EOF
 {
   "key": "$LICENSE_KEY",
   "hash": "$LICENSE_HASH",
-  "sha256": "$LICENSE_SHA256"
+  "sha256": "$LICENSE_SHA256",
+  "customer_id": "$CUSTOMER_ID"
 }
 EOF
 )
@@ -106,7 +113,7 @@ else
     # Create new secret
     aws secretsmanager create-secret \
         --name "$SECRET_NAME" \
-        --description "License key for Console AC in $ENVIRONMENT environment" \
+        --description "License key for standalone AC in $ENVIRONMENT environment" \
         --secret-string "$SECRET_VALUE" \
         --region "$AWS_REGION" > /dev/null
     echo "Created secret in Secrets Manager: $SECRET_NAME"
@@ -117,12 +124,17 @@ echo "=== Setup Complete ==="
 echo ""
 echo "Add these to your terraform.tfvars (or set as environment variables):"
 echo ""
-echo "  console_ac_license_key_hash   = \"$LICENSE_HASH\""
-echo "  console_ac_license_key_sha256 = \"$LICENSE_SHA256\""
+echo "  ac_customer_id        = \"$CUSTOMER_ID\""
+echo "  ac_license_key        = \"$LICENSE_KEY\""
+echo "  ac_license_key_hash   = \"$LICENSE_HASH\""
+echo "  ac_license_key_sha256 = \"$LICENSE_SHA256\""
 echo ""
 echo "Or export as TF_VARs:"
 echo ""
-echo "  export TF_VAR_console_ac_license_key_hash='$LICENSE_HASH'"
-echo "  export TF_VAR_console_ac_license_key_sha256='$LICENSE_SHA256'"
+echo "  export TF_VAR_ac_customer_id='$CUSTOMER_ID'"
+echo "  export TF_VAR_ac_license_key='$LICENSE_KEY'"
+echo "  export TF_VAR_ac_license_key_hash='$LICENSE_HASH'"
+echo "  export TF_VAR_ac_license_key_sha256='$LICENSE_SHA256'"
 echo ""
-echo "The Console AC will automatically read the license key from Secrets Manager at boot."
+echo "The standalone AC will read the license key from terraform.tfvars at deploy time."
+echo "The key is also stored in Secrets Manager for reference: $SECRET_NAME"

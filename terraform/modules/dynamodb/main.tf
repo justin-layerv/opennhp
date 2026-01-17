@@ -25,15 +25,26 @@ locals {
 # ==================== nhp_licenses Table ====================
 # Stores customer license information for validation
 #
-# PK: customer_id (String)
-# SK: resource_fqdn (String)
-# Attributes: license_key_hash, tier, max_acs, expires_at, active
+# PK: license_key_sha256 (String) - SHA256 hash of the plaintext license key (globally unique)
+# Attributes: license_key_hash (bcrypt), customer_id (ULID), resource_id, tier, max_acs, expires_at, active
+#
+# GSIs:
+#   - customer_id-index: Query all licenses for a customer
+#   - expires_at-index: Query licenses expiring before a given date (for renewal reminders)
+#
+# Note: License keys are globally unique, so no customer_id is needed for lookup.
+# Customer ID (ULID format) is stored for querying and audit purposes.
+# LayerV system customer uses nil ULID: 00000000000000000000000000
 
 resource "aws_dynamodb_table" "licenses" {
-  name         = "${var.name_prefix}-licenses"
+  name         = "${var.name_prefix}-${var.cell_id}-licenses"
   billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "customer_id"
-  range_key    = "resource_fqdn"
+  hash_key     = "license_key_sha256"
+
+  attribute {
+    name = "license_key_sha256"
+    type = "S"
+  }
 
   attribute {
     name = "customer_id"
@@ -41,8 +52,27 @@ resource "aws_dynamodb_table" "licenses" {
   }
 
   attribute {
-    name = "resource_fqdn"
-    type = "S"
+    name = "expires_at"
+    type = "N"
+  }
+
+  # GSI: Find all licenses for a customer
+  global_secondary_index {
+    name            = "customer_id-index"
+    hash_key        = "customer_id"
+    projection_type = "ALL"
+  }
+
+  # GSI: Find licenses by expiration date (for renewal reminders, compliance reports)
+  # Query pattern: Query by customer_id with expires_at range condition
+  # Example: "Find all licenses for customer X expiring before date Y"
+  # Note: This is a per-customer query, not a global expiration scan.
+  # For global expiration queries, use a table scan with FilterExpression (rare operation).
+  global_secondary_index {
+    name            = "expires_at-index"
+    hash_key        = "customer_id"
+    range_key       = "expires_at"
+    projection_type = "KEYS_ONLY"
   }
 
   # Enable point-in-time recovery for production
@@ -63,8 +93,9 @@ resource "aws_dynamodb_table" "licenses" {
   }
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-licenses"
+    Name      = "${var.name_prefix}-${var.cell_id}-licenses"
     Component = "dynamodb"
+    Cell      = var.cell_id
     Purpose   = "License validation"
   })
 }
@@ -80,7 +111,7 @@ resource "aws_dynamodb_table" "licenses" {
 # Note: For server_id lookups, see nhp_server_ac_index table below.
 
 resource "aws_dynamodb_table" "ac_assignments" {
-  name         = "${var.name_prefix}-ac-assignments"
+  name         = "${var.name_prefix}-${var.cell_id}-ac-assignments"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "ac_id"
 
@@ -131,8 +162,9 @@ resource "aws_dynamodb_table" "ac_assignments" {
   }
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-ac-assignments"
+    Name      = "${var.name_prefix}-${var.cell_id}-ac-assignments"
     Component = "dynamodb"
+    Cell      = var.cell_id
     Purpose   = "AC server assignment"
   })
 }
@@ -165,7 +197,7 @@ resource "aws_dynamodb_table" "ac_assignments" {
 # lives directly in ac_assignments.assigned_servers attribute.
 
 resource "aws_dynamodb_table" "server_ac_index" {
-  name         = "${var.name_prefix}-server-ac-index"
+  name         = "${var.name_prefix}-${var.cell_id}-server-ac-index"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "server_id"
   range_key    = "ac_id"
@@ -203,8 +235,9 @@ resource "aws_dynamodb_table" "server_ac_index" {
   }
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-server-ac-index"
+    Name      = "${var.name_prefix}-${var.cell_id}-server-ac-index"
     Component = "dynamodb"
+    Cell      = var.cell_id
     Purpose   = "Server to AC inverted index"
   })
 }
@@ -217,7 +250,7 @@ resource "aws_dynamodb_table" "server_ac_index" {
 # Attributes: resource_fqdn, ac_id, dest_host, dest_port, open_time, auth_service_id
 
 resource "aws_dynamodb_table" "resources" {
-  name         = "${var.name_prefix}-resources"
+  name         = "${var.name_prefix}-${var.cell_id}-resources"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "customer_id"
   range_key    = "resource_id"
@@ -256,8 +289,9 @@ resource "aws_dynamodb_table" "resources" {
   }
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-resources"
+    Name      = "${var.name_prefix}-${var.cell_id}-resources"
     Component = "dynamodb"
+    Cell      = var.cell_id
     Purpose   = "Resource definitions"
   })
 }

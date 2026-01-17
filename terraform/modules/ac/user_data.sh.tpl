@@ -1,4 +1,11 @@
 #!/bin/bash
+# NHP AC User Data Script - Standalone AC for customer deployments
+#
+# This template configures a standalone AC that protects customer resources.
+# For the Console's embedded AC, see: terraform/modules/console-ec2/user_data.sh.tpl
+#
+# Both templates share similar AC configuration patterns (config.toml, firewall rules).
+# When updating AC config structure, review both templates to keep them in sync.
 set -ex
 
 exec > >(tee /var/log/user-data.log | logger -t user-data) 2>&1
@@ -201,9 +208,10 @@ RSYSLOGEOF
 fi
 
 # ============================================================================
-# Per-Instance AC Key Generation and Registration
-# Each AC instance generates its own Curve25519 keypair and registers with etcd.
-# This provides per-instance isolation and revocation capability.
+# Per-Instance AC Key Generation
+# Each AC instance generates its own Curve25519 keypair and stores it in
+# Secrets Manager. This provides per-instance isolation and revocation capability.
+# The AC registers with NHP servers using cloud mode credentials.
 # ============================================================================
 
 # Install cryptography library for key generation
@@ -297,163 +305,9 @@ fi
 echo "AC keypair ready (public key: $${PUBLIC_KEY:0:20}...)"
 
 # ============================================================================
-# Configure etcd connection for multi-tenant with TLS
-%{ if etcd_endpoint != null }
-echo "Fetching etcd TLS certificates..."
-mkdir -p /opt/layerv/nhp-ac/etc/tls
-
-# Fetch etcd TLS certificates from Secrets Manager (CA + client certs for mTLS)
-%{ if etcd_tls_secret_arn != null }
-ETCD_TLS_SECRET=$(aws secretsmanager get-secret-value --secret-id "${etcd_tls_secret_arn}" --region "$REGION" --query SecretString --output text)
-# Extract CA certificate
-echo "$ETCD_TLS_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['caCert'])" > /opt/layerv/nhp-ac/etc/tls/ca.crt
-chmod 644 /opt/layerv/nhp-ac/etc/tls/ca.crt
-echo "etcd CA certificate installed"
-# Extract client certificate and key for mTLS authentication
-echo "$ETCD_TLS_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['clientCert'])" > /opt/layerv/nhp-ac/etc/tls/client.crt
-chmod 644 /opt/layerv/nhp-ac/etc/tls/client.crt
-echo "$ETCD_TLS_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['clientKey'])" > /opt/layerv/nhp-ac/etc/tls/client.key
-chmod 600 /opt/layerv/nhp-ac/etc/tls/client.key
-echo "etcd client certificate and key installed for mTLS"
-# Add etcd CA to system trust store for Go's default TLS verification
-cp /opt/layerv/nhp-ac/etc/tls/ca.crt /usr/local/share/ca-certificates/etcd-ca.crt
-update-ca-certificates
-echo "etcd CA added to system trust store"
-%{ endif }
-
-cat > /opt/layerv/nhp-ac/etc/remote.toml << 'REMOTEEOF'
-Provider = "etcd"
-Key = "nhp/config"
-Endpoints = ["${etcd_endpoint}"]
-%{ if etcd_tls_secret_arn != null }
-TLS = true
-CACert = "/opt/layerv/nhp-ac/etc/tls/ca.crt"
-ClientCert = "/opt/layerv/nhp-ac/etc/tls/client.crt"
-ClientKey = "/opt/layerv/nhp-ac/etc/tls/client.key"
-%{ endif }
-REMOTEEOF
-echo "Configured etcd endpoint: ${etcd_endpoint} (mTLS enabled)"
-
-# ============================================================================
-# AC Registration with etcd
-# Register this AC's public key and identity document with etcd.
-# The server will read this registry to know which ACs to trust.
-# Config (/nhp/config) is seeded by Terraform Lambda, not by ACs.
-# ============================================================================
-
-# Function to wait for DNS resolution with retries
-wait_for_dns() {
-  local hostname="$1"
-  local max_attempts=30
-  local attempt=1
-  echo "Waiting for DNS resolution of $hostname..."
-  while [ $attempt -le $max_attempts ]; do
-    if getent hosts "$hostname" > /dev/null 2>&1; then
-      echo "DNS resolution successful for $hostname"
-      return 0
-    fi
-    echo "DNS not ready (attempt $attempt/$max_attempts), waiting 10s..."
-    sleep 10
-    attempt=$((attempt + 1))
-  done
-  echo "ERROR: DNS resolution failed for $hostname after $max_attempts attempts"
-  return 1
-}
-
-# Extract hostname from etcd endpoint for DNS check
-ETCD_HOST=$(echo "${etcd_endpoint}" | sed 's|https://||' | sed 's|:.*||')
-
-echo "Registering AC with etcd..."
-
-# Wait for etcd DNS - FAIL if not available (fail fast)
-if ! wait_for_dns "$ETCD_HOST"; then
-  echo "FATAL: Cannot reach etcd, aborting AC startup"
-  exit 1
-fi
-
-# Register this AC in etcd using Python (for proper JSON/base64 handling)
-REGISTRATION_RESULT=$(python3 << REGISTER_EOF
-import json
-import ssl
-import tempfile
-import urllib.request
-import base64
-import sys
-import time
-
-# Configuration
-etcd_endpoint = "${etcd_endpoint}"
-instance_id = "$INSTANCE_ID"
-public_key = "$PUBLIC_KEY"
-local_ip = "$LOCAL_IP"
-
-# TLS certificate paths
-ca_path = "/opt/layerv/nhp-ac/etc/tls/ca.crt"
-cert_path = "/opt/layerv/nhp-ac/etc/tls/client.crt"
-key_path = "/opt/layerv/nhp-ac/etc/tls/client.key"
-
-# Build registration entry (TOML format for consistency)
-registered_at = int(time.time())
-registry_value = f'''# AC Registry Entry (auto-registered by instance)
-PublicKey = "{public_key}"
-InstanceId = "{instance_id}"
-Ip = "{local_ip}"
-Port = 62206
-RegisteredAt = {registered_at}
-'''
-
-# Create SSL context with client cert
-ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-ssl_context.load_verify_locations(ca_path)
-ssl_context.load_cert_chain(cert_path, key_path)
-
-# Register with retry
-max_retries = 5
-for attempt in range(1, max_retries + 1):
-    try:
-        url = f"{etcd_endpoint}/v3/kv/put"
-        key = f"/nhp/ac-registry/{instance_id}"
-        key_b64 = base64.b64encode(key.encode()).decode()
-        value_b64 = base64.b64encode(registry_value.encode()).decode()
-
-        data = json.dumps({
-            'key': key_b64,
-            'value': value_b64
-        }).encode()
-
-        req = urllib.request.Request(url, data=data, method='POST')
-        req.add_header('Content-Type', 'application/json')
-
-        with urllib.request.urlopen(req, context=ssl_context, timeout=30) as resp:
-            result = json.loads(resp.read().decode())
-            print(json.dumps({"success": True, "attempt": attempt}))
-            sys.exit(0)
-
-    except Exception as e:
-        print(f"Attempt {attempt}/{max_retries} failed: {e}", file=sys.stderr)
-        if attempt < max_retries:
-            time.sleep(2 ** attempt)  # Exponential backoff
-        else:
-            print(json.dumps({"success": False, "error": str(e)}))
-            sys.exit(1)
-REGISTER_EOF
-)
-
-# Check registration result
-if echo "$REGISTRATION_RESULT" | python3 -c "import sys,json; result=json.load(sys.stdin); sys.exit(0 if result.get('success') else 1)"; then
-  echo "Successfully registered AC in etcd"
-else
-  echo "FATAL: Failed to register AC in etcd"
-  echo "$REGISTRATION_RESULT"
-  exit 1
-fi
-%{ endif }
-
-# ============================================================================
 # Fetch NHP Server Public Key
-# Required for AC to communicate with NHP servers
+# Required for AC to communicate with NHP servers via cloud registration
 # ============================================================================
-%{ if server_secret_arn != "" }
 echo "Fetching NHP Server public key from Secrets Manager..."
 SERVER_SECRET=$(aws secretsmanager get-secret-value --secret-id "${server_secret_arn}" --region "$REGION" --query SecretString --output text)
 SERVER_PUBLIC_KEY=$(echo "$SERVER_SECRET" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('publicKey', d.get('PubKeyBase64', '')))" 2>/dev/null || echo "")
@@ -462,10 +316,6 @@ if [ -z "$SERVER_PUBLIC_KEY" ]; then
   exit 1
 fi
 echo "Server public key retrieved: $${SERVER_PUBLIC_KEY:0:20}..."
-%{ else }
-echo "WARNING: No server_secret_arn configured, server communication may fail"
-SERVER_PUBLIC_KEY=""
-%{ endif }
 
 # ============================================================================
 # NHP-ACD Configuration Files
@@ -473,10 +323,11 @@ SERVER_PUBLIC_KEY=""
 # ============================================================================
 
 # Generate AC config.toml with environment-specific values
-# Note: AC dials OUT to servers (doesn't listen). Server peers are in server.toml.
+# Cloud mode: AC registers with NHP server using credentials
 cat > /opt/layerv/nhp-ac/etc/config.toml << CONFIGEOF
 # NHP-AC base config (infrastructure-managed)
 # Generated by Terraform user_data
+# Cloud mode: Uses ServerEndpoint for registration with license credentials
 
 ACId = "${ac_id}"
 DefaultIp = "$LOCAL_IP"
@@ -487,8 +338,13 @@ LogLevel = 4
 AuthServiceId = "${auth_service_id}"
 ResourceIds = ${resource_ids}
 FilterMode = 0
+
+# Cloud mode registration credentials (license key is globally unique)
+LicenseKey = "${license_key}"
+ServerEndpoint = "${server_endpoint}"
+ServerPubKeyBase64 = "$SERVER_PUBLIC_KEY"
 CONFIGEOF
-echo "NHP-ACD config.toml created"
+echo "NHP-ACD config.toml created (cloud mode)"
 
 # HTTP server config for NHP-ACD
 cat > /opt/layerv/nhp-ac/etc/http.toml << 'HTTPEOF'
@@ -500,55 +356,6 @@ HttpListenIp = "127.0.0.1"
 HttpListenPort = 8888
 HTTPEOF
 echo "NHP-ACD HTTP config created"
-
-# Generate server.toml with NHP server peer discovery via Cloud Map
-# Note: SERVER_PUBLIC_KEY was fetched earlier in the script
-# This allows the AC to communicate with NHP servers in the same namespace
-cat > /opt/layerv/nhp-ac/etc/server.toml << 'SERVEREOF'
-# NHP Server peers configuration
-# Auto-discovered from Cloud Map service discovery
-# The AC will connect to these servers for knock validation
-
-# Note: In multi-tenant mode with etcd, server discovery is handled via etcd
-# This file provides fallback/bootstrap configuration
-SERVEREOF
-
-# Discover NHP servers from Cloud Map and add to server.toml
-echo "Discovering NHP servers from Cloud Map..."
-SERVERS=$(aws servicediscovery discover-instances \
-  --namespace-name "${namespace_name}" \
-  --service-name "server" \
-  --region "$REGION" \
-  --query 'Instances[*].[Attributes.AWS_INSTANCE_IPV4]' \
-  --output text 2>/dev/null || echo "")
-
-if [ -n "$SERVERS" ]; then
-  for SERVER_IP in $SERVERS; do
-    if [ -n "$SERVER_IP" ] && [ "$SERVER_IP" != "None" ]; then
-      cat >> /opt/layerv/nhp-ac/etc/server.toml << SERVERENTRY
-[[Servers]]
-Hostname = ""
-Ip = "$SERVER_IP"
-Port = 62206
-PubKeyBase64 = "$SERVER_PUBLIC_KEY"
-ExpireTime = 1924991999
-SERVERENTRY
-      echo "Added NHP server: $SERVER_IP (with public key)"
-    fi
-  done
-else
-  echo "No NHP servers found in Cloud Map, using NLB endpoint"
-  # Fallback to NLB DNS for server discovery
-  cat >> /opt/layerv/nhp-ac/etc/server.toml << SERVERENTRY
-[[Servers]]
-Hostname = "${server_nlb_dns}"
-Ip = ""
-Port = 62206
-PubKeyBase64 = "$SERVER_PUBLIC_KEY"
-ExpireTime = 1924991999
-SERVERENTRY
-fi
-echo "NHP-ACD server.toml created"
 
 # Traefik configuration for this environment
 # Note: traefik-plugins repo deploys plugins to /home/ubuntu/traefik/plugins-local via SSM

@@ -222,7 +222,7 @@ resource "aws_securityhub_account" "main" {
 # Enable AWS Foundational Security Best Practices standard
 resource "aws_securityhub_standards_subscription" "aws_foundational" {
   count         = var.enable_security_hub ? 1 : 0
-  standards_arn = "arn:aws:securityhub:${data.aws_region.current.name}::standards/aws-foundational-security-best-practices/v/1.0.0"
+  standards_arn = "arn:aws:securityhub:${data.aws_region.current.id}::standards/aws-foundational-security-best-practices/v/1.0.0"
 
   depends_on = [aws_securityhub_account.main]
 }
@@ -230,7 +230,7 @@ resource "aws_securityhub_standards_subscription" "aws_foundational" {
 # Enable CIS AWS Foundations Benchmark
 resource "aws_securityhub_standards_subscription" "cis" {
   count         = var.enable_security_hub && local.is_prod ? 1 : 0
-  standards_arn = "arn:aws:securityhub:${data.aws_region.current.name}::standards/cis-aws-foundations-benchmark/v/1.4.0"
+  standards_arn = "arn:aws:securityhub:${data.aws_region.current.id}::standards/cis-aws-foundations-benchmark/v/1.4.0"
 
   depends_on = [aws_securityhub_account.main]
 }
@@ -238,7 +238,7 @@ resource "aws_securityhub_standards_subscription" "cis" {
 # Send GuardDuty findings to Security Hub
 resource "aws_securityhub_product_subscription" "guardduty" {
   count       = var.enable_security_hub && var.enable_guardduty ? 1 : 0
-  product_arn = "arn:aws:securityhub:${data.aws_region.current.name}::product/aws/guardduty"
+  product_arn = "arn:aws:securityhub:${data.aws_region.current.id}::product/aws/guardduty"
 
   depends_on = [aws_securityhub_account.main]
 }
@@ -483,7 +483,7 @@ resource "aws_iam_policy" "permission_boundary" {
         Resource = "*"
         Condition = {
           StringEquals = {
-            "aws:RequestedRegion" = data.aws_region.current.name
+            "aws:RequestedRegion" = data.aws_region.current.id
           }
         }
       },
@@ -664,7 +664,7 @@ resource "aws_s3_bucket_policy" "cloudtrail" {
         Resource  = aws_s3_bucket.cloudtrail[0].arn
         Condition = {
           StringEquals = {
-            "AWS:SourceArn" = "arn:aws:cloudtrail:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:trail/${var.name_prefix}-trail"
+            "AWS:SourceArn" = "arn:aws:cloudtrail:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:trail/${var.name_prefix}-trail"
           }
         }
       },
@@ -677,7 +677,7 @@ resource "aws_s3_bucket_policy" "cloudtrail" {
         Condition = {
           StringEquals = {
             "s3:x-amz-acl"  = "bucket-owner-full-control"
-            "AWS:SourceArn" = "arn:aws:cloudtrail:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:trail/${var.name_prefix}-trail"
+            "AWS:SourceArn" = "arn:aws:cloudtrail:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:trail/${var.name_prefix}-trail"
           }
         }
       }

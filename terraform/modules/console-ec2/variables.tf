@@ -177,13 +177,20 @@ variable "nhp_health_monitor_operation_timeout" {
 }
 
 variable "nhp_console_ac_customer_id" {
-  description = "Customer/tenant ID for Console's embedded AC registration. Used in DynamoDB license validation and AC assignments."
+  description = "Customer ID (ULID format) for Console's embedded AC registration. LayerV system uses nil ULID."
   type        = string
-  default     = "layerv"
+  default     = "00000000000000000000000000" # Nil ULID for LayerV system customer
 }
 
 variable "nhp_console_ac_license_key_hash" {
   description = "Bcrypt hash of the Console AC license key. REQUIRED - AC registration will fail without it. Generate with: terraform/scripts/generate-console-ac-license.sh"
+  type        = string
+  sensitive   = true
+  default     = null
+}
+
+variable "nhp_console_ac_license_key_sha256" {
+  description = "SHA256 hash of the Console AC license key. REQUIRED for DynamoDB license lookup. Generate with: terraform/scripts/generate-console-ac-license.sh"
   type        = string
   sensitive   = true
   default     = null
@@ -232,8 +239,8 @@ variable "protected_hosted_zone_id" {
   default     = null
 }
 
-variable "nhp_server_nlb_dns" {
-  description = "NHP Server NLB DNS name for cloud mode AC registration (e.g., layerv-nhp-sandbox-nlb-xxx.elb.us-east-2.amazonaws.com). Required for cloud mode."
+variable "nhp_server_cloudmap_dns" {
+  description = "NHP Server Cloud Map internal DNS (e.g., server.nhp.sandbox.internal). Used for AC registration in cloud mode. Console uses this instead of public NLB since it's in the same VPC as NHP Servers."
   type        = string
   default     = null
 }

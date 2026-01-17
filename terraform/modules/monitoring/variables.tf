@@ -3,6 +3,12 @@ variable "environment" {
   type        = string
 }
 
+variable "cell_id" {
+  description = "Cell identifier for multi-cell deployments (e.g., cell0, cell1)"
+  type        = string
+  default     = "cell0"
+}
+
 variable "nlb_arn_suffix" {
   description = "NLB ARN suffix for CloudWatch metrics"
   type        = string
@@ -59,4 +65,17 @@ variable "alarm_on_missing_data" {
   EOT
   type        = bool
   default     = null # If null, defaults to true for prod, false otherwise
+}
+
+# DynamoDB monitoring variables
+variable "dynamodb_table_names" {
+  description = "List of DynamoDB table names to monitor"
+  type        = list(string)
+  default     = []
+}
+
+variable "enable_dynamodb_monitoring" {
+  description = "Enable DynamoDB monitoring alarms"
+  type        = bool
+  default     = true
 }

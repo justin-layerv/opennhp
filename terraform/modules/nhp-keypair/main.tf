@@ -18,7 +18,7 @@ data "aws_caller_identity" "current" {}
 
 locals {
   account_id = data.aws_caller_identity.current.account_id
-  region     = data.aws_region.current.name
+  region     = data.aws_region.current.id
 }
 
 # ==================== Lambda for Key Generation ====================
@@ -38,7 +38,11 @@ resource "aws_iam_role" "keygen_lambda" {
     }]
   })
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-registration-keygen-role"
+    Component = "nhp-keypair"
+    Cell      = var.cell_id
+  })
 }
 
 resource "aws_iam_role_policy_attachment" "keygen_lambda_basic" {
@@ -190,7 +194,11 @@ resource "aws_lambda_function" "keygen" {
   filename         = data.archive_file.keygen_lambda.output_path
   source_code_hash = data.archive_file.keygen_lambda.output_base64sha256
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-registration-keygen"
+    Component = "nhp-keypair"
+    Cell      = var.cell_id
+  })
 }
 
 # Invoke Lambda to generate keypair
@@ -229,6 +237,7 @@ resource "aws_ssm_parameter" "registration_public_key" {
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-registration-public-key"
     Component = "nhp-keypair"
+    Cell      = var.cell_id
     Purpose   = "AC configuration"
   })
 }
@@ -277,5 +286,9 @@ resource "aws_iam_policy" "server_keypair_access" {
     }] : [])
   })
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-keypair-read"
+    Component = "nhp-keypair"
+    Cell      = var.cell_id
+  })
 }

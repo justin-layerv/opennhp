@@ -83,12 +83,19 @@ module "nhp" {
   cross_account_route53_role_arn = var.cross_account_route53_role_arn
 
   # Console EC2
-  deploy_console_ec2          = var.deploy_console_ec2
-  console_ec2_domain          = var.console_ec2_domain
-  console_cookie_domain       = var.console_cookie_domain
-  console_internal_only       = var.console_internal_only
-  console_protected_hostname  = var.console_protected_hostname
-  console_ac_license_key_hash = var.console_ac_license_key_hash
+  deploy_console_ec2            = var.deploy_console_ec2
+  console_ec2_domain            = var.console_ec2_domain
+  console_cookie_domain         = var.console_cookie_domain
+  console_internal_only         = var.console_internal_only
+  console_protected_hostname    = var.console_protected_hostname
+  console_ac_license_key_hash   = var.console_ac_license_key_hash
+  console_ac_license_key_sha256 = var.console_ac_license_key_sha256
+
+  # Standalone AC license credentials
+  ac_customer_id        = var.ac_customer_id
+  ac_license_key        = var.ac_license_key
+  ac_license_key_hash   = var.ac_license_key_hash
+  ac_license_key_sha256 = var.ac_license_key_sha256
 }
 
 # Re-export outputs

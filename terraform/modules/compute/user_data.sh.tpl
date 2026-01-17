@@ -219,24 +219,60 @@ echo "Instance deregistered"
 CMEOF
 chmod +x /opt/layerv/nhp-server/cloudmap-deregister.sh
 
-cat > /opt/layerv/nhp-server/health-monitor.sh << 'HEALTHEOF'
+cat > /opt/layerv/nhp-server/health-monitor.sh << HEALTHEOF
 #!/bin/bash
+# Health monitor: Updates Cloud Map status and triggers ASG replacement for persistent failures
+#
+# Detection timeline:
+# - Check interval: 10s
+# - Unhealthy threshold: 6 consecutive failures (60s)
+# - After threshold: Mark instance unhealthy in ASG, triggering replacement
+#
+# This allows systemd to recover transient failures (RestartSec=5s) before
+# escalating to instance replacement.
+
 SERVICE_ID="${cloudmap_service_id}"
-TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
-REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+CHECK_INTERVAL=10
+UNHEALTHY_THRESHOLD=6  # 6 checks @ 10s = 60s before ASG replacement
+UNHEALTHY_COUNT=0
+
+# Get instance metadata (IMDSv2)
+TOKEN=\$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+INSTANCE_ID=\$(curl -s -H "X-aws-ec2-metadata-token: \$TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+REGION=\$(curl -s -H "X-aws-ec2-metadata-token: \$TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+
+echo "Health monitor started: instance=\$INSTANCE_ID region=\$REGION"
+
 while true; do
-  if docker ps | grep -q nhp-server; then
+  # Check if container is running AND UDP port is listening
+  if docker ps --format '{{.Names}}' | grep -q '^nhp-server\$' && \
+     docker exec nhp-server ss -uln 2>/dev/null | grep -q ':62206'; then
     HEALTH_STATUS="HEALTHY"
+    UNHEALTHY_COUNT=0
   else
     HEALTH_STATUS="UNHEALTHY"
+    UNHEALTHY_COUNT=\$((UNHEALTHY_COUNT + 1))
+    echo "Unhealthy check \$UNHEALTHY_COUNT/\$UNHEALTHY_THRESHOLD"
   fi
-  aws servicediscovery update-instance-custom-health-status \
-    --service-id "$SERVICE_ID" \
-    --instance-id "$INSTANCE_ID" \
-    --status "$HEALTH_STATUS" \
-    --region "$REGION" 2>/dev/null || true
-  sleep 30
+
+  # Update Cloud Map status
+  aws servicediscovery update-instance-custom-health-status \\
+    --service-id "\$SERVICE_ID" \\
+    --instance-id "\$INSTANCE_ID" \\
+    --status "\$HEALTH_STATUS" \\
+    --region "\$REGION" 2>/dev/null || true
+
+  # Trigger ASG replacement after persistent failures
+  if [ \$UNHEALTHY_COUNT -ge \$UNHEALTHY_THRESHOLD ]; then
+    echo "Unhealthy threshold reached, marking instance unhealthy in ASG"
+    aws autoscaling set-instance-health \\
+      --instance-id "\$INSTANCE_ID" \\
+      --health-status Unhealthy \\
+      --region "\$REGION" 2>&1 || echo "Failed to set instance health"
+    # Continue monitoring - ASG will terminate this instance
+  fi
+
+  sleep \$CHECK_INTERVAL
 done
 HEALTHEOF
 chmod +x /opt/layerv/nhp-server/health-monitor.sh
@@ -341,7 +377,7 @@ Requires=docker.service
 [Service]
 Type=simple
 Restart=always
-RestartSec=10
+RestartSec=5
 ExecStartPre=-/usr/bin/docker stop nhp-server
 ExecStartPre=-/usr/bin/docker rm nhp-server
 ExecStart=/usr/bin/docker run --rm --name nhp-server \

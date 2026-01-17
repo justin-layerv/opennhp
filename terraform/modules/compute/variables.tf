@@ -3,6 +3,12 @@ variable "environment" {
   type        = string
 }
 
+variable "cell_id" {
+  description = "Cell identifier for multi-cell deployments (e.g., cell0, cell1)"
+  type        = string
+  default     = "cell0"
+}
+
 variable "domain_name" {
   description = "Domain name for NHP server"
   type        = string

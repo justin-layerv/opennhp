@@ -129,14 +129,11 @@ func NewACRegistration(ac *UdpAC) *ACRegistration {
 // Start begins the registration process and keepalive loop.
 func (r *ACRegistration) Start() error {
 	// Validate required config
-	if r.ac.config.ResourceFQDN == "" {
-		return errors.New("ResourceFQDN is required")
-	}
-	if r.ac.config.CustomerId == "" {
-		return errors.New("CustomerId is required")
+	if r.ac.config.ServerEndpoint == "" {
+		return errors.New("ServerEndpoint is required")
 	}
 
-	log.Info("Starting AC registration with FQDN %s", r.ac.config.ResourceFQDN)
+	log.Info("Starting AC registration with endpoint %s", r.ac.config.ServerEndpoint)
 
 	// Add to wait group BEFORE starting goroutine to prevent race with Stop()
 	r.wg.Add(1)
@@ -243,10 +240,10 @@ func (r *ACRegistration) registrationLoop() {
 // DefaultServerPort is the default NHP server port.
 const DefaultServerPort = 62206
 
-// register performs initial registration via FQDN.
-// It sends NHP_AOL to the ResourceFQDN and handles NHP_ARD (redispatch) or NHP_AAK response.
+// register performs initial registration via ServerEndpoint.
+// It sends NHP_AOL to the ServerEndpoint and handles NHP_ARD (redispatch) or NHP_AAK response.
 func (r *ACRegistration) register() error {
-	// Validate config (ResourceFQDN and CustomerId already validated in Start())
+	// Validate config (ServerEndpoint already validated in Start())
 	if r.ac.config.ServerPubKeyBase64 == "" {
 		return errors.New("ServerPubKeyBase64 is required")
 	}
@@ -257,31 +254,29 @@ func (r *ACRegistration) register() error {
 		serverPort = DefaultServerPort
 	}
 
-	// Create temporary peer for FQDN registration
+	// Create temporary peer for endpoint registration
 	// This uses the shared registration public key (all servers share this for NLB)
 	registrationPeer := &core.UdpPeer{
-		Hostname:     r.ac.config.ResourceFQDN,
+		Hostname:     r.ac.config.ServerEndpoint,
 		Port:         serverPort,
 		PubKeyBase64: r.ac.config.ServerPubKeyBase64,
 		Type:         core.NHP_SERVER,
 	}
 
-	// Resolve FQDN to address
+	// Resolve endpoint to address
 	sendAddr := registrationPeer.SendAddr()
 	if sendAddr == nil {
-		return fmt.Errorf("cannot resolve FQDN %s", r.ac.config.ResourceFQDN)
+		return fmt.Errorf("cannot resolve endpoint %s", r.ac.config.ServerEndpoint)
 	}
 
-	log.Info("Registering AC %s via FQDN %s (resolved to %s)", r.ac.config.ACId, r.ac.config.ResourceFQDN, sendAddr.String())
+	log.Info("Registering AC %s via endpoint %s (resolved to %s)", r.ac.config.ACId, r.ac.config.ServerEndpoint, sendAddr.String())
 
 	// Create AOL message with registration credentials
 	aolMsg := &common.ACOnlineMsg{
 		ACId:          r.ac.config.ACId,
 		AuthServiceId: r.ac.config.AuthServiceId,
 		ResourceIds:   r.ac.config.ResourceIds,
-		CustomerId:    r.ac.config.CustomerId,
 		LicenseKey:    r.ac.config.LicenseKey,
-		ResourceFQDN:  r.ac.config.ResourceFQDN,
 		ACVersion:     r.ac.config.ACVersion,
 	}
 
@@ -490,9 +485,7 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 		ACId:          r.ac.config.ACId,
 		AuthServiceId: r.ac.config.AuthServiceId,
 		ResourceIds:   r.ac.config.ResourceIds,
-		CustomerId:    r.ac.config.CustomerId,
 		LicenseKey:    r.ac.config.LicenseKey,
-		ResourceFQDN:  r.ac.config.ResourceFQDN,
 		ACVersion:     r.ac.config.ACVersion,
 	}
 

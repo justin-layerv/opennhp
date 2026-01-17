@@ -1,5 +1,17 @@
 # Compute Module
 # ASG, NLB, Launch Template, Cloud Map Service
+#
+# Cell Architecture:
+# All resources in this module belong to a single cell (identified by var.cell_id).
+# Each cell is an isolated failure domain with its own NLB, ASG, and server fleet.
+#
+# Secrets Manager Naming Convention:
+# - Current: ${name_prefix}-server (e.g., nhp-sandbox-server)
+# - Future cells: ${name_prefix}-${cell_id}-server (e.g., nhp-sandbox-cell1-server)
+#
+# The existing secret name is kept for backward compatibility with cell0.
+# New cells should include cell_id in the secret name for clear isolation.
+# IAM policies can then use ARN patterns: arn:aws:secretsmanager:*:*:secret:nhp-*-cell1-*
 
 # ==================== Data Sources ====================
 
@@ -159,7 +171,11 @@ resource "aws_secretsmanager_secret" "server" {
   recovery_window_in_days = local.is_prod ? 30 : 0
   kms_key_id              = var.secrets_kms_key_arn
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-server-secret"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
 }
 
 # Custom resource to invoke Lambda for key generation
@@ -191,6 +207,7 @@ resource "aws_cloudwatch_log_group" "server" {
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-logs-server"
     Component = "compute"
+    Cell      = var.cell_id
   })
 }
 
@@ -211,10 +228,14 @@ resource "aws_service_discovery_service" "server" {
   }
 
   health_check_custom_config {
-    failure_threshold = 1
+    # failure_threshold is deprecated and always defaults to 1
   }
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-cloudmap-server"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
 }
 
 # IAM Role for NHP Server instances
@@ -332,6 +353,12 @@ resource "aws_iam_role_policy" "server" {
         Effect   = "Allow"
         Action   = ["kms:Decrypt"]
         Resource = var.secrets_kms_key_arn != null ? [var.secrets_kms_key_arn] : []
+      },
+      # Allow instance to mark itself unhealthy for ASG replacement
+      {
+        Effect   = "Allow"
+        Action   = ["autoscaling:SetInstanceHealth"]
+        Resource = aws_autoscaling_group.server.arn
       }
     ]
   })
@@ -368,14 +395,6 @@ resource "aws_security_group" "server" {
     description = "HTTP from Traefik"
   }
 
-  # SSH from VPC for NLB health checks (internal only)
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-    description = "NLB health check via SSH (internal only)"
-  }
 
   # HTTP for plugin endpoints (AC Traefik and Demo Gateway route here)
   # NHP Server HTTP listens on 8888 for passcode, OIDC, and other authentication plugins
@@ -399,6 +418,7 @@ resource "aws_security_group" "server" {
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-sg-server"
     Component = "compute"
+    Cell      = var.cell_id
   })
 
   lifecycle {
@@ -410,7 +430,7 @@ resource "aws_security_group" "server" {
 locals {
   user_data = templatefile("${path.module}/user_data.sh.tpl", {
     secret_arn          = aws_secretsmanager_secret.server.arn
-    region              = data.aws_region.current.name
+    region              = data.aws_region.current.id
     account_id          = data.aws_caller_identity.current.account_id
     cloudmap_service_id = aws_service_discovery_service.server.id
     server_repo_url     = var.server_repo_url
@@ -431,7 +451,7 @@ locals {
     auth_service_id = var.auth_service_id
     # Storage backend configuration (Phase 4)
     storage_backend               = var.storage_backend
-    dynamodb_region               = coalesce(var.dynamodb_region, data.aws_region.current.name)
+    dynamodb_region               = coalesce(var.dynamodb_region, data.aws_region.current.id)
     dynamodb_licenses_table       = var.dynamodb_licenses_table
     dynamodb_ac_assignments_table = var.dynamodb_ac_assignments_table
     dynamodb_resources_table      = var.dynamodb_resources_table
@@ -448,10 +468,11 @@ resource "aws_launch_template" "server" {
     arn = aws_iam_instance_profile.server.arn
   }
 
-  # NHP servers need public IPs for internet access (apt, ECR, etc.)
-  # Security is enforced by security group (only UDP 62206 + SSH from VPC)
+  # NHP servers run in private subnets - NAT Gateway provides internet access
+  # VPC endpoints provide access to ECR, Secrets Manager, CloudWatch Logs, SSM
+  # NLB in public subnets routes traffic to servers in private subnets
   network_interfaces {
-    associate_public_ip_address = true
+    associate_public_ip_address = false
     security_groups             = [aws_security_group.server.id]
   }
 
@@ -485,6 +506,7 @@ resource "aws_launch_template" "server" {
     tags = merge(var.tags, {
       Name      = "${var.name_prefix}-server"
       Component = "compute"
+      Cell      = var.cell_id
     })
   }
 
@@ -496,14 +518,14 @@ resource "aws_launch_template" "server" {
 }
 
 # Auto Scaling Group
-# NHP servers are deployed in PUBLIC subnets because:
-# 1. NHP is a public-facing knock protocol - servers must be reachable from the internet
-# 2. With NLB preserve_client_ip=true, servers must be able to respond directly to clients
-# 3. Security is enforced by the NHP cryptographic protocol, not network isolation
-# 4. Security group restricts access to only UDP 62206 (NHP) and TCP 22 (SSH from VPC)
+# NHP servers are deployed in PRIVATE subnets with NLB routing:
+# 1. NLB in public subnets handles internet-facing traffic
+# 2. Servers in private subnets are protected from direct internet access
+# 3. NAT Gateway provides outbound internet (apt updates)
+# 4. VPC endpoints provide access to AWS services (ECR, SSM, CloudWatch)
 resource "aws_autoscaling_group" "server" {
   name                = "${var.name_prefix}-server"
-  vpc_zone_identifier = var.public_subnet_ids
+  vpc_zone_identifier = var.private_subnet_ids
   min_size            = var.min_capacity
   max_size            = var.max_capacity
   desired_capacity    = var.min_capacity
@@ -514,19 +536,31 @@ resource "aws_autoscaling_group" "server" {
   }
 
   health_check_type         = "EC2"
-  health_check_grace_period = 300
+  health_check_grace_period = 180 # Instance launch (~60s) + user data (~90s) + container start (~15s) = ~165s
 
   instance_refresh {
     strategy = "Rolling"
     preferences {
       min_healthy_percentage = 50
-      instance_warmup        = 300
+      instance_warmup        = 180
     }
   }
 
   tag {
     key                 = "Name"
     value               = "${var.name_prefix}-server"
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "Component"
+    value               = "compute"
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "Cell"
+    value               = var.cell_id
     propagate_at_launch = true
   }
 
@@ -580,7 +614,11 @@ resource "aws_lb" "server" {
 
   enable_cross_zone_load_balancing = true
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-nlb"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
 }
 
 # UDP Target Group
@@ -591,18 +629,21 @@ resource "aws_lb_target_group" "udp" {
   vpc_id      = var.vpc_id
   target_type = "instance"
 
+  # Health checks disabled: NHP servers are UDP-only (no TCP exposure).
+  # NLB cannot perform UDP health checks. Failover is handled by:
+  # 1. NLB routes to any healthy server; server-side FWD/ARD handles routing to assigned servers
+  # 2. Health monitor marks persistent failures unhealthy in ASG, triggering replacement
   health_check {
-    enabled             = true
-    protocol            = "TCP"
-    port                = "22"
-    interval            = 30
-    healthy_threshold   = 2
-    unhealthy_threshold = 3
+    enabled = false
   }
 
   deregistration_delay = 30
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-tg-udp"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
 }
 
 # Attach ASG to Target Group
@@ -622,5 +663,9 @@ resource "aws_lb_listener" "udp" {
     target_group_arn = aws_lb_target_group.udp.arn
   }
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-listener-udp"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
 }

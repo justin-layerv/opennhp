@@ -1,4 +1,12 @@
 #!/bin/bash
+# Console EC2 User Data Script - Management plane with embedded AC
+#
+# This template configures the Console application server AND an embedded AC.
+# For standalone customer ACs, see: terraform/modules/ac/user_data.sh.tpl
+#
+# The embedded AC portion (config.toml, firewall rules) shares patterns with
+# the standalone AC template. When updating AC config structure, review both
+# templates to keep them in sync.
 set -ex
 
 exec > >(tee /var/log/user-data.log | logger -t user-data) 2>&1
@@ -510,13 +518,11 @@ FilterMode = 0
 # Cloud mode registration (required fields)
 # See docs/design/PLUGGABLE_STORAGE_BACKEND.md Section 6.2 for license validation flow
 #
-# Console AC is unique: ResourceFQDN uses NHP Server NLB DNS because:
-# 1. Customer ACs use per-resource FQDNs (e.g., a1b2c3d4.nhp.layerv.ai) that point to NHP Server NLB
-# 2. Console's protected_hostname (console2.apps.layerv.xyz) points to Console NLB (TCP 443 only)
-# 3. AC registration requires UDP 62206 to NHP Server NLB, so we use the NLB DNS directly
-# 4. DynamoDB license record uses the same value (nhp_server_nlb_dns) for validation
-ResourceFQDN = "${nhp_server_nlb_dns}"
-CustomerId = "${nhp_console_ac_customer_id}"
+# ServerEndpoint uses the Cloud Map internal DNS for NHP Server:
+# - Console EC2 is in the same VPC as NHP Servers, so it can reach them via internal DNS
+# - This avoids the timeout issue when Console tries to reach public NLB from private subnet
+# - License validation uses LicenseKey SHA256 only (globally unique)
+ServerEndpoint = "${nhp_server_cloudmap_dns}"
 LicenseKey = "$CONSOLE_AC_LICENSE_KEY"
 ACVersion = "0.6.0"
 ServerPubKeyBase64 = "$SERVER_PUBLIC_KEY"
@@ -524,7 +530,7 @@ ServerPort = 62206
 CONFIGEOF
 
   # Note: server.toml is NOT created for cloud mode
-  # The AC uses ResourceFQDN (NHP Server NLB) for registration instead of static server list
+  # The AC uses ServerEndpoint (Cloud Map internal DNS) for registration instead of static server list
   # See docs/design/PLUGGABLE_STORAGE_BACKEND.md for cloud mode architecture
 
   # Create nhp-acd systemd service

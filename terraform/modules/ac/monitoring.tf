@@ -44,7 +44,7 @@ resource "aws_cloudwatch_dashboard" "ac_monitoring" {
         height = 6
         properties = {
           title  = "AC Disk Usage by Instance"
-          region = data.aws_region.current.name
+          region = data.aws_region.current.id
           metrics = [
             ["NHP/AC", "DiskUsagePercent", { "stat" : "Maximum" }]
           ]
@@ -70,7 +70,7 @@ resource "aws_cloudwatch_dashboard" "ac_monitoring" {
         height = 6
         properties = {
           title  = "SSM Association Compliance"
-          region = data.aws_region.current.name
+          region = data.aws_region.current.id
           metrics = [
             ["AWS/SSM", "AssociationCompliantCount", "AssociationId", aws_ssm_association.bootstrap_instance[0].association_id],
             ["AWS/SSM", "AssociationNonCompliantCount", "AssociationId", aws_ssm_association.bootstrap_instance[0].association_id]

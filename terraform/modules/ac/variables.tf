@@ -51,30 +51,6 @@ variable "ac_repo_arn" {
   type        = string
 }
 
-variable "etcd_endpoint" {
-  description = "etcd endpoint for configuration"
-  type        = string
-  default     = null
-}
-
-variable "etcd_secret_arn" {
-  description = "etcd credentials secret ARN"
-  type        = string
-  default     = null
-}
-
-variable "etcd_tls_secret_arn" {
-  description = "etcd TLS certificates secret ARN"
-  type        = string
-  default     = null
-}
-
-variable "etcd_security_group_id" {
-  description = "etcd security group ID (for Lambda VPC access)"
-  type        = string
-  default     = null
-}
-
 variable "namespace_id" {
   description = "Cloud Map namespace ID"
   type        = string
@@ -125,6 +101,51 @@ variable "enable_cloudfront" {
 # These options control the AC daemon's behavior
 # ============================================================================
 
+# ============================================================================
+# Cloud Mode Registration
+# AC registers with NHP servers using credentials for DynamoDB license validation
+# ============================================================================
+
+variable "customer_id" {
+  description = "Customer ID (ULID format) for license record. Used for querying, not lookup."
+  type        = string
+}
+
+variable "license_key" {
+  description = "License key for server registration. AC sends this to server for validation. Required."
+  type        = string
+  sensitive   = true
+}
+
+variable "license_key_hash" {
+  description = "Bcrypt hash of license key for DynamoDB seeding. Generate with: htpasswd -bnBC 10 '' 'your-key' | tr -d ':\\n'"
+  type        = string
+  sensitive   = true
+}
+
+variable "license_key_sha256" {
+  description = "SHA256 hash of license key for DynamoDB lookup. Generate with: echo -n 'your-key' | sha256sum | cut -d' ' -f1"
+  type        = string
+  sensitive   = true
+}
+
+variable "server_endpoint" {
+  description = "NHP server endpoint for registration (e.g., 'server.nhp.sandbox.internal' for internal, or NLB DNS for external). Required."
+  type        = string
+}
+
+variable "nhp_dynamodb_licenses_table" {
+  description = "DynamoDB table name for license validation. If set, module will seed AC license."
+  type        = string
+  default     = null
+}
+
+variable "nhp_region" {
+  description = "AWS region for NHP DynamoDB tables"
+  type        = string
+  default     = null
+}
+
 variable "auth_service_id" {
   description = "Authentication service ID for the AC"
   type        = string
@@ -143,16 +164,9 @@ variable "resource_ids" {
   default     = ["default"]
 }
 
-variable "server_nlb_dns" {
-  description = "NLB DNS name for NHP server (fallback for server discovery)"
-  type        = string
-  default     = ""
-}
-
 variable "server_secret_arn" {
-  description = "ARN of the NHP Server's secret containing public key"
+  description = "ARN of the NHP Server's secret containing public key. Required for cloud registration."
   type        = string
-  default     = ""
 }
 
 variable "cross_account_route53_role_arn" {

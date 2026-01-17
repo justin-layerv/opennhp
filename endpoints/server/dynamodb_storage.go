@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -134,30 +136,35 @@ func (d *DynamoDBStorage) GetACsByServer(ctx context.Context, serverID string) (
 // License Operations
 // ============================================================================
 
-// GetLicense retrieves license information for a customer/resource combination.
-func (d *DynamoDBStorage) GetLicense(ctx context.Context, customerID, resourceFQDN string) (*License, error) {
+// GetLicense retrieves license information using the license key.
+// The license key is hashed with SHA256 for DynamoDB lookup (partition key).
+// License keys are globally unique, so no customer ID is needed.
+func (d *DynamoDBStorage) GetLicense(ctx context.Context, licenseKey string) (*License, error) {
 	ctx, cancel := context.WithTimeout(ctx, DynamoDBOperationTimeout)
 	defer cancel()
+
+	// Compute SHA256 of license key for lookup
+	hash := sha256.Sum256([]byte(licenseKey))
+	licenseKeySHA256 := hex.EncodeToString(hash[:])
 
 	result, err := d.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: aws.String(d.config.LicensesTable),
 		Key: map[string]types.AttributeValue{
-			"customer_id":   &types.AttributeValueMemberS{Value: customerID},
-			"resource_fqdn": &types.AttributeValueMemberS{Value: resourceFQDN},
+			"license_key_sha256": &types.AttributeValueMemberS{Value: licenseKeySHA256},
 		},
 	})
 	if err != nil {
-		log.Error("DynamoDB GetItem failed for license %s/%s: %v", customerID, resourceFQDN, err)
+		log.Error("DynamoDB GetItem failed for license: %v", err)
 		return nil, NewServiceUnavailableError("DynamoDB unavailable", err)
 	}
 
 	if result.Item == nil {
-		return nil, NewNotFoundError(fmt.Sprintf("license not found: %s/%s", customerID, resourceFQDN))
+		return nil, NewNotFoundError("license not found")
 	}
 
 	var license License
 	if err := attributevalue.UnmarshalMap(result.Item, &license); err != nil {
-		log.Error("Failed to unmarshal license %s/%s: %v", customerID, resourceFQDN, err)
+		log.Error("Failed to unmarshal license: %v", err)
 		return nil, &StorageError{Code: ErrCodeValidationFailed, Message: "failed to unmarshal license", Err: err}
 	}
 

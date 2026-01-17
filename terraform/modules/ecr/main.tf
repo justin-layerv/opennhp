@@ -135,7 +135,7 @@ data "aws_iam_openid_connect_provider" "github" {
 
 locals {
   account_id = data.aws_caller_identity.current.account_id
-  region     = data.aws_region.current.name
+  region     = data.aws_region.current.id
 
   # OIDC Provider ARN - either from created resource or existing data source
   # This abstraction allows the module to work in both self-managed and org-managed scenarios

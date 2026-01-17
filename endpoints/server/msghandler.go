@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -216,9 +218,9 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	acId := aolMsg.ACId
 
 	// Check if AC should be redirected to its assigned servers (per-AC server assignment).
-	// This only applies when storage is configured and AC provides credentials.
+	// This only applies when storage is configured and AC provides a license key.
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md section 6.2 for details.
-	if s.storage != nil && aolMsg.CustomerId != "" && aolMsg.ResourceFQDN != "" {
+	if s.storage != nil && aolMsg.LicenseKey != "" {
 		redirected, ardErr := s.handleACServerAssignment(ppd, aolMsg, transactionId, addrStr)
 		if ardErr != nil {
 			log.Error("server-ac(%s#%d@%s)[HandleACOnline] server assignment lookup error: %v", acId, transactionId, addrStr, ardErr)
@@ -397,9 +399,28 @@ func (s *UdpServer) handleACServerAssignment(
 	return true, nil
 }
 
+// dummyBcryptHash is used for constant-time license validation to prevent timing attacks.
+// When a license is not found, we still perform a bcrypt comparison against this dummy
+// hash to ensure the response time is similar regardless of whether the license exists.
+// This prevents attackers from enumerating valid license keys based on response timing.
+// Format: $2a$10$ (7 chars) + 22 char salt + 31 char hash = 60 chars total
+var dummyBcryptHash = []byte("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy")
+
+// licenseKeyPrefix returns the first 8 hex chars of the SHA256 hash of a license key.
+// This provides enough context for log correlation without exposing the full key.
+func licenseKeyPrefix(licenseKey string) string {
+	hash := sha256.Sum256([]byte(licenseKey))
+	return hex.EncodeToString(hash[:4]) // First 4 bytes = 8 hex chars
+}
+
 // validateACLicense validates AC credentials against DynamoDB in cloud mode.
 // Returns nil if validation succeeds, or an error if validation fails.
 // See docs/design/PLUGGABLE_STORAGE_BACKEND.md Section 6.2 for the validation flow.
+//
+// Security: This function uses constant-time comparison to prevent timing attacks.
+// The bcrypt comparison is ALWAYS performed (with real or dummy hash) BEFORE any
+// fast checks (active, expired) to ensure uniform response time for all cases.
+// This prevents attackers from distinguishing between different failure modes.
 func (s *UdpServer) validateACLicense(
 	ppd *core.PacketParserData,
 	aolMsg *common.ACOnlineMsg,
@@ -408,62 +429,79 @@ func (s *UdpServer) validateACLicense(
 ) *common.Error {
 	acId := aolMsg.ACId
 
-	// Check if credentials are provided - required in cloud mode
-	if aolMsg.CustomerId == "" || aolMsg.ResourceFQDN == "" {
-		log.Warning("server-ac(%s#%d@%s)[validateACLicense] missing credentials (customerId=%q, resourceFQDN=%q)",
-			acId, transactionId, addrStr, aolMsg.CustomerId, aolMsg.ResourceFQDN)
+	// Check if license key is provided - required in cloud mode
+	// This fast check is OK since missing key is an obvious client error, not useful for enumeration
+	if aolMsg.LicenseKey == "" {
+		log.Warning("server-ac(%s#%d@%s)[validateACLicense] missing license key",
+			acId, transactionId, addrStr)
 		return common.ErrServerACOpsFailed
 	}
 
-	// Look up license from DynamoDB
+	// Compute key prefix for log correlation (first 8 hex chars of SHA256)
+	// This helps operators debug without exposing full license keys
+	keyPrefix := licenseKeyPrefix(aolMsg.LicenseKey)
+
+	// Look up license from storage using license key SHA256 as the partition key
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	license, err := s.storage.GetLicense(ctx, aolMsg.CustomerId, aolMsg.ResourceFQDN)
+	license, err := s.storage.GetLicense(ctx, aolMsg.LicenseKey)
+
+	// TIMING ATTACK PROTECTION: Always perform bcrypt comparison before any fast checks.
+	// This ensures uniform response time regardless of license existence or validity.
+	// The bcrypt operation (~100ms) dominates response time, hiding fast checks.
+	var bcryptErr error
+	if err != nil || license == nil || license.LicenseKeyHash == "" {
+		// Use dummy hash when license not found or has no hash
+		bcryptErr = bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(aolMsg.LicenseKey))
+	} else {
+		// Use real hash when license exists
+		bcryptErr = bcrypt.CompareHashAndPassword([]byte(license.LicenseKeyHash), []byte(aolMsg.LicenseKey))
+	}
+
+	// Now perform fast checks AFTER the timing-sensitive bcrypt operation
+	// Storage error or not found
 	if err != nil {
 		if IsNotFoundError(err) {
-			log.Warning("server-ac(%s#%d@%s)[validateACLicense] license not found for customer=%s, resource=%s",
-				acId, transactionId, addrStr, aolMsg.CustomerId, aolMsg.ResourceFQDN)
-			return common.ErrServerACOpsFailed
+			log.Warning("server-ac(%s#%d@%s)[validateACLicense] license not found (key=%s...)",
+				acId, transactionId, addrStr, keyPrefix)
+		} else {
+			log.Error("server-ac(%s#%d@%s)[validateACLicense] storage error (key=%s...): %v",
+				acId, transactionId, addrStr, keyPrefix, err)
 		}
-		log.Error("server-ac(%s#%d@%s)[validateACLicense] storage error: %v", acId, transactionId, addrStr, err)
+		return common.ErrServerACOpsFailed
+	}
+
+	// License record exists but has no hash (misconfiguration)
+	if license.LicenseKeyHash == "" {
+		log.Error("server-ac(%s#%d@%s)[validateACLicense] license record has no key hash (key=%s..., misconfiguration)",
+			acId, transactionId, addrStr, keyPrefix)
 		return common.ErrServerACOpsFailed
 	}
 
 	// Check if license is active
 	if !license.Active {
-		log.Warning("server-ac(%s#%d@%s)[validateACLicense] license inactive for customer=%s",
-			acId, transactionId, addrStr, aolMsg.CustomerId)
+		log.Warning("server-ac(%s#%d@%s)[validateACLicense] license inactive (key=%s...)",
+			acId, transactionId, addrStr, keyPrefix)
 		return common.ErrServerACOpsFailed
 	}
 
 	// Check if license is expired
 	if license.ExpiresAt > 0 && time.Now().Unix() > license.ExpiresAt {
-		log.Warning("server-ac(%s#%d@%s)[validateACLicense] license expired for customer=%s (expired at %d)",
-			acId, transactionId, addrStr, aolMsg.CustomerId, license.ExpiresAt)
+		log.Warning("server-ac(%s#%d@%s)[validateACLicense] license expired (key=%s..., at %d)",
+			acId, transactionId, addrStr, keyPrefix, license.ExpiresAt)
 		return common.ErrServerACOpsFailed
 	}
 
-	// Validate license key - ALWAYS required in cloud mode
-	// A license record without a hash is a misconfiguration that must be rejected
-	if license.LicenseKeyHash == "" {
-		log.Error("server-ac(%s#%d@%s)[validateACLicense] license record has no key hash (misconfiguration) for customer=%s resource=%s",
-			acId, transactionId, addrStr, aolMsg.CustomerId, aolMsg.ResourceFQDN)
-		return common.ErrServerACOpsFailed
-	}
-	if aolMsg.LicenseKey == "" {
-		log.Warning("server-ac(%s#%d@%s)[validateACLicense] license key required but not provided for customer=%s",
-			acId, transactionId, addrStr, aolMsg.CustomerId)
-		return common.ErrServerACOpsFailed
-	}
-	if err := bcrypt.CompareHashAndPassword([]byte(license.LicenseKeyHash), []byte(aolMsg.LicenseKey)); err != nil {
-		log.Warning("server-ac(%s#%d@%s)[validateACLicense] license key mismatch for customer=%s",
-			acId, transactionId, addrStr, aolMsg.CustomerId)
+	// bcrypt validation result (computed earlier for constant-time)
+	if bcryptErr != nil {
+		log.Warning("server-ac(%s#%d@%s)[validateACLicense] license key mismatch (key=%s...)",
+			acId, transactionId, addrStr, keyPrefix)
 		return common.ErrServerACOpsFailed
 	}
 
-	log.Info("server-ac(%s#%d@%s)[validateACLicense] license validated for customer=%s, tier=%s",
-		acId, transactionId, addrStr, aolMsg.CustomerId, license.Tier)
+	log.Info("server-ac(%s#%d@%s)[validateACLicense] license validated (key=%s...), tier=%s, customer=%s",
+		acId, transactionId, addrStr, keyPrefix, license.Tier, license.CustomerID)
 	return nil
 }
 

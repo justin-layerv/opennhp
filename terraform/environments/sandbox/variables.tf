@@ -290,6 +290,41 @@ variable "console_ac_license_key_hash" {
   default     = ""
 }
 
+variable "console_ac_license_key_sha256" {
+  description = "SHA256 hash of Console AC license key for DynamoDB lookup. Generate with: ./terraform/scripts/generate-console-ac-license.sh"
+  type        = string
+  sensitive   = true
+  default     = null
+}
+
+# Standalone AC license credentials (for cloud mode registration)
+variable "ac_customer_id" {
+  description = "Customer ID for standalone AC license (ULID format)"
+  type        = string
+  default     = null
+}
+
+variable "ac_license_key" {
+  description = "License key for standalone AC registration (plaintext, passed via TF_VAR_ac_license_key)"
+  type        = string
+  sensitive   = true
+  default     = null
+}
+
+variable "ac_license_key_hash" {
+  description = "Bcrypt hash of standalone AC license key for validation"
+  type        = string
+  sensitive   = true
+  default     = null
+}
+
+variable "ac_license_key_sha256" {
+  description = "SHA256 hash of standalone AC license key for DynamoDB lookup"
+  type        = string
+  sensitive   = true
+  default     = null
+}
+
 # TLS certificate configuration
 variable "additional_tls_domains" {
   description = "Additional domains for TLS certificates in same account"

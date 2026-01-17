@@ -27,9 +27,9 @@ func TestEtcdStorage_KeyFormats(t *testing.T) {
 			expected: "/nhp/ac-assignments/ac-123",
 		},
 		{
-			name:     "License key",
-			testFunc: func() string { return licenseKey("cust-456", "app.example.com") },
-			expected: "/nhp/licenses/cust-456/app.example.com",
+			name:     "License key with SHA256",
+			testFunc: func() string { return licenseEtcdKey("abc123sha256hash") },
+			expected: "/nhp/licenses/abc123sha256hash",
 		},
 		{
 			name:     "Resource key",
@@ -142,13 +142,14 @@ func TestEtcdStorage_JSONSerialization(t *testing.T) {
 
 	t.Run("License", func(t *testing.T) {
 		license := &License{
-			CustomerID:     "cust-456",
-			ResourceFQDN:   "app.example.com",
-			LicenseKeyHash: "$2a$10$hashedkey",
-			Tier:           "enterprise",
-			MaxACs:         1000,
-			ExpiresAt:      time.Now().Add(365 * 24 * time.Hour).Unix(),
-			Active:         true,
+			CustomerID:       "cust-456",
+			LicenseKeySHA256: "abc123sha256hash",
+			LicenseKeyHash:   "$2a$10$hashedkey",
+			ResourceID:       "console",
+			Tier:             "enterprise",
+			MaxACs:           1000,
+			ExpiresAt:        time.Now().Add(365 * 24 * time.Hour).Unix(),
+			Active:           true,
 		}
 
 		data, err := json.Marshal(license)

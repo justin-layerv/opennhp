@@ -1090,7 +1090,7 @@ resource "aws_ecs_task_definition" "etcd" {
         logDriver = "awslogs"
         options = {
           "awslogs-group"         = aws_cloudwatch_log_group.etcd[0].name
-          "awslogs-region"        = data.aws_region.current.name
+          "awslogs-region"        = data.aws_region.current.id
           "awslogs-stream-prefix" = "etcd-${each.key}-tls-init"
         }
       }
@@ -1173,7 +1173,7 @@ resource "aws_ecs_task_definition" "etcd" {
         logDriver = "awslogs"
         options = {
           "awslogs-group"         = aws_cloudwatch_log_group.etcd[0].name
-          "awslogs-region"        = data.aws_region.current.name
+          "awslogs-region"        = data.aws_region.current.id
           "awslogs-stream-prefix" = "etcd-${each.key}"
         }
       }
@@ -1218,7 +1218,7 @@ resource "aws_service_discovery_service" "etcd" {
   }
 
   health_check_custom_config {
-    failure_threshold = 1
+    # failure_threshold is deprecated and always defaults to 1
   }
 
   tags = var.tags
@@ -1241,7 +1241,7 @@ resource "aws_service_discovery_service" "etcd_client" {
   }
 
   health_check_custom_config {
-    failure_threshold = 1
+    # failure_threshold is deprecated and always defaults to 1
   }
 
   tags = var.tags

@@ -44,6 +44,16 @@ output "server_ac_index_table_name" {
   value       = aws_dynamodb_table.server_ac_index.name
 }
 
+output "all_table_names" {
+  description = "List of all DynamoDB table names (for monitoring)"
+  value = [
+    aws_dynamodb_table.licenses.name,
+    aws_dynamodb_table.ac_assignments.name,
+    aws_dynamodb_table.server_ac_index.name,
+    aws_dynamodb_table.resources.name,
+  ]
+}
+
 # ==================== IAM Policy ARNs ====================
 
 output "read_policy_arn" {

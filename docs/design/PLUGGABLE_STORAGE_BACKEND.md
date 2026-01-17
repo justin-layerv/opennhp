@@ -846,11 +846,9 @@ func (c *ACAssignmentCache) getTTL(entry *CacheEntry) time.Duration {
 **ACOnlineMsg (NHP_AOL - Type 10) - Extended:**
 ```go
 type ACOnlineMsg struct {
-    // New authentication fields
+    // Authentication fields
     ACId          string   `json:"acId"`
-    CustomerId    string   `json:"customerId"`
-    LicenseKey    string   `json:"licenseKey"`
-    ResourceFQDN  string   `json:"resourceFqdn"`
+    LicenseKey    string   `json:"licenseKey"`  // Globally unique, used for auth
 
     // Existing fields
     AuthServiceId string   `json:"aspId"`
@@ -860,6 +858,8 @@ type ACOnlineMsg struct {
     ACVersion     string   `json:"version,omitempty"`
 }
 ```
+
+**Note:** `CustomerId` and `ResourceFQDN` were removed from ACOnlineMsg. License keys are globally unique identifiers - no additional context needed for lookup. The server endpoint is configured separately in AC config (`ServerEndpoint`).
 
 **ServerACAckMsg (NHP_AAK - Type 11):**
 ```go
@@ -1266,13 +1266,13 @@ type ACOnlineMsg struct {
 
     // LayerV extension: License credentials
     ACId          string   `json:"acId"`
-    CustomerId    string   `json:"customerId"`
-    LicenseKey    string   `json:"licenseKey"`
-    ResourceFQDN  string   `json:"resourceFqdn"`
+    LicenseKey    string   `json:"licenseKey"`  // Globally unique license key
 }
 ```
 
 **Rationale:** The spec's NHP_AOL says "connect to" - initial connection is part of NHP_AOL semantics. Adding license credentials to initial connection is a LayerV extension for SaaS licensing. The alternative (NHP_REG) is specified for agents, not ACs.
+
+**Note:** `CustomerId` and `ResourceFQDN` were removed in favor of globally unique license keys. This simplifies the authentication model - the license key alone is sufficient for lookup and validation.
 
 #### 6.14.2 Server-to-Server Forwarding (NHP_FWD/NHP_FRT)
 
@@ -1630,9 +1630,8 @@ done
 ```toml
 [AC]
 ACId = "ac-instance-001"
-ResourceFQDN = "a1b2c3d4.nhp.layerv.ai"
-CustomerId = "cust-12345"
-LicenseKey = "lk_xxxxx"
+ServerEndpoint = "server.nhp.sandbox.internal"  # Where to connect
+LicenseKey = "lk_xxxxx"                          # Globally unique license key
 ServerPubKeyBase64 = "base64-encoded-server-public-key"
 
 PrivKeyBase64 = "..."
@@ -1642,7 +1641,9 @@ ListenPort = 62206
 DefaultAcceptTimeoutSec = 60
 ```
 
-**Credential Provisioning:** AC credentials (`ACId`, `CustomerId`, `LicenseKey`, `ServerPubKeyBase64`) are provisioned via Console UI download or API. Deployment options include cloud-init user-data, configuration management (Ansible/Puppet), or manual configuration. See Operations Guide for deployment patterns.
+**Credential Provisioning:** AC credentials (`ACId`, `LicenseKey`, `ServerPubKeyBase64`, `ServerEndpoint`) are provisioned via Console UI download or API. Deployment options include cloud-init user-data, configuration management (Ansible/Puppet), or manual configuration. See Operations Guide for deployment patterns.
+
+**Note:** `CustomerId` and `ResourceFQDN` were removed. `ServerEndpoint` specifies where to connect (internal DNS or public NLB). `LicenseKey` is globally unique and sufficient for authentication.
 
 **Server config.toml (new format):**
 ```toml

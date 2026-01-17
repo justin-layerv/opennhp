@@ -50,6 +50,29 @@ check "nhp_protection_prerequisites" {
   }
 }
 
+# Validate standalone AC license credentials when deploy_ac is enabled
+check "ac_license_credentials" {
+  assert {
+    condition = (
+      var.deploy_ac == false || (
+        var.ac_customer_id != null &&
+        var.ac_license_key != null &&
+        var.ac_license_key_hash != null &&
+        var.ac_license_key_sha256 != null
+      )
+    )
+    error_message = <<-EOT
+      When deploy_ac = true, standalone AC license credentials are required:
+        - ac_customer_id (ULID format)
+        - ac_license_key (plaintext)
+        - ac_license_key_hash (bcrypt hash)
+        - ac_license_key_sha256 (SHA256 hash)
+
+      Generate with: ./terraform/scripts/generate-ac-license.sh <environment>
+    EOT
+  }
+}
+
 # Note: Provider configurations are defined in environments/*/backend.tf
 # This module expects to receive aws and aws.us_east_1 providers from the caller
 
@@ -185,6 +208,7 @@ module "dynamodb" {
   source = "./modules/dynamodb"
 
   environment = var.environment
+  cell_id     = var.cell_id
   name_prefix = local.name_prefix
   tags        = local.common_tags
 
@@ -197,6 +221,7 @@ module "nhp_keypair" {
   source = "./modules/nhp-keypair"
 
   environment = var.environment
+  cell_id     = var.cell_id
   name_prefix = local.name_prefix
   tags        = local.common_tags
 
@@ -209,6 +234,7 @@ module "compute" {
   source = "./modules/compute"
 
   environment         = var.environment
+  cell_id             = var.cell_id
   domain_name         = var.domain_name
   multi_tenant        = var.multi_tenant
   min_capacity        = var.min_capacity
@@ -268,6 +294,7 @@ module "monitoring" {
   source = "./modules/monitoring"
 
   environment             = var.environment
+  cell_id                 = var.cell_id
   nlb_arn_suffix          = module.compute.nlb_arn_suffix
   target_group_arn_suffix = module.compute.target_group_arn_suffix
   asg_name                = module.compute.asg_name
@@ -278,6 +305,9 @@ module "monitoring" {
   enable_slack_notifications = var.enable_slack_notifications
   slack_workspace_id         = var.slack_workspace_id
   slack_channel_id           = var.slack_channel_id
+
+  # DynamoDB monitoring
+  dynamodb_table_names = module.dynamodb.all_table_names
 }
 
 # DNS Module - Route 53 records
@@ -390,23 +420,20 @@ module "ac" {
     aws.us_east_1 = aws.us_east_1
   }
 
-  environment         = var.environment
-  domain_name         = var.domain_name
-  hosted_zone         = var.hosted_zone
-  acme_email          = var.acme_email
-  vpc_id              = module.networking.vpc_id
-  vpc_cidr            = var.vpc_cidr
-  public_subnet_ids   = module.networking.public_subnet_ids
-  private_subnet_ids  = module.networking.private_subnet_ids
-  ac_repo_url         = module.ecr.ac_repo_url
-  ac_repo_arn         = module.ecr.ac_repo_arn
-  etcd_endpoint       = module.data.etcd_endpoint
-  etcd_secret_arn     = module.data.etcd_secret_arn
-  etcd_tls_secret_arn = module.data.etcd_ca_cert_arn
-  namespace_id        = module.data.namespace_id
-  namespace_name      = module.data.namespace_name
-  name_prefix         = local.name_prefix
-  tags                = local.common_tags
+  environment        = var.environment
+  domain_name        = var.domain_name
+  hosted_zone        = var.hosted_zone
+  acme_email         = var.acme_email
+  vpc_id             = module.networking.vpc_id
+  vpc_cidr           = var.vpc_cidr
+  public_subnet_ids  = module.networking.public_subnet_ids
+  private_subnet_ids = module.networking.private_subnet_ids
+  ac_repo_url        = module.ecr.ac_repo_url
+  ac_repo_arn        = module.ecr.ac_repo_arn
+  namespace_id       = module.data.namespace_id
+  namespace_name     = module.data.namespace_name
+  name_prefix        = local.name_prefix
+  tags               = local.common_tags
 
   # KMS encryption keys
   logs_kms_key_arn    = module.kms.logs_key_arn
@@ -419,8 +446,18 @@ module "ac" {
   # AC configuration options
   auth_service_id   = var.ac_auth_service_id
   resource_ids      = var.ac_resource_ids
-  server_nlb_dns    = module.compute.nlb_dns_name
+  server_endpoint   = module.compute.nlb_dns_name # External ACs use public NLB
   server_secret_arn = module.compute.server_secret_arn
+
+  # License credentials for cloud mode registration
+  customer_id        = var.ac_customer_id
+  license_key        = var.ac_license_key
+  license_key_hash   = var.ac_license_key_hash
+  license_key_sha256 = var.ac_license_key_sha256
+
+  # DynamoDB for license seeding (optional)
+  nhp_dynamodb_licenses_table = module.dynamodb.licenses_table_name
+  nhp_region                  = var.aws_region
 
   # Production domains (ACME for qurl.site, qurl.link, etc.)
   cross_account_route53_role_arn = var.cross_account_route53_role_arn
@@ -559,15 +596,17 @@ module "console_ec2" {
   # Console AC License - for DynamoDB license validation in cloud mode
   # Generate with: ./terraform/scripts/generate-console-ac-license.sh <environment>
   # REQUIRED: AC registration will fail without valid license key hash
+  nhp_console_ac_customer_id        = var.console_ac_customer_id
   nhp_console_ac_license_key_hash   = var.console_ac_license_key_hash
-  nhp_console_ac_license_secret_arn = var.console_ac_license_key_hash != null && var.console_ac_license_key_hash != "" ? "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:layerv-nhp-${var.environment}/console-ac-license-key" : null
+  nhp_console_ac_license_key_sha256 = var.console_ac_license_key_sha256
+  nhp_console_ac_license_secret_arn = var.console_ac_license_key_hash != null && var.console_ac_license_key_hash != "" ? "arn:aws:secretsmanager:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:secret:layerv-nhp-${var.environment}/console-ac-license-key" : null
 
   # NHP AC Daemon - Console always needs its own AC for login flow to work
   # The AC registers with NHP Server and receives knock validations
-  nhp_server_secret_arn = var.deploy_ac ? module.compute.server_secret_arn : null
-  nhp_ac_repo_url       = module.ecr.ac_repo_url
-  nhp_ac_ecr_repo_arn   = module.ecr.ac_repo_arn
-  nhp_server_nlb_dns    = module.compute.nlb_dns_name
+  nhp_server_secret_arn   = var.deploy_ac ? module.compute.server_secret_arn : null
+  nhp_server_cloudmap_dns = module.compute.cloudmap_service_dns
+  nhp_ac_repo_url         = module.ecr.ac_repo_url
+  nhp_ac_ecr_repo_arn     = module.ecr.ac_repo_arn
 
   # NHP Network-Level Protection (true network hiding with iptables DROP)
   # Console EC2 configures iptables DROP by default.

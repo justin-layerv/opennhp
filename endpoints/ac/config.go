@@ -44,9 +44,8 @@ type Config struct {
 	// These fields enable AC to register with NHP servers and receive
 	// its assigned server list via NHP_ARD (redispatch).
 	// ============================================================================
-	CustomerId         string `json:"customerId"`         // Required: Customer ID for license validation
-	LicenseKey         string `json:"licenseKey"`         // License key for authentication
-	ResourceFQDN       string `json:"resourceFqdn"`       // Required: Resource FQDN (e.g., "a1b2c3d4.nhp.layerv.ai")
+	LicenseKey         string `json:"licenseKey"`         // License key for authentication (globally unique)
+	ServerEndpoint     string `json:"serverEndpoint"`     // Required: Server endpoint for registration (e.g., "server.nhp.sandbox.internal")
 	ACVersion          string `json:"acVersion"`          // AC software version for compatibility
 	ServerPubKeyBase64 string `json:"serverPubKeyBase64"` // Required: Shared registration public key (all servers share this for NLB)
 	ServerPort         int    `json:"serverPort"`         // Server port for initial registration (default: 62206)

@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -17,7 +19,7 @@ import (
 // Feature-flagged storage backend for on-prem deployments.
 // Uses etcd for:
 // - /nhp/ac-assignments/{ac_id}: AC-to-server assignment mapping
-// - /nhp/licenses/{customer_id}/{resource_fqdn}: Customer license validation
+// - /nhp/licenses/{license_key_sha256}: License validation (globally unique keys)
 // - /nhp/resources/{customer_id}/{resource_id}: Resource definitions per customer
 // - /nhp/resources-by-ac/{ac_id}/{resource_id}: Secondary index for resources by AC
 //
@@ -161,14 +163,21 @@ func (e *EtcdStorage) GetACsByServer(ctx context.Context, serverID string) ([]AC
 // License Operations
 // ============================================================================
 
-// licenseKey returns the etcd key for a license.
-func licenseKey(customerID, resourceFQDN string) string {
-	return etcdLicensesPrefix + customerID + "/" + resourceFQDN
+// licenseEtcdKey returns the etcd key for a license.
+// Uses SHA256 of the license key as the sole component (globally unique).
+func licenseEtcdKey(licenseKeySHA256 string) string {
+	return etcdLicensesPrefix + licenseKeySHA256
 }
 
-// GetLicense retrieves license information for a customer/resource combination.
-func (e *EtcdStorage) GetLicense(ctx context.Context, customerID, resourceFQDN string) (*License, error) {
-	key := licenseKey(customerID, resourceFQDN)
+// GetLicense retrieves license information using the license key.
+// The license key is hashed with SHA256 for the etcd key lookup.
+// License keys are globally unique, so no customer ID is needed.
+func (e *EtcdStorage) GetLicense(ctx context.Context, licenseKey string) (*License, error) {
+	// Compute SHA256 of license key for lookup
+	hash := sha256.Sum256([]byte(licenseKey))
+	licenseKeySHA256 := hex.EncodeToString(hash[:])
+
+	key := licenseEtcdKey(licenseKeySHA256)
 
 	// Use temporary connection with our key for GetValue
 	tempConn := *e.conn
@@ -177,15 +186,15 @@ func (e *EtcdStorage) GetLicense(ctx context.Context, customerID, resourceFQDN s
 	data, err := tempConn.GetValue()
 	if err != nil {
 		if strings.Contains(err.Error(), "key not found") || strings.Contains(err.Error(), "value not set") {
-			return nil, NewNotFoundError(fmt.Sprintf("license not found: %s/%s", customerID, resourceFQDN))
+			return nil, NewNotFoundError("license not found")
 		}
-		log.Error("etcd GetValue failed for license %s/%s: %v", customerID, resourceFQDN, err)
+		log.Error("etcd GetValue failed for license: %v", err)
 		return nil, NewServiceUnavailableError("etcd unavailable", err)
 	}
 
 	var license License
 	if err := json.Unmarshal(data, &license); err != nil {
-		log.Error("Failed to unmarshal license %s/%s: %v", customerID, resourceFQDN, err)
+		log.Error("Failed to unmarshal license: %v", err)
 		return nil, &StorageError{Code: ErrCodeValidationFailed, Message: "failed to unmarshal license", Err: err}
 	}
 

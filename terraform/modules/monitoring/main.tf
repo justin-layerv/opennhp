@@ -18,19 +18,20 @@ locals {
 
 # SNS Topic for Alerts
 resource "aws_sns_topic" "alerts" {
-  name         = "${var.name_prefix}-alerts"
-  display_name = "NHP ${var.environment} Infrastructure Alerts"
+  name         = "${var.name_prefix}-${var.cell_id}-alerts"
+  display_name = "NHP ${var.environment} ${var.cell_id} Alerts"
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-alerts"
+    Name      = "${var.name_prefix}-${var.cell_id}-alerts"
     Component = "monitoring"
+    Cell      = var.cell_id
   })
 }
 
 # AWS Chatbot IAM Role for Slack integration
 resource "aws_iam_role" "chatbot" {
   count = local.enable_slack ? 1 : 0
-  name  = "${var.name_prefix}-chatbot"
+  name  = "${var.name_prefix}-${var.cell_id}-chatbot"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -44,8 +45,9 @@ resource "aws_iam_role" "chatbot" {
   })
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-chatbot"
+    Name      = "${var.name_prefix}-${var.cell_id}-chatbot"
     Component = "monitoring"
+    Cell      = var.cell_id
   })
 }
 
@@ -73,7 +75,7 @@ resource "aws_iam_role_policy" "chatbot" {
 # AWS Chatbot Slack Channel Configuration
 resource "aws_chatbot_slack_channel_configuration" "alerts" {
   count              = local.enable_slack ? 1 : 0
-  configuration_name = "${var.name_prefix}-alerts"
+  configuration_name = "${var.name_prefix}-${var.cell_id}-alerts"
   iam_role_arn       = aws_iam_role.chatbot[0].arn
   slack_channel_id   = var.slack_channel_id
   slack_team_id      = var.slack_workspace_id
@@ -83,14 +85,15 @@ resource "aws_chatbot_slack_channel_configuration" "alerts" {
   logging_level         = "INFO"
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-slack-alerts"
+    Name      = "${var.name_prefix}-${var.cell_id}-slack-alerts"
     Component = "monitoring"
+    Cell      = var.cell_id
   })
 }
 
 # CloudWatch Dashboard
 resource "aws_cloudwatch_dashboard" "main" {
-  dashboard_name = "LayerV-NHP-${var.environment}"
+  dashboard_name = "LayerV-NHP-${var.environment}-${var.cell_id}"
 
   dashboard_body = jsonencode({
     widgets = [
@@ -102,7 +105,7 @@ resource "aws_cloudwatch_dashboard" "main" {
         height = 6
         properties = {
           title  = "NLB Active Flows"
-          region = data.aws_region.current.name
+          region = data.aws_region.current.id
           metrics = [
             ["AWS/NetworkELB", "ActiveFlowCount", "LoadBalancer", var.nlb_arn_suffix]
           ]
@@ -118,7 +121,7 @@ resource "aws_cloudwatch_dashboard" "main" {
         height = 6
         properties = {
           title  = "NLB Processed Bytes"
-          region = data.aws_region.current.name
+          region = data.aws_region.current.id
           metrics = [
             ["AWS/NetworkELB", "ProcessedBytes", "LoadBalancer", var.nlb_arn_suffix]
           ]
@@ -134,7 +137,7 @@ resource "aws_cloudwatch_dashboard" "main" {
         height = 6
         properties = {
           title  = "ASG Instance Count"
-          region = data.aws_region.current.name
+          region = data.aws_region.current.id
           metrics = [
             ["AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", var.asg_name],
             [".", "GroupDesiredCapacity", ".", "."],
@@ -153,7 +156,7 @@ resource "aws_cloudwatch_dashboard" "main" {
         height = 6
         properties = {
           title  = "ASG CPU Utilization"
-          region = data.aws_region.current.name
+          region = data.aws_region.current.id
           metrics = [
             ["AWS/EC2", "CPUUtilization", "AutoScalingGroupName", var.asg_name]
           ]
@@ -169,7 +172,7 @@ resource "aws_cloudwatch_dashboard" "main" {
         height = 6
         properties = {
           title  = "ASG Network Traffic"
-          region = data.aws_region.current.name
+          region = data.aws_region.current.id
           metrics = [
             ["AWS/EC2", "NetworkIn", "AutoScalingGroupName", var.asg_name],
             [".", "NetworkOut", ".", "."]
@@ -186,7 +189,7 @@ resource "aws_cloudwatch_dashboard" "main" {
         height = 6
         properties = {
           title  = "NHP Custom Metrics (when available)"
-          region = data.aws_region.current.name
+          region = data.aws_region.current.id
           metrics = [
             ["LayerV/NHP", "KnockRequests", "Environment", var.environment],
             [".", "AuthSuccess", ".", "."],
@@ -205,7 +208,7 @@ resource "aws_cloudwatch_dashboard" "main" {
         height = 6
         properties = {
           title  = "NHP Knock Latency p99 (when available)"
-          region = data.aws_region.current.name
+          region = data.aws_region.current.id
           metrics = [
             ["LayerV/NHP", "KnockLatency", "Environment", var.environment]
           ]
@@ -220,7 +223,7 @@ resource "aws_cloudwatch_dashboard" "main" {
 
 # High CPU Alarm
 resource "aws_cloudwatch_metric_alarm" "high_cpu" {
-  alarm_name          = "${var.name_prefix}-high-cpu"
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-high-cpu"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3
   metric_name         = "CPUUtilization"
@@ -237,12 +240,15 @@ resource "aws_cloudwatch_metric_alarm" "high_cpu" {
     AutoScalingGroupName = var.asg_name
   }
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
 }
 
 # Unhealthy Hosts Alarm
 resource "aws_cloudwatch_metric_alarm" "unhealthy_hosts" {
-  alarm_name          = "${var.name_prefix}-unhealthy-hosts"
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-unhealthy-hosts"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
   metric_name         = "UnHealthyHostCount"
@@ -260,12 +266,15 @@ resource "aws_cloudwatch_metric_alarm" "unhealthy_hosts" {
     TargetGroup  = var.target_group_arn_suffix
   }
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
 }
 
 # No Healthy Hosts Alarm (Critical)
 resource "aws_cloudwatch_metric_alarm" "no_healthy_hosts" {
-  alarm_name          = "${var.name_prefix}-no-healthy-hosts"
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-no-healthy-hosts"
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 1
   metric_name         = "HealthyHostCount"
@@ -283,12 +292,15 @@ resource "aws_cloudwatch_metric_alarm" "no_healthy_hosts" {
     TargetGroup  = var.target_group_arn_suffix
   }
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
 }
 
 # NLB TCP Reset Count - potential connectivity issues
 resource "aws_cloudwatch_metric_alarm" "tcp_resets" {
-  alarm_name          = "${var.name_prefix}-tcp-resets"
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-tcp-resets"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3
   metric_name         = "TCP_Target_Reset_Count"
@@ -306,12 +318,15 @@ resource "aws_cloudwatch_metric_alarm" "tcp_resets" {
     TargetGroup  = var.target_group_arn_suffix
   }
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
 }
 
 # ASG Group In Service Instances
 resource "aws_cloudwatch_metric_alarm" "low_instance_count" {
-  alarm_name          = "${var.name_prefix}-low-instances"
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-low-instances"
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 2
   metric_name         = "GroupInServiceInstances"
@@ -328,12 +343,15 @@ resource "aws_cloudwatch_metric_alarm" "low_instance_count" {
     AutoScalingGroupName = var.asg_name
   }
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
 }
 
 # Network Traffic Anomaly - sudden drop
 resource "aws_cloudwatch_metric_alarm" "network_in_low" {
-  alarm_name          = "${var.name_prefix}-network-in-low"
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-network-in-low"
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 5
   metric_name         = "NetworkIn"
@@ -350,12 +368,15 @@ resource "aws_cloudwatch_metric_alarm" "network_in_low" {
     AutoScalingGroupName = var.asg_name
   }
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
 }
 
 # etcd Health Alarm (custom metric from application)
 resource "aws_cloudwatch_metric_alarm" "etcd_health" {
-  alarm_name          = "${var.name_prefix}-etcd-health"
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-etcd-health"
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 3
   metric_name         = "EtcdHealthy"
@@ -372,12 +393,15 @@ resource "aws_cloudwatch_metric_alarm" "etcd_health" {
     Environment = var.environment
   }
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
 }
 
 # NHP Authentication Failures
 resource "aws_cloudwatch_metric_alarm" "auth_failures" {
-  alarm_name          = "${var.name_prefix}-auth-failures"
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-auth-failures"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3
   metric_name         = "AuthFailure"
@@ -394,12 +418,15 @@ resource "aws_cloudwatch_metric_alarm" "auth_failures" {
     Environment = var.environment
   }
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
 }
 
 # Knock Latency p99
 resource "aws_cloudwatch_metric_alarm" "high_latency" {
-  alarm_name          = "${var.name_prefix}-high-latency"
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-high-latency"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3
   metric_name         = "KnockLatency"
@@ -416,5 +443,92 @@ resource "aws_cloudwatch_metric_alarm" "high_latency" {
     Environment = var.environment
   }
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# ==================== DynamoDB Monitoring ====================
+
+# DynamoDB Throttled Requests - indicates capacity issues
+resource "aws_cloudwatch_metric_alarm" "dynamodb_throttled" {
+  for_each = var.enable_dynamodb_monitoring ? toset(var.dynamodb_table_names) : toset([])
+
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-dynamodb-throttled-${each.value}"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "ThrottledRequests"
+  namespace           = "AWS/DynamoDB"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "DynamoDB table ${each.value} experiencing throttling"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    TableName = each.value
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# DynamoDB System Errors - backend errors from DynamoDB
+resource "aws_cloudwatch_metric_alarm" "dynamodb_system_errors" {
+  for_each = var.enable_dynamodb_monitoring ? toset(var.dynamodb_table_names) : toset([])
+
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-dynamodb-errors-${each.value}"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "SystemErrors"
+  namespace           = "AWS/DynamoDB"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 5
+  alarm_description   = "DynamoDB table ${each.value} experiencing system errors"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    TableName = each.value
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# DynamoDB Read Latency - high latency may indicate issues
+resource "aws_cloudwatch_metric_alarm" "dynamodb_read_latency" {
+  for_each = var.enable_dynamodb_monitoring ? toset(var.dynamodb_table_names) : toset([])
+
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-dynamodb-latency-${each.value}"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  metric_name         = "SuccessfulRequestLatency"
+  namespace           = "AWS/DynamoDB"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 100 # 100ms - DynamoDB should be single-digit ms normally
+  alarm_description   = "DynamoDB table ${each.value} read latency exceeded 100ms"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    TableName = each.value
+    Operation = "GetItem"
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
 }

@@ -141,11 +141,9 @@ type ACOnlineMsg struct {
 	ResourceIds   []string `json:"resIds"`
 	ACId          string   `json:"acId,omitempty"`
 	// Phase 2 - Per-AC Server Assignment fields
-	// These are used for license validation and server assignment lookup
-	CustomerId   string `json:"custId,omitempty"`   // Customer identifier for license lookup
-	LicenseKey   string `json:"licKey,omitempty"`   // License key for validation
-	ResourceFQDN string `json:"resFqdn,omitempty"`  // Resource FQDN (e.g., "a1b2c3d4.nhp.layerv.ai")
-	ACVersion    string `json:"version,omitempty"`  // AC software version
+	// License key is globally unique and sufficient for lookup and validation
+	LicenseKey string `json:"licKey,omitempty"`  // License key for validation (globally unique)
+	ACVersion  string `json:"version,omitempty"` // AC software version
 }
 
 type ACRefreshMsg struct {
