@@ -1,8 +1,12 @@
-# Claude Code Configuration for NHP
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## CRITICAL RULES - NEVER VIOLATE
 
 > **NEVER push directly to `main` branch.** All changes MUST go through a Pull Request, no exceptions. This applies even for "quick fixes" or "urgent" changes. Create a branch, open a PR, and let CI run.
+
+> **All commits must be GPG/SSH signed.** Unsigned commits will be rejected by GitHub branch protection rules.
 
 ## Code Change Workflow
 
@@ -76,15 +80,6 @@ AWS_PROFILE=layerv-mgmt     # Management/Org operations
 ## Commit Convention (Release Please)
 
 This repository uses [Release Please](https://github.com/googleapis/release-please) for automated releases. Commits **must** follow [Conventional Commits](https://www.conventionalcommits.org/) format.
-
-### GPG Signing Requirement
-
-**All commits must be GPG signed.** Configure git to sign automatically:
-
-```bash
-git config commit.gpgsign true
-git config user.signingkey YOUR_KEY_ID
-```
 
 ### Format
 
@@ -173,8 +168,11 @@ make fuzz             # Run fuzz tests (60s each)
 # Run go mod tidy on all modules
 cd nhp && go mod tidy && cd ../endpoints && go mod tidy && cd ../examples/server_plugin && go mod tidy
 
-# Tests (KBS_SKIP_INIT prevents private key dir creation)
+# Run all tests (KBS_SKIP_INIT prevents private key dir creation)
 KBS_SKIP_INIT=1 go test ./... -v -race
+
+# Run a single test by name
+cd endpoints && KBS_SKIP_INIT=1 go test -v ./server/... -run TestACRegistry
 
 # Build single binary (static, no CGO)
 cd endpoints && CGO_ENABLED=0 go build -o ../release/nhp-server/nhp-serverd ./server/main/main.go
@@ -265,7 +263,6 @@ AWS_PROFILE=layerv aws autoscaling cancel-instance-refresh \
 | 502 on /plugins/* | Server HTTP down | Check port 8888, security groups |
 | Server "0 AC peers" | No ACs in etcd | Check AC registration |
 | Test panic "private key" | Missing env var | Set `KBS_SKIP_INIT=1` |
-| Push rejected "unsigned" | Missing GPG signature | Configure `git config commit.gpgsign true` |
 
 ## Cloud Map DNS (Internal)
 
@@ -296,4 +293,3 @@ etcd.nhp.sandbox.internal:2379  # etcd cluster
 - All storage encrypted with KMS CMKs
 - IMDSv2 required on EC2
 - AC private keys NEVER in etcd - only Secrets Manager
-- All commits must be GPG signed
