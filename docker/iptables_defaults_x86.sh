@@ -1,5 +1,5 @@
 #!/bin/bash
-CURRENT_DIR=`cd \`dirname $0\`; pwd`
+CURRENT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 ### flush existing rules and set chain policy setting to DROP
 if [ "$1" = "-f" ]; then

@@ -56,7 +56,7 @@ DNS_NAMES=(
 
 # Create temp directory
 TEMP_DIR=$(mktemp -d)
-trap "rm -rf $TEMP_DIR" EXIT
+trap 'rm -rf "$TEMP_DIR"' EXIT
 
 echo -e "${GREEN}Generating etcd TLS certificates for ${ENVIRONMENT}${NC}"
 echo "Temp directory: $TEMP_DIR"

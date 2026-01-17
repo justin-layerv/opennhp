@@ -1,5 +1,5 @@
 #!/bin/bash
-CURRENT_DIR=`cd \`dirname $0\`; pwd`
+CURRENT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 ### flush existing rules and set chain policy setting to DROP
 if [ "$1" = "-f" ]; then
@@ -65,14 +65,14 @@ fi
 echo "Setting up NHP_DENY chain ..."
 echo ""
 iptables -N NHP_DENY
-iptables -C NHP_DENY -d $(hostname -I | awk '{print $1}') -j LOG --log-prefix "[NHP-DENY] " --log-level 6 --log-ip-options > /dev/null 2>&1
+iptables -C NHP_DENY -d "$(hostname -I | awk '{print $1}')" -j LOG --log-prefix "[NHP-DENY] " --log-level 6 --log-ip-options > /dev/null 2>&1
 if [ $? -ne 0 ]; then
-    iptables -A NHP_DENY -d $(hostname -I | awk '{print $1}') -j LOG --log-prefix "[NHP-DENY] " --log-level 6 --log-ip-options
+    iptables -A NHP_DENY -d "$(hostname -I | awk '{print $1}')" -j LOG --log-prefix "[NHP-DENY] " --log-level 6 --log-ip-options
 fi
 
-iptables -C NHP_DENY -d $(hostname -I | awk '{print $1}') -j DROP > /dev/null 2>&1
+iptables -C NHP_DENY -d "$(hostname -I | awk '{print $1}')" -j DROP > /dev/null 2>&1
 if [ $? -ne 0 ]; then
-    iptables -A NHP_DENY -d $(hostname -I | awk '{print $1}') -j DROP
+    iptables -A NHP_DENY -d "$(hostname -I | awk '{print $1}')" -j DROP
 fi
 
 
@@ -300,12 +300,12 @@ if [ -d /etc/rsyslog.d ]; then
     # Use /var/log/nhp for rsyslog (rsyslog runs as syslog user, cannot access /root/)
     NHP_LOG_DIR="/var/log/nhp"
     mkdir -p $NHP_LOG_DIR
-    chown syslog:adm $NHP_LOG_DIR 2>/dev/null || chown root:root $NHP_LOG_DIR
-    chmod 755 $NHP_LOG_DIR
+    chown syslog:adm "$NHP_LOG_DIR" 2>/dev/null || chown root:root "$NHP_LOG_DIR"
+    chmod 755 "$NHP_LOG_DIR"
     # Also create local logs directory for other uses
-    mkdir -p $CURRENT_DIR/logs
-    chown $(whoami):$(id -gn) $CURRENT_DIR/logs
-    chmod -R 755 $CURRENT_DIR/logs/
+    mkdir -p "$CURRENT_DIR/logs"
+    chown "$(whoami):$(id -gn)" "$CURRENT_DIR/logs"
+    chmod -R 755 "$CURRENT_DIR/logs/"
     setenforce 0 2>/dev/null || true
     echo 'template(name="NHPFormat" type="string" string="%timegenerated:8:19% '"${LOCAL_IP}"' %syslogtag% %msg:::drop-last-lf%\n")
 template(name="NHPAcceptFile" type="string" string="'"$NHP_LOG_DIR"'/nhp_accept-%$YEAR%-%$MONTH%-%$DAY%.log")

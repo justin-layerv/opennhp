@@ -11,7 +11,7 @@ ip6tables -F 2>/dev/null || true
 ip6tables -X 2>/dev/null || true
 sleep 1
 
-CURRENT_DIR=`cd \`dirname $0\`; pwd`
+CURRENT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 #
 #	set iptables firewall DROP

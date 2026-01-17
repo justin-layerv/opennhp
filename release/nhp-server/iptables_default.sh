@@ -1,3 +1,4 @@
+#!/bin/bash
 ### INPUT chain ###
 echo "Setting up INPUT chain ..."
 echo ""
