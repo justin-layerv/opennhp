@@ -19,6 +19,7 @@ locals {
   interface_endpoints = {
     "ecr-api"          = "ecr.api"
     "ecr-dkr"          = "ecr.dkr"
+    "guardduty-data"   = "guardduty-data" # Required for Runtime Monitoring agent on EC2
     "logs"             = "logs"
     "secretsmanager"   = "secretsmanager"
     "servicediscovery" = "servicediscovery"

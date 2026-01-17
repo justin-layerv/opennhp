@@ -206,6 +206,160 @@ resource "aws_guardduty_detector_feature" "ebs_malware_protection" {
   status      = "ENABLED"
 }
 
+resource "aws_guardduty_detector_feature" "rds_login_events" {
+  count       = var.enable_guardduty ? 1 : 0
+  detector_id = aws_guardduty_detector.main[0].id
+  name        = "RDS_LOGIN_EVENTS"
+  status      = "ENABLED"
+}
+
+resource "aws_guardduty_detector_feature" "lambda_network_logs" {
+  count       = var.enable_guardduty ? 1 : 0
+  detector_id = aws_guardduty_detector.main[0].id
+  name        = "LAMBDA_NETWORK_LOGS"
+  status      = "ENABLED"
+}
+
+resource "aws_guardduty_detector_feature" "runtime_monitoring" {
+  count       = var.enable_guardduty ? 1 : 0
+  detector_id = aws_guardduty_detector.main[0].id
+  name        = "RUNTIME_MONITORING"
+  status      = "ENABLED"
+
+  additional_configuration {
+    name   = "EC2_AGENT_MANAGEMENT"
+    status = "ENABLED"
+  }
+}
+
+# ==================== GuardDuty Alerting ====================
+# EventBridge rule to send GuardDuty findings to SNS for email/Slack notifications
+
+locals {
+  enable_guardduty_alerts = var.enable_guardduty && var.enable_guardduty_alerts
+}
+
+# EventBridge rule for GuardDuty findings
+resource "aws_cloudwatch_event_rule" "guardduty_findings" {
+  count       = local.enable_guardduty_alerts ? 1 : 0
+  name        = "${var.name_prefix}-guardduty-findings"
+  description = "Capture GuardDuty findings for alerting"
+
+  event_pattern = jsonencode({
+    source      = ["aws.guardduty"]
+    detail-type = ["GuardDuty Finding"]
+    detail = {
+      severity = [{
+        numeric = [">=", var.guardduty_alert_severity_threshold]
+      }]
+    }
+  })
+
+  tags = var.tags
+}
+
+# EventBridge target for Email - plain text format
+resource "aws_cloudwatch_event_target" "guardduty_email" {
+  count     = local.enable_guardduty_alerts ? 1 : 0
+  rule      = aws_cloudwatch_event_rule.guardduty_findings[0].name
+  target_id = "guardduty-to-email"
+  arn       = var.alerts_sns_topic_arn
+
+  # Plain text format optimized for email readability
+  # Note: Some fields (instanceId, instanceType, actionType) may be empty for non-EC2 findings
+  # (e.g., IAM or S3 findings). EventBridge substitutes empty string for missing paths.
+  input_transformer {
+    input_paths = {
+      severity     = "$.detail.severity"
+      type         = "$.detail.type"
+      title        = "$.detail.title"
+      description  = "$.detail.description"
+      region       = "$.region"
+      account      = "$.account"
+      time         = "$.time"
+      findingId    = "$.detail.id"
+      resourceType = "$.detail.resource.resourceType"
+      instanceId   = "$.detail.resource.instanceDetails.instanceId"
+      instanceType = "$.detail.resource.instanceDetails.instanceType"
+      actionType   = "$.detail.service.action.actionType"
+    }
+    input_template = <<-EOF
+      🚨 GuardDuty Security Finding - Severity <severity>
+
+      Type: <type>
+      Title: <title>
+
+      Description:
+      <description>
+
+      Resource Details:
+      - Resource Type: <resourceType>
+      - Instance ID: <instanceId>
+      - Instance Type: <instanceType>
+      - Action Type: <actionType>
+
+      AWS Details:
+      - Region: <region>
+      - Account: <account>
+      - Time: <time>
+      - Finding ID: <findingId>
+
+      🔗 View in Console:
+      https://<region>.console.aws.amazon.com/guardduty/home?region=<region>#/findings?search=id%3D<findingId>
+    EOF
+  }
+}
+
+# EventBridge target for Slack - AWS Chatbot formatted JSON
+resource "aws_cloudwatch_event_target" "guardduty_slack" {
+  count     = local.enable_guardduty_alerts && var.enable_slack_target ? 1 : 0
+  rule      = aws_cloudwatch_event_rule.guardduty_findings[0].name
+  target_id = "guardduty-to-slack"
+  arn       = var.alerts_sns_topic_arn
+
+  # AWS Chatbot-optimized format with structured fields
+  input_transformer {
+    input_paths = {
+      severity     = "$.detail.severity"
+      type         = "$.detail.type"
+      title        = "$.detail.title"
+      description  = "$.detail.description"
+      region       = "$.region"
+      account      = "$.account"
+      time         = "$.time"
+      findingId    = "$.detail.id"
+      resourceType = "$.detail.resource.resourceType"
+      instanceId   = "$.detail.resource.instanceDetails.instanceId"
+      actionType   = "$.detail.service.action.actionType"
+    }
+    input_template = <<-EOF
+      {
+        "version": "1.0",
+        "source": "custom",
+        "content": {
+          "textType": "client-markdown",
+          "title": ":rotating_light: GuardDuty Finding - Severity <severity>",
+          "description": "*<type>*\n<title>\n\n<description>",
+          "nextSteps": [
+            "Resource: `<resourceType>` | Instance: `<instanceId>`",
+            "Action: `<actionType>` | Region: `<region>`",
+            "<https://<region>.console.aws.amazon.com/guardduty/home?region=<region>#/findings?search=id%3D<findingId>|View in GuardDuty Console>"
+          ]
+        }
+      }
+    EOF
+  }
+}
+
+# Email subscriptions for GuardDuty alerts
+resource "aws_sns_topic_subscription" "guardduty_email" {
+  for_each = local.enable_guardduty_alerts ? toset(var.guardduty_alert_emails) : toset([])
+
+  topic_arn = var.alerts_sns_topic_arn
+  protocol  = "email"
+  endpoint  = each.value
+}
+
 # ==================== Security Hub ====================
 # Centralized security findings and compliance checks
 

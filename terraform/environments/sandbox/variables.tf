@@ -337,3 +337,10 @@ variable "use_production_acme" {
   type        = bool
   default     = null
 }
+
+# Security alerting
+variable "guardduty_alert_emails" {
+  description = "List of email addresses to receive GuardDuty security finding alerts"
+  type        = list(string)
+  default     = []
+}

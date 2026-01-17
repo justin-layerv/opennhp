@@ -66,3 +66,39 @@ variable "enable_cloudtrail" {
   type        = bool
   default     = true
 }
+
+# GuardDuty alerting configuration
+variable "enable_guardduty_alerts" {
+  description = "Enable GuardDuty finding alerts via SNS (email + Slack)"
+  type        = bool
+  default     = false
+}
+
+variable "alerts_sns_topic_arn" {
+  description = "SNS topic ARN for security alerts (GuardDuty findings will be sent here)"
+  type        = string
+  default     = null
+}
+
+variable "guardduty_alert_emails" {
+  description = "List of email addresses to receive GuardDuty finding alerts"
+  type        = list(string)
+  default     = []
+}
+
+variable "guardduty_alert_severity_threshold" {
+  description = "Minimum severity for GuardDuty alerts (1-8, where 7+ is High, 4-6.9 is Medium)"
+  type        = number
+  default     = 4 # Medium and above
+
+  validation {
+    condition     = var.guardduty_alert_severity_threshold >= 1 && var.guardduty_alert_severity_threshold <= 8
+    error_message = "GuardDuty severity threshold must be between 1 and 8."
+  }
+}
+
+variable "enable_slack_target" {
+  description = "Enable separate Slack-optimized EventBridge target (requires AWS Chatbot integration)"
+  type        = bool
+  default     = true
+}

@@ -340,6 +340,11 @@ module "security" {
   logs_kms_key_arn    = module.kms.logs_key_arn
   enable_cloudtrail   = var.enable_cloudtrail
   tags                = local.common_tags
+
+  # GuardDuty alerting - sends findings to SNS for email/Slack notifications
+  enable_guardduty_alerts = length(var.guardduty_alert_emails) > 0
+  alerts_sns_topic_arn    = module.monitoring.sns_topic_arn
+  guardduty_alert_emails  = var.guardduty_alert_emails
 }
 
 # RDS Module - Aurora PostgreSQL Serverless for console application

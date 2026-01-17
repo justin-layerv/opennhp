@@ -533,6 +533,14 @@ variable "console_ac_customer_id" {
   default     = "00000000000000000000000000" # Nil ULID for LayerV system customer
 }
 
+# ==================== Security Alerting ====================
+
+variable "guardduty_alert_emails" {
+  description = "List of email addresses to receive GuardDuty security finding alerts"
+  type        = list(string)
+  default     = []
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {

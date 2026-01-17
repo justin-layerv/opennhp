@@ -52,6 +52,13 @@ enable_slack_notifications = true
 slack_workspace_id         = "T09UP622L90" # LayerV workspace
 slack_channel_id           = "C0A9S0VCAU9" # #alerts-sandbox
 
+# GuardDuty security alerts (email + Slack via same SNS topic)
+guardduty_alert_emails = [
+  "justin@layerv.ai",
+  "benc@layerv.ai",
+  "joe@layerv.ai"
+]
+
 # RDS configuration for console database
 deploy_rds              = true
 rds_database_name       = "portal"

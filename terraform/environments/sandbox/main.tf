@@ -96,6 +96,9 @@ module "nhp" {
   ac_license_key        = var.ac_license_key
   ac_license_key_hash   = var.ac_license_key_hash
   ac_license_key_sha256 = var.ac_license_key_sha256
+
+  # Security alerting
+  guardduty_alert_emails = var.guardduty_alert_emails
 }
 
 # Re-export outputs

@@ -28,6 +28,77 @@ resource "aws_sns_topic" "alerts" {
   })
 }
 
+# SNS Topic Policy - allows CloudWatch, EventBridge, and account to publish
+resource "aws_sns_topic_policy" "alerts" {
+  arn    = aws_sns_topic.alerts.arn
+  policy = data.aws_iam_policy_document.alerts_policy.json
+}
+
+data "aws_iam_policy_document" "alerts_policy" {
+  # Allow CloudWatch Alarms to publish
+  statement {
+    sid    = "AllowCloudWatchAlarms"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudwatch.amazonaws.com"]
+    }
+
+    actions   = ["sns:Publish"]
+    resources = [aws_sns_topic.alerts.arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+  }
+
+  # Allow EventBridge to publish (for GuardDuty and other event-driven alerts)
+  statement {
+    sid    = "AllowEventBridge"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["events.amazonaws.com"]
+    }
+
+    actions   = ["sns:Publish"]
+    resources = [aws_sns_topic.alerts.arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+  }
+
+  # Allow same-account principals to publish and subscribe
+  statement {
+    sid    = "AllowAccountAccess"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+
+    actions = [
+      "sns:Publish",
+      "sns:Subscribe",
+      "sns:GetTopicAttributes",
+      "sns:SetTopicAttributes",
+      "sns:AddPermission",
+      "sns:RemovePermission",
+      "sns:DeleteTopic",
+      "sns:ListSubscriptionsByTopic"
+    ]
+    resources = [aws_sns_topic.alerts.arn]
+  }
+}
+
 # AWS Chatbot IAM Role for Slack integration
 resource "aws_iam_role" "chatbot" {
   count = local.enable_slack ? 1 : 0
