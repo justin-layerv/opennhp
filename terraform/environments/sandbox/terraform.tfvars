@@ -50,7 +50,7 @@ resource_mode = "api"
 # Slack notifications via AWS Chatbot
 enable_slack_notifications = true
 slack_workspace_id         = "T09UP622L90" # LayerV workspace
-slack_channel_id           = "C09UP62A8F4" # #all-layerv
+slack_channel_id           = "C0A9S0VCAU9" # #alerts-sandbox
 
 # RDS configuration for console database
 deploy_rds              = true
