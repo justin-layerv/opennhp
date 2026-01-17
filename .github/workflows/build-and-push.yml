@@ -398,6 +398,7 @@ jobs:
         if: steps.changes.outputs.terraform_changed == 'true'
         working-directory: terraform/environments/sandbox
         run: |
+          set -o pipefail
           terraform plan -no-color 2>&1 | tee plan.txt
           echo "## Terraform Plan" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
@@ -406,19 +407,29 @@ jobs:
 
       - name: Comment PR with Plan
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-        if: steps.changes.outputs.terraform_changed == 'true'
+        if: always() && steps.changes.outputs.terraform_changed == 'true'
         with:
           script: |
             const fs = require('fs');
-            const plan = fs.readFileSync('terraform/environments/sandbox/plan.txt', 'utf8');
+            const planPath = 'terraform/environments/sandbox/plan.txt';
+            if (!fs.existsSync(planPath)) {
+              console.log('plan.txt not found - terraform plan may have failed before producing output');
+              return;
+            }
+            const plan = fs.readFileSync(planPath, 'utf8');
             const lines = plan.split('\n');
             const summary = lines.slice(-30).join('\n');
+
+            const planFailed = '${{ steps.plan.outcome }}' === 'failure';
+            const header = planFailed
+              ? '## ❌ Terraform Plan Failed (sandbox)'
+              : '## Terraform Plan (sandbox)';
 
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `## Terraform Plan (sandbox)\n\`\`\`\n${summary}\n\`\`\``
+              body: `${header}\n\`\`\`\n${summary}\n\`\`\``
             });
 
       - name: Skip Notice
@@ -494,6 +505,7 @@ jobs:
           # Deployment configuration - use commit SHA for immutable deployments
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         run: |
+          set -o pipefail
           terraform plan -out=tfplan -no-color 2>&1 | tee plan.txt
 
           if grep -q "No changes" plan.txt; then
