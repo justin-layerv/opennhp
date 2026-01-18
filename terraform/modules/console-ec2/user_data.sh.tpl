@@ -1036,7 +1036,7 @@ HEALTH_TIMEOUT=150
 HEALTH_CHECK_PASSED=false
 echo "Waiting for Console to be healthy (timeout: $${HEALTH_TIMEOUT}s)..."
 for i in {1..30}; do
-    HEALTH_RESPONSE=$(curl -s --max-time 5 -w "\nHTTP_CODE:%{http_code}" http://127.0.0.1:$HOST_PORT/health 2>&1)
+    HEALTH_RESPONSE=$(curl -s --max-time 5 -w "\nHTTP_CODE:%%{http_code}" http://127.0.0.1:$HOST_PORT/health 2>&1)
     CURL_EXIT_CODE=$?
 
     if echo "$HEALTH_RESPONSE" | grep -q "healthy"; then
