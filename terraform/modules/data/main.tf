@@ -1217,9 +1217,7 @@ resource "aws_service_discovery_service" "etcd" {
     routing_policy = "MULTIVALUE"
   }
 
-  health_check_custom_config {
-    # failure_threshold is deprecated and always defaults to 1
-  }
+  # No health_check_custom_config - ECS service handles health via task state
 
   tags = var.tags
 }
@@ -1240,9 +1238,7 @@ resource "aws_service_discovery_service" "etcd_client" {
     routing_policy = "MULTIVALUE"
   }
 
-  health_check_custom_config {
-    # failure_threshold is deprecated and always defaults to 1
-  }
+  # No health_check_custom_config - ECS service handles health via task state
 
   tags = var.tags
 }

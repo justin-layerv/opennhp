@@ -515,9 +515,7 @@ resource "aws_service_discovery_service" "ac" {
     routing_policy = "MULTIVALUE"
   }
 
-  health_check_custom_config {
-    # failure_threshold is deprecated and always defaults to 1
-  }
+  # No health_check_custom_config - instances register/deregister explicitly
 
   tags = var.tags
 }

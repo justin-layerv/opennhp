@@ -227,9 +227,7 @@ resource "aws_service_discovery_service" "server" {
     routing_policy = "MULTIVALUE"
   }
 
-  health_check_custom_config {
-    # failure_threshold is deprecated and always defaults to 1
-  }
+  # No health_check_custom_config - instances register/deregister explicitly
 
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-cloudmap-server"

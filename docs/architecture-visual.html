@@ -1,0 +1,1204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LayerV Architecture</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        :root {
+            --bg-primary: #0f172a;
+            --bg-secondary: #1e293b;
+            --bg-card: #334155;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --accent-blue: #3b82f6;
+            --accent-purple: #8b5cf6;
+            --accent-green: #10b981;
+            --accent-orange: #f59e0b;
+            --accent-red: #ef4444;
+            --accent-cyan: #06b6d4;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        header {
+            text-align: center;
+            padding: 3rem 0;
+            background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-primary) 100%);
+            border-bottom: 1px solid var(--bg-card);
+        }
+
+        h1 {
+            font-size: 3rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 0.5rem;
+        }
+
+        .subtitle {
+            color: var(--text-secondary);
+            font-size: 1.25rem;
+        }
+
+        .version {
+            display: inline-block;
+            margin-top: 1rem;
+            padding: 0.25rem 0.75rem;
+            background: var(--bg-card);
+            border-radius: 9999px;
+            font-size: 0.875rem;
+            color: var(--accent-cyan);
+        }
+
+        section {
+            margin: 3rem 0;
+        }
+
+        h2 {
+            font-size: 1.75rem;
+            margin-bottom: 1.5rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid var(--accent-blue);
+            display: inline-block;
+        }
+
+        h3 {
+            font-size: 1.25rem;
+            margin: 1.5rem 0 1rem;
+            color: var(--accent-cyan);
+        }
+
+        .diagram-container {
+            background: var(--bg-secondary);
+            border-radius: 1rem;
+            padding: 2rem;
+            margin: 1.5rem 0;
+            border: 1px solid var(--bg-card);
+            overflow-x: auto;
+        }
+
+        .diagram-title {
+            font-size: 1rem;
+            color: var(--text-secondary);
+            margin-bottom: 1rem;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+        }
+
+        .mermaid {
+            display: flex;
+            justify-content: center;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1.5rem;
+            margin: 1.5rem 0;
+        }
+
+        .card {
+            background: var(--bg-secondary);
+            border-radius: 1rem;
+            padding: 1.5rem;
+            border: 1px solid var(--bg-card);
+        }
+
+        .card h4 {
+            color: var(--accent-blue);
+            margin-bottom: 0.75rem;
+            font-size: 1.1rem;
+        }
+
+        .card p {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        .card .icon {
+            font-size: 2rem;
+            margin-bottom: 1rem;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1rem;
+            margin: 2rem 0;
+        }
+
+        .stat {
+            background: linear-gradient(135deg, var(--bg-secondary), var(--bg-card));
+            border-radius: 1rem;
+            padding: 1.5rem;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .stat-label {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            margin-top: 0.5rem;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1rem 0;
+        }
+
+        th, td {
+            padding: 1rem;
+            text-align: left;
+            border-bottom: 1px solid var(--bg-card);
+        }
+
+        th {
+            background: var(--bg-card);
+            color: var(--accent-cyan);
+            font-weight: 600;
+        }
+
+        tr:hover {
+            background: var(--bg-secondary);
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            border-radius: 0.25rem;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .badge-blue { background: rgba(59, 130, 246, 0.2); color: var(--accent-blue); }
+        .badge-green { background: rgba(16, 185, 129, 0.2); color: var(--accent-green); }
+        .badge-purple { background: rgba(139, 92, 246, 0.2); color: var(--accent-purple); }
+        .badge-orange { background: rgba(245, 158, 11, 0.2); color: var(--accent-orange); }
+
+        .flow-step {
+            display: flex;
+            align-items: flex-start;
+            margin: 1rem 0;
+            padding: 1rem;
+            background: var(--bg-secondary);
+            border-radius: 0.5rem;
+            border-left: 4px solid var(--accent-blue);
+        }
+
+        .flow-step-number {
+            background: var(--accent-blue);
+            color: white;
+            width: 2rem;
+            height: 2rem;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            margin-right: 1rem;
+            flex-shrink: 0;
+        }
+
+        .toc {
+            background: var(--bg-secondary);
+            border-radius: 1rem;
+            padding: 2rem;
+            margin: 2rem 0;
+        }
+
+        .toc h3 {
+            margin-top: 0;
+        }
+
+        .toc ul {
+            list-style: none;
+            columns: 2;
+        }
+
+        .toc li {
+            padding: 0.5rem 0;
+        }
+
+        .toc a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            transition: color 0.2s;
+        }
+
+        .toc a:hover {
+            color: var(--accent-cyan);
+        }
+
+        footer {
+            text-align: center;
+            padding: 3rem;
+            color: var(--text-secondary);
+            border-top: 1px solid var(--bg-card);
+            margin-top: 3rem;
+        }
+
+        @media (max-width: 768px) {
+            .stats { grid-template-columns: repeat(2, 1fr); }
+            .toc ul { columns: 1; }
+            h1 { font-size: 2rem; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>LayerV Architecture</h1>
+            <span class="version">January 2026</span>
+        </div>
+    </header>
+
+    <div class="container">
+        <nav class="toc">
+            <h3>Contents</h3>
+            <ul>
+                <li><a href="#overview">Overview & Value Proposition</a></li>
+                <li><a href="#components">Core Components</a></li>
+                <li><a href="#network">Infrastructure</a></li>
+                <li><a href="#protocol">Protocol & Messages</a></li>
+                <li><a href="#auth">Authentication Flows</a></li>
+                <li><a href="#data">Data Architecture</a></li>
+                <li><a href="#security">Security Model</a></li>
+                <li><a href="#deployment">Deployment Modes</a></li>
+            </ul>
+        </nav>
+
+        <!-- OVERVIEW SECTION -->
+        <section id="overview">
+            <h2>System Overview</h2>
+
+            <div class="grid" style="margin-bottom: 1.5rem;">
+                <div class="card" style="border-left: 4px solid var(--accent-red);">
+                    <h4 style="color: var(--accent-red);">The Problem</h4>
+                    <p>Traditional security exposes services to the internet, relying on authentication <em>after</em> connection. Attackers can scan, probe, and exploit vulnerabilities before auth even happens. VPNs create broad network access and management overhead.</p>
+                </div>
+                <div class="card" style="border-left: 4px solid var(--accent-green);">
+                    <h4 style="color: var(--accent-green);">LayerV Solution</h4>
+                    <p>Resources are <strong>invisible by default</strong>—all ports appear filtered. Users must cryptographically authenticate <em>before</em> the network path opens. No scanning, no probing, no pre-auth exploitation. Access is per-user, per-session, time-limited.</p>
+                </div>
+            </div>
+
+            <!-- How it works - 3 steps -->
+            <div class="diagram-container" style="background: linear-gradient(135deg, #0f172a, #1e293b);">
+                <div class="diagram-title">How It Works</div>
+                <div class="mermaid">
+flowchart LR
+    subgraph Step1["① Knock"]
+        User["👤 User"]
+    end
+
+    subgraph Step2["② Validate & Open"]
+        Server["🖥️ Server<br/>validates"]
+        AC["🛡️ AC allows<br/>user's IP"]
+    end
+
+    subgraph Step3["③ Access"]
+        Traefik["🔀 AC/Traefik"]
+        Resource["🎯 Resource"]
+    end
+
+    User -->|"UDP knock"| Server
+    Server -->|"UDP"| AC
+    User -->|"HTTPS"| Traefik
+    Traefik --> Resource
+
+    style User fill:#3b82f6,color:#fff
+    style Server fill:#8b5cf6,color:#fff
+    style AC fill:#10b981,color:#fff
+    style Traefik fill:#10b981,color:#fff
+    style Resource fill:#ef4444,color:#fff
+                </div>
+                <p style="text-align: center; color: var(--text-secondary); margin-top: 1rem;"><strong>Before:</strong> Resource invisible, all ports filtered. <strong>After:</strong> User's IP allowed, HTTPS flows through AC to resource.</p>
+            </div>
+
+            <div class="stats">
+                <div class="stat">
+                    <div class="stat-value">0</div>
+                    <div class="stat-label">Visible Attack Surface</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">UDP</div>
+                    <div class="stat-label">Control Plane</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">100K+</div>
+                    <div class="stat-label">AC Capacity</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">&lt;50ms</div>
+                    <div class="stat-label">Knock Latency</div>
+                </div>
+            </div>
+
+            <!-- Why LayerV -->
+            <h3>Why LayerV?</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th></th>
+                        <th>Traditional Firewall</th>
+                        <th>VPN</th>
+                        <th>Other ZTNA</th>
+                        <th style="background: var(--accent-purple); color: white;">LayerV</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Attack surface</td>
+                        <td>Ports visible to internet</td>
+                        <td>VPN endpoint exposed</td>
+                        <td>Auth endpoint exposed</td>
+                        <td><strong>Zero—invisible until auth</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Pre-auth exploitation</td>
+                        <td>Possible</td>
+                        <td>Possible</td>
+                        <td>Possible</td>
+                        <td><strong>Impossible</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Access scope</td>
+                        <td>IP/port rules</td>
+                        <td>Full network access</td>
+                        <td>Application-level</td>
+                        <td><strong>Per-user, per-session, time-limited</strong></td>
+                    </tr>
+                    <tr>
+                        <td>User experience</td>
+                        <td>N/A</td>
+                        <td>Client software required</td>
+                        <td>Varies</td>
+                        <td><strong>Browser-native, no client</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Deployment</td>
+                        <td>Network changes</td>
+                        <td>Client + server</td>
+                        <td>Agent on endpoints</td>
+                        <td><strong>Add AC in front of resource</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <!-- Use Cases -->
+            <h3>Use Cases</h3>
+            <div class="grid">
+                <div class="card">
+                    <div class="icon">🏢</div>
+                    <h4>Internal Applications</h4>
+                    <p>Protect admin panels, internal tools, and dashboards without VPN complexity. Users authenticate via SSO, resource becomes visible only to them.</p>
+                </div>
+                <div class="card">
+                    <div class="icon">🔌</div>
+                    <h4>API Protection</h4>
+                    <p>Hide APIs from scanners and bots. Only authenticated partners/clients can even see the endpoint exists. Eliminates API abuse and scraping.</p>
+                </div>
+                <div class="card">
+                    <div class="icon">☁️</div>
+                    <h4>Multi-Cloud Access</h4>
+                    <p>Unified access layer across AWS, GCP, Azure, on-prem. Users don't need to know where resources live—LayerV handles routing.</p>
+                </div>
+                <div class="card">
+                    <div class="icon">🏥</div>
+                    <h4>Compliance-Sensitive</h4>
+                    <p>Healthcare, finance, government. Data never touches LayerV in Hybrid mode. Audit logs for every access. Meet HIPAA, SOC2, FedRAMP requirements.</p>
+                </div>
+            </div>
+
+            <div class="diagram-container" style="background: linear-gradient(135deg, #1e3a5f, #1e293b); border-left: 4px solid var(--accent-cyan); margin-top: 2rem;">
+                <h4 style="color: var(--accent-cyan); margin-bottom: 0.5rem;">Key Architectural Decision: UDP-Only Control Plane</h4>
+                <p style="color: var(--text-secondary); margin: 0;">All protocol messages use <strong>UDP only</strong>. No TCP in the control plane. This eliminates handshake overhead and connection state, enabling stateless horizontal scaling and NAT traversal.</p>
+            </div>
+        </section>
+
+        <!-- COMPONENTS SECTION -->
+        <section id="components">
+            <h2>Core Components</h2>
+
+            <div class="grid">
+                <div class="card">
+                    <div class="icon">🖥️</div>
+                    <h4>NHP Server</h4>
+                    <p>Receives knock requests via UDP, validates credentials, and instructs ACs to add iptables rules. Stateless and horizontally scalable. HTTP 8888 is for plugin endpoints only.</p>
+                    <p style="margin-top: 0.5rem;"><span class="badge badge-blue">UDP 62206</span> <span class="badge badge-purple">HTTP 8888</span></p>
+                </div>
+
+                <div class="card">
+                    <div class="icon">🛡️</div>
+                    <h4>Access Controller (AC)</h4>
+                    <p>Runs alongside protected resources. Manages iptables/ipset rules to grant or revoke network access. Always dials OUT to servers.</p>
+                    <p style="margin-top: 0.5rem;"><span class="badge badge-green">iptables</span> <span class="badge badge-green">Traefik</span></p>
+                </div>
+
+                <div class="card">
+                    <div class="icon">🎛️</div>
+                    <h4>Console API</h4>
+                    <p>Management interface for users, resources, and AC assignments. Handles AZ-aware server assignment and license validation.</p>
+                    <p style="margin-top: 0.5rem;"><span class="badge badge-orange">REST API</span> <span class="badge badge-orange">Portal Sites</span></p>
+                </div>
+
+                <div class="card">
+                    <div class="icon">🔌</div>
+                    <h4>Auth Plugins</h4>
+                    <p>Modular authentication: Passcode (pre-generated codes), OIDC/Okta integration. Compiled into server binary.</p>
+                    <p style="margin-top: 0.5rem;"><span class="badge badge-purple">Passcode</span> <span class="badge badge-purple">OIDC</span></p>
+                </div>
+            </div>
+
+            <div class="diagram-container">
+                <div class="diagram-title">Component Interactions</div>
+                <div class="mermaid">
+flowchart LR
+    subgraph Clients["Clients"]
+        Agent["Agent/Browser"]
+    end
+
+    subgraph NHPServer["NHP Server"]
+        UDP["UDP Handler<br/>:62206"]
+        HTTP["HTTP Handler<br/>:8888"]
+        Plugins["Auth Plugins"]
+        Forwarder["Server Forwarder"]
+        Storage["Storage Backend"]
+    end
+
+    subgraph AC["Access Controller"]
+        ACDaemon["AC Daemon"]
+        IPTables["iptables/ipset"]
+        Traefik["Traefik Proxy"]
+    end
+
+    subgraph DataStores["Data Stores"]
+        DynamoDB[("DynamoDB")]
+        SecretsManager["Secrets Manager"]
+    end
+
+    Agent -->|"NHP_KNK"| UDP
+    Agent -->|"HTTPS"| Traefik
+    Traefik -->|"/plugins/*"| HTTP
+    HTTP --> Plugins
+    UDP --> Forwarder
+    Forwarder -->|"NHP_FWD"| UDP
+    Storage <--> DynamoDB
+
+    ACDaemon -->|"NHP_AOL"| UDP
+    UDP -->|"NHP_AOP"| ACDaemon
+    ACDaemon --> IPTables
+    ACDaemon --> SecretsManager
+
+    style Agent fill:#3b82f6,color:#fff
+    style UDP fill:#8b5cf6,color:#fff
+    style HTTP fill:#8b5cf6,color:#fff
+    style ACDaemon fill:#10b981,color:#fff
+    style DynamoDB fill:#06b6d4,color:#000
+                </div>
+            </div>
+        </section>
+
+        <!-- NETWORK TOPOLOGY -->
+        <section id="network">
+            <h2>Network Topology</h2>
+
+            <div class="diagram-container">
+                <div class="diagram-title">Infrastructure Layout (Multi-AZ)</div>
+                <div class="mermaid">
+flowchart TB
+    subgraph VPC["LayerV VPC"]
+        subgraph PubSub["Public Layer"]
+            NLB["⚖️ Network Load Balancer<br/>UDP 62206 + TCP 443"]
+        end
+
+        subgraph PrivSub["Compute Layer (3 AZs)"]
+            Servers["🖥️ NHP Servers<br/>(Auto Scaling Group)"]
+            ACs["🛡️ Access Controllers<br/>(Auto Scaling Group)"]
+            Console["🎛️ Console API"]
+        end
+
+        subgraph DataSub["Data Layer (Isolated)"]
+            DDB["📊 DynamoDB"]
+            RDS["🗄️ PostgreSQL"]
+            SM["🔐 Secrets Manager"]
+        end
+    end
+
+    Internet["🌐 Internet"] --> NLB
+    NLB --> Servers
+    Servers <--> ACs
+    Servers -.-> DDB
+    Console --> DDB
+    Console --> RDS
+    ACs --> SM
+
+    style Internet fill:#3b82f6,color:#fff
+    style NLB fill:#f59e0b,color:#000
+    style Servers fill:#8b5cf6,color:#fff
+    style ACs fill:#10b981,color:#fff
+    style Console fill:#f59e0b,color:#000
+    style DDB fill:#06b6d4,color:#000
+    style RDS fill:#06b6d4,color:#000
+    style SM fill:#06b6d4,color:#000
+                </div>
+            </div>
+
+            <div class="grid" style="margin-top: 1rem;">
+                <div class="card">
+                    <h4>High Availability</h4>
+                    <p>All components span 3 availability zones. Auto Scaling Groups maintain desired capacity. No single point of failure.</p>
+                </div>
+                <div class="card">
+                    <h4>Network Isolation</h4>
+                    <p>Compute layer has no direct internet access—outbound via NAT only. Data layer is fully isolated with VPC endpoints.</p>
+                </div>
+            </div>
+
+            <h3>Key Network Flows</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Flow</th>
+                        <th>Source</th>
+                        <th>Destination</th>
+                        <th>Port/Protocol</th>
+                        <th>Purpose</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="badge badge-blue">Knock</span></td>
+                        <td>Internet</td>
+                        <td>NHP Server (via NLB)</td>
+                        <td>UDP 62206</td>
+                        <td>Client knock requests</td>
+                    </tr>
+                    <tr>
+                        <td><span class="badge badge-green">AC → Server</span></td>
+                        <td>AC Instance</td>
+                        <td>NHP Server</td>
+                        <td>UDP 62206</td>
+                        <td>AC registration & keepalive</td>
+                    </tr>
+                    <tr>
+                        <td><span class="badge badge-purple">Server → AC</span></td>
+                        <td>NHP Server</td>
+                        <td>AC (via established conn)</td>
+                        <td>UDP 62206</td>
+                        <td>Open port commands</td>
+                    </tr>
+                    <tr>
+                        <td><span class="badge badge-orange">HTTPS</span></td>
+                        <td>Internet</td>
+                        <td>Traefik on AC (via NLB)</td>
+                        <td>TCP 443</td>
+                        <td>Web access to protected resources</td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- PROTOCOL FLOW -->
+        <section id="protocol">
+            <h2>NHP Protocol Flow</h2>
+
+            <div class="diagram-container">
+                <div class="diagram-title">Message Sequence - Knock & Access Grant</div>
+                <div class="mermaid">
+sequenceDiagram
+    participant U as 👤 User/Agent
+    participant NLB as ⚖️ NLB
+    participant S1 as 🖥️ Server 1
+    participant S2 as 🖥️ Server 2 (Assigned)
+    participant AC as 🛡️ Access Controller
+    participant R as 🎯 Resource
+
+    Note over AC,S2: AC maintains persistent connection to assigned servers
+    AC->>S2: NHP_AOL (AC Online)
+    S2->>AC: NHP_AAK (Acknowledge)
+
+    Note over U,R: User initiates knock
+    U->>NLB: NHP_KNK (Knock Request)
+    NLB->>S1: Route to available server
+
+    Note over S1,S2: Server checks if AC is local
+    S1->>S1: AC not connected here
+    S1->>S2: NHP_FWD (Forward Knock)
+
+    Note over S2,AC: Server with AC connection processes
+    S2->>AC: NHP_AOP (Open Port for User IP)
+    AC->>AC: iptables ACCEPT rule
+    AC->>S2: NHP_ART (Operation Result)
+    S2->>S1: NHP_FRT (Forward Result)
+    S1->>U: NHP_ACK (Access Granted)
+
+    Note over U,R: User can now access resource
+    U->>AC: HTTPS Request
+    AC->>R: Proxy to backend ✓
+                </div>
+            </div>
+
+            <h3>Protocol Messages</h3>
+            <p style="color: var(--text-secondary); margin-bottom: 1rem;">All messages are UDP packets with cryptographic authentication. The protocol has three message categories:</p>
+
+            <div class="grid">
+                <div class="card">
+                    <h4>User Access</h4>
+                    <p><code>KNK</code> → <code>ACK</code></p>
+                    <p style="color: var(--text-secondary); font-size: 0.9rem;">User sends knock, server responds with success/fail</p>
+                </div>
+                <div class="card">
+                    <h4>AC Registration</h4>
+                    <p><code>AOL</code> → <code>AAK</code> / <code>ARD</code></p>
+                    <p style="color: var(--text-secondary); font-size: 0.9rem;">AC announces online, server acknowledges or redirects to assigned server</p>
+                </div>
+                <div class="card">
+                    <h4>Access Control</h4>
+                    <p><code>AOP</code> → <code>ART</code></p>
+                    <p style="color: var(--text-secondary); font-size: 0.9rem;">Server instructs AC to open port, AC reports result</p>
+                </div>
+                <div class="card">
+                    <h4>Server Mesh</h4>
+                    <p><code>FWD</code> → <code>FRT</code></p>
+                    <p style="color: var(--text-secondary); font-size: 0.9rem;">Servers forward knocks to the server connected to the target AC</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- AUTH FLOWS -->
+        <section id="auth">
+            <h2>Authentication Flows</h2>
+
+            <div class="diagram-container">
+                <div class="diagram-title">Passcode Flow (Pre-Generated Code)</div>
+                <div class="mermaid">
+sequenceDiagram
+    participant W as 🌐 Website
+    participant C as 🎛️ Console API
+    participant U as 👤 User
+    participant B as 🌐 Browser
+    participant S as 🖥️ NHP Server
+    participant AC as 🛡️ AC
+    participant T as 🔀 Traefik
+    participant R as 🎯 Resource
+
+    Note over W,C: 1. Create Portal Site
+    W->>C: POST /api/ps/createPortalSitesByURL
+    C->>C: Generate appId + passcode
+    C->>W: { appId, passcode }
+    W->>U: Display cloaked URL + passcode
+
+    Note over U,S: 2. User authenticates
+    U->>B: Visit qurl.link/{appId}
+    B->>S: GET /plugins/passcode?action=login
+    S->>B: Login form
+    U->>B: Enter passcode
+    B->>S: POST passcode
+    S->>C: Validate passcode (one-time use)
+    C->>S: Valid ✓
+
+    Note over S,R: 3. iptables ACCEPT & redirect
+    S->>AC: NHP_AOP (open for user IP)
+    AC->>AC: iptables ACCEPT
+    S->>B: 302 + Set-Cookie (NHP token)
+    B->>T: GET https://{appId}.qurl.site + cookie
+    T->>T: Validate NHP token ✓
+    T->>R: Proxy request
+    R->>B: Protected content
+                </div>
+            </div>
+
+            <div class="diagram-container">
+                <div class="diagram-title">OIDC/Okta Flow</div>
+                <div class="mermaid">
+sequenceDiagram
+    participant U as 👤 User
+    participant B as 🌐 Browser
+    participant T as 🔀 Traefik
+    participant S as 🖥️ NHP Server
+    participant IDP as 🔐 Okta/OIDC
+    participant AC as 🛡️ AC
+    participant R as 🎯 Resource
+
+    U->>B: Visit protected URL
+    B->>T: GET https://app.example.com
+    T->>B: 302 Redirect to login
+    B->>S: GET /plugins/oidc?action=login
+    S->>B: 302 Redirect to Okta
+    B->>IDP: Okta login page
+    U->>IDP: Enter credentials
+    IDP->>IDP: Authenticate user
+    IDP->>B: 302 + auth code
+    B->>S: GET /callback?code=xxx
+    S->>IDP: Exchange code for tokens
+    IDP->>S: ID token + access token
+    S->>S: Validate tokens
+    S->>AC: NHP_AOP (open for user IP)
+    AC->>AC: iptables ACCEPT
+    S->>B: 302 + Set-Cookie (NHP token)
+    B->>T: Access with cookie ✓
+    T->>R: Proxy to resource
+                </div>
+            </div>
+        </section>
+
+        <!-- DATA ARCHITECTURE -->
+        <section id="data">
+            <h2>Data Architecture</h2>
+
+            <div class="diagram-container">
+                <div class="diagram-title">Data Flow</div>
+                <div class="mermaid">
+flowchart LR
+    subgraph Console["Console API"]
+        API["🎛️ REST API"]
+    end
+
+    subgraph Storage["Storage"]
+        DDB[("📊 DynamoDB")]
+        SM["🔐 Secrets Manager"]
+    end
+
+    subgraph Servers["NHP Servers"]
+        S["🖥️ Servers<br/>(with LRU cache)"]
+    end
+
+    subgraph ACs["Access Controllers"]
+        AC["🛡️ ACs"]
+    end
+
+    API -->|"Write"| DDB
+    S -.->|"Read"| DDB
+    AC -->|"Read keys"| SM
+    AC -.->|"No access"| DDB
+
+    style API fill:#f59e0b,color:#000
+    style DDB fill:#06b6d4,color:#000
+    style SM fill:#06b6d4,color:#000
+    style S fill:#8b5cf6,color:#fff
+    style AC fill:#10b981,color:#fff
+                </div>
+            </div>
+
+            <p style="color: var(--text-secondary); margin: 1rem 0;">Console is the <strong>single writer</strong>. NHP Servers are stateless readers with local caching (5-60s TTL). ACs have no database access—they only read their private keys from Secrets Manager.</p>
+
+            <h3>Data Ownership</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Data</th>
+                        <th>Purpose</th>
+                        <th>Written By</th>
+                        <th>Read By</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Licenses</td>
+                        <td>Validate AC credentials on connection</td>
+                        <td>Console</td>
+                        <td>NHP Server</td>
+                    </tr>
+                    <tr>
+                        <td>AC Assignments</td>
+                        <td>Map each AC to its assigned servers</td>
+                        <td>Console</td>
+                        <td>NHP Server</td>
+                    </tr>
+                    <tr>
+                        <td>Resources</td>
+                        <td>Protected resource definitions and policies</td>
+                        <td>Console</td>
+                        <td>NHP Server</td>
+                    </tr>
+                </tbody>
+            </table>
+            <p style="color: var(--text-secondary); font-size: 0.9rem; margin-top: 0.5rem;"><strong>Key insight:</strong> Console is the single source of truth. NHP Servers are stateless readers with local caching.</p>
+        </section>
+
+        <!-- SECURITY MODEL -->
+        <section id="security">
+            <h2>Security Model</h2>
+
+            <div class="grid">
+                <div class="card">
+                    <div class="icon">🔒</div>
+                    <h4>Zero Trust</h4>
+                    <p>Resources are invisible by default. All ports appear filtered until cryptographic authentication succeeds.</p>
+                </div>
+
+                <div class="card">
+                    <div class="icon">🔑</div>
+                    <h4>Curve25519 Crypto</h4>
+                    <p>All NHP communication uses Curve25519 keypairs with Noise protocol for forward secrecy.</p>
+                </div>
+
+                <div class="card">
+                    <div class="icon">🛡️</div>
+                    <h4>Network-Level Protection</h4>
+                    <p>iptables/ipset rules at the kernel level, not just application authentication.</p>
+                </div>
+
+                <div class="card">
+                    <div class="icon">⚡</div>
+                    <h4>Failopen Safety</h4>
+                    <p>If control plane fails, access is allowed—no lockout risk for legitimate users.</p>
+                </div>
+            </div>
+
+            <div class="diagram-container">
+                <div class="diagram-title">Trust Boundaries</div>
+                <div class="mermaid">
+flowchart TB
+    subgraph Untrusted["🔴 Untrusted Zone"]
+        Internet["Internet"]
+        Attacker["Attacker"]
+    end
+
+    subgraph DMZ["🟡 DMZ"]
+        NLB["NLB"]
+        WAF["WAF (optional)"]
+    end
+
+    subgraph Trusted["🟢 Trusted Zone (VPC)"]
+        subgraph Control["Control Plane"]
+            Servers["NHP Servers"]
+            Console["Console"]
+        end
+
+        subgraph Data["Data Plane"]
+            ACs["Access Controllers"]
+            Resources["Protected Resources"]
+        end
+    end
+
+    Internet --> NLB
+    Attacker -.->|"❌ Blocked"| Resources
+    NLB --> Servers
+    Servers <--> ACs
+    ACs --> Resources
+    Console --> Servers
+
+    style Attacker fill:#ef4444,color:#fff
+    style Resources fill:#10b981,color:#fff
+    style Servers fill:#8b5cf6,color:#fff
+                </div>
+            </div>
+
+            <h3>Key Security Properties</h3>
+            <div class="flow-step">
+                <div class="flow-step-number">1</div>
+                <div>
+                    <strong>AC Private Keys Never Leave Instance</strong>
+                    <p style="color: var(--text-secondary);">Private keys stored in Secrets Manager, read only by the AC instance. Never in etcd or DynamoDB.</p>
+                </div>
+            </div>
+            <div class="flow-step">
+                <div class="flow-step-number">2</div>
+                <div>
+                    <strong>AC Initiates All Connections</strong>
+                    <p style="color: var(--text-secondary);">Servers never connect to ACs. ACs dial out, enabling NAT traversal and reducing attack surface.</p>
+                </div>
+            </div>
+            <div class="flow-step">
+                <div class="flow-step-number">3</div>
+                <div>
+                    <strong>License-Based Trust (Cloud Mode)</strong>
+                    <p style="color: var(--text-secondary);">ACs authenticate via bcrypt-hashed license keys validated against DynamoDB. No pre-shared certificates.</p>
+                </div>
+            </div>
+            <div class="flow-step">
+                <div class="flow-step-number">4</div>
+                <div>
+                    <strong>Constant-Time Validation</strong>
+                    <p style="color: var(--text-secondary);">License validation uses constant-time comparison to prevent timing attacks.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- DEPLOYMENT MODES -->
+        <section id="deployment">
+            <h2>Deployment Modes</h2>
+
+            <p style="margin-bottom: 1.5rem;">LayerV NHP supports three deployment modes to meet different security, compliance, and operational requirements.</p>
+
+            <h3>1. All SaaS (Fully Managed)</h3>
+            <div class="diagram-container">
+                <div class="diagram-title">Control Plane + Data Plane through LayerV</div>
+                <div class="mermaid">
+flowchart LR
+    subgraph Internet["🌐 Internet"]
+        User["👤 User"]
+    end
+
+    subgraph LayerV["☁️ LayerV Cloud"]
+        NLB["⚖️ NLB"]
+        Server["🖥️ NHP Server"]
+        AC["🛡️ AC + Traefik"]
+        DDB[("📊 DynamoDB")]
+    end
+
+    subgraph Customer["🏢 Customer Environment"]
+        Resource["🎯 Protected Resource<br/>(IP whitelist: LayerV only)"]
+    end
+
+    User -->|"1. Knock (UDP)"| NLB
+    NLB --> Server
+    Server <-->|"2. NHP Protocol (UDP)"| AC
+    User -->|"3. HTTPS"| NLB
+    NLB --> AC
+    AC -->|"4. Proxy (whitelisted)"| Resource
+    Server --> DDB
+
+    style User fill:#3b82f6,color:#fff
+    style Server fill:#8b5cf6,color:#fff
+    style AC fill:#10b981,color:#fff
+    style Resource fill:#ef4444,color:#fff
+    style DDB fill:#06b6d4,color:#000
+                </div>
+            </div>
+            <div class="flow-step" style="border-left-color: var(--accent-blue);">
+                <div class="flow-step-number" style="background: var(--accent-blue);">✓</div>
+                <div>
+                    <strong>Both control plane AND data plane flow through LayerV</strong>
+                    <p style="color: var(--text-secondary);">NHP Servers and ACs run in LayerV. Protected resource is in customer's environment with <strong>IP whitelist allowing only LayerV AC IPs</strong>. User traffic flows: Internet → LayerV → Customer Resource. Customer never exposes resource to the internet directly.</p>
+                </div>
+            </div>
+
+            <h3>2. Hybrid (Customer-Deployed ACs)</h3>
+            <div class="diagram-container">
+                <div class="diagram-title">Control Plane through LayerV, Data Plane in Customer Environment</div>
+                <div class="mermaid">
+flowchart LR
+    subgraph Internet["🌐 Internet"]
+        User["👤 User"]
+    end
+
+    subgraph LayerV["☁️ LayerV Cloud"]
+        NLB["⚖️ NLB"]
+        Server["🖥️ NHP Server"]
+        DDB[("📊 DynamoDB")]
+        Console["🎛️ Console"]
+    end
+
+    subgraph Customer["🏢 Customer Environment"]
+        AC["🛡️ AC + Traefik"]
+        Resource["🎯 Protected Resource"]
+    end
+
+    User -->|"1. Knock (UDP)"| NLB
+    NLB --> Server
+    AC -->|"2. NHP Protocol (UDP)<br/>AC dials OUT"| NLB
+    Server --> DDB
+    Console --> DDB
+    User -->|"3. HTTPS"| AC
+    AC -->|"4. Proxy"| Resource
+
+    style User fill:#3b82f6,color:#fff
+    style Server fill:#8b5cf6,color:#fff
+    style AC fill:#10b981,color:#fff
+    style Resource fill:#ef4444,color:#fff
+    style DDB fill:#06b6d4,color:#000
+    style Console fill:#f59e0b,color:#000
+                </div>
+            </div>
+            <div class="flow-step" style="border-left-color: var(--accent-green);">
+                <div class="flow-step-number" style="background: var(--accent-green);">✓</div>
+                <div>
+                    <strong>Data plane does NOT flow through LayerV</strong>
+                    <p style="color: var(--text-secondary);">ACs run in customer's environment (on-prem, AWS, GCP, etc.). Control plane (knocks, AC registration) goes through LayerV. After NHP authentication, user connects to customer's AC/Traefik, which proxies to the resource—data traffic never touches LayerV infrastructure. Ideal for enterprises with data residency requirements.</p>
+                </div>
+            </div>
+
+            <h3>3. On-Prem (Self-Hosted)</h3>
+            <div class="diagram-container">
+                <div class="diagram-title">All Components in Customer Environment</div>
+                <div class="mermaid">
+flowchart LR
+    subgraph Internet["🌐 Internet"]
+        User["👤 User"]
+    end
+
+    subgraph Customer["🏢 Customer Environment"]
+        NLB["⚖️ Load Balancer"]
+        Server["🖥️ NHP Server"]
+        AC["🛡️ AC + Traefik"]
+        ETCD[("📊 etcd Cluster")]
+        Resource["🎯 Protected Resource"]
+    end
+
+    User -->|"1. Knock (UDP)"| NLB
+    NLB --> Server
+    Server <-->|"Watch"| ETCD
+    AC -->|"Register"| ETCD
+    AC -->|"2. NHP Protocol (UDP)"| Server
+    User -->|"3. HTTPS"| AC
+    AC -->|"4. Proxy"| Resource
+
+    style User fill:#3b82f6,color:#fff
+    style Server fill:#8b5cf6,color:#fff
+    style AC fill:#10b981,color:#fff
+    style Resource fill:#ef4444,color:#fff
+    style ETCD fill:#f59e0b,color:#000
+                </div>
+            </div>
+            <div class="flow-step" style="border-left-color: var(--accent-orange);">
+                <div class="flow-step-number" style="background: var(--accent-orange);">✓</div>
+                <div>
+                    <strong>No LayerV dependency—fully air-gapped capable</strong>
+                    <p style="color: var(--text-secondary);">All components (NHP Servers, ACs, etcd) run in customer's environment. Uses etcd instead of DynamoDB. Feature flag enabled. Ideal for air-gapped environments, government, or highly regulated industries.</p>
+                </div>
+            </div>
+
+            <h3>Comparison</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Aspect</th>
+                        <th><span class="badge badge-blue">All SaaS</span></th>
+                        <th><span class="badge badge-green">Hybrid</span></th>
+                        <th><span class="badge badge-orange">On-Prem</span></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Control Plane</td>
+                        <td>LayerV</td>
+                        <td>LayerV</td>
+                        <td>Customer</td>
+                    </tr>
+                    <tr>
+                        <td>Data Plane</td>
+                        <td>LayerV</td>
+                        <td><strong>Customer</strong></td>
+                        <td>Customer</td>
+                    </tr>
+                    <tr>
+                        <td>Storage Backend</td>
+                        <td>DynamoDB</td>
+                        <td>DynamoDB</td>
+                        <td>etcd</td>
+                    </tr>
+                    <tr>
+                        <td>AC Location</td>
+                        <td>LayerV Cloud</td>
+                        <td>Customer Env</td>
+                        <td>Customer Env</td>
+                    </tr>
+                    <tr>
+                        <td>Air-Gapped</td>
+                        <td>No</td>
+                        <td>No</td>
+                        <td>Yes</td>
+                    </tr>
+                    <tr>
+                        <td>Ops Complexity</td>
+                        <td>None</td>
+                        <td>Low (AC only)</td>
+                        <td>Higher (full stack)</td>
+                    </tr>
+                    <tr>
+                        <td>Scale</td>
+                        <td>100K+ ACs</td>
+                        <td>100K+ ACs</td>
+                        <td>~10K ACs</td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- KEY TAKEAWAYS -->
+        <section style="background: linear-gradient(135deg, #1e3a5f, #0f172a); padding: 2rem; border-radius: 12px; margin-top: 2rem;">
+            <h2 style="color: var(--accent-cyan); margin-bottom: 1rem;">Key Takeaways</h2>
+            <div class="grid">
+                <div>
+                    <h4>🎯 Core Value</h4>
+                    <p style="color: var(--text-secondary);">Eliminate attack surface entirely. Resources are invisible until authenticated—no ports to scan, no endpoints to exploit.</p>
+                </div>
+                <div>
+                    <h4>⚡ Architecture</h4>
+                    <p style="color: var(--text-secondary);">UDP-only control plane, stateless servers, ACs dial out. Scales to 100K+ protected resources with sub-50ms latency.</p>
+                </div>
+                <div>
+                    <h4>🔧 Flexibility</h4>
+                    <p style="color: var(--text-secondary);">Three deployment modes: All SaaS (fully managed), Hybrid (data stays local), On-prem (air-gapped). Same protocol, same experience.</p>
+                </div>
+                <div>
+                    <h4>✅ Production Ready</h4>
+                    <p style="color: var(--text-secondary);">Multi-AZ, auto-scaling, DynamoDB global tables. No single points of failure. Battle-tested infrastructure.</p>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <footer>
+        <p><strong>LayerV</strong> — Making the internet invisible</p>
+        <p style="margin-top: 0.5rem; font-size: 0.85rem;">January 2026 • Internal</p>
+    </footer>
+
+    <script>
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                primaryColor: '#8b5cf6',
+                primaryTextColor: '#f8fafc',
+                primaryBorderColor: '#6d28d9',
+                lineColor: '#64748b',
+                secondaryColor: '#1e293b',
+                tertiaryColor: '#334155',
+                background: '#1e293b',
+                mainBkg: '#1e293b',
+                nodeBorder: '#475569',
+                clusterBkg: '#1e293b',
+                clusterBorder: '#475569',
+                titleColor: '#f8fafc',
+                edgeLabelBackground: '#1e293b',
+                nodeTextColor: '#f8fafc'
+            },
+            flowchart: {
+                curve: 'basis',
+                padding: 20
+            },
+            sequence: {
+                actorMargin: 50,
+                boxMargin: 10,
+                boxTextMargin: 5,
+                noteMargin: 10,
+                messageMargin: 35
+            }
+        });
+    </script>
+</body>
+</html>
