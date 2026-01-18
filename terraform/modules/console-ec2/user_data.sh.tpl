@@ -737,10 +737,15 @@ server {
     # ===========================================================================
 
     # Health check endpoint (for NLB health checks)
+    # Proxies to Console's /health which verifies DB connectivity
     location /health {
         access_log off;
-        return 200 'OK';
-        add_header Content-Type text/plain;
+        proxy_pass http://console_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 5s;
     }
 
 %{ if nhp_server_endpoint != null ~}
@@ -1031,12 +1036,23 @@ HEALTH_TIMEOUT=150
 HEALTH_CHECK_PASSED=false
 echo "Waiting for Console to be healthy (timeout: $${HEALTH_TIMEOUT}s)..."
 for i in {1..30}; do
-    if curl -s --max-time 5 http://127.0.0.1:$HOST_PORT/health | grep -q "ok"; then
+    HEALTH_RESPONSE=$(curl -s --max-time 5 -w "\nHTTP_CODE:%{http_code}" http://127.0.0.1:$HOST_PORT/health 2>&1)
+    CURL_EXIT_CODE=$?
+
+    if echo "$HEALTH_RESPONSE" | grep -q "healthy"; then
         echo "Console is healthy after $((i * 5)) seconds"
         HEALTH_CHECK_PASSED=true
         break
     fi
-    echo "Health check attempt $i/30 failed, retrying in 5s..."
+
+    # Log detailed failure information for debugging
+    if [ $CURL_EXIT_CODE -ne 0 ]; then
+        echo "Health check attempt $i/30 failed: curl error (exit code: $CURL_EXIT_CODE)"
+    else
+        HTTP_CODE=$(echo "$HEALTH_RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+        echo "Health check attempt $i/30 failed: HTTP $HTTP_CODE"
+        echo "  Response: $(echo "$HEALTH_RESPONSE" | grep -v "HTTP_CODE:")"
+    fi
     sleep 5
 done
 
@@ -1119,11 +1135,15 @@ server {
     access_log /var/log/nginx/console-access.log;
     error_log /var/log/nginx/console-error.log;
 
-    # Health check
+    # Health check - proxies to Console's /health which verifies DB connectivity
     location /health {
         access_log off;
-        return 200 'OK';
-        add_header Content-Type text/plain;
+        proxy_pass http://console_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 5s;
     }
 
     # Proxy all requests to Console

@@ -462,7 +462,10 @@ resource "aws_autoscaling_group" "console" {
     version = "$Latest"
   }
 
-  health_check_type         = "EC2"
+  # Use ELB health checks so ASG considers target group health, not just EC2 status.
+  # In internal mode, the internal TG has HTTP health checks to /health endpoint.
+  # Unhealthy instances (app crash, DB unreachable) will be automatically replaced.
+  health_check_type         = "ELB"
   health_check_grace_period = 300
 
   # Target groups: internal or external mode, plus protected (always enabled)
