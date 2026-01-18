@@ -69,13 +69,13 @@ variable "enable_cloudtrail" {
 
 # GuardDuty alerting configuration
 variable "enable_guardduty_alerts" {
-  description = "Enable GuardDuty finding alerts via SNS (email + Slack)"
+  description = "Enable GuardDuty finding alerts (Slack via main topic, email via dedicated topic)"
   type        = bool
   default     = false
 }
 
 variable "alerts_sns_topic_arn" {
-  description = "SNS topic ARN for security alerts (GuardDuty findings will be sent here)"
+  description = "SNS topic ARN for Slack notifications via Chatbot (GuardDuty Slack + CloudWatch alarms). Email alerts use a separate dedicated topic."
   type        = string
   default     = null
 }

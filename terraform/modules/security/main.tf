@@ -234,9 +234,55 @@ resource "aws_guardduty_detector_feature" "runtime_monitoring" {
 
 # ==================== GuardDuty Alerting ====================
 # EventBridge rule to send GuardDuty findings to SNS for email/Slack notifications
+#
+# IMPORTANT: GuardDuty uses a SEPARATE SNS topic for email alerts to prevent
+# CloudWatch alarm emails from being sent to the same recipients. The main
+# alerts_sns_topic_arn (with Chatbot) is only used for Slack notifications.
 
 locals {
-  enable_guardduty_alerts = var.enable_guardduty && var.enable_guardduty_alerts
+  enable_guardduty_alerts       = var.enable_guardduty && var.enable_guardduty_alerts
+  enable_guardduty_email_alerts = local.enable_guardduty_alerts && length(var.guardduty_alert_emails) > 0
+}
+
+# Dedicated SNS topic for GuardDuty email alerts
+# This ensures CloudWatch alarms (which use alerts_sns_topic_arn) don't trigger emails
+# Note: No KMS encryption, consistent with main alerts SNS topic in monitoring module
+resource "aws_sns_topic" "guardduty_email" {
+  count = local.enable_guardduty_email_alerts ? 1 : 0
+  name  = "${var.name_prefix}-guardduty-email"
+
+  tags = var.tags
+}
+
+# SNS Topic Policy - allows EventBridge to publish GuardDuty findings
+resource "aws_sns_topic_policy" "guardduty_email" {
+  count  = local.enable_guardduty_email_alerts ? 1 : 0
+  arn    = aws_sns_topic.guardduty_email[0].arn
+  policy = data.aws_iam_policy_document.guardduty_email_policy[0].json
+}
+
+data "aws_iam_policy_document" "guardduty_email_policy" {
+  count = local.enable_guardduty_email_alerts ? 1 : 0
+
+  # Allow EventBridge to publish
+  statement {
+    sid    = "AllowEventBridgePublish"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["events.amazonaws.com"]
+    }
+
+    actions   = ["sns:Publish"]
+    resources = [aws_sns_topic.guardduty_email[0].arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+  }
 }
 
 # EventBridge rule for GuardDuty findings
@@ -259,11 +305,12 @@ resource "aws_cloudwatch_event_rule" "guardduty_findings" {
 }
 
 # EventBridge target for Email - plain text format
+# Uses dedicated GuardDuty email topic (NOT the main alerts topic)
 resource "aws_cloudwatch_event_target" "guardduty_email" {
-  count     = local.enable_guardduty_alerts ? 1 : 0
+  count     = local.enable_guardduty_email_alerts ? 1 : 0
   rule      = aws_cloudwatch_event_rule.guardduty_findings[0].name
   target_id = "guardduty-to-email"
-  arn       = var.alerts_sns_topic_arn
+  arn       = aws_sns_topic.guardduty_email[0].arn
 
   # Plain text format optimized for email readability
   # Template must be a quoted string for non-JSON output
@@ -334,10 +381,11 @@ resource "aws_cloudwatch_event_target" "guardduty_slack" {
 }
 
 # Email subscriptions for GuardDuty alerts
+# Subscribed to the dedicated GuardDuty email topic (NOT the main alerts topic)
 resource "aws_sns_topic_subscription" "guardduty_email" {
-  for_each = local.enable_guardduty_alerts ? toset(var.guardduty_alert_emails) : toset([])
+  for_each = local.enable_guardduty_email_alerts ? toset(var.guardduty_alert_emails) : toset([])
 
-  topic_arn = var.alerts_sns_topic_arn
+  topic_arn = aws_sns_topic.guardduty_email[0].arn
   protocol  = "email"
   endpoint  = each.value
 }
