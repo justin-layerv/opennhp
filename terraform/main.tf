@@ -519,6 +519,34 @@ module "demo_gateway" {
   fallback_url = var.demo_gateway_fallback_url
 }
 
+# ==================== Console Image Tag (SSM Parameter) ====================
+#
+# Console is built from a SEPARATE repository (layervai/console), not this repo.
+# Problem: Using NHP's image_tag (github.sha) for Console breaks deployments because
+# Console has different commit hashes than NHP.
+#
+# Solution: SSM Parameter Store as the source of truth for Console image tag.
+# - Console repo CI creates/updates the SSM parameter when deploying
+# - NHP terraform reads the current value via data source
+# - If the parameter doesn't exist, terraform fails fast (Console must deploy first)
+#
+# Flow:
+# 1. Console repo pushes image with tag "abc123" to ECR
+# 2. Console repo CI runs: aws ssm put-parameter --name /layerv-nhp-{env}/console-image-tag --value abc123
+# 3. Console repo CI triggers ASG refresh
+# 4. NHP deployments read current value from SSM - no interference
+#
+# SSM Parameter name: /${local.name_prefix}/console-image-tag
+# Example: /layerv-nhp-sandbox/console-image-tag
+#
+
+# Read the Console image tag from SSM (fails if parameter doesn't exist)
+data "aws_ssm_parameter" "console_image_tag" {
+  count = var.deploy_console_ec2 ? 1 : 0
+
+  name = "/${local.name_prefix}/console-image-tag"
+}
+
 # Console EC2 Module - Console API on EC2 with nginx + Docker
 # Serves the Console API for portal site management (createPortalSitesByURL, etc.)
 # When console_internal_only=true, Console is NHP-protected (traffic routed through AC)
@@ -534,8 +562,9 @@ module "console_ec2" {
   private_subnet_ids = module.networking.private_subnet_ids
   tags               = local.common_tags
 
-  # Console application - use explicit image_tag, not :latest
-  console_image = "${module.ecr.console_repo_url}:${var.image_tag}"
+  # Console image tag is managed via SSM Parameter Store (see above)
+  # Console repo CI updates SSM, this terraform reads current value
+  console_image = "${module.ecr.console_repo_url}:${data.aws_ssm_parameter.console_image_tag[0].value}"
   domain_name   = var.console_ec2_domain
   acme_email    = var.acme_email
   cookie_domain = var.console_cookie_domain
