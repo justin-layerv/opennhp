@@ -627,17 +627,16 @@ resource "aws_lb_target_group" "udp" {
   vpc_id      = var.vpc_id
   target_type = "instance"
 
-  # Health checks DISABLED: NHP servers are UDP-only (no TCP exposure).
-  # NLB cannot perform UDP health checks. Failover is handled by:
-  # 1. NLB routes to any healthy server; server-side FWD/ARD handles routing to assigned servers
-  # 2. Health monitor marks persistent failures unhealthy in ASG, triggering replacement
-  #
-  # Note: protocol/port are set to avoid AWS provider bug that sends empty healthCheckPath.
-  # These values are IGNORED when enabled=false - no TCP health check actually runs.
+  # TCP health check on port 8888 (HTTP plugin endpoint)
+  # AWS requires health checks for instance-type target groups - no way around this.
+  # Port 8888 is the NHP Server HTTP listener for authentication plugins.
   health_check {
-    enabled  = false
-    protocol = "TCP"
-    port     = "traffic-port"
+    enabled             = true
+    protocol            = "TCP"
+    port                = "8888"
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    interval            = 30
   }
 
   deregistration_delay = 30
