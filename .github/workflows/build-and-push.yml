@@ -672,6 +672,9 @@ jobs:
           echo "CANARY DEPLOYMENT - NHP Server"
           echo "============================================"
 
+          # Cancel any existing instance refresh from previous failed/cancelled runs
+          ./.github/scripts/cancel-existing-refresh.sh "$ASG_NAME"
+
           # Start instance refresh with canary settings (1 instance at a time)
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "$ASG_NAME" \
@@ -764,6 +767,9 @@ jobs:
           echo "CANARY DEPLOYMENT - Access Controller"
           echo "============================================"
 
+          # Cancel any existing instance refresh from previous failed/cancelled runs
+          ./.github/scripts/cancel-existing-refresh.sh "$ASG_NAME"
+
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "$ASG_NAME" \
             --preferences '{
@@ -853,6 +859,9 @@ jobs:
           echo "============================================"
           echo "CANARY DEPLOYMENT - Console EC2"
           echo "============================================"
+
+          # Cancel any existing instance refresh from previous failed/cancelled runs
+          ./.github/scripts/cancel-existing-refresh.sh "$ASG_NAME"
 
           # SkipMatching must be false for Console EC2 because the binary is downloaded
           # at boot via user_data, not baked into the AMI. When code changes, the launch
@@ -1112,6 +1121,9 @@ jobs:
           echo "CANARY DEPLOYMENT - NHP Server (PROD)"
           echo "============================================"
 
+          # Cancel any existing instance refresh from previous failed/cancelled runs
+          ./.github/scripts/cancel-existing-refresh.sh "$ASG_NAME"
+
           # Production: more conservative settings
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "$ASG_NAME" \
@@ -1161,6 +1173,9 @@ jobs:
           echo "============================================"
           echo "CANARY DEPLOYMENT - AC (PROD)"
           echo "============================================"
+
+          # Cancel any existing instance refresh from previous failed/cancelled runs
+          ./.github/scripts/cancel-existing-refresh.sh "$ASG_NAME"
 
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "$ASG_NAME" \
