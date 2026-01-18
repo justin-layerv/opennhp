@@ -207,7 +207,13 @@ resource "aws_iam_role_policy" "console" {
           "route53:ListResourceRecordSets"
         ]
         Resource = local.route53_zone_resources
-      }] : []
+      }] : [],
+      # SSM - read Console image tag at boot time
+      [{
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:parameter${var.console_image_tag_ssm_param}"
+      }]
     )
   })
 }
@@ -330,20 +336,21 @@ resource "aws_vpc_security_group_ingress_rule" "rds_from_console" {
 
 locals {
   user_data = templatefile("${path.module}/user_data.sh.tpl", {
-    domain_name       = var.domain_name
-    acme_email        = var.acme_email
-    console_image     = var.console_image
-    console_port      = var.console_port
-    rds_endpoint      = var.rds_endpoint
-    rds_port          = var.rds_port
-    rds_database_name = var.rds_database_name
-    rds_secret_arn    = var.rds_secret_arn
-    cookie_domain     = var.cookie_domain
-    ac_config_json    = local.ac_config_json
-    region            = data.aws_region.current.id
-    account_id        = data.aws_caller_identity.current.account_id
-    hosted_zone_id    = var.hosted_zone_id
-    internal_only     = var.internal_only
+    domain_name                 = var.domain_name
+    acme_email                  = var.acme_email
+    console_image_repo          = var.console_image_repo
+    console_image_tag_ssm_param = var.console_image_tag_ssm_param
+    console_port                = var.console_port
+    rds_endpoint                = var.rds_endpoint
+    rds_port                    = var.rds_port
+    rds_database_name           = var.rds_database_name
+    rds_secret_arn              = var.rds_secret_arn
+    cookie_domain               = var.cookie_domain
+    ac_config_json              = local.ac_config_json
+    region                      = data.aws_region.current.id
+    account_id                  = data.aws_caller_identity.current.account_id
+    hosted_zone_id              = var.hosted_zone_id
+    internal_only               = var.internal_only
     # RDS seeding for NHP Console resource
     seed_console_resource = var.seed_console_resource
     console_app_id        = var.console_app_id

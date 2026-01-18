@@ -1750,12 +1750,23 @@ go test -v -tags=e2e -timeout 5m ./tests/e2e/...
 
 ### Immutable Deployments
 
-Docker images are tagged with the commit SHA (`TF_VAR_image_tag`), not just `latest`. This ensures:
+Docker images are tagged with the commit SHA, not just `latest`. This ensures:
 - Each deployment creates a new launch template version (when user_data template changes)
 - Rollbacks are straightforward—just deploy a previous commit SHA
 
+**NHP Components (Server, AC):**
 The workflow passes `TF_VAR_image_tag=${{ github.sha }}` to Terraform, which flows through
 to the user_data scripts that pull the specific image version.
+
+**Console EC2:**
+Console is built from a separate repository (`layervai/console`) and deploys independently:
+1. Console CI pushes image with SHA tag to ECR
+2. Console CI writes the SHA tag to SSM parameter (`/layerv-nhp-{env}/console-image-tag`)
+3. Console CI triggers ASG instance refresh
+4. New instance reads tag from SSM at boot time and pulls the correct image
+
+This decouples Console deployments from NHP Terraform—Console can deploy without running
+NHP Terraform, and NHP Terraform won't trigger Console instance refreshes.
 
 **Important:** For components that download binaries at boot (like Console EC2's nhp-acd),
 code changes may NOT update the launch template if only the binary changed. The CI/CD

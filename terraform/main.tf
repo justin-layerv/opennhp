@@ -562,12 +562,13 @@ module "console_ec2" {
   private_subnet_ids = module.networking.private_subnet_ids
   tags               = local.common_tags
 
-  # Console image tag is managed via SSM Parameter Store (see above)
-  # Console repo CI updates SSM, this terraform reads current value
-  console_image = "${module.ecr.console_repo_url}:${data.aws_ssm_parameter.console_image_tag[0].value}"
-  domain_name   = var.console_ec2_domain
-  acme_email    = var.acme_email
-  cookie_domain = var.console_cookie_domain
+  # Console image is resolved at boot time by reading tag from SSM
+  # This allows Console CI to deploy independently without terraform
+  console_image_repo          = module.ecr.console_repo_url
+  console_image_tag_ssm_param = data.aws_ssm_parameter.console_image_tag[0].name
+  domain_name                 = var.console_ec2_domain
+  acme_email                  = var.acme_email
+  cookie_domain               = var.console_cookie_domain
 
   # NHP Protection: When enabled, Console is internal-only (behind AC)
   # Traffic flows: Internet → AC NLB → Traefik → Console internal NLB

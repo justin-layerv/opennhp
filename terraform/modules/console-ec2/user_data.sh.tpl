@@ -963,7 +963,18 @@ echo "Certificate obtained"
 # ============================================================================
 
 echo "Pulling Console Docker image..."
-CONSOLE_IMAGE="${console_image}"
+# Read image tag from SSM at boot time (allows Console CI to deploy independently)
+echo "Reading Console image tag from SSM: ${console_image_tag_ssm_param}"
+CONSOLE_IMAGE_TAG=$(aws ssm get-parameter --name "${console_image_tag_ssm_param}" --query 'Parameter.Value' --output text --region "$REGION") || {
+  echo "ERROR: SSM GetParameter API call failed for ${console_image_tag_ssm_param}"
+  exit 1
+}
+if [ -z "$CONSOLE_IMAGE_TAG" ] || [ "$CONSOLE_IMAGE_TAG" = "None" ]; then
+  echo "ERROR: Console image tag is empty or None (SSM parameter: ${console_image_tag_ssm_param})"
+  exit 1
+fi
+CONSOLE_IMAGE="${console_image_repo}:$CONSOLE_IMAGE_TAG"
+echo "Console image: $CONSOLE_IMAGE"
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${account_id}.dkr.ecr.${region}.amazonaws.com"
 docker pull "$CONSOLE_IMAGE"
 

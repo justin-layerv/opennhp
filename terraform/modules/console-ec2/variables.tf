@@ -35,8 +35,13 @@ variable "private_subnet_ids" {
 # Console Application Configuration
 # ============================================================================
 
-variable "console_image" {
-  description = "Docker image for console server. Use explicit tag (e.g., ECR_URL:commit-sha), not :latest, to ensure version matches Terraform-managed config."
+variable "console_image_repo" {
+  description = "ECR repository URL for console server (without tag). Tag is read from SSM at boot."
+  type        = string
+}
+
+variable "console_image_tag_ssm_param" {
+  description = "SSM parameter name containing the Console image tag. Read at boot for dynamic updates."
   type        = string
 }
 
