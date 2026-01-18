@@ -266,47 +266,32 @@ resource "aws_cloudwatch_event_target" "guardduty_email" {
   arn       = var.alerts_sns_topic_arn
 
   # Plain text format optimized for email readability
-  # Note: Some fields (instanceId, instanceType, actionType) may be empty for non-EC2 findings
-  # (e.g., IAM or S3 findings). EventBridge substitutes empty string for missing paths.
+  # Template must be a quoted string for non-JSON output
   input_transformer {
     input_paths = {
-      severity     = "$.detail.severity"
-      type         = "$.detail.type"
-      title        = "$.detail.title"
-      description  = "$.detail.description"
-      region       = "$.region"
-      account      = "$.account"
-      time         = "$.time"
-      findingId    = "$.detail.id"
-      resourceType = "$.detail.resource.resourceType"
-      instanceId   = "$.detail.resource.instanceDetails.instanceId"
-      instanceType = "$.detail.resource.instanceDetails.instanceType"
-      actionType   = "$.detail.service.action.actionType"
+      severity    = "$.detail.severity"
+      type        = "$.detail.type"
+      title       = "$.detail.title"
+      description = "$.detail.description"
+      region      = "$.region"
+      account     = "$.account"
+      time        = "$.time"
+      findingId   = "$.detail.id"
     }
-    input_template = <<-EOF
-      🚨 GuardDuty Security Finding - Severity <severity>
-
-      Type: <type>
-      Title: <title>
-
-      Description:
-      <description>
-
-      Resource Details:
-      - Resource Type: <resourceType>
-      - Instance ID: <instanceId>
-      - Instance Type: <instanceType>
-      - Action Type: <actionType>
-
-      AWS Details:
-      - Region: <region>
-      - Account: <account>
-      - Time: <time>
-      - Finding ID: <findingId>
-
-      🔗 View in Console:
-      https://<region>.console.aws.amazon.com/guardduty/home?region=<region>#/findings?search=id%3D<findingId>
-    EOF
+    input_template = join("", [
+      "\"GuardDuty Security Finding - Severity <severity>\\n\\n",
+      "Type: <type>\\n",
+      "Title: <title>\\n\\n",
+      "Description:\\n",
+      "<description>\\n\\n",
+      "AWS Details:\\n",
+      "- Region: <region>\\n",
+      "- Account: <account>\\n",
+      "- Time: <time>\\n",
+      "- Finding ID: <findingId>\\n\\n",
+      "View in Console:\\n",
+      "https://<region>.console.aws.amazon.com/guardduty/home?region=<region>#/findings?search=id%3D<findingId>\"",
+    ])
   }
 }
 
@@ -317,37 +302,34 @@ resource "aws_cloudwatch_event_target" "guardduty_slack" {
   target_id = "guardduty-to-slack"
   arn       = var.alerts_sns_topic_arn
 
-  # AWS Chatbot-optimized format with structured fields
+  # AWS Chatbot-optimized JSON format
+  # Note: Can't use jsonencode() because we need literal <placeholder> strings
   input_transformer {
     input_paths = {
-      severity     = "$.detail.severity"
-      type         = "$.detail.type"
-      title        = "$.detail.title"
-      description  = "$.detail.description"
-      region       = "$.region"
-      account      = "$.account"
-      time         = "$.time"
-      findingId    = "$.detail.id"
-      resourceType = "$.detail.resource.resourceType"
-      instanceId   = "$.detail.resource.instanceDetails.instanceId"
-      actionType   = "$.detail.service.action.actionType"
+      severity    = "$.detail.severity"
+      type        = "$.detail.type"
+      title       = "$.detail.title"
+      description = "$.detail.description"
+      region      = "$.region"
+      account     = "$.account"
+      time        = "$.time"
+      findingId   = "$.detail.id"
     }
-    input_template = <<-EOF
-      {
-        "version": "1.0",
-        "source": "custom",
-        "content": {
-          "textType": "client-markdown",
-          "title": ":rotating_light: GuardDuty Finding - Severity <severity>",
-          "description": "*<type>*\n<title>\n\n<description>",
-          "nextSteps": [
-            "Resource: `<resourceType>` | Instance: `<instanceId>`",
-            "Action: `<actionType>` | Region: `<region>`",
-            "<https://<region>.console.aws.amazon.com/guardduty/home?region=<region>#/findings?search=id%3D<findingId>|View in GuardDuty Console>"
-          ]
-        }
-      }
-    EOF
+    input_template = join("", [
+      "{",
+      "\"version\":\"1.0\",",
+      "\"source\":\"custom\",",
+      "\"content\":{",
+      "\"textType\":\"client-markdown\",",
+      "\"title\":\":rotating_light: GuardDuty Finding - Severity <severity>\",",
+      "\"description\":\"*<type>*\\n<title>\\n\\n<description>\",",
+      "\"nextSteps\":[",
+      "\"Account: `<account>` | Region: `<region>` | Time: `<time>`\",",
+      "\"<https://<region>.console.aws.amazon.com/guardduty/home?region=<region>#/findings?search=id%3D<findingId>|View in GuardDuty Console>\"",
+      "]",
+      "}",
+      "}",
+    ])
   }
 }
 
