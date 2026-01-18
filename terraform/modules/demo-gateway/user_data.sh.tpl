@@ -5,8 +5,33 @@ exec > >(tee /var/log/user-data.log | logger -t user-data) 2>&1
 echo "Starting Demo Gateway installation at $(date)"
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y nginx certbot python3-certbot-nginx python3-certbot-dns-route53 curl jq awscli
+
+# Retry apt-get commands with exponential backoff (Ubuntu runs unattended-upgrades on boot which holds locks)
+apt_get_with_retry() {
+    local max_attempts=10
+    local delay=2
+    local max_delay=60
+    local attempt=1
+    while true; do
+        if apt-get "$@"; then
+            return 0
+        fi
+        if [ $attempt -ge $max_attempts ]; then
+            echo "ERROR: apt-get $* failed after $max_attempts attempts"
+            return 1
+        fi
+        echo "apt-get $* failed (attempt $attempt/$max_attempts), retrying in $${delay}s..."
+        sleep $delay
+        attempt=$((attempt + 1))
+        delay=$((delay * 2))
+        if [ $delay -gt $max_delay ]; then
+            delay=$max_delay
+        fi
+    done
+}
+
+apt_get_with_retry update -y
+apt_get_with_retry install -y nginx certbot python3-certbot-nginx python3-certbot-dns-route53 curl jq awscli
 
 # ============================================================================
 # Configure nginx - Initial HTTP-only config for certbot

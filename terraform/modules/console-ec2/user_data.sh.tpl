@@ -14,14 +14,39 @@ echo "Starting Console EC2 installation at $(date)"
 echo "Mode: ${internal_only ? "INTERNAL (behind AC/NHP)" : "EXTERNAL (public)"}"
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
+
+# Retry apt-get commands with exponential backoff (Ubuntu runs unattended-upgrades on boot which holds locks)
+apt_get_with_retry() {
+    local max_attempts=10
+    local delay=2
+    local max_delay=60
+    local attempt=1
+    while true; do
+        if apt-get "$@"; then
+            return 0
+        fi
+        if [ $attempt -ge $max_attempts ]; then
+            echo "ERROR: apt-get $* failed after $max_attempts attempts"
+            return 1
+        fi
+        echo "apt-get $* failed (attempt $attempt/$max_attempts), retrying in $${delay}s..."
+        sleep $delay
+        attempt=$((attempt + 1))
+        delay=$((delay * 2))
+        if [ $delay -gt $max_delay ]; then
+            delay=$max_delay
+        fi
+    done
+}
+
+apt_get_with_retry update -y
 
 %{ if internal_only }
 # Internal mode: minimal packages (no TLS/certbot needed)
-apt-get install -y nginx docker.io curl jq unzip dnsutils
+apt_get_with_retry install -y nginx docker.io curl jq unzip dnsutils
 %{ else }
 # External mode: full packages including certbot for TLS
-apt-get install -y nginx certbot python3-certbot-nginx python3-certbot-dns-route53 docker.io curl jq unzip dnsutils
+apt_get_with_retry install -y nginx certbot python3-certbot-nginx python3-certbot-dns-route53 docker.io curl jq unzip dnsutils
 %{ endif }
 
 # Install AWS CLI v2
@@ -62,7 +87,7 @@ echo "RDS credentials retrieved"
 echo "Setting up NHP Protection (true network-level hiding)..."
 
 # Install iptables and ipset for firewall rules
-apt-get install -y iptables ipset python3-cryptography
+apt_get_with_retry install -y iptables ipset python3-cryptography
 
 # ============================================================================
 # NHP Firewall Setup - ipset and iptables rules for zero-trust access control
@@ -572,7 +597,7 @@ echo "NHP Protection setup complete (nhp-acd pending Console startup)"
 # ============================================================================
 
 echo "Installing certbot for protected domain TLS..."
-apt-get install -y certbot python3-certbot-nginx python3-certbot-dns-route53 || true
+apt_get_with_retry install -y certbot python3-certbot-nginx python3-certbot-dns-route53
 
 echo "Configuring nginx for protected domain (HTTPS on port 443)..."
 
@@ -1217,7 +1242,7 @@ systemctl start console-health
 echo "Seeding Console resource in RDS for NHP protection..."
 
 # Install PostgreSQL client for seeding Console resource
-apt-get install -y postgresql-client
+apt_get_with_retry install -y postgresql-client
 
 # Build the SQL to insert Console portal site (idempotent - only if not exists)
 # This creates the Console as a protected resource that AC/NHP Server can route to
