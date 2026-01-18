@@ -629,12 +629,17 @@ resource "aws_lb_target_group" "udp" {
   vpc_id      = var.vpc_id
   target_type = "instance"
 
-  # Health checks disabled: NHP servers are UDP-only (no TCP exposure).
+  # Health checks DISABLED: NHP servers are UDP-only (no TCP exposure).
   # NLB cannot perform UDP health checks. Failover is handled by:
   # 1. NLB routes to any healthy server; server-side FWD/ARD handles routing to assigned servers
   # 2. Health monitor marks persistent failures unhealthy in ASG, triggering replacement
+  #
+  # Note: protocol/port are set to avoid AWS provider bug that sends empty healthCheckPath.
+  # These values are IGNORED when enabled=false - no TCP health check actually runs.
   health_check {
-    enabled = false
+    enabled  = false
+    protocol = "TCP"
+    port     = "traffic-port"
   }
 
   deregistration_delay = 30
