@@ -382,10 +382,9 @@ jobs:
       - name: Terraform Init
         if: steps.changes.outputs.terraform_changed == 'true'
         working-directory: terraform/environments/sandbox
-        env:
-          TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
         run: |
-          mkdir -p ~/.terraform.d/plugin-cache
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
           terraform init
 
       - name: Terraform Validate
@@ -484,10 +483,9 @@ jobs:
 
       - name: Terraform Init
         working-directory: terraform/environments/${{ matrix.environment }}
-        env:
-          TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
         run: |
-          mkdir -p ~/.terraform.d/plugin-cache
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
           terraform init
 
       - name: Terraform Format Check
@@ -578,10 +576,9 @@ jobs:
 
       - name: Terraform Init
         working-directory: terraform/environments/sandbox
-        env:
-          TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
         run: |
-          mkdir -p ~/.terraform.d/plugin-cache
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
           terraform init
 
       - name: Handle ASG Attachment Migrations
@@ -1034,10 +1031,9 @@ jobs:
 
       - name: Terraform Init
         working-directory: terraform/environments/prod
-        env:
-          TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
         run: |
-          mkdir -p ~/.terraform.d/plugin-cache
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
           terraform init
 
       - name: Handle ASG Attachment Migrations (Prod)
