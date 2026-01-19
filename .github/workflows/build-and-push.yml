@@ -535,11 +535,17 @@ jobs:
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================================
-  # DEPLOY SANDBOX - Waits for all parallel jobs to complete
+  # DEPLOY SANDBOX - Split into parallel jobs for faster deploys
   # ============================================================================
-  deploy-sandbox:
-    name: Deploy to Sandbox
-    needs: [setup, test, build, terraform-plan]  # Waits for all parallel jobs
+  # Job dependency graph:
+  #   deploy-sandbox-infra → deploy-sandbox-server → deploy-sandbox-ac ─┬─→ deploy-sandbox-validate
+  #                                                 → deploy-sandbox-console ─┘
+  # AC and Console run in parallel after Server completes (~9 min savings)
+  # ============================================================================
+
+  deploy-sandbox-infra:
+    name: Deploy Sandbox - Infrastructure
+    needs: [setup, test, build, terraform-plan]
     if: |
       always() &&
       (needs.test.result == 'success' || needs.test.result == 'skipped') &&
@@ -551,7 +557,13 @@ jobs:
       )
     runs-on: ubuntu-latest
     environment: sandbox
-    timeout-minutes: 30
+    timeout-minutes: 10
+    outputs:
+      server_asg: ${{ steps.outputs.outputs.server_asg }}
+      ac_asg: ${{ steps.outputs.outputs.ac_asg }}
+      console_ec2_asg: ${{ steps.outputs.outputs.console_ec2_asg }}
+      nlb_dns: ${{ steps.outputs.outputs.nlb_dns }}
+      etcd_endpoint: ${{ steps.outputs.outputs.etcd_endpoint }}
     steps:
       - name: Checkout code
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -663,10 +675,23 @@ jobs:
           echo "nlb_dns=$(terraform output -raw nlb_dns_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
           echo "etcd_endpoint=$(terraform output -raw etcd_endpoint 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
 
+  deploy-sandbox-server:
+    name: Deploy Sandbox - NHP Server
+    needs: [deploy-sandbox-infra]
+    if: always() && needs.deploy-sandbox-infra.result == 'success' && needs.deploy-sandbox-infra.outputs.server_asg != ''
+    runs-on: ubuntu-latest
+    environment: sandbox
+    timeout-minutes: 25
+    steps:
+      - name: Setup deploy environment
+        uses: ./.github/actions/setup-deploy
+        with:
+          aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
       - name: Canary Deploy - NHP Server
-        if: steps.outputs.outputs.server_asg != ''
         env:
-          ASG_NAME: ${{ steps.outputs.outputs.server_asg }}
+          ASG_NAME: ${{ needs.deploy-sandbox-infra.outputs.server_asg }}
         run: |
           echo "============================================"
           echo "CANARY DEPLOYMENT - NHP Server"
@@ -758,10 +783,23 @@ jobs:
             esac
           done
 
+  deploy-sandbox-ac:
+    name: Deploy Sandbox - AC
+    needs: [deploy-sandbox-server, deploy-sandbox-infra]
+    if: always() && needs.deploy-sandbox-server.result == 'success' && needs.deploy-sandbox-infra.outputs.ac_asg != ''
+    runs-on: ubuntu-latest
+    environment: sandbox
+    timeout-minutes: 15
+    steps:
+      - name: Setup deploy environment
+        uses: ./.github/actions/setup-deploy
+        with:
+          aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
       - name: Canary Deploy - AC
-        if: steps.outputs.outputs.ac_asg != ''
         env:
-          ASG_NAME: ${{ steps.outputs.outputs.ac_asg }}
+          ASG_NAME: ${{ needs.deploy-sandbox-infra.outputs.ac_asg }}
         run: |
           echo "============================================"
           echo "CANARY DEPLOYMENT - Access Controller"
@@ -851,10 +889,23 @@ jobs:
             esac
           done
 
+  deploy-sandbox-console:
+    name: Deploy Sandbox - Console EC2
+    needs: [deploy-sandbox-server, deploy-sandbox-infra]
+    if: always() && needs.deploy-sandbox-server.result == 'success' && needs.deploy-sandbox-infra.outputs.console_ec2_asg != ''
+    runs-on: ubuntu-latest
+    environment: sandbox
+    timeout-minutes: 15
+    steps:
+      - name: Setup deploy environment
+        uses: ./.github/actions/setup-deploy
+        with:
+          aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
       - name: Canary Deploy - Console EC2
-        if: steps.outputs.outputs.console_ec2_asg != ''
         env:
-          ASG_NAME: ${{ steps.outputs.outputs.console_ec2_asg }}
+          ASG_NAME: ${{ needs.deploy-sandbox-infra.outputs.console_ec2_asg }}
         run: |
           echo "============================================"
           echo "CANARY DEPLOYMENT - Console EC2"
@@ -910,6 +961,25 @@ jobs:
             esac
           done
 
+  deploy-sandbox-validate:
+    name: Deploy Sandbox - Validate
+    needs: [setup, deploy-sandbox-infra, deploy-sandbox-server, deploy-sandbox-ac, deploy-sandbox-console]
+    if: |
+      always() &&
+      needs.deploy-sandbox-infra.result == 'success' &&
+      needs.deploy-sandbox-server.result == 'success' &&
+      (needs.deploy-sandbox-ac.result == 'success' || needs.deploy-sandbox-ac.result == 'skipped') &&
+      (needs.deploy-sandbox-console.result == 'success' || needs.deploy-sandbox-console.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: sandbox
+    timeout-minutes: 10
+    steps:
+      - name: Setup deploy environment
+        uses: ./.github/actions/setup-deploy
+        with:
+          aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
       - name: Post-Deployment Validation
         run: |
           echo "============================================"
@@ -936,8 +1006,8 @@ jobs:
 
       - name: Run Integration Tests
         env:
-          NHP_SERVER_ENDPOINT: "${{ steps.outputs.outputs.nlb_dns }}:62206"
-          ETCD_ENDPOINTS: ${{ steps.outputs.outputs.etcd_endpoint }}
+          NHP_SERVER_ENDPOINT: "${{ needs.deploy-sandbox-infra.outputs.nlb_dns }}:62206"
+          ETCD_ENDPOINTS: ${{ needs.deploy-sandbox-infra.outputs.etcd_endpoint }}
           AWS_REGION: ${{ env.AWS_REGION }}
         run: |
           echo "============================================"
@@ -980,19 +1050,33 @@ jobs:
           }
 
       - name: Deployment Summary
+        env:
+          AC_RESULT: ${{ needs.deploy-sandbox-ac.result }}
+          CONSOLE_RESULT: ${{ needs.deploy-sandbox-console.result }}
         run: |
+          # Map job result to friendly status
+          friendly_status() {
+            case "$1" in
+              success) echo "Deployed ✓" ;;
+              failure) echo "Failed ✗" ;;
+              skipped) echo "Skipped" ;;
+              cancelled) echo "Cancelled" ;;
+              *) echo "$1" ;;
+            esac
+          }
+
           echo "## Sandbox Deployment Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Infrastructure" >> $GITHUB_STEP_SUMMARY
           echo "| Component | ASG | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-----------|-----|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| NHP Server | ${{ steps.outputs.outputs.server_asg }} | Deployed |" >> $GITHUB_STEP_SUMMARY
-          echo "| AC | ${{ steps.outputs.outputs.ac_asg }} | Deployed |" >> $GITHUB_STEP_SUMMARY
-          echo "| Console EC2 | ${{ steps.outputs.outputs.console_ec2_asg || 'N/A' }} | ${{ steps.outputs.outputs.console_ec2_asg && 'Deployed' || 'Skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| NHP Server | ${{ needs.deploy-sandbox-infra.outputs.server_asg }} | Deployed ✓ |" >> $GITHUB_STEP_SUMMARY
+          echo "| AC | ${{ needs.deploy-sandbox-infra.outputs.ac_asg }} | $(friendly_status "$AC_RESULT") |" >> $GITHUB_STEP_SUMMARY
+          echo "| Console EC2 | ${{ needs.deploy-sandbox-infra.outputs.console_ec2_asg || 'N/A' }} | $(friendly_status "$CONSOLE_RESULT") |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Endpoints" >> $GITHUB_STEP_SUMMARY
-          echo "- **NHP NLB:** \`${{ steps.outputs.outputs.nlb_dns }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **etcd:** \`${{ steps.outputs.outputs.etcd_endpoint }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **NHP NLB:** \`${{ needs.deploy-sandbox-infra.outputs.nlb_dns }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **etcd:** \`${{ needs.deploy-sandbox-infra.outputs.etcd_endpoint }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Image Tag:** \`${{ needs.setup.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -1002,10 +1086,18 @@ jobs:
           echo "- E2E demo flow tests executed" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================================
-  # DEPLOY PROD
+  # DEPLOY PROD - Split into separate jobs (sequential - no Console to parallelize)
   # ============================================================================
-  deploy-prod:
-    name: Deploy to Production
+  # Job dependency graph:
+  #   deploy-prod-infra → deploy-prod-server → deploy-prod-ac → deploy-prod-validate
+  #
+  # Note: Production doesn't have Console EC2. Unlike sandbox where AC and Console
+  # run in parallel after Server, production runs sequentially. This is intentional -
+  # there's no time savings from splitting without a parallel workload.
+  # ============================================================================
+
+  deploy-prod-infra:
+    name: Deploy Prod - Infrastructure
     needs: [setup, test, build, terraform-plan]
     if: |
       always() &&
@@ -1015,7 +1107,12 @@ jobs:
       github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'prod'
     runs-on: ubuntu-latest
     environment: production
-    timeout-minutes: 30
+    timeout-minutes: 10
+    outputs:
+      server_asg: ${{ steps.outputs.outputs.server_asg }}
+      ac_asg: ${{ steps.outputs.outputs.ac_asg }}
+      nlb_dns: ${{ steps.outputs.outputs.nlb_dns }}
+      etcd_endpoint: ${{ steps.outputs.outputs.etcd_endpoint }}
     steps:
       - name: Checkout code
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -1112,10 +1209,23 @@ jobs:
           echo "nlb_dns=$(terraform output -raw nlb_dns_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
           echo "etcd_endpoint=$(terraform output -raw etcd_endpoint 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
 
+  deploy-prod-server:
+    name: Deploy Prod - NHP Server
+    needs: [deploy-prod-infra]
+    if: always() && needs.deploy-prod-infra.result == 'success' && needs.deploy-prod-infra.outputs.server_asg != ''
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 25
+    steps:
+      - name: Setup deploy environment
+        uses: ./.github/actions/setup-deploy
+        with:
+          aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
       - name: Canary Deploy - NHP Server (Production)
-        if: steps.outputs.outputs.server_asg != ''
         env:
-          ASG_NAME: ${{ steps.outputs.outputs.server_asg }}
+          ASG_NAME: ${{ needs.deploy-prod-infra.outputs.server_asg }}
         run: |
           echo "============================================"
           echo "CANARY DEPLOYMENT - NHP Server (PROD)"
@@ -1165,10 +1275,23 @@ jobs:
             fi
           done
 
+  deploy-prod-ac:
+    name: Deploy Prod - AC
+    needs: [deploy-prod-server, deploy-prod-infra]
+    if: always() && needs.deploy-prod-server.result == 'success' && needs.deploy-prod-infra.outputs.ac_asg != ''
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Setup deploy environment
+        uses: ./.github/actions/setup-deploy
+        with:
+          aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
       - name: Canary Deploy - AC (Production)
-        if: steps.outputs.outputs.ac_asg != ''
         env:
-          ASG_NAME: ${{ steps.outputs.outputs.ac_asg }}
+          ASG_NAME: ${{ needs.deploy-prod-infra.outputs.ac_asg }}
         run: |
           echo "============================================"
           echo "CANARY DEPLOYMENT - AC (PROD)"
@@ -1217,6 +1340,24 @@ jobs:
             fi
           done
 
+  deploy-prod-validate:
+    name: Deploy Prod - Validate
+    needs: [setup, deploy-prod-infra, deploy-prod-server, deploy-prod-ac]
+    if: |
+      always() &&
+      needs.deploy-prod-infra.result == 'success' &&
+      needs.deploy-prod-server.result == 'success' &&
+      (needs.deploy-prod-ac.result == 'success' || needs.deploy-prod-ac.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Setup deploy environment
+        uses: ./.github/actions/setup-deploy
+        with:
+          aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
       - name: Post-Deployment Validation (Production)
         run: |
           echo "============================================"
@@ -1240,8 +1381,8 @@ jobs:
 
       - name: Run Integration Tests (Production)
         env:
-          NHP_SERVER_ENDPOINT: "${{ steps.outputs.outputs.nlb_dns }}:62206"
-          ETCD_ENDPOINTS: ${{ steps.outputs.outputs.etcd_endpoint }}
+          NHP_SERVER_ENDPOINT: "${{ needs.deploy-prod-infra.outputs.nlb_dns }}:62206"
+          ETCD_ENDPOINTS: ${{ needs.deploy-prod-infra.outputs.etcd_endpoint }}
           AWS_REGION: ${{ env.AWS_REGION }}
         run: |
           echo "============================================"
@@ -1275,18 +1416,31 @@ jobs:
           }
 
       - name: Production Deployment Summary
+        env:
+          AC_RESULT: ${{ needs.deploy-prod-ac.result }}
         run: |
+          # Map job result to friendly status
+          friendly_status() {
+            case "$1" in
+              success) echo "Deployed ✓" ;;
+              failure) echo "Failed ✗" ;;
+              skipped) echo "Skipped" ;;
+              cancelled) echo "Cancelled" ;;
+              *) echo "$1" ;;
+            esac
+          }
+
           echo "## Production Deployment Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Infrastructure" >> $GITHUB_STEP_SUMMARY
           echo "| Component | ASG | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-----------|-----|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| NHP Server | ${{ steps.outputs.outputs.server_asg }} | Deployed |" >> $GITHUB_STEP_SUMMARY
-          echo "| AC | ${{ steps.outputs.outputs.ac_asg }} | Deployed |" >> $GITHUB_STEP_SUMMARY
+          echo "| NHP Server | ${{ needs.deploy-prod-infra.outputs.server_asg }} | Deployed ✓ |" >> $GITHUB_STEP_SUMMARY
+          echo "| AC | ${{ needs.deploy-prod-infra.outputs.ac_asg }} | $(friendly_status "$AC_RESULT") |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Endpoints" >> $GITHUB_STEP_SUMMARY
-          echo "- **NHP NLB:** \`${{ steps.outputs.outputs.nlb_dns }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **etcd:** \`${{ steps.outputs.outputs.etcd_endpoint }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **NHP NLB:** \`${{ needs.deploy-prod-infra.outputs.nlb_dns }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **etcd:** \`${{ needs.deploy-prod-infra.outputs.etcd_endpoint }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Image Tag:** \`${{ needs.setup.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -1300,7 +1454,21 @@ jobs:
   # ============================================================================
   notify:
     name: Notify
-    needs: [setup, test, build, deploy-sandbox, deploy-prod]
+    needs:
+      - setup
+      - test
+      - build
+      # Sandbox deploy jobs
+      - deploy-sandbox-infra
+      - deploy-sandbox-server
+      - deploy-sandbox-ac
+      - deploy-sandbox-console
+      - deploy-sandbox-validate
+      # Prod deploy jobs
+      - deploy-prod-infra
+      - deploy-prod-server
+      - deploy-prod-ac
+      - deploy-prod-validate
     if: always() && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1308,10 +1476,21 @@ jobs:
       - name: Notify Slack
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # Build phase
           TEST_RESULT: ${{ needs.test.result }}
           BUILD_RESULT: ${{ needs.build.result }}
-          DEPLOY_SANDBOX_RESULT: ${{ needs.deploy-sandbox.result }}
-          DEPLOY_PROD_RESULT: ${{ needs.deploy-prod.result }}
+          # Sandbox deploy components
+          SANDBOX_INFRA: ${{ needs.deploy-sandbox-infra.result }}
+          SANDBOX_SERVER: ${{ needs.deploy-sandbox-server.result }}
+          SANDBOX_AC: ${{ needs.deploy-sandbox-ac.result }}
+          SANDBOX_CONSOLE: ${{ needs.deploy-sandbox-console.result }}
+          SANDBOX_VALIDATE: ${{ needs.deploy-sandbox-validate.result }}
+          # Prod deploy components
+          PROD_INFRA: ${{ needs.deploy-prod-infra.result }}
+          PROD_SERVER: ${{ needs.deploy-prod-server.result }}
+          PROD_AC: ${{ needs.deploy-prod-ac.result }}
+          PROD_VALIDATE: ${{ needs.deploy-prod-validate.result }}
+          # Metadata
           IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
           ENVIRONMENT: ${{ needs.setup.outputs.environment }}
         run: |
@@ -1324,29 +1503,85 @@ jobs:
           SHORT_SHA="${{ github.sha }}"
           SHORT_SHA="${SHORT_SHA:0:7}"
 
+          # Helper to convert result to emoji
+          status_emoji() {
+            case "$1" in
+              success) echo "white_check_mark" ;;
+              failure) echo "x" ;;
+              cancelled) echo "warning" ;;
+              skipped) echo "white_circle" ;;
+              *) echo "question" ;;
+            esac
+          }
+
+          # Check if any sandbox deploy ran
+          SANDBOX_DEPLOYED="false"
+          if [[ "$SANDBOX_INFRA" != "skipped" ]]; then
+            SANDBOX_DEPLOYED="true"
+          fi
+
+          # Check if any prod deploy ran
+          PROD_DEPLOYED="false"
+          if [[ "$PROD_INFRA" != "skipped" ]]; then
+            PROD_DEPLOYED="true"
+          fi
+
+          # Build component status strings
+          SANDBOX_STATUS=""
+          if [[ "$SANDBOX_DEPLOYED" == "true" ]]; then
+            SANDBOX_STATUS=":$(status_emoji "$SANDBOX_INFRA"): Infra"
+            SANDBOX_STATUS="$SANDBOX_STATUS  :$(status_emoji "$SANDBOX_SERVER"): Server"
+            SANDBOX_STATUS="$SANDBOX_STATUS  :$(status_emoji "$SANDBOX_AC"): AC"
+            if [[ "$SANDBOX_CONSOLE" != "skipped" ]]; then
+              SANDBOX_STATUS="$SANDBOX_STATUS  :$(status_emoji "$SANDBOX_CONSOLE"): Console"
+            fi
+            SANDBOX_STATUS="$SANDBOX_STATUS  :$(status_emoji "$SANDBOX_VALIDATE"): Validate"
+          fi
+
+          PROD_STATUS=""
+          if [[ "$PROD_DEPLOYED" == "true" ]]; then
+            PROD_STATUS=":$(status_emoji "$PROD_INFRA"): Infra"
+            PROD_STATUS="$PROD_STATUS  :$(status_emoji "$PROD_SERVER"): Server"
+            PROD_STATUS="$PROD_STATUS  :$(status_emoji "$PROD_AC"): AC"
+            PROD_STATUS="$PROD_STATUS  :$(status_emoji "$PROD_VALIDATE"): Validate"
+          fi
+
           # Determine overall status
           if [[ "$BUILD_RESULT" == "success" ]]; then
-            if [[ "$DEPLOY_SANDBOX_RESULT" == "success" || "$DEPLOY_PROD_RESULT" == "success" ]]; then
+            # Check for any deploy or validation failures
+            DEPLOY_FAILED="false"
+            for result in "$SANDBOX_INFRA" "$SANDBOX_SERVER" "$SANDBOX_AC" "$SANDBOX_CONSOLE" "$SANDBOX_VALIDATE" "$PROD_INFRA" "$PROD_SERVER" "$PROD_AC" "$PROD_VALIDATE"; do
+              if [[ "$result" == "failure" ]]; then
+                DEPLOY_FAILED="true"
+                break
+              fi
+            done
+
+            if [[ "$SANDBOX_VALIDATE" == "success" || "$PROD_VALIDATE" == "success" ]]; then
               COLOR="#36a64f"
               EMOJI="ok"
               STATUS="successful"
               DETAILS="Build and deploy completed"
-            elif [[ "$DEPLOY_SANDBOX_RESULT" == "skipped" && "$DEPLOY_PROD_RESULT" == "skipped" ]]; then
+            elif [[ "$DEPLOY_FAILED" == "true" ]]; then
+              COLOR="#dc3545"
+              EMOJI="error"
+              STATUS="failed"
+              DETAILS="Deploy failed - see component status"
+            elif [[ "$SANDBOX_DEPLOYED" == "false" && "$PROD_DEPLOYED" == "false" ]]; then
               COLOR="#36a64f"
               EMOJI="ok"
               STATUS="successful"
               DETAILS="Build completed (deploy skipped)"
-            elif [[ "$DEPLOY_SANDBOX_RESULT" == "cancelled" || "$DEPLOY_PROD_RESULT" == "cancelled" ]]; then
-              # Cancelled is not a failure - usually means a newer run superseded this one
+            elif [[ "$SANDBOX_INFRA" == "cancelled" || "$PROD_INFRA" == "cancelled" ]]; then
               COLOR="#ffc107"
               EMOJI="warning"
               STATUS="cancelled"
-              DETAILS="Build succeeded, deploy cancelled (superseded by newer run)"
+              DETAILS="Build succeeded, deploy cancelled"
             else
               COLOR="#dc3545"
               EMOJI="error"
               STATUS="failed"
-              DETAILS="Build succeeded but deploy failed"
+              DETAILS="Deploy incomplete - check workflow"
             fi
           elif [[ "$BUILD_RESULT" == "failure" || "$TEST_RESULT" == "failure" ]]; then
             COLOR="#dc3545"
@@ -1366,57 +1601,87 @@ jobs:
           fi
 
           # Determine environment
-          if [[ "$DEPLOY_PROD_RESULT" == "success" ]]; then
+          if [[ "$PROD_DEPLOYED" == "true" ]]; then
             DEPLOY_ENV="production"
-          elif [[ "$DEPLOY_SANDBOX_RESULT" == "success" ]]; then
+          elif [[ "$SANDBOX_DEPLOYED" == "true" ]]; then
             DEPLOY_ENV="sandbox"
           else
             DEPLOY_ENV="build-only"
           fi
+
+          # Build the blocks array
+          BLOCKS="[
+            {
+              \"type\": \"section\",
+              \"text\": {
+                \"type\": \"mrkdwn\",
+                \"text\": \":$EMOJI: *NHP* build $STATUS\"
+              }
+            },
+            {
+              \"type\": \"section\",
+              \"fields\": [
+                {
+                  \"type\": \"mrkdwn\",
+                  \"text\": \"*Environment:*\n$DEPLOY_ENV\"
+                },
+                {
+                  \"type\": \"mrkdwn\",
+                  \"text\": \"*Branch:*\n${{ github.ref_name }}\"
+                },
+                {
+                  \"type\": \"mrkdwn\",
+                  \"text\": \"*Tests:*\n:$(status_emoji "$TEST_RESULT"): $TEST_RESULT\"
+                },
+                {
+                  \"type\": \"mrkdwn\",
+                  \"text\": \"*Build:*\n:$(status_emoji "$BUILD_RESULT"): $BUILD_RESULT\"
+                }
+              ]
+            }"
+
+          # Add sandbox component status if deployed
+          if [[ "$SANDBOX_DEPLOYED" == "true" ]]; then
+            BLOCKS="$BLOCKS,
+            {
+              \"type\": \"section\",
+              \"text\": {
+                \"type\": \"mrkdwn\",
+                \"text\": \"*Sandbox:* $SANDBOX_STATUS\"
+              }
+            }"
+          fi
+
+          # Add prod component status if deployed
+          if [[ "$PROD_DEPLOYED" == "true" ]]; then
+            BLOCKS="$BLOCKS,
+            {
+              \"type\": \"section\",
+              \"text\": {
+                \"type\": \"mrkdwn\",
+                \"text\": \"*Production:* $PROD_STATUS\"
+              }
+            }"
+          fi
+
+          # Add context footer
+          BLOCKS="$BLOCKS,
+            {
+              \"type\": \"context\",
+              \"elements\": [
+                {
+                  \"type\": \"mrkdwn\",
+                  \"text\": \"$DETAILS | <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|$SHORT_SHA> | <$WORKFLOW_URL|View workflow>\"
+                }
+              ]
+            }
+          ]"
 
           curl -sfS -X POST "$SLACK_WEBHOOK" \
             -H "Content-Type: application/json" \
             -d "{
               \"attachments\": [{
                 \"color\": \"$COLOR\",
-                \"blocks\": [
-                  {
-                    \"type\": \"section\",
-                    \"text\": {
-                      \"type\": \"mrkdwn\",
-                      \"text\": \"$EMOJI *NHP* build $STATUS\"
-                    }
-                  },
-                  {
-                    \"type\": \"section\",
-                    \"fields\": [
-                      {
-                        \"type\": \"mrkdwn\",
-                        \"text\": \"*Environment:*\n$DEPLOY_ENV\"
-                      },
-                      {
-                        \"type\": \"mrkdwn\",
-                        \"text\": \"*Branch:*\n${{ github.ref_name }}\"
-                      },
-                      {
-                        \"type\": \"mrkdwn\",
-                        \"text\": \"*Tests:*\n$TEST_RESULT\"
-                      },
-                      {
-                        \"type\": \"mrkdwn\",
-                        \"text\": \"*Build:*\n$BUILD_RESULT\"
-                      }
-                    ]
-                  },
-                  {
-                    \"type\": \"context\",
-                    \"elements\": [
-                      {
-                        \"type\": \"mrkdwn\",
-                        \"text\": \"$DETAILS | <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|$SHORT_SHA> | <$WORKFLOW_URL|View workflow>\"
-                      }
-                    ]
-                  }
-                ]
+                \"blocks\": $BLOCKS
               }]
             }" || echo "Slack notification failed (non-critical)"
