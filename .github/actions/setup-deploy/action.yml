@@ -1,5 +1,5 @@
-name: 'Setup Deploy Environment'
-description: 'Checkout code and configure AWS credentials for deploy jobs'
+name: 'Configure AWS Deploy Credentials'
+description: 'Configure AWS credentials for deploy jobs. Must be called AFTER actions/checkout.'
 
 inputs:
   aws-role-arn:
@@ -13,9 +13,6 @@ inputs:
 runs:
   using: 'composite'
   steps:
-    - name: Checkout code
-      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
       with:

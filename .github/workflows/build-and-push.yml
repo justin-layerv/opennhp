@@ -683,7 +683,10 @@ jobs:
     environment: sandbox
     timeout-minutes: 25
     steps:
-      - name: Setup deploy environment
+      - name: Checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Configure AWS credentials
         uses: ./.github/actions/setup-deploy
         with:
           aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
@@ -791,7 +794,10 @@ jobs:
     environment: sandbox
     timeout-minutes: 15
     steps:
-      - name: Setup deploy environment
+      - name: Checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Configure AWS credentials
         uses: ./.github/actions/setup-deploy
         with:
           aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
@@ -897,7 +903,10 @@ jobs:
     environment: sandbox
     timeout-minutes: 15
     steps:
-      - name: Setup deploy environment
+      - name: Checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Configure AWS credentials
         uses: ./.github/actions/setup-deploy
         with:
           aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
@@ -974,7 +983,10 @@ jobs:
     environment: sandbox
     timeout-minutes: 10
     steps:
-      - name: Setup deploy environment
+      - name: Checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Configure AWS credentials
         uses: ./.github/actions/setup-deploy
         with:
           aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
@@ -1217,7 +1229,10 @@ jobs:
     environment: production
     timeout-minutes: 25
     steps:
-      - name: Setup deploy environment
+      - name: Checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Configure AWS credentials
         uses: ./.github/actions/setup-deploy
         with:
           aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
@@ -1283,7 +1298,10 @@ jobs:
     environment: production
     timeout-minutes: 15
     steps:
-      - name: Setup deploy environment
+      - name: Checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Configure AWS credentials
         uses: ./.github/actions/setup-deploy
         with:
           aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
@@ -1352,7 +1370,10 @@ jobs:
     environment: production
     timeout-minutes: 10
     steps:
-      - name: Setup deploy environment
+      - name: Checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Configure AWS credentials
         uses: ./.github/actions/setup-deploy
         with:
           aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
