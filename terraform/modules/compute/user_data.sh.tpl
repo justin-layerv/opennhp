@@ -100,13 +100,16 @@ AesKey = "${auth_aes_key}"
 
 [webrtc]
 Enable = false
+CONFIGEOF
 
 # ============================================================================
-# Storage Backend Configuration (Phase 4)
+# Storage Backend Configuration - Separate file (storage.toml)
+# Server looks for storage.toml specifically, not config.toml [Storage] section.
 # Controls where AC assignments, licenses, and resources are stored.
 # - "dynamodb" (default): AWS DynamoDB for cloud deployments
 # - "etcd": etcd for on-prem deployments (feature flag)
 # ============================================================================
+cat > /opt/layerv/nhp-server/etc/storage.toml << STORAGEEOF
 [Storage]
 Backend = "${storage_backend}"
 
@@ -140,7 +143,7 @@ MaxEntries = 10000
 DefaultTTL = 60
 ReassignmentTTL = 5
 ReassignmentWindow = 300
-CONFIGEOF
+STORAGEEOF
 
 # NHP Server uses local config.toml for base config (UDP port 62206)
 # Configure HTTP server for plugin endpoints (passcode login, OIDC, etc.)

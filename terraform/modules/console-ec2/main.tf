@@ -427,9 +427,10 @@ resource "aws_launch_template" "console" {
   }
 
   metadata_options {
-    http_endpoint               = "enabled"
-    http_tokens                 = "required"
-    http_put_response_hop_limit = 1
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+    # Hop limit 2 required for Docker containers to access IMDS through bridge network
+    http_put_response_hop_limit = 2
   }
 
   tags = var.tags
