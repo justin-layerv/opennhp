@@ -243,13 +243,14 @@ echo "WARNING: No license secret ARN configured, Console AC will use empty licen
 # Generate Curve25519 keypair for Console AC
 echo "Generating Curve25519 keypair for Console AC..."
 
-CONSOLE_AC_SECRET_NAME="${name_prefix}-console-ac-$INSTANCE_ID"
+# Static secret name - shared across instance replacements for stable AC identity
+CONSOLE_AC_SECRET_NAME="${name_prefix}-console-ac"
 
 # Check for existing keypair
 EXISTING_SECRET=$(aws secretsmanager get-secret-value --secret-id "$CONSOLE_AC_SECRET_NAME" --region "$REGION" --query SecretString --output text 2>/dev/null || echo "")
 
 if [ -n "$EXISTING_SECRET" ]; then
-  echo "Found existing keypair for this instance"
+  echo "Found existing Console AC keypair (shared across instances)"
   PRIVATE_KEY=$(echo "$EXISTING_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['privateKey'])")
   PUBLIC_KEY=$(echo "$EXISTING_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['publicKey'])")
 else
@@ -306,12 +307,12 @@ KEYGEN_EOF
   PRIVATE_KEY=$(echo "$KEYPAIR" | python3 -c "import sys,json; print(json.load(sys.stdin)['privateKey'])")
   PUBLIC_KEY=$(echo "$KEYPAIR" | python3 -c "import sys,json; print(json.load(sys.stdin)['publicKey'])")
 
-  # Store keypair in Secrets Manager
+  # Store keypair in Secrets Manager (shared across instance replacements)
   SECRET_VALUE=$(cat << SECRETEOF
 {
   "privateKey": "$PRIVATE_KEY",
   "publicKey": "$PUBLIC_KEY",
-  "instanceId": "$INSTANCE_ID",
+  "acId": "console-ac",
   "createdAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 SECRETEOF
@@ -325,23 +326,27 @@ SECRETEOF
     --name "$CONSOLE_AC_SECRET_NAME" \
     --secret-string "$SECRET_VALUE" \
     $KMS_ARG \
-    --tags "Key=Environment,Value=${internal_only ? "internal" : "external"}" "Key=InstanceId,Value=$INSTANCE_ID" \
+    --tags "Key=Environment,Value=${internal_only ? "internal" : "external"}" "Key=Component,Value=console-ac" \
     --region "$REGION" 2>/dev/null; then
     echo "Created new secret: $CONSOLE_AC_SECRET_NAME"
   else
-    aws secretsmanager put-secret-value \
-      --secret-id "$CONSOLE_AC_SECRET_NAME" \
-      --secret-string "$SECRET_VALUE" \
-      --region "$REGION"
-    echo "Updated existing secret: $CONSOLE_AC_SECRET_NAME"
+    # Secret creation failed - likely race condition with another instance, or IAM/KMS issue
+    echo "Secret creation failed, attempting to fetch existing keypair..."
+    EXISTING_SECRET=$(aws secretsmanager get-secret-value --secret-id "$CONSOLE_AC_SECRET_NAME" --region "$REGION" --query SecretString --output text) || {
+      echo "FATAL: Could not create or fetch Console AC secret. Check IAM permissions and KMS key access."
+      exit 1
+    }
+    PRIVATE_KEY=$(echo "$EXISTING_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['privateKey'])")
+    PUBLIC_KEY=$(echo "$EXISTING_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['publicKey'])")
+    echo "Using existing keypair from secret: $CONSOLE_AC_SECRET_NAME"
   fi
 fi
 
 echo "Console AC keypair ready (public key: $${PUBLIC_KEY:0:20}...)"
 
 # Console AC ID - used for both etcd registration and portal_sites config
-# Must be defined before etcd block since it's used regardless of storage backend
-CONSOLE_AC_ID="console-ac-$INSTANCE_ID"
+# Static ID ensures resource records remain valid across instance replacements
+CONSOLE_AC_ID="console-ac"
 export CONSOLE_AC_ID
 
 # ============================================================================
@@ -533,7 +538,7 @@ if [ -f "/opt/layerv/nhp-ac/nhp-acd" ]; then
 # NHP-AC Configuration for Console (infrastructure-managed)
 # This AC protects the Console's port 443 via iptables/ipset
 
-ACId = "console-ac-$INSTANCE_ID"
+ACId = "$CONSOLE_AC_ID"
 DefaultIp = "$LOCAL_IP"
 PrivateKeyBase64 = "$PRIVATE_KEY"
 DefaultCipherScheme = 0
@@ -1049,10 +1054,10 @@ docker run -d \
     -e "GVA_CONFIG_NHP_HEALTH_MONITOR_OPERATION_TIMEOUT_SECONDS=${nhp_health_monitor_operation_timeout}" \
 %{ if nhp_ac_repo_url != null ~}
     -e "GVA_CONFIG_NHP_CONSOLE_AC_ENABLED=true" \
-    -e "GVA_CONFIG_NHP_CONSOLE_AC_SECRET_PREFIX=${name_prefix}-console-ac-" \
+    -e "GVA_CONFIG_NHP_CONSOLE_AC_SECRET_NAME=${name_prefix}-console-ac" \
+    -e "GVA_CONFIG_NHP_CONSOLE_AC_ID=console-ac" \
     -e "GVA_CONFIG_NHP_CONSOLE_AC_RESOURCE_FQDN=${protected_hostname != null ? protected_hostname : domain_name}" \
     -e "GVA_CONFIG_NHP_CONSOLE_AC_CUSTOMER_ID=${nhp_console_ac_customer_id}" \
-    -e "GVA_CONFIG_NHP_CONSOLE_AC_INSTANCE_ID=$INSTANCE_ID" \
 %{ endif ~}
     "$CONSOLE_IMAGE"
 

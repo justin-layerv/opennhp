@@ -109,6 +109,10 @@ if [ -d "/opt/layerv/nhp-ac-extracted" ]; then
   cp -r /opt/layerv/nhp-ac-extracted/* /opt/layerv/nhp-ac/
 fi
 
+# Remove server.toml from release artifact - cloud mode uses ServerEndpoint in config.toml
+# The release artifact may contain stale development server addresses
+rm -f /opt/layerv/nhp-ac/etc/server.toml
+
 # Extract iptables defaults script
 docker cp "$CONTAINER_ID:/iptables_defaults.sh" /opt/layerv/nhp-ac/iptables_defaults.sh || true
 chmod +x /opt/layerv/nhp-ac/iptables_defaults.sh 2>/dev/null || true

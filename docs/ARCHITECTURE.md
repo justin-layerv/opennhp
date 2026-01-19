@@ -251,17 +251,16 @@ When Console EC2 runs an embedded nhp-acd daemon, Console registers its own AC o
 3. HTTP server starts, `/health` returns OK
 4. user_data starts nhp-acd (which can now find its assignment in DynamoDB)
 
-> **Note:** Docker containers cannot access EC2 IMDS (169.254.169.254) due to bridge networking.
-> The instance ID must be passed via `GVA_CONFIG_NHP_CONSOLE_AC_INSTANCE_ID` environment variable.
-> user_data.sh.tpl fetches the instance ID from IMDS on the host and passes it to Docker.
+> **Note:** Console AC uses a static AC ID (`console-ac`) that persists across instance replacements.
+> This ensures resource records in Console DB remain valid after deployments.
 
 **Environment Variables (set by Terraform):**
 ```bash
 GVA_CONFIG_NHP_CONSOLE_AC_ENABLED=true
-GVA_CONFIG_NHP_CONSOLE_AC_SECRET_PREFIX=nhp-sandbox-console-ac-
+GVA_CONFIG_NHP_CONSOLE_AC_SECRET_NAME=nhp-sandbox-console-ac
+GVA_CONFIG_NHP_CONSOLE_AC_ID=console-ac
 GVA_CONFIG_NHP_CONSOLE_AC_RESOURCE_FQDN=console.apps.layerv.xyz
 GVA_CONFIG_NHP_CONSOLE_AC_CUSTOMER_ID=layerv
-GVA_CONFIG_NHP_CONSOLE_AC_INSTANCE_ID=$INSTANCE_ID  # Required for Docker
 ```
 
 ---

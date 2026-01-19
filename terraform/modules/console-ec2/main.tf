@@ -746,15 +746,15 @@ resource "aws_route53_record" "protected" {
   }
 }
 
-# ==================== ASG Lifecycle Hook for Cleanup ====================
-# Cleans up orphaned resources when Console EC2 instances terminate:
-# - AC assignments in DynamoDB
-# - AC keypair secrets in Secrets Manager
+# ==================== ASG Lifecycle Hook ====================
+# Handles Console EC2 instance termination lifecycle events.
+# Note: Console AC uses static ID - resources are shared across instances,
+# so no cleanup is needed (just completes the lifecycle action).
 
-# Lambda function to clean up resources on instance termination
+# Lambda function to handle instance termination lifecycle hook
 resource "aws_lambda_function" "console_cleanup" {
   function_name = "${local.console_name}-cleanup"
-  description   = "Cleans up Console AC resources on instance termination"
+  description   = "Handles Console EC2 instance termination lifecycle hook"
   runtime       = "python3.12"
   handler       = "index.handler"
   timeout       = 30
@@ -767,8 +767,7 @@ resource "aws_lambda_function" "console_cleanup" {
 
   environment {
     variables = {
-      DYNAMODB_TABLE = var.nhp_dynamodb_ac_assignments_table != null ? var.nhp_dynamodb_ac_assignments_table : ""
-      SECRET_PREFIX  = "${var.name_prefix}-console-ac-"
+      # Static Console AC - no cleanup needed, just complete lifecycle action
       AWS_REGION_VAR = data.aws_region.current.id
     }
   }
@@ -792,12 +791,13 @@ import os
 
 def handler(event, context):
     """
-    Clean up Console AC resources when an EC2 instance terminates.
+    Handle Console EC2 instance termination lifecycle hook.
 
     Triggered by ASG lifecycle hook via EventBridge.
-    Deletes:
-    - AC assignment from DynamoDB (console-ac-{instance_id})
-    - AC keypair from Secrets Manager ({prefix}{instance_id})
+
+    NOTE: Console AC resources (DynamoDB assignment, Secrets Manager keypair)
+    are NOT deleted because they use a static AC ID shared across instance
+    replacements. This ensures the resource records in Console DB remain valid.
     """
     print(f"Received event: {json.dumps(event)}")
 
@@ -806,44 +806,13 @@ def handler(event, context):
     instance_id = detail.get('EC2InstanceId')
 
     if not instance_id:
-        print("No instance ID found in event, skipping cleanup")
+        print("No instance ID found in event, skipping")
         return {'statusCode': 200, 'body': 'No instance ID'}
 
-    print(f"Cleaning up resources for instance: {instance_id}")
+    print(f"Instance terminating: {instance_id}")
+    print("Console AC uses static ID - no cleanup needed (resources shared across instances)")
 
     region = os.environ.get('AWS_REGION_VAR', os.environ.get('AWS_REGION', 'us-east-2'))
-    dynamodb_table = os.environ.get('DYNAMODB_TABLE', '')
-    secret_prefix = os.environ.get('SECRET_PREFIX', '')
-
-    # Clean up DynamoDB AC assignment
-    if dynamodb_table:
-        try:
-            dynamodb = boto3.client('dynamodb', region_name=region)
-            ac_id = f"console-ac-{instance_id}"
-
-            dynamodb.delete_item(
-                TableName=dynamodb_table,
-                Key={'ac_id': {'S': ac_id}}
-            )
-            print(f"Deleted DynamoDB assignment: {ac_id}")
-        except Exception as e:
-            print(f"Failed to delete DynamoDB assignment: {e}")
-
-    # Clean up Secrets Manager keypair
-    if secret_prefix:
-        try:
-            secrets = boto3.client('secretsmanager', region_name=region)
-            secret_name = f"{secret_prefix}{instance_id}"
-
-            secrets.delete_secret(
-                SecretId=secret_name,
-                ForceDeleteWithoutRecovery=True
-            )
-            print(f"Deleted secret: {secret_name}")
-        except secrets.exceptions.ResourceNotFoundException:
-            print(f"Secret not found (already deleted): {secret_name}")
-        except Exception as e:
-            print(f"Failed to delete secret: {e}")
 
     # Complete the lifecycle action
     asg_name = detail.get('AutoScalingGroupName')
@@ -863,7 +832,7 @@ def handler(event, context):
         except Exception as e:
             print(f"Failed to complete lifecycle action: {e}")
 
-    return {'statusCode': 200, 'body': f'Cleaned up {instance_id}'}
+    return {'statusCode': 200, 'body': f'Lifecycle completed for {instance_id}'}
 PYTHON
     filename = "index.py"
   }
@@ -907,22 +876,6 @@ resource "aws_iam_role_policy" "cleanup_lambda" {
           "logs:PutLogEvents"
         ]
         Resource = "arn:aws:logs:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.console_name}-cleanup:*"
-      },
-      {
-        Sid    = "DynamoDBCleanup"
-        Effect = "Allow"
-        Action = [
-          "dynamodb:DeleteItem"
-        ]
-        Resource = var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}" : "*"
-      },
-      {
-        Sid    = "SecretsManagerCleanup"
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:DeleteSecret"
-        ]
-        Resource = "arn:aws:secretsmanager:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}-console-ac-*"
       },
       {
         Sid    = "ASGLifecycleComplete"
