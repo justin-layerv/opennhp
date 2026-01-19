@@ -95,6 +95,7 @@ jobs:
     outputs:
       image_tag: ${{ steps.meta.outputs.image_tag }}
       environment: ${{ steps.meta.outputs.environment }}
+      start_time: ${{ steps.meta.outputs.start_time }}
     steps:
       - name: Set metadata
         id: meta
@@ -107,6 +108,7 @@ jobs:
             echo "environment=dev" >> $GITHUB_OUTPUT
           fi
           echo "image_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "start_time=$(date +%s)" >> $GITHUB_OUTPUT
 
   # ============================================================================
   # TEST - Runs in parallel with build and terraform-plan
@@ -1514,6 +1516,7 @@ jobs:
           # Metadata
           IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
           ENVIRONMENT: ${{ needs.setup.outputs.environment }}
+          START_TIME: ${{ needs.setup.outputs.start_time }}
         run: |
           if [[ -z "$SLACK_WEBHOOK" ]]; then
             echo "SLACK_WEBHOOK_URL not configured, skipping notification"
@@ -1524,14 +1527,46 @@ jobs:
           SHORT_SHA="${{ github.sha }}"
           SHORT_SHA="${SHORT_SHA:0:7}"
 
+          # Calculate duration with sanity check
+          END_TIME=$(date +%s)
+          if [[ -n "$START_TIME" ]]; then
+            DURATION_SECS=$((END_TIME - START_TIME))
+            # Sanity check: negative or > 24 hours indicates clock issues
+            if [[ $DURATION_SECS -lt 0 || $DURATION_SECS -gt 86400 ]]; then
+              DURATION="unknown"
+            else
+              DURATION_MINS=$((DURATION_SECS / 60))
+              DURATION_REMAINING_SECS=$((DURATION_SECS % 60))
+              DURATION="${DURATION_MINS}m ${DURATION_REMAINING_SECS}s"
+            fi
+          else
+            DURATION="unknown"
+          fi
+
+          # Determine trigger source
+          TRIGGER="${{ github.event_name }}"
+          case "$TRIGGER" in
+            push)
+              if [[ "${{ github.event.head_commit.message }}" == *"Merge pull request"* ]]; then
+                TRIGGER_TEXT="PR merge"
+              else
+                TRIGGER_TEXT="Push"
+              fi
+              ;;
+            pull_request) TRIGGER_TEXT="PR" ;;
+            workflow_dispatch) TRIGGER_TEXT="Manual" ;;
+            schedule) TRIGGER_TEXT="Scheduled" ;;
+            *) TRIGGER_TEXT="$TRIGGER" ;;
+          esac
+
           # Helper to convert result to emoji
           status_emoji() {
             case "$1" in
-              success) echo "white_check_mark" ;;
-              failure) echo "x" ;;
-              cancelled) echo "warning" ;;
-              skipped) echo "white_circle" ;;
-              *) echo "question" ;;
+              success) echo ":white_check_mark:" ;;
+              failure) echo ":x:" ;;
+              cancelled) echo ":warning:" ;;
+              skipped) echo ":white_circle:" ;;
+              *) echo ":grey_question:" ;;
             esac
           }
 
@@ -1547,27 +1582,26 @@ jobs:
             PROD_DEPLOYED="true"
           fi
 
-          # Build component status strings
+          # Build component status strings with visual pipeline (AC and Console run in parallel)
           SANDBOX_STATUS=""
           if [[ "$SANDBOX_DEPLOYED" == "true" ]]; then
-            SANDBOX_STATUS=":$(status_emoji "$SANDBOX_INFRA"): Infra"
-            SANDBOX_STATUS="$SANDBOX_STATUS  :$(status_emoji "$SANDBOX_SERVER"): Server"
-            SANDBOX_STATUS="$SANDBOX_STATUS  :$(status_emoji "$SANDBOX_AC"): AC"
+            SANDBOX_STATUS="$(status_emoji "$SANDBOX_INFRA") Infra → $(status_emoji "$SANDBOX_SERVER") Server → "
             if [[ "$SANDBOX_CONSOLE" != "skipped" ]]; then
-              SANDBOX_STATUS="$SANDBOX_STATUS  :$(status_emoji "$SANDBOX_CONSOLE"): Console"
+              # Show parallel execution: AC | Console
+              SANDBOX_STATUS="${SANDBOX_STATUS}$(status_emoji "$SANDBOX_AC") AC | $(status_emoji "$SANDBOX_CONSOLE") Console"
+            else
+              SANDBOX_STATUS="${SANDBOX_STATUS}$(status_emoji "$SANDBOX_AC") AC"
             fi
-            SANDBOX_STATUS="$SANDBOX_STATUS  :$(status_emoji "$SANDBOX_VALIDATE"): Validate"
+            SANDBOX_STATUS="${SANDBOX_STATUS} → $(status_emoji "$SANDBOX_VALIDATE") Validate"
           fi
 
           PROD_STATUS=""
           if [[ "$PROD_DEPLOYED" == "true" ]]; then
-            PROD_STATUS=":$(status_emoji "$PROD_INFRA"): Infra"
-            PROD_STATUS="$PROD_STATUS  :$(status_emoji "$PROD_SERVER"): Server"
-            PROD_STATUS="$PROD_STATUS  :$(status_emoji "$PROD_AC"): AC"
-            PROD_STATUS="$PROD_STATUS  :$(status_emoji "$PROD_VALIDATE"): Validate"
+            # Prod runs sequentially (no Console)
+            PROD_STATUS="$(status_emoji "$PROD_INFRA") Infra → $(status_emoji "$PROD_SERVER") Server → $(status_emoji "$PROD_AC") AC → $(status_emoji "$PROD_VALIDATE") Validate"
           fi
 
-          # Determine overall status
+          # Determine overall status and header
           if [[ "$BUILD_RESULT" == "success" ]]; then
             # Check for any deploy or validation failures
             DEPLOY_FAILED="false"
@@ -1578,65 +1612,65 @@ jobs:
               fi
             done
 
-            if [[ "$SANDBOX_VALIDATE" == "success" || "$PROD_VALIDATE" == "success" ]]; then
+            if [[ "$PROD_VALIDATE" == "success" ]]; then
               COLOR="#36a64f"
-              EMOJI="ok"
-              STATUS="successful"
-              DETAILS="Build and deploy completed"
+              EMOJI="rocket"
+              HEADER="LayerV.ai Production Deploy"
+              STATUS_TEXT="successful"
+            elif [[ "$SANDBOX_VALIDATE" == "success" ]]; then
+              COLOR="#36a64f"
+              EMOJI="white_check_mark"
+              HEADER="LayerV.ai Sandbox Deploy"
+              STATUS_TEXT="successful"
             elif [[ "$DEPLOY_FAILED" == "true" ]]; then
               COLOR="#dc3545"
-              EMOJI="error"
-              STATUS="failed"
-              DETAILS="Deploy failed - see component status"
+              EMOJI="x"
+              if [[ "$PROD_DEPLOYED" == "true" ]]; then
+                HEADER="LayerV.ai Production Deploy"
+              else
+                HEADER="LayerV.ai Sandbox Deploy"
+              fi
+              STATUS_TEXT="failed"
             elif [[ "$SANDBOX_DEPLOYED" == "false" && "$PROD_DEPLOYED" == "false" ]]; then
               COLOR="#36a64f"
-              EMOJI="ok"
-              STATUS="successful"
-              DETAILS="Build completed (deploy skipped)"
+              EMOJI="white_check_mark"
+              HEADER="LayerV.ai Build"
+              STATUS_TEXT="successful"
             elif [[ "$SANDBOX_INFRA" == "cancelled" || "$PROD_INFRA" == "cancelled" ]]; then
               COLOR="#ffc107"
               EMOJI="warning"
-              STATUS="cancelled"
-              DETAILS="Build succeeded, deploy cancelled"
+              HEADER="LayerV.ai Deploy"
+              STATUS_TEXT="cancelled"
             else
               COLOR="#dc3545"
-              EMOJI="error"
-              STATUS="failed"
-              DETAILS="Deploy incomplete - check workflow"
+              EMOJI="x"
+              HEADER="LayerV.ai Deploy"
+              STATUS_TEXT="incomplete"
             fi
           elif [[ "$BUILD_RESULT" == "failure" || "$TEST_RESULT" == "failure" ]]; then
             COLOR="#dc3545"
-            EMOJI="error"
-            STATUS="failed"
-            DETAILS="Build or tests failed"
+            EMOJI="x"
+            HEADER="LayerV.ai Build"
+            STATUS_TEXT="failed"
           elif [[ "$BUILD_RESULT" == "cancelled" ]]; then
             COLOR="#ffc107"
             EMOJI="warning"
-            STATUS="cancelled"
-            DETAILS="Build was cancelled"
+            HEADER="LayerV.ai Build"
+            STATUS_TEXT="cancelled"
           else
             COLOR="#ffc107"
             EMOJI="warning"
-            STATUS="incomplete"
-            DETAILS="Check workflow logs"
+            HEADER="LayerV.ai"
+            STATUS_TEXT="incomplete"
           fi
 
-          # Determine environment
-          if [[ "$PROD_DEPLOYED" == "true" ]]; then
-            DEPLOY_ENV="production"
-          elif [[ "$SANDBOX_DEPLOYED" == "true" ]]; then
-            DEPLOY_ENV="sandbox"
-          else
-            DEPLOY_ENV="build-only"
-          fi
-
-          # Build the blocks array
+          # Build the blocks array with improved layout
           BLOCKS="[
             {
               \"type\": \"section\",
               \"text\": {
                 \"type\": \"mrkdwn\",
-                \"text\": \":$EMOJI: *NHP* build $STATUS\"
+                \"text\": \":$EMOJI: *$HEADER* $STATUS_TEXT\"
               }
             },
             {
@@ -1644,19 +1678,19 @@ jobs:
               \"fields\": [
                 {
                   \"type\": \"mrkdwn\",
-                  \"text\": \"*Environment:*\n$DEPLOY_ENV\"
+                  \"text\": \"*Branch:*\n\`${{ github.ref_name }}\` ($SHORT_SHA)\"
                 },
                 {
                   \"type\": \"mrkdwn\",
-                  \"text\": \"*Branch:*\n${{ github.ref_name }}\"
+                  \"text\": \"*Trigger:*\n$TRIGGER_TEXT by ${{ github.actor }}\"
                 },
                 {
                   \"type\": \"mrkdwn\",
-                  \"text\": \"*Tests:*\n:$(status_emoji "$TEST_RESULT"): $TEST_RESULT\"
+                  \"text\": \"*Tests:*\n$(status_emoji "$TEST_RESULT")\"
                 },
                 {
                   \"type\": \"mrkdwn\",
-                  \"text\": \"*Build:*\n:$(status_emoji "$BUILD_RESULT"): $BUILD_RESULT\"
+                  \"text\": \"*Build:*\n$(status_emoji "$BUILD_RESULT")\"
                 }
               ]
             }"
@@ -1673,7 +1707,7 @@ jobs:
             }"
           fi
 
-          # Add prod component status if deployed
+          # Add prod component status if deployed, or show why it was skipped
           if [[ "$PROD_DEPLOYED" == "true" ]]; then
             BLOCKS="$BLOCKS,
             {
@@ -1683,16 +1717,30 @@ jobs:
                 \"text\": \"*Production:* $PROD_STATUS\"
               }
             }"
+          elif [[ "$SANDBOX_DEPLOYED" == "true" ]]; then
+            # Show why prod was skipped when sandbox deployed
+            # Note: Prod only deploys via workflow_dispatch with environment=prod
+            BLOCKS="$BLOCKS,
+            {
+              \"type\": \"context\",
+              \"elements\": [
+                {
+                  \"type\": \"mrkdwn\",
+                  \"text\": \"_Production: Skipped (manual deploy only)_\"
+                }
+              ]
+            }"
           fi
 
-          # Add context footer
+          # Add footer with duration, commit link, and workflow link
+          COMMIT_URL="${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
           BLOCKS="$BLOCKS,
             {
               \"type\": \"context\",
               \"elements\": [
                 {
                   \"type\": \"mrkdwn\",
-                  \"text\": \"$DETAILS | <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|$SHORT_SHA> | <$WORKFLOW_URL|View workflow>\"
+                  \"text\": \":stopwatch: $DURATION  |  <$COMMIT_URL|$SHORT_SHA>  |  <$WORKFLOW_URL|View workflow>\"
                 }
               ]
             }
