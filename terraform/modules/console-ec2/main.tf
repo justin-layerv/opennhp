@@ -467,7 +467,7 @@ resource "aws_autoscaling_group" "console" {
   # In internal mode, the internal TG has HTTP health checks to /health endpoint.
   # Unhealthy instances (app crash, DB unreachable) will be automatically replaced.
   health_check_type         = "ELB"
-  health_check_grace_period = 300
+  health_check_grace_period = 180 # Reduced from 300s - user_data validates health before completing
 
   # Target groups: internal or external mode, plus protected (always enabled)
   # NOTE: Must include protected target group here, not via aws_autoscaling_attachment,
@@ -484,7 +484,7 @@ resource "aws_autoscaling_group" "console" {
     strategy = "Rolling"
     preferences {
       min_healthy_percentage = 50
-      instance_warmup        = 300
+      instance_warmup        = 180 # Reduced from 300s - aligns with health_check_grace_period
     }
   }
 
@@ -538,7 +538,7 @@ resource "aws_lb_target_group" "https" {
     enabled             = true
     protocol            = "TCP"
     port                = "443"
-    interval            = 30
+    interval            = 10 # Reduced from 30s for faster health detection
     healthy_threshold   = 2
     unhealthy_threshold = 3
   }
@@ -562,7 +562,7 @@ resource "aws_lb_target_group" "http" {
     enabled             = true
     protocol            = "TCP"
     port                = "80"
-    interval            = 30
+    interval            = 10 # Reduced from 30s for faster health detection
     healthy_threshold   = 2
     unhealthy_threshold = 3
   }
@@ -621,7 +621,7 @@ resource "aws_lb_target_group" "internal" {
     protocol            = "HTTP"
     path                = "/health"
     port                = tostring(var.console_port)
-    interval            = 30
+    interval            = 10 # Reduced from 30s for faster health detection
     healthy_threshold   = 2
     unhealthy_threshold = 3
   }
@@ -703,7 +703,7 @@ resource "aws_lb_target_group" "protected" {
     enabled             = true
     protocol            = "TCP"
     port                = "22"
-    interval            = 30
+    interval            = 10 # Reduced from 30s for faster health detection
     healthy_threshold   = 2
     unhealthy_threshold = 3
   }
