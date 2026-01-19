@@ -461,9 +461,12 @@ resource "aws_iam_role_policy" "context_lookups" {
         Resource = "*"
       },
       {
-        Sid      = "ASGRefreshStart"
-        Effect   = "Allow"
-        Action   = ["autoscaling:StartInstanceRefresh"]
+        Sid    = "ASGRefreshManage"
+        Effect = "Allow"
+        Action = [
+          "autoscaling:StartInstanceRefresh",
+          "autoscaling:CancelInstanceRefresh"
+        ]
         Resource = "arn:aws:autoscaling:${local.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/layerv-nhp-*"
       },
       {
