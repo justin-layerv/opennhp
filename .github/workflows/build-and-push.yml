@@ -1517,6 +1517,7 @@ jobs:
           IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
           ENVIRONMENT: ${{ needs.setup.outputs.environment }}
           START_TIME: ${{ needs.setup.outputs.start_time }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
           if [[ -z "$SLACK_WEBHOOK" ]]; then
             echo "SLACK_WEBHOOK_URL not configured, skipping notification"
@@ -1547,7 +1548,9 @@ jobs:
           TRIGGER="${{ github.event_name }}"
           case "$TRIGGER" in
             push)
-              if [[ "${{ github.event.head_commit.message }}" == *"Merge pull request"* ]]; then
+              # Check first line of commit message for merge indicator
+              # (COMMIT_MESSAGE env var handles multi-line safely)
+              if echo "$COMMIT_MESSAGE" | head -n1 | grep -q "Merge pull request"; then
                 TRIGGER_TEXT="PR merge"
               else
                 TRIGGER_TEXT="Push"
