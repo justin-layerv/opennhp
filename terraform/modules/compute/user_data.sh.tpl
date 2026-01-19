@@ -252,9 +252,13 @@ cat > /opt/layerv/nhp-server/health-monitor.sh << HEALTHEOF
 # Health monitor: Updates Cloud Map status and triggers ASG replacement for persistent failures
 #
 # Detection timeline:
+# - Startup grace: 60s (wait for container to fully initialize)
 # - Check interval: 10s
 # - Unhealthy threshold: 6 consecutive failures (60s)
 # - After threshold: Mark instance unhealthy in ASG, triggering replacement
+#
+# Health check: HTTP port 8888 (same as NLB target group health check)
+# This ensures consistency between NLB routing and ASG health status.
 #
 # This allows systemd to recover transient failures (RestartSec=5s) before
 # escalating to instance replacement.
@@ -263,6 +267,7 @@ SERVICE_ID="${cloudmap_service_id}"
 CHECK_INTERVAL=10
 UNHEALTHY_THRESHOLD=6  # 6 checks @ 10s = 60s before ASG replacement
 UNHEALTHY_COUNT=0
+STARTUP_GRACE=60  # Wait for container to fully initialize before checking
 
 # Get instance metadata (IMDSv2)
 TOKEN=\$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
@@ -270,11 +275,16 @@ INSTANCE_ID=\$(curl -s -H "X-aws-ec2-metadata-token: \$TOKEN" http://169.254.169
 REGION=\$(curl -s -H "X-aws-ec2-metadata-token: \$TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
 
 echo "Health monitor started: instance=\$INSTANCE_ID region=\$REGION"
+echo "Startup grace period: waiting \$STARTUP_GRACE seconds for container to initialize..."
+sleep \$STARTUP_GRACE
+echo "Startup grace complete, beginning health checks"
 
 while true; do
-  # Check if container is running AND UDP port is listening
+  # Check if container is running AND HTTP port 8888 is responding
+  # Uses HTTP GET to port 8888 (NLB uses TCP, but HTTP confirms app is serving)
+  # Note: Don't use curl -f because server returns 404 on root endpoint
   if docker ps --format '{{.Names}}' | grep -q '^nhp-server\$' && \
-     docker exec nhp-server ss -uln 2>/dev/null | grep -q ':62206'; then
+     curl -s --connect-timeout 2 --max-time 5 http://127.0.0.1:8888/ -o /dev/null; then
     HEALTH_STATUS="HEALTHY"
     UNHEALTHY_COUNT=0
   else
