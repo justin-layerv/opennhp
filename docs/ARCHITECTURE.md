@@ -1635,8 +1635,35 @@ write permissions; Server only needs read. For on-prem, etcd access is protected
 ### Cleanup
 
 **Cloud Deployments (DynamoDB):**
-- **On termination**: ASG lifecycle hook triggers Lambda to delete DynamoDB assignment + Secrets Manager entry
-- **Weekly audit**: Lambda compares assignments to running instances, cleans orphans
+
+Three layers of cleanup ensure stale assignments are removed:
+
+| Layer | Mechanism | Cleanup Time | Enable Via |
+|-------|-----------|--------------|------------|
+| **Immediate** | ASG lifecycle hook + Lambda | Instant (before termination) | `enable_termination_cleanup = true` |
+| **Proactive** | Console health monitor (GSI-based) | 60-90 seconds | Always enabled |
+| **Real-time** | NHP Server health filtering | Per-registration | Always enabled |
+
+1. **ASG Lifecycle Hook + Lambda** (`terraform/modules/compute/lambda/`):
+   - Triggered on `EC2_INSTANCE_TERMINATING` lifecycle event
+   - Queries `server-ac-index` for affected assignments
+   - Updates assignments to remove terminating server
+   - Deletes assignments with no remaining servers
+   - Completes lifecycle hook, allowing termination
+
+2. **Console Health Monitor** (`console/server/service/nhp/health_monitor.go`):
+   - GSI-based detection: tracks healthy servers, detects terminations
+   - Queries only affected assignments (not full table scan)
+   - Full table scan every 24h as consistency fallback
+   - Deletes assignments where ALL servers are unhealthy
+
+3. **NHP Server Health Filtering** (`endpoints/server/cloudmap.go`):
+   - Filters NHP_ARD redirects to only healthy servers
+   - Accepts AC directly if all assigned servers unhealthy
+   - 30-second cache TTL for Cloud Map queries
+
+> **Production recommendation**: Enable ASG lifecycle hook for immediate cleanup.
+> Console health monitor and server filtering provide defense in depth.
 
 **On-Prem Deployments (etcd):**
 - **On termination**: ASG lifecycle hook triggers Lambda to delete etcd entry + secret

@@ -671,3 +671,265 @@ resource "aws_lb_listener" "udp" {
     Cell      = var.cell_id
   })
 }
+
+# =============================================================================
+# ASG Lifecycle Hook for Server Termination Cleanup
+# =============================================================================
+# When an NHP Server terminates, this lifecycle hook pauses termination and
+# triggers a Lambda function that cleans up DynamoDB assignments pointing to
+# the terminating server. This provides immediate cleanup instead of waiting
+# for Console health monitor.
+#
+# Flow:
+# 1. ASG initiates instance termination
+# 2. Lifecycle hook pauses termination, sends event to EventBridge
+# 3. EventBridge triggers Lambda function
+# 4. Lambda queries server-ac-index, updates/deletes assignments
+# 5. Lambda completes lifecycle action
+# 6. Instance terminates
+# =============================================================================
+
+# Lifecycle Hook - pauses termination to allow cleanup
+resource "aws_autoscaling_lifecycle_hook" "termination" {
+  count = var.enable_termination_cleanup ? 1 : 0
+
+  name                   = "${var.name_prefix}-termination-hook"
+  autoscaling_group_name = aws_autoscaling_group.server.name
+  lifecycle_transition   = "autoscaling:EC2_INSTANCE_TERMINATING"
+  default_result         = "CONTINUE" # Allow termination even if Lambda fails
+  heartbeat_timeout      = 300        # 5 minutes max for cleanup
+
+  # Note: We don't specify notification_target_arn here because we use
+  # EventBridge to capture the lifecycle event instead of SNS
+}
+
+# EventBridge Rule - captures lifecycle hook events
+resource "aws_cloudwatch_event_rule" "termination" {
+  count = var.enable_termination_cleanup ? 1 : 0
+
+  name        = "${var.name_prefix}-server-termination"
+  description = "Captures NHP Server termination lifecycle events"
+
+  event_pattern = jsonencode({
+    source      = ["aws.autoscaling"]
+    detail-type = ["EC2 Instance-terminate Lifecycle Action"]
+    detail = {
+      AutoScalingGroupName = [aws_autoscaling_group.server.name]
+    }
+  })
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-termination-rule"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+}
+
+# EventBridge Target - triggers Lambda on lifecycle events
+resource "aws_cloudwatch_event_target" "termination" {
+  count = var.enable_termination_cleanup ? 1 : 0
+
+  rule      = aws_cloudwatch_event_rule.termination[0].name
+  target_id = "server-termination-cleanup"
+  arn       = aws_lambda_function.termination_cleanup[0].arn
+}
+
+# Lambda Permission - allows EventBridge to invoke Lambda
+resource "aws_lambda_permission" "termination" {
+  count = var.enable_termination_cleanup ? 1 : 0
+
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.termination_cleanup[0].function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.termination[0].arn
+}
+
+# Lambda Function - performs DynamoDB cleanup
+data "archive_file" "termination_cleanup" {
+  count = var.enable_termination_cleanup ? 1 : 0
+
+  type        = "zip"
+  source_file = "${path.module}/lambda/server_termination_cleanup.py"
+  output_path = "${path.module}/lambda/server_termination_cleanup.zip"
+}
+
+resource "aws_lambda_function" "termination_cleanup" {
+  count = var.enable_termination_cleanup ? 1 : 0
+
+  # Ensure log group is created first with KMS encryption and retention settings
+  # Without this, Lambda auto-creates a log group without encryption
+  depends_on = [aws_cloudwatch_log_group.termination_cleanup]
+
+  filename         = data.archive_file.termination_cleanup[0].output_path
+  function_name    = "${var.name_prefix}-server-termination-cleanup"
+  role             = aws_iam_role.termination_cleanup[0].arn
+  handler          = "server_termination_cleanup.handler"
+  source_code_hash = data.archive_file.termination_cleanup[0].output_base64sha256
+  runtime          = "python3.11"
+  timeout          = 120 # 2 minutes; heartbeat_timeout is 300s
+  memory_size      = 256
+
+  environment {
+    variables = {
+      AC_ASSIGNMENTS_TABLE  = var.dynamodb_ac_assignments_table
+      SERVER_AC_INDEX_TABLE = var.dynamodb_server_ac_index_table
+    }
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-termination-cleanup"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+
+  lifecycle {
+    precondition {
+      condition     = var.dynamodb_server_ac_index_table != null
+      error_message = "dynamodb_server_ac_index_table is required when enable_termination_cleanup is true."
+    }
+    precondition {
+      condition     = var.dynamodb_ac_assignments_table != null
+      error_message = "dynamodb_ac_assignments_table is required when enable_termination_cleanup is true."
+    }
+    precondition {
+      condition     = var.dynamodb_ac_assignments_arn != null
+      error_message = "dynamodb_ac_assignments_arn is required when enable_termination_cleanup is true."
+    }
+    precondition {
+      condition     = var.dynamodb_server_ac_index_arn != null
+      error_message = "dynamodb_server_ac_index_arn is required when enable_termination_cleanup is true."
+    }
+  }
+}
+
+# CloudWatch Log Group for Lambda
+resource "aws_cloudwatch_log_group" "termination_cleanup" {
+  count = var.enable_termination_cleanup ? 1 : 0
+
+  name              = "/aws/lambda/${var.name_prefix}-server-termination-cleanup"
+  retention_in_days = local.is_prod ? 90 : 14
+  kms_key_id        = var.logs_kms_key_arn
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-termination-cleanup-logs"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+}
+
+# IAM Role for Lambda
+resource "aws_iam_role" "termination_cleanup" {
+  count = var.enable_termination_cleanup ? 1 : 0
+
+  name = "${var.name_prefix}-termination-cleanup"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+    }]
+  })
+
+  tags = var.tags
+}
+
+# IAM Policy for Lambda - DynamoDB access (includes KMS for encrypted tables)
+resource "aws_iam_role_policy" "termination_cleanup_dynamodb" {
+  count = var.enable_termination_cleanup ? 1 : 0
+
+  name = "dynamodb-access"
+  role = aws_iam_role.termination_cleanup[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat([
+      {
+        Sid    = "DynamoDBAccess"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:Query",
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:BatchWriteItem"
+        ]
+        Resource = compact([
+          var.dynamodb_ac_assignments_arn,
+          var.dynamodb_server_ac_index_arn
+        ])
+      }
+      ], var.secrets_kms_key_arn != null ? [{
+        Sid    = "KMSAccess"
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt",
+          "kms:Encrypt",
+          "kms:GenerateDataKey"
+        ]
+        Resource = [var.secrets_kms_key_arn]
+    }] : [])
+  })
+}
+
+# IAM Policy for Lambda - ASG lifecycle completion
+resource "aws_iam_role_policy" "termination_cleanup_asg" {
+  count = var.enable_termination_cleanup ? 1 : 0
+
+  name = "asg-lifecycle"
+  role = aws_iam_role.termination_cleanup[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "CompleteLifecycleAction"
+        Effect   = "Allow"
+        Action   = ["autoscaling:CompleteLifecycleAction"]
+        Resource = aws_autoscaling_group.server.arn
+      }
+    ]
+  })
+}
+
+# IAM Policy for Lambda - CloudWatch Logs
+resource "aws_iam_role_policy_attachment" "termination_cleanup_logs" {
+  count = var.enable_termination_cleanup ? 1 : 0
+
+  role       = aws_iam_role.termination_cleanup[0].name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+# CloudWatch Alarm for Lambda errors
+# Alerts when termination cleanup Lambda fails, which could indicate stale assignments not being cleaned
+resource "aws_cloudwatch_metric_alarm" "termination_cleanup_errors" {
+  count = var.enable_termination_cleanup && var.alerts_sns_topic_arn != null ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-termination-cleanup-errors"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 300 # 5 minutes
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "Termination cleanup Lambda errors - stale AC assignments may not be cleaned"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    FunctionName = aws_lambda_function.termination_cleanup[0].function_name
+  }
+
+  alarm_actions = [var.alerts_sns_topic_arn]
+  ok_actions    = [var.alerts_sns_topic_arn]
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-termination-cleanup-errors"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+}

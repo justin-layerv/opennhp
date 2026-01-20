@@ -287,6 +287,17 @@ module "compute" {
   dynamodb_licenses_table       = module.dynamodb.licenses_table_name
   dynamodb_ac_assignments_table = module.dynamodb.ac_assignments_table_name
   dynamodb_resources_table      = module.dynamodb.resources_table_name
+
+  # ASG Lifecycle Hook for immediate DynamoDB cleanup on server termination
+  # When enabled, a Lambda cleans up assignments before the server terminates
+  enable_termination_cleanup     = var.enable_termination_cleanup
+  dynamodb_server_ac_index_table = module.dynamodb.server_ac_index_table_name
+  dynamodb_ac_assignments_arn    = module.dynamodb.ac_assignments_table_arn
+  dynamodb_server_ac_index_arn   = module.dynamodb.server_ac_index_table_arn
+
+  # SNS topic for Lambda error alarms (from monitoring module)
+  # Note: The SNS topic is created before compute resources, avoiding circular dependency
+  alerts_sns_topic_arn = module.monitoring.sns_topic_arn
 }
 
 # Monitoring Module - CloudWatch Dashboard, Alarms, Slack Notifications

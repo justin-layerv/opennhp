@@ -256,3 +256,37 @@ variable "keypair_policy_arn" {
   type        = string
   default     = null
 }
+
+# =============================================================================
+# ASG Lifecycle Hook for Termination Cleanup
+# =============================================================================
+
+variable "enable_termination_cleanup" {
+  description = "Enable ASG lifecycle hook for immediate DynamoDB cleanup on server termination. When enabled, a Lambda function cleans up AC assignments before the server terminates."
+  type        = bool
+  default     = false
+}
+
+variable "dynamodb_server_ac_index_table" {
+  description = "DynamoDB table name for server-ac-index (inverted index). Required when enable_termination_cleanup is true."
+  type        = string
+  default     = null
+}
+
+variable "dynamodb_ac_assignments_arn" {
+  description = "DynamoDB table ARN for AC assignments. Required when enable_termination_cleanup is true."
+  type        = string
+  default     = null
+}
+
+variable "dynamodb_server_ac_index_arn" {
+  description = "DynamoDB table ARN for server-ac-index. Required when enable_termination_cleanup is true."
+  type        = string
+  default     = null
+}
+
+variable "alerts_sns_topic_arn" {
+  description = "SNS topic ARN for CloudWatch alarms. Used for Lambda error alerts."
+  type        = string
+  default     = null
+}

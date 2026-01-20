@@ -345,6 +345,14 @@ variable "slack_channel_id" {
   default     = ""
 }
 
+# ==================== ASG Lifecycle Hook ====================
+
+variable "enable_termination_cleanup" {
+  description = "Enable ASG lifecycle hook for immediate DynamoDB cleanup on server termination. When enabled, a Lambda function cleans up AC assignments before the server terminates, providing instant cleanup instead of waiting for Console health monitor."
+  type        = bool
+  default     = false
+}
+
 # ==================== RDS Configuration ====================
 
 variable "deploy_rds" {
