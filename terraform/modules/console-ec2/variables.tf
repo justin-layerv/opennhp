@@ -142,15 +142,15 @@ variable "nhp_dynamodb_licenses_table" {
 }
 
 variable "nhp_cloudmap_namespace" {
-  description = "CloudMap namespace for NHP server discovery"
+  description = "CloudMap namespace for NHP server discovery (e.g., 'nhp.sandbox.internal')"
   type        = string
-  default     = "nhp.internal"
+  # No default - must be passed from environment (module.data.namespace_name)
 }
 
 variable "nhp_cloudmap_service_name" {
   description = "CloudMap service name for NHP servers"
   type        = string
-  default     = "nhp-servers"
+  default     = "server"
 }
 
 variable "nhp_assignment_servers_per_ac" {

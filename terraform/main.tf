@@ -628,6 +628,9 @@ module "console_ec2" {
   nhp_dynamodb_server_ac_index_table = module.dynamodb.server_ac_index_table_name
   nhp_dynamodb_licenses_table        = module.dynamodb.licenses_table_name
 
+  # NHP CloudMap - Console needs namespace to discover NHP servers
+  nhp_cloudmap_namespace = module.data.namespace_name
+
   # Console AC License - for DynamoDB license validation in cloud mode
   # Generate with: ./terraform/scripts/generate-console-ac-license.sh <environment>
   # REQUIRED: AC registration will fail without valid license key hash
