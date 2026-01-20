@@ -290,6 +290,18 @@ resource "aws_security_group" "console" {
     description = "NHP knock packets from NHP Server"
   }
 
+  # NHP Protection: Allow return traffic on ephemeral ports from NHP Server
+  # When nhp-acd registers with the server, it uses an ephemeral source port.
+  # The server sends NHP_AOP packets to this ephemeral port for knock operations.
+  # Without this rule, NHP_AOP packets are blocked and knocks timeout.
+  ingress {
+    from_port   = 32768
+    to_port     = 65535
+    protocol    = "udp"
+    cidr_blocks = [var.vpc_cidr]
+    description = "NHP return traffic from NHP Server (ephemeral ports)"
+  }
+
   # SSH from VPC
   ingress {
     from_port   = 22
