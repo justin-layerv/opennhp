@@ -58,52 +58,52 @@ type StorageBackend interface {
 // ACAssignment represents an AC's server assignment.
 // Each AC is assigned to 3 servers in different AZs for resilience.
 type ACAssignment struct {
-	ACID            string         `json:"ac_id"`
-	ResourceFQDN    string         `json:"resource_fqdn"`
-	CustomerID      string         `json:"customer_id"`
-	AssignedServers []ServerInfo   `json:"assigned_servers"`
-	Version         int            `json:"version"`           // For optimistic locking during reassignment
-	ReassignedAt    *int64         `json:"reassigned_at"`     // Unix timestamp, set when Console reassigns
-	CreatedAt       int64          `json:"created_at"`
-	LastSeen        int64          `json:"last_seen"`
-	TTL             *int64         `json:"ttl,omitempty"`     // Unix timestamp for DynamoDB TTL
+	ACID            string       `json:"ac_id" dynamodbav:"ac_id"`
+	ResourceFQDN    string       `json:"resource_fqdn" dynamodbav:"resource_fqdn"`
+	CustomerID      string       `json:"customer_id" dynamodbav:"customer_id"`
+	AssignedServers []ServerInfo `json:"assigned_servers" dynamodbav:"assigned_servers"`
+	Version         int          `json:"version" dynamodbav:"version"`                     // For optimistic locking during reassignment
+	ReassignedAt    *int64       `json:"reassigned_at" dynamodbav:"reassigned_at"`         // Unix timestamp, set when Console reassigns
+	CreatedAt       int64        `json:"created_at" dynamodbav:"created_at"`
+	LastSeen        int64        `json:"last_seen" dynamodbav:"last_seen"`
+	TTL             *int64       `json:"ttl,omitempty" dynamodbav:"ttl,omitempty"`         // Unix timestamp for DynamoDB TTL
 }
 
 // ServerInfo represents an assigned server's connection details.
 type ServerInfo struct {
-	ID         string `json:"id"`                    // Server ID (e.g., "srv-abc123")
-	IP         string `json:"ip"`                    // Public IP for AC connection
-	InternalIP string `json:"internal_ip,omitempty"` // VPC IP for server-to-server forwarding
-	AZ         string `json:"az,omitempty"`          // Availability Zone
-	Port       int    `json:"port"`                  // NHP UDP port (default 62206)
-	PubKey     string `json:"pub_key,omitempty"`     // Server's public key (for forwarding)
+	ID         string `json:"id" dynamodbav:"id"`                              // Server ID (e.g., "srv-abc123")
+	IP         string `json:"ip" dynamodbav:"ip"`                              // Public IP for AC connection
+	InternalIP string `json:"internal_ip,omitempty" dynamodbav:"internal_ip,omitempty"` // VPC IP for server-to-server forwarding
+	AZ         string `json:"az,omitempty" dynamodbav:"az,omitempty"`          // Availability Zone
+	Port       int    `json:"port" dynamodbav:"port"`                          // NHP UDP port (default 62206)
+	PubKey     string `json:"pub_key,omitempty" dynamodbav:"pub_key,omitempty"` // Server's public key (for forwarding)
 }
 
 // License represents customer license information.
 // License keys are globally unique and serve as the primary lookup key.
 type License struct {
-	LicenseKeySHA256 string `json:"license_key_sha256"` // SHA256 of plaintext key (partition key for lookup)
-	LicenseKeyHash   string `json:"license_key_hash"`   // bcrypt hash for validation
-	CustomerID       string `json:"customer_id"`        // Customer ID (ULID, for GSI queries)
-	ResourceID       string `json:"resource_id"`        // Resource identifier (informational)
-	Tier             string `json:"tier"`               // "free", "pro", "enterprise"
-	MaxACs           int    `json:"max_acs"`
-	ExpiresAt        int64  `json:"expires_at"`  // Unix timestamp (0 = never expires)
-	Active           bool   `json:"active"`
-	CreatedAt        int64  `json:"created_at"`  // Unix timestamp
-	UpdatedAt        int64  `json:"updated_at"`  // Unix timestamp
+	LicenseKeySHA256 string `json:"license_key_sha256" dynamodbav:"license_key_sha256"` // SHA256 of plaintext key (partition key for lookup)
+	LicenseKeyHash   string `json:"license_key_hash" dynamodbav:"license_key_hash"`     // bcrypt hash for validation
+	CustomerID       string `json:"customer_id" dynamodbav:"customer_id"`               // Customer ID (ULID, for GSI queries)
+	ResourceID       string `json:"resource_id" dynamodbav:"resource_id"`               // Resource identifier (informational)
+	Tier             string `json:"tier" dynamodbav:"tier"`                             // "free", "pro", "enterprise"
+	MaxACs           int    `json:"max_acs" dynamodbav:"max_acs"`
+	ExpiresAt        int64  `json:"expires_at" dynamodbav:"expires_at"`                 // Unix timestamp (0 = never expires)
+	Active           bool   `json:"active" dynamodbav:"active"`
+	CreatedAt        int64  `json:"created_at" dynamodbav:"created_at"`                 // Unix timestamp
+	UpdatedAt        int64  `json:"updated_at" dynamodbav:"updated_at"`                 // Unix timestamp
 }
 
 // Resource represents a protected resource definition.
 type Resource struct {
-	CustomerID    string `json:"customer_id"`
-	ResourceID    string `json:"resource_id"`
-	ResourceFQDN  string `json:"resource_fqdn"`
-	ACID          string `json:"ac_id"`
-	DestHost      string `json:"dest_host"`
-	DestPort      int    `json:"dest_port"`
-	OpenTime      int    `json:"open_time"`      // Seconds
-	AuthServiceID string `json:"auth_service_id"`
+	CustomerID    string `json:"customer_id" dynamodbav:"customer_id"`
+	ResourceID    string `json:"resource_id" dynamodbav:"resource_id"`
+	ResourceFQDN  string `json:"resource_fqdn" dynamodbav:"resource_fqdn"`
+	ACID          string `json:"ac_id" dynamodbav:"ac_id"`
+	DestHost      string `json:"dest_host" dynamodbav:"dest_host"`
+	DestPort      int    `json:"dest_port" dynamodbav:"dest_port"`
+	OpenTime      int    `json:"open_time" dynamodbav:"open_time"` // Seconds
+	AuthServiceID string `json:"auth_service_id" dynamodbav:"auth_service_id"`
 }
 
 // ============================================================================
