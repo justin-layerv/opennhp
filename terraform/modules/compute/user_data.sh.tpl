@@ -110,11 +110,13 @@ CONFIGEOF
 # - "etcd": etcd for on-prem deployments (feature flag)
 # ============================================================================
 cat > /opt/layerv/nhp-server/etc/storage.toml << STORAGEEOF
-[Storage]
+# Storage backend configuration
+# The Go code unmarshals directly into StorageConfig struct, so no [Storage] wrapper.
+# See endpoints/server/config.go loadStorageConfig() for parsing logic.
 Backend = "${storage_backend}"
 
 %{ if storage_backend == "dynamodb" ~}
-[Storage.DynamoDB]
+[DynamoDB]
 Region = "${dynamodb_region}"
 %{ if dynamodb_licenses_table != null ~}
 LicensesTable = "${dynamodb_licenses_table}"
@@ -128,7 +130,7 @@ ResourcesTable = "${dynamodb_resources_table}"
 %{ endif ~}
 
 %{ if storage_backend == "etcd" && etcd_endpoint != "" ~}
-[Storage.Etcd]
+[Etcd]
 Endpoints = ["${etcd_endpoint}"]
 %{ if etcd_tls_secret_arn != "" ~}
 TLS = true
@@ -138,7 +140,7 @@ ClientKey = "/nhp-server/etc/tls/client.key"
 %{ endif ~}
 %{ endif ~}
 
-[Storage.Cache]
+[Cache]
 MaxEntries = 10000
 DefaultTTL = 60
 ReassignmentTTL = 5
