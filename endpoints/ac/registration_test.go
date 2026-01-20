@@ -536,6 +536,34 @@ func TestACRegistration_Stop(t *testing.T) {
 	}
 }
 
+// TestACRegistration_Stop_DoubleStopSafe tests that Stop() can be called multiple times without panic.
+func TestACRegistration_Stop_DoubleStopSafe(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+
+	reg := NewACRegistration(ac)
+
+	// Manually simulate what Start() would do for testing
+	reg.wg.Add(1)
+	go func() {
+		defer reg.wg.Done()
+		<-reg.stopCh
+	}()
+
+	// First Stop should work
+	reg.Stop()
+
+	// Second Stop should not panic (would panic if closing stopCh twice)
+	reg.Stop()
+
+	// Third Stop should also be safe
+	reg.Stop()
+}
+
 // TestACRegistration_ReregisteringGuard tests the atomic re-registration guard.
 func TestACRegistration_ReregisteringGuard(t *testing.T) {
 	ac := &UdpAC{
@@ -1075,14 +1103,35 @@ func TestACRegistration_Start_MissingConfig(t *testing.T) {
 
 // TestACRegistration_HandleRegistrationResponse tests all error paths in handleRegistrationResponse.
 func TestACRegistration_HandleRegistrationResponse(t *testing.T) {
+	// Create a test private key for the device
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
 	ac := &UdpAC{
 		config: &Config{
 			ACId:           "test-ac-001",
 			ServerEndpoint: "server.nhp.test.internal",
 		},
+		device: device,
 	}
 
 	reg := NewACRegistration(ac)
+
+	// Create a mock peer for testing (used by RemovePeer on error paths)
+	mockPeer := &core.UdpPeer{
+		Hostname:     "test-server",
+		Ip:           "10.0.0.1",
+		Port:         62206,
+		PubKeyBase64: "dGVzdC1wdWJrZXktYmFzZTY0", // "test-pubkey-base64" in base64
+		Type:         core.NHP_SERVER,
+	}
 
 	tests := []struct {
 		name          string
@@ -1151,11 +1200,27 @@ func TestACRegistration_HandleRegistrationResponse(t *testing.T) {
 			},
 			expectError: false,
 		},
+		{
+			name: "NHP_AAK success with ErrCode 0",
+			ppd: &core.PacketParserData{
+				HeaderType:  core.NHP_AAK,
+				BodyMessage: []byte(`{"errCode":"0","registered":true,"acAddr":"10.0.0.1:62206"}`),
+			},
+			expectError: false,
+		},
+		{
+			name: "NHP_AAK with invalid ErrCode string fails",
+			ppd: &core.PacketParserData{
+				HeaderType:  core.NHP_AAK,
+				BodyMessage: []byte(`{"errCode":"SUCCESS","registered":true,"acAddr":"10.0.0.1:62206"}`),
+			},
+			expectError: true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := reg.handleRegistrationResponse(tt.ppd)
+			err := reg.handleRegistrationResponse(tt.ppd, mockPeer)
 
 			if tt.expectError && err == nil {
 				t.Error("expected error but got nil")
@@ -1391,5 +1456,148 @@ func TestACRegistration_HandleRedispatch_PartialSuccess(t *testing.T) {
 	}
 	if connectedCount == 0 {
 		t.Error("this should be partial success (at least one connected)")
+	}
+}
+
+// TestACRegistration_Stop_CleansUpRegistrationPeer tests that Stop() cleans up
+// the registration peer that was kept after NHP_AAK response.
+func TestACRegistration_Stop_CleansUpRegistrationPeer(t *testing.T) {
+	// Create a test private key for the device
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	// Simulate a registration peer being set (as would happen after NHP_AAK)
+	regPeer := &core.UdpPeer{
+		Hostname:     "reg-server",
+		Ip:           "10.0.0.100",
+		Port:         62206,
+		PubKeyBase64: "cmVnLXNlcnZlci1wdWJrZXk=", // "reg-server-pubkey" in base64
+		Type:         core.NHP_SERVER,
+	}
+	device.AddPeer(regPeer)
+	reg.registrationPeer = regPeer
+
+	// Simulate some connected servers with peers
+	serverPeer := &core.UdpPeer{
+		Hostname:     "assigned-server",
+		Ip:           "10.0.0.1",
+		Port:         62206,
+		PubKeyBase64: "YXNzaWduZWQtc2VydmVyLXB1YmtleQ==", // "assigned-server-pubkey" in base64
+		Type:         core.NHP_SERVER,
+	}
+	device.AddPeer(serverPeer)
+
+	reg.mu.Lock()
+	reg.assignedServers = []*AssignedServer{
+		{
+			Target: common.RedirectTarget{
+				IP:           "10.0.0.1",
+				Port:         62206,
+				PubKeyBase64: "YXNzaWduZWQtc2VydmVyLXB1YmtleQ==",
+			},
+			Peer:      serverPeer,
+			Connected: true,
+		},
+	}
+	reg.mu.Unlock()
+
+	// Stop the registration manager
+	reg.Stop()
+
+	// Verify registration peer was cleaned up
+	if reg.registrationPeer != nil {
+		t.Error("registrationPeer should be nil after Stop()")
+	}
+
+	// Verify assigned servers were cleaned up
+	if len(reg.assignedServers) != 0 {
+		t.Errorf("assignedServers should be empty after Stop(), got %d", len(reg.assignedServers))
+	}
+}
+
+// TestACRegistration_HandleRegistrationResponse_ReplacesOldPeer tests that receiving
+// NHP_AAK when there's already a registration peer cleans up the old one.
+func TestACRegistration_HandleRegistrationResponse_ReplacesOldPeer(t *testing.T) {
+	// Create a test private key for the device
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	// Simulate an existing registration peer (from previous registration)
+	oldPeer := &core.UdpPeer{
+		Hostname:     "old-server",
+		Ip:           "10.0.0.50",
+		Port:         62206,
+		PubKeyBase64: "b2xkLXNlcnZlci1wdWJrZXk=", // "old-server-pubkey" in base64
+		Type:         core.NHP_SERVER,
+	}
+	device.AddPeer(oldPeer)
+	reg.registrationPeer = oldPeer
+
+	// Create a new peer for the new registration
+	newPeer := &core.UdpPeer{
+		Hostname:     "new-server",
+		Ip:           "10.0.0.100",
+		Port:         62206,
+		PubKeyBase64: "bmV3LXNlcnZlci1wdWJrZXk=", // "new-server-pubkey" in base64
+		Type:         core.NHP_SERVER,
+	}
+
+	// Simulate successful NHP_AAK response
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(`{"errCode":"0","registered":true,"acAddr":"10.0.0.100:62206"}`),
+	}
+
+	err := reg.handleRegistrationResponse(ppd, newPeer)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify the registration peer was updated to the new one
+	reg.mu.RLock()
+	currentPeer := reg.registrationPeer
+	reg.mu.RUnlock()
+
+	if currentPeer != newPeer {
+		t.Error("registrationPeer should be updated to the new peer")
+	}
+
+	if currentPeer.PubKeyBase64 != newPeer.PubKeyBase64 {
+		t.Errorf("registrationPeer pubkey mismatch: got %s, want %s",
+			currentPeer.PubKeyBase64, newPeer.PubKeyBase64)
 	}
 }

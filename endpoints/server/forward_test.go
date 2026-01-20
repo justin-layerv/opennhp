@@ -520,7 +520,7 @@ func TestHandleForwardResult_MatchingTransaction(t *testing.T) {
 	resultMsg := &common.ServerForwardResultMsg{
 		TransactionId: 12345,
 		Success:       true,
-		ACKData:       []byte(`{"errCode":"SUCCESS"}`),
+		ACKData:       []byte(`{"errCode":"0"}`),
 	}
 
 	forwarder.HandleForwardResult(nil, resultMsg)
@@ -1213,5 +1213,31 @@ func TestHealthTracker_RapidFailureSuccess(t *testing.T) {
 		if tracker.IsUnhealthy("srv-flaky") {
 			t.Errorf("Iteration %d: should be healthy after success", i)
 		}
+	}
+}
+
+// TestIsSuccessErrCode validates common.IsSuccessErrCode helper function.
+// Per nhp/common/errors.go, success is indicated by "" or "0".
+func TestIsSuccessErrCode(t *testing.T) {
+	tests := []struct {
+		name      string
+		errCode   string
+		isSuccess bool
+	}{
+		{"empty string is success", "", true},
+		{"0 is success", "0", true},
+		{"SUCCESS string is not success", "SUCCESS", false},
+		{"error code is not success", "LICENSE_EXPIRED", false},
+		{"numeric error is not success", "50001", false},
+		{"1 is not success", "1", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isSuccess := common.IsSuccessErrCode(tt.errCode)
+			if isSuccess != tt.isSuccess {
+				t.Errorf("IsSuccessErrCode(%q): got %v, want %v", tt.errCode, isSuccess, tt.isSuccess)
+			}
+		})
 	}
 }

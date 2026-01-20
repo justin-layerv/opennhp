@@ -370,7 +370,7 @@ func (f *ServerForwarder) HandleForwardRequest(
 	}
 
 	// Check if AC returned an error in the result message (even if no Go error)
-	if artMsg != nil && artMsg.ErrCode != "" {
+	if artMsg != nil && !common.IsSuccessErrCode(artMsg.ErrCode) {
 		log.Warning("AC returned error for forwarded knock: %s - %s", artMsg.ErrCode, artMsg.ErrMsg)
 		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, artMsg.ErrCode, artMsg.ErrMsg)
 		return

@@ -114,6 +114,16 @@ type ACRegistration struct {
 
 	// reregistering prevents concurrent re-registration attempts
 	reregistering atomic.Bool
+
+	// stopped prevents double Stop() calls from panicking (closing stopCh twice)
+	stopped atomic.Bool
+
+	// registrationPeer tracks the peer from NHP_AAK response (the server that is
+	// assigned to us and will send NHP_AOP packets). This is separate from
+	// connectedServers because the registration server responds with NHP_AAK
+	// directly, not NHP_ARD. We need to track it for cleanup when AC stops
+	// or re-registers to a different server.
+	registrationPeer *core.UdpPeer
 }
 
 // NewACRegistration creates a new AC registration manager.
@@ -142,11 +152,44 @@ func (r *ACRegistration) Start() error {
 	return nil
 }
 
-// Stop stops the registration manager.
+// Stop stops the registration manager. Safe to call multiple times.
 func (r *ACRegistration) Stop() {
+	// Prevent double Stop() from panicking (closing stopCh twice)
+	if r.stopped.Swap(true) {
+		return
+	}
+
 	log.Info("Stopping AC registration manager")
 	close(r.stopCh)
 	r.wg.Wait()
+
+	// Clean up all peers
+	r.mu.Lock()
+	// Clean up registration peer (from NHP_AAK response)
+	if r.registrationPeer != nil {
+		r.ac.device.RemovePeer(r.registrationPeer.PublicKeyBase64())
+		r.registrationPeer = nil
+	}
+	// Clean up connected server peers
+	for _, server := range r.assignedServers {
+		if server.Peer != nil {
+			r.ac.device.RemovePeer(server.Peer.PublicKeyBase64())
+			server.Peer = nil
+		}
+	}
+	r.assignedServers = nil
+	// Clean up any pending old server sets (from overlapping reassignments)
+	for cleanupKey, oldServers := range r.oldServerSets {
+		for _, server := range oldServers {
+			if server.Peer != nil {
+				r.ac.device.RemovePeer(server.Peer.PublicKeyBase64())
+				server.Peer = nil
+			}
+		}
+		delete(r.oldServerSets, cleanupKey)
+	}
+	r.mu.Unlock()
+
 	log.Debug("AC registration manager stopped")
 }
 
@@ -285,9 +328,10 @@ func (r *ACRegistration) register() error {
 		return fmt.Errorf("failed to marshal NHP_AOL: %w", err)
 	}
 
-	// Add peer to device temporarily for encryption
+	// Add peer to device for encryption
+	// The peer will be kept if NHP_AAK is received (this server is assigned to us)
+	// The peer will be removed if NHP_ARD is received (we'll connect to different servers)
 	r.ac.device.AddPeer(registrationPeer)
-	defer r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
 
 	// Create message data for sending
 	// Use buffered channel (size 1) to prevent sender from blocking if we exit early
@@ -303,6 +347,7 @@ func (r *ACRegistration) register() error {
 
 	// Send NHP_AOL
 	if !r.ac.IsRunning() {
+		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
 		return errors.New("AC not running")
 	}
 	r.ac.sendMsgCh <- md
@@ -313,11 +358,13 @@ func (r *ACRegistration) register() error {
 	// and the channel will be garbage collected when no longer referenced.
 	select {
 	case <-r.stopCh:
+		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
 		return errors.New("registration cancelled")
 	case <-time.After(RegistrationTimeout):
+		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
 		return errors.New("registration timeout")
 	case ppd := <-md.ResponseMsgCh:
-		return r.handleRegistrationResponse(ppd)
+		return r.handleRegistrationResponse(ppd, registrationPeer)
 	}
 }
 
@@ -325,14 +372,21 @@ func (r *ACRegistration) register() error {
 // The response can be:
 // - NHP_ARD: Server is not assigned to this AC, contains list of assigned servers
 // - NHP_AAK: Server is assigned to this AC
-func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData) error {
+//
+// The registrationPeer is removed if NHP_ARD is received (we'll connect to different servers),
+// but kept if NHP_AAK is received (this server will send us NHP_AOP packets).
+func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, registrationPeer *core.UdpPeer) error {
 	if ppd.Error != nil {
+		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
 		return fmt.Errorf("registration failed: %w", ppd.Error)
 	}
 
 	switch ppd.HeaderType {
 	case core.NHP_ARD:
 		// Server is not assigned to this AC - parse redispatch message
+		// Remove the registration peer since we'll connect to different servers
+		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+
 		var ardMsg common.ACRedispatchMsg
 		if err := json.Unmarshal(ppd.BodyMessage, &ardMsg); err != nil {
 			return fmt.Errorf("failed to parse NHP_ARD: %w", err)
@@ -350,30 +404,44 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData) 
 
 	case core.NHP_AAK:
 		// Server responded with ACK - this server is assigned to us
+		// Keep the registration peer because this server will send us NHP_AOP packets
 		var aakMsg common.ServerACAckMsg
 		if err := json.Unmarshal(ppd.BodyMessage, &aakMsg); err != nil {
+			r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
 			return fmt.Errorf("failed to parse NHP_AAK: %w", err)
 		}
 
-		if aakMsg.ErrCode != "" && aakMsg.ErrCode != "SUCCESS" {
+		if !common.IsSuccessErrCode(aakMsg.ErrCode) {
+			r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
 			return fmt.Errorf("registration rejected: %s - %s", aakMsg.ErrCode, aakMsg.ErrMsg)
 		}
 
 		if !aakMsg.Registered {
+			r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
 			return errors.New("server returned NHP_AAK with Registered=false")
 		}
 
-		log.Info("Received NHP_AAK: ACAddr=%s, Registered=%v", aakMsg.ACAddr, aakMsg.Registered)
+		// Track the registration peer for cleanup when AC stops or re-registers
+		r.mu.Lock()
+		// Clean up old registration peer if exists (re-registration case)
+		if r.registrationPeer != nil {
+			r.ac.device.RemovePeer(r.registrationPeer.PublicKeyBase64())
+		}
+		r.registrationPeer = registrationPeer
+		r.mu.Unlock()
+
+		log.Info("Received NHP_AAK: ACAddr=%s, Registered=%v (peer kept for NHP_AOP)", aakMsg.ACAddr, aakMsg.Registered)
 		return nil
 
 	default:
+		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
 		return fmt.Errorf("unexpected response type: %s", core.HeaderTypeToString(ppd.HeaderType))
 	}
 }
 
 // HandleRedispatch processes an NHP_ARD message and connects to assigned servers.
 func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error {
-	if ardMsg.ErrCode != "" && ardMsg.ErrCode != "SUCCESS" {
+	if !common.IsSuccessErrCode(ardMsg.ErrCode) {
 		return errors.New("redispatch failed: " + ardMsg.ErrMsg)
 	}
 
@@ -542,7 +610,7 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 			return fmt.Errorf("failed to parse NHP_AAK: %w", err)
 		}
 
-		if aakMsg.ErrCode != "" && aakMsg.ErrCode != "SUCCESS" {
+		if !common.IsSuccessErrCode(aakMsg.ErrCode) {
 			r.ac.device.RemovePeer(peer.PublicKeyBase64())
 			server.Peer = nil
 			return fmt.Errorf("server rejected: %s - %s", aakMsg.ErrCode, aakMsg.ErrMsg)

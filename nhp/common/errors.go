@@ -58,6 +58,14 @@ func ErrorCodeToError(code string) *Error {
 	return nil // should not happen
 }
 
+// IsSuccessErrCode returns true if the error code represents success.
+// Per NHP protocol, success is indicated by:
+//   - empty string (implicit success, no error)
+//   - ErrSuccess.ErrorCode() i.e. "0" (explicit success)
+func IsSuccessErrCode(errCode string) bool {
+	return errCode == "" || errCode == ErrSuccess.ErrorCode()
+}
+
 // application errors
 var (
 	// generic
