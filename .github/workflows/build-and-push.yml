@@ -713,7 +713,7 @@ jobs:
             --auto-scaling-group-name "$ASG_NAME" \
             --preferences '{
               "MinHealthyPercentage": 90,
-              "InstanceWarmup": 300,
+              "InstanceWarmup": 180,
               "MaxHealthyPercentage": 110,
               "SkipMatching": true
             }' \
@@ -763,7 +763,7 @@ jobs:
             --auto-scaling-group-name "$ASG_NAME" \
             --preferences '{
               "MinHealthyPercentage": 50,
-              "InstanceWarmup": 300,
+              "InstanceWarmup": 180,
               "MaxHealthyPercentage": 110,
               "SkipMatching": true
             }' \
@@ -816,7 +816,7 @@ jobs:
             --auto-scaling-group-name "$ASG_NAME" \
             --preferences '{
               "MinHealthyPercentage": 50,
-              "InstanceWarmup": 300,
+              "InstanceWarmup": 180,
               "MaxHealthyPercentage": 110,
               "SkipMatching": false
             }' \
@@ -1117,7 +1117,7 @@ jobs:
             --auto-scaling-group-name "$ASG_NAME" \
             --preferences '{
               "MinHealthyPercentage": 90,
-              "InstanceWarmup": 300,
+              "InstanceWarmup": 180,
               "MaxHealthyPercentage": 105,
               "SkipMatching": true
             }' \
@@ -1168,7 +1168,7 @@ jobs:
             --auto-scaling-group-name "$ASG_NAME" \
             --preferences '{
               "MinHealthyPercentage": 75,
-              "InstanceWarmup": 300,
+              "InstanceWarmup": 180,
               "MaxHealthyPercentage": 105,
               "SkipMatching": true
             }' \

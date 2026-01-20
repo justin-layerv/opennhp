@@ -260,7 +260,7 @@ resource "aws_autoscaling_group" "demo_gateway" {
   }
 
   health_check_type         = "EC2"
-  health_check_grace_period = 300
+  health_check_grace_period = 180 # Reduced from 300s - nginx startup is typically ~60-90s
 
   target_group_arns = [
     aws_lb_target_group.https.arn,
@@ -271,7 +271,7 @@ resource "aws_autoscaling_group" "demo_gateway" {
     strategy = "Rolling"
     preferences {
       min_healthy_percentage = 50
-      instance_warmup        = 300
+      instance_warmup        = 180 # Reduced from 300s - aligns with health_check_grace_period
     }
   }
 

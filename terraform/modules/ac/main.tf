@@ -628,13 +628,13 @@ resource "aws_autoscaling_group" "ac" {
   }
 
   health_check_type         = "EC2"
-  health_check_grace_period = 300
+  health_check_grace_period = 180 # Reduced from 300s - AC startup is typically ~90-120s
 
   instance_refresh {
     strategy = "Rolling"
     preferences {
       min_healthy_percentage = 50
-      instance_warmup        = 300
+      instance_warmup        = 180 # Reduced from 300s - aligns with health_check_grace_period
     }
   }
 
