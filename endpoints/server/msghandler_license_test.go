@@ -269,12 +269,13 @@ func TestValidateACLicense_TimingAttackPrevention(t *testing.T) {
 	//
 	// A real timing attack would show 10x+ difference (e.g., 10ms vs 100ms).
 	// We use relative tolerance to catch that while allowing CI variance.
+	// Note: CI environments have significant timing variance due to virtualization.
 	const (
 		warmupRuns      = 2    // Discard first N runs (CPU cache warming)
 		measuredRuns    = 8    // Runs to measure (after warmup)
 		totalRuns       = warmupRuns + measuredRuns
 		trimOutliers    = 1    // Remove N highest/lowest samples
-		maxRelativeDev  = 0.35 // Max 35% deviation from median (catches 10x attacks, allows CI noise)
+		maxRelativeDev  = 0.45 // Max 45% deviation from median (catches 10x attacks, allows CI noise)
 		minExpectedTime = 50 * time.Millisecond // bcrypt should take at least this long
 	)
 

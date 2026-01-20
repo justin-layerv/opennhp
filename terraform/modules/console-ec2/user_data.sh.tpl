@@ -251,8 +251,15 @@ EXISTING_SECRET=$(aws secretsmanager get-secret-value --secret-id "$CONSOLE_AC_S
 
 if [ -n "$EXISTING_SECRET" ]; then
   echo "Found existing Console AC keypair (shared across instances)"
-  PRIVATE_KEY=$(echo "$EXISTING_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['privateKey'])")
-  PUBLIC_KEY=$(echo "$EXISTING_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['publicKey'])")
+  # Support both snake_case (new) and camelCase (legacy) secret formats
+  PRIVATE_KEY=$(echo "$EXISTING_SECRET" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('private_key', d.get('privateKey', '')))")
+  PUBLIC_KEY=$(echo "$EXISTING_SECRET" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('public_key', d.get('publicKey', '')))")
+  # Validate extracted keys
+  if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+    echo "FATAL: Could not extract keys from existing secret (missing private_key or public_key)"
+    echo "Secret content may be corrupted. Check: $CONSOLE_AC_SECRET_NAME"
+    exit 1
+  fi
 else
   echo "Generating new Curve25519 keypair..."
 
@@ -282,10 +289,10 @@ if len(private_bytes) != 32 or len(public_bytes) != 32:
     print(json.dumps({"error": f"Invalid key lengths: private={len(private_bytes)}, public={len(public_bytes)}"}), file=sys.stderr)
     sys.exit(1)
 
-# Encode as base64
+# Encode as base64 (snake_case keys for consistency with AWS conventions)
 result = {
-    'privateKey': base64.b64encode(private_bytes).decode(),
-    'publicKey': base64.b64encode(public_bytes).decode()
+    'private_key': base64.b64encode(private_bytes).decode(),
+    'public_key': base64.b64encode(public_bytes).decode()
 }
 
 print(json.dumps(result))
@@ -298,22 +305,23 @@ KEYGEN_EOF
     exit 1
   fi
 
-  if ! echo "$KEYPAIR" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'privateKey' in d and 'publicKey' in d" 2>/dev/null; then
+  if ! echo "$KEYPAIR" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'private_key' in d and 'public_key' in d" 2>/dev/null; then
     echo "FATAL: Keypair generation failed - missing keys"
     echo "$KEYPAIR"
     exit 1
   fi
 
-  PRIVATE_KEY=$(echo "$KEYPAIR" | python3 -c "import sys,json; print(json.load(sys.stdin)['privateKey'])")
-  PUBLIC_KEY=$(echo "$KEYPAIR" | python3 -c "import sys,json; print(json.load(sys.stdin)['publicKey'])")
+  PRIVATE_KEY=$(echo "$KEYPAIR" | python3 -c "import sys,json; print(json.load(sys.stdin)['private_key'])")
+  PUBLIC_KEY=$(echo "$KEYPAIR" | python3 -c "import sys,json; print(json.load(sys.stdin)['public_key'])")
 
   # Store keypair in Secrets Manager (shared across instance replacements)
+  # Using snake_case keys for consistency with AWS conventions
   SECRET_VALUE=$(cat << SECRETEOF
 {
-  "privateKey": "$PRIVATE_KEY",
-  "publicKey": "$PUBLIC_KEY",
-  "acId": "console-ac",
-  "createdAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "private_key": "$PRIVATE_KEY",
+  "public_key": "$PUBLIC_KEY",
+  "ac_id": "console-ac",
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 SECRETEOF
 )
@@ -336,8 +344,15 @@ SECRETEOF
       echo "FATAL: Could not create or fetch Console AC secret. Check IAM permissions and KMS key access."
       exit 1
     }
-    PRIVATE_KEY=$(echo "$EXISTING_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['privateKey'])")
-    PUBLIC_KEY=$(echo "$EXISTING_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['publicKey'])")
+    # Support both snake_case (new) and camelCase (legacy) secret formats
+    PRIVATE_KEY=$(echo "$EXISTING_SECRET" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('private_key', d.get('privateKey', '')))")
+    PUBLIC_KEY=$(echo "$EXISTING_SECRET" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('public_key', d.get('publicKey', '')))")
+    # Validate extracted keys
+    if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+      echo "FATAL: Could not extract keys from fetched secret (missing private_key or public_key)"
+      echo "Secret content may be corrupted. Check: $CONSOLE_AC_SECRET_NAME"
+      exit 1
+    fi
     echo "Using existing keypair from secret: $CONSOLE_AC_SECRET_NAME"
   fi
 fi
