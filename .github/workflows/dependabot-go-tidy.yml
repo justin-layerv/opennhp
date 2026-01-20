@@ -1,0 +1,67 @@
+name: Dependabot Go Mod Tidy
+
+# Runs go mod tidy across all Go modules when dependabot updates dependencies.
+# Uses pull_request trigger (not pull_request_target) because dependabot creates
+# branches in the same repo, so the GITHUB_TOKEN has write permissions.
+
+on:
+  pull_request:
+    paths:
+      - "**/go.mod"
+      - "**/go.sum"
+
+concurrency:
+  group: go-mod-tidy-${{ github.head_ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  go-mod-tidy:
+    name: Sync Go Modules
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Only run for dependabot PRs
+    if: github.actor == 'dependabot[bot]'
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          ref: ${{ github.head_ref }}
+          persist-credentials: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
+        with:
+          go-version-file: nhp/go.mod
+          cache-dependency-path: |
+            nhp/go.sum
+            endpoints/go.sum
+            examples/server_plugin/go.sum
+
+      - name: Run go mod tidy on all modules
+        run: |
+          cd $GITHUB_WORKSPACE/nhp && go mod tidy
+          cd $GITHUB_WORKSPACE/endpoints && go mod tidy
+          cd $GITHUB_WORKSPACE/examples/server_plugin && go mod tidy
+
+      - name: Check for changes
+        id: changes
+        run: |
+          if git diff --quiet; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit and push changes
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore(deps): sync go.mod/go.sum files [automated]"
+          git push
