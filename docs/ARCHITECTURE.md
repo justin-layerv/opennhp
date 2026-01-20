@@ -53,6 +53,7 @@ The NHP Server receives knock requests and coordinates with ACs to grant access.
 | `storage.go` | Storage backend interface |
 | `dynamodb_storage.go` | DynamoDB storage implementation |
 | `etcd_storage.go` | etcd storage implementation (on-prem) |
+| `cloudmap.go` | Cloud Map health discovery for stale assignment filtering |
 | `msghandler.go` | NHP message processing |
 
 **HTTP Routes:**
@@ -220,6 +221,7 @@ The NHP service manages AC server assignments. When an AC is created, Console:
 | `assignment.go` | Server selection algorithm (multi-AZ) |
 | `cloudmap.go` | AWS Cloud Map server discovery |
 | `dynamodb.go` | DynamoDB storage operations |
+| `health_monitor.go` | Stale assignment cleanup and server health monitoring |
 | `console_ac.go` | Console's own AC self-registration |
 
 **AC Assignment Flow:**
@@ -262,6 +264,73 @@ GVA_CONFIG_NHP_CONSOLE_AC_ID=console-ac
 GVA_CONFIG_NHP_CONSOLE_AC_RESOURCE_FQDN=console.apps.layerv.xyz
 GVA_CONFIG_NHP_CONSOLE_AC_CUSTOMER_ID=layerv
 ```
+
+#### Stale Assignment Resilience
+
+When NHP Servers terminate (ASG scale-down, instance refresh, crash), DynamoDB AC assignments
+pointing to that server become **stale**. Without mitigation, this causes ACs to be redirected
+to dead servers in a failure loop.
+
+**Three-Layer Defense:**
+
+| Layer | Mechanism | Cleanup Time | Enable Via |
+|-------|-----------|--------------|------------|
+| **Immediate** | ASG lifecycle hook + Lambda | Instant (before termination) | `enable_termination_cleanup = true` |
+| **Proactive** | Console health monitor (GSI-based) | 60-90s | Always enabled |
+| **Real-time** | NHP Server health filtering | Per-registration | Always enabled (requires Cloud Map) |
+
+**NHP Server Health Filtering (`endpoints/server/cloudmap.go`):**
+
+Before sending an NHP_ARD redirect, the server verifies assigned servers are healthy:
+
+1. Query Cloud Map for currently healthy server IPs (30s cache TTL)
+2. Filter assignment's `AssignedServers` to only include healthy ones
+3. If NO healthy servers remain → accept AC directly (NHP_AAK), breaking the failure loop
+4. If SOME healthy servers remain → send NHP_ARD with filtered list
+
+```
+AC ──► NHP Server ──► Check Cloud Map ──► Filter assignment ──► NHP_ARD (or NHP_AAK if all dead)
+```
+
+**Fail-Open Design:**
+- If Cloud Map is unavailable, all servers are considered healthy (prevents blocking)
+- Uses separate 5s timeout context to avoid cascading timeouts from DynamoDB
+
+**Console Health Monitor (`console/server/service/nhp/health_monitor.go`):**
+
+The health monitor's `cleanupStaleAssignments()` function:
+
+1. Gets set of healthy server IPs and IDs from Cloud Map
+2. Scans all AC assignments from DynamoDB
+3. For each assignment, checks if ANY assigned server is healthy (by IP, InternalIP, or ID)
+4. If NONE are healthy → deletes the assignment (AC will re-register fresh)
+
+**Safety Mechanisms:**
+- **Fail-safe**: If Cloud Map returns no healthy servers, skip cleanup entirely (likely Cloud Map issue)
+- **Grace period**: Skip recently reassigned assignments (5 min) to prevent race conditions
+- **Batch deletes**: Uses DynamoDB BatchWriteItem for efficient bulk deletion
+
+**ASG Lifecycle Hook + Lambda (`terraform/modules/compute/`):**
+
+For immediate cleanup before server termination completes:
+
+1. ASG termination triggers lifecycle hook (pauses termination for up to 5 min)
+2. EventBridge rule captures lifecycle event
+3. Lambda function executes:
+   - Queries `server-ac-index` GSI for all ACs assigned to terminating server
+   - Updates each assignment to remove the server from `assigned_servers`
+   - Deletes assignments with no remaining servers
+   - Cleans up index entries
+   - Completes lifecycle action (allows termination to proceed)
+
+**Enable via Terraform:**
+```hcl
+enable_termination_cleanup = true
+```
+
+**Key Files:**
+- `terraform/modules/compute/lambda/server_termination_cleanup.py` - Lambda function
+- `terraform/modules/compute/main.tf` - Lifecycle hook, EventBridge, IAM
 
 ---
 

@@ -408,6 +408,35 @@ func TestDefaultStorageConfig(t *testing.T) {
 	if cfg.Cache.ReassignmentTTL != 5 {
 		t.Errorf("Expected ReassignmentTTL 5, got %d", cfg.Cache.ReassignmentTTL)
 	}
+
+	// CloudMap defaults
+	if cfg.CloudMap.Enabled != false {
+		t.Errorf("Expected CloudMap.Enabled false, got %v", cfg.CloudMap.Enabled)
+	}
+	// CloudMap should have empty config by default (user must configure)
+	if cfg.CloudMap.Region != "" {
+		t.Errorf("Expected CloudMap.Region empty, got '%s'", cfg.CloudMap.Region)
+	}
+	if cfg.CloudMap.NamespaceName != "" {
+		t.Errorf("Expected CloudMap.NamespaceName empty, got '%s'", cfg.CloudMap.NamespaceName)
+	}
+	if cfg.CloudMap.ServiceName != "" {
+		t.Errorf("Expected CloudMap.ServiceName empty, got '%s'", cfg.CloudMap.ServiceName)
+	}
+	// Configurable TTL/timeout should use defaults when 0
+	if cfg.CloudMap.CacheTTL != 0 {
+		t.Errorf("Expected CloudMap.CacheTTL 0 (use default), got %d", cfg.CloudMap.CacheTTL)
+	}
+	if cfg.CloudMap.OperationTimeout != 0 {
+		t.Errorf("Expected CloudMap.OperationTimeout 0 (use default), got %d", cfg.CloudMap.OperationTimeout)
+	}
+	// Verify GetCacheTTL/GetOperationTimeout return defaults
+	if cfg.CloudMap.GetCacheTTL() != DefaultCloudMapCacheTTL {
+		t.Errorf("Expected GetCacheTTL() %v, got %v", DefaultCloudMapCacheTTL, cfg.CloudMap.GetCacheTTL())
+	}
+	if cfg.CloudMap.GetOperationTimeout() != DefaultCloudMapOperationTimeout {
+		t.Errorf("Expected GetOperationTimeout() %v, got %v", DefaultCloudMapOperationTimeout, cfg.CloudMap.GetOperationTimeout())
+	}
 }
 
 // ============================================================================

@@ -171,6 +171,11 @@ type StorageConfig struct {
 
 	// Cache configuration
 	Cache CacheConfig `toml:"Cache"`
+
+	// CloudMap configuration for server health discovery.
+	// Used to filter stale AC assignments pointing to terminated servers.
+	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md for details.
+	CloudMap CloudMapConfig `toml:"CloudMap"`
 }
 
 // DynamoDBConfig configures the DynamoDB storage backend.
@@ -213,16 +218,19 @@ func DefaultStorageConfig() StorageConfig {
 	return StorageConfig{
 		Backend: "dynamodb",
 		DynamoDB: DynamoDBConfig{
-			Region:              "us-east-2",
-			LicensesTable:       "nhp-licenses",
-			ACAssignmentsTable:  "nhp-ac-assignments",
-			ResourcesTable:      "nhp-resources",
+			Region:             "us-east-2",
+			LicensesTable:      "nhp-licenses",
+			ACAssignmentsTable: "nhp-ac-assignments",
+			ResourcesTable:     "nhp-resources",
 		},
 		Cache: CacheConfig{
 			MaxEntries:         10000,
 			DefaultTTL:         60,  // 60 seconds
 			ReassignmentTTL:    5,   // 5 seconds
 			ReassignmentWindow: 300, // 5 minutes
+		},
+		CloudMap: CloudMapConfig{
+			Enabled: false, // Disabled by default, enable via storage.toml
 		},
 	}
 }

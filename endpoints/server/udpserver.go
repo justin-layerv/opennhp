@@ -107,6 +107,10 @@ type UdpServer struct {
 	storage       StorageBackend   // DynamoDB (cloud) or etcd (on-prem)
 	storageConfig *StorageConfig
 	forwarder     *ServerForwarder // Server-to-server knock forwarding
+
+	// Cloud Map client for server health discovery.
+	// Used to filter stale AC assignments pointing to terminated servers.
+	cloudMap *CloudMapClient
 }
 
 type BlockAddr struct {
@@ -202,6 +206,22 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 			// Continue without storage - fall back to etcd/local config
 		} else {
 			log.Info("Storage backend initialized: %s", s.storage.Name())
+		}
+	}
+
+	// Initialize Cloud Map client for server health discovery (if configured).
+	// This is used to filter stale AC assignments pointing to terminated servers.
+	if s.storageConfig != nil && s.storageConfig.CloudMap.Enabled {
+		cloudMapCtx, cloudMapCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cloudMapCancel()
+
+		var cloudMapErr error
+		s.cloudMap, cloudMapErr = NewCloudMapClient(cloudMapCtx, s.storageConfig.CloudMap)
+		if cloudMapErr != nil {
+			log.Warning("Failed to initialize Cloud Map client: %v (server health filtering disabled)", cloudMapErr)
+			// Continue without Cloud Map - fail-open
+		} else {
+			log.Info("Cloud Map client initialized for server health filtering")
 		}
 	}
 

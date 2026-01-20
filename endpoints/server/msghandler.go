@@ -323,6 +323,11 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 // Returns (true, nil) if AC was redirected via NHP_ARD.
 // Returns (false, nil) if this server should handle the AC (or AC not found in storage).
 // Returns (false, error) on storage error.
+//
+// IMPORTANT: Before redirecting, this function filters assignments to only include
+// servers that are currently healthy according to Cloud Map. This prevents ACs from
+// being redirected to terminated servers (stale assignments).
+// See docs/ARCHITECTURE.md "Stale DynamoDB Assignment Resilience" for details.
 func (s *UdpServer) handleACServerAssignment(
 	ppd *core.PacketParserData,
 	aolMsg *common.ACOnlineMsg,
@@ -345,10 +350,29 @@ func (s *UdpServer) handleACServerAssignment(
 		return false, err
 	}
 
-	// Check if this server is assigned to the AC
+	// Filter assignment to only healthy servers (via Cloud Map health discovery).
+	// This prevents redirecting ACs to terminated servers (stale assignments).
+	// If Cloud Map is unavailable, all servers are considered healthy (fail-open).
+	// Note: Use a separate context for Cloud Map to avoid timeout cascading from DynamoDB.
+	cloudMapCtx, cloudMapCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cloudMapCancel()
+	healthyServers := FilterHealthyServers(cloudMapCtx, s.cloudMap, assignment.AssignedServers)
+	if len(healthyServers) == 0 {
+		// All assigned servers are unhealthy - accept AC directly rather than
+		// redirecting to dead servers. This breaks the failure loop.
+		log.Warning("server-ac(%s#%d@%s)[HandleACOnline] all %d assigned servers unhealthy, accepting directly",
+			acId, transactionId, addrStr, len(assignment.AssignedServers))
+		return false, nil
+	}
+	if len(healthyServers) < len(assignment.AssignedServers) {
+		log.Info("server-ac(%s#%d@%s)[HandleACOnline] filtered to %d/%d healthy servers",
+			acId, transactionId, addrStr, len(healthyServers), len(assignment.AssignedServers))
+	}
+
+	// Check if this server is assigned to the AC (using filtered healthy servers)
 	serverID := s.config.Hostname // Use hostname as server identifier
 	isAssigned := false
-	for _, srv := range assignment.AssignedServers {
+	for _, srv := range healthyServers {
 		if srv.ID == serverID {
 			isAssigned = true
 			break
@@ -360,11 +384,11 @@ func (s *UdpServer) handleACServerAssignment(
 		return false, nil
 	}
 
-	// Not assigned - send NHP_ARD to redirect AC to assigned servers
-	log.Info("server-ac(%s#%d@%s)[HandleACOnline] redirecting AC to %d assigned servers", acId, transactionId, addrStr, len(assignment.AssignedServers))
+	// Not assigned - send NHP_ARD to redirect AC to healthy assigned servers
+	log.Info("server-ac(%s#%d@%s)[HandleACOnline] redirecting AC to %d healthy assigned servers", acId, transactionId, addrStr, len(healthyServers))
 
-	targets := make([]common.RedirectTarget, len(assignment.AssignedServers))
-	for i, srv := range assignment.AssignedServers {
+	targets := make([]common.RedirectTarget, len(healthyServers))
+	for i, srv := range healthyServers {
 		targets[i] = common.RedirectTarget{
 			IP:           srv.IP,
 			Port:         srv.Port,
