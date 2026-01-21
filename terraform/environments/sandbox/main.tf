@@ -72,6 +72,9 @@ module "nhp" {
   # Traefik plugins
   traefik_plugins = var.traefik_plugins
 
+  # Traefik plugins deploy bucket (for traefik-plugins CI/CD SSM-based deployment)
+  traefik_plugins_deploy_bucket_arn = var.traefik_plugins_deploy_bucket_arn
+
   # Plugin repos - repos that can assume the GitHub Actions role
   plugin_repos = var.plugin_repos
 

@@ -214,6 +214,13 @@ variable "traefik_plugins" {
   default = {}
 }
 
+# Traefik plugins deploy bucket (for traefik-plugins CI/CD SSM-based deployment)
+variable "traefik_plugins_deploy_bucket_arn" {
+  description = "ARN of the S3 bucket used by traefik-plugins CI/CD for SSM-based plugin deployment"
+  type        = string
+  default     = null
+}
+
 # Plugin repos - repos that can assume the GitHub Actions role
 variable "plugin_repos" {
   description = "Additional GitHub repos that can assume the GitHub Actions role"
