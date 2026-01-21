@@ -12,6 +12,11 @@
 !.github/
 !.golangci.yml
 
+# Claude Code
+!.claude/
+.claude/*
+!.claude/commands/
+
 # NHP binaries (compiled without extension on Unix)
 nhp-server
 nhp-acd
