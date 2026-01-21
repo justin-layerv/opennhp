@@ -491,6 +491,9 @@ module "ac" {
   plugin_download_policy_arn = module.plugins.download_policy_arn
   traefik_plugins            = module.plugins.traefik_plugins
 
+  # Traefik-plugins CI/CD bucket (for SSM-based plugin deployment)
+  traefik_plugins_deploy_bucket_arn = var.traefik_plugins_deploy_bucket_arn
+
   # Console backend routing (when Console is in internal_only mode)
   # Routes Console domain directly to Console EC2, bypassing nhp-acd
   console_backend_url = var.deploy_console_ec2 && var.console_internal_only ? module.console_ec2[0].internal_endpoint : null

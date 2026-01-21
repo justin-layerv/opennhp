@@ -85,6 +85,11 @@ traefik_plugins = {
   }
 }
 
+# Traefik-plugins CI/CD uses a separate S3 bucket for SSM-based deployment
+# This bucket is managed outside terraform (by traefik-plugins repo)
+# The ARN is needed for AC instances to download plugin tarballs via SSM
+traefik_plugins_deploy_bucket_arn = "arn:aws:s3:::traefik-plugins-deploy-767397897469"
+
 # Repos that can assume the GitHub Actions IAM role
 # NHP server plugins are now compiled in - only Traefik plugins use S3
 plugin_repos = ["traefik-plugins", "console"]

@@ -182,6 +182,16 @@ variable "traefik_plugins_github_repo" {
   default     = "traefik-plugins"
 }
 
+variable "traefik_plugins_deploy_bucket_arn" {
+  description = <<-EOT
+    ARN of the S3 bucket used by traefik-plugins CI/CD for plugin deployment.
+    This bucket is used by the SSM deploy document to download plugin tarballs.
+    Example: arn:aws:s3:::traefik-plugins-deploy-123456789012
+  EOT
+  type        = string
+  default     = null
+}
+
 variable "create_oidc_provider" {
   description = <<-EOT
     Whether to create the GitHub OIDC provider in this account.

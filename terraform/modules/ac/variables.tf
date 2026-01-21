@@ -285,6 +285,12 @@ variable "plugin_download_policy_arn" {
   default     = null
 }
 
+variable "traefik_plugins_deploy_bucket_arn" {
+  description = "ARN of the S3 bucket used by traefik-plugins CI/CD for plugin deployment"
+  type        = string
+  default     = null
+}
+
 variable "traefik_plugins" {
   description = <<-EOT
     Map of Traefik plugins with their S3 keys (from plugins module output).

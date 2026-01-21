@@ -492,6 +492,30 @@ resource "aws_iam_role_policy" "ac_cross_account_route53" {
   })
 }
 
+# Traefik plugins deploy bucket access (for traefik-plugins CI/CD)
+resource "aws_iam_role_policy" "ac_traefik_plugins_deploy" {
+  count = var.traefik_plugins_deploy_bucket_arn != null ? 1 : 0
+
+  name = "traefik-plugins-deploy"
+  role = aws_iam_role.ac.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "TraefikPluginsS3Download"
+      Effect = "Allow"
+      Action = [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ]
+      Resource = [
+        var.traefik_plugins_deploy_bucket_arn,
+        "${var.traefik_plugins_deploy_bucket_arn}/*"
+      ]
+    }]
+  })
+}
+
 resource "aws_iam_instance_profile" "ac" {
   name = "${var.name_prefix}-ac"
   role = aws_iam_role.ac.name
