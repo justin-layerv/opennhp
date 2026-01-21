@@ -204,6 +204,27 @@ variable "server_plugins" {
   default     = []
 }
 
+# QURL plugin configuration
+variable "qurl_config" {
+  description = "QURL plugin configuration for token resolution (qurl.link → qurl.site flow)"
+  type = object({
+    enabled                 = bool
+    api_url                 = string
+    allowed_redirect_domain = string
+    api_timeout             = number
+    max_idle_conns          = number
+    max_idle_conns_per_host = number
+    idle_conn_timeout       = number
+  })
+  default = null
+}
+
+variable "qurl_service_token_secret_arn" {
+  description = "ARN of Secrets Manager secret containing the QURL service token"
+  type        = string
+  default     = null
+}
+
 # Traefik plugins
 variable "traefik_plugins" {
   description = "Map of Traefik plugins to deploy"

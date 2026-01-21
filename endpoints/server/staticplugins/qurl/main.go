@@ -1,0 +1,243 @@
+package qurl
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"sync"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/OpenNHP/opennhp/nhp/common"
+	"github.com/OpenNHP/opennhp/nhp/log"
+	"github.com/OpenNHP/opennhp/nhp/plugins"
+
+	nhpplugins "github.com/fengyily/nhp-plugins-sdk"
+	nhpsdkutils "github.com/fengyily/nhp-plugins-sdk/utils"
+)
+
+const (
+	name    = "qurl"
+	version = "1.0.0"
+)
+
+var (
+	resolver *QurlResolver
+	initOnce sync.Once
+	initErr  error
+)
+
+// Version returns the plugin version string
+func Version() string {
+	return fmt.Sprintf("%s v%s", name, version)
+}
+
+// Init initializes the QURL plugin with configuration.
+// Returns an error if required configuration is missing (fail-fast).
+// Uses sync.Once to ensure thread-safe initialization even if called multiple times.
+func Init(in *plugins.PluginParamsIn) error {
+	_ = in // unused but required by plugin interface
+
+	initOnce.Do(func() {
+		resolver, initErr = NewQurlResolver()
+		if initErr != nil {
+			initErr = fmt.Errorf("[QURL] failed to initialize: %w", initErr)
+			return
+		}
+		log.Info("[QURL] Plugin initialized: %s", Version())
+	})
+
+	return initErr
+}
+
+// Close shuts down the plugin and releases resources.
+// The nil check is defensive - Close may be called even if Init failed or was never called.
+func Close() error {
+	if resolver != nil {
+		resolver.Close()
+	}
+	log.Info("[QURL] Plugin closed")
+	return nil
+}
+
+// AuthWithHttp handles HTTP-based QURL token resolution and NHP knock
+//
+// Flow:
+// 1. User visits qurl.link/#<access_token>
+// 2. qurl.link SPA extracts fragment and redirects to /plugins/qurl?token=<access_token>
+// 3. This handler validates the token via QURL API
+// 4. On success, triggers NHP knock via helper callback
+// 5. Sets NHP cookies and redirects to qurl.site resource
+//
+// Security note: Rate limiting should be handled at infrastructure level (NLB, WAF)
+// to protect against brute-force token guessing attacks.
+func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugins.HttpServerPluginHelper) (ackMsg *common.ServerKnockAckMsg, err error) {
+	if helper == nil {
+		return nil, fmt.Errorf("AuthWithHttp: helper is null")
+	}
+
+	// Set CORS headers early so error responses are also CORS-enabled.
+	// This is important for cross-origin error handling in the qurl.link SPA.
+	ctx.SetSameSite(http.SameSiteNoneMode)
+	nhpplugins.CorsMiddleware(ctx)
+
+	// Extract and validate access token from query parameter
+	accessToken := ctx.Query("token")
+	if err := ValidateAccessToken(accessToken); err != nil {
+		// Log detailed error for debugging, but return generic message to client
+		// to prevent attacker footprinting (e.g., learning token length requirements)
+		log.Error("[QURL] Invalid access token from %s: %v", ctx.ClientIP(), err)
+		ctx.JSON(http.StatusBadRequest, gin.H{
+			"error":   "invalid_token",
+			"message": "The provided token is invalid",
+		})
+		return nil, fmt.Errorf("invalid access token: %w", err)
+	}
+
+	// Resolve the access token via QURL API
+	resolveReq := &ResolveRequest{
+		AccessToken: accessToken,
+		SrcIP:       ctx.ClientIP(),
+		UserAgent:   ctx.Request.UserAgent(),
+	}
+
+	resolveResp, err := resolver.Resolve(ctx.Request.Context(), resolveReq)
+	if err != nil {
+		log.Error("[QURL] Token resolution failed: %v", err)
+		handleResolveError(ctx, err)
+		return nil, err
+	}
+
+	log.Info("[QURL] Token resolved successfully: resource_id=%s", resolveResp.ResourceID)
+
+	// Build ResourceData from the resolved response
+	res := buildResourceData(resolveResp)
+
+	// Trigger NHP knock via helper callback
+	ackMsg, err = helper.AuthWithHttpCallbackFunc(req, res)
+	if err != nil {
+		log.Error("[QURL] NHP knock failed: %v", err)
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "knock_failed",
+			"message": "Failed to open access to resource",
+		})
+		return nil, err
+	}
+
+	if ackMsg == nil || len(ackMsg.ResourceHost) == 0 {
+		log.Error("[QURL] NHP knock returned no resource hosts")
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "no_resource_hosts",
+			"message": "No resource hosts available",
+		})
+		return nil, fmt.Errorf("no resource hosts available")
+	}
+
+	log.Info("[QURL] NHP knock succeeded: hosts=%v", ackMsg.ResourceHost)
+
+	// Generate NHP tokens and set cookies
+	jwtSecret := nhpsdkutils.GetStringFromMap(res.ExInfo, "JWTSecret")
+	if jwtSecret == "" {
+		log.Error("[QURL] JWT secret is empty - cannot generate tokens")
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "configuration_error",
+			"message": "JWT secret not configured",
+		})
+		return nil, fmt.Errorf("JWT secret is empty")
+	}
+
+	jwt := &nhpplugins.JWTToken{
+		JwtKey: []byte(jwtSecret),
+	}
+
+	nhpToken, refreshToken, err := jwt.GenerateAll(res.AuthServiceId, res)
+	if err != nil {
+		log.Error("[QURL] Failed to generate tokens: %v", err)
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "token_generation_failed",
+			"message": "Failed to generate access tokens",
+		})
+		return nil, err
+	}
+
+	// Validate cookie domain and redirect URL BEFORE setting any cookies.
+	// This ensures we don't set cookies if either validation fails.
+	if err := ValidateCookieDomain(res.CookieDomain, resolver.AllowedRedirectDomain()); err != nil {
+		log.Error("[QURL] Invalid cookie domain from API: %v", err)
+		ctx.JSON(http.StatusBadGateway, gin.H{
+			"error":   "invalid_cookie_domain",
+			"message": "Invalid cookie domain from upstream service",
+		})
+		return nil, fmt.Errorf("invalid cookie domain: %w", err)
+	}
+
+	if err := ValidateRedirectURL(resolveResp.QurlSiteURL, resolver.AllowedRedirectDomain()); err != nil {
+		log.Error("[QURL] Invalid redirect URL from API: %v", err)
+		ctx.JSON(http.StatusBadGateway, gin.H{
+			"error":   "invalid_redirect",
+			"message": "Invalid redirect URL from upstream service",
+		})
+		return nil, fmt.Errorf("invalid redirect URL: %w", err)
+	}
+
+	// Now safe to set cookies and redirect
+	tokenExpire := nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire")
+	ctx.SetCookie("nhp_token", nhpToken, tokenExpire, "/", res.CookieDomain, true, true)
+	ctx.SetCookie("nhp_refresh_token", refreshToken, tokenExpire, "/", res.CookieDomain, true, true)
+
+	log.Info("[QURL] Tokens generated and cookies set, redirecting to: %s", resolveResp.QurlSiteURL)
+
+	// Redirect to the qurl.site URL (e.g., https://r_9f3a2c8e.qurl.site)
+	ctx.Redirect(http.StatusFound, resolveResp.QurlSiteURL)
+
+	return ackMsg, nil
+}
+
+// buildResourceData constructs a ResourceData from the QURL API response
+func buildResourceData(resp *ResolveResponse) *common.ResourceData {
+	return &common.ResourceData{
+		ResourceGroup: common.ResourceGroup{
+			ResourceId:    resp.ResourceID,
+			AuthServiceId: PluginID,
+			OpenTime:      resp.OpenTime,
+			Resources:     resp.Resources,
+		},
+		ExInfo: map[string]any{
+			"JWTSecret":   resp.JWTSecret,
+			"TokenExpire": resp.TokenExpire,
+		},
+		RedirectUrl:  resp.QurlSiteURL,
+		CookieDomain: resp.CookieDomain,
+	}
+}
+
+// handleResolveError sends appropriate error responses based on resolution failure
+func handleResolveError(ctx *gin.Context, err error) {
+	switch {
+	case errors.Is(err, ErrTokenNotFound):
+		ctx.JSON(http.StatusNotFound, gin.H{
+			"error":   "token_not_found",
+			"message": "Access token not found or expired",
+		})
+	case errors.Is(err, ErrTokenConsumed):
+		ctx.JSON(http.StatusGone, gin.H{
+			"error":   "token_consumed",
+			"message": "Access token has already been used",
+		})
+	case errors.Is(err, ErrTokenExpired):
+		ctx.JSON(http.StatusGone, gin.H{
+			"error":   "token_expired",
+			"message": "Access token has expired",
+		})
+	case errors.Is(err, ErrPolicyViolation):
+		ctx.JSON(http.StatusForbidden, gin.H{
+			"error":   "policy_violation",
+			"message": "Access denied by policy",
+		})
+	default:
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "resolution_failed",
+			"message": "Failed to resolve access token",
+		})
+	}
+}

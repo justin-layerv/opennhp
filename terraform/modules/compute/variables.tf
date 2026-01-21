@@ -290,3 +290,45 @@ variable "alerts_sns_topic_arn" {
   type        = string
   default     = null
 }
+
+# =============================================================================
+# QURL Plugin Configuration
+# These settings configure the QURL token resolution plugin for qurl.link flow.
+# All settings are passed as environment variables to the NHP Server container.
+# =============================================================================
+
+variable "qurl_config" {
+  description = <<-EOT
+    QURL plugin configuration. When enabled, the NHP Server will handle
+    token resolution for the qurl.link → qurl.site authentication flow.
+    All values are passed as environment variables to the Docker container.
+  EOT
+  type = object({
+    enabled                 = bool
+    api_url                 = string # QURL API base URL (e.g., https://api.qurl.internal)
+    allowed_redirect_domain = string # Domain suffix for redirect validation (e.g., qurl.site)
+    api_timeout             = number # API request timeout in seconds
+    max_idle_conns          = number # Maximum idle HTTP connections
+    max_idle_conns_per_host = number # Maximum idle connections per host
+    idle_conn_timeout       = number # Idle connection timeout in seconds
+  })
+  default = null
+
+  validation {
+    condition = var.qurl_config == null || (
+      var.qurl_config.api_timeout > 0 &&
+      var.qurl_config.max_idle_conns > 0 &&
+      var.qurl_config.max_idle_conns_per_host > 0 &&
+      var.qurl_config.idle_conn_timeout > 0 &&
+      length(var.qurl_config.allowed_redirect_domain) > 0 &&
+      length(var.qurl_config.api_url) > 0
+    )
+    error_message = "qurl_config: all timeout/connection values must be positive, and api_url/allowed_redirect_domain must be non-empty."
+  }
+}
+
+variable "qurl_service_token_secret_arn" {
+  description = "ARN of Secrets Manager secret containing the QURL service token for API authentication"
+  type        = string
+  default     = null
+}

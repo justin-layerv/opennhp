@@ -274,6 +274,10 @@ module "compute" {
   server_plugins  = var.server_plugins
   auth_service_id = var.ac_auth_service_id
 
+  # QURL plugin configuration
+  qurl_config                   = var.qurl_config
+  qurl_service_token_secret_arn = var.qurl_service_token_secret_arn
+
   # Pluggable storage backend - DynamoDB (cloud default) with etcd feature flag for on-prem
   # Note: attach_storage_policies is required because Terraform cannot evaluate count based on module outputs
   attach_storage_policies  = true

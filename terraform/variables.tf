@@ -451,6 +451,52 @@ variable "server_plugins" {
   default     = []
 }
 
+variable "qurl_config" {
+  description = <<-EOT
+    QURL plugin configuration for token resolution.
+    When enabled, the NHP Server handles the qurl.link → qurl.site authentication flow.
+
+    Example:
+    qurl_config = {
+      enabled                 = true
+      api_url                 = "https://api.qurl.internal"
+      allowed_redirect_domain = "qurl.site"
+      api_timeout             = 10
+      max_idle_conns          = 10
+      max_idle_conns_per_host = 5
+      idle_conn_timeout       = 30
+    }
+  EOT
+  type = object({
+    enabled                 = bool
+    api_url                 = string
+    allowed_redirect_domain = string
+    api_timeout             = number
+    max_idle_conns          = number
+    max_idle_conns_per_host = number
+    idle_conn_timeout       = number
+  })
+  default = null
+
+  validation {
+    condition = var.qurl_config == null || (
+      var.qurl_config.api_timeout > 0 &&
+      var.qurl_config.max_idle_conns > 0 &&
+      var.qurl_config.max_idle_conns_per_host > 0 &&
+      var.qurl_config.idle_conn_timeout > 0 &&
+      length(var.qurl_config.allowed_redirect_domain) > 0 &&
+      length(var.qurl_config.api_url) > 0
+    )
+    error_message = "qurl_config: all timeout/connection values must be positive, and api_url/allowed_redirect_domain must be non-empty."
+  }
+}
+
+variable "qurl_service_token_secret_arn" {
+  description = "ARN of Secrets Manager secret containing the QURL service token"
+  type        = string
+  default     = null
+}
+
 variable "traefik_plugins" {
   description = <<-EOT
     Map of Traefik plugins to deploy.

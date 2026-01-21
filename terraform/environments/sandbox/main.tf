@@ -69,6 +69,10 @@ module "nhp" {
   # NHP Server plugins
   server_plugins = var.server_plugins
 
+  # QURL plugin configuration
+  qurl_config                   = var.qurl_config
+  qurl_service_token_secret_arn = var.qurl_service_token_secret_arn
+
   # Traefik plugins
   traefik_plugins = var.traefik_plugins
 

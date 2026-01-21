@@ -408,6 +408,28 @@ echo "Created passcode plugin config"
 echo "No plugins configured, skipping resource.toml creation"
 %{ endif ~}
 
+# ============================================================================
+# QURL Plugin Configuration
+# Fetches service token from Secrets Manager and prepares environment variables
+# for the Docker container. The QURL plugin handles token resolution for the
+# qurl.link → qurl.site authentication flow.
+# ============================================================================
+%{ if qurl_enabled ~}
+echo "Fetching QURL service token from Secrets Manager..."
+QURL_SERVICE_TOKEN=$(aws secretsmanager get-secret-value \
+  --secret-id "${qurl_service_token_secret_arn}" \
+  --region "$REGION" \
+  --query SecretString --output text) || {
+    echo "ERROR: Failed to fetch QURL service token from Secrets Manager"
+    exit 1
+}
+if [ -z "$QURL_SERVICE_TOKEN" ]; then
+  echo "ERROR: QURL service token is empty"
+  exit 1
+fi
+echo "QURL plugin configured: api_url=${qurl_api_url}, allowed_domain=${qurl_allowed_redirect_domain}"
+%{ endif ~}
+
 cat > /etc/systemd/system/nhp-server.service << SVCEOF
 [Unit]
 Description=LayerV NHP Server
@@ -425,6 +447,15 @@ ExecStart=/usr/bin/docker run --rm --name nhp-server \
   -v /opt/layerv/nhp-server/etc:/nhp-server/etc:ro \
   -v /opt/layerv/nhp-server/log:/nhp-server/logs \
   -v /opt/layerv/nhp-server/plugins:/nhp-server/plugins:ro \
+%{ if qurl_enabled ~}
+  -e QURL_API_URL="${qurl_api_url}" \
+  -e QURL_SERVICE_TOKEN="$QURL_SERVICE_TOKEN" \
+  -e QURL_ALLOWED_REDIRECT_DOMAIN="${qurl_allowed_redirect_domain}" \
+  -e QURL_API_TIMEOUT="${qurl_api_timeout}" \
+  -e QURL_MAX_IDLE_CONNS="${qurl_max_idle_conns}" \
+  -e QURL_MAX_IDLE_CONNS_PER_HOST="${qurl_max_idle_conns_per_host}" \
+  -e QURL_IDLE_CONN_TIMEOUT="${qurl_idle_conn_timeout}" \
+%{ endif ~}
   ${server_repo_url}:${image_tag}
 ExecStop=/usr/bin/docker stop nhp-server
 

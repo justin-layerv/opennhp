@@ -21,6 +21,7 @@ import (
 	// not built as .so files by the plugins Makefile
 	_ "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/oidc"
 	_ "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/passcode"
+	_ "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/qurl"
 )
 
 // ANSI color codes

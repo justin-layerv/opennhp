@@ -290,7 +290,8 @@ resource "aws_iam_role_policy" "server" {
         Resource = compact(concat(
           [aws_secretsmanager_secret.server.arn],
           [var.etcd_secret_arn],
-          [var.etcd_tls_secret_arn]
+          [var.etcd_tls_secret_arn],
+          [var.qurl_service_token_secret_arn]
         ))
       },
       {
@@ -453,6 +454,15 @@ locals {
     dynamodb_licenses_table       = var.dynamodb_licenses_table
     dynamodb_ac_assignments_table = var.dynamodb_ac_assignments_table
     dynamodb_resources_table      = var.dynamodb_resources_table
+    # QURL plugin configuration
+    qurl_enabled                  = var.qurl_config != null ? var.qurl_config.enabled : false
+    qurl_api_url                  = var.qurl_config != null ? var.qurl_config.api_url : ""
+    qurl_allowed_redirect_domain  = var.qurl_config != null ? var.qurl_config.allowed_redirect_domain : ""
+    qurl_api_timeout              = var.qurl_config != null ? var.qurl_config.api_timeout : 10
+    qurl_max_idle_conns           = var.qurl_config != null ? var.qurl_config.max_idle_conns : 10
+    qurl_max_idle_conns_per_host  = var.qurl_config != null ? var.qurl_config.max_idle_conns_per_host : 5
+    qurl_idle_conn_timeout        = var.qurl_config != null ? var.qurl_config.idle_conn_timeout : 30
+    qurl_service_token_secret_arn = var.qurl_service_token_secret_arn != null ? var.qurl_service_token_secret_arn : ""
   })
 }
 
