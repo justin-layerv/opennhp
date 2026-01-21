@@ -45,9 +45,8 @@ func TestClose(t *testing.T) {
 // TestInit_ErrorPropagation verifies that Init returns wrapped errors from NewQurlResolver.
 // Note: This test manipulates package-level state and should run in isolation.
 func TestInit_ErrorPropagation(t *testing.T) {
-	// Save original state
+	// Save original state (sync.Once cannot be copied, so we just reset it)
 	oldResolver := resolver
-	oldInitOnce := initOnce
 	oldInitErr := initErr
 
 	// Reset state for this test
@@ -58,7 +57,7 @@ func TestInit_ErrorPropagation(t *testing.T) {
 	// Restore state after test
 	defer func() {
 		resolver = oldResolver
-		initOnce = oldInitOnce
+		initOnce = sync.Once{} // Reset to fresh Once for next test
 		initErr = oldInitErr
 	}()
 
@@ -105,9 +104,8 @@ func TestInit_ErrorPropagation(t *testing.T) {
 
 // TestInit_Success verifies successful initialization with valid config.
 func TestInit_Success(t *testing.T) {
-	// Save original state
+	// Save original state (sync.Once cannot be copied, so we just reset it)
 	oldResolver := resolver
-	oldInitOnce := initOnce
 	oldInitErr := initErr
 
 	// Reset state for this test
@@ -118,7 +116,7 @@ func TestInit_Success(t *testing.T) {
 	// Restore state after test
 	defer func() {
 		resolver = oldResolver
-		initOnce = oldInitOnce
+		initOnce = sync.Once{} // Reset to fresh Once for next test
 		initErr = oldInitErr
 	}()
 
