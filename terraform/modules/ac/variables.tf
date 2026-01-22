@@ -327,3 +327,44 @@ variable "console_domain" {
   type        = string
   default     = null
 }
+
+# ============================================================================
+# QURL Router Plugin Configuration
+# Routes requests from *.qurl.site subdomains to their target backends
+# ============================================================================
+
+variable "qurl_router_config" {
+  description = <<-EOT
+    QURL Router plugin configuration. When enabled, Traefik routes requests
+    from *.qurl.site subdomains by looking up target URLs from the QURL Service.
+
+    Example:
+    qurl_router_config = {
+      enabled         = true
+      api_url         = "http://qurl-api.internal:8080"
+      base_domain     = "qurl.site"
+      cache_ttl       = 60
+      negative_cache_ttl = 30
+      api_timeout     = 5
+      proxy_timeout   = 30
+    }
+  EOT
+  type = object({
+    enabled            = bool
+    api_url            = string # QURL Service internal URL
+    base_domain        = string # Base domain for QURL resources (e.g., qurl.site)
+    cache_ttl          = optional(number, 60)
+    negative_cache_ttl = optional(number, 30)
+    max_cache_size     = optional(number, 1000)
+    api_timeout        = optional(number, 5)
+    proxy_timeout      = optional(number, 30)
+    cache_shards       = optional(number, 16)
+  })
+  default = null
+}
+
+variable "qurl_service_token_secret_arn" {
+  description = "ARN of Secrets Manager secret containing the QURL service token for Traefik QURL router"
+  type        = string
+  default     = null
+}

@@ -159,6 +159,10 @@ module "ecr" {
 
   # NHP Server plugin repos (for IAM trust policy)
   plugin_repos = var.plugin_repos
+
+  # QURL Service ECR repository
+  deploy_qurl_ecr  = var.deploy_qurl_service
+  qurl_github_repo = var.qurl_github_repo
 }
 
 # Networking Module - VPC, Subnets, Security Groups
@@ -214,6 +218,9 @@ module "dynamodb" {
 
   # KMS encryption
   kms_key_arn = module.kms.secrets_key_arn
+
+  # QURL Service tables
+  deploy_qurl_tables = var.deploy_qurl_service
 }
 
 # NHP Keypair Module - Registration keypair for AC initial connection
@@ -502,6 +509,20 @@ module "ac" {
   # Routes Console domain directly to Console EC2, bypassing nhp-acd
   console_backend_url = var.deploy_console_ec2 && var.console_internal_only ? module.console_ec2[0].internal_endpoint : null
   console_domain      = var.deploy_console_ec2 && var.console_internal_only ? var.console_ec2_domain : null
+
+  # QURL Router Plugin configuration (routes *.qurl.site to target backends)
+  qurl_router_config = var.deploy_qurl_service && var.qurl_router_enabled ? {
+    enabled            = true
+    api_url            = "http://${module.qurl_service[0].alb_dns_name}"
+    base_domain        = var.qurl_router_base_domain
+    cache_ttl          = var.qurl_router_cache_ttl
+    negative_cache_ttl = var.qurl_router_negative_cache_ttl
+    max_cache_size     = var.qurl_router_max_cache_size
+    api_timeout        = var.qurl_router_api_timeout
+    proxy_timeout      = var.qurl_router_proxy_timeout
+    cache_shards       = var.qurl_router_cache_shards
+  } : null
+  qurl_service_token_secret_arn = var.deploy_qurl_service && var.qurl_router_enabled ? var.qurl_internal_service_token_arn : null
 }
 
 # Demo Gateway Module - nginx + certbot for qurl.link routing to NHP Server plugins
@@ -692,4 +713,64 @@ resource "aws_route53_record" "console_via_ac" {
     zone_id                = module.ac[0].nlb_zone_id
     evaluate_target_health = true
   }
+}
+
+# ==================== QURL Service ====================
+# ECS Fargate deployment for the QURL API service
+# Public API protected by Auth0 JWT, no NHP protection needed
+
+module "qurl_service" {
+  count  = var.deploy_qurl_service ? 1 : 0
+  source = "./modules/qurl-service"
+
+  environment = var.environment
+  name_prefix = local.name_prefix
+  cell_id     = var.cell_id
+  tags        = local.common_tags
+
+  # Networking
+  vpc_id             = module.networking.vpc_id
+  vpc_cidr           = module.networking.vpc_cidr
+  private_subnet_ids = module.networking.private_subnet_ids
+  public_subnet_ids  = module.networking.public_subnet_ids
+
+  # Container configuration
+  ecr_repo_url             = module.ecr.qurl_repo_url
+  image_tag_ssm_param      = "/${local.name_prefix}/qurl-api-image-tag"
+  container_cpu            = var.qurl_container_cpu
+  container_memory         = var.qurl_container_memory
+  desired_count            = var.qurl_desired_count
+  autoscaling_min_capacity = var.qurl_autoscaling_min_capacity
+  autoscaling_max_capacity = var.qurl_autoscaling_max_capacity
+
+  # DynamoDB
+  dynamodb_table_arns   = module.dynamodb.qurl_table_arns
+  dynamodb_table_prefix = "${local.name_prefix}-${var.cell_id}"
+
+  # Auth0
+  auth0_domain   = var.qurl_auth0_domain
+  auth0_audience = var.qurl_auth0_audience
+
+  # Secrets
+  secrets_kms_key_arn        = module.kms.secrets_key_arn
+  jwt_secret_arn             = var.qurl_jwt_secret_arn
+  internal_service_token_arn = var.qurl_internal_service_token_arn
+
+  # KMS
+  logs_kms_key_arn = module.kms.secrets_key_arn
+
+  # QURL defaults
+  cookie_domain        = var.qurl_cookie_domain
+  default_token_expire = var.qurl_default_token_expire
+  default_open_time    = var.qurl_default_open_time
+
+  # AC Fleet defaults
+  default_ac_id   = var.qurl_default_ac_id
+  default_ac_host = var.qurl_default_ac_host
+  default_ac_port = var.qurl_default_ac_port
+
+  # Domain
+  domain_name     = var.qurl_service_domain
+  hosted_zone_id  = var.qurl_hosted_zone_id
+  certificate_arn = var.qurl_certificate_arn
 }

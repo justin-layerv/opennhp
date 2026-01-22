@@ -225,6 +225,55 @@ variable "qurl_service_token_secret_arn" {
   default     = null
 }
 
+# QURL Router plugin configuration
+variable "qurl_router_enabled" {
+  description = "Enable QURL Router plugin in Traefik"
+  type        = bool
+  default     = false
+}
+
+variable "qurl_router_base_domain" {
+  description = "Base domain for QURL resources (e.g., qurl.site)"
+  type        = string
+  default     = "qurl.site"
+}
+
+variable "qurl_router_cache_ttl" {
+  description = "Cache TTL in seconds for successful lookups"
+  type        = number
+  default     = 60
+}
+
+variable "qurl_router_negative_cache_ttl" {
+  description = "Cache TTL in seconds for failed lookups"
+  type        = number
+  default     = 30
+}
+
+variable "qurl_router_max_cache_size" {
+  description = "Maximum cache entries"
+  type        = number
+  default     = 1000
+}
+
+variable "qurl_router_api_timeout" {
+  description = "Timeout in seconds for QURL API calls"
+  type        = number
+  default     = 5
+}
+
+variable "qurl_router_proxy_timeout" {
+  description = "Timeout in seconds for proxying to backends"
+  type        = number
+  default     = 30
+}
+
+variable "qurl_router_cache_shards" {
+  description = "Number of cache shards"
+  type        = number
+  default     = 16
+}
+
 # Traefik plugins
 variable "traefik_plugins" {
   description = "Map of Traefik plugins to deploy"

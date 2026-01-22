@@ -314,8 +314,10 @@ variable "qurl_config" {
   })
   default = null
 
+  # Note: Use ternary instead of || because Terraform evaluates both sides
+  # of || even when the first condition is true (no short-circuit evaluation)
   validation {
-    condition = var.qurl_config == null || (
+    condition = var.qurl_config == null ? true : (
       var.qurl_config.api_timeout > 0 &&
       var.qurl_config.max_idle_conns > 0 &&
       var.qurl_config.max_idle_conns_per_host > 0 &&

@@ -27,3 +27,11 @@ variable "kms_key_arn" {
   type        = string
   default     = null
 }
+
+# ==================== QURL Service Tables ====================
+
+variable "deploy_qurl_tables" {
+  description = "Whether to create QURL service DynamoDB tables"
+  type        = bool
+  default     = false
+}

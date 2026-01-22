@@ -385,3 +385,219 @@ resource "aws_iam_policy" "dynamodb_write" {
 
   tags = var.tags
 }
+
+# ==================== QURL Service Tables ====================
+# These tables are created when deploy_qurl_tables=true
+# They store QURL resources, access tokens, sessions, and audit logs
+
+# qurl-resources: Stores QURL resource definitions
+# PK: resource_id, SK: sk (single-table design with "RESOURCE" sort key)
+# GSI: owner-index (query resources by owner)
+resource "aws_dynamodb_table" "qurl_resources" {
+  count = var.deploy_qurl_tables ? 1 : 0
+
+  name                        = "${var.name_prefix}-${var.cell_id}-qurl-resources"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "resource_id"
+  range_key                   = "sk"
+  deletion_protection_enabled = local.is_prod
+
+  attribute {
+    name = "resource_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+
+  attribute {
+    name = "owner_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "created_at"
+    type = "S"
+  }
+
+  # GSI: Find resources by owner, sorted by creation time (newest first with ScanIndexForward=false)
+  global_secondary_index {
+    name            = "owner-index"
+    hash_key        = "owner_id"
+    range_key       = "created_at"
+    projection_type = "ALL"
+  }
+
+  # Enable point-in-time recovery for production
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  # Server-side encryption with KMS
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-qurl-resources"
+    Cell      = var.cell_id
+    Component = "qurl-service"
+    Purpose   = "QURL resource definitions"
+  })
+}
+
+# qurl-access-tokens: Stores access tokens (hashed)
+# PK: token_hash, SK: sk (single-table design with "TOKEN" sort key)
+# GSI: resource-token-index (query tokens by resource)
+resource "aws_dynamodb_table" "qurl_access_tokens" {
+  count = var.deploy_qurl_tables ? 1 : 0
+
+  name                        = "${var.name_prefix}-${var.cell_id}-qurl-access-tokens"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "token_hash"
+  range_key                   = "sk"
+  deletion_protection_enabled = local.is_prod
+
+  attribute {
+    name = "token_hash"
+    type = "S"
+  }
+
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+
+  attribute {
+    name = "resource_id"
+    type = "S"
+  }
+
+  # GSI: Find tokens by resource
+  global_secondary_index {
+    name            = "resource-token-index"
+    hash_key        = "resource_id"
+    projection_type = "ALL"
+  }
+
+  # Enable point-in-time recovery for production
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  # Server-side encryption with KMS
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  # TTL for automatic token expiration
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-qurl-access-tokens"
+    Cell      = var.cell_id
+    Component = "qurl-service"
+    Purpose   = "QURL access tokens"
+  })
+}
+
+# qurl-sessions: Stores active sessions per resource
+# PK: resource_id, SK: session_id
+# Uses composite key for efficient per-resource session queries
+resource "aws_dynamodb_table" "qurl_sessions" {
+  count = var.deploy_qurl_tables ? 1 : 0
+
+  name                        = "${var.name_prefix}-${var.cell_id}-qurl-sessions"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "resource_id"
+  range_key                   = "session_id"
+  deletion_protection_enabled = local.is_prod
+
+  attribute {
+    name = "resource_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "session_id"
+    type = "S"
+  }
+
+  # Enable point-in-time recovery for production
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  # Server-side encryption with KMS
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  # TTL for automatic session expiration
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-qurl-sessions"
+    Cell      = var.cell_id
+    Component = "qurl-service"
+    Purpose   = "QURL active sessions"
+  })
+}
+
+# qurl-audit-log: Stores audit log entries
+# PK: owner_id, SK: timestamp
+# Enables efficient time-range queries per owner
+resource "aws_dynamodb_table" "qurl_audit_log" {
+  count = var.deploy_qurl_tables ? 1 : 0
+
+  name                        = "${var.name_prefix}-${var.cell_id}-qurl-audit-log"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "owner_id"
+  range_key                   = "timestamp"
+  deletion_protection_enabled = local.is_prod
+
+  attribute {
+    name = "owner_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "timestamp"
+    type = "S"
+  }
+
+  # Enable point-in-time recovery for production
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  # Server-side encryption with KMS
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  # TTL for automatic audit log retention (90 days default)
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-qurl-audit-log"
+    Cell      = var.cell_id
+    Component = "qurl-service"
+    Purpose   = "QURL audit logs"
+  })
+}

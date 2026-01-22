@@ -479,7 +479,7 @@ variable "qurl_config" {
   default = null
 
   validation {
-    condition = var.qurl_config == null || (
+    condition = var.qurl_config == null ? true : (
       var.qurl_config.api_timeout > 0 &&
       var.qurl_config.max_idle_conns > 0 &&
       var.qurl_config.max_idle_conns_per_host > 0 &&
@@ -595,6 +595,194 @@ variable "console_ac_customer_id" {
   description = "Customer ID (ULID format) for Console's embedded AC. LayerV system uses nil ULID: 00000000000000000000000000"
   type        = string
   default     = "00000000000000000000000000" # Nil ULID for LayerV system customer
+}
+
+# ==================== QURL Service ====================
+
+variable "deploy_qurl_service" {
+  description = "Deploy the QURL API service on ECS Fargate"
+  type        = bool
+  default     = false
+}
+
+variable "qurl_service_domain" {
+  description = "Domain for QURL API (e.g., api.qurl.link)"
+  type        = string
+  default     = null
+}
+
+variable "qurl_auth0_domain" {
+  description = "Auth0 domain for QURL API JWT validation (e.g., 'layerv.us.auth0.com')"
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.qurl_auth0_domain == "" || can(regex("^[a-zA-Z0-9][a-zA-Z0-9.-]+[a-zA-Z0-9]$", var.qurl_auth0_domain))
+    error_message = "qurl_auth0_domain must be a valid hostname format."
+  }
+}
+
+variable "qurl_auth0_audience" {
+  description = "Auth0 audience for QURL API JWT validation"
+  type        = string
+  default     = "https://api.layerv.ai"
+}
+
+variable "qurl_cookie_domain" {
+  description = "Cookie domain for NHP tokens (e.g., .qurl.site)"
+  type        = string
+  default     = ".qurl.site"
+}
+
+variable "qurl_default_ac_id" {
+  description = "Default AC identifier for new QURL resources"
+  type        = string
+  default     = ""
+}
+
+variable "qurl_default_ac_host" {
+  description = "Default AC hostname for new QURL resources"
+  type        = string
+  default     = ""
+}
+
+variable "qurl_default_ac_port" {
+  description = "Default AC port for new QURL resources"
+  type        = number
+  default     = 443
+}
+
+variable "qurl_default_token_expire" {
+  description = "Default token expiration in seconds"
+  type        = number
+  default     = 3600
+}
+
+variable "qurl_default_open_time" {
+  description = "Default firewall open time in seconds"
+  type        = number
+  default     = 300
+}
+
+variable "qurl_container_cpu" {
+  description = "CPU units for QURL container (256 = 0.25 vCPU)"
+  type        = number
+  default     = 256
+
+  validation {
+    condition     = contains([256, 512, 1024, 2048, 4096, 8192, 16384], var.qurl_container_cpu)
+    error_message = "qurl_container_cpu must be a valid Fargate CPU value: 256, 512, 1024, 2048, 4096, 8192, or 16384."
+  }
+}
+
+variable "qurl_container_memory" {
+  description = "Memory in MB for QURL container"
+  type        = number
+  default     = 512
+
+  validation {
+    condition     = var.qurl_container_memory >= 512 && var.qurl_container_memory <= 122880
+    error_message = "qurl_container_memory must be between 512 and 122880 MB for Fargate."
+  }
+}
+
+variable "qurl_desired_count" {
+  description = "Desired number of QURL ECS tasks"
+  type        = number
+  default     = 1
+}
+
+variable "qurl_autoscaling_min_capacity" {
+  description = "Minimum number of QURL ECS tasks for auto-scaling (production only)"
+  type        = number
+  default     = 2
+}
+
+variable "qurl_autoscaling_max_capacity" {
+  description = "Maximum number of QURL ECS tasks for auto-scaling (production only)"
+  type        = number
+  default     = 10
+}
+
+variable "qurl_jwt_secret_arn" {
+  description = "Secrets Manager ARN for QURL JWT signing secret"
+  type        = string
+  default     = null
+}
+
+variable "qurl_internal_service_token_arn" {
+  description = "Secrets Manager ARN for QURL internal service token"
+  type        = string
+  default     = null
+}
+
+variable "qurl_hosted_zone_id" {
+  description = "Route53 hosted zone ID for QURL API domain"
+  type        = string
+  default     = null
+}
+
+variable "qurl_certificate_arn" {
+  description = "ACM certificate ARN for QURL API HTTPS"
+  type        = string
+  default     = null
+}
+
+variable "qurl_github_repo" {
+  description = "GitHub repository for QURL service (for ECR push permissions)"
+  type        = string
+  default     = "qurl-service"
+}
+
+# ==================== QURL Router Plugin ====================
+# Configuration for the Traefik QURL Router plugin that routes *.qurl.site requests
+
+variable "qurl_router_enabled" {
+  description = "Enable QURL Router plugin in Traefik (routes *.qurl.site subdomains to target backends)"
+  type        = bool
+  default     = false
+}
+
+variable "qurl_router_base_domain" {
+  description = "Base domain for QURL resources (e.g., qurl.site). Plugin routes {subdomain}.{base_domain} requests."
+  type        = string
+  default     = "qurl.site"
+}
+
+variable "qurl_router_cache_ttl" {
+  description = "Cache TTL in seconds for successful target URL lookups"
+  type        = number
+  default     = 60
+}
+
+variable "qurl_router_negative_cache_ttl" {
+  description = "Cache TTL in seconds for failed lookups (404s)"
+  type        = number
+  default     = 30
+}
+
+variable "qurl_router_max_cache_size" {
+  description = "Maximum number of entries in the URL lookup cache"
+  type        = number
+  default     = 1000
+}
+
+variable "qurl_router_api_timeout" {
+  description = "Timeout in seconds for QURL Service API calls"
+  type        = number
+  default     = 5
+}
+
+variable "qurl_router_proxy_timeout" {
+  description = "Timeout in seconds for proxying requests to target backends"
+  type        = number
+  default     = 30
+}
+
+variable "qurl_router_cache_shards" {
+  description = "Number of cache shards for concurrent access"
+  type        = number
+  default     = 16
 }
 
 # ==================== Security Alerting ====================

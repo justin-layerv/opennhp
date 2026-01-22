@@ -150,6 +150,51 @@ ac_license_key_sha256 = "a762d8af6c774acf2d0560575658062f306cd2e872409ac52cf0baf
 # Console runs its own nhp-acd with iptables DROP by default.
 # Port 443 is only accessible after NHP knock adds the user's IP to ipset.
 
+# ==============================================================================
+# QURL Service Configuration
+# ECS Fargate deployment for QURL API (Auth0 JWT protected, no NHP needed)
+# ==============================================================================
+# QURL API service is deployed by default
+deploy_qurl_service = true
+
+# Domain configuration (set these when deploying)
+# qurl_service_domain = "api.qurl.link"
+# qurl_hosted_zone_id = "Z..."  # qurl.link zone ID in layerv-mgmt
+# qurl_certificate_arn = "arn:aws:acm:us-east-2:767397897469:certificate/..."
+
+# Auth0 configuration for JWT validation
+# qurl_auth0_domain = "layerv.us.auth0.com"
+# qurl_auth0_audience = "https://api.layerv.ai"
+
+# Secrets Manager ARNs (create secrets before enabling QURL service)
+# qurl_jwt_secret_arn = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/qurl-jwt-secret"
+# qurl_internal_service_token_arn = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/qurl-internal-service-token"
+
+# AC Fleet defaults (for QURL resources)
+# qurl_default_ac_id = "ac-sandbox-01"
+# qurl_default_ac_host = "ac.nhp.layerv.xyz"
+
+# Container sizing (defaults are good for dev/sandbox)
+# qurl_container_cpu    = 256   # 0.25 vCPU
+# qurl_container_memory = 512   # 512 MB
+# qurl_desired_count    = 1
+
+# ==============================================================================
+# QURL Router Plugin Configuration
+# Traefik plugin that routes *.qurl.site requests to target backends
+# Requires QURL Service to be deployed (deploy_qurl_service = true)
+# ==============================================================================
+# Enable QURL Router when QURL Service is deployed and internal_service_token is configured
+qurl_router_enabled     = false # Set to true after configuring qurl_internal_service_token_arn
+qurl_router_base_domain = "qurl.site"
+
+# Cache settings (defaults are reasonable for most use cases)
+# qurl_router_cache_ttl          = 60   # seconds for successful lookups
+# qurl_router_negative_cache_ttl = 30   # seconds for 404s
+# qurl_router_max_cache_size     = 1000 # max cache entries
+# qurl_router_api_timeout        = 5    # seconds for QURL API calls
+# qurl_router_proxy_timeout      = 30   # seconds for proxying to backend
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"

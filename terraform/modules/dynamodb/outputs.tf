@@ -65,3 +65,37 @@ output "write_policy_arn" {
   description = "ARN of the IAM policy for DynamoDB write access (for Console)"
   value       = aws_iam_policy.dynamodb_write.arn
 }
+
+# ==================== QURL Service Table ARNs ====================
+
+output "qurl_resources_table_arn" {
+  description = "ARN of the QURL resources DynamoDB table"
+  value       = length(aws_dynamodb_table.qurl_resources) > 0 ? aws_dynamodb_table.qurl_resources[0].arn : null
+}
+
+output "qurl_access_tokens_table_arn" {
+  description = "ARN of the QURL access tokens DynamoDB table"
+  value       = length(aws_dynamodb_table.qurl_access_tokens) > 0 ? aws_dynamodb_table.qurl_access_tokens[0].arn : null
+}
+
+output "qurl_sessions_table_arn" {
+  description = "ARN of the QURL sessions DynamoDB table"
+  value       = length(aws_dynamodb_table.qurl_sessions) > 0 ? aws_dynamodb_table.qurl_sessions[0].arn : null
+}
+
+output "qurl_audit_log_table_arn" {
+  description = "ARN of the QURL audit log DynamoDB table"
+  value       = length(aws_dynamodb_table.qurl_audit_log) > 0 ? aws_dynamodb_table.qurl_audit_log[0].arn : null
+}
+
+# Note: All 4 QURL tables are created together via the deploy_qurl_tables flag,
+# so checking only qurl_resources is sufficient for the conditional.
+output "qurl_table_arns" {
+  description = "List of all QURL DynamoDB table ARNs (for IAM permissions)"
+  value = length(aws_dynamodb_table.qurl_resources) > 0 ? [
+    aws_dynamodb_table.qurl_resources[0].arn,
+    aws_dynamodb_table.qurl_access_tokens[0].arn,
+    aws_dynamodb_table.qurl_sessions[0].arn,
+    aws_dynamodb_table.qurl_audit_log[0].arn,
+  ] : []
+}

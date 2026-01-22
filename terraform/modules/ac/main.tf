@@ -391,6 +391,14 @@ resource "aws_iam_role_policy" "ac" {
         Action   = ["secretsmanager:GetSecretValue"]
         Resource = [var.server_secret_arn]
       },
+      # Secrets Manager - read QURL service token (for Traefik QURL router plugin)
+      # Note: Empty Resource array is intentional when ARN is null - grants no permissions
+      {
+        Sid      = "SecretsReadQurlServiceToken"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = var.qurl_service_token_secret_arn != null ? [var.qurl_service_token_secret_arn] : []
+      },
       # Secrets Manager - create and manage per-instance AC secrets
       # Each AC creates {prefix}-ac-{instance-id} for its private key
       {
@@ -581,6 +589,17 @@ locals {
     # Console backend routing (for NHP-protected Console)
     console_backend_url = var.console_backend_url
     console_domain      = var.console_domain
+    # QURL Router Plugin configuration
+    qurl_router_enabled            = var.qurl_router_config != null ? var.qurl_router_config.enabled : false
+    qurl_router_api_url            = var.qurl_router_config != null ? var.qurl_router_config.api_url : ""
+    qurl_router_base_domain        = var.qurl_router_config != null ? var.qurl_router_config.base_domain : ""
+    qurl_router_cache_ttl          = var.qurl_router_config != null ? var.qurl_router_config.cache_ttl : 60
+    qurl_router_negative_cache_ttl = var.qurl_router_config != null ? var.qurl_router_config.negative_cache_ttl : 30
+    qurl_router_max_cache_size     = var.qurl_router_config != null ? var.qurl_router_config.max_cache_size : 1000
+    qurl_router_api_timeout        = var.qurl_router_config != null ? var.qurl_router_config.api_timeout : 5
+    qurl_router_proxy_timeout      = var.qurl_router_config != null ? var.qurl_router_config.proxy_timeout : 30
+    qurl_router_cache_shards       = var.qurl_router_config != null ? var.qurl_router_config.cache_shards : 16
+    qurl_service_token_secret_arn  = var.qurl_service_token_secret_arn
   }) : null # Validation failed - this branch never executes (tobool throws first)
 }
 

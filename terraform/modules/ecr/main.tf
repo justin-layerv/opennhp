@@ -119,6 +119,18 @@ variable "create_oidc_provider" {
   default     = true
 }
 
+variable "deploy_qurl_ecr" {
+  description = "Whether to create ECR repository for QURL service"
+  type        = bool
+  default     = false
+}
+
+variable "qurl_github_repo" {
+  description = "GitHub repository for QURL service (for GitHub Actions trust policy)"
+  type        = string
+  default     = "qurl-service"
+}
+
 # ==================== Data Sources ====================
 
 data "aws_caller_identity" "current" {}
@@ -141,8 +153,9 @@ locals {
   # This abstraction allows the module to work in both self-managed and org-managed scenarios
   oidc_provider_arn = var.create_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : data.aws_iam_openid_connect_provider.github[0].arn
 
-  # ECR repository names
-  ecr_repos = ["nhp-server", "nhp-ac", "nhp-console"]
+  # ECR repository names (core repos + optional QURL)
+  core_ecr_repos = ["nhp-server", "nhp-ac", "nhp-console"]
+  ecr_repos      = var.deploy_qurl_ecr ? concat(local.core_ecr_repos, ["nhp-qurl"]) : local.core_ecr_repos
 
   # ECR lifecycle policy (shared across repos)
   ecr_lifecycle_policy = jsonencode({
@@ -315,7 +328,13 @@ resource "aws_iam_role" "github_actions" {
                 "repo:${var.github_org}/${repo}:environment:sandbox",
                 "repo:${var.github_org}/${repo}:environment:production"
               ]
-            ])
+            ]),
+            # QURL Service repo
+            var.deploy_qurl_ecr && var.qurl_github_repo != "" ? [
+              "repo:${var.github_org}/${var.qurl_github_repo}:ref:refs/heads/main",
+              "repo:${var.github_org}/${var.qurl_github_repo}:environment:sandbox",
+              "repo:${var.github_org}/${var.qurl_github_repo}:environment:production"
+            ] : []
           )
         }
       }
@@ -1242,6 +1261,72 @@ resource "aws_iam_role_policy_attachment" "plugin_bucket_write" {
   policy_arn = aws_iam_policy.plugin_bucket_write[0].arn
 }
 
+# ECS deployment permissions for QURL service
+# Allows CI to register task definitions and update ECS services
+#
+# Wildcard usage explanation:
+# - ECSTaskDefinition uses Resource="*" because AWS requires it for ecs:RegisterTaskDefinition
+#   (task definitions cannot be scoped by ARN at registration time)
+# - ECSServiceDeploy uses "layerv-nhp-*-qurl-api" pattern to allow deployment across
+#   environments (sandbox, prod) from the same policy
+# - PassRoleForECS uses similar wildcard pattern for execution/task roles
+resource "aws_iam_policy" "qurl_ecs_deploy" {
+  count = var.deploy_qurl_ecr ? 1 : 0
+
+  name        = "nhp-${var.environment}-github-actions-qurl-ecs-deploy"
+  description = "ECS deployment permissions for QURL service (${var.environment})"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # Note: Resource="*" is required by AWS for ecs:RegisterTaskDefinition
+        Sid    = "ECSTaskDefinition"
+        Effect = "Allow"
+        Action = [
+          "ecs:RegisterTaskDefinition",
+          "ecs:DescribeTaskDefinition",
+          "ecs:DeregisterTaskDefinition"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ECSServiceDeploy"
+        Effect = "Allow"
+        Action = [
+          "ecs:UpdateService",
+          "ecs:DescribeServices",
+          "ecs:DescribeClusters"
+        ]
+        Resource = [
+          "arn:aws:ecs:${local.region}:${local.account_id}:cluster/layerv-nhp-*-qurl-api",
+          "arn:aws:ecs:${local.region}:${local.account_id}:service/layerv-nhp-*-qurl-api/*"
+        ]
+      },
+      {
+        Sid    = "PassRoleForECS"
+        Effect = "Allow"
+        Action = "iam:PassRole"
+        Resource = [
+          "arn:aws:iam::${local.account_id}:role/layerv-nhp-*-qurl-api-*"
+        ]
+        Condition = {
+          StringEquals = {
+            "iam:PassedToService" = "ecs-tasks.amazonaws.com"
+          }
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "qurl_ecs_deploy" {
+  count = var.deploy_qurl_ecr ? 1 : 0
+
+  role       = aws_iam_role.github_actions.name
+  policy_arn = aws_iam_policy.qurl_ecs_deploy[0].arn
+}
+
 # ============================================================================
 # OUTPUTS - Unified interface regardless of primary/secondary account
 # ============================================================================
@@ -1284,4 +1369,14 @@ output "github_actions_role_arn" {
 output "github_oidc_provider_arn" {
   description = "GitHub OIDC provider ARN (created or referenced from existing)"
   value       = local.oidc_provider_arn
+}
+
+output "qurl_repo_url" {
+  description = "QURL Service ECR repository URL"
+  value       = var.deploy_qurl_ecr && var.is_primary_account ? aws_ecr_repository.main["nhp-qurl"].repository_url : var.deploy_qurl_ecr ? "${var.primary_account_id}.dkr.ecr.${local.region}.amazonaws.com/layerv/nhp-qurl" : null
+}
+
+output "qurl_repo_arn" {
+  description = "QURL Service ECR repository ARN"
+  value       = var.deploy_qurl_ecr && var.is_primary_account ? aws_ecr_repository.main["nhp-qurl"].arn : var.deploy_qurl_ecr ? "arn:aws:ecr:${local.region}:${var.primary_account_id}:repository/layerv/nhp-qurl" : null
 }

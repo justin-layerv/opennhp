@@ -73,6 +73,16 @@ module "nhp" {
   qurl_config                   = var.qurl_config
   qurl_service_token_secret_arn = var.qurl_service_token_secret_arn
 
+  # QURL Router plugin (Traefik)
+  qurl_router_enabled            = var.qurl_router_enabled
+  qurl_router_base_domain        = var.qurl_router_base_domain
+  qurl_router_cache_ttl          = var.qurl_router_cache_ttl
+  qurl_router_negative_cache_ttl = var.qurl_router_negative_cache_ttl
+  qurl_router_max_cache_size     = var.qurl_router_max_cache_size
+  qurl_router_api_timeout        = var.qurl_router_api_timeout
+  qurl_router_proxy_timeout      = var.qurl_router_proxy_timeout
+  qurl_router_cache_shards       = var.qurl_router_cache_shards
+
   # Traefik plugins
   traefik_plugins = var.traefik_plugins
 

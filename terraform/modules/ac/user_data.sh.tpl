@@ -386,6 +386,27 @@ HttpListenPort = 8888
 HTTPEOF
 echo "NHP-ACD HTTP config created"
 
+# ============================================================================
+# QURL Router Plugin Configuration
+# Fetches service token from Secrets Manager for QURL API authentication
+# ============================================================================
+%{ if qurl_router_enabled && qurl_service_token_secret_arn != null ~}
+echo "Fetching QURL service token from Secrets Manager..."
+# Use timeout to prevent hanging if Secrets Manager is unreachable (30s is sufficient for retries)
+QURL_SERVICE_TOKEN=$(timeout 30 aws secretsmanager get-secret-value \
+  --secret-id "${qurl_service_token_secret_arn}" \
+  --region "$REGION" \
+  --query SecretString --output text) || {
+    echo "ERROR: Failed to fetch QURL service token from Secrets Manager (timeout or auth failure)"
+    exit 1
+}
+if [ -z "$QURL_SERVICE_TOKEN" ]; then
+  echo "ERROR: QURL service token is empty"
+  exit 1
+fi
+echo "QURL service token retrieved successfully"
+%{ endif ~}
+
 # Traefik configuration for this environment
 # Note: traefik-plugins repo deploys plugins to /home/ubuntu/traefik/plugins-local via SSM
 cat > /home/ubuntu/traefik/traefik.toml << TRAEFIKEOF
@@ -438,8 +459,15 @@ cat > /home/ubuntu/traefik/traefik.toml << TRAEFIKEOF
   directory = "/home/ubuntu/traefik/"
   watch = true
 
+%{ if qurl_router_enabled ~}
+# QURL Router Plugin - routes *.qurl.site requests to target backends
+[experimental.localPlugins]
+  [experimental.localPlugins.qurl-router]
+    moduleName = "github.com/traefik/qurl-router"
+%{ else ~}
 # NOTE: [experimental.localPlugins] section is managed by traefik-plugins repo via SSM
 # The traefik-plugins deployment will add this section with plugin definitions
+%{ endif ~}
 TRAEFIKEOF
 
 # Create Traefik dynamic configuration (routes to nhp-acd and NHP Server)
@@ -557,9 +585,56 @@ cat >> /home/ubuntu/traefik/dynamic.toml << ADDTLSEOF
 ADDTLSEOF
 %{ endif }
 
+# ============================================================================
+# QURL Router Plugin Dynamic Configuration
+# Routes *.qurl.site requests through the QURL router plugin
+# ============================================================================
+%{ if qurl_router_enabled ~}
+cat >> /home/ubuntu/traefik/dynamic.toml << QURLDYNAMICEOF
+
+# QURL Router - routes *.${qurl_router_base_domain} to target backends
+[http.middlewares.qurl-router.plugin.qurl-router]
+  qurlApiUrl = "${qurl_router_api_url}"
+  serviceToken = "$QURL_SERVICE_TOKEN"
+  baseDomain = "${qurl_router_base_domain}"
+  cacheTtl = ${qurl_router_cache_ttl}
+  negativeCacheTtl = ${qurl_router_negative_cache_ttl}
+  maxCacheSize = ${qurl_router_max_cache_size}
+  apiTimeout = ${qurl_router_api_timeout}
+  proxyTimeout = ${qurl_router_proxy_timeout}
+  cacheShards = ${qurl_router_cache_shards}
+  circuitBreakerThreshold = 5
+  circuitBreakerTimeout = 30
+  evictionPercent = 10
+
+[http.routers.qurl-site]
+  rule = "HostRegexp(\`^.+\\\\.${qurl_router_base_domain}\$\`)"
+  service = "qurl-backend"
+  entryPoints = ["https"]
+  priority = 15
+  middlewares = ["qurl-router"]
+  [http.routers.qurl-site.tls]
+    certResolver = "letsencrypt"
+    [[http.routers.qurl-site.tls.domains]]
+      main = "${qurl_router_base_domain}"
+      sans = ["*.${qurl_router_base_domain}"]
+
+# QURL backend service - placeholder required by Traefik config validation.
+# The qurl-router middleware dynamically resolves the actual backend URL
+# by querying the QURL Service API. This placeholder is never actually used.
+[http.services.qurl-backend.loadBalancer]
+  passHostHeader = true
+  [[http.services.qurl-backend.loadBalancer.servers]]
+    url = "http://127.0.0.1:9999"
+QURLDYNAMICEOF
+echo "QURL router configuration added"
+%{ endif }
+
 # Create ACME storage
 touch /home/ubuntu/traefik/acme.json
 chmod 600 /home/ubuntu/traefik/acme.json
+# Restrict dynamic.toml permissions (contains service tokens)
+chmod 600 /home/ubuntu/traefik/dynamic.toml
 chown -R ubuntu:ubuntu /home/ubuntu/traefik
 
 # ============================================================================
