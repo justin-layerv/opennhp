@@ -375,7 +375,8 @@ cat > /opt/layerv/nhp-server/etc/resource.toml << 'RESEOF'
 
 %{ for plugin_name in server_plugins ~}
 [${plugin_name}]
-# Plugin "${plugin_name}" is compiled into the server
+# Plugin "${plugin_name}" is compiled into the server (no external path needed)
+PluginPath = ""
 
 %{ endfor ~}
 RESEOF

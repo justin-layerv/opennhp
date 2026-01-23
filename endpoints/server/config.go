@@ -280,9 +280,12 @@ func (s *UdpServer) loadResources() error {
 
 	resConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("resource config: %s has been updated", fileName)
-		if content, err = s.loadConfigFile(fileName); err == nil {
-			if err = toml.Unmarshal(content, &resConfigWatch); err == nil {
-				s.updateResources(aspMap)
+		if content, err := s.loadConfigFile(fileName); err == nil {
+			freshAspMap := make(common.AuthSvcProviderMap)
+			if err := toml.Unmarshal(content, &freshAspMap); err == nil {
+				s.updateResources(freshAspMap)
+			} else {
+				log.Error("failed to unmarshal updated resource config: %v", err)
 			}
 		}
 	})
@@ -651,6 +654,10 @@ func (s *UdpServer) updateResources(aspMap common.AuthSvcProviderMap) (err error
 	})
 
 	for aspId, aspData := range aspMap {
+		if aspData == nil {
+			log.Info("AuthServiceId %q has empty config (using static plugin registry)", aspId)
+			continue
+		}
 		aspData.AuthSvcId = aspId
 		// Try to load plugin from static registry first, then fall back to dynamic loading
 		h := plugins.GetPluginHandler(aspId, aspData.PluginPath)

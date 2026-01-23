@@ -2,6 +2,8 @@ package server
 
 import (
 	"testing"
+
+	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
 func TestParseACRegistryEntry(t *testing.T) {
@@ -63,5 +65,55 @@ InstanceId = "i-test"
 func TestACRegistryPrefix(t *testing.T) {
 	if ACRegistryPrefix != "/nhp/ac-registry/" {
 		t.Errorf("ACRegistryPrefix = %q, want %q", ACRegistryPrefix, "/nhp/ac-registry/")
+	}
+}
+
+func TestUpdateResources_NilAspData(t *testing.T) {
+	// This test verifies that updateResources handles nil aspData entries gracefully.
+	// TOML unmarshals empty tables (e.g., "[passcode]" with no fields) as nil pointers.
+	// The server should skip these entries without panicking.
+
+	s := &UdpServer{}
+
+	// Create a map with nil entry (simulates TOML empty table)
+	aspMap := common.AuthSvcProviderMap{
+		"passcode": nil, // Simulate TOML empty table like "[passcode]\n# comment only"
+	}
+
+	// Should not panic
+	err := s.updateResources(aspMap)
+	if err != nil {
+		t.Errorf("updateResources() unexpected error = %v", err)
+	}
+
+	// Verify the nil entry is preserved in the map (for static plugin lookup)
+	if len(s.authServiceMap) != 1 {
+		t.Errorf("authServiceMap length = %d, want 1", len(s.authServiceMap))
+	}
+}
+
+func TestUpdateResources_MixedNilAndValid(t *testing.T) {
+	// Test that valid entries are processed even when nil entries exist
+
+	s := &UdpServer{}
+
+	aspMap := common.AuthSvcProviderMap{
+		"nil-plugin":   nil, // Empty table
+		"valid-plugin": &common.AuthServiceProviderData{PluginPath: ""},
+	}
+
+	err := s.updateResources(aspMap)
+	if err != nil {
+		t.Errorf("updateResources() unexpected error = %v", err)
+	}
+
+	// Both entries should be in the map
+	if len(s.authServiceMap) != 2 {
+		t.Errorf("authServiceMap length = %d, want 2", len(s.authServiceMap))
+	}
+
+	// Valid entry should have AuthSvcId set
+	if s.authServiceMap["valid-plugin"] != nil && s.authServiceMap["valid-plugin"].AuthSvcId != "valid-plugin" {
+		t.Errorf("valid-plugin AuthSvcId = %q, want %q", s.authServiceMap["valid-plugin"].AuthSvcId, "valid-plugin")
 	}
 }
