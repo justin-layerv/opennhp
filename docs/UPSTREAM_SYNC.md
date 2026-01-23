@@ -6,13 +6,13 @@ This document tracks the synchronization status between this fork (LayerV NHP) a
 
 | Field | Value |
 |-------|-------|
-| **Last reviewed upstream SHA** | bd6b7538 |
-| **Last review date** | 2026-01-09 |
-| **Reviewer** | @posey |
+| **Last reviewed upstream SHA** | 3344ab68 |
+| **Last review date** | 2026-01-23 |
+| **Reviewer** | Claude Code |
 
 > **HOW TO USE:** When checking for updates, run:
 > ```bash
-> git log bd6b7538..upstream/main --oneline
+> git log 3344ab68..upstream/main --oneline
 > ```
 > This shows ONLY new commits since last review. Update the SHA after each review.
 
@@ -50,6 +50,20 @@ These are PERMANENTLY skipped. Don't waste time reviewing them:
 ---
 
 ## Sync History
+
+### 2026-01-23 - Routine Review (No Sync Required)
+
+- **Reviewed up to:** 3344ab68
+- **Commits reviewed:** ~75
+- **PRs created:** None
+- **Commits synced:** None
+- **Summary:**
+  - ~50 Dependabot/dependency updates (auto-skipped)
+  - ~20 CI/CD workflow changes (auto-skipped, fork has custom CI)
+  - 5 demo template changes (upstream examples only)
+  - 3 plugin refactors (we use QURL, not upstream's authenticator)
+  - 2 config.go bug fixes (`b9e5885a`, `21703687`) - **already fixed independently in our fork**
+- **Notes:** The config.go bug (unmarshal to wrong variable in file watcher callback) was identified in upstream but our fork already fixed this in recent commits with the `freshAspMap` pattern.
 
 ### 2026-01-09 - Shared Constants & PKCS7 Tests
 
@@ -103,6 +117,11 @@ Non-obvious skips that don't fit Auto-Skip Categories:
 | 634e3d8c | feat(cli): add --json output | SKIP | Fork doesn't use CLI this way | 2026-01-09 |
 | 1bbece70 | refactor(httpauth): dedup handlers | PENDING | Low priority, may do later | 2026-01-09 |
 | 9ef61076 | refactor(logging): standardize format | SKIP | Fork has own logging patterns | 2026-01-09 |
+| b9e5885a | fix: config.go codecov/aspMap bug | SKIP | Already fixed independently in fork | 2026-01-23 |
+| 21703687 | feat: QR/OTP login + config.go fix | SKIP | Feature not needed; bug already fixed in fork | 2026-01-23 |
+| 9b115972 | fix: OTP static key in templates | SKIP | Upstream authenticator plugin (we use QURL) | 2026-01-23 |
+| 320a90c4 | refactor: move server_plugin to basic/ | SKIP | Upstream example reorganization only | 2026-01-23 |
+| f32bd371 | refactor: rename qrauth to authenticator | SKIP | Upstream plugin rename (we use QURL) | 2026-01-23 |
 
 ---
 
