@@ -361,6 +361,11 @@ variable "qurl_router_config" {
     cache_shards       = optional(number, 16)
   })
   default = null
+
+  validation {
+    condition     = var.qurl_router_config == null || can(var.qurl_router_config.enabled)
+    error_message = "qurl_router_config must include 'enabled' field when set."
+  }
 }
 
 variable "qurl_service_token_secret_arn" {

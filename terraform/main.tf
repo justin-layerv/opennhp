@@ -525,7 +525,7 @@ module "ac" {
   qurl_router_config = var.deploy_qurl_service && var.qurl_router_enabled ? {
     enabled            = true
     api_url            = "http://${module.qurl_service[0].alb_dns_name}"
-    base_domain        = var.qurl_router_base_domain
+    base_domain        = var.qurl_site_domain
     cache_ttl          = var.qurl_router_cache_ttl
     negative_cache_ttl = var.qurl_router_negative_cache_ttl
     max_cache_size     = var.qurl_router_max_cache_size

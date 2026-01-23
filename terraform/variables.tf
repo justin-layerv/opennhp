@@ -1159,12 +1159,6 @@ variable "qurl_router_enabled" {
   default     = false
 }
 
-variable "qurl_router_base_domain" {
-  description = "Base domain for QURL resources (e.g., qurl.site). Plugin routes {subdomain}.{base_domain} requests."
-  type        = string
-  default     = "qurl.site"
-}
-
 variable "qurl_router_cache_ttl" {
   description = "Cache TTL in seconds for successful target URL lookups"
   type        = number

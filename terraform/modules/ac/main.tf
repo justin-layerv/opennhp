@@ -356,8 +356,9 @@ resource "aws_iam_role_policy" "ac" {
 
   lifecycle {
     # QURL service token is required when QURL router is enabled
+    # Use try() because Terraform doesn't short-circuit evaluate - accessing .enabled on null fails
     precondition {
-      condition     = var.qurl_router_config == null || !var.qurl_router_config.enabled || var.qurl_service_token_secret_arn != null
+      condition     = try(var.qurl_router_config.enabled, false) == false || var.qurl_service_token_secret_arn != null
       error_message = "qurl_service_token_secret_arn is required when qurl_router_config.enabled = true"
     }
   }

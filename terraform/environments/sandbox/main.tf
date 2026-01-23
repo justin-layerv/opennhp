@@ -75,7 +75,6 @@ module "nhp" {
 
   # QURL Router plugin (Traefik)
   qurl_router_enabled            = var.qurl_router_enabled
-  qurl_router_base_domain        = var.qurl_router_base_domain
   qurl_router_cache_ttl          = var.qurl_router_cache_ttl
   qurl_router_negative_cache_ttl = var.qurl_router_negative_cache_ttl
   qurl_router_max_cache_size     = var.qurl_router_max_cache_size

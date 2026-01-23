@@ -34,6 +34,11 @@ variable "max_capacity" {
   type = number
 }
 
+variable "enable_termination_cleanup" {
+  description = "Enable ASG lifecycle hook for immediate DynamoDB cleanup on server termination"
+  type        = bool
+}
+
 variable "vpc_cidr" {
   type = string
 }
@@ -225,6 +230,88 @@ variable "qurl_service_token_secret_arn" {
   default     = null
 }
 
+# QURL Service deployment
+variable "deploy_qurl_service" {
+  description = "Deploy the QURL API service on ECS Fargate"
+  type        = bool
+}
+
+variable "qurl_link_domain" {
+  description = "Domain for QURL access links (e.g., qurl.link)"
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]*[a-z0-9]\\.[a-z]{2,}$", var.qurl_link_domain))
+    error_message = "qurl_link_domain must be a valid domain name (e.g., qurl.link)"
+  }
+}
+
+variable "qurl_site_domain" {
+  description = "Domain for QURL protected resources (e.g., qurl.site)"
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]*[a-z0-9]\\.[a-z]{2,}$", var.qurl_site_domain))
+    error_message = "qurl_site_domain must be a valid domain name (e.g., qurl.site)"
+  }
+}
+
+variable "qurl_audit_retention_days" {
+  description = "Number of days to retain QURL audit logs in DynamoDB"
+  type        = number
+
+  validation {
+    condition     = var.qurl_audit_retention_days > 0 && var.qurl_audit_retention_days <= 3650
+    error_message = "qurl_audit_retention_days must be between 1 and 3650 days (10 years max)"
+  }
+}
+
+variable "qurl_cors_allowed_origins" {
+  description = "Comma-separated list of allowed CORS origins for QURL API"
+  type        = string
+}
+
+# QURL Rate Limiting
+variable "qurl_owner_rate_limit" {
+  description = "Rate limit for authenticated owner routes (requests per minute)"
+  type        = number
+
+  validation {
+    condition     = var.qurl_owner_rate_limit > 0 && var.qurl_owner_rate_limit <= 10000
+    error_message = "qurl_owner_rate_limit must be between 1 and 10000 requests per minute"
+  }
+}
+
+variable "qurl_owner_rate_burst" {
+  description = "Burst allowance for authenticated owner routes"
+  type        = number
+
+  validation {
+    condition     = var.qurl_owner_rate_burst > 0 && var.qurl_owner_rate_burst <= 1000
+    error_message = "qurl_owner_rate_burst must be between 1 and 1000"
+  }
+}
+
+variable "qurl_ip_rate_limit" {
+  description = "Rate limit for IP-based internal routes (requests per minute)"
+  type        = number
+
+  validation {
+    condition     = var.qurl_ip_rate_limit > 0 && var.qurl_ip_rate_limit <= 10000
+    error_message = "qurl_ip_rate_limit must be between 1 and 10000 requests per minute"
+  }
+}
+
+variable "qurl_ip_rate_burst" {
+  description = "Burst allowance for IP-based internal routes"
+  type        = number
+
+  validation {
+    condition     = var.qurl_ip_rate_burst > 0 && var.qurl_ip_rate_burst <= 1000
+    error_message = "qurl_ip_rate_burst must be between 1 and 1000"
+  }
+}
+
 # QURL Router plugin configuration
 variable "qurl_router_enabled" {
   description = "Enable QURL Router plugin in Traefik"
@@ -232,95 +319,164 @@ variable "qurl_router_enabled" {
   default     = false
 }
 
-variable "qurl_router_base_domain" {
-  description = "Base domain for QURL resources (e.g., qurl.site)"
-  type        = string
-  default     = "qurl.site"
-}
-
 variable "qurl_router_cache_ttl" {
   description = "Cache TTL in seconds for successful lookups"
   type        = number
   default     = 60
+
+  validation {
+    condition     = var.qurl_router_cache_ttl >= 0 && var.qurl_router_cache_ttl <= 86400
+    error_message = "qurl_router_cache_ttl must be between 0 and 86400 seconds (24 hours max)"
+  }
 }
 
 variable "qurl_router_negative_cache_ttl" {
   description = "Cache TTL in seconds for failed lookups"
   type        = number
   default     = 30
+
+  validation {
+    condition     = var.qurl_router_negative_cache_ttl >= 0 && var.qurl_router_negative_cache_ttl <= 3600
+    error_message = "qurl_router_negative_cache_ttl must be between 0 and 3600 seconds (1 hour max)"
+  }
 }
 
 variable "qurl_router_max_cache_size" {
   description = "Maximum cache entries"
   type        = number
   default     = 1000
+
+  validation {
+    condition     = var.qurl_router_max_cache_size > 0 && var.qurl_router_max_cache_size <= 100000
+    error_message = "qurl_router_max_cache_size must be between 1 and 100000 entries"
+  }
 }
 
 variable "qurl_router_api_timeout" {
   description = "Timeout in seconds for QURL API calls"
   type        = number
   default     = 5
+
+  validation {
+    condition     = var.qurl_router_api_timeout > 0 && var.qurl_router_api_timeout <= 300
+    error_message = "qurl_router_api_timeout must be between 1 and 300 seconds"
+  }
 }
 
 variable "qurl_router_proxy_timeout" {
   description = "Timeout in seconds for proxying to backends"
   type        = number
   default     = 30
+
+  validation {
+    condition     = var.qurl_router_proxy_timeout > 0 && var.qurl_router_proxy_timeout <= 600
+    error_message = "qurl_router_proxy_timeout must be between 1 and 600 seconds"
+  }
 }
 
 variable "qurl_router_cache_shards" {
   description = "Number of cache shards"
   type        = number
   default     = 16
+
+  validation {
+    condition     = var.qurl_router_cache_shards > 0 && var.qurl_router_cache_shards <= 256
+    error_message = "qurl_router_cache_shards must be between 1 and 256"
+  }
 }
 
 # QURL Idempotency Cache
 variable "qurl_idempotency_cache_ttl_seconds" {
   description = "TTL for idempotency cache entries in seconds"
   type        = number
+
+  validation {
+    condition     = var.qurl_idempotency_cache_ttl_seconds > 0 && var.qurl_idempotency_cache_ttl_seconds <= 86400
+    error_message = "qurl_idempotency_cache_ttl_seconds must be between 1 and 86400 seconds (24 hours max)"
+  }
 }
 
 variable "qurl_idempotency_cache_max_size" {
   description = "Maximum number of idempotency cache entries"
   type        = number
+
+  validation {
+    condition     = var.qurl_idempotency_cache_max_size > 0 && var.qurl_idempotency_cache_max_size <= 1000000
+    error_message = "qurl_idempotency_cache_max_size must be between 1 and 1000000 entries"
+  }
 }
 
 variable "qurl_idempotency_cleanup_interval_seconds" {
   description = "Interval between idempotency cache cleanup runs in seconds"
   type        = number
+
+  validation {
+    condition     = var.qurl_idempotency_cleanup_interval_seconds > 0 && var.qurl_idempotency_cleanup_interval_seconds <= 3600
+    error_message = "qurl_idempotency_cleanup_interval_seconds must be between 1 and 3600 seconds"
+  }
 }
 
 # QURL Health Check
 variable "qurl_health_check_timeout_seconds" {
   description = "Timeout for QURL health check operations in seconds"
   type        = number
+
+  validation {
+    condition     = var.qurl_health_check_timeout_seconds > 0 && var.qurl_health_check_timeout_seconds <= 300
+    error_message = "qurl_health_check_timeout_seconds must be between 1 and 300 seconds"
+  }
 }
 
 variable "qurl_health_startup_timeout_seconds" {
   description = "Timeout for QURL startup health checks in seconds"
   type        = number
+
+  validation {
+    condition     = var.qurl_health_startup_timeout_seconds > 0 && var.qurl_health_startup_timeout_seconds <= 600
+    error_message = "qurl_health_startup_timeout_seconds must be between 1 and 600 seconds"
+  }
 }
 
 # QURL License Cache
 variable "qurl_license_cache_ttl_seconds" {
   description = "TTL for license cache entries in seconds"
   type        = number
+
+  validation {
+    condition     = var.qurl_license_cache_ttl_seconds > 0 && var.qurl_license_cache_ttl_seconds <= 86400
+    error_message = "qurl_license_cache_ttl_seconds must be between 1 and 86400 seconds (24 hours max)"
+  }
 }
 
 variable "qurl_license_cache_max_size" {
   description = "Maximum number of license cache entries"
   type        = number
+
+  validation {
+    condition     = var.qurl_license_cache_max_size > 0 && var.qurl_license_cache_max_size <= 100000
+    error_message = "qurl_license_cache_max_size must be between 1 and 100000 entries"
+  }
 }
 
 # QURL Auth0 JWKS
 variable "qurl_auth0_jwks_cache_ttl_seconds" {
   description = "TTL for Auth0 JWKS cache in seconds"
   type        = number
+
+  validation {
+    condition     = var.qurl_auth0_jwks_cache_ttl_seconds > 0 && var.qurl_auth0_jwks_cache_ttl_seconds <= 86400
+    error_message = "qurl_auth0_jwks_cache_ttl_seconds must be between 1 and 86400 seconds (24 hours max)"
+  }
 }
 
 variable "qurl_auth0_jwks_fetch_timeout_seconds" {
   description = "Timeout for fetching Auth0 JWKS in seconds"
   type        = number
+
+  validation {
+    condition     = var.qurl_auth0_jwks_fetch_timeout_seconds > 0 && var.qurl_auth0_jwks_fetch_timeout_seconds <= 60
+    error_message = "qurl_auth0_jwks_fetch_timeout_seconds must be between 1 and 60 seconds"
+  }
 }
 
 # QURL Webhooks
@@ -333,41 +489,81 @@ variable "qurl_webhooks_enabled" {
 variable "qurl_webhooks_worker_count" {
   description = "Number of concurrent webhook delivery workers"
   type        = number
+
+  validation {
+    condition     = var.qurl_webhooks_worker_count > 0 && var.qurl_webhooks_worker_count <= 100
+    error_message = "qurl_webhooks_worker_count must be between 1 and 100"
+  }
 }
 
 variable "qurl_webhooks_max_webhooks_per_owner" {
   description = "Maximum number of webhooks per owner"
   type        = number
+
+  validation {
+    condition     = var.qurl_webhooks_max_webhooks_per_owner > 0 && var.qurl_webhooks_max_webhooks_per_owner <= 100
+    error_message = "qurl_webhooks_max_webhooks_per_owner must be between 1 and 100"
+  }
 }
 
 variable "qurl_webhooks_delivery_timeout_seconds" {
   description = "Timeout for webhook delivery in seconds"
   type        = number
+
+  validation {
+    condition     = var.qurl_webhooks_delivery_timeout_seconds > 0 && var.qurl_webhooks_delivery_timeout_seconds <= 300
+    error_message = "qurl_webhooks_delivery_timeout_seconds must be between 1 and 300 seconds"
+  }
 }
 
 variable "qurl_webhooks_max_retries" {
   description = "Maximum number of webhook delivery retries"
   type        = number
+
+  validation {
+    condition     = var.qurl_webhooks_max_retries >= 0 && var.qurl_webhooks_max_retries <= 10
+    error_message = "qurl_webhooks_max_retries must be between 0 and 10"
+  }
 }
 
 variable "qurl_webhooks_event_channel_size" {
   description = "Size of the webhook event channel buffer"
   type        = number
+
+  validation {
+    condition     = var.qurl_webhooks_event_channel_size > 0 && var.qurl_webhooks_event_channel_size <= 10000
+    error_message = "qurl_webhooks_event_channel_size must be between 1 and 10000"
+  }
 }
 
 variable "qurl_webhooks_retry_worker_interval_seconds" {
   description = "Interval between webhook retry worker runs in seconds"
   type        = number
+
+  validation {
+    condition     = var.qurl_webhooks_retry_worker_interval_seconds > 0 && var.qurl_webhooks_retry_worker_interval_seconds <= 3600
+    error_message = "qurl_webhooks_retry_worker_interval_seconds must be between 1 and 3600 seconds"
+  }
 }
 
 variable "qurl_webhooks_drain_timeout_seconds" {
   description = "Timeout for draining webhook events during shutdown in seconds"
   type        = number
+
+  validation {
+    condition     = var.qurl_webhooks_drain_timeout_seconds > 0 && var.qurl_webhooks_drain_timeout_seconds <= 300
+    error_message = "qurl_webhooks_drain_timeout_seconds must be between 1 and 300 seconds"
+  }
 }
 
 variable "qurl_webhooks_response_body_limit" {
   description = "Maximum response body size to store from webhook endpoints in bytes"
   type        = number
+
+  validation {
+    condition     = var.qurl_webhooks_response_body_limit > 0 && var.qurl_webhooks_response_body_limit <= 1048576
+    error_message = "qurl_webhooks_response_body_limit must be between 1 and 1048576 bytes (1MB max)"
+  }
 }
 
 variable "qurl_webhooks_api_version" {
@@ -415,11 +611,21 @@ variable "qurl_otel_exporter_insecure" {
 variable "qurl_otel_trace_sample_rate" {
   description = "Trace sampling rate (0.0 to 1.0)"
   type        = number
+
+  validation {
+    condition     = var.qurl_otel_trace_sample_rate >= 0 && var.qurl_otel_trace_sample_rate <= 1
+    error_message = "qurl_otel_trace_sample_rate must be between 0.0 and 1.0"
+  }
 }
 
 variable "qurl_otel_metrics_interval" {
   description = "Metrics export interval in seconds"
   type        = number
+
+  validation {
+    condition     = var.qurl_otel_metrics_interval > 0 && var.qurl_otel_metrics_interval <= 3600
+    error_message = "qurl_otel_metrics_interval must be between 1 and 3600 seconds"
+  }
 }
 
 variable "qurl_otel_metrics_enabled" {
