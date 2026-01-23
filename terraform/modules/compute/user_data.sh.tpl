@@ -164,7 +164,7 @@ HTTPEOF
 # Each AC registers its public key and AWS identity when it starts.
 # This enables per-AC keypairs and dynamic scaling without static ac.toml.
 # ============================================================================
-%{ if multi_tenant && etcd_endpoint != "" }
+%{ if multi_tenant && storage_backend == "etcd" && etcd_endpoint != "" }
 echo "Configuring etcd connection for AC registry discovery..."
 mkdir -p /opt/layerv/nhp-server/etc/tls
 
@@ -209,7 +209,7 @@ echo "etcd remote.toml configured: ${etcd_endpoint}"
 # ============================================================================
 echo "etcd configured for AC registry only (no static config seeding needed)"
 %{ else }
-echo "etcd not configured (multi_tenant=${multi_tenant}), using local config only"
+echo "etcd not configured (storage_backend=${storage_backend}), using local config only"
 %{ endif }
 
 CLOUDMAP_SERVICE_ID="${cloudmap_service_id}"
