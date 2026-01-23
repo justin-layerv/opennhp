@@ -495,7 +495,9 @@ resource "aws_launch_template" "server" {
     }
   }
 
-  user_data = base64encode(local.user_data)
+  # Use base64gzip to compress user_data - AWS EC2 automatically decompresses
+  # This allows scripts larger than the 16KB uncompressed limit
+  user_data = base64gzip(local.user_data)
 
   monitoring {
     enabled = true

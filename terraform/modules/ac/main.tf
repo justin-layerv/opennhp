@@ -354,141 +354,155 @@ resource "aws_iam_role_policy" "ac" {
   name = "ac-permissions"
   role = aws_iam_role.ac.id
 
+  lifecycle {
+    # QURL service token is required when QURL router is enabled
+    precondition {
+      condition     = var.qurl_router_config == null || !var.qurl_router_config.enabled || var.qurl_service_token_secret_arn != null
+      error_message = "qurl_service_token_secret_arn is required when qurl_router_config.enabled = true"
+    }
+  }
+
+  # Build policy with conditional statements using concat
+  # Statements with optional resources (QURL token, KMS key) are only included when configured
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      # Route53 access for ACME DNS-01 challenge
-      {
-        Sid    = "Route53ACME"
-        Effect = "Allow"
-        Action = [
-          "route53:GetChange",
-          "route53:ChangeResourceRecordSets",
-          "route53:ListResourceRecordSets"
-        ]
-        Resource = concat(
-          [data.aws_route53_zone.main.arn, "arn:aws:route53:::change/*"],
-          [for zone_id in var.production_zone_ids : "arn:aws:route53:::hostedzone/${zone_id}"]
-        )
-      },
-      {
-        Sid      = "Route53ListZones"
-        Effect   = "Allow"
-        Action   = ["route53:ListHostedZonesByName"]
-        Resource = "*"
-      },
-      # ECR access
-      {
-        Sid      = "ECRAuth"
-        Effect   = "Allow"
-        Action   = ["ecr:GetAuthorizationToken"]
-        Resource = "*"
-      },
-      {
-        Sid    = "ECRPull"
-        Effect = "Allow"
-        Action = [
-          "ecr:BatchCheckLayerAvailability",
-          "ecr:GetDownloadUrlForLayer",
-          "ecr:BatchGetImage"
-        ]
-        Resource = var.ac_repo_arn
-      },
-      # Secrets Manager - read NHP server public key
-      {
-        Sid      = "SecretsReadServerKey"
-        Effect   = "Allow"
-        Action   = ["secretsmanager:GetSecretValue"]
-        Resource = [var.server_secret_arn]
-      },
-      # Secrets Manager - read QURL service token (for Traefik QURL router plugin)
-      # Note: Empty Resource array is intentional when ARN is null - grants no permissions
-      {
-        Sid      = "SecretsReadQurlServiceToken"
-        Effect   = "Allow"
-        Action   = ["secretsmanager:GetSecretValue"]
-        Resource = var.qurl_service_token_secret_arn != null ? [var.qurl_service_token_secret_arn] : []
-      },
-      # Secrets Manager - create and manage per-instance AC secrets
-      # Each AC creates {prefix}-ac-{instance-id} for its private key
-      {
-        Sid    = "SecretsCreatePerInstance"
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:CreateSecret",
-          "secretsmanager:PutSecretValue",
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:TagResource",
-          "secretsmanager:DescribeSecret"
-        ]
-        Resource = "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:${var.name_prefix}-ac-i-*"
-      },
-      # KMS for Secrets Manager (encrypt for create, decrypt for read)
-      {
-        Sid      = "KMSForSecrets"
-        Effect   = "Allow"
-        Action   = ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"]
-        Resource = var.secrets_kms_key_arn != null ? [var.secrets_kms_key_arn] : []
-      },
-      # Cloud Map registration
-      {
-        Sid    = "CloudMapRegister"
-        Effect = "Allow"
-        Action = [
-          "servicediscovery:RegisterInstance",
-          "servicediscovery:DeregisterInstance",
-          "servicediscovery:UpdateInstanceCustomHealthStatus",
-          "servicediscovery:GetInstance"
-        ]
-        Resource = aws_service_discovery_service.ac.arn
-      },
-      # Route 53 permissions required for Cloud Map DNS integration with custom health checks
-      {
-        Sid    = "Route53HealthCheck"
-        Effect = "Allow"
-        Action = [
-          "route53:CreateHealthCheck",
-          "route53:DeleteHealthCheck",
-          "route53:UpdateHealthCheck",
-          "route53:GetHealthCheck"
-        ]
-        Resource = "*"
-      },
-      {
-        Sid    = "CloudMapDiscover"
-        Effect = "Allow"
-        Action = [
-          "servicediscovery:DiscoverInstances",
-          "servicediscovery:GetNamespace",
-          "servicediscovery:GetService"
-        ]
-        Resource = "*"
-      },
-      # CloudWatch Logs
-      {
-        Sid    = "CloudWatchLogs"
-        Effect = "Allow"
-        Action = [
-          "logs:CreateLogStream",
-          "logs:PutLogEvents"
-        ]
-        Resource = "${aws_cloudwatch_log_group.ac.arn}:*"
-      },
-      # CloudWatch Metrics (for disk monitoring)
-      {
-        Sid      = "CloudWatchMetrics"
-        Effect   = "Allow"
-        Action   = ["cloudwatch:PutMetricData"]
-        Resource = "*"
-        Condition = {
-          StringEquals = {
-            "cloudwatch:namespace" = "NHP/AC"
+    Statement = concat(
+      # Base statements (always present)
+      [
+        # Route53 access for ACME DNS-01 challenge
+        {
+          Sid    = "Route53ACME"
+          Effect = "Allow"
+          Action = [
+            "route53:GetChange",
+            "route53:ChangeResourceRecordSets",
+            "route53:ListResourceRecordSets"
+          ]
+          Resource = concat(
+            [data.aws_route53_zone.main.arn, "arn:aws:route53:::change/*"],
+            [for zone_id in var.production_zone_ids : "arn:aws:route53:::hostedzone/${zone_id}"]
+          )
+        },
+        {
+          Sid      = "Route53ListZones"
+          Effect   = "Allow"
+          Action   = ["route53:ListHostedZonesByName"]
+          Resource = "*"
+        },
+        # ECR access
+        {
+          Sid      = "ECRAuth"
+          Effect   = "Allow"
+          Action   = ["ecr:GetAuthorizationToken"]
+          Resource = "*"
+        },
+        {
+          Sid    = "ECRPull"
+          Effect = "Allow"
+          Action = [
+            "ecr:BatchCheckLayerAvailability",
+            "ecr:GetDownloadUrlForLayer",
+            "ecr:BatchGetImage"
+          ]
+          Resource = var.ac_repo_arn
+        },
+        # Secrets Manager - read NHP server public key
+        {
+          Sid      = "SecretsReadServerKey"
+          Effect   = "Allow"
+          Action   = ["secretsmanager:GetSecretValue"]
+          Resource = [var.server_secret_arn]
+        },
+        # Secrets Manager - create and manage per-instance AC secrets
+        # Each AC creates {prefix}-ac-{instance-id} for its private key
+        {
+          Sid    = "SecretsCreatePerInstance"
+          Effect = "Allow"
+          Action = [
+            "secretsmanager:CreateSecret",
+            "secretsmanager:PutSecretValue",
+            "secretsmanager:GetSecretValue",
+            "secretsmanager:TagResource",
+            "secretsmanager:DescribeSecret"
+          ]
+          Resource = "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:${var.name_prefix}-ac-i-*"
+        },
+        # Cloud Map registration
+        {
+          Sid    = "CloudMapRegister"
+          Effect = "Allow"
+          Action = [
+            "servicediscovery:RegisterInstance",
+            "servicediscovery:DeregisterInstance",
+            "servicediscovery:UpdateInstanceCustomHealthStatus",
+            "servicediscovery:GetInstance"
+          ]
+          Resource = aws_service_discovery_service.ac.arn
+        },
+        # Route 53 permissions required for Cloud Map DNS integration with custom health checks
+        {
+          Sid    = "Route53HealthCheck"
+          Effect = "Allow"
+          Action = [
+            "route53:CreateHealthCheck",
+            "route53:DeleteHealthCheck",
+            "route53:UpdateHealthCheck",
+            "route53:GetHealthCheck"
+          ]
+          Resource = "*"
+        },
+        {
+          Sid    = "CloudMapDiscover"
+          Effect = "Allow"
+          Action = [
+            "servicediscovery:DiscoverInstances",
+            "servicediscovery:GetNamespace",
+            "servicediscovery:GetService"
+          ]
+          Resource = "*"
+        },
+        # CloudWatch Logs
+        {
+          Sid    = "CloudWatchLogs"
+          Effect = "Allow"
+          Action = [
+            "logs:CreateLogStream",
+            "logs:PutLogEvents"
+          ]
+          Resource = "${aws_cloudwatch_log_group.ac.arn}:*"
+        },
+        # CloudWatch Metrics (for disk monitoring)
+        {
+          Sid      = "CloudWatchMetrics"
+          Effect   = "Allow"
+          Action   = ["cloudwatch:PutMetricData"]
+          Resource = "*"
+          Condition = {
+            StringEquals = {
+              "cloudwatch:namespace" = "NHP/AC"
+            }
           }
+        },
+      ],
+      # Conditional: QURL service token access (only when configured)
+      var.qurl_service_token_secret_arn != null ? [
+        {
+          Sid      = "SecretsReadQurlServiceToken"
+          Effect   = "Allow"
+          Action   = ["secretsmanager:GetSecretValue"]
+          Resource = [var.qurl_service_token_secret_arn]
         }
-      },
-      # Note: S3 plugin access is now handled via plugin_download_policy_arn
-      # from the plugins module (attached separately below)
-    ]
+      ] : [],
+      # Conditional: KMS for Secrets Manager (only when KMS key is configured)
+      var.secrets_kms_key_arn != null ? [
+        {
+          Sid      = "KMSForSecrets"
+          Effect   = "Allow"
+          Action   = ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"]
+          Resource = [var.secrets_kms_key_arn]
+        }
+      ] : [],
+    )
   })
 }
 
