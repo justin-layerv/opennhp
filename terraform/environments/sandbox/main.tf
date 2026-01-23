@@ -83,6 +83,61 @@ module "nhp" {
   qurl_router_proxy_timeout      = var.qurl_router_proxy_timeout
   qurl_router_cache_shards       = var.qurl_router_cache_shards
 
+  # QURL Idempotency Cache
+  qurl_idempotency_cache_ttl_seconds        = var.qurl_idempotency_cache_ttl_seconds
+  qurl_idempotency_cache_max_size           = var.qurl_idempotency_cache_max_size
+  qurl_idempotency_cleanup_interval_seconds = var.qurl_idempotency_cleanup_interval_seconds
+
+  # QURL Health Check
+  qurl_health_check_timeout_seconds   = var.qurl_health_check_timeout_seconds
+  qurl_health_startup_timeout_seconds = var.qurl_health_startup_timeout_seconds
+
+  # QURL License Cache
+  qurl_license_cache_ttl_seconds = var.qurl_license_cache_ttl_seconds
+  qurl_license_cache_max_size    = var.qurl_license_cache_max_size
+
+  # QURL Auth0 JWKS
+  qurl_auth0_jwks_cache_ttl_seconds     = var.qurl_auth0_jwks_cache_ttl_seconds
+  qurl_auth0_jwks_fetch_timeout_seconds = var.qurl_auth0_jwks_fetch_timeout_seconds
+
+  # QURL Webhooks
+  qurl_webhooks_enabled                       = var.qurl_webhooks_enabled
+  qurl_webhooks_worker_count                  = var.qurl_webhooks_worker_count
+  qurl_webhooks_max_webhooks_per_owner        = var.qurl_webhooks_max_webhooks_per_owner
+  qurl_webhooks_delivery_timeout_seconds      = var.qurl_webhooks_delivery_timeout_seconds
+  qurl_webhooks_max_retries                   = var.qurl_webhooks_max_retries
+  qurl_webhooks_event_channel_size            = var.qurl_webhooks_event_channel_size
+  qurl_webhooks_retry_worker_interval_seconds = var.qurl_webhooks_retry_worker_interval_seconds
+  qurl_webhooks_drain_timeout_seconds         = var.qurl_webhooks_drain_timeout_seconds
+  qurl_webhooks_response_body_limit           = var.qurl_webhooks_response_body_limit
+  qurl_webhooks_api_version                   = var.qurl_webhooks_api_version
+
+  # QURL Observability (OpenTelemetry)
+  qurl_otel_enabled           = var.qurl_otel_enabled
+  qurl_otel_service_name      = var.qurl_otel_service_name
+  qurl_otel_service_version   = var.qurl_otel_service_version
+  qurl_otel_environment       = var.qurl_otel_environment
+  qurl_otel_exporter_endpoint = var.qurl_otel_exporter_endpoint
+  qurl_otel_exporter_protocol = var.qurl_otel_exporter_protocol
+  qurl_otel_exporter_insecure = var.qurl_otel_exporter_insecure
+  qurl_otel_trace_sample_rate = var.qurl_otel_trace_sample_rate
+  qurl_otel_metrics_interval  = var.qurl_otel_metrics_interval
+  qurl_otel_metrics_enabled   = var.qurl_otel_metrics_enabled
+  qurl_otel_tracing_enabled   = var.qurl_otel_tracing_enabled
+  qurl_otel_log_correlation   = var.qurl_otel_log_correlation
+
+  # QURL Grafana Cloud (ADOT Sidecar)
+  qurl_grafana_cloud_enabled = var.qurl_grafana_cloud_enabled
+  qurl_grafana_secret_arn    = var.qurl_grafana_secret_arn
+  qurl_adot_collector_image  = var.qurl_adot_collector_image
+
+  # Grafana Cloud Dashboards
+  grafana_dashboards_enabled        = var.grafana_dashboards_enabled
+  grafana_url                       = var.grafana_url
+  grafana_auth                      = var.grafana_auth
+  grafana_prometheus_datasource_uid = var.grafana_prometheus_datasource_uid
+  grafana_tempo_datasource_uid      = var.grafana_tempo_datasource_uid
+
   # Traefik plugins
   traefik_plugins = var.traefik_plugins
 
@@ -107,6 +162,24 @@ module "nhp" {
   console_protected_hostname    = var.console_protected_hostname
   console_ac_license_key_hash   = var.console_ac_license_key_hash
   console_ac_license_key_sha256 = var.console_ac_license_key_sha256
+
+  # Console license lookup and customer provisioning
+  nhp_dynamodb_licenses_customer_index      = var.nhp_dynamodb_licenses_customer_index
+  nhp_dynamodb_licenses_auth0_subject_index = var.nhp_dynamodb_licenses_auth0_subject_index
+  internal_service_token_secret_arn         = var.internal_service_token_secret_arn
+  provisioning_resource_id                  = var.provisioning_resource_id
+  provisioning_default_tier                 = var.provisioning_default_tier
+  provisioning_default_max_acs              = var.provisioning_default_max_acs
+
+  # NHP Server Assignment configuration
+  nhp_server_assignment_enabled        = var.nhp_server_assignment_enabled
+  nhp_region                           = var.nhp_region
+  nhp_cloudmap_service_name            = var.nhp_cloudmap_service_name
+  nhp_assignment_servers_per_ac        = var.nhp_assignment_servers_per_ac
+  nhp_assignment_require_distinct_azs  = var.nhp_assignment_require_distinct_azs
+  nhp_health_monitor_check_interval    = var.nhp_health_monitor_check_interval
+  nhp_health_monitor_operation_timeout = var.nhp_health_monitor_operation_timeout
+  nhp_console_ac_enabled               = var.nhp_console_ac_enabled
 
   # Standalone AC license credentials
   ac_customer_id        = var.ac_customer_id

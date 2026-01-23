@@ -10,7 +10,9 @@
 *.dylib
 .*
 !.github/
+!.gitattributes
 !.golangci.yml
+!.pre-commit-config.yaml
 
 # Claude Code
 !.claude/

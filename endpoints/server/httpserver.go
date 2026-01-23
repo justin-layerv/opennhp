@@ -2,12 +2,14 @@ package server
 
 import (
 	"context"
+	"errors"
 	"html/template"
 	"io/fs"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +19,7 @@ import (
 	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
 
+	"github.com/OpenNHP/opennhp/endpoints/server/health"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
@@ -25,11 +28,12 @@ import (
 )
 
 type HttpServer struct {
-	id         string
-	udpServer  *UdpServer
-	httpServer *http.Server
-	ginEngine  *gin.Engine
-	listenAddr *net.TCPAddr
+	id            string
+	udpServer     *UdpServer
+	httpServer    *http.Server
+	ginEngine     *gin.Engine
+	listenAddr    *net.TCPAddr
+	healthManager *health.Manager
 
 	wg      sync.WaitGroup
 	running atomic.Bool
@@ -79,6 +83,11 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 	hs.ginEngine.Use(corsMiddleware())
 	hs.ginEngine.Use(gin.LoggerWithWriter(us.log.Writer()))
 	hs.ginEngine.Use(gin.Recovery())
+
+	// Initialize health check manager (fail-fast if no storage backend)
+	if err := hs.initHealthManager(); err != nil {
+		return err
+	}
 
 	hs.initRouter()
 
@@ -138,11 +147,10 @@ func (hs *HttpServer) Stop() {
 	hs.running.Store(false)
 	close(hs.signals.stop)
 	ctx, cancel := context.WithTimeout(context.Background(), 5500*time.Millisecond)
+	defer cancel() // Always cancel context to release resources
 	hs.httpServer.Shutdown(ctx)
 
 	hs.wg.Wait()
-	cancel()
-	cancel = nil
 	log.Info("==================================================")
 	log.Info("===  HttpServer (%s) stopped  ===", hs.id)
 	log.Info("==================================================")
@@ -150,6 +158,71 @@ func (hs *HttpServer) Stop() {
 
 func (hs *HttpServer) IsRunning() bool {
 	return hs.running.Load()
+}
+
+// ErrNoStorageBackend is returned when the server starts without a configured storage backend.
+var ErrNoStorageBackend = errors.New("no storage backend configured (etcd or DynamoDB required)")
+
+// initHealthManager initializes the health check manager with appropriate checkers.
+// In non-cloud mode (etcd backend), registers an etcd checker.
+// In cloud mode (DynamoDB backend), registers a DynamoDB checker.
+//
+// Returns an error if no storage backend is configured (fail-fast).
+//
+// Health check timeouts can be configured via environment variables:
+// - HEALTH_CHECK_TIMEOUT_SECONDS: Timeout for individual checks (default: 10)
+// - HEALTH_STARTUP_TIMEOUT_SECONDS: Startup probe timeout (default: 60)
+func (hs *HttpServer) initHealthManager() error {
+	// Default timeouts
+	timeout := 10 * time.Second
+	startupTimeout := 60 * time.Second
+
+	// Allow override via environment variables
+	if envTimeout := os.Getenv("HEALTH_CHECK_TIMEOUT_SECONDS"); envTimeout != "" {
+		if seconds, err := strconv.Atoi(envTimeout); err == nil && seconds > 0 {
+			timeout = time.Duration(seconds) * time.Second
+			log.Info("Health check timeout configured: %v", timeout)
+		}
+	}
+	if envStartup := os.Getenv("HEALTH_STARTUP_TIMEOUT_SECONDS"); envStartup != "" {
+		if seconds, err := strconv.Atoi(envStartup); err == nil && seconds > 0 {
+			startupTimeout = time.Duration(seconds) * time.Second
+			log.Info("Health check startup timeout configured: %v", startupTimeout)
+		}
+	}
+
+	hs.healthManager = health.NewManager(&health.ManagerConfig{
+		Service:        "nhp-server",
+		Version:        version.Version,
+		Timeout:        timeout,
+		StartupTimeout: startupTimeout,
+	})
+
+	backendName := hs.udpServer.GetStorageBackendName()
+
+	// Register etcd health checker for non-cloud mode
+	if pinger := hs.udpServer.GetEtcdPinger(); pinger != nil {
+		hs.healthManager.Register(health.NewEtcdChecker(&health.EtcdCheckerConfig{
+			Client:  pinger,
+			Timeout: 5 * time.Second,
+		}))
+		log.Info("Health check: etcd checker registered (storage backend: %s)", backendName)
+		return nil
+	}
+
+	// Register DynamoDB health checker for cloud mode
+	if pinger := hs.udpServer.GetDynamoDBPinger(); pinger != nil {
+		hs.healthManager.Register(health.NewDynamoDBChecker(&health.DynamoDBCheckerConfig{
+			Client:  pinger,
+			Timeout: 5 * time.Second,
+		}))
+		log.Info("Health check: DynamoDB checker registered (storage backend: %s)", backendName)
+		return nil
+	}
+
+	// Fail-fast: no storage backend means the server cannot function properly
+	log.Error("Health check: no storage checker registered (storage backend: %s) - server cannot start without storage", backendName)
+	return ErrNoStorageBackend
 }
 
 // LoadFilesRecursively loads HTML and template files recursively from the specified directory and adds them to the given gin.Engine.
@@ -203,6 +276,17 @@ func LoadFilesRecursively(g *gin.Engine, dir string) {
 // init gin engine. Must be called at initialization
 func (hs *HttpServer) initRouter() {
 	g := hs.ginEngine
+
+	// Register health check endpoints (internal use only - VPC restricted by security group)
+	// These endpoints are used by:
+	// - NLB target group health checks
+	// - Container orchestration (Docker/ECS)
+	// - Internal monitoring systems
+	if hs.healthManager != nil {
+		healthHandler := health.NewHandler(hs.healthManager)
+		healthHandler.RegisterRoutes(g)
+		log.Info("Health check endpoints registered: /health, /health/live, /health/ready, /health/startup")
+	}
 
 	// load templates. won't trigger panic if file does not exist
 	staticPath := filepath.Join(ExeDirPath, "static")
@@ -298,6 +382,8 @@ func (hs *HttpServer) initRouter() {
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// HTTP headers for CORS
+		// TODO: Make CORS origins configurable (see https://github.com/layervai/nhp/issues/219)
+		// Currently hardcoded to "*" which contradicts production CORS requirements in QURL.
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")                   // allow cross-origin resource sharing
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS, POST") // methods
 		c.Writer.Header().Set("Access-Control-Expose-Headers", "Content-Type, Content-Length, Set-Cookie")

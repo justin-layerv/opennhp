@@ -39,3 +39,8 @@ output "fqdn" {
   description = "Console fully qualified domain name"
   value       = var.domain_name != null && var.hosted_zone != null ? aws_route53_record.console[0].fqdn : null
 }
+
+output "task_role_arn" {
+  description = "Console ECS task role ARN (for granting permissions to publish to SNS, etc.)"
+  value       = aws_iam_role.console_task.arn
+}

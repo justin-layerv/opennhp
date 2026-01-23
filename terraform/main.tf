@@ -26,7 +26,18 @@ terraform {
       source  = "hashicorp/null"
       version = "~> 3.0"
     }
+    grafana = {
+      source  = "grafana/grafana"
+      version = "~> 3.0"
+    }
   }
+}
+
+# Grafana provider for dashboards module
+# Configured with URL and auth from variables. Only used when grafana_dashboards_enabled=true.
+provider "grafana" {
+  url  = var.grafana_url
+  auth = var.grafana_auth
 }
 
 # ==================== Validation ====================
@@ -661,14 +672,21 @@ module "console_ec2" {
   admin_password   = var.console_admin_password
   auth_signing_key = var.auth_signing_key
 
-  # NHP Server Assignment - DynamoDB tables for AC assignments
-  # Required when nhp_server_assignment_enabled=true (the default)
-  nhp_dynamodb_ac_assignments_table  = module.dynamodb.ac_assignments_table_name
-  nhp_dynamodb_server_ac_index_table = module.dynamodb.server_ac_index_table_name
-  nhp_dynamodb_licenses_table        = module.dynamodb.licenses_table_name
-
-  # NHP CloudMap - Console needs namespace to discover NHP servers
-  nhp_cloudmap_namespace = module.data.namespace_name
+  # NHP Server Assignment - DynamoDB tables and CloudMap for AC assignments
+  # All fields explicitly configured (no defaults in module)
+  nhp_server_assignment_enabled        = var.nhp_server_assignment_enabled
+  nhp_region                           = var.nhp_region
+  nhp_dynamodb_ac_assignments_table    = module.dynamodb.ac_assignments_table_name
+  nhp_dynamodb_server_ac_index_table   = module.dynamodb.server_ac_index_table_name
+  nhp_dynamodb_licenses_table          = module.dynamodb.licenses_table_name
+  nhp_dynamodb_resources_table         = module.dynamodb.resources_table_name
+  nhp_cloudmap_namespace               = module.data.namespace_name
+  nhp_cloudmap_service_name            = var.nhp_cloudmap_service_name
+  nhp_assignment_servers_per_ac        = var.nhp_assignment_servers_per_ac
+  nhp_assignment_require_distinct_azs  = var.nhp_assignment_require_distinct_azs
+  nhp_health_monitor_check_interval    = var.nhp_health_monitor_check_interval
+  nhp_health_monitor_operation_timeout = var.nhp_health_monitor_operation_timeout
+  nhp_console_ac_enabled               = var.nhp_console_ac_enabled
 
   # Console AC License - for DynamoDB license validation in cloud mode
   # Generate with: ./terraform/scripts/generate-console-ac-license.sh <environment>
@@ -691,6 +709,17 @@ module "console_ec2" {
   # Port 443 is only accessible after NHP knock adds the user's IP to ipset.
   # Reuse main hosted zone - apps.layerv.xyz is a subdomain of layerv.xyz
   protected_hosted_zone_id = length(data.aws_route53_zone.main) > 0 ? data.aws_route53_zone.main[0].zone_id : null
+
+  # License lookup GSI names - required for QURL quota lookup
+  nhp_dynamodb_licenses_customer_index      = var.nhp_dynamodb_licenses_customer_index
+  nhp_dynamodb_licenses_auth0_subject_index = var.nhp_dynamodb_licenses_auth0_subject_index
+
+  # Internal service authentication and customer provisioning
+  # Used by Auth0 Post User Registration Action to create licenses for new users
+  internal_service_token_secret_arn = var.internal_service_token_secret_arn
+  provisioning_resource_id          = var.provisioning_resource_id
+  provisioning_default_tier         = var.provisioning_default_tier
+  provisioning_default_max_acs      = var.provisioning_default_max_acs
 }
 
 # Data source for hosted zone (used by console_ec2)
@@ -747,9 +776,15 @@ module "qurl_service" {
   dynamodb_table_arns   = module.dynamodb.qurl_table_arns
   dynamodb_table_prefix = "${local.name_prefix}-${var.cell_id}"
 
+  # Licenses table for quota lookup (enables license-based quotas)
+  licenses_table_arn  = module.dynamodb.licenses_table_arn
+  licenses_table_name = module.dynamodb.licenses_table_name
+
   # Auth0
-  auth0_domain   = var.qurl_auth0_domain
-  auth0_audience = var.qurl_auth0_audience
+  auth0_domain                     = var.qurl_auth0_domain
+  auth0_audience                   = var.qurl_auth0_audience
+  auth0_jwks_cache_ttl_seconds     = var.qurl_auth0_jwks_cache_ttl_seconds
+  auth0_jwks_fetch_timeout_seconds = var.qurl_auth0_jwks_fetch_timeout_seconds
 
   # Secrets
   secrets_kms_key_arn        = module.kms.secrets_key_arn
@@ -761,8 +796,22 @@ module "qurl_service" {
 
   # QURL defaults
   cookie_domain        = var.qurl_cookie_domain
+  qurl_link_domain     = var.qurl_link_domain
+  qurl_site_domain     = var.qurl_site_domain
   default_token_expire = var.qurl_default_token_expire
   default_open_time    = var.qurl_default_open_time
+
+  # Rate limiting
+  owner_rate_limit = var.qurl_owner_rate_limit
+  owner_rate_burst = var.qurl_owner_rate_burst
+  ip_rate_limit    = var.qurl_ip_rate_limit
+  ip_rate_burst    = var.qurl_ip_rate_burst
+
+  # Audit
+  audit_retention_days = var.qurl_audit_retention_days
+
+  # CORS
+  cors_allowed_origins = var.qurl_cors_allowed_origins
 
   # AC Fleet defaults
   default_ac_id   = var.qurl_default_ac_id
@@ -773,4 +822,68 @@ module "qurl_service" {
   domain_name     = var.qurl_service_domain
   hosted_zone_id  = var.qurl_hosted_zone_id
   certificate_arn = var.qurl_certificate_arn
+
+  # Idempotency cache
+  idempotency_cache_ttl_seconds        = var.qurl_idempotency_cache_ttl_seconds
+  idempotency_cache_max_size           = var.qurl_idempotency_cache_max_size
+  idempotency_cleanup_interval_seconds = var.qurl_idempotency_cleanup_interval_seconds
+
+  # Health check
+  health_check_timeout_seconds   = var.qurl_health_check_timeout_seconds
+  health_startup_timeout_seconds = var.qurl_health_startup_timeout_seconds
+
+  # License cache
+  license_cache_ttl_seconds = var.qurl_license_cache_ttl_seconds
+  license_cache_max_size    = var.qurl_license_cache_max_size
+
+  # Webhooks
+  webhooks_enabled                       = var.qurl_webhooks_enabled
+  webhooks_worker_count                  = var.qurl_webhooks_worker_count
+  webhooks_max_webhooks_per_owner        = var.qurl_webhooks_max_webhooks_per_owner
+  webhooks_delivery_timeout_seconds      = var.qurl_webhooks_delivery_timeout_seconds
+  webhooks_max_retries                   = var.qurl_webhooks_max_retries
+  webhooks_event_channel_size            = var.qurl_webhooks_event_channel_size
+  webhooks_retry_worker_interval_seconds = var.qurl_webhooks_retry_worker_interval_seconds
+  webhooks_drain_timeout_seconds         = var.qurl_webhooks_drain_timeout_seconds
+  webhooks_response_body_limit           = var.qurl_webhooks_response_body_limit
+  webhooks_api_version                   = var.qurl_webhooks_api_version
+
+  # Observability (OpenTelemetry)
+  otel_enabled           = var.qurl_otel_enabled
+  otel_service_name      = var.qurl_otel_service_name
+  otel_service_version   = var.qurl_otel_service_version
+  otel_environment       = var.qurl_otel_environment
+  otel_exporter_endpoint = var.qurl_otel_exporter_endpoint
+  otel_exporter_protocol = var.qurl_otel_exporter_protocol
+  otel_exporter_insecure = var.qurl_otel_exporter_insecure
+  otel_trace_sample_rate = var.qurl_otel_trace_sample_rate
+  otel_metrics_interval  = var.qurl_otel_metrics_interval
+  otel_metrics_enabled   = var.qurl_otel_metrics_enabled
+  otel_tracing_enabled   = var.qurl_otel_tracing_enabled
+  otel_log_correlation   = var.qurl_otel_log_correlation
+
+  # Grafana Cloud (ADOT Sidecar)
+  grafana_cloud_enabled = var.qurl_grafana_cloud_enabled
+  grafana_secret_arn    = var.qurl_grafana_secret_arn
+  adot_collector_image  = var.qurl_adot_collector_image
+}
+
+# ==================== Grafana Cloud Dashboards ====================
+# Provisions QURL dashboards to Grafana Cloud
+# Requires a Grafana Cloud API key with Editor permissions
+
+module "grafana_dashboards" {
+  source = "./modules/grafana-dashboards"
+  count  = var.grafana_dashboards_enabled ? 1 : 0
+
+  providers = {
+    grafana = grafana
+  }
+
+  grafana_url               = var.grafana_url
+  environment               = var.environment
+  prometheus_datasource_uid = var.grafana_prometheus_datasource_uid
+  tempo_datasource_uid      = var.grafana_tempo_datasource_uid
+
+  tags = local.common_tags
 }

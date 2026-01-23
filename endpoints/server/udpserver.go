@@ -421,6 +421,56 @@ func (s *UdpServer) GetHttpTLSStatus() string {
 	return "disabled"
 }
 
+// EtcdPinger is the interface for health checking etcd connectivity.
+type EtcdPinger interface {
+	Ping(ctx context.Context) error
+}
+
+// DynamoDBPinger is the interface for health checking DynamoDB connectivity.
+type DynamoDBPinger interface {
+	Ping(ctx context.Context) error
+}
+
+// GetEtcdPinger returns an EtcdPinger if the storage backend supports it.
+// Returns nil if no etcd-based health check is available.
+func (s *UdpServer) GetEtcdPinger() EtcdPinger {
+	if s.storage == nil {
+		return nil
+	}
+	// Check if storage implements Ping (etcd storage does)
+	if pinger, ok := s.storage.(EtcdPinger); ok {
+		// Only return if this is actually etcd storage
+		if s.storage.Name() == "etcd" {
+			return pinger
+		}
+	}
+	return nil
+}
+
+// GetDynamoDBPinger returns a DynamoDBPinger if the storage backend supports it.
+// Returns nil if no DynamoDB-based health check is available.
+func (s *UdpServer) GetDynamoDBPinger() DynamoDBPinger {
+	if s.storage == nil {
+		return nil
+	}
+	// Check if storage implements Ping (DynamoDB storage does)
+	if pinger, ok := s.storage.(DynamoDBPinger); ok {
+		// Only return if this is actually DynamoDB storage
+		if s.storage.Name() == "dynamodb" {
+			return pinger
+		}
+	}
+	return nil
+}
+
+// GetStorageBackendName returns the name of the current storage backend.
+func (s *UdpServer) GetStorageBackendName() string {
+	if s.storage == nil {
+		return "none"
+	}
+	return s.storage.Name()
+}
+
 func (s *UdpServer) IsRunning() bool {
 	return s.running.Load()
 }

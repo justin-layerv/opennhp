@@ -274,6 +274,220 @@ variable "qurl_router_cache_shards" {
   default     = 16
 }
 
+# QURL Idempotency Cache
+variable "qurl_idempotency_cache_ttl_seconds" {
+  description = "TTL for idempotency cache entries in seconds"
+  type        = number
+}
+
+variable "qurl_idempotency_cache_max_size" {
+  description = "Maximum number of idempotency cache entries"
+  type        = number
+}
+
+variable "qurl_idempotency_cleanup_interval_seconds" {
+  description = "Interval between idempotency cache cleanup runs in seconds"
+  type        = number
+}
+
+# QURL Health Check
+variable "qurl_health_check_timeout_seconds" {
+  description = "Timeout for QURL health check operations in seconds"
+  type        = number
+}
+
+variable "qurl_health_startup_timeout_seconds" {
+  description = "Timeout for QURL startup health checks in seconds"
+  type        = number
+}
+
+# QURL License Cache
+variable "qurl_license_cache_ttl_seconds" {
+  description = "TTL for license cache entries in seconds"
+  type        = number
+}
+
+variable "qurl_license_cache_max_size" {
+  description = "Maximum number of license cache entries"
+  type        = number
+}
+
+# QURL Auth0 JWKS
+variable "qurl_auth0_jwks_cache_ttl_seconds" {
+  description = "TTL for Auth0 JWKS cache in seconds"
+  type        = number
+}
+
+variable "qurl_auth0_jwks_fetch_timeout_seconds" {
+  description = "Timeout for fetching Auth0 JWKS in seconds"
+  type        = number
+}
+
+# QURL Webhooks
+variable "qurl_webhooks_enabled" {
+  description = "Enable webhook delivery for QURL service"
+  type        = bool
+  default     = false
+}
+
+variable "qurl_webhooks_worker_count" {
+  description = "Number of concurrent webhook delivery workers"
+  type        = number
+}
+
+variable "qurl_webhooks_max_webhooks_per_owner" {
+  description = "Maximum number of webhooks per owner"
+  type        = number
+}
+
+variable "qurl_webhooks_delivery_timeout_seconds" {
+  description = "Timeout for webhook delivery in seconds"
+  type        = number
+}
+
+variable "qurl_webhooks_max_retries" {
+  description = "Maximum number of webhook delivery retries"
+  type        = number
+}
+
+variable "qurl_webhooks_event_channel_size" {
+  description = "Size of the webhook event channel buffer"
+  type        = number
+}
+
+variable "qurl_webhooks_retry_worker_interval_seconds" {
+  description = "Interval between webhook retry worker runs in seconds"
+  type        = number
+}
+
+variable "qurl_webhooks_drain_timeout_seconds" {
+  description = "Timeout for draining webhook events during shutdown in seconds"
+  type        = number
+}
+
+variable "qurl_webhooks_response_body_limit" {
+  description = "Maximum response body size to store from webhook endpoints in bytes"
+  type        = number
+}
+
+variable "qurl_webhooks_api_version" {
+  description = "API version string for webhook payloads"
+  type        = string
+}
+
+# QURL Observability (OpenTelemetry)
+variable "qurl_otel_enabled" {
+  description = "Enable OpenTelemetry instrumentation for QURL service"
+  type        = bool
+  default     = false
+}
+
+variable "qurl_otel_service_name" {
+  description = "Service name for OpenTelemetry"
+  type        = string
+}
+
+variable "qurl_otel_service_version" {
+  description = "Service version for OpenTelemetry"
+  type        = string
+}
+
+variable "qurl_otel_environment" {
+  description = "Environment name for OpenTelemetry"
+  type        = string
+}
+
+variable "qurl_otel_exporter_endpoint" {
+  description = "OTLP exporter endpoint (e.g., http://localhost:4317)"
+  type        = string
+}
+
+variable "qurl_otel_exporter_protocol" {
+  description = "OTLP exporter protocol (grpc or http/protobuf)"
+  type        = string
+}
+
+variable "qurl_otel_exporter_insecure" {
+  description = "Use insecure connection to OTLP endpoint (for localhost sidecar)"
+  type        = bool
+}
+
+variable "qurl_otel_trace_sample_rate" {
+  description = "Trace sampling rate (0.0 to 1.0)"
+  type        = number
+}
+
+variable "qurl_otel_metrics_interval" {
+  description = "Metrics export interval in seconds"
+  type        = number
+}
+
+variable "qurl_otel_metrics_enabled" {
+  description = "Enable OpenTelemetry metrics"
+  type        = bool
+}
+
+variable "qurl_otel_tracing_enabled" {
+  description = "Enable OpenTelemetry tracing"
+  type        = bool
+}
+
+variable "qurl_otel_log_correlation" {
+  description = "Enable trace ID correlation in logs"
+  type        = bool
+}
+
+# QURL Grafana Cloud (ADOT Sidecar)
+variable "qurl_grafana_cloud_enabled" {
+  description = "Enable Grafana Cloud OTLP export via ADOT sidecar for QURL service"
+  type        = bool
+  default     = false
+}
+
+variable "qurl_grafana_secret_arn" {
+  description = "ARN of Secrets Manager secret containing Grafana Cloud OTLP credentials"
+  type        = string
+  default     = null
+}
+
+variable "qurl_adot_collector_image" {
+  description = "ADOT Collector container image for QURL service"
+  type        = string
+  default     = "public.ecr.aws/aws-observability/aws-otel-collector:v0.40.0"
+}
+
+# Grafana Cloud Dashboards
+variable "grafana_dashboards_enabled" {
+  description = "Enable Grafana Cloud dashboard provisioning"
+  type        = bool
+  default     = false
+}
+
+variable "grafana_url" {
+  description = "Grafana Cloud stack URL (e.g., https://layervai.grafana.net)"
+  type        = string
+  default     = ""
+}
+
+variable "grafana_auth" {
+  description = "Grafana Cloud API key or service account token with Editor role"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "grafana_prometheus_datasource_uid" {
+  description = "UID of the Prometheus/Mimir datasource in Grafana Cloud"
+  type        = string
+  default     = "grafanacloud-prom"
+}
+
+variable "grafana_tempo_datasource_uid" {
+  description = "UID of the Tempo datasource in Grafana Cloud"
+  type        = string
+  default     = "grafanacloud-traces"
+}
+
 # Traefik plugins
 variable "traefik_plugins" {
   description = "Map of Traefik plugins to deploy"
@@ -371,6 +585,86 @@ variable "console_ac_license_key_sha256" {
   description = "SHA256 hash of Console AC license key for DynamoDB lookup. Generate with: ./terraform/scripts/generate-console-ac-license.sh"
   type        = string
   sensitive   = true
+  default     = null
+}
+
+# Console license lookup GSI names
+variable "nhp_dynamodb_licenses_customer_index" {
+  description = "GSI name for querying licenses by customer_id. Recommended: 'customer_id-index'"
+  type        = string
+  default     = null
+}
+
+variable "nhp_dynamodb_licenses_auth0_subject_index" {
+  description = "GSI name for querying licenses by auth0_subject. Recommended: 'auth0_subject-index'"
+  type        = string
+  default     = null
+}
+
+# NHP Server Assignment Configuration
+# All fields are required - no defaults (explicit configuration philosophy)
+variable "nhp_server_assignment_enabled" {
+  description = "Enable NHP server assignment for ACs. Required. Recommended: true"
+  type        = bool
+}
+
+variable "nhp_region" {
+  description = "AWS region for NHP DynamoDB tables and CloudMap. Required. Recommended: match deployment region"
+  type        = string
+}
+
+variable "nhp_cloudmap_service_name" {
+  description = "CloudMap service name for NHP servers. Required. Recommended: 'server'"
+  type        = string
+}
+
+variable "nhp_assignment_servers_per_ac" {
+  description = "Number of NHP servers to assign per AC. Required. Recommended: 3"
+  type        = number
+}
+
+variable "nhp_assignment_require_distinct_azs" {
+  description = "Require assigned servers to be in different AZs. Required. Recommended: true"
+  type        = bool
+}
+
+variable "nhp_health_monitor_check_interval" {
+  description = "Interval in seconds between health checks. Required. Recommended: 60"
+  type        = number
+}
+
+variable "nhp_health_monitor_operation_timeout" {
+  description = "Timeout in seconds for health check operations. Required. Recommended: 30"
+  type        = number
+}
+
+variable "nhp_console_ac_enabled" {
+  description = "Enable Console's embedded AC self-registration. Required. Recommended: true"
+  type        = bool
+}
+
+# Console internal service auth and customer provisioning
+variable "internal_service_token_secret_arn" {
+  description = "ARN of Secrets Manager secret for internal service token"
+  type        = string
+  default     = null
+}
+
+variable "provisioning_resource_id" {
+  description = "Resource ID for auto-provisioned licenses. Recommended: 'qurl-auto-provisioned'"
+  type        = string
+  default     = null
+}
+
+variable "provisioning_default_tier" {
+  description = "Default license tier for new customers. Recommended: 'free'"
+  type        = string
+  default     = null
+}
+
+variable "provisioning_default_max_acs" {
+  description = "Default MaxACs for new customers. Recommended: 1"
+  type        = number
   default     = null
 }
 

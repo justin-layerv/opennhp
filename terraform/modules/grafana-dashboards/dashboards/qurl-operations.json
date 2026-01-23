@@ -1,0 +1,977 @@
+{
+  "title": "QURL Operations",
+  "description": "HTTP RED metrics, SLOs, and infrastructure health for QURL API service",
+  "uid": "qurl-operations",
+  "tags": ["qurl", "operations", "${environment}"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "annotations": {
+    "list": [
+      {
+        "name": "Deployments",
+        "datasource": {"uid": "${datasource_uid}"},
+        "enable": true,
+        "hide": false,
+        "iconColor": "blue",
+        "expr": "changes(process_start_time_seconds{service_name=\"qurl-api\", deployment_environment=\"$environment\"}[2m]) > 0",
+        "step": "60s",
+        "titleFormat": "Deployment",
+        "textFormat": "Service restarted"
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "Business Metrics",
+      "type": "link",
+      "url": "/d/qurl-business/qurl-business-metrics?var-environment=$environment&var-cell_id=$cell_id",
+      "icon": "dashboard"
+    },
+    {
+      "title": "Webhooks",
+      "type": "link",
+      "url": "/d/qurl-webhooks/qurl-webhooks?var-environment=$environment&var-cell_id=$cell_id",
+      "icon": "dashboard"
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "environment",
+        "type": "custom",
+        "current": {
+          "text": "${environment}",
+          "value": "${environment}"
+        },
+        "options": [
+          {"text": "sandbox", "value": "sandbox"},
+          {"text": "prod", "value": "prod"}
+        ]
+      },
+      {
+        "name": "cell_id",
+        "type": "query",
+        "datasource": {"uid": "${datasource_uid}"},
+        "query": "label_values(http_server_request_duration_seconds_count{service_name=\"qurl-api\"}, cell_id)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      },
+      {
+        "name": "slo_target",
+        "type": "custom",
+        "current": {"text": "99.9", "value": "99.9"},
+        "options": [
+          {"text": "99.9", "value": "99.9"},
+          {"text": "99.5", "value": "99.5"},
+          {"text": "99.0", "value": "99.0"}
+        ],
+        "label": "SLO Target %"
+      },
+      {
+        "name": "latency_slo_ms",
+        "type": "custom",
+        "current": {"text": "500", "value": "500"},
+        "options": [
+          {"text": "200", "value": "200"},
+          {"text": "500", "value": "500"},
+          {"text": "1000", "value": "1000"}
+        ],
+        "label": "Latency SLO (ms)"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 100,
+      "title": "SLIs & Overview",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false
+    },
+    {
+      "id": 1,
+      "title": "Availability (30d)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 3, "x": 0, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "(1 - (sum(increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", http_status_code=~\"5..\"}[30d])) / sum(increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[30d])))) * 100",
+          "legendFormat": "Availability"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 3,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 99},
+              {"color": "green", "value": 99.9}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "value"}
+    },
+    {
+      "id": 2,
+      "title": "Error Budget",
+      "type": "gauge",
+      "gridPos": {"h": 4, "w": 3, "x": 3, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "clamp_min(100 * (1 - ((sum(increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", http_status_code=~\"5..\"}[30d])) / sum(increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[30d]))) / (1 - $slo_target/100))), 0)",
+          "legendFormat": "Budget"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 25},
+              {"color": "green", "value": 50}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 70,
+      "title": "Burn Rate (1h)",
+      "description": "How fast error budget is being consumed. >1 = burning faster than sustainable, >14.4 = will exhaust 30d budget in 1h",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 3, "x": 6, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "(sum(rate(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", http_status_code=~\"5..\"}[1h])) / sum(rate(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1h]))) / (1 - $slo_target/100) or vector(0)",
+          "legendFormat": "Burn Rate"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1},
+              {"color": "orange", "value": 6},
+              {"color": "red", "value": 14.4}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "value"}
+    },
+    {
+      "id": 71,
+      "title": "5xx Count (1h)",
+      "description": "Total 5xx errors in the last hour",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 3, "x": 9, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", http_status_code=~\"5..\"}[1h])) or vector(0)",
+          "legendFormat": "Errors"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1},
+              {"color": "orange", "value": 10},
+              {"color": "red", "value": 100}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "value"}
+    },
+    {
+      "id": 3,
+      "title": "Request Rate",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 3, "x": 12, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(rate(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
+          "legendFormat": "req/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [{"color": "blue", "value": null}]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "5xx Error Rate",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 3, "x": 15, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(rate(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", http_status_code=~\"5..\"}[5m])) / sum(rate(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) * 100 or vector(0)",
+          "legendFormat": "5xx %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 2,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 0.1},
+              {"color": "red", "value": 1}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "4xx Error Rate",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 3, "x": 18, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(rate(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", http_status_code=~\"4..\"}[5m])) / sum(rate(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) * 100 or vector(0)",
+          "legendFormat": "4xx %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 2,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 5},
+              {"color": "orange", "value": 10}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "p99 Latency",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 3, "x": 21, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_server_request_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 500},
+              {"color": "red", "value": 1000}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 101,
+      "title": "Traffic",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 5},
+      "collapsed": false
+    },
+    {
+      "id": 10,
+      "title": "Request Rate Over Time",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(rate(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
+          "legendFormat": "Current",
+          "exemplar": true
+        },
+        {
+          "expr": "sum(rate(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m] offset 1d))",
+          "legendFormat": "Yesterday"
+        },
+        {
+          "expr": "sum(rate(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m] offset 7d))",
+          "legendFormat": "Last Week"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Yesterday"}, "properties": [{"id": "custom.lineStyle", "value": {"fill": "dash"}}]},
+          {"matcher": {"id": "byName", "options": "Last Week"}, "properties": [{"id": "custom.lineStyle", "value": {"fill": "dot"}}]}
+        ]
+      },
+      "options": {
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "id": 11,
+      "title": "Requests by Endpoint",
+      "type": "table",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "topk(10, sum by (http_route, http_method) (increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1h])))",
+          "legendFormat": "{{http_method}} {{http_route}}",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {"id": "organize", "options": {"renameByName": {"http_route": "Endpoint", "http_method": "Method", "Value": "Requests (1h)"}}}
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "short"},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Requests (1h)"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background", "mode": "gradient"}}, {"id": "color", "value": {"mode": "continuous-BlPu"}}]}
+        ]
+      }
+    },
+    {
+      "id": 102,
+      "title": "Errors",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 14},
+      "collapsed": false
+    },
+    {
+      "id": 20,
+      "title": "Error Rate by Type (with SLO)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 15},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(rate(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", http_status_code=~\"5..\"}[5m])) / sum(rate(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) * 100 or vector(0)",
+          "legendFormat": "5xx (Server)",
+          "exemplar": true
+        },
+        {
+          "expr": "sum(rate(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", http_status_code=~\"4..\"}[5m])) / sum(rate(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) * 100 or vector(0)",
+          "legendFormat": "4xx (Client)",
+          "exemplar": true
+        },
+        {
+          "expr": "100 - $slo_target",
+          "legendFormat": "SLO Target (max error %)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20
+          }
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "5xx (Server)"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "4xx (Client)"}, "properties": [{"id": "color", "value": {"fixedColor": "orange", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "SLO Target (max error %)"}, "properties": [{"id": "color", "value": {"fixedColor": "purple", "mode": "fixed"}}, {"id": "custom.lineStyle", "value": {"fill": "dash", "dash": [10, 10]}}, {"id": "custom.fillOpacity", "value": 0}, {"id": "custom.lineWidth", "value": 2}]}
+        ]
+      },
+      "options": {
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "id": 21,
+      "title": "Top Errors by Endpoint",
+      "type": "table",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 15},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "topk(10, sum by (http_route, http_status_code) (increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", http_status_code=~\"[45]..\"}[1h])))",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {"id": "organize", "options": {"renameByName": {"http_route": "Endpoint", "http_status_code": "Status", "Value": "Count (1h)"}}}
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "short"},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Status"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-text"}}, {"id": "mappings", "value": [{"type": "range", "options": {"from": 500, "to": 599, "result": {"color": "red"}}}, {"type": "range", "options": {"from": 400, "to": 499, "result": {"color": "orange"}}}]}]}
+        ]
+      }
+    },
+    {
+      "id": 103,
+      "title": "Latency",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 23},
+      "collapsed": false
+    },
+    {
+      "id": 30,
+      "title": "Latency Percentiles (with SLO)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(http_server_request_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
+          "legendFormat": "p50",
+          "exemplar": true
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_server_request_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
+          "legendFormat": "p95",
+          "exemplar": true
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_server_request_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
+          "legendFormat": "p99",
+          "exemplar": true
+        },
+        {
+          "expr": "$latency_slo_ms",
+          "legendFormat": "SLO Target"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 0
+          }
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "SLO Target"}, "properties": [{"id": "color", "value": {"fixedColor": "purple", "mode": "fixed"}}, {"id": "custom.lineStyle", "value": {"fill": "dash", "dash": [10, 10]}}, {"id": "custom.lineWidth", "value": 2}]}
+        ]
+      },
+      "options": {
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "id": 31,
+      "title": "Latency Heatmap",
+      "type": "heatmap",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(increase(http_server_request_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1m])) by (le)",
+          "legendFormat": "{{le}}",
+          "format": "heatmap",
+          "exemplar": true
+        }
+      ],
+      "options": {
+        "calculate": false,
+        "yAxis": {"unit": "s"},
+        "color": {"scheme": "Oranges", "mode": "scheme"},
+        "cellGap": 1,
+        "exemplars": {"color": "rgba(255,0,255,0.7)"}
+      }
+    },
+    {
+      "id": 32,
+      "title": "Slowest Endpoints (p99)",
+      "type": "table",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 32},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "topk(10, histogram_quantile(0.99, sum(rate(http_server_request_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le, http_route, http_method)) * 1000)",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {"id": "organize", "options": {"excludeByName": {"le": true, "Time": true}, "renameByName": {"http_route": "Endpoint", "http_method": "Method", "Value": "p99 Latency (ms)"}}}
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "ms", "decimals": 1},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "p99 Latency (ms)"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background", "mode": "gradient"}}, {"id": "color", "value": {"mode": "continuous-YlOrRd"}}]}
+        ]
+      }
+    },
+    {
+      "id": 107,
+      "title": "Infrastructure",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 40},
+      "collapsed": false
+    },
+    {
+      "id": 80,
+      "title": "CPU Usage",
+      "description": "Container CPU utilization from ECS/ADOT",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 41},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "avg(container_cpu_utilization{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}) * 100",
+          "legendFormat": "Avg CPU %",
+          "exemplar": true
+        },
+        {
+          "expr": "max(container_cpu_utilization{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}) * 100",
+          "legendFormat": "Max CPU %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20,
+            "thresholdsStyle": {"mode": "line"}
+          },
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 70},
+              {"color": "red", "value": 90}
+            ]
+          }
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Max CPU %"}, "properties": [{"id": "custom.lineStyle", "value": {"fill": "dash"}}]}
+        ]
+      }
+    },
+    {
+      "id": 81,
+      "title": "Memory Usage",
+      "description": "Container memory utilization from ECS/ADOT",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 41},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "avg(container_memory_utilization{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}) * 100",
+          "legendFormat": "Avg Memory %",
+          "exemplar": true
+        },
+        {
+          "expr": "max(container_memory_utilization{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}) * 100",
+          "legendFormat": "Max Memory %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20,
+            "thresholdsStyle": {"mode": "line"}
+          },
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 75},
+              {"color": "red", "value": 90}
+            ]
+          }
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Max Memory %"}, "properties": [{"id": "custom.lineStyle", "value": {"fill": "dash"}}]}
+        ]
+      }
+    },
+    {
+      "id": 82,
+      "title": "Network I/O",
+      "description": "Container network throughput",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 41},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(rate(container_network_receive_bytes_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
+          "legendFormat": "RX"
+        },
+        {
+          "expr": "sum(rate(container_network_transmit_bytes_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
+          "legendFormat": "TX"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20
+          }
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "RX"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "TX"}, "properties": [{"id": "color", "value": {"fixedColor": "blue", "mode": "fixed"}}]}
+        ]
+      }
+    },
+    {
+      "id": 83,
+      "title": "Task Count",
+      "description": "Number of running ECS tasks",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 49},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "count(container_cpu_utilization{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"})",
+          "legendFormat": "Tasks"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "green", "value": 1}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 84,
+      "title": "Avg CPU",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 49},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "avg(container_cpu_utilization{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}) * 100",
+          "legendFormat": "CPU"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 70},
+              {"color": "red", "value": 90}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 85,
+      "title": "Avg Memory",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 49},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "avg(container_memory_utilization{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}) * 100",
+          "legendFormat": "Memory"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 75},
+              {"color": "red", "value": 90}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 86,
+      "title": "Go Heap (if available)",
+      "description": "Go runtime heap memory from process metrics",
+      "type": "timeseries",
+      "gridPos": {"h": 4, "w": 12, "x": 12, "y": 49},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "go_memstats_heap_inuse_bytes{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}",
+          "legendFormat": "Heap In Use"
+        },
+        {
+          "expr": "go_memstats_heap_alloc_bytes{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}",
+          "legendFormat": "Heap Alloc"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20
+          }
+        }
+      }
+    },
+    {
+      "id": 104,
+      "title": "Dependencies",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 53},
+      "collapsed": false
+    },
+    {
+      "id": 40,
+      "title": "DynamoDB Latency by Operation",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 54},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(aws_dynamodb_operation_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le, operation)) * 1000",
+          "legendFormat": "{{operation}}",
+          "exemplar": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 0
+          }
+        }
+      },
+      "options": {
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "id": 41,
+      "title": "DynamoDB Errors",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 54},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(rate(aws_dynamodb_operation_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", success=\"false\"}[5m])) by (operation)",
+          "legendFormat": "{{operation}}",
+          "exemplar": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20
+          }
+        }
+      }
+    },
+    {
+      "id": 42,
+      "title": "Auth0 JWT Validation",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 54},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(rate(auth0_jwt_validation_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", result=\"success\"}[5m]))",
+          "legendFormat": "Success",
+          "exemplar": true
+        },
+        {
+          "expr": "sum(rate(auth0_jwt_validation_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", result=\"failure\"}[5m]))",
+          "legendFormat": "Failure",
+          "exemplar": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20
+          }
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Success"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "Failure"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]}
+        ]
+      }
+    },
+    {
+      "id": 105,
+      "title": "Rate Limiting",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 62},
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 50,
+          "title": "Rate Limit Hits",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 63},
+          "datasource": {"uid": "${datasource_uid}"},
+          "targets": [
+            {
+              "expr": "sum(rate(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", http_status_code=\"429\"}[5m]))",
+              "legendFormat": "429 Rate Limited",
+              "exemplar": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "color": {"fixedColor": "orange", "mode": "fixed"},
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "smooth",
+                "fillOpacity": 20
+              }
+            }
+          }
+        },
+        {
+          "id": 51,
+          "title": "Rate Limit by Endpoint",
+          "type": "table",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 63},
+          "datasource": {"uid": "${datasource_uid}"},
+          "targets": [
+            {
+              "expr": "topk(10, sum by (http_route) (increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", http_status_code=\"429\"}[1h])))",
+              "format": "table",
+              "instant": true
+            }
+          ],
+          "transformations": [
+            {"id": "organize", "options": {"renameByName": {"http_route": "Endpoint", "Value": "429s (1h)"}}}
+          ]
+        }
+      ]
+    },
+    {
+      "id": 106,
+      "title": "Traces",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 71},
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 60,
+          "title": "Recent Traces (Errors)",
+          "type": "traces",
+          "gridPos": {"h": 10, "w": 24, "x": 0, "y": 72},
+          "datasource": {"uid": "${tempo_uid}"},
+          "targets": [
+            {
+              "queryType": "traceqlSearch",
+              "filters": [
+                {"id": "service-name", "operator": "=", "scope": "resource", "tag": "service.name", "value": ["qurl-api"]},
+                {"id": "status", "operator": "=", "scope": "intrinsic", "tag": "status", "value": ["error"]}
+              ],
+              "limit": 20
+            }
+          ]
+        },
+        {
+          "id": 61,
+          "title": "Slow Traces (>500ms)",
+          "type": "traces",
+          "gridPos": {"h": 10, "w": 24, "x": 0, "y": 82},
+          "datasource": {"uid": "${tempo_uid}"},
+          "targets": [
+            {
+              "queryType": "traceqlSearch",
+              "filters": [
+                {"id": "service-name", "operator": "=", "scope": "resource", "tag": "service.name", "value": ["qurl-api"]},
+                {"id": "min-duration", "operator": ">", "scope": "intrinsic", "tag": "duration", "value": ["500ms"]}
+              ],
+              "limit": 20
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

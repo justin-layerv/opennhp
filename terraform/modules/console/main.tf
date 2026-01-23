@@ -12,6 +12,18 @@ locals {
     enabled = length(var.ac_configs) > 0
     acs     = var.ac_configs
   })
+
+  # License events environment variables (conditional)
+  license_events_env = var.license_events_enabled ? [
+    {
+      name  = "GVA_CONFIG_NHP_LICENSE_EVENTS_ENABLED"
+      value = "true"
+    },
+    {
+      name  = "GVA_CONFIG_NHP_LICENSE_EVENTS_TOPIC_ARN"
+      value = var.license_events_topic_arn
+    }
+  ] : []
 }
 
 # ==================== ECS Cluster ====================
@@ -301,6 +313,29 @@ resource "aws_iam_role_policy" "console_secrets" {
   })
 }
 
+# IAM policy for SNS publish (license events)
+resource "aws_iam_role_policy" "console_sns" {
+  count = var.license_events_enabled ? 1 : 0
+
+  name = "${local.console_name}-sns"
+  role = aws_iam_role.console_task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "PublishLicenseEvents"
+        Effect = "Allow"
+        Action = [
+          "sns:Publish",
+          "sns:GetTopicAttributes"
+        ]
+        Resource = [var.license_events_topic_arn]
+      }
+    ]
+  })
+}
+
 # ==================== ECS Task Definition ====================
 
 resource "aws_ecs_task_definition" "console" {
@@ -326,7 +361,7 @@ resource "aws_ecs_task_definition" "console" {
         }
       ]
 
-      environment = [
+      environment = concat([
         {
           name  = "GVA_CONFIG_SYSTEM_ADDR"
           value = tostring(var.console_port)
@@ -359,7 +394,7 @@ resource "aws_ecs_task_definition" "console" {
           name  = "GVA_CONFIG_ACCESSCONTROLLERS"
           value = local.ac_config_json
         }
-      ]
+      ], local.license_events_env)
 
       secrets = [
         {

@@ -1,0 +1,514 @@
+{
+  "title": "QURL Business Metrics",
+  "description": "Business KPIs for QURL service: resources, tokens, quotas",
+  "uid": "qurl-business",
+  "tags": ["qurl", "business", "${environment}"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "1m",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "links": [
+    {
+      "title": "Operations",
+      "type": "link",
+      "url": "/d/qurl-operations/qurl-operations?var-environment=$environment&var-cell_id=$cell_id",
+      "icon": "dashboard"
+    },
+    {
+      "title": "Webhooks",
+      "type": "link",
+      "url": "/d/qurl-webhooks/qurl-webhooks?var-environment=$environment&var-cell_id=$cell_id",
+      "icon": "dashboard"
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "environment",
+        "type": "custom",
+        "current": {
+          "text": "${environment}",
+          "value": "${environment}"
+        },
+        "options": [
+          {"text": "sandbox", "value": "sandbox"},
+          {"text": "prod", "value": "prod"}
+        ]
+      },
+      {
+        "name": "cell_id",
+        "type": "query",
+        "datasource": {"uid": "${datasource_uid}"},
+        "query": "label_values(qurl_resource_created_total{service_name=\"qurl-api\"}, cell_id)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 100,
+      "title": "Overview",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false
+    },
+    {
+      "id": 1,
+      "title": "QURLs Created (24h)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(increase(qurl_resource_created_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h]))",
+          "legendFormat": "Created"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "blue", "value": null}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "vs Yesterday",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 2, "x": 4, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "((sum(increase(qurl_resource_created_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h])) - sum(increase(qurl_resource_created_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h] offset 1d))) / sum(increase(qurl_resource_created_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h] offset 1d))) * 100 or vector(0)",
+          "legendFormat": "Change"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": -10},
+              {"color": "green", "value": 0}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "value"}
+    },
+    {
+      "id": 3,
+      "title": "Active QURLs",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 6, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(qurl_resource_active{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"})",
+          "legendFormat": "Active"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Tokens Minted (24h)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 10, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(increase(qurl_token_minted_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h]))",
+          "legendFormat": "Minted"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "purple", "value": null}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Quota Limit Hits (24h)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 14, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(increase(qurl_quota_limit_hit_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h]))",
+          "legendFormat": "Quota Hits"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 10},
+              {"color": "red", "value": 100}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Access Denied (24h)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 18, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(increase(qurl_access_denied_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h]))",
+          "legendFormat": "Denied"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 10},
+              {"color": "red", "value": 50}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Successful Accesses (24h)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 2, "x": 22, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(increase(qurl_access_granted_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h]))",
+          "legendFormat": "Success"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 101,
+      "title": "Resource Lifecycle",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 5},
+      "collapsed": false
+    },
+    {
+      "id": 10,
+      "title": "QURLs Created Over Time",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(increase(qurl_resource_created_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1h]))",
+          "legendFormat": "Created (Current)"
+        },
+        {
+          "expr": "sum(increase(qurl_resource_created_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1h] offset 7d))",
+          "legendFormat": "Created (Last Week)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80
+          }
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Created (Last Week)"}, "properties": [{"id": "custom.drawStyle", "value": "line"}, {"id": "custom.fillOpacity", "value": 0}, {"id": "custom.lineStyle", "value": {"fill": "dash"}}]}
+        ]
+      }
+    },
+    {
+      "id": 11,
+      "title": "Active QURLs by Tier",
+      "type": "piechart",
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 6},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum by (tier) (qurl_resource_active{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"})",
+          "legendFormat": "{{tier}}"
+        }
+      ],
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "values": ["value", "percent"]},
+        "pieType": "donut"
+      }
+    },
+    {
+      "id": 12,
+      "title": "Resource Status Transitions",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 6},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(rate(qurl_resource_created_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
+          "legendFormat": "Created"
+        },
+        {
+          "expr": "sum(rate(qurl_resource_revoked_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
+          "legendFormat": "Revoked"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20
+          }
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Created"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "Revoked"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]}
+        ]
+      }
+    },
+    {
+      "id": 102,
+      "title": "Tokens & Access",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 14},
+      "collapsed": false
+    },
+    {
+      "id": 20,
+      "title": "Token Validation Results",
+      "type": "piechart",
+      "gridPos": {"h": 8, "w": 6, "x": 0, "y": 15},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum by (result) (increase(qurl_token_validation_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h]))",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "values": ["value", "percent"]},
+        "pieType": "donut"
+      },
+      "fieldConfig": {
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "valid"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "invalid"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "expired"}, "properties": [{"id": "color", "value": {"fixedColor": "yellow", "mode": "fixed"}}]}
+        ]
+      }
+    },
+    {
+      "id": 21,
+      "title": "Token Validation Rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 10, "x": 6, "y": 15},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(qurl_token_validation_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20,
+            "stacking": {"mode": "normal"}
+          }
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "valid"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "invalid"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "expired"}, "properties": [{"id": "color", "value": {"fixedColor": "yellow", "mode": "fixed"}}]}
+        ]
+      }
+    },
+    {
+      "id": 22,
+      "title": "Access Denied by Reason",
+      "type": "barchart",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 15},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum by (reason) (increase(qurl_access_denied_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h]))",
+          "legendFormat": "{{reason}}",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "options": {
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"}
+        }
+      }
+    },
+    {
+      "id": 103,
+      "title": "Quotas",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 23},
+      "collapsed": false
+    },
+    {
+      "id": 30,
+      "title": "Quota Limit Hits by Tier",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum by (tier) (increase(qurl_quota_limit_hit_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1h]))",
+          "legendFormat": "{{tier}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20,
+            "stacking": {"mode": "normal"}
+          }
+        }
+      }
+    },
+    {
+      "id": 31,
+      "title": "Top Quota Offenders",
+      "type": "table",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "topk(10, sum by (owner_id, tier) (increase(qurl_quota_limit_hit_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h])))",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {"id": "organize", "options": {"renameByName": {"owner_id": "Owner", "tier": "Tier", "Value": "Hits (24h)"}}}
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "short"},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Hits (24h)"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background", "mode": "gradient"}}, {"id": "color", "value": {"mode": "continuous-YlOrRd"}}]}
+        ]
+      }
+    },
+    {
+      "id": 104,
+      "title": "Batch Operations",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 32},
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 40,
+          "title": "Batch Create Operations",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 33},
+          "datasource": {"uid": "${datasource_uid}"},
+          "targets": [
+            {
+              "expr": "sum(rate(qurl_batch_create_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
+              "legendFormat": "Batch requests"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "color": {"mode": "palette-classic"},
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "smooth",
+                "fillOpacity": 20
+              }
+            }
+          }
+        },
+        {
+          "id": 41,
+          "title": "Batch Size Distribution",
+          "type": "heatmap",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 33},
+          "datasource": {"uid": "${datasource_uid}"},
+          "targets": [
+            {
+              "expr": "sum(increase(qurl_batch_create_size_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)",
+              "format": "heatmap"
+            }
+          ],
+          "options": {
+            "calculate": false,
+            "yAxis": {"unit": "short"},
+            "color": {"scheme": "Blues", "mode": "scheme"}
+          }
+        }
+      ]
+    }
+  ]
+}

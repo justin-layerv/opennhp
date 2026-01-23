@@ -40,7 +40,7 @@ locals {
   service_name = "${var.name_prefix}-${var.cell_id}-qurl-api"
 
   # Container environment variables
-  container_env = [
+  container_env = concat([
     { name = "QURL_ENV", value = local.is_prod ? "production" : "development" },
     { name = "AWS_REGION", value = data.aws_region.current.id },
     { name = "SERVER_HOST", value = "0.0.0.0" },
@@ -48,13 +48,81 @@ locals {
     { name = "DYNAMODB_TABLE_PREFIX", value = var.dynamodb_table_prefix },
     { name = "AUTH0_DOMAIN", value = var.auth0_domain },
     { name = "AUTH0_AUDIENCE", value = var.auth0_audience },
+    { name = "AUTH0_JWKS_CACHE_TTL", value = tostring(var.auth0_jwks_cache_ttl_seconds) },
+    { name = "AUTH0_JWKS_FETCH_TIMEOUT", value = tostring(var.auth0_jwks_fetch_timeout_seconds) },
     { name = "QURL_COOKIE_DOMAIN", value = var.cookie_domain },
+    { name = "QURL_LINK_DOMAIN", value = var.qurl_link_domain },
+    { name = "QURL_SITE_DOMAIN", value = var.qurl_site_domain },
     { name = "QURL_DEFAULT_TOKEN_EXPIRE", value = tostring(var.default_token_expire) },
     { name = "QURL_DEFAULT_OPEN_TIME", value = tostring(var.default_open_time) },
     { name = "QURL_AC_ID", value = var.default_ac_id },
     { name = "QURL_AC_HOST", value = var.default_ac_host },
     { name = "QURL_AC_PORT", value = tostring(var.default_ac_port) },
-  ]
+    { name = "OWNER_RATE_LIMIT", value = tostring(var.owner_rate_limit) },
+    { name = "OWNER_RATE_BURST", value = tostring(var.owner_rate_burst) },
+    { name = "IP_RATE_LIMIT", value = tostring(var.ip_rate_limit) },
+    { name = "IP_RATE_BURST", value = tostring(var.ip_rate_burst) },
+    { name = "AUDIT_RETENTION_DAYS", value = tostring(var.audit_retention_days) },
+    { name = "CORS_ALLOWED_ORIGINS", value = var.cors_allowed_origins },
+    { name = "LICENSES_TABLE_NAME", value = var.licenses_table_name },
+    # Idempotency cache configuration
+    { name = "IDEMPOTENCY_CACHE_TTL", value = tostring(var.idempotency_cache_ttl_seconds) },
+    { name = "IDEMPOTENCY_CACHE_MAX_SIZE", value = tostring(var.idempotency_cache_max_size) },
+    { name = "IDEMPOTENCY_CLEANUP_INTERVAL", value = tostring(var.idempotency_cleanup_interval_seconds) },
+    # Health check configuration
+    { name = "HEALTH_CHECK_TIMEOUT", value = tostring(var.health_check_timeout_seconds) },
+    { name = "HEALTH_STARTUP_TIMEOUT", value = tostring(var.health_startup_timeout_seconds) },
+    # License cache configuration
+    { name = "LICENSE_CACHE_TTL", value = tostring(var.license_cache_ttl_seconds) },
+    { name = "LICENSE_CACHE_MAX_SIZE", value = tostring(var.license_cache_max_size) },
+    ],
+    # Redis configuration (for distributed rate limiting)
+    var.redis_enabled ? [
+      { name = "REDIS_ENABLED", value = "true" },
+      { name = "REDIS_ENDPOINT", value = var.redis_endpoint },
+      { name = "REDIS_TLS_ENABLED", value = "true" },
+    ] : [],
+    # License events configuration (for cache invalidation)
+    var.license_events_enabled ? [
+      { name = "LICENSE_EVENTS_ENABLED", value = "true" },
+      { name = "LICENSE_EVENTS_QUEUE_URL", value = var.license_events_queue_url },
+    ] : [],
+    # Idempotency table (for distributed idempotency)
+    var.idempotency_table_name != "" ? [
+      { name = "IDEMPOTENCY_TABLE_NAME", value = var.idempotency_table_name },
+    ] : [],
+    # Webhooks configuration
+    var.webhooks_enabled ? [
+      { name = "WEBHOOKS_ENABLED", value = "true" },
+      { name = "WEBHOOKS_WORKER_COUNT", value = tostring(var.webhooks_worker_count) },
+      { name = "WEBHOOKS_MAX_PER_OWNER", value = tostring(var.webhooks_max_webhooks_per_owner) },
+      { name = "WEBHOOKS_DELIVERY_TIMEOUT", value = tostring(var.webhooks_delivery_timeout_seconds) },
+      { name = "WEBHOOKS_MAX_RETRIES", value = tostring(var.webhooks_max_retries) },
+      { name = "WEBHOOKS_EVENT_CHANNEL_SIZE", value = tostring(var.webhooks_event_channel_size) },
+      { name = "WEBHOOKS_RETRY_WORKER_INTERVAL", value = tostring(var.webhooks_retry_worker_interval_seconds) },
+      { name = "WEBHOOKS_DRAIN_TIMEOUT", value = tostring(var.webhooks_drain_timeout_seconds) },
+      { name = "WEBHOOKS_RESPONSE_BODY_LIMIT", value = tostring(var.webhooks_response_body_limit) },
+      { name = "WEBHOOKS_API_VERSION", value = var.webhooks_api_version },
+    ] : [],
+    # OpenTelemetry configuration
+    # When Grafana Cloud is enabled, OTEL exports to the local ADOT sidecar
+    # The sidecar then forwards to Grafana Cloud OTLP endpoint
+    var.otel_enabled ? [
+      { name = "OTEL_ENABLED", value = "true" },
+      { name = "OTEL_SERVICE_NAME", value = var.otel_service_name },
+      { name = "OTEL_SERVICE_VERSION", value = var.otel_service_version },
+      { name = "OTEL_ENVIRONMENT", value = var.otel_environment },
+      # When Grafana Cloud is enabled, send to local ADOT sidecar; otherwise use configured endpoint
+      { name = "OTEL_EXPORTER_OTLP_ENDPOINT", value = var.grafana_cloud_enabled ? "http://localhost:4317" : var.otel_exporter_endpoint },
+      { name = "OTEL_EXPORTER_OTLP_PROTOCOL", value = var.grafana_cloud_enabled ? "grpc" : var.otel_exporter_protocol },
+      { name = "OTEL_EXPORTER_OTLP_INSECURE", value = var.grafana_cloud_enabled ? "true" : (var.otel_exporter_insecure ? "true" : "false") },
+      { name = "OTEL_TRACE_SAMPLE_RATE", value = tostring(var.otel_trace_sample_rate) },
+      { name = "OTEL_METRICS_INTERVAL", value = tostring(var.otel_metrics_interval) },
+      { name = "OTEL_METRICS_ENABLED", value = var.otel_metrics_enabled ? "true" : "false" },
+      { name = "OTEL_TRACING_ENABLED", value = var.otel_tracing_enabled ? "true" : "false" },
+      { name = "OTEL_LOG_CORRELATION", value = var.otel_log_correlation ? "true" : "false" },
+    ] : [],
+  )
 
   # Secrets from Secrets Manager
   container_secrets = [
@@ -87,7 +155,7 @@ resource "aws_ecs_cluster" "qurl" {
 
   setting {
     name  = "containerInsights"
-    value = local.is_prod ? "enabled" : "disabled"
+    value = "enabled"
   }
 
   tags = merge(var.tags, {
@@ -133,10 +201,14 @@ resource "aws_iam_role_policy" "execution_secrets" {
       {
         Effect = "Allow"
         Action = ["secretsmanager:GetSecretValue"]
-        Resource = [
-          var.jwt_secret_arn,
-          var.internal_service_token_arn,
-        ]
+        Resource = concat(
+          [
+            var.jwt_secret_arn,
+            var.internal_service_token_arn,
+          ],
+          # Add Grafana Cloud secret when ADOT sidecar is enabled
+          var.grafana_cloud_enabled && var.grafana_secret_arn != null ? [var.grafana_secret_arn] : []
+        )
       }
       ], var.secrets_kms_key_arn != null ? [{
         Effect   = "Allow"
@@ -187,8 +259,22 @@ resource "aws_iam_role_policy" "task_dynamodb" {
         ]
         Resource = concat(
           var.dynamodb_table_arns,
-          [for arn in var.dynamodb_table_arns : "${arn}/index/*"]
+          [for arn in var.dynamodb_table_arns : "${arn}/index/*"],
+          # Idempotency table (if configured)
+          var.idempotency_table_arn != "" ? [var.idempotency_table_arn] : []
         )
+      },
+      {
+        Sid    = "LicensesTableReadAccess"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:Query",
+        ]
+        Resource = [
+          var.licenses_table_arn,
+          "${var.licenses_table_arn}/index/*",
+        ]
       }
       ],
       # KMS decrypt for DynamoDB (tables are encrypted with KMS)
@@ -197,6 +283,17 @@ resource "aws_iam_role_policy" "task_dynamodb" {
         Effect   = "Allow"
         Action   = ["kms:Decrypt"]
         Resource = [var.secrets_kms_key_arn]
+      }] : [],
+      # SQS access for license events
+      var.license_events_queue_arn != "" ? [{
+        Sid    = "SQSLicenseEvents"
+        Effect = "Allow"
+        Action = [
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes",
+        ]
+        Resource = [var.license_events_queue_arn]
     }] : [])
   })
 }
@@ -226,13 +323,13 @@ resource "aws_security_group" "alb" {
     description = "HTTP redirect"
   }
 
-  # Outbound to ECS tasks
+  # Outbound to ECS tasks - restrict to VPC only (least privilege)
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "All outbound"
+    cidr_blocks = [var.vpc_cidr]
+    description = "Outbound to VPC only"
   }
 
   tags = merge(var.tags, {
@@ -269,7 +366,7 @@ resource "aws_security_group" "ecs" {
     description = "HTTP from VPC (internal services)"
   }
 
-  # All outbound (DynamoDB, Secrets Manager, etc.)
+  # All outbound (DynamoDB, Secrets Manager, Redis, etc.)
   egress {
     from_port   = 0
     to_port     = 0
@@ -289,49 +386,194 @@ resource "aws_security_group" "ecs" {
   }
 }
 
+# Allow ECS tasks to connect to Redis (if enabled)
+resource "aws_security_group_rule" "ecs_to_redis" {
+  count = var.redis_security_group_id != null ? 1 : 0
+
+  type                     = "ingress"
+  from_port                = 6379
+  to_port                  = 6380
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.ecs.id
+  security_group_id        = var.redis_security_group_id
+  description              = "Redis from QURL ECS tasks"
+}
+
 # ==================== ECS Task Definition ====================
 
 resource "aws_ecs_task_definition" "qurl" {
   family                   = local.service_name
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
-  cpu                      = var.container_cpu
-  memory                   = var.container_memory
-  execution_role_arn       = aws_iam_role.execution.arn
-  task_role_arn            = aws_iam_role.task.arn
+  # When ADOT sidecar is enabled, increase task resources to accommodate both containers.
+  # CPU: ADOT collector requires ~256 CPU units for OTLP processing; 512 minimum ensures
+  #      headroom for batching and export operations under load.
+  # Memory: ADOT needs ~200MB (see memory_limiter config), +256MB provides buffer for
+  #         batching spikes. Monitor CloudWatch Container Insights after deployment.
+  cpu                = var.grafana_cloud_enabled ? max(var.container_cpu, 512) : var.container_cpu
+  memory             = var.grafana_cloud_enabled ? var.container_memory + 256 : var.container_memory
+  execution_role_arn = aws_iam_role.execution.arn
+  task_role_arn      = aws_iam_role.task.arn
 
   # Note: Initial deployment uses "latest" tag from SSM parameter default value.
   # CI pipeline updates the SSM parameter and deploys new task definitions independently.
   # Terraform ignores task_definition changes after initial creation (lifecycle.ignore_changes).
-  container_definitions = jsonencode([{
-    name  = "qurl-api"
-    image = "${var.ecr_repo_url}:${aws_ssm_parameter.image_tag.value}"
+  container_definitions = jsonencode(concat(
+    # QURL API container (always present)
+    [{
+      name  = "qurl-api"
+      image = "${var.ecr_repo_url}:${aws_ssm_parameter.image_tag.value}"
 
-    portMappings = [{
-      containerPort = var.container_port
-      protocol      = "tcp"
-    }]
+      portMappings = [{
+        containerPort = var.container_port
+        protocol      = "tcp"
+      }]
 
-    environment = local.container_env
-    secrets     = local.container_secrets
+      environment = local.container_env
+      secrets     = local.container_secrets
 
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.qurl.name
-        "awslogs-region"        = data.aws_region.current.id
-        "awslogs-stream-prefix" = "ecs"
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.qurl.name
+          "awslogs-region"        = data.aws_region.current.id
+          "awslogs-stream-prefix" = "ecs"
+        }
       }
-    }
 
-    healthCheck = {
-      command     = ["CMD-SHELL", "curl -f http://localhost:${var.container_port}/health || exit 1"]
-      interval    = 30
-      timeout     = 5
-      retries     = 3
-      startPeriod = 60
-    }
-  }])
+      # ECS container health check - uses liveness probe (fast, no dependency checks)
+      # /health/live only verifies the service is running, not that dependencies are healthy
+      healthCheck = {
+        command     = ["CMD-SHELL", "curl -f http://localhost:${var.container_port}/health/live || exit 1"]
+        interval    = 30
+        timeout     = 5
+        retries     = 3
+        startPeriod = 60
+      }
+
+      # Increase file descriptor limits to prevent resource exhaustion under load
+      ulimits = [{
+        name      = "nofile"
+        softLimit = 65536
+        hardLimit = 65536
+      }]
+    }],
+    # ADOT Collector sidecar (only when Grafana Cloud is enabled)
+    # Receives OTLP from QURL container and exports to Grafana Cloud
+    var.grafana_cloud_enabled ? [{
+      name      = "adot-collector"
+      image     = var.adot_collector_image
+      essential = false # Allow main container to continue if sidecar fails
+
+      portMappings = [
+        { containerPort = 4317, protocol = "tcp" }, # OTLP gRPC
+        { containerPort = 4318, protocol = "tcp" }, # OTLP HTTP
+      ]
+
+      secrets = [
+        { name = "GRAFANA_OTLP_ENDPOINT", valueFrom = "${var.grafana_secret_arn}:endpoint::" },
+        { name = "GRAFANA_OTLP_AUTH", valueFrom = "${var.grafana_secret_arn}:auth::" },
+      ]
+
+      # Use inline config via AOT_CONFIG_CONTENT environment variable
+      # This avoids needing to mount the config file from S3
+      command = ["--config=env:AOT_CONFIG_CONTENT"]
+
+      # ADOT collector config embedded as environment variable
+      # See files/otel-collector-config.yaml for the source config
+      environment = [
+        { name = "ENVIRONMENT", value = var.environment },
+        {
+          name = "AOT_CONFIG_CONTENT"
+          value = yamlencode({
+            receivers = {
+              otlp = {
+                protocols = {
+                  grpc = { endpoint = "0.0.0.0:4317" }
+                  http = { endpoint = "0.0.0.0:4318" }
+                }
+              }
+            }
+            processors = {
+              # Prevent OOM by limiting memory usage - critical for sidecar containers
+              memory_limiter = {
+                check_interval  = "1s"
+                limit_mib       = 200
+                spike_limit_mib = 50
+              }
+              batch = {
+                timeout         = "10s"
+                send_batch_size = 1024
+              }
+              resourcedetection = {
+                detectors = ["env", "ecs"]
+                timeout   = "5s"
+                override  = false
+              }
+              attributes = {
+                actions = [
+                  {
+                    key    = "deployment.environment"
+                    value  = var.environment
+                    action = "upsert"
+                  },
+                  {
+                    key    = "cell.id"
+                    value  = var.cell_id
+                    action = "upsert"
+                  }
+                ]
+              }
+            }
+            exporters = {
+              otlphttp = {
+                endpoint = "$${GRAFANA_OTLP_ENDPOINT}"
+                headers = {
+                  Authorization = "Basic $${GRAFANA_OTLP_AUTH}"
+                }
+              }
+            }
+            service = {
+              pipelines = {
+                traces = {
+                  receivers  = ["otlp"]
+                  processors = ["memory_limiter", "batch", "resourcedetection", "attributes"]
+                  exporters  = ["otlphttp"]
+                }
+                metrics = {
+                  receivers  = ["otlp"]
+                  processors = ["memory_limiter", "batch", "resourcedetection", "attributes"]
+                  exporters  = ["otlphttp"]
+                }
+                logs = {
+                  receivers  = ["otlp"]
+                  processors = ["memory_limiter", "batch", "resourcedetection", "attributes"]
+                  exporters  = ["otlphttp"]
+                }
+              }
+            }
+          })
+        },
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.qurl.name
+          "awslogs-region"        = data.aws_region.current.id
+          "awslogs-stream-prefix" = "adot"
+        }
+      }
+
+      healthCheck = {
+        command     = ["CMD", "/healthcheck"]
+        interval    = 30
+        timeout     = 5
+        retries     = 3
+        startPeriod = 60
+      }
+    }] : []
+  ))
 
   tags = merge(var.tags, {
     Name      = local.service_name
@@ -341,18 +583,37 @@ resource "aws_ecs_task_definition" "qurl" {
 
   # Validate Fargate CPU/memory combinations at plan time
   # See: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-cpu-memory-error.html
+  # Note: When grafana_cloud_enabled=true, CPU is set to max(container_cpu, 512) and memory is increased by 256MB
   lifecycle {
     precondition {
       condition = (
-        (var.container_cpu == 256 && var.container_memory >= 512 && var.container_memory <= 2048) ||
-        (var.container_cpu == 512 && var.container_memory >= 1024 && var.container_memory <= 4096) ||
-        (var.container_cpu == 1024 && var.container_memory >= 2048 && var.container_memory <= 8192) ||
-        (var.container_cpu == 2048 && var.container_memory >= 4096 && var.container_memory <= 16384) ||
-        (var.container_cpu == 4096 && var.container_memory >= 8192 && var.container_memory <= 30720) ||
-        (var.container_cpu == 8192 && var.container_memory >= 16384 && var.container_memory <= 61440) ||
-        (var.container_cpu == 16384 && var.container_memory >= 32768 && var.container_memory <= 122880)
+        # When ADOT sidecar is enabled, effective CPU is max(container_cpu, 512) and memory += 256
+        var.grafana_cloud_enabled ? (
+          # Effective CPU: max(container_cpu, 512)
+          # Effective memory: container_memory + 256
+          (max(var.container_cpu, 512) == 512 && (var.container_memory + 256) >= 1024 && (var.container_memory + 256) <= 4096) ||
+          (max(var.container_cpu, 512) == 1024 && (var.container_memory + 256) >= 2048 && (var.container_memory + 256) <= 8192) ||
+          (max(var.container_cpu, 512) == 2048 && (var.container_memory + 256) >= 4096 && (var.container_memory + 256) <= 16384) ||
+          (max(var.container_cpu, 512) == 4096 && (var.container_memory + 256) >= 8192 && (var.container_memory + 256) <= 30720) ||
+          (max(var.container_cpu, 512) == 8192 && (var.container_memory + 256) >= 16384 && (var.container_memory + 256) <= 61440) ||
+          (max(var.container_cpu, 512) == 16384 && (var.container_memory + 256) >= 32768 && (var.container_memory + 256) <= 122880)
+          ) : (
+          # Original validation when ADOT is disabled
+          (var.container_cpu == 256 && var.container_memory >= 512 && var.container_memory <= 2048) ||
+          (var.container_cpu == 512 && var.container_memory >= 1024 && var.container_memory <= 4096) ||
+          (var.container_cpu == 1024 && var.container_memory >= 2048 && var.container_memory <= 8192) ||
+          (var.container_cpu == 2048 && var.container_memory >= 4096 && var.container_memory <= 16384) ||
+          (var.container_cpu == 4096 && var.container_memory >= 8192 && var.container_memory <= 30720) ||
+          (var.container_cpu == 8192 && var.container_memory >= 16384 && var.container_memory <= 61440) ||
+          (var.container_cpu == 16384 && var.container_memory >= 32768 && var.container_memory <= 122880)
+        )
       )
-      error_message = "Invalid Fargate CPU/memory combination. See AWS docs for valid combinations."
+      error_message = "Invalid Fargate CPU/memory combination. See AWS docs for valid combinations. When grafana_cloud_enabled=true, effective CPU is max(container_cpu, 512) and memory is increased by 256MB."
+    }
+
+    precondition {
+      condition     = var.environment != "prod" || (var.cors_allowed_origins != "" && var.cors_allowed_origins != "*")
+      error_message = "Production requires explicit CORS origins, not empty or wildcard."
     }
   }
 }
@@ -366,12 +627,12 @@ resource "aws_lb" "qurl" {
   security_groups    = [aws_security_group.alb.id]
   subnets            = var.public_subnet_ids
 
-  # Access logging for production audit compliance (optional)
+  # Access logging for production audit compliance
   dynamic "access_logs" {
     for_each = var.alb_access_logs_bucket != null ? [1] : []
     content {
       bucket  = var.alb_access_logs_bucket
-      prefix  = "qurl-api"
+      prefix  = var.alb_access_logs_prefix
       enabled = true
     }
   }
@@ -381,6 +642,13 @@ resource "aws_lb" "qurl" {
     Component = "qurl-service"
     Cell      = var.cell_id
   })
+
+  lifecycle {
+    precondition {
+      condition     = var.environment != "prod" || var.alb_access_logs_bucket != null
+      error_message = "ALB access logs bucket is required for production environments for audit compliance."
+    }
+  }
 }
 
 resource "aws_lb_target_group" "qurl" {
@@ -390,13 +658,16 @@ resource "aws_lb_target_group" "qurl" {
   vpc_id      = var.vpc_id
   target_type = "ip"
 
+  # ALB health check - uses readiness probe (deep dependency checks)
+  # /health/ready verifies all critical dependencies are healthy before routing traffic
+  # Returns 200 for healthy/degraded, 503 for unhealthy (critical dependency failure)
   health_check {
     enabled             = true
     healthy_threshold   = 2
     unhealthy_threshold = 3
     timeout             = 5
     interval            = 30
-    path                = "/health"
+    path                = "/health/ready"
     matcher             = "200"
   }
 
@@ -438,6 +709,13 @@ resource "aws_lb_listener" "https" {
 # This should only be used during initial setup before certificate provisioning.
 # For production, always provide a certificate_arn.
 resource "aws_lb_listener" "http" {
+  lifecycle {
+    precondition {
+      condition     = var.environment != "prod" || var.certificate_arn != null
+      error_message = "Production requires HTTPS: certificate_arn must be provided for prod environment."
+    }
+  }
+
   load_balancer_arn = aws_lb.qurl.arn
   port              = 80
   protocol          = "HTTP"

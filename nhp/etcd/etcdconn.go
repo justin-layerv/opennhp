@@ -135,6 +135,12 @@ func (conn *EtcdConn) Close() {
 	}
 }
 
+// Client returns the underlying etcd client for direct operations.
+// This is primarily used for health checks.
+func (conn *EtcdConn) Client() *clientv3.Client {
+	return conn.client
+}
+
 // GetPrefix retrieves all key-value pairs with the given prefix
 func (conn *EtcdConn) GetPrefix(prefix string) (map[string][]byte, error) {
 	if conn.client == nil {

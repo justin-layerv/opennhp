@@ -136,3 +136,16 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+# License Events configuration
+variable "license_events_enabled" {
+  description = "Enable publishing license change events to SNS"
+  type        = bool
+  default     = false
+}
+
+variable "license_events_topic_arn" {
+  description = "SNS topic ARN for license events (required when license_events_enabled=true)"
+  type        = string
+  default     = ""
+}

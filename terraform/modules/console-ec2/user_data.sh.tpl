@@ -1065,14 +1065,39 @@ docker run -d \
     -e "GVA_CONFIG_NHP_CLOUDMAP_NAMESPACE=${nhp_cloudmap_namespace}" \
     -e "GVA_CONFIG_NHP_CLOUDMAP_SERVICE_NAME=${nhp_cloudmap_service_name}" \
     -e "GVA_CONFIG_NHP_ASSIGNMENT_SERVERS_PER_AC=${nhp_assignment_servers_per_ac}" \
+    -e "GVA_CONFIG_NHP_ASSIGNMENT_REQUIRE_DISTINCT_AZS=${nhp_assignment_require_distinct_azs}" \
     -e "GVA_CONFIG_NHP_HEALTH_MONITOR_CHECK_INTERVAL_SECONDS=${nhp_health_monitor_check_interval}" \
     -e "GVA_CONFIG_NHP_HEALTH_MONITOR_OPERATION_TIMEOUT_SECONDS=${nhp_health_monitor_operation_timeout}" \
 %{ if nhp_ac_repo_url != null ~}
-    -e "GVA_CONFIG_NHP_CONSOLE_AC_ENABLED=true" \
+    -e "GVA_CONFIG_NHP_CONSOLE_AC_ENABLED=${nhp_console_ac_enabled}" \
     -e "GVA_CONFIG_NHP_CONSOLE_AC_SECRET_NAME=${name_prefix}-console-ac" \
     -e "GVA_CONFIG_NHP_CONSOLE_AC_ID=console-ac" \
     -e "GVA_CONFIG_NHP_CONSOLE_AC_RESOURCE_FQDN=${protected_hostname != null ? protected_hostname : domain_name}" \
     -e "GVA_CONFIG_NHP_CONSOLE_AC_CUSTOMER_ID=${nhp_console_ac_customer_id}" \
+%{ endif ~}
+%{ if nhp_dynamodb_licenses_table != null ~}
+    -e "GVA_CONFIG_NHP_DYNAMODB_LICENSES_TABLE=${nhp_dynamodb_licenses_table}" \
+%{ endif ~}
+%{ if nhp_dynamodb_licenses_customer_index != null ~}
+    -e "GVA_CONFIG_NHP_DYNAMODB_LICENSES_CUSTOMER_INDEX=${nhp_dynamodb_licenses_customer_index}" \
+%{ endif ~}
+%{ if nhp_dynamodb_licenses_auth0_subject_index != null ~}
+    -e "GVA_CONFIG_NHP_DYNAMODB_LICENSES_AUTH0_SUBJECT_INDEX=${nhp_dynamodb_licenses_auth0_subject_index}" \
+%{ endif ~}
+%{ if nhp_dynamodb_resources_table != null ~}
+    -e "GVA_CONFIG_NHP_DYNAMODB_RESOURCES_TABLE=${nhp_dynamodb_resources_table}" \
+%{ endif ~}
+%{ if internal_service_token != null ~}
+    -e "GVA_CONFIG_INTERNAL_SERVICE_TOKEN=${internal_service_token}" \
+%{ endif ~}
+%{ if provisioning_resource_id != null ~}
+    -e "GVA_CONFIG_INTERNAL_PROVISIONING_RESOURCE_ID=${provisioning_resource_id}" \
+%{ endif ~}
+%{ if provisioning_default_tier != null ~}
+    -e "GVA_CONFIG_INTERNAL_PROVISIONING_DEFAULT_TIER=${provisioning_default_tier}" \
+%{ endif ~}
+%{ if provisioning_default_max_acs != null ~}
+    -e "GVA_CONFIG_INTERNAL_PROVISIONING_DEFAULT_MAX_ACS=${provisioning_default_max_acs}" \
 %{ endif ~}
     "$CONSOLE_IMAGE"
 

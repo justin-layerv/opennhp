@@ -88,7 +88,17 @@ output "qurl_audit_log_table_arn" {
   value       = length(aws_dynamodb_table.qurl_audit_log) > 0 ? aws_dynamodb_table.qurl_audit_log[0].arn : null
 }
 
-# Note: All 4 QURL tables are created together via the deploy_qurl_tables flag,
+output "qurl_webhooks_table_arn" {
+  description = "ARN of the QURL webhooks DynamoDB table"
+  value       = length(aws_dynamodb_table.qurl_webhooks) > 0 ? aws_dynamodb_table.qurl_webhooks[0].arn : null
+}
+
+output "qurl_webhook_deliveries_table_arn" {
+  description = "ARN of the QURL webhook deliveries DynamoDB table"
+  value       = length(aws_dynamodb_table.qurl_webhook_deliveries) > 0 ? aws_dynamodb_table.qurl_webhook_deliveries[0].arn : null
+}
+
+# Note: All QURL tables are created together via the deploy_qurl_tables flag,
 # so checking only qurl_resources is sufficient for the conditional.
 output "qurl_table_arns" {
   description = "List of all QURL DynamoDB table ARNs (for IAM permissions)"
@@ -97,5 +107,7 @@ output "qurl_table_arns" {
     aws_dynamodb_table.qurl_access_tokens[0].arn,
     aws_dynamodb_table.qurl_sessions[0].arn,
     aws_dynamodb_table.qurl_audit_log[0].arn,
+    aws_dynamodb_table.qurl_webhooks[0].arn,
+    aws_dynamodb_table.qurl_webhook_deliveries[0].arn,
   ] : []
 }

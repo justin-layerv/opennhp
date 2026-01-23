@@ -637,16 +637,18 @@ resource "aws_lb_target_group" "udp" {
   vpc_id      = var.vpc_id
   target_type = "instance"
 
-  # TCP health check on port 8888 (HTTP plugin endpoint)
-  # AWS requires health checks for instance-type target groups - no way around this.
-  # Port 8888 is the NHP Server HTTP listener for authentication plugins.
+  # HTTP health check on port 8888 (NHP Server HTTP listener)
+  # Uses /health/live endpoint for Kubernetes-style liveness probe
+  # This checks that the server is running and can respond to requests
   health_check {
     enabled             = true
-    protocol            = "TCP"
+    protocol            = "HTTP"
     port                = "8888"
+    path                = "/health/live"
     healthy_threshold   = 2
     unhealthy_threshold = 2
     interval            = 30
+    matcher             = "200" # Expect HTTP 200 OK
   }
 
   deregistration_delay = 30

@@ -1,0 +1,522 @@
+{
+  "title": "QURL Webhooks",
+  "description": "Webhook delivery metrics and health for QURL service",
+  "uid": "qurl-webhooks",
+  "tags": ["qurl", "webhooks", "${environment}"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "links": [
+    {
+      "title": "Operations",
+      "type": "link",
+      "url": "/d/qurl-operations/qurl-operations?var-environment=$environment&var-cell_id=$cell_id",
+      "icon": "dashboard"
+    },
+    {
+      "title": "Business Metrics",
+      "type": "link",
+      "url": "/d/qurl-business/qurl-business-metrics?var-environment=$environment&var-cell_id=$cell_id",
+      "icon": "dashboard"
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "environment",
+        "type": "custom",
+        "current": {
+          "text": "${environment}",
+          "value": "${environment}"
+        },
+        "options": [
+          {"text": "sandbox", "value": "sandbox"},
+          {"text": "prod", "value": "prod"}
+        ]
+      },
+      {
+        "name": "cell_id",
+        "type": "query",
+        "datasource": {"uid": "${datasource_uid}"},
+        "query": "label_values(qurl_webhook_delivery_total{service_name=\"qurl-api\"}, cell_id)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 100,
+      "title": "Overview",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false
+    },
+    {
+      "id": 1,
+      "title": "Delivery Success Rate (1h)",
+      "type": "gauge",
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"success\"}[1h])) / sum(rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1h])) * 100 or vector(100)",
+          "legendFormat": "Success %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 90},
+              {"color": "green", "value": 99}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Deliveries (1h)",
+      "type": "stat",
+      "gridPos": {"h": 3, "w": 3, "x": 6, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(increase(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1h]))",
+          "legendFormat": "Total"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {"steps": [{"color": "blue", "value": null}]}
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Successful (1h)",
+      "type": "stat",
+      "gridPos": {"h": 3, "w": 3, "x": 9, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(increase(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"success\"}[1h]))",
+          "legendFormat": "Success"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {"steps": [{"color": "green", "value": null}]}
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Failed (1h)",
+      "type": "stat",
+      "gridPos": {"h": 3, "w": 3, "x": 6, "y": 4},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(increase(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"failed\"}[1h]))",
+          "legendFormat": "Failed"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1},
+              {"color": "red", "value": 10}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Retrying",
+      "type": "stat",
+      "gridPos": {"h": 3, "w": 3, "x": 9, "y": 4},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(qurl_webhook_delivery_pending{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"retrying\"}) or vector(0)",
+          "legendFormat": "Retrying"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 5},
+              {"color": "orange", "value": 20}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "p95 Latency",
+      "type": "stat",
+      "gridPos": {"h": 6, "w": 4, "x": 12, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1000},
+              {"color": "red", "value": 5000}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Active Webhooks",
+      "type": "stat",
+      "gridPos": {"h": 3, "w": 4, "x": 16, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(qurl_webhook_active{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"})",
+          "legendFormat": "Active"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {"steps": [{"color": "blue", "value": null}]}
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Disabled Webhooks",
+      "type": "stat",
+      "gridPos": {"h": 3, "w": 4, "x": 16, "y": 4},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(qurl_webhook_disabled{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"})",
+          "legendFormat": "Disabled"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1},
+              {"color": "orange", "value": 5}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Event Queue Depth",
+      "type": "stat",
+      "gridPos": {"h": 6, "w": 4, "x": 20, "y": 1},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(qurl_webhook_queue_depth{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"})",
+          "legendFormat": "Queue"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 100},
+              {"color": "red", "value": 500}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 101,
+      "title": "Delivery Performance",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 7},
+      "collapsed": false
+    },
+    {
+      "id": 10,
+      "title": "Delivery Rate by Status",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20
+          }
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "success"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "failed"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]}
+        ]
+      }
+    },
+    {
+      "id": 11,
+      "title": "Delivery Latency",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 0
+          }
+        }
+      }
+    },
+    {
+      "id": 102,
+      "title": "Events",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 16},
+      "collapsed": false
+    },
+    {
+      "id": 20,
+      "title": "Deliveries by Event Type",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 17},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum by (event) (rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
+          "legendFormat": "{{event}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20,
+            "stacking": {"mode": "normal"}
+          }
+        }
+      }
+    },
+    {
+      "id": 21,
+      "title": "Event Type Distribution (24h)",
+      "type": "piechart",
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 17},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum by (event) (increase(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h]))",
+          "legendFormat": "{{event}}"
+        }
+      ],
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "values": ["value", "percent"]},
+        "pieType": "donut"
+      }
+    },
+    {
+      "id": 22,
+      "title": "Failure Rate by Event Type",
+      "type": "table",
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 17},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum by (event) (increase(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"failed\"}[24h])) / sum by (event) (increase(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h])) * 100",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {"id": "organize", "options": {"renameByName": {"event": "Event Type", "Value": "Failure %"}}}
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "percent", "decimals": 1},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Failure %"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background", "mode": "gradient"}}, {"id": "color", "value": {"mode": "continuous-GrYlRd"}}]}
+        ]
+      }
+    },
+    {
+      "id": 103,
+      "title": "Retries & Failures",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 25},
+      "collapsed": false
+    },
+    {
+      "id": 30,
+      "title": "Retry Distribution",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 26},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum by (retry_count) (rate(qurl_webhook_retry_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
+          "legendFormat": "Retry {{retry_count}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "stacking": {"mode": "normal"}
+          }
+        }
+      }
+    },
+    {
+      "id": 31,
+      "title": "Failure Reasons",
+      "type": "barchart",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 26},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum by (error_type) (increase(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"failed\"}[24h]))",
+          "legendFormat": "{{error_type}}",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "options": {
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"}
+        }
+      }
+    },
+    {
+      "id": 104,
+      "title": "Webhook Health",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 34},
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 40,
+          "title": "Webhooks with Consecutive Failures",
+          "type": "table",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 35},
+          "datasource": {"uid": "${datasource_uid}"},
+          "targets": [
+            {
+              "expr": "topk(10, qurl_webhook_consecutive_failures{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"} > 0)",
+              "format": "table",
+              "instant": true
+            }
+          ],
+          "transformations": [
+            {"id": "organize", "options": {"excludeByName": {"Time": true}, "renameByName": {"webhook_id": "Webhook ID", "owner_id": "Owner", "Value": "Consecutive Failures"}}}
+          ],
+          "fieldConfig": {
+            "defaults": {"unit": "short"},
+            "overrides": [
+              {"matcher": {"id": "byName", "options": "Consecutive Failures"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background", "mode": "gradient"}}, {"id": "color", "value": {"mode": "continuous-YlOrRd"}}]}
+            ]
+          }
+        },
+        {
+          "id": 41,
+          "title": "Recently Disabled Webhooks",
+          "type": "table",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 35},
+          "datasource": {"uid": "${datasource_uid}"},
+          "targets": [
+            {
+              "expr": "qurl_webhook_disabled_at{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"} > (time() - 86400)",
+              "format": "table",
+              "instant": true
+            }
+          ],
+          "transformations": [
+            {"id": "organize", "options": {"excludeByName": {"Time": true}, "renameByName": {"webhook_id": "Webhook ID", "owner_id": "Owner", "reason": "Reason", "Value": "Disabled At"}}}
+          ]
+        }
+      ]
+    }
+  ]
+}

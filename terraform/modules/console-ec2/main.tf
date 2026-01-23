@@ -43,6 +43,12 @@ data "aws_ssm_parameter" "ubuntu_ami" {
   name = "/aws/service/canonical/ubuntu/server/noble/stable/current/amd64/hvm/ebs-gp3/ami-id"
 }
 
+# Internal service token for Auth0 Actions to call Console API
+data "aws_secretsmanager_secret_version" "internal_service_token" {
+  count     = var.internal_service_token_secret_arn != null ? 1 : 0
+  secret_id = var.internal_service_token_secret_arn
+}
+
 # ==================== Locals ====================
 
 locals {
@@ -96,9 +102,18 @@ resource "aws_iam_role_policy_attachment" "console_ssm" {
 locals {
   # Pre-compute resource lists to check for empty arrays
   # Note: License secret ARN uses wildcard suffix because AWS adds random chars to secret ARNs
-  license_secret_arn_pattern = var.nhp_console_ac_license_secret_arn != null ? "${var.nhp_console_ac_license_secret_arn}*" : null
-  secrets_manager_resources  = compact([var.rds_secret_arn, var.nhp_server_secret_arn, var.etcd_tls_secret_arn, local.license_secret_arn_pattern])
-  ecr_repo_resources         = compact([var.ecr_repo_arn, var.nhp_ac_ecr_repo_arn])
+  license_secret_arn_pattern         = var.nhp_console_ac_license_secret_arn != null ? "${var.nhp_console_ac_license_secret_arn}*" : null
+  internal_service_token_arn_pattern = var.internal_service_token_secret_arn != null ? "${var.internal_service_token_secret_arn}*" : null
+  secrets_manager_resources = compact([
+    var.rds_secret_arn,
+    var.nhp_server_secret_arn,
+    var.etcd_tls_secret_arn,
+    local.license_secret_arn_pattern,
+    local.internal_service_token_arn_pattern
+  ])
+  # Read service token from Secrets Manager (null if not configured)
+  internal_service_token = var.internal_service_token_secret_arn != null ? data.aws_secretsmanager_secret_version.internal_service_token[0].secret_string : null
+  ecr_repo_resources     = compact([var.ecr_repo_arn, var.nhp_ac_ecr_repo_arn])
   dynamodb_resources = compact([
     var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}" : "",
     var.nhp_dynamodb_ac_assignments_table != null ? "arn:aws:dynamodb:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:table/${var.nhp_dynamodb_ac_assignments_table}/index/*" : "",
@@ -393,13 +408,26 @@ locals {
     nhp_region                           = var.nhp_region
     nhp_dynamodb_ac_assignments_table    = var.nhp_dynamodb_ac_assignments_table
     nhp_dynamodb_server_ac_index_table   = var.nhp_dynamodb_server_ac_index_table
+    nhp_dynamodb_licenses_table          = var.nhp_dynamodb_licenses_table
+    nhp_dynamodb_resources_table         = var.nhp_dynamodb_resources_table
     nhp_cloudmap_namespace               = var.nhp_cloudmap_namespace
     nhp_cloudmap_service_name            = var.nhp_cloudmap_service_name
     nhp_assignment_servers_per_ac        = var.nhp_assignment_servers_per_ac
+    nhp_assignment_require_distinct_azs  = var.nhp_assignment_require_distinct_azs
     nhp_health_monitor_check_interval    = var.nhp_health_monitor_check_interval
     nhp_health_monitor_operation_timeout = var.nhp_health_monitor_operation_timeout
-    nhp_console_ac_license_secret_arn    = var.nhp_console_ac_license_secret_arn
-    nhp_console_ac_customer_id           = var.nhp_console_ac_customer_id
+    # Console AC self-registration
+    nhp_console_ac_enabled            = var.nhp_console_ac_enabled
+    nhp_console_ac_license_secret_arn = var.nhp_console_ac_license_secret_arn
+    nhp_console_ac_customer_id        = var.nhp_console_ac_customer_id
+    # License lookup GSI names
+    nhp_dynamodb_licenses_customer_index      = var.nhp_dynamodb_licenses_customer_index
+    nhp_dynamodb_licenses_auth0_subject_index = var.nhp_dynamodb_licenses_auth0_subject_index
+    # Internal service authentication and provisioning
+    internal_service_token       = local.internal_service_token
+    provisioning_resource_id     = var.provisioning_resource_id
+    provisioning_default_tier    = var.provisioning_default_tier
+    provisioning_default_max_acs = var.provisioning_default_max_acs
   })
 }
 

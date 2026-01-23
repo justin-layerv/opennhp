@@ -54,5 +54,12 @@ services:
   #     - ./config/server:/nhp-server/etc:ro
   #   ports:
   #     - "62206:62206/udp"
+  #     - "8888:8888"
   #   networks:
   #     - nhp-test
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8888/health/live"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 3
+  #     start_period: 30s

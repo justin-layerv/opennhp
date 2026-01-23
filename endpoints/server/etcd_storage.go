@@ -94,6 +94,26 @@ func (e *EtcdStorage) Close() error {
 	return nil
 }
 
+// Ping checks if etcd is reachable and responsive.
+// This is used for health checks to verify the storage backend is available.
+func (e *EtcdStorage) Ping(ctx context.Context) error {
+	if e.conn == nil || e.conn.Client() == nil {
+		return fmt.Errorf("etcd client not initialized")
+	}
+
+	// Get status from the first endpoint
+	// NOTE: For clustered etcd deployments, this only checks the first endpoint.
+	// If the first endpoint is down but other cluster members are healthy,
+	// this will report unhealthy even though the cluster is functional.
+	// This is acceptable for single-endpoint deployments (our current setup).
+	if len(e.config.Endpoints) == 0 {
+		return fmt.Errorf("no etcd endpoints configured")
+	}
+
+	_, err := e.conn.Client().Status(ctx, e.config.Endpoints[0])
+	return err
+}
+
 // ============================================================================
 // AC Assignment Operations
 // ============================================================================

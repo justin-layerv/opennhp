@@ -112,15 +112,16 @@ variable "nhp_server_assignment_enabled" {
     assigns NHP servers to ACs using DynamoDB for storage and CloudMap for
     server discovery. Servers are selected from different availability zones
     for high availability.
+    Required (must be explicitly set). Recommended: true
   EOT
   type        = bool
-  default     = true
+  # No default - must be explicitly configured
 }
 
 variable "nhp_region" {
-  description = "AWS region for NHP DynamoDB tables and CloudMap namespace"
+  description = "AWS region for NHP DynamoDB tables and CloudMap namespace. Required. Recommended: match deployment region."
   type        = string
-  default     = "us-east-2"
+  # No default - must be explicitly configured
 }
 
 variable "nhp_dynamodb_ac_assignments_table" {
@@ -136,9 +137,15 @@ variable "nhp_dynamodb_server_ac_index_table" {
 }
 
 variable "nhp_dynamodb_licenses_table" {
-  description = "DynamoDB table name for license validation. Used to seed Console AC license."
+  description = "DynamoDB table name for license validation. Used to seed Console AC license. Recommended: '{env}-nhp-licenses'"
   type        = string
-  default     = null
+  default     = null # Optional - only needed if using license validation
+}
+
+variable "nhp_dynamodb_resources_table" {
+  description = "DynamoDB table name for resource definitions. Required for cloud mode. Recommended: '{env}-nhp-resources'"
+  type        = string
+  default     = null # Optional - only needed in cloud mode
 }
 
 variable "nhp_cloudmap_namespace" {
@@ -148,21 +155,32 @@ variable "nhp_cloudmap_namespace" {
 }
 
 variable "nhp_cloudmap_service_name" {
-  description = "CloudMap service name for NHP servers"
+  description = "CloudMap service name for NHP servers. Required. Recommended: 'server'"
   type        = string
-  default     = "server"
+  # No default - must be explicitly configured
 }
 
 variable "nhp_assignment_servers_per_ac" {
-  description = "Number of servers to assign per AC for redundancy (typically 3 for multi-AZ)"
+  description = "Number of servers to assign per AC for redundancy. Required. Recommended: 3 (one per AZ)."
   type        = number
-  default     = 3
+  # No default - must be explicitly configured
+
+  validation {
+    condition     = var.nhp_assignment_servers_per_ac >= 1
+    error_message = "nhp_assignment_servers_per_ac must be at least 1."
+  }
+}
+
+variable "nhp_assignment_require_distinct_azs" {
+  description = "Require assigned servers to be in different AZs for HA. Required. Recommended: true for production."
+  type        = bool
+  # No default - must be explicitly configured
 }
 
 variable "nhp_health_monitor_check_interval" {
-  description = "Interval in seconds between NHP health monitor checks. The monitor queries Cloud Map for unhealthy servers and reassigns affected ACs. Must be >= 1."
+  description = "Interval in seconds between NHP health monitor checks. Required. Recommended: 60 (check every minute)."
   type        = number
-  default     = 60 # Matches Console's DefaultNHPConfig()
+  # No default - must be explicitly configured
 
   validation {
     condition     = var.nhp_health_monitor_check_interval >= 1
@@ -171,14 +189,20 @@ variable "nhp_health_monitor_check_interval" {
 }
 
 variable "nhp_health_monitor_operation_timeout" {
-  description = "Timeout in seconds for each health monitor operation (e.g., reassigning ACs from an unhealthy server). Must be >= 1."
+  description = "Timeout in seconds for each health monitor operation. Required. Recommended: 30 seconds."
   type        = number
-  default     = 30 # Matches Console's DefaultNHPConfig()
+  # No default - must be explicitly configured
 
   validation {
     condition     = var.nhp_health_monitor_operation_timeout >= 1
     error_message = "nhp_health_monitor_operation_timeout must be at least 1 second."
   }
+}
+
+variable "nhp_console_ac_enabled" {
+  description = "Enable Console's embedded AC self-registration in DynamoDB. Required. Recommended: true for Console EC2 deployments."
+  type        = bool
+  # No default - must be explicitly configured
 }
 
 variable "nhp_console_ac_customer_id" {
@@ -205,6 +229,56 @@ variable "nhp_console_ac_license_secret_arn" {
   description = "ARN of Secrets Manager secret containing Console AC license key. Console AC reads this at boot."
   type        = string
   default     = null
+}
+
+variable "nhp_dynamodb_licenses_customer_index" {
+  description = "GSI name for querying licenses by customer_id. Recommended: 'customer_id-index'"
+  type        = string
+  default     = null
+}
+
+variable "nhp_dynamodb_licenses_auth0_subject_index" {
+  description = "GSI name for querying licenses by auth0_subject. Required for QURL quota lookup. Recommended: 'auth0_subject-index'"
+  type        = string
+  default     = null
+}
+
+# ============================================================================
+# Internal Service Authentication
+# ============================================================================
+
+variable "internal_service_token_secret_arn" {
+  description = "ARN of Secrets Manager secret containing the internal service token. Used for Auth0 Actions to call Console API."
+  type        = string
+  default     = null
+}
+
+variable "provisioning_resource_id" {
+  description = "Resource ID for auto-provisioned licenses. Recommended: 'qurl-auto-provisioned'"
+  type        = string
+  default     = null
+}
+
+variable "provisioning_default_tier" {
+  description = "Default license tier for new customers. Must be: free, pro, enterprise, or system. Recommended: 'free'"
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.provisioning_default_tier == null ? true : contains(["free", "pro", "enterprise", "system"], var.provisioning_default_tier)
+    error_message = "provisioning_default_tier must be one of: free, pro, enterprise, system"
+  }
+}
+
+variable "provisioning_default_max_acs" {
+  description = "Default MaxACs limit for new customers. 0 = unlimited. Recommended: 1 (for free tier)"
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.provisioning_default_max_acs == null ? true : var.provisioning_default_max_acs >= 0
+    error_message = "provisioning_default_max_acs must be non-negative"
+  }
 }
 
 # ============================================================================

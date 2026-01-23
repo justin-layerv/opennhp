@@ -139,6 +139,27 @@ console_protected_hostname = "console2.apps.layerv.xyz"
 console_ac_license_key_hash   = "$2b$10$CtI9zvLpcpzt0JNscTwUIOSXL67YvC4sh1dkJsh0/Y6nytM41sWGm"
 console_ac_license_key_sha256 = "f011ddf4f224db6f583da60bb998ec8ac225659c539aac176ca0d6935e28708c"
 
+# Console license lookup GSI names
+nhp_dynamodb_licenses_customer_index      = "customer_id-index"
+nhp_dynamodb_licenses_auth0_subject_index = "auth0_subject-index"
+
+# NHP Server Assignment Configuration
+# All fields are required - no defaults (explicit configuration philosophy)
+nhp_server_assignment_enabled        = true
+nhp_region                           = "us-east-2"
+nhp_cloudmap_service_name            = "server"
+nhp_assignment_servers_per_ac        = 3
+nhp_assignment_require_distinct_azs  = true
+nhp_health_monitor_check_interval    = 60
+nhp_health_monitor_operation_timeout = 30
+nhp_console_ac_enabled               = true
+
+# Console customer provisioning (for Auth0 Post User Registration)
+# internal_service_token_secret_arn must be created in Secrets Manager first
+# provisioning_resource_id   = "qurl-auto-provisioned"
+# provisioning_default_tier  = "free"
+# provisioning_default_max_acs = 1
+
 # Standalone AC license credentials for DynamoDB validation
 # Generated with: ./terraform/scripts/generate-ac-license.sh sandbox
 # Note: ac_license_key comes from GitHub Secret (AC_LICENSE_KEY)
@@ -174,10 +195,81 @@ deploy_qurl_service = true
 # qurl_default_ac_id = "ac-sandbox-01"
 # qurl_default_ac_host = "ac.nhp.layerv.xyz"
 
+# Domain configuration for QURL links and sites
+qurl_link_domain = "qurl.link"
+qurl_site_domain = "qurl.site"
+
+# Rate limiting (requests per minute)
+qurl_owner_rate_limit = 200 # authenticated owner routes
+qurl_owner_rate_burst = 50
+qurl_ip_rate_limit    = 300 # internal API routes
+qurl_ip_rate_burst    = 100
+
+# Audit log retention
+qurl_audit_retention_days = 90
+
+# CORS - empty string means allow all origins (development mode only)
+# In production, set to comma-separated list: "https://console.layerv.ai,https://app.layerv.ai"
+qurl_cors_allowed_origins = ""
+
 # Container sizing (defaults are good for dev/sandbox)
 # qurl_container_cpu    = 256   # 0.25 vCPU
 # qurl_container_memory = 512   # 512 MB
 # qurl_desired_count    = 1
+
+# Idempotency cache configuration
+qurl_idempotency_cache_ttl_seconds        = 300 # 5 minutes
+qurl_idempotency_cache_max_size           = 1000
+qurl_idempotency_cleanup_interval_seconds = 60 # 1 minute
+
+# Health check configuration
+qurl_health_check_timeout_seconds   = 10
+qurl_health_startup_timeout_seconds = 30
+
+# License cache configuration
+qurl_license_cache_ttl_seconds = 300 # 5 minutes
+qurl_license_cache_max_size    = 1000
+
+# Auth0 JWKS cache configuration
+qurl_auth0_jwks_cache_ttl_seconds     = 3600 # 1 hour
+qurl_auth0_jwks_fetch_timeout_seconds = 10
+
+# Webhooks configuration (disabled by default)
+qurl_webhooks_enabled                       = false
+qurl_webhooks_worker_count                  = 4
+qurl_webhooks_max_webhooks_per_owner        = 10
+qurl_webhooks_delivery_timeout_seconds      = 30
+qurl_webhooks_max_retries                   = 5
+qurl_webhooks_event_channel_size            = 1000
+qurl_webhooks_retry_worker_interval_seconds = 30
+qurl_webhooks_drain_timeout_seconds         = 30
+qurl_webhooks_response_body_limit           = 8192 # 8KB
+qurl_webhooks_api_version                   = "2024-01-01"
+
+# Observability configuration - enabled with Grafana Cloud export
+qurl_otel_enabled           = true
+qurl_otel_service_name      = "qurl-api"
+qurl_otel_service_version   = "dev"
+qurl_otel_environment       = "sandbox"
+qurl_otel_exporter_endpoint = "http://localhost:4317" # ADOT sidecar
+qurl_otel_exporter_protocol = "grpc"
+qurl_otel_exporter_insecure = true
+qurl_otel_trace_sample_rate = 1.0
+qurl_otel_metrics_interval  = 60
+qurl_otel_metrics_enabled   = true
+qurl_otel_tracing_enabled   = true
+qurl_otel_log_correlation   = true
+
+# Grafana Cloud ADOT Sidecar - exports telemetry to layervai.grafana.net
+qurl_grafana_cloud_enabled = true
+qurl_grafana_secret_arn    = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/grafana-cloud-otlp-mQLsCm"
+
+# Grafana Cloud Dashboards - provisions dashboards via Terraform
+# Pass token via: TF_VAR_grafana_auth=glsa_xxx terraform apply
+grafana_dashboards_enabled        = true
+grafana_url                       = "https://layervai.grafana.net"
+grafana_prometheus_datasource_uid = "grafanacloud-prom"
+grafana_tempo_datasource_uid      = "grafanacloud-traces"
 
 # ==============================================================================
 # QURL Router Plugin Configuration

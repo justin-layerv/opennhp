@@ -1,0 +1,71 @@
+# ADOT (AWS Distro for OpenTelemetry) Collector Configuration
+# Exports QURL service telemetry (metrics, traces, logs) to Grafana Cloud
+#
+# NOTE: This file is REFERENCE DOCUMENTATION only. The actual config is
+# embedded inline in main.tf (AOT_CONFIG_CONTENT env var) to avoid S3
+# mounting complexity. Keep this file in sync for documentation purposes.
+#
+# Environment variables required:
+#   ENVIRONMENT - deployment environment (sandbox, prod)
+#   CELL_ID - cell identifier (cell0, cell1, etc.)
+#   GRAFANA_OTLP_ENDPOINT - Grafana Cloud OTLP gateway URL
+#   GRAFANA_OTLP_AUTH - Base64 encoded "instance_id:api_token" for Basic auth
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Prevent OOM by limiting memory usage
+  # This is critical for sidecar containers with limited memory allocation
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 200
+    spike_limit_mib: 50
+
+  # Batch telemetry data for efficient export
+  batch:
+    timeout: 10s
+    send_batch_size: 1024
+
+  # Detect ECS Fargate metadata and add as resource attributes
+  resourcedetection:
+    detectors: [env, ecs]
+    timeout: 5s
+    override: false
+
+  # Add deployment environment and cell attributes to all telemetry
+  attributes:
+    actions:
+      - key: deployment.environment
+        value: ${ENVIRONMENT}
+        action: upsert
+      - key: cell.id
+        value: ${CELL_ID}
+        action: upsert
+
+exporters:
+  # Export to Grafana Cloud via OTLP/HTTP
+  otlphttp:
+    endpoint: ${GRAFANA_OTLP_ENDPOINT}
+    headers:
+      Authorization: "Basic ${GRAFANA_OTLP_AUTH}"
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, resourcedetection, attributes]
+      exporters: [otlphttp]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, resourcedetection, attributes]
+      exporters: [otlphttp]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, resourcedetection, attributes]
+      exporters: [otlphttp]

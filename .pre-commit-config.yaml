@@ -1,0 +1,34 @@
+# Pre-commit hooks for local development
+# Install: pip install pre-commit && pre-commit install
+# Run manually: pre-commit run --all-files
+# https://pre-commit.com
+#
+# NOTE: This repo uses a multi-module Go workspace (nhp/, endpoints/, examples/).
+# Go hooks are configured to run from module directories, not repo root.
+
+repos:
+  # SHA pinning ensures reproducible builds in CI environments
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+      - id: detect-private-key
+      - id: check-merge-conflict
+
+  # Go hooks - run gofmt only (other hooks have issues with multi-module workspace)
+  # For full linting, use: make test or golangci-lint run from module directories
+  - repo: https://github.com/dnephin/pre-commit-golang
+    rev: fb24a639f7c938759fe56eeebbb7713b69d60494  # v0.5.1
+    hooks:
+      - id: go-fmt
+
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: d0e12caebb2ab0ee8bf98181c8bfe9702bca103d  # v1.105.0
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_validate

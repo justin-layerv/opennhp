@@ -56,6 +56,11 @@ resource "aws_dynamodb_table" "licenses" {
     type = "N"
   }
 
+  attribute {
+    name = "auth0_subject"
+    type = "S"
+  }
+
   # GSI: Find all licenses for a customer
   global_secondary_index {
     name            = "customer_id-index"
@@ -73,6 +78,16 @@ resource "aws_dynamodb_table" "licenses" {
     hash_key        = "customer_id"
     range_key       = "expires_at"
     projection_type = "KEYS_ONLY"
+  }
+
+  # GSI: Find license by Auth0 subject (for QURL quota lookup)
+  # Query pattern: Query by auth0_subject to map Auth0 user to license/quota
+  # Example: "Find license for Auth0 user auth0|507f1f77bcf86cd799439011"
+  # Used by QURL service to determine quota plan based on license tier.
+  global_secondary_index {
+    name            = "auth0_subject-index"
+    hash_key        = "auth0_subject"
+    projection_type = "ALL"
   }
 
   # Enable point-in-time recovery for production
@@ -599,5 +614,131 @@ resource "aws_dynamodb_table" "qurl_audit_log" {
     Cell      = var.cell_id
     Component = "qurl-service"
     Purpose   = "QURL audit logs"
+  })
+}
+
+# qurl-webhooks: Stores webhook configurations
+# PK: webhook_id
+# GSI: owner-index (query webhooks by owner)
+resource "aws_dynamodb_table" "qurl_webhooks" {
+  count = var.deploy_qurl_tables ? 1 : 0
+
+  name                        = "${var.name_prefix}-${var.cell_id}-qurl-webhooks"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "webhook_id"
+  deletion_protection_enabled = local.is_prod
+
+  attribute {
+    name = "webhook_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "owner_id"
+    type = "S"
+  }
+
+  # GSI: Find webhooks by owner
+  global_secondary_index {
+    name            = "owner-index"
+    hash_key        = "owner_id"
+    projection_type = "ALL"
+  }
+
+  # Enable point-in-time recovery for production
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  # Server-side encryption with KMS
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-qurl-webhooks"
+    Cell      = var.cell_id
+    Component = "qurl-service"
+    Purpose   = "QURL webhook configurations"
+  })
+}
+
+# qurl-webhook-deliveries: Stores webhook delivery attempts
+# PK: delivery_id
+# GSI: webhook-index (query deliveries by webhook for history)
+# GSI: status-index (query failed deliveries for retry processing)
+resource "aws_dynamodb_table" "qurl_webhook_deliveries" {
+  count = var.deploy_qurl_tables ? 1 : 0
+
+  name                        = "${var.name_prefix}-${var.cell_id}-qurl-webhook-deliveries"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "delivery_id"
+  deletion_protection_enabled = local.is_prod
+
+  attribute {
+    name = "delivery_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "webhook_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "created_at"
+    type = "S"
+  }
+
+  attribute {
+    name = "status"
+    type = "S"
+  }
+
+  attribute {
+    name = "next_retry_at"
+    type = "S"
+  }
+
+  # GSI: Find deliveries by webhook, sorted by creation time (for delivery history)
+  global_secondary_index {
+    name            = "webhook-index"
+    hash_key        = "webhook_id"
+    range_key       = "created_at"
+    projection_type = "ALL"
+  }
+
+  # GSI: Find deliveries by status for retry processing
+  # Query pattern: status = "failed" AND next_retry_at < now()
+  global_secondary_index {
+    name            = "status-index"
+    hash_key        = "status"
+    range_key       = "next_retry_at"
+    projection_type = "ALL"
+  }
+
+  # Enable point-in-time recovery for production
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  # Server-side encryption with KMS
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  # TTL for automatic cleanup of old deliveries (30 days)
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-qurl-webhook-deliveries"
+    Cell      = var.cell_id
+    Component = "qurl-service"
+    Purpose   = "QURL webhook delivery attempts"
   })
 }

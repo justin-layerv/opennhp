@@ -88,6 +88,31 @@ func (d *DynamoDBStorage) Close() error {
 	return nil
 }
 
+// Ping checks DynamoDB connectivity by describing one of the configured tables.
+// This is used for health checks in cloud mode deployments.
+func (d *DynamoDBStorage) Ping(ctx context.Context) error {
+	if d.client == nil {
+		return fmt.Errorf("dynamodb client not initialized")
+	}
+
+	// Use the AC assignments table for health check (most commonly accessed)
+	tableName := d.config.ACAssignmentsTable
+	if tableName == "" {
+		tableName = d.config.LicensesTable
+	}
+	if tableName == "" {
+		return fmt.Errorf("no dynamodb tables configured")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, DynamoDBOperationTimeout)
+	defer cancel()
+
+	_, err := d.client.DescribeTable(ctx, &dynamodb.DescribeTableInput{
+		TableName: aws.String(tableName),
+	})
+	return err
+}
+
 // ============================================================================
 // AC Assignment Operations
 // ============================================================================
