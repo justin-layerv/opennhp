@@ -449,6 +449,18 @@ resource "aws_network_acl" "private" {
     }
   }
 
+  # Inbound: Allow NHP UDP knock packets from internet (for NHP Server behind NLB)
+  # NLB preserves client IPs, so traffic appears to come from external sources.
+  # The NHP Server runs in private subnets with NLB forwarding UDP traffic.
+  ingress {
+    protocol   = "udp"
+    rule_no    = 160
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 62206
+    to_port    = 62206
+  }
+
   # Inbound: Allow ephemeral ports (return traffic from internet via NAT)
   ingress {
     protocol   = "tcp"
@@ -493,6 +505,17 @@ resource "aws_network_acl" "private" {
   egress {
     protocol   = "tcp"
     rule_no    = 300
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 1024
+    to_port    = 65535
+  }
+
+  # Outbound: Allow UDP ephemeral ports (for NHP Server responses)
+  # Responses to UDP knock packets need to reach external clients via NAT.
+  egress {
+    protocol   = "udp"
+    rule_no    = 310
     action     = "allow"
     cidr_block = "0.0.0.0/0"
     from_port  = 1024
