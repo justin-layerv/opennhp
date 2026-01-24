@@ -271,16 +271,6 @@ resource "aws_security_group" "ac" {
     description = "SSH from VPC"
   }
 
-  # Traefik health check endpoint - VPC only (for NLB health checks)
-  # Traefik exposes /ping on port 8080 for health monitoring
-  ingress {
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-    description = "Traefik health check from VPC (NLB)"
-  }
-
   # All outbound
   egress {
     from_port   = 0
@@ -748,14 +738,15 @@ resource "aws_lb_target_group" "https" {
   target_type       = "instance"
   proxy_protocol_v2 = true
 
-  # HTTP health check on Traefik's ping endpoint
-  # Verifies Traefik is running and can respond to requests
+  # TCP health check on the same port as traffic (443)
+  # Verifies Traefik is listening and accepting connections
+  # Using TCP instead of HTTP reduces attack surface (no HTTP parsing)
   health_check {
     enabled             = true
-    protocol            = "HTTP"
-    port                = "8080"
-    path                = "/ping"
-    matcher             = "200"
+    protocol            = "TCP"
+    port                = "443"
+    path                = null # Not used for TCP
+    matcher             = null # Not used for TCP
     interval            = 30
     healthy_threshold   = 2
     unhealthy_threshold = 3
