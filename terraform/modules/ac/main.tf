@@ -731,7 +731,8 @@ resource "aws_lb" "ac" {
 # HTTPS Target Group (TCP passthrough to Traefik)
 # Proxy Protocol v2 enabled to preserve client IP for NHP firewall rules
 resource "aws_lb_target_group" "https" {
-  name              = replace("${var.name_prefix}-ac-https", "_", "-")
+  # Name changed from -ac-https to -ac-tcp to force recreation after HTTP->TCP migration
+  name              = replace("${var.name_prefix}-ac-tcp", "_", "-")
   port              = 443
   protocol          = "TCP"
   vpc_id            = var.vpc_id
@@ -745,8 +746,6 @@ resource "aws_lb_target_group" "https" {
     enabled             = true
     protocol            = "TCP"
     port                = "443"
-    path                = null # Not used for TCP
-    matcher             = null # Not used for TCP
     interval            = 30
     healthy_threshold   = 2
     unhealthy_threshold = 3
