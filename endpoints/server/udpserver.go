@@ -930,6 +930,10 @@ func (s *UdpServer) AddACPeer(acPeer *core.UdpPeer) {
 	if acPeer.DeviceType() == core.NHP_AC {
 		s.device.AddPeer(acPeer)
 		s.acPeerMapMutex.Lock()
+		// Initialize map if nil (cloud mode without ac.toml doesn't call updateACPeers)
+		if s.acPeerMap == nil {
+			s.acPeerMap = make(map[string]*core.UdpPeer)
+		}
 		s.acPeerMap[acPeer.PublicKeyBase64()] = acPeer
 		s.acPeerMapMutex.Unlock()
 	}
