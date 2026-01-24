@@ -1040,11 +1040,11 @@ docker run -d \
     --restart always \
     -p 127.0.0.1:$HOST_PORT:$CONTAINER_PORT \
     -e "GVA_CONFIG_SYSTEM_ADDR=$CONTAINER_PORT" \
-    -e "GVA_CONFIG_SYSTEM_DBTYPE=pgsql" \
-    -e "GVA_CONFIG_SYSTEM_COOKIEDOMAIN=${cookie_domain}" \
+    -e "GVA_CONFIG_SYSTEM_DB_TYPE=pgsql" \
+    -e "GVA_CONFIG_SYSTEM_COOKIE_DOMAIN=${cookie_domain}" \
     -e "GVA_CONFIG_PGSQL_PATH=${rds_endpoint}" \
     -e "GVA_CONFIG_PGSQL_PORT=${rds_port}" \
-    -e "GVA_CONFIG_PGSQL_DBNAME=${rds_database_name}" \
+    -e "GVA_CONFIG_PGSQL_DB_NAME=${rds_database_name}" \
     -e "GVA_CONFIG_PGSQL_USERNAME=$RDS_USERNAME" \
     -e "GVA_CONFIG_PGSQL_PASSWORD=$RDS_PASSWORD" \
     -e "GVA_CONFIG_PGSQL_CONFIG=sslmode=require TimeZone=UTC" \
