@@ -833,9 +833,13 @@ jobs:
           echo "Instance Refresh ID: $REFRESH_ID"
 
           # Wait for instance refresh (no health check for Console)
+          # Console EC2 needs more time due to Docker pulls, etcd DNS, AC registration
+          # 90 iterations * 10s = 900s (15 minutes) to accommodate 360s grace period + refresh time
           ./.github/scripts/wait-for-instance-refresh.sh \
             "$ASG_NAME" \
-            "$REFRESH_ID"
+            "$REFRESH_ID" \
+            "" \
+            90
 
   deploy-sandbox-validate:
     name: Deploy Sandbox - Validate

@@ -1071,7 +1071,7 @@ docker run -d \
 %{ if nhp_ac_repo_url != null ~}
     -e "GVA_CONFIG_NHP_CONSOLE_AC_ENABLED=${nhp_console_ac_enabled}" \
     -e "GVA_CONFIG_NHP_CONSOLE_AC_SECRET_NAME=${name_prefix}-console-ac" \
-    -e "GVA_CONFIG_NHP_CONSOLE_AC_ID=console-ac" \
+    -e "GVA_CONFIG_NHP_CONSOLE_AC_AC_ID=console-ac" \
     -e "GVA_CONFIG_NHP_CONSOLE_AC_RESOURCE_FQDN=${protected_hostname != null ? protected_hostname : domain_name}" \
     -e "GVA_CONFIG_NHP_CONSOLE_AC_CUSTOMER_ID=${nhp_console_ac_customer_id}" \
 %{ endif ~}

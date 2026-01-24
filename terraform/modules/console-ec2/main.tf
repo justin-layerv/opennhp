@@ -507,7 +507,7 @@ resource "aws_autoscaling_group" "console" {
   # In internal mode, the internal TG has HTTP health checks to /health endpoint.
   # Unhealthy instances (app crash, DB unreachable) will be automatically replaced.
   health_check_type         = "ELB"
-  health_check_grace_period = 180 # Reduced from 300s - user_data validates health before completing
+  health_check_grace_period = 360 # Console EC2 needs time for: Docker pulls, etcd DNS, AC registration, health wait
 
   # Target groups: internal or external mode, plus protected (always enabled)
   # NOTE: Must include protected target group here, not via aws_autoscaling_attachment,
@@ -524,7 +524,7 @@ resource "aws_autoscaling_group" "console" {
     strategy = "Rolling"
     preferences {
       min_healthy_percentage = 50
-      instance_warmup        = 180 # Reduced from 300s - aligns with health_check_grace_period
+      instance_warmup        = 360 # Match health_check_grace_period for Console EC2 startup time
     }
   }
 
