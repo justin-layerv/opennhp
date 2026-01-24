@@ -49,7 +49,7 @@ concurrency:
 
 env:
   AWS_REGION: us-east-2
-  TF_VERSION: '1.6'
+  TF_VERSION: '1.14.3'
   GO_VERSION: '1.24'
 
 jobs:
@@ -111,13 +111,19 @@ jobs:
           echo "start_time=$(date +%s)" >> $GITHUB_OUTPUT
 
   # ============================================================================
-  # TEST - Runs in parallel with build and terraform-plan
+  # TEST - Runs after terraform validation/plan passes (or is skipped)
+  # Terraform is fast (~2min) and catches config errors early, saving CI time
   # ============================================================================
   test:
     name: Test
-    needs: [changes]
+    needs: [changes, terraform-validate, terraform-plan]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Run if terraform jobs succeeded or were skipped (dependabot PRs, non-deploy dispatch)
+    if: |
+      always() &&
+      (needs.terraform-validate.result == 'success' || needs.terraform-validate.result == 'skipped') &&
+      (needs.terraform-plan.result == 'success' || needs.terraform-plan.result == 'skipped')
     steps:
       # Skip at step level (not job level) so the check name is always created
       # This is required for branch protection to see the check as successful
@@ -169,14 +175,19 @@ jobs:
             bash -c "cd nhp && go vet ./... && cd ../endpoints && go vet ./..."
 
   # ============================================================================
-  # BUILD - Parallel matrix builds (runs in parallel with test and terraform-plan)
+  # BUILD - Parallel matrix builds after terraform validation/plan passes (or is skipped)
+  # Terraform is fast (~2min) and catches config errors early, saving CI time
   # ============================================================================
   build:
     name: Build ${{ matrix.image }}
-    needs: [changes, setup]
+    needs: [changes, setup, terraform-validate, terraform-plan]
     runs-on: ubuntu-latest
-    # Note: No job-level 'if' - we skip at step level to ensure matrix expands
-    # and check names (Build server, Build ac) are created for branch protection
+    # Run if terraform jobs succeeded or were skipped (dependabot PRs, non-deploy dispatch)
+    # Note: We still skip at step level to ensure matrix expands and check names are created
+    if: |
+      always() &&
+      (needs.terraform-validate.result == 'success' || needs.terraform-validate.result == 'skipped') &&
+      (needs.terraform-plan.result == 'success' || needs.terraform-plan.result == 'skipped')
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -449,8 +460,10 @@ jobs:
   # ============================================================================
   terraform-plan:
     name: Terraform Plan (${{ matrix.environment }})
-    needs: [setup]  # Only needs metadata, runs in parallel with test/build
+    needs: [setup, terraform-validate]  # Validate must pass (or be skipped) before plan
     if: |
+      always() &&
+      (needs.terraform-validate.result == 'success' || needs.terraform-validate.result == 'skipped') &&
       github.event_name != 'pull_request' &&
       (
         (github.ref == 'refs/heads/main' && github.event_name == 'push') ||

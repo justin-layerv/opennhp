@@ -6,7 +6,7 @@
 # - Production (layerv-prod): Secondary account, pulls from sandbox ECR cross-account
 
 terraform {
-  required_version = ">= 1.0"
+  required_version = "~> 1.14" # Pessimistic constraint - allows 1.14.x patches only
 
   required_providers {
     aws = {

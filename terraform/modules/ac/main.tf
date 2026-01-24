@@ -728,10 +728,21 @@ resource "aws_lb" "ac" {
   tags = var.tags
 }
 
-# HTTPS Target Group (TCP passthrough to Traefik)
+# Old target group removed from state - had HTTP health check attributes incompatible with TCP
+# Terraform cannot update in-place when state has matcher/path but config uses TCP protocol
+#
+# TODO(#237): Remove this block after cleaning up the orphaned target group:
+#   aws elbv2 delete-target-group --target-group-arn <arn-of-nhp-*-ac-https>
+removed {
+  from = aws_lb_target_group.https
+  lifecycle {
+    destroy = false
+  }
+}
+
+# TCP Target Group (TLS passthrough to Traefik)
 # Proxy Protocol v2 enabled to preserve client IP for NHP firewall rules
-resource "aws_lb_target_group" "https" {
-  # Name changed from -ac-https to -ac-tcp to force recreation after HTTP->TCP migration
+resource "aws_lb_target_group" "ac_tcp" {
   name              = replace("${var.name_prefix}-ac-tcp", "_", "-")
   port              = 443
   protocol          = "TCP"
@@ -759,7 +770,7 @@ resource "aws_lb_target_group" "https" {
 # Attach ASG to Target Group
 resource "aws_autoscaling_attachment" "ac" {
   autoscaling_group_name = aws_autoscaling_group.ac.name
-  lb_target_group_arn    = aws_lb_target_group.https.arn
+  lb_target_group_arn    = aws_lb_target_group.ac_tcp.arn
 }
 
 # HTTPS Listener (TLS passthrough - Traefik handles TLS)
@@ -770,7 +781,7 @@ resource "aws_lb_listener" "https" {
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.https.arn
+    target_group_arn = aws_lb_target_group.ac_tcp.arn
   }
 
   tags = var.tags
