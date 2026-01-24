@@ -350,6 +350,17 @@ func TestCachedStorage_Name(t *testing.T) {
 	}
 }
 
+func TestCachedStorage_Backend(t *testing.T) {
+	backend := newMockStorageBackend()
+	config := CacheConfig{MaxEntries: 100, DefaultTTL: 60}
+	cached := NewCachedStorage(backend, config)
+
+	// Backend() should return the underlying storage backend
+	if cached.Backend() != backend {
+		t.Error("Backend() should return the underlying storage backend")
+	}
+}
+
 // ============================================================================
 // StorageError Tests
 // ============================================================================

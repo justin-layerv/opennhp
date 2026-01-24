@@ -104,7 +104,7 @@ type UdpServer struct {
 
 	// Pluggable storage backend (DynamoDB for cloud, etcd for on-prem)
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md for architecture details.
-	storage       StorageBackend   // DynamoDB (cloud) or etcd (on-prem)
+	storage       StorageBackend // DynamoDB (cloud) or etcd (on-prem)
 	storageConfig *StorageConfig
 	forwarder     *ServerForwarder // Server-to-server knock forwarding
 
@@ -437,12 +437,16 @@ func (s *UdpServer) GetEtcdPinger() EtcdPinger {
 	if s.storage == nil {
 		return nil
 	}
-	// Check if storage implements Ping (etcd storage does)
-	if pinger, ok := s.storage.(EtcdPinger); ok {
-		// Only return if this is actually etcd storage
-		if s.storage.Name() == "etcd" {
-			return pinger
-		}
+
+	// Unwrap CachedStorage to get the underlying backend for type assertion
+	backend := s.storage
+	if cached, ok := s.storage.(*CachedStorage); ok {
+		backend = cached.Backend()
+	}
+
+	// Check if underlying backend implements EtcdPinger
+	if pinger, ok := backend.(EtcdPinger); ok {
+		return pinger
 	}
 	return nil
 }
@@ -453,12 +457,16 @@ func (s *UdpServer) GetDynamoDBPinger() DynamoDBPinger {
 	if s.storage == nil {
 		return nil
 	}
-	// Check if storage implements Ping (DynamoDB storage does)
-	if pinger, ok := s.storage.(DynamoDBPinger); ok {
-		// Only return if this is actually DynamoDB storage
-		if s.storage.Name() == "dynamodb" {
-			return pinger
-		}
+
+	// Unwrap CachedStorage to get the underlying backend for type assertion
+	backend := s.storage
+	if cached, ok := s.storage.(*CachedStorage); ok {
+		backend = cached.Backend()
+	}
+
+	// Check if underlying backend implements DynamoDBPinger
+	if pinger, ok := backend.(DynamoDBPinger); ok {
+		return pinger
 	}
 	return nil
 }

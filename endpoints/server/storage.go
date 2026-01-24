@@ -62,21 +62,21 @@ type ACAssignment struct {
 	ResourceFQDN    string       `json:"resource_fqdn" dynamodbav:"resource_fqdn"`
 	CustomerID      string       `json:"customer_id" dynamodbav:"customer_id"`
 	AssignedServers []ServerInfo `json:"assigned_servers" dynamodbav:"assigned_servers"`
-	Version         int          `json:"version" dynamodbav:"version"`                     // For optimistic locking during reassignment
-	ReassignedAt    *int64       `json:"reassigned_at" dynamodbav:"reassigned_at"`         // Unix timestamp, set when Console reassigns
+	Version         int          `json:"version" dynamodbav:"version"`             // For optimistic locking during reassignment
+	ReassignedAt    *int64       `json:"reassigned_at" dynamodbav:"reassigned_at"` // Unix timestamp, set when Console reassigns
 	CreatedAt       int64        `json:"created_at" dynamodbav:"created_at"`
 	LastSeen        int64        `json:"last_seen" dynamodbav:"last_seen"`
-	TTL             *int64       `json:"ttl,omitempty" dynamodbav:"ttl,omitempty"`         // Unix timestamp for DynamoDB TTL
+	TTL             *int64       `json:"ttl,omitempty" dynamodbav:"ttl,omitempty"` // Unix timestamp for DynamoDB TTL
 }
 
 // ServerInfo represents an assigned server's connection details.
 type ServerInfo struct {
-	ID         string `json:"id" dynamodbav:"id"`                              // Server ID (e.g., "srv-abc123")
-	IP         string `json:"ip" dynamodbav:"ip"`                              // Public IP for AC connection
+	ID         string `json:"id" dynamodbav:"id"`                                       // Server ID (e.g., "srv-abc123")
+	IP         string `json:"ip" dynamodbav:"ip"`                                       // Public IP for AC connection
 	InternalIP string `json:"internal_ip,omitempty" dynamodbav:"internal_ip,omitempty"` // VPC IP for server-to-server forwarding
-	AZ         string `json:"az,omitempty" dynamodbav:"az,omitempty"`          // Availability Zone
-	Port       int    `json:"port" dynamodbav:"port"`                          // NHP UDP port (default 62206)
-	PubKey     string `json:"pub_key,omitempty" dynamodbav:"pub_key,omitempty"` // Server's public key (for forwarding)
+	AZ         string `json:"az,omitempty" dynamodbav:"az,omitempty"`                   // Availability Zone
+	Port       int    `json:"port" dynamodbav:"port"`                                   // NHP UDP port (default 62206)
+	PubKey     string `json:"pub_key,omitempty" dynamodbav:"pub_key,omitempty"`         // Server's public key (for forwarding)
 }
 
 // License represents customer license information.
@@ -88,10 +88,10 @@ type License struct {
 	ResourceID       string `json:"resource_id" dynamodbav:"resource_id"`               // Resource identifier (informational)
 	Tier             string `json:"tier" dynamodbav:"tier"`                             // "free", "pro", "enterprise"
 	MaxACs           int    `json:"max_acs" dynamodbav:"max_acs"`
-	ExpiresAt        int64  `json:"expires_at" dynamodbav:"expires_at"`                 // Unix timestamp (0 = never expires)
+	ExpiresAt        int64  `json:"expires_at" dynamodbav:"expires_at"` // Unix timestamp (0 = never expires)
 	Active           bool   `json:"active" dynamodbav:"active"`
-	CreatedAt        int64  `json:"created_at" dynamodbav:"created_at"`                 // Unix timestamp
-	UpdatedAt        int64  `json:"updated_at" dynamodbav:"updated_at"`                 // Unix timestamp
+	CreatedAt        int64  `json:"created_at" dynamodbav:"created_at"` // Unix timestamp
+	UpdatedAt        int64  `json:"updated_at" dynamodbav:"updated_at"` // Unix timestamp
 }
 
 // Resource represents a protected resource definition.
@@ -180,11 +180,11 @@ type StorageConfig struct {
 
 // DynamoDBConfig configures the DynamoDB storage backend.
 type DynamoDBConfig struct {
-	Region              string `toml:"Region"`
-	LicensesTable       string `toml:"LicensesTable"`
-	ACAssignmentsTable  string `toml:"ACAssignmentsTable"`
-	ResourcesTable      string `toml:"ResourcesTable"`
-	Endpoint            string `toml:"Endpoint,omitempty"` // For local development
+	Region             string `toml:"Region"`
+	LicensesTable      string `toml:"LicensesTable"`
+	ACAssignmentsTable string `toml:"ACAssignmentsTable"`
+	ResourcesTable     string `toml:"ResourcesTable"`
+	Endpoint           string `toml:"Endpoint,omitempty"` // For local development
 }
 
 // EtcdStorageConfig configures the etcd storage backend.
@@ -302,6 +302,13 @@ func (cs *CachedStorage) Close() error {
 // Name returns the backend name.
 func (cs *CachedStorage) Name() string {
 	return cs.backend.Name() + " (cached)"
+}
+
+// Backend returns the underlying storage backend.
+// This allows callers to unwrap the cache layer for type assertions
+// (e.g., checking if the underlying backend implements DynamoDBPinger).
+func (cs *CachedStorage) Backend() StorageBackend {
+	return cs.backend
 }
 
 // InvalidateACAssignment removes an AC assignment from the cache.
