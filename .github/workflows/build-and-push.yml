@@ -408,6 +408,9 @@ jobs:
       - name: Terraform Plan
         id: plan
         if: steps.changes.outputs.terraform_changed == 'true'
+        # TODO: Remove continue-on-error once Grafana Cloud 503 issue is resolved
+        # See: https://github.com/layervai/nhp/issues/241
+        continue-on-error: true
         working-directory: terraform/environments/sandbox
         env:
           # AC license credentials (from GitHub Secrets)
@@ -515,6 +518,9 @@ jobs:
 
       - name: Terraform Plan
         id: plan
+        # TODO: Remove continue-on-error once Grafana Cloud 503 issue is resolved
+        # See: https://github.com/layervai/nhp/issues/241
+        continue-on-error: true
         working-directory: terraform/environments/${{ matrix.environment }}
         env:
           # Sensitive variables passed via TF_VAR_ environment variables
