@@ -145,6 +145,18 @@ MaxEntries = 10000
 DefaultTTL = 60
 ReassignmentTTL = 5
 ReassignmentWindow = 300
+
+# Cloud Map configuration for server health discovery.
+# Used to filter stale AC assignments pointing to terminated servers.
+%{ if cloudmap_enabled ~}
+[CloudMap]
+Enabled = true
+Region = "${dynamodb_region}"
+NamespaceName = "${cloudmap_namespace_name}"
+ServiceName = "${cloudmap_service_name}"
+CacheTTL = 30
+OperationTimeout = 5
+%{ endif ~}
 STORAGEEOF
 
 # NHP Server uses local config.toml for base config (UDP port 62206)

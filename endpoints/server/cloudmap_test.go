@@ -85,6 +85,29 @@ func TestFilterHealthyServers_NilHealthChecker(t *testing.T) {
 	}
 }
 
+func TestFilterHealthyServers_NilInterfaceValue(t *testing.T) {
+	// Regression test for nil interface with typed nil value.
+	// In Go, a nil *CloudMapClient assigned to HealthChecker interface
+	// creates a non-nil interface (has type info) with nil underlying value.
+	// Calling methods on such interface panics with nil pointer dereference.
+	// This test ensures FilterHealthyServers handles this case correctly.
+	servers := []ServerInfo{
+		{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1", Port: 62206},
+		{ID: "srv-2", IP: "10.0.0.2", InternalIP: "10.0.0.2", Port: 62206},
+	}
+
+	// Create a nil *CloudMapClient and pass it as HealthChecker interface
+	var nilClient *CloudMapClient = nil
+	var healthChecker HealthChecker = nilClient // Interface is NOT nil, but underlying value IS nil
+
+	// This should NOT panic - it should return all servers (fail-open)
+	result := FilterHealthyServers(context.Background(), healthChecker, servers)
+
+	if len(result) != len(servers) {
+		t.Errorf("Expected %d servers, got %d", len(servers), len(result))
+	}
+}
+
 func TestFilterHealthyServers_EmptyInput(t *testing.T) {
 	// Empty server list should return empty list
 	result := FilterHealthyServers(context.Background(), nil, []ServerInfo{})

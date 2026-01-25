@@ -454,6 +454,10 @@ locals {
     dynamodb_licenses_table       = var.dynamodb_licenses_table
     dynamodb_ac_assignments_table = var.dynamodb_ac_assignments_table
     dynamodb_resources_table      = var.dynamodb_resources_table
+    # Cloud Map configuration for server health discovery
+    cloudmap_enabled        = var.cloudmap_enabled
+    cloudmap_namespace_name = var.cloudmap_namespace_name
+    cloudmap_service_name   = var.cloudmap_service_name
     # QURL plugin configuration
     qurl_enabled                  = var.qurl_config != null ? var.qurl_config.enabled : false
     qurl_api_url                  = var.qurl_config != null ? var.qurl_config.api_url : ""

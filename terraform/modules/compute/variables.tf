@@ -258,6 +258,29 @@ variable "keypair_policy_arn" {
 }
 
 # =============================================================================
+# Cloud Map Configuration for Server Health Discovery
+# Used to filter stale AC assignments pointing to terminated servers.
+# =============================================================================
+
+variable "cloudmap_enabled" {
+  description = "Enable Cloud Map health filtering for AC assignments"
+  type        = bool
+  default     = false
+}
+
+variable "cloudmap_namespace_name" {
+  description = "Cloud Map namespace name (e.g., 'nhp.sandbox.internal')"
+  type        = string
+  default     = null
+}
+
+variable "cloudmap_service_name" {
+  description = "Cloud Map service name within the namespace (e.g., 'server')"
+  type        = string
+  default     = null
+}
+
+# =============================================================================
 # ASG Lifecycle Hook for Termination Cleanup
 # =============================================================================
 

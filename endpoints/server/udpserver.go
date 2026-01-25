@@ -218,11 +218,13 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		var cloudMapErr error
 		s.cloudMap, cloudMapErr = NewCloudMapClient(cloudMapCtx, s.storageConfig.CloudMap)
 		if cloudMapErr != nil {
-			log.Warning("Failed to initialize Cloud Map client: %v (server health filtering disabled)", cloudMapErr)
-			// Continue without Cloud Map - fail-open
-		} else {
-			log.Info("Cloud Map client initialized for server health filtering")
+			// Fail-fast: if CloudMap is explicitly enabled, it must work.
+			// A silent failure here would cause nil pointer panics later when
+			// processing AC registrations (in handleACServerAssignment).
+			log.Error("Failed to initialize Cloud Map client: %v", cloudMapErr)
+			return fmt.Errorf("cloudmap client initialization failed (cloudmap.enabled=true): %w", cloudMapErr)
 		}
+		log.Info("Cloud Map client initialized for server health filtering")
 	}
 
 	// Initialize server-to-server forwarder

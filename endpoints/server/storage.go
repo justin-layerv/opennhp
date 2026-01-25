@@ -311,6 +311,21 @@ func (cs *CachedStorage) Backend() StorageBackend {
 	return cs.backend
 }
 
+// Pinger is the interface for storage backends that support health checks.
+type Pinger interface {
+	Ping(ctx context.Context) error
+}
+
+// Ping forwards to the underlying backend's Ping method if available.
+// This allows health checks to work through the cache layer.
+func (cs *CachedStorage) Ping(ctx context.Context) error {
+	if pinger, ok := cs.backend.(Pinger); ok {
+		return pinger.Ping(ctx)
+	}
+	// Backend doesn't support Ping - consider healthy
+	return nil
+}
+
 // InvalidateACAssignment removes an AC assignment from the cache.
 // Note: This is intentionally NOT part of the StorageBackend interface because
 // cache invalidation is specific to CachedStorage. Callers needing this method

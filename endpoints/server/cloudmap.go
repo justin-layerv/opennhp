@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 
@@ -260,7 +261,11 @@ func (c *CloudMapClient) InvalidateCache() {
 // If health check fails, returns the original list (fail-open).
 // If no healthy servers remain, returns an empty slice.
 func FilterHealthyServers(ctx context.Context, healthChecker HealthChecker, servers []ServerInfo) []ServerInfo {
-	if healthChecker == nil {
+	// Check both interface nil and underlying value nil.
+	// Go interfaces can be non-nil while holding a nil concrete pointer.
+	// Example: var c *CloudMapClient = nil; var h HealthChecker = c
+	// In this case, h != nil (interface has type info) but h.Method() panics.
+	if healthChecker == nil || reflect.ValueOf(healthChecker).IsNil() {
 		// Health checker not configured - return all servers
 		return servers
 	}

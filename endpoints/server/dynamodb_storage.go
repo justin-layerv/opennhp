@@ -72,6 +72,17 @@ func NewDynamoDBStorage(ctx context.Context, cfg DynamoDBConfig) (*DynamoDBStora
 		config: cfg,
 	}
 
+	// Warm up the connection by pinging DynamoDB.
+	// AWS SDK defers connection establishment until the first API call.
+	// This ensures any connection issues are detected at startup rather than
+	// causing timeouts when the first AC registration attempt happens.
+	log.Info("Warming up DynamoDB connection...")
+	pingStart := time.Now()
+	if err := storage.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("failed to ping DynamoDB during initialization: %w", err)
+	}
+	log.Info("DynamoDB connection established in %v", time.Since(pingStart))
+
 	log.Info("DynamoDB storage initialized: region=%s, licenses=%s, assignments=%s, resources=%s",
 		cfg.Region, cfg.LicensesTable, cfg.ACAssignmentsTable, cfg.ResourcesTable)
 

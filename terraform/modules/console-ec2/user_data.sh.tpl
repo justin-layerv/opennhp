@@ -582,10 +582,14 @@ CONFIGEOF
   # See docs/design/PLUGGABLE_STORAGE_BACKEND.md for cloud mode architecture
 
   # Create nhp-acd systemd service
+  # Note: After=docker.service ensures Docker is ready on reboot so Console container
+  # can auto-start (--restart always) before nhp-acd tries to connect.
+  # Wants=docker.service ensures Docker is started if not already running.
   cat > /etc/systemd/system/nhp-acd.service << SVCEOF
 [Unit]
 Description=NHP Access Controller Daemon (Console)
-After=network.target
+After=network.target docker.service
+Wants=docker.service
 
 [Service]
 Type=simple
@@ -593,7 +597,8 @@ User=root
 WorkingDirectory=/opt/layerv/nhp-ac
 ExecStart=/opt/layerv/nhp-ac/nhp-acd run
 Restart=always
-RestartSec=10
+# Wait a bit on restart to give Console container time to initialize
+RestartSec=15
 
 [Install]
 WantedBy=multi-user.target
@@ -1278,6 +1283,25 @@ SVCEOF
 systemctl daemon-reload
 systemctl enable console-health
 systemctl start console-health
+
+# ============================================================================
+# Update Console AC IP in RDS (always runs if postgresql-client is available)
+# This ensures the AC IP matches the current instance after replacements.
+# ============================================================================
+
+# Install PostgreSQL client for RDS operations (needed for IP update and seeding)
+apt_get_with_retry install -y postgresql-client
+
+# Always update Console resource IP if the record exists (handles instance replacement)
+echo "Updating Console AC IP in portal_sites..."
+PGPASSWORD="$RDS_PASSWORD" psql -h "${rds_endpoint}" -p ${rds_port} -U "$RDS_USERNAME" -d "${rds_database_name}" -c "
+UPDATE portal_sites
+SET resources = jsonb_set(resources, '{0,ip}', '\"$LOCAL_IP\"'::jsonb),
+    updated_at = NOW()
+WHERE app_id = '${console_app_id}'
+  AND resources IS NOT NULL
+  AND jsonb_array_length(resources) > 0;
+" 2>/dev/null && echo "Console AC IP updated to $LOCAL_IP" || echo "No existing Console resource to update (first deployment)"
 
 %{ if seed_console_resource }
 # ============================================================================

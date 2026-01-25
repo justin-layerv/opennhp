@@ -310,6 +310,12 @@ module "compute" {
   dynamodb_ac_assignments_table = module.dynamodb.ac_assignments_table_name
   dynamodb_resources_table      = module.dynamodb.resources_table_name
 
+  # Cloud Map configuration for server health discovery
+  # Filters stale AC assignments pointing to terminated servers
+  cloudmap_enabled        = true
+  cloudmap_namespace_name = module.data.namespace_name
+  cloudmap_service_name   = var.nhp_cloudmap_service_name
+
   # ASG Lifecycle Hook for immediate DynamoDB cleanup on server termination
   # When enabled, a Lambda cleans up assignments before the server terminates
   enable_termination_cleanup     = var.enable_termination_cleanup
