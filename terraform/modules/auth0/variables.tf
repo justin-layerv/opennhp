@@ -28,9 +28,9 @@ variable "api_token_lifetime" {
 }
 
 variable "web_token_lifetime" {
-  description = "Token lifetime for web/browser-based apps in seconds (default: 2 hours)"
+  description = "Token lifetime for web/browser-based apps in seconds (default: 1 hour). Must be <= api_token_lifetime."
   type        = number
-  default     = 7200
+  default     = 3600
 
   validation {
     condition     = var.web_token_lifetime >= 300 && var.web_token_lifetime <= 86400

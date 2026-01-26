@@ -33,6 +33,11 @@ resource "auth0_resource_server" "qurl_api" {
   # Prevent accidental deletion of API definition
   lifecycle {
     prevent_destroy = true
+
+    precondition {
+      condition     = var.web_token_lifetime <= var.api_token_lifetime
+      error_message = "web_token_lifetime (${var.web_token_lifetime}s) must be <= api_token_lifetime (${var.api_token_lifetime}s)"
+    }
   }
 }
 
