@@ -218,6 +218,28 @@ module "auth0" {
   api_audience = var.qurl_auth0_audience
 }
 
+# State migration: module.auth0 was previously deployed with count (as module.auth0[0])
+# These moved blocks handle the migration to the non-indexed version
+moved {
+  from = module.auth0[0].auth0_resource_server.qurl_api
+  to   = module.auth0.auth0_resource_server.qurl_api
+}
+
+moved {
+  from = module.auth0[0].auth0_resource_server_scopes.qurl_scopes
+  to   = module.auth0.auth0_resource_server_scopes.qurl_scopes
+}
+
+moved {
+  from = module.auth0[0].auth0_client.backend_service
+  to   = module.auth0.auth0_client.backend_service
+}
+
+moved {
+  from = module.auth0[0].auth0_client_grant.backend_qurl_api
+  to   = module.auth0.auth0_client_grant.backend_qurl_api
+}
+
 # Re-export outputs
 output "vpc_id" {
   value = module.nhp.vpc_id
