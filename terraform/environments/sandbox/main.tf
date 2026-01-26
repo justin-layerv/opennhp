@@ -137,6 +137,10 @@ module "nhp" {
   qurl_otel_tracing_enabled   = var.qurl_otel_tracing_enabled
   qurl_otel_log_correlation   = var.qurl_otel_log_correlation
 
+  # QURL Container Sizing
+  qurl_container_cpu    = var.qurl_container_cpu
+  qurl_container_memory = var.qurl_container_memory
+
   # QURL Grafana Cloud (ADOT Sidecar)
   qurl_grafana_cloud_enabled = var.qurl_grafana_cloud_enabled
   qurl_grafana_secret_arn    = var.qurl_grafana_secret_arn

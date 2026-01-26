@@ -711,6 +711,29 @@ variable "qurl_otel_log_correlation" {
   type        = bool
 }
 
+# QURL Container Sizing
+variable "qurl_container_cpu" {
+  description = "CPU units for QURL container (256, 512, 1024, 2048, 4096, 8192, 16384)"
+  type        = number
+  default     = 256
+
+  validation {
+    condition     = contains([256, 512, 1024, 2048, 4096, 8192, 16384], var.qurl_container_cpu)
+    error_message = "qurl_container_cpu must be a valid Fargate CPU value."
+  }
+}
+
+variable "qurl_container_memory" {
+  description = "Memory in MB for QURL container. When grafana_cloud_enabled=true, effective memory is container_memory + 256."
+  type        = number
+  default     = 512
+
+  validation {
+    condition     = var.qurl_container_memory >= 512 && var.qurl_container_memory <= 122880
+    error_message = "qurl_container_memory must be between 512 and 122880 MB."
+  }
+}
+
 # QURL Grafana Cloud (ADOT Sidecar)
 variable "qurl_grafana_cloud_enabled" {
   description = "Enable Grafana Cloud OTLP export via ADOT sidecar for QURL service"
