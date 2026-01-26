@@ -1087,6 +1087,38 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "events:UntagResource"
         ]
         Resource = "arn:aws:events:${local.region}:${local.account_id}:rule/layerv-nhp-*"
+      },
+      {
+        # ECR lifecycle and repository policy management for terraform-managed repos
+        Sid    = "ECRManagement"
+        Effect = "Allow"
+        Action = [
+          "ecr:PutLifecyclePolicy",
+          "ecr:DeleteLifecyclePolicy",
+          "ecr:SetRepositoryPolicy",
+          "ecr:DeleteRepositoryPolicy"
+        ]
+        Resource = "arn:aws:ecr:${local.region}:${local.account_id}:repository/layerv/*"
+      },
+      {
+        # ECS infrastructure management for terraform-managed resources
+        # Note: ecs:RegisterTaskDefinition and ecs:DeregisterTaskDefinition require Resource="*"
+        # per AWS API requirements (task definitions cannot be scoped by ARN at registration time)
+        Sid    = "ECSInfrastructure"
+        Effect = "Allow"
+        Action = [
+          "ecs:CreateCluster",
+          "ecs:DeleteCluster",
+          "ecs:UpdateCluster",
+          "ecs:CreateService",
+          "ecs:DeleteService",
+          "ecs:UpdateService",
+          "ecs:RegisterTaskDefinition",
+          "ecs:DeregisterTaskDefinition",
+          "ecs:TagResource",
+          "ecs:UntagResource"
+        ]
+        Resource = "*"
       }
     ]
   })
