@@ -3,11 +3,11 @@
 
 terraform {
   backend "s3" {
-    bucket         = "layerv-terraform-state-767397897469"
-    key            = "nhp/sandbox/terraform.tfstate"
-    region         = "us-east-2"
-    dynamodb_table = "terraform-state-lock"
-    encrypt        = true
+    bucket       = "layerv-terraform-state-767397897469"
+    key          = "nhp/sandbox/terraform.tfstate"
+    region       = "us-east-2"
+    use_lockfile = true
+    encrypt      = true
     # Note: Uses AWS_PROFILE env var locally, or IAM role in CI/CD
   }
 }
