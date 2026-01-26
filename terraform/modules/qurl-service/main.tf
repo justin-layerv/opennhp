@@ -33,6 +33,39 @@ resource "aws_ssm_parameter" "image_tag" {
   }
 }
 
+# SSM parameters for ECS cluster/service names - consumed by CI for deployments.
+# This avoids hardcoding infrastructure names in the CI workflow.
+#
+# Note: These use inline path construction (/${var.name_prefix}/...) rather than
+# variables like image_tag_ssm_param because CI only needs to know name_prefix
+# to construct the path. The image_tag param uses a variable because its path
+# pattern is more complex and was established before this convention.
+resource "aws_ssm_parameter" "ecs_cluster" {
+  name        = "/${var.name_prefix}/qurl-ecs-cluster"
+  type        = "String"
+  value       = aws_ecs_cluster.qurl.name
+  description = "ECS cluster name for QURL service (consumed by CI)"
+
+  tags = merge(var.tags, {
+    Name      = "${local.service_name}-ecs-cluster"
+    Component = "qurl-service"
+    Cell      = var.cell_id
+  })
+}
+
+resource "aws_ssm_parameter" "ecs_service" {
+  name        = "/${var.name_prefix}/qurl-ecs-service"
+  type        = "String"
+  value       = aws_ecs_service.qurl.name
+  description = "ECS service name for QURL service (consumed by CI)"
+
+  tags = merge(var.tags, {
+    Name      = "${local.service_name}-ecs-service"
+    Component = "qurl-service"
+    Cell      = var.cell_id
+  })
+}
+
 # ==================== Locals ====================
 
 locals {

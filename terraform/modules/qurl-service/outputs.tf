@@ -54,3 +54,13 @@ output "log_group_name" {
   description = "CloudWatch log group name"
   value       = aws_cloudwatch_log_group.qurl.name
 }
+
+output "ecs_cluster_ssm_param" {
+  description = "SSM parameter name containing ECS cluster name (for CI)"
+  value       = aws_ssm_parameter.ecs_cluster.name
+}
+
+output "ecs_service_ssm_param" {
+  description = "SSM parameter name containing ECS service name (for CI)"
+  value       = aws_ssm_parameter.ecs_service.name
+}
