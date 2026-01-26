@@ -798,7 +798,7 @@ module "qurl_service" {
   internal_service_token_arn = var.qurl_internal_service_token_arn
 
   # KMS
-  logs_kms_key_arn = module.kms.secrets_key_arn
+  logs_kms_key_arn = module.kms.logs_key_arn
 
   # QURL defaults
   cookie_domain        = var.qurl_cookie_domain
@@ -818,6 +818,9 @@ module "qurl_service" {
 
   # CORS
   cors_allowed_origins = var.qurl_cors_allowed_origins
+
+  # Security
+  additional_allowed_hosts = var.qurl_additional_allowed_hosts
 
   # AC Fleet defaults
   default_ac_id   = var.qurl_default_ac_id
@@ -841,6 +844,12 @@ module "qurl_service" {
   # License cache
   license_cache_ttl_seconds = var.qurl_license_cache_ttl_seconds
   license_cache_max_size    = var.qurl_license_cache_max_size
+
+  # QURL Resource Config
+  qurl_default_expires_in_seconds  = var.qurl_default_expires_in_seconds
+  qurl_resource_ttl_buffer_seconds = var.qurl_resource_ttl_buffer_seconds
+  qurl_session_ttl_seconds         = var.qurl_session_ttl_seconds
+  qurl_default_list_limit          = var.qurl_default_list_limit
 
   # Webhooks
   webhooks_enabled                       = var.qurl_webhooks_enabled

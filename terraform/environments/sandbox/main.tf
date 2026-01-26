@@ -70,7 +70,10 @@ module "nhp" {
   server_plugins = var.server_plugins
 
   # QURL Service
-  deploy_qurl_service = var.deploy_qurl_service
+  deploy_qurl_service             = var.deploy_qurl_service
+  qurl_jwt_secret_arn             = var.qurl_jwt_secret_arn
+  qurl_internal_service_token_arn = var.qurl_internal_service_token_arn
+  qurl_additional_allowed_hosts   = var.qurl_additional_allowed_hosts
 
   # QURL plugin configuration
   qurl_config                   = var.qurl_config
@@ -97,6 +100,12 @@ module "nhp" {
   # QURL License Cache
   qurl_license_cache_ttl_seconds = var.qurl_license_cache_ttl_seconds
   qurl_license_cache_max_size    = var.qurl_license_cache_max_size
+
+  # QURL Resource Config
+  qurl_default_expires_in_seconds  = var.qurl_default_expires_in_seconds
+  qurl_resource_ttl_buffer_seconds = var.qurl_resource_ttl_buffer_seconds
+  qurl_session_ttl_seconds         = var.qurl_session_ttl_seconds
+  qurl_default_list_limit          = var.qurl_default_list_limit
 
   # QURL Auth0 JWKS
   qurl_auth0_jwks_cache_ttl_seconds     = var.qurl_auth0_jwks_cache_ttl_seconds

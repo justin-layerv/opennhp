@@ -236,6 +236,18 @@ variable "deploy_qurl_service" {
   type        = bool
 }
 
+variable "qurl_jwt_secret_arn" {
+  description = "Secrets Manager ARN for QURL JWT signing secret"
+  type        = string
+  default     = null
+}
+
+variable "qurl_internal_service_token_arn" {
+  description = "Secrets Manager ARN for QURL internal service token"
+  type        = string
+  default     = null
+}
+
 variable "qurl_link_domain" {
   description = "Domain for QURL access links (e.g., qurl.link)"
   type        = string
@@ -269,6 +281,12 @@ variable "qurl_audit_retention_days" {
 variable "qurl_cors_allowed_origins" {
   description = "Comma-separated list of allowed CORS origins for QURL API"
   type        = string
+}
+
+variable "qurl_additional_allowed_hosts" {
+  description = "Additional allowed hostnames for DNS rebinding protection. ALB DNS and localhost are always included."
+  type        = list(string)
+  default     = []
 }
 
 # QURL Rate Limiting
@@ -455,6 +473,56 @@ variable "qurl_license_cache_max_size" {
   validation {
     condition     = var.qurl_license_cache_max_size > 0 && var.qurl_license_cache_max_size <= 100000
     error_message = "qurl_license_cache_max_size must be between 1 and 100000 entries"
+  }
+}
+
+# QURL Resource Config
+# TTL Relationship:
+# - qurl_default_expires_in_seconds: How long a QURL is valid (user-facing)
+# - qurl_resource_ttl_buffer_seconds: Additional time before DynamoDB cleanup
+# - qurl_session_ttl_seconds: How long session records persist
+
+variable "qurl_default_expires_in_seconds" {
+  description = "Default QURL lifetime in seconds (60s min, 30 days max)"
+  type        = number
+  default     = 86400 # 24 hours
+
+  validation {
+    condition     = var.qurl_default_expires_in_seconds >= 60 && var.qurl_default_expires_in_seconds <= 2592000
+    error_message = "qurl_default_expires_in_seconds must be between 60 (1 minute) and 2592000 (30 days)."
+  }
+}
+
+variable "qurl_resource_ttl_buffer_seconds" {
+  description = "Buffer after expiration for DynamoDB cleanup in seconds (1 hour min, 30 days max)"
+  type        = number
+  default     = 604800 # 7 days
+
+  validation {
+    condition     = var.qurl_resource_ttl_buffer_seconds >= 3600 && var.qurl_resource_ttl_buffer_seconds <= 2592000
+    error_message = "qurl_resource_ttl_buffer_seconds must be between 3600 (1 hour) and 2592000 (30 days)."
+  }
+}
+
+variable "qurl_session_ttl_seconds" {
+  description = "Session TTL in seconds (60s min, 30 days max)"
+  type        = number
+  default     = 86400 # 24 hours
+
+  validation {
+    condition     = var.qurl_session_ttl_seconds >= 60 && var.qurl_session_ttl_seconds <= 2592000
+    error_message = "qurl_session_ttl_seconds must be between 60 (1 minute) and 2592000 (30 days)."
+  }
+}
+
+variable "qurl_default_list_limit" {
+  description = "Default items per page for list endpoints (1-100)"
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.qurl_default_list_limit >= 1 && var.qurl_default_list_limit <= 100
+    error_message = "qurl_default_list_limit must be between 1 and 100."
   }
 }
 

@@ -851,6 +851,12 @@ variable "qurl_cors_allowed_origins" {
   default     = ""
 }
 
+variable "qurl_additional_allowed_hosts" {
+  description = "Additional allowed hostnames for QURL API. ALB DNS and localhost are always included."
+  type        = list(string)
+  default     = []
+}
+
 variable "qurl_container_cpu" {
   description = "CPU units for QURL container (256 = 0.25 vCPU)"
   type        = number
@@ -960,6 +966,56 @@ variable "qurl_license_cache_ttl_seconds" {
 variable "qurl_license_cache_max_size" {
   description = "Maximum number of license cache entries"
   type        = number
+}
+
+# ==================== QURL Resource Config ====================
+# TTL Relationship:
+# - qurl_default_expires_in_seconds: How long a QURL is valid (user-facing)
+# - qurl_resource_ttl_buffer_seconds: Additional time before DynamoDB cleanup
+# - qurl_session_ttl_seconds: How long session records persist
+
+variable "qurl_default_expires_in_seconds" {
+  description = "Default QURL lifetime in seconds (60s min, 30 days max)"
+  type        = number
+  default     = 86400 # 24 hours
+
+  validation {
+    condition     = var.qurl_default_expires_in_seconds >= 60 && var.qurl_default_expires_in_seconds <= 2592000
+    error_message = "qurl_default_expires_in_seconds must be between 60 (1 minute) and 2592000 (30 days)."
+  }
+}
+
+variable "qurl_resource_ttl_buffer_seconds" {
+  description = "Buffer after expiration for DynamoDB cleanup in seconds (1 hour min, 30 days max)"
+  type        = number
+  default     = 604800 # 7 days
+
+  validation {
+    condition     = var.qurl_resource_ttl_buffer_seconds >= 3600 && var.qurl_resource_ttl_buffer_seconds <= 2592000
+    error_message = "qurl_resource_ttl_buffer_seconds must be between 3600 (1 hour) and 2592000 (30 days)."
+  }
+}
+
+variable "qurl_session_ttl_seconds" {
+  description = "Session TTL in seconds (60s min, 30 days max)"
+  type        = number
+  default     = 86400 # 24 hours
+
+  validation {
+    condition     = var.qurl_session_ttl_seconds >= 60 && var.qurl_session_ttl_seconds <= 2592000
+    error_message = "qurl_session_ttl_seconds must be between 60 (1 minute) and 2592000 (30 days)."
+  }
+}
+
+variable "qurl_default_list_limit" {
+  description = "Default items per page for list endpoints (1-100)"
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.qurl_default_list_limit >= 1 && var.qurl_default_list_limit <= 100
+    error_message = "qurl_default_list_limit must be between 1 and 100."
+  }
 }
 
 # ==================== QURL Auth0 JWKS ====================

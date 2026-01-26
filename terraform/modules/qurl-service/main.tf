@@ -38,6 +38,15 @@ resource "aws_ssm_parameter" "image_tag" {
 locals {
   is_prod      = var.environment == "prod"
   service_name = "${var.name_prefix}-${var.cell_id}-qurl-api"
+  # Shorter name for resources with 32-char limit (ALB/NLB names)
+  short_name = "${var.name_prefix}-${var.cell_id}-qurl"
+
+  # Compute allowed hosts: ALB DNS + localhost for health checks + any additional hosts
+  # Note: aws_lb.qurl.dns_name is referenced later, terraform handles the dependency
+  computed_allowed_hosts = join(",", compact(concat(
+    [aws_lb.qurl.dns_name, "localhost", "127.0.0.1"],
+    var.additional_allowed_hosts
+  )))
 
   # Container environment variables
   container_env = concat([
@@ -64,6 +73,7 @@ locals {
     { name = "IP_RATE_BURST", value = tostring(var.ip_rate_burst) },
     { name = "AUDIT_RETENTION_DAYS", value = tostring(var.audit_retention_days) },
     { name = "CORS_ALLOWED_ORIGINS", value = var.cors_allowed_origins },
+    { name = "ALLOWED_HOSTS", value = local.computed_allowed_hosts },
     { name = "LICENSES_TABLE_NAME", value = var.licenses_table_name },
     # Idempotency cache configuration
     { name = "IDEMPOTENCY_CACHE_TTL", value = tostring(var.idempotency_cache_ttl_seconds) },
@@ -75,6 +85,11 @@ locals {
     # License cache configuration
     { name = "LICENSE_CACHE_TTL", value = tostring(var.license_cache_ttl_seconds) },
     { name = "LICENSE_CACHE_MAX_SIZE", value = tostring(var.license_cache_max_size) },
+    # QURL resource configuration
+    { name = "QURL_DEFAULT_EXPIRES_IN", value = tostring(var.qurl_default_expires_in_seconds) },
+    { name = "QURL_RESOURCE_TTL_BUFFER", value = tostring(var.qurl_resource_ttl_buffer_seconds) },
+    { name = "QURL_SESSION_TTL", value = tostring(var.qurl_session_ttl_seconds) },
+    { name = "QURL_DEFAULT_LIST_LIMIT", value = tostring(var.qurl_default_list_limit) },
     ],
     # Redis configuration (for distributed rate limiting)
     var.redis_enabled ? [
@@ -621,7 +636,7 @@ resource "aws_ecs_task_definition" "qurl" {
 # ==================== Application Load Balancer ====================
 
 resource "aws_lb" "qurl" {
-  name               = replace(local.service_name, "_", "-")
+  name               = replace(local.short_name, "_", "-")
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]

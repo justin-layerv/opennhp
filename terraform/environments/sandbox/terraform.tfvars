@@ -187,9 +187,9 @@ deploy_qurl_service = true
 # qurl_auth0_domain = "layerv.us.auth0.com"
 # qurl_auth0_audience = "https://api.layerv.ai"
 
-# Secrets Manager ARNs (create secrets before enabling QURL service)
-# qurl_jwt_secret_arn = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/qurl-jwt-secret"
-# qurl_internal_service_token_arn = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/qurl-internal-service-token"
+# Secrets Manager ARNs
+qurl_jwt_secret_arn             = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/qurl-jwt-secret-i8a8OZ"
+qurl_internal_service_token_arn = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/qurl-internal-service-token-XgjoDM"
 
 # AC Fleet defaults (for QURL resources)
 # qurl_default_ac_id = "ac-sandbox-01"
@@ -212,10 +212,18 @@ qurl_audit_retention_days = 90
 # In production, set to comma-separated list: "https://console.layerv.ai,https://app.layerv.ai"
 qurl_cors_allowed_origins = ""
 
-# Container sizing (defaults are good for dev/sandbox)
-# qurl_container_cpu    = 256   # 0.25 vCPU
-# qurl_container_memory = 512   # 512 MB
-# qurl_desired_count    = 1
+# Additional allowed hosts for DNS rebinding protection
+# ALB DNS name, localhost, and 127.0.0.1 are always included automatically.
+# Add custom domains here (e.g., ["api.qurl.link", "api-sandbox.qurl.link"])
+qurl_additional_allowed_hosts = []
+
+# Container sizing
+# Note: When grafana_cloud_enabled=true, ADOT sidecar requires min 512 CPU and adds 256MB memory.
+# Effective values: CPU=max(container_cpu, 512), Memory=container_memory+256
+# For 512 CPU, effective memory must be 1024-4096, so container_memory >= 768
+qurl_container_cpu    = 256 # 0.25 vCPU (effective: 512 with ADOT)
+qurl_container_memory = 768 # 768 MB (effective: 1024 with ADOT sidecar)
+# qurl_desired_count  = 1
 
 # Idempotency cache configuration
 qurl_idempotency_cache_ttl_seconds        = 300 # 5 minutes
