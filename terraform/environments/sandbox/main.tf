@@ -206,6 +206,18 @@ module "nhp" {
   guardduty_alert_emails = var.guardduty_alert_emails
 }
 
+# ==============================================================================
+# Auth0 Identity Management
+# ==============================================================================
+# Manages Auth0 resources for QURL API authentication.
+
+module "auth0" {
+  source = "../../modules/auth0"
+
+  environment  = var.environment
+  api_audience = var.qurl_auth0_audience
+}
+
 # Re-export outputs
 output "vpc_id" {
   value = module.nhp.vpc_id
@@ -310,4 +322,15 @@ output "demo_gateway_asg_name" {
 # Console repo
 output "console_repo_url" {
   value = module.nhp.console_repo_url
+}
+
+# Auth0 outputs
+output "auth0_api_identifier" {
+  description = "Auth0 API identifier (audience) for JWT validation"
+  value       = module.auth0.api_identifier
+}
+
+output "auth0_backend_service_client_id" {
+  description = "Auth0 backend service M2M client ID for QURL API"
+  value       = module.auth0.backend_service_client_id
 }

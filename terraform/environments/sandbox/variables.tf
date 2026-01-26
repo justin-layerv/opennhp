@@ -526,6 +526,22 @@ variable "qurl_default_list_limit" {
   }
 }
 
+# QURL Auth0 Configuration
+variable "qurl_auth0_domain" {
+  description = "Auth0 domain for JWKS validation (custom domain, e.g., auth.layerv.ai)"
+  type        = string
+}
+
+variable "qurl_auth0_audience" {
+  description = "Auth0 API audience/identifier (e.g., https://api.layerv.xyz)"
+  type        = string
+
+  validation {
+    condition     = can(regex("^https://", var.qurl_auth0_audience))
+    error_message = "qurl_auth0_audience must be an HTTPS URL"
+  }
+}
+
 # QURL Auth0 JWKS
 variable "qurl_auth0_jwks_cache_ttl_seconds" {
   description = "TTL for Auth0 JWKS cache in seconds"
@@ -1011,4 +1027,26 @@ variable "guardduty_alert_emails" {
   description = "List of email addresses to receive GuardDuty security finding alerts"
   type        = list(string)
   default     = []
+}
+
+# ==============================================================================
+# Auth0 Configuration
+# ==============================================================================
+
+variable "auth0_domain" {
+  description = "Auth0 tenant domain (e.g., layerv.us.auth0.com)"
+  type        = string
+  default     = ""
+}
+
+variable "auth0_tf_client_id" {
+  description = "Auth0 M2M client ID for Terraform (Management API access). Required - pass via TF_VAR_auth0_tf_client_id"
+  type        = string
+  sensitive   = true
+}
+
+variable "auth0_tf_client_secret" {
+  description = "Auth0 M2M client secret for Terraform (Management API access). Required - pass via TF_VAR_auth0_tf_client_secret"
+  type        = string
+  sensitive   = true
 }

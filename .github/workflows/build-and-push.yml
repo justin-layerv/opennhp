@@ -417,6 +417,9 @@ jobs:
           TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
           # Grafana Cloud API token for dashboard provisioning
           TF_VAR_grafana_auth: ${{ secrets.GRAFANA_AUTH }}
+          # Auth0 Terraform provider credentials
+          TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
+          TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
         run: |
           set -o pipefail
           terraform plan -no-color 2>&1 | tee plan.txt
@@ -530,6 +533,9 @@ jobs:
           TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
           # Grafana Cloud API token for dashboard provisioning
           TF_VAR_grafana_auth: ${{ secrets.GRAFANA_AUTH }}
+          # Auth0 Terraform provider credentials
+          TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
+          TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
           # Deployment configuration - use commit SHA for immutable deployments
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         run: |
@@ -625,6 +631,9 @@ jobs:
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
           TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
           TF_VAR_grafana_auth: ${{ secrets.GRAFANA_AUTH }}
+          # Auth0 Terraform provider credentials
+          TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
+          TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         run: |
           set -euo pipefail
@@ -681,6 +690,9 @@ jobs:
           TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
           # Grafana Cloud API token for dashboard provisioning
           TF_VAR_grafana_auth: ${{ secrets.GRAFANA_AUTH }}
+          # Auth0 Terraform provider credentials
+          TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
+          TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
           # Deployment configuration - use commit SHA for immutable deployments
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         # Apply the plan generated in previous step (or fresh if no migrations)
