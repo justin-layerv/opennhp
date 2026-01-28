@@ -326,6 +326,7 @@ resource "aws_iam_policy" "dynamodb_read" {
         Sid    = "DynamoDBReadAccess"
         Effect = "Allow"
         Action = [
+          "dynamodb:DescribeTable",
           "dynamodb:GetItem",
           "dynamodb:Query",
           "dynamodb:Scan",
