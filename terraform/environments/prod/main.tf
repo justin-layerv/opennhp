@@ -33,6 +33,8 @@ module "nhp" {
 
   # QURL Service
   deploy_qurl_service             = var.deploy_qurl_service
+  qurl_service_domain             = var.qurl_service_domain
+  qurl_hosted_zone_id             = var.qurl_hosted_zone_id
   qurl_jwt_secret_arn             = var.qurl_jwt_secret_arn
   qurl_internal_service_token_arn = var.qurl_internal_service_token_arn
   qurl_additional_allowed_hosts   = var.qurl_additional_allowed_hosts

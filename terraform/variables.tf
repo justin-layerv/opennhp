@@ -915,12 +915,6 @@ variable "qurl_hosted_zone_id" {
   default     = null
 }
 
-variable "qurl_certificate_arn" {
-  description = "ACM certificate ARN for QURL API HTTPS"
-  type        = string
-  default     = null
-}
-
 variable "qurl_github_repo" {
   description = "GitHub repository for QURL service (for ECR push permissions)"
   type        = string

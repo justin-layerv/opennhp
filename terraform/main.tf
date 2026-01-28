@@ -754,6 +754,46 @@ resource "aws_route53_record" "console_via_ac" {
 # ECS Fargate deployment for the QURL API service
 # Public API protected by Auth0 JWT, no NHP protection needed
 
+# ACM Certificate for QURL API custom domain
+resource "aws_acm_certificate" "qurl_api" {
+  count             = var.deploy_qurl_service && var.qurl_service_domain != null ? 1 : 0
+  domain_name       = var.qurl_service_domain
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-qurl-api-cert"
+  })
+}
+
+# DNS validation records for QURL API certificate
+resource "aws_route53_record" "qurl_api_cert_validation" {
+  for_each = var.deploy_qurl_service && var.qurl_service_domain != null ? {
+    for dvo in aws_acm_certificate.qurl_api[0].domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  } : {}
+
+  allow_overwrite = true
+  name            = each.value.name
+  records         = [each.value.record]
+  ttl             = 60
+  type            = each.value.type
+  zone_id         = var.qurl_hosted_zone_id
+}
+
+# Wait for certificate validation to complete
+resource "aws_acm_certificate_validation" "qurl_api" {
+  count                   = var.deploy_qurl_service && var.qurl_service_domain != null ? 1 : 0
+  certificate_arn         = aws_acm_certificate.qurl_api[0].arn
+  validation_record_fqdns = [for record in aws_route53_record.qurl_api_cert_validation : record.fqdn]
+}
+
 module "qurl_service" {
   count  = var.deploy_qurl_service ? 1 : 0
   source = "./modules/qurl-service"
@@ -827,10 +867,10 @@ module "qurl_service" {
   default_ac_host = var.qurl_default_ac_host
   default_ac_port = var.qurl_default_ac_port
 
-  # Domain
+  # Domain - use certificate created above if domain is configured
   domain_name     = var.qurl_service_domain
   hosted_zone_id  = var.qurl_hosted_zone_id
-  certificate_arn = var.qurl_certificate_arn
+  certificate_arn = var.qurl_service_domain != null ? aws_acm_certificate_validation.qurl_api[0].certificate_arn : null
 
   # Idempotency cache
   idempotency_cache_ttl_seconds        = var.qurl_idempotency_cache_ttl_seconds

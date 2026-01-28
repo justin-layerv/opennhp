@@ -178,10 +178,10 @@ ac_license_key_sha256 = "a762d8af6c774acf2d0560575658062f306cd2e872409ac52cf0baf
 # QURL API service is deployed by default
 deploy_qurl_service = true
 
-# Domain configuration (set these when deploying)
-# qurl_service_domain = "api.qurl.link"
-# qurl_hosted_zone_id = "Z..."  # qurl.link zone ID in layerv-mgmt
-# qurl_certificate_arn = "arn:aws:acm:us-east-2:767397897469:certificate/..."
+# Domain configuration for QURL API
+# Certificate is created automatically via Terraform when domain is set
+qurl_service_domain = "api.layerv.xyz"
+qurl_hosted_zone_id = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone
 
 # Auth0 configuration for JWT validation
 qurl_auth0_domain   = "auth.layerv.ai"

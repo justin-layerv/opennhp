@@ -112,6 +112,18 @@ variable "deploy_qurl_service" {
   default     = false
 }
 
+variable "qurl_service_domain" {
+  description = "Custom domain for QURL API (e.g., api.layerv.ai). When set, creates ACM certificate."
+  type        = string
+  default     = null
+}
+
+variable "qurl_hosted_zone_id" {
+  description = "Route53 hosted zone ID for qurl_service_domain DNS records"
+  type        = string
+  default     = null
+}
+
 variable "qurl_jwt_secret_arn" {
   description = "Secrets Manager ARN for QURL JWT signing secret"
   type        = string
