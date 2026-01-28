@@ -201,8 +201,9 @@ qurl_jwt_secret_arn             = "arn:aws:secretsmanager:us-east-2:767397897469
 qurl_internal_service_token_arn = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/qurl-internal-service-token-XgjoDM"
 
 # AC Fleet defaults (for QURL resources)
-# qurl_default_ac_id = "ac-sandbox-01"
-# qurl_default_ac_host = "ac.nhp.layerv.xyz"
+qurl_default_ac_id   = "ac-sandbox-01"
+qurl_default_ac_host = "ac.nhp.layerv.xyz"
+qurl_default_ac_port = 443
 
 # Domain configuration for QURL links and sites
 qurl_link_domain = "qurl.link"

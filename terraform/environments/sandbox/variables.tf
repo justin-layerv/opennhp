@@ -563,6 +563,33 @@ variable "qurl_auth0_jwks_fetch_timeout_seconds" {
   }
 }
 
+# QURL AC Fleet defaults
+variable "qurl_default_ac_id" {
+  description = "Default AC identifier for new QURL resources"
+  type        = string
+}
+
+variable "qurl_default_ac_host" {
+  description = "Default AC hostname for new QURL resources"
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-zA-Z0-9][a-zA-Z0-9.-]+[a-zA-Z0-9]$", var.qurl_default_ac_host))
+    error_message = "qurl_default_ac_host must be a valid hostname"
+  }
+}
+
+variable "qurl_default_ac_port" {
+  description = "Default AC port for new QURL resources"
+  type        = number
+  default     = 443
+
+  validation {
+    condition     = var.qurl_default_ac_port > 0 && var.qurl_default_ac_port <= 65535
+    error_message = "qurl_default_ac_port must be a valid port number (1-65535)"
+  }
+}
+
 # QURL Webhooks
 variable "qurl_webhooks_enabled" {
   description = "Enable webhook delivery for QURL service"
@@ -1034,9 +1061,13 @@ variable "guardduty_alert_emails" {
 # ==============================================================================
 
 variable "auth0_domain" {
-  description = "Auth0 tenant domain (e.g., layerv.us.auth0.com)"
+  description = "Auth0 tenant domain for Management API (e.g., dev-xxx.us.auth0.com). Required when using Auth0 module."
   type        = string
-  default     = ""
+
+  validation {
+    condition     = can(regex("^[a-zA-Z0-9-]+\\.(us|eu|au|jp)\\.auth0\\.com$", var.auth0_domain))
+    error_message = "auth0_domain must be a valid Auth0 tenant domain (e.g., dev-xxx.us.auth0.com)"
+  }
 }
 
 variable "auth0_tf_client_id" {
@@ -1049,4 +1080,26 @@ variable "auth0_tf_client_secret" {
   description = "Auth0 M2M client secret for Terraform (Management API access). Required - pass via TF_VAR_auth0_tf_client_secret"
   type        = string
   sensitive   = true
+}
+
+# ==============================================================================
+# Auth0 Secret Rotation Configuration
+# ==============================================================================
+
+variable "auth0_enable_rotation" {
+  description = "Enable automatic rotation for Auth0 M2M credentials"
+  type        = bool
+  default     = false
+}
+
+variable "auth0_rotation_days" {
+  description = "Rotate Auth0 M2M credentials every N days"
+  type        = number
+  default     = 30
+}
+
+variable "auth0_management_secret_arn" {
+  description = "Secrets Manager ARN containing Auth0 Management API credentials for rotation Lambda. Required when auth0_enable_rotation is true."
+  type        = string
+  default     = null
 }

@@ -107,9 +107,16 @@ module "nhp" {
   qurl_session_ttl_seconds         = var.qurl_session_ttl_seconds
   qurl_default_list_limit          = var.qurl_default_list_limit
 
-  # QURL Auth0 JWKS
+  # QURL Auth0 Configuration
+  qurl_auth0_domain                     = var.qurl_auth0_domain
+  qurl_auth0_audience                   = var.qurl_auth0_audience
   qurl_auth0_jwks_cache_ttl_seconds     = var.qurl_auth0_jwks_cache_ttl_seconds
   qurl_auth0_jwks_fetch_timeout_seconds = var.qurl_auth0_jwks_fetch_timeout_seconds
+
+  # QURL AC Fleet defaults
+  qurl_default_ac_id   = var.qurl_default_ac_id
+  qurl_default_ac_host = var.qurl_default_ac_host
+  qurl_default_ac_port = var.qurl_default_ac_port
 
   # QURL Webhooks
   qurl_webhooks_enabled                       = var.qurl_webhooks_enabled
@@ -211,11 +218,31 @@ module "nhp" {
 # ==============================================================================
 # Manages Auth0 resources for QURL API authentication.
 
+locals {
+  name_prefix = "layerv-nhp-${var.environment}"
+  common_tags = merge(var.tags, {
+    Project     = "NHP"
+    Application = "nhp"
+    Environment = var.environment
+    ManagedBy   = "terraform"
+    Repository  = "layervai/nhp"
+  })
+}
+
 module "auth0" {
   source = "../../modules/auth0"
 
   environment  = var.environment
+  name_prefix  = local.name_prefix
   api_audience = var.qurl_auth0_audience
+  tags         = local.common_tags
+  # secrets_kms_key_arn - uses AWS managed key (null default)
+
+  # Secret rotation configuration
+  enable_rotation             = var.auth0_enable_rotation
+  rotation_days               = var.auth0_rotation_days
+  auth0_domain                = var.auth0_enable_rotation ? var.auth0_domain : null
+  auth0_management_secret_arn = var.auth0_management_secret_arn
 }
 
 # State migration: module.auth0 was previously deployed with count (as module.auth0[0])
@@ -355,4 +382,19 @@ output "auth0_api_identifier" {
 output "auth0_backend_service_client_id" {
   description = "Auth0 backend service M2M client ID for QURL API"
   value       = module.auth0.backend_service_client_id
+}
+
+output "auth0_backend_credentials_secret_arn" {
+  description = "Secrets Manager ARN for Auth0 backend credentials (client_id, client_secret, audience)"
+  value       = module.auth0.backend_credentials_secret_arn
+}
+
+output "auth0_rotation_lambda_arn" {
+  description = "ARN of the Auth0 secret rotation Lambda (null if rotation disabled)"
+  value       = module.auth0.rotation_lambda_arn
+}
+
+output "auth0_rotation_enabled" {
+  description = "Whether Auth0 secret rotation is enabled"
+  value       = module.auth0.rotation_enabled
 }
