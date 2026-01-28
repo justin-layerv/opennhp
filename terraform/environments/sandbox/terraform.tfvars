@@ -218,9 +218,9 @@ qurl_ip_rate_burst    = 100
 # Audit log retention
 qurl_audit_retention_days = 90
 
-# CORS - empty string means allow all origins (development mode only)
-# In production, set to comma-separated list: "https://console.layerv.ai,https://app.layerv.ai"
-qurl_cors_allowed_origins = ""
+# CORS allowed origins (required)
+# For sandbox, allow console and qurl domains
+qurl_cors_allowed_origins = "https://console.nhp.layerv.xyz,https://qurl.link,https://*.qurl.site"
 
 # Additional allowed hosts for DNS rebinding protection
 # ALB DNS name, localhost, and 127.0.0.1 are always included automatically.
