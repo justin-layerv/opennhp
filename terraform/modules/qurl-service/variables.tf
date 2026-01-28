@@ -180,6 +180,23 @@ variable "alb_access_logs_prefix" {
 
 # ==================== QURL Defaults ====================
 
+variable "api_base_url" {
+  description = <<-EOT
+    Base URL for API responses (Location headers, etc.).
+    If not provided, computed automatically:
+    - With certificate: https://{domain_name}
+    - Without certificate: http://{alb_dns_name}
+    Example: https://api.qurl.link
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.api_base_url == null || can(regex("^https?://", var.api_base_url))
+    error_message = "api_base_url must start with http:// or https:// when provided."
+  }
+}
+
 variable "cookie_domain" {
   description = "Cookie domain for NHP tokens (e.g., .qurl.site)"
   type        = string

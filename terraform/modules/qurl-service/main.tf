@@ -81,12 +81,21 @@ locals {
     var.additional_allowed_hosts
   )))
 
+  # Compute API base URL for Location headers and absolute URLs
+  # Priority: explicit > domain with cert > ALB DNS
+  computed_api_base_url = coalesce(
+    var.api_base_url,
+    var.domain_name != null && var.certificate_arn != null ? "https://${var.domain_name}" : null,
+    "http://${aws_lb.qurl.dns_name}"
+  )
+
   # Container environment variables
   container_env = concat([
     { name = "QURL_ENV", value = local.is_prod ? "production" : "development" },
     { name = "AWS_REGION", value = data.aws_region.current.id },
     { name = "SERVER_HOST", value = "0.0.0.0" },
     { name = "SERVER_PORT", value = tostring(var.container_port) },
+    { name = "API_BASE_URL", value = local.computed_api_base_url },
     { name = "DYNAMODB_TABLE_PREFIX", value = var.dynamodb_table_prefix },
     { name = "AUTH0_DOMAIN", value = var.auth0_domain },
     { name = "AUTH0_AUDIENCE", value = var.auth0_audience },
@@ -664,6 +673,11 @@ resource "aws_ecs_task_definition" "qurl" {
     precondition {
       condition     = var.environment != "prod" || (var.cors_allowed_origins != "" && var.cors_allowed_origins != "*")
       error_message = "Production requires explicit CORS origins, not empty or wildcard."
+    }
+
+    precondition {
+      condition     = var.environment != "prod" || startswith(local.computed_api_base_url, "https://")
+      error_message = "Production requires HTTPS: API_BASE_URL must use https:// in prod environment. Either provide certificate_arn or set api_base_url to an https:// URL."
     }
   }
 }
