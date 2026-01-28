@@ -747,8 +747,11 @@ resource "aws_lb_target_group" "qurl" {
 }
 
 # HTTPS Listener (requires certificate)
+# Note: count uses domain_name (not certificate_arn) because certificate_arn may be
+# computed at apply time (e.g., from aws_acm_certificate_validation), which would
+# cause "Invalid count argument" errors during terraform plan.
 resource "aws_lb_listener" "https" {
-  count = var.certificate_arn != null ? 1 : 0
+  count = var.domain_name != null ? 1 : 0
 
   load_balancer_arn = aws_lb.qurl.arn
   port              = 443
@@ -768,15 +771,15 @@ resource "aws_lb_listener" "https" {
   })
 }
 
-# HTTP Listener (redirect to HTTPS when cert available, otherwise forward)
-# WARNING: When certificate_arn is null, traffic is served over unencrypted HTTP.
+# HTTP Listener (redirect to HTTPS when domain configured, otherwise forward)
+# WARNING: When domain_name is null, traffic is served over unencrypted HTTP.
 # This should only be used during initial setup before certificate provisioning.
-# For production, always provide a certificate_arn.
+# For production, always provide a domain_name (which implies certificate).
 resource "aws_lb_listener" "http" {
   lifecycle {
     precondition {
-      condition     = var.environment != "prod" || var.certificate_arn != null
-      error_message = "Production requires HTTPS: certificate_arn must be provided for prod environment."
+      condition     = var.environment != "prod" || var.domain_name != null
+      error_message = "Production requires HTTPS: domain_name must be provided for prod environment."
     }
   }
 
@@ -785,10 +788,10 @@ resource "aws_lb_listener" "http" {
   protocol          = "HTTP"
 
   default_action {
-    type = var.certificate_arn != null ? "redirect" : "forward"
+    type = var.domain_name != null ? "redirect" : "forward"
 
     dynamic "redirect" {
-      for_each = var.certificate_arn != null ? [1] : []
+      for_each = var.domain_name != null ? [1] : []
       content {
         port        = "443"
         protocol    = "HTTPS"
@@ -796,7 +799,7 @@ resource "aws_lb_listener" "http" {
       }
     }
 
-    target_group_arn = var.certificate_arn == null ? aws_lb_target_group.qurl.arn : null
+    target_group_arn = var.domain_name == null ? aws_lb_target_group.qurl.arn : null
   }
 
   tags = merge(var.tags, {
