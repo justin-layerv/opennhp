@@ -142,6 +142,51 @@ variable "qurl_additional_allowed_hosts" {
   default     = []
 }
 
+variable "qurl_cors_allowed_origins" {
+  description = "Comma-separated list of allowed CORS origins"
+  type        = string
+}
+
+variable "qurl_audit_retention_days" {
+  description = "Number of days to retain audit logs"
+  type        = number
+  default     = 90
+}
+
+variable "qurl_link_domain" {
+  description = "Domain for QURL links (e.g., qurl.link)"
+  type        = string
+}
+
+variable "qurl_site_domain" {
+  description = "Domain for QURL sites (e.g., qurl.site)"
+  type        = string
+}
+
+variable "qurl_owner_rate_limit" {
+  description = "Rate limit for authenticated owner routes (requests per minute)"
+  type        = number
+  default     = 200
+}
+
+variable "qurl_owner_rate_burst" {
+  description = "Burst limit for authenticated owner routes"
+  type        = number
+  default     = 50
+}
+
+variable "qurl_ip_rate_limit" {
+  description = "Rate limit for internal API routes (requests per minute)"
+  type        = number
+  default     = 300
+}
+
+variable "qurl_ip_rate_burst" {
+  description = "Burst limit for internal API routes"
+  type        = number
+  default     = 100
+}
+
 # QURL plugin configuration
 variable "qurl_config" {
   description = "QURL plugin configuration for token resolution"

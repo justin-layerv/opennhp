@@ -38,6 +38,14 @@ module "nhp" {
   qurl_jwt_secret_arn             = var.qurl_jwt_secret_arn
   qurl_internal_service_token_arn = var.qurl_internal_service_token_arn
   qurl_additional_allowed_hosts   = var.qurl_additional_allowed_hosts
+  qurl_cors_allowed_origins       = var.qurl_cors_allowed_origins
+  qurl_audit_retention_days       = var.qurl_audit_retention_days
+  qurl_link_domain                = var.qurl_link_domain
+  qurl_site_domain                = var.qurl_site_domain
+  qurl_owner_rate_limit           = var.qurl_owner_rate_limit
+  qurl_owner_rate_burst           = var.qurl_owner_rate_burst
+  qurl_ip_rate_limit              = var.qurl_ip_rate_limit
+  qurl_ip_rate_burst              = var.qurl_ip_rate_burst
 
   # QURL plugin configuration
   qurl_config                   = var.qurl_config
