@@ -787,19 +787,26 @@ resource "aws_lb_listener" "http" {
   port              = 80
   protocol          = "HTTP"
 
-  default_action {
-    type = var.domain_name != null ? "redirect" : "forward"
-
-    dynamic "redirect" {
-      for_each = var.domain_name != null ? [1] : []
-      content {
+  # When domain is configured, redirect HTTP to HTTPS
+  # When no domain, forward directly to target group (HTTP only mode)
+  dynamic "default_action" {
+    for_each = var.domain_name != null ? [1] : []
+    content {
+      type = "redirect"
+      redirect {
         port        = "443"
         protocol    = "HTTPS"
         status_code = "HTTP_301"
       }
     }
+  }
 
-    target_group_arn = var.domain_name == null ? aws_lb_target_group.qurl.arn : null
+  dynamic "default_action" {
+    for_each = var.domain_name == null ? [1] : []
+    content {
+      type             = "forward"
+      target_group_arn = aws_lb_target_group.qurl.arn
+    }
   }
 
   tags = merge(var.tags, {
