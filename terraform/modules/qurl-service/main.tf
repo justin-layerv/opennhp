@@ -74,10 +74,11 @@ locals {
   # Shorter name for resources with 32-char limit (ALB/NLB names)
   short_name = "${var.name_prefix}-${var.cell_id}-qurl"
 
-  # Compute allowed hosts: ALB DNS + localhost for health checks + any additional hosts
+  # Compute allowed hosts: ALB DNS + domain + localhost for health checks + any additional hosts
   # Note: aws_lb.qurl.dns_name is referenced later, terraform handles the dependency
   computed_allowed_hosts = join(",", compact(concat(
     [aws_lb.qurl.dns_name, "localhost", "127.0.0.1"],
+    var.domain_name != null ? [var.domain_name] : [],
     var.additional_allowed_hosts
   )))
 
