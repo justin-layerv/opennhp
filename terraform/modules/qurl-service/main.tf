@@ -503,8 +503,9 @@ resource "aws_ecs_task_definition" "qurl" {
 
       # ECS container health check - uses liveness probe (fast, no dependency checks)
       # /health/live only verifies the service is running, not that dependencies are healthy
+      # Note: Container uses Alpine with wget, not curl
       healthCheck = {
-        command     = ["CMD-SHELL", "curl -f http://localhost:${var.container_port}/health/live || exit 1"]
+        command     = ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:${var.container_port}/health/live || exit 1"]
         interval    = 30
         timeout     = 5
         retries     = 3
