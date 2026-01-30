@@ -102,6 +102,10 @@ resource "auth0_client_grant" "backend_qurl_api" {
 # ==============================================================================
 # Manages the client secret for the M2M application, enabling rotation via Terraform.
 # The secret can be rotated by running `terraform apply` - Auth0 will generate a new one.
+#
+# Note: If client_secret is empty in state, remove this resource from state and re-apply:
+#   terraform state rm 'module.auth0.auth0_client_credentials.backend_service'
+#   terraform state rm 'module.auth0.aws_secretsmanager_secret_version.auth0_backend[0]'
 
 resource "auth0_client_credentials" "backend_service" {
   client_id             = auth0_client.backend_service.id
