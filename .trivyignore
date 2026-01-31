@@ -12,10 +12,6 @@ CVE-2025-9086
 # gpgv - low priority
 CVE-2022-3219
 
-# gnupg/gpg - waiting for Ubuntu patches (HIGH severity)
-# https://avd.aquasec.com/nvd/cve-2025-68973
-CVE-2025-68973
-
 # libgcrypt20 - waiting for Ubuntu patches
 CVE-2024-2236
 
@@ -36,3 +32,12 @@ CVE-2025-66382
 
 # sigstore/timestamp-authority - no fix available yet (v1.2.9 is latest)
 CVE-2025-66564
+
+# Go stdlib - published 2026-01-28, after Go 1.24.12 release (2026-01-15)
+# Waiting for Go 1.24.13 or 1.25.7
+# https://avd.aquasec.com/nvd/cve-2025-61726
+CVE-2025-61726
+
+# Go stdlib - archive/zip CPU exhaustion
+# https://avd.aquasec.com/nvd/cve-2025-61728
+CVE-2025-61728
