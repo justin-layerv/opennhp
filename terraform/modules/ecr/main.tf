@@ -2,6 +2,18 @@
 # Creates ECR repositories in primary account (sandbox)
 # For prod account, references cross-account ECR
 #
+# ==================== GitHub Actions CI/CD Permissions ====================
+#
+# This module manages ALL GitHub Actions CI/CD IAM permissions, not just ECR.
+# The GitHub Actions role created here is used by CI workflows for:
+# - ECR push (container images)
+# - Terraform state access (S3/DynamoDB)
+# - Infrastructure deployment (EC2, ECS, CloudFront, S3, etc.)
+# - QURL link static site (CloudFront, S3, ACM)
+#
+# This consolidation avoids circular dependencies between modules and keeps
+# all CI/CD permissions in one place for easier auditing.
+#
 # ==================== Organization-Managed Resources ====================
 #
 # Some organizations manage certain IAM resources centrally via Service Control
@@ -1366,6 +1378,137 @@ resource "aws_iam_role_policy_attachment" "qurl_ecs_deploy" {
 
   role       = aws_iam_role.github_actions.name
   policy_arn = aws_iam_policy.qurl_ecs_deploy[0].arn
+}
+
+# QURL Link static site permissions
+# Allows CI to create/manage CloudFront distribution and S3 bucket for qurl.link redirect page
+#
+# Wildcard usage explanation:
+# - CloudFront uses Resource="*" because CloudFront resources are global and distribution
+#   ARNs are not known at policy creation time. Actions are scoped to specific operations.
+# - S3 bucket ARN uses wildcard pattern "layerv-nhp-*-qurl-link" to support multiple
+#   environments (sandbox, prod) from the same policy structure.
+# - ACM uses Resource="*" with region condition because certificate ARNs are not known
+#   at policy creation time, but is scoped to us-east-1 (CloudFront requirement).
+resource "aws_iam_policy" "qurl_link_static" {
+  name        = "nhp-${var.environment}-github-actions-qurl-link"
+  description = "CloudFront and S3 permissions for QURL link redirect page (${var.environment})"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "CloudFrontDistribution"
+        Effect = "Allow"
+        Action = [
+          "cloudfront:CreateDistribution",
+          "cloudfront:GetDistribution",
+          "cloudfront:GetDistributionConfig",
+          "cloudfront:UpdateDistribution",
+          "cloudfront:DeleteDistribution",
+          "cloudfront:TagResource",
+          "cloudfront:UntagResource",
+          "cloudfront:ListTagsForResource"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "CloudFrontOriginAccessControl"
+        Effect = "Allow"
+        Action = [
+          "cloudfront:CreateOriginAccessControl",
+          "cloudfront:GetOriginAccessControl",
+          "cloudfront:UpdateOriginAccessControl",
+          "cloudfront:DeleteOriginAccessControl",
+          "cloudfront:ListOriginAccessControls"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "CloudFrontResponseHeadersPolicy"
+        Effect = "Allow"
+        Action = [
+          "cloudfront:CreateResponseHeadersPolicy",
+          "cloudfront:GetResponseHeadersPolicy",
+          "cloudfront:UpdateResponseHeadersPolicy",
+          "cloudfront:DeleteResponseHeadersPolicy",
+          "cloudfront:ListResponseHeadersPolicies"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "CloudFrontCachePolicy"
+        Effect = "Allow"
+        Action = [
+          "cloudfront:GetCachePolicy",
+          "cloudfront:ListCachePolicies"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "S3QURLLinkBucket"
+        Effect = "Allow"
+        Action = [
+          "s3:CreateBucket",
+          "s3:DeleteBucket",
+          "s3:GetBucketPolicy",
+          "s3:PutBucketPolicy",
+          "s3:DeleteBucketPolicy",
+          "s3:GetBucketAcl",
+          "s3:PutBucketAcl",
+          "s3:GetBucketCORS",
+          "s3:PutBucketCORS",
+          "s3:GetBucketWebsite",
+          "s3:PutBucketWebsite",
+          "s3:DeleteBucketWebsite",
+          "s3:GetBucketVersioning",
+          "s3:PutBucketVersioning",
+          "s3:GetBucketPublicAccessBlock",
+          "s3:PutBucketPublicAccessBlock",
+          "s3:GetBucketOwnershipControls",
+          "s3:PutBucketOwnershipControls",
+          "s3:GetEncryptionConfiguration",
+          "s3:PutEncryptionConfiguration",
+          "s3:GetBucketTagging",
+          "s3:PutBucketTagging",
+          "s3:GetBucketLogging",
+          "s3:PutBucketLogging",
+          "s3:ListBucket",
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject"
+        ]
+        Resource = [
+          "arn:aws:s3:::layerv-nhp-*-qurl-link",
+          "arn:aws:s3:::layerv-nhp-*-qurl-link/*"
+        ]
+      },
+      {
+        # ACM certificates for CloudFront must be in us-east-1
+        Sid    = "ACMUsEast1"
+        Effect = "Allow"
+        Action = [
+          "acm:RequestCertificate",
+          "acm:DescribeCertificate",
+          "acm:DeleteCertificate",
+          "acm:ListCertificates",
+          "acm:ListTagsForCertificate",
+          "acm:AddTagsToCertificate"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:RequestedRegion" = "us-east-1"
+          }
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "qurl_link_static" {
+  role       = aws_iam_role.github_actions.name
+  policy_arn = aws_iam_policy.qurl_link_static.arn
 }
 
 # ============================================================================
