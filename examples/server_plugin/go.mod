@@ -1,8 +1,6 @@
 module github.com/OpenNHP/opennhp/examples/server_plugin
 
-go 1.24.3
-
-toolchain go1.24.5
+go 1.24.12
 
 require (
 	github.com/OpenNHP/opennhp/nhp v0.6.0

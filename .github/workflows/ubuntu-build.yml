@@ -9,6 +9,9 @@ on:
   pull_request:
     branches: [ "main" ]
 
+env:
+  GO_VERSION: '1.24.12'
+
 # Restrict default permissions for security
 permissions:
   contents: read
@@ -39,7 +42,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
       with:
-        go-version: '1.24'
+        go-version: ${{ env.GO_VERSION }}
 
     - name: Build
       run: make
@@ -56,7 +59,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
       with:
-        go-version: '1.24'
+        go-version: ${{ env.GO_VERSION }}
 
     - name: Install test dependencies
       run: cd tests/local && go mod tidy
