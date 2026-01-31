@@ -230,6 +230,37 @@ variable "qurl_service_token_secret_arn" {
   default     = null
 }
 
+# QURL Link redirect page (CloudFront + S3)
+variable "deploy_qurl_link" {
+  description = "Deploy the QURL link redirect page"
+  type        = bool
+  default     = false
+}
+
+variable "qurl_link_frontend_domain" {
+  description = "Domain for the QURL link redirect page (e.g., link.nhp.layerv.xyz)"
+  type        = string
+  default     = null
+}
+
+variable "qurl_link_hosted_zone_id" {
+  description = "Route53 hosted zone ID for the QURL link domain"
+  type        = string
+  default     = null
+}
+
+variable "qurl_link_external_dns" {
+  description = "When true, Route53 records for qurl_link are managed externally (e.g., via AWS CLI in layerv-mgmt)"
+  type        = bool
+  default     = false
+}
+
+variable "qurl_link_enable_access_logs" {
+  description = "Enable CloudFront access logging for QURL link redirect page"
+  type        = bool
+  default     = false
+}
+
 # QURL Service deployment
 variable "deploy_qurl_service" {
   description = "Deploy the QURL API service on ECS Fargate"

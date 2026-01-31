@@ -710,6 +710,15 @@ resource "aws_iam_policy" "terraform_read" {
         Resource = "*"
       },
       {
+        Sid    = "CloudFrontRead"
+        Effect = "Allow"
+        Action = [
+          "cloudfront:Get*",
+          "cloudfront:List*"
+        ]
+        Resource = "*"
+      },
+      {
         Sid    = "ECRRead"
         Effect = "Allow"
         Action = [

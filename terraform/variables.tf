@@ -497,6 +497,48 @@ variable "qurl_service_token_secret_arn" {
   default     = null
 }
 
+# ==================== QURL Link Redirect Page ====================
+
+variable "deploy_qurl_link" {
+  description = "Deploy the QURL link redirect page (CloudFront + S3)"
+  type        = bool
+  default     = false
+}
+
+variable "qurl_link_frontend_domain" {
+  description = "Domain for the QURL link redirect page (e.g., qurl.link). Required when deploy_qurl_link=true."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.qurl_link_frontend_domain == null || can(regex("^[a-z0-9][a-z0-9.-]*[a-z0-9]$", var.qurl_link_frontend_domain))
+    error_message = "qurl_link_frontend_domain must be a valid domain name"
+  }
+}
+
+variable "qurl_link_hosted_zone_id" {
+  description = "Route53 hosted zone ID for the QURL link domain. Required when deploy_qurl_link=true."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.qurl_link_hosted_zone_id == null || can(regex("^Z[A-Z0-9]+$", var.qurl_link_hosted_zone_id))
+    error_message = "qurl_link_hosted_zone_id must be a valid Route53 zone ID (starts with Z)"
+  }
+}
+
+variable "qurl_link_external_dns" {
+  description = "When true, Route53 records for qurl_link are managed externally (e.g., via AWS CLI in a different account)"
+  type        = bool
+  default     = false
+}
+
+variable "qurl_link_enable_access_logs" {
+  description = "Enable CloudFront access logging for QURL link redirect page"
+  type        = bool
+  default     = false
+}
+
 variable "traefik_plugins" {
   description = <<-EOT
     Map of Traefik plugins to deploy.

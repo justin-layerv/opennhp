@@ -223,3 +223,25 @@ output "nhp_keypair_policy_arn" {
   description = "IAM policy ARN for NHP keypair access"
   value       = module.nhp_keypair.server_keypair_policy_arn
 }
+
+# QURL Link (when external_dns=true, these are needed for manual DNS setup)
+output "qurl_link_acm_validation_records" {
+  description = "ACM certificate validation DNS records (create in Route53 when qurl_link_external_dns=true)"
+  value = var.deploy_qurl_link && var.qurl_link_external_dns ? {
+    for dvo in aws_acm_certificate.qurl_link[0].domain_validation_options : dvo.domain_name => {
+      name  = dvo.resource_record_name
+      type  = dvo.resource_record_type
+      value = dvo.resource_record_value
+    }
+  } : null
+}
+
+output "qurl_link_cloudfront_domain" {
+  description = "CloudFront distribution domain name for qurl.link alias record"
+  value       = var.deploy_qurl_link ? module.qurl_link[0].cloudfront_domain_name : null
+}
+
+output "qurl_link_cloudfront_zone_id" {
+  description = "CloudFront distribution hosted zone ID for Route53 alias record"
+  value       = var.deploy_qurl_link ? module.qurl_link[0].cloudfront_hosted_zone_id : null
+}

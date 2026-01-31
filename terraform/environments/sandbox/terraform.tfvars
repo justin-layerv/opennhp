@@ -206,7 +206,7 @@ qurl_default_ac_host = "ac.nhp.layerv.xyz"
 qurl_default_ac_port = 443
 
 # Domain configuration for QURL links and sites
-qurl_link_domain = "qurl.link"
+qurl_link_domain = "qurl.link" # Uses cross-account Route53 access to layerv-mgmt
 qurl_site_domain = "qurl.site"
 
 # Rate limiting (requests per minute)
@@ -288,6 +288,35 @@ grafana_dashboards_enabled        = true
 grafana_url                       = "https://layervai.grafana.net"
 grafana_prometheus_datasource_uid = "grafanacloud-prom"
 grafana_tempo_datasource_uid      = "grafanacloud-traces"
+
+# ==============================================================================
+# QURL Plugin Configuration (NHP Server)
+# Enables qurl.link → qurl.site authentication flow in NHP Server
+# ==============================================================================
+# QURL plugin handles token resolution: qurl.link SPA redirects to /plugins/qurl
+# which validates tokens via QURL API and performs NHP knock
+qurl_config = {
+  enabled                 = true
+  api_url                 = "https://api.layerv.xyz"
+  allowed_redirect_domain = "qurl.site"
+  api_timeout             = 10
+  max_idle_conns          = 10
+  max_idle_conns_per_host = 5
+  idle_conn_timeout       = 30
+}
+
+# Uses same secret as QURL service for internal API auth
+qurl_service_token_secret_arn = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/qurl-internal-service-token-XgjoDM"
+
+# ==============================================================================
+# QURL Link Redirect Page
+# Hosts the redirect page that extracts tokens and sends users to NHP Server
+# Uses qurl.link domain (hosted zone in layerv-mgmt, DNS records created via AWS CLI)
+# ==============================================================================
+deploy_qurl_link          = true
+qurl_link_frontend_domain = "qurl.link"
+qurl_link_hosted_zone_id  = "Z0693053DKJ8S3XN9WPG" # qurl.link zone in layerv-mgmt
+qurl_link_external_dns    = true                   # Route53 records managed via AWS CLI in layerv-mgmt
 
 # ==============================================================================
 # QURL Router Plugin Configuration

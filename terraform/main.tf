@@ -12,7 +12,7 @@ terraform {
     aws = {
       source                = "hashicorp/aws"
       version               = "~> 6.27"
-      configuration_aliases = [aws.us_east_1]
+      configuration_aliases = [aws.us_east_1, aws.route53_mgmt]
     }
     random = {
       source  = "hashicorp/random"
@@ -941,4 +941,118 @@ module "grafana_dashboards" {
   tempo_datasource_uid      = var.grafana_tempo_datasource_uid
 
   tags = local.common_tags
+}
+
+# ==================== QURL Link Redirect Page ====================
+# Hosts the redirect page that extracts access tokens and sends users
+# to the NHP Server QURL plugin for authentication.
+# Flow: User visits link.domain/#at_xxx → NHP Server → NHP knock → Protected resource
+
+# Validate required variables when deploy_qurl_link is enabled
+check "qurl_link_required_variables" {
+  assert {
+    condition = (
+      var.deploy_qurl_link == false || (
+        var.qurl_link_frontend_domain != null &&
+        var.qurl_link_hosted_zone_id != null
+      )
+    )
+    error_message = <<-EOT
+      When deploy_qurl_link = true, the following variables are required:
+        - qurl_link_frontend_domain (e.g., "qurl.link")
+        - qurl_link_hosted_zone_id (e.g., "Z0693053DKJ8S3XN9WPG")
+    EOT
+  }
+}
+
+# ACM Certificate for QURL Link CloudFront (must be in us-east-1)
+resource "aws_acm_certificate" "qurl_link" {
+  count             = var.deploy_qurl_link ? 1 : 0
+  provider          = aws.us_east_1
+  domain_name       = var.qurl_link_frontend_domain
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-qurl-link-cert"
+  })
+}
+
+# ACM validation records for QURL Link certificate
+# When qurl_link_external_dns=true, records are created manually via AWS CLI in layerv-mgmt
+resource "aws_route53_record" "qurl_link_cert_validation" {
+  for_each = var.deploy_qurl_link && !var.qurl_link_external_dns ? {
+    for dvo in aws_acm_certificate.qurl_link[0].domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  } : {}
+
+  provider = aws.route53_mgmt
+
+  allow_overwrite = true
+  name            = each.value.name
+  records         = [each.value.record]
+  ttl             = 60
+  type            = each.value.type
+  zone_id         = var.qurl_link_hosted_zone_id
+}
+
+# ACM validation - waits for certificate to be validated
+# When external_dns=true, validation records are created manually and we just wait
+resource "aws_acm_certificate_validation" "qurl_link" {
+  count                   = var.deploy_qurl_link ? 1 : 0
+  provider                = aws.us_east_1
+  certificate_arn         = aws_acm_certificate.qurl_link[0].arn
+  validation_record_fqdns = var.qurl_link_external_dns ? null : [for record in aws_route53_record.qurl_link_cert_validation : record.fqdn]
+}
+
+module "qurl_link" {
+  count  = var.deploy_qurl_link ? 1 : 0
+  source = "./modules/qurl-link"
+
+  domain_name         = var.qurl_link_frontend_domain
+  bucket_name         = "${local.name_prefix}-qurl-link"
+  acm_certificate_arn = aws_acm_certificate_validation.qurl_link[0].certificate_arn
+  nhp_resolve_url     = "https://ac.${var.domain_name}/plugins/qurl"
+  enable_access_logs  = var.qurl_link_enable_access_logs
+
+  tags = local.common_tags
+}
+
+# Route53 alias records for QURL Link CloudFront distribution
+# When qurl_link_external_dns=true, these records are created manually via AWS CLI in layerv-mgmt
+resource "aws_route53_record" "qurl_link" {
+  count    = var.deploy_qurl_link && !var.qurl_link_external_dns ? 1 : 0
+  provider = aws.route53_mgmt
+
+  zone_id = var.qurl_link_hosted_zone_id
+  name    = var.qurl_link_frontend_domain
+  type    = "A"
+
+  alias {
+    name                   = module.qurl_link[0].cloudfront_domain_name
+    zone_id                = module.qurl_link[0].cloudfront_hosted_zone_id
+    evaluate_target_health = false
+  }
+}
+
+# IPv6 AAAA record for CloudFront (is_ipv6_enabled=true on distribution)
+resource "aws_route53_record" "qurl_link_ipv6" {
+  count    = var.deploy_qurl_link && !var.qurl_link_external_dns ? 1 : 0
+  provider = aws.route53_mgmt
+
+  zone_id = var.qurl_link_hosted_zone_id
+  name    = var.qurl_link_frontend_domain
+  type    = "AAAA"
+
+  alias {
+    name                   = module.qurl_link[0].cloudfront_domain_name
+    zone_id                = module.qurl_link[0].cloudfront_hosted_zone_id
+    evaluate_target_health = false
+  }
 }

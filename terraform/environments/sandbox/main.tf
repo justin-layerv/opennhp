@@ -5,8 +5,9 @@ module "nhp" {
   source = "../.."
 
   providers = {
-    aws           = aws
-    aws.us_east_1 = aws.us_east_1
+    aws              = aws
+    aws.us_east_1    = aws.us_east_1
+    aws.route53_mgmt = aws.route53_mgmt
   }
 
   environment            = var.environment
@@ -88,6 +89,13 @@ module "nhp" {
   # QURL plugin configuration
   qurl_config                   = var.qurl_config
   qurl_service_token_secret_arn = var.qurl_service_token_secret_arn
+
+  # QURL Link redirect page
+  deploy_qurl_link             = var.deploy_qurl_link
+  qurl_link_frontend_domain    = var.qurl_link_frontend_domain
+  qurl_link_hosted_zone_id     = var.qurl_link_hosted_zone_id
+  qurl_link_external_dns       = var.qurl_link_external_dns
+  qurl_link_enable_access_logs = var.qurl_link_enable_access_logs
 
   # QURL Router plugin (Traefik)
   qurl_router_enabled            = var.qurl_router_enabled
