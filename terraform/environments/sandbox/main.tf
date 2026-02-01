@@ -229,6 +229,48 @@ module "nhp" {
 
   # Security alerting
   guardduty_alert_emails = var.guardduty_alert_emails
+
+  # Centralized certificate management
+  centralized_cert_enabled       = var.centralized_cert_enabled
+  centralized_cert_secret_arn    = var.centralized_cert_enabled ? module.acme_cert[0].certificate_secret_arn : null
+  centralized_cert_domains       = var.centralized_cert_enabled ? var.centralized_cert_domains : []
+  acme_lambda_function_name      = var.centralized_cert_enabled ? module.acme_cert[0].lambda_function_name : ""
+}
+
+# ==============================================================================
+# Centralized TLS Certificate Management
+# ==============================================================================
+# Manages TLS certificates for AC fleet using Let's Encrypt.
+# Certificates are stored in Secrets Manager and fetched by ACs on boot.
+# This scales to thousands of ACs without hitting Let's Encrypt rate limits.
+#
+# NOTE: This is an interim solution. For production at scale, consider
+# migrating to HashiCorp Vault PKI for:
+# - Short-lived certificates (hours vs 90 days)
+# - Internal CA (no external dependencies)
+# - Better revocation support
+
+module "acme_cert" {
+  count  = var.centralized_cert_enabled ? 1 : 0
+  source = "../../modules/acme-cert"
+
+  name_prefix         = local.name_prefix
+  environment         = var.environment
+  domains             = var.centralized_cert_domains
+  hosted_zone_id      = var.qurl_hosted_zone_id # layerv.xyz zone
+  acme_email          = var.acme_email
+  use_production_acme = var.use_production_acme
+  kms_key_arn         = module.nhp.secrets_kms_key_arn
+
+  # Renewal configuration
+  renewal_days_before_expiry = 30
+  renewal_schedule           = "rate(1 day)"
+
+  # Alerting
+  alert_emails           = var.guardduty_alert_emails
+  existing_sns_topic_arn = module.nhp.sns_topic_arn
+
+  tags = local.common_tags
 }
 
 # ==============================================================================

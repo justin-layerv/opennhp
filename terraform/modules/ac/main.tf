@@ -484,6 +484,15 @@ resource "aws_iam_role_policy" "ac" {
           Resource = [var.qurl_service_token_secret_arn]
         }
       ] : [],
+      # Conditional: Centralized TLS certificate access (for scalable cert management)
+      var.centralized_cert_secret_arn != null ? [
+        {
+          Sid      = "SecretsReadTLSCertificate"
+          Effect   = "Allow"
+          Action   = ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"]
+          Resource = [var.centralized_cert_secret_arn]
+        }
+      ] : [],
       # Conditional: KMS for Secrets Manager (only when KMS key is configured)
       var.secrets_kms_key_arn != null ? [
         {
@@ -615,6 +624,11 @@ locals {
     qurl_router_proxy_timeout      = var.qurl_router_config != null ? var.qurl_router_config.proxy_timeout : 30
     qurl_router_cache_shards       = var.qurl_router_config != null ? var.qurl_router_config.cache_shards : 16
     qurl_service_token_secret_arn  = var.qurl_service_token_secret_arn
+    # Centralized certificate management (for scalable AC deployments)
+    centralized_cert_enabled       = var.centralized_cert_enabled
+    centralized_cert_secret_arn    = var.centralized_cert_secret_arn != null ? var.centralized_cert_secret_arn : ""
+    centralized_cert_domains       = var.centralized_cert_domains
+    acme_lambda_function_name      = var.acme_lambda_function_name
   }) : null # Validation failed - this branch never executes (tobool throws first)
 }
 
@@ -669,6 +683,16 @@ resource "aws_launch_template" "ac" {
 
   lifecycle {
     create_before_destroy = true
+
+    precondition {
+      condition     = !var.centralized_cert_enabled || length(var.centralized_cert_domains) > 0
+      error_message = "centralized_cert_domains must not be empty when centralized_cert_enabled is true."
+    }
+
+    precondition {
+      condition     = !var.centralized_cert_enabled || (var.centralized_cert_secret_arn != null && var.centralized_cert_secret_arn != "")
+      error_message = "centralized_cert_secret_arn must be provided when centralized_cert_enabled is true."
+    }
   }
 }
 

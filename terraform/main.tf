@@ -540,6 +540,12 @@ module "ac" {
     cache_shards       = var.qurl_router_cache_shards
   } : null
   qurl_service_token_secret_arn = var.deploy_qurl_service && var.qurl_router_enabled ? var.qurl_internal_service_token_arn : null
+
+  # Centralized certificate management (for scalable AC deployments)
+  centralized_cert_enabled    = var.centralized_cert_enabled
+  centralized_cert_secret_arn = var.centralized_cert_secret_arn
+  centralized_cert_domains    = var.centralized_cert_domains
+  acme_lambda_function_name   = var.acme_lambda_function_name
 }
 
 # Demo Gateway Module - nginx + certbot for qurl.link routing to NHP Server plugins

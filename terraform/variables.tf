@@ -313,6 +313,34 @@ variable "use_production_acme" {
   default     = null
 }
 
+# ==================== Centralized Certificate Management ====================
+# When enabled, ACs fetch TLS certificates from Secrets Manager instead of
+# requesting individual certificates via ACME. This scales to thousands of ACs.
+
+variable "centralized_cert_enabled" {
+  description = "Enable centralized certificate management for AC fleet. When true, ACs fetch cert from Secrets Manager instead of per-instance ACME."
+  type        = bool
+  default     = false
+}
+
+variable "centralized_cert_secret_arn" {
+  description = "Secrets Manager ARN containing TLS certificate (from acme-cert module). Required when centralized_cert_enabled=true."
+  type        = string
+  default     = null
+}
+
+variable "centralized_cert_domains" {
+  description = "List of domains covered by the centralized certificate. Used to configure Traefik TLS."
+  type        = list(string)
+  default     = []
+}
+
+variable "acme_lambda_function_name" {
+  description = "Name of the ACME certificate Lambda function (for error messages in AC user_data)."
+  type        = string
+  default     = ""
+}
+
 # ==================== Terraform State Configuration ====================
 
 variable "terraform_state_bucket" {

@@ -1147,3 +1147,25 @@ variable "auth0_management_secret_arn" {
   type        = string
   default     = null
 }
+
+# ==============================================================================
+# Centralized TLS Certificate Management
+# ==============================================================================
+# When enabled, ACs fetch TLS certificates from Secrets Manager instead of
+# requesting individual certificates via ACME. This scales to thousands of ACs
+# without hitting Let's Encrypt rate limits.
+#
+# NOTE: This is an interim solution. For production at scale, consider migrating
+# to HashiCorp Vault PKI for short-lived certificates and better revocation.
+
+variable "centralized_cert_enabled" {
+  description = "Enable centralized certificate management for AC fleet"
+  type        = bool
+  default     = false
+}
+
+variable "centralized_cert_domains" {
+  description = "Domains for centralized TLS certificate (e.g., ['nhp.layerv.xyz', '*.nhp.layerv.xyz'])"
+  type        = list(string)
+  default     = []
+}

@@ -245,3 +245,17 @@ output "qurl_link_cloudfront_zone_id" {
   description = "CloudFront distribution hosted zone ID for Route53 alias record"
   value       = var.deploy_qurl_link ? module.qurl_link[0].cloudfront_hosted_zone_id : null
 }
+
+# ============================================================================
+# KMS and Alerting Outputs
+# ============================================================================
+
+output "secrets_kms_key_arn" {
+  description = "KMS key ARN for Secrets Manager encryption"
+  value       = module.kms.secrets_key_arn
+}
+
+output "sns_topic_arn" {
+  description = "SNS topic ARN for alerts"
+  value       = module.monitoring.sns_topic_arn
+}

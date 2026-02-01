@@ -109,6 +109,26 @@ additional_tls_domains = ["apps.layerv.xyz"]
 use_production_acme = true
 
 # ==============================================================================
+# Centralized TLS Certificate Management
+# ==============================================================================
+# When enabled, ACs fetch TLS certificates from Secrets Manager instead of
+# requesting individual certificates via ACME. This scales to thousands of ACs
+# without hitting Let's Encrypt rate limits.
+#
+# NOTE: This is an interim solution. For production at scale, consider migrating
+# to HashiCorp Vault PKI for short-lived certificates and better revocation.
+#
+# To enable:
+# 1. Set centralized_cert_enabled = true
+# 2. Set centralized_cert_domains to the domains for the certificate
+# 3. Run: terraform apply (creates the acme-cert module)
+# 4. Invoke Lambda to generate cert: aws lambda invoke --function-name layerv-nhp-sandbox-acme-cert-manager --payload '{"type":"force_renew"}' /dev/stdout
+# 5. Refresh AC instances to pick up the new cert
+
+centralized_cert_enabled = false
+centralized_cert_domains = ["nhp.layerv.xyz", "*.nhp.layerv.xyz", "apps.layerv.xyz", "*.apps.layerv.xyz"]
+
+# ==============================================================================
 # Demo Gateway Configuration
 # Routes qurl.link/{appId} to NHP Server passcode plugin for demo flow
 # ==============================================================================

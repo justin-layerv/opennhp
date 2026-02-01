@@ -193,6 +193,37 @@ variable "additional_tls_domains" {
   default     = []
 }
 
+# ============================================================================
+# Centralized Certificate Management
+# When enabled, ACs fetch TLS certificates from Secrets Manager instead of
+# requesting individual certificates via ACME. This scales to thousands of ACs
+# without hitting Let's Encrypt rate limits.
+# ============================================================================
+
+variable "centralized_cert_enabled" {
+  description = "Enable centralized certificate management. When true, ACs fetch TLS cert from Secrets Manager instead of using per-instance ACME."
+  type        = bool
+  default     = false
+}
+
+variable "centralized_cert_secret_arn" {
+  description = "ARN of Secrets Manager secret containing TLS certificate (from acme-cert module). Required when centralized_cert_enabled=true."
+  type        = string
+  default     = null
+}
+
+variable "centralized_cert_domains" {
+  description = "List of domains covered by the centralized certificate. Used to configure Traefik TLS. Required when centralized_cert_enabled=true."
+  type        = list(string)
+  default     = []
+}
+
+variable "acme_lambda_function_name" {
+  description = "Name of the ACME certificate Lambda function (for error messages). Only used when centralized_cert_enabled=true."
+  type        = string
+  default     = ""
+}
+
 variable "use_production_acme" {
   description = "Use production Let's Encrypt (true) or staging (false). Staging certs are not trusted by browsers."
   type        = bool

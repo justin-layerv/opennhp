@@ -407,6 +407,84 @@ fi
 echo "QURL service token retrieved successfully"
 %{ endif ~}
 
+# ============================================================================
+# Centralized TLS Certificate Management
+# Fetches TLS certificate from Secrets Manager instead of per-instance ACME.
+# This scales to thousands of ACs without hitting Let's Encrypt rate limits.
+# NOTE: This is an interim solution - consider Vault PKI for production at scale.
+# ============================================================================
+%{ if centralized_cert_enabled && centralized_cert_secret_arn != "" ~}
+echo "Fetching centralized TLS certificate from Secrets Manager..."
+mkdir -p /home/ubuntu/traefik/certs
+chmod 700 /home/ubuntu/traefik/certs
+
+# Fetch certificate secret and write directly to files (avoids secret in shell variables/process memory)
+# First fetch to temp file, validate, then extract components
+CERT_TEMP=$(mktemp)
+trap "rm -f $CERT_TEMP" EXIT
+
+timeout 30 aws secretsmanager get-secret-value \
+  --secret-id "${centralized_cert_secret_arn}" \
+  --region "$REGION" \
+  --query SecretString --output text > "$CERT_TEMP" || {
+    echo "ERROR: Failed to fetch TLS certificate from Secrets Manager"
+    rm -f "$CERT_TEMP"
+    exit 1
+}
+
+# Validate we got actual certificate data (not placeholder)
+if jq -e '.status == "pending"' "$CERT_TEMP" > /dev/null 2>&1; then
+    echo "ERROR: Certificate not yet generated. Run: aws lambda invoke --function-name ${acme_lambda_function_name} --payload '{\"force_renew\":true}' /dev/stdout"
+    rm -f "$CERT_TEMP"
+    exit 1
+fi
+
+# Extract and write certificate components directly from temp file
+# Use jq -e to fail if field is null/missing (prevents writing "null" to files)
+jq -e -r '.private_key // empty' "$CERT_TEMP" > /home/ubuntu/traefik/certs/privkey.pem || {
+    echo "ERROR: Certificate secret missing 'private_key' field"
+    rm -f "$CERT_TEMP"
+    exit 1
+}
+jq -e -r '.certificate // empty' "$CERT_TEMP" > /home/ubuntu/traefik/certs/cert.pem || {
+    echo "ERROR: Certificate secret missing 'certificate' field"
+    rm -f "$CERT_TEMP"
+    exit 1
+}
+jq -e -r '.chain // empty' "$CERT_TEMP" > /home/ubuntu/traefik/certs/chain.pem || {
+    echo "ERROR: Certificate secret missing 'chain' field"
+    rm -f "$CERT_TEMP"
+    exit 1
+}
+jq -e -r '.fullchain // empty' "$CERT_TEMP" > /home/ubuntu/traefik/certs/fullchain.pem || {
+    echo "ERROR: Certificate secret missing 'fullchain' field"
+    rm -f "$CERT_TEMP"
+    exit 1
+}
+
+# Securely delete temp file (keep EXIT trap - rm -f on non-existent file is harmless)
+rm -f "$CERT_TEMP"
+
+# Secure permissions - only ubuntu (Traefik user) can read private key
+chmod 600 /home/ubuntu/traefik/certs/privkey.pem
+chmod 644 /home/ubuntu/traefik/certs/cert.pem
+chmod 644 /home/ubuntu/traefik/certs/chain.pem
+chmod 644 /home/ubuntu/traefik/certs/fullchain.pem
+chown -R ubuntu:ubuntu /home/ubuntu/traefik/certs
+
+# Verify certificate is valid
+if ! openssl x509 -in /home/ubuntu/traefik/certs/cert.pem -noout -checkend 0; then
+    echo "ERROR: Certificate has expired"
+    exit 1
+fi
+
+# Log certificate info (not the key!)
+CERT_SUBJECT=$(openssl x509 -in /home/ubuntu/traefik/certs/cert.pem -noout -subject 2>/dev/null || echo "unknown")
+CERT_EXPIRY=$(openssl x509 -in /home/ubuntu/traefik/certs/cert.pem -noout -enddate 2>/dev/null || echo "unknown")
+echo "Certificate loaded: $CERT_SUBJECT, expires: $CERT_EXPIRY"
+
+%{ endif ~}
+
 # Traefik configuration for this environment
 # Note: traefik-plugins repo deploys plugins to /home/ubuntu/traefik/plugins-local via SSM
 cat > /home/ubuntu/traefik/traefik.toml << TRAEFIKEOF
@@ -444,6 +522,18 @@ cat > /home/ubuntu/traefik/traefik.toml << TRAEFIKEOF
   [entryPoints.traefik]
     address = ":8080"
 
+%{ if centralized_cert_enabled ~}
+# Centralized certificate from Secrets Manager (no per-instance ACME)
+# Certificate files are fetched at boot time and stored locally
+# NOTE: This is an interim solution - consider Vault PKI for production at scale
+[tls.stores]
+  [tls.stores.default]
+    [tls.stores.default.defaultCertificate]
+      certFile = "/home/ubuntu/traefik/certs/fullchain.pem"
+      keyFile = "/home/ubuntu/traefik/certs/privkey.pem"
+%{ else ~}
+# Per-instance ACME certificate resolver (Let's Encrypt)
+# WARNING: This does not scale well - use centralized_cert_enabled for large deployments
 [certificatesResolvers.letsencrypt.acme]
   email = "${acme_email}"
   storage = "/home/ubuntu/traefik/acme.json"
@@ -454,6 +544,7 @@ cat > /home/ubuntu/traefik/traefik.toml << TRAEFIKEOF
     # Route 53 DNS propagation can take up to 60 seconds
     [certificatesResolvers.letsencrypt.acme.dnsChallenge.propagation]
       delayBeforeChecks = "60s"
+%{ endif ~}
 
 [providers.file]
   directory = "/home/ubuntu/traefik/"
@@ -492,11 +583,16 @@ cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
     service = "console"
     entryPoints = ["https"]
     priority = 20
+%{ if centralized_cert_enabled ~}
+    # TLS uses centralized certificate from default store
+    [http.routers.console.tls]
+%{ else ~}
     [http.routers.console.tls]
       certResolver = "letsencrypt"
       [[http.routers.console.tls.domains]]
         main = "${domain_name}"
         sans = ["*.${domain_name}"]
+%{ endif ~}
 
 %{ endif ~}
   # Route /plugins to NHP Server for passcode login and auth
@@ -505,11 +601,16 @@ cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
     service = "nhp-server"
     entryPoints = ["https"]
     priority = 10
+%{ if centralized_cert_enabled ~}
+    # TLS uses centralized certificate from default store
+    [http.routers.nhp-plugins.tls]
+%{ else ~}
     [http.routers.nhp-plugins.tls]
       certResolver = "letsencrypt"
       [[http.routers.nhp-plugins.tls.domains]]
         main = "${domain_name}"
         sans = ["*.${domain_name}"]
+%{ endif ~}
 
   # Default route to nhp-acd for protected resource access
   [http.routers.nhp-ac]
@@ -517,11 +618,16 @@ cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
     service = "nhp-ac"
     entryPoints = ["https"]
     priority = 1
+%{ if centralized_cert_enabled ~}
+    # TLS uses centralized certificate from default store
+    [http.routers.nhp-ac.tls]
+%{ else ~}
     [http.routers.nhp-ac.tls]
       certResolver = "letsencrypt"
       [[http.routers.nhp-ac.tls.domains]]
         main = "${domain_name}"
         sans = ["*.${domain_name}"]
+%{ endif ~}
 
 [http.services]
 %{ if console_domain != null && console_backend_url != null ~}
@@ -546,7 +652,9 @@ cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
 DYNAMICEOF
 
 # Add production domain routers if configured
-%{ if length(production_domains) > 0 }
+# NOTE: When centralized_cert_enabled=true, ACME is disabled. Production domains
+# would need their own centralized certificate configuration.
+%{ if length(production_domains) > 0 && !centralized_cert_enabled }
 cat >> /home/ubuntu/traefik/dynamic.toml << PRODDYNAMICEOF
 
 # Production domain routers (certificates via cross-account ACME)
@@ -566,7 +674,9 @@ PRODDYNAMICEOF
 %{ endif }
 
 # Add additional TLS domain routers (same account, uses standard ACME)
-%{ if length(additional_tls_domains) > 0 }
+# NOTE: When centralized_cert_enabled=true, ACME is disabled. Additional TLS domains
+# must be included in the centralized certificate's SAN list.
+%{ if length(additional_tls_domains) > 0 && !centralized_cert_enabled }
 cat >> /home/ubuntu/traefik/dynamic.toml << ADDTLSEOF
 
 # Additional TLS domain routers (same account ACME)
@@ -613,11 +723,16 @@ cat >> /home/ubuntu/traefik/dynamic.toml << QURLDYNAMICEOF
   entryPoints = ["https"]
   priority = 15
   middlewares = ["qurl-router"]
+%{ if centralized_cert_enabled ~}
+  # TLS uses centralized certificate - qurl domain must be in cert SANs
+  [http.routers.qurl-site.tls]
+%{ else ~}
   [http.routers.qurl-site.tls]
     certResolver = "letsencrypt"
     [[http.routers.qurl-site.tls.domains]]
       main = "${qurl_router_base_domain}"
       sans = ["*.${qurl_router_base_domain}"]
+%{ endif ~}
 
 # QURL backend service - placeholder required by Traefik config validation.
 # The qurl-router middleware dynamically resolves the actual backend URL
@@ -630,9 +745,11 @@ QURLDYNAMICEOF
 echo "QURL router configuration added"
 %{ endif }
 
-# Create ACME storage
+%{ if !centralized_cert_enabled ~}
+# Create ACME storage (only needed for per-instance ACME, not centralized certs)
 touch /home/ubuntu/traefik/acme.json
 chmod 600 /home/ubuntu/traefik/acme.json
+%{ endif ~}
 # Restrict dynamic.toml permissions (contains service tokens)
 chmod 600 /home/ubuntu/traefik/dynamic.toml
 chown -R ubuntu:ubuntu /home/ubuntu/traefik
