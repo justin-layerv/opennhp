@@ -255,6 +255,11 @@ output "secrets_kms_key_arn" {
   value       = module.kms.secrets_key_arn
 }
 
+output "logs_kms_key_arn" {
+  description = "KMS key ARN for CloudWatch Logs encryption"
+  value       = module.kms.logs_key_arn
+}
+
 output "sns_topic_arn" {
   description = "SNS topic ARN for alerts"
   value       = module.monitoring.sns_topic_arn

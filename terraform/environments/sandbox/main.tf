@@ -234,7 +234,9 @@ module "nhp" {
   centralized_cert_enabled    = var.centralized_cert_enabled
   centralized_cert_secret_arn = var.centralized_cert_enabled ? module.acme_cert[0].certificate_secret_arn : null
   centralized_cert_domains    = var.centralized_cert_enabled ? var.centralized_cert_domains : []
-  acme_lambda_function_name   = var.centralized_cert_enabled ? module.acme_cert[0].lambda_function_name : ""
+  # Use computed name to avoid cycle: nhp depends on acme_cert output, acme_cert depends on nhp's logs_kms_key_arn
+  # WARNING: This name must match the pattern in modules/acme-cert/main.tf local.function_name
+  acme_lambda_function_name = var.centralized_cert_enabled ? "${local.name_prefix}-acme-cert-manager" : ""
 }
 
 # ==============================================================================
@@ -261,6 +263,7 @@ module "acme_cert" {
   acme_email          = var.acme_email
   use_production_acme = var.use_production_acme
   kms_key_arn         = module.nhp.secrets_kms_key_arn
+  logs_kms_key_arn    = module.nhp.logs_kms_key_arn
 
   # Renewal configuration
   renewal_days_before_expiry = 30

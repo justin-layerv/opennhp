@@ -52,6 +52,17 @@ variable "kms_key_arn" {
   default     = null
 }
 
+variable "logs_kms_key_arn" {
+  description = "KMS key ARN for CloudWatch Logs encryption. Should be a key with CloudWatch Logs service permissions."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.logs_kms_key_arn == null || can(regex("^arn:aws:kms:", var.logs_kms_key_arn))
+    error_message = "logs_kms_key_arn must be a valid KMS key ARN."
+  }
+}
+
 variable "create_kms_key" {
   description = "Create a dedicated KMS key for certificate encryption"
   type        = bool

@@ -150,8 +150,8 @@ resource "aws_secretsmanager_secret" "certificate" {
   kms_key_id              = local.kms_key_arn
 
   tags = merge(local.common_tags, {
-    Name    = local.secret_name
-    Domains = join(",", var.domains)
+    Name = local.secret_name
+    # Note: Domains tag omitted as wildcard (*) chars are not allowed in AWS tags
   })
 }
 
@@ -283,7 +283,7 @@ resource "aws_lambda_function" "cert_manager" {
 resource "aws_cloudwatch_log_group" "lambda" {
   name              = "/aws/lambda/${local.function_name}"
   retention_in_days = var.lambda_log_retention_days
-  kms_key_id        = local.kms_key_arn
+  kms_key_id        = var.logs_kms_key_arn
 
   tags = merge(local.common_tags, {
     Name = "/aws/lambda/${local.function_name}"
