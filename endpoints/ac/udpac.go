@@ -406,9 +406,10 @@ func (a *UdpAC) recvPacketRoutine(conn *UdpConn) {
 
 		atomic.StoreInt64(&conn.ConnData.LastLocalRecvTime, time.Now().UnixNano())
 
-		// Update LastSeen for assigned servers using the actual source address.
-		// This is critical when server responds directly (actualSource) instead of via NLB (addrStr).
-		// The assigned server's address matches the server's direct IP, not the NLB address.
+		// Address-based LastSeen update (fallback for direct connections without NAT).
+		// Note: For NAT scenarios, this may fail silently because the server's private IP
+		// (in ServerAddr) differs from the public NAT IP. The reliable update path is
+		// pubkey-based in recvMessageRoutine after crypto validation.
 		if a.registration != nil {
 			a.registration.UpdateServerLastSeenByAddr(actualSource)
 		}
@@ -518,8 +519,13 @@ func (a *UdpAC) recvMessageRoutine() {
 				continue
 			}
 
-			// Note: LastSeen is updated in recvPacketRoutine using the actual source address,
-			// which is critical for NLB scenarios where server responds directly.
+			// Update LastSeen using the server's public key after crypto validation.
+			// This is more reliable than address matching for NAT scenarios where the
+			// server's private IP (in ServerAddr) differs from its public NAT IP.
+			if a.registration != nil && len(ppd.RemotePubKey) > 0 {
+				pubKeyBase64 := base64.StdEncoding.EncodeToString(ppd.RemotePubKey)
+				a.registration.UpdateServerLastSeen(pubKeyBase64)
+			}
 
 			switch ppd.HeaderType {
 			case core.NHP_AOP:
