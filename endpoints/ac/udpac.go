@@ -406,6 +406,13 @@ func (a *UdpAC) recvPacketRoutine(conn *UdpConn) {
 
 		atomic.StoreInt64(&conn.ConnData.LastLocalRecvTime, time.Now().UnixNano())
 
+		// Update LastSeen for assigned servers using the actual source address.
+		// This is critical when server responds directly (actualSource) instead of via NLB (addrStr).
+		// The assigned server's address matches the server's direct IP, not the NLB address.
+		if a.registration != nil {
+			a.registration.UpdateServerLastSeenByAddr(actualSource)
+		}
+
 		conn.ConnData.ForwardInboundPacket(pkt)
 	}
 }
@@ -511,10 +518,8 @@ func (a *UdpAC) recvMessageRoutine() {
 				continue
 			}
 
-			// Update LastSeen for assigned servers on any received message
-			if a.registration != nil && ppd.ConnData != nil && ppd.ConnData.RemoteAddr != nil {
-				a.registration.UpdateServerLastSeenByAddr(ppd.ConnData.RemoteAddr.String())
-			}
+			// Note: LastSeen is updated in recvPacketRoutine using the actual source address,
+			// which is critical for NLB scenarios where server responds directly.
 
 			switch ppd.HeaderType {
 			case core.NHP_AOP:

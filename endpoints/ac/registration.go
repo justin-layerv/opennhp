@@ -243,6 +243,8 @@ func (r *ACRegistration) UpdateServerLastSeenByAddr(addr string) {
 			return
 		}
 	}
+	// No matching server found - expected during NLB registration before server assignment
+	log.Debug("No assigned server matches address %s (have %d servers)", addr, len(servers))
 }
 
 // registrationLoop attempts registration and maintains connections.
