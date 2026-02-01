@@ -133,7 +133,6 @@ module "nhp" {
 
   # QURL AC Fleet defaults
   qurl_default_ac_id   = var.qurl_default_ac_id
-  qurl_default_ac_host = var.qurl_default_ac_host
   qurl_default_ac_port = var.qurl_default_ac_port
 
   # QURL Webhooks

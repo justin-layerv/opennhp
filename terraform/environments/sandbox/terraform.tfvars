@@ -222,7 +222,6 @@ qurl_internal_service_token_arn = "arn:aws:secretsmanager:us-east-2:767397897469
 
 # AC Fleet defaults (for QURL resources)
 qurl_default_ac_id   = "layerv-ac-tf"
-qurl_default_ac_host = "ac.nhp.layerv.xyz"
 qurl_default_ac_port = 443
 
 # Domain configuration for QURL links and sites

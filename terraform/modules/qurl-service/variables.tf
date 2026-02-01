@@ -273,11 +273,6 @@ variable "default_ac_id" {
   type        = string
 }
 
-variable "default_ac_host" {
-  description = "Default AC hostname for new resources"
-  type        = string
-}
-
 variable "default_ac_port" {
   description = "Default AC port for new resources"
   type        = number

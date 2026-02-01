@@ -829,12 +829,6 @@ variable "qurl_default_ac_id" {
   default     = ""
 }
 
-variable "qurl_default_ac_host" {
-  description = "Default AC hostname for new QURL resources"
-  type        = string
-  default     = ""
-}
-
 variable "qurl_default_ac_port" {
   description = "Default AC port for new QURL resources"
   type        = number

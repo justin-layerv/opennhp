@@ -613,16 +613,6 @@ variable "qurl_default_ac_id" {
   type        = string
 }
 
-variable "qurl_default_ac_host" {
-  description = "Default AC hostname for new QURL resources"
-  type        = string
-
-  validation {
-    condition     = can(regex("^[a-zA-Z0-9][a-zA-Z0-9.-]+[a-zA-Z0-9]$", var.qurl_default_ac_host))
-    error_message = "qurl_default_ac_host must be a valid hostname"
-  }
-}
-
 variable "qurl_default_ac_port" {
   description = "Default AC port for new QURL resources"
   type        = number

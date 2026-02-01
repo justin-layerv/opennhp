@@ -127,7 +127,6 @@ module "qurl_service" {
 | Variable | Description | Type | Default |
 |----------|-------------|------|---------|
 | `default_ac_id` | Default AC identifier for new resources | `string` | Required |
-| `default_ac_host` | Default AC hostname for new resources | `string` | Required |
 | `default_ac_port` | Default AC port for new resources | `number` | `443` |
 
 ### Idempotency Cache

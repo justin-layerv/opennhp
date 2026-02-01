@@ -870,7 +870,6 @@ module "qurl_service" {
 
   # AC Fleet defaults
   default_ac_id   = var.qurl_default_ac_id
-  default_ac_host = var.qurl_default_ac_host
   default_ac_port = var.qurl_default_ac_port
 
   # Domain - use certificate created above if domain is configured

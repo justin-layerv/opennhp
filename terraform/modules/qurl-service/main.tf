@@ -108,7 +108,6 @@ locals {
     { name = "QURL_DEFAULT_TOKEN_EXPIRE", value = tostring(var.default_token_expire) },
     { name = "QURL_DEFAULT_OPEN_TIME", value = tostring(var.default_open_time) },
     { name = "QURL_AC_ID", value = var.default_ac_id },
-    { name = "QURL_AC_HOST", value = var.default_ac_host },
     { name = "QURL_AC_PORT", value = tostring(var.default_ac_port) },
     { name = "OWNER_RATE_LIMIT", value = tostring(var.owner_rate_limit) },
     { name = "OWNER_RATE_BURST", value = tostring(var.owner_rate_burst) },
