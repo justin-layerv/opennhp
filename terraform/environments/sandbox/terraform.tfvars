@@ -72,7 +72,7 @@ rds_deletion_protection = false # Allow deletion in sandbox
 # NHP Server plugins - statically compiled into server binary
 # This list specifies which AuthSvcIds are valid for authentication
 # Plugins are compiled in at build time - no S3 download needed
-server_plugins = ["passcode"]
+server_plugins = ["passcode", "qurl"]
 # Add "oktaoidc" when OIDC authentication is needed
 
 # Traefik plugins - sandbox uses "latest" for automatic updates
