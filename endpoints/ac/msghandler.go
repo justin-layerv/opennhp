@@ -119,10 +119,13 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 		}
 	}
 
-	// use ac default ip to override empty destination ip
+	// Use AC's default IP to override empty or sentinel destination IP.
+	// The sentinel value SentinelLocalIP ("0.0.0.0") means "local to this AC" -
+	// used by QURL resources where the destination is the AC itself (Traefik proxy).
+	// This avoids storing external hostnames/IPs that may change over time.
 	if len(a.config.DefaultIp) > 0 {
 		for _, addr := range dstAddrs {
-			if len(addr.Ip) == 0 {
+			if len(addr.Ip) == 0 || addr.Ip == SentinelLocalIP {
 				addr.Ip = a.config.DefaultIp
 			}
 		}
