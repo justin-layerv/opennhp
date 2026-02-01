@@ -301,14 +301,18 @@ def get_or_create_acme_account(private_key) -> Tuple[Any, Any]:
         account_uri = str(e)  # ConflictError's str() returns the account URI
         logger.info(f"ACME account already exists at: {account_uri}")
 
-        # Create a RegistrationResource with the existing account URI
-        # and set it on the network for subsequent requests
-        account = messages.RegistrationResource(
+        # Create a minimal RegistrationResource to query the full account
+        existing_reg = messages.RegistrationResource(
             uri=account_uri,
             body=messages.Registration()
         )
+        # Set on network first so query_registration can use it for signing
+        acme_client.net.account = existing_reg
+
+        # Query to get full registration details
+        account = acme_client.query_registration(existing_reg)
         acme_client.net.account = account
-        logger.info(f"Using existing ACME account: {account_uri}")
+        logger.info(f"Using existing ACME account: {account.uri}")
 
     return acme_client, account
 
