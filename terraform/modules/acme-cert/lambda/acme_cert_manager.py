@@ -383,10 +383,14 @@ def request_certificate(acme_client, private_key, domains: list) -> Tuple[str, s
     # Request new order
     order = acme_client.new_order(csr_pem)
 
-    # Process authorizations
+    # Collect all challenges - group by record name since wildcard and base domain
+    # share the same _acme-challenge record name but need different values
+    challenges_by_record = {}  # record_name -> [(challenge, validation)]
+    all_challenges = []
+
     for auth in order.authorizations:
         domain = auth.body.identifier.value
-        logger.info(f"Processing authorization for: {domain}")
+        logger.info(f"Collecting authorization for: {domain}")
 
         # Find DNS-01 challenge
         dns_challenge = None
@@ -402,15 +406,23 @@ def request_certificate(acme_client, private_key, domains: list) -> Tuple[str, s
         validation = dns_challenge.chall.validation(acme_client.net.key)
         record_name = f"_acme-challenge.{domain}"
 
-        logger.info(f"Creating DNS record: {record_name}")
+        # Group challenges by record name
+        if record_name not in challenges_by_record:
+            challenges_by_record[record_name] = []
+        challenges_by_record[record_name].append(validation)
+        all_challenges.append(dns_challenge)
 
-        # Create DNS record
-        create_dns_record(record_name, validation)
+    # Create all DNS records (with multi-value support for wildcards)
+    for record_name, validations in challenges_by_record.items():
+        logger.info(f"Creating DNS record: {record_name} with {len(validations)} value(s)")
+        create_dns_record_multi(record_name, validations)
 
-        # Wait for DNS propagation
-        wait_for_dns_propagation(record_name, validation)
+    # Wait for DNS propagation of all records
+    for record_name, validations in challenges_by_record.items():
+        wait_for_dns_propagation_multi(record_name, validations)
 
-        # Answer the challenge
+    # Answer all challenges
+    for dns_challenge in all_challenges:
         acme_client.answer_challenge(dns_challenge, dns_challenge.response(acme_client.net.key))
 
     # Finalize order
@@ -418,9 +430,7 @@ def request_certificate(acme_client, private_key, domains: list) -> Tuple[str, s
     order = acme_client.poll_and_finalize(order)
 
     # Clean up DNS records
-    for auth in order.authorizations:
-        domain = auth.body.identifier.value
-        record_name = f"_acme-challenge.{domain}"
+    for record_name in challenges_by_record.keys():
         try:
             delete_dns_record(record_name)
         except Exception as e:
@@ -438,6 +448,38 @@ def request_certificate(acme_client, private_key, domains: list) -> Tuple[str, s
 
     logger.info("Certificate obtained successfully")
     return cert_pem, chain_pem
+
+
+def create_dns_record_multi(record_name: str, values: list):
+    """Create TXT record with multiple values for ACME DNS-01 challenges.
+
+    When requesting a cert for both a domain and its wildcard, both challenges
+    use the same _acme-challenge.domain.com record but with different values.
+    Route53 allows multiple values in a single TXT record set.
+    """
+    # Handle wildcard domains - the challenge record should not have the wildcard
+    if record_name.startswith('_acme-challenge.*.'):
+        record_name = record_name.replace('_acme-challenge.*.', '_acme-challenge.')
+
+    logger.info(f"Creating DNS TXT record: {record_name} with {len(values)} value(s)")
+
+    # Create ResourceRecords list with all values
+    resource_records = [{'Value': f'"{v}"'} for v in values]
+
+    route53_client.change_resource_record_sets(
+        HostedZoneId=HOSTED_ZONE_ID,
+        ChangeBatch={
+            'Changes': [{
+                'Action': 'UPSERT',
+                'ResourceRecordSet': {
+                    'Name': record_name,
+                    'Type': 'TXT',
+                    'TTL': 60,
+                    'ResourceRecords': resource_records
+                }
+            }]
+        }
+    )
 
 
 def create_dns_record(record_name: str, value: str):
@@ -498,6 +540,39 @@ def delete_dns_record(record_name: str):
         )
     except ClientError as e:
         logger.warning(f"Failed to delete DNS record: {e}")
+
+
+def wait_for_dns_propagation_multi(record_name: str, expected_values: list, max_attempts: int = 30, delay: int = 10):
+    """Wait for DNS record with multiple values to propagate."""
+    if record_name.startswith('_acme-challenge.*.'):
+        record_name = record_name.replace('_acme-challenge.*.', '_acme-challenge.')
+
+    logger.info(f"Waiting for DNS propagation of {record_name} with {len(expected_values)} value(s)")
+    expected_set = set(expected_values)
+
+    for attempt in range(max_attempts):
+        try:
+            import dns.resolver
+            resolver = dns.resolver.Resolver()
+            resolver.nameservers = ['8.8.8.8', '1.1.1.1']
+
+            answers = resolver.resolve(record_name, 'TXT')
+            found_values = set()
+            for rdata in answers:
+                txt_value = str(rdata).strip('"')
+                found_values.add(txt_value)
+
+            # Check if all expected values are present
+            if expected_set.issubset(found_values):
+                logger.info(f"DNS propagation confirmed after {attempt + 1} attempts")
+                return
+        except Exception as e:
+            logger.debug(f"DNS query attempt {attempt + 1} failed: {e}")
+
+        time.sleep(delay)
+
+    # Even if we can't confirm, proceed - Let's Encrypt will verify
+    logger.warning(f"Could not confirm DNS propagation after {max_attempts} attempts, proceeding anyway")
 
 
 def wait_for_dns_propagation(record_name: str, expected_value: str, max_attempts: int = 30, delay: int = 10):
