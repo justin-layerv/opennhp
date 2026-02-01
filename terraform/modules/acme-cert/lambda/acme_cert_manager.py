@@ -296,15 +296,19 @@ def get_or_create_acme_account(private_key) -> Tuple[Any, Any]:
         if ACME_ACCOUNT_SECRET_ARN:
             save_acme_account_key(account_key)
     except acme.errors.ConflictError as e:
-        # Account already exists - retrieve it using only_return_existing=True
-        logger.info(f"ACME account already exists, retrieving: {e}")
-        existing_reg = messages.NewRegistration.from_data(
-            email=ACME_EMAIL,
-            terms_of_service_agreed=True,
-            only_return_existing=True
+        # Account already exists - ConflictError contains the account URI
+        # Extract it and construct a RegistrationResource
+        account_uri = str(e)  # ConflictError's str() returns the account URI
+        logger.info(f"ACME account already exists at: {account_uri}")
+
+        # Create a RegistrationResource with the existing account URI
+        # and set it on the network for subsequent requests
+        account = messages.RegistrationResource(
+            uri=account_uri,
+            body=messages.Registration()
         )
-        account = acme_client.new_account(existing_reg)
-        logger.info(f"Retrieved existing ACME account: {account.uri}")
+        acme_client.net.account = account
+        logger.info(f"Using existing ACME account: {account_uri}")
 
     return acme_client, account
 
