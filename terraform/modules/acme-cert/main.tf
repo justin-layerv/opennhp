@@ -355,23 +355,6 @@ resource "aws_iam_role_policy" "lambda_permissions" {
         Resource = aws_secretsmanager_secret.acme_account.arn
       },
 
-      # KMS - Encrypt/Decrypt secrets
-      {
-        Sid    = "KMSOperations"
-        Effect = "Allow"
-        Action = [
-          "kms:Decrypt",
-          "kms:Encrypt",
-          "kms:GenerateDataKey"
-        ]
-        Resource = local.kms_key_arn != null ? [local.kms_key_arn] : ["*"]
-        Condition = local.kms_key_arn == null ? {
-          StringEquals = {
-            "kms:ViaService" = "secretsmanager.${data.aws_region.current.id}.amazonaws.com"
-          }
-        } : null
-      },
-
       # Route 53 - DNS-01 Challenge
       {
         Sid    = "Route53DNSChallenge"
@@ -425,6 +408,61 @@ resource "aws_iam_role_policy" "lambda_permissions" {
           "xray:PutTelemetryRecords"
         ]
         Resource = "*"
+      }
+    ]
+  })
+}
+
+# ------------------------------------------------------------------------------
+# KMS Permissions (conditional - only one policy is created based on kms_key_arn)
+# ------------------------------------------------------------------------------
+
+# KMS permissions - with specific key ARN (when kms_key_arn is provided)
+resource "aws_iam_role_policy" "lambda_kms_specific" {
+  count = local.kms_key_arn != null ? 1 : 0
+  name  = "${local.function_name}-kms"
+  role  = aws_iam_role.lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "KMSOperations"
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt",
+          "kms:Encrypt",
+          "kms:GenerateDataKey"
+        ]
+        Resource = local.kms_key_arn
+      }
+    ]
+  })
+}
+
+# KMS permissions - any key via secretsmanager (when kms_key_arn is null)
+resource "aws_iam_role_policy" "lambda_kms_wildcard" {
+  count = local.kms_key_arn == null ? 1 : 0
+  name  = "${local.function_name}-kms"
+  role  = aws_iam_role.lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "KMSOperations"
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt",
+          "kms:Encrypt",
+          "kms:GenerateDataKey"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = "secretsmanager.${data.aws_region.current.id}.amazonaws.com"
+          }
+        }
       }
     ]
   })
