@@ -217,10 +217,28 @@ func (a *UdpAC) IsRunning() bool {
 func (a *UdpAC) newConnection(addr *net.UDPAddr) (conn *UdpConn) {
 	conn = &UdpConn{}
 	var err error
-	// unlike tcp, udp dial is fast (just socket bind), so no need to run in a thread
-	conn.netConn, err = net.DialUDP("udp", nil, addr)
+	// Use ListenUDP instead of DialUDP to create an unconnected socket.
+	// Connected sockets (from DialUDP) only accept packets from the dialed address,
+	// which breaks when AC connects through NLB but server responds from its direct IP.
+	// Unconnected sockets accept packets from any source, allowing the server to
+	// respond directly without going through the NLB.
+	//
+	// Security note: Accepting packets from any source is safe because all NHP
+	// packets are cryptographically validated by the device layer. Unauthenticated
+	// or forged packets are rejected in device.RecvPrecheck() before processing.
+	//
+	// Determine the network type based on the remote address to ensure we bind
+	// to the correct address family (IPv4 vs IPv6).
+	network := "udp4"
+	localIP := net.IPv4zero
+	if addr.IP.To4() == nil {
+		// IPv6 address
+		network = "udp6"
+		localIP = net.IPv6zero
+	}
+	conn.netConn, err = net.ListenUDP(network, &net.UDPAddr{IP: localIP, Port: 0})
 	if err != nil {
-		log.Error("could not connect to remote addr %s", addr.String())
+		log.Error("could not create UDP socket for remote addr %s: %v", addr.String(), err)
 		return nil
 	}
 
@@ -229,10 +247,11 @@ func (a *UdpAC) newConnection(addr *net.UDPAddr) (conn *UdpConn) {
 	localAddr, err := net.ResolveUDPAddr(laddr.Network(), laddr.String())
 	if err != nil {
 		log.Error("resolve local UDPAddr error %v\n", err)
+		conn.netConn.Close()
 		return nil
 	}
 
-	log.Info("Dial up new UDP connection from %s to %s", localAddr.String(), addr.String())
+	log.Info("Created UDP socket from %s for remote %s", localAddr.String(), addr.String())
 
 	conn.ConnData = &core.ConnectionData{
 		Device:               a.device,
@@ -320,7 +339,8 @@ func (a *UdpAC) SendPacket(pkt *core.Packet, conn *UdpConn) (n int, err error) {
 	//log.Debug("Send [%s] packet (%s -> %s): %+v", pktType, conn.ConnData.LocalAddr.String(), conn.ConnData.RemoteAddr.String(), pkt.Content)
 	log.Info("Send [%s] packet (%s -> %s), %d bytes", pktType, conn.ConnData.LocalAddr.String(), conn.ConnData.RemoteAddr.String(), len(pkt.Content))
 	log.Evaluate("Send [%s] packet (%s -> %s, %d bytes)", pktType, conn.ConnData.LocalAddr.String(), conn.ConnData.RemoteAddr.String(), len(pkt.Content))
-	return conn.netConn.Write(pkt.Content)
+	// Use WriteToUDP with explicit destination since we use unconnected sockets
+	return conn.netConn.WriteToUDP(pkt.Content, conn.ConnData.RemoteAddr)
 }
 
 func (a *UdpAC) recvPacketRoutine(conn *UdpConn) {
@@ -340,8 +360,10 @@ func (a *UdpAC) recvPacketRoutine(conn *UdpConn) {
 		}
 
 		// udp recv, blocking until packet arrives or netConn.Close()
+		// Use ReadFromUDP since we use unconnected sockets that accept from any source.
+		// This allows the server to respond directly (bypassing NLB) while AC sent via NLB.
 		pkt := a.device.AllocatePoolPacket()
-		n, err := conn.netConn.Read(pkt.Buf[:])
+		n, fromAddr, err := conn.netConn.ReadFromUDP(pkt.Buf[:])
 		if err != nil {
 			a.device.ReleasePoolPacket(pkt)
 			if n == 0 {
@@ -351,6 +373,12 @@ func (a *UdpAC) recvPacketRoutine(conn *UdpConn) {
 			log.Error("Failed to receive from remote address %s (%v)", addrStr, err)
 			continue
 		}
+		// Log the actual source address for debugging (may differ from expected remote)
+		// This is expected when server responds directly instead of through NLB
+		actualSource := fromAddr.String()
+		if actualSource != addrStr {
+			log.Debug("Received packet from %s (expected %s) - server responding directly", actualSource, addrStr)
+		}
 
 		// add total recv bytes
 		atomic.AddUint64(&a.stats.totalRecvBytes, uint64(n))
@@ -358,7 +386,7 @@ func (a *UdpAC) recvPacketRoutine(conn *UdpConn) {
 		// check minimal length
 		if n < pkt.MinimalLength() {
 			a.device.ReleasePoolPacket(pkt)
-			log.Error("Received UDP packet from %s is too short, discard", addrStr)
+			log.Error("Received UDP packet from %s is too short (%d bytes, min %d), discard", actualSource, n, pkt.MinimalLength())
 			continue
 		}
 
@@ -367,12 +395,12 @@ func (a *UdpAC) recvPacketRoutine(conn *UdpConn) {
 
 		typ, _, err := a.device.RecvPrecheck(pkt)
 		msgType := core.HeaderTypeToString(typ)
-		log.Info("Receive [%s] packet (%s -> %s), %d bytes", msgType, addrStr, conn.ConnData.LocalAddr.String(), n)
-		log.Evaluate("Receive [%s] packet (%s -> %s), %d bytes", msgType, addrStr, conn.ConnData.LocalAddr.String(), n)
+		log.Info("Receive [%s] packet (%s -> %s), %d bytes", msgType, actualSource, conn.ConnData.LocalAddr.String(), n)
+		log.Evaluate("Receive [%s] packet (%s -> %s), %d bytes", msgType, actualSource, conn.ConnData.LocalAddr.String(), n)
 		if err != nil {
 			a.device.ReleasePoolPacket(pkt)
-			log.Warning("Receive [%s] packet (%s -> %s), precheck error: %v", msgType, addrStr, conn.ConnData.LocalAddr.String(), err)
-			log.Evaluate("Receive [%s] packet (%s -> %s) precheck error: %v", msgType, addrStr, conn.ConnData.LocalAddr.String(), err)
+			log.Warning("Receive [%s] packet (%s -> %s), precheck error: %v", msgType, actualSource, conn.ConnData.LocalAddr.String(), err)
+			log.Evaluate("Receive [%s] packet (%s -> %s) precheck error: %v", msgType, actualSource, conn.ConnData.LocalAddr.String(), err)
 			continue
 		}
 
