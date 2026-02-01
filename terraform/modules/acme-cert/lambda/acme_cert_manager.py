@@ -281,9 +281,11 @@ def get_or_create_acme_account(private_key) -> Tuple[Any, Any]:
     acme_client = client.ClientV2(directory, net=network)
 
     # Register account (or retrieve existing)
+    # Using only_return_existing=True returns existing account without error
     registration = messages.NewRegistration.from_data(
         email=ACME_EMAIL,
-        terms_of_service_agreed=True
+        terms_of_service_agreed=True,
+        only_return_existing=False  # First try to create new
     )
 
     try:
@@ -294,16 +296,15 @@ def get_or_create_acme_account(private_key) -> Tuple[Any, Any]:
         if ACME_ACCOUNT_SECRET_ARN:
             save_acme_account_key(account_key)
     except acme.errors.ConflictError as e:
-        # Account already exists with this key - query existing registration
-        logger.info(f"ACME account already exists: {e}")
-        account = acme_client.query_registration(registration)
-    except Exception as e:
-        if 'already registered' in str(e).lower():
-            # Fallback check for other "already registered" errors
-            logger.info("ACME account already exists with this key")
-            account = acme_client.query_registration(registration)
-        else:
-            raise
+        # Account already exists - retrieve it using only_return_existing=True
+        logger.info(f"ACME account already exists, retrieving: {e}")
+        existing_reg = messages.NewRegistration.from_data(
+            email=ACME_EMAIL,
+            terms_of_service_agreed=True,
+            only_return_existing=True
+        )
+        account = acme_client.new_account(existing_reg)
+        logger.info(f"Retrieved existing ACME account: {account.uri}")
 
     return acme_client, account
 
