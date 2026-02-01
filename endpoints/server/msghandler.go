@@ -291,10 +291,18 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	s.acConnectionMap[acId] = acConn
 	s.acConnectionMapMutex.Unlock()
 
+	// Include server's direct address so AC can establish direct connection.
+	// When AC connects through NLB, the AC's connected UDP socket only accepts
+	// packets from the NLB IP. By providing the server's direct address, the AC
+	// can create a new connection directly to the server for subsequent traffic.
+	serverAddr := fmt.Sprintf("%s:%d", s.localIp, s.listenAddr.Port)
+
 	aakMsg := &common.ServerACAckMsg{
-		ErrCode:    common.ErrSuccess.ErrorCode(),
-		ACAddr:     ppd.ConnData.RemoteAddr.String(),
-		Registered: true, // This server is handling the AC
+		ErrCode:      common.ErrSuccess.ErrorCode(),
+		ACAddr:       ppd.ConnData.RemoteAddr.String(),
+		Registered:   true, // This server is handling the AC
+		ServerAddr:   serverAddr,
+		ServerPubKey: s.device.PublicKeyBase64(),
 	}
 	aakBytes, _ := json.Marshal(aakMsg)
 

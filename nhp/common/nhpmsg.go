@@ -156,6 +156,16 @@ type ServerACAckMsg struct {
 	ErrMsg     string `json:"errMsg,omitempty"`
 	ACAddr     string `json:"acAddr"`
 	Registered bool   `json:"registered"` // True if AC is registered with this server (Phase 2)
+
+	// ServerAddr is the server's direct IP:Port for AC to establish direct connection.
+	// When AC connects through NLB, responses from the server's direct IP would be
+	// dropped by the AC's connected UDP socket. This field allows AC to create a
+	// new connection directly to the server, bypassing NLB for subsequent traffic.
+	ServerAddr string `json:"serverAddr,omitempty"`
+
+	// ServerPubKey is the server's public key (base64) for the direct connection.
+	// This may differ from the shared NLB endpoint key used for initial registration.
+	ServerPubKey string `json:"serverPubKey,omitempty"`
 }
 
 type ResourceInfo struct {
@@ -355,10 +365,10 @@ type ServerForwardResultMsg struct {
 // RedirectTarget represents an assigned server that the AC should connect to.
 // Used in ACRedispatchMsg to redirect AC to its assigned servers.
 type RedirectTarget struct {
-	IP           string `json:"ip"`             // Server's public IP
-	Port         int    `json:"port"`           // Server's NHP UDP port
-	PubKeyBase64 string `json:"pubKey"`         // Server's public key for NHP_AOL encryption
-	AZ           string `json:"az,omitempty"`   // Availability Zone (for debugging/logging)
+	IP           string `json:"ip"`              // Server's public IP
+	Port         int    `json:"port"`            // Server's NHP UDP port
+	PubKeyBase64 string `json:"pubKey"`          // Server's public key for NHP_AOL encryption
+	AZ           string `json:"az,omitempty"`    // Availability Zone (for debugging/logging)
 	ServerID     string `json:"srvId,omitempty"` // Server ID (for debugging/logging)
 }
 

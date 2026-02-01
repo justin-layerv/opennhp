@@ -1943,3 +1943,997 @@ func TestACRegistration_NHP_AAK_AssignedServerFields(t *testing.T) {
 		t.Errorf("FailCount = %d, want 0", failCount)
 	}
 }
+
+// TestACRegistration_NHP_AAK_ServerAddr verifies that when NHP_AAK contains
+// ServerAddr and ServerPubKey, the AC creates a new peer with the direct server
+// address instead of using the registration peer (which may be connected to NLB).
+func TestACRegistration_NHP_AAK_ServerAddr(t *testing.T) {
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-serveraddr",
+			ServerEndpoint: "nlb.test.internal", // AC connects to NLB
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	// Registration peer is connected to NLB (initial registration endpoint)
+	registrationPeer := &core.UdpPeer{
+		Hostname:     "nlb.test.internal",
+		Ip:           "10.0.0.1", // NLB IP
+		Port:         62206,
+		PubKeyBase64: "bmxiLXB1YmtleQ==", // NLB/shared public key
+		Type:         core.NHP_SERVER,
+	}
+
+	// Server's direct address (different from NLB)
+	serverDirectIP := "10.0.1.100"
+	serverDirectPort := 62206
+	serverPubKey := "c2VydmVyLWRpcmVjdC1wdWJrZXk=" // Different from NLB key
+
+	// NHP_AAK with server's direct address
+	aakJSON := fmt.Sprintf(`{
+		"errCode": "0",
+		"registered": true,
+		"acAddr": "192.168.1.50:50000",
+		"serverAddr": "%s:%d",
+		"serverPubKey": "%s"
+	}`, serverDirectIP, serverDirectPort, serverPubKey)
+
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(aakJSON),
+	}
+
+	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	servers := reg.GetAssignedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 assigned server, got %d", len(servers))
+	}
+
+	server := servers[0]
+
+	// Verify the server uses the DIRECT address, not the NLB address
+	if server.Target.IP != serverDirectIP {
+		t.Errorf("Target.IP = %s, want %s (server direct IP)", server.Target.IP, serverDirectIP)
+	}
+	if server.Target.Port != serverDirectPort {
+		t.Errorf("Target.Port = %d, want %d", server.Target.Port, serverDirectPort)
+	}
+	if server.Target.PubKeyBase64 != serverPubKey {
+		t.Errorf("Target.PubKeyBase64 = %s, want %s (server direct pubkey)", server.Target.PubKeyBase64, serverPubKey)
+	}
+
+	// Verify the peer is the new direct peer, not the registration peer
+	if server.Peer == registrationPeer {
+		t.Error("server.Peer should be a NEW peer (direct), not the registration peer (NLB)")
+	}
+	if server.Peer.PublicKeyBase64() != serverPubKey {
+		t.Errorf("server.Peer.PublicKeyBase64() = %s, want %s", server.Peer.PublicKeyBase64(), serverPubKey)
+	}
+
+	// Verify the peer can send to the direct address
+	sendAddr := server.Peer.SendAddr()
+	if sendAddr == nil {
+		t.Fatal("server.Peer.SendAddr() should not be nil")
+	}
+	udpAddr := sendAddr.(*net.UDPAddr)
+	if udpAddr.IP.String() != serverDirectIP {
+		t.Errorf("SendAddr IP = %s, want %s", udpAddr.IP.String(), serverDirectIP)
+	}
+	if udpAddr.Port != serverDirectPort {
+		t.Errorf("SendAddr Port = %d, want %d", udpAddr.Port, serverDirectPort)
+	}
+}
+
+// TestACRegistration_NHP_AAK_ServerAddr_Fallback verifies that if ServerAddr
+// parsing fails, the AC falls back to using the registration peer.
+func TestACRegistration_NHP_AAK_ServerAddr_Fallback(t *testing.T) {
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-fallback",
+			ServerEndpoint: "nlb.test.internal",
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	registrationPeer := &core.UdpPeer{
+		Hostname:     "nlb.test.internal",
+		Ip:           "10.0.0.1",
+		Port:         62206,
+		PubKeyBase64: "bmxiLXB1YmtleQ==",
+		Type:         core.NHP_SERVER,
+	}
+
+	// NHP_AAK with invalid ServerAddr (missing port)
+	aakJSON := `{
+		"errCode": "0",
+		"registered": true,
+		"acAddr": "192.168.1.50:50000",
+		"serverAddr": "invalid-no-port",
+		"serverPubKey": "c2VydmVyLWRpcmVjdC1wdWJrZXk="
+	}`
+
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(aakJSON),
+	}
+
+	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	servers := reg.GetAssignedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 assigned server, got %d", len(servers))
+	}
+
+	server := servers[0]
+
+	// Should fall back to registration peer's address
+	if server.Peer != registrationPeer {
+		t.Error("should fall back to registration peer when ServerAddr parsing fails")
+	}
+}
+
+// TestACRegistration_NHP_AAK_Legacy verifies backwards compatibility:
+// when ServerAddr is not provided, the AC uses the registration peer (legacy behavior).
+func TestACRegistration_NHP_AAK_Legacy(t *testing.T) {
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-legacy",
+			ServerEndpoint: "nlb.test.internal",
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	registrationPeer := &core.UdpPeer{
+		Hostname:     "nlb.test.internal",
+		Ip:           "10.0.0.1",
+		Port:         62206,
+		PubKeyBase64: "bmxiLXB1YmtleQ==",
+		Type:         core.NHP_SERVER,
+	}
+
+	// Legacy NHP_AAK without ServerAddr/ServerPubKey
+	aakJSON := `{
+		"errCode": "0",
+		"registered": true,
+		"acAddr": "192.168.1.50:50000"
+	}`
+
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(aakJSON),
+	}
+
+	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	servers := reg.GetAssignedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 assigned server, got %d", len(servers))
+	}
+
+	server := servers[0]
+
+	// Should use registration peer (legacy behavior)
+	if server.Peer != registrationPeer {
+		t.Error("legacy mode should use registration peer")
+	}
+	if server.Target.PubKeyBase64 != registrationPeer.PublicKeyBase64() {
+		t.Errorf("Target.PubKeyBase64 = %s, want %s", server.Target.PubKeyBase64, registrationPeer.PublicKeyBase64())
+	}
+}
+
+// TestACRegistration_NHP_AAK_ServerAddr_RemovesOldPeer verifies that when switching
+// to direct connection, the old NLB-connected peer is removed from the device.
+func TestACRegistration_NHP_AAK_ServerAddr_RemovesOldPeer(t *testing.T) {
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-remove-peer",
+			ServerEndpoint: "nlb.test.internal",
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	// NLB peer (will be removed after direct connection)
+	nlbPubKey := "bmxiLXB1YmtleS1yZW1vdmU="
+	registrationPeer := &core.UdpPeer{
+		Ip:           "10.0.0.1",
+		Port:         62206,
+		PubKeyBase64: nlbPubKey,
+		Type:         core.NHP_SERVER,
+	}
+
+	// Add the registration peer to the device (simulating what register() does)
+	device.AddPeer(registrationPeer)
+
+	// Verify the NLB peer is in the device
+	if device.LookupPeer(registrationPeer.PublicKey()) == nil {
+		t.Fatal("NLB peer should be in device before NHP_AAK")
+	}
+
+	// Server's direct address (different public key)
+	serverPubKey := "c2VydmVyLWRpcmVjdC1rZXk="
+	aakJSON := fmt.Sprintf(`{
+		"errCode": "0",
+		"registered": true,
+		"acAddr": "192.168.1.50:50000",
+		"serverAddr": "10.0.1.100:62206",
+		"serverPubKey": "%s"
+	}`, serverPubKey)
+
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(aakJSON),
+	}
+
+	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify the OLD NLB peer was removed from the device
+	if device.LookupPeer(registrationPeer.PublicKey()) != nil {
+		t.Error("old NLB peer should be removed from device after switching to direct connection")
+	}
+
+	// Verify the NEW direct peer was added to the device
+	servers := reg.GetAssignedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 assigned server, got %d", len(servers))
+	}
+
+	directPeer := servers[0].Peer
+	if device.LookupPeer(directPeer.PublicKey()) == nil {
+		t.Error("new direct peer should be added to device")
+	}
+}
+
+// TestACRegistration_NHP_AAK_ServerAddr_IPv6 verifies handling of IPv6 server addresses.
+func TestACRegistration_NHP_AAK_ServerAddr_IPv6(t *testing.T) {
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-ipv6",
+			ServerEndpoint: "nlb.test.internal",
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	registrationPeer := &core.UdpPeer{
+		Ip:           "10.0.0.1",
+		Port:         62206,
+		PubKeyBase64: "bmxiLXB1YmtleQ==",
+		Type:         core.NHP_SERVER,
+	}
+
+	// IPv6 address with brackets (standard format for host:port)
+	serverIPv6 := "2001:db8::1"
+	serverPort := 62206
+	serverPubKey := "aXB2Ni1zZXJ2ZXIta2V5"
+
+	aakJSON := fmt.Sprintf(`{
+		"errCode": "0",
+		"registered": true,
+		"acAddr": "192.168.1.50:50000",
+		"serverAddr": "[%s]:%d",
+		"serverPubKey": "%s"
+	}`, serverIPv6, serverPort, serverPubKey)
+
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(aakJSON),
+	}
+
+	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	servers := reg.GetAssignedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 assigned server, got %d", len(servers))
+	}
+
+	server := servers[0]
+
+	// Verify IPv6 address was parsed correctly
+	if server.Target.IP != serverIPv6 {
+		t.Errorf("Target.IP = %s, want %s", server.Target.IP, serverIPv6)
+	}
+	if server.Target.Port != serverPort {
+		t.Errorf("Target.Port = %d, want %d", server.Target.Port, serverPort)
+	}
+}
+
+// TestACRegistration_NHP_AAK_ServerAddr_OnlyServerAddr verifies behavior when
+// ServerAddr is provided but ServerPubKey is missing (should fall back).
+func TestACRegistration_NHP_AAK_ServerAddr_OnlyServerAddr(t *testing.T) {
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-no-pubkey",
+			ServerEndpoint: "nlb.test.internal",
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	registrationPeer := &core.UdpPeer{
+		Ip:           "10.0.0.1",
+		Port:         62206,
+		PubKeyBase64: "bmxiLXB1YmtleQ==",
+		Type:         core.NHP_SERVER,
+	}
+
+	// ServerAddr provided but no ServerPubKey
+	aakJSON := `{
+		"errCode": "0",
+		"registered": true,
+		"acAddr": "192.168.1.50:50000",
+		"serverAddr": "10.0.1.100:62206"
+	}`
+
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(aakJSON),
+	}
+
+	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	servers := reg.GetAssignedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 assigned server, got %d", len(servers))
+	}
+
+	// Should fall back to registration peer when ServerPubKey is missing
+	if servers[0].Peer != registrationPeer {
+		t.Error("should use registration peer when ServerPubKey is missing")
+	}
+}
+
+// TestACRegistration_NHP_AAK_ServerAddr_OnlyServerPubKey verifies behavior when
+// ServerPubKey is provided but ServerAddr is missing (should fall back).
+func TestACRegistration_NHP_AAK_ServerAddr_OnlyServerPubKey(t *testing.T) {
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-no-addr",
+			ServerEndpoint: "nlb.test.internal",
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	registrationPeer := &core.UdpPeer{
+		Ip:           "10.0.0.1",
+		Port:         62206,
+		PubKeyBase64: "bmxiLXB1YmtleQ==",
+		Type:         core.NHP_SERVER,
+	}
+
+	// ServerPubKey provided but no ServerAddr
+	aakJSON := `{
+		"errCode": "0",
+		"registered": true,
+		"acAddr": "192.168.1.50:50000",
+		"serverPubKey": "c2VydmVyLXB1YmtleQ=="
+	}`
+
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(aakJSON),
+	}
+
+	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	servers := reg.GetAssignedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 assigned server, got %d", len(servers))
+	}
+
+	// Should fall back to registration peer when ServerAddr is missing
+	if servers[0].Peer != registrationPeer {
+		t.Error("should use registration peer when ServerAddr is missing")
+	}
+}
+
+// TestACRegistration_NHP_AAK_ServerAddr_ReRegistration verifies that re-registration
+// with ServerAddr properly replaces the old direct peer with a new one.
+func TestACRegistration_NHP_AAK_ServerAddr_ReRegistration(t *testing.T) {
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-rereg",
+			ServerEndpoint: "nlb.test.internal",
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	// First registration
+	firstPeer := &core.UdpPeer{
+		Ip:           "10.0.0.1",
+		Port:         62206,
+		PubKeyBase64: "Zmlyc3QtcGVlcg==",
+		Type:         core.NHP_SERVER,
+	}
+
+	firstServerPubKey := "Zmlyc3Qtc2VydmVy"
+	firstAAK := fmt.Sprintf(`{
+		"errCode": "0",
+		"registered": true,
+		"acAddr": "192.168.1.50:50000",
+		"serverAddr": "10.0.1.100:62206",
+		"serverPubKey": "%s"
+	}`, firstServerPubKey)
+
+	ppd1 := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(firstAAK),
+	}
+
+	err := reg.handleRegistrationResponse(ppd1, firstPeer)
+	if err != nil {
+		t.Fatalf("first registration failed: %v", err)
+	}
+
+	servers := reg.GetAssignedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 server after first registration, got %d", len(servers))
+	}
+	firstDirectPeer := servers[0].Peer
+
+	// Second registration (re-registration to different server)
+	secondPeer := &core.UdpPeer{
+		Ip:           "10.0.0.2",
+		Port:         62206,
+		PubKeyBase64: "c2Vjb25kLXBlZXI=",
+		Type:         core.NHP_SERVER,
+	}
+
+	secondServerPubKey := "c2Vjb25kLXNlcnZlcg=="
+	secondAAK := fmt.Sprintf(`{
+		"errCode": "0",
+		"registered": true,
+		"acAddr": "192.168.1.50:50001",
+		"serverAddr": "10.0.2.200:62206",
+		"serverPubKey": "%s"
+	}`, secondServerPubKey)
+
+	ppd2 := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(secondAAK),
+	}
+
+	err = reg.handleRegistrationResponse(ppd2, secondPeer)
+	if err != nil {
+		t.Fatalf("second registration failed: %v", err)
+	}
+
+	servers = reg.GetAssignedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 server after re-registration, got %d", len(servers))
+	}
+
+	// Verify the server was replaced
+	if servers[0].Target.IP != "10.0.2.200" {
+		t.Errorf("server IP should be updated to 10.0.2.200, got %s", servers[0].Target.IP)
+	}
+	if servers[0].Target.PubKeyBase64 != secondServerPubKey {
+		t.Errorf("server pubkey should be updated")
+	}
+
+	// Verify the first direct peer was removed from device
+	if device.LookupPeer(firstDirectPeer.PublicKey()) != nil {
+		t.Error("first direct peer should be removed after re-registration")
+	}
+
+	// Verify the second direct peer is in device
+	if device.LookupPeer(servers[0].Peer.PublicKey()) == nil {
+		t.Error("second direct peer should be in device")
+	}
+}
+
+// TestACRegistration_NHP_AAK_ServerAddr_KeepaliveTarget verifies that after
+// switching to direct connection, keepalives would be sent to the direct address.
+func TestACRegistration_NHP_AAK_ServerAddr_KeepaliveTarget(t *testing.T) {
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-keepalive",
+			ServerEndpoint: "nlb.test.internal",
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	nlbIP := "10.0.0.1"
+	registrationPeer := &core.UdpPeer{
+		Ip:           nlbIP,
+		Port:         62206,
+		PubKeyBase64: "bmxiLXB1YmtleQ==",
+		Type:         core.NHP_SERVER,
+	}
+
+	directIP := "10.0.1.100"
+	serverPubKey := "ZGlyZWN0LXNlcnZlcg=="
+	aakJSON := fmt.Sprintf(`{
+		"errCode": "0",
+		"registered": true,
+		"acAddr": "192.168.1.50:50000",
+		"serverAddr": "%s:62206",
+		"serverPubKey": "%s"
+	}`, directIP, serverPubKey)
+
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(aakJSON),
+	}
+
+	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	servers := reg.GetAssignedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 assigned server, got %d", len(servers))
+	}
+
+	server := servers[0]
+
+	// Verify keepalive would go to DIRECT address, not NLB
+	sendAddr := server.Peer.SendAddr()
+	if sendAddr == nil {
+		t.Fatal("Peer.SendAddr() should not be nil")
+	}
+
+	udpAddr := sendAddr.(*net.UDPAddr)
+	if udpAddr.IP.String() != directIP {
+		t.Errorf("keepalive target IP = %s, want %s (direct, not NLB %s)",
+			udpAddr.IP.String(), directIP, nlbIP)
+	}
+
+	// Verify the server meets keepalive eligibility criteria
+	if server.Peer == nil {
+		t.Error("server.Peer should not be nil for keepalives")
+	}
+	if !server.IsConnected() {
+		t.Error("server should be connected for keepalives")
+	}
+}
+
+// TestACRegistration_NHP_AAK_ServerAddr_SamePubKey verifies correct behavior when
+// the server's direct pubkey is the same as the NLB shared key.
+func TestACRegistration_NHP_AAK_ServerAddr_SamePubKey(t *testing.T) {
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-same-key",
+			ServerEndpoint: "nlb.test.internal",
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	// Same public key for both NLB and direct (shared key scenario)
+	sharedPubKey := "c2hhcmVkLWtleQ=="
+	registrationPeer := &core.UdpPeer{
+		Ip:           "10.0.0.1", // NLB IP
+		Port:         62206,
+		PubKeyBase64: sharedPubKey,
+		Type:         core.NHP_SERVER,
+	}
+
+	device.AddPeer(registrationPeer)
+
+	directIP := "10.0.1.100"
+	aakJSON := fmt.Sprintf(`{
+		"errCode": "0",
+		"registered": true,
+		"acAddr": "192.168.1.50:50000",
+		"serverAddr": "%s:62206",
+		"serverPubKey": "%s"
+	}`, directIP, sharedPubKey)
+
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(aakJSON),
+	}
+
+	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	servers := reg.GetAssignedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 assigned server, got %d", len(servers))
+	}
+
+	// Even with same pubkey, the peer should be pointing to the DIRECT IP
+	sendAddr := servers[0].Peer.SendAddr()
+	if sendAddr == nil {
+		t.Fatal("SendAddr should not be nil")
+	}
+
+	udpAddr := sendAddr.(*net.UDPAddr)
+	if udpAddr.IP.String() != directIP {
+		t.Errorf("peer should point to direct IP %s, got %s", directIP, udpAddr.IP.String())
+	}
+}
+
+// TestACRegistration_NHP_AAK_ServerAddr_VariousPorts verifies handling of various port numbers.
+func TestACRegistration_NHP_AAK_ServerAddr_VariousPorts(t *testing.T) {
+	testCases := []struct {
+		name         string
+		serverAddr   string
+		expectedIP   string
+		expectedPort int
+	}{
+		{
+			name:         "standard port",
+			serverAddr:   "10.0.1.100:62206",
+			expectedIP:   "10.0.1.100",
+			expectedPort: 62206,
+		},
+		{
+			name:         "high port",
+			serverAddr:   "10.0.1.100:65535",
+			expectedIP:   "10.0.1.100",
+			expectedPort: 65535,
+		},
+		{
+			name:         "low port",
+			serverAddr:   "10.0.1.100:1024",
+			expectedIP:   "10.0.1.100",
+			expectedPort: 1024,
+		},
+		{
+			name:         "port 1",
+			serverAddr:   "10.0.1.100:1",
+			expectedIP:   "10.0.1.100",
+			expectedPort: 1,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var testPrivateKey [32]byte
+			for i := range testPrivateKey {
+				testPrivateKey[i] = byte(i)
+			}
+
+			device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+			if device == nil {
+				t.Fatal("Failed to create device")
+			}
+
+			ac := &UdpAC{
+				config: &Config{
+					ACId:           "test-ac-" + tc.name,
+					ServerEndpoint: "nlb.test.internal",
+				},
+				device: device,
+			}
+
+			reg := NewACRegistration(ac)
+
+			registrationPeer := &core.UdpPeer{
+				Ip:           "10.0.0.1",
+				Port:         62206,
+				PubKeyBase64: "bmxiLXB1YmtleQ==",
+				Type:         core.NHP_SERVER,
+			}
+
+			aakJSON := fmt.Sprintf(`{
+				"errCode": "0",
+				"registered": true,
+				"acAddr": "192.168.1.50:50000",
+				"serverAddr": "%s",
+				"serverPubKey": "c2VydmVyLWtleQ=="
+			}`, tc.serverAddr)
+
+			ppd := &core.PacketParserData{
+				HeaderType:  core.NHP_AAK,
+				BodyMessage: []byte(aakJSON),
+			}
+
+			err := reg.handleRegistrationResponse(ppd, registrationPeer)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			servers := reg.GetAssignedServers()
+			if len(servers) != 1 {
+				t.Fatalf("expected 1 server, got %d", len(servers))
+			}
+
+			if servers[0].Target.IP != tc.expectedIP {
+				t.Errorf("IP = %s, want %s", servers[0].Target.IP, tc.expectedIP)
+			}
+			if servers[0].Target.Port != tc.expectedPort {
+				t.Errorf("Port = %d, want %d", servers[0].Target.Port, tc.expectedPort)
+			}
+		})
+	}
+}
+
+// TestACRegistration_NHP_AAK_ServerAddr_InvalidFormats tests various invalid ServerAddr formats.
+func TestACRegistration_NHP_AAK_ServerAddr_InvalidFormats(t *testing.T) {
+	testCases := []struct {
+		name       string
+		serverAddr string
+	}{
+		{"missing port", "10.0.1.100"},
+		{"empty string", ""},
+		{"just colon", ":"},
+		{"port only", ":62206"},
+		{"invalid port", "10.0.1.100:notaport"},
+		{"negative port", "10.0.1.100:-1"},
+		{"spaces", "10.0.1.100 : 62206"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var testPrivateKey [32]byte
+			for i := range testPrivateKey {
+				testPrivateKey[i] = byte(i)
+			}
+
+			device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+			if device == nil {
+				t.Fatal("Failed to create device")
+			}
+
+			ac := &UdpAC{
+				config: &Config{
+					ACId:           "test-ac-invalid",
+					ServerEndpoint: "nlb.test.internal",
+				},
+				device: device,
+			}
+
+			reg := NewACRegistration(ac)
+
+			nlbIP := "10.0.0.1"
+			registrationPeer := &core.UdpPeer{
+				Ip:           nlbIP,
+				Port:         62206,
+				PubKeyBase64: "bmxiLXB1YmtleQ==",
+				Type:         core.NHP_SERVER,
+			}
+
+			aakJSON := fmt.Sprintf(`{
+				"errCode": "0",
+				"registered": true,
+				"acAddr": "192.168.1.50:50000",
+				"serverAddr": "%s",
+				"serverPubKey": "c2VydmVyLWtleQ=="
+			}`, tc.serverAddr)
+
+			ppd := &core.PacketParserData{
+				HeaderType:  core.NHP_AAK,
+				BodyMessage: []byte(aakJSON),
+			}
+
+			err := reg.handleRegistrationResponse(ppd, registrationPeer)
+			if err != nil {
+				t.Fatalf("should not error, but got: %v", err)
+			}
+
+			servers := reg.GetAssignedServers()
+			if len(servers) != 1 {
+				t.Fatalf("expected 1 server, got %d", len(servers))
+			}
+
+			// Should fall back to registration peer for invalid formats
+			if servers[0].Peer != registrationPeer {
+				t.Error("should fall back to registration peer for invalid ServerAddr")
+			}
+
+			// Verify the peer points to NLB address (fallback)
+			sendAddr := servers[0].Peer.SendAddr()
+			if sendAddr != nil {
+				udpAddr := sendAddr.(*net.UDPAddr)
+				if udpAddr.IP.String() != nlbIP {
+					t.Errorf("fallback should use NLB IP %s, got %s", nlbIP, udpAddr.IP.String())
+				}
+			}
+		})
+	}
+}
+
+// TestACRegistration_NHP_AAK_ServerAddr_UnresolvableHost verifies that when ServerAddr
+// contains a valid format but unresolvable hostname, it falls back to registration peer.
+func TestACRegistration_NHP_AAK_ServerAddr_UnresolvableHost(t *testing.T) {
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-unresolvable",
+			ServerEndpoint: "nlb.test.internal",
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	nlbIP := "10.0.0.1"
+	registrationPeer := &core.UdpPeer{
+		Ip:           nlbIP,
+		Port:         62206,
+		PubKeyBase64: "bmxiLXB1YmtleQ==",
+		Type:         core.NHP_SERVER,
+	}
+
+	// Valid format but unresolvable hostname - should fall back via SendAddr() == nil
+	aakJSON := `{
+		"errCode": "0",
+		"registered": true,
+		"acAddr": "192.168.1.50:50000",
+		"serverAddr": "unresolvable.invalid.hostname.test:62206",
+		"serverPubKey": "c2VydmVyLWtleQ=="
+	}`
+
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(aakJSON),
+	}
+
+	err := reg.handleRegistrationResponse(ppd, registrationPeer)
+	if err != nil {
+		t.Fatalf("should not error, but got: %v", err)
+	}
+
+	servers := reg.GetAssignedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 server, got %d", len(servers))
+	}
+
+	// Should fall back to registration peer when hostname cannot be resolved
+	if servers[0].Peer != registrationPeer {
+		t.Error("should fall back to registration peer for unresolvable hostname")
+	}
+
+	// Verify the peer points to NLB address (fallback)
+	sendAddr := servers[0].Peer.SendAddr()
+	if sendAddr != nil {
+		udpAddr := sendAddr.(*net.UDPAddr)
+		if udpAddr.IP.String() != nlbIP {
+			t.Errorf("fallback should use NLB IP %s, got %s", nlbIP, udpAddr.IP.String())
+		}
+	}
+}

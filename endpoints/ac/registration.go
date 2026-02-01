@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -404,7 +405,6 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 
 	case core.NHP_AAK:
 		// Server responded with ACK - this server is assigned to us
-		// Keep the registration peer because this server will send us NHP_AOP packets
 		var aakMsg common.ServerACAckMsg
 		if err := json.Unmarshal(ppd.BodyMessage, &aakMsg); err != nil {
 			r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
@@ -421,45 +421,106 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 			return errors.New("server returned NHP_AAK with Registered=false")
 		}
 
-		// Track the registration peer for cleanup when AC stops or re-registers.
-		// NOTE: The peer is intentionally tracked in TWO places:
-		//   - registrationPeer: for cleanup on re-registration (RemovePeer above)
-		//   - assignedServers: for keepalive management (sendKeepalives iterates this)
-		// This dual-tracking is necessary because registrationPeer cleanup happens
-		// before we add the new server to assignedServers.
+		// Determine which peer to use for ongoing communication.
+		// If server provides its direct address (ServerAddr), create a new peer for direct
+		// communication. This is necessary when AC connects through NLB - the AC's connected
+		// UDP socket only accepts packets from the NLB IP, but the server sends responses
+		// directly from its own IP. By creating a new connection to the server's direct
+		// address, we ensure bidirectional communication works.
+		var serverPeer *core.UdpPeer
+
+		if aakMsg.ServerAddr != "" && aakMsg.ServerPubKey != "" {
+			// Parse server's direct address
+			host, portStr, parseErr := net.SplitHostPort(aakMsg.ServerAddr)
+			if parseErr != nil {
+				log.Warning("Failed to parse ServerAddr %s: %v, falling back to registration peer", aakMsg.ServerAddr, parseErr)
+				serverPeer = registrationPeer
+			} else {
+				port, portErr := strconv.Atoi(portStr)
+				if portErr != nil || port < 1 || port > 65535 {
+					log.Warning("Invalid port in ServerAddr %s, falling back to registration peer", aakMsg.ServerAddr)
+					serverPeer = registrationPeer
+				} else {
+					// Create new peer with server's direct address
+					serverPeer = &core.UdpPeer{
+						Ip:           host,
+						Port:         port,
+						PubKeyBase64: aakMsg.ServerPubKey,
+						Type:         core.NHP_SERVER,
+					}
+
+					// Verify the new peer can resolve its address
+					if serverPeer.SendAddr() == nil {
+						log.Warning("Cannot resolve server direct address %s, falling back to registration peer", aakMsg.ServerAddr)
+						serverPeer = registrationPeer
+					} else {
+						// Add the new direct peer to the device
+						r.ac.device.AddPeer(serverPeer)
+						// Remove the old registration peer (connected to NLB)
+						r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+						log.Info("Switched from NLB %s:%d to server direct address %s", registrationPeer.Ip, registrationPeer.Port, aakMsg.ServerAddr)
+					}
+				}
+			}
+		} else {
+			// No direct address provided, use registration peer (legacy behavior)
+			serverPeer = registrationPeer
+			// Log partial field cases to help diagnose misconfiguration
+			if aakMsg.ServerAddr != "" {
+				log.Debug("ServerAddr provided without ServerPubKey, using registration peer")
+			} else if aakMsg.ServerPubKey != "" {
+				log.Debug("ServerPubKey provided without ServerAddr, using registration peer")
+			}
+		}
+
+		// Get the server address for assignedServers
+		sendAddr := serverPeer.SendAddr()
+		if sendAddr == nil {
+			// Edge case: peer address cannot be resolved (e.g., DNS failure after initial check).
+			// We keep the peer for potential future use but skip adding to assignedServers,
+			// meaning no keepalives will be sent. The connection may timeout, but this is
+			// preferable to failing registration entirely for a transient DNS issue.
+			log.Warning("Server peer has nil SendAddr, cannot add to assignedServers for keepalive")
+			r.mu.Lock()
+			if r.registrationPeer != nil {
+				r.ac.device.RemovePeer(r.registrationPeer.PublicKeyBase64())
+			}
+			r.registrationPeer = serverPeer
+			r.mu.Unlock()
+			log.Info("Received NHP_AAK: ACAddr=%s, Registered=%v (peer kept but no keepalive)", aakMsg.ACAddr, aakMsg.Registered)
+			return nil
+		}
+
+		udpAddr := sendAddr.(*net.UDPAddr)
+
 		r.mu.Lock()
 		// Clean up old registration peer if exists (re-registration case)
-		if r.registrationPeer != nil {
+		if r.registrationPeer != nil && r.registrationPeer.PublicKeyBase64() != serverPeer.PublicKeyBase64() {
 			r.ac.device.RemovePeer(r.registrationPeer.PublicKeyBase64())
 		}
-		r.registrationPeer = registrationPeer
+		r.registrationPeer = serverPeer
 
-		// Replace assignedServers with the registration server for keepalive management.
-		// When NHP_AAK is received directly (no NHP_ARD redispatch), the registration
-		// server IS our assigned server. Without this, keepaliveLoop() has no servers
-		// to send keepalives to, causing the connection to timeout after 5 minutes.
+		// Replace assignedServers with the server for keepalive management.
 		// We replace (not append) to avoid duplicate entries on re-registration.
-		sendAddr := registrationPeer.SendAddr()
-		if sendAddr != nil {
-			udpAddr := sendAddr.(*net.UDPAddr)
-			assignedServer := &AssignedServer{
-				Target: common.RedirectTarget{
-					IP:           udpAddr.IP.String(),
-					Port:         udpAddr.Port,
-					PubKeyBase64: registrationPeer.PublicKeyBase64(),
-				},
-				Peer:      registrationPeer,
-				Connected: true,
-				LastSeen:  time.Now(),
-			}
-			r.assignedServers = []*AssignedServer{assignedServer}
-			log.Info("Set registration server as assignedServer for keepalive: %s:%d", udpAddr.IP.String(), udpAddr.Port)
-		} else {
-			log.Warning("Registration peer has nil SendAddr, cannot add to assignedServers for keepalive")
+		assignedServer := &AssignedServer{
+			Target: common.RedirectTarget{
+				IP:           udpAddr.IP.String(),
+				Port:         udpAddr.Port,
+				PubKeyBase64: serverPeer.PublicKeyBase64(),
+			},
+			Peer:      serverPeer,
+			Connected: true,
+			LastSeen:  time.Now(),
 		}
+		r.assignedServers = []*AssignedServer{assignedServer}
 		r.mu.Unlock()
 
-		log.Info("Received NHP_AAK: ACAddr=%s, Registered=%v (peer kept for NHP_AOP)", aakMsg.ACAddr, aakMsg.Registered)
+		log.Info("Set server as assignedServer for keepalive: %s:%d", udpAddr.IP.String(), udpAddr.Port)
+		if serverPeer == registrationPeer {
+			log.Info("Received NHP_AAK: ACAddr=%s, Registered=%v (using registration peer)", aakMsg.ACAddr, aakMsg.Registered)
+		} else {
+			log.Info("Received NHP_AAK: ACAddr=%s, Registered=%v, ServerAddr=%s (using direct connection)", aakMsg.ACAddr, aakMsg.Registered, aakMsg.ServerAddr)
+		}
 		return nil
 
 	default:
