@@ -2,6 +2,7 @@ package ac
 
 import (
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -61,9 +62,9 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 	reg := NewACRegistration(ac)
 
 	tests := []struct {
-		name        string
-		ardMsg      *common.ACRedispatchMsg
-		expectError bool
+		name          string
+		ardMsg        *common.ACRedispatchMsg
+		expectError   bool
 		errorContains string
 	}{
 		{
@@ -71,7 +72,7 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 			ardMsg: &common.ACRedispatchMsg{
 				Targets: []common.RedirectTarget{},
 			},
-			expectError: true,
+			expectError:   true,
 			errorContains: "no targets",
 		},
 		{
@@ -83,7 +84,7 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 					{IP: "10.0.0.1", Port: 62206, PubKeyBase64: "pubkey"},
 				},
 			},
-			expectError: true,
+			expectError:   true,
 			errorContains: "redispatch failed",
 		},
 		{
@@ -93,7 +94,7 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 					{IP: "", Port: 62206, PubKeyBase64: "pubkey"},
 				},
 			},
-			expectError: true,
+			expectError:   true,
 			errorContains: "empty IP",
 		},
 		{
@@ -103,7 +104,7 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 					{IP: "10.0.0.1", Port: 0, PubKeyBase64: "pubkey"},
 				},
 			},
-			expectError: true,
+			expectError:   true,
 			errorContains: "invalid port",
 		},
 		{
@@ -113,7 +114,7 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 					{IP: "10.0.0.1", Port: 62206, PubKeyBase64: ""},
 				},
 			},
-			expectError: true,
+			expectError:   true,
 			errorContains: "empty public key",
 		},
 		{
@@ -123,7 +124,7 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 					{IP: "not-an-ip", Port: 62206, PubKeyBase64: "pubkey"},
 				},
 			},
-			expectError: true,
+			expectError:   true,
 			errorContains: "invalid IP address",
 		},
 		// Note: We don't test "success code with targets" here because it requires
@@ -1599,5 +1600,346 @@ func TestACRegistration_HandleRegistrationResponse_ReplacesOldPeer(t *testing.T)
 	if currentPeer.PubKeyBase64 != newPeer.PubKeyBase64 {
 		t.Errorf("registrationPeer pubkey mismatch: got %s, want %s",
 			currentPeer.PubKeyBase64, newPeer.PubKeyBase64)
+	}
+}
+
+// TestACRegistration_NHP_AAK_AddsToAssignedServers verifies that when NHP_AAK is received
+// (direct registration without redispatch), the registration peer is added to assignedServers.
+// This is critical for keepalive management - without this fix, the connection times out
+// after 5 minutes because keepaliveLoop() has no servers to send keepalives to.
+func TestACRegistration_NHP_AAK_AddsToAssignedServers(t *testing.T) {
+	// Create a test private key for the device
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	// Create a peer with a resolvable IP address
+	testPeer := &core.UdpPeer{
+		Hostname:     "test-server",
+		Ip:           "10.0.0.1",
+		Port:         62206,
+		PubKeyBase64: "dGVzdC1wdWJrZXktYmFzZTY0", // "test-pubkey-base64" in base64
+		Type:         core.NHP_SERVER,
+	}
+
+	// Verify assignedServers is empty before
+	if reg.HasAssignedServers() {
+		t.Fatal("assignedServers should be empty before NHP_AAK")
+	}
+
+	// Simulate successful NHP_AAK response
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(`{"errCode":"0","registered":true,"acAddr":"10.0.0.1:62206"}`),
+	}
+
+	err := reg.handleRegistrationResponse(ppd, testPeer)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify the registration peer was added to assignedServers
+	if !reg.HasAssignedServers() {
+		t.Fatal("assignedServers should NOT be empty after NHP_AAK - this is the critical fix!")
+	}
+
+	servers := reg.GetAssignedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 assigned server, got %d", len(servers))
+	}
+
+	server := servers[0]
+
+	// Verify the assigned server has the correct peer
+	if server.Peer != testPeer {
+		t.Error("assigned server Peer should be the registration peer")
+	}
+
+	// Verify the assigned server is marked as connected
+	if !server.IsConnected() {
+		t.Error("assigned server should be marked as Connected=true")
+	}
+
+	// Verify LastSeen is set (not zero)
+	if server.GetLastSeen().IsZero() {
+		t.Error("assigned server LastSeen should be set")
+	}
+
+	// Verify the target has correct IP and port from the peer's SendAddr
+	sendAddr := testPeer.SendAddr()
+	if sendAddr == nil {
+		t.Fatal("test peer SendAddr should not be nil")
+	}
+	udpAddr := sendAddr.(*net.UDPAddr)
+
+	if server.Target.IP != udpAddr.IP.String() {
+		t.Errorf("Target.IP = %s, want %s", server.Target.IP, udpAddr.IP.String())
+	}
+	if server.Target.Port != udpAddr.Port {
+		t.Errorf("Target.Port = %d, want %d", server.Target.Port, udpAddr.Port)
+	}
+	if server.Target.PubKeyBase64 != testPeer.PublicKeyBase64() {
+		t.Errorf("Target.PubKeyBase64 = %s, want %s", server.Target.PubKeyBase64, testPeer.PublicKeyBase64())
+	}
+}
+
+// TestACRegistration_NHP_AAK_KeepaliveEligibility verifies that after NHP_AAK,
+// the assigned server is eligible for keepalives (has Peer != nil and IsConnected).
+// This test ensures the keepalive filtering logic will include the registration server.
+func TestACRegistration_NHP_AAK_KeepaliveEligibility(t *testing.T) {
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-002",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	testPeer := &core.UdpPeer{
+		Hostname:     "test-server",
+		Ip:           "10.0.0.2",
+		Port:         62206,
+		PubKeyBase64: "dGVzdC1wdWJrZXktMg==",
+		Type:         core.NHP_SERVER,
+	}
+
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(`{"errCode":"0","registered":true,"acAddr":"10.0.0.2:62206"}`),
+	}
+
+	err := reg.handleRegistrationResponse(ppd, testPeer)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	servers := reg.GetAssignedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 assigned server, got %d", len(servers))
+	}
+
+	server := servers[0]
+
+	// These are the exact conditions checked in sendKeepalives():
+	// if server.Peer == nil || !server.IsConnected() { continue }
+	if server.Peer == nil {
+		t.Error("server.Peer is nil - keepalives will NOT be sent!")
+	}
+	if !server.IsConnected() {
+		t.Error("server.IsConnected() is false - keepalives will NOT be sent!")
+	}
+
+	// Verify the peer has a valid SendAddr (required for sending keepalives)
+	if server.Peer.SendAddr() == nil {
+		t.Error("server.Peer.SendAddr() is nil - keepalives cannot be sent!")
+	}
+}
+
+// TestACRegistration_NHP_AAK_ReRegistration_ReplacesAssignedServer verifies that
+// when re-registration occurs (receiving another NHP_AAK), the old assigned server
+// is replaced with the new one.
+func TestACRegistration_NHP_AAK_ReRegistration_ReplacesAssignedServer(t *testing.T) {
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-003",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	// First registration
+	firstPeer := &core.UdpPeer{
+		Hostname:     "first-server",
+		Ip:           "10.0.0.10",
+		Port:         62206,
+		PubKeyBase64: "Zmlyc3Qtc2VydmVy",
+		Type:         core.NHP_SERVER,
+	}
+
+	ppd1 := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(`{"errCode":"0","registered":true,"acAddr":"10.0.0.10:62206"}`),
+	}
+
+	err := reg.handleRegistrationResponse(ppd1, firstPeer)
+	if err != nil {
+		t.Fatalf("first registration failed: %v", err)
+	}
+
+	servers := reg.GetAssignedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 assigned server after first registration, got %d", len(servers))
+	}
+	if servers[0].Target.IP != "10.0.0.10" {
+		t.Errorf("first server IP = %s, want 10.0.0.10", servers[0].Target.IP)
+	}
+
+	// Second registration (re-registration)
+	secondPeer := &core.UdpPeer{
+		Hostname:     "second-server",
+		Ip:           "10.0.0.20",
+		Port:         62206,
+		PubKeyBase64: "c2Vjb25kLXNlcnZlcg==",
+		Type:         core.NHP_SERVER,
+	}
+
+	ppd2 := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(`{"errCode":"0","registered":true,"acAddr":"10.0.0.20:62206"}`),
+	}
+
+	err = reg.handleRegistrationResponse(ppd2, secondPeer)
+	if err != nil {
+		t.Fatalf("second registration failed: %v", err)
+	}
+
+	// After re-registration, we should have exactly 1 server (replaced, not appended).
+	// This prevents duplicate entries from accumulating on repeated re-registrations.
+	servers = reg.GetAssignedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected exactly 1 assigned server after re-registration, got %d", len(servers))
+	}
+
+	// Verify it's the new server, not the old one
+	if servers[0].Target.IP != "10.0.0.20" {
+		t.Errorf("expected new server IP 10.0.0.20, got %s", servers[0].Target.IP)
+	}
+	if servers[0].Peer != secondPeer {
+		t.Error("new server should have secondPeer")
+	}
+
+	// Verify old server is NOT present
+	for _, s := range servers {
+		if s.Target.IP == "10.0.0.10" {
+			t.Error("old server (10.0.0.10) should not be in assignedServers after re-registration")
+		}
+	}
+}
+
+// TestACRegistration_NHP_AAK_AssignedServerFields verifies all fields of the
+// AssignedServer are correctly populated after NHP_AAK.
+func TestACRegistration_NHP_AAK_AssignedServerFields(t *testing.T) {
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-004",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	testPeer := &core.UdpPeer{
+		Hostname:     "test-server",
+		Ip:           "192.168.1.100",
+		Port:         12345,
+		PubKeyBase64: "dGVzdC1rZXktMTIzNDU=",
+		Type:         core.NHP_SERVER,
+	}
+
+	beforeTime := time.Now()
+
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: []byte(`{"errCode":"0","registered":true,"acAddr":"192.168.1.100:12345"}`),
+	}
+
+	err := reg.handleRegistrationResponse(ppd, testPeer)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	afterTime := time.Now()
+
+	servers := reg.GetAssignedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 assigned server, got %d", len(servers))
+	}
+
+	server := servers[0]
+
+	// Check Target fields
+	if server.Target.IP != "192.168.1.100" {
+		t.Errorf("Target.IP = %s, want 192.168.1.100", server.Target.IP)
+	}
+	if server.Target.Port != 12345 {
+		t.Errorf("Target.Port = %d, want 12345", server.Target.Port)
+	}
+	if server.Target.PubKeyBase64 != testPeer.PublicKeyBase64() {
+		t.Errorf("Target.PubKeyBase64 mismatch")
+	}
+
+	// Check Peer
+	if server.Peer != testPeer {
+		t.Error("Peer should be the test peer")
+	}
+
+	// Check Connected
+	if !server.IsConnected() {
+		t.Error("Connected should be true")
+	}
+
+	// Check LastSeen is within expected range
+	lastSeen := server.GetLastSeen()
+	if lastSeen.Before(beforeTime) || lastSeen.After(afterTime) {
+		t.Errorf("LastSeen %v not in expected range [%v, %v]", lastSeen, beforeTime, afterTime)
+	}
+
+	// Check FailCount is 0
+	server.mu.RLock()
+	failCount := server.FailCount
+	server.mu.RUnlock()
+	if failCount != 0 {
+		t.Errorf("FailCount = %d, want 0", failCount)
 	}
 }

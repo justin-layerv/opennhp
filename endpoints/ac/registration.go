@@ -421,13 +421,42 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 			return errors.New("server returned NHP_AAK with Registered=false")
 		}
 
-		// Track the registration peer for cleanup when AC stops or re-registers
+		// Track the registration peer for cleanup when AC stops or re-registers.
+		// NOTE: The peer is intentionally tracked in TWO places:
+		//   - registrationPeer: for cleanup on re-registration (RemovePeer above)
+		//   - assignedServers: for keepalive management (sendKeepalives iterates this)
+		// This dual-tracking is necessary because registrationPeer cleanup happens
+		// before we add the new server to assignedServers.
 		r.mu.Lock()
 		// Clean up old registration peer if exists (re-registration case)
 		if r.registrationPeer != nil {
 			r.ac.device.RemovePeer(r.registrationPeer.PublicKeyBase64())
 		}
 		r.registrationPeer = registrationPeer
+
+		// Replace assignedServers with the registration server for keepalive management.
+		// When NHP_AAK is received directly (no NHP_ARD redispatch), the registration
+		// server IS our assigned server. Without this, keepaliveLoop() has no servers
+		// to send keepalives to, causing the connection to timeout after 5 minutes.
+		// We replace (not append) to avoid duplicate entries on re-registration.
+		sendAddr := registrationPeer.SendAddr()
+		if sendAddr != nil {
+			udpAddr := sendAddr.(*net.UDPAddr)
+			assignedServer := &AssignedServer{
+				Target: common.RedirectTarget{
+					IP:           udpAddr.IP.String(),
+					Port:         udpAddr.Port,
+					PubKeyBase64: registrationPeer.PublicKeyBase64(),
+				},
+				Peer:      registrationPeer,
+				Connected: true,
+				LastSeen:  time.Now(),
+			}
+			r.assignedServers = []*AssignedServer{assignedServer}
+			log.Info("Set registration server as assignedServer for keepalive: %s:%d", udpAddr.IP.String(), udpAddr.Port)
+		} else {
+			log.Warning("Registration peer has nil SendAddr, cannot add to assignedServers for keepalive")
+		}
 		r.mu.Unlock()
 
 		log.Info("Received NHP_AAK: ACAddr=%s, Registered=%v (peer kept for NHP_AOP)", aakMsg.ACAddr, aakMsg.Registered)
