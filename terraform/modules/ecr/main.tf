@@ -1212,6 +1212,8 @@ resource "aws_iam_policy" "terraform_apply_data" {
           "lambda:DeleteFunction",
           "lambda:UpdateFunctionCode",
           "lambda:UpdateFunctionConfiguration",
+          "lambda:PutFunctionConcurrency",
+          "lambda:DeleteFunctionConcurrency",
           "lambda:AddPermission",
           "lambda:RemovePermission",
           "lambda:TagResource",
