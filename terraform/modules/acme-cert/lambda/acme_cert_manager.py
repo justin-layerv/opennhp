@@ -293,9 +293,13 @@ def get_or_create_acme_account(private_key) -> Tuple[Any, Any]:
         # Save the account key for future use
         if ACME_ACCOUNT_SECRET_ARN:
             save_acme_account_key(account_key)
+    except acme.errors.ConflictError as e:
+        # Account already exists with this key - query existing registration
+        logger.info(f"ACME account already exists: {e}")
+        account = acme_client.query_registration(registration)
     except Exception as e:
         if 'already registered' in str(e).lower():
-            # Account exists with this key, this is fine
+            # Fallback check for other "already registered" errors
             logger.info("ACME account already exists with this key")
             account = acme_client.query_registration(registration)
         else:
