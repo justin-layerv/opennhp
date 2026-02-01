@@ -364,8 +364,13 @@ def request_certificate(acme_client, private_key, domains: list) -> Tuple[str, s
 
     csr = csr_builder.sign(private_key, cryptography['hashes'].SHA256(), cryptography['default_backend']())
 
+    # Convert cryptography CSR to pyOpenSSL format (required by josepy)
+    from OpenSSL import crypto as openssl_crypto
+    csr_pem = csr.public_bytes(cryptography['serialization'].Encoding.PEM)
+    openssl_csr = openssl_crypto.load_certificate_request(openssl_crypto.FILETYPE_PEM, csr_pem)
+
     # Request new order
-    order = acme_client.new_order(josepy.ComparableX509(csr))
+    order = acme_client.new_order(josepy.ComparableX509(openssl_csr))
 
     # Process authorizations
     for auth in order.authorizations:
