@@ -125,7 +125,7 @@ use_production_acme = true
 # 4. Invoke Lambda to generate cert: aws lambda invoke --function-name layerv-nhp-sandbox-acme-cert-manager --payload '{"type":"force_renew"}' /dev/stdout
 # 5. Refresh AC instances to pick up the new cert
 
-centralized_cert_enabled = false
+centralized_cert_enabled = true
 centralized_cert_domains = ["nhp.layerv.xyz", "*.nhp.layerv.xyz", "apps.layerv.xyz", "*.apps.layerv.xyz"]
 
 # ==============================================================================

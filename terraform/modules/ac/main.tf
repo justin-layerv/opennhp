@@ -625,10 +625,10 @@ locals {
     qurl_router_cache_shards       = var.qurl_router_config != null ? var.qurl_router_config.cache_shards : 16
     qurl_service_token_secret_arn  = var.qurl_service_token_secret_arn
     # Centralized certificate management (for scalable AC deployments)
-    centralized_cert_enabled       = var.centralized_cert_enabled
-    centralized_cert_secret_arn    = var.centralized_cert_secret_arn != null ? var.centralized_cert_secret_arn : ""
-    centralized_cert_domains       = var.centralized_cert_domains
-    acme_lambda_function_name      = var.acme_lambda_function_name
+    centralized_cert_enabled    = var.centralized_cert_enabled
+    centralized_cert_secret_arn = var.centralized_cert_secret_arn != null ? var.centralized_cert_secret_arn : ""
+    centralized_cert_domains    = var.centralized_cert_domains
+    acme_lambda_function_name   = var.acme_lambda_function_name
   }) : null # Validation failed - this branch never executes (tobool throws first)
 }
 

@@ -231,10 +231,10 @@ module "nhp" {
   guardduty_alert_emails = var.guardduty_alert_emails
 
   # Centralized certificate management
-  centralized_cert_enabled       = var.centralized_cert_enabled
-  centralized_cert_secret_arn    = var.centralized_cert_enabled ? module.acme_cert[0].certificate_secret_arn : null
-  centralized_cert_domains       = var.centralized_cert_enabled ? var.centralized_cert_domains : []
-  acme_lambda_function_name      = var.centralized_cert_enabled ? module.acme_cert[0].lambda_function_name : ""
+  centralized_cert_enabled    = var.centralized_cert_enabled
+  centralized_cert_secret_arn = var.centralized_cert_enabled ? module.acme_cert[0].certificate_secret_arn : null
+  centralized_cert_domains    = var.centralized_cert_enabled ? var.centralized_cert_domains : []
+  acme_lambda_function_name   = var.centralized_cert_enabled ? module.acme_cert[0].lambda_function_name : ""
 }
 
 # ==============================================================================
