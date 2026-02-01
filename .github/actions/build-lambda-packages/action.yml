@@ -1,0 +1,46 @@
+name: 'Build Lambda Packages'
+description: 'Builds Lambda packages with Python dependencies for Terraform'
+
+inputs:
+  python-version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Cache pip packages
+      uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5
+      with:
+        path: ~/.cache/pip
+        key: lambda-pip-${{ runner.os }}-${{ hashFiles('terraform/modules/acme-cert/lambda/requirements.txt') }}
+        restore-keys: |
+          lambda-pip-${{ runner.os }}-
+
+    - name: Build ACME Certificate Lambda
+      shell: bash
+      run: |
+        echo "::group::Building ACME Certificate Manager Lambda"
+        bash terraform/modules/acme-cert/lambda/build.sh
+        echo "::endgroup::"
+
+    - name: Verify Build
+      shell: bash
+      run: |
+        echo "::group::Verifying Lambda Build"
+        bash terraform/modules/acme-cert/lambda/test_build.sh
+        echo "::endgroup::"
+
+    - name: Run Python Unit Tests
+      shell: bash
+      run: |
+        echo "::group::Running Python Unit Tests"
+        pip install -q -r terraform/modules/acme-cert/lambda/requirements-dev.txt
+        pytest terraform/modules/acme-cert/lambda/test_acme_cert_manager.py -v
+        echo "::endgroup::"

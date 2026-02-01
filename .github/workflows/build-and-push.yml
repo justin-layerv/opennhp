@@ -392,6 +392,10 @@ jobs:
         working-directory: terraform/environments/sandbox
         run: terraform fmt -check -recursive ../../
 
+      - name: Build Lambda Packages
+        if: steps.changes.outputs.terraform_changed == 'true'
+        uses: ./.github/actions/build-lambda-packages
+
       - name: Terraform Init
         if: steps.changes.outputs.terraform_changed == 'true'
         working-directory: terraform/environments/sandbox
@@ -503,6 +507,9 @@ jobs:
         with:
           role-to-assume: ${{ matrix.environment == 'prod' && secrets.AWS_PROD_ROLE_ARN || secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build Lambda Packages
+        uses: ./.github/actions/build-lambda-packages
 
       - name: Terraform Init
         working-directory: terraform/environments/${{ matrix.environment }}
@@ -616,6 +623,9 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build Lambda Packages
+        uses: ./.github/actions/build-lambda-packages
 
       - name: Terraform Init
         working-directory: terraform/environments/sandbox
@@ -1048,6 +1058,9 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build Lambda Packages
+        uses: ./.github/actions/build-lambda-packages
 
       - name: Terraform Init
         working-directory: terraform/environments/prod

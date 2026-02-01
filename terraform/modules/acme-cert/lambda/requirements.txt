@@ -1,0 +1,35 @@
+# ACME Certificate Manager Lambda Dependencies
+# Pinned versions for reproducible builds
+#
+# Update process:
+#   1. Check PyPI for latest versions of direct dependencies (acme, cryptography, dnspython)
+#   2. Verify manylinux2014_x86_64 wheels exist: pip download <pkg>==<ver> --platform manylinux2014_x86_64 --only-binary=:all:
+#   3. Update versions below and run: bash build.sh && bash test_build.sh
+#   4. Run Python unit tests: pytest test_acme_cert_manager.py -v
+#   5. Deploy to sandbox and verify Lambda invocation works
+#
+# All packages must have manylinux2014_x86_64 wheels for Lambda compatibility.
+
+# ACME client library (Let's Encrypt protocol)
+acme==2.11.0
+
+# JSON Object Signing and Encryption (ACME dependency)
+josepy==1.14.0
+
+# Cryptography for key generation and certificate handling
+cryptography==43.0.3
+
+# DNS resolver for propagation verification
+dnspython==2.7.0
+
+# Required transitive dependencies (with manylinux wheels)
+pyOpenSSL==24.2.1
+cffi==1.17.1
+pycparser==2.22
+pyrfc3339==1.1
+pytz==2024.2
+requests==2.32.3
+certifi==2024.8.30
+charset-normalizer==3.4.0
+idna==3.10
+urllib3==2.2.3

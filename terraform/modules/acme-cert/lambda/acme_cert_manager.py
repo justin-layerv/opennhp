@@ -38,18 +38,13 @@ cryptography = None
 
 def lazy_import_crypto():
     """Lazy import cryptography libraries to reduce cold start when not needed."""
-    global acme, josepy, cryptography
-    if acme is None:
+    global cryptography
+    if cryptography is None:
         from cryptography import x509
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import rsa, ec
         from cryptography.hazmat.backends import default_backend
-        import acme as acme_lib
-        from acme import client, messages, challenges
-        import josepy as josepy_lib
 
-        acme = acme_lib
-        josepy = josepy_lib
         cryptography = {
             'x509': x509,
             'hashes': hashes,
@@ -58,6 +53,20 @@ def lazy_import_crypto():
             'ec': ec,
             'default_backend': default_backend
         }
+
+
+def lazy_import_acme():
+    """Lazy import ACME/josepy libraries only when renewal is needed."""
+    global acme, josepy
+    # Ensure cryptography is loaded first
+    lazy_import_crypto()
+    if acme is None:
+        import acme as acme_lib
+        from acme import client, messages, challenges
+        import josepy as josepy_lib
+
+        acme = acme_lib
+        josepy = josepy_lib
 
 
 # Environment variables
@@ -180,8 +189,8 @@ def renew_certificate(force: bool = False) -> Dict[str, Any]:
     logger.info(f"Proceeding with certificate renewal for domains: {DOMAINS}")
 
     try:
-        # Import crypto libraries
-        lazy_import_crypto()
+        # Import crypto and ACME libraries
+        lazy_import_acme()
 
         # Generate new private key (4096-bit RSA for compatibility)
         private_key = cryptography['rsa'].generate_private_key(

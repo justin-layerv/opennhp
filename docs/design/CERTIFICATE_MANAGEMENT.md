@@ -155,7 +155,7 @@ centralized_cert_domains = [
 - Single certificate for all ACs (no per-tenant certs)
 - Renewal requires Route 53 access
 - No instant revocation capability
-- Lambda uses third-party [Klayers](https://github.com/keithrozario/Klayers) for Python dependencies (cryptography, acme, dnspython). If these become unavailable, you'll need to build and host your own layers.
+- Lambda dependencies (cryptography, acme, dnspython) are bundled directly in the deployment package via `build.sh`. No external Lambda layers are used.
 
 ---
 

@@ -209,15 +209,20 @@ resource "aws_sns_topic_subscription" "email" {
 # Lambda Function - Certificate Manager
 # ==============================================================================
 
-# NOTE: We use third-party Klayers (https://github.com/keithrozario/Klayers) for
-# Python cryptography, acme, and dnspython libraries. These are version-pinned
-# but hosted in account 770693421928. If these become unavailable, you'll need to
-# build and host your own layers. See docs/design/CERTIFICATE_MANAGEMENT.md.
-
+# Lambda package with bundled dependencies (cryptography, acme, josepy, dnspython)
+#
+# IMPORTANT: The build directory must be created BEFORE terraform plan/apply.
+# - CI: Workflow runs build.sh automatically before terraform
+# - Local: Run `bash terraform/modules/acme-cert/lambda/build.sh` first
+#
+# This bundles dependencies directly instead of using third-party Klayers
+# (which don't exist for Python 3.12 with acme/josepy/dnspython).
+#
+# See lambda/build.sh for the build process and lambda/requirements.txt for deps.
 data "archive_file" "lambda" {
   type        = "zip"
-  source_dir  = "${path.module}/lambda"
-  output_path = "${path.module}/.terraform/lambda-acme-cert.zip"
+  source_dir  = "${path.module}/build/package"
+  output_path = "${path.module}/build/lambda-acme-cert.zip"
 }
 
 resource "aws_lambda_function" "cert_manager" {
@@ -225,19 +230,16 @@ resource "aws_lambda_function" "cert_manager" {
   description   = "ACME certificate manager for ${join(", ", var.domains)}"
   role          = aws_iam_role.lambda.arn
 
+  # Use bundled package with all dependencies included (no external layers)
   filename         = data.archive_file.lambda.output_path
   source_code_hash = data.archive_file.lambda.output_base64sha256
   handler          = "acme_cert_manager.handler"
   runtime          = "python3.12"
+  architectures    = ["x86_64"] # Must match build.sh PLATFORM (manylinux2014_x86_64)
   timeout          = var.lambda_timeout
   memory_size      = var.lambda_memory
 
-  # Use AWS-provided cryptography layer
-  layers = [
-    "arn:aws:lambda:${data.aws_region.current.id}:770693421928:layer:Klayers-p312-cryptography:5",
-    "arn:aws:lambda:${data.aws_region.current.id}:770693421928:layer:Klayers-p312-acme:1",
-    "arn:aws:lambda:${data.aws_region.current.id}:770693421928:layer:Klayers-p312-dnspython:1"
-  ]
+  # Dependencies (cryptography, acme, josepy, dnspython) are bundled in the package
 
   environment {
     variables = {

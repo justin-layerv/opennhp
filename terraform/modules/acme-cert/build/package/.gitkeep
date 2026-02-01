@@ -1,0 +1,2 @@
+# Placeholder for Lambda package. Populated by lambda/build.sh
+# This file ensures the directory exists for terraform plan.
