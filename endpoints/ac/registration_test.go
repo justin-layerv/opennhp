@@ -1,6 +1,7 @@
 package ac
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net"
 	"strings"
@@ -1978,7 +1979,8 @@ func TestACRegistration_NHP_AAK_ServerAddr(t *testing.T) {
 	}
 
 	// Server's direct address (different from NLB)
-	serverDirectIP := "10.0.1.100"
+	// Use a public IP (TEST-NET-3 range) to test the switch-to-direct behavior
+	serverDirectIP := "203.0.113.100"
 	serverDirectPort := 62206
 	serverPubKey := "c2VydmVyLWRpcmVjdC1wdWJrZXk=" // Different from NLB key
 
@@ -2214,7 +2216,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_RemovesOldPeer(t *testing.T) {
 		"errCode": "0",
 		"registered": true,
 		"acAddr": "192.168.1.50:50000",
-		"serverAddr": "10.0.1.100:62206",
+		"serverAddr": "203.0.113.100:62206",
 		"serverPubKey": "%s"
 	}`, serverPubKey)
 
@@ -2348,7 +2350,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_OnlyServerAddr(t *testing.T) {
 		"errCode": "0",
 		"registered": true,
 		"acAddr": "192.168.1.50:50000",
-		"serverAddr": "10.0.1.100:62206"
+		"serverAddr": "203.0.113.100:62206"
 	}`
 
 	ppd := &core.PacketParserData{
@@ -2467,7 +2469,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_ReRegistration(t *testing.T) {
 		"errCode": "0",
 		"registered": true,
 		"acAddr": "192.168.1.50:50000",
-		"serverAddr": "10.0.1.100:62206",
+		"serverAddr": "203.0.113.100:62206",
 		"serverPubKey": "%s"
 	}`, firstServerPubKey)
 
@@ -2500,7 +2502,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_ReRegistration(t *testing.T) {
 		"errCode": "0",
 		"registered": true,
 		"acAddr": "192.168.1.50:50001",
-		"serverAddr": "10.0.2.200:62206",
+		"serverAddr": "203.0.113.200:62206",
 		"serverPubKey": "%s"
 	}`, secondServerPubKey)
 
@@ -2520,8 +2522,8 @@ func TestACRegistration_NHP_AAK_ServerAddr_ReRegistration(t *testing.T) {
 	}
 
 	// Verify the server was replaced
-	if servers[0].Target.IP != "10.0.2.200" {
-		t.Errorf("server IP should be updated to 10.0.2.200, got %s", servers[0].Target.IP)
+	if servers[0].Target.IP != "203.0.113.200" {
+		t.Errorf("server IP should be updated to 203.0.113.200, got %s", servers[0].Target.IP)
 	}
 	if servers[0].Target.PubKeyBase64 != secondServerPubKey {
 		t.Errorf("server pubkey should be updated")
@@ -2569,7 +2571,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_KeepaliveTarget(t *testing.T) {
 		Type:         core.NHP_SERVER,
 	}
 
-	directIP := "10.0.1.100"
+	directIP := "203.0.113.100"
 	serverPubKey := "ZGlyZWN0LXNlcnZlcg=="
 	aakJSON := fmt.Sprintf(`{
 		"errCode": "0",
@@ -2651,7 +2653,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_SamePubKey(t *testing.T) {
 
 	device.AddPeer(registrationPeer)
 
-	directIP := "10.0.1.100"
+	directIP := "203.0.113.100"
 	aakJSON := fmt.Sprintf(`{
 		"errCode": "0",
 		"registered": true,
@@ -2697,26 +2699,26 @@ func TestACRegistration_NHP_AAK_ServerAddr_VariousPorts(t *testing.T) {
 	}{
 		{
 			name:         "standard port",
-			serverAddr:   "10.0.1.100:62206",
-			expectedIP:   "10.0.1.100",
+			serverAddr:   "203.0.113.100:62206",
+			expectedIP:   "203.0.113.100",
 			expectedPort: 62206,
 		},
 		{
 			name:         "high port",
-			serverAddr:   "10.0.1.100:65535",
-			expectedIP:   "10.0.1.100",
+			serverAddr:   "203.0.113.100:65535",
+			expectedIP:   "203.0.113.100",
 			expectedPort: 65535,
 		},
 		{
 			name:         "low port",
-			serverAddr:   "10.0.1.100:1024",
-			expectedIP:   "10.0.1.100",
+			serverAddr:   "203.0.113.100:1024",
+			expectedIP:   "203.0.113.100",
 			expectedPort: 1024,
 		},
 		{
 			name:         "port 1",
-			serverAddr:   "10.0.1.100:1",
-			expectedIP:   "10.0.1.100",
+			serverAddr:   "203.0.113.100:1",
+			expectedIP:   "203.0.113.100",
 			expectedPort: 1,
 		},
 	}
@@ -2789,13 +2791,13 @@ func TestACRegistration_NHP_AAK_ServerAddr_InvalidFormats(t *testing.T) {
 		name       string
 		serverAddr string
 	}{
-		{"missing port", "10.0.1.100"},
+		{"missing port", "203.0.113.100"},
 		{"empty string", ""},
 		{"just colon", ":"},
 		{"port only", ":62206"},
-		{"invalid port", "10.0.1.100:notaport"},
-		{"negative port", "10.0.1.100:-1"},
-		{"spaces", "10.0.1.100 : 62206"},
+		{"invalid port", "203.0.113.100:notaport"},
+		{"negative port", "203.0.113.100:-1"},
+		{"spaces", "203.0.113.100 : 62206"},
 	}
 
 	for _, tc := range testCases {
@@ -2935,5 +2937,215 @@ func TestACRegistration_NHP_AAK_ServerAddr_UnresolvableHost(t *testing.T) {
 		if udpAddr.IP.String() != nlbIP {
 			t.Errorf("fallback should use NLB IP %s, got %s", nlbIP, udpAddr.IP.String())
 		}
+	}
+}
+
+// TestACRegistration_NHP_AAK_ServerAddr_PrivateIPBlocked verifies that when ServerAddr
+// contains a private IP (RFC 1918), the AC stays on the NLB connection instead of
+// switching to the private address which would be unreachable from outside the VPC.
+func TestACRegistration_NHP_AAK_ServerAddr_PrivateIPBlocked(t *testing.T) {
+	var testPrivateKey [32]byte
+	for i := range testPrivateKey {
+		testPrivateKey[i] = byte(i)
+	}
+
+	device := core.NewDevice(core.NHP_AC, testPrivateKey[:], nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-private-ip",
+			ServerEndpoint: "nlb.example.com",
+		},
+		device: device,
+	}
+
+	reg := NewACRegistration(ac)
+
+	// NLB has a public IP
+	nlbIP := "203.0.113.1"
+	nlbPubKey := "bmxiLXB1YmtleQ=="
+	registrationPeer := &core.UdpPeer{
+		Ip:           nlbIP,
+		Port:         62206,
+		PubKeyBase64: nlbPubKey,
+		Type:         core.NHP_SERVER,
+	}
+
+	// Test various non-routable IP ranges
+	testCases := []struct {
+		name      string
+		privateIP string
+	}{
+		// RFC 1918 private ranges
+		{"10.x.x.x range", "10.0.1.100"},
+		{"172.16.x.x range", "172.16.0.100"},
+		{"172.31.x.x range", "172.31.255.100"},
+		{"192.168.x.x range", "192.168.1.100"},
+		// Loopback
+		{"loopback 127.0.0.1", "127.0.0.1"},
+		{"loopback 127.0.0.100", "127.0.0.100"},
+		// Link-local
+		{"link-local 169.254.x.x", "169.254.1.1"},
+		// CGNAT (Carrier-Grade NAT) - 100.64.0.0/10
+		{"CGNAT 100.64.x.x", "100.64.0.1"},
+		{"CGNAT 100.100.x.x", "100.100.100.100"},
+		{"CGNAT 100.127.x.x", "100.127.255.255"},
+	}
+
+	serverPubKey := "c2VydmVyLWRpcmVjdC1wdWJrZXk="
+
+	// Helper to run a single test case
+	runTestCase := func(t *testing.T, privateIP string) {
+		t.Helper()
+
+		// Reset device state
+		device.RemovePeer(nlbPubKey)
+		device.RemovePeer(serverPubKey)
+
+		aakJSON := fmt.Sprintf(`{
+			"errCode": "0",
+			"registered": true,
+			"acAddr": "192.168.1.50:50000",
+			"serverAddr": "%s:62206",
+			"serverPubKey": "%s"
+		}`, privateIP, serverPubKey)
+
+		ppd := &core.PacketParserData{
+			HeaderType:  core.NHP_AAK,
+			BodyMessage: []byte(aakJSON),
+		}
+
+		err := reg.handleRegistrationResponse(ppd, registrationPeer)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		servers := reg.GetAssignedServers()
+		if len(servers) != 1 {
+			t.Fatalf("expected 1 server, got %d", len(servers))
+		}
+		server := servers[0]
+
+		// Verify IP stayed on NLB
+		if server.Target.IP != nlbIP {
+			t.Errorf("should stay on NLB IP %s, got %s (private IP should be blocked)", nlbIP, server.Target.IP)
+		}
+
+		// Verify pubkey updated to server's key
+		if server.Target.PubKeyBase64 != serverPubKey {
+			t.Errorf("should update pubkey to %s, got %s", serverPubKey, server.Target.PubKeyBase64)
+		}
+
+		// Verify peer is registration peer (NLB)
+		if server.Peer != registrationPeer {
+			t.Error("should use registration peer (NLB) when private IP is blocked")
+		}
+
+		// Verify peer map lookup by NEW public key works
+		if device.LookupPeer(decodeTestPubKey(t, serverPubKey)) == nil {
+			t.Error("peer should be findable by server's public key after update")
+		}
+
+		// Verify old NLB key no longer finds peer
+		if device.LookupPeer(decodeTestPubKey(t, nlbPubKey)) != nil {
+			t.Error("peer should NOT be findable by old NLB public key")
+		}
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			runTestCase(t, tc.privateIP)
+		})
+	}
+}
+
+// decodeTestPubKey decodes a base64 public key for test lookup
+func decodeTestPubKey(t *testing.T, pubKeyBase64 string) []byte {
+	t.Helper()
+	decoded, err := base64.StdEncoding.DecodeString(pubKeyBase64)
+	if err != nil {
+		t.Fatalf("failed to decode public key: %v", err)
+	}
+	return decoded
+}
+
+// TestIsNonRoutableIP tests the isNonRoutableIP helper function directly.
+func TestIsNonRoutableIP(t *testing.T) {
+	testCases := []struct {
+		name     string
+		ip       string
+		expected bool
+	}{
+		// RFC 1918 private ranges - should be non-routable
+		{"private 10.0.0.1", "10.0.0.1", true},
+		{"private 10.255.255.255", "10.255.255.255", true},
+		{"private 172.16.0.1", "172.16.0.1", true},
+		{"private 172.31.255.255", "172.31.255.255", true},
+		{"private 192.168.0.1", "192.168.0.1", true},
+		{"private 192.168.255.255", "192.168.255.255", true},
+
+		// Loopback - should be non-routable
+		{"loopback 127.0.0.1", "127.0.0.1", true},
+		{"loopback 127.255.255.255", "127.255.255.255", true},
+
+		// Link-local - should be non-routable
+		{"link-local 169.254.0.1", "169.254.0.1", true},
+		{"link-local 169.254.255.255", "169.254.255.255", true},
+
+		// CGNAT (100.64.0.0/10) - should be non-routable
+		{"CGNAT start 100.64.0.0", "100.64.0.0", true},
+		{"CGNAT middle 100.100.100.100", "100.100.100.100", true},
+		{"CGNAT end 100.127.255.255", "100.127.255.255", true},
+
+		// Just outside CGNAT range - should be routable
+		{"not CGNAT 100.63.255.255", "100.63.255.255", false},
+		{"not CGNAT 100.128.0.0", "100.128.0.0", false},
+
+		// Public IPs - should be routable
+		{"public 8.8.8.8", "8.8.8.8", false},
+		{"public 1.1.1.1", "1.1.1.1", false},
+		{"public 203.0.113.1", "203.0.113.1", false},
+		{"public 52.0.0.1", "52.0.0.1", false},
+
+		// Edge cases for 172.x.x.x - only 172.16-31 is private
+		{"not private 172.15.255.255", "172.15.255.255", false},
+		{"not private 172.32.0.0", "172.32.0.0", false},
+
+		// IPv6 private (fc00::/7) - should be non-routable
+		{"IPv6 private fc00::", "fc00::", true},
+		{"IPv6 private fd00::1", "fd00::1", true},
+
+		// IPv6 loopback - should be non-routable
+		{"IPv6 loopback ::1", "::1", true},
+
+		// IPv6 link-local - should be non-routable
+		{"IPv6 link-local fe80::1", "fe80::1", true},
+
+		// IPv6 public - should be routable
+		{"IPv6 public 2001:4860:4860::8888", "2001:4860:4860::8888", false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ip := net.ParseIP(tc.ip)
+			if ip == nil {
+				t.Fatalf("failed to parse IP: %s", tc.ip)
+			}
+
+			result := isNonRoutableIP(ip)
+			if result != tc.expected {
+				t.Errorf("isNonRoutableIP(%s) = %v, want %v", tc.ip, result, tc.expected)
+			}
+		})
+	}
+}
+
+// TestIsNonRoutableIP_NilIP tests that nil IP is treated as non-routable.
+func TestIsNonRoutableIP_NilIP(t *testing.T) {
+	if !isNonRoutableIP(nil) {
+		t.Error("nil IP should be treated as non-routable")
 	}
 }

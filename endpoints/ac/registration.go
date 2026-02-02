@@ -443,24 +443,42 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 					log.Warning("Invalid port in ServerAddr %s, falling back to registration peer", aakMsg.ServerAddr)
 					serverPeer = registrationPeer
 				} else {
-					// Create new peer with server's direct address
-					serverPeer = &core.UdpPeer{
-						Ip:           host,
-						Port:         port,
-						PubKeyBase64: aakMsg.ServerPubKey,
-						Type:         core.NHP_SERVER,
-					}
-
-					// Verify the new peer can resolve its address
-					if serverPeer.SendAddr() == nil {
-						log.Warning("Cannot resolve server direct address %s, falling back to registration peer", aakMsg.ServerAddr)
+					// Check if the server's direct IP is routable from this AC.
+					// Non-routable IPs should not be used for direct connection when
+					// the AC is outside the VPC (e.g., connected via NLB from internet).
+					// Note: If host is a hostname (not IP), ParseIP returns nil and we
+					// proceed to create a direct connection. This is intentional because
+					// hostnames may resolve differently in different network contexts.
+					serverIP := net.ParseIP(host)
+					if serverIP != nil && isNonRoutableIP(serverIP) {
+						log.Info("Server direct address %s is non-routable, staying on NLB connection", aakMsg.ServerAddr)
+						// Keep using NLB address but update peer's public key to server's key.
+						// Must remove and re-add because device's peer map is keyed by public key.
+						oldPubKey := registrationPeer.PublicKeyBase64()
+						r.ac.device.RemovePeer(oldPubKey)
+						registrationPeer.PubKeyBase64 = aakMsg.ServerPubKey
+						r.ac.device.AddPeer(registrationPeer)
 						serverPeer = registrationPeer
 					} else {
-						// Add the new direct peer to the device
-						r.ac.device.AddPeer(serverPeer)
-						// Remove the old registration peer (connected to NLB)
-						r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
-						log.Info("Switched from NLB %s:%d to server direct address %s", registrationPeer.Ip, registrationPeer.Port, aakMsg.ServerAddr)
+						// Create new peer with server's direct address
+						serverPeer = &core.UdpPeer{
+							Ip:           host,
+							Port:         port,
+							PubKeyBase64: aakMsg.ServerPubKey,
+							Type:         core.NHP_SERVER,
+						}
+
+						// Verify the new peer can resolve its address
+						if serverPeer.SendAddr() == nil {
+							log.Warning("Cannot resolve server direct address %s, falling back to registration peer", aakMsg.ServerAddr)
+							serverPeer = registrationPeer
+						} else {
+							// Add the new direct peer to the device
+							r.ac.device.AddPeer(serverPeer)
+							// Remove the old registration peer (connected to NLB)
+							r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+							log.Info("Switched from NLB %s:%d to server direct address %s", registrationPeer.Ip, registrationPeer.Port, aakMsg.ServerAddr)
+						}
 					}
 				}
 			}
@@ -854,4 +872,36 @@ func (r *ACRegistration) cleanupOldServers(cleanupKey string) {
 			log.Info("Cleaned up old server connection to %s", server.Target.IP)
 		}
 	}
+}
+
+// CGNAT is the Carrier-Grade NAT range (100.64.0.0/10) used by some cloud providers.
+// This is not covered by net.IP.IsPrivate().
+var cgnatBlock = &net.IPNet{
+	IP:   net.IPv4(100, 64, 0, 0),
+	Mask: net.CIDRMask(10, 32),
+}
+
+// isNonRoutableIP checks if an IP address is non-routable from the public internet.
+// This includes:
+//   - RFC 1918 private IPs (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+//   - Loopback (127.0.0.0/8, ::1)
+//   - Link-local (169.254.0.0/16, fe80::/10)
+//   - CGNAT/Carrier-Grade NAT (100.64.0.0/10)
+//   - IPv6 private (fc00::/7)
+func isNonRoutableIP(ip net.IP) bool {
+	if ip == nil {
+		return true // Treat nil as non-routable for safety
+	}
+
+	// Check standard non-routable ranges
+	if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+
+	// Check CGNAT range (100.64.0.0/10) - not covered by IsPrivate()
+	if ip4 := ip.To4(); ip4 != nil && cgnatBlock.Contains(ip4) {
+		return true
+	}
+
+	return false
 }
