@@ -252,6 +252,9 @@ resource "aws_lambda_function" "cert_manager" {
       HOSTED_ZONE_ID             = var.hosted_zone_id
       RENEWAL_DAYS_BEFORE_EXPIRY = tostring(var.renewal_days_before_expiry)
       SNS_TOPIC_ARN              = local.sns_topic_arn
+      # Multi-zone support for domains in different Route 53 zones/accounts
+      DOMAIN_ZONE_MAPPINGS   = jsonencode(var.domain_zone_mappings)
+      CROSS_ACCOUNT_ROLE_ARN = var.cross_account_role_arn != null ? var.cross_account_role_arn : ""
     }
   }
 
@@ -410,6 +413,25 @@ resource "aws_iam_role_policy" "lambda_permissions" {
           "xray:PutTelemetryRecords"
         ]
         Resource = "*"
+      }
+    ]
+  })
+}
+
+# Cross-account STS assume role (for Route53 in another account)
+resource "aws_iam_role_policy" "lambda_cross_account_assume" {
+  count = var.cross_account_role_arn != null ? 1 : 0
+  name  = "${local.function_name}-cross-account-assume"
+  role  = aws_iam_role.lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "AssumeRoute53Role"
+        Effect   = "Allow"
+        Action   = "sts:AssumeRole"
+        Resource = var.cross_account_role_arn
       }
     ]
   })

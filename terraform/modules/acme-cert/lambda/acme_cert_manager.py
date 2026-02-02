@@ -75,9 +75,21 @@ SECRET_ARN = os.environ.get('SECRET_ARN')
 KMS_KEY_ARN = os.environ.get('KMS_KEY_ARN')
 ACME_EMAIL = os.environ.get('ACME_EMAIL')
 ACME_DIRECTORY = os.environ.get('ACME_DIRECTORY', 'https://acme-v02.api.letsencrypt.org/directory')
-HOSTED_ZONE_ID = os.environ.get('HOSTED_ZONE_ID')
+HOSTED_ZONE_ID = os.environ.get('HOSTED_ZONE_ID')  # Default zone for domains not in DOMAIN_ZONE_MAPPINGS
 RENEWAL_DAYS_BEFORE_EXPIRY = int(os.environ.get('RENEWAL_DAYS_BEFORE_EXPIRY', '30'))
 SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
+
+# Multi-zone support: JSON map of domain suffix -> zone ID
+# Example: {"qurl.site": "Z1234", "qurl.link": "Z5678"}
+DOMAIN_ZONE_MAPPINGS_RAW = os.environ.get('DOMAIN_ZONE_MAPPINGS', '{}')
+try:
+    DOMAIN_ZONE_MAPPINGS = json.loads(DOMAIN_ZONE_MAPPINGS_RAW)
+except json.JSONDecodeError:
+    logger.warning(f"Invalid DOMAIN_ZONE_MAPPINGS JSON: {DOMAIN_ZONE_MAPPINGS_RAW!r}, using empty map")
+    DOMAIN_ZONE_MAPPINGS = {}
+
+# Cross-account IAM role for Route53 access in another AWS account
+CROSS_ACCOUNT_ROLE_ARN = os.environ.get('CROSS_ACCOUNT_ROLE_ARN')
 
 # AWS clients
 secrets_client = boto3.client('secretsmanager')
@@ -85,8 +97,106 @@ route53_client = boto3.client('route53')
 sns_client = boto3.client('sns')
 cloudwatch_client = boto3.client('cloudwatch')
 
+# Cross-account Route53 client (lazy initialized with credential expiry tracking)
+_cross_account_route53_client = None
+_cross_account_credentials_expiry = None
+
 # ACME account secret (for persisting account key across invocations)
 ACME_ACCOUNT_SECRET_ARN = os.environ.get('ACME_ACCOUNT_SECRET_ARN')
+
+
+def get_cross_account_route53_client():
+    """Get Route53 client with cross-account credentials.
+
+    Handles credential expiration by refreshing credentials when they're
+    within 5 minutes of expiry. This prevents failures when Lambda containers
+    stay warm for extended periods.
+    """
+    global _cross_account_route53_client, _cross_account_credentials_expiry
+
+    if not CROSS_ACCOUNT_ROLE_ARN:
+        return None
+
+    now = datetime.now(timezone.utc)
+
+    # Check if credentials need refresh (expired or within 5 minutes of expiry)
+    if _cross_account_credentials_expiry is not None:
+        if now >= _cross_account_credentials_expiry - timedelta(minutes=5):
+            logger.debug("Cross-account credentials expiring soon, refreshing")
+            _cross_account_route53_client = None
+            _cross_account_credentials_expiry = None
+
+    if _cross_account_route53_client is None:
+        sts_client = boto3.client('sts')
+        assumed_role = sts_client.assume_role(
+            RoleArn=CROSS_ACCOUNT_ROLE_ARN,
+            RoleSessionName='acme-cert-manager',
+            DurationSeconds=3600  # 1 hour (reasonable for certificate operations)
+        )
+        credentials = assumed_role['Credentials']
+        _cross_account_route53_client = boto3.client(
+            'route53',
+            aws_access_key_id=credentials['AccessKeyId'],
+            aws_secret_access_key=credentials['SecretAccessKey'],
+            aws_session_token=credentials['SessionToken']
+        )
+        _cross_account_credentials_expiry = credentials['Expiration']
+        logger.debug(f"Created cross-account Route53 client, expires: {_cross_account_credentials_expiry}")
+
+    return _cross_account_route53_client
+
+
+def get_zone_for_domain(domain: str) -> Tuple[str, Any]:
+    """
+    Get the hosted zone ID and Route53 client for a domain.
+
+    Returns:
+        Tuple of (zone_id, route53_client)
+    """
+    # Strip _acme-challenge. prefix and wildcard if present
+    clean_domain = domain
+    if clean_domain.startswith('_acme-challenge.'):
+        clean_domain = clean_domain[len('_acme-challenge.'):]
+    if clean_domain.startswith('*.'):
+        clean_domain = clean_domain[2:]
+
+    # Check DOMAIN_ZONE_MAPPINGS for matching suffix (longest match wins)
+    best_match = None
+    best_match_len = 0
+
+    for zone_domain, zone_config in DOMAIN_ZONE_MAPPINGS.items():
+        if clean_domain == zone_domain or clean_domain.endswith('.' + zone_domain):
+            if len(zone_domain) > best_match_len:
+                best_match = zone_config
+                best_match_len = len(zone_domain)
+
+    if best_match:
+        # zone_config can be a string (zone ID) or dict with zone_id and cross_account
+        if isinstance(best_match, dict):
+            zone_id = best_match.get('zone_id')
+            use_cross_account = best_match.get('cross_account', False)
+        else:
+            # Plain string = zone ID, same-account (cross_account defaults to False)
+            zone_id = best_match
+            use_cross_account = False
+
+        # Validate zone_id is present
+        if not zone_id:
+            logger.error(f"No zone_id found in mapping for domain {clean_domain}, falling back to default")
+            return HOSTED_ZONE_ID, route53_client
+
+        if use_cross_account and CROSS_ACCOUNT_ROLE_ARN:
+            client = get_cross_account_route53_client()
+            if client:
+                logger.debug(f"Using cross-account Route53 for {clean_domain} -> zone {zone_id}")
+                return zone_id, client
+
+        logger.debug(f"Using zone mapping for {clean_domain} -> zone {zone_id}")
+        return zone_id, route53_client
+
+    # Fall back to default zone
+    logger.debug(f"Using default zone for {clean_domain} -> zone {HOSTED_ZONE_ID}")
+    return HOSTED_ZONE_ID, route53_client
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -463,11 +573,14 @@ def create_dns_record_multi(record_name: str, values: list):
 
     logger.info(f"Creating DNS TXT record: {record_name} with {len(values)} value(s)")
 
+    # Get the correct zone and client for this domain
+    zone_id, r53_client = get_zone_for_domain(record_name)
+
     # Create ResourceRecords list with all values
     resource_records = [{'Value': f'"{v}"'} for v in values]
 
-    route53_client.change_resource_record_sets(
-        HostedZoneId=HOSTED_ZONE_ID,
+    r53_client.change_resource_record_sets(
+        HostedZoneId=zone_id,
         ChangeBatch={
             'Changes': [{
                 'Action': 'UPSERT',
@@ -490,8 +603,11 @@ def create_dns_record(record_name: str, value: str):
 
     logger.info(f"Creating DNS TXT record: {record_name} = {value[:20]}...")
 
-    route53_client.change_resource_record_sets(
-        HostedZoneId=HOSTED_ZONE_ID,
+    # Get the correct zone and client for this domain
+    zone_id, r53_client = get_zone_for_domain(record_name)
+
+    r53_client.change_resource_record_sets(
+        HostedZoneId=zone_id,
         ChangeBatch={
             'Changes': [{
                 'Action': 'UPSERT',
@@ -513,10 +629,13 @@ def delete_dns_record(record_name: str):
 
     logger.info(f"Deleting DNS TXT record: {record_name}")
 
+    # Get the correct zone and client for this domain
+    zone_id, r53_client = get_zone_for_domain(record_name)
+
     # First, get the current record value
     try:
-        response = route53_client.list_resource_record_sets(
-            HostedZoneId=HOSTED_ZONE_ID,
+        response = r53_client.list_resource_record_sets(
+            HostedZoneId=zone_id,
             StartRecordName=record_name,
             StartRecordType='TXT',
             MaxItems='1'
@@ -529,8 +648,8 @@ def delete_dns_record(record_name: str):
 
         record = records[0]
 
-        route53_client.change_resource_record_sets(
-            HostedZoneId=HOSTED_ZONE_ID,
+        r53_client.change_resource_record_sets(
+            HostedZoneId=zone_id,
             ChangeBatch={
                 'Changes': [{
                     'Action': 'DELETE',

@@ -258,11 +258,18 @@ module "acme_cert" {
   name_prefix         = local.name_prefix
   environment         = var.environment
   domains             = var.centralized_cert_domains
-  hosted_zone_id      = var.qurl_hosted_zone_id # layerv.xyz zone
+  hosted_zone_id      = var.qurl_hosted_zone_id # layerv.xyz zone (default for domains not in domain_zone_mappings)
   acme_email          = var.acme_email
   use_production_acme = var.use_production_acme
   kms_key_arn         = module.nhp.secrets_kms_key_arn
   logs_kms_key_arn    = module.nhp.logs_kms_key_arn
+
+  # Multi-zone support for production domains in layerv-mgmt account
+  domain_zone_mappings = {
+    "qurl.site" = { zone_id = "Z06942509AYXSB91X7CD", cross_account = true }
+    "qurl.link" = { zone_id = "Z0693053DKJ8S3XN9WPG", cross_account = true }
+  }
+  cross_account_role_arn = var.cross_account_route53_role_arn
 
   # Renewal configuration
   renewal_days_before_expiry = 30

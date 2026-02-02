@@ -27,8 +27,39 @@ variable "domains" {
 }
 
 variable "hosted_zone_id" {
-  description = "Route 53 hosted zone ID for DNS-01 challenge"
+  description = "Default Route 53 hosted zone ID for DNS-01 challenge. Used for domains not in domain_zone_mappings."
   type        = string
+}
+
+variable "domain_zone_mappings" {
+  description = <<-EOT
+    Map of domain suffix to Route 53 zone configuration for multi-zone certificate requests.
+    Each entry maps a domain suffix to either a zone ID string, or an object with zone_id and cross_account flag.
+    Example: {
+      "qurl.site" = { zone_id = "Z1234567890", cross_account = true },
+      "qurl.link" = { zone_id = "Z0987654321", cross_account = true }
+    }
+    Domains matching these suffixes will use the specified zone instead of hosted_zone_id.
+  EOT
+  type = map(object({
+    zone_id       = string
+    cross_account = optional(bool, false)
+  }))
+  default = {}
+}
+
+variable "cross_account_role_arn" {
+  description = "IAM role ARN to assume for cross-account Route 53 access. Required if any domain_zone_mappings have cross_account = true."
+  type        = string
+  default     = null
+
+  validation {
+    condition = (
+      var.cross_account_role_arn != null ||
+      length([for k, v in var.domain_zone_mappings : k if v.cross_account]) == 0
+    )
+    error_message = "cross_account_role_arn must be set when any domain_zone_mappings have cross_account = true."
+  }
 }
 
 variable "acme_email" {

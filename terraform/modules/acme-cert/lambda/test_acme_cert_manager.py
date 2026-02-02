@@ -241,5 +241,271 @@ class TestSendAlert:
         send_alert('Test message')
 
 
+class TestMultiZoneSupport:
+    """Tests for multi-zone and cross-account Route53 support."""
+
+    def test_get_zone_for_domain_exact_match(self):
+        """Matches domain exactly in zone mappings."""
+        import acme_cert_manager as acm
+
+        # Save original values
+        orig_mappings = acm.DOMAIN_ZONE_MAPPINGS
+        orig_zone = acm.HOSTED_ZONE_ID
+
+        try:
+            acm.DOMAIN_ZONE_MAPPINGS = {
+                'qurl.site': {'zone_id': 'Z_QURL_SITE', 'cross_account': False}
+            }
+            acm.HOSTED_ZONE_ID = 'Z_DEFAULT'
+
+            zone_id, client = acm.get_zone_for_domain('qurl.site')
+
+            assert zone_id == 'Z_QURL_SITE'
+            assert client == acm.route53_client
+        finally:
+            acm.DOMAIN_ZONE_MAPPINGS = orig_mappings
+            acm.HOSTED_ZONE_ID = orig_zone
+
+    def test_get_zone_for_domain_suffix_match(self):
+        """Matches subdomain by suffix."""
+        import acme_cert_manager as acm
+
+        orig_mappings = acm.DOMAIN_ZONE_MAPPINGS
+        orig_zone = acm.HOSTED_ZONE_ID
+
+        try:
+            acm.DOMAIN_ZONE_MAPPINGS = {
+                'qurl.site': {'zone_id': 'Z_QURL_SITE', 'cross_account': False}
+            }
+            acm.HOSTED_ZONE_ID = 'Z_DEFAULT'
+
+            zone_id, client = acm.get_zone_for_domain('app.qurl.site')
+
+            assert zone_id == 'Z_QURL_SITE'
+        finally:
+            acm.DOMAIN_ZONE_MAPPINGS = orig_mappings
+            acm.HOSTED_ZONE_ID = orig_zone
+
+    def test_get_zone_for_domain_longest_match_wins(self):
+        """Longer suffix match takes precedence."""
+        import acme_cert_manager as acm
+
+        orig_mappings = acm.DOMAIN_ZONE_MAPPINGS
+        orig_zone = acm.HOSTED_ZONE_ID
+
+        try:
+            acm.DOMAIN_ZONE_MAPPINGS = {
+                'site': {'zone_id': 'Z_SITE', 'cross_account': False},
+                'qurl.site': {'zone_id': 'Z_QURL_SITE', 'cross_account': False}
+            }
+            acm.HOSTED_ZONE_ID = 'Z_DEFAULT'
+
+            zone_id, client = acm.get_zone_for_domain('app.qurl.site')
+
+            # qurl.site (10 chars) should win over site (4 chars)
+            assert zone_id == 'Z_QURL_SITE'
+        finally:
+            acm.DOMAIN_ZONE_MAPPINGS = orig_mappings
+            acm.HOSTED_ZONE_ID = orig_zone
+
+    def test_get_zone_for_domain_falls_back_to_default(self):
+        """Uses HOSTED_ZONE_ID when no mapping matches."""
+        import acme_cert_manager as acm
+
+        orig_mappings = acm.DOMAIN_ZONE_MAPPINGS
+        orig_zone = acm.HOSTED_ZONE_ID
+
+        try:
+            acm.DOMAIN_ZONE_MAPPINGS = {
+                'qurl.site': {'zone_id': 'Z_QURL_SITE', 'cross_account': False}
+            }
+            acm.HOSTED_ZONE_ID = 'Z_DEFAULT'
+
+            zone_id, client = acm.get_zone_for_domain('example.com')
+
+            assert zone_id == 'Z_DEFAULT'
+            assert client == acm.route53_client
+        finally:
+            acm.DOMAIN_ZONE_MAPPINGS = orig_mappings
+            acm.HOSTED_ZONE_ID = orig_zone
+
+    def test_get_zone_for_domain_strips_acme_challenge_prefix(self):
+        """Strips _acme-challenge. prefix before matching."""
+        import acme_cert_manager as acm
+
+        orig_mappings = acm.DOMAIN_ZONE_MAPPINGS
+        orig_zone = acm.HOSTED_ZONE_ID
+
+        try:
+            acm.DOMAIN_ZONE_MAPPINGS = {
+                'qurl.site': {'zone_id': 'Z_QURL_SITE', 'cross_account': False}
+            }
+            acm.HOSTED_ZONE_ID = 'Z_DEFAULT'
+
+            zone_id, client = acm.get_zone_for_domain('_acme-challenge.qurl.site')
+
+            assert zone_id == 'Z_QURL_SITE'
+        finally:
+            acm.DOMAIN_ZONE_MAPPINGS = orig_mappings
+            acm.HOSTED_ZONE_ID = orig_zone
+
+    def test_get_zone_for_domain_strips_wildcard(self):
+        """Strips wildcard prefix before matching."""
+        import acme_cert_manager as acm
+
+        orig_mappings = acm.DOMAIN_ZONE_MAPPINGS
+        orig_zone = acm.HOSTED_ZONE_ID
+
+        try:
+            acm.DOMAIN_ZONE_MAPPINGS = {
+                'qurl.site': {'zone_id': 'Z_QURL_SITE', 'cross_account': False}
+            }
+            acm.HOSTED_ZONE_ID = 'Z_DEFAULT'
+
+            zone_id, client = acm.get_zone_for_domain('_acme-challenge.*.qurl.site')
+
+            assert zone_id == 'Z_QURL_SITE'
+        finally:
+            acm.DOMAIN_ZONE_MAPPINGS = orig_mappings
+            acm.HOSTED_ZONE_ID = orig_zone
+
+    def test_get_zone_for_domain_plain_string_mapping(self):
+        """Plain string mapping defaults to same-account (cross_account=False)."""
+        import acme_cert_manager as acm
+
+        orig_mappings = acm.DOMAIN_ZONE_MAPPINGS
+        orig_zone = acm.HOSTED_ZONE_ID
+
+        try:
+            # Plain string (not dict) should default to cross_account=False
+            acm.DOMAIN_ZONE_MAPPINGS = {
+                'qurl.site': 'Z_QURL_SITE'  # Plain string, not dict
+            }
+            acm.HOSTED_ZONE_ID = 'Z_DEFAULT'
+
+            zone_id, client = acm.get_zone_for_domain('qurl.site')
+
+            assert zone_id == 'Z_QURL_SITE'
+            # Should use default client (not cross-account) since cross_account defaults to False
+            assert client == acm.route53_client
+        finally:
+            acm.DOMAIN_ZONE_MAPPINGS = orig_mappings
+            acm.HOSTED_ZONE_ID = orig_zone
+
+    def test_get_zone_for_domain_missing_zone_id_falls_back(self):
+        """Falls back to default zone when zone_id is missing from mapping."""
+        import acme_cert_manager as acm
+
+        orig_mappings = acm.DOMAIN_ZONE_MAPPINGS
+        orig_zone = acm.HOSTED_ZONE_ID
+
+        try:
+            acm.DOMAIN_ZONE_MAPPINGS = {
+                'qurl.site': {'cross_account': False}  # Missing zone_id
+            }
+            acm.HOSTED_ZONE_ID = 'Z_DEFAULT'
+
+            zone_id, client = acm.get_zone_for_domain('qurl.site')
+
+            # Should fall back to default zone
+            assert zone_id == 'Z_DEFAULT'
+        finally:
+            acm.DOMAIN_ZONE_MAPPINGS = orig_mappings
+            acm.HOSTED_ZONE_ID = orig_zone
+
+    @patch('acme_cert_manager.boto3')
+    def test_cross_account_client_uses_assumed_role(self, mock_boto3):
+        """Creates client with STS assumed role credentials."""
+        import acme_cert_manager as acm
+
+        # Reset cached client
+        acm._cross_account_route53_client = None
+        acm._cross_account_credentials_expiry = None
+        orig_role_arn = acm.CROSS_ACCOUNT_ROLE_ARN
+
+        try:
+            acm.CROSS_ACCOUNT_ROLE_ARN = 'arn:aws:iam::123456789:role/test-role'
+
+            # Mock STS assume_role response
+            mock_sts = MagicMock()
+            mock_sts.assume_role.return_value = {
+                'Credentials': {
+                    'AccessKeyId': 'AKIATEST',
+                    'SecretAccessKey': 'secret',
+                    'SessionToken': 'token',
+                    'Expiration': datetime.now(timezone.utc) + timedelta(hours=1)
+                }
+            }
+            mock_boto3.client.side_effect = lambda svc, **kwargs: (
+                mock_sts if svc == 'sts' else MagicMock()
+            )
+
+            client = acm.get_cross_account_route53_client()
+
+            # Verify STS was called with correct role
+            mock_sts.assume_role.assert_called_once()
+            call_kwargs = mock_sts.assume_role.call_args[1]
+            assert call_kwargs['RoleArn'] == 'arn:aws:iam::123456789:role/test-role'
+            assert call_kwargs['RoleSessionName'] == 'acme-cert-manager'
+
+            # Verify Route53 client was created with assumed credentials
+            assert client is not None
+        finally:
+            acm.CROSS_ACCOUNT_ROLE_ARN = orig_role_arn
+            acm._cross_account_route53_client = None
+            acm._cross_account_credentials_expiry = None
+
+    def test_cross_account_client_returns_none_without_role_arn(self):
+        """Returns None when CROSS_ACCOUNT_ROLE_ARN is not set."""
+        import acme_cert_manager as acm
+
+        acm._cross_account_route53_client = None
+        acm._cross_account_credentials_expiry = None
+        orig_role_arn = acm.CROSS_ACCOUNT_ROLE_ARN
+
+        try:
+            acm.CROSS_ACCOUNT_ROLE_ARN = None
+
+            client = acm.get_cross_account_route53_client()
+
+            assert client is None
+        finally:
+            acm.CROSS_ACCOUNT_ROLE_ARN = orig_role_arn
+
+    @patch('acme_cert_manager.boto3')
+    def test_cross_account_client_refreshes_expired_credentials(self, mock_boto3):
+        """Refreshes credentials when they're near expiry."""
+        import acme_cert_manager as acm
+
+        acm._cross_account_route53_client = MagicMock()  # Existing client
+        acm._cross_account_credentials_expiry = datetime.now(timezone.utc) + timedelta(minutes=2)  # Expiring soon
+        orig_role_arn = acm.CROSS_ACCOUNT_ROLE_ARN
+
+        try:
+            acm.CROSS_ACCOUNT_ROLE_ARN = 'arn:aws:iam::123456789:role/test-role'
+
+            mock_sts = MagicMock()
+            mock_sts.assume_role.return_value = {
+                'Credentials': {
+                    'AccessKeyId': 'AKIANEW',
+                    'SecretAccessKey': 'newsecret',
+                    'SessionToken': 'newtoken',
+                    'Expiration': datetime.now(timezone.utc) + timedelta(hours=1)
+                }
+            }
+            mock_boto3.client.side_effect = lambda svc, **kwargs: (
+                mock_sts if svc == 'sts' else MagicMock()
+            )
+
+            client = acm.get_cross_account_route53_client()
+
+            # Should have refreshed (called assume_role again)
+            mock_sts.assume_role.assert_called_once()
+        finally:
+            acm.CROSS_ACCOUNT_ROLE_ARN = orig_role_arn
+            acm._cross_account_route53_client = None
+            acm._cross_account_credentials_expiry = None
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
