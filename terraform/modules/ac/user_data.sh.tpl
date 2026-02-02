@@ -169,13 +169,14 @@ iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || iptables -I INPUT -i lo -j ACCE
 iptables -C INPUT -p tcp -s "${vpc_cidr}" --dport 22 -j ACCEPT 2>/dev/null || \
     iptables -I INPUT -p tcp -s "${vpc_cidr}" --dport 22 -j ACCEPT
 
-# Allow HTTPS (443) from anywhere - NLB preserves client IP, security at app layer
-iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || \
-    iptables -I INPUT -p tcp --dport 443 -j ACCEPT
+# Allow Traefik health check (8080) from VPC - NLB health checks use this port
+# Port 443/80 are NOT opened here - they go through NHP ipset rules for port hiding
+iptables -C INPUT -p tcp -s "${vpc_cidr}" --dport 8080 -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -p tcp -s "${vpc_cidr}" --dport 8080 -j ACCEPT
 
-# Allow HTTP (80) from anywhere - for ACME challenge and redirects to HTTPS
-iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || \
-    iptables -I INPUT -p tcp --dport 80 -j ACCEPT
+# NOTE: Ports 443 and 80 are intentionally NOT allowed by default.
+# Traffic to these ports must match NHP ipset rules (tempset/defaultset) after a valid knock.
+# This enforces true zero-trust network hiding - ports are invisible until authenticated.
 
 # Allow portal (8888) from VPC
 iptables -C INPUT -p tcp -s "${vpc_cidr}" --dport 8888 -j ACCEPT 2>/dev/null || \
