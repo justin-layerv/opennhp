@@ -90,8 +90,9 @@ ECR_REPO="${ac_repo_url}"
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${account_id}.dkr.ecr.${region}.amazonaws.com"
 
 echo "Pulling AC image from ECR..."
-docker pull "$ECR_REPO:${image_tag}" || docker pull "$ECR_REPO:${environment}" || {
-  echo "ERROR: Could not pull AC image from ECR"
+docker pull "$ECR_REPO:${image_tag}" || {
+  echo "ERROR: Could not pull AC image with tag ${image_tag}"
+  echo "This likely means the image hasn't been built yet for this commit"
   exit 1
 }
 
