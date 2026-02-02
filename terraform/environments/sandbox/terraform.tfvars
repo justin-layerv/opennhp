@@ -342,7 +342,7 @@ qurl_link_external_dns    = true                   # Route53 records managed via
 # Requires QURL Service to be deployed (deploy_qurl_service = true)
 # ==============================================================================
 # Enable QURL Router when QURL Service is deployed and internal_service_token is configured
-qurl_router_enabled = false # Set to true after configuring qurl_internal_service_token_arn
+qurl_router_enabled = true
 
 # Cache settings (defaults are reasonable for most use cases)
 # qurl_router_cache_ttl          = 60   # seconds for successful lookups
