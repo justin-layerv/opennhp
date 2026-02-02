@@ -792,6 +792,7 @@ resource "aws_lb_target_group" "ac_tcp" {
     protocol            = "HTTP"
     port                = "8080"
     path                = "/ping"
+    matcher             = "200"
     interval            = 30
     healthy_threshold   = 2
     unhealthy_threshold = 3
