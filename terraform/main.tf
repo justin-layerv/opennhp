@@ -103,6 +103,17 @@ resource "null_resource" "account_validation" {
   }
 }
 
+# Validate qurl_router requires qurl_service_domain for HTTPS API calls
+# The qurl-router plugin uses HTTPS to call the QURL API, which requires a valid
+# TLS certificate. The ALB cert is issued for qurl_service_domain, not the ALB hostname.
+resource "null_resource" "qurl_router_domain_validation" {
+  count = var.qurl_router_enabled && var.qurl_service_domain == null ? 1 : 0
+
+  provisioner "local-exec" {
+    command = "echo 'ERROR: qurl_router_enabled=true requires qurl_service_domain to be set (needed for HTTPS API calls)' && exit 1"
+  }
+}
+
 # ==================== Locals ====================
 
 locals {
@@ -528,9 +539,11 @@ module "ac" {
   console_domain      = var.deploy_console_ec2 && var.console_internal_only ? var.console_ec2_domain : null
 
   # QURL Router Plugin configuration (routes *.qurl.site to target backends)
+  # Note: Uses public domain (api.layerv.xyz) because the ALB cert is issued for that domain,
+  # not the internal ALB hostname. Could also use internal HTTP but ALB has HTTP->HTTPS redirect.
   qurl_router_config = var.deploy_qurl_service && var.qurl_router_enabled ? {
     enabled            = true
-    api_url            = "http://${module.qurl_service[0].alb_dns_name}"
+    api_url            = "https://${var.qurl_service_domain}"
     base_domain        = var.qurl_site_domain
     cache_ttl          = var.qurl_router_cache_ttl
     negative_cache_ttl = var.qurl_router_negative_cache_ttl

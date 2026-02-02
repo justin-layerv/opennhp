@@ -45,11 +45,6 @@ output "api_endpoint" {
   value       = var.domain_name != null ? "https://${var.domain_name}" : "http://${aws_lb.qurl.dns_name}"
 }
 
-output "internal_endpoint" {
-  description = "Internal API endpoint (via ALB DNS)"
-  value       = "http://${aws_lb.qurl.dns_name}:80"
-}
-
 output "log_group_name" {
   description = "CloudWatch log group name"
   value       = aws_cloudwatch_log_group.qurl.name
