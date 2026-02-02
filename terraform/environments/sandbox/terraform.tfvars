@@ -94,11 +94,10 @@ traefik_plugins_deploy_bucket_arn = "arn:aws:s3:::traefik-plugins-deploy-7673978
 # NHP server plugins are now compiled in - only Traefik plugins use S3
 plugin_repos = ["traefik-plugins", "console"]
 
-# Production domains - disabled in sandbox
+# Production domains - now enabled for sandbox testing
 # qurl.site/qurl.link zones are in layerv-mgmt, requiring cross-account Route 53 access
-# which conflicts with nhp.layerv.xyz in layerv account. Enable in prod environment only.
-# production_domains = ["qurl.site", "qurl.link"]
-# cross_account_route53_role_arn = "arn:aws:iam::165115313779:role/nhp-ac-route53-access"
+production_domains             = ["qurl.site", "qurl.link"]
+cross_account_route53_role_arn = "arn:aws:iam::165115313779:role/nhp-ac-route53-access"
 
 # Additional domains for TLS certificates (same account, layerv.xyz zone)
 # apps.layerv.xyz is needed for console2.apps.layerv.xyz (NHP-protected Console)
@@ -126,7 +125,7 @@ use_production_acme = true
 # 5. Refresh AC instances to pick up the new cert
 
 centralized_cert_enabled = true
-centralized_cert_domains = ["nhp.layerv.xyz", "*.nhp.layerv.xyz", "apps.layerv.xyz", "*.apps.layerv.xyz"]
+centralized_cert_domains = ["nhp.layerv.xyz", "*.nhp.layerv.xyz", "apps.layerv.xyz", "*.apps.layerv.xyz", "qurl.site", "*.qurl.site", "qurl.link", "*.qurl.link"]
 
 # ==============================================================================
 # Demo Gateway Configuration
