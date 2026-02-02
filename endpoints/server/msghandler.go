@@ -235,7 +235,7 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	// Register AC connection and send NHP_AAK
 	acPubkeyBase64 := base64.StdEncoding.EncodeToString(ppd.RemotePubKey)
 	s.acPeerMapMutex.Lock()
-	acPeer := s.acPeerMap[acPubkeyBase64] // ac peer's recvAddr has already been updated by nhp packet parser
+	acPeer := s.acPeerMap[acPubkeyBase64] // recvAddr updated by responder.go (unless cloud mode, see below)
 	s.acPeerMapMutex.Unlock()
 
 	// In cloud mode (storage_backend=dynamodb), AC peers are not pre-registered.
@@ -274,6 +274,11 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 			ExpireTime:   0, // No expiration - managed via keepalives
 			Type:         core.NHP_AC,
 		}
+		// Initialize recvAddr from the current packet. Normally this is done by
+		// responder.go during packet validation, but in cloud mode peer validation
+		// is disabled (DisableACPeerValidation=true) so we must do it here.
+		// Without this, processACOperation fails with nil peer address.
+		acPeer.UpdateRecv(ppd.LocalInitTime, ppd.ConnData.RemoteAddr)
 		s.AddACPeer(acPeer)
 		log.Info("server-ac(%s#%d@%s)[HandleACOnline] Cloud mode: created AC peer after license validation", acId, transactionId, addrStr)
 	}

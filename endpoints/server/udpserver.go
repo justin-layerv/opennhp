@@ -1089,6 +1089,13 @@ func (s *UdpServer) processACOperation(knkMsg *common.AgentKnockMsg, conn *ACCon
 	}
 
 	acAddrStr := conn.ACPeer.RecvAddr().String()
+	if acAddrStr == "<nil>" {
+		log.Error("[processACOperation] AC peer %s has nil recvAddr - peer may not be properly initialized", conn.ACId)
+		err = common.ErrACEmptyPassAddress
+		artMsg.ErrCode = common.ErrACEmptyPassAddress.ErrorCode()
+		artMsg.ErrMsg = "AC peer address not initialized"
+		return
+	}
 	if openTime == 0 {
 		openTime = DefaultIpOpenTime
 	}

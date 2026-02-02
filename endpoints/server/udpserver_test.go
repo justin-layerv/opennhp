@@ -1,7 +1,9 @@
 package server
 
 import (
+	"net"
 	"testing"
+	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
@@ -124,5 +126,90 @@ func TestAddACPeer_NonACPeer(t *testing.T) {
 	// Verify peer was NOT added (wrong type)
 	if len(s.acPeerMap) != 0 {
 		t.Errorf("Expected 0 peers in acPeerMap for non-AC peer, got %d", len(s.acPeerMap))
+	}
+}
+
+// TestCloudModePeer_RecvAddrInitialized tests that a peer created in cloud mode
+// has its recvAddr properly initialized after UpdateRecv is called.
+// This is critical because in cloud mode, peer validation is disabled
+// (DisableACPeerValidation=true), so responder.go skips the UpdateRecv call.
+// The fix in HandleACOnline must call UpdateRecv explicitly.
+func TestCloudModePeer_RecvAddrInitialized(t *testing.T) {
+	// Simulate cloud mode peer creation (as done in msghandler.go HandleACOnline)
+	acPeer := &core.UdpPeer{
+		Hostname:     "test-ac",
+		Ip:           "10.0.0.100",
+		Port:         62206,
+		PubKeyBase64: "dGVzdHB1YmtleQ==",
+		ExpireTime:   0,
+	}
+	acPeer.Type = core.NHP_AC
+
+	// Before UpdateRecv, recvAddr.String() returns "<nil>" (the bug we're fixing)
+	// Note: RecvAddr() returns net.Addr interface which is not nil even when
+	// the underlying *net.UDPAddr is nil (Go interface semantics)
+	if acPeer.RecvAddr().String() != "<nil>" {
+		t.Errorf("Expected recvAddr.String() to be '<nil>' before UpdateRecv, got '%s'", acPeer.RecvAddr().String())
+	}
+
+	// Simulate the fix: call UpdateRecv with the connection address
+	remoteAddr := &net.UDPAddr{
+		IP:   net.ParseIP("10.0.0.100"),
+		Port: 62206,
+	}
+	acPeer.UpdateRecv(time.Now().UnixNano(), remoteAddr)
+
+	// After UpdateRecv, recvAddr should have valid address
+	if acPeer.RecvAddr().String() == "<nil>" {
+		t.Fatal("Expected recvAddr to be set after UpdateRecv, still got '<nil>'")
+	}
+
+	// Verify the address matches
+	if acPeer.RecvAddr().String() != "10.0.0.100:62206" {
+		t.Errorf("Expected recvAddr to be '10.0.0.100:62206', got '%s'", acPeer.RecvAddr().String())
+	}
+}
+
+// TestCloudModePeer_RecvAddrUsedInACConn tests that an ACConn created with a
+// properly initialized peer can be used in processACOperation without nil address.
+func TestCloudModePeer_RecvAddrUsedInACConn(t *testing.T) {
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	// Create peer as done in cloud mode
+	acPeer := &core.UdpPeer{
+		Hostname:     "test-ac",
+		Ip:           "10.0.0.100",
+		Port:         62206,
+		PubKeyBase64: "dGVzdHB1YmtleQ==",
+		ExpireTime:   0,
+	}
+	acPeer.Type = core.NHP_AC
+
+	// Initialize recvAddr (the fix)
+	remoteAddr := &net.UDPAddr{
+		IP:   net.ParseIP("10.0.0.100"),
+		Port: 62206,
+	}
+	acPeer.UpdateRecv(time.Now().UnixNano(), remoteAddr)
+
+	// Create ACConn as done in HandleACOnline
+	acConn := &ACConn{
+		ACPeer: acPeer,
+		ACId:   "test-ac",
+	}
+
+	// This is the line that failed with nil in processACOperation
+	acAddrStr := acConn.ACPeer.RecvAddr().String()
+
+	if acAddrStr == "<nil>" {
+		t.Error("ACConn.ACPeer.RecvAddr() returned <nil>, processACOperation would fail")
+	}
+
+	if acAddrStr != "10.0.0.100:62206" {
+		t.Errorf("Expected address '10.0.0.100:62206', got '%s'", acAddrStr)
 	}
 }
