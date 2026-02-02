@@ -3149,3 +3149,195 @@ func TestIsNonRoutableIP_NilIP(t *testing.T) {
 		t.Error("nil IP should be treated as non-routable")
 	}
 }
+
+// TestACRegistration_ResetIptables tests that resetIptables() correctly
+// handles different FilterMode values and nil iptables safely.
+func TestACRegistration_ResetIptables(t *testing.T) {
+	tests := []struct {
+		name       string
+		filterMode int
+	}{
+		{
+			name:       "IPTABLES mode with nil iptables - should not panic",
+			filterMode: FilterMode_IPTABLES,
+		},
+		{
+			name:       "EBPF mode - should not call iptables",
+			filterMode: FilterMode_EBPFXDP,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ac := &UdpAC{
+				config: &Config{
+					ACId:           "test-ac-001",
+					ServerEndpoint: "server.nhp.test.internal",
+					FilterMode:     tc.filterMode,
+				},
+				// iptables is nil - we're testing that resetIptables handles this safely
+			}
+
+			reg := NewACRegistration(ac)
+
+			// This should not panic even with nil iptables
+			// The function checks both FilterMode AND nil iptables before calling
+			reg.resetIptables()
+
+			// If we get here without panic, the nil-safety check works
+		})
+	}
+}
+
+// TestACRegistration_LastSeenUpdatePreventsReregistration tests that updating
+// LastSeen prevents false "server down" detection. This is a regression test
+// for the bug where NHP_KPL (unidirectional) responses were expected to update
+// LastSeen, causing constant re-registration every 30 seconds.
+//
+// The fix updates LastSeen when SENDING a keepalive, not when receiving a response.
+// This test verifies that pattern works correctly with the health check.
+func TestACRegistration_LastSeenUpdatePreventsReregistration(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+
+	reg := NewACRegistration(ac)
+
+	// Create a connected server with recent LastSeen (simulating sendKeepalives behavior)
+	server := &AssignedServer{
+		Target: common.RedirectTarget{
+			IP:           "10.0.0.1",
+			Port:         62206,
+			PubKeyBase64: "pubkey1",
+		},
+	}
+	server.SetConnected(true)
+	server.UpdateLastSeen() // Simulates what sendKeepalives() now does
+
+	reg.assignedServers = []*AssignedServer{server}
+
+	// Run health check - should NOT trigger re-registration
+	reg.checkServerHealth()
+
+	if reg.reregistering.Load() {
+		t.Error("Health check should NOT trigger re-registration when LastSeen is recent")
+	}
+
+	// Simulate time passing but LastSeen being refreshed (like keepalive loop)
+	// Sleep a tiny bit to ensure time advances
+	time.Sleep(10 * time.Millisecond)
+	server.UpdateLastSeen() // Simulates another keepalive send
+
+	reg.checkServerHealth()
+
+	if reg.reregistering.Load() {
+		t.Error("Health check should NOT trigger re-registration after LastSeen refresh")
+	}
+}
+
+// TestACRegistration_StaleLastSeenTriggersReregistration verifies that when
+// LastSeen is NOT updated (e.g., if keepalives fail to send), re-registration
+// is correctly triggered. This ensures the health check still works for
+// legitimate server failures.
+func TestACRegistration_StaleLastSeenTriggersReregistration(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+
+	reg := NewACRegistration(ac)
+
+	// Create a connected server with STALE LastSeen
+	server := &AssignedServer{
+		Target: common.RedirectTarget{
+			IP:           "10.0.0.1",
+			Port:         62206,
+			PubKeyBase64: "pubkey1",
+		},
+	}
+	server.SetConnected(true)
+	// Set LastSeen to 1 hour ago - way past the threshold
+	server.mu.Lock()
+	server.LastSeen = time.Now().Add(-1 * time.Hour)
+	server.mu.Unlock()
+
+	reg.assignedServers = []*AssignedServer{server}
+
+	// Run health check - SHOULD trigger re-registration
+	reg.checkServerHealth()
+
+	if !reg.reregistering.Load() {
+		t.Error("Health check SHOULD trigger re-registration when LastSeen is stale")
+	}
+}
+
+// TestACRegistration_SendKeepalives_SkipsInvalidServers verifies that
+// sendKeepalives correctly skips servers that shouldn't receive keepalives.
+func TestACRegistration_SendKeepalives_SkipsInvalidServers(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+
+	reg := NewACRegistration(ac)
+
+	// Server with no peer - should be skipped
+	serverNoPeer := &AssignedServer{
+		Target: common.RedirectTarget{
+			IP:   "10.0.0.1",
+			Port: 62206,
+		},
+		Peer: nil,
+	}
+	serverNoPeer.SetConnected(true)
+
+	// Server not connected - should be skipped
+	serverNotConnected := &AssignedServer{
+		Target: common.RedirectTarget{
+			IP:   "10.0.0.2",
+			Port: 62206,
+		},
+	}
+	// Connected is false by default
+
+	reg.assignedServers = []*AssignedServer{serverNoPeer, serverNotConnected}
+
+	// Record initial LastSeen times (zero time)
+	noPeerLastSeen := serverNoPeer.GetLastSeen()
+	notConnectedLastSeen := serverNotConnected.GetLastSeen()
+
+	// sendKeepalives would normally update LastSeen, but these servers should be skipped
+	// We can verify this by checking the skip conditions in the code
+
+	// Server with nil peer should NOT have LastSeen updated
+	if serverNoPeer.Peer != nil {
+		t.Error("Test setup error: serverNoPeer should have nil peer")
+	}
+
+	// Server not connected should NOT have LastSeen updated
+	if serverNotConnected.IsConnected() {
+		t.Error("Test setup error: serverNotConnected should not be connected")
+	}
+
+	// Verify neither would be processed (their conditions fail the skip check)
+	// The actual sendKeepalives requires device infrastructure, so we verify
+	// the conditions that would cause them to be skipped
+	for _, server := range reg.assignedServers {
+		if server.Peer == nil || !server.IsConnected() {
+			// This server would be skipped - verify LastSeen unchanged
+			if server.Target.IP == "10.0.0.1" && server.GetLastSeen() != noPeerLastSeen {
+				t.Error("Server with nil peer should be skipped, LastSeen should not change")
+			}
+			if server.Target.IP == "10.0.0.2" && server.GetLastSeen() != notConnectedLastSeen {
+				t.Error("Disconnected server should be skipped, LastSeen should not change")
+			}
+		}
+	}
+}

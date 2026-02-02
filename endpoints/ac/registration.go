@@ -262,6 +262,11 @@ func (r *ACRegistration) registrationLoop() {
 
 		err := r.register()
 		if err == nil {
+			// Registration successful - reset iptables to restore port hiding.
+			// This is critical: the server discovery loop in maintainServerConnectionRoutine
+			// may have opened the firewall (AcceptAllInput) if serverPeerMap was empty.
+			// Now that cloud-mode registration succeeded, we must close it.
+			r.resetIptables()
 			break
 		}
 
@@ -778,6 +783,12 @@ func (r *ACRegistration) sendKeepalives() {
 
 		if r.ac.IsRunning() {
 			r.ac.sendMsgCh <- md
+			// Update LastSeen when we send a keepalive, not when receiving a response.
+			// NHP_KPL is unidirectional - the server receives but doesn't respond.
+			// This keeps the connection "alive" from the AC's perspective as long as
+			// we can queue sends. If the server is truly unreachable, registration
+			// will fail when we eventually try to re-register.
+			server.UpdateLastSeen()
 			log.Debug("Sent NHP_KPL to assigned server %s:%d", server.Target.IP, server.Target.Port)
 		}
 	}
@@ -838,6 +849,8 @@ func (r *ACRegistration) handleServerDown(deadServer *AssignedServer) {
 		err := r.register()
 		if err == nil {
 			log.Info("Re-registration successful after %d attempt(s)", attempt)
+			// Reset iptables to restore port hiding after successful re-registration
+			r.resetIptables()
 			return
 		}
 
@@ -904,4 +917,14 @@ func isNonRoutableIP(ip net.IP) bool {
 	}
 
 	return false
+}
+
+// resetIptables resets iptables rules to restore NHP port hiding.
+// This should be called when cloud-mode registration succeeds to close the firewall
+// that may have been opened by AcceptAllInput() during server discovery.
+func (r *ACRegistration) resetIptables() {
+	if r.ac.config.FilterMode == FilterMode_IPTABLES && r.ac.iptables != nil {
+		log.Info("Resetting iptables after successful registration for AC %s", r.ac.config.ACId)
+		r.ac.iptables.ResetAllInput()
+	}
 }

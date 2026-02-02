@@ -777,6 +777,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
+# WorkingDirectory required for local plugins - Traefik looks for plugins at
+# plugins-local/src/{moduleName}/ relative to this directory
+WorkingDirectory=/home/ubuntu/traefik
 ExecStart=/usr/local/bin/traefik --configFile=/home/ubuntu/traefik/traefik.toml
 Restart=always
 RestartSec=5
