@@ -313,9 +313,12 @@ func TestConnection_SimulatesNLBScenario(t *testing.T) {
 	if acConn == nil {
 		t.Fatal("newConnection returned nil")
 	}
-	// Stop the recv routine that consumes packets
+	// Stop the recv routine that was started by newConnection.
+	// Set a short deadline to unblock ReadFromUDP, then signal stop and wait.
+	acConn.netConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
 	close(acConn.ConnData.StopSignal)
 	acConn.ConnData.Wait()
+	acConn.netConn.SetReadDeadline(time.Time{}) // Clear deadline for test use
 	defer acConn.netConn.Close()
 
 	// Get AC's local port - send to 127.0.0.1:port (not 0.0.0.0:port)
@@ -379,9 +382,12 @@ func TestConnection_ConcurrentReceive(t *testing.T) {
 		t.Fatal("newConnection returned nil")
 	}
 	// Stop the recv routine that was started by newConnection to avoid panic
-	// when it tries to parse our test packets as NHP packets
+	// when it tries to parse our test packets as NHP packets.
+	// Set a short deadline to unblock ReadFromUDP, then signal stop and wait.
+	conn.netConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
 	close(conn.ConnData.StopSignal)
 	conn.ConnData.Wait()
+	conn.netConn.SetReadDeadline(time.Time{}) // Clear deadline for test use
 	defer conn.netConn.Close()
 
 	// Get local port - send to 127.0.0.1:port (not 0.0.0.0:port)
@@ -546,9 +552,12 @@ func TestConnection_BidirectionalCommunication(t *testing.T) {
 	if acConn == nil {
 		t.Fatal("newConnection returned nil")
 	}
-	// Stop the recv routine that was started by newConnection
+	// Stop the recv routine that was started by newConnection.
+	// Set a short deadline to unblock ReadFromUDP, then signal stop and wait.
+	acConn.netConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
 	close(acConn.ConnData.StopSignal)
 	acConn.ConnData.Wait()
+	acConn.netConn.SetReadDeadline(time.Time{}) // Clear deadline for test use
 	defer acConn.netConn.Close()
 
 	// Get AC's local port for server to respond to
@@ -612,9 +621,12 @@ func TestConnection_MultipleSourcesSequential(t *testing.T) {
 	if acConn == nil {
 		t.Fatal("newConnection returned nil")
 	}
-	// Stop the recv routine that consumes packets
+	// Stop the recv routine that consumes packets.
+	// Set a short deadline to unblock ReadFromUDP, then signal stop and wait.
+	acConn.netConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
 	close(acConn.ConnData.StopSignal)
 	acConn.ConnData.Wait()
+	acConn.netConn.SetReadDeadline(time.Time{}) // Clear deadline for test use
 	defer acConn.netConn.Close()
 
 	// Get local port - send to 127.0.0.1:port (not 0.0.0.0:port)
