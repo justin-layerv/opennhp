@@ -523,6 +523,10 @@ cat > /home/ubuntu/traefik/traefik.toml << TRAEFIKEOF
       scheme = "https"
   [entryPoints.traefik]
     address = ":8080"
+    # ProxyProtocol required because NLB target group has proxy_protocol_v2 enabled
+    # This affects ALL traffic including health checks
+    [entryPoints.traefik.proxyProtocol]
+      trustedIPs = ["${vpc_cidr}"]
 
 %{ if centralized_cert_enabled ~}
 # Centralized certificate from Secrets Manager (no per-instance ACME)
