@@ -375,7 +375,7 @@ jobs:
 
       - name: Cache Terraform plugins
         if: steps.changes.outputs.terraform_changed == 'true'
-        uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
         with:
           path: ~/.terraform.d/plugin-cache
           key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
@@ -498,7 +498,7 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
 
       - name: Cache Terraform plugins
-        uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
         with:
           path: ~/.terraform.d/plugin-cache
           key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
@@ -614,7 +614,7 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
 
       - name: Cache Terraform plugins
-        uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
         with:
           path: ~/.terraform.d/plugin-cache
           key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
@@ -1049,7 +1049,7 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
 
       - name: Cache Terraform plugins
-        uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
         with:
           path: ~/.terraform.d/plugin-cache
           key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
