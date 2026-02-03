@@ -345,7 +345,7 @@ qurl_service_token_secret_arn = "arn:aws:secretsmanager:us-east-2:767397897469:s
 deploy_qurl_link          = true
 qurl_link_frontend_domain = "qurl.link"
 qurl_link_hosted_zone_id  = "Z0693053DKJ8S3XN9WPG" # qurl.link zone in layerv-mgmt
-qurl_link_external_dns    = true                   # Route53 records managed via AWS CLI in layerv-mgmt
+qurl_link_external_dns    = false                  # Terraform manages Route53 via aws.route53_mgmt provider
 
 # ==============================================================================
 # QURL Router Plugin Configuration

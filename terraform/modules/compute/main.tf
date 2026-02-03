@@ -426,29 +426,31 @@ resource "aws_security_group" "server" {
 }
 
 # Additional ingress rule for QURL resolve endpoint (NLB TLS → Server HTTP)
-# NLB preserves client source IP, so we restrict to CloudFront IPs only.
-# This ensures only traffic from qurl.link (via CloudFront) can reach the endpoint,
-# blocking direct attacks from arbitrary internet sources.
 #
-# Uses AWS-managed prefix list which is automatically updated when CloudFront IPs change.
-# Only added when HTTPS listener is configured (qurl_resolve_certificate_arn)
+# IMPORTANT: This allows ANY IP to reach the endpoint because:
+# 1. User visits qurl.link (CloudFront → S3 SPA)
+# 2. SPA JavaScript extracts token from URL fragment
+# 3. SPA redirects BROWSER to resolve.qurl.link (NOT via CloudFront!)
+# 4. Browser makes direct HTTPS request to resolve.qurl.link
+#
+# The browser's IP is the source, not CloudFront. Therefore we must allow
+# all IPs. The endpoint is protected by:
+# - TLS encryption (certificate validation)
+# - Token validation in the QURL plugin
+# - Short-lived tokens with limited uses
+#
+# Only added when HTTPS listener is configured (enable_qurl_resolve_endpoint)
 
-# Lookup the AWS-managed CloudFront prefix list
-data "aws_ec2_managed_prefix_list" "cloudfront" {
-  count = var.enable_qurl_resolve_endpoint ? 1 : 0
-  name  = "com.amazonaws.global.cloudfront.origin-facing"
-}
-
-resource "aws_security_group_rule" "server_https_from_cloudfront" {
+resource "aws_security_group_rule" "server_https_from_internet" {
   count = var.enable_qurl_resolve_endpoint ? 1 : 0
 
   type              = "ingress"
   from_port         = 8888
   to_port           = 8888
   protocol          = "tcp"
-  prefix_list_ids   = [data.aws_ec2_managed_prefix_list.cloudfront[0].id]
+  cidr_blocks       = ["0.0.0.0/0"]
   security_group_id = aws_security_group.server.id
-  description       = "QURL resolve endpoint - CloudFront only (via NLB TLS)"
+  description       = "QURL resolve endpoint - browser access via NLB TLS"
 }
 
 # User Data script - using templatefile for proper interpolation

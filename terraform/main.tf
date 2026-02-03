@@ -1139,10 +1139,11 @@ resource "aws_acm_certificate_validation" "qurl_resolve" {
 # Route53 record for QURL token resolution endpoint
 # Points resolve.qurl.link to the NHP Server NLB (NOT the AC NLB)
 #
-# Note: No AAAA (IPv6) record is needed because:
-# 1. The NHP Server NLB is IPv4-only (ip_address_type defaults to "ipv4")
-# 2. The only intended client is CloudFront (restricted by security group)
-# 3. CloudFront will resolve to IPv4 when making origin requests
+# IMPORTANT: This DNS record is for BROWSER access, not CloudFront!
+# Flow: User visits qurl.link → SPA redirects browser → browser hits resolve.qurl.link
+# The browser's IP is the client, so security group allows 0.0.0.0/0.
+#
+# Note: No AAAA (IPv6) record is needed because the NHP Server NLB is IPv4-only.
 resource "aws_route53_record" "qurl_link_resolve" {
   count    = var.deploy_qurl_link && !var.qurl_link_external_dns ? 1 : 0
   provider = aws.route53_mgmt
