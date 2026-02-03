@@ -868,6 +868,88 @@ func (r *ACRegistration) handleServerDown(deadServer *AssignedServer) {
 	log.Error("Re-registration failed after %d attempts, continuing with remaining servers", MaxReregistrationAttempts)
 }
 
+// IsServerAddress checks if the given address belongs to an assigned server.
+// This is used to determine if a connection closure should trigger re-registration.
+func (r *ACRegistration) IsServerAddress(addr string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	for _, server := range r.assignedServers {
+		// Use net.JoinHostPort for correct IPv6 formatting (adds brackets)
+		// e.g., "::1" + 62206 -> "[::1]:62206" to match net.UDPAddr.String()
+		serverAddr := net.JoinHostPort(server.Target.IP, strconv.Itoa(server.Target.Port))
+		if serverAddr == addr {
+			return true
+		}
+	}
+
+	// Also check the registration peer (for single-server cloud mode)
+	if r.registrationPeer != nil {
+		peerAddr := r.registrationPeer.SendAddr()
+		if peerAddr != nil && peerAddr.String() == addr {
+			return true
+		}
+	}
+
+	return false
+}
+
+// TriggerReregistration triggers re-registration due to a connection event.
+// This should be called when a server connection closes unexpectedly (e.g., socket
+// timeout/recreation) to ensure the server has our current address.
+// The reason parameter is logged for debugging.
+func (r *ACRegistration) TriggerReregistration(reason string) {
+	// Use atomic flag to prevent concurrent re-registration attempts
+	if !r.reregistering.CompareAndSwap(false, true) {
+		log.Debug("Re-registration already in progress, skipping trigger for: %s", reason)
+		return
+	}
+
+	log.Info("Triggering re-registration due to: %s", reason)
+
+	go func() {
+		// Always reset reregistering flag when done
+		defer r.reregistering.Store(false)
+
+		// Small jitter to avoid thundering herd if multiple connections close.
+		// Use half of ReregistrationJitter (0-2.5s) for connection-triggered re-registration
+		// since these are more time-sensitive than server-down scenarios (which use 0-5s).
+		jitter := time.Duration(rand.Intn(int(ReregistrationJitter.Milliseconds()/2))) * time.Millisecond
+		select {
+		case <-r.stopCh:
+			return
+		case <-time.After(jitter):
+		}
+
+		// Attempt re-registration with backoff
+		for attempt := 1; attempt <= MaxReregistrationAttempts; attempt++ {
+			select {
+			case <-r.stopCh:
+				return
+			default:
+			}
+
+			err := r.register()
+			if err == nil {
+				log.Info("Re-registration successful after %d attempt(s) (triggered by: %s)", attempt, reason)
+				r.resetIptables()
+				return
+			}
+
+			backoff := time.Duration(attempt*attempt) * time.Second
+			log.Warning("Re-registration attempt %d failed: %v, retrying in %v", attempt, err, backoff)
+
+			select {
+			case <-r.stopCh:
+				return
+			case <-time.After(backoff + jitter):
+			}
+		}
+
+		log.Error("Re-registration failed after %d attempts (triggered by: %s)", MaxReregistrationAttempts, reason)
+	}()
+}
+
 // cleanupOldServers removes old server connections after grace period.
 // Each cleanup goroutine receives a unique key to identify which set of servers
 // to clean up, preventing race conditions with overlapping reassignments.

@@ -131,6 +131,9 @@ Server validates against `nhp-licenses` table in DynamoDB. If valid, the AC's
 public key (from the NHP_AOL packet) is added to the peer map dynamically.
 See `docs/design/PLUGGABLE_STORAGE_BACKEND.md` Section 6.2 for details.
 
+For details on AC registration robustness (handling socket recreation, stale
+connections, and re-registration), see `docs/design/AC_REGISTRATION_ROBUSTNESS.md`.
+
 **On-Prem Mode (etcd storage backend):**
 
 In on-prem deployments, AC trust is established via **etcd pre-registration**:

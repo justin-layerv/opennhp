@@ -448,7 +448,13 @@ func (a *UdpAC) connectionRoutine(conn *UdpConn) {
 
 		case <-time.After(time.Duration(conn.ConnData.TimeoutMs) * time.Millisecond):
 			// timeout, quit routine
-			log.Debug("Connection routine idle timeout")
+			log.Debug("Connection routine idle timeout for %s", addrStr)
+			// If this is a server connection in cloud mode, trigger re-registration
+			// so the server gets our new address when we reconnect.
+			if a.registration != nil && a.registration.IsServerAddress(addrStr) {
+				log.Info("Server connection %s timed out, triggering re-registration", addrStr)
+				a.registration.TriggerReregistration("server_connection_timeout")
+			}
 			return
 
 		case pkt, ok := <-conn.ConnData.SendQueue:

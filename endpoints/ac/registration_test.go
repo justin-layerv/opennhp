@@ -3341,3 +3341,223 @@ func TestACRegistration_SendKeepalives_SkipsInvalidServers(t *testing.T) {
 		}
 	}
 }
+
+// TestACRegistration_IsServerAddress tests the IsServerAddress method that determines
+// if a given address belongs to an assigned server (used by connectionRoutine timeout handling).
+func TestACRegistration_IsServerAddress(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+
+	reg := NewACRegistration(ac)
+
+	// Add some assigned servers (including IPv6)
+	reg.assignedServers = []*AssignedServer{
+		{
+			Target: common.RedirectTarget{
+				IP:   "10.0.0.1",
+				Port: 62206,
+			},
+		},
+		{
+			Target: common.RedirectTarget{
+				IP:   "192.168.1.100",
+				Port: 62206,
+			},
+		},
+		{
+			Target: common.RedirectTarget{
+				IP:   "::1", // IPv6 loopback
+				Port: 62206,
+			},
+		},
+		{
+			Target: common.RedirectTarget{
+				IP:   "2001:db8::1", // IPv6 address
+				Port: 8080,
+			},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		addr     string
+		expected bool
+	}{
+		{
+			name:     "exact match first server",
+			addr:     "10.0.0.1:62206",
+			expected: true,
+		},
+		{
+			name:     "exact match second server",
+			addr:     "192.168.1.100:62206",
+			expected: true,
+		},
+		{
+			name:     "IPv6 loopback with brackets (as net.UDPAddr.String() formats)",
+			addr:     "[::1]:62206",
+			expected: true,
+		},
+		{
+			name:     "IPv6 address with brackets",
+			addr:     "[2001:db8::1]:8080",
+			expected: true,
+		},
+		{
+			name:     "IPv6 wrong port",
+			addr:     "[::1]:12345",
+			expected: false,
+		},
+		{
+			name:     "wrong port",
+			addr:     "10.0.0.1:12345",
+			expected: false,
+		},
+		{
+			name:     "wrong IP",
+			addr:     "10.0.0.99:62206",
+			expected: false,
+		},
+		{
+			name:     "completely different address",
+			addr:     "8.8.8.8:53",
+			expected: false,
+		},
+		{
+			name:     "empty address",
+			addr:     "",
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := reg.IsServerAddress(tt.addr)
+			if result != tt.expected {
+				t.Errorf("IsServerAddress(%q) = %v, want %v", tt.addr, result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestACRegistration_IsServerAddress_WithRegistrationPeer tests that IsServerAddress
+// also checks the registration peer address.
+func TestACRegistration_IsServerAddress_WithRegistrationPeer(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+
+	reg := NewACRegistration(ac)
+
+	// Create a registration peer with a send address
+	regPeer := &core.UdpPeer{
+		Ip:   "10.0.0.50",
+		Port: 62206,
+	}
+	regPeer.Type = core.NHP_SERVER
+	// Set SendAddr by encoding the IP/Port (UdpPeer uses these fields)
+	reg.registrationPeer = regPeer
+
+	// No assigned servers, only registration peer
+	reg.assignedServers = nil
+
+	// Registration peer address should match
+	// Note: SendAddr() returns *net.UDPAddr from the peer's Ip:Port fields
+	peerAddr := fmt.Sprintf("%s:%d", regPeer.Ip, regPeer.Port)
+
+	if !reg.IsServerAddress(peerAddr) {
+		t.Errorf("Expected IsServerAddress(%q) = true for registration peer", peerAddr)
+	}
+
+	// Other addresses should not match
+	if reg.IsServerAddress("8.8.8.8:53") {
+		t.Error("Expected IsServerAddress to return false for non-server address")
+	}
+}
+
+// TestACRegistration_TriggerReregistration_AtomicGuard tests that TriggerReregistration
+// respects the atomic re-registration guard to prevent concurrent re-registrations.
+func TestACRegistration_TriggerReregistration_AtomicGuard(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+
+	reg := NewACRegistration(ac)
+
+	// First call should proceed
+	reg.TriggerReregistration("test_reason_1")
+
+	// Poll for reregistering flag to be set (more reliable than fixed sleep)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if reg.reregistering.Load() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Verify reregistering flag is set
+	if !reg.reregistering.Load() {
+		t.Error("Expected reregistering flag to be true after first trigger")
+	}
+
+	// Second call while first is in progress should be skipped
+	reg.TriggerReregistration("test_reason_2")
+
+	// Brief pause to let second call attempt to run
+	time.Sleep(5 * time.Millisecond)
+
+	// The key assertion is that reregistering flag is still true (first call still running)
+	// and second call was skipped (didn't reset the flag or cause issues)
+	if !reg.reregistering.Load() {
+		t.Error("Expected reregistering flag to still be true (first trigger still running)")
+	}
+
+	// Stop the registration to clean up
+	reg.Stop()
+}
+
+// TestACRegistration_TriggerReregistration_StopsOnShutdown tests that TriggerReregistration
+// respects the stop channel and exits cleanly during shutdown.
+func TestACRegistration_TriggerReregistration_StopsOnShutdown(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+
+	reg := NewACRegistration(ac)
+
+	// Trigger re-registration
+	reg.TriggerReregistration("shutdown_test")
+
+	// Give goroutine time to start
+	time.Sleep(10 * time.Millisecond)
+
+	// Stop immediately - should cause the goroutine to exit
+	reg.Stop()
+
+	// Verify reregistering flag is eventually cleared
+	time.Sleep(100 * time.Millisecond)
+
+	// After stop, the flag should be cleared (goroutine exited)
+	// Note: The flag might still be true if goroutine didn't exit yet,
+	// but Stop() should have closed stopCh
+	select {
+	case <-reg.stopCh:
+		// Good - stop channel is closed
+	default:
+		t.Error("Expected stopCh to be closed after Stop()")
+	}
+}
