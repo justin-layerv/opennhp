@@ -2,11 +2,16 @@
 # Provides managed PostgreSQL for the console application
 
 # ==================== Random Password ====================
+# Use only URL-safe special characters to prevent encoding issues in database connection URLs.
+# Ref: https://github.com/layervai/nhp/issues/49
+#
+# Excluded (URL-unsafe): ! # $ % & * ( ) = + [ ] { } < > : ? @
+# Included (URL-safe):   - _
 
 resource "random_password" "master" {
   length           = 32
   special          = true
-  override_special = "!#$%&*()-_=+[]{}<>:?"
+  override_special = "-_"
 }
 
 # ==================== Secrets Manager ====================
