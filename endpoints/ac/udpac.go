@@ -559,6 +559,14 @@ func (a *UdpAC) maintainServerConnectionRoutine() {
 		defer a.iptables.ResetAllInput()
 	}
 
+	// Check for cloud mode at startup (no static servers configured)
+	a.serverPeerMutex.Lock()
+	isCloudMode := len(a.serverPeerMap) == 0
+	a.serverPeerMutex.Unlock()
+	if isCloudMode {
+		log.Info("Cloud mode detected: no static servers configured, AC will use dynamic registration")
+	}
+
 	var discoveryRoutineWg sync.WaitGroup
 	defer discoveryRoutineWg.Wait()
 
@@ -596,6 +604,12 @@ func (a *UdpAC) maintainServerConnectionRoutine() {
 				case <-quitCheck:
 					return
 				case <-time.After(MinialServerDiscoveryInterval * time.Second):
+					// Skip fail-open logic if no servers configured (cloud mode uses registration, not discovery)
+					if len(discoveryFailStatusArr) == 0 {
+						log.Debug("Cloud mode: skipping fail-open check (no static servers configured)")
+						continue
+					}
+
 					var totalFail int32
 					for _, status := range discoveryFailStatusArr {
 						totalFail += atomic.LoadInt32(status)

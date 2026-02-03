@@ -122,7 +122,51 @@ func NewIPTables() (*IPTables, error) {
 		}
 	}
 
+	// Clean up any stale fail-open rules from previous process instances
+	t.ClearStaleFailOpenRules()
+
 	return t, nil
+}
+
+// ClearStaleFailOpenRules removes any fail-open ACCEPT rules that may have been
+// left behind by a previous process instance. This is necessary because the
+// AcceptInputMode flag is in-memory only, and if the process crashes or restarts
+// while fail-open rules are active, the new process won't know to remove them.
+//
+// AcceptAllInput() adds both INPUT and FORWARD rules, so we must clean up both.
+func (table *IPTables) ClearStaleFailOpenRules() {
+	// Try to remove IPv4 fail-open INPUT rule (ignore errors if rule doesn't exist)
+	cmd := exec.Command(table.Binary, "-D", "INPUT", "-d", "0.0.0.0/0", "-j", "ACCEPT")
+	if err := cmd.Run(); err == nil {
+		log.Warning("Removed stale fail-open INPUT ACCEPT rule from previous process instance")
+	} else {
+		log.Debug("No stale fail-open INPUT rule found (this is normal)")
+	}
+
+	// Try to remove IPv4 fail-open FORWARD rule
+	cmdFwd := exec.Command(table.Binary, "-D", "FORWARD", "-d", "0.0.0.0/0", "-j", "ACCEPT")
+	if err := cmdFwd.Run(); err == nil {
+		log.Warning("Removed stale fail-open FORWARD ACCEPT rule from previous process instance")
+	} else {
+		log.Debug("No stale fail-open FORWARD rule found (this is normal)")
+	}
+
+	// Try to remove IPv6 fail-open rules if ip6tables is available
+	if table.IPv6Available {
+		cmd6 := exec.Command(table.Binary6, "-D", "INPUT", "-d", "::/0", "-j", "ACCEPT")
+		if err := cmd6.Run(); err == nil {
+			log.Warning("Removed stale fail-open INPUT6 ACCEPT rule from previous process instance")
+		} else {
+			log.Debug("No stale fail-open INPUT6 rule found (this is normal)")
+		}
+
+		cmd6Fwd := exec.Command(table.Binary6, "-D", "FORWARD", "-d", "::/0", "-j", "ACCEPT")
+		if err := cmd6Fwd.Run(); err == nil {
+			log.Warning("Removed stale fail-open FORWARD6 ACCEPT rule from previous process instance")
+		} else {
+			log.Debug("No stale fail-open FORWARD6 rule found (this is normal)")
+		}
+	}
 }
 
 func (table *IPTables) changePolicy(inputPolicy, forwardPolicy, outputPolicy *int) {
