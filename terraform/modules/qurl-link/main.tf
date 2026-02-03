@@ -88,9 +88,9 @@ locals {
       'use strict';
       var RESOLVE_URL = '${var.nhp_resolve_url}';
       var token = window.location.hash.substring(1);
-      // Token format: at_ prefix followed by 7-64 alphanumeric/underscore characters
-      // Max length prevents potential DoS via extremely long tokens
-      if (!token || !/^at_[A-Za-z0-9_]{7,64}$/.test(token)) {
+      // Token format matches QURL service generation (qurl-service/internal/domain/qurl.go):
+      // at_ prefix + 22 base64url chars (lowercase alphanumeric, underscore, hyphen)
+      if (!token || !/^at_[a-z0-9_-]{22}$/.test(token)) {
         document.getElementById('loading').style.display = 'none';
         document.getElementById('error').style.display = 'block';
         return;

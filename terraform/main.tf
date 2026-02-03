@@ -1036,7 +1036,7 @@ module "qurl_link" {
   domain_name         = var.qurl_link_frontend_domain
   bucket_name         = "${local.name_prefix}-qurl-link"
   acm_certificate_arn = aws_acm_certificate_validation.qurl_link[0].certificate_arn
-  nhp_resolve_url     = "https://ac.${var.domain_name}/plugins/qurl"
+  nhp_resolve_url     = "https://resolve.${var.qurl_link_frontend_domain}/plugins/qurl"
   enable_access_logs  = var.qurl_link_enable_access_logs
 
   tags = local.common_tags
@@ -1072,5 +1072,23 @@ resource "aws_route53_record" "qurl_link_ipv6" {
     name                   = module.qurl_link[0].cloudfront_domain_name
     zone_id                = module.qurl_link[0].cloudfront_hosted_zone_id
     evaluate_target_health = false
+  }
+}
+
+# Route53 record for QURL token resolution endpoint
+# Points resolve.qurl.link to the AC NLB where the QURL plugin handles token resolution
+# This overrides the wildcard *.qurl.link which points to the wrong NLB
+resource "aws_route53_record" "qurl_link_resolve" {
+  count    = var.deploy_qurl_link && var.deploy_ac && !var.qurl_link_external_dns ? 1 : 0
+  provider = aws.route53_mgmt
+
+  zone_id = var.qurl_link_hosted_zone_id
+  name    = "resolve.${var.qurl_link_frontend_domain}"
+  type    = "A"
+
+  alias {
+    name                   = module.ac[0].nlb_dns_name
+    zone_id                = module.ac[0].nlb_zone_id
+    evaluate_target_health = true
   }
 }
