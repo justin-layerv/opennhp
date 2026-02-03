@@ -2,6 +2,7 @@ package ac
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net"
 	"strings"
@@ -3559,5 +3560,294 @@ func TestACRegistration_TriggerReregistration_StopsOnShutdown(t *testing.T) {
 		// Good - stop channel is closed
 	default:
 		t.Error("Expected stopCh to be closed after Stop()")
+	}
+}
+
+// TestRegistrationRefreshInterval verifies the periodic refresh constant is set correctly.
+// The refresh interval determines how often NHP_AOL is re-sent to refresh server peer state,
+// handling server restarts where the server loses peer state but the AC continues
+// sending successful keep-alives.
+func TestRegistrationRefreshInterval(t *testing.T) {
+	// Verify refresh happens every 60 seconds (6 * 10s keepalive interval)
+	expectedTicks := 6
+	if RegistrationRefreshInterval != expectedTicks {
+		t.Errorf("Expected RegistrationRefreshInterval to be %d, got %d", expectedTicks, RegistrationRefreshInterval)
+	}
+
+	// Verify the actual interval is 60 seconds
+	actualInterval := time.Duration(RegistrationRefreshInterval) * KeepaliveInterval
+	expectedInterval := 60 * time.Second
+	if actualInterval != expectedInterval {
+		t.Errorf("Expected actual refresh interval to be %v, got %v", expectedInterval, actualInterval)
+	}
+}
+
+// TestRefreshAssignedServerRegistrations_NoServers verifies the function handles
+// an empty server list gracefully without panicking.
+func TestRefreshAssignedServerRegistrations_NoServers(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+
+	reg := NewACRegistration(ac)
+
+	// Should not panic with empty server list
+	reg.refreshAssignedServerRegistrations()
+	// Test passes if no panic occurs
+}
+
+// TestRefreshAssignedServerRegistrations_SkipsDisconnectedServers verifies that
+// the refresh logic skips servers that are not connected.
+func TestRefreshAssignedServerRegistrations_SkipsDisconnectedServers(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+		sendMsgCh: make(chan *core.MsgData, 10),
+	}
+
+	reg := NewACRegistration(ac)
+
+	// Add servers with different connection states
+	server1 := &AssignedServer{
+		Target: common.RedirectTarget{
+			IP:   "10.0.1.100",
+			Port: 62206,
+		},
+		Connected: false, // Not connected - should be skipped
+		Peer:      nil,
+	}
+
+	server2 := &AssignedServer{
+		Target: common.RedirectTarget{
+			IP:   "10.0.2.100",
+			Port: 62206,
+		},
+		Connected: true,
+		Peer:      nil, // Nil peer - should be skipped
+	}
+
+	reg.mu.Lock()
+	reg.assignedServers = []*AssignedServer{server1, server2}
+	reg.mu.Unlock()
+
+	// Should not panic and should skip both servers
+	reg.refreshAssignedServerRegistrations()
+
+	// Verify no messages were sent (both servers should be skipped)
+	select {
+	case <-ac.sendMsgCh:
+		t.Error("Expected no messages to be sent for disconnected/nil-peer servers")
+	default:
+		// Good - no messages sent
+	}
+}
+
+// TestHandleRefreshResponse_Success tests successful NHP_AAK response handling.
+func TestHandleRefreshResponse_Success(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+
+	reg := NewACRegistration(ac)
+
+	server := &AssignedServer{
+		Target: common.RedirectTarget{
+			IP:   "10.0.1.100",
+			Port: 62206,
+		},
+		Connected: true,
+		LastSeen:  time.Now().Add(-time.Minute), // Set old LastSeen
+	}
+
+	sendAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.100"), Port: 62206}
+
+	// Create successful NHP_AAK response
+	aakMsg := common.ServerACAckMsg{
+		ErrCode: common.ErrSuccess.ErrorCode(),
+	}
+	aakBytes, _ := json.Marshal(aakMsg)
+
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: aakBytes,
+	}
+
+	oldLastSeen := server.GetLastSeen()
+
+	// Handle the response
+	reg.handleRefreshResponse(ppd, server, sendAddr)
+
+	// Verify LastSeen was updated
+	if !server.GetLastSeen().After(oldLastSeen) {
+		t.Error("Expected LastSeen to be updated after successful refresh")
+	}
+}
+
+// TestHandleRefreshResponse_Rejected tests NHP_AAK with error code handling.
+func TestHandleRefreshResponse_Rejected(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+
+	reg := NewACRegistration(ac)
+
+	server := &AssignedServer{
+		Target: common.RedirectTarget{
+			IP:   "10.0.1.100",
+			Port: 62206,
+		},
+		Connected: true,
+		LastSeen:  time.Now().Add(-time.Minute),
+	}
+
+	sendAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.100"), Port: 62206}
+
+	// Create rejected NHP_AAK response
+	aakMsg := common.ServerACAckMsg{
+		ErrCode: "license_invalid",
+		ErrMsg:  "License validation failed",
+	}
+	aakBytes, _ := json.Marshal(aakMsg)
+
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: aakBytes,
+	}
+
+	oldLastSeen := server.GetLastSeen()
+
+	// Handle the response - should not update LastSeen
+	reg.handleRefreshResponse(ppd, server, sendAddr)
+
+	// Verify LastSeen was NOT updated (rejection)
+	if server.GetLastSeen() != oldLastSeen {
+		t.Error("Expected LastSeen to NOT be updated after rejected refresh")
+	}
+}
+
+// TestHandleRefreshResponse_Redirect tests NHP_ARD response triggering re-registration.
+func TestHandleRefreshResponse_Redirect(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+		sendMsgCh: make(chan *core.MsgData, 10),
+	}
+
+	reg := NewACRegistration(ac)
+
+	server := &AssignedServer{
+		Target: common.RedirectTarget{
+			IP:   "10.0.1.100",
+			Port: 62206,
+		},
+		Connected: true,
+	}
+
+	sendAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.100"), Port: 62206}
+
+	// Create NHP_ARD response (server wants us to connect elsewhere)
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_ARD,
+		BodyMessage: []byte("{}"), // Empty ARD message
+	}
+
+	// Handle the response - should trigger re-registration
+	reg.handleRefreshResponse(ppd, server, sendAddr)
+
+	// Give goroutine time to set the flag
+	time.Sleep(10 * time.Millisecond)
+
+	// Verify re-registration was triggered (reregistering flag should be set)
+	// Note: We can't directly check the flag, but the TriggerReregistration
+	// function was called. The test verifies no panic occurs.
+}
+
+// TestHandleRefreshResponse_Error tests error response handling.
+func TestHandleRefreshResponse_Error(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+
+	reg := NewACRegistration(ac)
+
+	server := &AssignedServer{
+		Target: common.RedirectTarget{
+			IP:   "10.0.1.100",
+			Port: 62206,
+		},
+		Connected: true,
+		LastSeen:  time.Now().Add(-time.Minute),
+	}
+
+	sendAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.100"), Port: 62206}
+
+	// Create response with error
+	ppd := &core.PacketParserData{
+		Error: fmt.Errorf("decryption failed"),
+	}
+
+	oldLastSeen := server.GetLastSeen()
+
+	// Handle the response - should not panic, should not update LastSeen
+	reg.handleRefreshResponse(ppd, server, sendAddr)
+
+	// Verify LastSeen was NOT updated
+	if server.GetLastSeen() != oldLastSeen {
+		t.Error("Expected LastSeen to NOT be updated after error response")
+	}
+}
+
+// TestHandleRefreshResponse_UnexpectedType tests handling of unexpected response types.
+func TestHandleRefreshResponse_UnexpectedType(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+
+	reg := NewACRegistration(ac)
+
+	server := &AssignedServer{
+		Target: common.RedirectTarget{
+			IP:   "10.0.1.100",
+			Port: 62206,
+		},
+		Connected: true,
+		LastSeen:  time.Now().Add(-time.Minute),
+	}
+
+	sendAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.100"), Port: 62206}
+
+	// Create unexpected response type (e.g., NHP_KPL)
+	ppd := &core.PacketParserData{
+		HeaderType:  core.NHP_KPL, // Unexpected type
+		BodyMessage: []byte{},
+	}
+
+	oldLastSeen := server.GetLastSeen()
+
+	// Handle the response - should not panic, should log warning
+	reg.handleRefreshResponse(ppd, server, sendAddr)
+
+	// Verify LastSeen was NOT updated
+	if server.GetLastSeen() != oldLastSeen {
+		t.Error("Expected LastSeen to NOT be updated after unexpected response type")
 	}
 }

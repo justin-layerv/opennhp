@@ -51,6 +51,12 @@ const (
 
 	// MaxReregistrationAttempts is the max attempts for re-registration after server failure.
 	MaxReregistrationAttempts = 5
+
+	// RegistrationRefreshInterval is how often to re-send NHP_AOL to assigned servers
+	// to refresh server peer state. This handles server restarts where the server loses
+	// peer state but the AC continues sending keep-alives.
+	// Set to 6 * KeepaliveInterval = 60 seconds.
+	RegistrationRefreshInterval = 6
 )
 
 // AssignedServer represents a server assigned to this AC.
@@ -739,17 +745,32 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 }
 
 // keepaliveLoop sends keepalives to all assigned servers and monitors their health.
+// Every RegistrationRefreshInterval ticks, it also sends NHP_AOL to refresh server
+// peer state (handles server restarts without AC knowing).
 func (r *ACRegistration) keepaliveLoop() {
 	ticker := time.NewTicker(KeepaliveInterval)
 	defer ticker.Stop()
 
+	tickCount := 0
 	for {
 		select {
 		case <-r.stopCh:
 			return
 		case <-ticker.C:
+			tickCount++
 			r.sendKeepalives()
 			r.checkServerHealth()
+
+			// Periodically refresh registration to handle server restarts.
+			// The server may have restarted and lost peer state, but the AC
+			// continues sending keep-alives successfully (UDP works).
+			// By re-sending NHP_AOL periodically, we ensure the server always
+			// has our peer state.
+			// Note: tickCount is incremented before the check, so first refresh happens after 6 ticks (60s).
+			if tickCount >= RegistrationRefreshInterval {
+				tickCount = 0
+				r.refreshAssignedServerRegistrations()
+			}
 		}
 	}
 }
@@ -791,6 +812,130 @@ func (r *ACRegistration) sendKeepalives() {
 			server.UpdateLastSeen()
 			log.Debug("Sent NHP_KPL to assigned server %s:%d", server.Target.IP, server.Target.Port)
 		}
+	}
+}
+
+// refreshAssignedServerRegistrations sends NHP_AOL to each assigned server to
+// refresh its peer state. This handles server restarts where the server loses
+// peer state but the AC continues sending successful keep-alives (UDP works).
+//
+// Unlike full re-registration through the NLB, this sends directly to assigned
+// servers. The server will either:
+// - NHP_AAK: Acknowledge and refresh/create peer state
+// - NHP_ARD: Redirect to different servers (triggers full re-registration)
+// - Timeout: Server unreachable, triggers health check failure
+func (r *ACRegistration) refreshAssignedServerRegistrations() {
+	r.mu.RLock()
+	servers := make([]*AssignedServer, len(r.assignedServers))
+	copy(servers, r.assignedServers)
+	r.mu.RUnlock()
+
+	if len(servers) == 0 {
+		log.Debug("No assigned servers to refresh")
+		return
+	}
+
+	log.Debug("Refreshing registration with %d assigned servers", len(servers))
+
+	for _, server := range servers {
+		if server.Peer == nil || !server.IsConnected() {
+			log.Debug("Skipping refresh for unconnected server %s", server.Target.IP)
+			continue
+		}
+
+		// Get server's send address
+		sendAddr := server.Peer.SendAddr()
+		if sendAddr == nil {
+			log.Warning("Cannot resolve address for server %s during refresh", server.Target.IP)
+			continue
+		}
+
+		// Send refresh in a goroutine to avoid blocking keepalive loop
+		go r.refreshSingleServer(server, sendAddr.(*net.UDPAddr))
+	}
+}
+
+// refreshSingleServer sends NHP_AOL to a single assigned server to refresh registration.
+func (r *ACRegistration) refreshSingleServer(server *AssignedServer, sendAddr *net.UDPAddr) {
+	// Create AOL message with registration credentials
+	aolMsg := &common.ACOnlineMsg{
+		ACId:          r.ac.config.ACId,
+		AuthServiceId: r.ac.config.AuthServiceId,
+		ResourceIds:   r.ac.config.ResourceIds,
+		LicenseKey:    r.ac.config.LicenseKey,
+		ACVersion:     r.ac.config.ACVersion,
+	}
+
+	aolBytes, err := json.Marshal(aolMsg)
+	if err != nil {
+		log.Error("Failed to marshal refresh NHP_AOL: %v", err)
+		return
+	}
+
+	// Create message data for sending
+	// Use buffered channel to prevent sender from blocking if we timeout
+	md := &core.MsgData{
+		RemoteAddr:    sendAddr,
+		HeaderType:    core.NHP_AOL,
+		CipherScheme:  r.ac.config.DefaultCipherScheme,
+		TransactionId: r.ac.device.NextCounterIndex(),
+		Compress:      true,
+		PeerPk:        server.Peer.PublicKey(),
+		Message:       aolBytes,
+		ResponseMsgCh: make(chan *core.PacketParserData, 1),
+	}
+
+	// Send NHP_AOL
+	if !r.ac.IsRunning() {
+		return
+	}
+	r.ac.sendMsgCh <- md
+
+	// Wait for response with short timeout (don't block keepalive loop)
+	select {
+	case <-r.stopCh:
+		return
+	case <-time.After(KeepaliveTimeout):
+		// Timeout is OK - server may be slow or unreachable
+		// Health check will eventually detect and trigger re-registration
+		log.Debug("Refresh NHP_AOL to %s timed out", sendAddr.String())
+		return
+	case ppd := <-md.ResponseMsgCh:
+		r.handleRefreshResponse(ppd, server, sendAddr)
+	}
+}
+
+// handleRefreshResponse handles the server's response to refresh NHP_AOL.
+func (r *ACRegistration) handleRefreshResponse(ppd *core.PacketParserData, server *AssignedServer, sendAddr *net.UDPAddr) {
+	if ppd.Error != nil {
+		log.Warning("Refresh NHP_AOL to %s failed: %v", sendAddr.String(), ppd.Error)
+		return
+	}
+
+	switch ppd.HeaderType {
+	case core.NHP_AAK:
+		// Server acknowledged - peer state refreshed
+		var aakMsg common.ServerACAckMsg
+		if err := json.Unmarshal(ppd.BodyMessage, &aakMsg); err != nil {
+			log.Warning("Failed to parse refresh NHP_AAK from %s: %v", sendAddr.String(), err)
+			return
+		}
+
+		if common.IsSuccessErrCode(aakMsg.ErrCode) {
+			server.UpdateLastSeen()
+			log.Debug("Refreshed registration with server %s", sendAddr.String())
+		} else {
+			log.Warning("Refresh rejected by %s: %s - %s", sendAddr.String(), aakMsg.ErrCode, aakMsg.ErrMsg)
+		}
+
+	case core.NHP_ARD:
+		// Server wants us to connect to different servers
+		// This shouldn't happen during refresh, but handle it gracefully
+		log.Info("Server %s responded with NHP_ARD during refresh, triggering full re-registration", sendAddr.String())
+		r.TriggerReregistration("refresh_redirect")
+
+	default:
+		log.Warning("Unexpected response type %d from %s during refresh", ppd.HeaderType, sendAddr.String())
 	}
 }
 
