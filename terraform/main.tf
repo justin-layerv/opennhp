@@ -307,6 +307,13 @@ module "compute" {
   qurl_config                   = var.qurl_config
   qurl_service_token_secret_arn = var.qurl_service_token_secret_arn
 
+  # QURL resolve endpoint - TLS listener for resolve.qurl.link
+  # Routes HTTPS traffic directly to NHP Server plugin endpoint
+  # Note: enable_qurl_resolve_endpoint uses a static boolean to avoid "count depends on
+  # resource attributes" errors. The certificate_arn is only used at apply time.
+  enable_qurl_resolve_endpoint = var.deploy_qurl_link
+  qurl_resolve_certificate_arn = var.deploy_qurl_link ? aws_acm_certificate_validation.qurl_resolve[0].certificate_arn : null
+
   # Pluggable storage backend - DynamoDB (cloud default) with etcd feature flag for on-prem
   # Note: attach_storage_policies is required because Terraform cannot evaluate count based on module outputs
   attach_storage_policies  = true
@@ -1075,11 +1082,69 @@ resource "aws_route53_record" "qurl_link_ipv6" {
   }
 }
 
+# ==============================================================================
+# QURL Resolve Endpoint - Direct to NHP Server
+# ==============================================================================
+# The resolve.qurl.link endpoint must route DIRECTLY to the NHP Server NLB,
+# NOT through the AC. This is because:
+# 1. AC port 443 is blocked by iptables until NHP knock authenticates (zero-trust)
+# 2. The QURL plugin runs on the NHP Server, not the AC
+# 3. resolve.qurl.link is called BEFORE authentication to initiate the NHP knock
+#
+# Traffic flow:
+#   qurl.link → CloudFront → resolve.qurl.link → NHP Server NLB:443 → Server:8888
+
+# ACM Certificate for resolve.qurl.link (must be in same region as NLB)
+resource "aws_acm_certificate" "qurl_resolve" {
+  count             = var.deploy_qurl_link ? 1 : 0
+  domain_name       = "resolve.${var.qurl_link_frontend_domain}"
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-qurl-resolve-cert"
+  })
+}
+
+# DNS validation records for QURL resolve certificate
+resource "aws_route53_record" "qurl_resolve_cert_validation" {
+  for_each = var.deploy_qurl_link && !var.qurl_link_external_dns ? {
+    for dvo in aws_acm_certificate.qurl_resolve[0].domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  } : {}
+
+  provider = aws.route53_mgmt
+
+  allow_overwrite = true
+  name            = each.value.name
+  records         = [each.value.record]
+  ttl             = 60
+  type            = each.value.type
+  zone_id         = var.qurl_link_hosted_zone_id
+}
+
+# Wait for certificate validation to complete
+resource "aws_acm_certificate_validation" "qurl_resolve" {
+  count                   = var.deploy_qurl_link ? 1 : 0
+  certificate_arn         = aws_acm_certificate.qurl_resolve[0].arn
+  validation_record_fqdns = var.qurl_link_external_dns ? null : [for record in aws_route53_record.qurl_resolve_cert_validation : record.fqdn]
+}
+
 # Route53 record for QURL token resolution endpoint
-# Points resolve.qurl.link to the AC NLB where the QURL plugin handles token resolution
-# This overrides the wildcard *.qurl.link which points to the wrong NLB
+# Points resolve.qurl.link to the NHP Server NLB (NOT the AC NLB)
+#
+# Note: No AAAA (IPv6) record is needed because:
+# 1. The NHP Server NLB is IPv4-only (ip_address_type defaults to "ipv4")
+# 2. The only intended client is CloudFront (restricted by security group)
+# 3. CloudFront will resolve to IPv4 when making origin requests
 resource "aws_route53_record" "qurl_link_resolve" {
-  count    = var.deploy_qurl_link && var.deploy_ac && !var.qurl_link_external_dns ? 1 : 0
+  count    = var.deploy_qurl_link && !var.qurl_link_external_dns ? 1 : 0
   provider = aws.route53_mgmt
 
   zone_id = var.qurl_link_hosted_zone_id
@@ -1087,8 +1152,8 @@ resource "aws_route53_record" "qurl_link_resolve" {
   type    = "A"
 
   alias {
-    name                   = module.ac[0].nlb_dns_name
-    zone_id                = module.ac[0].nlb_zone_id
+    name                   = module.compute.nlb_dns_name
+    zone_id                = module.compute.nlb_zone_id
     evaluate_target_health = true
   }
 }

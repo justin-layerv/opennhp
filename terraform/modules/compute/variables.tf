@@ -357,3 +357,15 @@ variable "qurl_service_token_secret_arn" {
   type        = string
   default     = null
 }
+
+variable "enable_qurl_resolve_endpoint" {
+  description = "Enable the QURL resolve endpoint (TLS listener on port 443). When true, adds infrastructure for resolve.qurl.link to route directly to the NHP Server plugin endpoint."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_resolve_certificate_arn" {
+  description = "ACM certificate ARN for the QURL resolve endpoint (resolve.qurl.link). Required when enable_qurl_resolve_endpoint is true."
+  type        = string
+  default     = null
+}

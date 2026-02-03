@@ -912,16 +912,117 @@ When a user's IP changes, they need to refresh their access.
 ```
 Internet
     │
-    ▼
-qurl.link ──────────► NLB (us-east-2) ─┬─► NHP Server (HTTP 443)
-                                       └─► NHP Server (UDP 62206)
-
-*.qurl.site ────────► NLB ────────────────► Traefik on AC ──► Protected Resource
+    ├── qurl.link ────────► CloudFront ──► S3 (redirect page)
+    │                            │
+    │                            ▼
+    │   resolve.qurl.link ──► NHP Server NLB:443 ──► Server:8888 (QURL plugin)
+    │
+    └── *.qurl.site ─────────► AC NLB:443 ──► Traefik ──► Protected Resource
 ```
 
 ---
 
-## Demo Gateway Architecture
+## QURL Link Architecture
+
+The QURL Link system provides secure, tokenized access to protected resources. Users receive a link
+(e.g., `qurl.link/#at_xxx`) that initiates NHP authentication before granting access.
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              CloudFront                                      │
+│   Domain: qurl.link                                                         │
+│   Origin: S3 bucket (static redirect page)                                  │
+│   Purpose: Serves HTML that extracts token and redirects to resolve endpoint│
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ JavaScript redirect with token
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           NHP Server NLB                                     │
+│   Domain: resolve.qurl.link                                                 │
+│   Listener: TLS 443 → TCP 8888                                              │
+│   Security: CloudFront IPs only (AWS managed prefix list)                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           NHP Server                                         │
+│   Endpoint: /plugins/qurl (port 8888)                                       │
+│   Actions:                                                                  │
+│   1. Validate token with QURL Service API                                   │
+│   2. Send NHP knock to AC (open firewall for user's IP)                     │
+│   3. Redirect user to protected resource (*.qurl.site)                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              AC NLB                                          │
+│   Domain: *.qurl.site                                                       │
+│   Listener: TLS 443 → Traefik                                               │
+│   Note: Port 443 blocked by iptables until NHP knock authenticates          │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Authentication Flow
+
+```
+1. User clicks link: qurl.link/#at_xxx
+        │
+        ▼
+2. CloudFront serves S3 redirect page
+        │
+        ▼
+3. JavaScript extracts token, redirects to:
+   resolve.qurl.link/plugins/qurl?token=xxx
+        │
+        ▼
+4. NHP Server validates token with QURL Service API
+        │
+        ▼
+5. NHP Server sends NHP_AOP to AC (adds user IP to ipset)
+        │
+        ▼
+6. NHP Server redirects user to: {appId}.qurl.site
+        │
+        ▼
+7. AC allows connection (IP now in ipset)
+        │
+        ▼
+8. User accesses protected resource
+```
+
+### Why resolve.qurl.link Routes to NHP Server (not AC)
+
+The AC implements zero-trust networking: **port 443 is blocked by iptables until NHP knock
+authenticates the user**. However, `resolve.qurl.link` must be accessible *before* authentication
+to initiate the NHP knock. Therefore:
+
+- `resolve.qurl.link` → NHP Server NLB (always accessible)
+- `*.qurl.site` → AC NLB (blocked until authenticated)
+
+### Security Model
+
+| Layer | Protection |
+|-------|------------|
+| CloudFront | DDoS protection, edge caching |
+| NHP Server NLB | Security group restricts to CloudFront IPs only |
+| QURL Plugin | Token validation, rate limiting |
+| AC | Zero-trust iptables, only authenticated IPs allowed |
+
+### Terraform Modules
+
+| Module | Purpose |
+|--------|---------|
+| `qurl-link` | CloudFront + S3 for redirect page |
+| `qurl-service` | ECS Fargate API for token management |
+| `compute` | NHP Server NLB with TLS listener for resolve endpoint |
+| `ac` | AC NLB for protected resources |
+
+---
+
+## Demo Gateway Architecture (Legacy)
 
 The Demo Gateway provides TLS termination and routing for the demo flow, bridging qurl.link traffic
 to the NHP Server's HTTP plugin endpoints.

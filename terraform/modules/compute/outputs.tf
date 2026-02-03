@@ -52,3 +52,8 @@ output "target_group_arn_suffix" {
   description = "Target group ARN suffix for CloudWatch"
   value       = aws_lb_target_group.udp.arn_suffix
 }
+
+output "https_target_group_arn_suffix" {
+  description = "HTTPS target group ARN suffix for CloudWatch (null if QURL resolve endpoint not enabled)"
+  value       = var.enable_qurl_resolve_endpoint ? aws_lb_target_group.https[0].arn_suffix : null
+}

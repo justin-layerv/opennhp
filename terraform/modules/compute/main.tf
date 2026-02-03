@@ -425,6 +425,32 @@ resource "aws_security_group" "server" {
   }
 }
 
+# Additional ingress rule for QURL resolve endpoint (NLB TLS → Server HTTP)
+# NLB preserves client source IP, so we restrict to CloudFront IPs only.
+# This ensures only traffic from qurl.link (via CloudFront) can reach the endpoint,
+# blocking direct attacks from arbitrary internet sources.
+#
+# Uses AWS-managed prefix list which is automatically updated when CloudFront IPs change.
+# Only added when HTTPS listener is configured (qurl_resolve_certificate_arn)
+
+# Lookup the AWS-managed CloudFront prefix list
+data "aws_ec2_managed_prefix_list" "cloudfront" {
+  count = var.enable_qurl_resolve_endpoint ? 1 : 0
+  name  = "com.amazonaws.global.cloudfront.origin-facing"
+}
+
+resource "aws_security_group_rule" "server_https_from_cloudfront" {
+  count = var.enable_qurl_resolve_endpoint ? 1 : 0
+
+  type              = "ingress"
+  from_port         = 8888
+  to_port           = 8888
+  protocol          = "tcp"
+  prefix_list_ids   = [data.aws_ec2_managed_prefix_list.cloudfront[0].id]
+  security_group_id = aws_security_group.server.id
+  description       = "QURL resolve endpoint - CloudFront only (via NLB TLS)"
+}
+
 # User Data script - using templatefile for proper interpolation
 locals {
   user_data = templatefile("${path.module}/user_data.sh.tpl", {
@@ -688,6 +714,90 @@ resource "aws_lb_listener" "udp" {
     Component = "compute"
     Cell      = var.cell_id
   })
+}
+
+# =============================================================================
+# TLS/HTTPS Target Group and Listener (for QURL resolve endpoint)
+# =============================================================================
+# When enable_qurl_resolve_endpoint is true, these resources create an HTTPS
+# endpoint on the NHP Server NLB for resolve.qurl.link traffic.
+#
+# This allows the QURL authentication flow to reach the NHP Server's plugin
+# endpoint directly, bypassing the AC which has port 443 blocked until NHP knock.
+#
+# Traffic flow:
+#   resolve.qurl.link → NLB:443 (TLS termination) → Server:8888 (HTTP plugin)
+
+# TCP Target Group for HTTPS traffic (routes to HTTP plugin endpoint)
+resource "aws_lb_target_group" "https" {
+  count = var.enable_qurl_resolve_endpoint ? 1 : 0
+
+  name        = replace("${var.name_prefix}-https", "_", "-")
+  port        = 8888
+  protocol    = "TCP"
+  vpc_id      = var.vpc_id
+  target_type = "instance"
+
+  # Health check on port 8888 (same as UDP target group)
+  health_check {
+    enabled             = true
+    protocol            = "HTTP"
+    port                = "8888"
+    path                = "/health/live"
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    interval            = 30
+    matcher             = "200"
+  }
+
+  deregistration_delay = 30
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-tg-https"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# Attach ASG to HTTPS Target Group
+resource "aws_autoscaling_attachment" "https" {
+  count = var.enable_qurl_resolve_endpoint ? 1 : 0
+
+  autoscaling_group_name = aws_autoscaling_group.server.name
+  lb_target_group_arn    = aws_lb_target_group.https[0].arn
+}
+
+# TLS Listener (terminates TLS, forwards to TCP target group)
+resource "aws_lb_listener" "https" {
+  count = var.enable_qurl_resolve_endpoint ? 1 : 0
+
+  load_balancer_arn = aws_lb.server.arn
+  port              = 443
+  protocol          = "TLS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = var.qurl_resolve_certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.https[0].arn
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-listener-https"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+
+  lifecycle {
+    precondition {
+      condition     = var.qurl_resolve_certificate_arn != null
+      error_message = "qurl_resolve_certificate_arn is required when enable_qurl_resolve_endpoint is true."
+    }
+  }
 }
 
 # =============================================================================
