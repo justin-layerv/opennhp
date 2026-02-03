@@ -1055,9 +1055,10 @@ resource "aws_route53_record" "qurl_link" {
   count    = var.deploy_qurl_link && !var.qurl_link_external_dns ? 1 : 0
   provider = aws.route53_mgmt
 
-  zone_id = var.qurl_link_hosted_zone_id
-  name    = var.qurl_link_frontend_domain
-  type    = "A"
+  allow_overwrite = true
+  zone_id         = var.qurl_link_hosted_zone_id
+  name            = var.qurl_link_frontend_domain
+  type            = "A"
 
   alias {
     name                   = module.qurl_link[0].cloudfront_domain_name
@@ -1071,9 +1072,10 @@ resource "aws_route53_record" "qurl_link_ipv6" {
   count    = var.deploy_qurl_link && !var.qurl_link_external_dns ? 1 : 0
   provider = aws.route53_mgmt
 
-  zone_id = var.qurl_link_hosted_zone_id
-  name    = var.qurl_link_frontend_domain
-  type    = "AAAA"
+  allow_overwrite = true
+  zone_id         = var.qurl_link_hosted_zone_id
+  name            = var.qurl_link_frontend_domain
+  type            = "AAAA"
 
   alias {
     name                   = module.qurl_link[0].cloudfront_domain_name
@@ -1148,9 +1150,10 @@ resource "aws_route53_record" "qurl_link_resolve" {
   count    = var.deploy_qurl_link && !var.qurl_link_external_dns ? 1 : 0
   provider = aws.route53_mgmt
 
-  zone_id = var.qurl_link_hosted_zone_id
-  name    = "resolve.${var.qurl_link_frontend_domain}"
-  type    = "A"
+  allow_overwrite = true
+  zone_id         = var.qurl_link_hosted_zone_id
+  name            = "resolve.${var.qurl_link_frontend_domain}"
+  type            = "A"
 
   alias {
     name                   = module.compute.nlb_dns_name
