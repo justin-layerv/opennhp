@@ -405,6 +405,12 @@ resource "aws_iam_role_policy" "server" {
         Resource = [
           "arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:parameter/${var.environment}/nhp/server/*"
         ]
+      },
+      # Allow instance to read its own tags (for DeployColor detection in blue/green deployments)
+      {
+        Effect   = "Allow"
+        Action   = ["ec2:DescribeTags"]
+        Resource = "*"
       }
     ]
   })
