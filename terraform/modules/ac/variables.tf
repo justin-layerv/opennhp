@@ -404,3 +404,30 @@ variable "qurl_service_token_secret_arn" {
   type        = string
   default     = null
 }
+
+# ============================================================================
+# Blue/Green Deployment Configuration
+# ============================================================================
+
+variable "enable_blue_green" {
+  description = "Enable blue/green deployment infrastructure for AC"
+  type        = bool
+  default     = false
+}
+
+variable "green_standby_min_size" {
+  description = "Min instance count for green ASG (1=warm standby, 0=cold)"
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.green_standby_min_size >= 0 && var.green_standby_min_size <= 10
+    error_message = "green_standby_min_size must be between 0 and 10."
+  }
+}
+
+variable "alerts_sns_topic_arn" {
+  description = "SNS topic ARN for deployment alarms"
+  type        = string
+  default     = null
+}

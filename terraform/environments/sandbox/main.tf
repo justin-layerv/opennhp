@@ -240,10 +240,14 @@ module "nhp" {
   # Termination cleanup
   enable_termination_cleanup = var.enable_termination_cleanup
 
-  # Blue/Green deployment configuration
+  # Blue/Green deployment configuration (Server)
   enable_blue_green               = var.enable_blue_green
   green_standby_min_size          = var.green_standby_min_size
   deployment_stale_threshold_days = var.deployment_stale_threshold_days
+
+  # Blue/Green deployment configuration (AC)
+  enable_ac_blue_green      = var.enable_ac_blue_green
+  ac_green_standby_min_size = var.ac_green_standby_min_size
 }
 
 # ==============================================================================

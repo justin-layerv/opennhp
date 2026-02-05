@@ -530,6 +530,13 @@ resource "aws_iam_role_policy" "ac" {
             "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/ac/*"
           ]
         },
+        # EC2 DescribeTags for blue/green deployment color detection
+        {
+          Sid      = "EC2DescribeTags"
+          Effect   = "Allow"
+          Action   = ["ec2:DescribeTags"]
+          Resource = ["*"]
+        },
       ],
       # Conditional: QURL service token access (only when configured)
       var.qurl_service_token_secret_arn != null ? [
@@ -665,8 +672,10 @@ locals {
     plugin_bucket_name = var.plugin_bucket_name
     traefik_plugins    = var.traefik_plugins
     # Deployment configuration
-    image_tag               = var.image_tag
-    ssm_image_tag_parameter = aws_ssm_parameter.image_tag.name
+    image_tag                     = var.image_tag
+    ssm_image_tag_parameter       = aws_ssm_parameter.image_tag.name
+    enable_blue_green             = var.enable_blue_green
+    ssm_green_image_tag_parameter = var.enable_blue_green ? aws_ssm_parameter.green_image_tag[0].name : ""
     # Console backend routing (for NHP-protected Console)
     console_backend_url = var.console_backend_url
     console_domain      = var.console_domain
@@ -780,6 +789,20 @@ resource "aws_autoscaling_group" "ac" {
   tag {
     key                 = "Name"
     value               = "${var.name_prefix}-ac"
+    propagate_at_launch = true
+  }
+
+  # Blue/green deployment: tag blue ASG for color detection in user_data
+  tag {
+    key                 = "DeployColor"
+    value               = "blue"
+    propagate_at_launch = true
+  }
+
+  # SSM parameter path for image tag - matches green ASG's ImageTagSSMParam tag
+  tag {
+    key                 = "ImageTagSSMParam"
+    value               = aws_ssm_parameter.image_tag.name
     propagate_at_launch = true
   }
 

@@ -1,6 +1,6 @@
 name: Blue/Green Deploy
 
-# Blue/Green deployment for NHP Server with instant traffic switching
+# Blue/Green deployment for NHP Server and/or AC with instant traffic switching
 #
 # This workflow enables:
 # - Deploy new image to standby ASG
@@ -9,7 +9,7 @@ name: Blue/Green Deploy
 # - Warm standby (1 instance) for previous color
 #
 # Prerequisites:
-# - enable_blue_green = true in terraform.tfvars
+# - enable_blue_green = true (server) or enable_ac_blue_green = true (ac) in terraform.tfvars
 # - Green ASG and target groups created via terraform apply
 
 on:
@@ -22,6 +22,15 @@ on:
         type: choice
         options:
           - sandbox
+      component:
+        description: 'Component to deploy'
+        required: true
+        default: 'server'
+        type: choice
+        options:
+          - server
+          - ac
+          - both
       action:
         description: 'Deployment action'
         required: true
@@ -60,9 +69,9 @@ permissions:
   id-token: write
   contents: read
 
-# Only one blue/green deployment per environment at a time
+# Only one blue/green deployment per environment+component at a time
 concurrency:
-  group: blue-green-${{ inputs.environment }}
+  group: blue-green-${{ inputs.environment }}-${{ inputs.component }}
   cancel-in-progress: false
 
 env:
@@ -78,19 +87,34 @@ jobs:
     environment: ${{ inputs.environment }}
     timeout-minutes: 5
     outputs:
-      active_color: ${{ steps.state.outputs.active_color }}
-      standby_color: ${{ steps.state.outputs.standby_color }}
-      active_asg: ${{ steps.state.outputs.active_asg }}
-      standby_asg: ${{ steps.state.outputs.standby_asg }}
-      active_image_tag: ${{ steps.state.outputs.active_image_tag }}
-      standby_image_tag: ${{ steps.state.outputs.standby_image_tag }}
-      udp_listener_arn: ${{ steps.state.outputs.udp_listener_arn }}
-      blue_udp_tg_arn: ${{ steps.state.outputs.blue_udp_tg_arn }}
-      green_udp_tg_arn: ${{ steps.state.outputs.green_udp_tg_arn }}
-      https_listener_arn: ${{ steps.state.outputs.https_listener_arn }}
-      blue_https_tg_arn: ${{ steps.state.outputs.blue_https_tg_arn }}
-      green_https_tg_arn: ${{ steps.state.outputs.green_https_tg_arn }}
-      target_image_tag: ${{ steps.validate.outputs.target_image_tag }}
+      # Server outputs
+      server_active_color: ${{ steps.server-state.outputs.active_color }}
+      server_standby_color: ${{ steps.server-state.outputs.standby_color }}
+      server_active_asg: ${{ steps.server-state.outputs.active_asg }}
+      server_standby_asg: ${{ steps.server-state.outputs.standby_asg }}
+      server_active_image_tag: ${{ steps.server-state.outputs.active_image_tag }}
+      server_standby_image_tag: ${{ steps.server-state.outputs.standby_image_tag }}
+      server_primary_listener_arn: ${{ steps.server-state.outputs.primary_listener_arn }}
+      server_blue_primary_tg_arn: ${{ steps.server-state.outputs.blue_primary_tg_arn }}
+      server_green_primary_tg_arn: ${{ steps.server-state.outputs.green_primary_tg_arn }}
+      server_secondary_listener_arn: ${{ steps.server-state.outputs.secondary_listener_arn }}
+      server_blue_secondary_tg_arn: ${{ steps.server-state.outputs.blue_secondary_tg_arn }}
+      server_green_secondary_tg_arn: ${{ steps.server-state.outputs.green_secondary_tg_arn }}
+      server_target_image_tag: ${{ steps.validate.outputs.server_target_image_tag }}
+      # AC outputs
+      ac_active_color: ${{ steps.ac-state.outputs.active_color }}
+      ac_standby_color: ${{ steps.ac-state.outputs.standby_color }}
+      ac_active_asg: ${{ steps.ac-state.outputs.active_asg }}
+      ac_standby_asg: ${{ steps.ac-state.outputs.standby_asg }}
+      ac_active_image_tag: ${{ steps.ac-state.outputs.active_image_tag }}
+      ac_standby_image_tag: ${{ steps.ac-state.outputs.standby_image_tag }}
+      ac_primary_listener_arn: ${{ steps.ac-state.outputs.primary_listener_arn }}
+      ac_blue_primary_tg_arn: ${{ steps.ac-state.outputs.blue_primary_tg_arn }}
+      ac_green_primary_tg_arn: ${{ steps.ac-state.outputs.green_primary_tg_arn }}
+      ac_target_image_tag: ${{ steps.validate.outputs.ac_target_image_tag }}
+      # Flags - reconciled after SSM state reads (handles component=both with only one enabled)
+      deploy_server: ${{ steps.reconcile.outputs.deploy_server }}
+      deploy_ac: ${{ steps.reconcile.outputs.deploy_ac }}
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
@@ -98,42 +122,64 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Read SSM State
-        id: state
+      - name: Determine Components
+        id: components
+        run: |
+          COMPONENT="${{ inputs.component }}"
+          if [[ "$COMPONENT" == "server" || "$COMPONENT" == "both" ]]; then
+            echo "deploy_server=true" >> $GITHUB_OUTPUT
+          else
+            echo "deploy_server=false" >> $GITHUB_OUTPUT
+          fi
+          if [[ "$COMPONENT" == "ac" || "$COMPONENT" == "both" ]]; then
+            echo "deploy_ac=true" >> $GITHUB_OUTPUT
+          else
+            echo "deploy_ac=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Read Server SSM State
+        id: server-state
+        if: steps.components.outputs.deploy_server == 'true'
         env:
           ENVIRONMENT: ${{ inputs.environment }}
+          COMPONENT: ${{ inputs.component }}
         run: |
-          echo "Reading blue/green state from SSM..."
+          SSM_BASE="/${ENVIRONMENT}/nhp/server"
+          echo "Reading server blue/green state from SSM..."
 
           # Read active color
           ACTIVE_COLOR=$(aws ssm get-parameter \
-            --name "/${ENVIRONMENT}/nhp/server/active-color" \
+            --name "${SSM_BASE}/active-color" \
             --query "Parameter.Value" --output text 2>/dev/null) || ACTIVE_COLOR=""
 
           if [[ -z "$ACTIVE_COLOR" ]]; then
-            echo "::error::Blue/green not enabled - SSM parameter /${ENVIRONMENT}/nhp/server/active-color not found"
-            echo "Run 'terraform apply' with enable_blue_green=true first"
-            exit 1
+            if [[ "$COMPONENT" == "both" ]]; then
+              echo "::warning::Server blue/green not enabled - skipping server deployment"
+              echo "enabled=false" >> $GITHUB_OUTPUT
+              exit 0
+            else
+              echo "::error::Server blue/green not enabled - SSM parameter ${SSM_BASE}/active-color not found"
+              echo "Run 'terraform apply' with enable_blue_green=true first"
+              exit 1
+            fi
           fi
+          echo "enabled=true" >> $GITHUB_OUTPUT
 
-          echo "Active color: $ACTIVE_COLOR"
+          echo "Server active color: $ACTIVE_COLOR"
           echo "active_color=$ACTIVE_COLOR" >> $GITHUB_OUTPUT
 
-          # Determine standby color
           if [[ "$ACTIVE_COLOR" == "blue" ]]; then
-            STANDBY_COLOR="green"
+            echo "standby_color=green" >> $GITHUB_OUTPUT
           else
-            STANDBY_COLOR="blue"
+            echo "standby_color=blue" >> $GITHUB_OUTPUT
           fi
-          echo "Standby color: $STANDBY_COLOR"
-          echo "standby_color=$STANDBY_COLOR" >> $GITHUB_OUTPUT
 
           # Read ASG names
           BLUE_ASG=$(aws ssm get-parameter \
-            --name "/${ENVIRONMENT}/nhp/server/asg-name" \
+            --name "${SSM_BASE}/asg-name" \
             --query "Parameter.Value" --output text)
           GREEN_ASG=$(aws ssm get-parameter \
-            --name "/${ENVIRONMENT}/nhp/server/green-asg-name" \
+            --name "${SSM_BASE}/green-asg-name" \
             --query "Parameter.Value" --output text)
 
           if [[ "$ACTIVE_COLOR" == "blue" ]]; then
@@ -146,10 +192,10 @@ jobs:
 
           # Read current image tags
           BLUE_TAG=$(aws ssm get-parameter \
-            --name "/${ENVIRONMENT}/nhp/server/image-tag" \
+            --name "${SSM_BASE}/image-tag" \
             --query "Parameter.Value" --output text 2>/dev/null) || BLUE_TAG="unknown"
           GREEN_TAG=$(aws ssm get-parameter \
-            --name "/${ENVIRONMENT}/nhp/server/green-image-tag" \
+            --name "${SSM_BASE}/green-image-tag" \
             --query "Parameter.Value" --output text 2>/dev/null) || GREEN_TAG="unknown"
 
           if [[ "$ACTIVE_COLOR" == "blue" ]]; then
@@ -160,42 +206,161 @@ jobs:
             echo "standby_image_tag=$BLUE_TAG" >> $GITHUB_OUTPUT
           fi
 
-          # Read listener and target group ARNs
-          echo "udp_listener_arn=$(aws ssm get-parameter \
-            --name "/${ENVIRONMENT}/nhp/server/udp-listener-arn" \
+          # Server listeners: primary=UDP, secondary=HTTPS (optional)
+          echo "primary_listener_arn=$(aws ssm get-parameter \
+            --name "${SSM_BASE}/udp-listener-arn" \
             --query "Parameter.Value" --output text)" >> $GITHUB_OUTPUT
 
-          echo "blue_udp_tg_arn=$(aws ssm get-parameter \
-            --name "/${ENVIRONMENT}/nhp/server/blue-udp-tg-arn" \
+          echo "blue_primary_tg_arn=$(aws ssm get-parameter \
+            --name "${SSM_BASE}/blue-udp-tg-arn" \
             --query "Parameter.Value" --output text)" >> $GITHUB_OUTPUT
 
-          echo "green_udp_tg_arn=$(aws ssm get-parameter \
-            --name "/${ENVIRONMENT}/nhp/server/green-udp-tg-arn" \
+          echo "green_primary_tg_arn=$(aws ssm get-parameter \
+            --name "${SSM_BASE}/green-udp-tg-arn" \
             --query "Parameter.Value" --output text)" >> $GITHUB_OUTPUT
 
           # HTTPS listener/TGs are optional (only exist if QURL resolve endpoint is enabled)
           HTTPS_LISTENER=$(aws ssm get-parameter \
-            --name "/${ENVIRONMENT}/nhp/server/https-listener-arn" \
+            --name "${SSM_BASE}/https-listener-arn" \
             --query "Parameter.Value" --output text 2>/dev/null) || HTTPS_LISTENER=""
-          echo "https_listener_arn=$HTTPS_LISTENER" >> $GITHUB_OUTPUT
+          echo "secondary_listener_arn=$HTTPS_LISTENER" >> $GITHUB_OUTPUT
 
           if [[ -n "$HTTPS_LISTENER" ]]; then
-            echo "blue_https_tg_arn=$(aws ssm get-parameter \
-              --name "/${ENVIRONMENT}/nhp/server/blue-https-tg-arn" \
+            echo "blue_secondary_tg_arn=$(aws ssm get-parameter \
+              --name "${SSM_BASE}/blue-https-tg-arn" \
               --query "Parameter.Value" --output text)" >> $GITHUB_OUTPUT
 
-            echo "green_https_tg_arn=$(aws ssm get-parameter \
-              --name "/${ENVIRONMENT}/nhp/server/green-https-tg-arn" \
+            echo "green_secondary_tg_arn=$(aws ssm get-parameter \
+              --name "${SSM_BASE}/green-https-tg-arn" \
               --query "Parameter.Value" --output text)" >> $GITHUB_OUTPUT
           fi
+
+      - name: Read AC SSM State
+        id: ac-state
+        if: steps.components.outputs.deploy_ac == 'true'
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          COMPONENT: ${{ inputs.component }}
+        run: |
+          SSM_BASE="/${ENVIRONMENT}/nhp/ac"
+          echo "Reading AC blue/green state from SSM..."
+
+          # Read active color
+          ACTIVE_COLOR=$(aws ssm get-parameter \
+            --name "${SSM_BASE}/active-color" \
+            --query "Parameter.Value" --output text 2>/dev/null) || ACTIVE_COLOR=""
+
+          if [[ -z "$ACTIVE_COLOR" ]]; then
+            if [[ "$COMPONENT" == "both" ]]; then
+              echo "::warning::AC blue/green not enabled - skipping AC deployment"
+              echo "enabled=false" >> $GITHUB_OUTPUT
+              exit 0
+            else
+              echo "::error::AC blue/green not enabled - SSM parameter ${SSM_BASE}/active-color not found"
+              echo "Run 'terraform apply' with enable_ac_blue_green=true first"
+              exit 1
+            fi
+          fi
+          echo "enabled=true" >> $GITHUB_OUTPUT
+
+          echo "AC active color: $ACTIVE_COLOR"
+          echo "active_color=$ACTIVE_COLOR" >> $GITHUB_OUTPUT
+
+          if [[ "$ACTIVE_COLOR" == "blue" ]]; then
+            echo "standby_color=green" >> $GITHUB_OUTPUT
+          else
+            echo "standby_color=blue" >> $GITHUB_OUTPUT
+          fi
+
+          # Read ASG names
+          BLUE_ASG=$(aws ssm get-parameter \
+            --name "${SSM_BASE}/asg-name" \
+            --query "Parameter.Value" --output text)
+          GREEN_ASG=$(aws ssm get-parameter \
+            --name "${SSM_BASE}/green-asg-name" \
+            --query "Parameter.Value" --output text)
+
+          if [[ "$ACTIVE_COLOR" == "blue" ]]; then
+            echo "active_asg=$BLUE_ASG" >> $GITHUB_OUTPUT
+            echo "standby_asg=$GREEN_ASG" >> $GITHUB_OUTPUT
+          else
+            echo "active_asg=$GREEN_ASG" >> $GITHUB_OUTPUT
+            echo "standby_asg=$BLUE_ASG" >> $GITHUB_OUTPUT
+          fi
+
+          # Read current image tags
+          BLUE_TAG=$(aws ssm get-parameter \
+            --name "${SSM_BASE}/image-tag" \
+            --query "Parameter.Value" --output text 2>/dev/null) || BLUE_TAG="unknown"
+          GREEN_TAG=$(aws ssm get-parameter \
+            --name "${SSM_BASE}/green-image-tag" \
+            --query "Parameter.Value" --output text 2>/dev/null) || GREEN_TAG="unknown"
+
+          if [[ "$ACTIVE_COLOR" == "blue" ]]; then
+            echo "active_image_tag=$BLUE_TAG" >> $GITHUB_OUTPUT
+            echo "standby_image_tag=$GREEN_TAG" >> $GITHUB_OUTPUT
+          else
+            echo "active_image_tag=$GREEN_TAG" >> $GITHUB_OUTPUT
+            echo "standby_image_tag=$BLUE_TAG" >> $GITHUB_OUTPUT
+          fi
+
+          # AC listeners: primary=TCP only (no secondary)
+          echo "primary_listener_arn=$(aws ssm get-parameter \
+            --name "${SSM_BASE}/tcp-listener-arn" \
+            --query "Parameter.Value" --output text)" >> $GITHUB_OUTPUT
+
+          echo "blue_primary_tg_arn=$(aws ssm get-parameter \
+            --name "${SSM_BASE}/blue-tcp-tg-arn" \
+            --query "Parameter.Value" --output text)" >> $GITHUB_OUTPUT
+
+          echo "green_primary_tg_arn=$(aws ssm get-parameter \
+            --name "${SSM_BASE}/green-tcp-tg-arn" \
+            --query "Parameter.Value" --output text)" >> $GITHUB_OUTPUT
+
+      - name: Reconcile Component Flags
+        id: reconcile
+        run: |
+          # When component=both, a component may not have blue/green enabled.
+          # Downgrade deploy flags based on actual SSM state availability.
+          WANT_SERVER="${{ steps.components.outputs.deploy_server }}"
+          WANT_AC="${{ steps.components.outputs.deploy_ac }}"
+          SERVER_ENABLED="${{ steps.server-state.outputs.enabled }}"
+          AC_ENABLED="${{ steps.ac-state.outputs.enabled }}"
+
+          # If we wanted to deploy but SSM state wasn't found, downgrade
+          FINAL_SERVER="$WANT_SERVER"
+          FINAL_AC="$WANT_AC"
+
+          if [[ "$WANT_SERVER" == "true" && "$SERVER_ENABLED" == "false" ]]; then
+            FINAL_SERVER="false"
+            echo "::warning::Server blue/green not available, excluding from deployment"
+          fi
+
+          if [[ "$WANT_AC" == "true" && "$AC_ENABLED" == "false" ]]; then
+            FINAL_AC="false"
+            echo "::warning::AC blue/green not available, excluding from deployment"
+          fi
+
+          # Fail if neither component is deployable
+          if [[ "$FINAL_SERVER" != "true" && "$FINAL_AC" != "true" ]]; then
+            echo "::error::No components available for blue/green deployment"
+            exit 1
+          fi
+
+          echo "deploy_server=$FINAL_SERVER" >> $GITHUB_OUTPUT
+          echo "deploy_ac=$FINAL_AC" >> $GITHUB_OUTPUT
 
       - name: Validate Inputs
         id: validate
         env:
           ACTION: ${{ inputs.action }}
           IMAGE_TAG: ${{ inputs.image_tag }}
-          ACTIVE_TAG: ${{ steps.state.outputs.active_image_tag }}
-          STANDBY_TAG: ${{ steps.state.outputs.standby_image_tag }}
+          DEPLOY_SERVER: ${{ steps.reconcile.outputs.deploy_server }}
+          DEPLOY_AC: ${{ steps.reconcile.outputs.deploy_ac }}
+          SERVER_ACTIVE_TAG: ${{ steps.server-state.outputs.active_image_tag }}
+          SERVER_STANDBY_TAG: ${{ steps.server-state.outputs.standby_image_tag }}
+          AC_ACTIVE_TAG: ${{ steps.ac-state.outputs.active_image_tag }}
+          AC_STANDBY_TAG: ${{ steps.ac-state.outputs.standby_image_tag }}
           REFRESH_TIMEOUT: ${{ inputs.refresh_timeout_minutes }}
           HEALTH_TIMEOUT: ${{ inputs.health_check_timeout_minutes }}
         run: |
@@ -214,47 +379,89 @@ jobs:
               echo "::error::image_tag is required for deploy action"
               exit 1
             fi
-            # Warn if deploying the same image that's already active
-            if [[ "$IMAGE_TAG" == "$ACTIVE_TAG" ]]; then
-              echo "::warning::Deploying same image tag ($IMAGE_TAG) that is already active."
-              echo "::warning::This will trigger instance refresh but won't change the running version."
-              echo "same_image_warning=true" >> $GITHUB_OUTPUT
+            # Server validation
+            if [[ "$DEPLOY_SERVER" == "true" ]]; then
+              if [[ "$IMAGE_TAG" == "$SERVER_ACTIVE_TAG" ]]; then
+                echo "::warning::Server: Deploying same image tag ($IMAGE_TAG) that is already active."
+              fi
+              echo "server_target_image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
             fi
-            echo "target_image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+            # AC validation
+            if [[ "$DEPLOY_AC" == "true" ]]; then
+              if [[ "$IMAGE_TAG" == "$AC_ACTIVE_TAG" ]]; then
+                echo "::warning::AC: Deploying same image tag ($IMAGE_TAG) that is already active."
+              fi
+              echo "ac_target_image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+            fi
           elif [[ "$ACTION" == "rollback" || "$ACTION" == "switch-only" ]]; then
-            # For rollback/switch-only, use existing standby image
-            # Validate that standby has a known image tag
-            if [[ "$STANDBY_TAG" == "unknown" || -z "$STANDBY_TAG" ]]; then
-              echo "::error::Cannot $ACTION: standby image tag is unknown"
-              echo "::error::The standby ASG may not have been deployed yet."
-              echo "::error::Use 'deploy' action with an image_tag to initialize the standby first."
-              exit 1
+            # Server
+            if [[ "$DEPLOY_SERVER" == "true" ]]; then
+              if [[ "$SERVER_STANDBY_TAG" == "unknown" || -z "$SERVER_STANDBY_TAG" ]]; then
+                echo "::error::Cannot $ACTION server: standby image tag is unknown"
+                echo "::error::Use 'deploy' action with an image_tag to initialize the standby first."
+                exit 1
+              fi
+              echo "server_target_image_tag=$SERVER_STANDBY_TAG" >> $GITHUB_OUTPUT
             fi
-            echo "target_image_tag=$STANDBY_TAG" >> $GITHUB_OUTPUT
+            # AC
+            if [[ "$DEPLOY_AC" == "true" ]]; then
+              if [[ "$AC_STANDBY_TAG" == "unknown" || -z "$AC_STANDBY_TAG" ]]; then
+                echo "::error::Cannot $ACTION AC: standby image tag is unknown"
+                echo "::error::Use 'deploy' action with an image_tag to initialize the standby first."
+                exit 1
+              fi
+              echo "ac_target_image_tag=$AC_STANDBY_TAG" >> $GITHUB_OUTPUT
+            fi
           fi
 
       - name: Summary
         env:
           ACTION: ${{ inputs.action }}
-          ACTIVE_COLOR: ${{ steps.state.outputs.active_color }}
-          STANDBY_COLOR: ${{ steps.state.outputs.standby_color }}
-          ACTIVE_TAG: ${{ steps.state.outputs.active_image_tag }}
-          TARGET_TAG: ${{ steps.validate.outputs.target_image_tag }}
+          COMPONENT: ${{ inputs.component }}
+          DEPLOY_SERVER: ${{ steps.reconcile.outputs.deploy_server }}
+          DEPLOY_AC: ${{ steps.reconcile.outputs.deploy_ac }}
+          SERVER_ACTIVE_COLOR: ${{ steps.server-state.outputs.active_color }}
+          SERVER_STANDBY_COLOR: ${{ steps.server-state.outputs.standby_color }}
+          SERVER_ACTIVE_TAG: ${{ steps.server-state.outputs.active_image_tag }}
+          SERVER_TARGET_TAG: ${{ steps.validate.outputs.server_target_image_tag }}
+          AC_ACTIVE_COLOR: ${{ steps.ac-state.outputs.active_color }}
+          AC_STANDBY_COLOR: ${{ steps.ac-state.outputs.standby_color }}
+          AC_ACTIVE_TAG: ${{ steps.ac-state.outputs.active_image_tag }}
+          AC_TARGET_TAG: ${{ steps.validate.outputs.ac_target_image_tag }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           echo "## Blue/Green State" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [[ "$DRY_RUN" == "true" ]]; then
-            echo "⚠️ **DRY RUN MODE** - No changes will be made" >> $GITHUB_STEP_SUMMARY
+            echo "> **DRY RUN MODE** - No changes will be made" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
           echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Action | $ACTION |" >> $GITHUB_STEP_SUMMARY
-          echo "| Active Color | **$ACTIVE_COLOR** |" >> $GITHUB_STEP_SUMMARY
-          echo "| Standby Color | $STANDBY_COLOR |" >> $GITHUB_STEP_SUMMARY
-          echo "| Active Image | \`$ACTIVE_TAG\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Target Image | \`$TARGET_TAG\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | $COMPONENT |" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$DEPLOY_SERVER" == "true" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Server" >> $GITHUB_STEP_SUMMARY
+            echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Active Color | **$SERVER_ACTIVE_COLOR** |" >> $GITHUB_STEP_SUMMARY
+            echo "| Standby Color | $SERVER_STANDBY_COLOR |" >> $GITHUB_STEP_SUMMARY
+            echo "| Active Image | \`$SERVER_ACTIVE_TAG\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| Target Image | \`$SERVER_TARGET_TAG\` |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [[ "$DEPLOY_AC" == "true" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### AC" >> $GITHUB_STEP_SUMMARY
+            echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Active Color | **$AC_ACTIVE_COLOR** |" >> $GITHUB_STEP_SUMMARY
+            echo "| Standby Color | $AC_STANDBY_COLOR |" >> $GITHUB_STEP_SUMMARY
+            echo "| Active Image | \`$AC_ACTIVE_TAG\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| Target Image | \`$AC_TARGET_TAG\` |" >> $GITHUB_STEP_SUMMARY
+          fi
 
   # =============================================================================
   # DEPLOY TO STANDBY - Update standby ASG with new image
@@ -265,8 +472,10 @@ jobs:
     if: inputs.action == 'deploy'
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
-    # Timeout must accommodate: refresh_timeout_minutes (max 60) + health_check_timeout_minutes (max 30) + buffer
-    # GitHub Actions doesn't support expressions in timeout-minutes, so we use the max possible value
+    # Steps run sequentially even for component=both.
+    # Timeout: refresh (max 60m) + health check (max 30m) + buffer (5m) = 95m.
+    # Health checks use a shorter range (2-30m) than refresh (5-60m) because target
+    # group registration should be faster than a full instance refresh cycle.
     timeout-minutes: 95
     steps:
       - name: Checkout code
@@ -278,42 +487,37 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Validate Image Exists in ECR
+      # ---- Server Deploy Steps ----
+      - name: "[Server] Validate Image Exists in ECR"
+        if: needs.prepare.outputs.deploy_server == 'true'
         env:
-          IMAGE_TAG: ${{ needs.prepare.outputs.target_image_tag }}
+          IMAGE_TAG: ${{ needs.prepare.outputs.server_target_image_tag }}
           ENVIRONMENT: ${{ inputs.environment }}
-          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          # Get ECR repository name from SSM (set by Terraform)
           REPO_NAME=$(aws ssm get-parameter \
             --name "/${ENVIRONMENT}/nhp/server/ecr-repo-name" \
             --query "Parameter.Value" --output text 2>/dev/null) || REPO_NAME=""
-
-          # Fallback to default if SSM parameter doesn't exist
           if [[ -z "$REPO_NAME" ]]; then
             REPO_NAME="layerv/nhp-server"
             echo "::warning::SSM parameter /${ENVIRONMENT}/nhp/server/ecr-repo-name not found, using default: $REPO_NAME"
           fi
-
           echo "Verifying image $REPO_NAME:$IMAGE_TAG exists in ECR..."
-
           if ! aws ecr describe-images \
             --repository-name "$REPO_NAME" \
             --image-ids imageTag="$IMAGE_TAG" \
             --query "imageDetails[0].imageTags" \
             --output text > /dev/null 2>&1; then
             echo "::error::Image $REPO_NAME:$IMAGE_TAG not found in ECR"
-            echo "::error::Ensure the image has been built and pushed before deploying"
             exit 1
           fi
-
           echo "Image verified: $REPO_NAME:$IMAGE_TAG exists"
 
-      - name: Update Standby Image Tag
+      - name: "[Server] Update Standby Image Tag"
+        if: needs.prepare.outputs.deploy_server == 'true'
         env:
           ENVIRONMENT: ${{ inputs.environment }}
-          STANDBY_COLOR: ${{ needs.prepare.outputs.standby_color }}
-          IMAGE_TAG: ${{ needs.prepare.outputs.target_image_tag }}
+          STANDBY_COLOR: ${{ needs.prepare.outputs.server_standby_color }}
+          IMAGE_TAG: ${{ needs.prepare.outputs.server_target_image_tag }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           if [[ "$STANDBY_COLOR" == "green" ]]; then
@@ -321,228 +525,294 @@ jobs:
           else
             SSM_PARAM="/${ENVIRONMENT}/nhp/server/image-tag"
           fi
-
           echo "Updating $SSM_PARAM to $IMAGE_TAG"
           if [[ "$DRY_RUN" == "true" ]]; then
             echo "[DRY RUN] Would update SSM parameter: $SSM_PARAM = $IMAGE_TAG"
           else
-            aws ssm put-parameter \
-              --name "$SSM_PARAM" \
-              --value "$IMAGE_TAG" \
-              --type String \
-              --overwrite
+            aws ssm put-parameter --name "$SSM_PARAM" --value "$IMAGE_TAG" --type String --overwrite
           fi
 
-      - name: Scale Up Standby ASG
+      - name: "[Server] Scale Up Standby ASG"
+        if: needs.prepare.outputs.deploy_server == 'true'
         env:
-          STANDBY_ASG: ${{ needs.prepare.outputs.standby_asg }}
-          ACTIVE_ASG: ${{ needs.prepare.outputs.active_asg }}
+          STANDBY_ASG: ${{ needs.prepare.outputs.server_standby_asg }}
+          ACTIVE_ASG: ${{ needs.prepare.outputs.server_active_asg }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          # Get active ASG's desired capacity
           ACTIVE_CAPACITY=$(aws autoscaling describe-auto-scaling-groups \
             --auto-scaling-group-names "$ACTIVE_ASG" \
             --query "AutoScalingGroups[0].DesiredCapacity" --output text)
-
-          echo "Active ASG capacity: $ACTIVE_CAPACITY"
-          echo "Scaling standby ASG to match..."
-
+          echo "Server active ASG capacity: $ACTIVE_CAPACITY"
           if [[ "$DRY_RUN" == "true" ]]; then
             echo "[DRY RUN] Would scale $STANDBY_ASG to min=$ACTIVE_CAPACITY, desired=$ACTIVE_CAPACITY"
           else
             aws autoscaling update-auto-scaling-group \
               --auto-scaling-group-name "$STANDBY_ASG" \
-              --min-size "$ACTIVE_CAPACITY" \
-              --desired-capacity "$ACTIVE_CAPACITY"
+              --min-size "$ACTIVE_CAPACITY" --desired-capacity "$ACTIVE_CAPACITY"
           fi
 
-      - name: Instance Refresh on Standby
-        if: inputs.dry_run != true
+      - name: "[Server] Instance Refresh on Standby"
+        if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run != true
         env:
-          STANDBY_ASG: ${{ needs.prepare.outputs.standby_asg }}
+          STANDBY_ASG: ${{ needs.prepare.outputs.server_standby_asg }}
           REFRESH_TIMEOUT_MINUTES: ${{ inputs.refresh_timeout_minutes }}
         run: |
-          echo "Starting instance refresh on standby ASG: $STANDBY_ASG"
-
-          # Cancel any existing refresh
+          echo "Starting instance refresh on server standby ASG: $STANDBY_ASG"
           EXISTING=$(aws autoscaling describe-instance-refreshes \
             --auto-scaling-group-name "$STANDBY_ASG" \
             --query "InstanceRefreshes[?Status=='InProgress' || Status=='Pending'].InstanceRefreshId" \
             --output text 2>/dev/null) || true
-
           if [[ -n "$EXISTING" ]]; then
             echo "Cancelling existing refresh: $EXISTING"
-            aws autoscaling cancel-instance-refresh \
-              --auto-scaling-group-name "$STANDBY_ASG" || true
+            aws autoscaling cancel-instance-refresh --auto-scaling-group-name "$STANDBY_ASG" || true
             sleep 10
           fi
-
-          # Start new instance refresh
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "$STANDBY_ASG" \
-            --preferences '{
-              "MinHealthyPercentage": 50,
-              "InstanceWarmup": 180,
-              "SkipMatching": false
-            }' \
+            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 180, "SkipMatching": false}' \
             --query "InstanceRefreshId" --output text)
-
           echo "Instance refresh started: $REFRESH_ID"
-
-          # Wait for refresh to complete using wall-clock time
-          # This is more accurate than iteration count as it accounts for API call latency
           DEADLINE=$(($(date +%s) + REFRESH_TIMEOUT_MINUTES * 60))
-          echo "Waiting for instance refresh to complete (timeout: ${REFRESH_TIMEOUT_MINUTES}m, deadline: $(date -d @$DEADLINE '+%H:%M:%S' 2>/dev/null || date -r $DEADLINE '+%H:%M:%S'))..."
-
           ITERATION=0
           while [[ $(date +%s) -lt $DEADLINE ]]; do
             ITERATION=$((ITERATION + 1))
             REMAINING=$(( (DEADLINE - $(date +%s)) / 60 ))
-
             STATUS=$(aws autoscaling describe-instance-refreshes \
               --auto-scaling-group-name "$STANDBY_ASG" \
               --instance-refresh-ids "$REFRESH_ID" \
               --query "InstanceRefreshes[0].Status" --output text)
-
-            echo "[iter $ITERATION, ${REMAINING}m remaining] Refresh status: $STATUS"
-
+            echo "[Server] [iter $ITERATION, ${REMAINING}m remaining] Refresh status: $STATUS"
             case "$STATUS" in
-              Successful)
-                echo "Instance refresh completed successfully"
-                break
-                ;;
-              Failed|Cancelled)
-                echo "::error::Instance refresh $STATUS"
-                exit 1
-                ;;
-              *)
-                sleep 10
-                ;;
+              Successful) echo "Server instance refresh completed successfully"; break ;;
+              Failed|Cancelled) echo "::error::Server instance refresh $STATUS"; exit 1 ;;
+              *) sleep 10 ;;
             esac
           done
-
-          # Final status check after loop exit - handles both:
-          # 1. Timeout case: loop exited because deadline passed, STATUS still in-progress
-          # 2. Edge case: API call latency caused deadline to pass mid-iteration
           if [[ "$STATUS" != "Successful" ]]; then
-            echo "::error::Instance refresh timed out after ${REFRESH_TIMEOUT_MINUTES} minutes (status: $STATUS)"
+            echo "::error::Server instance refresh timed out after ${REFRESH_TIMEOUT_MINUTES} minutes (status: $STATUS)"
             exit 1
           fi
 
-      - name: Dry Run Notice (Instance Refresh)
-        if: inputs.dry_run == true
-        run: |
-          echo "[DRY RUN] Would start instance refresh and wait for completion"
-          echo "[DRY RUN] Would verify target group health"
-
-      - name: Verify Standby Health
-        if: inputs.dry_run != true
+      - name: "[Server] Verify Standby Health"
+        if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run != true
         env:
-          STANDBY_COLOR: ${{ needs.prepare.outputs.standby_color }}
-          GREEN_UDP_TG: ${{ needs.prepare.outputs.green_udp_tg_arn }}
-          BLUE_UDP_TG: ${{ needs.prepare.outputs.blue_udp_tg_arn }}
-          GREEN_HTTPS_TG: ${{ needs.prepare.outputs.green_https_tg_arn }}
-          BLUE_HTTPS_TG: ${{ needs.prepare.outputs.blue_https_tg_arn }}
+          STANDBY_COLOR: ${{ needs.prepare.outputs.server_standby_color }}
+          GREEN_PRIMARY_TG: ${{ needs.prepare.outputs.server_green_primary_tg_arn }}
+          BLUE_PRIMARY_TG: ${{ needs.prepare.outputs.server_blue_primary_tg_arn }}
+          GREEN_SECONDARY_TG: ${{ needs.prepare.outputs.server_green_secondary_tg_arn }}
+          BLUE_SECONDARY_TG: ${{ needs.prepare.outputs.server_blue_secondary_tg_arn }}
           HEALTH_CHECK_TIMEOUT_MINUTES: ${{ inputs.health_check_timeout_minutes }}
         run: |
-          # Function to verify target group health using wall-clock timeout
-          # This is more accurate than iteration count as it accounts for API latency
           verify_tg_health() {
-            local TG_ARN="$1"
-            local TG_NAME="$2"
-            local RESULT_FILE="$3"  # File to write result for parallel execution
+            local TG_ARN="$1" TG_NAME="$2" RESULT_FILE="$3"
             local DEADLINE=$(($(date +%s) + HEALTH_CHECK_TIMEOUT_MINUTES * 60))
-
             echo "[$TG_NAME] Verifying target group health: $TG_ARN"
-            echo "[$TG_NAME] Timeout: ${HEALTH_CHECK_TIMEOUT_MINUTES}m"
-
             local ITERATION=0
             while [[ $(date +%s) -lt $DEADLINE ]]; do
               ITERATION=$((ITERATION + 1))
               local REMAINING=$(( (DEADLINE - $(date +%s)) / 60 ))
-
-              # Get health status with explicit error checking
               if ! HEALTH=$(aws elbv2 describe-target-health \
                 --target-group-arn "$TG_ARN" \
-                --query "TargetHealthDescriptions[*].TargetHealth.State" \
-                --output text 2>&1); then
-                echo "[$TG_NAME] Warning: Failed to get health status: $HEALTH"
-                sleep 10
-                continue
+                --query "TargetHealthDescriptions[*].TargetHealth.State" --output text 2>&1); then
+                echo "[$TG_NAME] Warning: Failed to get health: $HEALTH"; sleep 10; continue
               fi
-
-              # Count healthy targets with explicit handling for empty response
-              if [[ -z "$HEALTH" ]]; then
-                HEALTHY_COUNT=0
-                TOTAL_COUNT=0
+              if [[ -z "$HEALTH" ]]; then HEALTHY_COUNT=0; TOTAL_COUNT=0
               else
-                # Use awk for more reliable counting (avoids pipefail issues)
                 HEALTHY_COUNT=$(echo "$HEALTH" | awk '{for(i=1;i<=NF;i++) if($i=="healthy") c++} END{print c+0}')
                 TOTAL_COUNT=$(echo "$HEALTH" | awk '{print NF}')
               fi
-
               echo "[$TG_NAME] [iter $ITERATION, ${REMAINING}m left] $HEALTHY_COUNT/$TOTAL_COUNT healthy"
-
               if [[ "$TOTAL_COUNT" -gt 0 && "$HEALTHY_COUNT" -eq "$TOTAL_COUNT" ]]; then
                 echo "[$TG_NAME] All targets healthy"
                 [[ -n "$RESULT_FILE" ]] && echo "success" > "$RESULT_FILE"
                 return 0
               fi
-
               sleep 10
             done
-
             echo "::error::[$TG_NAME] Targets not healthy after ${HEALTH_CHECK_TIMEOUT_MINUTES} minutes"
             [[ -n "$RESULT_FILE" ]] && echo "failed" > "$RESULT_FILE"
             return 1
           }
-
-          # Determine target groups based on standby color
           if [[ "$STANDBY_COLOR" == "green" ]]; then
-            UDP_TG="$GREEN_UDP_TG"
-            HTTPS_TG="$GREEN_HTTPS_TG"
+            PRIMARY_TG="$GREEN_PRIMARY_TG"; SECONDARY_TG="$GREEN_SECONDARY_TG"
           else
-            UDP_TG="$BLUE_UDP_TG"
-            HTTPS_TG="$BLUE_HTTPS_TG"
+            PRIMARY_TG="$BLUE_PRIMARY_TG"; SECONDARY_TG="$BLUE_SECONDARY_TG"
           fi
-
-          # Run health checks in parallel if both UDP and HTTPS are configured
-          if [[ -n "$HTTPS_TG" ]]; then
+          if [[ -n "$SECONDARY_TG" ]]; then
             echo "Running UDP and HTTPS health checks in parallel..."
-
-            # Create temp files for results
-            UDP_RESULT=$(mktemp)
-            HTTPS_RESULT=$(mktemp)
+            UDP_RESULT=$(mktemp); HTTPS_RESULT=$(mktemp)
             trap "rm -f $UDP_RESULT $HTTPS_RESULT" EXIT INT TERM
-
-            # Run both health checks in background
-            verify_tg_health "$UDP_TG" "UDP" "$UDP_RESULT" &
+            verify_tg_health "$PRIMARY_TG" "UDP" "$UDP_RESULT" &
             UDP_PID=$!
-            verify_tg_health "$HTTPS_TG" "HTTPS" "$HTTPS_RESULT" &
+            verify_tg_health "$SECONDARY_TG" "HTTPS" "$HTTPS_RESULT" &
             HTTPS_PID=$!
-
-            # Wait for both to complete
-            UDP_EXIT=0
-            HTTPS_EXIT=0
+            UDP_EXIT=0; HTTPS_EXIT=0
             wait $UDP_PID || UDP_EXIT=$?
             wait $HTTPS_PID || HTTPS_EXIT=$?
-
-            # Check results
-            if [[ $UDP_EXIT -ne 0 ]]; then
-              echo "::error::UDP health check failed"
-              exit 1
-            fi
-            if [[ $HTTPS_EXIT -ne 0 ]]; then
-              echo "::error::HTTPS health check failed"
-              exit 1
-            fi
-
-            echo "Both UDP and HTTPS targets are healthy"
+            if [[ $UDP_EXIT -ne 0 ]]; then echo "::error::Server UDP health check failed"; exit 1; fi
+            if [[ $HTTPS_EXIT -ne 0 ]]; then echo "::error::Server HTTPS health check failed"; exit 1; fi
           else
-            # Only UDP, run sequentially
-            echo "No HTTPS target group configured (QURL not enabled)"
-            verify_tg_health "$UDP_TG" "UDP" "" || exit 1
+            verify_tg_health "$PRIMARY_TG" "Server-UDP" "" || exit 1
           fi
+
+      # ---- AC Deploy Steps ----
+      - name: "[AC] Validate Image Exists in ECR"
+        if: needs.prepare.outputs.deploy_ac == 'true'
+        env:
+          IMAGE_TAG: ${{ needs.prepare.outputs.ac_target_image_tag }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          REPO_NAME=$(aws ssm get-parameter \
+            --name "/${ENVIRONMENT}/nhp/ac/ecr-repo-name" \
+            --query "Parameter.Value" --output text 2>/dev/null) || REPO_NAME=""
+          if [[ -z "$REPO_NAME" ]]; then
+            REPO_NAME="layerv/nhp-ac"
+            echo "::warning::SSM parameter /${ENVIRONMENT}/nhp/ac/ecr-repo-name not found, using default: $REPO_NAME"
+          fi
+          echo "Verifying image $REPO_NAME:$IMAGE_TAG exists in ECR..."
+          if ! aws ecr describe-images \
+            --repository-name "$REPO_NAME" \
+            --image-ids imageTag="$IMAGE_TAG" \
+            --query "imageDetails[0].imageTags" \
+            --output text > /dev/null 2>&1; then
+            echo "::error::Image $REPO_NAME:$IMAGE_TAG not found in ECR"
+            exit 1
+          fi
+          echo "Image verified: $REPO_NAME:$IMAGE_TAG exists"
+
+      - name: "[AC] Update Standby Image Tag"
+        if: needs.prepare.outputs.deploy_ac == 'true'
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          STANDBY_COLOR: ${{ needs.prepare.outputs.ac_standby_color }}
+          IMAGE_TAG: ${{ needs.prepare.outputs.ac_target_image_tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [[ "$STANDBY_COLOR" == "green" ]]; then
+            SSM_PARAM="/${ENVIRONMENT}/nhp/ac/green-image-tag"
+          else
+            SSM_PARAM="/${ENVIRONMENT}/nhp/ac/image-tag"
+          fi
+          echo "Updating $SSM_PARAM to $IMAGE_TAG"
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "[DRY RUN] Would update SSM parameter: $SSM_PARAM = $IMAGE_TAG"
+          else
+            aws ssm put-parameter --name "$SSM_PARAM" --value "$IMAGE_TAG" --type String --overwrite
+          fi
+
+      - name: "[AC] Scale Up Standby ASG"
+        if: needs.prepare.outputs.deploy_ac == 'true'
+        env:
+          STANDBY_ASG: ${{ needs.prepare.outputs.ac_standby_asg }}
+          ACTIVE_ASG: ${{ needs.prepare.outputs.ac_active_asg }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          ACTIVE_CAPACITY=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ACTIVE_ASG" \
+            --query "AutoScalingGroups[0].DesiredCapacity" --output text)
+          echo "AC active ASG capacity: $ACTIVE_CAPACITY"
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "[DRY RUN] Would scale $STANDBY_ASG to min=$ACTIVE_CAPACITY, desired=$ACTIVE_CAPACITY"
+          else
+            aws autoscaling update-auto-scaling-group \
+              --auto-scaling-group-name "$STANDBY_ASG" \
+              --min-size "$ACTIVE_CAPACITY" --desired-capacity "$ACTIVE_CAPACITY"
+          fi
+
+      - name: "[AC] Instance Refresh on Standby"
+        if: needs.prepare.outputs.deploy_ac == 'true' && inputs.dry_run != true
+        env:
+          STANDBY_ASG: ${{ needs.prepare.outputs.ac_standby_asg }}
+          REFRESH_TIMEOUT_MINUTES: ${{ inputs.refresh_timeout_minutes }}
+        run: |
+          echo "Starting instance refresh on AC standby ASG: $STANDBY_ASG"
+          EXISTING=$(aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name "$STANDBY_ASG" \
+            --query "InstanceRefreshes[?Status=='InProgress' || Status=='Pending'].InstanceRefreshId" \
+            --output text 2>/dev/null) || true
+          if [[ -n "$EXISTING" ]]; then
+            echo "Cancelling existing refresh: $EXISTING"
+            aws autoscaling cancel-instance-refresh --auto-scaling-group-name "$STANDBY_ASG" || true
+            sleep 10
+          fi
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$STANDBY_ASG" \
+            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 180, "SkipMatching": false}' \
+            --query "InstanceRefreshId" --output text)
+          echo "Instance refresh started: $REFRESH_ID"
+          DEADLINE=$(($(date +%s) + REFRESH_TIMEOUT_MINUTES * 60))
+          ITERATION=0
+          while [[ $(date +%s) -lt $DEADLINE ]]; do
+            ITERATION=$((ITERATION + 1))
+            REMAINING=$(( (DEADLINE - $(date +%s)) / 60 ))
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$STANDBY_ASG" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query "InstanceRefreshes[0].Status" --output text)
+            echo "[AC] [iter $ITERATION, ${REMAINING}m remaining] Refresh status: $STATUS"
+            case "$STATUS" in
+              Successful) echo "AC instance refresh completed successfully"; break ;;
+              Failed|Cancelled) echo "::error::AC instance refresh $STATUS"; exit 1 ;;
+              *) sleep 10 ;;
+            esac
+          done
+          if [[ "$STATUS" != "Successful" ]]; then
+            echo "::error::AC instance refresh timed out after ${REFRESH_TIMEOUT_MINUTES} minutes (status: $STATUS)"
+            exit 1
+          fi
+
+      - name: "[AC] Verify Standby Health"
+        if: needs.prepare.outputs.deploy_ac == 'true' && inputs.dry_run != true
+        env:
+          STANDBY_COLOR: ${{ needs.prepare.outputs.ac_standby_color }}
+          GREEN_PRIMARY_TG: ${{ needs.prepare.outputs.ac_green_primary_tg_arn }}
+          BLUE_PRIMARY_TG: ${{ needs.prepare.outputs.ac_blue_primary_tg_arn }}
+          HEALTH_CHECK_TIMEOUT_MINUTES: ${{ inputs.health_check_timeout_minutes }}
+        run: |
+          if [[ "$STANDBY_COLOR" == "green" ]]; then
+            TG_ARN="$GREEN_PRIMARY_TG"
+          else
+            TG_ARN="$BLUE_PRIMARY_TG"
+          fi
+          echo "Verifying AC target group health: $TG_ARN"
+          DEADLINE=$(($(date +%s) + HEALTH_CHECK_TIMEOUT_MINUTES * 60))
+          ITERATION=0
+          while [[ $(date +%s) -lt $DEADLINE ]]; do
+            ITERATION=$((ITERATION + 1))
+            REMAINING=$(( (DEADLINE - $(date +%s)) / 60 ))
+            if ! HEALTH=$(aws elbv2 describe-target-health \
+              --target-group-arn "$TG_ARN" \
+              --query "TargetHealthDescriptions[*].TargetHealth.State" --output text 2>&1); then
+              echo "[AC-TCP] Warning: Failed to get health: $HEALTH"; sleep 10; continue
+            fi
+            if [[ -z "$HEALTH" ]]; then HEALTHY_COUNT=0; TOTAL_COUNT=0
+            else
+              HEALTHY_COUNT=$(echo "$HEALTH" | awk '{for(i=1;i<=NF;i++) if($i=="healthy") c++} END{print c+0}')
+              TOTAL_COUNT=$(echo "$HEALTH" | awk '{print NF}')
+            fi
+            echo "[AC-TCP] [iter $ITERATION, ${REMAINING}m left] $HEALTHY_COUNT/$TOTAL_COUNT healthy"
+            if [[ "$TOTAL_COUNT" -gt 0 && "$HEALTHY_COUNT" -eq "$TOTAL_COUNT" ]]; then
+              echo "[AC-TCP] All targets healthy"
+              break
+            fi
+            sleep 10
+          done
+          if [[ "$TOTAL_COUNT" -eq 0 || "$HEALTHY_COUNT" -ne "$TOTAL_COUNT" ]]; then
+            echo "::error::[AC-TCP] Targets not healthy after ${HEALTH_CHECK_TIMEOUT_MINUTES} minutes"
+            exit 1
+          fi
+
+      - name: "[Server] Dry Run Notice"
+        if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run == true
+        run: |
+          echo "[DRY RUN] [Server] Would start instance refresh and wait for completion"
+          echo "[DRY RUN] [Server] Would verify target group health"
+
+      - name: "[AC] Dry Run Notice"
+        if: needs.prepare.outputs.deploy_ac == 'true' && inputs.dry_run == true
+        run: |
+          echo "[DRY RUN] [AC] Would start instance refresh and wait for completion"
+          echo "[DRY RUN] [AC] Would verify target group health"
 
   # =============================================================================
   # SWITCH TRAFFIC - Modify NLB listeners (instant, <1 second)
@@ -564,100 +834,37 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Switch NLB Listeners
+      - name: "[Server] Switch NLB Listeners"
+        if: needs.prepare.outputs.deploy_server == 'true'
         env:
-          STANDBY_COLOR: ${{ needs.prepare.outputs.standby_color }}
-          ACTIVE_COLOR: ${{ needs.prepare.outputs.active_color }}
-          UDP_LISTENER: ${{ needs.prepare.outputs.udp_listener_arn }}
-          BLUE_UDP_TG: ${{ needs.prepare.outputs.blue_udp_tg_arn }}
-          GREEN_UDP_TG: ${{ needs.prepare.outputs.green_udp_tg_arn }}
-          HTTPS_LISTENER: ${{ needs.prepare.outputs.https_listener_arn }}
-          BLUE_HTTPS_TG: ${{ needs.prepare.outputs.blue_https_tg_arn }}
-          GREEN_HTTPS_TG: ${{ needs.prepare.outputs.green_https_tg_arn }}
+          STANDBY_COLOR: ${{ needs.prepare.outputs.server_standby_color }}
+          ACTIVE_COLOR: ${{ needs.prepare.outputs.server_active_color }}
           DRY_RUN: ${{ inputs.dry_run }}
-        run: |
-          echo "Switching traffic to $STANDBY_COLOR..."
-
-          # Determine target groups based on colors
-          if [[ "$STANDBY_COLOR" == "green" ]]; then
-            TARGET_UDP_TG="$GREEN_UDP_TG"
-            TARGET_HTTPS_TG="$GREEN_HTTPS_TG"
-            ROLLBACK_UDP_TG="$BLUE_UDP_TG"
-          else
-            TARGET_UDP_TG="$BLUE_UDP_TG"
-            TARGET_HTTPS_TG="$BLUE_HTTPS_TG"
-            ROLLBACK_UDP_TG="$GREEN_UDP_TG"
-          fi
-
-          if [[ "$DRY_RUN" == "true" ]]; then
-            echo "[DRY RUN] Would switch UDP listener to: $TARGET_UDP_TG"
-            if [[ -n "$HTTPS_LISTENER" && -n "$TARGET_HTTPS_TG" ]]; then
-              echo "[DRY RUN] Would switch HTTPS listener to: $TARGET_HTTPS_TG"
-            fi
-            echo "[DRY RUN] Traffic switch skipped"
-            exit 0
-          fi
-
-          # Switch UDP listener
-          echo "Switching UDP listener to target group: $TARGET_UDP_TG"
-          aws elbv2 modify-listener \
-            --listener-arn "$UDP_LISTENER" \
-            --default-actions "Type=forward,TargetGroupArn=$TARGET_UDP_TG"
-
-          UDP_SWITCH_SUCCESS=true
-
-          # Switch HTTPS listener if present, rollback UDP on failure
-          if [[ -n "$HTTPS_LISTENER" && -n "$TARGET_HTTPS_TG" ]]; then
-            echo "Switching HTTPS listener to target group: $TARGET_HTTPS_TG"
-            if ! aws elbv2 modify-listener \
-              --listener-arn "$HTTPS_LISTENER" \
-              --default-actions "Type=forward,TargetGroupArn=$TARGET_HTTPS_TG"; then
-              echo "::error::HTTPS switch failed, reverting UDP listener to $ACTIVE_COLOR..."
-              aws elbv2 modify-listener \
-                --listener-arn "$UDP_LISTENER" \
-                --default-actions "Type=forward,TargetGroupArn=$ROLLBACK_UDP_TG"
-              echo "::error::UDP listener reverted. Traffic remains on $ACTIVE_COLOR."
-              exit 1
-            fi
-          fi
-
-          echo "Traffic switched successfully"
-
-      - name: Update SSM Active Color
-        if: inputs.dry_run != true
-        env:
           ENVIRONMENT: ${{ inputs.environment }}
-          STANDBY_COLOR: ${{ needs.prepare.outputs.standby_color }}
           ACTION: ${{ inputs.action }}
         run: |
-          # Update active color
-          # Note: Traffic switch already succeeded at this point. If SSM update fails,
-          # warn but don't fail - the validate job's reconciliation check will detect
-          # any listener/SSM mismatch and alert for manual intervention.
-          if ! aws ssm put-parameter \
-            --name "/${ENVIRONMENT}/nhp/server/active-color" \
-            --value "$STANDBY_COLOR" \
-            --type String \
-            --overwrite; then
-            echo "::warning::SSM active-color update failed but traffic switch succeeded"
-            echo "::warning::Reconciliation check will detect this. Manual intervention may be required."
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "[DRY RUN] Would switch server traffic to $STANDBY_COLOR"
+            exit 0
           fi
+          chmod +x .github/scripts/blue-green-switch.sh
+          .github/scripts/blue-green-switch.sh "$ENVIRONMENT" "$STANDBY_COLOR" server
 
-          # Update last switch timestamp
-          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          if [[ "$ACTION" == "rollback" ]]; then
-            TIMESTAMP="${TIMESTAMP}-ROLLBACK"
+      - name: "[AC] Switch NLB Listener"
+        if: needs.prepare.outputs.deploy_ac == 'true'
+        env:
+          STANDBY_COLOR: ${{ needs.prepare.outputs.ac_standby_color }}
+          ACTIVE_COLOR: ${{ needs.prepare.outputs.ac_active_color }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          ACTION: ${{ inputs.action }}
+        run: |
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "[DRY RUN] Would switch AC traffic to $STANDBY_COLOR"
+            exit 0
           fi
-
-          if ! aws ssm put-parameter \
-            --name "/${ENVIRONMENT}/nhp/server/last-switch-timestamp" \
-            --value "$TIMESTAMP" \
-            --type String \
-            --overwrite; then
-            echo "::warning::SSM timestamp update failed (non-critical)"
-          fi
-
-          echo "SSM state updated: active-color=$STANDBY_COLOR, timestamp=$TIMESTAMP"
+          chmod +x .github/scripts/blue-green-switch.sh
+          .github/scripts/blue-green-switch.sh "$ENVIRONMENT" "$STANDBY_COLOR" ac
 
   # =============================================================================
   # SCALE DOWN PREVIOUS - Reduce previous active to warm standby
@@ -676,19 +883,27 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Scale Down Previous Active
+      - name: "[Server] Scale Down Previous Active"
+        if: needs.prepare.outputs.deploy_server == 'true'
         env:
-          PREVIOUS_ASG: ${{ needs.prepare.outputs.active_asg }}
+          PREVIOUS_ASG: ${{ needs.prepare.outputs.server_active_asg }}
         run: |
-          echo "Scaling down previous active ASG to warm standby: $PREVIOUS_ASG"
-
-          # Scale down to 1 instance for warm standby
+          echo "Scaling down previous server active ASG to warm standby: $PREVIOUS_ASG"
           aws autoscaling update-auto-scaling-group \
             --auto-scaling-group-name "$PREVIOUS_ASG" \
-            --min-size 1 \
-            --desired-capacity 1
+            --min-size 1 --desired-capacity 1
+          echo "Previous server ASG scaled down to 1 instance"
 
-          echo "Previous active ASG scaled down to 1 instance"
+      - name: "[AC] Scale Down Previous Active"
+        if: needs.prepare.outputs.deploy_ac == 'true'
+        env:
+          PREVIOUS_ASG: ${{ needs.prepare.outputs.ac_active_asg }}
+        run: |
+          echo "Scaling down previous AC active ASG to warm standby: $PREVIOUS_ASG"
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "$PREVIOUS_ASG" \
+            --min-size 1 --desired-capacity 1
+          echo "Previous AC ASG scaled down to 1 instance"
 
   # =============================================================================
   # VALIDATE - Post-switch validation
@@ -710,78 +925,93 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Verify Traffic Switch
+      - name: "[Server] Verify Traffic Switch"
+        if: needs.prepare.outputs.deploy_server == 'true'
         env:
-          STANDBY_COLOR: ${{ needs.prepare.outputs.standby_color }}
-          UDP_LISTENER: ${{ needs.prepare.outputs.udp_listener_arn }}
-          GREEN_UDP_TG: ${{ needs.prepare.outputs.green_udp_tg_arn }}
-          BLUE_UDP_TG: ${{ needs.prepare.outputs.blue_udp_tg_arn }}
+          STANDBY_COLOR: ${{ needs.prepare.outputs.server_standby_color }}
+          PRIMARY_LISTENER: ${{ needs.prepare.outputs.server_primary_listener_arn }}
+          GREEN_PRIMARY_TG: ${{ needs.prepare.outputs.server_green_primary_tg_arn }}
+          BLUE_PRIMARY_TG: ${{ needs.prepare.outputs.server_blue_primary_tg_arn }}
         run: |
-          # Get current target group from listener
           CURRENT_TG=$(aws elbv2 describe-listeners \
-            --listener-arns "$UDP_LISTENER" \
+            --listener-arns "$PRIMARY_LISTENER" \
             --query "Listeners[0].DefaultActions[0].TargetGroupArn" --output text)
-
-          if [[ "$STANDBY_COLOR" == "green" ]]; then
-            EXPECTED_TG="$GREEN_UDP_TG"
-          else
-            EXPECTED_TG="$BLUE_UDP_TG"
-          fi
-
+          if [[ "$STANDBY_COLOR" == "green" ]]; then EXPECTED_TG="$GREEN_PRIMARY_TG"
+          else EXPECTED_TG="$BLUE_PRIMARY_TG"; fi
           if [[ "$CURRENT_TG" == "$EXPECTED_TG" ]]; then
-            echo "Traffic verified: UDP listener pointing to $STANDBY_COLOR target group"
+            echo "Server traffic verified: UDP listener pointing to $STANDBY_COLOR target group"
           else
-            echo "::error::Traffic mismatch! Expected $EXPECTED_TG but got $CURRENT_TG"
+            echo "::error::Server traffic mismatch! Expected $EXPECTED_TG but got $CURRENT_TG"
             exit 1
           fi
 
-      - name: Reconcile Listener and SSM State
+      - name: "[Server] Reconcile Listener and SSM State"
+        if: needs.prepare.outputs.deploy_server == 'true'
         env:
           ENVIRONMENT: ${{ inputs.environment }}
-          UDP_LISTENER: ${{ needs.prepare.outputs.udp_listener_arn }}
-          GREEN_UDP_TG: ${{ needs.prepare.outputs.green_udp_tg_arn }}
-          BLUE_UDP_TG: ${{ needs.prepare.outputs.blue_udp_tg_arn }}
+          PRIMARY_LISTENER: ${{ needs.prepare.outputs.server_primary_listener_arn }}
+          GREEN_PRIMARY_TG: ${{ needs.prepare.outputs.server_green_primary_tg_arn }}
+          BLUE_PRIMARY_TG: ${{ needs.prepare.outputs.server_blue_primary_tg_arn }}
         run: |
-          # Reconciliation check: Verify listener state matches SSM active-color
-          # This catches any race conditions or partial failures
-          #
-          # NOTE: This is a best-effort consistency check, not a guarantee.
-          # Edge cases like concurrent workflow runs or AWS API eventual consistency
-          # could still cause state divergence. The check runs immediately after
-          # switch-traffic completes, so timing-related inconsistencies are unlikely
-          # but not impossible. Manual verification is recommended for critical deployments.
-
-          echo "Running listener/SSM state reconciliation check..."
-
-          # Get current SSM active color
+          echo "Running server listener/SSM state reconciliation check..."
           SSM_COLOR=$(aws ssm get-parameter \
             --name "/${ENVIRONMENT}/nhp/server/active-color" \
             --query "Parameter.Value" --output text)
-
-          # Get current listener target group
           LISTENER_TG=$(aws elbv2 describe-listeners \
-            --listener-arns "$UDP_LISTENER" \
+            --listener-arns "$PRIMARY_LISTENER" \
             --query "Listeners[0].DefaultActions[0].TargetGroupArn" --output text)
-
-          # Determine which color the listener is pointing to
-          if [[ "$LISTENER_TG" == "$BLUE_UDP_TG" ]]; then
-            LISTENER_COLOR="blue"
-          elif [[ "$LISTENER_TG" == "$GREEN_UDP_TG" ]]; then
-            LISTENER_COLOR="green"
+          if [[ "$LISTENER_TG" == "$BLUE_PRIMARY_TG" ]]; then LISTENER_COLOR="blue"
+          elif [[ "$LISTENER_TG" == "$GREEN_PRIMARY_TG" ]]; then LISTENER_COLOR="green"
+          else echo "::error::Server listener pointing to unknown TG: $LISTENER_TG"; exit 1; fi
+          if [[ "$SSM_COLOR" == "$LISTENER_COLOR" ]]; then
+            echo "Server reconciliation passed: SSM ($SSM_COLOR) matches listener ($LISTENER_COLOR)"
           else
-            echo "::error::Listener pointing to unknown target group: $LISTENER_TG"
+            echo "::error::Server state inconsistency! SSM=$SSM_COLOR, listener=$LISTENER_COLOR"
             exit 1
           fi
 
-          # Verify consistency
-          if [[ "$SSM_COLOR" == "$LISTENER_COLOR" ]]; then
-            echo "Reconciliation passed: SSM ($SSM_COLOR) matches listener ($LISTENER_COLOR)"
+      - name: "[AC] Verify Traffic Switch"
+        if: needs.prepare.outputs.deploy_ac == 'true'
+        env:
+          STANDBY_COLOR: ${{ needs.prepare.outputs.ac_standby_color }}
+          PRIMARY_LISTENER: ${{ needs.prepare.outputs.ac_primary_listener_arn }}
+          GREEN_PRIMARY_TG: ${{ needs.prepare.outputs.ac_green_primary_tg_arn }}
+          BLUE_PRIMARY_TG: ${{ needs.prepare.outputs.ac_blue_primary_tg_arn }}
+        run: |
+          CURRENT_TG=$(aws elbv2 describe-listeners \
+            --listener-arns "$PRIMARY_LISTENER" \
+            --query "Listeners[0].DefaultActions[0].TargetGroupArn" --output text)
+          if [[ "$STANDBY_COLOR" == "green" ]]; then EXPECTED_TG="$GREEN_PRIMARY_TG"
+          else EXPECTED_TG="$BLUE_PRIMARY_TG"; fi
+          if [[ "$CURRENT_TG" == "$EXPECTED_TG" ]]; then
+            echo "AC traffic verified: TCP listener pointing to $STANDBY_COLOR target group"
           else
-            echo "::error::State inconsistency detected!"
-            echo "::error::SSM active-color: $SSM_COLOR"
-            echo "::error::Listener pointing to: $LISTENER_COLOR"
-            echo "::error::This may indicate a partial failure during traffic switch."
-            echo "::error::Manual intervention required: update SSM or re-run switch."
+            echo "::error::AC traffic mismatch! Expected $EXPECTED_TG but got $CURRENT_TG"
+            exit 1
+          fi
+
+      - name: "[AC] Reconcile Listener and SSM State"
+        if: needs.prepare.outputs.deploy_ac == 'true'
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          PRIMARY_LISTENER: ${{ needs.prepare.outputs.ac_primary_listener_arn }}
+          GREEN_PRIMARY_TG: ${{ needs.prepare.outputs.ac_green_primary_tg_arn }}
+          BLUE_PRIMARY_TG: ${{ needs.prepare.outputs.ac_blue_primary_tg_arn }}
+        run: |
+          echo "Running AC listener/SSM state reconciliation check..."
+          SSM_COLOR=$(aws ssm get-parameter \
+            --name "/${ENVIRONMENT}/nhp/ac/active-color" \
+            --query "Parameter.Value" --output text)
+          LISTENER_TG=$(aws elbv2 describe-listeners \
+            --listener-arns "$PRIMARY_LISTENER" \
+            --query "Listeners[0].DefaultActions[0].TargetGroupArn" --output text)
+          if [[ "$LISTENER_TG" == "$BLUE_PRIMARY_TG" ]]; then LISTENER_COLOR="blue"
+          elif [[ "$LISTENER_TG" == "$GREEN_PRIMARY_TG" ]]; then LISTENER_COLOR="green"
+          else echo "::error::AC listener pointing to unknown TG: $LISTENER_TG"; exit 1; fi
+          if [[ "$SSM_COLOR" == "$LISTENER_COLOR" ]]; then
+            echo "AC reconciliation passed: SSM ($SSM_COLOR) matches listener ($LISTENER_COLOR)"
+          else
+            echo "::error::AC state inconsistency! SSM=$SSM_COLOR, listener=$LISTENER_COLOR"
             exit 1
           fi
 
@@ -801,36 +1031,65 @@ jobs:
       - name: Push Deployment Metric
         env:
           ENVIRONMENT: ${{ inputs.environment }}
+          COMPONENT: ${{ inputs.component }}
         run: |
           # Push deployment count metric for stale deployment detection
-          # The alarm checks if Sum(DeploymentCount) over 7 days < 1
+          # Emit with Environment-only dimension for backward compatibility with
+          # existing server stale-deployment alarm, plus Environment+Component
+          # for per-component tracking
           aws cloudwatch put-metric-data \
             --namespace "NHP/BlueGreen" \
             --metric-name "DeploymentCount" \
             --dimensions "Environment=$ENVIRONMENT" \
             --value 1 \
             --unit Count
-          echo "Deployment metric pushed to CloudWatch"
+          aws cloudwatch put-metric-data \
+            --namespace "NHP/BlueGreen" \
+            --metric-name "DeploymentCount" \
+            --dimensions "Environment=$ENVIRONMENT,Component=$COMPONENT" \
+            --value 1 \
+            --unit Count
+          echo "Deployment metric pushed to CloudWatch (both dimension sets)"
 
       - name: Deployment Summary
         env:
           ACTION: ${{ inputs.action }}
-          NEW_ACTIVE: ${{ needs.prepare.outputs.standby_color }}
-          PREVIOUS_ACTIVE: ${{ needs.prepare.outputs.active_color }}
-          NEW_ACTIVE_TAG: ${{ needs.prepare.outputs.target_image_tag }}
-          PREVIOUS_TAG: ${{ needs.prepare.outputs.active_image_tag }}
+          COMPONENT: ${{ inputs.component }}
+          DEPLOY_SERVER: ${{ needs.prepare.outputs.deploy_server }}
+          DEPLOY_AC: ${{ needs.prepare.outputs.deploy_ac }}
+          SERVER_NEW_ACTIVE: ${{ needs.prepare.outputs.server_standby_color }}
+          SERVER_PREVIOUS_ACTIVE: ${{ needs.prepare.outputs.server_active_color }}
+          SERVER_NEW_TAG: ${{ needs.prepare.outputs.server_target_image_tag }}
+          SERVER_PREVIOUS_TAG: ${{ needs.prepare.outputs.server_active_image_tag }}
+          AC_NEW_ACTIVE: ${{ needs.prepare.outputs.ac_standby_color }}
+          AC_PREVIOUS_ACTIVE: ${{ needs.prepare.outputs.ac_active_color }}
+          AC_NEW_TAG: ${{ needs.prepare.outputs.ac_target_image_tag }}
+          AC_PREVIOUS_TAG: ${{ needs.prepare.outputs.ac_active_image_tag }}
         run: |
           echo "## Blue/Green Deployment Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Property | Before | After |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Active Color | $PREVIOUS_ACTIVE | **$NEW_ACTIVE** |" >> $GITHUB_STEP_SUMMARY
-          echo "| Active Image | \`$PREVIOUS_TAG\` | \`$NEW_ACTIVE_TAG\` |" >> $GITHUB_STEP_SUMMARY
+          echo "**Action:** $ACTION | **Component:** $COMPONENT" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Action:** $ACTION" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$DEPLOY_SERVER" == "true" ]]; then
+            echo "### Server" >> $GITHUB_STEP_SUMMARY
+            echo "| Property | Before | After |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Active Color | $SERVER_PREVIOUS_ACTIVE | **$SERVER_NEW_ACTIVE** |" >> $GITHUB_STEP_SUMMARY
+            echo "| Active Image | \`$SERVER_PREVIOUS_TAG\` | \`$SERVER_NEW_TAG\` |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [[ "$DEPLOY_AC" == "true" ]]; then
+            echo "### AC" >> $GITHUB_STEP_SUMMARY
+            echo "| Property | Before | After |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Active Color | $AC_PREVIOUS_ACTIVE | **$AC_NEW_ACTIVE** |" >> $GITHUB_STEP_SUMMARY
+            echo "| Active Image | \`$AC_PREVIOUS_TAG\` | \`$AC_NEW_TAG\` |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
           echo "### Rollback" >> $GITHUB_STEP_SUMMARY
           echo "To rollback, run this workflow with:" >> $GITHUB_STEP_SUMMARY
           echo "- **action:** \`rollback\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "This will switch traffic back to **$PREVIOUS_ACTIVE** (image: \`$PREVIOUS_TAG\`)" >> $GITHUB_STEP_SUMMARY
+          echo "- **component:** \`$COMPONENT\`" >> $GITHUB_STEP_SUMMARY

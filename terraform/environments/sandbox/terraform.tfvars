@@ -369,6 +369,10 @@ qurl_router_enabled = true
 enable_blue_green      = true
 green_standby_min_size = 1 # Warm standby - 1 instance ready for instant switch
 
+# AC Blue/Green Deployment
+enable_ac_blue_green      = true
+ac_green_standby_min_size = 1 # Warm standby - 1 instance ready for instant switch
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"

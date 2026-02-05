@@ -288,3 +288,27 @@ output "ssm_green_image_tag_parameter" {
   description = "SSM parameter name for green ASG image tag"
   value       = module.compute.ssm_green_image_tag_parameter
 }
+
+# ============================================================================
+# AC Blue/Green Deployment Outputs
+# ============================================================================
+
+output "ac_blue_green_enabled" {
+  description = "Whether blue/green deployment is enabled for AC"
+  value       = var.deploy_ac ? module.ac[0].blue_green_enabled : false
+}
+
+output "ac_green_asg_name" {
+  description = "AC Green ASG name for CI/CD scripts (null if not enabled)"
+  value       = var.deploy_ac ? module.ac[0].green_asg_name : null
+}
+
+output "ac_ssm_active_color_parameter" {
+  description = "SSM parameter name for AC active deployment color"
+  value       = var.deploy_ac ? module.ac[0].ssm_active_color_parameter : null
+}
+
+output "ac_ssm_green_image_tag_parameter" {
+  description = "SSM parameter name for AC green ASG image tag"
+  value       = var.deploy_ac ? module.ac[0].ssm_green_image_tag_parameter : null
+}

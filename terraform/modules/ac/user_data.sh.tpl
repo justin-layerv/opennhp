@@ -90,12 +90,88 @@ ECR_REPO="${ac_repo_url}"
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${account_id}.dkr.ecr.${region}.amazonaws.com"
 
 # ============================================================================
+# Blue/Green Deployment: Detect Deploy Color
+# Instances are tagged with DeployColor (blue or green) by the ASG.
+# Green instances read from a different SSM parameter for their image tag.
+#
+# Tag Propagation: ASG tags typically propagate within seconds, but can
+# occasionally be delayed. We retry with exponential backoff to handle this.
+# ============================================================================
+echo "Detecting deployment color from instance tags..."
+
+# Retry function for tag detection with exponential backoff
+get_deploy_color_with_retry() {
+    local max_attempts=5
+    local delay=2
+    local max_delay=30
+    local attempt=1
+
+    while [ $attempt -le $max_attempts ]; do
+        DEPLOY_COLOR=$(aws ec2 describe-tags \
+          --filters "Name=resource-id,Values=$INSTANCE_ID" "Name=key,Values=DeployColor" \
+          --query "Tags[0].Value" \
+          --output text \
+          --region "$REGION" 2>/dev/null) || DEPLOY_COLOR=""
+
+        # Check if we got a valid color (not empty, not "None")
+        if [ -n "$DEPLOY_COLOR" ] && [ "$DEPLOY_COLOR" != "None" ]; then
+            echo "Detected deployment color: $DEPLOY_COLOR (attempt $attempt)"
+            return 0
+        fi
+
+        if [ $attempt -lt $max_attempts ]; then
+            echo "DeployColor tag not found (attempt $attempt/$max_attempts), retrying in $${delay}s..."
+            sleep $delay
+            attempt=$((attempt + 1))
+            delay=$((delay * 2))
+            if [ $delay -gt $max_delay ]; then
+                delay=$max_delay
+            fi
+        else
+            echo "DeployColor tag not found after $max_attempts attempts"
+            return 1
+        fi
+    done
+}
+
+# Try to detect deploy color with retries
+ENABLE_BLUE_GREEN="${enable_blue_green}"
+
+if get_deploy_color_with_retry; then
+    echo "Using deployment color: $DEPLOY_COLOR"
+else
+    if [ "$ENABLE_BLUE_GREEN" = "true" ]; then
+        # When blue/green is enabled, tag detection failure is a critical error.
+        # Defaulting to blue could cause green instances to use wrong image tag.
+        echo "ERROR: DeployColor tag not found but blue/green deployment is enabled!"
+        echo "ERROR: This instance may be misconfigured. Check ASG tag propagation."
+        echo "ERROR: Failing hard to prevent incorrect deployment."
+        exit 1
+    else
+        # When blue/green is disabled, default to blue for backward compatibility
+        DEPLOY_COLOR="blue"
+        echo "DeployColor tag not found, defaulting to: $DEPLOY_COLOR"
+    fi
+fi
+
+# ============================================================================
 # SSM-based Image Tag Lookup
 # Read the image tag from SSM Parameter Store for CI/CD-driven deployments.
+# Blue and green ASGs use different SSM parameters for independent deployments.
 # Falls back to Terraform-interpolated value for backward compatibility.
 # ============================================================================
 FALLBACK_IMAGE_TAG="${image_tag}"
-SSM_IMAGE_TAG_PARAM="${ssm_image_tag_parameter}"
+BLUE_SSM_PARAM="${ssm_image_tag_parameter}"
+
+# Green ASG uses a different SSM parameter path
+GREEN_SSM_PARAM="${ssm_green_image_tag_parameter}"
+if [ "$DEPLOY_COLOR" = "green" ] && [ -n "$GREEN_SSM_PARAM" ]; then
+  SSM_IMAGE_TAG_PARAM="$GREEN_SSM_PARAM"
+  echo "Green deployment: using SSM parameter $SSM_IMAGE_TAG_PARAM"
+else
+  SSM_IMAGE_TAG_PARAM="$BLUE_SSM_PARAM"
+  echo "Blue deployment: using SSM parameter $SSM_IMAGE_TAG_PARAM"
+fi
 
 echo "Fetching image tag from SSM parameter: $SSM_IMAGE_TAG_PARAM"
 SSM_IMAGE_TAG=$(aws ssm get-parameter \

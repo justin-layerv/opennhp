@@ -1347,6 +1347,23 @@ variable "deployment_stale_threshold_days" {
   }
 }
 
+variable "enable_ac_blue_green" {
+  description = "Enable blue/green deployment infrastructure for AC. Creates a second ASG and SSM parameters for instant traffic switching."
+  type        = bool
+  default     = false
+}
+
+variable "ac_green_standby_min_size" {
+  description = "Minimum instance count for AC green ASG in standby mode. 1 = warm standby (instant switch), 0 = cold standby (requires scale-up)."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.ac_green_standby_min_size >= 0 && var.ac_green_standby_min_size <= 10
+    error_message = "ac_green_standby_min_size must be between 0 and 10."
+  }
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {

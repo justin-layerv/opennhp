@@ -75,3 +75,47 @@ output "ssm_asg_name_parameter" {
   description = "SSM parameter name for the ASG name"
   value       = aws_ssm_parameter.asg_name.name
 }
+
+# =============================================================================
+# Blue/Green Deployment Outputs
+# =============================================================================
+
+output "blue_green_enabled" {
+  description = "Whether blue/green deployment is enabled for AC"
+  value       = var.enable_blue_green
+}
+
+output "green_asg_name" {
+  description = "AC Green ASG name for CI/CD scripts (null if blue/green not enabled)"
+  value       = var.enable_blue_green ? aws_autoscaling_group.ac_green[0].name : null
+}
+
+output "green_asg_arn" {
+  description = "AC Green ASG ARN (null if blue/green not enabled)"
+  value       = var.enable_blue_green ? aws_autoscaling_group.ac_green[0].arn : null
+}
+
+output "tcp_target_group_blue_arn" {
+  description = "Blue TCP target group ARN (existing)"
+  value       = aws_lb_target_group.ac_tcp.arn
+}
+
+output "tcp_target_group_green_arn" {
+  description = "Green TCP target group ARN (null if blue/green not enabled)"
+  value       = var.enable_blue_green ? aws_lb_target_group.ac_tcp_green[0].arn : null
+}
+
+output "ssm_active_color_parameter" {
+  description = "SSM parameter name for AC active deployment color"
+  value       = var.enable_blue_green ? aws_ssm_parameter.active_color[0].name : null
+}
+
+output "ssm_green_image_tag_parameter" {
+  description = "SSM parameter name for AC green ASG image tag"
+  value       = var.enable_blue_green ? aws_ssm_parameter.green_image_tag[0].name : null
+}
+
+output "ssm_green_asg_name_parameter" {
+  description = "SSM parameter name for AC green ASG name"
+  value       = var.enable_blue_green ? aws_ssm_parameter.green_asg_name[0].name : null
+}

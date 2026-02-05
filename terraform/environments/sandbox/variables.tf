@@ -1181,3 +1181,15 @@ variable "deployment_stale_threshold_days" {
   type        = number
   default     = 7
 }
+
+variable "enable_ac_blue_green" {
+  description = "Enable blue/green deployment infrastructure for AC. Creates a second ASG and SSM parameters for instant traffic switching."
+  type        = bool
+  default     = false
+}
+
+variable "ac_green_standby_min_size" {
+  description = "Minimum instance count for AC green ASG in standby mode. 1 = warm standby (instant switch), 0 = cold standby (requires scale-up)."
+  type        = number
+  default     = 1
+}

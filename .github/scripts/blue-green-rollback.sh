@@ -4,10 +4,11 @@
 # Performs instant rollback by switching NLB traffic back to the previous color.
 # This is the fastest possible rollback - just an NLB listener change.
 #
-# Usage: blue-green-rollback.sh <environment>
+# Usage: blue-green-rollback.sh <environment> [component]
 #
 # Arguments:
 #   environment - Environment name (sandbox, prod)
+#   component   - Component to rollback (server, ac). Defaults to "server".
 #
 # Environment Variables (optional):
 #   AWS_REGION  - AWS region (default: us-east-2)
@@ -15,7 +16,8 @@
 #
 # Example:
 #   ./blue-green-rollback.sh sandbox
-#   DRY_RUN=true ./blue-green-rollback.sh prod
+#   ./blue-green-rollback.sh sandbox ac
+#   DRY_RUN=true ./blue-green-rollback.sh prod server
 
 set -euo pipefail
 
@@ -35,24 +37,33 @@ log_rollback() { echo -e "${BLUE}[ROLLBACK]${NC} $*"; }
 
 # Validate arguments
 if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <environment>"
+    echo "Usage: $0 <environment> [component]"
     echo "  environment: sandbox, prod"
+    echo "  component: server (default), ac"
     exit 1
 fi
 
 ENVIRONMENT="$1"
+COMPONENT="${2:-server}"
 AWS_REGION="${AWS_REGION:-us-east-2}"
 DRY_RUN="${DRY_RUN:-false}"
+
+# Validate component
+if [[ "$COMPONENT" != "server" && "$COMPONENT" != "ac" ]]; then
+    log_error "Invalid component: $COMPONENT. Must be 'server' or 'ac'."
+    exit 1
+fi
 
 log_rollback "=========================================="
 log_rollback "INITIATING ROLLBACK"
 log_rollback "Environment: $ENVIRONMENT"
+log_rollback "Component: $COMPONENT"
 log_rollback "=========================================="
 
 [[ "$DRY_RUN" == "true" ]] && log_warn "DRY RUN MODE - No changes will be made"
 
 # SSM parameter base path
-SSM_BASE="/${ENVIRONMENT}/nhp/server"
+SSM_BASE="/${ENVIRONMENT}/nhp/${COMPONENT}"
 
 # Function to get SSM parameter
 get_ssm_param() {
@@ -122,7 +133,7 @@ log_info "$ROLLBACK_TARGET ASG has $INSTANCE_COUNT healthy instance(s)"
 # Confirm rollback (if interactive)
 if [[ -t 0 && "$DRY_RUN" != "true" ]]; then
     echo ""
-    log_warn "This will immediately switch all traffic from $CURRENT_COLOR to $ROLLBACK_TARGET."
+    log_warn "This will immediately switch all $COMPONENT traffic from $CURRENT_COLOR to $ROLLBACK_TARGET."
     read -p "Continue with rollback? (y/N): " -n 1 -r
     echo ""
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
@@ -137,9 +148,9 @@ ROLLBACK_START=$(date +%s)
 # Execute switch using the switch script
 log_rollback "Executing traffic switch..."
 if [[ "$DRY_RUN" == "true" ]]; then
-    DRY_RUN=true "$SCRIPT_DIR/blue-green-switch.sh" "$ENVIRONMENT" "$ROLLBACK_TARGET"
+    DRY_RUN=true "$SCRIPT_DIR/blue-green-switch.sh" "$ENVIRONMENT" "$ROLLBACK_TARGET" "$COMPONENT"
 else
-    "$SCRIPT_DIR/blue-green-switch.sh" "$ENVIRONMENT" "$ROLLBACK_TARGET"
+    "$SCRIPT_DIR/blue-green-switch.sh" "$ENVIRONMENT" "$ROLLBACK_TARGET" "$COMPONENT"
 fi
 
 # Calculate rollback duration (integer seconds)
@@ -160,6 +171,7 @@ fi
 
 log_rollback "=========================================="
 log_rollback "ROLLBACK COMPLETE"
+log_rollback "Component: $COMPONENT"
 log_rollback "Previous active: $CURRENT_COLOR"
 log_rollback "New active: $ROLLBACK_TARGET"
 log_rollback "Rollback duration: ${ROLLBACK_DURATION}s"
@@ -169,6 +181,6 @@ log_rollback "=========================================="
 # Provide next steps
 echo ""
 log_info "Next steps:"
-log_info "1. Verify traffic is flowing correctly to $ROLLBACK_TARGET"
+log_info "1. Verify $COMPONENT traffic is flowing correctly to $ROLLBACK_TARGET"
 log_info "2. Investigate issues with the $CURRENT_COLOR deployment"
 log_info "3. Once fixed, deploy again using the blue-green-deploy workflow"

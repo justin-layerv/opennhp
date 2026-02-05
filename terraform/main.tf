@@ -571,6 +571,11 @@ module "ac" {
   centralized_cert_secret_arn = var.centralized_cert_secret_arn
   centralized_cert_domains    = var.centralized_cert_domains
   acme_lambda_function_name   = var.acme_lambda_function_name
+
+  # Blue/Green deployment configuration
+  enable_blue_green      = var.enable_ac_blue_green
+  green_standby_min_size = var.ac_green_standby_min_size
+  alerts_sns_topic_arn   = module.monitoring.sns_topic_arn
 }
 
 # Demo Gateway Module - nginx + certbot for qurl.link routing to NHP Server plugins
