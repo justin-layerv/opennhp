@@ -364,12 +364,87 @@ ECR_REPO="${server_repo_url}"
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${account_id}.dkr.ecr.${region}.amazonaws.com"
 
 # ============================================================================
+# Blue/Green Deployment: Detect Deploy Color
+# Instances are tagged with DeployColor (blue or green) by the ASG.
+# Green instances read from a different SSM parameter for their image tag.
+#
+# Tag Propagation: ASG tags typically propagate within seconds, but can
+# occasionally be delayed. We retry with exponential backoff to handle this.
+# ============================================================================
+echo "Detecting deployment color from instance tags..."
+
+# Retry function for tag detection with exponential backoff
+get_deploy_color_with_retry() {
+    local max_attempts=5
+    local delay=2
+    local max_delay=30
+    local attempt=1
+
+    while [ $attempt -le $max_attempts ]; do
+        DEPLOY_COLOR=$(aws ec2 describe-tags \
+          --filters "Name=resource-id,Values=$INSTANCE_ID" "Name=key,Values=DeployColor" \
+          --query "Tags[0].Value" \
+          --output text \
+          --region "$REGION" 2>/dev/null) || DEPLOY_COLOR=""
+
+        # Check if we got a valid color (not empty, not "None")
+        if [ -n "$DEPLOY_COLOR" ] && [ "$DEPLOY_COLOR" != "None" ]; then
+            echo "Detected deployment color: $DEPLOY_COLOR (attempt $attempt)"
+            return 0
+        fi
+
+        if [ $attempt -lt $max_attempts ]; then
+            echo "DeployColor tag not found (attempt $attempt/$max_attempts), retrying in $${delay}s..."
+            sleep $delay
+            attempt=$((attempt + 1))
+            delay=$((delay * 2))
+            if [ $delay -gt $max_delay ]; then
+                delay=$max_delay
+            fi
+        else
+            echo "DeployColor tag not found after $max_attempts attempts"
+            return 1
+        fi
+    done
+}
+
+# Try to detect deploy color with retries
+ENABLE_BLUE_GREEN="${enable_blue_green}"
+
+if get_deploy_color_with_retry; then
+    echo "Using deployment color: $DEPLOY_COLOR"
+else
+    if [ "$ENABLE_BLUE_GREEN" = "true" ]; then
+        # When blue/green is enabled, tag detection failure is a critical error.
+        # Defaulting to blue could cause green instances to use wrong image tag.
+        echo "ERROR: DeployColor tag not found but blue/green deployment is enabled!"
+        echo "ERROR: This instance may be misconfigured. Check ASG tag propagation."
+        echo "ERROR: Failing hard to prevent incorrect deployment."
+        exit 1
+    else
+        # When blue/green is disabled, default to blue for backward compatibility
+        DEPLOY_COLOR="blue"
+        echo "DeployColor tag not found, defaulting to: $DEPLOY_COLOR"
+    fi
+fi
+
+# ============================================================================
 # SSM-based Image Tag Lookup
 # Read the image tag from SSM Parameter Store for CI/CD-driven deployments.
+# Blue and green ASGs use different SSM parameters for independent deployments.
 # Falls back to Terraform-interpolated value for backward compatibility.
 # ============================================================================
 FALLBACK_IMAGE_TAG="${image_tag}"
-SSM_IMAGE_TAG_PARAM="${ssm_image_tag_parameter}"
+BLUE_SSM_PARAM="${ssm_image_tag_parameter}"
+
+# Green ASG uses a different SSM parameter path
+if [ "$DEPLOY_COLOR" = "green" ]; then
+  SSM_IMAGE_TAG_PARAM="/${environment}/nhp/server/green-image-tag"
+  echo "Green deployment: using SSM parameter $SSM_IMAGE_TAG_PARAM"
+else
+  SSM_IMAGE_TAG_PARAM="$BLUE_SSM_PARAM"
+  echo "Blue deployment: using SSM parameter $SSM_IMAGE_TAG_PARAM"
+fi
 
 echo "Fetching image tag from SSM parameter: $SSM_IMAGE_TAG_PARAM"
 SSM_IMAGE_TAG=$(aws ssm get-parameter \
@@ -471,18 +546,22 @@ echo "QURL plugin configured: api_url=${qurl_api_url}, allowed_domain=${qurl_all
 %{ endif ~}
 
 # ============================================================================
-# Create environment file for systemd service
-# This file contains the dynamically resolved image tag and other runtime config
-# Create with restricted permissions first to avoid race condition with sensitive data
+# Create environment files for systemd service
+# Security: Secrets are stored in a separate file from non-sensitive config.
+# This follows defense-in-depth - if the main env file is exposed, secrets
+# remain protected in a dedicated file with strict permissions.
+#
+# Files created:
+# - /opt/layerv/nhp-server/etc/env: Non-sensitive runtime config (644 ok)
+# - /opt/layerv/nhp-server/etc/secrets.env: Sensitive credentials (600 required)
 # ============================================================================
-touch /opt/layerv/nhp-server/etc/env
-chmod 600 /opt/layerv/nhp-server/etc/env
+
+# Non-sensitive environment variables
 cat > /opt/layerv/nhp-server/etc/env << ENVEOF
 NHP_IMAGE_TAG=$IMAGE_TAG
 NHP_ECR_REPO=${server_repo_url}
 %{ if qurl_enabled ~}
 QURL_API_URL=${qurl_api_url}
-QURL_SERVICE_TOKEN=$QURL_SERVICE_TOKEN
 QURL_ALLOWED_REDIRECT_DOMAIN=${qurl_allowed_redirect_domain}
 QURL_API_TIMEOUT=${qurl_api_timeout}
 QURL_MAX_IDLE_CONNS=${qurl_max_idle_conns}
@@ -490,7 +569,24 @@ QURL_MAX_IDLE_CONNS_PER_HOST=${qurl_max_idle_conns_per_host}
 QURL_IDLE_CONN_TIMEOUT=${qurl_idle_conn_timeout}
 %{ endif ~}
 ENVEOF
+chmod 644 /opt/layerv/nhp-server/etc/env
 echo "Created environment file with image tag: $IMAGE_TAG"
+
+# Sensitive secrets - separate file with restricted permissions
+# Create with restrictive permissions before writing any content
+touch /opt/layerv/nhp-server/etc/secrets.env
+chmod 600 /opt/layerv/nhp-server/etc/secrets.env
+%{ if qurl_enabled ~}
+cat > /opt/layerv/nhp-server/etc/secrets.env << SECRETSEOF
+# QURL service authentication token - fetched from Secrets Manager
+# This file contains sensitive credentials and should NOT be readable by other users
+QURL_SERVICE_TOKEN=$QURL_SERVICE_TOKEN
+SECRETSEOF
+echo "Created secrets file for QURL service token"
+%{ else ~}
+# No secrets to store when QURL is disabled
+echo "# No secrets configured" > /opt/layerv/nhp-server/etc/secrets.env
+%{ endif ~}
 
 cat > /etc/systemd/system/nhp-server.service << 'SVCEOF'
 [Unit]
@@ -502,7 +598,10 @@ Requires=docker.service
 Type=simple
 Restart=always
 RestartSec=5
+# Non-sensitive config (image tag, repo, timeouts)
 EnvironmentFile=/opt/layerv/nhp-server/etc/env
+# Sensitive secrets (service tokens) - separate file with restricted permissions
+EnvironmentFile=/opt/layerv/nhp-server/etc/secrets.env
 ExecStartPre=-/usr/bin/docker stop nhp-server
 ExecStartPre=-/usr/bin/docker rm nhp-server
 ExecStart=/bin/bash -c "docker run --rm --name nhp-server \
@@ -511,6 +610,7 @@ ExecStart=/bin/bash -c "docker run --rm --name nhp-server \
   -v /opt/layerv/nhp-server/log:/nhp-server/logs \
   -v /opt/layerv/nhp-server/plugins:/nhp-server/plugins:ro \
   --env-file /opt/layerv/nhp-server/etc/env \
+  --env-file /opt/layerv/nhp-server/etc/secrets.env \
   $${NHP_ECR_REPO}:$${NHP_IMAGE_TAG}"
 ExecStop=/usr/bin/docker stop nhp-server
 

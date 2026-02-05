@@ -1159,3 +1159,25 @@ variable "centralized_cert_domains" {
   type        = list(string)
   default     = []
 }
+
+# ==============================================================================
+# Blue/Green Deployment Configuration
+# ==============================================================================
+
+variable "enable_blue_green" {
+  description = "Enable blue/green deployment infrastructure for NHP Server"
+  type        = bool
+  default     = false
+}
+
+variable "green_standby_min_size" {
+  description = "Min instances for green ASG in standby (1=warm, 0=cold)"
+  type        = number
+  default     = 1
+}
+
+variable "deployment_stale_threshold_days" {
+  description = "Days without deployments before stale alarm fires (0=disable)"
+  type        = number
+  default     = 7
+}

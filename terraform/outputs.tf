@@ -264,3 +264,27 @@ output "sns_topic_arn" {
   description = "SNS topic ARN for alerts"
   value       = module.monitoring.sns_topic_arn
 }
+
+# ============================================================================
+# Blue/Green Deployment Outputs
+# ============================================================================
+
+output "blue_green_enabled" {
+  description = "Whether blue/green deployment is enabled"
+  value       = module.compute.blue_green_enabled
+}
+
+output "green_asg_name" {
+  description = "Green ASG name for CI/CD scripts (null if blue/green not enabled)"
+  value       = module.compute.green_asg_name
+}
+
+output "ssm_active_color_parameter" {
+  description = "SSM parameter name for active deployment color"
+  value       = module.compute.ssm_active_color_parameter
+}
+
+output "ssm_green_image_tag_parameter" {
+  description = "SSM parameter name for green ASG image tag"
+  value       = module.compute.ssm_green_image_tag_parameter
+}

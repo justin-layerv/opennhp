@@ -236,6 +236,14 @@ module "nhp" {
   # Use computed name to avoid cycle: nhp depends on acme_cert output, acme_cert depends on nhp's logs_kms_key_arn
   # WARNING: This name must match the pattern in modules/acme-cert/main.tf local.function_name
   acme_lambda_function_name = var.centralized_cert_enabled ? "${local.name_prefix}-acme-cert-manager" : ""
+
+  # Termination cleanup
+  enable_termination_cleanup = var.enable_termination_cleanup
+
+  # Blue/Green deployment configuration
+  enable_blue_green               = var.enable_blue_green
+  green_standby_min_size          = var.green_standby_min_size
+  deployment_stale_threshold_days = var.deployment_stale_threshold_days
 }
 
 # ==============================================================================

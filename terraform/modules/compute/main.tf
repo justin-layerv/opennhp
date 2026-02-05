@@ -543,6 +543,8 @@ locals {
     qurl_max_idle_conns_per_host  = var.qurl_config != null ? var.qurl_config.max_idle_conns_per_host : 5
     qurl_idle_conn_timeout        = var.qurl_config != null ? var.qurl_config.idle_conn_timeout : 30
     qurl_service_token_secret_arn = var.qurl_service_token_secret_arn != null ? var.qurl_service_token_secret_arn : ""
+    # Blue/Green deployment configuration
+    enable_blue_green = var.enable_blue_green
   })
 }
 
@@ -651,6 +653,14 @@ resource "aws_autoscaling_group" "server" {
   tag {
     key                 = "Cell"
     value               = var.cell_id
+    propagate_at_launch = true
+  }
+
+  # Blue/Green deployment: Mark this as the blue ASG
+  # user_data.sh.tpl reads this tag to determine which SSM image tag parameter to use
+  tag {
+    key                 = "DeployColor"
+    value               = "blue"
     propagate_at_launch = true
   }
 

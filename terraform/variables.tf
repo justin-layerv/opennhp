@@ -1317,6 +1317,36 @@ variable "guardduty_alert_emails" {
   default     = []
 }
 
+# ==================== Blue/Green Deployment ====================
+
+variable "enable_blue_green" {
+  description = "Enable blue/green deployment infrastructure for NHP Server. Creates a second ASG and SSM parameters for instant traffic switching."
+  type        = bool
+  default     = false
+}
+
+variable "green_standby_min_size" {
+  description = "Minimum instance count for green ASG in standby mode. 1 = warm standby (instant switch), 0 = cold standby (requires scale-up)."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.green_standby_min_size >= 0 && var.green_standby_min_size <= 10
+    error_message = "green_standby_min_size must be between 0 and 10."
+  }
+}
+
+variable "deployment_stale_threshold_days" {
+  description = "Number of days without deployments before the stale deployment alarm fires. Set to 0 to disable the alarm."
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.deployment_stale_threshold_days >= 0 && var.deployment_stale_threshold_days <= 30
+    error_message = "deployment_stale_threshold_days must be between 0 and 30."
+  }
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {

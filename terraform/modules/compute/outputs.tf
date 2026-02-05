@@ -85,3 +85,62 @@ output "target_group_arn" {
   description = "UDP target group ARN"
   value       = aws_lb_target_group.udp.arn
 }
+
+# =============================================================================
+# Blue/Green Deployment Outputs
+# =============================================================================
+
+output "blue_green_enabled" {
+  description = "Whether blue/green deployment infrastructure is enabled"
+  value       = var.enable_blue_green
+}
+
+output "green_asg_name" {
+  description = "Green Auto Scaling Group name (null if blue/green not enabled)"
+  value       = var.enable_blue_green ? aws_autoscaling_group.server_green[0].name : null
+}
+
+output "green_asg_arn" {
+  description = "Green Auto Scaling Group ARN (null if blue/green not enabled)"
+  value       = var.enable_blue_green ? aws_autoscaling_group.server_green[0].arn : null
+}
+
+output "udp_target_group_blue_arn" {
+  description = "Blue UDP target group ARN (same as target_group_arn)"
+  value       = aws_lb_target_group.udp.arn
+}
+
+output "udp_target_group_green_arn" {
+  description = "Green UDP target group ARN (null if blue/green not enabled)"
+  value       = var.enable_blue_green ? aws_lb_target_group.udp_green[0].arn : null
+}
+
+output "https_target_group_blue_arn" {
+  description = "Blue HTTPS target group ARN (null if QURL resolve endpoint not enabled)"
+  value       = var.enable_qurl_resolve_endpoint ? aws_lb_target_group.https[0].arn : null
+}
+
+output "https_target_group_green_arn" {
+  description = "Green HTTPS target group ARN (null if blue/green or QURL resolve not enabled)"
+  value       = var.enable_blue_green && var.enable_qurl_resolve_endpoint ? aws_lb_target_group.https_green[0].arn : null
+}
+
+output "nlb_https_listener_arn" {
+  description = "NLB HTTPS listener ARN (null if QURL resolve endpoint not enabled)"
+  value       = var.enable_qurl_resolve_endpoint ? aws_lb_listener.https[0].arn : null
+}
+
+output "ssm_active_color_parameter" {
+  description = "SSM parameter name for active deployment color (null if blue/green not enabled)"
+  value       = var.enable_blue_green ? aws_ssm_parameter.active_color[0].name : null
+}
+
+output "ssm_green_image_tag_parameter" {
+  description = "SSM parameter name for green ASG image tag (null if blue/green not enabled)"
+  value       = var.enable_blue_green ? aws_ssm_parameter.green_image_tag[0].name : null
+}
+
+output "ssm_green_asg_name_parameter" {
+  description = "SSM parameter name for green ASG name (null if blue/green not enabled)"
+  value       = var.enable_blue_green ? aws_ssm_parameter.green_asg_name[0].name : null
+}

@@ -344,6 +344,11 @@ module "compute" {
   # SNS topic for Lambda error alarms (from monitoring module)
   # Note: The SNS topic is created before compute resources, avoiding circular dependency
   alerts_sns_topic_arn = module.monitoring.sns_topic_arn
+
+  # Blue/Green deployment configuration
+  enable_blue_green               = var.enable_blue_green
+  green_standby_min_size          = var.green_standby_min_size
+  deployment_stale_threshold_days = var.deployment_stale_threshold_days
 }
 
 # Monitoring Module - CloudWatch Dashboard, Alarms, Slack Notifications

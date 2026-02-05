@@ -194,6 +194,28 @@ AWS_PROFILE=layerv terraform state list
 AWS_PROFILE=layerv terraform state show 'module.ac.resource'
 ```
 
+**State Drift Protection for CI/CD-Managed Values:**
+
+Some SSM parameters are created by Terraform but updated by CI/CD (e.g., image tags, blue/green deployment state). These use `lifecycle { ignore_changes = [value] }` to prevent Terraform from overwriting CI/CD updates:
+
+```hcl
+resource "aws_ssm_parameter" "image_tag" {
+  name  = "/${var.environment}/nhp/server/image-tag"
+  value = var.image_tag  # Initial value from Terraform
+
+  lifecycle {
+    ignore_changes = [value]  # CI/CD updates this
+  }
+}
+```
+
+Parameters using this pattern:
+- `/${env}/nhp/server/image-tag` - Docker image tag (CI updates on deploy)
+- `/${env}/nhp/server/green-image-tag` - Green ASG image tag (blue/green)
+- `/${env}/nhp/server/active-color` - Current active deployment color
+- `/${env}/nhp/server/last-switch-timestamp` - Deployment audit trail
+- `/${env}/nhp/ac/image-tag` - AC Docker image tag
+
 ### Docker
 
 ```bash

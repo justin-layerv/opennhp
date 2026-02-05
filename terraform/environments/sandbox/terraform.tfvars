@@ -362,6 +362,13 @@ qurl_router_enabled = true
 # qurl_router_api_timeout        = 5    # seconds for QURL API calls
 # qurl_router_proxy_timeout      = 30   # seconds for proxying to backend
 
+# ==============================================================================
+# Blue/Green Deployment Configuration
+# Enables instant traffic switching and sub-second rollback for NHP Server
+# ==============================================================================
+enable_blue_green      = true
+green_standby_min_size = 1 # Warm standby - 1 instance ready for instant switch
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"
