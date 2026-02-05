@@ -505,19 +505,13 @@ RestartSec=5
 EnvironmentFile=/opt/layerv/nhp-server/etc/env
 ExecStartPre=-/usr/bin/docker stop nhp-server
 ExecStartPre=-/usr/bin/docker rm nhp-server
-ExecStart=/usr/bin/docker run --rm --name nhp-server \
+ExecStart=/bin/bash -c "docker run --rm --name nhp-server \
   --net=host \
   -v /opt/layerv/nhp-server/etc:/nhp-server/etc:ro \
   -v /opt/layerv/nhp-server/log:/nhp-server/logs \
   -v /opt/layerv/nhp-server/plugins:/nhp-server/plugins:ro \
-  -e QURL_API_URL=$${QURL_API_URL:-} \
-  -e QURL_SERVICE_TOKEN=$${QURL_SERVICE_TOKEN:-} \
-  -e QURL_ALLOWED_REDIRECT_DOMAIN=$${QURL_ALLOWED_REDIRECT_DOMAIN:-} \
-  -e QURL_API_TIMEOUT=$${QURL_API_TIMEOUT:-} \
-  -e QURL_MAX_IDLE_CONNS=$${QURL_MAX_IDLE_CONNS:-} \
-  -e QURL_MAX_IDLE_CONNS_PER_HOST=$${QURL_MAX_IDLE_CONNS_PER_HOST:-} \
-  -e QURL_IDLE_CONN_TIMEOUT=$${QURL_IDLE_CONN_TIMEOUT:-} \
-  $${NHP_ECR_REPO}:$${NHP_IMAGE_TAG}
+  --env-file /opt/layerv/nhp-server/etc/env \
+  $${NHP_ECR_REPO}:$${NHP_IMAGE_TAG}"
 ExecStop=/usr/bin/docker stop nhp-server
 
 [Install]
