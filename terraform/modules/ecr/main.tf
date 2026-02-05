@@ -871,6 +871,24 @@ resource "aws_iam_policy" "terraform_apply_ec2" {
           "autoscaling:DeleteLifecycleHook"
         ]
         Resource = "arn:aws:autoscaling:${local.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/layerv-nhp-*"
+      },
+      {
+        # Required when creating ASGs that reference launch templates
+        # ASG creation implicitly requires ec2:RunInstances to validate the launch template
+        Sid    = "EC2RunInstancesForASG"
+        Effect = "Allow"
+        Action = [
+          "ec2:RunInstances"
+        ]
+        Resource = [
+          "arn:aws:ec2:${local.region}:${local.account_id}:launch-template/*",
+          "arn:aws:ec2:${local.region}:${local.account_id}:instance/*",
+          "arn:aws:ec2:${local.region}:${local.account_id}:volume/*",
+          "arn:aws:ec2:${local.region}:${local.account_id}:network-interface/*",
+          "arn:aws:ec2:${local.region}:${local.account_id}:security-group/*",
+          "arn:aws:ec2:${local.region}:${local.account_id}:subnet/*",
+          "arn:aws:ec2:${local.region}::image/*"
+        ]
       }
     ]
   })
