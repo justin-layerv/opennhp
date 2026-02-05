@@ -363,8 +363,31 @@ SVCEOF
 ECR_REPO="${server_repo_url}"
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${account_id}.dkr.ecr.${region}.amazonaws.com"
 
-docker pull "$ECR_REPO:${image_tag}" || {
-  echo "ERROR: Could not pull server image with tag ${image_tag}"
+# ============================================================================
+# SSM-based Image Tag Lookup
+# Read the image tag from SSM Parameter Store for CI/CD-driven deployments.
+# Falls back to Terraform-interpolated value for backward compatibility.
+# ============================================================================
+FALLBACK_IMAGE_TAG="${image_tag}"
+SSM_IMAGE_TAG_PARAM="${ssm_image_tag_parameter}"
+
+echo "Fetching image tag from SSM parameter: $SSM_IMAGE_TAG_PARAM"
+SSM_IMAGE_TAG=$(aws ssm get-parameter \
+  --name "$SSM_IMAGE_TAG_PARAM" \
+  --region "$REGION" \
+  --query "Parameter.Value" \
+  --output text 2>/dev/null) || SSM_IMAGE_TAG=""
+
+if [ -n "$SSM_IMAGE_TAG" ]; then
+  IMAGE_TAG="$SSM_IMAGE_TAG"
+  echo "Using image tag from SSM: $IMAGE_TAG"
+else
+  IMAGE_TAG="$FALLBACK_IMAGE_TAG"
+  echo "SSM parameter not found or empty, using fallback image tag: $IMAGE_TAG"
+fi
+
+docker pull "$ECR_REPO:$IMAGE_TAG" || {
+  echo "ERROR: Could not pull server image with tag $IMAGE_TAG"
   echo "This likely means the image hasn't been built yet for this commit"
   exit 1
 }
@@ -447,7 +470,29 @@ fi
 echo "QURL plugin configured: api_url=${qurl_api_url}, allowed_domain=${qurl_allowed_redirect_domain}"
 %{ endif ~}
 
-cat > /etc/systemd/system/nhp-server.service << SVCEOF
+# ============================================================================
+# Create environment file for systemd service
+# This file contains the dynamically resolved image tag and other runtime config
+# Create with restricted permissions first to avoid race condition with sensitive data
+# ============================================================================
+touch /opt/layerv/nhp-server/etc/env
+chmod 600 /opt/layerv/nhp-server/etc/env
+cat > /opt/layerv/nhp-server/etc/env << ENVEOF
+NHP_IMAGE_TAG=$IMAGE_TAG
+NHP_ECR_REPO=${server_repo_url}
+%{ if qurl_enabled ~}
+QURL_API_URL=${qurl_api_url}
+QURL_SERVICE_TOKEN=$QURL_SERVICE_TOKEN
+QURL_ALLOWED_REDIRECT_DOMAIN=${qurl_allowed_redirect_domain}
+QURL_API_TIMEOUT=${qurl_api_timeout}
+QURL_MAX_IDLE_CONNS=${qurl_max_idle_conns}
+QURL_MAX_IDLE_CONNS_PER_HOST=${qurl_max_idle_conns_per_host}
+QURL_IDLE_CONN_TIMEOUT=${qurl_idle_conn_timeout}
+%{ endif ~}
+ENVEOF
+echo "Created environment file with image tag: $IMAGE_TAG"
+
+cat > /etc/systemd/system/nhp-server.service << 'SVCEOF'
 [Unit]
 Description=LayerV NHP Server
 After=network.target docker.service
@@ -457,6 +502,7 @@ Requires=docker.service
 Type=simple
 Restart=always
 RestartSec=5
+EnvironmentFile=/opt/layerv/nhp-server/etc/env
 ExecStartPre=-/usr/bin/docker stop nhp-server
 ExecStartPre=-/usr/bin/docker rm nhp-server
 ExecStart=/usr/bin/docker run --rm --name nhp-server \
@@ -464,16 +510,14 @@ ExecStart=/usr/bin/docker run --rm --name nhp-server \
   -v /opt/layerv/nhp-server/etc:/nhp-server/etc:ro \
   -v /opt/layerv/nhp-server/log:/nhp-server/logs \
   -v /opt/layerv/nhp-server/plugins:/nhp-server/plugins:ro \
-%{ if qurl_enabled ~}
-  -e QURL_API_URL="${qurl_api_url}" \
-  -e QURL_SERVICE_TOKEN="$QURL_SERVICE_TOKEN" \
-  -e QURL_ALLOWED_REDIRECT_DOMAIN="${qurl_allowed_redirect_domain}" \
-  -e QURL_API_TIMEOUT="${qurl_api_timeout}" \
-  -e QURL_MAX_IDLE_CONNS="${qurl_max_idle_conns}" \
-  -e QURL_MAX_IDLE_CONNS_PER_HOST="${qurl_max_idle_conns_per_host}" \
-  -e QURL_IDLE_CONN_TIMEOUT="${qurl_idle_conn_timeout}" \
-%{ endif ~}
-  ${server_repo_url}:${image_tag}
+  -e QURL_API_URL=$${QURL_API_URL:-} \
+  -e QURL_SERVICE_TOKEN=$${QURL_SERVICE_TOKEN:-} \
+  -e QURL_ALLOWED_REDIRECT_DOMAIN=$${QURL_ALLOWED_REDIRECT_DOMAIN:-} \
+  -e QURL_API_TIMEOUT=$${QURL_API_TIMEOUT:-} \
+  -e QURL_MAX_IDLE_CONNS=$${QURL_MAX_IDLE_CONNS:-} \
+  -e QURL_MAX_IDLE_CONNS_PER_HOST=$${QURL_MAX_IDLE_CONNS_PER_HOST:-} \
+  -e QURL_IDLE_CONN_TIMEOUT=$${QURL_IDLE_CONN_TIMEOUT:-} \
+  $${NHP_ECR_REPO}:$${NHP_IMAGE_TAG}
 ExecStop=/usr/bin/docker stop nhp-server
 
 [Install]

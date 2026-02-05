@@ -57,3 +57,31 @@ output "https_target_group_arn_suffix" {
   description = "HTTPS target group ARN suffix for CloudWatch (null if QURL resolve endpoint not enabled)"
   value       = var.enable_qurl_resolve_endpoint ? aws_lb_target_group.https[0].arn_suffix : null
 }
+
+# =============================================================================
+# SSM Parameter Outputs for CI/CD
+# =============================================================================
+
+output "ssm_image_tag_parameter" {
+  description = "SSM parameter name for the deployed image tag"
+  value       = aws_ssm_parameter.image_tag.name
+}
+
+output "ssm_asg_name_parameter" {
+  description = "SSM parameter name for the ASG name"
+  value       = aws_ssm_parameter.asg_name.name
+}
+
+# =============================================================================
+# NLB Outputs for Blue/Green Deployment (Phase 2)
+# =============================================================================
+
+output "nlb_udp_listener_arn" {
+  description = "NLB UDP listener ARN - used for blue/green traffic switching"
+  value       = aws_lb_listener.udp.arn
+}
+
+output "target_group_arn" {
+  description = "UDP target group ARN"
+  value       = aws_lb_target_group.udp.arn
+}

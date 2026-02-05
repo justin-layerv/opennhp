@@ -312,6 +312,43 @@ resource "aws_cloudwatch_log_group" "ac" {
   })
 }
 
+# =============================================================================
+# SSM Parameters for Deployment State
+# These parameters enable CI/CD to update image tags without Terraform apply.
+# Instances read the image tag from SSM at boot time.
+# =============================================================================
+
+# Current deployed image tag - updated by CI/CD after successful builds
+resource "aws_ssm_parameter" "image_tag" {
+  name        = "/${var.environment}/nhp/ac/image-tag"
+  description = "NHP AC Docker image tag - updated by CI/CD"
+  type        = "String"
+  value       = var.image_tag
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-ac-ssm-image-tag"
+    Component = "ac"
+  })
+
+  # Allow CI/CD to update the value without TF drift
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+# ASG name - used by CI/CD scripts to trigger instance refresh
+resource "aws_ssm_parameter" "asg_name" {
+  name        = "/${var.environment}/nhp/ac/asg-name"
+  description = "NHP AC Auto Scaling Group name - used by CI/CD for instance refresh"
+  type        = "String"
+  value       = aws_autoscaling_group.ac.name
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-ac-ssm-asg-name"
+    Component = "ac"
+  })
+}
+
 # ==================== Plugin Configuration ====================
 # Traefik plugins are now managed by the unified plugins module.
 # This module receives plugin_bucket_name from the plugins module and uses
@@ -484,6 +521,15 @@ resource "aws_iam_role_policy" "ac" {
             }
           }
         },
+        # SSM Parameter Store access for deployment state (image tags)
+        {
+          Sid    = "SSMParameterAccess"
+          Effect = "Allow"
+          Action = ["ssm:GetParameter", "ssm:GetParameters"]
+          Resource = [
+            "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/ac/*"
+          ]
+        },
       ],
       # Conditional: QURL service token access (only when configured)
       var.qurl_service_token_secret_arn != null ? [
@@ -619,7 +665,8 @@ locals {
     plugin_bucket_name = var.plugin_bucket_name
     traefik_plugins    = var.traefik_plugins
     # Deployment configuration
-    image_tag = var.image_tag
+    image_tag               = var.image_tag
+    ssm_image_tag_parameter = aws_ssm_parameter.image_tag.name
     # Console backend routing (for NHP-protected Console)
     console_backend_url = var.console_backend_url
     console_domain      = var.console_domain

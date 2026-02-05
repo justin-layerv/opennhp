@@ -61,3 +61,17 @@ output "ac_secret_arn" {
   description = "ARN of the AC secret containing the private key"
   value       = aws_secretsmanager_secret.ac.arn
 }
+
+# =============================================================================
+# SSM Parameter Outputs for CI/CD
+# =============================================================================
+
+output "ssm_image_tag_parameter" {
+  description = "SSM parameter name for the deployed image tag"
+  value       = aws_ssm_parameter.image_tag.name
+}
+
+output "ssm_asg_name_parameter" {
+  description = "SSM parameter name for the ASG name"
+  value       = aws_ssm_parameter.asg_name.name
+}

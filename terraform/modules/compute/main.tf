@@ -211,6 +211,45 @@ resource "aws_cloudwatch_log_group" "server" {
   })
 }
 
+# =============================================================================
+# SSM Parameters for Deployment State
+# These parameters enable CI/CD to update image tags without Terraform apply.
+# Instances read the image tag from SSM at boot time.
+# =============================================================================
+
+# Current deployed image tag - updated by CI/CD after successful builds
+resource "aws_ssm_parameter" "image_tag" {
+  name        = "/${var.environment}/nhp/server/image-tag"
+  description = "NHP Server Docker image tag - updated by CI/CD"
+  type        = "String"
+  value       = var.image_tag
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-ssm-image-tag"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+
+  # Allow CI/CD to update the value without TF drift
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+# ASG name - used by CI/CD scripts to trigger instance refresh
+resource "aws_ssm_parameter" "asg_name" {
+  name        = "/${var.environment}/nhp/server/asg-name"
+  description = "NHP Server Auto Scaling Group name - used by CI/CD for instance refresh"
+  type        = "String"
+  value       = aws_autoscaling_group.server.name
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-ssm-asg-name"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+}
+
 # Cloud Map Service for NHP servers
 resource "aws_service_discovery_service" "server" {
   name        = "server"
@@ -358,6 +397,14 @@ resource "aws_iam_role_policy" "server" {
         Effect   = "Allow"
         Action   = ["autoscaling:SetInstanceHealth"]
         Resource = aws_autoscaling_group.server.arn
+      },
+      # SSM Parameter Store access for deployment state (image tags)
+      {
+        Effect = "Allow"
+        Action = ["ssm:GetParameter", "ssm:GetParameters"]
+        Resource = [
+          "arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:parameter/${var.environment}/nhp/server/*"
+        ]
       }
     ]
   })
@@ -472,7 +519,8 @@ locals {
     auth_signing_key = var.auth_signing_key
     auth_aes_key     = var.auth_aes_key
     # Deployment configuration
-    image_tag = var.image_tag
+    image_tag               = var.image_tag
+    ssm_image_tag_parameter = aws_ssm_parameter.image_tag.name
     # Plugin configuration (plugins are baked into Docker image)
     server_plugins  = var.server_plugins
     auth_service_id = var.auth_service_id

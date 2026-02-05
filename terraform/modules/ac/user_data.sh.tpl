@@ -89,16 +89,39 @@ mkdir -p /acme
 ECR_REPO="${ac_repo_url}"
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${account_id}.dkr.ecr.${region}.amazonaws.com"
 
+# ============================================================================
+# SSM-based Image Tag Lookup
+# Read the image tag from SSM Parameter Store for CI/CD-driven deployments.
+# Falls back to Terraform-interpolated value for backward compatibility.
+# ============================================================================
+FALLBACK_IMAGE_TAG="${image_tag}"
+SSM_IMAGE_TAG_PARAM="${ssm_image_tag_parameter}"
+
+echo "Fetching image tag from SSM parameter: $SSM_IMAGE_TAG_PARAM"
+SSM_IMAGE_TAG=$(aws ssm get-parameter \
+  --name "$SSM_IMAGE_TAG_PARAM" \
+  --region "$REGION" \
+  --query "Parameter.Value" \
+  --output text 2>/dev/null) || SSM_IMAGE_TAG=""
+
+if [ -n "$SSM_IMAGE_TAG" ]; then
+  IMAGE_TAG="$SSM_IMAGE_TAG"
+  echo "Using image tag from SSM: $IMAGE_TAG"
+else
+  IMAGE_TAG="$FALLBACK_IMAGE_TAG"
+  echo "SSM parameter not found or empty, using fallback image tag: $IMAGE_TAG"
+fi
+
 echo "Pulling AC image from ECR..."
-docker pull "$ECR_REPO:${image_tag}" || {
-  echo "ERROR: Could not pull AC image with tag ${image_tag}"
+docker pull "$ECR_REPO:$IMAGE_TAG" || {
+  echo "ERROR: Could not pull AC image with tag $IMAGE_TAG"
   echo "This likely means the image hasn't been built yet for this commit"
   exit 1
 }
 
 # Extract binaries from Docker image
 echo "Extracting binaries from AC image..."
-CONTAINER_ID=$(docker create "$ECR_REPO:${image_tag}")
+CONTAINER_ID=$(docker create "$ECR_REPO:$IMAGE_TAG")
 
 # Extract Traefik binary
 docker cp "$CONTAINER_ID:/usr/local/bin/traefik" /usr/local/bin/traefik
