@@ -94,15 +94,29 @@ aws ecr get-login-password --region "$REGION" | docker login --username AWS --pa
 # Instances are tagged with DeployColor (blue or green) by the ASG.
 # Green instances read from a different SSM parameter for their image tag.
 #
-# Tag Propagation: ASG tags typically propagate within seconds, but can
-# occasionally be delayed. We retry with exponential backoff to handle this.
+# Detection strategy (in order):
+# 1. IMDS instance tags (instant, requires instance_metadata_tags=enabled)
+# 2. EC2 DescribeTags API with exponential backoff (handles IMDS unavailable)
 # ============================================================================
 echo "Detecting deployment color from instance tags..."
 
-# Retry function for tag detection with exponential backoff
-get_deploy_color_with_retry() {
-    local max_attempts=5
-    local delay=2
+# Try IMDS first (instant, no API dependency)
+# Requires $TOKEN from IMDSv2 session established earlier in this script
+get_deploy_color_from_imds() {
+    DEPLOY_COLOR=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+      http://169.254.169.254/latest/meta-data/tags/instance/DeployColor 2>/dev/null) || DEPLOY_COLOR=""
+    if [ -n "$DEPLOY_COLOR" ] && [ "$DEPLOY_COLOR" != "None" ] && [ "$DEPLOY_COLOR" != "Not Found" ]; then
+        echo "Detected deployment color from IMDS: $DEPLOY_COLOR"
+        return 0
+    fi
+    DEPLOY_COLOR=""
+    return 1
+}
+
+# Fallback: EC2 DescribeTags API with exponential backoff
+get_deploy_color_from_api() {
+    local max_attempts=12
+    local delay=5
     local max_delay=30
     local attempt=1
 
@@ -115,7 +129,7 @@ get_deploy_color_with_retry() {
 
         # Check if we got a valid color (not empty, not "None")
         if [ -n "$DEPLOY_COLOR" ] && [ "$DEPLOY_COLOR" != "None" ]; then
-            echo "Detected deployment color: $DEPLOY_COLOR (attempt $attempt)"
+            echo "Detected deployment color from API: $DEPLOY_COLOR (attempt $attempt)"
             return 0
         fi
 
@@ -132,6 +146,12 @@ get_deploy_color_with_retry() {
             return 1
         fi
     done
+}
+
+get_deploy_color_with_retry() {
+    get_deploy_color_from_imds && return 0
+    echo "IMDS tag not available, falling back to EC2 API..."
+    get_deploy_color_from_api
 }
 
 # Try to detect deploy color with retries
