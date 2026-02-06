@@ -816,6 +816,13 @@ resource "aws_lb_target_group" "https" {
     matcher             = "200"
   }
 
+  # Disable client IP preservation for TLS-terminated traffic.
+  # When enabled (the default for instance targets), the NLB uses the client's
+  # public IP as the source when connecting to the backend. The server security
+  # group only allows VPC CIDR (10.x.x.x), so the client IP gets blocked.
+  # With this disabled, the NLB uses its own private IP as the source.
+  preserve_client_ip = false
+
   deregistration_delay = 30
 
   tags = merge(var.tags, {

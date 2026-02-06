@@ -293,6 +293,9 @@ resource "aws_lb_target_group" "https_green" {
     matcher             = "200"
   }
 
+  # Disable client IP preservation for TLS-terminated traffic (same as blue).
+  preserve_client_ip = false
+
   deregistration_delay = 30
 
   tags = merge(var.tags, {
