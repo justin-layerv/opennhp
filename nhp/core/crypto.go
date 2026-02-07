@@ -57,7 +57,11 @@ func NewCipherSuite() (ciphers *CipherSuite) {
 func NewHash(t HashTypeEnum) (hash.Hash, error) {
 	switch t {
 	case HASH_BLAKE2S:
-		return blake2s.New256(nil)
+		h, err := blake2s.New256(nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create BLAKE2s hash: %w", err)
+		}
+		return h, nil
 	case HASH_SHA256:
 		return sha256.New(), nil
 	default:
