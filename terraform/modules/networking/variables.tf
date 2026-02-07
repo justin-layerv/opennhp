@@ -24,3 +24,9 @@ variable "allow_private_ingress_443" {
   type        = bool
   default     = false
 }
+
+variable "logs_kms_key_arn" {
+  description = "KMS key ARN for encrypting CloudWatch log groups (VPC flow logs)"
+  type        = string
+  default     = null
+}

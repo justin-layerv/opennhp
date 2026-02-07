@@ -720,6 +720,7 @@ resource "aws_lb" "server" {
   subnets            = var.public_subnet_ids
 
   enable_cross_zone_load_balancing = true
+  enable_deletion_protection       = local.is_prod
 
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-nlb"

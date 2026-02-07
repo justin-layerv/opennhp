@@ -184,6 +184,7 @@ resource "aws_route_table_association" "isolated" {
 resource "aws_cloudwatch_log_group" "flow_logs" {
   name              = "/layerv/nhp/${var.environment}/vpc-flow-logs"
   retention_in_days = local.is_prod ? 365 : 30
+  kms_key_id        = var.logs_kms_key_arn
 
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-vpc-flow-logs"

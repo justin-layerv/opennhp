@@ -191,10 +191,11 @@ module "ecr" {
 module "networking" {
   source = "./modules/networking"
 
-  environment = var.environment
-  vpc_cidr    = var.vpc_cidr
-  name_prefix = local.name_prefix
-  tags        = local.common_tags
+  environment      = var.environment
+  vpc_cidr         = var.vpc_cidr
+  name_prefix      = local.name_prefix
+  logs_kms_key_arn = module.kms.logs_key_arn
+  tags             = local.common_tags
 
   # NHP protection requires NACL to allow port 443 from internet
   # so NLB can route to private subnets (iptables enforces access)
