@@ -28,7 +28,7 @@ cffi==1.17.1
 pycparser==2.22
 pyrfc3339==1.1
 pytz==2024.2
-requests==2.32.3
+requests==2.32.4
 certifi==2024.8.30
 charset-normalizer==3.4.0
 idna==3.10
