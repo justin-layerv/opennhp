@@ -242,6 +242,9 @@ jobs:
         if: needs.changes.outputs.app == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      # ECR is hosted in the sandbox account (primary_account). Prod pulls cross-account
+      # via ECR repository policy (see terraform/modules/ecr/main.tf). Images are always
+      # pushed to sandbox ECR, so we always use the sandbox role here.
       - name: Configure AWS credentials
         if: needs.changes.outputs.app == 'true' && github.event_name != 'pull_request'
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
@@ -363,6 +366,14 @@ jobs:
           docker push $ECR_REGISTRY/${{ matrix.repo }}:$ENV_TAG
           docker push $ECR_REGISTRY/${{ matrix.repo }}:latest
           echo "::notice::Image pushed: $ECR_REGISTRY/${{ matrix.repo }}:$IMAGE_TAG"
+
+      # Re-authenticate for prod SSM updates (build job uses sandbox ECR credentials above)
+      - name: Configure AWS credentials (prod SSM)
+        if: needs.changes.outputs.app == 'true' && github.event_name != 'pull_request' && needs.setup.outputs.environment == 'prod'
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
       # Update SSM parameter with the new image tag
       # This enables instance refresh to use the new image without terraform apply
@@ -598,12 +609,14 @@ jobs:
           TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
           # AC license key (plaintext - stored in Secrets Manager)
-          TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
+          TF_VAR_ac_license_key: ${{ matrix.environment == 'prod' && secrets.PROD_AC_LICENSE_KEY || secrets.AC_LICENSE_KEY }}
           # Grafana Cloud API token for dashboard provisioning
-          TF_VAR_grafana_auth: ${{ secrets.GRAFANA_AUTH }}
-          # Auth0 Terraform provider credentials
-          TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
-          TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
+          TF_VAR_grafana_auth: ${{ matrix.environment == 'prod' && secrets.PROD_GRAFANA_AUTH || secrets.GRAFANA_AUTH }}
+          # Auth0 Terraform provider credentials (prod requires dedicated secrets)
+          TF_VAR_auth0_tf_client_id: ${{ matrix.environment == 'prod' && secrets.PROD_AUTH0_CLIENT_ID || secrets.AUTH0_CLIENT_ID }}
+          TF_VAR_auth0_tf_client_secret: ${{ matrix.environment == 'prod' && secrets.PROD_AUTH0_CLIENT_SECRET || secrets.AUTH0_CLIENT_SECRET }}
+          # Prod deployment safeguard
+          TF_VAR_confirm_prod_deployment: ${{ matrix.environment == 'prod' && 'yes-deploy-to-production' || '' }}
           # Deployment configuration - use commit SHA for immutable deployments
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         run: |
@@ -1136,6 +1149,10 @@ jobs:
           TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
           TF_VAR_ac_license_key: ${{ secrets.PROD_AC_LICENSE_KEY }}
+          TF_VAR_grafana_auth: ${{ secrets.PROD_GRAFANA_AUTH }}
+          TF_VAR_auth0_tf_client_id: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
+          TF_VAR_auth0_tf_client_secret: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
+          TF_VAR_confirm_prod_deployment: "yes-deploy-to-production"
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         run: |
           set -euo pipefail
@@ -1176,6 +1193,10 @@ jobs:
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
           # AC license key (plaintext - stored in Secrets Manager) - prod uses separate secrets
           TF_VAR_ac_license_key: ${{ secrets.PROD_AC_LICENSE_KEY }}
+          TF_VAR_grafana_auth: ${{ secrets.PROD_GRAFANA_AUTH }}
+          TF_VAR_auth0_tf_client_id: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
+          TF_VAR_auth0_tf_client_secret: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
+          TF_VAR_confirm_prod_deployment: "yes-deploy-to-production"
           # Deployment configuration - use commit SHA for immutable deployments
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         # Manual approval is handled by GitHub environment protection rules
