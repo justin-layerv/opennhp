@@ -1023,6 +1023,8 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "logs:CreateLogGroup",
           "logs:DeleteLogGroup",
           "logs:PutRetentionPolicy",
+          "logs:AssociateKmsKey",
+          "logs:DisassociateKmsKey",
           "logs:TagLogGroup",
           "logs:UntagLogGroup",
           "cloudwatch:PutMetricAlarm",
