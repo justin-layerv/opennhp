@@ -48,6 +48,27 @@ resource "aws_kms_key" "ebs" {
         }
       },
       {
+        # Required for ASG to create encrypted EBS volumes on new instances.
+        # The AllowAutoScalingService statement above grants access via service
+        # principal with CallerAccount condition, but ASG also needs explicit
+        # grants for its service-linked role to perform CreateGrant operations
+        # during instance launches with encrypted volumes.
+        Sid    = "AllowAutoScalingServiceLinkedRole"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
+        }
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey",
+          "kms:CreateGrant"
+        ]
+        Resource = "*"
+      },
+      {
         Sid    = "AllowEC2Service"
         Effect = "Allow"
         Principal = {

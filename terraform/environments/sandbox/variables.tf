@@ -311,6 +311,17 @@ variable "qurl_site_domain" {
   }
 }
 
+variable "qurl_site_hosted_zone_id" {
+  description = "Route53 hosted zone ID for the qurl.site domain wildcard record"
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.qurl_site_hosted_zone_id == null || can(regex("^Z[A-Z0-9]+$", var.qurl_site_hosted_zone_id))
+    error_message = "qurl_site_hosted_zone_id must be a valid Route53 zone ID (starts with Z)"
+  }
+}
+
 variable "qurl_audit_retention_days" {
   description = "Number of days to retain QURL audit logs in DynamoDB"
   type        = number

@@ -91,9 +91,10 @@ centralized_cert_domains = ["nhp.layerv.ai", "*.nhp.layerv.ai", "qurl.site", "*.
 cross_account_route53_role_arn = "arn:aws:iam::165115313779:role/nhp-ac-route53-access"
 
 # QURL domains
-qurl_link_domain   = "qurl.link"
-qurl_site_domain   = "qurl.site"
-qurl_cookie_domain = ".qurl.site"
+qurl_link_domain         = "qurl.link"
+qurl_site_domain         = "qurl.site"
+qurl_site_hosted_zone_id = "Z09870522JYXPU8N4YJHY" # qurl.site hosted zone
+qurl_cookie_domain       = ".qurl.site"
 
 # QURL Service (ECS Fargate API)
 deploy_qurl_service             = true

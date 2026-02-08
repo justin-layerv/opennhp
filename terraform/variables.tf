@@ -877,6 +877,17 @@ variable "qurl_site_domain" {
   default     = "qurl.site"
 }
 
+variable "qurl_site_hosted_zone_id" {
+  description = "Route53 hosted zone ID for the qurl.site domain wildcard record. For sandbox (qurl.site.layerv.xyz), this is the layerv.xyz zone. For prod (qurl.site), this is the qurl.site zone."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.qurl_site_hosted_zone_id == null || can(regex("^Z[A-Z0-9]+$", var.qurl_site_hosted_zone_id))
+    error_message = "qurl_site_hosted_zone_id must be a valid Route53 zone ID (starts with Z)"
+  }
+}
+
 variable "qurl_owner_rate_limit" {
   description = "Rate limit for authenticated owner routes (requests per minute)"
   type        = number

@@ -230,9 +230,10 @@ qurl_default_ac_id   = "layerv-ac-tf"
 qurl_default_ac_port = 443
 
 # Domain configuration for QURL links and sites
-qurl_cookie_domain = ".qurl.site.layerv.xyz"
-qurl_link_domain   = "qurl.link.layerv.xyz"
-qurl_site_domain   = "qurl.site.layerv.xyz"
+qurl_cookie_domain       = ".qurl.site.layerv.xyz"
+qurl_link_domain         = "qurl.link.layerv.xyz"
+qurl_site_domain         = "qurl.site.layerv.xyz"
+qurl_site_hosted_zone_id = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone (same account)
 
 # Rate limiting (requests per minute)
 qurl_owner_rate_limit = 200 # authenticated owner routes

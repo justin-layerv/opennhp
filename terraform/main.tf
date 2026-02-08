@@ -833,6 +833,29 @@ resource "aws_route53_record" "ac_wildcard" {
   }
 }
 
+# Wildcard DNS for QURL site domains (e.g., *.qurl.site.layerv.xyz)
+# Routes all resource-specific subdomains (r_xxx.qurl.site) to the AC NLB,
+# where Traefik's QURL Router plugin handles routing to protected backends.
+#
+# Unlike ac_wildcard above, this doesn't check cross_account_route53_role_arn
+# because qurl_site_hosted_zone_id is explicitly provided per environment
+# (sandbox: layerv.xyz zone, prod: dedicated qurl.site zone).
+resource "aws_route53_record" "qurl_site_wildcard" {
+  count    = var.deploy_ac && var.qurl_site_hosted_zone_id != null ? 1 : 0
+  provider = aws.route53_mgmt
+
+  allow_overwrite = true
+  zone_id         = var.qurl_site_hosted_zone_id
+  name            = "*.${var.qurl_site_domain}"
+  type            = "A"
+
+  alias {
+    name                   = module.ac[0].nlb_dns_name
+    zone_id                = module.ac[0].nlb_zone_id
+    evaluate_target_health = true
+  }
+}
+
 # ==================== QURL Service ====================
 # ECS Fargate deployment for the QURL API service
 # Public API protected by Auth0 JWT, no NHP protection needed
