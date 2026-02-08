@@ -20,9 +20,9 @@ var (
 	// Console API endpoint for createPortalSitesByURL
 	consoleAPIURL = getEnv("CONSOLE_API_URL", "https://home.secure.layerv.xyz")
 	// Login portal domain
-	loginPortalDomain = getEnv("LOGIN_PORTAL_DOMAIN", "qurl.link")
+	loginPortalDomain = getEnv("LOGIN_PORTAL_DOMAIN", "qurl.link.layerv.xyz")
 	// Protected apps domain
-	appsDomain = getEnv("APPS_DOMAIN", "qurl.site")
+	appsDomain = getEnv("APPS_DOMAIN", "qurl.site.layerv.xyz")
 )
 
 func getEnv(key, defaultValue string) string {

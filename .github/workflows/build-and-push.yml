@@ -1027,8 +1027,8 @@ jobs:
       - name: Run E2E Tests (Demo Flow)
         env:
           CONSOLE_API_URL: "https://home.secure.layerv.xyz"
-          LOGIN_PORTAL_DOMAIN: "qurl.link"
-          APPS_DOMAIN: "qurl.site"
+          LOGIN_PORTAL_DOMAIN: "qurl.link.layerv.xyz"
+          APPS_DOMAIN: "qurl.site.layerv.xyz"
         run: |
           echo "============================================"
           echo "E2E TESTS - DEMO FLOW"

@@ -57,6 +57,12 @@ variable "primary_account_id" {
   default = ""
 }
 
+variable "secondary_account_ids" {
+  description = "AWS account IDs that need cross-account ECR pull access"
+  type        = list(string)
+  default     = []
+}
+
 variable "github_org" {
   type    = string
   default = "layervai"
@@ -277,6 +283,12 @@ variable "qurl_internal_service_token_arn" {
   description = "Secrets Manager ARN for QURL internal service token"
   type        = string
   default     = null
+}
+
+variable "qurl_cookie_domain" {
+  description = "Cookie domain for NHP tokens (must match qurl_site_domain with leading dot)"
+  type        = string
+  default     = ".qurl.site"
 }
 
 variable "qurl_link_domain" {

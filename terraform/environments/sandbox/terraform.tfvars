@@ -12,8 +12,8 @@ max_capacity   = 10
 vpc_cidr       = "10.100.0.0/16"
 
 # Multi-account config: sandbox owns ECR repositories
-is_primary_account = true
-# secondary_account_ids = ["PROD_ACCOUNT_ID"]  # TODO: Add prod account ID when created
+is_primary_account    = true
+secondary_account_ids = ["235500187906"] # Prod account - enables cross-account ECR pull
 
 # AC configuration (Traefik with Let's Encrypt for TLS)
 deploy_ac          = true
@@ -105,10 +105,9 @@ traefik_plugins_deploy_bucket_arn = "arn:aws:s3:::traefik-plugins-deploy-7673978
 # NHP server plugins are now compiled in - only Traefik plugins use S3
 plugin_repos = ["traefik-plugins", "console"]
 
-# Production domains - now enabled for sandbox testing
-# qurl.site/qurl.link zones are in layerv-mgmt, requiring cross-account Route 53 access
-production_domains             = ["qurl.site", "qurl.link"]
-cross_account_route53_role_arn = "arn:aws:iam::165115313779:role/nhp-ac-route53-access"
+# QURL domains for sandbox (subdomains of layerv.xyz, same-account DNS)
+# Production owns qurl.site and qurl.link directly
+production_domains = ["qurl.site.layerv.xyz", "qurl.link.layerv.xyz"]
 
 # Additional domains for TLS certificates (same account, layerv.xyz zone)
 # apps.layerv.xyz is needed for console2.apps.layerv.xyz (NHP-protected Console)
@@ -136,17 +135,13 @@ use_production_acme = true
 # 5. Refresh AC instances to pick up the new cert
 
 centralized_cert_enabled = true
-centralized_cert_domains = ["nhp.layerv.xyz", "*.nhp.layerv.xyz", "apps.layerv.xyz", "*.apps.layerv.xyz", "qurl.site", "*.qurl.site", "qurl.link", "*.qurl.link"]
+centralized_cert_domains = ["nhp.layerv.xyz", "*.nhp.layerv.xyz", "apps.layerv.xyz", "*.apps.layerv.xyz", "qurl.site.layerv.xyz", "*.qurl.site.layerv.xyz", "qurl.link.layerv.xyz", "*.qurl.link.layerv.xyz"]
 
 # ==============================================================================
 # Demo Gateway Configuration
-# Routes qurl.link/{appId} to NHP Server passcode plugin for demo flow
+# Routes qurl.link.layerv.xyz/{appId} to NHP Server passcode plugin for demo flow
 # ==============================================================================
-# Set to true to deploy Demo Gateway (nginx + certbot for TLS)
-# Requires cross_account_route53_role_arn for qurl.link ACME challenges
 deploy_demo_gateway = false
-# demo_gateway_domain = "qurl.link"
-# demo_gateway_hosted_zone_id = "Z..." # qurl.link zone ID in layerv-mgmt
 
 # ==============================================================================
 # Console EC2 Configuration
@@ -235,8 +230,9 @@ qurl_default_ac_id   = "layerv-ac-tf"
 qurl_default_ac_port = 443
 
 # Domain configuration for QURL links and sites
-qurl_link_domain = "qurl.link" # Uses cross-account Route53 access to layerv-mgmt
-qurl_site_domain = "qurl.site"
+qurl_cookie_domain = ".qurl.site.layerv.xyz"
+qurl_link_domain   = "qurl.link.layerv.xyz"
+qurl_site_domain   = "qurl.site.layerv.xyz"
 
 # Rate limiting (requests per minute)
 qurl_owner_rate_limit = 200 # authenticated owner routes
@@ -249,11 +245,11 @@ qurl_audit_retention_days = 90
 
 # CORS allowed origins (required)
 # For sandbox, allow console and qurl domains
-qurl_cors_allowed_origins = "https://console.nhp.layerv.xyz,https://qurl.link,https://*.qurl.site"
+qurl_cors_allowed_origins = "https://console.nhp.layerv.xyz,https://qurl.link.layerv.xyz,https://*.qurl.site.layerv.xyz"
 
 # Additional allowed hosts for DNS rebinding protection
 # ALB DNS name, localhost, and 127.0.0.1 are always included automatically.
-# Add custom domains here (e.g., ["api.qurl.link", "api-sandbox.qurl.link"])
+# Add custom domains here if needed
 qurl_additional_allowed_hosts = []
 
 # Container sizing
@@ -320,14 +316,14 @@ grafana_tempo_datasource_uid      = "grafanacloud-traces"
 
 # ==============================================================================
 # QURL Plugin Configuration (NHP Server)
-# Enables qurl.link → qurl.site authentication flow in NHP Server
+# Enables qurl.link.layerv.xyz → qurl.site.layerv.xyz authentication flow in NHP Server
 # ==============================================================================
-# QURL plugin handles token resolution: qurl.link SPA redirects to /plugins/qurl
+# QURL plugin handles token resolution: SPA redirects to /plugins/qurl
 # which validates tokens via QURL API and performs NHP knock
 qurl_config = {
   enabled                 = true
   api_url                 = "https://api.layerv.xyz"
-  allowed_redirect_domain = "qurl.site"
+  allowed_redirect_domain = "qurl.site.layerv.xyz"
   api_timeout             = 10
   max_idle_conns          = 10
   max_idle_conns_per_host = 5
@@ -340,16 +336,15 @@ qurl_service_token_secret_arn = "arn:aws:secretsmanager:us-east-2:767397897469:s
 # ==============================================================================
 # QURL Link Redirect Page
 # Hosts the redirect page that extracts tokens and sends users to NHP Server
-# Uses qurl.link domain (hosted zone in layerv-mgmt, DNS records created via AWS CLI)
 # ==============================================================================
 deploy_qurl_link          = true
-qurl_link_frontend_domain = "qurl.link"
-qurl_link_hosted_zone_id  = "Z0693053DKJ8S3XN9WPG" # qurl.link zone in layerv-mgmt
-qurl_link_external_dns    = false                  # Terraform manages Route53 via aws.route53_mgmt provider
+qurl_link_frontend_domain = "qurl.link.layerv.xyz"
+qurl_link_hosted_zone_id  = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone (same account)
+qurl_link_external_dns    = false
 
 # ==============================================================================
 # QURL Router Plugin Configuration
-# Traefik plugin that routes *.qurl.site requests to target backends
+# Traefik plugin that routes *.qurl.site.layerv.xyz requests to target backends
 # Requires QURL Service to be deployed (deploy_qurl_service = true)
 # ==============================================================================
 # Enable QURL Router when QURL Service is deployed and internal_service_token is configured

@@ -22,6 +22,7 @@ module "nhp" {
   tags                   = var.tags
   is_primary_account     = var.is_primary_account
   primary_account_id     = var.primary_account_id
+  secondary_account_ids  = var.secondary_account_ids
   github_org             = var.github_org
   github_repo            = var.github_repo
   deploy_ac              = var.deploy_ac
@@ -58,7 +59,7 @@ module "nhp" {
   rds_max_capacity        = var.rds_max_capacity
   rds_deletion_protection = var.rds_deletion_protection
 
-  # Production domains (qurl.site, qurl.link)
+  # QURL domains (sandbox uses layerv.xyz subdomains)
   production_domains     = var.production_domains
   production_zone_ids    = var.production_zone_ids
   additional_tls_domains = var.additional_tls_domains
@@ -79,6 +80,7 @@ module "nhp" {
   qurl_additional_allowed_hosts   = var.qurl_additional_allowed_hosts
   qurl_cors_allowed_origins       = var.qurl_cors_allowed_origins
   qurl_audit_retention_days       = var.qurl_audit_retention_days
+  qurl_cookie_domain              = var.qurl_cookie_domain
   qurl_link_domain                = var.qurl_link_domain
   qurl_site_domain                = var.qurl_site_domain
   qurl_owner_rate_limit           = var.qurl_owner_rate_limit
@@ -276,12 +278,9 @@ module "acme_cert" {
   kms_key_arn         = module.nhp.secrets_kms_key_arn
   logs_kms_key_arn    = module.nhp.logs_kms_key_arn
 
-  # Multi-zone support for production domains in layerv-mgmt account
-  domain_zone_mappings = {
-    "qurl.site" = { zone_id = "Z06942509AYXSB91X7CD", cross_account = true }
-    "qurl.link" = { zone_id = "Z0693053DKJ8S3XN9WPG", cross_account = true }
-  }
-  cross_account_role_arn = var.cross_account_route53_role_arn
+  # All sandbox domains are in the layerv.xyz zone (same account, no cross-account needed)
+  domain_zone_mappings   = {}
+  cross_account_role_arn = null
 
   # Renewal configuration
   renewal_days_before_expiry = 30

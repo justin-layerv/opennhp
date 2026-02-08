@@ -54,7 +54,7 @@ provider "aws" {
 # Provider alias for Route53 operations in the management account
 #
 # This provider assumes a cross-account role to access Route53 in layerv-mgmt.
-# Required for qurl.link DNS records when qurl_link_external_dns=false.
+# Used by production for DNS records in externally hosted zones.
 #
 # The role (nhp-ac-route53-access) must exist in layerv-mgmt and trust the
 # GitHub Actions role in this account.
@@ -63,9 +63,13 @@ provider "aws" {
   region = var.aws_region
 
   # Cross-account access to Route53 in management account
-  assume_role {
-    role_arn     = var.cross_account_route53_role_arn
-    session_name = "TerraformRoute53"
+  # Uses dynamic block so provider is valid even when role ARN is not set (same-account DNS)
+  dynamic "assume_role" {
+    for_each = var.cross_account_route53_role_arn != null ? [1] : []
+    content {
+      role_arn     = var.cross_account_route53_role_arn
+      session_name = "TerraformRoute53"
+    }
   }
 
   default_tags {
