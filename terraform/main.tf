@@ -36,7 +36,7 @@ terraform {
 # Grafana provider for dashboards module
 # Configured with URL and auth from variables. Only used when grafana_dashboards_enabled=true.
 provider "grafana" {
-  url  = var.grafana_url
+  url  = coalesce(var.grafana_url, "https://grafana.placeholder.local")
   auth = var.grafana_auth
 }
 
@@ -206,13 +206,14 @@ module "networking" {
 module "data" {
   source = "./modules/data"
 
-  environment        = var.environment
-  multi_tenant       = var.multi_tenant
-  vpc_id             = module.networking.vpc_id
-  private_subnet_ids = module.networking.private_subnet_ids
-  vpc_cidr           = var.vpc_cidr
-  name_prefix        = local.name_prefix
-  tags               = local.common_tags
+  environment         = var.environment
+  multi_tenant        = var.multi_tenant
+  lambda_layer_bucket = coalesce(var.lambda_layer_bucket, var.terraform_state_bucket)
+  vpc_id              = module.networking.vpc_id
+  private_subnet_ids  = module.networking.private_subnet_ids
+  vpc_cidr            = var.vpc_cidr
+  name_prefix         = local.name_prefix
+  tags                = local.common_tags
 
   # KMS encryption keys
   efs_kms_key_arn     = module.kms.efs_key_arn
@@ -293,9 +294,9 @@ module "compute" {
   resource_mode = var.resource_mode
   # auth_url: Point to Console API for passcode validation
   # Uses Console EC2 internal endpoint when deployed, otherwise falls back to var.auth_url
-  auth_url         = var.deploy_console_ec2 && var.deploy_rds ? module.console_ec2[0].internal_endpoint : var.auth_url
-  auth_signing_key = var.auth_signing_key
-  auth_aes_key     = var.auth_aes_key
+  auth_url         = var.deploy_console_ec2 && var.deploy_rds ? module.console_ec2[0].internal_endpoint : (var.auth_url != null ? var.auth_url : "")
+  auth_signing_key = var.auth_signing_key != null ? var.auth_signing_key : ""
+  auth_aes_key     = var.auth_aes_key != null ? var.auth_aes_key : ""
 
   # Deployment configuration
   image_tag = var.image_tag
@@ -345,6 +346,7 @@ module "compute" {
   # SNS topic for Lambda error alarms (from monitoring module)
   # Note: The SNS topic is created before compute resources, avoiding circular dependency
   alerts_sns_topic_arn = module.monitoring.sns_topic_arn
+  enable_sns_alerts    = true # Static boolean - monitoring module always creates SNS topic
 
   # Blue/Green deployment configuration
   enable_blue_green               = var.enable_blue_green
@@ -376,11 +378,12 @@ module "monitoring" {
 # DNS Module - Route 53 records
 module "dns" {
   source = "./modules/dns"
-  count  = var.hosted_zone != null ? 1 : 0
+  count  = var.hosted_zone != null || var.hosted_zone_id != null ? 1 : 0
 
   environment      = var.environment
   domain_name      = var.domain_name
   hosted_zone_name = var.hosted_zone
+  hosted_zone_id   = var.hosted_zone_id
   nlb_dns_name     = module.compute.nlb_dns_name
   nlb_zone_id      = module.compute.nlb_zone_id
   name_prefix      = local.name_prefix
@@ -491,6 +494,8 @@ module "ac" {
   environment        = var.environment
   domain_name        = var.domain_name
   hosted_zone        = var.hosted_zone
+  hosted_zone_id     = var.hosted_zone_id
+  skip_dns_records   = var.cross_account_route53_role_arn != null # Cross-account zones: DNS records created in root module
   acme_email         = var.acme_email
   vpc_id             = module.networking.vpc_id
   vpc_cidr           = var.vpc_cidr
@@ -518,10 +523,11 @@ module "ac" {
   server_secret_arn = module.compute.server_secret_arn
 
   # License credentials for cloud mode registration
-  customer_id        = var.ac_customer_id
-  license_key        = var.ac_license_key
-  license_key_hash   = var.ac_license_key_hash
-  license_key_sha256 = var.ac_license_key_sha256
+  # Default to empty strings to prevent null interpolation errors in user_data template
+  customer_id        = var.ac_customer_id != null ? var.ac_customer_id : ""
+  license_key        = var.ac_license_key != null ? var.ac_license_key : ""
+  license_key_hash   = var.ac_license_key_hash != null ? var.ac_license_key_hash : ""
+  license_key_sha256 = var.ac_license_key_sha256 != null ? var.ac_license_key_sha256 : ""
 
   # DynamoDB for license seeding (optional)
   nhp_dynamodb_licenses_table = module.dynamodb.licenses_table_name
@@ -701,7 +707,7 @@ module "console_ec2" {
   ] : []
 
   # Route 53 for DNS (only used in external mode; internal mode DNS points to AC)
-  hosted_zone_id = var.hosted_zone != null ? data.aws_route53_zone.main[0].zone_id : null
+  hosted_zone_id = local.main_zone_id
 
   # ECR for pulling console image
   ecr_repo_arn = module.ecr.console_repo_arn
@@ -751,7 +757,7 @@ module "console_ec2" {
   # Console EC2 configures iptables DROP by default.
   # Port 443 is only accessible after NHP knock adds the user's IP to ipset.
   # Reuse main hosted zone - apps.layerv.xyz is a subdomain of layerv.xyz
-  protected_hosted_zone_id = length(data.aws_route53_zone.main) > 0 ? data.aws_route53_zone.main[0].zone_id : null
+  protected_hosted_zone_id = local.main_zone_id
 
   # License lookup GSI names - required for QURL quota lookup
   nhp_dynamodb_licenses_customer_index      = var.nhp_dynamodb_licenses_customer_index
@@ -766,18 +772,58 @@ module "console_ec2" {
 }
 
 # Data source for hosted zone (used by console_ec2)
+# Skip lookup when hosted_zone_id is provided directly (cross-account zones)
 data "aws_route53_zone" "main" {
-  count = var.hosted_zone != null ? 1 : 0
+  count = var.hosted_zone_id == null && var.hosted_zone != null ? 1 : 0
   name  = var.hosted_zone
+}
+
+locals {
+  main_zone_id = var.hosted_zone_id != null ? var.hosted_zone_id : try(data.aws_route53_zone.main[0].zone_id, null)
 }
 
 # Route 53 record for Console domain pointing to AC NLB (internal mode only)
 # When Console is NHP-protected, DNS should point to AC, not Console NLB
+# Uses route53_mgmt provider for cross-account DNS (prod: layerv.ai zone in mgmt account)
 resource "aws_route53_record" "console_via_ac" {
-  count = var.deploy_console_ec2 && var.console_internal_only && var.deploy_ac && var.hosted_zone != null ? 1 : 0
+  count    = var.deploy_console_ec2 && var.console_internal_only && var.deploy_ac && local.main_zone_id != null ? 1 : 0
+  provider = aws.route53_mgmt
 
-  zone_id = data.aws_route53_zone.main[0].zone_id
+  zone_id = local.main_zone_id
   name    = var.console_ec2_domain
+  type    = "A"
+
+  alias {
+    name                   = module.ac[0].nlb_dns_name
+    zone_id                = module.ac[0].nlb_zone_id
+    evaluate_target_health = true
+  }
+}
+
+# AC DNS records for cross-account zones
+# When skip_dns_records is true in the AC module (cross-account scenario),
+# the root module creates records using the route53_mgmt provider
+resource "aws_route53_record" "ac_domain" {
+  count    = var.deploy_ac && var.cross_account_route53_role_arn != null && local.main_zone_id != null ? 1 : 0
+  provider = aws.route53_mgmt
+
+  zone_id = local.main_zone_id
+  name    = var.domain_name
+  type    = "A"
+
+  alias {
+    name                   = module.ac[0].nlb_dns_name
+    zone_id                = module.ac[0].nlb_zone_id
+    evaluate_target_health = true
+  }
+}
+
+resource "aws_route53_record" "ac_wildcard" {
+  count    = var.deploy_ac && var.cross_account_route53_role_arn != null && local.main_zone_id != null ? 1 : 0
+  provider = aws.route53_mgmt
+
+  zone_id = local.main_zone_id
+  name    = "*.${var.domain_name}"
   type    = "A"
 
   alias {
@@ -807,7 +853,9 @@ resource "aws_acm_certificate" "qurl_api" {
 }
 
 # DNS validation records for QURL API certificate
+# Uses route53_mgmt provider for cross-account DNS validation (prod: layerv.ai zone in mgmt account)
 resource "aws_route53_record" "qurl_api_cert_validation" {
+  provider = aws.route53_mgmt
   for_each = var.deploy_qurl_service && var.qurl_service_domain != null ? {
     for dvo in aws_acm_certificate.qurl_api[0].domain_validation_options : dvo.domain_name => {
       name   = dvo.resource_record_name
@@ -829,6 +877,23 @@ resource "aws_acm_certificate_validation" "qurl_api" {
   count                   = var.deploy_qurl_service && var.qurl_service_domain != null ? 1 : 0
   certificate_arn         = aws_acm_certificate.qurl_api[0].arn
   validation_record_fqdns = [for record in aws_route53_record.qurl_api_cert_validation : record.fqdn]
+}
+
+# DNS A record for QURL API domain pointing to ALB
+# Uses route53_mgmt provider for cross-account DNS (prod: layerv.ai zone in mgmt account)
+resource "aws_route53_record" "qurl_api" {
+  count    = var.deploy_qurl_service && var.qurl_service_domain != null && var.qurl_hosted_zone_id != null ? 1 : 0
+  provider = aws.route53_mgmt
+
+  zone_id = var.qurl_hosted_zone_id
+  name    = var.qurl_service_domain
+  type    = "A"
+
+  alias {
+    name                   = module.qurl_service[0].alb_dns_name
+    zone_id                = module.qurl_service[0].alb_zone_id
+    evaluate_target_health = true
+  }
 }
 
 module "qurl_service" {
@@ -904,9 +969,13 @@ module "qurl_service" {
   default_ac_port = var.qurl_default_ac_port
 
   # Domain - use certificate created above if domain is configured
+  # DNS record created in root module (not module) for cross-account Route53 support
   domain_name     = var.qurl_service_domain
-  hosted_zone_id  = var.qurl_hosted_zone_id
+  hosted_zone_id  = null
   certificate_arn = var.qurl_service_domain != null ? aws_acm_certificate_validation.qurl_api[0].certificate_arn : null
+
+  # ALB access logs (required for production)
+  alb_access_logs_bucket = var.qurl_alb_access_logs_bucket
 
   # Idempotency cache
   idempotency_cache_ttl_seconds        = var.qurl_idempotency_cache_ttl_seconds

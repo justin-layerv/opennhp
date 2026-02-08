@@ -1103,7 +1103,7 @@ resource "aws_iam_role_policy_attachment" "termination_cleanup_logs" {
 # CloudWatch Alarm for Lambda errors
 # Alerts when termination cleanup Lambda fails, which could indicate stale assignments not being cleaned
 resource "aws_cloudwatch_metric_alarm" "termination_cleanup_errors" {
-  count = var.enable_termination_cleanup && var.alerts_sns_topic_arn != null ? 1 : 0
+  count = var.enable_termination_cleanup && var.enable_sns_alerts ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-termination-cleanup-errors"
   comparison_operator = "GreaterThanThreshold"

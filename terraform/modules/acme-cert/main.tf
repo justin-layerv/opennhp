@@ -187,7 +187,7 @@ resource "aws_secretsmanager_secret" "acme_account" {
 # ==============================================================================
 
 resource "aws_sns_topic" "alerts" {
-  count = var.existing_sns_topic_arn == null ? 1 : 0
+  count = !var.use_existing_sns_topic ? 1 : 0
 
   name              = "${var.name_prefix}-acme-cert-alerts"
   kms_master_key_id = local.kms_key_arn
@@ -198,7 +198,7 @@ resource "aws_sns_topic" "alerts" {
 }
 
 resource "aws_sns_topic_subscription" "email" {
-  for_each = var.existing_sns_topic_arn == null ? toset(var.alert_emails) : toset([])
+  for_each = !var.use_existing_sns_topic ? toset(var.alert_emails) : toset([])
 
   topic_arn = aws_sns_topic.alerts[0].arn
   protocol  = "email"
@@ -443,7 +443,7 @@ resource "aws_iam_role_policy" "lambda_cross_account_assume" {
 
 # KMS permissions - with specific key ARN (when kms_key_arn is provided)
 resource "aws_iam_role_policy" "lambda_kms_specific" {
-  count = local.kms_key_arn != null ? 1 : 0
+  count = var.has_kms_key || var.create_kms_key ? 1 : 0
   name  = "${local.function_name}-kms"
   role  = aws_iam_role.lambda.id
 
@@ -466,7 +466,7 @@ resource "aws_iam_role_policy" "lambda_kms_specific" {
 
 # KMS permissions - any key via secretsmanager (when kms_key_arn is null)
 resource "aws_iam_role_policy" "lambda_kms_wildcard" {
-  count = local.kms_key_arn == null ? 1 : 0
+  count = !var.has_kms_key && !var.create_kms_key ? 1 : 0
   name  = "${local.function_name}-kms"
   role  = aws_iam_role.lambda.id
 

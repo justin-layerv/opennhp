@@ -314,6 +314,12 @@ variable "alerts_sns_topic_arn" {
   default     = null
 }
 
+variable "enable_sns_alerts" {
+  description = "Static boolean: set true when alerts_sns_topic_arn is provided (avoids count-depends-on-computed)"
+  type        = bool
+  default     = false
+}
+
 # =============================================================================
 # QURL Plugin Configuration
 # These settings configure the QURL token resolution plugin for qurl.link flow.

@@ -216,6 +216,24 @@ variable "hosted_zone" {
   default     = null
 }
 
+variable "hosted_zone_id" {
+  description = "Route 53 hosted zone ID (bypasses zone lookup for cross-account zones)"
+  type        = string
+  default     = null
+}
+
+variable "lambda_layer_bucket" {
+  description = "S3 bucket containing Lambda layer artifacts (defaults to terraform state bucket)"
+  type        = string
+  default     = null
+}
+
+variable "qurl_alb_access_logs_bucket" {
+  description = "S3 bucket for QURL ALB access logs (required for production)"
+  type        = string
+  default     = null
+}
+
 # ==================== AC Configuration ====================
 
 variable "deploy_ac" {

@@ -48,22 +48,6 @@ resource "aws_kms_key" "ebs" {
         }
       },
       {
-        Sid    = "AllowAutoScalingServiceLinkedRole"
-        Effect = "Allow"
-        Principal = {
-          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
-        }
-        Action = [
-          "kms:Encrypt",
-          "kms:Decrypt",
-          "kms:ReEncrypt*",
-          "kms:GenerateDataKey*",
-          "kms:DescribeKey",
-          "kms:CreateGrant"
-        ]
-        Resource = "*"
-      },
-      {
         Sid    = "AllowEC2Service"
         Effect = "Allow"
         Principal = {

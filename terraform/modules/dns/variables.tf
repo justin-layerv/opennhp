@@ -11,7 +11,13 @@ variable "domain_name" {
 }
 
 variable "hosted_zone_name" {
-  description = "Route 53 hosted zone name (optional)"
+  description = "Route 53 hosted zone name (optional, used for zone lookup)"
+  type        = string
+  default     = null
+}
+
+variable "hosted_zone_id" {
+  description = "Route 53 hosted zone ID (optional, bypasses zone lookup for cross-account zones)"
   type        = string
   default     = null
 }

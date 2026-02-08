@@ -16,6 +16,18 @@ variable "hosted_zone" {
   type        = string
 }
 
+variable "hosted_zone_id" {
+  description = "Route 53 hosted zone ID (bypasses zone lookup for cross-account zones)"
+  type        = string
+  default     = null
+}
+
+variable "skip_dns_records" {
+  description = "Skip creating DNS records (for cross-account zones where records are created by the caller with the correct provider)"
+  type        = bool
+  default     = false
+}
+
 variable "acme_email" {
   description = "Email for Let's Encrypt certificate registration"
   type        = string

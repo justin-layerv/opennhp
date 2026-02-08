@@ -100,6 +100,12 @@ variable "create_kms_key" {
   default     = false
 }
 
+variable "has_kms_key" {
+  description = "Static boolean: set true when kms_key_arn is provided (avoids count-depends-on-computed)"
+  type        = bool
+  default     = false
+}
+
 # ------------------------------------------------------------------------------
 # Renewal Configuration
 # ------------------------------------------------------------------------------
@@ -142,6 +148,12 @@ variable "existing_sns_topic_arn" {
   description = "Existing SNS topic ARN for alerts. If not provided, a new topic will be created."
   type        = string
   default     = null
+}
+
+variable "use_existing_sns_topic" {
+  description = "Static boolean: set true when existing_sns_topic_arn is provided (avoids count-depends-on-computed)"
+  type        = bool
+  default     = false
 }
 
 # ------------------------------------------------------------------------------

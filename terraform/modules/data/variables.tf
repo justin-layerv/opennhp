@@ -57,3 +57,9 @@ variable "terraform_state_bucket" {
   type        = string
   default     = null
 }
+
+variable "lambda_layer_bucket" {
+  description = "S3 bucket containing Lambda layer artifacts (cryptography layer)"
+  type        = string
+  default     = null
+}

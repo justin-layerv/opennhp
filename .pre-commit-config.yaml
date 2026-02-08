@@ -32,7 +32,8 @@ repos:
     hooks:
       - id: terraform_fmt
       - id: terraform_validate
-        # Exclude modules that use provider aliases (e.g., aws.us_east_1 for
-        # CloudFront/WAF). terraform validate in isolation cannot resolve
-        # aliased providers defined in the root module.
-        exclude: 'terraform/modules/ac/'
+        # Exclude directories/files that use provider aliases (configuration_aliases).
+        # terraform validate in isolation cannot resolve aliased providers
+        # (aws.us_east_1, aws.route53_mgmt) that are passed from environment configs.
+        # Anchored to root-level files only to avoid excluding files in subdirectories.
+        exclude: '^terraform/(modules/ac/|main\.tf$|variables\.tf$|outputs\.tf$)'

@@ -160,7 +160,7 @@ resource "aws_iam_role_policy" "etcd_tls_lambda_secrets" {
 #   aws s3 cp cryptography-layer.zip s3://layerv-terraform-state-767397897469/lambda-layers/
 data "aws_s3_object" "cryptography_layer" {
   count  = var.multi_tenant ? 1 : 0
-  bucket = "layerv-terraform-state-767397897469"
+  bucket = coalesce(var.lambda_layer_bucket, "layerv-terraform-state-767397897469")
   key    = "lambda-layers/cryptography-layer.zip"
 }
 

@@ -187,9 +187,16 @@ locals {
 }
 
 # Route 53 hosted zone lookup for DNS-01 challenge
+# Skip lookup when hosted_zone_id is provided directly (cross-account zones)
 data "aws_route53_zone" "main" {
+  count        = var.hosted_zone_id == null ? 1 : 0
   name         = "${var.hosted_zone}."
   private_zone = false
+}
+
+locals {
+  resolved_zone_id  = var.hosted_zone_id != null ? var.hosted_zone_id : data.aws_route53_zone.main[0].zone_id
+  resolved_zone_arn = var.hosted_zone_id != null ? "arn:aws:route53:::hostedzone/${var.hosted_zone_id}" : data.aws_route53_zone.main[0].arn
 }
 
 # Security Group for AC instances
@@ -417,7 +424,7 @@ resource "aws_iam_role_policy" "ac" {
             "route53:ListResourceRecordSets"
           ]
           Resource = concat(
-            [data.aws_route53_zone.main.arn, "arn:aws:route53:::change/*"],
+            [local.resolved_zone_arn, "arn:aws:route53:::change/*"],
             [for zone_id in var.production_zone_ids : "arn:aws:route53:::hostedzone/${zone_id}"]
           )
         },
@@ -898,8 +905,8 @@ resource "aws_lb_listener" "https" {
 # Route 53 record for AC (points to NLB when CloudFront is disabled)
 # When CloudFront is enabled, the ac_cloudfront record takes precedence
 resource "aws_route53_record" "ac" {
-  count   = var.enable_cloudfront ? 0 : 1
-  zone_id = data.aws_route53_zone.main.zone_id
+  count   = !var.skip_dns_records && !var.enable_cloudfront ? 1 : 0
+  zone_id = local.resolved_zone_id
   name    = var.domain_name
   type    = "A"
 
@@ -912,7 +919,8 @@ resource "aws_route53_record" "ac" {
 
 # Wildcard record for tenant subdomains (points to CloudFront if enabled, otherwise NLB)
 resource "aws_route53_record" "ac_wildcard" {
-  zone_id = data.aws_route53_zone.main.zone_id
+  count   = !var.skip_dns_records ? 1 : 0
+  zone_id = local.resolved_zone_id
   name    = "*.${var.domain_name}"
   type    = "A"
 
@@ -956,7 +964,7 @@ resource "aws_route53_record" "cloudfront_cert_validation" {
   records         = [each.value.record]
   ttl             = 60
   type            = each.value.type
-  zone_id         = data.aws_route53_zone.main.zone_id
+  zone_id         = local.resolved_zone_id
 }
 
 resource "aws_acm_certificate_validation" "cloudfront" {
@@ -1144,7 +1152,7 @@ resource "aws_cloudfront_distribution" "ac" {
 # Update Route 53 record to point to CloudFront when enabled
 resource "aws_route53_record" "ac_cloudfront" {
   count   = var.enable_cloudfront ? 1 : 0
-  zone_id = data.aws_route53_zone.main.zone_id
+  zone_id = local.resolved_zone_id
   name    = var.domain_name
   type    = "A"
 
@@ -1160,7 +1168,7 @@ resource "aws_route53_record" "ac_cloudfront" {
 # License keys are globally unique, so license_key_sha256 is the sole partition key
 
 resource "aws_dynamodb_table_item" "ac_license" {
-  count      = var.nhp_dynamodb_licenses_table != null ? 1 : 0
+  count      = var.nhp_dynamodb_licenses_table != null && var.license_key_sha256 != "" ? 1 : 0
   table_name = var.nhp_dynamodb_licenses_table
   hash_key   = "license_key_sha256"
 

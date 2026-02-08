@@ -7,10 +7,10 @@ output "fqdn" {
 
 output "zone_id" {
   description = "Route 53 hosted zone ID"
-  value       = var.hosted_zone_name != null ? data.aws_route53_zone.main[0].zone_id : null
+  value       = local.resolved_zone
 }
 
 output "name_servers" {
   description = "Name servers for the hosted zone"
-  value       = var.hosted_zone_name != null ? data.aws_route53_zone.main[0].name_servers : null
+  value       = length(data.aws_route53_zone.main) > 0 ? data.aws_route53_zone.main[0].name_servers : null
 }

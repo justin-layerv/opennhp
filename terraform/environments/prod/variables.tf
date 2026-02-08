@@ -22,7 +22,13 @@ variable "aws_region" {
 }
 
 variable "aws_account_id" {
-  type = string
+  description = "AWS account ID for the production environment"
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.aws_account_id))
+    error_message = "aws_account_id must be a 12-digit AWS account ID"
+  }
 }
 
 variable "domain_name" {
@@ -32,6 +38,24 @@ variable "domain_name" {
 variable "hosted_zone" {
   type    = string
   default = null
+}
+
+variable "hosted_zone_id" {
+  description = "Route 53 hosted zone ID (bypasses zone lookup for cross-account zones)"
+  type        = string
+  default     = null
+}
+
+variable "lambda_layer_bucket" {
+  description = "S3 bucket containing Lambda layer artifacts"
+  type        = string
+  default     = null
+}
+
+variable "qurl_alb_access_logs_bucket" {
+  description = "S3 bucket for QURL ALB access logs"
+  type        = string
+  default     = null
 }
 
 variable "multi_tenant" {
@@ -94,6 +118,77 @@ variable "terraform_lock_table" {
   default = "terraform-state-lock"
 }
 
+# AC configuration
+variable "ac_auth_service_id" {
+  type    = string
+  default = "layerv"
+}
+
+variable "ac_resource_ids" {
+  type    = list(string)
+  default = ["default"]
+}
+
+# Security services
+variable "enable_cloudtrail" {
+  description = "Enable AWS CloudTrail. Set to false if SCP blocks cloudtrail operations."
+  type        = bool
+  default     = true
+}
+
+# GitHub OIDC
+variable "create_oidc_provider" {
+  description = "Create GitHub OIDC provider. Set to false if org manages centrally or SCP blocks creation."
+  type        = bool
+  default     = true
+}
+
+# Server configuration
+variable "dev_mode" {
+  type    = bool
+  default = false
+}
+
+variable "resource_mode" {
+  type    = string
+  default = "local"
+}
+
+variable "auth_url" {
+  type    = string
+  default = null
+}
+
+variable "auth_signing_key" {
+  description = "Signing key for authentication tokens (required when resource_mode is 'api')"
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "auth_aes_key" {
+  description = "AES encryption key for authentication (required when resource_mode is 'api')"
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+# Monitoring
+variable "enable_slack_notifications" {
+  type    = bool
+  default = false
+}
+
+variable "slack_workspace_id" {
+  type    = string
+  default = ""
+}
+
+variable "slack_channel_id" {
+  type    = string
+  default = ""
+}
+
 # Deployment configuration
 variable "image_tag" {
   description = "Docker image tag for NHP server and AC"
@@ -101,95 +196,176 @@ variable "image_tag" {
   default     = "latest"
 }
 
-# ==============================================================================
-# QURL Service Configuration
-# ==============================================================================
-
-# QURL Service deployment
-variable "deploy_qurl_service" {
-  description = "Deploy the QURL API service on ECS Fargate"
-  type        = bool
-  default     = false
-}
-
-variable "qurl_service_domain" {
-  description = "Custom domain for QURL API (e.g., api.layerv.ai). When set, creates ACM certificate."
-  type        = string
-  default     = null
-}
-
-variable "qurl_hosted_zone_id" {
-  description = "Route53 hosted zone ID for qurl_service_domain DNS records"
-  type        = string
-  default     = null
-}
-
-variable "qurl_jwt_secret_arn" {
-  description = "Secrets Manager ARN for QURL JWT signing secret"
-  type        = string
-  default     = null
-}
-
-variable "qurl_internal_service_token_arn" {
-  description = "Secrets Manager ARN for QURL internal service token"
-  type        = string
-  default     = null
-}
-
-variable "qurl_additional_allowed_hosts" {
-  description = "Additional allowed hostnames for DNS rebinding protection"
+variable "server_plugins" {
+  description = "List of NHP Server plugins to enable"
   type        = list(string)
   default     = []
 }
 
+# RDS configuration
+variable "deploy_rds" {
+  type    = bool
+  default = false
+}
+
+variable "rds_database_name" {
+  type    = string
+  default = "portal"
+}
+
+variable "rds_min_capacity" {
+  type    = number
+  default = 0.5
+}
+
+variable "rds_max_capacity" {
+  type    = number
+  default = 4
+}
+
+variable "rds_deletion_protection" {
+  type    = bool
+  default = true
+}
+
+# Production domains
+variable "production_domains" {
+  type    = list(string)
+  default = []
+}
+
+variable "production_zone_ids" {
+  type    = list(string)
+  default = []
+}
+
+variable "additional_tls_domains" {
+  type    = list(string)
+  default = []
+}
+
+variable "use_production_acme" {
+  type    = bool
+  default = null
+}
+
+variable "enable_termination_cleanup" {
+  type    = bool
+  default = true
+}
+
+# ==============================================================================
+# QURL Service Configuration
+# ==============================================================================
+
+variable "deploy_qurl_service" {
+  type    = bool
+  default = false
+}
+
+variable "qurl_service_domain" {
+  type    = string
+  default = null
+}
+
+variable "qurl_hosted_zone_id" {
+  type    = string
+  default = null
+}
+
+variable "qurl_jwt_secret_arn" {
+  type    = string
+  default = null
+}
+
+variable "qurl_internal_service_token_arn" {
+  type    = string
+  default = null
+}
+
+variable "qurl_additional_allowed_hosts" {
+  type    = list(string)
+  default = []
+}
+
 variable "qurl_cors_allowed_origins" {
-  description = "Comma-separated list of allowed CORS origins"
+  description = "Comma-separated list of allowed CORS origins for QURL API"
   type        = string
+  default     = ""
 }
 
 variable "qurl_audit_retention_days" {
-  description = "Number of days to retain audit logs"
-  type        = number
-  default     = 90
+  type    = number
+  default = 365
 }
 
 variable "qurl_link_domain" {
-  description = "Domain for QURL links (e.g., qurl.link)"
+  description = "Domain for QURL access links (e.g., qurl.link)"
   type        = string
+  default     = "qurl.link"
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]*[a-z0-9]\\.[a-z]{2,}$", var.qurl_link_domain))
+    error_message = "qurl_link_domain must be a valid domain name (e.g., qurl.link)"
+  }
 }
 
 variable "qurl_site_domain" {
-  description = "Domain for QURL sites (e.g., qurl.site)"
+  description = "Domain for QURL protected resources (e.g., qurl.site)"
   type        = string
+  default     = "qurl.site"
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]*[a-z0-9]\\.[a-z]{2,}$", var.qurl_site_domain))
+    error_message = "qurl_site_domain must be a valid domain name (e.g., qurl.site)"
+  }
 }
 
 variable "qurl_owner_rate_limit" {
   description = "Rate limit for authenticated owner routes (requests per minute)"
   type        = number
   default     = 200
+
+  validation {
+    condition     = var.qurl_owner_rate_limit > 0 && var.qurl_owner_rate_limit <= 10000
+    error_message = "qurl_owner_rate_limit must be between 1 and 10000 requests per minute"
+  }
 }
 
 variable "qurl_owner_rate_burst" {
-  description = "Burst limit for authenticated owner routes"
+  description = "Burst allowance for authenticated owner routes"
   type        = number
   default     = 50
+
+  validation {
+    condition     = var.qurl_owner_rate_burst > 0 && var.qurl_owner_rate_burst <= 1000
+    error_message = "qurl_owner_rate_burst must be between 1 and 1000"
+  }
 }
 
 variable "qurl_ip_rate_limit" {
-  description = "Rate limit for internal API routes (requests per minute)"
+  description = "Rate limit for IP-based internal routes (requests per minute)"
   type        = number
   default     = 300
+
+  validation {
+    condition     = var.qurl_ip_rate_limit > 0 && var.qurl_ip_rate_limit <= 10000
+    error_message = "qurl_ip_rate_limit must be between 1 and 10000 requests per minute"
+  }
 }
 
 variable "qurl_ip_rate_burst" {
-  description = "Burst limit for internal API routes"
+  description = "Burst allowance for IP-based internal routes"
   type        = number
   default     = 100
+
+  validation {
+    condition     = var.qurl_ip_rate_burst > 0 && var.qurl_ip_rate_burst <= 1000
+    error_message = "qurl_ip_rate_burst must be between 1 and 1000"
+  }
 }
 
-# QURL plugin configuration
 variable "qurl_config" {
-  description = "QURL plugin configuration for token resolution"
   type = object({
     enabled                 = bool
     api_url                 = string
@@ -202,273 +378,278 @@ variable "qurl_config" {
   default = null
 }
 
-variable "qurl_service_token_secret_arn" {
-  description = "ARN of Secrets Manager secret containing the QURL service token"
+variable "qurl_cookie_domain" {
+  description = "Cookie domain for NHP tokens (e.g., .qurl.site)"
   type        = string
-  default     = null
+  default     = ".qurl.site"
 }
 
-# QURL Router plugin
+variable "qurl_service_token_secret_arn" {
+  type    = string
+  default = null
+}
+
+variable "deploy_qurl_link" {
+  type    = bool
+  default = false
+}
+
+variable "qurl_link_frontend_domain" {
+  type    = string
+  default = null
+}
+
+variable "qurl_link_hosted_zone_id" {
+  type    = string
+  default = null
+}
+
+variable "qurl_link_external_dns" {
+  type    = bool
+  default = false
+}
+
+variable "qurl_link_enable_access_logs" {
+  type    = bool
+  default = false
+}
+
 variable "qurl_router_enabled" {
-  description = "Enable QURL Router plugin in Traefik"
-  type        = bool
-  default     = false
+  type    = bool
+  default = false
 }
 
 variable "qurl_router_cache_ttl" {
-  description = "Cache TTL in seconds for successful lookups"
-  type        = number
-  default     = 60
+  type    = number
+  default = 60
 }
 
 variable "qurl_router_negative_cache_ttl" {
-  description = "Cache TTL in seconds for failed lookups"
-  type        = number
-  default     = 30
+  type    = number
+  default = 30
 }
 
 variable "qurl_router_max_cache_size" {
-  description = "Maximum cache entries"
-  type        = number
-  default     = 1000
+  type    = number
+  default = 1000
 }
 
 variable "qurl_router_api_timeout" {
-  description = "Timeout in seconds for QURL API calls"
-  type        = number
-  default     = 5
+  type    = number
+  default = 5
 }
 
 variable "qurl_router_proxy_timeout" {
-  description = "Timeout in seconds for proxying to backends"
-  type        = number
-  default     = 30
+  type    = number
+  default = 30
 }
 
 variable "qurl_router_cache_shards" {
-  description = "Number of cache shards"
-  type        = number
-  default     = 16
+  type    = number
+  default = 16
 }
 
-# QURL Idempotency Cache
 variable "qurl_idempotency_cache_ttl_seconds" {
-  description = "TTL for idempotency cache entries in seconds"
-  type        = number
-  default     = 300
+  type    = number
+  default = 300
 }
 
 variable "qurl_idempotency_cache_max_size" {
-  description = "Maximum number of idempotency cache entries"
-  type        = number
-  default     = 1000
+  type    = number
+  default = 1000
 }
 
 variable "qurl_idempotency_cleanup_interval_seconds" {
-  description = "Interval between idempotency cache cleanup runs"
-  type        = number
-  default     = 60
+  type    = number
+  default = 60
 }
 
-# QURL Health Check
 variable "qurl_health_check_timeout_seconds" {
-  description = "Timeout for QURL health check operations"
-  type        = number
-  default     = 10
+  type    = number
+  default = 10
 }
 
 variable "qurl_health_startup_timeout_seconds" {
-  description = "Timeout for QURL startup health checks"
-  type        = number
-  default     = 30
+  type    = number
+  default = 30
 }
 
-# QURL License Cache
 variable "qurl_license_cache_ttl_seconds" {
-  description = "TTL for license cache entries in seconds"
-  type        = number
-  default     = 300
+  type    = number
+  default = 300
 }
 
 variable "qurl_license_cache_max_size" {
-  description = "Maximum number of license cache entries"
-  type        = number
-  default     = 1000
+  type    = number
+  default = 1000
 }
 
-# QURL Resource Config
 variable "qurl_default_expires_in_seconds" {
-  description = "Default QURL lifetime in seconds"
-  type        = number
-  default     = 86400
+  type    = number
+  default = 86400
 }
 
 variable "qurl_resource_ttl_buffer_seconds" {
-  description = "Buffer after expiration for DynamoDB cleanup"
-  type        = number
-  default     = 604800
+  type    = number
+  default = 604800
 }
 
 variable "qurl_session_ttl_seconds" {
-  description = "Session TTL in seconds"
-  type        = number
-  default     = 86400
+  type    = number
+  default = 86400
 }
 
 variable "qurl_default_list_limit" {
-  description = "Default items per page for list endpoints"
-  type        = number
-  default     = 20
+  type    = number
+  default = 20
 }
 
-# QURL Auth0 JWKS
+variable "qurl_auth0_domain" {
+  type    = string
+  default = "auth.layerv.ai"
+}
+
+variable "qurl_auth0_audience" {
+  description = "Auth0 API audience/identifier for JWT validation"
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.qurl_auth0_audience == "" || can(regex("^https://", var.qurl_auth0_audience))
+    error_message = "qurl_auth0_audience must be an HTTPS URL"
+  }
+}
+
 variable "qurl_auth0_jwks_cache_ttl_seconds" {
-  description = "TTL for Auth0 JWKS cache in seconds"
-  type        = number
-  default     = 3600
+  type    = number
+  default = 3600
 }
 
 variable "qurl_auth0_jwks_fetch_timeout_seconds" {
-  description = "Timeout for fetching Auth0 JWKS"
-  type        = number
-  default     = 10
+  type    = number
+  default = 10
 }
 
-# QURL Webhooks
+variable "qurl_default_ac_id" {
+  type    = string
+  default = ""
+}
+
+variable "qurl_default_ac_port" {
+  type    = number
+  default = 443
+}
+
 variable "qurl_webhooks_enabled" {
-  description = "Enable webhook delivery for QURL service"
-  type        = bool
-  default     = false
+  type    = bool
+  default = false
 }
 
 variable "qurl_webhooks_worker_count" {
-  description = "Number of concurrent webhook delivery workers"
-  type        = number
-  default     = 4
+  type    = number
+  default = 4
 }
 
 variable "qurl_webhooks_max_webhooks_per_owner" {
-  description = "Maximum number of webhooks per owner"
-  type        = number
-  default     = 10
+  type    = number
+  default = 10
 }
 
 variable "qurl_webhooks_delivery_timeout_seconds" {
-  description = "Timeout for webhook delivery"
-  type        = number
-  default     = 30
+  type    = number
+  default = 30
 }
 
 variable "qurl_webhooks_max_retries" {
-  description = "Maximum number of webhook delivery retries"
-  type        = number
-  default     = 5
+  type    = number
+  default = 5
 }
 
 variable "qurl_webhooks_event_channel_size" {
-  description = "Size of the webhook event channel buffer"
-  type        = number
-  default     = 1000
+  type    = number
+  default = 1000
 }
 
 variable "qurl_webhooks_retry_worker_interval_seconds" {
-  description = "Interval between webhook retry worker runs"
-  type        = number
-  default     = 30
+  type    = number
+  default = 30
 }
 
 variable "qurl_webhooks_drain_timeout_seconds" {
-  description = "Timeout for draining webhook events during shutdown"
-  type        = number
-  default     = 30
+  type    = number
+  default = 30
 }
 
 variable "qurl_webhooks_response_body_limit" {
-  description = "Maximum response body size from webhook endpoints"
-  type        = number
-  default     = 8192
+  type    = number
+  default = 8192
 }
 
 variable "qurl_webhooks_api_version" {
-  description = "API version string for webhook payloads"
-  type        = string
-  default     = "2024-01-01"
+  type    = string
+  default = "2024-01-01"
 }
 
-# QURL Observability (OpenTelemetry)
 variable "qurl_otel_enabled" {
-  description = "Enable OpenTelemetry instrumentation"
-  type        = bool
-  default     = false
+  type    = bool
+  default = false
 }
 
 variable "qurl_otel_service_name" {
-  description = "Service name for OpenTelemetry"
-  type        = string
-  default     = "qurl-api"
+  type    = string
+  default = "qurl-api"
 }
 
 variable "qurl_otel_service_version" {
-  description = "Service version for OpenTelemetry"
-  type        = string
-  default     = "prod"
+  type    = string
+  default = "prod"
 }
 
 variable "qurl_otel_environment" {
-  description = "Environment name for OpenTelemetry"
-  type        = string
-  default     = "prod"
+  type    = string
+  default = "prod"
 }
 
 variable "qurl_otel_exporter_endpoint" {
-  description = "OTLP exporter endpoint"
-  type        = string
-  default     = "http://localhost:4317"
+  type    = string
+  default = "http://localhost:4317"
 }
 
 variable "qurl_otel_exporter_protocol" {
-  description = "OTLP exporter protocol"
-  type        = string
-  default     = "grpc"
+  type    = string
+  default = "grpc"
 }
 
 variable "qurl_otel_exporter_insecure" {
-  description = "Use insecure connection to OTLP endpoint"
-  type        = bool
-  default     = true
+  type    = bool
+  default = true
 }
 
 variable "qurl_otel_trace_sample_rate" {
-  description = "Trace sampling rate (0.0 to 1.0)"
-  type        = number
-  default     = 0.1
+  type    = number
+  default = 0.1
 }
 
 variable "qurl_otel_metrics_interval" {
-  description = "Metrics export interval in seconds"
-  type        = number
-  default     = 60
+  type    = number
+  default = 60
 }
 
 variable "qurl_otel_metrics_enabled" {
-  description = "Enable OpenTelemetry metrics"
-  type        = bool
-  default     = true
+  type    = bool
+  default = true
 }
 
 variable "qurl_otel_tracing_enabled" {
-  description = "Enable OpenTelemetry tracing"
-  type        = bool
-  default     = true
+  type    = bool
+  default = true
 }
 
 variable "qurl_otel_log_correlation" {
-  description = "Enable trace ID correlation in logs"
-  type        = bool
-  default     = true
+  type    = bool
+  default = true
 }
 
-# QURL Container Sizing
 variable "qurl_container_cpu" {
   description = "CPU units for QURL container"
   type        = number
@@ -491,53 +672,308 @@ variable "qurl_container_memory" {
   }
 }
 
-# QURL Grafana Cloud (ADOT Sidecar)
 variable "qurl_grafana_cloud_enabled" {
-  description = "Enable Grafana Cloud OTLP export via ADOT sidecar"
-  type        = bool
-  default     = false
+  type    = bool
+  default = false
 }
 
 variable "qurl_grafana_secret_arn" {
-  description = "ARN of Secrets Manager secret containing Grafana Cloud credentials"
-  type        = string
-  default     = null
+  type    = string
+  default = null
 }
 
 variable "qurl_adot_collector_image" {
-  description = "ADOT Collector container image"
-  type        = string
-  default     = "public.ecr.aws/aws-observability/aws-otel-collector:v0.40.0"
+  type    = string
+  default = "public.ecr.aws/aws-observability/aws-otel-collector:v0.40.0"
 }
 
-# Grafana Cloud Dashboards
 variable "grafana_dashboards_enabled" {
-  description = "Enable Grafana Cloud dashboard provisioning"
-  type        = bool
-  default     = false
+  type    = bool
+  default = false
 }
 
 variable "grafana_url" {
-  description = "Grafana Cloud stack URL"
-  type        = string
-  default     = ""
+  type    = string
+  default = ""
 }
 
 variable "grafana_auth" {
-  description = "Grafana Cloud API key or service account token"
-  type        = string
-  default     = ""
-  sensitive   = true
+  type      = string
+  default   = ""
+  sensitive = true
 }
 
 variable "grafana_prometheus_datasource_uid" {
-  description = "UID of the Prometheus datasource in Grafana Cloud"
-  type        = string
-  default     = "grafanacloud-prom"
+  type    = string
+  default = "grafanacloud-prom"
 }
 
 variable "grafana_tempo_datasource_uid" {
-  description = "UID of the Tempo datasource in Grafana Cloud"
+  type    = string
+  default = "grafanacloud-traces"
+}
+
+variable "traefik_plugins" {
+  type = map(object({
+    version = string
+    config  = optional(map(string), {})
+  }))
+  default = {}
+}
+
+variable "traefik_plugins_deploy_bucket_arn" {
+  type    = string
+  default = null
+}
+
+variable "plugin_repos" {
+  type    = list(string)
+  default = []
+}
+
+variable "deploy_demo_gateway" {
+  type    = bool
+  default = false
+}
+
+variable "demo_gateway_domain" {
+  type    = string
+  default = null
+}
+
+variable "demo_gateway_hosted_zone_id" {
+  type    = string
+  default = null
+}
+
+variable "demo_gateway_fallback_url" {
+  type    = string
+  default = "https://layerv.ai/demo"
+}
+
+variable "cross_account_route53_role_arn" {
+  type    = string
+  default = null
+}
+
+variable "deploy_console_ec2" {
+  type    = bool
+  default = false
+}
+
+variable "console_ec2_domain" {
+  type    = string
+  default = null
+}
+
+variable "console_cookie_domain" {
+  type    = string
+  default = null
+}
+
+variable "console_internal_only" {
+  type    = bool
+  default = false
+}
+
+variable "console_protected_hostname" {
+  type    = string
+  default = null
+}
+
+variable "console_ac_license_key_hash" {
+  type      = string
+  sensitive = true
+  default   = ""
+}
+
+variable "console_ac_license_key_sha256" {
+  type      = string
+  sensitive = true
+  default   = null
+}
+
+variable "nhp_dynamodb_licenses_customer_index" {
+  type    = string
+  default = null
+}
+
+variable "nhp_dynamodb_licenses_auth0_subject_index" {
+  type    = string
+  default = null
+}
+
+variable "internal_service_token_secret_arn" {
+  type    = string
+  default = null
+}
+
+variable "provisioning_resource_id" {
+  type    = string
+  default = null
+}
+
+variable "provisioning_default_tier" {
+  type    = string
+  default = null
+}
+
+variable "provisioning_default_max_acs" {
+  type    = number
+  default = null
+}
+
+# NHP Server Assignment Configuration (required, no defaults)
+variable "nhp_server_assignment_enabled" {
+  type = bool
+}
+
+variable "nhp_region" {
+  type = string
+}
+
+variable "nhp_cloudmap_service_name" {
+  type = string
+}
+
+variable "nhp_assignment_servers_per_ac" {
+  type = number
+}
+
+variable "nhp_assignment_require_distinct_azs" {
+  type = bool
+}
+
+variable "nhp_health_monitor_check_interval" {
+  type = number
+}
+
+variable "nhp_health_monitor_operation_timeout" {
+  type = number
+}
+
+variable "nhp_console_ac_enabled" {
+  type = bool
+}
+
+variable "ac_customer_id" {
+  type    = string
+  default = null
+}
+
+variable "ac_license_key" {
+  type      = string
+  sensitive = true
+  default   = null
+}
+
+variable "ac_license_key_hash" {
+  type      = string
+  sensitive = true
+  default   = null
+}
+
+variable "ac_license_key_sha256" {
+  type      = string
+  sensitive = true
+  default   = null
+}
+
+variable "guardduty_alert_emails" {
+  type    = list(string)
+  default = []
+}
+
+# ==============================================================================
+# Auth0 Configuration
+# ==============================================================================
+
+variable "auth0_domain" {
+  description = "Auth0 tenant domain for Management API (e.g., dev-xxx.us.auth0.com)"
   type        = string
-  default     = "grafanacloud-traces"
+
+  validation {
+    condition     = can(regex("^[a-zA-Z0-9-]+(\\.(us|eu|au|jp))?\\.auth0\\.com$", var.auth0_domain))
+    error_message = "auth0_domain must be a valid Auth0 tenant domain (e.g., layerv.auth0.com or dev-xxx.us.auth0.com)"
+  }
+}
+
+variable "auth0_tf_client_id" {
+  description = "Auth0 M2M client ID for Terraform provider. Set via TF_VAR_auth0_tf_client_id."
+  type        = string
+  sensitive   = true
+
+  validation {
+    condition     = length(var.auth0_tf_client_id) > 0
+    error_message = "auth0_tf_client_id must be set. Pass via TF_VAR_auth0_tf_client_id environment variable or sensitive.auto.tfvars."
+  }
+}
+
+variable "auth0_tf_client_secret" {
+  description = "Auth0 M2M client secret for Terraform provider. Set via TF_VAR_auth0_tf_client_secret."
+  type        = string
+  sensitive   = true
+
+  validation {
+    condition     = length(var.auth0_tf_client_secret) > 0
+    error_message = "auth0_tf_client_secret must be set. Pass via TF_VAR_auth0_tf_client_secret environment variable or sensitive.auto.tfvars."
+  }
+}
+
+variable "auth0_enable_rotation" {
+  type    = bool
+  default = false
+}
+
+variable "auth0_rotation_days" {
+  type    = number
+  default = 30
+}
+
+variable "auth0_management_secret_arn" {
+  type    = string
+  default = null
+}
+
+# ==============================================================================
+# Centralized TLS Certificate Management
+# ==============================================================================
+
+variable "centralized_cert_enabled" {
+  type    = bool
+  default = false
+}
+
+variable "centralized_cert_domains" {
+  type    = list(string)
+  default = []
+}
+
+# ==============================================================================
+# Blue/Green Deployment Configuration
+# ==============================================================================
+
+variable "enable_blue_green" {
+  type    = bool
+  default = false
+}
+
+variable "green_standby_min_size" {
+  type    = number
+  default = 1
+}
+
+variable "deployment_stale_threshold_days" {
+  type    = number
+  default = 7
+}
+
+variable "enable_ac_blue_green" {
+  type    = bool
+  default = false
+}
+
+variable "ac_green_standby_min_size" {
+  type    = number
+  default = 1
 }

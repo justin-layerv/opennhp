@@ -17,7 +17,7 @@ output "nlb_zone_id" {
 
 output "fqdn" {
   description = "AC fully qualified domain name"
-  value       = var.enable_cloudfront ? aws_route53_record.ac_cloudfront[0].fqdn : aws_route53_record.ac[0].fqdn
+  value       = var.skip_dns_records ? var.domain_name : (var.enable_cloudfront ? aws_route53_record.ac_cloudfront[0].fqdn : aws_route53_record.ac[0].fqdn)
 }
 
 output "asg_name" {
