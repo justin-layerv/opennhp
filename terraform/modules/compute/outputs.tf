@@ -72,6 +72,16 @@ output "ssm_asg_name_parameter" {
   value       = aws_ssm_parameter.asg_name.name
 }
 
+output "ssm_deployed_commit_parameter" {
+  description = "SSM parameter name for deployed commit SHA"
+  value       = aws_ssm_parameter.deployed_commit.name
+}
+
+output "ssm_deployed_at_parameter" {
+  description = "SSM parameter name for deployment timestamp"
+  value       = aws_ssm_parameter.deployed_at.name
+}
+
 # =============================================================================
 # NLB Outputs for Blue/Green Deployment (Phase 2)
 # =============================================================================

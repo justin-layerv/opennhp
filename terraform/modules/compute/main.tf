@@ -250,6 +250,41 @@ resource "aws_ssm_parameter" "asg_name" {
   })
 }
 
+# Deployment tracking - commit SHA of the currently deployed version
+resource "aws_ssm_parameter" "deployed_commit" {
+  name        = "/${var.environment}/nhp/deploy/deployed-commit"
+  description = "Git commit SHA of the currently deployed version"
+  type        = "String"
+  value       = "initial"
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-ssm-deployed-commit"
+    Component = "deploy"
+    Cell      = var.cell_id
+  })
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+resource "aws_ssm_parameter" "deployed_at" {
+  name        = "/${var.environment}/nhp/deploy/deployed-at"
+  description = "ISO 8601 timestamp of last successful deployment"
+  type        = "String"
+  value       = "never"
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-ssm-deployed-at"
+    Component = "deploy"
+    Cell      = var.cell_id
+  })
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
 # Cloud Map Service for NHP servers
 resource "aws_service_discovery_service" "server" {
   name        = "server"

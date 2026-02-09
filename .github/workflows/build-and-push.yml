@@ -1083,6 +1083,20 @@ jobs:
           echo "- Integration tests completed (etcd tests skipped without mTLS certs)" >> $GITHUB_STEP_SUMMARY
           echo "- E2E demo flow tests executed" >> $GITHUB_STEP_SUMMARY
 
+      - name: Update Deployment Tracking
+        run: |
+          aws ssm put-parameter \
+            --name "/sandbox/nhp/deploy/deployed-commit" \
+            --value "${{ github.sha }}" --type String --overwrite \
+            --region "$AWS_REGION" \
+            || echo "::warning::Failed to update SSM /sandbox/nhp/deploy/deployed-commit"
+          aws ssm put-parameter \
+            --name "/sandbox/nhp/deploy/deployed-at" \
+            --value "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --type String --overwrite \
+            --region "$AWS_REGION" \
+            || echo "::warning::Failed to update SSM /sandbox/nhp/deploy/deployed-at"
+          echo "::notice::Deployment tracking updated: deployed-commit = ${{ github.sha }}"
+
   # ============================================================================
   # DEPLOY PROD - Split into separate jobs (sequential - no Console to parallelize)
   # ============================================================================
@@ -1432,6 +1446,20 @@ jobs:
           echo "- Post-deployment validation script executed" >> $GITHUB_STEP_SUMMARY
           echo "- Integration tests completed" >> $GITHUB_STEP_SUMMARY
           echo "- E2E demo flow tests executed" >> $GITHUB_STEP_SUMMARY
+
+      - name: Update Deployment Tracking
+        run: |
+          aws ssm put-parameter \
+            --name "/prod/nhp/deploy/deployed-commit" \
+            --value "${{ github.sha }}" --type String --overwrite \
+            --region "$AWS_REGION" \
+            || echo "::warning::Failed to update SSM /prod/nhp/deploy/deployed-commit"
+          aws ssm put-parameter \
+            --name "/prod/nhp/deploy/deployed-at" \
+            --value "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --type String --overwrite \
+            --region "$AWS_REGION" \
+            || echo "::warning::Failed to update SSM /prod/nhp/deploy/deployed-at"
+          echo "::notice::Deployment tracking updated: deployed-commit = ${{ github.sha }}"
 
   # ============================================================================
   # NOTIFY
