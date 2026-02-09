@@ -312,3 +312,17 @@ output "ac_ssm_green_image_tag_parameter" {
   description = "SSM parameter name for AC green ASG image tag"
   value       = var.deploy_ac ? module.ac[0].ssm_green_image_tag_parameter : null
 }
+
+# ============================================================================
+# Canary Deployment Outputs
+# ============================================================================
+
+output "canary_state_machine_arn" {
+  description = "Step Functions state machine ARN for canary deployment"
+  value       = var.enable_canary_deployment ? module.canary_deployment[0].state_machine_arn : null
+}
+
+output "canary_composite_alarm_name" {
+  description = "CloudWatch composite alarm name for canary health"
+  value       = var.enable_canary_deployment ? module.canary_deployment[0].composite_alarm_name : null
+}

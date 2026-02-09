@@ -127,6 +127,9 @@ auth0_domain = "layerv.us.auth0.com"
 qurl_auth0_domain   = "auth.layerv.ai"
 qurl_auth0_audience = "https://api.layerv.ai"
 
+# Canary deployment (Phase 3)
+enable_canary_deployment = true
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"

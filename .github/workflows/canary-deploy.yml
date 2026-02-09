@@ -1,0 +1,371 @@
+name: "Canary Deploy (Production)"
+
+# Canary deployment using AWS Step Functions for automated rollout.
+#
+# This workflow:
+# 1. Validates the image exists in ECR and canary state is idle
+# 2. Updates the SSM image tag parameter
+# 3. Starts a Step Functions execution for the canary rollout
+# 4. Polls execution status until completion
+#
+# The Step Functions state machine handles:
+# - Launching canary instance(s)
+# - Health checks and metric evaluation
+# - Gradual traffic shifting
+# - Automatic rollback on failure
+
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: 'Component to deploy'
+        required: true
+        default: 'server'
+        type: choice
+        options:
+          - server
+          - ac
+      image_tag:
+        description: 'Docker image tag to deploy'
+        required: true
+        type: string
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'prod'
+        type: choice
+        options:
+          - prod
+      cell_id:
+        description: 'Cell identifier for multi-cell deployments'
+        required: false
+        default: 'cell0'
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: canary-deploy-${{ inputs.environment }}-${{ inputs.component }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+
+jobs:
+  # =============================================================================
+  # VALIDATE - Verify prerequisites before starting canary deployment
+  # =============================================================================
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 5
+    outputs:
+      state_machine_arn: ${{ steps.state-machine.outputs.arn }}
+      account_id: ${{ steps.aws-info.outputs.account_id }}
+      ecr_repo: ${{ steps.ecr-info.outputs.repo_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+        with:
+          role-to-assume: ${{ inputs.environment == 'prod' && secrets.AWS_PROD_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account Info
+        id: aws-info
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+          echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+          echo "AWS Account: $ACCOUNT_ID"
+
+      - name: Verify Image Exists in ECR
+        id: ecr-info
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          COMPONENT: ${{ inputs.component }}
+        run: |
+          REPO_NAME=$(aws ssm get-parameter \
+            --name "/${ENVIRONMENT}/nhp/${COMPONENT}/ecr-repo-name" \
+            --query "Parameter.Value" --output text 2>/dev/null) || REPO_NAME=""
+
+          if [[ -z "$REPO_NAME" ]]; then
+            if [[ "$COMPONENT" == "server" ]]; then
+              REPO_NAME="layerv/nhp-server"
+            else
+              REPO_NAME="layerv/nhp-ac"
+            fi
+            echo "::warning::SSM parameter /${ENVIRONMENT}/nhp/${COMPONENT}/ecr-repo-name not found, using default: $REPO_NAME"
+          fi
+
+          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+
+          echo "Verifying image $REPO_NAME:$IMAGE_TAG exists in ECR..."
+          if ! aws ecr describe-images \
+            --repository-name "$REPO_NAME" \
+            --image-ids imageTag="$IMAGE_TAG" \
+            --query "imageDetails[0].imageTags" \
+            --output text > /dev/null 2>&1; then
+            echo "::error::Image $REPO_NAME:$IMAGE_TAG not found in ECR"
+            exit 1
+          fi
+          echo "Image verified: $REPO_NAME:$IMAGE_TAG exists"
+
+      - name: Check Canary State is Idle
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          CELL_ID: ${{ inputs.cell_id }}
+        run: |
+          SSM_PARAM="/${ENVIRONMENT}/nhp/${CELL_ID}/canary/state"
+          echo "Checking canary state: $SSM_PARAM"
+
+          STATE=$(aws ssm get-parameter \
+            --name "$SSM_PARAM" \
+            --query "Parameter.Value" --output text 2>/dev/null) || STATE=""
+
+          if [[ -z "$STATE" ]]; then
+            echo "::warning::Canary state parameter not found - assuming idle (first deployment)"
+          elif [[ "$STATE" != "idle" ]]; then
+            echo "::error::Canary state is '$STATE', expected 'idle'. Another deployment may be in progress."
+            echo "::error::Wait for the current deployment to complete or manually reset the state."
+            exit 1
+          fi
+          echo "Canary state: idle (ready for deployment)"
+
+      - name: Read Step Functions State Machine ARN
+        id: state-machine
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          CELL_ID: ${{ inputs.cell_id }}
+        run: |
+          SSM_PARAM="/${ENVIRONMENT}/nhp/${CELL_ID}/canary/state-machine-arn"
+          echo "Reading state machine ARN from: $SSM_PARAM"
+
+          ARN=$(aws ssm get-parameter \
+            --name "$SSM_PARAM" \
+            --query "Parameter.Value" --output text 2>/dev/null) || ARN=""
+
+          if [[ -z "$ARN" ]]; then
+            echo "::error::State machine ARN not found in SSM parameter $SSM_PARAM"
+            echo "::error::Ensure the canary infrastructure has been deployed via Terraform"
+            exit 1
+          fi
+
+          echo "arn=$ARN" >> $GITHUB_OUTPUT
+          echo "State machine ARN: $ARN"
+
+      - name: Validation Summary
+        env:
+          COMPONENT: ${{ inputs.component }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          STATE_MACHINE_ARN: ${{ steps.state-machine.outputs.arn }}
+          ECR_REPO: ${{ steps.ecr-info.outputs.repo_name }}
+        run: |
+          echo "## Canary Deployment - Validation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | $COMPONENT |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | $ENVIRONMENT |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`$ECR_REPO:$IMAGE_TAG\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| State Machine | \`${STATE_MACHINE_ARN##*:}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All validation checks passed." >> $GITHUB_STEP_SUMMARY
+
+  # =============================================================================
+  # DEPLOY - Update SSM and execute Step Functions canary rollout
+  # =============================================================================
+  deploy:
+    name: Deploy
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 45
+    outputs:
+      execution_arn: ${{ steps.start-execution.outputs.execution_arn }}
+      status: ${{ steps.poll-execution.outputs.status }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+        with:
+          role-to-assume: ${{ inputs.environment == 'prod' && secrets.AWS_PROD_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update SSM Image Tag
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          COMPONENT: ${{ inputs.component }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          SSM_PARAM="/${ENVIRONMENT}/nhp/${COMPONENT}/image-tag"
+          echo "Updating SSM parameter: $SSM_PARAM = $IMAGE_TAG"
+          aws ssm put-parameter \
+            --name "$SSM_PARAM" \
+            --value "$IMAGE_TAG" \
+            --type String \
+            --overwrite
+          echo "SSM parameter updated successfully"
+
+      - name: Start Step Functions Execution
+        id: start-execution
+        env:
+          STATE_MACHINE_ARN: ${{ needs.validate.outputs.state_machine_arn }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          COMPONENT: ${{ inputs.component }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "Starting Step Functions execution..."
+          EXECUTION_ARN=$(aws stepfunctions start-execution \
+            --state-machine-arn "$STATE_MACHINE_ARN" \
+            --input "{\"image_tag\":\"$IMAGE_TAG\",\"component\":\"$COMPONENT\",\"environment\":\"$ENVIRONMENT\",\"triggered_by\":\"github-actions-$RUN_ID\"}" \
+            --query 'executionArn' --output text)
+
+          echo "execution_arn=$EXECUTION_ARN" >> $GITHUB_OUTPUT
+          echo "Execution started: $EXECUTION_ARN"
+
+      - name: Poll Execution Status
+        id: poll-execution
+        env:
+          EXECUTION_ARN: ${{ steps.start-execution.outputs.execution_arn }}
+        run: |
+          echo "Polling execution status every 30s..."
+          echo "Execution: $EXECUTION_ARN"
+          echo ""
+
+          ITERATION=0
+          START_TIME=$(date +%s)
+
+          while true; do
+            ITERATION=$((ITERATION + 1))
+            ELAPSED=$(( ($(date +%s) - START_TIME) / 60 ))
+
+            STATUS=$(aws stepfunctions describe-execution \
+              --execution-arn "$EXECUTION_ARN" \
+              --query 'status' --output text)
+
+            echo "[iter $ITERATION, ${ELAPSED}m elapsed] Status: $STATUS"
+
+            case "$STATUS" in
+              RUNNING)
+                sleep 30
+                ;;
+              SUCCEEDED)
+                echo "Canary deployment succeeded!"
+                echo "status=SUCCEEDED" >> $GITHUB_OUTPUT
+                break
+                ;;
+              FAILED)
+                echo "::error::Canary deployment FAILED"
+                OUTPUT=$(aws stepfunctions describe-execution \
+                  --execution-arn "$EXECUTION_ARN" \
+                  --query 'output' --output text 2>/dev/null) || OUTPUT=""
+                CAUSE=$(aws stepfunctions describe-execution \
+                  --execution-arn "$EXECUTION_ARN" \
+                  --query 'error' --output text 2>/dev/null) || CAUSE=""
+                if [[ -n "$CAUSE" && "$CAUSE" != "None" ]]; then
+                  echo "Error: $CAUSE"
+                fi
+                if [[ -n "$OUTPUT" && "$OUTPUT" != "None" ]]; then
+                  echo "Output: $OUTPUT"
+                fi
+                echo "status=FAILED" >> $GITHUB_OUTPUT
+                exit 1
+                ;;
+              TIMED_OUT)
+                echo "::error::Canary deployment TIMED OUT"
+                echo "status=TIMED_OUT" >> $GITHUB_OUTPUT
+                exit 1
+                ;;
+              ABORTED)
+                echo "::error::Canary deployment was ABORTED"
+                echo "status=ABORTED" >> $GITHUB_OUTPUT
+                exit 1
+                ;;
+              *)
+                echo "::warning::Unknown status: $STATUS"
+                sleep 30
+                ;;
+            esac
+          done
+
+  # =============================================================================
+  # SUMMARY - Generate deployment summary (runs even on failure)
+  # =============================================================================
+  summary:
+    name: Summary
+    if: always()
+    needs: [validate, deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Generate Deployment Summary
+        env:
+          COMPONENT: ${{ inputs.component }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          EXECUTION_ARN: ${{ needs.deploy.outputs.execution_arn }}
+          DEPLOY_STATUS: ${{ needs.deploy.outputs.status }}
+          ECR_REPO: ${{ needs.validate.outputs.ecr_repo }}
+          ACCOUNT_ID: ${{ needs.validate.outputs.account_id }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "## Canary Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Determine overall outcome
+          if [[ "$DEPLOY_RESULT" == "success" ]]; then
+            echo "> **Status: SUCCEEDED**" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$VALIDATE_RESULT" != "success" ]]; then
+            echo "> **Status: VALIDATION FAILED**" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$DEPLOY_RESULT" == "failure" ]]; then
+            echo "> **Status: DEPLOYMENT FAILED** ($DEPLOY_STATUS)" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$DEPLOY_RESULT" == "cancelled" ]]; then
+            echo "> **Status: CANCELLED**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "> **Status: UNKNOWN** ($DEPLOY_RESULT)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | **$COMPONENT** |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | **$ENVIRONMENT** |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | \`$IMAGE_TAG\` |" >> $GITHUB_STEP_SUMMARY
+          if [[ -n "$ECR_REPO" ]]; then
+            echo "| ECR Repository | \`$ECR_REPO\` |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "| Triggered By | \`${{ github.actor }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "### Execution" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Validation | $VALIDATE_RESULT |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployment | $DEPLOY_RESULT |" >> $GITHUB_STEP_SUMMARY
+
+          if [[ -n "$EXECUTION_ARN" ]]; then
+            # Extract execution name from ARN for display
+            EXECUTION_NAME="${EXECUTION_ARN##*:}"
+            # Build Step Functions console URL
+            REGION="${AWS_REGION}"
+            SFN_URL="https://${REGION}.console.aws.amazon.com/states/home?region=${REGION}#/v2/executions/details/${EXECUTION_ARN}"
+            echo "| Execution | [${EXECUTION_NAME}](${SFN_URL}) |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$DEPLOY_RESULT" == "failure" ]]; then
+            echo "### Troubleshooting" >> $GITHUB_STEP_SUMMARY
+            echo "1. Check the [Step Functions execution](${SFN_URL}) for detailed error information" >> $GITHUB_STEP_SUMMARY
+            echo "2. Review CloudWatch logs for the canary Lambda functions" >> $GITHUB_STEP_SUMMARY
+            echo "3. Verify the canary state has been reset to \`idle\` before retrying" >> $GITHUB_STEP_SUMMARY
+          fi

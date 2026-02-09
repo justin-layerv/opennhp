@@ -254,6 +254,12 @@ module "nhp" {
   deployment_stale_threshold_days = var.deployment_stale_threshold_days
   enable_ac_blue_green            = var.enable_ac_blue_green
   ac_green_standby_min_size       = var.ac_green_standby_min_size
+
+  # Canary deployment
+  enable_canary_deployment        = var.enable_canary_deployment
+  canary_checkpoint_percentages   = var.canary_checkpoint_percentages
+  canary_checkpoint_delay_seconds = var.canary_checkpoint_delay_seconds
+  canary_instance_warmup_seconds  = var.canary_instance_warmup_seconds
 }
 
 # ==============================================================================

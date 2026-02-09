@@ -375,6 +375,29 @@ module "monitoring" {
   dynamodb_table_names = module.dynamodb.all_table_names
 }
 
+# Canary Deployment Module - Step Functions-orchestrated progressive rollout
+module "canary_deployment" {
+  source = "./modules/canary-deployment"
+  count  = var.enable_canary_deployment ? 1 : 0
+
+  environment = var.environment
+  name_prefix = local.name_prefix
+  cell_id     = var.cell_id
+  tags        = local.common_tags
+
+  asg_name                = module.compute.asg_name
+  asg_arn                 = module.compute.asg_arn
+  nlb_arn_suffix          = module.compute.nlb_arn_suffix
+  target_group_arn_suffix = module.compute.target_group_arn_suffix
+  alerts_sns_topic_arn    = module.monitoring.sns_topic_arn
+  logs_kms_key_arn        = module.kms.logs_key_arn
+  ssm_image_tag_parameter = module.compute.ssm_image_tag_parameter
+
+  checkpoint_percentages   = var.canary_checkpoint_percentages
+  checkpoint_delay_seconds = var.canary_checkpoint_delay_seconds
+  instance_warmup_seconds  = var.canary_instance_warmup_seconds
+}
+
 # DNS Module - Route 53 records
 module "dns" {
   source = "./modules/dns"

@@ -988,3 +988,31 @@ variable "ac_green_standby_min_size" {
   type    = number
   default = 1
 }
+
+# ==============================================================================
+# Canary Deployment Configuration
+# ==============================================================================
+
+variable "enable_canary_deployment" {
+  description = "Enable Step Functions-based canary deployment for progressive production rollouts"
+  type        = bool
+  default     = false
+}
+
+variable "canary_checkpoint_percentages" {
+  description = "Instance refresh checkpoint percentages for canary stages"
+  type        = list(number)
+  default     = [20, 50, 100]
+}
+
+variable "canary_checkpoint_delay_seconds" {
+  description = "Seconds to observe at each canary checkpoint before auto-resuming"
+  type        = number
+  default     = 300
+}
+
+variable "canary_instance_warmup_seconds" {
+  description = "Instance warmup time in seconds for canary refresh"
+  type        = number
+  default     = 180
+}
