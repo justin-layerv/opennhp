@@ -732,7 +732,7 @@ func (d *e2eForwarderDeps) SendMessage(md *core.MsgData) {
 	d.device.SendMsgToPacket(md)
 }
 
-func (d *e2eForwarderDeps) FindACConnectionForKnock(knkMsg *common.AgentKnockMsg) *ACConn {
+func (d *e2eForwarderDeps) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*ACConn {
 	return nil
 }
 
@@ -747,6 +747,19 @@ func (d *e2eForwarderDeps) ProcessACOperation(
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
 ) (*common.ACOpsResultMsg, error) {
+	return nil, nil
+}
+
+func (d *e2eForwarderDeps) ProcessACOperationBroadcast(
+	knkMsg *common.AgentKnockMsg,
+	conns []*ACConn,
+	srcAddr *common.NetAddress,
+	dstAddrs []*common.NetAddress,
+	openTime uint32,
+) (*common.ACOpsResultMsg, error) {
+	if len(conns) > 0 {
+		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+	}
 	return nil, nil
 }
 
@@ -932,7 +945,7 @@ func (d *capturingForwarderDeps) SendMessage(md *core.MsgData) {
 	// since we're only testing decryption, not the full network round-trip.
 }
 
-func (d *capturingForwarderDeps) FindACConnectionForKnock(knkMsg *common.AgentKnockMsg) *ACConn {
+func (d *capturingForwarderDeps) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*ACConn {
 	return nil
 }
 
@@ -947,6 +960,19 @@ func (d *capturingForwarderDeps) ProcessACOperation(
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
 ) (*common.ACOpsResultMsg, error) {
+	return nil, nil
+}
+
+func (d *capturingForwarderDeps) ProcessACOperationBroadcast(
+	knkMsg *common.AgentKnockMsg,
+	conns []*ACConn,
+	srcAddr *common.NetAddress,
+	dstAddrs []*common.NetAddress,
+	openTime uint32,
+) (*common.ACOpsResultMsg, error) {
+	if len(conns) > 0 {
+		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+	}
 	return nil, nil
 }
 
@@ -1041,15 +1067,17 @@ func (d *mockACForwarderDeps) SendMessage(md *core.MsgData) {
 	}
 }
 
-func (d *mockACForwarderDeps) FindACConnectionForKnock(knkMsg *common.AgentKnockMsg) *ACConn {
+func (d *mockACForwarderDeps) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*ACConn {
 	// Return a minimal ACConn that points to our mock AC
-	return &ACConn{
-		ACId: d.mockACNode.id,
-		ACPeer: &core.UdpPeer{
-			Hostname:     d.mockACNode.id,
-			Ip:           d.mockACNode.addr.IP.String(),
-			Port:         d.mockACNode.addr.Port,
-			PubKeyBase64: d.mockACNode.publicKey,
+	return []*ACConn{
+		{
+			ACId: d.mockACNode.id,
+			ACPeer: &core.UdpPeer{
+				Hostname:     d.mockACNode.id,
+				Ip:           d.mockACNode.addr.IP.String(),
+				Port:         d.mockACNode.addr.Port,
+				PubKeyBase64: d.mockACNode.publicKey,
+			},
 		},
 	}
 }
@@ -1088,14 +1116,14 @@ func (d *mockACForwarderDeps) ProcessACOperation(
 ) (*common.ACOpsResultMsg, error) {
 	// Build the ServerACOpsMsg (same as real server)
 	aopMsg := &common.ServerACOpsMsg{
-		UserId:         knkMsg.UserId,
-		DeviceId:       knkMsg.DeviceId,
-		OrganizationId: knkMsg.OrganizationId,
-		AuthServiceId:  knkMsg.AuthServiceId,
-		ResourceId:     knkMsg.ResourceId,
-		SourceAddrs:    []*common.NetAddress{srcAddr},
+		UserId:           knkMsg.UserId,
+		DeviceId:         knkMsg.DeviceId,
+		OrganizationId:   knkMsg.OrganizationId,
+		AuthServiceId:    knkMsg.AuthServiceId,
+		ResourceId:       knkMsg.ResourceId,
+		SourceAddrs:      []*common.NetAddress{srcAddr},
 		DestinationAddrs: dstAddrs,
-		OpenTime:       openTime,
+		OpenTime:         openTime,
 	}
 	aopBytes, _ := json.Marshal(aopMsg)
 
@@ -1158,6 +1186,19 @@ func (d *mockACForwarderDeps) ProcessACOperation(
 			ErrMsg:  "timeout waiting for AC response",
 		}, nil
 	}
+}
+
+func (d *mockACForwarderDeps) ProcessACOperationBroadcast(
+	knkMsg *common.AgentKnockMsg,
+	conns []*ACConn,
+	srcAddr *common.NetAddress,
+	dstAddrs []*common.NetAddress,
+	openTime uint32,
+) (*common.ACOpsResultMsg, error) {
+	if len(conns) > 0 {
+		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+	}
+	return nil, nil
 }
 
 // TestE2E_HandleForwardRequest_FullACFlow tests the complete forwarding flow
@@ -1390,7 +1431,7 @@ type errorACForwarderDeps struct {
 	errorMsg     string
 }
 
-func (d *errorACForwarderDeps) GetHostname() string { return d.hostname }
+func (d *errorACForwarderDeps) GetHostname() string     { return d.hostname }
 func (d *errorACForwarderDeps) GetDevice() *core.Device { return d.device }
 
 func (d *errorACForwarderDeps) SendMessage(md *core.MsgData) {
@@ -1402,14 +1443,16 @@ func (d *errorACForwarderDeps) SendMessage(md *core.MsgData) {
 	}
 }
 
-func (d *errorACForwarderDeps) FindACConnectionForKnock(knkMsg *common.AgentKnockMsg) *ACConn {
-	return &ACConn{
-		ACId: d.mockACNode.id,
-		ACPeer: &core.UdpPeer{
-			Hostname:     d.mockACNode.id,
-			Ip:           d.mockACNode.addr.IP.String(),
-			Port:         d.mockACNode.addr.Port,
-			PubKeyBase64: d.mockACNode.publicKey,
+func (d *errorACForwarderDeps) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*ACConn {
+	return []*ACConn{
+		{
+			ACId: d.mockACNode.id,
+			ACPeer: &core.UdpPeer{
+				Hostname:     d.mockACNode.id,
+				Ip:           d.mockACNode.addr.IP.String(),
+				Port:         d.mockACNode.addr.Port,
+				PubKeyBase64: d.mockACNode.publicKey,
+			},
 		},
 	}
 }
@@ -1447,6 +1490,19 @@ func (d *errorACForwarderDeps) ProcessACOperation(
 		ErrCode: d.errorCode,
 		ErrMsg:  d.errorMsg,
 	}, nil
+}
+
+func (d *errorACForwarderDeps) ProcessACOperationBroadcast(
+	knkMsg *common.AgentKnockMsg,
+	conns []*ACConn,
+	srcAddr *common.NetAddress,
+	dstAddrs []*common.NetAddress,
+	openTime uint32,
+) (*common.ACOpsResultMsg, error) {
+	if len(conns) > 0 {
+		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+	}
+	return nil, nil
 }
 
 func TestE2E_HandleForwardRequest_ACReturnsError(t *testing.T) {
@@ -1556,7 +1612,7 @@ type timeoutACForwarderDeps struct {
 	t            *testing.T
 }
 
-func (d *timeoutACForwarderDeps) GetHostname() string { return d.hostname }
+func (d *timeoutACForwarderDeps) GetHostname() string     { return d.hostname }
 func (d *timeoutACForwarderDeps) GetDevice() *core.Device { return d.device }
 
 func (d *timeoutACForwarderDeps) SendMessage(md *core.MsgData) {
@@ -1568,14 +1624,16 @@ func (d *timeoutACForwarderDeps) SendMessage(md *core.MsgData) {
 	}
 }
 
-func (d *timeoutACForwarderDeps) FindACConnectionForKnock(knkMsg *common.AgentKnockMsg) *ACConn {
-	return &ACConn{
-		ACId: d.mockACNode.id,
-		ACPeer: &core.UdpPeer{
-			Hostname:     d.mockACNode.id,
-			Ip:           d.mockACNode.addr.IP.String(),
-			Port:         d.mockACNode.addr.Port,
-			PubKeyBase64: d.mockACNode.publicKey,
+func (d *timeoutACForwarderDeps) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*ACConn {
+	return []*ACConn{
+		{
+			ACId: d.mockACNode.id,
+			ACPeer: &core.UdpPeer{
+				Hostname:     d.mockACNode.id,
+				Ip:           d.mockACNode.addr.IP.String(),
+				Port:         d.mockACNode.addr.Port,
+				PubKeyBase64: d.mockACNode.publicKey,
+			},
 		},
 	}
 }
@@ -1615,6 +1673,19 @@ func (d *timeoutACForwarderDeps) ProcessACOperation(
 		ErrCode: "AC_TIMEOUT",
 		ErrMsg:  "AC did not respond in time",
 	}, nil
+}
+
+func (d *timeoutACForwarderDeps) ProcessACOperationBroadcast(
+	knkMsg *common.AgentKnockMsg,
+	conns []*ACConn,
+	srcAddr *common.NetAddress,
+	dstAddrs []*common.NetAddress,
+	openTime uint32,
+) (*common.ACOpsResultMsg, error) {
+	if len(conns) > 0 {
+		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+	}
+	return nil, nil
 }
 
 func TestE2E_HandleForwardRequest_ACTimeout(t *testing.T) {

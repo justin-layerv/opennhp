@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -227,7 +228,7 @@ func TestACConnectionCleanup_OnReregistration(t *testing.T) {
 	s := &UdpServer{
 		device:              device,
 		acPeerMap:           make(map[string]*core.UdpPeer),
-		acConnectionMap:     make(map[string]*ACConn),
+		acConnectionMap:     make(map[string][]*ACConn),
 		remoteConnectionMap: make(map[string]*UdpConn),
 	}
 
@@ -257,7 +258,7 @@ func TestACConnectionCleanup_OnReregistration(t *testing.T) {
 	}
 
 	// Store old connection in both maps
-	s.acConnectionMap[acId] = oldACConn
+	s.acConnectionMap[acId] = []*ACConn{oldACConn}
 	s.remoteConnectionMap[oldRemoteAddr.String()] = oldUdpConn
 
 	// Verify old connection is stored
@@ -287,25 +288,38 @@ func TestACConnectionCleanup_OnReregistration(t *testing.T) {
 		ACId:     acId,
 	}
 
-	// Simulate the cleanup logic from HandleACOnline (using address comparison)
+	// Simulate the cleanup logic from HandleACOnline (same IP, different port → update in-place)
 	s.acConnectionMapMutex.Lock()
-	if oldConn, exists := s.acConnectionMap[acId]; exists {
-		oldAddrStr := oldConn.ConnData.RemoteAddr.String()
-		newAddrStr := newConnData.RemoteAddr.String()
-		if oldAddrStr != newAddrStr {
-			s.acConnectionMapMutex.Unlock()
-
-			s.remoteConnectionMapMutex.Lock()
-			if _, found := s.remoteConnectionMap[oldAddrStr]; found {
-				delete(s.remoteConnectionMap, oldAddrStr)
+	existingConns := s.acConnectionMap[acId]
+	var staleConn *ACConn
+	updated := false
+	for i, existing := range existingConns {
+		if existing.ConnData.RemoteAddr.IP.Equal(newConnData.RemoteAddr.IP) {
+			oldAddr := existing.ConnData.RemoteAddr.String()
+			newAddr := newConnData.RemoteAddr.String()
+			if oldAddr != newAddr {
+				staleConn = existing
 			}
-			s.remoteConnectionMapMutex.Unlock()
-
-			s.acConnectionMapMutex.Lock()
+			existingConns[i] = newACConn
+			updated = true
+			break
 		}
 	}
-	s.acConnectionMap[acId] = newACConn
+	if !updated {
+		existingConns = append(existingConns, newACConn)
+	}
+	s.acConnectionMap[acId] = existingConns
 	s.acConnectionMapMutex.Unlock()
+
+	// Clean up stale connection
+	if staleConn != nil {
+		oldAddrStr := staleConn.ConnData.RemoteAddr.String()
+		s.remoteConnectionMapMutex.Lock()
+		if _, found := s.remoteConnectionMap[oldAddrStr]; found {
+			delete(s.remoteConnectionMap, oldAddrStr)
+		}
+		s.remoteConnectionMapMutex.Unlock()
+	}
 
 	// Verify: old connection should be removed from remoteConnectionMap
 	if _, exists := s.remoteConnectionMap[oldRemoteAddr.String()]; exists {
@@ -313,15 +327,16 @@ func TestACConnectionCleanup_OnReregistration(t *testing.T) {
 	}
 
 	// Verify: new AC connection should be stored
-	if storedConn, exists := s.acConnectionMap[acId]; !exists {
+	conns, exists := s.acConnectionMap[acId]
+	if !exists || len(conns) == 0 {
 		t.Error("New AC connection should be stored in acConnectionMap")
-	} else if storedConn.ConnData.RemoteAddr.Port != 38229 {
-		t.Errorf("Expected new connection port 38229, got %d", storedConn.ConnData.RemoteAddr.Port)
+	} else if conns[0].ConnData.RemoteAddr.Port != 38229 {
+		t.Errorf("Expected new connection port 38229, got %d", conns[0].ConnData.RemoteAddr.Port)
 	}
 
-	// Verify: only 1 AC connection exists (no duplicates)
-	if len(s.acConnectionMap) != 1 {
-		t.Errorf("Expected exactly 1 AC connection after re-registration, got %d", len(s.acConnectionMap))
+	// Verify: only 1 AC connection exists for this ID (same IP = update in-place)
+	if len(conns) != 1 {
+		t.Errorf("Expected exactly 1 AC connection after re-registration from same IP, got %d", len(conns))
 	}
 }
 
@@ -371,7 +386,7 @@ func TestACConnectionCleanup_SameConnection(t *testing.T) {
 	s := &UdpServer{
 		device:              device,
 		acPeerMap:           make(map[string]*core.UdpPeer),
-		acConnectionMap:     make(map[string]*ACConn),
+		acConnectionMap:     make(map[string][]*ACConn),
 		remoteConnectionMap: make(map[string]*UdpConn),
 	}
 
@@ -401,24 +416,217 @@ func TestACConnectionCleanup_SameConnection(t *testing.T) {
 	}
 
 	// Store connection
-	s.acConnectionMap[acId] = acConn
+	s.acConnectionMap[acId] = []*ACConn{acConn}
 	s.remoteConnectionMap[remoteAddr.String()] = udpConn
 
-	// Simulate re-registration from SAME connection (same address)
+	// Simulate re-registration from SAME connection (same IP, same port → update in-place, no stale conn)
 	s.acConnectionMapMutex.Lock()
-	if oldConn, exists := s.acConnectionMap[acId]; exists {
-		oldAddrStr := oldConn.ConnData.RemoteAddr.String()
-		newAddrStr := connData.RemoteAddr.String()
-		// Same address - should NOT clean up
-		if oldAddrStr != newAddrStr {
-			t.Error("Same address should not trigger cleanup")
+	existingConns := s.acConnectionMap[acId]
+	var staleConn *ACConn
+	for i, existing := range existingConns {
+		if existing.ConnData.RemoteAddr.IP.Equal(connData.RemoteAddr.IP) {
+			oldAddr := existing.ConnData.RemoteAddr.String()
+			newAddr := connData.RemoteAddr.String()
+			if oldAddr != newAddr {
+				staleConn = existing
+			}
+			existingConns[i] = acConn
+			break
 		}
 	}
-	s.acConnectionMap[acId] = acConn
+	s.acConnectionMap[acId] = existingConns
 	s.acConnectionMapMutex.Unlock()
+
+	// Same address → no stale connection to clean up
+	if staleConn != nil {
+		t.Error("Same address should not produce a stale connection")
+	}
 
 	// Verify: connection should still exist in remoteConnectionMap
 	if _, exists := s.remoteConnectionMap[remoteAddr.String()]; !exists {
 		t.Error("Connection should NOT be removed when re-registering from same connection")
+	}
+}
+
+// TestMultiACRegistration tests that multiple ACs with the same AC ID but
+// different IPs are stored as separate entries (blue/green deployment).
+func TestMultiACRegistration(t *testing.T) {
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	s := &UdpServer{
+		device:              device,
+		acPeerMap:           make(map[string]*core.UdpPeer),
+		acConnectionMap:     make(map[string][]*ACConn),
+		remoteConnectionMap: make(map[string]*UdpConn),
+	}
+
+	acId := "test-ac"
+
+	// Register first AC instance (blue) from IP 10.0.0.1
+	blueAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 47051}
+	blueConnData := &core.ConnectionData{RemoteAddr: blueAddr}
+	bluePeer := &core.UdpPeer{Ip: "10.0.0.1", Port: 47051, PubKeyBase64: "Ymx1ZQ=="}
+	bluePeer.Type = core.NHP_AC
+	bluePeer.UpdateRecv(time.Now().UnixNano(), blueAddr)
+	blueACConn := &ACConn{ConnData: blueConnData, ACPeer: bluePeer, ACId: acId}
+
+	s.acConnectionMapMutex.Lock()
+	s.acConnectionMap[acId] = append(s.acConnectionMap[acId], blueACConn)
+	s.acConnectionMapMutex.Unlock()
+
+	// Register second AC instance (green) from IP 10.0.0.2
+	greenAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 47051}
+	greenConnData := &core.ConnectionData{RemoteAddr: greenAddr}
+	greenPeer := &core.UdpPeer{Ip: "10.0.0.2", Port: 47051, PubKeyBase64: "Z3JlZW4="}
+	greenPeer.Type = core.NHP_AC
+	greenPeer.UpdateRecv(time.Now().UnixNano(), greenAddr)
+	greenACConn := &ACConn{ConnData: greenConnData, ACPeer: greenPeer, ACId: acId}
+
+	// Simulate the new registration logic: different IP → append
+	s.acConnectionMapMutex.Lock()
+	existingConns := s.acConnectionMap[acId]
+	found := false
+	for _, existing := range existingConns {
+		if existing.ConnData.RemoteAddr.IP.Equal(greenConnData.RemoteAddr.IP) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		existingConns = append(existingConns, greenACConn)
+	}
+	s.acConnectionMap[acId] = existingConns
+	s.acConnectionMapMutex.Unlock()
+
+	// Verify both connections are stored
+	conns := s.acConnectionMap[acId]
+	if len(conns) != 2 {
+		t.Fatalf("Expected 2 AC connections for same AC ID (blue/green), got %d", len(conns))
+	}
+
+	// Verify they have different IPs
+	ip1 := conns[0].ConnData.RemoteAddr.IP.String()
+	ip2 := conns[1].ConnData.RemoteAddr.IP.String()
+	if ip1 == ip2 {
+		t.Errorf("Expected different IPs for blue/green, both are %s", ip1)
+	}
+
+	t.Logf("Multi-AC registration: blue=%s, green=%s", ip1, ip2)
+}
+
+// TestMultiACConnectionTimeout tests that connection timeout cleanup removes
+// only the matching entry from the slice, not the entire AC ID key.
+func TestMultiACConnectionTimeout(t *testing.T) {
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	s := &UdpServer{
+		device:              device,
+		acPeerMap:           make(map[string]*core.UdpPeer),
+		acConnectionMap:     make(map[string][]*ACConn),
+		remoteConnectionMap: make(map[string]*UdpConn),
+	}
+
+	acId := "test-ac"
+
+	// Create two AC connections (blue and green)
+	blueAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 47051}
+	blueConnData := &core.ConnectionData{RemoteAddr: blueAddr}
+	blueACConn := &ACConn{ConnData: blueConnData, ACId: acId}
+
+	greenAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 47051}
+	greenConnData := &core.ConnectionData{RemoteAddr: greenAddr}
+	greenACConn := &ACConn{ConnData: greenConnData, ACId: acId}
+
+	s.acConnectionMap[acId] = []*ACConn{blueACConn, greenACConn}
+
+	// Simulate blue connection timing out (connectionRoutine cleanup)
+	blueUdpConn := &UdpConn{ConnData: blueConnData, isACConnection: true}
+
+	s.acConnectionMapMutex.Lock()
+	for acIdKey, conns := range s.acConnectionMap {
+		for i, acConn := range conns {
+			if acConn.ConnData.Equal(blueUdpConn.ConnData) {
+				s.acConnectionMap[acIdKey] = append(conns[:i], conns[i+1:]...)
+				if len(s.acConnectionMap[acIdKey]) == 0 {
+					delete(s.acConnectionMap, acIdKey)
+				}
+				break
+			}
+		}
+	}
+	s.acConnectionMapMutex.Unlock()
+
+	// Verify: green connection should still be there
+	conns, exists := s.acConnectionMap[acId]
+	if !exists {
+		t.Fatal("AC ID key should still exist after removing one of two connections")
+	}
+	if len(conns) != 1 {
+		t.Fatalf("Expected 1 remaining connection, got %d", len(conns))
+	}
+	if !conns[0].ConnData.RemoteAddr.IP.Equal(net.ParseIP("10.0.0.2")) {
+		t.Errorf("Expected green connection (10.0.0.2) to remain, got %s", conns[0].ConnData.RemoteAddr.IP)
+	}
+}
+
+// TestMaxACConnsPerID tests that the cap on connections per AC ID works correctly.
+func TestMaxACConnsPerID(t *testing.T) {
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	s := &UdpServer{
+		device:              device,
+		acPeerMap:           make(map[string]*core.UdpPeer),
+		acConnectionMap:     make(map[string][]*ACConn),
+		remoteConnectionMap: make(map[string]*UdpConn),
+	}
+
+	acId := "test-ac"
+	const maxConns = 10
+
+	// Register maxConns AC instances
+	for i := 0; i < maxConns; i++ {
+		addr := &net.UDPAddr{IP: net.ParseIP(fmt.Sprintf("10.0.0.%d", i+1)), Port: 47051}
+		connData := &core.ConnectionData{RemoteAddr: addr}
+		acConn := &ACConn{ConnData: connData, ACId: acId}
+		s.acConnectionMap[acId] = append(s.acConnectionMap[acId], acConn)
+	}
+
+	if len(s.acConnectionMap[acId]) != maxConns {
+		t.Fatalf("Expected %d connections, got %d", maxConns, len(s.acConnectionMap[acId]))
+	}
+
+	// Register one more (should evict oldest)
+	newAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.1"), Port: 47051}
+	newConnData := &core.ConnectionData{RemoteAddr: newAddr}
+	newACConn := &ACConn{ConnData: newConnData, ACId: acId}
+
+	existingConns := s.acConnectionMap[acId]
+	if len(existingConns) >= maxConns {
+		existingConns = existingConns[1:] // evict oldest
+	}
+	existingConns = append(existingConns, newACConn)
+	s.acConnectionMap[acId] = existingConns
+
+	// Verify count stays at max
+	if len(s.acConnectionMap[acId]) != maxConns {
+		t.Errorf("Expected %d connections after cap eviction, got %d", maxConns, len(s.acConnectionMap[acId]))
+	}
+
+	// Verify newest is the last entry
+	lastConn := s.acConnectionMap[acId][maxConns-1]
+	if !lastConn.ConnData.RemoteAddr.IP.Equal(net.ParseIP("10.0.1.1")) {
+		t.Errorf("Expected newest connection (10.0.1.1) as last entry, got %s", lastConn.ConnData.RemoteAddr.IP)
 	}
 }

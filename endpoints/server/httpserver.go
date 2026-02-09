@@ -467,9 +467,14 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 		}
 		acId := resInfo.ACId
 		s.acConnectionMapMutex.Lock()
-		acConn, found := s.acConnectionMap[acId]
+		acConns, found := s.acConnectionMap[acId]
+		var connsCopy []*ACConn
+		if found {
+			connsCopy = make([]*ACConn, len(acConns))
+			copy(connsCopy, acConns)
+		}
 		s.acConnectionMapMutex.Unlock()
-		if !found {
+		if !found || len(connsCopy) == 0 {
 			log.Warning("httpserver-agent(%s#%s@%s)-ac(@%s)[HandleHttpKnockRequest] no ac connection is available", knkMsg.UserId, knkMsg.DeviceId, srcIp, acId)
 			artMsg := &common.ACOpsResultMsg{}
 			err = common.ErrACConnectionNotFound
@@ -489,7 +494,7 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 			if knkMsg.HeaderType == core.NHP_EXT {
 				openTime = 1 // timeout in 1 second
 			}
-			artMsg, err := s.processACOperation(knkMsg, acConn, srcAddr, dstAddrs, openTime)
+			artMsg, err := s.processACOperationBroadcast(knkMsg, connsCopy, srcAddr, dstAddrs, openTime)
 			artMsgsMutex.Lock()
 			artMsgs[name] = artMsg
 			if err == nil {

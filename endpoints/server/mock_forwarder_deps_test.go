@@ -10,7 +10,7 @@ type MockForwarderDeps struct {
 	hostname      string
 	device        *core.Device
 	sendCh        chan *core.MsgData
-	acConn        *ACConn
+	acConns       []*ACConn
 	aspData       *common.AuthServiceProviderData
 	processResult *common.ACOpsResultMsg
 	processErr    error
@@ -38,8 +38,8 @@ func (m *MockForwarderDeps) SendMessage(md *core.MsgData) {
 	}
 }
 
-func (m *MockForwarderDeps) FindACConnectionForKnock(knkMsg *common.AgentKnockMsg) *ACConn {
-	return m.acConn
+func (m *MockForwarderDeps) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*ACConn {
+	return m.acConns
 }
 
 func (m *MockForwarderDeps) FindAuthSvcProvider(authSvcId string) *common.AuthServiceProviderData {
@@ -56,6 +56,19 @@ func (m *MockForwarderDeps) ProcessACOperation(
 	return m.processResult, m.processErr
 }
 
+func (m *MockForwarderDeps) ProcessACOperationBroadcast(
+	knkMsg *common.AgentKnockMsg,
+	conns []*ACConn,
+	srcAddr *common.NetAddress,
+	dstAddrs []*common.NetAddress,
+	openTime uint32,
+) (*common.ACOpsResultMsg, error) {
+	if len(conns) > 0 {
+		return m.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+	}
+	return m.processResult, m.processErr
+}
+
 // SetHostname sets the hostname for testing.
 func (m *MockForwarderDeps) SetHostname(hostname string) {
 	m.hostname = hostname
@@ -66,9 +79,13 @@ func (m *MockForwarderDeps) SetDevice(device *core.Device) {
 	m.device = device
 }
 
-// SetACConnection sets the AC connection to return.
+// SetACConnection sets the AC connections to return.
 func (m *MockForwarderDeps) SetACConnection(acConn *ACConn) {
-	m.acConn = acConn
+	if acConn != nil {
+		m.acConns = []*ACConn{acConn}
+	} else {
+		m.acConns = nil
+	}
 }
 
 // SetAuthServiceProvider sets the auth service provider to return.

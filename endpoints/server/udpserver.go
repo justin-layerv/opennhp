@@ -57,7 +57,7 @@ type UdpServer struct {
 	agentPeerMap      map[string]*core.UdpPeer // indexed by peer's public key base64 string
 
 	acConnectionMapMutex sync.Mutex
-	acConnectionMap      map[string]*ACConn // ac connection is indexed by remote IP address
+	acConnectionMap      map[string][]*ACConn // ac connections indexed by AC ID, multiple per ID for blue/green
 
 	acPeerMapMutex sync.Mutex
 	acPeerMap      map[string]*core.UdpPeer // indexed by peer's public key base64 string
@@ -330,7 +330,7 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	}
 
 	s.remoteConnectionMap = make(map[string]*UdpConn)
-	s.acConnectionMap = make(map[string]*ACConn)
+	s.acConnectionMap = make(map[string][]*ACConn)
 	s.dbConnectionMap = make(map[string]*DBConn)
 	s.tokenStore = common.NewTokenStore[*ACTokenEntry]()
 	s.blockAddrMap = make(map[string]*BlockAddr)
@@ -661,15 +661,21 @@ func (s *UdpServer) connectionRoutine(conn *UdpConn) {
 		// and it may come with the same remote ip but a different remote port
 		// so make sure the timeout removal here does not delete newer ac connections
 		if conn.isACConnection {
-			var acToDelete string
 			s.acConnectionMapMutex.Lock()
-			for acId, acConn := range s.acConnectionMap {
-				if acConn.ConnData.Equal(conn.ConnData) {
-					acToDelete = acId
-					break
+		acCleanup:
+			for acId, conns := range s.acConnectionMap {
+				for i, acConn := range conns {
+					if acConn.ConnData.Equal(conn.ConnData) {
+						// Safe to modify conns here because we break out of both
+						// loops immediately via the labeled break.
+						s.acConnectionMap[acId] = append(conns[:i], conns[i+1:]...)
+						if len(s.acConnectionMap[acId]) == 0 {
+							delete(s.acConnectionMap, acId)
+						}
+						break acCleanup
+					}
 				}
 			}
-			delete(s.acConnectionMap, acToDelete)
 			s.acConnectionMapMutex.Unlock()
 		}
 
@@ -1171,6 +1177,50 @@ func (s *UdpServer) processACOperation(knkMsg *common.AgentKnockMsg, conn *ACCon
 	return artMsg, nil
 }
 
+// processACOperationBroadcast sends NHP-AOP to all AC connections in parallel.
+// Returns the first successful result. If all fail, returns the last error.
+// This supports blue/green deployments where multiple ACs register with the same AC ID.
+func (s *UdpServer) processACOperationBroadcast(
+	knkMsg *common.AgentKnockMsg,
+	conns []*ACConn,
+	srcAddr *common.NetAddress,
+	dstAddrs []*common.NetAddress,
+	openTime uint32,
+) (*common.ACOpsResultMsg, error) {
+	if len(conns) == 1 {
+		return s.processACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+	}
+
+	log.Info("server-agent(%s@%s)[processACOperationBroadcast] broadcasting to %d ACs", knkMsg.UserId, srcAddr.String(), len(conns))
+
+	type result struct {
+		artMsg *common.ACOpsResultMsg
+		err    error
+		acAddr string
+	}
+	results := make(chan result, len(conns))
+	for _, conn := range conns {
+		go func(c *ACConn) {
+			artMsg, err := s.processACOperation(knkMsg, c, srcAddr, dstAddrs, openTime)
+			results <- result{artMsg, err, c.ACPeer.RecvAddr().String()}
+		}(conn)
+	}
+
+	var lastErr error
+	var lastArtMsg *common.ACOpsResultMsg
+	for i := 0; i < len(conns); i++ {
+		r := <-results
+		if r.err == nil {
+			log.Info("server-agent(%s@%s)[processACOperationBroadcast] AC at %s succeeded", knkMsg.UserId, srcAddr.String(), r.acAddr)
+			return r.artMsg, nil
+		}
+		lastErr = r.err
+		lastArtMsg = r.artMsg
+	}
+	log.Warning("server-agent(%s@%s)[processACOperationBroadcast] all %d ACs failed", knkMsg.UserId, srcAddr.String(), len(conns))
+	return lastArtMsg, lastErr
+}
+
 func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *common.ResourceData) (ackMsg *common.ServerKnockAckMsg, err error) {
 	knkMsg := req.Msg
 	srcAddr := req.SrcAddr
@@ -1198,9 +1248,9 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 			continue
 		}
 		s.acConnectionMapMutex.Lock()
-		_, found := s.acConnectionMap[resInfo.ACId]
+		conns, found := s.acConnectionMap[resInfo.ACId]
 		s.acConnectionMapMutex.Unlock()
-		if !found {
+		if !found || len(conns) == 0 {
 			needsForwarding = true
 			forwardACId = resInfo.ACId
 			break
@@ -1261,9 +1311,14 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 		}
 		acId := resInfo.ACId
 		s.acConnectionMapMutex.Lock()
-		acConn, found := s.acConnectionMap[acId]
+		acConns, found := s.acConnectionMap[acId]
+		var connsCopy []*ACConn
+		if found {
+			connsCopy = make([]*ACConn, len(acConns))
+			copy(connsCopy, acConns)
+		}
 		s.acConnectionMapMutex.Unlock()
-		if !found {
+		if !found || len(connsCopy) == 0 {
 			log.Warning("server-agent(%s@%s)-ac(@%s)[handleNhpOpenResource] no ac connection is available", knkMsg.UserId, addrStr, acId)
 			artMsg := &common.ACOpsResultMsg{}
 			err = common.ErrACConnectionNotFound
@@ -1283,7 +1338,7 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 			if knkMsg.HeaderType == core.NHP_EXT {
 				openTime = 1 // timeout in 1 second
 			}
-			artMsg, err := s.processACOperation(knkMsg, acConn, srcAddr, dstAddrs, openTime)
+			artMsg, err := s.processACOperationBroadcast(knkMsg, connsCopy, srcAddr, dstAddrs, openTime)
 			artMsgsMutex.Lock()
 			artMsgs[name] = artMsg
 			if err == nil {
@@ -1435,41 +1490,47 @@ func (s *UdpServer) ProcessDataPrivateKeyWrapping(dwrMsg *common.DWRMsg, conn *D
 	return dwaMsg, nil
 }
 
-// FindACConnectionForKnock finds the AC connection for a given knock message.
+// FindACConnectionsForKnock finds all AC connections for a given knock message.
 // This looks up the AC ID from the auth service provider's resource info
-// and returns the corresponding AC connection if found.
-func (s *UdpServer) FindACConnectionForKnock(knkMsg *common.AgentKnockMsg) *ACConn {
+// and returns all corresponding AC connections if found.
+// Multiple connections exist when blue/green ACs register with the same AC ID.
+func (s *UdpServer) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*ACConn {
 	// Find the auth service provider
 	aspData := s.FindAuthSvcProvider(knkMsg.AuthServiceId)
 	if aspData == nil {
-		log.Debug("FindACConnectionForKnock: ASP not found for %s", knkMsg.AuthServiceId)
+		log.Debug("FindACConnectionsForKnock: ASP not found for %s", knkMsg.AuthServiceId)
 		return nil
 	}
 
 	// Find the resource to get the AC ID
 	resInfo := aspData.FindResource(knkMsg.ResourceId)
 	if resInfo == nil {
-		log.Debug("FindACConnectionForKnock: Resource %s not found in ASP %s", knkMsg.ResourceId, knkMsg.AuthServiceId)
+		log.Debug("FindACConnectionsForKnock: Resource %s not found in ASP %s", knkMsg.ResourceId, knkMsg.AuthServiceId)
 		return nil
 	}
 
 	acId := resInfo.ACId
 	if acId == "" {
-		log.Debug("FindACConnectionForKnock: Resource %s has no AC ID", knkMsg.ResourceId)
+		log.Debug("FindACConnectionsForKnock: Resource %s has no AC ID", knkMsg.ResourceId)
 		return nil
 	}
 
-	// Look up the AC connection
+	// Look up all AC connections
 	s.acConnectionMapMutex.Lock()
-	acConn, found := s.acConnectionMap[acId]
+	conns, found := s.acConnectionMap[acId]
+	var result []*ACConn
+	if found {
+		result = make([]*ACConn, len(conns))
+		copy(result, conns)
+	}
 	s.acConnectionMapMutex.Unlock()
 
-	if !found {
-		log.Debug("FindACConnectionForKnock: AC %s not connected", acId)
+	if !found || len(result) == 0 {
+		log.Debug("FindACConnectionsForKnock: AC %s not connected", acId)
 		return nil
 	}
 
-	return acConn
+	return result
 }
 
 // ============================================================================
@@ -1500,4 +1561,15 @@ func (s *UdpServer) ProcessACOperation(
 	openTime uint32,
 ) (*common.ACOpsResultMsg, error) {
 	return s.processACOperation(knkMsg, acConn, srcAddr, dstAddrs, openTime)
+}
+
+// ProcessACOperationBroadcast wraps the internal processACOperationBroadcast method.
+func (s *UdpServer) ProcessACOperationBroadcast(
+	knkMsg *common.AgentKnockMsg,
+	conns []*ACConn,
+	srcAddr *common.NetAddress,
+	dstAddrs []*common.NetAddress,
+	openTime uint32,
+) (*common.ACOpsResultMsg, error) {
+	return s.processACOperationBroadcast(knkMsg, conns, srcAddr, dstAddrs, openTime)
 }

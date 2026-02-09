@@ -28,8 +28,9 @@ type ForwarderDeps interface {
 	// SendMessage queues a message for sending via the server's send channel.
 	SendMessage(md *core.MsgData)
 
-	// FindACConnectionForKnock finds the AC connection that can handle a knock.
-	FindACConnectionForKnock(knkMsg *common.AgentKnockMsg) *ACConn
+	// FindACConnectionsForKnock finds all AC connections that can handle a knock.
+	// Returns multiple connections when blue/green ACs register with the same AC ID.
+	FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*ACConn
 
 	// FindAuthSvcProvider finds the auth service provider by ID.
 	FindAuthSvcProvider(authSvcId string) *common.AuthServiceProviderData
@@ -38,6 +39,16 @@ type ForwarderDeps interface {
 	ProcessACOperation(
 		knkMsg *common.AgentKnockMsg,
 		acConn *ACConn,
+		srcAddr *common.NetAddress,
+		dstAddrs []*common.NetAddress,
+		openTime uint32,
+	) (*common.ACOpsResultMsg, error)
+
+	// ProcessACOperationBroadcast sends AOP to all AC connections in parallel.
+	// Returns the first successful result.
+	ProcessACOperationBroadcast(
+		knkMsg *common.AgentKnockMsg,
+		conns []*ACConn,
 		srcAddr *common.NetAddress,
 		dstAddrs []*common.NetAddress,
 		openTime uint32,

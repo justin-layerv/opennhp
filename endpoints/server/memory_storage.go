@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -491,8 +492,8 @@ func CreateTestACAssignment(acID string, serverIDs ...string) *ACAssignment {
 	for i, id := range serverIDs {
 		servers[i] = ServerInfo{
 			ID:         id,
-			IP:         "10.0.0." + string(rune('1'+i)),
-			InternalIP: "192.168.0." + string(rune('1'+i)),
+			IP:         fmt.Sprintf("10.0.0.%d", i+1),
+			InternalIP: fmt.Sprintf("192.168.0.%d", i+1),
 			AZ:         "us-east-2" + string(rune('a'+i)),
 			Port:       62206,
 			PubKey:     "test-pubkey-" + id,

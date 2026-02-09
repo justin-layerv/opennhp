@@ -41,3 +41,11 @@ CVE-2025-61726
 # Go stdlib - archive/zip CPU exhaustion
 # https://avd.aquasec.com/nvd/cve-2025-61728
 CVE-2025-61728
+
+# Go stdlib - crypto/tls session resumption issue
+# https://avd.aquasec.com/nvd/cve-2025-68121
+CVE-2025-68121
+
+# Go stdlib - TLS 1.3 handshake issue
+# https://avd.aquasec.com/nvd/cve-2025-61730
+CVE-2025-61730

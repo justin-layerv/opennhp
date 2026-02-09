@@ -3,6 +3,7 @@ package server
 import "github.com/OpenNHP/opennhp/nhp/common"
 
 const (
+	MaxACConnsPerID                 = 10 // max AC connections per AC ID (blue/green)
 	MaxConcurrentConnection         = 20480
 	OverloadConnectionThreshold     = MaxConcurrentConnection * 4 / 5      // 80%
 	BlockAddrRefreshRate            = 20                                   // 20 seconds

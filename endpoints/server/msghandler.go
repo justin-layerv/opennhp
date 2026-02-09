@@ -304,48 +304,58 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		Apps:           aolMsg.ResourceIds,
 	}
 
-	// Clean up any stale connection for this AC before storing the new one.
-	// This handles the case where an AC re-registers from a different source port
-	// (e.g., after socket recreation, network change, or AC restart).
-	// Without cleanup, the server may use stale connections for knock operations.
+	// Register the AC connection, supporting multiple ACs with the same AC ID (blue/green).
+	// If the same IP re-registers (e.g., socket recreation), update in-place.
+	// If a new IP registers, append (different AC instance with same AC ID).
 	s.acConnectionMapMutex.Lock()
-	if oldACConn, exists := s.acConnectionMap[acId]; exists {
-		oldAddrStr := oldACConn.ConnData.RemoteAddr.String()
-		newAddrStr := ppd.ConnData.RemoteAddr.String()
-		// Only cleanup if this is actually a different connection (different remote address)
-		if oldAddrStr != newAddrStr {
-			log.Info("server-ac(%s#%d@%s)[HandleACOnline] Cleaning up stale connection from %s",
-				acId, transactionId, addrStr, oldAddrStr)
+	existingConns := s.acConnectionMap[acId]
 
-			// Remove old connection from remoteConnectionMap.
-			// Must release acConnectionMapMutex first to avoid deadlock (lock ordering).
-			//
-			// NOTE: There is a brief window here where another goroutine could modify
-			// acConnectionMap[acId]. This is acceptable because:
-			// 1. Concurrent re-registration from the same AC is rare (requires two AOL
-			//    messages in rapid succession from the same AC instance)
-			// 2. The final write (s.acConnectionMap[acId] = acConn) always wins,
-			//    ensuring the newest connection is stored
-			// 3. The cleanup uses oldAddrStr (a copied string), so it's safe even if
-			//    acConnectionMap is modified
-			s.acConnectionMapMutex.Unlock()
-
-			s.remoteConnectionMapMutex.Lock()
-			if oldUdpConn, found := s.remoteConnectionMap[oldAddrStr]; found {
-				delete(s.remoteConnectionMap, oldAddrStr)
-				log.Debug("server-ac(%s)[HandleACOnline] Removed stale UdpConn from remoteConnectionMap: %s",
-					acId, oldAddrStr)
-				// Close the old connection outside the lock
-				go oldUdpConn.Close()
+	updated := false
+	var staleConn *ACConn
+	for i, existing := range existingConns {
+		if existing.ConnData.RemoteAddr.IP.Equal(ppd.ConnData.RemoteAddr.IP) {
+			// Same IP, possibly different port → re-registration (e.g., socket recreation)
+			oldAddr := existing.ConnData.RemoteAddr.String()
+			newAddr := ppd.ConnData.RemoteAddr.String()
+			if oldAddr != newAddr {
+				staleConn = existing
+				log.Info("server-ac(%s#%d@%s)[HandleACOnline] Updating connection from %s (same IP, new port)",
+					acId, transactionId, addrStr, oldAddr)
 			}
-			s.remoteConnectionMapMutex.Unlock()
-
-			// Re-acquire acConnectionMapMutex to store new connection
-			s.acConnectionMapMutex.Lock()
+			existingConns[i] = acConn
+			updated = true
+			break
 		}
 	}
-	s.acConnectionMap[acId] = acConn
+
+	if !updated {
+		// New IP → different AC instance with same AC ID (blue/green)
+		log.Info("server-ac(%s#%d@%s)[HandleACOnline] New AC instance registered (total: %d)",
+			acId, transactionId, addrStr, len(existingConns)+1)
+		if len(existingConns) >= MaxACConnsPerID {
+			staleConn = existingConns[0]
+			existingConns = existingConns[1:]
+			log.Warning("server-ac(%s)[HandleACOnline] Max connections per AC ID reached (%d), evicting oldest",
+				acId, MaxACConnsPerID)
+		}
+		existingConns = append(existingConns, acConn)
+	}
+
+	s.acConnectionMap[acId] = existingConns
 	s.acConnectionMapMutex.Unlock()
+
+	// Clean up stale connection outside the lock (if any)
+	if staleConn != nil {
+		oldAddrStr := staleConn.ConnData.RemoteAddr.String()
+		s.remoteConnectionMapMutex.Lock()
+		if oldUdpConn, found := s.remoteConnectionMap[oldAddrStr]; found {
+			delete(s.remoteConnectionMap, oldAddrStr)
+			log.Debug("server-ac(%s)[HandleACOnline] Removed stale UdpConn from remoteConnectionMap: %s",
+				acId, oldAddrStr)
+			go oldUdpConn.Close()
+		}
+		s.remoteConnectionMapMutex.Unlock()
+	}
 
 	// Include server's direct address so AC can establish direct connection.
 	// When AC connects through NLB, the AC's connected UDP socket only accepts

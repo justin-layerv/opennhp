@@ -48,16 +48,16 @@ const (
 
 // ServerForwarder handles server-to-server knock forwarding.
 type ServerForwarder struct {
-	deps          ForwarderDeps
-	health        *ServerHealthTracker
-	pendingFwds   map[uint64]*PendingForward // Transaction ID -> pending forward
-	pendingMutex  sync.Mutex
-	serverPeers   map[string]*core.UdpPeer // Server ID -> peer
-	peerMutex     sync.RWMutex
-	nextTxID      uint64
-	txIDMutex     sync.Mutex
-	stopCh        chan struct{}
-	wg            sync.WaitGroup
+	deps         ForwarderDeps
+	health       *ServerHealthTracker
+	pendingFwds  map[uint64]*PendingForward // Transaction ID -> pending forward
+	pendingMutex sync.Mutex
+	serverPeers  map[string]*core.UdpPeer // Server ID -> peer
+	peerMutex    sync.RWMutex
+	nextTxID     uint64
+	txIDMutex    sync.Mutex
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
 }
 
 // PendingForward tracks a pending forward request.
@@ -304,9 +304,9 @@ func (f *ServerForwarder) HandleForwardRequest(
 		return
 	}
 
-	// Step 3: Find the AC connection for this resource
-	acConn := f.deps.FindACConnectionForKnock(knkMsg)
-	if acConn == nil {
+	// Step 3: Find all AC connections for this resource
+	acConns := f.deps.FindACConnectionsForKnock(knkMsg)
+	if acConns == nil || len(acConns) == 0 {
 		log.Warning("No AC connection found for forwarded knock (resource=%s, authSvc=%s)",
 			knkMsg.ResourceId, knkMsg.AuthServiceId)
 		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "AC_NOT_CONNECTED", "AC not connected to this server")
@@ -355,8 +355,8 @@ func (f *ServerForwarder) HandleForwardRequest(
 		openTime = 60 // Default open time
 	}
 
-	// Step 5: Call processACOperation to send AOP and wait for ART
-	artMsg, err := f.deps.ProcessACOperation(knkMsg, acConn, srcAddr, dstAddrs, openTime)
+	// Step 5: Broadcast AOP to all ACs (supports blue/green with same AC ID)
+	artMsg, err := f.deps.ProcessACOperationBroadcast(knkMsg, acConns, srcAddr, dstAddrs, openTime)
 	if err != nil {
 		log.Error("AC operation failed for forwarded knock: %v", err)
 		errCode := "AC_OP_FAILED"
