@@ -810,6 +810,8 @@ resource "aws_iam_policy" "terraform_apply_ec2" {
           "ec2:AuthorizeSecurityGroup*",
           "ec2:RevokeSecurityGroup*",
           "ec2:ModifySecurityGroupRules",
+          "ec2:UpdateSecurityGroupRuleDescriptionsIngress",
+          "ec2:UpdateSecurityGroupRuleDescriptionsEgress",
           "ec2:CreateVpc",
           "ec2:DeleteVpc",
           "ec2:ModifyVpcAttribute",
