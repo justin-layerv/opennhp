@@ -481,11 +481,11 @@ module "console" {
   rds_secret_arn        = module.rds[0].secret_arn
   rds_security_group_id = module.rds[0].security_group_id
 
-  # AC configuration - use Terraform-managed AC IPs
+  # AC configuration - use NLB DNS for load-balanced access to AC instances
   ac_configs = var.deploy_ac ? [
     {
       id       = "layerv-ac-tf"
-      ip       = "10.100.0.248" # TODO: Get from AC module output
+      host     = module.ac[0].nlb_dns_name
       port     = 443
       protocol = "tcp"
     }
@@ -723,7 +723,7 @@ module "console_ec2" {
   ac_configs = var.deploy_ac ? [
     {
       id       = "layerv-ac-tf"
-      ip       = module.ac[0].nlb_dns_name
+      host     = module.ac[0].nlb_dns_name
       port     = 443
       protocol = "tcp"
     }

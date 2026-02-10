@@ -840,18 +840,6 @@ resource "aws_lb" "ac" {
   tags = var.tags
 }
 
-# Old target group removed from state - had HTTP health check attributes incompatible with TCP
-# Terraform cannot update in-place when state has matcher/path but config uses TCP protocol
-#
-# TODO(#237): Remove this block after cleaning up the orphaned target group:
-#   aws elbv2 delete-target-group --target-group-arn <arn-of-nhp-*-ac-https>
-removed {
-  from = aws_lb_target_group.https
-  lifecycle {
-    destroy = false
-  }
-}
-
 # TCP Target Group (TLS passthrough to Traefik)
 # Proxy Protocol v2 enabled to preserve client IP for NHP firewall rules
 resource "aws_lb_target_group" "ac_tcp" {

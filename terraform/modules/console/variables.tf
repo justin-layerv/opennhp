@@ -74,7 +74,7 @@ variable "ac_configs" {
   description = "List of AC configurations for portal sites"
   type = list(object({
     id       = string
-    ip       = string
+    host     = string
     port     = number
     protocol = string
   }))
