@@ -7,7 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.41.1
 	github.com/aws/aws-sdk-go-v2/config v1.32.7
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue v1.20.30
-	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.54.0
+	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.55.0
 	github.com/aws/aws-sdk-go-v2/service/servicediscovery v1.39.22
 	github.com/cilium/ebpf v0.20.0
 	github.com/coreos/go-oidc/v3 v3.17.0
