@@ -28,7 +28,7 @@ require (
 	go.etcd.io/etcd/client/v3 v3.6.7
 	golang.org/x/crypto v0.47.0
 	golang.org/x/mobile v0.0.0-20190719004257-d2bd2a29d028
-	golang.org/x/oauth2 v0.34.0
+	golang.org/x/oauth2 v0.35.0
 	golang.org/x/sync v0.19.0
 )
 
