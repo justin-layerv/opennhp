@@ -560,7 +560,6 @@ locals {
     auth_signing_key = var.auth_signing_key
     auth_aes_key     = var.auth_aes_key
     # Deployment configuration
-    image_tag               = var.image_tag
     ssm_image_tag_parameter = aws_ssm_parameter.image_tag.name
     # Plugin configuration (plugins are baked into Docker image)
     server_plugins  = var.server_plugins

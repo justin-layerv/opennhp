@@ -679,7 +679,6 @@ locals {
     plugin_bucket_name = var.plugin_bucket_name
     traefik_plugins    = var.traefik_plugins
     # Deployment configuration
-    image_tag                     = var.image_tag
     ssm_image_tag_parameter       = aws_ssm_parameter.image_tag.name
     enable_blue_green             = var.enable_blue_green
     ssm_green_image_tag_parameter = var.enable_blue_green ? aws_ssm_parameter.green_image_tag[0].name : ""

@@ -452,9 +452,7 @@ fi
 # SSM-based Image Tag Lookup
 # Read the image tag from SSM Parameter Store for CI/CD-driven deployments.
 # Blue and green ASGs use different SSM parameters for independent deployments.
-# Falls back to Terraform-interpolated value for backward compatibility.
 # ============================================================================
-FALLBACK_IMAGE_TAG="${image_tag}"
 BLUE_SSM_PARAM="${ssm_image_tag_parameter}"
 
 # Green ASG uses a different SSM parameter path
@@ -467,19 +465,23 @@ else
 fi
 
 echo "Fetching image tag from SSM parameter: $SSM_IMAGE_TAG_PARAM"
-SSM_IMAGE_TAG=$(aws ssm get-parameter \
+IMAGE_TAG=$(aws ssm get-parameter \
   --name "$SSM_IMAGE_TAG_PARAM" \
   --region "$REGION" \
   --query "Parameter.Value" \
-  --output text 2>/dev/null) || SSM_IMAGE_TAG=""
+  --output text) || {
+  echo "ERROR: Failed to fetch image tag from SSM parameter: $SSM_IMAGE_TAG_PARAM"
+  echo "SSM is the source of truth for image tags. Ensure the parameter exists and has a value."
+  exit 1
+}
 
-if [ -n "$SSM_IMAGE_TAG" ]; then
-  IMAGE_TAG="$SSM_IMAGE_TAG"
-  echo "Using image tag from SSM: $IMAGE_TAG"
-else
-  IMAGE_TAG="$FALLBACK_IMAGE_TAG"
-  echo "SSM parameter not found or empty, using fallback image tag: $IMAGE_TAG"
+if [ -z "$IMAGE_TAG" ] || [ "$IMAGE_TAG" = "None" ] || [ "$IMAGE_TAG" = "initial" ]; then
+  echo "ERROR: SSM parameter $SSM_IMAGE_TAG_PARAM has no valid image tag (got: '$IMAGE_TAG')"
+  echo "Deploy an image first via CI/CD before launching instances."
+  exit 1
 fi
+
+echo "Using image tag from SSM: $IMAGE_TAG"
 
 docker pull "$ECR_REPO:$IMAGE_TAG" || {
   echo "ERROR: Could not pull server image with tag $IMAGE_TAG"
