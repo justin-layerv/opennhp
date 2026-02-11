@@ -246,6 +246,11 @@ output "qurl_link_cloudfront_zone_id" {
   value       = var.deploy_qurl_link ? module.qurl_link[0].cloudfront_hosted_zone_id : null
 }
 
+output "qurl_link_url_ssm_param" {
+  description = "SSM parameter name containing the QURL link URL (for CI smoke tests)"
+  value       = aws_ssm_parameter.qurl_link_url.name
+}
+
 # ============================================================================
 # KMS and Alerting Outputs
 # ============================================================================

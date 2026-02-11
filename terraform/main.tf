@@ -1164,6 +1164,24 @@ module "qurl_service" {
   adot_collector_image  = var.qurl_adot_collector_image
 }
 
+# =============================================================================
+# SSM Parameters for QURL Domain Configuration
+# These parameters enable CI/CD to read domain configuration from Terraform
+# instead of hardcoding values in workflow files.
+# =============================================================================
+
+resource "aws_ssm_parameter" "qurl_link_url" {
+  name        = "/${var.environment}/nhp/qurl/link-url"
+  description = "QURL link frontend URL (e.g., https://qurl.link) - consumed by CI for smoke tests"
+  type        = "String"
+  value       = "https://${var.qurl_link_domain}"
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-ssm-qurl-link-url"
+    Component = "qurl"
+  })
+}
+
 # ==================== Grafana Cloud Dashboards ====================
 # Provisions QURL dashboards to Grafana Cloud
 # Requires a Grafana Cloud API key with Editor permissions

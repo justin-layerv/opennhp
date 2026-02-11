@@ -1026,10 +1026,29 @@ jobs:
             echo "::warning::Some integration tests failed or skipped"
           }
 
+      - name: Read QURL domain from SSM
+        id: qurl-domain-sandbox
+        run: |
+          # Read QURL link URL from SSM (Terraform is the source of truth)
+          QURL_LINK_URL=$(aws ssm get-parameter \
+            --name "/sandbox/nhp/qurl/link-url" \
+            --query "Parameter.Value" --output text 2>/dev/null) || true
+
+          if [ -z "$QURL_LINK_URL" ]; then
+            echo "::warning::SSM parameter /sandbox/nhp/qurl/link-url not found, falling back to hardcoded value"
+            QURL_LINK_URL="https://qurl.link.layerv.xyz"
+          fi
+
+          # Extract domain from URL (strip https://)
+          LOGIN_PORTAL_DOMAIN="${QURL_LINK_URL#https://}"
+          echo "qurl_link_url=$QURL_LINK_URL" >> $GITHUB_OUTPUT
+          echo "login_portal_domain=$LOGIN_PORTAL_DOMAIN" >> $GITHUB_OUTPUT
+          echo "Using QURL link URL: $QURL_LINK_URL"
+
       - name: Run E2E Tests (Demo Flow)
         env:
           CONSOLE_API_URL: "https://home.secure.layerv.xyz"
-          LOGIN_PORTAL_DOMAIN: "qurl.link.layerv.xyz"
+          LOGIN_PORTAL_DOMAIN: ${{ steps.qurl-domain-sandbox.outputs.login_portal_domain }}
           APPS_DOMAIN: "qurl.site.layerv.xyz"
         run: |
           echo "============================================"
@@ -1399,17 +1418,37 @@ jobs:
             echo "::warning::Some production integration tests failed or skipped"
           }
 
+      - name: Read QURL domain from SSM
+        id: qurl-domain-prod
+        run: |
+          # Read QURL link URL from SSM (Terraform is the source of truth)
+          QURL_LINK_URL=$(aws ssm get-parameter \
+            --name "/prod/nhp/qurl/link-url" \
+            --query "Parameter.Value" --output text 2>/dev/null) || true
+
+          if [ -z "$QURL_LINK_URL" ]; then
+            echo "::warning::SSM parameter /prod/nhp/qurl/link-url not found, falling back to hardcoded value"
+            QURL_LINK_URL="https://qurl.link"
+          fi
+
+          # Extract domain from URL (strip https://)
+          LOGIN_PORTAL_DOMAIN="${QURL_LINK_URL#https://}"
+          echo "qurl_link_url=$QURL_LINK_URL" >> $GITHUB_OUTPUT
+          echo "login_portal_domain=$LOGIN_PORTAL_DOMAIN" >> $GITHUB_OUTPUT
+          echo "Using QURL link URL: $QURL_LINK_URL"
+
       - name: Run E2E Tests (Production Demo Flow)
         env:
-          # Production uses different domains
+          # Production domains read from SSM (Terraform is the source of truth)
           CONSOLE_API_URL: "https://home.secure.layerv.ai"
-          LOGIN_PORTAL_DOMAIN: "qurl.link"
+          LOGIN_PORTAL_DOMAIN: ${{ steps.qurl-domain-prod.outputs.login_portal_domain }}
           APPS_DOMAIN: "qurl.site"
         run: |
           echo "============================================"
           echo "E2E TESTS - PRODUCTION DEMO FLOW"
           echo "============================================"
           echo "Console API: $CONSOLE_API_URL"
+          echo "Login Portal: $LOGIN_PORTAL_DOMAIN"
           echo ""
 
           cd tests/e2e
