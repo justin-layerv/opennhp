@@ -1496,8 +1496,11 @@ resource "aws_iam_policy" "qurl_link_static" {
         Sid    = "CloudFrontCachePolicy"
         Effect = "Allow"
         Action = [
+          "cloudfront:CreateCachePolicy",
+          "cloudfront:DeleteCachePolicy",
           "cloudfront:GetCachePolicy",
-          "cloudfront:ListCachePolicies"
+          "cloudfront:ListCachePolicies",
+          "cloudfront:UpdateCachePolicy"
         ]
         Resource = "*"
       },
