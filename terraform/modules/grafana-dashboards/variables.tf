@@ -37,6 +37,52 @@ variable "folder_name" {
   default     = "QURL"
 }
 
+# ==============================================================================
+# CloudWatch Data Source (for NHP Infrastructure dashboard)
+# ==============================================================================
+
+variable "cloudwatch_datasource_enabled" {
+  description = "Enable CloudWatch data source and NHP Infrastructure dashboard"
+  type        = bool
+  default     = false
+}
+
+variable "cloudwatch_assume_role_arn" {
+  description = "IAM role ARN for Grafana Cloud to assume for CloudWatch access. If empty and cloudwatch_datasource_enabled=true, a role is created automatically."
+  type        = string
+  default     = ""
+}
+
+variable "grafana_cloud_aws_account_id" {
+  description = "Grafana Cloud's AWS account ID for IAM trust policy (find in Grafana Cloud > CloudWatch integration setup)"
+  type        = string
+  default     = ""
+}
+
+variable "grafana_cloud_external_id" {
+  description = "External ID for Grafana Cloud IAM assume role (find in Grafana Cloud > CloudWatch integration setup)"
+  type        = string
+  default     = ""
+}
+
+variable "name_prefix" {
+  description = "Name prefix for IAM resources"
+  type        = string
+  default     = "nhp"
+}
+
+variable "aws_region" {
+  description = "AWS region for CloudWatch data source"
+  type        = string
+  default     = "us-east-2"
+}
+
+variable "nhp_folder_name" {
+  description = "Grafana folder name for NHP dashboards"
+  type        = string
+  default     = "NHP"
+}
+
 variable "tags" {
   description = "Tags to apply to resources"
   type        = map(string)

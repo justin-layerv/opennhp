@@ -873,6 +873,30 @@ variable "grafana_auth" {
   sensitive   = true
 }
 
+variable "grafana_nhp_dashboard_url" {
+  description = "URL to the NHP Infrastructure Grafana dashboard (shown on status page)"
+  type        = string
+  default     = ""
+}
+
+variable "grafana_cloudwatch_enabled" {
+  description = "Enable CloudWatch data source in Grafana for NHP Infrastructure dashboard"
+  type        = bool
+  default     = false
+}
+
+variable "grafana_cloud_aws_account_id" {
+  description = "Grafana Cloud's AWS account ID for IAM trust policy"
+  type        = string
+  default     = ""
+}
+
+variable "grafana_cloud_external_id" {
+  description = "External ID for Grafana Cloud IAM assume role"
+  type        = string
+  default     = ""
+}
+
 variable "grafana_prometheus_datasource_uid" {
   description = "UID of the Prometheus/Mimir datasource in Grafana Cloud"
   type        = string

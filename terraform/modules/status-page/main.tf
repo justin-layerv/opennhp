@@ -25,10 +25,13 @@ data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
 locals {
-  is_prod          = var.environment == "prod"
-  bucket_name      = "${var.name_prefix}-status-page-${data.aws_caller_identity.current.account_id}"
-  has_domain       = var.status_domain != null && var.acm_certificate_arn != null
-  frontend_content = templatefile("${path.module}/frontend/index.html", { api_url = "${aws_apigatewayv2_stage.default.invoke_url}/status" })
+  is_prod     = var.environment == "prod"
+  bucket_name = "${var.name_prefix}-status-page-${data.aws_caller_identity.current.account_id}"
+  has_domain  = var.status_domain != null && var.acm_certificate_arn != null
+  frontend_content = templatefile("${path.module}/frontend/index.html", {
+    api_url               = "${aws_apigatewayv2_stage.default.invoke_url}/status"
+    grafana_dashboard_url = var.grafana_dashboard_url
+  })
 }
 
 # ==============================================================================
@@ -55,11 +58,18 @@ resource "aws_lambda_function" "status_aggregator" {
 
   environment {
     variables = {
-      ENVIRONMENT        = var.environment
-      SSM_PREFIX         = var.ssm_prefix
-      SERVER_NLB_TG_ARNS = join(",", var.server_nlb_tg_arns)
-      AC_NLB_TG_ARNS     = join(",", var.ac_nlb_tg_arns)
-      ALARM_NAME_PREFIX  = var.alarm_name_prefix
+      ENVIRONMENT            = var.environment
+      SSM_PREFIX             = var.ssm_prefix
+      SERVER_NLB_TG_ARNS     = join(",", var.server_nlb_tg_arns)
+      AC_NLB_TG_ARNS         = join(",", var.ac_nlb_tg_arns)
+      ALARM_NAME_PREFIX      = var.alarm_name_prefix
+      SERVER_NLB_ARN_SUFFIX  = var.server_nlb_arn_suffix
+      AC_NLB_ARN_SUFFIX      = var.ac_nlb_arn_suffix
+      SERVER_ASG_NAME        = var.server_asg_name
+      AC_ASG_NAME            = var.ac_asg_name
+      DEPLOYMENT_MODEL       = var.deployment_model
+      CANARY_STATE_SSM_PARAM = var.canary_state_ssm_param
+      DEPENDENT_SERVICE_URLS = jsonencode(var.dependent_service_urls)
     }
   }
 
@@ -121,9 +131,10 @@ resource "aws_iam_role_policy" "status_aggregator" {
       {
         Sid    = "ReadSSMParameters"
         Effect = "Allow"
-        Action = ["ssm:GetParameters"]
+        Action = ["ssm:GetParameters", "ssm:GetParameter"]
         Resource = [
-          "arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:parameter${var.ssm_prefix}/*"
+          "arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:parameter${var.ssm_prefix}/*",
+          "arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:parameter/${var.environment}/nhp/*/canary/*",
         ]
       },
       {
@@ -144,6 +155,32 @@ resource "aws_iam_role_policy" "status_aggregator" {
         Effect = "Allow"
         Action = [
           "cloudwatch:DescribeAlarms"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:RequestedRegion" = data.aws_region.current.id
+          }
+        }
+      },
+      {
+        Sid    = "GetMetricData"
+        Effect = "Allow"
+        Action = [
+          "cloudwatch:GetMetricData"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:RequestedRegion" = data.aws_region.current.id
+          }
+        }
+      },
+      {
+        Sid    = "DescribeASGs"
+        Effect = "Allow"
+        Action = [
+          "autoscaling:DescribeAutoScalingGroups"
         ]
         Resource = "*"
         Condition = {

@@ -190,6 +190,10 @@ module "nhp" {
   grafana_auth                      = var.grafana_auth
   grafana_prometheus_datasource_uid = var.grafana_prometheus_datasource_uid
   grafana_tempo_datasource_uid      = var.grafana_tempo_datasource_uid
+  grafana_nhp_dashboard_url         = var.grafana_nhp_dashboard_url
+  grafana_cloudwatch_enabled        = var.grafana_cloudwatch_enabled
+  grafana_cloud_aws_account_id      = var.grafana_cloud_aws_account_id
+  grafana_cloud_external_id         = var.grafana_cloud_external_id
 
   # Traefik plugins
   traefik_plugins                   = var.traefik_plugins

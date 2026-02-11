@@ -4,9 +4,10 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="api-url" content="${api_url}">
+  <meta name="grafana-url" content="${grafana_dashboard_url}">
   <title>LayerV NHP Status</title>
   <style>
-    /* ── Design System ── */
+    /* -- Design System -- */
     :root {
       /* Surfaces */
       --bg-root: #080b10;
@@ -84,14 +85,14 @@
       --letter-wide: 0.06em;
     }
 
-    /* ── Reset ── */
+    /* -- Reset -- */
     *, *::before, *::after {
       box-sizing: border-box;
       margin: 0;
       padding: 0;
     }
 
-    /* ── Base ── */
+    /* -- Base -- */
     body {
       background: var(--bg-root);
       color: var(--text-secondary);
@@ -139,14 +140,14 @@
       text-decoration: underline;
     }
 
-    /* ── Focus ── */
+    /* -- Focus -- */
     :focus-visible {
       outline: 2px solid var(--accent-blue);
       outline-offset: 2px;
       border-radius: 2px;
     }
 
-    /* ── Animations ── */
+    /* -- Animations -- */
     @keyframes pulse-healthy {
       0%, 100% { box-shadow: 0 0 0 0 var(--status-healthy-glow); }
       50% { box-shadow: 0 0 0 5px transparent; }
@@ -177,7 +178,7 @@
       to { opacity: 1; max-height: 500px; }
     }
 
-    /* ── Header ── */
+    /* -- Header -- */
     .header {
       border-bottom: 1px solid var(--border-subtle);
       padding: var(--space-lg) var(--space-lg);
@@ -261,7 +262,7 @@
     }
     .conn-stale .conn-label { color: var(--status-unhealthy); }
 
-    /* ── Stale banner ── */
+    /* -- Stale banner -- */
     .stale-banner {
       display: none;
       background: var(--status-degraded-dim);
@@ -277,7 +278,7 @@
       display: block;
     }
 
-    /* ── Main ── */
+    /* -- Main -- */
     .main {
       flex: 1;
       max-width: 960px;
@@ -286,7 +287,7 @@
       padding: var(--space-xl) var(--space-lg);
     }
 
-    /* ── Error banner ── */
+    /* -- Error banner -- */
     .error-banner {
       display: none;
       background: var(--status-unhealthy-dim);
@@ -304,7 +305,7 @@
       display: block;
     }
 
-    /* ── Loading skeleton ── */
+    /* -- Loading skeleton -- */
     .loading {
       display: flex;
       flex-direction: column;
@@ -365,7 +366,7 @@
     .skeleton-alarms .skeleton-line:nth-child(2) { width: 60%; }
     .skeleton-alarms .skeleton-line:nth-child(3) { width: 45%; }
 
-    /* ── Cards grid ── */
+    /* -- Cards grid -- */
     .cards-grid {
       display: grid;
       grid-template-columns: repeat(2, 1fr);
@@ -379,7 +380,7 @@
       }
     }
 
-    /* ── Card (glassmorphism) ── */
+    /* -- Card (glassmorphism) -- */
     .card {
       background: var(--glass-bg);
       backdrop-filter: blur(var(--glass-blur));
@@ -431,7 +432,7 @@
       letter-spacing: var(--letter-tight);
     }
 
-    /* ── Status indicator ── */
+    /* -- Status indicator -- */
     .status-indicator {
       display: flex;
       align-items: center;
@@ -475,7 +476,7 @@
     }
     .status-unknown .status-text { color: var(--status-unknown); }
 
-    /* ── Card body ── */
+    /* -- Card body -- */
     .card-body {
       display: flex;
       flex-direction: column;
@@ -503,7 +504,7 @@
       text-align: right;
     }
 
-    /* ── Color badge ── */
+    /* -- Color badge -- */
     .color-badge {
       display: inline-flex;
       align-items: center;
@@ -525,7 +526,56 @@
       background: var(--deploy-green);
     }
 
-    /* ── Health bar ── */
+    /* -- Standby section -- */
+    .standby-section {
+      margin-top: var(--space-md);
+      padding-top: var(--space-md);
+      border-top: 1px dashed var(--border-subtle);
+      opacity: 0.7;
+    }
+
+    .standby-label {
+      font-size: var(--text-xs);
+      font-weight: var(--weight-semibold);
+      color: var(--text-tertiary);
+      text-transform: uppercase;
+      letter-spacing: var(--letter-wide);
+      margin-bottom: var(--space-sm);
+    }
+
+    /* -- Canary badge -- */
+    .canary-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 10px;
+      border-radius: 12px;
+      font-size: var(--text-xs);
+      font-weight: var(--weight-semibold);
+      text-transform: uppercase;
+      letter-spacing: var(--letter-wide);
+    }
+
+    .canary-idle {
+      background: var(--status-healthy-dim);
+      color: var(--status-healthy);
+      border: 1px solid rgba(52, 208, 88, 0.25);
+    }
+
+    .canary-deploying {
+      background: var(--status-degraded-dim);
+      color: var(--status-degraded);
+      border: 1px solid rgba(232, 163, 32, 0.25);
+      animation: pulse-degraded 2s ease-in-out infinite;
+    }
+
+    .canary-rolling_back {
+      background: var(--status-unhealthy-dim);
+      color: var(--status-unhealthy);
+      border: 1px solid rgba(240, 72, 72, 0.25);
+      animation: pulse-unhealthy 1.5s ease-in-out infinite;
+    }
+
+    /* -- Health bar -- */
     .health-bar-container {
       display: flex;
       align-items: center;
@@ -564,7 +614,127 @@
       color: var(--text-tertiary);
     }
 
-    /* ── Alarms section ── */
+    /* -- Key Metrics Bar -- */
+    .metrics-bar {
+      display: none;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: var(--space-sm);
+      margin-bottom: var(--space-lg);
+      animation: fadeIn var(--transition-slow) ease-out both;
+      animation-delay: 120ms;
+    }
+
+    .metrics-bar.visible {
+      display: grid;
+    }
+
+    .metric-tile {
+      background: var(--glass-bg);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius-md);
+      padding: var(--space-sm) var(--space-md);
+      text-align: center;
+      transition: border-color var(--transition-fast);
+    }
+
+    .metric-tile:hover {
+      border-color: var(--border-hover);
+    }
+
+    .metric-label {
+      font-size: 10px;
+      font-weight: var(--weight-semibold);
+      text-transform: uppercase;
+      letter-spacing: var(--letter-wide);
+      color: var(--text-tertiary);
+      margin-bottom: 2px;
+    }
+
+    .metric-value {
+      font-family: var(--font-mono);
+      font-size: var(--text-lg);
+      font-weight: var(--weight-semibold);
+      color: var(--text-primary);
+    }
+
+    .metric-unit {
+      font-size: var(--text-xs);
+      color: var(--text-tertiary);
+      margin-left: 2px;
+    }
+
+    .metric-value.metric-green { color: var(--status-healthy); }
+    .metric-value.metric-amber { color: var(--status-degraded); }
+    .metric-value.metric-red { color: var(--status-unhealthy); }
+
+    /* -- Dependent Services -- */
+    .dep-services-section {
+      margin-bottom: var(--space-lg);
+      animation: fadeIn var(--transition-slow) ease-out both;
+      animation-delay: 140ms;
+    }
+
+    .dep-services-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: var(--space-sm);
+    }
+
+    .dep-service-tile {
+      background: var(--glass-bg);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius-md);
+      padding: var(--space-sm) var(--space-md);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      transition: border-color var(--transition-fast);
+    }
+
+    .dep-service-tile:hover {
+      border-color: var(--border-hover);
+    }
+
+    .dep-service-name {
+      font-size: var(--text-sm);
+      font-weight: var(--weight-medium);
+      color: var(--text-secondary);
+    }
+
+    .dep-service-info {
+      display: flex;
+      align-items: center;
+      gap: var(--space-sm);
+    }
+
+    .dep-service-latency {
+      font-family: var(--font-mono);
+      font-size: var(--text-xs);
+      color: var(--text-tertiary);
+    }
+
+    .dep-service-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .dep-service-dot.dot-healthy {
+      background: var(--status-healthy);
+      box-shadow: 0 0 6px var(--status-healthy-glow);
+    }
+
+    .dep-service-dot.dot-unhealthy {
+      background: var(--status-unhealthy);
+      animation: pulse-unhealthy 1.5s ease-in-out infinite;
+    }
+
+    /* -- Alarms section -- */
     .alarms-section {
       margin-bottom: var(--space-lg);
       animation: fadeIn var(--transition-slow) ease-out both;
@@ -588,22 +758,74 @@
     }
 
     .alarm-item {
-      display: flex;
-      align-items: center;
-      gap: var(--space-sm);
-      padding: var(--space-sm) var(--space-md);
       background: var(--glass-bg);
       backdrop-filter: blur(8px);
       -webkit-backdrop-filter: blur(8px);
       border: 1px solid var(--glass-border);
       border-radius: var(--radius-sm);
-      font-size: var(--text-sm);
       transition: border-color var(--transition-fast), background var(--transition-fast);
+      overflow: hidden;
     }
 
     .alarm-item:hover {
       border-color: var(--border-hover);
       background: var(--bg-surface-hover);
+    }
+
+    .alarm-header {
+      display: flex;
+      align-items: center;
+      gap: var(--space-sm);
+      padding: var(--space-sm) var(--space-md);
+      cursor: pointer;
+      font-size: var(--text-sm);
+    }
+
+    .alarm-header:focus-visible {
+      outline: 2px solid var(--accent-blue);
+      outline-offset: -2px;
+    }
+
+    .alarm-chevron {
+      font-size: 10px;
+      color: var(--text-tertiary);
+      transition: transform var(--transition-fast);
+      flex-shrink: 0;
+    }
+
+    .alarm-item[aria-expanded="true"] .alarm-chevron {
+      transform: rotate(90deg);
+    }
+
+    .alarm-detail {
+      display: none;
+      padding: 0 var(--space-md) var(--space-md);
+      font-size: var(--text-xs);
+      color: var(--text-tertiary);
+      border-top: 1px solid var(--border-subtle);
+      margin: 0 var(--space-sm);
+      padding-top: var(--space-sm);
+    }
+
+    .alarm-item[aria-expanded="true"] .alarm-detail {
+      display: block;
+    }
+
+    .alarm-detail-row {
+      display: flex;
+      gap: var(--space-sm);
+      padding: 2px 0;
+    }
+
+    .alarm-detail-label {
+      color: var(--text-tertiary);
+      min-width: 80px;
+      flex-shrink: 0;
+    }
+
+    .alarm-detail-value {
+      color: var(--text-secondary);
+      word-break: break-word;
     }
 
     .alarm-badge {
@@ -668,7 +890,7 @@
       padding: var(--space-sm) 0;
     }
 
-    /* ── Time tooltip ── */
+    /* -- Time tooltip -- */
     .time-tooltip {
       cursor: default;
       border-bottom: 1px dotted var(--text-tertiary);
@@ -679,7 +901,7 @@
       border-color: var(--text-secondary);
     }
 
-    /* ── Footer ── */
+    /* -- Footer -- */
     .footer {
       border-top: 1px solid var(--border-subtle);
       padding: var(--space-lg);
@@ -699,6 +921,10 @@
       flex-wrap: wrap;
     }
 
+    .footer-sep {
+      color: var(--border-subtle);
+    }
+
     .footer-brand {
       color: var(--text-tertiary);
       font-weight: var(--weight-medium);
@@ -711,7 +937,7 @@
       color: var(--accent-blue);
     }
 
-    /* ── Content visibility ── */
+    /* -- Content visibility -- */
     .content {
       display: none;
     }
@@ -779,7 +1005,7 @@
               <span class="status-text">Unknown</span>
             </div>
           </div>
-          <div class="card-body">
+          <div class="card-body" id="server-body">
             <div class="card-row">
               <span class="card-label">Active Color</span>
               <span class="card-value" id="server-color">--</span>
@@ -800,6 +1026,11 @@
               <span class="card-label">Host Health</span>
               <span class="card-value" id="server-health">--</span>
             </div>
+            <div class="card-row" id="server-asg-row" style="display:none">
+              <span class="card-label">ASG Capacity</span>
+              <span class="card-value mono" id="server-asg-capacity">--</span>
+            </div>
+            <div id="server-deploy-extra"></div>
           </div>
         </div>
 
@@ -811,7 +1042,7 @@
               <span class="status-text">Unknown</span>
             </div>
           </div>
-          <div class="card-body">
+          <div class="card-body" id="ac-body">
             <div class="card-row">
               <span class="card-label">Active Color</span>
               <span class="card-value" id="ac-color">--</span>
@@ -832,8 +1063,20 @@
               <span class="card-label">Host Health</span>
               <span class="card-value" id="ac-health">--</span>
             </div>
+            <div class="card-row" id="ac-asg-row" style="display:none">
+              <span class="card-label">ASG Capacity</span>
+              <span class="card-value mono" id="ac-asg-capacity">--</span>
+            </div>
+            <div id="ac-deploy-extra"></div>
           </div>
         </div>
+      </div>
+
+      <div class="metrics-bar" id="metrics-bar" role="status" aria-label="Key metrics"></div>
+
+      <div class="dep-services-section" id="dep-services-section" style="display:none" role="status" aria-label="Dependent services">
+        <div class="section-title">Dependent Services</div>
+        <div class="dep-services-grid" id="dep-services-grid"></div>
       </div>
 
       <div class="alarms-section" id="alarms-section" role="status" aria-live="polite">
@@ -846,9 +1089,10 @@
   </main>
 
   <footer class="footer">
-    <div class="footer-links">
+    <div class="footer-links" id="footer-links">
       <span id="refresh-info">Auto-refreshes every 30s</span>
-      <a href="https://console.aws.amazon.com/cloudwatch" target="_blank" rel="noopener noreferrer">CloudWatch Dashboard</a>
+      <span class="footer-sep">|</span>
+      <a href="https://console.aws.amazon.com/cloudwatch" target="_blank" rel="noopener noreferrer">CloudWatch Metrics</a>
     </div>
     <span class="footer-brand">Powered by <span class="footer-brand-accent">LayerV NHP</span></span>
   </footer>
@@ -857,7 +1101,7 @@
     (function () {
       'use strict';
 
-      /* ── Configuration ── */
+      /* -- Configuration -- */
       var apiMeta = document.querySelector('meta[name="api-url"]');
       var API_URL = apiMeta ? apiMeta.getAttribute('content') : null;
       if (!API_URL) {
@@ -866,13 +1110,31 @@
         document.getElementById('error-banner').classList.add('visible');
         return;
       }
+
+      var grafanaMeta = document.querySelector('meta[name="grafana-url"]');
+      var GRAFANA_URL = grafanaMeta ? grafanaMeta.getAttribute('content') : '';
+
+      /* Add Grafana link to footer if configured */
+      if (GRAFANA_URL) {
+        var footerLinks = document.getElementById('footer-links');
+        var sep = createEl('span', { className: 'footer-sep', textContent: '|' });
+        var link = createEl('a', {
+          href: GRAFANA_URL,
+          target: '_blank',
+          rel: 'noopener noreferrer',
+          textContent: 'Grafana Dashboard'
+        });
+        footerLinks.appendChild(sep);
+        footerLinks.appendChild(link);
+      }
+
       var BASE_INTERVAL = 30000;
       var MAX_INTERVAL = 120000;
       var TICK_INTERVAL = 1000;
       var STALE_THRESHOLD = 120000; /* 2 minutes */
       var FETCH_TIMEOUT = 10000;
 
-      /* ── State ── */
+      /* -- State -- */
       var lastFetchTime = null;
       var lastData = null;
       var currentInterval = BASE_INTERVAL;
@@ -884,7 +1146,7 @@
       /* connection: 'connected' | 'refreshing' | 'stale' */
       var connectionState = 'stale';
 
-      /* ── DOM references ── */
+      /* -- DOM references -- */
       var els = {
         loading: document.getElementById('loading'),
         content: document.getElementById('content'),
@@ -902,13 +1164,22 @@
         serverCommit: document.getElementById('server-commit'),
         serverDeployedAt: document.getElementById('server-deployed-at'),
         serverHealth: document.getElementById('server-health'),
+        serverAsgRow: document.getElementById('server-asg-row'),
+        serverAsgCapacity: document.getElementById('server-asg-capacity'),
+        serverDeployExtra: document.getElementById('server-deploy-extra'),
         statusAc: document.getElementById('status-ac'),
         acColor: document.getElementById('ac-color'),
         acImageTag: document.getElementById('ac-image-tag'),
         acCommit: document.getElementById('ac-commit'),
         acDeployedAt: document.getElementById('ac-deployed-at'),
         acHealth: document.getElementById('ac-health'),
-        alarmsContent: document.getElementById('alarms-content')
+        acAsgRow: document.getElementById('ac-asg-row'),
+        acAsgCapacity: document.getElementById('ac-asg-capacity'),
+        acDeployExtra: document.getElementById('ac-deploy-extra'),
+        alarmsContent: document.getElementById('alarms-content'),
+        metricsBar: document.getElementById('metrics-bar'),
+        depServicesSection: document.getElementById('dep-services-section'),
+        depServicesGrid: document.getElementById('dep-services-grid')
       };
 
       var STATUS_LABELS = {
@@ -918,7 +1189,7 @@
         unknown: 'Unknown'
       };
 
-      /* ── Helpers ── */
+      /* -- Helpers -- */
 
       /**
        * Clear all children of an element and append new nodes.
@@ -972,7 +1243,7 @@
         return el;
       }
 
-      /* ── Connection state machine ── */
+      /* -- Connection state machine -- */
       function setConnectionState(state) {
         if (connectionState === state) return;
         connectionState = state;
@@ -983,7 +1254,7 @@
         label.textContent = labels[state] || 'Unknown';
       }
 
-      /* ── Stale detection ── */
+      /* -- Stale detection -- */
       function checkStale() {
         if (!lastFetchTime) return;
         var age = Date.now() - lastFetchTime;
@@ -997,7 +1268,7 @@
         }
       }
 
-      /* ── Time formatting ── */
+      /* -- Time formatting -- */
       function formatRelativeTime(isoString) {
         if (!isoString) return '--';
         var then = new Date(isoString);
@@ -1022,7 +1293,7 @@
         return d.toUTCString();
       }
 
-      /* ── DOM builders ── */
+      /* -- DOM builders -- */
 
       function setDeployedAt(el, isoString) {
         var relative = formatRelativeTime(isoString);
@@ -1059,6 +1330,19 @@
       }
 
       /**
+       * Creates a canary state badge DOM node.
+       */
+      function createCanaryBadge(state) {
+        if (!state) return document.createTextNode('--');
+        var labels = { idle: 'Idle', deploying: 'Deploying', rolling_back: 'Rolling Back' };
+        var label = labels[state] || state;
+        return createEl('span', {
+          className: 'canary-badge canary-' + state,
+          textContent: label
+        });
+      }
+
+      /**
        * Creates a health bar DOM node (not innerHTML).
        */
       function createHealthBar(healthy, unhealthy, total) {
@@ -1080,12 +1364,11 @@
         return createEl('div', { className: 'health-bar-container' }, [bar, count]);
       }
 
-      function capitalize(s) {
-        return s.charAt(0).toUpperCase() + s.slice(1);
-      }
-
-      function renderComponent(prefix, comp) {
+      function renderComponent(prefix, comp, deploymentModel, canary, asgDetails) {
         var cardEl = prefix === 'server' ? els.cardServer : els.cardAc;
+        var deployExtra = prefix === 'server' ? els.serverDeployExtra : els.acDeployExtra;
+        var asgRow = prefix === 'server' ? els.serverAsgRow : els.acAsgRow;
+        var asgCapacityEl = prefix === 'server' ? els.serverAsgCapacity : els.acAsgCapacity;
 
         if (!comp) {
           var statusEl = prefix === 'server' ? els.statusServer : els.statusAc;
@@ -1095,6 +1378,8 @@
           els[prefix + 'Commit'].textContent = '--';
           replaceContent(els[prefix + 'DeployedAt'], '--');
           replaceContent(els[prefix + 'Health'], '--');
+          asgRow.style.display = 'none';
+          replaceContent(deployExtra);
           cardEl.removeAttribute('data-status');
           return;
         }
@@ -1103,7 +1388,17 @@
         var statusElRef = prefix === 'server' ? els.statusServer : els.statusAc;
         setStatusIndicator(statusElRef, status);
         cardEl.setAttribute('data-status', status);
-        replaceContent(els[prefix + 'Color'], createColorBadge(comp.active_color));
+
+        /* Deployment model determines what color/deploy info to show */
+        if (deploymentModel === 'canary') {
+          /* Canary: show canary state badge instead of color */
+          var canaryState = canary ? canary.state : null;
+          replaceContent(els[prefix + 'Color'], createCanaryBadge(canaryState));
+        } else {
+          /* Blue/green: show active color badge */
+          replaceContent(els[prefix + 'Color'], createColorBadge(comp.active_color));
+        }
+
         els[prefix + 'ImageTag'].textContent = comp.image_tag || '--';
         els[prefix + 'Commit'].textContent = comp.deployed_commit ? comp.deployed_commit.substring(0, 7) : '--';
         setDeployedAt(els[prefix + 'DeployedAt'], comp.deployed_at);
@@ -1112,6 +1407,220 @@
           comp.unhealthy_hosts,
           comp.total_hosts
         ));
+
+        /* ASG capacity */
+        var asg = asgDetails && asgDetails[prefix];
+        if (asg) {
+          asgRow.style.display = '';
+          asgCapacityEl.textContent = asg.desired_capacity + ' desired (' + asg.min_size + '-' + asg.max_size + ')';
+        } else {
+          asgRow.style.display = 'none';
+        }
+
+        /* Blue/green standby info */
+        replaceContent(deployExtra);
+        if (deploymentModel === 'blue_green' && comp.green_image_tag) {
+          var standbyColor = comp.active_color === 'blue' ? 'green' : 'blue';
+          var section = createEl('div', { className: 'standby-section' });
+          section.appendChild(createEl('div', { className: 'standby-label', textContent: 'Standby' }));
+
+          var colorRow = createEl('div', { className: 'card-row' }, [
+            createEl('span', { className: 'card-label', textContent: 'Color' }),
+            createEl('span', { className: 'card-value' }, [createColorBadge(standbyColor)])
+          ]);
+          section.appendChild(colorRow);
+
+          var tagRow = createEl('div', { className: 'card-row' }, [
+            createEl('span', { className: 'card-label', textContent: 'Image Tag' }),
+            createEl('span', { className: 'card-value mono', textContent: comp.green_image_tag })
+          ]);
+          section.appendChild(tagRow);
+
+          if (comp.last_switch_timestamp) {
+            var switchRow = createEl('div', { className: 'card-row' });
+            switchRow.appendChild(createEl('span', { className: 'card-label', textContent: 'Last Switch' }));
+            var switchVal = createEl('span', { className: 'card-value' });
+            var switchSpan = createEl('span', {
+              className: 'time-tooltip',
+              title: formatAbsoluteTime(comp.last_switch_timestamp),
+              tabindex: '0',
+              textContent: formatRelativeTime(comp.last_switch_timestamp)
+            });
+            switchVal.appendChild(switchSpan);
+            switchRow.appendChild(switchVal);
+            section.appendChild(switchRow);
+          }
+
+          deployExtra.appendChild(section);
+        }
+      }
+
+      /* -- Key Metrics Bar -- */
+      function renderMetrics(metrics) {
+        if (!metrics) {
+          els.metricsBar.classList.remove('visible');
+          return;
+        }
+
+        els.metricsBar.classList.add('visible');
+
+        var tiles = [
+          { id: 'server_active_flows', label: 'Server Flows', unit: '', format: 'int' },
+          { id: 'ac_active_flows', label: 'AC Flows', unit: '', format: 'int' },
+          { id: 'knock_latency_p99', label: 'Knock p99', unit: 'ms', format: 'float',
+            thresholds: { amber: 200, red: 500 } },
+          { id: 'auth_success', label: 'Auth OK', unit: '/5m', format: 'int' },
+          { id: 'auth_failure', label: 'Auth Fail', unit: '/5m', format: 'int',
+            thresholds: { amber: 10, red: 50 } },
+          { id: 'server_cpu', label: 'Server CPU', unit: '%', format: 'pct',
+            thresholds: { amber: 60, red: 80 } },
+          { id: 'ac_cpu', label: 'AC CPU', unit: '%', format: 'pct',
+            thresholds: { amber: 60, red: 80 } }
+        ];
+
+        replaceContent(els.metricsBar);
+
+        for (var i = 0; i < tiles.length; i++) {
+          var t = tiles[i];
+          var val = metrics[t.id];
+          if (val === undefined) continue; /* metric not in response - skip tile */
+
+          var formatted;
+          var colorClass = 'metric-green';
+
+          if (val === null) {
+            formatted = '--';
+            colorClass = '';
+          } else if (t.format === 'int') {
+            formatted = Math.round(val).toString();
+          } else if (t.format === 'float') {
+            formatted = val.toFixed(1);
+          } else if (t.format === 'pct') {
+            formatted = val.toFixed(1);
+          } else {
+            formatted = val.toString();
+          }
+
+          if (val !== null && t.thresholds) {
+            if (val >= t.thresholds.red) {
+              colorClass = 'metric-red';
+            } else if (val >= t.thresholds.amber) {
+              colorClass = 'metric-amber';
+            }
+          }
+
+          var valueEl = createEl('div', {
+            className: 'metric-value ' + colorClass
+          }, [
+            document.createTextNode(formatted),
+            t.unit ? createEl('span', { className: 'metric-unit', textContent: t.unit }) : null
+          ]);
+
+          var tile = createEl('div', { className: 'metric-tile' }, [
+            createEl('div', { className: 'metric-label', textContent: t.label }),
+            valueEl
+          ]);
+
+          els.metricsBar.appendChild(tile);
+        }
+      }
+
+      /* -- Dependent Services -- */
+      var DEP_SERVICE_LABELS = {
+        'qurl_api': 'QURL API'
+      };
+
+      function renderDependentServices(services) {
+        if (!services || Object.keys(services).length === 0) {
+          els.depServicesSection.style.display = 'none';
+          return;
+        }
+
+        els.depServicesSection.style.display = '';
+        replaceContent(els.depServicesGrid);
+
+        var names = Object.keys(services);
+        for (var i = 0; i < names.length; i++) {
+          var name = names[i];
+          var svc = services[name];
+          var label = DEP_SERVICE_LABELS[name] || name;
+          var dotClass = svc.status === 'healthy' ? 'dot-healthy' : 'dot-unhealthy';
+          var latencyText = svc.response_time_ms != null ? svc.response_time_ms + 'ms' : '';
+
+          var tile = createEl('div', { className: 'dep-service-tile' }, [
+            createEl('span', { className: 'dep-service-name', textContent: label }),
+            createEl('div', { className: 'dep-service-info' }, [
+              latencyText ? createEl('span', { className: 'dep-service-latency', textContent: latencyText }) : null,
+              createEl('span', { className: 'dep-service-dot ' + dotClass })
+            ])
+          ]);
+
+          els.depServicesGrid.appendChild(tile);
+        }
+      }
+
+      /* -- Alarms -- */
+      function createAlarmItem(alarm, badgeClass, badgeText) {
+        var item = createEl('li', { className: 'alarm-item', 'aria-expanded': 'false' });
+
+        var header = createEl('div', {
+          className: 'alarm-header',
+          tabindex: '0',
+          role: 'button'
+        }, [
+          createEl('span', { className: 'alarm-chevron', textContent: '\u25B6' }),
+          createEl('span', { className: 'alarm-badge ' + badgeClass, textContent: badgeText }),
+          createEl('span', { className: 'alarm-name mono', textContent: alarm.name || alarm })
+        ]);
+
+        var detail = createEl('div', { className: 'alarm-detail' });
+
+        /* Only show detail if alarm is an object with detail fields */
+        if (alarm.description || alarm.metric_name || alarm.state_reason) {
+          if (alarm.description) {
+            detail.appendChild(createEl('div', { className: 'alarm-detail-row' }, [
+              createEl('span', { className: 'alarm-detail-label', textContent: 'Description' }),
+              createEl('span', { className: 'alarm-detail-value', textContent: alarm.description })
+            ]));
+          }
+          if (alarm.namespace && alarm.metric_name) {
+            detail.appendChild(createEl('div', { className: 'alarm-detail-row' }, [
+              createEl('span', { className: 'alarm-detail-label', textContent: 'Metric' }),
+              createEl('span', { className: 'alarm-detail-value mono', textContent: alarm.namespace + ' / ' + alarm.metric_name })
+            ]));
+          }
+          if (alarm.threshold != null && alarm.comparison) {
+            detail.appendChild(createEl('div', { className: 'alarm-detail-row' }, [
+              createEl('span', { className: 'alarm-detail-label', textContent: 'Threshold' }),
+              createEl('span', { className: 'alarm-detail-value mono', textContent: alarm.comparison + ' ' + alarm.threshold })
+            ]));
+          }
+          if (alarm.state_reason) {
+            detail.appendChild(createEl('div', { className: 'alarm-detail-row' }, [
+              createEl('span', { className: 'alarm-detail-label', textContent: 'Reason' }),
+              createEl('span', { className: 'alarm-detail-value', textContent: alarm.state_reason })
+            ]));
+          }
+        }
+
+        item.appendChild(header);
+        if (detail.childNodes.length > 0) {
+          item.appendChild(detail);
+
+          /* Toggle expand/collapse */
+          header.addEventListener('click', function () {
+            var expanded = item.getAttribute('aria-expanded') === 'true';
+            item.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+          });
+          header.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              header.click();
+            }
+          });
+        }
+
+        return item;
       }
 
       function renderAlarms(alarms) {
@@ -1139,11 +1648,7 @@
         if (active.length > 0) {
           var activeList = createEl('ul', { className: 'alarm-list' });
           for (var i = 0; i < active.length; i++) {
-            var li = createEl('li', { className: 'alarm-item' }, [
-              createEl('span', { className: 'alarm-badge alarm-badge-active', textContent: 'ALARM' }),
-              createEl('span', { className: 'alarm-name mono', textContent: active[i] })
-            ]);
-            activeList.appendChild(li);
+            activeList.appendChild(createAlarmItem(active[i], 'alarm-badge-active', 'ALARM'));
           }
           container.appendChild(activeList);
         }
@@ -1165,11 +1670,7 @@
             className: 'alarm-list ok-alarms' + (okAlarmsExpanded ? ' expanded' : '')
           });
           for (var j = 0; j < ok.length; j++) {
-            var okLi = createEl('li', { className: 'alarm-item' }, [
-              createEl('span', { className: 'alarm-badge alarm-badge-ok', textContent: 'OK' }),
-              createEl('span', { className: 'alarm-name mono', textContent: ok[j] })
-            ]);
-            okList.appendChild(okLi);
+            okList.appendChild(createAlarmItem(ok[j], 'alarm-badge-ok', 'OK'));
           }
           container.appendChild(okList);
 
@@ -1199,21 +1700,33 @@
         replaceContent(els.alarmsContent, container);
       }
 
-      /* ── Render ── */
+      /* -- Render -- */
       function render(data) {
         lastData = data;
         els.envBadge.textContent = data.environment || '--';
 
         var components = data.components || {};
-        renderComponent('server', components.server);
-        renderComponent('ac', components.ac);
+        var deploymentModel = data.deployment_model || 'blue_green';
+
+        /* Update Active Color label for canary model */
+        var colorLabels = document.querySelectorAll('.card-label');
+        for (var i = 0; i < colorLabels.length; i++) {
+          if (colorLabels[i].textContent === 'Active Color' || colorLabels[i].textContent === 'Deploy State') {
+            colorLabels[i].textContent = deploymentModel === 'canary' ? 'Deploy State' : 'Active Color';
+          }
+        }
+
+        renderComponent('server', components.server, deploymentModel, data.canary, data.asg_details);
+        renderComponent('ac', components.ac, deploymentModel, data.canary, data.asg_details);
+        renderMetrics(data.key_metrics);
+        renderDependentServices(data.dependent_services);
         renderAlarms(data.alarms);
 
         els.loading.style.display = 'none';
         els.content.classList.add('visible');
       }
 
-      /* ── Error handling ── */
+      /* -- Error handling -- */
       function showError(msg) {
         els.errorBanner.textContent = msg;
         els.errorBanner.classList.add('visible');
@@ -1223,7 +1736,7 @@
         els.errorBanner.classList.remove('visible');
       }
 
-      /* ── Tick updates ── */
+      /* -- Tick updates -- */
       function updateLastUpdated() {
         if (!lastFetchTime) {
           els.lastUpdated.textContent = '--';
@@ -1257,7 +1770,7 @@
         els.refreshInfo.textContent = 'Auto-refreshes every ' + seconds + 's';
       }
 
-      /* ── Backoff logic ── */
+      /* -- Backoff logic -- */
       function onFetchSuccess() {
         consecutiveFailures = 0;
         currentInterval = BASE_INTERVAL;
@@ -1286,7 +1799,7 @@
         refreshTimer = setTimeout(fetchStatus, currentInterval);
       }
 
-      /* ── Fetch ── */
+      /* -- Fetch -- */
       function fetchStatus() {
         /* Abort any in-flight request */
         if (abortController) {
@@ -1332,7 +1845,7 @@
           });
       }
 
-      /* ── Init ── */
+      /* -- Init -- */
       fetchStatus();
 
       setInterval(function () {

@@ -74,6 +74,71 @@ variable "ac_nlb_tg_arns" {
 }
 
 # ==============================================================================
+# Metrics & ASG
+# ==============================================================================
+
+variable "server_nlb_arn_suffix" {
+  description = "Server NLB ARN suffix for CloudWatch NLB metric dimensions"
+  type        = string
+  default     = ""
+}
+
+variable "ac_nlb_arn_suffix" {
+  description = "AC NLB ARN suffix for CloudWatch NLB metric dimensions"
+  type        = string
+  default     = ""
+}
+
+variable "server_asg_name" {
+  description = "Server ASG name for CPU metrics and instance details"
+  type        = string
+  default     = ""
+}
+
+variable "ac_asg_name" {
+  description = "AC ASG name for CPU metrics and instance details"
+  type        = string
+  default     = ""
+}
+
+variable "grafana_dashboard_url" {
+  description = "URL to the NHP Grafana dashboard (shown in footer)"
+  type        = string
+  default     = ""
+}
+
+# ==============================================================================
+# Deployment Model
+# ==============================================================================
+
+variable "deployment_model" {
+  description = "Deployment strategy: blue_green (two ASGs, NLB switch) or canary (single ASG, progressive rollout)"
+  type        = string
+  default     = "blue_green"
+
+  validation {
+    condition     = contains(["blue_green", "canary"], var.deployment_model)
+    error_message = "deployment_model must be 'blue_green' or 'canary'."
+  }
+}
+
+variable "canary_state_ssm_param" {
+  description = "Full SSM parameter name for canary deployment state. Only used when deployment_model is canary."
+  type        = string
+  default     = ""
+}
+
+# ==============================================================================
+# Dependent Services
+# ==============================================================================
+
+variable "dependent_service_urls" {
+  description = "Map of dependent service names to health check URLs. Lambda performs HTTP GET and reports status + response time. Keep total Lambda env vars under 4KB."
+  type        = map(string)
+  default     = {}
+}
+
+# ==============================================================================
 # Encryption
 # ==============================================================================
 

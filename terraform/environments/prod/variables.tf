@@ -714,6 +714,26 @@ variable "grafana_auth" {
   sensitive = true
 }
 
+variable "grafana_nhp_dashboard_url" {
+  type    = string
+  default = ""
+}
+
+variable "grafana_cloudwatch_enabled" {
+  type    = bool
+  default = false
+}
+
+variable "grafana_cloud_aws_account_id" {
+  type    = string
+  default = ""
+}
+
+variable "grafana_cloud_external_id" {
+  type    = string
+  default = ""
+}
+
 variable "grafana_prometheus_datasource_uid" {
   type    = string
   default = "grafanacloud-prom"

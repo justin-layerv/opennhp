@@ -10,6 +10,11 @@ output "nlb_arn" {
   value       = aws_lb.ac.arn
 }
 
+output "nlb_arn_suffix" {
+  description = "AC NLB ARN suffix for CloudWatch"
+  value       = aws_lb.ac.arn_suffix
+}
+
 output "nlb_zone_id" {
   description = "AC NLB zone ID for Route 53"
   value       = aws_lb.ac.zone_id

@@ -10,11 +10,17 @@
 #   }
 
 terraform {
+  required_version = ">= 1.5"
+
   required_providers {
     grafana = {
       source                = "grafana/grafana"
       version               = "~> 3.0"
       configuration_aliases = [grafana]
+    }
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 6.0"
     }
   }
 }
@@ -59,4 +65,127 @@ resource "grafana_dashboard" "webhooks" {
   })
 
   overwrite = true
+}
+
+# ==============================================================================
+# CloudWatch Data Source & NHP Infrastructure Dashboard
+# ==============================================================================
+
+locals {
+  create_cw_role = var.cloudwatch_datasource_enabled && var.cloudwatch_assume_role_arn == "" && var.grafana_cloud_aws_account_id != ""
+  cw_role_arn    = local.create_cw_role ? aws_iam_role.grafana_cloudwatch[0].arn : var.cloudwatch_assume_role_arn
+}
+
+resource "grafana_data_source" "cloudwatch" {
+  count = var.cloudwatch_datasource_enabled ? 1 : 0
+
+  type = "cloudwatch"
+  name = "CloudWatch"
+
+  json_data_encoded = jsonencode({
+    defaultRegion = var.aws_region
+    authType      = "ec2_iam_role"
+    assumeRoleArn = local.cw_role_arn
+  })
+}
+
+resource "grafana_folder" "nhp" {
+  count = var.cloudwatch_datasource_enabled ? 1 : 0
+  title = var.nhp_folder_name
+}
+
+resource "grafana_dashboard" "nhp_infrastructure" {
+  count = var.cloudwatch_datasource_enabled ? 1 : 0
+
+  folder = grafana_folder.nhp[0].id
+  config_json = templatefile("${path.module}/dashboards/nhp-infrastructure.json", {
+    cloudwatch_uid = grafana_data_source.cloudwatch[0].uid
+    environment    = var.environment
+  })
+
+  overwrite = true
+}
+
+# ==============================================================================
+# IAM Role for Grafana Cloud CloudWatch Access
+# ==============================================================================
+
+resource "aws_iam_role" "grafana_cloudwatch" {
+  count = local.create_cw_role ? 1 : 0
+
+  name = "${var.name_prefix}-grafana-cloudwatch"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${var.grafana_cloud_aws_account_id}:root"
+        }
+        Action = "sts:AssumeRole"
+        Condition = var.grafana_cloud_external_id != "" ? {
+          StringEquals = {
+            "sts:ExternalId" = var.grafana_cloud_external_id
+          }
+        } : {}
+      }
+    ]
+  })
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-grafana-cloudwatch"
+    Component = "grafana-dashboards"
+  })
+}
+
+resource "aws_iam_role_policy" "grafana_cloudwatch" {
+  count = local.create_cw_role ? 1 : 0
+
+  name = "${var.name_prefix}-grafana-cloudwatch-policy"
+  role = aws_iam_role.grafana_cloudwatch[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "CloudWatchReadOnly"
+        Effect = "Allow"
+        Action = [
+          "cloudwatch:GetMetricData",
+          "cloudwatch:ListMetrics",
+          "cloudwatch:DescribeAlarms",
+          "cloudwatch:GetMetricStatistics",
+          "cloudwatch:DescribeAlarmsForMetric"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "EC2Describe"
+        Effect = "Allow"
+        Action = [
+          "ec2:DescribeInstances",
+          "ec2:DescribeRegions"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "AutoScalingDescribe"
+        Effect = "Allow"
+        Action = [
+          "autoscaling:DescribeAutoScalingGroups",
+          "autoscaling:DescribeAutoScalingInstances"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "TagsRead"
+        Effect = "Allow"
+        Action = [
+          "tag:GetResources"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
 }

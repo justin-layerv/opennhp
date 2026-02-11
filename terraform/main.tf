@@ -467,6 +467,22 @@ module "status_page" {
   sns_topic_arn     = module.monitoring.sns_topic_arn
   logs_kms_key_arn  = module.kms.logs_key_arn
   ssm_prefix        = "/${var.environment}/nhp"
+
+  # Metrics & ASG
+  server_nlb_arn_suffix = module.compute.nlb_arn_suffix
+  ac_nlb_arn_suffix     = var.deploy_ac ? module.ac[0].nlb_arn_suffix : ""
+  server_asg_name       = module.compute.asg_name
+  ac_asg_name           = var.deploy_ac ? module.ac[0].asg_name : ""
+  grafana_dashboard_url = var.grafana_dashboards_enabled && var.grafana_cloudwatch_enabled ? module.grafana_dashboards[0].nhp_infrastructure_dashboard_url : var.grafana_nhp_dashboard_url
+
+  # Deployment model
+  deployment_model       = var.enable_canary_deployment ? "canary" : "blue_green"
+  canary_state_ssm_param = var.enable_canary_deployment ? module.canary_deployment[0].ssm_canary_state_parameter : ""
+
+  # Dependent services
+  dependent_service_urls = var.qurl_service_domain != null ? {
+    qurl_api = "https://${var.qurl_service_domain}/health/ready"
+  } : {}
 }
 
 # DNS Module - Route 53 records
@@ -1161,6 +1177,13 @@ module "grafana_dashboards" {
   environment               = var.environment
   prometheus_datasource_uid = var.grafana_prometheus_datasource_uid
   tempo_datasource_uid      = var.grafana_tempo_datasource_uid
+
+  # CloudWatch data source for NHP Infrastructure dashboard
+  cloudwatch_datasource_enabled = var.grafana_cloudwatch_enabled
+  aws_region                    = var.aws_region
+  name_prefix                   = local.name_prefix
+  grafana_cloud_aws_account_id  = var.grafana_cloud_aws_account_id
+  grafana_cloud_external_id     = var.grafana_cloud_external_id
 
   tags = local.common_tags
 }

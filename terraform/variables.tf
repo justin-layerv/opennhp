@@ -1293,6 +1293,30 @@ variable "grafana_tempo_datasource_uid" {
   default     = "grafanacloud-traces"
 }
 
+variable "grafana_nhp_dashboard_url" {
+  description = "URL to the NHP Infrastructure Grafana dashboard (shown on status page)"
+  type        = string
+  default     = ""
+}
+
+variable "grafana_cloudwatch_enabled" {
+  description = "Enable CloudWatch data source in Grafana for NHP Infrastructure dashboard"
+  type        = bool
+  default     = false
+}
+
+variable "grafana_cloud_aws_account_id" {
+  description = "Grafana Cloud's AWS account ID for IAM trust policy (find in Grafana Cloud CloudWatch integration setup)"
+  type        = string
+  default     = ""
+}
+
+variable "grafana_cloud_external_id" {
+  description = "External ID for Grafana Cloud IAM assume role"
+  type        = string
+  default     = ""
+}
+
 # ==================== QURL Router Plugin ====================
 # Configuration for the Traefik QURL Router plugin that routes *.qurl.site requests
 

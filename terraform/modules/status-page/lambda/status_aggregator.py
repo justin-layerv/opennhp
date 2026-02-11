@@ -2,14 +2,17 @@
 Status aggregator Lambda function.
 
 Reads deployment state from SSM, target group health from ELBv2,
-and alarm states from CloudWatch. Returns a JSON summary suitable
-for API Gateway proxy integration.
+alarm states from CloudWatch, key metrics, and ASG details.
+Returns a JSON summary suitable for API Gateway proxy integration.
 """
 
 import json
 import os
+import time
 import traceback
-from datetime import datetime, timezone
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 import boto3
 
@@ -17,6 +20,7 @@ import boto3
 ssm = boto3.client("ssm")
 elbv2 = boto3.client("elbv2")
 cloudwatch = boto3.client("cloudwatch")
+autoscaling = boto3.client("autoscaling")
 
 # CORS allows all origins intentionally: status data is public/read-only
 # and restricting to CloudFront domain would create a circular dependency
@@ -59,6 +63,7 @@ def build_status():
     environment = os.environ.get("ENVIRONMENT", "unknown")
     ssm_prefix = os.environ.get("SSM_PREFIX", "")
     alarm_prefix = os.environ.get("ALARM_NAME_PREFIX", "")
+    deployment_model = os.environ.get("DEPLOYMENT_MODEL", "blue_green")
 
     server_tg_arns = _parse_csv(os.environ.get("SERVER_NLB_TG_ARNS", ""))
     ac_tg_arns = _parse_csv(os.environ.get("AC_NLB_TG_ARNS", ""))
@@ -89,21 +94,31 @@ def build_status():
 
     server_has_alarm = any(
         a for a in alarms["active"]
-        if "-server-" in a.lower()
+        if "-server-" in a["name"].lower()
     )
     ac_has_alarm = any(
         a for a in alarms["active"]
-        if "-ac-" in a.lower()
+        if "-ac-" in a["name"].lower()
     )
+
+    key_metrics = _get_key_metrics()
+    asg_details = _get_asg_details()
+    canary = _get_canary_state() if deployment_model == "canary" else None
+    dependent_services = _check_dependent_services()
 
     return {
         "environment": environment,
+        "deployment_model": deployment_model,
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "components": {
             "server": _build_component(server_params, server_health, server_has_alarm),
             "ac": _build_component(ac_params, ac_health, ac_has_alarm),
         },
         "alarms": alarms,
+        "key_metrics": key_metrics,
+        "asg_details": asg_details,
+        "canary": canary,
+        "dependent_services": dependent_services,
     }
 
 
@@ -184,32 +199,314 @@ def _aggregate_target_health(tg_arns):
 # ---------------------------------------------------------------------------
 
 def _get_alarm_states(prefix):
-    """Return lists of active and ok alarm names matching the prefix."""
+    """Return lists of active and ok alarm objects matching the prefix.
+
+    Each alarm is a dict with: name, description, metric_name, namespace,
+    threshold, comparison, state_reason.
+    """
     active = []
     ok = []
 
     if not prefix:
         return {"active": active, "ok": ok}
 
+    def _alarm_obj(alarm, is_composite=False):
+        obj = {
+            "name": alarm["AlarmName"],
+            "description": alarm.get("AlarmDescription", ""),
+            "state_reason": alarm.get("StateReason", ""),
+        }
+        if is_composite:
+            obj["metric_name"] = None
+            obj["namespace"] = None
+            obj["threshold"] = None
+            obj["comparison"] = None
+        else:
+            obj["metric_name"] = alarm.get("MetricName", "")
+            obj["namespace"] = alarm.get("Namespace", "")
+            obj["threshold"] = alarm.get("Threshold")
+            obj["comparison"] = alarm.get("ComparisonOperator", "")
+        return obj
+
     try:
         paginator = cloudwatch.get_paginator("describe_alarms")
         for page in paginator.paginate(AlarmNamePrefix=prefix):
             for alarm in page.get("MetricAlarms", []):
-                name = alarm["AlarmName"]
+                obj = _alarm_obj(alarm)
                 if alarm["StateValue"] == "ALARM":
-                    active.append(name)
+                    active.append(obj)
                 else:
-                    ok.append(name)
+                    ok.append(obj)
             for alarm in page.get("CompositeAlarms", []):
-                name = alarm["AlarmName"]
+                obj = _alarm_obj(alarm, is_composite=True)
                 if alarm["StateValue"] == "ALARM":
-                    active.append(name)
+                    active.append(obj)
                 else:
-                    ok.append(name)
+                    ok.append(obj)
     except Exception:
         print(f"WARN: Failed to describe alarms: {traceback.format_exc()}")
 
     return {"active": active, "ok": ok}
+
+
+# ---------------------------------------------------------------------------
+# Key metrics (current values only)
+# ---------------------------------------------------------------------------
+
+def _get_key_metrics():
+    """Fetch latest data point for key NHP metrics from CloudWatch.
+
+    Returns a dict of metric_id -> current value, or None if no env vars configured.
+    Only fetches the most recent data point (10-min window, 5-min period).
+    """
+    server_nlb = os.environ.get("SERVER_NLB_ARN_SUFFIX", "")
+    ac_nlb = os.environ.get("AC_NLB_ARN_SUFFIX", "")
+    server_asg = os.environ.get("SERVER_ASG_NAME", "")
+    ac_asg = os.environ.get("AC_ASG_NAME", "")
+
+    if not any([server_nlb, ac_nlb, server_asg, ac_asg]):
+        return None
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(minutes=10)
+
+    queries = []
+
+    if server_nlb:
+        queries.append({
+            "Id": "server_active_flows",
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "AWS/NetworkELB",
+                    "MetricName": "ActiveFlowCount",
+                    "Dimensions": [{"Name": "LoadBalancer", "Value": server_nlb}],
+                },
+                "Period": 300,
+                "Stat": "Sum",
+            },
+        })
+
+    if ac_nlb:
+        queries.append({
+            "Id": "ac_active_flows",
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "AWS/NetworkELB",
+                    "MetricName": "ActiveFlowCount",
+                    "Dimensions": [{"Name": "LoadBalancer", "Value": ac_nlb}],
+                },
+                "Period": 300,
+                "Stat": "Sum",
+            },
+        })
+
+    # Custom NHP metrics (may not exist yet)
+    queries.extend([
+        {
+            "Id": "knock_latency_p99",
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "LayerV/NHP",
+                    "MetricName": "KnockLatency",
+                    "Dimensions": [],
+                },
+                "Period": 300,
+                "Stat": "p99",
+            },
+        },
+        {
+            "Id": "auth_success",
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "LayerV/NHP",
+                    "MetricName": "AuthSuccess",
+                    "Dimensions": [],
+                },
+                "Period": 300,
+                "Stat": "Sum",
+            },
+        },
+        {
+            "Id": "auth_failure",
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "LayerV/NHP",
+                    "MetricName": "AuthFailure",
+                    "Dimensions": [],
+                },
+                "Period": 300,
+                "Stat": "Sum",
+            },
+        },
+    ])
+
+    if server_asg:
+        queries.append({
+            "Id": "server_cpu",
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "AWS/EC2",
+                    "MetricName": "CPUUtilization",
+                    "Dimensions": [{"Name": "AutoScalingGroupName", "Value": server_asg}],
+                },
+                "Period": 300,
+                "Stat": "Average",
+            },
+        })
+
+    if ac_asg:
+        queries.append({
+            "Id": "ac_cpu",
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "AWS/EC2",
+                    "MetricName": "CPUUtilization",
+                    "Dimensions": [{"Name": "AutoScalingGroupName", "Value": ac_asg}],
+                },
+                "Period": 300,
+                "Stat": "Average",
+            },
+        })
+
+    try:
+        resp = cloudwatch.get_metric_data(
+            MetricDataQueries=queries,
+            StartTime=start,
+            EndTime=now,
+        )
+    except Exception:
+        print(f"WARN: Failed to get metric data: {traceback.format_exc()}")
+        return None
+
+    result = {}
+    for metric_result in resp.get("MetricDataResults", []):
+        metric_id = metric_result["Id"]
+        values = metric_result.get("Values", [])
+        result[metric_id] = values[0] if values else None
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# ASG details
+# ---------------------------------------------------------------------------
+
+def _get_asg_details():
+    """Fetch ASG capacity and instance details.
+
+    Returns a dict with server and ac ASG info, or None if no ASG names configured.
+    """
+    server_asg = os.environ.get("SERVER_ASG_NAME", "")
+    ac_asg = os.environ.get("AC_ASG_NAME", "")
+
+    if not server_asg and not ac_asg:
+        return None
+
+    names = [n for n in [server_asg, ac_asg] if n]
+
+    try:
+        resp = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=names)
+    except Exception:
+        print(f"WARN: Failed to describe ASGs: {traceback.format_exc()}")
+        return None
+
+    asg_map = {}
+    for asg in resp.get("AutoScalingGroups", []):
+        asg_map[asg["AutoScalingGroupName"]] = {
+            "desired_capacity": asg["DesiredCapacity"],
+            "min_size": asg["MinSize"],
+            "max_size": asg["MaxSize"],
+            "instances": [
+                {
+                    "id": inst["InstanceId"],
+                    "health_status": inst["HealthStatus"],
+                    "lifecycle_state": inst["LifecycleState"],
+                }
+                for inst in asg.get("Instances", [])
+            ],
+        }
+
+    result = {}
+    if server_asg:
+        result["server"] = asg_map.get(server_asg)
+    if ac_asg:
+        result["ac"] = asg_map.get(ac_asg)
+
+    return result if result else None
+
+
+# ---------------------------------------------------------------------------
+# Canary deployment state
+# ---------------------------------------------------------------------------
+
+def _get_canary_state():
+    """Read canary deployment state from SSM.
+
+    Returns {"state": "idle|deploying|rolling_back"} or None.
+    """
+    param_name = os.environ.get("CANARY_STATE_SSM_PARAM", "")
+    if not param_name:
+        return None
+
+    try:
+        resp = ssm.get_parameter(Name=param_name)
+        value = resp["Parameter"]["Value"]
+        if value in ("", "initial"):
+            return None
+        return {"state": value}
+    except Exception:
+        print(f"WARN: Failed to read canary state from {param_name}: {traceback.format_exc()}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Dependent services health check
+# ---------------------------------------------------------------------------
+
+def _check_dependent_services():
+    """Check health of dependent services via HTTP GET.
+
+    Reads DEPENDENT_SERVICE_URLS env var (JSON map of name -> URL).
+    Returns a dict of {name: {status, response_time_ms}} or None if unconfigured.
+    """
+    raw = os.environ.get("DEPENDENT_SERVICE_URLS", "")
+    if not raw or raw == "{}":
+        return None
+
+    try:
+        url_map = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        print(f"WARN: Invalid DEPENDENT_SERVICE_URLS: {raw}")
+        return None
+
+    if not url_map:
+        return None
+
+    results = {}
+    for name, url in url_map.items():
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            results[name] = {"status": "unhealthy", "response_time_ms": 0}
+            continue
+        start = time.monotonic()
+        try:
+            req = urllib.request.Request(url, method="GET")
+            req.add_header("User-Agent", "LayerV-StatusPage/1.0")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                elapsed_ms = round((time.monotonic() - start) * 1000)
+                status_code = resp.getcode()
+                results[name] = {
+                    "status": "healthy" if 200 <= status_code < 400 else "unhealthy",
+                    "response_time_ms": elapsed_ms,
+                }
+        except Exception:
+            elapsed_ms = round((time.monotonic() - start) * 1000)
+            results[name] = {
+                "status": "unhealthy",
+                "response_time_ms": elapsed_ms,
+            }
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +525,8 @@ def _build_component(params, health, has_alarm):
         "healthy_hosts": health["healthy"],
         "unhealthy_hosts": health["unhealthy"],
         "total_hosts": health["total"],
+        "green_image_tag": params.get("green_image_tag"),
+        "last_switch_timestamp": params.get("last_switch_timestamp"),
     }
 
 
