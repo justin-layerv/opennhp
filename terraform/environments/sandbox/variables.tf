@@ -888,7 +888,7 @@ variable "grafana_cloudwatch_enabled" {
 variable "grafana_cloud_aws_account_id" {
   description = "Grafana Cloud's AWS account ID for IAM trust policy"
   type        = string
-  default     = ""
+  default     = "008923505280"
 }
 
 variable "grafana_cloud_external_id" {

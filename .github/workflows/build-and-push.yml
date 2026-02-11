@@ -902,7 +902,7 @@ jobs:
     if: always() && needs.deploy-sandbox-server.result == 'success' && needs.deploy-sandbox-infra.outputs.console_ec2_asg != ''
     runs-on: ubuntu-latest
     environment: sandbox
-    timeout-minutes: 15
+    timeout-minutes: 25
     concurrency:
       group: deploy-sandbox-console
       cancel-in-progress: true
@@ -930,11 +930,16 @@ jobs:
           # SkipMatching must be false for Console EC2 because the binary is downloaded
           # at boot via user_data, not baked into the AMI. When code changes, the launch
           # template doesn't change, so SkipMatching would incorrectly skip replacement.
+          #
+          # InstanceWarmup must match the ASG health_check_grace_period (360s).
+          # If warmup < grace period, the refresh tries to evaluate health before
+          # the grace period allows ELB health checks to take effect, causing the
+          # refresh to hang at 25% until the grace period expires.
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "$ASG_NAME" \
             --preferences '{
               "MinHealthyPercentage": 50,
-              "InstanceWarmup": 180,
+              "InstanceWarmup": 360,
               "MaxHealthyPercentage": 110,
               "SkipMatching": false
             }' \
@@ -944,13 +949,14 @@ jobs:
           echo "Instance Refresh ID: $REFRESH_ID"
 
           # Wait for instance refresh (no health check for Console)
-          # Console EC2 needs more time due to Docker pulls, etcd DNS, AC registration
-          # 90 iterations * 10s = 900s (15 minutes) to accommodate 360s grace period + refresh time
+          # Console EC2 needs time for: apt install, Docker pull, service start,
+          # 360s health_check_grace_period, ELB health check convergence, 360s warmup.
+          # 120 iterations * 10s = 1200s (20 minutes), with 5 min margin in 25 min timeout.
           ./.github/scripts/wait-for-instance-refresh.sh \
             "$ASG_NAME" \
             "$REFRESH_ID" \
             "" \
-            90
+            120
 
   deploy-sandbox-validate:
     name: Deploy Sandbox - Validate
