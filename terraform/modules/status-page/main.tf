@@ -308,9 +308,28 @@ resource "aws_cloudfront_origin_access_control" "status" {
   signing_protocol                  = "sigv4"
 }
 
-# AWS managed cache policy for static content
-data "aws_cloudfront_cache_policy" "caching_optimized" {
-  name = "Managed-CachingOptimized"
+# Custom cache policy with short TTLs so CloudFront picks up S3 changes quickly.
+# The status page is a single small HTML file — aggressive caching isn't needed.
+resource "aws_cloudfront_cache_policy" "status" {
+  name        = replace("${var.name_prefix}-status-page-cache", ".", "-")
+  comment     = "Short TTL cache policy for status page - revalidates within 60s"
+  min_ttl     = 0
+  default_ttl = 60
+  max_ttl     = 300
+
+  parameters_in_cache_key_and_forwarded_to_origin {
+    cookies_config {
+      cookie_behavior = "none"
+    }
+    headers_config {
+      header_behavior = "none"
+    }
+    query_strings_config {
+      query_string_behavior = "none"
+    }
+    enable_accept_encoding_gzip   = true
+    enable_accept_encoding_brotli = true
+  }
 }
 
 resource "aws_cloudfront_response_headers_policy" "status" {
@@ -360,7 +379,7 @@ resource "aws_cloudfront_distribution" "status" {
     cached_methods   = ["GET", "HEAD"]
     target_origin_id = "S3-${local.bucket_name}"
 
-    cache_policy_id            = data.aws_cloudfront_cache_policy.caching_optimized.id
+    cache_policy_id            = aws_cloudfront_cache_policy.status.id
     response_headers_policy_id = aws_cloudfront_response_headers_policy.status.id
 
     viewer_protocol_policy = "redirect-to-https"

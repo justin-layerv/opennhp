@@ -857,7 +857,7 @@ variable "qurl_adot_collector_image" {
 variable "grafana_dashboards_enabled" {
   description = "Enable Grafana Cloud dashboard provisioning"
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "grafana_url" {
@@ -882,7 +882,7 @@ variable "grafana_nhp_dashboard_url" {
 variable "grafana_cloudwatch_enabled" {
   description = "Enable CloudWatch data source in Grafana for NHP Infrastructure dashboard"
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "grafana_cloud_aws_account_id" {
