@@ -15,7 +15,7 @@ terraform {
   required_providers {
     grafana = {
       source                = "grafana/grafana"
-      version               = "~> 3.0"
+      version               = "~> 4.0"
       configuration_aliases = [grafana]
     }
     aws = {
@@ -27,13 +27,15 @@ terraform {
 
 # Create a folder for QURL dashboards
 resource "grafana_folder" "qurl" {
-  title = var.folder_name
+  uid                          = "qurl"
+  title                        = var.folder_name
+  prevent_destroy_if_not_empty = true
 }
 
 # QURL Operations Dashboard
 # Monitors HTTP RED metrics (Rate, Errors, Duration) and DynamoDB performance
 resource "grafana_dashboard" "operations" {
-  folder = grafana_folder.qurl.id
+  folder = grafana_folder.qurl.uid
   config_json = templatefile("${path.module}/dashboards/qurl-operations.json", {
     datasource_uid = var.prometheus_datasource_uid
     tempo_uid      = var.tempo_datasource_uid
@@ -46,7 +48,7 @@ resource "grafana_dashboard" "operations" {
 # QURL Business Dashboard
 # Monitors business metrics: QURLs created, tokens, quotas
 resource "grafana_dashboard" "business" {
-  folder = grafana_folder.qurl.id
+  folder = grafana_folder.qurl.uid
   config_json = templatefile("${path.module}/dashboards/qurl-business.json", {
     datasource_uid = var.prometheus_datasource_uid
     environment    = var.environment
@@ -58,7 +60,7 @@ resource "grafana_dashboard" "business" {
 # QURL Webhooks Dashboard
 # Monitors webhook delivery metrics and health
 resource "grafana_dashboard" "webhooks" {
-  folder = grafana_folder.qurl.id
+  folder = grafana_folder.qurl.uid
   config_json = templatefile("${path.module}/dashboards/qurl-webhooks.json", {
     datasource_uid = var.prometheus_datasource_uid
     environment    = var.environment
@@ -84,20 +86,22 @@ resource "grafana_data_source" "cloudwatch" {
 
   json_data_encoded = jsonencode({
     defaultRegion = var.aws_region
-    authType      = "ec2_iam_role"
+    authType      = "grafana_assume_role"
     assumeRoleArn = local.cw_role_arn
   })
 }
 
 resource "grafana_folder" "nhp" {
-  count = var.cloudwatch_datasource_enabled ? 1 : 0
-  title = var.nhp_folder_name
+  count                        = var.cloudwatch_datasource_enabled ? 1 : 0
+  uid                          = "nhp"
+  title                        = var.nhp_folder_name
+  prevent_destroy_if_not_empty = true
 }
 
 resource "grafana_dashboard" "nhp_infrastructure" {
   count = var.cloudwatch_datasource_enabled ? 1 : 0
 
-  folder = grafana_folder.nhp[0].id
+  folder = grafana_folder.nhp[0].uid
   config_json = templatefile("${path.module}/dashboards/nhp-infrastructure.json", {
     cloudwatch_uid = grafana_data_source.cloudwatch[0].uid
     environment    = var.environment

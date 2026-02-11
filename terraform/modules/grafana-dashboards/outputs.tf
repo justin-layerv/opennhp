@@ -1,8 +1,8 @@
 # Grafana Dashboards Module Outputs
 
-output "folder_id" {
-  description = "Grafana folder ID for QURL dashboards"
-  value       = grafana_folder.qurl.id
+output "folder_uid" {
+  description = "Grafana folder UID for QURL dashboards"
+  value       = grafana_folder.qurl.uid
 }
 
 output "folder_url" {
