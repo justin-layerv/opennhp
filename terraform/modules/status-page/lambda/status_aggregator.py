@@ -2,7 +2,7 @@
 Status aggregator Lambda function.
 
 Reads deployment state from SSM, target group health from ELBv2,
-alarm states from CloudWatch, key metrics, and ASG details.
+alarm states from CloudWatch, key metrics, ASG details, and SSL cert expiry.
 Returns a JSON summary suitable for API Gateway proxy integration.
 """
 
@@ -21,6 +21,7 @@ ssm = boto3.client("ssm")
 elbv2 = boto3.client("elbv2")
 cloudwatch = boto3.client("cloudwatch")
 autoscaling = boto3.client("autoscaling")
+acm = boto3.client("acm")
 
 # CORS allows all origins intentionally: status data is public/read-only
 # and restricting to CloudFront domain would create a circular dependency
@@ -64,6 +65,7 @@ def build_status():
     ssm_prefix = os.environ.get("SSM_PREFIX", "")
     alarm_prefix = os.environ.get("ALARM_NAME_PREFIX", "")
     deployment_model = os.environ.get("DEPLOYMENT_MODEL", "blue_green")
+    region = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "unknown"))
 
     server_tg_arns = _parse_csv(os.environ.get("SERVER_NLB_TG_ARNS", ""))
     ac_tg_arns = _parse_csv(os.environ.get("AC_NLB_TG_ARNS", ""))
@@ -87,8 +89,9 @@ def build_status():
         "deployed_at": all_params.get(f"{ssm_prefix}/deploy/deployed-at"),
     }
 
-    server_health = _aggregate_target_health(server_tg_arns)
-    ac_health = _aggregate_target_health(ac_tg_arns)
+    # Single pass: returns both aggregate counts and per-TG breakdown
+    server_health, server_per_tg = _aggregate_target_health(server_tg_arns)
+    ac_health, ac_per_tg = _aggregate_target_health(ac_tg_arns)
 
     alarms = _get_alarm_states(alarm_prefix)
 
@@ -105,20 +108,29 @@ def build_status():
     asg_details = _get_asg_details()
     canary = _get_canary_state() if deployment_model == "canary" else None
     dependent_services = _check_dependent_services()
+    ssl_certs = _get_ssl_cert_expiry()
 
     return {
         "environment": environment,
+        "region": region,
         "deployment_model": deployment_model,
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "components": {
-            "server": _build_component(server_params, server_health, server_has_alarm),
-            "ac": _build_component(ac_params, ac_health, ac_has_alarm),
+            "server": _build_component(
+                server_params, server_health, server_has_alarm,
+                per_tg_health=server_per_tg,
+            ),
+            "ac": _build_component(
+                ac_params, ac_health, ac_has_alarm,
+                per_tg_health=ac_per_tg,
+            ),
         },
         "alarms": alarms,
         "key_metrics": key_metrics,
         "asg_details": asg_details,
         "canary": canary,
         "dependent_services": dependent_services,
+        "ssl_certs": ssl_certs,
     }
 
 
@@ -172,26 +184,50 @@ def _get_all_ssm_params(prefix):
 # ---------------------------------------------------------------------------
 
 def _aggregate_target_health(tg_arns):
-    """Return aggregated healthy / unhealthy / total counts across TG ARNs."""
-    healthy = 0
-    unhealthy = 0
-    total = 0
+    """Return aggregated and per-TG health from a single pass of API calls.
+
+    Returns (aggregate, per_tg) where:
+      aggregate = {"healthy": int, "unhealthy": int, "total": int}
+      per_tg = [{"arn": str, "name": str, "healthy": int, "unhealthy": int, "total": int}, ...]
+    """
+    agg_healthy = 0
+    agg_unhealthy = 0
+    agg_total = 0
+    per_tg = []
 
     for arn in tg_arns:
+        # Extract TG name from ARN: ...targetgroup/<name>/<id>
+        parts = arn.split("/")
+        tg_name = parts[-2] if len(parts) >= 2 else arn
+
+        tg_healthy = 0
+        tg_unhealthy = 0
+        tg_total = 0
         try:
             resp = elbv2.describe_target_health(TargetGroupArn=arn)
             for desc in resp.get("TargetHealthDescriptions", []):
-                total += 1
+                tg_total += 1
                 state = desc.get("TargetHealth", {}).get("State", "")
                 if state == "healthy":
-                    healthy += 1
+                    tg_healthy += 1
                 else:
-                    unhealthy += 1
+                    tg_unhealthy += 1
         except Exception:
             print(f"WARN: Failed to describe target health for {arn}: {traceback.format_exc()}")
-            continue
 
-    return {"healthy": healthy, "unhealthy": unhealthy, "total": total}
+        agg_healthy += tg_healthy
+        agg_unhealthy += tg_unhealthy
+        agg_total += tg_total
+        per_tg.append({
+            "arn": arn,
+            "name": tg_name,
+            "healthy": tg_healthy,
+            "unhealthy": tg_unhealthy,
+            "total": tg_total,
+        })
+
+    aggregate = {"healthy": agg_healthy, "unhealthy": agg_unhealthy, "total": agg_total}
+    return aggregate, per_tg
 
 
 # ---------------------------------------------------------------------------
@@ -510,13 +546,88 @@ def _check_dependent_services():
 
 
 # ---------------------------------------------------------------------------
+# SSL certificate expiry
+# ---------------------------------------------------------------------------
+
+def _get_ssl_cert_expiry():
+    """Check ACM certificate expiry for monitored domains.
+
+    Reads SSL_CERT_ARNS env var (JSON map of label -> cert ARN).
+    Returns a list of {domain, expires_at, days_remaining, status} or None.
+    Status uses "ok" / "warning" / "critical" (distinct from component health
+    which uses "healthy" / "degraded" / "unhealthy") since they represent
+    different domains: cert validity vs service availability.
+    """
+    raw = os.environ.get("SSL_CERT_ARNS", "")
+    if not raw or raw == "{}":
+        return None
+
+    try:
+        cert_map = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        print(f"WARN: Invalid SSL_CERT_ARNS: {raw}")
+        return None
+
+    if not cert_map:
+        return None
+
+    now = datetime.now(timezone.utc)
+    results = []
+
+    for label, cert_arn in cert_map.items():
+        try:
+            resp = acm.describe_certificate(CertificateArn=cert_arn)
+            cert = resp["Certificate"]
+            not_after = cert.get("NotAfter")
+            domain = cert.get("DomainName", label)
+
+            if not_after:
+                # NotAfter is already a datetime object from boto3
+                if not_after.tzinfo is None:
+                    not_after = not_after.replace(tzinfo=timezone.utc)
+                days_remaining = (not_after - now).days
+                expires_at = not_after.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                if days_remaining < 7:
+                    status = "critical"
+                elif days_remaining < 30:
+                    status = "warning"
+                else:
+                    status = "ok"
+
+                results.append({
+                    "domain": domain,
+                    "expires_at": expires_at,
+                    "days_remaining": days_remaining,
+                    "status": status,
+                })
+            else:
+                results.append({
+                    "domain": domain,
+                    "expires_at": None,
+                    "days_remaining": None,
+                    "status": "unknown",
+                })
+        except Exception:
+            print(f"WARN: Failed to describe cert {cert_arn}: {traceback.format_exc()}")
+            results.append({
+                "domain": label,
+                "expires_at": None,
+                "days_remaining": None,
+                "status": "unknown",
+            })
+
+    return results if results else None
+
+
+# ---------------------------------------------------------------------------
 # Status derivation
 # ---------------------------------------------------------------------------
 
-def _build_component(params, health, has_alarm):
+def _build_component(params, health, has_alarm, per_tg_health=None):
     """Combine SSM params, target health, and alarm state into a component dict."""
     status = _derive_status(health, has_alarm)
-    return {
+    result = {
         "status": status,
         "active_color": params.get("active_color") or "blue",
         "image_tag": params.get("image_tag"),
@@ -528,6 +639,9 @@ def _build_component(params, health, has_alarm):
         "green_image_tag": params.get("green_image_tag"),
         "last_switch_timestamp": params.get("last_switch_timestamp"),
     }
+    if per_tg_health:
+        result["per_tg_health"] = per_tg_health
+    return result
 
 
 def _derive_status(health, has_alarm):

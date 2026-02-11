@@ -937,6 +937,91 @@
       color: var(--accent-blue);
     }
 
+    /* -- SSL Certs section -- */
+    .ssl-certs-section {
+      margin-bottom: var(--space-lg);
+      animation: fadeIn var(--transition-slow) ease-out both;
+      animation-delay: 180ms;
+    }
+
+    .ssl-certs-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: var(--space-sm);
+    }
+
+    .ssl-cert-tile {
+      background: var(--glass-bg);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius-md);
+      padding: var(--space-sm) var(--space-md);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      transition: border-color var(--transition-fast);
+    }
+
+    .ssl-cert-tile:hover {
+      border-color: var(--border-hover);
+    }
+
+    .ssl-cert-domain {
+      font-size: var(--text-sm);
+      font-weight: var(--weight-medium);
+      color: var(--text-secondary);
+    }
+
+    .ssl-cert-info {
+      display: flex;
+      align-items: center;
+      gap: var(--space-sm);
+    }
+
+    .ssl-cert-days {
+      font-family: var(--font-mono);
+      font-size: var(--text-xs);
+    }
+
+    .ssl-cert-days.cert-ok { color: var(--status-healthy); }
+    .ssl-cert-days.cert-warning { color: var(--status-degraded); }
+    .ssl-cert-days.cert-critical { color: var(--status-unhealthy); }
+    .ssl-cert-days.cert-unknown { color: var(--text-tertiary); }
+
+    .ssl-cert-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .ssl-cert-dot.cert-dot-ok {
+      background: var(--status-healthy);
+      box-shadow: 0 0 6px var(--status-healthy-glow);
+    }
+
+    .ssl-cert-dot.cert-dot-warning {
+      background: var(--status-degraded);
+      animation: pulse-degraded 2s ease-in-out infinite;
+    }
+
+    .ssl-cert-dot.cert-dot-critical {
+      background: var(--status-unhealthy);
+      animation: pulse-unhealthy 1.5s ease-in-out infinite;
+    }
+
+    .ssl-cert-dot.cert-dot-unknown {
+      background: var(--status-unknown);
+    }
+
+    /* -- Region badge (header) -- */
+    .region-badge {
+      font-size: var(--text-xs);
+      color: var(--text-tertiary);
+      font-family: var(--font-mono);
+    }
+
     /* -- Content visibility -- */
     .content {
       display: none;
@@ -954,6 +1039,7 @@
       <span class="env-badge" id="env-badge" aria-label="Environment">--</span>
     </div>
     <div class="header-right">
+      <span class="region-badge" id="region-badge"></span>
       <span class="conn-indicator conn-stale" id="conn-indicator">
         <span class="conn-dot" aria-hidden="true"></span>
         <span class="conn-label">Connecting</span>
@@ -1079,6 +1165,11 @@
         <div class="dep-services-grid" id="dep-services-grid"></div>
       </div>
 
+      <div class="ssl-certs-section" id="ssl-certs-section" style="display:none" role="status" aria-label="SSL certificates">
+        <div class="section-title">SSL Certificates</div>
+        <div class="ssl-certs-grid" id="ssl-certs-grid"></div>
+      </div>
+
       <div class="alarms-section" id="alarms-section" role="status" aria-live="polite">
         <div class="section-title">Alarms</div>
         <div id="alarms-content">
@@ -1179,7 +1270,10 @@
         alarmsContent: document.getElementById('alarms-content'),
         metricsBar: document.getElementById('metrics-bar'),
         depServicesSection: document.getElementById('dep-services-section'),
-        depServicesGrid: document.getElementById('dep-services-grid')
+        depServicesGrid: document.getElementById('dep-services-grid'),
+        sslCertsSection: document.getElementById('ssl-certs-section'),
+        sslCertsGrid: document.getElementById('ssl-certs-grid'),
+        regionBadge: document.getElementById('region-badge')
       };
 
       var STATUS_LABELS = {
@@ -1422,7 +1516,7 @@
         if (deploymentModel === 'blue_green' && comp.green_image_tag) {
           var standbyColor = comp.active_color === 'blue' ? 'green' : 'blue';
           var section = createEl('div', { className: 'standby-section' });
-          section.appendChild(createEl('div', { className: 'standby-label', textContent: 'Standby' }));
+          section.appendChild(createEl('div', { className: 'standby-label', textContent: 'Standby (' + standbyColor + ')' }));
 
           var colorRow = createEl('div', { className: 'card-row' }, [
             createEl('span', { className: 'card-label', textContent: 'Color' }),
@@ -1435,6 +1529,20 @@
             createEl('span', { className: 'card-value mono', textContent: comp.green_image_tag })
           ]);
           section.appendChild(tagRow);
+
+          /* Per-TG health for standby: server_nlb_tg_arns is ordered
+             [active, standby] by Terraform, so perTg[1] is the standby TG. */
+          var perTg = comp.per_tg_health;
+          if (perTg && perTg.length > 1) {
+            var standbyTg = perTg[1];
+            var tgHealthRow = createEl('div', { className: 'card-row' }, [
+              createEl('span', { className: 'card-label', textContent: 'TG Health' }),
+              createEl('span', { className: 'card-value' }, [
+                createHealthBar(standbyTg.healthy, standbyTg.unhealthy, standbyTg.total)
+              ])
+            ]);
+            section.appendChild(tgHealthRow);
+          }
 
           if (comp.last_switch_timestamp) {
             var switchRow = createEl('div', { className: 'card-row' });
@@ -1556,6 +1664,39 @@
           ]);
 
           els.depServicesGrid.appendChild(tile);
+        }
+      }
+
+      /* -- SSL Certificates -- */
+      function renderSslCerts(certs) {
+        if (!certs || certs.length === 0) {
+          els.sslCertsSection.style.display = 'none';
+          return;
+        }
+
+        els.sslCertsSection.style.display = '';
+        replaceContent(els.sslCertsGrid);
+
+        for (var i = 0; i < certs.length; i++) {
+          var cert = certs[i];
+          var days = cert.days_remaining;
+          var status = cert.status || 'unknown';
+
+          var daysText = days != null ? days + 'd' : '--';
+          var daysClass = 'cert-' + status;
+          var dotClass = 'cert-dot-' + status;
+
+          var expiryTitle = cert.expires_at ? 'Expires: ' + formatAbsoluteTime(cert.expires_at) : '';
+
+          var tile = createEl('div', { className: 'ssl-cert-tile', title: expiryTitle }, [
+            createEl('span', { className: 'ssl-cert-domain', textContent: cert.domain }),
+            createEl('div', { className: 'ssl-cert-info' }, [
+              createEl('span', { className: 'ssl-cert-days ' + daysClass, textContent: daysText }),
+              createEl('span', { className: 'ssl-cert-dot ' + dotClass })
+            ])
+          ]);
+
+          els.sslCertsGrid.appendChild(tile);
         }
       }
 
@@ -1705,6 +1846,11 @@
         lastData = data;
         els.envBadge.textContent = data.environment || '--';
 
+        /* Region display */
+        if (data.region && data.region !== 'unknown') {
+          els.regionBadge.textContent = data.region;
+        }
+
         var components = data.components || {};
         var deploymentModel = data.deployment_model || 'blue_green';
 
@@ -1720,6 +1866,7 @@
         renderComponent('ac', components.ac, deploymentModel, data.canary, data.asg_details);
         renderMetrics(data.key_metrics);
         renderDependentServices(data.dependent_services);
+        renderSslCerts(data.ssl_certs);
         renderAlarms(data.alarms);
 
         els.loading.style.display = 'none';

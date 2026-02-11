@@ -139,6 +139,16 @@ variable "dependent_service_urls" {
 }
 
 # ==============================================================================
+# SSL Certificate Monitoring
+# ==============================================================================
+
+variable "ssl_cert_arns" {
+  description = "Map of label to ACM certificate ARN for SSL expiry monitoring. Lambda checks each cert and reports days remaining."
+  type        = map(string)
+  default     = {}
+}
+
+# ==============================================================================
 # Encryption
 # ==============================================================================
 

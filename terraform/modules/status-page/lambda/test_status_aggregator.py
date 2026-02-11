@@ -185,8 +185,12 @@ class TestAggregateTargetHealth:
                 {"TargetHealth": {"State": "unhealthy"}},
             ]
         }
-        result = _aggregate_target_health(["arn:aws:tg/test"])
-        assert result == {"healthy": 2, "unhealthy": 1, "total": 3}
+        agg, per_tg = _aggregate_target_health(["arn:aws:tg/test"])
+        assert agg == {"healthy": 2, "unhealthy": 1, "total": 3}
+        assert len(per_tg) == 1
+        assert per_tg[0]["healthy"] == 2
+        assert per_tg[0]["unhealthy"] == 1
+        assert per_tg[0]["total"] == 3
 
     @patch("status_aggregator.elbv2")
     def test_empty_target_group(self, mock_elbv2):
@@ -194,13 +198,15 @@ class TestAggregateTargetHealth:
         mock_elbv2.describe_target_health.return_value = {
             "TargetHealthDescriptions": []
         }
-        result = _aggregate_target_health(["arn:aws:tg/empty"])
-        assert result == {"healthy": 0, "unhealthy": 0, "total": 0}
+        agg, per_tg = _aggregate_target_health(["arn:aws:tg/empty"])
+        assert agg == {"healthy": 0, "unhealthy": 0, "total": 0}
+        assert len(per_tg) == 1
 
     def test_no_arns(self):
         from status_aggregator import _aggregate_target_health
-        result = _aggregate_target_health([])
-        assert result == {"healthy": 0, "unhealthy": 0, "total": 0}
+        agg, per_tg = _aggregate_target_health([])
+        assert agg == {"healthy": 0, "unhealthy": 0, "total": 0}
+        assert per_tg == []
 
     @patch("status_aggregator.elbv2")
     def test_aggregates_multiple_target_groups(self, mock_elbv2):
@@ -209,8 +215,9 @@ class TestAggregateTargetHealth:
             {"TargetHealthDescriptions": [{"TargetHealth": {"State": "healthy"}}]},
             {"TargetHealthDescriptions": [{"TargetHealth": {"State": "unhealthy"}}]},
         ]
-        result = _aggregate_target_health(["arn:tg/1", "arn:tg/2"])
-        assert result == {"healthy": 1, "unhealthy": 1, "total": 2}
+        agg, per_tg = _aggregate_target_health(["arn:tg/1", "arn:tg/2"])
+        assert agg == {"healthy": 1, "unhealthy": 1, "total": 2}
+        assert len(per_tg) == 2
 
     @patch("status_aggregator.elbv2")
     def test_continues_on_error(self, mock_elbv2):
@@ -219,8 +226,11 @@ class TestAggregateTargetHealth:
             RuntimeError("access denied"),
             {"TargetHealthDescriptions": [{"TargetHealth": {"State": "healthy"}}]},
         ]
-        result = _aggregate_target_health(["arn:tg/bad", "arn:tg/good"])
-        assert result == {"healthy": 1, "unhealthy": 0, "total": 1}
+        agg, per_tg = _aggregate_target_health(["arn:tg/bad", "arn:tg/good"])
+        assert agg == {"healthy": 1, "unhealthy": 0, "total": 1}
+        assert len(per_tg) == 2
+        assert per_tg[0]["healthy"] == 0  # errored TG
+        assert per_tg[1]["healthy"] == 1
 
     @patch("status_aggregator.elbv2")
     def test_initial_and_draining_count_as_unhealthy(self, mock_elbv2):
@@ -232,8 +242,32 @@ class TestAggregateTargetHealth:
                 {"TargetHealth": {"State": "healthy"}},
             ]
         }
-        result = _aggregate_target_health(["arn:aws:tg/mixed"])
-        assert result == {"healthy": 1, "unhealthy": 2, "total": 3}
+        agg, per_tg = _aggregate_target_health(["arn:aws:tg/mixed"])
+        assert agg == {"healthy": 1, "unhealthy": 2, "total": 3}
+
+    @patch("status_aggregator.elbv2")
+    def test_per_tg_extracts_name_from_arn(self, mock_elbv2):
+        from status_aggregator import _aggregate_target_health
+        mock_elbv2.describe_target_health.side_effect = [
+            {"TargetHealthDescriptions": [
+                {"TargetHealth": {"State": "healthy"}},
+                {"TargetHealth": {"State": "healthy"}},
+            ]},
+            {"TargetHealthDescriptions": [
+                {"TargetHealth": {"State": "unhealthy"}},
+            ]},
+        ]
+        _, per_tg = _aggregate_target_health([
+            "arn:aws:elasticloadbalancing:us-east-1:123:targetgroup/server-blue/abc",
+            "arn:aws:elasticloadbalancing:us-east-1:123:targetgroup/server-green/def",
+        ])
+        assert len(per_tg) == 2
+        assert per_tg[0]["name"] == "server-blue"
+        assert per_tg[0]["healthy"] == 2
+        assert per_tg[0]["total"] == 2
+        assert per_tg[1]["name"] == "server-green"
+        assert per_tg[1]["unhealthy"] == 1
+        assert per_tg[1]["total"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -762,6 +796,7 @@ class TestHandler:
 class TestBuildStatus:
     """Integration tests for build_status with all dependencies mocked."""
 
+    @patch("status_aggregator._get_ssl_cert_expiry")
     @patch("status_aggregator._check_dependent_services")
     @patch("status_aggregator._get_canary_state")
     @patch("status_aggregator._get_asg_details")
@@ -769,8 +804,9 @@ class TestBuildStatus:
     @patch("status_aggregator._get_alarm_states")
     @patch("status_aggregator._aggregate_target_health")
     @patch("status_aggregator._get_all_ssm_params")
-    def test_full_build_blue_green(self, mock_all_params, mock_health, mock_alarms,
-                                    mock_metrics, mock_asg, mock_canary, mock_dep_svc):
+    def test_full_build_blue_green(self, mock_all_params, mock_health,
+                                    mock_alarms, mock_metrics, mock_asg,
+                                    mock_canary, mock_dep_svc, mock_ssl):
         from status_aggregator import build_status
         mock_all_params.return_value = {
             "/sandbox/nhp/server/active-color": "blue",
@@ -784,30 +820,36 @@ class TestBuildStatus:
             "/sandbox/nhp/deploy/deployed-commit": "deadbeef",
             "/sandbox/nhp/deploy/deployed-at": "2025-01-01T00:00:00Z",
         }
-        mock_health.return_value = {"healthy": 2, "unhealthy": 0, "total": 2}
+        per_tg_data = [{"arn": "arn:tg/blue", "name": "blue", "healthy": 2, "unhealthy": 0, "total": 2}]
+        mock_health.return_value = ({"healthy": 2, "unhealthy": 0, "total": 2}, per_tg_data)
         mock_alarms.return_value = {"active": [], "ok": [{"name": "nhp-sandbox-server-cpu", "description": "", "metric_name": "CPUUtilization", "namespace": "AWS/EC2", "threshold": 80, "comparison": "GreaterThanThreshold", "state_reason": "OK"}]}
         mock_metrics.return_value = {"server_cpu": 23.5, "ac_cpu": 15.2}
         mock_asg.return_value = {"server": {"desired_capacity": 2, "min_size": 1, "max_size": 4, "instances": []}}
         mock_dep_svc.return_value = {"qurl_api": {"status": "healthy", "response_time_ms": 45}}
+        mock_ssl.return_value = None
 
         result = build_status()
 
         assert result["environment"] == "sandbox"
         assert result["deployment_model"] == "blue_green"
         assert "timestamp" in result
+        assert "region" in result
         assert result["components"]["server"]["status"] == "healthy"
         assert result["components"]["server"]["image_tag"] == "abc123"
         assert result["components"]["server"]["deployed_commit"] == "deadbeef"
         assert result["components"]["server"]["green_image_tag"] == "def456"
         assert result["components"]["server"]["last_switch_timestamp"] == "2025-01-15T10:30:00Z"
+        assert result["components"]["server"]["per_tg_health"] is not None
         assert result["components"]["ac"]["status"] == "healthy"
         assert result["alarms"]["active"] == []
         assert result["key_metrics"]["server_cpu"] == 23.5
         assert result["asg_details"]["server"]["desired_capacity"] == 2
         assert result["canary"] is None  # blue_green model, canary not called
         assert result["dependent_services"]["qurl_api"]["status"] == "healthy"
+        assert result["ssl_certs"] is None
 
     @patch.dict(os.environ, {"DEPLOYMENT_MODEL": "canary"})
+    @patch("status_aggregator._get_ssl_cert_expiry")
     @patch("status_aggregator._check_dependent_services")
     @patch("status_aggregator._get_canary_state")
     @patch("status_aggregator._get_asg_details")
@@ -815,8 +857,9 @@ class TestBuildStatus:
     @patch("status_aggregator._get_alarm_states")
     @patch("status_aggregator._aggregate_target_health")
     @patch("status_aggregator._get_all_ssm_params")
-    def test_full_build_canary(self, mock_all_params, mock_health, mock_alarms,
-                               mock_metrics, mock_asg, mock_canary, mock_dep_svc):
+    def test_full_build_canary(self, mock_all_params, mock_health,
+                               mock_alarms, mock_metrics, mock_asg,
+                               mock_canary, mock_dep_svc, mock_ssl):
         from status_aggregator import build_status
         mock_all_params.return_value = {
             "/sandbox/nhp/server/active-color": None,
@@ -830,12 +873,13 @@ class TestBuildStatus:
             "/sandbox/nhp/deploy/deployed-commit": "deadbeef",
             "/sandbox/nhp/deploy/deployed-at": "2025-01-01T00:00:00Z",
         }
-        mock_health.return_value = {"healthy": 1, "unhealthy": 0, "total": 1}
+        mock_health.return_value = ({"healthy": 1, "unhealthy": 0, "total": 1}, [])
         mock_alarms.return_value = {"active": [], "ok": []}
         mock_metrics.return_value = None
         mock_asg.return_value = None
         mock_canary.return_value = {"state": "deploying"}
         mock_dep_svc.return_value = None
+        mock_ssl.return_value = None
 
         result = build_status()
 
@@ -844,6 +888,7 @@ class TestBuildStatus:
         assert result["dependent_services"] is None
         mock_canary.assert_called_once()
 
+    @patch("status_aggregator._get_ssl_cert_expiry")
     @patch("status_aggregator._check_dependent_services")
     @patch("status_aggregator._get_canary_state")
     @patch("status_aggregator._get_asg_details")
@@ -851,8 +896,9 @@ class TestBuildStatus:
     @patch("status_aggregator._get_alarm_states")
     @patch("status_aggregator._aggregate_target_health")
     @patch("status_aggregator._get_all_ssm_params")
-    def test_server_alarm_only_degrades_server(self, mock_all_params, mock_health, mock_alarms,
-                                                mock_metrics, mock_asg, mock_canary, mock_dep_svc):
+    def test_server_alarm_only_degrades_server(self, mock_all_params, mock_health,
+                                                mock_alarms, mock_metrics, mock_asg,
+                                                mock_canary, mock_dep_svc, mock_ssl):
         from status_aggregator import build_status
         mock_all_params.return_value = {
             "/sandbox/nhp/server/active-color": "green",
@@ -866,15 +912,136 @@ class TestBuildStatus:
             "/sandbox/nhp/deploy/deployed-commit": None,
             "/sandbox/nhp/deploy/deployed-at": None,
         }
-        mock_health.return_value = {"healthy": 1, "unhealthy": 0, "total": 1}
+        mock_health.return_value = ({"healthy": 1, "unhealthy": 0, "total": 1}, [])
         mock_alarms.return_value = {
             "active": [{"name": "nhp-sandbox-server-cpu-high", "description": "", "metric_name": "CPUUtilization", "namespace": "AWS/EC2", "threshold": 80, "comparison": "GreaterThanThreshold", "state_reason": "Crossed"}],
             "ok": [],
         }
         mock_metrics.return_value = None
         mock_asg.return_value = None
+        mock_ssl.return_value = None
 
         result = build_status()
 
         assert result["components"]["server"]["status"] == "degraded"
         assert result["components"]["ac"]["status"] == "healthy"
+
+
+# ---------------------------------------------------------------------------
+# _get_ssl_cert_expiry
+# ---------------------------------------------------------------------------
+
+class TestGetSslCertExpiry:
+    """Tests for SSL certificate expiry checking."""
+
+    @patch.dict(os.environ, {"SSL_CERT_ARNS": '{"console": "arn:aws:acm:us-east-1:123:certificate/abc"}'})
+    @patch("status_aggregator.acm")
+    def test_returns_cert_info(self, mock_acm):
+        from status_aggregator import _get_ssl_cert_expiry
+        from datetime import datetime, timezone, timedelta
+        future = datetime.now(timezone.utc) + timedelta(days=90)
+        mock_acm.describe_certificate.return_value = {
+            "Certificate": {
+                "DomainName": "console.nhp.layerv.xyz",
+                "NotAfter": future,
+            }
+        }
+        result = _get_ssl_cert_expiry()
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["domain"] == "console.nhp.layerv.xyz"
+        assert result[0]["days_remaining"] >= 89
+        assert result[0]["status"] == "ok"
+
+    @patch.dict(os.environ, {"SSL_CERT_ARNS": '{"console": "arn:aws:acm:us-east-1:123:certificate/abc"}'})
+    @patch("status_aggregator.acm")
+    def test_warning_when_expiring_soon(self, mock_acm):
+        from status_aggregator import _get_ssl_cert_expiry
+        from datetime import datetime, timezone, timedelta
+        future = datetime.now(timezone.utc) + timedelta(days=15)
+        mock_acm.describe_certificate.return_value = {
+            "Certificate": {
+                "DomainName": "console.nhp.layerv.xyz",
+                "NotAfter": future,
+            }
+        }
+        result = _get_ssl_cert_expiry()
+        assert result[0]["status"] == "warning"
+
+    @patch.dict(os.environ, {"SSL_CERT_ARNS": '{"console": "arn:aws:acm:us-east-1:123:certificate/abc"}'})
+    @patch("status_aggregator.acm")
+    def test_critical_when_expiring_very_soon(self, mock_acm):
+        from status_aggregator import _get_ssl_cert_expiry
+        from datetime import datetime, timezone, timedelta
+        future = datetime.now(timezone.utc) + timedelta(days=3)
+        mock_acm.describe_certificate.return_value = {
+            "Certificate": {
+                "DomainName": "console.nhp.layerv.xyz",
+                "NotAfter": future,
+            }
+        }
+        result = _get_ssl_cert_expiry()
+        assert result[0]["status"] == "critical"
+
+    @patch.dict(os.environ, {"SSL_CERT_ARNS": ""})
+    def test_returns_none_when_empty(self):
+        from status_aggregator import _get_ssl_cert_expiry
+        result = _get_ssl_cert_expiry()
+        assert result is None
+
+    @patch.dict(os.environ, {"SSL_CERT_ARNS": "{}"})
+    def test_returns_none_when_empty_map(self):
+        from status_aggregator import _get_ssl_cert_expiry
+        result = _get_ssl_cert_expiry()
+        assert result is None
+
+    @patch.dict(os.environ, {"SSL_CERT_ARNS": '{"console": "arn:aws:acm:us-east-1:123:certificate/abc"}'})
+    @patch("status_aggregator.acm")
+    def test_returns_unknown_on_error(self, mock_acm):
+        from status_aggregator import _get_ssl_cert_expiry
+        mock_acm.describe_certificate.side_effect = RuntimeError("not found")
+        result = _get_ssl_cert_expiry()
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["domain"] == "console"
+        assert result[0]["status"] == "unknown"
+
+    @patch.dict(os.environ, {"SSL_CERT_ARNS": "not valid json"})
+    def test_returns_none_on_invalid_json(self):
+        from status_aggregator import _get_ssl_cert_expiry
+        result = _get_ssl_cert_expiry()
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _build_component with per_tg_health
+# ---------------------------------------------------------------------------
+
+class TestBuildComponentPerTg:
+    """Tests for _build_component with per-TG health data."""
+
+    def test_includes_per_tg_health_when_present(self):
+        from status_aggregator import _build_component
+        params = {"active_color": "blue", "image_tag": "abc", "deployed_at": None,
+                  "deployed_commit": None, "green_image_tag": None, "last_switch_timestamp": None}
+        health = {"healthy": 2, "unhealthy": 0, "total": 2}
+        per_tg = [{"arn": "arn:tg/blue", "name": "blue", "healthy": 2, "unhealthy": 0, "total": 2}]
+        result = _build_component(params, health, False, per_tg_health=per_tg)
+        assert "per_tg_health" in result
+        assert result["per_tg_health"][0]["name"] == "blue"
+
+    def test_omits_per_tg_health_when_empty(self):
+        from status_aggregator import _build_component
+        params = {"active_color": "blue", "image_tag": "abc", "deployed_at": None,
+                  "deployed_commit": None, "green_image_tag": None, "last_switch_timestamp": None}
+        health = {"healthy": 1, "unhealthy": 0, "total": 1}
+        result = _build_component(params, health, False, per_tg_health=[])
+        assert "per_tg_health" not in result
+
+    def test_omits_per_tg_health_when_none(self):
+        from status_aggregator import _build_component
+        params = {"active_color": "blue", "image_tag": "abc", "deployed_at": None,
+                  "deployed_commit": None, "green_image_tag": None, "last_switch_timestamp": None}
+        health = {"healthy": 1, "unhealthy": 0, "total": 1}
+        result = _build_component(params, health, False)
+        assert "per_tg_health" not in result

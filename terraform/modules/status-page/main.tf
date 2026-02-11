@@ -70,6 +70,7 @@ resource "aws_lambda_function" "status_aggregator" {
       DEPLOYMENT_MODEL       = var.deployment_model
       CANARY_STATE_SSM_PARAM = var.canary_state_ssm_param
       DEPENDENT_SERVICE_URLS = jsonencode(var.dependent_service_urls)
+      SSL_CERT_ARNS          = jsonencode(var.ssl_cert_arns)
     }
   }
 
@@ -188,6 +189,14 @@ resource "aws_iam_role_policy" "status_aggregator" {
             "aws:RequestedRegion" = data.aws_region.current.id
           }
         }
+      },
+      {
+        Sid    = "DescribeACMCertificates"
+        Effect = "Allow"
+        Action = [
+          "acm:DescribeCertificate"
+        ]
+        Resource = "arn:aws:acm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:certificate/*"
       }
     ]
   })
