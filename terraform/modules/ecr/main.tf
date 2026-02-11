@@ -1133,6 +1133,38 @@ resource "aws_iam_policy" "terraform_apply_services" {
         Resource = "arn:aws:events:${local.region}:${local.account_id}:rule/layerv-nhp-*"
       },
       {
+        # API Gateway v2 (HTTP API) for status page
+        Sid    = "APIGatewayV2"
+        Effect = "Allow"
+        Action = [
+          "apigateway:POST",
+          "apigateway:GET",
+          "apigateway:PATCH",
+          "apigateway:DELETE",
+          "apigateway:PUT",
+          "apigateway:TagResource",
+          "apigateway:UntagResource"
+        ]
+        Resource = [
+          "arn:aws:apigateway:${local.region}::/apis",
+          "arn:aws:apigateway:${local.region}::/apis/*",
+          "arn:aws:apigateway:${local.region}::/tags/*"
+        ]
+      },
+      {
+        # S3 object permissions for status page frontend (index.html upload)
+        Sid    = "S3StatusPage"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:GetObjectTagging",
+          "s3:PutObjectTagging"
+        ]
+        Resource = "arn:aws:s3:::layerv-nhp-*-status-page-*/*"
+      },
+      {
         # ECR lifecycle and repository policy management for terraform-managed repos
         Sid    = "ECRManagement"
         Effect = "Allow"
