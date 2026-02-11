@@ -1145,11 +1145,10 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "apigateway:TagResource",
           "apigateway:UntagResource"
         ]
-        Resource = [
-          "arn:aws:apigateway:${local.region}::/apis",
-          "arn:aws:apigateway:${local.region}::/apis/*",
-          "arn:aws:apigateway:${local.region}::/tags/*"
-        ]
+        # Resource uses /* because API Gateway tag ARNs contain URL-encoded
+        # sub-ARNs (e.g., /tags/arn%3Aaws%3Aapigateway%3A...%2Fv2%2Fapis%2F*)
+        # which don't match narrower /tags/* patterns in IAM evaluation.
+        Resource = "arn:aws:apigateway:${local.region}::/*"
       },
       {
         # S3 object permissions for status page frontend (index.html upload)
