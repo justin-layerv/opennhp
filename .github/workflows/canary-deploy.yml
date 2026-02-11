@@ -296,6 +296,87 @@ jobs:
           done
 
   # =============================================================================
+  # NOTIFY - Send deployment notification to SNS (Slack via AWS Chatbot)
+  # =============================================================================
+  notify:
+    name: Notify
+    if: always()
+    needs: [validate, deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+        with:
+          role-to-assume: ${{ inputs.environment == 'prod' && secrets.AWS_PROD_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Send deployment notification
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          COMPONENT: ${{ inputs.component }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          DEPLOY_STATUS: ${{ needs.deploy.outputs.status }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Read SNS topic ARN from SSM
+          SNS_ARN=$(aws ssm get-parameter \
+            --name "/${ENVIRONMENT}/nhp/monitoring/sns-topic-arn" \
+            --query 'Parameter.Value' --output text 2>/dev/null) || SNS_ARN=""
+
+          if [ -z "$SNS_ARN" ] || [[ ! "$SNS_ARN" =~ ^arn:aws:sns: ]]; then
+            echo "No valid SNS topic ARN found at /${ENVIRONMENT}/nhp/monitoring/sns-topic-arn, skipping notification"
+            exit 0
+          fi
+
+          # Determine overall status
+          if [[ "$DEPLOY_RESULT" == "success" ]]; then
+            STATUS="SUCCESS"
+          elif [[ "$VALIDATE_RESULT" != "success" ]]; then
+            STATUS="FAILED (validation)"
+          elif [[ "$DEPLOY_RESULT" == "failure" ]]; then
+            STATUS="FAILED (${DEPLOY_STATUS:-deploy})"
+          else
+            STATUS="FAILED"
+          fi
+
+          # Build message
+          SUBJECT="Canary Deploy: ${STATUS} - ${COMPONENT} (${ENVIRONMENT})"
+
+          MSG="Canary Deployment Notification"
+          MSG+="\n"
+          MSG+="\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          MSG+="\n  Status:      ${STATUS}"
+          MSG+="\n  Environment: ${ENVIRONMENT}"
+          MSG+="\n  Component:   ${COMPONENT}"
+          MSG+="\n  Image Tag:   ${IMAGE_TAG}"
+          MSG+="\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          MSG+="\n"
+          MSG+="\n┌─ Stage Results ─────────────────"
+          MSG+="\n│ Validation: $([ "$VALIDATE_RESULT" = "success" ] && echo "[OK]" || echo "[FAILED]") ${VALIDATE_RESULT}"
+          MSG+="\n│ Deployment: $([ "$DEPLOY_RESULT" = "success" ] && echo "[OK]" || [ "$DEPLOY_RESULT" = "skipped" ] && echo "[SKIP]" || echo "[FAILED]") ${DEPLOY_RESULT}"
+          MSG+="\n└─────────────────────────────────"
+
+          if [[ "$STATUS" == *"FAILED"* ]]; then
+            MSG+="\n"
+            MSG+="\n⚠ Recovery:"
+            MSG+="\n  • Check Step Functions execution in AWS Console"
+            MSG+="\n  • Verify canary state is reset to 'idle' before retry"
+            MSG+="\n  • Check logs: ${WORKFLOW_URL}"
+          fi
+
+          MSG+="\n"
+          MSG+="\nTriggered by: ${{ github.actor }}"
+          MSG+="\nRun: ${WORKFLOW_URL}"
+
+          aws sns publish \
+            --topic-arn "$SNS_ARN" \
+            --subject "$SUBJECT" \
+            --message "$(echo -e "$MSG")" || echo "::warning::SNS notification failed - check IAM permissions or topic existence"
+
+  # =============================================================================
   # SUMMARY - Generate deployment summary (runs even on failure)
   # =============================================================================
   summary:

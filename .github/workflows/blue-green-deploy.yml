@@ -1093,3 +1093,109 @@ jobs:
           echo "To rollback, run this workflow with:" >> $GITHUB_STEP_SUMMARY
           echo "- **action:** \`rollback\`" >> $GITHUB_STEP_SUMMARY
           echo "- **component:** \`$COMPONENT\`" >> $GITHUB_STEP_SUMMARY
+
+  # =============================================================================
+  # NOTIFY - Send deployment notification to SNS (Slack via AWS Chatbot)
+  # =============================================================================
+  notify:
+    name: Notify
+    if: always()
+    needs: [prepare, deploy-to-standby, switch-traffic, scale-down-previous, validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Send deployment notification
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          COMPONENT: ${{ inputs.component }}
+          ACTION: ${{ inputs.action }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          DEPLOY_RESULT: ${{ needs.deploy-to-standby.result }}
+          SWITCH_RESULT: ${{ needs.switch-traffic.result }}
+          SCALEDOWN_RESULT: ${{ needs.scale-down-previous.result }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          SERVER_ACTIVE_COLOR: ${{ needs.prepare.outputs.server_standby_color }}
+          AC_ACTIVE_COLOR: ${{ needs.prepare.outputs.ac_standby_color }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Read SNS topic ARN from SSM
+          SNS_ARN=$(aws ssm get-parameter \
+            --name "/${ENVIRONMENT}/nhp/monitoring/sns-topic-arn" \
+            --query 'Parameter.Value' --output text 2>/dev/null) || SNS_ARN=""
+
+          if [ -z "$SNS_ARN" ] || [[ ! "$SNS_ARN" =~ ^arn:aws:sns: ]]; then
+            echo "No valid SNS topic ARN found at /${ENVIRONMENT}/nhp/monitoring/sns-topic-arn, skipping notification"
+            exit 0
+          fi
+
+          # Determine overall status
+          if [[ "$VALIDATE_RESULT" == "success" || ("$SWITCH_RESULT" == "success" && "$VALIDATE_RESULT" == "skipped") ]]; then
+            STATUS="SUCCESS"
+          elif [[ "$PREPARE_RESULT" != "success" ]]; then
+            STATUS="FAILED (prepare)"
+          elif [[ "$DEPLOY_RESULT" == "failure" ]]; then
+            STATUS="FAILED (deploy-to-standby)"
+          elif [[ "$SWITCH_RESULT" == "failure" ]]; then
+            STATUS="FAILED (switch-traffic)"
+          else
+            STATUS="FAILED"
+          fi
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+            STATUS="DRY RUN - $STATUS"
+          fi
+
+          SUBJECT="Blue/Green Deploy: ${STATUS} - ${COMPONENT} (${ENVIRONMENT})"
+
+          MSG="Blue/Green Deployment Notification"
+          MSG+="\n"
+          MSG+="\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          MSG+="\n  Status:      ${STATUS}"
+          MSG+="\n  Environment: ${ENVIRONMENT}"
+          MSG+="\n  Component:   ${COMPONENT}"
+          MSG+="\n  Action:      ${ACTION}"
+          MSG+="\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          if [ -n "$IMAGE_TAG" ]; then
+            MSG+="\n  Image Tag:   ${IMAGE_TAG}"
+          fi
+
+          if [ -n "$SERVER_ACTIVE_COLOR" ]; then
+            MSG+="\n  Server:      ${SERVER_ACTIVE_COLOR} (active)"
+          fi
+          if [ -n "$AC_ACTIVE_COLOR" ]; then
+            MSG+="\n  AC:          ${AC_ACTIVE_COLOR} (active)"
+          fi
+
+          MSG+="\n"
+          MSG+="\n┌─ Stage Results ─────────────────"
+          MSG+="\n│ Prepare:        $([ "$PREPARE_RESULT" = "success" ] && echo "[OK]" || echo "[FAILED]") ${PREPARE_RESULT}"
+          MSG+="\n│ Deploy Standby: $([ "$DEPLOY_RESULT" = "success" ] && echo "[OK]" || [ "$DEPLOY_RESULT" = "skipped" ] && echo "[SKIP]" || echo "[FAILED]") ${DEPLOY_RESULT}"
+          MSG+="\n│ Switch Traffic: $([ "$SWITCH_RESULT" = "success" ] && echo "[OK]" || [ "$SWITCH_RESULT" = "skipped" ] && echo "[SKIP]" || echo "[FAILED]") ${SWITCH_RESULT}"
+          MSG+="\n│ Scale Down:     $([ "$SCALEDOWN_RESULT" = "success" ] && echo "[OK]" || [ "$SCALEDOWN_RESULT" = "skipped" ] && echo "[SKIP]" || echo "[FAILED]") ${SCALEDOWN_RESULT}"
+          MSG+="\n│ Validate:       $([ "$VALIDATE_RESULT" = "success" ] && echo "[OK]" || [ "$VALIDATE_RESULT" = "skipped" ] && echo "[SKIP]" || echo "[FAILED]") ${VALIDATE_RESULT}"
+          MSG+="\n└─────────────────────────────────"
+
+          if [[ "$STATUS" == *"FAILED"* ]]; then
+            MSG+="\n"
+            MSG+="\n⚠ Recovery:"
+            MSG+="\n  • To rollback: re-run with action=rollback"
+            MSG+="\n  • Check logs: ${WORKFLOW_URL}"
+          fi
+
+          MSG+="\n"
+          MSG+="\nTriggered by: ${{ github.actor }}"
+          MSG+="\nRun: ${WORKFLOW_URL}"
+
+          aws sns publish \
+            --topic-arn "$SNS_ARN" \
+            --subject "$SUBJECT" \
+            --message "$(echo -e "$MSG")" || echo "::warning::SNS notification failed - check IAM permissions or topic existence"

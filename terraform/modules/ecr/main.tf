@@ -1049,6 +1049,7 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "sns:UntagResource",
           "sns:Subscribe",
           "sns:Unsubscribe",
+          "sns:Publish",
           "chatbot:CreateSlackChannelConfiguration",
           "chatbot:UpdateSlackChannelConfiguration",
           "chatbot:DeleteSlackChannelConfiguration",

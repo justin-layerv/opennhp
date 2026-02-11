@@ -1,0 +1,1346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="api-url" content="${api_url}">
+  <title>LayerV NHP Status</title>
+  <style>
+    /* ── Design System ── */
+    :root {
+      /* Surfaces */
+      --bg-root: #080b10;
+      --bg-surface: rgba(14, 19, 28, 0.7);
+      --bg-surface-hover: rgba(20, 27, 40, 0.8);
+      --bg-elevated: rgba(22, 30, 44, 0.6);
+      --border-subtle: rgba(56, 72, 96, 0.3);
+      --border-default: rgba(72, 92, 120, 0.25);
+      --border-hover: rgba(88, 112, 148, 0.35);
+
+      /* Text */
+      --text-primary: #e8edf4;
+      --text-secondary: #8894a8;
+      --text-tertiary: #5c6878;
+      --text-inverse: #080b10;
+
+      /* Accent */
+      --accent-blue: #4d8dff;
+      --accent-blue-dim: rgba(77, 141, 255, 0.12);
+      --accent-blue-border: rgba(77, 141, 255, 0.25);
+
+      /* Status */
+      --status-healthy: #34d058;
+      --status-healthy-dim: rgba(52, 208, 88, 0.1);
+      --status-healthy-glow: rgba(52, 208, 88, 0.15);
+      --status-degraded: #e8a320;
+      --status-degraded-dim: rgba(232, 163, 32, 0.1);
+      --status-degraded-glow: rgba(232, 163, 32, 0.15);
+      --status-unhealthy: #f04848;
+      --status-unhealthy-dim: rgba(240, 72, 72, 0.1);
+      --status-unhealthy-glow: rgba(240, 72, 72, 0.15);
+      --status-unknown: #6c7a8e;
+      --status-unknown-dim: rgba(108, 122, 142, 0.1);
+
+      /* Deploy colors */
+      --deploy-blue: #4d8dff;
+      --deploy-green: #34d058;
+
+      /* Spacing */
+      --space-xs: 4px;
+      --space-sm: 8px;
+      --space-md: 16px;
+      --space-lg: 24px;
+      --space-xl: 32px;
+      --space-2xl: 48px;
+
+      /* Radius */
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 14px;
+
+      /* Transitions */
+      --transition-fast: 150ms cubic-bezier(0.25, 0.1, 0.25, 1);
+      --transition-base: 250ms cubic-bezier(0.25, 0.1, 0.25, 1);
+      --transition-slow: 400ms cubic-bezier(0.25, 0.1, 0.25, 1);
+
+      /* Glass */
+      --glass-blur: 12px;
+      --glass-bg: rgba(14, 19, 28, 0.65);
+      --glass-border: rgba(72, 92, 120, 0.18);
+
+      /* Typography */
+      --font-sans: 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace;
+      --text-xs: 11px;
+      --text-sm: 13px;
+      --text-base: 14px;
+      --text-lg: 16px;
+      --text-xl: 20px;
+      --text-2xl: 24px;
+      --weight-normal: 400;
+      --weight-medium: 500;
+      --weight-semibold: 600;
+      --letter-tight: -0.01em;
+      --letter-wide: 0.06em;
+    }
+
+    /* ── Reset ── */
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    /* ── Base ── */
+    body {
+      background: var(--bg-root);
+      color: var(--text-secondary);
+      font-family: var(--font-sans);
+      font-size: var(--text-base);
+      line-height: 1.55;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    /* Subtle grid texture on body */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image:
+        radial-gradient(circle at 20% 20%, rgba(77, 141, 255, 0.03) 0%, transparent 50%),
+        radial-gradient(circle at 80% 80%, rgba(52, 208, 88, 0.02) 0%, transparent 50%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    body > * {
+      position: relative;
+      z-index: 1;
+    }
+
+    code, .mono {
+      font-family: var(--font-mono);
+      font-size: 0.9em;
+      letter-spacing: var(--letter-tight);
+    }
+
+    a {
+      color: var(--accent-blue);
+      text-decoration: none;
+      transition: color var(--transition-fast);
+    }
+
+    a:hover {
+      color: #6ba3ff;
+      text-decoration: underline;
+    }
+
+    /* ── Focus ── */
+    :focus-visible {
+      outline: 2px solid var(--accent-blue);
+      outline-offset: 2px;
+      border-radius: 2px;
+    }
+
+    /* ── Animations ── */
+    @keyframes pulse-healthy {
+      0%, 100% { box-shadow: 0 0 0 0 var(--status-healthy-glow); }
+      50% { box-shadow: 0 0 0 5px transparent; }
+    }
+
+    @keyframes pulse-degraded {
+      0%, 100% { box-shadow: 0 0 0 0 var(--status-degraded-glow); opacity: 1; }
+      50% { box-shadow: 0 0 0 5px transparent; opacity: 0.7; }
+    }
+
+    @keyframes pulse-unhealthy {
+      0%, 100% { box-shadow: 0 0 0 0 var(--status-unhealthy-glow); opacity: 1; }
+      50% { box-shadow: 0 0 0 5px transparent; opacity: 0.6; }
+    }
+
+    @keyframes shimmer {
+      0% { background-position: -200% 0; }
+      100% { background-position: 200% 0; }
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @keyframes slideDown {
+      from { opacity: 0; max-height: 0; }
+      to { opacity: 1; max-height: 500px; }
+    }
+
+    /* ── Header ── */
+    .header {
+      border-bottom: 1px solid var(--border-subtle);
+      padding: var(--space-lg) var(--space-lg);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: var(--space-md);
+      backdrop-filter: blur(8px);
+      background: rgba(8, 11, 16, 0.85);
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: var(--space-md);
+    }
+
+    .header h1 {
+      font-size: var(--text-xl);
+      font-weight: var(--weight-semibold);
+      color: var(--text-primary);
+      letter-spacing: var(--letter-tight);
+    }
+
+    .env-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 3px 12px;
+      border-radius: 20px;
+      font-size: var(--text-xs);
+      font-weight: var(--weight-semibold);
+      text-transform: uppercase;
+      letter-spacing: var(--letter-wide);
+      background: var(--accent-blue-dim);
+      color: var(--accent-blue);
+      border: 1px solid var(--accent-blue-border);
+    }
+
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: var(--space-md);
+      font-size: var(--text-sm);
+      color: var(--text-tertiary);
+    }
+
+    /* Connection indicator */
+    .conn-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: var(--text-xs);
+      font-weight: var(--weight-medium);
+      text-transform: uppercase;
+      letter-spacing: var(--letter-wide);
+    }
+
+    .conn-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      transition: background var(--transition-base), box-shadow var(--transition-base);
+    }
+
+    .conn-connected .conn-dot {
+      background: var(--status-healthy);
+      box-shadow: 0 0 6px var(--status-healthy-glow);
+    }
+    .conn-connected .conn-label { color: var(--status-healthy); }
+
+    .conn-refreshing .conn-dot {
+      background: var(--status-degraded);
+      box-shadow: 0 0 6px var(--status-degraded-glow);
+    }
+    .conn-refreshing .conn-label { color: var(--status-degraded); }
+
+    .conn-stale .conn-dot {
+      background: var(--status-unhealthy);
+      box-shadow: 0 0 6px var(--status-unhealthy-glow);
+    }
+    .conn-stale .conn-label { color: var(--status-unhealthy); }
+
+    /* ── Stale banner ── */
+    .stale-banner {
+      display: none;
+      background: var(--status-degraded-dim);
+      border-bottom: 1px solid rgba(232, 163, 32, 0.2);
+      padding: var(--space-sm) var(--space-lg);
+      color: var(--status-degraded);
+      font-size: var(--text-sm);
+      font-weight: var(--weight-medium);
+      text-align: center;
+    }
+
+    .stale-banner.visible {
+      display: block;
+    }
+
+    /* ── Main ── */
+    .main {
+      flex: 1;
+      max-width: 960px;
+      width: 100%;
+      margin: 0 auto;
+      padding: var(--space-xl) var(--space-lg);
+    }
+
+    /* ── Error banner ── */
+    .error-banner {
+      display: none;
+      background: var(--status-unhealthy-dim);
+      border: 1px solid rgba(240, 72, 72, 0.2);
+      border-radius: var(--radius-md);
+      padding: var(--space-md);
+      margin-bottom: var(--space-lg);
+      color: var(--status-unhealthy);
+      font-size: var(--text-sm);
+      font-weight: var(--weight-medium);
+      animation: fadeIn var(--transition-base) ease-out;
+    }
+
+    .error-banner.visible {
+      display: block;
+    }
+
+    /* ── Loading skeleton ── */
+    .loading {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-md);
+      padding: var(--space-xl) 0;
+    }
+
+    .skeleton-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: var(--space-md);
+    }
+
+    @media (max-width: 640px) {
+      .skeleton-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .skeleton-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: var(--space-lg);
+      height: 260px;
+    }
+
+    .skeleton-line {
+      height: 12px;
+      border-radius: 6px;
+      background: linear-gradient(
+        90deg,
+        rgba(72, 92, 120, 0.08) 25%,
+        rgba(72, 92, 120, 0.18) 50%,
+        rgba(72, 92, 120, 0.08) 75%
+      );
+      background-size: 200% 100%;
+      animation: shimmer 1.8s ease-in-out infinite;
+      margin-bottom: var(--space-md);
+    }
+
+    .skeleton-line:first-child { width: 40%; height: 16px; margin-bottom: var(--space-lg); }
+    .skeleton-line:nth-child(2) { width: 70%; }
+    .skeleton-line:nth-child(3) { width: 55%; }
+    .skeleton-line:nth-child(4) { width: 80%; }
+    .skeleton-line:nth-child(5) { width: 60%; }
+    .skeleton-line:nth-child(6) { width: 90%; }
+
+    .skeleton-alarms {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: var(--space-lg);
+      margin-top: var(--space-md);
+    }
+
+    .skeleton-alarms .skeleton-line:first-child { width: 20%; height: 14px; margin-bottom: var(--space-lg); }
+    .skeleton-alarms .skeleton-line:nth-child(2) { width: 60%; }
+    .skeleton-alarms .skeleton-line:nth-child(3) { width: 45%; }
+
+    /* ── Cards grid ── */
+    .cards-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: var(--space-md);
+      margin-bottom: var(--space-lg);
+    }
+
+    @media (max-width: 640px) {
+      .cards-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    /* ── Card (glassmorphism) ── */
+    .card {
+      background: var(--glass-bg);
+      backdrop-filter: blur(var(--glass-blur));
+      -webkit-backdrop-filter: blur(var(--glass-blur));
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius-lg);
+      padding: var(--space-lg);
+      transition:
+        border-color var(--transition-base),
+        box-shadow var(--transition-slow),
+        background var(--transition-base);
+      animation: fadeIn var(--transition-slow) ease-out both;
+    }
+
+    .card:nth-child(2) {
+      animation-delay: 80ms;
+    }
+
+    .card:hover {
+      border-color: var(--border-hover);
+      background: var(--bg-surface-hover);
+      box-shadow: 0 0 30px -10px rgba(77, 141, 255, 0.06);
+    }
+
+    /* Glow accent on card based on status */
+    .card[data-status="healthy"]:hover {
+      box-shadow: 0 0 30px -10px var(--status-healthy-glow);
+    }
+    .card[data-status="degraded"]:hover {
+      box-shadow: 0 0 30px -10px var(--status-degraded-glow);
+    }
+    .card[data-status="unhealthy"]:hover {
+      box-shadow: 0 0 30px -10px var(--status-unhealthy-glow);
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: var(--space-lg);
+      padding-bottom: var(--space-md);
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .card-title {
+      font-size: var(--text-lg);
+      font-weight: var(--weight-semibold);
+      color: var(--text-primary);
+      letter-spacing: var(--letter-tight);
+    }
+
+    /* ── Status indicator ── */
+    .status-indicator {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-size: var(--text-sm);
+      font-weight: var(--weight-medium);
+    }
+
+    .status-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      transition: background var(--transition-base), box-shadow var(--transition-base);
+    }
+
+    .status-text {
+      transition: color var(--transition-base);
+    }
+
+    .status-healthy .status-dot {
+      background: var(--status-healthy);
+      box-shadow: 0 0 6px var(--status-healthy-glow);
+    }
+    .status-healthy .status-text { color: var(--status-healthy); }
+
+    .status-degraded .status-dot {
+      background: var(--status-degraded);
+      animation: pulse-degraded 2s ease-in-out infinite;
+    }
+    .status-degraded .status-text { color: var(--status-degraded); }
+
+    .status-unhealthy .status-dot {
+      background: var(--status-unhealthy);
+      animation: pulse-unhealthy 1.5s ease-in-out infinite;
+    }
+    .status-unhealthy .status-text { color: var(--status-unhealthy); }
+
+    .status-unknown .status-dot {
+      background: var(--status-unknown);
+    }
+    .status-unknown .status-text { color: var(--status-unknown); }
+
+    /* ── Card body ── */
+    .card-body {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-sm);
+    }
+
+    .card-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: var(--text-sm);
+      padding: 3px 0;
+    }
+
+    .card-label {
+      color: var(--text-tertiary);
+      font-weight: var(--weight-medium);
+      font-size: var(--text-xs);
+      text-transform: uppercase;
+      letter-spacing: var(--letter-wide);
+    }
+
+    .card-value {
+      color: var(--text-secondary);
+      text-align: right;
+    }
+
+    /* ── Color badge ── */
+    .color-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 10px;
+      border-radius: 12px;
+      font-size: var(--text-xs);
+      font-weight: var(--weight-semibold);
+      text-transform: uppercase;
+      letter-spacing: var(--letter-wide);
+      color: #fff;
+      transition: background var(--transition-base);
+    }
+
+    .color-blue {
+      background: var(--deploy-blue);
+    }
+
+    .color-green {
+      background: var(--deploy-green);
+    }
+
+    /* ── Health bar ── */
+    .health-bar-container {
+      display: flex;
+      align-items: center;
+      gap: var(--space-sm);
+    }
+
+    .health-bar {
+      flex: 1;
+      height: 5px;
+      background: rgba(72, 92, 120, 0.15);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .health-bar-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width var(--transition-slow), background var(--transition-base);
+    }
+
+    .health-bar-fill.bar-healthy {
+      background: linear-gradient(90deg, var(--status-healthy), #45e06a);
+    }
+
+    .health-bar-fill.bar-degraded {
+      background: linear-gradient(90deg, var(--status-degraded), #f0b840);
+    }
+
+    .health-bar-fill.bar-unhealthy {
+      background: linear-gradient(90deg, var(--status-unhealthy), #f06868);
+    }
+
+    .health-count {
+      font-size: var(--text-xs);
+      white-space: nowrap;
+      color: var(--text-tertiary);
+    }
+
+    /* ── Alarms section ── */
+    .alarms-section {
+      margin-bottom: var(--space-lg);
+      animation: fadeIn var(--transition-slow) ease-out both;
+      animation-delay: 160ms;
+    }
+
+    .section-title {
+      font-size: var(--text-xs);
+      font-weight: var(--weight-semibold);
+      color: var(--text-tertiary);
+      text-transform: uppercase;
+      letter-spacing: var(--letter-wide);
+      margin-bottom: var(--space-md);
+    }
+
+    .alarm-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .alarm-item {
+      display: flex;
+      align-items: center;
+      gap: var(--space-sm);
+      padding: var(--space-sm) var(--space-md);
+      background: var(--glass-bg);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius-sm);
+      font-size: var(--text-sm);
+      transition: border-color var(--transition-fast), background var(--transition-fast);
+    }
+
+    .alarm-item:hover {
+      border-color: var(--border-hover);
+      background: var(--bg-surface-hover);
+    }
+
+    .alarm-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 10px;
+      font-weight: var(--weight-semibold);
+      text-transform: uppercase;
+      letter-spacing: var(--letter-wide);
+    }
+
+    .alarm-badge-active {
+      background: var(--status-unhealthy-dim);
+      color: var(--status-unhealthy);
+      border: 1px solid rgba(240, 72, 72, 0.25);
+    }
+
+    .alarm-badge-ok {
+      background: var(--status-healthy-dim);
+      color: var(--status-healthy);
+      border: 1px solid rgba(52, 208, 88, 0.25);
+    }
+
+    .alarm-name {
+      color: var(--text-secondary);
+    }
+
+    .alarm-toggle {
+      background: none;
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      color: var(--text-tertiary);
+      cursor: pointer;
+      font-size: var(--text-sm);
+      font-family: var(--font-sans);
+      font-weight: var(--weight-medium);
+      padding: 5px 12px;
+      margin-top: var(--space-sm);
+      transition: color var(--transition-fast), border-color var(--transition-fast), background var(--transition-fast);
+    }
+
+    .alarm-toggle:hover {
+      color: var(--text-secondary);
+      border-color: var(--border-hover);
+      background: var(--bg-elevated);
+    }
+
+    .ok-alarms {
+      display: none;
+      margin-top: 6px;
+    }
+
+    .ok-alarms.expanded {
+      display: flex;
+    }
+
+    .no-alarms {
+      color: var(--text-tertiary);
+      font-size: var(--text-sm);
+      padding: var(--space-sm) 0;
+    }
+
+    /* ── Time tooltip ── */
+    .time-tooltip {
+      cursor: default;
+      border-bottom: 1px dotted var(--text-tertiary);
+      transition: border-color var(--transition-fast);
+    }
+
+    .time-tooltip:hover {
+      border-color: var(--text-secondary);
+    }
+
+    /* ── Footer ── */
+    .footer {
+      border-top: 1px solid var(--border-subtle);
+      padding: var(--space-lg);
+      text-align: center;
+      font-size: var(--text-xs);
+      color: var(--text-tertiary);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--space-sm);
+    }
+
+    .footer-links {
+      display: flex;
+      justify-content: center;
+      gap: var(--space-md);
+      flex-wrap: wrap;
+    }
+
+    .footer-brand {
+      color: var(--text-tertiary);
+      font-weight: var(--weight-medium);
+      letter-spacing: var(--letter-wide);
+      text-transform: uppercase;
+      font-size: 10px;
+    }
+
+    .footer-brand-accent {
+      color: var(--accent-blue);
+    }
+
+    /* ── Content visibility ── */
+    .content {
+      display: none;
+    }
+
+    .content.visible {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <div class="header-left">
+      <h1>LayerV NHP Status</h1>
+      <span class="env-badge" id="env-badge" aria-label="Environment">--</span>
+    </div>
+    <div class="header-right">
+      <span class="conn-indicator conn-stale" id="conn-indicator">
+        <span class="conn-dot" aria-hidden="true"></span>
+        <span class="conn-label">Connecting</span>
+      </span>
+      <span>Updated <span id="last-updated">--</span></span>
+    </div>
+  </header>
+
+  <div class="stale-banner" id="stale-banner" role="alert" aria-live="polite">
+    Data may be outdated. Last successful update was more than 2 minutes ago.
+  </div>
+
+  <main class="main">
+    <div class="error-banner" id="error-banner" role="alert" aria-live="polite"></div>
+
+    <div class="loading" id="loading" aria-label="Loading status data">
+      <div class="skeleton-grid">
+        <div class="skeleton-card">
+          <div class="skeleton-line"></div>
+          <div class="skeleton-line"></div>
+          <div class="skeleton-line"></div>
+          <div class="skeleton-line"></div>
+          <div class="skeleton-line"></div>
+          <div class="skeleton-line"></div>
+        </div>
+        <div class="skeleton-card">
+          <div class="skeleton-line"></div>
+          <div class="skeleton-line"></div>
+          <div class="skeleton-line"></div>
+          <div class="skeleton-line"></div>
+          <div class="skeleton-line"></div>
+          <div class="skeleton-line"></div>
+        </div>
+      </div>
+      <div class="skeleton-alarms">
+        <div class="skeleton-line"></div>
+        <div class="skeleton-line"></div>
+        <div class="skeleton-line"></div>
+      </div>
+    </div>
+
+    <div class="content" id="content">
+      <div class="cards-grid" role="status" aria-live="polite">
+        <div class="card" id="card-server" aria-label="Server component status">
+          <div class="card-header">
+            <span class="card-title">Server</span>
+            <div class="status-indicator status-unknown" id="status-server">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span class="status-text">Unknown</span>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="card-row">
+              <span class="card-label">Active Color</span>
+              <span class="card-value" id="server-color">--</span>
+            </div>
+            <div class="card-row">
+              <span class="card-label">Image Tag</span>
+              <span class="card-value mono" id="server-image-tag">--</span>
+            </div>
+            <div class="card-row">
+              <span class="card-label">Deployed Commit</span>
+              <span class="card-value mono" id="server-commit">--</span>
+            </div>
+            <div class="card-row">
+              <span class="card-label">Deployed At</span>
+              <span class="card-value" id="server-deployed-at">--</span>
+            </div>
+            <div class="card-row">
+              <span class="card-label">Host Health</span>
+              <span class="card-value" id="server-health">--</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" id="card-ac" aria-label="Access Controller component status">
+          <div class="card-header">
+            <span class="card-title">Access Controller</span>
+            <div class="status-indicator status-unknown" id="status-ac">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span class="status-text">Unknown</span>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="card-row">
+              <span class="card-label">Active Color</span>
+              <span class="card-value" id="ac-color">--</span>
+            </div>
+            <div class="card-row">
+              <span class="card-label">Image Tag</span>
+              <span class="card-value mono" id="ac-image-tag">--</span>
+            </div>
+            <div class="card-row">
+              <span class="card-label">Deployed Commit</span>
+              <span class="card-value mono" id="ac-commit">--</span>
+            </div>
+            <div class="card-row">
+              <span class="card-label">Deployed At</span>
+              <span class="card-value" id="ac-deployed-at">--</span>
+            </div>
+            <div class="card-row">
+              <span class="card-label">Host Health</span>
+              <span class="card-value" id="ac-health">--</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="alarms-section" id="alarms-section" role="status" aria-live="polite">
+        <div class="section-title">Alarms</div>
+        <div id="alarms-content">
+          <p class="no-alarms">No alarm data available.</p>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-links">
+      <span id="refresh-info">Auto-refreshes every 30s</span>
+      <a href="https://console.aws.amazon.com/cloudwatch" target="_blank" rel="noopener noreferrer">CloudWatch Dashboard</a>
+    </div>
+    <span class="footer-brand">Powered by <span class="footer-brand-accent">LayerV NHP</span></span>
+  </footer>
+
+  <script>
+    (function () {
+      'use strict';
+
+      /* ── Configuration ── */
+      var apiMeta = document.querySelector('meta[name="api-url"]');
+      var API_URL = apiMeta ? apiMeta.getAttribute('content') : null;
+      if (!API_URL) {
+        document.getElementById('loading').style.display = 'none';
+        document.getElementById('error-banner').textContent = 'Status API URL not configured.';
+        document.getElementById('error-banner').classList.add('visible');
+        return;
+      }
+      var BASE_INTERVAL = 30000;
+      var MAX_INTERVAL = 120000;
+      var TICK_INTERVAL = 1000;
+      var STALE_THRESHOLD = 120000; /* 2 minutes */
+      var FETCH_TIMEOUT = 10000;
+
+      /* ── State ── */
+      var lastFetchTime = null;
+      var lastData = null;
+      var currentInterval = BASE_INTERVAL;
+      var consecutiveFailures = 0;
+      var okAlarmsExpanded = false;
+      var refreshTimer = null;
+      var abortController = null;
+
+      /* connection: 'connected' | 'refreshing' | 'stale' */
+      var connectionState = 'stale';
+
+      /* ── DOM references ── */
+      var els = {
+        loading: document.getElementById('loading'),
+        content: document.getElementById('content'),
+        errorBanner: document.getElementById('error-banner'),
+        staleBanner: document.getElementById('stale-banner'),
+        envBadge: document.getElementById('env-badge'),
+        lastUpdated: document.getElementById('last-updated'),
+        connIndicator: document.getElementById('conn-indicator'),
+        refreshInfo: document.getElementById('refresh-info'),
+        cardServer: document.getElementById('card-server'),
+        cardAc: document.getElementById('card-ac'),
+        statusServer: document.getElementById('status-server'),
+        serverColor: document.getElementById('server-color'),
+        serverImageTag: document.getElementById('server-image-tag'),
+        serverCommit: document.getElementById('server-commit'),
+        serverDeployedAt: document.getElementById('server-deployed-at'),
+        serverHealth: document.getElementById('server-health'),
+        statusAc: document.getElementById('status-ac'),
+        acColor: document.getElementById('ac-color'),
+        acImageTag: document.getElementById('ac-image-tag'),
+        acCommit: document.getElementById('ac-commit'),
+        acDeployedAt: document.getElementById('ac-deployed-at'),
+        acHealth: document.getElementById('ac-health'),
+        alarmsContent: document.getElementById('alarms-content')
+      };
+
+      var STATUS_LABELS = {
+        healthy: 'Operational',
+        degraded: 'Degraded',
+        unhealthy: 'Outage',
+        unknown: 'Unknown'
+      };
+
+      /* ── Helpers ── */
+
+      /**
+       * Clear all children of an element and append new nodes.
+       */
+      function replaceContent(el) {
+        while (el.firstChild) {
+          el.removeChild(el.firstChild);
+        }
+        for (var i = 1; i < arguments.length; i++) {
+          var node = arguments[i];
+          if (node != null) {
+            if (typeof node === 'string') {
+              el.appendChild(document.createTextNode(node));
+            } else {
+              el.appendChild(node);
+            }
+          }
+        }
+      }
+
+      function createEl(tag, attrs, children) {
+        var el = document.createElement(tag);
+        if (attrs) {
+          for (var key in attrs) {
+            if (attrs.hasOwnProperty(key)) {
+              if (key === 'className') {
+                el.className = attrs[key];
+              } else if (key === 'textContent') {
+                el.textContent = attrs[key];
+              } else if (key === 'style' && typeof attrs[key] === 'object') {
+                for (var prop in attrs[key]) {
+                  if (attrs[key].hasOwnProperty(prop)) {
+                    el.style[prop] = attrs[key][prop];
+                  }
+                }
+              } else {
+                el.setAttribute(key, attrs[key]);
+              }
+            }
+          }
+        }
+        if (children) {
+          for (var i = 0; i < children.length; i++) {
+            if (typeof children[i] === 'string') {
+              el.appendChild(document.createTextNode(children[i]));
+            } else if (children[i]) {
+              el.appendChild(children[i]);
+            }
+          }
+        }
+        return el;
+      }
+
+      /* ── Connection state machine ── */
+      function setConnectionState(state) {
+        if (connectionState === state) return;
+        connectionState = state;
+        var indicator = els.connIndicator;
+        indicator.className = 'conn-indicator conn-' + state;
+        var label = indicator.querySelector('.conn-label');
+        var labels = { connected: 'Connected', refreshing: 'Refreshing', stale: 'Disconnected' };
+        label.textContent = labels[state] || 'Unknown';
+      }
+
+      /* ── Stale detection ── */
+      function checkStale() {
+        if (!lastFetchTime) return;
+        var age = Date.now() - lastFetchTime;
+        if (age > STALE_THRESHOLD) {
+          els.staleBanner.classList.add('visible');
+          if (connectionState !== 'refreshing') {
+            setConnectionState('stale');
+          }
+        } else {
+          els.staleBanner.classList.remove('visible');
+        }
+      }
+
+      /* ── Time formatting ── */
+      function formatRelativeTime(isoString) {
+        if (!isoString) return '--';
+        var then = new Date(isoString);
+        if (isNaN(then.getTime())) return '--';
+        var diffMs = Date.now() - then;
+        if (diffMs < 0) return 'just now';
+        var seconds = Math.floor(diffMs / 1000);
+        if (seconds < 10) return 'just now';
+        if (seconds < 60) return seconds + 's ago';
+        var minutes = Math.floor(seconds / 60);
+        if (minutes < 60) return minutes + 'm ago';
+        var hours = Math.floor(minutes / 60);
+        if (hours < 24) return hours + 'h ago';
+        var days = Math.floor(hours / 24);
+        return days + 'd ago';
+      }
+
+      function formatAbsoluteTime(isoString) {
+        if (!isoString) return '';
+        var d = new Date(isoString);
+        if (isNaN(d.getTime())) return '';
+        return d.toUTCString();
+      }
+
+      /* ── DOM builders ── */
+
+      function setDeployedAt(el, isoString) {
+        var relative = formatRelativeTime(isoString);
+        var absolute = formatAbsoluteTime(isoString);
+        if (relative === '--') {
+          replaceContent(el, '--');
+          return;
+        }
+        var span = createEl('span', {
+          className: 'time-tooltip',
+          title: absolute,
+          tabindex: '0',
+          textContent: relative
+        });
+        replaceContent(el, span);
+      }
+
+      function setStatusIndicator(el, status) {
+        var normalized = STATUS_LABELS[status] ? status : 'unknown';
+        el.className = 'status-indicator status-' + normalized;
+        el.querySelector('.status-text').textContent = STATUS_LABELS[normalized];
+      }
+
+      /**
+       * Creates a color badge DOM node (not innerHTML).
+       */
+      function createColorBadge(color) {
+        if (!color) return document.createTextNode('--');
+        var cls = color === 'blue' ? 'color-blue' : 'color-green';
+        return createEl('span', {
+          className: 'color-badge ' + cls,
+          textContent: color
+        });
+      }
+
+      /**
+       * Creates a health bar DOM node (not innerHTML).
+       */
+      function createHealthBar(healthy, unhealthy, total) {
+        if (total == null || total === 0) return document.createTextNode('--');
+        var pct = (healthy / total) * 100;
+        var barClass = 'bar-healthy';
+        if (unhealthy > 0 && healthy > 0) barClass = 'bar-degraded';
+        if (healthy === 0) barClass = 'bar-unhealthy';
+
+        var fill = createEl('div', {
+          className: 'health-bar-fill ' + barClass,
+          style: { width: pct + '%' }
+        });
+        var bar = createEl('div', { className: 'health-bar' }, [fill]);
+        var count = createEl('span', {
+          className: 'health-count mono',
+          textContent: healthy + '/' + total
+        });
+        return createEl('div', { className: 'health-bar-container' }, [bar, count]);
+      }
+
+      function capitalize(s) {
+        return s.charAt(0).toUpperCase() + s.slice(1);
+      }
+
+      function renderComponent(prefix, comp) {
+        var cardEl = prefix === 'server' ? els.cardServer : els.cardAc;
+
+        if (!comp) {
+          var statusEl = prefix === 'server' ? els.statusServer : els.statusAc;
+          setStatusIndicator(statusEl, 'unknown');
+          replaceContent(els[prefix + 'Color'], '--');
+          els[prefix + 'ImageTag'].textContent = '--';
+          els[prefix + 'Commit'].textContent = '--';
+          replaceContent(els[prefix + 'DeployedAt'], '--');
+          replaceContent(els[prefix + 'Health'], '--');
+          cardEl.removeAttribute('data-status');
+          return;
+        }
+
+        var status = comp.status || 'unknown';
+        var statusElRef = prefix === 'server' ? els.statusServer : els.statusAc;
+        setStatusIndicator(statusElRef, status);
+        cardEl.setAttribute('data-status', status);
+        replaceContent(els[prefix + 'Color'], createColorBadge(comp.active_color));
+        els[prefix + 'ImageTag'].textContent = comp.image_tag || '--';
+        els[prefix + 'Commit'].textContent = comp.deployed_commit ? comp.deployed_commit.substring(0, 7) : '--';
+        setDeployedAt(els[prefix + 'DeployedAt'], comp.deployed_at);
+        replaceContent(els[prefix + 'Health'], createHealthBar(
+          comp.healthy_hosts,
+          comp.unhealthy_hosts,
+          comp.total_hosts
+        ));
+      }
+
+      function renderAlarms(alarms) {
+        if (!alarms) {
+          replaceContent(els.alarmsContent, createEl('p', {
+            className: 'no-alarms',
+            textContent: 'No alarm data available.'
+          }));
+          return;
+        }
+
+        var active = alarms.active || [];
+        var ok = alarms.ok || [];
+
+        if (active.length === 0 && ok.length === 0) {
+          replaceContent(els.alarmsContent, createEl('p', {
+            className: 'no-alarms',
+            textContent: 'No alarms configured.'
+          }));
+          return;
+        }
+
+        var container = document.createDocumentFragment();
+
+        if (active.length > 0) {
+          var activeList = createEl('ul', { className: 'alarm-list' });
+          for (var i = 0; i < active.length; i++) {
+            var li = createEl('li', { className: 'alarm-item' }, [
+              createEl('span', { className: 'alarm-badge alarm-badge-active', textContent: 'ALARM' }),
+              createEl('span', { className: 'alarm-name mono', textContent: active[i] })
+            ]);
+            activeList.appendChild(li);
+          }
+          container.appendChild(activeList);
+        }
+
+        if (ok.length > 0) {
+          if (active.length > 0) {
+            container.appendChild(createEl('div', { style: { marginTop: '8px' } }));
+          }
+
+          var toggleLabel = (okAlarmsExpanded ? 'Hide' : 'Show') + ' ' + ok.length + ' OK alarm' + (ok.length !== 1 ? 's' : '');
+          var toggleBtn = createEl('button', {
+            className: 'alarm-toggle',
+            'aria-expanded': okAlarmsExpanded ? 'true' : 'false',
+            textContent: toggleLabel
+          });
+          container.appendChild(toggleBtn);
+
+          var okList = createEl('ul', {
+            className: 'alarm-list ok-alarms' + (okAlarmsExpanded ? ' expanded' : '')
+          });
+          for (var j = 0; j < ok.length; j++) {
+            var okLi = createEl('li', { className: 'alarm-item' }, [
+              createEl('span', { className: 'alarm-badge alarm-badge-ok', textContent: 'OK' }),
+              createEl('span', { className: 'alarm-name mono', textContent: ok[j] })
+            ]);
+            okList.appendChild(okLi);
+          }
+          container.appendChild(okList);
+
+          /* Toggle click handler - capture references via closure */
+          (function (btn, list, okCount) {
+            btn.addEventListener('click', function () {
+              okAlarmsExpanded = !okAlarmsExpanded;
+              if (okAlarmsExpanded) {
+                list.classList.add('expanded');
+                btn.textContent = 'Hide ' + okCount + ' OK alarm' + (okCount !== 1 ? 's' : '');
+                btn.setAttribute('aria-expanded', 'true');
+              } else {
+                list.classList.remove('expanded');
+                btn.textContent = 'Show ' + okCount + ' OK alarm' + (okCount !== 1 ? 's' : '');
+                btn.setAttribute('aria-expanded', 'false');
+              }
+            });
+          })(toggleBtn, okList, ok.length);
+
+        } else if (active.length === 0) {
+          container.appendChild(createEl('p', {
+            className: 'no-alarms',
+            textContent: 'All systems operational.'
+          }));
+        }
+
+        replaceContent(els.alarmsContent, container);
+      }
+
+      /* ── Render ── */
+      function render(data) {
+        lastData = data;
+        els.envBadge.textContent = data.environment || '--';
+
+        var components = data.components || {};
+        renderComponent('server', components.server);
+        renderComponent('ac', components.ac);
+        renderAlarms(data.alarms);
+
+        els.loading.style.display = 'none';
+        els.content.classList.add('visible');
+      }
+
+      /* ── Error handling ── */
+      function showError(msg) {
+        els.errorBanner.textContent = msg;
+        els.errorBanner.classList.add('visible');
+      }
+
+      function hideError() {
+        els.errorBanner.classList.remove('visible');
+      }
+
+      /* ── Tick updates ── */
+      function updateLastUpdated() {
+        if (!lastFetchTime) {
+          els.lastUpdated.textContent = '--';
+          return;
+        }
+        var diffMs = Date.now() - lastFetchTime;
+        var seconds = Math.floor(diffMs / 1000);
+        if (seconds < 5) {
+          els.lastUpdated.textContent = 'just now';
+        } else if (seconds < 60) {
+          els.lastUpdated.textContent = seconds + 's ago';
+        } else {
+          var minutes = Math.floor(seconds / 60);
+          els.lastUpdated.textContent = minutes + 'm ago';
+        }
+      }
+
+      function updateDeployedTimes() {
+        if (!lastData || !lastData.components) return;
+        var components = lastData.components;
+        if (components.server && components.server.deployed_at) {
+          setDeployedAt(els.serverDeployedAt, components.server.deployed_at);
+        }
+        if (components.ac && components.ac.deployed_at) {
+          setDeployedAt(els.acDeployedAt, components.ac.deployed_at);
+        }
+      }
+
+      function updateRefreshInfo() {
+        var seconds = Math.round(currentInterval / 1000);
+        els.refreshInfo.textContent = 'Auto-refreshes every ' + seconds + 's';
+      }
+
+      /* ── Backoff logic ── */
+      function onFetchSuccess() {
+        consecutiveFailures = 0;
+        currentInterval = BASE_INTERVAL;
+        setConnectionState('connected');
+        updateRefreshInfo();
+        scheduleNextFetch();
+      }
+
+      function onFetchFailure() {
+        consecutiveFailures++;
+        /* Exponential backoff: 30s -> 60s -> 120s (capped) */
+        currentInterval = Math.min(BASE_INTERVAL * Math.pow(2, consecutiveFailures), MAX_INTERVAL);
+        if (connectionState !== 'stale') {
+          /* Only go stale if data is old enough, otherwise just mark as not-connected */
+          var age = lastFetchTime ? (Date.now() - lastFetchTime) : Infinity;
+          if (age > STALE_THRESHOLD) {
+            setConnectionState('stale');
+          }
+        }
+        updateRefreshInfo();
+        scheduleNextFetch();
+      }
+
+      function scheduleNextFetch() {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(fetchStatus, currentInterval);
+      }
+
+      /* ── Fetch ── */
+      function fetchStatus() {
+        /* Abort any in-flight request */
+        if (abortController) {
+          abortController.abort();
+        }
+        abortController = new AbortController();
+
+        setConnectionState('refreshing');
+
+        var timeoutId = setTimeout(function () {
+          if (abortController) abortController.abort();
+        }, FETCH_TIMEOUT);
+
+        fetch(API_URL, { signal: abortController.signal })
+          .then(function (response) {
+            clearTimeout(timeoutId);
+            if (!response.ok) {
+              throw new Error('HTTP ' + response.status);
+            }
+            return response.json();
+          })
+          .then(function (data) {
+            lastFetchTime = Date.now();
+            hideError();
+            render(data);
+            onFetchSuccess();
+          })
+          .catch(function (err) {
+            clearTimeout(timeoutId);
+            if (err.name === 'AbortError') {
+              showError('Status request timed out.');
+            } else if (err.message && err.message.indexOf('HTTP ') === 0) {
+              showError('Status endpoint returned ' + err.message + '.');
+            } else {
+              showError('Unable to reach status endpoint.');
+            }
+            /* Show content even on error so stale data is visible */
+            if (!lastData) {
+              els.loading.style.display = 'none';
+              els.content.classList.add('visible');
+            }
+            onFetchFailure();
+          });
+      }
+
+      /* ── Init ── */
+      fetchStatus();
+
+      setInterval(function () {
+        updateLastUpdated();
+        updateDeployedTimes();
+        checkStale();
+      }, TICK_INTERVAL);
+    })();
+  </script>
+</body>
+</html>

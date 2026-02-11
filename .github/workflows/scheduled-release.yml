@@ -404,6 +404,79 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Send SNS notification
+        env:
+          HAS_CHANGES: ${{ needs.check-pending-changes.outputs.has_changes }}
+          HEAD_SHA_SHORT: ${{ needs.check-pending-changes.outputs.head_sha_short }}
+          MODE: ${{ needs.check-pending-changes.outputs.mode }}
+          SANDBOX_RESULT: ${{ needs.ensure-sandbox-deployed.result }}
+          SOAK_RESULT: ${{ needs.soak.result }}
+          PROD_RESULT: ${{ needs.promote-to-prod.result }}
+          TAG_RESULT: ${{ needs.tag-and-track.result }}
+          IMAGE_TAG: ${{ needs.ensure-sandbox-deployed.outputs.image_tag }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Try sandbox first, then prod for SNS topic
+          SNS_ARN=$(aws ssm get-parameter \
+            --name "/sandbox/nhp/monitoring/sns-topic-arn" \
+            --query 'Parameter.Value' --output text 2>/dev/null) || SNS_ARN=""
+
+          if [ -z "$SNS_ARN" ] || [[ ! "$SNS_ARN" =~ ^arn:aws:sns: ]]; then
+            echo "No valid SNS topic ARN found at /sandbox/nhp/monitoring/sns-topic-arn, skipping SNS notification"
+          else
+            # Determine overall status
+            if [[ "$HAS_CHANGES" == "false" ]]; then
+              STATUS="SKIPPED (no changes)"
+            elif [[ "$PROD_RESULT" == "success" || ("$MODE" == "sandbox-only" && "$SOAK_RESULT" == "success") ]]; then
+              STATUS="SUCCESS"
+            else
+              STATUS="FAILED"
+            fi
+
+            SUBJECT="Scheduled Release: ${STATUS} (${MODE})"
+
+            MSG="Scheduled Release Notification"
+            MSG+="\n"
+            MSG+="\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            MSG+="\n  Status:  ${STATUS}"
+            MSG+="\n  Mode:    ${MODE}"
+            MSG+="\n  Commit:  ${HEAD_SHA_SHORT:-unknown}"
+            MSG+="\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            if [ -n "$IMAGE_TAG" ]; then
+              MSG+="\n  Image:   ${IMAGE_TAG}"
+            fi
+
+            MSG+="\n"
+            MSG+="\n┌─ Pipeline Stages ──────────────"
+            MSG+="\n│ Sandbox:    $([ "$SANDBOX_RESULT" = "success" ] && echo "[OK]" || [ "$SANDBOX_RESULT" = "skipped" ] && echo "[SKIP]" || echo "[FAILED]") ${SANDBOX_RESULT:-skipped}"
+            MSG+="\n│ Soak:       $([ "$SOAK_RESULT" = "success" ] && echo "[OK]" || [ "$SOAK_RESULT" = "skipped" ] && echo "[SKIP]" || echo "[FAILED]") ${SOAK_RESULT:-skipped}"
+            MSG+="\n│ Production: $([ "$PROD_RESULT" = "success" ] && echo "[OK]" || [ "$PROD_RESULT" = "skipped" ] && echo "[SKIP]" || echo "[FAILED]") ${PROD_RESULT:-skipped}"
+            MSG+="\n│ Tags:       $([ "$TAG_RESULT" = "success" ] && echo "[OK]" || [ "$TAG_RESULT" = "skipped" ] && echo "[SKIP]" || echo "[FAILED]") ${TAG_RESULT:-skipped}"
+            MSG+="\n└─────────────────────────────────"
+
+            if [[ "$STATUS" == "FAILED" ]]; then
+              MSG+="\n"
+              MSG+="\n⚠ Recovery:"
+              MSG+="\n  • Check failed stage in workflow run"
+              MSG+="\n  • Re-run with force_redeploy=true if needed"
+              MSG+="\n  • Check logs: ${WORKFLOW_URL}"
+            fi
+
+            MSG+="\nRun: ${WORKFLOW_URL}"
+
+            aws sns publish \
+              --topic-arn "$SNS_ARN" \
+              --subject "$SUBJECT" \
+              --message "$(echo -e "$MSG")" || echo "::warning::SNS notification failed - check IAM permissions or topic existence"
+          fi
+
       - name: Notify Slack
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}

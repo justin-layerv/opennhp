@@ -369,6 +369,14 @@ green_standby_min_size = 1 # Warm standby - 1 instance ready for instant switch
 enable_ac_blue_green      = true
 ac_green_standby_min_size = 1 # Warm standby - 1 instance ready for instant switch
 
+# ==============================================================================
+# Status Page Configuration
+# Deployment visibility dashboard at status.layerv.xyz
+# ==============================================================================
+deploy_status_page         = true
+status_page_domain         = "status.layerv.xyz"
+status_page_hosted_zone_id = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"

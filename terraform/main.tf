@@ -398,6 +398,77 @@ module "canary_deployment" {
   instance_warmup_seconds  = var.canary_instance_warmup_seconds
 }
 
+# Status Page Module - Deployment visibility dashboard
+# ACM certificate must be in us-east-1 for CloudFront
+resource "aws_acm_certificate" "status_page" {
+  count             = var.deploy_status_page && var.status_page_domain != null ? 1 : 0
+  provider          = aws.us_east_1
+  domain_name       = var.status_page_domain
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-status-page-cert"
+  })
+}
+
+resource "aws_route53_record" "status_page_cert_validation" {
+  for_each = var.deploy_status_page && var.status_page_domain != null && var.status_page_hosted_zone_id != null ? {
+    for dvo in aws_acm_certificate.status_page[0].domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  } : {}
+
+  allow_overwrite = true
+  name            = each.value.name
+  records         = [each.value.record]
+  ttl             = 60
+  type            = each.value.type
+  zone_id         = var.status_page_hosted_zone_id
+}
+
+resource "aws_acm_certificate_validation" "status_page" {
+  count                   = var.deploy_status_page && var.status_page_domain != null ? 1 : 0
+  provider                = aws.us_east_1
+  certificate_arn         = aws_acm_certificate.status_page[0].arn
+  validation_record_fqdns = var.status_page_hosted_zone_id != null ? [for record in aws_route53_record.status_page_cert_validation : record.fqdn] : null
+}
+
+module "status_page" {
+  source = "./modules/status-page"
+  count  = var.deploy_status_page ? 1 : 0
+
+  environment = var.environment
+  name_prefix = local.name_prefix
+  tags        = local.common_tags
+
+  # Domain (optional - uses CloudFront default domain if not set)
+  status_domain       = var.status_page_domain
+  hosted_zone_id      = var.status_page_hosted_zone_id
+  acm_certificate_arn = var.status_page_domain != null ? aws_acm_certificate_validation.status_page[0].certificate_arn : null
+
+  # Target group ARNs for health checks
+  server_nlb_tg_arns = compact([
+    module.compute.udp_target_group_blue_arn,
+    module.compute.udp_target_group_green_arn,
+  ])
+  ac_nlb_tg_arns = var.deploy_ac ? compact([
+    module.ac[0].tcp_target_group_blue_arn,
+    module.ac[0].tcp_target_group_green_arn,
+  ]) : []
+
+  # Monitoring
+  alarm_name_prefix = "${local.name_prefix}-${var.cell_id}"
+  sns_topic_arn     = module.monitoring.sns_topic_arn
+  logs_kms_key_arn  = module.kms.logs_key_arn
+  ssm_prefix        = "/${var.environment}/nhp"
+}
+
 # DNS Module - Route 53 records
 module "dns" {
   source = "./modules/dns"

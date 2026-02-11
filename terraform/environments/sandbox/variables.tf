@@ -1244,3 +1244,30 @@ variable "canary_instance_warmup_seconds" {
   type        = number
   default     = 180
 }
+
+# ==============================================================================
+# Status Page Configuration
+# ==============================================================================
+
+variable "deploy_status_page" {
+  description = "Deploy the deployment status page (Lambda + API Gateway + S3 + CloudFront)"
+  type        = bool
+  default     = false
+}
+
+variable "status_page_domain" {
+  description = "Custom domain for the status page (e.g., status.layerv.xyz)"
+  type        = string
+  default     = null
+}
+
+variable "status_page_hosted_zone_id" {
+  description = "Route53 hosted zone ID for the status page custom domain"
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.status_page_hosted_zone_id == null || can(regex("^Z[A-Z0-9]+$", var.status_page_hosted_zone_id))
+    error_message = "status_page_hosted_zone_id must be a valid Route53 zone ID (starts with Z)"
+  }
+}

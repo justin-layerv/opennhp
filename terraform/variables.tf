@@ -1419,6 +1419,36 @@ variable "canary_instance_warmup_seconds" {
   default     = 180
 }
 
+# ==================== Status Page ====================
+
+variable "deploy_status_page" {
+  description = "Deploy the status page for deployment visibility (Lambda + API Gateway + S3 + CloudFront)"
+  type        = bool
+  default     = false
+}
+
+variable "status_page_domain" {
+  description = "Custom domain for the status page (e.g., status.layerv.xyz). If null, CloudFront default domain is used."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.status_page_domain == null || can(regex("^[a-z0-9][a-z0-9.-]*[a-z0-9]$", var.status_page_domain))
+    error_message = "status_page_domain must be a valid domain name."
+  }
+}
+
+variable "status_page_hosted_zone_id" {
+  description = "Route53 hosted zone ID for the status page domain. Required when status_page_domain is set."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.status_page_hosted_zone_id == null || can(regex("^Z[A-Z0-9]+$", var.status_page_hosted_zone_id))
+    error_message = "status_page_hosted_zone_id must be a valid Route53 zone ID (starts with Z)."
+  }
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {

@@ -1,0 +1,11 @@
+# Development dependencies for testing Status Aggregator Lambda
+# Install with: pip install -r requirements-dev.txt
+
+# Testing framework
+pytest>=8.0.0
+
+# AWS SDK (provided by Lambda runtime, needed for testing)
+boto3>=1.34.0
+
+# Mocking AWS services
+moto>=5.0.0

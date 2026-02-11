@@ -326,3 +326,22 @@ output "canary_composite_alarm_name" {
   description = "CloudWatch composite alarm name for canary health"
   value       = var.enable_canary_deployment ? module.canary_deployment[0].composite_alarm_name : null
 }
+
+# ============================================================================
+# Status Page Outputs
+# ============================================================================
+
+output "status_page_url" {
+  description = "Status page URL"
+  value       = var.deploy_status_page ? module.status_page[0].status_url : null
+}
+
+output "status_page_api_url" {
+  description = "Status page API endpoint URL"
+  value       = var.deploy_status_page ? module.status_page[0].api_url : null
+}
+
+output "status_page_cloudfront_distribution_id" {
+  description = "CloudFront distribution ID for status page (for cache invalidation)"
+  value       = var.deploy_status_page ? module.status_page[0].cloudfront_distribution_id : null
+}
