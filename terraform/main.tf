@@ -36,8 +36,11 @@ terraform {
 # Grafana provider for dashboards module
 # Configured with URL and auth from variables. Only used when grafana_dashboards_enabled=true.
 provider "grafana" {
-  url  = coalesce(var.grafana_url, "https://grafana.placeholder.local")
-  auth = var.grafana_auth
+  url                = coalesce(var.grafana_url, "https://grafana.placeholder.local")
+  auth               = var.grafana_auth
+  retries            = 3
+  retry_status_codes = ["429", "500", "502", "503"]
+  retry_wait         = 10
 }
 
 # ==================== Validation ====================
