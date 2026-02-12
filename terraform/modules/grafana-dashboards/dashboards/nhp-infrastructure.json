@@ -1728,7 +1728,7 @@
           ],
           "dimensions": {
             "AutoScalingGroupName": [
-              "nhp-${environment}-*"
+              "layerv-nhp-${environment}-*"
             ]
           },
           "period": "60",
@@ -1858,7 +1858,7 @@
           ],
           "dimensions": {
             "AutoScalingGroupName": [
-              "nhp-${environment}-*"
+              "layerv-nhp-${environment}-*"
             ]
           },
           "period": "60",
