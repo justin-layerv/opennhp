@@ -1111,8 +1111,9 @@ HEALTH_TIMEOUT=150
 HEALTH_CHECK_PASSED=false
 echo "Waiting for Console to be healthy (timeout: $${HEALTH_TIMEOUT}s)..."
 for i in {1..30}; do
-    HEALTH_RESPONSE=$(curl -s --max-time 5 -w "\nHTTP_CODE:%%{http_code}" http://127.0.0.1:$HOST_PORT/health 2>&1)
-    CURL_EXIT_CODE=$?
+    # Use || to capture exit code without triggering set -e (curl returns non-zero when container isn't ready)
+    CURL_EXIT_CODE=0
+    HEALTH_RESPONSE=$(curl -s --max-time 5 -w "\nHTTP_CODE:%%{http_code}" http://127.0.0.1:$HOST_PORT/health 2>&1) || CURL_EXIT_CODE=$?
 
     if echo "$HEALTH_RESPONSE" | grep -q "healthy"; then
         echo "Console is healthy after $((i * 5)) seconds"
