@@ -88,13 +88,14 @@
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
-          "expr": "sum(increase(qurl_resource_created_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h]))",
+          "expr": "ceil(sum(increase(qurl_resource_created_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h])))",
           "legendFormat": "Created"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
+          "decimals": 0,
           "color": {"mode": "thresholds"},
           "thresholds": {
             "steps": [

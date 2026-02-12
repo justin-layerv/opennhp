@@ -99,13 +99,24 @@ resource "grafana_folder" "nhp" {
   prevent_destroy_if_not_empty = true
 }
 
+# NHP Infrastructure Dashboard
+# Uses templatefile() to inject exact CloudWatch dimension values from module
+# outputs. This is required because Grafana's CloudWatch plugin only supports
+# "*" (match all) or exact dimension values — partial wildcards like
+# "nhp-sandbox-*" silently match nothing. Pass exact ARN suffixes and ASG
+# names from compute/AC module outputs to ensure panels query the right resources.
 resource "grafana_dashboard" "nhp_infrastructure" {
   count = var.cloudwatch_datasource_enabled ? 1 : 0
 
   folder = grafana_folder.nhp[0].uid
   config_json = templatefile("${path.module}/dashboards/nhp-infrastructure.json", {
-    cloudwatch_uid = grafana_data_source.cloudwatch[0].uid
-    environment    = var.environment
+    cloudwatch_uid        = grafana_data_source.cloudwatch[0].uid
+    environment           = var.environment
+    server_nlb_arn_suffix = var.server_nlb_arn_suffix
+    ac_nlb_arn_suffix     = var.ac_nlb_arn_suffix
+    server_asg_name       = var.server_asg_name
+    ac_asg_name           = var.ac_asg_name
+    name_prefix           = var.name_prefix
   })
 
   overwrite = true
@@ -237,6 +248,16 @@ check "loki_datasource_uid_required" {
   assert {
     condition     = !var.loki_datasource_enabled || length(var.loki_datasource_uid) > 0
     error_message = "loki_datasource_uid must be set when loki_datasource_enabled is true."
+  }
+}
+
+check "cloudwatch_dimensions_should_be_set" {
+  assert {
+    condition = !var.cloudwatch_datasource_enabled || (
+      length(var.server_nlb_arn_suffix) > 0 &&
+      length(var.server_asg_name) > 0
+    )
+    error_message = "server_nlb_arn_suffix and server_asg_name should be set when cloudwatch_datasource_enabled is true, otherwise NHP Infrastructure dashboard panels will show no data. Pass these from compute module outputs."
   }
 }
 

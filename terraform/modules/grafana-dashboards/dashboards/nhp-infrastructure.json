@@ -122,7 +122,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-server*"
+              "${server_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -184,7 +184,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-ac*"
+              "${ac_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -250,7 +250,7 @@
           ],
           "dimensions": {
             "AutoScalingGroupName": [
-              "nhp-$environment-server*"
+              "${server_asg_name}"
             ]
           },
           "period": "300",
@@ -308,7 +308,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-server*"
+              "${server_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -324,7 +324,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-ac*"
+              "${ac_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -386,7 +386,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-server*"
+              "${server_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -402,7 +402,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-ac*"
+              "${ac_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -465,7 +465,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-server*"
+              "${server_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -516,7 +516,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-ac*"
+              "${ac_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -565,7 +565,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-server*"
+              "${server_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -581,7 +581,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-ac*"
+              "${ac_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -630,7 +630,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-*"
+              "*"
             ]
           },
           "period": "300",
@@ -646,7 +646,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-*"
+              "*"
             ]
           },
           "period": "300",
@@ -662,7 +662,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-*"
+              "*"
             ]
           },
           "period": "300",
@@ -711,7 +711,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-server*"
+              "${server_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -727,7 +727,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-server*"
+              "${server_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -743,7 +743,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-server*"
+              "${server_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -837,7 +837,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-server*"
+              "${server_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -853,7 +853,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-ac*"
+              "${ac_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -902,7 +902,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-server*"
+              "${server_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -918,7 +918,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-ac*"
+              "${ac_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -967,7 +967,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-server*"
+              "${server_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -983,7 +983,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-ac*"
+              "${ac_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -1425,7 +1425,7 @@
           ],
           "dimensions": {
             "AutoScalingGroupName": [
-              "nhp-$environment-server*"
+              "${server_asg_name}"
             ]
           },
           "period": "300",
@@ -1441,7 +1441,7 @@
           ],
           "dimensions": {
             "AutoScalingGroupName": [
-              "nhp-$environment-ac*"
+              "${ac_asg_name}"
             ]
           },
           "period": "300",
@@ -1491,7 +1491,7 @@
           ],
           "dimensions": {
             "AutoScalingGroupName": [
-              "nhp-$environment-server*"
+              "${server_asg_name}"
             ]
           },
           "period": "300",
@@ -1507,7 +1507,7 @@
           ],
           "dimensions": {
             "AutoScalingGroupName": [
-              "nhp-$environment-ac*"
+              "${ac_asg_name}"
             ]
           },
           "period": "300",
@@ -1566,7 +1566,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-server*"
+              "${server_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -1582,7 +1582,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-ac*"
+              "${ac_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -1645,7 +1645,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-server*"
+              "${server_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -1661,7 +1661,7 @@
           ],
           "dimensions": {
             "LoadBalancer": [
-              "nhp-$environment-ac*"
+              "${ac_nlb_arn_suffix}"
             ]
           },
           "period": "300",
@@ -1728,7 +1728,7 @@
           ],
           "dimensions": {
             "AutoScalingGroupName": [
-              "layerv-nhp-${environment}-*"
+              "*"
             ]
           },
           "period": "60",
@@ -1858,7 +1858,7 @@
           ],
           "dimensions": {
             "AutoScalingGroupName": [
-              "layerv-nhp-${environment}-*"
+              "*"
             ]
           },
           "period": "60",
@@ -1932,7 +1932,7 @@
           ],
           "dimensions": {
             "TableName": [
-              "nhp-$environment-*"
+              "*"
             ]
           },
           "period": "300",
@@ -1981,7 +1981,7 @@
           ],
           "dimensions": {
             "TableName": [
-              "nhp-$environment-*"
+              "*"
             ]
           },
           "period": "300",
@@ -1997,7 +1997,7 @@
           ],
           "dimensions": {
             "TableName": [
-              "nhp-$environment-*"
+              "*"
             ]
           },
           "period": "300",
@@ -2057,7 +2057,7 @@
           "metricName": "MetricAlarms",
           "queryMode": "Annotations",
           "prefixMatching": true,
-          "alarmNamePrefix": "nhp-$environment",
+          "alarmNamePrefix": "${name_prefix}",
           "region": "default"
         }
       ]

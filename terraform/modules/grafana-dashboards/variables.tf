@@ -123,6 +123,34 @@ variable "athena_region" {
   default     = "us-east-1"
 }
 
+# ==============================================================================
+# NHP Infrastructure Dashboard Dimensions
+# ==============================================================================
+
+variable "server_nlb_arn_suffix" {
+  description = "Server NLB ARN suffix for CloudWatch LoadBalancer dimension (e.g., net/name/id)"
+  type        = string
+  default     = ""
+}
+
+variable "ac_nlb_arn_suffix" {
+  description = "AC NLB ARN suffix for CloudWatch LoadBalancer dimension (e.g., net/name/id)"
+  type        = string
+  default     = ""
+}
+
+variable "server_asg_name" {
+  description = "Server ASG name for CloudWatch AutoScalingGroupName dimension"
+  type        = string
+  default     = ""
+}
+
+variable "ac_asg_name" {
+  description = "AC ASG name for CloudWatch AutoScalingGroupName dimension"
+  type        = string
+  default     = ""
+}
+
 variable "tags" {
   description = "Tags to apply to resources"
   type        = map(string)

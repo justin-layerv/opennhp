@@ -1243,6 +1243,12 @@ module "grafana_dashboards" {
   grafana_cloud_aws_account_id  = var.grafana_cloud_aws_account_id
   grafana_cloud_external_id     = var.grafana_cloud_external_id
 
+  # NHP Infrastructure dashboard dimensions (from compute/AC modules)
+  server_nlb_arn_suffix = module.compute.nlb_arn_suffix
+  ac_nlb_arn_suffix     = var.deploy_ac ? module.ac[0].nlb_arn_suffix : ""
+  server_asg_name       = module.compute.asg_name
+  ac_asg_name           = var.deploy_ac ? module.ac[0].asg_name : ""
+
   # Athena data source for AWS Cost dashboard
   athena_datasource_enabled = var.deploy_cost_analytics
   athena_assume_role_arn    = var.deploy_cost_analytics ? module.cost_analytics[0].grafana_athena_role_arn : ""
