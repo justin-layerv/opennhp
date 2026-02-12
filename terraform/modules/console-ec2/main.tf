@@ -223,11 +223,14 @@ resource "aws_iam_role_policy" "console" {
         ]
         Resource = local.route53_zone_resources
       }] : [],
-      # SSM - read Console image tag at boot time
+      # SSM - read Console and AC image tags at boot time
       [{
-        Effect   = "Allow"
-        Action   = ["ssm:GetParameter"]
-        Resource = "arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:parameter${var.console_image_tag_ssm_param}"
+        Effect = "Allow"
+        Action = ["ssm:GetParameter"]
+        Resource = [
+          "arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:parameter${var.console_image_tag_ssm_param}",
+          "arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:parameter${var.ac_image_tag_ssm_param}"
+        ]
       }]
     )
   })
@@ -395,7 +398,7 @@ locals {
     # NHP Protection (always enabled)
     nhp_server_secret_arn   = var.nhp_server_secret_arn
     nhp_ac_repo_url         = var.nhp_ac_repo_url
-    image_tag               = var.image_tag
+    ac_image_tag_ssm_param  = var.ac_image_tag_ssm_param
     nhp_server_cloudmap_dns = var.nhp_server_cloudmap_dns
     vpc_cidr                = var.vpc_cidr
     name_prefix             = var.name_prefix

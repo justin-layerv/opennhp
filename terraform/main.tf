@@ -864,7 +864,7 @@ module "console_ec2" {
   nhp_server_cloudmap_dns = module.compute.cloudmap_service_dns
   nhp_ac_repo_url         = module.ecr.ac_repo_url
   nhp_ac_ecr_repo_arn     = module.ecr.ac_repo_arn
-  image_tag               = var.image_tag
+  ac_image_tag_ssm_param  = var.deploy_ac ? module.ac[0].ssm_image_tag_parameter : "/${var.environment}/nhp/ac/image-tag"
 
   # NHP Network-Level Protection (true network hiding with iptables DROP)
   # Console EC2 configures iptables DROP by default.

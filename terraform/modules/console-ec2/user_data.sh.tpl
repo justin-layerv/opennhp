@@ -515,16 +515,26 @@ echo "Extracting nhp-acd binary from AC image..."
 
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${account_id}.dkr.ecr.${region}.amazonaws.com"
 
-# Pull AC image and extract nhp-acd binary
-# Use explicit image_tag to ensure binary version matches Terraform-managed config
-docker pull "${nhp_ac_repo_url}:${image_tag}" || {
-  echo "ERROR: Could not pull AC image with tag ${image_tag}"
-  echo "This likely means the image hasn't been built yet for this commit"
+# Read AC image tag from SSM at boot time (allows AC CI to deploy independently)
+echo "Reading AC image tag from SSM: ${ac_image_tag_ssm_param}"
+AC_IMAGE_TAG=$(aws ssm get-parameter --name "${ac_image_tag_ssm_param}" --query 'Parameter.Value' --output text --region "$REGION") || {
+  echo "ERROR: Failed to read AC image tag from SSM parameter ${ac_image_tag_ssm_param}"
+  exit 1
+}
+if [ -z "$AC_IMAGE_TAG" ] || [ "$AC_IMAGE_TAG" = "None" ]; then
+  echo "ERROR: AC image tag is empty or None (SSM parameter: ${ac_image_tag_ssm_param})"
+  exit 1
+fi
+echo "AC image tag: $AC_IMAGE_TAG"
+
+docker pull "${nhp_ac_repo_url}:$AC_IMAGE_TAG" || {
+  echo "ERROR: Could not pull AC image with tag $AC_IMAGE_TAG"
+  echo "This likely means the image hasn't been built yet"
   exit 1
 }
 
 if docker images | grep -q "nhp-ac"; then
-  CONTAINER_ID=$(docker create "${nhp_ac_repo_url}:${image_tag}")
+  CONTAINER_ID=$(docker create "${nhp_ac_repo_url}:$AC_IMAGE_TAG")
 
   mkdir -p /opt/layerv/nhp-ac/etc
 

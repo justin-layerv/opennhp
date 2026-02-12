@@ -312,8 +312,8 @@ variable "nhp_ac_ecr_repo_arn" {
   default     = null
 }
 
-variable "image_tag" {
-  description = "Image tag for nhp-ac image. Must match deployed infrastructure to avoid config/binary version mismatches."
+variable "ac_image_tag_ssm_param" {
+  description = "SSM parameter name containing the AC image tag. Read at boot for dynamic updates (same pattern as console_image_tag_ssm_param)."
   type        = string
 }
 
