@@ -1030,6 +1030,7 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "logs:TagLogGroup",
           "logs:UntagLogGroup",
           "cloudwatch:PutMetricAlarm",
+          "cloudwatch:PutMetricData",
           "cloudwatch:DeleteAlarms",
           "cloudwatch:PutDashboard",
           "cloudwatch:DeleteDashboards",
