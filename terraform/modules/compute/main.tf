@@ -682,6 +682,18 @@ resource "aws_autoscaling_group" "server" {
   health_check_type         = "EC2"
   health_check_grace_period = 180 # Instance launch (~60s) + user data (~90s) + container start (~15s) = ~165s
 
+  # Publish ASG group metrics to CloudWatch (AWS/AutoScaling namespace).
+  # Without this, metrics like GroupInServiceInstances are not emitted.
+  enabled_metrics = [
+    "GroupInServiceInstances",
+    "GroupDesiredCapacity",
+    "GroupMinSize",
+    "GroupMaxSize",
+    "GroupPendingInstances",
+    "GroupTerminatingInstances",
+    "GroupTotalInstances",
+  ]
+
   instance_refresh {
     strategy = "Rolling"
     preferences {

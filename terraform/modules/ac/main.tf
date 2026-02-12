@@ -785,6 +785,18 @@ resource "aws_autoscaling_group" "ac" {
   health_check_type         = "EC2"
   health_check_grace_period = 180 # Reduced from 300s - AC startup is typically ~90-120s
 
+  # Publish ASG group metrics to CloudWatch (AWS/AutoScaling namespace).
+  # Without this, metrics like GroupInServiceInstances are not emitted.
+  enabled_metrics = [
+    "GroupInServiceInstances",
+    "GroupDesiredCapacity",
+    "GroupMinSize",
+    "GroupMaxSize",
+    "GroupPendingInstances",
+    "GroupTerminatingInstances",
+    "GroupTotalInstances",
+  ]
+
   instance_refresh {
     strategy = "Rolling"
     preferences {

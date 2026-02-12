@@ -123,6 +123,9 @@
           "dimensions": {
             "LoadBalancer": [
               "${server_nlb_arn_suffix}"
+            ],
+            "TargetGroup": [
+              "*"
             ]
           },
           "period": "300",
@@ -185,6 +188,9 @@
           "dimensions": {
             "LoadBalancer": [
               "${ac_nlb_arn_suffix}"
+            ],
+            "TargetGroup": [
+              "*"
             ]
           },
           "period": "300",
@@ -387,6 +393,9 @@
           "dimensions": {
             "LoadBalancer": [
               "${server_nlb_arn_suffix}"
+            ],
+            "TargetGroup": [
+              "*"
             ]
           },
           "period": "300",
@@ -403,6 +412,9 @@
           "dimensions": {
             "LoadBalancer": [
               "${ac_nlb_arn_suffix}"
+            ],
+            "TargetGroup": [
+              "*"
             ]
           },
           "period": "300",
@@ -838,6 +850,9 @@
           "dimensions": {
             "LoadBalancer": [
               "${server_nlb_arn_suffix}"
+            ],
+            "TargetGroup": [
+              "*"
             ]
           },
           "period": "300",
@@ -854,6 +869,9 @@
           "dimensions": {
             "LoadBalancer": [
               "${ac_nlb_arn_suffix}"
+            ],
+            "TargetGroup": [
+              "*"
             ]
           },
           "period": "300",
@@ -1567,6 +1585,9 @@
           "dimensions": {
             "LoadBalancer": [
               "${server_nlb_arn_suffix}"
+            ],
+            "TargetGroup": [
+              "*"
             ]
           },
           "period": "300",
@@ -1583,6 +1604,9 @@
           "dimensions": {
             "LoadBalancer": [
               "${ac_nlb_arn_suffix}"
+            ],
+            "TargetGroup": [
+              "*"
             ]
           },
           "period": "300",
@@ -1646,6 +1670,9 @@
           "dimensions": {
             "LoadBalancer": [
               "${server_nlb_arn_suffix}"
+            ],
+            "TargetGroup": [
+              "*"
             ]
           },
           "period": "300",
@@ -1662,6 +1689,9 @@
           "dimensions": {
             "LoadBalancer": [
               "${ac_nlb_arn_suffix}"
+            ],
+            "TargetGroup": [
+              "*"
             ]
           },
           "period": "300",
@@ -1740,7 +1770,7 @@
     {
       "id": 24,
       "title": "AC Disk Usage %",
-      "description": "Disk usage percentage on AC instances from custom NHP/AC CloudWatch namespace. Action: >80% requires log rotation or disk cleanup; >90% is critical.",
+      "description": "Root filesystem disk usage from CloudWatch Agent on AC instances. Action: >80% requires log rotation or disk cleanup; >90% is critical.",
       "type": "timeseries",
       "datasource": {
         "uid": "${cloudwatch_uid}",
@@ -1788,15 +1818,19 @@
       "targets": [
         {
           "refId": "A",
-          "namespace": "NHP/AC",
-          "metricName": "DiskUsagePercent",
+          "namespace": "LayerV/NHP",
+          "metricName": "disk_used_percent",
           "statistics": [
             "Average"
           ],
-          "dimensions": {},
-          "period": "300",
+          "dimensions": {
+            "AutoScalingGroupName": [
+              "${ac_asg_name}"
+            ]
+          },
+          "period": "60",
           "region": "default",
-          "label": "Disk Usage"
+          "label": "$${PROP('Dim.AutoScalingGroupName')}"
         }
       ]
     },
