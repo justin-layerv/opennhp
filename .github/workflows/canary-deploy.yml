@@ -295,6 +295,20 @@ jobs:
             esac
           done
 
+      - name: Push Deployment Metric
+        if: steps.poll-execution.outputs.status == 'SUCCEEDED'
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          COMPONENT: ${{ inputs.component }}
+        run: |
+          aws cloudwatch put-metric-data \
+            --namespace "LayerV/NHP" \
+            --metric-name "DeploymentEvent" \
+            --dimensions "Environment=$ENVIRONMENT,Component=$COMPONENT,Strategy=canary" \
+            --value 1 \
+            --unit Count
+          echo "Deployment event pushed to LayerV/NHP namespace"
+
   # =============================================================================
   # NOTIFY - Send deployment notification to SNS (Slack via AWS Chatbot)
   # =============================================================================

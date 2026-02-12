@@ -111,6 +111,9 @@ type UdpServer struct {
 	// Cloud Map client for server health discovery.
 	// Used to filter stale AC assignments pointing to terminated servers.
 	cloudMap *CloudMapClient
+
+	// CloudWatch metrics publisher for NHP operational metrics.
+	metrics *MetricsPublisher
 }
 
 type BlockAddr struct {
@@ -226,6 +229,9 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		}
 		log.Info("Cloud Map client initialized for server health filtering")
 	}
+
+	// Initialize CloudWatch metrics publisher (non-fatal if unavailable)
+	s.metrics = NewMetricsPublisher()
 
 	// Initialize server-to-server forwarder
 	s.forwarder = NewServerForwarder(s)
@@ -377,6 +383,10 @@ func (s *UdpServer) Stop() {
 	// Stop forwarder cleanup routine
 	if s.forwarder != nil {
 		s.forwarder.Stop()
+	}
+	// Flush remaining CloudWatch metrics
+	if s.metrics != nil {
+		s.metrics.Stop()
 	}
 	close(s.signals.stop)
 	s.listenConn.Close()

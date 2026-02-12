@@ -10,6 +10,21 @@
     "from": "now-24h",
     "to": "now"
   },
+  "annotations": {
+    "list": [
+      {
+        "name": "Deployments",
+        "datasource": {"uid": "${datasource_uid}"},
+        "enable": true,
+        "hide": false,
+        "iconColor": "blue",
+        "expr": "changes(process_start_time_seconds{service_name=\"qurl-api\", deployment_environment=\"$environment\"}[2m]) > 0",
+        "step": "60s",
+        "titleFormat": "Deployment",
+        "textFormat": "Service restarted"
+      }
+    ]
+  },
   "links": [
     {
       "title": "Operations",
@@ -21,6 +36,12 @@
       "title": "Webhooks",
       "type": "link",
       "url": "/d/qurl-webhooks/qurl-webhooks?var-environment=$environment&var-cell_id=$cell_id",
+      "icon": "dashboard"
+    },
+    {
+      "title": "NHP Infrastructure",
+      "type": "link",
+      "url": "/d/nhp-infrastructure-${environment}/nhp-infrastructure?var-environment=$environment",
       "icon": "dashboard"
     }
   ],
@@ -53,6 +74,7 @@
     {
       "id": 100,
       "title": "Overview",
+      "description": "High-level business KPIs for QURL service health at a glance.",
       "type": "row",
       "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
       "collapsed": false
@@ -60,6 +82,7 @@
     {
       "id": 1,
       "title": "QURLs Created (24h)",
+      "description": "Total number of QURL resources created in the last 24 hours.",
       "type": "stat",
       "gridPos": {"h": 4, "w": 4, "x": 0, "y": 1},
       "datasource": {"uid": "${datasource_uid}"},
@@ -84,8 +107,9 @@
     {
       "id": 2,
       "title": "vs Yesterday",
+      "description": "Percentage change in QURLs created compared to the previous 24-hour period. Green indicates growth, red indicates decline.",
       "type": "stat",
-      "gridPos": {"h": 4, "w": 2, "x": 4, "y": 1},
+      "gridPos": {"h": 4, "w": 3, "x": 4, "y": 1},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -107,13 +131,14 @@
           }
         }
       },
-      "options": {"colorMode": "value"}
+      "options": {"colorMode": "value", "graphMode": "area"}
     },
     {
       "id": 3,
       "title": "Active QURLs",
+      "description": "Current count of non-expired, non-revoked QURL resources.",
       "type": "stat",
-      "gridPos": {"h": 4, "w": 4, "x": 6, "y": 1},
+      "gridPos": {"h": 4, "w": 4, "x": 7, "y": 1},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -136,8 +161,9 @@
     {
       "id": 4,
       "title": "Tokens Minted (24h)",
+      "description": "Total access tokens generated in the last 24 hours. Each token represents a unique access attempt.",
       "type": "stat",
-      "gridPos": {"h": 4, "w": 4, "x": 10, "y": 1},
+      "gridPos": {"h": 4, "w": 3, "x": 11, "y": 1},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -160,8 +186,9 @@
     {
       "id": 5,
       "title": "Quota Limit Hits (24h)",
+      "description": "Number of times users hit their tier quota limits in the last 24 hours. High values suggest users need tier upgrades.",
       "type": "stat",
-      "gridPos": {"h": 4, "w": 4, "x": 14, "y": 1},
+      "gridPos": {"h": 4, "w": 3, "x": 14, "y": 1},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -186,8 +213,9 @@
     {
       "id": 6,
       "title": "Access Denied (24h)",
+      "description": "Total access attempts denied in the last 24 hours due to invalid tokens, expired QURLs, or quota limits.",
       "type": "stat",
-      "gridPos": {"h": 4, "w": 4, "x": 18, "y": 1},
+      "gridPos": {"h": 4, "w": 4, "x": 17, "y": 1},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -212,8 +240,9 @@
     {
       "id": 7,
       "title": "Successful Accesses (24h)",
+      "description": "Total successful QURL access grants in the last 24 hours. Represents completed end-to-end user journeys.",
       "type": "stat",
-      "gridPos": {"h": 4, "w": 2, "x": 22, "y": 1},
+      "gridPos": {"h": 4, "w": 3, "x": 21, "y": 1},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -234,17 +263,60 @@
       }
     },
     {
+      "id": 50,
+      "title": "Conversion Funnel (24h)",
+      "description": "QURL lifecycle funnel showing conversion from creation to successful access. Drop-off between stages indicates where users are lost.",
+      "type": "bargauge",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(increase(qurl_resource_created_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h]))",
+          "legendFormat": "Created"
+        },
+        {
+          "expr": "sum(increase(qurl_token_minted_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h]))",
+          "legendFormat": "Tokens Minted"
+        },
+        {
+          "expr": "sum(increase(qurl_token_validation_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", result=\"valid\"}[24h]))",
+          "legendFormat": "Valid Tokens"
+        },
+        {
+          "expr": "sum(increase(qurl_access_granted_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h]))",
+          "legendFormat": "Access Granted"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "thresholds": {
+            "steps": [
+              {"color": "blue", "value": null}
+            ]
+          }
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient"
+      }
+    },
+    {
       "id": 101,
       "title": "Resource Lifecycle",
+      "description": "QURL resource creation, activation, and revocation patterns over time.",
       "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 5},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 13},
       "collapsed": false
     },
     {
       "id": 10,
       "title": "QURLs Created Over Time",
+      "description": "Hourly QURL creation rate with week-over-week comparison. Bars show current period, dashed line shows last week.",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -273,8 +345,9 @@
     {
       "id": 11,
       "title": "Active QURLs by Tier",
+      "description": "Distribution of currently active QURLs across pricing tiers. Helps identify tier adoption patterns.",
       "type": "piechart",
-      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 6},
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 14},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -290,8 +363,9 @@
     {
       "id": 12,
       "title": "Resource Status Transitions",
+      "description": "Rate of QURL creation vs revocation over time. A growing gap between created and revoked indicates healthy adoption.",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 6},
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 14},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -322,15 +396,17 @@
     {
       "id": 102,
       "title": "Tokens & Access",
+      "description": "Token lifecycle and access control metrics including validation results and denial reasons.",
       "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 14},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 22},
       "collapsed": false
     },
     {
       "id": 20,
       "title": "Token Validation Results",
+      "description": "Breakdown of token validation outcomes over 24 hours. High invalid/expired ratios may indicate token misconfiguration or abuse.",
       "type": "piechart",
-      "gridPos": {"h": 8, "w": 6, "x": 0, "y": 15},
+      "gridPos": {"h": 8, "w": 6, "x": 0, "y": 23},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -353,8 +429,9 @@
     {
       "id": 21,
       "title": "Token Validation Rate",
+      "description": "Rate of token validations per second by result type, stacked to show total validation load and success ratio.",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 10, "x": 6, "y": 15},
+      "gridPos": {"h": 8, "w": 10, "x": 6, "y": 23},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -383,8 +460,9 @@
     {
       "id": 22,
       "title": "Access Denied by Reason",
+      "description": "Categorized breakdown of access denials over 24 hours. Use to identify the primary causes of failed access attempts.",
       "type": "barchart",
-      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 15},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 23},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -407,15 +485,17 @@
     {
       "id": 103,
       "title": "Quotas",
+      "description": "Quota usage, limit hits, and top offenders by tier. Monitor for users approaching or exceeding their limits.",
       "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 23},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 31},
       "collapsed": false
     },
     {
       "id": 30,
       "title": "Quota Limit Hits by Tier",
+      "description": "Hourly rate of quota limit hits broken down by pricing tier. Spikes indicate tiers that need quota increases.",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -439,74 +519,188 @@
     {
       "id": 31,
       "title": "Top Quota Offenders",
+      "description": "Top 10 users by quota limit hits in the last 24 hours, showing their tier and tier limit for context.",
       "type": "table",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
           "expr": "topk(10, sum by (owner_id, tier) (increase(qurl_quota_limit_hit_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h])))",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "refId": "A"
+        },
+        {
+          "expr": "max by (owner_id, tier) (qurl_quota_limit{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"})",
+          "format": "table",
+          "instant": true,
+          "refId": "B"
         }
       ],
       "transformations": [
-        {"id": "organize", "options": {"renameByName": {"owner_id": "Owner", "tier": "Tier", "Value": "Hits (24h)"}}}
+        {"id": "merge"},
+        {"id": "organize", "options": {"renameByName": {"owner_id": "Owner", "tier": "Tier", "Value #A": "Hits (24h)", "Value #B": "Tier Limit"}}}
       ],
       "fieldConfig": {
         "defaults": {"unit": "short"},
         "overrides": [
-          {"matcher": {"id": "byName", "options": "Hits (24h)"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background", "mode": "gradient"}}, {"id": "color", "value": {"mode": "continuous-YlOrRd"}}]}
+          {"matcher": {"id": "byName", "options": "Hits (24h)"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background", "mode": "gradient"}}, {"id": "color", "value": {"mode": "continuous-YlOrRd"}}]},
+          {"matcher": {"id": "byName", "options": "Tier Limit"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-text"}}, {"id": "color", "value": {"fixedColor": "text", "mode": "fixed"}}]}
         ]
+      }
+    },
+    {
+      "id": 51,
+      "title": "Quota Utilization by Tier",
+      "description": "How close each tier is to its quota limit. Action: If > 80%, consider proactive tier upgrades or quota increases.",
+      "type": "gauge",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 40},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "avg by (tier) (qurl_quota_utilization{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"} * 100) or vector(0)",
+          "legendFormat": "{{tier}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 70},
+              {"color": "red", "value": 90}
+            ]
+          }
+        }
       }
     },
     {
       "id": 104,
       "title": "Batch Operations",
+      "description": "Batch QURL creation metrics including request rates and size distribution heatmaps.",
       "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 32},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 48},
+      "collapsed": false
+    },
+    {
+      "id": 40,
+      "title": "Batch Create Operations",
+      "description": "Rate of batch QURL creation requests per second. Spikes may indicate automated integrations or API-driven workflows.",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 49},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(rate(qurl_batch_create_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
+          "legendFormat": "Batch requests"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20
+          }
+        }
+      }
+    },
+    {
+      "id": 41,
+      "title": "Batch Size Distribution",
+      "description": "Heatmap showing the distribution of batch creation sizes. Helps identify typical batch sizes and outliers.",
+      "type": "heatmap",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 49},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(increase(qurl_batch_create_size_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)",
+          "format": "heatmap"
+        }
+      ],
+      "options": {
+        "calculate": false,
+        "yAxis": {"unit": "short"},
+        "color": {"scheme": "Blues", "mode": "scheme"}
+      }
+    },
+    {
+      "id": 105,
+      "title": "Trends",
+      "description": "Daily and weekly trend analysis for QURL usage patterns over longer time periods.",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 57},
       "collapsed": true,
       "panels": [
         {
-          "id": 40,
-          "title": "Batch Create Operations",
-          "type": "timeseries",
-          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 33},
+          "id": 52,
+          "title": "QURLs Created per Day (30d)",
+          "description": "Daily count of QURLs created over the last 30 days. Use to identify growth trends, weekly patterns, and anomalies.",
+          "type": "barchart",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 58},
           "datasource": {"uid": "${datasource_uid}"},
           "targets": [
             {
-              "expr": "sum(rate(qurl_batch_create_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
-              "legendFormat": "Batch requests"
+              "expr": "sum(increase(qurl_resource_created_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1d]))",
+              "legendFormat": "Created",
+              "interval": "1d"
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "reqps",
+              "unit": "short",
+              "color": {"mode": "fixed"},
+              "custom": {
+                "fillOpacity": 80
+              },
+              "thresholds": {
+                "steps": [
+                  {"color": "blue", "value": null}
+                ]
+              }
+            }
+          },
+          "options": {
+            "orientation": "vertical"
+          },
+          "timeFrom": "30d"
+        },
+        {
+          "id": 53,
+          "title": "Weekly Active QURLs",
+          "description": "Number of unique QURLs that received at least one access attempt per week. Measures real engagement vs total created.",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 58},
+          "datasource": {"uid": "${datasource_uid}"},
+          "targets": [
+            {
+              "expr": "count(sum by (resource_id) (increase(qurl_access_granted_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[7d])) > 0) or vector(0)",
+              "legendFormat": "Active QURLs (7d)"
+            },
+            {
+              "expr": "sum(qurl_resource_active{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}) or vector(0)",
+              "legendFormat": "Total Active QURLs"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
               "color": {"mode": "palette-classic"},
               "custom": {
                 "drawStyle": "line",
                 "lineInterpolation": "smooth",
-                "fillOpacity": 20
+                "fillOpacity": 10,
+                "lineWidth": 2
               }
             }
-          }
-        },
-        {
-          "id": 41,
-          "title": "Batch Size Distribution",
-          "type": "heatmap",
-          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 33},
-          "datasource": {"uid": "${datasource_uid}"},
-          "targets": [
-            {
-              "expr": "sum(increase(qurl_batch_create_size_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)",
-              "format": "heatmap"
-            }
-          ],
-          "options": {
-            "calculate": false,
-            "yAxis": {"unit": "short"},
-            "color": {"scheme": "Blues", "mode": "scheme"}
-          }
+          },
+          "timeFrom": "30d"
         }
       ]
     }

@@ -92,7 +92,7 @@ resource "grafana_data_source" "cloudwatch" {
 }
 
 resource "grafana_folder" "nhp" {
-  count                        = (var.cloudwatch_datasource_enabled || var.athena_datasource_enabled) ? 1 : 0
+  count                        = (var.cloudwatch_datasource_enabled || var.athena_datasource_enabled || var.loki_datasource_enabled) ? 1 : 0
   uid                          = "nhp"
   title                        = var.nhp_folder_name
   prevent_destroy_if_not_empty = true
@@ -222,6 +222,22 @@ resource "grafana_dashboard" "aws_cost" {
   folder = grafana_folder.nhp[0].uid
   config_json = templatefile("${path.module}/dashboards/aws-cost.json", {
     athena_uid  = grafana_data_source.athena[0].uid
+    environment = var.environment
+  })
+
+  overwrite = true
+}
+
+# ==============================================================================
+# NHP Logs Dashboard (Loki)
+# ==============================================================================
+
+resource "grafana_dashboard" "nhp_logs" {
+  count = var.loki_datasource_enabled ? 1 : 0
+
+  folder = grafana_folder.nhp[0].uid
+  config_json = templatefile("${path.module}/dashboards/nhp-logs.json", {
+    loki_uid    = var.loki_datasource_uid
     environment = var.environment
   })
 

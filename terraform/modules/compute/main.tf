@@ -446,6 +446,17 @@ resource "aws_iam_role_policy" "server" {
         Effect   = "Allow"
         Action   = ["ec2:DescribeTags"]
         Resource = "*"
+      },
+      # CloudWatch Agent + application metrics (mem, disk, NHP custom metrics)
+      {
+        Effect   = "Allow"
+        Action   = ["cloudwatch:PutMetricData"]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "cloudwatch:namespace" = "LayerV/NHP"
+          }
+        }
       }
     ]
   })

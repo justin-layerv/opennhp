@@ -844,6 +844,16 @@ jobs:
             "$REFRESH_ID" \
             "docker ps | grep nhp-server && systemctl is-active nhp-server"
 
+      - name: Push Deployment Metric
+        run: |
+          aws cloudwatch put-metric-data \
+            --namespace "LayerV/NHP" \
+            --metric-name "DeploymentEvent" \
+            --dimensions "Environment=sandbox,Component=server,Strategy=instance-refresh" \
+            --value 1 \
+            --unit Count
+          echo "Deployment event pushed to LayerV/NHP namespace"
+
   deploy-sandbox-ac:
     name: Deploy Sandbox - AC
     needs: [deploy-sandbox-server, deploy-sandbox-infra]
@@ -893,6 +903,16 @@ jobs:
             "$ASG_NAME" \
             "$REFRESH_ID" \
             "systemctl is-active traefik nhp-acd"
+
+      - name: Push Deployment Metric
+        run: |
+          aws cloudwatch put-metric-data \
+            --namespace "LayerV/NHP" \
+            --metric-name "DeploymentEvent" \
+            --dimensions "Environment=sandbox,Component=ac,Strategy=instance-refresh" \
+            --value 1 \
+            --unit Count
+          echo "Deployment event pushed to LayerV/NHP namespace"
 
   deploy-sandbox-console:
     name: Deploy Sandbox - Console EC2
@@ -1303,6 +1323,16 @@ jobs:
             "docker ps | grep nhp-server && systemctl is-active nhp-server" \
             90
 
+      - name: Push Deployment Metric
+        run: |
+          aws cloudwatch put-metric-data \
+            --namespace "LayerV/NHP" \
+            --metric-name "DeploymentEvent" \
+            --dimensions "Environment=prod,Component=server,Strategy=instance-refresh" \
+            --value 1 \
+            --unit Count
+          echo "Deployment event pushed to LayerV/NHP namespace"
+
   deploy-prod-ac:
     name: Deploy Prod - AC
     needs: [deploy-prod-server, deploy-prod-infra]
@@ -1353,6 +1383,16 @@ jobs:
             "$REFRESH_ID" \
             "systemctl is-active traefik nhp-acd" \
             90
+
+      - name: Push Deployment Metric
+        run: |
+          aws cloudwatch put-metric-data \
+            --namespace "LayerV/NHP" \
+            --metric-name "DeploymentEvent" \
+            --dimensions "Environment=prod,Component=ac,Strategy=instance-refresh" \
+            --value 1 \
+            --unit Count
+          echo "Deployment event pushed to LayerV/NHP namespace"
 
   deploy-prod-validate:
     name: Deploy Prod - Validate

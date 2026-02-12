@@ -1051,6 +1051,15 @@ jobs:
             --unit Count
           echo "Deployment metric pushed to CloudWatch (both dimension sets)"
 
+          # Push deployment event for Grafana annotations
+          aws cloudwatch put-metric-data \
+            --namespace "LayerV/NHP" \
+            --metric-name "DeploymentEvent" \
+            --dimensions "Environment=$ENVIRONMENT,Component=$COMPONENT,Strategy=blue-green" \
+            --value 1 \
+            --unit Count
+          echo "Deployment event pushed to LayerV/NHP namespace"
+
       - name: Deployment Summary
         env:
           ACTION: ${{ inputs.action }}

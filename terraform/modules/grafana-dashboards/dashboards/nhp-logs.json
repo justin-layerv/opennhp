@@ -1,0 +1,213 @@
+{
+  "uid": "nhp-logs-${environment}",
+  "title": "NHP Logs",
+  "description": "NHP server and AC log aggregation via Loki",
+  "tags": ["nhp", "logs", "${environment}"],
+  "timezone": "browser",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [
+    {
+      "title": "NHP Infrastructure",
+      "type": "link",
+      "url": "/d/nhp-infrastructure-${environment}/nhp-infrastructure?var-environment=${environment}",
+      "icon": "dashboard"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Log Volume",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Log Lines by Component",
+      "description": "Total log volume split by NHP component (server, ac, traefik)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "datasource": { "type": "loki", "uid": "${loki_uid}" },
+      "targets": [
+        {
+          "expr": "sum by (component) (count_over_time({job=~\"nhp-.*\", environment=\"${environment}\"} [1m]))",
+          "legendFormat": "{{ component }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 50,
+            "stacking": { "mode": "normal" }
+          },
+          "unit": "short"
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "table", "calcs": ["sum", "mean"] }
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Error Log Rate",
+      "description": "Log lines containing ERROR or FATAL level, by component",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "datasource": { "type": "loki", "uid": "${loki_uid}" },
+      "targets": [
+        {
+          "expr": "sum by (component) (count_over_time({job=~\"nhp-.*\", environment=\"${environment}\"} |~ \"(?i)(ERROR|FATAL)\" [1m]))",
+          "legendFormat": "{{ component }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20
+          },
+          "color": { "mode": "palette-classic" },
+          "unit": "short"
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "table", "calcs": ["sum", "max"] }
+      }
+    },
+    {
+      "id": 4,
+      "type": "row",
+      "title": "NHP Server Logs",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "collapsed": false
+    },
+    {
+      "id": 5,
+      "type": "logs",
+      "title": "Server Logs",
+      "description": "NHP server log stream with search",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 10 },
+      "datasource": { "type": "loki", "uid": "${loki_uid}" },
+      "targets": [
+        {
+          "expr": "{job=\"nhp-server\", environment=\"${environment}\"}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      }
+    },
+    {
+      "id": 6,
+      "type": "row",
+      "title": "Access Controller Logs",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "collapsed": false
+    },
+    {
+      "id": 7,
+      "type": "logs",
+      "title": "AC Logs",
+      "description": "NHP Access Controller log stream with search",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 23 },
+      "datasource": { "type": "loki", "uid": "${loki_uid}" },
+      "targets": [
+        {
+          "expr": "{job=\"nhp-ac\", environment=\"${environment}\"}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      }
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "NHP Firewall Logs",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 },
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 9,
+          "type": "timeseries",
+          "title": "Firewall Actions",
+          "description": "NHP-ACCEPT, NHP-DENY, and NHP-FORWARD events from iptables logging",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 36 },
+          "datasource": { "type": "loki", "uid": "${loki_uid}" },
+          "targets": [
+            {
+              "expr": "sum by (action) (count_over_time({job=\"nhp-ac\", environment=\"${environment}\"} |~ \"\\\\[NHP-(ACCEPT|DENY|FORWARD)\\\\]\" | regexp \"\\\\[NHP-(?P<action>\\\\w+)\\\\]\" [1m]))",
+              "legendFormat": "{{ action }}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "bars",
+                "fillOpacity": 50,
+                "stacking": { "mode": "normal" }
+              },
+              "unit": "short"
+            }
+          }
+        },
+        {
+          "id": 10,
+          "type": "logs",
+          "title": "Firewall Deny Log",
+          "description": "All NHP-DENY events (unauthorized access attempts)",
+          "gridPos": { "h": 10, "w": 24, "x": 0, "y": 44 },
+          "datasource": { "type": "loki", "uid": "${loki_uid}" },
+          "targets": [
+            {
+              "expr": "{job=\"nhp-ac\", environment=\"${environment}\"} |~ \"\\\\[NHP-DENY\\\\]\"",
+              "refId": "A"
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "showLabels": true,
+            "wrapLogMessage": true,
+            "enableLogDetails": true,
+            "sortOrder": "Descending"
+          }
+        }
+      ]
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "environment",
+        "type": "constant",
+        "current": { "value": "${environment}" },
+        "hide": 2
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "30s",
+  "schemaVersion": 39
+}

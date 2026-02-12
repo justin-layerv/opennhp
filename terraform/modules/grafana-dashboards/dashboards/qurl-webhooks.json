@@ -10,6 +10,21 @@
     "from": "now-6h",
     "to": "now"
   },
+  "annotations": {
+    "list": [
+      {
+        "name": "Deployments",
+        "datasource": {"uid": "${datasource_uid}"},
+        "enable": true,
+        "hide": false,
+        "iconColor": "blue",
+        "expr": "changes(process_start_time_seconds{service_name=\"qurl-api\", deployment_environment=\"$environment\"}[2m]) > 0",
+        "step": "60s",
+        "titleFormat": "Deployment",
+        "textFormat": "Service restarted"
+      }
+    ]
+  },
   "links": [
     {
       "title": "Operations",
@@ -60,6 +75,7 @@
     {
       "id": 1,
       "title": "Delivery Success Rate (1h)",
+      "description": "Percentage of successful webhook deliveries over the last hour. Action: If < 99%, investigate failed deliveries in the Retries & Failures section.",
       "type": "gauge",
       "gridPos": {"h": 6, "w": 6, "x": 0, "y": 1},
       "datasource": {"uid": "${datasource_uid}"},
@@ -88,6 +104,7 @@
     {
       "id": 2,
       "title": "Deliveries (1h)",
+      "description": "Total webhook delivery attempts in the last hour. Action: If zero when traffic is expected, check webhook event emission.",
       "type": "stat",
       "gridPos": {"h": 3, "w": 3, "x": 6, "y": 1},
       "datasource": {"uid": "${datasource_uid}"},
@@ -108,6 +125,7 @@
     {
       "id": 3,
       "title": "Successful (1h)",
+      "description": "Successful webhook deliveries in the last hour. Action: Compare with total deliveries to spot success rate trends.",
       "type": "stat",
       "gridPos": {"h": 3, "w": 3, "x": 9, "y": 1},
       "datasource": {"uid": "${datasource_uid}"},
@@ -128,6 +146,7 @@
     {
       "id": 4,
       "title": "Failed (1h)",
+      "description": "Failed webhook deliveries in the last hour. Action: If > 0, check Failure Reasons panel for error breakdown.",
       "type": "stat",
       "gridPos": {"h": 3, "w": 3, "x": 6, "y": 4},
       "datasource": {"uid": "${datasource_uid}"},
@@ -154,6 +173,7 @@
     {
       "id": 5,
       "title": "Retrying",
+      "description": "Currently pending retry deliveries. Action: If consistently > 20, check destination health and retry backoff configuration.",
       "type": "stat",
       "gridPos": {"h": 3, "w": 3, "x": 9, "y": 4},
       "datasource": {"uid": "${datasource_uid}"},
@@ -179,14 +199,15 @@
     },
     {
       "id": 6,
-      "title": "p95 Latency",
+      "title": "p999 Latency",
+      "description": "99.9th percentile webhook delivery latency. Action: If > 10s, check destination endpoint health and retry configuration.",
       "type": "stat",
       "gridPos": {"h": 6, "w": 4, "x": 12, "y": 1},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
-          "legendFormat": "p95"
+          "expr": "histogram_quantile(0.999, sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
+          "legendFormat": "p999"
         }
       ],
       "fieldConfig": {
@@ -196,8 +217,8 @@
           "thresholds": {
             "steps": [
               {"color": "green", "value": null},
-              {"color": "yellow", "value": 1000},
-              {"color": "red", "value": 5000}
+              {"color": "yellow", "value": 2000},
+              {"color": "red", "value": 10000}
             ]
           }
         }
@@ -206,6 +227,7 @@
     {
       "id": 7,
       "title": "Active Webhooks",
+      "description": "Number of currently active webhook subscriptions. Action: If unexpectedly zero, check webhook registration service.",
       "type": "stat",
       "gridPos": {"h": 3, "w": 4, "x": 16, "y": 1},
       "datasource": {"uid": "${datasource_uid}"},
@@ -226,6 +248,7 @@
     {
       "id": 8,
       "title": "Disabled Webhooks",
+      "description": "Number of disabled webhook subscriptions. Action: If increasing, check Webhook Health section for consecutive failure patterns.",
       "type": "stat",
       "gridPos": {"h": 3, "w": 4, "x": 16, "y": 4},
       "datasource": {"uid": "${datasource_uid}"},
@@ -252,6 +275,7 @@
     {
       "id": 9,
       "title": "Event Queue Depth",
+      "description": "Current number of webhook events waiting in the delivery queue. Action: If > 500, check for processing bottlenecks or stalled consumers.",
       "type": "stat",
       "gridPos": {"h": 6, "w": 4, "x": 20, "y": 1},
       "datasource": {"uid": "${datasource_uid}"},
@@ -285,6 +309,7 @@
     {
       "id": 10,
       "title": "Delivery Rate by Status",
+      "description": "Webhook delivery rate over time broken down by status. Action: If failed rate spikes, correlate with deployment annotations and check destination health.",
       "type": "timeseries",
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
       "datasource": {"uid": "${datasource_uid}"},
@@ -313,6 +338,7 @@
     {
       "id": 11,
       "title": "Delivery Latency",
+      "description": "Webhook delivery latency percentiles over time. Action: If p99/p999 diverge significantly from p50, investigate slow outlier destinations.",
       "type": "timeseries",
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
       "datasource": {"uid": "${datasource_uid}"},
@@ -328,6 +354,10 @@
         {
           "expr": "histogram_quantile(0.99, sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
           "legendFormat": "p99"
+        },
+        {
+          "expr": "histogram_quantile(0.999, sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
+          "legendFormat": "p999"
         }
       ],
       "fieldConfig": {
@@ -343,17 +373,99 @@
       }
     },
     {
+      "id": 12,
+      "title": "Delivery Latency Heatmap",
+      "description": "Distribution of delivery times. Bimodal pattern (fast+slow clusters) suggests mixed destination health.",
+      "type": "heatmap",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(increase(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1m])) by (le)",
+          "legendFormat": "{{le}}",
+          "format": "heatmap"
+        }
+      ],
+      "options": {
+        "calculate": false,
+        "yAxis": {"unit": "s"},
+        "color": {"scheme": "Oranges", "mode": "scheme"},
+        "cellGap": 1
+      }
+    },
+    {
+      "id": 13,
+      "title": "Failure Rate by Destination",
+      "description": "Per-destination webhook failure rate. Action: If a single destination dominates failures, contact the destination owner or consider disabling the webhook.",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum by (destination_host) (rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"failed\"}[5m])) / sum by (destination_host) (rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) * 100",
+          "legendFormat": "{{destination_host}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10
+          }
+        }
+      }
+    },
+    {
+      "id": 14,
+      "title": "Queue Depth Over Time",
+      "description": "Webhook event queue depth trend. Action: If steadily increasing, consumers may be falling behind. Check for processing errors or resource constraints.",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(qurl_webhook_queue_depth{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"})",
+          "legendFormat": "Queue Depth"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 100},
+              {"color": "red", "value": 500}
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20,
+            "gradientMode": "scheme"
+          }
+        }
+      }
+    },
+    {
       "id": 102,
       "title": "Events",
       "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 16},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 32},
       "collapsed": false
     },
     {
       "id": 20,
       "title": "Deliveries by Event Type",
+      "description": "Webhook delivery rate broken down by event type. Action: If a specific event type has disproportionate volume, verify it is not generating duplicate events.",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 17},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 33},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -377,8 +489,9 @@
     {
       "id": 21,
       "title": "Event Type Distribution (24h)",
+      "description": "Proportion of webhook deliveries by event type over 24 hours. Action: Compare with expected distribution to spot anomalies.",
       "type": "piechart",
-      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 17},
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 33},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -394,8 +507,9 @@
     {
       "id": 22,
       "title": "Failure Rate by Event Type",
+      "description": "Percentage of failed deliveries per event type over 24 hours. Action: If one event type has significantly higher failure rate, check its payload size and destination compatibility.",
       "type": "table",
-      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 17},
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 33},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -418,14 +532,15 @@
       "id": 103,
       "title": "Retries & Failures",
       "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 25},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 41},
       "collapsed": false
     },
     {
       "id": 30,
       "title": "Retry Distribution",
+      "description": "Retry attempts over time broken down by retry count. Action: If higher retry counts (3+) are increasing, destinations may be persistently unhealthy.",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 26},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 42},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -448,8 +563,9 @@
     {
       "id": 31,
       "title": "Failure Reasons",
+      "description": "Breakdown of webhook failure reasons over 24 hours. Action: If timeout errors dominate, increase delivery timeout or check destination response times.",
       "type": "barchart",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 26},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 42},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
@@ -470,51 +586,240 @@
       }
     },
     {
+      "id": 32,
+      "title": "Cumulative Retry Percentage",
+      "description": "Percentage of deliveries that required at least one retry. Action: If > 20%, investigate destination reliability or network issues.",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 42},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(rate(qurl_webhook_retry_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) / sum(rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) * 100",
+          "legendFormat": "Retry %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 10},
+              {"color": "red", "value": 20}
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20,
+            "gradientMode": "scheme"
+          }
+        }
+      }
+    },
+    {
+      "id": 33,
+      "title": "Response Code Distribution",
+      "description": "HTTP response codes from webhook destinations over time. Action: If 4xx codes dominate, check payload format. If 5xx, destination may be unhealthy.",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 50},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum by (response_code) (rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
+          "legendFormat": "{{response_code}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "stacking": {"mode": "normal"}
+          }
+        },
+        "overrides": [
+          {"matcher": {"id": "byRegexp", "options": "^2.."}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]},
+          {"matcher": {"id": "byRegexp", "options": "^4.."}, "properties": [{"id": "color", "value": {"fixedColor": "yellow", "mode": "fixed"}}]},
+          {"matcher": {"id": "byRegexp", "options": "^5.."}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]}
+        ]
+      }
+    },
+    {
+      "id": 34,
+      "title": "Delivery Attempt vs End-to-End Latency",
+      "description": "Comparison of individual delivery attempt latency (HTTP call) vs end-to-end latency (including queue time and retries). Action: If end-to-end significantly exceeds attempt latency, queue backlog or retries are adding delay.",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 50},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
+          "legendFormat": "p95 Attempt Latency"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(qurl_webhook_e2e_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
+          "legendFormat": "p95 End-to-End Latency"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10
+          }
+        }
+      }
+    },
+    {
       "id": 104,
       "title": "Webhook Health",
       "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 34},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 58},
+      "collapsed": false
+    },
+    {
+      "id": 40,
+      "title": "Webhooks with Consecutive Failures",
+      "description": "Top 10 webhooks by consecutive failure count. Action: If any webhook exceeds failure threshold, it may be auto-disabled. Contact the destination owner.",
+      "type": "table",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 59},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "topk(10, qurl_webhook_consecutive_failures{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"} > 0)",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {"id": "organize", "options": {"excludeByName": {"Time": true}, "renameByName": {"webhook_id": "Webhook ID", "owner_id": "Owner", "Value": "Consecutive Failures"}}}
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "short"},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Consecutive Failures"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background", "mode": "gradient"}}, {"id": "color", "value": {"mode": "continuous-YlOrRd"}}]}
+        ]
+      }
+    },
+    {
+      "id": 41,
+      "title": "Recently Disabled Webhooks",
+      "description": "Webhooks disabled in the last 24 hours. Action: Review the disable reason and contact webhook owners to fix their endpoints.",
+      "type": "table",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 59},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "qurl_webhook_disabled_at{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"} > (time() - 86400)",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {"id": "organize", "options": {"excludeByName": {"Time": true}, "renameByName": {"webhook_id": "Webhook ID", "owner_id": "Owner", "reason": "Reason", "Value": "Disabled At"}}}
+      ]
+    },
+    {
+      "id": 105,
+      "title": "Webhook Delivery SLO",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 67},
       "collapsed": true,
       "panels": [
         {
-          "id": 40,
-          "title": "Webhooks with Consecutive Failures",
-          "type": "table",
-          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 35},
+          "id": 50,
+          "title": "SLO: Delivered Within 30s",
+          "description": "Percentage of webhooks delivered successfully within 30 seconds on the first attempt. SLO target: 99%. Action: If below target, check delivery latency and failure panels.",
+          "type": "gauge",
+          "gridPos": {"h": 8, "w": 8, "x": 0, "y": 68},
           "datasource": {"uid": "${datasource_uid}"},
           "targets": [
             {
-              "expr": "topk(10, qurl_webhook_consecutive_failures{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"} > 0)",
-              "format": "table",
-              "instant": true
+              "expr": "(\n  sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", le=\"30\"}[1h]))\n  / sum(rate(qurl_webhook_delivery_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1h]))\n) * 100 or vector(100)",
+              "legendFormat": "SLO %"
             }
           ],
-          "transformations": [
-            {"id": "organize", "options": {"excludeByName": {"Time": true}, "renameByName": {"webhook_id": "Webhook ID", "owner_id": "Owner", "Value": "Consecutive Failures"}}}
-          ],
           "fieldConfig": {
-            "defaults": {"unit": "short"},
-            "overrides": [
-              {"matcher": {"id": "byName", "options": "Consecutive Failures"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background", "mode": "gradient"}}, {"id": "color", "value": {"mode": "continuous-YlOrRd"}}]}
-            ]
+            "defaults": {
+              "unit": "percent",
+              "min": 0,
+              "max": 100,
+              "color": {"mode": "thresholds"},
+              "thresholds": {
+                "steps": [
+                  {"color": "red", "value": null},
+                  {"color": "yellow", "value": 95},
+                  {"color": "green", "value": 99}
+                ]
+              }
+            }
           }
         },
         {
-          "id": 41,
-          "title": "Recently Disabled Webhooks",
-          "type": "table",
-          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 35},
+          "id": 51,
+          "title": "1h Burn Rate",
+          "description": "Rate at which the error budget is being consumed over the last hour. Action: If > 1, the SLO will be breached at current pace. Investigate immediately.",
+          "type": "stat",
+          "gridPos": {"h": 8, "w": 8, "x": 8, "y": 68},
           "datasource": {"uid": "${datasource_uid}"},
           "targets": [
             {
-              "expr": "qurl_webhook_disabled_at{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"} > (time() - 86400)",
-              "format": "table",
-              "instant": true
+              "expr": "(\n  1 - (\n    sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", le=\"30\"}[1h]))\n    / sum(rate(qurl_webhook_delivery_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1h]))\n  )\n) / (1 - 0.99) or vector(0)",
+              "legendFormat": "Burn Rate"
             }
           ],
-          "transformations": [
-            {"id": "organize", "options": {"excludeByName": {"Time": true}, "renameByName": {"webhook_id": "Webhook ID", "owner_id": "Owner", "reason": "Reason", "Value": "Disabled At"}}}
-          ]
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 2,
+              "color": {"mode": "thresholds"},
+              "thresholds": {
+                "steps": [
+                  {"color": "green", "value": null},
+                  {"color": "yellow", "value": 1},
+                  {"color": "red", "value": 2}
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": 52,
+          "title": "Error Budget Remaining (30d)",
+          "description": "Remaining error budget for the 30-day SLO window. Action: If < 50%, reduce risk by pausing non-critical changes. If < 0%, SLO is breached.",
+          "type": "gauge",
+          "gridPos": {"h": 8, "w": 8, "x": 16, "y": 68},
+          "datasource": {"uid": "${datasource_uid}"},
+          "targets": [
+            {
+              "expr": "(\n  1 - (\n    (\n      1 - (\n        sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", le=\"30\"}[30d]))\n        / sum(rate(qurl_webhook_delivery_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[30d]))\n      )\n    ) / (1 - 0.99)\n  )\n) * 100 or vector(100)",
+              "legendFormat": "Budget %"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "min": 0,
+              "max": 100,
+              "color": {"mode": "thresholds"},
+              "thresholds": {
+                "steps": [
+                  {"color": "red", "value": null},
+                  {"color": "orange", "value": 25},
+                  {"color": "yellow", "value": 50},
+                  {"color": "green", "value": 75}
+                ]
+              }
+            }
+          }
         }
       ]
     }

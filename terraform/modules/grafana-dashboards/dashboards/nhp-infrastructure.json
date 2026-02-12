@@ -16,6 +16,18 @@
       "type": "link",
       "url": "/d/qurl-operations/qurl-operations?var-environment=$environment",
       "icon": "dashboard"
+    },
+    {
+      "title": "Webhooks",
+      "type": "link",
+      "url": "/d/qurl-webhooks/qurl-webhooks?var-environment=$environment",
+      "icon": "dashboard"
+    },
+    {
+      "title": "AWS Cost",
+      "type": "link",
+      "url": "/d/aws-cost/aws-cost",
+      "icon": "dashboard"
     }
   ],
   "templating": {
@@ -31,34 +43,241 @@
           {"text": "sandbox", "value": "sandbox"},
           {"text": "prod", "value": "prod"}
         ]
-      },
-      {
-        "name": "component",
-        "type": "custom",
-        "current": {"text": "All", "value": "$__all"},
-        "includeAll": true,
-        "options": [
-          {"text": "server", "value": "server"},
-          {"text": "ac", "value": "ac"}
-        ],
-        "label": "Component"
       }
     ]
   },
   "panels": [
     {
-      "id": 100,
-      "title": "Network Load Balancer",
+      "id": 50,
+      "title": "Overview",
       "type": "row",
       "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
       "collapsed": false
     },
     {
+      "id": 15,
+      "title": "Healthy Targets (Server)",
+      "description": "Number of healthy NLB targets for the NHP server. Action: if 0, check server ASG instances and NLB target group health checks.",
+      "type": "stat",
+      "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
+      "gridPos": {"h": 4, "w": 5, "x": 0, "y": 1},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "red"},
+              {"value": 1, "color": "green"}
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "namespace": "AWS/NetworkELB",
+          "metricName": "HealthyHostCount",
+          "statistics": ["Average"],
+          "dimensions": {"LoadBalancer": ["nhp-$environment-server*"]},
+          "period": "300",
+          "region": "default",
+          "label": "Server"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "title": "Healthy Targets (AC)",
+      "description": "Number of healthy NLB targets for the Access Controller. Action: if 0, check AC ASG instances and NLB target group health checks.",
+      "type": "stat",
+      "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
+      "gridPos": {"h": 4, "w": 5, "x": 5, "y": 1},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "red"},
+              {"value": 1, "color": "green"}
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "namespace": "AWS/NetworkELB",
+          "metricName": "HealthyHostCount",
+          "statistics": ["Average"],
+          "dimensions": {"LoadBalancer": ["nhp-$environment-ac*"]},
+          "period": "300",
+          "region": "default",
+          "label": "AC"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "title": "Server CPU %",
+      "description": "Average CPU utilization across NHP server ASG instances. Action: if sustained >80%, consider scaling up or investigating high-CPU processes.",
+      "type": "stat",
+      "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
+      "gridPos": {"h": 4, "w": 5, "x": 10, "y": 1},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "green"},
+              {"value": 60, "color": "yellow"},
+              {"value": 80, "color": "red"}
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "namespace": "AWS/EC2",
+          "metricName": "CPUUtilization",
+          "statistics": ["Average"],
+          "dimensions": {"AutoScalingGroupName": ["nhp-$environment-server*"]},
+          "period": "300",
+          "region": "default",
+          "label": "Server CPU"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "title": "Active NLB Flows",
+      "description": "Total active TCP/UDP flows across both server and AC NLBs. Action: correlate spikes with traffic patterns or potential DDoS.",
+      "type": "stat",
+      "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
+      "gridPos": {"h": 4, "w": 5, "x": 15, "y": 1},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "blue"}
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "namespace": "AWS/NetworkELB",
+          "metricName": "ActiveFlowCount",
+          "statistics": ["Sum"],
+          "dimensions": {"LoadBalancer": ["nhp-$environment-server*"]},
+          "period": "300",
+          "region": "default",
+          "label": "Server"
+        },
+        {
+          "refId": "B",
+          "namespace": "AWS/NetworkELB",
+          "metricName": "ActiveFlowCount",
+          "statistics": ["Sum"],
+          "dimensions": {"LoadBalancer": ["nhp-$environment-ac*"]},
+          "period": "300",
+          "region": "default",
+          "label": "AC"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "title": "Unhealthy Targets",
+      "description": "Count of unhealthy NLB targets across server and AC. Action: any value >0 requires immediate investigation of instance health and NLB target group.",
+      "type": "stat",
+      "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 1},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "green"},
+              {"value": 1, "color": "red"}
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "namespace": "AWS/NetworkELB",
+          "metricName": "UnHealthyHostCount",
+          "statistics": ["Average"],
+          "dimensions": {"LoadBalancer": ["nhp-$environment-server*"]},
+          "period": "300",
+          "region": "default",
+          "label": "Server"
+        },
+        {
+          "refId": "B",
+          "namespace": "AWS/NetworkELB",
+          "metricName": "UnHealthyHostCount",
+          "statistics": ["Average"],
+          "dimensions": {"LoadBalancer": ["nhp-$environment-ac*"]},
+          "period": "300",
+          "region": "default",
+          "label": "AC"
+        }
+      ]
+    },
+    {
+      "id": 100,
+      "title": "Network Load Balancer",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 5},
+      "collapsed": false
+    },
+    {
       "id": 1,
       "title": "NLB Active Flows - Server",
+      "description": "Active TCP/UDP flow count on the NHP server NLB over time. Action: correlate with knock traffic and investigate unexpected drops to 0.",
       "type": "timeseries",
       "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 1},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
       "fieldConfig": {
         "defaults": {
           "color": {"mode": "palette-classic"},
@@ -90,9 +309,10 @@
     {
       "id": 2,
       "title": "NLB Active Flows - AC",
+      "description": "Active TCP/UDP flow count on the AC NLB over time. Action: correlate with QURL access patterns and investigate unexpected drops.",
       "type": "timeseries",
       "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 1},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
       "fieldConfig": {
         "defaults": {
           "color": {"mode": "palette-classic"},
@@ -124,9 +344,10 @@
     {
       "id": 3,
       "title": "NLB Processed Bytes",
+      "description": "Total bytes processed by server and AC NLBs. Action: use for capacity planning and detecting traffic anomalies.",
       "type": "timeseries",
       "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 9},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
       "fieldConfig": {
         "defaults": {
           "color": {"mode": "palette-classic"},
@@ -166,9 +387,10 @@
     {
       "id": 4,
       "title": "TCP Resets",
+      "description": "TCP reset counts from clients, targets, and the NLB itself. Action: high client resets may indicate connection issues; high target resets suggest backend problems.",
       "type": "timeseries",
       "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 9},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
       "fieldConfig": {
         "defaults": {
           "color": {"mode": "palette-classic"},
@@ -216,18 +438,222 @@
       ]
     },
     {
+      "id": 20,
+      "title": "NLB Target Response Time",
+      "description": "End-to-end response time measured by the NLB for TCP/TLS listeners (HTTP endpoint on port 8888). UDP knock port (62206) not included. Action: p99 >1s warrants investigation of server processing latency.",
+      "type": "timeseries",
+      "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          },
+          "unit": "s"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "namespace": "AWS/NetworkELB",
+          "metricName": "TargetResponseTime",
+          "statistics": ["p50"],
+          "dimensions": {"LoadBalancer": ["nhp-$environment-server*"]},
+          "period": "300",
+          "region": "default",
+          "label": "Server p50"
+        },
+        {
+          "refId": "B",
+          "namespace": "AWS/NetworkELB",
+          "metricName": "TargetResponseTime",
+          "statistics": ["p95"],
+          "dimensions": {"LoadBalancer": ["nhp-$environment-server*"]},
+          "period": "300",
+          "region": "default",
+          "label": "Server p95"
+        },
+        {
+          "refId": "C",
+          "namespace": "AWS/NetworkELB",
+          "metricName": "TargetResponseTime",
+          "statistics": ["p99"],
+          "dimensions": {"LoadBalancer": ["nhp-$environment-server*"]},
+          "period": "300",
+          "region": "default",
+          "label": "Server p99"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "title": "NLB Unhealthy Host Count",
+      "description": "Unhealthy target count over time for server and AC NLBs. Action: any sustained non-zero value requires investigation of instance health, security groups, and health check configuration.",
+      "type": "timeseries",
+      "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "green"},
+              {"value": 1, "color": "red"}
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "Server Unhealthy"},
+            "properties": [
+              {"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}
+            ]
+          },
+          {
+            "matcher": {"id": "byName", "options": "AC Unhealthy"},
+            "properties": [
+              {"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "namespace": "AWS/NetworkELB",
+          "metricName": "UnHealthyHostCount",
+          "statistics": ["Average"],
+          "dimensions": {"LoadBalancer": ["nhp-$environment-server*"]},
+          "period": "300",
+          "region": "default",
+          "label": "Server Unhealthy"
+        },
+        {
+          "refId": "B",
+          "namespace": "AWS/NetworkELB",
+          "metricName": "UnHealthyHostCount",
+          "statistics": ["Average"],
+          "dimensions": {"LoadBalancer": ["nhp-$environment-ac*"]},
+          "period": "300",
+          "region": "default",
+          "label": "AC Unhealthy"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "title": "NLB New Flow Count",
+      "description": "Rate of new TCP/UDP flows established through server and AC NLBs. Action: sudden spikes may indicate traffic surges or scanning activity.",
+      "type": "timeseries",
+      "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 30},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          },
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "namespace": "AWS/NetworkELB",
+          "metricName": "NewFlowCount",
+          "statistics": ["Sum"],
+          "dimensions": {"LoadBalancer": ["nhp-$environment-server*"]},
+          "period": "300",
+          "region": "default",
+          "label": "Server New Flows"
+        },
+        {
+          "refId": "B",
+          "namespace": "AWS/NetworkELB",
+          "metricName": "NewFlowCount",
+          "statistics": ["Sum"],
+          "dimensions": {"LoadBalancer": ["nhp-$environment-ac*"]},
+          "period": "300",
+          "region": "default",
+          "label": "AC New Flows"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "title": "NLB Consumed LCUs",
+      "description": "Load Balancer Capacity Units consumed by server and AC NLBs. Each LCU costs money. Action: track for cost optimization and capacity planning.",
+      "type": "timeseries",
+      "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 30},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          },
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "namespace": "AWS/NetworkELB",
+          "metricName": "ConsumedLCUs",
+          "statistics": ["Sum"],
+          "dimensions": {"LoadBalancer": ["nhp-$environment-server*"]},
+          "period": "300",
+          "region": "default",
+          "label": "Server LCUs"
+        },
+        {
+          "refId": "B",
+          "namespace": "AWS/NetworkELB",
+          "metricName": "ConsumedLCUs",
+          "statistics": ["Sum"],
+          "dimensions": {"LoadBalancer": ["nhp-$environment-ac*"]},
+          "period": "300",
+          "region": "default",
+          "label": "AC LCUs"
+        }
+      ]
+    },
+    {
       "id": 200,
       "title": "NHP Protocol",
       "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 17},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 38},
       "collapsed": false
     },
     {
       "id": 5,
       "title": "NHP Knock Latency",
+      "description": "End-to-end NHP knock latency at p50/p95/p99 percentiles. Action: p99 >500ms (red) indicates protocol or network issues requiring investigation.",
       "type": "timeseries",
       "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 18},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 39},
       "fieldConfig": {
         "defaults": {
           "color": {"mode": "palette-classic"},
@@ -285,9 +711,10 @@
     {
       "id": 6,
       "title": "Knock Latency p99",
+      "description": "Current p99 knock latency as a single stat. Action: green <200ms is healthy, yellow 200-500ms is degraded, red >500ms needs immediate attention.",
       "type": "stat",
       "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
-      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 18},
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 39},
       "fieldConfig": {
         "defaults": {
           "unit": "ms",
@@ -321,9 +748,10 @@
     {
       "id": 7,
       "title": "Auth Success / Failure Rate",
+      "description": "Stacked view of NHP authentication successes and failures over time. Action: rising failures (red) may indicate credential issues, key mismatches, or attack attempts.",
       "type": "timeseries",
       "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
-      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 18},
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 39},
       "fieldConfig": {
         "defaults": {
           "color": {"mode": "palette-classic"},
@@ -372,9 +800,10 @@
     {
       "id": 8,
       "title": "Auth Success Count",
+      "description": "Total NHP authentication successes in the current period. Action: if 0 during expected traffic, check server connectivity and Auth0 integration.",
       "type": "stat",
       "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
-      "gridPos": {"h": 4, "w": 3, "x": 12, "y": 22},
+      "gridPos": {"h": 4, "w": 3, "x": 12, "y": 43},
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -406,9 +835,10 @@
     {
       "id": 9,
       "title": "Auth Failure Count",
+      "description": "Total NHP authentication failures in the current period. Action: any non-zero value should be investigated; check server logs for ECDH or key mismatch errors.",
       "type": "stat",
       "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
-      "gridPos": {"h": 4, "w": 3, "x": 15, "y": 22},
+      "gridPos": {"h": 4, "w": 3, "x": 15, "y": 43},
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -443,15 +873,16 @@
       "id": 300,
       "title": "Compute",
       "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 26},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 47},
       "collapsed": false
     },
     {
       "id": 10,
       "title": "CPU Utilization",
+      "description": "CPU utilization for server and AC ASG instances over time. Action: sustained >80% (red) requires scaling or performance investigation.",
       "type": "timeseries",
       "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 27},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 48},
       "fieldConfig": {
         "defaults": {
           "color": {"mode": "palette-classic"},
@@ -500,9 +931,10 @@
     {
       "id": 11,
       "title": "ASG Instance Count",
+      "description": "Number of in-service instances per ASG. Action: if count drops below desired capacity, check ASG activity and instance launch errors.",
       "type": "timeseries",
       "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
-      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 27},
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 48},
       "fieldConfig": {
         "defaults": {
           "color": {"mode": "palette-classic"},
@@ -543,9 +975,10 @@
     {
       "id": 12,
       "title": "Target Group Health",
+      "description": "Healthy host count in NLB target groups. Action: should match ASG desired capacity; mismatches indicate health check failures.",
       "type": "stat",
       "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
-      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 27},
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 48},
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -590,9 +1023,10 @@
     {
       "id": 13,
       "title": "Unhealthy Targets",
+      "description": "Unhealthy host count in NLB target groups. Action: any non-zero (red) value requires immediate investigation of instance health.",
       "type": "stat",
       "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
-      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 31},
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 52},
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -636,18 +1070,151 @@
       ]
     },
     {
+      "id": 24,
+      "title": "AC Disk Usage %",
+      "description": "Disk usage percentage on AC instances from custom NHP/AC CloudWatch namespace. Action: >80% requires log rotation or disk cleanup; >90% is critical.",
+      "type": "timeseries",
+      "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 56},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "axisSoftMax": 100
+          },
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "green"},
+              {"value": 80, "color": "yellow"},
+              {"value": 90, "color": "red"}
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "namespace": "NHP/AC",
+          "metricName": "DiskUsagePercent",
+          "statistics": ["Average"],
+          "dimensions": {},
+          "period": "300",
+          "region": "default",
+          "label": "Disk Usage"
+        }
+      ]
+    },
+    {
+      "id": 350,
+      "title": "DynamoDB",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 64},
+      "collapsed": false
+    },
+    {
+      "id": 25,
+      "title": "DynamoDB Throttled Requests",
+      "description": "Throttled read/write requests by DynamoDB table. Action: non-zero values indicate capacity limits being hit; consider increasing provisioned capacity or switching to on-demand.",
+      "type": "timeseries",
+      "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 65},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "green"},
+              {"value": 1, "color": "red"}
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "namespace": "AWS/DynamoDB",
+          "metricName": "ThrottledRequests",
+          "statistics": ["Sum"],
+          "dimensions": {"TableName": ["nhp-$environment-*"]},
+          "period": "300",
+          "region": "default",
+          "label": "$${PROP('Dim.TableName')}"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "title": "DynamoDB Latency (p50/p99)",
+      "description": "Successful request latency for DynamoDB tables at p50 and p99 percentiles. Action: p99 >20ms may indicate hot partitions or throttling.",
+      "type": "timeseries",
+      "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 65},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          },
+          "unit": "ms"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "namespace": "AWS/DynamoDB",
+          "metricName": "SuccessfulRequestLatency",
+          "statistics": ["p50"],
+          "dimensions": {"TableName": ["nhp-$environment-*"]},
+          "period": "300",
+          "region": "default",
+          "label": "$${PROP('Dim.TableName')} p50"
+        },
+        {
+          "refId": "B",
+          "namespace": "AWS/DynamoDB",
+          "metricName": "SuccessfulRequestLatency",
+          "statistics": ["p99"],
+          "dimensions": {"TableName": ["nhp-$environment-*"]},
+          "period": "300",
+          "region": "default",
+          "label": "$${PROP('Dim.TableName')} p99"
+        }
+      ]
+    },
+    {
       "id": 400,
       "title": "CloudWatch Alarms",
       "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 35},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 73},
       "collapsed": false
     },
     {
       "id": 14,
       "title": "Active CloudWatch Alarms",
+      "description": "Table of all NHP CloudWatch alarms and their current state. Action: any alarm in ALARM state should be investigated immediately; check the alarm's linked metric for details.",
       "type": "table",
       "datasource": {"uid": "${cloudwatch_uid}", "type": "cloudwatch"},
-      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 36},
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 74},
       "fieldConfig": {
         "defaults": {
           "custom": {

@@ -516,7 +516,7 @@ resource "aws_iam_role_policy" "ac" {
           ]
           Resource = "${aws_cloudwatch_log_group.ac.arn}:*"
         },
-        # CloudWatch Metrics (for disk monitoring)
+        # CloudWatch Metrics (disk monitor script uses NHP/AC, CW Agent uses LayerV/NHP)
         {
           Sid      = "CloudWatchMetrics"
           Effect   = "Allow"
@@ -524,7 +524,7 @@ resource "aws_iam_role_policy" "ac" {
           Resource = "*"
           Condition = {
             StringEquals = {
-              "cloudwatch:namespace" = "NHP/AC"
+              "cloudwatch:namespace" = ["NHP/AC", "LayerV/NHP"]
             }
           }
         },

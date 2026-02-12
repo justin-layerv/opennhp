@@ -58,6 +58,49 @@ systemctl start docker
 # Wait for Docker to be ready
 for i in {1..30}; do docker info && break || sleep 2; done
 
+# ============================================================================
+# CloudWatch Agent - Publishes mem_used_percent and disk_used_percent
+# Enables NHP Infrastructure dashboard panels for instance-level metrics
+# ============================================================================
+echo "Installing CloudWatch Agent..."
+CW_AGENT_DEB="/tmp/amazon-cloudwatch-agent.deb"
+curl -sfL "https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb" -o "$CW_AGENT_DEB"
+if [ ! -s "$CW_AGENT_DEB" ]; then
+  echo "WARNING: CloudWatch Agent download failed, skipping CW Agent install"
+else
+  dpkg -i "$CW_AGENT_DEB" || apt_get_with_retry install -f -y
+  rm -f "$CW_AGENT_DEB"
+
+  mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+  cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWEOF'
+{
+  "metrics": {
+    "namespace": "LayerV/NHP",
+    "metrics_collected": {
+      "mem": {
+        "measurement": ["mem_used_percent"],
+        "metrics_collection_interval": 60
+      },
+      "disk": {
+        "measurement": ["disk_used_percent"],
+        "resources": ["/"],
+        "metrics_collection_interval": 60
+      }
+    },
+    "append_dimensions": {
+      "InstanceId": "$${!aws:InstanceId}",
+      "AutoScalingGroupName": "$${!aws:AutoScalingGroupName}"
+    }
+  }
+}
+CWEOF
+
+  /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+    -a fetch-config -m ec2 \
+    -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+  echo "CloudWatch Agent installed and started"
+fi
+
 REGION="${region}"
 ACCOUNT_ID="${account_id}"
 

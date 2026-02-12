@@ -1987,6 +1987,20 @@ leaving old code running. See PR #94 for the fix.
 
 ---
 
+## Observability
+
+The system publishes metrics to CloudWatch under the `LayerV/NHP` namespace from three sources:
+
+| Source | Metrics | How |
+|--------|---------|-----|
+| NHP Server (Go) | `KnockRequest`, `AuthSuccess`, `AuthFailure`, `KnockLatency` | Custom `MetricsPublisher` in `endpoints/server/metrics.go` — batches and flushes every 60s via `PutMetricData` with StatisticSets |
+| CloudWatch Agent | `mem_used_percent`, `disk_used_percent` | Installed on Server and AC instances via user_data; config in `/opt/aws/amazon-cloudwatch-agent/etc/` |
+| CI Workflows | `DeploymentEvent` | `put-metric-data` in blue-green, canary, and build-and-push workflows with Environment/Component/Strategy dimensions |
+
+Grafana dashboards consume these metrics via a CloudWatch datasource. See `docs/grafana-dashboard-improvements.md` for the phased dashboard improvement plan and `terraform/modules/grafana-dashboards/` for dashboard JSON definitions.
+
+---
+
 ## Debugging & Operations
 
 ### Component Dependency Chain
