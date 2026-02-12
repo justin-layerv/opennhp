@@ -663,9 +663,7 @@ jobs:
       )
     runs-on: ubuntu-latest
     environment: sandbox
-    # DynamoDB GSI changes and capacity mode switches can take 20-30+ minutes.
-    # 45 minutes allows for these operations plus init/plan/output overhead.
-    timeout-minutes: 45
+    timeout-minutes: 30
     outputs:
       server_asg: ${{ steps.outputs.outputs.server_asg }}
       ac_asg: ${{ steps.outputs.outputs.ac_asg }}
@@ -1140,9 +1138,7 @@ jobs:
       github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'prod'
     runs-on: ubuntu-latest
     environment: production
-    # DynamoDB GSI changes and capacity mode switches can take 20-30+ minutes.
-    # 45 minutes allows for these operations plus init/plan/output overhead.
-    timeout-minutes: 45
+    timeout-minutes: 30
     outputs:
       server_asg: ${{ steps.outputs.outputs.server_asg }}
       ac_asg: ${{ steps.outputs.outputs.ac_asg }}
