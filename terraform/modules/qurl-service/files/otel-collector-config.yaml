@@ -11,6 +11,11 @@
 #   GRAFANA_OTLP_ENDPOINT - Grafana Cloud OTLP gateway URL
 #   GRAFANA_OTLP_AUTH - Base64 encoded "instance_id:api_token" for Basic auth
 
+extensions:
+  # Health check endpoint for container health checks (/healthcheck binary)
+  health_check:
+    endpoint: 0.0.0.0:13133
+
 receivers:
   otlp:
     protocols:
@@ -56,6 +61,7 @@ exporters:
       Authorization: "Basic ${GRAFANA_OTLP_AUTH}"
 
 service:
+  extensions: [health_check]
   pipelines:
     traces:
       receivers: [otlp]

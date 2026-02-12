@@ -170,7 +170,8 @@ locals {
       { name = "OTEL_SERVICE_VERSION", value = var.otel_service_version },
       { name = "OTEL_ENVIRONMENT", value = var.otel_environment },
       # When Grafana Cloud is enabled, send to local ADOT sidecar; otherwise use configured endpoint
-      { name = "OTEL_EXPORTER_OTLP_ENDPOINT", value = var.grafana_cloud_enabled ? "http://localhost:4317" : var.otel_exporter_endpoint },
+      # gRPC endpoint must be host:port without scheme - http:// causes "too many colons" error
+      { name = "OTEL_EXPORTER_OTLP_ENDPOINT", value = var.grafana_cloud_enabled ? "localhost:4317" : var.otel_exporter_endpoint },
       { name = "OTEL_EXPORTER_OTLP_PROTOCOL", value = var.grafana_cloud_enabled ? "grpc" : var.otel_exporter_protocol },
       { name = "OTEL_EXPORTER_OTLP_INSECURE", value = var.grafana_cloud_enabled ? "true" : (var.otel_exporter_insecure ? "true" : "false") },
       { name = "OTEL_TRACE_SAMPLE_RATE", value = tostring(var.otel_trace_sample_rate) },
@@ -520,6 +521,7 @@ resource "aws_ecs_task_definition" "qurl" {
     }],
     # ADOT Collector sidecar (only when Grafana Cloud is enabled)
     # Receives OTLP from QURL container and exports to Grafana Cloud
+    # Config is inline below; keep files/otel-collector-config.yaml in sync for reference
     var.grafana_cloud_enabled ? [{
       name      = "adot-collector"
       image     = var.adot_collector_image
@@ -546,6 +548,11 @@ resource "aws_ecs_task_definition" "qurl" {
         {
           name = "AOT_CONFIG_CONTENT"
           value = yamlencode({
+            extensions = {
+              health_check = {
+                endpoint = "0.0.0.0:13133"
+              }
+            }
             receivers = {
               otlp = {
                 protocols = {
@@ -594,6 +601,7 @@ resource "aws_ecs_task_definition" "qurl" {
               }
             }
             service = {
+              extensions = ["health_check"]
               pipelines = {
                 traces = {
                   receivers  = ["otlp"]
