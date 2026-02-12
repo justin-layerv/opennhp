@@ -10,15 +10,9 @@
 # - DynamoDB is the DEFAULT for cloud deployments
 # - etcd remains as a FEATURE FLAG for on-prem deployments
 # See docs/design/PLUGGABLE_STORAGE_BACKEND.md for full architecture.
-
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = ">= 6.29"
-    }
-  }
-}
+#
+# NOTE: GSIs use hash_key/range_key attributes instead of key_schema blocks.
+# The key_schema syntax causes perpetual plan diffs in the AWS provider (PR #399).
 
 # ==================== Data Sources ====================
 
@@ -73,12 +67,8 @@ resource "aws_dynamodb_table" "licenses" {
   # GSI: Find all licenses for a customer
   global_secondary_index {
     name            = "customer_id-index"
+    hash_key        = "customer_id"
     projection_type = "ALL"
-
-    key_schema {
-      attribute_name = "customer_id"
-      key_type       = "HASH"
-    }
   }
 
   # GSI: Find licenses by expiration date (for renewal reminders, compliance reports)
@@ -88,16 +78,9 @@ resource "aws_dynamodb_table" "licenses" {
   # For global expiration queries, use a table scan with FilterExpression (rare operation).
   global_secondary_index {
     name            = "expires_at-index"
+    hash_key        = "customer_id"
+    range_key       = "expires_at"
     projection_type = "KEYS_ONLY"
-
-    key_schema {
-      attribute_name = "customer_id"
-      key_type       = "HASH"
-    }
-    key_schema {
-      attribute_name = "expires_at"
-      key_type       = "RANGE"
-    }
   }
 
   # GSI: Find license by Auth0 subject (for QURL quota lookup)
@@ -106,12 +89,8 @@ resource "aws_dynamodb_table" "licenses" {
   # Used by QURL service to determine quota plan based on license tier.
   global_secondary_index {
     name            = "auth0_subject-index"
+    hash_key        = "auth0_subject"
     projection_type = "ALL"
-
-    key_schema {
-      attribute_name = "auth0_subject"
-      key_type       = "HASH"
-    }
   }
 
   # Enable point-in-time recovery for production
@@ -172,23 +151,15 @@ resource "aws_dynamodb_table" "ac_assignments" {
   # GSI: Find AC by resource FQDN
   global_secondary_index {
     name            = "resource_fqdn-index"
+    hash_key        = "resource_fqdn"
     projection_type = "ALL"
-
-    key_schema {
-      attribute_name = "resource_fqdn"
-      key_type       = "HASH"
-    }
   }
 
   # GSI: List ACs by customer
   global_secondary_index {
     name            = "customer_id-index"
+    hash_key        = "customer_id"
     projection_type = "ALL"
-
-    key_schema {
-      attribute_name = "customer_id"
-      key_type       = "HASH"
-    }
   }
 
   # Enable point-in-time recovery for production
@@ -320,12 +291,8 @@ resource "aws_dynamodb_table" "resources" {
   # GSI: Find resources by AC
   global_secondary_index {
     name            = "ac_id-index"
+    hash_key        = "ac_id"
     projection_type = "ALL"
-
-    key_schema {
-      attribute_name = "ac_id"
-      key_type       = "HASH"
-    }
   }
 
   # Enable point-in-time recovery for production
@@ -477,16 +444,9 @@ resource "aws_dynamodb_table" "qurl_resources" {
   # GSI: Find resources by owner, sorted by creation time (newest first with ScanIndexForward=false)
   global_secondary_index {
     name            = "owner-index"
+    hash_key        = "owner_id"
+    range_key       = "created_at"
     projection_type = "ALL"
-
-    key_schema {
-      attribute_name = "owner_id"
-      key_type       = "HASH"
-    }
-    key_schema {
-      attribute_name = "created_at"
-      key_type       = "RANGE"
-    }
   }
 
   # Enable point-in-time recovery for production
@@ -538,12 +498,8 @@ resource "aws_dynamodb_table" "qurl_access_tokens" {
   # GSI: Find tokens by resource
   global_secondary_index {
     name            = "resource-token-index"
+    hash_key        = "resource_id"
     projection_type = "ALL"
-
-    key_schema {
-      attribute_name = "resource_id"
-      key_type       = "HASH"
-    }
   }
 
   # Enable point-in-time recovery for production
@@ -689,12 +645,8 @@ resource "aws_dynamodb_table" "qurl_webhooks" {
   # GSI: Find webhooks by owner
   global_secondary_index {
     name            = "owner-index"
+    hash_key        = "owner_id"
     projection_type = "ALL"
-
-    key_schema {
-      attribute_name = "owner_id"
-      key_type       = "HASH"
-    }
   }
 
   # Enable point-in-time recovery for production
@@ -756,32 +708,18 @@ resource "aws_dynamodb_table" "qurl_webhook_deliveries" {
   # GSI: Find deliveries by webhook, sorted by creation time (for delivery history)
   global_secondary_index {
     name            = "webhook-index"
+    hash_key        = "webhook_id"
+    range_key       = "created_at"
     projection_type = "ALL"
-
-    key_schema {
-      attribute_name = "webhook_id"
-      key_type       = "HASH"
-    }
-    key_schema {
-      attribute_name = "created_at"
-      key_type       = "RANGE"
-    }
   }
 
   # GSI: Find deliveries by status for retry processing
   # Query pattern: status = "failed" AND next_retry_at < now()
   global_secondary_index {
     name            = "status-index"
+    hash_key        = "status"
+    range_key       = "next_retry_at"
     projection_type = "ALL"
-
-    key_schema {
-      attribute_name = "status"
-      key_type       = "HASH"
-    }
-    key_schema {
-      attribute_name = "next_retry_at"
-      key_type       = "RANGE"
-    }
   }
 
   # Enable point-in-time recovery for production
