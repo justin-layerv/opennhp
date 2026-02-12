@@ -130,6 +130,8 @@ resource "aws_bcmdataexports_export" "cost_usage" {
     name = "${var.name_prefix}-cost-usage"
 
     data_query {
+      # CUR 2.0 nested map columns: product and resource_tags.
+      # Dot notation extracts keys; AS aliases match Glue table column names.
       query_statement = <<-SQL
         SELECT
           identity_line_item_id, identity_time_interval,
@@ -138,9 +140,11 @@ resource "aws_bcmdataexports_export" "cost_usage" {
           line_item_usage_type, line_item_operation,
           line_item_line_item_type, line_item_unblended_cost,
           line_item_blended_cost, line_item_usage_amount,
-          line_item_currency_code, product_product_name,
-          product_region, product_instance_type,
-          pricing_unit, resource_tags
+          line_item_currency_code, product_instance_type,
+          pricing_unit,
+          product.product_name AS product_product_name,
+          product.region AS product_region,
+          resource_tags
         FROM COST_AND_USAGE_REPORT
       SQL
 
