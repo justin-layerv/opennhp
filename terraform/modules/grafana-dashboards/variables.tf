@@ -29,11 +29,6 @@ variable "loki_datasource_uid" {
   description = "UID of the Loki datasource in Grafana Cloud"
   type        = string
   default     = "grafanacloud-logs"
-
-  validation {
-    condition     = !var.loki_datasource_enabled || length(var.loki_datasource_uid) > 0
-    error_message = "loki_datasource_uid must be set when loki_datasource_enabled is true."
-  }
 }
 
 variable "loki_datasource_enabled" {

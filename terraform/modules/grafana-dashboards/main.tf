@@ -39,6 +39,7 @@ resource "grafana_dashboard" "operations" {
   config_json = templatefile("${path.module}/dashboards/qurl-operations.json", {
     datasource_uid = var.prometheus_datasource_uid
     tempo_uid      = var.tempo_datasource_uid
+    loki_uid       = var.loki_datasource_uid
     environment    = var.environment
   })
 
@@ -226,6 +227,17 @@ resource "grafana_dashboard" "aws_cost" {
   })
 
   overwrite = true
+}
+
+# ==============================================================================
+# Input Validation
+# ==============================================================================
+
+check "loki_datasource_uid_required" {
+  assert {
+    condition     = !var.loki_datasource_enabled || length(var.loki_datasource_uid) > 0
+    error_message = "loki_datasource_uid must be set when loki_datasource_enabled is true."
+  }
 }
 
 # ==============================================================================

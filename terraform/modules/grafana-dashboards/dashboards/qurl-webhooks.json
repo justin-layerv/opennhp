@@ -2,7 +2,11 @@
   "title": "QURL Webhooks",
   "description": "Webhook delivery metrics and health for QURL service",
   "uid": "qurl-webhooks",
-  "tags": ["qurl", "webhooks", "${environment}"],
+  "tags": [
+    "qurl",
+    "webhooks",
+    "${environment}"
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
   "refresh": "30s",
@@ -14,7 +18,9 @@
     "list": [
       {
         "name": "Deployments",
-        "datasource": {"uid": "${datasource_uid}"},
+        "datasource": {
+          "uid": "${datasource_uid}"
+        },
         "enable": true,
         "hide": false,
         "iconColor": "blue",
@@ -49,14 +55,22 @@
           "value": "${environment}"
         },
         "options": [
-          {"text": "sandbox", "value": "sandbox"},
-          {"text": "prod", "value": "prod"}
+          {
+            "text": "sandbox",
+            "value": "sandbox"
+          },
+          {
+            "text": "prod",
+            "value": "prod"
+          }
         ]
       },
       {
         "name": "cell_id",
         "type": "query",
-        "datasource": {"uid": "${datasource_uid}"},
+        "datasource": {
+          "uid": "${datasource_uid}"
+        },
         "query": "label_values(qurl_webhook_delivery_total{service_name=\"qurl-api\"}, cell_id)",
         "refresh": 2,
         "includeAll": true,
@@ -69,7 +83,12 @@
       "id": 100,
       "title": "Overview",
       "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
       "collapsed": false
     },
     {
@@ -77,8 +96,15 @@
       "title": "Delivery Success Rate (1h)",
       "description": "Percentage of successful webhook deliveries over the last hour. Action: If < 99%, investigate failed deliveries in the Retries & Failures section.",
       "type": "gauge",
-      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 1},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum(rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"success\"}[1h])) / sum(rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1h])) * 100 or vector(100)",
@@ -90,12 +116,23 @@
           "unit": "percent",
           "min": 0,
           "max": 100,
-          "color": {"mode": "thresholds"},
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "steps": [
-              {"color": "red", "value": null},
-              {"color": "yellow", "value": 90},
-              {"color": "green", "value": 99}
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 90
+              },
+              {
+                "color": "green",
+                "value": 99
+              }
             ]
           }
         }
@@ -106,8 +143,15 @@
       "title": "Deliveries (1h)",
       "description": "Total webhook delivery attempts in the last hour. Action: If zero when traffic is expected, check webhook event emission.",
       "type": "stat",
-      "gridPos": {"h": 3, "w": 3, "x": 6, "y": 1},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 3,
+        "w": 3,
+        "x": 6,
+        "y": 1
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum(increase(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1h]))",
@@ -117,8 +161,17 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": {"mode": "thresholds"},
-          "thresholds": {"steps": [{"color": "blue", "value": null}]}
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
         }
       }
     },
@@ -127,8 +180,15 @@
       "title": "Successful (1h)",
       "description": "Successful webhook deliveries in the last hour. Action: Compare with total deliveries to spot success rate trends.",
       "type": "stat",
-      "gridPos": {"h": 3, "w": 3, "x": 9, "y": 1},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 3,
+        "w": 3,
+        "x": 9,
+        "y": 1
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum(increase(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"success\"}[1h]))",
@@ -138,8 +198,17 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": {"mode": "thresholds"},
-          "thresholds": {"steps": [{"color": "green", "value": null}]}
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
         }
       }
     },
@@ -148,8 +217,15 @@
       "title": "Failed (1h)",
       "description": "Failed webhook deliveries in the last hour. Action: If > 0, check Failure Reasons panel for error breakdown.",
       "type": "stat",
-      "gridPos": {"h": 3, "w": 3, "x": 6, "y": 4},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 3,
+        "w": 3,
+        "x": 6,
+        "y": 4
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum(increase(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"failed\"}[1h]))",
@@ -159,12 +235,23 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": {"mode": "thresholds"},
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "steps": [
-              {"color": "green", "value": null},
-              {"color": "yellow", "value": 1},
-              {"color": "red", "value": 10}
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
             ]
           }
         }
@@ -175,8 +262,15 @@
       "title": "Retrying",
       "description": "Currently pending retry deliveries. Action: If consistently > 20, check destination health and retry backoff configuration.",
       "type": "stat",
-      "gridPos": {"h": 3, "w": 3, "x": 9, "y": 4},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 3,
+        "w": 3,
+        "x": 9,
+        "y": 4
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum(qurl_webhook_delivery_pending{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"retrying\"}) or vector(0)",
@@ -186,12 +280,23 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": {"mode": "thresholds"},
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "steps": [
-              {"color": "green", "value": null},
-              {"color": "yellow", "value": 5},
-              {"color": "orange", "value": 20}
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 5
+              },
+              {
+                "color": "orange",
+                "value": 20
+              }
             ]
           }
         }
@@ -202,8 +307,15 @@
       "title": "p999 Latency",
       "description": "99.9th percentile webhook delivery latency. Action: If > 10s, check destination endpoint health and retry configuration.",
       "type": "stat",
-      "gridPos": {"h": 6, "w": 4, "x": 12, "y": 1},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.999, sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
@@ -213,12 +325,23 @@
       "fieldConfig": {
         "defaults": {
           "unit": "ms",
-          "color": {"mode": "thresholds"},
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "steps": [
-              {"color": "green", "value": null},
-              {"color": "yellow", "value": 2000},
-              {"color": "red", "value": 10000}
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 2000
+              },
+              {
+                "color": "red",
+                "value": 10000
+              }
             ]
           }
         }
@@ -229,8 +352,15 @@
       "title": "Active Webhooks",
       "description": "Number of currently active webhook subscriptions. Action: If unexpectedly zero, check webhook registration service.",
       "type": "stat",
-      "gridPos": {"h": 3, "w": 4, "x": 16, "y": 1},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 3,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum(qurl_webhook_active{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"})",
@@ -240,8 +370,17 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": {"mode": "thresholds"},
-          "thresholds": {"steps": [{"color": "blue", "value": null}]}
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
         }
       }
     },
@@ -250,8 +389,15 @@
       "title": "Disabled Webhooks",
       "description": "Number of disabled webhook subscriptions. Action: If increasing, check Webhook Health section for consecutive failure patterns.",
       "type": "stat",
-      "gridPos": {"h": 3, "w": 4, "x": 16, "y": 4},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 3,
+        "w": 4,
+        "x": 16,
+        "y": 4
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum(qurl_webhook_disabled{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"})",
@@ -261,12 +407,23 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": {"mode": "thresholds"},
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "steps": [
-              {"color": "green", "value": null},
-              {"color": "yellow", "value": 1},
-              {"color": "orange", "value": 5}
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "orange",
+                "value": 5
+              }
             ]
           }
         }
@@ -277,8 +434,15 @@
       "title": "Event Queue Depth",
       "description": "Current number of webhook events waiting in the delivery queue. Action: If > 500, check for processing bottlenecks or stalled consumers.",
       "type": "stat",
-      "gridPos": {"h": 6, "w": 4, "x": 20, "y": 1},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 3,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum(qurl_webhook_queue_depth{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"})",
@@ -288,12 +452,68 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": {"mode": "thresholds"},
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "steps": [
-              {"color": "green", "value": null},
-              {"color": "yellow", "value": 100},
-              {"color": "red", "value": 500}
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 100
+              },
+              {
+                "color": "red",
+                "value": 500
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 60,
+      "title": "DLQ Depth",
+      "description": "Webhook deliveries that exhausted all retries (abandoned). Action: If increasing, destinations may be persistently unreachable.",
+      "type": "stat",
+      "gridPos": {
+        "h": 3,
+        "w": 4,
+        "x": 20,
+        "y": 4
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
+      "targets": [
+        {
+          "expr": "sum(qurl_webhook_dlq_depth{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}) or vector(0)",
+          "legendFormat": "DLQ"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 5
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
             ]
           }
         }
@@ -303,7 +523,12 @@
       "id": 101,
       "title": "Delivery Performance",
       "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 7},
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 7
+      },
       "collapsed": false
     },
     {
@@ -311,8 +536,15 @@
       "title": "Delivery Rate by Status",
       "description": "Webhook delivery rate over time broken down by status. Action: If failed rate spikes, correlate with deployment annotations and check destination health.",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum by (status) (rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
@@ -322,7 +554,9 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": {"mode": "palette-classic"},
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "drawStyle": "line",
             "lineInterpolation": "smooth",
@@ -330,8 +564,36 @@
           }
         },
         "overrides": [
-          {"matcher": {"id": "byName", "options": "success"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]},
-          {"matcher": {"id": "byName", "options": "failed"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]}
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "success"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
         ]
       }
     },
@@ -340,8 +602,15 @@
       "title": "Delivery Latency",
       "description": "Webhook delivery latency percentiles over time. Action: If p99/p999 diverge significantly from p50, investigate slow outlier destinations.",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
@@ -363,7 +632,9 @@
       "fieldConfig": {
         "defaults": {
           "unit": "ms",
-          "color": {"mode": "palette-classic"},
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "drawStyle": "line",
             "lineInterpolation": "smooth",
@@ -377,8 +648,15 @@
       "title": "Delivery Latency Heatmap",
       "description": "Distribution of delivery times. Bimodal pattern (fast+slow clusters) suggests mixed destination health.",
       "type": "heatmap",
-      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum(increase(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1m])) by (le)",
@@ -388,8 +666,13 @@
       ],
       "options": {
         "calculate": false,
-        "yAxis": {"unit": "s"},
-        "color": {"scheme": "Oranges", "mode": "scheme"},
+        "yAxis": {
+          "unit": "s"
+        },
+        "color": {
+          "scheme": "Oranges",
+          "mode": "scheme"
+        },
         "cellGap": 1
       }
     },
@@ -398,8 +681,15 @@
       "title": "Failure Rate by Destination",
       "description": "Per-destination webhook failure rate. Action: If a single destination dominates failures, contact the destination owner or consider disabling the webhook.",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum by (destination_host) (rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"failed\"}[5m])) / sum by (destination_host) (rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) * 100",
@@ -411,7 +701,9 @@
           "unit": "percent",
           "min": 0,
           "max": 100,
-          "color": {"mode": "palette-classic"},
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "drawStyle": "line",
             "lineInterpolation": "smooth",
@@ -425,8 +717,15 @@
       "title": "Queue Depth Over Time",
       "description": "Webhook event queue depth trend. Action: If steadily increasing, consumers may be falling behind. Check for processing errors or resource constraints.",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum(qurl_webhook_queue_depth{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"})",
@@ -436,12 +735,23 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": {"mode": "thresholds"},
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "steps": [
-              {"color": "green", "value": null},
-              {"color": "yellow", "value": 100},
-              {"color": "red", "value": 500}
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 100
+              },
+              {
+                "color": "red",
+                "value": 500
+              }
             ]
           },
           "custom": {
@@ -457,7 +767,12 @@
       "id": 102,
       "title": "Events",
       "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 32},
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 32
+      },
       "collapsed": false
     },
     {
@@ -465,8 +780,15 @@
       "title": "Deliveries by Event Type",
       "description": "Webhook delivery rate broken down by event type. Action: If a specific event type has disproportionate volume, verify it is not generating duplicate events.",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 33},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 33
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum by (event) (rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
@@ -476,12 +798,16 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": {"mode": "palette-classic"},
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "drawStyle": "line",
             "lineInterpolation": "smooth",
             "fillOpacity": 20,
-            "stacking": {"mode": "normal"}
+            "stacking": {
+              "mode": "normal"
+            }
           }
         }
       }
@@ -491,8 +817,15 @@
       "title": "Event Type Distribution (24h)",
       "description": "Proportion of webhook deliveries by event type over 24 hours. Action: Compare with expected distribution to spot anomalies.",
       "type": "piechart",
-      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 33},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 33
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum by (event) (increase(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h]))",
@@ -500,7 +833,14 @@
         }
       ],
       "options": {
-        "legend": {"displayMode": "table", "placement": "right", "values": ["value", "percent"]},
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
         "pieType": "donut"
       }
     },
@@ -509,8 +849,15 @@
       "title": "Failure Rate by Event Type",
       "description": "Percentage of failed deliveries per event type over 24 hours. Action: If one event type has significantly higher failure rate, check its payload size and destination compatibility.",
       "type": "table",
-      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 33},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 33
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum by (event) (increase(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"failed\"}[24h])) / sum by (event) (increase(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h])) * 100",
@@ -519,12 +866,43 @@
         }
       ],
       "transformations": [
-        {"id": "organize", "options": {"renameByName": {"event": "Event Type", "Value": "Failure %"}}}
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "event": "Event Type",
+              "Value": "Failure %"
+            }
+          }
+        }
       ],
       "fieldConfig": {
-        "defaults": {"unit": "percent", "decimals": 1},
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1
+        },
         "overrides": [
-          {"matcher": {"id": "byName", "options": "Failure %"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background", "mode": "gradient"}}, {"id": "color", "value": {"mode": "continuous-GrYlRd"}}]}
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Failure %"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "gradient"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "continuous-GrYlRd"
+                }
+              }
+            ]
+          }
         ]
       }
     },
@@ -532,7 +910,12 @@
       "id": 103,
       "title": "Retries & Failures",
       "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 41},
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 41
+      },
       "collapsed": false
     },
     {
@@ -540,8 +923,15 @@
       "title": "Retry Distribution",
       "description": "Retry attempts over time broken down by retry count. Action: If higher retry counts (3+) are increasing, destinations may be persistently unhealthy.",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 42},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 42
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum by (retry_count) (rate(qurl_webhook_retry_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
@@ -551,11 +941,15 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": {"mode": "palette-classic"},
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "drawStyle": "bars",
             "fillOpacity": 80,
-            "stacking": {"mode": "normal"}
+            "stacking": {
+              "mode": "normal"
+            }
           }
         }
       }
@@ -565,8 +959,15 @@
       "title": "Failure Reasons",
       "description": "Breakdown of webhook failure reasons over 24 hours. Action: If timeout errors dominate, increase delivery timeout or check destination response times.",
       "type": "barchart",
-      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 42},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 42
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum by (error_type) (increase(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"failed\"}[24h]))",
@@ -581,7 +982,9 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": {"mode": "palette-classic"}
+          "color": {
+            "mode": "palette-classic"
+          }
         }
       }
     },
@@ -590,8 +993,15 @@
       "title": "Cumulative Retry Percentage",
       "description": "Percentage of deliveries that required at least one retry. Action: If > 20%, investigate destination reliability or network issues.",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 42},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 42
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum(rate(qurl_webhook_retry_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) / sum(rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) * 100",
@@ -602,12 +1012,23 @@
         "defaults": {
           "unit": "percent",
           "min": 0,
-          "color": {"mode": "thresholds"},
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "steps": [
-              {"color": "green", "value": null},
-              {"color": "yellow", "value": 10},
-              {"color": "red", "value": 20}
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 10
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
             ]
           },
           "custom": {
@@ -624,8 +1045,15 @@
       "title": "Response Code Distribution",
       "description": "HTTP response codes from webhook destinations over time. Action: If 4xx codes dominate, check payload format. If 5xx, destination may be unhealthy.",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 50},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 50
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "sum by (response_code) (rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
@@ -635,17 +1063,63 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": {"mode": "palette-classic"},
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "drawStyle": "bars",
             "fillOpacity": 80,
-            "stacking": {"mode": "normal"}
+            "stacking": {
+              "mode": "normal"
+            }
           }
         },
         "overrides": [
-          {"matcher": {"id": "byRegexp", "options": "^2.."}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]},
-          {"matcher": {"id": "byRegexp", "options": "^4.."}, "properties": [{"id": "color", "value": {"fixedColor": "yellow", "mode": "fixed"}}]},
-          {"matcher": {"id": "byRegexp", "options": "^5.."}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]}
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^2.."
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^4.."
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "yellow",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^5.."
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
         ]
       }
     },
@@ -654,8 +1128,15 @@
       "title": "Delivery Attempt vs End-to-End Latency",
       "description": "Comparison of individual delivery attempt latency (HTTP call) vs end-to-end latency (including queue time and retries). Action: If end-to-end significantly exceeds attempt latency, queue backlog or retries are adding delay.",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 50},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 50
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
@@ -669,7 +1150,98 @@
       "fieldConfig": {
         "defaults": {
           "unit": "ms",
-          "color": {"mode": "palette-classic"},
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10
+          }
+        }
+      }
+    },
+    {
+      "id": 61,
+      "title": "DLQ Depth Over Time",
+      "description": "Cumulative abandoned webhook deliveries over time. A steadily rising trend indicates persistent destination failures.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 58
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
+      "targets": [
+        {
+          "expr": "sum(qurl_webhook_dlq_depth{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}) or vector(0)",
+          "legendFormat": "DLQ Depth"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 5
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20,
+            "gradientMode": "scheme"
+          }
+        }
+      }
+    },
+    {
+      "id": 62,
+      "title": "Webhook Staleness (Last Success Age)",
+      "description": "Time since last successful delivery per webhook. Webhooks with large ages may have silently broken destinations.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 58
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(qurl_webhook_last_success_age_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(qurl_webhook_last_success_age_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "drawStyle": "line",
             "lineInterpolation": "smooth",
@@ -682,7 +1254,12 @@
       "id": 104,
       "title": "Webhook Health",
       "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 58},
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 66
+      },
       "collapsed": false
     },
     {
@@ -690,8 +1267,15 @@
       "title": "Webhooks with Consecutive Failures",
       "description": "Top 10 webhooks by consecutive failure count. Action: If any webhook exceeds failure threshold, it may be auto-disabled. Contact the destination owner.",
       "type": "table",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 59},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 67
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "topk(10, qurl_webhook_consecutive_failures{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"} > 0)",
@@ -700,12 +1284,46 @@
         }
       ],
       "transformations": [
-        {"id": "organize", "options": {"excludeByName": {"Time": true}, "renameByName": {"webhook_id": "Webhook ID", "owner_id": "Owner", "Value": "Consecutive Failures"}}}
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "webhook_id": "Webhook ID",
+              "owner_id": "Owner",
+              "Value": "Consecutive Failures"
+            }
+          }
+        }
       ],
       "fieldConfig": {
-        "defaults": {"unit": "short"},
+        "defaults": {
+          "unit": "short"
+        },
         "overrides": [
-          {"matcher": {"id": "byName", "options": "Consecutive Failures"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background", "mode": "gradient"}}, {"id": "color", "value": {"mode": "continuous-YlOrRd"}}]}
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Consecutive Failures"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "gradient"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "continuous-YlOrRd"
+                }
+              }
+            ]
+          }
         ]
       }
     },
@@ -714,8 +1332,15 @@
       "title": "Recently Disabled Webhooks",
       "description": "Webhooks disabled in the last 24 hours. Action: Review the disable reason and contact webhook owners to fix their endpoints.",
       "type": "table",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 59},
-      "datasource": {"uid": "${datasource_uid}"},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 67
+      },
+      "datasource": {
+        "uid": "${datasource_uid}"
+      },
       "targets": [
         {
           "expr": "qurl_webhook_disabled_at{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"} > (time() - 86400)",
@@ -724,14 +1349,32 @@
         }
       ],
       "transformations": [
-        {"id": "organize", "options": {"excludeByName": {"Time": true}, "renameByName": {"webhook_id": "Webhook ID", "owner_id": "Owner", "reason": "Reason", "Value": "Disabled At"}}}
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "webhook_id": "Webhook ID",
+              "owner_id": "Owner",
+              "reason": "Reason",
+              "Value": "Disabled At"
+            }
+          }
+        }
       ]
     },
     {
       "id": 105,
       "title": "Webhook Delivery SLO",
       "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 67},
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 75
+      },
       "collapsed": true,
       "panels": [
         {
@@ -739,8 +1382,15 @@
           "title": "SLO: Delivered Within 30s",
           "description": "Percentage of webhooks delivered successfully within 30 seconds on the first attempt. SLO target: 99%. Action: If below target, check delivery latency and failure panels.",
           "type": "gauge",
-          "gridPos": {"h": 8, "w": 8, "x": 0, "y": 68},
-          "datasource": {"uid": "${datasource_uid}"},
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 76
+          },
+          "datasource": {
+            "uid": "${datasource_uid}"
+          },
           "targets": [
             {
               "expr": "(\n  sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", le=\"30\"}[1h]))\n  / sum(rate(qurl_webhook_delivery_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1h]))\n) * 100 or vector(100)",
@@ -752,12 +1402,23 @@
               "unit": "percent",
               "min": 0,
               "max": 100,
-              "color": {"mode": "thresholds"},
+              "color": {
+                "mode": "thresholds"
+              },
               "thresholds": {
                 "steps": [
-                  {"color": "red", "value": null},
-                  {"color": "yellow", "value": 95},
-                  {"color": "green", "value": 99}
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 95
+                  },
+                  {
+                    "color": "green",
+                    "value": 99
+                  }
                 ]
               }
             }
@@ -768,8 +1429,15 @@
           "title": "1h Burn Rate",
           "description": "Rate at which the error budget is being consumed over the last hour. Action: If > 1, the SLO will be breached at current pace. Investigate immediately.",
           "type": "stat",
-          "gridPos": {"h": 8, "w": 8, "x": 8, "y": 68},
-          "datasource": {"uid": "${datasource_uid}"},
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 76
+          },
+          "datasource": {
+            "uid": "${datasource_uid}"
+          },
           "targets": [
             {
               "expr": "(\n  1 - (\n    sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", le=\"30\"}[1h]))\n    / sum(rate(qurl_webhook_delivery_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1h]))\n  )\n) / (1 - 0.99) or vector(0)",
@@ -780,12 +1448,23 @@
             "defaults": {
               "unit": "short",
               "decimals": 2,
-              "color": {"mode": "thresholds"},
+              "color": {
+                "mode": "thresholds"
+              },
               "thresholds": {
                 "steps": [
-                  {"color": "green", "value": null},
-                  {"color": "yellow", "value": 1},
-                  {"color": "red", "value": 2}
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 1
+                  },
+                  {
+                    "color": "red",
+                    "value": 2
+                  }
                 ]
               }
             }
@@ -796,8 +1475,15 @@
           "title": "Error Budget Remaining (30d)",
           "description": "Remaining error budget for the 30-day SLO window. Action: If < 50%, reduce risk by pausing non-critical changes. If < 0%, SLO is breached.",
           "type": "gauge",
-          "gridPos": {"h": 8, "w": 8, "x": 16, "y": 68},
-          "datasource": {"uid": "${datasource_uid}"},
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 76
+          },
+          "datasource": {
+            "uid": "${datasource_uid}"
+          },
           "targets": [
             {
               "expr": "(\n  1 - (\n    (\n      1 - (\n        sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", le=\"30\"}[30d]))\n        / sum(rate(qurl_webhook_delivery_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[30d]))\n      )\n    ) / (1 - 0.99)\n  )\n) * 100 or vector(100)",
@@ -809,13 +1495,27 @@
               "unit": "percent",
               "min": 0,
               "max": 100,
-              "color": {"mode": "thresholds"},
+              "color": {
+                "mode": "thresholds"
+              },
               "thresholds": {
                 "steps": [
-                  {"color": "red", "value": null},
-                  {"color": "orange", "value": 25},
-                  {"color": "yellow", "value": 50},
-                  {"color": "green", "value": 75}
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 25
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 50
+                  },
+                  {
+                    "color": "green",
+                    "value": 75
+                  }
                 ]
               }
             }

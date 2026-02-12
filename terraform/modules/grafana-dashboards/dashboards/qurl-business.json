@@ -304,6 +304,117 @@
       }
     },
     {
+      "id": 60,
+      "title": "Time to First Access",
+      "description": "Median time from QURL creation to first successful token resolve. Lower values indicate faster user engagement.",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 5},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(qurl_time_to_first_access_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[24h])) by (le))",
+          "legendFormat": "Median"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 3600},
+              {"color": "red", "value": 86400}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "value", "graphMode": "none"}
+    },
+    {
+      "id": 61,
+      "title": "Expiring <24h",
+      "description": "QURLs expiring within the next 24 hours. High values may indicate a wave of upcoming expirations.",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 3, "x": 18, "y": 5},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(qurl_resource_expiring_soon{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", window=\"24h\"}) or vector(0)",
+          "legendFormat": "24h"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 10},
+              {"color": "orange", "value": 50}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 62,
+      "title": "Expiring <7d",
+      "description": "QURLs expiring within the next 7 days. Useful for planning retention and renewal outreach.",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 3, "x": 21, "y": 5},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "sum(qurl_resource_expiring_soon{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", window=\"7d\"}) or vector(0)",
+          "legendFormat": "7d"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 25},
+              {"color": "orange", "value": 100}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 63,
+      "title": "Time to First Access Over Time",
+      "description": "Median and p95 time from QURL creation to first access. Tracks user engagement speed trends.",
+      "type": "timeseries",
+      "gridPos": {"h": 4, "w": 12, "x": 12, "y": 9},
+      "datasource": {"uid": "${datasource_uid}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(qurl_time_to_first_access_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1h])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(qurl_time_to_first_access_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1h])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10
+          }
+        }
+      }
+    },
+    {
       "id": 101,
       "title": "Resource Lifecycle",
       "description": "QURL resource creation, activation, and revocation patterns over time.",
