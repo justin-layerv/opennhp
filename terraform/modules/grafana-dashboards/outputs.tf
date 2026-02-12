@@ -29,3 +29,8 @@ output "grafana_cloudwatch_role_arn" {
   description = "IAM role ARN for Grafana Cloud CloudWatch access (null if not created)"
   value       = local.create_cw_role ? aws_iam_role.grafana_cloudwatch[0].arn : null
 }
+
+output "aws_cost_dashboard_url" {
+  description = "URL to the AWS Cost dashboard (null if Athena datasource not enabled)"
+  value       = var.athena_datasource_enabled ? "${var.grafana_url}/d/${grafana_dashboard.aws_cost[0].uid}" : null
+}

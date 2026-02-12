@@ -83,6 +83,40 @@ variable "nhp_folder_name" {
   default     = "NHP"
 }
 
+# ==============================================================================
+# Athena Data Source (for AWS Cost dashboard)
+# ==============================================================================
+
+variable "athena_datasource_enabled" {
+  description = "Enable Athena data source and AWS Cost dashboard"
+  type        = bool
+  default     = false
+}
+
+variable "athena_assume_role_arn" {
+  description = "IAM role ARN for Grafana Cloud to assume for Athena access (in mgmt account)"
+  type        = string
+  default     = ""
+}
+
+variable "athena_workgroup" {
+  description = "Athena workgroup name for cost queries"
+  type        = string
+  default     = ""
+}
+
+variable "athena_database" {
+  description = "Glue database name for cost data"
+  type        = string
+  default     = ""
+}
+
+variable "athena_region" {
+  description = "AWS region where Athena resources live"
+  type        = string
+  default     = "us-east-1"
+}
+
 variable "tags" {
   description = "Tags to apply to resources"
   type        = map(string)

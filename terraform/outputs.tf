@@ -350,3 +350,12 @@ output "status_page_cloudfront_distribution_id" {
   description = "CloudFront distribution ID for status page (for cache invalidation)"
   value       = var.deploy_status_page ? module.status_page[0].cloudfront_distribution_id : null
 }
+
+# ============================================================================
+# Cost Analytics Outputs
+# ============================================================================
+
+output "cost_analytics_bucket" {
+  description = "S3 bucket for AWS cost data (mgmt account)"
+  value       = var.deploy_cost_analytics ? module.cost_analytics[0].cost_data_bucket_name : null
+}

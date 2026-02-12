@@ -12,7 +12,7 @@ terraform {
     aws = {
       source                = "hashicorp/aws"
       version               = "~> 6.27"
-      configuration_aliases = [aws.us_east_1, aws.route53_mgmt]
+      configuration_aliases = [aws.us_east_1, aws.route53_mgmt, aws.billing_mgmt]
     }
     random = {
       source  = "hashicorp/random"
@@ -1182,6 +1182,43 @@ resource "aws_ssm_parameter" "qurl_link_url" {
   })
 }
 
+# ==================== Cost Analytics ====================
+# AWS Data Exports (CUR 2.0) → S3 (Parquet) → Athena → Grafana dashboard
+# Runs in mgmt/payer account for consolidated billing across all accounts.
+
+module "cost_analytics" {
+  count  = var.deploy_cost_analytics ? 1 : 0
+  source = "./modules/cost-analytics"
+
+  providers = {
+    aws = aws.billing_mgmt
+  }
+
+  name_prefix                  = "layerv-nhp-mgmt" # mgmt account prefix
+  grafana_cloud_aws_account_id = var.grafana_cloud_aws_account_id
+  grafana_cloud_external_id    = var.grafana_cloud_external_id
+  tags                         = local.common_tags
+}
+
+# CI role needs sts:AssumeRole permission to assume into mgmt account
+# for cost analytics resources (same pattern as cross-account-route53)
+resource "aws_iam_role_policy" "ci_cross_account_cost_analytics" {
+  count = var.deploy_cost_analytics && var.cross_account_cost_analytics_role_arn != null ? 1 : 0
+
+  name = "cross-account-cost-analytics"
+  role = module.ecr.github_actions_role_name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "AssumeCostAnalyticsCrossAccountRole"
+      Effect   = "Allow"
+      Action   = "sts:AssumeRole"
+      Resource = var.cross_account_cost_analytics_role_arn
+    }]
+  })
+}
+
 # ==================== Grafana Cloud Dashboards ====================
 # Provisions QURL dashboards to Grafana Cloud
 # Requires a Grafana Cloud API key with Editor permissions
@@ -1205,6 +1242,13 @@ module "grafana_dashboards" {
   name_prefix                   = local.name_prefix
   grafana_cloud_aws_account_id  = var.grafana_cloud_aws_account_id
   grafana_cloud_external_id     = var.grafana_cloud_external_id
+
+  # Athena data source for AWS Cost dashboard
+  athena_datasource_enabled = var.deploy_cost_analytics
+  athena_assume_role_arn    = var.deploy_cost_analytics ? module.cost_analytics[0].grafana_athena_role_arn : ""
+  athena_workgroup          = var.deploy_cost_analytics ? module.cost_analytics[0].athena_workgroup_name : ""
+  athena_database           = var.deploy_cost_analytics ? module.cost_analytics[0].glue_database_name : ""
+  athena_region             = var.deploy_cost_analytics ? module.cost_analytics[0].athena_region : "us-east-1"
 
   tags = local.common_tags
 }

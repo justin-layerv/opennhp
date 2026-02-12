@@ -81,6 +81,29 @@ provider "aws" {
   }
 }
 
+# Provider for cost analytics in management account (us-east-1)
+# Data Exports API and all cost resources live in mgmt us-east-1
+provider "aws" {
+  alias  = "billing_mgmt"
+  region = "us-east-1" # Data Exports is us-east-1 only
+
+  dynamic "assume_role" {
+    for_each = var.cross_account_cost_analytics_role_arn != null ? [1] : []
+    content {
+      role_arn     = var.cross_account_cost_analytics_role_arn
+      session_name = "TerraformCostAnalytics"
+    }
+  }
+
+  default_tags {
+    tags = {
+      Project     = "LayerV-NHP"
+      Environment = var.environment
+      ManagedBy   = "terraform"
+    }
+  }
+}
+
 # Auth0 provider for identity management
 # Credentials MUST be passed via environment variables (required, no defaults):
 #   TF_VAR_auth0_tf_client_id     - M2M client ID with Management API access

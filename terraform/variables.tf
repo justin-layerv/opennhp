@@ -1473,6 +1473,20 @@ variable "status_page_hosted_zone_id" {
   }
 }
 
+# ==================== Cost Analytics ====================
+
+variable "deploy_cost_analytics" {
+  description = "Deploy AWS cost analytics (Data Export + Athena + Grafana dashboard)"
+  type        = bool
+  default     = false
+}
+
+variable "cross_account_cost_analytics_role_arn" {
+  description = "IAM role ARN in mgmt account for cross-account cost analytics"
+  type        = string
+  default     = null
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {

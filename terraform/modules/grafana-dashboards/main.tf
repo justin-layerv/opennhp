@@ -92,7 +92,7 @@ resource "grafana_data_source" "cloudwatch" {
 }
 
 resource "grafana_folder" "nhp" {
-  count                        = var.cloudwatch_datasource_enabled ? 1 : 0
+  count                        = (var.cloudwatch_datasource_enabled || var.athena_datasource_enabled) ? 1 : 0
   uid                          = "nhp"
   title                        = var.nhp_folder_name
   prevent_destroy_if_not_empty = true
@@ -192,4 +192,38 @@ resource "aws_iam_role_policy" "grafana_cloudwatch" {
       }
     ]
   })
+}
+
+# ==============================================================================
+# Athena Data Source & AWS Cost Dashboard
+# ==============================================================================
+# Requires grafana-athena-datasource plugin installed in Grafana Cloud UI
+# (Administration > Plugins > "Athena" > Install)
+
+resource "grafana_data_source" "athena" {
+  count = var.athena_datasource_enabled ? 1 : 0
+
+  type = "grafana-athena-datasource"
+  name = "Amazon Athena"
+
+  json_data_encoded = jsonencode({
+    defaultRegion = var.athena_region
+    authType      = "grafana_assume_role"
+    assumeRoleArn = var.athena_assume_role_arn
+    catalog       = "AwsDataCatalog"
+    database      = var.athena_database
+    workgroup     = var.athena_workgroup
+  })
+}
+
+resource "grafana_dashboard" "aws_cost" {
+  count = var.athena_datasource_enabled ? 1 : 0
+
+  folder = grafana_folder.nhp[0].uid
+  config_json = templatefile("${path.module}/dashboards/aws-cost.json", {
+    athena_uid  = grafana_data_source.athena[0].uid
+    environment = var.environment
+  })
+
+  overwrite = true
 }

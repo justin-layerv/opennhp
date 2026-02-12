@@ -8,6 +8,7 @@ module "nhp" {
     aws              = aws
     aws.us_east_1    = aws.us_east_1
     aws.route53_mgmt = aws.route53_mgmt
+    aws.billing_mgmt = aws.billing_mgmt
   }
 
   environment            = var.environment
@@ -183,6 +184,10 @@ module "nhp" {
   grafana_cloudwatch_enabled        = var.grafana_cloudwatch_enabled
   grafana_cloud_aws_account_id      = var.grafana_cloud_aws_account_id
   grafana_cloud_external_id         = var.grafana_cloud_external_id
+
+  # Cost analytics
+  deploy_cost_analytics                 = var.deploy_cost_analytics
+  cross_account_cost_analytics_role_arn = var.cross_account_cost_analytics_role_arn
 
   # Traefik plugins
   traefik_plugins = var.traefik_plugins

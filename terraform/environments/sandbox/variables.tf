@@ -897,6 +897,21 @@ variable "grafana_cloud_external_id" {
   default     = ""
 }
 
+# Cost analytics
+# Role in LayerV mgmt/payer account (165115313779) for consolidated billing access.
+# Same cross-account pattern as cross_account_route53_role_arn above.
+variable "cross_account_cost_analytics_role_arn" {
+  description = "IAM role ARN in mgmt account for cost analytics resources"
+  type        = string
+  default     = "arn:aws:iam::165115313779:role/nhp-cost-analytics-access"
+}
+
+variable "deploy_cost_analytics" {
+  description = "Deploy AWS cost analytics (Data Export + Athena + Grafana dashboard)"
+  type        = bool
+  default     = true
+}
+
 variable "grafana_prometheus_datasource_uid" {
   description = "UID of the Prometheus/Mimir datasource in Grafana Cloud"
   type        = string
