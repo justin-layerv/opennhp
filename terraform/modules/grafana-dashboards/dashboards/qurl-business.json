@@ -721,7 +721,7 @@
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
-          "expr": "sum(increase(qurl_batch_create_size_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)",
+          "expr": "sum(increase(qurl_batch_create_size_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[$__rate_interval])) by (le)",
           "format": "heatmap"
         }
       ],

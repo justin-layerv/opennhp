@@ -1761,6 +1761,7 @@
               "*"
             ]
           },
+          "matchExact": false,
           "period": "60",
           "region": "default",
           "label": "$${PROP('Dim.AutoScalingGroupName')}"
@@ -1828,6 +1829,7 @@
               "${ac_asg_name}"
             ]
           },
+          "matchExact": false,
           "period": "60",
           "region": "default",
           "label": "$${PROP('Dim.AutoScalingGroupName')}"
@@ -1895,6 +1897,7 @@
               "*"
             ]
           },
+          "matchExact": false,
           "period": "60",
           "region": "default",
           "label": "$${PROP('Dim.AutoScalingGroupName')}"
@@ -1969,6 +1972,7 @@
               "*"
             ]
           },
+          "matchExact": false,
           "period": "300",
           "region": "default",
           "label": "$${PROP('Dim.TableName')}"
@@ -2018,6 +2022,7 @@
               "*"
             ]
           },
+          "matchExact": false,
           "period": "300",
           "region": "default",
           "label": "$${PROP('Dim.TableName')} p50"
@@ -2034,6 +2039,7 @@
               "*"
             ]
           },
+          "matchExact": false,
           "period": "300",
           "region": "default",
           "label": "$${PROP('Dim.TableName')} p99"

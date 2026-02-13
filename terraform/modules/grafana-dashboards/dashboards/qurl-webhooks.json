@@ -659,7 +659,7 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1m])) by (le)",
+          "expr": "sum(increase(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[$__rate_interval])) by (le)",
           "legendFormat": "{{le}}",
           "format": "heatmap"
         }
