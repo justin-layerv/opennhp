@@ -368,7 +368,7 @@
       },
       "targets": [
         {
-          "expr": "sum(qurl_webhook_active{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"})",
+          "expr": "clamp_min(sum(qurl_webhook_active{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}), 0)",
           "legendFormat": "Active"
         }
       ],
@@ -405,7 +405,7 @@
       },
       "targets": [
         {
-          "expr": "sum(qurl_webhook_disabled{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"})",
+          "expr": "clamp_min(sum(qurl_webhook_disabled{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}), 0)",
           "legendFormat": "Disabled"
         }
       ],
