@@ -278,7 +278,7 @@
       },
       "targets": [
         {
-          "expr": "sum(qurl_webhook_delivery_pending{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}) or vector(0)",
+          "expr": "clamp_min(sum(qurl_webhook_delivery_pending{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}), 0) or vector(0)",
           "legendFormat": "Pending"
         }
       ],
