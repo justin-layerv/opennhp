@@ -74,7 +74,12 @@
         "query": "label_values(qurl_webhook_delivery_total{service_name=\"qurl-api\"}, cell_id)",
         "refresh": 2,
         "includeAll": true,
-        "multi": true
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "text": ["All"],
+          "value": ["$__all"]
+        }
       }
     ]
   },

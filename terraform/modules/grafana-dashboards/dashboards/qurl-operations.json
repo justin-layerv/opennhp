@@ -80,7 +80,12 @@
         "query": "label_values(http_server_request_duration_seconds_count{service_name=\"qurl-api\"}, cell_id)",
         "refresh": 2,
         "includeAll": true,
-        "multi": true
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "text": ["All"],
+          "value": ["$__all"]
+        }
       },
       {
         "name": "slo_target",
