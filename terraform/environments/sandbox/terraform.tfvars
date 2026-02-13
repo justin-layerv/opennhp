@@ -278,8 +278,8 @@ qurl_license_cache_max_size    = 1000
 qurl_auth0_jwks_cache_ttl_seconds     = 3600 # 1 hour
 qurl_auth0_jwks_fetch_timeout_seconds = 10
 
-# Webhooks configuration (disabled by default)
-qurl_webhooks_enabled                       = false
+# Webhooks configuration
+qurl_webhooks_enabled                       = true
 qurl_webhooks_worker_count                  = 4
 qurl_webhooks_max_webhooks_per_owner        = 10
 qurl_webhooks_delivery_timeout_seconds      = 30
