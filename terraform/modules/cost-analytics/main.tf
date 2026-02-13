@@ -355,6 +355,36 @@ resource "aws_iam_role" "grafana_athena" {
   })
 }
 
+# ==============================================================================
+# Cost Allocation Tag Activation
+# ==============================================================================
+# Tags must be activated in the management/payer account for them to appear
+# in CUR data. Without activation, resource_tags in Athena will be empty
+# and the Grafana "Spend by Component Tag" panel shows only "untagged".
+#
+# NOTE: After activation, tags only appear in NEW CUR data (not retroactive).
+# It may take up to 24 hours for newly activated tags to appear.
+
+resource "aws_ce_cost_allocation_tag" "component" {
+  tag_key = "Component"
+  status  = "Active"
+}
+
+resource "aws_ce_cost_allocation_tag" "environment" {
+  tag_key = "Environment"
+  status  = "Active"
+}
+
+resource "aws_ce_cost_allocation_tag" "project" {
+  tag_key = "Project"
+  status  = "Active"
+}
+
+resource "aws_ce_cost_allocation_tag" "cell" {
+  tag_key = "Cell"
+  status  = "Active"
+}
+
 resource "aws_iam_role_policy" "grafana_athena" {
   name = "${var.name_prefix}-grafana-athena-policy"
   role = aws_iam_role.grafana_athena.id

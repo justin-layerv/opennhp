@@ -37,7 +37,8 @@ resource "aws_ecs_cluster" "console" {
   }
 
   tags = merge(var.tags, {
-    Name = local.console_name
+    Name      = local.console_name
+    Component = "console"
   })
 }
 

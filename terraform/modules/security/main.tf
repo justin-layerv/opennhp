@@ -145,7 +145,7 @@ resource "aws_wafv2_web_acl" "main" {
     sampled_requests_enabled   = true
   }
 
-  tags = var.tags
+  tags = merge(var.tags, { Component = "security" })
 }
 
 # CloudWatch Log Group for WAF logs
@@ -155,7 +155,7 @@ resource "aws_cloudwatch_log_group" "waf" {
   retention_in_days = local.is_prod ? 90 : 30
   kms_key_id        = var.logs_kms_key_arn
 
-  tags = var.tags
+  tags = merge(var.tags, { Component = "security" })
 }
 
 # WAF Logging Configuration
@@ -188,7 +188,7 @@ resource "aws_guardduty_detector" "main" {
 
   finding_publishing_frequency = local.is_prod ? "FIFTEEN_MINUTES" : "SIX_HOURS"
 
-  tags = var.tags
+  tags = merge(var.tags, { Component = "security" })
 }
 
 # GuardDuty features (replaces deprecated datasources block)
@@ -251,7 +251,7 @@ resource "aws_sns_topic" "guardduty_email" {
   count = local.enable_guardduty_email_alerts ? 1 : 0
   name  = "${var.name_prefix}-guardduty-email"
 
-  tags = var.tags
+  tags = merge(var.tags, { Component = "security" })
 }
 
 # SNS Topic Policy - allows EventBridge to publish GuardDuty findings
@@ -301,7 +301,7 @@ resource "aws_cloudwatch_event_rule" "guardduty_findings" {
     }
   })
 
-  tags = var.tags
+  tags = merge(var.tags, { Component = "security" })
 }
 
 # EventBridge target for Email - plain text format
@@ -456,7 +456,7 @@ resource "aws_iam_role" "config" {
     }]
   })
 
-  tags = var.tags
+  tags = merge(var.tags, { Component = "security" })
 }
 
 resource "aws_iam_role_policy_attachment" "config" {
@@ -493,7 +493,7 @@ resource "aws_s3_bucket" "config" {
   count  = var.enable_aws_config ? 1 : 0
   bucket = "${var.name_prefix}-config-${data.aws_caller_identity.current.account_id}"
 
-  tags = var.tags
+  tags = merge(var.tags, { Component = "security" })
 }
 
 resource "aws_s3_bucket_versioning" "config" {
@@ -763,7 +763,7 @@ resource "aws_iam_policy" "permission_boundary" {
     ]
   })
 
-  tags = var.tags
+  tags = merge(var.tags, { Component = "security" })
 }
 
 # ==================== CloudTrail ====================
@@ -773,7 +773,7 @@ resource "aws_s3_bucket" "cloudtrail" {
   count  = var.enable_cloudtrail ? 1 : 0
   bucket = "${var.name_prefix}-cloudtrail-${data.aws_caller_identity.current.account_id}"
 
-  tags = var.tags
+  tags = merge(var.tags, { Component = "security" })
 }
 
 resource "aws_s3_bucket_versioning" "cloudtrail" {
@@ -872,7 +872,7 @@ resource "aws_cloudwatch_log_group" "cloudtrail" {
   retention_in_days = local.is_prod ? 365 : 90
   kms_key_id        = var.logs_kms_key_arn
 
-  tags = var.tags
+  tags = merge(var.tags, { Component = "security" })
 }
 
 resource "aws_iam_role" "cloudtrail" {
@@ -890,7 +890,7 @@ resource "aws_iam_role" "cloudtrail" {
     }]
   })
 
-  tags = var.tags
+  tags = merge(var.tags, { Component = "security" })
 }
 
 resource "aws_iam_role_policy" "cloudtrail" {
@@ -928,7 +928,7 @@ resource "aws_cloudtrail" "main" {
     include_management_events = true
   }
 
-  tags = var.tags
+  tags = merge(var.tags, { Component = "security" })
 
   depends_on = [aws_s3_bucket_policy.cloudtrail]
 

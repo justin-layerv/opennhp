@@ -70,6 +70,7 @@ locals {
   # Common tags
   common_tags = merge(var.tags, {
     Module      = "acme-cert"
+    Component   = "acme-cert"
     Environment = var.environment
   })
 }

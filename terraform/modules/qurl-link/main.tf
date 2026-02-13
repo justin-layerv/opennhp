@@ -111,7 +111,8 @@ resource "aws_s3_bucket" "qurl_link" {
   bucket = var.bucket_name
 
   tags = merge(var.tags, {
-    Name = var.bucket_name
+    Name      = var.bucket_name
+    Component = "qurl-link"
   })
 }
 
@@ -156,7 +157,8 @@ resource "aws_s3_bucket" "logs" {
   bucket = "${var.bucket_name}-logs"
 
   tags = merge(var.tags, {
-    Name = "${var.bucket_name}-logs"
+    Name      = "${var.bucket_name}-logs"
+    Component = "qurl-link"
   })
 }
 
@@ -347,7 +349,8 @@ resource "aws_cloudfront_distribution" "qurl_link" {
   }
 
   tags = merge(var.tags, {
-    Name = var.domain_name
+    Name      = var.domain_name
+    Component = "qurl-link"
   })
 }
 
@@ -363,5 +366,5 @@ resource "aws_s3_object" "index" {
   etag          = md5(local.index_html)
   cache_control = "max-age=3600, must-revalidate" # 1 hour, easier to invalidate than 24h default
 
-  tags = var.tags
+  tags = merge(var.tags, { Component = "qurl-link" })
 }
