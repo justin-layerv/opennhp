@@ -91,10 +91,14 @@
         "name": "slo_target",
         "type": "custom",
         "current": {
-          "text": "99.9",
-          "value": "99.9"
+          "text": "99.99",
+          "value": "99.99"
         },
         "options": [
+          {
+            "text": "99.99",
+            "value": "99.99"
+          },
           {
             "text": "99.9",
             "value": "99.9"
@@ -102,10 +106,6 @@
           {
             "text": "99.5",
             "value": "99.5"
-          },
-          {
-            "text": "99.0",
-            "value": "99.0"
           }
         ],
         "label": "SLO Target %"
