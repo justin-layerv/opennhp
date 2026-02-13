@@ -1424,7 +1424,7 @@
       },
       "targets": [
         {
-          "expr": "topk(10, histogram_quantile(0.999, sum(rate(http_server_request_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le, http_route, http_method)) * 1000 > 0)",
+          "expr": "topk(10, histogram_quantile(0.999, sum(rate(http_server_request_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1h])) by (le, http_route, http_method)) * 1000 > 0)",
           "format": "table",
           "instant": true
         }
