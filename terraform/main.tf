@@ -1249,6 +1249,10 @@ module "grafana_dashboards" {
   server_asg_name       = module.compute.asg_name
   ac_asg_name           = var.deploy_ac ? module.ac[0].asg_name : ""
 
+  # NHP Logs dashboard (CloudWatch Logs Insights)
+  server_log_group_name = module.compute.log_group_name
+  ac_log_group_name     = var.deploy_ac ? module.ac[0].log_group_name : ""
+
   # Athena data source for AWS Cost dashboard
   athena_datasource_enabled = var.deploy_cost_analytics
   athena_assume_role_arn    = var.deploy_cost_analytics ? module.cost_analytics[0].grafana_athena_role_arn : ""

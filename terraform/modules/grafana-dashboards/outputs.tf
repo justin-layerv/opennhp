@@ -34,3 +34,8 @@ output "aws_cost_dashboard_url" {
   description = "URL to the AWS Cost dashboard (null if Athena datasource not enabled)"
   value       = var.athena_datasource_enabled ? "${var.grafana_url}/d/${grafana_dashboard.aws_cost[0].uid}" : null
 }
+
+output "nhp_logs_dashboard_url" {
+  description = "URL to the NHP Logs dashboard (null if CloudWatch datasource not enabled)"
+  value       = var.cloudwatch_datasource_enabled ? "${var.grafana_url}/d/${grafana_dashboard.nhp_logs[0].uid}" : null
+}

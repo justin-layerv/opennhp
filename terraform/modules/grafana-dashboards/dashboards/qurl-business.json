@@ -18,7 +18,7 @@
         "enable": true,
         "hide": false,
         "iconColor": "blue",
-        "expr": "changes(process_start_time_seconds{service_name=\"qurl-api\", deployment_environment=\"$environment\"}[2m]) > 0",
+        "expr": "changes(target_info{service_name=\"qurl-api\", deployment_environment=\"$environment\"}[2m]) > 0",
         "step": "60s",
         "titleFormat": "Deployment",
         "textFormat": "Service restarted"
@@ -280,7 +280,7 @@
           "legendFormat": "Tokens Minted"
         },
         {
-          "expr": "sum(increase(qurl_token_validation_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", result=\"valid\"}[24h]))",
+          "expr": "sum(increase(qurl_token_validation_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", result=\"success\"}[24h]))",
           "legendFormat": "Valid Tokens"
         },
         {
@@ -641,17 +641,10 @@
           "format": "table",
           "instant": true,
           "refId": "A"
-        },
-        {
-          "expr": "max by (owner_id, tier) (qurl_quota_limit{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"})",
-          "format": "table",
-          "instant": true,
-          "refId": "B"
         }
       ],
       "transformations": [
-        {"id": "merge"},
-        {"id": "organize", "options": {"renameByName": {"owner_id": "Owner", "tier": "Tier", "Value #A": "Hits (24h)", "Value #B": "Tier Limit"}}}
+        {"id": "organize", "options": {"renameByName": {"owner_id": "Owner", "tier": "Tier", "Value": "Hits (24h)"}}}
       ],
       "fieldConfig": {
         "defaults": {"unit": "short"},
@@ -663,31 +656,27 @@
     },
     {
       "id": 51,
-      "title": "Quota Utilization by Tier",
-      "description": "How close each tier is to its quota limit. Action: If > 80%, consider proactive tier upgrades or quota increases.",
-      "type": "gauge",
+      "title": "Active QURLs by Tier",
+      "description": "Number of currently active QURLs per tier. Compare against quota limits (free: 10, pro: 100) to assess utilization.",
+      "type": "bargauge",
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 40},
       "datasource": {"uid": "${datasource_uid}"},
       "targets": [
         {
-          "expr": "avg by (tier) (qurl_quota_utilization{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"} * 100) or vector(0)",
+          "expr": "sum by (tier) (qurl_resource_active{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}) or vector(0)",
           "legendFormat": "{{tier}}"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "percent",
-          "min": 0,
-          "max": 100,
-          "color": {"mode": "thresholds"},
-          "thresholds": {
-            "steps": [
-              {"color": "green", "value": null},
-              {"color": "yellow", "value": 70},
-              {"color": "red", "value": 90}
-            ]
-          }
+          "unit": "short",
+          "color": {"mode": "palette-classic"}
         }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true
       }
     },
     {
@@ -785,15 +774,15 @@
         },
         {
           "id": 53,
-          "title": "Weekly Active QURLs",
-          "description": "Number of unique QURLs that received at least one access attempt per week. Measures real engagement vs total created.",
+          "title": "Access Activity",
+          "description": "Access grant rate and total active QURLs over time. Shows how actively QURLs are being used.",
           "type": "timeseries",
           "gridPos": {"h": 8, "w": 12, "x": 12, "y": 58},
           "datasource": {"uid": "${datasource_uid}"},
           "targets": [
             {
-              "expr": "count(sum by (resource_id) (increase(qurl_access_granted_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[7d])) > 0) or vector(0)",
-              "legendFormat": "Active QURLs (7d)"
+              "expr": "sum(increase(qurl_access_granted_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[1h]))",
+              "legendFormat": "Accesses (1h)"
             },
             {
               "expr": "sum(qurl_resource_active{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}) or vector(0)",

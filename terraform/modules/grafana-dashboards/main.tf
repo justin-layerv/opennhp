@@ -195,6 +195,19 @@ resource "aws_iam_role_policy" "grafana_cloudwatch" {
         Resource = "*"
       },
       {
+        Sid    = "CloudWatchLogsRead"
+        Effect = "Allow"
+        Action = [
+          "logs:DescribeLogGroups",
+          "logs:GetLogGroupFields",
+          "logs:StartQuery",
+          "logs:StopQuery",
+          "logs:GetQueryResults",
+          "logs:GetLogEvents"
+        ]
+        Resource = "*"
+      },
+      {
         Sid    = "TagsRead"
         Effect = "Allow"
         Action = [
@@ -251,6 +264,16 @@ check "loki_datasource_uid_required" {
   }
 }
 
+check "cloudwatch_log_groups_should_be_set" {
+  assert {
+    condition = !var.cloudwatch_datasource_enabled || (
+      length(var.server_log_group_name) > 0 &&
+      length(var.ac_log_group_name) > 0
+    )
+    error_message = "server_log_group_name and ac_log_group_name should be set when cloudwatch_datasource_enabled is true, otherwise NHP Logs dashboard panels will show no data. Pass these from compute and AC module outputs."
+  }
+}
+
 check "cloudwatch_dimensions_should_be_set" {
   assert {
     condition = !var.cloudwatch_datasource_enabled || (
@@ -262,16 +285,18 @@ check "cloudwatch_dimensions_should_be_set" {
 }
 
 # ==============================================================================
-# NHP Logs Dashboard (Loki)
+# NHP Logs Dashboard (CloudWatch Logs Insights)
 # ==============================================================================
 
 resource "grafana_dashboard" "nhp_logs" {
-  count = var.loki_datasource_enabled ? 1 : 0
+  count = var.cloudwatch_datasource_enabled ? 1 : 0
 
   folder = grafana_folder.nhp[0].uid
   config_json = templatefile("${path.module}/dashboards/nhp-logs.json", {
-    loki_uid    = var.loki_datasource_uid
-    environment = var.environment
+    cloudwatch_uid   = grafana_data_source.cloudwatch[0].uid
+    environment      = var.environment
+    server_log_group = var.server_log_group_name
+    ac_log_group     = var.ac_log_group_name
   })
 
   overwrite = true

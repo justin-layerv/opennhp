@@ -91,6 +91,50 @@ else
       "InstanceId": "$${aws:InstanceId}",
       "AutoScalingGroupName": "$${aws:AutoScalingGroupName}"
     }
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/opt/layerv/nhp-ac/logs/ac-*.log",
+            "log_group_name": "/layerv/nhp/${environment}/ac",
+            "log_stream_name": "{instance_id}/ac",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/opt/layerv/nhp-ac/logs/nhp_accept-*.log",
+            "log_group_name": "/layerv/nhp/${environment}/ac",
+            "log_stream_name": "{instance_id}/nhp-accept",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/opt/layerv/nhp-ac/logs/nhp_deny-*.log",
+            "log_group_name": "/layerv/nhp/${environment}/ac",
+            "log_stream_name": "{instance_id}/nhp-deny",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/opt/layerv/nhp-ac/logs/nhp_forward-*.log",
+            "log_group_name": "/layerv/nhp/${environment}/ac",
+            "log_stream_name": "{instance_id}/nhp-forward",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/var/log/traefik/access.log",
+            "log_group_name": "/layerv/nhp/${environment}/ac",
+            "log_stream_name": "{instance_id}/traefik-access",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/var/log/traefik/traefik.log",
+            "log_group_name": "/layerv/nhp/${environment}/ac",
+            "log_stream_name": "{instance_id}/traefik",
+            "timezone": "UTC"
+          }
+        ]
+      }
+    }
   }
 }
 CWEOF

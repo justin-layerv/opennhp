@@ -24,7 +24,7 @@
         "enable": true,
         "hide": false,
         "iconColor": "blue",
-        "expr": "changes(process_start_time_seconds{service_name=\"qurl-api\", deployment_environment=\"$environment\"}[2m]) > 0",
+        "expr": "changes(target_info{service_name=\"qurl-api\", deployment_environment=\"$environment\"}[2m]) > 0",
         "step": "60s",
         "titleFormat": "Deployment",
         "textFormat": "Service restarted"
@@ -273,8 +273,8 @@
       },
       "targets": [
         {
-          "expr": "sum(qurl_webhook_delivery_pending{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"retrying\"}) or vector(0)",
-          "legendFormat": "Retrying"
+          "expr": "sum(qurl_webhook_delivery_pending{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}) or vector(0)",
+          "legendFormat": "Pending"
         }
       ],
       "fieldConfig": {
@@ -490,7 +490,7 @@
       },
       "targets": [
         {
-          "expr": "sum(qurl_webhook_dlq_depth{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}) or vector(0)",
+          "expr": "sum(qurl_webhook_dlq_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}) or vector(0)",
           "legendFormat": "DLQ"
         }
       ],
@@ -678,8 +678,8 @@
     },
     {
       "id": 13,
-      "title": "Failure Rate by Destination",
-      "description": "Per-destination webhook failure rate. Action: If a single destination dominates failures, contact the destination owner or consider disabling the webhook.",
+      "title": "Failure Rate by Event Type",
+      "description": "Per-event-type webhook failure rate. Action: If a specific event type has high failure rate, check payload format or destination compatibility.",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -692,8 +692,8 @@
       },
       "targets": [
         {
-          "expr": "sum by (destination_host) (rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"failed\"}[5m])) / sum by (destination_host) (rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) * 100",
-          "legendFormat": "{{destination_host}}"
+          "expr": "sum by (event) (rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"failed\"}[5m])) / sum by (event) (rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) * 100",
+          "legendFormat": "{{event}}"
         }
       ],
       "fieldConfig": {
@@ -956,8 +956,8 @@
     },
     {
       "id": 31,
-      "title": "Failure Reasons",
-      "description": "Breakdown of webhook failure reasons over 24 hours. Action: If timeout errors dominate, increase delivery timeout or check destination response times.",
+      "title": "Failures by Event Type",
+      "description": "Breakdown of failed webhook deliveries by event type over 24 hours.",
       "type": "barchart",
       "gridPos": {
         "h": 8,
@@ -970,8 +970,8 @@
       },
       "targets": [
         {
-          "expr": "sum by (error_type) (increase(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"failed\"}[24h]))",
-          "legendFormat": "{{error_type}}",
+          "expr": "sum by (event) (increase(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", status=\"failed\"}[24h]))",
+          "legendFormat": "{{event}}",
           "format": "table",
           "instant": true
         }
@@ -1042,8 +1042,8 @@
     },
     {
       "id": 33,
-      "title": "Response Code Distribution",
-      "description": "HTTP response codes from webhook destinations over time. Action: If 4xx codes dominate, check payload format. If 5xx, destination may be unhealthy.",
+      "title": "Delivery Status Distribution",
+      "description": "Webhook delivery outcomes over time by status (success, failed, abandoned).",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -1056,8 +1056,8 @@
       },
       "targets": [
         {
-          "expr": "sum by (response_code) (rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
-          "legendFormat": "{{response_code}}"
+          "expr": "sum by (status) (rate(qurl_webhook_delivery_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m]))",
+          "legendFormat": "{{status}}"
         }
       ],
       "fieldConfig": {
@@ -1140,11 +1140,11 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
-          "legendFormat": "p95 Attempt Latency"
+          "legendFormat": "p95 Delivery Latency"
         },
         {
-          "expr": "histogram_quantile(0.95, sum(rate(qurl_webhook_e2e_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
-          "legendFormat": "p95 End-to-End Latency"
+          "expr": "histogram_quantile(0.999, sum(rate(qurl_webhook_delivery_duration_seconds_bucket{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[5m])) by (le)) * 1000",
+          "legendFormat": "p999 Delivery Latency"
         }
       ],
       "fieldConfig": {
@@ -1177,7 +1177,7 @@
       },
       "targets": [
         {
-          "expr": "sum(qurl_webhook_dlq_depth{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}) or vector(0)",
+          "expr": "sum(qurl_webhook_dlq_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}) or vector(0)",
           "legendFormat": "DLQ Depth"
         }
       ],
@@ -1264,8 +1264,8 @@
     },
     {
       "id": 40,
-      "title": "Webhooks with Consecutive Failures",
-      "description": "Top 10 webhooks by consecutive failure count. Action: If any webhook exceeds failure threshold, it may be auto-disabled. Contact the destination owner.",
+      "title": "Webhooks with Pending Retries",
+      "description": "Webhooks with pending delivery retries. Action: If retries accumulate, check destination endpoint health.",
       "type": "table",
       "gridPos": {
         "h": 8,
@@ -1278,7 +1278,7 @@
       },
       "targets": [
         {
-          "expr": "topk(10, qurl_webhook_consecutive_failures{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"} > 0)",
+          "expr": "topk(10, qurl_webhook_delivery_pending{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"} > 0)",
           "format": "table",
           "instant": true
         }
@@ -1329,8 +1329,8 @@
     },
     {
       "id": 41,
-      "title": "Recently Disabled Webhooks",
-      "description": "Webhooks disabled in the last 24 hours. Action: Review the disable reason and contact webhook owners to fix their endpoints.",
+      "title": "Currently Disabled Webhooks",
+      "description": "Webhooks currently in disabled state. Action: Review and contact webhook owners to fix their endpoints.",
       "type": "table",
       "gridPos": {
         "h": 8,
@@ -1343,7 +1343,7 @@
       },
       "targets": [
         {
-          "expr": "qurl_webhook_disabled_at{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"} > (time() - 86400)",
+          "expr": "qurl_webhook_disabled{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"} > 0",
           "format": "table",
           "instant": true
         }
@@ -1356,10 +1356,8 @@
               "Time": true
             },
             "renameByName": {
-              "webhook_id": "Webhook ID",
               "owner_id": "Owner",
-              "reason": "Reason",
-              "Value": "Disabled At"
+              "Value": "Count"
             }
           }
         }

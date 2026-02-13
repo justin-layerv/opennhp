@@ -1,7 +1,7 @@
 {
   "uid": "nhp-logs-${environment}",
   "title": "NHP Logs",
-  "description": "NHP server and AC log aggregation via Loki",
+  "description": "NHP server and AC log aggregation via CloudWatch Logs Insights",
   "tags": ["nhp", "logs", "${environment}"],
   "timezone": "browser",
   "editable": true,
@@ -26,15 +26,20 @@
     {
       "id": 2,
       "type": "timeseries",
-      "title": "Log Lines by Component",
-      "description": "Total log volume split by NHP component (server, ac, traefik)",
+      "title": "Server Log Volume",
+      "description": "NHP Server log lines per minute",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
-      "datasource": { "type": "loki", "uid": "${loki_uid}" },
+      "datasource": { "type": "cloudwatch", "uid": "${cloudwatch_uid}" },
       "targets": [
         {
-          "expr": "sum by (component) (count_over_time({job=~\"nhp-.*\", environment=\"${environment}\"} [1m]))",
-          "legendFormat": "{{ component }}",
-          "refId": "A"
+          "refId": "A",
+          "queryMode": "Logs",
+          "logGroupNames": ["${server_log_group}"],
+          "expression": "fields @timestamp, @message\n| stats count(*) as log_lines by bin(1m)",
+          "region": "default",
+          "statsGroups": ["bin(1m)"],
+          "namespace": "",
+          "id": ""
         }
       ],
       "fieldConfig": {
@@ -55,15 +60,54 @@
     {
       "id": 3,
       "type": "timeseries",
-      "title": "Error Log Rate",
-      "description": "Log lines containing ERROR or FATAL level, by component",
+      "title": "AC Log Volume",
+      "description": "NHP AC log lines per minute by stream type (ac, firewall, traefik)",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
-      "datasource": { "type": "loki", "uid": "${loki_uid}" },
+      "datasource": { "type": "cloudwatch", "uid": "${cloudwatch_uid}" },
       "targets": [
         {
-          "expr": "sum by (component) (count_over_time({job=~\"nhp-.*\", environment=\"${environment}\"} |~ \"(?i)(ERROR|FATAL)\" [1m]))",
-          "legendFormat": "{{ component }}",
-          "refId": "A"
+          "refId": "A",
+          "queryMode": "Logs",
+          "logGroupNames": ["${ac_log_group}"],
+          "expression": "fields @timestamp, @logStream\n| parse @logStream \"*/*\" as instance_id, stream_type\n| stats count(*) as log_lines by stream_type, bin(1m)",
+          "region": "default",
+          "statsGroups": ["stream_type", "bin(1m)"],
+          "namespace": "",
+          "id": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 50,
+            "stacking": { "mode": "normal" }
+          },
+          "unit": "short"
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "table", "calcs": ["sum", "mean"] }
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Error Log Rate",
+      "description": "Log lines containing ERROR or FATAL across server and AC",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 9 },
+      "datasource": { "type": "cloudwatch", "uid": "${cloudwatch_uid}" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryMode": "Logs",
+          "logGroupNames": ["${server_log_group}", "${ac_log_group}"],
+          "expression": "fields @timestamp, @message, @logStream\n| filter @message like /(?i)(ERROR|FATAL)/\n| stats count(*) as errors by bin(1m)",
+          "region": "default",
+          "statsGroups": ["bin(1m)"],
+          "namespace": "",
+          "id": ""
         }
       ],
       "fieldConfig": {
@@ -82,53 +126,29 @@
       }
     },
     {
-      "id": 4,
+      "id": 5,
       "type": "row",
       "title": "NHP Server Logs",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
       "collapsed": false
-    },
-    {
-      "id": 5,
-      "type": "logs",
-      "title": "Server Logs",
-      "description": "NHP server log stream with search",
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 10 },
-      "datasource": { "type": "loki", "uid": "${loki_uid}" },
-      "targets": [
-        {
-          "expr": "{job=\"nhp-server\", environment=\"${environment}\"}",
-          "refId": "A"
-        }
-      ],
-      "options": {
-        "showTime": true,
-        "showLabels": true,
-        "showCommonLabels": false,
-        "wrapLogMessage": true,
-        "enableLogDetails": true,
-        "sortOrder": "Descending",
-        "dedupStrategy": "none"
-      }
     },
     {
       "id": 6,
-      "type": "row",
-      "title": "Access Controller Logs",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
-      "collapsed": false
-    },
-    {
-      "id": 7,
       "type": "logs",
-      "title": "AC Logs",
-      "description": "NHP Access Controller log stream with search",
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 23 },
-      "datasource": { "type": "loki", "uid": "${loki_uid}" },
+      "title": "Server Logs",
+      "description": "NHP server log stream",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 18 },
+      "datasource": { "type": "cloudwatch", "uid": "${cloudwatch_uid}" },
       "targets": [
         {
-          "expr": "{job=\"nhp-ac\", environment=\"${environment}\"}",
-          "refId": "A"
+          "refId": "A",
+          "queryMode": "Logs",
+          "logGroupNames": ["${server_log_group}"],
+          "expression": "fields @timestamp, @message, @logStream\n| sort @timestamp desc\n| limit 200",
+          "region": "default",
+          "statsGroups": [],
+          "namespace": "",
+          "id": ""
         }
       ],
       "options": {
@@ -142,24 +162,65 @@
       }
     },
     {
+      "id": 7,
+      "type": "row",
+      "title": "Access Controller Logs",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 30 },
+      "collapsed": false
+    },
+    {
       "id": 8,
+      "type": "logs",
+      "title": "AC Logs",
+      "description": "NHP Access Controller log stream",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 31 },
+      "datasource": { "type": "cloudwatch", "uid": "${cloudwatch_uid}" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryMode": "Logs",
+          "logGroupNames": ["${ac_log_group}"],
+          "expression": "fields @timestamp, @message, @logStream\n| filter @logStream like /\\/ac$/\n| sort @timestamp desc\n| limit 200",
+          "region": "default",
+          "statsGroups": [],
+          "namespace": "",
+          "id": ""
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      }
+    },
+    {
+      "id": 9,
       "type": "row",
       "title": "NHP Firewall Logs",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 43 },
       "collapsed": true,
       "panels": [
         {
-          "id": 9,
+          "id": 10,
           "type": "timeseries",
           "title": "Firewall Actions",
           "description": "NHP-ACCEPT, NHP-DENY, and NHP-FORWARD events from iptables logging",
-          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 36 },
-          "datasource": { "type": "loki", "uid": "${loki_uid}" },
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 44 },
+          "datasource": { "type": "cloudwatch", "uid": "${cloudwatch_uid}" },
           "targets": [
             {
-              "expr": "sum by (action) (count_over_time({job=\"nhp-ac\", environment=\"${environment}\"} |~ \"\\\\[NHP-(ACCEPT|DENY|FORWARD)\\\\]\" | regexp \"\\\\[NHP-(?P<action>\\\\w+)\\\\]\" [1m]))",
-              "legendFormat": "{{ action }}",
-              "refId": "A"
+              "refId": "A",
+              "queryMode": "Logs",
+              "logGroupNames": ["${ac_log_group}"],
+              "expression": "fields @timestamp, @message, @logStream\n| filter @logStream like /nhp-(accept|deny|forward)/\n| parse @logStream \"*/*\" as instance_id, action\n| stats count(*) as events by action, bin(1m)",
+              "region": "default",
+              "statsGroups": ["action", "bin(1m)"],
+              "namespace": "",
+              "id": ""
             }
           ],
           "fieldConfig": {
@@ -174,16 +235,49 @@
           }
         },
         {
-          "id": 10,
+          "id": 11,
           "type": "logs",
           "title": "Firewall Deny Log",
           "description": "All NHP-DENY events (unauthorized access attempts)",
-          "gridPos": { "h": 10, "w": 24, "x": 0, "y": 44 },
-          "datasource": { "type": "loki", "uid": "${loki_uid}" },
+          "gridPos": { "h": 10, "w": 24, "x": 0, "y": 52 },
+          "datasource": { "type": "cloudwatch", "uid": "${cloudwatch_uid}" },
           "targets": [
             {
-              "expr": "{job=\"nhp-ac\", environment=\"${environment}\"} |~ \"\\\\[NHP-DENY\\\\]\"",
-              "refId": "A"
+              "refId": "A",
+              "queryMode": "Logs",
+              "logGroupNames": ["${ac_log_group}"],
+              "expression": "fields @timestamp, @message\n| filter @logStream like /nhp-deny/\n| sort @timestamp desc\n| limit 200",
+              "region": "default",
+              "statsGroups": [],
+              "namespace": "",
+              "id": ""
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "showLabels": true,
+            "wrapLogMessage": true,
+            "enableLogDetails": true,
+            "sortOrder": "Descending"
+          }
+        },
+        {
+          "id": 12,
+          "type": "logs",
+          "title": "Traefik Access Log",
+          "description": "Traefik reverse proxy access logs (HTTP requests to protected resources)",
+          "gridPos": { "h": 10, "w": 24, "x": 0, "y": 62 },
+          "datasource": { "type": "cloudwatch", "uid": "${cloudwatch_uid}" },
+          "targets": [
+            {
+              "refId": "A",
+              "queryMode": "Logs",
+              "logGroupNames": ["${ac_log_group}"],
+              "expression": "fields @timestamp, @message\n| filter @logStream like /traefik-access/\n| sort @timestamp desc\n| limit 200",
+              "region": "default",
+              "statsGroups": [],
+              "namespace": "",
+              "id": ""
             }
           ],
           "options": {

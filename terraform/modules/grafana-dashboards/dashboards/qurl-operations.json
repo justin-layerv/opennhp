@@ -24,7 +24,7 @@
         "enable": true,
         "hide": false,
         "iconColor": "blue",
-        "expr": "changes(process_start_time_seconds{service_name=\"qurl-api\", deployment_environment=\"$environment\"}[2m]) > 0",
+        "expr": "changes(target_info{service_name=\"qurl-api\", deployment_environment=\"$environment\"}[2m]) > 0",
         "step": "60s",
         "titleFormat": "Deployment",
         "textFormat": "Service restarted"
@@ -158,7 +158,7 @@
       },
       "targets": [
         {
-          "expr": "(1 - (sum(increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", http_status_code=~\"5..\"}[30d])) / sum(increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[30d])))) * 100",
+          "expr": "(1 - ((sum(increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", http_status_code=~\"5..\"}[30d])) or vector(0)) / sum(increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[30d])))) * 100",
           "legendFormat": "Availability"
         }
       ],
@@ -206,7 +206,7 @@
       },
       "targets": [
         {
-          "expr": "clamp_min(100 * (1 - ((sum(increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", http_status_code=~\"5..\"}[30d])) / sum(increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[30d]))) / (1 - $slo_target/100))), 0)",
+          "expr": "clamp_min(100 * (1 - (((sum(increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", http_status_code=~\"5..\"}[30d])) or vector(0)) / sum(increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[30d]))) / (1 - $slo_target/100))), 0)",
           "legendFormat": "Budget"
         }
       ],
@@ -700,7 +700,7 @@
           },
           "targets": [
             {
-              "expr": "clamp_min(100 * (1 - ((sum(increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", http_status_code=~\"5..\"}[30d])) / sum(increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[30d]))) / (1 - $slo_target/100))), 0)",
+              "expr": "clamp_min(100 * (1 - (((sum(increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", http_status_code=~\"5..\"}[30d])) or vector(0)) / sum(increase(http_server_request_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\"}[30d]))) / (1 - $slo_target/100))), 0)",
               "legendFormat": "Budget Remaining %"
             }
           ],
@@ -1545,8 +1545,8 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(aws_dynamodb_operation_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", success=\"false\"}[5m])) by (operation)",
-          "legendFormat": "{{operation}}",
+          "expr": "sum(rate(aws_dynamodb_operation_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", success=\"false\"}[5m])) by (operation, table)",
+          "legendFormat": "{{operation}} ({{table}})",
           "exemplar": true
         }
       ],
@@ -1566,8 +1566,8 @@
     },
     {
       "id": 43,
-      "title": "DynamoDB Throttle Events",
-      "description": "DynamoDB throttled requests (ProvisionedThroughputExceededException). Action: If sustained, increase table capacity or enable auto-scaling. Check for hot partition keys.",
+      "title": "DynamoDB Failed Operations",
+      "description": "DynamoDB operations that returned errors (includes throttles, validation errors, etc). Action: If sustained, check table capacity, hot partition keys, or item size limits.",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -1580,8 +1580,8 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(aws_dynamodb_operation_duration_seconds_count{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", error_type=~\".*[Tt]hrottle.*|.*ProvisionedThroughputExceeded.*\"}[5m])) by (operation)",
-          "legendFormat": "{{operation}}",
+          "expr": "sum(rate(aws_dynamodb_operation_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", success=\"false\"}[5m])) by (operation, table)",
+          "legendFormat": "{{operation}} ({{table}})",
           "exemplar": true
         }
       ],
@@ -1640,7 +1640,7 @@
           "exemplar": true
         },
         {
-          "expr": "sum(rate(auth0_jwt_validation_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", result=\"failure\"}[5m]))",
+          "expr": "sum(rate(auth0_jwt_validation_total{service_name=\"qurl-api\", deployment_environment=\"$environment\", cell_id=~\"$cell_id\", result!=\"success\"}[5m]))",
           "legendFormat": "Failure",
           "exemplar": true
         }
@@ -1795,31 +1795,14 @@
             "y": 93
           },
           "datasource": {
+            "type": "tempo",
             "uid": "${tempo_uid}"
           },
           "targets": [
             {
-              "queryType": "traceqlSearch",
-              "filters": [
-                {
-                  "id": "service-name",
-                  "operator": "=",
-                  "scope": "resource",
-                  "tag": "service.name",
-                  "value": [
-                    "qurl-api"
-                  ]
-                },
-                {
-                  "id": "status",
-                  "operator": "=",
-                  "scope": "intrinsic",
-                  "tag": "status",
-                  "value": [
-                    "error"
-                  ]
-                }
-              ],
+              "refId": "A",
+              "queryType": "traceql",
+              "query": "{resource.service.name = \"qurl-api\" && status = error}",
               "limit": 20
             }
           ]
@@ -1835,31 +1818,14 @@
             "y": 103
           },
           "datasource": {
+            "type": "tempo",
             "uid": "${tempo_uid}"
           },
           "targets": [
             {
-              "queryType": "traceqlSearch",
-              "filters": [
-                {
-                  "id": "service-name",
-                  "operator": "=",
-                  "scope": "resource",
-                  "tag": "service.name",
-                  "value": [
-                    "qurl-api"
-                  ]
-                },
-                {
-                  "id": "min-duration",
-                  "operator": ">",
-                  "scope": "intrinsic",
-                  "tag": "duration",
-                  "value": [
-                    "500ms"
-                  ]
-                }
-              ],
+              "refId": "A",
+              "queryType": "traceql",
+              "query": "{resource.service.name = \"qurl-api\" && duration > 500ms}",
               "limit": 20
             }
           ]

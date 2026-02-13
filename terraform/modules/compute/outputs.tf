@@ -48,6 +48,11 @@ output "security_group_id" {
   value       = aws_security_group.server.id
 }
 
+output "log_group_name" {
+  description = "CloudWatch log group name"
+  value       = aws_cloudwatch_log_group.server.name
+}
+
 output "target_group_arn_suffix" {
   description = "Target group ARN suffix for CloudWatch"
   value       = aws_lb_target_group.udp.arn_suffix

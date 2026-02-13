@@ -82,6 +82,20 @@ else
       "InstanceId": "$${aws:InstanceId}",
       "AutoScalingGroupName": "$${aws:AutoScalingGroupName}"
     }
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/opt/layerv/nhp-server/log/server-*.log",
+            "log_group_name": "/layerv/nhp/${environment}/server",
+            "log_stream_name": "{instance_id}/server",
+            "timezone": "UTC"
+          }
+        ]
+      }
+    }
   }
 }
 CWEOF

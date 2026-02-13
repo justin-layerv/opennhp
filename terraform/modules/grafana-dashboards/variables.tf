@@ -151,6 +151,22 @@ variable "ac_asg_name" {
   default     = ""
 }
 
+# ==============================================================================
+# NHP Logs Dashboard (CloudWatch Logs Insights)
+# ==============================================================================
+
+variable "server_log_group_name" {
+  description = "CloudWatch log group name for NHP server logs"
+  type        = string
+  default     = ""
+}
+
+variable "ac_log_group_name" {
+  description = "CloudWatch log group name for NHP AC logs"
+  type        = string
+  default     = ""
+}
+
 variable "tags" {
   description = "Tags to apply to resources"
   type        = map(string)
