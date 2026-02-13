@@ -85,10 +85,14 @@ resource "grafana_data_source" "cloudwatch" {
   type = "cloudwatch"
   name = "CloudWatch"
 
+  # Dashboard query targets use Grafana 11.x+ CloudWatch plugin format:
+  # statistic (singular string), queryMode, metricQueryType, metricEditorMode.
+  # customMetricsNamespaces enables discovery of LayerV/NHP metrics in Grafana UI.
   json_data_encoded = jsonencode({
-    defaultRegion = var.aws_region
-    authType      = "grafana_assume_role"
-    assumeRoleArn = local.cw_role_arn
+    defaultRegion           = var.aws_region
+    authType                = "grafana_assume_role"
+    assumeRoleArn           = local.cw_role_arn
+    customMetricsNamespaces = "LayerV/NHP"
   })
 }
 
