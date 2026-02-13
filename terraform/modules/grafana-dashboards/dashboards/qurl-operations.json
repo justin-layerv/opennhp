@@ -1871,7 +1871,7 @@
                 "uid": "${loki_uid}",
                 "type": "loki"
               },
-              "expr": "{service_name=\"qurl-api\", deployment_environment=\"$environment\"} |~ \"(?i)error\"",
+              "expr": "{service_name=\"qurl-api\", deployment_environment=\"$environment\", detected_level=~\"error|critical|fatal\"}",
               "queryType": "range"
             }
           ],
@@ -1921,8 +1921,8 @@
                 "uid": "${loki_uid}",
                 "type": "loki"
               },
-              "expr": "sum by (level) (rate({service_name=\"qurl-api\", deployment_environment=\"$environment\"} | logfmt | level != \"\" [$__auto]))",
-              "legendFormat": "{{level}}"
+              "expr": "sum by (detected_level) (rate({service_name=\"qurl-api\", deployment_environment=\"$environment\"} [$__auto]))",
+              "legendFormat": "{{detected_level}}"
             }
           ]
         }
