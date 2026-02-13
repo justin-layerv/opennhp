@@ -122,7 +122,7 @@
             "resultReuseEnabled": false
           },
           "format": 1,
-          "rawSQL": "SELECT billing_period,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\nGROUP BY 1\nORDER BY 1 DESC\nLIMIT 3",
+          "rawSQL": "SELECT billing_period,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')\nGROUP BY 1\nORDER BY 1 DESC\nLIMIT 3",
           "refId": "A"
         }
       ]
@@ -154,7 +154,7 @@
         "reduceOptions": {
           "calcs": ["sum"],
           "fields": "",
-          "values": false
+          "values": true
         },
         "tooltip": {
           "mode": "single",
@@ -172,7 +172,7 @@
             "resultReuseEnabled": false
           },
           "format": 1,
-          "rawSQL": "SELECT line_item_usage_account_id AS account,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\nGROUP BY 1\nORDER BY 2 DESC",
+          "rawSQL": "SELECT line_item_usage_account_id AS account,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')\nGROUP BY 1\nORDER BY 2 DESC",
           "refId": "A"
         }
       ]
@@ -289,7 +289,7 @@
             "resultReuseEnabled": false
           },
           "format": 1,
-          "rawSQL": "SELECT date_parse(\n    split_part(identity_time_interval, '/', 1),\n    '%Y-%m-%dT%H:%i:%sZ'\n  ) AS day,\n  product_product_name AS service,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND product_product_name IN (\n    SELECT product_product_name\n    FROM cost_and_usage\n    WHERE billing_period = '$billing_period'\n      AND line_item_line_item_type != 'Tax'\n    GROUP BY 1\n    ORDER BY SUM(line_item_unblended_cost) DESC\n    LIMIT 10\n  )\nGROUP BY 1, 2\nORDER BY 1",
+          "rawSQL": "SELECT date_parse(\n    split_part(identity_time_interval, '/', 1),\n    '%Y-%m-%dT%H:%i:%sZ'\n  ) AS day,\n  product_product_name AS service,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND product_product_name IN (\n    SELECT product_product_name\n    FROM cost_and_usage\n    WHERE billing_period = '$billing_period'\n      AND line_item_line_item_type != 'Tax'\n      AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n    GROUP BY 1\n    ORDER BY SUM(line_item_unblended_cost) DESC\n    LIMIT 10\n  )\nGROUP BY 1, 2\nORDER BY 1",
           "refId": "A"
         }
       ]
@@ -329,7 +329,7 @@
         "reduceOptions": {
           "calcs": ["sum"],
           "fields": "",
-          "values": false
+          "values": true
         },
         "tooltip": {
           "mode": "single",
@@ -347,7 +347,7 @@
             "resultReuseEnabled": false
           },
           "format": 1,
-          "rawSQL": "SELECT product_product_name AS service,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\nGROUP BY 1\nORDER BY 2 DESC\nLIMIT 15",
+          "rawSQL": "SELECT product_product_name AS service,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')\nGROUP BY 1\nORDER BY 2 DESC\nLIMIT 15",
           "refId": "A"
         }
       ]
@@ -379,7 +379,7 @@
         "reduceOptions": {
           "calcs": ["sum"],
           "fields": "",
-          "values": false
+          "values": true
         },
         "tooltip": {
           "mode": "single",
@@ -397,7 +397,7 @@
             "resultReuseEnabled": false
           },
           "format": 1,
-          "rawSQL": "SELECT COALESCE(resource_tags['user:Component'], 'untagged') AS component,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\nGROUP BY 1\nORDER BY 2 DESC",
+          "rawSQL": "SELECT COALESCE(resource_tags['user:Component'], 'untagged') AS component,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')\nGROUP BY 1\nORDER BY 2 DESC",
           "refId": "A"
         }
       ]
@@ -520,7 +520,7 @@
             "resultReuseEnabled": false
           },
           "format": 1,
-          "rawSQL": "SELECT CASE\n    WHEN SUM(CASE WHEN line_item_line_item_type IN ('Usage', 'SavingsPlanCoveredUsage') THEN line_item_unblended_cost ELSE 0 END) = 0 THEN 0\n    ELSE 100.0 * SUM(CASE WHEN line_item_line_item_type = 'SavingsPlanCoveredUsage' THEN line_item_unblended_cost ELSE 0 END)\n      / SUM(CASE WHEN line_item_line_item_type IN ('Usage', 'SavingsPlanCoveredUsage') THEN line_item_unblended_cost ELSE 0 END)\n  END AS coverage_pct\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'",
+          "rawSQL": "SELECT CASE\n    WHEN SUM(CASE WHEN line_item_line_item_type IN ('Usage', 'SavingsPlanCoveredUsage') THEN line_item_unblended_cost ELSE 0 END) = 0 THEN 0\n    ELSE 100.0 * SUM(CASE WHEN line_item_line_item_type = 'SavingsPlanCoveredUsage' THEN line_item_unblended_cost ELSE 0 END)\n      / SUM(CASE WHEN line_item_line_item_type IN ('Usage', 'SavingsPlanCoveredUsage') THEN line_item_unblended_cost ELSE 0 END)\n  END AS coverage_pct\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')",
           "refId": "A"
         }
       ]
