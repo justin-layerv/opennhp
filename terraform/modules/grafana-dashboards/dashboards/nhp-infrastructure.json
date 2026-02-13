@@ -1081,7 +1081,11 @@
           "statistics": [
             "p50"
           ],
-          "dimensions": {},
+          "dimensions": {
+            "Environment": ["$environment"],
+            "Component": ["server"]
+          },
+          "matchExact": false,
           "period": "300",
           "region": "default",
           "label": "p50"
@@ -1093,7 +1097,11 @@
           "statistics": [
             "p95"
           ],
-          "dimensions": {},
+          "dimensions": {
+            "Environment": ["$environment"],
+            "Component": ["server"]
+          },
+          "matchExact": false,
           "period": "300",
           "region": "default",
           "label": "p95"
@@ -1105,7 +1113,11 @@
           "statistics": [
             "p99"
           ],
-          "dimensions": {},
+          "dimensions": {
+            "Environment": ["$environment"],
+            "Component": ["server"]
+          },
+          "matchExact": false,
           "period": "300",
           "region": "default",
           "label": "p99"
@@ -1117,7 +1129,11 @@
           "statistics": [
             "p99.9"
           ],
-          "dimensions": {},
+          "dimensions": {
+            "Environment": ["$environment"],
+            "Component": ["server"]
+          },
+          "matchExact": false,
           "period": "300",
           "region": "default",
           "label": "p999"
@@ -1178,7 +1194,11 @@
           "statistics": [
             "p99.9"
           ],
-          "dimensions": {},
+          "dimensions": {
+            "Environment": ["$environment"],
+            "Component": ["server"]
+          },
+          "matchExact": false,
           "period": "300",
           "region": "default"
         }
@@ -1242,7 +1262,11 @@
           "statistics": [
             "Sum"
           ],
-          "dimensions": {},
+          "dimensions": {
+            "Environment": ["$environment"],
+            "Component": ["server"]
+          },
+          "matchExact": false,
           "period": "300",
           "region": "default",
           "label": "Successes"
@@ -1254,7 +1278,11 @@
           "statistics": [
             "Sum"
           ],
-          "dimensions": {},
+          "dimensions": {
+            "Environment": ["$environment"],
+            "Component": ["server"]
+          },
+          "matchExact": false,
           "period": "300",
           "region": "default",
           "label": "Failures"
@@ -1307,7 +1335,11 @@
           "statistics": [
             "Sum"
           ],
-          "dimensions": {},
+          "dimensions": {
+            "Environment": ["$environment"],
+            "Component": ["server"]
+          },
+          "matchExact": false,
           "period": "300",
           "region": "default"
         }
@@ -1367,7 +1399,11 @@
           "statistics": [
             "Sum"
           ],
-          "dimensions": {},
+          "dimensions": {
+            "Environment": ["$environment"],
+            "Component": ["server"]
+          },
+          "matchExact": false,
           "period": "300",
           "region": "default"
         }
