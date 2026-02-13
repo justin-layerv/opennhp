@@ -961,19 +961,23 @@ resource "aws_iam_policy" "terraform_apply_iam" {
         Sid    = "SecurityServices"
         Effect = "Allow"
         Action = [
-          "guardduty:CreateDetector",
-          "guardduty:DeleteDetector",
-          "guardduty:UpdateDetector",
-          "securityhub:EnableSecurityHub",
-          "securityhub:DisableSecurityHub",
-          "securityhub:EnableImportFindingsForProduct",
-          "securityhub:DisableImportFindingsForProduct",
-          "config:Put*",
           "config:Delete*",
+          "config:Put*",
           "config:Start*",
           "config:Stop*",
           "config:TagResource",
-          "config:UntagResource"
+          "config:UntagResource",
+          "guardduty:CreateDetector",
+          "guardduty:DeleteDetector",
+          "guardduty:TagResource",
+          "guardduty:UntagResource",
+          "guardduty:UpdateDetector",
+          "securityhub:DisableImportFindingsForProduct",
+          "securityhub:DisableSecurityHub",
+          "securityhub:EnableImportFindingsForProduct",
+          "securityhub:EnableSecurityHub",
+          "wafv2:TagResource",
+          "wafv2:UntagResource"
         ]
         Resource = "*"
       },
@@ -1029,8 +1033,8 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "logs:PutRetentionPolicy",
           "logs:AssociateKmsKey",
           "logs:DisassociateKmsKey",
-          "logs:TagLogGroup",
-          "logs:UntagLogGroup",
+          "logs:TagResource",
+          "logs:UntagResource",
           "cloudwatch:PutMetricAlarm",
           "cloudwatch:PutMetricData",
           "cloudwatch:DeleteAlarms",
