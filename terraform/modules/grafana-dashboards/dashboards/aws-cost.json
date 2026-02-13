@@ -46,7 +46,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 1 },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 1 },
       "id": 1,
       "options": {
         "colorMode": "value",
@@ -81,7 +81,7 @@
         "type": "grafana-athena-datasource",
         "uid": "${athena_uid}"
       },
-      "description": "Cost comparison across the last 3 billing periods. Action: If month-over-month growth exceeds 20%, investigate new resources or usage spikes in the Daily Spend Trend.",
+      "description": "Projected end-of-month cost based on average daily spend extrapolated to the full month. Action: If the estimate exceeds your budget, investigate top services and consider scaling down or rightsizing.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -90,28 +90,30 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null }
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 150 },
+              { "color": "red", "value": 600 }
             ]
           },
           "unit": "currencyUSD"
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 1 },
-      "id": 5,
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 1 },
+      "id": 10,
       "options": {
         "colorMode": "value",
-        "graphMode": "area",
+        "graphMode": "none",
         "justifyMode": "auto",
         "orientation": "auto",
         "reduceOptions": {
           "calcs": ["lastNotNull"],
           "fields": "",
-          "values": true
+          "values": false
         },
         "textMode": "auto"
       },
-      "title": "Month-over-Month",
+      "title": "Estimated End-of-Month",
       "type": "stat",
       "targets": [
         {
@@ -122,7 +124,60 @@
             "resultReuseEnabled": false
           },
           "format": 1,
-          "rawSQL": "SELECT billing_period,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')\nGROUP BY 1\nORDER BY 1 DESC\nLIMIT 3",
+          "rawSQL": "SELECT (SUM(line_item_unblended_cost) / COUNT(DISTINCT date_parse(split_part(identity_time_interval, '/', 1), '%Y-%m-%dT%H:%i:%sZ')))\n  * DAY(LAST_DAY_OF_MONTH(DATE(billing_period || '-01'))) AS estimated_eom\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "grafana-athena-datasource",
+        "uid": "${athena_uid}"
+      },
+      "description": "Percentage change in total spend compared to the prior billing period. Action: If growth exceeds 20%, investigate new resources or usage spikes in the Daily Spend Trend.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 10 },
+              { "color": "red", "value": 25 }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 1 },
+      "id": 5,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "title": "Month-over-Month Change",
+      "type": "stat",
+      "targets": [
+        {
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default",
+            "resultReuseEnabled": false
+          },
+          "format": 1,
+          "rawSQL": "WITH selected AS (\n  SELECT SUM(line_item_unblended_cost) AS cost\n  FROM cost_and_usage\n  WHERE billing_period = '$billing_period'\n    AND line_item_line_item_type != 'Tax'\n    AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n    AND ('$service' = 'All' OR product_product_name = '$service')\n),\nprior AS (\n  SELECT SUM(line_item_unblended_cost) AS cost\n  FROM cost_and_usage\n  WHERE billing_period = (\n      SELECT MAX(billing_period) FROM cost_and_usage\n      WHERE billing_period < '$billing_period'\n    )\n    AND line_item_line_item_type != 'Tax'\n    AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n    AND ('$service' = 'All' OR product_product_name = '$service')\n)\nSELECT CASE\n    WHEN (SELECT cost FROM prior) IS NULL OR (SELECT cost FROM prior) = 0 THEN NULL\n    ELSE 100.0 * ((SELECT cost FROM selected) - (SELECT cost FROM prior)) / (SELECT cost FROM prior)\n  END AS pct_change",
           "refId": "A"
         }
       ]
@@ -142,7 +197,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 1 },
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 1 },
       "id": 6,
       "options": {
         "legend": {
@@ -178,12 +233,223 @@
       ]
     },
     {
+      "datasource": {
+        "type": "grafana-athena-datasource",
+        "uid": "${athena_uid}"
+      },
+      "description": "Percentage of monthly budget consumed so far. Set your target budget using the Budget dropdown. Action: If above 80% before mid-month, review top services and consider deferring non-critical workloads.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "max": 150,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 80 },
+              { "color": "red", "value": 100 }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 7 },
+      "id": 18,
+      "options": {
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "title": "Budget vs Actual",
+      "type": "gauge",
+      "targets": [
+        {
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default",
+            "resultReuseEnabled": false
+          },
+          "format": 1,
+          "rawSQL": "SELECT 100.0 * SUM(line_item_unblended_cost) / CAST('$budget' AS DOUBLE) AS budget_pct\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "grafana-athena-datasource",
+        "uid": "${athena_uid}"
+      },
+      "description": "Dollar split between on-demand usage and Savings Plan covered usage. Action: If on-demand dominates, evaluate purchasing Savings Plans for consistently used services to reduce costs by up to 30%.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 7 },
+      "id": 19,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": ["value", "percent"]
+        },
+        "pieType": "donut",
+        "reduceOptions": {
+          "calcs": ["sum"],
+          "fields": "",
+          "values": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "title": "On-Demand vs SP Covered",
+      "type": "piechart",
+      "targets": [
+        {
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default",
+            "resultReuseEnabled": false
+          },
+          "format": 1,
+          "rawSQL": "SELECT CASE line_item_line_item_type\n    WHEN 'Usage' THEN 'On-Demand'\n    WHEN 'SavingsPlanCoveredUsage' THEN 'SP Covered'\n  END AS category,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type IN ('Usage', 'SavingsPlanCoveredUsage')\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')\nGROUP BY 1\nORDER BY 2 DESC",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "grafana-athena-datasource",
+        "uid": "${athena_uid}"
+      },
+      "description": "Percentage of eligible on-demand usage covered by Savings Plans. Higher coverage means more savings. Action: If coverage is low or 0%, evaluate purchasing Savings Plans for consistently used services like EC2 or Fargate.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 30 },
+              { "color": "green", "value": 70 }
+            ]
+          },
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 7 },
+      "id": 9,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "title": "Savings Plan Coverage",
+      "type": "stat",
+      "targets": [
+        {
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default",
+            "resultReuseEnabled": false
+          },
+          "format": 1,
+          "rawSQL": "SELECT CASE\n    WHEN SUM(CASE WHEN line_item_line_item_type IN ('Usage', 'SavingsPlanCoveredUsage') THEN line_item_unblended_cost ELSE 0 END) = 0 THEN 0\n    ELSE 100.0 * SUM(CASE WHEN line_item_line_item_type = 'SavingsPlanCoveredUsage' THEN line_item_unblended_cost ELSE 0 END)\n      / SUM(CASE WHEN line_item_line_item_type IN ('Usage', 'SavingsPlanCoveredUsage') THEN line_item_unblended_cost ELSE 0 END)\n  END AS coverage_pct\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')",
+          "refId": "A"
+        }
+      ]
+    },
+    {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 7 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
       "id": 101,
       "title": "Trends",
       "type": "row",
       "panels": []
+    },
+    {
+      "datasource": {
+        "type": "grafana-athena-datasource",
+        "uid": "${athena_uid}"
+      },
+      "description": "Total monthly spend over the last 6 billing periods. Shows the cost trajectory at a glance. Action: If the trend is consistently rising, investigate which services or accounts are driving the increase.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "gradientMode": "scheme",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "stacking": { "group": "A", "mode": "none" }
+          },
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 14 },
+      "id": 20,
+      "options": {
+        "legend": { "calcs": ["sum"], "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
+      "timeFrom": "now-7M",
+      "title": "Rolling 6-Month Spend",
+      "type": "timeseries",
+      "targets": [
+        {
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default",
+            "resultReuseEnabled": false
+          },
+          "format": 1,
+          "rawSQL": "SELECT date_parse(billing_period || '-01', '%Y-%m-%d') AS month,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')\nGROUP BY 1\nORDER BY 1 DESC\nLIMIT 6",
+          "refId": "A"
+        }
+      ]
     },
     {
       "datasource": {
@@ -222,7 +488,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 22 },
       "id": 2,
       "options": {
         "legend": { "calcs": ["sum"], "displayMode": "list", "placement": "bottom" },
@@ -272,7 +538,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 16 },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 30 },
       "id": 8,
       "options": {
         "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "right" },
@@ -295,8 +561,58 @@
       ]
     },
     {
+      "datasource": {
+        "type": "grafana-athena-datasource",
+        "uid": "${athena_uid}"
+      },
+      "description": "Daily cost stacked by AWS account. Shows which accounts drive daily spend. Action: If one account shows a sudden spike, filter by that account to identify the responsible service.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "gradientMode": "none",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "stacking": { "group": "A", "mode": "normal" }
+          },
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 40 },
+      "id": 12,
+      "options": {
+        "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "right" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "title": "Daily Spend by Account",
+      "type": "timeseries",
+      "targets": [
+        {
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default",
+            "resultReuseEnabled": false
+          },
+          "format": 1,
+          "rawSQL": "SELECT date_parse(\n    split_part(identity_time_interval, '/', 1),\n    '%Y-%m-%dT%H:%i:%sZ'\n  ) AS day,\n  line_item_usage_account_id AS account,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')\nGROUP BY 1, 2\nORDER BY 1",
+          "refId": "A"
+        }
+      ]
+    },
+    {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 50 },
       "id": 102,
       "title": "Breakdown",
       "type": "row",
@@ -317,7 +633,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 27 },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 51 },
       "id": 3,
       "options": {
         "legend": {
@@ -367,7 +683,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 27 },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 51 },
       "id": 7,
       "options": {
         "legend": {
@@ -403,12 +719,331 @@
       ]
     },
     {
+      "datasource": {
+        "type": "grafana-athena-datasource",
+        "uid": "${athena_uid}"
+      },
+      "description": "Cost distribution across AWS regions. Regionless services (e.g., Route 53, CloudFront) appear as 'global'. Action: If unexpected regions appear, investigate resources provisioned outside your primary region.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 10, "w": 8, "x": 0, "y": 61 },
+      "id": 13,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": ["value", "percent"]
+        },
+        "pieType": "donut",
+        "reduceOptions": {
+          "calcs": ["sum"],
+          "fields": "",
+          "values": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "title": "Spend by Region",
+      "type": "piechart",
+      "targets": [
+        {
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default",
+            "resultReuseEnabled": false
+          },
+          "format": 1,
+          "rawSQL": "SELECT COALESCE(NULLIF(product_region, ''), 'global') AS region,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')\nGROUP BY 1\nORDER BY 2 DESC",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "grafana-athena-datasource",
+        "uid": "${athena_uid}"
+      },
+      "description": "Cost breakdown by the Environment tag. Untagged resources appear as 'untagged'. Action: If a significant portion is untagged, apply Environment tags to improve cost attribution across sandbox, production, and management accounts.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 10, "w": 8, "x": 8, "y": 61 },
+      "id": 14,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": ["value"]
+        },
+        "pieType": "donut",
+        "reduceOptions": {
+          "calcs": ["sum"],
+          "fields": "",
+          "values": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "title": "Spend by Environment Tag",
+      "type": "piechart",
+      "targets": [
+        {
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default",
+            "resultReuseEnabled": false
+          },
+          "format": 1,
+          "rawSQL": "SELECT COALESCE(resource_tags['user:Environment'], 'untagged') AS environment,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')\nGROUP BY 1\nORDER BY 2 DESC",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "grafana-athena-datasource",
+        "uid": "${athena_uid}"
+      },
+      "description": "Breakdown of costs by line item type (Usage, Tax, SavingsPlanCoveredUsage, SavingsPlanNegation, etc.). Action: Helps understand the composition of your bill and the impact of Savings Plans, credits, and discounts.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 10, "w": 8, "x": 16, "y": 61 },
+      "id": 15,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": ["value", "percent"]
+        },
+        "pieType": "donut",
+        "reduceOptions": {
+          "calcs": ["sum"],
+          "fields": "",
+          "values": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "title": "Cost by Line Item Type",
+      "type": "piechart",
+      "targets": [
+        {
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default",
+            "resultReuseEnabled": false
+          },
+          "format": 1,
+          "rawSQL": "SELECT line_item_line_item_type AS line_item_type,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')\nGROUP BY 1\nORDER BY 2 DESC",
+          "refId": "A"
+        }
+      ]
+    },
+    {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 37 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 71 },
       "id": 103,
       "title": "Details",
       "type": "row",
       "panels": []
+    },
+    {
+      "datasource": {
+        "type": "grafana-athena-datasource",
+        "uid": "${athena_uid}"
+      },
+      "description": "Services with the largest absolute dollar change compared to the prior billing period. Shows which services are driving cost increases or decreases. Action: Investigate services with large positive changes for unexpected growth.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "current_cost" },
+            "properties": [
+              { "id": "unit", "value": "currencyUSD" },
+              { "id": "custom.align", "value": "right" },
+              { "id": "decimals", "value": 2 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "prior_cost" },
+            "properties": [
+              { "id": "unit", "value": "currencyUSD" },
+              { "id": "custom.align", "value": "right" },
+              { "id": "decimals", "value": 2 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "change" },
+            "properties": [
+              { "id": "unit", "value": "currencyUSD" },
+              { "id": "custom.align", "value": "right" },
+              { "id": "decimals", "value": 2 },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "mode": "basic",
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green", "value": null },
+                    { "color": "yellow", "value": 5 },
+                    { "color": "red", "value": 25 }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "pct_change" },
+            "properties": [
+              { "id": "unit", "value": "percent" },
+              { "id": "custom.align", "value": "right" },
+              { "id": "decimals", "value": 1 }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 72 },
+      "id": 21,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "enablePagination": false,
+          "fields": "",
+          "reducer": ["sum"],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": [
+          { "desc": true, "displayName": "change" }
+        ]
+      },
+      "title": "Top Cost Movers",
+      "type": "table",
+      "targets": [
+        {
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default",
+            "resultReuseEnabled": false
+          },
+          "format": 1,
+          "rawSQL": "WITH current_period AS (\n  SELECT product_product_name AS service,\n    SUM(line_item_unblended_cost) AS cost\n  FROM cost_and_usage\n  WHERE billing_period = '$billing_period'\n    AND line_item_line_item_type != 'Tax'\n    AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  GROUP BY 1\n),\nprior_bp AS (\n  SELECT MAX(billing_period) AS bp\n  FROM cost_and_usage\n  WHERE billing_period < '$billing_period'\n),\nprior_period AS (\n  SELECT product_product_name AS service,\n    SUM(line_item_unblended_cost) AS cost\n  FROM cost_and_usage\n  WHERE billing_period = (SELECT bp FROM prior_bp)\n    AND line_item_line_item_type != 'Tax'\n    AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  GROUP BY 1\n)\nSELECT COALESCE(c.service, p.service) AS service,\n  COALESCE(c.cost, 0) AS current_cost,\n  COALESCE(p.cost, 0) AS prior_cost,\n  COALESCE(c.cost, 0) - COALESCE(p.cost, 0) AS change,\n  CASE WHEN COALESCE(p.cost, 0) = 0 THEN NULL\n    ELSE 100.0 * (COALESCE(c.cost, 0) - COALESCE(p.cost, 0)) / p.cost\n  END AS pct_change\nFROM current_period c\nFULL OUTER JOIN prior_period p ON c.service = p.service\nORDER BY ABS(COALESCE(c.cost, 0) - COALESCE(p.cost, 0)) DESC\nLIMIT 10",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "grafana-athena-datasource",
+        "uid": "${athena_uid}"
+      },
+      "description": "Costs for always-on infrastructure that bills continuously regardless of traffic: NAT Gateways, load balancers, EBS volumes, Elastic IPs, KMS keys, and VPC endpoints. This is the floor of your AWS bill. Action: Review whether all always-on resources are still needed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "cost" },
+            "properties": [
+              { "id": "unit", "value": "currencyUSD" },
+              { "id": "custom.align", "value": "right" },
+              { "id": "decimals", "value": 2 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "usage_amount" },
+            "properties": [
+              { "id": "custom.align", "value": "right" },
+              { "id": "decimals", "value": 1 }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 72 },
+      "id": 22,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "enablePagination": true,
+          "fields": "",
+          "reducer": ["sum"],
+          "show": true
+        },
+        "showHeader": true,
+        "sortBy": [
+          { "desc": true, "displayName": "cost" }
+        ]
+      },
+      "title": "Always-On Infrastructure Costs",
+      "type": "table",
+      "targets": [
+        {
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default",
+            "resultReuseEnabled": false
+          },
+          "format": 1,
+          "rawSQL": "SELECT product_product_name AS service,\n  line_item_usage_type AS usage_type,\n  SUM(line_item_unblended_cost) AS cost,\n  SUM(line_item_usage_amount) AS usage_amount,\n  pricing_unit\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND (\n    line_item_usage_type LIKE '%NatGateway%'\n    OR line_item_usage_type LIKE '%IdleAddress%'\n    OR line_item_usage_type LIKE '%ElasticIP%'\n    OR line_item_usage_type LIKE '%EBS:VolumeUsage%'\n    OR line_item_usage_type LIKE '%EBS:SnapshotUsage%'\n    OR line_item_usage_type LIKE '%LoadBalancerUsage%'\n    OR line_item_usage_type LIKE '%KMS%'\n    OR line_item_usage_type LIKE '%VpcEndpoint%'\n    OR line_item_usage_type LIKE '%Endpoint-Hour%'\n  )\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\nGROUP BY 1, 2, 5\nHAVING SUM(line_item_unblended_cost) > 0\nORDER BY 3 DESC\nLIMIT 25",
+          "refId": "A"
+        }
+      ]
     },
     {
       "datasource": {
@@ -438,7 +1073,7 @@
           }
         ]
       },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 38 },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 82 },
       "id": 4,
       "options": {
         "cellHeight": "sm",
@@ -475,42 +1110,54 @@
         "type": "grafana-athena-datasource",
         "uid": "${athena_uid}"
       },
-      "description": "Percentage of eligible on-demand usage covered by Savings Plans. Higher coverage means more savings. Action: If coverage is low or 0%, evaluate purchasing Savings Plans for consistently used services like EC2 or Fargate.",
+      "description": "Data transfer costs broken down by service and usage type. Helps identify cross-region, cross-AZ, and internet egress transfer costs. Action: If transfer costs are high, consider VPC endpoints, CloudFront, or co-locating resources.",
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "thresholds"
+            "mode": "palette-classic"
           },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "yellow", "value": 30 },
-              { "color": "green", "value": 70 }
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "cost" },
+            "properties": [
+              { "id": "unit", "value": "currencyUSD" },
+              { "id": "custom.align", "value": "right" },
+              { "id": "decimals", "value": 2 }
             ]
           },
-          "unit": "percent",
-          "min": 0,
-          "max": 100
-        },
-        "overrides": []
+          {
+            "matcher": { "id": "byName", "options": "usage_amount" },
+            "properties": [
+              { "id": "custom.align", "value": "right" },
+              { "id": "decimals", "value": 2 }
+            ]
+          }
+        ]
       },
-      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 48 },
-      "id": 9,
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 92 },
+      "id": 16,
       "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": ["lastNotNull"],
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "enablePagination": true,
           "fields": "",
-          "values": false
+          "reducer": ["sum"],
+          "show": true
         },
-        "textMode": "auto"
+        "showHeader": true,
+        "sortBy": [
+          { "desc": true, "displayName": "cost" }
+        ]
       },
-      "title": "Savings Plan Coverage",
-      "type": "stat",
+      "title": "Data Transfer Costs",
+      "type": "table",
       "targets": [
         {
           "connectionArgs": {
@@ -520,7 +1167,74 @@
             "resultReuseEnabled": false
           },
           "format": 1,
-          "rawSQL": "SELECT CASE\n    WHEN SUM(CASE WHEN line_item_line_item_type IN ('Usage', 'SavingsPlanCoveredUsage') THEN line_item_unblended_cost ELSE 0 END) = 0 THEN 0\n    ELSE 100.0 * SUM(CASE WHEN line_item_line_item_type = 'SavingsPlanCoveredUsage' THEN line_item_unblended_cost ELSE 0 END)\n      / SUM(CASE WHEN line_item_line_item_type IN ('Usage', 'SavingsPlanCoveredUsage') THEN line_item_unblended_cost ELSE 0 END)\n  END AS coverage_pct\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')",
+          "rawSQL": "SELECT product_product_name AS service,\n  line_item_usage_type AS usage_type,\n  SUM(line_item_unblended_cost) AS cost,\n  SUM(line_item_usage_amount) AS usage_amount\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND line_item_usage_type LIKE '%DataTransfer%'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')\nGROUP BY 1, 2\nHAVING SUM(line_item_unblended_cost) > 0\nORDER BY 3 DESC\nLIMIT 30",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "grafana-athena-datasource",
+        "uid": "${athena_uid}"
+      },
+      "description": "EC2 costs broken down by instance type. Helps identify rightsizing opportunities and the most expensive instance families. Note: This panel always shows EC2 costs regardless of the Service filter. Action: If large instance types dominate, evaluate downsizing or switching to Graviton (ARM) instances.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "cost" },
+            "properties": [
+              { "id": "unit", "value": "currencyUSD" },
+              { "id": "custom.align", "value": "right" },
+              { "id": "decimals", "value": 2 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "usage_hours" },
+            "properties": [
+              { "id": "custom.align", "value": "right" },
+              { "id": "decimals", "value": 1 }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 92 },
+      "id": 17,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "enablePagination": true,
+          "fields": "",
+          "reducer": ["sum"],
+          "show": true
+        },
+        "showHeader": true,
+        "sortBy": [
+          { "desc": true, "displayName": "cost" }
+        ]
+      },
+      "title": "EC2 Instance Type Costs",
+      "type": "table",
+      "targets": [
+        {
+          "connectionArgs": {
+            "catalog": "__default",
+            "database": "__default",
+            "region": "__default",
+            "resultReuseEnabled": false
+          },
+          "format": 1,
+          "rawSQL": "SELECT COALESCE(NULLIF(product_instance_type, ''), 'other') AS instance_type,\n  line_item_usage_type AS usage_type,\n  SUM(line_item_unblended_cost) AS cost,\n  SUM(line_item_usage_amount) AS usage_hours\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND line_item_product_code = 'AmazonEC2'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\nGROUP BY 1, 2\nHAVING SUM(line_item_unblended_cost) > 0\nORDER BY 3 DESC\nLIMIT 30",
           "refId": "A"
         }
       ]
@@ -603,6 +1317,14 @@
         },
         "refresh": 1,
         "type": "query",
+        "sort": 0
+      },
+      {
+        "current": {},
+        "name": "budget",
+        "label": "Monthly Budget ($)",
+        "query": "100,150,200,300,500,1000",
+        "type": "custom",
         "sort": 0
       }
     ]
