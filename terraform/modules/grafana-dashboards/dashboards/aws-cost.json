@@ -124,7 +124,7 @@
             "resultReuseEnabled": false
           },
           "format": 1,
-          "rawSQL": "SELECT (SUM(line_item_unblended_cost) / COUNT(DISTINCT date_parse(split_part(identity_time_interval, '/', 1), '%Y-%m-%dT%H:%i:%sZ')))\n  * DAY(LAST_DAY_OF_MONTH(DATE(billing_period || '-01'))) AS estimated_eom\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')",
+          "rawSQL": "SELECT (SUM(line_item_unblended_cost) / COUNT(DISTINCT date_parse(split_part(identity_time_interval, '/', 1), '%Y-%m-%dT%H:%i:%sZ')))\n  * DAY(LAST_DAY_OF_MONTH(DATE(MAX(billing_period) || '-01'))) AS estimated_eom\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')",
           "refId": "A"
         }
       ]
