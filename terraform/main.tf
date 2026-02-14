@@ -1285,6 +1285,7 @@ module "grafana_dashboards" {
   # NHP Logs dashboard (CloudWatch Logs Insights)
   server_log_group_name = module.compute.log_group_name
   ac_log_group_name     = var.deploy_ac ? module.ac[0].log_group_name : ""
+  qurl_log_group_name   = var.deploy_qurl_service ? module.qurl_service[0].log_group_name : ""
 
   # Athena data source for AWS Cost dashboard
   athena_datasource_enabled = var.deploy_cost_analytics

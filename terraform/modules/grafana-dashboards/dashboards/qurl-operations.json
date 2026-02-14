@@ -1852,11 +1852,11 @@
         {
           "id": 111,
           "title": "Recent Error Logs",
-          "description": "Error-level log entries from QURL API service. Shows the most recent errors with timestamp, level, and message. Action: investigate recurring errors or error spikes after deployments.",
+          "description": "Error-level log entries from the QURL API service. Shows the most recent errors with timestamp and message. Action: investigate recurring errors or error spikes after deployments.",
           "type": "logs",
           "datasource": {
-            "uid": "${loki_uid}",
-            "type": "loki"
+            "type": "cloudwatch",
+            "uid": "${cloudwatch_uid}"
           },
           "gridPos": {
             "h": 12,
@@ -1867,12 +1867,13 @@
           "targets": [
             {
               "refId": "A",
-              "datasource": {
-                "uid": "${loki_uid}",
-                "type": "loki"
-              },
-              "expr": "{service_name=\"qurl-api\", deployment_environment=\"$environment\", detected_level=~\"error|critical|fatal\"}",
-              "queryType": "range"
+              "queryMode": "Logs",
+              "logGroupNames": ["${qurl_log_group}"],
+              "expression": "fields @timestamp, @message\n| filter @message like /(?i)(ERROR|FATAL|panic)/\n| sort @timestamp desc\n| limit 200",
+              "region": "default",
+              "statsGroups": [],
+              "namespace": "",
+              "id": ""
             }
           ],
           "options": {
@@ -1887,12 +1888,12 @@
         },
         {
           "id": 112,
-          "title": "Log Volume by Level",
-          "description": "Rate of log entries by severity level. Useful for spotting error spikes or unusual log volume after deployments.",
+          "title": "QURL Log Volume",
+          "description": "QURL API service log lines per 5 minutes. Useful for spotting error spikes or unusual log volume after deployments.",
           "type": "timeseries",
           "datasource": {
-            "uid": "${loki_uid}",
-            "type": "loki"
+            "type": "cloudwatch",
+            "uid": "${cloudwatch_uid}"
           },
           "gridPos": {
             "h": 8,
@@ -1906,25 +1907,31 @@
                 "mode": "palette-classic"
               },
               "custom": {
-                "lineWidth": 1,
-                "fillOpacity": 30,
+                "drawStyle": "bars",
+                "fillOpacity": 50,
                 "stacking": {
                   "mode": "normal"
                 }
-              }
+              },
+              "unit": "short"
             }
           },
           "targets": [
             {
               "refId": "A",
-              "datasource": {
-                "uid": "${loki_uid}",
-                "type": "loki"
-              },
-              "expr": "sum by (detected_level) (rate({service_name=\"qurl-api\", deployment_environment=\"$environment\"} [$__auto]))",
-              "legendFormat": "{{detected_level}}"
+              "queryMode": "Logs",
+              "logGroupNames": ["${qurl_log_group}"],
+              "expression": "fields @timestamp, @message\n| stats count(*) as log_lines by bin(5m)",
+              "region": "default",
+              "statsGroups": ["bin(5m)"],
+              "namespace": "",
+              "id": ""
             }
-          ]
+          ],
+          "options": {
+            "tooltip": { "mode": "multi" },
+            "legend": { "displayMode": "table", "calcs": ["sum", "mean"] }
+          }
         }
       ]
     }

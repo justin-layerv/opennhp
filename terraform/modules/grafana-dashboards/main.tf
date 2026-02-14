@@ -39,7 +39,8 @@ resource "grafana_dashboard" "operations" {
   config_json = templatefile("${path.module}/dashboards/qurl-operations.json", {
     datasource_uid = var.prometheus_datasource_uid
     tempo_uid      = var.tempo_datasource_uid
-    loki_uid       = var.loki_datasource_uid
+    cloudwatch_uid = var.cloudwatch_datasource_enabled ? grafana_data_source.cloudwatch[0].uid : ""
+    qurl_log_group = var.qurl_log_group_name
     environment    = var.environment
   })
 
@@ -104,7 +105,7 @@ resource "grafana_data_source" "cloudwatch" {
 }
 
 resource "grafana_folder" "nhp" {
-  count                        = (var.cloudwatch_datasource_enabled || var.athena_datasource_enabled || var.loki_datasource_enabled) ? 1 : 0
+  count                        = (var.cloudwatch_datasource_enabled || var.athena_datasource_enabled) ? 1 : 0
   uid                          = "nhp"
   title                        = var.nhp_folder_name
   prevent_destroy_if_not_empty = true
@@ -268,13 +269,6 @@ resource "grafana_dashboard" "aws_cost" {
 # Input Validation
 # ==============================================================================
 
-check "loki_datasource_uid_required" {
-  assert {
-    condition     = !var.loki_datasource_enabled || length(var.loki_datasource_uid) > 0
-    error_message = "loki_datasource_uid must be set when loki_datasource_enabled is true."
-  }
-}
-
 check "cloudwatch_log_groups_should_be_set" {
   assert {
     condition = !var.cloudwatch_datasource_enabled || (
@@ -282,6 +276,13 @@ check "cloudwatch_log_groups_should_be_set" {
       length(var.ac_log_group_name) > 0
     )
     error_message = "server_log_group_name and ac_log_group_name should be set when cloudwatch_datasource_enabled is true, otherwise NHP Logs dashboard panels will show no data. Pass these from compute and AC module outputs."
+  }
+}
+
+check "qurl_log_group_should_be_set" {
+  assert {
+    condition     = !var.cloudwatch_datasource_enabled || length(var.qurl_log_group_name) > 0
+    error_message = "qurl_log_group_name should be set when cloudwatch_datasource_enabled is true, otherwise QURL Operations dashboard log panels will show no data. Pass this from qurl_service module output."
   }
 }
 

@@ -25,18 +25,6 @@ variable "tempo_datasource_uid" {
   default     = "grafanacloud-traces"
 }
 
-variable "loki_datasource_uid" {
-  description = "UID of the Loki datasource in Grafana Cloud"
-  type        = string
-  default     = "grafanacloud-logs"
-}
-
-variable "loki_datasource_enabled" {
-  description = "Enable NHP Logs dashboard (requires Loki datasource in Grafana Cloud)"
-  type        = bool
-  default     = false
-}
-
 variable "folder_name" {
   description = "Grafana folder name for QURL dashboards"
   type        = string
@@ -163,6 +151,12 @@ variable "server_log_group_name" {
 
 variable "ac_log_group_name" {
   description = "CloudWatch log group name for NHP AC logs"
+  type        = string
+  default     = ""
+}
+
+variable "qurl_log_group_name" {
+  description = "CloudWatch log group name for QURL API service logs"
   type        = string
   default     = ""
 }
