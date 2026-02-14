@@ -1,29 +1,42 @@
 name: Promote to Production
 
-# Promotion-only deployment workflow. No rebuild — deploys existing sandbox ECR images to prod.
+# Enterprise-grade promotion workflow. Deploys existing sandbox ECR images to prod
+# using proven deployment mechanisms (canary for server/AC, ECS task def for QURL).
 #
-# This workflow:
-# 1. Verifies images exist in sandbox ECR (preflight)
-# 2. Runs terraform apply to create/update prod infrastructure
-# 3. Updates SSM image tags and triggers instance refresh
-# 4. Validates the deployment (NLB, ASG, etcd, secrets)
+# Deployment flow:
+#   manifest ──→ preflight (approval gate) ──→ terraform-apply
+#     ──→ deploy-server (canary) ──→ deploy-ac (canary) ──→ deploy-qurl (ECS)
+#     ──→ smoke-test ──→ monitor ──→ finalize
 #
-# First-time usage:
+# Usage:
+#   # Standard promotion
+#   gh workflow run promote-to-prod.yml --ref main \
+#     -f image_tag=<commit-sha>
+#
+#   # First-time (with infrastructure)
 #   gh workflow run promote-to-prod.yml --ref main \
 #     -f image_tag=<commit-sha> -f run_terraform=true
 #
-# Rollback procedure:
-#   Re-run the workflow with the previous known-good image tag:
+#   # QURL-only deployment
 #   gh workflow run promote-to-prod.yml --ref main \
-#     -f image_tag=<previous-commit-sha> -f run_terraform=false
-#   This updates SSM parameters and triggers instance refresh to roll back.
+#     -f image_tag=<any-valid-sha> -f deploy_server=false -f deploy_ac=false \
+#     -f deploy_qurl=true -f qurl_image_tag=<qurl-tag>
+#
+#   # Rollback to previous known-good state
+#   gh workflow run promote-to-prod.yml --ref main \
+#     -f image_tag=<any-valid-sha> -f rollback=true
 
 on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: 'Commit SHA of images already in sandbox ECR'
+        description: 'Commit SHA for NHP Server + AC images in sandbox ECR'
         required: true
+        type: string
+      qurl_image_tag:
+        description: 'QURL service image tag (reads from sandbox SSM if empty)'
+        required: false
+        default: ''
         type: string
       run_terraform:
         description: 'Run terraform apply (required for first deploy or infra changes)'
@@ -31,19 +44,40 @@ on:
         default: true
         type: boolean
       deploy_server:
-        description: 'Deploy NHP Server (SSM update + instance refresh)'
+        description: 'Deploy NHP Server via canary'
         required: true
         default: true
         type: boolean
       deploy_ac:
-        description: 'Deploy Access Controller (SSM update + instance refresh)'
+        description: 'Deploy Access Controller via canary'
         required: true
         default: true
+        type: boolean
+      deploy_qurl:
+        description: 'Deploy QURL Service via ECS task definition'
+        required: true
+        default: true
+        type: boolean
+      cell_id:
+        description: 'Target cell identifier'
+        required: false
+        default: 'cell0'
+        type: string
+      rollback:
+        description: 'Rollback to previous deployed-commit from SSM'
+        required: false
+        default: false
+        type: boolean
+      force_unlock:
+        description: 'Force-release a stale deployment lock (e.g., from a cancelled workflow)'
+        required: false
+        default: false
         type: boolean
 
 permissions:
   id-token: write
   contents: read
+  actions: write  # needed for gh workflow run dispatch
 
 concurrency:
   group: promote-to-prod
@@ -52,23 +86,28 @@ concurrency:
 env:
   AWS_REGION: us-east-2
   TF_VERSION: '1.14.3'
-  # Production environment constants (centralized for easy updates)
   PROD_MGMT_ACCOUNT_ID: '165115313779'
   PROD_ACCOUNT_ID: '235500187906'
+  SANDBOX_ACCOUNT_ID: '767397897469'
   ECR_SERVER_REPO: 'layerv/nhp-server'
   ECR_AC_REPO: 'layerv/nhp-ac'
+  ECR_QURL_REPO: 'layerv/nhp-qurl'
+  PROD_SSM_PREFIX: 'layerv-nhp-prod'
 
 jobs:
   # =============================================================================
-  # PREFLIGHT - Verify prerequisites exist before spending time on TF apply
+  # MANIFEST - Pre-approval promotion summary (NO environment gate)
   # =============================================================================
-  preflight:
-    name: Preflight Checks
+  manifest:
+    name: Promotion Manifest
     runs-on: ubuntu-latest
-    environment: production
     timeout-minutes: 10
+    outputs:
+      qurl_image_tag: ${{ steps.resolve-qurl-tag.outputs.qurl_image_tag }}
+      effective_image_tag: ${{ steps.resolve-rollback.outputs.effective_image_tag }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
     steps:
-      - name: Checkout code (for git verification)
+      - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
@@ -87,6 +126,383 @@ jobs:
           fi
           echo "Image tag valid: $IMAGE_TAG (commit exists in repo)"
 
+      - name: Configure AWS credentials (sandbox - read-only)
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve QURL image tag
+        id: resolve-qurl-tag
+        env:
+          QURL_IMAGE_TAG_INPUT: ${{ inputs.qurl_image_tag }}
+          DEPLOY_QURL: ${{ inputs.deploy_qurl }}
+          ROLLBACK: ${{ inputs.rollback }}
+        run: |
+          if [[ -n "$QURL_IMAGE_TAG_INPUT" ]]; then
+            echo "Using provided QURL image tag: $QURL_IMAGE_TAG_INPUT"
+            echo "qurl_image_tag=$QURL_IMAGE_TAG_INPUT" >> $GITHUB_OUTPUT
+          elif [[ "$ROLLBACK" == "true" && "$DEPLOY_QURL" == "true" ]]; then
+            echo "::error::rollback=true with deploy_qurl=true requires an explicit qurl_image_tag."
+            echo "::error::QURL is not tracked by deployed-commit, so automatic rollback is not possible."
+            echo "::error::Either provide qurl_image_tag or set deploy_qurl=false."
+            exit 1
+          else
+            echo "No QURL image tag provided, reading from sandbox SSM..."
+            QURL_TAG=$(aws ssm get-parameter \
+              --name "/layerv-nhp-sandbox/qurl-api-image-tag" \
+              --query "Parameter.Value" --output text 2>/dev/null || echo "")
+            if [[ -z "$QURL_TAG" || "$QURL_TAG" == "latest" ]]; then
+              echo "::warning::Could not resolve QURL image tag from sandbox SSM"
+              echo "qurl_image_tag=" >> $GITHUB_OUTPUT
+            else
+              echo "Resolved QURL image tag from sandbox SSM: $QURL_TAG"
+              echo "qurl_image_tag=$QURL_TAG" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Gather sandbox state
+        id: sandbox-state
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          SANDBOX_ACTIVE_COLOR=$(aws ssm get-parameter \
+            --name "/sandbox/nhp/server/active-color" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "unknown")
+          SANDBOX_SERVER_TAG=$(aws ssm get-parameter \
+            --name "/sandbox/nhp/server/image-tag" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "unknown")
+          SANDBOX_AC_TAG=$(aws ssm get-parameter \
+            --name "/sandbox/nhp/ac/image-tag" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "unknown")
+          SANDBOX_QURL_TAG=$(aws ssm get-parameter \
+            --name "/layerv-nhp-sandbox/qurl-api-image-tag" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "unknown")
+
+          # Calculate soak duration
+          SANDBOX_DEPLOYED_AT=$(aws ssm get-parameter \
+            --name "/sandbox/nhp/deploy/deployed-at" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+          if [[ -n "$SANDBOX_DEPLOYED_AT" && "$SANDBOX_DEPLOYED_AT" != "initial" ]]; then
+            DEPLOYED_EPOCH=$(date -d "$SANDBOX_DEPLOYED_AT" +%s 2>/dev/null || echo "0")
+            NOW_EPOCH=$(date +%s)
+            if [[ "$DEPLOYED_EPOCH" -gt 0 ]]; then
+              SOAK_SECONDS=$(( NOW_EPOCH - DEPLOYED_EPOCH ))
+              SOAK_HOURS=$(( SOAK_SECONDS / 3600 ))
+              if [[ "$SOAK_HOURS" -gt 0 ]]; then
+                SOAK_DURATION="${SOAK_HOURS}h"
+              else
+                SOAK_MINUTES=$(( SOAK_SECONDS / 60 ))
+                SOAK_DURATION="${SOAK_MINUTES}m"
+              fi
+            else
+              SOAK_DURATION="unknown"
+            fi
+          else
+            SOAK_DURATION="unknown"
+          fi
+
+          echo "active_color=$SANDBOX_ACTIVE_COLOR" >> $GITHUB_OUTPUT
+          echo "server_tag=$SANDBOX_SERVER_TAG" >> $GITHUB_OUTPUT
+          echo "ac_tag=$SANDBOX_AC_TAG" >> $GITHUB_OUTPUT
+          echo "qurl_tag=$SANDBOX_QURL_TAG" >> $GITHUB_OUTPUT
+          echo "soak_duration=$SOAK_DURATION" >> $GITHUB_OUTPUT
+
+      - name: Get image metadata from ECR
+        id: ecr-metadata
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          QURL_IMAGE_TAG: ${{ steps.resolve-qurl-tag.outputs.qurl_image_tag }}
+          DEPLOY_SERVER: ${{ inputs.deploy_server }}
+          DEPLOY_AC: ${{ inputs.deploy_ac }}
+          DEPLOY_QURL: ${{ inputs.deploy_qurl }}
+        run: |
+          if [[ "$DEPLOY_SERVER" == "true" ]]; then
+            SERVER_PUSHED=$(aws ecr describe-images \
+              --repository-name "$ECR_SERVER_REPO" \
+              --image-ids imageTag="$IMAGE_TAG" \
+              --query "imageDetails[0].imagePushedAt" --output text 2>/dev/null || echo "N/A")
+          else
+            SERVER_PUSHED="N/A"
+          fi
+
+          if [[ "$DEPLOY_AC" == "true" ]]; then
+            AC_PUSHED=$(aws ecr describe-images \
+              --repository-name "$ECR_AC_REPO" \
+              --image-ids imageTag="$IMAGE_TAG" \
+              --query "imageDetails[0].imagePushedAt" --output text 2>/dev/null || echo "N/A")
+          else
+            AC_PUSHED="N/A"
+          fi
+
+          if [[ "$DEPLOY_QURL" == "true" && -n "$QURL_IMAGE_TAG" ]]; then
+            QURL_PUSHED=$(aws ecr describe-images \
+              --repository-name "$ECR_QURL_REPO" \
+              --image-ids imageTag="$QURL_IMAGE_TAG" \
+              --query "imageDetails[0].imagePushedAt" --output text 2>/dev/null || echo "N/A")
+          else
+            QURL_PUSHED="N/A"
+          fi
+
+          echo "server_pushed=$SERVER_PUSHED" >> $GITHUB_OUTPUT
+          echo "ac_pushed=$AC_PUSHED" >> $GITHUB_OUTPUT
+          echo "qurl_pushed=$QURL_PUSHED" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials (prod - for state read)
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Read current prod state
+        id: prod-state
+        run: |
+          PROD_SERVER_TAG=$(aws ssm get-parameter \
+            --name "/prod/nhp/server/image-tag" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "not deployed")
+          PROD_AC_TAG=$(aws ssm get-parameter \
+            --name "/prod/nhp/ac/image-tag" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "not deployed")
+          PROD_QURL_TAG=$(aws ssm get-parameter \
+            --name "/${PROD_SSM_PREFIX}/qurl-api-image-tag" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "not deployed")
+          PROD_DEPLOYED_COMMIT=$(aws ssm get-parameter \
+            --name "/prod/nhp/deploy/deployed-commit" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "not deployed")
+
+          echo "server_tag=$PROD_SERVER_TAG" >> $GITHUB_OUTPUT
+          echo "ac_tag=$PROD_AC_TAG" >> $GITHUB_OUTPUT
+          echo "qurl_tag=$PROD_QURL_TAG" >> $GITHUB_OUTPUT
+          echo "deployed_commit=$PROD_DEPLOYED_COMMIT" >> $GITHUB_OUTPUT
+
+      - name: Resolve rollback target
+        id: resolve-rollback
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          ROLLBACK: ${{ inputs.rollback }}
+        run: |
+          if [[ "$ROLLBACK" == "true" ]]; then
+            # Read deployed-commit-previous (the version before the current deploy),
+            # NOT deployed-commit (which is the currently deployed — possibly broken — version)
+            echo "Rollback mode: reading deployed-commit-previous from prod SSM..."
+            PREV_COMMIT=$(aws ssm get-parameter \
+              --name "/prod/nhp/deploy/deployed-commit-previous" \
+              --query "Parameter.Value" --output text 2>/dev/null || echo "")
+            if [[ -n "$PREV_COMMIT" && "$PREV_COMMIT" != "initial" ]]; then
+              echo "Previous deployed-commit: $PREV_COMMIT"
+              echo "effective_image_tag=$PREV_COMMIT" >> $GITHUB_OUTPUT
+            else
+              echo "::warning::No deployed-commit-previous in SSM. Falling back to provided image_tag."
+              echo "effective_image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "effective_image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate changelog
+        id: changelog
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          PROD_DEPLOYED_COMMIT: ${{ steps.prod-state.outputs.deployed_commit }}
+        run: |
+          CHANGELOG=""
+          if [[ -n "$PROD_DEPLOYED_COMMIT" && "$PROD_DEPLOYED_COMMIT" != "not deployed" && "$PROD_DEPLOYED_COMMIT" != "initial" ]]; then
+            if git rev-parse --verify "${PROD_DEPLOYED_COMMIT}^{commit}" > /dev/null 2>&1; then
+              CHANGELOG=$(git log --oneline "${PROD_DEPLOYED_COMMIT}..${IMAGE_TAG}" 2>/dev/null || echo "Unable to generate changelog")
+            else
+              CHANGELOG="Previous commit $PROD_DEPLOYED_COMMIT not found in local repo"
+            fi
+          else
+            CHANGELOG="First deployment (no previous commit tracked)"
+          fi
+
+          # Store changelog in output (escape for multiline)
+          {
+            echo "changelog<<CHANGELOG_EOF"
+            echo "$CHANGELOG"
+            echo "CHANGELOG_EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Write promotion manifest
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          EFFECTIVE_TAG: ${{ steps.resolve-rollback.outputs.effective_image_tag }}
+          QURL_IMAGE_TAG: ${{ steps.resolve-qurl-tag.outputs.qurl_image_tag }}
+          DEPLOY_SERVER: ${{ inputs.deploy_server }}
+          DEPLOY_AC: ${{ inputs.deploy_ac }}
+          DEPLOY_QURL: ${{ inputs.deploy_qurl }}
+          RUN_TERRAFORM: ${{ inputs.run_terraform }}
+          ROLLBACK: ${{ inputs.rollback }}
+          CHANGELOG: ${{ steps.changelog.outputs.changelog }}
+          # Sandbox state
+          SB_ACTIVE_COLOR: ${{ steps.sandbox-state.outputs.active_color }}
+          SB_SERVER_TAG: ${{ steps.sandbox-state.outputs.server_tag }}
+          SB_AC_TAG: ${{ steps.sandbox-state.outputs.ac_tag }}
+          SB_QURL_TAG: ${{ steps.sandbox-state.outputs.qurl_tag }}
+          SB_SOAK: ${{ steps.sandbox-state.outputs.soak_duration }}
+          # ECR metadata
+          SERVER_PUSHED: ${{ steps.ecr-metadata.outputs.server_pushed }}
+          AC_PUSHED: ${{ steps.ecr-metadata.outputs.ac_pushed }}
+          QURL_PUSHED: ${{ steps.ecr-metadata.outputs.qurl_pushed }}
+          # Prod state
+          PROD_SERVER_TAG: ${{ steps.prod-state.outputs.server_tag }}
+          PROD_AC_TAG: ${{ steps.prod-state.outputs.ac_tag }}
+          PROD_QURL_TAG: ${{ steps.prod-state.outputs.qurl_tag }}
+          PROD_DEPLOYED_COMMIT: ${{ steps.prod-state.outputs.deployed_commit }}
+        run: |
+          # Get commit info
+          COMMIT_MSG=$(git log -1 --format="%s" "$IMAGE_TAG" 2>/dev/null || echo "unknown")
+          COMMIT_DATE=$(git log -1 --format="%ci" "$IMAGE_TAG" 2>/dev/null || echo "unknown")
+          COMMIT_AUTHOR=$(git log -1 --format="%an" "$IMAGE_TAG" 2>/dev/null || echo "unknown")
+
+          # Determine tag match
+          if [[ "$SB_SERVER_TAG" == *"$IMAGE_TAG"* ]]; then
+            TAG_MATCH="matches active sandbox ($SB_ACTIVE_COLOR)"
+          else
+            TAG_MATCH="does NOT match active sandbox (active=$SB_ACTIVE_COLOR, tag=$SB_SERVER_TAG)"
+          fi
+
+          {
+            echo "## Promotion Manifest"
+            echo ""
+
+            # Rollback banner
+            if [[ "$ROLLBACK" == "true" ]]; then
+              echo "> :warning: **ROLLBACK MODE** — deploying previous known-good commit: \`$EFFECTIVE_TAG\`"
+              if [[ "$DEPLOY_QURL" == "true" ]]; then
+                echo "> :information_source: **Note:** QURL rollback is not automatic. The QURL service uses a separate image tag that is not tracked by \`deployed-commit\`. Provide \`qurl_image_tag\` explicitly to roll back QURL."
+              fi
+              echo ""
+            fi
+
+            # Artifacts table
+            echo "### Artifacts"
+            echo "| Component | Image | Tag | Built | Deploy |"
+            echo "|-----------|-------|-----|-------|--------|"
+            if [[ "$DEPLOY_SERVER" == "true" ]]; then
+              echo "| NHP Server | \`$ECR_SERVER_REPO\` | \`$EFFECTIVE_TAG\` | $SERVER_PUSHED | :white_check_mark: |"
+            else
+              echo "| NHP Server | \`$ECR_SERVER_REPO\` | \`$EFFECTIVE_TAG\` | $SERVER_PUSHED | :no_entry_sign: skipped |"
+            fi
+            if [[ "$DEPLOY_AC" == "true" ]]; then
+              echo "| Access Controller | \`$ECR_AC_REPO\` | \`$EFFECTIVE_TAG\` | $AC_PUSHED | :white_check_mark: |"
+            else
+              echo "| Access Controller | \`$ECR_AC_REPO\` | \`$EFFECTIVE_TAG\` | $AC_PUSHED | :no_entry_sign: skipped |"
+            fi
+            if [[ "$DEPLOY_QURL" == "true" && -n "$QURL_IMAGE_TAG" ]]; then
+              echo "| QURL Service | \`$ECR_QURL_REPO\` | \`$QURL_IMAGE_TAG\` | $QURL_PUSHED | :white_check_mark: |"
+            elif [[ "$DEPLOY_QURL" == "true" ]]; then
+              echo "| QURL Service | \`$ECR_QURL_REPO\` | _(not resolved)_ | — | :warning: no tag |"
+            else
+              echo "| QURL Service | \`$ECR_QURL_REPO\` | \`${QURL_IMAGE_TAG:-N/A}\` | $QURL_PUSHED | :no_entry_sign: skipped |"
+            fi
+            echo ""
+
+            # Commit details
+            echo "### Commit"
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| SHA | [\`$IMAGE_TAG\`](https://github.com/${{ github.repository }}/commit/$IMAGE_TAG) |"
+            echo "| Message | $COMMIT_MSG |"
+            echo "| Author | $COMMIT_AUTHOR |"
+            echo "| Date | $COMMIT_DATE |"
+            echo ""
+
+            # Changelog
+            echo "### Changelog"
+            echo "<details><summary>Commits since last production deployment</summary>"
+            echo ""
+            echo "\`\`\`"
+            echo "$CHANGELOG"
+            echo "\`\`\`"
+            echo ""
+            echo "</details>"
+            echo ""
+
+            # Sandbox state
+            echo "### Sandbox Validation"
+            echo "| Parameter | Value |"
+            echo "|-----------|-------|"
+            echo "| Active color | **$SB_ACTIVE_COLOR** |"
+            echo "| Server tag | \`$SB_SERVER_TAG\` |"
+            echo "| AC tag | \`$SB_AC_TAG\` |"
+            echo "| QURL tag | \`$SB_QURL_TAG\` |"
+            echo "| Tag match | $TAG_MATCH |"
+            echo "| Soak duration | $SB_SOAK |"
+            echo ""
+
+            # Current prod vs new
+            echo "### Production State"
+            echo "| Component | Current | Promoting To | Changed |"
+            echo "|-----------|---------|--------------|---------|"
+
+            if [[ "$PROD_SERVER_TAG" == *"$EFFECTIVE_TAG"* ]]; then
+              SERVER_CHANGED="no change"
+            else
+              SERVER_CHANGED=":arrow_right: **updating**"
+            fi
+            echo "| NHP Server | \`$PROD_SERVER_TAG\` | \`$EFFECTIVE_TAG\` | $SERVER_CHANGED |"
+
+            if [[ "$PROD_AC_TAG" == *"$EFFECTIVE_TAG"* ]]; then
+              AC_CHANGED="no change"
+            else
+              AC_CHANGED=":arrow_right: **updating**"
+            fi
+            echo "| Access Controller | \`$PROD_AC_TAG\` | \`$EFFECTIVE_TAG\` | $AC_CHANGED |"
+
+            QURL_PROMOTE_TAG="${QURL_IMAGE_TAG:-N/A}"
+            if [[ "$PROD_QURL_TAG" == "$QURL_PROMOTE_TAG" ]]; then
+              QURL_CHANGED="no change"
+            else
+              QURL_CHANGED=":arrow_right: **updating**"
+            fi
+            echo "| QURL Service | \`$PROD_QURL_TAG\` | \`$QURL_PROMOTE_TAG\` | $QURL_CHANGED |"
+            echo ""
+
+            # Configuration
+            echo "### Configuration"
+            echo "| Setting | Value |"
+            echo "|---------|-------|"
+            echo "| Terraform Apply | $RUN_TERRAFORM |"
+            echo "| Cell ID | ${{ inputs.cell_id }} |"
+            echo "| Rollback | $ROLLBACK |"
+            echo "| Source | \`$SANDBOX_ACCOUNT_ID\` (sandbox ECR) |"
+            echo "| Target | \`$PROD_ACCOUNT_ID\` (prod) |"
+          } >> $GITHUB_STEP_SUMMARY
+
+          # Print compact log summary
+          echo "============================================="
+          echo "  PROMOTION MANIFEST"
+          echo "============================================="
+          if [[ "$ROLLBACK" == "true" ]]; then
+            echo "  MODE:        ROLLBACK"
+          fi
+          echo "  Commit:      $IMAGE_TAG ($COMMIT_MSG)"
+          echo "  Author:      $COMMIT_AUTHOR ($COMMIT_DATE)"
+          echo "  Effective:   $EFFECTIVE_TAG"
+          echo ""
+          echo "  Server:      deploy=$DEPLOY_SERVER"
+          echo "  AC:          deploy=$DEPLOY_AC"
+          echo "  QURL:        deploy=$DEPLOY_QURL (tag=${QURL_IMAGE_TAG:-N/A})"
+          echo ""
+          echo "  Sandbox:     active=$SB_ACTIVE_COLOR, soak=$SB_SOAK"
+          echo "  Tag match:   $TAG_MATCH"
+          echo "  Terraform:   $RUN_TERRAFORM"
+          echo "============================================="
+
+  # =============================================================================
+  # PREFLIGHT - Approval gate + validation + deploy lock
+  # =============================================================================
+  preflight:
+    name: Preflight Checks
+    needs: [manifest]
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
       - name: Configure AWS credentials (sandbox - for ECR check)
         uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
         with:
@@ -95,22 +511,64 @@ jobs:
 
       - name: Verify images exist in sandbox ECR
         env:
-          IMAGE_TAG: ${{ inputs.image_tag }}
+          IMAGE_TAG: ${{ needs.manifest.outputs.effective_image_tag }}
+          QURL_IMAGE_TAG: ${{ needs.manifest.outputs.qurl_image_tag }}
+          DEPLOY_SERVER: ${{ inputs.deploy_server }}
+          DEPLOY_AC: ${{ inputs.deploy_ac }}
+          DEPLOY_QURL: ${{ inputs.deploy_qurl }}
         run: |
           echo "Verifying images in sandbox ECR..."
-          for repo in "$ECR_SERVER_REPO" "$ECR_AC_REPO"; do
-            echo "Checking $repo:$IMAGE_TAG..."
-            if ! aws ecr describe-images \
-              --repository-name "$repo" \
+          FAILED=0
+
+          if [[ "$DEPLOY_SERVER" == "true" ]]; then
+            echo "Checking $ECR_SERVER_REPO:$IMAGE_TAG..."
+            if aws ecr describe-images \
+              --repository-name "$ECR_SERVER_REPO" \
               --image-ids imageTag="$IMAGE_TAG" \
-              --query "imageDetails[0].imageTags" \
+              --query "imageDetails[0].imagePushedAt" \
               --output text > /dev/null 2>&1; then
-              echo "::error::Image $repo:$IMAGE_TAG not found in sandbox ECR"
-              exit 1
+              echo "  Found: $ECR_SERVER_REPO:$IMAGE_TAG"
+            else
+              echo "::error::Image $ECR_SERVER_REPO:$IMAGE_TAG not found in sandbox ECR"
+              FAILED=1
             fi
-            echo "  Found: $repo:$IMAGE_TAG"
-          done
-          echo "All images verified."
+          fi
+
+          if [[ "$DEPLOY_AC" == "true" ]]; then
+            echo "Checking $ECR_AC_REPO:$IMAGE_TAG..."
+            if aws ecr describe-images \
+              --repository-name "$ECR_AC_REPO" \
+              --image-ids imageTag="$IMAGE_TAG" \
+              --query "imageDetails[0].imagePushedAt" \
+              --output text > /dev/null 2>&1; then
+              echo "  Found: $ECR_AC_REPO:$IMAGE_TAG"
+            else
+              echo "::error::Image $ECR_AC_REPO:$IMAGE_TAG not found in sandbox ECR"
+              FAILED=1
+            fi
+          fi
+
+          if [[ "$DEPLOY_QURL" == "true" && -n "$QURL_IMAGE_TAG" ]]; then
+            echo "Checking $ECR_QURL_REPO:$QURL_IMAGE_TAG..."
+            if aws ecr describe-images \
+              --repository-name "$ECR_QURL_REPO" \
+              --image-ids imageTag="$QURL_IMAGE_TAG" \
+              --query "imageDetails[0].imagePushedAt" \
+              --output text > /dev/null 2>&1; then
+              echo "  Found: $ECR_QURL_REPO:$QURL_IMAGE_TAG"
+            else
+              echo "::error::Image $ECR_QURL_REPO:$QURL_IMAGE_TAG not found in sandbox ECR"
+              FAILED=1
+            fi
+          elif [[ "$DEPLOY_QURL" == "true" ]]; then
+            echo "::error::deploy_qurl=true but no QURL image tag available (provide qurl_image_tag or ensure sandbox SSM has a value)"
+            FAILED=1
+          fi
+
+          if [[ $FAILED -eq 1 ]]; then
+            exit 1
+          fi
+          echo "All required images verified."
 
       - name: Configure AWS credentials (prod)
         uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
@@ -190,21 +648,45 @@ jobs:
           fi
           echo "All GitHub secrets verified."
 
+      - name: Check and acquire deployment lock
+        env:
+          FORCE_UNLOCK: ${{ inputs.force_unlock }}
+        run: |
+          echo "Checking deployment lock..."
+          DEPLOY_STATE=$(aws ssm get-parameter \
+            --name "/prod/nhp/deploy/state" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+
+          if [[ "$DEPLOY_STATE" == "deploying" ]]; then
+            if [[ "$FORCE_UNLOCK" == "true" ]]; then
+              echo "::warning::Deployment lock is held, but force_unlock=true — overriding stale lock"
+            else
+              echo "::error::Deployment lock is held — another deployment is in progress."
+              echo "::error::Wait for it to finish, or re-run with force_unlock=true to override a stale lock."
+              exit 1
+            fi
+          else
+            echo "  Deploy state: ${DEPLOY_STATE:-not set} (no lock held)"
+          fi
+
+          echo "Acquiring deployment lock..."
+          aws ssm put-parameter \
+            --name "/prod/nhp/deploy/state" \
+            --value "deploying" \
+            --type String \
+            --overwrite
+          echo "  Lock acquired: /prod/nhp/deploy/state = deploying"
+
   # =============================================================================
   # TERRAFORM APPLY - Create/update production infrastructure
   # =============================================================================
   terraform-apply:
     name: Terraform Apply (prod)
-    needs: [preflight]
+    needs: [manifest, preflight]
     if: inputs.run_terraform
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 45
-    outputs:
-      server_asg: ${{ steps.outputs.outputs.server_asg }}
-      ac_asg: ${{ steps.outputs.outputs.ac_asg }}
-      nlb_dns: ${{ steps.outputs.outputs.nlb_dns }}
-      etcd_endpoint: ${{ steps.outputs.outputs.etcd_endpoint }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -247,32 +729,26 @@ jobs:
           TF_VAR_auth0_tf_client_id: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
           TF_VAR_auth0_tf_client_secret: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
           TF_VAR_confirm_prod_deployment: "yes-deploy-to-production"
-          TF_VAR_image_tag: ${{ inputs.image_tag }}
+          TF_VAR_image_tag: ${{ needs.manifest.outputs.effective_image_tag }}
+          TF_VAR_cell_id: ${{ inputs.cell_id }}
         run: terraform apply -auto-approve
 
-      - name: Get Terraform Outputs
-        id: outputs
-        working-directory: terraform/environments/prod
-        run: |
-          echo "server_asg=$(terraform output -raw asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
-          echo "ac_asg=$(terraform output -raw ac_asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
-          echo "nlb_dns=$(terraform output -raw nlb_dns_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
-          echo "etcd_endpoint=$(terraform output -raw etcd_endpoint 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
-
   # =============================================================================
-  # DEPLOY SERVER - Update SSM and trigger instance refresh
+  # DEPLOY SERVER - Via canary (Step Functions) with first-deploy fallback
   # =============================================================================
   deploy-server:
     name: Deploy NHP Server
-    needs: [preflight, terraform-apply]
+    needs: [manifest, preflight, terraform-apply]
     if: |
       always() &&
       needs.preflight.result == 'success' &&
       (needs.terraform-apply.result == 'success' || needs.terraform-apply.result == 'skipped') &&
       inputs.deploy_server
     runs-on: ubuntu-latest
-    environment: production
-    timeout-minutes: 15
+    timeout-minutes: 50
+    env:
+      IMAGE_TAG: ${{ needs.manifest.outputs.effective_image_tag }}
+      CELL_ID: ${{ inputs.cell_id }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -283,25 +759,141 @@ jobs:
           aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Update SSM and deploy server
+      - name: Deploy server
+        id: deploy-server-step
         env:
-          IMAGE_TAG: ${{ inputs.image_tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          ./.github/scripts/update-ssm-image-tag.sh prod server "$IMAGE_TAG" --refresh
+          echo "--- Deploying NHP Server ---"
+          START_TIME=$(date +%s)
+
+          # Check if canary state machine exists (indicates mature infra)
+          STATE_MACHINE_ARN=$(aws ssm get-parameter \
+            --name "/prod/nhp/${CELL_ID}/canary/state-machine-arn" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+
+          if [[ -n "$STATE_MACHINE_ARN" && "$STATE_MACHINE_ARN" != "initial" ]]; then
+            echo "deploy_method=canary" >> $GITHUB_OUTPUT
+            ./.github/scripts/dispatch-and-poll-canary.sh server "$IMAGE_TAG" prod "$CELL_ID"
+          else
+            echo "deploy_method=direct" >> $GITHUB_OUTPUT
+            echo "::notice::No canary state machine — using direct SSM + instance refresh (first deploy)"
+            ./.github/scripts/update-ssm-image-tag.sh prod server "$IMAGE_TAG" --refresh
+          fi
+
+          DURATION=$(( $(date +%s) - START_TIME ))
+          echo "duration=${DURATION}s" >> $GITHUB_OUTPUT
+
+      - name: Server deploy summary
+        if: always() && steps.deploy-server-step.outcome != 'skipped'
+        env:
+          DEPLOY_METHOD: ${{ steps.deploy-server-step.outputs.deploy_method }}
+          RUN_URL: ${{ steps.deploy-server-step.outputs.run_url }}
+          DURATION: ${{ steps.deploy-server-step.outputs.duration }}
+          RESULT: ${{ steps.deploy-server-step.outcome }}
+        run: |
+          {
+            echo "## Deploy Server"
+            echo ""
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| Component | NHP Server |"
+            echo "| Method | ${DEPLOY_METHOD:-unknown} |"
+            echo "| Image | \`$IMAGE_TAG\` |"
+            echo "| Duration | ${DURATION:-unknown} |"
+            echo "| Result | **$RESULT** |"
+            if [[ -n "$RUN_URL" ]]; then
+              echo "| Canary Run | [View]($RUN_URL) |"
+            fi
+          } >> $GITHUB_STEP_SUMMARY
 
   # =============================================================================
-  # DEPLOY AC - Update SSM and trigger instance refresh
+  # DEPLOY AC - Via canary (Step Functions) with first-deploy fallback
   # =============================================================================
   deploy-ac:
     name: Deploy Access Controller
-    needs: [preflight, terraform-apply]
+    needs: [manifest, preflight, terraform-apply, deploy-server]
     if: |
       always() &&
       needs.preflight.result == 'success' &&
       (needs.terraform-apply.result == 'success' || needs.terraform-apply.result == 'skipped') &&
+      (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
       inputs.deploy_ac
     runs-on: ubuntu-latest
-    environment: production
+    timeout-minutes: 50
+    env:
+      IMAGE_TAG: ${{ needs.manifest.outputs.effective_image_tag }}
+      CELL_ID: ${{ inputs.cell_id }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Configure AWS credentials
+        uses: ./.github/actions/setup-deploy
+        with:
+          aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy AC
+        id: deploy-ac-step
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "--- Deploying Access Controller ---"
+          START_TIME=$(date +%s)
+
+          STATE_MACHINE_ARN=$(aws ssm get-parameter \
+            --name "/prod/nhp/${CELL_ID}/canary/state-machine-arn" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+
+          if [[ -n "$STATE_MACHINE_ARN" && "$STATE_MACHINE_ARN" != "initial" ]]; then
+            echo "deploy_method=canary" >> $GITHUB_OUTPUT
+            ./.github/scripts/dispatch-and-poll-canary.sh ac "$IMAGE_TAG" prod "$CELL_ID"
+          else
+            echo "deploy_method=direct" >> $GITHUB_OUTPUT
+            echo "::notice::No canary state machine — using direct SSM + instance refresh (first deploy)"
+            ./.github/scripts/update-ssm-image-tag.sh prod ac "$IMAGE_TAG" --refresh
+          fi
+
+          DURATION=$(( $(date +%s) - START_TIME ))
+          echo "duration=${DURATION}s" >> $GITHUB_OUTPUT
+
+      - name: AC deploy summary
+        if: always() && steps.deploy-ac-step.outcome != 'skipped'
+        env:
+          DEPLOY_METHOD: ${{ steps.deploy-ac-step.outputs.deploy_method }}
+          RUN_URL: ${{ steps.deploy-ac-step.outputs.run_url }}
+          DURATION: ${{ steps.deploy-ac-step.outputs.duration }}
+          RESULT: ${{ steps.deploy-ac-step.outcome }}
+        run: |
+          {
+            echo "## Deploy AC"
+            echo ""
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| Component | Access Controller |"
+            echo "| Method | ${DEPLOY_METHOD:-unknown} |"
+            echo "| Image | \`$IMAGE_TAG\` |"
+            echo "| Duration | ${DURATION:-unknown} |"
+            echo "| Result | **$RESULT** |"
+            if [[ -n "$RUN_URL" ]]; then
+              echo "| Canary Run | [View]($RUN_URL) |"
+            fi
+          } >> $GITHUB_STEP_SUMMARY
+
+  # =============================================================================
+  # DEPLOY QURL - ECS task definition re-registration
+  # =============================================================================
+  deploy-qurl:
+    name: Deploy QURL Service
+    needs: [manifest, preflight, terraform-apply, deploy-ac]
+    if: |
+      always() &&
+      needs.preflight.result == 'success' &&
+      (needs.terraform-apply.result == 'success' || needs.terraform-apply.result == 'skipped') &&
+      (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
+      inputs.deploy_qurl
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout code
@@ -313,30 +905,54 @@ jobs:
           aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Update SSM and deploy AC
+      - name: Deploy QURL via ECS task def
+        id: deploy-qurl-step
         env:
-          IMAGE_TAG: ${{ inputs.image_tag }}
+          QURL_IMAGE_TAG: ${{ needs.manifest.outputs.qurl_image_tag }}
         run: |
-          ./.github/scripts/update-ssm-image-tag.sh prod ac "$IMAGE_TAG" --refresh
+          if [[ -z "$QURL_IMAGE_TAG" ]]; then
+            echo "::error::QURL_IMAGE_TAG is empty, cannot deploy"
+            exit 1
+          fi
+          START_TIME=$(date +%s)
+          ./.github/scripts/deploy-ecs-service.sh "$PROD_SSM_PREFIX" "$QURL_IMAGE_TAG"
+          DURATION=$(( $(date +%s) - START_TIME ))
+          echo "duration=${DURATION}s" >> $GITHUB_OUTPUT
+
+      - name: QURL deploy summary
+        if: always() && steps.deploy-qurl-step.outcome != 'skipped'
+        env:
+          QURL_IMAGE_TAG: ${{ needs.manifest.outputs.qurl_image_tag }}
+          DURATION: ${{ steps.deploy-qurl-step.outputs.duration }}
+          RESULT: ${{ steps.deploy-qurl-step.outcome }}
+        run: |
+          {
+            echo "## Deploy QURL"
+            echo ""
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| Component | QURL Service |"
+            echo "| Method | ECS task definition |"
+            echo "| Image | \`$ECR_QURL_REPO:$QURL_IMAGE_TAG\` |"
+            echo "| Duration | ${DURATION:-unknown} |"
+            echo "| Result | **$RESULT** |"
+            echo "| Rollback | ECS circuit breaker (automatic) |"
+          } >> $GITHUB_STEP_SUMMARY
 
   # =============================================================================
-  # VALIDATE - Verify the deployment is healthy
+  # SMOKE TEST - Application-level validation
   # =============================================================================
-  validate-deployment:
-    name: Validate Deployment
-    needs: [deploy-server, deploy-ac, terraform-apply]
-    # always() is required because `needs` jobs may be skipped (e.g., deploy_server=false).
-    # Without always(), GitHub skips this job when any dependency is skipped.
-    # The additional conditions ensure we:
-    #   1. Only run if at least one job actually did something (success)
-    #   2. Don't run if any job that DID run failed (failure != skipped)
+  smoke-test:
+    name: Smoke Test
+    needs: [manifest, preflight, deploy-server, deploy-ac, deploy-qurl]
     if: |
       always() &&
-      (needs.deploy-server.result == 'success' || needs.deploy-ac.result == 'success' || needs.terraform-apply.result == 'success') &&
-      needs.deploy-server.result != 'failure' &&
-      needs.deploy-ac.result != 'failure'
+      needs.preflight.result == 'success' &&
+      (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
+      (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
+      (needs.deploy-qurl.result == 'success' || needs.deploy-qurl.result == 'skipped') &&
+      (needs.deploy-server.result == 'success' || needs.deploy-ac.result == 'success' || needs.deploy-qurl.result == 'success')
     runs-on: ubuntu-latest
-    environment: production
     timeout-minutes: 10
     steps:
       - name: Checkout code
@@ -348,22 +964,381 @@ jobs:
           aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Run deployment validation
+      - name: Infrastructure validation
         run: ./scripts/validate-deployment.sh prod
+
+      - name: QURL health checks
+        id: qurl-health
+        if: needs.deploy-qurl.result == 'success'
+        run: |
+          echo "Running QURL health checks..."
+          RETRIES=3
+          RETRY_DELAY=10
+          RESULTS=""
+
+          for endpoint in "health/live" "health/ready" "v1/health"; do
+            URL="https://api.layerv.ai/${endpoint}"
+            echo "  Checking $URL..."
+            SUCCESS=false
+            FINAL_STATUS="000"
+            for i in $(seq 1 $RETRIES); do
+              HTTP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "$URL" 2>/dev/null || echo "000")
+              FINAL_STATUS="$HTTP_STATUS"
+              if [[ "$HTTP_STATUS" == "200" ]]; then
+                echo "    $endpoint: OK (200)"
+                SUCCESS=true
+                break
+              fi
+              echo "    Attempt $i/$RETRIES: HTTP $HTTP_STATUS, retrying in ${RETRY_DELAY}s..."
+              sleep "$RETRY_DELAY"
+            done
+            if [[ "$SUCCESS" == "true" ]]; then
+              RESULTS="${RESULTS}| \`${endpoint}\` | $FINAL_STATUS | :white_check_mark: |"$'\n'
+            else
+              RESULTS="${RESULTS}| \`${endpoint}\` | $FINAL_STATUS | :x: |"$'\n'
+              echo "::error::QURL health check failed: $URL (last status: $HTTP_STATUS)"
+              # Write summary before exiting on failure
+              {
+                echo "## Smoke Test — QURL Health"
+                echo ""
+                echo "| Endpoint | HTTP Status | Result |"
+                echo "|----------|-------------|--------|"
+                echo "$RESULTS"
+              } >> $GITHUB_STEP_SUMMARY
+              exit 1
+            fi
+          done
+          echo "All QURL health checks passed."
+
+          {
+            echo "## Smoke Test — QURL Health"
+            echo ""
+            echo "| Endpoint | HTTP Status | Result |"
+            echo "|----------|-------------|--------|"
+            echo "$RESULTS"
+          } >> $GITHUB_STEP_SUMMARY
+
+  # =============================================================================
+  # MONITOR - Post-deploy CloudWatch alarm watch
+  # =============================================================================
+  monitor:
+    name: Post-Deploy Monitor
+    needs: [smoke-test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: List monitored alarms
+        run: |
+          echo "Discovering CloudWatch alarms with prefix 'layerv-nhp-prod'..."
+          ALL_ALARMS=$(aws cloudwatch describe-alarms \
+            --alarm-name-prefix "layerv-nhp-prod" \
+            --query "MetricAlarms[*].{Name: AlarmName, State: StateValue, Metric: MetricName}" \
+            --output table 2>/dev/null || echo "No alarms found")
+          echo "$ALL_ALARMS"
+
+          ALARM_COUNT=$(aws cloudwatch describe-alarms \
+            --alarm-name-prefix "layerv-nhp-prod" \
+            --query "length(MetricAlarms)" --output text 2>/dev/null || echo "0")
+          echo "::notice::Monitoring $ALARM_COUNT alarm(s) for 5 minutes"
+
+      - name: Monitor CloudWatch alarms (5 minutes)
+        id: monitor-step
+        run: |
+          echo "Monitoring CloudWatch alarms for 5 minutes..."
+          echo ""
+
+          CHECKS=10
+          INTERVAL=30
+
+          for i in $(seq 1 $CHECKS); do
+            ALARMS=$(aws cloudwatch describe-alarms \
+              --alarm-name-prefix "layerv-nhp-prod" \
+              --state-value ALARM \
+              --query "MetricAlarms[*].AlarmName" --output text 2>/dev/null || echo "")
+
+            ELAPSED=$(( i * INTERVAL ))
+
+            if [[ -n "$ALARMS" && "$ALARMS" != "None" ]]; then
+              echo "::error::CloudWatch alarm(s) in ALARM state after ${ELAPSED}s: $ALARMS"
+              echo ""
+              ALARM_DETAILS=$(aws cloudwatch describe-alarms \
+                --alarm-name-prefix "layerv-nhp-prod" \
+                --state-value ALARM \
+                --query "MetricAlarms[*].{Name: AlarmName, Reason: StateReason}" \
+                --output json 2>/dev/null || echo "[]")
+              echo "$ALARM_DETAILS" | jq -r '.[] | "  \(.Name): \(.Reason)"' 2>/dev/null || true
+
+              # Write failure details to step summary
+              {
+                echo "## Post-Deploy Monitor"
+                echo ""
+                echo "> :x: **Alarm(s) triggered** after ${ELAPSED}s"
+                echo ""
+                echo "| Alarm | Reason |"
+                echo "|-------|--------|"
+                echo "$ALARM_DETAILS" | jq -r '.[] | "| `\(.Name)` | \(.Reason | .[0:100]) |"' 2>/dev/null || echo "| (parse error) | — |"
+                echo ""
+                CW_URL="https://${AWS_REGION}.console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#alarmsV2:?~(alarmStateFilter~'ALARM)"
+                echo "[View alarms in CloudWatch Console]($CW_URL)"
+              } >> $GITHUB_STEP_SUMMARY
+              exit 1
+            fi
+
+            echo "  Check $i/$CHECKS (${ELAPSED}s): All alarms OK"
+            if [[ $i -lt $CHECKS ]]; then
+              sleep "$INTERVAL"
+            fi
+          done
+
+          echo ""
+          echo "::notice::No alarms triggered during 5-minute monitoring window"
+
+          {
+            echo "## Post-Deploy Monitor"
+            echo ""
+            echo "> :white_check_mark: **5-minute monitoring window passed** — no alarms triggered"
+            echo ""
+            echo "10 checks at 30s intervals. All \`layerv-nhp-prod*\` alarms remained in OK state."
+          } >> $GITHUB_STEP_SUMMARY
+
+  # =============================================================================
+  # FINALIZE - Tracking, metrics, notifications, summary
+  # =============================================================================
+  finalize:
+    name: Finalize
+    if: always()
+    needs: [manifest, preflight, terraform-apply, deploy-server, deploy-ac, deploy-qurl, smoke-test, monitor]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Determine deployment outcome
+        id: outcome
+        env:
+          MANIFEST_RESULT: ${{ needs.manifest.result }}
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          TF_RESULT: ${{ needs.terraform-apply.result }}
+          SERVER_RESULT: ${{ needs.deploy-server.result }}
+          AC_RESULT: ${{ needs.deploy-ac.result }}
+          QURL_RESULT: ${{ needs.deploy-qurl.result }}
+          SMOKE_RESULT: ${{ needs.smoke-test.result }}
+          MONITOR_RESULT: ${{ needs.monitor.result }}
+        run: |
+          # Check if any non-skipped job failed
+          FAILED=false
+          for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$AC_RESULT" "$QURL_RESULT" "$SMOKE_RESULT" "$MONITOR_RESULT"; do
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              FAILED=true
+              break
+            fi
+          done
+
+          if [[ "$FAILED" == "true" ]]; then
+            echo "status=failed" >> $GITHUB_OUTPUT
+          else
+            echo "status=success" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Release deployment lock
+        if: always()
+        env:
+          DEPLOY_STATUS: ${{ steps.outcome.outputs.status }}
+        run: |
+          echo "Releasing deployment lock..."
+          LOCK_VALUE="deployed"
+          if [[ "$DEPLOY_STATUS" != "success" ]]; then
+            LOCK_VALUE="failed"
+          fi
+          aws ssm put-parameter \
+            --name "/prod/nhp/deploy/state" \
+            --value "$LOCK_VALUE" \
+            --type String \
+            --overwrite || echo "::warning::Failed to release deployment lock"
+          echo "  Lock released: /prod/nhp/deploy/state = $LOCK_VALUE"
+
+      - name: Update deployment tracking
+        if: steps.outcome.outputs.status == 'success'
+        env:
+          IMAGE_TAG: ${{ needs.manifest.outputs.effective_image_tag }}
+        run: |
+          echo "Updating deployment tracking..."
+
+          # Save the current deployed-commit as previous before overwriting,
+          # so rollback can target the actual previous version (not current)
+          CURRENT=$(aws ssm get-parameter \
+            --name "/prod/nhp/deploy/deployed-commit" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+          if [[ -n "$CURRENT" && "$CURRENT" != "initial" && "$CURRENT" != "$IMAGE_TAG" ]]; then
+            aws ssm put-parameter \
+              --name "/prod/nhp/deploy/deployed-commit-previous" \
+              --value "$CURRENT" --type String --overwrite \
+              || echo "::warning::Failed to update deployed-commit-previous"
+            echo "  Previous commit saved: deployed-commit-previous=$CURRENT"
+          fi
+
+          aws ssm put-parameter \
+            --name "/prod/nhp/deploy/deployed-commit" \
+            --value "$IMAGE_TAG" --type String --overwrite \
+            || echo "::warning::Failed to update deployed-commit"
+          aws ssm put-parameter \
+            --name "/prod/nhp/deploy/deployed-at" \
+            --value "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --type String --overwrite \
+            || echo "::warning::Failed to update deployed-at"
+          echo "  Tracking updated: deployed-commit=$IMAGE_TAG"
+
+      - name: Push CloudWatch deployment metric
+        if: always()
+        env:
+          DEPLOY_STATUS: ${{ steps.outcome.outputs.status }}
+        run: |
+          aws cloudwatch put-metric-data \
+            --namespace "LayerV/NHP" \
+            --metric-name "DeploymentEvent" \
+            --dimensions "Environment=prod,Strategy=promote,Status=$DEPLOY_STATUS" \
+            --value 1 \
+            --unit Count \
+            || echo "::warning::Failed to push deployment metric"
+          echo "  Deployment metric pushed: Status=$DEPLOY_STATUS"
+
+      - name: Send SNS notification
+        if: always()
+        env:
+          IMAGE_TAG: ${{ needs.manifest.outputs.effective_image_tag }}
+          DEPLOY_STATUS: ${{ steps.outcome.outputs.status }}
+          MANIFEST_RESULT: ${{ needs.manifest.result }}
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          TF_RESULT: ${{ needs.terraform-apply.result }}
+          SERVER_RESULT: ${{ needs.deploy-server.result }}
+          AC_RESULT: ${{ needs.deploy-ac.result }}
+          QURL_RESULT: ${{ needs.deploy-qurl.result }}
+          SMOKE_RESULT: ${{ needs.smoke-test.result }}
+          MONITOR_RESULT: ${{ needs.monitor.result }}
+          ROLLBACK: ${{ inputs.rollback }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          SNS_ARN=$(aws ssm get-parameter \
+            --name "/prod/nhp/monitoring/sns-topic-arn" \
+            --query 'Parameter.Value' --output text 2>/dev/null) || SNS_ARN=""
+
+          if [[ -z "$SNS_ARN" || ! "$SNS_ARN" =~ ^arn:aws:sns: ]]; then
+            echo "No valid SNS topic ARN found, skipping notification"
+            exit 0
+          fi
+
+          STATUS_UPPER=$(echo "$DEPLOY_STATUS" | tr '[:lower:]' '[:upper:]')
+          MODE=""
+          if [[ "$ROLLBACK" == "true" ]]; then
+            MODE=" (ROLLBACK)"
+          fi
+
+          SUBJECT="Promote to Prod: ${STATUS_UPPER}${MODE} - ${IMAGE_TAG:0:7}"
+
+          result_icon() {
+            case "$1" in
+              success) echo "[OK]" ;;
+              skipped) echo "[SKIP]" ;;
+              failure) echo "[FAIL]" ;;
+              cancelled) echo "[CANCEL]" ;;
+              *) echo "[$1]" ;;
+            esac
+          }
+
+          MSG="Production Promotion Notification${MODE}"
+          MSG+="\n"
+          MSG+="\n  Status:    ${STATUS_UPPER}"
+          MSG+="\n  Image Tag: ${IMAGE_TAG}"
+          MSG+="\n  Triggered: ${{ github.actor }}"
+          MSG+="\n"
+          MSG+="\n  Manifest:   $(result_icon "$MANIFEST_RESULT")"
+          MSG+="\n  Preflight:  $(result_icon "$PREFLIGHT_RESULT")"
+          MSG+="\n  Terraform:  $(result_icon "$TF_RESULT")"
+          MSG+="\n  Server:     $(result_icon "$SERVER_RESULT")"
+          MSG+="\n  AC:         $(result_icon "$AC_RESULT")"
+          MSG+="\n  QURL:       $(result_icon "$QURL_RESULT")"
+          MSG+="\n  Smoke Test: $(result_icon "$SMOKE_RESULT")"
+          MSG+="\n  Monitor:    $(result_icon "$MONITOR_RESULT")"
+          MSG+="\n"
+          MSG+="\n  Run: ${WORKFLOW_URL}"
+
+          aws sns publish \
+            --topic-arn "$SNS_ARN" \
+            --subject "$SUBJECT" \
+            --message "$(echo -e "$MSG")" \
+            || echo "::warning::SNS notification failed"
 
       - name: Deployment summary
         if: always()
         env:
-          IMAGE_TAG: ${{ inputs.image_tag }}
+          IMAGE_TAG: ${{ needs.manifest.outputs.effective_image_tag }}
+          QURL_IMAGE_TAG: ${{ needs.manifest.outputs.qurl_image_tag }}
+          DEPLOY_STATUS: ${{ steps.outcome.outputs.status }}
+          MANIFEST_RESULT: ${{ needs.manifest.result }}
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
           TF_RESULT: ${{ needs.terraform-apply.result }}
           SERVER_RESULT: ${{ needs.deploy-server.result }}
           AC_RESULT: ${{ needs.deploy-ac.result }}
+          QURL_RESULT: ${{ needs.deploy-qurl.result }}
+          SMOKE_RESULT: ${{ needs.smoke-test.result }}
+          MONITOR_RESULT: ${{ needs.monitor.result }}
+          ROLLBACK: ${{ inputs.rollback }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Image Tag | \`$IMAGE_TAG\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Terraform Apply | $TF_RESULT |" >> $GITHUB_STEP_SUMMARY
-          echo "| NHP Server | $SERVER_RESULT |" >> $GITHUB_STEP_SUMMARY
-          echo "| Access Controller | $AC_RESULT |" >> $GITHUB_STEP_SUMMARY
+          result_emoji() {
+            case "$1" in
+              success) echo ":white_check_mark:" ;;
+              skipped) echo ":fast_forward:" ;;
+              failure) echo ":x:" ;;
+              cancelled) echo ":stop_sign:" ;;
+              *) echo ":grey_question:" ;;
+            esac
+          }
+
+          {
+            echo "---"
+            echo "## Deployment Summary"
+            echo ""
+            if [[ "$DEPLOY_STATUS" == "success" ]]; then
+              echo "> :white_check_mark: **Production deployment successful**"
+            else
+              echo "> :x: **Production deployment failed**"
+            fi
+            if [[ "$ROLLBACK" == "true" ]]; then
+              echo "> :warning: This was a **ROLLBACK** deployment"
+            fi
+            echo ""
+            echo "### Job Results"
+            echo "| Job | Status |"
+            echo "|-----|--------|"
+            echo "| Manifest | $(result_emoji "$MANIFEST_RESULT") $MANIFEST_RESULT |"
+            echo "| Preflight | $(result_emoji "$PREFLIGHT_RESULT") $PREFLIGHT_RESULT |"
+            echo "| Terraform Apply | $(result_emoji "$TF_RESULT") $TF_RESULT |"
+            echo "| Deploy Server | $(result_emoji "$SERVER_RESULT") $SERVER_RESULT |"
+            echo "| Deploy AC | $(result_emoji "$AC_RESULT") $AC_RESULT |"
+            echo "| Deploy QURL | $(result_emoji "$QURL_RESULT") $QURL_RESULT |"
+            echo "| Smoke Test | $(result_emoji "$SMOKE_RESULT") $SMOKE_RESULT |"
+            echo "| Monitor | $(result_emoji "$MONITOR_RESULT") $MONITOR_RESULT |"
+            echo ""
+            echo "### Deployed Artifacts"
+            echo "| Component | Image |"
+            echo "|-----------|-------|"
+            echo "| NHP Server | \`$ECR_SERVER_REPO:$IMAGE_TAG\` |"
+            echo "| Access Controller | \`$ECR_AC_REPO:$IMAGE_TAG\` |"
+            echo "| QURL Service | \`$ECR_QURL_REPO:${QURL_IMAGE_TAG:-N/A}\` |"
+            echo ""
+            echo "### Quick Links"
+            echo "- [ECS Console](https://${AWS_REGION}.console.aws.amazon.com/ecs/v2/clusters?region=${AWS_REGION})"
+            echo "- [CloudWatch Alarms](https://${AWS_REGION}.console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#alarmsV2:)"
+            echo "- [Step Functions](https://${AWS_REGION}.console.aws.amazon.com/states/home?region=${AWS_REGION}#/statemachines)"
+            echo "- [This workflow run]($WORKFLOW_URL)"
+          } >> $GITHUB_STEP_SUMMARY
