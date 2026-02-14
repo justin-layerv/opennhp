@@ -710,6 +710,9 @@ module "ac" {
   enable_blue_green      = var.enable_ac_blue_green
   green_standby_min_size = var.ac_green_standby_min_size
   alerts_sns_topic_arn   = module.monitoring.sns_topic_arn
+
+  # Secret reconciliation (cleanup orphaned per-instance secrets)
+  enable_secret_reconciliation = var.enable_secret_reconciliation
 }
 
 # Demo Gateway Module - nginx + certbot for qurl.link routing to NHP Server plugins

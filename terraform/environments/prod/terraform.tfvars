@@ -53,6 +53,9 @@ resource_mode = "api"
 # Termination cleanup
 enable_termination_cleanup = true
 
+# Secret reconciliation: Lambda cleans orphaned per-instance AC secrets daily
+enable_secret_reconciliation = true
+
 # Slack notifications via AWS Chatbot
 # TEMPORARY: Disabled until Slack workspace is authorized for prod account (235500187906)
 enable_slack_notifications = false

@@ -1447,6 +1447,12 @@ variable "enable_ac_blue_green" {
   default     = false
 }
 
+variable "enable_secret_reconciliation" {
+  description = "Enable scheduled cleanup of orphaned per-instance AC secrets"
+  type        = bool
+  default     = true
+}
+
 variable "ac_green_standby_min_size" {
   description = "Minimum instance count for AC green ASG in standby mode. 1 = warm standby (instant switch), 0 = cold standby (requires scale-up)."
   type        = number

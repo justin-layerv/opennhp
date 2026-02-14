@@ -278,6 +278,12 @@ variable "enable_termination_cleanup" {
   default = true
 }
 
+variable "enable_secret_reconciliation" {
+  description = "Enable scheduled cleanup of orphaned per-instance AC secrets"
+  type        = bool
+  default     = true
+}
+
 # ==============================================================================
 # QURL Service Configuration
 # ==============================================================================

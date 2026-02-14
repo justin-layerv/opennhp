@@ -253,6 +253,9 @@ module "nhp" {
   # Termination cleanup
   enable_termination_cleanup = var.enable_termination_cleanup
 
+  # Secret reconciliation (cleanup orphaned per-instance secrets)
+  enable_secret_reconciliation = var.enable_secret_reconciliation
+
   # Blue/Green deployment configuration (Server)
   enable_blue_green               = var.enable_blue_green
   green_standby_min_size          = var.green_standby_min_size

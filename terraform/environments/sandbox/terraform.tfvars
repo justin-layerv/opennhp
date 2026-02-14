@@ -47,6 +47,9 @@ resource_mode = "api"
 
 # Termination cleanup: Lambda cleans stale DynamoDB assignments on server termination
 enable_termination_cleanup = true
+
+# Secret reconciliation: Lambda cleans orphaned per-instance AC secrets daily
+enable_secret_reconciliation = true
 # auth_url is set dynamically in main.tf to Console EC2 internal NLB endpoint
 # auth_signing_key and auth_aes_key are passed via GitHub Secrets (TF_VAR_auth_signing_key, TF_VAR_auth_aes_key)
 # IMPORTANT: auth_signing_key must match Console's jwt.signing-key in config.yaml

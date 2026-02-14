@@ -39,6 +39,12 @@ variable "enable_termination_cleanup" {
   type        = bool
 }
 
+variable "enable_secret_reconciliation" {
+  description = "Enable scheduled cleanup of orphaned per-instance AC secrets"
+  type        = bool
+  default     = true
+}
+
 variable "vpc_cidr" {
   type = string
 }

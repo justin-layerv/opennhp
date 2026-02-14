@@ -470,3 +470,9 @@ variable "alerts_sns_topic_arn" {
   type        = string
   default     = null
 }
+
+variable "enable_secret_reconciliation" {
+  description = "Enable scheduled cleanup of orphaned per-instance AC secrets"
+  type        = bool
+  default     = true
+}
