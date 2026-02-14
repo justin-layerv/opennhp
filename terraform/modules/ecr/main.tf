@@ -921,6 +921,8 @@ resource "aws_iam_policy" "terraform_apply_iam" {
           "iam:UpdateAssumeRolePolicy",
           "iam:TagRole",
           "iam:UntagRole",
+          "iam:TagInstanceProfile",
+          "iam:UntagInstanceProfile",
           "iam:PutRolePolicy",
           "iam:DeleteRolePolicy",
           "iam:AttachRolePolicy",
@@ -1120,9 +1122,24 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "s3:PutBucketPublicAccessBlock",
           "s3:PutBucketTagging",
           "s3:PutBucketPolicy",
-          "s3:DeleteBucketPolicy"
+          "s3:DeleteBucketPolicy",
+          "s3:PutBucketLifecycleConfiguration",
+          "s3:GetBucketLifecycleConfiguration"
         ]
         Resource = "arn:aws:s3:::layerv-nhp-*"
+      },
+      {
+        # S3 object permissions for Terraform-managed objects (plugin manifests, configs)
+        Sid    = "S3Objects"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:GetObjectTagging",
+          "s3:PutObjectTagging"
+        ]
+        Resource = "arn:aws:s3:::layerv-nhp-*-plugins/*"
       },
       {
         Sid    = "EventBridge"
@@ -1178,7 +1195,9 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "ecr:PutLifecyclePolicy",
           "ecr:DeleteLifecyclePolicy",
           "ecr:SetRepositoryPolicy",
-          "ecr:DeleteRepositoryPolicy"
+          "ecr:DeleteRepositoryPolicy",
+          "ecr:TagResource",
+          "ecr:UntagResource"
         ]
         Resource = "arn:aws:ecr:${local.region}:${local.account_id}:repository/layerv/*"
       },
