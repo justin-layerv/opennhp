@@ -673,7 +673,7 @@
         "type": "grafana-athena-datasource",
         "uid": "${athena_uid}"
       },
-      "description": "Cost breakdown by the Component tag applied to resources. Untagged resources appear as 'untagged'. Action: If a large portion is untagged, improve resource tagging for better cost attribution.",
+      "description": "Cost breakdown by the Service tag applied to resources (nhp-server, nhp-ac, qurl, shared). Untagged resources appear as 'untagged'. Action: If a large portion is untagged, improve resource tagging for better cost attribution.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -702,7 +702,7 @@
           "sort": "none"
         }
       },
-      "title": "Spend by Component Tag",
+      "title": "Spend by Service Tag",
       "type": "piechart",
       "targets": [
         {
@@ -713,7 +713,7 @@
             "resultReuseEnabled": false
           },
           "format": 1,
-          "rawSQL": "SELECT COALESCE(resource_tags['user:Component'], 'untagged') AS component,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')\nGROUP BY 1\nORDER BY 2 DESC",
+          "rawSQL": "SELECT COALESCE(resource_tags['user_service'], 'untagged') AS service,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')\nGROUP BY 1\nORDER BY 2 DESC",
           "refId": "A"
         }
       ]
@@ -813,7 +813,7 @@
             "resultReuseEnabled": false
           },
           "format": 1,
-          "rawSQL": "SELECT COALESCE(resource_tags['user:Environment'], 'untagged') AS environment,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')\nGROUP BY 1\nORDER BY 2 DESC",
+          "rawSQL": "SELECT COALESCE(resource_tags['user_environment'], 'untagged') AS environment,\n  SUM(line_item_unblended_cost) AS cost\nFROM cost_and_usage\nWHERE billing_period = '$billing_period'\n  AND line_item_line_item_type != 'Tax'\n  AND ('$account' = 'All' OR line_item_usage_account_id = '$account')\n  AND ('$service' = 'All' OR product_product_name = '$service')\nGROUP BY 1\nORDER BY 2 DESC",
           "refId": "A"
         }
       ]

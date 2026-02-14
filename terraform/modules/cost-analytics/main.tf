@@ -360,13 +360,13 @@ resource "aws_iam_role" "grafana_athena" {
 # ==============================================================================
 # Tags must be activated in the management/payer account for them to appear
 # in CUR data. Without activation, resource_tags in Athena will be empty
-# and the Grafana "Spend by Component Tag" panel shows only "untagged".
+# and the Grafana "Spend by Service Tag" panel shows only "untagged".
 #
 # NOTE: After activation, tags only appear in NEW CUR data (not retroactive).
 # It may take up to 24 hours for newly activated tags to appear.
 
-resource "aws_ce_cost_allocation_tag" "component" {
-  tag_key = "Component"
+resource "aws_ce_cost_allocation_tag" "service" {
+  tag_key = "Service"
   status  = "Active"
 }
 
