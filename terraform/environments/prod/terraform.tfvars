@@ -148,8 +148,8 @@ auth0_domain = "layerv.us.auth0.com"
 qurl_auth0_domain   = "auth.layerv.ai"
 qurl_auth0_audience = "https://api.layerv.ai"
 
-# Auth0 M2M credential rotation (Phase 2: required for prod security)
-auth0_enable_rotation = true
+# Auth0 M2M credential rotation (Phase 2: enable after auth0 management secret is created)
+auth0_enable_rotation = false
 
 # Console license lookup GSIs (required for license validation even without Console EC2)
 nhp_dynamodb_licenses_customer_index      = "customer_id-index"

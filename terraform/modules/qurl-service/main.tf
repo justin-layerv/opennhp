@@ -448,7 +448,7 @@ resource "aws_security_group" "ecs" {
 
 # Allow ECS tasks to connect to Redis (if enabled)
 resource "aws_security_group_rule" "ecs_to_redis" {
-  count = var.redis_security_group_id != null ? 1 : 0
+  count = var.redis_enabled ? 1 : 0
 
   type                     = "ingress"
   from_port                = 6379
