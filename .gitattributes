@@ -1,7 +1,13 @@
+* text=auto
+
 * linguist-language=Go
 
 *.c linguist-vendored
 *.h linguist-vendored
 
-
 *.md linguist-documentation=true
+
+# Ensure consistent LF line endings for shell-interpreted files
+*.tf text eol=lf
+*.sh text eol=lf
+*.tpl text eol=lf

@@ -702,6 +702,10 @@ module "ac" {
   centralized_cert_domains    = var.centralized_cert_domains
   acme_lambda_function_name   = var.acme_lambda_function_name
 
+  # ASG capacity overrides
+  ac_min_capacity = var.ac_min_capacity
+  ac_max_capacity = var.ac_max_capacity
+
   # Blue/Green deployment configuration
   enable_blue_green      = var.enable_ac_blue_green
   green_standby_min_size = var.ac_green_standby_min_size

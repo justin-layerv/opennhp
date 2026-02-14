@@ -118,6 +118,19 @@ variable "terraform_lock_table" {
   default = "terraform-state-lock"
 }
 
+# AC capacity
+variable "ac_min_capacity" {
+  description = "Minimum number of AC instances"
+  type        = number
+  default     = null
+}
+
+variable "ac_max_capacity" {
+  description = "Maximum number of AC instances"
+  type        = number
+  default     = null
+}
+
 # AC configuration
 variable "ac_auth_service_id" {
   type    = string

@@ -307,6 +307,22 @@ variable "alarm_sns_topic_arn" {
 }
 
 # ============================================================================
+# ASG Capacity Configuration
+# ============================================================================
+
+variable "ac_min_capacity" {
+  description = "Minimum number of AC instances. Defaults to 2 for prod, 1 otherwise."
+  type        = number
+  default     = null
+}
+
+variable "ac_max_capacity" {
+  description = "Maximum number of AC instances. Defaults to 6 for prod, 3 otherwise."
+  type        = number
+  default     = null
+}
+
+# ============================================================================
 # Deployment Configuration
 # ============================================================================
 

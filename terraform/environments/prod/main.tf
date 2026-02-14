@@ -46,6 +46,8 @@ module "nhp" {
   # AC configuration
   ac_auth_service_id = var.ac_auth_service_id
   ac_resource_ids    = var.ac_resource_ids
+  ac_min_capacity    = var.ac_min_capacity
+  ac_max_capacity    = var.ac_max_capacity
 
   # Security services
   enable_cloudtrail  = var.enable_cloudtrail

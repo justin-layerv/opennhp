@@ -10,8 +10,9 @@ domain_name    = "nhp.layerv.ai"
 hosted_zone    = "layerv.ai"            # Hosted in layerv-mgmt account - requires cross-account DNS access
 hosted_zone_id = "Z0748438C8EK6UAW94ST" # Bypass lookup - zone is in layerv-mgmt account
 multi_tenant   = true
-min_capacity   = 3
-max_capacity   = 10
+# Minimal for initial deployment. Production-ready values: min=3, max=10
+min_capacity   = 1
+max_capacity   = 3
 vpc_cidr       = "10.200.0.0/16" # Different CIDR from sandbox
 
 # Multi-account config: prod pulls images from sandbox account's ECR
@@ -23,6 +24,8 @@ deploy_ac          = true
 acme_email         = "admin@layerv.ai"
 ac_auth_service_id = "layerv"
 ac_resource_ids    = ["qurl"] # Phase 2: QURL is the only service deployed initially
+ac_min_capacity    = 1        # Minimal for initial deployment. Production-ready: 2
+ac_max_capacity    = 3        # Production-ready: 6
 
 # Terraform state bucket for GitHub Actions permissions
 terraform_state_bucket = "layerv-terraform-state-235500187906"
@@ -81,8 +84,8 @@ server_plugins = ["passcode", "qurl"]
 nhp_server_assignment_enabled        = true
 nhp_region                           = "us-east-2"
 nhp_cloudmap_service_name            = "server"
-nhp_assignment_servers_per_ac        = 3
-nhp_assignment_require_distinct_azs  = true
+nhp_assignment_servers_per_ac        = 1     # Minimal for initial deployment. Production-ready: 3
+nhp_assignment_require_distinct_azs  = false # Production-ready: true (requires servers_per_ac >= 3)
 nhp_health_monitor_check_interval    = 60
 nhp_health_monitor_operation_timeout = 30
 nhp_console_ac_enabled               = true

@@ -1,0 +1,369 @@
+name: Promote to Production
+
+# Promotion-only deployment workflow. No rebuild — deploys existing sandbox ECR images to prod.
+#
+# This workflow:
+# 1. Verifies images exist in sandbox ECR (preflight)
+# 2. Runs terraform apply to create/update prod infrastructure
+# 3. Updates SSM image tags and triggers instance refresh
+# 4. Validates the deployment (NLB, ASG, etcd, secrets)
+#
+# First-time usage:
+#   gh workflow run promote-to-prod.yml --ref main \
+#     -f image_tag=<commit-sha> -f run_terraform=true
+#
+# Rollback procedure:
+#   Re-run the workflow with the previous known-good image tag:
+#   gh workflow run promote-to-prod.yml --ref main \
+#     -f image_tag=<previous-commit-sha> -f run_terraform=false
+#   This updates SSM parameters and triggers instance refresh to roll back.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Commit SHA of images already in sandbox ECR'
+        required: true
+        type: string
+      run_terraform:
+        description: 'Run terraform apply (required for first deploy or infra changes)'
+        required: true
+        default: true
+        type: boolean
+      deploy_server:
+        description: 'Deploy NHP Server (SSM update + instance refresh)'
+        required: true
+        default: true
+        type: boolean
+      deploy_ac:
+        description: 'Deploy Access Controller (SSM update + instance refresh)'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: promote-to-prod
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+  TF_VERSION: '1.14.3'
+  # Production environment constants (centralized for easy updates)
+  PROD_MGMT_ACCOUNT_ID: '165115313779'
+  PROD_ACCOUNT_ID: '235500187906'
+  ECR_SERVER_REPO: 'layerv/nhp-server'
+  ECR_AC_REPO: 'layerv/nhp-ac'
+
+jobs:
+  # =============================================================================
+  # PREFLIGHT - Verify prerequisites exist before spending time on TF apply
+  # =============================================================================
+  preflight:
+    name: Preflight Checks
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code (for git verification)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate image_tag format
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          if ! echo "$IMAGE_TAG" | grep -qE '^[0-9a-f]{7,40}$'; then
+            echo "::error::image_tag must be a 7-40 character hex commit SHA, got: '$IMAGE_TAG'"
+            exit 1
+          fi
+          if ! git rev-parse --verify "${IMAGE_TAG}^{commit}" > /dev/null 2>&1; then
+            echo "::error::Commit $IMAGE_TAG not found in this repository"
+            exit 1
+          fi
+          echo "Image tag valid: $IMAGE_TAG (commit exists in repo)"
+
+      - name: Configure AWS credentials (sandbox - for ECR check)
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify images exist in sandbox ECR
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          echo "Verifying images in sandbox ECR..."
+          for repo in "$ECR_SERVER_REPO" "$ECR_AC_REPO"; do
+            echo "Checking $repo:$IMAGE_TAG..."
+            if ! aws ecr describe-images \
+              --repository-name "$repo" \
+              --image-ids imageTag="$IMAGE_TAG" \
+              --query "imageDetails[0].imageTags" \
+              --output text > /dev/null 2>&1; then
+              echo "::error::Image $repo:$IMAGE_TAG not found in sandbox ECR"
+              exit 1
+            fi
+            echo "  Found: $repo:$IMAGE_TAG"
+          done
+          echo "All images verified."
+
+      - name: Configure AWS credentials (prod)
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify Secrets Manager secrets exist
+        run: |
+          echo "Verifying Secrets Manager secrets..."
+          SECRETS=(
+            "layerv-nhp-prod/qurl-jwt-secret"
+            "layerv-nhp-prod/qurl-internal-service-token"
+            "layerv-nhp-prod/grafana-cloud-otlp"
+          )
+          for secret in "${SECRETS[@]}"; do
+            if aws secretsmanager describe-secret --secret-id "$secret" > /dev/null 2>&1; then
+              echo "  Found: $secret"
+            else
+              echo "::error::Secret not found: $secret"
+              exit 1
+            fi
+          done
+          echo "All secrets verified."
+
+      - name: Verify S3 buckets exist
+        run: |
+          echo "Verifying S3 buckets..."
+          BUCKETS=(
+            "layerv-terraform-state-${PROD_ACCOUNT_ID}"
+            "layerv-nhp-prod-alb-logs"
+          )
+          for bucket in "${BUCKETS[@]}"; do
+            if aws s3api head-bucket --bucket "$bucket" 2>/dev/null; then
+              echo "  Found: $bucket"
+            else
+              echo "::error::S3 bucket not found: $bucket"
+              exit 1
+            fi
+          done
+          echo "All buckets verified."
+
+      - name: Verify cross-account Route53 role
+        run: |
+          echo "Verifying cross-account Route53 role..."
+          ROLE_ARN="arn:aws:iam::${PROD_MGMT_ACCOUNT_ID}:role/nhp-ac-route53-access"
+          if aws sts assume-role \
+            --role-arn "$ROLE_ARN" \
+            --role-session-name "preflight-check" \
+            --duration-seconds 900 \
+            --query "Credentials.AccessKeyId" \
+            --output text > /dev/null 2>&1; then
+            echo "  Route53 cross-account role assumable"
+          else
+            echo "::warning::Cannot assume Route53 cross-account role: $ROLE_ARN"
+            echo "  This may be expected if the role has not been created yet."
+          fi
+
+      - name: Verify GitHub secrets are set
+        env:
+          PROD_AUTH0_CLIENT_ID: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
+          PROD_AUTH0_CLIENT_SECRET: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
+          PROD_GRAFANA_AUTH: ${{ secrets.PROD_GRAFANA_AUTH }}
+        run: |
+          echo "Verifying GitHub secrets..."
+          MISSING=0
+          for var in PROD_AUTH0_CLIENT_ID PROD_AUTH0_CLIENT_SECRET PROD_GRAFANA_AUTH; do
+            if [[ -z "${!var}" ]]; then
+              echo "::error::GitHub secret $var is not set"
+              MISSING=1
+            else
+              echo "  Found: $var"
+            fi
+          done
+          if [[ $MISSING -eq 1 ]]; then
+            exit 1
+          fi
+          echo "All GitHub secrets verified."
+
+  # =============================================================================
+  # TERRAFORM APPLY - Create/update production infrastructure
+  # =============================================================================
+  terraform-apply:
+    name: Terraform Apply (prod)
+    needs: [preflight]
+    if: inputs.run_terraform
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 45
+    outputs:
+      server_asg: ${{ steps.outputs.outputs.server_asg }}
+      ac_asg: ${{ steps.outputs.outputs.ac_asg }}
+      nlb_dns: ${{ steps.outputs.outputs.nlb_dns }}
+      etcd_endpoint: ${{ steps.outputs.outputs.etcd_endpoint }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Cache Terraform plugins
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
+          restore-keys: terraform-plugins-
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build Lambda Packages
+        uses: ./.github/actions/build-lambda-packages
+
+      - name: Terraform Init
+        working-directory: terraform/environments/prod
+        run: |
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
+          terraform init
+
+      - name: Terraform Apply
+        working-directory: terraform/environments/prod
+        env:
+          TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
+          TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
+          TF_VAR_ac_license_key: ${{ secrets.PROD_AC_LICENSE_KEY }}
+          TF_VAR_grafana_auth: ${{ secrets.PROD_GRAFANA_AUTH }}
+          TF_VAR_auth0_tf_client_id: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
+          TF_VAR_auth0_tf_client_secret: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
+          TF_VAR_confirm_prod_deployment: "yes-deploy-to-production"
+          TF_VAR_image_tag: ${{ inputs.image_tag }}
+        run: terraform apply -auto-approve
+
+      - name: Get Terraform Outputs
+        id: outputs
+        working-directory: terraform/environments/prod
+        run: |
+          echo "server_asg=$(terraform output -raw asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+          echo "ac_asg=$(terraform output -raw ac_asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+          echo "nlb_dns=$(terraform output -raw nlb_dns_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+          echo "etcd_endpoint=$(terraform output -raw etcd_endpoint 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+
+  # =============================================================================
+  # DEPLOY SERVER - Update SSM and trigger instance refresh
+  # =============================================================================
+  deploy-server:
+    name: Deploy NHP Server
+    needs: [preflight, terraform-apply]
+    if: |
+      always() &&
+      needs.preflight.result == 'success' &&
+      (needs.terraform-apply.result == 'success' || needs.terraform-apply.result == 'skipped') &&
+      inputs.deploy_server
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Configure AWS credentials
+        uses: ./.github/actions/setup-deploy
+        with:
+          aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update SSM and deploy server
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          ./.github/scripts/update-ssm-image-tag.sh prod server "$IMAGE_TAG" --refresh
+
+  # =============================================================================
+  # DEPLOY AC - Update SSM and trigger instance refresh
+  # =============================================================================
+  deploy-ac:
+    name: Deploy Access Controller
+    needs: [preflight, terraform-apply]
+    if: |
+      always() &&
+      needs.preflight.result == 'success' &&
+      (needs.terraform-apply.result == 'success' || needs.terraform-apply.result == 'skipped') &&
+      inputs.deploy_ac
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Configure AWS credentials
+        uses: ./.github/actions/setup-deploy
+        with:
+          aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update SSM and deploy AC
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          ./.github/scripts/update-ssm-image-tag.sh prod ac "$IMAGE_TAG" --refresh
+
+  # =============================================================================
+  # VALIDATE - Verify the deployment is healthy
+  # =============================================================================
+  validate-deployment:
+    name: Validate Deployment
+    needs: [deploy-server, deploy-ac, terraform-apply]
+    # always() is required because `needs` jobs may be skipped (e.g., deploy_server=false).
+    # Without always(), GitHub skips this job when any dependency is skipped.
+    # The additional conditions ensure we:
+    #   1. Only run if at least one job actually did something (success)
+    #   2. Don't run if any job that DID run failed (failure != skipped)
+    if: |
+      always() &&
+      (needs.deploy-server.result == 'success' || needs.deploy-ac.result == 'success' || needs.terraform-apply.result == 'success') &&
+      needs.deploy-server.result != 'failure' &&
+      needs.deploy-ac.result != 'failure'
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Configure AWS credentials
+        uses: ./.github/actions/setup-deploy
+        with:
+          aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run deployment validation
+        run: ./scripts/validate-deployment.sh prod
+
+      - name: Deployment summary
+        if: always()
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          TF_RESULT: ${{ needs.terraform-apply.result }}
+          SERVER_RESULT: ${{ needs.deploy-server.result }}
+          AC_RESULT: ${{ needs.deploy-ac.result }}
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | \`$IMAGE_TAG\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Terraform Apply | $TF_RESULT |" >> $GITHUB_STEP_SUMMARY
+          echo "| NHP Server | $SERVER_RESULT |" >> $GITHUB_STEP_SUMMARY
+          echo "| Access Controller | $AC_RESULT |" >> $GITHUB_STEP_SUMMARY

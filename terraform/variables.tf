@@ -247,6 +247,18 @@ variable "qurl_alb_access_logs_bucket" {
 
 # ==================== AC Configuration ====================
 
+variable "ac_min_capacity" {
+  description = "Minimum number of AC instances. Overrides the module default (2 for prod, 1 otherwise)."
+  type        = number
+  default     = null
+}
+
+variable "ac_max_capacity" {
+  description = "Maximum number of AC instances. Overrides the module default (6 for prod, 3 otherwise)."
+  type        = number
+  default     = null
+}
+
 variable "deploy_ac" {
   description = "Deploy the Access Controller (AC) with embedded Traefik for TLS termination"
   type        = bool

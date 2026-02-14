@@ -774,9 +774,9 @@ resource "aws_launch_template" "ac" {
 resource "aws_autoscaling_group" "ac" {
   name                = "${var.name_prefix}-ac"
   vpc_zone_identifier = var.public_subnet_ids
-  min_size            = local.is_prod ? 2 : 1
-  max_size            = local.is_prod ? 6 : 3
-  desired_capacity    = local.is_prod ? 2 : 1
+  min_size            = coalesce(var.ac_min_capacity, local.is_prod ? 2 : 1)
+  max_size            = coalesce(var.ac_max_capacity, local.is_prod ? 6 : 3)
+  desired_capacity    = coalesce(var.ac_min_capacity, local.is_prod ? 2 : 1)
 
   launch_template {
     id      = aws_launch_template.ac.id
