@@ -206,6 +206,10 @@ func (hs *HttpServer) initHealthManager() error {
 			Client:  pinger,
 			Timeout: 5 * time.Second,
 		}))
+		// Wire storage health probe into metrics publisher for StorageHealthy metric
+		hs.udpServer.metrics.SetHealthProbe(func(ctx context.Context) bool {
+			return pinger.Ping(ctx) == nil
+		})
 		log.Info("Health check: etcd checker registered (storage backend: %s)", backendName)
 		return nil
 	}
@@ -216,6 +220,10 @@ func (hs *HttpServer) initHealthManager() error {
 			Client:  pinger,
 			Timeout: 5 * time.Second,
 		}))
+		// Wire storage health probe into metrics publisher for StorageHealthy metric
+		hs.udpServer.metrics.SetHealthProbe(func(ctx context.Context) bool {
+			return pinger.Ping(ctx) == nil
+		})
 		log.Info("Health check: DynamoDB checker registered (storage backend: %s)", backendName)
 		return nil
 	}

@@ -671,7 +671,7 @@ resource "aws_dynamodb_table" "qurl_webhooks" {
 # qurl-webhook-deliveries: Stores webhook delivery attempts
 # PK: delivery_id
 # GSI: webhook-index (query deliveries by webhook for history)
-# GSI: status-index (query failed deliveries for retry processing)
+# GSI: status-date-index (query failed deliveries for retry processing, time-sharded)
 resource "aws_dynamodb_table" "qurl_webhook_deliveries" {
   count = var.deploy_qurl_tables ? 1 : 0
 
@@ -696,7 +696,7 @@ resource "aws_dynamodb_table" "qurl_webhook_deliveries" {
   }
 
   attribute {
-    name = "status"
+    name = "status_date"
     type = "S"
   }
 
@@ -714,10 +714,12 @@ resource "aws_dynamodb_table" "qurl_webhook_deliveries" {
   }
 
   # GSI: Find deliveries by status for retry processing
-  # Query pattern: status = "failed" AND next_retry_at < now()
+  # Uses time-sharded partition key (status#YYYY-MM-DD) to avoid hot partitions.
+  # Bare "status" has only 2-3 values, causing all items to hash to the same partition.
+  # Query pattern: status_date = "retrying#YYYY-MM-DD" AND next_retry_at <= now()
   global_secondary_index {
-    name            = "status-index"
-    hash_key        = "status"
+    name            = "status-date-index"
+    hash_key        = "status_date"
     range_key       = "next_retry_at"
     projection_type = "ALL"
   }

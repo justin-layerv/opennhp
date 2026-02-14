@@ -1,12 +1,15 @@
 package log
 
 import (
+	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,6 +27,67 @@ const (
 	LogLevelDebug
 	LogLevelTrace
 )
+
+// Custom slog levels for NHP-specific log categories.
+const (
+	SlogLevelTrace       slog.Level = slog.LevelDebug - 8 // -12
+	SlogLevelVerbose     slog.Level = slog.LevelDebug - 4 // -8
+	SlogLevelDebug       slog.Level = slog.LevelDebug     // -4
+	SlogLevelInfo        slog.Level = slog.LevelInfo      // 0
+	SlogLevelAudit       slog.Level = slog.LevelInfo + 1  // 1
+	SlogLevelStats       slog.Level = slog.LevelInfo + 2  // 2
+	SlogLevelTransaction slog.Level = slog.LevelInfo + 3  // 3
+	SlogLevelWarning     slog.Level = slog.LevelWarn      // 4
+	SlogLevelEvaluate    slog.Level = slog.LevelWarn + 2  // 6
+	SlogLevelError       slog.Level = slog.LevelError     // 8
+	SlogLevelCritical    slog.Level = slog.LevelError + 4 // 12
+)
+
+// slogLevelName maps custom slog levels to their display names for JSON output.
+func slogLevelName(l slog.Level) string {
+	switch l {
+	case SlogLevelTrace:
+		return "TRACE"
+	case SlogLevelVerbose:
+		return "VERBOSE"
+	case SlogLevelDebug:
+		return "DEBUG"
+	case SlogLevelInfo:
+		return "INFO"
+	case SlogLevelAudit:
+		return "AUDIT"
+	case SlogLevelStats:
+		return "STATS"
+	case SlogLevelTransaction:
+		return "TRANSACTION"
+	case SlogLevelWarning:
+		return "WARNING"
+	case SlogLevelEvaluate:
+		return "EVALUATE"
+	case SlogLevelError:
+		return "ERROR"
+	case SlogLevelCritical:
+		return "CRITICAL"
+	default:
+		return l.String()
+	}
+}
+
+// newJSONHandler creates a slog.JSONHandler configured for NHP structured logging.
+func newJSONHandler(w io.Writer) slog.Handler {
+	return slog.NewJSONHandler(w, &slog.HandlerOptions{
+		AddSource: ShowCallerFileLine,
+		Level:     SlogLevelTrace, // Allow all levels through; filtering is done by Logger
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.LevelKey {
+				if level, ok := a.Value.Any().(slog.Level); ok {
+					a.Value = slog.StringValue(slogLevelName(level))
+				}
+			}
+			return a
+		},
+	})
+}
 
 type AsyncLogWriter struct {
 	sync.Mutex
@@ -61,12 +125,16 @@ func (lw *AsyncLogWriter) Write(buf []byte) (n int, err error) {
 	lw.Lock()
 	defer lw.Unlock()
 
-	len := len(buf)
-	msg := make([]byte, len)
+	if lw.msg == nil {
+		return 0, nil // writer closed; discard silently during shutdown
+	}
+
+	n = len(buf)
+	msg := make([]byte, n)
 	copy(msg, buf)
 	lw.msg <- msg
 
-	return len, nil
+	return n, nil
 }
 
 func (lw *AsyncLogWriter) writeRoutine() {
@@ -181,25 +249,19 @@ func (lw *AsyncLogWriter) Close() {
 
 }
 
-// A logger that implements async logging by default (logging without impact on real business logic).
-// It also provides customizable logging functions.
+// A logger that outputs structured JSON using slog.JSONHandler backed by AsyncLogWriter.
+// It preserves the existing printf-style API for backward compatibility with all call sites.
 // At default implementation, it is recommended to call Close() at program termination.
 type Logger struct {
 	sync.Mutex
 	lw         *AsyncLogWriter
 	lwEvaluate *AsyncLogWriter
 	lwAudit    *AsyncLogWriter
-	lgWrn      *log.Logger
-	lgErr      *log.Logger
-	lgCrt      *log.Logger
-	lgEva      *log.Logger
-	lgInf      *log.Logger
-	lgSts      *log.Logger
-	lgAdt      *log.Logger
-	lgTrx      *log.Logger
-	lgDbg      *log.Logger
-	lgTrc      *log.Logger
-	lgVbs      *log.Logger
+
+	handler      slog.Handler // JSON handler for main log
+	evalHandler  slog.Handler // JSON handler for evaluate log
+	auditHandler slog.Handler // JSON handler for audit log
+	component    string       // component name included in each JSON record
 
 	Warning     func(format string, args ...any)
 	Error       func(format string, args ...any)
@@ -214,9 +276,9 @@ type Logger struct {
 	Verbose     func(format string, args ...any)
 
 	logLevel    int
-	callDepth   int // call depth to be adjusted by how it is called
+	callDepth   int // call depth for runtime.Callers to report correct source location
 	isSubLogger bool
-	isRunning   bool
+	stopped     atomic.Bool
 
 	subLoggers []*Logger
 }
@@ -224,8 +286,22 @@ type Logger struct {
 // Function for use in Logger for discarding logged lines.
 func BlackholeLogf(format string, args ...any) {}
 
-// NewLogger constructs a Logger that logs at the specified log l.logLevel and above.
-// It decorates log lines with the log l.logLevel, date, time, and prepend.
+// logJSON writes a structured JSON log record to the given handler.
+func (l *Logger) logJSON(handler slog.Handler, level slog.Level, format string, args ...any) {
+	if l.stopped.Load() {
+		return
+	}
+	var pcs [1]uintptr
+	runtime.Callers(l.callDepth+1, pcs[:])
+	r := slog.NewRecord(time.Now(), level, fmt.Sprintf(format, args...), pcs[0])
+	if l.component != "" {
+		r.AddAttrs(slog.String("component", l.component))
+	}
+	_ = handler.Handle(context.Background(), r)
+}
+
+// NewLogger constructs a Logger that logs at the specified log level and above.
+// Output is structured JSON with time, level, source, message, and component fields.
 func NewLogger(prepend string, level int, dir string, filename string) *Logger {
 	l := &Logger{
 		logLevel:  level,
@@ -259,89 +335,77 @@ func NewLogger(prepend string, level int, dir string, filename string) *Logger {
 }
 
 func (l *Logger) initActions(prepend string) {
-	flag := log.Ldate | log.Ltime | log.Lmsgprefix
-	if ShowCallerFileLine {
-		flag |= log.Lshortfile
-	}
+	l.handler = newJSONHandler(l.lw)
+	l.evalHandler = newJSONHandler(l.lwEvaluate)
+	l.auditHandler = newJSONHandler(l.lwAudit)
+	l.component = prepend
 
-	l.lgWrn = log.New(l.lw, prepend+" [Warning] ", flag)
 	l.Warning = func(format string, args ...any) {
 		if l.logLevel >= LogLevelError {
-			l.lgWrn.Output(l.callDepth, fmt.Sprintf(format, args...))
+			l.logJSON(l.handler, SlogLevelWarning, format, args...)
 		}
 	}
 
-	l.lgErr = log.New(l.lw, prepend+" [Error] ", flag)
 	l.Error = func(format string, args ...any) {
 		if l.logLevel >= LogLevelError {
-			l.lgErr.Output(l.callDepth, fmt.Sprintf(format, args...))
+			l.logJSON(l.handler, SlogLevelError, format, args...)
 		}
 	}
 
-	l.lgCrt = log.New(l.lw, prepend+" [Critical] ", flag)
 	l.Critical = func(format string, args ...any) {
 		if l.logLevel >= LogLevelError {
-			l.lgCrt.Output(l.callDepth, fmt.Sprintf(format, args...))
+			l.logJSON(l.handler, SlogLevelCritical, format, args...)
 		}
 	}
 
-	l.lgEva = log.New(l.lwEvaluate, prepend+" [Evaluate] ", flag|log.Lmicroseconds)
 	l.Evaluate = func(format string, args ...any) {
 		if l.logLevel >= LogLevelError {
-			l.lgEva.Output(l.callDepth, fmt.Sprintf(format, args...))
+			l.logJSON(l.evalHandler, SlogLevelEvaluate, format, args...)
 		}
 	}
 
-	l.lgInf = log.New(l.lw, prepend+" [Info] ", flag)
 	l.Info = func(format string, args ...any) {
 		if l.logLevel >= LogLevelInfo {
-			l.lgInf.Output(l.callDepth, fmt.Sprintf(format, args...))
+			l.logJSON(l.handler, SlogLevelInfo, format, args...)
 		}
 	}
 
-	l.lgSts = log.New(l.lw, prepend+" [Stats] ", flag)
 	l.Stats = func(format string, args ...any) {
 		if l.logLevel >= LogLevelInfo {
-			l.lgSts.Output(l.callDepth, fmt.Sprintf(format, args...))
+			l.logJSON(l.handler, SlogLevelStats, format, args...)
 		}
 	}
 
-	// output to audit log writer
-	l.lgAdt = log.New(l.lwAudit, prepend+" [Audit] ", flag)
+	// output to audit log handler
 	l.Audit = func(format string, args ...any) {
 		if l.logLevel >= LogLevelAudit {
-			l.lgAdt.Output(l.callDepth, fmt.Sprintf(format, args...))
+			l.logJSON(l.auditHandler, SlogLevelAudit, format, args...)
 		}
 	}
 
-	l.lgTrx = log.New(l.lwAudit, prepend+" [Transaction] ", flag)
 	l.Transaction = func(format string, args ...any) {
 		if l.logLevel >= LogLevelAudit {
-			l.lgTrx.Output(l.callDepth, fmt.Sprintf(format, args...))
+			l.logJSON(l.auditHandler, SlogLevelTransaction, format, args...)
 		}
 	}
 
-	l.lgDbg = log.New(l.lw, prepend+" [Debug] ", flag)
 	l.Debug = func(format string, args ...any) {
 		if l.logLevel >= LogLevelDebug {
-			l.lgDbg.Output(l.callDepth, fmt.Sprintf(format, args...))
+			l.logJSON(l.handler, SlogLevelDebug, format, args...)
 		}
 	}
 
-	l.lgVbs = log.New(l.lw, prepend+" [Verbose] ", flag)
 	l.Verbose = func(format string, args ...any) {
 		if l.logLevel >= LogLevelTrace {
-			l.lgVbs.Output(l.callDepth, fmt.Sprintf(format, args...))
+			l.logJSON(l.handler, SlogLevelVerbose, format, args...)
 		}
 	}
 
-	l.lgTrc = log.New(l.lw, prepend+" [Trace] ", flag)
 	l.Trace = func(format string, args ...any) {
 		if l.logLevel >= LogLevelTrace {
-			l.lgTrc.Output(l.callDepth, fmt.Sprintf(format, args...))
+			l.logJSON(l.handler, SlogLevelTrace, format, args...)
 		}
 	}
-	l.isRunning = true
 }
 
 func (l *Logger) SetLogLevel(level int) {
@@ -359,44 +423,10 @@ func (l *Logger) SetLogLevel(level int) {
 }
 
 func (l *Logger) Close() {
-	if !l.isRunning {
-		return
+	if l.stopped.Swap(true) {
+		return // already stopped
 	}
-	l.isRunning = false
-	// stop pushing further messages by SetOutput() because it is thread-safe
-	if l.lgWrn != nil {
-		l.lgWrn.SetOutput(io.Discard)
-	}
-	if l.lgErr != nil {
-		l.lgErr.SetOutput(io.Discard)
-	}
-	if l.lgCrt != nil {
-		l.lgCrt.SetOutput(io.Discard)
-	}
-	if l.lgEva != nil {
-		l.lgEva.SetOutput(io.Discard)
-	}
-	if l.lgInf != nil {
-		l.lgInf.SetOutput(io.Discard)
-	}
-	if l.lgAdt != nil {
-		l.lgAdt.SetOutput(io.Discard)
-	}
-	if l.lgSts != nil {
-		l.lgSts.SetOutput(io.Discard)
-	}
-	if l.lgTrx != nil {
-		l.lgTrx.SetOutput(io.Discard)
-	}
-	if l.lgDbg != nil {
-		l.lgDbg.SetOutput(io.Discard)
-	}
-	if l.lgTrc != nil {
-		l.lgTrc.SetOutput(io.Discard)
-	}
-	if l.lgVbs != nil {
-		l.lgVbs.SetOutput(io.Discard)
-	}
+
 	if l.isSubLogger {
 		// sublogger reuses writer so must not close the writer routine
 		return
@@ -443,44 +473,9 @@ func (l *Logger) DateUpdateChan() chan string {
 	return l.lw.dateUpdatedCh
 }
 
-func (l *Logger) SetFlags(flag int) {
-	l.Lock()
-	defer l.Unlock()
-
-	if l.lgWrn != nil {
-		l.lgWrn.SetFlags(flag)
-	}
-	if l.lgErr != nil {
-		l.lgErr.SetFlags(flag)
-	}
-	if l.lgCrt != nil {
-		l.lgCrt.SetFlags(flag)
-	}
-	if l.lgEva != nil {
-		l.lgEva.SetFlags(flag)
-	}
-	if l.lgInf != nil {
-		l.lgInf.SetFlags(flag)
-	}
-	if l.lgSts != nil {
-		l.lgSts.SetFlags(flag)
-	}
-	if l.lgAdt != nil {
-		l.lgAdt.SetFlags(flag)
-	}
-	if l.lgTrx != nil {
-		l.lgTrx.SetFlags(flag)
-	}
-	if l.lgDbg != nil {
-		l.lgDbg.SetFlags(flag)
-	}
-	if l.lgTrc != nil {
-		l.lgTrc.SetFlags(flag)
-	}
-	if l.lgVbs != nil {
-		l.lgVbs.SetFlags(flag)
-	}
-}
+// SetFlags is a no-op for structured JSON logging.
+// Retained for backward compatibility with callers that set stdlib log flags.
+func (l *Logger) SetFlags(flag int) {}
 
 func NewLoggerDefine(prepend string, level int, dir string, filename string) *Logger {
 	l := &Logger{
@@ -515,17 +510,67 @@ func NewLoggerDefine(prepend string, level int, dir string, filename string) *Lo
 }
 
 func (l *Logger) initActionsNoInfoPrepend(prepend string) {
-	flag := log.Ldate | log.Ltime | log.Lmsgprefix
-	if ShowCallerFileLine {
-		flag |= log.Lshortfile
-	}
+	l.handler = newJSONHandler(l.lw)
+	l.evalHandler = newJSONHandler(l.lwEvaluate)
+	l.auditHandler = newJSONHandler(l.lwAudit)
+	l.component = prepend
 
-	l.lgInf = log.New(l.lw, prepend, flag)
+	// Info uses no prepend in this variant (used by ebpf deny/accept loggers)
 	l.Info = func(format string, args ...any) {
 		if l.logLevel >= LogLevelInfo {
-			l.lgInf.Output(l.callDepth, fmt.Sprintf(format, args...))
+			l.logJSON(l.handler, SlogLevelInfo, format, args...)
 		}
 	}
 
-	l.isRunning = true
+	// Initialize remaining methods to prevent nil function panics
+	l.Warning = func(format string, args ...any) {
+		if l.logLevel >= LogLevelError {
+			l.logJSON(l.handler, SlogLevelWarning, format, args...)
+		}
+	}
+	l.Error = func(format string, args ...any) {
+		if l.logLevel >= LogLevelError {
+			l.logJSON(l.handler, SlogLevelError, format, args...)
+		}
+	}
+	l.Critical = func(format string, args ...any) {
+		if l.logLevel >= LogLevelError {
+			l.logJSON(l.handler, SlogLevelCritical, format, args...)
+		}
+	}
+	l.Evaluate = func(format string, args ...any) {
+		if l.logLevel >= LogLevelError {
+			l.logJSON(l.evalHandler, SlogLevelEvaluate, format, args...)
+		}
+	}
+	l.Stats = func(format string, args ...any) {
+		if l.logLevel >= LogLevelInfo {
+			l.logJSON(l.handler, SlogLevelStats, format, args...)
+		}
+	}
+	l.Audit = func(format string, args ...any) {
+		if l.logLevel >= LogLevelAudit {
+			l.logJSON(l.auditHandler, SlogLevelAudit, format, args...)
+		}
+	}
+	l.Transaction = func(format string, args ...any) {
+		if l.logLevel >= LogLevelAudit {
+			l.logJSON(l.auditHandler, SlogLevelTransaction, format, args...)
+		}
+	}
+	l.Debug = func(format string, args ...any) {
+		if l.logLevel >= LogLevelDebug {
+			l.logJSON(l.handler, SlogLevelDebug, format, args...)
+		}
+	}
+	l.Verbose = func(format string, args ...any) {
+		if l.logLevel >= LogLevelTrace {
+			l.logJSON(l.handler, SlogLevelVerbose, format, args...)
+		}
+	}
+	l.Trace = func(format string, args ...any) {
+		if l.logLevel >= LogLevelTrace {
+			l.logJSON(l.handler, SlogLevelTrace, format, args...)
+		}
+	}
 }

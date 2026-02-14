@@ -30,18 +30,23 @@ const (
 	maxLatencySamples = 10000
 )
 
+// HealthProbe is a function that returns true if the storage backend is healthy.
+type HealthProbe func(ctx context.Context) bool
+
 // MetricsPublisher batches and publishes NHP metrics to CloudWatch.
 // Metrics are accumulated in-memory and flushed periodically to minimize
 // API calls and stay within CloudWatch PutMetricData limits.
 type MetricsPublisher struct {
-	client    *cloudwatch.Client
-	mu        sync.Mutex
-	counters  map[string]float64   // metric name → accumulated count
-	latencies map[string][]float64 // metric name → recorded latencies
-	dims      []types.Dimension
-	stop      chan struct{}
-	wg        sync.WaitGroup // tracks flushLoop goroutine for graceful shutdown
-	once      sync.Once      // ensures Stop is idempotent
+	client      *cloudwatch.Client
+	mu          sync.Mutex
+	counters    map[string]float64   // metric name → accumulated count (skipped when 0)
+	gauges      map[string]float64   // metric name → current value (always published)
+	latencies   map[string][]float64 // metric name → recorded latencies
+	dims        []types.Dimension
+	stop        chan struct{}
+	wg          sync.WaitGroup // tracks flushLoop goroutine for graceful shutdown
+	once        sync.Once      // ensures Stop is idempotent
+	healthProbe HealthProbe    // optional: emits StorageHealthy gauge each flush
 }
 
 // NewMetricsPublisher creates a CloudWatch metrics publisher.
@@ -62,14 +67,17 @@ func NewMetricsPublisher() *MetricsPublisher {
 		environment = "unknown"
 	}
 
+	// Only use Environment dimension — CloudWatch alarms and dashboard widgets
+	// match on exact dimension set. Adding extra dimensions (e.g., Component)
+	// creates a separate metric time series that existing alarms won't find.
 	dims := []types.Dimension{
 		{Name: aws.String("Environment"), Value: aws.String(environment)},
-		{Name: aws.String("Component"), Value: aws.String("server")},
 	}
 
 	mp := &MetricsPublisher{
 		client:    cloudwatch.NewFromConfig(cfg),
 		counters:  make(map[string]float64),
+		gauges:    make(map[string]float64),
 		latencies: make(map[string][]float64),
 		dims:      dims,
 		stop:      make(chan struct{}),
@@ -88,6 +96,17 @@ func (mp *MetricsPublisher) IncrCounter(name string) {
 	}
 	mp.mu.Lock()
 	mp.counters[name]++
+	mp.mu.Unlock()
+}
+
+// SetHealthProbe registers a function that is called each flush interval.
+// The result is published as StorageHealthy (1.0 = healthy, 0.0 = unhealthy).
+func (mp *MetricsPublisher) SetHealthProbe(probe HealthProbe) {
+	if mp == nil {
+		return
+	}
+	mp.mu.Lock()
+	mp.healthProbe = probe
 	mp.mu.Unlock()
 }
 
@@ -131,11 +150,38 @@ func (mp *MetricsPublisher) flushLoop() {
 	for {
 		select {
 		case <-ticker.C:
+			mp.probeHealth()
 			mp.flush()
 		case <-mp.stop:
 			return
 		}
 	}
+}
+
+// probeHealth runs the health probe (if set) and records the result as a gauge.
+// The probe receives a context with metricsTimeout (5s). If the probe's underlying
+// ping has its own timeout, the shorter of the two wins.
+func (mp *MetricsPublisher) probeHealth() {
+	mp.mu.Lock()
+	probe := mp.healthProbe
+	mp.mu.Unlock()
+
+	if probe == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), metricsTimeout)
+	defer cancel()
+
+	healthy := probe(ctx)
+	val := 0.0
+	if healthy {
+		val = 1.0
+	}
+
+	mp.mu.Lock()
+	mp.gauges["StorageHealthy"] = val
+	mp.mu.Unlock()
 }
 
 // flush swaps out the in-memory metric maps and publishes them to CloudWatch.
@@ -145,14 +191,16 @@ func (mp *MetricsPublisher) flushLoop() {
 func (mp *MetricsPublisher) flush() {
 	mp.mu.Lock()
 	counters := mp.counters
+	gauges := mp.gauges
 	latencies := mp.latencies
 	mp.counters = make(map[string]float64)
+	mp.gauges = make(map[string]float64)
 	mp.latencies = make(map[string][]float64)
 	mp.mu.Unlock()
 
 	var metricData []types.MetricDatum
 
-	// Flush counters
+	// Flush counters (skip 0 — means the counter wasn't incremented this interval)
 	for name, value := range counters {
 		if value == 0 {
 			continue
@@ -162,6 +210,16 @@ func (mp *MetricsPublisher) flush() {
 			Dimensions: mp.dims,
 			Value:      aws.Float64(value),
 			Unit:       types.StandardUnitCount,
+		})
+	}
+
+	// Flush gauges (always published — 0 is a meaningful value, e.g. StorageHealthy=0 means unhealthy)
+	for name, value := range gauges {
+		metricData = append(metricData, types.MetricDatum{
+			MetricName: aws.String(name),
+			Dimensions: mp.dims,
+			Value:      aws.Float64(value),
+			Unit:       types.StandardUnitNone,
 		})
 	}
 

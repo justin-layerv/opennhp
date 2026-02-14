@@ -445,17 +445,17 @@ resource "aws_cloudwatch_metric_alarm" "network_in_low" {
   })
 }
 
-# etcd Health Alarm (custom metric from application)
-resource "aws_cloudwatch_metric_alarm" "etcd_health" {
-  alarm_name          = "${var.name_prefix}-${var.cell_id}-etcd-health"
+# Storage Health Alarm (custom metric from application — covers etcd or DynamoDB)
+resource "aws_cloudwatch_metric_alarm" "storage_health" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-storage-health"
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 3
-  metric_name         = "EtcdHealthy"
+  metric_name         = "StorageHealthy"
   namespace           = "LayerV/NHP"
   period              = 60
   statistic           = "Minimum"
   threshold           = 1
-  alarm_description   = "etcd cluster health check failing"
+  alarm_description   = "Storage backend health check failing"
   alarm_actions       = [aws_sns_topic.alerts.arn]
   ok_actions          = [aws_sns_topic.alerts.arn]
   treat_missing_data  = "notBreaching"

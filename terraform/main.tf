@@ -127,6 +127,7 @@ locals {
     Environment = var.environment
     ManagedBy   = "terraform"
     Repository  = "layervai/nhp"
+    Service     = "shared"
   })
 }
 
@@ -285,7 +286,7 @@ module "compute" {
   namespace_id        = module.data.namespace_id
   namespace_name      = module.data.namespace_name
   name_prefix         = local.name_prefix
-  tags                = local.common_tags
+  tags                = merge(local.common_tags, { Service = "nhp-server" })
 
   # KMS encryption keys
   ebs_kms_key_arn     = module.kms.ebs_key_arn
@@ -386,7 +387,7 @@ module "canary_deployment" {
   environment = var.environment
   name_prefix = local.name_prefix
   cell_id     = var.cell_id
-  tags        = local.common_tags
+  tags        = merge(local.common_tags, { Service = "nhp-server" })
 
   asg_name                = module.compute.asg_name
   asg_arn                 = module.compute.asg_arn
@@ -619,7 +620,7 @@ module "ac" {
   namespace_id       = module.data.namespace_id
   namespace_name     = module.data.namespace_name
   name_prefix        = local.name_prefix
-  tags               = local.common_tags
+  tags               = merge(local.common_tags, { Service = "nhp-ac" })
 
   # KMS encryption keys
   logs_kms_key_arn    = module.kms.logs_key_arn
@@ -1039,7 +1040,7 @@ module "qurl_service" {
   environment = var.environment
   name_prefix = local.name_prefix
   cell_id     = var.cell_id
-  tags        = local.common_tags
+  tags        = merge(local.common_tags, { Service = "qurl" })
 
   # Networking
   vpc_id             = module.networking.vpc_id
@@ -1341,7 +1342,7 @@ module "qurl_link" {
   nhp_resolve_url     = "https://resolve.${var.qurl_link_frontend_domain}/plugins/qurl"
   enable_access_logs  = var.qurl_link_enable_access_logs
 
-  tags = local.common_tags
+  tags = merge(local.common_tags, { Service = "qurl" })
 }
 
 # Route53 alias records for QURL Link CloudFront distribution
