@@ -125,6 +125,17 @@ variable "vpc_cidr" {
 
 # ==================== Server Configuration Options ====================
 
+variable "log_level" {
+  description = "NHP log level for all components (server, AC, console AC): 0=silent, 1=error, 2=info, 3=audit, 4=debug, 5=trace"
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.log_level >= 0 && var.log_level <= 5
+    error_message = "log_level must be between 0 (silent) and 5 (trace)."
+  }
+}
+
 variable "dev_mode" {
   description = "Enable development mode for the NHP server (enables additional debugging features)"
   type        = bool

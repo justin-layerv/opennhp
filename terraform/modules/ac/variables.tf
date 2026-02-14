@@ -113,6 +113,17 @@ variable "enable_cloudfront" {
 # These options control the AC daemon's behavior
 # ============================================================================
 
+variable "log_level" {
+  description = "NHP AC log level: 0=silent, 1=error, 2=info, 3=audit, 4=debug, 5=trace"
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.log_level >= 0 && var.log_level <= 5
+    error_message = "log_level must be between 0 (silent) and 5 (trace)."
+  }
+}
+
 # ============================================================================
 # Cloud Mode Registration
 # AC registers with NHP servers using credentials for DynamoDB license validation

@@ -565,6 +565,7 @@ locals {
     etcd_endpoint       = var.etcd_endpoint
     etcd_tls_secret_arn = var.etcd_tls_secret_arn
     # Server configuration options
+    log_level        = var.log_level
     dev_mode         = var.dev_mode
     resource_mode    = var.resource_mode
     auth_url         = var.auth_url

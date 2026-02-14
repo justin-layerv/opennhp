@@ -294,6 +294,7 @@ module "compute" {
   secrets_kms_key_arn = module.kms.secrets_key_arn
 
   # Server configuration options
+  log_level     = var.log_level
   dev_mode      = var.dev_mode
   resource_mode = var.resource_mode
   # auth_url: Point to Console API for passcode validation
@@ -631,6 +632,7 @@ module "ac" {
   enable_cloudfront = var.enable_cloudfront
 
   # AC configuration options
+  log_level         = var.log_level
   auth_service_id   = var.ac_auth_service_id
   resource_ids      = var.ac_resource_ids
   server_endpoint   = module.compute.nlb_dns_name # External ACs use public NLB
@@ -858,6 +860,9 @@ module "console_ec2" {
   nhp_console_ac_license_key_hash   = var.console_ac_license_key_hash
   nhp_console_ac_license_key_sha256 = var.console_ac_license_key_sha256
   nhp_console_ac_license_secret_arn = var.console_ac_license_key_hash != null && var.console_ac_license_key_hash != "" ? "arn:aws:secretsmanager:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:secret:layerv-nhp-${var.environment}/console-ac-license-key" : null
+
+  # NHP AC log level
+  log_level = var.log_level
 
   # NHP AC Daemon - Console always needs its own AC for login flow to work
   # The AC registers with NHP Server and receives knock validations

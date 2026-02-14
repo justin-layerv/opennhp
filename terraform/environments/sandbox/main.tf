@@ -42,6 +42,7 @@ module "nhp" {
   create_oidc_provider = var.create_oidc_provider
 
   # Server configuration
+  log_level        = var.log_level
   dev_mode         = var.dev_mode
   resource_mode    = var.resource_mode
   auth_url         = var.auth_url

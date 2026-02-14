@@ -144,6 +144,17 @@ variable "create_oidc_provider" {
 }
 
 # Server configuration
+variable "log_level" {
+  description = "NHP log level for all components: 0=silent, 1=error, 2=info, 3=audit, 4=debug, 5=trace"
+  type        = number
+  default     = 2 # Info for production
+
+  validation {
+    condition     = var.log_level >= 0 && var.log_level <= 5
+    error_message = "log_level must be between 0 (silent) and 5 (trace)."
+  }
+}
+
 variable "dev_mode" {
   type    = bool
   default = false

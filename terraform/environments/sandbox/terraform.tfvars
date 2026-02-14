@@ -41,6 +41,7 @@ enable_cloudtrail = false
 
 # NHP Server configuration
 # Set to true for sandbox to enable debug features
+log_level     = 4 # Debug for sandbox (0=silent, 1=error, 2=info, 3=audit, 4=debug, 5=trace)
 dev_mode      = true
 resource_mode = "api"
 

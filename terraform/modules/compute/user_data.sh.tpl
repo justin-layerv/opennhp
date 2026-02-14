@@ -137,7 +137,7 @@ DefaultCipherScheme = 0
 ListenIp = ""
 ListenPort = 62206
 Hostname = "$HOSTNAME"
-LogLevel = 3
+LogLevel = ${log_level}
 DisableAgentValidation = false
 %{ if dev_mode }
 Dev = true

@@ -664,6 +664,7 @@ locals {
     name_prefix         = var.name_prefix
     secrets_kms_key_arn = var.secrets_kms_key_arn != null ? var.secrets_kms_key_arn : ""
     # AC configuration options
+    log_level         = var.log_level
     ac_id             = var.ac_id
     auth_service_id   = var.auth_service_id
     resource_ids      = jsonencode(var.resource_ids)

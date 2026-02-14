@@ -43,6 +43,7 @@ create_oidc_provider = true
 enable_cloudtrail = true
 
 # NHP Server configuration - NEVER enable dev_mode in production
+log_level     = 2 # Info for production (0=silent, 1=error, 2=info, 3=audit, 4=debug, 5=trace)
 dev_mode      = false
 resource_mode = "api"
 

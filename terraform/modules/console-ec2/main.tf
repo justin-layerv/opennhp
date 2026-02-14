@@ -394,7 +394,8 @@ locals {
     admin_password   = var.admin_password
     auth_signing_key = var.auth_signing_key
     # AC ID for knock routing (must match AC module's ac_id)
-    ac_id = var.ac_id
+    ac_id     = var.ac_id
+    log_level = var.log_level
     # NHP Protection (always enabled)
     nhp_server_secret_arn   = var.nhp_server_secret_arn
     nhp_ac_repo_url         = var.nhp_ac_repo_url
