@@ -526,9 +526,10 @@ func (f *ServerForwarder) getOrCreateServerPeer(target ServerInfo) (*core.UdpPee
 		return peer, nil
 	}
 
-	// Create peer with target server's public key
+	// Create peer with target server's public key.
+	// Hostname is intentionally left empty so ResolveHost() uses the static Ip
+	// field directly. target.ID is an identifier, not a DNS-resolvable hostname.
 	peer = &core.UdpPeer{
-		Hostname:     target.ID,
 		Ip:           target.InternalIP, // Use internal IP for server-to-server
 		Port:         target.Port,
 		PubKeyBase64: target.PubKey,

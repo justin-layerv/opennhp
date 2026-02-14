@@ -22,7 +22,7 @@ primary_account_id = "767397897469" # Sandbox (layerv) account ID
 deploy_ac          = true
 acme_email         = "admin@layerv.ai"
 ac_auth_service_id = "layerv"
-ac_resource_ids    = ["default"]
+ac_resource_ids    = ["qurl"] # Phase 2: QURL is the only service deployed initially
 
 # Terraform state bucket for GitHub Actions permissions
 terraform_state_bucket = "layerv-terraform-state-235500187906"
@@ -62,6 +62,17 @@ guardduty_alert_emails = [
   "benc@layerv.ai",
   "joe@layerv.ai"
 ]
+
+# CloudWatch alarm email notifications (B8 - interim until Slack is authorized)
+# Each email must confirm the SNS subscription via email link
+alert_emails = [
+  "justin@layerv.ai",
+  "benc@layerv.ai",
+  "joe@layerv.ai"
+]
+
+# WAF logging (B5 - security audit trail, cannot be backfilled)
+enable_waf_logging = true
 
 # NHP Server plugins
 server_plugins = ["passcode", "qurl"]
@@ -128,8 +139,88 @@ auth0_domain = "layerv.us.auth0.com"
 qurl_auth0_domain   = "auth.layerv.ai"
 qurl_auth0_audience = "https://api.layerv.ai"
 
-# Canary deployment (Phase 3)
+# Auth0 M2M credential rotation (Phase 2: required for prod security)
+auth0_enable_rotation = true
+
+# Console license lookup GSIs (required for license validation even without Console EC2)
+nhp_dynamodb_licenses_customer_index      = "customer_id-index"
+nhp_dynamodb_licenses_auth0_subject_index = "auth0_subject-index"
+
+# QURL ECS Fargate capacity (right-sized for initial sporadic traffic)
+# At 256 CPU / 512 MB with 1 task, Fargate cost is ~$9/month
+qurl_container_cpu            = 256 # 0.25 vCPU — sufficient for sporadic traffic
+qurl_container_memory         = 512 # 512 MB — QURL is lightweight Go binary
+qurl_desired_count            = 1   # Single task for initial low traffic
+qurl_autoscaling_min_capacity = 1   # Minimum tasks (scale to zero not supported)
+qurl_autoscaling_max_capacity = 4   # Allow burst scaling if traffic spikes
+
+# QURL AC Fleet defaults
+qurl_default_ac_id   = "layerv-ac-tf"
+qurl_default_ac_port = 443
+
+# QURL plugin configuration (NHP Server)
+# Enables qurl.link → qurl.site authentication flow in NHP Server
+qurl_config = {
+  enabled                 = true
+  api_url                 = "https://api.layerv.ai"
+  allowed_redirect_domain = "qurl.site"
+  api_timeout             = 10
+  max_idle_conns          = 10
+  max_idle_conns_per_host = 5
+  idle_conn_timeout       = 30
+}
+
+# QURL internal service token (same secret used by QURL service for internal API auth)
+qurl_service_token_secret_arn = "arn:aws:secretsmanager:us-east-2:235500187906:secret:layerv-nhp-prod/qurl-internal-service-token-ETbWzv"
+
+# ==============================================================================
+# Observability (Phase 2)
+# ==============================================================================
+
+# QURL OpenTelemetry (enabled with Grafana Cloud ADOT sidecar)
+qurl_otel_enabled           = true
+qurl_otel_service_name      = "qurl-api"
+qurl_otel_service_version   = "prod"
+qurl_otel_environment       = "prod"
+qurl_otel_exporter_endpoint = "http://localhost:4317" # ADOT sidecar
+qurl_otel_exporter_protocol = "grpc"
+qurl_otel_exporter_insecure = true
+qurl_otel_trace_sample_rate = 0.1 # 10% sampling in prod (vs 100% in sandbox)
+qurl_otel_metrics_interval  = 60
+qurl_otel_metrics_enabled   = true
+qurl_otel_tracing_enabled   = true
+qurl_otel_log_correlation   = true
+
+# Grafana Cloud ADOT Sidecar - exports telemetry to layervai.grafana.net
+qurl_grafana_cloud_enabled = true
+qurl_grafana_secret_arn    = "arn:aws:secretsmanager:us-east-2:235500187906:secret:layerv-nhp-prod/grafana-cloud-otlp-8P5nBG"
+
+# Grafana Cloud Dashboards (PROD_GRAFANA_AUTH GitHub secret already set)
+# Token is passed via TF_VAR_grafana_auth in CI
+grafana_dashboards_enabled        = true
+grafana_url                       = "https://layervai.grafana.net"
+grafana_prometheus_datasource_uid = "grafanacloud-prom"
+grafana_tempo_datasource_uid      = "grafanacloud-traces"
+
+# Grafana CloudWatch datasource (Grafana Cloud assumes IAM role to read CloudWatch)
+grafana_cloudwatch_enabled   = true
+grafana_cloud_aws_account_id = "008923505280" # Grafana Cloud stack account (same as sandbox)
+grafana_cloud_external_id    = ""             # Not required - same Grafana Cloud stack
+
+# ==============================================================================
+# Status Page (B1)
+# ==============================================================================
+deploy_status_page         = true
+status_page_domain         = "status.layerv.ai"
+status_page_hosted_zone_id = "Z0748438C8EK6UAW94ST" # layerv.ai zone
+
+# Canary deployment
 enable_canary_deployment = true
+
+# QURL Redis rate limiting (B15)
+# ElastiCache Serverless Redis for distributed rate limiting across ECS tasks.
+# Cost: ~$0/month idle (serverless scales to zero when unused, pay per ECPU + storage)
+deploy_redis = true
 
 tags = {
   Organization = "LayerV"

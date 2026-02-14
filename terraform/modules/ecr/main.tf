@@ -1081,6 +1081,12 @@ resource "aws_iam_policy" "terraform_apply_services" {
         Resource = "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:layerv-nhp-*"
       },
       {
+        Sid      = "SecretsManagerRandomPassword"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetRandomPassword"]
+        Resource = "*"
+      },
+      {
         Sid    = "EFS"
         Effect = "Allow"
         Action = [
@@ -1350,6 +1356,27 @@ resource "aws_iam_policy" "terraform_apply_data" {
           "lambda:DeleteLayerVersion"
         ]
         Resource = "arn:aws:lambda:${local.region}:${local.account_id}:layer:layerv-nhp-*"
+      },
+      {
+        Sid    = "ElastiCache"
+        Effect = "Allow"
+        Action = [
+          "elasticache:CreateServerlessCache",
+          "elasticache:DeleteServerlessCache",
+          "elasticache:ModifyServerlessCache",
+          "elasticache:DescribeServerlessCaches",
+          "elasticache:ListTagsForResource",
+          "elasticache:AddTagsToResource",
+          "elasticache:RemoveTagsFromResource",
+          "elasticache:CreateCacheSubnetGroup",
+          "elasticache:DeleteCacheSubnetGroup",
+          "elasticache:ModifyCacheSubnetGroup",
+          "elasticache:DescribeCacheSubnetGroups"
+        ]
+        Resource = [
+          "arn:aws:elasticache:${local.region}:${local.account_id}:serverlesscache:layerv-nhp-*",
+          "arn:aws:elasticache:${local.region}:${local.account_id}:subnetgroup:layerv-nhp-*"
+        ]
       }
     ]
   })

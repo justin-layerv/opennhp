@@ -88,3 +88,9 @@ variable "github_actions_role_arn" {
   type        = string
   default     = null
 }
+
+variable "kms_key_arn" {
+  description = "KMS key ARN for S3 server-side encryption. If null, uses AES256 (SSE-S3)."
+  type        = string
+  default     = null
+}

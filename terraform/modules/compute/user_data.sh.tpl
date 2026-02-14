@@ -47,7 +47,7 @@ aws --version
 systemctl enable docker
 systemctl start docker
 
-for i in {1..30}; do docker info && break || sleep 2; done
+for _ in {1..30}; do docker info && break || sleep 2; done
 
 # ============================================================================
 # CloudWatch Agent - Publishes mem_used_percent and disk_used_percent
@@ -656,17 +656,47 @@ echo "Created environment file with image tag: $IMAGE_TAG"
 # Create with restrictive permissions before writing any content
 touch /opt/layerv/nhp-server/etc/secrets.env
 chmod 600 /opt/layerv/nhp-server/etc/secrets.env
-%{ if qurl_enabled ~}
+
+# Fetch cookie session keys from Secrets Manager (shared across all instances)
+# Secret contains JSON with current + optional previous key pairs for rotation.
+# Base64-encoded before writing to env file to avoid shell/heredoc quoting issues.
+echo "Fetching cookie session keys from Secrets Manager..."
+COOKIE_KEYS_JSON=$(aws secretsmanager get-secret-value \
+  --secret-id "${cookie_secret_arn}" \
+  --region "$REGION" \
+  --query SecretString --output text) || {
+    echo "ERROR: Failed to fetch cookie session keys from Secrets Manager"
+    exit 1
+}
+if [ -z "$COOKIE_KEYS_JSON" ]; then
+  echo "ERROR: Cookie session keys secret is empty"
+  exit 1
+fi
+
+# Validate JSON structure has required fields
+echo "$COOKIE_KEYS_JSON" | python3 -c "
+import json, sys
+d = json.loads(sys.stdin.read())
+assert 'current' in d, 'missing current key set'
+assert 'auth_key' in d['current'], 'missing current.auth_key'
+assert 'encrypt_key' in d['current'], 'missing current.encrypt_key'
+" || {
+  echo "ERROR: Cookie secret JSON missing required fields (current.auth_key, current.encrypt_key)"
+  exit 1
+}
+
+# Base64-encode for safe transport through env file and docker --env-file
+NHP_COOKIE_KEYS=$(echo -n "$COOKIE_KEYS_JSON" | base64 -w 0)
+
 cat > /opt/layerv/nhp-server/etc/secrets.env << SECRETSEOF
+NHP_COOKIE_KEYS=$NHP_COOKIE_KEYS
+%{ if qurl_enabled ~}
 # QURL service authentication token - fetched from Secrets Manager
 # This file contains sensitive credentials and should NOT be readable by other users
 QURL_SERVICE_TOKEN=$QURL_SERVICE_TOKEN
-SECRETSEOF
-echo "Created secrets file for QURL service token"
-%{ else ~}
-# No secrets to store when QURL is disabled
-echo "# No secrets configured" > /opt/layerv/nhp-server/etc/secrets.env
 %{ endif ~}
+SECRETSEOF
+echo "Created secrets file with cookie keys and service credentials"
 
 cat > /etc/systemd/system/nhp-server.service << 'SVCEOF'
 [Unit]

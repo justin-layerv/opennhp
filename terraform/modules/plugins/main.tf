@@ -50,8 +50,10 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "plugins" {
 
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
+      sse_algorithm     = var.kms_key_arn != null ? "aws:kms" : "AES256"
+      kms_master_key_id = var.kms_key_arn
     }
+    bucket_key_enabled = var.kms_key_arn != null
   }
 }
 
@@ -133,6 +135,21 @@ data "aws_iam_policy_document" "plugin_upload" {
       "${aws_s3_bucket.plugins.arn}/traefik/*"
     ]
   }
+
+  # KMS permissions required when bucket uses KMS encryption
+  dynamic "statement" {
+    for_each = var.kms_key_arn != null ? [1] : []
+    content {
+      sid    = "PluginUploadKMS"
+      effect = "Allow"
+      actions = [
+        "kms:GenerateDataKey",
+        "kms:Decrypt",
+        "kms:DescribeKey"
+      ]
+      resources = [var.kms_key_arn]
+    }
+  }
 }
 
 # Standalone policy that can be attached to GitHub Actions role
@@ -162,6 +179,17 @@ data "aws_iam_policy_document" "plugin_download" {
       aws_s3_bucket.plugins.arn,
       "${aws_s3_bucket.plugins.arn}/*"
     ]
+  }
+
+  # KMS permissions required when bucket uses KMS encryption
+  dynamic "statement" {
+    for_each = var.kms_key_arn != null ? [1] : []
+    content {
+      sid       = "PluginDownloadKMS"
+      effect    = "Allow"
+      actions   = ["kms:Decrypt", "kms:DescribeKey"]
+      resources = [var.kms_key_arn]
+    }
   }
 }
 

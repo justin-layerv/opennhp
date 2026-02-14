@@ -157,6 +157,9 @@ module "plugins" {
   # GitHub repos that can upload plugins
   github_org   = var.github_org
   plugin_repos = var.plugin_repos
+
+  # KMS encryption (consistent with other S3 buckets)
+  kms_key_arn = module.kms.logs_key_arn
 }
 
 # ECR Module - Creates ECR in primary account, references cross-account in secondary
@@ -376,6 +379,9 @@ module "monitoring" {
   slack_workspace_id         = var.slack_workspace_id
   slack_channel_id           = var.slack_channel_id
 
+  # Email alert subscriptions (B8 - interim until Slack is authorized for prod)
+  alert_emails = var.alert_emails
+
   # DynamoDB monitoring
   dynamodb_table_names = module.dynamodb.all_table_names
 }
@@ -520,6 +526,7 @@ module "security" {
   rate_limit_requests = var.environment == "prod" ? 5000 : 2000
   logs_kms_key_arn    = module.kms.logs_key_arn
   enable_cloudtrail   = var.enable_cloudtrail
+  enable_waf_logging  = var.enable_waf_logging
   tags                = local.common_tags
 
   # GuardDuty alerting - sends findings to SNS for email/Slack notifications
@@ -1038,6 +1045,21 @@ resource "aws_route53_record" "qurl_api" {
   }
 }
 
+# ==================== Redis (Distributed Rate Limiting) ====================
+
+module "redis" {
+  count  = var.deploy_redis ? 1 : 0
+  source = "./modules/redis-cluster"
+
+  name_prefix        = local.name_prefix
+  cell_id            = var.cell_id
+  vpc_id             = module.networking.vpc_id
+  vpc_cidr           = var.vpc_cidr
+  private_subnet_ids = module.networking.private_subnet_ids
+  kms_key_arn        = module.kms.secrets_key_arn
+  tags               = local.common_tags
+}
+
 module "qurl_service" {
   count  = var.deploy_qurl_service ? 1 : 0
   source = "./modules/qurl-service"
@@ -1096,6 +1118,11 @@ module "qurl_service" {
   owner_rate_burst = var.qurl_owner_rate_burst
   ip_rate_limit    = var.qurl_ip_rate_limit
   ip_rate_burst    = var.qurl_ip_rate_burst
+
+  # Redis (distributed rate limiting)
+  redis_enabled           = var.deploy_redis
+  redis_endpoint          = var.deploy_redis ? "${module.redis[0].endpoint}:${module.redis[0].port}" : ""
+  redis_security_group_id = var.deploy_redis ? module.redis[0].security_group_id : null
 
   # Audit
   audit_retention_days = var.qurl_audit_retention_days

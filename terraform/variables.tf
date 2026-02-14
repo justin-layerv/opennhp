@@ -943,6 +943,12 @@ variable "qurl_ip_rate_burst" {
   }
 }
 
+variable "deploy_redis" {
+  description = "Deploy ElastiCache Serverless Redis for distributed QURL rate limiting"
+  type        = bool
+  default     = false
+}
+
 variable "qurl_audit_retention_days" {
   description = "Number of days to retain QURL audit logs in DynamoDB"
   type        = number
@@ -1379,6 +1385,18 @@ variable "guardduty_alert_emails" {
   description = "List of email addresses to receive GuardDuty security finding alerts"
   type        = list(string)
   default     = []
+}
+
+variable "alert_emails" {
+  description = "Email addresses for CloudWatch alarm notifications via SNS. Each email must confirm the subscription."
+  type        = list(string)
+  default     = []
+}
+
+variable "enable_waf_logging" {
+  description = "Enable WAF logging to CloudWatch Logs. WAF logs cannot be backfilled — every day without logging is a gap in your security audit trail."
+  type        = bool
+  default     = true
 }
 
 # ==================== Blue/Green Deployment ====================

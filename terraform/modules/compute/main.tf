@@ -65,7 +65,10 @@ resource "aws_iam_role_policy" "keygen_lambda_secrets" {
           "secretsmanager:GetSecretValue",
           "secretsmanager:PutSecretValue"
         ]
-        Resource = aws_secretsmanager_secret.server.arn
+        Resource = [
+          aws_secretsmanager_secret.server.arn,
+          aws_secretsmanager_secret.cookie_secret.arn
+        ]
       },
       {
         Effect   = "Allow"
@@ -195,6 +198,60 @@ resource "aws_lambda_invocation" "keygen" {
 
   lifecycle {
     ignore_changes = [input]
+  }
+}
+
+# Cookie session keys for HTTP session cookies (shared across all server instances)
+# JSON structure:
+#   {
+#     "current":  {"auth_key": "...", "encrypt_key": "..."},
+#     "previous": {"auth_key": "...", "encrypt_key": "..."}  // optional
+#   }
+#
+# - current: Used for writing new cookies AND reading existing ones
+# - previous: Read-only, enables graceful rotation during rolling deployments
+#
+# Rotation procedure:
+#   1. Read the current secret value
+#   2. Move "current" → "previous"
+#   3. Generate new keys for "current"
+#   4. Update the secret with both current and previous
+#   5. Trigger ASG instance refresh — as instances roll:
+#      - New instances write cookies with new keys
+#      - New instances can still read cookies signed with old keys
+#   6. After all instances are refreshed, remove "previous" (optional)
+resource "aws_secretsmanager_secret" "cookie_secret" {
+  name                    = "${var.name_prefix}-cookie-secret"
+  description             = "NHP Server cookie session keys (HMAC auth + AES-256 encryption)"
+  recovery_window_in_days = local.is_prod ? 30 : 0
+  kms_key_id              = var.secrets_kms_key_arn
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-cookie-secret"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+}
+
+# Seed the secret with random keys generated server-side by AWS.
+# Keys are generated via AWS CLI (secretsmanager:GetRandomPassword) and stored
+# directly in Secrets Manager — they never appear in Terraform state.
+# Only runs on first creation (triggered by secret ARN).
+resource "terraform_data" "cookie_secret_seed" {
+  triggers_replace = [aws_secretsmanager_secret.cookie_secret.arn]
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      AUTH_KEY=$(aws secretsmanager get-random-password \
+        --password-length 32 --exclude-punctuation \
+        --query RandomPassword --output text)
+      ENCRYPT_KEY=$(aws secretsmanager get-random-password \
+        --password-length 32 --exclude-punctuation \
+        --query RandomPassword --output text)
+      aws secretsmanager put-secret-value \
+        --secret-id "${aws_secretsmanager_secret.cookie_secret.id}" \
+        --secret-string "{\"current\":{\"auth_key\":\"$AUTH_KEY\",\"encrypt_key\":\"$ENCRYPT_KEY\"}}"
+    EOT
   }
 }
 
@@ -597,6 +654,8 @@ locals {
     qurl_service_token_secret_arn = var.qurl_service_token_secret_arn != null ? var.qurl_service_token_secret_arn : ""
     # Blue/Green deployment configuration
     enable_blue_green = var.enable_blue_green
+    # Cookie signing secret (shared across all instances)
+    cookie_secret_arn = aws_secretsmanager_secret.cookie_secret.arn
   })
 }
 

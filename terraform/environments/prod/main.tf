@@ -48,7 +48,8 @@ module "nhp" {
   ac_resource_ids    = var.ac_resource_ids
 
   # Security services
-  enable_cloudtrail = var.enable_cloudtrail
+  enable_cloudtrail  = var.enable_cloudtrail
+  enable_waf_logging = var.enable_waf_logging
 
   # GitHub OIDC
   create_oidc_provider = var.create_oidc_provider
@@ -243,6 +244,7 @@ module "nhp" {
 
   # Security alerting
   guardduty_alert_emails = var.guardduty_alert_emails
+  alert_emails           = var.alert_emails
 
   # Centralized certificate management
   centralized_cert_enabled    = var.centralized_cert_enabled
@@ -265,6 +267,19 @@ module "nhp" {
   canary_checkpoint_percentages   = var.canary_checkpoint_percentages
   canary_checkpoint_delay_seconds = var.canary_checkpoint_delay_seconds
   canary_instance_warmup_seconds  = var.canary_instance_warmup_seconds
+
+  # Status page (B1)
+  deploy_status_page         = var.deploy_status_page
+  status_page_domain         = var.status_page_domain
+  status_page_hosted_zone_id = var.status_page_hosted_zone_id
+
+  # QURL ECS capacity
+  qurl_desired_count            = var.qurl_desired_count
+  qurl_autoscaling_min_capacity = var.qurl_autoscaling_min_capacity
+  qurl_autoscaling_max_capacity = var.qurl_autoscaling_max_capacity
+
+  # Redis (distributed rate limiting)
+  deploy_redis = var.deploy_redis
 }
 
 # ==============================================================================

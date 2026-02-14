@@ -2,7 +2,10 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"html/template"
 	"io/fs"
 	"net"
@@ -78,10 +81,18 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 
 	gin.SetMode(gin.ReleaseMode)
 	hs.ginEngine = gin.New()
-	store := cookie.NewStore([]byte("nhpstore"))
+	cookieKeys, err := parseCookieKeys(os.Getenv("NHP_COOKIE_KEYS"))
+	if err != nil {
+		return fmt.Errorf("NHP_COOKIE_KEYS: %w", err)
+	}
+	store := cookie.NewStore(cookieKeys...)
+	hs.ginEngine.Use(requestIDMiddleware())
 	hs.ginEngine.Use(sessions.Sessions("nhpsessions", store))
 	hs.ginEngine.Use(corsMiddleware())
-	hs.ginEngine.Use(gin.LoggerWithWriter(us.log.Writer()))
+	hs.ginEngine.Use(gin.LoggerWithConfig(gin.LoggerConfig{
+		Output:    us.log.Writer(),
+		Formatter: ginLogFormatter,
+	}))
 	hs.ginEngine.Use(gin.Recovery())
 
 	// Initialize health check manager (fail-fast if no storage backend)
@@ -384,7 +395,101 @@ func (hs *HttpServer) initRouter() {
 
 }
 
-// corsMiddleware is a middleware function that adds CORS headers to the HTTP response.
+// cookieKeySet represents a pair of cookie signing/encryption keys.
+// Gorilla securecookie uses auth_key for HMAC-SHA256 and encrypt_key for AES-256.
+type cookieKeySet struct {
+	AuthKey    string `json:"auth_key"`
+	EncryptKey string `json:"encrypt_key"`
+}
+
+// cookieKeysConfig is the JSON structure stored in Secrets Manager.
+// Current keys are used for writing new cookies. Previous keys (if present)
+// are used for reading only, enabling graceful key rotation without
+// invalidating active sessions during rolling deployments.
+type cookieKeysConfig struct {
+	Current  cookieKeySet  `json:"current"`
+	Previous *cookieKeySet `json:"previous,omitempty"`
+}
+
+// parseCookieKeys decodes a base64-encoded JSON string containing cookie session
+// keys and returns them in the order expected by gorilla/sessions cookie.NewStore:
+// [currentAuth, currentEncrypt, previousAuth, previousEncrypt]
+func parseCookieKeys(raw string) ([][]byte, error) {
+	if raw == "" {
+		return nil, fmt.Errorf("environment variable is required")
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid base64: %w", err)
+	}
+
+	var cfg cookieKeysConfig
+	if err := json.Unmarshal(decoded, &cfg); err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+
+	if cfg.Current.AuthKey == "" || cfg.Current.EncryptKey == "" {
+		return nil, fmt.Errorf("current.auth_key and current.encrypt_key are required")
+	}
+
+	if err := validateKeyLengths("current", cfg.Current); err != nil {
+		return nil, err
+	}
+
+	keys := [][]byte{
+		[]byte(cfg.Current.AuthKey),
+		[]byte(cfg.Current.EncryptKey),
+	}
+
+	if cfg.Previous != nil && cfg.Previous.AuthKey != "" && cfg.Previous.EncryptKey != "" {
+		if err := validateKeyLengths("previous", *cfg.Previous); err != nil {
+			return nil, err
+		}
+		keys = append(keys, []byte(cfg.Previous.AuthKey), []byte(cfg.Previous.EncryptKey))
+	}
+
+	return keys, nil
+}
+
+// validateKeyLengths checks that auth and encrypt keys have valid lengths
+// for gorilla/securecookie: auth key must be 32 or 64 bytes (HMAC-SHA256/512),
+// encrypt key must be 16, 24, or 32 bytes (AES-128/192/256).
+func validateKeyLengths(label string, ks cookieKeySet) error {
+	authLen := len(ks.AuthKey)
+	if authLen != 32 && authLen != 64 {
+		return fmt.Errorf("%s.auth_key must be 32 or 64 bytes, got %d", label, authLen)
+	}
+	encLen := len(ks.EncryptKey)
+	if encLen != 16 && encLen != 24 && encLen != 32 {
+		return fmt.Errorf("%s.encrypt_key must be 16, 24, or 32 bytes, got %d", label, encLen)
+	}
+	return nil
+}
+
+// ginLogFormatter formats Gin access log lines with request ID and error context.
+func ginLogFormatter(param gin.LogFormatterParams) string {
+	reqID := ""
+	if v, ok := param.Keys[RequestIDKey].(string); ok {
+		reqID = v
+	}
+	errMsg := ""
+	if param.ErrorMessage != "" {
+		errMsg = fmt.Sprintf(" | err=%s", param.ErrorMessage)
+	}
+	return fmt.Sprintf("[GIN] %s | %3d | %13v | %15s | %-7s %s | req_id=%s%s\n",
+		param.TimeStamp.Format("2006/01/02 - 15:04:05"),
+		param.StatusCode,
+		param.Latency,
+		param.ClientIP,
+		param.Method,
+		param.Path,
+		reqID,
+		errMsg,
+	)
+}
+
+// corsMiddleware adds CORS headers to the HTTP response.
 // It allows cross-origin resource sharing, specifies allowed methods, exposes headers, and sets maximum age.
 // If the request method is OPTIONS, PUT, or DELETE, it aborts the request with a 204 status code.
 func corsMiddleware() gin.HandlerFunc {
@@ -394,8 +499,8 @@ func corsMiddleware() gin.HandlerFunc {
 		// Currently hardcoded to "*" which contradicts production CORS requirements in QURL.
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")                   // allow cross-origin resource sharing
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS, POST") // methods
-		c.Writer.Header().Set("Access-Control-Expose-Headers", "Content-Type, Content-Length, Set-Cookie")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Authorization, X-NHP-Ver, Cookie")
+		c.Writer.Header().Set("Access-Control-Expose-Headers", "Content-Type, Content-Length, Set-Cookie, X-Request-ID")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Authorization, X-NHP-Ver, Cookie, X-Request-ID")
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		c.Writer.Header().Set("Access-Control-Max-Age", "300")
 		// NHP headers

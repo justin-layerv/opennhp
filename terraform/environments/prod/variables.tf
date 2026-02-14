@@ -926,6 +926,42 @@ variable "guardduty_alert_emails" {
   default = []
 }
 
+variable "alert_emails" {
+  description = "Email addresses for CloudWatch alarm SNS notifications"
+  type        = list(string)
+  default     = []
+}
+
+variable "enable_waf_logging" {
+  description = "Enable WAF logging to CloudWatch Logs"
+  type        = bool
+  default     = true
+}
+
+variable "qurl_desired_count" {
+  description = "Desired number of QURL ECS tasks"
+  type        = number
+  default     = 1
+}
+
+variable "qurl_autoscaling_min_capacity" {
+  description = "Minimum number of QURL ECS tasks for auto-scaling"
+  type        = number
+  default     = 1
+}
+
+variable "qurl_autoscaling_max_capacity" {
+  description = "Maximum number of QURL ECS tasks for auto-scaling"
+  type        = number
+  default     = 4
+}
+
+variable "deploy_redis" {
+  description = "Deploy ElastiCache Serverless Redis for distributed QURL rate limiting"
+  type        = bool
+  default     = false
+}
+
 # ==============================================================================
 # Auth0 Configuration
 # ==============================================================================
@@ -1046,4 +1082,26 @@ variable "canary_instance_warmup_seconds" {
   description = "Instance warmup time in seconds for canary refresh"
   type        = number
   default     = 180
+}
+
+# ==============================================================================
+# Status Page Configuration
+# ==============================================================================
+
+variable "deploy_status_page" {
+  description = "Deploy the status page (Lambda + API Gateway + S3 + CloudFront)"
+  type        = bool
+  default     = false
+}
+
+variable "status_page_domain" {
+  description = "Custom domain for the status page"
+  type        = string
+  default     = null
+}
+
+variable "status_page_hosted_zone_id" {
+  description = "Route53 hosted zone ID for the status page domain"
+  type        = string
+  default     = null
 }

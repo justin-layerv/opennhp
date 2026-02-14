@@ -82,6 +82,13 @@ locals {
 resource "grafana_data_source" "cloudwatch" {
   count = var.cloudwatch_datasource_enabled ? 1 : 0
 
+  lifecycle {
+    precondition {
+      condition     = var.cloudwatch_assume_role_arn != "" || var.grafana_cloud_aws_account_id != ""
+      error_message = "When cloudwatch_datasource_enabled is true, either cloudwatch_assume_role_arn or grafana_cloud_aws_account_id must be set so Grafana Cloud can assume an IAM role for CloudWatch access."
+    }
+  }
+
   type = "cloudwatch"
   name = "CloudWatch"
 

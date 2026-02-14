@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -1240,4 +1241,79 @@ func TestIsSuccessErrCode(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ============================================================================
+// getOrCreateServerPeer Regression Tests
+// ============================================================================
+
+// TestGetOrCreateServerPeer_UsesStaticIP verifies that server peers use the
+// static InternalIP field for addressing, NOT DNS resolution of the server ID.
+// Regression test: previously target.ID was set as Hostname, causing DNS
+// resolution of identifiers like "server-b" to random IPs.
+func TestGetOrCreateServerPeer_UsesStaticIP(t *testing.T) {
+	device := core.NewDevice(core.NHP_SERVER, make([]byte, 32), nil)
+	if device == nil {
+		t.Fatal("failed to create device")
+	}
+	device.Start()
+	defer device.Stop()
+
+	forwarder := &ServerForwarder{
+		health:      NewServerHealthTracker(),
+		pendingFwds: make(map[uint64]*PendingForward),
+		serverPeers: make(map[string]*core.UdpPeer),
+		deps:        &testForwarderDepsWithDevice{device: device},
+	}
+
+	target := ServerInfo{
+		ID:         "non-resolvable-server-id", // NOT a valid hostname
+		InternalIP: "10.0.1.50",
+		Port:       62206,
+		PubKey:     device.PublicKeyBase64(), // self-key for simplicity
+	}
+
+	peer, err := forwarder.getOrCreateServerPeer(target)
+	if err != nil {
+		t.Fatalf("getOrCreateServerPeer failed: %v", err)
+	}
+
+	addr := peer.SendAddr()
+	if addr == nil {
+		t.Fatal("SendAddr() returned nil — peer has no valid address")
+	}
+
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", addr)
+	}
+
+	if udpAddr.IP.String() != "10.0.1.50" {
+		t.Errorf("expected IP 10.0.1.50, got %s (DNS resolution of server ID?)", udpAddr.IP)
+	}
+	if udpAddr.Port != 62206 {
+		t.Errorf("expected port 62206, got %d", udpAddr.Port)
+	}
+}
+
+// testForwarderDepsWithDevice is a minimal ForwarderDeps for unit tests that
+// only need GetDevice().
+type testForwarderDepsWithDevice struct {
+	device *core.Device
+}
+
+func (d *testForwarderDepsWithDevice) GetHostname() string       { return "test-server" }
+func (d *testForwarderDepsWithDevice) GetDevice() *core.Device   { return d.device }
+func (d *testForwarderDepsWithDevice) SendMessage(*core.MsgData) {}
+func (d *testForwarderDepsWithDevice) FindACConnectionsForKnock(*common.AgentKnockMsg) []*ACConn {
+	return nil
+}
+func (d *testForwarderDepsWithDevice) FindAuthSvcProvider(string) *common.AuthServiceProviderData {
+	return nil
+}
+func (d *testForwarderDepsWithDevice) ProcessACOperation(*common.AgentKnockMsg, *ACConn, *common.NetAddress, []*common.NetAddress, uint32) (*common.ACOpsResultMsg, error) {
+	return nil, nil
+}
+func (d *testForwarderDepsWithDevice) ProcessACOperationBroadcast(*common.AgentKnockMsg, []*ACConn, *common.NetAddress, []*common.NetAddress, uint32) (*common.ACOpsResultMsg, error) {
+	return nil, nil
 }

@@ -79,3 +79,9 @@ variable "enable_dynamodb_monitoring" {
   type        = bool
   default     = true
 }
+
+variable "alert_emails" {
+  description = "Email addresses for CloudWatch alarm SNS notifications. Each address must confirm the subscription."
+  type        = list(string)
+  default     = []
+}

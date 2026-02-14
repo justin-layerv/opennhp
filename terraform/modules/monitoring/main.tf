@@ -99,6 +99,16 @@ data "aws_iam_policy_document" "alerts_policy" {
   }
 }
 
+# Email subscriptions for CloudWatch alarm notifications (B8 alert routing)
+# NOTE: Each email address must confirm the subscription via a link sent by AWS.
+# Subscriptions remain "PendingConfirmation" until confirmed and will not receive alerts.
+resource "aws_sns_topic_subscription" "alert_emails" {
+  for_each  = toset(var.alert_emails)
+  topic_arn = aws_sns_topic.alerts.arn
+  protocol  = "email"
+  endpoint  = each.value
+}
+
 # AWS Chatbot IAM Role for Slack integration
 resource "aws_iam_role" "chatbot" {
   count = local.enable_slack ? 1 : 0

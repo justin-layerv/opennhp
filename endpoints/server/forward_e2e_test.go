@@ -2187,6 +2187,9 @@ func TestE2E_ForwardIntegration_HealthTracking(t *testing.T) {
 	// ========================================================================
 	t.Log("=== Test 2: Mark server-a unhealthy - should skip to server-b ===")
 
+	// Small delay to avoid triggering flood protection (MinimalRecvIntervalMs = 20)
+	time.Sleep(100 * time.Millisecond)
+
 	// Mark server-a as unhealthy using the health tracker
 	forwarder.health.RecordFailure("server-a")
 	t.Log("Marked server-a as unhealthy")
