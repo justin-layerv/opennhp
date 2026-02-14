@@ -231,6 +231,10 @@ enable_canary_deployment = true
 # Cost: ~$0/month idle (serverless scales to zero when unused, pay per ECPU + storage)
 deploy_redis = true
 
+# Cost analytics (CUR 2.0 → Athena → Grafana)
+deploy_cost_analytics                 = true
+cross_account_cost_analytics_role_arn = "arn:aws:iam::165115313779:role/nhp-cost-analytics-access"
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"
