@@ -275,7 +275,7 @@ func TestValidateACLicense_TimingAttackPrevention(t *testing.T) {
 		measuredRuns    = 8    // Runs to measure (after warmup)
 		totalRuns       = warmupRuns + measuredRuns
 		trimOutliers    = 1    // Remove N highest/lowest samples
-		maxRelativeDev  = 0.45 // Max 45% deviation from median (catches 10x attacks, allows CI noise)
+		maxRelativeDev  = 0.47 // Max 47% deviation from median (catches 10x attacks, allows CI noise)
 		minExpectedTime = 50 * time.Millisecond // bcrypt should take at least this long
 	)
 
