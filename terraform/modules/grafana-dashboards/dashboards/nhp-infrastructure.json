@@ -2246,6 +2246,7 @@
           "metricName": "MetricAlarms",
           "queryMode": "Annotations",
           "prefixMatching": true,
+          "actionPrefix": "arn:",
           "alarmNamePrefix": "${name_prefix}",
           "region": "default"
         }
