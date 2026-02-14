@@ -11,9 +11,9 @@ hosted_zone    = "layerv.ai"            # Hosted in layerv-mgmt account - requir
 hosted_zone_id = "Z0748438C8EK6UAW94ST" # Bypass lookup - zone is in layerv-mgmt account
 multi_tenant   = true
 # Minimal for initial deployment. Production-ready values: min=3, max=10
-min_capacity   = 1
-max_capacity   = 3
-vpc_cidr       = "10.200.0.0/16" # Different CIDR from sandbox
+min_capacity = 1
+max_capacity = 3
+vpc_cidr     = "10.200.0.0/16" # Different CIDR from sandbox
 
 # Multi-account config: prod pulls images from sandbox account's ECR
 is_primary_account = false
