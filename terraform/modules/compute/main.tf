@@ -241,16 +241,12 @@ resource "terraform_data" "cookie_secret_seed" {
   triggers_replace = [aws_secretsmanager_secret.cookie_secret.arn]
 
   provisioner "local-exec" {
-    command = <<-EOT
-      AUTH_KEY=$(aws secretsmanager get-random-password \
-        --password-length 32 --exclude-punctuation \
-        --query RandomPassword --output text)
-      ENCRYPT_KEY=$(aws secretsmanager get-random-password \
-        --password-length 32 --exclude-punctuation \
-        --query RandomPassword --output text)
-      aws secretsmanager put-secret-value \
-        --secret-id "${aws_secretsmanager_secret.cookie_secret.id}" \
-        --secret-string "{\"current\":{\"auth_key\":\"$AUTH_KEY\",\"encrypt_key\":\"$ENCRYPT_KEY\"}}"
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -euo pipefail
+      AUTH_KEY=$(aws secretsmanager get-random-password --password-length 32 --exclude-punctuation --query RandomPassword --output text)
+      ENCRYPT_KEY=$(aws secretsmanager get-random-password --password-length 32 --exclude-punctuation --query RandomPassword --output text)
+      aws secretsmanager put-secret-value --secret-id "${aws_secretsmanager_secret.cookie_secret.id}" --secret-string "{\"current\":{\"auth_key\":\"$AUTH_KEY\",\"encrypt_key\":\"$ENCRYPT_KEY\"}}"
     EOT
   }
 }
