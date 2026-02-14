@@ -39,6 +39,9 @@ create_oidc_provider = false
 # The existing trail was created before SCP was applied and continues to work
 enable_cloudtrail = false
 
+# AWS Config: DAILY recording of specific resource types (was CONTINUOUS/ALL = ~$460/mo)
+config_recording_frequency = "DAILY"
+
 # NHP Server configuration
 # Set to true for sandbox to enable debug features
 log_level     = 4 # Debug for sandbox (0=silent, 1=error, 2=info, 3=audit, 4=debug, 5=trace)

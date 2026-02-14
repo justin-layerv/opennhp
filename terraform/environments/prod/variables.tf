@@ -149,6 +149,18 @@ variable "enable_cloudtrail" {
   default     = true
 }
 
+variable "config_recording_frequency" {
+  description = "AWS Config recording frequency: CONTINUOUS or DAILY"
+  type        = string
+  default     = "DAILY"
+}
+
+variable "config_resource_types" {
+  description = "Specific AWS resource types to record. Empty list uses module defaults."
+  type        = list(string)
+  default     = []
+}
+
 # GitHub OIDC
 variable "create_oidc_provider" {
   description = "Create GitHub OIDC provider. Set to false if org manages centrally or SCP blocks creation."

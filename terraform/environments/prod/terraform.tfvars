@@ -45,6 +45,9 @@ create_oidc_provider = true
 # CloudTrail - enable in prod for security auditing
 enable_cloudtrail = true
 
+# AWS Config: DAILY recording of specific resource types (was CONTINUOUS/ALL = ~$176/mo projected)
+config_recording_frequency = "DAILY"
+
 # NHP Server configuration - NEVER enable dev_mode in production
 log_level     = 2 # Info for production (0=silent, 1=error, 2=info, 3=audit, 4=debug, 5=trace)
 dev_mode      = false

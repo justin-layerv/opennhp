@@ -404,6 +404,18 @@ variable "enable_cloudtrail" {
   default     = true
 }
 
+variable "config_recording_frequency" {
+  description = "AWS Config recording frequency: CONTINUOUS (every change) or DAILY (once per 24h). DAILY reduces costs ~90%."
+  type        = string
+  default     = "DAILY"
+}
+
+variable "config_resource_types" {
+  description = "Specific AWS resource types to record. Empty list means all supported types. Default includes types needed by Config rules and SecurityHub."
+  type        = list(string)
+  default     = []
+}
+
 # ==================== Monitoring & Alerting ====================
 
 variable "enable_slack_notifications" {

@@ -521,13 +521,15 @@ module "dns" {
 module "security" {
   source = "./modules/security"
 
-  environment         = var.environment
-  name_prefix         = local.name_prefix
-  rate_limit_requests = var.environment == "prod" ? 5000 : 2000
-  logs_kms_key_arn    = module.kms.logs_key_arn
-  enable_cloudtrail   = var.enable_cloudtrail
-  enable_waf_logging  = var.enable_waf_logging
-  tags                = local.common_tags
+  environment                = var.environment
+  name_prefix                = local.name_prefix
+  rate_limit_requests        = var.environment == "prod" ? 5000 : 2000
+  logs_kms_key_arn           = module.kms.logs_key_arn
+  enable_cloudtrail          = var.enable_cloudtrail
+  enable_waf_logging         = var.enable_waf_logging
+  config_recording_frequency = var.config_recording_frequency
+  config_resource_types      = var.config_resource_types
+  tags                       = local.common_tags
 
   # GuardDuty alerting - sends findings to SNS for email/Slack notifications
   enable_guardduty_alerts = length(var.guardduty_alert_emails) > 0

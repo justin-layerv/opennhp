@@ -50,8 +50,10 @@ module "nhp" {
   ac_max_capacity    = var.ac_max_capacity
 
   # Security services
-  enable_cloudtrail  = var.enable_cloudtrail
-  enable_waf_logging = var.enable_waf_logging
+  enable_cloudtrail          = var.enable_cloudtrail
+  enable_waf_logging         = var.enable_waf_logging
+  config_recording_frequency = var.config_recording_frequency
+  config_resource_types      = var.config_resource_types
 
   # GitHub OIDC
   create_oidc_provider = var.create_oidc_provider

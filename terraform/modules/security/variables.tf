@@ -61,6 +61,56 @@ variable "enable_aws_config" {
   default     = true
 }
 
+variable "config_recording_frequency" {
+  description = "AWS Config recording frequency: CONTINUOUS (every change) or DAILY (once per 24h). DAILY reduces costs ~90%."
+  type        = string
+  default     = "DAILY"
+
+  validation {
+    condition     = contains(["CONTINUOUS", "DAILY"], var.config_recording_frequency)
+    error_message = "config_recording_frequency must be CONTINUOUS or DAILY."
+  }
+}
+
+variable "config_resource_types" {
+  description = "Specific AWS resource types to record. When set, only these types are recorded instead of all supported types. Reduces Config costs by excluding high-churn resources."
+  type        = list(string)
+  default = [
+    # Required by Config rules: ENCRYPTED_VOLUMES
+    "AWS::EC2::Volume",
+    # Required by Config rules: S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED
+    "AWS::S3::Bucket",
+    # Required by Config rules: INCOMING_SSH_DISABLED
+    "AWS::EC2::SecurityGroup",
+    # Required by Config rules: VPC_FLOW_LOGS_ENABLED
+    "AWS::EC2::VPC",
+    # Required by Config rules: IAM_USER_MFA_ENABLED, ROOT_ACCOUNT_MFA_ENABLED
+    "AWS::IAM::User",
+    # SecurityHub FSBP: instance metadata, IMDSv2
+    "AWS::EC2::Instance",
+    # SecurityHub FSBP: encryption, public access
+    "AWS::RDS::DBInstance",
+    "AWS::RDS::DBCluster",
+    # SecurityHub FSBP: public access checks
+    "AWS::Lambda::Function",
+    # SecurityHub FSBP: key rotation
+    "AWS::KMS::Key",
+    # SecurityHub FSBP: certificate expiration
+    "AWS::ACM::Certificate",
+    # SecurityHub FSBP: load balancer security
+    "AWS::ElasticLoadBalancingV2::LoadBalancer",
+    # SecurityHub FSBP: cluster/service configuration
+    "AWS::ECS::Cluster",
+    "AWS::ECS::Service",
+    # SecurityHub FSBP: ASG health checks
+    "AWS::AutoScaling::AutoScalingGroup",
+    # SecurityHub FSBP: topic encryption
+    "AWS::SNS::Topic",
+    # SecurityHub CIS: CloudTrail configuration
+    "AWS::CloudTrail::Trail",
+  ]
+}
+
 variable "enable_cloudtrail" {
   description = "Enable AWS CloudTrail for API audit logging"
   type        = bool

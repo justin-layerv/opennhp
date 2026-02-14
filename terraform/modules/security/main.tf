@@ -433,11 +433,12 @@ resource "aws_config_configuration_recorder" "main" {
   role_arn = aws_iam_role.config[0].arn
 
   recording_group {
-    all_supported = true
+    all_supported  = length(var.config_resource_types) == 0
+    resource_types = length(var.config_resource_types) > 0 ? var.config_resource_types : null
   }
 
   recording_mode {
-    recording_frequency = "CONTINUOUS"
+    recording_frequency = var.config_recording_frequency
   }
 }
 

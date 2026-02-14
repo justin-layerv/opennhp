@@ -36,7 +36,9 @@ module "nhp" {
   ac_resource_ids    = var.ac_resource_ids
 
   # Security services
-  enable_cloudtrail = var.enable_cloudtrail
+  enable_cloudtrail          = var.enable_cloudtrail
+  config_recording_frequency = var.config_recording_frequency
+  config_resource_types      = var.config_resource_types
 
   # GitHub OIDC - set to false if org manages centrally or SCP blocks creation
   create_oidc_provider = var.create_oidc_provider
