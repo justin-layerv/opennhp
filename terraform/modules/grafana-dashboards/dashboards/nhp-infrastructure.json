@@ -1127,9 +1127,6 @@
           "dimensions": {
             "Environment": [
               "$environment"
-            ],
-            "Component": [
-              "server"
             ]
           },
           "matchExact": false,
@@ -1148,9 +1145,6 @@
           "dimensions": {
             "Environment": [
               "$environment"
-            ],
-            "Component": [
-              "server"
             ]
           },
           "matchExact": false,
@@ -1169,9 +1163,6 @@
           "dimensions": {
             "Environment": [
               "$environment"
-            ],
-            "Component": [
-              "server"
             ]
           },
           "matchExact": false,
@@ -1190,9 +1181,6 @@
           "dimensions": {
             "Environment": [
               "$environment"
-            ],
-            "Component": [
-              "server"
             ]
           },
           "matchExact": false,
@@ -1260,9 +1248,6 @@
           "dimensions": {
             "Environment": [
               "$environment"
-            ],
-            "Component": [
-              "server"
             ]
           },
           "matchExact": false,
@@ -1333,9 +1318,6 @@
           "dimensions": {
             "Environment": [
               "$environment"
-            ],
-            "Component": [
-              "server"
             ]
           },
           "matchExact": false,
@@ -1354,9 +1336,6 @@
           "dimensions": {
             "Environment": [
               "$environment"
-            ],
-            "Component": [
-              "server"
             ]
           },
           "matchExact": false,
@@ -1416,9 +1395,6 @@
           "dimensions": {
             "Environment": [
               "$environment"
-            ],
-            "Component": [
-              "server"
             ]
           },
           "matchExact": false,
@@ -1485,9 +1461,6 @@
           "dimensions": {
             "Environment": [
               "$environment"
-            ],
-            "Component": [
-              "server"
             ]
           },
           "matchExact": false,
