@@ -156,12 +156,12 @@ nhp_dynamodb_licenses_customer_index      = "customer_id-index"
 nhp_dynamodb_licenses_auth0_subject_index = "auth0_subject-index"
 
 # QURL ECS Fargate capacity (right-sized for initial sporadic traffic)
-# At 256 CPU / 512 MB with 1 task, Fargate cost is ~$9/month
-qurl_container_cpu            = 256 # 0.25 vCPU — sufficient for sporadic traffic
-qurl_container_memory         = 512 # 512 MB — QURL is lightweight Go binary
-qurl_desired_count            = 1   # Single task for initial low traffic
-qurl_autoscaling_min_capacity = 1   # Minimum tasks (scale to zero not supported)
-qurl_autoscaling_max_capacity = 4   # Allow burst scaling if traffic spikes
+# With ADOT sidecar: effective CPU = max(256,512)=512, memory = 1024+256=1280 → valid for 512 CPU
+qurl_container_cpu            = 256  # 0.25 vCPU — sufficient for sporadic traffic
+qurl_container_memory         = 1024 # 1024 MB — minimum for Fargate 512 CPU with ADOT sidecar
+qurl_desired_count            = 1    # Single task for initial low traffic
+qurl_autoscaling_min_capacity = 1    # Minimum tasks (scale to zero not supported)
+qurl_autoscaling_max_capacity = 4    # Allow burst scaling if traffic spikes
 
 # QURL AC Fleet defaults
 qurl_default_ac_id   = "layerv-ac-tf"
