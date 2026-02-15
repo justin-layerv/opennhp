@@ -129,10 +129,32 @@ resource "aws_iam_role_policy" "orchestrator" {
         Resource = "*"
       },
       {
-        Sid      = "LaunchTemplateForDesiredConfiguration"
+        # RunInstances requires authorization on ALL resource types it creates/references,
+        # not just the launch template. The ASG's launch template constrains what actually
+        # gets created; this policy just satisfies IAM validation.
+        Sid    = "RunInstancesForDesiredConfiguration"
+        Effect = "Allow"
+        Action = ["ec2:RunInstances"]
+        Resource = [
+          var.launch_template_arn,
+          "arn:aws:ec2:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:instance/*",
+          "arn:aws:ec2:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:volume/*",
+          "arn:aws:ec2:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:network-interface/*",
+          "arn:aws:ec2:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:subnet/*",
+          "arn:aws:ec2:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:security-group/*",
+          "arn:aws:ec2:${data.aws_region.current.id}::image/*",
+        ]
+      },
+      {
+        Sid      = "PassRoleForInstanceProfile"
         Effect   = "Allow"
-        Action   = ["ec2:RunInstances"]
-        Resource = var.launch_template_arn
+        Action   = ["iam:PassRole"]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "iam:PassedToService" = "ec2.amazonaws.com"
+          }
+        }
       },
       {
         Sid    = "SSMCanaryState"
