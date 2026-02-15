@@ -807,6 +807,7 @@ resource "aws_iam_policy" "terraform_apply_ec2" {
           "ec2:DeleteLaunchTemplateVersions",
           "ec2:CreateSecurityGroup",
           "ec2:DeleteSecurityGroup",
+          "ec2:DeleteNetworkInterface",
           "ec2:AuthorizeSecurityGroup*",
           "ec2:RevokeSecurityGroup*",
           "ec2:ModifySecurityGroupRules",
