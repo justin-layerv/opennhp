@@ -111,7 +111,6 @@ resource "aws_iam_role_policy" "orchestrator" {
         Effect = "Allow"
         Action = [
           "autoscaling:StartInstanceRefresh",
-          "autoscaling:DescribeInstanceRefreshes",
           "autoscaling:CancelInstanceRefresh",
           "autoscaling:RollbackInstanceRefresh"
         ]
@@ -122,6 +121,7 @@ resource "aws_iam_role_policy" "orchestrator" {
         Effect = "Allow"
         Action = [
           "autoscaling:DescribeAutoScalingGroups",
+          "autoscaling:DescribeInstanceRefreshes",
           "cloudwatch:GetMetricData",
           "cloudwatch:DescribeAlarms"
         ]
