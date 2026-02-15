@@ -224,7 +224,9 @@ qurl_auth0_audience = "https://api.layerv.xyz"
 # IMPORTANT: auth0_domain must be the TENANT domain (not custom domain auth.layerv.ai)
 # The custom domain is used for qurl_auth0_domain (JWKS validation in QURL service)
 # but the Management API requires the actual tenant domain.
-auth0_domain = "dev-q1kiedn8knbutena.us.auth0.com"
+# Both sandbox and prod share a single Auth0 tenant with the auth.layerv.ai custom
+# domain. They are distinguished by separate API audiences.
+auth0_domain = "layerv.us.auth0.com"
 # auth0_tf_client_id and auth0_tf_client_secret are REQUIRED
 # Pass via: TF_VAR_auth0_tf_client_id and TF_VAR_auth0_tf_client_secret
 # In CI: Set from GitHub Secrets (AUTH0_CLIENT_ID, AUTH0_CLIENT_SECRET)

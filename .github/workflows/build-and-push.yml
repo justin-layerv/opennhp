@@ -595,6 +595,12 @@ jobs:
         working-directory: terraform/environments/${{ matrix.environment }}
         run: terraform validate
 
+      - name: Validate Auth0 Credentials
+        env:
+          AUTH0_CLIENT_ID: ${{ matrix.environment == 'prod' && secrets.PROD_AUTH0_CLIENT_ID || secrets.AUTH0_CLIENT_ID }}
+          AUTH0_CLIENT_SECRET: ${{ matrix.environment == 'prod' && secrets.PROD_AUTH0_CLIENT_SECRET || secrets.AUTH0_CLIENT_SECRET }}
+        run: ./.github/scripts/validate-auth0-credentials.sh "terraform/environments/${{ matrix.environment }}/terraform.tfvars" "${{ matrix.environment }}"
+
       - name: Terraform Plan
         id: plan
         working-directory: terraform/environments/${{ matrix.environment }}
@@ -701,6 +707,12 @@ jobs:
           mkdir -p "$HOME/.terraform.d/plugin-cache"
           export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
           terraform init
+
+      - name: Validate Auth0 Credentials
+        env:
+          AUTH0_CLIENT_ID: ${{ secrets.AUTH0_CLIENT_ID }}
+          AUTH0_CLIENT_SECRET: ${{ secrets.AUTH0_CLIENT_SECRET }}
+        run: ./.github/scripts/validate-auth0-credentials.sh terraform/environments/sandbox/terraform.tfvars sandbox
 
       - name: Handle ASG Attachment Migrations
         working-directory: terraform/environments/sandbox
