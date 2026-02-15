@@ -60,7 +60,7 @@ jobs:
   validate:
     name: Validate
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}
+    environment: ${{ inputs.environment == 'prod' && 'production' || inputs.environment }}
     timeout-minutes: 5
     outputs:
       state_machine_arn: ${{ steps.state-machine.outputs.arn }}
@@ -185,7 +185,7 @@ jobs:
     name: Deploy
     needs: validate
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}
+    environment: ${{ inputs.environment == 'prod' && 'production' || inputs.environment }}
     timeout-minutes: 45
     outputs:
       execution_arn: ${{ steps.start-execution.outputs.execution_arn }}

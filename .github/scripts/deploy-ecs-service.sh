@@ -119,7 +119,7 @@ echo "  New image: $NEW_IMAGE"
 NEW_TASK_DEF=$(echo "$CURRENT_TASK_DEF" | jq \
   --arg new_image "$NEW_IMAGE" \
   --arg repo "$IMAGE_REPO" \
-  '.containerDefinitions = [.containerDefinitions[] | if (.image | startswith($repo + ":")) then .image = $new_image else . end] | del(.taskDefinitionArn, .revision, .status, .registeredAt, .registeredBy, .compatibilities, .requiresAttributes)')
+  '.containerDefinitions = [.containerDefinitions[] | if (.image | startswith($repo + ":")) then .image = $new_image else . end] | del(.taskDefinitionArn, .revision, .status, .registeredAt, .registeredBy, .deregisteredAt, .compatibilities, .requiresAttributes)')
 echo ""
 
 # Step 5: Register new task definition
