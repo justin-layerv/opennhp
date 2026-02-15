@@ -122,6 +122,7 @@ resource "aws_iam_role_policy" "orchestrator" {
         Action = [
           "autoscaling:DescribeAutoScalingGroups",
           "autoscaling:DescribeInstanceRefreshes",
+          "ec2:DescribeLaunchTemplateVersions",
           "cloudwatch:GetMetricData",
           "cloudwatch:DescribeAlarms"
         ]

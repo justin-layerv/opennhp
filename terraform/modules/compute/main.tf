@@ -416,6 +416,7 @@ resource "aws_iam_role_policy" "server" {
         Action = ["secretsmanager:GetSecretValue"]
         Resource = compact(concat(
           [aws_secretsmanager_secret.server.arn],
+          [aws_secretsmanager_secret.cookie_secret.arn],
           [var.etcd_secret_arn],
           [var.etcd_tls_secret_arn],
           [var.qurl_service_token_secret_arn]

@@ -142,9 +142,33 @@ def handle_start_refresh(event, context):
 
     logger.info(f"Starting instance refresh for ASG {ASG_NAME} with image_tag={image_tag}")
 
+    # Look up the ASG's current launch template to pass as DesiredConfiguration.
+    # Without DesiredConfiguration, AWS rejects RollbackInstanceRefresh with
+    # IrreversibleInstanceRefreshFault.
+    asg_response = autoscaling.describe_auto_scaling_groups(
+        AutoScalingGroupNames=[ASG_NAME]
+    )
+    groups = asg_response.get('AutoScalingGroups', [])
+    if not groups:
+        raise ValueError(f"ASG not found: {ASG_NAME}")
+
+    asg = groups[0]
+    launch_template = asg.get('LaunchTemplate', {})
+    if not launch_template:
+        raise ValueError(f"ASG {ASG_NAME} has no launch template configured")
+
+    desired_config = {
+        'LaunchTemplate': {
+            'LaunchTemplateId': launch_template['LaunchTemplateId'],
+            'Version': launch_template['Version'],
+        }
+    }
+    logger.info(f"DesiredConfiguration: {desired_config}")
+
     response = autoscaling.start_instance_refresh(
         AutoScalingGroupName=ASG_NAME,
         Strategy='Rolling',
+        DesiredConfiguration=desired_config,
         Preferences={
             'MinHealthyPercentage': 90,
             'InstanceWarmup': INSTANCE_WARMUP,

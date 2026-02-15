@@ -80,36 +80,33 @@ class CanaryTestCase(unittest.TestCase):
 class TestHandler(CanaryTestCase):
     """Test the main handler action routing."""
 
-    def test_missing_action_returns_error(self):
-        result = canary_orchestrator.handler({}, None)
-        self.assertIn('error', result)
-        self.assertIn('Missing required field: action', result['error'])
+    def test_missing_action_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            canary_orchestrator.handler({}, None)
+        self.assertIn('Missing required field: action', str(ctx.exception))
 
-    def test_unknown_action_returns_error(self):
-        result = canary_orchestrator.handler({'action': 'nonexistent'}, None)
-        self.assertIn('error', result)
-        self.assertIn('Unknown action', result['error'])
+    def test_unknown_action_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            canary_orchestrator.handler({'action': 'nonexistent'}, None)
+        self.assertIn('Unknown action', str(ctx.exception))
 
     def test_action_routing(self):
-        """Verify all expected actions are routable."""
+        """Verify all expected actions have handler functions."""
         expected_actions = [
             'prepare', 'start_refresh', 'check_refresh_status',
             'check_health', 'rollback', 'alarm_triggered_rollback',
             'notify', 'complete',
         ]
         for action in expected_actions:
-            result = canary_orchestrator.handler({'action': action}, None)
-            if 'error' in result:
-                self.assertNotIn('Unknown action', result['error'],
-                                 f"Action '{action}' not routed correctly")
+            handler_fn = getattr(canary_orchestrator, f'handle_{action}', None)
+            self.assertIsNotNone(handler_fn, f"No handler for action '{action}'")
 
-    def test_exception_in_handler_returns_error_dict(self):
+    def test_exception_in_handler_re_raises(self):
         self.mock_autoscaling.describe_auto_scaling_groups.side_effect = \
             Exception("Simulated failure")
-        result = canary_orchestrator.handler({'action': 'prepare'}, None)
-        self.assertIn('error', result)
-        self.assertEqual(result['error_type'], 'Exception')
-        self.assertIn('Simulated failure', result['error'])
+        with self.assertRaises(Exception) as ctx:
+            canary_orchestrator.handler({'action': 'prepare'}, None)
+        self.assertIn('Simulated failure', str(ctx.exception))
 
 
 class TestPrepare(CanaryTestCase):
@@ -131,7 +128,7 @@ class TestPrepare(CanaryTestCase):
 
         self.mock_ssm.put_parameter.assert_called_once()
         call_args = self.mock_ssm.put_parameter.call_args
-        self.assertEqual(call_args[1]['Value'], 'deploying')
+        self.assertTrue(call_args[1]['Value'].startswith('deploying:'))
 
     def test_prepare_blocks_concurrent_deployment(self):
         self.mock_autoscaling.describe_auto_scaling_groups.return_value = {
@@ -159,6 +156,15 @@ class TestStartRefresh(CanaryTestCase):
     """Test the start_refresh action handler."""
 
     def test_start_refresh_success(self):
+        self.mock_autoscaling.describe_auto_scaling_groups.return_value = {
+            'AutoScalingGroups': [{
+                'AutoScalingGroupName': 'test-asg',
+                'LaunchTemplate': {
+                    'LaunchTemplateId': 'lt-abc123',
+                    'Version': '3',
+                }
+            }]
+        }
         self.mock_autoscaling.start_instance_refresh.return_value = {
             'InstanceRefreshId': 'refresh-123'
         }
@@ -175,11 +181,41 @@ class TestStartRefresh(CanaryTestCase):
         self.assertEqual(call_args['Preferences']['CheckpointDelay'], 300)
         self.assertEqual(call_args['Preferences']['InstanceWarmup'], 180)
         self.assertEqual(call_args['Preferences']['MinHealthyPercentage'], 90)
+        self.assertEqual(
+            call_args['DesiredConfiguration']['LaunchTemplate']['LaunchTemplateId'],
+            'lt-abc123'
+        )
+        self.assertEqual(
+            call_args['DesiredConfiguration']['LaunchTemplate']['Version'],
+            '3'
+        )
 
     def test_start_refresh_missing_image_tag(self):
         with self.assertRaises(ValueError) as ctx:
             canary_orchestrator.handle_start_refresh({}, None)
         self.assertIn('image_tag', str(ctx.exception))
+
+    def test_start_refresh_asg_not_found(self):
+        self.mock_autoscaling.describe_auto_scaling_groups.return_value = {
+            'AutoScalingGroups': []
+        }
+        with self.assertRaises(ValueError) as ctx:
+            canary_orchestrator.handle_start_refresh(
+                {'image_tag': 'sha-abc123'}, None
+            )
+        self.assertIn('ASG not found', str(ctx.exception))
+
+    def test_start_refresh_no_launch_template(self):
+        self.mock_autoscaling.describe_auto_scaling_groups.return_value = {
+            'AutoScalingGroups': [{
+                'AutoScalingGroupName': 'test-asg',
+            }]
+        }
+        with self.assertRaises(ValueError) as ctx:
+            canary_orchestrator.handle_start_refresh(
+                {'image_tag': 'sha-abc123'}, None
+            )
+        self.assertIn('no launch template', str(ctx.exception))
 
 
 class TestCheckRefreshStatus(CanaryTestCase):
