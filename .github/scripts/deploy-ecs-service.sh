@@ -124,10 +124,13 @@ echo ""
 
 # Step 5: Register new task definition
 echo "Step 5: Registering new task definition revision..."
-NEW_TASK_DEF_ARN=$(echo "$NEW_TASK_DEF" | aws ecs register-task-definition \
-  --cli-input-json file:///dev/stdin \
+TASK_DEF_FILE=$(mktemp)
+echo "$NEW_TASK_DEF" > "$TASK_DEF_FILE"
+NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+  --cli-input-json "file://$TASK_DEF_FILE" \
   --query "taskDefinition.taskDefinitionArn" --output text \
   --region "$AWS_REGION")
+rm -f "$TASK_DEF_FILE"
 
 echo "  New task definition: $NEW_TASK_DEF_ARN"
 echo ""

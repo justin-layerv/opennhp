@@ -60,7 +60,9 @@ jobs:
   validate:
     name: Validate
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment == 'prod' && 'production' || inputs.environment }}
+    # No environment gate — this workflow is dispatched from promote-to-prod.yml
+    # which already has the production approval gate. Adding one here would block
+    # the dispatched run in "waiting" status, causing the parent to time out.
     timeout-minutes: 5
     outputs:
       state_machine_arn: ${{ steps.state-machine.outputs.arn }}
@@ -185,7 +187,9 @@ jobs:
     name: Deploy
     needs: validate
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment == 'prod' && 'production' || inputs.environment }}
+    # No environment gate — this workflow is dispatched from promote-to-prod.yml
+    # which already has the production approval gate. Adding one here would block
+    # the dispatched run in "waiting" status, causing the parent to time out.
     timeout-minutes: 45
     outputs:
       execution_arn: ${{ steps.start-execution.outputs.execution_arn }}
