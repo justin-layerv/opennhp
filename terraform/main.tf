@@ -400,6 +400,7 @@ module "canary_deployment" {
   asg_name                = module.compute.asg_name
   asg_arn                 = module.compute.asg_arn
   launch_template_arn     = module.compute.launch_template_arn
+  ebs_kms_key_arn         = module.kms.ebs_key_arn
   nlb_arn_suffix          = module.compute.nlb_arn_suffix
   target_group_arn_suffix = module.compute.target_group_arn_suffix
   alerts_sns_topic_arn    = module.monitoring.sns_topic_arn

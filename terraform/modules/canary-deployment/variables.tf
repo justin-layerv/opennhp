@@ -66,6 +66,12 @@ variable "launch_template_arn" {
   type        = string
 }
 
+variable "ebs_kms_key_arn" {
+  description = "KMS key ARN for EBS encryption (required for ec2:RunInstances validation with encrypted volumes)"
+  type        = string
+  default     = null
+}
+
 # ==============================================================================
 # Canary Configuration
 # ==============================================================================

@@ -129,12 +129,15 @@ resource "aws_iam_role_policy" "orchestrator" {
         Resource = "*"
       },
       {
-        # RunInstances requires authorization on ALL resource types it creates/references,
-        # not just the launch template. The ASG's launch template constrains what actually
-        # gets created; this policy just satisfies IAM validation.
+        # StartInstanceRefresh with DesiredConfiguration does a dry-run ec2:RunInstances
+        # validation. This requires authorization on ALL resource types the launch template
+        # references, plus CreateTags for tag specifications and KMS for encrypted volumes.
         Sid    = "RunInstancesForDesiredConfiguration"
         Effect = "Allow"
-        Action = ["ec2:RunInstances"]
+        Action = [
+          "ec2:RunInstances",
+          "ec2:CreateTags",
+        ]
         Resource = [
           var.launch_template_arn,
           "arn:aws:ec2:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:instance/*",
@@ -155,6 +158,18 @@ resource "aws_iam_role_policy" "orchestrator" {
             "iam:PassedToService" = "ec2.amazonaws.com"
           }
         }
+      },
+      {
+        Sid    = "KMSForEncryptedVolumes"
+        Effect = "Allow"
+        Action = [
+          "kms:CreateGrant",
+          "kms:DescribeKey",
+          "kms:GenerateDataKeyWithoutPlaintext",
+          "kms:ReEncryptFrom",
+          "kms:ReEncryptTo",
+        ]
+        Resource = compact([var.ebs_kms_key_arn])
       },
       {
         Sid    = "SSMCanaryState"
