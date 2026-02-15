@@ -8,6 +8,12 @@ variable "multi_tenant" {
   type        = bool
 }
 
+variable "deploy_etcd" {
+  description = "Deploy etcd infrastructure. Set to false for cloud deployments using DynamoDB backend."
+  type        = bool
+  default     = null # Defaults to multi_tenant when null
+}
+
 variable "vpc_id" {
   description = "VPC ID"
   type        = string

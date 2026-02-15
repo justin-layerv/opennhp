@@ -8,6 +8,14 @@
 #     providers = { grafana = grafana }
 #     ...
 #   }
+#
+# CONVENTION: Environment-specific UIDs
+# Both sandbox and prod share the same Grafana Cloud instance, so all UIDs
+# and names must include the environment suffix to avoid conflicts:
+#   - Folder UIDs:     "qurl-${environment}", "nhp-${environment}"
+#   - Dashboard UIDs:  "qurl-operations-${environment}" (in JSON templates)
+#   - Datasource names: "CloudWatch (${environment})"
+# When adding new folders, dashboards, or datasources, always follow this pattern.
 
 terraform {
   required_version = ">= 1.5"
@@ -27,8 +35,8 @@ terraform {
 
 # Create a folder for QURL dashboards
 resource "grafana_folder" "qurl" {
-  uid                          = "qurl"
-  title                        = var.folder_name
+  uid                          = "qurl-${var.environment}"
+  title                        = "${var.folder_name} (${var.environment})"
   prevent_destroy_if_not_empty = true
 }
 
@@ -91,7 +99,7 @@ resource "grafana_data_source" "cloudwatch" {
   }
 
   type = "cloudwatch"
-  name = "CloudWatch"
+  name = "CloudWatch (${var.environment})"
 
   # Dashboard query targets use Grafana 11.x+ CloudWatch plugin format:
   # statistic (singular string), queryMode, metricQueryType, metricEditorMode.
@@ -106,8 +114,8 @@ resource "grafana_data_source" "cloudwatch" {
 
 resource "grafana_folder" "nhp" {
   count                        = (var.cloudwatch_datasource_enabled || var.athena_datasource_enabled) ? 1 : 0
-  uid                          = "nhp"
-  title                        = var.nhp_folder_name
+  uid                          = "nhp-${var.environment}"
+  title                        = "${var.nhp_folder_name} (${var.environment})"
   prevent_destroy_if_not_empty = true
 }
 
@@ -241,7 +249,7 @@ resource "grafana_data_source" "athena" {
   count = var.athena_datasource_enabled ? 1 : 0
 
   type = "grafana-athena-datasource"
-  name = "Amazon Athena"
+  name = "Amazon Athena (${var.environment})"
 
   json_data_encoded = jsonencode({
     defaultRegion = var.athena_region

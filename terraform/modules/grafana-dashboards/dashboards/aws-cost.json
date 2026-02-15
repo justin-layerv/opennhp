@@ -1,4 +1,6 @@
 {
+  "uid": "aws-cost-${environment}",
+  "title": "AWS Cost",
   "annotations": {
     "list": []
   },
@@ -1335,7 +1337,5 @@
   },
   "timepicker": {},
   "timezone": "utc",
-  "title": "AWS Cost",
-  "uid": "aws-cost",
   "version": 1
 }

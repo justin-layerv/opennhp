@@ -215,6 +215,7 @@ module "data" {
 
   environment         = var.environment
   multi_tenant        = var.multi_tenant
+  deploy_etcd         = var.deploy_etcd
   lambda_layer_bucket = coalesce(var.lambda_layer_bucket, var.terraform_state_bucket)
   vpc_id              = module.networking.vpc_id
   private_subnet_ids  = module.networking.private_subnet_ids
@@ -435,6 +436,8 @@ resource "aws_route53_record" "status_page_cert_validation" {
     }
   } : {}
 
+  provider = aws.route53_mgmt
+
   allow_overwrite = true
   name            = each.value.name
   records         = [each.value.record]
@@ -459,8 +462,9 @@ module "status_page" {
   tags        = local.common_tags
 
   # Domain (optional - uses CloudFront default domain if not set)
+  # DNS record created in root module (not module) for cross-account Route53 support
   status_domain       = var.status_page_domain
-  hosted_zone_id      = var.status_page_hosted_zone_id
+  hosted_zone_id      = null
   acm_certificate_arn = var.status_page_domain != null ? aws_acm_certificate_validation.status_page[0].certificate_arn : null
 
   # Target group ARNs for health checks
@@ -494,6 +498,23 @@ module "status_page" {
   dependent_service_urls = var.qurl_service_domain != null ? {
     qurl_api = "https://${var.qurl_service_domain}/health/ready"
   } : {}
+}
+
+# Status page DNS record for cross-account zones
+# Uses route53_mgmt provider (same pattern as AC and QURL API DNS records)
+resource "aws_route53_record" "status_page_dns" {
+  count    = var.deploy_status_page && var.status_page_domain != null && var.status_page_hosted_zone_id != null ? 1 : 0
+  provider = aws.route53_mgmt
+
+  zone_id = var.status_page_hosted_zone_id
+  name    = var.status_page_domain
+  type    = "A"
+
+  alias {
+    name                   = module.status_page[0].cloudfront_domain_name
+    zone_id                = module.status_page[0].cloudfront_hosted_zone_id
+    evaluate_target_health = false
+  }
 }
 
 # DNS Module - Route 53 records

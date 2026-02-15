@@ -15,6 +15,11 @@ output "cloudfront_distribution_id" {
   value       = aws_cloudfront_distribution.status.id
 }
 
+output "cloudfront_hosted_zone_id" {
+  description = "CloudFront distribution Route53 hosted zone ID (for alias records)"
+  value       = aws_cloudfront_distribution.status.hosted_zone_id
+}
+
 output "status_url" {
   description = "Public URL for the status page"
   value       = var.status_domain != null ? "https://${var.status_domain}" : "https://${aws_cloudfront_distribution.status.domain_name}"

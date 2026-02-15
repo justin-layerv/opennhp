@@ -1,7 +1,7 @@
 {
   "title": "QURL Operations",
   "description": "HTTP RED metrics, SLOs, and infrastructure health for QURL API service",
-  "uid": "qurl-operations",
+  "uid": "qurl-operations-${environment}",
   "tags": [
     "qurl",
     "operations",

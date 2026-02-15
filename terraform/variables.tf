@@ -90,6 +90,17 @@ variable "multi_tenant" {
   default     = true
 }
 
+variable "deploy_etcd" {
+  description = "Deploy etcd infrastructure. Set to false for cloud deployments using DynamoDB backend."
+  type        = bool
+  default     = null # Defaults to multi_tenant when null
+
+  validation {
+    condition     = var.deploy_etcd != true || var.multi_tenant == true
+    error_message = "deploy_etcd = true requires multi_tenant = true. etcd is only used in multi-tenant mode."
+  }
+}
+
 variable "min_capacity" {
   description = "Minimum ASG capacity"
   type        = number

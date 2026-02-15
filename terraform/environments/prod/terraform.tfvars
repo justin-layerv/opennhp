@@ -10,6 +10,7 @@ domain_name    = "nhp.layerv.ai"
 hosted_zone    = "layerv.ai"            # Hosted in layerv-mgmt account - requires cross-account DNS access
 hosted_zone_id = "Z0748438C8EK6UAW94ST" # Bypass lookup - zone is in layerv-mgmt account
 multi_tenant   = true
+deploy_etcd    = false # Cloud deployment uses DynamoDB, not etcd
 # Minimal for initial deployment. Production-ready values: min=3, max=10
 min_capacity = 1
 max_capacity = 3
@@ -232,7 +233,9 @@ enable_canary_deployment = true
 deploy_redis = true
 
 # Cost analytics (CUR 2.0 → Athena → Grafana)
-deploy_cost_analytics                 = true
+# Shared mgmt resources (S3, Glue, Athena) are managed by sandbox environment only.
+# Both environments query the same consolidated billing data.
+deploy_cost_analytics                 = false
 cross_account_cost_analytics_role_arn = "arn:aws:iam::165115313779:role/nhp-cost-analytics-access"
 
 tags = {

@@ -10,6 +10,7 @@ data "aws_caller_identity" "current" {}
 
 locals {
   is_prod            = var.environment == "prod"
+  deploy_etcd        = coalesce(var.deploy_etcd, var.multi_tenant)
   etcd_cluster_size  = local.is_prod ? 3 : 1
   etcd_cluster_token = "${var.name_prefix}-cluster"
 
@@ -51,13 +52,13 @@ resource "aws_service_discovery_private_dns_namespace" "main" {
 
 # etcd credentials and TLS certificates
 resource "random_password" "etcd" {
-  count   = var.multi_tenant ? 1 : 0
+  count   = local.deploy_etcd ? 1 : 0
   length  = 32
   special = false
 }
 
 resource "aws_secretsmanager_secret" "etcd" {
-  count                   = var.multi_tenant ? 1 : 0
+  count                   = local.deploy_etcd ? 1 : 0
   name                    = "${var.name_prefix}-etcd-credentials"
   description             = "etcd authentication credentials for NHP ${var.environment}"
   recovery_window_in_days = local.is_prod ? 30 : 0
@@ -70,7 +71,7 @@ resource "aws_secretsmanager_secret" "etcd" {
 }
 
 resource "aws_secretsmanager_secret_version" "etcd" {
-  count     = var.multi_tenant ? 1 : 0
+  count     = local.deploy_etcd ? 1 : 0
   secret_id = aws_secretsmanager_secret.etcd[0].id
   secret_string = jsonencode({
     username = "root"
@@ -84,7 +85,7 @@ resource "aws_secretsmanager_secret_version" "etcd" {
 
 # TLS Certificates for etcd (CA + server certs)
 resource "aws_secretsmanager_secret" "etcd_tls" {
-  count                   = var.multi_tenant ? 1 : 0
+  count                   = local.deploy_etcd ? 1 : 0
   name                    = "${var.name_prefix}-etcd-tls"
   description             = "etcd mTLS certificates (CA, server, client) for NHP ${var.environment}"
   recovery_window_in_days = local.is_prod ? 30 : 0
@@ -98,7 +99,7 @@ resource "aws_secretsmanager_secret" "etcd_tls" {
 
 # TLS certificate generation Lambda (Python with cryptography library)
 resource "aws_iam_role" "etcd_tls_lambda" {
-  count = var.multi_tenant ? 1 : 0
+  count = local.deploy_etcd ? 1 : 0
   name  = "${var.name_prefix}-etcd-tls-lambda"
 
   assume_role_policy = jsonencode({
@@ -119,13 +120,13 @@ resource "aws_iam_role" "etcd_tls_lambda" {
 }
 
 resource "aws_iam_role_policy_attachment" "etcd_tls_lambda_basic" {
-  count      = var.multi_tenant ? 1 : 0
+  count      = local.deploy_etcd ? 1 : 0
   role       = aws_iam_role.etcd_tls_lambda[0].name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
 resource "aws_iam_role_policy" "etcd_tls_lambda_secrets" {
-  count = var.multi_tenant ? 1 : 0
+  count = local.deploy_etcd ? 1 : 0
   name  = "secrets-access"
   role  = aws_iam_role.etcd_tls_lambda[0].id
 
@@ -159,13 +160,13 @@ resource "aws_iam_role_policy" "etcd_tls_lambda_secrets" {
 #   cd /tmp/lambda-layer && zip -r cryptography-layer.zip python/
 #   aws s3 cp cryptography-layer.zip s3://layerv-terraform-state-767397897469/lambda-layers/
 data "aws_s3_object" "cryptography_layer" {
-  count  = var.multi_tenant ? 1 : 0
+  count  = local.deploy_etcd ? 1 : 0
   bucket = coalesce(var.lambda_layer_bucket, "layerv-terraform-state-767397897469")
   key    = "lambda-layers/cryptography-layer.zip"
 }
 
 resource "aws_lambda_layer_version" "cryptography" {
-  count               = var.multi_tenant ? 1 : 0
+  count               = local.deploy_etcd ? 1 : 0
   layer_name          = "${var.name_prefix}-cryptography"
   description         = "Python cryptography library for Lambda (v46.0.3)"
   s3_bucket           = data.aws_s3_object.cryptography_layer[0].bucket
@@ -176,7 +177,7 @@ resource "aws_lambda_layer_version" "cryptography" {
 
 # Lambda to generate TLS certificates using cryptography library
 data "archive_file" "etcd_tls_lambda" {
-  count       = var.multi_tenant ? 1 : 0
+  count       = local.deploy_etcd ? 1 : 0
   type        = "zip"
   output_path = "${path.module}/etcd_tls_lambda.zip"
 
@@ -371,7 +372,7 @@ PYTHON
 }
 
 resource "aws_lambda_function" "etcd_tls" {
-  count            = var.multi_tenant ? 1 : 0
+  count            = local.deploy_etcd ? 1 : 0
   function_name    = "${var.name_prefix}-etcd-tls-gen"
   role             = aws_iam_role.etcd_tls_lambda[0].arn
   handler          = "lambda_function.handler"
@@ -394,7 +395,7 @@ resource "aws_lambda_function" "etcd_tls" {
 # Invoke Lambda to generate TLS certs
 # Uses triggers to force regeneration when Lambda code changes or manually triggered
 resource "aws_lambda_invocation" "etcd_tls" {
-  count         = var.multi_tenant ? 1 : 0
+  count         = local.deploy_etcd ? 1 : 0
   function_name = aws_lambda_function.etcd_tls[0].function_name
 
   input = jsonencode({
@@ -419,7 +420,7 @@ resource "aws_lambda_invocation" "etcd_tls" {
 
 # Secrets rotation for etcd credentials (production only)
 resource "aws_iam_role" "secrets_rotation" {
-  count = var.multi_tenant && local.is_prod ? 1 : 0
+  count = local.deploy_etcd && local.is_prod ? 1 : 0
   name  = "${var.name_prefix}-secrets-rotation"
 
   assume_role_policy = jsonencode({
@@ -437,20 +438,20 @@ resource "aws_iam_role" "secrets_rotation" {
 }
 
 resource "aws_iam_role_policy_attachment" "secrets_rotation_basic" {
-  count      = var.multi_tenant && local.is_prod ? 1 : 0
+  count      = local.deploy_etcd && local.is_prod ? 1 : 0
   role       = aws_iam_role.secrets_rotation[0].name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
 # VPC access policy for secrets rotation Lambda
 resource "aws_iam_role_policy_attachment" "secrets_rotation_vpc" {
-  count      = var.multi_tenant && local.is_prod ? 1 : 0
+  count      = local.deploy_etcd && local.is_prod ? 1 : 0
   role       = aws_iam_role.secrets_rotation[0].name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
 
 resource "aws_iam_role_policy" "secrets_rotation" {
-  count = var.multi_tenant && local.is_prod ? 1 : 0
+  count = local.deploy_etcd && local.is_prod ? 1 : 0
   name  = "secrets-rotation"
   role  = aws_iam_role.secrets_rotation[0].id
 
@@ -477,7 +478,7 @@ resource "aws_iam_role_policy" "secrets_rotation" {
 }
 
 data "archive_file" "secrets_rotation" {
-  count       = var.multi_tenant && local.is_prod ? 1 : 0
+  count       = local.deploy_etcd && local.is_prod ? 1 : 0
   type        = "zip"
   output_path = "${path.module}/secrets_rotation.zip"
 
@@ -659,7 +660,7 @@ EOF
 }
 
 resource "aws_lambda_function" "secrets_rotation" {
-  count            = var.multi_tenant && local.is_prod ? 1 : 0
+  count            = local.deploy_etcd && local.is_prod ? 1 : 0
   function_name    = "${var.name_prefix}-secrets-rotation"
   role             = aws_iam_role.secrets_rotation[0].arn
   handler          = "index.handler"
@@ -689,7 +690,7 @@ resource "aws_lambda_function" "secrets_rotation" {
 }
 
 resource "aws_lambda_permission" "secrets_rotation" {
-  count         = var.multi_tenant && local.is_prod ? 1 : 0
+  count         = local.deploy_etcd && local.is_prod ? 1 : 0
   statement_id  = "AllowSecretsManagerInvocation"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.secrets_rotation[0].function_name
@@ -697,7 +698,7 @@ resource "aws_lambda_permission" "secrets_rotation" {
 }
 
 resource "aws_secretsmanager_secret_rotation" "etcd" {
-  count               = var.multi_tenant && local.is_prod ? 1 : 0
+  count               = local.deploy_etcd && local.is_prod ? 1 : 0
   secret_id           = aws_secretsmanager_secret.etcd[0].id
   rotation_lambda_arn = aws_lambda_function.secrets_rotation[0].arn
 
@@ -711,7 +712,7 @@ resource "aws_secretsmanager_secret_rotation" "etcd" {
 # Security Group for EFS mount targets
 # Separate from etcd SG to allow proper NFS connectivity
 resource "aws_security_group" "efs" {
-  count       = var.multi_tenant ? 1 : 0
+  count       = local.deploy_etcd ? 1 : 0
   name_prefix = "${var.name_prefix}-efs-"
   vpc_id      = var.vpc_id
   description = "Security group for EFS mount targets"
@@ -745,7 +746,7 @@ resource "aws_security_group" "efs" {
 
 # Security Group for etcd ECS tasks
 resource "aws_security_group" "etcd" {
-  count       = var.multi_tenant ? 1 : 0
+  count       = local.deploy_etcd ? 1 : 0
   name_prefix = "${var.name_prefix}-etcd-"
   vpc_id      = var.vpc_id
   description = "Security group for etcd cluster"
@@ -807,7 +808,7 @@ resource "aws_security_group" "etcd" {
 
 # EFS for etcd persistent data
 resource "aws_efs_file_system" "etcd" {
-  count          = var.multi_tenant ? 1 : 0
+  count          = local.deploy_etcd ? 1 : 0
   creation_token = "${var.name_prefix}-etcd"
   encrypted      = true
   kms_key_id     = var.efs_kms_key_arn
@@ -832,7 +833,7 @@ resource "aws_efs_file_system" "etcd" {
 
 # EFS Backup Policy for disaster recovery
 resource "aws_efs_backup_policy" "etcd" {
-  count          = var.multi_tenant ? 1 : 0
+  count          = local.deploy_etcd ? 1 : 0
   file_system_id = aws_efs_file_system.etcd[0].id
 
   backup_policy {
@@ -842,7 +843,7 @@ resource "aws_efs_backup_policy" "etcd" {
 
 # EFS mount targets - use EFS security group, not etcd SG
 resource "aws_efs_mount_target" "etcd" {
-  count           = var.multi_tenant ? length(var.private_subnet_ids) : 0
+  count           = local.deploy_etcd ? length(var.private_subnet_ids) : 0
   file_system_id  = aws_efs_file_system.etcd[0].id
   subnet_id       = var.private_subnet_ids[count.index]
   security_groups = [aws_security_group.efs[0].id]
@@ -850,7 +851,7 @@ resource "aws_efs_mount_target" "etcd" {
 
 # EFS Access Points - one per cluster member for data isolation
 resource "aws_efs_access_point" "etcd" {
-  for_each       = var.multi_tenant ? toset([for i in range(local.etcd_cluster_size) : tostring(i)]) : []
+  for_each       = local.deploy_etcd ? toset([for i in range(local.etcd_cluster_size) : tostring(i)]) : []
   file_system_id = aws_efs_file_system.etcd[0].id
 
   root_directory {
@@ -876,7 +877,7 @@ resource "aws_efs_access_point" "etcd" {
 
 # ECS Cluster for etcd
 resource "aws_ecs_cluster" "etcd" {
-  count = var.multi_tenant ? 1 : 0
+  count = local.deploy_etcd ? 1 : 0
   name  = "${var.name_prefix}-etcd"
 
   setting {
@@ -892,7 +893,7 @@ resource "aws_ecs_cluster" "etcd" {
 
 # CloudWatch Log Group for etcd
 resource "aws_cloudwatch_log_group" "etcd" {
-  count             = var.multi_tenant ? 1 : 0
+  count             = local.deploy_etcd ? 1 : 0
   name              = "/layerv/nhp/${var.environment}/etcd"
   retention_in_days = 30
   kms_key_id        = var.logs_kms_key_arn
@@ -905,7 +906,7 @@ resource "aws_cloudwatch_log_group" "etcd" {
 
 # ECS Task Execution Role
 resource "aws_iam_role" "etcd_execution" {
-  count = var.multi_tenant ? 1 : 0
+  count = local.deploy_etcd ? 1 : 0
   name  = "${var.name_prefix}-etcd-execution"
 
   assume_role_policy = jsonencode({
@@ -923,14 +924,14 @@ resource "aws_iam_role" "etcd_execution" {
 }
 
 resource "aws_iam_role_policy_attachment" "etcd_execution" {
-  count      = var.multi_tenant ? 1 : 0
+  count      = local.deploy_etcd ? 1 : 0
   role       = aws_iam_role.etcd_execution[0].name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
 # ECS Execution Role - Secrets access for native secrets injection
 resource "aws_iam_role_policy" "etcd_execution_secrets" {
-  count = var.multi_tenant ? 1 : 0
+  count = local.deploy_etcd ? 1 : 0
   name  = "secrets-access"
   role  = aws_iam_role.etcd_execution[0].id
 
@@ -959,7 +960,7 @@ resource "aws_iam_role_policy" "etcd_execution_secrets" {
 
 # ECS Task Role
 resource "aws_iam_role" "etcd_task" {
-  count = var.multi_tenant ? 1 : 0
+  count = local.deploy_etcd ? 1 : 0
   name  = "${var.name_prefix}-etcd-task"
 
   assume_role_policy = jsonencode({
@@ -977,7 +978,7 @@ resource "aws_iam_role" "etcd_task" {
 }
 
 resource "aws_iam_role_policy" "etcd_task" {
-  count = var.multi_tenant ? 1 : 0
+  count = local.deploy_etcd ? 1 : 0
   name  = "etcd-task"
   role  = aws_iam_role.etcd_task[0].id
 
@@ -1031,7 +1032,7 @@ resource "aws_iam_role_policy" "etcd_task" {
 
 # ECS Task Definition - one per cluster member with TLS and auth support
 resource "aws_ecs_task_definition" "etcd" {
-  for_each                 = var.multi_tenant ? toset([for i in range(local.etcd_cluster_size) : tostring(i)]) : []
+  for_each                 = local.deploy_etcd ? toset([for i in range(local.etcd_cluster_size) : tostring(i)]) : []
   family                   = "${var.name_prefix}-etcd-${each.key}"
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
@@ -1203,7 +1204,7 @@ resource "aws_ecs_task_definition" "etcd" {
 
 # Cloud Map Service for etcd members (one per cluster member for stable naming)
 resource "aws_service_discovery_service" "etcd" {
-  for_each = var.multi_tenant ? toset([for i in range(local.etcd_cluster_size) : "etcd-${i}"]) : []
+  for_each = local.deploy_etcd ? toset([for i in range(local.etcd_cluster_size) : "etcd-${i}"]) : []
   name     = each.key
 
   dns_config {
@@ -1224,7 +1225,7 @@ resource "aws_service_discovery_service" "etcd" {
 
 # Cloud Map Service for etcd client connections (all members)
 resource "aws_service_discovery_service" "etcd_client" {
-  count = var.multi_tenant ? 1 : 0
+  count = local.deploy_etcd ? 1 : 0
   name  = "etcd"
 
   dns_config {
@@ -1245,7 +1246,7 @@ resource "aws_service_discovery_service" "etcd_client" {
 
 # ECS Service for etcd - one per cluster member
 resource "aws_ecs_service" "etcd" {
-  for_each        = var.multi_tenant ? toset([for i in range(local.etcd_cluster_size) : tostring(i)]) : []
+  for_each        = local.deploy_etcd ? toset([for i in range(local.etcd_cluster_size) : tostring(i)]) : []
   name            = "${var.name_prefix}-etcd-${each.key}"
   cluster         = aws_ecs_cluster.etcd[0].id
   task_definition = aws_ecs_task_definition.etcd[each.key].arn
