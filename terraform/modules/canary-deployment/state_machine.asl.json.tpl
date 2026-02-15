@@ -1,7 +1,7 @@
 {
   "Comment": "Canary deployment orchestrator using ASG instance refresh with checkpoint-based health checks",
   "StartAt": "PrepareDeployment",
-  "TimeoutSeconds": 3600,
+  "TimeoutSeconds": 7200,
   "States": {
     "PrepareDeployment": {
       "Type": "Task",
