@@ -1231,7 +1231,7 @@ resource "aws_iam_policy" "terraform_apply_services" {
         Resource = "*"
       },
       {
-        # Step Functions for canary deployment state machines
+        # Step Functions — Terraform management of canary state machines
         Sid    = "StepFunctions"
         Effect = "Allow"
         Action = [
@@ -1245,6 +1245,19 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "states:ListTagsForResource"
         ]
         Resource = "arn:aws:states:${local.region}:${local.account_id}:stateMachine:layerv-nhp-*"
+      },
+      {
+        # Step Functions — canary deploy runtime (start and monitor executions)
+        Sid    = "StepFunctionsExecution"
+        Effect = "Allow"
+        Action = [
+          "states:StartExecution",
+          "states:DescribeExecution"
+        ]
+        Resource = [
+          "arn:aws:states:${local.region}:${local.account_id}:stateMachine:layerv-nhp-*",
+          "arn:aws:states:${local.region}:${local.account_id}:execution:layerv-nhp-*:*"
+        ]
       }
     ]
   })
