@@ -66,6 +66,22 @@ resource "aws_ssm_parameter" "ecs_service" {
   })
 }
 
+# SSM parameter for default AC ID - resolved by ECS at task launch time via
+# valueFrom in the container definition. This ensures the value is always
+# current, even when task definitions are cloned by CI.
+resource "aws_ssm_parameter" "default_ac_id" {
+  name        = "/${var.name_prefix}/qurl-default-ac-id"
+  type        = "String"
+  value       = var.default_ac_id
+  description = "Default AC ID for QURL service (resolved by ECS at task launch)"
+
+  tags = merge(var.tags, {
+    Name      = "${local.service_name}-default-ac-id"
+    Component = "qurl-service"
+    Cell      = var.cell_id
+  })
+}
+
 # ==================== Locals ====================
 
 locals {
@@ -114,7 +130,6 @@ locals {
     { name = "QURL_SITE_DOMAIN", value = var.qurl_site_domain },
     { name = "QURL_DEFAULT_TOKEN_EXPIRE", value = tostring(var.default_token_expire) },
     { name = "QURL_DEFAULT_OPEN_TIME", value = tostring(var.default_open_time) },
-    { name = "QURL_AC_ID", value = var.default_ac_id },
     { name = "QURL_AC_PORT", value = tostring(var.default_ac_port) },
     { name = "OWNER_RATE_LIMIT", value = tostring(var.owner_rate_limit) },
     { name = "OWNER_RATE_BURST", value = tostring(var.owner_rate_burst) },
@@ -189,10 +204,13 @@ locals {
     ] : [],
   )
 
-  # Secrets from Secrets Manager
+  # Secrets and SSM parameters resolved by ECS at task launch time.
+  # Despite the field name, ECS "secrets" supports both Secrets Manager ARNs
+  # and SSM Parameter Store ARNs — it's the mechanism for dynamic value resolution.
   container_secrets = [
     { name = "QURL_JWT_SECRET", valueFrom = var.jwt_secret_arn },
     { name = "QURL_INTERNAL_SERVICE_TOKEN", valueFrom = var.internal_service_token_arn },
+    { name = "QURL_AC_ID", valueFrom = aws_ssm_parameter.default_ac_id.arn },
   ]
 }
 
@@ -255,7 +273,7 @@ resource "aws_iam_role_policy_attachment" "execution_basic" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# Policy to read secrets from Secrets Manager
+# Policy to read secrets from Secrets Manager and SSM parameters for valueFrom
 resource "aws_iam_role_policy" "execution_secrets" {
   name = "secrets-access"
   role = aws_iam_role.execution.id
@@ -274,6 +292,11 @@ resource "aws_iam_role_policy" "execution_secrets" {
           # Add Grafana Cloud secret when ADOT sidecar is enabled
           var.grafana_cloud_enabled && var.grafana_secret_arn != null ? [var.grafana_secret_arn] : []
         )
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameters"]
+        Resource = [aws_ssm_parameter.default_ac_id.arn]
       }
       ], var.secrets_kms_key_arn != null ? [{
         Effect   = "Allow"
