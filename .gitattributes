@@ -9,5 +9,6 @@
 
 # Ensure consistent LF line endings for shell-interpreted files
 *.tf text eol=lf
+*.tfvars text eol=lf
 *.sh text eol=lf
 *.tpl text eol=lf

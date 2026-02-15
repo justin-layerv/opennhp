@@ -31,8 +31,8 @@ if [[ -z "${AUTH0_CLIENT_ID:-}" || -z "${AUTH0_CLIENT_SECRET:-}" ]]; then
   exit 1
 fi
 
-# Read auth0_domain from tfvars
-AUTH0_DOMAIN=$(grep -E '^auth0_domain\s*=' "$TFVARS_PATH" | sed 's/.*=\s*"\(.*\)"/\1/')
+# Read auth0_domain from tfvars (strip \r for CRLF line endings)
+AUTH0_DOMAIN=$(grep -E '^auth0_domain\s*=' "$TFVARS_PATH" | sed 's/.*=\s*"\(.*\)"/\1/' | tr -d '\r')
 if [[ -z "$AUTH0_DOMAIN" ]]; then
   echo "::error::Could not read auth0_domain from $TFVARS_PATH"
   exit 1
