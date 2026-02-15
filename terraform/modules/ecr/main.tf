@@ -1320,6 +1320,10 @@ resource "aws_iam_policy" "terraform_apply_data" {
         Action = [
           "ssm:PutParameter",
           "ssm:DeleteParameter",
+          "ssm:CreateDocument",
+          "ssm:UpdateDocument",
+          "ssm:DeleteDocument",
+          "ssm:UpdateDocumentDefaultVersion",
           "ssm:AddTagsToResource",
           "ssm:RemoveTagsFromResource",
           "acm:RequestCertificate",
