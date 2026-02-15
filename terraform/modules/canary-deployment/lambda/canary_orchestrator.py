@@ -109,18 +109,21 @@ def handle_prepare(event, context):
     # Manual Step Functions executions could theoretically race, but this is acceptable
     # since StartInstanceRefresh rejects concurrent refreshes on the same ASG.
     current_state = get_ssm_value(SSM_CANARY_STATE_PARAM)
-    if current_state == 'deploying':
+    if current_state and current_state.startswith('deploying'):
         raise RuntimeError(
-            f"Concurrent deployment blocked: canary state is already 'deploying'. "
+            f"Concurrent deployment blocked: canary state is '{current_state}'. "
             f"If a previous deployment is stuck, manually set {SSM_CANARY_STATE_PARAM} to 'idle'."
         )
 
     # Read current image tag
     current_image_tag = get_ssm_value(SSM_IMAGE_TAG_PARAM)
 
-    # Set canary state to deploying
+    # Set canary state to deploying with timestamp for stale lock detection.
+    # Format: "deploying:<ISO timestamp>" — parsed by canary-deploy.yml validate step
+    # to auto-reset stale locks from crashed deployments.
     deployment_id = str(uuid.uuid4())[:8]
-    set_ssm_value(SSM_CANARY_STATE_PARAM, 'deploying')
+    deploy_timestamp = datetime.now(timezone.utc).isoformat()
+    set_ssm_value(SSM_CANARY_STATE_PARAM, f'deploying:{deploy_timestamp}')
 
     logger.info(f"Deployment {deployment_id} prepared: current_image_tag={current_image_tag}")
 
@@ -351,7 +354,7 @@ def handle_alarm_triggered_rollback(event, context):
     logger.info("Alarm-triggered rollback received")
 
     current_state = get_ssm_value(SSM_CANARY_STATE_PARAM)
-    if current_state != 'deploying':
+    if not current_state or not current_state.startswith('deploying'):
         logger.info(f"Skipping alarm rollback: canary state is '{current_state}', not 'deploying'")
         return {
             'action_taken': False,

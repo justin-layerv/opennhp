@@ -131,6 +131,7 @@ jobs:
         env:
           ENVIRONMENT: ${{ inputs.environment }}
           CELL_ID: ${{ inputs.cell_id }}
+          STALE_THRESHOLD_SECONDS: '3900' # 65 minutes (state machine timeout is 60 min + 5 min buffer)
         run: |
           SSM_PARAM="/${ENVIRONMENT}/nhp/${CELL_ID}/canary/state"
           echo "Checking canary state: $SSM_PARAM"
@@ -139,14 +140,46 @@ jobs:
             --name "$SSM_PARAM" \
             --query "Parameter.Value" --output text 2>/dev/null) || STATE=""
 
-          if [[ -z "$STATE" ]]; then
-            echo "::warning::Canary state parameter not found - assuming idle (first deployment)"
-          elif [[ "$STATE" != "idle" ]]; then
-            echo "::error::Canary state is '$STATE', expected 'idle'. Another deployment may be in progress."
-            echo "::error::Wait for the current deployment to complete or manually reset the state."
-            exit 1
+          if [[ -z "$STATE" || "$STATE" == "idle" ]]; then
+            if [[ -z "$STATE" ]]; then
+              echo "::warning::Canary state parameter not found - assuming idle (first deployment)"
+            fi
+            echo "Canary state: idle (ready for deployment)"
+            exit 0
           fi
-          echo "Canary state: idle (ready for deployment)"
+
+          # State is not idle — check if it's a stale lock.
+          # Format: "deploying:<ISO timestamp>" (set by canary_orchestrator.py handle_prepare)
+          # or legacy "deploying" (no timestamp).
+          # Note: This is a best-effort check (TOCTOU race between read and reset).
+          # The GitHub Actions concurrency group is the primary lock preventing concurrent deploys.
+          if [[ "$STATE" == deploying:* ]]; then
+            TIMESTAMP="${STATE#deploying:}"
+            DEPLOY_EPOCH=$(date -d "$TIMESTAMP" +%s 2>/dev/null) || DEPLOY_EPOCH=0
+            NOW_EPOCH=$(date +%s)
+            AGE_SECONDS=$((NOW_EPOCH - DEPLOY_EPOCH))
+            AGE_MINUTES=$((AGE_SECONDS / 60))
+
+            if [[ $AGE_SECONDS -gt $STALE_THRESHOLD_SECONDS ]]; then
+              echo "::warning::Canary state is '$STATE' but is ${AGE_MINUTES}m old (threshold: $((STALE_THRESHOLD_SECONDS / 60))m). Auto-resetting stale lock."
+              aws ssm put-parameter \
+                --name "$SSM_PARAM" \
+                --value "idle" \
+                --type String \
+                --overwrite
+              echo "Canary state: reset to idle (stale lock cleared)"
+              exit 0
+            else
+              echo "::error::Canary state is '$STATE' (${AGE_MINUTES}m old). Another deployment is in progress."
+              echo "::error::Wait for it to complete or manually set $SSM_PARAM to 'idle' if stuck."
+              exit 1
+            fi
+          fi
+
+          # Legacy format (no timestamp) or other non-idle state — hard fail.
+          echo "::error::Canary state is '$STATE', expected 'idle'. Another deployment may be in progress."
+          echo "::error::Wait for the current deployment to complete or manually reset the state."
+          exit 1
 
       - name: Read Step Functions State Machine ARN
         id: state-machine
@@ -402,6 +435,45 @@ jobs:
             --topic-arn "$SNS_ARN" \
             --subject "$SUBJECT" \
             --message "$(echo -e "$MSG")" || echo "::warning::SNS notification failed - check IAM permissions or topic existence"
+
+  # =============================================================================
+  # CLEANUP - Reset canary state on failure to prevent stale locks
+  # =============================================================================
+  cleanup:
+    name: Cleanup
+    if: always() && (needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled')
+    needs: [validate, deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+        with:
+          role-to-assume: ${{ inputs.environment == 'prod' && secrets.AWS_PROD_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Reset canary state to idle
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          CELL_ID: ${{ inputs.cell_id }}
+        run: |
+          SSM_PARAM="/${ENVIRONMENT}/nhp/${CELL_ID}/canary/state"
+          CURRENT=$(aws ssm get-parameter \
+            --name "$SSM_PARAM" \
+            --query "Parameter.Value" --output text 2>/dev/null) || CURRENT=""
+
+          # Only reset if still in a deploying state (don't clobber a concurrent deploy
+          # or a state that was already cleaned up by the state machine).
+          if [[ "$CURRENT" == deploying* ]]; then
+            echo "::notice::Resetting canary state from '$CURRENT' to 'idle' after deployment failure"
+            aws ssm put-parameter \
+              --name "$SSM_PARAM" \
+              --value "idle" \
+              --type String \
+              --overwrite
+          else
+            echo "Canary state is '$CURRENT' — no reset needed"
+          fi
 
   # =============================================================================
   # SUMMARY - Generate deployment summary (runs even on failure)
