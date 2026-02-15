@@ -98,7 +98,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "CheckHealth"
+          "Next": "WaitForHealthSettling"
         },
         {
           "Variable": "$.status.result.status",
@@ -108,7 +108,7 @@
         {
           "Variable": "$.status.result.status",
           "StringEquals": "Successful",
-          "Next": "CheckFinalHealth"
+          "Next": "WaitForFinalHealthSettling"
         },
         {
           "Variable": "$.status.result.status",
@@ -122,6 +122,13 @@
         }
       ],
       "Default": "WaitForRefresh"
+    },
+
+    "WaitForHealthSettling": {
+      "Type": "Wait",
+      "Comment": "Allow NLB targets to register and pass health checks before evaluating",
+      "Seconds": 90,
+      "Next": "CheckHealth"
     },
 
     "CheckHealth": {
@@ -164,6 +171,13 @@
         }
       ],
       "Default": "NotifyUnhealthy"
+    },
+
+    "WaitForFinalHealthSettling": {
+      "Type": "Wait",
+      "Comment": "Allow NLB targets to stabilize after refresh completes before final check",
+      "Seconds": 90,
+      "Next": "CheckFinalHealth"
     },
 
     "CheckFinalHealth": {
