@@ -159,3 +159,12 @@ output "ssm_green_asg_name_parameter" {
   description = "SSM parameter name for green ASG name (null if blue/green not enabled)"
   value       = var.enable_blue_green ? aws_ssm_parameter.green_asg_name[0].name : null
 }
+
+# =============================================================================
+# Launch Template Outputs
+# =============================================================================
+
+output "launch_template_arn" {
+  description = "Server launch template ARN (for canary deployment IAM)"
+  value       = aws_launch_template.server.arn
+}

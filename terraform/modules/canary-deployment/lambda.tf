@@ -129,6 +129,12 @@ resource "aws_iam_role_policy" "orchestrator" {
         Resource = "*"
       },
       {
+        Sid      = "LaunchTemplateForDesiredConfiguration"
+        Effect   = "Allow"
+        Action   = ["ec2:RunInstances"]
+        Resource = var.launch_template_arn
+      },
+      {
         Sid    = "SSMCanaryState"
         Effect = "Allow"
         Action = [

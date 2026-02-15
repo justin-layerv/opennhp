@@ -61,6 +61,11 @@ variable "ssm_image_tag_parameter" {
   type        = string
 }
 
+variable "launch_template_arn" {
+  description = "Launch template ARN for ec2:RunInstances permission (required for DesiredConfiguration in StartInstanceRefresh)"
+  type        = string
+}
+
 # ==============================================================================
 # Canary Configuration
 # ==============================================================================
