@@ -1,11 +1,17 @@
 name: Dependabot Go Mod Tidy
 
 # Runs go mod tidy across all Go modules when dependabot updates dependencies.
-# Uses pull_request trigger (not pull_request_target) because dependabot creates
-# branches in the same repo, so the GITHUB_TOKEN has write permissions.
+#
+# Uses pull_request_target (not pull_request) so the GITHUB_TOKEN has write
+# permissions to the repo. Commits are pushed via the GitHub Git Data API
+# (not git push) so they are signed by GitHub — satisfying the repository's
+# "Require signed commits" ruleset.
+#
+# Security: The job-level `if: github.actor == 'dependabot[bot]'` check ensures
+# the PR branch checkout only happens for dependabot PRs, not arbitrary forks.
 
 on:
-  pull_request:
+  pull_request_target:
     paths:
       - "**/go.mod"
       - "**/go.sum"
@@ -22,7 +28,6 @@ jobs:
     name: Sync Go Modules
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Only run for dependabot PRs
     if: github.actor == 'dependabot[bot]'
 
     steps:
@@ -30,8 +35,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ github.head_ref }}
-          persist-credentials: true
-          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
 
       - name: Setup Go
         uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
@@ -55,13 +59,56 @@ jobs:
             echo "changed=false" >> $GITHUB_OUTPUT
           else
             echo "changed=true" >> $GITHUB_OUTPUT
+            echo "Changed files:"
+            git diff --name-only
           fi
 
-      - name: Commit and push changes
+      - name: Commit via GitHub API (signed)
         if: steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.head_ref }}
+          REPO: ${{ github.repository }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "chore(deps): sync go.mod/go.sum files [automated]"
-          git push
+          # Push via the GitHub Git Data API so commits are signed by GitHub.
+          # Regular git push produces unsigned commits → GH013 ruleset rejection.
+          set -euo pipefail
+          trap 'echo "::error::Failed to create signed commit via GitHub API. Check API rate limits and permissions."' ERR
+
+          # 1. Get current branch HEAD
+          HEAD_SHA=$(gh api "repos/$REPO/git/ref/heads/$BRANCH" --jq '.object.sha')
+          BASE_TREE=$(gh api "repos/$REPO/git/commits/$HEAD_SHA" --jq '.tree.sha')
+          echo "HEAD: $HEAD_SHA  Tree: $BASE_TREE"
+
+          # 2. Create blobs for each changed file and build tree entries
+          TREE_ENTRIES="[]"
+          while IFS= read -r file; do
+            BLOB_SHA=$(gh api "repos/$REPO/git/blobs" \
+              -f content="$(base64 -w 0 "$file")" \
+              -f encoding="base64" \
+              --jq '.sha')
+            TREE_ENTRIES=$(echo "$TREE_ENTRIES" | jq -c \
+              --arg path "$file" --arg sha "$BLOB_SHA" \
+              '. + [{"path":$path,"mode":"100644","type":"blob","sha":$sha}]')
+            echo "  blob $file → $BLOB_SHA"
+          done < <(git diff --name-only)
+
+          # 3. Create new tree
+          NEW_TREE=$(jq -n --arg base "$BASE_TREE" --argjson tree "$TREE_ENTRIES" \
+            '{base_tree:$base, tree:$tree}' \
+            | gh api "repos/$REPO/git/trees" --input - --jq '.sha')
+          echo "Tree: $NEW_TREE"
+
+          # 4. Create commit (GitHub signs it automatically)
+          NEW_COMMIT=$(jq -n \
+            --arg msg "chore(deps): sync go.mod/go.sum files [automated]" \
+            --arg tree "$NEW_TREE" \
+            --arg parent "$HEAD_SHA" \
+            '{message:$msg, tree:$tree, parents:[$parent]}' \
+            | gh api "repos/$REPO/git/commits" --input - --jq '.sha')
+          echo "Commit: $NEW_COMMIT"
+
+          # 5. Update branch ref
+          gh api "repos/$REPO/git/refs/heads/$BRANCH" \
+            --method PATCH -f sha="$NEW_COMMIT" > /dev/null
+          echo "Pushed signed commit $NEW_COMMIT to $BRANCH"
