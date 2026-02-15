@@ -418,7 +418,10 @@ WantedBy=multi-user.target
 SVCEOF
 
 ECR_REPO="${server_repo_url}"
-aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${account_id}.dkr.ecr.${region}.amazonaws.com"
+# Extract registry domain from repo URL (handles cross-account ECR where images
+# live in sandbox but instances run in prod).
+ECR_REGISTRY="$(echo "$ECR_REPO" | cut -d/ -f1)"
+aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
 # ============================================================================
 # Blue/Green Deployment: Detect Deploy Color
