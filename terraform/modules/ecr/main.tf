@@ -1075,6 +1075,7 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "secretsmanager:DeleteSecret",
           "secretsmanager:UpdateSecret",
           "secretsmanager:PutSecretValue",
+          "secretsmanager:CancelRotateSecret",
           "secretsmanager:TagResource",
           "secretsmanager:UntagResource"
         ]
