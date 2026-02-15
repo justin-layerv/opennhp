@@ -253,7 +253,7 @@ resource "terraform_data" "cookie_secret_seed" {
 
 # CloudWatch Log Group for servers
 resource "aws_cloudwatch_log_group" "server" {
-  name              = "/layerv/nhp/${var.environment}/server"
+  name              = "/layerv/nhp/${var.environment}/${var.cell_id}/server"
   retention_in_days = local.is_prod ? 365 : 30
   kms_key_id        = var.logs_kms_key_arn
 
@@ -615,6 +615,7 @@ locals {
     cloudmap_service_id = aws_service_discovery_service.server.id
     server_repo_url     = var.server_repo_url
     environment         = var.environment
+    cell_id             = var.cell_id
     multi_tenant        = var.multi_tenant
     etcd_endpoint       = var.etcd_endpoint
     etcd_tls_secret_arn = var.etcd_tls_secret_arn

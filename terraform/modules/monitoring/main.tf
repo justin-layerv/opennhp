@@ -472,6 +472,7 @@ resource "aws_cloudwatch_metric_alarm" "storage_health" {
 
   dimensions = {
     Environment = var.environment
+    Cell        = var.cell_id
   }
 
   tags = merge(var.tags, {
@@ -497,6 +498,7 @@ resource "aws_cloudwatch_metric_alarm" "auth_failures" {
 
   dimensions = {
     Environment = var.environment
+    Cell        = var.cell_id
   }
 
   tags = merge(var.tags, {
@@ -522,6 +524,7 @@ resource "aws_cloudwatch_metric_alarm" "high_latency" {
 
   dimensions = {
     Environment = var.environment
+    Cell        = var.cell_id
   }
 
   tags = merge(var.tags, {

@@ -1,11 +1,10 @@
 {
   "title": "QURL Webhooks",
   "description": "Webhook delivery metrics and health for QURL service",
-  "uid": "qurl-webhooks-${environment}",
+  "uid": "qurl-webhooks",
   "tags": [
     "qurl",
-    "webhooks",
-    "${environment}"
+    "webhooks"
   ],
   "timezone": "browser",
   "schemaVersion": 39,

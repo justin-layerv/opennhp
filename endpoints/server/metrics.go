@@ -49,6 +49,26 @@ type MetricsPublisher struct {
 	healthProbe HealthProbe    // optional: emits StorageHealthy gauge each flush
 }
 
+// buildMetricDimensions returns the CloudWatch dimensions derived from environment
+// variables. Dimensions: [Environment, Cell]. CloudWatch alarms and Grafana dashboard
+// panels match on this exact set. Adding or removing dimensions creates a separate
+// metric time series that existing alarms/panels won't find.
+func buildMetricDimensions() []types.Dimension {
+	environment := os.Getenv("NHP_ENVIRONMENT")
+	if environment == "" {
+		environment = "unknown"
+	}
+	cellID := os.Getenv("NHP_CELL_ID")
+	if cellID == "" {
+		cellID = "cell0"
+	}
+
+	return []types.Dimension{
+		{Name: aws.String("Environment"), Value: aws.String(environment)},
+		{Name: aws.String("Cell"), Value: aws.String(cellID)},
+	}
+}
+
 // NewMetricsPublisher creates a CloudWatch metrics publisher.
 // Returns nil if AWS config cannot be loaded (e.g., running locally without IAM).
 func NewMetricsPublisher() *MetricsPublisher {
@@ -61,18 +81,7 @@ func NewMetricsPublisher() *MetricsPublisher {
 		return nil
 	}
 
-	// Build dimensions from environment
-	environment := os.Getenv("NHP_ENVIRONMENT")
-	if environment == "" {
-		environment = "unknown"
-	}
-
-	// Only use Environment dimension — CloudWatch alarms and dashboard widgets
-	// match on exact dimension set. Adding extra dimensions (e.g., Component)
-	// creates a separate metric time series that existing alarms won't find.
-	dims := []types.Dimension{
-		{Name: aws.String("Environment"), Value: aws.String(environment)},
-	}
+	dims := buildMetricDimensions()
 
 	mp := &MetricsPublisher{
 		client:    cloudwatch.NewFromConfig(cfg),
@@ -85,7 +94,8 @@ func NewMetricsPublisher() *MetricsPublisher {
 
 	mp.wg.Add(1)
 	go mp.flushLoop()
-	log.Info("CloudWatch metrics publisher started (namespace=%s, env=%s)", metricsNamespace, environment)
+	log.Info("CloudWatch metrics publisher started (namespace=%s, env=%s, cell=%s)",
+		metricsNamespace, *dims[0].Value, *dims[1].Value)
 	return mp
 }
 

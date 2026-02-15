@@ -782,6 +782,11 @@ variable "grafana_cloud_external_id" {
   default = ""
 }
 
+variable "grafana_create_dashboards" {
+  type    = bool
+  default = true
+}
+
 variable "grafana_prometheus_datasource_uid" {
   type    = string
   default = "grafanacloud-prom"

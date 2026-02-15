@@ -189,6 +189,40 @@ func TestMetricsPublisher_FlushResetsState(t *testing.T) {
 	}
 }
 
+func TestBuildMetricDimensions(t *testing.T) {
+	tests := []struct {
+		name     string
+		envCell  string // NHP_CELL_ID value ("" means unset)
+		envEnv   string // NHP_ENVIRONMENT value ("" means unset)
+		wantEnv  string
+		wantCell string
+	}{
+		{"defaults when unset", "", "", "unknown", "cell0"},
+		{"custom values", "cell3", "prod", "prod", "cell3"},
+		{"only cell set", "cell1", "", "unknown", "cell1"},
+		{"only env set", "", "sandbox", "sandbox", "cell0"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("NHP_ENVIRONMENT", tt.envEnv)
+			t.Setenv("NHP_CELL_ID", tt.envCell)
+
+			dims := buildMetricDimensions()
+
+			if len(dims) != 2 {
+				t.Fatalf("expected 2 dimensions, got %d", len(dims))
+			}
+			if *dims[0].Name != "Environment" || *dims[0].Value != tt.wantEnv {
+				t.Errorf("Environment dimension: got %s=%s, want Environment=%s", *dims[0].Name, *dims[0].Value, tt.wantEnv)
+			}
+			if *dims[1].Name != "Cell" || *dims[1].Value != tt.wantCell {
+				t.Errorf("Cell dimension: got %s=%s, want Cell=%s", *dims[1].Name, *dims[1].Value, tt.wantCell)
+			}
+		})
+	}
+}
+
 func TestMetricsPublisher_StopWaitsForFlushLoop(t *testing.T) {
 	mp := &MetricsPublisher{
 		counters:  make(map[string]float64),

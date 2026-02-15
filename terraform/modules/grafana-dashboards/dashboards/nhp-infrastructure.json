@@ -1,11 +1,10 @@
 {
   "title": "NHP Infrastructure",
   "description": "NHP protocol infrastructure metrics: NLB flows, knock latency, auth rates, CPU, ASG health, and alarms",
-  "uid": "nhp-infrastructure-${environment}",
+  "uid": "nhp-infrastructure",
   "tags": [
     "nhp",
-    "infrastructure",
-    "${environment}"
+    "infrastructure"
   ],
   "timezone": "browser",
   "schemaVersion": 39,
@@ -30,7 +29,7 @@
     {
       "title": "AWS Cost",
       "type": "link",
-      "url": "/d/aws-cost/aws-cost",
+      "url": "/d/aws-cost-$environment/aws-cost?var-environment=$environment",
       "icon": "dashboard"
     }
   ],
@@ -39,20 +38,34 @@
       {
         "name": "environment",
         "type": "custom",
-        "current": {
-          "text": "${environment}",
-          "value": "${environment}"
-        },
+        "label": "Environment",
+        "query": "sandbox,prod",
+        "current": { "text": "prod", "value": "prod" },
         "options": [
-          {
-            "text": "sandbox",
-            "value": "sandbox"
-          },
-          {
-            "text": "prod",
-            "value": "prod"
-          }
-        ]
+          { "text": "sandbox", "value": "sandbox", "selected": false },
+          { "text": "prod", "value": "prod", "selected": true }
+        ],
+        "hide": 0
+      },
+      {
+        "name": "cw_datasource",
+        "type": "datasource",
+        "label": "CloudWatch",
+        "query": "cloudwatch",
+        "regex": "/CloudWatch \\($environment\\)/",
+        "hide": 2,
+        "current": {}
+      },
+      {
+        "name": "cell_id",
+        "type": "custom",
+        "label": "Cell",
+        "query": "cell0",
+        "current": { "text": "cell0", "value": "cell0" },
+        "options": [
+          { "text": "cell0", "value": "cell0", "selected": true }
+        ],
+        "hide": 0
       }
     ]
   },
@@ -75,7 +88,7 @@
       "description": "Number of healthy NLB targets for the NHP server. Action: if 0, check server ASG instances and NLB target group health checks.",
       "type": "stat",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -119,7 +132,7 @@
           "metricName": "HealthyHostCount",
           "dimensions": {
             "LoadBalancer": [
-              "${server_nlb_arn_suffix}"
+              "*"
             ],
             "TargetGroup": [
               "*"
@@ -142,7 +155,7 @@
       "description": "Number of healthy NLB targets for the Access Controller. Action: if 0, check AC ASG instances and NLB target group health checks.",
       "type": "stat",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -186,7 +199,7 @@
           "metricName": "HealthyHostCount",
           "dimensions": {
             "LoadBalancer": [
-              "${ac_nlb_arn_suffix}"
+              "*"
             ],
             "TargetGroup": [
               "*"
@@ -209,7 +222,7 @@
       "description": "Average CPU utilization across NHP server ASG instances. Action: if sustained >80%, consider scaling up or investigating high-CPU processes.",
       "type": "stat",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -257,7 +270,7 @@
           "metricName": "CPUUtilization",
           "dimensions": {
             "AutoScalingGroupName": [
-              "${server_asg_name}"
+              "*"
             ]
           },
           "period": "300",
@@ -277,7 +290,7 @@
       "description": "Total active TCP/UDP flows across both server and AC NLBs. Action: correlate spikes with traffic patterns or potential DDoS.",
       "type": "stat",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -317,7 +330,7 @@
           "metricName": "ActiveFlowCount",
           "dimensions": {
             "LoadBalancer": [
-              "${server_nlb_arn_suffix}"
+              "*"
             ]
           },
           "period": "300",
@@ -335,7 +348,7 @@
           "metricName": "ActiveFlowCount",
           "dimensions": {
             "LoadBalancer": [
-              "${ac_nlb_arn_suffix}"
+              "*"
             ]
           },
           "period": "300",
@@ -355,7 +368,7 @@
       "description": "Count of unhealthy NLB targets across server and AC. Action: any value >0 requires immediate investigation of instance health and NLB target group.",
       "type": "stat",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -399,7 +412,7 @@
           "metricName": "UnHealthyHostCount",
           "dimensions": {
             "LoadBalancer": [
-              "${server_nlb_arn_suffix}"
+              "*"
             ],
             "TargetGroup": [
               "*"
@@ -420,7 +433,7 @@
           "metricName": "UnHealthyHostCount",
           "dimensions": {
             "LoadBalancer": [
-              "${ac_nlb_arn_suffix}"
+              "*"
             ],
             "TargetGroup": [
               "*"
@@ -455,7 +468,7 @@
       "description": "Active TCP/UDP flow count on the NHP server NLB over time. Action: correlate with knock traffic and investigate unexpected drops to 0.",
       "type": "timeseries",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -488,7 +501,7 @@
           "metricName": "ActiveFlowCount",
           "dimensions": {
             "LoadBalancer": [
-              "${server_nlb_arn_suffix}"
+              "*"
             ]
           },
           "period": "300",
@@ -508,7 +521,7 @@
       "description": "Active TCP/UDP flow count on the AC NLB over time. Action: correlate with QURL access patterns and investigate unexpected drops.",
       "type": "timeseries",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -541,7 +554,7 @@
           "metricName": "ActiveFlowCount",
           "dimensions": {
             "LoadBalancer": [
-              "${ac_nlb_arn_suffix}"
+              "*"
             ]
           },
           "period": "300",
@@ -561,7 +574,7 @@
       "description": "Total bytes processed by server and AC NLBs. Action: use for capacity planning and detecting traffic anomalies.",
       "type": "timeseries",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -592,7 +605,7 @@
           "metricName": "ProcessedBytes",
           "dimensions": {
             "LoadBalancer": [
-              "${server_nlb_arn_suffix}"
+              "*"
             ]
           },
           "period": "300",
@@ -610,7 +623,7 @@
           "metricName": "ProcessedBytes",
           "dimensions": {
             "LoadBalancer": [
-              "${ac_nlb_arn_suffix}"
+              "*"
             ]
           },
           "period": "300",
@@ -630,7 +643,7 @@
       "description": "TCP reset counts from clients, targets, and the NLB itself. Action: high client resets may indicate connection issues; high target resets suggest backend problems.",
       "type": "timeseries",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -717,7 +730,7 @@
       "description": "End-to-end response time measured by the NLB for TCP/TLS listeners (HTTP endpoint on port 8888). UDP knock port (62206) not included. Action: p99 >1s warrants investigation of server processing latency.",
       "type": "timeseries",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -748,7 +761,7 @@
           "metricName": "TargetResponseTime",
           "dimensions": {
             "LoadBalancer": [
-              "${server_nlb_arn_suffix}"
+              "*"
             ]
           },
           "period": "300",
@@ -766,7 +779,7 @@
           "metricName": "TargetResponseTime",
           "dimensions": {
             "LoadBalancer": [
-              "${server_nlb_arn_suffix}"
+              "*"
             ]
           },
           "period": "300",
@@ -784,7 +797,7 @@
           "metricName": "TargetResponseTime",
           "dimensions": {
             "LoadBalancer": [
-              "${server_nlb_arn_suffix}"
+              "*"
             ]
           },
           "period": "300",
@@ -804,7 +817,7 @@
       "description": "Unhealthy target count over time for server and AC NLBs. Action: any sustained non-zero value requires investigation of instance health, security groups, and health check configuration.",
       "type": "timeseries",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -880,7 +893,7 @@
           "metricName": "UnHealthyHostCount",
           "dimensions": {
             "LoadBalancer": [
-              "${server_nlb_arn_suffix}"
+              "*"
             ],
             "TargetGroup": [
               "*"
@@ -901,7 +914,7 @@
           "metricName": "UnHealthyHostCount",
           "dimensions": {
             "LoadBalancer": [
-              "${ac_nlb_arn_suffix}"
+              "*"
             ],
             "TargetGroup": [
               "*"
@@ -924,7 +937,7 @@
       "description": "Rate of new TCP/UDP flows established through server and AC NLBs. Action: sudden spikes may indicate traffic surges or scanning activity.",
       "type": "timeseries",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -955,7 +968,7 @@
           "metricName": "NewFlowCount",
           "dimensions": {
             "LoadBalancer": [
-              "${server_nlb_arn_suffix}"
+              "*"
             ]
           },
           "period": "300",
@@ -973,7 +986,7 @@
           "metricName": "NewFlowCount",
           "dimensions": {
             "LoadBalancer": [
-              "${ac_nlb_arn_suffix}"
+              "*"
             ]
           },
           "period": "300",
@@ -993,7 +1006,7 @@
       "description": "Load Balancer Capacity Units consumed by server and AC NLBs. Each LCU costs money. Action: track for cost optimization and capacity planning.",
       "type": "timeseries",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -1024,7 +1037,7 @@
           "metricName": "ConsumedLCUs",
           "dimensions": {
             "LoadBalancer": [
-              "${server_nlb_arn_suffix}"
+              "*"
             ]
           },
           "period": "300",
@@ -1042,7 +1055,7 @@
           "metricName": "ConsumedLCUs",
           "dimensions": {
             "LoadBalancer": [
-              "${ac_nlb_arn_suffix}"
+              "*"
             ]
           },
           "period": "300",
@@ -1074,7 +1087,7 @@
       "description": "End-to-end NHP knock latency at p50/p95/p99/p999 percentiles. p999 is the primary SLI for tail latency. Action: p999 >1s indicates protocol or network issues requiring investigation.",
       "type": "timeseries",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -1127,6 +1140,9 @@
           "dimensions": {
             "Environment": [
               "$environment"
+            ],
+            "Cell": [
+              "$cell_id"
             ]
           },
           "matchExact": false,
@@ -1145,6 +1161,9 @@
           "dimensions": {
             "Environment": [
               "$environment"
+            ],
+            "Cell": [
+              "$cell_id"
             ]
           },
           "matchExact": false,
@@ -1163,6 +1182,9 @@
           "dimensions": {
             "Environment": [
               "$environment"
+            ],
+            "Cell": [
+              "$cell_id"
             ]
           },
           "matchExact": false,
@@ -1181,6 +1203,9 @@
           "dimensions": {
             "Environment": [
               "$environment"
+            ],
+            "Cell": [
+              "$cell_id"
             ]
           },
           "matchExact": false,
@@ -1200,7 +1225,7 @@
       "description": "Current p999 (99.9th percentile) knock latency. This is the tail latency SLI. Action: green <400ms healthy, yellow 400-1000ms degraded, red >1000ms needs immediate attention.",
       "type": "stat",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -1248,6 +1273,9 @@
           "dimensions": {
             "Environment": [
               "$environment"
+            ],
+            "Cell": [
+              "$cell_id"
             ]
           },
           "matchExact": false,
@@ -1266,7 +1294,7 @@
       "description": "Authentication success and failure rates from the NHP server MetricsPublisher. Failures indicate bad tokens, expired access, or protocol errors. Action: rising failure rate suggests key rotation issues or attack.",
       "type": "timeseries",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -1318,6 +1346,9 @@
           "dimensions": {
             "Environment": [
               "$environment"
+            ],
+            "Cell": [
+              "$cell_id"
             ]
           },
           "matchExact": false,
@@ -1336,6 +1367,9 @@
           "dimensions": {
             "Environment": [
               "$environment"
+            ],
+            "Cell": [
+              "$cell_id"
             ]
           },
           "matchExact": false,
@@ -1355,7 +1389,7 @@
       "description": "Total successful authentications in the selected time range. Action: a sudden drop may indicate server issues or upstream auth provider problems.",
       "type": "stat",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -1395,6 +1429,9 @@
           "dimensions": {
             "Environment": [
               "$environment"
+            ],
+            "Cell": [
+              "$cell_id"
             ]
           },
           "matchExact": false,
@@ -1413,7 +1450,7 @@
       "description": "Total failed authentications in the selected time range. Action: spikes may indicate brute-force attempts or misconfigured clients.",
       "type": "stat",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -1461,6 +1498,9 @@
           "dimensions": {
             "Environment": [
               "$environment"
+            ],
+            "Cell": [
+              "$cell_id"
             ]
           },
           "matchExact": false,
@@ -1491,7 +1531,7 @@
       "description": "CPU utilization for server and AC ASG instances over time. Action: sustained >80% (red) requires scaling or performance investigation.",
       "type": "timeseries",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -1540,7 +1580,7 @@
           "metricName": "CPUUtilization",
           "dimensions": {
             "AutoScalingGroupName": [
-              "${server_asg_name}"
+              "*"
             ]
           },
           "period": "300",
@@ -1558,7 +1598,7 @@
           "metricName": "CPUUtilization",
           "dimensions": {
             "AutoScalingGroupName": [
-              "${ac_asg_name}"
+              "*"
             ]
           },
           "period": "300",
@@ -1578,7 +1618,7 @@
       "description": "Number of in-service instances per ASG. Action: if count drops below desired capacity, check ASG activity and instance launch errors.",
       "type": "timeseries",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -1610,7 +1650,7 @@
           "metricName": "GroupInServiceInstances",
           "dimensions": {
             "AutoScalingGroupName": [
-              "${server_asg_name}"
+              "*"
             ]
           },
           "period": "300",
@@ -1628,7 +1668,7 @@
           "metricName": "GroupInServiceInstances",
           "dimensions": {
             "AutoScalingGroupName": [
-              "${ac_asg_name}"
+              "*"
             ]
           },
           "period": "300",
@@ -1648,7 +1688,7 @@
       "description": "Healthy host count in NLB target groups. Action: should match ASG desired capacity; mismatches indicate health check failures.",
       "type": "stat",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -1689,7 +1729,7 @@
           "metricName": "HealthyHostCount",
           "dimensions": {
             "LoadBalancer": [
-              "${server_nlb_arn_suffix}"
+              "*"
             ],
             "TargetGroup": [
               "*"
@@ -1710,7 +1750,7 @@
           "metricName": "HealthyHostCount",
           "dimensions": {
             "LoadBalancer": [
-              "${ac_nlb_arn_suffix}"
+              "*"
             ],
             "TargetGroup": [
               "*"
@@ -1733,7 +1773,7 @@
       "description": "Unhealthy host count in NLB target groups. Action: any non-zero (red) value requires immediate investigation of instance health.",
       "type": "stat",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -1778,7 +1818,7 @@
           "metricName": "UnHealthyHostCount",
           "dimensions": {
             "LoadBalancer": [
-              "${server_nlb_arn_suffix}"
+              "*"
             ],
             "TargetGroup": [
               "*"
@@ -1799,7 +1839,7 @@
           "metricName": "UnHealthyHostCount",
           "dimensions": {
             "LoadBalancer": [
-              "${ac_nlb_arn_suffix}"
+              "*"
             ],
             "TargetGroup": [
               "*"
@@ -1822,7 +1862,7 @@
       "description": "Memory usage percentage from CloudWatch Agent on server and AC instances. Action: >80% indicates memory pressure; check for leaks or increase instance size.",
       "type": "timeseries",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -1891,7 +1931,7 @@
       "description": "Root filesystem disk usage from CloudWatch Agent on AC instances. Action: >80% requires log rotation or disk cleanup; >90% is critical.",
       "type": "timeseries",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -1940,7 +1980,7 @@
           "metricName": "disk_used_percent",
           "dimensions": {
             "AutoScalingGroupName": [
-              "${ac_asg_name}"
+              "*"
             ]
           },
           "matchExact": false,
@@ -1960,7 +2000,7 @@
       "description": "Root filesystem disk usage from CloudWatch Agent on server instances. Action: >80% requires cleanup (Docker images, logs); >90% is critical.",
       "type": "timeseries",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -2041,7 +2081,7 @@
       "description": "Throttled read/write requests by DynamoDB table. Action: non-zero values indicate capacity limits being hit; consider increasing provisioned capacity or switching to on-demand.",
       "type": "timeseries",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -2105,7 +2145,7 @@
       "description": "Successful request latency for DynamoDB tables at p50 and p99 percentiles. Action: p99 >20ms may indicate hot partitions or throttling.",
       "type": "timeseries",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -2186,7 +2226,7 @@
       "description": "Table of all NHP CloudWatch alarms and their current state. Action: any alarm in ALARM state should be investigated immediately; check the alarm's linked metric for details.",
       "type": "table",
       "datasource": {
-        "uid": "${cloudwatch_uid}",
+        "uid": "$cw_datasource",
         "type": "cloudwatch"
       },
       "gridPos": {
@@ -2220,7 +2260,7 @@
           "queryMode": "Annotations",
           "prefixMatching": true,
           "actionPrefix": "arn:",
-          "alarmNamePrefix": "${name_prefix}",
+          "alarmNamePrefix": "layerv-nhp-$environment",
           "region": "default"
         }
       ]
@@ -2231,7 +2271,7 @@
       {
         "name": "Deployments",
         "datasource": {
-          "uid": "${cloudwatch_uid}",
+          "uid": "$cw_datasource",
           "type": "cloudwatch"
         },
         "enable": true,
@@ -2243,6 +2283,9 @@
         "dimensions": {
           "Environment": [
             "$environment"
+          ],
+          "Cell": [
+            "$cell_id"
           ]
         },
         "region": "default",

@@ -236,6 +236,7 @@ grafana_tempo_datasource_uid      = "grafanacloud-traces"
 grafana_cloudwatch_enabled   = true
 grafana_cloud_aws_account_id = "008923505280" # Grafana Cloud stack account (same as sandbox)
 grafana_cloud_external_id    = ""             # Not required - same Grafana Cloud stack
+grafana_create_dashboards    = true
 
 # ==============================================================================
 # Status Page (B1)

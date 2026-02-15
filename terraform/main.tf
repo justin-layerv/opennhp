@@ -490,7 +490,7 @@ module "status_page" {
   ac_nlb_arn_suffix     = var.deploy_ac ? module.ac[0].nlb_arn_suffix : ""
   server_asg_name       = module.compute.asg_name
   ac_asg_name           = var.deploy_ac ? module.ac[0].asg_name : ""
-  grafana_dashboard_url = var.grafana_dashboards_enabled && var.grafana_cloudwatch_enabled ? module.grafana_dashboards[0].nhp_infrastructure_dashboard_url : var.grafana_nhp_dashboard_url
+  grafana_dashboard_url = var.grafana_dashboards_enabled && var.grafana_cloudwatch_enabled && var.grafana_create_dashboards ? module.grafana_dashboards[0].nhp_infrastructure_dashboard_url : var.grafana_nhp_dashboard_url
 
   # Deployment model
   deployment_model       = var.enable_canary_deployment ? "canary" : "blue_green"
@@ -1298,6 +1298,7 @@ module "grafana_dashboards" {
 
   grafana_url               = var.grafana_url
   environment               = var.environment
+  create_dashboards         = var.grafana_create_dashboards
   prometheus_datasource_uid = var.grafana_prometheus_datasource_uid
   tempo_datasource_uid      = var.grafana_tempo_datasource_uid
 
@@ -1307,17 +1308,6 @@ module "grafana_dashboards" {
   name_prefix                   = local.name_prefix
   grafana_cloud_aws_account_id  = var.grafana_cloud_aws_account_id
   grafana_cloud_external_id     = var.grafana_cloud_external_id
-
-  # NHP Infrastructure dashboard dimensions (from compute/AC modules)
-  server_nlb_arn_suffix = module.compute.nlb_arn_suffix
-  ac_nlb_arn_suffix     = var.deploy_ac ? module.ac[0].nlb_arn_suffix : ""
-  server_asg_name       = module.compute.asg_name
-  ac_asg_name           = var.deploy_ac ? module.ac[0].asg_name : ""
-
-  # NHP Logs dashboard (CloudWatch Logs Insights)
-  server_log_group_name = module.compute.log_group_name
-  ac_log_group_name     = var.deploy_ac ? module.ac[0].log_group_name : ""
-  qurl_log_group_name   = var.deploy_qurl_service ? module.qurl_service[0].log_group_name : ""
 
   # Athena data source for AWS Cost dashboard
   athena_datasource_enabled = var.deploy_cost_analytics

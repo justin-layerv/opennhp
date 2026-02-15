@@ -1,8 +1,8 @@
 {
   "title": "QURL Business Metrics",
   "description": "Business KPIs for QURL service: resources, tokens, quotas",
-  "uid": "qurl-business-${environment}",
-  "tags": ["qurl", "business", "${environment}"],
+  "uid": "qurl-business",
+  "tags": ["qurl", "business"],
   "timezone": "browser",
   "schemaVersion": 39,
   "refresh": "1m",
@@ -41,7 +41,7 @@
     {
       "title": "NHP Infrastructure",
       "type": "link",
-      "url": "/d/nhp-infrastructure-${environment}/nhp-infrastructure?var-environment=$environment",
+      "url": "/d/nhp-infrastructure/nhp-infrastructure?var-environment=$environment",
       "icon": "dashboard"
     }
   ],

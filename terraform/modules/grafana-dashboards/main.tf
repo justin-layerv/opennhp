@@ -9,13 +9,12 @@
 #     ...
 #   }
 #
-# CONVENTION: Environment-specific UIDs
-# Both sandbox and prod share the same Grafana Cloud instance, so all UIDs
-# and names must include the environment suffix to avoid conflicts:
-#   - Folder UIDs:     "qurl-${environment}", "nhp-${environment}"
-#   - Dashboard UIDs:  "qurl-operations-${environment}" (in JSON templates)
-#   - Datasource names: "CloudWatch (${environment})"
-# When adding new folders, dashboards, or datasources, always follow this pattern.
+# Dashboard Unification:
+# A single set of dashboards serves all environments. Each dashboard uses
+# template variables (environment, cw_datasource, cell_id) for switching.
+# Only the "primary" environment (create_dashboards=true) creates folder and
+# dashboard resources. Every environment creates its own CloudWatch datasource
+# and IAM role so the unified dashboards can query any environment's metrics.
 
 terraform {
   required_version = ">= 1.5"
@@ -35,20 +34,21 @@ terraform {
 
 # Create a folder for QURL dashboards
 resource "grafana_folder" "qurl" {
-  uid                          = "qurl-${var.environment}"
-  title                        = "${var.folder_name} (${var.environment})"
+  count                        = var.create_dashboards ? 1 : 0
+  uid                          = "qurl"
+  title                        = var.folder_name
   prevent_destroy_if_not_empty = true
 }
 
 # QURL Operations Dashboard
 # Monitors HTTP RED metrics (Rate, Errors, Duration) and DynamoDB performance
 resource "grafana_dashboard" "operations" {
-  folder = grafana_folder.qurl.uid
+  count = var.create_dashboards ? 1 : 0
+
+  folder = grafana_folder.qurl[0].uid
   config_json = templatefile("${path.module}/dashboards/qurl-operations.json", {
     datasource_uid = var.prometheus_datasource_uid
     tempo_uid      = var.tempo_datasource_uid
-    cloudwatch_uid = var.cloudwatch_datasource_enabled ? grafana_data_source.cloudwatch[0].uid : ""
-    qurl_log_group = var.qurl_log_group_name
     environment    = var.environment
   })
 
@@ -58,7 +58,9 @@ resource "grafana_dashboard" "operations" {
 # QURL Business Dashboard
 # Monitors business metrics: QURLs created, tokens, quotas
 resource "grafana_dashboard" "business" {
-  folder = grafana_folder.qurl.uid
+  count = var.create_dashboards ? 1 : 0
+
+  folder = grafana_folder.qurl[0].uid
   config_json = templatefile("${path.module}/dashboards/qurl-business.json", {
     datasource_uid = var.prometheus_datasource_uid
     environment    = var.environment
@@ -70,7 +72,9 @@ resource "grafana_dashboard" "business" {
 # QURL Webhooks Dashboard
 # Monitors webhook delivery metrics and health
 resource "grafana_dashboard" "webhooks" {
-  folder = grafana_folder.qurl.uid
+  count = var.create_dashboards ? 1 : 0
+
+  folder = grafana_folder.qurl[0].uid
   config_json = templatefile("${path.module}/dashboards/qurl-webhooks.json", {
     datasource_uid = var.prometheus_datasource_uid
     environment    = var.environment
@@ -113,30 +117,19 @@ resource "grafana_data_source" "cloudwatch" {
 }
 
 resource "grafana_folder" "nhp" {
-  count                        = (var.cloudwatch_datasource_enabled || var.athena_datasource_enabled) ? 1 : 0
-  uid                          = "nhp-${var.environment}"
-  title                        = "${var.nhp_folder_name} (${var.environment})"
+  count                        = var.create_dashboards && (var.cloudwatch_datasource_enabled || var.athena_datasource_enabled) ? 1 : 0
+  uid                          = "nhp"
+  title                        = var.nhp_folder_name
   prevent_destroy_if_not_empty = true
 }
 
 # NHP Infrastructure Dashboard
-# Uses templatefile() to inject exact CloudWatch dimension values from module
-# outputs. This is required because Grafana's CloudWatch plugin only supports
-# "*" (match all) or exact dimension values — partial wildcards like
-# "nhp-sandbox-*" silently match nothing. Pass exact ARN suffixes and ASG
-# names from compute/AC module outputs to ensure panels query the right resources.
 resource "grafana_dashboard" "nhp_infrastructure" {
-  count = var.cloudwatch_datasource_enabled ? 1 : 0
+  count = var.create_dashboards && var.cloudwatch_datasource_enabled ? 1 : 0
 
   folder = grafana_folder.nhp[0].uid
   config_json = templatefile("${path.module}/dashboards/nhp-infrastructure.json", {
-    cloudwatch_uid        = grafana_data_source.cloudwatch[0].uid
-    environment           = var.environment
-    server_nlb_arn_suffix = var.server_nlb_arn_suffix
-    ac_nlb_arn_suffix     = var.ac_nlb_arn_suffix
-    server_asg_name       = var.server_asg_name
-    ac_asg_name           = var.ac_asg_name
-    name_prefix           = var.name_prefix
+    environment = var.environment
   })
 
   overwrite = true
@@ -262,7 +255,7 @@ resource "grafana_data_source" "athena" {
 }
 
 resource "grafana_dashboard" "aws_cost" {
-  count = var.athena_datasource_enabled ? 1 : 0
+  count = var.create_dashboards && var.athena_datasource_enabled ? 1 : 0
 
   folder = grafana_folder.nhp[0].uid
   config_json = templatefile("${path.module}/dashboards/aws-cost.json", {
@@ -274,49 +267,15 @@ resource "grafana_dashboard" "aws_cost" {
 }
 
 # ==============================================================================
-# Input Validation
-# ==============================================================================
-
-check "cloudwatch_log_groups_should_be_set" {
-  assert {
-    condition = !var.cloudwatch_datasource_enabled || (
-      length(var.server_log_group_name) > 0 &&
-      length(var.ac_log_group_name) > 0
-    )
-    error_message = "server_log_group_name and ac_log_group_name should be set when cloudwatch_datasource_enabled is true, otherwise NHP Logs dashboard panels will show no data. Pass these from compute and AC module outputs."
-  }
-}
-
-check "qurl_log_group_should_be_set" {
-  assert {
-    condition     = !var.cloudwatch_datasource_enabled || length(var.qurl_log_group_name) > 0
-    error_message = "qurl_log_group_name should be set when cloudwatch_datasource_enabled is true, otherwise QURL Operations dashboard log panels will show no data. Pass this from qurl_service module output."
-  }
-}
-
-check "cloudwatch_dimensions_should_be_set" {
-  assert {
-    condition = !var.cloudwatch_datasource_enabled || (
-      length(var.server_nlb_arn_suffix) > 0 &&
-      length(var.server_asg_name) > 0
-    )
-    error_message = "server_nlb_arn_suffix and server_asg_name should be set when cloudwatch_datasource_enabled is true, otherwise NHP Infrastructure dashboard panels will show no data. Pass these from compute module outputs."
-  }
-}
-
-# ==============================================================================
 # NHP Logs Dashboard (CloudWatch Logs Insights)
 # ==============================================================================
 
 resource "grafana_dashboard" "nhp_logs" {
-  count = var.cloudwatch_datasource_enabled ? 1 : 0
+  count = var.create_dashboards && var.cloudwatch_datasource_enabled ? 1 : 0
 
   folder = grafana_folder.nhp[0].uid
   config_json = templatefile("${path.module}/dashboards/nhp-logs.json", {
-    cloudwatch_uid   = grafana_data_source.cloudwatch[0].uid
-    environment      = var.environment
-    server_log_group = var.server_log_group_name
-    ac_log_group     = var.ac_log_group_name
+    environment = var.environment
   })
 
   overwrite = true

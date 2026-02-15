@@ -8,6 +8,12 @@ variable "grafana_url" {
   type        = string
 }
 
+variable "create_dashboards" {
+  description = "Create dashboard and folder resources. False = only create datasources/IAM (for non-primary environments)."
+  type        = bool
+  default     = true
+}
+
 variable "environment" {
   description = "Environment name (sandbox, prod)"
   type        = string
@@ -109,56 +115,6 @@ variable "athena_region" {
   description = "AWS region where Athena resources live"
   type        = string
   default     = "us-east-1"
-}
-
-# ==============================================================================
-# NHP Infrastructure Dashboard Dimensions
-# ==============================================================================
-
-variable "server_nlb_arn_suffix" {
-  description = "Server NLB ARN suffix for CloudWatch LoadBalancer dimension (e.g., net/name/id)"
-  type        = string
-  default     = ""
-}
-
-variable "ac_nlb_arn_suffix" {
-  description = "AC NLB ARN suffix for CloudWatch LoadBalancer dimension (e.g., net/name/id)"
-  type        = string
-  default     = ""
-}
-
-variable "server_asg_name" {
-  description = "Server ASG name for CloudWatch AutoScalingGroupName dimension"
-  type        = string
-  default     = ""
-}
-
-variable "ac_asg_name" {
-  description = "AC ASG name for CloudWatch AutoScalingGroupName dimension"
-  type        = string
-  default     = ""
-}
-
-# ==============================================================================
-# NHP Logs Dashboard (CloudWatch Logs Insights)
-# ==============================================================================
-
-variable "server_log_group_name" {
-  description = "CloudWatch log group name for NHP server logs"
-  type        = string
-  default     = ""
-}
-
-variable "ac_log_group_name" {
-  description = "CloudWatch log group name for NHP AC logs"
-  type        = string
-  default     = ""
-}
-
-variable "qurl_log_group_name" {
-  description = "CloudWatch log group name for QURL API service logs"
-  type        = string
-  default     = ""
 }
 
 variable "tags" {

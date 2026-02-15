@@ -12,7 +12,7 @@
     {
       "title": "NHP Infrastructure",
       "type": "link",
-      "url": "/d/nhp-infrastructure-${environment}/nhp-infrastructure?var-environment=${environment}",
+      "url": "/d/nhp-infrastructure/nhp-infrastructure?var-environment=${environment}",
       "icon": "dashboard"
     }
   ],

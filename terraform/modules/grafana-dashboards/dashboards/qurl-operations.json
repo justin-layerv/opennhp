@@ -1,11 +1,10 @@
 {
   "title": "QURL Operations",
   "description": "HTTP RED metrics, SLOs, and infrastructure health for QURL API service",
-  "uid": "qurl-operations-${environment}",
+  "uid": "qurl-operations",
   "tags": [
     "qurl",
-    "operations",
-    "${environment}"
+    "operations"
   ],
   "timezone": "browser",
   "schemaVersion": 39,
@@ -47,7 +46,7 @@
     {
       "title": "NHP Infrastructure",
       "type": "link",
-      "url": "/d/nhp-infrastructure-${environment}/nhp-infrastructure?var-environment=$environment",
+      "url": "/d/nhp-infrastructure/nhp-infrastructure?var-environment=$environment",
       "icon": "dashboard"
     }
   ],
@@ -86,6 +85,15 @@
           "text": ["All"],
           "value": ["$__all"]
         }
+      },
+      {
+        "name": "cw_datasource",
+        "type": "datasource",
+        "label": "CloudWatch",
+        "query": "cloudwatch",
+        "regex": "/CloudWatch \\($environment\\)/",
+        "hide": 2,
+        "current": {}
       },
       {
         "name": "slo_target",
@@ -1856,7 +1864,7 @@
           "type": "logs",
           "datasource": {
             "type": "cloudwatch",
-            "uid": "${cloudwatch_uid}"
+            "uid": "$cw_datasource"
           },
           "gridPos": {
             "h": 12,
@@ -1868,7 +1876,7 @@
             {
               "refId": "A",
               "queryMode": "Logs",
-              "logGroupNames": ["${qurl_log_group}"],
+              "logGroupNames": ["/layerv/nhp/$environment/$cell_id/qurl-api"],
               "expression": "fields @timestamp, @message\n| filter @message like /(?i)(ERROR|FATAL|panic)/\n| sort @timestamp desc\n| limit 200",
               "region": "default",
               "statsGroups": [],
@@ -1893,7 +1901,7 @@
           "type": "timeseries",
           "datasource": {
             "type": "cloudwatch",
-            "uid": "${cloudwatch_uid}"
+            "uid": "$cw_datasource"
           },
           "gridPos": {
             "h": 8,
@@ -1920,7 +1928,7 @@
             {
               "refId": "A",
               "queryMode": "Logs",
-              "logGroupNames": ["${qurl_log_group}"],
+              "logGroupNames": ["/layerv/nhp/$environment/$cell_id/qurl-api"],
               "expression": "fields @timestamp, @message\n| stats count(*) as log_lines by bin(5m)",
               "region": "default",
               "statsGroups": ["bin(5m)"],

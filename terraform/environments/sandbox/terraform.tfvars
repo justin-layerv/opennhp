@@ -325,6 +325,14 @@ grafana_url                       = "https://layervai.grafana.net"
 grafana_prometheus_datasource_uid = "grafanacloud-prom"
 grafana_tempo_datasource_uid      = "grafanacloud-traces"
 
+# CloudWatch datasource (Grafana Cloud assumes IAM role to read CloudWatch)
+grafana_cloudwatch_enabled   = true
+grafana_cloud_aws_account_id = "008923505280"
+grafana_cloud_external_id    = ""
+
+# Don't create dashboards from sandbox (prod owns them)
+grafana_create_dashboards = false
+
 # ==============================================================================
 # QURL Plugin Configuration (NHP Server)
 # Enables qurl.link.layerv.xyz → qurl.site.layerv.xyz authentication flow in NHP Server

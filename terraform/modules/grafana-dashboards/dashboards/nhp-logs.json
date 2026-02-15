@@ -1,8 +1,8 @@
 {
-  "uid": "nhp-logs-${environment}",
+  "uid": "nhp-logs",
   "title": "NHP Logs",
   "description": "NHP server and AC log aggregation via CloudWatch Logs Insights",
-  "tags": ["nhp", "logs", "${environment}"],
+  "tags": ["nhp", "logs"],
   "timezone": "browser",
   "editable": true,
   "fiscalYearStartMonth": 0,
@@ -11,7 +11,7 @@
     {
       "title": "NHP Infrastructure",
       "type": "link",
-      "url": "/d/nhp-infrastructure-${environment}/nhp-infrastructure?var-environment=${environment}",
+      "url": "/d/nhp-infrastructure/nhp-infrastructure?var-environment=$environment",
       "icon": "dashboard"
     }
   ],
@@ -29,12 +29,12 @@
       "title": "Server Log Volume",
       "description": "NHP Server log lines per minute",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
-      "datasource": { "type": "cloudwatch", "uid": "${cloudwatch_uid}" },
+      "datasource": { "type": "cloudwatch", "uid": "$cw_datasource" },
       "targets": [
         {
           "refId": "A",
           "queryMode": "Logs",
-          "logGroupNames": ["${server_log_group}"],
+          "logGroupNames": ["/layerv/nhp/$environment/$cell_id/server"],
           "expression": "fields @timestamp, @message\n| stats count(*) as log_lines by bin(1m)",
           "region": "default",
           "statsGroups": ["bin(1m)"],
@@ -63,12 +63,12 @@
       "title": "AC Log Volume",
       "description": "NHP AC log lines per minute by stream type (ac, firewall, traefik)",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
-      "datasource": { "type": "cloudwatch", "uid": "${cloudwatch_uid}" },
+      "datasource": { "type": "cloudwatch", "uid": "$cw_datasource" },
       "targets": [
         {
           "refId": "A",
           "queryMode": "Logs",
-          "logGroupNames": ["${ac_log_group}"],
+          "logGroupNames": ["/layerv/nhp/$environment/ac"],
           "expression": "fields @timestamp, @logStream\n| parse @logStream \"*/*\" as instance_id, stream_type\n| stats count(*) as log_lines by stream_type, bin(1m)",
           "region": "default",
           "statsGroups": ["stream_type", "bin(1m)"],
@@ -97,12 +97,12 @@
       "title": "Error Log Rate",
       "description": "Log lines containing ERROR or FATAL across server and AC",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 9 },
-      "datasource": { "type": "cloudwatch", "uid": "${cloudwatch_uid}" },
+      "datasource": { "type": "cloudwatch", "uid": "$cw_datasource" },
       "targets": [
         {
           "refId": "A",
           "queryMode": "Logs",
-          "logGroupNames": ["${server_log_group}", "${ac_log_group}"],
+          "logGroupNames": ["/layerv/nhp/$environment/$cell_id/server", "/layerv/nhp/$environment/ac"],
           "expression": "fields @timestamp, @message, @logStream\n| filter @message like /(?i)(ERROR|FATAL)/\n| stats count(*) as errors by bin(1m)",
           "region": "default",
           "statsGroups": ["bin(1m)"],
@@ -138,12 +138,12 @@
       "title": "Server Logs",
       "description": "NHP server log stream",
       "gridPos": { "h": 12, "w": 24, "x": 0, "y": 18 },
-      "datasource": { "type": "cloudwatch", "uid": "${cloudwatch_uid}" },
+      "datasource": { "type": "cloudwatch", "uid": "$cw_datasource" },
       "targets": [
         {
           "refId": "A",
           "queryMode": "Logs",
-          "logGroupNames": ["${server_log_group}"],
+          "logGroupNames": ["/layerv/nhp/$environment/$cell_id/server"],
           "expression": "fields @timestamp, @message, @logStream\n| sort @timestamp desc\n| limit 200",
           "region": "default",
           "statsGroups": [],
@@ -174,12 +174,12 @@
       "title": "AC Logs",
       "description": "NHP Access Controller log stream",
       "gridPos": { "h": 12, "w": 24, "x": 0, "y": 31 },
-      "datasource": { "type": "cloudwatch", "uid": "${cloudwatch_uid}" },
+      "datasource": { "type": "cloudwatch", "uid": "$cw_datasource" },
       "targets": [
         {
           "refId": "A",
           "queryMode": "Logs",
-          "logGroupNames": ["${ac_log_group}"],
+          "logGroupNames": ["/layerv/nhp/$environment/ac"],
           "expression": "fields @timestamp, @message, @logStream\n| filter @logStream like /\\/ac$/\n| sort @timestamp desc\n| limit 200",
           "region": "default",
           "statsGroups": [],
@@ -210,12 +210,12 @@
           "title": "Firewall Actions",
           "description": "NHP-ACCEPT, NHP-DENY, and NHP-FORWARD events from iptables logging",
           "gridPos": { "h": 8, "w": 24, "x": 0, "y": 44 },
-          "datasource": { "type": "cloudwatch", "uid": "${cloudwatch_uid}" },
+          "datasource": { "type": "cloudwatch", "uid": "$cw_datasource" },
           "targets": [
             {
               "refId": "A",
               "queryMode": "Logs",
-              "logGroupNames": ["${ac_log_group}"],
+              "logGroupNames": ["/layerv/nhp/$environment/ac"],
               "expression": "fields @timestamp, @message, @logStream\n| filter @logStream like /nhp-(accept|deny|forward)/\n| parse @logStream \"*/*\" as instance_id, action\n| stats count(*) as events by action, bin(1m)",
               "region": "default",
               "statsGroups": ["action", "bin(1m)"],
@@ -240,12 +240,12 @@
           "title": "Firewall Deny Log",
           "description": "All NHP-DENY events (unauthorized access attempts)",
           "gridPos": { "h": 10, "w": 24, "x": 0, "y": 52 },
-          "datasource": { "type": "cloudwatch", "uid": "${cloudwatch_uid}" },
+          "datasource": { "type": "cloudwatch", "uid": "$cw_datasource" },
           "targets": [
             {
               "refId": "A",
               "queryMode": "Logs",
-              "logGroupNames": ["${ac_log_group}"],
+              "logGroupNames": ["/layerv/nhp/$environment/ac"],
               "expression": "fields @timestamp, @message\n| filter @logStream like /nhp-deny/\n| sort @timestamp desc\n| limit 200",
               "region": "default",
               "statsGroups": [],
@@ -267,12 +267,12 @@
           "title": "Traefik Access Log",
           "description": "Traefik reverse proxy access logs (HTTP requests to protected resources)",
           "gridPos": { "h": 10, "w": 24, "x": 0, "y": 62 },
-          "datasource": { "type": "cloudwatch", "uid": "${cloudwatch_uid}" },
+          "datasource": { "type": "cloudwatch", "uid": "$cw_datasource" },
           "targets": [
             {
               "refId": "A",
               "queryMode": "Logs",
-              "logGroupNames": ["${ac_log_group}"],
+              "logGroupNames": ["/layerv/nhp/$environment/ac"],
               "expression": "fields @timestamp, @message\n| filter @logStream like /traefik-access/\n| sort @timestamp desc\n| limit 200",
               "region": "default",
               "statsGroups": [],
@@ -295,9 +295,35 @@
     "list": [
       {
         "name": "environment",
-        "type": "constant",
-        "current": { "value": "${environment}" },
-        "hide": 2
+        "type": "custom",
+        "label": "Environment",
+        "query": "sandbox,prod",
+        "current": { "text": "prod", "value": "prod" },
+        "options": [
+          { "text": "sandbox", "value": "sandbox", "selected": false },
+          { "text": "prod", "value": "prod", "selected": true }
+        ],
+        "hide": 0
+      },
+      {
+        "name": "cw_datasource",
+        "type": "datasource",
+        "label": "CloudWatch",
+        "query": "cloudwatch",
+        "regex": "/CloudWatch \\($environment\\)/",
+        "hide": 2,
+        "current": {}
+      },
+      {
+        "name": "cell_id",
+        "type": "custom",
+        "label": "Cell",
+        "query": "cell0",
+        "current": { "text": "cell0", "value": "cell0" },
+        "options": [
+          { "text": "cell0", "value": "cell0", "selected": true }
+        ],
+        "hide": 0
       }
     ]
   },

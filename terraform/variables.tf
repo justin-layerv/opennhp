@@ -1357,6 +1357,12 @@ variable "grafana_cloudwatch_enabled" {
   default     = false
 }
 
+variable "grafana_create_dashboards" {
+  description = "Create Grafana dashboard and folder resources. Set to false for non-primary environments that only need CloudWatch datasources."
+  type        = bool
+  default     = true
+}
+
 variable "grafana_cloud_aws_account_id" {
   description = "Grafana Cloud's AWS account ID for IAM trust policy (find in Grafana Cloud CloudWatch integration setup)"
   type        = string

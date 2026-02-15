@@ -101,7 +101,7 @@ else
         "collect_list": [
           {
             "file_path": "/opt/layerv/nhp-server/log/server-*.log",
-            "log_group_name": "/layerv/nhp/${environment}/server",
+            "log_group_name": "/layerv/nhp/${environment}/${cell_id}/server",
             "log_stream_name": "{instance_id}/server",
             "timezone": "UTC"
           }
@@ -659,6 +659,7 @@ cat > /opt/layerv/nhp-server/etc/env << ENVEOF
 NHP_IMAGE_TAG=$IMAGE_TAG
 NHP_ECR_REPO=${server_repo_url}
 NHP_ENVIRONMENT=${environment}
+NHP_CELL_ID=${cell_id}
 %{ if qurl_enabled ~}
 QURL_API_URL=${qurl_api_url}
 QURL_ALLOWED_REDIRECT_DOMAIN=${qurl_allowed_redirect_domain}

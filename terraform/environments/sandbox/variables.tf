@@ -932,6 +932,12 @@ variable "grafana_cloud_external_id" {
   default     = ""
 }
 
+variable "grafana_create_dashboards" {
+  description = "Create Grafana dashboard and folder resources. Set to false for non-primary environments."
+  type        = bool
+  default     = true
+}
+
 # Cost analytics
 # Role in LayerV mgmt/payer account (165115313779) for consolidated billing access.
 # Same cross-account pattern as cross_account_route53_role_arn above.

@@ -188,6 +188,7 @@ module "nhp" {
   grafana_cloudwatch_enabled        = var.grafana_cloudwatch_enabled
   grafana_cloud_aws_account_id      = var.grafana_cloud_aws_account_id
   grafana_cloud_external_id         = var.grafana_cloud_external_id
+  grafana_create_dashboards         = var.grafana_create_dashboards
 
   # Cost analytics
   deploy_cost_analytics                 = var.deploy_cost_analytics
