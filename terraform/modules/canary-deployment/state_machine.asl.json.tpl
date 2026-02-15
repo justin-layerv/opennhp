@@ -548,7 +548,14 @@
         "result.$": "$.Payload"
       },
       "ResultPath": "$.error_notify",
-      "Next": "CleanupAfterFailure"
+      "Next": "CleanupAfterFailure",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error_notify_failed",
+          "Next": "CleanupAfterFailure"
+        }
+      ]
     },
 
     "DeploymentFailed": {

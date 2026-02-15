@@ -64,7 +64,7 @@ def handler(event, context):
 
     action = event.get('action')
     if not action:
-        return {'error': 'Missing required field: action'}
+        raise ValueError('Missing required field: action')
 
     actions = {
         'prepare': handle_prepare,
@@ -79,17 +79,16 @@ def handler(event, context):
 
     action_handler = actions.get(action)
     if not action_handler:
-        return {'error': f'Unknown action: {action}'}
+        raise ValueError(f'Unknown action: {action}')
 
     try:
         return action_handler(event, context)
     except Exception as e:
         logger.error(f"Error handling action '{action}': {str(e)}", exc_info=True)
-        return {
-            'error': str(e),
-            'action': action,
-            'error_type': type(e).__name__,
-        }
+        # Re-raise so Lambda returns a FunctionError response.
+        # Step Functions Catch blocks only activate on task failures,
+        # not on successful responses containing error dicts.
+        raise
 
 
 def handle_prepare(event, context):
