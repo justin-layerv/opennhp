@@ -886,11 +886,12 @@ jobs:
   # =============================================================================
   deploy-qurl:
     name: Deploy QURL Service
-    needs: [manifest, preflight, terraform-apply, deploy-ac]
+    needs: [manifest, preflight, terraform-apply, deploy-server, deploy-ac]
     if: |
       always() &&
       needs.preflight.result == 'success' &&
       (needs.terraform-apply.result == 'success' || needs.terraform-apply.result == 'skipped') &&
+      (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
       (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
       inputs.deploy_qurl
     runs-on: ubuntu-latest
