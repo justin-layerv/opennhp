@@ -52,6 +52,7 @@ concurrency:
 
 env:
   AWS_REGION: us-east-2
+  SANDBOX_ACCOUNT_ID: '767397897469'
 
 jobs:
   # =============================================================================
@@ -107,8 +108,15 @@ jobs:
 
           echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
 
+          # Prod pulls images from sandbox ECR (cross-account)
+          ECR_REGISTRY_ARGS=""
+          if [[ "$ENVIRONMENT" == "prod" ]]; then
+            ECR_REGISTRY_ARGS="--registry-id $SANDBOX_ACCOUNT_ID"
+          fi
+
           echo "Verifying image $REPO_NAME:$IMAGE_TAG exists in ECR..."
           if ! aws ecr describe-images \
+            $ECR_REGISTRY_ARGS \
             --repository-name "$REPO_NAME" \
             --image-ids imageTag="$IMAGE_TAG" \
             --query "imageDetails[0].imageTags" \
