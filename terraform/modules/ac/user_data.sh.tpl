@@ -68,7 +68,19 @@ curl -sfL "https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/amd64/latest/a
 if [ ! -s "$CW_AGENT_DEB" ]; then
   echo "WARNING: CloudWatch Agent download failed, skipping CW Agent install"
 else
-  dpkg -i "$CW_AGENT_DEB" || apt_get_with_retry install -f -y
+  # Retry dpkg install - unattended-upgrades holds the dpkg lock on fresh instances
+  for dpkg_attempt in $(seq 1 10); do
+    if dpkg -i "$CW_AGENT_DEB"; then
+      break
+    fi
+    if [ "$dpkg_attempt" -eq 10 ]; then
+      echo "WARNING: dpkg -i CloudWatch Agent failed after 10 attempts, skipping"
+      rm -f "$CW_AGENT_DEB"
+      break
+    fi
+    echo "dpkg locked (attempt $dpkg_attempt/10), retrying in $${dpkg_attempt}s..."
+    sleep "$dpkg_attempt"
+  done
   rm -f "$CW_AGENT_DEB"
 
   mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
@@ -139,10 +151,14 @@ else
 }
 CWEOF
 
-  /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-    -a fetch-config -m ec2 \
-    -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
-  echo "CloudWatch Agent installed and started"
+  if [ -x /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl ]; then
+    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+      -a fetch-config -m ec2 \
+      -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+    echo "CloudWatch Agent installed and started"
+  else
+    echo "WARNING: CloudWatch Agent binary not found, skipping configuration"
+  fi
 fi
 
 REGION="${region}"
