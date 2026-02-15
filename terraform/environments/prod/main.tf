@@ -31,6 +31,7 @@ module "nhp" {
   lambda_layer_bucket         = var.lambda_layer_bucket
   qurl_alb_access_logs_bucket = var.qurl_alb_access_logs_bucket
   multi_tenant                = var.multi_tenant
+  deploy_etcd                 = var.deploy_etcd
   min_capacity                = var.min_capacity
   max_capacity                = var.max_capacity
   vpc_cidr                    = var.vpc_cidr

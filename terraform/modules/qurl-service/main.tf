@@ -74,6 +74,13 @@ locals {
   # Shorter name for resources with 32-char limit (ALB/NLB names)
   short_name = "${var.name_prefix}-${var.cell_id}-qurl"
 
+  # Task-level CPU/memory with ADOT sidecar overhead.
+  # Fargate requires specific CPU/memory combinations (memory in 1024 MB increments
+  # for CPU values 256-4096). Round up to avoid invalid combinations like 512 CPU / 1280 MB.
+  # See: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-cpu-memory-error.html
+  task_cpu    = var.grafana_cloud_enabled ? max(var.container_cpu, 512) : var.container_cpu
+  task_memory = ceil((var.grafana_cloud_enabled ? var.container_memory + 256 : var.container_memory) / 1024) * 1024
+
   # Compute allowed hosts: ALB DNS + domain + localhost for health checks + any additional hosts
   # Note: aws_lb.qurl.dns_name is referenced later, terraform handles the dependency
   computed_allowed_hosts = join(",", compact(concat(
@@ -465,15 +472,10 @@ resource "aws_ecs_task_definition" "qurl" {
   family                   = local.service_name
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
-  # When ADOT sidecar is enabled, increase task resources to accommodate both containers.
-  # CPU: ADOT collector requires ~256 CPU units for OTLP processing; 512 minimum ensures
-  #      headroom for batching and export operations under load.
-  # Memory: ADOT needs ~200MB (see memory_limiter config), +256MB provides buffer for
-  #         batching spikes. Monitor CloudWatch Container Insights after deployment.
-  cpu                = var.grafana_cloud_enabled ? max(var.container_cpu, 512) : var.container_cpu
-  memory             = var.grafana_cloud_enabled ? var.container_memory + 256 : var.container_memory
-  execution_role_arn = aws_iam_role.execution.arn
-  task_role_arn      = aws_iam_role.task.arn
+  cpu                      = local.task_cpu
+  memory                   = local.task_memory
+  execution_role_arn       = aws_iam_role.execution.arn
+  task_role_arn            = aws_iam_role.task.arn
 
   # Note: Initial deployment uses "latest" tag from SSM parameter default value.
   # CI pipeline updates the SSM parameter and deploys new task definitions independently.

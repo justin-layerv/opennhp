@@ -17,6 +17,7 @@ module "nhp" {
   domain_name            = var.domain_name
   hosted_zone            = var.hosted_zone
   multi_tenant           = var.multi_tenant
+  deploy_etcd            = var.deploy_etcd
   min_capacity           = var.min_capacity
   max_capacity           = var.max_capacity
   vpc_cidr               = var.vpc_cidr

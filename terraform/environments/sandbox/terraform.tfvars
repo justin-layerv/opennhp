@@ -7,6 +7,7 @@ aws_account_id = "767397897469"
 domain_name    = "nhp.layerv.xyz"
 hosted_zone    = "layerv.xyz"
 multi_tenant   = true
+deploy_etcd    = false # Cloud deployment uses DynamoDB, not etcd
 min_capacity   = 1
 max_capacity   = 10
 vpc_cidr       = "10.100.0.0/16"

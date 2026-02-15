@@ -1226,6 +1226,22 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "ecs:UntagResource"
         ]
         Resource = "*"
+      },
+      {
+        # Step Functions for canary deployment state machines
+        Sid    = "StepFunctions"
+        Effect = "Allow"
+        Action = [
+          "states:CreateStateMachine",
+          "states:DeleteStateMachine",
+          "states:UpdateStateMachine",
+          "states:DescribeStateMachine",
+          "states:ListStateMachineVersions",
+          "states:TagResource",
+          "states:UntagResource",
+          "states:ListTagsForResource"
+        ]
+        Resource = "arn:aws:states:${local.region}:${local.account_id}:stateMachine:layerv-nhp-*"
       }
     ]
   })
