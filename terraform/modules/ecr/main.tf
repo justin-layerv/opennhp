@@ -198,7 +198,8 @@ locals {
       Action = [
         "ecr:GetDownloadUrlForLayer",
         "ecr:BatchGetImage",
-        "ecr:BatchCheckLayerAvailability"
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:DescribeImages"
       ]
     }]
   }) : null

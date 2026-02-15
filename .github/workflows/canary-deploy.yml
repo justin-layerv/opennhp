@@ -108,7 +108,8 @@ jobs:
 
           echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
 
-          # Prod pulls images from sandbox ECR (cross-account)
+          # Prod pulls images from sandbox ECR (cross-account).
+          # The ECR resource policy includes ecr:DescribeImages for secondary accounts.
           ECR_REGISTRY_ARGS=""
           if [[ "$ENVIRONMENT" == "prod" ]]; then
             ECR_REGISTRY_ARGS="--registry-id $SANDBOX_ACCOUNT_ID"
