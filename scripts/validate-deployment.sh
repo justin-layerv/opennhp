@@ -70,10 +70,10 @@ echo ""
 echo "2. NHP Server"
 echo "-------------"
 NHP_NLB=$(run_aws elbv2 describe-load-balancers \
-    --query "LoadBalancers[?contains(LoadBalancerName, 'nhp-${ENV}')].DNSName" \
-    --output text 2>/dev/null | head -1)
+    --query "LoadBalancers[?contains(LoadBalancerName, 'nhp-${ENV}-nlb')].DNSName | [0]" \
+    --output text 2>/dev/null || true)
 
-if [ -n "$NHP_NLB" ]; then
+if [ -n "$NHP_NLB" ] && [ "$NHP_NLB" != "None" ]; then
     pass "NHP NLB found: $NHP_NLB"
 
     # Check DNS resolution
@@ -98,11 +98,11 @@ echo ""
 echo "3. AC Instances"
 echo "---------------"
 AC_INSTANCES=$(run_aws ec2 describe-instances \
-    --filters "Name=tag:Name,Values=*nhp*ac*${ENV}*" "Name=instance-state-name,Values=running" \
+    --filters "Name=tag:Name,Values=*nhp-${ENV}*ac*,*nhp*ac*${ENV}*" "Name=instance-state-name,Values=running" \
     --query 'Reservations[*].Instances[*].[InstanceId,PrivateIpAddress,State.Name]' \
-    --output text 2>/dev/null)
+    --output text 2>/dev/null || true)
 
-if [ -n "$AC_INSTANCES" ]; then
+if [ -n "$AC_INSTANCES" ] && [ "$AC_INSTANCES" != "None" ]; then
     AC_COUNT=$(echo "$AC_INSTANCES" | wc -l | tr -d ' ')
     pass "Found $AC_COUNT running AC instance(s)"
     echo "$AC_INSTANCES" | while read -r id ip state; do
@@ -149,21 +149,27 @@ echo ""
 # 5. Check Secrets Manager
 echo "5. Secrets Manager"
 echo "------------------"
-NHP_SERVER_KEY=$(run_aws secretsmanager list-secrets \
-    --query "SecretList[?contains(Name, 'nhp-${ENV}-server')].Name" \
-    --output text 2>/dev/null | head -1)
-
-if [ -n "$NHP_SERVER_KEY" ]; then
-    pass "NHP server key found in Secrets Manager"
+# Use describe-secret on known names (more specific IAM permissions)
+SERVER_SECRET="layerv-nhp-${ENV}-server"
+if run_aws secretsmanager describe-secret --secret-id "$SERVER_SECRET" &>/dev/null; then
+    pass "NHP server key found: $SERVER_SECRET"
 else
-    warn "NHP server key not found (may use different naming)"
+    warn "NHP server key not found: $SERVER_SECRET"
 fi
 
-# Check for AC private keys
-AC_KEYS=$(run_aws secretsmanager list-secrets \
-    --query "SecretList[?contains(Name, 'nhp-${ENV}-ac-')].Name" \
-    --output text 2>/dev/null | wc -l | tr -d ' ')
-info "$AC_KEYS AC private key(s) in Secrets Manager"
+# Check for per-instance AC keys by looking for running AC instances
+if [ -n "$AC_INSTANCES" ] && [ "$AC_INSTANCES" != "None" ]; then
+    AC_KEY_COUNT=0
+    while read -r id _ _; do
+        AC_SECRET="layerv-nhp-${ENV}-ac-${id}"
+        if run_aws secretsmanager describe-secret --secret-id "$AC_SECRET" &>/dev/null; then
+            AC_KEY_COUNT=$((AC_KEY_COUNT + 1))
+        fi
+    done <<< "$AC_INSTANCES"
+    info "$AC_KEY_COUNT AC private key(s) in Secrets Manager"
+else
+    info "Skipping AC key check (no instances found)"
+fi
 echo ""
 
 # 6. Check CloudWatch Logs
@@ -171,9 +177,9 @@ echo "6. CloudWatch Logs"
 echo "------------------"
 LOG_GROUPS=$(run_aws logs describe-log-groups \
     --query "logGroups[?contains(logGroupName, 'nhp')].logGroupName" \
-    --output text 2>/dev/null)
+    --output text 2>/dev/null || true)
 
-if [ -n "$LOG_GROUPS" ]; then
+if [ -n "$LOG_GROUPS" ] && [ "$LOG_GROUPS" != "None" ]; then
     LOG_COUNT=$(echo "$LOG_GROUPS" | wc -w | tr -d ' ')
     pass "Found $LOG_COUNT NHP log group(s)"
     for lg in $LOG_GROUPS; do
