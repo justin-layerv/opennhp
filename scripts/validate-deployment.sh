@@ -157,16 +157,27 @@ else
     warn "NHP server key not found: $SERVER_SECRET"
 fi
 
-# Check for per-instance AC keys by looking for running AC instances
+# Check for per-instance AC keys (parallel for performance at scale)
 if [ -n "$AC_INSTANCES" ] && [ "$AC_INSTANCES" != "None" ]; then
-    AC_KEY_COUNT=0
+    AC_KEY_TMPDIR=$(mktemp -d)
+    cleanup_ac_tmpdir() { [[ -d "${AC_KEY_TMPDIR:-}" ]] && rm -rf "$AC_KEY_TMPDIR"; }
+    trap cleanup_ac_tmpdir EXIT
     while read -r id _ _; do
-        AC_SECRET="layerv-nhp-${ENV}-ac-${id}"
-        if run_aws secretsmanager describe-secret --secret-id "$AC_SECRET" &>/dev/null; then
-            AC_KEY_COUNT=$((AC_KEY_COUNT + 1))
-        fi
+        (
+            AC_SECRET="layerv-nhp-${ENV}-ac-${id}"
+            if timeout 30 run_aws secretsmanager describe-secret --secret-id "$AC_SECRET" &>/dev/null; then
+                touch "$AC_KEY_TMPDIR/$id"
+            fi
+        ) &
     done <<< "$AC_INSTANCES"
-    info "$AC_KEY_COUNT AC private key(s) in Secrets Manager"
+    wait
+    AC_KEY_COUNT=$(find "$AC_KEY_TMPDIR" -type f | wc -l | tr -d ' ')
+    AC_EXPECTED=$(echo "$AC_INSTANCES" | wc -l | tr -d ' ')
+    if [ "$AC_KEY_COUNT" -eq 0 ] && [ "$AC_EXPECTED" -gt 0 ]; then
+        warn "No AC keys found in Secrets Manager (expected $AC_EXPECTED based on running instances)"
+    else
+        info "$AC_KEY_COUNT AC private key(s) in Secrets Manager"
+    fi
 else
     info "Skipping AC key check (no instances found)"
 fi
