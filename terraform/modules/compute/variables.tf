@@ -391,6 +391,12 @@ variable "qurl_resolve_certificate_arn" {
 # Blue/Green Deployment Configuration
 # =============================================================================
 
+variable "cloudfront_cidrs_ssm_parameter" {
+  description = "SSM parameter containing CloudFront origin-facing CIDRs for trusted proxy config"
+  type        = string
+  default     = null
+}
+
 variable "enable_blue_green" {
   description = "Enable blue/green deployment infrastructure. Creates a second ASG (green) and SSM parameters for traffic switching."
   type        = bool

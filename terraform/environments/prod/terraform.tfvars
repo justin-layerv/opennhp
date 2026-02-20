@@ -142,6 +142,9 @@ qurl_link_frontend_domain = "qurl.link"
 qurl_link_hosted_zone_id  = "Z0693053DKJ8S3XN9WPG" # qurl.link zone (in layerv-mgmt account)
 qurl_link_external_dns    = false                  # DNS via route53_mgmt cross-account provider
 
+# CloudFront for resolve.qurl.link - ISP compatibility (AT&T WiFi blocks NLB IPs)
+enable_resolve_cloudfront = true
+
 # Traefik plugins (downloaded from S3 at boot time)
 # Plugin source files are uploaded by traefik-plugins repo CI to s3://layerv-nhp-prod-plugins/
 # Key names must match moduleName in traefik.toml for Traefik local plugin resolution

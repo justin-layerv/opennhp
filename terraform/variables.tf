@@ -631,6 +631,12 @@ variable "qurl_link_enable_access_logs" {
   default     = false
 }
 
+variable "enable_resolve_cloudfront" {
+  description = "Enable CloudFront + WAF in front of resolve.qurl.link for ISP compatibility"
+  type        = bool
+  default     = false
+}
+
 variable "traefik_plugins" {
   description = <<-EOT
     Map of Traefik plugins to deploy.

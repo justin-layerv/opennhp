@@ -81,6 +81,21 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 
 	gin.SetMode(gin.ReleaseMode)
 	hs.ginEngine = gin.New()
+
+	// Configure trusted proxies for correct client IP via X-Forwarded-For.
+	// - With CloudFront: trust origin-facing CIDRs → extract real client IP
+	// - Without CloudFront: trust nobody → use RemoteAddr (NLB-preserved source IP)
+	// This also fixes a pre-existing issue: Gin v1.11 trusts ALL proxies by default,
+	// allowing X-Forwarded-For spoofing for NHP knocks.
+	if validCIDRs := parseTrustedCIDRs(os.Getenv("NHP_TRUSTED_PROXY_CIDRS")); len(validCIDRs) > 0 {
+		if err := hs.ginEngine.SetTrustedProxies(validCIDRs); err != nil {
+			return fmt.Errorf("failed to set trusted proxies: %w", err)
+		}
+		log.Info("Trusted proxies configured with %d CIDRs (first: %s)", len(validCIDRs), validCIDRs[0])
+	} else {
+		hs.ginEngine.SetTrustedProxies(nil)
+	}
+
 	cookieKeys, err := parseCookieKeys(os.Getenv("NHP_COOKIE_KEYS"))
 	if err != nil {
 		return fmt.Errorf("NHP_COOKIE_KEYS: %w", err)
@@ -465,6 +480,22 @@ func validateKeyLengths(label string, ks cookieKeySet) error {
 		return fmt.Errorf("%s.encrypt_key must be 16, 24, or 32 bytes, got %d", label, encLen)
 	}
 	return nil
+}
+
+// parseTrustedCIDRs splits a comma-separated CIDR string, trims whitespace,
+// and filters empty entries. Returns nil if input is empty or contains no valid entries.
+func parseTrustedCIDRs(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	cidrs := strings.Split(raw, ",")
+	var valid []string
+	for _, cidr := range cidrs {
+		if c := strings.TrimSpace(cidr); c != "" {
+			valid = append(valid, c)
+		}
+	}
+	return valid
 }
 
 // ginLogFormatter formats Gin access log lines with request ID and error context.

@@ -654,6 +654,8 @@ locals {
     enable_blue_green = var.enable_blue_green
     # Cookie signing secret (shared across all instances)
     cookie_secret_arn = aws_secretsmanager_secret.cookie_secret.arn
+    # CloudFront trusted proxy CIDRs (for correct client IP via X-Forwarded-For)
+    cloudfront_cidrs_ssm_parameter = var.cloudfront_cidrs_ssm_parameter
   })
 }
 

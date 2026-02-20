@@ -302,6 +302,12 @@ variable "qurl_link_enable_access_logs" {
   default     = false
 }
 
+variable "enable_resolve_cloudfront" {
+  description = "Enable CloudFront + WAF in front of resolve.qurl.link for ISP compatibility"
+  type        = bool
+  default     = false
+}
+
 # QURL Service deployment
 variable "deploy_qurl_service" {
   description = "Deploy the QURL API service on ECS Fargate"

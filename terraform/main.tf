@@ -357,6 +357,9 @@ module "compute" {
   alerts_sns_topic_arn = module.monitoring.sns_topic_arn
   enable_sns_alerts    = true # Static boolean - monitoring module always creates SNS topic
 
+  # CloudFront trusted proxy CIDRs (for correct client IP extraction from X-Forwarded-For)
+  cloudfront_cidrs_ssm_parameter = var.deploy_qurl_link && var.enable_resolve_cloudfront ? aws_ssm_parameter.cloudfront_cidrs[0].name : null
+
   # Blue/Green deployment configuration
   enable_blue_green               = var.enable_blue_green
   green_standby_min_size          = var.green_standby_min_size
@@ -1490,13 +1493,14 @@ resource "aws_acm_certificate_validation" "qurl_resolve" {
 }
 
 # Route53 record for QURL token resolution endpoint
-# Points resolve.qurl.link to the NHP Server NLB (NOT the AC NLB)
+# Points resolve.qurl.link to CloudFront (when enabled) or NHP Server NLB directly.
 #
-# IMPORTANT: This DNS record is for BROWSER access, not CloudFront!
-# Flow: User visits qurl.link → SPA redirects browser → browser hits resolve.qurl.link
-# The browser's IP is the client, so security group allows 0.0.0.0/0.
+# When CloudFront is enabled:
+#   Flow: Browser → CloudFront → NLB → Server:8888
+#   Benefit: CloudFront IPs are universally trusted by ISPs (AT&T WiFi blocks NLB IPs)
 #
-# Note: No AAAA (IPv6) record is needed because the NHP Server NLB is IPv4-only.
+# When CloudFront is disabled:
+#   Flow: Browser → NLB → Server:8888
 resource "aws_route53_record" "qurl_link_resolve" {
   count    = var.deploy_qurl_link && !var.qurl_link_external_dns ? 1 : 0
   provider = aws.route53_mgmt
@@ -1507,8 +1511,453 @@ resource "aws_route53_record" "qurl_link_resolve" {
   type            = "A"
 
   alias {
-    name                   = module.compute.nlb_dns_name
-    zone_id                = module.compute.nlb_zone_id
-    evaluate_target_health = true
+    name                   = var.enable_resolve_cloudfront ? aws_cloudfront_distribution.qurl_resolve[0].domain_name : module.compute.nlb_dns_name
+    zone_id                = var.enable_resolve_cloudfront ? aws_cloudfront_distribution.qurl_resolve[0].hosted_zone_id : module.compute.nlb_zone_id
+    evaluate_target_health = !var.enable_resolve_cloudfront
   }
+}
+
+# IPv6 AAAA record for resolve.qurl.link (only when CloudFront is enabled)
+# CloudFront natively supports IPv6, NLB is IPv4-only
+resource "aws_route53_record" "qurl_link_resolve_ipv6" {
+  count    = var.deploy_qurl_link && var.enable_resolve_cloudfront && !var.qurl_link_external_dns ? 1 : 0
+  provider = aws.route53_mgmt
+
+  allow_overwrite = true
+  zone_id         = var.qurl_link_hosted_zone_id
+  name            = "resolve.${var.qurl_link_frontend_domain}"
+  type            = "AAAA"
+
+  alias {
+    name                   = aws_cloudfront_distribution.qurl_resolve[0].domain_name
+    zone_id                = aws_cloudfront_distribution.qurl_resolve[0].hosted_zone_id
+    evaluate_target_health = false
+  }
+}
+
+# ==============================================================================
+# CloudFront for resolve.qurl.link (ISP compatibility)
+# ==============================================================================
+# ISPs (notably AT&T WiFi) intercept TLS connections to NLB IP addresses,
+# causing resolve.qurl.link to fail. CloudFront IPs are universally trusted.
+# This CloudFront distribution is placed in front of resolve.qurl.link ONLY —
+# *.qurl.site stays direct-to-NLB to preserve true NHP (zero ports open).
+
+# ACM Certificate for CloudFront (must be in us-east-1)
+resource "aws_acm_certificate" "qurl_resolve_cloudfront" {
+  count             = var.deploy_qurl_link && var.enable_resolve_cloudfront ? 1 : 0
+  provider          = aws.us_east_1
+  domain_name       = "resolve.${var.qurl_link_frontend_domain}"
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-qurl-resolve-cf-cert"
+  })
+}
+
+# DNS validation records for CloudFront certificate
+resource "aws_route53_record" "qurl_resolve_cf_cert_validation" {
+  for_each = var.deploy_qurl_link && var.enable_resolve_cloudfront && !var.qurl_link_external_dns ? {
+    for dvo in aws_acm_certificate.qurl_resolve_cloudfront[0].domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  } : {}
+
+  provider = aws.route53_mgmt
+
+  allow_overwrite = true
+  name            = each.value.name
+  records         = [each.value.record]
+  ttl             = 60
+  type            = each.value.type
+  zone_id         = var.qurl_link_hosted_zone_id
+}
+
+# Wait for CloudFront certificate validation
+resource "aws_acm_certificate_validation" "qurl_resolve_cloudfront" {
+  count                   = var.deploy_qurl_link && var.enable_resolve_cloudfront ? 1 : 0
+  provider                = aws.us_east_1
+  certificate_arn         = aws_acm_certificate.qurl_resolve_cloudfront[0].arn
+  validation_record_fqdns = var.qurl_link_external_dns ? null : [for record in aws_route53_record.qurl_resolve_cf_cert_validation : record.fqdn]
+}
+
+# WAF Web ACL for CloudFront (must be in us-east-1, CLOUDFRONT scope)
+resource "aws_wafv2_web_acl" "qurl_resolve" {
+  count       = var.deploy_qurl_link && var.enable_resolve_cloudfront ? 1 : 0
+  provider    = aws.us_east_1
+  name        = "${local.name_prefix}-resolve-cf-waf"
+  description = "WAF for CloudFront - QURL resolve endpoint"
+  scope       = "CLOUDFRONT"
+
+  default_action {
+    allow {}
+  }
+
+  # Rate limiting
+  rule {
+    name     = "RateLimit"
+    priority = 1
+
+    action {
+      block {}
+    }
+
+    statement {
+      rate_based_statement {
+        limit              = var.environment == "prod" ? 5000 : 2000
+        aggregate_key_type = "IP"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name_prefix}-resolve-rate-limit"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # AWS Managed Rules - Common Rule Set
+  rule {
+    name     = "AWSManagedRulesCommonRuleSet"
+    priority = 2
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesCommonRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name_prefix}-resolve-common-rules"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # AWS Managed Rules - Known Bad Inputs
+  rule {
+    name     = "AWSManagedRulesKnownBadInputsRuleSet"
+    priority = 3
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesKnownBadInputsRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name_prefix}-resolve-bad-inputs"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # AWS Managed Rules - IP Reputation
+  rule {
+    name     = "AWSManagedRulesAmazonIpReputationList"
+    priority = 4
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesAmazonIpReputationList"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name_prefix}-resolve-ip-reputation"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "${local.name_prefix}-resolve-cf-waf"
+    sampled_requests_enabled   = true
+  }
+
+  tags = local.common_tags
+}
+
+# CloudFront Distribution for resolve.qurl.link
+resource "aws_cloudfront_distribution" "qurl_resolve" {
+  count           = var.deploy_qurl_link && var.enable_resolve_cloudfront ? 1 : 0
+  enabled         = true
+  is_ipv6_enabled = true
+  comment         = "CloudFront for ${local.name_prefix} QURL resolve"
+  aliases         = ["resolve.${var.qurl_link_frontend_domain}"]
+  web_acl_id      = aws_wafv2_web_acl.qurl_resolve[0].arn
+  price_class     = var.environment == "prod" ? "PriceClass_All" : "PriceClass_100"
+
+  origin {
+    domain_name = module.compute.nlb_dns_name
+    origin_id   = "nlb"
+
+    custom_origin_config {
+      http_port                = 80
+      https_port               = 443
+      origin_protocol_policy   = "https-only"
+      origin_ssl_protocols     = ["TLSv1.2"]
+      origin_read_timeout      = 60
+      origin_keepalive_timeout = 30
+    }
+  }
+
+  default_cache_behavior {
+    allowed_methods  = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+    cached_methods   = ["GET", "HEAD"]
+    target_origin_id = "nlb"
+
+    # Use managed policies instead of deprecated forwarded_values block.
+    # CachingDisabled: TTL=0, no caching. AllViewer: forwards all headers, query strings, cookies.
+    cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad" # CachingDisabled
+    origin_request_policy_id = "216adef6-5c7f-47e4-b989-5492eafa07d3" # AllViewer
+    compress                 = true
+
+    viewer_protocol_policy = "redirect-to-https"
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    acm_certificate_arn      = aws_acm_certificate_validation.qurl_resolve_cloudfront[0].certificate_arn
+    ssl_support_method       = "sni-only"
+    minimum_protocol_version = "TLSv1.2_2021"
+  }
+
+  tags       = local.common_tags
+  depends_on = [aws_acm_certificate_validation.qurl_resolve_cloudfront]
+}
+
+# CloudFront origin-facing IP ranges (for Gin trusted proxies)
+# Uses cloudfront_origin_facing (45 CIDRs / ~705 bytes) NOT cloudfront (199 CIDRs - wrong IPs)
+# Only IPv4 cidr_blocks are used: CloudFront connects to origins over IPv4 even when
+# the viewer connection is IPv6, so ipv6_cidr_blocks are not needed for trusted proxies.
+data "aws_ip_ranges" "cloudfront_origin" {
+  count    = var.deploy_qurl_link && var.enable_resolve_cloudfront ? 1 : 0
+  services = ["cloudfront_origin_facing"]
+}
+
+# SSM Parameter for CloudFront CIDRs (consumed by NHP Server for SetTrustedProxies)
+# Covered by existing IAM wildcard: ssm:GetParameter on parameter/${env}/nhp/server/*
+resource "aws_ssm_parameter" "cloudfront_cidrs" {
+  count = var.deploy_qurl_link && var.enable_resolve_cloudfront ? 1 : 0
+  name  = "/${var.environment}/nhp/server/cloudfront-cidrs"
+  type  = "String"
+  value = join(",", data.aws_ip_ranges.cloudfront_origin[0].cidr_blocks)
+  tags  = local.common_tags
+}
+
+# ==============================================================================
+# CloudFront CIDR Drift Detection
+# ==============================================================================
+# The SSM parameter is updated on `terraform apply`. If AWS publishes new
+# CloudFront origin-facing CIDRs between applies, requests from those IPs
+# will be untrusted. This Lambda runs daily to detect drift and alarm.
+
+locals {
+  cf_drift_enabled = var.deploy_qurl_link && var.enable_resolve_cloudfront
+}
+
+data "archive_file" "cloudfront_cidr_drift" {
+  count       = local.cf_drift_enabled ? 1 : 0
+  type        = "zip"
+  source_file = "${path.module}/lambda/cloudfront_cidr_drift.py"
+  output_path = "${path.module}/lambda/.build/cloudfront_cidr_drift.zip"
+}
+
+resource "aws_cloudwatch_log_group" "cloudfront_cidr_drift" {
+  count             = local.cf_drift_enabled ? 1 : 0
+  name              = "/aws/lambda/${local.name_prefix}-cf-cidr-drift"
+  retention_in_days = var.environment == "prod" ? 90 : 14
+  kms_key_id        = module.kms.logs_key_arn
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-cf-cidr-drift-logs"
+    Component = "cloudfront"
+  })
+}
+
+resource "aws_iam_role" "cloudfront_cidr_drift" {
+  count = local.cf_drift_enabled ? 1 : 0
+  name  = "${local.name_prefix}-cf-cidr-drift"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-cf-cidr-drift-role"
+    Component = "cloudfront"
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "cloudfront_cidr_drift_logs" {
+  count      = local.cf_drift_enabled ? 1 : 0
+  role       = aws_iam_role.cloudfront_cidr_drift[0].name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_iam_role_policy" "cloudfront_cidr_drift" {
+  count = local.cf_drift_enabled ? 1 : 0
+  name  = "ssm-and-cloudwatch"
+  role  = aws_iam_role.cloudfront_cidr_drift[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ReadSSMParameter"
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = aws_ssm_parameter.cloudfront_cidrs[0].arn
+      },
+      {
+        Sid      = "PublishMetrics"
+        Effect   = "Allow"
+        Action   = ["cloudwatch:PutMetricData"]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_lambda_function" "cloudfront_cidr_drift" {
+  count = local.cf_drift_enabled ? 1 : 0
+
+  depends_on = [aws_cloudwatch_log_group.cloudfront_cidr_drift]
+
+  filename         = data.archive_file.cloudfront_cidr_drift[0].output_path
+  function_name    = "${local.name_prefix}-cf-cidr-drift"
+  role             = aws_iam_role.cloudfront_cidr_drift[0].arn
+  handler          = "cloudfront_cidr_drift.handler"
+  source_code_hash = data.archive_file.cloudfront_cidr_drift[0].output_base64sha256
+  runtime          = "python3.12"
+  timeout          = 30
+  memory_size      = 128
+
+  environment {
+    variables = {
+      SSM_PARAMETER_NAME = aws_ssm_parameter.cloudfront_cidrs[0].name
+      ENVIRONMENT        = var.environment
+    }
+  }
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-cf-cidr-drift"
+    Component = "cloudfront"
+  })
+}
+
+# Daily EventBridge trigger
+resource "aws_cloudwatch_event_rule" "cloudfront_cidr_drift" {
+  count               = local.cf_drift_enabled ? 1 : 0
+  name                = "${local.name_prefix}-cf-cidr-drift"
+  description         = "Daily check for CloudFront origin-facing CIDR drift"
+  schedule_expression = "rate(1 day)"
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-cf-cidr-drift-rule"
+    Component = "cloudfront"
+  })
+}
+
+resource "aws_cloudwatch_event_target" "cloudfront_cidr_drift" {
+  count     = local.cf_drift_enabled ? 1 : 0
+  rule      = aws_cloudwatch_event_rule.cloudfront_cidr_drift[0].name
+  target_id = "cf-cidr-drift"
+  arn       = aws_lambda_function.cloudfront_cidr_drift[0].arn
+}
+
+resource "aws_lambda_permission" "cloudfront_cidr_drift" {
+  count         = local.cf_drift_enabled ? 1 : 0
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.cloudfront_cidr_drift[0].function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.cloudfront_cidr_drift[0].arn
+}
+
+# Alarm: fires when CIDRs are out of sync (drift metric = 1)
+resource "aws_cloudwatch_metric_alarm" "cloudfront_cidr_drift" {
+  count               = local.cf_drift_enabled ? 1 : 0
+  alarm_name          = "${local.name_prefix}-cf-cidr-drift"
+  alarm_description   = "CloudFront origin-facing CIDRs have changed — run 'terraform apply' to update trusted proxy config"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "CloudFrontCIDRDrift"
+  namespace           = "LayerV/NHP"
+  period              = 86400 # 1 day
+  statistic           = "Maximum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+  }
+
+  alarm_actions = [module.monitoring.sns_topic_arn]
+  ok_actions    = [module.monitoring.sns_topic_arn]
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-cf-cidr-drift-alarm"
+    Component = "cloudfront"
+  })
+}
+
+# Alarm: Lambda execution errors
+resource "aws_cloudwatch_metric_alarm" "cloudfront_cidr_drift_errors" {
+  count               = local.cf_drift_enabled ? 1 : 0
+  alarm_name          = "${local.name_prefix}-cf-cidr-drift-errors"
+  alarm_description   = "CloudFront CIDR drift checker Lambda errors"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    FunctionName = aws_lambda_function.cloudfront_cidr_drift[0].function_name
+  }
+
+  alarm_actions = [module.monitoring.sns_topic_arn]
+  ok_actions    = [module.monitoring.sns_topic_arn]
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-cf-cidr-drift-errors-alarm"
+    Component = "cloudfront"
+  })
 }

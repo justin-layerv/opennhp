@@ -654,6 +654,18 @@ echo "QURL plugin configured: api_url=${qurl_api_url}, allowed_domain=${qurl_all
 # - /opt/layerv/nhp-server/etc/secrets.env: Sensitive credentials (600 required)
 # ============================================================================
 
+%{ if cloudfront_cidrs_ssm_parameter != null ~}
+# Fetch CloudFront origin-facing CIDRs for trusted proxy configuration
+echo "Fetching CloudFront CIDRs from SSM..."
+CF_CIDRS=$(aws ssm get-parameter \
+  --name "${cloudfront_cidrs_ssm_parameter}" \
+  --region "$REGION" \
+  --query "Parameter.Value" --output text) || {
+  echo "FATAL: Failed to fetch CloudFront CIDRs from SSM. Server would not trust any proxies."
+  exit 1
+}
+%{ endif ~}
+
 # Non-sensitive environment variables
 cat > /opt/layerv/nhp-server/etc/env << ENVEOF
 NHP_IMAGE_TAG=$IMAGE_TAG
@@ -667,6 +679,9 @@ QURL_API_TIMEOUT=${qurl_api_timeout}
 QURL_MAX_IDLE_CONNS=${qurl_max_idle_conns}
 QURL_MAX_IDLE_CONNS_PER_HOST=${qurl_max_idle_conns_per_host}
 QURL_IDLE_CONN_TIMEOUT=${qurl_idle_conn_timeout}
+%{ endif ~}
+%{ if cloudfront_cidrs_ssm_parameter != null ~}
+NHP_TRUSTED_PROXY_CIDRS=$CF_CIDRS
 %{ endif ~}
 ENVEOF
 chmod 644 /opt/layerv/nhp-server/etc/env

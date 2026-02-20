@@ -118,6 +118,7 @@ module "nhp" {
   qurl_link_hosted_zone_id     = var.qurl_link_hosted_zone_id
   qurl_link_external_dns       = var.qurl_link_external_dns
   qurl_link_enable_access_logs = var.qurl_link_enable_access_logs
+  enable_resolve_cloudfront    = var.enable_resolve_cloudfront
 
   # QURL Router plugin
   qurl_router_enabled            = var.qurl_router_enabled

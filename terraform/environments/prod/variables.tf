@@ -473,6 +473,11 @@ variable "qurl_link_enable_access_logs" {
   default = false
 }
 
+variable "enable_resolve_cloudfront" {
+  type    = bool
+  default = false
+}
+
 variable "qurl_router_enabled" {
   type    = bool
   default = false

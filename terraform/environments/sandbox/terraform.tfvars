@@ -361,6 +361,9 @@ qurl_link_frontend_domain = "qurl.link.layerv.xyz"
 qurl_link_hosted_zone_id  = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone (same account)
 qurl_link_external_dns    = false
 
+# CloudFront for resolve.qurl.link - ISP compatibility (AT&T WiFi blocks NLB IPs)
+enable_resolve_cloudfront = true
+
 # ==============================================================================
 # QURL Router Plugin Configuration
 # Traefik plugin that routes *.qurl.site.layerv.xyz requests to target backends
