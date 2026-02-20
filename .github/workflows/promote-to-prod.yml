@@ -1020,11 +1020,38 @@ jobs:
           } >> $GITHUB_STEP_SUMMARY
 
   # =============================================================================
+  # QURL SMOKE TESTS - Comprehensive Go test suite from qurl repo
+  # =============================================================================
+  qurl-smoke-tests:
+    name: QURL Smoke Tests
+    needs: [manifest, preflight, deploy-server, deploy-ac, deploy-qurl]
+    if: |
+      always() &&
+      needs.preflight.result == 'success' &&
+      (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
+      (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
+      (needs.deploy-qurl.result == 'success' || needs.deploy-qurl.result == 'skipped') &&
+      (needs.deploy-server.result == 'success' || needs.deploy-ac.result == 'success' || needs.deploy-qurl.result == 'success')
+    uses: layervai/qurl-service/.github/workflows/smoke-tests.yml@main
+    with:
+      environment: prod
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_PROD_ROLE_ARN }}
+      REPO_TOKEN: ${{ secrets.PLUGIN_REPO_TOKEN }}
+      AUTH0_SMOKE_TEST_CLIENT_ID: ${{ secrets.AUTH0_SMOKE_TEST_CLIENT_ID }}
+      AUTH0_SMOKE_TEST_CLIENT_SECRET: ${{ secrets.AUTH0_SMOKE_TEST_CLIENT_SECRET }}
+
+  # =============================================================================
   # MONITOR - Post-deploy CloudWatch alarm watch
   # =============================================================================
   monitor:
     name: Post-Deploy Monitor
-    needs: [smoke-test]
+    needs: [smoke-test, qurl-smoke-tests]
+    if: |
+      always() &&
+      (needs.smoke-test.result == 'success' || needs.smoke-test.result == 'skipped') &&
+      (needs.qurl-smoke-tests.result == 'success' || needs.qurl-smoke-tests.result == 'skipped') &&
+      (needs.smoke-test.result == 'success' || needs.qurl-smoke-tests.result == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -1114,7 +1141,7 @@ jobs:
   finalize:
     name: Finalize
     if: always()
-    needs: [manifest, preflight, terraform-apply, deploy-server, deploy-ac, deploy-qurl, smoke-test, monitor]
+    needs: [manifest, preflight, terraform-apply, deploy-server, deploy-ac, deploy-qurl, smoke-test, qurl-smoke-tests, monitor]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -1134,11 +1161,12 @@ jobs:
           AC_RESULT: ${{ needs.deploy-ac.result }}
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
+          QURL_SMOKE_RESULT: ${{ needs.qurl-smoke-tests.result }}
           MONITOR_RESULT: ${{ needs.monitor.result }}
         run: |
           # Check if any non-skipped job failed
           FAILED=false
-          for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$AC_RESULT" "$QURL_RESULT" "$SMOKE_RESULT" "$MONITOR_RESULT"; do
+          for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$AC_RESULT" "$QURL_RESULT" "$SMOKE_RESULT" "$QURL_SMOKE_RESULT" "$MONITOR_RESULT"; do
             if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
               FAILED=true
               break
@@ -1224,6 +1252,7 @@ jobs:
           AC_RESULT: ${{ needs.deploy-ac.result }}
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
+          QURL_SMOKE_RESULT: ${{ needs.qurl-smoke-tests.result }}
           MONITOR_RESULT: ${{ needs.monitor.result }}
           ROLLBACK: ${{ inputs.rollback }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -1268,6 +1297,7 @@ jobs:
           MSG+="\n  AC:         $(result_icon "$AC_RESULT")"
           MSG+="\n  QURL:       $(result_icon "$QURL_RESULT")"
           MSG+="\n  Smoke Test: $(result_icon "$SMOKE_RESULT")"
+          MSG+="\n  QURL Smoke: $(result_icon "$QURL_SMOKE_RESULT")"
           MSG+="\n  Monitor:    $(result_icon "$MONITOR_RESULT")"
           MSG+="\n"
           MSG+="\n  Run: ${WORKFLOW_URL}"
@@ -1291,6 +1321,7 @@ jobs:
           AC_RESULT: ${{ needs.deploy-ac.result }}
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
+          QURL_SMOKE_RESULT: ${{ needs.qurl-smoke-tests.result }}
           MONITOR_RESULT: ${{ needs.monitor.result }}
           ROLLBACK: ${{ inputs.rollback }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -1328,6 +1359,7 @@ jobs:
             echo "| Deploy AC | $(result_emoji "$AC_RESULT") $AC_RESULT |"
             echo "| Deploy QURL | $(result_emoji "$QURL_RESULT") $QURL_RESULT |"
             echo "| Smoke Test | $(result_emoji "$SMOKE_RESULT") $SMOKE_RESULT |"
+            echo "| QURL Smoke Tests | $(result_emoji "$QURL_SMOKE_RESULT") $QURL_SMOKE_RESULT |"
             echo "| Monitor | $(result_emoji "$MONITOR_RESULT") $MONITOR_RESULT |"
             echo ""
             echo "### Deployed Artifacts"
