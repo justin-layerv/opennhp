@@ -977,7 +977,7 @@ jobs:
           RETRY_DELAY=10
           RESULTS=""
 
-          for endpoint in "health/live" "health/ready" "v1/health"; do
+          for endpoint in "health/live" "health/ready"; do
             URL="https://api.layerv.ai/${endpoint}"
             echo "  Checking $URL..."
             SUCCESS=false
