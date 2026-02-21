@@ -980,6 +980,11 @@ resource "aws_iam_policy" "terraform_apply_iam" {
           "securityhub:DisableSecurityHub",
           "securityhub:EnableImportFindingsForProduct",
           "securityhub:EnableSecurityHub",
+          "wafv2:CreateWebACL",
+          "wafv2:DeleteWebACL",
+          "wafv2:UpdateWebACL",
+          "wafv2:PutLoggingConfiguration",
+          "wafv2:DeleteLoggingConfiguration",
           "wafv2:TagResource",
           "wafv2:UntagResource"
         ]
