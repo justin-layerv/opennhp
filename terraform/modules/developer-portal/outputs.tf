@@ -1,0 +1,46 @@
+# Developer Portal Module Outputs
+
+output "api_url" {
+  description = "API Gateway invoke URL"
+  value       = aws_apigatewayv2_stage.default.invoke_url
+}
+
+output "api_id" {
+  description = "API Gateway HTTP API ID"
+  value       = aws_apigatewayv2_api.developer_portal.id
+}
+
+output "playground_lambda_function_name" {
+  description = "Playground proxy Lambda function name"
+  value       = aws_lambda_function.playground.function_name
+}
+
+output "credentials_lambda_function_name" {
+  description = "Credential provisioner Lambda function name"
+  value       = aws_lambda_function.credentials.function_name
+}
+
+output "credentials_table_name" {
+  description = "DynamoDB credentials table name"
+  value       = aws_dynamodb_table.credentials.name
+}
+
+output "credentials_table_arn" {
+  description = "DynamoDB credentials table ARN"
+  value       = aws_dynamodb_table.credentials.arn
+}
+
+output "rate_limits_table_name" {
+  description = "DynamoDB rate limits table name"
+  value       = aws_dynamodb_table.rate_limits.name
+}
+
+output "rate_limits_table_arn" {
+  description = "DynamoDB rate limits table ARN"
+  value       = aws_dynamodb_table.rate_limits.arn
+}
+
+output "custom_domain_url" {
+  description = "Custom domain URL for the developer portal API (null if no custom domain configured)"
+  value       = local.has_custom_domain ? "https://${var.custom_domain}" : null
+}

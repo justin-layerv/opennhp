@@ -1287,6 +1287,37 @@ resource "aws_iam_role_policy" "ci_cross_account_cost_analytics" {
   })
 }
 
+# ==================== Developer Portal ====================
+# Playground proxy and credential provisioner for the developer experience.
+# Separate HTTP API with Lambda backends, DynamoDB tables, and CORS.
+
+module "developer_portal" {
+  count  = var.deploy_developer_portal ? 1 : 0
+  source = "./modules/developer-portal"
+
+  environment = var.environment
+  name_prefix = local.name_prefix
+  tags        = merge(local.common_tags, { Service = "developer-portal" })
+
+  logs_kms_key_arn     = module.kms.logs_key_arn
+  dynamodb_kms_key_arn = module.kms.secrets_key_arn
+
+  playground_m2m_secret_name = var.developer_portal_m2m_secret_name
+  auth0_mgmt_secret_name     = var.developer_portal_auth0_mgmt_secret_name
+
+  qurl_api_url      = "https://${var.qurl_service_domain}"
+  auth0_domain      = var.developer_portal_auth0_domain
+  qurl_api_audience = var.developer_portal_qurl_api_audience
+
+  from_email   = var.developer_portal_from_email
+  notify_email = var.developer_portal_notify_email
+  site_url     = var.developer_portal_site_url
+  verify_url   = var.developer_portal_verify_url
+
+  allowed_origins = var.developer_portal_allowed_origins
+  sns_topic_arn   = module.monitoring.sns_topic_arn
+}
+
 # ==================== Grafana Cloud Dashboards ====================
 # Provisions QURL dashboards to Grafana Cloud
 # Requires a Grafana Cloud API key with Editor permissions

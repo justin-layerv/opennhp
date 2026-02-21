@@ -273,6 +273,12 @@ grafana_athena_config = {
   region          = "us-east-1"
 }
 
+# ==============================================================================
+# Developer Portal Configuration
+# Disabled in prod until sandbox is validated. Enable and set values when ready.
+# ==============================================================================
+deploy_developer_portal = false
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"

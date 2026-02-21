@@ -401,6 +401,21 @@ deploy_status_page         = true
 status_page_domain         = "status.layerv.xyz"
 status_page_hosted_zone_id = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone
 
+# ==============================================================================
+# Developer Portal Configuration
+# Playground proxy and credential provisioner for developer experience
+# ==============================================================================
+deploy_developer_portal                 = true
+developer_portal_m2m_secret_name        = "layerv-nhp-sandbox/developer-portal/playground-m2m"
+developer_portal_auth0_mgmt_secret_name = "layerv-nhp-sandbox/developer-portal/auth0-mgmt"
+developer_portal_auth0_domain           = "auth.layerv.ai"
+developer_portal_qurl_api_audience      = "https://api.layerv.xyz"
+developer_portal_from_email             = "noreply@layerv.ai"
+developer_portal_notify_email           = "team@layerv.ai"
+developer_portal_site_url               = "https://staging.layerv.ai"
+developer_portal_verify_url             = "https://staging.layerv.ai/qurl/keys"
+developer_portal_allowed_origins        = ["https://staging.layerv.ai"]
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"

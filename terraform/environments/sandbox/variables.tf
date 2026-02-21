@@ -1368,3 +1368,64 @@ variable "status_page_hosted_zone_id" {
     error_message = "status_page_hosted_zone_id must be a valid Route53 zone ID (starts with Z)"
   }
 }
+
+# Developer Portal
+variable "deploy_developer_portal" {
+  description = "Deploy developer portal infrastructure (playground proxy + credential provisioner)"
+  type        = bool
+  default     = false
+}
+
+variable "developer_portal_m2m_secret_name" {
+  description = "Secrets Manager secret name for playground M2M credentials"
+  type        = string
+  default     = null
+}
+
+variable "developer_portal_auth0_mgmt_secret_name" {
+  description = "Secrets Manager secret name for Auth0 management API credentials"
+  type        = string
+  default     = null
+}
+
+variable "developer_portal_auth0_domain" {
+  description = "Auth0 domain for developer portal"
+  type        = string
+  default     = null
+}
+
+variable "developer_portal_qurl_api_audience" {
+  description = "Auth0 API audience identifier for QURL API"
+  type        = string
+  default     = null
+}
+
+variable "developer_portal_from_email" {
+  description = "SES verified sender email for developer portal notifications"
+  type        = string
+  default     = null
+}
+
+variable "developer_portal_notify_email" {
+  description = "Email to receive developer portal admin notifications"
+  type        = string
+  default     = null
+}
+
+variable "developer_portal_site_url" {
+  description = "Website URL for developer portal"
+  type        = string
+  default     = null
+}
+
+variable "developer_portal_verify_url" {
+  description = "Email verification URL for API keys page"
+  type        = string
+  default     = null
+}
+
+variable "developer_portal_allowed_origins" {
+  description = "CORS allowed origins for developer portal API"
+  type        = list(string)
+  default     = []
+}
