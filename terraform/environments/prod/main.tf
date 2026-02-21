@@ -295,6 +295,7 @@ module "nhp" {
   # Cost analytics
   deploy_cost_analytics                 = var.deploy_cost_analytics
   cross_account_cost_analytics_role_arn = var.cross_account_cost_analytics_role_arn
+  grafana_athena_config                 = var.grafana_athena_config
 }
 
 # ==============================================================================

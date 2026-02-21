@@ -1569,6 +1569,22 @@ variable "cross_account_cost_analytics_role_arn" {
   default     = null
 }
 
+variable "grafana_athena_config" {
+  description = "Direct Athena config for cost dashboard when cost_analytics module is not deployed. Allows environments to share a single cost_analytics backend."
+  type = object({
+    assume_role_arn = string
+    workgroup       = string
+    database        = string
+    region          = optional(string, "us-east-1")
+  })
+  default = null
+
+  validation {
+    condition     = !(var.grafana_athena_config != null && var.deploy_cost_analytics)
+    error_message = "grafana_athena_config and deploy_cost_analytics are mutually exclusive. Use deploy_cost_analytics when this environment owns the cost_analytics backend, or grafana_athena_config to point to another environment's backend."
+  }
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {

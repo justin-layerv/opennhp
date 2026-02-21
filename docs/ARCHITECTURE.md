@@ -1999,6 +1999,27 @@ The system publishes metrics to CloudWatch under the `LayerV/NHP` namespace from
 
 Grafana dashboards consume these metrics via a CloudWatch datasource. See `docs/grafana-dashboard-improvements.md` for the phased dashboard improvement plan and `terraform/modules/grafana-dashboards/` for dashboard JSON definitions.
 
+### Cost Analytics (Shared Athena Backend)
+
+AWS cost data flows through a single pipeline deployed by **sandbox only**:
+
+```
+AWS Data Export (CUR 2.0) → S3 (mgmt account) → Glue Catalog → Athena → Grafana Dashboard
+```
+
+The backend infrastructure (S3 bucket, Glue database, Athena workgroup, IAM roles) lives in the mgmt account (`165115313779`) and is deployed by sandbox's `cost_analytics` module (`terraform/modules/cost-analytics/`). Only one environment deploys this to avoid duplicate resources in the shared mgmt account.
+
+**How each environment connects to Grafana:**
+
+| Environment | `deploy_cost_analytics` | Athena config source | Dashboard? |
+|-------------|------------------------|---------------------|------------|
+| Sandbox | `true` | Module outputs (automatic) | No (`grafana_create_dashboards = false`) |
+| Prod | `false` | `grafana_athena_config` (manual) | Yes (`grafana_create_dashboards = true`) |
+
+Prod uses `grafana_athena_config` in `terraform.tfvars` to specify Athena connection details directly, pointing to the same resources sandbox deployed. These values are derived from the `cost_analytics` module outputs — if sandbox's config changes (e.g., `name_prefix`), prod's `grafana_athena_config` must be updated to match.
+
+The two variables are mutually exclusive: setting both `deploy_cost_analytics = true` and `grafana_athena_config` will fail validation.
+
 ---
 
 ## Debugging & Operations

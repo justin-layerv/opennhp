@@ -959,6 +959,17 @@ variable "deploy_cost_analytics" {
   default     = true
 }
 
+variable "grafana_athena_config" {
+  description = "Direct Athena config for cost dashboard when cost_analytics module is not deployed. Allows environments to share a single cost_analytics backend."
+  type = object({
+    assume_role_arn = string
+    workgroup       = string
+    database        = string
+    region          = optional(string, "us-east-1")
+  })
+  default = null
+}
+
 variable "grafana_prometheus_datasource_uid" {
   description = "UID of the Prometheus/Mimir datasource in Grafana Cloud"
   type        = string

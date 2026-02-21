@@ -333,6 +333,9 @@ grafana_cloud_external_id    = ""
 # Don't create dashboards from sandbox (prod owns them)
 grafana_create_dashboards = false
 
+# Cost analytics: sandbox deploys the shared backend (S3, Glue, Athena) in mgmt account
+deploy_cost_analytics = true
+
 # ==============================================================================
 # QURL Plugin Configuration (NHP Server)
 # Enables qurl.link.layerv.xyz → qurl.site.layerv.xyz authentication flow in NHP Server

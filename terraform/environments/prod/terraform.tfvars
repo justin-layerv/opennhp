@@ -263,6 +263,16 @@ deploy_redis = true
 deploy_cost_analytics                 = false
 cross_account_cost_analytics_role_arn = "arn:aws:iam::165115313779:role/nhp-cost-analytics-access"
 
+# Athena config for Grafana cost dashboard — points to sandbox-deployed resources in mgmt account.
+# These values come from sandbox's cost_analytics module outputs (terraform/modules/cost-analytics/outputs.tf).
+# If sandbox's cost_analytics config changes (name_prefix, region, etc.), update these values to match.
+grafana_athena_config = {
+  assume_role_arn = "arn:aws:iam::165115313779:role/layerv-nhp-mgmt-grafana-athena"
+  workgroup       = "layerv-nhp-mgmt-cost-analytics"
+  database        = "layerv_nhp_mgmt_cost"
+  region          = "us-east-1"
+}
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"

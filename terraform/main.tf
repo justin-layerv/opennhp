@@ -1291,6 +1291,14 @@ resource "aws_iam_role_policy" "ci_cross_account_cost_analytics" {
 # Provisions QURL dashboards to Grafana Cloud
 # Requires a Grafana Cloud API key with Editor permissions
 
+locals {
+  grafana_athena_enabled   = var.deploy_cost_analytics || var.grafana_athena_config != null
+  grafana_athena_role_arn  = var.deploy_cost_analytics ? module.cost_analytics[0].grafana_athena_role_arn : (var.grafana_athena_config != null ? var.grafana_athena_config.assume_role_arn : "")
+  grafana_athena_workgroup = var.deploy_cost_analytics ? module.cost_analytics[0].athena_workgroup_name : (var.grafana_athena_config != null ? var.grafana_athena_config.workgroup : "")
+  grafana_athena_database  = var.deploy_cost_analytics ? module.cost_analytics[0].glue_database_name : (var.grafana_athena_config != null ? var.grafana_athena_config.database : "")
+  grafana_athena_region    = var.deploy_cost_analytics ? module.cost_analytics[0].athena_region : (var.grafana_athena_config != null ? var.grafana_athena_config.region : "us-east-1")
+}
+
 module "grafana_dashboards" {
   source = "./modules/grafana-dashboards"
   count  = var.grafana_dashboards_enabled ? 1 : 0
@@ -1313,11 +1321,11 @@ module "grafana_dashboards" {
   grafana_cloud_external_id     = var.grafana_cloud_external_id
 
   # Athena data source for AWS Cost dashboard
-  athena_datasource_enabled = var.deploy_cost_analytics
-  athena_assume_role_arn    = var.deploy_cost_analytics ? module.cost_analytics[0].grafana_athena_role_arn : ""
-  athena_workgroup          = var.deploy_cost_analytics ? module.cost_analytics[0].athena_workgroup_name : ""
-  athena_database           = var.deploy_cost_analytics ? module.cost_analytics[0].glue_database_name : ""
-  athena_region             = var.deploy_cost_analytics ? module.cost_analytics[0].athena_region : "us-east-1"
+  athena_datasource_enabled = local.grafana_athena_enabled
+  athena_assume_role_arn    = local.grafana_athena_role_arn
+  athena_workgroup          = local.grafana_athena_workgroup
+  athena_database           = local.grafana_athena_database
+  athena_region             = local.grafana_athena_region
 
   tags = local.common_tags
 }
