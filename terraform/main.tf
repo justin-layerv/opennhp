@@ -1287,6 +1287,47 @@ resource "aws_iam_role_policy" "ci_cross_account_cost_analytics" {
   })
 }
 
+# ==================== API Gateway Account Logging ====================
+# Singleton per-region, per-account resource. API Gateway (v1 and v2) requires
+# an account-level CloudWatch Logs role to write access logs. Managed here at
+# root level so it's instantiated exactly once regardless of which modules need
+# API Gateway access logging.
+
+resource "aws_api_gateway_account" "this" {
+  count               = var.deploy_developer_portal ? 1 : 0
+  cloudwatch_role_arn = aws_iam_role.apigateway_logging[0].arn
+}
+
+resource "aws_iam_role" "apigateway_logging" {
+  count = var.deploy_developer_portal ? 1 : 0
+  name  = "${local.name_prefix}-apigateway-logging"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "apigateway.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-apigateway-logging"
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "apigateway_logging" {
+  count      = var.deploy_developer_portal ? 1 : 0
+  role       = aws_iam_role.apigateway_logging[0].name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
 # ==================== Developer Portal ====================
 # Playground proxy and credential provisioner for the developer experience.
 # Separate HTTP API with Lambda backends, DynamoDB tables, and CORS.
@@ -1294,6 +1335,10 @@ resource "aws_iam_role_policy" "ci_cross_account_cost_analytics" {
 module "developer_portal" {
   count  = var.deploy_developer_portal ? 1 : 0
   source = "./modules/developer-portal"
+
+  # Ensure the account-level API GW logging role exists before the module
+  # creates a stage with access_log_settings.
+  depends_on = [aws_api_gateway_account.this]
 
   environment = var.environment
   name_prefix = local.name_prefix
