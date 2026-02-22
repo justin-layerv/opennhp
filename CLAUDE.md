@@ -232,6 +232,19 @@ gh run watch
 gh pr create --title "feat(scope): description" --body "..."
 ```
 
+### Deployment
+
+```bash
+# Trigger production deployment (interactive — reads state, validates, confirms)
+./scripts/trigger-prod-deploy.sh
+
+# Dry-run: show what would be deployed without prompting
+./scripts/trigger-prod-deploy.sh --dry-run
+
+# Machine-readable JSON output for tooling
+./scripts/trigger-prod-deploy.sh --json
+```
+
 ## Key Ports
 
 | Port | Protocol | Component | Purpose |

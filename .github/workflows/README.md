@@ -8,6 +8,8 @@ Triggered on every push to `main` with app or infra changes. Builds Docker image
 
 ### `promote-to-prod.yml` — Promote to Production
 
+> **Preferred method:** Use `./scripts/trigger-prod-deploy.sh` instead of running `gh workflow run` manually. The script reads SSM state from both accounts, validates sandbox health, auto-detects which components changed, and generates the correct command. Run with `--dry-run` to preview without executing.
+
 **Manual workflow** for promoting existing sandbox ECR images to production. No rebuild — uses images already built and validated in sandbox. Orchestrates deployment through canary (server/AC) and ECS task def registration (QURL).
 
 **Components deployed:**
@@ -35,7 +37,22 @@ manifest ──→ preflight (approval) ──→ terraform ──→ server ─
 - **Smoke tests** — Infrastructure validation + QURL health/readiness/API checks
 - **Tracking** — SSM deployed-commit/deployed-at, CloudWatch deployment metrics, SNS notifications
 
-#### First-time deployment (new infrastructure)
+#### Standard deployment
+
+```bash
+# Recommended: auto-detects components, validates health, confirms before executing
+./scripts/trigger-prod-deploy.sh
+
+# Preview what would be deployed without executing
+./scripts/trigger-prod-deploy.sh --dry-run
+```
+
+#### Manual deployment (fallback)
+
+<details>
+<summary>Raw <code>gh workflow run</code> commands (use trigger-prod-deploy.sh instead)</summary>
+
+##### First-time deployment (new infrastructure)
 
 ```bash
 gh workflow run promote-to-prod.yml --ref main \
@@ -45,7 +62,7 @@ gh workflow run promote-to-prod.yml --ref main \
 
 `run_terraform=true` runs `terraform apply` to create VPC, NLBs, ASGs, ECS, DynamoDB, etc.
 
-#### Subsequent deployments (image update only)
+##### Subsequent deployments (image update only)
 
 ```bash
 gh workflow run promote-to-prod.yml --ref main \
@@ -53,7 +70,7 @@ gh workflow run promote-to-prod.yml --ref main \
   -f run_terraform=false
 ```
 
-#### Deploy only QURL service
+##### Deploy only QURL service
 
 ```bash
 gh workflow run promote-to-prod.yml --ref main \
@@ -66,6 +83,8 @@ gh workflow run promote-to-prod.yml --ref main \
 ```
 
 If `qurl_image_tag` is omitted, the workflow reads the current tag from sandbox SSM.
+
+</details>
 
 #### Rollback (automatic)
 
