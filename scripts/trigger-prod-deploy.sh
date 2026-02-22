@@ -159,7 +159,7 @@ audit_log() {
     local action="$1" extra="${2:-}"
     local ts entry
     ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    entry="${ts} | ${action} | operator=$(get_operator) | sandbox=${SANDBOX_COMMIT:-unknown} | prod=${PROD_COMMIT:-unknown}"
+    entry="${ts} | ${action} | operator=$(get_operator) | sandbox=${SANDBOX_COMMIT:-unknown} | image_tag=${PROMOTION_TAG:-unknown} | prod=${PROD_COMMIT:-unknown}"
     if [[ -n "$extra" ]]; then
         entry="${entry} | ${extra}"
     fi
@@ -177,24 +177,25 @@ echo "  =============================================="
 
 header "PREFLIGHT"
 
-# Check 1: AWS sandbox credentials
-if AWS_PROFILE=layerv aws sts get-caller-identity --region "$REGION" --no-cli-pager &>/dev/null; then
-    SANDBOX_ACCOUNT=$(AWS_PROFILE=layerv aws sts get-caller-identity --query Account --output text --region "$REGION" --no-cli-pager)
+# Check 1: AWS sandbox credentials (single call — cache output)
+if STS_SANDBOX=$(AWS_PROFILE=layerv aws sts get-caller-identity --region "$REGION" --no-cli-pager --output json 2>&1); then
+    SANDBOX_ACCOUNT=$(echo "$STS_SANDBOX" | jq -r '.Account')
     pass "AWS sandbox credentials valid (account: $SANDBOX_ACCOUNT)"
 else
     fail "Cannot access sandbox AWS account. Configure AWS_PROFILE=layerv."
 fi
 
-# Check 2: AWS prod credentials
-if AWS_PROFILE=layerv-prod aws sts get-caller-identity --region "$REGION" --no-cli-pager &>/dev/null; then
-    PROD_ACCOUNT=$(AWS_PROFILE=layerv-prod aws sts get-caller-identity --query Account --output text --region "$REGION" --no-cli-pager)
+# Check 2: AWS prod credentials (single call — cache output)
+if STS_PROD=$(AWS_PROFILE=layerv-prod aws sts get-caller-identity --region "$REGION" --no-cli-pager --output json 2>&1); then
+    PROD_ACCOUNT=$(echo "$STS_PROD" | jq -r '.Account')
     pass "AWS prod credentials valid (account: $PROD_ACCOUNT)"
 else
     fail "Cannot access prod AWS account. Configure AWS_PROFILE=layerv-prod."
 fi
 
-# Check 3: GitHub CLI
-if gh auth status &>/dev/null; then
+# Check 3: GitHub CLI (gh auth status exits non-zero if ANY account has issues,
+# even if the active account is fine — so check the active account specifically)
+if gh auth token &>/dev/null; then
     pass "GitHub CLI authenticated"
 else
     fail "GitHub CLI not authenticated. Run: gh auth login"
@@ -283,9 +284,11 @@ if [[ "$PROD_COMMIT" != "(not set)" && ! "$PROD_COMMIT" =~ ^[a-f0-9]{7,40}$ ]]; 
     exit 1
 fi
 
-# Early exit: sandbox and prod already at the same commit
-if [[ "$SANDBOX_COMMIT" == "$PROD_COMMIT" && -n "$SANDBOX_COMMIT" ]]; then
-    info "Sandbox and prod at same commit (${SANDBOX_COMMIT:0:7}). Nothing to deploy."
+# Early exit: sandbox and prod already at the same commit AND same image tags
+if [[ "$SANDBOX_COMMIT" == "$PROD_COMMIT" && -n "$SANDBOX_COMMIT" \
+    && "$SANDBOX_SERVER_TAG" == "$PROD_SERVER_TAG" \
+    && "$SANDBOX_AC_TAG" == "$PROD_AC_TAG" ]]; then
+    info "Sandbox and prod at same commit (${SANDBOX_COMMIT:0:7}) with matching image tags. Nothing to deploy."
     exit 0
 fi
 
@@ -302,9 +305,22 @@ else
     pass "Prod not in deployment lock (state='${PROD_STATE}')"
 fi
 
+# Warn if last prod deployment failed — environment may be partially broken
+if [[ "$PROD_STATE" == "failed" ]]; then
+    msg="Last prod deployment failed. Deploying on top of a potentially broken environment."
+    warn "$msg"
+    WARNINGS+=("$msg")
+fi
+
 # Check: Sandbox deploy state
+# Note: /sandbox/nhp/deploy/state may not exist if the build-and-push workflow
+# doesn't set it. Infer "deployed" from the presence of deployed-commit/deployed-at.
 if [[ "$SANDBOX_STATE" == "deployed" ]]; then
     pass "Sandbox in expected state ('deployed')"
+elif [[ "$SANDBOX_STATE" == "(not set)" && -n "$SANDBOX_COMMIT" && "$SANDBOX_DEPLOYED_AT" != "(not set)" ]]; then
+    pass "Sandbox deploy state inferred as 'deployed' (state param not set, but deployed-commit exists)"
+elif [[ "$SANDBOX_STATE" == "deploying" ]]; then
+    fail "Sandbox deployment in progress (state='deploying'). Wait for it to finish."
 else
     fail "Sandbox is in state '${SANDBOX_STATE}'. Fix sandbox before promoting."
 fi
@@ -323,46 +339,107 @@ fi
 
 header "SANDBOX HEALTH"
 
-# Check: Last sandbox CI was green
-LAST_CI=$(gh run list --workflow=deploy-to-sandbox.yml --branch main --limit 1 --json databaseId,conclusion --jq '.[0]' 2>/dev/null || echo "")
-if [[ -n "$LAST_CI" ]]; then
-    CI_CONCLUSION=$(echo "$LAST_CI" | jq -r '.conclusion // "unknown"')
-    CI_ID=$(echo "$LAST_CI" | jq -r '.databaseId // "?"')
-    if [[ "$CI_CONCLUSION" == "success" ]]; then
-        pass "Last sandbox CI run: success (#${CI_ID})"
+# Determine PROMOTION_TAG first — needed by the CI check below.
+# The promote-to-prod workflow uses a SINGLE image_tag for both server and AC
+# ECR lookups. If the tags diverge, the workflow will fail for one component.
+if [[ "$SANDBOX_SERVER_TAG" != "(not set)" && "$SANDBOX_AC_TAG" != "(not set)" \
+    && "$SANDBOX_SERVER_TAG" != "$SANDBOX_AC_TAG" ]]; then
+    fail "Server tag (${SANDBOX_SERVER_TAG:0:7}) != AC tag (${SANDBOX_AC_TAG:0:7}). Cannot use single image_tag for both."
+    echo -e "  ${RED}Fix: re-deploy sandbox to bring server/AC tags back in sync.${NC}"
+    exit 1
+fi
+
+# Use the server image tag (from SSM) since that reflects what's actually in ECR.
+# deployed-commit can diverge from image tags when builds skip image creation
+# (e.g., terraform-only or CI-only commits).
+PROMOTION_TAG="$SANDBOX_SERVER_TAG"
+
+# Validate image tag format (same SHA check as deployed-commit)
+if [[ ! "$PROMOTION_TAG" =~ ^[a-f0-9]{7,40}$ ]]; then
+    fail "Server image tag '${PROMOTION_TAG}' is not a valid git SHA. SSM parameter may be corrupted."
+    exit 1
+fi
+
+# Check: CI status for the images we're promoting
+# Look for the build that produced PROMOTION_TAG, not just the latest run.
+# The latest run may have failed on terraform while our images are from
+# an earlier successful build.
+IMAGE_CI=$(gh run list --workflow=build-and-push.yml --branch main --limit 10 --json databaseId,conclusion,headSha 2>/dev/null || echo "[]")
+if [[ -n "$IMAGE_CI" && "$IMAGE_CI" != "[]" ]]; then
+    # Find the run that matches our image tag (PROMOTION_TAG = commit SHA)
+    MATCHING_RUN=$(echo "$IMAGE_CI" | jq -r --arg sha "$PROMOTION_TAG" '[.[] | select(.headSha | startswith($sha))][0] // empty' 2>/dev/null || echo "")
+    LATEST_RUN=$(echo "$IMAGE_CI" | jq -r '.[0]' 2>/dev/null || echo "")
+
+    if [[ -n "$MATCHING_RUN" ]]; then
+        # Found the exact build that produced our images
+        IMG_CI_CONCLUSION=$(echo "$MATCHING_RUN" | jq -r '.conclusion // "unknown"')
+        IMG_CI_ID=$(echo "$MATCHING_RUN" | jq -r '.databaseId // "?"')
+        if [[ "$IMG_CI_CONCLUSION" == "success" ]]; then
+            pass "CI run for image ${PROMOTION_TAG:0:7}: success (#${IMG_CI_ID})"
+        else
+            fail "CI run for image ${PROMOTION_TAG:0:7}: ${IMG_CI_CONCLUSION} (#${IMG_CI_ID}). Images may be from a failed build."
+        fi
     else
-        fail "Last sandbox CI run: ${CI_CONCLUSION} (#${CI_ID}). Fix sandbox first."
+        # Image build is older than last 10 runs — fall back to latest run check
+        warn "Could not find CI run for image ${PROMOTION_TAG:0:7} in recent history"
+    fi
+
+    # Also check the latest run — warn if it failed (indicates sandbox issues)
+    LATEST_CONCLUSION=$(echo "$LATEST_RUN" | jq -r '.conclusion // ""')
+    LATEST_ID=$(echo "$LATEST_RUN" | jq -r '.databaseId // "?"')
+    if [[ "$LATEST_CONCLUSION" == "failure" ]]; then
+        msg="Latest sandbox CI run failed (#${LATEST_ID}) — may indicate infrastructure issues"
+        warn "$msg"
+        WARNINGS+=("$msg")
+    elif [[ "$LATEST_CONCLUSION" == "" ]]; then
+        msg="Latest sandbox CI run still in progress (#${LATEST_ID})"
+        warn "$msg"
+        WARNINGS+=("$msg")
     fi
 else
     warn "Could not check sandbox CI status"
 fi
 
 # Check: Soak time >= 30 minutes
-SOAK_MINUTES=$(minutes_since "$SANDBOX_DEPLOYED_AT")
-if (( SOAK_MINUTES < 30 )); then
-    fail "Sandbox deployed only ${SOAK_MINUTES}m ago. Minimum 30m soak required."
+# SOAK_MINUTES is reused later for the 48h staleness warning
+SOAK_MINUTES=0
+if [[ "$SANDBOX_DEPLOYED_AT" == "(not set)" ]]; then
+    warn "Sandbox deployed-at timestamp not set — cannot verify soak time"
+    WARNINGS+=("Sandbox soak time unknown (deployed-at not set)")
 else
-    pass "Sandbox soak time: $(time_ago "$SANDBOX_DEPLOYED_AT") (min: 30m)"
+    SOAK_MINUTES=$(minutes_since "$SANDBOX_DEPLOYED_AT")
+    if (( SOAK_MINUTES < 30 )); then
+        fail "Sandbox deployed only ${SOAK_MINUTES}m ago. Minimum 30m soak required."
+    else
+        pass "Sandbox soak time: $(time_ago "$SANDBOX_DEPLOYED_AT") (min: 30m)"
+    fi
 fi
 
 # Check: Server image exists in ECR
-if AWS_PROFILE=layerv aws ecr describe-images \
+# Use the actual image tag from SSM (not deployed-commit) — the build-and-push
+# workflow updates deployed-commit even for terraform-only changes that don't
+# build images, so deployed-commit may have no corresponding ECR image.
+if [[ "$SANDBOX_SERVER_TAG" == "(not set)" ]]; then
+    fail "Sandbox server image tag not set in SSM (${SSM_SANDBOX_SERVER_TAG})."
+elif AWS_PROFILE=layerv aws ecr describe-images \
     --repository-name layerv/nhp-server \
-    --image-ids imageTag="${SANDBOX_COMMIT}" \
+    --image-ids imageTag="${SANDBOX_SERVER_TAG}" \
     --region "$REGION" --no-cli-pager &>/dev/null; then
-    pass "Server image ${SANDBOX_COMMIT:0:7} exists in ECR"
+    pass "Server image ${SANDBOX_SERVER_TAG:0:7} exists in ECR"
 else
-    fail "Server image ${SANDBOX_COMMIT} not found in ECR."
+    fail "Server image ${SANDBOX_SERVER_TAG} not found in ECR."
 fi
 
 # Check: AC image exists in ECR
-if AWS_PROFILE=layerv aws ecr describe-images \
+if [[ "$SANDBOX_AC_TAG" == "(not set)" ]]; then
+    fail "Sandbox AC image tag not set in SSM (${SSM_SANDBOX_AC_TAG})."
+elif AWS_PROFILE=layerv aws ecr describe-images \
     --repository-name layerv/nhp-ac \
-    --image-ids imageTag="${SANDBOX_COMMIT}" \
+    --image-ids imageTag="${SANDBOX_AC_TAG}" \
     --region "$REGION" --no-cli-pager &>/dev/null; then
-    pass "AC image ${SANDBOX_COMMIT:0:7} exists in ECR"
+    pass "AC image ${SANDBOX_AC_TAG:0:7} exists in ECR"
 else
-    fail "AC image ${SANDBOX_COMMIT} not found in ECR."
+    fail "AC image ${SANDBOX_AC_TAG} not found in ECR."
 fi
 
 # Hard exit if any deployment state or health checks failed
@@ -370,6 +447,13 @@ if [[ "$PREFLIGHT_FAILED" -ne 0 ]]; then
     echo ""
     echo -e "  ${RED}Deployment checks failed. Fix the above issues and retry.${NC}"
     exit 1
+fi
+
+# Emit promotion tag warning after all hard checks pass
+if [[ "$SANDBOX_SERVER_TAG" != "$SANDBOX_COMMIT" ]]; then
+    msg="Image tag (${SANDBOX_SERVER_TAG:0:7}) differs from deployed-commit (${SANDBOX_COMMIT:0:7}) — using image tag for promotion"
+    warn "$msg"
+    WARNINGS+=("$msg")
 fi
 
 # =============================================================================
@@ -387,7 +471,7 @@ if [[ -n "$MAIN_HEAD" && "${SANDBOX_COMMIT:0:7}" != "$MAIN_HEAD" ]]; then
     fi
 fi
 
-# Sandbox age > 48h
+# Sandbox age > 48h (reuse SOAK_MINUTES from earlier)
 if (( SOAK_MINUTES > 2880 )); then
     msg="Sandbox deployed $(time_ago "$SANDBOX_DEPLOYED_AT"). Consider re-deploying sandbox with latest main."
     warn "$msg"
@@ -427,31 +511,46 @@ if [[ "$FIRST_DEPLOY" == "true" ]]; then
     TF_REASON="first prod deployment"
     QURL_REASON="first prod deployment"
 else
-    # Get changed files between prod and sandbox commits
-    if ! CHANGED_FILES=$(git diff --name-only "${PROD_COMMIT}..${SANDBOX_COMMIT}" 2>&1); then
-        warn "Git history too shallow for diff. Run: git fetch --unshallow"
-        warn "Deploying all components as fallback."
+    # Server/AC: always deployed together — they share Go modules (nhp/, endpoints/)
+    # and are built from the same commit. Compare image tags directly rather than
+    # git diff, since deployed-commit can diverge from image tags.
+    if [[ "$PROMOTION_TAG" != "$PROD_SERVER_TAG" ]]; then
         deploy_server=true
         deploy_ac=true
-        run_terraform=true
-        SERVER_REASON="git diff failed (shallow clone?)"
-        AC_REASON="git diff failed (shallow clone?)"
-        TF_REASON="git diff failed (shallow clone?)"
-    else
-        # NHP Server + AC (always together — shared Go modules)
-        if echo "$CHANGED_FILES" | grep -qE '^(nhp/|endpoints/|docker/|examples/|\.github/workflows/)'; then
+        SERVER_REASON="image tag changed: ${PROD_SERVER_TAG:0:7} → ${PROMOTION_TAG:0:7}"
+        AC_REASON="image tag changed: ${PROD_AC_TAG:0:7} → ${PROMOTION_TAG:0:7}"
+    fi
+
+    # Terraform: use full commit range (terraform runs from main HEAD, not from image tag)
+    if ! CHANGED_FILES=$(git diff --name-only "${PROD_COMMIT}..${SANDBOX_COMMIT}" 2>&1); then
+        warn "Git history too shallow for diff. Run: git fetch --unshallow"
+        if [[ "$deploy_server" == "false" ]]; then
+            warn "Deploying all components as fallback."
             deploy_server=true
             deploy_ac=true
-            # Collect which paths matched for the reason string
-            MATCHED_PATHS=$(echo "$CHANGED_FILES" | grep -oE '^(nhp|endpoints|docker|examples|\.github/workflows)/' | sort -u | tr '\n' ', ' | sed 's/,$//')
-            SERVER_REASON="code changes in ${MATCHED_PATHS}"
-            AC_REASON="code changes in ${MATCHED_PATHS}"
+            SERVER_REASON="git diff failed (shallow clone?)"
+            AC_REASON="git diff failed (shallow clone?)"
         fi
+        run_terraform=true
+        TF_REASON="git diff failed (shallow clone?)"
+    else
 
         # Terraform
         if echo "$CHANGED_FILES" | grep -qE '^terraform/'; then
             run_terraform=true
             TF_REASON="changes in terraform/"
+
+            # Warn if terraform changes exist beyond what was in the image-producing build.
+            # This means terraform changes were introduced after the last image build and
+            # may not have been successfully applied to sandbox yet.
+            if [[ "$PROMOTION_TAG" != "$SANDBOX_COMMIT" ]]; then
+                TF_UNCOMMITTED=$(git diff --name-only "${PROMOTION_TAG}..${SANDBOX_COMMIT}" 2>/dev/null | grep -c '^terraform/' || echo "0")
+                if (( TF_UNCOMMITTED > 0 )); then
+                    msg="Terraform has ${TF_UNCOMMITTED} file(s) changed after image build (${PROMOTION_TAG:0:7}..${SANDBOX_COMMIT:0:7}). These may not be validated in sandbox."
+                    warn "$msg"
+                    WARNINGS+=("$msg")
+                fi
+            fi
         fi
     fi
 
@@ -512,8 +611,9 @@ if [[ "$QURL_TAG_FOR_COMMAND" == "(not set)" ]]; then
 fi
 
 # Build the gh workflow run command as an array (avoids eval)
+# Uses PROMOTION_TAG (actual ECR image tag) not SANDBOX_COMMIT (which may lack images)
 GH_CMD=(gh workflow run promote-to-prod.yml --ref main
-    -f "image_tag=${SANDBOX_COMMIT}"
+    -f "image_tag=${PROMOTION_TAG}"
     -f "deploy_server=${deploy_server}" -f "deploy_ac=${deploy_ac}"
     -f "deploy_qurl=${deploy_qurl}" -f "run_terraform=${run_terraform}"
 )
@@ -561,7 +661,7 @@ if [[ "$MODE" == "json" ]]; then
         --argjson deploy_qurl "$deploy_qurl" \
         --argjson run_terraform "$run_terraform" \
         --arg command "$GH_COMMAND" \
-        --arg image_tag "$SANDBOX_COMMIT" \
+        --arg image_tag "$PROMOTION_TAG" \
         --arg qurl_image_tag "${QURL_TAG_FOR_COMMAND:-}" \
         --argjson first_deploy "$([[ "$FIRST_DEPLOY" == "true" ]] && echo true || echo false)" \
         --argjson changelog_count "$CHANGELOG_COUNT" \
@@ -669,7 +769,7 @@ fi
 # --- Command ---
 header "COMMAND"
 echo "  gh workflow run promote-to-prod.yml --ref main \\"
-echo "    -f image_tag=${SANDBOX_COMMIT} \\"
+echo "    -f image_tag=${PROMOTION_TAG} \\"
 echo "    -f deploy_server=${deploy_server} \\"
 echo "    -f deploy_ac=${deploy_ac} \\"
 echo "    -f deploy_qurl=${deploy_qurl} \\"
@@ -693,7 +793,7 @@ fi
 # Interactive mode: prompt for confirmation
 echo ""
 echo -e "  ${BOLD}Deploy ${COMPONENT_LIST} to PROD?${NC}"
-echo -e "  Sandbox commit: ${SANDBOX_COMMIT:0:7} → Production"
+echo -e "  Image tag: ${PROMOTION_TAG:0:7} → Production"
 read -r -p "  [y/N]: " confirm
 echo ""
 
@@ -701,6 +801,14 @@ if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
     echo -e "  ${YELLOW}Aborted.${NC} Run with --dry-run to review without prompting."
     audit_log "ABORTED" "reason=user_cancelled"
     exit 0
+fi
+
+# Re-check for in-flight workflows just before triggering (narrows the race window)
+RECHECK_IN_FLIGHT=$(gh run list --workflow=promote-to-prod.yml --status=in_progress --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo "")
+if [[ -n "$RECHECK_IN_FLIGHT" ]]; then
+    echo -e "  ${RED}Aborted: promote-to-prod workflow started since checks ran (run #${RECHECK_IN_FLIGHT}).${NC}"
+    audit_log "ABORTED" "reason=concurrent_workflow_detected | run=${RECHECK_IN_FLIGHT}"
+    exit 1
 fi
 
 # Execute the workflow
@@ -726,7 +834,7 @@ if OUTPUT=$("${GH_CMD[@]}" 2>&1); then
     echo ""
     echo "  2. If deployment fails and needs rollback:"
     echo "     gh workflow run promote-to-prod.yml --ref main \\"
-    echo "       -f rollback=true -f image_tag=${SANDBOX_COMMIT}"
+    echo "       -f rollback=true -f image_tag=${PROMOTION_TAG}"
     echo ""
     echo "  3. If deployment lock is stuck:"
     echo "     GitHub Actions UI → promote-to-prod → Run workflow → force_unlock=true"
