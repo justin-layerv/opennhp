@@ -30,6 +30,10 @@ terraform {
       source  = "grafana/grafana"
       version = "~> 4.0"
     }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.12"
+    }
   }
 }
 
@@ -1328,6 +1332,16 @@ resource "aws_iam_role_policy_attachment" "apigateway_logging" {
   }
 }
 
+# Allow IAM propagation after the account-level logging role is configured.
+# API Gateway checks the CloudWatch role asynchronously; without this delay,
+# stage creation with access_log_settings fails with "Insufficient permissions
+# to enable logging" due to eventual consistency.
+resource "time_sleep" "apigateway_logging_propagation" {
+  count           = var.deploy_developer_portal ? 1 : 0
+  create_duration = "10s"
+  depends_on      = [aws_api_gateway_account.this]
+}
+
 # ==================== Developer Portal ====================
 # Playground proxy and credential provisioner for the developer experience.
 # Separate HTTP API with Lambda backends, DynamoDB tables, and CORS.
@@ -1336,9 +1350,9 @@ module "developer_portal" {
   count  = var.deploy_developer_portal ? 1 : 0
   source = "./modules/developer-portal"
 
-  # Ensure the account-level API GW logging role exists before the module
-  # creates a stage with access_log_settings.
-  depends_on = [aws_api_gateway_account.this]
+  # Ensure the account-level API GW logging role has propagated before the
+  # module creates a stage with access_log_settings.
+  depends_on = [time_sleep.apigateway_logging_propagation]
 
   environment = var.environment
   name_prefix = local.name_prefix
