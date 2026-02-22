@@ -1044,12 +1044,16 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "logs:DisassociateKmsKey",
           "logs:TagResource",
           "logs:UntagResource",
-          # API Gateway v2 access logging requires log delivery permissions
+          # API Gateway v2 HTTP API access logging requires log delivery
+          # and resource policy permissions on the caller
           "logs:CreateLogDelivery",
           "logs:DeleteLogDelivery",
           "logs:GetLogDelivery",
           "logs:UpdateLogDelivery",
           "logs:ListLogDeliveries",
+          "logs:PutResourcePolicy",
+          "logs:DescribeResourcePolicies",
+          "logs:DescribeLogGroups",
           "cloudwatch:PutMetricAlarm",
           "cloudwatch:PutMetricData",
           "cloudwatch:DeleteAlarms",
