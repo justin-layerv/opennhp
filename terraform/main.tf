@@ -1346,6 +1346,62 @@ resource "time_sleep" "apigateway_logging_propagation" {
 # Playground proxy and credential provisioner for the developer experience.
 # Separate HTTP API with Lambda backends, DynamoDB tables, and CORS.
 
+# ACM certificate for custom domain (regional — same region as API Gateway)
+resource "aws_acm_certificate" "developer_portal" {
+  count             = var.deploy_developer_portal && var.developer_portal_custom_domain != null ? 1 : 0
+  domain_name       = var.developer_portal_custom_domain
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-developer-portal-cert"
+  })
+}
+
+resource "aws_route53_record" "developer_portal_cert_validation" {
+  for_each = var.deploy_developer_portal && var.developer_portal_custom_domain != null && var.developer_portal_hosted_zone_id != null ? {
+    for dvo in aws_acm_certificate.developer_portal[0].domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  } : {}
+
+  provider = aws.route53_mgmt
+
+  allow_overwrite = true
+  name            = each.value.name
+  records         = [each.value.record]
+  ttl             = 60
+  type            = each.value.type
+  zone_id         = var.developer_portal_hosted_zone_id
+}
+
+resource "aws_acm_certificate_validation" "developer_portal" {
+  count                   = var.deploy_developer_portal && var.developer_portal_custom_domain != null ? 1 : 0
+  certificate_arn         = aws_acm_certificate.developer_portal[0].arn
+  validation_record_fqdns = var.developer_portal_hosted_zone_id != null ? [for record in aws_route53_record.developer_portal_cert_validation : record.fqdn] : null
+}
+
+# Route53 A record for developer portal custom domain
+resource "aws_route53_record" "developer_portal" {
+  count    = var.deploy_developer_portal && var.developer_portal_custom_domain != null && var.developer_portal_hosted_zone_id != null ? 1 : 0
+  provider = aws.route53_mgmt
+
+  zone_id = var.developer_portal_hosted_zone_id
+  name    = var.developer_portal_custom_domain
+  type    = "A"
+
+  alias {
+    name                   = module.developer_portal[0].custom_domain_target_domain_name
+    zone_id                = module.developer_portal[0].custom_domain_target_hosted_zone_id
+    evaluate_target_health = false
+  }
+}
+
 module "developer_portal" {
   count  = var.deploy_developer_portal ? 1 : 0
   source = "./modules/developer-portal"
@@ -1375,6 +1431,14 @@ module "developer_portal" {
 
   allowed_origins = var.developer_portal_allowed_origins
   sns_topic_arn   = module.monitoring.sns_topic_arn
+
+  # Custom domain — Route53 record created in root module for cross-account support
+  custom_domain       = var.developer_portal_custom_domain
+  hosted_zone_id      = null
+  acm_certificate_arn = var.developer_portal_custom_domain != null ? aws_acm_certificate_validation.developer_portal[0].certificate_arn : null
+
+  # CI bypass key for integration tests
+  ci_bypass_secret_name = var.developer_portal_ci_bypass_secret_name
 }
 
 # ==================== Grafana Cloud Dashboards ====================

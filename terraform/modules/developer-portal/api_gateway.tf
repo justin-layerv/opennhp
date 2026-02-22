@@ -175,6 +175,13 @@ resource "aws_apigatewayv2_domain_name" "developer_portal" {
     security_policy = "TLS_1_2"
   }
 
+  lifecycle {
+    precondition {
+      condition     = var.acm_certificate_arn != null
+      error_message = "acm_certificate_arn must be provided when custom_domain is set."
+    }
+  }
+
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-developer-portal-domain"
     Component = local.component

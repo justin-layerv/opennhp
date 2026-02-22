@@ -1647,6 +1647,24 @@ variable "developer_portal_allowed_origins" {
   default     = []
 }
 
+variable "developer_portal_custom_domain" {
+  description = "Custom domain for developer portal API (e.g., devapi.layerv.xyz). If null, uses default API Gateway URL."
+  type        = string
+  default     = null
+}
+
+variable "developer_portal_hosted_zone_id" {
+  description = "Route53 hosted zone ID for developer portal custom domain. Required when developer_portal_custom_domain is set."
+  type        = string
+  default     = null
+}
+
+variable "developer_portal_ci_bypass_secret_name" {
+  description = "Secrets Manager secret name for CI bypass key. If set, Lambda functions skip rate limiting when X-CI-Key header matches."
+  type        = string
+  default     = null
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {

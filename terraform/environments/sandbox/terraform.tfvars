@@ -415,6 +415,9 @@ developer_portal_notify_email           = "team@layerv.ai"
 developer_portal_site_url               = "https://staging.layerv.ai"
 developer_portal_verify_url             = "https://staging.layerv.ai/qurl/keys"
 developer_portal_allowed_origins        = ["https://staging.layerv.ai"]
+developer_portal_custom_domain          = "devapi.layerv.xyz"
+developer_portal_hosted_zone_id         = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone
+developer_portal_ci_bypass_secret_name  = "layerv-nhp-sandbox/developer-portal/ci-bypass-key"
 
 tags = {
   Organization = "LayerV"

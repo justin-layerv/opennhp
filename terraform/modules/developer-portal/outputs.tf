@@ -44,3 +44,13 @@ output "custom_domain_url" {
   description = "Custom domain URL for the developer portal API (null if no custom domain configured)"
   value       = local.has_custom_domain ? "https://${var.custom_domain}" : null
 }
+
+output "custom_domain_target_domain_name" {
+  description = "API Gateway custom domain target domain name for Route53 alias"
+  value       = local.has_custom_domain ? aws_apigatewayv2_domain_name.developer_portal[0].domain_name_configuration[0].target_domain_name : null
+}
+
+output "custom_domain_target_hosted_zone_id" {
+  description = "API Gateway custom domain target hosted zone ID for Route53 alias"
+  value       = local.has_custom_domain ? aws_apigatewayv2_domain_name.developer_portal[0].domain_name_configuration[0].hosted_zone_id : null
+}

@@ -34,16 +34,21 @@ resource "aws_lambda_function" "playground" {
   }
 
   environment {
-    variables = {
-      QURL_API_URL                 = var.qurl_api_url
-      M2M_SECRET_NAME              = var.playground_m2m_secret_name
-      RATE_TABLE_NAME              = aws_dynamodb_table.rate_limits.name
-      ALLOWED_ORIGINS              = join(",", var.allowed_origins)
-      AUTH0_DOMAIN                 = var.auth0_domain
-      PLAYGROUND_IP_RATE_LIMIT     = tostring(var.playground_ip_rate_limit)
-      PLAYGROUND_GLOBAL_RATE_LIMIT = tostring(var.playground_global_rate_limit)
-      RATE_WINDOW                  = tostring(var.playground_rate_window)
-    }
+    variables = merge(
+      {
+        QURL_API_URL                 = var.qurl_api_url
+        M2M_SECRET_NAME              = var.playground_m2m_secret_name
+        RATE_TABLE_NAME              = aws_dynamodb_table.rate_limits.name
+        ALLOWED_ORIGINS              = join(",", var.allowed_origins)
+        AUTH0_DOMAIN                 = var.auth0_domain
+        PLAYGROUND_IP_RATE_LIMIT     = tostring(var.playground_ip_rate_limit)
+        PLAYGROUND_GLOBAL_RATE_LIMIT = tostring(var.playground_global_rate_limit)
+        RATE_WINDOW                  = tostring(var.playground_rate_window)
+      },
+      var.ci_bypass_secret_name != null ? {
+        CI_BYPASS_SECRET_NAME = var.ci_bypass_secret_name
+      } : {}
+    )
   }
 
   tags = merge(var.tags, {
@@ -148,6 +153,14 @@ resource "aws_iam_role_policy" "playground" {
             "kms:GenerateDataKey"
           ]
           Resource = var.dynamodb_kms_key_arn
+        }
+      ] : [],
+      var.ci_bypass_secret_name != null ? [
+        {
+          Sid      = "SecretsManagerCIBypass"
+          Effect   = "Allow"
+          Action   = ["secretsmanager:GetSecretValue"]
+          Resource = "arn:aws:secretsmanager:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:secret:${var.ci_bypass_secret_name}-*"
         }
       ] : []
     )

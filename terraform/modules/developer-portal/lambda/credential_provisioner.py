@@ -85,6 +85,12 @@ REGISTRATION_RATE_WINDOW = int(os.environ.get('REGISTRATION_RATE_WINDOW', '86400
 VERIFY_RATE_LIMIT_IP = int(os.environ.get('VERIFY_RATE_LIMIT_IP', '10'))
 VERIFY_RATE_WINDOW = int(os.environ.get('VERIFY_RATE_WINDOW', '3600'))
 
+# CI bypass key — loaded from Secrets Manager with 5-minute cache TTL
+CI_BYPASS_SECRET_NAME = os.environ.get('CI_BYPASS_SECRET_NAME', '')
+_ci_bypass_key = None
+_ci_bypass_key_expires_at = 0
+CI_BYPASS_CACHE_TTL = 300  # 5 minutes
+
 # Email validation regex (compiled for performance)
 EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
 
@@ -156,10 +162,11 @@ def handle_register(event):
 
     source_ip = event.get('requestContext', {}).get('http', {}).get('sourceIp', 'unknown')
 
-    # Rate limit check (per-IP, 5/day)
-    rate_error = check_registration_rate_limits(source_ip)
-    if rate_error:
-        return cors_response(event, 429, {'error': rate_error})
+    # Rate limit check (per-IP, 5/day) — skipped for CI bypass
+    if not _is_ci_bypass(event):
+        rate_error = check_registration_rate_limits(source_ip)
+        if rate_error:
+            return cors_response(event, 429, {'error': rate_error})
 
     # Check if email already has provisioned credentials
     try:
@@ -252,10 +259,11 @@ def handle_verify(event):
 
     source_ip = event.get('requestContext', {}).get('http', {}).get('sourceIp', 'unknown')
 
-    # Rate limit verification attempts to prevent brute force
-    verify_error = check_verify_rate_limits(source_ip)
-    if verify_error:
-        return cors_response(event, 429, {'error': 'Too many attempts. Please try again later.'})
+    # Rate limit verification attempts to prevent brute force — skipped for CI bypass
+    if not _is_ci_bypass(event):
+        verify_error = check_verify_rate_limits(source_ip)
+        if verify_error:
+            return cors_response(event, 429, {'error': 'Too many attempts. Please try again later.'})
 
     try:
         response = credentials_table.get_item(Key={'email': email})
@@ -581,6 +589,38 @@ def authorize_auth0_app(client_id):
 # ---------------------------------------------------------------------------
 
 _cloudwatch = None
+
+
+def _get_ci_bypass_key():
+    """Load CI bypass key from Secrets Manager (cached with 5-minute TTL)."""
+    global _ci_bypass_key, _ci_bypass_key_expires_at
+    if _ci_bypass_key is not None and time.time() < _ci_bypass_key_expires_at:
+        return _ci_bypass_key
+    if not CI_BYPASS_SECRET_NAME:
+        return ''
+    try:
+        sm = boto3.client('secretsmanager')
+        resp = sm.get_secret_value(SecretId=CI_BYPASS_SECRET_NAME)
+        _ci_bypass_key = resp.get('SecretString', '')
+        _ci_bypass_key_expires_at = time.time() + CI_BYPASS_CACHE_TTL
+        return _ci_bypass_key
+    except Exception as e:
+        logger.warning("Failed to load CI bypass key", extra={"error": str(e)})
+        return ''
+
+
+def _is_ci_bypass(event):
+    """Check if request has a valid CI bypass header to skip rate limiting."""
+    bypass_key = _get_ci_bypass_key()
+    if not bypass_key:
+        return False
+    headers = event.get('headers', {}) or {}
+    ci_key = headers.get('x-ci-key', '')
+    if ci_key and hmac.compare_digest(ci_key, bypass_key):
+        source_ip = event.get('requestContext', {}).get('http', {}).get('sourceIp', 'unknown')
+        logger.info("CI bypass: rate limiting skipped", extra={"source_ip": source_ip})
+        return True
+    return False
 
 
 def _emit_rate_limit_fail_open_metric(function_name):

@@ -1395,3 +1395,128 @@ class TestDynamoDBThrottling:
 
             result = cp.check_registration_rate_limits('203.0.113.1')
             assert result is None  # Should fail open
+
+
+# ---------------------------------------------------------------------------
+# CI Bypass Tests
+# ---------------------------------------------------------------------------
+
+class TestCIBypass:
+    """Tests for CI bypass key functionality."""
+
+    def test_ci_bypass_with_valid_key(self):
+        """Verify CI bypass returns True when X-CI-Key matches."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import credential_provisioner as cp
+
+            cp._ci_bypass_key = 'test-secret-key'
+            cp._ci_bypass_key_expires_at = time.time() + 300
+            cp.CI_BYPASS_SECRET_NAME = 'some-secret'
+
+            event = {
+                'headers': {'x-ci-key': 'test-secret-key'},
+            }
+
+            assert cp._is_ci_bypass(event) is True
+
+    def test_ci_bypass_with_invalid_key(self):
+        """Verify CI bypass returns False when X-CI-Key doesn't match."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import credential_provisioner as cp
+
+            cp._ci_bypass_key = 'test-secret-key'
+            cp._ci_bypass_key_expires_at = time.time() + 300
+            cp.CI_BYPASS_SECRET_NAME = 'some-secret'
+
+            event = {
+                'headers': {'x-ci-key': 'wrong-key'},
+            }
+
+            assert cp._is_ci_bypass(event) is False
+
+    def test_ci_bypass_with_no_header(self):
+        """Verify CI bypass returns False when header is missing."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import credential_provisioner as cp
+
+            cp._ci_bypass_key = 'test-secret-key'
+            cp._ci_bypass_key_expires_at = time.time() + 300
+            cp.CI_BYPASS_SECRET_NAME = 'some-secret'
+
+            event = {
+                'headers': {'origin': 'https://layerv.ai'},
+            }
+
+            assert cp._is_ci_bypass(event) is False
+
+    def test_ci_bypass_disabled_when_no_secret_name(self):
+        """Verify CI bypass returns False when CI_BYPASS_SECRET_NAME is empty."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import credential_provisioner as cp
+
+            cp._ci_bypass_key = None
+            cp._ci_bypass_key_expires_at = 0
+            cp.CI_BYPASS_SECRET_NAME = ''
+
+            event = {
+                'headers': {'x-ci-key': 'some-key'},
+            }
+
+            assert cp._is_ci_bypass(event) is False
+
+    def test_ci_bypass_skips_rate_limiting_register(self, mock_aws, register_event):
+        """Verify that CI bypass skips rate limiting on register."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import credential_provisioner as cp
+
+            cp.credentials_table = mock_aws['credentials_table']
+            cp.ses = mock_aws['ses']
+            cp._ci_bypass_key = 'ci-key-123'
+            cp._ci_bypass_key_expires_at = time.time() + 300
+            cp.CI_BYPASS_SECRET_NAME = 'some-secret'
+
+            # Set rate limiter to always reject
+            cp.check_registration_rate_limits = MagicMock(return_value='Rate limited')
+
+            # Add CI bypass header
+            register_event['headers']['x-ci-key'] = 'ci-key-123'
+
+            response = cp.handle_register(register_event)
+            # Should NOT be 429 — bypass skips rate limiting
+            assert response['statusCode'] != 429
+            # Rate limit function should not have been called
+            cp.check_registration_rate_limits.assert_not_called()
+
+    def test_ci_bypass_key_ttl_expiry(self):
+        """Verify expired key triggers re-fetch from Secrets Manager."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import credential_provisioner as cp
+
+            cp._ci_bypass_key = 'old-key'
+            cp._ci_bypass_key_expires_at = time.time() - 1  # Expired
+            cp.CI_BYPASS_SECRET_NAME = 'my-secret'
+
+            mock_sm = MagicMock()
+            mock_sm.get_secret_value.return_value = {'SecretString': 'new-key'}
+
+            with patch('credential_provisioner.boto3.client', return_value=mock_sm):
+                result = cp._get_ci_bypass_key()
+
+            assert result == 'new-key'
+            assert cp._ci_bypass_key == 'new-key'
+            mock_sm.get_secret_value.assert_called_once_with(SecretId='my-secret')
+
+    def test_ci_bypass_key_cached_within_ttl(self):
+        """Verify cached key is returned within TTL without SM call."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import credential_provisioner as cp
+
+            cp._ci_bypass_key = 'cached-key'
+            cp._ci_bypass_key_expires_at = time.time() + 300
+            cp.CI_BYPASS_SECRET_NAME = 'my-secret'
+
+            with patch('credential_provisioner.boto3.client') as mock_boto:
+                result = cp._get_ci_bypass_key()
+
+            assert result == 'cached-key'
+            mock_boto.assert_not_called()

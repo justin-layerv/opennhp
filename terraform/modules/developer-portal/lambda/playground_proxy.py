@@ -15,6 +15,7 @@ Endpoints:
 
 import json
 import boto3
+import hmac
 import logging
 import time
 import os
@@ -78,6 +79,12 @@ ALLOWED_ORIGINS = os.environ.get(
 PLAYGROUND_IP_RATE_LIMIT = int(os.environ.get('PLAYGROUND_IP_RATE_LIMIT', '20'))
 PLAYGROUND_GLOBAL_RATE_LIMIT = int(os.environ.get('PLAYGROUND_GLOBAL_RATE_LIMIT', '500'))
 RATE_WINDOW = int(os.environ.get('RATE_WINDOW', '3600'))
+
+# CI bypass key — loaded from Secrets Manager with 5-minute cache TTL
+CI_BYPASS_SECRET_NAME = os.environ.get('CI_BYPASS_SECRET_NAME', '')
+_ci_bypass_key = None
+_ci_bypass_key_expires_at = 0
+CI_BYPASS_CACHE_TTL = 300  # 5 minutes
 
 # Playground constraints
 MAX_TTL_MINUTES = 30
@@ -162,10 +169,11 @@ def handle_create_qurl(event):
 
     source_ip = event.get('requestContext', {}).get('http', {}).get('sourceIp', 'unknown')
 
-    # Rate limit check (per-IP and global)
-    rate_error = check_rate_limits(source_ip)
-    if rate_error:
-        return cors_response(event, 429, {'error': rate_error})
+    # Rate limit check (per-IP and global) — skipped for CI bypass
+    if not _is_ci_bypass(event):
+        rate_error = check_rate_limits(source_ip)
+        if rate_error:
+            return cors_response(event, 429, {'error': rate_error})
 
     # Validate target URL (must be HTTPS, no private/internal IPs)
     target_url = body.get('target_url', '')
@@ -223,9 +231,10 @@ def handle_get_qurl(event, qurl_id):
     """Get QURL status by ID."""
     source_ip = event.get('requestContext', {}).get('http', {}).get('sourceIp', 'unknown')
 
-    rate_error = check_rate_limits(source_ip)
-    if rate_error:
-        return cors_response(event, 429, {'error': rate_error})
+    if not _is_ci_bypass(event):
+        rate_error = check_rate_limits(source_ip)
+        if rate_error:
+            return cors_response(event, 429, {'error': rate_error})
 
     status, response_body = proxy_to_qurl_api('GET', f'/v1/qurls/{qurl_id}')
     return cors_response(event, status, response_body)
@@ -235,9 +244,10 @@ def handle_delete_qurl(event, qurl_id):
     """Revoke/delete a QURL by ID."""
     source_ip = event.get('requestContext', {}).get('http', {}).get('sourceIp', 'unknown')
 
-    rate_error = check_rate_limits(source_ip)
-    if rate_error:
-        return cors_response(event, 429, {'error': rate_error})
+    if not _is_ci_bypass(event):
+        rate_error = check_rate_limits(source_ip)
+        if rate_error:
+            return cors_response(event, 429, {'error': rate_error})
 
     status, response_body = proxy_to_qurl_api('DELETE', f'/v1/qurls/{qurl_id}')
     return cors_response(event, status, response_body)
@@ -247,9 +257,10 @@ def handle_mint_link(event, qurl_id):
     """Mint a new link for an existing QURL."""
     source_ip = event.get('requestContext', {}).get('http', {}).get('sourceIp', 'unknown')
 
-    rate_error = check_rate_limits(source_ip)
-    if rate_error:
-        return cors_response(event, 429, {'error': rate_error})
+    if not _is_ci_bypass(event):
+        rate_error = check_rate_limits(source_ip)
+        if rate_error:
+            return cors_response(event, 429, {'error': rate_error})
 
     # Parse optional body for mint parameters
     try:
@@ -506,6 +517,38 @@ def cap_ttl(expires_in):
 # ---------------------------------------------------------------------------
 
 _cloudwatch = None
+
+
+def _get_ci_bypass_key():
+    """Load CI bypass key from Secrets Manager (cached with 5-minute TTL)."""
+    global _ci_bypass_key, _ci_bypass_key_expires_at
+    if _ci_bypass_key is not None and time.time() < _ci_bypass_key_expires_at:
+        return _ci_bypass_key
+    if not CI_BYPASS_SECRET_NAME:
+        return ''
+    try:
+        sm = boto3.client('secretsmanager')
+        resp = sm.get_secret_value(SecretId=CI_BYPASS_SECRET_NAME)
+        _ci_bypass_key = resp.get('SecretString', '')
+        _ci_bypass_key_expires_at = time.time() + CI_BYPASS_CACHE_TTL
+        return _ci_bypass_key
+    except Exception as e:
+        logger.warning("Failed to load CI bypass key", extra={"error": str(e)})
+        return ''
+
+
+def _is_ci_bypass(event):
+    """Check if request has a valid CI bypass header to skip rate limiting."""
+    bypass_key = _get_ci_bypass_key()
+    if not bypass_key:
+        return False
+    headers = event.get('headers', {}) or {}
+    ci_key = headers.get('x-ci-key', '')
+    if ci_key and hmac.compare_digest(ci_key, bypass_key):
+        source_ip = event.get('requestContext', {}).get('http', {}).get('sourceIp', 'unknown')
+        logger.info("CI bypass: rate limiting skipped", extra={"source_ip": source_ip})
+        return True
+    return False
 
 
 def _emit_rate_limit_fail_open_metric(function_name):

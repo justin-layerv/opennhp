@@ -26,7 +26,7 @@ data "aws_caller_identity" "current" {}
 locals {
   is_prod           = var.environment == "prod"
   component         = "developer-portal"
-  has_custom_domain = var.custom_domain != null && var.acm_certificate_arn != null
+  has_custom_domain = var.custom_domain != null
   has_sns           = var.sns_topic_arn != null
 }
 

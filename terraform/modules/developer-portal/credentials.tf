@@ -34,23 +34,28 @@ resource "aws_lambda_function" "credentials" {
   }
 
   environment {
-    variables = {
-      AUTH0_MGMT_SECRET_NAME     = var.auth0_mgmt_secret_name
-      CREDENTIALS_TABLE_NAME     = aws_dynamodb_table.credentials.name
-      RATE_TABLE_NAME            = aws_dynamodb_table.rate_limits.name
-      FROM_EMAIL                 = var.from_email
-      NOTIFY_EMAIL               = var.notify_email
-      SITE_URL                   = var.site_url
-      VERIFY_URL                 = var.verify_url
-      ALLOWED_ORIGINS            = join(",", var.allowed_origins)
-      AUTH0_DOMAIN               = var.auth0_domain
-      QURL_API_AUDIENCE          = var.qurl_api_audience
-      SES_REGION                 = var.ses_region
-      REGISTRATION_RATE_LIMIT_IP = tostring(var.registration_rate_limit_ip)
-      REGISTRATION_RATE_WINDOW   = tostring(var.registration_rate_window)
-      VERIFY_RATE_LIMIT_IP       = tostring(var.verify_rate_limit_ip)
-      VERIFY_RATE_WINDOW         = tostring(var.verify_rate_window)
-    }
+    variables = merge(
+      {
+        AUTH0_MGMT_SECRET_NAME     = var.auth0_mgmt_secret_name
+        CREDENTIALS_TABLE_NAME     = aws_dynamodb_table.credentials.name
+        RATE_TABLE_NAME            = aws_dynamodb_table.rate_limits.name
+        FROM_EMAIL                 = var.from_email
+        NOTIFY_EMAIL               = var.notify_email
+        SITE_URL                   = var.site_url
+        VERIFY_URL                 = var.verify_url
+        ALLOWED_ORIGINS            = join(",", var.allowed_origins)
+        AUTH0_DOMAIN               = var.auth0_domain
+        QURL_API_AUDIENCE          = var.qurl_api_audience
+        SES_REGION                 = var.ses_region
+        REGISTRATION_RATE_LIMIT_IP = tostring(var.registration_rate_limit_ip)
+        REGISTRATION_RATE_WINDOW   = tostring(var.registration_rate_window)
+        VERIFY_RATE_LIMIT_IP       = tostring(var.verify_rate_limit_ip)
+        VERIFY_RATE_WINDOW         = tostring(var.verify_rate_window)
+      },
+      var.ci_bypass_secret_name != null ? {
+        CI_BYPASS_SECRET_NAME = var.ci_bypass_secret_name
+      } : {}
+    )
   }
 
   tags = merge(var.tags, {
@@ -174,6 +179,14 @@ resource "aws_iam_role_policy" "credentials" {
             "kms:GenerateDataKey"
           ]
           Resource = var.dynamodb_kms_key_arn
+        }
+      ] : [],
+      var.ci_bypass_secret_name != null ? [
+        {
+          Sid      = "SecretsManagerCIBypass"
+          Effect   = "Allow"
+          Action   = ["secretsmanager:GetSecretValue"]
+          Resource = "arn:aws:secretsmanager:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:secret:${var.ci_bypass_secret_name}-*"
         }
       ] : []
     )

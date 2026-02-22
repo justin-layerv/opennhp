@@ -1429,3 +1429,21 @@ variable "developer_portal_allowed_origins" {
   type        = list(string)
   default     = []
 }
+
+variable "developer_portal_custom_domain" {
+  description = "Custom domain for developer portal API"
+  type        = string
+  default     = null
+}
+
+variable "developer_portal_hosted_zone_id" {
+  description = "Route53 hosted zone ID for developer portal custom domain"
+  type        = string
+  default     = null
+}
+
+variable "developer_portal_ci_bypass_secret_name" {
+  description = "Secrets Manager secret name for CI bypass key"
+  type        = string
+  default     = null
+}

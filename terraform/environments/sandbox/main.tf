@@ -293,6 +293,9 @@ module "nhp" {
   developer_portal_site_url               = var.developer_portal_site_url
   developer_portal_verify_url             = var.developer_portal_verify_url
   developer_portal_allowed_origins        = var.developer_portal_allowed_origins
+  developer_portal_custom_domain          = var.developer_portal_custom_domain
+  developer_portal_hosted_zone_id         = var.developer_portal_hosted_zone_id
+  developer_portal_ci_bypass_secret_name  = var.developer_portal_ci_bypass_secret_name
 }
 
 # ==============================================================================

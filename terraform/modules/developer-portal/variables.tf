@@ -201,6 +201,16 @@ variable "verify_rate_window" {
 }
 
 # ==============================================================================
+# CI Bypass
+# ==============================================================================
+
+variable "ci_bypass_secret_name" {
+  description = "Secrets Manager secret name for CI bypass key. If set, requests with matching X-CI-Key header skip rate limiting."
+  type        = string
+  default     = null
+}
+
+# ==============================================================================
 # SES
 # ==============================================================================
 
