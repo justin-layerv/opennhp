@@ -85,6 +85,10 @@ resource "auth0_client" "backend_service" {
 
   # OIDC conformant
   oidc_conformant = true
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # ==============================================================================
@@ -343,4 +347,84 @@ resource "aws_secretsmanager_secret_rotation" "auth0_backend" {
   }
 
   depends_on = [aws_lambda_permission.auth0_rotation]
+}
+
+# ==============================================================================
+# Developer Portal Management M2M Application
+# ==============================================================================
+# Creates an Auth0 M2M application authorized for the Management API,
+# used by the developer portal to create/manage developer credentials.
+# Only created when dev_portal_mgmt_secret_name is set.
+
+resource "auth0_client" "dev_portal_mgmt" {
+  count       = var.dev_portal_mgmt_secret_name != null ? 1 : 0
+  name        = "Developer Portal Management (${var.environment})"
+  description = "M2M client for developer portal management operations - ${var.environment}"
+  app_type    = "non_interactive"
+  grant_types = ["client_credentials"]
+
+  oidc_conformant = true
+
+  jwt_configuration {
+    alg                 = "RS256"
+    lifetime_in_seconds = var.m2m_token_lifetime
+  }
+
+  lifecycle {
+    prevent_destroy = true
+
+    precondition {
+      condition     = var.auth0_tenant_domain != null
+      error_message = "auth0_tenant_domain is required when dev_portal_mgmt_secret_name is set"
+    }
+  }
+}
+
+resource "auth0_client_credentials" "dev_portal_mgmt" {
+  count                 = var.dev_portal_mgmt_secret_name != null ? 1 : 0
+  client_id             = auth0_client.dev_portal_mgmt[0].id
+  authentication_method = "client_secret_post"
+}
+
+# Grant Management API access with scopes needed for developer credential provisioning
+resource "auth0_client_grant" "dev_portal_mgmt_api" {
+  count     = var.dev_portal_mgmt_secret_name != null ? 1 : 0
+  client_id = auth0_client.dev_portal_mgmt[0].id
+  audience  = "https://${var.auth0_tenant_domain}/api/v2/"
+  scopes = [
+    "create:clients",
+    "read:clients",
+    "delete:clients",
+    "create:client_grants",
+    "read:client_grants",
+    "delete:client_grants",
+  ]
+}
+
+# Secrets Manager secret for management credentials
+resource "aws_secretsmanager_secret" "dev_portal_mgmt" {
+  count                   = var.dev_portal_mgmt_secret_name != null ? 1 : 0
+  name                    = var.dev_portal_mgmt_secret_name
+  description             = "Auth0 Management API credentials for developer portal (${var.environment})"
+  recovery_window_in_days = local.is_prod ? 30 : 0
+  kms_key_id              = var.secrets_kms_key_arn
+
+  tags = merge(var.tags, {
+    Name      = var.dev_portal_mgmt_secret_name
+    Component = "auth0"
+  })
+}
+
+resource "aws_secretsmanager_secret_version" "dev_portal_mgmt" {
+  count     = var.dev_portal_mgmt_secret_name != null ? 1 : 0
+  secret_id = aws_secretsmanager_secret.dev_portal_mgmt[0].id
+  secret_string = jsonencode({
+    client_id     = auth0_client.dev_portal_mgmt[0].client_id
+    client_secret = auth0_client_credentials.dev_portal_mgmt[0].client_secret
+    audience      = "https://${var.auth0_tenant_domain}/api/v2/"
+  })
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }

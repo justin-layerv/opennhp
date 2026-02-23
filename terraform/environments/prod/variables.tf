@@ -1217,6 +1217,12 @@ variable "developer_portal_from_email" {
   default     = null
 }
 
+variable "developer_portal_ses_region" {
+  description = "AWS region for SES (may differ from deployment region)"
+  type        = string
+  default     = null
+}
+
 variable "developer_portal_notify_email" {
   description = "Email to receive developer portal admin notifications"
   type        = string

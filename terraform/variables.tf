@@ -1623,6 +1623,14 @@ variable "developer_portal_from_email" {
   default     = null
 }
 
+# When null, falls through to the developer-portal module default (us-east-1).
+# Override when SES domain identity is verified in a different region.
+variable "developer_portal_ses_region" {
+  description = "AWS region for SES (may differ from deployment region if SES identity is verified elsewhere)"
+  type        = string
+  default     = null
+}
+
 variable "developer_portal_notify_email" {
   description = "Email address to receive developer portal admin notifications"
   type        = string

@@ -110,3 +110,27 @@ variable "auth0_management_secret_arn" {
     error_message = "auth0_management_secret_arn must be a valid Secrets Manager ARN"
   }
 }
+
+# ==============================================================================
+# Developer Portal Management M2M Configuration
+# ==============================================================================
+
+variable "dev_portal_mgmt_secret_name" {
+  description = "Secrets Manager name for developer portal Auth0 Management API credentials. If set, creates a management M2M app with Management API grants."
+  type        = string
+  default     = null
+}
+
+# Separate from auth0_domain (which is only used by the rotation Lambda and
+# conditionally passed based on enable_rotation). This variable is always
+# passed and used to construct the Management API audience URL.
+variable "auth0_tenant_domain" {
+  description = "Auth0 tenant domain (e.g., layerv.us.auth0.com). Required when dev_portal_mgmt_secret_name is set, used for Management API audience."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.auth0_tenant_domain == null || can(regex("^[a-zA-Z0-9-]+\\.[a-z]{2,3}\\.auth0\\.com$", var.auth0_tenant_domain))
+    error_message = "auth0_tenant_domain must be a valid Auth0 tenant domain (e.g., layerv.us.auth0.com)"
+  }
+}

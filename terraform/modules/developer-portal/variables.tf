@@ -218,4 +218,9 @@ variable "ses_region" {
   description = "AWS region for SES (may differ from deployment region if SES identity is verified elsewhere)"
   type        = string
   default     = "us-east-1"
+
+  validation {
+    condition     = can(regex("^[a-z]{2}-[a-z]+-\\d$", var.ses_region))
+    error_message = "ses_region must be a valid AWS region (e.g., us-east-1, us-east-2)"
+  }
 }

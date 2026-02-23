@@ -30,3 +30,13 @@ output "rotation_enabled" {
   description = "Whether secret rotation is enabled"
   value       = var.enable_rotation
 }
+
+output "dev_portal_mgmt_secret_name" {
+  description = "Name of the SM secret containing developer portal management credentials (null if not created)"
+  value       = var.dev_portal_mgmt_secret_name != null ? aws_secretsmanager_secret.dev_portal_mgmt[0].name : null
+}
+
+output "dev_portal_mgmt_secret_arn" {
+  description = "ARN of the SM secret containing developer portal management credentials (null if not created)"
+  value       = var.dev_portal_mgmt_secret_name != null ? aws_secretsmanager_secret.dev_portal_mgmt[0].arn : null
+}

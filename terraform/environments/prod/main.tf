@@ -291,6 +291,7 @@ module "nhp" {
   developer_portal_auth0_domain           = var.developer_portal_auth0_domain
   developer_portal_qurl_api_audience      = var.developer_portal_qurl_api_audience
   developer_portal_from_email             = var.developer_portal_from_email
+  developer_portal_ses_region             = var.developer_portal_ses_region
   developer_portal_notify_email           = var.developer_portal_notify_email
   developer_portal_site_url               = var.developer_portal_site_url
   developer_portal_verify_url             = var.developer_portal_verify_url
@@ -364,6 +365,10 @@ module "auth0" {
   rotation_days               = var.auth0_rotation_days
   auth0_domain                = var.auth0_enable_rotation ? var.auth0_domain : null
   auth0_management_secret_arn = var.auth0_management_secret_arn
+
+  # Developer portal management M2M app (only create when portal is enabled)
+  dev_portal_mgmt_secret_name = var.deploy_developer_portal ? var.developer_portal_auth0_mgmt_secret_name : null
+  auth0_tenant_domain         = var.auth0_domain
 }
 
 # ==============================================================================

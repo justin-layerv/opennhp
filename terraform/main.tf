@@ -1425,6 +1425,7 @@ module "developer_portal" {
   qurl_api_audience = var.developer_portal_qurl_api_audience
 
   from_email   = var.developer_portal_from_email
+  ses_region   = var.developer_portal_ses_region
   notify_email = var.developer_portal_notify_email
   site_url     = var.developer_portal_site_url
   verify_url   = var.developer_portal_verify_url
