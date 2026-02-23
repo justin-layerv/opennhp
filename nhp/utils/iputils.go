@@ -3,6 +3,7 @@ package utils
 import (
 	"fmt"
 	"net"
+	"strings"
 )
 
 // CIDR mask constants for IP address handling
@@ -38,6 +39,48 @@ func IsIPv6(ipStr string) bool {
 func IsIPv4(ipStr string) bool {
 	ip := net.ParseIP(ipStr)
 	return ip != nil && ip.To4() != nil
+}
+
+// IPv4ToIPv6Mapped converts an IPv4 address string to its IPv6-mapped form (::ffff:x.x.x.x).
+// Returns the original string if it's already IPv6 or if parsing fails.
+func IPv4ToIPv6Mapped(ipStr string) string {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return ipStr
+	}
+	if ip.To4() != nil {
+		return "::ffff:" + ip.To4().String()
+	}
+	return ipStr
+}
+
+// NormalizeIPSetEntry adjusts IP addresses in a hash:ip,port,ip entry so all IPs
+// match the target ipset family. When adding to an inet6 set (ipType == IPV6),
+// any IPv4 addresses in the entry are converted to their IPv6-mapped form.
+// Format: "srcIP,port,dstIP" or "srcIP,proto:port,dstIP"
+func NormalizeIPSetEntry(ipType IPTYPE, entry string) string {
+	if ipType != IPV6 {
+		return entry
+	}
+
+	// Split on commas: expect [srcIP, port_spec, dstIP]
+	parts := strings.SplitN(entry, ",", 3)
+	if len(parts) != 3 {
+		return entry
+	}
+
+	// Convert any IPv4 components to IPv6-mapped form for inet6 ipsets
+	srcIP := parts[0]
+	dstIP := parts[2]
+
+	if IsIPv4(srcIP) {
+		parts[0] = IPv4ToIPv6Mapped(srcIP)
+	}
+	if IsIPv4(dstIP) {
+		parts[2] = IPv4ToIPv6Mapped(dstIP)
+	}
+
+	return strings.Join(parts, ",")
 }
 
 // GetCIDRMask returns the appropriate CIDR mask suffix for a given IP type and access mode.

@@ -1685,23 +1685,12 @@ resource "aws_route53_record" "qurl_link_resolve" {
   }
 }
 
-# IPv6 AAAA record for resolve.qurl.link (only when CloudFront is enabled)
-# CloudFront natively supports IPv6, NLB is IPv4-only
-resource "aws_route53_record" "qurl_link_resolve_ipv6" {
-  count    = var.deploy_qurl_link && var.enable_resolve_cloudfront && !var.qurl_link_external_dns ? 1 : 0
-  provider = aws.route53_mgmt
-
-  allow_overwrite = true
-  zone_id         = var.qurl_link_hosted_zone_id
-  name            = "resolve.${var.qurl_link_frontend_domain}"
-  type            = "AAAA"
-
-  alias {
-    name                   = aws_cloudfront_distribution.qurl_resolve[0].domain_name
-    zone_id                = aws_cloudfront_distribution.qurl_resolve[0].hosted_zone_id
-    evaluate_target_health = false
-  }
-}
+# IPv6 AAAA record for resolve.qurl.link — REMOVED.
+# The resolve endpoint captures the client IP for NHP knock (ipset src matching).
+# The AC NLB is IPv4-only, so the AC will only ever see IPv4 source addresses.
+# Publishing AAAA records here would cause clients to connect via IPv6, resulting
+# in an IPv6 address in X-Forwarded-For that can never match real AC traffic.
+# See also: is_ipv6_enabled=false on the CloudFront distribution above.
 
 # Origin-specific DNS record for CloudFront → NLB connectivity.
 # CloudFront verifies the origin's TLS cert matches the origin domain name.
@@ -1893,11 +1882,13 @@ resource "aws_wafv2_web_acl" "qurl_resolve" {
 resource "aws_cloudfront_distribution" "qurl_resolve" {
   count           = var.deploy_qurl_link && var.enable_resolve_cloudfront ? 1 : 0
   enabled         = true
-  is_ipv6_enabled = true
-  comment         = "CloudFront for ${local.name_prefix} QURL resolve"
-  aliases         = ["resolve.${var.qurl_link_frontend_domain}"]
-  web_acl_id      = aws_wafv2_web_acl.qurl_resolve[0].arn
-  price_class     = var.environment == "prod" ? "PriceClass_All" : "PriceClass_100"
+  is_ipv6_enabled = false # Must be false: resolve endpoint captures client IP for NHP knock.
+  # IPv6 clients would get their IPv6 in X-Forwarded-For, but the AC NLB is IPv4-only,
+  # so the AC would never see that IPv6 address — causing ipset mismatches and knock failures.
+  comment     = "CloudFront for ${local.name_prefix} QURL resolve"
+  aliases     = ["resolve.${var.qurl_link_frontend_domain}"]
+  web_acl_id  = aws_wafv2_web_acl.qurl_resolve[0].arn
+  price_class = var.environment == "prod" ? "PriceClass_All" : "PriceClass_100"
 
   origin {
     # Use the origin-specific DNS record instead of the raw NLB DNS name.

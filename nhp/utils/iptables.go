@@ -412,7 +412,19 @@ func (ipset *IPSet) Add(ipType IPTYPE, t int, expire int, args ...string) (strin
 	defer cancel()
 
 	name := ipset.GetIpsetName(ipType, t)
-	params := append([]string{"add", "-exist", name}, args...)
+
+	// Normalize IP addresses in hash entries to match the ipset family.
+	// For inet6 sets (ipType==IPV6), any IPv4 addresses in "srcIP,port,dstIP"
+	// entries are converted to IPv6-mapped form (::ffff:x.x.x.x).
+	// This prevents "ipset add" failures from mixed address families (e.g.,
+	// IPv6 source + IPv4 DefaultIp destination in an inet6 set).
+	normalizedArgs := make([]string, len(args))
+	copy(normalizedArgs, args)
+	for i, arg := range normalizedArgs {
+		normalizedArgs[i] = NormalizeIPSetEntry(ipType, arg)
+	}
+
+	params := append([]string{"add", "-exist", name}, normalizedArgs...)
 	params = append(params, "timeout", fmt.Sprintf("%d", expire))
 
 	log.Debug("Execute ipset: ipset %s", params)
