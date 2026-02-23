@@ -107,9 +107,18 @@ resource "auth0_client_grant" "backend_qurl_api" {
 # Manages the client secret for the M2M application, enabling rotation via Terraform.
 # The secret can be rotated by running `terraform apply` - Auth0 will generate a new one.
 #
-# Note: If client_secret is empty in state, remove this resource from state and re-apply:
-#   terraform state rm 'module.auth0.auth0_client_credentials.backend_service'
-#   terraform state rm 'module.auth0.aws_secretsmanager_secret_version.auth0_backend[0]'
+# Note: The Auth0 TF provider returns empty client_secret unless the management
+# app (Terraform) has read:client_keys scope on the Management API grant.
+# Even with that scope, the provider may still return empty for client_secret_post
+# auth method — this is a known provider limitation.
+#
+# For NEW environments: after initial `terraform apply`, the SM secret will contain
+# an empty client_secret. You MUST run the manual fix below before services will work.
+#
+# If client_secret is empty in Secrets Manager, copy the secret from the Auth0
+# dashboard (Applications > Backend Service > Settings) and update SM manually:
+#   aws secretsmanager put-secret-value --secret-id <secret-name> \
+#     --secret-string '{"client_id":"...","client_secret":"...","audience":"..."}'
 
 resource "auth0_client_credentials" "backend_service" {
   client_id             = auth0_client.backend_service.id
@@ -152,6 +161,10 @@ resource "aws_secretsmanager_secret_version" "auth0_backend" {
 
   lifecycle {
     create_before_destroy = true
+    # The Auth0 TF provider returns empty client_secret unless the management
+    # app has read:client_keys scope. To prevent overwriting a manually-set
+    # secret value, ignore changes after initial creation.
+    ignore_changes = [secret_string]
   }
 }
 
@@ -426,5 +439,9 @@ resource "aws_secretsmanager_secret_version" "dev_portal_mgmt" {
 
   lifecycle {
     create_before_destroy = true
+    # Auth0 TF provider returns empty client_secret (provider limitation).
+    # Prevent overwriting manually-set secret. For new environments, copy the
+    # secret from Auth0 dashboard after initial apply (see backend_service comment).
+    ignore_changes = [secret_string]
   }
 }

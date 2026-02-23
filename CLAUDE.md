@@ -215,6 +215,8 @@ Parameters using this pattern:
 - `/${env}/nhp/server/active-color` - Current active deployment color
 - `/${env}/nhp/server/last-switch-timestamp` - Deployment audit trail
 - `/${env}/nhp/ac/image-tag` - AC Docker image tag
+- Auth0 backend credentials secret version - Auth0 provider returns empty `client_secret`
+- Dev portal management credentials secret version - same Auth0 provider limitation
 
 ### Docker
 
