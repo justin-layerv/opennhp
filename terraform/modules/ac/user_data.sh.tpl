@@ -365,7 +365,28 @@ ipset -exist create defaultset hash:ip,port,ip counters maxelem 1000000 timeout 
 ipset -exist create defaultset_down hash:ip,port,ip counters maxelem 1000000 timeout 121
 ipset -exist create tempset hash:net,port counters maxelem 1000000 timeout 5
 
-echo "ipsets created successfully"
+echo "IPv4 ipsets created successfully"
+
+# Create IPv6 ipsets (required for clients connecting via IPv6)
+# The NHP AC code uses *_v6 suffixed sets for IPv6 addresses.
+# Without these, ipset add fails and the NHP knock returns "ipset operation failed".
+IP6TABLES=$(which ip6tables 2>/dev/null)
+IPSET6_OK=0
+if [ -n "$IP6TABLES" ]; then
+    echo "Setting up IPv6 ipsets..."
+    ipset -exist create defaultset_v6 hash:ip,port,ip family inet6 counters maxelem 1000000 timeout 120 2>/dev/null || true
+    ipset -exist create defaultset_down_v6 hash:ip,port,ip family inet6 counters maxelem 1000000 timeout 121 2>/dev/null || true
+    ipset -exist create tempset_v6 hash:net,port family inet6 counters maxelem 1000000 timeout 5 2>/dev/null || true
+
+    # Verify IPv6 ipset creation
+    IPSET6_OK=1
+    ipset list defaultset_v6 > /dev/null 2>&1 || IPSET6_OK=0
+    if [ $IPSET6_OK -eq 1 ]; then
+        echo "IPv6 ipsets created successfully"
+    else
+        echo "WARNING: IPv6 ipset creation failed, IPv6 clients will not be supported"
+    fi
+fi
 
 # Create NHP_DENY chain for logging and dropping unauthorized traffic
 iptables -N NHP_DENY 2>/dev/null || true
@@ -429,10 +450,68 @@ iptables -C FORWARD -m state --state ESTABLISHED -j ACCEPT 2>/dev/null || \
     iptables -A FORWARD -m state --state ESTABLISHED -j ACCEPT
 iptables -C FORWARD -j NHP_DENY 2>/dev/null || iptables -A FORWARD -j NHP_DENY
 
-# Set chain policies
+# Set IPv4 chain policies
 iptables -P INPUT DROP
 iptables -P OUTPUT ACCEPT
 iptables -P FORWARD DROP
+
+echo "IPv4 NHP firewall setup complete"
+
+# ============================================================================
+# IPv6 firewall rules (mirrors IPv4 rules using *_v6 ipsets and ip6tables)
+# ============================================================================
+if [ -n "$IP6TABLES" ] && [ $IPSET6_OK -eq 1 ]; then
+    echo "Configuring IPv6 NHP firewall..."
+
+    # NHP_DENY chain for IPv6
+    ip6tables -N NHP_DENY 2>/dev/null || true
+    ip6tables -C NHP_DENY -j LOG --log-prefix "[NHP-DENY6] " --log-level 6 --log-ip-options 2>/dev/null || \
+        ip6tables -A NHP_DENY -j LOG --log-prefix "[NHP-DENY6] " --log-level 6 --log-ip-options 2>/dev/null || true
+    ip6tables -C NHP_DENY -j DROP 2>/dev/null || \
+        ip6tables -A NHP_DENY -j DROP 2>/dev/null || true
+
+    # IPv6 INPUT chain
+    ip6tables -C INPUT -m set --match-set tempset_v6 src,dst -j SET --add-set defaultset_v6 src,dst,dst 2>/dev/null || \
+        ip6tables -A INPUT -m set --match-set tempset_v6 src,dst -j SET --add-set defaultset_v6 src,dst,dst 2>/dev/null || true
+    ip6tables -C INPUT -m set --match-set defaultset_v6 src,dst,dst -j SET --add-set defaultset_down_v6 src,dst,dst 2>/dev/null || \
+        ip6tables -A INPUT -m set --match-set defaultset_v6 src,dst,dst -j SET --add-set defaultset_down_v6 src,dst,dst 2>/dev/null || true
+    ip6tables -C INPUT -m set --match-set defaultset_v6 src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT6] " --log-level 6 --log-ip-options 2>/dev/null || \
+        ip6tables -A INPUT -m set --match-set defaultset_v6 src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT6] " --log-level 6 --log-ip-options 2>/dev/null || true
+    ip6tables -C INPUT -m set --match-set defaultset_v6 src,dst,dst -j ACCEPT 2>/dev/null || \
+        ip6tables -A INPUT -m set --match-set defaultset_v6 src,dst,dst -j ACCEPT 2>/dev/null || true
+    ip6tables -C INPUT -m set --match-set tempset_v6 src,dst -j ACCEPT 2>/dev/null || \
+        ip6tables -A INPUT -m set --match-set tempset_v6 src,dst -j ACCEPT 2>/dev/null || true
+
+    # Allow loopback
+    ip6tables -C INPUT -i lo -j ACCEPT 2>/dev/null || ip6tables -I INPUT -i lo -j ACCEPT
+
+    # Allow established connections
+    ip6tables -C INPUT -m state --state ESTABLISHED -j ACCEPT 2>/dev/null || \
+        ip6tables -A INPUT -m state --state ESTABLISHED -j ACCEPT
+
+    # Default deny for IPv6 INPUT
+    ip6tables -C INPUT -j NHP_DENY 2>/dev/null || ip6tables -A INPUT -j NHP_DENY 2>/dev/null || true
+
+    # IPv6 FORWARD chain
+    ip6tables -C FORWARD -m set --match-set defaultset_v6 src,dst,dst -j SET --add-set defaultset_down_v6 src,dst,dst 2>/dev/null || \
+        ip6tables -A FORWARD -m set --match-set defaultset_v6 src,dst,dst -j SET --add-set defaultset_down_v6 src,dst,dst 2>/dev/null || true
+    ip6tables -C FORWARD -m set --match-set defaultset_v6 src,dst,dst -j LOG --log-prefix "[NHP-FORWARD6] " --log-level 6 --log-ip-options 2>/dev/null || \
+        ip6tables -A FORWARD -m set --match-set defaultset_v6 src,dst,dst -j LOG --log-prefix "[NHP-FORWARD6] " --log-level 6 --log-ip-options 2>/dev/null || true
+    ip6tables -C FORWARD -m set --match-set defaultset_v6 src,dst,dst -j ACCEPT 2>/dev/null || \
+        ip6tables -A FORWARD -m set --match-set defaultset_v6 src,dst,dst -j ACCEPT 2>/dev/null || true
+    ip6tables -C FORWARD -m state --state ESTABLISHED -j ACCEPT 2>/dev/null || \
+        ip6tables -A FORWARD -m state --state ESTABLISHED -j ACCEPT
+    ip6tables -C FORWARD -j NHP_DENY 2>/dev/null || ip6tables -A FORWARD -j NHP_DENY 2>/dev/null || true
+
+    # Set IPv6 chain policies
+    ip6tables -P INPUT DROP
+    ip6tables -P OUTPUT ACCEPT
+    ip6tables -P FORWARD DROP
+
+    echo "IPv6 NHP firewall setup complete"
+else
+    echo "Skipping IPv6 firewall setup (ip6tables not available or IPv6 ipsets failed)"
+fi
 
 echo "NHP firewall setup complete"
 
