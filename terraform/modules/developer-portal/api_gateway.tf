@@ -171,10 +171,10 @@ resource "aws_lambda_permission" "credentials" {
 #
 # This SLR is an account-wide singleton. If it already exists, import it:
 #   terraform import 'module.nhp.module.developer_portal[0].aws_iam_service_linked_role.apigateway[0]' \
-#     arn:aws:iam::ACCOUNT_ID:role/aws-service-role/apigateway.amazonaws.com/AWSServiceRoleForAPIGateway
+#     arn:aws:iam::ACCOUNT_ID:role/aws-service-role/ops.apigateway.amazonaws.com/AWSServiceRoleForAPIGateway
 resource "aws_iam_service_linked_role" "apigateway" {
   count            = local.has_custom_domain ? 1 : 0
-  aws_service_name = "apigateway.amazonaws.com"
+  aws_service_name = "ops.apigateway.amazonaws.com"
 }
 
 resource "aws_apigatewayv2_domain_name" "developer_portal" {
