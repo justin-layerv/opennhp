@@ -165,21 +165,14 @@ resource "aws_lambda_permission" "credentials" {
 # Custom Domain (optional)
 # ==============================================================================
 
-# API Gateway v2 custom domains require a Service Linked Role. Create it
-# explicitly so the domain resource can depend on it — otherwise the IAM
-# permission grant and the domain creation race during the same apply.
-#
-# This SLR is an account-wide singleton. If it already exists, import it:
-#   terraform import 'module.nhp.module.developer_portal[0].aws_iam_service_linked_role.apigateway[0]' \
-#     arn:aws:iam::ACCOUNT_ID:role/aws-service-role/ops.apigateway.amazonaws.com/AWSServiceRoleForAPIGateway
-resource "aws_iam_service_linked_role" "apigateway" {
-  count            = local.has_custom_domain ? 1 : 0
-  aws_service_name = "ops.apigateway.amazonaws.com"
-}
+# API Gateway v2 custom domains require the AWSServiceRoleForAPIGateway SLR.
+# The SLR is created automatically when API Gateway first needs it, provided
+# the caller has iam:CreateServiceLinkedRole (granted in the ecr module's
+# CI role policy). The SLR is an account-wide singleton — once created it
+# persists and subsequent domain creations succeed without IAM calls.
 
 resource "aws_apigatewayv2_domain_name" "developer_portal" {
   count       = local.has_custom_domain ? 1 : 0
-  depends_on  = [aws_iam_service_linked_role.apigateway]
   domain_name = var.custom_domain
 
   domain_name_configuration {
