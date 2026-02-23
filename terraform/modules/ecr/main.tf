@@ -962,6 +962,20 @@ resource "aws_iam_policy" "terraform_apply_iam" {
         ]
       },
       {
+        # API Gateway v2 custom domains require a Service Linked Role on first use
+        Sid    = "ServiceLinkedRoles"
+        Effect = "Allow"
+        Action = [
+          "iam:CreateServiceLinkedRole"
+        ]
+        Resource = "arn:aws:iam::${local.account_id}:role/aws-service-role/apigateway.amazonaws.com/*"
+        Condition = {
+          StringEquals = {
+            "iam:AWSServiceName" = "apigateway.amazonaws.com"
+          }
+        }
+      },
+      {
         Sid    = "SecurityServices"
         Effect = "Allow"
         Action = [
