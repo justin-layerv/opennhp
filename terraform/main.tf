@@ -1614,9 +1614,14 @@ resource "aws_route53_record" "qurl_link_ipv6" {
 #   qurl.link → CloudFront → resolve.qurl.link → NHP Server NLB:443 → Server:8888
 
 # ACM Certificate for resolve.qurl.link (must be in same region as NLB)
+# When CloudFront is enabled, includes an origin-specific SAN so CloudFront's
+# TLS verification passes (CloudFront checks the cert against the origin domain).
 resource "aws_acm_certificate" "qurl_resolve" {
-  count             = var.deploy_qurl_link ? 1 : 0
-  domain_name       = "resolve.${var.qurl_link_frontend_domain}"
+  count       = var.deploy_qurl_link ? 1 : 0
+  domain_name = "resolve.${var.qurl_link_frontend_domain}"
+  subject_alternative_names = var.enable_resolve_cloudfront ? [
+    "resolve-origin.${var.qurl_link_frontend_domain}"
+  ] : []
   validation_method = "DNS"
 
   lifecycle {
@@ -1695,6 +1700,27 @@ resource "aws_route53_record" "qurl_link_resolve_ipv6" {
     name                   = aws_cloudfront_distribution.qurl_resolve[0].domain_name
     zone_id                = aws_cloudfront_distribution.qurl_resolve[0].hosted_zone_id
     evaluate_target_health = false
+  }
+}
+
+# Origin-specific DNS record for CloudFront → NLB connectivity.
+# CloudFront verifies the origin's TLS cert matches the origin domain name.
+# Using the raw NLB DNS as origin fails because the NLB cert is for
+# resolve.qurl.link, not the NLB's auto-generated hostname.
+# This record provides a stable domain that matches the NLB cert's SAN.
+resource "aws_route53_record" "qurl_link_resolve_origin" {
+  count    = var.deploy_qurl_link && var.enable_resolve_cloudfront && !var.qurl_link_external_dns ? 1 : 0
+  provider = aws.route53_mgmt
+
+  allow_overwrite = true
+  zone_id         = var.qurl_link_hosted_zone_id
+  name            = "resolve-origin.${var.qurl_link_frontend_domain}"
+  type            = "A"
+
+  alias {
+    name                   = module.compute.nlb_dns_name
+    zone_id                = module.compute.nlb_zone_id
+    evaluate_target_health = true
   }
 }
 
@@ -1874,7 +1900,10 @@ resource "aws_cloudfront_distribution" "qurl_resolve" {
   price_class     = var.environment == "prod" ? "PriceClass_All" : "PriceClass_100"
 
   origin {
-    domain_name = module.compute.nlb_dns_name
+    # Use the origin-specific DNS record instead of the raw NLB DNS name.
+    # CloudFront verifies the origin's TLS cert matches this domain. The NLB
+    # cert includes resolve-origin.* as a SAN, so TLS verification passes.
+    domain_name = "resolve-origin.${var.qurl_link_frontend_domain}"
     origin_id   = "nlb"
 
     custom_origin_config {
