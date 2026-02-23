@@ -111,8 +111,8 @@ time_ago() {
     now=$(date +%s)
     # macOS uses `date -j -f` for parsing; Linux/CI uses `date -d`.
     # Try macOS first (no-op on Linux), fall back to GNU date.
-    if date -j -f "%Y-%m-%dT%H:%M:%S" "${ts%%[Z+]*}" +%s &>/dev/null 2>&1; then
-        ts_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${ts%%[Z+]*}" +%s 2>/dev/null)
+    if date -j -u -f "%Y-%m-%dT%H:%M:%S" "${ts%%[Z+]*}" +%s &>/dev/null 2>&1; then
+        ts_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "${ts%%[Z+]*}" +%s 2>/dev/null)
     else
         ts_epoch=$(date -d "$ts" +%s 2>/dev/null || echo "0")
     fi
@@ -130,8 +130,8 @@ minutes_since() {
     local now ts_epoch
     now=$(date +%s)
     # macOS uses `date -j -f` for parsing; Linux/CI uses `date -d`
-    if date -j -f "%Y-%m-%dT%H:%M:%S" "${ts%%[Z+]*}" +%s &>/dev/null 2>&1; then
-        ts_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${ts%%[Z+]*}" +%s 2>/dev/null)
+    if date -j -u -f "%Y-%m-%dT%H:%M:%S" "${ts%%[Z+]*}" +%s &>/dev/null 2>&1; then
+        ts_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "${ts%%[Z+]*}" +%s 2>/dev/null)
     else
         ts_epoch=$(date -d "$ts" +%s 2>/dev/null || echo "0")
     fi
