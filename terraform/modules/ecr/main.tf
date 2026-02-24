@@ -940,6 +940,7 @@ resource "aws_iam_policy" "terraform_apply_iam" {
         Resource = [
           "arn:aws:iam::${local.account_id}:role/layerv-nhp-*",
           "arn:aws:iam::${local.account_id}:role/nhp-*-github-actions",
+          "arn:aws:iam::${local.account_id}:role/traefik-plugins-*",
           "arn:aws:iam::${local.account_id}:instance-profile/layerv-nhp-*",
           "arn:aws:iam::${local.account_id}:oidc-provider/*"
         ]
@@ -1165,7 +1166,10 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "s3:PutBucketLifecycleConfiguration",
           "s3:GetBucketLifecycleConfiguration"
         ]
-        Resource = "arn:aws:s3:::layerv-nhp-*"
+        Resource = [
+          "arn:aws:s3:::layerv-nhp-*",
+          "arn:aws:s3:::traefik-plugins-*"
+        ]
       },
       {
         # S3 object permissions for Terraform-managed objects (plugin manifests, configs)
