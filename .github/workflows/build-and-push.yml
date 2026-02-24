@@ -459,6 +459,22 @@ jobs:
           role-to-assume: arn:aws:iam::767397897469:role/nhp-sandbox-github-actions
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Check for stale import blocks
+        if: steps.changes.outputs.terraform_changed == 'true'
+        run: |
+          # Import blocks are declarative and re-evaluate on every plan/apply.
+          # They should be removed after the initial import succeeds, otherwise
+          # they cause state drift and unexpected resource modifications.
+          IMPORT_FILES=$(grep -rl '^import {' terraform/environments/ 2>/dev/null || true)
+          if [[ -n "$IMPORT_FILES" ]]; then
+            echo "::warning::Stale Terraform import blocks detected. Import blocks re-run on every apply and should be removed after successful import."
+            echo ""
+            echo "Files with import blocks:"
+            echo "$IMPORT_FILES"
+            echo ""
+            echo "If these imports have already been applied, delete the import blocks to prevent state drift."
+          fi
+
       - name: Terraform Format Check
         if: steps.changes.outputs.terraform_changed == 'true'
         working-directory: terraform/environments/sandbox
@@ -586,6 +602,16 @@ jobs:
           mkdir -p "$HOME/.terraform.d/plugin-cache"
           export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
           terraform init
+
+      - name: Check for stale import blocks
+        run: |
+          IMPORT_FILES=$(grep -rl '^import {' terraform/environments/ 2>/dev/null || true)
+          if [[ -n "$IMPORT_FILES" ]]; then
+            echo "::warning::Stale Terraform import blocks detected. Import blocks re-run on every apply and should be removed after successful import."
+            echo ""
+            echo "Files with import blocks:"
+            echo "$IMPORT_FILES"
+          fi
 
       - name: Terraform Format Check
         working-directory: terraform/environments/${{ matrix.environment }}

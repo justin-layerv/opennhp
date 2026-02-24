@@ -485,6 +485,10 @@ resource "aws_ssm_document" "deploy" {
       S3Bucket:
         type: String
         description: "S3 bucket containing the plugin tarball"
+      PluginName:
+        type: String
+        default: "hqdatamiddleware"
+        description: "Plugin name used for S3 tarball key (e.g. hqdatamiddleware, qurl-router)"
       DeployPath:
         type: String
         default: "/home/ubuntu/traefik/plugins-local/src/github.com/traefik/hqdatamiddleware"
@@ -510,12 +514,14 @@ resource "aws_ssm_document" "deploy" {
                   # Parameters (substituted by SSM at runtime)
                   VERSION="{{ Version }}"
                   S3_BUCKET="{{ S3Bucket }}"
+                  PLUGIN_NAME="{{ PluginName }}"
                   DEPLOY_PATH="{{ DeployPath }}"
                   BACKUP_RETENTION="{{ BackupRetention }}"
 
                   echo "============================================"
                   echo "Traefik Plugin Deployment"
                   echo "============================================"
+                  echo "Plugin:      $PLUGIN_NAME"
                   echo "Version:     $VERSION"
                   echo "S3 Bucket:   $S3_BUCKET"
                   echo "Deploy Path: $DEPLOY_PATH"
@@ -560,8 +566,8 @@ resource "aws_ssm_document" "deploy" {
                   # Download and extract
                   echo ""
                   echo "Downloading plugin from S3..."
-                  TARBALL="/tmp/hqdatamiddleware-$${VERSION}.tar.gz"
-                  aws s3 cp "s3://$${S3_BUCKET}/traefik-plugins/hqdatamiddleware-$${VERSION}.tar.gz" "$TARBALL"
+                  TARBALL="/tmp/$${PLUGIN_NAME}-$${VERSION}.tar.gz"
+                  aws s3 cp "s3://$${S3_BUCKET}/traefik-plugins/$${PLUGIN_NAME}-$${VERSION}.tar.gz" "$TARBALL"
 
                   echo "Extracting to $DEPLOY_PATH..."
                   sudo mkdir -p "$DEPLOY_PATH"
@@ -589,12 +595,13 @@ resource "aws_ssm_document" "deploy" {
                   PLUGIN_DEPLOYED=false
                   TRAEFIK_OK=false
 
-                  # Critical check: Plugin file exists
-                  if [ -f "$DEPLOY_PATH/hqdata-middleware.go" ]; then
-                    echo "Plugin file deployed"
+                  # Critical check: Plugin .go files exist in deploy path
+                  GO_FILE_COUNT=$(find "$DEPLOY_PATH" -maxdepth 1 -name '*.go' ! -name '*_test.go' ! -name '*.go.bak' 2>/dev/null | wc -l | tr -d ' ')
+                  if [ "$GO_FILE_COUNT" -gt 0 ]; then
+                    echo "Plugin deployed: $GO_FILE_COUNT .go file(s) in $DEPLOY_PATH"
                     PLUGIN_DEPLOYED=true
                   else
-                    echo "Plugin file not found at $DEPLOY_PATH/hqdata-middleware.go"
+                    echo "No .go plugin files found in $DEPLOY_PATH"
                   fi
 
                   # Secondary check: Traefik state (only checked if it was running before)
