@@ -638,6 +638,21 @@ class TestEndpointRouting:
             assert call_args[0][0] == 'DELETE'
             assert '/v1/qurls/r_test123' in call_args[0][1]
 
+    def test_delete_qurl_204_normalized(self, mock_dynamodb, mock_proxy, delete_event):
+        """Verify upstream 204 No Content is normalized to 200 with a body."""
+        mock_proxy.return_value = (204, {})
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+
+            response = pp.lambda_handler(delete_event, None)
+
+            assert response['statusCode'] == 200
+            body = json.loads(response['body'])
+            assert body['data']['resource_id'] == 'r_test123'
+            assert body['data']['status'] == 'revoked'
+
     def test_mint_link_routed(self, mock_dynamodb, mock_proxy, mint_event):
         """Verify POST /playground/qurl/{id}/mint routes to mint handler."""
         with patch('boto3.resource'), patch('boto3.client'):

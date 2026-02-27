@@ -250,6 +250,11 @@ def handle_delete_qurl(event, qurl_id):
             return cors_response(event, 429, {'error': rate_error})
 
     status, response_body = proxy_to_qurl_api('DELETE', f'/v1/qurls/{qurl_id}')
+    # Upstream returns 204 No Content on success; normalize to 200 with a body
+    # so the browser can parse the JSON response.
+    if status == 204:
+        status = 200
+        response_body = {'data': {'resource_id': qurl_id, 'status': 'revoked'}}
     return cors_response(event, status, response_body)
 
 
