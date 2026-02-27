@@ -653,6 +653,21 @@ class TestEndpointRouting:
             assert call_args[0][0] == 'POST'
             assert '/v1/qurls/r_test123/mint_link' in call_args[0][1]
 
+    def test_mint_link_no_body(self, mock_dynamodb, mock_proxy, mint_event):
+        """Verify mint sends empty dict body when frontend sends no body."""
+        mint_event['body'] = None  # Frontend sends POST with no body
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            pp.rate_table = mock_dynamodb['rate_table']
+
+            response = pp.lambda_handler(mint_event, None)
+
+            assert response['statusCode'] == 200
+            mock_proxy.assert_called_once()
+            # body kwarg should be empty dict, not None
+            assert mock_proxy.call_args.kwargs.get('body') == {}
+
     def test_health_check_routed(self, health_event):
         """Verify GET /playground/health returns healthy status."""
         with patch('boto3.resource'), patch('boto3.client'):
@@ -998,6 +1013,30 @@ class TestProxyFunction:
 
             assert status == 502
             assert 'Upstream service unavailable' in body['error']['detail']
+
+    def test_proxy_logs_unparseable_upstream_error(self, mock_token):
+        """Verify unparseable upstream errors are logged with raw body."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            http_error = urllib.error.HTTPError(
+                url='https://api.layerv.xyz/v1/qurls/r_123/mint_link',
+                code=400,
+                msg='Bad Request',
+                hdrs={},
+                fp=io.BytesIO(b'')  # Empty body, not parseable as JSON
+            )
+
+            with patch('urllib.request.urlopen', side_effect=http_error), \
+                 patch.object(pp.logger, 'error') as mock_logger:
+                status, body = pp.proxy_to_qurl_api('POST', '/v1/qurls/r_123/mint_link', body={})
+
+            assert status == 400
+            assert body == {'error': {'detail': 'Upstream request failed'}}
+            mock_logger.assert_called_once()
+            log_extra = mock_logger.call_args.kwargs.get('extra', {})
+            assert log_extra['status'] == 400
+            assert log_extra['path'] == '/v1/qurls/r_123/mint_link'
 
 
 # ---------------------------------------------------------------------------

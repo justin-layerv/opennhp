@@ -348,7 +348,7 @@ def proxy_to_qurl_api(method, path, body=None, _retry=False):
         'Content-Type': 'application/json',
     }
 
-    data = json.dumps(body).encode() if body else None
+    data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
 
     try:
@@ -363,9 +363,12 @@ def proxy_to_qurl_api(method, path, body=None, _retry=False):
             _token_expires_at = 0
             logger.warning("QURL API returned 401, retrying with fresh token")
             return proxy_to_qurl_api(method, path, body, _retry=True)
+        raw_body = e.read()
         try:
-            error_body = json.loads(e.read())
-        except Exception:
+            error_body = json.loads(raw_body)
+        except (json.JSONDecodeError, ValueError):
+            logger.error("Upstream error with unparseable body",
+                         extra={"status": e.code, "path": path, "body": raw_body.decode('utf-8', errors='replace')[:500]})
             error_body = {'error': {'detail': 'Upstream request failed'}}
         return e.code, error_body
     except Exception as e:
