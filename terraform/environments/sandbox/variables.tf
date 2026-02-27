@@ -1006,31 +1006,6 @@ variable "plugin_repos" {
   default     = []
 }
 
-# Demo Gateway configuration
-variable "deploy_demo_gateway" {
-  description = "Deploy the Demo Gateway for qurl.link routing"
-  type        = bool
-  default     = false
-}
-
-variable "demo_gateway_domain" {
-  description = "Domain name for Demo Gateway (e.g., qurl.link)"
-  type        = string
-  default     = null
-}
-
-variable "demo_gateway_hosted_zone_id" {
-  description = "Route 53 hosted zone ID for Demo Gateway domain"
-  type        = string
-  default     = null
-}
-
-variable "demo_gateway_fallback_url" {
-  description = "URL to redirect to when no appId is provided"
-  type        = string
-  default     = "https://layerv.ai/demo"
-}
-
 variable "cross_account_route53_role_arn" {
   description = "IAM role ARN for cross-account Route 53 access"
   type        = string

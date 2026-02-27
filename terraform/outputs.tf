@@ -127,22 +127,6 @@ output "console_repo_url" {
   value       = module.ecr.console_repo_url
 }
 
-# Demo Gateway outputs
-output "demo_gateway_nlb_dns" {
-  description = "Demo Gateway NLB DNS name"
-  value       = var.deploy_demo_gateway ? module.demo_gateway[0].nlb_dns_name : null
-}
-
-output "demo_gateway_fqdn" {
-  description = "Demo Gateway fully qualified domain name"
-  value       = var.deploy_demo_gateway ? module.demo_gateway[0].fqdn : null
-}
-
-output "demo_gateway_asg_name" {
-  description = "Demo Gateway Auto Scaling Group name"
-  value       = var.deploy_demo_gateway ? module.demo_gateway[0].asg_name : null
-}
-
 # Console EC2 outputs
 output "console_ec2_nlb_dns" {
   description = "Console EC2 NLB DNS name"

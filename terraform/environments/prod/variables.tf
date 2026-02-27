@@ -820,26 +820,6 @@ variable "plugin_repos" {
   default = []
 }
 
-variable "deploy_demo_gateway" {
-  type    = bool
-  default = false
-}
-
-variable "demo_gateway_domain" {
-  type    = string
-  default = null
-}
-
-variable "demo_gateway_hosted_zone_id" {
-  type    = string
-  default = null
-}
-
-variable "demo_gateway_fallback_url" {
-  type    = string
-  default = "https://layerv.ai/demo"
-}
-
 variable "cross_account_route53_role_arn" {
   type    = string
   default = null

@@ -146,12 +146,6 @@ centralized_cert_enabled = true
 centralized_cert_domains = ["nhp.layerv.xyz", "*.nhp.layerv.xyz", "apps.layerv.xyz", "*.apps.layerv.xyz", "qurl.site.layerv.xyz", "*.qurl.site.layerv.xyz", "qurl.link.layerv.xyz", "*.qurl.link.layerv.xyz"]
 
 # ==============================================================================
-# Demo Gateway Configuration
-# Routes qurl.link.layerv.xyz/{appId} to NHP Server passcode plugin for demo flow
-# ==============================================================================
-deploy_demo_gateway = false
-
-# ==============================================================================
 # Console EC2 Configuration
 # Console API for portal site management (alternative to Fargate - more cost effective)
 # ==============================================================================

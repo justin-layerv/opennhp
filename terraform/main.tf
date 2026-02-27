@@ -765,40 +765,6 @@ module "ac" {
   # Secret reconciliation (cleanup orphaned per-instance secrets)
   enable_secret_reconciliation = var.enable_secret_reconciliation
 }
-
-# Demo Gateway Module - nginx + certbot for qurl.link routing to NHP Server plugins
-# Routes qurl.link/{appId} to NHP Server HTTP passcode plugin
-module "demo_gateway" {
-  source = "./modules/demo-gateway"
-  count  = var.deploy_demo_gateway ? 1 : 0
-
-  environment       = var.environment
-  domain_name       = var.demo_gateway_domain
-  acme_email        = var.acme_email
-  vpc_id            = module.networking.vpc_id
-  vpc_cidr          = var.vpc_cidr
-  public_subnet_ids = module.networking.public_subnet_ids
-  name_prefix       = local.name_prefix
-  tags              = local.common_tags
-
-  # NHP Server endpoint for plugin HTTP requests
-  # Uses Cloud Map DNS for service discovery within VPC
-  nhp_server_endpoint = "server.${module.data.namespace_name}"
-  nhp_server_port     = 8888
-
-  # Route 53 for DNS and ACME challenges
-  # For cross-account zones (e.g., qurl.link in layerv-mgmt), use cross_account_route53_role_arn
-  cross_account_route53_role_arn = var.cross_account_route53_role_arn
-  hosted_zone_id                 = var.demo_gateway_hosted_zone_id
-
-  # KMS encryption
-  ebs_kms_key_arn  = module.kms.ebs_key_arn
-  logs_kms_key_arn = module.kms.logs_key_arn
-
-  # Fallback redirect
-  fallback_url = var.demo_gateway_fallback_url
-}
-
 # ==================== Console Image Tag (SSM Parameter) ====================
 #
 # Console is built from a SEPARATE repository (layervai/console), not this repo.
