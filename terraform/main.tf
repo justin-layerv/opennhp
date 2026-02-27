@@ -1201,6 +1201,11 @@ module "qurl_service" {
   webhooks_response_body_limit           = var.qurl_webhooks_response_body_limit
   webhooks_api_version                   = var.qurl_webhooks_api_version
 
+  # GeoIP
+  geoip_enabled = var.qurl_geoip_enabled
+  geoip_db_path = var.qurl_geoip_db_path
+  geoip_s3_uri  = var.qurl_geoip_s3_uri
+
   # Observability (OpenTelemetry)
   otel_enabled           = var.qurl_otel_enabled
   otel_service_name      = var.qurl_otel_service_name

@@ -1202,6 +1202,26 @@ variable "qurl_webhooks_api_version" {
   type        = string
 }
 
+# ==================== QURL GeoIP ====================
+
+variable "qurl_geoip_enabled" {
+  description = "Enable GeoIP lookups for geo-restriction policies"
+  type        = bool
+  default     = false
+}
+
+variable "qurl_geoip_db_path" {
+  description = "Filesystem path for the GeoIP .mmdb database inside the container"
+  type        = string
+  default     = "/app/data/GeoLite2-Country.mmdb"
+}
+
+variable "qurl_geoip_s3_uri" {
+  description = "S3 URI of the GeoLite2-Country .mmdb database. Container downloads on startup when set."
+  type        = string
+  default     = ""
+}
+
 # ==================== QURL Observability (OpenTelemetry) ====================
 
 variable "qurl_otel_enabled" {

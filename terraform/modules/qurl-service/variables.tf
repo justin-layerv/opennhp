@@ -576,6 +576,35 @@ variable "otel_log_correlation" {
   type        = bool
 }
 
+# ==================== GeoIP ====================
+
+variable "geoip_enabled" {
+  description = "Enable GeoIP lookups for geo-restriction policies. Requires a MaxMind GeoLite2-Country .mmdb database."
+  type        = bool
+  default     = false
+}
+
+variable "geoip_db_path" {
+  description = "Filesystem path where the GeoIP .mmdb database is stored inside the container."
+  type        = string
+  default     = "/app/data/GeoLite2-Country.mmdb"
+}
+
+variable "geoip_s3_uri" {
+  description = <<-EOT
+    S3 URI of the GeoLite2-Country .mmdb database (e.g., s3://my-bucket/geoip/GeoLite2-Country.mmdb).
+    When set, the container entrypoint downloads the database from S3 on startup.
+    Leave empty if the database is baked into the container image.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.geoip_s3_uri == "" || can(regex("^s3://", var.geoip_s3_uri))
+    error_message = "geoip_s3_uri must be an S3 URI starting with s3:// or empty."
+  }
+}
+
 # ==================== Grafana Cloud (ADOT Sidecar) ====================
 
 variable "grafana_cloud_enabled" {

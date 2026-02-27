@@ -183,6 +183,15 @@ locals {
       { name = "WEBHOOKS_RESPONSE_BODY_LIMIT", value = tostring(var.webhooks_response_body_limit) },
       { name = "WEBHOOKS_API_VERSION", value = var.webhooks_api_version },
     ] : [],
+    # GeoIP configuration (for geo-restriction policies)
+    var.geoip_enabled ? concat([
+      { name = "GEOIP_ENABLED", value = "true" },
+      { name = "GEOIP_DB_PATH", value = var.geoip_db_path },
+      ],
+      var.geoip_s3_uri != "" ? [
+        { name = "GEOIP_S3_URI", value = var.geoip_s3_uri },
+      ] : [],
+    ) : [],
     # OpenTelemetry configuration
     # When Grafana Cloud is enabled, OTEL exports to the local ADOT sidecar
     # The sidecar then forwards to Grafana Cloud OTLP endpoint
@@ -385,6 +394,23 @@ resource "aws_iam_role_policy" "task_dynamodb" {
         ]
         Resource = [var.license_events_queue_arn]
     }] : [])
+  })
+}
+
+# Policy for GeoIP database download from S3 (conditional)
+resource "aws_iam_role_policy" "task_geoip_s3" {
+  count = var.geoip_s3_uri != "" ? 1 : 0
+  name  = "geoip-s3-access"
+  role  = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "GeoIPDatabaseDownload"
+      Effect   = "Allow"
+      Action   = ["s3:GetObject"]
+      Resource = [replace(var.geoip_s3_uri, "s3://", "arn:aws:s3:::")]
+    }]
   })
 }
 
