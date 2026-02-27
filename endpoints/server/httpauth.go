@@ -7,31 +7,18 @@ import (
 
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/log"
+	"github.com/OpenNHP/opennhp/nhp/plugins"
 )
 
 func (hs *HttpServer) authWithAspPlugin(c *gin.Context, req *common.HttpKnockRequest) {
-	var err error
-	aspId := req.AuthServiceId
-
-	handler := hs.FindPluginHandler(aspId)
+	handler := hs.FindPluginHandler(req.AuthServiceId)
 	if handler == nil {
-		// Note: err not used here since we return immediately
 		log.Error("no auth handler provided")
 		c.JSON(http.StatusOK, gin.H{"errMsg": "no auth handler provided"})
 		return
 	}
 
-	helper := hs.NewHttpServerHelper()
-	ackMsg, err := handler.AuthWithHttp(c, req, helper)
-	_ = ackMsg
-	if err != nil {
-		log.Info("auth error: %v", err)
-		if !c.Writer.Written() {
-			c.String(http.StatusOK, "{\"errMsg\": \"auth error: %v\"}", err)
-		}
-	} else {
-		log.Info("auth completed successfully")
-	}
+	hs.runPluginAuth(c, req, handler)
 }
 
 func (hs *HttpServer) legacyAuthWithAspPlugin(c *gin.Context, req *common.HttpKnockRequest) {
@@ -42,12 +29,18 @@ func (hs *HttpServer) legacyAuthWithAspPlugin(c *gin.Context, req *common.HttpKn
 		return
 	}
 
+	hs.runPluginAuth(c, req, handler)
+}
+
+// runPluginAuth calls the plugin's AuthWithHttp and handles the result.
+// If the plugin aborted the context (e.g., NHP silent drop), no error
+// response is written — preserving NHP protocol silence.
+func (hs *HttpServer) runPluginAuth(c *gin.Context, req *common.HttpKnockRequest, handler plugins.PluginHandler) {
 	helper := hs.NewHttpServerHelper()
-	ackMsg, err := handler.AuthWithHttp(c, req, helper)
-	_ = ackMsg
+	_, err := handler.AuthWithHttp(c, req, helper)
 	if err != nil {
 		log.Info("auth error: %v", err)
-		if !c.Writer.Written() {
+		if !c.Writer.Written() && !c.IsAborted() {
 			c.String(http.StatusOK, "{\"errMsg\": \"auth error: %v\"}", err)
 		}
 	} else {
