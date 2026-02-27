@@ -165,62 +165,53 @@ func TestInit_Success(t *testing.T) {
 	}
 }
 
-func TestHandleResolveError(t *testing.T) {
-	tests := []struct {
-		name           string
-		err            error
-		expectedStatus int
-		expectedError  string
+func TestHandleResolveError_NHPSilence(t *testing.T) {
+	// NHP behavior: all resolution errors result in silent connection drop.
+	// No HTTP status, no headers, no body — the server disappears.
+	testCases := []struct {
+		name string
+		err  error
 	}{
-		{
-			name:           "token not found",
-			err:            ErrTokenNotFound,
-			expectedStatus: http.StatusNotFound,
-			expectedError:  "token_not_found",
-		},
-		{
-			name:           "token consumed",
-			err:            ErrTokenConsumed,
-			expectedStatus: http.StatusGone,
-			expectedError:  "token_consumed",
-		},
-		{
-			name:           "token expired",
-			err:            ErrTokenExpired,
-			expectedStatus: http.StatusGone,
-			expectedError:  "token_expired",
-		},
-		{
-			name:           "policy violation",
-			err:            ErrPolicyViolation,
-			expectedStatus: http.StatusForbidden,
-			expectedError:  "policy_violation",
-		},
-		{
-			name:           "service error",
-			err:            ErrServiceError,
-			expectedStatus: http.StatusInternalServerError,
-			expectedError:  "resolution_failed",
-		},
+		{"token not found", ErrTokenNotFound},
+		{"token consumed", ErrTokenConsumed},
+		{"token expired", ErrTokenExpired},
+		{"policy violation", ErrPolicyViolation},
+		{"service error", ErrServiceError},
 	}
 
-	for _, tt := range tests {
+	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(w)
 
 			handleResolveError(ctx, tt.err)
 
-			if w.Code != tt.expectedStatus {
-				t.Errorf("handleResolveError(%v) status = %d, want %d", tt.err, w.Code, tt.expectedStatus)
+			// Verify NHP silence: no response body written
+			if body := w.Body.String(); body != "" {
+				t.Errorf("handleResolveError(%v) wrote body %q, want empty (NHP silence)", tt.err, body)
 			}
 
-			// Check response contains expected error code
-			body := w.Body.String()
-			if !strings.Contains(body, tt.expectedError) {
-				t.Errorf("handleResolveError(%v) body = %s, want to contain %q", tt.err, body, tt.expectedError)
+			// Verify context was aborted (no further handlers run)
+			if !ctx.IsAborted() {
+				t.Errorf("handleResolveError(%v) did not abort context", tt.err)
 			}
 		})
+	}
+}
+
+func TestNhpDrop(t *testing.T) {
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+
+	nhpDrop(ctx)
+
+	// httptest.ResponseRecorder doesn't implement http.Hijacker,
+	// so nhpDrop falls back to ctx.Abort() — verify that path works
+	if !ctx.IsAborted() {
+		t.Error("nhpDrop did not abort context")
+	}
+	if body := w.Body.String(); body != "" {
+		t.Errorf("nhpDrop wrote body %q, want empty", body)
 	}
 }
 
@@ -398,8 +389,12 @@ func TestAuthWithHttp_InvalidToken(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for empty token")
 	}
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected status %d, got %d", http.StatusBadRequest, w.Code)
+	// NHP behavior: invalid token gets silent drop, no HTTP response
+	if body := w.Body.String(); body != "" {
+		t.Errorf("invalid token should produce NHP silence, got body: %s", body)
+	}
+	if !ctx.IsAborted() {
+		t.Error("invalid token should abort context (NHP drop)")
 	}
 }
 
@@ -461,7 +456,11 @@ func TestAuthWithHttp_ResolverError(t *testing.T) {
 	if err == nil {
 		t.Error("expected error when resolver fails")
 	}
-	if w.Code != http.StatusNotFound {
-		t.Errorf("expected status %d, got %d", http.StatusNotFound, w.Code)
+	// NHP behavior: resolver errors get silent drop, no HTTP response
+	if body := w.Body.String(); body != "" {
+		t.Errorf("resolver error should produce NHP silence, got body: %s", body)
+	}
+	if !ctx.IsAborted() {
+		t.Error("resolver error should abort context (NHP drop)")
 	}
 }

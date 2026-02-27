@@ -1,7 +1,6 @@
 package qurl
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -81,16 +80,13 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	ctx.SetSameSite(http.SameSiteNoneMode)
 	nhpplugins.CorsMiddleware(ctx)
 
-	// Extract and validate access token from query parameter
+	// Extract and validate access token from query parameter.
+	// NHP behavior: invalid tokens get silent connection drop — revealing nothing
+	// about token format requirements or server existence.
 	accessToken := ctx.Query("token")
 	if err := ValidateAccessToken(accessToken); err != nil {
-		// Log detailed error for debugging, but return generic message to client
-		// to prevent attacker footprinting (e.g., learning token length requirements)
 		log.Error("[QURL] Invalid access token from %s: %v", ctx.ClientIP(), err)
-		ctx.JSON(http.StatusBadRequest, gin.H{
-			"error":   "invalid_token",
-			"message": "The provided token is invalid",
-		})
+		nhpDrop(ctx)
 		return nil, fmt.Errorf("invalid access token: %w", err)
 	}
 
@@ -211,33 +207,30 @@ func buildResourceData(resp *ResolveResponse) *common.ResourceData {
 	}
 }
 
-// handleResolveError sends appropriate error responses based on resolution failure
-func handleResolveError(ctx *gin.Context, err error) {
-	switch {
-	case errors.Is(err, ErrTokenNotFound):
-		ctx.JSON(http.StatusNotFound, gin.H{
-			"error":   "token_not_found",
-			"message": "Access token not found or expired",
-		})
-	case errors.Is(err, ErrTokenConsumed):
-		ctx.JSON(http.StatusGone, gin.H{
-			"error":   "token_consumed",
-			"message": "Access token has already been used",
-		})
-	case errors.Is(err, ErrTokenExpired):
-		ctx.JSON(http.StatusGone, gin.H{
-			"error":   "token_expired",
-			"message": "Access token has expired",
-		})
-	case errors.Is(err, ErrPolicyViolation):
-		ctx.JSON(http.StatusForbidden, gin.H{
-			"error":   "policy_violation",
-			"message": "Access denied by policy",
-		})
-	default:
-		ctx.JSON(http.StatusInternalServerError, gin.H{
-			"error":   "resolution_failed",
-			"message": "Failed to resolve access token",
-		})
-	}
+// nhpDrop silently drops the connection without sending any HTTP response.
+// This implements NHP (Network Hiding Protocol) behavior: unauthorized requests
+// receive no application-level response, making the server appear non-existent.
+// Behind infrastructure (CloudFront/NLB), this manifests as a generic 502/504.
+func nhpDrop(ctx *gin.Context) {
+	// Attempt to hijack the TCP connection for a true NHP silent drop.
+	// In production, Hijack() closes the raw TCP connection — the client
+	// sees a connection reset with no HTTP response.
+	// In tests (httptest.ResponseRecorder), gin's Hijack() panics because
+	// the underlying writer doesn't support it, so we recover gracefully.
+	func() {
+		defer func() { recover() }()
+		if conn, _, err := ctx.Writer.Hijack(); err == nil && conn != nil {
+			conn.Close()
+		}
+	}()
+	// Prevent any further handler processing
+	ctx.Abort()
+}
+
+// handleResolveError implements NHP behavior for all token resolution failures.
+// Instead of returning error details that reveal token state (consumed, expired,
+// not found, policy violation), it silently drops the connection. An attacker
+// learns nothing about why their request failed — the server simply disappears.
+func handleResolveError(ctx *gin.Context, _ error) {
+	nhpDrop(ctx)
 }

@@ -558,6 +558,22 @@ resource "aws_security_group" "server" {
     description = "HTTP plugin endpoints from AC and Demo Gateway"
   }
 
+  # QURL resolve endpoint: NLB TLS termination → Server HTTP on 8888.
+  # Must allow all IPs because NLB preserve_client_ip=true forwards packets
+  # with the original client IP (or CloudFront IP) as source. The endpoint
+  # is protected by TLS, short-lived token validation, and WAF (when
+  # CloudFront is enabled).
+  dynamic "ingress" {
+    for_each = var.enable_qurl_resolve_endpoint ? [1] : []
+    content {
+      from_port   = 8888
+      to_port     = 8888
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+      description = "QURL resolve endpoint - browser/CloudFront access via NLB TLS"
+    }
+  }
+
   # All outbound
   egress {
     from_port   = 0
@@ -576,34 +592,6 @@ resource "aws_security_group" "server" {
   lifecycle {
     create_before_destroy = true
   }
-}
-
-# Additional ingress rule for QURL resolve endpoint (NLB TLS → Server HTTP)
-#
-# IMPORTANT: This allows ANY IP to reach the endpoint because:
-# 1. User visits qurl.link (CloudFront → S3 SPA)
-# 2. SPA JavaScript extracts token from URL fragment
-# 3. SPA redirects BROWSER to resolve.qurl.link (NOT via CloudFront!)
-# 4. Browser makes direct HTTPS request to resolve.qurl.link
-#
-# The browser's IP is the source, not CloudFront. Therefore we must allow
-# all IPs. The endpoint is protected by:
-# - TLS encryption (certificate validation)
-# - Token validation in the QURL plugin
-# - Short-lived tokens with limited uses
-#
-# Only added when HTTPS listener is configured (enable_qurl_resolve_endpoint)
-
-resource "aws_security_group_rule" "server_https_from_internet" {
-  count = var.enable_qurl_resolve_endpoint ? 1 : 0
-
-  type              = "ingress"
-  from_port         = 8888
-  to_port           = 8888
-  protocol          = "tcp"
-  cidr_blocks       = ["0.0.0.0/0"]
-  security_group_id = aws_security_group.server.id
-  description       = "QURL resolve endpoint - browser access via NLB TLS"
 }
 
 # User Data script - using templatefile for proper interpolation
