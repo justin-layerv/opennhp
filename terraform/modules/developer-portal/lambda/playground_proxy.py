@@ -353,7 +353,8 @@ def proxy_to_qurl_api(method, path, body=None, _retry=False):
 
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            response_body = json.loads(resp.read())
+            raw = resp.read()
+            response_body = json.loads(raw) if raw else {}
             return resp.status, response_body
     except urllib.error.HTTPError as e:
         # On 401, invalidate cached token and retry once

@@ -1003,6 +1003,23 @@ class TestProxyFunction:
             assert status == 404
             assert 'error' in body
 
+    def test_proxy_handles_empty_response_body(self, mock_token):
+        """Verify proxy handles 204 No Content (empty body) from upstream."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import playground_proxy as pp
+
+            mock_resp = MagicMock()
+            mock_resp.status = 204
+            mock_resp.read.return_value = b''
+            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = MagicMock(return_value=False)
+
+            with patch('urllib.request.urlopen', return_value=mock_resp):
+                status, body = pp.proxy_to_qurl_api('DELETE', '/v1/qurls/r_123')
+
+            assert status == 204
+            assert body == {}
+
     def test_proxy_handles_connection_error(self, mock_token):
         """Verify proxy handles connection errors gracefully."""
         with patch('boto3.resource'), patch('boto3.client'):
