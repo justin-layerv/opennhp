@@ -217,86 +217,6 @@ resource "aws_security_group" "ac" {
   vpc_id      = var.vpc_id
   description = "Security group for AC instances"
 
-  # HTTPS - Traefik web proxy (NLB + direct access)
-  # Protected by CloudFront + WAF when enable_cloudfront=true
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "HTTPS - Traefik proxy (WAF protected via CloudFront)"
-  }
-
-  # HTTP - Traefik (redirect to HTTPS, ACME HTTP-01)
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "HTTP - Traefik redirect/ACME"
-  }
-
-  # Portal service - INTENTIONALLY PUBLIC
-  # This is the authentication entry point for the Zero Trust model.
-  # Users must access the portal to initiate NHP authentication.
-  ingress {
-    from_port   = 8888
-    to_port     = 8888
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Portal service (Zero Trust auth entry point)"
-  }
-
-  # NHP ConnectorClient - TCP - INTENTIONALLY PUBLIC
-  # Clients connect here after completing NHP knock authentication.
-  # Security is enforced by the NHP protocol, not network restrictions.
-  ingress {
-    from_port   = 4732
-    to_port     = 4732
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "NHP ConnectorClient (protocol-secured)"
-  }
-
-  # NHP knock packets - UDP - INTENTIONALLY PUBLIC
-  # Zero Trust: knock packets can come from anywhere.
-  # Only authenticated knocks are processed by the NHP protocol.
-  ingress {
-    from_port   = 62206
-    to_port     = 62206
-    protocol    = "udp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "NHP knock packets (protocol-secured)"
-  }
-
-  # SSH (for SSM, admin) - VPC only
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-    description = "SSH from VPC"
-  }
-
-  # Traefik health check endpoint - VPC only (for NLB health checks)
-  # Port 8080 is Traefik's dashboard/ping entrypoint
-  ingress {
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-    description = "Traefik health check from VPC (NLB)"
-  }
-
-  # All outbound
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "All outbound"
-  }
-
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-sg-ac"
     Component = "ac"
@@ -304,6 +224,126 @@ resource "aws_security_group" "ac" {
 
   lifecycle {
     create_before_destroy = true
+  }
+}
+
+# --- AC SG Rules (separate resources to avoid inline/standalone conflicts) ---
+
+# HTTPS - Traefik web proxy (NLB + direct access)
+# Protected by CloudFront + WAF when enable_cloudfront=true
+resource "aws_vpc_security_group_ingress_rule" "ac_https" {
+  security_group_id = aws_security_group.ac.id
+  description       = "HTTPS - Traefik proxy (WAF protected via CloudFront)"
+  from_port         = 443
+  to_port           = 443
+  ip_protocol       = "tcp"
+  cidr_ipv4         = "0.0.0.0/0"
+
+  tags = {
+    Name = "${var.name_prefix}-ac-https"
+  }
+}
+
+# HTTP - Traefik (redirect to HTTPS, ACME HTTP-01)
+resource "aws_vpc_security_group_ingress_rule" "ac_http" {
+  security_group_id = aws_security_group.ac.id
+  description       = "HTTP - Traefik redirect/ACME"
+  from_port         = 80
+  to_port           = 80
+  ip_protocol       = "tcp"
+  cidr_ipv4         = "0.0.0.0/0"
+
+  tags = {
+    Name = "${var.name_prefix}-ac-http"
+  }
+}
+
+# Portal service - INTENTIONALLY PUBLIC
+# This is the authentication entry point for the Zero Trust model.
+# Users must access the portal to initiate NHP authentication.
+resource "aws_vpc_security_group_ingress_rule" "ac_portal" {
+  security_group_id = aws_security_group.ac.id
+  description       = "Portal service (Zero Trust auth entry point)"
+  from_port         = 8888
+  to_port           = 8888
+  ip_protocol       = "tcp"
+  cidr_ipv4         = "0.0.0.0/0"
+
+  tags = {
+    Name = "${var.name_prefix}-ac-portal"
+  }
+}
+
+# NHP ConnectorClient - TCP - INTENTIONALLY PUBLIC
+# Clients connect here after completing NHP knock authentication.
+# Security is enforced by the NHP protocol, not network restrictions.
+resource "aws_vpc_security_group_ingress_rule" "ac_nhp_connector" {
+  security_group_id = aws_security_group.ac.id
+  description       = "NHP ConnectorClient (protocol-secured)"
+  from_port         = 4732
+  to_port           = 4732
+  ip_protocol       = "tcp"
+  cidr_ipv4         = "0.0.0.0/0"
+
+  tags = {
+    Name = "${var.name_prefix}-ac-nhp-connector"
+  }
+}
+
+# NHP knock packets - UDP - INTENTIONALLY PUBLIC
+# Zero Trust: knock packets can come from anywhere.
+# Only authenticated knocks are processed by the NHP protocol.
+resource "aws_vpc_security_group_ingress_rule" "ac_nhp_knock" {
+  security_group_id = aws_security_group.ac.id
+  description       = "NHP knock packets (protocol-secured)"
+  from_port         = 62206
+  to_port           = 62206
+  ip_protocol       = "udp"
+  cidr_ipv4         = "0.0.0.0/0"
+
+  tags = {
+    Name = "${var.name_prefix}-ac-nhp-knock"
+  }
+}
+
+# SSH (for SSM, admin) - VPC only
+resource "aws_vpc_security_group_ingress_rule" "ac_ssh" {
+  security_group_id = aws_security_group.ac.id
+  description       = "SSH from VPC"
+  from_port         = 22
+  to_port           = 22
+  ip_protocol       = "tcp"
+  cidr_ipv4         = var.vpc_cidr
+
+  tags = {
+    Name = "${var.name_prefix}-ac-ssh"
+  }
+}
+
+# Traefik health check endpoint - VPC only (for NLB health checks)
+# Port 8080 is Traefik's dashboard/ping entrypoint
+resource "aws_vpc_security_group_ingress_rule" "ac_traefik_health" {
+  security_group_id = aws_security_group.ac.id
+  description       = "Traefik health check from VPC (NLB)"
+  from_port         = 8080
+  to_port           = 8080
+  ip_protocol       = "tcp"
+  cidr_ipv4         = var.vpc_cidr
+
+  tags = {
+    Name = "${var.name_prefix}-ac-traefik-health"
+  }
+}
+
+# All outbound
+resource "aws_vpc_security_group_egress_rule" "ac_all" {
+  security_group_id = aws_security_group.ac.id
+  description       = "All outbound"
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
+
+  tags = {
+    Name = "${var.name_prefix}-ac-egress"
   }
 }
 

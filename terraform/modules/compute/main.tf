@@ -529,60 +529,6 @@ resource "aws_security_group" "server" {
   vpc_id      = var.vpc_id
   description = "Security group for NHP Server instances"
 
-  # NHP Protocol (UDP 62206) - from NLB
-  ingress {
-    from_port   = 62206
-    to_port     = 62206
-    protocol    = "udp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "NHP Protocol from NLB"
-  }
-
-  # HTTP (TCP 62206) - from VPC (Traefik proxies here)
-  ingress {
-    from_port   = 62206
-    to_port     = 62206
-    protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-    description = "HTTP from Traefik"
-  }
-
-
-  # HTTP for plugin endpoints (AC Traefik and Demo Gateway route here)
-  # NHP Server HTTP listens on 8888 for passcode, OIDC, and other authentication plugins
-  ingress {
-    from_port   = 8888
-    to_port     = 8888
-    protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-    description = "HTTP plugin endpoints from AC and Demo Gateway"
-  }
-
-  # QURL resolve endpoint: NLB TLS termination → Server HTTP on 8888.
-  # Must allow all IPs because NLB preserve_client_ip=true forwards packets
-  # with the original client IP (or CloudFront IP) as source. The endpoint
-  # is protected by TLS, short-lived token validation, and WAF (when
-  # CloudFront is enabled).
-  dynamic "ingress" {
-    for_each = var.enable_qurl_resolve_endpoint ? [1] : []
-    content {
-      from_port   = 8888
-      to_port     = 8888
-      protocol    = "tcp"
-      cidr_blocks = ["0.0.0.0/0"]
-      description = "QURL resolve endpoint - browser/CloudFront access via NLB TLS"
-    }
-  }
-
-  # All outbound
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "All outbound"
-  }
-
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-sg-server"
     Component = "compute"
@@ -591,6 +537,82 @@ resource "aws_security_group" "server" {
 
   lifecycle {
     create_before_destroy = true
+  }
+}
+
+# --- Server SG Rules (separate resources to avoid inline/standalone conflicts) ---
+
+# NHP Protocol (UDP 62206) - from NLB
+resource "aws_vpc_security_group_ingress_rule" "server_nhp_udp" {
+  security_group_id = aws_security_group.server.id
+  description       = "NHP Protocol from NLB"
+  from_port         = 62206
+  to_port           = 62206
+  ip_protocol       = "udp"
+  cidr_ipv4         = "0.0.0.0/0"
+
+  tags = {
+    Name = "${var.name_prefix}-server-nhp-udp"
+  }
+}
+
+# HTTP (TCP 62206) - from VPC (Traefik proxies here)
+resource "aws_vpc_security_group_ingress_rule" "server_http_traefik" {
+  security_group_id = aws_security_group.server.id
+  description       = "HTTP from Traefik"
+  from_port         = 62206
+  to_port           = 62206
+  ip_protocol       = "tcp"
+  cidr_ipv4         = var.vpc_cidr
+
+  tags = {
+    Name = "${var.name_prefix}-server-http-traefik"
+  }
+}
+
+# HTTP for plugin endpoints (AC Traefik and Demo Gateway route here)
+resource "aws_vpc_security_group_ingress_rule" "server_http_plugins" {
+  security_group_id = aws_security_group.server.id
+  description       = "HTTP plugin endpoints from AC and Demo Gateway"
+  from_port         = 8888
+  to_port           = 8888
+  ip_protocol       = "tcp"
+  cidr_ipv4         = var.vpc_cidr
+
+  tags = {
+    Name = "${var.name_prefix}-server-http-plugins"
+  }
+}
+
+# QURL resolve endpoint: NLB TLS termination → Server HTTP on 8888.
+# Must allow all IPs because NLB preserve_client_ip=true forwards packets
+# with the original client IP (or CloudFront IP) as source. The endpoint
+# is protected by TLS, short-lived token validation, and WAF (when
+# CloudFront is enabled).
+resource "aws_vpc_security_group_ingress_rule" "server_qurl_resolve" {
+  count = var.enable_qurl_resolve_endpoint ? 1 : 0
+
+  security_group_id = aws_security_group.server.id
+  description       = "QURL resolve endpoint - browser/CloudFront access via NLB TLS"
+  from_port         = 8888
+  to_port           = 8888
+  ip_protocol       = "tcp"
+  cidr_ipv4         = "0.0.0.0/0"
+
+  tags = {
+    Name = "${var.name_prefix}-server-qurl-resolve"
+  }
+}
+
+# All outbound
+resource "aws_vpc_security_group_egress_rule" "server_all" {
+  security_group_id = aws_security_group.server.id
+  description       = "All outbound"
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
+
+  tags = {
+    Name = "${var.name_prefix}-server-egress"
   }
 }
 
