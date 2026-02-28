@@ -26,7 +26,8 @@ on:
         type: choice
         options:
           - sandbox
-          - prod
+          # prod removed — prod deploys MUST go through promote-to-prod.yml
+          # via ./scripts/trigger-prod-deploy.sh (prevents accidental terraform apply in prod)
       deploy:
         description: 'Deploy after build?'
         required: true
