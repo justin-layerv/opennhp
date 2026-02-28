@@ -1,6 +1,7 @@
 package qurl
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -227,10 +228,24 @@ func nhpDrop(ctx *gin.Context) {
 	ctx.Abort()
 }
 
-// handleResolveError implements NHP behavior for all token resolution failures.
-// Instead of returning error details that reveal token state (consumed, expired,
-// not found, policy violation), it silently drops the connection. An attacker
-// learns nothing about why their request failed — the server simply disappears.
-func handleResolveError(ctx *gin.Context, _ error) {
-	nhpDrop(ctx)
+// handleResolveError handles token resolution failures.
+// Known token errors (consumed, expired, not found, policy violation) return
+// a generic 403 with no details — the user sees "access denied" but learns
+// nothing about the token's actual state. This avoids CloudFront 502 errors
+// that occur when the connection is silently dropped behind CDN infrastructure.
+// Unexpected errors still trigger nhpDrop for true NHP stealth behavior.
+func handleResolveError(ctx *gin.Context, err error) {
+	switch {
+	case errors.Is(err, ErrTokenConsumed),
+		errors.Is(err, ErrTokenExpired),
+		errors.Is(err, ErrTokenNotFound),
+		errors.Is(err, ErrPolicyViolation):
+		ctx.JSON(http.StatusForbidden, gin.H{
+			"error":   "access_denied",
+			"message": "This link is no longer available",
+		})
+		ctx.Abort()
+	default:
+		nhpDrop(ctx)
+	}
 }

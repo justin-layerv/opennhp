@@ -165,9 +165,9 @@ func TestInit_Success(t *testing.T) {
 	}
 }
 
-func TestHandleResolveError_NHPSilence(t *testing.T) {
-	// NHP behavior: all resolution errors result in silent connection drop.
-	// No HTTP status, no headers, no body — the server disappears.
+func TestHandleResolveError_KnownErrors_Return403(t *testing.T) {
+	// Known token errors return generic 403 to avoid CloudFront 502s
+	// from silent connection drops behind CDN infrastructure.
 	testCases := []struct {
 		name string
 		err  error
@@ -176,6 +176,40 @@ func TestHandleResolveError_NHPSilence(t *testing.T) {
 		{"token consumed", ErrTokenConsumed},
 		{"token expired", ErrTokenExpired},
 		{"policy violation", ErrPolicyViolation},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(w)
+
+			handleResolveError(ctx, tt.err)
+
+			if w.Code != http.StatusForbidden {
+				t.Errorf("handleResolveError(%v) status = %d, want %d", tt.err, w.Code, http.StatusForbidden)
+			}
+
+			var body map[string]string
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("handleResolveError(%v) response not valid JSON: %v", tt.err, err)
+			}
+			if body["error"] != "access_denied" {
+				t.Errorf("handleResolveError(%v) error = %q, want \"access_denied\"", tt.err, body["error"])
+			}
+
+			if !ctx.IsAborted() {
+				t.Errorf("handleResolveError(%v) did not abort context", tt.err)
+			}
+		})
+	}
+}
+
+func TestHandleResolveError_UnknownErrors_NHPDrop(t *testing.T) {
+	// Unknown/unexpected errors still trigger NHP silent drop
+	testCases := []struct {
+		name string
+		err  error
+	}{
 		{"service error", ErrServiceError},
 	}
 
@@ -186,12 +220,11 @@ func TestHandleResolveError_NHPSilence(t *testing.T) {
 
 			handleResolveError(ctx, tt.err)
 
-			// Verify NHP silence: no response body written
+			// NHP silence: no response body written
 			if body := w.Body.String(); body != "" {
 				t.Errorf("handleResolveError(%v) wrote body %q, want empty (NHP silence)", tt.err, body)
 			}
 
-			// Verify context was aborted (no further handlers run)
 			if !ctx.IsAborted() {
 				t.Errorf("handleResolveError(%v) did not abort context", tt.err)
 			}
@@ -456,11 +489,18 @@ func TestAuthWithHttp_ResolverError(t *testing.T) {
 	if err == nil {
 		t.Error("expected error when resolver fails")
 	}
-	// NHP behavior: resolver errors get silent drop, no HTTP response
-	if body := w.Body.String(); body != "" {
-		t.Errorf("resolver error should produce NHP silence, got body: %s", body)
+	// Known token errors return 403 (avoids CloudFront 502 from silent drop)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("resolver error status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("failed to parse response body: %v", err)
+	}
+	if body["error"] != "access_denied" {
+		t.Errorf("expected error='access_denied', got %q", body["error"])
 	}
 	if !ctx.IsAborted() {
-		t.Error("resolver error should abort context (NHP drop)")
+		t.Error("resolver error should abort context")
 	}
 }
