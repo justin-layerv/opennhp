@@ -1,4 +1,4 @@
-package qurl // rebuild: include PR #552 consumed-link 403 fix
+package qurl
 
 import (
 	"errors"
