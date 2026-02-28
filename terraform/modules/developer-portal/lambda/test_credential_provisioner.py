@@ -19,10 +19,14 @@ from unittest.mock import MagicMock, patch, ANY
 @pytest.fixture(autouse=True)
 def setup_module():
     """Import the module with mocked AWS clients."""
+    import sys
+    # Remove module so it gets re-imported within the patched context
+    sys.modules.pop('credential_provisioner', None)
     with patch('boto3.resource'), patch('boto3.client'):
-        import sys
-        if 'credential_provisioner' in sys.modules:
-            del sys.modules['credential_provisioner']
+        import importlib
+        import credential_provisioner
+        importlib.reload(credential_provisioner)
+        yield
 
 
 @pytest.fixture
@@ -51,19 +55,6 @@ def mock_ses():
 def mock_aws(mock_dynamodb, mock_ses):
     """Combined AWS mocks."""
     return {**mock_dynamodb, 'ses': mock_ses}
-
-
-@pytest.fixture
-def mock_auth0():
-    """Mock Auth0 Management API calls."""
-    with patch('credential_provisioner.create_auth0_m2m_app') as mock_create, \
-         patch('credential_provisioner.authorize_auth0_app') as mock_auth:
-        mock_create.return_value = {
-            'client_id': 'test_client_id_abc',
-            'client_secret': 'test_client_secret_xyz'
-        }
-        mock_auth.return_value = None
-        yield {'create': mock_create, 'authorize': mock_auth}
 
 
 @pytest.fixture
@@ -120,6 +111,58 @@ def health_event():
 
 
 # ---------------------------------------------------------------------------
+# API Key Generation Tests
+# ---------------------------------------------------------------------------
+
+class TestGenerateApiKey:
+    """Tests for generate_api_key() function."""
+
+    def test_key_has_correct_prefix(self):
+        with patch('boto3.resource'), patch('boto3.client'):
+            import credential_provisioner as cp
+            result = cp.generate_api_key()
+            assert result['api_key'].startswith('lv_live_')
+
+    def test_key_hash_is_sha256(self):
+        with patch('boto3.resource'), patch('boto3.client'):
+            import credential_provisioner as cp
+            result = cp.generate_api_key()
+            expected = hashlib.sha256(result['api_key'].encode()).hexdigest()
+            assert result['key_hash'] == expected
+
+    def test_key_prefix_masks_random_portion(self):
+        with patch('boto3.resource'), patch('boto3.client'):
+            import credential_provisioner as cp
+            result = cp.generate_api_key()
+            # Prefix should start with "lv_live_", show 4 random chars, end with "..."
+            assert result['key_prefix'].startswith('lv_live_')
+            assert result['key_prefix'].endswith('...')
+            # Should not expose more than 4 chars of the random portion
+            assert len(result['key_prefix']) == len('lv_live_') + 4 + 3  # prefix + 4 chars + "..."
+
+    def test_key_id_has_prefix(self):
+        with patch('boto3.resource'), patch('boto3.client'):
+            import credential_provisioner as cp
+            result = cp.generate_api_key()
+            assert result['key_id'].startswith('key_')
+
+    def test_keys_are_unique(self):
+        with patch('boto3.resource'), patch('boto3.client'):
+            import credential_provisioner as cp
+            key1 = cp.generate_api_key()
+            key2 = cp.generate_api_key()
+            assert key1['api_key'] != key2['api_key']
+            assert key1['key_hash'] != key2['key_hash']
+
+    def test_key_length_is_sufficient(self):
+        with patch('boto3.resource'), patch('boto3.client'):
+            import credential_provisioner as cp
+            result = cp.generate_api_key()
+            # lv_live_ (8) + token_urlsafe(32) (~43) = ~51 chars minimum
+            assert len(result['api_key']) > 40
+
+
+# ---------------------------------------------------------------------------
 # Routing Tests
 # ---------------------------------------------------------------------------
 
@@ -138,7 +181,7 @@ class TestRouting:
             response = cp.lambda_handler(register_event, None)
             assert response['statusCode'] == 200
 
-    def test_verify_routed(self, mock_aws, mock_auth0, verify_event):
+    def test_verify_routed(self, mock_aws, verify_event):
         """Verify GET /credentials/verify routes correctly."""
         with patch('boto3.resource'), patch('boto3.client'):
             import credential_provisioner as cp
@@ -360,8 +403,8 @@ class TestRegistration:
 class TestVerification:
     """Tests for the verification and credential provisioning flow."""
 
-    def test_successful_verification_provisions_credentials(self, mock_aws, mock_auth0, verify_event):
-        """Verify successful verification creates Auth0 app and returns credentials."""
+    def test_successful_verification_provisions_api_key(self, mock_aws, verify_event):
+        """Verify successful verification generates API key and returns it."""
         with patch('boto3.resource'), patch('boto3.client'):
             import credential_provisioner as cp
 
@@ -386,15 +429,11 @@ class TestVerification:
             assert response['statusCode'] == 200
             body = json.loads(response['body'])
             assert 'data' in body
-            assert body['data']['client_id'] == 'test_client_id_abc'
-            assert body['data']['client_secret'] == 'test_client_secret_xyz'
-            assert 'token_endpoint' in body['data']
+            assert body['data']['api_key'].startswith('lv_live_')
+            assert 'api_url' in body['data']
+            assert 'note' in body['data']
 
-            # Verify Auth0 was called
-            mock_auth0['create'].assert_called_once_with('developer@example.com')
-            mock_auth0['authorize'].assert_called_once_with('test_client_id_abc')
-
-    def test_verification_updates_dynamodb(self, mock_aws, mock_auth0, verify_event):
+    def test_verification_updates_dynamodb(self, mock_aws, verify_event):
         """Verify successful verification updates DynamoDB record."""
         with patch('boto3.resource'), patch('boto3.client'):
             import credential_provisioner as cp
@@ -417,15 +456,17 @@ class TestVerification:
 
             cp.handle_verify(verify_event)
 
-            # Verify update removes token_hash and TTL
-            update_call = mock_aws['credentials_table'].update_item.call_args
-            expr = update_call[1]['UpdateExpression']
+            # Verify update removes token_hash and TTL, stores api_key_id
+            # update_item is called twice: first for pending→provisioning, then for final update
+            calls = mock_aws['credentials_table'].update_item.call_args_list
+            final_call = calls[-1]
+            expr = final_call[1]['UpdateExpression']
             assert 'REMOVE' in expr
             assert '#th' in expr
             assert '#ttl' in expr
-            assert 'auth0_client_id' in expr
+            assert 'api_key_id' in expr
 
-    def test_verification_sends_credentials_email(self, mock_aws, mock_auth0, verify_event):
+    def test_verification_sends_credentials_email(self, mock_aws, verify_event):
         """Verify credentials email is sent after provisioning."""
         with patch('boto3.resource'), patch('boto3.client'):
             import credential_provisioner as cp
@@ -448,7 +489,7 @@ class TestVerification:
 
             cp.handle_verify(verify_event)
 
-            # Should have sent at least 2 emails: credentials + notification
+            # Should have sent at least 2 emails: API key + notification
             assert mock_aws['ses'].send_email.call_count >= 2
 
     def test_verification_constant_time_comparison(self):
@@ -576,8 +617,8 @@ class TestVerification:
             response = cp.handle_verify(verify_event)
             assert response['statusCode'] == 429
 
-    def test_auth0_failure_returns_500(self, mock_aws, verify_event):
-        """Verify Auth0 API failure returns 500."""
+    def test_key_generation_failure_returns_500(self, mock_aws, verify_event):
+        """Verify API key generation failure returns 500."""
         with patch('boto3.resource'), patch('boto3.client'):
             import credential_provisioner as cp
 
@@ -597,8 +638,8 @@ class TestVerification:
                 }
             }
 
-            with patch('credential_provisioner.create_auth0_m2m_app',
-                        side_effect=RuntimeError('Auth0 API error: 500')):
+            with patch('credential_provisioner.generate_api_key',
+                        side_effect=RuntimeError('Key generation error')):
                 response = cp.handle_verify(verify_event)
 
             assert response['statusCode'] == 500
@@ -753,202 +794,111 @@ class TestRateLimiting:
 
 
 # ---------------------------------------------------------------------------
-# Auth0 Management API Tests
+# _atomic_rate_check Direct Unit Tests
 # ---------------------------------------------------------------------------
 
-class TestAuth0Management:
-    """Tests for Auth0 Management API interactions."""
+class TestAtomicRateCheck:
+    """Direct tests for _atomic_rate_check edge cases.
 
-    def test_mgmt_token_cached(self):
-        """Verify management token is cached after first fetch."""
+    The rate limiting tests above exercise _atomic_rate_check through the
+    check_*_rate_limits wrappers. These tests exercise the function directly
+    to cover specific edge cases and verify the two-phase DynamoDB logic.
+    """
+
+    def _setup_rate_table(self, mock_dynamodb, side_effects):
+        """Configure rate_table mock and return (cp, exc_class)."""
+        from botocore.exceptions import ClientError
+        exc = ClientError(
+            {'Error': {'Code': 'ConditionalCheckFailedException', 'Message': 'Condition not met'}},
+            'UpdateItem',
+        )
+        mock_dynamodb['rate_table'].update_item.side_effect = side_effects(exc)
+        mock_dynamodb['rate_table'].meta = MagicMock()
+        mock_dynamodb['rate_table'].meta.client.exceptions.ConditionalCheckFailedException = type(exc)
+        return type(exc)
+
+    def test_new_key_resets_window_and_allows(self, mock_dynamodb):
+        """First request for a key: window reset succeeds → allowed."""
         with patch('boto3.resource'), patch('boto3.client'):
             import credential_provisioner as cp
+            cp.rate_table = mock_dynamodb['rate_table']
 
-            # Reset cache
-            cp._mgmt_token = None
-            cp._mgmt_token_expires_at = 0
+            # First update (window reset) succeeds — new key or expired window
+            mock_dynamodb['rate_table'].update_item.return_value = {}
+            mock_dynamodb['rate_table'].meta = MagicMock()
 
-            mock_sm = MagicMock()
-            mock_sm.get_secret_value.return_value = {
-                'SecretString': json.dumps({
-                    'client_id': 'mgmt_id',
-                    'client_secret': 'mgmt_secret'
-                })
-            }
+            result = cp._atomic_rate_check('test:key', 5, 3600)
+            assert result is True
+            # Only one call — didn't need to increment
+            assert mock_dynamodb['rate_table'].update_item.call_count == 1
 
-            token_response = json.dumps({
-                'access_token': 'mgmt-token-abc',
-                'expires_in': 86400
-            }).encode()
-
-            mock_resp = MagicMock()
-            mock_resp.read.return_value = token_response
-            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-            mock_resp.__exit__ = MagicMock(return_value=False)
-
-            with patch('boto3.client', return_value=mock_sm), \
-                 patch('urllib.request.urlopen', return_value=mock_resp):
-                token = cp.get_mgmt_token()
-
-            assert token == 'mgmt-token-abc'
-            assert cp._mgmt_token == 'mgmt-token-abc'
-
-    def test_cached_mgmt_token_returned(self):
-        """Verify cached management token is returned without API call."""
+    def test_current_window_increment_succeeds(self, mock_dynamodb):
+        """Window is current, under limit: increment succeeds → allowed."""
         with patch('boto3.resource'), patch('boto3.client'):
             import credential_provisioner as cp
+            cp.rate_table = mock_dynamodb['rate_table']
 
-            cp._mgmt_token = 'cached-mgmt-token'
-            cp._mgmt_token_expires_at = time.time() + 3600
+            self._setup_rate_table(mock_dynamodb, lambda exc: [exc, {}])
 
-            with patch('boto3.client') as mock_client:
-                token = cp.get_mgmt_token()
+            result = cp._atomic_rate_check('test:key', 5, 3600)
+            assert result is True
+            assert mock_dynamodb['rate_table'].update_item.call_count == 2
 
-            assert token == 'cached-mgmt-token'
-            mock_client.assert_not_called()
-
-    def test_create_auth0_app_sends_correct_payload(self):
-        """Verify Auth0 app creation sends the correct payload."""
+    def test_current_window_at_limit_rejected(self, mock_dynamodb):
+        """Window is current, at limit: increment fails → rejected."""
         with patch('boto3.resource'), patch('boto3.client'):
             import credential_provisioner as cp
+            cp.rate_table = mock_dynamodb['rate_table']
 
-            cp._mgmt_token = 'test-mgmt-token'
-            cp._mgmt_token_expires_at = time.time() + 3600
+            self._setup_rate_table(mock_dynamodb, lambda exc: [exc, exc])
 
-            app_response = json.dumps({
-                'client_id': 'new_client_id',
-                'client_secret': 'new_client_secret'
-            }).encode()
+            result = cp._atomic_rate_check('test:key', 5, 3600)
+            assert result is False
 
-            mock_resp = MagicMock()
-            mock_resp.read.return_value = app_response
-            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-            mock_resp.__exit__ = MagicMock(return_value=False)
-
-            with patch('urllib.request.urlopen', return_value=mock_resp) as mock_urlopen:
-                result = cp.create_auth0_m2m_app('dev@example.com')
-
-            assert result['client_id'] == 'new_client_id'
-            assert result['client_secret'] == 'new_client_secret'
-
-            # Verify the request payload
-            call_args = mock_urlopen.call_args
-            req = call_args[0][0]
-            payload = json.loads(req.data)
-            assert payload['app_type'] == 'non_interactive'
-            assert 'dev@example.com' in payload['name']
-
-    def test_authorize_app_sends_correct_grant(self):
-        """Verify Auth0 grant creation sends correct payload."""
+    def test_window_reset_sets_correct_ttl(self, mock_dynamodb):
+        """Window reset sets TTL to now + window_seconds."""
         with patch('boto3.resource'), patch('boto3.client'):
             import credential_provisioner as cp
+            cp.rate_table = mock_dynamodb['rate_table']
 
-            cp._mgmt_token = 'test-mgmt-token'
-            cp._mgmt_token_expires_at = time.time() + 3600
-            cp.QURL_API_AUDIENCE = 'https://api.layerv.xyz'
+            mock_dynamodb['rate_table'].update_item.return_value = {}
+            mock_dynamodb['rate_table'].meta = MagicMock()
 
-            grant_response = json.dumps({
-                'id': 'grant_id',
-                'client_id': 'test_client',
-                'audience': 'https://api.layerv.xyz'
-            }).encode()
+            cp._atomic_rate_check('test:key', 5, 3600)
 
-            mock_resp = MagicMock()
-            mock_resp.read.return_value = grant_response
-            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-            mock_resp.__exit__ = MagicMock(return_value=False)
+            call_kwargs = mock_dynamodb['rate_table'].update_item.call_args[1]
+            ttl_val = call_kwargs['ExpressionAttributeValues'][':ttl']
+            now_val = call_kwargs['ExpressionAttributeValues'][':now']
+            assert ttl_val == now_val + 3600
 
-            with patch('urllib.request.urlopen', return_value=mock_resp) as mock_urlopen:
-                cp.authorize_auth0_app('test_client')
-
-            call_args = mock_urlopen.call_args
-            req = call_args[0][0]
-            payload = json.loads(req.data)
-            assert payload['client_id'] == 'test_client'
-            assert payload['audience'] == 'https://api.layerv.xyz'
-
-    def test_authorize_skipped_without_audience(self):
-        """Verify grant creation raises error if audience is not configured."""
+    def test_increment_passes_correct_limit(self, mock_dynamodb):
+        """Increment phase passes the limit value in ConditionExpression."""
         with patch('boto3.resource'), patch('boto3.client'):
             import credential_provisioner as cp
+            cp.rate_table = mock_dynamodb['rate_table']
 
-            cp.QURL_API_AUDIENCE = ''
+            self._setup_rate_table(mock_dynamodb, lambda exc: [exc, {}])
 
-            with pytest.raises(RuntimeError, match='QURL_API_AUDIENCE not configured'):
-                cp.authorize_auth0_app('test_client')
+            cp._atomic_rate_check('test:key', 42, 3600)
 
-    def test_authorize_failure_triggers_rollback_delete(self, mock_aws, verify_event):
-        """Verify failed authorize_auth0_app triggers delete_auth0_app rollback."""
+            # Second call is the increment
+            second_call = mock_dynamodb['rate_table'].update_item.call_args_list[1]
+            assert second_call[1]['ExpressionAttributeValues'][':limit'] == 42
+
+    def test_unexpected_error_on_reset_propagates(self, mock_dynamodb):
+        """Non-ConditionalCheck error on first update propagates to caller."""
         with patch('boto3.resource'), patch('boto3.client'):
             import credential_provisioner as cp
+            cp.rate_table = mock_dynamodb['rate_table']
 
-            token = 'test-token-123'
-            token_hash = hashlib.sha256(token.encode()).hexdigest()
+            mock_dynamodb['rate_table'].update_item.side_effect = Exception('InternalServerError')
+            mock_dynamodb['rate_table'].meta = MagicMock()
+            cond_exc = type('ConditionalCheckFailedException', (Exception,), {})
+            mock_dynamodb['rate_table'].meta.client.exceptions.ConditionalCheckFailedException = cond_exc
 
-            cp.check_verify_rate_limits = MagicMock(return_value=None)
-            cp.credentials_table = mock_aws['credentials_table']
-            cp.ses = mock_aws['ses']
-
-            mock_aws['credentials_table'].get_item.return_value = {
-                'Item': {
-                    'email': 'developer@example.com',
-                    'status': 'pending',
-                    'token_hash': token_hash,
-                    'ttl': int(time.time()) + 3600
-                }
-            }
-
-            with patch('credential_provisioner.create_auth0_m2m_app') as mock_create, \
-                 patch('credential_provisioner.authorize_auth0_app') as mock_auth, \
-                 patch('credential_provisioner.delete_auth0_app') as mock_delete:
-                mock_create.return_value = {
-                    'client_id': 'orphan_client_id',
-                    'client_secret': 'orphan_secret'
-                }
-                mock_auth.side_effect = RuntimeError('Auth0 grant error: 403')
-
-                response = cp.handle_verify(verify_event)
-
-            assert response['statusCode'] == 500
-            mock_delete.assert_called_once_with('orphan_client_id')
-
-    def test_authorize_failure_rollback_delete_also_fails(self, mock_aws, verify_event):
-        """Verify failed rollback delete is handled gracefully (no crash)."""
-        with patch('boto3.resource'), patch('boto3.client'):
-            import credential_provisioner as cp
-
-            token = 'test-token-123'
-            token_hash = hashlib.sha256(token.encode()).hexdigest()
-
-            cp.check_verify_rate_limits = MagicMock(return_value=None)
-            cp.credentials_table = mock_aws['credentials_table']
-            cp.ses = mock_aws['ses']
-
-            mock_aws['credentials_table'].get_item.return_value = {
-                'Item': {
-                    'email': 'developer@example.com',
-                    'status': 'pending',
-                    'token_hash': token_hash,
-                    'ttl': int(time.time()) + 3600
-                }
-            }
-
-            with patch('credential_provisioner.create_auth0_m2m_app') as mock_create, \
-                 patch('credential_provisioner.authorize_auth0_app') as mock_auth, \
-                 patch('credential_provisioner.delete_auth0_app') as mock_delete:
-                mock_create.return_value = {
-                    'client_id': 'orphan_client_id',
-                    'client_secret': 'orphan_secret'
-                }
-                mock_auth.side_effect = RuntimeError('Auth0 grant error: 403')
-                mock_delete.side_effect = RuntimeError('Delete also failed')
-
-                response = cp.handle_verify(verify_event)
-
-            assert response['statusCode'] == 500
-            mock_delete.assert_called_once_with('orphan_client_id')
-            body = json.loads(response['body'])
-            assert 'Failed to provision' in body['error']
+            # The exception propagates (caller's try/except handles it)
+            with pytest.raises(Exception, match='InternalServerError'):
+                cp._atomic_rate_check('test:key', 5, 3600)
 
 
 # ---------------------------------------------------------------------------
@@ -1028,24 +978,23 @@ class TestEmailTemplates:
             assert 'https://api.layerv.ai/credentials/verify?token=abc' in html
             assert 'Verify' in html
 
-    def test_credentials_email_contains_credentials(self):
-        """Verify credentials email contains client_id and client_secret."""
+    def test_credentials_email_contains_api_key(self):
+        """Verify credentials email contains the API key."""
         with patch('boto3.resource'), patch('boto3.client'):
             import credential_provisioner as cp
 
-            html = cp._credentials_email_html('my_client_id', 'my_client_secret')
-            assert 'my_client_id' in html
-            assert 'my_client_secret' in html
+            html = cp._credentials_email_html('lv_live_test_key_abc')
+            assert 'lv_live_test_key_abc' in html
+            assert 'API Key' in html
 
-    def test_credentials_text_email_contains_credentials(self):
-        """Verify plain text credentials email contains credentials."""
+    def test_credentials_text_email_contains_api_key(self):
+        """Verify plain text credentials email contains the API key."""
         with patch('boto3.resource'), patch('boto3.client'):
             import credential_provisioner as cp
 
-            text = cp._credentials_email_text('my_client_id', 'my_client_secret')
-            assert 'my_client_id' in text
-            assert 'my_client_secret' in text
-            assert 'token' in text.lower()  # Should mention token endpoint
+            text = cp._credentials_email_text('lv_live_test_key_abc')
+            assert 'lv_live_test_key_abc' in text
+            assert 'API Key' in text
 
 
 # ---------------------------------------------------------------------------
@@ -1055,12 +1004,12 @@ class TestEmailTemplates:
 class TestSecurityCoverage:
     """Tests for security-critical validation paths."""
 
-    def test_verify_provisioning_race_condition(self, mock_aws, mock_auth0, verify_event):
+    def test_verify_provisioning_race_condition(self, mock_aws, verify_event):
         """Simulate race: two concurrent verify requests.
 
         The atomic pending->provisioning conditional update should cause the
         second request to get a ConditionalCheckFailedException, returning
-        400 with the generic error message (not a 500 or duplicate credentials).
+        400 with the generic error message (not a 500 or duplicate keys).
         """
         with patch('boto3.resource'), patch('boto3.client'):
             import credential_provisioner as cp
@@ -1098,8 +1047,6 @@ class TestSecurityCoverage:
             assert response['statusCode'] == 400
             body = json.loads(response['body'])
             assert 'invalid or has expired' in body['error']
-            # Auth0 should NOT have been called since the claim failed
-            mock_auth0['create'].assert_not_called()
 
     def test_verify_provisioning_status_returns_generic_error(self, mock_aws, verify_event):
         """Item with status='provisioning' should return 400 with generic error.
@@ -1183,20 +1130,6 @@ class TestSecurityCoverage:
             assert not mock_aws['credentials_table'].put_item.called
             assert not mock_aws['ses'].send_email.called
 
-    def test_audience_empty_raises_error(self):
-        """authorize_auth0_app with empty QURL_API_AUDIENCE should raise RuntimeError.
-
-        This prevents silently creating apps without an audience grant,
-        which would result in unusable credentials.
-        """
-        with patch('boto3.resource'), patch('boto3.client'):
-            import credential_provisioner as cp
-
-            cp.QURL_API_AUDIENCE = ''
-
-            with pytest.raises(RuntimeError, match='QURL_API_AUDIENCE not configured'):
-                cp.authorize_auth0_app('test_client_id')
-
     def test_null_headers_no_crash(self):
         """Event with headers: None should not crash get_cors_origin.
 
@@ -1212,10 +1145,10 @@ class TestSecurityCoverage:
             assert result is not None
             assert 'layerv.ai' in result
 
-    def test_verify_returns_audience_in_response(self, mock_aws, mock_auth0, verify_event):
-        """Successful verification should include audience field in response data.
+    def test_verify_returns_api_url_in_response(self, mock_aws, verify_event):
+        """Successful verification should include api_url field in response data.
 
-        The audience is needed by developers to configure their token requests.
+        The API URL is needed by developers to configure their API calls.
         """
         with patch('boto3.resource'), patch('boto3.client'):
             import credential_provisioner as cp
@@ -1241,80 +1174,8 @@ class TestSecurityCoverage:
             assert response['statusCode'] == 200
             body = json.loads(response['body'])
             assert 'data' in body
-            assert 'audience' in body['data']
-            assert body['data']['audience'] == cp.QURL_API_AUDIENCE
-
-
-# ---------------------------------------------------------------------------
-# Token Refresh Race Condition Tests
-# ---------------------------------------------------------------------------
-
-class TestTokenRefreshRace:
-    """Tests for concurrent management token refresh behavior."""
-
-    def test_concurrent_mgmt_token_refresh(self):
-        """Verify concurrent calls to get_mgmt_token with expired cache both succeed.
-
-        When two Lambda invocations hit an expired token simultaneously, both
-        should be able to fetch a new token. The second call overwrites the
-        cache but returns a valid token either way.
-        """
-        with patch('boto3.resource'), patch('boto3.client'):
-            import credential_provisioner as cp
-
-            cp._mgmt_token = None
-            cp._mgmt_token_expires_at = 0
-
-            mock_sm = MagicMock()
-            mock_sm.get_secret_value.return_value = {
-                'SecretString': json.dumps({
-                    'client_id': 'mgmt_id',
-                    'client_secret': 'mgmt_secret'
-                })
-            }
-
-            token_response = json.dumps({
-                'access_token': 'concurrent-mgmt-token',
-                'expires_in': 86400
-            }).encode()
-
-            mock_resp = MagicMock()
-            mock_resp.read.return_value = token_response
-            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-            mock_resp.__exit__ = MagicMock(return_value=False)
-
-            with patch('boto3.client', return_value=mock_sm), \
-                 patch('urllib.request.urlopen', return_value=mock_resp):
-                token1 = cp.get_mgmt_token()
-                # Reset cache to simulate second concurrent call
-                cp._mgmt_token = None
-                cp._mgmt_token_expires_at = 0
-                token2 = cp.get_mgmt_token()
-
-            assert token1 == 'concurrent-mgmt-token'
-            assert token2 == 'concurrent-mgmt-token'
-
-    def test_auth0_mgmt_token_endpoint_failure_raises(self):
-        """Verify Auth0 management token endpoint failure raises RuntimeError."""
-        with patch('boto3.resource'), patch('boto3.client'):
-            import credential_provisioner as cp
-            import urllib.error
-
-            cp._mgmt_token = None
-            cp._mgmt_token_expires_at = 0
-
-            mock_sm = MagicMock()
-            mock_sm.get_secret_value.return_value = {
-                'SecretString': json.dumps({
-                    'client_id': 'mgmt_id',
-                    'client_secret': 'mgmt_secret'
-                })
-            }
-
-            with patch('boto3.client', return_value=mock_sm), \
-                 patch('urllib.request.urlopen', side_effect=urllib.error.URLError('Connection refused')):
-                with pytest.raises(RuntimeError, match='Failed to obtain Auth0 management token'):
-                    cp.get_mgmt_token()
+            assert 'api_url' in body['data']
+            assert body['data']['api_url'] == cp.QURL_API_URL
 
 
 # ---------------------------------------------------------------------------

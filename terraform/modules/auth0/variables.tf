@@ -134,3 +134,83 @@ variable "auth0_tenant_domain" {
     error_message = "auth0_tenant_domain must be a valid Auth0 tenant domain (e.g., layerv.us.auth0.com)"
   }
 }
+
+# ==============================================================================
+# SPA Dashboard Configuration
+# ==============================================================================
+
+variable "enable_spa_dashboard" {
+  description = "Enable SPA dashboard Auth0 client for developer login"
+  type        = bool
+  default     = false
+}
+
+variable "spa_callback_urls" {
+  description = "Allowed callback URLs for SPA dashboard (Auth0 redirect after login)"
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for url in var.spa_callback_urls : can(regex("^https://", url))])
+    error_message = "All SPA callback URLs must use HTTPS"
+  }
+
+  validation {
+    condition     = !var.enable_spa_dashboard || length(var.spa_callback_urls) > 0
+    error_message = "spa_callback_urls must not be empty when enable_spa_dashboard is true"
+  }
+}
+
+variable "spa_logout_urls" {
+  description = "Allowed logout redirect URLs for SPA dashboard"
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for url in var.spa_logout_urls : can(regex("^https://", url))])
+    error_message = "All SPA logout URLs must use HTTPS"
+  }
+}
+
+variable "spa_web_origins" {
+  description = "Allowed web origins for SPA dashboard (CORS)"
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for url in var.spa_web_origins : can(regex("^https://", url))])
+    error_message = "All SPA web origins must use HTTPS"
+  }
+}
+
+# ==============================================================================
+# Social Connection Configuration (Google + GitHub)
+# ==============================================================================
+
+variable "google_oauth_client_id" {
+  description = "Google OAuth2 client ID for social login. If null, Google connection is not created."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "google_oauth_client_secret" {
+  description = "Google OAuth2 client secret for social login."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "github_oauth_client_id" {
+  description = "GitHub OAuth client ID for social login. If null, GitHub connection is not created."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "github_oauth_client_secret" {
+  description = "GitHub OAuth client secret for social login."
+  type        = string
+  default     = null
+  sensitive   = true
+}

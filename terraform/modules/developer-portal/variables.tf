@@ -41,7 +41,7 @@ variable "playground_m2m_secret_name" {
 }
 
 variable "auth0_mgmt_secret_name" {
-  description = "Secrets Manager secret name for Auth0 management API credentials"
+  description = "Secrets Manager secret name for Auth0 management API credentials (used by cleanup Lambda)"
   type        = string
 }
 
@@ -55,7 +55,7 @@ variable "qurl_api_url" {
 }
 
 variable "auth0_domain" {
-  description = "Auth0 domain for credential provisioner (e.g., auth.layerv.ai)"
+  description = "Auth0 domain (e.g., auth.layerv.ai). Used by cleanup Lambda."
   type        = string
 }
 
@@ -67,6 +67,34 @@ variable "qurl_api_audience" {
     condition     = var.qurl_api_audience != null && var.qurl_api_audience != ""
     error_message = "qurl_api_audience must be set to the Auth0 API identifier (e.g., https://api.layerv.ai). Empty audience prevents credential provisioning."
   }
+}
+
+# ==============================================================================
+# API Keys & Customers Tables (created externally, e.g. in qurl repo)
+# ==============================================================================
+
+variable "qurl_api_keys_table_name" {
+  description = "DynamoDB table name for QURL API keys (created in qurl repo)"
+  type        = string
+  default     = ""
+}
+
+variable "qurl_api_keys_table_arn" {
+  description = "DynamoDB table ARN for QURL API keys (created in qurl repo)"
+  type        = string
+  default     = ""
+}
+
+variable "qurl_customers_table_name" {
+  description = "DynamoDB table name for QURL customers (created in qurl repo)"
+  type        = string
+  default     = ""
+}
+
+variable "qurl_customers_table_arn" {
+  description = "DynamoDB table ARN for QURL customers (created in qurl repo)"
+  type        = string
+  default     = ""
 }
 
 # ==============================================================================

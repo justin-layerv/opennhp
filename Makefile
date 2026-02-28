@@ -196,12 +196,17 @@ test:
 	cd endpoints && KBS_SKIP_INIT=1 go test -v ./server/... -run "Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry"
 	@echo "$(COLOUR_GREEN)[OpenNHP] Unit Tests Done!$(END_COLOUR)"
 
+test-lambdas: ## Run Lambda unit tests (Python)
+	@echo "[OpenNHP] Running Lambda Unit Tests..."
+	python3 -m pytest terraform/modules/billing/lambda/test_*.py terraform/modules/developer-portal/lambda/test_*.py -v
+	@echo "$(COLOUR_GREEN)[OpenNHP] Lambda Unit Tests Done!$(END_COLOUR)"
+
 test-local: ## Run local e2e tests (requires: docker compose -f tests/local/docker-compose.test.yaml up -d etcd)
 	@echo "[OpenNHP] Running Local E2E Tests..."
 	cd tests/local && go test -v -tags=local ./...
 	@echo "$(COLOUR_GREEN)[OpenNHP] Local E2E Tests Done!$(END_COLOUR)"
 
-test-all: test test-local ## Run all tests
+test-all: test test-lambdas test-local ## Run all tests
 
 # Run fuzz tests (60 seconds each by default)
 fuzz:
@@ -225,4 +230,4 @@ archive:
 	@cd release && mkdir -p archive && tar -czvf ./archive/$(PACKAGE_FILE) nhp-agent nhp-ac nhp-db nhp-server
 	@echo "$(COLOUR_GREEN)[OpenNHP] Package ${PACKAGE_FILE} archived!$(END_COLOUR)"
 
-.PHONY: all generate-version-and-build init agentd acd serverd db linuxagentsdk androidagentsdk macosagentsdk iosagentsdk devicesdk plugins test test-local test-all fuzz fuzz-quick archive ebpf clean_ebpf
+.PHONY: all generate-version-and-build init agentd acd serverd db linuxagentsdk androidagentsdk macosagentsdk iosagentsdk devicesdk plugins test test-lambdas test-local test-all fuzz fuzz-quick archive ebpf clean_ebpf

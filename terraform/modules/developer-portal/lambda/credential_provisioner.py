@@ -1,12 +1,19 @@
 """
 QURL Developer Credential Provisioner Lambda
 
-Provides self-service Auth0 M2M credential provisioning for developers.
+Provides self-service API key provisioning for developers.
 Implements email verification flow before issuing credentials.
+
+Flow:
+    1. Developer registers with email (POST /credentials/register)
+    2. Verification email sent with a one-time token link
+    3. Developer clicks link, token is verified (GET /credentials/verify)
+    4. API key (lv_live_...) is generated, hashed, and stored in DynamoDB
+    5. Plaintext key is shown once and emailed to the developer
 
 Endpoints:
     POST /credentials/register  - Accept email, send verification link
-    GET  /credentials/verify    - Verify email token, provision Auth0 M2M app
+    GET  /credentials/verify    - Verify email token, provision API key
     GET  /credentials/health    - Health check
 """
 
@@ -20,9 +27,6 @@ import secrets
 import time
 import re
 import os
-import urllib.request
-import urllib.parse
-import urllib.error
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -65,7 +69,6 @@ dynamodb = boto3.resource('dynamodb')
 ses = boto3.client('ses', region_name=os.environ.get('SES_REGION', 'us-east-1'))
 
 # Configuration from environment
-AUTH0_MGMT_SECRET_NAME = os.environ.get('AUTH0_MGMT_SECRET_NAME', 'layerv/auth0-mgmt-credentials')
 CREDENTIALS_TABLE_NAME = os.environ.get('CREDENTIALS_TABLE_NAME', 'layerv-developer-credentials')
 RATE_TABLE_NAME = os.environ.get('RATE_TABLE_NAME', 'layerv-rate-limits')
 FROM_EMAIL = os.environ.get('FROM_EMAIL', 'noreply@layerv.ai')
@@ -75,9 +78,10 @@ ALLOWED_ORIGINS = os.environ.get(
     'ALLOWED_ORIGINS',
     'https://layerv.ai,https://www.layerv.ai,https://staging.layerv.ai'
 ).split(',')
-AUTH0_DOMAIN = os.environ.get('AUTH0_DOMAIN', 'auth.layerv.ai')
-QURL_API_AUDIENCE = os.environ.get('QURL_API_AUDIENCE', '')
 NOTIFY_EMAIL = os.environ.get('NOTIFY_EMAIL', 'team@layerv.ai')
+API_KEYS_TABLE_NAME = os.environ.get('API_KEYS_TABLE_NAME', '')
+CUSTOMERS_TABLE_NAME = os.environ.get('CUSTOMERS_TABLE_NAME', '')
+QURL_API_URL = os.environ.get('QURL_API_URL', 'https://api.layerv.xyz')
 
 # Rate limiting (configurable via env vars)
 REGISTRATION_RATE_LIMIT_IP = int(os.environ.get('REGISTRATION_RATE_LIMIT_IP', '5'))
@@ -97,10 +101,8 @@ EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
 # DynamoDB tables
 credentials_table = dynamodb.Table(CREDENTIALS_TABLE_NAME)
 rate_table = dynamodb.Table(RATE_TABLE_NAME)
-
-# Module-level Auth0 Management API token cache
-_mgmt_token = None
-_mgmt_token_expires_at = 0
+api_keys_table = dynamodb.Table(API_KEYS_TABLE_NAME) if API_KEYS_TABLE_NAME else None
+customers_table = dynamodb.Table(CUSTOMERS_TABLE_NAME) if CUSTOMERS_TABLE_NAME else None
 
 
 def lambda_handler(event, context):
@@ -201,7 +203,7 @@ def handle_register(event):
             ExpressionAttributeNames={'#s': 'status'},
             ExpressionAttributeValues={':provisioned': 'provisioned'}
         )
-    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+    except credentials_table.meta.client.exceptions.ConditionalCheckFailedException:
         # Already provisioned - don't reveal, return same message
         return cors_response(event, 200, {
             'message': 'Check your email to verify and receive credentials.'
@@ -237,15 +239,15 @@ def handle_register(event):
 
 def handle_verify(event):
     """
-    Handle email verification and credential provisioning.
+    Handle email verification and API key provisioning.
 
     1. Validate token + email
     2. Constant-time hash comparison
-    3. Create Auth0 M2M app via Management API
-    4. Authorize app for QURL API audience
-    5. Store credentials in DynamoDB
-    6. Return client_id + client_secret
-    7. Send credentials email
+    3. Generate API key (lv_live_...)
+    4. Store key hash in qurl-api-keys DynamoDB table
+    5. Lazy-provision customer record in qurl-customers table
+    6. Send API key email
+    7. Return plaintext API key (shown once)
     """
     # Uniform error message to prevent enumeration
     VERIFY_ERROR = 'This verification link is invalid or has expired.'
@@ -290,7 +292,7 @@ def handle_verify(event):
             return cors_response(event, 400, {'error': VERIFY_ERROR})
 
         # Atomically claim the pending→provisioning transition to prevent
-        # concurrent verify requests from both creating Auth0 apps
+        # concurrent verify requests from both generating API keys
         try:
             credentials_table.update_item(
                 Key={'email': email},
@@ -307,35 +309,72 @@ def handle_verify(event):
             # Another request already claimed this — return generic error
             return cors_response(event, 400, {'error': VERIFY_ERROR})
 
-        # Token is valid and claimed — provision Auth0 M2M credentials
+        # Token is valid and claimed — generate API key
         try:
-            auth0_app = create_auth0_m2m_app(email)
-            client_id = auth0_app['client_id']
-            client_secret = auth0_app['client_secret']
+            key_data = generate_api_key()
+            api_key = key_data['api_key']
 
-            # Authorize the app for the QURL API audience
-            try:
-                authorize_auth0_app(client_id)
-            except Exception as auth_err:
-                # Rollback: delete the orphaned Auth0 app
-                logger.error("Auth0 authorize failed, rolling back app creation", extra={"error": str(auth_err)})
+            # Derive owner_id for bridge keys (email-based, pre-Auth0 login)
+            email_hash = hashlib.sha256(email.encode()).hexdigest()
+            owner_id = f"email:{email_hash}"
+            now_iso = datetime.now(timezone.utc).isoformat()
+
+            # Write to qurl-api-keys table
+            if api_keys_table:
+                api_keys_table.put_item(Item={
+                    'key_hash': key_data['key_hash'],
+                    'key_id': key_data['key_id'],
+                    'key_prefix': key_data['key_prefix'],
+                    'owner_id': owner_id,
+                    'email': email,
+                    'name': 'Default',
+                    'scopes': ['qurl:read', 'qurl:write'],
+                    'status': 'active',
+                    'created_at': now_iso,
+                    'last_used_at': now_iso,
+                    'expires_at': '',  # Empty = never expires
+                })
+
+            # Write/update qurl-customers table (lazy provisioning)
+            if customers_table:
                 try:
-                    delete_auth0_app(client_id)
-                except Exception as del_err:
-                    logger.error("Auth0 rollback delete failed", extra={"error": str(del_err)})
-                raise
+                    customers_table.put_item(
+                        Item={
+                            'auth0_subject': owner_id,
+                            'email': email,
+                            'tier': 'free',
+                            'created_at': now_iso,
+                            'updated_at': now_iso,
+                        },
+                        ConditionExpression='attribute_not_exists(auth0_subject)'
+                    )
+                except customers_table.meta.client.exceptions.ConditionalCheckFailedException:
+                    pass  # Customer already exists, that's fine
 
         except Exception as e:
-            logger.error("Auth0 provisioning error", extra={"error": str(e)})
+            logger.error("API key provisioning error", extra={"error": str(e)})
+            # Reset status so the user can retry verification
+            try:
+                credentials_table.update_item(
+                    Key={'email': email},
+                    UpdateExpression='SET #s = :pending, updated_at = :now',
+                    ExpressionAttributeNames={'#s': 'status'},
+                    ExpressionAttributeValues={
+                        ':pending': 'pending',
+                        ':now': datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+            except Exception:
+                logger.error("Failed to reset provisioning state", extra={"email": email})
             return cors_response(event, 500, {
                 'error': 'Failed to provision credentials. Please try again or contact support.'
             })
 
-        # Update DynamoDB record: mark as provisioned, remove token, store client_id
+        # Update DynamoDB record: mark as provisioned, remove token, store key_id
         credentials_table.update_item(
             Key={'email': email},
             UpdateExpression='SET #s = :provisioned, updated_at = :now, '
-                            'auth0_client_id = :cid, provisioned_at = :now '
+                            'api_key_id = :kid, provisioned_at = :now '
                             'REMOVE #ttl, #th',
             ExpressionAttributeNames={
                 '#s': 'status',
@@ -344,26 +383,26 @@ def handle_verify(event):
             },
             ExpressionAttributeValues={
                 ':provisioned': 'provisioned',
-                ':now': datetime.now(timezone.utc).isoformat(),
-                ':cid': client_id,
+                ':now': now_iso,
+                ':kid': key_data['key_id'],
             }
         )
 
-        # Send credentials email (non-blocking)
+        # Send API key email (non-blocking)
         try:
             ses.send_email(
                 Source=FROM_EMAIL,
                 Destination={'ToAddresses': [email]},
                 Message={
-                    'Subject': {'Data': 'Your LayerV API credentials'},
+                    'Subject': {'Data': 'Your LayerV API Key'},
                     'Body': {
-                        'Html': {'Data': _credentials_email_html(client_id, client_secret)},
-                        'Text': {'Data': _credentials_email_text(client_id, client_secret)}
+                        'Html': {'Data': _credentials_email_html(api_key)},
+                        'Text': {'Data': _credentials_email_text(api_key)}
                     }
                 }
             )
         except Exception as e:
-            logger.warning("Credentials email failed (non-critical)", extra={"error": str(e)})
+            logger.warning("API key email failed (non-critical)", extra={"error": str(e)})
 
         # Notify team (non-blocking)
         try:
@@ -371,14 +410,15 @@ def handle_verify(event):
                 Source=FROM_EMAIL,
                 Destination={'ToAddresses': [NOTIFY_EMAIL]},
                 Message={
-                    'Subject': {'Data': f'New developer credential provisioned: {email}'},
+                    'Subject': {'Data': f'New API key provisioned: {email}'},
                     'Body': {
                         'Text': {'Data': (
-                            f'New developer credential provisioned:\n\n'
+                            f'New API key provisioned:\n\n'
                             f'Email: {email}\n'
                             f'Name: {item.get("name", "N/A")}\n'
-                            f'Client ID: {client_id}\n'
-                            f'Time: {datetime.now(timezone.utc).isoformat()} UTC'
+                            f'Key ID: {key_data["key_id"]}\n'
+                            f'Key Prefix: {key_data["key_prefix"]}\n'
+                            f'Time: {now_iso} UTC'
                         )}
                     }
                 }
@@ -387,14 +427,12 @@ def handle_verify(event):
             logger.warning("Notification email failed (non-critical)", extra={"error": str(e)})
 
         return cors_response(event, 200, {
-            'message': 'Credentials provisioned successfully.',
+            'message': 'API key provisioned successfully.',
             'data': {
-                'client_id': client_id,
-                'client_secret': client_secret,
-                'auth0_domain': AUTH0_DOMAIN,
-                'audience': QURL_API_AUDIENCE,
-                'token_endpoint': f'https://{AUTH0_DOMAIN}/oauth/token',
-                'note': 'Save your client_secret now. It will not be shown again.'
+                'api_key': api_key,
+                'api_url': QURL_API_URL,
+                'note': 'Save your API key now. It will not be shown again.',
+                'usage': f'curl -H "Authorization: Bearer {key_data["key_prefix"]}..." {QURL_API_URL}/v1/qurl'
             }
         })
 
@@ -413,175 +451,30 @@ def handle_health(event):
 
 
 # ---------------------------------------------------------------------------
-# Auth0 Management API
+# API Key Generation
 # ---------------------------------------------------------------------------
 
-def get_mgmt_token():
+def generate_api_key():
     """
-    Fetch or return cached Auth0 Management API token.
+    Generate a custom API key with lv_live_ prefix.
 
-    Uses a separate secret from the playground M2M credentials.
-    The management token has permissions to create clients and grants.
+    Returns dict with:
+      - api_key: full plaintext key (shown once, never stored)
+      - key_hash: SHA-256 hash (stored in DynamoDB)
+      - key_id: public identifier for CRUD operations
+      - key_prefix: first 12 chars for display
     """
-    global _mgmt_token, _mgmt_token_expires_at
-    now = time.time()
-
-    # Return cached token if still valid
-    if _mgmt_token and now < _mgmt_token_expires_at:
-        return _mgmt_token
-
-    # Fetch management API credentials from Secrets Manager
-    sm = boto3.client('secretsmanager')
-    secret = json.loads(
-        sm.get_secret_value(SecretId=AUTH0_MGMT_SECRET_NAME)['SecretString']
-    )
-
-    # Request management token from Auth0
-    data = urllib.parse.urlencode({
-        'grant_type': 'client_credentials',
-        'client_id': secret['client_id'],
-        'client_secret': secret['client_secret'],
-        'audience': f'https://{AUTH0_DOMAIN}/api/v2/',
-    }).encode()
-
-    req = urllib.request.Request(
-        f'https://{AUTH0_DOMAIN}/oauth/token',
-        data=data,
-        headers={'Content-Type': 'application/x-www-form-urlencoded'}
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            token_data = json.loads(resp.read())
-    except Exception as e:
-        logger.error("Auth0 management token request failed", extra={"error": str(e)})
-        raise RuntimeError('Failed to obtain Auth0 management token') from e
-
-    _mgmt_token = token_data['access_token']
-    _mgmt_token_expires_at = now + token_data.get('expires_in', 3600) - 60
-    return _mgmt_token
-
-
-def create_auth0_m2m_app(email):
-    """
-    Create an Auth0 Machine-to-Machine application for a developer.
-
-    Args:
-        email: Developer's email for naming the app.
-
-    Returns:
-        Dict with 'client_id' and 'client_secret'.
-    """
-    token = get_mgmt_token()
-
-    # Sanitize email for app name
-    safe_name = re.sub(r'[^a-zA-Z0-9@._-]', '', email)
-
-    payload = {
-        'name': f'QURL Developer - {safe_name}',
-        'description': f'QURL API credentials for {email}. Provisioned via self-service.',
-        'app_type': 'non_interactive',
-        'grant_types': ['client_credentials'],
-        'token_endpoint_auth_method': 'client_secret_post',
-    }
-
-    data = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        f'https://{AUTH0_DOMAIN}/api/v2/clients',
-        data=data,
-        headers={
-            'Authorization': f'Bearer {token}',
-            'Content-Type': 'application/json',
-        },
-        method='POST'
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            app_data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode() if hasattr(e, 'read') else str(e)
-        logger.error("Auth0 create client error", extra={"status": e.code, "response": error_body})
-        raise RuntimeError(f'Auth0 API error: {e.code}') from e
-    except Exception as e:
-        logger.error("Auth0 create client error", extra={"error": str(e)})
-        raise RuntimeError('Failed to create Auth0 application') from e
-
+    raw = secrets.token_urlsafe(32)
+    api_key = f"lv_live_{raw}"
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+    key_id = f"key_{secrets.token_urlsafe(9)}"  # 12 chars of randomness
+    key_prefix = f"lv_live_{raw[:4]}..."  # "lv_live_a3x9..." — shows prefix only
     return {
-        'client_id': app_data['client_id'],
-        'client_secret': app_data['client_secret'],
+        'api_key': api_key,
+        'key_hash': key_hash,
+        'key_id': key_id,
+        'key_prefix': key_prefix,
     }
-
-
-def delete_auth0_app(client_id):
-    """
-    Delete an Auth0 application (used for rollback on failed authorization).
-
-    Args:
-        client_id: The Auth0 client ID to delete.
-    """
-    token = get_mgmt_token()
-
-    req = urllib.request.Request(
-        f'https://{AUTH0_DOMAIN}/api/v2/clients/{client_id}',
-        headers={
-            'Authorization': f'Bearer {token}',
-        },
-        method='DELETE'
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            resp.read()  # Consume response
-    except Exception as e:
-        logger.error("Auth0 delete client error", extra={"error": str(e)})
-        raise RuntimeError(f'Failed to delete Auth0 application: {e}') from e
-
-
-def authorize_auth0_app(client_id):
-    """
-    Authorize an Auth0 M2M app for the QURL API audience.
-
-    Creates a client grant that allows the app to request tokens
-    for the QURL API.
-
-    Args:
-        client_id: The Auth0 client ID to authorize.
-    """
-    if not QURL_API_AUDIENCE:
-        raise RuntimeError(
-            'QURL_API_AUDIENCE not configured. Cannot authorize app without an audience.'
-        )
-
-    token = get_mgmt_token()
-
-    payload = {
-        'client_id': client_id,
-        'audience': QURL_API_AUDIENCE,
-        'scope': ['qurl:read', 'qurl:write'],
-    }
-
-    data = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        f'https://{AUTH0_DOMAIN}/api/v2/client-grants',
-        data=data,
-        headers={
-            'Authorization': f'Bearer {token}',
-            'Content-Type': 'application/json',
-        },
-        method='POST'
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            json.loads(resp.read())  # Consume response
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode() if hasattr(e, 'read') else str(e)
-        logger.error("Auth0 create grant error", extra={"status": e.code, "response": error_body})
-        raise RuntimeError(f'Auth0 grant error: {e.code}') from e
-    except Exception as e:
-        logger.error("Auth0 create grant error", extra={"error": str(e)})
-        raise RuntimeError('Failed to authorize Auth0 application') from e
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +494,13 @@ def _get_ci_bypass_key():
     try:
         sm = boto3.client('secretsmanager')
         resp = sm.get_secret_value(SecretId=CI_BYPASS_SECRET_NAME)
-        _ci_bypass_key = resp.get('SecretString', '')
+        raw = resp.get('SecretString', '')
+        # Handle both JSON ({"key": "..."}) and raw string formats
+        try:
+            parsed = json.loads(raw)
+            _ci_bypass_key = parsed.get('key', '') if isinstance(parsed, dict) else raw
+        except (json.JSONDecodeError, TypeError):
+            _ci_bypass_key = raw
         _ci_bypass_key_expires_at = time.time() + CI_BYPASS_CACHE_TTL
         return _ci_bypass_key
     except Exception as e:
@@ -822,13 +721,11 @@ If you didn't request API credentials, you can safely ignore this email.
 -- LayerV"""
 
 
-def _credentials_email_html(client_id, client_secret):
-    """HTML template for credentials delivery email."""
+def _credentials_email_html(api_key):
+    """HTML template for API key delivery email."""
     esc = html_module.escape
-    safe_id = esc(client_id)
-    safe_secret = esc(client_secret)
-    safe_domain = esc(AUTH0_DOMAIN)
-    safe_audience = esc(QURL_API_AUDIENCE)
+    safe_key = esc(api_key)
+    safe_api_url = esc(QURL_API_URL)
     safe_site = esc(SITE_URL)
     return f"""<!DOCTYPE html>
 <html>
@@ -839,28 +736,23 @@ def _credentials_email_html(client_id, client_secret):
     <h1 style="color: #6366f1; font-size: 24px; margin: 0;">LayerV</h1>
   </div>
 
-  <h2 style="font-size: 20px; margin-bottom: 16px;">Your QURL API Credentials</h2>
+  <h2 style="font-size: 20px; margin-bottom: 16px;">Your QURL API Key</h2>
 
-  <p>Your credentials have been provisioned. Save your client secret now &mdash;
+  <p>Your API key has been provisioned. Save it now &mdash;
   it will not be shown again.</p>
 
   <div style="background: #f1f5f9; border-radius: 8px; padding: 20px; margin: 24px 0;
               font-family: 'SF Mono', 'Fira Code', monospace; font-size: 14px;">
-    <p style="margin: 4px 0;"><strong>Client ID:</strong> <code>{safe_id}</code></p>
-    <p style="margin: 4px 0;"><strong>Client Secret:</strong> <code>{safe_secret}</code></p>
-    <p style="margin: 4px 0;"><strong>Token Endpoint:</strong>
-      <code>https://{safe_domain}/oauth/token</code></p>
-    <p style="margin: 4px 0;"><strong>Audience:</strong> <code>{safe_audience}</code></p>
+    <p style="margin: 4px 0;"><strong>API Key:</strong> <code>{safe_key}</code></p>
+    <p style="margin: 4px 0;"><strong>API URL:</strong> <code>{safe_api_url}</code></p>
   </div>
 
   <h3 style="font-size: 16px; margin-top: 28px;">Quick Start</h3>
   <div style="background: #1e293b; border-radius: 8px; padding: 16px; margin: 16px 0;
               font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px;
               color: #e2e8f0; overflow-x: auto;">
-    <pre style="margin: 0; white-space: pre-wrap;">curl -s --request POST \\
-  --url "https://{safe_domain}/oauth/token" \\
-  --header "content-type: application/json" \\
-  --data '{{"client_id":"{safe_id}","client_secret":"YOUR_SECRET","audience":"{safe_audience}","grant_type":"client_credentials"}}'</pre>
+    <pre style="margin: 0; white-space: pre-wrap;">curl -H "Authorization: Bearer {safe_key}" \\
+  {safe_api_url}/v1/qurl</pre>
   </div>
 
   <p style="font-size: 14px; color: #64748b;">
@@ -875,23 +767,18 @@ def _credentials_email_html(client_id, client_secret):
 </html>"""
 
 
-def _credentials_email_text(client_id, client_secret):
-    """Plain text template for credentials delivery email."""
-    return f"""LayerV - Your QURL API Credentials
+def _credentials_email_text(api_key):
+    """Plain text template for API key delivery email."""
+    return f"""LayerV - Your QURL API Key
 
-Your credentials have been provisioned. Save your client secret now -- it will not be shown again.
+Your API key has been provisioned. Save it now -- it will not be shown again.
 
-Client ID: {client_id}
-Client Secret: {client_secret}
-Token Endpoint: https://{AUTH0_DOMAIN}/oauth/token
-Audience: {QURL_API_AUDIENCE}
+API Key: {api_key}
+API URL: {QURL_API_URL}
 
 Quick Start:
 
-curl -s --request POST \\
-  --url "https://{AUTH0_DOMAIN}/oauth/token" \\
-  --header "content-type: application/json" \\
-  --data '{{"client_id":"{client_id}","client_secret":"YOUR_SECRET","audience":"{QURL_API_AUDIENCE}","grant_type":"client_credentials"}}'
+curl -H "Authorization: Bearer {api_key}" {QURL_API_URL}/v1/qurl
 
 See {SITE_URL}/docs/qurl-api for full usage details.
 

@@ -40,3 +40,24 @@ output "dev_portal_mgmt_secret_arn" {
   description = "ARN of the SM secret containing developer portal management credentials (null if not created)"
   value       = var.dev_portal_mgmt_secret_name != null ? aws_secretsmanager_secret.dev_portal_mgmt[0].arn : null
 }
+
+# SPA Dashboard outputs
+output "spa_dashboard_client_id" {
+  description = "Auth0 SPA dashboard client ID (for NEXT_PUBLIC_AUTH0_CLIENT_ID)"
+  value       = var.enable_spa_dashboard ? auth0_client.spa_dashboard[0].client_id : null
+}
+
+output "spa_dashboard_enabled" {
+  description = "Whether the SPA dashboard Auth0 client is enabled"
+  value       = var.enable_spa_dashboard
+}
+
+output "auth0_domain" {
+  description = "Auth0 domain for frontend configuration (NEXT_PUBLIC_AUTH0_DOMAIN)"
+  value       = var.auth0_tenant_domain
+}
+
+output "api_audience" {
+  description = "Auth0 API audience for frontend configuration (NEXT_PUBLIC_AUTH0_AUDIENCE)"
+  value       = auth0_resource_server.qurl_api.identifier
+}

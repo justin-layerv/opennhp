@@ -70,6 +70,7 @@ jobs:
       app: ${{ steps.filter.outputs.app }}
       infra: ${{ steps.filter.outputs.infra }}
       tests: ${{ steps.filter.outputs.tests }}
+      lambdas: ${{ steps.filter.outputs.lambdas }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -99,6 +100,8 @@ jobs:
               - 'tests/**'
               - 'nhp/**'
               - 'endpoints/**'
+            lambdas:
+              - 'terraform/modules/**/lambda/**'
 
       - name: Change Detection Summary
         run: |
@@ -109,6 +112,7 @@ jobs:
           echo "| App (nhp, endpoints, docker) | ${{ steps.filter.outputs.app }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Infrastructure (terraform) | ${{ steps.filter.outputs.infra }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Tests | ${{ steps.filter.outputs.tests }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Lambdas | ${{ steps.filter.outputs.lambdas }} |" >> $GITHUB_STEP_SUMMARY
 
       - name: Annotate skipped jobs
         if: steps.filter.outputs.code == 'false'
@@ -203,6 +207,45 @@ jobs:
             -w /workspace \
             golang:${{ env.GO_VERSION }}-bookworm \
             bash -c "cd nhp && go vet ./... && cd ../endpoints && go vet ./..."
+
+  # ============================================================================
+  # TEST LAMBDAS - Python unit tests for Lambda functions (billing, etc.)
+  # Runs in parallel with Go tests when Lambda code changes
+  # ============================================================================
+  test-lambdas:
+    name: Test Lambdas
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Skip notice
+        if: needs.changes.outputs.lambdas != 'true'
+        run: |
+          echo "::notice::Skipping Lambda tests - no Lambda code changes detected"
+
+      - name: Checkout code
+        if: needs.changes.outputs.lambdas == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Python
+        if: needs.changes.outputs.lambdas == 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        if: needs.changes.outputs.lambdas == 'true'
+        run: pip install pytest boto3
+
+      - name: Run Lambda unit tests
+        if: needs.changes.outputs.lambdas == 'true'
+        run: |
+          echo '::group::Billing Lambda Tests'
+          python -m pytest terraform/modules/billing/lambda/test_*.py -v
+          echo '::endgroup::'
+          echo '::group::Developer Portal Lambda Tests'
+          python -m pytest terraform/modules/developer-portal/lambda/test_*.py -v
+          echo '::endgroup::'
 
   # ============================================================================
   # BUILD - Parallel matrix builds after terraform validation/plan passes (or is skipped)
@@ -683,10 +726,11 @@ jobs:
 
   deploy-sandbox-infra:
     name: Deploy Sandbox - Infrastructure
-    needs: [setup, test, build, terraform-plan]
+    needs: [setup, test, test-lambdas, build, terraform-plan]
     if: |
       always() &&
       (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      (needs.test-lambdas.result == 'success' || needs.test-lambdas.result == 'skipped') &&
       needs.build.result == 'success' &&
       needs.terraform-plan.result == 'success' &&
       (
@@ -1187,10 +1231,11 @@ jobs:
 
   deploy-prod-infra:
     name: Deploy Prod - Infrastructure
-    needs: [setup, test, build, terraform-plan]
+    needs: [setup, test, test-lambdas, build, terraform-plan]
     if: |
       always() &&
       (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      (needs.test-lambdas.result == 'success' || needs.test-lambdas.result == 'skipped') &&
       needs.build.result == 'success' &&
       needs.terraform-plan.result == 'success' &&
       github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'prod'
@@ -1586,6 +1631,7 @@ jobs:
     needs:
       - setup
       - test
+      - test-lambdas
       - build
       # Sandbox deploy jobs
       - deploy-sandbox-infra
@@ -1607,6 +1653,7 @@ jobs:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
           # Build phase
           TEST_RESULT: ${{ needs.test.result }}
+          TEST_LAMBDAS_RESULT: ${{ needs.test-lambdas.result }}
           BUILD_RESULT: ${{ needs.build.result }}
           # Sandbox deploy components
           SANDBOX_INFRA: ${{ needs.deploy-sandbox-infra.result }}

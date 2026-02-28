@@ -18,12 +18,15 @@ from unittest.mock import MagicMock, patch, ANY
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def setup_module():
+def _import_module():
     """Import the module with mocked AWS clients."""
+    import sys
+    for mod in [k for k in sys.modules if k.startswith('playground_proxy')]:
+        del sys.modules[mod]
     with patch('boto3.resource'), patch('boto3.client'):
-        import sys
-        if 'playground_proxy' in sys.modules:
-            del sys.modules['playground_proxy']
+        import importlib
+        import playground_proxy as _mod
+        importlib.reload(_mod)
 
 
 @pytest.fixture

@@ -445,3 +445,128 @@ resource "aws_secretsmanager_secret_version" "dev_portal_mgmt" {
     ignore_changes = [secret_string]
   }
 }
+
+# ==============================================================================
+# SPA Application (for website dashboard login)
+# ==============================================================================
+# Auth0 SPA client for the website dashboard. Uses authorization_code + PKCE
+# (no client secret). Developers log in via Google/GitHub/email to manage
+# API keys, view usage, and handle billing.
+
+resource "auth0_client" "spa_dashboard" {
+  count       = var.enable_spa_dashboard ? 1 : 0
+  name        = "QURL Dashboard (${var.environment})"
+  description = "SPA client for developer dashboard - ${var.environment}"
+  app_type    = "spa"
+
+  # SPA uses authorization_code with PKCE (no client secret needed)
+  grant_types = ["authorization_code", "refresh_token"]
+
+  # Callbacks and logout URLs
+  callbacks           = var.spa_callback_urls
+  allowed_logout_urls = var.spa_logout_urls
+  web_origins         = var.spa_web_origins
+
+  # Token configuration
+  jwt_configuration {
+    alg                 = "RS256"
+    lifetime_in_seconds = var.web_token_lifetime
+  }
+
+  # Refresh token configuration for SPA
+  refresh_token {
+    rotation_type                = "rotating"
+    expiration_type              = "expiring"
+    token_lifetime               = 2592000 # 30 days
+    idle_token_lifetime          = 1296000 # 15 days
+    infinite_idle_token_lifetime = false
+    infinite_token_lifetime      = false
+    leeway                       = 0
+  }
+
+  # OIDC conformant
+  oidc_conformant = true
+
+  lifecycle {
+    precondition {
+      condition     = length(var.spa_callback_urls) > 0
+      error_message = "spa_callback_urls must not be empty when enable_spa_dashboard is true"
+    }
+  }
+}
+
+# SPA clients use PKCE (no client secret) — set auth method to "none"
+resource "auth0_client_credentials" "spa_dashboard" {
+  count                 = var.enable_spa_dashboard ? 1 : 0
+  client_id             = auth0_client.spa_dashboard[0].id
+  authentication_method = "none"
+}
+
+# Grant SPA dashboard access to QURL API scopes
+resource "auth0_client_grant" "spa_qurl_api" {
+  count     = var.enable_spa_dashboard ? 1 : 0
+  client_id = auth0_client.spa_dashboard[0].id
+  audience  = auth0_resource_server.qurl_api.identifier
+  scopes    = ["qurl:read", "qurl:write"]
+}
+
+# ==============================================================================
+# Social Connections (Google + GitHub)
+# ==============================================================================
+# These connections enable social login for the SPA dashboard.
+# The connections are created only when the SPA dashboard is enabled and
+# corresponding OAuth credentials are provided.
+
+resource "auth0_connection" "google" {
+  count                = var.enable_spa_dashboard && var.google_oauth_client_id != null ? 1 : 0
+  name                 = "google-oauth2"
+  strategy             = "google-oauth2"
+  is_domain_connection = false
+
+  options {
+    client_id     = var.google_oauth_client_id
+    client_secret = var.google_oauth_client_secret
+    scopes        = ["email", "profile"]
+
+    set_user_root_attributes = "on_first_login"
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "auth0_connection_clients" "google" {
+  count         = var.enable_spa_dashboard && var.google_oauth_client_id != null ? 1 : 0
+  connection_id = auth0_connection.google[0].id
+  enabled_clients = [
+    auth0_client.spa_dashboard[0].id,
+  ]
+}
+
+resource "auth0_connection" "github" {
+  count                = var.enable_spa_dashboard && var.github_oauth_client_id != null ? 1 : 0
+  name                 = "github"
+  strategy             = "github"
+  is_domain_connection = false
+
+  options {
+    client_id     = var.github_oauth_client_id
+    client_secret = var.github_oauth_client_secret
+    scopes        = ["user:email", "read:user"]
+
+    set_user_root_attributes = "on_first_login"
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "auth0_connection_clients" "github" {
+  count         = var.enable_spa_dashboard && var.github_oauth_client_id != null ? 1 : 0
+  connection_id = auth0_connection.github[0].id
+  enabled_clients = [
+    auth0_client.spa_dashboard[0].id,
+  ]
+}

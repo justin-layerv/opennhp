@@ -369,6 +369,12 @@ module "auth0" {
   # Developer portal management M2M app (only create when portal is enabled)
   dev_portal_mgmt_secret_name = var.deploy_developer_portal ? var.developer_portal_auth0_mgmt_secret_name : null
   auth0_tenant_domain         = var.auth0_domain
+
+  # SPA dashboard client for developer login
+  enable_spa_dashboard = var.enable_auth0_spa_dashboard
+  spa_callback_urls    = var.auth0_spa_callback_urls
+  spa_logout_urls      = var.auth0_spa_logout_urls
+  spa_web_origins      = var.auth0_spa_web_origins
 }
 
 # ==============================================================================

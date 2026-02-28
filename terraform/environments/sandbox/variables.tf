@@ -1447,3 +1447,31 @@ variable "developer_portal_ci_bypass_secret_name" {
   type        = string
   default     = null
 }
+
+# ==============================================================================
+# Auth0 SPA Dashboard Configuration
+# ==============================================================================
+
+variable "enable_auth0_spa_dashboard" {
+  description = "Enable Auth0 SPA client for dashboard login"
+  type        = bool
+  default     = false
+}
+
+variable "auth0_spa_callback_urls" {
+  description = "Auth0 SPA callback URLs for dashboard"
+  type        = list(string)
+  default     = []
+}
+
+variable "auth0_spa_logout_urls" {
+  description = "Auth0 SPA logout URLs for dashboard"
+  type        = list(string)
+  default     = []
+}
+
+variable "auth0_spa_web_origins" {
+  description = "Auth0 SPA web origins for dashboard CORS"
+  type        = list(string)
+  default     = []
+}
