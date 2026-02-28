@@ -229,6 +229,9 @@ auth0_domain = "layerv.us.auth0.com"
 qurl_jwt_secret_arn             = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/qurl-jwt-secret-i8a8OZ"
 qurl_internal_service_token_arn = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/qurl-internal-service-token-XgjoDM"
 
+# GeoIP database for geo-restriction policies (geo_allowlist/geo_denylist)
+qurl_geoip_s3_uri = "s3://layerv-nhp-sandbox-plugins/geoip/GeoLite2-Country.mmdb"
+
 # AC Fleet defaults (for QURL resources)
 qurl_default_ac_id   = "layerv-ac-tf"
 qurl_default_ac_port = 443

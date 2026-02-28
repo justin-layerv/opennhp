@@ -188,6 +188,9 @@ qurl_desired_count            = 1    # Single task for initial low traffic
 qurl_autoscaling_min_capacity = 1    # Minimum tasks (scale to zero not supported)
 qurl_autoscaling_max_capacity = 4    # Allow burst scaling if traffic spikes
 
+# GeoIP database for geo-restriction policies (geo_allowlist/geo_denylist)
+qurl_geoip_s3_uri = "s3://layerv-nhp-prod-plugins/geoip/GeoLite2-Country.mmdb"
+
 # QURL AC Fleet defaults
 qurl_default_ac_id   = "layerv-ac-tf"
 qurl_default_ac_port = 443
