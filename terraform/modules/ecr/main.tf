@@ -1163,8 +1163,8 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "s3:PutBucketTagging",
           "s3:PutBucketPolicy",
           "s3:DeleteBucketPolicy",
-          "s3:PutBucketLifecycleConfiguration",
-          "s3:GetBucketLifecycleConfiguration"
+          "s3:PutLifecycleConfiguration",
+          "s3:GetLifecycleConfiguration"
         ]
         Resource = [
           "arn:aws:s3:::layerv-nhp-*",
