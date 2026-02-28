@@ -411,14 +411,6 @@ jobs:
           docker push $ECR_REGISTRY/${{ matrix.repo }}:latest
           echo "::notice::Image pushed: $ECR_REGISTRY/${{ matrix.repo }}:$IMAGE_TAG"
 
-      # Re-authenticate for prod SSM updates (build job uses sandbox ECR credentials above)
-      - name: Configure AWS credentials (prod SSM)
-        if: needs.changes.outputs.app == 'true' && github.event_name != 'pull_request' && needs.setup.outputs.environment == 'prod'
-        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
-        with:
-          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
       # Update SSM parameter with the new image tag
       # This enables instance refresh to use the new image without terraform apply
       - name: Update SSM Image Tag
@@ -634,7 +626,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
         with:
-          role-to-assume: ${{ matrix.environment == 'prod' && secrets.AWS_PROD_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Build Lambda Packages
@@ -667,8 +659,8 @@ jobs:
 
       - name: Validate Auth0 Credentials
         env:
-          AUTH0_CLIENT_ID: ${{ matrix.environment == 'prod' && secrets.PROD_AUTH0_CLIENT_ID || secrets.AUTH0_CLIENT_ID }}
-          AUTH0_CLIENT_SECRET: ${{ matrix.environment == 'prod' && secrets.PROD_AUTH0_CLIENT_SECRET || secrets.AUTH0_CLIENT_SECRET }}
+          AUTH0_CLIENT_ID: ${{ secrets.AUTH0_CLIENT_ID }}
+          AUTH0_CLIENT_SECRET: ${{ secrets.AUTH0_CLIENT_SECRET }}
         run: ./.github/scripts/validate-auth0-credentials.sh "terraform/environments/${{ matrix.environment }}/terraform.tfvars" "${{ matrix.environment }}"
 
       - name: Terraform Plan
@@ -679,14 +671,12 @@ jobs:
           TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
           TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
           # AC license key (plaintext - stored in Secrets Manager)
-          TF_VAR_ac_license_key: ${{ matrix.environment == 'prod' && secrets.PROD_AC_LICENSE_KEY || secrets.AC_LICENSE_KEY }}
+          TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
           # Grafana Cloud API token for dashboard provisioning
-          TF_VAR_grafana_auth: ${{ matrix.environment == 'prod' && secrets.PROD_GRAFANA_AUTH || secrets.GRAFANA_AUTH }}
-          # Auth0 Terraform provider credentials (prod requires dedicated secrets)
-          TF_VAR_auth0_tf_client_id: ${{ matrix.environment == 'prod' && secrets.PROD_AUTH0_CLIENT_ID || secrets.AUTH0_CLIENT_ID }}
-          TF_VAR_auth0_tf_client_secret: ${{ matrix.environment == 'prod' && secrets.PROD_AUTH0_CLIENT_SECRET || secrets.AUTH0_CLIENT_SECRET }}
-          # Prod deployment safeguard
-          TF_VAR_confirm_prod_deployment: ${{ matrix.environment == 'prod' && 'yes-deploy-to-production' || '' }}
+          TF_VAR_grafana_auth: ${{ secrets.GRAFANA_AUTH }}
+          # Auth0 Terraform provider credentials
+          TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
+          TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
           # Deployment configuration - use commit SHA for immutable deployments
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         run: |
@@ -1220,409 +1210,9 @@ jobs:
           echo "::notice::Deployment tracking updated: deployed-commit = ${{ github.sha }}"
 
   # ============================================================================
-  # DEPLOY PROD - Split into separate jobs (sequential - no Console to parallelize)
+  # PROD DEPLOY - Handled exclusively by promote-to-prod.yml
+  # Use ./scripts/trigger-prod-deploy.sh to deploy to production.
   # ============================================================================
-  # Job dependency graph:
-  #   deploy-prod-infra → deploy-prod-server → deploy-prod-ac → deploy-prod-validate
-  #
-  # Note: Production doesn't have Console EC2. Unlike sandbox where AC and Console
-  # run in parallel after Server, production runs sequentially. This is intentional -
-  # there's no time savings from splitting without a parallel workload.
-  # ============================================================================
-
-  deploy-prod-infra:
-    name: Deploy Prod - Infrastructure
-    needs: [setup, test, test-lambdas, build, terraform-plan]
-    if: |
-      always() &&
-      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
-      (needs.test-lambdas.result == 'success' || needs.test-lambdas.result == 'skipped') &&
-      needs.build.result == 'success' &&
-      needs.terraform-plan.result == 'success' &&
-      github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true' && github.event.inputs.environment == 'prod'
-    runs-on: ubuntu-latest
-    environment: production
-    timeout-minutes: 30
-    outputs:
-      server_asg: ${{ steps.outputs.outputs.server_asg }}
-      ac_asg: ${{ steps.outputs.outputs.ac_asg }}
-      nlb_dns: ${{ steps.outputs.outputs.nlb_dns }}
-      etcd_endpoint: ${{ steps.outputs.outputs.etcd_endpoint }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Cache Terraform plugins
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
-        with:
-          path: ~/.terraform.d/plugin-cache
-          key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
-          restore-keys: terraform-plugins-
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
-        with:
-          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Build Lambda Packages
-        uses: ./.github/actions/build-lambda-packages
-
-      - name: Terraform Init
-        working-directory: terraform/environments/prod
-        run: |
-          mkdir -p "$HOME/.terraform.d/plugin-cache"
-          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
-          terraform init
-
-      - name: Handle ASG Attachment Migrations (Prod)
-        working-directory: terraform/environments/prod
-        env:
-          TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
-          TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
-          TF_VAR_ac_license_key: ${{ secrets.PROD_AC_LICENSE_KEY }}
-          TF_VAR_grafana_auth: ${{ secrets.PROD_GRAFANA_AUTH }}
-          TF_VAR_auth0_tf_client_id: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
-          TF_VAR_auth0_tf_client_secret: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
-          TF_VAR_confirm_prod_deployment: "yes-deploy-to-production"
-          TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
-        run: |
-          set -euo pipefail
-
-          # Clean up any stale plan files from previous failed runs
-          rm -f tfplan plan.txt
-
-          # See sandbox job for detailed explanation of the race condition
-          terraform plan -out=tfplan -no-color 2>&1 | tee plan.txt
-
-          # Pattern matches both indexed (foo[0]) and non-indexed (foo) resources
-          ATTACHMENTS=$(grep -E "aws_autoscaling_attachment\.[^ ]+ will be destroyed" plan.txt | \
-            sed 's/.*# //' | sed 's/ will be destroyed//' || true)
-
-          # Warn if we found attachment references but failed to parse them (format may have changed)
-          if grep -q "aws_autoscaling_attachment" plan.txt && [[ -z "$ATTACHMENTS" ]]; then
-            echo "::warning::Found aws_autoscaling_attachment in plan but no destructions detected (this is normal if not migrating)"
-          fi
-
-          if [[ -n "$ATTACHMENTS" ]]; then
-            echo "::warning::Detected ASG attachment migration - removing from state to prevent race condition"
-            for att in $ATTACHMENTS; do
-              echo "Removing from state: $att"
-              terraform state rm "$att" || true
-            done
-            rm -f tfplan
-            if ! terraform plan -out=tfplan -no-color; then
-              echo "::error::Re-plan failed after state removal. Manual intervention may be required."
-              exit 1
-            fi
-          fi
-
-      - name: Terraform Apply
-        working-directory: terraform/environments/prod
-        env:
-          # Sensitive variables passed via TF_VAR_ environment variables
-          TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
-          TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
-          # AC license key (plaintext - stored in Secrets Manager) - prod uses separate secrets
-          TF_VAR_ac_license_key: ${{ secrets.PROD_AC_LICENSE_KEY }}
-          TF_VAR_grafana_auth: ${{ secrets.PROD_GRAFANA_AUTH }}
-          TF_VAR_auth0_tf_client_id: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
-          TF_VAR_auth0_tf_client_secret: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
-          TF_VAR_confirm_prod_deployment: "yes-deploy-to-production"
-          # Deployment configuration - use commit SHA for immutable deployments
-          TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
-        # Manual approval is handled by GitHub environment protection rules
-        run: |
-          if [[ -f tfplan ]]; then
-            echo "::notice::Applying saved plan from migration step ($(stat -f%z tfplan 2>/dev/null || stat -c%s tfplan) bytes)"
-            terraform apply -auto-approve tfplan
-          else
-            echo "::notice::No saved plan found, running fresh apply"
-            terraform apply -auto-approve
-          fi
-
-      - name: Get Terraform Outputs
-        id: outputs
-        working-directory: terraform/environments/prod
-        run: |
-          echo "server_asg=$(terraform output -raw asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
-          echo "ac_asg=$(terraform output -raw ac_asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
-          echo "nlb_dns=$(terraform output -raw nlb_dns_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
-          echo "etcd_endpoint=$(terraform output -raw etcd_endpoint 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
-
-  deploy-prod-server:
-    name: Deploy Prod - NHP Server
-    needs: [deploy-prod-infra]
-    if: always() && needs.deploy-prod-infra.result == 'success' && needs.deploy-prod-infra.outputs.server_asg != ''
-    runs-on: ubuntu-latest
-    environment: production
-    timeout-minutes: 25
-    concurrency:
-      group: deploy-prod-server
-      cancel-in-progress: true
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Configure AWS credentials
-        uses: ./.github/actions/setup-deploy
-        with:
-          aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Canary Deploy - NHP Server (Production)
-        env:
-          ASG_NAME: ${{ needs.deploy-prod-infra.outputs.server_asg }}
-        run: |
-          echo "============================================"
-          echo "CANARY DEPLOYMENT - NHP Server (PROD)"
-          echo "============================================"
-
-          # Cancel any existing instance refresh from previous failed/cancelled runs
-          ./.github/scripts/cancel-existing-refresh.sh "$ASG_NAME"
-
-          # Production: more conservative settings
-          REFRESH_ID=$(aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name "$ASG_NAME" \
-            --preferences '{
-              "MinHealthyPercentage": 90,
-              "InstanceWarmup": 180,
-              "MaxHealthyPercentage": 105,
-              "SkipMatching": true
-            }' \
-            --query "InstanceRefreshId" \
-            --output text)
-
-          echo "Instance Refresh ID: $REFRESH_ID"
-
-          # Wait for instance refresh with health check (90 iterations = 15 min for prod)
-          ./.github/scripts/wait-for-instance-refresh.sh \
-            "$ASG_NAME" \
-            "$REFRESH_ID" \
-            "docker ps | grep nhp-server && systemctl is-active nhp-server" \
-            90
-
-      - name: Push Deployment Metric
-        run: |
-          aws cloudwatch put-metric-data \
-            --namespace "LayerV/NHP" \
-            --metric-name "DeploymentEvent" \
-            --dimensions "Environment=prod,Component=server,Strategy=instance-refresh" \
-            --value 1 \
-            --unit Count
-          echo "Deployment event pushed to LayerV/NHP namespace"
-
-  deploy-prod-ac:
-    name: Deploy Prod - AC
-    needs: [deploy-prod-server, deploy-prod-infra]
-    if: always() && needs.deploy-prod-server.result == 'success' && needs.deploy-prod-infra.outputs.ac_asg != ''
-    runs-on: ubuntu-latest
-    environment: production
-    timeout-minutes: 15
-    concurrency:
-      group: deploy-prod-ac
-      cancel-in-progress: true
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Configure AWS credentials
-        uses: ./.github/actions/setup-deploy
-        with:
-          aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Canary Deploy - AC (Production)
-        env:
-          ASG_NAME: ${{ needs.deploy-prod-infra.outputs.ac_asg }}
-        run: |
-          echo "============================================"
-          echo "CANARY DEPLOYMENT - AC (PROD)"
-          echo "============================================"
-
-          # Cancel any existing instance refresh from previous failed/cancelled runs
-          ./.github/scripts/cancel-existing-refresh.sh "$ASG_NAME"
-
-          REFRESH_ID=$(aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name "$ASG_NAME" \
-            --preferences '{
-              "MinHealthyPercentage": 75,
-              "InstanceWarmup": 180,
-              "MaxHealthyPercentage": 105,
-              "SkipMatching": true
-            }' \
-            --query "InstanceRefreshId" \
-            --output text)
-
-          echo "Instance Refresh ID: $REFRESH_ID"
-
-          # Wait for instance refresh with health check (90 iterations = 15 min for prod)
-          ./.github/scripts/wait-for-instance-refresh.sh \
-            "$ASG_NAME" \
-            "$REFRESH_ID" \
-            "systemctl is-active traefik nhp-acd" \
-            90
-
-      - name: Push Deployment Metric
-        run: |
-          aws cloudwatch put-metric-data \
-            --namespace "LayerV/NHP" \
-            --metric-name "DeploymentEvent" \
-            --dimensions "Environment=prod,Component=ac,Strategy=instance-refresh" \
-            --value 1 \
-            --unit Count
-          echo "Deployment event pushed to LayerV/NHP namespace"
-
-  deploy-prod-validate:
-    name: Deploy Prod - Validate
-    needs: [setup, deploy-prod-infra, deploy-prod-server, deploy-prod-ac]
-    if: |
-      always() &&
-      needs.deploy-prod-infra.result == 'success' &&
-      needs.deploy-prod-server.result == 'success' &&
-      (needs.deploy-prod-ac.result == 'success' || needs.deploy-prod-ac.result == 'skipped')
-    runs-on: ubuntu-latest
-    environment: production
-    timeout-minutes: 10
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Configure AWS credentials
-        uses: ./.github/actions/setup-deploy
-        with:
-          aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Post-Deployment Validation (Production)
-        run: |
-          echo "============================================"
-          echo "POST-DEPLOYMENT VALIDATION (PRODUCTION)"
-          echo "============================================"
-
-          chmod +x scripts/validate-deployment.sh
-          ./scripts/validate-deployment.sh prod || VALIDATION_FAILED=1
-
-          if [ "${VALIDATION_FAILED:-0}" -eq 1 ]; then
-            echo "::warning::Some production validation checks failed - see output above"
-          fi
-
-      - name: Setup Go for Integration Tests
-        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: |
-            nhp/go.sum
-            endpoints/go.sum
-
-      - name: Run Integration Tests (Production)
-        env:
-          NHP_SERVER_ENDPOINT: "${{ needs.deploy-prod-infra.outputs.nlb_dns }}:62206"
-          ETCD_ENDPOINTS: ${{ needs.deploy-prod-infra.outputs.etcd_endpoint }}
-          AWS_REGION: ${{ env.AWS_REGION }}
-        run: |
-          echo "============================================"
-          echo "INTEGRATION TESTS (PRODUCTION)"
-          echo "============================================"
-          echo "NHP Server: $NHP_SERVER_ENDPOINT"
-          echo "etcd: $ETCD_ENDPOINTS"
-          echo ""
-
-          cd tests/integration
-          go test -v -tags=integration -timeout 5m ./... 2>&1 || {
-            echo "::warning::Some production integration tests failed or skipped"
-          }
-
-      - name: Read QURL domain from SSM
-        id: qurl-domain-prod
-        run: |
-          # Read QURL link URL from SSM (Terraform is the source of truth)
-          QURL_LINK_URL=$(aws ssm get-parameter \
-            --name "/prod/nhp/qurl/link-url" \
-            --query "Parameter.Value" --output text 2>/dev/null) || true
-
-          if [ -z "$QURL_LINK_URL" ]; then
-            echo "::warning::SSM parameter /prod/nhp/qurl/link-url not found, falling back to hardcoded value"
-            QURL_LINK_URL="https://qurl.link"
-          fi
-
-          # Extract domain from URL (strip https://)
-          LOGIN_PORTAL_DOMAIN="${QURL_LINK_URL#https://}"
-          echo "qurl_link_url=$QURL_LINK_URL" >> $GITHUB_OUTPUT
-          echo "login_portal_domain=$LOGIN_PORTAL_DOMAIN" >> $GITHUB_OUTPUT
-          echo "Using QURL link URL: $QURL_LINK_URL"
-
-      - name: Run E2E Tests (Production Demo Flow)
-        env:
-          # Production domains read from SSM (Terraform is the source of truth)
-          CONSOLE_API_URL: "https://home.secure.layerv.ai"
-          LOGIN_PORTAL_DOMAIN: ${{ steps.qurl-domain-prod.outputs.login_portal_domain }}
-          APPS_DOMAIN: "qurl.site"
-        run: |
-          echo "============================================"
-          echo "E2E TESTS - PRODUCTION DEMO FLOW"
-          echo "============================================"
-          echo "Console API: $CONSOLE_API_URL"
-          echo "Login Portal: $LOGIN_PORTAL_DOMAIN"
-          echo ""
-
-          cd tests/e2e
-          go test -v -tags=e2e -timeout 5m ./... 2>&1 || {
-            echo "::warning::Some production E2E tests failed"
-          }
-
-      - name: Production Deployment Summary
-        env:
-          AC_RESULT: ${{ needs.deploy-prod-ac.result }}
-        run: |
-          # Map job result to friendly status
-          friendly_status() {
-            case "$1" in
-              success) echo "Deployed ✓" ;;
-              failure) echo "Failed ✗" ;;
-              skipped) echo "Skipped" ;;
-              cancelled) echo "Cancelled" ;;
-              *) echo "$1" ;;
-            esac
-          }
-
-          echo "## Production Deployment Complete" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Infrastructure" >> $GITHUB_STEP_SUMMARY
-          echo "| Component | ASG | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|-----|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| NHP Server | ${{ needs.deploy-prod-infra.outputs.server_asg }} | Deployed ✓ |" >> $GITHUB_STEP_SUMMARY
-          echo "| AC | ${{ needs.deploy-prod-infra.outputs.ac_asg }} | $(friendly_status "$AC_RESULT") |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Endpoints" >> $GITHUB_STEP_SUMMARY
-          echo "- **NHP NLB:** \`${{ needs.deploy-prod-infra.outputs.nlb_dns }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **etcd:** \`${{ needs.deploy-prod-infra.outputs.etcd_endpoint }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Image Tag:** \`${{ needs.setup.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Validation" >> $GITHUB_STEP_SUMMARY
-          echo "- Post-deployment validation script executed" >> $GITHUB_STEP_SUMMARY
-          echo "- Integration tests completed" >> $GITHUB_STEP_SUMMARY
-          echo "- E2E demo flow tests executed" >> $GITHUB_STEP_SUMMARY
-
-      - name: Update Deployment Tracking
-        run: |
-          aws ssm put-parameter \
-            --name "/prod/nhp/deploy/deployed-commit" \
-            --value "${{ github.sha }}" --type String --overwrite \
-            --region "$AWS_REGION" \
-            || echo "::warning::Failed to update SSM /prod/nhp/deploy/deployed-commit"
-          aws ssm put-parameter \
-            --name "/prod/nhp/deploy/deployed-at" \
-            --value "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --type String --overwrite \
-            --region "$AWS_REGION" \
-            || echo "::warning::Failed to update SSM /prod/nhp/deploy/deployed-at"
-          echo "::notice::Deployment tracking updated: deployed-commit = ${{ github.sha }}"
 
   # ============================================================================
   # NOTIFY
@@ -1640,11 +1230,6 @@ jobs:
       - deploy-sandbox-ac
       - deploy-sandbox-console
       - deploy-sandbox-validate
-      # Prod deploy jobs
-      - deploy-prod-infra
-      - deploy-prod-server
-      - deploy-prod-ac
-      - deploy-prod-validate
     if: always() && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1662,11 +1247,6 @@ jobs:
           SANDBOX_AC: ${{ needs.deploy-sandbox-ac.result }}
           SANDBOX_CONSOLE: ${{ needs.deploy-sandbox-console.result }}
           SANDBOX_VALIDATE: ${{ needs.deploy-sandbox-validate.result }}
-          # Prod deploy components
-          PROD_INFRA: ${{ needs.deploy-prod-infra.result }}
-          PROD_SERVER: ${{ needs.deploy-prod-server.result }}
-          PROD_AC: ${{ needs.deploy-prod-ac.result }}
-          PROD_VALIDATE: ${{ needs.deploy-prod-validate.result }}
           # Metadata
           IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
           ENVIRONMENT: ${{ needs.setup.outputs.environment }}
@@ -1733,12 +1313,6 @@ jobs:
             SANDBOX_DEPLOYED="true"
           fi
 
-          # Check if any prod deploy ran
-          PROD_DEPLOYED="false"
-          if [[ "$PROD_INFRA" != "skipped" ]]; then
-            PROD_DEPLOYED="true"
-          fi
-
           # Build component status strings with visual pipeline (AC and Console run in parallel)
           SANDBOX_STATUS=""
           if [[ "$SANDBOX_DEPLOYED" == "true" ]]; then
@@ -1752,29 +1326,18 @@ jobs:
             SANDBOX_STATUS="${SANDBOX_STATUS} → $(status_emoji "$SANDBOX_VALIDATE") Validate"
           fi
 
-          PROD_STATUS=""
-          if [[ "$PROD_DEPLOYED" == "true" ]]; then
-            # Prod runs sequentially (no Console)
-            PROD_STATUS="$(status_emoji "$PROD_INFRA") Infra → $(status_emoji "$PROD_SERVER") Server → $(status_emoji "$PROD_AC") AC → $(status_emoji "$PROD_VALIDATE") Validate"
-          fi
-
           # Determine overall status and header
           if [[ "$BUILD_RESULT" == "success" ]]; then
             # Check for any deploy or validation failures
             DEPLOY_FAILED="false"
-            for result in "$SANDBOX_INFRA" "$SANDBOX_SERVER" "$SANDBOX_AC" "$SANDBOX_CONSOLE" "$SANDBOX_VALIDATE" "$PROD_INFRA" "$PROD_SERVER" "$PROD_AC" "$PROD_VALIDATE"; do
+            for result in "$SANDBOX_INFRA" "$SANDBOX_SERVER" "$SANDBOX_AC" "$SANDBOX_CONSOLE" "$SANDBOX_VALIDATE"; do
               if [[ "$result" == "failure" ]]; then
                 DEPLOY_FAILED="true"
                 break
               fi
             done
 
-            if [[ "$PROD_VALIDATE" == "success" ]]; then
-              COLOR="#36a64f"
-              EMOJI="rocket"
-              HEADER="LayerV.ai Production Deploy"
-              STATUS_TEXT="successful"
-            elif [[ "$SANDBOX_VALIDATE" == "success" ]]; then
+            if [[ "$SANDBOX_VALIDATE" == "success" ]]; then
               COLOR="#36a64f"
               EMOJI="white_check_mark"
               HEADER="LayerV.ai Sandbox Deploy"
@@ -1782,18 +1345,14 @@ jobs:
             elif [[ "$DEPLOY_FAILED" == "true" ]]; then
               COLOR="#dc3545"
               EMOJI="x"
-              if [[ "$PROD_DEPLOYED" == "true" ]]; then
-                HEADER="LayerV.ai Production Deploy"
-              else
-                HEADER="LayerV.ai Sandbox Deploy"
-              fi
+              HEADER="LayerV.ai Sandbox Deploy"
               STATUS_TEXT="failed"
-            elif [[ "$SANDBOX_DEPLOYED" == "false" && "$PROD_DEPLOYED" == "false" ]]; then
+            elif [[ "$SANDBOX_DEPLOYED" == "false" ]]; then
               COLOR="#36a64f"
               EMOJI="white_check_mark"
               HEADER="LayerV.ai Build"
               STATUS_TEXT="successful"
-            elif [[ "$SANDBOX_INFRA" == "cancelled" || "$PROD_INFRA" == "cancelled" ]]; then
+            elif [[ "$SANDBOX_INFRA" == "cancelled" ]]; then
               COLOR="#ffc107"
               EMOJI="warning"
               HEADER="LayerV.ai Deploy"
@@ -1861,31 +1420,6 @@ jobs:
                 \"type\": \"mrkdwn\",
                 \"text\": \"*Sandbox:* $SANDBOX_STATUS\"
               }
-            }"
-          fi
-
-          # Add prod component status if deployed, or show why it was skipped
-          if [[ "$PROD_DEPLOYED" == "true" ]]; then
-            BLOCKS="$BLOCKS,
-            {
-              \"type\": \"section\",
-              \"text\": {
-                \"type\": \"mrkdwn\",
-                \"text\": \"*Production:* $PROD_STATUS\"
-              }
-            }"
-          elif [[ "$SANDBOX_DEPLOYED" == "true" ]]; then
-            # Show why prod was skipped when sandbox deployed
-            # Note: Prod only deploys via workflow_dispatch with environment=prod
-            BLOCKS="$BLOCKS,
-            {
-              \"type\": \"context\",
-              \"elements\": [
-                {
-                  \"type\": \"mrkdwn\",
-                  \"text\": \"_Production: Skipped (manual deploy only)_\"
-                }
-              ]
             }"
           fi
 
