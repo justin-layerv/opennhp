@@ -278,9 +278,8 @@ grafana_athena_config = {
 
 # ==============================================================================
 # Developer Portal Configuration
-# Disabled in prod until sandbox is validated. Enable and set values when ready.
 # ==============================================================================
-deploy_developer_portal                 = false
+deploy_developer_portal                 = true
 developer_portal_m2m_secret_name        = "layerv-nhp-prod-auth0-backend-credentials"
 developer_portal_auth0_mgmt_secret_name = "layerv-nhp-prod/developer-portal/auth0-mgmt"
 developer_portal_auth0_domain           = "auth.layerv.ai"
