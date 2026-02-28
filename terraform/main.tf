@@ -183,6 +183,12 @@ module "traefik_plugins_deploy" {
   terraform_state_bucket       = var.terraform_state_bucket
   terraform_lock_table         = var.terraform_lock_table
   boot_time_plugins_bucket_arn = module.plugins.bucket_arn
+
+  # Explicit dependency: module.ecr manages the GitHub Actions IAM role and its
+  # policies (including iam:CreateRole and s3:CreateBucket for traefik-plugins-*).
+  # Without this, Terraform may create this module's resources before the IAM
+  # policy updates are applied, causing AccessDenied errors.
+  depends_on = [module.ecr]
 }
 
 # ECR Module - Creates ECR in primary account, references cross-account in secondary
