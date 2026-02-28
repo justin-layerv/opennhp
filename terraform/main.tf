@@ -171,18 +171,19 @@ module "plugins" {
 module "traefik_plugins_deploy" {
   source = "./modules/traefik-plugins-deploy"
 
-  environment                  = var.environment
-  name_prefix                  = local.name_prefix
-  tags                         = local.common_tags
-  aws_account_id               = data.aws_caller_identity.current.account_id
-  aws_region                   = var.aws_region
-  github_oidc_provider_arn     = module.ecr.github_oidc_provider_arn
-  github_org                   = var.github_org
-  github_repo                  = var.traefik_plugins_github_repo
-  ac_instance_tag_names        = compact(["nhp_ac", "${local.name_prefix}-ac"])
-  terraform_state_bucket       = var.terraform_state_bucket
-  terraform_lock_table         = var.terraform_lock_table
-  boot_time_plugins_bucket_arn = module.plugins.bucket_arn
+  environment                   = var.environment
+  name_prefix                   = local.name_prefix
+  tags                          = local.common_tags
+  aws_account_id                = data.aws_caller_identity.current.account_id
+  aws_region                    = var.aws_region
+  github_oidc_provider_arn      = module.ecr.github_oidc_provider_arn
+  github_org                    = var.github_org
+  github_repo                   = var.traefik_plugins_github_repo
+  ac_instance_tag_names         = compact(["nhp_ac", "${local.name_prefix}-ac"])
+  terraform_state_bucket        = var.terraform_state_bucket
+  terraform_lock_table          = var.terraform_lock_table
+  boot_time_plugins_bucket_arn  = module.plugins.bucket_arn
+  boot_time_plugins_kms_key_arn = module.kms.logs_key_arn
 
   # Explicit dependency: module.ecr manages the GitHub Actions IAM role and its
   # policies (including iam:CreateRole and s3:CreateBucket for traefik-plugins-*).

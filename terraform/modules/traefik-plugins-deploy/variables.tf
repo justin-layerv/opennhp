@@ -77,3 +77,9 @@ variable "boot_time_plugins_bucket_arn" {
   description = "ARN of the boot-time plugins S3 bucket (layerv-nhp-{env}-plugins, from plugins module)"
   type        = string
 }
+
+variable "boot_time_plugins_kms_key_arn" {
+  description = "ARN of the KMS key used to encrypt the boot-time plugins S3 bucket. Required for S3 PutObject when bucket uses KMS encryption."
+  type        = string
+  default     = null
+}

@@ -331,7 +331,7 @@ resource "aws_iam_role_policy" "deploy" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Sid    = "S3Access"
         Effect = "Allow"
@@ -358,7 +358,18 @@ resource "aws_iam_role_policy" "deploy" {
           "${var.boot_time_plugins_bucket_arn}/*"
         ]
       },
-      {
+      ],
+      # KMS permissions for boot-time plugins bucket (when bucket uses KMS encryption)
+      var.boot_time_plugins_kms_key_arn != null ? [{
+        Sid    = "KMSBootTimePlugins"
+        Effect = "Allow"
+        Action = [
+          "kms:GenerateDataKey",
+          "kms:Decrypt"
+        ]
+        Resource = [var.boot_time_plugins_kms_key_arn]
+      }] : [],
+      [{
         Sid    = "SSMSendCommandDocuments"
         Effect = "Allow"
         Action = [
@@ -370,41 +381,41 @@ resource "aws_iam_role_policy" "deploy" {
           "arn:aws:ssm:${local.region}:${local.account_id}:document/AWS-RunShellScript",
           "arn:aws:ssm:${local.region}::document/AWS-RunShellScript"
         ]
-      },
-      {
-        Sid    = "SSMSendCommandInstances"
-        Effect = "Allow"
-        Action = [
-          "ssm:SendCommand"
-        ]
-        Resource = [
-          "arn:aws:ec2:${local.region}:${local.account_id}:instance/*"
-        ]
-        Condition = {
-          StringEquals = {
-            "ssm:resourceTag/Name" = var.ac_instance_tag_names
+        },
+        {
+          Sid    = "SSMSendCommandInstances"
+          Effect = "Allow"
+          Action = [
+            "ssm:SendCommand"
+          ]
+          Resource = [
+            "arn:aws:ec2:${local.region}:${local.account_id}:instance/*"
+          ]
+          Condition = {
+            StringEquals = {
+              "ssm:resourceTag/Name" = var.ac_instance_tag_names
+            }
           }
+        },
+        {
+          Sid    = "SSMCommandStatus"
+          Effect = "Allow"
+          Action = [
+            "ssm:GetCommandInvocation",
+            "ssm:ListCommandInvocations"
+          ]
+          Resource = "*"
+        },
+        {
+          Sid    = "EC2DescribeInstances"
+          Effect = "Allow"
+          Action = [
+            "ec2:DescribeInstances",
+            "ec2:DescribeTags"
+          ]
+          Resource = "*"
         }
-      },
-      {
-        Sid    = "SSMCommandStatus"
-        Effect = "Allow"
-        Action = [
-          "ssm:GetCommandInvocation",
-          "ssm:ListCommandInvocations"
-        ]
-        Resource = "*"
-      },
-      {
-        Sid    = "EC2DescribeInstances"
-        Effect = "Allow"
-        Action = [
-          "ec2:DescribeInstances",
-          "ec2:DescribeTags"
-        ]
-        Resource = "*"
-      }
-    ]
+    ])
   })
 }
 
