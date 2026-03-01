@@ -73,11 +73,12 @@ func respondErrorJSON(ctx *gin.Context, format, resId, errCode string, err error
 	}
 }
 
-// knockTokenResult holds the output of a successful knock + JWT generation flow.
+// knockTokenResult holds the output of a knock + JWT flow.
 type knockTokenResult struct {
 	AckMsg       *common.ServerKnockAckMsg
 	NHPToken     string
 	RefreshToken string
+	KnockOK      bool // true when knock succeeded and ResourceHost is available
 }
 
 // knockAndIssueTokens performs the NHP knock via the helper, generates JWT
@@ -110,13 +111,83 @@ func knockAndIssueTokens(ctx *gin.Context, req *common.HttpKnockRequest, res *co
 		log.Error("failed to generate token: %v", err)
 		return knockTokenResult{}, "410", err
 	}
-	log.Info("token: %s", nhpToken)
+	log.Info("token: %s...", nhpToken[:min(10, len(nhpToken))])
 
 	tokenExpire := nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire")
 	ctx.SetCookie("nhp_token", nhpToken, tokenExpire, "/", res.CookieDomain, true, true)
 	ctx.SetCookie("nhp_refresh_token", refreshToken, tokenExpire, "/", res.CookieDomain, true, true)
 
-	return knockTokenResult{AckMsg: ackMsg, NHPToken: nhpToken, RefreshToken: refreshToken}, "", nil
+	return knockTokenResult{AckMsg: ackMsg, NHPToken: nhpToken, RefreshToken: refreshToken, KnockOK: true}, "", nil
+}
+
+// exchangeAndKnock reads NHP token cookies, exchanges them for a new token,
+// performs the knock, and sets session cookies. On knock success, cookies are
+// set with the configured TokenExpire. On knock failure with a non-nil ackMsg,
+// cookies are cleared (expire=0). Callers handle the HTTP response.
+//
+// Returns (result, error). On token-exchange failure error is non-nil and
+// result is zero-valued. On knock failure error is nil but result.KnockOK is
+// false and result.AckMsg contains error details.
+func exchangeAndKnock(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (knockTokenResult, error) {
+	oldNHPToken := nhpplugins.GetCookie("nhp_token", ctx)
+	if len(oldNHPToken) == 0 {
+		log.Error("old token is empty")
+		return knockTokenResult{}, fmt.Errorf("old token is empty")
+	}
+
+	refreshTok := nhpplugins.GetCookie("nhp_refresh_token", ctx)
+	if len(refreshTok) == 0 {
+		log.Error("refresh token is empty")
+		return knockTokenResult{}, fmt.Errorf("refresh token is empty")
+	}
+
+	jwt := &nhpplugins.JWTToken{
+		JwtKey: []byte(nhpsdkutils.GetStringFromMap(res.ExInfo, "JWTSecret")),
+	}
+	nhpToken, err := jwt.ExchangeNHPToken(oldNHPToken, refreshTok, res)
+	if err != nil {
+		log.Error("failed to exchange token: %v", err)
+		return knockTokenResult{}, err
+	}
+
+	ackMsg, err := helper.AuthWithHttpCallbackFunc(req, res)
+
+	// Both knock failure paths clear cookies so stale tokens are not reused.
+	if ackMsg == nil || err != nil {
+		log.Error("knock failed. ackMsg is nil")
+		ctx.SetSameSite(http.SameSiteNoneMode)
+		ctx.SetCookie("nhp_token", nhpToken, 0, "/", res.CookieDomain, true, true)
+		ctx.SetCookie("nhp_refresh_token", refreshTok, 0, "/", res.CookieDomain, true, true)
+		ackMsg = &common.ServerKnockAckMsg{}
+		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
+		if err != nil {
+			ackMsg.ErrMsg = err.Error()
+		} else {
+			ackMsg.ErrMsg = "knock failed: ackMsg is nil"
+		}
+		return knockTokenResult{AckMsg: ackMsg, NHPToken: nhpToken, RefreshToken: refreshTok}, nil
+	}
+
+	if len(ackMsg.ResourceHost) == 0 {
+		log.Error("knock failed. ackMsg.ResourceHost is empty")
+		ctx.SetSameSite(http.SameSiteNoneMode)
+		ctx.SetCookie("nhp_token", nhpToken, 0, "/", res.CookieDomain, true, true)
+		ctx.SetCookie("nhp_refresh_token", refreshTok, 0, "/", res.CookieDomain, true, true)
+		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
+		ackMsg.ErrMsg = "knock failed: ResourceHost is empty"
+		return knockTokenResult{AckMsg: ackMsg, NHPToken: nhpToken, RefreshToken: refreshTok}, nil
+	}
+
+	log.Info("knock succeeded.%+v", res.Resources)
+	log.Info("token: %s...", nhpToken[:min(10, len(nhpToken))])
+
+	tokenExpire := nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire")
+	ctx.SetSameSite(http.SameSiteNoneMode)
+	ctx.SetCookie("nhp_token", nhpToken, tokenExpire, "/", res.CookieDomain, true, true)
+	ctx.SetCookie("nhp_refresh_token", refreshTok, tokenExpire, "/", res.CookieDomain, true, true)
+
+	ackMsg.ErrMsg = ""
+	return knockTokenResult{AckMsg: ackMsg, NHPToken: nhpToken, RefreshToken: refreshTok, KnockOK: true}, nil
 }
 
 // respondSuccessOrRedirect sends either a JSON success payload or an HTTP
@@ -244,7 +315,7 @@ func AuthWithHttpRefresh(ctx *gin.Context, action string, req *common.HttpKnockR
 		return
 	}
 	jwt := &nhpplugins.JWTToken{
-		JwtKey: []byte(res.ExInfo["JWTSecret"].(string)),
+		JwtKey: []byte(nhpsdkutils.GetStringFromMap(res.ExInfo, "JWTSecret")),
 	}
 
 	isOk, err := jwt.Validate(nHPToken, nhpplugins.TokenTypeNHPToken)
@@ -367,32 +438,8 @@ func refreshToken(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Re
 		return nil, fmt.Errorf("refreshToken: helper is null")
 	}
 
-	oldNHPToken := nhpplugins.GetCookie("nhp_token", ctx)
-
-	if len(oldNHPToken) == 0 {
-		log.Error("old token is empty")
-		ackMsg := &common.ServerKnockAckMsg{}
-		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
-		ackMsg.ErrMsg = "old token is empty"
-		ctx.JSON(http.StatusOK, ackMsg)
-		return nil, fmt.Errorf("old token is empty")
-	}
-	refreshToken := nhpplugins.GetCookie("nhp_refresh_token", ctx)
-	if len(refreshToken) == 0 {
-		log.Error("refresh token is empty")
-
-		ackMsg := &common.ServerKnockAckMsg{}
-		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
-		ackMsg.ErrMsg = "refresh token is empty"
-		ctx.JSON(http.StatusOK, ackMsg)
-		return nil, fmt.Errorf("refresh token is empty")
-	}
-	jwt := &nhpplugins.JWTToken{
-		JwtKey: []byte(res.ExInfo["JWTSecret"].(string)),
-	}
-	nhpToken, err := jwt.ExchangeNHPToken(oldNHPToken, refreshToken, res)
+	result, err := exchangeAndKnock(ctx, req, res, helper)
 	if err != nil {
-		log.Error("failed to generate token: %v", err)
 		ackMsg := &common.ServerKnockAckMsg{}
 		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
 		ackMsg.ErrMsg = err.Error()
@@ -400,83 +447,33 @@ func refreshToken(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Re
 		return nil, err
 	}
 
-	// interact with udp server for door operation
-	ackMsg, err := helper.AuthWithHttpCallbackFunc(req, res)
-	if ackMsg == nil || err != nil {
-		log.Error("knock failed. ackMsg is nil")
-		ackMsg = &common.ServerKnockAckMsg{}
-		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
-		if err != nil {
-			ackMsg.ErrMsg = err.Error()
-		} else {
-			ackMsg.ErrMsg = "ackMsg is nil"
-		}
-	} else {
-		if len(ackMsg.ResourceHost) > 0 {
-			log.Info("knock succeeded.%+v", res.Resources)
-			log.Info("token: %s", nhpToken)
+	if !result.KnockOK {
+		ctx.JSON(http.StatusOK, result.AckMsg)
+		return result.AckMsg, nil
+	}
 
-			ctx.SetSameSite(http.SameSiteNoneMode)
-			ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
-			ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
-			ackMsg.ErrMsg = ""
-			// assign the redirect url to the ackMsg
-			if len(res.RedirectUrl) == 0 {
-				log.Error("RedirectUrl is not provided.")
-			} else {
-				ackMsg.RedirectUrl = res.RedirectUrl
-			}
-		} else {
-			ctx.SetSameSite(http.SameSiteNoneMode)
-			ctx.SetCookie("nhp_token", nhpToken, 0, "/", res.CookieDomain, true, true)
-			ctx.SetCookie("nhp_refresh_token", refreshToken, 0, "/", res.CookieDomain, true, true)
-			log.Error("knock failed. ackMsg is nil")
-			ackMsg = &common.ServerKnockAckMsg{}
-			ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
-			ackMsg.ErrMsg = "ackMsg is nil"
-		}
+	if len(res.RedirectUrl) == 0 {
+		log.Error("RedirectUrl is not provided.")
+	} else {
+		result.AckMsg.RedirectUrl = res.RedirectUrl
 	}
 
 	ctx.JSON(http.StatusOK, map[string]interface{}{
 		"code":              0,
-		"nhp_token":         nhpToken,
-		"nhp_refresh_token": refreshToken,
+		"nhp_token":         result.NHPToken,
+		"nhp_refresh_token": result.RefreshToken,
 		"message":           "success",
 	})
-	return ackMsg, nil
+	return result.AckMsg, nil
 }
 
 func knockByToken(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
 	if helper == nil {
-		return nil, fmt.Errorf("refreshToken: helper is null")
+		return nil, fmt.Errorf("knockByToken: helper is null")
 	}
 
-	oldNHPToken := nhpplugins.GetCookie("nhp_token", ctx)
-
-	if len(oldNHPToken) == 0 {
-		log.Error("old token is empty")
-		ackMsg := &common.ServerKnockAckMsg{}
-		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
-		ackMsg.ErrMsg = "old token is empty"
-		ctx.JSON(http.StatusOK, ackMsg)
-		return nil, fmt.Errorf("old token is empty")
-	}
-	refreshToken := nhpplugins.GetCookie("nhp_refresh_token", ctx)
-	if len(refreshToken) == 0 {
-		log.Error("refresh token is empty")
-
-		ackMsg := &common.ServerKnockAckMsg{}
-		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
-		ackMsg.ErrMsg = "refresh token is empty"
-		ctx.JSON(http.StatusOK, ackMsg)
-		return nil, fmt.Errorf("refresh token is empty")
-	}
-	jwt := &nhpplugins.JWTToken{
-		JwtKey: []byte(nhpsdkutils.GetStringFromMap(res.ExInfo, "JWTSecret")),
-	}
-	nhpToken, err := jwt.ExchangeNHPToken(oldNHPToken, refreshToken, res)
+	result, err := exchangeAndKnock(ctx, req, res, helper)
 	if err != nil {
-		log.Error("failed to generate token: %v", err)
 		ackMsg := &common.ServerKnockAckMsg{}
 		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
 		ackMsg.ErrMsg = err.Error()
@@ -484,60 +481,24 @@ func knockByToken(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Re
 		return nil, err
 	}
 
-	// interact with udp server for door operation
-	ackMsg, err := helper.AuthWithHttpCallbackFunc(req, res)
-	if ackMsg == nil || err != nil {
-		log.Error("knock failed. ackMsg is nil")
-		ackMsg = &common.ServerKnockAckMsg{}
-		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
-		if err != nil {
-			ackMsg.ErrMsg = err.Error()
-		} else {
-			ackMsg.ErrMsg = "ackMsg is nil"
-		}
-	} else {
-		if len(ackMsg.ResourceHost) > 0 {
-			log.Info("knock succeeded.%+v", res.Resources)
-			log.Info("token: %s", nhpToken)
-
-			ctx.SetSameSite(http.SameSiteNoneMode)
-			ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
-			ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
-
-			ackMsg.ErrMsg = ""
-
-			// knock action, user is anonymous (verified from token, no specific user info)
-			ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(ackMsg, res, resourceHander.GetConfig(), "knock", "anonymous")
-			if err != nil {
-				log.Error("failed to get redirect url: %v", err)
-				return ackMsg, nil
-			}
-
-			if len(redirectUrl) == 0 {
-				log.Error("RedirectUrl is not provided.")
-			} else {
-				ctx.Redirect(http.StatusFound, redirectUrl)
-				return ackMsg, nil
-			}
-
-			return ackMsg, nil
-		} else {
-			ctx.SetSameSite(http.SameSiteNoneMode)
-			ctx.SetCookie("nhp_token", nhpToken, 0, "/", res.CookieDomain, true, true)
-			ctx.SetCookie("nhp_refresh_token", refreshToken, 0, "/", res.CookieDomain, true, true)
-
-			log.Error("knock failed. ackMsg is nil")
-			ackMsg = &common.ServerKnockAckMsg{}
-			ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
-			ackMsg.ErrMsg = "ackMsg is nil"
-		}
+	if !result.KnockOK {
+		ctx.JSON(http.StatusOK, result.AckMsg)
+		return result.AckMsg, nil
 	}
-	ctx.JSON(http.StatusOK, map[string]interface{}{
-		"code":              0,
-		"nhp_token":         nhpToken,
-		"nhp_refresh_token": refreshToken,
-		"message":           "success",
-	})
+
+	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHander.GetConfig(), "knock", "anonymous")
+	if err != nil {
+		log.Error("failed to get redirect url: %v", err)
+		return ackMsg, nil
+	}
+
+	if len(redirectUrl) == 0 {
+		log.Error("RedirectUrl is not provided.")
+	} else {
+		ctx.Redirect(http.StatusFound, redirectUrl)
+		return ackMsg, nil
+	}
+
 	return ackMsg, nil
 }
 
