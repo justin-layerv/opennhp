@@ -35,6 +35,7 @@ module "nhp" {
   # AC configuration
   ac_auth_service_id = var.ac_auth_service_id
   ac_resource_ids    = var.ac_resource_ids
+  ac_min_capacity    = var.ac_min_capacity
 
   # Security services
   enable_cloudtrail          = var.enable_cloudtrail
@@ -176,8 +177,10 @@ module "nhp" {
   qurl_otel_log_correlation   = var.qurl_otel_log_correlation
 
   # QURL Container Sizing
-  qurl_container_cpu    = var.qurl_container_cpu
-  qurl_container_memory = var.qurl_container_memory
+  qurl_container_cpu            = var.qurl_container_cpu
+  qurl_container_memory         = var.qurl_container_memory
+  qurl_desired_count            = var.qurl_desired_count
+  qurl_autoscaling_min_capacity = var.qurl_autoscaling_min_capacity
 
   # QURL Grafana Cloud (ADOT Sidecar)
   qurl_grafana_cloud_enabled = var.qurl_grafana_cloud_enabled

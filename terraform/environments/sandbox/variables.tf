@@ -116,6 +116,12 @@ variable "ac_resource_ids" {
   default = ["default"]
 }
 
+variable "ac_min_capacity" {
+  description = "Minimum number of AC instances. Overrides the module default (2 for prod, 1 otherwise)."
+  type        = number
+  default     = null
+}
+
 # Security services
 variable "enable_cloudtrail" {
   description = "Enable AWS CloudTrail. Set to false if SCP blocks cloudtrail operations."
@@ -892,6 +898,18 @@ variable "qurl_container_memory" {
     condition     = var.qurl_container_memory >= 512 && var.qurl_container_memory <= 122880
     error_message = "qurl_container_memory must be between 512 and 122880 MB."
   }
+}
+
+variable "qurl_desired_count" {
+  description = "Desired number of QURL ECS tasks"
+  type        = number
+  default     = 1
+}
+
+variable "qurl_autoscaling_min_capacity" {
+  description = "Minimum number of QURL ECS tasks for auto-scaling"
+  type        = number
+  default     = 1
 }
 
 # QURL Grafana Cloud (ADOT Sidecar)

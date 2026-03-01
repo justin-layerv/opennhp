@@ -8,7 +8,7 @@ domain_name    = "nhp.layerv.xyz"
 hosted_zone    = "layerv.xyz"
 multi_tenant   = true
 deploy_etcd    = false # Cloud deployment uses DynamoDB, not etcd
-min_capacity   = 1
+min_capacity   = 3
 max_capacity   = 10
 vpc_cidr       = "10.100.0.0/16"
 
@@ -20,6 +20,7 @@ secondary_account_ids = ["235500187906"] # Prod account - enables cross-account 
 deploy_ac          = true
 acme_email         = "admin@layerv.xyz"
 ac_auth_service_id = "layerv"
+ac_min_capacity    = 3
 ac_resource_ids    = ["demo", "mini-app-demo", "console"]
 
 # Terraform state bucket for GitHub Actions permissions
@@ -264,9 +265,10 @@ qurl_additional_allowed_hosts = []
 # Note: When grafana_cloud_enabled=true, ADOT sidecar requires min 512 CPU and adds 256MB memory.
 # Effective values: CPU=max(container_cpu, 512), Memory=container_memory+256
 # For 512 CPU, effective memory must be 1024-4096, so container_memory >= 768
-qurl_container_cpu    = 256 # 0.25 vCPU (effective: 512 with ADOT)
-qurl_container_memory = 768 # 768 MB (effective: 1024 with ADOT sidecar)
-# qurl_desired_count  = 1
+qurl_container_cpu            = 256 # 0.25 vCPU (effective: 512 with ADOT)
+qurl_container_memory         = 768 # 768 MB (effective: 1024 with ADOT sidecar)
+qurl_desired_count            = 3
+qurl_autoscaling_min_capacity = 3
 
 # Idempotency cache configuration
 qurl_idempotency_cache_ttl_seconds        = 300 # 5 minutes
