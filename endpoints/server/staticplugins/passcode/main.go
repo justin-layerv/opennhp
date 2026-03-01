@@ -16,7 +16,6 @@ import (
 
 	nhpplugins "github.com/fengyily/nhp-plugins-sdk"
 	"github.com/fengyily/nhp-plugins-sdk/resource"
-	"github.com/fengyily/nhp-plugins-sdk/utils"
 	nhpsdkutils "github.com/fengyily/nhp-plugins-sdk/utils"
 )
 
@@ -71,6 +70,68 @@ func respondErrorJSON(ctx *gin.Context, format, resId, errCode string, err error
 		})
 	} else {
 		ctx.Redirect(http.StatusFound, "/plugins/passcode?resid="+resId+"&action=error&id="+errCode)
+	}
+}
+
+// knockTokenResult holds the output of a successful knock + JWT generation flow.
+type knockTokenResult struct {
+	AckMsg       *common.ServerKnockAckMsg
+	NHPToken     string
+	RefreshToken string
+}
+
+// knockAndIssueTokens performs the NHP knock via the helper, generates JWT
+// tokens on success, and sets session cookies. Callers handle redirect URLs
+// and the final HTTP response, including all error responses.
+//
+// Returns (knockTokenResult{}, errCode, error) on failure.
+// Returns (knockTokenResult{...}, "", nil) on success.
+func knockAndIssueTokens(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (knockTokenResult, string, error) {
+	ackMsg, err := helper.AuthWithHttpCallbackFunc(req, res)
+	if ackMsg == nil || len(ackMsg.ResourceHost) == 0 {
+		log.Error("knock failed. ackMsg is nil")
+		ackMsg = &common.ServerKnockAckMsg{}
+		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
+		if err != nil {
+			ackMsg.ErrMsg = err.Error()
+		} else {
+			ackMsg.ErrMsg = "ackMsg is nil"
+		}
+		return knockTokenResult{}, "505", fmt.Errorf("knock failed: %s", ackMsg.ErrMsg)
+	}
+
+	log.Info("knock succeeded.%+v", res.Resources)
+
+	jwt := &nhpplugins.JWTToken{
+		JwtKey: []byte(nhpsdkutils.GetStringFromMap(res.ExInfo, "JWTSecret")),
+	}
+	nhpToken, refreshToken, err := jwt.GenerateAll(res.AuthServiceId, res)
+	if err != nil {
+		log.Error("failed to generate token: %v", err)
+		return knockTokenResult{}, "410", err
+	}
+	log.Info("token: %s", nhpToken)
+
+	tokenExpire := nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire")
+	ctx.SetCookie("nhp_token", nhpToken, tokenExpire, "/", res.CookieDomain, true, true)
+	ctx.SetCookie("nhp_refresh_token", refreshToken, tokenExpire, "/", res.CookieDomain, true, true)
+
+	return knockTokenResult{AckMsg: ackMsg, NHPToken: nhpToken, RefreshToken: refreshToken}, "", nil
+}
+
+// respondSuccessOrRedirect sends either a JSON success payload or an HTTP
+// redirect depending on the format query parameter.
+func respondSuccessOrRedirect(ctx *gin.Context, format, nhpToken, refreshToken, redirectUrl string) {
+	if format == "json" {
+		ctx.JSON(http.StatusOK, map[string]interface{}{
+			"code":              0,
+			"nhp_token":         nhpToken,
+			"nhp_refresh_token": refreshToken,
+			"redirect_url":      redirectUrl,
+			"message":           "success",
+		})
+	} else {
+		ctx.Redirect(http.StatusFound, redirectUrl)
 	}
 }
 
@@ -495,7 +556,7 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 			return nil, "401", fmt.Errorf("AuthUrl is not provided")
 		}
 
-		resp, err := utils.SendRequest(utils.RequestOptions{
+		resp, err := nhpsdkutils.SendRequest(nhpsdkutils.RequestOptions{
 			Method:   "GET",
 			BaseURL:  AuthUrl,
 			Endpoint: "PC/auth",
@@ -521,7 +582,7 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		}
 		// Parse JSON response
 		var apiResponse Response
-		if err := utils.ParseJSONResponse(resp, &apiResponse); err != nil {
+		if err := nhpsdkutils.ParseJSONResponse(resp, &apiResponse); err != nil {
 			log.Error("Error parsing response: %v", err)
 			return nil, "403", fmt.Errorf("error parsing response: %v", err)
 		}
@@ -552,73 +613,43 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		log.Debug("Authenticating passcode: %s succeeded!", passcode)
 	}
 
-	resp := &nhpplugins.RefreshResponse{}
-	// interact with udp server for door operation
-	ackMsg, err := helper.AuthWithHttpCallbackFunc(req, res)
-	if ackMsg == nil || len(ackMsg.ResourceHost) == 0 {
-		log.Error("knock failed. ackMsg is nil")
-		ackMsg = &common.ServerKnockAckMsg{}
-		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
-		if err != nil {
-			ackMsg.ErrMsg = err.Error()
-		} else {
-			ackMsg.ErrMsg = "ackMsg is nil"
-		}
-	} else {
-		log.Info("knock succeeded.%+v", res.Resources)
-
-		jwt := &nhpplugins.JWTToken{
-			JwtKey: []byte(nhpsdkutils.GetStringFromMap(res.ExInfo, "JWTSecret")),
-		}
-		nhpToken, refreshToken, err := jwt.GenerateAll(res.AuthServiceId, res)
-		if err != nil {
-			log.Error("failed to generate token: %v", err)
-			ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
-			ackMsg.ErrMsg = err.Error()
-			ctx.JSON(http.StatusOK, ackMsg)
-			return ackMsg, "410", err
-		}
-		log.Info("token: %s", nhpToken)
-		ackMsg.ErrMsg = ""
-
-		// Check if passcode is JWT format and extract key_type and sharing_key
-		redirectUrl := ""
-		if sharingRedirectUrl := getSharingLinkRedirectUrl(passcode, ackMsg.ResourceHost); len(sharingRedirectUrl) > 0 {
-			redirectUrl = sharingRedirectUrl
-			log.Info("Using sharing link redirect url: %s", redirectUrl)
-		} else {
-			// valid action (passcode verification), user is anonymous
-			ackMsg, redirectUrl, err = nhpplugins.GetRedirectUrlByResource(ackMsg, res, resourceHander.GetConfig(), "valid", "anonymous")
-			if err != nil {
-				log.Error("failed to get redirect url: %v", err)
-				return ackMsg, "404", err
-			}
-		}
-
-		if len(redirectUrl) == 0 {
-			log.Error("RedirectUrl is not provided.")
-		} else {
-			resp.RedirectUrl = redirectUrl
-		}
-
-		ctx.SetSameSite(http.SameSiteNoneMode)
-		ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
-		ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
-
-		resp.CookieDomain = res.CookieDomain
-		resp.ResourceHost = ackMsg.ResourceHost
-		resp.NHPRefreshToken = refreshToken
-		resp.NHPToken = nhpToken
-
-		log.Info("ackMsg.ResourceHost: %+v", ackMsg.ResourceHost)
+	result, errCode, knockErr := knockAndIssueTokens(ctx, req, res, helper)
+	if knockErr != nil {
+		return nil, errCode, knockErr
 	}
 
+	// Check if passcode is a sharing link JWT
+	redirectUrl := ""
+	if sharingRedirectUrl := getSharingLinkRedirectUrl(passcode, result.AckMsg.ResourceHost); len(sharingRedirectUrl) > 0 {
+		redirectUrl = sharingRedirectUrl
+		log.Info("Using sharing link redirect url: %s", redirectUrl)
+	} else {
+		result.AckMsg, redirectUrl, err = nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHander.GetConfig(), "valid", "anonymous")
+		if err != nil {
+			log.Error("failed to get redirect url: %v", err)
+			return result.AckMsg, "404", err
+		}
+	}
+
+	if len(redirectUrl) == 0 {
+		log.Error("RedirectUrl is not provided.")
+	}
+
+	resp := &nhpplugins.RefreshResponse{
+		RedirectUrl:     redirectUrl,
+		CookieDomain:    res.CookieDomain,
+		ResourceHost:    result.AckMsg.ResourceHost,
+		NHPToken:        result.NHPToken,
+		NHPRefreshToken: result.RefreshToken,
+	}
+
+	log.Info("ackMsg.ResourceHost: %+v", result.AckMsg.ResourceHost)
 	if format == "json" {
 		ctx.JSON(http.StatusOK, resp)
 	} else {
 		ctx.Redirect(http.StatusFound, resp.RedirectUrl)
 	}
-	return ackMsg, "", nil
+	return result.AckMsg, "", nil
 }
 
 func authAccessFromRaaS(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, string, error) {
@@ -661,65 +692,35 @@ func authAccessFromRaaS(ctx *gin.Context, req *common.HttpKnockRequest, res *com
 	}
 
 	log.Info("Successfully got response from real IAM: %s", string(body))
-	resp := &nhpplugins.RefreshResponse{}
-	// interact with udp server for door operation
-	ackMsg, err := helper.AuthWithHttpCallbackFunc(req, res)
-	if ackMsg == nil || len(ackMsg.ResourceHost) == 0 {
-		log.Error("knock failed. ackMsg is nil")
-		ackMsg = &common.ServerKnockAckMsg{}
-		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
-		if err != nil {
-			ackMsg.ErrMsg = err.Error()
-		} else {
-			ackMsg.ErrMsg = "ackMsg is nil"
-		}
-		ctx.JSON(http.StatusInternalServerError, ackMsg)
-		return ackMsg, "410", fmt.Errorf("knock failed: %s", ackMsg.ErrMsg)
-	} else {
-		log.Info("knock succeeded.%+v", res.Resources)
 
-		jwt := &nhpplugins.JWTToken{
-			JwtKey: []byte(nhpsdkutils.GetStringFromMap(res.ExInfo, "JWTSecret")),
-		}
-		nhpToken, refreshToken, err := jwt.GenerateAll(res.AuthServiceId, res)
-		if err != nil {
-			log.Error("failed to generate token: %v", err)
-			ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
-			ackMsg.ErrMsg = err.Error()
-			ctx.JSON(http.StatusOK, ackMsg)
-			return ackMsg, "410", err
-		}
-		log.Info("token: %s", nhpToken)
-
-		ackMsg.ErrMsg = ""
-		// access action, get user info from Authorization header
-		user := GetUserFromAuthHeader(authHeader)
-		ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(ackMsg, res, resourceHander.GetConfig(), "access", user)
-		if err != nil {
-			log.Error("failed to get redirect url: %v", err)
-			return ackMsg, "404", err
-		}
-		log.Info("redirectUrl: %s", redirectUrl)
-		if len(redirectUrl) == 0 {
-			log.Error("RedirectUrl is not provided.")
-		} else {
-			resp.RedirectUrl = redirectUrl
-		}
-
-		ctx.SetSameSite(http.SameSiteNoneMode)
-		ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
-		ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
-
-		resp.CookieDomain = res.CookieDomain
-		resp.ResourceHost = ackMsg.ResourceHost
-		resp.NHPRefreshToken = refreshToken
-		resp.NHPToken = nhpToken
-
-		log.Info("ackMsg.ResourceHost: %+v", ackMsg.ResourceHost)
-		ctx.JSON(http.StatusOK, resp)
-		log.Info("Done %+v", resp)
-		return ackMsg, "", nil
+	result, errCode, knockErr := knockAndIssueTokens(ctx, req, res, helper)
+	if knockErr != nil {
+		return nil, errCode, knockErr
 	}
+
+	user := GetUserFromAuthHeader(authHeader)
+	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHander.GetConfig(), "access", user)
+	if err != nil {
+		log.Error("failed to get redirect url: %v", err)
+		return ackMsg, "404", err
+	}
+	log.Info("redirectUrl: %s", redirectUrl)
+	if len(redirectUrl) == 0 {
+		log.Error("RedirectUrl is not provided.")
+	}
+
+	resp := &nhpplugins.RefreshResponse{
+		RedirectUrl:     redirectUrl,
+		CookieDomain:    res.CookieDomain,
+		ResourceHost:    ackMsg.ResourceHost,
+		NHPToken:        result.NHPToken,
+		NHPRefreshToken: result.RefreshToken,
+	}
+
+	log.Info("ackMsg.ResourceHost: %+v", ackMsg.ResourceHost)
+	ctx.JSON(http.StatusOK, resp)
+	log.Info("Done %+v", resp)
+	return ackMsg, "", nil
 }
 
 // getSharingLinkRedirectUrl checks if passcode is JWT format with key_type=sharing_link
@@ -774,7 +775,7 @@ func getSharingLinkRedirectUrl(passcode string, resourceHost map[string]string) 
 	}
 
 	// Get host using Loadbalancing
-	host := utils.Loadbalancing(resourceHost)
+	host := nhpsdkutils.Loadbalancing(resourceHost)
 	if len(host) == 0 {
 		log.Error("failed to get host from Loadbalancing")
 		return ""
