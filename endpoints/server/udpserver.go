@@ -1346,7 +1346,7 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 		}
 		s.acConnectionMapMutex.Unlock()
 		if !found || len(connsCopy) == 0 {
-			log.Warning("server-agent(%s@%s)-ac(@%s)[handleNhpOpenResource] no ac connection is available", knkMsg.UserId, addrStr, acId)
+			log.Warning("server-agent(%s@%s)-ac(%s)[handleNhpOpenResource] no ac connection is available", knkMsg.UserId, addrStr, acId)
 			artMsg := &common.ACOpsResultMsg{}
 			err = common.ErrACConnectionNotFound
 			artMsg.ErrCode = common.ErrACConnectionNotFound.ErrorCode()
@@ -1490,7 +1490,7 @@ func (s *UdpServer) ProcessDataPrivateKeyWrapping(dwrMsg *common.DWRMsg, conn *D
 	dwaMsg = &common.DWAMsg{}
 
 	if !s.IsRunning() {
-		log.Error("server-agent-db(%s#%d@%s)[ProcessDataPrivateKeyWrapping] MsgData channel closed or being closed, skip sending", conn.DBId, dwrMd.TransactionId, dbAddrStr)
+		log.Error("server-db(%s#%d@%s)[ProcessDataPrivateKeyWrapping] MsgData channel closed or being closed, skip sending", conn.DBId, dwrMd.TransactionId, dbAddrStr)
 		err = common.ErrPacketToMessageRoutineStopped
 		errCode, _ := strconv.Atoi(common.ErrPacketToMessageRoutineStopped.ErrorCode())
 		dwaMsg.ErrCode = errCode
@@ -1507,7 +1507,7 @@ func (s *UdpServer) ProcessDataPrivateKeyWrapping(dwrMsg *common.DWRMsg, conn *D
 
 	err = json.Unmarshal(dbPpd.BodyMessage, dwaMsg)
 	if err != nil {
-		log.Error("server-agent-db(%s#%d@%s)[ProcessDataPrivateKeyWrapping] failed to parse %s message: %v", conn.DBId, dwrMd.TransactionId, dbAddrStr, core.HeaderTypeToString(dbPpd.HeaderType), err)
+		log.Error("server-db(%s#%d@%s)[ProcessDataPrivateKeyWrapping] failed to parse %s message: %v", conn.DBId, dwrMd.TransactionId, dbAddrStr, core.HeaderTypeToString(dbPpd.HeaderType), err)
 		errCode, _ := strconv.Atoi(common.ErrJsonParseFailed.ErrorCode())
 		dwaMsg.ErrCode = errCode
 		dwaMsg.ErrMsg = err.Error()

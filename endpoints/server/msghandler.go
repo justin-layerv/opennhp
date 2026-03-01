@@ -20,6 +20,20 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// forwardToTransaction finds the remote transaction and forwards the message to it.
+// Returns common.ErrTransactionIdNotFound if the transaction is not available.
+//
+// Log format follows the codebase convention: component(id#txn@addr)[handler] message
+func forwardToTransaction(connData *core.ConnectionData, transactionId uint64, md *core.MsgData, component, handler, id, addrStr string) error {
+	transaction := connData.FindRemoteTransaction(transactionId)
+	if transaction == nil {
+		log.Error("%s(%s#%d@%s)[%s] transaction is not available", component, id, transactionId, addrStr, handler)
+		return common.ErrTransactionIdNotFound
+	}
+	transaction.NextMsgCh <- md
+	return nil
+}
+
 // HandleOTPRequest
 // Server will not respond to agent's otp request
 func (s *UdpServer) HandleOTPRequest(ppd *core.PacketParserData) (err error) {
@@ -118,16 +132,9 @@ func (s *UdpServer) HandleRegisterRequest(ppd *core.PacketParserData) (err error
 		Message:        rakBytes,
 	}
 
-	// forward to a specific transaction
-	transaction := ppd.ConnData.FindRemoteTransaction(transactionId)
-	if transaction == nil {
-		log.Error("server-agent(%s#%d@%s)[HandleRegisterRequest] transaction is not available", regMsg.UserId, transactionId, addrStr)
-		err = common.ErrTransactionIdNotFound
-		return err
+	if fwdErr := forwardToTransaction(ppd.ConnData, transactionId, rakMd, "server-agent", "HandleRegisterRequest", regMsg.UserId, addrStr); fwdErr != nil {
+		return fwdErr
 	}
-
-	transaction.NextMsgCh <- rakMd
-
 	return err
 }
 
@@ -188,16 +195,9 @@ func (s *UdpServer) HandleListRequest(ppd *core.PacketParserData) (err error) {
 		Message:        lrtBytes,
 	}
 
-	// forward to a specific transaction
-	transaction := ppd.ConnData.FindRemoteTransaction(transactionId)
-	if transaction == nil {
-		log.Error("server-agent(%s#%d@%s)[HandleListRequest] transaction is not available", lstMsg.UserId, transactionId, addrStr)
-		err = common.ErrTransactionIdNotFound
-		return err
+	if fwdErr := forwardToTransaction(ppd.ConnData, transactionId, ackMd, "server-agent", "HandleListRequest", lstMsg.UserId, addrStr); fwdErr != nil {
+		return fwdErr
 	}
-
-	transaction.NextMsgCh <- ackMd
-
 	return err
 }
 
@@ -380,17 +380,7 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		Message:        aakBytes,
 	}
 
-	// forward to a specific transaction
-	transaction := ppd.ConnData.FindRemoteTransaction(transactionId)
-	if transaction == nil {
-		log.Error("server-ac(@%s#%d@%s)[HandleACOnline] transaction is not available", acId, transactionId, addrStr)
-		err = common.ErrTransactionIdNotFound
-		return err
-	}
-
-	transaction.NextMsgCh <- aakMd
-
-	return nil
+	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-ac", "HandleACOnline", acId, addrStr)
 }
 
 // handleACServerAssignment checks if the AC should be redirected to its assigned servers.
@@ -486,14 +476,9 @@ func (s *UdpServer) handleACServerAssignment(
 		Message:        ardBytes,
 	}
 
-	// Forward to the transaction
-	transaction := ppd.ConnData.FindRemoteTransaction(transactionId)
-	if transaction == nil {
-		log.Error("server-ac(%s#%d@%s)[HandleACOnline] transaction not found for NHP_ARD", acId, transactionId, addrStr)
-		return false, common.ErrTransactionIdNotFound
+	if err := forwardToTransaction(ppd.ConnData, transactionId, ardMd, "server-ac", "HandleACOnline/ARD", acId, addrStr); err != nil {
+		return false, err
 	}
-
-	transaction.NextMsgCh <- ardMd
 	return true, nil
 }
 
@@ -648,17 +633,7 @@ func (s *UdpServer) HandleDBOnline(ppd *core.PacketParserData) (err error) {
 		Message:        aakBytes,
 	}
 
-	// forward to a specific transaction
-	transaction := ppd.ConnData.FindRemoteTransaction(transactionId)
-	if transaction == nil {
-		log.Error("server-db(@%s#%d@%s)[HandleDBOnline] transaction is not available", dbId, transactionId, addrStr)
-		err = common.ErrTransactionIdNotFound
-		return err
-	}
-
-	transaction.NextMsgCh <- aakMd
-
-	return nil
+	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-db", "HandleDBOnline", dbId, addrStr)
 }
 
 func (s *UdpServer) HandleDHPDARMessage(ppd *core.PacketParserData) (err error) {
@@ -699,17 +674,7 @@ func (s *UdpServer) HandleDHPDARMessage(ppd *core.PacketParserData) (err error) 
 		PrevParserData: ppd,
 		Message:        aakBytes,
 	}
-	// forward to a specific transaction
-	transaction := ppd.ConnData.FindRemoteTransaction(transactionId)
-	if transaction == nil {
-		log.Error("server-agent(@%s#%d@%s)[HandleDHPDARMessage] transaction is not available", doId, transactionId, addrStr)
-		err = common.ErrTransactionIdNotFound
-		return err
-	}
-
-	transaction.NextMsgCh <- aakMd
-
-	return nil
+	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-agent", "HandleDHPDARMessage", doId, addrStr)
 }
 
 func (s *UdpServer) HandleDHPDAVMessage(ppd *core.PacketParserData) (err error) {
@@ -781,17 +746,7 @@ func (s *UdpServer) HandleDHPDAVMessage(ppd *core.PacketParserData) (err error) 
 		PrevParserData: ppd,
 		Message:        aakBytes,
 	}
-	// forward to a specific transaction
-	transaction := ppd.ConnData.FindRemoteTransaction(transactionId)
-	if transaction == nil {
-		log.Error("server-agent(@%s#%d@%s)[HandleDHPDARMessage] transaction is not available", doId, transactionId, addrStr)
-		err = common.ErrTransactionIdNotFound
-		return err
-	}
-
-	transaction.NextMsgCh <- aakMd
-
-	return nil
+	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-agent", "HandleDHPDAVMessage", doId, addrStr)
 }
 
 // HandleDHPDRGMessage
@@ -836,16 +791,7 @@ func (s *UdpServer) HandleDHPDRGMessage(ppd *core.PacketParserData) (err error) 
 		Message:        aakBytes,
 	}
 
-	// forward to a specific transaction
-
-	transaction := ppd.ConnData.FindRemoteTransaction(transactionId)
-	if transaction == nil {
-		log.Error("server-DB(@%s#%d@%s)[HandleDHPDRGMessage] transaction is not available", doId, transactionId, addrStr)
-		err = common.ErrTransactionIdNotFound
-		return err
-	}
-	transaction.NextMsgCh <- aakMd
-	return nil
+	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-db", "HandleDHPDRGMessage", doId, addrStr)
 }
 
 func (s *UdpServer) onAttestationVerify(spo *common.SmartPolicy, attestation string) error {

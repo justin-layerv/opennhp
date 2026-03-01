@@ -120,14 +120,5 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 		Message:        ackBytes,
 	}
 
-	// forward to a specific transaction
-	transaction := ppd.ConnData.FindRemoteTransaction(transactionId)
-	if transaction == nil {
-		log.Error("server-agent(%s#%d@%s)[HandleKnockRequest] transaction is not available", knkMsg.UserId, transactionId, addrStr)
-		err = common.ErrTransactionIdNotFound
-		return err
-	}
-
-	transaction.NextMsgCh <- ackMd
-	return nil
+	return forwardToTransaction(ppd.ConnData, transactionId, ackMd, "server-agent", "HandleKnockRequest", knkMsg.UserId, addrStr)
 }
