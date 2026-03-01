@@ -420,6 +420,42 @@ developer_portal_custom_domain             = "devapi.layerv.xyz"
 developer_portal_hosted_zone_id            = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone
 developer_portal_ci_bypass_secret_name     = "layerv-nhp-sandbox/developer-portal/ci-bypass-key"
 
+# ==============================================================================
+# Auth0 SPA Dashboard Configuration
+# Website dashboard login for developers to manage API keys, usage, and billing
+# ==============================================================================
+enable_auth0_spa_dashboard = true
+# Single Auth0 tenant shared across environments — custom domain is the same for sandbox and prod.
+auth0_custom_domain = "auth.layerv.ai"
+
+# Callback URLs: Auth0 redirects here after login
+# Include staging site + localhost for development
+auth0_spa_callback_urls = [
+  "https://staging.layerv.ai/qurl/dashboard/callback",
+  "https://staging.layerv.ai/api/auth/callback",
+  "http://localhost:3000/qurl/dashboard/callback",
+  "http://localhost:3000/api/auth/callback",
+]
+
+# Logout URLs: Auth0 redirects here after logout
+auth0_spa_logout_urls = [
+  "https://staging.layerv.ai",
+  "https://staging.layerv.ai/qurl/dashboard",
+  "http://localhost:3000",
+  "http://localhost:3000/qurl/dashboard",
+]
+
+# Web origins: allowed for CORS and silent authentication
+auth0_spa_web_origins = [
+  "https://staging.layerv.ai",
+  "http://localhost:3000",
+]
+
+# Social connections (Google + GitHub) for developer login
+# OAuth credentials are passed via TF_VAR_* environment variables
+# Store in GitHub Secrets: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET,
+#                          GITHUB_OAUTH_CLIENT_ID, GITHUB_OAUTH_CLIENT_SECRET
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"

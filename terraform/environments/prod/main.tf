@@ -378,6 +378,14 @@ module "auth0" {
   spa_callback_urls    = var.auth0_spa_callback_urls
   spa_logout_urls      = var.auth0_spa_logout_urls
   spa_web_origins      = var.auth0_spa_web_origins
+  auth0_custom_domain  = var.auth0_custom_domain
+
+  # Social connections (Google + GitHub)
+  # OAuth credentials are passed via TF_VAR_* environment variables from GitHub Secrets
+  google_oauth_client_id     = var.google_oauth_client_id
+  google_oauth_client_secret = var.google_oauth_client_secret
+  github_oauth_client_id     = var.github_oauth_client_id
+  github_oauth_client_secret = var.github_oauth_client_secret
 }
 
 # ==============================================================================
@@ -517,4 +525,40 @@ output "auth0_rotation_lambda_arn" {
 output "auth0_rotation_enabled" {
   description = "Whether Auth0 credential rotation is enabled"
   value       = module.auth0.rotation_enabled
+}
+
+# SPA Dashboard outputs
+output "auth0_spa_dashboard_client_id" {
+  description = "Auth0 SPA dashboard client ID (NEXT_PUBLIC_AUTH0_CLIENT_ID)"
+  value       = module.auth0.spa_dashboard_client_id
+}
+
+output "auth0_spa_dashboard_enabled" {
+  description = "Whether the SPA dashboard Auth0 client is enabled"
+  value       = module.auth0.spa_dashboard_enabled
+}
+
+output "auth0_spa_domain" {
+  description = "Auth0 domain for SPA frontend configuration (NEXT_PUBLIC_AUTH0_DOMAIN)"
+  value       = module.auth0.auth0_domain
+}
+
+output "auth0_spa_api_audience" {
+  description = "Auth0 API audience for SPA frontend configuration (NEXT_PUBLIC_AUTH0_AUDIENCE)"
+  value       = module.auth0.api_audience
+}
+
+output "auth0_spa_client_id_ssm_arn" {
+  description = "ARN of SSM parameter containing SPA client ID (for IAM policies)"
+  value       = module.auth0.spa_client_id_ssm_arn
+}
+
+output "auth0_spa_domain_ssm_arn" {
+  description = "ARN of SSM parameter containing Auth0 domain (for IAM policies)"
+  value       = module.auth0.spa_auth0_domain_ssm_arn
+}
+
+output "auth0_spa_api_audience_ssm_arn" {
+  description = "ARN of SSM parameter containing API audience (for IAM policies)"
+  value       = module.auth0.spa_api_audience_ssm_arn
 }

@@ -53,11 +53,27 @@ output "spa_dashboard_enabled" {
 }
 
 output "auth0_domain" {
-  description = "Auth0 domain for frontend configuration (NEXT_PUBLIC_AUTH0_DOMAIN)"
-  value       = var.auth0_tenant_domain
+  description = "Auth0 domain for frontend configuration (NEXT_PUBLIC_AUTH0_DOMAIN). Returns custom domain if set, otherwise tenant domain."
+  value       = var.auth0_custom_domain != null ? var.auth0_custom_domain : var.auth0_tenant_domain
 }
 
 output "api_audience" {
   description = "Auth0 API audience for frontend configuration (NEXT_PUBLIC_AUTH0_AUDIENCE)"
   value       = auth0_resource_server.qurl_api.identifier
+}
+
+# SSM parameter ARNs (for cross-stack references / IAM policies)
+output "spa_client_id_ssm_arn" {
+  description = "ARN of the SSM parameter containing the SPA client ID"
+  value       = var.enable_spa_dashboard ? aws_ssm_parameter.spa_client_id[0].arn : null
+}
+
+output "spa_auth0_domain_ssm_arn" {
+  description = "ARN of the SSM parameter containing the Auth0 domain"
+  value       = var.enable_spa_dashboard ? aws_ssm_parameter.spa_auth0_domain[0].arn : null
+}
+
+output "spa_api_audience_ssm_arn" {
+  description = "ARN of the SSM parameter containing the API audience"
+  value       = var.enable_spa_dashboard ? aws_ssm_parameter.spa_api_audience[0].arn : null
 }

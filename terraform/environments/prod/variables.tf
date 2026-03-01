@@ -1308,3 +1308,44 @@ variable "auth0_spa_web_origins" {
   type        = list(string)
   default     = []
 }
+
+variable "auth0_custom_domain" {
+  description = "Auth0 custom domain for SPA login (e.g., auth.layerv.ai). If null, falls back to auth0_domain."
+  type        = string
+  default     = null
+}
+
+# ==============================================================================
+# Auth0 Social Connection Configuration
+# ==============================================================================
+# OAuth credentials for social login providers (Google, GitHub).
+# Pass via environment variables: TF_VAR_google_oauth_client_id, etc.
+# Store in GitHub Secrets for CI/CD.
+
+variable "google_oauth_client_id" {
+  description = "Google OAuth2 client ID for social login. If null, Google connection is not created."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "google_oauth_client_secret" {
+  description = "Google OAuth2 client secret for social login."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "github_oauth_client_id" {
+  description = "GitHub OAuth client ID for social login. If null, GitHub connection is not created."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "github_oauth_client_secret" {
+  description = "GitHub OAuth client secret for social login."
+  type        = string
+  default     = null
+  sensitive   = true
+}

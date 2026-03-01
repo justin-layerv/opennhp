@@ -296,6 +296,36 @@ developer_portal_allowed_origins           = ["https://layerv.ai", "https://www.
 developer_portal_custom_domain             = "devapi.layerv.ai"
 developer_portal_hosted_zone_id            = "Z0748438C8EK6UAW94ST" # layerv.ai zone (in layerv-mgmt account)
 
+# ==============================================================================
+# Auth0 SPA Dashboard Configuration
+# Website dashboard login for developers to manage API keys, usage, and billing
+# ==============================================================================
+enable_auth0_spa_dashboard = true
+# Single Auth0 tenant shared across environments — custom domain is the same for sandbox and prod.
+auth0_custom_domain = "auth.layerv.ai"
+
+# Callback URLs: Auth0 redirects here after login
+auth0_spa_callback_urls = [
+  "https://layerv.ai/qurl/dashboard/callback",
+  "https://layerv.ai/api/auth/callback",
+]
+
+# Logout URLs: Auth0 redirects here after logout
+auth0_spa_logout_urls = [
+  "https://layerv.ai",
+  "https://layerv.ai/qurl/dashboard",
+]
+
+# Web origins: allowed for CORS and silent authentication
+auth0_spa_web_origins = [
+  "https://layerv.ai",
+]
+
+# Social connections (Google + GitHub) for developer login
+# OAuth credentials are passed via TF_VAR_* environment variables
+# Store in GitHub Secrets: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET,
+#                          GITHUB_OAUTH_CLIENT_ID, GITHUB_OAUTH_CLIENT_SECRET
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"

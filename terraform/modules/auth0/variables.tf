@@ -151,8 +151,8 @@ variable "spa_callback_urls" {
   default     = []
 
   validation {
-    condition     = alltrue([for url in var.spa_callback_urls : can(regex("^https://", url))])
-    error_message = "All SPA callback URLs must use HTTPS"
+    condition     = alltrue([for url in var.spa_callback_urls : can(regex("^https://", url)) || can(regex("^http://localhost", url))])
+    error_message = "All SPA callback URLs must use HTTPS (http://localhost is allowed for development)"
   }
 
   validation {
@@ -167,8 +167,13 @@ variable "spa_logout_urls" {
   default     = []
 
   validation {
-    condition     = alltrue([for url in var.spa_logout_urls : can(regex("^https://", url))])
-    error_message = "All SPA logout URLs must use HTTPS"
+    condition     = alltrue([for url in var.spa_logout_urls : can(regex("^https://", url)) || can(regex("^http://localhost", url))])
+    error_message = "All SPA logout URLs must use HTTPS (http://localhost is allowed for development)"
+  }
+
+  validation {
+    condition     = !var.enable_spa_dashboard || length(var.spa_logout_urls) > 0
+    error_message = "spa_logout_urls must not be empty when enable_spa_dashboard is true"
   }
 }
 
@@ -178,8 +183,13 @@ variable "spa_web_origins" {
   default     = []
 
   validation {
-    condition     = alltrue([for url in var.spa_web_origins : can(regex("^https://", url))])
-    error_message = "All SPA web origins must use HTTPS"
+    condition     = alltrue([for url in var.spa_web_origins : can(regex("^https://", url)) || can(regex("^http://localhost", url))])
+    error_message = "All SPA web origins must use HTTPS (http://localhost is allowed for development)"
+  }
+
+  validation {
+    condition     = !var.enable_spa_dashboard || length(var.spa_web_origins) > 0
+    error_message = "spa_web_origins must not be empty when enable_spa_dashboard is true"
   }
 }
 
@@ -213,4 +223,19 @@ variable "github_oauth_client_secret" {
   type        = string
   default     = null
   sensitive   = true
+}
+
+# ==============================================================================
+# Auth0 Custom Domain
+# ==============================================================================
+
+variable "auth0_custom_domain" {
+  description = "Auth0 custom domain (e.g., auth.layerv.ai) used by the SPA for login. If null, falls back to auth0_tenant_domain for SSM parameter."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.auth0_custom_domain == null || can(regex("^[a-zA-Z0-9][a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$", var.auth0_custom_domain))
+    error_message = "auth0_custom_domain must be a valid domain name (e.g., auth.layerv.ai)"
+  }
 }

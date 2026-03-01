@@ -531,8 +531,15 @@ resource "auth0_connection" "google" {
     set_user_root_attributes = "on_first_login"
   }
 
+  # prevent_destroy: social connections accumulate user data (linked accounts).
+  # To remove a connection, first remove it from state with `terraform state rm`.
   lifecycle {
     prevent_destroy = true
+
+    precondition {
+      condition     = var.google_oauth_client_secret != null
+      error_message = "google_oauth_client_secret is required when google_oauth_client_id is provided"
+    }
   }
 }
 
@@ -558,8 +565,15 @@ resource "auth0_connection" "github" {
     set_user_root_attributes = "on_first_login"
   }
 
+  # prevent_destroy: social connections accumulate user data (linked accounts).
+  # To remove a connection, first remove it from state with `terraform state rm`.
   lifecycle {
     prevent_destroy = true
+
+    precondition {
+      condition     = var.github_oauth_client_secret != null
+      error_message = "github_oauth_client_secret is required when github_oauth_client_id is provided"
+    }
   }
 }
 
@@ -569,4 +583,61 @@ resource "auth0_connection_clients" "github" {
   enabled_clients = [
     auth0_client.spa_dashboard[0].id,
   ]
+}
+
+# ==============================================================================
+# SSM Parameters for SPA Dashboard Configuration
+# ==============================================================================
+# Publish Auth0 SPA configuration to SSM so the website can consume it.
+# The website reads these values at build/deploy time as NEXT_PUBLIC_* env vars.
+
+resource "aws_ssm_parameter" "spa_client_id" {
+  count       = var.enable_spa_dashboard ? 1 : 0
+  name        = "/${var.environment}/auth0/spa-client-id"
+  description = "Auth0 SPA dashboard client ID (NEXT_PUBLIC_AUTH0_CLIENT_ID)"
+  type        = "String"
+  value       = auth0_client.spa_dashboard[0].client_id
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-auth0-spa-client-id"
+    Component = "auth0"
+  })
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_ssm_parameter" "spa_auth0_domain" {
+  count       = var.enable_spa_dashboard ? 1 : 0
+  name        = "/${var.environment}/auth0/domain"
+  description = "Auth0 domain for SPA dashboard (NEXT_PUBLIC_AUTH0_DOMAIN)"
+  type        = "String"
+  value       = var.auth0_custom_domain != null ? var.auth0_custom_domain : var.auth0_tenant_domain
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-auth0-domain"
+    Component = "auth0"
+  })
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_ssm_parameter" "spa_api_audience" {
+  count       = var.enable_spa_dashboard ? 1 : 0
+  name        = "/${var.environment}/auth0/api-audience"
+  description = "Auth0 API audience for SPA dashboard (NEXT_PUBLIC_AUTH0_AUDIENCE)"
+  type        = "String"
+  value       = auth0_resource_server.qurl_api.identifier
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-auth0-api-audience"
+    Component = "auth0"
+  })
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
