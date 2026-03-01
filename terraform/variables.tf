@@ -1605,10 +1605,28 @@ variable "developer_portal_auth0_domain" {
   default     = null
 }
 
-variable "developer_portal_qurl_api_audience" {
-  description = "Auth0 API audience identifier for QURL API. Required when deploy_developer_portal is true."
+variable "developer_portal_qurl_api_keys_table_name" {
+  description = "DynamoDB table name for QURL API keys (created in qurl repo, e.g. qurl-sandbox-api-keys)"
   type        = string
-  default     = null
+  default     = ""
+}
+
+variable "developer_portal_qurl_api_keys_table_arn" {
+  description = "DynamoDB table ARN for QURL API keys (created in qurl repo)"
+  type        = string
+  default     = ""
+}
+
+variable "developer_portal_qurl_customers_table_name" {
+  description = "DynamoDB table name for QURL customers (created in qurl repo, e.g. qurl-sandbox-customers)"
+  type        = string
+  default     = ""
+}
+
+variable "developer_portal_qurl_customers_table_arn" {
+  description = "DynamoDB table ARN for QURL customers (created in qurl repo)"
+  type        = string
+  default     = ""
 }
 
 variable "developer_portal_from_email" {

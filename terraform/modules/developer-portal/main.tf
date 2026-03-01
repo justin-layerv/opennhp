@@ -2,7 +2,7 @@
 #
 # Deploys infrastructure for the developer experience features:
 # - Playground proxy Lambda (proxies requests to QURL API with M2M auth)
-# - Credential provisioner Lambda (Auth0 app creation, email verification)
+# - Credential provisioner Lambda (API key provisioning, email verification)
 # - API Gateway HTTP API with CORS
 # - DynamoDB tables for credentials and rate limiting
 

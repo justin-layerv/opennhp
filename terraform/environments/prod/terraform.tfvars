@@ -279,19 +279,22 @@ grafana_athena_config = {
 # ==============================================================================
 # Developer Portal Configuration
 # ==============================================================================
-deploy_developer_portal                 = true
-developer_portal_m2m_secret_name        = "layerv-nhp-prod-auth0-backend-credentials"
-developer_portal_auth0_mgmt_secret_name = "layerv-nhp-prod/developer-portal/auth0-mgmt"
-developer_portal_auth0_domain           = "auth.layerv.ai"
-developer_portal_qurl_api_audience      = "https://api.layerv.ai"
-developer_portal_from_email             = "noreply@layerv.ai"
-developer_portal_ses_region             = "us-east-1"
-developer_portal_notify_email           = "team@layerv.ai"
-developer_portal_site_url               = "https://layerv.ai"
-developer_portal_verify_url             = "https://layerv.ai/qurl/keys"
-developer_portal_allowed_origins        = ["https://layerv.ai", "https://www.layerv.ai"]
-developer_portal_custom_domain          = "devapi.layerv.ai"
-developer_portal_hosted_zone_id         = "Z0748438C8EK6UAW94ST" # layerv.ai zone (in layerv-mgmt account)
+deploy_developer_portal                    = true
+developer_portal_m2m_secret_name           = "layerv-nhp-prod-auth0-backend-credentials"
+developer_portal_auth0_mgmt_secret_name    = "layerv-nhp-prod/developer-portal/auth0-mgmt"
+developer_portal_auth0_domain              = "auth.layerv.ai"
+developer_portal_qurl_api_keys_table_name  = "qurl-prod-api-keys"
+developer_portal_qurl_api_keys_table_arn   = "arn:aws:dynamodb:us-east-2:235500187906:table/qurl-prod-api-keys"
+developer_portal_qurl_customers_table_name = "qurl-prod-customers"
+developer_portal_qurl_customers_table_arn  = "arn:aws:dynamodb:us-east-2:235500187906:table/qurl-prod-customers"
+developer_portal_from_email                = "noreply@layerv.ai"
+developer_portal_ses_region                = "us-east-1"
+developer_portal_notify_email              = "team@layerv.ai"
+developer_portal_site_url                  = "https://layerv.ai"
+developer_portal_verify_url                = "https://layerv.ai/qurl/keys"
+developer_portal_allowed_origins           = ["https://layerv.ai", "https://www.layerv.ai"]
+developer_portal_custom_domain             = "devapi.layerv.ai"
+developer_portal_hosted_zone_id            = "Z0748438C8EK6UAW94ST" # layerv.ai zone (in layerv-mgmt account)
 
 tags = {
   Organization = "LayerV"

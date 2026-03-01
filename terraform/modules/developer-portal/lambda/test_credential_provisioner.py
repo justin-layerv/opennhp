@@ -33,14 +33,27 @@ def setup_module():
 def mock_dynamodb():
     """Mock DynamoDB table operations."""
     with patch('credential_provisioner.credentials_table') as mock_cred_table, \
-         patch('credential_provisioner.rate_table') as mock_rate_table:
+         patch('credential_provisioner.rate_table') as mock_rate_table, \
+         patch('credential_provisioner.api_keys_table') as mock_api_keys_table, \
+         patch('credential_provisioner.customers_table') as mock_customers_table:
         mock_cred_table.put_item = MagicMock()
         mock_cred_table.get_item = MagicMock(return_value={})
         mock_cred_table.update_item = MagicMock()
         mock_rate_table.get_item = MagicMock(return_value={})
         mock_rate_table.put_item = MagicMock()
         mock_rate_table.update_item = MagicMock()
-        yield {'credentials_table': mock_cred_table, 'rate_table': mock_rate_table}
+        mock_api_keys_table.put_item = MagicMock()
+        mock_customers_table.put_item = MagicMock()
+        # Mock the ConditionalCheckFailedException for customers_table
+        mock_customers_table.meta.client.exceptions.ConditionalCheckFailedException = type(
+            'ConditionalCheckFailedException', (Exception,), {}
+        )
+        yield {
+            'credentials_table': mock_cred_table,
+            'rate_table': mock_rate_table,
+            'api_keys_table': mock_api_keys_table,
+            'customers_table': mock_customers_table,
+        }
 
 
 @pytest.fixture
@@ -465,6 +478,88 @@ class TestVerification:
             assert '#th' in expr
             assert '#ttl' in expr
             assert 'api_key_id' in expr
+
+    def test_verification_writes_api_key_and_customer_records(self, mock_aws, verify_event):
+        """Verify successful verification writes to qurl-api-keys and qurl-customers tables."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import credential_provisioner as cp
+
+            token = 'test-token-123'
+            token_hash = hashlib.sha256(token.encode()).hexdigest()
+
+            cp.check_verify_rate_limits = MagicMock(return_value=None)
+            cp.credentials_table = mock_aws['credentials_table']
+            cp.api_keys_table = mock_aws['api_keys_table']
+            cp.customers_table = mock_aws['customers_table']
+            cp.ses = mock_aws['ses']
+
+            mock_aws['credentials_table'].get_item.return_value = {
+                'Item': {
+                    'email': 'developer@example.com',
+                    'status': 'pending',
+                    'token_hash': token_hash,
+                    'ttl': int(time.time()) + 3600
+                }
+            }
+
+            cp.handle_verify(verify_event)
+
+            # Verify api_keys_table.put_item was called with correct structure
+            mock_aws['api_keys_table'].put_item.assert_called_once()
+            api_key_item = mock_aws['api_keys_table'].put_item.call_args[1]['Item']
+            assert api_key_item['status'] == 'active'
+            assert api_key_item['scopes'] == ['qurl:read', 'qurl:write']
+            assert api_key_item['name'] == 'Default'
+            assert api_key_item['owner_id'].startswith('email:')
+            assert 'key_hash' in api_key_item
+            assert 'key_id' in api_key_item
+            assert 'key_prefix' in api_key_item
+
+            # Verify customers_table.put_item was called with frozen: False
+            mock_aws['customers_table'].put_item.assert_called_once()
+            customer_call = mock_aws['customers_table'].put_item.call_args
+            customer_item = customer_call[1].get('Item') or customer_call[0][0] if customer_call[0] else customer_call[1]['Item']
+            assert customer_item['tier'] == 'free'
+            assert customer_item['frozen'] is False
+            assert customer_item['auth0_subject'].startswith('email:')
+            assert customer_item['email'] == 'developer@example.com'
+
+    def test_verification_idempotent_customer_creation(self, mock_aws, verify_event):
+        """Verify that existing customer records don't cause verification failure."""
+        with patch('boto3.resource'), patch('boto3.client'):
+            import credential_provisioner as cp
+
+            token = 'test-token-123'
+            token_hash = hashlib.sha256(token.encode()).hexdigest()
+
+            cp.check_verify_rate_limits = MagicMock(return_value=None)
+            cp.credentials_table = mock_aws['credentials_table']
+            cp.api_keys_table = mock_aws['api_keys_table']
+            cp.customers_table = mock_aws['customers_table']
+            cp.ses = mock_aws['ses']
+
+            mock_aws['credentials_table'].get_item.return_value = {
+                'Item': {
+                    'email': 'developer@example.com',
+                    'status': 'pending',
+                    'token_hash': token_hash,
+                    'ttl': int(time.time()) + 3600
+                }
+            }
+
+            # Simulate customer already exists — put_item raises ConditionalCheckFailedException
+            mock_aws['customers_table'].put_item.side_effect = \
+                mock_aws['customers_table'].meta.client.exceptions.ConditionalCheckFailedException(
+                    {'Error': {'Code': 'ConditionalCheckFailedException', 'Message': 'exists'}},
+                    'PutItem'
+                )
+
+            response = cp.handle_verify(verify_event)
+
+            # Verification should still succeed (customer exists = fine)
+            assert response['statusCode'] == 200
+            # API key should still be written
+            mock_aws['api_keys_table'].put_item.assert_called_once()
 
     def test_verification_sends_credentials_email(self, mock_aws, verify_event):
         """Verify credentials email is sent after provisioning."""

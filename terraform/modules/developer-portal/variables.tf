@@ -59,16 +59,6 @@ variable "auth0_domain" {
   type        = string
 }
 
-variable "qurl_api_audience" {
-  description = "Auth0 API audience for QURL API"
-  type        = string
-
-  validation {
-    condition     = var.qurl_api_audience != null && var.qurl_api_audience != ""
-    error_message = "qurl_api_audience must be set to the Auth0 API identifier (e.g., https://api.layerv.ai). Empty audience prevents credential provisioning."
-  }
-}
-
 # ==============================================================================
 # API Keys & Customers Tables (created externally, e.g. in qurl repo)
 # ==============================================================================
@@ -77,6 +67,11 @@ variable "qurl_api_keys_table_name" {
   description = "DynamoDB table name for QURL API keys (created in qurl repo)"
   type        = string
   default     = ""
+
+  validation {
+    condition     = (var.qurl_api_keys_table_name == "") == (var.qurl_api_keys_table_arn == "")
+    error_message = "qurl_api_keys_table_name and qurl_api_keys_table_arn must both be set or both be empty"
+  }
 }
 
 variable "qurl_api_keys_table_arn" {
@@ -89,6 +84,11 @@ variable "qurl_customers_table_name" {
   description = "DynamoDB table name for QURL customers (created in qurl repo)"
   type        = string
   default     = ""
+
+  validation {
+    condition     = (var.qurl_customers_table_name == "") == (var.qurl_customers_table_arn == "")
+    error_message = "qurl_customers_table_name and qurl_customers_table_arn must both be set or both be empty"
+  }
 }
 
 variable "qurl_customers_table_arn" {

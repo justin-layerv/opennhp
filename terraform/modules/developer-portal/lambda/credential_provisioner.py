@@ -343,6 +343,7 @@ def handle_verify(event):
                             'auth0_subject': owner_id,
                             'email': email,
                             'tier': 'free',
+                            'frozen': False,  # Frozen accounts cannot create QURLs or use API keys
                             'created_at': now_iso,
                             'updated_at': now_iso,
                         },

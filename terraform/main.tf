@@ -1417,9 +1417,14 @@ module "developer_portal" {
   playground_m2m_secret_name = var.developer_portal_m2m_secret_name
   auth0_mgmt_secret_name     = var.developer_portal_auth0_mgmt_secret_name
 
-  qurl_api_url      = "https://${var.qurl_service_domain}"
-  auth0_domain      = var.developer_portal_auth0_domain
-  qurl_api_audience = var.developer_portal_qurl_api_audience
+  qurl_api_url = "https://${var.qurl_service_domain}"
+  auth0_domain = var.developer_portal_auth0_domain
+
+  # QURL DynamoDB tables (created in qurl repo, referenced here for API key provisioning)
+  qurl_api_keys_table_name  = var.developer_portal_qurl_api_keys_table_name
+  qurl_api_keys_table_arn   = var.developer_portal_qurl_api_keys_table_arn
+  qurl_customers_table_name = var.developer_portal_qurl_customers_table_name
+  qurl_customers_table_arn  = var.developer_portal_qurl_customers_table_arn
 
   from_email   = var.developer_portal_from_email
   ses_region   = var.developer_portal_ses_region

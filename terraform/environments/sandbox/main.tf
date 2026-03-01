@@ -283,20 +283,23 @@ module "nhp" {
   status_page_hosted_zone_id = var.status_page_hosted_zone_id
 
   # Developer Portal
-  deploy_developer_portal                 = var.deploy_developer_portal
-  developer_portal_m2m_secret_name        = var.developer_portal_m2m_secret_name
-  developer_portal_auth0_mgmt_secret_name = var.developer_portal_auth0_mgmt_secret_name
-  developer_portal_auth0_domain           = var.developer_portal_auth0_domain
-  developer_portal_qurl_api_audience      = var.developer_portal_qurl_api_audience
-  developer_portal_from_email             = var.developer_portal_from_email
-  developer_portal_ses_region             = var.developer_portal_ses_region
-  developer_portal_notify_email           = var.developer_portal_notify_email
-  developer_portal_site_url               = var.developer_portal_site_url
-  developer_portal_verify_url             = var.developer_portal_verify_url
-  developer_portal_allowed_origins        = var.developer_portal_allowed_origins
-  developer_portal_custom_domain          = var.developer_portal_custom_domain
-  developer_portal_hosted_zone_id         = var.developer_portal_hosted_zone_id
-  developer_portal_ci_bypass_secret_name  = var.developer_portal_ci_bypass_secret_name
+  deploy_developer_portal                    = var.deploy_developer_portal
+  developer_portal_m2m_secret_name           = var.developer_portal_m2m_secret_name
+  developer_portal_auth0_mgmt_secret_name    = var.developer_portal_auth0_mgmt_secret_name
+  developer_portal_auth0_domain              = var.developer_portal_auth0_domain
+  developer_portal_qurl_api_keys_table_name  = var.developer_portal_qurl_api_keys_table_name
+  developer_portal_qurl_api_keys_table_arn   = var.developer_portal_qurl_api_keys_table_arn
+  developer_portal_qurl_customers_table_name = var.developer_portal_qurl_customers_table_name
+  developer_portal_qurl_customers_table_arn  = var.developer_portal_qurl_customers_table_arn
+  developer_portal_from_email                = var.developer_portal_from_email
+  developer_portal_ses_region                = var.developer_portal_ses_region
+  developer_portal_notify_email              = var.developer_portal_notify_email
+  developer_portal_site_url                  = var.developer_portal_site_url
+  developer_portal_verify_url                = var.developer_portal_verify_url
+  developer_portal_allowed_origins           = var.developer_portal_allowed_origins
+  developer_portal_custom_domain             = var.developer_portal_custom_domain
+  developer_portal_hosted_zone_id            = var.developer_portal_hosted_zone_id
+  developer_portal_ci_bypass_secret_name     = var.developer_portal_ci_bypass_secret_name
 }
 
 # ==============================================================================
