@@ -46,6 +46,34 @@ func Close() error {
 	return nhpplugins.Close()
 }
 
+// respondErrorRedirect sends a redirect-or-JSON error response for auth failures.
+// Uses RefreshResponse format for actions that go through the standard auth flow.
+func respondErrorRedirect(ctx *gin.Context, format, resId, errCode string, err error) {
+	errorUrl := "/plugins/passcode?resid=" + resId + "&action=error&id=" + errCode
+	if format == "json" {
+		ctx.JSON(http.StatusOK, nhpplugins.RefreshResponse{
+			RedirectUrl: errorUrl,
+			ErrCode:     errCode,
+			ErrMsg:      err.Error(),
+		})
+	} else {
+		ctx.Redirect(http.StatusFound, errorUrl)
+	}
+}
+
+// respondErrorJSON sends a redirect-or-JSON error response for custom auth failures.
+// Uses a simple code/message format for auth_code, auth, and hmac_auth actions.
+func respondErrorJSON(ctx *gin.Context, format, resId, errCode string, err error) {
+	if format == "json" {
+		ctx.JSON(http.StatusOK, map[string]interface{}{
+			"code":    10001,
+			"message": err.Error(),
+		})
+	} else {
+		ctx.Redirect(http.StatusFound, "/plugins/passcode?resid="+resId+"&action=error&id="+errCode)
+	}
+}
+
 func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugins.HttpServerPluginHelper) (ackMsg *common.ServerKnockAckMsg, err error) {
 	action := ctx.Query("action")
 	if strings.EqualFold(action, "refresh") || strings.EqualFold(action, "nhp-refresh") {
@@ -62,15 +90,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	res, err := resourceHander.FindResourceByID(resId)
 	statusCode := "500"
 	if err != nil {
-		if format == "json" {
-			ctx.JSON(http.StatusOK, nhpplugins.RefreshResponse{
-				RedirectUrl: "/plugins/passcode?resid=" + resId + "&action=error&id=" + statusCode,
-				ErrCode:     statusCode,
-				ErrMsg:      err.Error(),
-			})
-		} else {
-			ctx.Redirect(http.StatusFound, "/plugins/passcode?resid="+resId+"&action=error&id="+statusCode)
-		}
+		respondErrorRedirect(ctx, format, resId, statusCode, err)
 		log.Error("call findResourceApi failed: %v", err)
 		return
 	}
@@ -96,29 +116,13 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 			log.Info("authRegular took %s", time.Since(startTime))
 		}
 		if err != nil {
-			if format == "json" {
-				ctx.JSON(http.StatusOK, nhpplugins.RefreshResponse{
-					RedirectUrl: "/plugins/passcode?resid=" + resId + "&action=error&id=" + errCode,
-					ErrCode:     errCode,
-					ErrMsg:      err.Error(),
-				})
-			} else {
-				ctx.Redirect(http.StatusFound, "/plugins/passcode?resid="+resId+"&action=error&id="+errCode)
-			}
+			respondErrorRedirect(ctx, format, resId, errCode, err)
 		}
 	case strings.EqualFold(action, "access"):
 		errCode := ""
 		ackMsg, errCode, err = authAccessFromRaaS(ctx, req, res, helper)
 		if err != nil {
-			if format == "json" {
-				ctx.JSON(http.StatusOK, nhpplugins.RefreshResponse{
-					RedirectUrl: "/plugins/passcode?resid=" + resId + "&action=error&id=" + errCode,
-					ErrCode:     errCode,
-					ErrMsg:      err.Error(),
-				})
-			} else {
-				ctx.Redirect(http.StatusFound, "/plugins/passcode?resid="+resId+"&action=error&id="+errCode)
-			}
+			respondErrorRedirect(ctx, format, resId, errCode, err)
 		}
 
 	case strings.EqualFold(action, "knock"):
@@ -130,42 +134,21 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		errCode := ""
 		ackMsg, errCode, err = customAuthByCode(ctx, req, res, helper)
 		if err != nil {
-			if format == "json" {
-				ctx.JSON(http.StatusOK, map[string]interface{}{
-					"code":    10001,
-					"message": err.Error(),
-				})
-			} else {
-				ctx.Redirect(http.StatusFound, "/plugins/passcode?resid="+resId+"&action=error&id="+errCode)
-			}
+			respondErrorJSON(ctx, format, resId, errCode, err)
 		}
 	case strings.EqualFold(action, "auth"):
 		format := ctx.Query("format")
 		errCode := ""
 		ackMsg, errCode, err = std_auth(ctx, req, res, helper)
 		if err != nil {
-			if format == "json" {
-				ctx.JSON(http.StatusOK, map[string]interface{}{
-					"code":    10001,
-					"message": err.Error(),
-				})
-			} else {
-				ctx.Redirect(http.StatusFound, "/plugins/passcode?resid="+resId+"&action=error&id="+errCode)
-			}
+			respondErrorJSON(ctx, format, resId, errCode, err)
 		}
 	case strings.EqualFold(action, "hmac_auth"):
 		format := ctx.Query("format")
 		errCode := ""
 		ackMsg, errCode, err = customAuthByHmac(ctx, req, res, helper)
 		if err != nil {
-			if format == "json" {
-				ctx.JSON(http.StatusOK, map[string]interface{}{
-					"code":    10001,
-					"message": err.Error(),
-				})
-			} else {
-				ctx.Redirect(http.StatusFound, "/plugins/passcode?resid="+resId+"&action=error&id="+errCode)
-			}
+			respondErrorJSON(ctx, format, resId, errCode, err)
 		}
 	default:
 		ackMsg = nil
