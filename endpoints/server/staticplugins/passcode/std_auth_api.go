@@ -95,7 +95,7 @@ func std_auth(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Resour
 		return nil, errCode, knockErr
 	}
 
-	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHander.GetConfig(), "auth", "anonymous")
+	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHandler.GetConfig(), "auth", "anonymous")
 	if err != nil {
 		log.Error("failed to get redirect url: %v", err)
 		return ackMsg, "404", err

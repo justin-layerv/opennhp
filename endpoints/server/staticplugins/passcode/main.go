@@ -22,7 +22,7 @@ import (
 var (
 	name           = "passcode"
 	version        = "0.1.1"
-	resourceHander resource.ResourceHandler
+	resourceHandler resource.ResourceHandler
 	pluginsIn      *plugins.PluginParamsIn
 )
 
@@ -30,15 +30,15 @@ func Version() string {
 	return fmt.Sprintf("%s v%s", name, version)
 }
 
-func registerHander(handler resource.ResourceHandler) error {
-	resourceHander = handler
+func registerHandler(handler resource.ResourceHandler) error {
+	resourceHandler = handler
 	log.Info("register resource handler: %s", handler.GetConfig().ResourceMode)
 	return nil
 }
 
 func Init(in *plugins.PluginParamsIn) error {
 	pluginsIn = in
-	return nhpplugins.Init(in, registerHander)
+	return nhpplugins.Init(in, registerHandler)
 }
 
 func Close() error {
@@ -219,7 +219,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		ackMsg, err = authAndShowRefreshError(ctx)
 		return
 	}
-	res, err := resourceHander.FindResourceByID(resId)
+	res, err := resourceHandler.FindResourceByID(resId)
 	statusCode := "500"
 	if err != nil {
 		respondErrorRedirect(ctx, format, resId, statusCode, err)
@@ -230,7 +230,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		ackMsg = nil
 		err = common.ErrResourceNotFound
 		log.Error("resource error: %v", err)
-		ctx.String(http.StatusOK, "{\"errMsg\": \"resource error: %v\"}", err)
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": fmt.Sprintf("resource error: %v", err)})
 		return
 	}
 	ctx.SetSameSite(http.SameSiteNoneMode)
@@ -302,7 +302,7 @@ func AuthWithHttpRefresh(ctx *gin.Context, action string, req *common.HttpKnockR
 	}
 	resId := payload.ResourceID
 	log.Info("resId from nhp_token: %s", resId)
-	res, err := resourceHander.FindResourceByID(resId)
+	res, err := resourceHandler.FindResourceByID(resId)
 	if err != nil {
 		log.Error("call findResourceApi failed: %v", err)
 		return
@@ -311,7 +311,7 @@ func AuthWithHttpRefresh(ctx *gin.Context, action string, req *common.HttpKnockR
 		ackMsg = nil
 		err = common.ErrResourceNotFound
 		log.Error("resource error: %v", err)
-		ctx.String(http.StatusOK, "{\"errMsg\": \"resource error: %v\"}", err)
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": fmt.Sprintf("resource error: %v", err)})
 		return
 	}
 	jwt := &nhpplugins.JWTToken{
@@ -343,7 +343,7 @@ func AuthWithHttpRefresh(ctx *gin.Context, action string, req *common.HttpKnockR
 		ackMsg = nil
 		err = fmt.Errorf("unknown action: %s", action)
 		log.Error("unknown action error: %v", err)
-		ctx.String(http.StatusBadRequest, "{\"errMsg\": \"unknown action: %s\"}", action)
+		ctx.JSON(http.StatusBadRequest, gin.H{"errMsg": fmt.Sprintf("unknown action: %s", action)})
 	}
 
 	return
@@ -355,7 +355,7 @@ func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelp
 		return ackMsg, fmt.Errorf("AuthWithNHP: helper is null")
 	}
 
-	res, err := resourceHander.FindResourceByID(req.Msg.ResourceId)
+	res, err := resourceHandler.FindResourceByID(req.Msg.ResourceId)
 	if err != nil {
 		err = common.ErrResourceNotFound
 		ackMsg.ErrCode = common.ErrResourceNotFound.ErrorCode()
@@ -389,7 +389,7 @@ func authAndShowLogin(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 
 	if res.ExInfo == nil {
 		log.Error("extra login info not available")
-		ctx.String(http.StatusOK, "{\"errMsg\": \"extra login info not available\"}")
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": "extra login info not available"})
 		return nil, fmt.Errorf("extra login info not available")
 	}
 
@@ -417,7 +417,7 @@ func authAndShowRefresh(ctx *gin.Context, req *common.HttpKnockRequest, res *com
 
 	if res.ExInfo == nil {
 		log.Error("extra login info not available")
-		ctx.String(http.StatusOK, "{\"errMsg\": \"extra login info not available\"}")
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": "extra login info not available"})
 		return nil, fmt.Errorf("extra login info not available")
 	}
 
@@ -486,7 +486,7 @@ func knockByToken(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Re
 		return result.AckMsg, nil
 	}
 
-	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHander.GetConfig(), "knock", "anonymous")
+	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHandler.GetConfig(), "knock", "anonymous")
 	if err != nil {
 		log.Error("failed to get redirect url: %v", err)
 		return ackMsg, nil
@@ -510,8 +510,8 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 	var err error
 	passcode := ctx.Query("passcode")
 	format := ctx.Query("format")
-	if resourceHander.GetConfig().ResourceMode == "api" {
-		AuthUrl := resourceHander.GetConfig().AuthUrl
+	if resourceHandler.GetConfig().ResourceMode == "api" {
+		AuthUrl := resourceHandler.GetConfig().AuthUrl
 		if len(AuthUrl) == 0 {
 			log.Error("AuthUrl is not provided.")
 			return nil, "401", fmt.Errorf("AuthUrl is not provided")
@@ -585,7 +585,7 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		redirectUrl = sharingRedirectUrl
 		log.Info("Using sharing link redirect url: %s", redirectUrl)
 	} else {
-		result.AckMsg, redirectUrl, err = nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHander.GetConfig(), "valid", "anonymous")
+		result.AckMsg, redirectUrl, err = nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHandler.GetConfig(), "valid", "anonymous")
 		if err != nil {
 			log.Error("failed to get redirect url: %v", err)
 			return result.AckMsg, "404", err
@@ -617,7 +617,7 @@ func authAccessFromRaaS(ctx *gin.Context, req *common.HttpKnockRequest, res *com
 	if helper == nil {
 		return nil, "600", fmt.Errorf(" authRegular helper is null")
 	}
-	IAMServiceUrl := resourceHander.GetConfig().IAMServiceUrl
+	IAMServiceUrl := resourceHandler.GetConfig().IAMServiceUrl
 
 	idStr := ctx.Query("id")
 	if idStr == "" {
@@ -660,7 +660,7 @@ func authAccessFromRaaS(ctx *gin.Context, req *common.HttpKnockRequest, res *com
 	}
 
 	user := GetUserFromAuthHeader(authHeader)
-	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHander.GetConfig(), "access", user)
+	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHandler.GetConfig(), "access", user)
 	if err != nil {
 		log.Error("failed to get redirect url: %v", err)
 		return ackMsg, "404", err

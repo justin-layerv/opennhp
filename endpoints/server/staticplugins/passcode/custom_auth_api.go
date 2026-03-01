@@ -67,7 +67,7 @@ func customAuthByHmac(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 		return nil, errCode, knockErr
 	}
 
-	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHander.GetConfig(), "hmac", "anonymous")
+	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHandler.GetConfig(), "hmac", "anonymous")
 	if err != nil {
 		log.Error("failed to get redirect url: %v", err)
 		return ackMsg, "404", err
@@ -144,7 +144,7 @@ func customAuthByCode(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 		return nil, errCode, knockErr
 	}
 
-	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHander.GetConfig(), "auth_code", "anonymous")
+	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(result.AckMsg, res, resourceHandler.GetConfig(), "auth_code", "anonymous")
 	if err != nil {
 		log.Error("failed to get redirect url: %v", err)
 		return ackMsg, "404", err

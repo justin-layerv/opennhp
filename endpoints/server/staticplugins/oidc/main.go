@@ -37,13 +37,13 @@ var (
 	name    = "oktaoidc"
 	version = "0.1.1"
 
-	resourceHander resource.ResourceHandler
+	resourceHandler resource.ResourceHandler
 	pluginsIn      *plugins.PluginParamsIn
 )
 
-func registerHander(handler resource.ResourceHandler) error {
-	resourceHander = handler
-	log.Info("registerHander handler.GetConfig() %+v", handler.GetConfig())
+func registerHandler(handler resource.ResourceHandler) error {
+	resourceHandler = handler
+	log.Info("registerHandler handler.GetConfig() %+v", handler.GetConfig())
 	log.Info("pluginsIn.PluginDirPath: %+v", pluginsIn.PluginDirPath)
 	log.Info("register resource handler: %s", handler.GetConfig().ResourceMode)
 	return nil
@@ -62,7 +62,7 @@ func ExportedData() *plugins.PluginParamsOut {
 
 func Init(in *plugins.PluginParamsIn) error {
 	pluginsIn = in
-	return nhpplugins.Init(in, registerHander)
+	return nhpplugins.Init(in, registerHandler)
 }
 
 func Close() error {
@@ -84,7 +84,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		}
 	}
 
-	res, err := resourceHander.FindResourceByID(resId)
+	res, err := resourceHandler.FindResourceByID(resId)
 	if err != nil {
 		log.Error("call FindResourceByID failed: %v", err)
 		return
@@ -93,7 +93,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		ackMsg = nil
 		err = common.ErrResourceNotFound
 		log.Error("resource error: %v", err)
-		ctx.String(http.StatusOK, "{\"errMsg\": \"resource error: %v\"}", err)
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": fmt.Sprintf("resource error: %v", err)})
 		return
 	}
 	baseConf = &config{
@@ -145,14 +145,14 @@ func authOkta(ctx *gin.Context) error {
 	var err error
 	oktaAuth, err = NewAuthenticator(*baseConf)
 	if err != nil {
-		ctx.String(http.StatusOK, "{\"errMsg\": \"failed to initialize authenticator\"}")
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to initialize authenticator"})
 		oktaAuth = nil
 		return fmt.Errorf("failed to initialize authenticator")
 	}
 
 	err = oktaAuth.DoAuth(ctx)
 	if err != nil {
-		ctx.String(http.StatusOK, "{\"errMsg\": \"user authentication failed\"}")
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": "user authentication failed"})
 		return fmt.Errorf("user authentication failed")
 	}
 
@@ -161,13 +161,13 @@ func authOkta(ctx *gin.Context) error {
 
 func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
 	if oktaAuth == nil {
-		ctx.String(http.StatusOK, "{\"errMsg\": \"invalid authenticator\"}")
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": "invalid authenticator"})
 		return nil, fmt.Errorf("invalid authenticator")
 	}
 
 	session := sessions.Default(ctx)
 	if ctx.Query("state") != session.Get("state") {
-		ctx.String(http.StatusOK, "{\"errMsg\": \"invalid authentication session\"}")
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": "invalid authentication session"})
 		log.Error("session.state = %s, query.state = %s", session.Get("state"), ctx.Query("state"))
 		return nil, fmt.Errorf("invalid authentication session")
 	}
@@ -181,19 +181,19 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		// Exchange an authorization code for a token.
 		oktaToken, err = oktaAuth.Exchange(ctx.Request.Context(), authorizeCode)
 		if err != nil {
-			ctx.String(http.StatusOK, "{\"errMsg\": \"failed to convert an authorization code into a token\"}")
+			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to convert an authorization code into a token"})
 			return nil, fmt.Errorf("failed to convert an authorization code into a token")
 		}
 
 		idToken, err := oktaAuth.VerifyIDToken(ctx.Request.Context(), oktaToken)
 		if err != nil {
-			ctx.String(http.StatusOK, "{\"errMsg\": \"failed to verify ID token\"}")
+			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to verify ID token"})
 			return nil, fmt.Errorf("failed to verify ID token")
 		}
 
 		var profile map[string]interface{}
 		if err := idToken.Claims(&profile); err != nil {
-			ctx.String(http.StatusOK, "{\"errMsg\": \"failed to claim user profile\"}")
+			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to claim user profile"})
 			return nil, fmt.Errorf("failed to claim user profile")
 		}
 
@@ -207,21 +207,21 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		oauthToken := session.Get("oauth_token")
 		t, ok := oauthToken.(oauth2.Token)
 		if !ok {
-			ctx.String(http.StatusOK, "{\"errMsg\": \"invalid session paramete\"}")
+			ctx.JSON(http.StatusOK, gin.H{"errMsg": "invalid session parameter"})
 			return nil, fmt.Errorf("invalid session parameter")
 		}
 		oktaToken = &t
 
 		idToken, err := oktaAuth.VerifyIDToken(ctx.Request.Context(), oktaToken)
 		if err != nil {
-			ctx.String(http.StatusOK, "{\"errMsg\": \"failed to verify ID token\"}")
+			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to verify ID token"})
 			session.Clear()
 			ctx.Redirect(http.StatusSeeOther, fmt.Sprintf("/plugins/oktaoidc?resid=%s&action=login", res.Id()))
 			return nil, fmt.Errorf("failed to verify ID token")
 		}
 		var profile map[string]interface{}
 		if err := idToken.Claims(&profile); err != nil {
-			ctx.String(http.StatusOK, "{\"errMsg\": \"failed to claim user profile\"}")
+			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to claim user profile"})
 			return nil, fmt.Errorf("failed to claim user profile")
 		}
 
@@ -250,7 +250,7 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		return nil, fmt.Errorf("knock failed: %s", ackMsg.ErrMsg)
 	}
 
-	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(ackMsg, res, resourceHander.GetConfig(), "oidc", "")
+	ackMsg, redirectUrl, err := nhpplugins.GetRedirectUrlByResource(ackMsg, res, resourceHandler.GetConfig(), "oidc", "")
 	if err != nil {
 		log.Error("failed to get redirect url: %v", err)
 		return ackMsg, err
@@ -268,19 +268,12 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 	jwtSecret := nhpsdkutils.GetStringFromMap(res.ExInfo, "JWTSecret")
 	if jwtSecret == "" {
 		log.Error("JWTSecret is empty or not found in ExInfo")
-		ctx.String(http.StatusOK, "{\"errMsg\": \"JWT secret not configured\"}")
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": "JWT secret not configured"})
 		return nil, fmt.Errorf("JWT secret not configured")
 	}
 
 	jwt := &nhpplugins.JWTToken{
 		JwtKey: []byte(jwtSecret),
-	}
-
-	// Verify jwt object
-	if jwt == nil {
-		log.Error("Failed to create JWTToken object")
-		ctx.String(http.StatusOK, "{\"errMsg\": \"failed to create token generator\"}")
-		return nil, fmt.Errorf("failed to create token generator")
 	}
 
 	nhpToken, refreshToken, err := jwt.GenerateAll(res.AuthServiceId, res)
@@ -295,13 +288,13 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 	// Verify the generated token
 	if nhpToken == "" {
 		log.Error("Generated nhpToken is empty")
-		ctx.String(http.StatusOK, "{\"errMsg\": \"failed to generate authentication token\"}")
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to generate authentication token"})
 		return nil, fmt.Errorf("empty authentication token generated")
 	}
 
 	if refreshToken == "" {
 		log.Error("Generated refreshToken is empty")
-		ctx.String(http.StatusOK, "{\"errMsg\": \"failed to generate refresh token\"}")
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to generate refresh token"})
 		return nil, fmt.Errorf("empty refresh token generated")
 	}
 
@@ -312,9 +305,10 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 	if ctx.Query("format") == "json" {
 		ctx.JSON(http.StatusOK, resp)
 	} else {
+		tokenExpire := nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire")
 		ctx.SetSameSite(http.SameSiteNoneMode)
-		ctx.SetCookie("nhp_token", nhpToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
-		ctx.SetCookie("nhp_refresh_token", refreshToken, nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire"), "/", res.CookieDomain, true, true)
+		ctx.SetCookie("nhp_token", nhpToken, tokenExpire, "/", res.CookieDomain, true, true)
+		ctx.SetCookie("nhp_refresh_token", refreshToken, tokenExpire, "/", res.CookieDomain, true, true)
 		ctx.Redirect(http.StatusFound, resp.RedirectUrl)
 	}
 	return ackMsg, nil
@@ -327,7 +321,7 @@ func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelp
 	}
 
 	var res *common.ResourceData
-	res, err = resourceHander.FindResourceByID(req.Msg.ResourceId)
+	res, err = resourceHandler.FindResourceByID(req.Msg.ResourceId)
 	if err != nil {
 		log.Error("call findResourceApi failed: %v", err)
 		return
