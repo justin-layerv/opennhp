@@ -470,21 +470,22 @@ type DynamoDBPinger interface {
 	Ping(ctx context.Context) error
 }
 
-// GetEtcdPinger returns an EtcdPinger if the storage backend supports it.
-// Returns nil if no etcd-based health check is available.
-func (s *UdpServer) GetEtcdPinger() EtcdPinger {
+// unwrapStorageBackend returns the underlying storage backend, unwrapping
+// CachedStorage if present. Returns nil if no storage is configured.
+func (s *UdpServer) unwrapStorageBackend() StorageBackend {
 	if s.storage == nil {
 		return nil
 	}
-
-	// Unwrap CachedStorage to get the underlying backend for type assertion
-	backend := s.storage
 	if cached, ok := s.storage.(*CachedStorage); ok {
-		backend = cached.Backend()
+		return cached.Backend()
 	}
+	return s.storage
+}
 
-	// Check if underlying backend implements EtcdPinger
-	if pinger, ok := backend.(EtcdPinger); ok {
+// GetEtcdPinger returns an EtcdPinger if the storage backend supports it.
+// Returns nil if no etcd-based health check is available.
+func (s *UdpServer) GetEtcdPinger() EtcdPinger {
+	if pinger, ok := s.unwrapStorageBackend().(EtcdPinger); ok {
 		return pinger
 	}
 	return nil
@@ -493,18 +494,7 @@ func (s *UdpServer) GetEtcdPinger() EtcdPinger {
 // GetDynamoDBPinger returns a DynamoDBPinger if the storage backend supports it.
 // Returns nil if no DynamoDB-based health check is available.
 func (s *UdpServer) GetDynamoDBPinger() DynamoDBPinger {
-	if s.storage == nil {
-		return nil
-	}
-
-	// Unwrap CachedStorage to get the underlying backend for type assertion
-	backend := s.storage
-	if cached, ok := s.storage.(*CachedStorage); ok {
-		backend = cached.Backend()
-	}
-
-	// Check if underlying backend implements DynamoDBPinger
-	if pinger, ok := backend.(DynamoDBPinger); ok {
+	if pinger, ok := s.unwrapStorageBackend().(DynamoDBPinger); ok {
 		return pinger
 	}
 	return nil

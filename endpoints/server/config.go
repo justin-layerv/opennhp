@@ -599,53 +599,40 @@ func (s *UdpServer) updateHttpConfig(httpConf HttpConfig) (err error) {
 	return err
 }
 
-func (s *UdpServer) updateACPeers(peers []*core.UdpPeer) (err error) {
+// updatePeers is a generic helper that adds new peers of the given type to the
+// device, removes stale peers that are no longer in the list, and atomically
+// swaps the peer map under the provided mutex.
+func (s *UdpServer) updatePeers(peers []*core.UdpPeer, peerType int, mu *sync.Mutex, peerMap *map[string]*core.UdpPeer) (err error) {
 	utils.CatchPanicThenRun(func() {
 		err = errLoadConfig
 	})
 
-	acPeerMap := make(map[string]*core.UdpPeer)
+	newMap := make(map[string]*core.UdpPeer)
 	for _, p := range peers {
-		p.Type = core.NHP_AC
+		p.Type = peerType
 		s.device.AddPeer(p)
-		acPeerMap[p.PublicKeyBase64()] = p
+		newMap[p.PublicKeyBase64()] = p
 	}
 
 	// remove old peers from device
-	s.acPeerMapMutex.Lock()
-	defer s.acPeerMapMutex.Unlock()
-	for pubKey := range s.acPeerMap {
-		if _, found := acPeerMap[pubKey]; !found {
+	mu.Lock()
+	defer mu.Unlock()
+	for pubKey := range *peerMap {
+		if _, found := newMap[pubKey]; !found {
 			s.device.RemovePeer(pubKey)
 		}
 	}
-	s.acPeerMap = acPeerMap
+	*peerMap = newMap
 
 	return err
 }
 
-func (s *UdpServer) updateAgentPeers(peers []*core.UdpPeer) (err error) {
-	utils.CatchPanicThenRun(func() {
-		err = errLoadConfig
-	})
-	agentPeerMap := make(map[string]*core.UdpPeer)
-	for _, p := range peers {
-		p.Type = core.NHP_AGENT
-		s.device.AddPeer(p)
-		agentPeerMap[p.PublicKeyBase64()] = p
-	}
+func (s *UdpServer) updateACPeers(peers []*core.UdpPeer) error {
+	return s.updatePeers(peers, core.NHP_AC, &s.acPeerMapMutex, &s.acPeerMap)
+}
 
-	// remove old peers from device
-	s.agentPeerMapMutex.Lock()
-	defer s.agentPeerMapMutex.Unlock()
-	for pubKey := range s.agentPeerMap {
-		if _, found := agentPeerMap[pubKey]; !found {
-			s.device.RemovePeer(pubKey)
-		}
-	}
-	s.agentPeerMap = agentPeerMap
-
-	return err
+func (s *UdpServer) updateAgentPeers(peers []*core.UdpPeer) error {
+	return s.updatePeers(peers, core.NHP_AGENT, &s.agentPeerMapMutex, &s.agentPeerMap)
 }
 
 func (s *UdpServer) updateResources(aspMap common.AuthSvcProviderMap) (err error) {
@@ -697,56 +684,19 @@ func (s *UdpServer) updateSourceIps(srcIpMap map[string][]*common.NetAddress) (e
 }
 
 func (s *UdpServer) StopConfigWatch() {
-	if baseConfigWatch != nil {
-		baseConfigWatch.Close()
-	}
-	if httpConfigWatch != nil {
-		httpConfigWatch.Close()
-	}
-	if acConfigWatch != nil {
-		acConfigWatch.Close()
-	}
-	if agentConfigWatch != nil {
-		agentConfigWatch.Close()
-	}
-	if resConfigWatch != nil {
-		resConfigWatch.Close()
-	}
-	if srcipConfigWatch != nil {
-		srcipConfigWatch.Close()
-	}
-	//add dbConfigWatch
-	if dbConfigWatch != nil {
-		dbConfigWatch.Close()
-	}
-	if teeWatch != nil {
-		teeWatch.Close()
+	for _, w := range []io.Closer{
+		baseConfigWatch, httpConfigWatch, acConfigWatch,
+		agentConfigWatch, resConfigWatch, srcipConfigWatch,
+		dbConfigWatch, teeWatch,
+	} {
+		if w != nil {
+			w.Close()
+		}
 	}
 }
 
-// updateDePeers
-func (s *UdpServer) updateDePeers(peers []*core.UdpPeer) (err error) {
-	utils.CatchPanicThenRun(func() {
-		err = errLoadConfig
-	})
-
-	dbPeerMap := make(map[string]*core.UdpPeer)
-	for _, p := range peers {
-		p.Type = core.NHP_DB
-		s.device.AddPeer(p)
-		dbPeerMap[p.PublicKeyBase64()] = p
-	}
-
-	// remove old peers from device
-	s.dbPeerMapMutex.Lock()
-	defer s.dbPeerMapMutex.Unlock()
-	for pubKey := range s.dbPeerMap {
-		if _, found := dbPeerMap[pubKey]; !found {
-			s.device.RemovePeer(pubKey)
-		}
-	}
-	s.dbPeerMap = dbPeerMap
-	return err
+func (s *UdpServer) updateDePeers(peers []*core.UdpPeer) error {
+	return s.updatePeers(peers, core.NHP_DB, &s.dbPeerMapMutex, &s.dbPeerMap)
 }
 
 // update tee

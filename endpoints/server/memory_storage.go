@@ -72,16 +72,22 @@ func NewMemoryStorage() *MemoryStorage {
 // StorageBackend Interface Implementation
 // ============================================================================
 
-// GetACAssignment retrieves the server assignment for an AC.
-func (m *MemoryStorage) GetACAssignment(ctx context.Context, acID string) (*ACAssignment, error) {
+// preamble increments the call counter, checks for injected delays and errors.
+// All StorageBackend methods call this before their actual logic.
+func (m *MemoryStorage) preamble(ctx context.Context, method string) error {
 	m.mu.Lock()
-	m.callCounts["GetACAssignment"]++
+	m.callCounts[method]++
 	m.mu.Unlock()
 
-	if err := m.checkContextAndDelay(ctx, "GetACAssignment"); err != nil {
-		return nil, err
+	if err := m.checkContextAndDelay(ctx, method); err != nil {
+		return err
 	}
-	if err := m.checkError("GetACAssignment"); err != nil {
+	return m.checkError(method)
+}
+
+// GetACAssignment retrieves the server assignment for an AC.
+func (m *MemoryStorage) GetACAssignment(ctx context.Context, acID string) (*ACAssignment, error) {
+	if err := m.preamble(ctx, "GetACAssignment"); err != nil {
 		return nil, err
 	}
 
@@ -104,14 +110,7 @@ func (m *MemoryStorage) GetACAssignment(ctx context.Context, acID string) (*ACAs
 
 // GetACsByServer retrieves all ACs assigned to a specific server.
 func (m *MemoryStorage) GetACsByServer(ctx context.Context, serverID string) ([]ACAssignment, error) {
-	m.mu.Lock()
-	m.callCounts["GetACsByServer"]++
-	m.mu.Unlock()
-
-	if err := m.checkContextAndDelay(ctx, "GetACsByServer"); err != nil {
-		return nil, err
-	}
-	if err := m.checkError("GetACsByServer"); err != nil {
+	if err := m.preamble(ctx, "GetACsByServer"); err != nil {
 		return nil, err
 	}
 
@@ -140,14 +139,7 @@ func (m *MemoryStorage) GetACsByServer(ctx context.Context, serverID string) ([]
 // The license key is hashed with SHA256 for lookup (matching DynamoDB implementation).
 // License keys are globally unique, so no customer ID is needed.
 func (m *MemoryStorage) GetLicense(ctx context.Context, licenseKey string) (*License, error) {
-	m.mu.Lock()
-	m.callCounts["GetLicense"]++
-	m.mu.Unlock()
-
-	if err := m.checkContextAndDelay(ctx, "GetLicense"); err != nil {
-		return nil, err
-	}
-	if err := m.checkError("GetLicense"); err != nil {
+	if err := m.preamble(ctx, "GetLicense"); err != nil {
 		return nil, err
 	}
 
@@ -170,14 +162,7 @@ func (m *MemoryStorage) GetLicense(ctx context.Context, licenseKey string) (*Lic
 
 // GetResource retrieves resource definition.
 func (m *MemoryStorage) GetResource(ctx context.Context, customerID, resourceID string) (*Resource, error) {
-	m.mu.Lock()
-	m.callCounts["GetResource"]++
-	m.mu.Unlock()
-
-	if err := m.checkContextAndDelay(ctx, "GetResource"); err != nil {
-		return nil, err
-	}
-	if err := m.checkError("GetResource"); err != nil {
+	if err := m.preamble(ctx, "GetResource"); err != nil {
 		return nil, err
 	}
 
@@ -197,14 +182,7 @@ func (m *MemoryStorage) GetResource(ctx context.Context, customerID, resourceID 
 
 // GetResourceByACID retrieves resources associated with an AC.
 func (m *MemoryStorage) GetResourceByACID(ctx context.Context, acID string) ([]Resource, error) {
-	m.mu.Lock()
-	m.callCounts["GetResourceByACID"]++
-	m.mu.Unlock()
-
-	if err := m.checkContextAndDelay(ctx, "GetResourceByACID"); err != nil {
-		return nil, err
-	}
-	if err := m.checkError("GetResourceByACID"); err != nil {
+	if err := m.preamble(ctx, "GetResourceByACID"); err != nil {
 		return nil, err
 	}
 
