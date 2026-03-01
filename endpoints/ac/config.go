@@ -278,13 +278,9 @@ func (a *UdpAC) IpPassMode() int {
 }
 
 func (a *UdpAC) StopConfigWatch() {
-	if baseConfigWatch != nil {
-		baseConfigWatch.Close()
-	}
-	if httpConfigWatch != nil {
-		httpConfigWatch.Close()
-	}
-	if serverPeerWatch != nil {
-		serverPeerWatch.Close()
+	for _, w := range []io.Closer{baseConfigWatch, httpConfigWatch, serverPeerWatch} {
+		if w != nil {
+			w.Close()
+		}
 	}
 }

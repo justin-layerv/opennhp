@@ -181,11 +181,11 @@ func (a *UdpAgent) updateDHPConfig(file string) (err error) {
 		log.Error("failed to unmarshal DHP config: %v", err)
 	}
 
+	// Only set on first load; subsequent reloads are a no-op to preserve
+	// write-once semantics (readers access DHPConfig without synchronization).
 	if a.config.DHPConfig == nil {
 		a.config.DHPConfig = &conf
-		return err
 	}
-
 	return err
 }
 
@@ -270,17 +270,10 @@ func (a *UdpAgent) updateResources(file string) (err error) {
 }
 
 func (a *UdpAgent) StopConfigWatch() {
-	if baseConfigWatch != nil {
-		baseConfigWatch.Close()
-	}
-	if dhpConfigWatch != nil {
-		dhpConfigWatch.Close()
-	}
-	if serverConfigWatch != nil {
-		serverConfigWatch.Close()
-	}
-	if resourceConfigWatch != nil {
-		resourceConfigWatch.Close()
+	for _, w := range []io.Closer{baseConfigWatch, dhpConfigWatch, serverConfigWatch, resourceConfigWatch} {
+		if w != nil {
+			w.Close()
+		}
 	}
 }
 
@@ -300,34 +293,20 @@ func (a *UdpAgent) NewEcdhFromConfigFile() (core.Ecdh, error) {
 	return core.NewECDH(conf.GetEccType()), nil
 }
 
-func (a *UdpAgent) RotateTeeKey() error {
-	fileName := filepath.Join(ExeDirPath, "etc", "dhp.toml")
-
+func (a *UdpAgent) rotateKey(file, tomlKey string) error {
 	ecdh, err := a.NewEcdhFromConfigFile()
 	if err != nil {
 		return err
 	}
+	return utils.UpdateTomlConfig(file, tomlKey, ecdh.PrivateKeyBase64())
+}
 
-	if err := utils.UpdateTomlConfig(fileName, "TEEPrivateKeyBase64", ecdh.PrivateKeyBase64()); err != nil {
-		return err
-	}
-
-	return nil
+func (a *UdpAgent) RotateTeeKey() error {
+	return a.rotateKey(filepath.Join(ExeDirPath, "etc", "dhp.toml"), "TEEPrivateKeyBase64")
 }
 
 func (a *UdpAgent) RotateAgentKey() error {
-	fileName := filepath.Join(ExeDirPath, "etc", "config.toml")
-
-	ecdh, err := a.NewEcdhFromConfigFile()
-	if err != nil {
-		return err
-	}
-
-	if err := utils.UpdateTomlConfig(fileName, "PrivateKeyBase64", ecdh.PrivateKeyBase64()); err != nil {
-		return err
-	}
-
-	return nil
+	return a.rotateKey(filepath.Join(ExeDirPath, "etc", "config.toml"), "PrivateKeyBase64")
 }
 
 func (a *UdpAgent) InitializeSecret() error {

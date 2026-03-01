@@ -14,10 +14,9 @@ import (
 )
 
 var (
-	baseConfigWatch     io.Closer
-	serverConfigWatch   io.Closer
-	teesConfigWatch     io.Closer
-	resourceConfigWatch io.Closer
+	baseConfigWatch   io.Closer
+	serverConfigWatch io.Closer
+	teesConfigWatch   io.Closer
 
 	errLoadConfig = fmt.Errorf("config load error")
 )
@@ -192,16 +191,9 @@ func (a *UdpDevice) updateTEEConfig(file string) (err error) {
 }
 
 func (a *UdpDevice) StopConfigWatch() {
-	if baseConfigWatch != nil {
-		baseConfigWatch.Close()
-	}
-	if serverConfigWatch != nil {
-		serverConfigWatch.Close()
-	}
-	if resourceConfigWatch != nil {
-		resourceConfigWatch.Close()
-	}
-	if teesConfigWatch != nil {
-		teesConfigWatch.Close()
+	for _, w := range []io.Closer{baseConfigWatch, serverConfigWatch, teesConfigWatch} {
+		if w != nil {
+			w.Close()
+		}
 	}
 }
