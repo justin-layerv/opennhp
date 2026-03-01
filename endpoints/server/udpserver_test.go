@@ -9,6 +9,63 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
 
+// TestBuildServerMetricDimensions tests that buildServerMetricDimensions returns
+// correct CloudWatch dimensions based on environment variables, including the
+// default fallback values ("unknown" and "cell0") when env vars are unset.
+func TestBuildServerMetricDimensions(t *testing.T) {
+	t.Run("defaults when env vars unset", func(t *testing.T) {
+		// Use t.Setenv for automatic cleanup and parallel safety.
+		// Setting to "" is equivalent to unset for our logic (Getenv returns "" for both).
+		t.Setenv("NHP_ENVIRONMENT", "")
+		t.Setenv("NHP_CELL_ID", "")
+
+		dims := buildServerMetricDimensions()
+
+		if len(dims) != 2 {
+			t.Fatalf("Expected 2 dimensions, got %d", len(dims))
+		}
+
+		if *dims[0].Name != "Environment" || *dims[0].Value != "unknown" {
+			t.Errorf("Expected Environment=unknown, got %s=%s", *dims[0].Name, *dims[0].Value)
+		}
+		if *dims[1].Name != "Cell" || *dims[1].Value != "cell0" {
+			t.Errorf("Expected Cell=cell0, got %s=%s", *dims[1].Name, *dims[1].Value)
+		}
+	})
+
+	t.Run("custom values from env vars", func(t *testing.T) {
+		t.Setenv("NHP_ENVIRONMENT", "sandbox")
+		t.Setenv("NHP_CELL_ID", "cell3")
+
+		dims := buildServerMetricDimensions()
+
+		if len(dims) != 2 {
+			t.Fatalf("Expected 2 dimensions, got %d", len(dims))
+		}
+
+		if *dims[0].Name != "Environment" || *dims[0].Value != "sandbox" {
+			t.Errorf("Expected Environment=sandbox, got %s=%s", *dims[0].Name, *dims[0].Value)
+		}
+		if *dims[1].Name != "Cell" || *dims[1].Value != "cell3" {
+			t.Errorf("Expected Cell=cell3, got %s=%s", *dims[1].Name, *dims[1].Value)
+		}
+	})
+
+	t.Run("partial env vars", func(t *testing.T) {
+		t.Setenv("NHP_ENVIRONMENT", "production")
+		t.Setenv("NHP_CELL_ID", "")
+
+		dims := buildServerMetricDimensions()
+
+		if *dims[0].Value != "production" {
+			t.Errorf("Expected Environment=production, got %s", *dims[0].Value)
+		}
+		if *dims[1].Value != "cell0" {
+			t.Errorf("Expected Cell=cell0 (default), got %s", *dims[1].Value)
+		}
+	})
+}
+
 // testPrivateKey returns a valid 32-byte private key for testing.
 func testPrivateKey() []byte {
 	key := make([]byte, 32)

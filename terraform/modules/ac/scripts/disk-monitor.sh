@@ -17,12 +17,12 @@ echo "Instance: $INSTANCE_ID"
 echo "Disk usage: $DISK_USAGE%"
 echo "Threshold: $THRESHOLD%"
 
-# Publish metric to CloudWatch
+# Publish metric to CloudWatch (unified namespace with Go app metrics)
 aws cloudwatch put-metric-data \
   --region "$REGION" \
-  --namespace "NHP/AC" \
+  --namespace "LayerV/NHP" \
   --metric-name "DiskUsagePercent" \
-  --dimensions InstanceId="$INSTANCE_ID" \
+  --dimensions Component=AC,InstanceId="$INSTANCE_ID" \
   --value "$DISK_USAGE" \
   --unit Percent
 

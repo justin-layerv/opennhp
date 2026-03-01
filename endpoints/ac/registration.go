@@ -6,14 +6,20 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 )
 
 // ============================================================================
@@ -57,6 +63,26 @@ const (
 	// peer state but the AC continues sending keep-alives.
 	// Set to 6 * KeepaliveInterval = 60 seconds.
 	RegistrationRefreshInterval = 6
+)
+
+// CloudWatch metric names for AC registration lifecycle.
+const (
+	MetricRegistrationAttempts    = "RegistrationAttempts"
+	MetricRegistrationSuccess     = "RegistrationSuccess"
+	MetricRegistrationFailure     = "RegistrationFailure"
+	MetricRegistrationLatency     = "RegistrationLatency"
+	MetricServerConnections       = "ServerConnections"
+	MetricServerConnectionFailure = "ServerConnectionFailure"
+	MetricServerHealthFailures    = "ServerHealthFailures"
+	MetricReregistrationTriggers  = "ReregistrationTriggers"
+)
+
+// Re-registration reason constants. These are the only values that
+// classifyReason passes through; all others map to "other".
+const (
+	ReasonRefreshRedirect         = "refresh_redirect"
+	ReasonServerConnectionTimeout = "server_connection_timeout"
+	ReasonConnectionTimeout       = "connection_timeout"
 )
 
 // AssignedServer represents a server assigned to this AC.
@@ -106,6 +132,15 @@ func (s *AssignedServer) IncrementFailCount() int {
 	return s.FailCount
 }
 
+// Pre-allocated dimension name strings to avoid per-call heap allocations.
+var (
+	dimNameACId             = aws.String("ACId")
+	dimNameErrorCode        = aws.String("ErrorCode")
+	dimNameRegistrationType = aws.String("RegistrationType")
+	dimNameConnectionType   = aws.String("ConnectionType")
+	dimNameReason           = aws.String("Reason")
+)
+
 // ACRegistration manages AC registration with NHP servers.
 type ACRegistration struct {
 	ac              *UdpAC
@@ -131,16 +166,72 @@ type ACRegistration struct {
 	// directly, not NHP_ARD. We need to track it for cleanup when AC stops
 	// or re-registers to a different server.
 	registrationPeer *core.UdpPeer
+
+	// CloudWatch metrics publisher (batched, shared package)
+	metrics *metrics.Publisher
+
+	// cachedACIdDim is the pre-built ACId dimension. ACId is immutable after
+	// startup, so we build once and reuse to avoid per-call aws.String allocations.
+	cachedACIdDim types.Dimension
+
+	// cachedAOLBytes is the pre-marshaled ACOnlineMsg. Config is immutable after
+	// startup, so we marshal once and reuse across register/connect/refresh calls.
+	cachedAOLBytes []byte
 }
 
 // NewACRegistration creates a new AC registration manager.
-func NewACRegistration(ac *UdpAC) *ACRegistration {
+// Returns an error if the ACOnlineMsg cannot be marshaled (indicates a
+// programmer error in the Config struct — json.Marshal should never fail
+// on these simple fields).
+func NewACRegistration(ac *UdpAC) (*ACRegistration, error) {
+	env := ac.config.Environment
+	if env == "" {
+		env = "unknown"
+	}
+
+	// Marshal ACOnlineMsg once — config is immutable after startup.
+	aolMsg := &common.ACOnlineMsg{
+		ACId:          ac.config.ACId,
+		AuthServiceId: ac.config.AuthServiceId,
+		ResourceIds:   ac.config.ResourceIds,
+		LicenseKey:    ac.config.LicenseKey,
+		ACVersion:     ac.config.ACVersion,
+	}
+	aolBytes, err := json.Marshal(aolMsg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal ACOnlineMsg: %w", err)
+	}
+
+	// Build shared dimensions for all metrics.
+	// ACId is included as an extra dimension on failure/debug metrics only.
+	dims := []types.Dimension{
+		{Name: aws.String("Environment"), Value: aws.String(env)},
+		{Name: aws.String("Component"), Value: aws.String("AC")},
+	}
+	// Include Region when available (set by AWS SDK or user data scripts).
+	// Enables querying metrics across regions in multi-region deployments.
+	if region := os.Getenv("AWS_REGION"); region != "" {
+		dims = append(dims, types.Dimension{Name: aws.String("Region"), Value: aws.String(region)})
+	}
+
 	return &ACRegistration{
 		ac:              ac,
 		assignedServers: make([]*AssignedServer, 0),
 		oldServerSets:   make(map[string][]*AssignedServer),
 		stopCh:          make(chan struct{}),
-	}
+		cachedAOLBytes:  aolBytes,
+		cachedACIdDim:   types.Dimension{Name: dimNameACId, Value: aws.String(ac.config.ACId)},
+		metrics: metrics.NewPublisher(metrics.Config{
+			Namespace:  "LayerV/NHP",
+			Dimensions: dims,
+		}),
+	}, nil
+}
+
+// acIdDimension returns the cached CloudWatch dimension for this AC's ID.
+// The dimension is built once at startup since ACId is immutable.
+func (r *ACRegistration) acIdDimension() types.Dimension {
+	return r.cachedACIdDim
 }
 
 // Start begins the registration process and keepalive loop.
@@ -197,6 +288,9 @@ func (r *ACRegistration) Stop() {
 	}
 	r.mu.Unlock()
 
+	// Flush remaining CloudWatch metrics
+	r.metrics.Stop()
+
 	log.Debug("AC registration manager stopped")
 }
 
@@ -242,7 +336,7 @@ func (r *ACRegistration) UpdateServerLastSeenByAddr(addr string) {
 	r.mu.RUnlock()
 
 	for _, server := range servers {
-		serverAddr := fmt.Sprintf("%s:%d", server.Target.IP, server.Target.Port)
+		serverAddr := net.JoinHostPort(server.Target.IP, strconv.Itoa(server.Target.Port))
 		if serverAddr == addr {
 			server.UpdateLastSeen()
 			log.Debug("Updated LastSeen for server at %s", addr)
@@ -305,6 +399,10 @@ func (r *ACRegistration) register() error {
 		return errors.New("ServerPubKeyBase64 is required")
 	}
 
+	// Track attempt after validation so RegistrationAttempts == RegistrationSuccess + RegistrationFailure.
+	r.metrics.IncrCounter(MetricRegistrationAttempts)
+	startTime := time.Now()
+
 	// Determine server port (default 62206)
 	serverPort := r.ac.config.ServerPort
 	if serverPort == 0 {
@@ -328,18 +426,12 @@ func (r *ACRegistration) register() error {
 
 	log.Info("Registering AC %s via endpoint %s (resolved to %s)", r.ac.config.ACId, r.ac.config.ServerEndpoint, sendAddr.String())
 
-	// Create AOL message with registration credentials
-	aolMsg := &common.ACOnlineMsg{
-		ACId:          r.ac.config.ACId,
-		AuthServiceId: r.ac.config.AuthServiceId,
-		ResourceIds:   r.ac.config.ResourceIds,
-		LicenseKey:    r.ac.config.LicenseKey,
-		ACVersion:     r.ac.config.ACVersion,
-	}
-
-	aolBytes, err := json.Marshal(aolMsg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal NHP_AOL: %w", err)
+	// Use pre-marshaled AOL bytes (config is immutable after startup).
+	// cachedAOLBytes is set by NewACRegistration, which returns an error on
+	// marshal failure. A nil value here means a bug in the construction path.
+	// Intentional panic: this is a programming error, not a runtime condition.
+	if r.cachedAOLBytes == nil {
+		panic("BUG: cachedAOLBytes is nil — NewACRegistration should have returned an error")
 	}
 
 	// Add peer to device for encryption
@@ -355,7 +447,7 @@ func (r *ACRegistration) register() error {
 		TransactionId: r.ac.device.NextCounterIndex(),
 		Compress:      true,
 		PeerPk:        registrationPeer.PublicKey(),
-		Message:       aolBytes,
+		Message:       r.cachedAOLBytes,
 		ResponseMsgCh: make(chan *core.PacketParserData, 1),
 	}
 
@@ -370,15 +462,32 @@ func (r *ACRegistration) register() error {
 	// Note: We don't close ResponseMsgCh here because the sender (in another goroutine)
 	// may write to it after we exit. The buffered channel (size 1) prevents blocking,
 	// and the channel will be garbage collected when no longer referenced.
+	// Use time.NewTimer instead of time.After to avoid leaking the timer
+	// goroutine when stopCh fires or a response arrives before timeout.
+	regTimer := time.NewTimer(RegistrationTimeout)
+	defer regTimer.Stop()
+
 	select {
 	case <-r.stopCh:
 		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+		r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
+			r.acIdDimension(),
+			{Name: dimNameErrorCode, Value: aws.String("cancelled")},
+		})
 		return errors.New("registration cancelled")
-	case <-time.After(RegistrationTimeout):
+	case <-regTimer.C:
 		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+		r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
+			r.acIdDimension(),
+			{Name: dimNameErrorCode, Value: aws.String("timeout")},
+		})
 		return errors.New("registration timeout")
 	case ppd := <-md.ResponseMsgCh:
-		return r.handleRegistrationResponse(ppd, registrationPeer)
+		err := r.handleRegistrationResponse(ppd, registrationPeer)
+		if err == nil {
+			r.metrics.RecordLatency(MetricRegistrationLatency, float64(time.Since(startTime).Milliseconds()))
+		}
+		return err
 	}
 }
 
@@ -392,6 +501,14 @@ func (r *ACRegistration) register() error {
 func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, registrationPeer *core.UdpPeer) error {
 	if ppd.Error != nil {
 		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+
+		// Send registration failure metric with error category (not raw message)
+		// to keep dimension cardinality bounded.
+		r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
+			r.acIdDimension(),
+			{Name: dimNameErrorCode, Value: aws.String(classifyError(ppd.Error))},
+		})
+
 		return fmt.Errorf("registration failed: %w", ppd.Error)
 	}
 
@@ -414,6 +531,12 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 		}
 
 		log.Info("Successfully connected to assigned servers")
+
+		// Send registration success metric
+		r.metrics.IncrCounterWithDims(MetricRegistrationSuccess, []types.Dimension{
+			{Name: dimNameRegistrationType, Value: aws.String("Redispatch")},
+		})
+
 		return nil
 
 	case core.NHP_AAK:
@@ -426,11 +549,29 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 
 		if !common.IsSuccessErrCode(aakMsg.ErrCode) {
 			r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+
+			// Send registration failure metric with server's error code (bounded cardinality).
+			errCode := aakMsg.ErrCode
+			if errCode == "" {
+				errCode = "unknown"
+			}
+			r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
+				r.acIdDimension(),
+				{Name: dimNameErrorCode, Value: aws.String(errCode)},
+			})
+
 			return fmt.Errorf("registration rejected: %s - %s", aakMsg.ErrCode, aakMsg.ErrMsg)
 		}
 
 		if !aakMsg.Registered {
 			r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+
+			// Send registration failure metric for server-side rejection.
+			r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
+				r.acIdDimension(),
+				{Name: dimNameErrorCode, Value: aws.String("registered_false")},
+			})
+
 			return errors.New("server returned NHP_AAK with Registered=false")
 		}
 
@@ -519,6 +660,12 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 			r.registrationPeer = serverPeer
 			r.mu.Unlock()
 			log.Info("Received NHP_AAK: ACAddr=%s, Registered=%v (peer kept but no keepalive)", aakMsg.ACAddr, aakMsg.Registered)
+
+			// Send registration success metric
+			r.metrics.IncrCounterWithDims(MetricRegistrationSuccess, []types.Dimension{
+				{Name: dimNameRegistrationType, Value: aws.String("Direct")},
+			})
+
 			return nil
 		}
 
@@ -552,6 +699,12 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 		} else {
 			log.Info("Received NHP_AAK: ACAddr=%s, Registered=%v, ServerAddr=%s (using direct connection)", aakMsg.ACAddr, aakMsg.Registered, aakMsg.ServerAddr)
 		}
+
+		// Send registration success metric
+		r.metrics.IncrCounterWithDims(MetricRegistrationSuccess, []types.Dimension{
+			{Name: dimNameRegistrationType, Value: aws.String("Direct")},
+		})
+
 		return nil
 
 	default:
@@ -615,14 +768,28 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 	serversToConnect := r.assignedServers
 	r.mu.Unlock()
 
-	successCount := 0
+	// Connect to all assigned servers concurrently. Each connection has its own
+	// ConnectionTimeout (10s), so sequential attempts could take 30s+ total.
+	var connectWg sync.WaitGroup
+	var successCount int32
 	for _, server := range serversToConnect {
-		if err := r.connectToServer(server); err != nil {
-			log.Warning("Failed to connect to assigned server %s: %v", server.Target.IP, err)
-		} else {
-			successCount++
-		}
+		connectWg.Add(1)
+		go func(s *AssignedServer) {
+			defer connectWg.Done()
+			if err := r.connectToServer(s); err != nil {
+				log.Warning("Failed to connect to assigned server %s: %v", s.Target.IP, err)
+
+				// Track individual connection failures for alerting on partial connectivity.
+				r.metrics.IncrCounterWithDims(MetricServerConnectionFailure, []types.Dimension{
+					r.acIdDimension(),
+					{Name: dimNameErrorCode, Value: aws.String(classifyError(err))},
+				})
+			} else {
+				atomic.AddInt32(&successCount, 1)
+			}
+		}(server)
 	}
+	connectWg.Wait()
 
 	// Fail if no connections succeeded - AC would be unreachable
 	if successCount == 0 {
@@ -630,7 +797,7 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 	}
 
 	// Warn if partial failure (some but not all servers connected)
-	if successCount < len(serversToConnect) {
+	if int(successCount) < len(serversToConnect) {
 		log.Warning("Partial connection success: %d/%d assigned servers connected", successCount, len(serversToConnect))
 	} else {
 		log.Info("Successfully connected to all %d assigned servers", successCount)
@@ -640,6 +807,11 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 	if hasOldServers {
 		go r.cleanupOldServers(cleanupKey)
 	}
+
+	// Send server connections metric
+	r.metrics.AddCounterWithDims(MetricServerConnections, float64(successCount), []types.Dimension{
+		{Name: dimNameConnectionType, Value: aws.String("Redispatch")},
+	})
 
 	return nil
 }
@@ -669,20 +841,7 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 	r.ac.device.AddPeer(peer)
 	server.Peer = peer
 
-	// Send NHP_AOL to register with this server
-	aolMsg := &common.ACOnlineMsg{
-		ACId:          r.ac.config.ACId,
-		AuthServiceId: r.ac.config.AuthServiceId,
-		ResourceIds:   r.ac.config.ResourceIds,
-		LicenseKey:    r.ac.config.LicenseKey,
-		ACVersion:     r.ac.config.ACVersion,
-	}
-
-	msgBytes, err := json.Marshal(aolMsg)
-	if err != nil {
-		return err
-	}
-
+	// Send NHP_AOL to register with this server (use cached bytes)
 	// Use buffered channel (size 1) to prevent sender from blocking if we exit early
 	md := &core.MsgData{
 		RemoteAddr:    sendAddr.(*net.UDPAddr),
@@ -690,7 +849,7 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 		TransactionId: r.ac.device.NextCounterIndex(),
 		Compress:      true,
 		PeerPk:        peer.PublicKey(),
-		Message:       msgBytes,
+		Message:       r.cachedAOLBytes,
 		ResponseMsgCh: make(chan *core.PacketParserData, 1),
 	}
 
@@ -857,22 +1016,7 @@ func (r *ACRegistration) refreshAssignedServerRegistrations() {
 
 // refreshSingleServer sends NHP_AOL to a single assigned server to refresh registration.
 func (r *ACRegistration) refreshSingleServer(server *AssignedServer, sendAddr *net.UDPAddr) {
-	// Create AOL message with registration credentials
-	aolMsg := &common.ACOnlineMsg{
-		ACId:          r.ac.config.ACId,
-		AuthServiceId: r.ac.config.AuthServiceId,
-		ResourceIds:   r.ac.config.ResourceIds,
-		LicenseKey:    r.ac.config.LicenseKey,
-		ACVersion:     r.ac.config.ACVersion,
-	}
-
-	aolBytes, err := json.Marshal(aolMsg)
-	if err != nil {
-		log.Error("Failed to marshal refresh NHP_AOL: %v", err)
-		return
-	}
-
-	// Create message data for sending
+	// Create message data for sending (use cached AOL bytes)
 	// Use buffered channel to prevent sender from blocking if we timeout
 	md := &core.MsgData{
 		RemoteAddr:    sendAddr,
@@ -881,7 +1025,7 @@ func (r *ACRegistration) refreshSingleServer(server *AssignedServer, sendAddr *n
 		TransactionId: r.ac.device.NextCounterIndex(),
 		Compress:      true,
 		PeerPk:        server.Peer.PublicKey(),
-		Message:       aolBytes,
+		Message:       r.cachedAOLBytes,
 		ResponseMsgCh: make(chan *core.PacketParserData, 1),
 	}
 
@@ -891,11 +1035,16 @@ func (r *ACRegistration) refreshSingleServer(server *AssignedServer, sendAddr *n
 	}
 	r.ac.sendMsgCh <- md
 
-	// Wait for response with short timeout (don't block keepalive loop)
+	// Wait for response with short timeout (don't block keepalive loop).
+	// Use time.NewTimer instead of time.After to avoid leaking the timer
+	// goroutine when stopCh fires or a response arrives before timeout.
+	timer := time.NewTimer(KeepaliveTimeout)
+	defer timer.Stop()
+
 	select {
 	case <-r.stopCh:
 		return
-	case <-time.After(KeepaliveTimeout):
+	case <-timer.C:
 		// Timeout is OK - server may be slow or unreachable
 		// Health check will eventually detect and trigger re-registration
 		log.Debug("Refresh NHP_AOL to %s timed out", sendAddr.String())
@@ -932,7 +1081,7 @@ func (r *ACRegistration) handleRefreshResponse(ppd *core.PacketParserData, serve
 		// Server wants us to connect to different servers
 		// This shouldn't happen during refresh, but handle it gracefully
 		log.Info("Server %s responded with NHP_ARD during refresh, triggering full re-registration", sendAddr.String())
-		r.TriggerReregistration("refresh_redirect")
+		r.TriggerReregistration(ReasonRefreshRedirect)
 
 	default:
 		log.Warning("Unexpected response type %d from %s during refresh", ppd.HeaderType, sendAddr.String())
@@ -958,6 +1107,14 @@ func (r *ACRegistration) checkServerHealth() {
 			// Check if already re-registering to prevent concurrent attempts
 			if r.reregistering.CompareAndSwap(false, true) {
 				log.Warning("Server %s appears down, triggering re-registration", server.Target.IP)
+
+				// Send server health failure metric.
+				// Only ACId as extra dimension — no ServerIP to keep cardinality bounded
+				// (server IPs change on every ASG launch).
+				r.metrics.IncrCounterWithDims(MetricServerHealthFailures, []types.Dimension{
+					r.acIdDimension(),
+				})
+
 				go r.handleServerDown(server)
 			} else {
 				log.Debug("Server %s appears down but re-registration already in progress", server.Target.IP)
@@ -1051,6 +1208,12 @@ func (r *ACRegistration) TriggerReregistration(reason string) {
 	}
 
 	log.Info("Triggering re-registration due to: %s", reason)
+
+	// Send reregistration trigger metric with bounded reason category.
+	r.metrics.IncrCounterWithDims(MetricReregistrationTriggers, []types.Dimension{
+		r.acIdDimension(),
+		{Name: dimNameReason, Value: aws.String(classifyReason(reason))},
+	})
 
 	go func() {
 		// Always reset reregistering flag when done
@@ -1153,5 +1316,68 @@ func (r *ACRegistration) resetIptables() {
 	if r.ac.config.FilterMode == FilterMode_IPTABLES && r.ac.iptables != nil {
 		log.Info("Resetting iptables after successful registration for AC %s", r.ac.config.ACId)
 		r.ac.iptables.ResetAllInput()
+	}
+}
+
+// classifyError maps an error to a bounded category string for use as a
+// CloudWatch dimension value. Using raw error messages would create unbounded
+// cardinality; this function ensures a finite set of dimension values.
+//
+// Priority order (first match wins):
+//  1. Typed *common.Error — returns the NHP error code (e.g., "ErrTransactionFailedByTimeout")
+//  2. net.Error with Timeout() — returns "timeout"
+//  3. String matching — categorizes by message content (timeout, connection_error, crypto_error, dns_error)
+//  4. Fallback — returns "other"
+//
+// NHP error codes are checked first because a *common.Error may also satisfy
+// net.Error (via wrapping), and the specific NHP code is more useful than
+// the generic "timeout" category.
+func classifyError(err error) string {
+	if err == nil {
+		return "none"
+	}
+
+	// Check for typed NHP errors, unwrapping if needed.
+	var nhpErr *common.Error
+	if errors.As(err, &nhpErr) {
+		if code := nhpErr.ErrorCode(); code != "" {
+			return code
+		}
+	}
+
+	// Check for net.Error timeout via interface (handles wrapped net errors).
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+
+	// Fall back to string matching for errors without typed wrappers.
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "timeout") || strings.Contains(msg, "timed out") || strings.Contains(msg, "deadline exceeded"):
+		return "timeout"
+	case strings.Contains(msg, "connection refused") || strings.Contains(msg, "connection reset"):
+		return "connection_error"
+	case strings.Contains(msg, "ecdh") || strings.Contains(msg, "decrypt") || strings.Contains(msg, "encrypt"):
+		return "crypto_error"
+	case strings.Contains(msg, "resolve") || strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "dns") || strings.Contains(msg, "name resolution"):
+		return "dns_error"
+	default:
+		return "other"
+	}
+}
+
+// classifyReason maps a re-registration reason string to a bounded category
+// for use as a CloudWatch dimension value. This prevents unbounded cardinality
+// from free-form caller-supplied reason strings.
+func classifyReason(reason string) string {
+	switch reason {
+	case ReasonRefreshRedirect,
+		ReasonServerConnectionTimeout,
+		ReasonConnectionTimeout:
+		return reason
+	default:
+		return "other"
 	}
 }

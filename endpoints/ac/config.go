@@ -49,6 +49,7 @@ type Config struct {
 	ACVersion          string `json:"acVersion"`          // AC software version for compatibility
 	ServerPubKeyBase64 string `json:"serverPubKeyBase64"` // Required: Shared registration public key (all servers share this for NLB)
 	ServerPort         int    `json:"serverPort"`         // Server port for initial registration (default: 62206)
+	Environment        string `json:"environment"`        // Environment name for CloudWatch metrics (e.g., "sandbox", "prod")
 }
 
 type HttpConfig struct {

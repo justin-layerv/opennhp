@@ -718,6 +718,7 @@ ExpireTime = 1924991999       # Unix timestamp
 PrivKeyBase64 = "..."         # AC's private key (NEVER in etcd)
 DefaultIp = "0.0.0.0"
 ListenPort = 62206
+Environment = "sandbox"       # Environment name for CloudWatch metrics (e.g., "sandbox", "prod"). Defaults to "unknown" if omitted.
 
 [IPTables]
 DefaultAcceptTimeoutSec = 60

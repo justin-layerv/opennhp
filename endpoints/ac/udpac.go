@@ -169,7 +169,11 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	a.device.Start()
 
 	// Initialize multi-server registration manager
-	a.registration = NewACRegistration(a)
+	var regErr error
+	a.registration, regErr = NewACRegistration(a)
+	if regErr != nil {
+		return fmt.Errorf("failed to create AC registration manager: %w", regErr)
+	}
 	if err := a.registration.Start(); err != nil {
 		return fmt.Errorf("failed to start AC registration manager: %w", err)
 	}
@@ -453,7 +457,7 @@ func (a *UdpAC) connectionRoutine(conn *UdpConn) {
 			// so the server gets our new address when we reconnect.
 			if a.registration != nil && a.registration.IsServerAddress(addrStr) {
 				log.Info("Server connection %s timed out, triggering re-registration", addrStr)
-				a.registration.TriggerReregistration("server_connection_timeout")
+				a.registration.TriggerReregistration(ReasonServerConnectionTimeout)
 			}
 			return
 

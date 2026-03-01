@@ -1,29 +1,19 @@
 package qurl
 
 import (
-	"os"
 	"strings"
 	"testing"
 )
 
 func TestLoadConfig_AllRequired(t *testing.T) {
-	// Set all required env vars
-	os.Setenv("QURL_API_URL", "https://qurl-api.example.com")
-	os.Setenv("QURL_SERVICE_TOKEN", "my-secret-token")
-	os.Setenv("QURL_ALLOWED_REDIRECT_DOMAIN", "qurl.site")
-	os.Setenv("QURL_API_TIMEOUT", "10")
-	os.Setenv("QURL_MAX_IDLE_CONNS", "10")
-	os.Setenv("QURL_MAX_IDLE_CONNS_PER_HOST", "5")
-	os.Setenv("QURL_IDLE_CONN_TIMEOUT", "30")
-	defer func() {
-		os.Unsetenv("QURL_API_URL")
-		os.Unsetenv("QURL_SERVICE_TOKEN")
-		os.Unsetenv("QURL_ALLOWED_REDIRECT_DOMAIN")
-		os.Unsetenv("QURL_API_TIMEOUT")
-		os.Unsetenv("QURL_MAX_IDLE_CONNS")
-		os.Unsetenv("QURL_MAX_IDLE_CONNS_PER_HOST")
-		os.Unsetenv("QURL_IDLE_CONN_TIMEOUT")
-	}()
+	// Set all required env vars (t.Setenv auto-restores on test cleanup)
+	t.Setenv("QURL_API_URL", "https://qurl-api.example.com")
+	t.Setenv("QURL_SERVICE_TOKEN", "my-secret-token")
+	t.Setenv("QURL_ALLOWED_REDIRECT_DOMAIN", "qurl.site")
+	t.Setenv("QURL_API_TIMEOUT", "10")
+	t.Setenv("QURL_MAX_IDLE_CONNS", "10")
+	t.Setenv("QURL_MAX_IDLE_CONNS_PER_HOST", "5")
+	t.Setenv("QURL_IDLE_CONN_TIMEOUT", "30")
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -66,15 +56,12 @@ func baseEnvVars() map[string]string {
 	}
 }
 
-// clearAllEnvVars clears all QURL env vars
-func clearAllEnvVars() {
-	os.Unsetenv("QURL_API_URL")
-	os.Unsetenv("QURL_SERVICE_TOKEN")
-	os.Unsetenv("QURL_ALLOWED_REDIRECT_DOMAIN")
-	os.Unsetenv("QURL_API_TIMEOUT")
-	os.Unsetenv("QURL_MAX_IDLE_CONNS")
-	os.Unsetenv("QURL_MAX_IDLE_CONNS_PER_HOST")
-	os.Unsetenv("QURL_IDLE_CONN_TIMEOUT")
+// setBaseEnvVars sets all base env vars on the test using t.Setenv.
+func setBaseEnvVars(t *testing.T, envVars map[string]string) {
+	t.Helper()
+	for k, v := range envVars {
+		t.Setenv(k, v)
+	}
 }
 
 func TestLoadConfig_MissingRequired(t *testing.T) {
@@ -122,15 +109,10 @@ func TestLoadConfig_MissingRequired(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			clearAllEnvVars()
-
 			// Set all env vars except the one we're testing
 			envVars := baseEnvVars()
 			delete(envVars, tt.removeKey)
-			for k, v := range envVars {
-				os.Setenv(k, v)
-			}
-			defer clearAllEnvVars()
+			setBaseEnvVars(t, envVars)
 
 			_, err := LoadConfig()
 			if err == nil {
@@ -145,13 +127,9 @@ func TestLoadConfig_MissingRequired(t *testing.T) {
 }
 
 func TestLoadConfig_InvalidURLFormat(t *testing.T) {
-	clearAllEnvVars()
 	envVars := baseEnvVars()
 	envVars["QURL_API_URL"] = "not-a-url" // invalid URL
-	for k, v := range envVars {
-		os.Setenv(k, v)
-	}
-	defer clearAllEnvVars()
+	setBaseEnvVars(t, envVars)
 
 	_, err := LoadConfig()
 	if err == nil {
@@ -210,15 +188,10 @@ func TestLoadConfig_MissingRequired_ExactErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			clearAllEnvVars()
-
 			// Set all env vars except the one we're testing
 			envVars := baseEnvVars()
 			delete(envVars, tt.removeKey)
-			for k, v := range envVars {
-				os.Setenv(k, v)
-			}
-			defer clearAllEnvVars()
+			setBaseEnvVars(t, envVars)
 
 			_, err := LoadConfig()
 			if err == nil {
@@ -269,15 +242,10 @@ func TestLoadConfig_InvalidIntegerValues(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			clearAllEnvVars()
-
-			// Set all valid env vars
+			// Set all valid env vars, then override with invalid value
 			envVars := baseEnvVars()
-			envVars[tt.envKey] = tt.envValue // Override with invalid value
-			for k, v := range envVars {
-				os.Setenv(k, v)
-			}
-			defer clearAllEnvVars()
+			envVars[tt.envKey] = tt.envValue
+			setBaseEnvVars(t, envVars)
 
 			_, err := LoadConfig()
 			if err == nil {

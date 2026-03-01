@@ -706,7 +706,10 @@ func TestConnectionTimeout_TriggersReregistration(t *testing.T) {
 	ac.signals.stop = make(chan struct{})
 
 	// Create registration manager with test server
-	reg := NewACRegistration(ac)
+	reg, err := NewACRegistration(ac)
+	if err != nil {
+		t.Fatalf("NewACRegistration failed: %v", err)
+	}
 	ac.registration = reg
 
 	// Add a server to assignedServers so IsServerAddress returns true
@@ -795,7 +798,10 @@ func TestConnectionTimeout_NonServerConnection(t *testing.T) {
 	ac.signals.stop = make(chan struct{})
 
 	// Create registration manager with a DIFFERENT server address
-	reg := NewACRegistration(ac)
+	reg, err := NewACRegistration(ac)
+	if err != nil {
+		t.Fatalf("NewACRegistration failed: %v", err)
+	}
 	ac.registration = reg
 
 	// Server at different address than our test connection

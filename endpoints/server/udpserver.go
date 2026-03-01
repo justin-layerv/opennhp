@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -14,8 +15,11 @@ import (
 
 	"github.com/OpenNHP/opennhp/nhp/etcd"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/pion/webrtc/v4"
 
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
@@ -27,6 +31,26 @@ import (
 var (
 	ExeDirPath string
 )
+
+// buildServerMetricDimensions returns the CloudWatch dimensions derived from environment
+// variables. Dimensions: [Environment, Cell]. CloudWatch alarms and Grafana dashboard
+// panels match on this exact set. Adding or removing dimensions creates a separate
+// metric time series that existing alarms/panels won't find.
+func buildServerMetricDimensions() []types.Dimension {
+	environment := os.Getenv("NHP_ENVIRONMENT")
+	if environment == "" {
+		environment = "unknown"
+	}
+	cellID := os.Getenv("NHP_CELL_ID")
+	if cellID == "" {
+		cellID = "cell0"
+	}
+
+	return []types.Dimension{
+		{Name: aws.String("Environment"), Value: aws.String(environment)},
+		{Name: aws.String("Cell"), Value: aws.String(cellID)},
+	}
+}
 
 type UdpServer struct {
 	stats struct {
@@ -113,7 +137,7 @@ type UdpServer struct {
 	cloudMap *CloudMapClient
 
 	// CloudWatch metrics publisher for NHP operational metrics.
-	metrics *MetricsPublisher
+	metrics *metrics.Publisher
 }
 
 type BlockAddr struct {
@@ -231,7 +255,10 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	}
 
 	// Initialize CloudWatch metrics publisher (non-fatal if unavailable)
-	s.metrics = NewMetricsPublisher()
+	s.metrics = metrics.NewPublisher(metrics.Config{
+		Namespace:  "LayerV/NHP",
+		Dimensions: buildServerMetricDimensions(),
+	})
 
 	// Initialize server-to-server forwarder
 	s.forwarder = NewServerForwarder(s)

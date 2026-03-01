@@ -11,12 +11,16 @@ resource "aws_cloudwatch_metric_alarm" "disk_usage_high" {
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
   metric_name         = "DiskUsagePercent"
-  namespace           = "NHP/AC"
+  namespace           = "LayerV/NHP"
   period              = 900 # 15 minutes
   statistic           = "Maximum"
   threshold           = var.disk_usage_threshold_percent
   alarm_description   = "Disk usage exceeds ${var.disk_usage_threshold_percent}% on AC instances"
   treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Component = "AC"
+  }
 
   # Send to SNS if configured
   alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
@@ -24,6 +28,58 @@ resource "aws_cloudwatch_metric_alarm" "disk_usage_high" {
 
   tags = merge(var.tags, {
     Name = "${var.name_prefix}-ac-disk-usage-high"
+  })
+}
+
+resource "aws_cloudwatch_metric_alarm" "registration_failure" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-registration-failure"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "RegistrationFailure"
+  namespace           = "LayerV/NHP"
+  period              = 300 # 5 minutes
+  statistic           = "Sum"
+  threshold           = 5
+  alarm_description   = "AC registration failures exceeded 5 in 5 minutes"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Component = "AC"
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-ac-registration-failure"
+  })
+}
+
+resource "aws_cloudwatch_metric_alarm" "server_connection_failure" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-server-connection-failure"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "ServerConnectionFailure"
+  namespace           = "LayerV/NHP"
+  period              = 300 # 5 minutes
+  statistic           = "Sum"
+  threshold           = 10
+  alarm_description   = "AC server connection failures exceeded 10 in 10 minutes (2 consecutive periods)"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Component = "AC"
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-ac-server-connection-failure"
   })
 }
 
@@ -46,7 +102,7 @@ resource "aws_cloudwatch_dashboard" "ac_monitoring" {
           title  = "AC Disk Usage by Instance"
           region = data.aws_region.current.id
           metrics = [
-            ["NHP/AC", "DiskUsagePercent", { "stat" : "Maximum" }]
+            ["LayerV/NHP", "DiskUsagePercent", "Component", "AC", { "stat" : "Maximum" }]
           ]
           view    = "timeSeries"
           stacked = false
@@ -87,8 +143,12 @@ resource "aws_cloudwatch_dashboard" "ac_monitoring" {
         width  = 24
         height = 3
         properties = {
-          title  = "Active Alarms"
-          alarms = [aws_cloudwatch_metric_alarm.disk_usage_high[0].arn]
+          title = "Active Alarms"
+          alarms = [
+            aws_cloudwatch_metric_alarm.disk_usage_high[0].arn,
+            aws_cloudwatch_metric_alarm.registration_failure[0].arn,
+            aws_cloudwatch_metric_alarm.server_connection_failure[0].arn,
+          ]
         }
       },
       {
