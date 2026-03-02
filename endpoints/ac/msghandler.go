@@ -102,9 +102,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 	// check empty src address
 	if len(srcAddrs) == 0 || len(dstAddrs) == 0 {
 		log.Error("[HandleAccessControl] no source or destination address specified")
-		err = common.ErrACEmptyPassAddress
-		artMsg.ErrCode = common.ErrACEmptyPassAddress.ErrorCode()
-		artMsg.ErrMsg = err.Error()
+		err = setArtMsgError(artMsg, common.ErrACEmptyPassAddress)
 		return
 	}
 
@@ -112,9 +110,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 	if a.config.FilterMode == FilterMode_IPTABLES {
 		if a.ipset == nil {
 			log.Error("[HandleAccessControl] ipset is nil")
-			err = common.ErrACIPSetNotFound
-			artMsg.ErrCode = common.ErrACIPSetNotFound.ErrorCode()
-			artMsg.ErrMsg = err.Error()
+			err = setArtMsgError(artMsg, common.ErrACIPSetNotFound)
 			return
 		}
 	}
@@ -168,9 +164,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 						_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
 						if err != nil {
 							log.Error("[HandleAccessControl] add ipset %s error: %v", ipHashStr, err)
-							err = common.ErrACIPSetOperationFailed
-							artMsg.ErrCode = common.ErrACIPSetOperationFailed.ErrorCode()
-							artMsg.ErrMsg = err.Error()
+							err = setArtMsgError(artMsg, common.ErrACIPSetOperationFailed)
 							return
 						}
 					//ebpf knock
@@ -217,9 +211,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 						_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
 						if err != nil {
 							log.Error("[HandleAccessControl] add ipset %s error: %v", ipHashStr, err)
-							err = common.ErrACIPSetOperationFailed
-							artMsg.ErrCode = common.ErrACIPSetOperationFailed.ErrorCode()
-							artMsg.ErrMsg = err.Error()
+							err = setArtMsgError(artMsg, common.ErrACIPSetOperationFailed)
 							return
 						}
 					case FilterMode_EBPFXDP:
@@ -268,9 +260,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 							_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
 							if err != nil {
 								log.Error("[HandleAccessControl] add ipset %s error: %v", ipHashStr, err)
-								err = common.ErrACIPSetOperationFailed
-								artMsg.ErrCode = common.ErrACIPSetOperationFailed.ErrorCode()
-								artMsg.ErrMsg = err.Error()
+								err = setArtMsgError(artMsg, common.ErrACIPSetOperationFailed)
 								return
 							}
 						case FilterMode_EBPFXDP:
@@ -410,9 +400,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 		dstIp := net.ParseIP(dstAddrs[0].Ip)
 		if dstIp == nil {
 			log.Error("[HandleAccessControl] destination IP %s is invalid", dstAddrs[0].Ip)
-			err = common.ErrInvalidIpAddress
-			artMsg.ErrCode = common.ErrInvalidIpAddress.ErrorCode()
-			artMsg.ErrMsg = err.Error()
+			err = setArtMsgError(artMsg, common.ErrInvalidIpAddress)
 			return
 		}
 
@@ -427,9 +415,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 		ipType, ipErr := utils.DetectIPType(dstAddrs[0].Ip)
 		if ipErr != nil {
 			log.Error("[HandleAccessControl] invalid destination IP for PASS_PRE_ACCESS_IP: %s", dstAddrs[0].Ip)
-			err = common.ErrInvalidIpAddress
-			artMsg.ErrCode = common.ErrInvalidIpAddress.ErrorCode()
-			artMsg.ErrMsg = err.Error()
+			err = setArtMsgError(artMsg, common.ErrInvalidIpAddress)
 			return
 		}
 		if ipType == utils.IPV6 {
@@ -448,9 +434,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 
 		if err != nil {
 			log.Error("[HandleAccessControl] temporary tcp listening error: %v", err)
-			err = common.ErrACTempPortListenFailed
-			artMsg.ErrCode = common.ErrACTempPortListenFailed.ErrorCode()
-			artMsg.ErrMsg = err.Error()
+			err = setArtMsgError(artMsg, common.ErrACTempPortListenFailed)
 			return
 		}
 
@@ -459,9 +443,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 		tlocalAddr, locErr := net.ResolveTCPAddr(tladdr.Network(), tladdr.String())
 		if locErr != nil {
 			log.Error("[HandleAccessControl] resolve local TCPAddr error: %v", locErr)
-			err = common.ErrACResolveTempPortFailed
-			artMsg.ErrCode = common.ErrACResolveTempPortFailed.ErrorCode()
-			artMsg.ErrMsg = err.Error()
+			err = setArtMsgError(artMsg, common.ErrACResolveTempPortFailed)
 			return
 		}
 
@@ -473,9 +455,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 
 			if err != nil {
 				log.Error("[HandleAccessControl] add ipset %s error: %v", portHashStr, err)
-				err = common.ErrACIPSetOperationFailed
-				artMsg.ErrCode = common.ErrACIPSetOperationFailed.ErrorCode()
-				artMsg.ErrMsg = err.Error()
+				err = setArtMsgError(artMsg, common.ErrACIPSetOperationFailed)
 				return
 			}
 			// IPv4 requires two ranges (0.0.0.0/1 and 128.0.0.0/1) since ipset doesn't allow 0.0.0.0/0
@@ -485,9 +465,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 				_, err = a.ipset.Add(ipType, 4, tempOpenTimeSec, portHashStr)
 				if err != nil {
 					log.Error("[HandleAccessControl] add ipset %s error: %v", portHashStr, err)
-					err = common.ErrACIPSetOperationFailed
-					artMsg.ErrCode = common.ErrACIPSetOperationFailed.ErrorCode()
-					artMsg.ErrMsg = err.Error()
+					err = setArtMsgError(artMsg, common.ErrACIPSetOperationFailed)
 					return
 				}
 			}
@@ -516,9 +494,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 		})
 		if err != nil {
 			log.Error("[HandleAccessControl] temporary udp listening error: %v", err)
-			err = common.ErrACTempPortListenFailed
-			artMsg.ErrCode = common.ErrACTempPortListenFailed.ErrorCode()
-			artMsg.ErrMsg = err.Error()
+			err = setArtMsgError(artMsg, common.ErrACTempPortListenFailed)
 			return
 		}
 
@@ -527,9 +503,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 		_, locErr = net.ResolveUDPAddr(uladdr.Network(), uladdr.String())
 		if locErr != nil {
 			log.Error("[HandleAccessControl] resolve local UDPAddr error: %v", locErr)
-			err = common.ErrACResolveTempPortFailed
-			artMsg.ErrCode = common.ErrACResolveTempPortFailed.ErrorCode()
-			artMsg.ErrMsg = err.Error()
+			err = setArtMsgError(artMsg, common.ErrACResolveTempPortFailed)
 			return
 		}
 
@@ -542,9 +516,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 			_, err = a.ipset.Add(ipType, 4, tempOpenTimeSec, portHashStr)
 			if err != nil {
 				log.Error("[HandleAccessControl] add ipset %s error: %v", portHashStr, err)
-				err = common.ErrACIPSetOperationFailed
-				artMsg.ErrCode = common.ErrACIPSetOperationFailed.ErrorCode()
-				artMsg.ErrMsg = err.Error()
+				err = setArtMsgError(artMsg, common.ErrACIPSetOperationFailed)
 				return
 			}
 			// IPv4 requires two ranges (0.0.0.0/1 and 128.0.0.0/1) since ipset doesn't allow 0.0.0.0/0
@@ -554,9 +526,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 				_, err = a.ipset.Add(ipType, 4, tempOpenTimeSec, portHashStr)
 				if err != nil {
 					log.Error("[HandleAccessControl] add ipset %s error: %v", portHashStr, err)
-					err = common.ErrACIPSetOperationFailed
-					artMsg.ErrCode = common.ErrACIPSetOperationFailed.ErrorCode()
-					artMsg.ErrMsg = err.Error()
+					err = setArtMsgError(artMsg, common.ErrACIPSetOperationFailed)
 					return
 				}
 			}
@@ -920,6 +890,14 @@ func (a *UdpAC) tempConnTerminator(conn net.Conn, ctx context.Context) {
 	case <-ctx.Done():
 		return
 	}
+}
+
+// setArtMsgError sets the error code and message on an ACOpsResultMsg from
+// a common.Error and returns it for use in named return assignment.
+func setArtMsgError(artMsg *common.ACOpsResultMsg, nhpErr *common.Error) error {
+	artMsg.ErrCode = nhpErr.ErrorCode()
+	artMsg.ErrMsg = nhpErr.Error()
+	return nhpErr
 }
 
 func incrementIP(ip net.IP) {
