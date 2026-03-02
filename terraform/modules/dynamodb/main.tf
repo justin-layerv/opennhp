@@ -748,3 +748,154 @@ resource "aws_dynamodb_table" "qurl_webhook_deliveries" {
     Purpose   = "QURL webhook delivery attempts"
   })
 }
+
+# qurl-api-keys: Stores API key hashes and metadata
+# PK: key_hash (SHA-256 of plaintext key)
+# GSI: owner-index (list keys by owner), key-id-index (lookup by public key ID)
+resource "aws_dynamodb_table" "qurl_api_keys" {
+  count = var.deploy_qurl_tables ? 1 : 0
+
+  name                        = "${var.name_prefix}-${var.cell_id}-qurl-api-keys"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "key_hash"
+  deletion_protection_enabled = local.is_prod
+
+  attribute {
+    name = "key_hash"
+    type = "S"
+  }
+
+  attribute {
+    name = "owner_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "created_at"
+    type = "S"
+  }
+
+  attribute {
+    name = "key_id"
+    type = "S"
+  }
+
+  # GSI: List API keys by owner, sorted by creation time
+  global_secondary_index {
+    name            = "owner-index"
+    hash_key        = "owner_id"
+    range_key       = "created_at"
+    projection_type = "ALL"
+  }
+
+  # GSI: Look up API key by public key ID (for CRUD operations)
+  global_secondary_index {
+    name            = "key-id-index"
+    hash_key        = "key_id"
+    projection_type = "ALL"
+  }
+
+  # Enable point-in-time recovery for production
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  # Server-side encryption with KMS
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  # TTL for revoked key cleanup (30 days after revocation)
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-qurl-api-keys"
+    Cell      = var.cell_id
+    Component = "qurl-service"
+    Purpose   = "QURL API key storage"
+  })
+}
+
+# qurl-customers: Stores customer records for quota and billing
+# PK: auth0_subject (Auth0 user ID or "email:<sha256>" for bridge keys)
+resource "aws_dynamodb_table" "qurl_customers" {
+  count = var.deploy_qurl_tables ? 1 : 0
+
+  name                        = "${var.name_prefix}-${var.cell_id}-qurl-customers"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "auth0_subject"
+  deletion_protection_enabled = local.is_prod
+
+  attribute {
+    name = "auth0_subject"
+    type = "S"
+  }
+
+  # Enable point-in-time recovery for production
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  # Server-side encryption with KMS
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-qurl-customers"
+    Cell      = var.cell_id
+    Component = "qurl-service"
+    Purpose   = "QURL customer records"
+  })
+}
+
+# qurl-billing-audit: Stores billing event audit trail
+# PK: owner_id, SK: event_id
+resource "aws_dynamodb_table" "qurl_billing_audit" {
+  count = var.deploy_qurl_tables ? 1 : 0
+
+  name                        = "${var.name_prefix}-${var.cell_id}-qurl-billing-audit"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "owner_id"
+  range_key                   = "event_id"
+  deletion_protection_enabled = local.is_prod
+
+  attribute {
+    name = "owner_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "event_id"
+    type = "S"
+  }
+
+  # Enable point-in-time recovery for production
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  # Server-side encryption with KMS
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  # TTL for automatic cleanup (2-year retention)
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-qurl-billing-audit"
+    Cell      = var.cell_id
+    Component = "qurl-service"
+    Purpose   = "QURL billing audit trail"
+  })
+}

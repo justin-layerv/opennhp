@@ -98,6 +98,36 @@ output "qurl_webhook_deliveries_table_arn" {
   value       = length(aws_dynamodb_table.qurl_webhook_deliveries) > 0 ? aws_dynamodb_table.qurl_webhook_deliveries[0].arn : null
 }
 
+output "qurl_api_keys_table_arn" {
+  description = "ARN of the QURL API keys DynamoDB table"
+  value       = length(aws_dynamodb_table.qurl_api_keys) > 0 ? aws_dynamodb_table.qurl_api_keys[0].arn : null
+}
+
+output "qurl_api_keys_table_name" {
+  description = "Name of the QURL API keys DynamoDB table"
+  value       = length(aws_dynamodb_table.qurl_api_keys) > 0 ? aws_dynamodb_table.qurl_api_keys[0].name : null
+}
+
+output "qurl_customers_table_arn" {
+  description = "ARN of the QURL customers DynamoDB table"
+  value       = length(aws_dynamodb_table.qurl_customers) > 0 ? aws_dynamodb_table.qurl_customers[0].arn : null
+}
+
+output "qurl_customers_table_name" {
+  description = "Name of the QURL customers DynamoDB table"
+  value       = length(aws_dynamodb_table.qurl_customers) > 0 ? aws_dynamodb_table.qurl_customers[0].name : null
+}
+
+output "qurl_billing_audit_table_arn" {
+  description = "ARN of the QURL billing audit DynamoDB table"
+  value       = length(aws_dynamodb_table.qurl_billing_audit) > 0 ? aws_dynamodb_table.qurl_billing_audit[0].arn : null
+}
+
+output "qurl_billing_audit_table_name" {
+  description = "Name of the QURL billing audit DynamoDB table"
+  value       = length(aws_dynamodb_table.qurl_billing_audit) > 0 ? aws_dynamodb_table.qurl_billing_audit[0].name : null
+}
+
 # Note: All QURL tables are created together via the deploy_qurl_tables flag,
 # so checking only qurl_resources is sufficient for the conditional.
 output "qurl_table_arns" {
@@ -109,5 +139,8 @@ output "qurl_table_arns" {
     aws_dynamodb_table.qurl_audit_log[0].arn,
     aws_dynamodb_table.qurl_webhooks[0].arn,
     aws_dynamodb_table.qurl_webhook_deliveries[0].arn,
+    aws_dynamodb_table.qurl_api_keys[0].arn,
+    aws_dynamodb_table.qurl_customers[0].arn,
+    aws_dynamodb_table.qurl_billing_audit[0].arn,
   ] : []
 }
