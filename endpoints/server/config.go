@@ -467,7 +467,7 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 	}
 	s.updateSourceIps(srcIpMap)
 
-	return err
+	return nil
 }
 
 func (s *UdpServer) loadConfigFile(file string) (content []byte, err error) {
@@ -491,7 +491,7 @@ func (s *UdpServer) updateBaseConfig(conf Config) (err error) {
 				log.Error("failed to start WebRTC server: %v", err)
 			}
 		}
-		return err
+		return nil
 	}
 
 	// update
@@ -528,7 +528,7 @@ func (s *UdpServer) updateBaseConfig(conf Config) (err error) {
 	}
 	s.config.WebRTC = conf.WebRTC
 
-	return err
+	return nil
 }
 
 func (s *UdpServer) updateHttpConfig(httpConf HttpConfig) (err error) {
@@ -572,7 +572,7 @@ func (s *UdpServer) updateHttpConfig(httpConf HttpConfig) (err error) {
 	}
 
 	s.httpConfig = &httpConf
-	return err
+	return nil
 }
 
 // updatePeers is a generic helper that adds new peers of the given type to the
@@ -600,7 +600,7 @@ func (s *UdpServer) updatePeers(peers []*core.UdpPeer, peerType int, mu *sync.Mu
 	}
 	*peerMap = newMap
 
-	return err
+	return nil
 }
 
 func (s *UdpServer) updateACPeers(peers []*core.UdpPeer) error {
@@ -644,7 +644,7 @@ func (s *UdpServer) updateResources(aspMap common.AuthSvcProviderMap) (err error
 	defer s.authServiceMapMutex.Unlock()
 	s.authServiceMap = aspMap
 
-	return err
+	return nil
 }
 
 func (s *UdpServer) updateSourceIps(srcIpMap map[string][]*common.NetAddress) (err error) {
@@ -656,7 +656,7 @@ func (s *UdpServer) updateSourceIps(srcIpMap map[string][]*common.NetAddress) (e
 	defer s.srcIpAssociatedAddrMapMutex.Unlock()
 	s.srcIpAssociatedAddrMap = srcIpMap
 
-	return err
+	return nil
 }
 
 func (s *UdpServer) StopConfigWatch() {

@@ -174,7 +174,7 @@ func (a *UdpAC) updateBaseConfig(conf Config) (err error) {
 	if a.config == nil {
 		a.config = &conf
 		a.log.SetLogLevel(conf.LogLevel)
-		return err
+		return nil
 	}
 
 	// update
@@ -199,7 +199,7 @@ func (a *UdpAC) updateBaseConfig(conf Config) (err error) {
 		a.config.DefaultCipherScheme = conf.DefaultCipherScheme
 	}
 
-	return err
+	return nil
 }
 
 func (a *UdpAC) updateHttpConfig(httpConf HttpConfig) (err error) {
@@ -231,7 +231,7 @@ func (a *UdpAC) updateHttpConfig(httpConf HttpConfig) (err error) {
 	}
 
 	a.httpConfig = &httpConf
-	return err
+	return nil
 }
 
 func (a *UdpAC) updateServerPeers(peers []*core.UdpPeer) (err error) {
@@ -260,8 +260,9 @@ func (a *UdpAC) updateServerPeers(peers []*core.UdpPeer) (err error) {
 	}
 	a.serverPeerMap = serverPeerMap
 
-	return err
+	return nil
 }
+
 func (a *UdpAC) loadConfigFile(file string) (content []byte, err error) {
 	utils.CatchPanicThenRun(func() {
 		err = errLoadConfig
