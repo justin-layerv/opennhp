@@ -22,6 +22,14 @@ const (
 	PASS_PRE_ACCESS_IP
 )
 
+// icmpEchoType returns the ipset ICMP echo-request type string for the given IP version.
+func icmpEchoType(ipType utils.IPTYPE) string {
+	if ipType == utils.IPV6 {
+		return "icmpv6:128/0"
+	}
+	return "icmp:8/0"
+}
+
 func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
 	defer a.wg.Done()
 
@@ -249,12 +257,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 				// for icmp ping
 				if dstAddr.Port == 0 && (len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "any") {
 					for _, dstAddr := range dstAddrs {
-						// ICMPv4 Echo Request = type 8, ICMPv6 Echo Request = type 128
-						icmpType := "icmp:8/0"
-						if ipType == utils.IPV6 {
-							icmpType = "icmpv6:128/0"
-						}
-						ipHashStr := fmt.Sprintf("%s,%s,%s", srcAddr.Ip, icmpType, dstAddr.Ip)
+						ipHashStr := fmt.Sprintf("%s,%s,%s", srcAddr.Ip, icmpEchoType(ipType), dstAddr.Ip)
 						switch a.config.FilterMode {
 						case FilterMode_IPTABLES:
 							_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
@@ -304,12 +307,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 						if dstAddr.Port == 0 && (len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "any") {
 							// ICMP rules are supplementary (ping diagnostics) - failure is non-fatal
 							// because the user can still access the protected service via TCP/UDP.
-							// ICMPv4 Echo Request = type 8, ICMPv6 Echo Request = type 128
-							icmpType := "icmp:8/0"
-							if ipType == utils.IPV6 {
-								icmpType = "icmpv6:128/0"
-							}
-							netHashStr := fmt.Sprintf("%s,%s", netStr, icmpType)
+							netHashStr := fmt.Sprintf("%s,%s", netStr, icmpEchoType(ipType))
 							_, addErr := a.ipset.Add(ipType, 4, tempOpenTimeSec, netHashStr)
 							if addErr != nil {
 								log.Warning("[HandleAccessControl] failed to add tempset entry %s: %v", netHashStr, addErr)
@@ -320,6 +318,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 						srcIp, ipnet, err := net.ParseCIDR(netStr)
 						if err != nil {
 							log.Error("[HandleAccessControl] failed to parse CIDR %s: %v", netStr, err)
+							continue
 						}
 						if len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "tcp" || dstAddr.Protocol == "any" {
 							for srcIp := srcIp.Mask(ipnet.Mask); ipnet.Contains(srcIp); incrementIP(srcIp) {
@@ -852,12 +851,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 				case FilterMode_IPTABLES:
 					// ICMP rules are supplementary (ping diagnostics) - failure is non-fatal
 					// because the user can still access the protected service via TCP/UDP.
-					// ICMPv4 Echo Request = type 8, ICMPv6 Echo Request = type 128
-					icmpType := "icmp:8/0"
-					if ipType == utils.IPV6 {
-						icmpType = "icmpv6:128/0"
-					}
-					ipHashStr := fmt.Sprintf("%s,%s,%s", remoteAddr.IP.String(), icmpType, dstAddr.Ip)
+					ipHashStr := fmt.Sprintf("%s,%s,%s", remoteAddr.IP.String(), icmpEchoType(ipType), dstAddr.Ip)
 					_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
 					if err != nil {
 						log.Warning("[udpTempAccessHandler] failed to add ICMP rule %s: %v", ipHashStr, err)

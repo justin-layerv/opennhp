@@ -23,7 +23,11 @@ func (a *UdpAgent) HandleCookieMessage(ppd *core.PacketParserData) bool {
 	}
 
 	// update cookie
-	cokBytes, _ := base64.StdEncoding.DecodeString(cokMsg.Cookie)
+	cokBytes, err := base64.StdEncoding.DecodeString(cokMsg.Cookie)
+	if err != nil {
+		log.Error("agent[HandleCookieMessage] failed to decode cookie base64: %v", err)
+		return false
+	}
 	copy(ppd.ConnData.CookieStore.CurrCookie[:], cokBytes)
 
 	transactionId := cokMsg.TransactionId // note this transaction id is in message structure, not the one in packet
