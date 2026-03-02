@@ -46,24 +46,27 @@ resource "aws_iam_role_policy" "checkout_session" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "DynamoDBCustomers"
-        Effect = "Allow"
-        Action = [
-          "dynamodb:GetItem",
-          "dynamodb:PutItem",
-          "dynamodb:UpdateItem"
-        ]
-        Resource = var.customers_table_arn
-      },
-      {
-        Sid      = "SecretsManagerStripe"
-        Effect   = "Allow"
-        Action   = ["secretsmanager:GetSecretValue"]
-        Resource = local.stripe_secret_arn
-      }
-    ]
+    Statement = concat(
+      [
+        {
+          Sid    = "DynamoDBCustomers"
+          Effect = "Allow"
+          Action = [
+            "dynamodb:GetItem",
+            "dynamodb:PutItem",
+            "dynamodb:UpdateItem"
+          ]
+          Resource = var.customers_table_arn
+        },
+        {
+          Sid      = "SecretsManagerStripe"
+          Effect   = "Allow"
+          Action   = ["secretsmanager:GetSecretValue"]
+          Resource = local.stripe_secret_arn
+        }
+      ],
+      local.kms_dynamodb_statement
+    )
   })
 }
 
@@ -151,7 +154,8 @@ resource "aws_iam_role_policy" "stripe_webhook" {
           Action   = ["sns:Publish"]
           Resource = var.sns_topic_arn
         }
-      ] : []
+      ] : [],
+      local.kms_dynamodb_statement
     )
   })
 }
@@ -246,7 +250,8 @@ resource "aws_iam_role_policy" "usage_reporter" {
           ]
           Resource = var.sqs_kms_key_arn
         }
-      ] : []
+      ] : [],
+      local.kms_dynamodb_statement
     )
   })
 }
@@ -326,7 +331,8 @@ resource "aws_iam_role_policy" "reconciliation" {
           ]
           Resource = var.billing_audit_table_arn
         }
-      ] : []
+      ] : [],
+      local.kms_dynamodb_statement
     )
   })
 }
@@ -373,44 +379,47 @@ resource "aws_iam_role_policy" "payment_grace" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "DynamoDBCustomers"
-        Effect = "Allow"
-        Action = [
-          "dynamodb:GetItem",
-          "dynamodb:UpdateItem",
-          "dynamodb:Scan"
-        ]
-        Resource = var.customers_table_arn
-      },
-      {
-        Sid      = "SecretsManagerStripe"
-        Effect   = "Allow"
-        Action   = ["secretsmanager:GetSecretValue"]
-        Resource = local.stripe_secret_arn
-      },
-      {
-        Sid    = "SESEmail"
-        Effect = "Allow"
-        Action = [
-          "ses:SendEmail",
-          "ses:SendRawEmail"
-        ]
-        Resource = "arn:aws:ses:${var.ses_region}:${data.aws_caller_identity.current.account_id}:identity/${var.from_email}"
-      },
-      {
-        Sid      = "CloudWatchMetrics"
-        Effect   = "Allow"
-        Action   = ["cloudwatch:PutMetricData"]
-        Resource = "*"
-        Condition = {
-          StringEquals = {
-            "cloudwatch:namespace" = "LayerV/Billing"
+    Statement = concat(
+      [
+        {
+          Sid    = "DynamoDBCustomers"
+          Effect = "Allow"
+          Action = [
+            "dynamodb:GetItem",
+            "dynamodb:UpdateItem",
+            "dynamodb:Scan"
+          ]
+          Resource = var.customers_table_arn
+        },
+        {
+          Sid      = "SecretsManagerStripe"
+          Effect   = "Allow"
+          Action   = ["secretsmanager:GetSecretValue"]
+          Resource = local.stripe_secret_arn
+        },
+        {
+          Sid    = "SESEmail"
+          Effect = "Allow"
+          Action = [
+            "ses:SendEmail",
+            "ses:SendRawEmail"
+          ]
+          Resource = "arn:aws:ses:${var.ses_region}:${data.aws_caller_identity.current.account_id}:identity/${var.from_email}"
+        },
+        {
+          Sid      = "CloudWatchMetrics"
+          Effect   = "Allow"
+          Action   = ["cloudwatch:PutMetricData"]
+          Resource = "*"
+          Condition = {
+            StringEquals = {
+              "cloudwatch:namespace" = "LayerV/Billing"
+            }
           }
         }
-      }
-    ]
+      ],
+      local.kms_dynamodb_statement
+    )
   })
 }
 
@@ -456,21 +465,24 @@ resource "aws_iam_role_policy" "invoices" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "DynamoDBCustomers"
-        Effect = "Allow"
-        Action = [
-          "dynamodb:GetItem"
-        ]
-        Resource = var.customers_table_arn
-      },
-      {
-        Sid      = "SecretsManagerStripe"
-        Effect   = "Allow"
-        Action   = ["secretsmanager:GetSecretValue"]
-        Resource = local.stripe_secret_arn
-      }
-    ]
+    Statement = concat(
+      [
+        {
+          Sid    = "DynamoDBCustomers"
+          Effect = "Allow"
+          Action = [
+            "dynamodb:GetItem"
+          ]
+          Resource = var.customers_table_arn
+        },
+        {
+          Sid      = "SecretsManagerStripe"
+          Effect   = "Allow"
+          Action   = ["secretsmanager:GetSecretValue"]
+          Resource = local.stripe_secret_arn
+        }
+      ],
+      local.kms_dynamodb_statement
+    )
   })
 }

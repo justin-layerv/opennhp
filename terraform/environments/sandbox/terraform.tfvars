@@ -410,9 +410,9 @@ deploy_billing = true
 billing_stripe_secret_name         = "layerv-nhp-sandbox/billing/stripe-api-key"
 billing_stripe_webhook_secret_name = "layerv-nhp-sandbox/billing/stripe-webhook-secret"
 
-# Stripe Price IDs (empty until Stripe products are created in sandbox)
-# billing_growth_price_id   = "price_xxx"
-# billing_base_fee_price_id = "price_xxx"
+# Stripe Price IDs
+billing_growth_price_id = "price_1T6LJIHjvKwZFxwsbwOw913O"
+# billing_base_fee_price_id = "price_xxx"  # optional flat monthly fee, not yet created
 
 # Checkout redirect URLs
 billing_success_url = "https://staging.layerv.ai/qurl/dashboard/billing?success=true"

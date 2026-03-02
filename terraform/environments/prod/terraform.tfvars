@@ -279,6 +279,11 @@ grafana_athena_config = {
 # ==============================================================================
 # Billing Configuration
 # Stripe billing — not yet enabled in production
+#
+# When enabling, use SSM parameters for Stripe price IDs instead of tfvars
+# so prices can be updated without code changes:
+#   billing_growth_price_id   → /${environment}/nhp/billing/growth-price-id
+#   billing_base_fee_price_id → /${environment}/nhp/billing/base-fee-price-id
 # ==============================================================================
 deploy_billing = false
 

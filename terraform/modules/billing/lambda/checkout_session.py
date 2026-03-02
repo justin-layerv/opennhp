@@ -159,8 +159,9 @@ def handle_checkout_session(event, auth0_sub):
         'mode': 'subscription',
         'success_url': SUCCESS_URL,
         'cancel_url': CANCEL_URL,
-        'automatic_tax[enabled]': 'true',
-        'customer_update[address]': 'auto',
+        # TODO: Re-enable when head office address is configured in Stripe Dashboard
+        # Also restore: 'customer_update[address]': 'auto'
+        'automatic_tax[enabled]': 'false',
     }
     for i, item in enumerate(line_items):
         params[f'line_items[{i}][price]'] = item['price']

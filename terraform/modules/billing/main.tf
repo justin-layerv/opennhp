@@ -37,5 +37,20 @@ locals {
   stripe_secret_arn         = "arn:aws:secretsmanager:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:secret:${var.stripe_secret_name}-*"
   stripe_webhook_secret_arn = "arn:aws:secretsmanager:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:secret:${var.stripe_webhook_secret_name}-*"
 
-  has_audit_table = var.billing_audit_table_arn != ""
+  has_audit_table  = var.billing_audit_table_arn != ""
+  has_dynamodb_kms = var.dynamodb_kms_key_arn != null
+
+  # Shared IAM statement for KMS decrypt on the DynamoDB customers table CMK
+  # (used by all 6 Lambda roles that access the customers table)
+  kms_dynamodb_statement = local.has_dynamodb_kms ? [
+    {
+      Sid    = "KMSDecryptDynamoDB"
+      Effect = "Allow"
+      Action = [
+        "kms:Decrypt",
+        "kms:GenerateDataKey"
+      ]
+      Resource = var.dynamodb_kms_key_arn
+    }
+  ] : []
 }
