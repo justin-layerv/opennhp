@@ -64,10 +64,8 @@ func (a *UdpDevice) loadBaseConfig() error {
 func (a *UdpDevice) loadPeers() error {
 	// server.toml
 	fileName := filepath.Join(ExeDirPath, "etc", "server.toml")
-	if err := a.updateServerPeers(fileName); err != nil {
-		// ignore error
-		_ = err
-	}
+	// error intentionally ignored; server config may not exist yet
+	a.updateServerPeers(fileName)
 
 	serverConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("server peer config: %s has been updated", fileName)
@@ -80,10 +78,8 @@ func (a *UdpDevice) loadPeers() error {
 func (a *UdpDevice) loadTEEs() error {
 	// consumer.toml
 	fileName := filepath.Join(ExeDirPath, "etc", "tee.toml")
-	if err := a.updateTEEConfig(fileName); err != nil {
-		// ignore error
-		_ = err
-	}
+	// error intentionally ignored; TEE config may not exist yet
+	a.updateTEEConfig(fileName)
 
 	teesConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("tee peer config: %s has been updated", fileName)

@@ -710,14 +710,12 @@ func (a *UdpDevice) SendDHPRegister(msg common.DRGMsg) {
 
 // send NHP_DRG to NHP-Server
 func (a *UdpDevice) SendNHPDRG(server *core.UdpPeer, msg common.DRGMsg) bool {
-
-	result := false
 	sendAddr := server.SendAddr()
 	if sendAddr == nil {
 		log.Critical("device(%v)[SendNHPDRG] register server IP cannot be parsed", a)
+		return false
 	}
-	drgMsg := msg
-	drgBytes, _ := json.Marshal(drgMsg)
+	drgBytes, _ := json.Marshal(msg)
 	drgMd := &core.MsgData{
 		RemoteAddr:    sendAddr.(*net.UDPAddr),
 		HeaderType:    core.NHP_DRG,
@@ -731,7 +729,7 @@ func (a *UdpDevice) SendNHPDRG(server *core.UdpPeer, msg common.DRGMsg) bool {
 	currTime := time.Now().UnixNano()
 	if !a.IsRunning() {
 		log.Error("server-deviceMsgData channel closed or being closed, skip sending")
-		return result
+		return false
 	}
 	// device will create or find existing connection and sends the MsgAssembler via that connection
 	a.sendMsgCh <- drgMd
@@ -740,43 +738,29 @@ func (a *UdpDevice) SendNHPDRG(server *core.UdpPeer, msg common.DRGMsg) bool {
 	serverPpd := <-drgMd.ResponseMsgCh
 	close(drgMd.ResponseMsgCh)
 
-	//Awaiting response from NHP-Server and processing it in the `func()` function below
-	var err error
-	result = func() bool {
+	if serverPpd.Error != nil {
+		log.Error("DB(%s#%d)[SendNHPDRG] failed to receive response from server %s: %v", msg.DoId, drgMd.TransactionId, server.Ip, serverPpd.Error)
+		return false
+	}
 
-		if serverPpd.Error != nil {
-			log.Error("DB(%s#%d)[SendNHPDRG] failed to receive response from server %s: %v", drgMsg.DoId, drgMd.TransactionId, server.Ip, serverPpd.Error)
-			err = serverPpd.Error
-			return false
-		}
+	if serverPpd.HeaderType != core.NHP_DAK {
+		log.Error("DB(%s#%d)[SendNHPDRG] response from server %s has wrong type: %s", msg.DoId, drgMd.TransactionId, server.Ip, core.HeaderTypeToString(serverPpd.HeaderType))
+		return false
+	}
 
-		if serverPpd.HeaderType != core.NHP_DAK {
-			log.Error("DB(%s#%d)[SendNHPDRG] response from server %s has wrong type: %s", drgMsg.DoId, drgMd.TransactionId, server.Ip, core.HeaderTypeToString(serverPpd.HeaderType))
-			err = common.ErrTransactionRepliedWithWrongType
-			return false
-		}
+	dakMsg := &common.DAKMsg{}
+	if err := json.Unmarshal(serverPpd.BodyMessage, dakMsg); err != nil {
+		log.Error("DB(%s#%d)[SendNHPDRG] failed to parse %s message: %v", msg.DoId, serverPpd.SenderTrxId, core.HeaderTypeToString(serverPpd.HeaderType), err)
+		return false
+	}
 
-		dakMsg := &common.DAKMsg{}
-		//json string to DAKMsg Object
-		err = json.Unmarshal(serverPpd.BodyMessage, dakMsg)
-		if err != nil {
-			log.Error("DB(%s#%d)[HandleDHPDRGMessage] failed to parse %s message: %v", drgMsg.DoId, serverPpd.SenderTrxId, core.HeaderTypeToString(serverPpd.HeaderType), err)
-			return false
-		}
-		dakMsgString, err := json.Marshal(dakMsg)
-		if err != nil {
-			log.Error("DB DAKMsg failed to parse message: DoId=%s, error=%v", dakMsg.DoId, err)
-			return false
-		}
-		log.Info("SendNHPDRG result：%v", string(dakMsgString))
-		if dakMsg.ErrCode != 0 {
-			log.Error("SendNHPDRG send failed, error: %s", dakMsg.ErrMsg)
-			return false
-		}
-		return true
-	}()
-	log.Info("SendNHPDRG sent successfully | Returned result:%v", result)
-	return result
+	if dakMsg.ErrCode != 0 {
+		log.Error("SendNHPDRG send failed, error: %s", dakMsg.ErrMsg)
+		return false
+	}
+
+	log.Info("SendNHPDRG sent successfully: doId=%s", msg.DoId)
+	return true
 }
 
 func (a *UdpDevice) GetCipherSchema() int {

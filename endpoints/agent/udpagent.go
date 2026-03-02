@@ -947,13 +947,12 @@ func (a *UdpAgent) GetFirstServerPeer() (serverPeer *core.UdpPeer) {
 }
 
 func (a *UdpAgent) SendDARMsgToServer(server *core.UdpPeer, msg common.DARMsg) (bool, *common.DAGMsg) {
-	result := false
 	sendAddr := server.SendAddr()
 	if sendAddr == nil {
 		log.Critical("device(%v)[SendDARMsgToServer] register server IP cannot be parsed", a)
+		return false, nil
 	}
-	drgMsg := msg
-	drgBytes, _ := json.Marshal(drgMsg)
+	drgBytes, _ := json.Marshal(msg)
 	drgMd := &core.MsgData{
 		RemoteAddr:    sendAddr.(*net.UDPAddr),
 		HeaderType:    core.NHP_DAR,
@@ -967,7 +966,7 @@ func (a *UdpAgent) SendDARMsgToServer(server *core.UdpPeer, msg common.DARMsg) (
 	currTime := time.Now().UnixNano()
 	if !a.IsRunning() {
 		log.Error("server-agentMsgData channel closed or being closed, skip sending")
-		return result, nil
+		return false, nil
 	}
 	// device will create or find existing connection and sends the MsgAssembler via that connection
 	a.sendMsgCh <- drgMd
@@ -976,90 +975,67 @@ func (a *UdpAgent) SendDARMsgToServer(server *core.UdpPeer, msg common.DARMsg) (
 	serverPpd := <-drgMd.ResponseMsgCh
 	close(drgMd.ResponseMsgCh)
 
-	//Wait for NHP-Server response and implement reception and processing within the func() function below.
-	var err error
-	result, dsaMsg := func() (bool, *common.DSAMsg) {
-		dsaMsg := &common.DSAMsg{}
-		if serverPpd.Error != nil {
-			log.Error("Agent(%s#%d)[SendDARMsgToServer] failed to receive response from server %s: %v", drgMsg.DoId, drgMd.TransactionId, server.Ip, serverPpd.Error)
-			err = serverPpd.Error
-			return false, dsaMsg
-		}
+	// Parse DSA response
+	dsaMsg := &common.DSAMsg{}
+	dagMsg := &common.DAGMsg{}
+	if serverPpd.Error != nil {
+		log.Error("Agent(%s#%d)[SendDARMsgToServer] failed to receive response from server %s: %v", msg.DoId, drgMd.TransactionId, server.Ip, serverPpd.Error)
+		return false, dagMsg
+	}
 
-		if serverPpd.HeaderType != core.NHP_DSA {
-			log.Error("DB(%s#%d)[SendDARMsgToServer] response from server %s has wrong type: %s", drgMsg.DoId, drgMd.TransactionId, server.Ip, core.HeaderTypeToString(serverPpd.HeaderType))
-			err = common.ErrTransactionRepliedWithWrongType
-			return false, dsaMsg
-		}
-		//message []byte to DSAMSg Object
-		err = json.Unmarshal(serverPpd.BodyMessage, dsaMsg)
-		if err != nil {
-			log.Error("Agent(%s#%d)[HandleDHPDAGMessage] failed to parse %s message: %v", drgMsg.DoId, serverPpd.SenderTrxId, core.HeaderTypeToString(serverPpd.HeaderType), err)
-			return false, dsaMsg
-		}
-		dsaMsgString, err := json.Marshal(dsaMsg)
-		if err != nil {
-			log.Error("Agent DSAMsg failed to parse message: DoId=%s, error=%v", dsaMsg.DoId, err)
-			return false, dsaMsg
-		}
-		log.Info("SendDARMsgToServer response result: %v", dsaMsgString)
-		if dsaMsg.ErrCode != 0 {
-			log.Error("SendDARMsgToServer send failed, error: %s", dsaMsg.ErrMsg)
-			return false, dsaMsg
-		}
-		return true, dsaMsg
-	}()
+	if serverPpd.HeaderType != core.NHP_DSA {
+		log.Error("DB(%s#%d)[SendDARMsgToServer] response from server %s has wrong type: %s", msg.DoId, drgMd.TransactionId, server.Ip, core.HeaderTypeToString(serverPpd.HeaderType))
+		return false, dagMsg
+	}
 
-	if result {
-		// clear related resources when load new smart data policy
-		if spoId, exist := a.smartPolicyIdentifier[dsaMsg.DoId]; exist {
-			if _, exist := a.smartPolicyEngine[spoId]; exist {
-				a.smartPolicyEngine[spoId].Close()
-				delete(a.smartPolicyEngine, spoId)
-			}
-			delete(a.smartPolicyIdentifier, dsaMsg.DoId)
-		}
-		a.smartPolicyIdentifier[dsaMsg.DoId] = dsaMsg.Spo.PolicyId
+	if err := json.Unmarshal(serverPpd.BodyMessage, dsaMsg); err != nil {
+		log.Error("Agent(%s#%d)[SendDARMsgToServer] failed to parse %s message: %v", msg.DoId, serverPpd.SenderTrxId, core.HeaderTypeToString(serverPpd.HeaderType), err)
+		return false, dagMsg
+	}
 
-		// Collect attestation proofs with smart policy
-		evidence, err := a.onAttestationCollect(dsaMsg.Spo)
-		if err != nil {
-			dagMsg := &common.DAGMsg{}
-			dagMsg.DoId = dsaMsg.DoId
-			dagMsg.ErrCode = 1
-			dagMsg.ErrMsg = err.Error()
-
-			return false, dagMsg
-		}
-
-		// avoid flood attack from server side
-		time.Sleep(core.MinimalRecvIntervalMs * time.Millisecond)
-
-		davMsg := common.DAVMsg{
-			DoId:     msg.DoId,
-			SpoId:    dsaMsg.SpoId,
-			Evidence: evidence,
-		}
-
-		return a.SendDAVMsgToServer(server, davMsg)
-	} else {
-		dagMsg := &common.DAGMsg{}
+	if dsaMsg.ErrCode != 0 {
+		log.Error("SendDARMsgToServer send failed, error: %s", dsaMsg.ErrMsg)
 		dagMsg.DoId = dsaMsg.DoId
 		dagMsg.ErrCode = dsaMsg.ErrCode
 		dagMsg.ErrMsg = dsaMsg.ErrMsg
-
-		return result, dagMsg
+		return false, dagMsg
 	}
+
+	// Clear related resources when loading new smart data policy
+	if spoId, exist := a.smartPolicyIdentifier[dsaMsg.DoId]; exist {
+		if _, exist := a.smartPolicyEngine[spoId]; exist {
+			a.smartPolicyEngine[spoId].Close()
+			delete(a.smartPolicyEngine, spoId)
+		}
+		delete(a.smartPolicyIdentifier, dsaMsg.DoId)
+	}
+	a.smartPolicyIdentifier[dsaMsg.DoId] = dsaMsg.Spo.PolicyId
+
+	// Collect attestation proofs with smart policy
+	evidence, err := a.onAttestationCollect(dsaMsg.Spo)
+	if err != nil {
+		return false, &common.DAGMsg{DoId: dsaMsg.DoId, ErrCode: 1, ErrMsg: err.Error()}
+	}
+
+	// avoid flood attack from server side
+	time.Sleep(core.MinimalRecvIntervalMs * time.Millisecond)
+
+	davMsg := common.DAVMsg{
+		DoId:     msg.DoId,
+		SpoId:    dsaMsg.SpoId,
+		Evidence: evidence,
+	}
+
+	return a.SendDAVMsgToServer(server, davMsg)
 }
 
 func (a *UdpAgent) SendDAVMsgToServer(server *core.UdpPeer, msg common.DAVMsg) (bool, *common.DAGMsg) {
-	result := false
 	sendAddr := server.SendAddr()
 	if sendAddr == nil {
 		log.Critical("device(%v)[SendDAVMsgToServer] register server IP cannot be parsed", a)
+		return false, nil
 	}
-	davMsg := msg
-	davBytes, _ := json.Marshal(davMsg)
+	davBytes, _ := json.Marshal(msg)
 	davMd := &core.MsgData{
 		RemoteAddr:    sendAddr.(*net.UDPAddr),
 		HeaderType:    core.NHP_DAV,
@@ -1073,7 +1049,7 @@ func (a *UdpAgent) SendDAVMsgToServer(server *core.UdpPeer, msg common.DAVMsg) (
 	currTime := time.Now().UnixNano()
 	if !a.IsRunning() {
 		log.Error("server-agentMsgData channel closed or being closed, skip sending")
-		return result, nil
+		return false, nil
 	}
 	// device will create or find existing connection and sends the MsgAssembler via that connection
 	a.sendMsgCh <- davMd
@@ -1082,40 +1058,28 @@ func (a *UdpAgent) SendDAVMsgToServer(server *core.UdpPeer, msg common.DAVMsg) (
 	serverPpd := <-davMd.ResponseMsgCh
 	close(davMd.ResponseMsgCh)
 
-	//Wait for NHP-Server response and implement reception and processing within the func() function below.
-	var err error
-	result, dagMsg := func() (bool, *common.DAGMsg) {
-		dagMsg := &common.DAGMsg{}
-		if serverPpd.Error != nil {
-			log.Error("Agent(%s#%d)[SendDAVMsgToServer] failed to receive response from server %s: %v", davMsg.DoId, davMd.TransactionId, server.Ip, serverPpd.Error)
-			err = serverPpd.Error
-			return false, dagMsg
-		}
+	dagMsg := &common.DAGMsg{}
+	if serverPpd.Error != nil {
+		log.Error("Agent(%s#%d)[SendDAVMsgToServer] failed to receive response from server %s: %v", msg.DoId, davMd.TransactionId, server.Ip, serverPpd.Error)
+		return false, dagMsg
+	}
 
-		if serverPpd.HeaderType != core.NHP_DAG {
-			log.Error("DB(%s#%d)[SendDAVMsgToServer] response from server %s has wrong type: %s", davMsg.DoId, davMd.TransactionId, server.Ip, core.HeaderTypeToString(serverPpd.HeaderType))
-			err = common.ErrTransactionRepliedWithWrongType
-			return false, dagMsg
-		}
-		//message []byte to DAGMSg Object
-		err = json.Unmarshal(serverPpd.BodyMessage, dagMsg)
-		if err != nil {
-			log.Error("Agent(%s#%d)[HandleDHPDAVMessage] failed to parse %s message: %v", davMsg.DoId, serverPpd.SenderTrxId, core.HeaderTypeToString(serverPpd.HeaderType), err)
-			return false, dagMsg
-		}
-		dagMsgString, err := json.Marshal(dagMsg)
-		if err != nil {
-			log.Error("Agent DAKMsg failed to parse message: DoId=%s, error=%v", dagMsg.DoId, err)
-			return false, dagMsg
-		}
-		log.Info("SendDAVMsgToServer response result: %v", dagMsgString)
-		if dagMsg.ErrCode != 0 {
-			log.Error("SendDAVMsgToServer send failed, error: %s", dagMsg.ErrMsg)
-			return false, dagMsg
-		}
-		return true, dagMsg
-	}()
-	return result, dagMsg
+	if serverPpd.HeaderType != core.NHP_DAG {
+		log.Error("DB(%s#%d)[SendDAVMsgToServer] response from server %s has wrong type: %s", msg.DoId, davMd.TransactionId, server.Ip, core.HeaderTypeToString(serverPpd.HeaderType))
+		return false, dagMsg
+	}
+
+	if err := json.Unmarshal(serverPpd.BodyMessage, dagMsg); err != nil {
+		log.Error("Agent(%s#%d)[SendDAVMsgToServer] failed to parse %s message: %v", msg.DoId, serverPpd.SenderTrxId, core.HeaderTypeToString(serverPpd.HeaderType), err)
+		return false, dagMsg
+	}
+
+	if dagMsg.ErrCode != 0 {
+		log.Error("SendDAVMsgToServer send failed, error: %s", dagMsg.ErrMsg)
+		return false, dagMsg
+	}
+
+	return true, dagMsg
 }
 
 func (s *UdpAgent) onAttestationCollect(spo *common.SmartPolicy) (string, error) {
