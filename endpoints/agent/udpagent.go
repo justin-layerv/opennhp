@@ -868,17 +868,17 @@ func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOut
 			var err error
 			ztdoPath, err := utils.DownloadFileToTemp(dagMsg.AccessUrl, "ztdo-")
 			if err != nil {
-				log.Error("failed to download ztdo: %v\n", err)
+				log.Error("failed to download ztdo: %v", err)
 				return "", fmt.Errorf("failed to download ztdo: %v", err)
 			}
 
 			if err := ztdo.ParseHeader(ztdoPath); err != nil {
-				fmt.Printf("Error: failed to parse ztdo header:%s\n", err)
+				log.Error("failed to parse ztdo header: %s", err)
 				return "", fmt.Errorf("failed to parse ztdo header:%s", err)
 			}
 
 			if ztdoId != ztdo.GetObjectID() {
-				fmt.Printf("Error: ztdo id mismatch, please check with data provider\n")
+				log.Error("ztdo id mismatch: expected=%s, got=%s", ztdoId, ztdo.GetObjectID())
 				return "", fmt.Errorf("ztdo id mismatch, please check with data provider")
 			}
 

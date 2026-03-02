@@ -14,6 +14,7 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	ztdolib "github.com/OpenNHP/opennhp/nhp/core/ztdo"
+	"github.com/OpenNHP/opennhp/nhp/log"
 	"github.com/OpenNHP/opennhp/nhp/utils"
 )
 
@@ -285,8 +286,7 @@ func (a *UdpDevice) UploadFileToNHPServer(filePath string) (string, error) {
 	duration := time.Since(startTime)
 	speed := float64(progress.TotalSize) / duration.Seconds() / (1024 * 1024)
 
-	// change the chinese to english
-	fmt.Printf("\nUpload %s to %s success! (time: %.2fs, speed: %.2fMB/s)\n",
+	log.Info("upload completed: src=%s, dst=%s, time=%.2fs, speed=%.2fMB/s",
 		filePath, httpHost+respBody.FileURI, duration.Seconds(), speed)
 
 	return httpHost + respBody.FileURI, nil

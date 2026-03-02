@@ -702,9 +702,9 @@ func (a *UdpDevice) SendDHPRegister(msg common.DRGMsg) {
 	log.Debug("serverPeer:%v", serverPeer)
 	result := a.SendNHPDRG(serverPeer, msg)
 	if result {
-		fmt.Printf("Successfully register or update data object which doId is %s.\n", msg.DoId)
+		log.Info("successfully registered or updated data object: doId=%s", msg.DoId)
 	} else {
-		fmt.Printf("Error: fail to register or update data object.\n")
+		log.Error("failed to register or update data object: doId=%s", msg.DoId)
 	}
 }
 
