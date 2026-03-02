@@ -111,7 +111,7 @@ func (d *DataPrivateKeyStore) toJson() []byte {
 func (d *DataPrivateKeyStore) fromJson(jsonData []byte) error {
 	err := json.Unmarshal(jsonData, d)
 	if err != nil {
-		return fmt.Errorf("json parsing error: %s", err)
+		return fmt.Errorf("json parsing error: %w", err)
 	}
 	return nil
 }
@@ -146,7 +146,7 @@ func (a *AppParams) NewSmartPolicy() (common.SmartPolicy, error) {
 
 	err = json.Unmarshal(fileContentByte, &config)
 	if err != nil {
-		return common.SmartPolicy{}, fmt.Errorf("json parsing error: %s", err)
+		return common.SmartPolicy{}, fmt.Errorf("json parsing error: %w", err)
 	}
 
 	spoId, err := utils.GenerateUUIDv4()

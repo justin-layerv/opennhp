@@ -13,12 +13,13 @@ import (
 	"path/filepath"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	wasmEngine "github.com/OpenNHP/opennhp/nhp/core/wasm/engine"
 	"github.com/OpenNHP/opennhp/nhp/log"
 	utils "github.com/OpenNHP/opennhp/nhp/utils"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // forwardToTransaction finds the remote transaction and forwards the message to it.
@@ -761,7 +762,7 @@ func (s *UdpServer) onAttestationVerify(spo *common.SmartPolicy, attestation str
 			return err
 		}
 		defer os.Remove(filepath.Dir(wasmPath)) // LIFO: runs second, removes empty dir
-		defer os.Remove(wasmPath)                // LIFO: runs first, removes file
+		defer os.Remove(wasmPath)               // LIFO: runs first, removes file
 		wasmBytes, err = os.ReadFile(wasmPath)
 		if err != nil {
 			return err
@@ -837,7 +838,7 @@ func ReadZdtoConfig(doId string) (common.DRGMsg, error) {
 
 	err = json.Unmarshal(fileContentByte, &config)
 	if err != nil {
-		return common.DRGMsg{}, fmt.Errorf("json parsing error: %s", err)
+		return common.DRGMsg{}, fmt.Errorf("json parsing error: %w", err)
 	}
 	return config, nil
 }

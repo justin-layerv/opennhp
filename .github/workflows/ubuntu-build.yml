@@ -34,6 +34,25 @@ jobs:
           ! -path "./node_modules/*" \
           -print0 | xargs -0 shellcheck --severity=warning
 
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [nhp, endpoints]
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - name: Set up Go
+      uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Run golangci-lint (${{ matrix.module }})
+      uses: golangci/golangci-lint-action@7119f3d5ddced62a10a044847a6c6bb0f7a5e76a # v7.0.0
+      with:
+        version: v2.7.2
+        working-directory: ${{ matrix.module }}
+
   build:
     runs-on: ubuntu-latest
     steps:

@@ -17,13 +17,13 @@ import (
 // is compiled at a time, so a package-level variable is safe.
 var instance *agent.UdpAgent
 
-// Init initialises the NHP agent singleton with the given working directory and
+// Init initializes the NHP agent singleton with the given working directory and
 // log level. Configuration files are read from workingDir/etc/ and logs are
 // written to workingDir/logs/.
 //
 // logLevel: 0 = silent, 1 = error, 2 = info, 3 = debug, 4 = verbose.
 //
-// Returns true on success or if the agent is already initialised.
+// Returns true on success or if the agent is already initialized.
 func Init(workingDir string, logLevel int) bool {
 	if instance != nil {
 		return true
@@ -38,7 +38,7 @@ func Init(workingDir string, logLevel int) bool {
 }
 
 // Close synchronously stops and releases the NHP agent singleton.
-// Safe to call when the agent is not initialised.
+// Safe to call when the agent is not initialized.
 func Close() {
 	if instance == nil {
 		return
@@ -51,7 +51,7 @@ func Close() {
 // and asynchronously starts the knock loop thread.
 //
 // Returns the number of resources being knocked, or -1 if the agent is not
-// initialised.
+// initialized.
 func KnockloopStart() int {
 	if instance == nil {
 		return -1
@@ -71,10 +71,10 @@ func KnockloopStop() {
 //
 //   - userId:   user identifier (optional but recommended)
 //   - devId:    device identifier (optional)
-//   - orgId:    organisation identifier (optional)
+//   - orgId:    organization identifier (optional)
 //   - userData: additional fields as a JSON string (optional)
 //
-// Returns false if the agent is not initialised or userData is invalid JSON.
+// Returns false if the agent is not initialized or userData is invalid JSON.
 func SetKnockUser(userId, devId, orgId, userData string) bool {
 	if instance == nil {
 		return false
@@ -98,7 +98,7 @@ func SetKnockUser(userId, devId, orgId, userData string) bool {
 //   - port:   server UDP port  (0 → default 62206)
 //   - expire: public key expiry as epoch seconds (0 → no expiry)
 //
-// Returns false if the agent is not initialised or inputs are invalid.
+// Returns false if the agent is not initialized or inputs are invalid.
 func AddServer(pubkey, ip, host string, port int, expire int64) bool {
 	if instance == nil {
 		return false
@@ -136,7 +136,7 @@ func RemoveServer(pubkey string) {
 //   - serverHostname:  NHP server hostname (required if serverIp is empty)
 //   - serverPort:      NHP server port
 //
-// Returns false if the agent is not initialised or inputs are invalid.
+// Returns false if the agent is not initialized or inputs are invalid.
 func AddResource(aspId, resId, serverIp, serverHostname string, serverPort int) bool {
 	if instance == nil {
 		return false

@@ -8,6 +8,7 @@ linters:
     - misspell
     - unconvert
     - gosec
+    - errorlint
   disable:
     - depguard
     - errcheck  # TODO: Enable after fixing existing issues (tracked in UPSTREAM_SYNC.md)
@@ -70,6 +71,11 @@ linters:
           - gosec
         text: "G404:"
         path: "nhp/utils/(uuid|utils)\\.go"
+      # Suppress G404 (weak random) for jitter timing - not security-sensitive
+      - linters:
+          - gosec
+        text: "G404:"
+        path: "endpoints/(ac/registration|server/forward)\\.go"
       # Suppress G107 (variable URL) for file download - admin-controlled paths
       - linters:
           - gosec

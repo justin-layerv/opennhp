@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -1066,21 +1067,21 @@ func TestForwardKnock_ContextCancellation(t *testing.T) {
 		},
 	}
 
-	// Create an already-cancelled context
+	// Create an already-canceled context
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately
 
-	// Try to forward with cancelled context
+	// Try to forward with canceled context
 	_, err := forwarder.ForwardKnock(ctx, assignment, []byte("test-knock"), nil)
 
 	// Should return context error
 	if err == nil {
-		t.Fatal("Expected error from cancelled context")
+		t.Fatal("Expected error from canceled context")
 	}
 
 	// The error might be context.Canceled or could be from connection timeout
 	// depending on timing, but it should fail
-	t.Logf("Got expected error on cancelled context: %v", err)
+	t.Logf("Got expected error on canceled context: %v", err)
 }
 
 // ============================================================================
@@ -1113,8 +1114,8 @@ func TestIntegration_StorageError_GracefulDegradation(t *testing.T) {
 		t.Fatal("Expected error during storage outage")
 	}
 
-	se, ok := err.(*StorageError)
-	if !ok {
+	var se *StorageError
+	if !errors.As(err, &se) {
 		t.Fatalf("Expected StorageError, got %T", err)
 	}
 	if se.Code != ErrCodeServiceUnavail {

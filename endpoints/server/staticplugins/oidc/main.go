@@ -39,7 +39,7 @@ var (
 	version = "0.1.1"
 
 	resourceHandler resource.ResourceHandler
-	pluginsIn      *plugins.PluginParamsIn
+	pluginsIn       *plugins.PluginParamsIn
 )
 
 func registerHandler(handler resource.ResourceHandler) error {

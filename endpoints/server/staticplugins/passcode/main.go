@@ -21,10 +21,10 @@ import (
 )
 
 var (
-	name           = "passcode"
-	version        = "0.1.1"
+	name            = "passcode"
+	version         = "0.1.1"
 	resourceHandler resource.ResourceHandler
-	pluginsIn      *plugins.PluginParamsIn
+	pluginsIn       *plugins.PluginParamsIn
 )
 
 func Version() string {

@@ -9,8 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OpenNHP/opennhp/nhp/common"
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
 // ============================================================================

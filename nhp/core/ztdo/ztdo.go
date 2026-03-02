@@ -348,7 +348,7 @@ func (ztdo *Ztdo) EncryptZtdoFile(plaintextPath, ciphertextPath string, gcmKey [
 		buf := make([]byte, chunkSize)
 		n, err := plaintextFile.Read(buf)
 		if err != nil {
-			if err != io.EOF {
+			if !errors.Is(err, io.EOF) {
 				return err
 			}
 			if n == 0 { // protect

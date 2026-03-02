@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -148,7 +149,8 @@ func NewServiceUnavailableError(msg string, err error) *StorageError {
 
 // IsNotFoundError returns true if the error is a not-found error.
 func IsNotFoundError(err error) bool {
-	if se, ok := err.(*StorageError); ok {
+	var se *StorageError
+	if errors.As(err, &se) {
 		return se.Code == ErrCodeNotFound
 	}
 	return false

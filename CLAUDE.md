@@ -156,6 +156,7 @@ chore: sync with upstream OpenNHP
 ```bash
 make all              # Full build: all binaries, SDKs, plugins, archive
 make init             # Clean and go mod tidy all modules
+make lint             # Run golangci-lint on nhp/ and endpoints/
 make test             # Run unit tests
 make test-local       # Run local e2e tests (requires etcd container)
 make fuzz-quick       # Run fuzz tests (10s each, for CI)

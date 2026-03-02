@@ -1,6 +1,7 @@
 package test
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -133,7 +134,7 @@ func TestCBCEncryptionChaChaNotApplicable(t *testing.T) {
 	if err == nil {
 		t.Error("Expected ErrNotApplicable for ChaCha20 CBC encryption, got nil")
 	}
-	if err != core.ErrNotApplicable {
+	if !errors.Is(err, core.ErrNotApplicable) {
 		t.Errorf("Expected ErrNotApplicable, got: %v", err)
 	}
 }
@@ -150,7 +151,7 @@ func TestCBCDecryptionChaChaNotApplicable(t *testing.T) {
 	if err == nil {
 		t.Error("Expected ErrNotApplicable for ChaCha20 CBC decryption, got nil")
 	}
-	if err != core.ErrNotApplicable {
+	if !errors.Is(err, core.ErrNotApplicable) {
 		t.Errorf("Expected ErrNotApplicable, got: %v", err)
 	}
 }

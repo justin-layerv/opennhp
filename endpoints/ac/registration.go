@@ -470,9 +470,9 @@ func (r *ACRegistration) register() error {
 		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
 		r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
 			r.acIdDimension(),
-			{Name: dimNameErrorCode, Value: aws.String("cancelled")},
+			{Name: dimNameErrorCode, Value: aws.String("canceled")},
 		})
-		return errors.New("registration cancelled")
+		return errors.New("registration canceled")
 	case <-regTimer.C:
 		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
 		r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
@@ -864,7 +864,7 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 	case <-r.stopCh:
 		r.ac.device.RemovePeer(peer.PublicKeyBase64())
 		server.Peer = nil
-		return errors.New("connection cancelled")
+		return errors.New("connection canceled")
 	case <-time.After(ConnectionTimeout):
 		r.ac.device.RemovePeer(peer.PublicKeyBase64())
 		server.Peer = nil

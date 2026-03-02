@@ -6,9 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // testServer creates a minimal UdpServer for testing validateACLicense.
@@ -272,11 +273,11 @@ func TestValidateACLicense_TimingAttackPrevention(t *testing.T) {
 	// We use relative tolerance to catch that while allowing CI variance.
 	// Note: CI environments have significant timing variance due to virtualization.
 	const (
-		warmupRuns      = 2    // Discard first N runs (CPU cache warming)
-		measuredRuns    = 8    // Runs to measure (after warmup)
+		warmupRuns      = 2 // Discard first N runs (CPU cache warming)
+		measuredRuns    = 8 // Runs to measure (after warmup)
 		totalRuns       = warmupRuns + measuredRuns
-		trimOutliers    = 1    // Remove N highest/lowest samples
-		maxRelativeDev  = 0.47 // Max 47% deviation from median (catches 10x attacks, allows CI noise)
+		trimOutliers    = 1                     // Remove N highest/lowest samples
+		maxRelativeDev  = 0.47                  // Max 47% deviation from median (catches 10x attacks, allows CI noise)
 		minExpectedTime = 50 * time.Millisecond // bcrypt should take at least this long
 	)
 

@@ -9,7 +9,7 @@ import (
 )
 
 // TestNilInstanceGuards verifies that every public function handles a nil
-// singleton gracefully (the agent has not been initialised).
+// singleton gracefully (the agent has not been initialized).
 func TestNilInstanceGuards(t *testing.T) {
 	// Ensure instance is nil for this test group.
 	instance = nil

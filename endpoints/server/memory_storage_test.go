@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -255,8 +256,8 @@ func TestMemoryStorage_ErrorInjection_NextCall(t *testing.T) {
 	if err == nil {
 		t.Fatal("Expected error from injected error")
 	}
-	se, ok := err.(*StorageError)
-	if !ok {
+	var se *StorageError
+	if !errors.As(err, &se) {
 		t.Fatal("Expected StorageError")
 	}
 	if se.Code != ErrCodeServiceUnavail {
@@ -309,8 +310,8 @@ func TestMemoryStorage_ErrorInjection_ServiceUnavailable(t *testing.T) {
 		t.Fatal("Expected SERVICE_UNAVAILABLE error")
 	}
 
-	se, ok := err.(*StorageError)
-	if !ok || se.Code != ErrCodeServiceUnavail {
+	var se2 *StorageError
+	if !errors.As(err, &se2) || se2.Code != ErrCodeServiceUnavail {
 		t.Error("Expected SERVICE_UNAVAILABLE error code")
 	}
 }
@@ -371,9 +372,9 @@ func TestMemoryStorage_DelayInjection_ContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	// Should be cancelled before delay completes
+	// Should be canceled before delay completes
 	_, err := storage.GetACAssignment(ctx, "ac-1")
-	if err != context.DeadlineExceeded {
+	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Expected context.DeadlineExceeded, got %v", err)
 	}
 }

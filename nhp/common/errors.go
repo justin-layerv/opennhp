@@ -1,6 +1,7 @@
 package common
 
 import (
+	"errors"
 	"strconv"
 )
 
@@ -35,16 +36,16 @@ func newError(code string, msg string) *Error {
 }
 
 func ErrorToErrorCode(err error) string {
-	e, ok := err.(*Error)
-	if ok {
+	var e *Error
+	if errors.As(err, &e) {
 		return e.ErrorCode()
 	}
 	return ""
 }
 
 func ErrorToString(err error) string {
-	e, ok := err.(*Error)
-	if ok {
+	var e *Error
+	if errors.As(err, &e) {
 		return e.Error()
 	}
 	return ""

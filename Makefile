@@ -191,6 +191,12 @@ plugins:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building plugins... $(END_COLOUR)"
 	@if test -d $(NHP_SERVER_PLUGINS); then $(MAKE) -C $(NHP_SERVER_PLUGINS); fi
 
+lint:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Running linters...$(END_COLOUR)"
+	cd nhp && golangci-lint run ./...
+	cd endpoints && golangci-lint run ./...
+	@echo "$(COLOUR_GREEN)[OpenNHP] Lint passed!$(END_COLOUR)"
+
 test:
 	@echo "[OpenNHP] Running Unit Tests..."
 	cd endpoints && KBS_SKIP_INIT=1 go test -v ./server/... -run "Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry"
@@ -230,4 +236,4 @@ archive:
 	@cd release && mkdir -p archive && tar -czvf ./archive/$(PACKAGE_FILE) nhp-agent nhp-ac nhp-db nhp-server
 	@echo "$(COLOUR_GREEN)[OpenNHP] Package ${PACKAGE_FILE} archived!$(END_COLOUR)"
 
-.PHONY: all generate-version-and-build init agentd acd serverd db linuxagentsdk androidagentsdk macosagentsdk iosagentsdk devicesdk plugins test test-lambdas test-local test-all fuzz fuzz-quick archive ebpf clean_ebpf
+.PHONY: all generate-version-and-build init agentd acd serverd db linuxagentsdk androidagentsdk macosagentsdk iosagentsdk devicesdk plugins lint test test-lambdas test-local test-all fuzz fuzz-quick archive ebpf clean_ebpf

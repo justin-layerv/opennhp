@@ -7,6 +7,7 @@ import "C"
 
 import (
 	"encoding/base64"
+	"errors"
 	"unsafe"
 
 	core "github.com/OpenNHP/opennhp/nhp/core"
@@ -147,8 +148,8 @@ func nhp_device_encrypt_data(handle uintptr, msgType C.int, peerPbk *C.uchar, pe
 
 	mad, err := device.MsgToPacket(md)
 	if err != nil {
-		nhpError := err.(*core.Error)
-		if nhpError != nil {
+		var nhpError *core.Error
+		if errors.As(err, &nhpError) {
 			resultPtr.errCode = C.int(nhpError.ErrorNumber())
 		} else {
 			resultPtr.errCode = -1
@@ -212,8 +213,8 @@ func nhp_device_decrypt_packet(handle uintptr, packet *C.uchar, packetLen C.int,
 	ppd, err := device.PacketToMsg(pd)
 
 	if err != nil {
-		nhpError := err.(*core.Error)
-		if nhpError != nil {
+		var nhpError *core.Error
+		if errors.As(err, &nhpError) {
 			resultPtr.errCode = C.int(nhpError.ErrorNumber())
 		} else {
 			resultPtr.errCode = -1

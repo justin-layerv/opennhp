@@ -268,7 +268,7 @@ func TestQurlResolver_Resolve_ContextCancellation(t *testing.T) {
 	_, err := resolver.Resolve(ctx, req)
 
 	if err == nil {
-		t.Error("expected error for cancelled context")
+		t.Error("expected error for canceled context")
 	}
 }
 

@@ -874,7 +874,7 @@ func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOut
 
 			if err := ztdo.ParseHeader(ztdoPath); err != nil {
 				log.Error("failed to parse ztdo header: %s", err)
-				return "", fmt.Errorf("failed to parse ztdo header:%s", err)
+				return "", fmt.Errorf("failed to parse ztdo header: %w", err)
 			}
 
 			if ztdoId != ztdo.GetObjectID() {
@@ -894,7 +894,7 @@ func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOut
 
 			dataPrkBase64, err := dataPrkWrapping.Unwrap(gcmKey[:], ad)
 			if err != nil {
-				return "", fmt.Errorf("failed to unwrap data private key: %s", err)
+				return "", fmt.Errorf("failed to unwrap data private key: %w", err)
 			}
 
 			if ztdoPath == "" || output == "" {
