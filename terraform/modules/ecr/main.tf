@@ -1200,6 +1200,21 @@ resource "aws_iam_policy" "terraform_apply_services" {
         Resource = "arn:aws:events:${local.region}:${local.account_id}:rule/layerv-nhp-*"
       },
       {
+        Sid    = "SQS"
+        Effect = "Allow"
+        Action = [
+          "sqs:CreateQueue",
+          "sqs:DeleteQueue",
+          "sqs:GetQueueAttributes",
+          "sqs:SetQueueAttributes",
+          "sqs:TagQueue",
+          "sqs:UntagQueue",
+          "sqs:GetQueueUrl",
+          "sqs:ListQueueTags"
+        ]
+        Resource = "arn:aws:sqs:${local.region}:${local.account_id}:layerv-nhp-*"
+      },
+      {
         # API Gateway v2 (HTTP API) for status page
         Sid    = "APIGatewayV2"
         Effect = "Allow"
