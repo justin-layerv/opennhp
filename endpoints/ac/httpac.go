@@ -83,7 +83,7 @@ func (hs *HttpAC) Start(uac *UdpAC, hc *HttpConfig) error {
 				log.Info("Listening https on %s", hs.listenAddr.String())
 				var err = hs.httpServer.ListenAndServeTLS(certFilePath, keyFilePath)
 				if err != nil && err != http.ErrServerClosed {
-					log.Error("https server close error: %v\n", err)
+					log.Error("https server close error: %v", err)
 				}
 			}()
 
@@ -96,7 +96,7 @@ func (hs *HttpAC) Start(uac *UdpAC, hc *HttpConfig) error {
 		log.Info("Listening http on %s", hs.listenAddr.String())
 		var err = hs.httpServer.ListenAndServe()
 		if err != nil && err != http.ErrServerClosed {
-			log.Error("http server close error: %v\n", err)
+			log.Error("http server close error: %v", err)
 		}
 	}()
 

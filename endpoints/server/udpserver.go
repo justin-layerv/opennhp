@@ -287,7 +287,7 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		Port: s.config.ListenPort,
 	})
 	if err != nil {
-		log.Error("listen error %v\n", err)
+		log.Error("listen error %v", err)
 		return fmt.Errorf("listen error %v", err)
 	}
 
@@ -295,13 +295,13 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	laddr := s.listenConn.LocalAddr()
 	s.listenAddr, err = net.ResolveUDPAddr(laddr.Network(), laddr.String())
 	if err != nil {
-		log.Error("resolve local UDPAddr error %v\n", err)
+		log.Error("resolve local UDPAddr error %v", err)
 		return fmt.Errorf("resolve UDPAddr error %v", err)
 	}
 
 	prk, err := base64.StdEncoding.DecodeString(s.config.PrivateKeyBase64)
 	if err != nil {
-		log.Error("private key parse error %v\n", err)
+		log.Error("private key parse error %v", err)
 		return fmt.Errorf("private key parse error %v", err)
 	}
 
@@ -320,7 +320,7 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	}
 	s.device = core.NewDevice(core.NHP_SERVER, prk, option)
 	if s.device == nil {
-		log.Critical("failed to create device %v\n", err)
+		log.Critical("failed to create device %v", err)
 		return fmt.Errorf("failed to create device %v", err)
 	}
 
@@ -557,7 +557,7 @@ func (s *UdpServer) recvPacketRoutine() {
 		n, remoteAddr, err := s.listenConn.ReadFromUDP(pkt.Buf[:])
 		if err != nil {
 			s.device.ReleasePoolPacket(pkt)
-			log.Error("Read from UDP error: %v\n", err)
+			log.Error("Read from UDP error: %v", err)
 			if n == 0 {
 				// listenConn closed
 				return
@@ -621,7 +621,7 @@ func (s *UdpServer) recvPacketRoutine() {
 				s.device.SetOverload(true)
 			} else if len(s.remoteConnectionMap) >= MaxConcurrentConnection {
 				s.remoteConnectionMapMutex.Unlock()
-				log.Critical("Reached maximum concurrent connection. Discard new packet from addr: %s\n", addrStr)
+				log.Critical("Reached maximum concurrent connection. Discard new packet from addr: %s", addrStr)
 				s.device.ReleasePoolPacket(pkt)
 				continue
 			}
@@ -757,7 +757,7 @@ func (s *UdpServer) connectionRoutine(conn *UdpConn) {
 			if pkt == nil {
 				continue
 			}
-			log.Debug("Received udp packet len [%d] from addr: %s\n", len(pkt.Content), addrStr)
+			log.Debug("Received udp packet len [%d] from addr: %s", len(pkt.Content), addrStr)
 
 			// process keepalive packet
 			if pkt.HeaderType == core.NHP_KPL {

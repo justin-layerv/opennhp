@@ -135,13 +135,13 @@ func (a *UdpDevice) Start(dirPath string, logLevel int) (err error) {
 
 	prk, err := base64.StdEncoding.DecodeString(a.config.PrivateKeyBase64)
 	if err != nil {
-		log.Error("private key parse error %v\n", err)
+		log.Error("private key parse error %v", err)
 		return fmt.Errorf("private key parse error %v", err)
 	}
 
 	a.device = core.NewDevice(core.NHP_DB, prk, nil)
 	if a.device == nil {
-		log.Critical("failed to create device %v\n", err)
+		log.Critical("failed to create device %v", err)
 		return fmt.Errorf("failed to create device %v", err)
 	}
 
@@ -209,7 +209,7 @@ func (a *UdpDevice) newConnection(addr *net.UDPAddr) (conn *UdpConn) {
 	laddr := conn.netConn.LocalAddr()
 	localAddr, err := net.ResolveUDPAddr(laddr.Network(), laddr.String())
 	if err != nil {
-		log.Error("resolve local UDPAddr error %v\n", err)
+		log.Error("resolve local UDPAddr error %v", err)
 		return nil
 	}
 
@@ -412,7 +412,7 @@ func (a *UdpDevice) connectionRoutine(conn *UdpConn) {
 			if pkt == nil {
 				continue
 			}
-			log.Debug("Received udp packet len [%d] from addr: %s\n", len(pkt.Content), addrStr)
+			log.Debug("Received udp packet len [%d] from addr: %s", len(pkt.Content), addrStr)
 			// process keepalive packet
 			if pkt.HeaderType == core.NHP_KPL {
 				a.device.ReleasePoolPacket(pkt)

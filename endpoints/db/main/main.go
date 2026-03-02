@@ -205,7 +205,7 @@ func runApp(params db.AppParams) error {
 		outputFilePath := params.Output
 		smartPolicy, err := params.NewSmartPolicy()
 		if err != nil {
-			log.Error("failed to read policy file:%s\n", err)
+			log.Error("failed to read policy file: %s", err)
 			return err
 		}
 		if strings.HasPrefix(smartPolicy.Policy, "file://") {
@@ -217,7 +217,7 @@ func runApp(params db.AppParams) error {
 
 			smartPolicy.Policy, err = a.UploadFileToNHPServer(policyPath)
 			if err != nil {
-				log.Error("failed to upload policy file:%s\n", err)
+				log.Error("failed to upload policy file: %s", err)
 				return err
 			}
 		}
@@ -232,13 +232,13 @@ func runApp(params db.AppParams) error {
 			if smartPolicy.Embedded {
 				structMetadata, err := params.LoadMetadataAsStruct()
 				if err != nil {
-					log.Error("failed to load metadata:%s\n", err)
+					log.Error("failed to load metadata: %s", err)
 					return err
 				}
 
 				wasmBytes, err := smartPolicy.GetPolicy()
 				if err != nil {
-					log.Error("failed to get policy:%s\n", err)
+					log.Error("failed to get policy: %s", err)
 					return err
 				}
 
@@ -246,7 +246,7 @@ func runApp(params db.AppParams) error {
 
 				metadataBytes, err := json.Marshal(structMetadata)
 				if err != nil {
-					log.Error("failed to marshal metadata:%s\n", err)
+					log.Error("failed to marshal metadata: %s", err)
 					return err
 				}
 
@@ -254,7 +254,7 @@ func runApp(params db.AppParams) error {
 			} else {
 				metadata, err = params.GetMetadata()
 				if err != nil {
-					log.Error("failed to read metadata file:%s\n", err)
+					log.Error("failed to read metadata file: %s", err)
 					return err
 				}
 			}
@@ -283,15 +283,15 @@ func runApp(params db.AppParams) error {
 
 				symmetricCipherMode, err := ztdolib.NewSymmetricCipherMode(a.GetSymmetricCipherMode())
 				if err != nil {
-					log.Error("failed to create symmetric cipher mode:%s\n", err)
+					log.Error("failed to create symmetric cipher mode: %s", err)
 					return err
 				}
 				ztdo.SetCipherConfig(true, symmetricCipherMode, dataKeyPairEccMode)
 
-				log.Info("Encrypt ztdo file(file name: %s and ztdo id: %s) with cipher settings: ECC mode(%s) and Symmetric Cipher Mode(%s)\n", params.Source, ztdoId, dataKeyPairEccMode, symmetricCipherMode)
+				log.Info("Encrypt ztdo file(file name: %s and ztdo id: %s) with cipher settings: ECC mode(%s) and Symmetric Cipher Mode(%s)", params.Source, ztdoId, dataKeyPairEccMode, symmetricCipherMode)
 
 				if err := ztdo.EncryptZtdoFile(params.Source, outputFilePath, gcmKey[:], ad); err != nil {
-					log.Error("failed to encrypt ztdo file: %s\n", err)
+					log.Error("failed to encrypt ztdo file: %s", err)
 					return err
 				}
 
@@ -299,7 +299,7 @@ func runApp(params db.AppParams) error {
 					// upload ztdo to nhp server
 					params.AccessUrl, err = a.UploadFileToNHPServer(outputFilePath)
 					if err != nil {
-						log.Error("failed to upload ztdo file:%s\n", err)
+						log.Error("failed to upload ztdo file: %s", err)
 						return err
 					}
 				}
@@ -326,7 +326,7 @@ func runApp(params db.AppParams) error {
 		os.Exit(0)
 	case "decrypt":
 		if err := ztdo.ParseHeader(params.ZtdoFilePath); err != nil {
-			log.Error("failed to parse ztdo header:%s\n", err)
+			log.Error("failed to parse ztdo header: %s", err)
 			fmt.Printf("Error: failed to parse ztdo header:%s.\n", err)
 			os.Exit(1)
 		}
@@ -353,14 +353,14 @@ func runApp(params db.AppParams) error {
 
 		gcmKey, ad := sa.AgreeSymmetricKey()
 
-		log.Info("Decrypting ztdo file(file name: %s and ztdo id: %s) with cipher settings: ECC mode(%s) and Symmetric Cipher Mode(%s)\n", params.ZtdoFilePath, ztdo.GetObjectID(), dataKeyPairEccMode, ztdo.GetCipherMode())
+		log.Info("Decrypting ztdo file(file name: %s and ztdo id: %s) with cipher settings: ECC mode(%s) and Symmetric Cipher Mode(%s)", params.ZtdoFilePath, ztdo.GetObjectID(), dataKeyPairEccMode, ztdo.GetCipherMode())
 
 		if err := ztdo.DecryptZtdoFile(params.ZtdoFilePath, params.Output, gcmKey[:], ad); err != nil {
-			log.Error("failed to decrypt ztdo file:%s\n", err)
+			log.Error("failed to decrypt ztdo file: %s", err)
 			fmt.Printf("Error: failed to decrypt ztdo file:%s.\n", err)
 			os.Exit(1)
 		} else {
-			log.Info("Decrypt ztdo file successfully\n")
+			log.Info("Decrypt ztdo file successfully")
 			fmt.Printf("Successfully decrypt ztdo file.\n")
 		}
 

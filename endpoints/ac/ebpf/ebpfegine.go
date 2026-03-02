@@ -141,7 +141,7 @@ func EbpfEngineLoad(dirPath string, logLevel int, acId string) error {
 		log.Error("failed to get default route interface")
 		return err
 	}
-	log.Info("Default route interface: %s\n", ifaceName)
+	log.Info("Default route interface: %s", ifaceName)
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		log.Error("failed to find interface %s", ifaceName)
