@@ -27,7 +27,7 @@ RegisteredAt = 1703980800
 				return e.PublicKey == "dGVzdHB1YmtleWJhc2U2NA==" &&
 					e.InstanceId == "i-1234567890abcdef0" &&
 					e.Ip == "10.0.0.100" &&
-					e.Port == 62206 &&
+					e.Port == common.DefaultNHPPort &&
 					e.RegisteredAt == 1703980800
 			},
 		},

@@ -55,7 +55,7 @@ func TestNilInstanceGuards(t *testing.T) {
 	})
 
 	t.Run("KnockResource", func(t *testing.T) {
-		result := KnockResource("asp", "res", "1.2.3.4", "", 62206)
+		result := KnockResource("asp", "res", "1.2.3.4", "", common.DefaultNHPPort)
 		var ack common.ServerKnockAckMsg
 		if err := json.Unmarshal([]byte(result), &ack); err != nil {
 			t.Fatalf("invalid JSON: %v", err)
@@ -66,7 +66,7 @@ func TestNilInstanceGuards(t *testing.T) {
 	})
 
 	t.Run("ExitResource", func(t *testing.T) {
-		if ExitResource("asp", "res", "1.2.3.4", "", 62206) {
+		if ExitResource("asp", "res", "1.2.3.4", "", common.DefaultNHPPort) {
 			t.Error("expected false")
 		}
 	})
@@ -77,7 +77,7 @@ func TestBuildTargetValidation(t *testing.T) {
 	instance = nil
 
 	t.Run("nil instance", func(t *testing.T) {
-		target, ack := buildTarget("asp", "res", "1.2.3.4", "", 62206)
+		target, ack := buildTarget("asp", "res", "1.2.3.4", "", common.DefaultNHPPort)
 		if target != nil {
 			t.Error("expected nil target")
 		}

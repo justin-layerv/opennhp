@@ -389,7 +389,7 @@ func (r *ACRegistration) registrationLoop() {
 }
 
 // DefaultServerPort is the default NHP server port.
-const DefaultServerPort = 62206
+const DefaultServerPort = common.DefaultNHPPort
 
 // register performs initial registration via ServerEndpoint.
 // It sends NHP_AOL to the ServerEndpoint and handles NHP_ARD (redispatch) or NHP_AAK response.

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
 // ============================================================================
@@ -109,9 +111,9 @@ func TestEtcdStorage_JSONSerialization(t *testing.T) {
 			ResourceFQDN: "test.nhp.example.com",
 			CustomerID:   "cust-123",
 			AssignedServers: []ServerInfo{
-				{ID: "srv-1", IP: "10.0.0.1", InternalIP: "192.168.1.1", AZ: "us-east-1a", Port: 62206, PubKey: "key1"},
-				{ID: "srv-2", IP: "10.0.0.2", InternalIP: "192.168.1.2", AZ: "us-east-1b", Port: 62206, PubKey: "key2"},
-				{ID: "srv-3", IP: "10.0.0.3", InternalIP: "192.168.1.3", AZ: "us-east-1c", Port: 62206, PubKey: "key3"},
+				{ID: "srv-1", IP: "10.0.0.1", InternalIP: "192.168.1.1", AZ: "us-east-1a", Port: common.DefaultNHPPort, PubKey: "key1"},
+				{ID: "srv-2", IP: "10.0.0.2", InternalIP: "192.168.1.2", AZ: "us-east-1b", Port: common.DefaultNHPPort, PubKey: "key2"},
+				{ID: "srv-3", IP: "10.0.0.3", InternalIP: "192.168.1.3", AZ: "us-east-1c", Port: common.DefaultNHPPort, PubKey: "key3"},
 			},
 			Version:      1,
 			ReassignedAt: &now,

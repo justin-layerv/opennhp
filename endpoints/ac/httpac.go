@@ -46,7 +46,7 @@ func (hs *HttpAC) Start(uac *UdpAC, hc *HttpConfig) error {
 
 	port := hc.HttpListenPort
 	if hc.HttpListenPort == 0 {
-		port = 62206
+		port = DefaultServerPort
 	}
 	// only listen to localhost for security reason.
 	hs.listenAddr = &net.TCPAddr{
@@ -149,8 +149,8 @@ func (ha *HttpAC) initRouter() {
 		}
 
 		if token, err = url.QueryUnescape(token); err != nil {
+			log.Error("token unescape failed: %v", err)
 			err = common.ErrUrlPathInvalid
-			log.Error("token error: %v", err)
 			ctx.JSON(http.StatusOK, gin.H{"errMsg": fmt.Sprintf("token error: %v", err)})
 			return
 		}

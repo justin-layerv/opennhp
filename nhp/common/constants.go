@@ -19,6 +19,17 @@ const (
 	TokenStoreRefreshInterval = 10 // seconds
 )
 
+// Network defaults
+const (
+	// DefaultNHPPort is the default UDP port for NHP server knock packets.
+	// Used by AC, Agent, and Server when no port is explicitly configured.
+	DefaultNHPPort = 62206
+
+	// FarFutureExpiry is a Unix timestamp (2030-12-31 23:59:59 UTC) used as a sentinel
+	// value when a peer should effectively never expire.
+	FarFutureExpiry int64 = 1924991999
+)
+
 // Server discovery constants (shared by AC and DB)
 const (
 	// ReportToServerInterval is how often to report status to the server.

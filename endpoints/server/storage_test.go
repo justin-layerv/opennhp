@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
 // ============================================================================
@@ -26,7 +28,7 @@ func TestAssignmentCache_BasicOperations(t *testing.T) {
 		ResourceFQDN: "test.nhp.example.com",
 		CustomerID:   "cust-123",
 		AssignedServers: []ServerInfo{
-			{ID: "srv-1", IP: "10.0.0.1", Port: 62206},
+			{ID: "srv-1", IP: "10.0.0.1", Port: common.DefaultNHPPort},
 		},
 	}
 

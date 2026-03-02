@@ -206,7 +206,7 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 				ErrCode: "LICENSE_EXPIRED",
 				ErrMsg:  "License has expired",
 				Targets: []common.RedirectTarget{
-					{IP: "10.0.0.1", Port: 62206, PubKeyBase64: "pubkey"},
+					{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: "pubkey"},
 				},
 			},
 			expectError:   true,
@@ -216,7 +216,7 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 			name: "target with empty IP",
 			ardMsg: &common.ACRedispatchMsg{
 				Targets: []common.RedirectTarget{
-					{IP: "", Port: 62206, PubKeyBase64: "pubkey"},
+					{IP: "", Port: DefaultServerPort, PubKeyBase64: "pubkey"},
 				},
 			},
 			expectError:   true,
@@ -236,7 +236,7 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 			name: "target with empty public key",
 			ardMsg: &common.ACRedispatchMsg{
 				Targets: []common.RedirectTarget{
-					{IP: "10.0.0.1", Port: 62206, PubKeyBase64: ""},
+					{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: ""},
 				},
 			},
 			expectError:   true,
@@ -246,7 +246,7 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 			name: "target with invalid IP format",
 			ardMsg: &common.ACRedispatchMsg{
 				Targets: []common.RedirectTarget{
-					{IP: "not-an-ip", Port: 62206, PubKeyBase64: "pubkey"},
+					{IP: "not-an-ip", Port: DefaultServerPort, PubKeyBase64: "pubkey"},
 				},
 			},
 			expectError:   true,
@@ -291,7 +291,7 @@ func TestACRegistration_UpdateServerLastSeen(t *testing.T) {
 	server1 := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:           "10.0.0.1",
-			Port:         62206,
+			Port:         DefaultServerPort,
 			PubKeyBase64: "pubkey1",
 		},
 	}
@@ -301,7 +301,7 @@ func TestACRegistration_UpdateServerLastSeen(t *testing.T) {
 	server2 := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:           "10.0.0.2",
-			Port:         62206,
+			Port:         DefaultServerPort,
 			PubKeyBase64: "pubkey2",
 		},
 	}
@@ -360,7 +360,7 @@ func TestACRegistration_HasAssignedServers(t *testing.T) {
 		{
 			Target: common.RedirectTarget{
 				IP:   "10.0.0.1",
-				Port: 62206,
+				Port: DefaultServerPort,
 			},
 		},
 	}
@@ -385,7 +385,7 @@ func TestACRegistration_ConcurrentAccess(t *testing.T) {
 	server := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:           "10.0.0.1",
-			Port:         62206,
+			Port:         DefaultServerPort,
 			PubKeyBase64: "pubkey1",
 		},
 	}
@@ -445,7 +445,7 @@ func TestConfig_RegistrationFields(t *testing.T) {
 		ServerEndpoint:     "server.nhp.test.internal",
 		ACVersion:          "1.0.0",
 		ServerPubKeyBase64: "serverpubkey",
-		ServerPort:         62206,
+		ServerPort:         DefaultServerPort,
 	}
 
 	if config.LicenseKey != "lk_abc123" {
@@ -485,10 +485,10 @@ func TestACRegistration_OldServerSetsCleanup(t *testing.T) {
 	key2 := time.Now().Add(-1 * time.Minute).Format(time.RFC3339Nano)
 
 	reg.oldServerSets[key1] = []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: 62206}},
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort}},
 	}
 	reg.oldServerSets[key2] = []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: 62206}},
+		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: DefaultServerPort}},
 	}
 
 	if len(reg.oldServerSets) != 2 {
@@ -514,7 +514,7 @@ func TestAssignedServer_Accessors(t *testing.T) {
 	server := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:   "10.0.0.1",
-			Port: 62206,
+			Port: DefaultServerPort,
 		},
 	}
 
@@ -584,8 +584,8 @@ func TestACRegistration_GetAssignedServers(t *testing.T) {
 
 	// Add some servers
 	reg.assignedServers = []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: 62206}},
-		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: 62206}},
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort}},
+		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: DefaultServerPort}},
 	}
 
 	servers = reg.GetAssignedServers()
@@ -609,7 +609,7 @@ func TestACRegistration_UpdateServerLastSeen_NoMatch(t *testing.T) {
 	server := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:           "10.0.0.1",
-			Port:         62206,
+			Port:         DefaultServerPort,
 			PubKeyBase64: "actual-pubkey",
 		},
 	}
@@ -735,7 +735,7 @@ func TestACRegistration_ServerAssignment(t *testing.T) {
 		{
 			Target: common.RedirectTarget{
 				IP:           "10.0.0.1",
-				Port:         62206,
+				Port:         DefaultServerPort,
 				PubKeyBase64: "pubkey1",
 				ServerID:     "server-1",
 				AZ:           "us-west-2a",
@@ -744,7 +744,7 @@ func TestACRegistration_ServerAssignment(t *testing.T) {
 		{
 			Target: common.RedirectTarget{
 				IP:           "10.0.0.2",
-				Port:         62206,
+				Port:         DefaultServerPort,
 				PubKeyBase64: "pubkey2",
 				ServerID:     "server-2",
 				AZ:           "us-west-2b",
@@ -753,7 +753,7 @@ func TestACRegistration_ServerAssignment(t *testing.T) {
 		{
 			Target: common.RedirectTarget{
 				IP:           "10.0.0.3",
-				Port:         62206,
+				Port:         DefaultServerPort,
 				PubKeyBase64: "pubkey3",
 				ServerID:     "server-3",
 				AZ:           "us-west-2c",
@@ -801,7 +801,7 @@ func TestACRegistration_CheckServerHealth_SkipsNeverConnected(t *testing.T) {
 	neverConnectedServer := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:           "10.0.0.1",
-			Port:         62206,
+			Port:         DefaultServerPort,
 			PubKeyBase64: "pubkey1",
 		},
 		// Connected is false (default), LastSeen is zero (default)
@@ -811,7 +811,7 @@ func TestACRegistration_CheckServerHealth_SkipsNeverConnected(t *testing.T) {
 	healthyServer := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:           "10.0.0.2",
-			Port:         62206,
+			Port:         DefaultServerPort,
 			PubKeyBase64: "pubkey2",
 		},
 	}
@@ -861,7 +861,7 @@ func TestACRegistration_ConcurrentRedispatchAndHealthCheck(t *testing.T) {
 		server := &AssignedServer{
 			Target: common.RedirectTarget{
 				IP:           fmt.Sprintf("10.0.0.%d", i+1),
-				Port:         62206,
+				Port:         DefaultServerPort,
 				PubKeyBase64: fmt.Sprintf("pubkey%d", i+1),
 			},
 		}
@@ -885,7 +885,7 @@ func TestACRegistration_ConcurrentRedispatchAndHealthCheck(t *testing.T) {
 				newServers[j] = &AssignedServer{
 					Target: common.RedirectTarget{
 						IP:           fmt.Sprintf("192.168.%d.%d", i%256, j+1),
-						Port:         62206,
+						Port:         DefaultServerPort,
 						PubKeyBase64: fmt.Sprintf("newkey%d-%d", i, j),
 					},
 				}
@@ -960,8 +960,8 @@ func TestACRegistration_RapidRedispatchOldServerSets(t *testing.T) {
 
 		// Create new servers
 		reg.assignedServers = []*AssignedServer{
-			{Target: common.RedirectTarget{IP: fmt.Sprintf("10.%d.0.1", i), Port: 62206}},
-			{Target: common.RedirectTarget{IP: fmt.Sprintf("10.%d.0.2", i), Port: 62206}},
+			{Target: common.RedirectTarget{IP: fmt.Sprintf("10.%d.0.1", i), Port: DefaultServerPort}},
+			{Target: common.RedirectTarget{IP: fmt.Sprintf("10.%d.0.2", i), Port: DefaultServerPort}},
 		}
 		reg.mu.Unlock()
 
@@ -1011,7 +1011,7 @@ func TestACRegistration_HandleServerDownRespectStopChannel(t *testing.T) {
 	deadServer := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:   "10.0.0.1",
-			Port: 62206,
+			Port: DefaultServerPort,
 		},
 	}
 
@@ -1063,7 +1063,7 @@ func TestACRegistration_HealthCheckFullFlow(t *testing.T) {
 		{
 			Target: common.RedirectTarget{
 				IP:           "10.0.0.1",
-				Port:         62206,
+				Port:         DefaultServerPort,
 				PubKeyBase64: "pubkey1",
 			},
 			// Connected: false (default)
@@ -1073,7 +1073,7 @@ func TestACRegistration_HealthCheckFullFlow(t *testing.T) {
 		{
 			Target: common.RedirectTarget{
 				IP:           "10.0.0.2",
-				Port:         62206,
+				Port:         DefaultServerPort,
 				PubKeyBase64: "pubkey2",
 			},
 		},
@@ -1081,7 +1081,7 @@ func TestACRegistration_HealthCheckFullFlow(t *testing.T) {
 		{
 			Target: common.RedirectTarget{
 				IP:           "10.0.0.3",
-				Port:         62206,
+				Port:         DefaultServerPort,
 				PubKeyBase64: "pubkey3",
 			},
 		},
@@ -1142,12 +1142,12 @@ func TestACRegistration_KeepaliveFilteringLogic(t *testing.T) {
 	connectedWithPeer := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:           "10.0.0.1",
-			Port:         62206,
+			Port:         DefaultServerPort,
 			PubKeyBase64: "pubkey1",
 		},
 		Peer: &core.UdpPeer{
 			Ip:   "10.0.0.1",
-			Port: 62206,
+			Port: DefaultServerPort,
 		},
 	}
 	connectedWithPeer.SetConnected(true)
@@ -1155,12 +1155,12 @@ func TestACRegistration_KeepaliveFilteringLogic(t *testing.T) {
 	disconnectedWithPeer := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:           "10.0.0.2",
-			Port:         62206,
+			Port:         DefaultServerPort,
 			PubKeyBase64: "pubkey2",
 		},
 		Peer: &core.UdpPeer{
 			Ip:   "10.0.0.2",
-			Port: 62206,
+			Port: DefaultServerPort,
 		},
 	}
 	// disconnectedWithPeer.Connected is false by default
@@ -1168,7 +1168,7 @@ func TestACRegistration_KeepaliveFilteringLogic(t *testing.T) {
 	connectedNoPeer := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:           "10.0.0.3",
-			Port:         62206,
+			Port:         DefaultServerPort,
 			PubKeyBase64: "pubkey3",
 		},
 		// Peer is nil
@@ -1254,7 +1254,7 @@ func TestACRegistration_HandleRegistrationResponse(t *testing.T) {
 	mockPeer := &core.UdpPeer{
 		Hostname:     "test-server",
 		Ip:           "10.0.0.1",
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "dGVzdC1wdWJrZXktYmFzZTY0", // "test-pubkey-base64" in base64
 		Type:         core.NHP_SERVER,
 	}
@@ -1379,7 +1379,7 @@ func TestACRegistration_CheckServerHealth_AlreadyReregistering(t *testing.T) {
 	staleServer := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:           "10.0.0.1",
-			Port:         62206,
+			Port:         DefaultServerPort,
 			PubKeyBase64: "pubkey1",
 		},
 	}
@@ -1428,11 +1428,11 @@ func TestACRegistration_CleanupOldServers_NilPeer(t *testing.T) {
 	cleanupKey := "test-cleanup-key"
 	reg.oldServerSets[cleanupKey] = []*AssignedServer{
 		{
-			Target: common.RedirectTarget{IP: "10.0.0.1", Port: 62206},
+			Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort},
 			Peer:   nil, // No peer - should be handled gracefully
 		},
 		{
-			Target: common.RedirectTarget{IP: "10.0.0.2", Port: 62206},
+			Target: common.RedirectTarget{IP: "10.0.0.2", Port: DefaultServerPort},
 			Peer:   nil, // No peer
 		},
 	}
@@ -1552,9 +1552,9 @@ func TestACRegistration_HandleRedispatch_PartialSuccess(t *testing.T) {
 	// Manually simulate what HandleRedispatch does for server assignment
 	reg.mu.Lock()
 	reg.assignedServers = []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: 62206, PubKeyBase64: "key1"}, Connected: false},
-		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: 62206, PubKeyBase64: "key2"}, Connected: false},
-		{Target: common.RedirectTarget{IP: "10.0.0.3", Port: 62206, PubKeyBase64: "key3"}, Connected: false},
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort, PubKeyBase64: "key1"}, Connected: false},
+		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: DefaultServerPort, PubKeyBase64: "key2"}, Connected: false},
+		{Target: common.RedirectTarget{IP: "10.0.0.3", Port: DefaultServerPort, PubKeyBase64: "key3"}, Connected: false},
 	}
 	reg.mu.Unlock()
 
@@ -1613,7 +1613,7 @@ func TestACRegistration_Stop_CleansUpRegistrationPeer(t *testing.T) {
 	regPeer := &core.UdpPeer{
 		Hostname:     "reg-server",
 		Ip:           "10.0.0.100",
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "cmVnLXNlcnZlci1wdWJrZXk=", // "reg-server-pubkey" in base64
 		Type:         core.NHP_SERVER,
 	}
@@ -1624,7 +1624,7 @@ func TestACRegistration_Stop_CleansUpRegistrationPeer(t *testing.T) {
 	serverPeer := &core.UdpPeer{
 		Hostname:     "assigned-server",
 		Ip:           "10.0.0.1",
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "YXNzaWduZWQtc2VydmVyLXB1YmtleQ==", // "assigned-server-pubkey" in base64
 		Type:         core.NHP_SERVER,
 	}
@@ -1635,7 +1635,7 @@ func TestACRegistration_Stop_CleansUpRegistrationPeer(t *testing.T) {
 		{
 			Target: common.RedirectTarget{
 				IP:           "10.0.0.1",
-				Port:         62206,
+				Port:         DefaultServerPort,
 				PubKeyBase64: "YXNzaWduZWQtc2VydmVyLXB1YmtleQ==",
 			},
 			Peer:      serverPeer,
@@ -1686,7 +1686,7 @@ func TestACRegistration_HandleRegistrationResponse_ReplacesOldPeer(t *testing.T)
 	oldPeer := &core.UdpPeer{
 		Hostname:     "old-server",
 		Ip:           "10.0.0.50",
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "b2xkLXNlcnZlci1wdWJrZXk=", // "old-server-pubkey" in base64
 		Type:         core.NHP_SERVER,
 	}
@@ -1697,7 +1697,7 @@ func TestACRegistration_HandleRegistrationResponse_ReplacesOldPeer(t *testing.T)
 	newPeer := &core.UdpPeer{
 		Hostname:     "new-server",
 		Ip:           "10.0.0.100",
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "bmV3LXNlcnZlci1wdWJrZXk=", // "new-server-pubkey" in base64
 		Type:         core.NHP_SERVER,
 	}
@@ -1758,7 +1758,7 @@ func TestACRegistration_NHP_AAK_AddsToAssignedServers(t *testing.T) {
 	testPeer := &core.UdpPeer{
 		Hostname:     "test-server",
 		Ip:           "10.0.0.1",
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "dGVzdC1wdWJrZXktYmFzZTY0", // "test-pubkey-base64" in base64
 		Type:         core.NHP_SERVER,
 	}
@@ -1851,7 +1851,7 @@ func TestACRegistration_NHP_AAK_KeepaliveEligibility(t *testing.T) {
 	testPeer := &core.UdpPeer{
 		Hostname:     "test-server",
 		Ip:           "10.0.0.2",
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "dGVzdC1wdWJrZXktMg==",
 		Type:         core.NHP_SERVER,
 	}
@@ -1916,7 +1916,7 @@ func TestACRegistration_NHP_AAK_ReRegistration_ReplacesAssignedServer(t *testing
 	firstPeer := &core.UdpPeer{
 		Hostname:     "first-server",
 		Ip:           "10.0.0.10",
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "Zmlyc3Qtc2VydmVy",
 		Type:         core.NHP_SERVER,
 	}
@@ -1943,7 +1943,7 @@ func TestACRegistration_NHP_AAK_ReRegistration_ReplacesAssignedServer(t *testing
 	secondPeer := &core.UdpPeer{
 		Hostname:     "second-server",
 		Ip:           "10.0.0.20",
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "c2Vjb25kLXNlcnZlcg==",
 		Type:         core.NHP_SERVER,
 	}
@@ -2097,7 +2097,7 @@ func TestACRegistration_NHP_AAK_ServerAddr(t *testing.T) {
 	registrationPeer := &core.UdpPeer{
 		Hostname:     "nlb.test.internal",
 		Ip:           "10.0.0.1", // NLB IP
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "bmxiLXB1YmtleQ==", // NLB/shared public key
 		Type:         core.NHP_SERVER,
 	}
@@ -2105,7 +2105,7 @@ func TestACRegistration_NHP_AAK_ServerAddr(t *testing.T) {
 	// Server's direct address (different from NLB)
 	// Use a public IP (TEST-NET-3 range) to test the switch-to-direct behavior
 	serverDirectIP := "203.0.113.100"
-	serverDirectPort := 62206
+	serverDirectPort := DefaultServerPort
 	serverPubKey := "c2VydmVyLWRpcmVjdC1wdWJrZXk=" // Different from NLB key
 
 	// NHP_AAK with server's direct address
@@ -2193,7 +2193,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_Fallback(t *testing.T) {
 	registrationPeer := &core.UdpPeer{
 		Hostname:     "nlb.test.internal",
 		Ip:           "10.0.0.1",
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "bmxiLXB1YmtleQ==",
 		Type:         core.NHP_SERVER,
 	}
@@ -2256,7 +2256,7 @@ func TestACRegistration_NHP_AAK_Legacy(t *testing.T) {
 	registrationPeer := &core.UdpPeer{
 		Hostname:     "nlb.test.internal",
 		Ip:           "10.0.0.1",
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "bmxiLXB1YmtleQ==",
 		Type:         core.NHP_SERVER,
 	}
@@ -2321,7 +2321,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_RemovesOldPeer(t *testing.T) {
 	nlbPubKey := "bmxiLXB1YmtleS1yZW1vdmU="
 	registrationPeer := &core.UdpPeer{
 		Ip:           "10.0.0.1",
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: nlbPubKey,
 		Type:         core.NHP_SERVER,
 	}
@@ -2395,14 +2395,14 @@ func TestACRegistration_NHP_AAK_ServerAddr_IPv6(t *testing.T) {
 
 	registrationPeer := &core.UdpPeer{
 		Ip:           "10.0.0.1",
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "bmxiLXB1YmtleQ==",
 		Type:         core.NHP_SERVER,
 	}
 
 	// IPv6 address with brackets (standard format for host:port)
 	serverIPv6 := "2001:db8::1"
-	serverPort := 62206
+	serverPort := DefaultServerPort
 	serverPubKey := "aXB2Ni1zZXJ2ZXIta2V5"
 
 	aakJSON := fmt.Sprintf(`{
@@ -2464,7 +2464,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_OnlyServerAddr(t *testing.T) {
 
 	registrationPeer := &core.UdpPeer{
 		Ip:           "10.0.0.1",
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "bmxiLXB1YmtleQ==",
 		Type:         core.NHP_SERVER,
 	}
@@ -2523,7 +2523,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_OnlyServerPubKey(t *testing.T) {
 
 	registrationPeer := &core.UdpPeer{
 		Ip:           "10.0.0.1",
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "bmxiLXB1YmtleQ==",
 		Type:         core.NHP_SERVER,
 	}
@@ -2583,7 +2583,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_ReRegistration(t *testing.T) {
 	// First registration
 	firstPeer := &core.UdpPeer{
 		Ip:           "10.0.0.1",
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "Zmlyc3QtcGVlcg==",
 		Type:         core.NHP_SERVER,
 	}
@@ -2616,7 +2616,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_ReRegistration(t *testing.T) {
 	// Second registration (re-registration to different server)
 	secondPeer := &core.UdpPeer{
 		Ip:           "10.0.0.2",
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "c2Vjb25kLXBlZXI=",
 		Type:         core.NHP_SERVER,
 	}
@@ -2690,7 +2690,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_KeepaliveTarget(t *testing.T) {
 	nlbIP := "10.0.0.1"
 	registrationPeer := &core.UdpPeer{
 		Ip:           nlbIP,
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "bmxiLXB1YmtleQ==",
 		Type:         core.NHP_SERVER,
 	}
@@ -2770,7 +2770,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_SamePubKey(t *testing.T) {
 	sharedPubKey := "c2hhcmVkLWtleQ=="
 	registrationPeer := &core.UdpPeer{
 		Ip:           "10.0.0.1", // NLB IP
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: sharedPubKey,
 		Type:         core.NHP_SERVER,
 	}
@@ -2825,7 +2825,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_VariousPorts(t *testing.T) {
 			name:         "standard port",
 			serverAddr:   "203.0.113.100:62206",
 			expectedIP:   "203.0.113.100",
-			expectedPort: 62206,
+			expectedPort: DefaultServerPort,
 		},
 		{
 			name:         "high port",
@@ -2871,7 +2871,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_VariousPorts(t *testing.T) {
 
 			registrationPeer := &core.UdpPeer{
 				Ip:           "10.0.0.1",
-				Port:         62206,
+				Port:         DefaultServerPort,
 				PubKeyBase64: "bmxiLXB1YmtleQ==",
 				Type:         core.NHP_SERVER,
 			}
@@ -2949,7 +2949,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_InvalidFormats(t *testing.T) {
 			nlbIP := "10.0.0.1"
 			registrationPeer := &core.UdpPeer{
 				Ip:           nlbIP,
-				Port:         62206,
+				Port:         DefaultServerPort,
 				PubKeyBase64: "bmxiLXB1YmtleQ==",
 				Type:         core.NHP_SERVER,
 			}
@@ -3020,7 +3020,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_UnresolvableHost(t *testing.T) {
 	nlbIP := "10.0.0.1"
 	registrationPeer := &core.UdpPeer{
 		Ip:           nlbIP,
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: "bmxiLXB1YmtleQ==",
 		Type:         core.NHP_SERVER,
 	}
@@ -3093,7 +3093,7 @@ func TestACRegistration_NHP_AAK_ServerAddr_PrivateIPBlocked(t *testing.T) {
 	nlbPubKey := "bmxiLXB1YmtleQ=="
 	registrationPeer := &core.UdpPeer{
 		Ip:           nlbIP,
-		Port:         62206,
+		Port:         DefaultServerPort,
 		PubKeyBase64: nlbPubKey,
 		Type:         core.NHP_SERVER,
 	}
@@ -3334,7 +3334,7 @@ func TestACRegistration_LastSeenUpdatePreventsReregistration(t *testing.T) {
 	server := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:           "10.0.0.1",
-			Port:         62206,
+			Port:         DefaultServerPort,
 			PubKeyBase64: "pubkey1",
 		},
 	}
@@ -3380,7 +3380,7 @@ func TestACRegistration_StaleLastSeenTriggersReregistration(t *testing.T) {
 	server := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:           "10.0.0.1",
-			Port:         62206,
+			Port:         DefaultServerPort,
 			PubKeyBase64: "pubkey1",
 		},
 	}
@@ -3416,7 +3416,7 @@ func TestACRegistration_SendKeepalives_SkipsInvalidServers(t *testing.T) {
 	serverNoPeer := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:   "10.0.0.1",
-			Port: 62206,
+			Port: DefaultServerPort,
 		},
 		Peer: nil,
 	}
@@ -3426,7 +3426,7 @@ func TestACRegistration_SendKeepalives_SkipsInvalidServers(t *testing.T) {
 	serverNotConnected := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:   "10.0.0.2",
-			Port: 62206,
+			Port: DefaultServerPort,
 		},
 	}
 	// Connected is false by default
@@ -3483,19 +3483,19 @@ func TestACRegistration_IsServerAddress(t *testing.T) {
 		{
 			Target: common.RedirectTarget{
 				IP:   "10.0.0.1",
-				Port: 62206,
+				Port: DefaultServerPort,
 			},
 		},
 		{
 			Target: common.RedirectTarget{
 				IP:   "192.168.1.100",
-				Port: 62206,
+				Port: DefaultServerPort,
 			},
 		},
 		{
 			Target: common.RedirectTarget{
 				IP:   "::1", // IPv6 loopback
-				Port: 62206,
+				Port: DefaultServerPort,
 			},
 		},
 		{
@@ -3583,7 +3583,7 @@ func TestACRegistration_IsServerAddress_WithRegistrationPeer(t *testing.T) {
 	// Create a registration peer with a send address
 	regPeer := &core.UdpPeer{
 		Ip:   "10.0.0.50",
-		Port: 62206,
+		Port: DefaultServerPort,
 	}
 	regPeer.Type = core.NHP_SERVER
 	// Set SendAddr by encoding the IP/Port (UdpPeer uses these fields)
@@ -3739,7 +3739,7 @@ func TestRefreshAssignedServerRegistrations_SkipsDisconnectedServers(t *testing.
 	server1 := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:   "10.0.1.100",
-			Port: 62206,
+			Port: DefaultServerPort,
 		},
 		Connected: false, // Not connected - should be skipped
 		Peer:      nil,
@@ -3748,7 +3748,7 @@ func TestRefreshAssignedServerRegistrations_SkipsDisconnectedServers(t *testing.
 	server2 := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:   "10.0.2.100",
-			Port: 62206,
+			Port: DefaultServerPort,
 		},
 		Connected: true,
 		Peer:      nil, // Nil peer - should be skipped
@@ -3784,13 +3784,13 @@ func TestHandleRefreshResponse_Success(t *testing.T) {
 	server := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:   "10.0.1.100",
-			Port: 62206,
+			Port: DefaultServerPort,
 		},
 		Connected: true,
 		LastSeen:  time.Now().Add(-time.Minute), // Set old LastSeen
 	}
 
-	sendAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.100"), Port: 62206}
+	sendAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.100"), Port: DefaultServerPort}
 
 	// Create successful NHP_AAK response
 	aakMsg := common.ServerACAckMsg{
@@ -3828,13 +3828,13 @@ func TestHandleRefreshResponse_Rejected(t *testing.T) {
 	server := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:   "10.0.1.100",
-			Port: 62206,
+			Port: DefaultServerPort,
 		},
 		Connected: true,
 		LastSeen:  time.Now().Add(-time.Minute),
 	}
 
-	sendAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.100"), Port: 62206}
+	sendAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.100"), Port: DefaultServerPort}
 
 	// Create rejected NHP_AAK response
 	aakMsg := common.ServerACAckMsg{
@@ -3874,12 +3874,12 @@ func TestHandleRefreshResponse_Redirect(t *testing.T) {
 	server := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:   "10.0.1.100",
-			Port: 62206,
+			Port: DefaultServerPort,
 		},
 		Connected: true,
 	}
 
-	sendAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.100"), Port: 62206}
+	sendAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.100"), Port: DefaultServerPort}
 
 	// Create NHP_ARD response (server wants us to connect elsewhere)
 	ppd := &core.PacketParserData{
@@ -3912,13 +3912,13 @@ func TestHandleRefreshResponse_Error(t *testing.T) {
 	server := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:   "10.0.1.100",
-			Port: 62206,
+			Port: DefaultServerPort,
 		},
 		Connected: true,
 		LastSeen:  time.Now().Add(-time.Minute),
 	}
 
-	sendAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.100"), Port: 62206}
+	sendAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.100"), Port: DefaultServerPort}
 
 	// Create response with error
 	ppd := &core.PacketParserData{
@@ -3950,13 +3950,13 @@ func TestHandleRefreshResponse_UnexpectedType(t *testing.T) {
 	server := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:   "10.0.1.100",
-			Port: 62206,
+			Port: DefaultServerPort,
 		},
 		Connected: true,
 		LastSeen:  time.Now().Add(-time.Minute),
 	}
 
-	sendAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.100"), Port: 62206}
+	sendAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.100"), Port: DefaultServerPort}
 
 	// Create unexpected response type (e.g., NHP_KPL)
 	ppd := &core.PacketParserData{

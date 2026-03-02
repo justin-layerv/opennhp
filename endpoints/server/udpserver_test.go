@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
 
@@ -94,9 +95,9 @@ func TestAddACPeer_NilMap(t *testing.T) {
 	// Create a mock AC peer
 	acPeer := &core.UdpPeer{
 		Ip:           "10.0.0.100",
-		Port:         62206,
+		Port:         common.DefaultNHPPort,
 		PubKeyBase64: "dGVzdHB1YmtleQ==", // "testpubkey" base64
-		ExpireTime:   1924991999,
+		ExpireTime:   common.FarFutureExpiry,
 	}
 	acPeer.Type = core.NHP_AC
 
@@ -134,9 +135,9 @@ func TestAddACPeer_ExistingMap(t *testing.T) {
 	// Add first peer
 	peer1 := &core.UdpPeer{
 		Ip:           "10.0.0.1",
-		Port:         62206,
+		Port:         common.DefaultNHPPort,
 		PubKeyBase64: "cGVlcjE=", // "peer1"
-		ExpireTime:   1924991999,
+		ExpireTime:   common.FarFutureExpiry,
 	}
 	peer1.Type = core.NHP_AC
 	s.AddACPeer(peer1)
@@ -144,9 +145,9 @@ func TestAddACPeer_ExistingMap(t *testing.T) {
 	// Add second peer
 	peer2 := &core.UdpPeer{
 		Ip:           "10.0.0.2",
-		Port:         62206,
+		Port:         common.DefaultNHPPort,
 		PubKeyBase64: "cGVlcjI=", // "peer2"
-		ExpireTime:   1924991999,
+		ExpireTime:   common.FarFutureExpiry,
 	}
 	peer2.Type = core.NHP_AC
 	s.AddACPeer(peer2)
@@ -173,9 +174,9 @@ func TestAddACPeer_NonACPeer(t *testing.T) {
 	// Create a peer with wrong type (not NHP_AC)
 	peer := &core.UdpPeer{
 		Ip:           "10.0.0.1",
-		Port:         62206,
+		Port:         common.DefaultNHPPort,
 		PubKeyBase64: "bm90YWM=", // "notac"
-		ExpireTime:   1924991999,
+		ExpireTime:   common.FarFutureExpiry,
 	}
 	peer.Type = core.NHP_AGENT // Not an AC
 
@@ -197,7 +198,7 @@ func TestCloudModePeer_RecvAddrInitialized(t *testing.T) {
 	acPeer := &core.UdpPeer{
 		Hostname:     "test-ac",
 		Ip:           "10.0.0.100",
-		Port:         62206,
+		Port:         common.DefaultNHPPort,
 		PubKeyBase64: "dGVzdHB1YmtleQ==",
 		ExpireTime:   0,
 	}
@@ -213,7 +214,7 @@ func TestCloudModePeer_RecvAddrInitialized(t *testing.T) {
 	// Simulate the fix: call UpdateRecv with the connection address
 	remoteAddr := &net.UDPAddr{
 		IP:   net.ParseIP("10.0.0.100"),
-		Port: 62206,
+		Port: common.DefaultNHPPort,
 	}
 	acPeer.UpdateRecv(time.Now().UnixNano(), remoteAddr)
 
@@ -241,7 +242,7 @@ func TestCloudModePeer_RecvAddrUsedInACConn(t *testing.T) {
 	acPeer := &core.UdpPeer{
 		Hostname:     "test-ac",
 		Ip:           "10.0.0.100",
-		Port:         62206,
+		Port:         common.DefaultNHPPort,
 		PubKeyBase64: "dGVzdHB1YmtleQ==",
 		ExpireTime:   0,
 	}
@@ -250,7 +251,7 @@ func TestCloudModePeer_RecvAddrUsedInACConn(t *testing.T) {
 	// Initialize recvAddr (the fix)
 	remoteAddr := &net.UDPAddr{
 		IP:   net.ParseIP("10.0.0.100"),
-		Port: 62206,
+		Port: common.DefaultNHPPort,
 	}
 	acPeer.UpdateRecv(time.Now().UnixNano(), remoteAddr)
 

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
 // ============================================================================
@@ -473,7 +475,7 @@ func CreateTestACAssignment(acID string, serverIDs ...string) *ACAssignment {
 			IP:         fmt.Sprintf("10.0.0.%d", i+1),
 			InternalIP: fmt.Sprintf("192.168.0.%d", i+1),
 			AZ:         "us-east-2" + string(rune('a'+i)),
-			Port:       62206,
+			Port:       common.DefaultNHPPort,
 			PubKey:     "test-pubkey-" + id,
 		}
 	}

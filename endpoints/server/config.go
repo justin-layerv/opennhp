@@ -845,7 +845,7 @@ func (s *UdpServer) reconcileACPeersFromRegistry() {
 		peer.Ip = entry.Ip
 		peer.Port = entry.Port
 		peer.PubKeyBase64 = entry.PublicKey
-		peer.ExpireTime = 1924991999 // Far future expiry
+		peer.ExpireTime = common.FarFutureExpiry
 
 		peers = append(peers, peer)
 	}

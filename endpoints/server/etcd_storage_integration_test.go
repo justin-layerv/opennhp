@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenNHP/opennhp/nhp/common"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -60,8 +61,8 @@ func setupTestData(t *testing.T, client *clientv3.Client) {
 		ResourceFQDN: "test.nhp.example.com",
 		CustomerID:   "cust-integration",
 		AssignedServers: []ServerInfo{
-			{ID: "srv-1", IP: "10.0.0.1", Port: 62206, PubKey: "key1"},
-			{ID: "srv-2", IP: "10.0.0.2", Port: 62206, PubKey: "key2"},
+			{ID: "srv-1", IP: "10.0.0.1", Port: common.DefaultNHPPort, PubKey: "key1"},
+			{ID: "srv-2", IP: "10.0.0.2", Port: common.DefaultNHPPort, PubKey: "key2"},
 		},
 		Version:   1,
 		CreatedAt: time.Now().Unix(),

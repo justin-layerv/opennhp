@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
 // ============================================================================
@@ -74,8 +76,8 @@ func (m *MockHealthChecker) GetCallCount() int32 {
 func TestFilterHealthyServers_NilHealthChecker(t *testing.T) {
 	// When health checker is nil, all servers should be returned (fail-open)
 	servers := []ServerInfo{
-		{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1", Port: 62206},
-		{ID: "srv-2", IP: "10.0.0.2", InternalIP: "10.0.0.2", Port: 62206},
+		{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1", Port: common.DefaultNHPPort},
+		{ID: "srv-2", IP: "10.0.0.2", InternalIP: "10.0.0.2", Port: common.DefaultNHPPort},
 	}
 
 	result := FilterHealthyServers(context.Background(), nil, servers)
@@ -92,8 +94,8 @@ func TestFilterHealthyServers_NilInterfaceValue(t *testing.T) {
 	// Calling methods on such interface panics with nil pointer dereference.
 	// This test ensures FilterHealthyServers handles this case correctly.
 	servers := []ServerInfo{
-		{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1", Port: 62206},
-		{ID: "srv-2", IP: "10.0.0.2", InternalIP: "10.0.0.2", Port: 62206},
+		{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1", Port: common.DefaultNHPPort},
+		{ID: "srv-2", IP: "10.0.0.2", InternalIP: "10.0.0.2", Port: common.DefaultNHPPort},
 	}
 
 	// Create a nil *CloudMapClient and pass it as HealthChecker interface
@@ -125,9 +127,9 @@ func TestFilterHealthyServers_AllHealthy(t *testing.T) {
 	})
 
 	servers := []ServerInfo{
-		{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1", Port: 62206},
-		{ID: "srv-2", IP: "10.0.0.2", InternalIP: "10.0.0.2", Port: 62206},
-		{ID: "srv-3", IP: "10.0.0.3", InternalIP: "10.0.0.3", Port: 62206},
+		{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1", Port: common.DefaultNHPPort},
+		{ID: "srv-2", IP: "10.0.0.2", InternalIP: "10.0.0.2", Port: common.DefaultNHPPort},
+		{ID: "srv-3", IP: "10.0.0.3", InternalIP: "10.0.0.3", Port: common.DefaultNHPPort},
 	}
 
 	// Use the real FilterHealthyServers function with the mock
@@ -145,9 +147,9 @@ func TestFilterHealthyServers_SomeHealthy(t *testing.T) {
 	})
 
 	servers := []ServerInfo{
-		{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1", Port: 62206},
-		{ID: "srv-2", IP: "10.0.0.2", InternalIP: "10.0.0.2", Port: 62206}, // Not healthy
-		{ID: "srv-3", IP: "10.0.0.3", InternalIP: "10.0.0.3", Port: 62206},
+		{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1", Port: common.DefaultNHPPort},
+		{ID: "srv-2", IP: "10.0.0.2", InternalIP: "10.0.0.2", Port: common.DefaultNHPPort}, // Not healthy
+		{ID: "srv-3", IP: "10.0.0.3", InternalIP: "10.0.0.3", Port: common.DefaultNHPPort},
 	}
 
 	result := FilterHealthyServers(context.Background(), mock, servers)
@@ -169,8 +171,8 @@ func TestFilterHealthyServers_NoneHealthy(t *testing.T) {
 	mock := NewMockHealthChecker(map[string]bool{})
 
 	servers := []ServerInfo{
-		{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1", Port: 62206},
-		{ID: "srv-2", IP: "10.0.0.2", InternalIP: "10.0.0.2", Port: 62206},
+		{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1", Port: common.DefaultNHPPort},
+		{ID: "srv-2", IP: "10.0.0.2", InternalIP: "10.0.0.2", Port: common.DefaultNHPPort},
 	}
 
 	// When health checker returns 0 healthy servers, we fail-open and return all
@@ -189,7 +191,7 @@ func TestFilterHealthyServers_MatchByInternalIP(t *testing.T) {
 	})
 
 	servers := []ServerInfo{
-		{ID: "srv-1", IP: "54.1.2.3", InternalIP: "192.168.1.100", Port: 62206},
+		{ID: "srv-1", IP: "54.1.2.3", InternalIP: "192.168.1.100", Port: common.DefaultNHPPort},
 	}
 
 	result := FilterHealthyServers(context.Background(), mock, servers)
@@ -205,8 +207,8 @@ func TestFilterHealthyServers_HealthCheckError(t *testing.T) {
 	mock.SetError(context.DeadlineExceeded)
 
 	servers := []ServerInfo{
-		{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1", Port: 62206},
-		{ID: "srv-2", IP: "10.0.0.2", InternalIP: "10.0.0.2", Port: 62206},
+		{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1", Port: common.DefaultNHPPort},
+		{ID: "srv-2", IP: "10.0.0.2", InternalIP: "10.0.0.2", Port: common.DefaultNHPPort},
 	}
 
 	result := FilterHealthyServers(context.Background(), mock, servers)
@@ -410,9 +412,9 @@ func TestFilterHealthyServers_ConcurrentAccess(t *testing.T) {
 	})
 
 	servers := []ServerInfo{
-		{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1", Port: 62206},
-		{ID: "srv-2", IP: "10.0.0.2", InternalIP: "10.0.0.2", Port: 62206},
-		{ID: "srv-3", IP: "10.0.0.3", InternalIP: "10.0.0.3", Port: 62206},
+		{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1", Port: common.DefaultNHPPort},
+		{ID: "srv-2", IP: "10.0.0.2", InternalIP: "10.0.0.2", Port: common.DefaultNHPPort},
+		{ID: "srv-3", IP: "10.0.0.3", InternalIP: "10.0.0.3", Port: common.DefaultNHPPort},
 	}
 
 	var wg sync.WaitGroup

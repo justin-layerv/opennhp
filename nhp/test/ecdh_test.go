@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/OpenNHP/opennhp/nhp/common"
 	core "github.com/OpenNHP/opennhp/nhp/core"
 )
 
@@ -35,7 +36,7 @@ func TestPublicKeys(t *testing.T) {
 func TestPeer(t *testing.T) {
 	server := &core.UdpPeer{
 		Ip:           "192.168.2.27",
-		Port:         62206,
+		Port:         common.DefaultNHPPort,
 		PubKeyBase64: "c0HALYy3433SqJmfN0JpRk1Q6H7xh84MAg89jYtRrQM=",
 		ExpireTime:   1716345064,
 		Type:         core.NHP_SERVER,

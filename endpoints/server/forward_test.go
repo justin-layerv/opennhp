@@ -904,7 +904,7 @@ func TestGetOrCreateServerPeer_CreatesNew(t *testing.T) {
 	serverInfo := ServerInfo{
 		ID:         "test-server-1",
 		InternalIP: "10.0.0.1",
-		Port:       62206,
+		Port:       common.DefaultNHPPort,
 		PubKey:     "dGVzdHB1YmtleWJhc2U2NA==", // "testpubkeybase64" in base64
 	}
 
@@ -950,7 +950,7 @@ func TestGetOrCreateServerPeer_ReturnsExisting(t *testing.T) {
 	serverInfo := ServerInfo{
 		ID:         "test-server-2",
 		InternalIP: "10.0.0.2",
-		Port:       62206,
+		Port:       common.DefaultNHPPort,
 		PubKey:     "dGVzdHB1YmtleTI=", // "testpubkey2" in base64
 	}
 
@@ -991,7 +991,7 @@ func TestGetOrCreateServerPeer_ConcurrentCreation(t *testing.T) {
 	serverInfo := ServerInfo{
 		ID:         "test-server-concurrent",
 		InternalIP: "10.0.0.3",
-		Port:       62206,
+		Port:       common.DefaultNHPPort,
 		PubKey:     "Y29uY3VycmVudHRlc3Q=", // "concurrenttest" in base64
 	}
 
@@ -1061,8 +1061,8 @@ func TestForwardKnock_ContextCancellation(t *testing.T) {
 	assignment := &ACAssignment{
 		ACID: "test-ac-cancel",
 		AssignedServers: []ServerInfo{
-			{ID: "srv-1", InternalIP: "10.0.0.1", Port: 62206, PubKey: "c3J2MXB1YmtleQ=="},
-			{ID: "srv-2", InternalIP: "10.0.0.2", Port: 62206, PubKey: "c3J2MnB1YmtleQ=="},
+			{ID: "srv-1", InternalIP: "10.0.0.1", Port: common.DefaultNHPPort, PubKey: "c3J2MXB1YmtleQ=="},
+			{ID: "srv-2", InternalIP: "10.0.0.2", Port: common.DefaultNHPPort, PubKey: "c3J2MnB1YmtleQ=="},
 		},
 	}
 
@@ -1269,7 +1269,7 @@ func TestGetOrCreateServerPeer_UsesStaticIP(t *testing.T) {
 	target := ServerInfo{
 		ID:         "non-resolvable-server-id", // NOT a valid hostname
 		InternalIP: "10.0.1.50",
-		Port:       62206,
+		Port:       common.DefaultNHPPort,
 		PubKey:     device.PublicKeyBase64(), // self-key for simplicity
 	}
 
@@ -1291,8 +1291,8 @@ func TestGetOrCreateServerPeer_UsesStaticIP(t *testing.T) {
 	if udpAddr.IP.String() != "10.0.1.50" {
 		t.Errorf("expected IP 10.0.1.50, got %s (DNS resolution of server ID?)", udpAddr.IP)
 	}
-	if udpAddr.Port != 62206 {
-		t.Errorf("expected port 62206, got %d", udpAddr.Port)
+	if udpAddr.Port != common.DefaultNHPPort {
+		t.Errorf("expected port %d, got %d", common.DefaultNHPPort, udpAddr.Port)
 	}
 }
 

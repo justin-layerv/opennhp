@@ -107,7 +107,7 @@ func AddServer(pubkey, ip, host string, port int, expire int64) bool {
 		return false
 	}
 	if port == 0 {
-		port = 62206 // default server listening port
+		port = common.DefaultNHPPort
 	}
 	instance.AddServer(&core.UdpPeer{
 		Type:         core.NHP_SERVER,

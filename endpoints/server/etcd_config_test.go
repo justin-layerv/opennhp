@@ -220,9 +220,9 @@ func TestUpdateACPeers_PreservesExistingPeers(t *testing.T) {
 	// Simulate AC registry loading: add a peer to the device
 	registryPeer := &core.UdpPeer{
 		Ip:           "10.0.0.100",
-		Port:         62206,
+		Port:         common.DefaultNHPPort,
 		PubKeyBase64: "cmVnaXN0cnlwZWVycHVia2V5YmFzZTY0", // "registrypeerpubkeybase64"
-		ExpireTime:   1924991999,
+		ExpireTime:   common.FarFutureExpiry,
 	}
 	registryPeer.Type = core.NHP_AC
 
@@ -297,9 +297,9 @@ func TestUpdateACPeers_UpdatesPeers_WhenACsDefinedInEtcd(t *testing.T) {
 	// Start with one peer
 	initialPeer := &core.UdpPeer{
 		Ip:           "10.0.0.1",
-		Port:         62206,
+		Port:         common.DefaultNHPPort,
 		PubKeyBase64: "aW5pdGlhbHBlZXI=", // "initialpeer"
-		ExpireTime:   1924991999,
+		ExpireTime:   common.FarFutureExpiry,
 	}
 	server.updateACPeers([]*core.UdpPeer{initialPeer})
 
