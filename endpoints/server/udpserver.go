@@ -1025,12 +1025,6 @@ func (s *UdpServer) AddResource(res *common.ResourceData) error {
 }
 
 func (s *UdpServer) ValidatePlugin(h plugins.PluginHandler) bool {
-	// placeholder to validate plugin file
-	// err = checkSignature(s.Signature())
-	// if err != nil {
-	//   return false
-	// }
-
 	return true
 }
 
@@ -1061,9 +1055,6 @@ func (s *UdpServer) LoadPlugin(pluginId string, h plugins.PluginHandler) error {
 	}
 
 	ver := h.Version()
-	info := h.ExportedData()
-	// use info if necessary
-	_ = info
 
 	s.pluginHandlerMapMutex.Lock()
 	s.pluginHandlerMap[pluginId] = h

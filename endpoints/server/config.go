@@ -373,25 +373,6 @@ func (s *UdpServer) initRemoteConn() error {
 
 }
 
-// loadRemoteBaseConfig is DEPRECATED.
-// Private keys and base config should ALWAYS come from local config.toml, never from etcd.
-// This function is kept for backwards compatibility but should not be used.
-// Use loadBaseConfig() for private key/LogLevel, then loadRemoteConfig() for server peers.
-func (s *UdpServer) loadRemoteBaseConfig() error {
-	var serverEtcdConfig ServerEtcdConfig
-	value, err := s.etcdConn.GetValue()
-	if err != nil {
-		return err
-	}
-	if err = toml.Unmarshal(value, &serverEtcdConfig); err != nil {
-		log.Error("failed to unmarshal remote config: %v", err)
-		return err
-	}
-
-	err = s.updateBaseConfig(serverEtcdConfig.BaseConfig)
-	return err
-}
-
 func (s *UdpServer) loadRemoteConfig() error {
 	value, err := s.etcdConn.GetValue()
 	if err != nil {

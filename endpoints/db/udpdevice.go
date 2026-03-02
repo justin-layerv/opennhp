@@ -172,7 +172,6 @@ func (a *UdpDevice) Start(dirPath string, logLevel int) (err error) {
 		go a.maintainServerConnectionRoutine()
 	}
 	a.running.Store(true)
-	// time.Sleep(1000 * time.Millisecond)
 	return nil
 }
 
@@ -650,10 +649,9 @@ func (a *UdpDevice) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sy
 			if (currTime - lastSendTime) > int64(ServerKeepaliveInterval*time.Second) {
 				// send NHP_KPL to server if no send happens within ServerKeepaliveInterval
 				md := &core.MsgData{
-					RemoteAddr:   sendAddr.(*net.UDPAddr),
-					HeaderType:   core.NHP_KPL,
-					CipherScheme: a.config.DefaultCipherScheme,
-					//PeerPk:        peerPbk, // pubkey not needed
+					RemoteAddr:    sendAddr.(*net.UDPAddr),
+					HeaderType:    core.NHP_KPL,
+					CipherScheme:  a.config.DefaultCipherScheme,
 					TransactionId: a.device.NextCounterIndex(),
 				}
 
