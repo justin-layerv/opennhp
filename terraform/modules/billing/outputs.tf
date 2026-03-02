@@ -25,11 +25,6 @@ output "usage_events_dlq_arn" {
   value       = aws_sqs_queue.usage_events_dlq.arn
 }
 
-output "checkout_session_lambda_function_name" {
-  description = "Checkout session Lambda function name"
-  value       = aws_lambda_function.checkout_session.function_name
-}
-
 output "stripe_webhook_lambda_function_name" {
   description = "Stripe webhook Lambda function name"
   value       = aws_lambda_function.stripe_webhook.function_name
@@ -48,11 +43,6 @@ output "reconciliation_lambda_function_name" {
 output "payment_grace_lambda_function_name" {
   description = "Payment grace Lambda function name"
   value       = aws_lambda_function.payment_grace.function_name
-}
-
-output "invoices_lambda_function_name" {
-  description = "Invoices Lambda function name"
-  value       = aws_lambda_function.invoices.function_name
 }
 
 output "webhook_dedup_table_name" {

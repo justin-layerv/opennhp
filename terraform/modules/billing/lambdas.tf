@@ -1,22 +1,14 @@
 # Billing - Lambda Functions
 #
-# Six Lambda functions for Stripe billing integration:
-# 1. checkout_session  - Stripe Checkout & Portal session creation (API-facing)
-# 2. stripe_webhook    - Stripe webhook event processing (API-facing)
-# 3. usage_reporter    - SQS consumer, reports metered usage to Stripe
-# 4. reconciliation    - Daily usage count reconciliation
-# 5. payment_grace     - Hourly payment grace period enforcement
-# 6. invoices          - Customer invoice retrieval (API-facing)
+# Four Lambda functions for Stripe billing integration:
+# 1. stripe_webhook    - Stripe webhook event processing (API-facing)
+# 2. usage_reporter    - SQS consumer, reports metered usage to Stripe
+# 3. reconciliation    - Daily usage count reconciliation
+# 4. payment_grace     - Hourly payment grace period enforcement
 
 # ==============================================================================
 # Lambda Packages
 # ==============================================================================
-
-data "archive_file" "checkout_session" {
-  type        = "zip"
-  source_file = "${path.module}/lambda/checkout_session.py"
-  output_path = "${path.module}/lambda/checkout_session.zip"
-}
 
 data "archive_file" "stripe_webhook" {
   type        = "zip"
@@ -42,64 +34,8 @@ data "archive_file" "payment_grace" {
   output_path = "${path.module}/lambda/payment_grace.zip"
 }
 
-data "archive_file" "invoices" {
-  type        = "zip"
-  source_file = "${path.module}/lambda/invoices.py"
-  output_path = "${path.module}/lambda/invoices.zip"
-}
-
 # ==============================================================================
-# 1. Checkout Session Lambda (API-facing)
-# ==============================================================================
-
-resource "aws_lambda_function" "checkout_session" {
-  depends_on = [aws_cloudwatch_log_group.checkout_session]
-
-  filename         = data.archive_file.checkout_session.output_path
-  function_name    = "${var.name_prefix}-billing-checkout-session"
-  role             = aws_iam_role.checkout_session.arn
-  handler          = "checkout_session.lambda_handler"
-  source_code_hash = data.archive_file.checkout_session.output_base64sha256
-  runtime          = "python3.12"
-  timeout          = 30
-  memory_size      = 256
-
-  tracing_config {
-    mode = "Active"
-  }
-
-  environment {
-    variables = {
-      STRIPE_SECRET_NAME   = var.stripe_secret_name
-      STRIPE_API_BASE_URL  = var.stripe_api_base_url
-      CUSTOMERS_TABLE_NAME = var.customers_table_name
-      GROWTH_PRICE_ID      = var.growth_price_id
-      BASE_FEE_PRICE_ID    = var.base_fee_price_id
-      SUCCESS_URL          = var.success_url
-      CANCEL_URL           = var.cancel_url
-      ALLOWED_ORIGINS      = join(",", var.allowed_origins)
-    }
-  }
-
-  tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-billing-checkout-session"
-    Component = local.component
-  })
-}
-
-resource "aws_cloudwatch_log_group" "checkout_session" {
-  name              = "/aws/lambda/${var.name_prefix}-billing-checkout-session"
-  retention_in_days = local.is_prod ? 90 : 14
-  kms_key_id        = var.logs_kms_key_arn
-
-  tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-billing-checkout-session-logs"
-    Component = local.component
-  })
-}
-
-# ==============================================================================
-# 2. Stripe Webhook Lambda (API-facing)
+# 1. Stripe Webhook Lambda (API-facing)
 # ==============================================================================
 
 resource "aws_lambda_function" "stripe_webhook" {
@@ -128,6 +64,8 @@ resource "aws_lambda_function" "stripe_webhook" {
       SNS_TOPIC_ARN              = var.sns_topic_arn
       ALLOWED_ORIGINS            = join(",", var.allowed_origins)
       GRACE_PERIOD_DAYS          = var.grace_period_days
+      CUSTOMERS_GSI_NAME         = "stripe-customer-id-index"
+      BILLING_AUDIT_TABLE_NAME   = var.billing_audit_table_name
     }
   }
 
@@ -262,13 +200,14 @@ resource "aws_lambda_function" "payment_grace" {
 
   environment {
     variables = {
-      CUSTOMERS_TABLE_NAME = var.customers_table_name
-      FROM_EMAIL           = var.from_email
-      SES_REGION           = var.ses_region
-      STRIPE_SECRET_NAME   = var.stripe_secret_name
-      STRIPE_API_BASE_URL  = var.stripe_api_base_url
-      DOWNGRADE_AFTER_DAYS = var.downgrade_after_days
-      METRICS_NAMESPACE    = var.metrics_namespace
+      CUSTOMERS_TABLE_NAME     = var.customers_table_name
+      FROM_EMAIL               = var.from_email
+      SES_REGION               = var.ses_region
+      STRIPE_SECRET_NAME       = var.stripe_secret_name
+      STRIPE_API_BASE_URL      = var.stripe_api_base_url
+      DOWNGRADE_AFTER_DAYS     = var.downgrade_after_days
+      METRICS_NAMESPACE        = var.metrics_namespace
+      BILLING_AUDIT_TABLE_NAME = var.billing_audit_table_name
     }
   }
 
@@ -290,85 +229,11 @@ resource "aws_cloudwatch_log_group" "payment_grace" {
 }
 
 # ==============================================================================
-# 6. Invoices Lambda (API-facing)
-# ==============================================================================
-
-resource "aws_lambda_function" "invoices" {
-  depends_on = [aws_cloudwatch_log_group.invoices]
-
-  filename         = data.archive_file.invoices.output_path
-  function_name    = "${var.name_prefix}-billing-invoices"
-  role             = aws_iam_role.invoices.arn
-  handler          = "invoices.lambda_handler"
-  source_code_hash = data.archive_file.invoices.output_base64sha256
-  runtime          = "python3.12"
-  timeout          = 30
-  memory_size      = 256
-
-  tracing_config {
-    mode = "Active"
-  }
-
-  environment {
-    variables = {
-      STRIPE_SECRET_NAME   = var.stripe_secret_name
-      STRIPE_API_BASE_URL  = var.stripe_api_base_url
-      CUSTOMERS_TABLE_NAME = var.customers_table_name
-      ALLOWED_ORIGINS      = join(",", var.allowed_origins)
-    }
-  }
-
-  tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-billing-invoices"
-    Component = local.component
-  })
-}
-
-resource "aws_cloudwatch_log_group" "invoices" {
-  name              = "/aws/lambda/${var.name_prefix}-billing-invoices"
-  retention_in_days = local.is_prod ? 90 : 14
-  kms_key_id        = var.logs_kms_key_arn
-
-  tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-billing-invoices-logs"
-    Component = local.component
-  })
-}
-
-# ==============================================================================
 # CloudWatch Alarms (optional)
 # ==============================================================================
 
-# User-facing Lambdas (checkout_session, invoices) use threshold=5 because
-# transient client errors (invalid input, missing customer) are expected.
 # Background Lambdas (webhook, usage_reporter, reconciliation, payment_grace)
 # use threshold=0 because any error indicates a system problem.
-
-resource "aws_cloudwatch_metric_alarm" "checkout_session_errors" {
-  count               = local.has_sns ? 1 : 0
-  alarm_name          = "${var.name_prefix}-billing-checkout-session-errors"
-  alarm_description   = "Billing checkout session Lambda function errors"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "Errors"
-  namespace           = "AWS/Lambda"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 5 # User-facing — see comment above
-  treat_missing_data  = "notBreaching"
-
-  dimensions = {
-    FunctionName = aws_lambda_function.checkout_session.function_name
-  }
-
-  alarm_actions = [var.sns_topic_arn]
-  ok_actions    = [var.sns_topic_arn]
-
-  tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-billing-checkout-session-errors"
-    Component = local.component
-  })
-}
 
 resource "aws_cloudwatch_metric_alarm" "stripe_webhook_errors" {
   count               = local.has_sns ? 1 : 0
@@ -470,32 +335,6 @@ resource "aws_cloudwatch_metric_alarm" "payment_grace_errors" {
 
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-billing-payment-grace-errors"
-    Component = local.component
-  })
-}
-
-resource "aws_cloudwatch_metric_alarm" "invoices_errors" {
-  count               = local.has_sns ? 1 : 0
-  alarm_name          = "${var.name_prefix}-billing-invoices-errors"
-  alarm_description   = "Billing invoices Lambda function errors"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "Errors"
-  namespace           = "AWS/Lambda"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 5 # User-facing — see comment above
-  treat_missing_data  = "notBreaching"
-
-  dimensions = {
-    FunctionName = aws_lambda_function.invoices.function_name
-  }
-
-  alarm_actions = [var.sns_topic_arn]
-  ok_actions    = [var.sns_topic_arn]
-
-  tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-billing-invoices-errors"
     Component = local.component
   })
 }

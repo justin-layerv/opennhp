@@ -19,6 +19,7 @@ import botocore.exceptions
 import logging
 import os
 import time
+import uuid
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
@@ -64,6 +65,7 @@ SES_REGION = os.environ.get('SES_REGION', 'us-east-1')
 STRIPE_SECRET_NAME = os.environ.get('STRIPE_SECRET_NAME', '')
 METRICS_NAMESPACE = os.environ.get('METRICS_NAMESPACE', 'LayerV/Billing')
 STRIPE_API_BASE_URL = os.environ.get('STRIPE_API_BASE_URL', 'https://api.stripe.com')
+BILLING_AUDIT_TABLE_NAME = os.environ.get('BILLING_AUDIT_TABLE_NAME', '')
 
 # Downgrade after N days of frozen state (configurable, default 30)
 DOWNGRADE_AFTER_DAYS = int(os.environ.get('DOWNGRADE_AFTER_DAYS', '30'))
@@ -78,6 +80,7 @@ dynamodb = boto3.resource('dynamodb')
 ses = boto3.client('ses', region_name=SES_REGION)
 cloudwatch = boto3.client('cloudwatch')
 customers_table = dynamodb.Table(CUSTOMERS_TABLE_NAME) if CUSTOMERS_TABLE_NAME else None
+audit_table = dynamodb.Table(BILLING_AUDIT_TABLE_NAME) if BILLING_AUDIT_TABLE_NAME else None
 
 
 def lambda_handler(event, context):
@@ -110,6 +113,10 @@ def lambda_handler(event, context):
             # Freeze the account
             if _freeze_account(auth0_sub, now_iso):
                 frozen_count += 1
+                _write_audit(auth0_sub, 'account_frozen', {
+                    'reason': 'payment_failed',
+                    'payment_grace_deadline': customer.get('payment_grace_deadline', ''),
+                })
 
                 # Send notification email
                 if email:
@@ -127,6 +134,11 @@ def lambda_handler(event, context):
                 if now - frozen_dt > timedelta(days=DOWNGRADE_AFTER_DAYS):
                     if _downgrade_account(auth0_sub, now_iso):
                         downgraded_count += 1
+                        _write_audit(auth0_sub, 'account_downgraded', {
+                            'reason': 'grace_period_expired',
+                            'frozen_at': frozen_at,
+                            'days_frozen': (now - frozen_dt).days,
+                        })
 
                         if email:
                             _send_downgrade_notification(email)
@@ -290,6 +302,26 @@ def _get_customer_subscription_id(auth0_sub):
             "error": str(e), "auth0_sub": auth0_sub,
         })
         return ''
+
+
+def _write_audit(owner_id, event_type, details):
+    """Write an entry to the billing audit table."""
+    if not audit_table:
+        return
+    try:
+        now = datetime.now(timezone.utc)
+        audit_table.put_item(Item={
+            'owner_id': owner_id,
+            'event_id': f"{now.isoformat()}#{uuid.uuid4()}",
+            'event_type': event_type,
+            'timestamp': now.isoformat(),
+            'ttl': int((now + timedelta(days=730)).timestamp()),
+            'details': details,
+        })
+    except Exception as e:
+        logger.warning("Failed to write audit entry", extra={
+            "error": str(e), "owner_id": owner_id, "event_type": event_type,
+        })
 
 
 # ---------------------------------------------------------------------------

@@ -5,72 +5,6 @@
 # Per-function: specific DynamoDB, Secrets Manager, SQS, SES, CloudWatch permissions
 
 # ==============================================================================
-# 1. Checkout Session IAM
-# ==============================================================================
-
-resource "aws_iam_role" "checkout_session" {
-  name = "${var.name_prefix}-billing-checkout-session-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Principal = {
-          Service = "lambda.amazonaws.com"
-        }
-        Action = "sts:AssumeRole"
-      }
-    ]
-  })
-
-  tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-billing-checkout-session-role"
-    Component = local.component
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "checkout_session_basic" {
-  role       = aws_iam_role.checkout_session.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-}
-
-resource "aws_iam_role_policy_attachment" "checkout_session_xray" {
-  role       = aws_iam_role.checkout_session.name
-  policy_arn = "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess"
-}
-
-resource "aws_iam_role_policy" "checkout_session" {
-  name = "${var.name_prefix}-billing-checkout-session-policy"
-  role = aws_iam_role.checkout_session.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = concat(
-      [
-        {
-          Sid    = "DynamoDBCustomers"
-          Effect = "Allow"
-          Action = [
-            "dynamodb:GetItem",
-            "dynamodb:PutItem",
-            "dynamodb:UpdateItem"
-          ]
-          Resource = var.customers_table_arn
-        },
-        {
-          Sid      = "SecretsManagerStripe"
-          Effect   = "Allow"
-          Action   = ["secretsmanager:GetSecretValue"]
-          Resource = local.stripe_secret_arn
-        }
-      ],
-      local.kms_dynamodb_statement
-    )
-  })
-}
-
-# ==============================================================================
 # 2. Stripe Webhook IAM
 # ==============================================================================
 
@@ -121,9 +55,9 @@ resource "aws_iam_role_policy" "stripe_webhook" {
             "dynamodb:GetItem",
             "dynamodb:PutItem",
             "dynamodb:UpdateItem",
-            "dynamodb:Scan"
+            "dynamodb:Query"
           ]
-          Resource = var.customers_table_arn
+          Resource = [var.customers_table_arn, "${var.customers_table_arn}/index/stripe-customer-id-index"]
         },
         {
           Sid    = "DynamoDBWebhookDedup"
@@ -153,6 +87,16 @@ resource "aws_iam_role_policy" "stripe_webhook" {
           Effect   = "Allow"
           Action   = ["sns:Publish"]
           Resource = var.sns_topic_arn
+        }
+      ] : [],
+      local.has_audit_table ? [
+        {
+          Sid    = "DynamoDBAudit"
+          Effect = "Allow"
+          Action = [
+            "dynamodb:PutItem"
+          ]
+          Resource = var.billing_audit_table_arn
         }
       ] : [],
       local.kms_dynamodb_statement
@@ -418,70 +362,16 @@ resource "aws_iam_role_policy" "payment_grace" {
           }
         }
       ],
-      local.kms_dynamodb_statement
-    )
-  })
-}
-
-# ==============================================================================
-# 6. Invoices IAM
-# ==============================================================================
-
-resource "aws_iam_role" "invoices" {
-  name = "${var.name_prefix}-billing-invoices-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Principal = {
-          Service = "lambda.amazonaws.com"
-        }
-        Action = "sts:AssumeRole"
-      }
-    ]
-  })
-
-  tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-billing-invoices-role"
-    Component = local.component
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "invoices_basic" {
-  role       = aws_iam_role.invoices.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-}
-
-resource "aws_iam_role_policy_attachment" "invoices_xray" {
-  role       = aws_iam_role.invoices.name
-  policy_arn = "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess"
-}
-
-resource "aws_iam_role_policy" "invoices" {
-  name = "${var.name_prefix}-billing-invoices-policy"
-  role = aws_iam_role.invoices.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = concat(
-      [
+      local.has_audit_table ? [
         {
-          Sid    = "DynamoDBCustomers"
+          Sid    = "DynamoDBAudit"
           Effect = "Allow"
           Action = [
-            "dynamodb:GetItem"
+            "dynamodb:PutItem"
           ]
-          Resource = var.customers_table_arn
-        },
-        {
-          Sid      = "SecretsManagerStripe"
-          Effect   = "Allow"
-          Action   = ["secretsmanager:GetSecretValue"]
-          Resource = local.stripe_secret_arn
+          Resource = var.billing_audit_table_arn
         }
-      ],
+      ] : [],
       local.kms_dynamodb_statement
     )
   })

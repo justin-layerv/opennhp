@@ -25,7 +25,7 @@ import uuid
 import urllib.request
 import urllib.parse
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # JSON logging for CloudWatch Insights
 _LOG_BUILTIN_KEYS = {
@@ -282,6 +282,8 @@ def _write_audit(owner_id, event_type, details):
             'owner_id': owner_id,
             'event_id': f"{now.isoformat()}#{uuid.uuid4()}",
             'event_type': event_type,
+            'timestamp': now.isoformat(),
+            'ttl': int((now + timedelta(days=730)).timestamp()),
             'details': details,
         })
     except Exception as e:

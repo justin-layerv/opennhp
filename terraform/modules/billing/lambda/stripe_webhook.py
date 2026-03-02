@@ -23,6 +23,7 @@ import hmac
 import logging
 import os
 import time
+import uuid
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -83,6 +84,9 @@ dynamodb = boto3.resource('dynamodb')
 sns = boto3.client('sns') if SNS_TOPIC_ARN else None
 customers_table = dynamodb.Table(CUSTOMERS_TABLE_NAME) if CUSTOMERS_TABLE_NAME else None
 dedup_table = dynamodb.Table(WEBHOOK_DEDUP_TABLE_NAME) if WEBHOOK_DEDUP_TABLE_NAME else None
+
+BILLING_AUDIT_TABLE_NAME = os.environ.get('BILLING_AUDIT_TABLE_NAME', '')
+audit_table = dynamodb.Table(BILLING_AUDIT_TABLE_NAME) if BILLING_AUDIT_TABLE_NAME else None
 
 
 def lambda_handler(event, context):
@@ -352,6 +356,10 @@ def _handle_checkout_completed(session):
             "stripe_customer_id": customer_id,
             "stripe_sub_item_id": sub_item_id,
         })
+        _write_audit(auth0_sub, 'tier_upgraded', {
+            'tier': 'growth',
+            'stripe_customer_id': customer_id,
+        })
     except Exception as e:
         logger.error("Failed to update customer after checkout", extra={
             "error": str(e), "auth0_sub": auth0_sub,
@@ -454,6 +462,10 @@ def _handle_subscription_deleted(subscription):
             "auth0_sub": auth0_sub,
             "stripe_customer_id": customer_id,
         })
+        _write_audit(auth0_sub, 'tier_downgraded', {
+            'previous_tier': 'growth',
+            'stripe_customer_id': customer_id,
+        })
     except Exception as e:
         logger.error("Failed to downgrade customer", extra={
             "error": str(e), "auth0_sub": auth0_sub,
@@ -497,6 +509,10 @@ def _handle_payment_failed(invoice):
             "auth0_sub": auth0_sub,
             "grace_deadline": grace_deadline,
         })
+        _write_audit(auth0_sub, 'grace_started', {
+            'grace_period_days': int(GRACE_PERIOD_DAYS),
+            'stripe_customer_id': customer_id,
+        })
     except Exception as e:
         logger.error("Failed to set grace deadline", extra={
             "error": str(e), "auth0_sub": auth0_sub,
@@ -535,6 +551,9 @@ def _handle_payment_succeeded(invoice):
             "auth0_sub": auth0_sub,
             "stripe_customer_id": customer_id,
         })
+        _write_audit(auth0_sub, 'grace_cleared', {
+            'stripe_customer_id': customer_id,
+        })
     except Exception as e:
         logger.error("Failed to clear grace deadline", extra={
             "error": str(e), "auth0_sub": auth0_sub,
@@ -548,34 +567,57 @@ def _handle_payment_succeeded(invoice):
 
 def _find_auth0_sub_by_stripe_id(stripe_customer_id):
     """
-    Find auth0_subject by stripe_customer_id using a table scan.
+    Find auth0_subject by stripe_customer_id using a GSI query.
 
-    This is called infrequently (only on webhook events) so a scan is
-    acceptable. For higher volume, add a GSI on stripe_customer_id.
+    Uses the stripe-customer-id-index GSI for O(1) lookup instead of
+    a full table scan.
     """
     if not customers_table or not stripe_customer_id:
         return None
 
+    gsi_name = os.environ.get('CUSTOMERS_GSI_NAME', 'stripe-customer-id-index')
+
     try:
-        scan_kwargs = {
-            'FilterExpression': 'stripe_customer_id = :cid',
-            'ExpressionAttributeValues': {':cid': stripe_customer_id},
-        }
-        while True:
-            resp = customers_table.scan(**scan_kwargs)
-            items = resp.get('Items', [])
-            if items:
-                return items[0].get('auth0_subject')
-            last_key = resp.get('LastEvaluatedKey')
-            if not last_key:
-                break
-            scan_kwargs['ExclusiveStartKey'] = last_key
+        resp = customers_table.query(
+            IndexName=gsi_name,
+            KeyConditionExpression='stripe_customer_id = :cid',
+            ExpressionAttributeValues={':cid': stripe_customer_id},
+            Limit=1,
+        )
+        items = resp.get('Items', [])
+        if items:
+            return items[0].get('auth0_subject')
     except Exception as e:
         logger.error("Customer lookup by Stripe ID failed", extra={
-            "error": str(e), "stripe_customer_id": stripe_customer_id,
+            "error": str(e), "error_type": type(e).__name__,
+            "stripe_customer_id": stripe_customer_id,
         })
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Audit Helpers
+# ---------------------------------------------------------------------------
+
+def _write_audit(owner_id, event_type, details):
+    """Write an entry to the billing audit table."""
+    if not audit_table:
+        return
+    try:
+        now = datetime.now(timezone.utc)
+        audit_table.put_item(Item={
+            'owner_id': owner_id,
+            'event_id': f"{now.isoformat()}#{uuid.uuid4()}",
+            'event_type': event_type,
+            'timestamp': now.isoformat(),
+            'ttl': int((now + timedelta(days=730)).timestamp()),
+            'details': details,
+        })
+    except Exception as e:
+        logger.warning("Failed to write audit entry", extra={
+            "error": str(e), "owner_id": owner_id, "event_type": event_type,
+        })
 
 
 # ---------------------------------------------------------------------------

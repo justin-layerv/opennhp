@@ -358,11 +358,6 @@ output "billing_usage_events_queue_url" {
   value       = var.deploy_billing ? module.billing[0].usage_events_queue_url : null
 }
 
-output "billing_checkout_session_lambda_name" {
-  description = "Billing checkout session Lambda function name"
-  value       = var.deploy_billing ? module.billing[0].checkout_session_lambda_function_name : null
-}
-
 output "billing_stripe_webhook_lambda_name" {
   description = "Billing Stripe webhook Lambda function name"
   value       = var.deploy_billing ? module.billing[0].stripe_webhook_lambda_function_name : null
@@ -381,9 +376,4 @@ output "billing_reconciliation_lambda_name" {
 output "billing_payment_grace_lambda_name" {
   description = "Billing payment grace Lambda function name"
   value       = var.deploy_billing ? module.billing[0].payment_grace_lambda_function_name : null
-}
-
-output "billing_invoices_lambda_name" {
-  description = "Billing invoices Lambda function name"
-  value       = var.deploy_billing ? module.billing[0].invoices_lambda_function_name : null
 }

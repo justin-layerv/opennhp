@@ -192,6 +192,10 @@ locals {
         { name = "GEOIP_S3_URI", value = var.geoip_s3_uri },
       ] : [],
     ) : [],
+    # Stripe billing integration (for checkout, portal, invoices)
+    var.stripe_secret_arn != "" ? [
+      { name = "STRIPE_SECRET_ARN", value = var.stripe_secret_arn },
+    ] : [],
     # OpenTelemetry configuration
     # When Grafana Cloud is enabled, OTEL exports to the local ADOT sidecar
     # The sidecar then forwards to Grafana Cloud OTLP endpoint
@@ -411,6 +415,29 @@ resource "aws_iam_role_policy" "task_geoip_s3" {
       Action   = ["s3:GetObject"]
       Resource = [replace(var.geoip_s3_uri, "s3://", "arn:aws:s3:::")]
     }]
+  })
+}
+
+# Policy to read Stripe secret from Secrets Manager (conditional)
+resource "aws_iam_role_policy" "task_stripe_secret" {
+  count = var.stripe_secret_arn != "" ? 1 : 0
+  name  = "stripe-secret-access"
+  role  = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat([{
+      Sid      = "StripeSecretRead"
+      Effect   = "Allow"
+      Action   = ["secretsmanager:GetSecretValue"]
+      Resource = [var.stripe_secret_arn]
+      }],
+      var.secrets_kms_key_arn != null ? [{
+        Sid      = "KMSDecryptStripeSecret"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = [var.secrets_kms_key_arn]
+    }] : [])
   })
 }
 

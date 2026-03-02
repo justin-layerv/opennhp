@@ -835,6 +835,19 @@ resource "aws_dynamodb_table" "qurl_customers" {
     type = "S"
   }
 
+  attribute {
+    name = "stripe_customer_id"
+    type = "S"
+  }
+
+  # Webhook looks up auth0_subject (table PK) by stripe_customer_id.
+  # KEYS_ONLY is sufficient — the PK is always projected.
+  global_secondary_index {
+    name            = "stripe-customer-id-index"
+    hash_key        = "stripe_customer_id"
+    projection_type = "KEYS_ONLY"
+  }
+
   # Enable point-in-time recovery for production
   point_in_time_recovery {
     enabled = local.is_prod
@@ -873,6 +886,25 @@ resource "aws_dynamodb_table" "qurl_billing_audit" {
   attribute {
     name = "event_id"
     type = "S"
+  }
+
+  attribute {
+    name = "event_type"
+    type = "S"
+  }
+
+  attribute {
+    name = "timestamp"
+    type = "S"
+  }
+
+  # GSI for cross-owner time-range queries (e.g. "all account_frozen events in the last hour")
+  global_secondary_index {
+    name               = "event-type-timestamp-index"
+    hash_key           = "event_type"
+    range_key          = "timestamp"
+    projection_type    = "INCLUDE"
+    non_key_attributes = ["owner_id"]
   }
 
   # Enable point-in-time recovery for production

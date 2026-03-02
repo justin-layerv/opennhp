@@ -88,55 +88,11 @@ resource "aws_apigatewayv2_authorizer" "auth0_jwt" {
 # Integrations
 # ==============================================================================
 
-resource "aws_apigatewayv2_integration" "checkout_session" {
-  api_id                 = aws_apigatewayv2_api.billing.id
-  integration_type       = "AWS_PROXY"
-  integration_uri        = aws_lambda_function.checkout_session.invoke_arn
-  payload_format_version = "2.0"
-}
-
 resource "aws_apigatewayv2_integration" "stripe_webhook" {
   api_id                 = aws_apigatewayv2_api.billing.id
   integration_type       = "AWS_PROXY"
   integration_uri        = aws_lambda_function.stripe_webhook.invoke_arn
   payload_format_version = "2.0"
-}
-
-resource "aws_apigatewayv2_integration" "invoices" {
-  api_id                 = aws_apigatewayv2_api.billing.id
-  integration_type       = "AWS_PROXY"
-  integration_uri        = aws_lambda_function.invoices.invoke_arn
-  payload_format_version = "2.0"
-}
-
-# ==============================================================================
-# Authenticated Routes (JWT authorizer)
-# ==============================================================================
-
-resource "aws_apigatewayv2_route" "checkout_session" {
-  api_id             = aws_apigatewayv2_api.billing.id
-  route_key          = "POST /billing/checkout-session"
-  target             = "integrations/${aws_apigatewayv2_integration.checkout_session.id}"
-  authorization_type = "JWT"
-  authorizer_id      = aws_apigatewayv2_authorizer.auth0_jwt.id
-}
-
-# Portal session shares the checkout_session Lambda integration.
-# The Lambda routes internally based on rawPath (/checkout-session vs /portal-session).
-resource "aws_apigatewayv2_route" "portal_session" {
-  api_id             = aws_apigatewayv2_api.billing.id
-  route_key          = "POST /billing/portal-session"
-  target             = "integrations/${aws_apigatewayv2_integration.checkout_session.id}"
-  authorization_type = "JWT"
-  authorizer_id      = aws_apigatewayv2_authorizer.auth0_jwt.id
-}
-
-resource "aws_apigatewayv2_route" "invoices" {
-  api_id             = aws_apigatewayv2_api.billing.id
-  route_key          = "GET /billing/invoices"
-  target             = "integrations/${aws_apigatewayv2_integration.invoices.id}"
-  authorization_type = "JWT"
-  authorizer_id      = aws_apigatewayv2_authorizer.auth0_jwt.id
 }
 
 # ==============================================================================
@@ -158,26 +114,10 @@ resource "aws_apigatewayv2_route" "stripe_webhook" {
 # Lambda Permissions (allow API GW to invoke)
 # ==============================================================================
 
-resource "aws_lambda_permission" "checkout_session" {
-  statement_id  = "AllowAPIGatewayInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.checkout_session.function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.billing.execution_arn}/*/*"
-}
-
 resource "aws_lambda_permission" "stripe_webhook" {
   statement_id  = "AllowAPIGatewayInvoke"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.stripe_webhook.function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.billing.execution_arn}/*/*"
-}
-
-resource "aws_lambda_permission" "invoices" {
-  statement_id  = "AllowAPIGatewayInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.invoices.function_name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.billing.execution_arn}/*/*"
 }

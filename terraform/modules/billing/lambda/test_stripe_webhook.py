@@ -107,9 +107,11 @@ class TestHandleCheckoutCompleted:
     """Tests for _handle_checkout_completed()."""
 
     def test_updates_customer_tier(self, mod):
+        mock_audit = MagicMock()
         with patch.object(mod, 'customers_table') as mock_table, \
              patch.object(mod, '_find_auth0_sub_by_stripe_id', return_value='auth0|user1'), \
-             patch.object(mod, '_get_stripe_key_for_api', return_value=None):
+             patch.object(mod, '_get_stripe_key_for_api', return_value=None), \
+             patch.object(mod, 'audit_table', mock_audit):
             mock_table.update_item = MagicMock()
 
             session = {
@@ -125,10 +127,18 @@ class TestHandleCheckoutCompleted:
             assert ':tier' in call_kwargs['ExpressionAttributeValues']
             assert call_kwargs['ExpressionAttributeValues'][':tier'] == 'growth'
 
+            # Verify audit write
+            mock_audit.put_item.assert_called_once()
+            audit_item = mock_audit.put_item.call_args[1]['Item']
+            assert audit_item['event_type'] == 'tier_upgraded'
+            assert 'timestamp' in audit_item
+            assert 'ttl' in audit_item
+
     def test_uses_metadata_auth0_sub(self, mod):
         with patch.object(mod, 'customers_table') as mock_table, \
              patch.object(mod, '_find_auth0_sub_by_stripe_id') as mock_find, \
-             patch.object(mod, '_get_stripe_key_for_api', return_value=None):
+             patch.object(mod, '_get_stripe_key_for_api', return_value=None), \
+             patch.object(mod, 'audit_table', MagicMock()):
             mock_table.update_item = MagicMock()
 
             session = {
@@ -153,14 +163,23 @@ class TestHandleSubscriptionDeleted:
     """Tests for _handle_subscription_deleted()."""
 
     def test_downgrades_to_free(self, mod):
+        mock_audit = MagicMock()
         with patch.object(mod, 'customers_table') as mock_table, \
-             patch.object(mod, '_find_auth0_sub_by_stripe_id', return_value='auth0|u1'):
+             patch.object(mod, '_find_auth0_sub_by_stripe_id', return_value='auth0|u1'), \
+             patch.object(mod, 'audit_table', mock_audit):
             mock_table.update_item = MagicMock()
             mod._handle_subscription_deleted({'customer': 'cus_1'})
 
             call_kwargs = mock_table.update_item.call_args[1]
             assert call_kwargs['ExpressionAttributeValues'][':tier'] == 'free'
             assert 'REMOVE stripe_subscription_id' in call_kwargs['UpdateExpression']
+
+            # Verify audit write
+            mock_audit.put_item.assert_called_once()
+            audit_item = mock_audit.put_item.call_args[1]['Item']
+            assert audit_item['event_type'] == 'tier_downgraded'
+            assert 'timestamp' in audit_item
+            assert 'ttl' in audit_item
 
     def test_customer_not_found_skips(self, mod):
         with patch.object(mod, 'customers_table') as mock_table, \
@@ -174,8 +193,10 @@ class TestHandlePaymentFailed:
     """Tests for _handle_payment_failed()."""
 
     def test_sets_grace_deadline(self, mod):
+        mock_audit = MagicMock()
         with patch.object(mod, 'customers_table') as mock_table, \
-             patch.object(mod, '_find_auth0_sub_by_stripe_id', return_value='auth0|u1'):
+             patch.object(mod, '_find_auth0_sub_by_stripe_id', return_value='auth0|u1'), \
+             patch.object(mod, 'audit_table', mock_audit):
             mock_table.update_item = MagicMock()
             mod._handle_payment_failed({'customer': 'cus_1'})
 
@@ -183,18 +204,34 @@ class TestHandlePaymentFailed:
             assert ':deadline' in call_kwargs['ExpressionAttributeValues']
             assert 'payment_grace_deadline' in call_kwargs['UpdateExpression']
 
+            # Verify audit write
+            mock_audit.put_item.assert_called_once()
+            audit_item = mock_audit.put_item.call_args[1]['Item']
+            assert audit_item['event_type'] == 'grace_started'
+            assert 'timestamp' in audit_item
+            assert 'ttl' in audit_item
+
 
 class TestHandlePaymentSucceeded:
     """Tests for _handle_payment_succeeded()."""
 
     def test_clears_frozen_state(self, mod):
+        mock_audit = MagicMock()
         with patch.object(mod, 'customers_table') as mock_table, \
-             patch.object(mod, '_find_auth0_sub_by_stripe_id', return_value='auth0|u1'):
+             patch.object(mod, '_find_auth0_sub_by_stripe_id', return_value='auth0|u1'), \
+             patch.object(mod, 'audit_table', mock_audit):
             mock_table.update_item = MagicMock()
             mod._handle_payment_succeeded({'customer': 'cus_1'})
 
             call_kwargs = mock_table.update_item.call_args[1]
             assert 'REMOVE payment_grace_deadline, frozen, frozen_reason' in call_kwargs['UpdateExpression']
+
+            # Verify audit write
+            mock_audit.put_item.assert_called_once()
+            audit_item = mock_audit.put_item.call_args[1]['Item']
+            assert audit_item['event_type'] == 'grace_cleared'
+            assert 'timestamp' in audit_item
+            assert 'ttl' in audit_item
 
 
 # ---------------------------------------------------------------------------
@@ -202,36 +239,23 @@ class TestHandlePaymentSucceeded:
 # ---------------------------------------------------------------------------
 
 class TestFindAuth0SubByStripeId:
-    """Tests for _find_auth0_sub_by_stripe_id() including pagination."""
+    """Tests for _find_auth0_sub_by_stripe_id() using GSI query."""
 
-    def test_found_on_first_page(self, mod):
+    def test_found_via_gsi_query(self, mod):
         mock_table = MagicMock()
-        mock_table.scan.return_value = {
-            'Items': [{'auth0_subject': 'auth0|u1', 'stripe_customer_id': 'cus_1'}],
+        mock_table.query.return_value = {
+            'Items': [{'auth0_subject': 'auth0|u1'}],
         }
         with patch.object(mod, 'customers_table', mock_table):
             assert mod._find_auth0_sub_by_stripe_id('cus_1') == 'auth0|u1'
-            mock_table.scan.assert_called_once()
+            mock_table.query.assert_called_once()
+            call_kwargs = mock_table.query.call_args[1]
+            assert call_kwargs['IndexName'] == 'stripe-customer-id-index'
+            assert call_kwargs['Limit'] == 1
 
-    def test_found_on_second_page(self, mod):
+    def test_not_found_returns_none(self, mod):
         mock_table = MagicMock()
-        mock_table.scan.side_effect = [
-            {'Items': [], 'LastEvaluatedKey': {'auth0_subject': 'auth0|page1'}},
-            {'Items': [{'auth0_subject': 'auth0|u2', 'stripe_customer_id': 'cus_2'}]},
-        ]
-        with patch.object(mod, 'customers_table', mock_table):
-            assert mod._find_auth0_sub_by_stripe_id('cus_2') == 'auth0|u2'
-            assert mock_table.scan.call_count == 2
-            # Second call should include ExclusiveStartKey
-            second_call = mock_table.scan.call_args_list[1]
-            assert second_call[1]['ExclusiveStartKey'] == {'auth0_subject': 'auth0|page1'}
-
-    def test_not_found_after_all_pages(self, mod):
-        mock_table = MagicMock()
-        mock_table.scan.side_effect = [
-            {'Items': [], 'LastEvaluatedKey': {'auth0_subject': 'auth0|page1'}},
-            {'Items': []},
-        ]
+        mock_table.query.return_value = {'Items': []}
         with patch.object(mod, 'customers_table', mock_table):
             assert mod._find_auth0_sub_by_stripe_id('cus_missing') is None
 
@@ -242,6 +266,67 @@ class TestFindAuth0SubByStripeId:
     def test_returns_none_when_no_table(self, mod):
         with patch.object(mod, 'customers_table', None):
             assert mod._find_auth0_sub_by_stripe_id('cus_1') is None
+
+    def test_query_error_returns_none(self, mod):
+        mock_table = MagicMock()
+        mock_table.query.side_effect = Exception("DDB error")
+        with patch.object(mod, 'customers_table', mock_table):
+            assert mod._find_auth0_sub_by_stripe_id('cus_1') is None
+
+
+# ---------------------------------------------------------------------------
+# Audit Write Resilience Tests
+# ---------------------------------------------------------------------------
+
+class TestAuditWriteResilience:
+    """Verify billing operations succeed even when audit writes fail."""
+
+    def test_checkout_succeeds_when_audit_fails(self, mod):
+        mock_audit = MagicMock()
+        mock_audit.put_item.side_effect = Exception("DDB throttle")
+        with patch.object(mod, 'customers_table') as mock_table, \
+             patch.object(mod, '_find_auth0_sub_by_stripe_id', return_value='auth0|u1'), \
+             patch.object(mod, '_get_stripe_key_for_api', return_value=None), \
+             patch.object(mod, 'audit_table', mock_audit):
+            mock_table.update_item = MagicMock()
+            session = {
+                'customer': 'cus_1',
+                'subscription': 'sub_1',
+                'metadata': {},
+            }
+            # Should not raise despite audit failure
+            mod._handle_checkout_completed(session)
+            mock_table.update_item.assert_called_once()
+
+    def test_payment_failed_succeeds_when_audit_fails(self, mod):
+        mock_audit = MagicMock()
+        mock_audit.put_item.side_effect = Exception("DDB throttle")
+        with patch.object(mod, 'customers_table') as mock_table, \
+             patch.object(mod, '_find_auth0_sub_by_stripe_id', return_value='auth0|u1'), \
+             patch.object(mod, 'audit_table', mock_audit):
+            mock_table.update_item = MagicMock()
+            mod._handle_payment_failed({'customer': 'cus_1'})
+            mock_table.update_item.assert_called_once()
+
+    def test_subscription_deleted_succeeds_when_audit_fails(self, mod):
+        mock_audit = MagicMock()
+        mock_audit.put_item.side_effect = Exception("DDB throttle")
+        with patch.object(mod, 'customers_table') as mock_table, \
+             patch.object(mod, '_find_auth0_sub_by_stripe_id', return_value='auth0|u1'), \
+             patch.object(mod, 'audit_table', mock_audit):
+            mock_table.update_item = MagicMock()
+            mod._handle_subscription_deleted({'customer': 'cus_1'})
+            mock_table.update_item.assert_called_once()
+
+    def test_payment_succeeded_succeeds_when_audit_fails(self, mod):
+        mock_audit = MagicMock()
+        mock_audit.put_item.side_effect = Exception("DDB throttle")
+        with patch.object(mod, 'customers_table') as mock_table, \
+             patch.object(mod, '_find_auth0_sub_by_stripe_id', return_value='auth0|u1'), \
+             patch.object(mod, 'audit_table', mock_audit):
+            mock_table.update_item = MagicMock()
+            mod._handle_payment_succeeded({'customer': 'cus_1'})
+            mock_table.update_item.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

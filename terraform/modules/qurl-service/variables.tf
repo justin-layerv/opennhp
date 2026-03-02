@@ -635,6 +635,12 @@ variable "grafana_secret_arn" {
   }
 }
 
+variable "stripe_secret_arn" {
+  description = "ARN of the Secrets Manager secret containing the Stripe API key"
+  type        = string
+  default     = ""
+}
+
 variable "adot_collector_image" {
   description = "ADOT Collector container image. Uses AWS public ECR for the official ADOT image."
   type        = string

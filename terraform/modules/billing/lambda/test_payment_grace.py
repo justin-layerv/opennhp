@@ -230,15 +230,24 @@ class TestLambdaHandler:
             'frozen': False,
             'frozen_at': '',
         }
+        mock_audit = MagicMock()
         with patch.object(mod, 'customers_table', MagicMock()), \
              patch.object(mod, '_get_customers_past_deadline', return_value=[customer]), \
              patch.object(mod, '_freeze_account', return_value=True) as mock_freeze, \
              patch.object(mod, '_send_freeze_notification') as mock_email, \
-             patch.object(mod, '_emit_metric'):
+             patch.object(mod, '_emit_metric'), \
+             patch.object(mod, 'audit_table', mock_audit):
             mod.lambda_handler({}, None)
 
             mock_freeze.assert_called_once()
             mock_email.assert_called_once_with('user@test.com')
+
+            # Verify audit write
+            mock_audit.put_item.assert_called_once()
+            audit_item = mock_audit.put_item.call_args[1]['Item']
+            assert audit_item['event_type'] == 'account_frozen'
+            assert 'timestamp' in audit_item
+            assert 'ttl' in audit_item
 
     def test_freeze_failure_skips_notification(self, mod):
         customer = {
@@ -267,15 +276,24 @@ class TestLambdaHandler:
             'frozen': True,
             'frozen_at': frozen_at,
         }
+        mock_audit = MagicMock()
         with patch.object(mod, 'customers_table', MagicMock()), \
              patch.object(mod, '_get_customers_past_deadline', return_value=[customer]), \
              patch.object(mod, '_downgrade_account', return_value=True) as mock_downgrade, \
              patch.object(mod, '_send_downgrade_notification') as mock_email, \
-             patch.object(mod, '_emit_metric'):
+             patch.object(mod, '_emit_metric'), \
+             patch.object(mod, 'audit_table', mock_audit):
             mod.lambda_handler({}, None)
 
             mock_downgrade.assert_called_once()
             mock_email.assert_called_once_with('user@test.com')
+
+            # Verify audit write
+            mock_audit.put_item.assert_called_once()
+            audit_item = mock_audit.put_item.call_args[1]['Item']
+            assert audit_item['event_type'] == 'account_downgraded'
+            assert 'timestamp' in audit_item
+            assert 'ttl' in audit_item
 
     def test_does_not_downgrade_within_30_days(self, mod):
         frozen_at = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
@@ -292,6 +310,51 @@ class TestLambdaHandler:
             mod.lambda_handler({}, None)
 
             mock_downgrade.assert_not_called()
+
+    def test_freeze_succeeds_when_audit_fails(self, mod):
+        customer = {
+            'auth0_subject': 'auth0|u1',
+            'email': 'user@test.com',
+            'frozen': False,
+            'frozen_at': '',
+        }
+        mock_audit = MagicMock()
+        mock_audit.put_item.side_effect = Exception("DDB throttle")
+        with patch.object(mod, 'customers_table', MagicMock()), \
+             patch.object(mod, '_get_customers_past_deadline', return_value=[customer]), \
+             patch.object(mod, '_freeze_account', return_value=True) as mock_freeze, \
+             patch.object(mod, '_send_freeze_notification'), \
+             patch.object(mod, '_emit_metric'), \
+             patch.object(mod, 'audit_table', mock_audit):
+            resp = mod.lambda_handler({}, None)
+
+            # Freeze should succeed despite audit failure
+            mock_freeze.assert_called_once()
+            body = json.loads(resp['body'])
+            assert body['accounts_frozen'] == 1
+
+    def test_downgrade_succeeds_when_audit_fails(self, mod):
+        frozen_at = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+        customer = {
+            'auth0_subject': 'auth0|u1',
+            'email': 'user@test.com',
+            'frozen': True,
+            'frozen_at': frozen_at,
+        }
+        mock_audit = MagicMock()
+        mock_audit.put_item.side_effect = Exception("DDB throttle")
+        with patch.object(mod, 'customers_table', MagicMock()), \
+             patch.object(mod, '_get_customers_past_deadline', return_value=[customer]), \
+             patch.object(mod, '_downgrade_account', return_value=True) as mock_downgrade, \
+             patch.object(mod, '_send_downgrade_notification'), \
+             patch.object(mod, '_emit_metric'), \
+             patch.object(mod, 'audit_table', mock_audit):
+            resp = mod.lambda_handler({}, None)
+
+            # Downgrade should succeed despite audit failure
+            mock_downgrade.assert_called_once()
+            body = json.loads(resp['body'])
+            assert body['accounts_downgraded'] == 1
 
     def test_emits_metrics(self, mod):
         with patch.object(mod, 'customers_table', MagicMock()), \
