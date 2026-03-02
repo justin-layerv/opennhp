@@ -117,10 +117,10 @@ var _ HealthChecker = (*CloudMapClient)(nil)
 // NewCloudMapClient creates a new Cloud Map client.
 func NewCloudMapClient(ctx context.Context, cfg CloudMapConfig) (*CloudMapClient, error) {
 	if cfg.NamespaceName == "" {
-		return nil, fmt.Errorf("CloudMap NamespaceName is required")
+		return nil, fmt.Errorf("cloudmap namespace name is required")
 	}
 	if cfg.ServiceName == "" {
-		return nil, fmt.Errorf("CloudMap ServiceName is required")
+		return nil, fmt.Errorf("cloudmap service name is required")
 	}
 
 	// Build AWS config options
@@ -212,7 +212,7 @@ func (c *CloudMapClient) refreshCache() (map[string]bool, error) {
 	})
 	if err != nil {
 		log.Warning("Cloud Map DiscoverInstances failed: %v", err)
-		return nil, fmt.Errorf("Cloud Map discovery failed: %w", err)
+		return nil, fmt.Errorf("cloud map discovery failed: %w", err)
 	}
 
 	// Build IP set from discovered instances

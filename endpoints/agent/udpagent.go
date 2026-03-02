@@ -772,7 +772,7 @@ func (a *UdpAgent) StartConfidentialComputing(ztdoId string, taId string, functi
 		if refreshSdp {
 			output, err = a.RefreshDataAccess(ztdoId, decrypted, output)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to refresh SDP: %s", err.Error())
+				return nil, fmt.Errorf("failed to refresh SDP: %w", err)
 			}
 		}
 	}
@@ -787,12 +787,12 @@ func (a *UdpAgent) StartConfidentialComputing(ztdoId string, taId string, functi
 
 	taRes, err := a.CallTrustedApplication(taId, function, params, policyId)
 	if err != nil {
-		return nil, fmt.Errorf("fail to call trusted application with error: %s", err.Error())
+		return nil, fmt.Errorf("failed to call trusted application: %w", err)
 	}
 
 	var structResult map[string]any
 	if err := json.Unmarshal([]byte(taRes), &structResult); err != nil {
-		return nil, fmt.Errorf("fail to unmarshal confidential computing result: %s", err.Error())
+		return nil, fmt.Errorf("failed to unmarshal confidential computing result: %w", err)
 	}
 	return structResult, nil
 }
@@ -846,7 +846,7 @@ func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOut
 		if !decrypted {
 			output, err = utils.GenerateTempFilePath("plaintext-*")
 			if err != nil {
-				return "", fmt.Errorf("Error: fail to generating temporary file path: %w", err)
+				return "", fmt.Errorf("failed to generate temporary file path: %w", err)
 			}
 
 			dataPrkWrapping := ztdolib.DataPrivateKeyWrapping{}
@@ -938,7 +938,7 @@ func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOut
 			a.trustedByNHPDB.Store(false)
 		}
 
-		return "", fmt.Errorf("Error: fail to request ztdo with error: %s.", dagMsg.ErrMsg)
+		return "", fmt.Errorf("failed to request ztdo: %s", dagMsg.ErrMsg)
 	}
 	return output, nil
 }

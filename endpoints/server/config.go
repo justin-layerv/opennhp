@@ -117,7 +117,7 @@ func (s *UdpServer) loadBaseConfig() error {
 
 	// Validate required fields
 	if config.PrivateKeyBase64 == "" {
-		return fmt.Errorf("PrivateKeyBase64 is required in %s", fileName)
+		return fmt.Errorf("privateKeyBase64 is required in %s", fileName)
 	}
 
 	if err = s.updateBaseConfig(config); err != nil {

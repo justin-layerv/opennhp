@@ -79,7 +79,7 @@ func (a *UdpAC) loadBaseConfig() error {
 
 	// Validate required fields before proceeding
 	if conf.PrivateKeyBase64 == "" {
-		return fmt.Errorf("PrivateKeyBase64 is required in %s", fileName)
+		return fmt.Errorf("privateKeyBase64 is required in %s", fileName)
 	}
 
 	if err := a.updateBaseConfig(conf); err != nil {

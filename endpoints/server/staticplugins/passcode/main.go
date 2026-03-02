@@ -352,7 +352,7 @@ func AuthWithHttpRefresh(ctx *gin.Context, action string, req *common.HttpKnockR
 func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelper) (ackMsg *common.ServerKnockAckMsg, err error) {
 	ackMsg = req.Ack
 	if helper == nil {
-		return ackMsg, fmt.Errorf("AuthWithNHP: helper is null")
+		return ackMsg, fmt.Errorf("authWithNHP: helper is null")
 	}
 
 	res, err := resourceHandler.FindResourceByID(req.Msg.ResourceId)
@@ -514,7 +514,7 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		AuthUrl := resourceHandler.GetConfig().AuthUrl
 		if len(AuthUrl) == 0 {
 			log.Error("AuthUrl is not provided.")
-			return nil, "401", fmt.Errorf("AuthUrl is not provided")
+			return nil, "401", fmt.Errorf("auth URL is not provided")
 		}
 
 		resp, err := nhpsdkutils.SendRequest(nhpsdkutils.RequestOptions{

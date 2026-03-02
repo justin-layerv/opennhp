@@ -28,7 +28,7 @@ func customAuthByHmac(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 	secretKey := nhpsdkutils.GetStringFromMap(res.ExInfo, "SecretKey")
 	if len(secretKey) == 0 {
 		log.Error("SecretKey is not provided in ExInfo")
-		return nil, "401", fmt.Errorf("SecretKey is not provided")
+		return nil, "401", fmt.Errorf("secret key is not provided")
 	}
 
 	algorithm := nhpsdkutils.GetStringFromMap(res.ExInfo, "Algorithm")
@@ -84,7 +84,7 @@ func customAuthByHmac(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 
 func customAuthByCode(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, string, error) {
 	if helper == nil {
-		return nil, "400", fmt.Errorf(" authRegular helper is null")
+		return nil, "400", fmt.Errorf("customAuthByCode helper is null")
 	}
 
 	var err error
@@ -94,7 +94,7 @@ func customAuthByCode(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 	AuthUrl := nhpsdkutils.GetStringFromMap(res.ExInfo, "AuthUrl")
 	if len(AuthUrl) == 0 {
 		log.Error("AuthUrl is not provided.")
-		return nil, "401", fmt.Errorf("AuthUrl is not provided")
+		return nil, "401", fmt.Errorf("auth URL is not provided")
 	}
 
 	method := nhpsdkutils.GetStringFromMap(res.ExInfo, "Method")

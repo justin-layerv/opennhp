@@ -73,7 +73,7 @@ func Close() error {
 // to protect against brute-force token guessing attacks.
 func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugins.HttpServerPluginHelper) (ackMsg *common.ServerKnockAckMsg, err error) {
 	if helper == nil {
-		return nil, fmt.Errorf("AuthWithHttp: helper is null")
+		return nil, fmt.Errorf("authWithHTTP: helper is null")
 	}
 
 	// Set CORS headers early so error responses are also CORS-enabled.

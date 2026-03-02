@@ -166,7 +166,7 @@ func findResource(resId string) *common.ResourceData {
 
 func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugins.HttpServerPluginHelper) (ackMsg *common.ServerKnockAckMsg, err error) {
 	if helper == nil {
-		return nil, fmt.Errorf("AuthWithHttp: helper is null")
+		return nil, fmt.Errorf("authWithHTTP: helper is null")
 	}
 
 	resId := ctx.Query("resid")
@@ -353,7 +353,7 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelper) (ackMsg *common.ServerKnockAckMsg, err error) {
 	ackMsg = req.Ack
 	if helper == nil {
-		return ackMsg, fmt.Errorf("AuthWithNHP: helper is null")
+		return ackMsg, fmt.Errorf("authWithNHP: helper is null")
 	}
 
 	var found bool

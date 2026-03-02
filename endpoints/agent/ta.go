@@ -136,7 +136,7 @@ func GetTrustedApplication(trustedAppUuid string) (*TrustedApplication, error) {
 	if ta, exists := bufferedTaMap[trustedAppUuid]; exists {
 		return ta, nil
 	}
-	return nil, fmt.Errorf("TrustedApplication not found, please register first")
+	return nil, fmt.Errorf("trusted application not found, please register first")
 }
 
 func (ta *TrustedApplication) GetSupportedFunctions() []TAFunction {
