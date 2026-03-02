@@ -343,3 +343,47 @@ output "cost_analytics_bucket" {
   description = "S3 bucket for AWS cost data (mgmt account)"
   value       = var.deploy_cost_analytics ? module.cost_analytics[0].cost_data_bucket_name : null
 }
+
+# ============================================================================
+# Billing Outputs
+# ============================================================================
+
+output "billing_api_url" {
+  description = "Billing API Gateway invoke URL"
+  value       = var.deploy_billing ? module.billing[0].api_url : null
+}
+
+output "billing_usage_events_queue_url" {
+  description = "SQS queue URL for billing usage events"
+  value       = var.deploy_billing ? module.billing[0].usage_events_queue_url : null
+}
+
+output "billing_checkout_session_lambda_name" {
+  description = "Billing checkout session Lambda function name"
+  value       = var.deploy_billing ? module.billing[0].checkout_session_lambda_function_name : null
+}
+
+output "billing_stripe_webhook_lambda_name" {
+  description = "Billing Stripe webhook Lambda function name"
+  value       = var.deploy_billing ? module.billing[0].stripe_webhook_lambda_function_name : null
+}
+
+output "billing_usage_reporter_lambda_name" {
+  description = "Billing usage reporter Lambda function name"
+  value       = var.deploy_billing ? module.billing[0].usage_reporter_lambda_function_name : null
+}
+
+output "billing_reconciliation_lambda_name" {
+  description = "Billing reconciliation Lambda function name"
+  value       = var.deploy_billing ? module.billing[0].reconciliation_lambda_function_name : null
+}
+
+output "billing_payment_grace_lambda_name" {
+  description = "Billing payment grace Lambda function name"
+  value       = var.deploy_billing ? module.billing[0].payment_grace_lambda_function_name : null
+}
+
+output "billing_invoices_lambda_name" {
+  description = "Billing invoices Lambda function name"
+  value       = var.deploy_billing ? module.billing[0].invoices_lambda_function_name : null
+}

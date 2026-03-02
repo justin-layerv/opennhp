@@ -1294,13 +1294,23 @@ resource "aws_iam_role_policy" "ci_cross_account_cost_analytics" {
 # root level so it's instantiated exactly once regardless of which modules need
 # API Gateway access logging.
 
+locals {
+  deploy_any_apigw = var.deploy_developer_portal || var.deploy_billing
+
+  # Shared CORS origins for all API Gateway modules (developer portal, billing).
+  # Individual overrides take precedence; fall back to the shared default.
+  dashboard_cors_origins = var.dashboard_allowed_origins
+  billing_cors_origins   = length(var.billing_allowed_origins) > 0 ? var.billing_allowed_origins : local.dashboard_cors_origins
+  devportal_cors_origins = length(var.developer_portal_allowed_origins) > 0 ? var.developer_portal_allowed_origins : local.dashboard_cors_origins
+}
+
 resource "aws_api_gateway_account" "this" {
-  count               = var.deploy_developer_portal ? 1 : 0
+  count               = local.deploy_any_apigw ? 1 : 0
   cloudwatch_role_arn = aws_iam_role.apigateway_logging[0].arn
 }
 
 resource "aws_iam_role" "apigateway_logging" {
-  count = var.deploy_developer_portal ? 1 : 0
+  count = local.deploy_any_apigw ? 1 : 0
   name  = "${local.name_prefix}-apigateway-logging"
 
   assume_role_policy = jsonencode({
@@ -1320,7 +1330,7 @@ resource "aws_iam_role" "apigateway_logging" {
 }
 
 resource "aws_iam_role_policy_attachment" "apigateway_logging" {
-  count      = var.deploy_developer_portal ? 1 : 0
+  count      = local.deploy_any_apigw ? 1 : 0
   role       = aws_iam_role.apigateway_logging[0].name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
 
@@ -1334,7 +1344,7 @@ resource "aws_iam_role_policy_attachment" "apigateway_logging" {
 # stage creation with access_log_settings fails with "Insufficient permissions
 # to enable logging" due to eventual consistency.
 resource "time_sleep" "apigateway_logging_propagation" {
-  count           = var.deploy_developer_portal ? 1 : 0
+  count           = local.deploy_any_apigw ? 1 : 0
   create_duration = "10s"
   depends_on      = [aws_api_gateway_account.this]
 }
@@ -1420,7 +1430,7 @@ module "developer_portal" {
   qurl_api_url = "https://${var.qurl_service_domain}"
   auth0_domain = var.developer_portal_auth0_domain
 
-  allowed_origins = var.developer_portal_allowed_origins
+  allowed_origins = local.devportal_cors_origins
   sns_topic_arn   = module.monitoring.sns_topic_arn
 
   # Custom domain — Route53 record created in root module for cross-account support
@@ -1430,6 +1440,105 @@ module "developer_portal" {
 
   # CI bypass key for integration tests
   ci_bypass_secret_name = var.developer_portal_ci_bypass_secret_name
+}
+
+# ==================== Billing ====================
+# Stripe billing integration: checkout sessions, webhooks, usage reporting,
+# reconciliation, payment grace periods, and invoice retrieval.
+
+# Validate required billing variables before the module is instantiated.
+resource "terraform_data" "billing_preconditions" {
+  count = var.deploy_billing ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = var.billing_stripe_secret_name != null
+      error_message = "billing_stripe_secret_name is required when deploy_billing = true."
+    }
+    precondition {
+      condition     = var.billing_stripe_webhook_secret_name != null
+      error_message = "billing_stripe_webhook_secret_name is required when deploy_billing = true."
+    }
+    precondition {
+      condition     = var.billing_success_url != null
+      error_message = "billing_success_url is required when deploy_billing = true."
+    }
+    precondition {
+      condition     = var.billing_cancel_url != null
+      error_message = "billing_cancel_url is required when deploy_billing = true."
+    }
+    precondition {
+      condition     = length(local.billing_cors_origins) > 0
+      error_message = "billing_allowed_origins (or dashboard_allowed_origins) must contain at least one origin when deploy_billing = true."
+    }
+    precondition {
+      condition     = var.billing_from_email != null
+      error_message = "billing_from_email is required when deploy_billing = true."
+    }
+    precondition {
+      condition     = module.dynamodb.qurl_billing_audit_table_name != null
+      error_message = "QURL DynamoDB tables (including billing_audit) must be deployed when deploy_billing = true. Set deploy_qurl_tables = true."
+    }
+  }
+}
+
+module "billing" {
+  count  = var.deploy_billing ? 1 : 0
+  source = "./modules/billing"
+
+  # Ensure the account-level API GW logging role has propagated before the
+  # module creates a stage with access_log_settings.
+  depends_on = [time_sleep.apigateway_logging_propagation, terraform_data.billing_preconditions]
+
+  environment = var.environment
+  name_prefix = local.name_prefix
+  tags        = merge(local.common_tags, { Service = "billing" })
+
+  # Encryption
+  logs_kms_key_arn     = module.kms.logs_key_arn
+  sqs_kms_key_arn      = module.kms.secrets_key_arn
+  dynamodb_kms_key_arn = module.kms.secrets_key_arn
+
+  # Auth0 / JWT
+  auth0_domain   = var.qurl_auth0_domain
+  auth0_audience = var.qurl_auth0_audience
+
+  # Stripe secrets
+  stripe_secret_name         = var.billing_stripe_secret_name
+  stripe_webhook_secret_name = var.billing_stripe_webhook_secret_name
+  stripe_api_base_url        = var.billing_stripe_api_base_url
+
+  # DynamoDB tables (created by dynamodb module)
+  customers_table_name     = module.dynamodb.qurl_customers_table_name
+  customers_table_arn      = module.dynamodb.qurl_customers_table_arn
+  billing_audit_table_name = coalesce(module.dynamodb.qurl_billing_audit_table_name, "")
+  billing_audit_table_arn  = coalesce(module.dynamodb.qurl_billing_audit_table_arn, "")
+
+  # Stripe Price IDs
+  growth_price_id   = var.billing_growth_price_id
+  base_fee_price_id = var.billing_base_fee_price_id
+
+  # URLs
+  success_url = var.billing_success_url
+  cancel_url  = var.billing_cancel_url
+
+  # CORS (falls back to shared dashboard_allowed_origins if billing-specific not set)
+  allowed_origins = local.billing_cors_origins
+
+  # Email (SES)
+  from_email = var.billing_from_email
+  ses_region = var.billing_ses_region
+
+  # Monitoring
+  sns_topic_arn = module.monitoring.sns_topic_arn
+
+  # Grace period
+  grace_period_days    = var.billing_grace_period_days
+  downgrade_after_days = var.billing_downgrade_after_days
+
+  # Throttling
+  api_throttle_burst_limit = var.billing_api_throttle_burst_limit
+  api_throttle_rate_limit  = var.billing_api_throttle_rate_limit
 }
 
 # ==================== Grafana Cloud Dashboards ====================

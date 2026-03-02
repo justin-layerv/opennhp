@@ -285,6 +285,24 @@ module "nhp" {
   status_page_domain         = var.status_page_domain
   status_page_hosted_zone_id = var.status_page_hosted_zone_id
 
+  # Billing
+  deploy_billing                     = var.deploy_billing
+  billing_stripe_secret_name         = var.billing_stripe_secret_name
+  billing_stripe_webhook_secret_name = var.billing_stripe_webhook_secret_name
+  billing_stripe_api_base_url        = var.billing_stripe_api_base_url
+  billing_growth_price_id            = var.billing_growth_price_id
+  billing_base_fee_price_id          = var.billing_base_fee_price_id
+  billing_success_url                = var.billing_success_url
+  billing_cancel_url                 = var.billing_cancel_url
+  billing_allowed_origins            = var.billing_allowed_origins
+  dashboard_allowed_origins          = var.dashboard_allowed_origins
+  billing_from_email                 = var.billing_from_email
+  billing_ses_region                 = var.billing_ses_region
+  billing_grace_period_days          = var.billing_grace_period_days
+  billing_downgrade_after_days       = var.billing_downgrade_after_days
+  billing_api_throttle_burst_limit   = var.billing_api_throttle_burst_limit
+  billing_api_throttle_rate_limit    = var.billing_api_throttle_rate_limit
+
   # Developer Portal
   deploy_developer_portal                 = var.deploy_developer_portal
   developer_portal_m2m_secret_name        = var.developer_portal_m2m_secret_name
@@ -562,4 +580,15 @@ output "auth0_spa_domain_ssm_arn" {
 output "auth0_spa_api_audience_ssm_arn" {
   description = "ARN of SSM parameter containing API audience (for IAM policies)"
   value       = module.auth0.spa_api_audience_ssm_arn
+}
+
+# Billing outputs
+output "billing_api_url" {
+  description = "Billing API Gateway invoke URL"
+  value       = module.nhp.billing_api_url
+}
+
+output "billing_usage_events_queue_url" {
+  description = "SQS queue URL for billing usage events"
+  value       = module.nhp.billing_usage_events_queue_url
 }

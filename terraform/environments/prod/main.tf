@@ -290,9 +290,14 @@ module "nhp" {
   developer_portal_auth0_mgmt_secret_name = var.developer_portal_auth0_mgmt_secret_name
   developer_portal_auth0_domain           = var.developer_portal_auth0_domain
   developer_portal_allowed_origins        = var.developer_portal_allowed_origins
+  dashboard_allowed_origins               = var.dashboard_allowed_origins
   developer_portal_custom_domain          = var.developer_portal_custom_domain
   developer_portal_hosted_zone_id         = var.developer_portal_hosted_zone_id
   developer_portal_ci_bypass_secret_name  = var.developer_portal_ci_bypass_secret_name
+
+  # Billing — not yet deployed to production.
+  # Wire remaining billing variables here when ready to enable in prod.
+  deploy_billing = var.deploy_billing
 
   # QURL ECS capacity
   qurl_desired_count            = var.qurl_desired_count

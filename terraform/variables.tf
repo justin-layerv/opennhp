@@ -1629,6 +1629,106 @@ variable "developer_portal_ci_bypass_secret_name" {
   default     = null
 }
 
+# ==================== Shared Dashboard CORS ====================
+
+variable "dashboard_allowed_origins" {
+  description = "Default CORS origins shared by all dashboard APIs (developer portal, billing). Individual module vars override this when set."
+  type        = list(string)
+  default     = []
+}
+
+# ==================== Billing ====================
+
+variable "deploy_billing" {
+  description = "Deploy billing infrastructure (Stripe integration, usage reporting, payment grace)"
+  type        = bool
+  default     = false
+}
+
+variable "billing_stripe_secret_name" {
+  description = "Secrets Manager secret name for Stripe API key"
+  type        = string
+  default     = null
+}
+
+variable "billing_stripe_webhook_secret_name" {
+  description = "Secrets Manager secret name for Stripe webhook signing secret"
+  type        = string
+  default     = null
+}
+
+variable "billing_stripe_api_base_url" {
+  description = "Base URL for Stripe API. Override for testing."
+  type        = string
+  default     = "https://api.stripe.com"
+}
+
+variable "billing_growth_price_id" {
+  description = "Stripe Price ID for the Growth plan metered usage component"
+  type        = string
+  default     = ""
+}
+
+variable "billing_base_fee_price_id" {
+  description = "Stripe Price ID for the Growth plan base fee (flat monthly)"
+  type        = string
+  default     = ""
+}
+
+variable "billing_success_url" {
+  description = "URL to redirect to after successful Stripe Checkout"
+  type        = string
+  default     = null
+}
+
+variable "billing_cancel_url" {
+  description = "URL to redirect to when user cancels Stripe Checkout"
+  type        = string
+  default     = null
+}
+
+variable "billing_allowed_origins" {
+  description = "List of allowed CORS origins for billing API"
+  type        = list(string)
+  default     = []
+}
+
+variable "billing_from_email" {
+  description = "SES verified sender email for grace period notifications"
+  type        = string
+  default     = null
+}
+
+variable "billing_ses_region" {
+  description = "AWS region for SES (may differ from deployment region)"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "billing_grace_period_days" {
+  description = "Days after payment failure before account is frozen"
+  type        = number
+  default     = 7
+}
+
+variable "billing_downgrade_after_days" {
+  description = "Days after account freeze before downgrade to free tier"
+  type        = number
+  default     = 30
+}
+
+variable "billing_api_throttle_burst_limit" {
+  description = "API Gateway default throttle burst limit for billing API"
+  type        = number
+  default     = 50
+}
+
+variable "billing_api_throttle_rate_limit" {
+  description = "API Gateway default throttle rate limit for billing API"
+  type        = number
+  default     = 25
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {

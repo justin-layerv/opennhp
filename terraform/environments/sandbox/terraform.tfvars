@@ -401,6 +401,34 @@ status_page_domain         = "status.layerv.xyz"
 status_page_hosted_zone_id = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone
 
 # ==============================================================================
+# Billing Configuration
+# Stripe billing integration for usage-based pricing
+# ==============================================================================
+deploy_billing = true
+
+# Stripe secrets (must be created in Secrets Manager before first apply)
+billing_stripe_secret_name         = "layerv-nhp-sandbox/billing/stripe-api-key"
+billing_stripe_webhook_secret_name = "layerv-nhp-sandbox/billing/stripe-webhook-secret"
+
+# Stripe Price IDs (empty until Stripe products are created in sandbox)
+# billing_growth_price_id   = "price_xxx"
+# billing_base_fee_price_id = "price_xxx"
+
+# Checkout redirect URLs
+billing_success_url = "https://staging.layerv.ai/qurl/dashboard/billing?success=true"
+billing_cancel_url  = "https://staging.layerv.ai/qurl/dashboard/billing?cancelled=true"
+
+# SES sender for payment grace notifications
+billing_from_email = "billing@layerv.ai"
+billing_ses_region = "us-east-1"
+
+# ==============================================================================
+# Shared Dashboard CORS Origins
+# Used by billing and developer portal APIs (per-module vars override if set)
+# ==============================================================================
+dashboard_allowed_origins = ["https://staging.layerv.ai", "http://localhost:3000"]
+
+# ==============================================================================
 # Developer Portal Configuration
 # Playground proxy and credential provisioner for developer experience
 # ==============================================================================
@@ -408,7 +436,6 @@ deploy_developer_portal                 = true
 developer_portal_m2m_secret_name        = "layerv-nhp-sandbox-auth0-backend-credentials"
 developer_portal_auth0_mgmt_secret_name = "layerv-nhp-sandbox/developer-portal/auth0-mgmt"
 developer_portal_auth0_domain           = "auth.layerv.ai"
-developer_portal_allowed_origins        = ["https://staging.layerv.ai", "http://localhost:3000"]
 developer_portal_custom_domain          = "devapi.layerv.xyz"
 developer_portal_hosted_zone_id         = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone
 developer_portal_ci_bypass_secret_name  = "layerv-nhp-sandbox/developer-portal/ci-bypass-key"

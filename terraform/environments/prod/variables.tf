@@ -1209,6 +1209,18 @@ variable "developer_portal_allowed_origins" {
   default     = []
 }
 
+variable "dashboard_allowed_origins" {
+  description = "Default CORS origins shared by all dashboard APIs (developer portal, billing)"
+  type        = list(string)
+  default     = []
+}
+
+variable "deploy_billing" {
+  description = "Deploy billing infrastructure (Stripe integration, usage reporting, payment grace)"
+  type        = bool
+  default     = false
+}
+
 variable "developer_portal_custom_domain" {
   description = "Custom domain for developer portal API"
   type        = string
