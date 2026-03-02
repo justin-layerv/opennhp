@@ -56,22 +56,46 @@ func (w *WebRTCServer) Start() error {
 
 	// if an offer file is provided, perform one-shot signaling using files
 	if w.conf.OfferFile != "" {
-		if offerBytes, err := os.ReadFile(w.conf.OfferFile); err == nil {
-			var offer webrtc.SessionDescription
-			if err := json.Unmarshal(offerBytes, &offer); err == nil {
-				if err := w.pc.SetRemoteDescription(offer); err == nil {
-					answer, err := w.pc.CreateAnswer(nil)
-					if err == nil {
-						if err = w.pc.SetLocalDescription(answer); err == nil {
-							if w.conf.AnswerFile != "" {
-								if data, err := json.Marshal(answer); err == nil {
-									_ = os.WriteFile(w.conf.AnswerFile, data, 0644)
-								}
-							}
-						}
-					}
-				}
-			}
+		if err := w.fileSignaling(); err != nil {
+			log.Error("[WebRTC] file signaling failed: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// fileSignaling performs one-shot SDP exchange via offer/answer files.
+func (w *WebRTCServer) fileSignaling() error {
+	offerBytes, err := os.ReadFile(w.conf.OfferFile)
+	if err != nil {
+		return err
+	}
+
+	var offer webrtc.SessionDescription
+	if err := json.Unmarshal(offerBytes, &offer); err != nil {
+		return err
+	}
+
+	if err := w.pc.SetRemoteDescription(offer); err != nil {
+		return err
+	}
+
+	answer, err := w.pc.CreateAnswer(nil)
+	if err != nil {
+		return err
+	}
+
+	if err := w.pc.SetLocalDescription(answer); err != nil {
+		return err
+	}
+
+	if w.conf.AnswerFile != "" {
+		data, err := json.Marshal(answer)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(w.conf.AnswerFile, data, 0600); err != nil {
+			return err
 		}
 	}
 

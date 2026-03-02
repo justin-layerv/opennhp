@@ -97,16 +97,18 @@ func (a *UdpDevice) updateBaseConfig(file string) (err error) {
 	content, err := os.ReadFile(file)
 	if err != nil {
 		log.Error("failed to read base config: %v", err)
+		return err
 	}
 
 	var conf Config
 	if err := toml.Unmarshal(content, &conf); err != nil {
 		log.Error("failed to unmarshal base config: %v", err)
+		return err
 	}
 	if a.config == nil {
 		a.config = &conf
 		a.log.SetLogLevel(conf.LogLevel)
-		return err
+		return nil
 	}
 
 	// update
@@ -121,7 +123,7 @@ func (a *UdpDevice) updateBaseConfig(file string) (err error) {
 		a.config.DefaultCipherScheme = conf.DefaultCipherScheme
 	}
 
-	return err
+	return nil
 }
 
 func (a *UdpDevice) updateServerPeers(file string) (err error) {
@@ -132,13 +134,14 @@ func (a *UdpDevice) updateServerPeers(file string) (err error) {
 	content, err := os.ReadFile(file)
 	if err != nil {
 		log.Error("failed to read server peer config: %v", err)
+		return err
 	}
 
-	// update
 	var peers Peers
 	serverPeerMap := make(map[string]*core.UdpPeer)
 	if err := toml.Unmarshal(content, &peers); err != nil {
 		log.Error("failed to unmarshal server config: %v", err)
+		return err
 	}
 	for _, p := range peers.Servers {
 		p.Type = core.NHP_DB
@@ -167,11 +170,13 @@ func (a *UdpDevice) updateTEEConfig(file string) (err error) {
 	content, err := os.ReadFile(file)
 	if err != nil {
 		log.Error("failed to read TEE config: %v", err)
+		return err
 	}
 
 	var tees TEEs
 	if err := toml.Unmarshal(content, &tees); err != nil {
 		log.Error("failed to unmarshal TEE config: %v", err)
+		return err
 	}
 
 	teeMap := make(map[string]*TEE)
