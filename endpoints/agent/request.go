@@ -11,6 +11,20 @@ import (
 
 // note: code in request.go is for nhp-agent to send request to nhp-server.
 
+// resolveServerAddr validates the server peer and returns its UDP send address.
+func resolveServerAddr(peer *core.UdpPeer, userId, funcName string) (*net.UDPAddr, error) {
+	if peer == nil {
+		log.Critical("agent(%s)[%s] server is not assigned", userId, funcName)
+		return nil, common.ErrKnockServerNotFound
+	}
+	sendAddr := peer.SendAddr()
+	if sendAddr == nil {
+		log.Critical("agent(%s)[%s] server IP cannot be parsed", userId, funcName)
+		return nil, common.ErrKnockServerNotFound
+	}
+	return sendAddr.(*net.UDPAddr), nil
+}
+
 // newMsgData creates a MsgData with common agent fields pre-populated.
 // Callers should set ResponseMsgCh or EncryptedPktCh as needed.
 func (a *UdpAgent) newMsgData(addr *net.UDPAddr, headerType int, msg []byte, peerPk []byte) *core.MsgData {
@@ -38,18 +52,12 @@ func (a *UdpAgent) RequestOtp(target *KnockTarget) error {
 	otpBytes, _ := json.Marshal(otpMsg)
 
 	serverPeer := target.GetServerPeer()
-	if serverPeer == nil {
-		log.Critical("agent(%s)[RequestOtp] server is not assigned", otpMsg.UserId)
-		return common.ErrKnockServerNotFound
+	addr, err := resolveServerAddr(serverPeer, otpMsg.UserId, "RequestOtp")
+	if err != nil {
+		return err
 	}
 
-	sendAddr := serverPeer.SendAddr()
-	if sendAddr == nil {
-		log.Critical("agent(%s)[RequestOtp] server IP cannot be parsed", otpMsg.UserId)
-		return common.ErrKnockServerNotFound
-	}
-
-	otpMd := a.newMsgData(sendAddr.(*net.UDPAddr), core.NHP_OTP, otpBytes, serverPeer.PublicKey())
+	otpMd := a.newMsgData(addr, core.NHP_OTP, otpBytes, serverPeer.PublicKey())
 
 	if !a.IsRunning() {
 		log.Error("agent(%s#%d)[RequestOtp] MsgData channel closed or being closed, skip sending", otpMsg.UserId, otpMd.TransactionId)
@@ -77,19 +85,13 @@ func (a *UdpAgent) RegisterPublicKey(otp string, target *KnockTarget) (rakMsg *c
 	regBytes, _ := json.Marshal(regMsg)
 
 	serverPeer := target.GetServerPeer()
-	if serverPeer == nil {
-		log.Critical("agent(%s)[RegisterPublicKey] server is not assigned", regMsg.UserId)
-		return nil, common.ErrKnockServerNotFound
+	addr, err := resolveServerAddr(serverPeer, regMsg.UserId, "RegisterPublicKey")
+	if err != nil {
+		return nil, err
 	}
+	addrStr := addr.String()
 
-	sendAddr := serverPeer.SendAddr()
-	if sendAddr == nil {
-		log.Critical("agent(%s)[RegisterPublicKey] server IP cannot be parsed", regMsg.UserId)
-		return nil, common.ErrKnockServerNotFound
-	}
-	addrStr := sendAddr.String()
-
-	regMd := a.newMsgData(sendAddr.(*net.UDPAddr), core.NHP_REG, regBytes, serverPeer.PublicKey())
+	regMd := a.newMsgData(addr, core.NHP_REG, regBytes, serverPeer.PublicKey())
 	regMd.ResponseMsgCh = make(chan *core.PacketParserData)
 
 	if !a.IsRunning() {
@@ -146,19 +148,13 @@ func (a *UdpAgent) ListResource(target *KnockTarget) (lrtMsg *common.ServerListR
 	lstBytes, _ := json.Marshal(lstMsg)
 
 	serverPeer := target.GetServerPeer()
-	if serverPeer == nil {
-		log.Critical("agent(%s)[ListResource] server is not assigned", lstMsg.UserId)
-		return nil, common.ErrKnockServerNotFound
+	addr, err := resolveServerAddr(serverPeer, lstMsg.UserId, "ListResource")
+	if err != nil {
+		return nil, err
 	}
+	addrStr := addr.String()
 
-	sendAddr := serverPeer.SendAddr()
-	if sendAddr == nil {
-		log.Critical("agent(%s)[ListResource] server IP cannot be parsed", lstMsg.UserId)
-		return nil, common.ErrKnockServerNotFound
-	}
-	addrStr := sendAddr.String()
-
-	lstMd := a.newMsgData(sendAddr.(*net.UDPAddr), core.NHP_LST, lstBytes, serverPeer.PublicKey())
+	lstMd := a.newMsgData(addr, core.NHP_LST, lstBytes, serverPeer.PublicKey())
 	lstMd.ResponseMsgCh = make(chan *core.PacketParserData)
 
 	if !a.IsRunning() {

@@ -52,17 +52,11 @@ func (a *UdpAgent) Knock(res *KnockTarget) (ackMsg *common.ServerKnockAckMsg, er
 
 func (a *UdpAgent) knockRequest(res *KnockTarget, useCookie bool) (ackMsg *common.ServerKnockAckMsg, err error) {
 	serverPeer := res.GetServerPeer()
-	if serverPeer == nil {
-		log.Critical("agent(%s)[KnockRequest] knock server is not assigned", a.knockUser.UserId)
-		return nil, common.ErrKnockServerNotFound
+	addr, err := resolveServerAddr(serverPeer, a.knockUser.UserId, "KnockRequest")
+	if err != nil {
+		return nil, err
 	}
-
-	sendAddr := serverPeer.SendAddr()
-	if sendAddr == nil {
-		log.Critical("agent(%s)[KnockRequest] knock server IP cannot be parsed", a.knockUser.UserId)
-		return nil, common.ErrKnockServerNotFound
-	}
-	addrStr := sendAddr.String()
+	addrStr := addr.String()
 
 	a.knockUserMutex.RLock()
 	knkMsg := &common.AgentKnockMsg{
@@ -81,7 +75,7 @@ func (a *UdpAgent) knockRequest(res *KnockTarget, useCookie bool) (ackMsg *commo
 	if useCookie {
 		headerType = core.NHP_RKN
 	}
-	knkMd := a.newMsgData(sendAddr.(*net.UDPAddr), headerType, knkBytes, serverPeer.PublicKey())
+	knkMd := a.newMsgData(addr, headerType, knkBytes, serverPeer.PublicKey())
 	knkMd.ResponseMsgCh = make(chan *core.PacketParserData)
 
 	ackMsg = &common.ServerKnockAckMsg{}
@@ -144,17 +138,11 @@ func (a *UdpAgent) knockRequest(res *KnockTarget, useCookie bool) (ackMsg *commo
 
 func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnockAckMsg, err error) {
 	serverPeer := res.GetServerPeer()
-	if serverPeer == nil {
-		log.Critical("agent(%s)[ExitKnockRequest] knock server is not assigned", a.knockUser.UserId)
-		return nil, common.ErrKnockServerNotFound
+	addr, err := resolveServerAddr(serverPeer, a.knockUser.UserId, "ExitKnockRequest")
+	if err != nil {
+		return nil, err
 	}
-
-	sendAddr := serverPeer.SendAddr()
-	if sendAddr == nil {
-		log.Critical("agent(%s)[ExitKnockRequest] knock server IP cannot be parsed", a.knockUser.UserId)
-		return nil, common.ErrKnockServerNotFound
-	}
-	addrStr := sendAddr.String()
+	addrStr := addr.String()
 
 	a.knockUserMutex.RLock()
 	knkMsg := &common.AgentKnockMsg{
@@ -169,7 +157,7 @@ func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnoc
 	a.knockUserMutex.RUnlock()
 
 	knkBytes, _ := json.Marshal(knkMsg)
-	knkMd := a.newMsgData(sendAddr.(*net.UDPAddr), core.NHP_EXT, knkBytes, serverPeer.PublicKey())
+	knkMd := a.newMsgData(addr, core.NHP_EXT, knkBytes, serverPeer.PublicKey())
 	knkMd.ResponseMsgCh = make(chan *core.PacketParserData)
 
 	ackMsg = &common.ServerKnockAckMsg{}
@@ -359,17 +347,11 @@ func (a *UdpAgent) processPreAccessAction(info *common.PreAccessInfo) error {
 
 func (a *UdpAgent) KnockDHP() (ackMsg *common.ServerDHPKnockAckMsg, err error) {
 	serverPeer := a.GetFirstServerPeer()
-	if serverPeer == nil {
-		log.Critical("agent(%s)[KnockDHP] knock server is not assigned", a.knockUser.UserId)
-		return nil, common.ErrKnockServerNotFound
+	addr, err := resolveServerAddr(serverPeer, a.knockUser.UserId, "KnockDHP")
+	if err != nil {
+		return nil, err
 	}
-
-	sendAddr := serverPeer.SendAddr()
-	if sendAddr == nil {
-		log.Critical("agent(%s)[KnockDHP] knock server IP cannot be parsed", a.knockUser.UserId)
-		return nil, common.ErrKnockServerNotFound
-	}
-	addrStr := sendAddr.String()
+	addrStr := addr.String()
 
 	evidence, err := wasmEngine.GetEvidence()
 	if err != nil {
@@ -388,7 +370,7 @@ func (a *UdpAgent) KnockDHP() (ackMsg *common.ServerDHPKnockAckMsg, err error) {
 	a.knockUserMutex.RUnlock()
 
 	knkBytes, _ := json.Marshal(knkMsg)
-	knkMd := a.newMsgData(sendAddr.(*net.UDPAddr), core.DHP_KNK, knkBytes, serverPeer.PublicKey())
+	knkMd := a.newMsgData(addr, core.DHP_KNK, knkBytes, serverPeer.PublicKey())
 	knkMd.ResponseMsgCh = make(chan *core.PacketParserData)
 
 	ackMsg = &common.ServerDHPKnockAckMsg{}
