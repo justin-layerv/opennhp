@@ -50,7 +50,7 @@ func registerHandler(handler resource.ResourceHandler) error {
 	return nil
 }
 func Version() string {
-	return fmt.Sprintf("%s v%s", name, version)
+	return name + " v" + version
 }
 
 func Signature() string {

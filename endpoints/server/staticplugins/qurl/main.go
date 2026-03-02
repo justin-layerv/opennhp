@@ -29,7 +29,7 @@ var (
 
 // Version returns the plugin version string
 func Version() string {
-	return fmt.Sprintf("%s v%s", name, version)
+	return name + " v" + version
 }
 
 // Init initializes the QURL plugin with configuration.

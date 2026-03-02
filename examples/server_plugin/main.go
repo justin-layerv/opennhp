@@ -50,7 +50,7 @@ var (
 )
 
 func Version() string {
-	return fmt.Sprintf("%s v%s", name, version)
+	return name + " v" + version
 }
 
 func Init(in *plugins.PluginParamsIn) error {

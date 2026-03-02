@@ -28,7 +28,7 @@ var (
 )
 
 func Version() string {
-	return fmt.Sprintf("%s v%s", name, version)
+	return name + " v" + version
 }
 
 func registerHandler(handler resource.ResourceHandler) error {

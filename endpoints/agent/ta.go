@@ -14,7 +14,7 @@ import (
 )
 
 var (
-	taApiPrefix    = fmt.Sprintf("%s/ta", serviceApiPrefix)
+	taApiPrefix    = serviceApiPrefix + "/ta"
 	bufferedTaMap  = make(map[string]*TrustedApplication)
 	bufferedTaLock sync.Mutex
 )
@@ -92,7 +92,7 @@ func NewTrustApplication(tadId string, language string, entry string) (*TrustedA
 	for _, tool := range toolsResult.Tools {
 		taFunc := TAFunction{
 			Method:      "POST",
-			Name:        fmt.Sprintf("%s/%s/%s", taApiPrefix, ta.Id, tool.Name),
+			Name:        taApiPrefix + "/" + ta.Id + "/" + tool.Name,
 			Description: tool.Description,
 			Params: []TAFunctionParam{
 				{

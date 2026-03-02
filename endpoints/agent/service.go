@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -49,21 +48,21 @@ func (a *UdpAgent) CreateDHPWebConsole() {
 
 	router.Use(a.CheckAgentSafeOrNot(taApiPrefix))
 
-	router.POST(fmt.Sprintf("%s/%s", serviceApiPrefix, "config/server"), a.configServer)
-	router.GET(fmt.Sprintf("%s/%s", serviceApiPrefix, "config/server"), a.getServerConfig)
+	router.POST(serviceApiPrefix+"/config/server", a.configServer)
+	router.GET(serviceApiPrefix+"/config/server", a.getServerConfig)
 
-	router.GET(fmt.Sprintf("%s/%s", serviceApiPrefix, "key/agent"), a.getAgentPublicKey)
-	router.GET(fmt.Sprintf("%s/%s", serviceApiPrefix, "key/tee"), a.getTeePublicKey)
-	router.POST(fmt.Sprintf("%s/%s", serviceApiPrefix, "key/agent/rotate"), a.rotateAgentKey)
-	router.POST(fmt.Sprintf("%s/%s", serviceApiPrefix, "key/tee/rotate"), a.rotateTeeKey)
+	router.GET(serviceApiPrefix+"/key/agent", a.getAgentPublicKey)
+	router.GET(serviceApiPrefix+"/key/tee", a.getTeePublicKey)
+	router.POST(serviceApiPrefix+"/key/agent/rotate", a.rotateAgentKey)
+	router.POST(serviceApiPrefix+"/key/tee/rotate", a.rotateTeeKey)
 
-	router.GET(fmt.Sprintf("%s/%s", serviceApiPrefix, "agent/restart"), a.restartAgent)
+	router.GET(serviceApiPrefix+"/agent/restart", a.restartAgent)
 
-	router.GET(fmt.Sprintf("%s/%s", serviceApiPrefix, "status/agent"), a.getTeeStatus)
+	router.GET(serviceApiPrefix+"/status/agent", a.getTeeStatus)
 
-	router.GET(fmt.Sprintf("%s/%s", serviceApiPrefix, "attestation/tee"), a.getTeeAttestation)
+	router.GET(serviceApiPrefix+"/attestation/tee", a.getTeeAttestation)
 
-	router.POST(fmt.Sprintf("%s/%s", taApiPrefix, "register"), a.registerTAService)
+	router.POST(taApiPrefix+"/register", a.registerTAService)
 
 	// Dynamic route handler - this catches all requests and checks our dynamic routes
 	router.NoRoute(func(c *gin.Context) {
