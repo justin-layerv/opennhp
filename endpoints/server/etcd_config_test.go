@@ -254,7 +254,9 @@ PubKeyBase64 = "c2VydmVycHVia2V5"
 
 	// The fix: only call updateACPeers if ACs > 0
 	if len(cfg.ACs) > 0 {
-		server.updateACPeers(cfg.ACs)
+		if err := server.updateACPeers(cfg.ACs); err != nil {
+			t.Fatalf("updateACPeers failed: %v", err)
+		}
 		t.Log("updateACPeers was called (ACs defined in config)")
 	} else {
 		t.Log("updateACPeers was SKIPPED (no ACs in config) - this is the fix!")
@@ -301,7 +303,9 @@ func TestUpdateACPeers_UpdatesPeers_WhenACsDefinedInEtcd(t *testing.T) {
 		PubKeyBase64: "aW5pdGlhbHBlZXI=", // "initialpeer"
 		ExpireTime:   common.FarFutureExpiry,
 	}
-	server.updateACPeers([]*core.UdpPeer{initialPeer})
+	if err := server.updateACPeers([]*core.UdpPeer{initialPeer}); err != nil {
+		t.Fatalf("updateACPeers failed: %v", err)
+	}
 
 	if len(server.acPeerMap) != 1 {
 		t.Fatalf("Setup failed: expected 1 peer, got %d", len(server.acPeerMap))
@@ -322,7 +326,9 @@ ExpireTime = 1924991999
 	// When [[ACs]] is defined, updateACPeers SHOULD be called
 	if len(cfg.ACs) > 0 {
 		t.Logf("Config has %d ACs defined, calling updateACPeers", len(cfg.ACs))
-		server.updateACPeers(cfg.ACs)
+		if err := server.updateACPeers(cfg.ACs); err != nil {
+			t.Fatalf("updateACPeers failed: %v", err)
+		}
 	} else {
 		t.Error("Expected ACs to be defined in config")
 	}

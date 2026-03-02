@@ -47,8 +47,14 @@ func TestECCSharedKey(t *testing.T) {
 		" and install a pre-built Qt for Windows, follow the instructions on the Getting Started with Qt page."
 
 	for i := 0; i < 10; i++ {
-		ecdh := core.NewECDH(core.ECC_CURVE25519)
-		ecdhr := core.NewECDH(core.ECC_CURVE25519)
+		ecdh, err := core.NewECDH(core.ECC_CURVE25519)
+		if err != nil {
+			t.Fatalf("NewECDH failed: %v", err)
+		}
+		ecdhr, err := core.NewECDH(core.ECC_CURVE25519)
+		if err != nil {
+			t.Fatalf("NewECDH failed: %v", err)
+		}
 
 		ssc := ecdh.SharedSecret(ecdhr.PublicKey())
 		sss := ecdhr.SharedSecret(ecdh.PublicKey())

@@ -338,10 +338,18 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		if err := s.loadRemoteConfig(); err != nil {
 			log.Info("Remote config not loaded from etcd (key may not exist): %v", err)
 			// Fall back to local config files for HTTP, peers, resources
-			s.loadPeers()
-			s.loadHttpConfig()
-			s.loadSourceIps()
-			s.loadResources()
+			if loadErr := s.loadPeers(); loadErr != nil {
+				log.Error("failed to load peers: %v", loadErr)
+			}
+			if loadErr := s.loadHttpConfig(); loadErr != nil {
+				log.Error("failed to load HTTP config: %v", loadErr)
+			}
+			if loadErr := s.loadSourceIps(); loadErr != nil {
+				log.Error("failed to load source IPs: %v", loadErr)
+			}
+			if loadErr := s.loadResources(); loadErr != nil {
+				log.Error("failed to load resources: %v", loadErr)
+			}
 		}
 
 		// Load AC registry - per-instance AC keys registered dynamically
@@ -353,15 +361,23 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		}
 	} else {
 		// load peers
-		s.loadPeers()
+		if err := s.loadPeers(); err != nil {
+			log.Error("failed to load peers: %v", err)
+		}
 
 		// load http config and turn on http server if needed
-		s.loadHttpConfig()
+		if err := s.loadHttpConfig(); err != nil {
+			log.Error("failed to load HTTP config: %v", err)
+		}
 
 		// load ip associated addresses
-		s.loadSourceIps()
+		if err := s.loadSourceIps(); err != nil {
+			log.Error("failed to load source IPs: %v", err)
+		}
 
-		s.loadResources()
+		if err := s.loadResources(); err != nil {
+			log.Error("failed to load resources: %v", err)
+		}
 	}
 
 	s.remoteConnectionMap = make(map[string]*UdpConn)
@@ -407,7 +423,7 @@ func (s *UdpServer) Stop() {
 	}
 	// Close storage backend
 	if s.storage != nil {
-		s.storage.Close()
+		_ = s.storage.Close()
 	}
 	// Stop forwarder cleanup routine
 	if s.forwarder != nil {
@@ -418,7 +434,7 @@ func (s *UdpServer) Stop() {
 		s.metrics.Stop()
 	}
 	close(s.signals.stop)
-	s.listenConn.Close()
+	_ = s.listenConn.Close()
 	s.device.Stop()
 	s.StopConfigWatch()
 	s.wg.Wait()
@@ -780,7 +796,9 @@ func (s *UdpServer) connectionRoutine(conn *UdpConn) {
 			if pkt == nil {
 				continue
 			}
-			s.SendPacket(pkt, conn)
+			if _, sendErr := s.SendPacket(pkt, conn); sendErr != nil {
+				log.Error("failed to send packet to %s: %v", conn.ConnData.RemoteAddr.String(), sendErr)
+			}
 		}
 	}
 }
@@ -889,29 +907,61 @@ func (s *UdpServer) recvMessageRoutine() {
 			switch ppd.HeaderType {
 			case core.NHP_KNK, core.NHP_RKN, core.NHP_EXT, core.DHP_KNK:
 				// aynchronously process knock messages with ack response
-				go s.HandleKnockRequest(ppd)
+				go func() {
+					if knockErr := s.HandleKnockRequest(ppd); knockErr != nil {
+						log.Error("HandleKnockRequest failed: %v", knockErr)
+					}
+				}()
 
 			case core.NHP_AOL:
 				// synchronously block and deal with NHP_DOL to ensure future ac messages will be correctly processed. Don't use go routine
-				s.HandleACOnline(ppd)
+				if err := s.HandleACOnline(ppd); err != nil {
+					log.Error("HandleACOnline failed: %v", err)
+				}
 
 			case core.NHP_DOL:
-				s.HandleDBOnline(ppd)
+				if err := s.HandleDBOnline(ppd); err != nil {
+					log.Error("HandleDBOnline failed: %v", err)
+				}
 
 			case core.NHP_OTP:
-				go s.HandleOTPRequest(ppd)
+				go func() {
+					if otpErr := s.HandleOTPRequest(ppd); otpErr != nil {
+						log.Error("HandleOTPRequest failed: %v", otpErr)
+					}
+				}()
 
 			case core.NHP_REG:
-				go s.HandleRegisterRequest(ppd)
+				go func() {
+					if regErr := s.HandleRegisterRequest(ppd); regErr != nil {
+						log.Error("HandleRegisterRequest failed: %v", regErr)
+					}
+				}()
 
 			case core.NHP_LST:
-				go s.HandleListRequest(ppd)
+				go func() {
+					if listErr := s.HandleListRequest(ppd); listErr != nil {
+						log.Error("HandleListRequest failed: %v", listErr)
+					}
+				}()
 			case core.NHP_DAR:
-				go s.HandleDHPDARMessage(ppd)
+				go func() {
+					if darErr := s.HandleDHPDARMessage(ppd); darErr != nil {
+						log.Error("HandleDHPDARMessage failed: %v", darErr)
+					}
+				}()
 			case core.NHP_DRG:
-				go s.HandleDHPDRGMessage(ppd)
+				go func() {
+					if drgErr := s.HandleDHPDRGMessage(ppd); drgErr != nil {
+						log.Error("HandleDHPDRGMessage failed: %v", drgErr)
+					}
+				}()
 			case core.NHP_DAV:
-				go s.HandleDHPDAVMessage(ppd)
+				go func() {
+					if davErr := s.HandleDHPDAVMessage(ppd); davErr != nil {
+						log.Error("HandleDHPDAVMessage failed: %v", davErr)
+					}
+				}()
 
 			// Server-to-server forwarding
 			case core.NHP_FWD:
@@ -1044,7 +1094,9 @@ func (s *UdpServer) LoadPlugin(pluginId string, h plugins.PluginHandler) error {
 	oldHandler, found := s.pluginHandlerMap[pluginId]
 	s.pluginHandlerMapMutex.RUnlock()
 	if found {
-		oldHandler.Close()
+		if closeErr := oldHandler.Close(); closeErr != nil {
+			log.Error("failed to close old plugin handler %s: %v", pluginId, closeErr)
+		}
 	}
 
 	pluginDirPath := filepath.Join(ExeDirPath, "plugins", pluginId)
@@ -1076,7 +1128,9 @@ func (s *UdpServer) ClosePlugins() {
 
 	for id, handler := range s.pluginHandlerMap {
 		log.Info("closing plugin: %s", id)
-		handler.Close()
+		if closeErr := handler.Close(); closeErr != nil {
+			log.Error("failed to close plugin %s: %v", id, closeErr)
+		}
 	}
 }
 

@@ -579,7 +579,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 
 func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, dstAddrs []*common.NetAddress, openTimeSec int) {
 	defer a.wg.Done()
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	// accept only the first incoming tcp connection
 	startTime := time.Now()
@@ -596,7 +596,7 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 		return
 	}
 
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	err = conn.SetDeadline(deadlineTime)
 	if err != nil {
 		log.Error("[tcpTempAccessHandler] temporary port on %s failed to set tcp conn timeout", localAddrStr)
@@ -713,7 +713,7 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 
 func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs []*common.NetAddress, openTimeSec int) {
 	defer a.wg.Done()
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	// listen to accept and handle only one incoming connection
 	startTime := time.Now()
 	deadlineTime := startTime.Add(time.Duration(timeoutSec) * time.Second)
@@ -878,7 +878,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 func (a *UdpAC) tempConnTerminator(conn net.Conn, ctx context.Context) {
 	select {
 	case <-a.signals.stop:
-		conn.Close()
+		_ = conn.Close()
 		return
 
 	case <-ctx.Done():

@@ -91,7 +91,9 @@ func (a *UdpAC) loadBaseConfig() error {
 		log.Info("base config: %s has been updated", fileName)
 		if content, err = a.loadConfigFile(fileName); err == nil {
 			if err = toml.Unmarshal(content, &conf); err == nil {
-				a.updateBaseConfig(conf)
+				if updateErr := a.updateBaseConfig(conf); updateErr != nil {
+					log.Error("failed to apply base config update: %v", updateErr)
+				}
 			}
 
 		}
@@ -124,7 +126,9 @@ func (a *UdpAC) loadHttpConfig() error {
 		log.Info("http config: %s has been updated", fileName)
 		if content, err = a.loadConfigFile(fileName); err == nil {
 			if err = toml.Unmarshal(content, &httpConf); err == nil {
-				a.updateHttpConfig(httpConf)
+				if updateErr := a.updateHttpConfig(httpConf); updateErr != nil {
+					log.Error("failed to apply http config update: %v", updateErr)
+				}
 			}
 		}
 	})
@@ -159,7 +163,9 @@ func (a *UdpAC) loadPeers() error {
 		log.Info("server peer config: %s has been updated", fileName)
 		if content, err = a.loadConfigFile(fileName); err == nil {
 			if err = toml.Unmarshal(content, &peers); err == nil {
-				a.updateServerPeers(peers.Servers)
+				if updateErr := a.updateServerPeers(peers.Servers); updateErr != nil {
+					log.Error("failed to apply server peers update: %v", updateErr)
+				}
 			}
 		}
 	})
@@ -282,7 +288,7 @@ func (a *UdpAC) IpPassMode() int {
 func (a *UdpAC) StopConfigWatch() {
 	for _, w := range []io.Closer{baseConfigWatch, httpConfigWatch, serverPeerWatch} {
 		if w != nil {
-			w.Close()
+			_ = w.Close()
 		}
 	}
 }

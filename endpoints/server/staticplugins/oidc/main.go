@@ -202,7 +202,9 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		session.Set("profile", profile)
 
 		log.Info("User profile: %+v", profile)
-		session.Save()
+		if saveErr := session.Save(); saveErr != nil {
+			log.Error("failed to save session: %v", saveErr)
+		}
 	} else {
 		// if no authorize code exists, try extract the oauth token from the session
 		oauthToken := session.Get("oauth_token")
@@ -229,7 +231,9 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		session.Set("oauth_token", *oktaToken)
 		session.Set("profile", profile)
 		log.Info("User profile: %+v", profile)
-		session.Save()
+		if saveErr := session.Save(); saveErr != nil {
+			log.Error("failed to save session: %v", saveErr)
+		}
 	}
 	resp := &nhpplugins.RefreshResponse{}
 	// interact with udp server for ac operation

@@ -47,7 +47,10 @@ func main() {
 		Name:  "keygen",
 		Usage: "generate key pairs for NHP devices",
 		Action: func(c *cli.Context) error {
-			e := core.NewECDH(core.ECC_CURVE25519)
+			e, err := core.NewECDH(core.ECC_CURVE25519)
+			if err != nil {
+				return fmt.Errorf("failed to generate key pair: %w", err)
+			}
 			pub := e.PublicKeyBase64()
 			priv := e.PrivateKeyBase64()
 			fmt.Println("Private key: ", priv)

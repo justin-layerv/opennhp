@@ -133,7 +133,7 @@ func (n *E2ETestNode) Stop() {
 	close(n.done)
 
 	// Close UDP connection to unblock read loop
-	n.udpConn.Close()
+	_ = n.udpConn.Close()
 
 	// Wait for all goroutines to exit BEFORE closing connections
 	// This prevents the race between connectionSendLoop and conn.Close()
@@ -257,10 +257,13 @@ func (n *E2ETestNode) udpReceiveLoop() {
 		default:
 		}
 
-		n.udpConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		if err := n.udpConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+			return
+		}
 		numBytes, from, err := n.udpConn.ReadFromUDP(buf)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
 				continue
 			}
 			select {
@@ -672,7 +675,10 @@ func TestE2E_ForwarderIntegration(t *testing.T) {
 		}
 
 		var fwdMsg common.ServerForwardMsg
-		json.Unmarshal(msg.Data, &fwdMsg)
+		if err := json.Unmarshal(msg.Data, &fwdMsg); err != nil {
+			t.Errorf("NodeB: failed to unmarshal NHP_FWD: %v", err)
+			return
+		}
 		t.Logf("NodeB received forward for txID=%d", fwdMsg.TransactionId)
 
 		// Send success response
@@ -1282,7 +1288,9 @@ func TestE2E_HandleForwardRequest_FullACFlow(t *testing.T) {
 			// Send NHP_ART response back to server
 			// Use the same transaction ID from the request
 			if msg.PPD != nil {
-				mockAC.SendMessage(serverNode, core.NHP_ART, msg.PPD.SenderTrxId, artBytes, msg.PPD)
+				if err := mockAC.SendMessage(serverNode, core.NHP_ART, msg.PPD.SenderTrxId, artBytes, msg.PPD); err != nil {
+					t.Errorf("Mock AC: failed to send NHP_ART: %v", err)
+				}
 			}
 		}
 	})
@@ -1844,7 +1852,9 @@ func TestE2E_HandleForwardRequest_MultipleClients(t *testing.T) {
 			artBytes, _ := json.Marshal(artMsg)
 
 			if msg.PPD != nil {
-				mockAC.SendMessage(serverNode, core.NHP_ART, msg.PPD.SenderTrxId, artBytes, msg.PPD)
+				if err := mockAC.SendMessage(serverNode, core.NHP_ART, msg.PPD.SenderTrxId, artBytes, msg.PPD); err != nil {
+					t.Errorf("Mock AC: failed to send NHP_ART: %v", err)
+				}
 			}
 		}
 	})
@@ -2099,7 +2109,10 @@ func TestE2E_ForwardIntegration_HealthTracking(t *testing.T) {
 			requestMu.Unlock()
 
 			var fwdMsg common.ServerForwardMsg
-			json.Unmarshal(msg.Data, &fwdMsg)
+			if err := json.Unmarshal(msg.Data, &fwdMsg); err != nil {
+				t.Errorf("NodeA: failed to unmarshal NHP_FWD: %v", err)
+				return
+			}
 			t.Logf("NodeA received forward (responding)")
 
 			resultMsg := &common.ServerForwardResultMsg{
@@ -2126,7 +2139,10 @@ func TestE2E_ForwardIntegration_HealthTracking(t *testing.T) {
 			requestMu.Unlock()
 
 			var fwdMsg common.ServerForwardMsg
-			json.Unmarshal(msg.Data, &fwdMsg)
+			if err := json.Unmarshal(msg.Data, &fwdMsg); err != nil {
+				t.Errorf("NodeB: failed to unmarshal NHP_FWD: %v", err)
+				return
+			}
 			t.Logf("NodeB received forward (responding)")
 
 			resultMsg := &common.ServerForwardResultMsg{

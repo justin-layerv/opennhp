@@ -118,7 +118,7 @@ func (conn *EtcdConn) WatchValue(callbackFunc func(val []byte)) {
 				}
 			}
 		case <-conn.signals.stop:
-			conn.watcher.Close()
+			_ = conn.watcher.Close()
 			return
 		}
 	}
@@ -131,7 +131,7 @@ func (conn *EtcdConn) Close() {
 		if conn.signals.stop != nil {
 			close(conn.signals.stop)
 		}
-		conn.client.Close()
+		_ = conn.client.Close()
 	}
 }
 
@@ -192,7 +192,7 @@ func (conn *EtcdConn) WatchPrefix(prefix string, callbacks WatchPrefixCallbacks)
 				}
 			}
 		case <-conn.signals.stop:
-			watcher.Close()
+			_ = watcher.Close()
 			return
 		}
 	}

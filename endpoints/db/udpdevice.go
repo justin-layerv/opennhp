@@ -108,7 +108,7 @@ type UdpConn struct {
 }
 
 func (c *UdpConn) Close() {
-	c.netConn.Close()
+	_ = c.netConn.Close()
 	c.ConnData.Close()
 }
 
@@ -150,10 +150,14 @@ func (a *UdpDevice) Start(dirPath string, logLevel int) (err error) {
 	a.serverPeerMap = make(map[string]*core.UdpPeer)
 
 	// load peers
-	a.loadPeers()
+	if err := a.loadPeers(); err != nil {
+		log.Error("failed to load peers: %v", err)
+	}
 
 	// load TEEs
-	a.loadTEEs()
+	if err := a.loadTEEs(); err != nil {
+		log.Error("failed to load TEEs: %v", err)
+	}
 
 	a.signals.stop = make(chan struct{})
 	a.signals.serverMapUpdated = make(chan struct{}, 1)
@@ -404,7 +408,9 @@ func (a *UdpDevice) connectionRoutine(conn *UdpConn) {
 			if pkt == nil {
 				continue
 			}
-			a.SendPacket(pkt, conn)
+			if _, sendErr := a.SendPacket(pkt, conn); sendErr != nil {
+				log.Error("failed to send packet to %s: %v", addrStr, sendErr)
+			}
 
 		case pkt, ok := <-conn.ConnData.RecvQueue:
 			if !ok {
@@ -468,7 +474,11 @@ func (a *UdpDevice) recvMessageRoutine() {
 			case core.NHP_DWR:
 				// deal with NHP_AOP message
 				a.wg.Add(1)
-				go a.HandleUdpDataKeyWrappingOperations(ppd)
+				go func() {
+					if opErr := a.HandleUdpDataKeyWrappingOperations(ppd); opErr != nil {
+						log.Error("HandleUdpDataKeyWrappingOperations failed: %v", opErr)
+					}
+				}()
 			}
 		}
 	}

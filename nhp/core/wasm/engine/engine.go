@@ -61,7 +61,7 @@ func (e *Engine) LoadWasm(wasmBytes []byte) error {
 // Close terminates the engine's resources by closing the underlying runner.
 // It should be called to clean up resources when the engine is no longer needed.
 func (e *Engine) Close() {
-	e.r.Close(e.ctx)
+	_ = e.r.Close(e.ctx)
 }
 
 func (e *Engine) ReadContentFromVMMemory(memPos uint32, memLen uint32) []byte {

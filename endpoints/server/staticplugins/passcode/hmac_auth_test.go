@@ -271,6 +271,6 @@ func BenchmarkVerify(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		signer.Verify(authHeader)
+		_, _ = signer.Verify(authHeader)
 	}
 }

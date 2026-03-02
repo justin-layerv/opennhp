@@ -761,8 +761,8 @@ func (s *UdpServer) onAttestationVerify(spo *common.SmartPolicy, attestation str
 		if err != nil {
 			return err
 		}
-		defer os.Remove(filepath.Dir(wasmPath)) // LIFO: runs second, removes empty dir
-		defer os.Remove(wasmPath)               // LIFO: runs first, removes file
+		defer func() { _ = os.Remove(filepath.Dir(wasmPath)) }() // LIFO: runs second, removes empty dir
+		defer func() { _ = os.Remove(wasmPath) }()               // LIFO: runs first, removes file
 		wasmBytes, err = os.ReadFile(wasmPath)
 		if err != nil {
 			return err
@@ -796,7 +796,7 @@ func SaveZdtoConfig(drgMsg *common.DRGMsg) error {
 			drgMsg.AccessUrl = existingDrgMsg.AccessUrl
 		}
 
-		os.Remove(configPath)
+		_ = os.Remove(configPath)
 	}
 
 	// Make sure the etc directory exists
@@ -812,7 +812,7 @@ func SaveZdtoConfig(drgMsg *common.DRGMsg) error {
 	if err != nil {
 		return fmt.Errorf("failed to create config.json: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
@@ -827,7 +827,7 @@ func ReadZdtoConfig(doId string) (common.DRGMsg, error) {
 	if err != nil {
 		return common.DRGMsg{}, fmt.Errorf("could not open file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	fileContentByte, err := io.ReadAll(file)
 	if err != nil {

@@ -460,7 +460,7 @@ func (ppd *PacketParserData) decryptBody() (err error) {
 			ErrDataDecompressionFailed.SetExtraError(err)
 			return ErrDataDecompressionFailed
 		}
-		defer r.Close()
+		defer func() { _ = r.Close() }()
 
 		// Limit decompressed size to 10MB to prevent DoS via decompression bomb
 		const maxDecompressedSize = 10 * 1024 * 1024

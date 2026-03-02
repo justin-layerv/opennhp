@@ -128,7 +128,9 @@ func (s *UdpServer) loadBaseConfig() error {
 		log.Info("base config: %s has been updated", fileName)
 		if content, err = s.loadConfigFile(fileName); err == nil {
 			if err = toml.Unmarshal(content, &config); err == nil {
-				s.updateBaseConfig(config)
+				if updateErr := s.updateBaseConfig(config); updateErr != nil {
+					log.Error("failed to apply base config update: %v", updateErr)
+				}
 			}
 
 		}
@@ -161,7 +163,9 @@ func (s *UdpServer) loadHttpConfig() error {
 		log.Info("http config: %s has been updated", fileName)
 		if content, err = s.loadConfigFile(fileName); err == nil {
 			if err = toml.Unmarshal(content, &httpConf); err == nil {
-				s.updateHttpConfig(httpConf)
+				if updateErr := s.updateHttpConfig(httpConf); updateErr != nil {
+					log.Error("failed to apply http config update: %v", updateErr)
+				}
 			}
 		}
 	})
@@ -189,7 +193,9 @@ func (s *UdpServer) loadPeers() error {
 			log.Info("ac peer config: %s has been updated", fileNameAC)
 			if contentAC, err = s.loadConfigFile(fileNameAC); err == nil {
 				if err = toml.Unmarshal(contentAC, &acPeers); err == nil {
-					s.updateACPeers(acPeers.ACs)
+					if updateErr := s.updateACPeers(acPeers.ACs); updateErr != nil {
+						log.Error("failed to apply AC peers update: %v", updateErr)
+					}
 				}
 			}
 		})
@@ -215,7 +221,9 @@ func (s *UdpServer) loadPeers() error {
 			log.Info("agent peer config: %s has been updated", fileNameAgent)
 			if contentAgent, err = s.loadConfigFile(fileNameAgent); err == nil {
 				if err = toml.Unmarshal(contentAgent, &agentPeers); err == nil {
-					s.updateAgentPeers(agentPeers.Agents)
+					if updateErr := s.updateAgentPeers(agentPeers.Agents); updateErr != nil {
+						log.Error("failed to apply agent peers update: %v", updateErr)
+					}
 				}
 			}
 		})
@@ -241,7 +249,9 @@ func (s *UdpServer) loadPeers() error {
 			log.Info("device peer config: %s has been updated", fileNameDE)
 			if contentDE, err = s.loadConfigFile(fileNameDE); err == nil {
 				if err = toml.Unmarshal(contentDE, &dePeers); err == nil {
-					s.updateDePeers(dePeers.DBs)
+					if updateErr := s.updateDePeers(dePeers.DBs); updateErr != nil {
+						log.Error("failed to apply DB peers update: %v", updateErr)
+					}
 				}
 			}
 		})
@@ -249,10 +259,14 @@ func (s *UdpServer) loadPeers() error {
 
 	// tee.toml - optional, errors handled inside updateTee
 	fileNameTee := filepath.Join(ExeDirPath, "etc", "tee.toml")
-	s.updateTee(fileNameTee)
+	if err := s.updateTee(fileNameTee); err != nil {
+		log.Error("failed to load tee config: %v", err)
+	}
 	teeWatch = utils.WatchFile(fileNameTee, func() {
 		log.Info("tee: %s has been updated", fileNameTee)
-		s.updateTee(fileNameTee)
+		if err := s.updateTee(fileNameTee); err != nil {
+			log.Error("failed to apply tee config update: %v", err)
+		}
 	})
 
 	return nil
@@ -272,14 +286,18 @@ func (s *UdpServer) loadResources() error {
 		log.Error("failed to unmarshal resource config: %v", err)
 		return nil
 	}
-	s.updateResources(aspMap)
+	if err := s.updateResources(aspMap); err != nil {
+		log.Error("failed to apply resource config: %v", err)
+	}
 
 	resConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("resource config: %s has been updated", fileName)
 		if content, err := s.loadConfigFile(fileName); err == nil {
 			freshAspMap := make(common.AuthSvcProviderMap)
 			if err := toml.Unmarshal(content, &freshAspMap); err == nil {
-				s.updateResources(freshAspMap)
+				if updateErr := s.updateResources(freshAspMap); updateErr != nil {
+					log.Error("failed to apply resource config update: %v", updateErr)
+				}
 			} else {
 				log.Error("failed to unmarshal updated resource config: %v", err)
 			}
@@ -303,13 +321,17 @@ func (s *UdpServer) loadSourceIps() error {
 		log.Error("failed to unmarshal src ip config: %v", err)
 		return nil
 	}
-	s.updateSourceIps(srcIpMap)
+	if err := s.updateSourceIps(srcIpMap); err != nil {
+		log.Error("failed to apply source IP config: %v", err)
+	}
 
 	srcipConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("src ip config: %s has been updated", fileName)
 		if content, err = s.loadConfigFile(fileName); err == nil {
 			if err = toml.Unmarshal(content, &srcIpMap); err == nil {
-				s.updateSourceIps(srcIpMap)
+				if updateErr := s.updateSourceIps(srcIpMap); updateErr != nil {
+					log.Error("failed to apply source IP config update: %v", updateErr)
+				}
 			}
 		}
 	})
@@ -379,7 +401,9 @@ func (s *UdpServer) loadRemoteConfig() error {
 	go s.etcdConn.WatchValue(func(val []byte) {
 		s.remoteConfigUpdateMutex.Lock()
 		defer s.remoteConfigUpdateMutex.Unlock()
-		s.updateEtcdConfig(val, true)
+		if err := s.updateEtcdConfig(val, true); err != nil {
+			log.Error("failed to apply etcd config update: %v", err)
+		}
 	})
 
 	return nil
@@ -409,7 +433,9 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 	// (non-zero port or EnableHttp=true). Otherwise keep local http.toml config.
 	// This allows etcd to be used purely for AC registry without requiring HttpConfig.
 	if serverEtcdConfig.HttpConfig.EnableHttp || serverEtcdConfig.HttpConfig.HttpListenPort > 0 {
-		s.updateHttpConfig(serverEtcdConfig.HttpConfig)
+		if updateErr := s.updateHttpConfig(serverEtcdConfig.HttpConfig); updateErr != nil {
+			log.Error("failed to apply http config from etcd: %v", updateErr)
+		}
 	}
 
 	// Only update AC/Agent/DB peers from etcd config if they are explicitly defined.
@@ -418,19 +444,25 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 	// the etcd config is updated without [[ACs]] section.
 	if len(serverEtcdConfig.ACs) > 0 {
 		log.Info("Updating %d AC peers from etcd config", len(serverEtcdConfig.ACs))
-		s.updateACPeers(serverEtcdConfig.ACs)
+		if updateErr := s.updateACPeers(serverEtcdConfig.ACs); updateErr != nil {
+			log.Error("failed to apply AC peers from etcd: %v", updateErr)
+		}
 	} else {
 		log.Debug("No [[ACs]] in etcd config, preserving existing AC peers (registry mode)")
 	}
 	if len(serverEtcdConfig.Agents) > 0 {
 		log.Info("Updating %d Agent peers from etcd config", len(serverEtcdConfig.Agents))
-		s.updateAgentPeers(serverEtcdConfig.Agents)
+		if updateErr := s.updateAgentPeers(serverEtcdConfig.Agents); updateErr != nil {
+			log.Error("failed to apply agent peers from etcd: %v", updateErr)
+		}
 	} else {
 		log.Debug("No [[Agents]] in etcd config, preserving existing Agent peers")
 	}
 	if len(serverEtcdConfig.DBs) > 0 {
 		log.Info("Updating %d DB peers from etcd config", len(serverEtcdConfig.DBs))
-		s.updateDePeers(serverEtcdConfig.DBs)
+		if updateErr := s.updateDePeers(serverEtcdConfig.DBs); updateErr != nil {
+			log.Error("failed to apply DB peers from etcd: %v", updateErr)
+		}
 	} else {
 		log.Debug("No [[DBs]] in etcd config, preserving existing DB peers")
 	}
@@ -447,7 +479,9 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 		for aspId, aspData := range aspMap {
 			log.Debug("  AuthServiceId[%s]: PluginPath=%q", aspId, aspData.PluginPath)
 		}
-		s.updateResources(aspMap)
+		if updateErr := s.updateResources(aspMap); updateErr != nil {
+			log.Error("failed to apply resources from etcd: %v", updateErr)
+		}
 	} else {
 		log.Info("No AuthServiceId in etcd config, using local resource.toml")
 	}
@@ -463,7 +497,9 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 		}
 		srcIpMap[srcIp.SrcIp] = ips
 	}
-	s.updateSourceIps(srcIpMap)
+	if updateErr := s.updateSourceIps(srcIpMap); updateErr != nil {
+		log.Error("failed to apply source IPs from etcd: %v", updateErr)
+	}
 
 	return nil
 }
@@ -623,8 +659,11 @@ func (s *UdpServer) updateResources(aspMap common.AuthSvcProviderMap) (err error
 		// Try to load plugin from static registry first, then fall back to dynamic loading
 		h := plugins.GetPluginHandler(aspId, aspData.PluginPath)
 		if h != nil {
-			s.LoadPlugin(aspId, h)
-			log.Info("Loaded plugin for AuthServiceId %q", aspId)
+			if loadErr := s.LoadPlugin(aspId, h); loadErr != nil {
+				log.Error("failed to load plugin for AuthServiceId %q: %v", aspId, loadErr)
+			} else {
+				log.Info("Loaded plugin for AuthServiceId %q", aspId)
+			}
 		} else if len(aspData.PluginPath) > 0 {
 			log.Error("Failed to load plugin for AuthServiceId %q from path %q", aspId, aspData.PluginPath)
 		} else {
@@ -664,7 +703,7 @@ func (s *UdpServer) StopConfigWatch() {
 		dbConfigWatch, teeWatch,
 	} {
 		if w != nil {
-			w.Close()
+			_ = w.Close()
 		}
 	}
 }

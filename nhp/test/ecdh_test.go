@@ -10,7 +10,10 @@ import (
 )
 
 func TestCurve25519Keys(t *testing.T) {
-	e := core.NewECDH(core.ECC_CURVE25519)
+	e, err := core.NewECDH(core.ECC_CURVE25519)
+	if err != nil {
+		t.Fatalf("NewECDH failed: %v", err)
+	}
 
 	fmt.Printf("Private key: %s\n", e.PrivateKeyBase64())
 	fmt.Printf("Public key: %s\n", e.PublicKeyBase64())

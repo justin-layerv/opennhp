@@ -147,6 +147,8 @@ func (header *ZtdoHeader) SetMetadata(metadata string) error {
 		})
 	}
 
+	// Final chunk: length is always <= MetadataChunkMaxSize (it's the remainder),
+	// so encodeMetadataLength cannot fail here.
 	chunk := metadata[chunkNum*MetadataChunkMaxSize:]
 	chunkEncodedLen, _ := encodeMetadataLength(len(chunk), false)
 	header.Metadata = append(header.Metadata, ZtdoMetadata{
@@ -290,9 +292,12 @@ func NewZtdo() *Ztdo {
 	}
 }
 
-func (ztdo *Ztdo) Generate(mode DataKeyPairECCMode) (privateKey []byte) {
-	ecdh := core.NewECDH(mode.ToEccType())
-	return ecdh.PrivateKey()
+func (ztdo *Ztdo) Generate(mode DataKeyPairECCMode) ([]byte, error) {
+	ecdh, err := core.NewECDH(mode.ToEccType())
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate ECDH key pair: %w", err)
+	}
+	return ecdh.PrivateKey(), nil
 }
 
 func (ztdo *Ztdo) SetNhpServer(nhpServer string) error {
@@ -319,28 +324,45 @@ func (ztdo *Ztdo) GetECCMode() DataKeyPairECCMode {
 	return ztdo.header.GetECCMode()
 }
 
-func (ztdo *Ztdo) EncryptZtdoFile(plaintextPath, ciphertextPath string, gcmKey []byte, ad []byte) error {
+func (ztdo *Ztdo) EncryptZtdoFile(plaintextPath, ciphertextPath string, gcmKey []byte, ad []byte) (err error) {
 	plaintextFile, err := os.OpenFile(plaintextPath, os.O_RDONLY, 0666)
 	if err != nil {
 		return err
 	}
-	defer plaintextFile.Close()
+	defer func() {
+		cerr := plaintextFile.Close()
+		if err == nil {
+			err = cerr
+		}
+	}()
 
 	ciphertextFile, err := os.Create(ciphertextPath)
 	if err != nil {
 		return err
 	}
-	defer ciphertextFile.Close()
+	defer func() {
+		cerr := ciphertextFile.Close()
+		if err == nil {
+			err = cerr
+		}
+	}()
 
 	// If metadata is empty, set it to an empty string
 	if len(ztdo.header.GetMetadata()) == 0 {
-		ztdo.SetMetadata("")
+		if err := ztdo.SetMetadata(""); err != nil {
+			return err
+		}
 	}
 
 	// Write header
-	headerBuf := toBuffer(ztdo.header)
+	headerBuf, err := toBuffer(ztdo.header)
+	if err != nil {
+		return err
+	}
 	ztdo.signature.mixHash(headerBuf)
-	ciphertextFile.Write(headerBuf.Bytes())
+	if _, err := ciphertextFile.Write(headerBuf.Bytes()); err != nil {
+		return err
+	}
 
 	// Write payloads
 	for {
@@ -357,16 +379,29 @@ func (ztdo *Ztdo) EncryptZtdoFile(plaintextPath, ciphertextPath string, gcmKey [
 		}
 
 		payload := NewZtdoPayload()
-		payload.SetCipherText(ztdo.header.GetCipherMode(), gcmKey, buf[:n], ad)
+		if err := payload.SetCipherText(ztdo.header.GetCipherMode(), gcmKey, buf[:n], ad); err != nil {
+			return err
+		}
 		payload.SetLength()
-		payloadBuf := toBuffer(payload)
+		payloadBuf, err := toBuffer(payload)
+		if err != nil {
+			return err
+		}
 		ztdo.signature.mixHash(payloadBuf)
-		ciphertextFile.Write(payloadBuf.Bytes())
+		if _, err := ciphertextFile.Write(payloadBuf.Bytes()); err != nil {
+			return err
+		}
 	}
 
 	// update signature
 	ztdo.signature.sign(gcmKey)
-	ciphertextFile.Write(toBuffer(ztdo.signature).Bytes())
+	sigBuf, err := toBuffer(ztdo.signature)
+	if err != nil {
+		return err
+	}
+	if _, err := ciphertextFile.Write(sigBuf.Bytes()); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -376,7 +411,7 @@ func (ztdo *Ztdo) ParseHeader(ciphertextPath string) error {
 	if err != nil {
 		return err
 	}
-	defer ciphertextFile.Close()
+	defer func() { _ = ciphertextFile.Close() }()
 
 	// always initialize header
 	ztdo.header = *NewZtdoHeader()
@@ -389,12 +424,12 @@ func (ztdo *Ztdo) ParseHeader(ciphertextPath string) error {
 	return nil
 }
 
-func (ztdo *Ztdo) DecryptZtdoFile(ciphertextPath, plaintextPath string, gcmKey []byte, ad []byte) error {
+func (ztdo *Ztdo) DecryptZtdoFile(ciphertextPath, plaintextPath string, gcmKey []byte, ad []byte) (err error) {
 	ciphertextFile, err := os.OpenFile(ciphertextPath, os.O_RDONLY, 0666)
 	if err != nil {
 		return err
 	}
-	defer ciphertextFile.Close()
+	defer func() { _ = ciphertextFile.Close() }() // read-only: close errors are non-critical
 
 	ciphertextFileInfo, err := ciphertextFile.Stat()
 	if err != nil {
@@ -407,7 +442,12 @@ func (ztdo *Ztdo) DecryptZtdoFile(ciphertextPath, plaintextPath string, gcmKey [
 	if err != nil {
 		return err
 	}
-	defer plaintextFile.Close()
+	defer func() {
+		cerr := plaintextFile.Close()
+		if err == nil {
+			err = cerr
+		}
+	}()
 
 	recalcSig := NewZtdoSignature()
 
@@ -418,7 +458,10 @@ func (ztdo *Ztdo) DecryptZtdoFile(ciphertextPath, plaintextPath string, gcmKey [
 	if err := toStructure(ciphertextFile, &ztdo.header); err != nil {
 		return err
 	}
-	headerBuf := toBuffer(ztdo.header)
+	headerBuf, err := toBuffer(ztdo.header)
+	if err != nil {
+		return err
+	}
 	recalcSig.mixHash(headerBuf)
 	remainingCiphertextFileSize -= int64(headerBuf.Len())
 
@@ -429,7 +472,10 @@ func (ztdo *Ztdo) DecryptZtdoFile(ciphertextPath, plaintextPath string, gcmKey [
 			return err
 		}
 
-		payloadBuf := toBuffer(payload)
+		payloadBuf, err := toBuffer(payload)
+		if err != nil {
+			return err
+		}
 		recalcSig.mixHash(payloadBuf)
 		remainingCiphertextFileSize -= int64(payloadBuf.Len())
 
@@ -437,7 +483,9 @@ func (ztdo *Ztdo) DecryptZtdoFile(ciphertextPath, plaintextPath string, gcmKey [
 		if err != nil {
 			return err
 		}
-		plaintextFile.Write(plaintext)
+		if _, err := plaintextFile.Write(plaintext); err != nil {
+			return err
+		}
 
 		if ztdo.header.HasSignature() {
 			if remainingCiphertextFileSize == SIGNATURELenSize {
@@ -603,10 +651,12 @@ func unmarshal(f *os.File, data any) error {
 }
 
 // toBuffer provides unified way to serialize a Go struct into bytes buffer
-func toBuffer(data any) *bytes.Buffer {
+func toBuffer(data any) (*bytes.Buffer, error) {
 	buf := bytes.NewBuffer(nil)
-	marshal(buf, data)
-	return buf
+	if err := marshal(buf, data); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 // toStructure provides unified way to deserialize bytes from a file into a Go struct

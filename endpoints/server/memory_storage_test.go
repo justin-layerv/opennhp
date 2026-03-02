@@ -392,12 +392,12 @@ func TestMemoryStorage_DelayInjection_SpecificMethod(t *testing.T) {
 
 	// GetACAssignment should be fast
 	start := time.Now()
-	storage.GetACAssignment(ctx, "ac-1")
+	_, _ = storage.GetACAssignment(ctx, "ac-1")
 	acElapsed := time.Since(start)
 
 	// GetLicense should be slow
 	start = time.Now()
-	storage.GetLicense(ctx, licenseKey)
+	_, _ = storage.GetLicense(ctx, licenseKey)
 	licElapsed := time.Since(start)
 
 	if acElapsed > 50*time.Millisecond {
@@ -419,10 +419,10 @@ func TestMemoryStorage_CallCounts(t *testing.T) {
 	storage.PutACAssignment(CreateTestACAssignment("ac-1", "srv-1"))
 
 	// Make calls
-	storage.GetACAssignment(ctx, "ac-1")
-	storage.GetACAssignment(ctx, "ac-1")
-	storage.GetACAssignment(ctx, "nonexistent") // Error case still counts
-	storage.GetACsByServer(ctx, "srv-1")
+	_, _ = storage.GetACAssignment(ctx, "ac-1")
+	_, _ = storage.GetACAssignment(ctx, "ac-1")
+	_, _ = storage.GetACAssignment(ctx, "nonexistent") // Error case still counts
+	_, _ = storage.GetACsByServer(ctx, "srv-1")
 
 	// Check counts
 	if storage.GetCallCount("GetACAssignment") != 3 {
@@ -441,8 +441,8 @@ func TestMemoryStorage_ResetCallCounts(t *testing.T) {
 	ctx := context.Background()
 
 	storage.PutACAssignment(CreateTestACAssignment("ac-1", "srv-1"))
-	storage.GetACAssignment(ctx, "ac-1")
-	storage.GetACAssignment(ctx, "ac-1")
+	_, _ = storage.GetACAssignment(ctx, "ac-1")
+	_, _ = storage.GetACAssignment(ctx, "ac-1")
 
 	if storage.GetCallCount("GetACAssignment") != 2 {
 		t.Fatal("Expected 2 calls before reset")
@@ -481,9 +481,9 @@ func TestMemoryStorage_ConcurrentAccess(t *testing.T) {
 				case 0:
 					storage.PutACAssignment(CreateTestACAssignment("ac-concurrent-"+string(rune('A'+gid%10)), "srv-x"))
 				case 1:
-					storage.GetACAssignment(ctx, "ac-"+string(rune('A'+i%10)))
+					_, _ = storage.GetACAssignment(ctx, "ac-"+string(rune('A'+i%10)))
 				case 2:
-					storage.GetACsByServer(ctx, "srv-1")
+					_, _ = storage.GetACsByServer(ctx, "srv-1")
 				case 3:
 					storage.DeleteACAssignment("ac-concurrent-" + string(rune('A'+(gid+1)%10)))
 				case 4:

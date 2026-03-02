@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"slices"
 	"strconv"
@@ -22,7 +23,7 @@ func (a *UdpAgent) Knock(res *KnockTarget) (ackMsg *common.ServerKnockAckMsg, er
 	startTime := time.Now()
 
 	ackMsg, err = a.knockRequest(res, false)
-	if err == common.ErrKnockTerminatedByCookie {
+	if errors.Is(err, common.ErrKnockTerminatedByCookie) {
 		// if cookie is required by server, use cookie to knock
 		// Note: don't use recursive calling method, it may get too deep if cookie message is kept sending
 		// use flat calling
@@ -43,7 +44,9 @@ func (a *UdpAgent) Knock(res *KnockTarget) (ackMsg *common.ServerKnockAckMsg, er
 
 	// deal with ac PASS_ACCESS_IP mode
 	if len(ackMsg.PreAccessActions) > 0 {
-		a.preAccessRequest(ackMsg)
+		if preErr := a.preAccessRequest(ackMsg); preErr != nil {
+			log.Error("agent(%s)[KnockRequest] pre-access request failed: %v", a.knockUser.UserId, preErr)
+		}
 	}
 	res.LastKnockSuccessTime = time.Now()
 
@@ -234,7 +237,9 @@ func (a *UdpAgent) preAccessRequest(ackMsg *common.ServerKnockAckMsg) (err error
 		go func(info *common.PreAccessInfo) {
 			defer acWg.Done()
 			if info != nil {
-				a.processPreAccessAction(info)
+				if err := a.processPreAccessAction(info); err != nil {
+					log.Error("agent[preAccessRequest] processPreAccessAction failed: %v", err)
+				}
 			}
 		}(action)
 	}
@@ -313,7 +318,7 @@ func (a *UdpAgent) processPreAccessAction(info *common.PreAccessInfo) error {
 			log.Error("agent(%s)[PreAccessRequest] failed to connect to temporary tcp access port: %v", accMsg.UserId, err)
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		_, err = conn.Write(packet)
 		if err != nil {
@@ -331,7 +336,7 @@ func (a *UdpAgent) processPreAccessAction(info *common.PreAccessInfo) error {
 			log.Error("agent(%s)[PreAccessRequest] failed to connect to temporary udp access port: %v", accMsg.UserId, err)
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		_, err = conn.Write(packet)
 		if err != nil {

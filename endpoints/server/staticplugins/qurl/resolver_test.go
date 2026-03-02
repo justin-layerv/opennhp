@@ -3,6 +3,7 @@ package qurl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -61,7 +62,7 @@ func TestQurlResolver_Resolve_Success(t *testing.T) {
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer server.Close()
 
@@ -105,7 +106,7 @@ func TestQurlResolver_Resolve_TokenNotFound(t *testing.T) {
 				Message: "Token not found",
 			},
 		}
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer server.Close()
 
@@ -118,7 +119,7 @@ func TestQurlResolver_Resolve_TokenNotFound(t *testing.T) {
 	req := &ResolveRequest{AccessToken: "invalid-token"}
 	_, err := resolver.Resolve(context.Background(), req)
 
-	if err != ErrTokenNotFound {
+	if !errors.Is(err, ErrTokenNotFound) {
 		t.Errorf("expected ErrTokenNotFound, got: %v", err)
 	}
 }
@@ -133,7 +134,7 @@ func TestQurlResolver_Resolve_TokenConsumed(t *testing.T) {
 				Message: "Token already consumed",
 			},
 		}
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer server.Close()
 
@@ -146,7 +147,7 @@ func TestQurlResolver_Resolve_TokenConsumed(t *testing.T) {
 	req := &ResolveRequest{AccessToken: "consumed-token"}
 	_, err := resolver.Resolve(context.Background(), req)
 
-	if err != ErrTokenConsumed {
+	if !errors.Is(err, ErrTokenConsumed) {
 		t.Errorf("expected ErrTokenConsumed, got: %v", err)
 	}
 }
@@ -161,7 +162,7 @@ func TestQurlResolver_Resolve_TokenExpired(t *testing.T) {
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer server.Close()
 
@@ -174,7 +175,7 @@ func TestQurlResolver_Resolve_TokenExpired(t *testing.T) {
 	req := &ResolveRequest{AccessToken: "expired-token"}
 	_, err := resolver.Resolve(context.Background(), req)
 
-	if err != ErrTokenExpired {
+	if !errors.Is(err, ErrTokenExpired) {
 		t.Errorf("expected ErrTokenExpired, got: %v", err)
 	}
 }
@@ -189,7 +190,7 @@ func TestQurlResolver_Resolve_PolicyViolation(t *testing.T) {
 				Message: "Access denied by policy",
 			},
 		}
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer server.Close()
 
@@ -202,7 +203,7 @@ func TestQurlResolver_Resolve_PolicyViolation(t *testing.T) {
 	req := &ResolveRequest{AccessToken: "policy-denied-token"}
 	_, err := resolver.Resolve(context.Background(), req)
 
-	if err != ErrPolicyViolation {
+	if !errors.Is(err, ErrPolicyViolation) {
 		t.Errorf("expected ErrPolicyViolation, got: %v", err)
 	}
 }
@@ -222,7 +223,7 @@ func TestQurlResolver_Resolve_ServerError(t *testing.T) {
 	req := &ResolveRequest{AccessToken: "any-token"}
 	_, err := resolver.Resolve(context.Background(), req)
 
-	if err != ErrServiceError {
+	if !errors.Is(err, ErrServiceError) {
 		t.Errorf("expected ErrServiceError, got: %v", err)
 	}
 }
@@ -230,7 +231,7 @@ func TestQurlResolver_Resolve_ServerError(t *testing.T) {
 func TestQurlResolver_Resolve_InvalidJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte("invalid json"))
+		_, _ = w.Write([]byte("invalid json"))
 	}))
 	defer server.Close()
 
@@ -314,7 +315,7 @@ func TestMapErrorCode(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.code, func(t *testing.T) {
 			err := resolver.mapErrorCode(tt.code)
-			if err != tt.expected {
+			if !errors.Is(err, tt.expected) {
 				t.Errorf("mapErrorCode(%q) = %v, want %v", tt.code, err, tt.expected)
 			}
 		})
@@ -359,7 +360,7 @@ func TestParseErrorResponse(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := resolver.parseErrorResponse(tt.statusCode, []byte(tt.body))
-			if err != tt.expected {
+			if !errors.Is(err, tt.expected) {
 				t.Errorf("parseErrorResponse(%d, %q) = %v, want %v", tt.statusCode, tt.body, err, tt.expected)
 			}
 		})

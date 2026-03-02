@@ -138,7 +138,7 @@ func TestNewConnection_AcceptsFromAnySource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create unconnected socket: %v", err)
 	}
-	defer receiver.Close()
+	defer func() { _ = receiver.Close() }()
 
 	// Expected "remote" address - but we won't actually connect to it
 	expectedRemoteAddr := &net.UDPAddr{
@@ -155,7 +155,7 @@ func TestNewConnection_AcceptsFromAnySource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create sender socket: %v", err)
 	}
-	defer sender.Close()
+	defer func() { _ = sender.Close() }()
 	senderAddr := sender.LocalAddr().(*net.UDPAddr)
 
 	// Send a test packet from a DIFFERENT address than expected
@@ -166,7 +166,7 @@ func TestNewConnection_AcceptsFromAnySource(t *testing.T) {
 	}
 
 	// Set read deadline to avoid hanging
-	receiver.SetReadDeadline(time.Now().Add(1 * time.Second))
+	_ = receiver.SetReadDeadline(time.Now().Add(1 * time.Second))
 
 	// Read the packet - should succeed even though sender != expected remote
 	buf := make([]byte, 1024)
@@ -200,7 +200,7 @@ func TestSendPacket_WriteToUDP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create receiver socket: %v", err)
 	}
-	defer receiver.Close()
+	defer func() { _ = receiver.Close() }()
 	receiverAddr := receiver.LocalAddr().(*net.UDPAddr)
 
 	ac := createTestAC(t)
@@ -228,7 +228,7 @@ func TestSendPacket_WriteToUDP(t *testing.T) {
 	}
 
 	// Receive the packet on the receiver
-	receiver.SetReadDeadline(time.Now().Add(1 * time.Second))
+	_ = receiver.SetReadDeadline(time.Now().Add(1 * time.Second))
 	buf := make([]byte, 1024)
 	n, fromAddr, err := receiver.ReadFromUDP(buf)
 	if err != nil {
@@ -306,7 +306,7 @@ func TestConnection_SimulatesNLBScenario(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create NLB socket: %v", err)
 	}
-	defer nlbSocket.Close()
+	defer func() { _ = nlbSocket.Close() }()
 	nlbAddr := nlbSocket.LocalAddr().(*net.UDPAddr)
 
 	// Create AC's connection (would be to NLB in production)
@@ -316,11 +316,11 @@ func TestConnection_SimulatesNLBScenario(t *testing.T) {
 	}
 	// Stop the recv routine that was started by newConnection.
 	// Set a short deadline to unblock ReadFromUDP, then signal stop and wait.
-	acConn.netConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
+	_ = acConn.netConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
 	close(acConn.ConnData.StopSignal)
 	acConn.ConnData.Wait()
-	acConn.netConn.SetReadDeadline(time.Time{}) // Clear deadline for test use
-	defer acConn.netConn.Close()
+	_ = acConn.netConn.SetReadDeadline(time.Time{}) // Clear deadline for test use
+	defer func() { _ = acConn.netConn.Close() }()
 
 	// Get AC's local port - send to 127.0.0.1:port (not 0.0.0.0:port)
 	acLocalAddr := acConn.netConn.LocalAddr().(*net.UDPAddr)
@@ -331,7 +331,7 @@ func TestConnection_SimulatesNLBScenario(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create server socket: %v", err)
 	}
-	defer serverSocket.Close()
+	defer func() { _ = serverSocket.Close() }()
 	serverAddr := serverSocket.LocalAddr().(*net.UDPAddr)
 
 	// Server sends response to AC (from its direct IP, not NLB)
@@ -342,7 +342,7 @@ func TestConnection_SimulatesNLBScenario(t *testing.T) {
 	}
 
 	// AC receives response - this would FAIL with connected socket!
-	acConn.netConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	_ = acConn.netConn.SetReadDeadline(time.Now().Add(1 * time.Second))
 	buf := make([]byte, 1024)
 	n, fromAddr, err := acConn.netConn.ReadFromUDP(buf)
 	if err != nil {
@@ -385,11 +385,11 @@ func TestConnection_ConcurrentReceive(t *testing.T) {
 	// Stop the recv routine that was started by newConnection to avoid panic
 	// when it tries to parse our test packets as NHP packets.
 	// Set a short deadline to unblock ReadFromUDP, then signal stop and wait.
-	conn.netConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
+	_ = conn.netConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
 	close(conn.ConnData.StopSignal)
 	conn.ConnData.Wait()
-	conn.netConn.SetReadDeadline(time.Time{}) // Clear deadline for test use
-	defer conn.netConn.Close()
+	_ = conn.netConn.SetReadDeadline(time.Time{}) // Clear deadline for test use
+	defer func() { _ = conn.netConn.Close() }()
 
 	// Get local port - send to 127.0.0.1:port (not 0.0.0.0:port)
 	localAddr := conn.netConn.LocalAddr().(*net.UDPAddr)
@@ -400,7 +400,7 @@ func TestConnection_ConcurrentReceive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create sender: %v", err)
 	}
-	defer sender.Close()
+	defer func() { _ = sender.Close() }()
 
 	// Send multiple packets
 	numPackets := 10
@@ -415,7 +415,7 @@ func TestConnection_ConcurrentReceive(t *testing.T) {
 	var received int32
 	var wg sync.WaitGroup
 
-	conn.netConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.netConn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
 	for i := 0; i < 3; i++ {
 		wg.Add(1)
@@ -436,7 +436,7 @@ func TestConnection_ConcurrentReceive(t *testing.T) {
 
 	// Wait for receivers to finish (timeout)
 	time.Sleep(500 * time.Millisecond)
-	conn.netConn.Close()
+	_ = conn.netConn.Close()
 	wg.Wait()
 
 	t.Logf("Received %d of %d packets concurrently", received, numPackets)
@@ -545,7 +545,7 @@ func TestConnection_BidirectionalCommunication(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create server socket: %v", err)
 	}
-	defer serverSocket.Close()
+	defer func() { _ = serverSocket.Close() }()
 	serverAddr := serverSocket.LocalAddr().(*net.UDPAddr)
 
 	// Create AC connection to server
@@ -555,11 +555,11 @@ func TestConnection_BidirectionalCommunication(t *testing.T) {
 	}
 	// Stop the recv routine that was started by newConnection.
 	// Set a short deadline to unblock ReadFromUDP, then signal stop and wait.
-	acConn.netConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
+	_ = acConn.netConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
 	close(acConn.ConnData.StopSignal)
 	acConn.ConnData.Wait()
-	acConn.netConn.SetReadDeadline(time.Time{}) // Clear deadline for test use
-	defer acConn.netConn.Close()
+	_ = acConn.netConn.SetReadDeadline(time.Time{}) // Clear deadline for test use
+	defer func() { _ = acConn.netConn.Close() }()
 
 	// Get AC's local port for server to respond to
 	acLocalAddr := acConn.netConn.LocalAddr().(*net.UDPAddr)
@@ -573,7 +573,7 @@ func TestConnection_BidirectionalCommunication(t *testing.T) {
 	}
 
 	// Server receives
-	serverSocket.SetReadDeadline(time.Now().Add(1 * time.Second))
+	_ = serverSocket.SetReadDeadline(time.Now().Add(1 * time.Second))
 	buf := make([]byte, 1024)
 	n, fromAddr, err := serverSocket.ReadFromUDP(buf)
 	if err != nil {
@@ -595,7 +595,7 @@ func TestConnection_BidirectionalCommunication(t *testing.T) {
 	}
 
 	// AC receives response
-	acConn.netConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	_ = acConn.netConn.SetReadDeadline(time.Now().Add(1 * time.Second))
 	n, fromAddr, err = acConn.netConn.ReadFromUDP(buf)
 	if err != nil {
 		t.Fatalf("AC failed to receive response: %v", err)
@@ -624,11 +624,11 @@ func TestConnection_MultipleSourcesSequential(t *testing.T) {
 	}
 	// Stop the recv routine that consumes packets.
 	// Set a short deadline to unblock ReadFromUDP, then signal stop and wait.
-	acConn.netConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
+	_ = acConn.netConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
 	close(acConn.ConnData.StopSignal)
 	acConn.ConnData.Wait()
-	acConn.netConn.SetReadDeadline(time.Time{}) // Clear deadline for test use
-	defer acConn.netConn.Close()
+	_ = acConn.netConn.SetReadDeadline(time.Time{}) // Clear deadline for test use
+	defer func() { _ = acConn.netConn.Close() }()
 
 	// Get local port - send to 127.0.0.1:port (not 0.0.0.0:port)
 	acLocalAddr := acConn.netConn.LocalAddr().(*net.UDPAddr)
@@ -643,7 +643,7 @@ func TestConnection_MultipleSourcesSequential(t *testing.T) {
 			t.Fatalf("Failed to create sender %d: %v", i, err)
 		}
 		senders = append(senders, sender)
-		defer sender.Close()
+		defer func() { _ = sender.Close() }()
 	}
 
 	// Each sender sends a unique message
@@ -657,7 +657,7 @@ func TestConnection_MultipleSourcesSequential(t *testing.T) {
 
 	// Receive all messages
 	receivedFrom := make(map[int]bool)
-	acConn.netConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = acConn.netConn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
 	for i := 0; i < numSenders; i++ {
 		buf := make([]byte, 1024)

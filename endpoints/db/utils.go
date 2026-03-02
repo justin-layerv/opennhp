@@ -49,15 +49,20 @@ func NewDataPrivateKeyStoreWith(doId string) (d *DataPrivateKeyStore, err error)
 	}
 
 	d = &DataPrivateKeyStore{}
-	d.fromJson(fileContentByte)
+	if err := d.fromJson(fileContentByte); err != nil {
+		return nil, fmt.Errorf("failed to parse data key store: %w", err)
+	}
 
 	return
 }
 
-func (d *DataPrivateKeyStore) Generate(mode ztdolib.DataKeyPairECCMode) (privateKey []byte) {
-	ecdh := core.NewECDH(mode.ToEccType())
+func (d *DataPrivateKeyStore) Generate(mode ztdolib.DataKeyPairECCMode) ([]byte, error) {
+	ecdh, err := core.NewECDH(mode.ToEccType())
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate ECDH key pair: %w", err)
+	}
 	d.DataPrivateKeyBase64 = ecdh.PrivateKeyBase64()
-	return ecdh.PrivateKey()
+	return ecdh.PrivateKey(), nil
 }
 
 // Save saves the dataPrivateKeyBase64 to a file, the format of file name is data-<doId>.json
@@ -79,9 +84,11 @@ func (d *DataPrivateKeyStore) Save(doId string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
-	file.Write(d.toJson())
+	if _, err := file.Write(d.toJson()); err != nil {
+		return fmt.Errorf("failed to write data key store: %w", err)
+	}
 
 	return nil
 }
@@ -135,7 +142,7 @@ func (a *AppParams) NewSmartPolicy() (common.SmartPolicy, error) {
 	if err != nil {
 		return common.SmartPolicy{}, fmt.Errorf("could not open file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	fileContentByte, err := io.ReadAll(file)
 	if err != nil {
@@ -207,7 +214,7 @@ func (a *UdpDevice) UploadFileToNHPServer(filePath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("could not open file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	fileInfo, err := file.Stat()
 	if err != nil {
@@ -261,7 +268,7 @@ func (a *UdpDevice) UploadFileToNHPServer(filePath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("could not send https request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)

@@ -43,7 +43,7 @@ func GetEvidenceWithCCUrl() ([]byte, error) {
 		return nil, fmt.Errorf("http request failed: %w", err)
 	}
 
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
@@ -57,7 +57,9 @@ func GetEvidenceWithCCUrl() ([]byte, error) {
 	var buf bytes.Buffer
 	w := zlib.NewWriter(&buf)
 	_, err = w.Write(body)
-	w.Close()
+	if cerr := w.Close(); err == nil {
+		err = cerr
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to compress response body: %w", err)
 	}
@@ -87,7 +89,9 @@ func GetEvidenceWithAgentUuid() ([]byte, error) {
 	var buf bytes.Buffer
 	w := zlib.NewWriter(&buf)
 	_, err = w.Write(evidenceBytes)
-	w.Close()
+	if cerr := w.Close(); err == nil {
+		err = cerr
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to compress response body: %w", err)
 	}

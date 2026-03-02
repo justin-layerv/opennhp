@@ -94,7 +94,7 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 		}
 		log.Info("Trusted proxies configured with %d CIDRs (first: %s)", len(validCIDRs), validCIDRs[0])
 	} else {
-		hs.ginEngine.SetTrustedProxies(nil)
+		_ = hs.ginEngine.SetTrustedProxies(nil)
 	}
 
 	cookieKeys, err := parseCookieKeys(os.Getenv("NHP_COOKIE_KEYS"))
@@ -137,7 +137,7 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 				defer hs.wg.Done()
 				log.Info("Listening https on %s", hs.listenAddr.String())
 				var err = hs.httpServer.ListenAndServeTLS(certFilePath, keyFilePath)
-				if err != nil && err != http.ErrServerClosed {
+				if err != nil && !errors.Is(err, http.ErrServerClosed) {
 					log.Error("https server close error: %v", err)
 				}
 			}()
@@ -150,7 +150,7 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 		defer hs.wg.Done()
 		log.Info("Listening http on %s", hs.listenAddr.String())
 		var err = hs.httpServer.ListenAndServe()
-		if err != nil && err != http.ErrServerClosed {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http server close error: %v", err)
 		}
 	}()
@@ -173,7 +173,7 @@ func (hs *HttpServer) Stop() {
 	close(hs.signals.stop)
 	ctx, cancel := context.WithTimeout(context.Background(), 5500*time.Millisecond)
 	defer cancel() // Always cancel context to release resources
-	hs.httpServer.Shutdown(ctx)
+	_ = hs.httpServer.Shutdown(ctx)
 
 	hs.wg.Wait()
 	log.Info("==================================================")

@@ -96,13 +96,13 @@ func ECDHFromKey(t EccTypeEnum, prk []byte) (e Ecdh) {
 	return e
 }
 
-func NewECDH(t EccTypeEnum) (e Ecdh) {
+func NewECDH(t EccTypeEnum) (Ecdh, error) {
 	switch t {
 	case ECC_CURVE25519:
-		e = curve.NewECDH()
+		return curve.NewECDH()
 	}
 
-	return e
+	return nil, fmt.Errorf("unsupported ECC type: %d", t)
 }
 
 func AeadFromKey(t GcmTypeEnum, key *[SymmetricKeySize]byte) (cipher.AEAD, error) {

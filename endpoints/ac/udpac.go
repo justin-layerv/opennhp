@@ -72,7 +72,7 @@ type UdpConn struct {
 
 func (c *UdpConn) Close() {
 	if c.netConn != nil {
-		c.netConn.Close()
+		_ = c.netConn.Close()
 		c.ConnData.Close()
 	}
 }
@@ -140,10 +140,14 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	a.tokenStore = common.NewTokenStore[*AccessEntry]()
 
 	// Load http config and turn on http server if needed
-	a.loadHttpConfig()
+	if err := a.loadHttpConfig(); err != nil {
+		log.Error("failed to load http config: %v", err)
+	}
 
 	// Load server peers from local config
-	a.loadPeers()
+	if err := a.loadPeers(); err != nil {
+		log.Error("failed to load server peers: %v", err)
+	}
 
 	if a.config.FilterMode == FilterMode_EBPFXDP {
 		for _, server := range a.config.Servers {
@@ -252,7 +256,7 @@ func (a *UdpAC) newConnection(addr *net.UDPAddr) (conn *UdpConn) {
 	localAddr, err := net.ResolveUDPAddr(laddr.Network(), laddr.String())
 	if err != nil {
 		log.Error("resolve local UDPAddr error %v", err)
-		conn.netConn.Close()
+		_ = conn.netConn.Close()
 		return nil
 	}
 
@@ -469,7 +473,9 @@ func (a *UdpAC) connectionRoutine(conn *UdpConn) {
 			if pkt == nil {
 				continue
 			}
-			a.SendPacket(pkt, conn)
+			if _, sendErr := a.SendPacket(pkt, conn); sendErr != nil {
+				log.Error("failed to send packet to %s: %v", addrStr, sendErr)
+			}
 
 		case pkt, ok := <-conn.ConnData.RecvQueue:
 			if !ok {
@@ -542,7 +548,11 @@ func (a *UdpAC) recvMessageRoutine() {
 			case core.NHP_AOP:
 				// deal with NHP_AOP message
 				a.wg.Add(1)
-				go a.HandleUdpACOperations(ppd)
+				go func() {
+					if err := a.HandleUdpACOperations(ppd); err != nil {
+						log.Error("HandleUdpACOperations failed: %v", err)
+					}
+				}()
 
 			case core.NHP_ARD:
 				// Handle AC redispatch to assigned servers

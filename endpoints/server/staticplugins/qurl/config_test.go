@@ -1,6 +1,7 @@
 package qurl
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -330,7 +331,7 @@ func TestValidateAccessToken(t *testing.T) {
 					t.Errorf("ValidateAccessToken(%q) error = %v, want nil", tt.token, err)
 				}
 			} else {
-				if err != tt.wantErr {
+				if !errors.Is(err, tt.wantErr) {
 					t.Errorf("ValidateAccessToken(%q) error = %v, want %v", tt.token, err, tt.wantErr)
 				}
 			}

@@ -71,13 +71,13 @@ func DownloadFileToTemp(fileUrl string, pattern string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer outFile.Close()
+	defer func() { _ = outFile.Close() }()
 
 	resp, err := http.Get(fileUrl)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("failed to download file (%s): status code %s", fileUrl, resp.Status)

@@ -2,6 +2,7 @@ package qurl
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -71,18 +72,10 @@ func TestInit_ErrorPropagation(t *testing.T) {
 		"QURL_MAX_IDLE_CONNS_PER_HOST",
 		"QURL_IDLE_CONN_TIMEOUT",
 	}
-	savedEnv := make(map[string]string)
 	for _, key := range envVars {
-		savedEnv[key] = os.Getenv(key)
+		t.Setenv(key, "") // registers restore of original value
 		os.Unsetenv(key)
 	}
-	defer func() {
-		for key, val := range savedEnv {
-			if val != "" {
-				os.Setenv(key, val)
-			}
-		}
-	}()
 
 	// Call Init - should fail due to missing config
 	err := Init(nil)
@@ -97,7 +90,7 @@ func TestInit_ErrorPropagation(t *testing.T) {
 
 	// Verify idempotency - second call returns same error
 	err2 := Init(nil)
-	if err2 != err {
+	if !errors.Is(err2, err) {
 		t.Errorf("Init() second call returned different error: %v vs %v", err2, err)
 	}
 }
@@ -131,21 +124,10 @@ func TestInit_Success(t *testing.T) {
 		"QURL_IDLE_CONN_TIMEOUT":       "30",
 	}
 
-	// Save and set env vars
-	savedEnv := make(map[string]string)
+	// Set env vars (t.Setenv handles save/restore automatically)
 	for key, val := range envVars {
-		savedEnv[key] = os.Getenv(key)
-		os.Setenv(key, val)
+		t.Setenv(key, val)
 	}
-	defer func() {
-		for key, val := range savedEnv {
-			if val != "" {
-				os.Setenv(key, val)
-			} else {
-				os.Unsetenv(key)
-			}
-		}
-	}()
 
 	// Call Init - should succeed
 	err := Init(nil)
@@ -323,7 +305,7 @@ func TestAuthWithHttp_FullFlow(t *testing.T) {
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer qurlServer.Close()
 
@@ -458,7 +440,7 @@ func TestAuthWithHttp_ResolverError(t *testing.T) {
 				Message: "Token not found",
 			},
 		}
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer qurlServer.Close()
 

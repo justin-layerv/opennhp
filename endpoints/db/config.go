@@ -56,7 +56,9 @@ func (a *UdpDevice) loadBaseConfig() error {
 
 	baseConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("base config: %s has been updated", fileName)
-		a.updateBaseConfig(fileName)
+		if updateErr := a.updateBaseConfig(fileName); updateErr != nil {
+			log.Error("failed to apply base config update: %v", updateErr)
+		}
 	})
 	return nil
 }
@@ -65,11 +67,15 @@ func (a *UdpDevice) loadPeers() error {
 	// server.toml
 	fileName := filepath.Join(ExeDirPath, "etc", "server.toml")
 	// error intentionally ignored; server config may not exist yet
-	a.updateServerPeers(fileName)
+	if err := a.updateServerPeers(fileName); err != nil {
+		log.Debug("server peer config not loaded (may not exist yet): %v", err)
+	}
 
 	serverConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("server peer config: %s has been updated", fileName)
-		a.updateServerPeers(fileName)
+		if updateErr := a.updateServerPeers(fileName); updateErr != nil {
+			log.Error("failed to apply server peer config update: %v", updateErr)
+		}
 	})
 
 	return nil
@@ -79,11 +85,15 @@ func (a *UdpDevice) loadTEEs() error {
 	// consumer.toml
 	fileName := filepath.Join(ExeDirPath, "etc", "tee.toml")
 	// error intentionally ignored; TEE config may not exist yet
-	a.updateTEEConfig(fileName)
+	if err := a.updateTEEConfig(fileName); err != nil {
+		log.Debug("TEE config not loaded (may not exist yet): %v", err)
+	}
 
 	teesConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("tee peer config: %s has been updated", fileName)
-		a.updateTEEConfig(fileName)
+		if updateErr := a.updateTEEConfig(fileName); updateErr != nil {
+			log.Error("failed to apply TEE config update: %v", updateErr)
+		}
 	})
 
 	return nil
@@ -194,7 +204,7 @@ func (a *UdpDevice) updateTEEConfig(file string) (err error) {
 func (a *UdpDevice) StopConfigWatch() {
 	for _, w := range []io.Closer{baseConfigWatch, serverConfigWatch, teesConfigWatch} {
 		if w != nil {
-			w.Close()
+			_ = w.Close()
 		}
 	}
 }

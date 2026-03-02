@@ -36,7 +36,7 @@ func HashFile(method string, fileName string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer file.Close() // Be sure to close your file
+	defer func() { _ = file.Close() }() // Be sure to close your file
 
 	var hash hash.Hash
 
@@ -64,12 +64,15 @@ type fileWatcher struct {
 }
 
 func (w *fileWatcher) Close() error {
-	w.watcher.Close()
+	_ = w.watcher.Close()
 	w.wait.Wait()
 	log.Info("file watcher for %s closed", w.filename)
 	return nil
 }
 
+// WatchFile watches a file for changes and calls callback on modifications.
+// Returns nil if the watcher could not be set up (errors are logged internally).
+// Callers must check for nil before calling Close on the returned value.
 func WatchFile(file string, callback func()) io.Closer {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -80,7 +83,11 @@ func WatchFile(file string, callback func()) io.Closer {
 	// we have to watch the entire directory to pick up renames/atomic saves in a cross-platform way
 	filename := filepath.Clean(file)
 	dirPath, _ := filepath.Split(filename)
-	watcher.Add(dirPath)
+	if err := watcher.Add(dirPath); err != nil {
+		log.Error("failed to watch directory %s: %v", dirPath, err)
+		_ = watcher.Close()
+		return nil
+	}
 
 	var eventsWG sync.WaitGroup
 	var debounceTimer *time.Timer
@@ -89,7 +96,7 @@ func WatchFile(file string, callback func()) io.Closer {
 
 	go func() {
 		defer CatchPanic()
-		defer watcher.Close()
+		defer func() { _ = watcher.Close() }()
 		defer eventsWG.Done()
 
 		for {

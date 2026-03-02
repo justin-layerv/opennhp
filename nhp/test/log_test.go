@@ -17,7 +17,7 @@ func TestLog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	tlog := log.NewLogger("NHP-LogTest", log.LogLevelDebug, tmpDir, "logtest")
 	log.SetGlobalLogger(tlog)
@@ -75,7 +75,7 @@ func TestLog_JSONFormat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	l := log.NewLogger("NHP-Test", log.LogLevelTrace, tmpDir, "jsontest")
 	l.Info("hello %s", "world")
@@ -132,7 +132,7 @@ func TestLog_AuditSeparateFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	l := log.NewLogger("NHP-Audit", log.LogLevelAudit, tmpDir, "auditlog")
 	l.Info("info message")
@@ -172,7 +172,7 @@ func TestLog_LevelFiltering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	// LogLevelError only allows Error, Warning, Critical
 	l := log.NewLogger("NHP-Level", log.LogLevelError, tmpDir, "leveltest")
@@ -201,7 +201,7 @@ func TestLog_GlobalLogger(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	l := log.NewLogger("NHP-Global", log.LogLevelInfo, tmpDir, "globaltest")
 	log.SetGlobalLogger(l)
@@ -231,7 +231,7 @@ func TestLog_SubLogger(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	parent := log.NewLogger("Parent", log.LogLevelInfo, tmpDir, "subtest")
 	child := parent.NewSubLogger("Child", log.LogLevelInfo)
@@ -260,7 +260,7 @@ func TestLog_NewLoggerDefine_AllMethodsSafe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	// NewLoggerDefine should have all methods initialized (no nil panics)
 	l := log.NewLoggerDefine("", log.LogLevelTrace, tmpDir, "definetest")
@@ -300,7 +300,7 @@ func TestLog_CloseTwice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	l := log.NewLogger("NHP-Close", log.LogLevelInfo, tmpDir, "closetest")
 	l.Info("before close")

@@ -147,8 +147,8 @@ func (a *UdpAgent) registerTAService(c *gin.Context) {
 
 	_, err = os.Stat(filepath.Join(taDir, md5sum))
 	if err == nil { // corresponding trusted application has been uploaded.
-		os.Remove(fullFilePath)
-		os.Remove(filepath.Join(taDir, fileUuid))
+		_ = os.Remove(fullFilePath)
+		_ = os.Remove(filepath.Join(taDir, fileUuid))
 
 		fileInfo, err := utils.LoadJsonFileAsStruct(filepath.Join(taDir, md5sum))
 		if err != nil {
@@ -159,7 +159,7 @@ func (a *UdpAgent) registerTAService(c *gin.Context) {
 	}
 
 	// save file information into the file which name is md5sum, no matter the file exists or not.
-	utils.SaveStructAsJsonFile(filepath.Join(taDir, md5sum), map[string]any{
+	if saveErr := utils.SaveStructAsJsonFile(filepath.Join(taDir, md5sum), map[string]any{
 		"fileName":    file.Filename,
 		"name":        taName,
 		"uuid":        fileUuid,
@@ -167,7 +167,9 @@ func (a *UdpAgent) registerTAService(c *gin.Context) {
 		"description": description,
 		"language":    language,
 		"entry":       entry,
-	})
+	}); saveErr != nil {
+		log.Error("failed to save metadata for %s: %v", md5sum, saveErr)
+	}
 
 	ta, err := NewTrustApplication(fileUuid, language, filepath.Join(taDir, fileUuid, file.Filename))
 	if err != nil {
@@ -247,7 +249,7 @@ func (a *UdpAgent) configServer(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	encoder := toml.NewEncoder(file)
 	if err := encoder.Encode(peers); err != nil {

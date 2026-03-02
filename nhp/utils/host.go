@@ -10,7 +10,7 @@ func GetLocalOutboundAddress() net.IP {
 	if err != nil {
 		return nil
 	}
-	defer con.Close()
+	defer func() { _ = con.Close() }()
 
 	addr := con.LocalAddr().(*net.UDPAddr)
 

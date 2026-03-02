@@ -59,7 +59,7 @@ func (hs *HttpServer) initStorageRouter() {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "file not found"})
 			return
 		}
-		defer file.Close()
+		defer func() { _ = file.Close() }()
 
 		// generate UUID and file path
 		fileUUID := uuid.New().String()
@@ -83,7 +83,7 @@ func (hs *HttpServer) initStorageRouter() {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "create file failed"})
 			return
 		}
-		defer out.Close()
+		defer func() { _ = out.Close() }()
 
 		// create md5 calculator and progress tracker
 		md5Hash := md5.New()
@@ -113,7 +113,7 @@ func (hs *HttpServer) initStorageRouter() {
 		existingMetadata, exists := checkFileExists(fileMD5)
 		if exists {
 			// delete duplicate file
-			os.RemoveAll(fileDir)
+			_ = os.RemoveAll(fileDir)
 
 			c.JSON(http.StatusOK, gin.H{
 				"message":  "file already exists, skip storage",
@@ -297,7 +297,7 @@ func saveMetadata(metadata FileMetadata) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
@@ -327,7 +327,7 @@ func loadMetadata(uuid string) (FileMetadata, error) {
 	if err != nil {
 		return metadata, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	decoder := json.NewDecoder(file)
 	err = decoder.Decode(&metadata)

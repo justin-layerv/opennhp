@@ -212,7 +212,7 @@ func AddEbpfRuleForSrcDstPortProto(srcIPStr, dstIPStr string, protocol uint8, ds
 		log.Error("failed to load pinned whitelist map: %v", err)
 		return err
 	}
-	defer whitelistMap.Close()
+	defer func() { _ = whitelistMap.Close() }()
 
 	srcIP, err := parseIP(srcIPStr)
 	if err != nil {
@@ -242,7 +242,7 @@ func AddEbpfRuleForSrcDst(srcIPStr, dstIPStr string, ttlSec uint64) error {
 		log.Error("failed to load pinned whitelist map: %v", err)
 		return err
 	}
-	defer whitelistMap.Close()
+	defer func() { _ = whitelistMap.Close() }()
 
 	srcIP, err := parseIP(srcIPStr)
 	if err != nil {
@@ -270,7 +270,7 @@ func AddEbpfRuleForSrcDestPort(srcIPStr string, dstPort int, ttlSec uint64) erro
 		log.Error("failed to load pinned whitelist map: %v", err)
 		return err
 	}
-	defer whitelistMap.Close()
+	defer func() { _ = whitelistMap.Close() }()
 
 	srcIP, err := parseIP(srcIPStr)
 	if err != nil {
@@ -299,7 +299,7 @@ func AddEbpfIcmpRuleForSrcDst(srcIPStr, dstIPStr string, ttlSec uint64) error {
 		log.Error("failed to load pinned whitelist map: %v", err)
 		return err
 	}
-	defer whitelistMap.Close()
+	defer func() { _ = whitelistMap.Close() }()
 
 	srcIP, err := parseIP(srcIPStr)
 	if err != nil {
@@ -328,7 +328,7 @@ func AddEbpfRuleForSrcDestPortList(srcIPStr string, dstPortStart, dstPortEnd int
 		log.Error("failed to load pinned port_list map: %v", err)
 		return err
 	}
-	defer portListMap.Close()
+	defer func() { _ = portListMap.Close() }()
 
 	srcIP, err := parseIP(srcIPStr)
 	if err != nil {
@@ -370,7 +370,7 @@ func AddEbpfRuleForProtocolPort(protocol uint8, dstPort uint16, ttlSec uint64) e
 		log.Error("failed to load pinned protocol_port map: %v", err)
 		return err
 	}
-	defer portListMap.Close()
+	defer func() { _ = portListMap.Close() }()
 
 	rule := &procoPortKey{
 		DstPort:  dstPortt,

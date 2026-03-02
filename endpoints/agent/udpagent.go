@@ -138,7 +138,7 @@ type UdpConn struct {
 }
 
 func (c *UdpConn) Close() {
-	c.netConn.Close()
+	_ = c.netConn.Close()
 	c.ConnData.Close()
 }
 
@@ -183,7 +183,9 @@ func (a *UdpAgent) Start(dirPath string, logLevel int) (err error) {
 	a.device.Start()
 
 	// load peers
-	a.loadPeers()
+	if err := a.loadPeers(); err != nil {
+		log.Error("failed to load peers: %v", err)
+	}
 
 	a.remoteConnectionMap = make(map[string]*UdpConn)
 
@@ -192,7 +194,9 @@ func (a *UdpAgent) Start(dirPath string, logLevel int) (err error) {
 	a.signals.knockTargetMapUpdated = make(chan struct{}, 1)
 
 	// load knock resources
-	a.loadResources()
+	if err := a.loadResources(); err != nil {
+		log.Error("failed to load resources: %v", err)
+	}
 
 	a.recvMsgCh = a.device.DecryptedMsgQueue
 	a.sendMsgCh = make(chan *core.MsgData, core.SendQueueSize)
@@ -495,7 +499,9 @@ func (a *UdpAgent) connectionRoutine(conn *UdpConn) {
 			if pkt == nil {
 				continue
 			}
-			a.SendPacket(pkt, conn)
+			if _, sendErr := a.SendPacket(pkt, conn); sendErr != nil {
+				log.Error("failed to send packet to %s: %v", addrStr, sendErr)
+			}
 
 		case pkt, ok := <-conn.ConnData.RecvQueue:
 			if !ok {
@@ -591,7 +597,9 @@ func (a *UdpAgent) knockResourceRoutine() {
 				defer knockRoutineWg.Done()
 				defer log.Info("knock %s sub-routine stopped", knockStr)
 				defer func() {
-					a.ExitKnockRequest(res)
+					if _, exitErr := a.ExitKnockRequest(res); exitErr != nil {
+						log.Error("exit knock request failed for %s: %v", knockStr, exitErr)
+					}
 				}()
 
 				log.Info("knock %s sub-routine started", knockStr)
@@ -824,7 +832,10 @@ func (a *UdpAgent) PreCheckDataAccess(ztdoId string) (output string, refreshSdp 
 func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOutput string) (output string, err error) {
 	ztdo := ztdolib.NewZtdo()
 
-	consumerEphemeralEcdh := core.NewECDH(a.config.GetEccType())
+	consumerEphemeralEcdh, err := core.NewECDH(a.config.GetEccType())
+	if err != nil {
+		return "", fmt.Errorf("failed to generate ephemeral ECDH: %w", err)
+	}
 	teeEcdh := a.config.GetTeeEcdh()
 
 	darMsg := common.DARMsg{

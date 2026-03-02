@@ -54,7 +54,7 @@ func Init(in *plugins.PluginParamsIn) error {
 // The nil check is defensive - Close may be called even if Init failed or was never called.
 func Close() error {
 	if resolver != nil {
-		resolver.Close()
+		_ = resolver.Close()
 	}
 	log.Info("[QURL] Plugin closed")
 	return nil
@@ -219,9 +219,9 @@ func nhpDrop(ctx *gin.Context) {
 	// In tests (httptest.ResponseRecorder), gin's Hijack() panics because
 	// the underlying writer doesn't support it, so we recover gracefully.
 	func() {
-		defer func() { recover() }()
+		defer func() { recover() }() //nolint:errcheck // side-effect intentional; return value unused
 		if conn, _, err := ctx.Writer.Hijack(); err == nil && conn != nil {
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 	// Prevent any further handler processing

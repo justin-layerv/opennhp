@@ -9,9 +9,9 @@ linters:
     - unconvert
     - gosec
     - errorlint
+    - errcheck
   disable:
     - depguard
-    - errcheck  # TODO: Enable after fixing existing issues (tracked in UPSTREAM_SYNC.md)
   settings:
     govet:
       # Not using enable-all to avoid shadow analyzer

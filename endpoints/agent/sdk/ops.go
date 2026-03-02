@@ -225,7 +225,10 @@ func ExitResource(aspId, resId, serverIp, serverHostname string, serverPort int)
 // GenerateKeys creates a new Curve25519 key pair and returns the result as
 // "privateKeyBase64|publicKeyBase64".
 func GenerateKeys() string {
-	e := core.NewECDH(core.ECC_CURVE25519)
+	e, err := core.NewECDH(core.ECC_CURVE25519)
+	if err != nil {
+		return fmt.Sprintf("error: %v", err)
+	}
 	return fmt.Sprintf("%s|%s", e.PrivateKeyBase64(), e.PublicKeyBase64())
 }
 

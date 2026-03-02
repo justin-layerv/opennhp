@@ -159,7 +159,10 @@ func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err
 
 	// create ephermeral key
 	ephermalEccType := mad.ciphers.EccType
-	mad.ephermeralEcdh = NewECDH(ephermalEccType)
+	mad.ephermeralEcdh, err = NewECDH(ephermalEccType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create ephemeral ECDH key: %w", err)
+	}
 	copy(mad.header.EphermeralBytes(), mad.ephermeralEcdh.PublicKey())
 
 	return mad, nil
@@ -342,7 +345,9 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 		w := zlib.NewWriter(&buf)
 
 		_, err = w.Write(mad.bodyMessage)
-		w.Close()
+		if cerr := w.Close(); err == nil {
+			err = cerr
+		}
 		if err != nil {
 			log.Critical("message compression failed: %v", err)
 			ErrDataCompressionFailed.SetExtraError(err)

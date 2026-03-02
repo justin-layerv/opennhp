@@ -80,17 +80,19 @@ func (c *Curve25519ECDH) MidPublicKey() []byte {
 	return nil
 }
 
-func NewECDH() *Curve25519ECDH {
+func NewECDH() (*Curve25519ECDH, error) {
 	key := make([]byte, PrivateKeySize)
 	_, err := rand.Read(key)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("failed to generate random key: %w", err)
 	}
 	// clamp
 	key[0] &= 248
 	key[31] = (key[31] & 127) | 64
 	var c Curve25519ECDH
-	c.SetPrivateKey(key)
+	if err := c.SetPrivateKey(key); err != nil {
+		return nil, fmt.Errorf("failed to set private key: %w", err)
+	}
 
-	return &c
+	return &c, nil
 }

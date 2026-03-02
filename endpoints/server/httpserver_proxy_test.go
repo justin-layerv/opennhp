@@ -72,7 +72,7 @@ func TestTrustedProxyConfiguration(t *testing.T) {
 			if tt.envValue != "" {
 				t.Setenv("NHP_TRUSTED_PROXY_CIDRS", tt.envValue)
 			} else {
-				os.Unsetenv("NHP_TRUSTED_PROXY_CIDRS")
+				_ = os.Unsetenv("NHP_TRUSTED_PROXY_CIDRS")
 			}
 
 			var trusted bool
@@ -88,7 +88,7 @@ func TestTrustedProxyConfiguration(t *testing.T) {
 				}
 				trusted = true
 			} else {
-				engine.SetTrustedProxies(nil)
+				_ = engine.SetTrustedProxies(nil)
 			}
 
 			if trusted != tt.wantTrusted {

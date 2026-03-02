@@ -60,7 +60,9 @@ func TestDecompressionSizeLimit(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to compress test data: %v", err)
 			}
-			w.Close()
+			if err := w.Close(); err != nil {
+				t.Fatalf("failed to close zlib writer: %v", err)
+			}
 
 			// Decompress with size limit (mirrors responder.go logic)
 			br := bytes.NewReader(compressedBuf.Bytes())
@@ -68,7 +70,7 @@ func TestDecompressionSizeLimit(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to create zlib reader: %v", err)
 			}
-			defer r.Close()
+			defer func() { _ = r.Close() }()
 
 			var decompressedBuf bytes.Buffer
 			limitedReader := io.LimitReader(r, maxDecompressedSize+1)
@@ -139,7 +141,7 @@ func TestDecompressionInvalidData(t *testing.T) {
 					// If NewReader succeeded, try to read - it should fail
 					var buf bytes.Buffer
 					_, readErr := io.Copy(&buf, r)
-					r.Close()
+					_ = r.Close()
 					if readErr == nil && buf.Len() > 0 {
 						t.Errorf("expected error for invalid data, but got valid output")
 					}
@@ -152,7 +154,7 @@ func TestDecompressionInvalidData(t *testing.T) {
 				t.Errorf("unexpected error: %v", err)
 			}
 			if r != nil {
-				r.Close()
+				_ = r.Close()
 			}
 		})
 	}
@@ -169,7 +171,9 @@ func TestDecompressionValidData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compression failed: %v", err)
 	}
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Fatalf("failed to close zlib writer: %v", err)
+	}
 
 	// Decompress
 	br := bytes.NewReader(compressedBuf.Bytes())
@@ -177,7 +181,7 @@ func TestDecompressionValidData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create zlib reader: %v", err)
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	var decompressedBuf bytes.Buffer
 	_, err = io.Copy(&decompressedBuf, r)

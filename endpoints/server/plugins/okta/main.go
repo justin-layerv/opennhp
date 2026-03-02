@@ -80,19 +80,27 @@ func Init(in *plugins.PluginParamsIn) error {
 	// load config
 	fileNameBase := (filepath.Join(pluginDirPath, "etc", "config.toml"))
 	// optional config, may not exist yet
-	updateConfig(fileNameBase)
+	if err := updateConfig(fileNameBase); err != nil {
+		log.Info("base config not loaded (may not exist yet): %v", err)
+	}
 
 	baseConfigWatch = utils.WatchFile(fileNameBase, func() {
 		log.Info("base config: %s has been updated", fileNameBase)
-		updateConfig(fileNameBase)
+		if updateErr := updateConfig(fileNameBase); updateErr != nil {
+			log.Error("failed to apply base config update: %v", updateErr)
+		}
 	})
 
 	fileNameRes := filepath.Join(pluginDirPath, "etc", "resource.toml")
 	// optional config, may not exist yet
-	updateResource(fileNameRes)
+	if err := updateResource(fileNameRes); err != nil {
+		log.Info("resource config not loaded (may not exist yet): %v", err)
+	}
 	resConfigWatch = utils.WatchFile(fileNameRes, func() {
 		log.Info("resource config: %s has been updated", fileNameRes)
-		updateResource(fileNameRes)
+		if updateErr := updateResource(fileNameRes); updateErr != nil {
+			log.Error("failed to apply resource config update: %v", updateErr)
+		}
 	})
 
 	return nil
@@ -146,10 +154,10 @@ func updateResource(file string) (err error) {
 
 func Close() error {
 	if baseConfigWatch != nil {
-		baseConfigWatch.Close()
+		_ = baseConfigWatch.Close()
 	}
 	if resConfigWatch != nil {
-		resConfigWatch.Close()
+		_ = resConfigWatch.Close()
 	}
 	return nil
 }
@@ -282,7 +290,9 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 
 		session.Set("oauth_token", *oktaToken)
 		session.Set("profile", profile)
-		session.Save()
+		if saveErr := session.Save(); saveErr != nil {
+			log.Error("failed to save session: %v", saveErr)
+		}
 	} else {
 		// if no authorize code exists, try extract the oauth token from the session
 		oauthToken := session.Get("oauth_token")

@@ -66,7 +66,9 @@ func (a *Authenticator) DoAuth(ctx *gin.Context) error {
 	// Save the state inside the session
 	session := sessions.Default(ctx)
 	session.Set("state", state)
-	session.Save()
+	if err := session.Save(); err != nil {
+		return err
+	}
 
 	ctx.Redirect(http.StatusTemporaryRedirect, a.AuthCodeURL(state))
 	return nil

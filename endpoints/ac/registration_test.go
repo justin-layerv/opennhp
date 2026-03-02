@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -148,11 +147,7 @@ func TestACRegistration_NewACRegistration(t *testing.T) {
 // TestACRegistration_NewACRegistration_RegionDimension tests that AWS_REGION
 // env var adds a Region dimension to shared metrics dimensions.
 func TestACRegistration_NewACRegistration_RegionDimension(t *testing.T) {
-	// Save and restore AWS_REGION
-	orig := os.Getenv("AWS_REGION")
-	defer os.Setenv("AWS_REGION", orig)
-
-	os.Setenv("AWS_REGION", "us-west-2")
+	t.Setenv("AWS_REGION", "us-west-2")
 
 	ac := &UdpAC{
 		config: &Config{

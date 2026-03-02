@@ -34,7 +34,7 @@ func Decompression(data string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer gzreader.Close()
+	defer func() { _ = gzreader.Close() }()
 
 	output, err := io.ReadAll(gzreader)
 	if err != nil {

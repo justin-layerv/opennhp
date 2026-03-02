@@ -178,7 +178,7 @@ func (r *QurlResolver) Resolve(ctx context.Context, req *ResolveRequest) (*Resol
 		log.Error("[QURL] HTTP request failed: %v", err)
 		return nil, fmt.Errorf("failed to call QURL API: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Read response body with size limit to prevent memory exhaustion
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize))

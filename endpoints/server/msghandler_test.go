@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -18,7 +19,7 @@ func TestForwardToTransaction(t *testing.T) {
 		md := &core.MsgData{}
 		err := forwardToTransaction(connData, 42, md, "server-agent", "TestHandler", "user1", "1.2.3.4:5678")
 
-		if err != common.ErrTransactionIdNotFound {
+		if !errors.Is(err, common.ErrTransactionIdNotFound) {
 			t.Errorf("expected ErrTransactionIdNotFound, got %v", err)
 		}
 	})
@@ -60,15 +61,15 @@ func TestTempFileCleanupOrder(t *testing.T) {
 
 	file := filepath.Join(dir, "test.wasm")
 	if err := os.WriteFile(file, []byte("test"), 0600); err != nil {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir)
 		t.Fatal(err)
 	}
 
 	// Reproduce the defer order from onAttestationVerify.
 	// LIFO: last defer runs first, so file is removed before directory.
 	func() {
-		defer os.Remove(filepath.Dir(file)) // runs second — removes empty dir
-		defer os.Remove(file)               // runs first — removes file
+		defer func() { _ = os.Remove(filepath.Dir(file)) }() // runs second — removes empty dir
+		defer func() { _ = os.Remove(file) }()               // runs first — removes file
 	}()
 
 	if _, err := os.Stat(file); !os.IsNotExist(err) {
@@ -76,6 +77,6 @@ func TestTempFileCleanupOrder(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Errorf("temp directory was not removed: %s", dir)
-		os.RemoveAll(dir) // cleanup on failure
+		_ = os.RemoveAll(dir) // cleanup on failure
 	}
 }

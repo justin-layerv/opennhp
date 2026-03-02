@@ -210,7 +210,7 @@ func respondSuccessOrRedirect(ctx *gin.Context, format, nhpToken, refreshToken, 
 func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugins.HttpServerPluginHelper) (ackMsg *common.ServerKnockAckMsg, err error) {
 	action := ctx.Query("action")
 	if strings.EqualFold(action, "refresh") || strings.EqualFold(action, "nhp-refresh") {
-		AuthWithHttpRefresh(ctx, action, req, helper)
+		ackMsg, err = AuthWithHttpRefresh(ctx, action, req, helper)
 		return
 	}
 	resId := ctx.Query("resid")
@@ -641,7 +641,7 @@ func authAccessFromRaaS(ctx *gin.Context, req *common.HttpKnockRequest, res *com
 	if err != nil {
 		return nil, "604", fmt.Errorf("failed to call real IAM service: %w", err)
 	}
-	defer respRaas.Body.Close()
+	defer func() { _ = respRaas.Body.Close() }()
 	// Check status code
 	if respRaas.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(respRaas.Body)

@@ -53,7 +53,7 @@ func TestPanicCatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	tlog := log.NewLogger("NHP-LogTest", log.LogLevelDebug, tmpDir, "logtest")
 	log.SetGlobalLogger(tlog)
@@ -83,7 +83,7 @@ func TestUpdateTomlConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("can't create temporary file: %v", err)
 	}
-	defer os.Remove(tempFile.Name())
+	defer func() { _ = os.Remove(tempFile.Name()) }()
 
 	initialContent := `# NHP-Agent base config
 # field with (-) does not support dynamic update
@@ -109,7 +109,9 @@ LogLevel = 4
 	if _, err := tempFile.WriteString(initialContent); err != nil {
 		t.Fatalf("can't write into temporary file: %v", err)
 	}
-	tempFile.Close()
+	if err := tempFile.Close(); err != nil {
+		t.Fatalf("failed to close temp file: %v", err)
+	}
 
 	if err := utils.UpdateTomlConfig(tempFile.Name(), "PrivateKeyBase64", "+Jnee2lP6Kn47qzSaqwSmWxORsBkkCV6YHsRqXM23Vo="); err != nil {
 		t.Fatalf("can't update toml config: %v", err)

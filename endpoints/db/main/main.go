@@ -129,7 +129,10 @@ func initApp() {
 		Name:  "keygen",
 		Usage: "generate key pairs for NHP devices",
 		Action: func(c *cli.Context) error {
-			e := core.NewECDH(core.ECC_CURVE25519)
+			e, err := core.NewECDH(core.ECC_CURVE25519)
+			if err != nil {
+				return fmt.Errorf("failed to generate key pair: %w", err)
+			}
 			pub := e.PublicKeyBase64()
 			priv := e.PrivateKeyBase64()
 			fmt.Println("Private key: ", priv)
@@ -260,17 +263,30 @@ func runApp(params db.AppParams) error {
 				}
 			}
 
-			ztdo.SetMetadata(metadata)
+			if err := ztdo.SetMetadata(metadata); err != nil {
+				log.Error("failed to set metadata: %s", err)
+				return err
+			}
 
 			// generate data private key
 			dataPrkStore := db.NewDataPrivateKeyStore(a.GetOwnEcdh().PublicKeyBase64())
-			dataPrk := dataPrkStore.Generate(dataKeyPairEccMode)
+			dataPrk, err := dataPrkStore.Generate(dataKeyPairEccMode)
+			if err != nil {
+				log.Error("failed to generate data private key: %s", err)
+				return err
+			}
 
 			if !(params.DsType == "stream") { // generate ztdo file
 				if params.DsType == "online" {
-					ztdo.SetNhpServer(a.GetServerPeer().SendAddr().String())
+					if err := ztdo.SetNhpServer(a.GetServerPeer().SendAddr().String()); err != nil {
+						log.Error("failed to set NHP server: %s", err)
+						return err
+					}
 				} else { // offline
-					ztdo.SetNhpServer("")
+					if err := ztdo.SetNhpServer(""); err != nil {
+						log.Error("failed to set NHP server: %s", err)
+						return err
+					}
 				}
 
 				dataPbk := core.ECDHFromKey(dataKeyPairEccMode.ToEccType(), dataPrk).PublicKey()
@@ -307,7 +323,10 @@ func runApp(params db.AppParams) error {
 			}
 
 			// Save data private key after success encryption
-			dataPrkStore.Save(ztdoId)
+			if err := dataPrkStore.Save(ztdoId); err != nil {
+				log.Error("failed to save data private key: %s", err)
+				return err
+			}
 		}
 
 		if params.DsType != "offline" {

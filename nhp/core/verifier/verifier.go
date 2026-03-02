@@ -61,7 +61,7 @@ func NewVerifier(compressedEvienceBase64 string) (Verifier, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create zlib reader: %w", err)
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	evidenceBytes, err := io.ReadAll(r)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read evidence: %w", err)

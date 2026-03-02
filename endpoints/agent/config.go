@@ -69,7 +69,9 @@ func (a *UdpAgent) loadBaseConfig() error {
 
 	baseConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("base config: %s has been updated", fileName)
-		a.updateBaseConfig(fileName)
+		if updateErr := a.updateBaseConfig(fileName); updateErr != nil {
+			log.Error("failed to apply base config update: %v", updateErr)
+		}
 	})
 	return nil
 }
@@ -78,11 +80,15 @@ func (a *UdpAgent) loadDHPConfig() error {
 	// dhp.toml
 	fileName := filepath.Join(ExeDirPath, "etc", "dhp.toml")
 	// optional config, may not exist yet
-	a.updateDHPConfig(fileName)
+	if updateErr := a.updateDHPConfig(fileName); updateErr != nil {
+		log.Debug("DHP config not loaded: %v", updateErr)
+	}
 
 	dhpConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("DHP config: %s has been updated", fileName)
-		a.updateDHPConfig(fileName)
+		if updateErr := a.updateDHPConfig(fileName); updateErr != nil {
+			log.Error("failed to apply DHP config update: %v", updateErr)
+		}
 	})
 
 	return nil
@@ -92,11 +98,15 @@ func (a *UdpAgent) loadPeers() error {
 	// server.toml
 	fileName := filepath.Join(ExeDirPath, "etc", "server.toml")
 	// optional config, may not exist yet
-	a.updateServerPeers(fileName)
+	if updateErr := a.updateServerPeers(fileName); updateErr != nil {
+		log.Debug("server peers not loaded: %v", updateErr)
+	}
 
 	serverConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("server peer config: %s has been updated", fileName)
-		a.updateServerPeers(fileName)
+		if updateErr := a.updateServerPeers(fileName); updateErr != nil {
+			log.Error("failed to apply server peers update: %v", updateErr)
+		}
 	})
 
 	return nil
@@ -106,11 +116,15 @@ func (a *UdpAgent) loadResources() error {
 	// resource.toml
 	fileName := filepath.Join(ExeDirPath, "etc", "resource.toml")
 	// optional config, may not exist yet
-	a.updateResources(fileName)
+	if updateErr := a.updateResources(fileName); updateErr != nil {
+		log.Debug("resources not loaded: %v", updateErr)
+	}
 
 	resourceConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("resource config: %s has been updated", fileName)
-		a.updateResources(fileName)
+		if updateErr := a.updateResources(fileName); updateErr != nil {
+			log.Error("failed to apply resource config update: %v", updateErr)
+		}
 	})
 
 	return nil
@@ -274,7 +288,7 @@ func (a *UdpAgent) updateResources(file string) (err error) {
 func (a *UdpAgent) StopConfigWatch() {
 	for _, w := range []io.Closer{baseConfigWatch, dhpConfigWatch, serverConfigWatch, resourceConfigWatch} {
 		if w != nil {
-			w.Close()
+			_ = w.Close()
 		}
 	}
 }
@@ -292,7 +306,7 @@ func (a *UdpAgent) NewEcdhFromConfigFile() (core.Ecdh, error) {
 		return nil, err
 	}
 
-	return core.NewECDH(conf.GetEccType()), nil
+	return core.NewECDH(conf.GetEccType())
 }
 
 func (a *UdpAgent) rotateKey(file, tomlKey string) error {
