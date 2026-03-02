@@ -247,12 +247,9 @@ func (s *UdpServer) loadPeers() error {
 		})
 	}
 
-	// tee.toml
+	// tee.toml - optional, errors handled inside updateTee
 	fileNameTee := filepath.Join(ExeDirPath, "etc", "tee.toml")
-	if err := s.updateTee(fileNameTee); err != nil {
-		// ignore error
-		_ = err
-	}
+	s.updateTee(fileNameTee)
 	teeWatch = utils.WatchFile(fileNameTee, func() {
 		log.Info("tee: %s has been updated", fileNameTee)
 		s.updateTee(fileNameTee)
@@ -267,16 +264,15 @@ func (s *UdpServer) loadResources() error {
 	content, err := os.ReadFile(fileName)
 	if err != nil {
 		log.Error("failed to read resource config: %v", err)
+		return nil // optional config, watcher will pick up changes
 	}
 	aspMap := make(common.AuthSvcProviderMap)
 	// update
 	if err := toml.Unmarshal(content, &aspMap); err != nil {
 		log.Error("failed to unmarshal resource config: %v", err)
+		return nil
 	}
-	if err := s.updateResources(aspMap); err != nil {
-		// ignore error
-		_ = err
-	}
+	s.updateResources(aspMap)
 
 	resConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("resource config: %s has been updated", fileName)
@@ -298,17 +294,16 @@ func (s *UdpServer) loadSourceIps() error {
 	content, err := os.ReadFile(fileName)
 	if err != nil {
 		log.Error("failed to read src ip config: %v", err)
+		return nil // optional config, watcher will pick up changes
 	}
 
 	// update
 	srcIpMap := make(map[string][]*common.NetAddress)
 	if err := toml.Unmarshal(content, &srcIpMap); err != nil {
 		log.Error("failed to unmarshal src ip config: %v", err)
+		return nil
 	}
-	if err := s.updateSourceIps(srcIpMap); err != nil {
-		// ignore error
-		_ = err
-	}
+	s.updateSourceIps(srcIpMap)
 
 	srcipConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("src ip config: %s has been updated", fileName)
@@ -689,12 +684,14 @@ func (s *UdpServer) updateTee(file string) (err error) {
 	content, err := os.ReadFile(file)
 	if err != nil {
 		log.Error("failed to read tee config: %v", err)
+		return err
 	}
 
 	var tees TeeAttestationReports
 	teeMap := make(map[string]*TeeAttestationReport)
 	if err := toml.Unmarshal(content, &tees); err != nil {
 		log.Error("failed to unmarshal device peer config: %v", err)
+		return err
 	}
 	for _, tee := range tees.TEEs {
 		teeMap[tee.Measure] = tee
@@ -703,7 +700,7 @@ func (s *UdpServer) updateTee(file string) (err error) {
 	s.teeMapMutex.Lock()
 	defer s.teeMapMutex.Unlock()
 	s.teeMap = teeMap
-	return err
+	return nil
 }
 
 func (s *UdpServer) AppraiseEvidence(evidenceBase64 string) bool {

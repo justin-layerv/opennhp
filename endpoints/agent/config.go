@@ -130,11 +130,13 @@ func (a *UdpAgent) updateBaseConfig(file string) (err error) {
 	content, err := os.ReadFile(file)
 	if err != nil {
 		log.Error("failed to read base config: %v", err)
+		return err
 	}
 
 	var conf Config
 	if err := toml.Unmarshal(content, &conf); err != nil {
 		log.Error("failed to unmarshal base config: %v", err)
+		return err
 	}
 
 	a.knockUserMutex.Lock()
@@ -148,7 +150,7 @@ func (a *UdpAgent) updateBaseConfig(file string) (err error) {
 	if a.config == nil {
 		a.config = &conf
 		a.log.SetLogLevel(conf.LogLevel)
-		return err
+		return nil
 	}
 
 	// update
@@ -163,7 +165,7 @@ func (a *UdpAgent) updateBaseConfig(file string) (err error) {
 		a.config.DefaultCipherScheme = conf.DefaultCipherScheme
 	}
 
-	return err
+	return nil
 }
 
 func (a *UdpAgent) updateDHPConfig(file string) (err error) {
@@ -174,11 +176,13 @@ func (a *UdpAgent) updateDHPConfig(file string) (err error) {
 	content, err := os.ReadFile(file)
 	if err != nil {
 		log.Error("failed to read DHP config: %v", err)
+		return err
 	}
 
 	var conf DHPConfig
 	if err := toml.Unmarshal(content, &conf); err != nil {
 		log.Error("failed to unmarshal DHP config: %v", err)
+		return err
 	}
 
 	// Only set on first load; subsequent reloads are a no-op to preserve
@@ -186,7 +190,7 @@ func (a *UdpAgent) updateDHPConfig(file string) (err error) {
 	if a.config.DHPConfig == nil {
 		a.config.DHPConfig = &conf
 	}
-	return err
+	return nil
 }
 
 func (a *UdpAgent) updateServerPeers(file string) (err error) {
@@ -197,6 +201,7 @@ func (a *UdpAgent) updateServerPeers(file string) (err error) {
 	content, err := os.ReadFile(file)
 	if err != nil {
 		log.Error("failed to read server peer config: %v", err)
+		return err
 	}
 
 	// update
@@ -204,6 +209,7 @@ func (a *UdpAgent) updateServerPeers(file string) (err error) {
 	serverPeerMap := make(map[string]*core.UdpPeer)
 	if err := toml.Unmarshal(content, &peers); err != nil {
 		log.Error("failed to unmarshal server config: %v", err)
+		return err
 	}
 	for _, p := range peers.Servers {
 		p.Type = core.NHP_SERVER
@@ -221,7 +227,7 @@ func (a *UdpAgent) updateServerPeers(file string) (err error) {
 	}
 	a.serverPeerMap = serverPeerMap
 
-	return err
+	return nil
 }
 
 func (a *UdpAgent) updateResources(file string) (err error) {
@@ -232,12 +238,14 @@ func (a *UdpAgent) updateResources(file string) (err error) {
 	content, err := os.ReadFile(file)
 	if err != nil {
 		log.Error("failed to read resource config: %v", err)
+		return err
 	}
 
 	var resources Resources
 	targetMap := make(map[string]*KnockTarget)
 	if err := toml.Unmarshal(content, &resources); err != nil {
 		log.Error("failed to unmarshal resource config: %v", err)
+		return err
 	}
 	for _, res := range resources.Resources {
 		peer := a.FindServerPeerFromResource(res)
@@ -253,7 +261,7 @@ func (a *UdpAgent) updateResources(file string) (err error) {
 
 	if a.knockTargetMap == nil {
 		a.knockTargetMap = targetMap
-		return err
+		return nil
 	}
 
 	// update
@@ -266,7 +274,7 @@ func (a *UdpAgent) updateResources(file string) (err error) {
 		a.signals.knockTargetMapUpdated <- struct{}{}
 	}
 
-	return err
+	return nil
 }
 
 func (a *UdpAgent) StopConfigWatch() {
