@@ -886,18 +886,18 @@ jobs:
           aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Canary Deploy - NHP Server
+      - name: Instance Refresh - NHP Server
         env:
           ASG_NAME: ${{ needs.deploy-sandbox-infra.outputs.server_asg }}
         run: |
           echo "============================================"
-          echo "CANARY DEPLOYMENT - NHP Server"
+          echo "INSTANCE REFRESH - NHP Server"
           echo "============================================"
 
           # Cancel any existing instance refresh from previous failed/cancelled runs
           ./.github/scripts/cancel-existing-refresh.sh "$ASG_NAME"
 
-          # Start instance refresh with canary settings (1 instance at a time)
+          # Start instance refresh (1 instance at a time)
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "$ASG_NAME" \
             --preferences '{
@@ -947,12 +947,12 @@ jobs:
           aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Canary Deploy - AC
+      - name: Instance Refresh - AC
         env:
           ASG_NAME: ${{ needs.deploy-sandbox-infra.outputs.ac_asg }}
         run: |
           echo "============================================"
-          echo "CANARY DEPLOYMENT - Access Controller"
+          echo "INSTANCE REFRESH - Access Controller"
           echo "============================================"
 
           # Cancel any existing instance refresh from previous failed/cancelled runs
@@ -1007,12 +1007,12 @@ jobs:
           aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Canary Deploy - Console EC2
+      - name: Instance Refresh - Console EC2
         env:
           ASG_NAME: ${{ needs.deploy-sandbox-infra.outputs.console_ec2_asg }}
         run: |
           echo "============================================"
-          echo "CANARY DEPLOYMENT - Console EC2"
+          echo "INSTANCE REFRESH - Console EC2"
           echo "============================================"
 
           # Cancel any existing instance refresh from previous failed/cancelled runs
