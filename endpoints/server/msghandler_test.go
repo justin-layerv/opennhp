@@ -1,6 +1,8 @@
 package server
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
@@ -47,4 +49,33 @@ func TestForwardToTransaction(t *testing.T) {
 			t.Error("expected message to be sent to NextMsgCh")
 		}
 	})
+}
+
+func TestTempFileCleanupOrder(t *testing.T) {
+	// Simulate the temp directory+file created by utils.DownloadFileToTemp
+	dir, err := os.MkdirTemp("", "wasm-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	file := filepath.Join(dir, "test.wasm")
+	if err := os.WriteFile(file, []byte("test"), 0600); err != nil {
+		os.RemoveAll(dir)
+		t.Fatal(err)
+	}
+
+	// Reproduce the defer order from onAttestationVerify.
+	// LIFO: last defer runs first, so file is removed before directory.
+	func() {
+		defer os.Remove(filepath.Dir(file)) // runs second — removes empty dir
+		defer os.Remove(file)               // runs first — removes file
+	}()
+
+	if _, err := os.Stat(file); !os.IsNotExist(err) {
+		t.Errorf("temp file was not removed: %s", file)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("temp directory was not removed: %s", dir)
+		os.RemoveAll(dir) // cleanup on failure
+	}
 }

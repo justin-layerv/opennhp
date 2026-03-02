@@ -756,11 +756,11 @@ func (s *UdpServer) onAttestationVerify(spo *common.SmartPolicy, attestation str
 	wasmBytes, err := base64.StdEncoding.DecodeString(spo.Policy)
 	if err != nil {
 		wasmPath, err := utils.DownloadFileToTemp(spo.Policy, "wasm-")
-		defer os.Remove(filepath.Dir(wasmPath))
-		defer os.Remove(wasmPath)
 		if err != nil {
 			return err
 		}
+		defer os.Remove(filepath.Dir(wasmPath)) // LIFO: runs second, removes empty dir
+		defer os.Remove(wasmPath)                // LIFO: runs first, removes file
 		wasmBytes, err = os.ReadFile(wasmPath)
 		if err != nil {
 			return err
@@ -768,17 +768,15 @@ func (s *UdpServer) onAttestationVerify(spo *common.SmartPolicy, attestation str
 	}
 
 	engine := wasmEngine.NewEngine()
-	err = engine.LoadWasm(wasmBytes)
 	defer engine.Close()
-	if err != nil {
+	if err = engine.LoadWasm(wasmBytes); err != nil {
 		return err
 	}
 
 	if engine.OnAttestationVerify(attestation) {
 		return nil
-	} else {
-		return fmt.Errorf("attestation verification failed")
 	}
+	return fmt.Errorf("attestation verification failed")
 }
 
 func SaveZdtoConfig(drgMsg *common.DRGMsg) error {
