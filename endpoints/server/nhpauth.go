@@ -13,8 +13,8 @@ import (
 // HandleKnockRequest
 // Server will respond with success or error with NHP_ACK message
 func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
-	defer s.wg.Done()
 	s.wg.Add(1)
+	defer s.wg.Done()
 
 	knockStart := time.Now()
 	s.metrics.IncrCounter("KnockRequest")
@@ -112,13 +112,7 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 		ackBytes, _ = json.Marshal(dhpAckMsg)
 	}
 
-	ackMd := &core.MsgData{
-		HeaderType:     core.NHP_ACK,
-		TransactionId:  transactionId, // transactionId of the original knock request
-		Compress:       true,
-		PrevParserData: ppd,
-		Message:        ackBytes,
-	}
+	ackMd := makeMsgData(ppd, core.NHP_ACK, ackBytes)
 
 	return forwardToTransaction(ppd.ConnData, transactionId, ackMd, "server-agent", "HandleKnockRequest", knkMsg.UserId, addrStr)
 }

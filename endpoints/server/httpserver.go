@@ -552,8 +552,8 @@ func corsMiddleware() gin.HandlerFunc {
 }
 
 func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *common.ResourceData) (ack *common.ServerKnockAckMsg, err error) {
-	defer hs.wg.Done()
 	hs.wg.Add(1)
+	defer hs.wg.Done()
 	s := hs.udpServer
 	srcIp := req.SrcIp
 

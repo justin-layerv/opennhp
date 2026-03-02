@@ -14,8 +14,8 @@ import (
 )
 
 func (a *UdpAgent) Knock(res *KnockTarget) (ackMsg *common.ServerKnockAckMsg, err error) {
-	defer a.wg.Done()
 	a.wg.Add(1)
+	defer a.wg.Done()
 
 	errWaitTime := (core.AgentLocalTransactionResponseTimeoutMs - 100) * time.Millisecond
 	startTime := time.Now()

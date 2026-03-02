@@ -10,8 +10,8 @@ import (
 )
 
 func (a *UdpAgent) HandleCookieMessage(ppd *core.PacketParserData) bool {
-	defer a.wg.Done()
 	a.wg.Add(1)
+	defer a.wg.Done()
 
 	// redirect cookie response message to original knock request
 	cokMsg := &common.ServerCookieMsg{}

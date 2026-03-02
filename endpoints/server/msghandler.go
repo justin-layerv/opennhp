@@ -34,11 +34,23 @@ func forwardToTransaction(connData *core.ConnectionData, transactionId uint64, m
 	return nil
 }
 
+// makeMsgData creates a MsgData for sending a response back through the
+// same connection that delivered the request.
+func makeMsgData(ppd *core.PacketParserData, headerType int, msg []byte) *core.MsgData {
+	return &core.MsgData{
+		HeaderType:     headerType,
+		TransactionId:  ppd.SenderTrxId,
+		Compress:       true,
+		PrevParserData: ppd,
+		Message:        msg,
+	}
+}
+
 // HandleOTPRequest
 // Server will not respond to agent's otp request
 func (s *UdpServer) HandleOTPRequest(ppd *core.PacketParserData) (err error) {
-	defer s.wg.Done()
 	s.wg.Add(1)
+	defer s.wg.Done()
 
 	transactionId := ppd.SenderTrxId
 	addrStr := ppd.ConnData.RemoteAddr.String()
@@ -76,8 +88,8 @@ func (s *UdpServer) HandleOTPRequest(ppd *core.PacketParserData) (err error) {
 // HandleRegisterRequest
 // Server will respond with success or error with NHP_RAK message
 func (s *UdpServer) HandleRegisterRequest(ppd *core.PacketParserData) (err error) {
-	defer s.wg.Done()
 	s.wg.Add(1)
+	defer s.wg.Done()
 
 	transactionId := ppd.SenderTrxId
 	addrStr := ppd.ConnData.RemoteAddr.String()
@@ -124,13 +136,7 @@ func (s *UdpServer) HandleRegisterRequest(ppd *core.PacketParserData) (err error
 
 	// send NHP_RAK message
 	rakBytes, _ := json.Marshal(rakMsg)
-	rakMd := &core.MsgData{
-		HeaderType:     core.NHP_RAK,
-		TransactionId:  transactionId,
-		Compress:       true,
-		PrevParserData: ppd,
-		Message:        rakBytes,
-	}
+	rakMd := makeMsgData(ppd, core.NHP_RAK, rakBytes)
 
 	if fwdErr := forwardToTransaction(ppd.ConnData, transactionId, rakMd, "server-agent", "HandleRegisterRequest", regMsg.UserId, addrStr); fwdErr != nil {
 		return fwdErr
@@ -141,8 +147,8 @@ func (s *UdpServer) HandleRegisterRequest(ppd *core.PacketParserData) (err error
 // HandleListRequest
 // Server will respond with success or error with NHP_LRT message
 func (s *UdpServer) HandleListRequest(ppd *core.PacketParserData) (err error) {
-	defer s.wg.Done()
 	s.wg.Add(1)
+	defer s.wg.Done()
 
 	transactionId := ppd.SenderTrxId
 	addrStr := ppd.ConnData.RemoteAddr.String()
@@ -187,13 +193,7 @@ func (s *UdpServer) HandleListRequest(ppd *core.PacketParserData) (err error) {
 	}()
 
 	lrtBytes, _ := json.Marshal(lrtMsg)
-	ackMd := &core.MsgData{
-		HeaderType:     core.NHP_LRT,
-		TransactionId:  transactionId,
-		Compress:       true,
-		PrevParserData: ppd,
-		Message:        lrtBytes,
-	}
+	ackMd := makeMsgData(ppd, core.NHP_LRT, lrtBytes)
 
 	if fwdErr := forwardToTransaction(ppd.ConnData, transactionId, ackMd, "server-agent", "HandleListRequest", lstMsg.UserId, addrStr); fwdErr != nil {
 		return fwdErr
@@ -202,8 +202,8 @@ func (s *UdpServer) HandleListRequest(ppd *core.PacketParserData) (err error) {
 }
 
 func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
-	defer s.wg.Done()
 	s.wg.Add(1)
+	defer s.wg.Done()
 
 	transactionId := ppd.SenderTrxId
 	addrStr := ppd.ConnData.RemoteAddr.String()
@@ -252,13 +252,7 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 				ErrMsg:  validationErr.Error(),
 			}
 			aakBytes, _ := json.Marshal(aakMsg)
-			aakMd := &core.MsgData{
-				HeaderType:     core.NHP_AAK,
-				TransactionId:  transactionId,
-				Compress:       true,
-				PrevParserData: ppd,
-				Message:        aakBytes,
-			}
+			aakMd := makeMsgData(ppd, core.NHP_AAK, aakBytes)
 			if transaction := ppd.ConnData.FindRemoteTransaction(transactionId); transaction != nil {
 				transaction.NextMsgCh <- aakMd
 			}
@@ -371,14 +365,7 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		ServerPubKey: s.device.PublicKeyBase64(),
 	}
 	aakBytes, _ := json.Marshal(aakMsg)
-
-	aakMd := &core.MsgData{
-		HeaderType:     core.NHP_AAK,
-		TransactionId:  transactionId,
-		Compress:       true,
-		PrevParserData: ppd,
-		Message:        aakBytes,
-	}
+	aakMd := makeMsgData(ppd, core.NHP_AAK, aakBytes)
 
 	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-ac", "HandleACOnline", acId, addrStr)
 }
@@ -467,14 +454,7 @@ func (s *UdpServer) handleACServerAssignment(
 		ErrCode: common.ErrSuccess.ErrorCode(),
 	}
 	ardBytes, _ := json.Marshal(ardMsg)
-
-	ardMd := &core.MsgData{
-		HeaderType:     core.NHP_ARD,
-		TransactionId:  transactionId,
-		Compress:       true,
-		PrevParserData: ppd,
-		Message:        ardBytes,
-	}
+	ardMd := makeMsgData(ppd, core.NHP_ARD, ardBytes)
 
 	if err := forwardToTransaction(ppd.ConnData, transactionId, ardMd, "server-ac", "HandleACOnline/ARD", acId, addrStr); err != nil {
 		return false, err
@@ -589,8 +569,8 @@ func (s *UdpServer) validateACLicense(
 }
 
 func (s *UdpServer) HandleDBOnline(ppd *core.PacketParserData) (err error) {
-	defer s.wg.Done()
 	s.wg.Add(1)
+	defer s.wg.Done()
 
 	transactionId := ppd.SenderTrxId
 	addrStr := ppd.ConnData.RemoteAddr.String()
@@ -624,21 +604,14 @@ func (s *UdpServer) HandleDBOnline(ppd *core.PacketParserData) (err error) {
 		DBAddr:  ppd.ConnData.RemoteAddr.String(),
 	}
 	aakBytes, _ := json.Marshal(aakMsg)
-
-	aakMd := &core.MsgData{
-		HeaderType:     core.NHP_DBA,
-		TransactionId:  transactionId,
-		Compress:       true,
-		PrevParserData: ppd,
-		Message:        aakBytes,
-	}
+	aakMd := makeMsgData(ppd, core.NHP_DBA, aakBytes)
 
 	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-db", "HandleDBOnline", dbId, addrStr)
 }
 
 func (s *UdpServer) HandleDHPDARMessage(ppd *core.PacketParserData) (err error) {
-	defer s.wg.Done()
 	s.wg.Add(1)
+	defer s.wg.Done()
 
 	transactionId := ppd.SenderTrxId
 	addrStr := ppd.ConnData.RemoteAddr.String()
@@ -667,19 +640,13 @@ func (s *UdpServer) HandleDHPDARMessage(ppd *core.PacketParserData) (err error) 
 
 	aakBytes, _ := json.Marshal(dsaMsg)
 	log.Debug("dagMsg:%s", (string)(aakBytes))
-	aakMd := &core.MsgData{
-		HeaderType:     core.NHP_DSA,
-		TransactionId:  transactionId,
-		Compress:       true,
-		PrevParserData: ppd,
-		Message:        aakBytes,
-	}
+	aakMd := makeMsgData(ppd, core.NHP_DSA, aakBytes)
 	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-agent", "HandleDHPDARMessage", doId, addrStr)
 }
 
 func (s *UdpServer) HandleDHPDAVMessage(ppd *core.PacketParserData) (err error) {
-	defer s.wg.Done()
 	s.wg.Add(1)
+	defer s.wg.Done()
 
 	transactionId := ppd.SenderTrxId
 	addrStr := ppd.ConnData.RemoteAddr.String()
@@ -739,20 +706,14 @@ func (s *UdpServer) HandleDHPDAVMessage(ppd *core.PacketParserData) (err error) 
 
 	aakBytes, _ := json.Marshal(dagMsg)
 	log.Debug("dagMsg:%s", (string)(aakBytes))
-	aakMd := &core.MsgData{
-		HeaderType:     core.NHP_DAG,
-		TransactionId:  transactionId,
-		Compress:       true,
-		PrevParserData: ppd,
-		Message:        aakBytes,
-	}
+	aakMd := makeMsgData(ppd, core.NHP_DAG, aakBytes)
 	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-agent", "HandleDHPDAVMessage", doId, addrStr)
 }
 
 // HandleDHPDRGMessage
 func (s *UdpServer) HandleDHPDRGMessage(ppd *core.PacketParserData) (err error) {
-	defer s.wg.Done()
 	s.wg.Add(1)
+	defer s.wg.Done()
 
 	transactionId := ppd.SenderTrxId
 	addrStr := ppd.ConnData.RemoteAddr.String()
@@ -782,14 +743,7 @@ func (s *UdpServer) HandleDHPDRGMessage(ppd *core.PacketParserData) (err error) 
 		ErrMsg:  errMsg,
 	}
 	aakBytes, _ := json.Marshal(aakMsg)
-
-	aakMd := &core.MsgData{
-		HeaderType:     core.NHP_DAK,
-		TransactionId:  transactionId,
-		Compress:       true,
-		PrevParserData: ppd,
-		Message:        aakBytes,
-	}
+	aakMd := makeMsgData(ppd, core.NHP_DAK, aakBytes)
 
 	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-db", "HandleDHPDRGMessage", doId, addrStr)
 }
