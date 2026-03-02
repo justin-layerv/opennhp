@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -362,8 +363,7 @@ func buildDimCounterKey(name string, dims []types.Dimension) string {
 	// pre-sorted and extras are appended in consistent order).
 	sorted := dims
 	if !dimsSorted(dims) {
-		sorted = make([]types.Dimension, len(dims))
-		copy(sorted, dims)
+		sorted = slices.Clone(dims)
 		sort.Slice(sorted, func(i, j int) bool {
 			return *sorted[i].Name < *sorted[j].Name
 		})

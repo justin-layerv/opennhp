@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -298,8 +299,7 @@ func (r *ACRegistration) Stop() {
 func (r *ACRegistration) GetAssignedServers() []*AssignedServer {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	servers := make([]*AssignedServer, len(r.assignedServers))
-	copy(servers, r.assignedServers)
+	servers := slices.Clone(r.assignedServers)
 	return servers
 }
 
@@ -314,8 +314,7 @@ func (r *ACRegistration) HasAssignedServers() bool {
 // This should be called when any message is received from a server (NHP_AOP, NHP_AAK, etc.).
 func (r *ACRegistration) UpdateServerLastSeen(pubKeyBase64 string) {
 	r.mu.RLock()
-	servers := make([]*AssignedServer, len(r.assignedServers))
-	copy(servers, r.assignedServers)
+	servers := slices.Clone(r.assignedServers)
 	r.mu.RUnlock()
 
 	for _, server := range servers {
@@ -331,8 +330,7 @@ func (r *ACRegistration) UpdateServerLastSeen(pubKeyBase64 string) {
 // This is useful when we receive a message but don't have the public key readily available.
 func (r *ACRegistration) UpdateServerLastSeenByAddr(addr string) {
 	r.mu.RLock()
-	servers := make([]*AssignedServer, len(r.assignedServers))
-	copy(servers, r.assignedServers)
+	servers := slices.Clone(r.assignedServers)
 	r.mu.RUnlock()
 
 	for _, server := range servers {
@@ -937,8 +935,7 @@ func (r *ACRegistration) keepaliveLoop() {
 // sendKeepalives sends keepalive to each assigned server.
 func (r *ACRegistration) sendKeepalives() {
 	r.mu.RLock()
-	servers := make([]*AssignedServer, len(r.assignedServers))
-	copy(servers, r.assignedServers)
+	servers := slices.Clone(r.assignedServers)
 	r.mu.RUnlock()
 
 	for _, server := range servers {
@@ -985,8 +982,7 @@ func (r *ACRegistration) sendKeepalives() {
 // - Timeout: Server unreachable, triggers health check failure
 func (r *ACRegistration) refreshAssignedServerRegistrations() {
 	r.mu.RLock()
-	servers := make([]*AssignedServer, len(r.assignedServers))
-	copy(servers, r.assignedServers)
+	servers := slices.Clone(r.assignedServers)
 	r.mu.RUnlock()
 
 	if len(servers) == 0 {
@@ -1091,8 +1087,7 @@ func (r *ACRegistration) handleRefreshResponse(ppd *core.PacketParserData, serve
 // checkServerHealth checks if any server is down and triggers re-registration.
 func (r *ACRegistration) checkServerHealth() {
 	r.mu.RLock()
-	servers := make([]*AssignedServer, len(r.assignedServers))
-	copy(servers, r.assignedServers)
+	servers := slices.Clone(r.assignedServers)
 	r.mu.RUnlock()
 
 	for _, server := range servers {

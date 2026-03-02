@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -418,8 +419,7 @@ func (ipset *IPSet) Add(ipType IPTYPE, t int, expire int, args ...string) (strin
 	// entries are converted to IPv6-mapped form (::ffff:x.x.x.x).
 	// This prevents "ipset add" failures from mixed address families (e.g.,
 	// IPv6 source + IPv4 DefaultIp destination in an inet6 set).
-	normalizedArgs := make([]string, len(args))
-	copy(normalizedArgs, args)
+	normalizedArgs := slices.Clone(args)
 	for i, arg := range normalizedArgs {
 		normalizedArgs[i] = NormalizeIPSetEntry(ipType, arg)
 	}

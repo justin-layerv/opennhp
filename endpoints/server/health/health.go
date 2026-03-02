@@ -9,6 +9,7 @@ package health
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -240,8 +241,7 @@ func (m *Manager) CheckReadinessWithRequestID(ctx context.Context, requestID str
 
 func (m *Manager) checkReadinessWithRequestID(ctx context.Context, requestID string) *HealthResponse {
 	m.mu.RLock()
-	checkers := make([]Checker, len(m.checkers))
-	copy(checkers, m.checkers)
+	checkers := slices.Clone(m.checkers)
 	m.mu.RUnlock()
 
 	// Create context with timeout

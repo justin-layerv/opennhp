@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -132,8 +133,7 @@ func (f *ServerForwarder) ForwardKnock(
 	}
 
 	// Copy and shuffle servers for load distribution
-	servers := make([]ServerInfo, len(assignment.AssignedServers))
-	copy(servers, assignment.AssignedServers)
+	servers := slices.Clone(assignment.AssignedServers)
 	rand.Shuffle(len(servers), func(i, j int) {
 		servers[i], servers[j] = servers[j], servers[i]
 	})

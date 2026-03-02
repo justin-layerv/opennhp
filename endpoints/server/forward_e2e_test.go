@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -1015,8 +1016,7 @@ func captureEncryptedPacket(sender, receiver *E2ETestNode, headerType int, messa
 	case pkt := <-captureConn.SendQueue:
 		if pkt != nil && pkt.Content != nil {
 			// Copy the content since the packet might be released
-			captured := make([]byte, len(pkt.Content))
-			copy(captured, pkt.Content)
+			captured := slices.Clone(pkt.Content)
 			return captured, nil
 		}
 		return nil, errors.New("captured empty packet")

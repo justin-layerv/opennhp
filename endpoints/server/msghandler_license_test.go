@@ -1,6 +1,7 @@
 package server
 
 import (
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -392,8 +393,7 @@ func trimmedMedian(durations []time.Duration, trim int) time.Duration {
 	}
 
 	// Sort a copy to avoid mutating the original
-	sorted := make([]time.Duration, len(durations))
-	copy(sorted, durations)
+	sorted := slices.Clone(durations)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 
 	// Trim outliers

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -129,12 +130,10 @@ func (lw *AsyncLogWriter) Write(buf []byte) (n int, err error) {
 		return 0, nil // writer closed; discard silently during shutdown
 	}
 
-	n = len(buf)
-	msg := make([]byte, n)
-	copy(msg, buf)
+	msg := slices.Clone(buf)
 	lw.msg <- msg
 
-	return n, nil
+	return len(buf), nil
 }
 
 func (lw *AsyncLogWriter) writeRoutine() {

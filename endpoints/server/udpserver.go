@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -1337,8 +1338,7 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 		acConns, found := s.acConnectionMap[acId]
 		var connsCopy []*ACConn
 		if found {
-			connsCopy = make([]*ACConn, len(acConns))
-			copy(connsCopy, acConns)
+			connsCopy = slices.Clone(acConns)
 		}
 		s.acConnectionMapMutex.Unlock()
 		if !found || len(connsCopy) == 0 {
@@ -1543,8 +1543,7 @@ func (s *UdpServer) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*A
 	conns, found := s.acConnectionMap[acId]
 	var result []*ACConn
 	if found {
-		result = make([]*ACConn, len(conns))
-		copy(result, conns)
+		result = slices.Clone(conns)
 	}
 	s.acConnectionMapMutex.Unlock()
 

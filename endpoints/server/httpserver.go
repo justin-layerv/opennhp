@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -588,8 +589,7 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 		acConns, found := s.acConnectionMap[acId]
 		var connsCopy []*ACConn
 		if found {
-			connsCopy = make([]*ACConn, len(acConns))
-			copy(connsCopy, acConns)
+			connsCopy = slices.Clone(acConns)
 		}
 		s.acConnectionMapMutex.Unlock()
 		if !found || len(connsCopy) == 0 {

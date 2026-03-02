@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -597,7 +598,5 @@ func (ppd *PacketParserData) BasePacketContent() []byte {
 		return nil
 	}
 	// Return a copy to prevent modification of the original
-	content := make([]byte, len(ppd.basePacket.Content))
-	copy(content, ppd.basePacket.Content)
-	return content
+	return slices.Clone(ppd.basePacket.Content)
 }

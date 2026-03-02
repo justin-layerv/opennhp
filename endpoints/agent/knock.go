@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"net"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -301,8 +302,7 @@ func (a *UdpAgent) processPreAccessAction(info *common.PreAccessInfo) error {
 	}
 
 	// copy the packet for GC recycling and release the original packet buffer
-	packetBytes := make([]byte, len(accMad.BasePacket.Content))
-	copy(packetBytes, accMad.BasePacket.Content)
+	packetBytes := slices.Clone(accMad.BasePacket.Content)
 	accMad.Destroy()
 
 	// open new routine(s) to send access packet to ac's temporary port
