@@ -77,10 +77,8 @@ func (a *UdpAgent) loadBaseConfig() error {
 func (a *UdpAgent) loadDHPConfig() error {
 	// dhp.toml
 	fileName := filepath.Join(ExeDirPath, "etc", "dhp.toml")
-	if err := a.updateDHPConfig(fileName); err != nil {
-		// ignore error
-		_ = err
-	}
+	// optional config, may not exist yet
+	a.updateDHPConfig(fileName)
 
 	dhpConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("DHP config: %s has been updated", fileName)
@@ -93,10 +91,8 @@ func (a *UdpAgent) loadDHPConfig() error {
 func (a *UdpAgent) loadPeers() error {
 	// server.toml
 	fileName := filepath.Join(ExeDirPath, "etc", "server.toml")
-	if err := a.updateServerPeers(fileName); err != nil {
-		// ignore error
-		_ = err
-	}
+	// optional config, may not exist yet
+	a.updateServerPeers(fileName)
 
 	serverConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("server peer config: %s has been updated", fileName)
@@ -109,10 +105,8 @@ func (a *UdpAgent) loadPeers() error {
 func (a *UdpAgent) loadResources() error {
 	// resource.toml
 	fileName := filepath.Join(ExeDirPath, "etc", "resource.toml")
-	if err := a.updateResources(fileName); err != nil {
-		// ignore error
-		_ = err
-	}
+	// optional config, may not exist yet
+	a.updateResources(fileName)
 
 	resourceConfigWatch = utils.WatchFile(fileName, func() {
 		log.Info("resource config: %s has been updated", fileName)

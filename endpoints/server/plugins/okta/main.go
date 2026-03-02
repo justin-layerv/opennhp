@@ -78,10 +78,8 @@ func Init(in *plugins.PluginParamsIn) error {
 
 	// load config
 	fileNameBase := (filepath.Join(pluginDirPath, "etc", "config.toml"))
-	if err := updateConfig(fileNameBase); err != nil {
-		// ignore error
-		_ = err
-	}
+	// optional config, may not exist yet
+	updateConfig(fileNameBase)
 
 	baseConfigWatch = utils.WatchFile(fileNameBase, func() {
 		log.Info("base config: %s has been updated", fileNameBase)
@@ -89,10 +87,8 @@ func Init(in *plugins.PluginParamsIn) error {
 	})
 
 	fileNameRes := filepath.Join(pluginDirPath, "etc", "resource.toml")
-	if err := updateResource(fileNameRes); err != nil {
-		// ignore error
-		_ = err
-	}
+	// optional config, may not exist yet
+	updateResource(fileNameRes)
 	resConfigWatch = utils.WatchFile(fileNameRes, func() {
 		log.Info("resource config: %s has been updated", fileNameRes)
 		updateResource(fileNameRes)

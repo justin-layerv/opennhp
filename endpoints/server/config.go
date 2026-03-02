@@ -360,12 +360,10 @@ func (s *UdpServer) initRemoteConn() error {
 			ClientKey:  conf.ClientKey,
 		}
 
-		err = s.etcdConn.InitClient()
-		return err
-	} else {
-		return errors.New("unknown remote provider")
+		return s.etcdConn.InitClient()
 	}
 
+	return errors.New("unknown remote provider")
 }
 
 func (s *UdpServer) loadRemoteConfig() error {

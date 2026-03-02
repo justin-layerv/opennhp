@@ -86,36 +86,36 @@ func NewTrustApplication(tadId string, language string, entry string) (*TrustedA
 		log.Error("Failed to list functions which are supported in trusted application: %v", err)
 		cancel()
 		return nil, err
-	} else {
-		for _, tool := range toolsResult.Tools {
-			taFunc := TAFunction{
-				Method:      "POST",
-				Name:        fmt.Sprintf("%s/%s/%s", taApiPrefix, ta.Id, tool.Name),
-				Description: tool.Description,
-				Params: []TAFunctionParam{
-					{
-						Name:        "doId",
-						Description: "identifier of the data object",
-						Type:        "string",
-					},
-				},
-			}
+	}
 
-			schema := tool.InputSchema
-			for name, propSchema := range schema.Properties {
-				if name == "path" { // path is injected by nhp agent
-					continue
-				}
-				prop, _ := propSchema.(map[string]any)
-				taFuncParam := TAFunctionParam{
-					Name:        name,
-					Description: prop["description"].(string),
-					Type:        prop["type"].(string),
-				}
-				taFunc.Params = append(taFunc.Params, taFuncParam)
-			}
-			ta.Functions = append(ta.Functions, taFunc)
+	for _, tool := range toolsResult.Tools {
+		taFunc := TAFunction{
+			Method:      "POST",
+			Name:        fmt.Sprintf("%s/%s/%s", taApiPrefix, ta.Id, tool.Name),
+			Description: tool.Description,
+			Params: []TAFunctionParam{
+				{
+					Name:        "doId",
+					Description: "identifier of the data object",
+					Type:        "string",
+				},
+			},
 		}
+
+		schema := tool.InputSchema
+		for name, propSchema := range schema.Properties {
+			if name == "path" { // path is injected by nhp agent
+				continue
+			}
+			prop, _ := propSchema.(map[string]any)
+			taFuncParam := TAFunctionParam{
+				Name:        name,
+				Description: prop["description"].(string),
+				Type:        prop["type"].(string),
+			}
+			taFunc.Params = append(taFunc.Params, taFuncParam)
+		}
+		ta.Functions = append(ta.Functions, taFunc)
 	}
 
 	ta.Ctx = ctx
@@ -135,9 +135,8 @@ func GetTrustedApplication(trustedAppUuid string) (*TrustedApplication, error) {
 
 	if ta, exists := bufferedTaMap[trustedAppUuid]; exists {
 		return ta, nil
-	} else {
-		return nil, fmt.Errorf("TrustedApplication not found, please register first")
 	}
+	return nil, fmt.Errorf("TrustedApplication not found, please register first")
 }
 
 func (ta *TrustedApplication) GetSupportedFunctions() []TAFunction {

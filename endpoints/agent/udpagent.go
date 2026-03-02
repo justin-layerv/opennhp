@@ -781,22 +781,19 @@ func (a *UdpAgent) StartConfidentialComputing(ztdoId string, taId string, functi
 
 	var exist bool
 	if policyId, exist = a.smartPolicyIdentifier[ztdoId]; !exist {
-		return nil, fmt.Errorf("Error: fail to find policyId for ztdoId %s.\n", ztdoId)
+		return nil, fmt.Errorf("failed to find policyId for ztdoId %s", ztdoId)
 	}
 
 	taRes, err := a.CallTrustedApplication(taId, function, params, policyId)
 	if err != nil {
-		return nil, fmt.Errorf("fail to call trusted application with error: %s\n", err.Error())
-	} else {
-		var structResult map[string]any
-
-		err := json.Unmarshal([]byte(taRes), &structResult)
-		if err != nil {
-			return nil, fmt.Errorf("fail to unmarshal confidential computing result: %s\n", err.Error())
-		}
-
-		return structResult, nil
+		return nil, fmt.Errorf("fail to call trusted application with error: %s", err.Error())
 	}
+
+	var structResult map[string]any
+	if err := json.Unmarshal([]byte(taRes), &structResult); err != nil {
+		return nil, fmt.Errorf("fail to unmarshal confidential computing result: %s", err.Error())
+	}
+	return structResult, nil
 }
 
 func (a *UdpAgent) PreCheckDataAccess(ztdoId string) (output string, refreshSdp bool, decrypted bool) {
@@ -920,10 +917,9 @@ func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOut
 			gcmKey, ad = saData.AgreeSymmetricKey()
 
 			if err := ztdo.DecryptZtdoFile(ztdoPath, output, gcmKey[:], ad); err != nil {
-				return "", fmt.Errorf("Failed to decrypt ztdo file: %v", err)
-			} else {
-				a.decryptedZtdoRecord[ztdoId] = output
+				return "", fmt.Errorf("failed to decrypt ztdo file: %v", err)
 			}
+			a.decryptedZtdoRecord[ztdoId] = output
 		} else {
 			output = decryptedOutput
 		}
@@ -1114,12 +1110,10 @@ func (a *UdpAgent) CallTrustedApplication(taId string, function string, params m
 	taRes, err := ta.CallFunction(function, params)
 	if err != nil {
 		return "", err
-	} else {
-		if spEngine, exist := a.smartPolicyEngine[spoId]; exist {
-			resultWithPostProcess := spEngine.OnDataPostprocess(taRes)
-			return resultWithPostProcess, nil
-		} else {
-			return taRes, nil
-		}
 	}
+
+	if spEngine, exist := a.smartPolicyEngine[spoId]; exist {
+		return spEngine.OnDataPostprocess(taRes), nil
+	}
+	return taRes, nil
 }
