@@ -690,20 +690,7 @@ func (s *UdpServer) connectionRoutine(conn *UdpConn) {
 		// so make sure the timeout removal here does not delete newer ac connections
 		if conn.isACConnection {
 			s.acConnectionMapMutex.Lock()
-		acCleanup:
-			for acId, conns := range s.acConnectionMap {
-				for i, acConn := range conns {
-					if acConn.ConnData.Equal(conn.ConnData) {
-						// Safe to modify conns here because we break out of both
-						// loops immediately via the labeled break.
-						s.acConnectionMap[acId] = append(conns[:i], conns[i+1:]...)
-						if len(s.acConnectionMap[acId]) == 0 {
-							delete(s.acConnectionMap, acId)
-						}
-						break acCleanup
-					}
-				}
-			}
+			s.removeACConnectionRecord(conn)
 			s.acConnectionMapMutex.Unlock()
 		}
 
@@ -962,6 +949,23 @@ func (s *UdpServer) GetTeePublicKeyBase64AndConsumerEphemeralPublicKeyBase64(age
 	}
 	return "", ""
 }
+
+// removeACConnectionRecord removes the given connection from acConnectionMap.
+// Must be called while holding s.acConnectionMapMutex.
+func (s *UdpServer) removeACConnectionRecord(conn *UdpConn) {
+	for acId, conns := range s.acConnectionMap {
+		for i, acConn := range conns {
+			if acConn.ConnData.Equal(conn.ConnData) {
+				s.acConnectionMap[acId] = append(conns[:i], conns[i+1:]...)
+				if len(s.acConnectionMap[acId]) == 0 {
+					delete(s.acConnectionMap, acId)
+				}
+				return
+			}
+		}
+	}
+}
+
 func (s *UdpServer) AddACPeer(acPeer *core.UdpPeer) {
 	if acPeer.DeviceType() == core.NHP_AC {
 		s.device.AddPeer(acPeer)
