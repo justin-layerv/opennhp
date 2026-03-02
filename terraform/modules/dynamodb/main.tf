@@ -441,11 +441,24 @@ resource "aws_dynamodb_table" "qurl_resources" {
     type = "S"
   }
 
+  attribute {
+    name = "expires_at"
+    type = "S"
+  }
+
   # GSI: Find resources by owner, sorted by creation time (newest first with ScanIndexForward=false)
   global_secondary_index {
     name            = "owner-index"
     hash_key        = "owner_id"
     range_key       = "created_at"
+    projection_type = "ALL"
+  }
+
+  # GSI: Find resources by owner, sorted by expiration time (soonest first with ScanIndexForward=true)
+  global_secondary_index {
+    name            = "owner-expires-index"
+    hash_key        = "owner_id"
+    range_key       = "expires_at"
     projection_type = "ALL"
   }
 
