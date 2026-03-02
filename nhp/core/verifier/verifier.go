@@ -33,11 +33,11 @@ func (f *FallbackVerifier) Verify() error {
 }
 
 func (f *FallbackVerifier) GetSerialNumber() string {
-	return f.Measure
+	return f.SerialNumber
 }
 
 func (f *FallbackVerifier) GetMeasure() string {
-	return f.SerialNumber
+	return f.Measure
 }
 
 func NewFallbackVerifier(evidence []byte) (*FallbackVerifier, error) {
@@ -54,22 +54,22 @@ func NewFallbackVerifier(evidence []byte) (*FallbackVerifier, error) {
 func NewVerifier(compressedEvienceBase64 string) (Verifier, error) {
 	compressedEvidence, err := base64.StdEncoding.DecodeString(compressedEvienceBase64)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode evidence: %v", err)
+		return nil, fmt.Errorf("failed to decode evidence: %w", err)
 	}
 
 	r, err := zlib.NewReader(bytes.NewReader(compressedEvidence))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create zlib reader: %v", err)
+		return nil, fmt.Errorf("failed to create zlib reader: %w", err)
 	}
 	defer r.Close()
 	evidenceBytes, err := io.ReadAll(r)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read evidence: %v", err)
+		return nil, fmt.Errorf("failed to read evidence: %w", err)
 	}
 
 	verifier, err := NewFallbackVerifier(evidenceBytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create verifier: %v", err)
+		return nil, fmt.Errorf("failed to create verifier: %w", err)
 	}
 
 	return verifier, nil

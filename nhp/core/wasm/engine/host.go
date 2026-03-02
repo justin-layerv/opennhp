@@ -70,7 +70,7 @@ func GetEvidenceWithCCUrl() ([]byte, error) {
 func GetEvidenceWithAgentUuid() ([]byte, error) {
 	agentUniqueId, err := CalculateAgentUniqueId()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get agent unique id: %v", err)
+		return nil, fmt.Errorf("failed to get agent unique id: %w", err)
 	}
 
 	evidence := map[string]any{
@@ -81,7 +81,7 @@ func GetEvidenceWithAgentUuid() ([]byte, error) {
 
 	evidenceBytes, err := json.Marshal(evidence)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal evidence: %v", err)
+		return nil, fmt.Errorf("failed to marshal evidence: %w", err)
 	}
 
 	var buf bytes.Buffer
