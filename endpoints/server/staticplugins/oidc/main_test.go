@@ -34,7 +34,7 @@ func TestAuthWithHttp_NilHelper(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for nil helper")
 	}
-	if err.Error() != "AuthWithHttp: helper is null" {
+	if err.Error() != "authWithHTTP: helper is null" {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
@@ -47,7 +47,7 @@ func TestAuthWithNHP_NilHelper(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for nil helper")
 	}
-	if err.Error() != "AuthWithNHP: helper is null" {
+	if err.Error() != "authWithNHP: helper is null" {
 		t.Errorf("unexpected error: %v", err)
 	}
 	if result != ack {

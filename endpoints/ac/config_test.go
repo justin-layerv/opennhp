@@ -160,8 +160,8 @@ LogLevel = 4
 	if err == nil {
 		t.Fatal("Expected error for missing PrivateKeyBase64, got nil")
 	}
-	if !strings.Contains(err.Error(), "PrivateKeyBase64 is required") {
-		t.Errorf("Expected 'PrivateKeyBase64 is required' error, got: %v", err)
+	if !strings.Contains(err.Error(), "privateKeyBase64 is required") {
+		t.Errorf("Expected 'privateKeyBase64 is required' error, got: %v", err)
 	}
 }
 
