@@ -1420,18 +1420,6 @@ module "developer_portal" {
   qurl_api_url = "https://${var.qurl_service_domain}"
   auth0_domain = var.developer_portal_auth0_domain
 
-  # QURL DynamoDB tables (created in qurl repo, referenced here for API key provisioning)
-  qurl_api_keys_table_name  = var.developer_portal_qurl_api_keys_table_name
-  qurl_api_keys_table_arn   = var.developer_portal_qurl_api_keys_table_arn
-  qurl_customers_table_name = var.developer_portal_qurl_customers_table_name
-  qurl_customers_table_arn  = var.developer_portal_qurl_customers_table_arn
-
-  from_email   = var.developer_portal_from_email
-  ses_region   = var.developer_portal_ses_region
-  notify_email = var.developer_portal_notify_email
-  site_url     = var.developer_portal_site_url
-  verify_url   = var.developer_portal_verify_url
-
   allowed_origins = var.developer_portal_allowed_origins
   sns_topic_arn   = module.monitoring.sns_topic_arn
 

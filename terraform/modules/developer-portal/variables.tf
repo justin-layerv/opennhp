@@ -60,72 +60,6 @@ variable "auth0_domain" {
 }
 
 # ==============================================================================
-# API Keys & Customers Tables (created externally, e.g. in qurl repo)
-# ==============================================================================
-
-variable "qurl_api_keys_table_name" {
-  description = "DynamoDB table name for QURL API keys (created in qurl repo)"
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = (var.qurl_api_keys_table_name == "") == (var.qurl_api_keys_table_arn == "")
-    error_message = "qurl_api_keys_table_name and qurl_api_keys_table_arn must both be set or both be empty"
-  }
-}
-
-variable "qurl_api_keys_table_arn" {
-  description = "DynamoDB table ARN for QURL API keys (created in qurl repo)"
-  type        = string
-  default     = ""
-}
-
-variable "qurl_customers_table_name" {
-  description = "DynamoDB table name for QURL customers (created in qurl repo)"
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = (var.qurl_customers_table_name == "") == (var.qurl_customers_table_arn == "")
-    error_message = "qurl_customers_table_name and qurl_customers_table_arn must both be set or both be empty"
-  }
-}
-
-variable "qurl_customers_table_arn" {
-  description = "DynamoDB table ARN for QURL customers (created in qurl repo)"
-  type        = string
-  default     = ""
-}
-
-# ==============================================================================
-# Email
-# ==============================================================================
-
-variable "from_email" {
-  description = "SES verified sender email address"
-  type        = string
-}
-
-variable "notify_email" {
-  description = "Email address for admin notifications"
-  type        = string
-}
-
-# ==============================================================================
-# URLs
-# ==============================================================================
-
-variable "site_url" {
-  description = "Website URL (e.g., https://staging.layerv.ai)"
-  type        = string
-}
-
-variable "verify_url" {
-  description = "Email verification URL - the keys page (e.g., https://staging.layerv.ai/qurl/keys)"
-  type        = string
-}
-
-# ==============================================================================
 # CORS
 # ==============================================================================
 
@@ -183,7 +117,7 @@ variable "api_throttle_rate_limit" {
 }
 
 # ==============================================================================
-# Rate Limiting (Lambda-level)
+# Rate Limiting (Lambda-level, playground only)
 # ==============================================================================
 
 variable "playground_ip_rate_limit" {
@@ -204,30 +138,6 @@ variable "playground_rate_window" {
   default     = 3600
 }
 
-variable "registration_rate_limit_ip" {
-  description = "Max registration attempts per IP per rate window"
-  type        = number
-  default     = 5
-}
-
-variable "registration_rate_window" {
-  description = "Registration rate limit window in seconds"
-  type        = number
-  default     = 86400
-}
-
-variable "verify_rate_limit_ip" {
-  description = "Max verification attempts per IP per rate window"
-  type        = number
-  default     = 10
-}
-
-variable "verify_rate_window" {
-  description = "Verification rate limit window in seconds"
-  type        = number
-  default     = 3600
-}
-
 # ==============================================================================
 # CI Bypass
 # ==============================================================================
@@ -236,19 +146,4 @@ variable "ci_bypass_secret_name" {
   description = "Secrets Manager secret name for CI bypass key. If set, requests with matching X-CI-Key header skip rate limiting."
   type        = string
   default     = null
-}
-
-# ==============================================================================
-# SES
-# ==============================================================================
-
-variable "ses_region" {
-  description = "AWS region for SES (may differ from deployment region if SES identity is verified elsewhere)"
-  type        = string
-  default     = "us-east-1"
-
-  validation {
-    condition     = can(regex("^[a-z]{2}-[a-z]+-\\d$", var.ses_region))
-    error_message = "ses_region must be a valid AWS region (e.g., us-east-1, us-east-2)"
-  }
 }

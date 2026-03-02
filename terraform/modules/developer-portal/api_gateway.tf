@@ -78,13 +78,6 @@ resource "aws_apigatewayv2_integration" "playground" {
   payload_format_version = "2.0"
 }
 
-resource "aws_apigatewayv2_integration" "credentials" {
-  api_id                 = aws_apigatewayv2_api.developer_portal.id
-  integration_type       = "AWS_PROXY"
-  integration_uri        = aws_lambda_function.credentials.invoke_arn
-  payload_format_version = "2.0"
-}
-
 # ==============================================================================
 # Playground Routes (5 routes)
 # ==============================================================================
@@ -120,28 +113,6 @@ resource "aws_apigatewayv2_route" "playground_mint" {
 }
 
 # ==============================================================================
-# Credentials Routes (3 routes)
-# ==============================================================================
-
-resource "aws_apigatewayv2_route" "credentials_health" {
-  api_id    = aws_apigatewayv2_api.developer_portal.id
-  route_key = "GET /credentials/health"
-  target    = "integrations/${aws_apigatewayv2_integration.credentials.id}"
-}
-
-resource "aws_apigatewayv2_route" "credentials_register" {
-  api_id    = aws_apigatewayv2_api.developer_portal.id
-  route_key = "POST /credentials/register"
-  target    = "integrations/${aws_apigatewayv2_integration.credentials.id}"
-}
-
-resource "aws_apigatewayv2_route" "credentials_verify" {
-  api_id    = aws_apigatewayv2_api.developer_portal.id
-  route_key = "GET /credentials/verify"
-  target    = "integrations/${aws_apigatewayv2_integration.credentials.id}"
-}
-
-# ==============================================================================
 # Lambda Permissions (allow API GW to invoke)
 # ==============================================================================
 
@@ -149,14 +120,6 @@ resource "aws_lambda_permission" "playground" {
   statement_id  = "AllowAPIGatewayInvoke"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.playground.function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.developer_portal.execution_arn}/*/*"
-}
-
-resource "aws_lambda_permission" "credentials" {
-  statement_id  = "AllowAPIGatewayInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.credentials.function_name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.developer_portal.execution_arn}/*/*"
 }

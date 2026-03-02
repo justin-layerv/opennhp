@@ -15,21 +15,6 @@ output "playground_lambda_function_name" {
   value       = aws_lambda_function.playground.function_name
 }
 
-output "credentials_lambda_function_name" {
-  description = "Credential provisioner Lambda function name"
-  value       = aws_lambda_function.credentials.function_name
-}
-
-output "credentials_table_name" {
-  description = "DynamoDB credentials table name"
-  value       = aws_dynamodb_table.credentials.name
-}
-
-output "credentials_table_arn" {
-  description = "DynamoDB credentials table ARN"
-  value       = aws_dynamodb_table.credentials.arn
-}
-
 output "rate_limits_table_name" {
   description = "DynamoDB rate limits table name"
   value       = aws_dynamodb_table.rate_limits.name

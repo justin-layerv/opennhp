@@ -2,9 +2,9 @@
 #
 # Deploys infrastructure for the developer experience features:
 # - Playground proxy Lambda (proxies requests to QURL API with M2M auth)
-# - Credential provisioner Lambda (API key provisioning, email verification)
+# - Credential provisioner Lambda (health check only)
 # - API Gateway HTTP API with CORS
-# - DynamoDB tables for credentials and rate limiting
+# - DynamoDB table for rate limiting (shared by playground)
 
 terraform {
   required_version = ">= 1.5"
@@ -33,39 +33,6 @@ locals {
 # ==============================================================================
 # DynamoDB Tables
 # ==============================================================================
-
-resource "aws_dynamodb_table" "credentials" {
-  name         = "${var.name_prefix}-dev-credentials"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "email"
-
-  attribute {
-    name = "email"
-    type = "S"
-  }
-
-  ttl {
-    attribute_name = "ttl"
-    enabled        = true
-  }
-
-  point_in_time_recovery {
-    enabled = local.is_prod
-  }
-
-  dynamic "server_side_encryption" {
-    for_each = var.dynamodb_kms_key_arn != null ? [1] : []
-    content {
-      enabled     = true
-      kms_key_arn = var.dynamodb_kms_key_arn
-    }
-  }
-
-  tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-dev-credentials"
-    Component = local.component
-  })
-}
 
 resource "aws_dynamodb_table" "rate_limits" {
   name         = "${var.name_prefix}-dev-rate-limits"

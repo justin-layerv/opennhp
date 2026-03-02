@@ -1406,60 +1406,6 @@ variable "developer_portal_auth0_domain" {
   default     = null
 }
 
-variable "developer_portal_qurl_api_keys_table_name" {
-  description = "DynamoDB table name for QURL API keys (created in qurl repo)"
-  type        = string
-  default     = ""
-}
-
-variable "developer_portal_qurl_api_keys_table_arn" {
-  description = "DynamoDB table ARN for QURL API keys (created in qurl repo)"
-  type        = string
-  default     = ""
-}
-
-variable "developer_portal_qurl_customers_table_name" {
-  description = "DynamoDB table name for QURL customers (created in qurl repo)"
-  type        = string
-  default     = ""
-}
-
-variable "developer_portal_qurl_customers_table_arn" {
-  description = "DynamoDB table ARN for QURL customers (created in qurl repo)"
-  type        = string
-  default     = ""
-}
-
-variable "developer_portal_from_email" {
-  description = "SES verified sender email for developer portal notifications"
-  type        = string
-  default     = null
-}
-
-variable "developer_portal_ses_region" {
-  description = "AWS region for SES (may differ from deployment region)"
-  type        = string
-  default     = null
-}
-
-variable "developer_portal_notify_email" {
-  description = "Email to receive developer portal admin notifications"
-  type        = string
-  default     = null
-}
-
-variable "developer_portal_site_url" {
-  description = "Website URL for developer portal"
-  type        = string
-  default     = null
-}
-
-variable "developer_portal_verify_url" {
-  description = "Email verification URL for API keys page"
-  type        = string
-  default     = null
-}
-
 variable "developer_portal_allowed_origins" {
   description = "CORS allowed origins for developer portal API"
   type        = list(string)
