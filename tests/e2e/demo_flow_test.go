@@ -52,7 +52,7 @@ func TestDemoFlow_CreateAndAccessCloakedURL(t *testing.T) {
 	t.Log("Step 1: Creating cloaked URL...")
 
 	targetURL := "https://httpbin.org/get"
-	createReq := map[string]interface{}{
+	createReq := map[string]any{
 		"url":            targetURL,
 		"expirationDays": 1,
 		"usageCount":     100, // Allow multiple uses for testing
@@ -212,7 +212,7 @@ func TestDemoFlow_CreateAndAccessCloakedURL(t *testing.T) {
 // TestDemoFlow_InvalidPasscode verifies that invalid passcodes are rejected
 func TestDemoFlow_InvalidPasscode(t *testing.T) {
 	// Create a cloaked URL first
-	createReq := map[string]interface{}{
+	createReq := map[string]any{
 		"url": "https://httpbin.org/get",
 	}
 	reqBody, _ := json.Marshal(createReq)

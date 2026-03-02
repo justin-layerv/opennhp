@@ -490,7 +490,7 @@ func TestHandler_Integration_StatusCodeMatrix(t *testing.T) {
 			}
 
 			// Verify response body contains expected status
-			var resp map[string]interface{}
+			var resp map[string]any
 			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 				t.Fatalf("failed to unmarshal response: %v", err)
 			}
@@ -547,7 +547,7 @@ func TestHandler_Integration_RequestIDOmittedWhenEmpty(t *testing.T) {
 	router.ServeHTTP(w, req)
 
 	// Verify request_id is omitted (omitempty)
-	var resp map[string]interface{}
+	var resp map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("failed to unmarshal response: %v", err)
 	}
@@ -575,7 +575,7 @@ func TestBaseHealthResponse_JSONSerialization(t *testing.T) {
 	}
 
 	// Verify fields are at top level (not nested under "BaseHealthResponse")
-	var parsed map[string]interface{}
+	var parsed map[string]any
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		t.Fatalf("failed to unmarshal to map: %v", err)
 	}

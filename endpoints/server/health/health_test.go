@@ -385,7 +385,7 @@ func TestCheckResult_DurationSerialization(t *testing.T) {
 		t.Fatalf("failed to marshal: %v", err)
 	}
 
-	var unmarshaled map[string]interface{}
+	var unmarshaled map[string]any
 	if err := json.Unmarshal(data, &unmarshaled); err != nil {
 		t.Fatalf("failed to unmarshal: %v", err)
 	}

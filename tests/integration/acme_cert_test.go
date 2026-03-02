@@ -114,7 +114,7 @@ func TestACMECertLambdaCheckStatus(t *testing.T) {
 	}
 
 	// Parse response
-	var response map[string]interface{}
+	var response map[string]any
 	if err := json.Unmarshal(result.Payload, &response); err != nil {
 		t.Fatalf("Failed to parse response: %v\nPayload: %s", err, string(result.Payload))
 	}
@@ -218,7 +218,7 @@ func TestACMECertSecretContents(t *testing.T) {
 		t.Fatal("Secret has no string value")
 	}
 
-	var secret map[string]interface{}
+	var secret map[string]any
 	if err := json.Unmarshal([]byte(*result.SecretString), &secret); err != nil {
 		t.Fatalf("Failed to parse secret JSON: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestACMECertSecretContents(t *testing.T) {
 	}
 
 	t.Logf("Certificate secret structure verified")
-	if domains, ok := secret["domains"].([]interface{}); ok {
+	if domains, ok := secret["domains"].([]any); ok {
 		t.Logf("  Domains: %v", domains)
 	}
 	if renewedAt, ok := secret["renewed_at"].(string); ok {

@@ -173,7 +173,7 @@ func (c *CloudMapClient) GetHealthyServerIPs(ctx context.Context) (map[string]bo
 	c.cacheMu.RUnlock()
 
 	// Cache miss - use singleflight to deduplicate concurrent refresh requests
-	result, err, _ := c.sfGroup.Do("refresh", func() (interface{}, error) {
+	result, err, _ := c.sfGroup.Do("refresh", func() (any, error) {
 		return c.refreshCache()
 	})
 

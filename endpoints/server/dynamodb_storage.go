@@ -50,7 +50,7 @@ func NewDynamoDBStorage(ctx context.Context, cfg DynamoDBConfig) (*DynamoDBStora
 	// If a custom endpoint is specified (local development), add it
 	if cfg.Endpoint != "" {
 		customResolver := aws.EndpointResolverWithOptionsFunc(
-			func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+			func(service, region string, options ...any) (aws.Endpoint, error) {
 				return aws.Endpoint{
 					URL:           cfg.Endpoint,
 					SigningRegion: cfg.Region,

@@ -66,7 +66,7 @@ func TestExchangeAndKnock_KnockFailureNilAckMsg(t *testing.T) {
 	})
 	req := &common.HttpKnockRequest{}
 	res := &common.ResourceData{
-		ExInfo: map[string]interface{}{
+		ExInfo: map[string]any{
 			"JWTSecret": "test-secret",
 		},
 		CookieDomain: "example.com",
@@ -118,7 +118,7 @@ func TestExchangeAndKnock_KnockFailureEmptyResourceHost(t *testing.T) {
 	})
 	req := &common.HttpKnockRequest{}
 	res := &common.ResourceData{
-		ExInfo: map[string]interface{}{
+		ExInfo: map[string]any{
 			"JWTSecret": "test-secret",
 		},
 		CookieDomain: "example.com",
@@ -161,7 +161,7 @@ func TestExchangeAndKnock_KnockSuccess(t *testing.T) {
 	})
 	req := &common.HttpKnockRequest{}
 	res := &common.ResourceData{
-		ExInfo: map[string]interface{}{
+		ExInfo: map[string]any{
 			"JWTSecret":   "test-secret",
 			"TokenExpire": 3600,
 		},

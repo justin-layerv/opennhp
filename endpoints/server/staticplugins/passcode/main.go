@@ -65,7 +65,7 @@ func respondErrorRedirect(ctx *gin.Context, format, resId, errCode string, err e
 // Uses a simple code/message format for auth_code, auth, and hmac_auth actions.
 func respondErrorJSON(ctx *gin.Context, format, resId, errCode string, err error) {
 	if format == "json" {
-		ctx.JSON(http.StatusOK, map[string]interface{}{
+		ctx.JSON(http.StatusOK, map[string]any{
 			"code":    10001,
 			"message": err.Error(),
 		})
@@ -195,7 +195,7 @@ func exchangeAndKnock(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 // redirect depending on the format query parameter.
 func respondSuccessOrRedirect(ctx *gin.Context, format, nhpToken, refreshToken, redirectUrl string) {
 	if format == "json" {
-		ctx.JSON(http.StatusOK, map[string]interface{}{
+		ctx.JSON(http.StatusOK, map[string]any{
 			"code":              0,
 			"nhp_token":         nhpToken,
 			"nhp_refresh_token": refreshToken,
@@ -459,7 +459,7 @@ func refreshToken(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Re
 		result.AckMsg.RedirectUrl = res.RedirectUrl
 	}
 
-	ctx.JSON(http.StatusOK, map[string]interface{}{
+	ctx.JSON(http.StatusOK, map[string]any{
 		"code":              0,
 		"nhp_token":         result.NHPToken,
 		"nhp_refresh_token": result.RefreshToken,
@@ -538,9 +538,9 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		}
 
 		type Response struct {
-			Code int         `json:"code"`
-			Data interface{} `json:"data"`
-			Msg  string      `json:"msg"`
+			Code int    `json:"code"`
+			Data any    `json:"data"`
+			Msg  string `json:"msg"`
 		}
 		// Parse JSON response
 		var apiResponse Response
@@ -558,8 +558,8 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		switch res.ExInfo["AppSecret"].(type) {
 		case string:
 			appSecrets[nhpsdkutils.GetStringFromMap(res.ExInfo, "JWTSecret")] = true
-		case []interface{}:
-			secrets := res.ExInfo["AppSecret"].([]interface{})
+		case []any:
+			secrets := res.ExInfo["AppSecret"].([]any)
 			for _, secret := range secrets {
 				appSecrets[secret.(string)] = true
 			}

@@ -124,9 +124,9 @@ func customAuthByCode(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 	}
 
 	type Response struct {
-		Code int         `json:"code"`
-		Data interface{} `json:"data"`
-		Msg  string      `json:"msg"`
+		Code int    `json:"code"`
+		Data any    `json:"data"`
+		Msg  string `json:"msg"`
 	}
 	// Parse JSON response
 	var apiResponse Response

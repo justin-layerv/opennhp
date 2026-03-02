@@ -274,7 +274,7 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 			return nil, errors.New("failed to verify ID token")
 		}
 
-		var profile map[string]interface{}
+		var profile map[string]any
 		if err := idToken.Claims(&profile); err != nil {
 			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to claim user profile"})
 			return nil, errors.New("failed to claim user profile")
