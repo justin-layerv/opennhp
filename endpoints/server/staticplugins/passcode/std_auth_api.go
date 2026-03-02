@@ -1,6 +1,7 @@
 package passcode
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -61,7 +62,7 @@ func detectMiniProgram(userAgent string) MiniProgramInfo {
 
 func std_auth(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, string, error) {
 	if helper == nil {
-		return nil, "400", fmt.Errorf(" authRegular helper is null")
+		return nil, "400", errors.New("std_auth helper is null")
 	}
 	format := ctx.Query("format")
 

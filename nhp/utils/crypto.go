@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -97,7 +98,7 @@ func Md5sum(fullFilePath string) (string, error) {
 	}
 
 	if !fileInfo.Mode().IsRegular() {
-		return "", fmt.Errorf("path is not a regular file")
+		return "", errors.New("path is not a regular file")
 	}
 
 	file, err := os.Open(fullFilePath)

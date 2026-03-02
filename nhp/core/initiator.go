@@ -5,6 +5,7 @@ import (
 	"compress/zlib"
 	"crypto/cipher"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash"
 	"net"
@@ -40,13 +41,13 @@ type MsgData struct {
 func (d *Device) validateMsgData(md *MsgData) (err error) {
 	if md.PrevParserData == nil {
 		if d.deviceType == NHP_SERVER && md.ConnData == nil {
-			err = fmt.Errorf("missing connection data for server")
+			err = errors.New("missing connection data for server")
 		} else if d.deviceType != NHP_SERVER && md.RemoteAddr == nil {
-			err = fmt.Errorf("missing remote address")
+			err = errors.New("missing remote address")
 		}
 
 		if md.PeerPk == nil {
-			err = fmt.Errorf("missing remote peer public key")
+			err = errors.New("missing remote peer public key")
 		}
 	}
 

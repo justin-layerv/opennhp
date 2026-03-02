@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
@@ -117,10 +118,10 @@ var _ HealthChecker = (*CloudMapClient)(nil)
 // NewCloudMapClient creates a new Cloud Map client.
 func NewCloudMapClient(ctx context.Context, cfg CloudMapConfig) (*CloudMapClient, error) {
 	if cfg.NamespaceName == "" {
-		return nil, fmt.Errorf("cloudmap namespace name is required")
+		return nil, errors.New("cloudmap namespace name is required")
 	}
 	if cfg.ServiceName == "" {
-		return nil, fmt.Errorf("cloudmap service name is required")
+		return nil, errors.New("cloudmap service name is required")
 	}
 
 	// Build AWS config options

@@ -405,7 +405,7 @@ type cookieKeysConfig struct {
 // [currentAuth, currentEncrypt, previousAuth, previousEncrypt]
 func parseCookieKeys(raw string) ([][]byte, error) {
 	if raw == "" {
-		return nil, fmt.Errorf("environment variable is required")
+		return nil, errors.New("environment variable is required")
 	}
 
 	decoded, err := base64.StdEncoding.DecodeString(raw)
@@ -419,7 +419,7 @@ func parseCookieKeys(raw string) ([][]byte, error) {
 	}
 
 	if cfg.Current.AuthKey == "" || cfg.Current.EncryptKey == "" {
-		return nil, fmt.Errorf("current.auth_key and current.encrypt_key are required")
+		return nil, errors.New("current.auth_key and current.encrypt_key are required")
 	}
 
 	if err := validateKeyLengths("current", cfg.Current); err != nil {

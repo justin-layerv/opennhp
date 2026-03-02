@@ -1,6 +1,7 @@
 package ac
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,7 +19,7 @@ var (
 	httpConfigWatch io.Closer
 	serverPeerWatch io.Closer
 
-	errLoadConfig = fmt.Errorf("config load error")
+	errLoadConfig = errors.New("config load error")
 )
 
 const (

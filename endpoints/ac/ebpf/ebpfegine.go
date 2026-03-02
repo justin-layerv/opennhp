@@ -6,6 +6,7 @@ import (
 	// "log"
 
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -172,7 +173,7 @@ func EbpfEngineLoad(dirPath string, logLevel int, acId string) error {
 	eventsMap := objs.Events
 	if eventsMap == nil {
 		log.Error("failed to load 'events' map from eBPF object (nil)")
-		return fmt.Errorf("'events' map not found")
+		return errors.New("'events' map not found")
 	}
 
 	ExeDirPath := dirPath
@@ -284,7 +285,7 @@ func getDefaultRouteInterface() (string, error) {
 	matches := re.FindStringSubmatch(string(output))
 	if len(matches) < 3 {
 		log.Error("failed to parse default route")
-		return "", fmt.Errorf("failed to parse default route")
+		return "", errors.New("failed to parse default route")
 	}
 	interfaceName := matches[2]
 	return interfaceName, nil

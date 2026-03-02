@@ -2,6 +2,7 @@ package utils
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -107,10 +108,10 @@ func GenerateTempFilePath(pattern string) (string, error) {
 
 func SaveStructAsJsonFile(filePath string, data any) error {
 	if data == nil {
-		return fmt.Errorf("data cannot be nil")
+		return errors.New("data cannot be nil")
 	}
 	if filePath == "" {
-		return fmt.Errorf("file path cannot be empty")
+		return errors.New("file path cannot be empty")
 	}
 
 	jsonData, err := json.MarshalIndent(data, "", "  ")
@@ -128,7 +129,7 @@ func SaveStructAsJsonFile(filePath string, data any) error {
 
 func LoadJsonFileAsStruct(filePath string) (any, error) {
 	if filePath == "" {
-		return nil, fmt.Errorf("file path cannot be empty")
+		return nil, errors.New("file path cannot be empty")
 	}
 
 	jsonData, err := os.ReadFile(filePath)

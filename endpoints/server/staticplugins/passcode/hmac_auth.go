@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"strconv"
@@ -56,13 +57,13 @@ func (s *HMACSigner) Verify(authHeader string) (bool, error) {
 	// 1. Parse format
 	parts := strings.Split(authHeader, " ")
 	if len(parts) != 2 || parts[0] != "HMAC" {
-		return false, fmt.Errorf("invalid format: expected 'HMAC accessKey:timestamp:signature'")
+		return false, errors.New("invalid format: expected 'HMAC accessKey:timestamp:signature'")
 	}
 
 	// 2. Parse parameters
 	params := strings.Split(parts[1], ":")
 	if len(params) != 3 {
-		return false, fmt.Errorf("invalid params: expected 'accessKey:timestamp:signature'")
+		return false, errors.New("invalid params: expected 'accessKey:timestamp:signature'")
 	}
 
 	accessKey := params[0]
@@ -71,13 +72,13 @@ func (s *HMACSigner) Verify(authHeader string) (bool, error) {
 
 	// 3. Verify access key
 	if accessKey != s.config.AccessKey {
-		return false, fmt.Errorf("invalid access key")
+		return false, errors.New("invalid access key")
 	}
 
 	// 4. Verify timestamp format
 	timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
 	if err != nil {
-		return false, fmt.Errorf("invalid timestamp format")
+		return false, errors.New("invalid timestamp format")
 	}
 
 	// 5. Check if expired (if expiration time is set)
@@ -98,7 +99,7 @@ func (s *HMACSigner) Verify(authHeader string) (bool, error) {
 
 	// 7. Compare signatures (using constant time comparison to prevent timing attacks)
 	if !hmac.Equal([]byte(expectedSignature), []byte(signature)) {
-		return false, fmt.Errorf("signature mismatch")
+		return false, errors.New("signature mismatch")
 	}
 
 	return true, nil
@@ -132,7 +133,7 @@ func (s *HMACSigner) calcHMAC(data string) string {
 // authHeader: Authorization header content
 func VerifyHMACFromHeader(resId, secretKey, algorithm string, expireSec int, authHeader string) (bool, error) {
 	if len(authHeader) == 0 {
-		return false, fmt.Errorf("authorization header is empty")
+		return false, errors.New("authorization header is empty")
 	}
 
 	config := &HMACConfig{

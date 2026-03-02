@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -50,42 +51,42 @@ func initApp() {
 			if c.String("mode") == "encrypt" {
 				if c.String("data-source-type") != "" {
 					if !slices.Contains([]string{"online", "offline", "stream"}, c.String("data-source-type")) {
-						return fmt.Errorf("invalid --data-source-type, allowed values are online, offline and stream")
+						return errors.New("invalid --data-source-type, allowed values are online, offline and stream")
 					}
 				}
 
 				if c.String("ztdo-id") != "" { // update ztdo
 					if c.String("source") != "" || c.String("output") != "" || c.String("metadata") != "" || c.String("data-source-type") != "" {
-						return fmt.Errorf("--source, --output, --data-source-type and --metadata are not allowed when --ztdo-id is specified")
+						return errors.New("--source, --output, --data-source-type and --metadata are not allowed when --ztdo-id is specified")
 					}
 				} else { // create ztdo
 					if c.String("data-source-type") != "stream" {
 						if c.String("source") == "" {
-							return fmt.Errorf("--source is required when --data-source-type is not stream and --ztdo-id is not specified")
+							return errors.New("--source is required when --data-source-type is not stream and --ztdo-id is not specified")
 						}
 					} else {
 						if c.String("access-url") == "" {
-							return fmt.Errorf("--access-url is required when --data-source-type is stream")
+							return errors.New("--access-url is required when --data-source-type is stream")
 						}
 					}
 				}
 
 				if c.String("smart-policy") == "" {
-					return fmt.Errorf("--smart-policy is required in encrypt mode")
+					return errors.New("--smart-policy is required in encrypt mode")
 				}
 
 				// only be available in decrypt mode
 				if c.String("ztdo") != "" || c.String("data-private-key") != "" || c.String("provider-public-key") != "" {
-					return fmt.Errorf("--ztdo, --data-private-key and --provider-public-key are only allowed in decrypt mode")
+					return errors.New("--ztdo, --data-private-key and --provider-public-key are only allowed in decrypt mode")
 				}
 			} else if c.String("mode") == "decrypt" {
 				if c.String("source") != "" || c.String("smart-policy") != "" || c.String("access-url") != "" {
-					return fmt.Errorf("--source, --smart-policy and --access-url are only allowed in encrypt mode")
+					return errors.New("--source, --smart-policy and --access-url are only allowed in encrypt mode")
 				}
 
 				// only be available in encrypt mode
 				if c.String("ztdo") == "" || c.String("output") == "" || c.String("data-private-key") == "" || c.String("provider-public-key") == "" {
-					return fmt.Errorf("--ztdo, --output, --data-private-key and --provider-public-key are required in decrypt mode")
+					return errors.New("--ztdo, --output, --data-private-key and --provider-public-key are required in decrypt mode")
 				}
 			} else {
 				return nil
@@ -147,7 +148,7 @@ func initApp() {
 			}
 			e := core.ECDHFromKey(core.ECC_CURVE25519, privKey)
 			if e == nil {
-				return fmt.Errorf("invalid input key")
+				return errors.New("invalid input key")
 			}
 			pub := e.PublicKeyBase64()
 			fmt.Println("Public key: ", pub)

@@ -2,7 +2,7 @@ package agent
 
 import (
 	"encoding/base64"
-	"fmt"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -20,7 +20,7 @@ var (
 	serverConfigWatch   io.Closer
 	resourceConfigWatch io.Closer
 
-	errLoadConfig = fmt.Errorf("config load error")
+	errLoadConfig = errors.New("config load error")
 
 	secretCreated = "/var/run/secret.created"
 )

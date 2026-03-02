@@ -835,7 +835,7 @@ func (a *UdpAC) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sync.W
 				a.remoteConnectionMutex.Unlock()
 				if conn == nil {
 					log.Error("ac(%s#%d)[ACOnline] connection not found in map after successful handshake", acId, aolMd.TransactionId)
-					err = fmt.Errorf("connection not found after handshake")
+					err = errors.New("connection not found after handshake")
 					return
 				}
 				log.Info("ac(%s#%d)[ACOnline] succeed. ac external address is %s, replied by server %s", acId, aolMd.TransactionId, aakMsg.ACAddr, addrStr)

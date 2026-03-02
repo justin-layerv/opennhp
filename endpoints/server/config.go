@@ -30,7 +30,7 @@ var (
 	srcipConfigWatch io.Closer
 	dbConfigWatch    io.Closer
 	teeWatch         io.Closer
-	errLoadConfig    = fmt.Errorf("config load error")
+	errLoadConfig    = errors.New("config load error")
 )
 
 // ACRegistryPrefix is the etcd prefix for AC registration entries

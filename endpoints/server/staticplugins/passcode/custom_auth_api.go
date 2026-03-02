@@ -1,6 +1,7 @@
 package passcode
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -19,7 +20,7 @@ import (
 // AccessKey uses resId
 func customAuthByHmac(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, string, error) {
 	if helper == nil {
-		return nil, "400", fmt.Errorf("customAuthByHmac helper is null")
+		return nil, "400", errors.New("customAuthByHmac helper is null")
 	}
 
 	format := ctx.Query("format")
@@ -28,7 +29,7 @@ func customAuthByHmac(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 	secretKey := nhpsdkutils.GetStringFromMap(res.ExInfo, "SecretKey")
 	if len(secretKey) == 0 {
 		log.Error("SecretKey is not provided in ExInfo")
-		return nil, "401", fmt.Errorf("secret key is not provided")
+		return nil, "401", errors.New("secret key is not provided")
 	}
 
 	algorithm := nhpsdkutils.GetStringFromMap(res.ExInfo, "Algorithm")
@@ -45,7 +46,7 @@ func customAuthByHmac(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 	authHeader := ctx.GetHeader("Authorization")
 	if len(authHeader) == 0 {
 		log.Error("Authorization header is empty")
-		return nil, "402", fmt.Errorf("authorization header is empty")
+		return nil, "402", errors.New("authorization header is empty")
 	}
 
 	// 3. Verify HMAC signature (AccessKey uses resId)
@@ -56,7 +57,7 @@ func customAuthByHmac(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 	}
 	if !valid {
 		log.Error("HMAC signature is invalid")
-		return nil, "403", fmt.Errorf("HMAC signature is invalid")
+		return nil, "403", errors.New("HMAC signature is invalid")
 	}
 
 	log.Debug("HMAC authentication succeeded for resource: %s", res.ResourceId)
@@ -84,7 +85,7 @@ func customAuthByHmac(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 
 func customAuthByCode(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, string, error) {
 	if helper == nil {
-		return nil, "400", fmt.Errorf("customAuthByCode helper is null")
+		return nil, "400", errors.New("customAuthByCode helper is null")
 	}
 
 	var err error
@@ -94,7 +95,7 @@ func customAuthByCode(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 	AuthUrl := nhpsdkutils.GetStringFromMap(res.ExInfo, "AuthUrl")
 	if len(AuthUrl) == 0 {
 		log.Error("AuthUrl is not provided.")
-		return nil, "401", fmt.Errorf("auth URL is not provided")
+		return nil, "401", errors.New("auth URL is not provided")
 	}
 
 	method := nhpsdkutils.GetStringFromMap(res.ExInfo, "Method")

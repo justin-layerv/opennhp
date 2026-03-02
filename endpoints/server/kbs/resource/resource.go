@@ -231,17 +231,17 @@ func VerifyJWT(tokenString string) (*jwt.Token, error) {
 	// Extract JWK from header
 	jwkHeader, ok := unverifiedToken.Header["jwk"].(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("missing or invalid jwk in header")
+		return nil, errors.New("missing or invalid jwk in header")
 	}
 
 	// Convert JWK back to ECDSA public key
 	xStr, ok := jwkHeader["x"].(string)
 	if !ok {
-		return nil, fmt.Errorf("missing x coordinate in jwk")
+		return nil, errors.New("missing x coordinate in jwk")
 	}
 	yStr, ok := jwkHeader["y"].(string)
 	if !ok {
-		return nil, fmt.Errorf("missing y coordinate in jwk")
+		return nil, errors.New("missing y coordinate in jwk")
 	}
 
 	xBytes, err := base64.RawURLEncoding.DecodeString(xStr)

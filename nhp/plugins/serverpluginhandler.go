@@ -1,7 +1,7 @@
 package plugins
 
 import (
-	"fmt"
+	"errors"
 	"path/filepath"
 	"plugin"
 
@@ -40,7 +40,7 @@ type PluginHandlerSymbol struct {
 	sAuthWithHttp  plugin.Symbol
 }
 
-var errPluginNotImplemented error = fmt.Errorf("plugin not implemented")
+var errPluginNotImplemented error = errors.New("plugin not implemented")
 
 func (s *PluginHandlerSymbol) Version() string {
 	if s.sVersion == nil {

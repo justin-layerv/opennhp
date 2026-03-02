@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 
 	"github.com/OpenNHP/opennhp/nhp/core"
@@ -96,7 +97,7 @@ func (mode SymmetricCipherMode) newCipherBlock(key []byte) (cipher.Block, error)
 	case AES256GCM64Tag, AES256GCM96Tag, AES256GCM104Tag,
 		AES256GCM112Tag, AES256GCM120Tag, AES256GCM128Tag:
 		if len(key) != 32 {
-			return nil, fmt.Errorf("invalid key length for AES-256-GCM")
+			return nil, errors.New("invalid key length for AES-256-GCM")
 		}
 		return aes.NewCipher(key)
 	default:

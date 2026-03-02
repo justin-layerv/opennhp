@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -118,7 +119,7 @@ func (header *ZtdoHeader) SetVersion() {
 
 func (header *ZtdoHeader) SetNhpServer(nhpServer string) error {
 	if len(nhpServer) > NhpServerMaxSize {
-		return fmt.Errorf("nhp server length is too long")
+		return errors.New("nhp server length is too long")
 	}
 
 	header.NhpServerLen[0] = byte(len(nhpServer))
@@ -443,7 +444,7 @@ func (ztdo *Ztdo) DecryptZtdoFile(ciphertextPath, plaintextPath string, gcmKey [
 				break
 			}
 			if remainingCiphertextFileSize == 0 {
-				return fmt.Errorf("invalid ztdo file")
+				return errors.New("invalid ztdo file")
 			}
 		} else {
 			if remainingCiphertextFileSize == 0 {
@@ -461,7 +462,7 @@ func (ztdo *Ztdo) DecryptZtdoFile(ciphertextPath, plaintextPath string, gcmKey [
 		}
 
 		if !ztdo.signature.verify(recalcSig) {
-			return fmt.Errorf("signature verification failed")
+			return errors.New("signature verification failed")
 		}
 	}
 
@@ -476,7 +477,7 @@ func marshal(buf *bytes.Buffer, data any) error {
 	}
 
 	if rData.Kind() != reflect.Struct {
-		return fmt.Errorf("data must be a struct")
+		return errors.New("data must be a struct")
 	}
 
 	for i := range rData.NumField() {
@@ -525,7 +526,7 @@ func unmarshal(f *os.File, data any) error {
 	}
 
 	if rValues.Kind() != reflect.Struct {
-		return fmt.Errorf("data must be a struct")
+		return errors.New("data must be a struct")
 	}
 
 	for i := range rTypes.NumField() {
@@ -613,7 +614,7 @@ func toStructure(f *os.File, data any) error {
 	lengthMap = make(map[string]uint32)
 	rValues := reflect.ValueOf(data)
 	if rValues.Kind() != reflect.Ptr {
-		return fmt.Errorf("data must be a pointer")
+		return errors.New("data must be a pointer")
 	}
 	return unmarshal(f, data)
 }

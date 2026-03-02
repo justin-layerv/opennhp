@@ -109,32 +109,32 @@ func getEnvInt(key string) int {
 // Returns an error for any missing or invalid value.
 func validateConfig(cfg *Config) error {
 	if cfg.QurlAPIURL == "" {
-		return fmt.Errorf("missing required config: QURL_API_URL")
+		return errors.New("missing required config: QURL_API_URL")
 	}
 	if cfg.ServiceToken == "" {
-		return fmt.Errorf("missing required config: QURL_SERVICE_TOKEN")
+		return errors.New("missing required config: QURL_SERVICE_TOKEN")
 	}
 	if cfg.AllowedRedirectDomain == "" {
-		return fmt.Errorf("missing required config: QURL_ALLOWED_REDIRECT_DOMAIN")
+		return errors.New("missing required config: QURL_ALLOWED_REDIRECT_DOMAIN")
 	}
 
 	// Validate URL format
 	if !strings.HasPrefix(cfg.QurlAPIURL, "http://") && !strings.HasPrefix(cfg.QurlAPIURL, "https://") {
-		return fmt.Errorf("invalid QURL_API_URL: must start with http:// or https://")
+		return errors.New("invalid QURL_API_URL: must start with http:// or https://")
 	}
 
 	// Validate HTTP client settings
 	if cfg.APITimeout <= 0 {
-		return fmt.Errorf("missing or invalid QURL_API_TIMEOUT: must be positive (recommended: 10)")
+		return errors.New("missing or invalid QURL_API_TIMEOUT: must be positive (recommended: 10)")
 	}
 	if cfg.MaxIdleConns <= 0 {
-		return fmt.Errorf("missing or invalid QURL_MAX_IDLE_CONNS: must be positive (recommended: 10)")
+		return errors.New("missing or invalid QURL_MAX_IDLE_CONNS: must be positive (recommended: 10)")
 	}
 	if cfg.MaxIdleConnsPerHost <= 0 {
-		return fmt.Errorf("missing or invalid QURL_MAX_IDLE_CONNS_PER_HOST: must be positive (recommended: 5)")
+		return errors.New("missing or invalid QURL_MAX_IDLE_CONNS_PER_HOST: must be positive (recommended: 5)")
 	}
 	if cfg.IdleConnTimeout <= 0 {
-		return fmt.Errorf("missing or invalid QURL_IDLE_CONN_TIMEOUT: must be positive (recommended: 30)")
+		return errors.New("missing or invalid QURL_IDLE_CONN_TIMEOUT: must be positive (recommended: 30)")
 	}
 
 	return nil
@@ -144,7 +144,7 @@ func validateConfig(cfg *Config) error {
 // It must use HTTPS and belong to the allowed domain (exact match or subdomain).
 func ValidateRedirectURL(rawURL, allowedDomain string) error {
 	if rawURL == "" {
-		return fmt.Errorf("redirect URL is empty")
+		return errors.New("redirect URL is empty")
 	}
 
 	// Use net/url.Parse for robust URL parsing (handles edge cases like userinfo, query params)
@@ -205,7 +205,7 @@ func isValidTokenChar(c rune) bool {
 // This prevents a compromised upstream from setting cookies on arbitrary domains.
 func ValidateCookieDomain(cookieDomain, allowedDomain string) error {
 	if cookieDomain == "" {
-		return fmt.Errorf("cookie domain is empty")
+		return errors.New("cookie domain is empty")
 	}
 
 	// Cookie domain typically has a leading dot (e.g., ".qurl.site")

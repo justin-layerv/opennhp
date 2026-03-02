@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -776,7 +777,7 @@ func (s *UdpServer) onAttestationVerify(spo *common.SmartPolicy, attestation str
 	if engine.OnAttestationVerify(attestation) {
 		return nil
 	}
-	return fmt.Errorf("attestation verification failed")
+	return errors.New("attestation verification failed")
 }
 
 func SaveZdtoConfig(drgMsg *common.DRGMsg) error {

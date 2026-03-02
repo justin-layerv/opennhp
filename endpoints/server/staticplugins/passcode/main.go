@@ -1,6 +1,7 @@
 package passcode
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -132,13 +133,13 @@ func exchangeAndKnock(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 	oldNHPToken := nhpplugins.GetCookie("nhp_token", ctx)
 	if len(oldNHPToken) == 0 {
 		log.Error("old token is empty")
-		return knockTokenResult{}, fmt.Errorf("old token is empty")
+		return knockTokenResult{}, errors.New("old token is empty")
 	}
 
 	refreshTok := nhpplugins.GetCookie("nhp_refresh_token", ctx)
 	if len(refreshTok) == 0 {
 		log.Error("refresh token is empty")
-		return knockTokenResult{}, fmt.Errorf("refresh token is empty")
+		return knockTokenResult{}, errors.New("refresh token is empty")
 	}
 
 	jwt := &nhpplugins.JWTToken{
@@ -284,7 +285,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		}
 	default:
 		ackMsg = nil
-		err = fmt.Errorf("action invalid")
+		err = errors.New("action invalid")
 	}
 	return
 }
@@ -325,7 +326,7 @@ func AuthWithHttpRefresh(ctx *gin.Context, action string, req *common.HttpKnockR
 	}
 	if !isOk {
 		log.Error("nhp token is invalid")
-		return nil, fmt.Errorf("nhp token is invalid")
+		return nil, errors.New("nhp token is invalid")
 	}
 
 	nhpplugins.CorsMiddleware(ctx)
@@ -352,7 +353,7 @@ func AuthWithHttpRefresh(ctx *gin.Context, action string, req *common.HttpKnockR
 func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelper) (ackMsg *common.ServerKnockAckMsg, err error) {
 	ackMsg = req.Ack
 	if helper == nil {
-		return ackMsg, fmt.Errorf("authWithNHP: helper is null")
+		return ackMsg, errors.New("authWithNHP: helper is null")
 	}
 
 	res, err := resourceHandler.FindResourceByID(req.Msg.ResourceId)
@@ -384,13 +385,13 @@ func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelp
 
 func authAndShowLogin(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
 	if helper == nil {
-		return nil, fmt.Errorf("authAndShowLogin: helper is null")
+		return nil, errors.New("authAndShowLogin: helper is null")
 	}
 
 	if res.ExInfo == nil {
 		log.Error("extra login info not available")
 		ctx.JSON(http.StatusOK, gin.H{"errMsg": "extra login info not available"})
-		return nil, fmt.Errorf("extra login info not available")
+		return nil, errors.New("extra login info not available")
 	}
 
 	ctx.HTML(http.StatusOK, "passcode/passcode_login.html", gin.H{
@@ -412,13 +413,13 @@ func authAndShowRefreshError(ctx *gin.Context) (*common.ServerKnockAckMsg, error
 
 func authAndShowRefresh(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
 	if helper == nil {
-		return nil, fmt.Errorf("authAndShowLogin: helper is null")
+		return nil, errors.New("authAndShowRefresh: helper is null")
 	}
 
 	if res.ExInfo == nil {
 		log.Error("extra login info not available")
 		ctx.JSON(http.StatusOK, gin.H{"errMsg": "extra login info not available"})
-		return nil, fmt.Errorf("extra login info not available")
+		return nil, errors.New("extra login info not available")
 	}
 
 	ctx.HTML(http.StatusOK, "passcode/nhp_refresh.html", gin.H{
@@ -435,7 +436,7 @@ func authAndShowRefresh(ctx *gin.Context, req *common.HttpKnockRequest, res *com
 
 func refreshToken(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
 	if helper == nil {
-		return nil, fmt.Errorf("refreshToken: helper is null")
+		return nil, errors.New("refreshToken: helper is null")
 	}
 
 	result, err := exchangeAndKnock(ctx, req, res, helper)
@@ -469,7 +470,7 @@ func refreshToken(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Re
 
 func knockByToken(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
 	if helper == nil {
-		return nil, fmt.Errorf("knockByToken: helper is null")
+		return nil, errors.New("knockByToken: helper is null")
 	}
 
 	result, err := exchangeAndKnock(ctx, req, res, helper)
@@ -504,7 +505,7 @@ func knockByToken(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Re
 
 func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, string, error) {
 	if helper == nil {
-		return nil, "400", fmt.Errorf(" authRegular helper is null")
+		return nil, "400", errors.New("authRegular helper is null")
 	}
 
 	var err error
@@ -514,7 +515,7 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		AuthUrl := resourceHandler.GetConfig().AuthUrl
 		if len(AuthUrl) == 0 {
 			log.Error("AuthUrl is not provided.")
-			return nil, "401", fmt.Errorf("auth URL is not provided")
+			return nil, "401", errors.New("auth URL is not provided")
 		}
 
 		resp, err := nhpsdkutils.SendRequest(nhpsdkutils.RequestOptions{
@@ -615,20 +616,20 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 
 func authAccessFromRaaS(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, string, error) {
 	if helper == nil {
-		return nil, "600", fmt.Errorf(" authRegular helper is null")
+		return nil, "600", errors.New("authAccessFromRaaS helper is null")
 	}
 	IAMServiceUrl := resourceHandler.GetConfig().IAMServiceUrl
 
 	idStr := ctx.Query("id")
 	if idStr == "" {
-		return nil, "601", fmt.Errorf("id is missing")
+		return nil, "601", errors.New("id is missing")
 	}
 	log.Info("raas portal Site app id is %s", idStr)
 	potalSiteUrl := fmt.Sprintf("%s/api/v1/portal-sites/%s", IAMServiceUrl, idStr)
 	log.Info("Calling real IAM service: %s", potalSiteUrl)
 	authHeader := ctx.GetHeader("Authorization")
 	if authHeader == "" {
-		return nil, "602", fmt.Errorf("authorization header is missing")
+		return nil, "602", errors.New("authorization header is missing")
 	}
 	raasHttpReq, err := http.NewRequestWithContext(ctx.Request.Context(), "GET", potalSiteUrl, nil)
 	if err != nil {

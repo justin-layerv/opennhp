@@ -1,7 +1,7 @@
 package db
 
 import (
-	"fmt"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -18,7 +18,7 @@ var (
 	serverConfigWatch io.Closer
 	teesConfigWatch   io.Closer
 
-	errLoadConfig = fmt.Errorf("config load error")
+	errLoadConfig = errors.New("config load error")
 )
 
 type Config struct {

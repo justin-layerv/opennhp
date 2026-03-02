@@ -2,7 +2,7 @@ package core
 
 import (
 	"encoding/binary"
-	"fmt"
+	"errors"
 	"unsafe"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
@@ -241,16 +241,16 @@ func (d *Device) RecvPrecheck(pkt *Packet) (int, int, error) {
 		if s == 0 {
 			return t, s, nil
 		} else {
-			return t, s, fmt.Errorf("keepalive packet size is incorrect")
+			return t, s, errors.New("keepalive packet size is incorrect")
 		}
 	}
 	if !d.CheckRecvHeaderType(t) {
-		return t, s, fmt.Errorf("packet header type does not match device")
+		return t, s, errors.New("packet header type does not match device")
 	}
 
 	totalLen := len(pkt.Content)
 	if totalLen != headerSize+s {
-		return t, s, fmt.Errorf("packet total size is incorrect")
+		return t, s, errors.New("packet total size is incorrect")
 	}
 
 	return t, s, nil

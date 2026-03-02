@@ -167,7 +167,7 @@ func (r *QurlResolver) Resolve(ctx context.Context, req *ResolveRequest) (*Resol
 	// Fail fast if token is empty - this should never happen due to config validation,
 	// but proceeding without auth would be a silent security issue.
 	if r.serviceToken == "" {
-		return nil, fmt.Errorf("service token is empty - cannot authenticate with QURL API")
+		return nil, errors.New("service token is empty - cannot authenticate with QURL API")
 	}
 	httpReq.Header.Set("X-Service-Token", r.serviceToken)
 

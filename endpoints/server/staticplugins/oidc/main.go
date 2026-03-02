@@ -1,6 +1,7 @@
 package oidc
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -71,7 +72,7 @@ func Close() error {
 
 func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugins.HttpServerPluginHelper) (ackMsg *common.ServerKnockAckMsg, err error) {
 	if helper == nil {
-		return nil, fmt.Errorf("authWithHTTP: helper is null")
+		return nil, errors.New("authWithHTTP: helper is null")
 	}
 
 	resId := ctx.Query("resid")
@@ -118,7 +119,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 
 	default:
 		ackMsg = nil
-		err = fmt.Errorf("action invalid")
+		err = errors.New("action invalid")
 	}
 	return
 }
@@ -147,13 +148,13 @@ func authOkta(ctx *gin.Context) error {
 	if err != nil {
 		ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to initialize authenticator"})
 		oktaAuth = nil
-		return fmt.Errorf("failed to initialize authenticator")
+		return errors.New("failed to initialize authenticator")
 	}
 
 	err = oktaAuth.DoAuth(ctx)
 	if err != nil {
 		ctx.JSON(http.StatusOK, gin.H{"errMsg": "user authentication failed"})
-		return fmt.Errorf("user authentication failed")
+		return errors.New("user authentication failed")
 	}
 
 	return nil
@@ -162,14 +163,14 @@ func authOkta(ctx *gin.Context) error {
 func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
 	if oktaAuth == nil {
 		ctx.JSON(http.StatusOK, gin.H{"errMsg": "invalid authenticator"})
-		return nil, fmt.Errorf("invalid authenticator")
+		return nil, errors.New("invalid authenticator")
 	}
 
 	session := sessions.Default(ctx)
 	if ctx.Query("state") != session.Get("state") {
 		ctx.JSON(http.StatusOK, gin.H{"errMsg": "invalid authentication session"})
 		log.Error("session.state = %s, query.state = %s", session.Get("state"), ctx.Query("state"))
-		return nil, fmt.Errorf("invalid authentication session")
+		return nil, errors.New("invalid authentication session")
 	}
 
 	authorizeCode := ctx.Query("code")
@@ -182,19 +183,19 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		oktaToken, err = oktaAuth.Exchange(ctx.Request.Context(), authorizeCode)
 		if err != nil {
 			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to convert an authorization code into a token"})
-			return nil, fmt.Errorf("failed to convert an authorization code into a token")
+			return nil, errors.New("failed to convert an authorization code into a token")
 		}
 
 		idToken, err := oktaAuth.VerifyIDToken(ctx.Request.Context(), oktaToken)
 		if err != nil {
 			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to verify ID token"})
-			return nil, fmt.Errorf("failed to verify ID token")
+			return nil, errors.New("failed to verify ID token")
 		}
 
 		var profile map[string]interface{}
 		if err := idToken.Claims(&profile); err != nil {
 			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to claim user profile"})
-			return nil, fmt.Errorf("failed to claim user profile")
+			return nil, errors.New("failed to claim user profile")
 		}
 
 		session.Set("oauth_token", *oktaToken)
@@ -208,7 +209,7 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		t, ok := oauthToken.(oauth2.Token)
 		if !ok {
 			ctx.JSON(http.StatusOK, gin.H{"errMsg": "invalid session parameter"})
-			return nil, fmt.Errorf("invalid session parameter")
+			return nil, errors.New("invalid session parameter")
 		}
 		oktaToken = &t
 
@@ -217,12 +218,12 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to verify ID token"})
 			session.Clear()
 			ctx.Redirect(http.StatusSeeOther, fmt.Sprintf("/plugins/oktaoidc?resid=%s&action=login", res.Id()))
-			return nil, fmt.Errorf("failed to verify ID token")
+			return nil, errors.New("failed to verify ID token")
 		}
 		var profile map[string]interface{}
 		if err := idToken.Claims(&profile); err != nil {
 			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to claim user profile"})
-			return nil, fmt.Errorf("failed to claim user profile")
+			return nil, errors.New("failed to claim user profile")
 		}
 
 		session.Set("oauth_token", *oktaToken)
@@ -241,7 +242,7 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 	if ackMsg == nil {
 		log.Error("AuthWithHttpCallbackFunc returned nil ackMsg")
 		ctx.JSON(http.StatusOK, gin.H{"errMsg": "internal error: nil response"})
-		return nil, fmt.Errorf("nil ackMsg from AuthWithHttpCallbackFunc")
+		return nil, errors.New("nil ackMsg from AuthWithHttpCallbackFunc")
 	}
 
 	if ackMsg.ErrCode != common.ErrSuccess.ErrorCode() {
@@ -269,7 +270,7 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 	if jwtSecret == "" {
 		log.Error("JWTSecret is empty or not found in ExInfo")
 		ctx.JSON(http.StatusOK, gin.H{"errMsg": "JWT secret not configured"})
-		return nil, fmt.Errorf("JWT secret not configured")
+		return nil, errors.New("JWT secret not configured")
 	}
 
 	jwt := &nhpplugins.JWTToken{
@@ -289,13 +290,13 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 	if nhpToken == "" {
 		log.Error("Generated nhpToken is empty")
 		ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to generate authentication token"})
-		return nil, fmt.Errorf("empty authentication token generated")
+		return nil, errors.New("empty authentication token generated")
 	}
 
 	if refreshToken == "" {
 		log.Error("Generated refreshToken is empty")
 		ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to generate refresh token"})
-		return nil, fmt.Errorf("empty refresh token generated")
+		return nil, errors.New("empty refresh token generated")
 	}
 
 	resp.CookieDomain = res.CookieDomain
@@ -317,7 +318,7 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelper) (ackMsg *common.ServerKnockAckMsg, err error) {
 	ackMsg = req.Ack
 	if helper == nil {
-		return ackMsg, fmt.Errorf("authWithNHP: helper is null")
+		return ackMsg, errors.New("authWithNHP: helper is null")
 	}
 
 	var res *common.ResourceData

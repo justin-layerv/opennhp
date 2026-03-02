@@ -1,7 +1,7 @@
 package plugins
 
 import (
-	"fmt"
+	"errors"
 	"sync"
 
 	log "github.com/OpenNHP/opennhp/nhp/log"
@@ -81,4 +81,4 @@ func ClearRegistry() {
 }
 
 // ErrPluginNotRegistered is returned when a requested plugin is not found
-var ErrPluginNotRegistered = fmt.Errorf("plugin not registered")
+var ErrPluginNotRegistered = errors.New("plugin not registered")

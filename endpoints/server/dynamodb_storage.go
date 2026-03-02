@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -103,7 +104,7 @@ func (d *DynamoDBStorage) Close() error {
 // This is used for health checks in cloud mode deployments.
 func (d *DynamoDBStorage) Ping(ctx context.Context) error {
 	if d.client == nil {
-		return fmt.Errorf("dynamodb client not initialized")
+		return errors.New("dynamodb client not initialized")
 	}
 
 	// Use the AC assignments table for health check (most commonly accessed)
@@ -112,7 +113,7 @@ func (d *DynamoDBStorage) Ping(ctx context.Context) error {
 		tableName = d.config.LicensesTable
 	}
 	if tableName == "" {
-		return fmt.Errorf("no dynamodb tables configured")
+		return errors.New("no dynamodb tables configured")
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, DynamoDBOperationTimeout)

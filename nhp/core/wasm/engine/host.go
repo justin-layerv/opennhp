@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -99,7 +100,7 @@ func GetEvidence() (string, error) {
 	if err != nil {
 		evidence, err = GetEvidenceWithAgentUuid()
 		if err != nil {
-			return "", fmt.Errorf("failed to get evidence from CC or agent uuid")
+			return "", errors.New("failed to get evidence from CC or agent uuid")
 		}
 	}
 

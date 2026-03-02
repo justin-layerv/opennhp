@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -53,7 +54,7 @@ var _ StorageBackend = (*EtcdStorage)(nil)
 // NewEtcdStorage creates a new etcd storage backend.
 func NewEtcdStorage(ctx context.Context, cfg EtcdStorageConfig) (*EtcdStorage, error) {
 	if len(cfg.Endpoints) == 0 {
-		return nil, fmt.Errorf("etcd endpoints are required")
+		return nil, errors.New("etcd endpoints are required")
 	}
 
 	conn := &etcd.EtcdConn{
@@ -98,7 +99,7 @@ func (e *EtcdStorage) Close() error {
 // This is used for health checks to verify the storage backend is available.
 func (e *EtcdStorage) Ping(ctx context.Context) error {
 	if e.conn == nil || e.conn.Client() == nil {
-		return fmt.Errorf("etcd client not initialized")
+		return errors.New("etcd client not initialized")
 	}
 
 	// Get status from the first endpoint
@@ -107,7 +108,7 @@ func (e *EtcdStorage) Ping(ctx context.Context) error {
 	// this will report unhealthy even though the cluster is functional.
 	// This is acceptable for single-endpoint deployments (our current setup).
 	if len(e.config.Endpoints) == 0 {
-		return fmt.Errorf("no etcd endpoints configured")
+		return errors.New("no etcd endpoints configured")
 	}
 
 	_, err := e.conn.Client().Status(ctx, e.config.Endpoints[0])

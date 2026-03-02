@@ -4,6 +4,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -282,7 +283,7 @@ func saveMetadata(metadata FileMetadata) error {
 	// Validate UUID to prevent path traversal
 	safeUUID := filepath.Base(metadata.UUID)
 	if safeUUID == "" || safeUUID == "." || safeUUID == ".." || safeUUID != metadata.UUID {
-		return fmt.Errorf("invalid UUID format")
+		return errors.New("invalid UUID format")
 	}
 
 	if _, err := os.Stat(filepath.Join(ExeDirPath, metadataDir)); os.IsNotExist(err) {
@@ -319,7 +320,7 @@ func loadMetadata(uuid string) (FileMetadata, error) {
 		return metadata, err
 	}
 	if !strings.HasPrefix(absPath, safeDirAbs+string(os.PathSeparator)) {
-		return metadata, fmt.Errorf("invalid file name")
+		return metadata, errors.New("invalid file name")
 	}
 
 	file, err := os.Open(absPath)

@@ -863,7 +863,7 @@ func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOut
 
 			if dagMsg.AccessUrl == "" {
 				log.Error("access url is empty, please check with data provider")
-				return "", fmt.Errorf("access url is empty, please check with data provider")
+				return "", errors.New("access url is empty, please check with data provider")
 			}
 
 			ztdoPath, err := utils.DownloadFileToTemp(dagMsg.AccessUrl, "ztdo-")
@@ -879,7 +879,7 @@ func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOut
 
 			if ztdoId != ztdo.GetObjectID() {
 				log.Error("ztdo id mismatch: expected=%s, got=%s", ztdoId, ztdo.GetObjectID())
-				return "", fmt.Errorf("ztdo id mismatch, please check with data provider")
+				return "", errors.New("ztdo id mismatch, please check with data provider")
 			}
 
 			// decrypt data private key
@@ -898,7 +898,7 @@ func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOut
 			}
 
 			if ztdoPath == "" || output == "" {
-				return "", fmt.Errorf("ztdo path or output is empty")
+				return "", errors.New("ztdo path or output is empty")
 			}
 
 			// decrypt data

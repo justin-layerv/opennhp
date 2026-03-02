@@ -277,7 +277,7 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		netIP = net.ParseIP(s.config.ListenIp)
 		if netIP == nil {
 			log.Error("udp listen ip address is incorrect!")
-			return fmt.Errorf("udp listen ip address is incorrect")
+			return errors.New("udp listen ip address is incorrect")
 		}
 	} else {
 		netIP = net.IPv4zero // will both listen on ipv4 0.0.0.0:port and ipv6 [::]:port
@@ -993,7 +993,7 @@ func (s *UdpServer) RemoveAddressAssociation(srcIp string) {
 
 func (s *UdpServer) AddAuthService(aspData *common.AuthServiceProviderData) error {
 	if len(aspData.AuthSvcId) == 0 {
-		return fmt.Errorf("aspId is empty")
+		return errors.New("aspId is empty")
 	}
 
 	s.authServiceMapMutex.Lock()
@@ -1014,14 +1014,14 @@ func (s *UdpServer) AddAuthService(aspData *common.AuthServiceProviderData) erro
 
 func (s *UdpServer) AddResource(res *common.ResourceData) error {
 	if len(res.AuthServiceId) == 0 || len(res.ResourceId) == 0 {
-		return fmt.Errorf("aspId or resId is empty")
+		return errors.New("aspId or resId is empty")
 	}
 
 	s.authServiceMapMutex.Lock()
 	aspData, found := s.authServiceMap[res.AuthServiceId]
 	if !found {
 		s.authServiceMapMutex.Unlock()
-		return fmt.Errorf("aspId not found")
+		return errors.New("aspId not found")
 	}
 	aspData.ResourceGroups[res.ResourceId] = res
 	s.authServiceMapMutex.Unlock()
@@ -1036,7 +1036,7 @@ func (s *UdpServer) ValidatePlugin(h plugins.PluginHandler) bool {
 func (s *UdpServer) LoadPlugin(pluginId string, h plugins.PluginHandler) error {
 	if !s.ValidatePlugin(h) {
 		log.Error("Plugin: %s validation failed", pluginId)
-		return fmt.Errorf("plugin validation failed")
+		return errors.New("plugin validation failed")
 	}
 
 	s.pluginHandlerMapMutex.Lock()

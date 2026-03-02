@@ -6,6 +6,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -185,7 +186,7 @@ func CBCDecryption(t GcmTypeEnum, key *[SymmetricKeySize]byte, ciphertext []byte
 	}
 
 	if len(ciphertext) < block.BlockSize() {
-		return nil, fmt.Errorf("ciphertext too short")
+		return nil, errors.New("ciphertext too short")
 	}
 
 	var plaintext []byte
@@ -254,7 +255,7 @@ func AESDecrypt(cipherText []byte, key []byte) ([]byte, error) {
 		return nil, fmt.Errorf("cipherText too short: need at least %d bytes, got %d", aes.BlockSize*2, len(cipherText))
 	}
 	if (len(cipherText)-aes.BlockSize)%aes.BlockSize != 0 {
-		return nil, fmt.Errorf("cipherText length invalid: must be IV + multiple of block size")
+		return nil, errors.New("cipherText length invalid: must be IV + multiple of block size")
 	}
 	iv := cipherText[:aes.BlockSize]
 	cipherText = cipherText[aes.BlockSize:]
@@ -276,7 +277,7 @@ func AESDecrypt(cipherText []byte, key []byte) ([]byte, error) {
 func unpad(padded []byte, blockSize int) ([]byte, error) {
 	length := len(padded)
 	if length == 0 {
-		return nil, fmt.Errorf("empty padded data")
+		return nil, errors.New("empty padded data")
 	}
 	unpadLen := int(padded[length-1])
 	if unpadLen == 0 || unpadLen > blockSize || unpadLen > length {
@@ -285,7 +286,7 @@ func unpad(padded []byte, blockSize int) ([]byte, error) {
 	// Validate all padding bytes match PKCS#7 requirements
 	for i := length - unpadLen; i < length; i++ {
 		if padded[i] != byte(unpadLen) {
-			return nil, fmt.Errorf("invalid PKCS#7 padding bytes")
+			return nil, errors.New("invalid PKCS#7 padding bytes")
 		}
 	}
 	return padded[:length-unpadLen], nil

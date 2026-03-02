@@ -5,12 +5,12 @@ package ebpf
 import (
 	// "log"
 
-	"fmt"
+	"errors"
 
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
-var ErrEBPFSupportedOnlyOnLinux = fmt.Errorf("eBPF functionality is only supported on Linux, current platform is not Linux")
+var ErrEBPFSupportedOnlyOnLinux = errors.New("eBPF functionality is only supported on Linux, current platform is not Linux")
 var (
 	DenyLogger *log.Logger
 	AcLogger   *log.Logger

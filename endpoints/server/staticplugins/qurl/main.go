@@ -73,7 +73,7 @@ func Close() error {
 // to protect against brute-force token guessing attacks.
 func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugins.HttpServerPluginHelper) (ackMsg *common.ServerKnockAckMsg, err error) {
 	if helper == nil {
-		return nil, fmt.Errorf("authWithHTTP: helper is null")
+		return nil, errors.New("authWithHTTP: helper is null")
 	}
 
 	// Set CORS headers early so error responses are also CORS-enabled.
@@ -127,7 +127,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 			"error":   "no_resource_hosts",
 			"message": "No resource hosts available",
 		})
-		return nil, fmt.Errorf("no resource hosts available")
+		return nil, errors.New("no resource hosts available")
 	}
 
 	log.Info("[QURL] NHP knock succeeded: hosts=%v", ackMsg.ResourceHost)
@@ -140,7 +140,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 			"error":   "configuration_error",
 			"message": "JWT secret not configured",
 		})
-		return nil, fmt.Errorf("JWT secret is empty")
+		return nil, errors.New("JWT secret is empty")
 	}
 
 	jwt := &nhpplugins.JWTToken{
