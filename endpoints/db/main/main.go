@@ -333,12 +333,22 @@ func runApp(params db.AppParams) error {
 
 		dataKeyPairEccMode := ztdo.GetECCMode()
 
-		dataPrk, _ := base64.StdEncoding.DecodeString(params.DataPrivateKeyBase64)
+		dataPrk, err := base64.StdEncoding.DecodeString(params.DataPrivateKeyBase64)
+		if err != nil {
+			log.Error("failed to decode data private key base64: %v", err)
+			fmt.Printf("Error: failed to decode data private key base64: %v\n", err)
+			os.Exit(1)
+		}
 		sa := ztdolib.NewSymmetricAgreement(dataKeyPairEccMode, false)
 		sa.SetMessagePatterns(dataMsgPattern)
 		sa.SetStaticKeyPair(core.ECDHFromKey(dataKeyPairEccMode.ToEccType(), dataPrk))
 
-		providerPublicKey, _ := base64.StdEncoding.DecodeString(params.ProviderPublicKeyBase64)
+		providerPublicKey, err := base64.StdEncoding.DecodeString(params.ProviderPublicKeyBase64)
+		if err != nil {
+			log.Error("failed to decode provider public key base64: %v", err)
+			fmt.Printf("Error: failed to decode provider public key base64: %v\n", err)
+			os.Exit(1)
+		}
 		sa.SetRemoteStaticPublicKey(providerPublicKey)
 
 		gcmKey, ad := sa.AgreeSymmetricKey()

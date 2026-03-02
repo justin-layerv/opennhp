@@ -855,14 +855,16 @@ func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOut
 				return "", fmt.Errorf("failed to unmarshal data private key wrapping: %v", err)
 			}
 
-			providerPbk, _ := base64.StdEncoding.DecodeString(dataPrkWrapping.ProviderPublicKeyBase64)
+			providerPbk, err := base64.StdEncoding.DecodeString(dataPrkWrapping.ProviderPublicKeyBase64)
+			if err != nil {
+				return "", fmt.Errorf("failed to decode provider public key base64: %v", err)
+			}
 
 			if dagMsg.AccessUrl == "" {
 				log.Error("access url is empty, please check with data provider")
 				return "", fmt.Errorf("access url is empty, please check with data provider")
 			}
 
-			var err error
 			ztdoPath, err := utils.DownloadFileToTemp(dagMsg.AccessUrl, "ztdo-")
 			if err != nil {
 				log.Error("failed to download ztdo: %v", err)
@@ -906,12 +908,18 @@ func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOut
 				{ztdolib.MessagePatternRS, ztdolib.MessagePatternDHSS},
 			}
 
-			dataPrk, _ := base64.StdEncoding.DecodeString(dataPrkBase64)
+			dataPrk, err := base64.StdEncoding.DecodeString(dataPrkBase64)
+			if err != nil {
+				return "", fmt.Errorf("failed to decode data private key base64: %v", err)
+			}
 			saData := ztdolib.NewSymmetricAgreement(dataKeyPairEccMode, false)
 			saData.SetMessagePatterns(dataMsgPattern)
 			saData.SetStaticKeyPair(core.ECDHFromKey(dataKeyPairEccMode.ToEccType(), dataPrk))
 
-			providerPublicKey, _ := base64.StdEncoding.DecodeString(dataPrkWrapping.ProviderPublicKeyBase64)
+			providerPublicKey, err := base64.StdEncoding.DecodeString(dataPrkWrapping.ProviderPublicKeyBase64)
+			if err != nil {
+				return "", fmt.Errorf("failed to decode provider public key base64: %v", err)
+			}
 			saData.SetRemoteStaticPublicKey(providerPublicKey)
 
 			gcmKey, ad = saData.AgreeSymmetricKey()

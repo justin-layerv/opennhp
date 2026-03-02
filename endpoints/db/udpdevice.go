@@ -814,27 +814,37 @@ func (a *UdpDevice) HandleUdpDataKeyWrappingOperations(ppd *core.PacketParserDat
 			} else {
 				dataKeyPairEccMode := ztdolib.CURVE25519
 
-				teePbk, _ := base64.StdEncoding.DecodeString(dwrMsg.TeePublicKey)
-				consumerEPbk, _ := base64.StdEncoding.DecodeString(dwrMsg.ConsumerEphemeralPublicKey)
+				teePbk, err := base64.StdEncoding.DecodeString(dwrMsg.TeePublicKey)
+				if err != nil {
+					log.Error("failed to decode TEE public key base64: %v", err)
+					errCode, _ := strconv.Atoi(common.ErrDataPrivateKeyStore.ErrorCode())
+					dwaMsg.ErrCode = errCode
+					dwaMsg.ErrMsg = fmt.Sprintf("failed to decode TEE public key: %v", err)
+				} else if consumerEPbk, err := base64.StdEncoding.DecodeString(dwrMsg.ConsumerEphemeralPublicKey); err != nil {
+					log.Error("failed to decode consumer ephemeral public key base64: %v", err)
+					errCode, _ := strconv.Atoi(common.ErrDataPrivateKeyStore.ErrorCode())
+					dwaMsg.ErrCode = errCode
+					dwaMsg.ErrMsg = fmt.Sprintf("failed to decode consumer ephemeral public key: %v", err)
+				} else {
+					sa := ztdolib.NewSymmetricAgreement(dataKeyPairEccMode, true)
+					sa.SetMessagePatterns(ztdolib.DataPrivateKeyWrappingPatterns)
+					sa.SetPsk([]byte(ztdolib.InitialDHPKeyWrappingString))
+					sa.SetStaticKeyPair(a.GetOwnEcdh())
+					sa.SetRemoteStaticPublicKey(teePbk)
+					sa.SetRemoteEphemeralPublicKey(consumerEPbk)
 
-				sa := ztdolib.NewSymmetricAgreement(dataKeyPairEccMode, true)
-				sa.SetMessagePatterns(ztdolib.DataPrivateKeyWrappingPatterns)
-				sa.SetPsk([]byte(ztdolib.InitialDHPKeyWrappingString))
-				sa.SetStaticKeyPair(a.GetOwnEcdh())
-				sa.SetRemoteStaticPublicKey(teePbk)
-				sa.SetRemoteEphemeralPublicKey(consumerEPbk)
+					gcmKey, ad := sa.AgreeSymmetricKey()
 
-				gcmKey, ad := sa.AgreeSymmetricKey()
+					dataPrkWrapping := ztdolib.NewDataPrivateKeyWrapping(dataPrkStore.ProviderPublicKeyBase64, dataPrkStore.DataPrivateKeyBase64, gcmKey[:], ad)
 
-				dataPrkWrapping := ztdolib.NewDataPrivateKeyWrapping(dataPrkStore.ProviderPublicKeyBase64, dataPrkStore.DataPrivateKeyBase64, gcmKey[:], ad)
+					dataPrkWrappingJson, _ := json.Marshal(dataPrkWrapping)
 
-				dataPrkWrappingJson, _ := json.Marshal(dataPrkWrapping)
-
-				kao := common.KeyAccessObject{
-					WrappedDataKey: string(dataPrkWrappingJson),
+					kao := common.KeyAccessObject{
+						WrappedDataKey: string(dataPrkWrappingJson),
+					}
+					dwaMsg.Kao = &kao
+					dwaMsg.DoId = dwrMsg.DoId
 				}
-				dwaMsg.Kao = &kao
-				dwaMsg.DoId = dwrMsg.DoId
 			}
 		}
 	} else {
