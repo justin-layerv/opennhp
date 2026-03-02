@@ -188,7 +188,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		ackMsg = nil
 		err = common.ErrResourceNotFound
 		log.Error("resource error: %v", err)
-		ctx.String(http.StatusOK, "{\"errMsg\": \"resource error: %v\"}", err)
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": fmt.Sprintf("resource error: %v", err)})
 		return
 	}
 
@@ -232,14 +232,14 @@ func authOkta(ctx *gin.Context) error {
 	var err error
 	oktaAuth, err = NewAuthenticator(*baseConf)
 	if err != nil {
-		ctx.String(http.StatusOK, "{\"errMsg\": \"failed to initialize authenticator\"}")
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to initialize authenticator"})
 		oktaAuth = nil
 		return fmt.Errorf("failed to initialize authenticator")
 	}
 
 	err = oktaAuth.DoAuth(ctx)
 	if err != nil {
-		ctx.String(http.StatusOK, "{\"errMsg\": \"user authentication failed\"}")
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": "user authentication failed"})
 		return fmt.Errorf("user authentication failed")
 	}
 
@@ -248,13 +248,13 @@ func authOkta(ctx *gin.Context) error {
 
 func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
 	if oktaAuth == nil {
-		ctx.String(http.StatusOK, "{\"errMsg\": \"invalid authenticator\"}")
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": "invalid authenticator"})
 		return nil, fmt.Errorf("invalid authenticator")
 	}
 
 	session := sessions.Default(ctx)
 	if ctx.Query("state") != session.Get("state") {
-		ctx.String(http.StatusOK, "{\"errMsg\": \"invalid authentication session\"}")
+		ctx.JSON(http.StatusOK, gin.H{"errMsg": "invalid authentication session"})
 		return nil, fmt.Errorf("invalid authentication session")
 	}
 
@@ -267,19 +267,19 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		// Exchange an authorization code for a token.
 		oktaToken, err = oktaAuth.Exchange(ctx.Request.Context(), authorizeCode)
 		if err != nil {
-			ctx.String(http.StatusOK, "{\"errMsg\": \"failed to convert an authorization code into a token\"}")
+			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to convert an authorization code into a token"})
 			return nil, fmt.Errorf("failed to convert an authorization code into a token")
 		}
 
 		idToken, err := oktaAuth.VerifyIDToken(ctx.Request.Context(), oktaToken)
 		if err != nil {
-			ctx.String(http.StatusOK, "{\"errMsg\": \"failed to verify ID token\"}")
+			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to verify ID token"})
 			return nil, fmt.Errorf("failed to verify ID token")
 		}
 
 		var profile map[string]interface{}
 		if err := idToken.Claims(&profile); err != nil {
-			ctx.String(http.StatusOK, "{\"errMsg\": \"failed to claim user profile\"}")
+			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to claim user profile"})
 			return nil, fmt.Errorf("failed to claim user profile")
 		}
 
@@ -291,14 +291,14 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		oauthToken := session.Get("oauth_token")
 		t, ok := oauthToken.(oauth2.Token)
 		if !ok {
-			ctx.String(http.StatusOK, "{\"errMsg\": \"invalid session paramete\"}")
+			ctx.JSON(http.StatusOK, gin.H{"errMsg": "invalid session parameter"})
 			return nil, fmt.Errorf("invalid session parameter")
 		}
 		oktaToken = &t
 
 		_, err := oktaAuth.VerifyIDToken(ctx.Request.Context(), oktaToken)
 		if err != nil {
-			ctx.String(http.StatusOK, "{\"errMsg\": \"failed to verify ID token\"}")
+			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to verify ID token"})
 			session.Clear()
 			ctx.Redirect(http.StatusSeeOther, "/plugins/okta?resid=demo&action=login")
 			return nil, fmt.Errorf("failed to verify ID token")

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -25,7 +26,7 @@ func (hs *HttpServer) legacyAuthWithAspPlugin(c *gin.Context, req *common.HttpKn
 	handler := hs.FindPluginHandler(req.AuthServiceId)
 	if handler == nil {
 		log.Error("no auth handler provided")
-		c.String(http.StatusOK, "{\"errMsg\": \"no auth handler provided\"}")
+		c.JSON(http.StatusOK, gin.H{"errMsg": "no auth handler provided"})
 		return
 	}
 
@@ -41,7 +42,7 @@ func (hs *HttpServer) runPluginAuth(c *gin.Context, req *common.HttpKnockRequest
 	if err != nil {
 		log.Info("auth error: %v", err)
 		if !c.Writer.Written() && !c.IsAborted() {
-			c.String(http.StatusOK, "{\"errMsg\": \"auth error: %v\"}", err)
+			c.JSON(http.StatusOK, gin.H{"errMsg": fmt.Sprintf("auth error: %v", err)})
 		}
 	} else {
 		log.Info("auth completed successfully")

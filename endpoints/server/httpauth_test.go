@@ -85,7 +85,7 @@ func TestRunPluginAuth_ErrorWithoutAbort_WritesError(t *testing.T) {
 
 	hs.runPluginAuth(ctx, &common.HttpKnockRequest{}, handler)
 
-	expected := `{"errMsg": "auth error: some plugin error"}`
+	expected := `{"errMsg":"auth error: some plugin error"}`
 	if body := w.Body.String(); body != expected {
 		t.Errorf("expected %q, got %q", expected, body)
 	}

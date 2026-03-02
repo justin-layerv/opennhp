@@ -138,7 +138,6 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 				var err = hs.httpServer.ListenAndServeTLS(certFilePath, keyFilePath)
 				if err != nil && err != http.ErrServerClosed {
 					log.Error("https server close error: %v\n", err)
-					//panic(err)
 				}
 			}()
 
@@ -152,7 +151,6 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 		var err = hs.httpServer.ListenAndServe()
 		if err != nil && err != http.ErrServerClosed {
 			log.Error("http server close error: %v\n", err)
-			//panic(err)
 		}
 	}()
 
@@ -338,7 +336,7 @@ func (hs *HttpServer) initRouter() {
 		if len(aspId) == 0 {
 			err = common.ErrUrlPathInvalid
 			log.Error("path error: %v", err)
-			ctx.String(http.StatusOK, "{\"errMsg\": \"path error: %v\"}", err)
+			ctx.JSON(http.StatusOK, gin.H{"errMsg": fmt.Sprintf("path error: %v", err)})
 			return
 		}
 
@@ -361,13 +359,13 @@ func (hs *HttpServer) initRouter() {
 
 		if len(aspId) == 0 {
 			log.Error("no aspId provided")
-			ctx.String(http.StatusOK, "{\"errMsg\": \"no aspId provided\"}")
+			ctx.JSON(http.StatusOK, gin.H{"errMsg": "no aspId provided"})
 			return
 		}
 
 		if len(resId) == 0 {
 			log.Error("no resId provided")
-			ctx.String(http.StatusOK, "{\"errMsg\": \"no resId provided\"}")
+			ctx.JSON(http.StatusOK, gin.H{"errMsg": "no resId provided"})
 			return
 		}
 
@@ -384,30 +382,6 @@ func (hs *HttpServer) initRouter() {
 	hs.initStorageRouter()
 
 	hs.initKbsRouter()
-
-	/*
-		refreshGrp := g.Group("refresh")
-		refreshGrp.GET("/:token", func(ctx *gin.Context) {
-			var err error
-			token := ctx.Param("token")
-			log.Info("get refresh request. aspId: %s, query: %v", token, ctx.Request.URL.RawQuery)
-
-			if len(token) == 0 {
-				err = common.ErrUrlPathInvalid
-				log.Error("path error: %v", err)
-				ctx.String(http.StatusOK, "{\"errMsg\": \"path error: %v\"}", err)
-				return
-			}
-
-			req := &common.HttpRefreshRequest{
-				Token: token,
-				SrcIp: ctx.Query("srcip"),
-			}
-
-			hs.handleRefreshResource()
-		})
-	*/
-
 }
 
 // cookieKeySet represents a pair of cookie signing/encryption keys.
@@ -689,7 +663,3 @@ func (hs *HttpServer) FindPluginHandler(aspId string) plugins.PluginHandler {
 	return hs.udpServer.FindPluginHandler(aspId)
 }
 
-func (hs *HttpServer) handleRefreshResource(token string) (err error) {
-	// to do
-	return nil
-}

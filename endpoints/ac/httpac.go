@@ -3,6 +3,7 @@ package ac
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -83,7 +84,6 @@ func (hs *HttpAC) Start(uac *UdpAC, hc *HttpConfig) error {
 				var err = hs.httpServer.ListenAndServeTLS(certFilePath, keyFilePath)
 				if err != nil && err != http.ErrServerClosed {
 					log.Error("https server close error: %v\n", err)
-					//panic(err)
 				}
 			}()
 
@@ -97,7 +97,6 @@ func (hs *HttpAC) Start(uac *UdpAC, hc *HttpConfig) error {
 		var err = hs.httpServer.ListenAndServe()
 		if err != nil && err != http.ErrServerClosed {
 			log.Error("http server close error: %v\n", err)
-			//panic(err)
 		}
 	}()
 
@@ -145,14 +144,14 @@ func (ha *HttpAC) initRouter() {
 		if len(token) == 0 {
 			err = common.ErrUrlPathInvalid
 			log.Error("path error: %v", err)
-			ctx.String(http.StatusOK, "{\"errMsg\": \"path error: %v\"}", err)
+			ctx.JSON(http.StatusOK, gin.H{"errMsg": fmt.Sprintf("path error: %v", err)})
 			return
 		}
 
 		if token, err = url.QueryUnescape(token); err != nil {
 			err = common.ErrUrlPathInvalid
 			log.Error("token error: %v", err)
-			ctx.String(http.StatusOK, "{\"errMsg\": \"token error: %v\"}", err)
+			ctx.JSON(http.StatusOK, gin.H{"errMsg": fmt.Sprintf("token error: %v", err)})
 			return
 		}
 
@@ -168,28 +167,28 @@ func (ha *HttpAC) initRouter() {
 func (ha *HttpAC) HandleHttpRefreshOperations(c *gin.Context, req *common.HttpRefreshRequest) {
 	if len(req.SrcIp) == 0 {
 		log.Error("empty source ip")
-		c.String(http.StatusOK, "{\"errMsg\": \"empty source ip\"}")
+		c.JSON(http.StatusOK, gin.H{"errMsg": "empty source ip"})
 		return
 	}
 
 	netIp := net.ParseIP(req.SrcIp)
 	if netIp == nil {
 		log.Error("invalid source ip")
-		c.String(http.StatusOK, "{\"errMsg\": \"invalid source ip\"}")
+		c.JSON(http.StatusOK, gin.H{"errMsg": "invalid source ip"})
 		return
 	}
 
 	buf, err := base64.StdEncoding.DecodeString(req.Token)
 	if err != nil || len(buf) != 32 {
 		log.Error("invalid token format")
-		c.String(http.StatusOK, "{\"errMsg\": \"invalid token format\"}")
+		c.JSON(http.StatusOK, gin.H{"errMsg": "invalid token format"})
 		return
 	}
 
 	entry := ha.ua.VerifyAccessToken(req.Token)
 	if entry == nil {
 		log.Error("token verification failed")
-		c.String(http.StatusOK, "{\"errMsg\": \"token verification failed\"}")
+		c.JSON(http.StatusOK, gin.H{"errMsg": "token verification failed"})
 		return
 	}
 
@@ -213,7 +212,7 @@ func (ha *HttpAC) HandleHttpRefreshOperations(c *gin.Context, req *common.HttpRe
 	_, err = ha.ua.HandleAccessControl(entry.User, entry.SrcAddrs, entry.DstAddrs, entry.OpenTime, nil)
 	if err != nil {
 		log.Error("HandleAccessControl failed: %v", err)
-		c.String(http.StatusOK, "{\"errMsg\": \"%s\"}", err)
+		c.JSON(http.StatusOK, gin.H{"errMsg": err.Error()})
 		return
 	}
 
