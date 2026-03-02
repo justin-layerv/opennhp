@@ -363,6 +363,70 @@ resource "aws_secretsmanager_secret_rotation" "auth0_backend" {
 }
 
 # ==============================================================================
+# Smoke Test M2M Application
+# ==============================================================================
+# Dedicated M2M client for automated smoke tests. Runs on "system" tier with
+# unlimited quotas, isolated from the backend service client used by the
+# playground and production services.
+
+resource "auth0_client" "smoke_test" {
+  count       = var.enable_smoke_test_client ? 1 : 0
+  name        = "Smoke Test (${var.environment})"
+  description = "Dedicated M2M client for automated smoke tests - system tier, unlimited quotas - ${var.environment}"
+  app_type    = "non_interactive"
+  grant_types = ["client_credentials"]
+
+  jwt_configuration {
+    alg                 = "RS256"
+    lifetime_in_seconds = var.m2m_token_lifetime
+  }
+
+  oidc_conformant = true
+}
+
+resource "auth0_client_credentials" "smoke_test" {
+  count                 = var.enable_smoke_test_client ? 1 : 0
+  client_id             = auth0_client.smoke_test[0].id
+  authentication_method = "client_secret_post"
+}
+
+resource "auth0_client_grant" "smoke_test_qurl_api" {
+  count     = var.enable_smoke_test_client ? 1 : 0
+  client_id = auth0_client.smoke_test[0].id
+  audience  = auth0_resource_server.qurl_api.identifier
+  scopes    = ["qurl:read", "qurl:write", "qurl:admin"]
+}
+
+resource "aws_secretsmanager_secret" "smoke_test" {
+  count                   = var.enable_smoke_test_client ? 1 : 0
+  name                    = "${var.name_prefix}-auth0-smoke-test-credentials"
+  description             = "Auth0 M2M credentials for smoke tests (${var.environment}) - system tier"
+  recovery_window_in_days = 0 # No recovery needed for test credentials
+  kms_key_id              = var.secrets_kms_key_arn
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-auth0-smoke-test-credentials"
+    Component = "auth0"
+    Purpose   = "smoke-tests"
+  })
+}
+
+resource "aws_secretsmanager_secret_version" "smoke_test" {
+  count     = var.enable_smoke_test_client ? 1 : 0
+  secret_id = aws_secretsmanager_secret.smoke_test[0].id
+  secret_string = jsonencode({
+    client_id     = auth0_client.smoke_test[0].client_id
+    client_secret = auth0_client_credentials.smoke_test[0].client_secret
+    audience      = auth0_resource_server.qurl_api.identifier
+  })
+
+  lifecycle {
+    create_before_destroy = true
+    ignore_changes        = [secret_string] # Same Auth0 provider limitation
+  }
+}
+
+# ==============================================================================
 # Developer Portal Management M2M Application
 # ==============================================================================
 # Creates an Auth0 M2M application authorized for the Management API,

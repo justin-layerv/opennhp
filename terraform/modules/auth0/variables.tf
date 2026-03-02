@@ -112,6 +112,16 @@ variable "auth0_management_secret_arn" {
 }
 
 # ==============================================================================
+# Smoke Test M2M Configuration
+# ==============================================================================
+
+variable "enable_smoke_test_client" {
+  description = "Create a dedicated Auth0 M2M client for smoke tests with system tier"
+  type        = bool
+  default     = false
+}
+
+# ==============================================================================
 # Developer Portal Management M2M Configuration
 # ==============================================================================
 

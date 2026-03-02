@@ -382,6 +382,9 @@ module "auth0" {
   google_oauth_client_secret = var.google_oauth_client_secret
   github_oauth_client_id     = var.github_oauth_client_id
   github_oauth_client_secret = var.github_oauth_client_secret
+
+  # Dedicated smoke test M2M client (system tier)
+  enable_smoke_test_client = true
 }
 
 # ==============================================================================
@@ -557,4 +560,15 @@ output "auth0_spa_domain_ssm_arn" {
 output "auth0_spa_api_audience_ssm_arn" {
   description = "ARN of SSM parameter containing API audience (for IAM policies)"
   value       = module.auth0.spa_api_audience_ssm_arn
+}
+
+# Smoke test outputs
+output "auth0_smoke_test_client_id" {
+  description = "Auth0 smoke test M2M client ID"
+  value       = module.auth0.smoke_test_client_id
+}
+
+output "auth0_smoke_test_credentials_secret_arn" {
+  description = "Secrets Manager ARN for smoke test Auth0 credentials"
+  value       = module.auth0.smoke_test_credentials_secret_arn
 }

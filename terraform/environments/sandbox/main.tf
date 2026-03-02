@@ -403,6 +403,9 @@ module "auth0" {
   google_oauth_client_secret = var.google_oauth_client_secret
   github_oauth_client_id     = var.github_oauth_client_id
   github_oauth_client_secret = var.github_oauth_client_secret
+
+  # Dedicated smoke test M2M client (system tier)
+  enable_smoke_test_client = true
 }
 
 # State migration: module.auth0 was previously deployed with count (as module.auth0[0])
@@ -591,4 +594,15 @@ output "billing_api_url" {
 output "billing_usage_events_queue_url" {
   description = "SQS queue URL for billing usage events"
   value       = module.nhp.billing_usage_events_queue_url
+}
+
+# Smoke test outputs
+output "auth0_smoke_test_client_id" {
+  description = "Auth0 smoke test M2M client ID"
+  value       = module.auth0.smoke_test_client_id
+}
+
+output "auth0_smoke_test_credentials_secret_arn" {
+  description = "Secrets Manager ARN for smoke test Auth0 credentials"
+  value       = module.auth0.smoke_test_credentials_secret_arn
 }

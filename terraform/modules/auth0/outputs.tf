@@ -41,6 +41,22 @@ output "dev_portal_mgmt_secret_arn" {
   value       = var.dev_portal_mgmt_secret_name != null ? aws_secretsmanager_secret.dev_portal_mgmt[0].arn : null
 }
 
+# Smoke Test outputs
+output "smoke_test_client_id" {
+  description = "Auth0 smoke test M2M client ID (null if not enabled)"
+  value       = var.enable_smoke_test_client ? auth0_client.smoke_test[0].client_id : null
+}
+
+output "smoke_test_credentials_secret_arn" {
+  description = "ARN of Secrets Manager secret for smoke test credentials (null if not enabled)"
+  value       = var.enable_smoke_test_client ? aws_secretsmanager_secret.smoke_test[0].arn : null
+}
+
+output "smoke_test_credentials_secret_name" {
+  description = "Name of Secrets Manager secret for smoke test credentials (null if not enabled)"
+  value       = var.enable_smoke_test_client ? aws_secretsmanager_secret.smoke_test[0].name : null
+}
+
 # SPA Dashboard outputs
 output "spa_dashboard_client_id" {
   description = "Auth0 SPA dashboard client ID (for NEXT_PUBLIC_AUTH0_CLIENT_ID)"
