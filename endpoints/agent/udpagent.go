@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -169,13 +170,13 @@ func (a *UdpAgent) Start(dirPath string, logLevel int) (err error) {
 	prk, err := base64.StdEncoding.DecodeString(a.config.PrivateKeyBase64)
 	if err != nil {
 		log.Error("private key parse error %v", err)
-		return fmt.Errorf("private key parse error %v", err)
+		return fmt.Errorf("private key parse error: %w", err)
 	}
 
 	a.device = core.NewDevice(core.NHP_AGENT, prk, nil)
 	if a.device == nil {
-		log.Critical("failed to create device %v", err)
-		return fmt.Errorf("failed to create device %v", err)
+		log.Critical("failed to create device")
+		return errors.New("failed to create device")
 	}
 
 	// start device routines
@@ -852,12 +853,12 @@ func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOut
 
 			if err := json.Unmarshal([]byte(dagMsg.Kao.WrappedDataKey), &dataPrkWrapping); err != nil {
 				log.Error("failed to unmarshal data private key wrapping: %v", err)
-				return "", fmt.Errorf("failed to unmarshal data private key wrapping: %v", err)
+				return "", fmt.Errorf("failed to unmarshal data private key wrapping: %w", err)
 			}
 
 			providerPbk, err := base64.StdEncoding.DecodeString(dataPrkWrapping.ProviderPublicKeyBase64)
 			if err != nil {
-				return "", fmt.Errorf("failed to decode provider public key base64: %v", err)
+				return "", fmt.Errorf("failed to decode provider public key base64: %w", err)
 			}
 
 			if dagMsg.AccessUrl == "" {
@@ -868,7 +869,7 @@ func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOut
 			ztdoPath, err := utils.DownloadFileToTemp(dagMsg.AccessUrl, "ztdo-")
 			if err != nil {
 				log.Error("failed to download ztdo: %v", err)
-				return "", fmt.Errorf("failed to download ztdo: %v", err)
+				return "", fmt.Errorf("failed to download ztdo: %w", err)
 			}
 
 			if err := ztdo.ParseHeader(ztdoPath); err != nil {
@@ -910,7 +911,7 @@ func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOut
 
 			dataPrk, err := base64.StdEncoding.DecodeString(dataPrkBase64)
 			if err != nil {
-				return "", fmt.Errorf("failed to decode data private key base64: %v", err)
+				return "", fmt.Errorf("failed to decode data private key base64: %w", err)
 			}
 			saData := ztdolib.NewSymmetricAgreement(dataKeyPairEccMode, false)
 			saData.SetMessagePatterns(dataMsgPattern)
@@ -918,14 +919,14 @@ func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOut
 
 			providerPublicKey, err := base64.StdEncoding.DecodeString(dataPrkWrapping.ProviderPublicKeyBase64)
 			if err != nil {
-				return "", fmt.Errorf("failed to decode provider public key base64: %v", err)
+				return "", fmt.Errorf("failed to decode provider public key base64: %w", err)
 			}
 			saData.SetRemoteStaticPublicKey(providerPublicKey)
 
 			gcmKey, ad = saData.AgreeSymmetricKey()
 
 			if err := ztdo.DecryptZtdoFile(ztdoPath, output, gcmKey[:], ad); err != nil {
-				return "", fmt.Errorf("failed to decrypt ztdo file: %v", err)
+				return "", fmt.Errorf("failed to decrypt ztdo file: %w", err)
 			}
 			a.decryptedZtdoRecord[ztdoId] = output
 		} else {

@@ -52,7 +52,7 @@ func customAuthByHmac(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 	valid, err := VerifyHMACFromHeader(res.ResourceId, secretKey, algorithm, expireSec, authHeader)
 	if err != nil {
 		log.Error("HMAC verification failed: %v", err)
-		return nil, "403", fmt.Errorf("HMAC verification failed: %v", err)
+		return nil, "403", fmt.Errorf("HMAC verification failed: %w", err)
 	}
 	if !valid {
 		log.Error("HMAC signature is invalid")
@@ -114,7 +114,7 @@ func customAuthByCode(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 	})
 	if err != nil {
 		log.Error("Request failed: %v", err)
-		return nil, "402", fmt.Errorf("request failed: %v", err)
+		return nil, "402", fmt.Errorf("request failed: %w", err)
 	}
 
 	if authResp.StatusCode != http.StatusOK {
@@ -131,7 +131,7 @@ func customAuthByCode(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 	var apiResponse Response
 	if err := nhpsdkutils.ParseJSONResponse(authResp, &apiResponse); err != nil {
 		log.Error("Error parsing response: %v", err)
-		return nil, "403", fmt.Errorf("error parsing response: %v", err)
+		return nil, "403", fmt.Errorf("error parsing response: %w", err)
 	}
 	if apiResponse.Code != 0 {
 		log.Error("API request failed with code %d: %s", apiResponse.Code, apiResponse.Msg)

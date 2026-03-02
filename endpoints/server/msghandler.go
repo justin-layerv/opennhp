@@ -799,7 +799,7 @@ func SaveZdtoConfig(drgMsg *common.DRGMsg) error {
 
 	// Make sure the etc directory exists
 	if err := os.MkdirAll(etcDir, 0755); err != nil {
-		return fmt.Errorf("failed to create etc directory: %v", err)
+		return fmt.Errorf("failed to create etc directory: %w", err)
 	}
 
 	if _, err := os.Stat(configPath); err == nil {
@@ -808,7 +808,7 @@ func SaveZdtoConfig(drgMsg *common.DRGMsg) error {
 
 	file, err := os.Create(configPath)
 	if err != nil {
-		return fmt.Errorf("failed to create config.json: %v", err)
+		return fmt.Errorf("failed to create config.json: %w", err)
 	}
 	defer file.Close()
 
@@ -823,13 +823,13 @@ func ReadZdtoConfig(doId string) (common.DRGMsg, error) {
 	configFilePath := filepath.Join(etcDir, "data-"+doId+".json")
 	file, err := os.Open(configFilePath)
 	if err != nil {
-		return common.DRGMsg{}, fmt.Errorf("could not open file: %v", err)
+		return common.DRGMsg{}, fmt.Errorf("could not open file: %w", err)
 	}
 	defer file.Close()
 
 	fileContentByte, err := io.ReadAll(file)
 	if err != nil {
-		return common.DRGMsg{}, fmt.Errorf("error reading file: %v", err)
+		return common.DRGMsg{}, fmt.Errorf("error reading file: %w", err)
 	}
 
 	var config common.DRGMsg

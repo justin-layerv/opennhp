@@ -3,6 +3,7 @@ package ac
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -125,13 +126,13 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	prk, err := base64.StdEncoding.DecodeString(a.config.PrivateKeyBase64)
 	if err != nil {
 		log.Error("private key parse error %v", err)
-		return fmt.Errorf("private key parse error %v", err)
+		return fmt.Errorf("private key parse error: %w", err)
 	}
 
 	a.device = core.NewDevice(core.NHP_AC, prk, nil)
 	if a.device == nil {
-		log.Critical("failed to create device %v", err)
-		return fmt.Errorf("failed to create device %v", err)
+		log.Critical("failed to create device")
+		return errors.New("failed to create device")
 	}
 
 	a.remoteConnectionMap = make(map[string]*UdpConn)

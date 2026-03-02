@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -288,7 +289,7 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	})
 	if err != nil {
 		log.Error("listen error %v", err)
-		return fmt.Errorf("listen error %v", err)
+		return fmt.Errorf("listen error: %w", err)
 	}
 
 	// retrieve local port
@@ -296,13 +297,13 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	s.listenAddr, err = net.ResolveUDPAddr(laddr.Network(), laddr.String())
 	if err != nil {
 		log.Error("resolve local UDPAddr error %v", err)
-		return fmt.Errorf("resolve UDPAddr error %v", err)
+		return fmt.Errorf("resolve UDPAddr error: %w", err)
 	}
 
 	prk, err := base64.StdEncoding.DecodeString(s.config.PrivateKeyBase64)
 	if err != nil {
 		log.Error("private key parse error %v", err)
-		return fmt.Errorf("private key parse error %v", err)
+		return fmt.Errorf("private key parse error: %w", err)
 	}
 
 	// In cloud mode (storage_backend = "dynamodb"), disable AC peer pre-validation.
@@ -320,8 +321,8 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	}
 	s.device = core.NewDevice(core.NHP_SERVER, prk, option)
 	if s.device == nil {
-		log.Critical("failed to create device %v", err)
-		return fmt.Errorf("failed to create device %v", err)
+		log.Critical("failed to create device")
+		return errors.New("failed to create device")
 	}
 
 	// retrieve local ip and mac

@@ -528,7 +528,7 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		})
 		if err != nil {
 			log.Error("Request failed: %v", err)
-			return nil, "402", fmt.Errorf("request failed: %v", err)
+			return nil, "402", fmt.Errorf("request failed: %w", err)
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -545,7 +545,7 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		var apiResponse Response
 		if err := nhpsdkutils.ParseJSONResponse(resp, &apiResponse); err != nil {
 			log.Error("Error parsing response: %v", err)
-			return nil, "403", fmt.Errorf("error parsing response: %v", err)
+			return nil, "403", fmt.Errorf("error parsing response: %w", err)
 		}
 		if apiResponse.Code != 0 {
 			log.Error("API request failed with code %d: %s", apiResponse.Code, apiResponse.Msg)
@@ -632,7 +632,7 @@ func authAccessFromRaaS(ctx *gin.Context, req *common.HttpKnockRequest, res *com
 	}
 	raasHttpReq, err := http.NewRequestWithContext(ctx.Request.Context(), "GET", potalSiteUrl, nil)
 	if err != nil {
-		return nil, "603", fmt.Errorf("failed to create request: %v", err)
+		return nil, "603", fmt.Errorf("failed to create request: %w", err)
 	}
 	raasHttpReq.Header.Set("Authorization", authHeader)
 	client := &http.Client{}
@@ -649,7 +649,7 @@ func authAccessFromRaaS(ctx *gin.Context, req *common.HttpKnockRequest, res *com
 	}
 	body, err := io.ReadAll(respRaas.Body)
 	if err != nil {
-		return nil, "606", fmt.Errorf("failed to read IAM response body: %v", err)
+		return nil, "606", fmt.Errorf("failed to read IAM response body: %w", err)
 	}
 
 	log.Info("Successfully got response from real IAM: %s", string(body))
@@ -791,7 +791,7 @@ func parseUserFromJWT(tokenString string) (string, error) {
 	parser := new(jwt.Parser)
 	_, _, err := parser.ParseUnverified(tokenString, claims)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse token unverified: %v", err)
+		return "", fmt.Errorf("failed to parse token unverified: %w", err)
 	}
 
 	// Return user identifier by priority, checking various common field names

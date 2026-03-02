@@ -40,12 +40,12 @@ func NewDataPrivateKeyStoreWith(doId string) (d *DataPrivateKeyStore, err error)
 	// open and read all the content in file
 	file, err := os.Open(fullPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %v", err)
+		return nil, fmt.Errorf("failed to open file: %w", err)
 	}
 
 	fileContentByte, err := io.ReadAll(file)
 	if err != nil {
-		return nil, fmt.Errorf("error reading file: %v", err)
+		return nil, fmt.Errorf("error reading file: %w", err)
 	}
 
 	d = &DataPrivateKeyStore{}
@@ -66,7 +66,7 @@ func (d *DataPrivateKeyStore) Save(doId string) error {
 	// Make sure the etc directory exists
 	etcDir := "etc/ztdo"
 	if err := os.MkdirAll(etcDir, 0755); err != nil {
-		return fmt.Errorf("failed to create etc directory: %v", err)
+		return fmt.Errorf("failed to create etc directory: %w", err)
 	}
 
 	fileName := "data-key-" + doId + ".json"
@@ -77,7 +77,7 @@ func (d *DataPrivateKeyStore) Save(doId string) error {
 
 	file, err := os.Create(fullPath)
 	if err != nil {
-		return fmt.Errorf("failed to create file: %v", err)
+		return fmt.Errorf("failed to create file: %w", err)
 	}
 	defer file.Close()
 
@@ -94,7 +94,7 @@ func (d *DataPrivateKeyStore) Delete(doId string) error {
 	// delete the file
 	err := os.Remove(fullPath)
 	if err != nil {
-		return fmt.Errorf("failed to delete file: %v", err)
+		return fmt.Errorf("failed to delete file: %w", err)
 	}
 	return nil
 }
@@ -133,13 +133,13 @@ type AppParams struct {
 func (a *AppParams) NewSmartPolicy() (common.SmartPolicy, error) {
 	file, err := os.Open(a.SmartPolicy)
 	if err != nil {
-		return common.SmartPolicy{}, fmt.Errorf("could not open file: %v", err)
+		return common.SmartPolicy{}, fmt.Errorf("could not open file: %w", err)
 	}
 	defer file.Close()
 
 	fileContentByte, err := io.ReadAll(file)
 	if err != nil {
-		return common.SmartPolicy{}, fmt.Errorf("error reading file: %v", err)
+		return common.SmartPolicy{}, fmt.Errorf("error reading file: %w", err)
 	}
 
 	var config common.SmartPolicy
@@ -151,7 +151,7 @@ func (a *AppParams) NewSmartPolicy() (common.SmartPolicy, error) {
 
 	spoId, err := utils.GenerateUUIDv4()
 	if err != nil {
-		return common.SmartPolicy{}, fmt.Errorf("error generating spoId: %v", err)
+		return common.SmartPolicy{}, fmt.Errorf("error generating spoId: %w", err)
 	}
 
 	config.PolicyId = spoId
@@ -205,13 +205,13 @@ func (a *UdpDevice) UploadFileToNHPServer(filePath string) (string, error) {
 
 	file, err := os.Open(filePath)
 	if err != nil {
-		return "", fmt.Errorf("could not open file: %v", err)
+		return "", fmt.Errorf("could not open file: %w", err)
 	}
 	defer file.Close()
 
 	fileInfo, err := file.Stat()
 	if err != nil {
-		return "", fmt.Errorf("could not get file info: %v", err)
+		return "", fmt.Errorf("could not get file info: %w", err)
 	}
 
 	// create upload progress
@@ -226,7 +226,7 @@ func (a *UdpDevice) UploadFileToNHPServer(filePath string) (string, error) {
 
 	part, err := writer.CreateFormFile("file", filepath.Base(filePath))
 	if err != nil {
-		return "", fmt.Errorf("could not create form file: %v", err)
+		return "", fmt.Errorf("could not create form file: %w", err)
 	}
 
 	progressReader := &ProgressReader{
@@ -236,19 +236,19 @@ func (a *UdpDevice) UploadFileToNHPServer(filePath string) (string, error) {
 
 	_, err = io.Copy(part, progressReader)
 	if err != nil {
-		return "", fmt.Errorf("could not copy file to server: %v", err)
+		return "", fmt.Errorf("could not copy file to server: %w", err)
 	}
 
 	err = writer.Close()
 	if err != nil {
-		return "", fmt.Errorf("could not close writer: %v", err)
+		return "", fmt.Errorf("could not close writer: %w", err)
 	}
 
 	uploadUrl := httpHost + "storage/upload"
 
 	req, err := http.NewRequest("POST", uploadUrl, body)
 	if err != nil {
-		return "", fmt.Errorf("could not create request: %v", err)
+		return "", fmt.Errorf("could not create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", writer.FormDataContentType())
@@ -259,7 +259,7 @@ func (a *UdpDevice) UploadFileToNHPServer(filePath string) (string, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("could not send https request: %v", err)
+		return "", fmt.Errorf("could not send https request: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -272,7 +272,7 @@ func (a *UdpDevice) UploadFileToNHPServer(filePath string) (string, error) {
 	// read response body
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("could not read response body: %v", err)
+		return "", fmt.Errorf("could not read response body: %w", err)
 	}
 
 	// parse response body
@@ -280,7 +280,7 @@ func (a *UdpDevice) UploadFileToNHPServer(filePath string) (string, error) {
 
 	err = json.Unmarshal(bodyBytes, &respBody)
 	if err != nil {
-		return "", fmt.Errorf("could not parse response body: %v", err)
+		return "", fmt.Errorf("could not parse response body: %w", err)
 	}
 
 	duration := time.Since(startTime)
