@@ -52,7 +52,7 @@ type ServerForwarder struct {
 	deps         ForwarderDeps
 	health       *ServerHealthTracker
 	pendingFwds  map[uint64]*PendingForward // Transaction ID -> pending forward
-	pendingMutex sync.Mutex
+	pendingMutex sync.RWMutex
 	serverPeers  map[string]*core.UdpPeer // Server ID -> peer
 	peerMutex    sync.RWMutex
 	nextTxID     uint64
@@ -456,9 +456,9 @@ func (f *ServerForwarder) HandleForwardResult(
 	ppd *core.PacketParserData,
 	resultMsg *common.ServerForwardResultMsg,
 ) {
-	f.pendingMutex.Lock()
+	f.pendingMutex.RLock()
 	pending, ok := f.pendingFwds[resultMsg.TransactionId]
-	f.pendingMutex.Unlock()
+	f.pendingMutex.RUnlock()
 
 	if !ok {
 		log.Warning("Received NHP_FRT for unknown transaction %d", resultMsg.TransactionId)

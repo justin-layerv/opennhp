@@ -17,7 +17,7 @@ type TokenEntry interface {
 // The first level is indexed by the first character of the token for fast lookup.
 // This design distributes tokens across ~64 buckets (base64 characters).
 type TokenStore[E TokenEntry] struct {
-	mu    sync.Mutex
+	mu    sync.RWMutex
 	store map[string]map[string]E
 }
 
@@ -58,8 +58,8 @@ func (ts *TokenStore[E]) Load(token string) (E, bool) {
 		return zero, false
 	}
 
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
 
 	prefix := token[0:1]
 	tokenMap, found := ts.store[prefix]
@@ -143,8 +143,8 @@ func (ts *TokenStore[E]) RunRefreshRoutine(wg *sync.WaitGroup, stop <-chan struc
 
 // Size returns the total number of tokens in the store.
 func (ts *TokenStore[E]) Size() int {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
 
 	count := 0
 	for _, tokenMap := range ts.store {

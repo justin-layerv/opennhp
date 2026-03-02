@@ -57,7 +57,7 @@ type dimCounterEntry struct {
 type Publisher struct {
 	client      *cloudwatch.Client
 	namespace   string
-	mu          sync.Mutex
+	mu          sync.RWMutex
 	counters    map[string]float64          // metric name → accumulated count (skipped when 0)
 	dimCounters map[string]*dimCounterEntry // composite key → counter with extra dims
 	gauges      map[string]float64          // metric name → current value (always published)
@@ -210,9 +210,9 @@ func (mp *Publisher) flushLoop() {
 // The probe receives a context with apiTimeout (5s). If the probe's underlying
 // ping has its own timeout, the shorter of the two wins.
 func (mp *Publisher) probeHealth() {
-	mp.mu.Lock()
+	mp.mu.RLock()
 	probe := mp.healthProbe
-	mp.mu.Unlock()
+	mp.mu.RUnlock()
 
 	if probe == nil {
 		return

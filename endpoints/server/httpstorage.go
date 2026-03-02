@@ -35,7 +35,7 @@ type FileMetadata struct {
 
 // upload progress
 var progressMap = make(map[string]int64)
-var progressMutex sync.Mutex
+var progressMutex sync.RWMutex
 
 func (hs *HttpServer) initStorageRouter() {
 	g := hs.ginEngine.Group("/storage")
@@ -158,8 +158,8 @@ func (hs *HttpServer) initStorageRouter() {
 	// get upload progress
 	g.GET("/progress/:uuid", func(c *gin.Context) {
 		uuid := c.Param("uuid")
-		progressMutex.Lock()
-		defer progressMutex.Unlock()
+		progressMutex.RLock()
+		defer progressMutex.RUnlock()
 
 		bytesCopied, exists := progressMap[uuid]
 		if !exists {
@@ -260,7 +260,7 @@ type ProgressWriter struct {
 	io.Writer
 	Progress *map[string]int64
 	Key      string
-	Mutex    *sync.Mutex
+	Mutex    *sync.RWMutex
 	Total    int64
 	written  int64
 }

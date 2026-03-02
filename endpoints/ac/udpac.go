@@ -40,7 +40,7 @@ type UdpAC struct {
 	remoteConnectionMutex sync.Mutex
 	remoteConnectionMap   map[string]*UdpConn // indexed by remote UDP address
 
-	serverPeerMutex sync.Mutex
+	serverPeerMutex sync.RWMutex
 	serverPeerMap   map[string]*core.UdpPeer // indexed by server's public key
 
 	tokenStore *common.TokenStore[*AccessEntry]
@@ -565,9 +565,9 @@ func (a *UdpAC) maintainServerConnectionRoutine() {
 	}
 
 	// Check for cloud mode at startup (no static servers configured)
-	a.serverPeerMutex.Lock()
+	a.serverPeerMutex.RLock()
 	isCloudMode := len(a.serverPeerMap) == 0
-	a.serverPeerMutex.Unlock()
+	a.serverPeerMutex.RUnlock()
 	if isCloudMode {
 		log.Info("Cloud mode detected: no static servers configured, AC will use dynamic registration")
 	}
@@ -577,7 +577,7 @@ func (a *UdpAC) maintainServerConnectionRoutine() {
 
 	for {
 		// make a local copy of servers then iterate because next operations are time consuming (too long to use locked iteration)
-		a.serverPeerMutex.Lock()
+		a.serverPeerMutex.RLock()
 		var serverCount int32 = int32(len(a.serverPeerMap))
 		discoveryQuitArr := make([]chan struct{}, 0, serverCount)
 		discoveryFailStatusArr := make([]*int32, 0, serverCount)
@@ -592,7 +592,7 @@ func (a *UdpAC) maintainServerConnectionRoutine() {
 			discoveryRoutineWg.Add(1)
 			go a.serverDiscovery(server, &discoveryRoutineWg, fail, quit)
 		}
-		a.serverPeerMutex.Unlock()
+		a.serverPeerMutex.RUnlock()
 
 		// check whether all server discovery failed.
 		// If so, open all blocked input

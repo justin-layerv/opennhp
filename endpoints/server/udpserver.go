@@ -102,11 +102,11 @@ type UdpServer struct {
 	srcIpAssociatedAddrMap      map[string][]*common.NetAddress // indexed by source ip
 
 	// preset asp-resource-address map
-	authServiceMapMutex sync.Mutex
+	authServiceMapMutex sync.RWMutex
 	authServiceMap      common.AuthSvcProviderMap // indexed by asp id and then resource id
 
 	// plugin handlers
-	pluginHandlerMapMutex sync.Mutex
+	pluginHandlerMapMutex sync.RWMutex
 	pluginHandlerMap      map[string]plugins.PluginHandler
 
 	// signals
@@ -1040,9 +1040,9 @@ func (s *UdpServer) LoadPlugin(pluginId string, h plugins.PluginHandler) error {
 		return errors.New("plugin validation failed")
 	}
 
-	s.pluginHandlerMapMutex.Lock()
+	s.pluginHandlerMapMutex.RLock()
 	oldHandler, found := s.pluginHandlerMap[pluginId]
-	s.pluginHandlerMapMutex.Unlock()
+	s.pluginHandlerMapMutex.RUnlock()
 	if found {
 		oldHandler.Close()
 	}
@@ -1081,8 +1081,8 @@ func (s *UdpServer) ClosePlugins() {
 }
 
 func (s *UdpServer) FindAuthSvcProvider(aspId string) *common.AuthServiceProviderData {
-	s.authServiceMapMutex.Lock()
-	defer s.authServiceMapMutex.Unlock()
+	s.authServiceMapMutex.RLock()
+	defer s.authServiceMapMutex.RUnlock()
 
 	aspData, found := s.authServiceMap[aspId]
 	if found {
@@ -1406,8 +1406,8 @@ func (us *UdpServer) NewNhpServerHelper(ppd *core.PacketParserData) *plugins.Nhp
 }
 
 func (us *UdpServer) FindPluginHandler(aspId string) plugins.PluginHandler {
-	us.pluginHandlerMapMutex.Lock()
-	defer us.pluginHandlerMapMutex.Unlock()
+	us.pluginHandlerMapMutex.RLock()
+	defer us.pluginHandlerMapMutex.RUnlock()
 
 	handler, found := us.pluginHandlerMap[aspId]
 	if !found {
