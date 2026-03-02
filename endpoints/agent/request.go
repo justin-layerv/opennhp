@@ -11,6 +11,20 @@ import (
 
 // note: code in request.go is for nhp-agent to send request to nhp-server.
 
+// newMsgData creates a MsgData with common agent fields pre-populated.
+// Callers should set ResponseMsgCh or EncryptedPktCh as needed.
+func (a *UdpAgent) newMsgData(addr *net.UDPAddr, headerType int, msg []byte, peerPk []byte) *core.MsgData {
+	return &core.MsgData{
+		RemoteAddr:    addr,
+		HeaderType:    headerType,
+		CipherScheme:  a.config.DefaultCipherScheme,
+		TransactionId: a.device.NextCounterIndex(),
+		Compress:      true,
+		Message:       msg,
+		PeerPk:        peerPk,
+	}
+}
+
 func (a *UdpAgent) RequestOtp(target *KnockTarget) error {
 	a.knockUserMutex.RLock()
 	otpMsg := &common.AgentOTPMsg{
@@ -35,15 +49,7 @@ func (a *UdpAgent) RequestOtp(target *KnockTarget) error {
 		return common.ErrKnockServerNotFound
 	}
 
-	otpMd := &core.MsgData{
-		RemoteAddr:    sendAddr.(*net.UDPAddr),
-		HeaderType:    core.NHP_OTP,
-		CipherScheme:  a.config.DefaultCipherScheme,
-		TransactionId: a.device.NextCounterIndex(),
-		Compress:      true,
-		Message:       otpBytes,
-		PeerPk:        serverPeer.PublicKey(),
-	}
+	otpMd := a.newMsgData(sendAddr.(*net.UDPAddr), core.NHP_OTP, otpBytes, serverPeer.PublicKey())
 
 	if !a.IsRunning() {
 		log.Error("agent(%s#%d)[RequestOtp] MsgData channel closed or being closed, skip sending", otpMsg.UserId, otpMd.TransactionId)
@@ -83,16 +89,8 @@ func (a *UdpAgent) RegisterPublicKey(otp string, target *KnockTarget) (rakMsg *c
 	}
 	addrStr := sendAddr.String()
 
-	regMd := &core.MsgData{
-		RemoteAddr:    sendAddr.(*net.UDPAddr),
-		HeaderType:    core.NHP_REG,
-		CipherScheme:  a.config.DefaultCipherScheme,
-		TransactionId: a.device.NextCounterIndex(),
-		Compress:      true,
-		Message:       regBytes,
-		PeerPk:        serverPeer.PublicKey(),
-		ResponseMsgCh: make(chan *core.PacketParserData),
-	}
+	regMd := a.newMsgData(sendAddr.(*net.UDPAddr), core.NHP_REG, regBytes, serverPeer.PublicKey())
+	regMd.ResponseMsgCh = make(chan *core.PacketParserData)
 
 	if !a.IsRunning() {
 		log.Error("agent(%s#%d)[RegisterPublicKey] MsgData channel closed or being closed, skip sending", regMsg.UserId, regMd.TransactionId)
@@ -160,16 +158,8 @@ func (a *UdpAgent) ListResource(target *KnockTarget) (lrtMsg *common.ServerListR
 	}
 	addrStr := sendAddr.String()
 
-	lstMd := &core.MsgData{
-		RemoteAddr:    sendAddr.(*net.UDPAddr),
-		HeaderType:    core.NHP_LST,
-		CipherScheme:  a.config.DefaultCipherScheme,
-		TransactionId: a.device.NextCounterIndex(),
-		Compress:      true,
-		Message:       lstBytes,
-		PeerPk:        serverPeer.PublicKey(),
-		ResponseMsgCh: make(chan *core.PacketParserData),
-	}
+	lstMd := a.newMsgData(sendAddr.(*net.UDPAddr), core.NHP_LST, lstBytes, serverPeer.PublicKey())
+	lstMd.ResponseMsgCh = make(chan *core.PacketParserData)
 
 	if !a.IsRunning() {
 		log.Error("agent(%s#%d)[ListResource] MsgData channel closed or being closed, skip sending", lstMsg.UserId, lstMd.TransactionId)

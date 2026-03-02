@@ -77,19 +77,12 @@ func (a *UdpAgent) knockRequest(res *KnockTarget, useCookie bool) (ackMsg *commo
 	a.knockUserMutex.RUnlock()
 
 	knkBytes, _ := json.Marshal(knkMsg)
-	knkMd := &core.MsgData{
-		RemoteAddr:    sendAddr.(*net.UDPAddr),
-		HeaderType:    core.NHP_KNK,
-		CipherScheme:  a.config.DefaultCipherScheme,
-		TransactionId: a.device.NextCounterIndex(),
-		Compress:      true,
-		Message:       knkBytes,
-		PeerPk:        serverPeer.PublicKey(),
-		ResponseMsgCh: make(chan *core.PacketParserData),
-	}
+	headerType := core.NHP_KNK
 	if useCookie {
-		knkMd.HeaderType = core.NHP_RKN
+		headerType = core.NHP_RKN
 	}
+	knkMd := a.newMsgData(sendAddr.(*net.UDPAddr), headerType, knkBytes, serverPeer.PublicKey())
+	knkMd.ResponseMsgCh = make(chan *core.PacketParserData)
 
 	ackMsg = &common.ServerKnockAckMsg{}
 	if !a.IsRunning() {
@@ -176,16 +169,8 @@ func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnoc
 	a.knockUserMutex.RUnlock()
 
 	knkBytes, _ := json.Marshal(knkMsg)
-	knkMd := &core.MsgData{
-		RemoteAddr:    sendAddr.(*net.UDPAddr),
-		HeaderType:    core.NHP_EXT,
-		CipherScheme:  a.config.DefaultCipherScheme,
-		TransactionId: a.device.NextCounterIndex(),
-		Compress:      true,
-		Message:       knkBytes,
-		PeerPk:        serverPeer.PublicKey(),
-		ResponseMsgCh: make(chan *core.PacketParserData),
-	}
+	knkMd := a.newMsgData(sendAddr.(*net.UDPAddr), core.NHP_EXT, knkBytes, serverPeer.PublicKey())
+	knkMd.ResponseMsgCh = make(chan *core.PacketParserData)
 
 	ackMsg = &common.ServerKnockAckMsg{}
 	if !a.IsRunning() {
@@ -307,16 +292,8 @@ func (a *UdpAgent) processPreAccessAction(info *common.PreAccessInfo) error {
 	a.knockUserMutex.RUnlock()
 	accBytes, _ := json.Marshal(accMsg)
 
-	accMd := &core.MsgData{
-		RemoteAddr:     udpACAddr,
-		HeaderType:     core.NHP_ACC,
-		CipherScheme:   a.config.DefaultCipherScheme,
-		TransactionId:  a.device.NextCounterIndex(),
-		Compress:       true,
-		Message:        accBytes,
-		PeerPk:         acPk,
-		EncryptedPktCh: make(chan *core.MsgAssemblerData),
-	}
+	accMd := a.newMsgData(udpACAddr, core.NHP_ACC, accBytes, acPk)
+	accMd.EncryptedPktCh = make(chan *core.MsgAssemblerData)
 
 	if !a.IsRunning() {
 		log.Error("agent(%s)[PreAccessRequest] MsgData channel closed or being closed, skip sending", accMsg.UserId)
@@ -411,16 +388,8 @@ func (a *UdpAgent) KnockDHP() (ackMsg *common.ServerDHPKnockAckMsg, err error) {
 	a.knockUserMutex.RUnlock()
 
 	knkBytes, _ := json.Marshal(knkMsg)
-	knkMd := &core.MsgData{
-		RemoteAddr:    sendAddr.(*net.UDPAddr),
-		HeaderType:    core.DHP_KNK,
-		CipherScheme:  a.config.DefaultCipherScheme,
-		TransactionId: a.device.NextCounterIndex(),
-		Compress:      true,
-		Message:       knkBytes,
-		PeerPk:        serverPeer.PublicKey(),
-		ResponseMsgCh: make(chan *core.PacketParserData),
-	}
+	knkMd := a.newMsgData(sendAddr.(*net.UDPAddr), core.DHP_KNK, knkBytes, serverPeer.PublicKey())
+	knkMd.ResponseMsgCh = make(chan *core.PacketParserData)
 
 	ackMsg = &common.ServerDHPKnockAckMsg{}
 	if !a.IsRunning() {
