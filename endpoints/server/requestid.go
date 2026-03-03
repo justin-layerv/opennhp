@@ -6,6 +6,8 @@ import (
 	"log/slog"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -19,25 +21,37 @@ const (
 	maxRequestIDLength = 128
 )
 
+// traceContextPropagator is reused across requests to avoid per-request allocation.
+var traceContextPropagator = propagation.TraceContext{}
+
 // requestIDMiddleware extracts or generates a request ID for every HTTP request.
-// If the incoming request has an X-Request-ID header, it is reused for distributed
-// tracing. Otherwise, a random 16-character hex ID is generated.
-// Client-provided IDs exceeding maxRequestIDLength are rejected and replaced.
+//
+// When OTEL tracing is active, the trace ID is used as the request ID so that
+// logs and traces share a single correlation key. The resolution order is:
+//  1. OTEL span context already in the Go context (set by OTEL middleware)
+//  2. W3C traceparent header (set by upstream proxy / load balancer)
+//  3. Client-provided X-Request-ID header
+//  4. Random 16-character hex ID
 //
 // The request ID is:
 // - Stored in the Gin context (accessible via GetRequestID)
 // - Added to the response X-Request-ID header
 func requestIDMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		requestID := c.GetHeader(RequestIDHeader)
-		if requestID != "" && (len(requestID) > maxRequestIDLength || !isValidRequestID(requestID)) {
-			slog.Warn("rejected invalid X-Request-ID header", //nolint:gosec // G706: requestID validated by isValidRequestID and length check above
-				"reason", requestIDRejectReason(requestID),
-				"client_ip", c.ClientIP(),
-				"path", c.Request.URL.Path,
-			)
-			requestID = ""
+		requestID := traceIDFromContext(c)
+
+		if requestID == "" {
+			requestID = c.GetHeader(RequestIDHeader)
+			if requestID != "" && (len(requestID) > maxRequestIDLength || !isValidRequestID(requestID)) {
+				slog.Warn("rejected invalid X-Request-ID header", //nolint:gosec // G706: requestID is not logged; only safe rejection reason
+					"reason", requestIDRejectReason(requestID),
+					"client_ip", c.ClientIP(),
+					"path", c.Request.URL.Path,
+				)
+				requestID = ""
+			}
 		}
+
 		if requestID == "" {
 			requestID = generateRequestID()
 		}
@@ -47,6 +61,30 @@ func requestIDMiddleware() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+// traceIDFromContext extracts the OTEL trace ID from the request context.
+// It first checks for an active span context (set by OTEL middleware), then
+// falls back to parsing the W3C traceparent header via the OTEL propagator.
+//
+// NOTE: Span context extraction (step 1) requires OTEL middleware (e.g.,
+// otelgin) to run before this middleware in the chain. If no OTEL middleware
+// is configured, step 2 still extracts trace IDs from the traceparent header.
+func traceIDFromContext(c *gin.Context) string {
+	ctx := c.Request.Context()
+
+	// Check existing span context (injected by OTEL middleware)
+	if spanCtx := trace.SpanFromContext(ctx).SpanContext(); spanCtx.HasTraceID() {
+		return spanCtx.TraceID().String()
+	}
+
+	// Fall back to W3C traceparent header parsing via OTEL propagator
+	extracted := traceContextPropagator.Extract(ctx, propagation.HeaderCarrier(c.Request.Header))
+	if spanCtx := trace.SpanContextFromContext(extracted); spanCtx.HasTraceID() {
+		return spanCtx.TraceID().String()
+	}
+
+	return ""
 }
 
 // GetRequestID retrieves the request ID from a Gin context.

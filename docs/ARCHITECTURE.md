@@ -55,6 +55,25 @@ The NHP Server receives knock requests and coordinates with ACs to grant access.
 | `etcd_storage.go` | etcd storage implementation (on-prem) |
 | `cloudmap.go` | Cloud Map health discovery for stale assignment filtering |
 | `msghandler.go` | NHP message processing |
+| `requestid.go` | Request ID middleware (OTEL trace correlation) |
+
+**HTTP Middleware Chain** (`httpserver.go`):
+
+The Gin middleware chain order matters. When OTEL tracing is added, the OTEL
+middleware (e.g., `otelgin`) **must** be registered before `requestIDMiddleware`
+so that the span context is available for trace ID extraction.
+
+```
+1. [OTEL middleware]      ← must come first if/when added (not yet configured)
+2. requestIDMiddleware    ← extracts trace ID from span context or traceparent header
+3. sessions
+4. CORS
+5. gin.Logger
+6. gin.Recovery
+```
+
+The request ID resolution priority is: OTEL span context > W3C `traceparent`
+header > client `X-Request-ID` header > random generation. See `requestid.go`.
 
 **HTTP Routes:**
 ```
