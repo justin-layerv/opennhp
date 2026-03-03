@@ -235,16 +235,19 @@ func (r *QurlResolver) parseErrorResponse(statusCode int, body []byte) error {
 	}
 }
 
-// mapErrorCode converts QURL API error codes to domain errors
+// mapErrorCode converts QURL API error codes to domain errors.
+// Maps both token-level and resource-level errors from the QURL API.
+// Resource-level errors are mapped to their token-level equivalents
+// so handleResolveError returns a generic 403 without leaking state.
 func (r *QurlResolver) mapErrorCode(code string) error {
 	switch code {
-	case "token_not_found":
+	case "token_not_found", "resource_not_found", "token_revoked", "resource_revoked":
 		return ErrTokenNotFound
-	case "token_consumed":
+	case "token_consumed", "resource_consumed":
 		return ErrTokenConsumed
-	case "token_expired":
+	case "token_expired", "resource_expired":
 		return ErrTokenExpired
-	case "policy_violation":
+	case "policy_violation", "max_sessions_reached":
 		return ErrPolicyViolation
 	default:
 		return ErrServiceError

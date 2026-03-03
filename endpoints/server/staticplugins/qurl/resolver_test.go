@@ -304,10 +304,20 @@ func TestMapErrorCode(t *testing.T) {
 		code     string
 		expected error
 	}{
+		// Token-level errors
 		{"token_not_found", ErrTokenNotFound},
 		{"token_consumed", ErrTokenConsumed},
 		{"token_expired", ErrTokenExpired},
+		{"token_revoked", ErrTokenNotFound},
+		// Resource-level errors mapped to token equivalents
+		{"resource_not_found", ErrTokenNotFound},
+		{"resource_revoked", ErrTokenNotFound},
+		{"resource_consumed", ErrTokenConsumed},
+		{"resource_expired", ErrTokenExpired},
+		// Policy errors
 		{"policy_violation", ErrPolicyViolation},
+		{"max_sessions_reached", ErrPolicyViolation},
+		// Unknown codes
 		{"unknown_error", ErrServiceError},
 		{"", ErrServiceError},
 	}
@@ -335,6 +345,12 @@ func TestParseErrorResponse(t *testing.T) {
 			name:       "404 with error body",
 			statusCode: http.StatusNotFound,
 			body:       `{"success":false,"error":{"code":"token_not_found","message":"not found"}}`,
+			expected:   ErrTokenNotFound,
+		},
+		{
+			name:       "410 with resource_revoked body",
+			statusCode: http.StatusGone,
+			body:       `{"success":false,"error":{"code":"resource_revoked","message":"Resource has been revoked"}}`,
 			expected:   ErrTokenNotFound,
 		},
 		{
