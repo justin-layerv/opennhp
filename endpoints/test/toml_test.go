@@ -63,7 +63,19 @@ func TestTomlUnmarshal(t *testing.T) {
 	}
 	fmt.Printf("peer0: %+v\n", Obj.Servers[0])
 	fmt.Printf("config: %+v, ACId: %s, B: %s\n", Obj, Obj.ACId, Obj.B)
-	fmt.Printf("Data: %+v, %s, %t, %d,\n", Obj.Data, Obj.Data["Abc"].(string), Obj.Data["aBc"].(bool), Obj.Data["abC"].(int64))
+	abc, ok := Obj.Data["Abc"].(string)
+	if !ok {
+		t.Fatalf("expected string for Abc, got %T", Obj.Data["Abc"])
+	}
+	aBc, ok := Obj.Data["aBc"].(bool)
+	if !ok {
+		t.Fatalf("expected bool for aBc, got %T", Obj.Data["aBc"])
+	}
+	abC, ok := Obj.Data["abC"].(int64)
+	if !ok {
+		t.Fatalf("expected int64 for abC, got %T", Obj.Data["abC"])
+	}
+	fmt.Printf("Data: %+v, %s, %t, %d,\n", Obj.Data, abc, aBc, abC)
 	// below will trigger panic
 	//fmt.Printf("non-exist data %s, %t, %d\n", Obj.Data["Abc1"].(string), Obj.Data["aBc2"].(bool), Obj.Data["abC3"].(int64))
 }

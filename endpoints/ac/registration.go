@@ -439,8 +439,13 @@ func (r *ACRegistration) register() error {
 
 	// Create message data for sending
 	// Use buffered channel (size 1) to prevent sender from blocking if we exit early
+	udpAddr, ok := sendAddr.(*net.UDPAddr)
+	if !ok {
+		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+		return fmt.Errorf("unexpected address type %T for registration peer", sendAddr)
+	}
 	md := &core.MsgData{
-		RemoteAddr:    sendAddr.(*net.UDPAddr),
+		RemoteAddr:    udpAddr,
 		HeaderType:    core.NHP_AOL,
 		TransactionId: r.ac.device.NextCounterIndex(),
 		Compress:      true,
@@ -667,7 +672,11 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 			return nil
 		}
 
-		udpAddr := sendAddr.(*net.UDPAddr)
+		udpAddr, ok := sendAddr.(*net.UDPAddr)
+		if !ok {
+			r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+			return fmt.Errorf("unexpected address type %T for server peer", sendAddr)
+		}
 
 		r.mu.Lock()
 		// Clean up old registration peer if exists (re-registration case)
@@ -841,8 +850,13 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 
 	// Send NHP_AOL to register with this server (use cached bytes)
 	// Use buffered channel (size 1) to prevent sender from blocking if we exit early
+	udpAddr, ok := sendAddr.(*net.UDPAddr)
+	if !ok {
+		r.ac.device.RemovePeer(peer.PublicKeyBase64())
+		return fmt.Errorf("unexpected address type %T for server %s", sendAddr, server.Target.IP)
+	}
 	md := &core.MsgData{
-		RemoteAddr:    sendAddr.(*net.UDPAddr),
+		RemoteAddr:    udpAddr,
 		HeaderType:    core.NHP_AOL,
 		TransactionId: r.ac.device.NextCounterIndex(),
 		Compress:      true,
@@ -951,8 +965,13 @@ func (r *ACRegistration) sendKeepalives() {
 		}
 
 		// Create and send NHP_KPL message
+		udpAddr, ok := sendAddr.(*net.UDPAddr)
+		if !ok {
+			log.Warning("Unexpected address type %T for server %s, skipping keepalive", sendAddr, server.Target.IP)
+			continue
+		}
 		md := &core.MsgData{
-			RemoteAddr:    sendAddr.(*net.UDPAddr),
+			RemoteAddr:    udpAddr,
 			HeaderType:    core.NHP_KPL,
 			CipherScheme:  r.ac.config.DefaultCipherScheme,
 			TransactionId: r.ac.device.NextCounterIndex(),
@@ -1006,7 +1025,12 @@ func (r *ACRegistration) refreshAssignedServerRegistrations() {
 		}
 
 		// Send refresh in a goroutine to avoid blocking keepalive loop
-		go r.refreshSingleServer(server, sendAddr.(*net.UDPAddr))
+		udpAddr, ok := sendAddr.(*net.UDPAddr)
+		if !ok {
+			log.Warning("Unexpected address type %T for server %s during refresh, skipping", sendAddr, server.Target.IP)
+			continue
+		}
+		go r.refreshSingleServer(server, udpAddr)
 	}
 }
 

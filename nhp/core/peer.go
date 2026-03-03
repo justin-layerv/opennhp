@@ -238,7 +238,12 @@ func (p *UdpPeer) UpdateRecv(currTime int64, currAddr net.Addr) {
 	defer p.Unlock()
 
 	p.lastRecvTime = currTime
-	p.recvAddr = currAddr.(*net.UDPAddr)
+	udpAddr, ok := currAddr.(*net.UDPAddr)
+	if !ok {
+		log.Warning("UpdateRecv: unexpected address type %T", currAddr)
+		return
+	}
+	p.recvAddr = udpAddr
 }
 
 func (p *UdpPeer) TeePublicKeyBase64() string {

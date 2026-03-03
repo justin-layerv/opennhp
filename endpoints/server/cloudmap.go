@@ -182,12 +182,15 @@ func (c *CloudMapClient) GetHealthyServerIPs(ctx context.Context) (map[string]bo
 	}
 
 	// Return a copy of the result
-	ips := result.(map[string]bool)
-	copy := make(map[string]bool, len(ips))
-	for k, v := range ips {
-		copy[k] = v
+	ips, ok := result.(map[string]bool)
+	if !ok {
+		return nil, fmt.Errorf("unexpected result type %T from singleflight refresh", result)
 	}
-	return copy, nil
+	ipsCopy := make(map[string]bool, len(ips))
+	for k, v := range ips {
+		ipsCopy[k] = v
+	}
+	return ipsCopy, nil
 }
 
 // refreshCache fetches fresh data from Cloud Map and updates the cache.

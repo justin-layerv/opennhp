@@ -968,13 +968,18 @@ func (a *UdpAgent) SendDARMsgToServer(server *core.UdpPeer, msg common.DARMsg) (
 		log.Critical("device(%v)[SendDARMsgToServer] register server IP cannot be parsed", a)
 		return false, nil
 	}
+	udpAddr, ok := sendAddr.(*net.UDPAddr)
+	if !ok {
+		log.Critical("device(%v)[SendDARMsgToServer] unexpected address type %T", a, sendAddr)
+		return false, nil
+	}
 	drgBytes, marshalErr := json.Marshal(msg)
 	if marshalErr != nil {
 		log.Error("[Agent] SendDARMsgToServer failed to marshal DAR message: %v", marshalErr)
 		return false, nil
 	}
 	drgMd := &core.MsgData{
-		RemoteAddr:    sendAddr.(*net.UDPAddr),
+		RemoteAddr:    udpAddr,
 		HeaderType:    core.NHP_DAR,
 		TransactionId: a.device.NextCounterIndex(),
 		Compress:      true,
@@ -1055,13 +1060,18 @@ func (a *UdpAgent) SendDAVMsgToServer(server *core.UdpPeer, msg common.DAVMsg) (
 		log.Critical("device(%v)[SendDAVMsgToServer] register server IP cannot be parsed", a)
 		return false, nil
 	}
+	udpAddr, ok := sendAddr.(*net.UDPAddr)
+	if !ok {
+		log.Critical("device(%v)[SendDAVMsgToServer] unexpected address type %T", a, sendAddr)
+		return false, nil
+	}
 	davBytes, marshalErr := json.Marshal(msg)
 	if marshalErr != nil {
 		log.Error("[Agent] SendDAVMsgToServer failed to marshal DAV message: %v", marshalErr)
 		return false, nil
 	}
 	davMd := &core.MsgData{
-		RemoteAddr:    sendAddr.(*net.UDPAddr),
+		RemoteAddr:    udpAddr,
 		HeaderType:    core.NHP_DAV,
 		TransactionId: a.device.NextCounterIndex(),
 		Compress:      true,

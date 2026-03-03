@@ -75,7 +75,10 @@ func TestNewConnection_UnconnectedSocket(t *testing.T) {
 	}
 
 	// Verify the socket is listening on a local port (ephemeral)
-	localAddr := conn.netConn.LocalAddr().(*net.UDPAddr)
+	localAddr, ok := conn.netConn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", conn.netConn.LocalAddr())
+	}
 	if localAddr.Port == 0 {
 		t.Error("Socket not bound to a port")
 	}
@@ -112,7 +115,10 @@ func TestNewConnection_IPv6Socket(t *testing.T) {
 	}
 
 	// Verify the socket is bound to an IPv6 address
-	localAddr := conn.netConn.LocalAddr().(*net.UDPAddr)
+	localAddr, ok := conn.netConn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", conn.netConn.LocalAddr())
+	}
 	if localAddr.IP.To4() != nil {
 		t.Errorf("Expected IPv6 socket but got IPv4: %s", localAddr.String())
 	}
@@ -147,7 +153,10 @@ func TestNewConnection_AcceptsFromAnySource(t *testing.T) {
 	}
 
 	// Get the local port to send to
-	localAddr := receiver.LocalAddr().(*net.UDPAddr)
+	localAddr, ok := receiver.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", receiver.LocalAddr())
+	}
 	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: localAddr.Port}
 
 	// Create a sender from a DIFFERENT address (simulating server responding from different IP)
@@ -156,7 +165,10 @@ func TestNewConnection_AcceptsFromAnySource(t *testing.T) {
 		t.Fatalf("Failed to create sender socket: %v", err)
 	}
 	defer func() { _ = sender.Close() }()
-	senderAddr := sender.LocalAddr().(*net.UDPAddr)
+	senderAddr, ok2 := sender.LocalAddr().(*net.UDPAddr)
+	if !ok2 {
+		t.Fatalf("expected *net.UDPAddr, got %T", sender.LocalAddr())
+	}
 
 	// Send a test packet from a DIFFERENT address than expected
 	testData := []byte("test packet from unexpected source")
@@ -201,7 +213,10 @@ func TestSendPacket_WriteToUDP(t *testing.T) {
 		t.Fatalf("Failed to create receiver socket: %v", err)
 	}
 	defer func() { _ = receiver.Close() }()
-	receiverAddr := receiver.LocalAddr().(*net.UDPAddr)
+	receiverAddr, ok := receiver.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", receiver.LocalAddr())
+	}
 
 	ac := createTestAC(t)
 	defer ac.device.Stop()
@@ -307,7 +322,10 @@ func TestConnection_SimulatesNLBScenario(t *testing.T) {
 		t.Fatalf("Failed to create NLB socket: %v", err)
 	}
 	defer func() { _ = nlbSocket.Close() }()
-	nlbAddr := nlbSocket.LocalAddr().(*net.UDPAddr)
+	nlbAddr, ok := nlbSocket.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", nlbSocket.LocalAddr())
+	}
 
 	// Create AC's connection (would be to NLB in production)
 	acConn := ac.newConnection(nlbAddr)
@@ -323,7 +341,10 @@ func TestConnection_SimulatesNLBScenario(t *testing.T) {
 	defer func() { _ = acConn.netConn.Close() }()
 
 	// Get AC's local port - send to 127.0.0.1:port (not 0.0.0.0:port)
-	acLocalAddr := acConn.netConn.LocalAddr().(*net.UDPAddr)
+	acLocalAddr, ok := acConn.netConn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", acConn.netConn.LocalAddr())
+	}
 	acTargetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: acLocalAddr.Port}
 
 	// Create "server direct" socket (different port simulates different IP)
@@ -332,7 +353,10 @@ func TestConnection_SimulatesNLBScenario(t *testing.T) {
 		t.Fatalf("Failed to create server socket: %v", err)
 	}
 	defer func() { _ = serverSocket.Close() }()
-	serverAddr := serverSocket.LocalAddr().(*net.UDPAddr)
+	serverAddr, ok := serverSocket.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", serverSocket.LocalAddr())
+	}
 
 	// Server sends response to AC (from its direct IP, not NLB)
 	response := []byte("NHP_AAK response from server")
@@ -392,7 +416,10 @@ func TestConnection_ConcurrentReceive(t *testing.T) {
 	defer func() { _ = conn.netConn.Close() }()
 
 	// Get local port - send to 127.0.0.1:port (not 0.0.0.0:port)
-	localAddr := conn.netConn.LocalAddr().(*net.UDPAddr)
+	localAddr, ok := conn.netConn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", conn.netConn.LocalAddr())
+	}
 	targetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: localAddr.Port}
 
 	// Create sender
@@ -546,7 +573,10 @@ func TestConnection_BidirectionalCommunication(t *testing.T) {
 		t.Fatalf("Failed to create server socket: %v", err)
 	}
 	defer func() { _ = serverSocket.Close() }()
-	serverAddr := serverSocket.LocalAddr().(*net.UDPAddr)
+	serverAddr, ok := serverSocket.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", serverSocket.LocalAddr())
+	}
 
 	// Create AC connection to server
 	acConn := ac.newConnection(serverAddr)
@@ -562,7 +592,10 @@ func TestConnection_BidirectionalCommunication(t *testing.T) {
 	defer func() { _ = acConn.netConn.Close() }()
 
 	// Get AC's local port for server to respond to
-	acLocalAddr := acConn.netConn.LocalAddr().(*net.UDPAddr)
+	acLocalAddr, ok := acConn.netConn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", acConn.netConn.LocalAddr())
+	}
 	acTargetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: acLocalAddr.Port}
 
 	// AC sends to server
@@ -631,7 +664,10 @@ func TestConnection_MultipleSourcesSequential(t *testing.T) {
 	defer func() { _ = acConn.netConn.Close() }()
 
 	// Get local port - send to 127.0.0.1:port (not 0.0.0.0:port)
-	acLocalAddr := acConn.netConn.LocalAddr().(*net.UDPAddr)
+	acLocalAddr, ok := acConn.netConn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", acConn.netConn.LocalAddr())
+	}
 	acTargetAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: acLocalAddr.Port}
 
 	// Create multiple senders (simulating packets from different sources)
@@ -674,7 +710,11 @@ func TestConnection_MultipleSourcesSequential(t *testing.T) {
 		receivedFrom[senderIdx] = true
 
 		// Verify packet came from the correct sender
-		expectedPort := senders[senderIdx].LocalAddr().(*net.UDPAddr).Port
+		senderLocalAddr, ok := senders[senderIdx].LocalAddr().(*net.UDPAddr)
+		if !ok {
+			t.Fatalf("expected *net.UDPAddr, got %T", senders[senderIdx].LocalAddr())
+		}
+		expectedPort := senderLocalAddr.Port
 		if fromAddr.Port != expectedPort {
 			t.Errorf("Packet %d from wrong port: got %d, want %d", senderIdx, fromAddr.Port, expectedPort)
 		}
@@ -737,11 +777,15 @@ func TestConnectionTimeout_TriggersReregistration(t *testing.T) {
 
 	// Create connection with very short timeout (50ms)
 	remoteAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: DefaultServerPort}
+	netConnLocalAddr, ok := netConn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", netConn.LocalAddr())
+	}
 	conn := &UdpConn{
 		netConn: netConn,
 		ConnData: &core.ConnectionData{
 			RemoteAddr:       remoteAddr,
-			LocalAddr:        netConn.LocalAddr().(*net.UDPAddr),
+			LocalAddr:        netConnLocalAddr,
 			TimeoutMs:        50, // Very short timeout
 			SendQueue:        make(chan *core.Packet, 16),
 			RecvQueue:        make(chan *core.Packet, 16),
@@ -829,11 +873,15 @@ func TestConnectionTimeout_NonServerConnection(t *testing.T) {
 
 	// Create connection with very short timeout
 	remoteAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.99"), Port: 12345}
+	netConnLocalAddr, ok := netConn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", netConn.LocalAddr())
+	}
 	conn := &UdpConn{
 		netConn: netConn,
 		ConnData: &core.ConnectionData{
 			RemoteAddr:       remoteAddr,
-			LocalAddr:        netConn.LocalAddr().(*net.UDPAddr),
+			LocalAddr:        netConnLocalAddr,
 			TimeoutMs:        50,
 			SendQueue:        make(chan *core.Packet, 16),
 			RecvQueue:        make(chan *core.Packet, 16),

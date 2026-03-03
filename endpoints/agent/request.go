@@ -22,7 +22,12 @@ func resolveServerAddr(peer *core.UdpPeer, userId, funcName string) (*net.UDPAdd
 		log.Critical("agent(%s)[%s] server IP cannot be parsed", userId, funcName)
 		return nil, common.ErrKnockServerNotFound
 	}
-	return sendAddr.(*net.UDPAddr), nil
+	udpAddr, ok := sendAddr.(*net.UDPAddr)
+	if !ok {
+		log.Critical("agent(%s)[%s] unexpected address type %T", userId, funcName, sendAddr)
+		return nil, common.ErrKnockServerNotFound
+	}
+	return udpAddr, nil
 }
 
 // newMsgData creates a MsgData with common agent fields pre-populated.

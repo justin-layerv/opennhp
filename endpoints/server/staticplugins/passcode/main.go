@@ -394,8 +394,9 @@ func authAndShowLogin(ctx *gin.Context, req *common.HttpKnockRequest, res *commo
 		return nil, errors.New("extra login info not available")
 	}
 
+	title, _ := res.ExInfo["Title"].(string)
 	ctx.HTML(http.StatusOK, "passcode/passcode_login.html", gin.H{
-		"title":       res.ExInfo["Title"].(string),
+		"title":       title,
 		"nhpServer":   pluginsIn.Hostname,
 		"aspId":       req.AuthServiceId,
 		"resId":       res.ResourceId,
@@ -422,8 +423,9 @@ func authAndShowRefresh(ctx *gin.Context, req *common.HttpKnockRequest, res *com
 		return nil, errors.New("extra login info not available")
 	}
 
+	refreshTitle, _ := res.ExInfo["Title"].(string)
 	ctx.HTML(http.StatusOK, "passcode/nhp_refresh.html", gin.H{
-		"title":       res.ExInfo["Title"].(string),
+		"title":       refreshTitle,
 		"nhpServer":   pluginsIn.Hostname,
 		"aspId":       req.AuthServiceId,
 		"resId":       res.ResourceId,
@@ -555,13 +557,14 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		log.Debug("Authenticating passcode: %s succeeded!", passcode)
 	} else {
 		appSecrets := make(map[string]bool, 0)
-		switch res.ExInfo["AppSecret"].(type) {
+		switch v := res.ExInfo["AppSecret"].(type) {
 		case string:
 			appSecrets[nhpsdkutils.GetStringFromMap(res.ExInfo, "JWTSecret")] = true
 		case []any:
-			secrets := res.ExInfo["AppSecret"].([]any)
-			for _, secret := range secrets {
-				appSecrets[secret.(string)] = true
+			for _, secret := range v {
+				if s, ok := secret.(string); ok {
+					appSecrets[s] = true
+				}
 			}
 		}
 		if _, ok := appSecrets[passcode]; !ok {

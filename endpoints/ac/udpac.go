@@ -754,8 +754,13 @@ func (a *UdpAC) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sync.W
 				return
 			}
 
+			udpAddr, ok := sendAddr.(*net.UDPAddr)
+			if !ok {
+				log.Error("ac(%s)[ACOnline] unexpected address type %T", acId, sendAddr)
+				return
+			}
 			aolMd := &core.MsgData{
-				RemoteAddr:    sendAddr.(*net.UDPAddr),
+				RemoteAddr:    udpAddr,
 				HeaderType:    core.NHP_AOL,
 				CipherScheme:  a.config.DefaultCipherScheme,
 				TransactionId: a.device.NextCounterIndex(),
@@ -858,8 +863,13 @@ func (a *UdpAC) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sync.W
 		} else if connected {
 			if (currTime - lastSendTime) > int64(ServerKeepaliveInterval*time.Second) {
 				// send NHP_KPL to server if no send happens within ServerKeepaliveInterval
+				kplAddr, ok := sendAddr.(*net.UDPAddr)
+				if !ok {
+					log.Error("ac(%s)[ACOnline] unexpected address type %T for keepalive", acId, sendAddr)
+					continue
+				}
 				md := &core.MsgData{
-					RemoteAddr:   sendAddr.(*net.UDPAddr),
+					RemoteAddr:   kplAddr,
 					HeaderType:   core.NHP_KPL,
 					CipherScheme: a.config.DefaultCipherScheme,
 					//PeerPk:        peerPbk, // pubkey not needed

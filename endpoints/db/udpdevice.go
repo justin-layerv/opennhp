@@ -582,8 +582,13 @@ func (a *UdpDevice) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sy
 				return
 			}
 
+			udpAddr, ok := sendAddr.(*net.UDPAddr)
+			if !ok {
+				log.Error("db(%s)[DBOnline] unexpected address type %T", dbId, sendAddr)
+				return
+			}
 			aolMd := &core.MsgData{
-				RemoteAddr:    sendAddr.(*net.UDPAddr),
+				RemoteAddr:    udpAddr,
 				HeaderType:    core.NHP_DOL,
 				CipherScheme:  a.config.DefaultCipherScheme,
 				TransactionId: a.device.NextCounterIndex(),
@@ -663,8 +668,13 @@ func (a *UdpDevice) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sy
 		} else if connected {
 			if (currTime - lastSendTime) > int64(ServerKeepaliveInterval*time.Second) {
 				// send NHP_KPL to server if no send happens within ServerKeepaliveInterval
+				kplAddr, ok := sendAddr.(*net.UDPAddr)
+				if !ok {
+					log.Error("db(%s)[DBOnline] unexpected address type %T for keepalive", dbId, sendAddr)
+					continue
+				}
 				md := &core.MsgData{
-					RemoteAddr:    sendAddr.(*net.UDPAddr),
+					RemoteAddr:    kplAddr,
 					HeaderType:    core.NHP_KPL,
 					CipherScheme:  a.config.DefaultCipherScheme,
 					TransactionId: a.device.NextCounterIndex(),
@@ -730,13 +740,18 @@ func (a *UdpDevice) SendNHPDRG(server *core.UdpPeer, msg common.DRGMsg) bool {
 		log.Critical("device(%v)[SendNHPDRG] register server IP cannot be parsed", a)
 		return false
 	}
+	udpAddr, ok := sendAddr.(*net.UDPAddr)
+	if !ok {
+		log.Critical("device(%v)[SendNHPDRG] unexpected address type %T", a, sendAddr)
+		return false
+	}
 	drgBytes, marshalErr := json.Marshal(msg)
 	if marshalErr != nil {
 		log.Error("device[SendNHPDRG] failed to marshal DRG message: %v", marshalErr)
 		return false
 	}
 	drgMd := &core.MsgData{
-		RemoteAddr:    sendAddr.(*net.UDPAddr),
+		RemoteAddr:    udpAddr,
 		HeaderType:    core.NHP_DRG,
 		CipherScheme:  a.config.DefaultCipherScheme,
 		TransactionId: a.device.NextCounterIndex(),

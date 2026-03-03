@@ -547,7 +547,11 @@ func marshal(buf *bytes.Buffer, data any) error {
 						}
 					}
 				} else if field.Type().Elem().Kind() == reflect.Uint8 {
-					bytes = field.Interface().([]byte)
+					var ok bool
+					bytes, ok = field.Interface().([]byte)
+					if !ok {
+						return fmt.Errorf("unsupported field type: expected []byte but got %T", field.Interface())
+					}
 				} else {
 					return fmt.Errorf("unsupported field type: %v in slice", field.Type().Elem().Kind())
 				}

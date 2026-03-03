@@ -128,7 +128,12 @@ func (bp *PacketBufferPool) Init(max uint32) {
 
 // must be called after Init()
 func (bp *PacketBufferPool) Get() *PacketBuffer {
-	return bp.pool.Get().(*PacketBuffer)
+	buf, ok := bp.pool.Get().(*PacketBuffer)
+	if !ok {
+		log.Error("PacketBufferPool.Get: unexpected type from pool")
+		return nil
+	}
+	return buf
 }
 
 // must be called after Init()
@@ -258,6 +263,9 @@ func (d *Device) RecvPrecheck(pkt *Packet) (int, int, error) {
 
 func (d *Device) AllocatePoolPacket() *Packet {
 	buf := d.pool.Get()
+	if buf == nil {
+		return nil
+	}
 	return &Packet{Buf: buf, Content: buf[:], PoolAllocated: true}
 }
 

@@ -108,11 +108,16 @@ func NewTrustApplication(tadId string, language string, entry string) (*TrustedA
 			if name == "path" { // path is injected by nhp agent
 				continue
 			}
-			prop, _ := propSchema.(map[string]any)
+			prop, ok := propSchema.(map[string]any)
+			if !ok {
+				continue
+			}
+			desc, _ := prop["description"].(string)
+			propType, _ := prop["type"].(string)
 			taFuncParam := TAFunctionParam{
 				Name:        name,
-				Description: prop["description"].(string),
-				Type:        prop["type"].(string),
+				Description: desc,
+				Type:        propType,
 			}
 			taFunc.Params = append(taFunc.Params, taFuncParam)
 		}

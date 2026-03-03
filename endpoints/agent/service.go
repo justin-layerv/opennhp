@@ -155,7 +155,17 @@ func (a *UdpAgent) registerTAService(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		fileUuid = fileInfo.(map[string]any)["uuid"].(string)
+		fileMap, ok := fileInfo.(map[string]any)
+		if !ok {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected file info format"})
+			return
+		}
+		uuidVal, ok := fileMap["uuid"].(string)
+		if !ok {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "uuid field missing or not a string"})
+			return
+		}
+		fileUuid = uuidVal
 	}
 
 	// save file information into the file which name is md5sum, no matter the file exists or not.
@@ -217,7 +227,13 @@ func (a *UdpAgent) callFunction(c *gin.Context) {
 	function := parts[len(parts)-1]
 	taId := parts[len(parts)-2]
 
-	ccRes, err := a.StartConfidentialComputing(body["doId"].(string), taId, function, body)
+	doId, ok := body["doId"].(string)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "doId must be a string"})
+		return
+	}
+
+	ccRes, err := a.StartConfidentialComputing(doId, taId, function, body)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

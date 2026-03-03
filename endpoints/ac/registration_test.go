@@ -1806,7 +1806,10 @@ func TestACRegistration_NHP_AAK_AddsToAssignedServers(t *testing.T) {
 	if sendAddr == nil {
 		t.Fatal("test peer SendAddr should not be nil")
 	}
-	udpAddr := sendAddr.(*net.UDPAddr)
+	udpAddr, ok := sendAddr.(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", sendAddr)
+	}
 
 	if server.Target.IP != udpAddr.IP.String() {
 		t.Errorf("Target.IP = %s, want %s", server.Target.IP, udpAddr.IP.String())
@@ -2153,7 +2156,10 @@ func TestACRegistration_NHP_AAK_ServerAddr(t *testing.T) {
 	if sendAddr == nil {
 		t.Fatal("server.Peer.SendAddr() should not be nil")
 	}
-	udpAddr := sendAddr.(*net.UDPAddr)
+	udpAddr, ok := sendAddr.(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", sendAddr)
+	}
 	if udpAddr.IP.String() != serverDirectIP {
 		t.Errorf("SendAddr IP = %s, want %s", udpAddr.IP.String(), serverDirectIP)
 	}
@@ -2723,7 +2729,10 @@ func TestACRegistration_NHP_AAK_ServerAddr_KeepaliveTarget(t *testing.T) {
 		t.Fatal("Peer.SendAddr() should not be nil")
 	}
 
-	udpAddr := sendAddr.(*net.UDPAddr)
+	udpAddr, ok := sendAddr.(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", sendAddr)
+	}
 	if udpAddr.IP.String() != directIP {
 		t.Errorf("keepalive target IP = %s, want %s (direct, not NLB %s)",
 			udpAddr.IP.String(), directIP, nlbIP)
@@ -2802,7 +2811,10 @@ func TestACRegistration_NHP_AAK_ServerAddr_SamePubKey(t *testing.T) {
 		t.Fatal("SendAddr should not be nil")
 	}
 
-	udpAddr := sendAddr.(*net.UDPAddr)
+	udpAddr, ok := sendAddr.(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", sendAddr)
+	}
 	if udpAddr.IP.String() != directIP {
 		t.Errorf("peer should point to direct IP %s, got %s", directIP, udpAddr.IP.String())
 	}
@@ -2980,7 +2992,10 @@ func TestACRegistration_NHP_AAK_ServerAddr_InvalidFormats(t *testing.T) {
 			// Verify the peer points to NLB address (fallback)
 			sendAddr := servers[0].Peer.SendAddr()
 			if sendAddr != nil {
-				udpAddr := sendAddr.(*net.UDPAddr)
+				udpAddr, ok := sendAddr.(*net.UDPAddr)
+				if !ok {
+					t.Fatalf("expected *net.UDPAddr, got %T", sendAddr)
+				}
 				if udpAddr.IP.String() != nlbIP {
 					t.Errorf("fallback should use NLB IP %s, got %s", nlbIP, udpAddr.IP.String())
 				}
@@ -3052,7 +3067,10 @@ func TestACRegistration_NHP_AAK_ServerAddr_UnresolvableHost(t *testing.T) {
 	// Verify the peer points to NLB address (fallback)
 	sendAddr := servers[0].Peer.SendAddr()
 	if sendAddr != nil {
-		udpAddr := sendAddr.(*net.UDPAddr)
+		udpAddr, ok := sendAddr.(*net.UDPAddr)
+		if !ok {
+			t.Fatalf("expected *net.UDPAddr, got %T", sendAddr)
+		}
 		if udpAddr.IP.String() != nlbIP {
 			t.Errorf("fallback should use NLB IP %s, got %s", nlbIP, udpAddr.IP.String())
 		}

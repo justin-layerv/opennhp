@@ -99,7 +99,10 @@ func newE2ETestNodeWithType(t *testing.T, id string, deviceType int) *E2ETestNod
 		t.Fatalf("Failed to bind UDP for node %s: %v", id, err)
 	}
 
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", conn.LocalAddr())
+	}
 
 	node := &E2ETestNode{
 		t:            t,

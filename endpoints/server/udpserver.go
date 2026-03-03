@@ -327,7 +327,10 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	}
 
 	// retrieve local ip and mac
-	s.localIp = utils.GetLocalOutboundAddress().String()
+	localAddr := utils.GetLocalOutboundAddress()
+	if localAddr != nil {
+		s.localIp = localAddr.String()
+	}
 	s.localMac = utils.GetMacAddress(s.localIp)
 	// load asp resources and plugins
 	s.pluginHandlerMap = make(map[string]plugins.PluginHandler)
