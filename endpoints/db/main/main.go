@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -219,7 +220,7 @@ func runApp(params db.AppParams) error {
 				policyPath = filepath.Join(smartPolicyDir, policyPath)
 			}
 
-			smartPolicy.Policy, err = a.UploadFileToNHPServer(policyPath)
+			smartPolicy.Policy, err = a.UploadFileToNHPServer(context.Background(), policyPath)
 			if err != nil {
 				log.Error("failed to upload policy file: %s", err)
 				return err
@@ -314,7 +315,7 @@ func runApp(params db.AppParams) error {
 
 				if params.AccessUrl == "" {
 					// upload ztdo to nhp server
-					params.AccessUrl, err = a.UploadFileToNHPServer(outputFilePath)
+					params.AccessUrl, err = a.UploadFileToNHPServer(context.Background(), outputFilePath)
 					if err != nil {
 						log.Error("failed to upload ztdo file: %s", err)
 						return err

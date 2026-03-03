@@ -200,16 +200,22 @@ func (a *AppParams) LoadMetadataAsStruct() (map[string]any, error) {
 	return metadata, nil
 }
 
-func (a *UdpDevice) UploadFileToNHPServer(filePath string) (string, error) {
-	httpHost := fmt.Sprintf("http://%s/", a.GetServerPeer().Host())
-	testReq, err := http.Get(httpHost) //nolint:noctx // probe request with no meaningful context
+func (a *UdpDevice) UploadFileToNHPServer(ctx context.Context, filePath string) (string, error) {
+	httpHost := fmt.Sprintf("https://%s/", a.GetServerPeer().Host())
+	probeReq, err := http.NewRequestWithContext(ctx, http.MethodGet, httpHost, nil)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("could not create probe request: %w", err)
 	}
-	_ = testReq.Body.Close()
-
-	if testReq.StatusCode == http.StatusBadRequest {
-		httpHost = fmt.Sprintf("https://%s/", a.GetServerPeer().Host())
+	probeClient := &http.Client{Timeout: 5 * time.Second}
+	probeResp, err := probeClient.Do(probeReq)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("probe request canceled: %w", ctx.Err())
+		}
+		log.Warning("[DB] HTTPS probe failed, falling back to HTTP: %v", err)
+		httpHost = fmt.Sprintf("http://%s/", a.GetServerPeer().Host())
+	} else {
+		_ = probeResp.Body.Close()
 	}
 
 	file, err := os.Open(filePath)
@@ -255,7 +261,7 @@ func (a *UdpDevice) UploadFileToNHPServer(filePath string) (string, error) {
 
 	uploadUrl := httpHost + "storage/upload"
 
-	req, err := http.NewRequestWithContext(context.Background(), "POST", uploadUrl, body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadUrl, body)
 	if err != nil {
 		return "", fmt.Errorf("could not create request: %w", err)
 	}
