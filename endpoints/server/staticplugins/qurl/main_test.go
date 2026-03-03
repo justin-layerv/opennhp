@@ -486,3 +486,142 @@ func TestAuthWithHttp_ResolverError(t *testing.T) {
 		t.Error("resolver error should abort context")
 	}
 }
+
+func TestAuthWithHttp_KnockRetrySuccess(t *testing.T) {
+	// Create mock QURL API server that returns success
+	qurlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := internalResolveResponse{
+			Success: true,
+			Data: &ResolveResponse{
+				ResourceID:  "r_retry",
+				TargetURL:   "https://backend.example.com",
+				QurlSiteURL: "https://r_retry.qurl.site",
+				Resources: map[string]*common.ResourceInfo{
+					"default": {
+						ACId:     "ac-001",
+						Hostname: "backend.example.com",
+					},
+				},
+				JWTSecret:    "test-jwt-secret-key-for-signing",
+				TokenExpire:  3600,
+				OpenTime:     300,
+				CookieDomain: ".qurl.site",
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer qurlServer.Close()
+
+	oldResolver := resolver
+	resolver = &QurlResolver{
+		httpClient:            &http.Client{Timeout: 5 * time.Second},
+		baseURL:               qurlServer.URL,
+		serviceToken:          "test-service-token",
+		allowedRedirectDomain: "qurl.site",
+	}
+	defer func() { resolver = oldResolver }()
+
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/plugins/qurl?token=valid_test_token_123", nil)
+
+	// First knock fails, second succeeds
+	var attempts int
+	helper := &plugins.HttpServerPluginHelper{
+		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			attempts++
+			if attempts == 1 {
+				return nil, errors.New("AC connection closed")
+			}
+			return &common.ServerKnockAckMsg{
+				ResourceHost: map[string]string{"default": "10.0.0.1:443"},
+			}, nil
+		},
+	}
+
+	req := &common.HttpKnockRequest{}
+	ackMsg, err := AuthWithHttp(ctx, req, helper)
+
+	if err != nil {
+		t.Fatalf("expected success after retry, got error: %v", err)
+	}
+	if attempts != 2 {
+		t.Errorf("expected 2 knock attempts, got %d", attempts)
+	}
+	if ackMsg == nil || len(ackMsg.ResourceHost) == 0 {
+		t.Error("expected resource hosts in ack message")
+	}
+	if w.Code != http.StatusFound {
+		t.Errorf("expected redirect (302), got %d", w.Code)
+	}
+}
+
+func TestAuthWithHttp_KnockRetryExhausted(t *testing.T) {
+	// Create mock QURL API server that returns success
+	qurlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := internalResolveResponse{
+			Success: true,
+			Data: &ResolveResponse{
+				ResourceID:  "r_fail",
+				TargetURL:   "https://backend.example.com",
+				QurlSiteURL: "https://r_fail.qurl.site",
+				Resources: map[string]*common.ResourceInfo{
+					"default": {
+						ACId:     "ac-001",
+						Hostname: "backend.example.com",
+					},
+				},
+				JWTSecret:    "test-jwt-secret-key-for-signing",
+				TokenExpire:  3600,
+				OpenTime:     300,
+				CookieDomain: ".qurl.site",
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer qurlServer.Close()
+
+	oldResolver := resolver
+	resolver = &QurlResolver{
+		httpClient:            &http.Client{Timeout: 5 * time.Second},
+		baseURL:               qurlServer.URL,
+		serviceToken:          "test-service-token",
+		allowedRedirectDomain: "qurl.site",
+	}
+	defer func() { resolver = oldResolver }()
+
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/plugins/qurl?token=valid_test_token_123", nil)
+
+	// Both knock attempts fail
+	var attempts int
+	helper := &plugins.HttpServerPluginHelper{
+		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			attempts++
+			return nil, errors.New("AC connection closed")
+		},
+	}
+
+	req := &common.HttpKnockRequest{}
+	_, err := AuthWithHttp(ctx, req, helper)
+
+	if err == nil {
+		t.Fatal("expected error after both attempts fail")
+	}
+	if attempts != 2 {
+		t.Errorf("expected 2 knock attempts, got %d", attempts)
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", w.Code)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("failed to parse response body: %v", err)
+	}
+	if body["error"] != "knock_failed" {
+		t.Errorf("expected error='knock_failed', got %q", body["error"])
+	}
+}

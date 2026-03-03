@@ -9,7 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"slices"
+
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -1334,8 +1334,16 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 		}
 		s.acConnectionMapMutex.Lock()
 		conns, found := s.acConnectionMap[resInfo.ACId]
+		liveCount := 0
+		if found {
+			for _, c := range conns {
+				if !c.ConnData.IsClosed() {
+					liveCount++
+				}
+			}
+		}
 		s.acConnectionMapMutex.Unlock()
-		if !found || len(conns) == 0 {
+		if !found || liveCount == 0 {
 			needsForwarding = true
 			forwardACId = resInfo.ACId
 			break
@@ -1399,7 +1407,14 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 		acConns, found := s.acConnectionMap[acId]
 		var connsCopy []*ACConn
 		if found {
-			connsCopy = slices.Clone(acConns)
+			// Filter out connections that have already been closed to avoid
+			// sending NHP-AOP on stale connections (which would fail immediately
+			// with ErrTransactionFailedByClosedConnection).
+			for _, c := range acConns {
+				if !c.ConnData.IsClosed() {
+					connsCopy = append(connsCopy, c)
+				}
+			}
 		}
 		s.acConnectionMapMutex.Unlock()
 		if !found || len(connsCopy) == 0 {
@@ -1603,12 +1618,16 @@ func (s *UdpServer) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*A
 		return nil
 	}
 
-	// Look up all AC connections
+	// Look up all AC connections, filtering out stale (closed) ones
 	s.acConnectionMapMutex.Lock()
 	conns, found := s.acConnectionMap[acId]
 	var result []*ACConn
 	if found {
-		result = slices.Clone(conns)
+		for _, c := range conns {
+			if !c.ConnData.IsClosed() {
+				result = append(result, c)
+			}
+		}
 	}
 	s.acConnectionMapMutex.Unlock()
 

@@ -12,7 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"slices"
+
 	"strconv"
 	"strings"
 	"sync"
@@ -589,7 +589,14 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 		acConns, found := s.acConnectionMap[acId]
 		var connsCopy []*ACConn
 		if found {
-			connsCopy = slices.Clone(acConns)
+			// Filter out connections that have already been closed to avoid
+			// sending NHP-AOP on stale connections (which would fail immediately
+			// with ErrTransactionFailedByClosedConnection).
+			for _, c := range acConns {
+				if !c.ConnData.IsClosed() {
+					connsCopy = append(connsCopy, c)
+				}
+			}
 		}
 		s.acConnectionMapMutex.Unlock()
 		if !found || len(connsCopy) == 0 {

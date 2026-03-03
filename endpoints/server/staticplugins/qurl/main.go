@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -19,6 +20,11 @@ import (
 const (
 	name    = "qurl"
 	version = "1.0.0"
+
+	// knockRetryDelay is the wait time before retrying a failed NHP knock.
+	// This gives time for AC connections to re-establish during blue/green
+	// deployments or transient connectivity gaps.
+	knockRetryDelay = 2 * time.Second
 )
 
 var (
@@ -110,10 +116,18 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	// Build ResourceData from the resolved response
 	res := buildResourceData(resolveResp)
 
-	// Trigger NHP knock via helper callback
+	// Trigger NHP knock via helper callback.
+	// Retry once on failure: AC connections can be briefly unavailable during
+	// blue/green deployments or connection re-establishment. A short retry
+	// avoids returning 500 to users for transient AC connectivity issues.
 	ackMsg, err = helper.AuthWithHttpCallbackFunc(req, res)
 	if err != nil {
-		log.Error("[QURL] NHP knock failed: %v", err)
+		log.Warning("[QURL] NHP knock failed (attempt 1/2): %v, retrying...", err)
+		time.Sleep(knockRetryDelay)
+		ackMsg, err = helper.AuthWithHttpCallbackFunc(req, res)
+	}
+	if err != nil {
+		log.Error("[QURL] NHP knock failed after retry: %v", err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "knock_failed",
 			"message": "Failed to open access to resource",
