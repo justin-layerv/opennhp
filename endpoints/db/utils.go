@@ -207,7 +207,7 @@ func (a *UdpDevice) UploadFileToNHPServer(ctx context.Context, filePath string) 
 		return "", fmt.Errorf("could not create probe request: %w", err)
 	}
 	probeClient := &http.Client{Timeout: 5 * time.Second}
-	probeResp, err := probeClient.Do(probeReq)
+	probeResp, err := probeClient.Do(probeReq) //nolint:gosec // G704: host from server peer config (TOML), not user input
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", fmt.Errorf("probe request canceled: %w", ctx.Err())
@@ -272,7 +272,7 @@ func (a *UdpDevice) UploadFileToNHPServer(ctx context.Context, filePath string) 
 		Timeout: 120 * time.Minute,
 	}
 
-	resp, err := client.Do(req)
+	resp, err := client.Do(req) //nolint:gosec // G704: URL from server peer config (TOML), not user input
 	if err != nil {
 		return "", fmt.Errorf("could not send https request: %w", err)
 	}

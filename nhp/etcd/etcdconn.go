@@ -17,18 +17,18 @@ type EtcdConfig struct {
 	Key       string
 	Endpoints []string
 	Username  string
-	Password  string
+	Password  string //nolint:gosec // G117: no JSON tag, never serialized — runtime config only
 }
 
 type EtcdConn struct {
 	Endpoints  []string
 	Username   string
-	Password   string
+	Password   string //nolint:gosec // G117: no JSON tag, never serialized — runtime config only
 	Key        string
 	TLS        bool
 	CACert     string
 	ClientCert string
-	ClientKey  string
+	ClientKey  string //nolint:gosec // G117: no JSON tag, never serialized — TLS client key path
 	client     *clientv3.Client
 	ctx        context.Context
 	watcher    clientv3.Watcher

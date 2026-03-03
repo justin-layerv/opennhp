@@ -388,7 +388,7 @@ func (hs *HttpServer) initRouter() {
 // cookieKeySet represents a pair of cookie signing/encryption keys.
 // Gorilla securecookie uses auth_key for HMAC-SHA256 and encrypt_key for AES-256.
 type cookieKeySet struct {
-	AuthKey    string `json:"auth_key"`
+	AuthKey    string `json:"auth_key"` //nolint:gosec // G117: JSON tag required — deserialized from Secrets Manager, never marshaled out
 	EncryptKey string `json:"encrypt_key"`
 }
 

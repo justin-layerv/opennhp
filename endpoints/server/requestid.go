@@ -31,7 +31,7 @@ func requestIDMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		requestID := c.GetHeader(RequestIDHeader)
 		if requestID != "" && (len(requestID) > maxRequestIDLength || !isValidRequestID(requestID)) {
-			slog.Warn("rejected invalid X-Request-ID header",
+			slog.Warn("rejected invalid X-Request-ID header", //nolint:gosec // G706: requestID validated by isValidRequestID and length check above
 				"reason", requestIDRejectReason(requestID),
 				"client_ip", c.ClientIP(),
 				"path", c.Request.URL.Path,

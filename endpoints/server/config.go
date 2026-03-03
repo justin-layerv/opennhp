@@ -62,7 +62,7 @@ type SrcIpMap struct {
 }
 
 type Config struct {
-	PrivateKeyBase64       string       `json:"privateKey"`
+	PrivateKeyBase64       string       `json:"privateKey"` //nolint:gosec // G117: config struct, never JSON-marshaled — TOML input only
 	Hostname               string       `json:"hostname"`
 	ListenIp               string       `json:"listenIp"`
 	ListenPort             int          `json:"listenPort"`
@@ -77,11 +77,11 @@ type RemoteConfig struct {
 	Key        string
 	Endpoints  []string
 	Username   string
-	Password   string
+	Password   string //nolint:gosec // G117: no JSON tag, never serialized — TOML config for etcd
 	TLS        bool
 	CACert     string
 	ClientCert string
-	ClientKey  string
+	ClientKey  string //nolint:gosec // G117: no JSON tag, never serialized — TLS client key path
 }
 
 type HttpConfig struct {

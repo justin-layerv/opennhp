@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -78,8 +79,8 @@ func respondErrorJSON(ctx *gin.Context, format, resId, errCode string, err error
 type knockTokenResult struct {
 	AckMsg       *common.ServerKnockAckMsg
 	NHPToken     string
-	RefreshToken string
-	KnockOK      bool // true when knock succeeded and ResourceHost is available
+	RefreshToken string //nolint:gosec // G117: no JSON tag, never serialized — internal return value only
+	KnockOK      bool   // true when knock succeeded and ResourceHost is available
 }
 
 // knockAndIssueTokens performs the NHP knock via the helper, generates JWT
@@ -628,19 +629,19 @@ func authAccessFromRaaS(ctx *gin.Context, req *common.HttpKnockRequest, res *com
 		return nil, "601", errors.New("id is missing")
 	}
 	log.Info("raas portal Site app id is %s", idStr)
-	potalSiteUrl := fmt.Sprintf("%s/api/v1/portal-sites/%s", IAMServiceUrl, idStr)
-	log.Info("Calling real IAM service: %s", potalSiteUrl)
+	portalSiteUrl := fmt.Sprintf("%s/api/v1/portal-sites/%s", IAMServiceUrl, url.PathEscape(idStr))
+	log.Info("Calling real IAM service: %s", portalSiteUrl)
 	authHeader := ctx.GetHeader("Authorization")
 	if authHeader == "" {
 		return nil, "602", errors.New("authorization header is missing")
 	}
-	raasHttpReq, err := http.NewRequestWithContext(ctx.Request.Context(), "GET", potalSiteUrl, nil)
+	raasHttpReq, err := http.NewRequestWithContext(ctx.Request.Context(), "GET", portalSiteUrl, nil)
 	if err != nil {
 		return nil, "603", fmt.Errorf("failed to create request: %w", err)
 	}
 	raasHttpReq.Header.Set("Authorization", authHeader)
 	client := &http.Client{}
-	respRaas, err := client.Do(raasHttpReq)
+	respRaas, err := client.Do(raasHttpReq) //nolint:gosec // G704: host from IAMServiceUrl config, path component is url.PathEscape'd
 	if err != nil {
 		return nil, "604", fmt.Errorf("failed to call real IAM service: %w", err)
 	}

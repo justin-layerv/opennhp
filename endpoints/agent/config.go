@@ -28,7 +28,7 @@ var (
 type Config struct {
 	LogLevel            int    `json:"logLevel"`
 	DefaultCipherScheme int    `json:"defaultCipherScheme"`
-	PrivateKeyBase64    string `json:"privateKey"`
+	PrivateKeyBase64    string `json:"privateKey"` //nolint:gosec // G117: config struct, never JSON-marshaled — TOML input only
 	KnockUser           `mapstructure:",squash"`
 	*DHPConfig
 }

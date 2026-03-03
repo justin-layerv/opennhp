@@ -35,7 +35,7 @@ var (
 // This is sent to the QURL API internal endpoint for token resolution.
 type ResolveRequest struct {
 	// AccessToken is the token extracted from the qurl.link redirect
-	AccessToken string `json:"access_token"`
+	AccessToken string `json:"access_token"` //nolint:gosec // G117: JSON tag required — sent to QURL API for token resolution
 	// SrcIP is the client's IP address for policy evaluation
 	SrcIP string `json:"src_ip"`
 	// UserAgent is the client's user agent for logging/analytics
@@ -61,7 +61,7 @@ type ResolveResponse struct {
 	Resources map[string]*common.ResourceInfo `json:"resources"`
 
 	// JWTSecret is the secret used to sign NHP tokens for this resource
-	JWTSecret string `json:"jwt_secret"`
+	JWTSecret string `json:"jwt_secret"` //nolint:gosec // G117: JSON tag required — received from QURL API response, never re-serialized
 	// TokenExpire is the token expiration time in seconds
 	TokenExpire int64 `json:"token_expire"`
 	// OpenTime is the firewall open time in seconds
@@ -173,7 +173,7 @@ func (r *QurlResolver) Resolve(ctx context.Context, req *ResolveRequest) (*Resol
 
 	// Execute request
 	log.Debug("[QURL] Calling QURL API: %s", url)
-	resp, err := r.httpClient.Do(httpReq)
+	resp, err := r.httpClient.Do(httpReq) //nolint:gosec // G704: URL from QURL_API_URL env var with schema validation
 	if err != nil {
 		log.Error("[QURL] HTTP request failed: %v", err)
 		return nil, fmt.Errorf("failed to call QURL API: %w", err)

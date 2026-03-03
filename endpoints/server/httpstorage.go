@@ -78,7 +78,7 @@ func (hs *HttpServer) initStorageRouter() {
 			return
 		}
 		filePath := filepath.Join(fileDir, filename)
-		out, err := os.Create(filePath)
+		out, err := os.Create(filePath) //nolint:gosec // G703: filename sanitized with filepath.Base above
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "create file failed"})
 			return

@@ -41,7 +41,7 @@ func Request(url, method string, str string, header map[string]string) (string, 
 		req.Header.Add(k, v)
 	}
 
-	res, err := client.Do(req)
+	res, err := client.Do(req) //nolint:gosec // G704: URL is caller-controlled (config values or test constants)
 	if err != nil {
 		return "", err
 	}

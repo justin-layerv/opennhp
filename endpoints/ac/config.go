@@ -28,7 +28,7 @@ const (
 )
 
 type Config struct {
-	PrivateKeyBase64    string          `json:"privateKey"`
+	PrivateKeyBase64    string          `json:"privateKey"` //nolint:gosec // G117: config struct, never JSON-marshaled — TOML input only
 	ACId                string          `json:"acId"`
 	DefaultIp           string          `json:"defaultIp"`
 	AuthServiceId       string          `json:"aspId"`

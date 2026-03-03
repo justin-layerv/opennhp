@@ -16,7 +16,7 @@ import (
 
 // HMACConfig HMAC signature verification configuration
 type HMACConfig struct {
-	AccessKey string // Access key (using resId)
+	AccessKey string //nolint:gosec // G117: not a secret — holds resource ID used as HMAC access key identifier
 	SecretKey string // Signing key
 	Algorithm string // Algorithm: "sha256", "sha512", "sha1"
 	ExpireSec int    // Signature validity period (seconds), 0 means no expiration check

@@ -33,7 +33,7 @@ type AgentOTPMsg struct {
 	DeviceId       string         `json:"devId"`
 	OrganizationId string         `json:"orgId,omitempty"`
 	AuthServiceId  string         `json:"aspId"`
-	Passcode       string         `json:"pass,omitempty"`
+	Passcode       string         `json:"pass,omitempty"` //nolint:gosec // G117: JSON tag required — NHP protocol wire format
 	UserData       map[string]any `json:"usrData,omitempty"`
 }
 

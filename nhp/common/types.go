@@ -25,7 +25,7 @@ type ResourceData struct {
 	// optional extension data
 	AppKey             string         `json:"appKey,omitempty"`
 	AppSecret          string         `json:"appSecret,omitempty"`
-	AccessKey          string         `json:"accessKey,omitempty"`
+	AccessKey          string         `json:"accessKey,omitempty"` //nolint:gosec // G117: JSON tag required — resource config loaded from TOML, not user input
 	SecretKey          string         `json:"secretKey,omitempty"`
 	ExInfo             map[string]any `json:"exinfo,omitempty"`
 	RedirectUrl        string         `json:"redirectUrl,omitempty"`

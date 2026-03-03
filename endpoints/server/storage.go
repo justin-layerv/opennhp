@@ -195,9 +195,9 @@ type EtcdStorageConfig struct {
 	TLS        bool     `toml:"TLS"`
 	CACert     string   `toml:"CACert,omitempty"`
 	ClientCert string   `toml:"ClientCert,omitempty"`
-	ClientKey  string   `toml:"ClientKey,omitempty"`
+	ClientKey  string   `toml:"ClientKey,omitempty"` //nolint:gosec // G117: TOML tag only (no JSON), never serialized — TLS client key path
 	Username   string   `toml:"Username,omitempty"`
-	Password   string   `toml:"Password,omitempty"`
+	Password   string   `toml:"Password,omitempty"` //nolint:gosec // G117: TOML tag only (no JSON), never serialized — etcd auth config
 }
 
 // CacheConfig configures the assignment cache.
