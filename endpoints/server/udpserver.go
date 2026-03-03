@@ -269,7 +269,7 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	if s.config.WebRTC.Enable {
 		s.webrtcServer = NewWebRTCServer(s, &s.config.WebRTC)
 		if err := s.webrtcServer.Start(); err != nil {
-			log.Error("failed to start WebRTC server: %v", err)
+			log.Error("[Server] failed to start WebRTC server: %v", err)
 		}
 	}
 
@@ -277,7 +277,7 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	if len(s.config.ListenIp) > 0 {
 		netIP = net.ParseIP(s.config.ListenIp)
 		if netIP == nil {
-			log.Error("udp listen ip address is incorrect!")
+			log.Error("[Server] UDP listen IP address is incorrect")
 			return errors.New("udp listen ip address is incorrect")
 		}
 	} else {
@@ -289,7 +289,7 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		Port: s.config.ListenPort,
 	})
 	if err != nil {
-		log.Error("listen error %v", err)
+		log.Error("[Server] listen error on %s: %v", s.listenAddr.String(), err)
 		return fmt.Errorf("listen error: %w", err)
 	}
 
@@ -297,13 +297,13 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	laddr := s.listenConn.LocalAddr()
 	s.listenAddr, err = net.ResolveUDPAddr(laddr.Network(), laddr.String())
 	if err != nil {
-		log.Error("resolve local UDPAddr error %v", err)
+		log.Error("[Server] failed to resolve local UDPAddr: %v", err)
 		return fmt.Errorf("resolve UDPAddr error: %w", err)
 	}
 
 	prk, err := base64.StdEncoding.DecodeString(s.config.PrivateKeyBase64)
 	if err != nil {
-		log.Error("private key parse error %v", err)
+		log.Error("[Server] private key parse error: %v", err)
 		return fmt.Errorf("private key parse error: %w", err)
 	}
 
@@ -339,16 +339,16 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 			log.Info("Remote config not loaded from etcd (key may not exist): %v", err)
 			// Fall back to local config files for HTTP, peers, resources
 			if loadErr := s.loadPeers(); loadErr != nil {
-				log.Error("failed to load peers: %v", loadErr)
+				log.Error("[Server] failed to load peers: %v", loadErr)
 			}
 			if loadErr := s.loadHttpConfig(); loadErr != nil {
-				log.Error("failed to load HTTP config: %v", loadErr)
+				log.Error("[Server] failed to load HTTP config: %v", loadErr)
 			}
 			if loadErr := s.loadSourceIps(); loadErr != nil {
-				log.Error("failed to load source IPs: %v", loadErr)
+				log.Error("[Server] failed to load source IPs: %v", loadErr)
 			}
 			if loadErr := s.loadResources(); loadErr != nil {
-				log.Error("failed to load resources: %v", loadErr)
+				log.Error("[Server] failed to load resources: %v", loadErr)
 			}
 		}
 
@@ -362,21 +362,21 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	} else {
 		// load peers
 		if err := s.loadPeers(); err != nil {
-			log.Error("failed to load peers: %v", err)
+			log.Error("[Server] failed to load peers: %v", err)
 		}
 
 		// load http config and turn on http server if needed
 		if err := s.loadHttpConfig(); err != nil {
-			log.Error("failed to load HTTP config: %v", err)
+			log.Error("[Server] failed to load HTTP config: %v", err)
 		}
 
 		// load ip associated addresses
 		if err := s.loadSourceIps(); err != nil {
-			log.Error("failed to load source IPs: %v", err)
+			log.Error("[Server] failed to load source IPs: %v", err)
 		}
 
 		if err := s.loadResources(); err != nil {
-			log.Error("failed to load resources: %v", err)
+			log.Error("[Server] failed to load resources: %v", err)
 		}
 	}
 
@@ -575,7 +575,7 @@ func (s *UdpServer) recvPacketRoutine() {
 		n, remoteAddr, err := s.listenConn.ReadFromUDP(pkt.Buf[:])
 		if err != nil {
 			s.device.ReleasePoolPacket(pkt)
-			log.Error("Read from UDP error: %v", err)
+			log.Error("[Server] ReadFromUDP on %s failed: %v", s.listenAddr.String(), err)
 			if n == 0 {
 				// listenConn closed
 				return
@@ -590,7 +590,7 @@ func (s *UdpServer) recvPacketRoutine() {
 		// check minimal length
 		if n < pkt.MinimalLength() {
 			s.device.ReleasePoolPacket(pkt)
-			log.Error("Received UDP packet from %s is too short, discard", addrStr)
+			log.Error("[Server] received UDP packet from %s is too short (%d bytes, min %d), discarding", addrStr, n, pkt.MinimalLength())
 			continue
 		}
 
@@ -797,7 +797,7 @@ func (s *UdpServer) connectionRoutine(conn *UdpConn) {
 				continue
 			}
 			if _, sendErr := s.SendPacket(pkt, conn); sendErr != nil {
-				log.Error("failed to send packet to %s: %v", conn.ConnData.RemoteAddr.String(), sendErr)
+				log.Error("[Server] failed to send packet to %s: %v", conn.ConnData.RemoteAddr.String(), sendErr)
 			}
 		}
 	}
@@ -909,57 +909,57 @@ func (s *UdpServer) recvMessageRoutine() {
 				// aynchronously process knock messages with ack response
 				go func() {
 					if knockErr := s.HandleKnockRequest(ppd); knockErr != nil {
-						log.Error("HandleKnockRequest failed: %v", knockErr)
+						log.Error("[Server] HandleKnockRequest failed: %v", knockErr)
 					}
 				}()
 
 			case core.NHP_AOL:
 				// synchronously block and deal with NHP_DOL to ensure future ac messages will be correctly processed. Don't use go routine
 				if err := s.HandleACOnline(ppd); err != nil {
-					log.Error("HandleACOnline failed: %v", err)
+					log.Error("[Server] HandleACOnline failed: %v", err)
 				}
 
 			case core.NHP_DOL:
 				if err := s.HandleDBOnline(ppd); err != nil {
-					log.Error("HandleDBOnline failed: %v", err)
+					log.Error("[Server] HandleDBOnline failed: %v", err)
 				}
 
 			case core.NHP_OTP:
 				go func() {
 					if otpErr := s.HandleOTPRequest(ppd); otpErr != nil {
-						log.Error("HandleOTPRequest failed: %v", otpErr)
+						log.Error("[Server] HandleOTPRequest failed: %v", otpErr)
 					}
 				}()
 
 			case core.NHP_REG:
 				go func() {
 					if regErr := s.HandleRegisterRequest(ppd); regErr != nil {
-						log.Error("HandleRegisterRequest failed: %v", regErr)
+						log.Error("[Server] HandleRegisterRequest failed: %v", regErr)
 					}
 				}()
 
 			case core.NHP_LST:
 				go func() {
 					if listErr := s.HandleListRequest(ppd); listErr != nil {
-						log.Error("HandleListRequest failed: %v", listErr)
+						log.Error("[Server] HandleListRequest failed: %v", listErr)
 					}
 				}()
 			case core.NHP_DAR:
 				go func() {
 					if darErr := s.HandleDHPDARMessage(ppd); darErr != nil {
-						log.Error("HandleDHPDARMessage failed: %v", darErr)
+						log.Error("[Server] HandleDHPDARMessage failed: %v", darErr)
 					}
 				}()
 			case core.NHP_DRG:
 				go func() {
 					if drgErr := s.HandleDHPDRGMessage(ppd); drgErr != nil {
-						log.Error("HandleDHPDRGMessage failed: %v", drgErr)
+						log.Error("[Server] HandleDHPDRGMessage failed: %v", drgErr)
 					}
 				}()
 			case core.NHP_DAV:
 				go func() {
 					if davErr := s.HandleDHPDAVMessage(ppd); davErr != nil {
-						log.Error("HandleDHPDAVMessage failed: %v", davErr)
+						log.Error("[Server] HandleDHPDAVMessage failed: %v", davErr)
 					}
 				}()
 
@@ -1086,7 +1086,7 @@ func (s *UdpServer) ValidatePlugin(h plugins.PluginHandler) bool {
 
 func (s *UdpServer) LoadPlugin(pluginId string, h plugins.PluginHandler) error {
 	if !s.ValidatePlugin(h) {
-		log.Error("Plugin: %s validation failed", pluginId)
+		log.Error("[Server] plugin %s validation failed", pluginId)
 		return errors.New("plugin validation failed")
 	}
 
@@ -1095,7 +1095,7 @@ func (s *UdpServer) LoadPlugin(pluginId string, h plugins.PluginHandler) error {
 	s.pluginHandlerMapMutex.RUnlock()
 	if found {
 		if closeErr := oldHandler.Close(); closeErr != nil {
-			log.Error("failed to close old plugin handler %s: %v", pluginId, closeErr)
+			log.Error("[Server] failed to close old plugin handler %s: %v", pluginId, closeErr)
 		}
 	}
 
@@ -1108,7 +1108,7 @@ func (s *UdpServer) LoadPlugin(pluginId string, h plugins.PluginHandler) error {
 		LocalMac:      &s.localMac,
 	})
 	if err != nil {
-		log.Error("plugin: %s initialization failed, %v", pluginId, err)
+		log.Error("[Server] plugin %s initialization failed: %v", pluginId, err)
 		return err
 	}
 
@@ -1129,7 +1129,7 @@ func (s *UdpServer) ClosePlugins() {
 	for id, handler := range s.pluginHandlerMap {
 		log.Info("closing plugin: %s", id)
 		if closeErr := handler.Close(); closeErr != nil {
-			log.Error("failed to close plugin %s: %v", id, closeErr)
+			log.Error("[Server] failed to close plugin %s: %v", id, closeErr)
 		}
 	}
 }

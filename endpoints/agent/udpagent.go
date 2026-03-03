@@ -184,7 +184,7 @@ func (a *UdpAgent) Start(dirPath string, logLevel int) (err error) {
 
 	// load peers
 	if err := a.loadPeers(); err != nil {
-		log.Error("failed to load peers: %v", err)
+		log.Error("[Agent] failed to load peers: %v", err)
 	}
 
 	a.remoteConnectionMap = make(map[string]*UdpConn)
@@ -195,7 +195,7 @@ func (a *UdpAgent) Start(dirPath string, logLevel int) (err error) {
 
 	// load knock resources
 	if err := a.loadResources(); err != nil {
-		log.Error("failed to load resources: %v", err)
+		log.Error("[Agent] failed to load resources: %v", err)
 	}
 
 	a.recvMsgCh = a.device.DecryptedMsgQueue
@@ -297,7 +297,7 @@ func (a *UdpAgent) newConnection(addr *net.UDPAddr) (conn *UdpConn) {
 	// unlike tcp, udp dial is fast (just socket bind), so no need to run in a thread
 	conn.netConn, err = net.DialUDP("udp", nil, addr)
 	if err != nil {
-		log.Error("could not connect to remote addr %s", addr.String())
+		log.Error("[Agent] failed to dial UDP to remote addr %s: %v", addr.String(), err)
 		return nil
 	}
 
@@ -305,7 +305,7 @@ func (a *UdpAgent) newConnection(addr *net.UDPAddr) (conn *UdpConn) {
 	laddr := conn.netConn.LocalAddr()
 	localAddr, err := net.ResolveUDPAddr(laddr.Network(), laddr.String())
 	if err != nil {
-		log.Error("resolve local UDPAddr error %v", err)
+		log.Error("[Agent] failed to resolve local UDPAddr %s: %v", laddr.String(), err)
 		return nil
 	}
 
@@ -362,7 +362,7 @@ func (a *UdpAgent) sendMessageRoutine() {
 			} else {
 				conn = a.newConnection(md.RemoteAddr)
 				if conn == nil {
-					log.Error("Failed to dial to remote address: %s", addrStr)
+					log.Error("[Agent] failed to create connection to remote address %s", addrStr)
 					continue
 				}
 
@@ -425,7 +425,7 @@ func (a *UdpAgent) recvPacketRoutine(conn *UdpConn) {
 				// udp connection closed, it is not an error
 				return
 			}
-			log.Error("Failed to receive from remote address %s (%v)", addrStr, err)
+			log.Error("[Agent] failed to receive UDP packet from %s: %v", addrStr, err)
 			continue
 		}
 
@@ -435,7 +435,7 @@ func (a *UdpAgent) recvPacketRoutine(conn *UdpConn) {
 		// check minimal length
 		if n < pkt.MinimalLength() {
 			a.device.ReleasePoolPacket(pkt)
-			log.Error("Received UDP packet from %s is too short, discard", addrStr)
+			log.Error("[Agent] received UDP packet from %s is too short (%d bytes, min %d), discarding", addrStr, n, pkt.MinimalLength())
 			continue
 		}
 
@@ -500,7 +500,7 @@ func (a *UdpAgent) connectionRoutine(conn *UdpConn) {
 				continue
 			}
 			if _, sendErr := a.SendPacket(pkt, conn); sendErr != nil {
-				log.Error("failed to send packet to %s: %v", addrStr, sendErr)
+				log.Error("[Agent] failed to send packet to %s: %v", addrStr, sendErr)
 			}
 
 		case pkt, ok := <-conn.ConnData.RecvQueue:
@@ -598,7 +598,7 @@ func (a *UdpAgent) knockResourceRoutine() {
 				defer log.Info("knock %s sub-routine stopped", knockStr)
 				defer func() {
 					if _, exitErr := a.ExitKnockRequest(res); exitErr != nil {
-						log.Error("exit knock request failed for %s: %v", knockStr, exitErr)
+						log.Error("[Agent] exit knock request failed for %s: %v", knockStr, exitErr)
 					}
 				}()
 
@@ -616,7 +616,7 @@ func (a *UdpAgent) knockResourceRoutine() {
 					ackMsg, err := a.Knock(res) // timeout in AgentLocalTransactionTimeoutMs
 					if err != nil {
 						// if error happens wait some time (total AgentLocalTransactionResponseTimeoutMs) to retry
-						log.Error("failed to knock %s, error: %v", knockStr, err)
+						log.Error("[Agent] knock failed for resource %s: %v", knockStr, err)
 						continue // retry knock
 					}
 
@@ -667,7 +667,7 @@ func (a *UdpAgent) dhpKnockResourceRoutine() {
 			a.safeTee.Store(false)
 
 			// if error happens wait some time (total AgentLocalTransactionResponseTimeoutMs) to retry
-			log.Error("failed to knock, error: %v", err)
+			log.Error("[Agent] DHP knock failed: %v", err)
 			// avoid flood attack from server side
 			time.Sleep(core.FailureRetryInterval * time.Second)
 			continue // retry knock
@@ -703,7 +703,7 @@ func (a *UdpAgent) RemoveServer(serverKey string) {
 func (a *UdpAgent) AddResource(res *KnockResource) error {
 	peer := a.FindServerPeerFromResource(res)
 	if peer == nil {
-		log.Error("failed to find corresponding server peer for resource %s", res.Id())
+		log.Error("[Agent] no server peer found for resource %s (server=%s)", res.Id(), res.ServerHost())
 		return common.ErrKnockServerNotFound
 	}
 
@@ -981,7 +981,7 @@ func (a *UdpAgent) SendDARMsgToServer(server *core.UdpPeer, msg common.DARMsg) (
 
 	currTime := time.Now().UnixNano()
 	if !a.IsRunning() {
-		log.Error("server-agentMsgData channel closed or being closed, skip sending")
+		log.Error("[Agent] send channel closed or closing, skipping message send")
 		return false, nil
 	}
 	// device will create or find existing connection and sends the MsgAssembler via that connection
@@ -1000,7 +1000,7 @@ func (a *UdpAgent) SendDARMsgToServer(server *core.UdpPeer, msg common.DARMsg) (
 	}
 
 	if serverPpd.HeaderType != core.NHP_DSA {
-		log.Error("DB(%s#%d)[SendDARMsgToServer] response from server %s has wrong type: %s", msg.DoId, drgMd.TransactionId, server.Ip, core.HeaderTypeToString(serverPpd.HeaderType))
+		log.Error("[Agent] SendDARMsgToServer(%s#%d) response from server %s has wrong type: %s", msg.DoId, drgMd.TransactionId, server.Ip, core.HeaderTypeToString(serverPpd.HeaderType))
 		return false, dagMsg
 	}
 
@@ -1010,7 +1010,7 @@ func (a *UdpAgent) SendDARMsgToServer(server *core.UdpPeer, msg common.DARMsg) (
 	}
 
 	if dsaMsg.ErrCode != 0 {
-		log.Error("SendDARMsgToServer send failed, error: %s", dsaMsg.ErrMsg)
+		log.Error("[Agent] SendDARMsgToServer failed for doId=%s: errCode=%d, errMsg=%s", dsaMsg.DoId, dsaMsg.ErrCode, dsaMsg.ErrMsg)
 		dagMsg.DoId = dsaMsg.DoId
 		dagMsg.ErrCode = dsaMsg.ErrCode
 		dagMsg.ErrMsg = dsaMsg.ErrMsg
@@ -1064,7 +1064,7 @@ func (a *UdpAgent) SendDAVMsgToServer(server *core.UdpPeer, msg common.DAVMsg) (
 
 	currTime := time.Now().UnixNano()
 	if !a.IsRunning() {
-		log.Error("server-agentMsgData channel closed or being closed, skip sending")
+		log.Error("[Agent] send channel closed or closing, skipping message send")
 		return false, nil
 	}
 	// device will create or find existing connection and sends the MsgAssembler via that connection
@@ -1081,7 +1081,7 @@ func (a *UdpAgent) SendDAVMsgToServer(server *core.UdpPeer, msg common.DAVMsg) (
 	}
 
 	if serverPpd.HeaderType != core.NHP_DAG {
-		log.Error("DB(%s#%d)[SendDAVMsgToServer] response from server %s has wrong type: %s", msg.DoId, davMd.TransactionId, server.Ip, core.HeaderTypeToString(serverPpd.HeaderType))
+		log.Error("[Agent] SendDAVMsgToServer(%s#%d) response from server %s has wrong type: %s", msg.DoId, davMd.TransactionId, server.Ip, core.HeaderTypeToString(serverPpd.HeaderType))
 		return false, dagMsg
 	}
 
@@ -1091,7 +1091,7 @@ func (a *UdpAgent) SendDAVMsgToServer(server *core.UdpPeer, msg common.DAVMsg) (
 	}
 
 	if dagMsg.ErrCode != 0 {
-		log.Error("SendDAVMsgToServer send failed, error: %s", dagMsg.ErrMsg)
+		log.Error("[Agent] SendDAVMsgToServer failed for doId=%s: errCode=%d, errMsg=%s", dagMsg.DoId, dagMsg.ErrCode, dagMsg.ErrMsg)
 		return false, dagMsg
 	}
 

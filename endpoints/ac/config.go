@@ -88,11 +88,11 @@ func (a *UdpAC) loadBaseConfig() error {
 	}
 
 	baseConfigWatch = utils.WatchFile(fileName, func() {
-		log.Info("base config: %s has been updated", fileName)
+		log.Info("[AC] base config %s has been updated, reloading", fileName)
 		if content, err = a.loadConfigFile(fileName); err == nil {
 			if err = toml.Unmarshal(content, &conf); err == nil {
 				if updateErr := a.updateBaseConfig(conf); updateErr != nil {
-					log.Error("failed to apply base config update: %v", updateErr)
+					log.Error("[AC] failed to apply base config update from %s: %v", fileName, updateErr)
 				}
 			}
 
@@ -123,11 +123,11 @@ func (a *UdpAC) loadHttpConfig() error {
 	}
 
 	httpConfigWatch = utils.WatchFile(fileName, func() {
-		log.Info("http config: %s has been updated", fileName)
+		log.Info("[AC] http config %s has been updated, reloading", fileName)
 		if content, err = a.loadConfigFile(fileName); err == nil {
 			if err = toml.Unmarshal(content, &httpConf); err == nil {
 				if updateErr := a.updateHttpConfig(httpConf); updateErr != nil {
-					log.Error("failed to apply http config update: %v", updateErr)
+					log.Error("[AC] failed to apply http config update from %s: %v", fileName, updateErr)
 				}
 			}
 		}
@@ -160,11 +160,11 @@ func (a *UdpAC) loadPeers() error {
 	}
 
 	serverPeerWatch = utils.WatchFile(fileName, func() {
-		log.Info("server peer config: %s has been updated", fileName)
+		log.Info("[AC] server peer config %s has been updated, reloading", fileName)
 		if content, err = a.loadConfigFile(fileName); err == nil {
 			if err = toml.Unmarshal(content, &peers); err == nil {
 				if updateErr := a.updateServerPeers(peers.Servers); updateErr != nil {
-					log.Error("failed to apply server peers update: %v", updateErr)
+					log.Error("[AC] failed to apply server peer update from %s: %v", fileName, updateErr)
 				}
 			}
 		}
@@ -276,7 +276,7 @@ func (a *UdpAC) loadConfigFile(file string) (content []byte, err error) {
 	})
 	content, err = os.ReadFile(file)
 	if err != nil {
-		log.Error("failed to read base config: %v", err)
+		log.Error("[AC] failed to read config file %s: %v", file, err)
 	}
 	return
 }

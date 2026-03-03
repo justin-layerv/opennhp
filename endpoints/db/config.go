@@ -55,9 +55,9 @@ func (a *UdpDevice) loadBaseConfig() error {
 	}
 
 	baseConfigWatch = utils.WatchFile(fileName, func() {
-		log.Info("base config: %s has been updated", fileName)
+		log.Info("[DB] base config %s has been updated, reloading", fileName)
 		if updateErr := a.updateBaseConfig(fileName); updateErr != nil {
-			log.Error("failed to apply base config update: %v", updateErr)
+			log.Error("[DB] failed to apply base config update from %s: %v", fileName, updateErr)
 		}
 	})
 	return nil
@@ -72,9 +72,9 @@ func (a *UdpDevice) loadPeers() error {
 	}
 
 	serverConfigWatch = utils.WatchFile(fileName, func() {
-		log.Info("server peer config: %s has been updated", fileName)
+		log.Info("[DB] server peer config %s has been updated, reloading", fileName)
 		if updateErr := a.updateServerPeers(fileName); updateErr != nil {
-			log.Error("failed to apply server peer config update: %v", updateErr)
+			log.Error("[DB] failed to apply server peer update from %s: %v", fileName, updateErr)
 		}
 	})
 
@@ -90,9 +90,9 @@ func (a *UdpDevice) loadTEEs() error {
 	}
 
 	teesConfigWatch = utils.WatchFile(fileName, func() {
-		log.Info("tee peer config: %s has been updated", fileName)
+		log.Info("[DB] TEE config %s has been updated, reloading", fileName)
 		if updateErr := a.updateTEEConfig(fileName); updateErr != nil {
-			log.Error("failed to apply TEE config update: %v", updateErr)
+			log.Error("[DB] failed to apply TEE config update from %s: %v", fileName, updateErr)
 		}
 	})
 
@@ -106,13 +106,13 @@ func (a *UdpDevice) updateBaseConfig(file string) (err error) {
 
 	content, err := os.ReadFile(file)
 	if err != nil {
-		log.Error("failed to read base config: %v", err)
+		log.Error("[DB] failed to read base config %s: %v", file, err)
 		return err
 	}
 
 	var conf Config
 	if err := toml.Unmarshal(content, &conf); err != nil {
-		log.Error("failed to unmarshal base config: %v", err)
+		log.Error("[DB] failed to parse base config %s: %v", file, err)
 		return err
 	}
 	if a.config == nil {
@@ -143,14 +143,14 @@ func (a *UdpDevice) updateServerPeers(file string) (err error) {
 
 	content, err := os.ReadFile(file)
 	if err != nil {
-		log.Error("failed to read server peer config: %v", err)
+		log.Error("[DB] failed to read server peer config %s: %v", file, err)
 		return err
 	}
 
 	var peers Peers
 	serverPeerMap := make(map[string]*core.UdpPeer)
 	if err := toml.Unmarshal(content, &peers); err != nil {
-		log.Error("failed to unmarshal server config: %v", err)
+		log.Error("[DB] failed to parse server peer config %s: %v", file, err)
 		return err
 	}
 	for _, p := range peers.Servers {
@@ -179,13 +179,13 @@ func (a *UdpDevice) updateTEEConfig(file string) (err error) {
 
 	content, err := os.ReadFile(file)
 	if err != nil {
-		log.Error("failed to read TEE config: %v", err)
+		log.Error("[DB] failed to read TEE config %s: %v", file, err)
 		return err
 	}
 
 	var tees TEEs
 	if err := toml.Unmarshal(content, &tees); err != nil {
-		log.Error("failed to unmarshal TEE config: %v", err)
+		log.Error("[DB] failed to parse TEE config %s: %v", file, err)
 		return err
 	}
 

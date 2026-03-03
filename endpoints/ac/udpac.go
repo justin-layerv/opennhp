@@ -247,7 +247,7 @@ func (a *UdpAC) newConnection(addr *net.UDPAddr) (conn *UdpConn) {
 	}
 	conn.netConn, err = net.ListenUDP(network, &net.UDPAddr{IP: localIP, Port: 0})
 	if err != nil {
-		log.Error("could not create UDP socket for remote addr %s: %v", addr.String(), err)
+		log.Error("[AC] failed to create UDP socket (%s) for remote addr %s: %v", network, addr.String(), err)
 		return nil
 	}
 
@@ -255,7 +255,7 @@ func (a *UdpAC) newConnection(addr *net.UDPAddr) (conn *UdpConn) {
 	laddr := conn.netConn.LocalAddr()
 	localAddr, err := net.ResolveUDPAddr(laddr.Network(), laddr.String())
 	if err != nil {
-		log.Error("resolve local UDPAddr error %v", err)
+		log.Error("[AC] failed to resolve local UDPAddr %s: %v", laddr.String(), err)
 		_ = conn.netConn.Close()
 		return nil
 	}
@@ -314,7 +314,7 @@ func (a *UdpAC) sendMessageRoutine() {
 			} else {
 				conn = a.newConnection(md.RemoteAddr)
 				if conn == nil {
-					log.Error("Failed to dial to remote address: %s", addrStr)
+					log.Error("[AC] failed to create connection to remote address %s", addrStr)
 					continue
 				}
 
@@ -379,7 +379,7 @@ func (a *UdpAC) recvPacketRoutine(conn *UdpConn) {
 				// udp connection closed, it is not an error
 				return
 			}
-			log.Error("Failed to receive from remote address %s (%v)", addrStr, err)
+			log.Error("[AC] failed to receive UDP packet from %s: %v", addrStr, err)
 			continue
 		}
 		// Log the actual source address for debugging (may differ from expected remote)
@@ -395,7 +395,7 @@ func (a *UdpAC) recvPacketRoutine(conn *UdpConn) {
 		// check minimal length
 		if n < pkt.MinimalLength() {
 			a.device.ReleasePoolPacket(pkt)
-			log.Error("Received UDP packet from %s is too short (%d bytes, min %d), discard", actualSource, n, pkt.MinimalLength())
+			log.Error("[AC] received UDP packet from %s is too short (%d bytes, min %d), discarding", actualSource, n, pkt.MinimalLength())
 			continue
 		}
 

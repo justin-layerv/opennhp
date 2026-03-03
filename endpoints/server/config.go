@@ -125,11 +125,11 @@ func (s *UdpServer) loadBaseConfig() error {
 	}
 
 	baseConfigWatch = utils.WatchFile(fileName, func() {
-		log.Info("base config: %s has been updated", fileName)
+		log.Info("[Server] base config %s has been updated, reloading", fileName)
 		if content, err = s.loadConfigFile(fileName); err == nil {
 			if err = toml.Unmarshal(content, &config); err == nil {
 				if updateErr := s.updateBaseConfig(config); updateErr != nil {
-					log.Error("failed to apply base config update: %v", updateErr)
+					log.Error("[Server] failed to apply base config update from %s: %v", fileName, updateErr)
 				}
 			}
 
@@ -160,11 +160,11 @@ func (s *UdpServer) loadHttpConfig() error {
 	}
 
 	httpConfigWatch = utils.WatchFile(fileName, func() {
-		log.Info("http config: %s has been updated", fileName)
+		log.Info("[Server] http config %s has been updated, reloading", fileName)
 		if content, err = s.loadConfigFile(fileName); err == nil {
 			if err = toml.Unmarshal(content, &httpConf); err == nil {
 				if updateErr := s.updateHttpConfig(httpConf); updateErr != nil {
-					log.Error("failed to apply http config update: %v", updateErr)
+					log.Error("[Server] failed to apply http config update from %s: %v", fileName, updateErr)
 				}
 			}
 		}
@@ -190,11 +190,11 @@ func (s *UdpServer) loadPeers() error {
 			return fmt.Errorf("failed to apply AC peers: %w", err)
 		}
 		acConfigWatch = utils.WatchFile(fileNameAC, func() {
-			log.Info("ac peer config: %s has been updated", fileNameAC)
+			log.Info("[Server] AC peer config %s has been updated, reloading", fileNameAC)
 			if contentAC, err = s.loadConfigFile(fileNameAC); err == nil {
 				if err = toml.Unmarshal(contentAC, &acPeers); err == nil {
 					if updateErr := s.updateACPeers(acPeers.ACs); updateErr != nil {
-						log.Error("failed to apply AC peers update: %v", updateErr)
+						log.Error("[Server] failed to apply AC peer update from %s: %v", fileNameAC, updateErr)
 					}
 				}
 			}
@@ -218,11 +218,11 @@ func (s *UdpServer) loadPeers() error {
 			return fmt.Errorf("failed to apply agent peers: %w", err)
 		}
 		agentConfigWatch = utils.WatchFile(fileNameAgent, func() {
-			log.Info("agent peer config: %s has been updated", fileNameAgent)
+			log.Info("[Server] agent peer config %s has been updated, reloading", fileNameAgent)
 			if contentAgent, err = s.loadConfigFile(fileNameAgent); err == nil {
 				if err = toml.Unmarshal(contentAgent, &agentPeers); err == nil {
 					if updateErr := s.updateAgentPeers(agentPeers.Agents); updateErr != nil {
-						log.Error("failed to apply agent peers update: %v", updateErr)
+						log.Error("[Server] failed to apply agent peer update from %s: %v", fileNameAgent, updateErr)
 					}
 				}
 			}
@@ -246,11 +246,11 @@ func (s *UdpServer) loadPeers() error {
 			return fmt.Errorf("failed to apply DB peers: %w", err)
 		}
 		dbConfigWatch = utils.WatchFile(fileNameDE, func() {
-			log.Info("device peer config: %s has been updated", fileNameDE)
+			log.Info("[Server] DB peer config %s has been updated, reloading", fileNameDE)
 			if contentDE, err = s.loadConfigFile(fileNameDE); err == nil {
 				if err = toml.Unmarshal(contentDE, &dePeers); err == nil {
 					if updateErr := s.updateDePeers(dePeers.DBs); updateErr != nil {
-						log.Error("failed to apply DB peers update: %v", updateErr)
+						log.Error("[Server] failed to apply DB peer update from %s: %v", fileNameDE, updateErr)
 					}
 				}
 			}
@@ -260,12 +260,12 @@ func (s *UdpServer) loadPeers() error {
 	// tee.toml - optional, errors handled inside updateTee
 	fileNameTee := filepath.Join(ExeDirPath, "etc", "tee.toml")
 	if err := s.updateTee(fileNameTee); err != nil {
-		log.Error("failed to load tee config: %v", err)
+		log.Error("[Server] failed to load TEE config from %s: %v", fileNameTee, err)
 	}
 	teeWatch = utils.WatchFile(fileNameTee, func() {
-		log.Info("tee: %s has been updated", fileNameTee)
+		log.Info("[Server] TEE config %s has been updated, reloading", fileNameTee)
 		if err := s.updateTee(fileNameTee); err != nil {
-			log.Error("failed to apply tee config update: %v", err)
+			log.Error("[Server] failed to apply TEE config update from %s: %v", fileNameTee, err)
 		}
 	})
 
@@ -277,29 +277,29 @@ func (s *UdpServer) loadResources() error {
 	fileName := filepath.Join(ExeDirPath, "etc", "resource.toml")
 	content, err := os.ReadFile(fileName)
 	if err != nil {
-		log.Error("failed to read resource config: %v", err)
+		log.Error("[Server] failed to read resource config %s: %v", fileName, err)
 		return nil // optional config, watcher will pick up changes
 	}
 	aspMap := make(common.AuthSvcProviderMap)
 	// update
 	if err := toml.Unmarshal(content, &aspMap); err != nil {
-		log.Error("failed to unmarshal resource config: %v", err)
+		log.Error("[Server] failed to parse resource config %s: %v", fileName, err)
 		return nil
 	}
 	if err := s.updateResources(aspMap); err != nil {
-		log.Error("failed to apply resource config: %v", err)
+		log.Error("[Server] failed to apply resource config from %s: %v", fileName, err)
 	}
 
 	resConfigWatch = utils.WatchFile(fileName, func() {
-		log.Info("resource config: %s has been updated", fileName)
+		log.Info("[Server] resource config %s has been updated, reloading", fileName)
 		if content, err := s.loadConfigFile(fileName); err == nil {
 			freshAspMap := make(common.AuthSvcProviderMap)
 			if err := toml.Unmarshal(content, &freshAspMap); err == nil {
 				if updateErr := s.updateResources(freshAspMap); updateErr != nil {
-					log.Error("failed to apply resource config update: %v", updateErr)
+					log.Error("[Server] failed to apply resource config update from %s: %v", fileName, updateErr)
 				}
 			} else {
-				log.Error("failed to unmarshal updated resource config: %v", err)
+				log.Error("[Server] failed to parse resource config %s on reload: %v", fileName, err)
 			}
 		}
 	})
@@ -311,26 +311,26 @@ func (s *UdpServer) loadSourceIps() error {
 	fileName := filepath.Join(ExeDirPath, "etc", "srcip.toml")
 	content, err := os.ReadFile(fileName)
 	if err != nil {
-		log.Error("failed to read src ip config: %v", err)
+		log.Error("[Server] failed to read source IP config %s: %v", fileName, err)
 		return nil // optional config, watcher will pick up changes
 	}
 
 	// update
 	srcIpMap := make(map[string][]*common.NetAddress)
 	if err := toml.Unmarshal(content, &srcIpMap); err != nil {
-		log.Error("failed to unmarshal src ip config: %v", err)
+		log.Error("[Server] failed to parse source IP config %s: %v", fileName, err)
 		return nil
 	}
 	if err := s.updateSourceIps(srcIpMap); err != nil {
-		log.Error("failed to apply source IP config: %v", err)
+		log.Error("[Server] failed to apply source IP config from %s: %v", fileName, err)
 	}
 
 	srcipConfigWatch = utils.WatchFile(fileName, func() {
-		log.Info("src ip config: %s has been updated", fileName)
+		log.Info("[Server] source IP config %s has been updated, reloading", fileName)
 		if content, err = s.loadConfigFile(fileName); err == nil {
 			if err = toml.Unmarshal(content, &srcIpMap); err == nil {
 				if updateErr := s.updateSourceIps(srcIpMap); updateErr != nil {
-					log.Error("failed to apply source IP config update: %v", updateErr)
+					log.Error("[Server] failed to apply source IP config update from %s: %v", fileName, updateErr)
 				}
 			}
 		}
@@ -350,24 +350,24 @@ func (s *UdpServer) initRemoteConn() error {
 
 	content, err := os.ReadFile(fileName)
 	if err != nil {
-		log.Error("failed to read remote config: %v", err)
+		log.Error("[Server] failed to read remote config %s: %v", fileName, err)
 		return err
 	}
 
 	var conf RemoteConfig
 	if err = toml.Unmarshal(content, &conf); err != nil {
-		log.Error("failed to unmarshal remote config: %v", err)
+		log.Error("[Server] failed to parse remote config %s: %v", fileName, err)
 		return err
 	}
 
 	if strings.EqualFold(conf.Provider, "etcd") {
 		if len(conf.Endpoints) == 0 {
-			log.Error("remote config has no endpoints,open nhp server will startup with local configuration")
+			log.Error("[Server] remote config %s has no endpoints, falling back to local configuration", fileName)
 			return nil
 		}
 
 		if len(conf.Key) == 0 {
-			log.Error("remote config has no key,open nhp server will startup with local configuration")
+			log.Error("[Server] remote config %s has no key, falling back to local configuration", fileName)
 			return nil
 		}
 
@@ -401,8 +401,8 @@ func (s *UdpServer) loadRemoteConfig() error {
 	go s.etcdConn.WatchValue(func(val []byte) {
 		s.remoteConfigUpdateMutex.Lock()
 		defer s.remoteConfigUpdateMutex.Unlock()
-		if err := s.updateEtcdConfig(val, true); err != nil {
-			log.Error("failed to apply etcd config update: %v", err)
+		if updateErr := s.updateEtcdConfig(val, true); updateErr != nil {
+			log.Error("[Server] failed to apply etcd config update (%d bytes): %v", len(val), updateErr)
 		}
 	})
 
@@ -417,7 +417,7 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 	log.Info("Parsing etcd config (%d bytes): %q", len(content), string(content))
 	var serverEtcdConfig ServerEtcdConfig
 	if err = toml.Unmarshal(content, &serverEtcdConfig); err != nil {
-		log.Error("failed to unmarshal remote config: %v", err)
+		log.Error("[Server] failed to parse etcd config (%d bytes): %v", len(content), err)
 		return err
 	}
 	log.Info("Unmarshaled serverEtcdConfig.AuthServiceId has %d entries", len(serverEtcdConfig.AuthServiceId))
@@ -434,7 +434,7 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 	// This allows etcd to be used purely for AC registry without requiring HttpConfig.
 	if serverEtcdConfig.HttpConfig.EnableHttp || serverEtcdConfig.HttpConfig.HttpListenPort > 0 {
 		if updateErr := s.updateHttpConfig(serverEtcdConfig.HttpConfig); updateErr != nil {
-			log.Error("failed to apply http config from etcd: %v", updateErr)
+			log.Error("[Server] failed to apply http config from etcd: %v", updateErr)
 		}
 	}
 
@@ -445,7 +445,7 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 	if len(serverEtcdConfig.ACs) > 0 {
 		log.Info("Updating %d AC peers from etcd config", len(serverEtcdConfig.ACs))
 		if updateErr := s.updateACPeers(serverEtcdConfig.ACs); updateErr != nil {
-			log.Error("failed to apply AC peers from etcd: %v", updateErr)
+			log.Error("[Server] failed to apply AC peers from etcd: %v", updateErr)
 		}
 	} else {
 		log.Debug("No [[ACs]] in etcd config, preserving existing AC peers (registry mode)")
@@ -453,7 +453,7 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 	if len(serverEtcdConfig.Agents) > 0 {
 		log.Info("Updating %d Agent peers from etcd config", len(serverEtcdConfig.Agents))
 		if updateErr := s.updateAgentPeers(serverEtcdConfig.Agents); updateErr != nil {
-			log.Error("failed to apply agent peers from etcd: %v", updateErr)
+			log.Error("[Server] failed to apply agent peers from etcd: %v", updateErr)
 		}
 	} else {
 		log.Debug("No [[Agents]] in etcd config, preserving existing Agent peers")
@@ -461,7 +461,7 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 	if len(serverEtcdConfig.DBs) > 0 {
 		log.Info("Updating %d DB peers from etcd config", len(serverEtcdConfig.DBs))
 		if updateErr := s.updateDePeers(serverEtcdConfig.DBs); updateErr != nil {
-			log.Error("failed to apply DB peers from etcd: %v", updateErr)
+			log.Error("[Server] failed to apply DB peers from etcd: %v", updateErr)
 		}
 	} else {
 		log.Debug("No [[DBs]] in etcd config, preserving existing DB peers")
@@ -480,7 +480,7 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 			log.Debug("  AuthServiceId[%s]: PluginPath=%q", aspId, aspData.PluginPath)
 		}
 		if updateErr := s.updateResources(aspMap); updateErr != nil {
-			log.Error("failed to apply resources from etcd: %v", updateErr)
+			log.Error("[Server] failed to apply resources from etcd: %v", updateErr)
 		}
 	} else {
 		log.Info("No AuthServiceId in etcd config, using local resource.toml")
@@ -498,7 +498,7 @@ func (s *UdpServer) updateEtcdConfig(content []byte, baseLoad bool) (err error) 
 		srcIpMap[srcIp.SrcIp] = ips
 	}
 	if updateErr := s.updateSourceIps(srcIpMap); updateErr != nil {
-		log.Error("failed to apply source IPs from etcd: %v", updateErr)
+		log.Error("[Server] failed to apply source IPs from etcd: %v", updateErr)
 	}
 
 	return nil
@@ -510,7 +510,7 @@ func (s *UdpServer) loadConfigFile(file string) (content []byte, err error) {
 	})
 	content, err = os.ReadFile(file)
 	if err != nil {
-		log.Error("failed to read base config: %v", err)
+		log.Error("[Server] failed to read config file %s: %v", file, err)
 	}
 	return
 }
@@ -720,14 +720,14 @@ func (s *UdpServer) updateTee(file string) (err error) {
 
 	content, err := os.ReadFile(file)
 	if err != nil {
-		log.Error("failed to read tee config: %v", err)
+		log.Error("[Server] failed to read TEE config %s: %v", file, err)
 		return err
 	}
 
 	var tees TeeAttestationReports
 	teeMap := make(map[string]*TeeAttestationReport)
 	if err := toml.Unmarshal(content, &tees); err != nil {
-		log.Error("failed to unmarshal device peer config: %v", err)
+		log.Error("[Server] failed to parse TEE config %s: %v", file, err)
 		return err
 	}
 	for _, tee := range tees.TEEs {

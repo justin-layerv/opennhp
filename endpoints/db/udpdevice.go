@@ -151,12 +151,12 @@ func (a *UdpDevice) Start(dirPath string, logLevel int) (err error) {
 
 	// load peers
 	if err := a.loadPeers(); err != nil {
-		log.Error("failed to load peers: %v", err)
+		log.Error("[DB] failed to load peers: %v", err)
 	}
 
 	// load TEEs
 	if err := a.loadTEEs(); err != nil {
-		log.Error("failed to load TEEs: %v", err)
+		log.Error("[DB] failed to load TEEs: %v", err)
 	}
 
 	a.signals.stop = make(chan struct{})
@@ -206,7 +206,7 @@ func (a *UdpDevice) newConnection(addr *net.UDPAddr) (conn *UdpConn) {
 	// unlike tcp, udp dial is fast (just socket bind), so no need to run in a thread
 	conn.netConn, err = net.DialUDP("udp", nil, addr)
 	if err != nil {
-		log.Error("could not connect to remote addr %s", addr.String())
+		log.Error("[DB] failed to dial UDP to remote addr %s: %v", addr.String(), err)
 		return nil
 	}
 
@@ -214,7 +214,7 @@ func (a *UdpDevice) newConnection(addr *net.UDPAddr) (conn *UdpConn) {
 	laddr := conn.netConn.LocalAddr()
 	localAddr, err := net.ResolveUDPAddr(laddr.Network(), laddr.String())
 	if err != nil {
-		log.Error("resolve local UDPAddr error %v", err)
+		log.Error("[DB] failed to resolve local UDPAddr %s: %v", laddr.String(), err)
 		return nil
 	}
 
@@ -271,7 +271,7 @@ func (a *UdpDevice) sendMessageRoutine() {
 			} else {
 				conn = a.newConnection(md.RemoteAddr)
 				if conn == nil {
-					log.Error("Failed to dial to remote address: %s", addrStr)
+					log.Error("[DB] failed to create connection to remote address %s", addrStr)
 					continue
 				}
 
@@ -334,7 +334,7 @@ func (a *UdpDevice) recvPacketRoutine(conn *UdpConn) {
 				// udp connection closed, it is not an error
 				return
 			}
-			log.Error("Failed to receive from remote address %s (%v)", addrStr, err)
+			log.Error("[DB] failed to receive UDP packet from %s: %v", addrStr, err)
 			continue
 		}
 
@@ -344,7 +344,7 @@ func (a *UdpDevice) recvPacketRoutine(conn *UdpConn) {
 		// check minimal length
 		if n < pkt.MinimalLength() {
 			a.device.ReleasePoolPacket(pkt)
-			log.Error("Received UDP packet from %s is too short, discard", addrStr)
+			log.Error("[DB] received UDP packet from %s is too short (%d bytes, min %d), discarding", addrStr, n, pkt.MinimalLength())
 			continue
 		}
 
@@ -409,7 +409,7 @@ func (a *UdpDevice) connectionRoutine(conn *UdpConn) {
 				continue
 			}
 			if _, sendErr := a.SendPacket(pkt, conn); sendErr != nil {
-				log.Error("failed to send packet to %s: %v", addrStr, sendErr)
+				log.Error("[DB] failed to send packet to %s: %v", addrStr, sendErr)
 			}
 
 		case pkt, ok := <-conn.ConnData.RecvQueue:
@@ -476,7 +476,7 @@ func (a *UdpDevice) recvMessageRoutine() {
 				a.wg.Add(1)
 				go func() {
 					if opErr := a.HandleUdpDataKeyWrappingOperations(ppd); opErr != nil {
-						log.Error("HandleUdpDataKeyWrappingOperations failed: %v", opErr)
+						log.Error("[DB] HandleUdpDataKeyWrappingOperations failed: %v", opErr)
 					}
 				}()
 			}
@@ -533,7 +533,7 @@ func (a *UdpDevice) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sy
 	dbId := a.config.DbId
 	sendAddr := server.SendAddr()
 	if sendAddr == nil {
-		log.Error("Cannot connect to nil server address")
+		log.Error("[DB] cannot resolve server address for peer %s (ip=%s, port=%d)", server.Hostname, server.Ip, server.Port)
 		return
 	}
 
@@ -739,7 +739,7 @@ func (a *UdpDevice) SendNHPDRG(server *core.UdpPeer, msg common.DRGMsg) bool {
 	}
 	currTime := time.Now().UnixNano()
 	if !a.IsRunning() {
-		log.Error("server-deviceMsgData channel closed or being closed, skip sending")
+		log.Error("[DB] send channel closed or closing, skipping NHP_DRG for doId=%s", msg.DoId)
 		return false
 	}
 	// device will create or find existing connection and sends the MsgAssembler via that connection
@@ -766,7 +766,7 @@ func (a *UdpDevice) SendNHPDRG(server *core.UdpPeer, msg common.DRGMsg) bool {
 	}
 
 	if dakMsg.ErrCode != 0 {
-		log.Error("SendNHPDRG send failed, error: %s", dakMsg.ErrMsg)
+		log.Error("[DB] SendNHPDRG failed for doId=%s: errCode=%d, errMsg=%s", msg.DoId, dakMsg.ErrCode, dakMsg.ErrMsg)
 		return false
 	}
 

@@ -68,9 +68,9 @@ func (a *UdpAgent) loadBaseConfig() error {
 	}
 
 	baseConfigWatch = utils.WatchFile(fileName, func() {
-		log.Info("base config: %s has been updated", fileName)
+		log.Info("[Agent] base config %s has been updated, reloading", fileName)
 		if updateErr := a.updateBaseConfig(fileName); updateErr != nil {
-			log.Error("failed to apply base config update: %v", updateErr)
+			log.Error("[Agent] failed to apply base config update from %s: %v", fileName, updateErr)
 		}
 	})
 	return nil
@@ -85,9 +85,9 @@ func (a *UdpAgent) loadDHPConfig() error {
 	}
 
 	dhpConfigWatch = utils.WatchFile(fileName, func() {
-		log.Info("DHP config: %s has been updated", fileName)
+		log.Info("[Agent] DHP config %s has been updated, reloading", fileName)
 		if updateErr := a.updateDHPConfig(fileName); updateErr != nil {
-			log.Error("failed to apply DHP config update: %v", updateErr)
+			log.Error("[Agent] failed to apply DHP config update from %s: %v", fileName, updateErr)
 		}
 	})
 
@@ -103,9 +103,9 @@ func (a *UdpAgent) loadPeers() error {
 	}
 
 	serverConfigWatch = utils.WatchFile(fileName, func() {
-		log.Info("server peer config: %s has been updated", fileName)
+		log.Info("[Agent] server peer config %s has been updated, reloading", fileName)
 		if updateErr := a.updateServerPeers(fileName); updateErr != nil {
-			log.Error("failed to apply server peers update: %v", updateErr)
+			log.Error("[Agent] failed to apply server peer update from %s: %v", fileName, updateErr)
 		}
 	})
 
@@ -121,9 +121,9 @@ func (a *UdpAgent) loadResources() error {
 	}
 
 	resourceConfigWatch = utils.WatchFile(fileName, func() {
-		log.Info("resource config: %s has been updated", fileName)
+		log.Info("[Agent] resource config %s has been updated, reloading", fileName)
 		if updateErr := a.updateResources(fileName); updateErr != nil {
-			log.Error("failed to apply resource config update: %v", updateErr)
+			log.Error("[Agent] failed to apply resource config update from %s: %v", fileName, updateErr)
 		}
 	})
 
@@ -137,13 +137,13 @@ func (a *UdpAgent) updateBaseConfig(file string) (err error) {
 
 	content, err := os.ReadFile(file)
 	if err != nil {
-		log.Error("failed to read base config: %v", err)
+		log.Error("[Agent] failed to read base config %s: %v", file, err)
 		return err
 	}
 
 	var conf Config
 	if err := toml.Unmarshal(content, &conf); err != nil {
-		log.Error("failed to unmarshal base config: %v", err)
+		log.Error("[Agent] failed to parse base config %s: %v", file, err)
 		return err
 	}
 
@@ -183,13 +183,13 @@ func (a *UdpAgent) updateDHPConfig(file string) (err error) {
 
 	content, err := os.ReadFile(file)
 	if err != nil {
-		log.Error("failed to read DHP config: %v", err)
+		log.Error("[Agent] failed to read DHP config %s: %v", file, err)
 		return err
 	}
 
 	var conf DHPConfig
 	if err := toml.Unmarshal(content, &conf); err != nil {
-		log.Error("failed to unmarshal DHP config: %v", err)
+		log.Error("[Agent] failed to parse DHP config %s: %v", file, err)
 		return err
 	}
 
@@ -208,7 +208,7 @@ func (a *UdpAgent) updateServerPeers(file string) (err error) {
 
 	content, err := os.ReadFile(file)
 	if err != nil {
-		log.Error("failed to read server peer config: %v", err)
+		log.Error("[Agent] failed to read server peer config %s: %v", file, err)
 		return err
 	}
 
@@ -216,7 +216,7 @@ func (a *UdpAgent) updateServerPeers(file string) (err error) {
 	var peers Peers
 	serverPeerMap := make(map[string]*core.UdpPeer)
 	if err := toml.Unmarshal(content, &peers); err != nil {
-		log.Error("failed to unmarshal server config: %v", err)
+		log.Error("[Agent] failed to parse server peer config %s: %v", file, err)
 		return err
 	}
 	for _, p := range peers.Servers {
@@ -245,20 +245,20 @@ func (a *UdpAgent) updateResources(file string) (err error) {
 
 	content, err := os.ReadFile(file)
 	if err != nil {
-		log.Error("failed to read resource config: %v", err)
+		log.Error("[Agent] failed to read resource config %s: %v", file, err)
 		return err
 	}
 
 	var resources Resources
 	targetMap := make(map[string]*KnockTarget)
 	if err := toml.Unmarshal(content, &resources); err != nil {
-		log.Error("failed to unmarshal resource config: %v", err)
+		log.Error("[Agent] failed to parse resource config %s: %v", file, err)
 		return err
 	}
 	for _, res := range resources.Resources {
 		peer := a.FindServerPeerFromResource(res)
 		if peer == nil {
-			log.Error("failed to find corresponding server peer for resource %s", res.Id())
+			log.Error("[Agent] no server peer found for resource %s (server=%s)", res.Id(), res.ServerHost())
 			continue
 		}
 		targetMap[res.Id()] = &KnockTarget{
