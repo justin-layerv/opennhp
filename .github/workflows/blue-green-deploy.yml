@@ -127,14 +127,14 @@ jobs:
         run: |
           COMPONENT="${{ inputs.component }}"
           if [[ "$COMPONENT" == "server" || "$COMPONENT" == "both" ]]; then
-            echo "deploy_server=true" >> $GITHUB_OUTPUT
+            echo "deploy_server=true" >> "$GITHUB_OUTPUT"
           else
-            echo "deploy_server=false" >> $GITHUB_OUTPUT
+            echo "deploy_server=false" >> "$GITHUB_OUTPUT"
           fi
           if [[ "$COMPONENT" == "ac" || "$COMPONENT" == "both" ]]; then
-            echo "deploy_ac=true" >> $GITHUB_OUTPUT
+            echo "deploy_ac=true" >> "$GITHUB_OUTPUT"
           else
-            echo "deploy_ac=false" >> $GITHUB_OUTPUT
+            echo "deploy_ac=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Read Server SSM State
@@ -155,7 +155,7 @@ jobs:
           if [[ -z "$ACTIVE_COLOR" ]]; then
             if [[ "$COMPONENT" == "both" ]]; then
               echo "::warning::Server blue/green not enabled - skipping server deployment"
-              echo "enabled=false" >> $GITHUB_OUTPUT
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
               exit 0
             else
               echo "::error::Server blue/green not enabled - SSM parameter ${SSM_BASE}/active-color not found"
@@ -163,15 +163,15 @@ jobs:
               exit 1
             fi
           fi
-          echo "enabled=true" >> $GITHUB_OUTPUT
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
 
           echo "Server active color: $ACTIVE_COLOR"
-          echo "active_color=$ACTIVE_COLOR" >> $GITHUB_OUTPUT
+          echo "active_color=$ACTIVE_COLOR" >> "$GITHUB_OUTPUT"
 
           if [[ "$ACTIVE_COLOR" == "blue" ]]; then
-            echo "standby_color=green" >> $GITHUB_OUTPUT
+            echo "standby_color=green" >> "$GITHUB_OUTPUT"
           else
-            echo "standby_color=blue" >> $GITHUB_OUTPUT
+            echo "standby_color=blue" >> "$GITHUB_OUTPUT"
           fi
 
           # Read ASG names
@@ -183,11 +183,11 @@ jobs:
             --query "Parameter.Value" --output text)
 
           if [[ "$ACTIVE_COLOR" == "blue" ]]; then
-            echo "active_asg=$BLUE_ASG" >> $GITHUB_OUTPUT
-            echo "standby_asg=$GREEN_ASG" >> $GITHUB_OUTPUT
+            echo "active_asg=$BLUE_ASG" >> "$GITHUB_OUTPUT"
+            echo "standby_asg=$GREEN_ASG" >> "$GITHUB_OUTPUT"
           else
-            echo "active_asg=$GREEN_ASG" >> $GITHUB_OUTPUT
-            echo "standby_asg=$BLUE_ASG" >> $GITHUB_OUTPUT
+            echo "active_asg=$GREEN_ASG" >> "$GITHUB_OUTPUT"
+            echo "standby_asg=$BLUE_ASG" >> "$GITHUB_OUTPUT"
           fi
 
           # Read current image tags
@@ -199,40 +199,40 @@ jobs:
             --query "Parameter.Value" --output text 2>/dev/null) || GREEN_TAG="unknown"
 
           if [[ "$ACTIVE_COLOR" == "blue" ]]; then
-            echo "active_image_tag=$BLUE_TAG" >> $GITHUB_OUTPUT
-            echo "standby_image_tag=$GREEN_TAG" >> $GITHUB_OUTPUT
+            echo "active_image_tag=$BLUE_TAG" >> "$GITHUB_OUTPUT"
+            echo "standby_image_tag=$GREEN_TAG" >> "$GITHUB_OUTPUT"
           else
-            echo "active_image_tag=$GREEN_TAG" >> $GITHUB_OUTPUT
-            echo "standby_image_tag=$BLUE_TAG" >> $GITHUB_OUTPUT
+            echo "active_image_tag=$GREEN_TAG" >> "$GITHUB_OUTPUT"
+            echo "standby_image_tag=$BLUE_TAG" >> "$GITHUB_OUTPUT"
           fi
 
           # Server listeners: primary=UDP, secondary=HTTPS (optional)
-          echo "primary_listener_arn=$(aws ssm get-parameter \
-            --name "${SSM_BASE}/udp-listener-arn" \
-            --query "Parameter.Value" --output text)" >> $GITHUB_OUTPUT
-
-          echo "blue_primary_tg_arn=$(aws ssm get-parameter \
-            --name "${SSM_BASE}/blue-udp-tg-arn" \
-            --query "Parameter.Value" --output text)" >> $GITHUB_OUTPUT
-
-          echo "green_primary_tg_arn=$(aws ssm get-parameter \
-            --name "${SSM_BASE}/green-udp-tg-arn" \
-            --query "Parameter.Value" --output text)" >> $GITHUB_OUTPUT
+          {
+            echo "primary_listener_arn=$(aws ssm get-parameter \
+              --name "${SSM_BASE}/udp-listener-arn" \
+              --query "Parameter.Value" --output text)"
+            echo "blue_primary_tg_arn=$(aws ssm get-parameter \
+              --name "${SSM_BASE}/blue-udp-tg-arn" \
+              --query "Parameter.Value" --output text)"
+            echo "green_primary_tg_arn=$(aws ssm get-parameter \
+              --name "${SSM_BASE}/green-udp-tg-arn" \
+              --query "Parameter.Value" --output text)"
+          } >> "$GITHUB_OUTPUT"
 
           # HTTPS listener/TGs are optional (only exist if QURL resolve endpoint is enabled)
           HTTPS_LISTENER=$(aws ssm get-parameter \
             --name "${SSM_BASE}/https-listener-arn" \
             --query "Parameter.Value" --output text 2>/dev/null) || HTTPS_LISTENER=""
-          echo "secondary_listener_arn=$HTTPS_LISTENER" >> $GITHUB_OUTPUT
+          echo "secondary_listener_arn=$HTTPS_LISTENER" >> "$GITHUB_OUTPUT"
 
           if [[ -n "$HTTPS_LISTENER" ]]; then
             echo "blue_secondary_tg_arn=$(aws ssm get-parameter \
               --name "${SSM_BASE}/blue-https-tg-arn" \
-              --query "Parameter.Value" --output text)" >> $GITHUB_OUTPUT
+              --query "Parameter.Value" --output text)" >> "$GITHUB_OUTPUT"
 
             echo "green_secondary_tg_arn=$(aws ssm get-parameter \
               --name "${SSM_BASE}/green-https-tg-arn" \
-              --query "Parameter.Value" --output text)" >> $GITHUB_OUTPUT
+              --query "Parameter.Value" --output text)" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Read AC SSM State
@@ -253,7 +253,7 @@ jobs:
           if [[ -z "$ACTIVE_COLOR" ]]; then
             if [[ "$COMPONENT" == "both" ]]; then
               echo "::warning::AC blue/green not enabled - skipping AC deployment"
-              echo "enabled=false" >> $GITHUB_OUTPUT
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
               exit 0
             else
               echo "::error::AC blue/green not enabled - SSM parameter ${SSM_BASE}/active-color not found"
@@ -261,15 +261,15 @@ jobs:
               exit 1
             fi
           fi
-          echo "enabled=true" >> $GITHUB_OUTPUT
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
 
           echo "AC active color: $ACTIVE_COLOR"
-          echo "active_color=$ACTIVE_COLOR" >> $GITHUB_OUTPUT
+          echo "active_color=$ACTIVE_COLOR" >> "$GITHUB_OUTPUT"
 
           if [[ "$ACTIVE_COLOR" == "blue" ]]; then
-            echo "standby_color=green" >> $GITHUB_OUTPUT
+            echo "standby_color=green" >> "$GITHUB_OUTPUT"
           else
-            echo "standby_color=blue" >> $GITHUB_OUTPUT
+            echo "standby_color=blue" >> "$GITHUB_OUTPUT"
           fi
 
           # Read ASG names
@@ -281,11 +281,11 @@ jobs:
             --query "Parameter.Value" --output text)
 
           if [[ "$ACTIVE_COLOR" == "blue" ]]; then
-            echo "active_asg=$BLUE_ASG" >> $GITHUB_OUTPUT
-            echo "standby_asg=$GREEN_ASG" >> $GITHUB_OUTPUT
+            echo "active_asg=$BLUE_ASG" >> "$GITHUB_OUTPUT"
+            echo "standby_asg=$GREEN_ASG" >> "$GITHUB_OUTPUT"
           else
-            echo "active_asg=$GREEN_ASG" >> $GITHUB_OUTPUT
-            echo "standby_asg=$BLUE_ASG" >> $GITHUB_OUTPUT
+            echo "active_asg=$GREEN_ASG" >> "$GITHUB_OUTPUT"
+            echo "standby_asg=$BLUE_ASG" >> "$GITHUB_OUTPUT"
           fi
 
           # Read current image tags
@@ -297,25 +297,25 @@ jobs:
             --query "Parameter.Value" --output text 2>/dev/null) || GREEN_TAG="unknown"
 
           if [[ "$ACTIVE_COLOR" == "blue" ]]; then
-            echo "active_image_tag=$BLUE_TAG" >> $GITHUB_OUTPUT
-            echo "standby_image_tag=$GREEN_TAG" >> $GITHUB_OUTPUT
+            echo "active_image_tag=$BLUE_TAG" >> "$GITHUB_OUTPUT"
+            echo "standby_image_tag=$GREEN_TAG" >> "$GITHUB_OUTPUT"
           else
-            echo "active_image_tag=$GREEN_TAG" >> $GITHUB_OUTPUT
-            echo "standby_image_tag=$BLUE_TAG" >> $GITHUB_OUTPUT
+            echo "active_image_tag=$GREEN_TAG" >> "$GITHUB_OUTPUT"
+            echo "standby_image_tag=$BLUE_TAG" >> "$GITHUB_OUTPUT"
           fi
 
           # AC listeners: primary=TCP only (no secondary)
-          echo "primary_listener_arn=$(aws ssm get-parameter \
-            --name "${SSM_BASE}/tcp-listener-arn" \
-            --query "Parameter.Value" --output text)" >> $GITHUB_OUTPUT
-
-          echo "blue_primary_tg_arn=$(aws ssm get-parameter \
-            --name "${SSM_BASE}/blue-tcp-tg-arn" \
-            --query "Parameter.Value" --output text)" >> $GITHUB_OUTPUT
-
-          echo "green_primary_tg_arn=$(aws ssm get-parameter \
-            --name "${SSM_BASE}/green-tcp-tg-arn" \
-            --query "Parameter.Value" --output text)" >> $GITHUB_OUTPUT
+          {
+            echo "primary_listener_arn=$(aws ssm get-parameter \
+              --name "${SSM_BASE}/tcp-listener-arn" \
+              --query "Parameter.Value" --output text)"
+            echo "blue_primary_tg_arn=$(aws ssm get-parameter \
+              --name "${SSM_BASE}/blue-tcp-tg-arn" \
+              --query "Parameter.Value" --output text)"
+            echo "green_primary_tg_arn=$(aws ssm get-parameter \
+              --name "${SSM_BASE}/green-tcp-tg-arn" \
+              --query "Parameter.Value" --output text)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Reconcile Component Flags
         id: reconcile
@@ -347,8 +347,8 @@ jobs:
             exit 1
           fi
 
-          echo "deploy_server=$FINAL_SERVER" >> $GITHUB_OUTPUT
-          echo "deploy_ac=$FINAL_AC" >> $GITHUB_OUTPUT
+          echo "deploy_server=$FINAL_SERVER" >> "$GITHUB_OUTPUT"
+          echo "deploy_ac=$FINAL_AC" >> "$GITHUB_OUTPUT"
 
       - name: Validate Inputs
         id: validate
@@ -384,14 +384,14 @@ jobs:
               if [[ "$IMAGE_TAG" == "$SERVER_ACTIVE_TAG" ]]; then
                 echo "::warning::Server: Deploying same image tag ($IMAGE_TAG) that is already active."
               fi
-              echo "server_target_image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+              echo "server_target_image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
             fi
             # AC validation
             if [[ "$DEPLOY_AC" == "true" ]]; then
               if [[ "$IMAGE_TAG" == "$AC_ACTIVE_TAG" ]]; then
                 echo "::warning::AC: Deploying same image tag ($IMAGE_TAG) that is already active."
               fi
-              echo "ac_target_image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+              echo "ac_target_image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
             fi
           elif [[ "$ACTION" == "rollback" || "$ACTION" == "switch-only" ]]; then
             # Server
@@ -401,7 +401,7 @@ jobs:
                 echo "::error::Use 'deploy' action with an image_tag to initialize the standby first."
                 exit 1
               fi
-              echo "server_target_image_tag=$SERVER_STANDBY_TAG" >> $GITHUB_OUTPUT
+              echo "server_target_image_tag=$SERVER_STANDBY_TAG" >> "$GITHUB_OUTPUT"
             fi
             # AC
             if [[ "$DEPLOY_AC" == "true" ]]; then
@@ -410,7 +410,7 @@ jobs:
                 echo "::error::Use 'deploy' action with an image_tag to initialize the standby first."
                 exit 1
               fi
-              echo "ac_target_image_tag=$AC_STANDBY_TAG" >> $GITHUB_OUTPUT
+              echo "ac_target_image_tag=$AC_STANDBY_TAG" >> "$GITHUB_OUTPUT"
             fi
           fi
 
@@ -430,37 +430,47 @@ jobs:
           AC_TARGET_TAG: ${{ steps.validate.outputs.ac_target_image_tag }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          echo "## Blue/Green State" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Blue/Green State"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
           if [[ "$DRY_RUN" == "true" ]]; then
-            echo "> **DRY RUN MODE** - No changes will be made" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
+            {
+              echo "> **DRY RUN MODE** - No changes will be made"
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
-          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Action | $ACTION |" >> $GITHUB_STEP_SUMMARY
-          echo "| Component | $COMPONENT |" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| Action | $ACTION |"
+            echo "| Component | $COMPONENT |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
           if [[ "$DEPLOY_SERVER" == "true" ]]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Server" >> $GITHUB_STEP_SUMMARY
-            echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-            echo "| Active Color | **$SERVER_ACTIVE_COLOR** |" >> $GITHUB_STEP_SUMMARY
-            echo "| Standby Color | $SERVER_STANDBY_COLOR |" >> $GITHUB_STEP_SUMMARY
-            echo "| Active Image | \`$SERVER_ACTIVE_TAG\` |" >> $GITHUB_STEP_SUMMARY
-            echo "| Target Image | \`$SERVER_TARGET_TAG\` |" >> $GITHUB_STEP_SUMMARY
+            {
+              echo ""
+              echo "### Server"
+              echo "| Property | Value |"
+              echo "|----------|-------|"
+              echo "| Active Color | **$SERVER_ACTIVE_COLOR** |"
+              echo "| Standby Color | $SERVER_STANDBY_COLOR |"
+              echo "| Active Image | \`$SERVER_ACTIVE_TAG\` |"
+              echo "| Target Image | \`$SERVER_TARGET_TAG\` |"
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
           if [[ "$DEPLOY_AC" == "true" ]]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### AC" >> $GITHUB_STEP_SUMMARY
-            echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-            echo "| Active Color | **$AC_ACTIVE_COLOR** |" >> $GITHUB_STEP_SUMMARY
-            echo "| Standby Color | $AC_STANDBY_COLOR |" >> $GITHUB_STEP_SUMMARY
-            echo "| Active Image | \`$AC_ACTIVE_TAG\` |" >> $GITHUB_STEP_SUMMARY
-            echo "| Target Image | \`$AC_TARGET_TAG\` |" >> $GITHUB_STEP_SUMMARY
+            {
+              echo ""
+              echo "### AC"
+              echo "| Property | Value |"
+              echo "|----------|-------|"
+              echo "| Active Color | **$AC_ACTIVE_COLOR** |"
+              echo "| Standby Color | $AC_STANDBY_COLOR |"
+              echo "| Active Image | \`$AC_ACTIVE_TAG\` |"
+              echo "| Target Image | \`$AC_TARGET_TAG\` |"
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
   # =============================================================================
@@ -641,7 +651,8 @@ jobs:
           if [[ -n "$SECONDARY_TG" ]]; then
             echo "Running UDP and HTTPS health checks in parallel..."
             UDP_RESULT=$(mktemp); HTTPS_RESULT=$(mktemp)
-            trap "rm -f $UDP_RESULT $HTTPS_RESULT" EXIT INT TERM
+            cleanup() { rm -f "$UDP_RESULT" "$HTTPS_RESULT"; }
+            trap cleanup EXIT INT TERM
             verify_tg_health "$PRIMARY_TG" "UDP" "$UDP_RESULT" &
             UDP_PID=$!
             verify_tg_health "$SECONDARY_TG" "HTTPS" "$HTTPS_RESULT" &
@@ -1075,33 +1086,41 @@ jobs:
           AC_NEW_TAG: ${{ needs.prepare.outputs.ac_target_image_tag }}
           AC_PREVIOUS_TAG: ${{ needs.prepare.outputs.ac_active_image_tag }}
         run: |
-          echo "## Blue/Green Deployment Complete" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Action:** $ACTION | **Component:** $COMPONENT" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Blue/Green Deployment Complete"
+            echo ""
+            echo "**Action:** $ACTION | **Component:** $COMPONENT"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
           if [[ "$DEPLOY_SERVER" == "true" ]]; then
-            echo "### Server" >> $GITHUB_STEP_SUMMARY
-            echo "| Property | Before | After |" >> $GITHUB_STEP_SUMMARY
-            echo "|----------|--------|-------|" >> $GITHUB_STEP_SUMMARY
-            echo "| Active Color | $SERVER_PREVIOUS_ACTIVE | **$SERVER_NEW_ACTIVE** |" >> $GITHUB_STEP_SUMMARY
-            echo "| Active Image | \`$SERVER_PREVIOUS_TAG\` | \`$SERVER_NEW_TAG\` |" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
+            {
+              echo "### Server"
+              echo "| Property | Before | After |"
+              echo "|----------|--------|-------|"
+              echo "| Active Color | $SERVER_PREVIOUS_ACTIVE | **$SERVER_NEW_ACTIVE** |"
+              echo "| Active Image | \`$SERVER_PREVIOUS_TAG\` | \`$SERVER_NEW_TAG\` |"
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
           if [[ "$DEPLOY_AC" == "true" ]]; then
-            echo "### AC" >> $GITHUB_STEP_SUMMARY
-            echo "| Property | Before | After |" >> $GITHUB_STEP_SUMMARY
-            echo "|----------|--------|-------|" >> $GITHUB_STEP_SUMMARY
-            echo "| Active Color | $AC_PREVIOUS_ACTIVE | **$AC_NEW_ACTIVE** |" >> $GITHUB_STEP_SUMMARY
-            echo "| Active Image | \`$AC_PREVIOUS_TAG\` | \`$AC_NEW_TAG\` |" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
+            {
+              echo "### AC"
+              echo "| Property | Before | After |"
+              echo "|----------|--------|-------|"
+              echo "| Active Color | $AC_PREVIOUS_ACTIVE | **$AC_NEW_ACTIVE** |"
+              echo "| Active Image | \`$AC_PREVIOUS_TAG\` | \`$AC_NEW_TAG\` |"
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          echo "### Rollback" >> $GITHUB_STEP_SUMMARY
-          echo "To rollback, run this workflow with:" >> $GITHUB_STEP_SUMMARY
-          echo "- **action:** \`rollback\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **component:** \`$COMPONENT\`" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "### Rollback"
+            echo "To rollback, run this workflow with:"
+            echo "- **action:** \`rollback\`"
+            echo "- **component:** \`$COMPONENT\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # =============================================================================
   # NOTIFY - Send deployment notification to SNS (Slack via AWS Chatbot)
