@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -327,6 +328,120 @@ func TestMapErrorCode(t *testing.T) {
 			err := resolver.mapErrorCode(tt.code)
 			if !errors.Is(err, tt.expected) {
 				t.Errorf("mapErrorCode(%q) = %v, want %v", tt.code, err, tt.expected)
+			}
+		})
+	}
+}
+
+func TestValidateResolveResponse(t *testing.T) {
+	tests := []struct {
+		name    string
+		resp    *ResolveResponse
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name: "valid response",
+			resp: &ResolveResponse{
+				Resources: map[string]*common.ResourceInfo{
+					"default": {
+						ACId: "ac-001",
+						Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "empty resources",
+			resp: &ResolveResponse{
+				Resources: map[string]*common.ResourceInfo{},
+			},
+			wantErr: true,
+			errMsg:  "empty resources",
+		},
+		{
+			name: "nil resources",
+			resp: &ResolveResponse{
+				Resources: nil,
+			},
+			wantErr: true,
+			errMsg:  "empty resources",
+		},
+		{
+			name: "nil resource entry",
+			resp: &ResolveResponse{
+				Resources: map[string]*common.ResourceInfo{
+					"default": nil,
+				},
+			},
+			wantErr: true,
+			errMsg:  "is nil",
+		},
+		{
+			name: "empty ACId",
+			resp: &ResolveResponse{
+				Resources: map[string]*common.ResourceInfo{
+					"default": {
+						ACId: "",
+						Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443},
+					},
+				},
+			},
+			wantErr: true,
+			errMsg:  "empty ACId",
+		},
+		{
+			name: "nil address",
+			resp: &ResolveResponse{
+				Resources: map[string]*common.ResourceInfo{
+					"default": {
+						ACId: "ac-001",
+						Addr: nil,
+					},
+				},
+			},
+			wantErr: true,
+			errMsg:  "nil address",
+		},
+		{
+			name: "empty IP",
+			resp: &ResolveResponse{
+				Resources: map[string]*common.ResourceInfo{
+					"default": {
+						ACId: "ac-001",
+						Addr: &common.NetAddress{Ip: "", Port: 443},
+					},
+				},
+			},
+			wantErr: true,
+			errMsg:  "empty IP",
+		},
+		{
+			name: "zero port",
+			resp: &ResolveResponse{
+				Resources: map[string]*common.ResourceInfo{
+					"default": {
+						ACId: "ac-001",
+						Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 0},
+					},
+				},
+			},
+			wantErr: true,
+			errMsg:  "zero port",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateResolveResponse(tt.resp)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateResolveResponse() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr && err != nil && tt.errMsg != "" {
+				if !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("validateResolveResponse() error = %q, want to contain %q", err.Error(), tt.errMsg)
+				}
 			}
 		})
 	}

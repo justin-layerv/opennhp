@@ -29,6 +29,10 @@ var (
 	ErrPolicyViolation = errors.New("access denied by policy")
 	// ErrServiceError indicates an internal error in the QURL service
 	ErrServiceError = errors.New("qurl service error")
+	// ErrInvalidResolveResponse indicates the QURL API returned structurally
+	// invalid data (e.g., missing resources, nil addresses). This is distinct
+	// from token/policy errors and indicates a configuration issue.
+	ErrInvalidResolveResponse = errors.New("invalid resolve response")
 )
 
 // ResolveRequest represents a request to validate and consume a QURL access token.
@@ -211,7 +215,41 @@ func (r *QurlResolver) Resolve(ctx context.Context, req *ResolveRequest) (*Resol
 		return nil, ErrServiceError
 	}
 
+	if err := validateResolveResponse(internalResp.Data); err != nil {
+		log.Error("[QURL] Invalid resolve response: %v", err)
+		return nil, fmt.Errorf("%w: %s", ErrInvalidResolveResponse, err.Error())
+	}
+
 	return internalResp.Data, nil
+}
+
+// validateResolveResponse checks that the QURL API returned all fields
+// required for a successful NHP knock. Missing fields here would cause
+// a downstream knock failure with a less actionable error message.
+func validateResolveResponse(resp *ResolveResponse) error {
+	if len(resp.Resources) == 0 {
+		return errors.New("QURL API returned empty resources — ensure the resource has NHP configuration")
+	}
+
+	for name, info := range resp.Resources {
+		if info == nil {
+			return fmt.Errorf("resource %q is nil", name)
+		}
+		if info.ACId == "" {
+			return fmt.Errorf("resource %q has empty ACId", name)
+		}
+		if info.Addr == nil {
+			return fmt.Errorf("resource %q has nil address — QURL API must include addr with ip and port", name)
+		}
+		if info.Addr.Ip == "" {
+			return fmt.Errorf("resource %q has empty IP address", name)
+		}
+		if info.Addr.Port == 0 {
+			return fmt.Errorf("resource %q has zero port", name)
+		}
+	}
+
+	return nil
 }
 
 // parseErrorResponse converts HTTP status codes to domain errors

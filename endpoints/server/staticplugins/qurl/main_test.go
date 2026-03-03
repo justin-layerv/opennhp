@@ -296,6 +296,7 @@ func TestAuthWithHttp_FullFlow(t *testing.T) {
 					"default": {
 						ACId:     "ac-001",
 						Hostname: "backend.example.com",
+						Addr:     &common.NetAddress{Ip: "10.0.0.1", Port: 443},
 					},
 				},
 				JWTSecret:    "test-jwt-secret-key-for-signing",
@@ -500,6 +501,7 @@ func TestAuthWithHttp_KnockRetrySuccess(t *testing.T) {
 					"default": {
 						ACId:     "ac-001",
 						Hostname: "backend.example.com",
+						Addr:     &common.NetAddress{Ip: "10.0.0.1", Port: 443},
 					},
 				},
 				JWTSecret:    "test-jwt-secret-key-for-signing",
@@ -547,7 +549,7 @@ func TestAuthWithHttp_KnockRetrySuccess(t *testing.T) {
 		t.Fatalf("expected success after retry, got error: %v", err)
 	}
 	if attempts != 2 {
-		t.Errorf("expected 2 knock attempts, got %d", attempts)
+		t.Errorf("expected exactly 2 knock attempts, got %d", attempts)
 	}
 	if ackMsg == nil || len(ackMsg.ResourceHost) == 0 {
 		t.Error("expected resource hosts in ack message")
@@ -570,6 +572,7 @@ func TestAuthWithHttp_KnockRetryExhausted(t *testing.T) {
 					"default": {
 						ACId:     "ac-001",
 						Hostname: "backend.example.com",
+						Addr:     &common.NetAddress{Ip: "10.0.0.1", Port: 443},
 					},
 				},
 				JWTSecret:    "test-jwt-secret-key-for-signing",
@@ -609,10 +612,10 @@ func TestAuthWithHttp_KnockRetryExhausted(t *testing.T) {
 	_, err := AuthWithHttp(ctx, req, helper)
 
 	if err == nil {
-		t.Fatal("expected error after both attempts fail")
+		t.Fatal("expected error after all attempts fail")
 	}
-	if attempts != 2 {
-		t.Errorf("expected 2 knock attempts, got %d", attempts)
+	if attempts != knockMaxAttempts {
+		t.Errorf("expected %d knock attempts, got %d", knockMaxAttempts, attempts)
 	}
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("expected 500, got %d", w.Code)

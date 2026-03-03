@@ -526,7 +526,7 @@ func corsMiddleware() gin.HandlerFunc {
 	}
 }
 
-func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *common.ResourceData) (ack *common.ServerKnockAckMsg, err error) {
+func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *common.ResourceData) (ackMsg *common.ServerKnockAckMsg, err error) {
 	hs.wg.Add(1)
 	defer hs.wg.Done()
 	s := hs.udpServer
@@ -544,7 +544,7 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 		knkMsg.HeaderType = core.NHP_EXT
 	}
 
-	ackMsg := &common.ServerKnockAckMsg{
+	ackMsg = &common.ServerKnockAckMsg{
 		AuthProviderToken: req.Token,
 		AgentAddr:         srcIp,
 		OpenTime:          res.OpenTime,
@@ -640,8 +640,20 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 	}
 
 	if successCount == 0 {
-		log.Info("httpserver-agent(%s#%s@%s)[handleHttpOpenResource] failed: %+v", knkMsg.UserId, knkMsg.DeviceId, srcIp, artMsgs)
-		err = common.ErrServerACOpsFailed
+		// Collect specific error messages from each failed AC operation
+		// so callers (e.g., QURL plugin) can surface actionable diagnostics.
+		var details []string
+		for resName, artMsg := range artMsgs {
+			if artMsg.ErrMsg != "" {
+				details = append(details, fmt.Sprintf("%s: %s", resName, artMsg.ErrMsg))
+			}
+		}
+		log.Error("httpserver-agent(%s#%s@%s)[handleHttpOpenResource] all AC operations failed: %v", knkMsg.UserId, knkMsg.DeviceId, srcIp, details)
+		if len(details) > 0 {
+			err = fmt.Errorf("%w (%s)", common.ErrServerACOpsFailed, strings.Join(details, "; "))
+		} else {
+			err = common.ErrServerACOpsFailed
+		}
 		ackMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
 		ackMsg.ErrMsg = err.Error()
 		return

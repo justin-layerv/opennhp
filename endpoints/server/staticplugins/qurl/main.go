@@ -21,6 +21,11 @@ const (
 	name    = "qurl"
 	version = "1.0.0"
 
+	// knockMaxAttempts is the total number of knock attempts (initial + retries).
+	// Multiple attempts handle transient failures: stale connections get closed
+	// on timeout, so subsequent attempts use fresh connections.
+	knockMaxAttempts = 3
+
 	// knockRetryDelay is the wait time before retrying a failed NHP knock.
 	// This gives time for AC connections to re-establish during blue/green
 	// deployments or transient connectivity gaps.
@@ -111,26 +116,42 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		return nil, err
 	}
 
-	log.Info("[QURL] Token resolved successfully: resource_id=%s", resolveResp.ResourceID)
+	log.Info("[QURL] Token resolved successfully: resource_id=%s, resources=%d", resolveResp.ResourceID, len(resolveResp.Resources))
 
 	// Build ResourceData from the resolved response
 	res := buildResourceData(resolveResp)
 
 	// Trigger NHP knock via helper callback.
-	// Retry once on failure: AC connections can be briefly unavailable during
-	// blue/green deployments or connection re-establishment. A short retry
-	// avoids returning 500 to users for transient AC connectivity issues.
-	ackMsg, err = helper.AuthWithHttpCallbackFunc(req, res)
-	if err != nil {
-		log.Warning("[QURL] NHP knock failed (attempt 1/2): %v, retrying...", err)
-		time.Sleep(knockRetryDelay)
+	// Retry on failure: timed-out connections are closed after the first failure,
+	// so subsequent attempts use fresh connections. This handles transient AC
+	// connectivity issues during blue/green deployments or network blips.
+	// The retry loop is context-aware: if the client disconnects or the HTTP
+	// write deadline passes, retries stop to avoid wasted work.
+	reqCtx := ctx.Request.Context()
+	for attempt := 1; attempt <= knockMaxAttempts; attempt++ {
 		ackMsg, err = helper.AuthWithHttpCallbackFunc(req, res)
+		if err == nil {
+			break
+		}
+		if attempt < knockMaxAttempts {
+			log.Warning("[QURL] NHP knock failed (attempt %d/%d): %v, retrying...", attempt, knockMaxAttempts, err)
+			select {
+			case <-time.After(knockRetryDelay):
+			case <-reqCtx.Done():
+				log.Warning("[QURL] NHP knock retry canceled: %v", reqCtx.Err())
+				err = fmt.Errorf("knock canceled: %w", reqCtx.Err())
+			}
+			if reqCtx.Err() != nil {
+				break
+			}
+		}
 	}
 	if err != nil {
-		log.Error("[QURL] NHP knock failed after retry: %v", err)
+		log.Error("[QURL] NHP knock failed after %d attempts: %v", knockMaxAttempts, err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "knock_failed",
 			"message": "Failed to open access to resource",
+			"detail":  err.Error(),
 		})
 		return nil, err
 	}
@@ -247,6 +268,8 @@ func nhpDrop(ctx *gin.Context) {
 // a generic 403 with no details — the user sees "access denied" but learns
 // nothing about the token's actual state. This avoids CloudFront 502 errors
 // that occur when the connection is silently dropped behind CDN infrastructure.
+// Invalid resolve responses (missing resources, nil addresses) return a 502
+// to indicate the upstream QURL API returned bad data.
 // Unexpected errors still trigger nhpDrop for true NHP stealth behavior.
 func handleResolveError(ctx *gin.Context, err error) {
 	switch {
@@ -257,6 +280,13 @@ func handleResolveError(ctx *gin.Context, err error) {
 		ctx.JSON(http.StatusForbidden, gin.H{
 			"error":   "access_denied",
 			"message": "This link is no longer available",
+		})
+		ctx.Abort()
+	case errors.Is(err, ErrInvalidResolveResponse):
+		ctx.JSON(http.StatusBadGateway, gin.H{
+			"error":   "invalid_resource_config",
+			"message": "Resource configuration is incomplete",
+			"detail":  err.Error(),
 		})
 		ctx.Abort()
 	default:

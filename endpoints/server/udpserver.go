@@ -1234,6 +1234,14 @@ func (s *UdpServer) processACOperation(knkMsg *common.AgentKnockMsg, conn *ACCon
 		err = acPpd.Error
 		artMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
 		artMsg.ErrMsg = err.Error()
+		// If the transaction timed out, the connection is likely unhealthy
+		// (e.g., AC unreachable, network path broken). Close it so that
+		// retry attempts filter it out via IsClosed() instead of sending
+		// to the same dead connection again.
+		if errors.Is(acPpd.Error, common.ErrTransactionFailedByTimeout) {
+			log.Warning("server-agent(%s@%s)-ac(%s#%d@%s)[processACOperation] closing timed-out connection", knkMsg.UserId, srcAddr.String(), conn.ACId, aopMd.TransactionId, acAddrStr)
+			conn.ConnData.Close()
+		}
 		return
 	}
 
