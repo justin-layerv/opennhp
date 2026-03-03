@@ -2,6 +2,7 @@ package db
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -201,10 +202,11 @@ func (a *AppParams) LoadMetadataAsStruct() (map[string]any, error) {
 
 func (a *UdpDevice) UploadFileToNHPServer(filePath string) (string, error) {
 	httpHost := fmt.Sprintf("http://%s/", a.GetServerPeer().Host())
-	testReq, err := http.Get(httpHost)
+	testReq, err := http.Get(httpHost) //nolint:noctx // probe request with no meaningful context
 	if err != nil {
 		return "", err
 	}
+	_ = testReq.Body.Close()
 
 	if testReq.StatusCode == http.StatusBadRequest {
 		httpHost = fmt.Sprintf("https://%s/", a.GetServerPeer().Host())
@@ -253,7 +255,7 @@ func (a *UdpDevice) UploadFileToNHPServer(filePath string) (string, error) {
 
 	uploadUrl := httpHost + "storage/upload"
 
-	req, err := http.NewRequest("POST", uploadUrl, body)
+	req, err := http.NewRequestWithContext(context.Background(), "POST", uploadUrl, body)
 	if err != nil {
 		return "", fmt.Errorf("could not create request: %w", err)
 	}
