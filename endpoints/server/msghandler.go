@@ -137,7 +137,11 @@ func (s *UdpServer) HandleRegisterRequest(ppd *core.PacketParserData) (err error
 	}()
 
 	// send NHP_RAK message
-	rakBytes, _ := json.Marshal(rakMsg)
+	rakBytes, marshalErr := json.Marshal(rakMsg)
+	if marshalErr != nil {
+		log.Error("server-agent(%s#%d@%s)[HandleRegisterRequest] failed to marshal RAK message: %v", regMsg.UserId, transactionId, addrStr, marshalErr)
+		return marshalErr
+	}
 	rakMd := makeMsgData(ppd, core.NHP_RAK, rakBytes)
 
 	if fwdErr := forwardToTransaction(ppd.ConnData, transactionId, rakMd, "server-agent", "HandleRegisterRequest", regMsg.UserId, addrStr); fwdErr != nil {
@@ -194,7 +198,11 @@ func (s *UdpServer) HandleListRequest(ppd *core.PacketParserData) (err error) {
 		log.Info("server-agent(%s#%d@%s)[HandleListRequest] succeeded", lstMsg.UserId, transactionId, addrStr)
 	}()
 
-	lrtBytes, _ := json.Marshal(lrtMsg)
+	lrtBytes, marshalErr := json.Marshal(lrtMsg)
+	if marshalErr != nil {
+		log.Error("server-agent(%s#%d@%s)[HandleListRequest] failed to marshal LRT message: %v", lstMsg.UserId, transactionId, addrStr, marshalErr)
+		return marshalErr
+	}
 	ackMd := makeMsgData(ppd, core.NHP_LRT, lrtBytes)
 
 	if fwdErr := forwardToTransaction(ppd.ConnData, transactionId, ackMd, "server-agent", "HandleListRequest", lstMsg.UserId, addrStr); fwdErr != nil {
@@ -253,7 +261,11 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 				ErrCode: validationErr.ErrorCode(),
 				ErrMsg:  validationErr.Error(),
 			}
-			aakBytes, _ := json.Marshal(aakMsg)
+			aakBytes, marshalErr := json.Marshal(aakMsg)
+			if marshalErr != nil {
+				log.Error("server-ac(%s#%d@%s)[HandleACOnline] failed to marshal AAK error message: %v", acId, transactionId, addrStr, marshalErr)
+				return validationErr
+			}
 			aakMd := makeMsgData(ppd, core.NHP_AAK, aakBytes)
 			if transaction := ppd.ConnData.FindRemoteTransaction(transactionId); transaction != nil {
 				transaction.NextMsgCh <- aakMd
@@ -366,7 +378,11 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		ServerAddr:   serverAddr,
 		ServerPubKey: s.device.PublicKeyBase64(),
 	}
-	aakBytes, _ := json.Marshal(aakMsg)
+	aakBytes, marshalErr := json.Marshal(aakMsg)
+	if marshalErr != nil {
+		log.Error("server-ac(%s#%d@%s)[HandleACOnline] failed to marshal AAK message: %v", acId, transactionId, addrStr, marshalErr)
+		return marshalErr
+	}
 	aakMd := makeMsgData(ppd, core.NHP_AAK, aakBytes)
 
 	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-ac", "HandleACOnline", acId, addrStr)
@@ -455,7 +471,11 @@ func (s *UdpServer) handleACServerAssignment(
 		Targets: targets,
 		ErrCode: common.ErrSuccess.ErrorCode(),
 	}
-	ardBytes, _ := json.Marshal(ardMsg)
+	ardBytes, marshalErr := json.Marshal(ardMsg)
+	if marshalErr != nil {
+		log.Error("server-ac(%s#%d@%s)[HandleACOnline/ARD] failed to marshal ARD message: %v", acId, transactionId, addrStr, marshalErr)
+		return false, marshalErr
+	}
 	ardMd := makeMsgData(ppd, core.NHP_ARD, ardBytes)
 
 	if err := forwardToTransaction(ppd.ConnData, transactionId, ardMd, "server-ac", "HandleACOnline/ARD", acId, addrStr); err != nil {
@@ -605,7 +625,11 @@ func (s *UdpServer) HandleDBOnline(ppd *core.PacketParserData) (err error) {
 		ErrCode: common.ErrSuccess.ErrorCode(),
 		DBAddr:  ppd.ConnData.RemoteAddr.String(),
 	}
-	aakBytes, _ := json.Marshal(aakMsg)
+	aakBytes, marshalErr := json.Marshal(aakMsg)
+	if marshalErr != nil {
+		log.Error("server-db(%s#%d@%s)[HandleDBOnline] failed to marshal DBA message: %v", dbId, transactionId, addrStr, marshalErr)
+		return marshalErr
+	}
 	aakMd := makeMsgData(ppd, core.NHP_DBA, aakBytes)
 
 	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-db", "HandleDBOnline", dbId, addrStr)
@@ -640,7 +664,11 @@ func (s *UdpServer) HandleDHPDARMessage(ppd *core.PacketParserData) (err error) 
 		s.UpdateTeePublicKeyAndConsumerEphemeralPublicKey(darMsg.TeePublicKey, darMsg.ConsumerEphemeralPublicKey, ppd.RemotePubKey)
 	}
 
-	aakBytes, _ := json.Marshal(dsaMsg)
+	aakBytes, marshalErr := json.Marshal(dsaMsg)
+	if marshalErr != nil {
+		log.Error("server-agent(%s#%d@%s)[HandleDHPDARMessage] failed to marshal DSA message: %v", doId, transactionId, addrStr, marshalErr)
+		return marshalErr
+	}
 	log.Debug("dagMsg:%s", (string)(aakBytes))
 	aakMd := makeMsgData(ppd, core.NHP_DSA, aakBytes)
 	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-agent", "HandleDHPDARMessage", doId, addrStr)
@@ -706,7 +734,11 @@ func (s *UdpServer) HandleDHPDAVMessage(ppd *core.PacketParserData) (err error) 
 		}
 	}
 
-	aakBytes, _ := json.Marshal(dagMsg)
+	aakBytes, marshalErr := json.Marshal(dagMsg)
+	if marshalErr != nil {
+		log.Error("server-agent(%s#%d@%s)[HandleDHPDAVMessage] failed to marshal DAG message: %v", doId, transactionId, addrStr, marshalErr)
+		return marshalErr
+	}
 	log.Debug("dagMsg:%s", (string)(aakBytes))
 	aakMd := makeMsgData(ppd, core.NHP_DAG, aakBytes)
 	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-agent", "HandleDHPDAVMessage", doId, addrStr)
@@ -744,7 +776,11 @@ func (s *UdpServer) HandleDHPDRGMessage(ppd *core.PacketParserData) (err error) 
 		ErrCode: errCode,
 		ErrMsg:  errMsg,
 	}
-	aakBytes, _ := json.Marshal(aakMsg)
+	aakBytes, marshalErr := json.Marshal(aakMsg)
+	if marshalErr != nil {
+		log.Error("server-db(%s#%d@%s)[HandleDHPDRGMessage] failed to marshal DAK message: %v", doId, transactionId, addrStr, marshalErr)
+		return marshalErr
+	}
 	aakMd := makeMsgData(ppd, core.NHP_DAK, aakBytes)
 
 	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-db", "HandleDHPDRGMessage", doId, addrStr)

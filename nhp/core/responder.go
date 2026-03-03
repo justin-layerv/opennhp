@@ -523,7 +523,11 @@ func (ppd *PacketParserData) sendCookie() {
 		TransactionId: ppd.SenderTrxId,
 		Cookie:        cokStr,
 	}
-	cokBytes, _ := json.Marshal(cokMsg)
+	cokBytes, err := json.Marshal(cokMsg)
+	if err != nil {
+		log.Error("sendCookie: failed to marshal cookie message: %v", err)
+		return
+	}
 
 	md := &MsgData{
 		HeaderType:    NHP_COK,

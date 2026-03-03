@@ -71,7 +71,11 @@ func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
 	//log.Info("generate knock token: %s", artMsg.ACToken)
 
 	// send ac result
-	artBytes, _ := json.Marshal(artMsg)
+	artBytes, marshalErr := json.Marshal(artMsg)
+	if marshalErr != nil {
+		log.Error("ac(%s#%d)[HandleUdpACOperations] failed to marshal ART message: %v", acId, transactionId, marshalErr)
+		return marshalErr
+	}
 	md := &core.MsgData{
 		HeaderType:     core.NHP_ART,
 		TransactionId:  transactionId,

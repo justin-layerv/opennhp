@@ -748,7 +748,11 @@ func (a *UdpAC) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sync.W
 				AuthServiceId: a.config.AuthServiceId,
 				ResourceIds:   a.config.ResourceIds,
 			}
-			aolBytes, _ := json.Marshal(aolMsg)
+			aolBytes, marshalErr := json.Marshal(aolMsg)
+			if marshalErr != nil {
+				log.Error("ac(%s)[ACOnline] failed to marshal AOL message: %v", acId, marshalErr)
+				return
+			}
 
 			aolMd := &core.MsgData{
 				RemoteAddr:    sendAddr.(*net.UDPAddr),

@@ -105,11 +105,19 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 	s.metrics.RecordLatency("KnockLatency", float64(time.Since(knockStart).Milliseconds()))
 
 	// send back knock ack response
-	ackBytes, _ := json.Marshal(ackMsg)
+	ackBytes, marshalErr := json.Marshal(ackMsg)
+	if marshalErr != nil {
+		log.Error("server-agent(%s#%d@%s)[HandleKnockRequest] failed to marshal ack message: %v", knkMsg.UserId, transactionId, addrStr, marshalErr)
+		return marshalErr
+	}
 
 	// DHP knock
 	if ppd.HeaderType == core.DHP_KNK {
-		ackBytes, _ = json.Marshal(dhpAckMsg)
+		ackBytes, marshalErr = json.Marshal(dhpAckMsg)
+		if marshalErr != nil {
+			log.Error("server-agent(%s#%d@%s)[HandleKnockRequest] failed to marshal DHP ack message: %v", knkMsg.UserId, transactionId, addrStr, marshalErr)
+			return marshalErr
+		}
 	}
 
 	ackMd := makeMsgData(ppd, core.NHP_ACK, ackBytes)

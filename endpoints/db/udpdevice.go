@@ -576,7 +576,11 @@ func (a *UdpDevice) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sy
 			aolMsg := &common.DBOnlineMsg{
 				DBId: dbId,
 			}
-			aolBytes, _ := json.Marshal(aolMsg)
+			aolBytes, marshalErr := json.Marshal(aolMsg)
+			if marshalErr != nil {
+				log.Error("db(%s)[DBOnline] failed to marshal DOL message: %v", dbId, marshalErr)
+				return
+			}
 
 			aolMd := &core.MsgData{
 				RemoteAddr:    sendAddr.(*net.UDPAddr),
@@ -726,7 +730,11 @@ func (a *UdpDevice) SendNHPDRG(server *core.UdpPeer, msg common.DRGMsg) bool {
 		log.Critical("device(%v)[SendNHPDRG] register server IP cannot be parsed", a)
 		return false
 	}
-	drgBytes, _ := json.Marshal(msg)
+	drgBytes, marshalErr := json.Marshal(msg)
+	if marshalErr != nil {
+		log.Error("device[SendNHPDRG] failed to marshal DRG message: %v", marshalErr)
+		return false
+	}
 	drgMd := &core.MsgData{
 		RemoteAddr:    sendAddr.(*net.UDPAddr),
 		HeaderType:    core.NHP_DRG,
@@ -848,13 +856,19 @@ func (a *UdpDevice) HandleUdpDataKeyWrappingOperations(ppd *core.PacketParserDat
 
 					dataPrkWrapping := ztdolib.NewDataPrivateKeyWrapping(dataPrkStore.ProviderPublicKeyBase64, dataPrkStore.DataPrivateKeyBase64, gcmKey[:], ad)
 
-					dataPrkWrappingJson, _ := json.Marshal(dataPrkWrapping)
-
-					kao := common.KeyAccessObject{
-						WrappedDataKey: string(dataPrkWrappingJson),
+					dataPrkWrappingJson, marshalErr := json.Marshal(dataPrkWrapping)
+					if marshalErr != nil {
+						log.Error("db(%s#%d)[HandleUdpDataKeyWrappingOperations] failed to marshal data private key wrapping: %v", dbId, transactionId, marshalErr)
+						errCode, _ := strconv.Atoi(common.ErrDataPrivateKeyStore.ErrorCode())
+						dwaMsg.ErrCode = errCode
+						dwaMsg.ErrMsg = fmt.Sprintf("failed to marshal data private key wrapping: %v", marshalErr)
+					} else {
+						kao := common.KeyAccessObject{
+							WrappedDataKey: string(dataPrkWrappingJson),
+						}
+						dwaMsg.Kao = &kao
+						dwaMsg.DoId = dwrMsg.DoId
 					}
-					dwaMsg.Kao = &kao
-					dwaMsg.DoId = dwrMsg.DoId
 				}
 			}
 		}
@@ -865,7 +879,11 @@ func (a *UdpDevice) HandleUdpDataKeyWrappingOperations(ppd *core.PacketParserDat
 		dwaMsg.ErrMsg = err.Error()
 	}
 
-	dwaBytes, _ := json.Marshal(dwaMsg)
+	dwaBytes, marshalErr := json.Marshal(dwaMsg)
+	if marshalErr != nil {
+		log.Error("db(%s#%d)[HandleUdpDataKeyWrappingOperations] failed to marshal DWA message: %v", dbId, transactionId, marshalErr)
+		return marshalErr
+	}
 	md := &core.MsgData{
 		HeaderType:     core.NHP_DWA,
 		TransactionId:  transactionId,
