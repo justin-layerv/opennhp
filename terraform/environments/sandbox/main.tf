@@ -530,12 +530,12 @@ output "auth0_api_identifier" {
 }
 
 output "auth0_backend_service_client_id" {
-  description = "Auth0 backend service M2M client ID for QURL API"
+  description = "Website playground M2M client ID (legacy name: 'backend') — NOT for CI/smoke tests"
   value       = module.auth0.backend_service_client_id
 }
 
 output "auth0_backend_credentials_secret_arn" {
-  description = "Secrets Manager ARN for Auth0 backend credentials (client_id, client_secret, audience)"
+  description = "Secrets Manager ARN for website playground proxy credentials — NOT for CI/smoke tests"
   value       = module.auth0.backend_credentials_secret_arn
 }
 

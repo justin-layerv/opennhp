@@ -6,18 +6,18 @@ output "api_identifier" {
 }
 
 output "backend_service_client_id" {
-  description = "The backend service M2M client ID"
+  description = "Website playground M2M client ID (legacy name: 'backend_service')"
   value       = auth0_client.backend_service.client_id
 }
 
 output "backend_service_client_secret" {
-  description = "The backend service M2M client secret (stored in Secrets Manager)"
+  description = "Website playground M2M client secret (stored in Secrets Manager)"
   value       = auth0_client_credentials.backend_service.client_secret
   sensitive   = true
 }
 
 output "backend_credentials_secret_arn" {
-  description = "ARN of the Secrets Manager secret containing Auth0 backend credentials"
+  description = "ARN of Secrets Manager secret for website playground proxy (legacy name: 'backend')"
   value       = aws_secretsmanager_secret.auth0_backend.arn
 }
 

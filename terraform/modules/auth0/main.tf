@@ -67,11 +67,14 @@ resource "auth0_resource_server_scopes" "qurl_scopes" {
 # ==============================================================================
 # Machine-to-Machine Application (for backend services)
 # ==============================================================================
-# For service-to-service communication (e.g., QURL internal API calls)
+# Used by the developer portal playground proxy to call the QURL API on behalf
+# of playground users.  Despite the legacy "backend_service" resource name, this
+# client is NOT a general-purpose service account — it runs on the free tier.
+# For CI/smoke tests, use the dedicated smoke_test client (system tier).
 
 resource "auth0_client" "backend_service" {
-  name        = "Backend Service (${var.environment})"
-  description = "M2M client for backend services - ${var.environment}"
+  name        = "Website Playground (${var.environment})"
+  description = "M2M client for developer portal playground proxy - ${var.environment}"
   app_type    = "non_interactive"
 
   # Grant types
@@ -136,14 +139,18 @@ locals {
 }
 
 resource "aws_secretsmanager_secret" "auth0_backend" {
+  # Legacy name — this secret is consumed by the developer portal playground
+  # proxy, NOT by general backend services.  Kept as-is to avoid a destructive
+  # rename (Secrets Manager requires delete + recreate).
   name                    = "${var.name_prefix}-auth0-backend-credentials"
-  description             = "Auth0 M2M client credentials for backend service (${var.environment})"
+  description             = "Auth0 M2M credentials for website playground proxy (${var.environment}) — NOT for CI/smoke tests"
   recovery_window_in_days = local.is_prod ? 30 : 0
   kms_key_id              = var.secrets_kms_key_arn
 
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-auth0-backend-credentials"
     Component = "auth0"
+    Purpose   = "playground-proxy"
   })
 }
 
