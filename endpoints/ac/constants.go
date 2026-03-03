@@ -8,7 +8,7 @@ const (
 	PacketQueueSizePerConnection = 256
 
 	ReportToServerInterval         = common.ReportToServerInterval
-	MinialServerDiscoveryInterval  = common.MinimalServerDiscoveryInterval
+	MinimalServerDiscoveryInterval = common.MinimalServerDiscoveryInterval
 	ServerKeepaliveInterval        = common.ServerKeepaliveInterval
 	ServerDiscoveryRetryBeforeFail = common.ServerDiscoveryRetryBeforeFail
 

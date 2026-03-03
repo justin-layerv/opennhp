@@ -691,7 +691,7 @@ func (a *UdpDevice) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sy
 			return
 		case <-quit:
 			return
-		case <-time.After(MinialServerDiscoveryInterval * time.Second):
+		case <-time.After(MinimalServerDiscoveryInterval * time.Second):
 			// wait for ServerConnectionDiscoveryInterval
 		}
 	}

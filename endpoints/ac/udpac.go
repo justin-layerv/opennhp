@@ -618,7 +618,7 @@ func (a *UdpAC) maintainServerConnectionRoutine() {
 					return
 				case <-quitCheck:
 					return
-				case <-time.After(MinialServerDiscoveryInterval * time.Second):
+				case <-time.After(MinimalServerDiscoveryInterval * time.Second):
 					// Skip fail-open logic if no servers configured (cloud mode uses registration, not discovery)
 					if len(discoveryFailStatusArr) == 0 {
 						log.Debug("Cloud mode: skipping fail-open check (no static servers configured)")
@@ -684,7 +684,7 @@ func (a *UdpAC) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sync.W
 				return
 			case <-quit:
 				return
-			case <-time.After(MinialServerDiscoveryInterval * time.Second):
+			case <-time.After(MinimalServerDiscoveryInterval * time.Second):
 				continue
 			}
 		}
@@ -886,7 +886,7 @@ func (a *UdpAC) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sync.W
 			return
 		case <-quit:
 			return
-		case <-time.After(MinialServerDiscoveryInterval * time.Second):
+		case <-time.After(MinimalServerDiscoveryInterval * time.Second):
 			// wait for ServerConnectionDiscoveryInterval
 		}
 	}
