@@ -483,10 +483,9 @@ jobs:
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     # Steps run sequentially even for component=both.
-    # Timeout: refresh (max 60m) + health check (max 30m) + buffer (5m) = 95m.
-    # Health checks use a shorter range (2-30m) than refresh (5-60m) because target
-    # group registration should be faster than a full instance refresh cycle.
-    timeout-minutes: 95
+    # Per-component timeout: refresh (max 60m) + health check (max 30m) + buffer (5m) = 95m.
+    # For component=both, two sequential components (2 * 95m = 190m) + extra buffer (10m) = 200m.
+    timeout-minutes: ${{ inputs.component == 'both' && 200 || 95 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
