@@ -224,16 +224,6 @@ variable "default_open_time" {
 
 # ==================== Rate Limiting ====================
 
-variable "owner_rate_limit" {
-  description = "Rate limit for authenticated owner routes (requests per minute)"
-  type        = number
-}
-
-variable "owner_rate_burst" {
-  description = "Burst allowance for authenticated owner routes"
-  type        = number
-}
-
 variable "ip_rate_limit" {
   description = "Rate limit for IP-based internal routes (requests per minute)"
   type        = number

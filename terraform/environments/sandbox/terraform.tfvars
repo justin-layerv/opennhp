@@ -244,10 +244,8 @@ qurl_site_domain         = "qurl.site.layerv.xyz"
 qurl_site_hosted_zone_id = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone (same account)
 
 # Rate limiting (requests per minute)
-qurl_owner_rate_limit = 200 # authenticated owner routes
-qurl_owner_rate_burst = 50
-qurl_ip_rate_limit    = 300 # internal API routes
-qurl_ip_rate_burst    = 100
+qurl_ip_rate_limit = 300 # internal API routes
+qurl_ip_rate_burst = 100
 
 # Audit log retention
 qurl_audit_retention_days = 90

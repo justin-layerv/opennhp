@@ -1145,10 +1145,8 @@ module "qurl_service" {
   default_open_time    = var.qurl_default_open_time
 
   # Rate limiting
-  owner_rate_limit = var.qurl_owner_rate_limit
-  owner_rate_burst = var.qurl_owner_rate_burst
-  ip_rate_limit    = var.qurl_ip_rate_limit
-  ip_rate_burst    = var.qurl_ip_rate_burst
+  ip_rate_limit = var.qurl_ip_rate_limit
+  ip_rate_burst = var.qurl_ip_rate_burst
 
   # Redis (distributed rate limiting)
   redis_enabled           = var.deploy_redis

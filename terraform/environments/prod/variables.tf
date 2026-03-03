@@ -380,28 +380,6 @@ variable "qurl_site_hosted_zone_id" {
   }
 }
 
-variable "qurl_owner_rate_limit" {
-  description = "Rate limit for authenticated owner routes (requests per minute)"
-  type        = number
-  default     = 200
-
-  validation {
-    condition     = var.qurl_owner_rate_limit > 0 && var.qurl_owner_rate_limit <= 10000
-    error_message = "qurl_owner_rate_limit must be between 1 and 10000 requests per minute"
-  }
-}
-
-variable "qurl_owner_rate_burst" {
-  description = "Burst allowance for authenticated owner routes"
-  type        = number
-  default     = 50
-
-  validation {
-    condition     = var.qurl_owner_rate_burst > 0 && var.qurl_owner_rate_burst <= 1000
-    error_message = "qurl_owner_rate_burst must be between 1 and 1000"
-  }
-}
-
 variable "qurl_ip_rate_limit" {
   description = "Rate limit for IP-based internal routes (requests per minute)"
   type        = number

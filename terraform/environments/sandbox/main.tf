@@ -90,8 +90,6 @@ module "nhp" {
   qurl_link_domain                = var.qurl_link_domain
   qurl_site_domain                = var.qurl_site_domain
   qurl_site_hosted_zone_id        = var.qurl_site_hosted_zone_id
-  qurl_owner_rate_limit           = var.qurl_owner_rate_limit
-  qurl_owner_rate_burst           = var.qurl_owner_rate_burst
   qurl_ip_rate_limit              = var.qurl_ip_rate_limit
   qurl_ip_rate_burst              = var.qurl_ip_rate_burst
 

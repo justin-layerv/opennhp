@@ -111,8 +111,6 @@ module "qurl_service" {
 
 | Variable | Description | Type | Required |
 |----------|-------------|------|----------|
-| `owner_rate_limit` | Rate limit for authenticated owner routes (req/min) | `number` | Yes |
-| `owner_rate_burst` | Burst allowance for authenticated owner routes | `number` | Yes |
 | `ip_rate_limit` | Rate limit for IP-based internal routes (req/min) | `number` | Yes |
 | `ip_rate_burst` | Burst allowance for IP-based internal routes | `number` | Yes |
 
