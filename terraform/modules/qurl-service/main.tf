@@ -164,6 +164,11 @@ locals {
       { name = "LICENSE_EVENTS_ENABLED", value = "true" },
       { name = "LICENSE_EVENTS_QUEUE_URL", value = var.license_events_queue_url },
     ] : [],
+    # Usage events (billing metered usage reporting via SQS)
+    var.usage_events_enabled ? [
+      { name = "USAGE_EVENTS_ENABLED", value = "true" },
+      { name = "USAGE_SQS_QUEUE_URL", value = var.usage_events_queue_url },
+    ] : [],
     # Idempotency table (for distributed idempotency)
     var.idempotency_table_name != "" ? [
       { name = "IDEMPOTENCY_TABLE_NAME", value = var.idempotency_table_name },
@@ -193,6 +198,9 @@ locals {
     # Stripe billing integration (for checkout, portal, invoices)
     var.stripe_secret_arn != "" ? [
       { name = "STRIPE_SECRET_ARN", value = var.stripe_secret_arn },
+      { name = "GROWTH_PRICE_ID", value = var.stripe_growth_price_id },
+      { name = "STRIPE_CHECKOUT_SUCCESS_URL", value = var.stripe_checkout_success_url },
+      { name = "STRIPE_CHECKOUT_CANCEL_URL", value = var.stripe_checkout_cancel_url },
     ] : [],
     # OpenTelemetry configuration
     # When Grafana Cloud is enabled, OTEL exports to the local ADOT sidecar
@@ -434,6 +442,28 @@ resource "aws_iam_role_policy" "task_stripe_secret" {
         Sid      = "KMSDecryptStripeSecret"
         Effect   = "Allow"
         Action   = ["kms:Decrypt"]
+        Resource = [var.secrets_kms_key_arn]
+    }] : [])
+  })
+}
+
+resource "aws_iam_role_policy" "task_usage_events" {
+  count = var.usage_events_queue_arn != "" ? 1 : 0
+  name  = "usage-events-sqs-send"
+  role  = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat([{
+      Sid      = "SQSSendUsageEvents"
+      Effect   = "Allow"
+      Action   = ["sqs:SendMessage"]
+      Resource = [var.usage_events_queue_arn]
+      }],
+      var.secrets_kms_key_arn != null ? [{
+        Sid      = "KMSEncryptSQS"
+        Effect   = "Allow"
+        Action   = ["kms:GenerateDataKey", "kms:Decrypt"]
         Resource = [var.secrets_kms_key_arn]
     }] : [])
   })

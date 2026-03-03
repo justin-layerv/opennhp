@@ -293,9 +293,22 @@ module "nhp" {
   developer_portal_hosted_zone_id         = var.developer_portal_hosted_zone_id
   developer_portal_ci_bypass_secret_name  = var.developer_portal_ci_bypass_secret_name
 
-  # Billing — not yet deployed to production.
-  # Wire remaining billing variables here when ready to enable in prod.
-  deploy_billing = var.deploy_billing
+  # Billing
+  deploy_billing                     = var.deploy_billing
+  billing_stripe_secret_name         = var.billing_stripe_secret_name
+  billing_stripe_webhook_secret_name = var.billing_stripe_webhook_secret_name
+  billing_stripe_api_base_url        = var.billing_stripe_api_base_url
+  billing_growth_price_id            = var.billing_growth_price_id
+  billing_base_fee_price_id          = var.billing_base_fee_price_id
+  billing_success_url                = var.billing_success_url
+  billing_cancel_url                 = var.billing_cancel_url
+  billing_allowed_origins            = var.billing_allowed_origins
+  billing_from_email                 = var.billing_from_email
+  billing_ses_region                 = var.billing_ses_region
+  billing_grace_period_days          = var.billing_grace_period_days
+  billing_downgrade_after_days       = var.billing_downgrade_after_days
+  billing_api_throttle_burst_limit   = var.billing_api_throttle_burst_limit
+  billing_api_throttle_rate_limit    = var.billing_api_throttle_rate_limit
 
   # QURL ECS capacity
   qurl_desired_count            = var.qurl_desired_count

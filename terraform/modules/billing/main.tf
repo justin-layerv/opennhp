@@ -1,12 +1,10 @@
 # Billing Module
 #
 # Deploys infrastructure for Stripe billing integration:
-# - Checkout session Lambda (creates Stripe Checkout/Portal sessions)
 # - Stripe webhook Lambda (processes Stripe webhook events)
 # - Usage reporter Lambda (SQS consumer, reports metered usage to Stripe)
 # - Reconciliation Lambda (daily, compares usage counts)
 # - Payment grace Lambda (hourly, freezes past-due accounts)
-# - Invoices Lambda (returns customer invoices from Stripe)
 # - API Gateway HTTP API with JWT authorizer
 # - SQS queue + DLQ for usage events
 # - EventBridge scheduled rules

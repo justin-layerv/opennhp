@@ -340,16 +340,18 @@ class TestPublishCustomerUpdated:
         mock_sns = MagicMock()
         with patch.object(mod, 'sns', mock_sns), \
              patch.object(mod, 'SNS_TOPIC_ARN', 'arn:aws:sns:us-east-1:123:topic'):
-            mod._publish_customer_updated('checkout.session.completed', {'customer': 'cus_1'})
+            mod._publish_customer_updated('checkout.session.completed', {'customer': 'cus_1'}, 'auth0|test1')
             mock_sns.publish.assert_called_once()
             call_kwargs = mock_sns.publish.call_args[1]
             assert call_kwargs['Subject'] == 'customer.updated'
+            msg = json.loads(call_kwargs['Message'])
+            assert msg['auth0_subject'] == 'auth0|test1'
 
     def test_skips_when_no_sns(self, mod):
         with patch.object(mod, 'sns', None), \
              patch.object(mod, 'SNS_TOPIC_ARN', ''):
             # Should not raise
-            mod._publish_customer_updated('checkout.session.completed', {'customer': 'cus_1'})
+            mod._publish_customer_updated('checkout.session.completed', {'customer': 'cus_1'}, 'auth0|test1')
 
 
 # ---------------------------------------------------------------------------
@@ -609,21 +611,24 @@ class TestPublishCustomerUpdatedFix:
             mod._publish_customer_updated('invoice.paid', {
                 'customer': 'cus_correct',
                 'metadata': {'customer': 'cus_wrong'},
-            })
+            }, 'auth0|paid_user')
             call_kwargs = mock_sns.publish.call_args[1]
             msg = json.loads(call_kwargs['Message'])
             assert msg['stripe_customer_id'] == 'cus_correct'
+            assert msg['auth0_subject'] == 'auth0|paid_user'
 
     def test_empty_customer_still_publishes(self, mod):
         """Should still publish even if customer field is empty."""
         mock_sns = MagicMock()
         with patch.object(mod, 'sns', mock_sns), \
-             patch.object(mod, 'SNS_TOPIC_ARN', 'arn:aws:sns:us-east-1:123:topic'):
+             patch.object(mod, 'SNS_TOPIC_ARN', 'arn:aws:sns:us-east-1:123:topic'), \
+             patch.object(mod, '_find_auth0_sub_by_stripe_id', return_value=None):
             mod._publish_customer_updated('checkout.session.completed', {})
             mock_sns.publish.assert_called_once()
             call_kwargs = mock_sns.publish.call_args[1]
             msg = json.loads(call_kwargs['Message'])
             assert msg['stripe_customer_id'] == ''
+            assert msg['auth0_subject'] == ''
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +708,7 @@ class TestWebhookIntegration:
             msg = json.loads(sns_kwargs['Message'])
             assert msg['event_type'] == 'checkout.session.completed'
             assert msg['stripe_customer_id'] == 'cus_integ1'
+            assert msg['auth0_subject'] == 'auth0|integ1'
 
     def test_payment_failed_full_chain(self, mod):
         """invoice.payment_failed → DDB update (grace deadline) → SNS publish."""

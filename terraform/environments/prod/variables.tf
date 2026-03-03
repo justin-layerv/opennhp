@@ -1199,6 +1199,90 @@ variable "deploy_billing" {
   default     = false
 }
 
+variable "billing_stripe_secret_name" {
+  description = "Secrets Manager secret name for Stripe API key"
+  type        = string
+  default     = null
+}
+
+variable "billing_stripe_webhook_secret_name" {
+  description = "Secrets Manager secret name for Stripe webhook signing secret"
+  type        = string
+  default     = null
+}
+
+variable "billing_stripe_api_base_url" {
+  description = "Base URL for Stripe API"
+  type        = string
+  default     = "https://api.stripe.com"
+}
+
+variable "billing_growth_price_id" {
+  description = "Stripe Price ID for the Growth plan metered usage component"
+  type        = string
+  default     = ""
+}
+
+variable "billing_base_fee_price_id" {
+  description = "Stripe Price ID for the Growth plan base fee"
+  type        = string
+  default     = ""
+}
+
+variable "billing_success_url" {
+  description = "URL to redirect to after successful Stripe Checkout"
+  type        = string
+  default     = null
+}
+
+variable "billing_cancel_url" {
+  description = "URL to redirect to when user cancels Stripe Checkout"
+  type        = string
+  default     = null
+}
+
+variable "billing_allowed_origins" {
+  description = "List of allowed CORS origins for billing API"
+  type        = list(string)
+  default     = []
+}
+
+variable "billing_from_email" {
+  description = "SES verified sender email for grace period notifications"
+  type        = string
+  default     = null
+}
+
+variable "billing_ses_region" {
+  description = "AWS region for SES"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "billing_grace_period_days" {
+  description = "Days after payment failure before account is frozen"
+  type        = number
+  default     = 7
+}
+
+variable "billing_downgrade_after_days" {
+  description = "Days after account freeze before downgrade to free tier"
+  type        = number
+  default     = 30
+}
+
+variable "billing_api_throttle_burst_limit" {
+  description = "API Gateway throttle burst limit for billing API"
+  type        = number
+  default     = 10
+}
+
+variable "billing_api_throttle_rate_limit" {
+  description = "API Gateway throttle rate limit for billing API"
+  type        = number
+  default     = 5
+}
+
 variable "developer_portal_custom_domain" {
   description = "Custom domain for developer portal API"
   type        = string

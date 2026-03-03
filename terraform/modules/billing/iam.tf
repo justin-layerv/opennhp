@@ -261,7 +261,7 @@ resource "aws_iam_role_policy" "reconciliation" {
           Resource = "*"
           Condition = {
             StringEquals = {
-              "cloudwatch:namespace" = "LayerV/Billing"
+              "cloudwatch:namespace" = var.metrics_namespace
             }
           }
         }
@@ -357,7 +357,7 @@ resource "aws_iam_role_policy" "payment_grace" {
           Resource = "*"
           Condition = {
             StringEquals = {
-              "cloudwatch:namespace" = "LayerV/Billing"
+              "cloudwatch:namespace" = var.metrics_namespace
             }
           }
         }

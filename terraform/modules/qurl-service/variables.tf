@@ -631,6 +631,42 @@ variable "stripe_secret_arn" {
   default     = ""
 }
 
+variable "stripe_growth_price_id" {
+  description = "Stripe Price ID for the Growth plan"
+  type        = string
+  default     = ""
+}
+
+variable "stripe_checkout_success_url" {
+  description = "Redirect URL after successful Stripe Checkout"
+  type        = string
+  default     = ""
+}
+
+variable "stripe_checkout_cancel_url" {
+  description = "Redirect URL when user cancels Stripe Checkout"
+  type        = string
+  default     = ""
+}
+
+variable "usage_events_enabled" {
+  description = "Enable sending usage events to billing SQS queue"
+  type        = bool
+  default     = false
+}
+
+variable "usage_events_queue_url" {
+  description = "SQS queue URL for billing usage events"
+  type        = string
+  default     = ""
+}
+
+variable "usage_events_queue_arn" {
+  description = "SQS queue ARN for IAM permissions"
+  type        = string
+  default     = ""
+}
+
 variable "adot_collector_image" {
   description = "ADOT Collector container image. Uses AWS public ECR for the official ADOT image."
   type        = string

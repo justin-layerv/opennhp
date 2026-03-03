@@ -160,7 +160,22 @@ traefik_plugins = {
 qurl_router_enabled = true
 
 # CORS
-qurl_cors_allowed_origins = "https://console.nhp.layerv.ai,https://qurl.link,https://*.qurl.site"
+# Note: website origins appear here (QURL API) AND in dashboard_allowed_origins
+# (billing/developer-portal APIs) because they are separate CORS configurations.
+qurl_cors_allowed_origins = "https://console.nhp.layerv.ai,https://qurl.link,https://*.qurl.site,https://layerv.ai,https://www.layerv.ai"
+
+# Dashboard CORS origins (shared by developer portal, billing API)
+dashboard_allowed_origins = ["https://layerv.ai", "https://www.layerv.ai"]
+
+# Billing — When enabling deploy_billing in prod, set these values:
+# billing_stripe_secret_name         = "layerv-nhp-prod-stripe-credentials"
+# billing_stripe_webhook_secret_name = "layerv-nhp-prod-stripe-webhook-secret"
+# billing_growth_price_id            = "price_xxx"  # from Stripe dashboard
+# billing_base_fee_price_id          = "price_xxx"  # from Stripe dashboard
+# billing_success_url                = "https://layerv.ai/qurl/dashboard/billing?success=true"
+# billing_cancel_url                 = "https://layerv.ai/qurl/dashboard/billing?cancelled=true"
+# billing_allowed_origins            = ["https://layerv.ai", "https://www.layerv.ai"]
+# billing_from_email                 = "billing@layerv.ai"
 
 # Audit log retention (production: longer retention)
 qurl_audit_retention_days = 365

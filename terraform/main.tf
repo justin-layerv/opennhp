@@ -1091,6 +1091,11 @@ module "redis" {
   tags               = local.common_tags
 }
 
+data "aws_secretsmanager_secret" "billing_stripe" {
+  count = var.billing_stripe_secret_name != null ? 1 : 0
+  name  = var.billing_stripe_secret_name
+}
+
 module "qurl_service" {
   count  = var.deploy_qurl_service ? 1 : 0
   source = "./modules/qurl-service"
@@ -1133,6 +1138,17 @@ module "qurl_service" {
   secrets_kms_key_arn        = module.kms.secrets_key_arn
   jwt_secret_arn             = var.qurl_jwt_secret_arn
   internal_service_token_arn = var.qurl_internal_service_token_arn
+
+  # Stripe billing
+  stripe_secret_arn           = var.billing_stripe_secret_name != null ? data.aws_secretsmanager_secret.billing_stripe[0].arn : ""
+  stripe_growth_price_id      = var.billing_growth_price_id
+  stripe_checkout_success_url = var.deploy_billing ? var.billing_success_url : ""
+  stripe_checkout_cancel_url  = var.deploy_billing ? var.billing_cancel_url : ""
+
+  # Usage events (billing metered usage)
+  usage_events_enabled   = var.deploy_billing
+  usage_events_queue_url = var.deploy_billing ? module.billing[0].usage_events_queue_url : ""
+  usage_events_queue_arn = var.deploy_billing ? module.billing[0].usage_events_queue_arn : ""
 
   # KMS
   logs_kms_key_arn = module.kms.logs_key_arn

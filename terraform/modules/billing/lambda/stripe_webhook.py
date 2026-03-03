@@ -143,21 +143,22 @@ def lambda_handler(event, context):
 
     # Route to event handlers
     customer_changed = False
+    auth0_sub = None
     try:
         if event_type == 'checkout.session.completed':
-            _handle_checkout_completed(event_data)
+            auth0_sub = _handle_checkout_completed(event_data)
             customer_changed = True
         elif event_type == 'customer.subscription.updated':
-            _handle_subscription_updated(event_data)
+            auth0_sub = _handle_subscription_updated(event_data)
             customer_changed = True
         elif event_type == 'customer.subscription.deleted':
-            _handle_subscription_deleted(event_data)
+            auth0_sub = _handle_subscription_deleted(event_data)
             customer_changed = True
         elif event_type == 'invoice.payment_failed':
-            _handle_payment_failed(event_data)
+            auth0_sub = _handle_payment_failed(event_data)
             customer_changed = True
         elif event_type == 'invoice.paid':
-            _handle_payment_succeeded(event_data)
+            auth0_sub = _handle_payment_succeeded(event_data)
             customer_changed = True
         else:
             logger.info("Unhandled event type", extra={"event_type": event_type})
@@ -172,7 +173,7 @@ def lambda_handler(event, context):
 
     # Publish SNS notification so QURL service can invalidate cached customer data
     if customer_changed:
-        _publish_customer_updated(event_type, event_data)
+        _publish_customer_updated(event_type, event_data, auth0_sub)
 
     return cors_response(event, 200, {'received': True})
 
@@ -299,7 +300,7 @@ def _handle_checkout_completed(session):
 
     if not customer_id:
         logger.warning("checkout.session.completed missing customer ID")
-        return
+        return None
 
     # Find customer by stripe_customer_id if auth0_sub not in metadata
     if not auth0_sub:
@@ -308,7 +309,7 @@ def _handle_checkout_completed(session):
             logger.error("Cannot find customer for checkout", extra={
                 "stripe_customer_id": customer_id,
             })
-            return
+            return None
 
     # Retrieve subscription details for sub_item_id and period start
     sub_item_id = ''
@@ -366,6 +367,8 @@ def _handle_checkout_completed(session):
         })
         raise
 
+    return auth0_sub
+
 
 def _handle_subscription_updated(subscription):
     """
@@ -383,7 +386,7 @@ def _handle_subscription_updated(subscription):
         logger.warning("subscription.updated: customer not found", extra={
             "stripe_customer_id": customer_id,
         })
-        return
+        return None
 
     # Extract subscription item ID for metered usage reporting
     items = subscription.get('items', {}).get('data', [])
@@ -428,6 +431,8 @@ def _handle_subscription_updated(subscription):
         })
         raise
 
+    return auth0_sub
+
 
 def _handle_subscription_deleted(subscription):
     """
@@ -442,7 +447,7 @@ def _handle_subscription_deleted(subscription):
         logger.warning("subscription.deleted: customer not found", extra={
             "stripe_customer_id": customer_id,
         })
-        return
+        return None
 
     now = datetime.now(timezone.utc).isoformat()
     try:
@@ -472,6 +477,8 @@ def _handle_subscription_deleted(subscription):
         })
         raise
 
+    return auth0_sub
+
 
 def _handle_payment_failed(invoice):
     """
@@ -487,7 +494,7 @@ def _handle_payment_failed(invoice):
         logger.warning("invoice.payment_failed: customer not found", extra={
             "stripe_customer_id": customer_id,
         })
-        return
+        return None
 
     grace_deadline = (
         datetime.now(timezone.utc) + timedelta(days=GRACE_PERIOD_DAYS)
@@ -519,6 +526,8 @@ def _handle_payment_failed(invoice):
         })
         raise
 
+    return auth0_sub
+
 
 def _handle_payment_succeeded(invoice):
     """
@@ -533,7 +542,7 @@ def _handle_payment_succeeded(invoice):
         logger.warning("invoice.paid: customer not found", extra={
             "stripe_customer_id": customer_id,
         })
-        return
+        return None
 
     now = datetime.now(timezone.utc).isoformat()
     try:
@@ -559,6 +568,8 @@ def _handle_payment_succeeded(invoice):
             "error": str(e), "auth0_sub": auth0_sub,
         })
         raise
+
+    return auth0_sub
 
 
 # ---------------------------------------------------------------------------
@@ -624,13 +635,16 @@ def _write_audit(owner_id, event_type, details):
 # SNS Notification
 # ---------------------------------------------------------------------------
 
-def _publish_customer_updated(event_type, event_data):
+def _publish_customer_updated(event_type, event_data, auth0_subject=None):
     """Publish customer.updated event to SNS for cache invalidation."""
     if not sns or not SNS_TOPIC_ARN:
         return
 
-    # All handled events have 'customer' as a top-level field on the data object
     customer_id = event_data.get('customer', '')
+
+    # Use provided auth0_subject, or look it up
+    if not auth0_subject:
+        auth0_subject = _find_auth0_sub_by_stripe_id(customer_id)
 
     try:
         sns.publish(
@@ -639,6 +653,7 @@ def _publish_customer_updated(event_type, event_data):
             Message=json.dumps({
                 'event_type': event_type,
                 'stripe_customer_id': customer_id,
+                'auth0_subject': auth0_subject or '',
                 'timestamp': datetime.now(timezone.utc).isoformat(),
             }),
             MessageAttributes={
@@ -651,6 +666,7 @@ def _publish_customer_updated(event_type, event_data):
         logger.info("Published customer.updated to SNS", extra={
             "event_type": event_type,
             "stripe_customer_id": customer_id,
+            "auth0_subject": auth0_subject or '',
         })
     except Exception as e:
         # Non-fatal — webhook already updated DynamoDB
