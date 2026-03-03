@@ -43,7 +43,11 @@ func (p *PolicyImpl) OnAttestationCollect() (attestation string) {
 		ProductName:     "Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz",
 	}
 
-	attestationJson, _ := json.Marshal(attestationStruct)
+	attestationJson, err := json.Marshal(attestationStruct)
+	if err != nil {
+		policy.Log("OnAttestationCollect: failed to marshal attestation: " + err.Error())
+		return "{}"
+	}
 
 	return string(attestationJson)
 }

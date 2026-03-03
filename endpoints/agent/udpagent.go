@@ -968,7 +968,11 @@ func (a *UdpAgent) SendDARMsgToServer(server *core.UdpPeer, msg common.DARMsg) (
 		log.Critical("device(%v)[SendDARMsgToServer] register server IP cannot be parsed", a)
 		return false, nil
 	}
-	drgBytes, _ := json.Marshal(msg)
+	drgBytes, marshalErr := json.Marshal(msg)
+	if marshalErr != nil {
+		log.Error("[Agent] SendDARMsgToServer failed to marshal DAR message: %v", marshalErr)
+		return false, nil
+	}
 	drgMd := &core.MsgData{
 		RemoteAddr:    sendAddr.(*net.UDPAddr),
 		HeaderType:    core.NHP_DAR,
@@ -1051,7 +1055,11 @@ func (a *UdpAgent) SendDAVMsgToServer(server *core.UdpPeer, msg common.DAVMsg) (
 		log.Critical("device(%v)[SendDAVMsgToServer] register server IP cannot be parsed", a)
 		return false, nil
 	}
-	davBytes, _ := json.Marshal(msg)
+	davBytes, marshalErr := json.Marshal(msg)
+	if marshalErr != nil {
+		log.Error("[Agent] SendDAVMsgToServer failed to marshal DAV message: %v", marshalErr)
+		return false, nil
+	}
 	davMd := &core.MsgData{
 		RemoteAddr:    sendAddr.(*net.UDPAddr),
 		HeaderType:    core.NHP_DAV,

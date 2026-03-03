@@ -74,7 +74,11 @@ func (a *UdpAgent) knockRequest(res *KnockTarget, useCookie bool) (ackMsg *commo
 	}
 	a.knockUserMutex.RUnlock()
 
-	knkBytes, _ := json.Marshal(knkMsg)
+	knkBytes, marshalErr := json.Marshal(knkMsg)
+	if marshalErr != nil {
+		log.Error("agent(%s)[Knock] failed to marshal KNK message: %v", knkMsg.UserId, marshalErr)
+		return nil, marshalErr
+	}
 	headerType := core.NHP_KNK
 	if useCookie {
 		headerType = core.NHP_RKN
@@ -160,7 +164,11 @@ func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnoc
 	}
 	a.knockUserMutex.RUnlock()
 
-	knkBytes, _ := json.Marshal(knkMsg)
+	knkBytes, marshalErr := json.Marshal(knkMsg)
+	if marshalErr != nil {
+		log.Error("agent(%s)[ExitKnockRequest] failed to marshal EXT message: %v", knkMsg.UserId, marshalErr)
+		return nil, marshalErr
+	}
 	knkMd := a.newMsgData(addr, core.NHP_EXT, knkBytes, serverPeer.PublicKey())
 	knkMd.ResponseMsgCh = make(chan *core.PacketParserData)
 
@@ -284,7 +292,11 @@ func (a *UdpAgent) processPreAccessAction(info *common.PreAccessInfo) error {
 		UserData:       a.knockUser.UserData,
 	}
 	a.knockUserMutex.RUnlock()
-	accBytes, _ := json.Marshal(accMsg)
+	accBytes, marshalErr := json.Marshal(accMsg)
+	if marshalErr != nil {
+		log.Error("agent(%s)[PreAccessRequest] failed to marshal ACC message: %v", accMsg.UserId, marshalErr)
+		return marshalErr
+	}
 
 	accMd := a.newMsgData(udpACAddr, core.NHP_ACC, accBytes, acPk)
 	accMd.EncryptedPktCh = make(chan *core.MsgAssemblerData)
@@ -374,7 +386,11 @@ func (a *UdpAgent) KnockDHP() (ackMsg *common.ServerDHPKnockAckMsg, err error) {
 	}
 	a.knockUserMutex.RUnlock()
 
-	knkBytes, _ := json.Marshal(knkMsg)
+	knkBytes, marshalErr := json.Marshal(knkMsg)
+	if marshalErr != nil {
+		log.Error("agent(%s)[KnockDHP] failed to marshal DHP_KNK message: %v", knkMsg.UserId, marshalErr)
+		return nil, marshalErr
+	}
 	knkMd := a.newMsgData(addr, core.DHP_KNK, knkBytes, serverPeer.PublicKey())
 	knkMd.ResponseMsgCh = make(chan *core.PacketParserData)
 

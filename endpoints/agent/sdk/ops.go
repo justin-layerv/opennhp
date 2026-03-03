@@ -11,6 +11,7 @@ import (
 	"github.com/OpenNHP/opennhp/endpoints/agent"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
+	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
 // instance holds the singleton agent. Only one binary (CGo or gomobile)
@@ -205,7 +206,11 @@ func KnockResource(aspId, resId, serverIp, serverHostname string, serverPort int
 	if target != nil {
 		ackMsg, _ = instance.Knock(target)
 	}
-	bytes, _ := json.Marshal(ackMsg)
+	bytes, err := json.Marshal(ackMsg)
+	if err != nil {
+		log.Error("[Agent SDK] KnockResource failed to marshal ack message: %v", err)
+		return "{}"
+	}
 	return string(bytes)
 }
 

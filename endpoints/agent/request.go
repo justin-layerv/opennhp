@@ -49,7 +49,11 @@ func (a *UdpAgent) RequestOtp(target *KnockTarget) error {
 		UserData:       a.knockUser.UserData,
 	}
 	a.knockUserMutex.RUnlock()
-	otpBytes, _ := json.Marshal(otpMsg)
+	otpBytes, marshalErr := json.Marshal(otpMsg)
+	if marshalErr != nil {
+		log.Error("agent(%s)[RequestOtp] failed to marshal OTP message: %v", otpMsg.UserId, marshalErr)
+		return marshalErr
+	}
 
 	serverPeer := target.GetServerPeer()
 	addr, err := resolveServerAddr(serverPeer, otpMsg.UserId, "RequestOtp")
@@ -82,7 +86,11 @@ func (a *UdpAgent) RegisterPublicKey(otp string, target *KnockTarget) (rakMsg *c
 		UserData:       a.knockUser.UserData,
 	}
 	a.knockUserMutex.RUnlock()
-	regBytes, _ := json.Marshal(regMsg)
+	regBytes, marshalErr := json.Marshal(regMsg)
+	if marshalErr != nil {
+		log.Error("agent(%s)[RegisterPublicKey] failed to marshal REG message: %v", regMsg.UserId, marshalErr)
+		return nil, marshalErr
+	}
 
 	serverPeer := target.GetServerPeer()
 	addr, err := resolveServerAddr(serverPeer, regMsg.UserId, "RegisterPublicKey")
@@ -145,7 +153,11 @@ func (a *UdpAgent) ListResource(target *KnockTarget) (lrtMsg *common.ServerListR
 		UserData:       a.knockUser.UserData,
 	}
 	a.knockUserMutex.RUnlock()
-	lstBytes, _ := json.Marshal(lstMsg)
+	lstBytes, marshalErr := json.Marshal(lstMsg)
+	if marshalErr != nil {
+		log.Error("agent(%s)[ListResource] failed to marshal LST message: %v", lstMsg.UserId, marshalErr)
+		return nil, marshalErr
+	}
 
 	serverPeer := target.GetServerPeer()
 	addr, err := resolveServerAddr(serverPeer, lstMsg.UserId, "ListResource")

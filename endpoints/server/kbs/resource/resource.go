@@ -154,7 +154,11 @@ func GetResource(c *gin.Context) {
 		"alg": "RSA1_5",
 		"enc": "A256GCM",
 	}
-	protectedJSON, _ := json.Marshal(protected)
+	protectedJSON, err := json.Marshal(protected)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, kbsError.ContentEncryptionFailed(err))
+		return
+	}
 
 	response := map[string]string{
 		"protected":     string(protectedJSON),

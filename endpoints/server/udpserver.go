@@ -1194,7 +1194,11 @@ func (s *UdpServer) processACOperation(knkMsg *common.AgentKnockMsg, conn *ACCon
 		DestinationAddrs: dstAddrs,
 		OpenTime:         openTime + ACOpenCompensationTime, // compensate ac open time
 	}
-	aopBytes, _ := json.Marshal(aopMsg)
+	aopBytes, marshalErr := json.Marshal(aopMsg)
+	if marshalErr != nil {
+		log.Error("server-agent(%s@%s)[processACOperation] failed to marshal AOP message: %v", knkMsg.UserId, srcAddr.String(), marshalErr)
+		return nil, marshalErr
+	}
 
 	aopMd := &core.MsgData{
 		ConnData:      conn.ConnData,
@@ -1524,7 +1528,11 @@ func (s *UdpServer) ProcessDataPrivateKeyWrapping(dwrMsg *common.DWRMsg, conn *D
 
 	dbAddrStr := conn.DBPeer.RecvAddr().String()
 
-	dwrBytes, _ := json.Marshal(dwrMsg)
+	dwrBytes, marshalErr := json.Marshal(dwrMsg)
+	if marshalErr != nil {
+		log.Error("server-db(%s)[ProcessDataPrivateKeyWrapping] failed to marshal DWR message: %v", dbAddrStr, marshalErr)
+		return nil, marshalErr
+	}
 
 	dwrMd := &core.MsgData{
 		ConnData:      conn.ConnData,
