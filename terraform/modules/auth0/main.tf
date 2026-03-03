@@ -712,3 +712,146 @@ resource "aws_ssm_parameter" "spa_api_audience" {
     prevent_destroy = true
   }
 }
+
+# ==============================================================================
+# Branding (Universal Login page appearance)
+# ==============================================================================
+# Configures the Auth0 Universal Login page with LayerV branding: logo, colors,
+# and theme. This affects the login/signup flow users see.
+
+resource "auth0_branding" "layerv" {
+  logo_url = var.branding_logo_url
+
+  colors {
+    primary         = var.branding_primary_color
+    page_background = var.branding_page_background
+  }
+}
+
+resource "auth0_branding_theme" "layerv" {
+  depends_on = [auth0_branding.layerv]
+
+  borders {
+    button_border_radius = 8
+    button_border_weight = 0
+    buttons_style        = "rounded"
+    input_border_radius  = 8
+    input_border_weight  = 1
+    inputs_style         = "rounded"
+    show_widget_shadow   = true
+    widget_border_weight = 0
+    widget_corner_radius = 12
+  }
+
+  colors {
+    body_text                 = "#f9fafb"
+    error                     = "#ef4444"
+    header                    = "#f9fafb"
+    icons                     = "#9ca3af"
+    input_background          = "#1f2937"
+    input_border              = "#374151"
+    input_filled_text         = "#f9fafb"
+    input_labels_placeholders = "#9ca3af"
+    links_focused_components  = "#0099FF"
+    primary_button            = "#0099FF"
+    primary_button_label      = "#ffffff"
+    secondary_button_border   = "#374151"
+    secondary_button_label    = "#d1d5db"
+    success                   = "#10b981"
+    widget_background         = "#0a0f1a"
+    widget_border             = "#1f2937"
+  }
+
+  fonts {
+    links_style         = "normal"
+    reference_text_size = 16
+
+    body_text {
+      bold = false
+      size = 100
+    }
+
+    buttons_text {
+      bold = true
+      size = 100
+    }
+
+    input_labels {
+      bold = false
+      size = 100
+    }
+
+    links {
+      bold = false
+      size = 100
+    }
+
+    title {
+      bold = true
+      size = 150
+    }
+
+    subtitle {
+      bold = false
+      size = 100
+    }
+  }
+
+  page_background {
+    background_color = "#030712"
+    page_layout      = "center"
+  }
+
+  widget {
+    header_text_alignment = "center"
+    logo_height           = 40
+    logo_position         = "center"
+    logo_url              = var.branding_logo_url
+    social_buttons_layout = "top"
+  }
+}
+
+# ==============================================================================
+# Email Templates
+# ==============================================================================
+# Branded email templates for Auth0 transactional emails. Uses Auth0's built-in
+# email provider until SES production access is granted.
+#
+# Note: The from address will remain Auth0's default (no-reply@auth0user.net)
+# until a custom email provider (SES) is configured. The template bodies are
+# branded with LayerV styling regardless.
+
+resource "auth0_email_template" "verify_email" {
+  template                = "verify_email"
+  body                    = file("${path.module}/email-templates/verify_email.html")
+  from                    = var.email_from_address
+  subject                 = "Verify your email for LayerV"
+  syntax                  = "liquid"
+  url_lifetime_in_seconds = 432000 # 5 days
+  enabled                 = true
+  result_url              = var.email_result_url
+}
+
+resource "auth0_email_template" "welcome_email" {
+  template = "welcome_email"
+  body = templatefile("${path.module}/email-templates/welcome_email.html", {
+    dashboard_url = "${var.email_result_url}/qurl/dashboard/"
+  })
+  from                    = var.email_from_address
+  subject                 = "Welcome to LayerV"
+  syntax                  = "liquid"
+  url_lifetime_in_seconds = 0
+  enabled                 = true
+  result_url              = var.email_result_url
+}
+
+resource "auth0_email_template" "reset_email" {
+  template                = "reset_email"
+  body                    = file("${path.module}/email-templates/reset_email.html")
+  from                    = var.email_from_address
+  subject                 = "Reset your LayerV password"
+  syntax                  = "liquid"
+  url_lifetime_in_seconds = 432000 # 5 days
+  enabled                 = true
+  result_url              = var.email_result_url
+}

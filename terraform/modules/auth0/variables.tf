@@ -249,3 +249,51 @@ variable "auth0_custom_domain" {
     error_message = "auth0_custom_domain must be a valid domain name (e.g., auth.layerv.ai)"
   }
 }
+
+# ==============================================================================
+# Branding Configuration
+# ==============================================================================
+
+variable "branding_logo_url" {
+  description = "URL to the logo displayed on Auth0 Universal Login and emails"
+  type        = string
+  default     = "https://layerv.ai/layerv-wordmark.svg"
+}
+
+variable "branding_primary_color" {
+  description = "Primary brand color for Auth0 UI elements"
+  type        = string
+  default     = "#0099FF"
+
+  validation {
+    condition     = can(regex("^#[0-9a-fA-F]{6}$", var.branding_primary_color))
+    error_message = "branding_primary_color must be a 6-digit hex color (e.g., #0099FF)"
+  }
+}
+
+variable "branding_page_background" {
+  description = "Background color for Auth0 Universal Login page"
+  type        = string
+  default     = "#030712"
+
+  validation {
+    condition     = can(regex("^#[0-9a-fA-F]{6}$", var.branding_page_background))
+    error_message = "branding_page_background must be a 6-digit hex color (e.g., #030712)"
+  }
+}
+
+# ==============================================================================
+# Email Configuration
+# ==============================================================================
+
+variable "email_from_address" {
+  description = "From address for Auth0 transactional emails. Note: this only takes effect when a custom email provider (SES) is configured."
+  type        = string
+  default     = "LayerV <noreply@layerv.ai>"
+}
+
+variable "email_result_url" {
+  description = "URL to redirect users to after email actions (e.g., after verifying email)"
+  type        = string
+  default     = "https://layerv.ai"
+}
