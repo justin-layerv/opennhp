@@ -323,14 +323,14 @@ auth0_custom_domain = "auth.layerv.ai"
 
 # Callback URLs: Auth0 redirects here after login
 auth0_spa_callback_urls = [
-  "https://layerv.ai/qurl/dashboard/callback",
-  "https://layerv.ai/api/auth/callback",
+  "https://layerv.ai/qurl/dashboard/callback/",
+  "https://layerv.ai/api/auth/callback/",
 ]
 
 # Logout URLs: Auth0 redirects here after logout
 auth0_spa_logout_urls = [
   "https://layerv.ai",
-  "https://layerv.ai/qurl/dashboard",
+  "https://layerv.ai/qurl/dashboard/",
 ]
 
 # Web origins: allowed for CORS and silent authentication

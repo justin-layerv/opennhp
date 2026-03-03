@@ -452,18 +452,18 @@ auth0_custom_domain = "auth.layerv.ai"
 # Callback URLs: Auth0 redirects here after login
 # Include staging site + localhost for development
 auth0_spa_callback_urls = [
-  "https://staging.layerv.ai/qurl/dashboard/callback",
-  "https://staging.layerv.ai/api/auth/callback",
-  "http://localhost:3000/qurl/dashboard/callback",
-  "http://localhost:3000/api/auth/callback",
+  "https://staging.layerv.ai/qurl/dashboard/callback/",
+  "https://staging.layerv.ai/api/auth/callback/",
+  "http://localhost:3000/qurl/dashboard/callback/",
+  "http://localhost:3000/api/auth/callback/",
 ]
 
 # Logout URLs: Auth0 redirects here after logout
 auth0_spa_logout_urls = [
   "https://staging.layerv.ai",
-  "https://staging.layerv.ai/qurl/dashboard",
+  "https://staging.layerv.ai/qurl/dashboard/",
   "http://localhost:3000",
-  "http://localhost:3000/qurl/dashboard",
+  "http://localhost:3000/qurl/dashboard/",
 ]
 
 # Web origins: allowed for CORS and silent authentication
