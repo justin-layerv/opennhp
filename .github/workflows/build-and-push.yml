@@ -401,7 +401,7 @@ jobs:
         with:
           name: trivy-results-${{ matrix.image }}
           path: '${{ matrix.image }}-trivy-results.sarif'
-          retention-days: 30
+          retention-days: 7
 
       - name: Push to ECR
         if: needs.changes.outputs.app == 'true' && github.event_name != 'pull_request'

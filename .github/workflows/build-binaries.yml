@@ -4,11 +4,9 @@ name: Build Binaries
 
 on:
   push:
-    branches: ["main", "develop"]
+    branches: ["main"]
     tags:
       - 'v*'
-  pull_request:
-    branches: ["main"]
   workflow_dispatch:  # Manual trigger support
 
 # Restrict default permissions for security
@@ -130,28 +128,28 @@ jobs:
         with:
           name: nhp-agent-${{ matrix.goos }}-${{ matrix.goarch }}
           path: output/nhp-agent/
-          retention-days: 30
+          retention-days: 7
 
       - name: Upload nhp-ac artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: nhp-ac-${{ matrix.goos }}-${{ matrix.goarch }}
           path: output/nhp-ac/
-          retention-days: 30
+          retention-days: 7
 
       - name: Upload nhp-server artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: nhp-server-${{ matrix.goos }}-${{ matrix.goarch }}
           path: output/nhp-server/
-          retention-days: 30
+          retention-days: 7
 
       - name: Upload nhp-db artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: nhp-db-${{ matrix.goos }}-${{ matrix.goarch }}
           path: output/nhp-db/
-          retention-days: 30
+          retention-days: 7
 
       # Create complete package artifact
       - name: Create archive (Unix)
@@ -173,7 +171,7 @@ jobs:
         with:
           name: opennhp-${{ matrix.goos }}-${{ matrix.goarch }}
           path: output/opennhp-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.archive_ext }}
-          retention-days: 30
+          retention-days: 7
 
   # Aggregate artifacts from all platforms
   summary:
@@ -198,7 +196,7 @@ jobs:
         with:
           name: opennhp-all-platforms
           path: all-artifacts/opennhp-*/
-          retention-days: 30
+          retention-days: 7
 
   # Create official release when a tag is pushed
   release:
