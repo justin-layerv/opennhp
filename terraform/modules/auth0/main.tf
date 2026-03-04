@@ -27,8 +27,11 @@ resource "auth0_resource_server" "qurl_api" {
   # Skip consent for first-party applications
   skip_consent_for_verifiable_first_party_clients = true
 
-  # Enforce policies
+  # RBAC: enforce policies and include permissions claim in access tokens.
+  # The "User" role (below) grants qurl:read/qurl:write to all users.
+  # The post-login Action ensures new users get permissions immediately.
   enforce_policies = true
+  token_dialect    = "access_token_authz"
 
   # Prevent accidental deletion of API definition
   lifecycle {
@@ -61,6 +64,73 @@ resource "auth0_resource_server_scopes" "qurl_scopes" {
   scopes {
     name        = "qurl:admin"
     description = "Administrative access to all QURL resources"
+  }
+}
+
+# ==============================================================================
+# RBAC Roles
+# ==============================================================================
+# Default role assigned to all dashboard users. The post-login Action
+# auto-injects these permissions into the access token so users get
+# access immediately — no manual role assignment required.
+
+resource "auth0_role" "user" {
+  name        = "User"
+  description = "Default role for QURL dashboard users (${var.environment})"
+}
+
+resource "auth0_role_permissions" "user" {
+  role_id = auth0_role.user.id
+
+  permissions {
+    resource_server_identifier = auth0_resource_server.qurl_api.identifier
+    name                       = "qurl:read"
+  }
+
+  permissions {
+    resource_server_identifier = auth0_resource_server.qurl_api.identifier
+    name                       = "qurl:write"
+  }
+}
+
+# ==============================================================================
+# Post-Login Action — Inject Default Permissions
+# ==============================================================================
+# Every authenticated user gets qurl:read and qurl:write in their access
+# token. This Action merges default permissions with any existing RBAC
+# permissions so manual role assignments are additive, not required.
+#
+# Why an Action instead of just RBAC roles?
+# - RBAC permissions only appear in the token AFTER a role is assigned.
+# - New users have no roles on first login, so they'd get 403.
+# - The Action guarantees permissions from the very first token.
+
+resource "auth0_action" "default_permissions" {
+  name    = "Inject Default Permissions (${var.environment})"
+  runtime = "node18"
+  deploy  = true
+
+  supported_triggers {
+    id      = "post-login"
+    version = "v3"
+  }
+
+  code = <<-EOT
+    exports.onExecutePostLogin = async (event, api) => {
+      const defaultPerms = ['qurl:read', 'qurl:write'];
+      const existing = event.authorization?.permissions || [];
+      const merged = [...new Set([...existing, ...defaultPerms])];
+      api.accessToken.setCustomClaim('permissions', merged);
+    };
+  EOT
+}
+
+resource "auth0_trigger_actions" "post_login" {
+  trigger = "post-login"
+
+  actions {
+    id           = auth0_action.default_permissions.id
+    display_name = auth0_action.default_permissions.name
   }
 }
 
