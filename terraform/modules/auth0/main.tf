@@ -28,8 +28,11 @@ resource "auth0_resource_server" "qurl_api" {
   skip_consent_for_verifiable_first_party_clients = true
 
   # RBAC: enforce policies and include permissions claim in access tokens.
-  # The "User" role (below) grants qurl:read/qurl:write to all users.
-  # The post-login Action ensures new users get permissions immediately.
+  # Note: RBAC owns the `permissions` claim — Actions cannot override it via
+  # setCustomClaim('permissions', ...). The post-login Action below injects
+  # default permissions into the namespaced `https://layerv.ai/permissions`
+  # claim instead, which the QURL validator checks alongside `scope` and
+  # `permissions`.
   enforce_policies = true
   token_dialect    = "access_token_authz"
 
@@ -118,9 +121,9 @@ resource "auth0_action" "default_permissions" {
   code = <<-EOT
     exports.onExecutePostLogin = async (event, api) => {
       const defaultPerms = ['qurl:read', 'qurl:write'];
-      const existing = event.authorization?.permissions || [];
-      const merged = [...new Set([...existing, ...defaultPerms])];
-      api.accessToken.setCustomClaim('permissions', merged);
+      const rbacPerms = event.authorization?.permissions || [];
+      const merged = [...new Set([...rbacPerms, ...defaultPerms])];
+      api.accessToken.setCustomClaim('https://layerv.ai/permissions', merged);
     };
   EOT
 }
