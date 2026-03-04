@@ -109,7 +109,7 @@ resource "auth0_role_permissions" "user" {
 # - The Action guarantees permissions from the very first token.
 
 resource "auth0_action" "default_permissions" {
-  name    = "Inject Default Permissions (${var.environment})"
+  name    = "Post-Login Security Gates (${var.environment})"
   runtime = "node18"
   deploy  = true
 
@@ -120,6 +120,33 @@ resource "auth0_action" "default_permissions" {
 
   code = <<-EOT
     exports.onExecutePostLogin = async (event, api) => {
+      // --- Gate 1: Block disposable email domains ---
+      // Last updated: 2026-03, source: https://github.com/disposable-email-domains/disposable-email-domains
+      const disposableDomains = [
+        'mailinator.com', 'guerrillamail.com', 'guerrillamail.de',
+        'yopmail.com', 'tempmail.com', 'throwaway.email',
+        'temp-mail.org', 'fakeinbox.com', 'sharklasers.com',
+        'guerrillamailblock.com', 'grr.la', 'dispostable.com',
+        'maildrop.cc', 'mailnesia.com', 'trashmail.com',
+        'getnada.com', 'tempail.com', 'mohmal.com',
+        'minutemail.com', 'emailondeck.com'
+      ];
+      const emailDomain = (event.user.email || '').split('@')[1]?.toLowerCase();
+      if (emailDomain && disposableDomains.includes(emailDomain)) {
+        api.access.deny('Disposable email addresses are not allowed. Please sign up with a permanent email.');
+        return;
+      }
+
+      // --- Gate 2: Require email verification (email/password only) ---
+      // Social logins (Google, GitHub) always have verified emails, so this
+      // only blocks unverified email/password signups. Allow first login
+      // attempt so the user can receive the verification email.
+      if (!event.user.email_verified && event.stats.logins_count > 0) {
+        api.access.deny('Please verify your email address before logging in. Check your inbox for a verification link.');
+        return;
+      }
+
+      // --- Inject default permissions ---
       const defaultPerms = ['qurl:read', 'qurl:write'];
       const rbacPerms = event.authorization?.permissions || [];
       const merged = [...new Set([...rbacPerms, ...defaultPerms])];
@@ -881,6 +908,61 @@ resource "auth0_branding_theme" "layerv" {
     logo_position         = "center"
     logo_url              = var.branding_logo_url
     social_buttons_layout = "top"
+  }
+}
+
+# ==============================================================================
+# Attack Protection (Bot Detection, Brute Force, Breached Passwords)
+# ==============================================================================
+# Tenant-level singleton resource. Bot detection starts in monitoring mode
+# to observe traffic before enforcing. Brute force, suspicious IP throttling,
+# and breached password detection enforce immediately (low false-positive risk).
+#
+# Auth0 plan requirement: Bot Detection and Breached Password Detection
+# require B2C Essentials plan or higher.
+
+resource "auth0_attack_protection" "protection" {
+  bot_detection {
+    bot_detection_level             = var.bot_detection_level
+    challenge_password_policy       = "when_risky"
+    challenge_passwordless_policy   = "when_risky"
+    challenge_password_reset_policy = "always"
+    monitoring_mode_enabled         = var.bot_detection_monitoring
+  }
+
+  brute_force_protection {
+    enabled      = true
+    max_attempts = var.brute_force_max_attempts
+    mode         = "count_per_identifier_and_ip"
+    shields      = ["block", "user_notification"]
+  }
+
+  suspicious_ip_throttling {
+    enabled = true
+    shields = ["admin_notification", "block"]
+
+    # Rate = window in seconds over which max_attempts is counted.
+    # These are Auth0's documented defaults from the provider docs.
+    pre_login {
+      max_attempts = 100
+      rate         = 864000 # 10 days — long window catches slow-and-steady attacks
+    }
+
+    pre_user_registration {
+      max_attempts = 50
+      rate         = 1200 # 20 minutes — tighter window for signup spam
+    }
+  }
+
+  breached_password_detection {
+    enabled                      = true
+    method                       = "standard"
+    shields                      = ["admin_notification", "block"]
+    admin_notification_frequency = ["daily"]
+
+    pre_user_registration {
+      shields = ["admin_notification", "block"]
+    }
   }
 }
 

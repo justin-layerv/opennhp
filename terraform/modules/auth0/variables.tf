@@ -251,6 +251,38 @@ variable "auth0_custom_domain" {
 }
 
 # ==============================================================================
+# Attack Protection Configuration
+# ==============================================================================
+
+variable "bot_detection_level" {
+  description = "Bot detection sensitivity level (low, medium, high). Higher levels catch more bots but may challenge more legitimate users."
+  type        = string
+  default     = "medium"
+
+  validation {
+    condition     = contains(["low", "medium", "high"], var.bot_detection_level)
+    error_message = "bot_detection_level must be one of: low, medium, high"
+  }
+}
+
+variable "bot_detection_monitoring" {
+  description = "Enable monitoring mode for bot detection. When true, Auth0 logs risk assessments without blocking. Set to false after ~1 week of traffic observation to enforce."
+  type        = bool
+  default     = true
+}
+
+variable "brute_force_max_attempts" {
+  description = "Number of failed login attempts per IP+identifier before blocking"
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.brute_force_max_attempts >= 3 && var.brute_force_max_attempts <= 100
+    error_message = "brute_force_max_attempts must be between 3 and 100"
+  }
+}
+
+# ==============================================================================
 # Branding Configuration
 # ==============================================================================
 
