@@ -7,6 +7,15 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const (
+	// requestIDKey must stay aligned with server.RequestIDKey in
+	// endpoints/server/requestid.go. If these values drift, health handlers may
+	// miss middleware-injected IDs and return empty request IDs unexpectedly.
+	//
+	// Duplicating this constant avoids an import cycle: server -> health -> server.
+	requestIDKey = "request_id"
+)
+
 // Handler handles health check HTTP endpoints.
 type Handler struct {
 	manager *Manager
@@ -46,7 +55,7 @@ func (h *Handler) Liveness(c *gin.Context) {
 	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
 
 	// Extract request ID for distributed tracing
-	requestID := c.GetHeader("X-Request-ID")
+	requestID := GetRequestID(c)
 	resp := h.manager.CheckLivenessWithRequestID(c.Request.Context(), requestID)
 
 	c.JSON(http.StatusOK, LivenessResponse{
@@ -70,7 +79,7 @@ func (h *Handler) Readiness(c *gin.Context) {
 	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
 
 	// Extract request ID for distributed tracing
-	requestID := c.GetHeader("X-Request-ID")
+	requestID := GetRequestID(c)
 	resp := h.manager.CheckReadinessWithRequestID(c.Request.Context(), requestID)
 
 	httpStatus := http.StatusOK
@@ -101,7 +110,7 @@ func (h *Handler) Startup(c *gin.Context) {
 	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
 
 	// Extract request ID for distributed tracing
-	requestID := c.GetHeader("X-Request-ID")
+	requestID := GetRequestID(c)
 	resp := h.manager.CheckStartupWithRequestID(c.Request.Context(), requestID)
 
 	httpStatus := http.StatusOK
@@ -125,6 +134,23 @@ func (h *Handler) Startup(c *gin.Context) {
 // This is an alias for the readiness check.
 func (h *Handler) Health(c *gin.Context) {
 	h.Readiness(c)
+}
+
+// GetRequestID retrieves the request ID from Gin context.
+//
+// Health handlers intentionally read request IDs from context only, not directly
+// from headers. This keeps behavior aligned with middleware-driven request ID
+// propagation in the server package. Routes using this helper must run behind
+// requestIDMiddleware to guarantee request_id is populated.
+//
+// It mirrors server/requestid.go behavior and avoids package import cycles.
+func GetRequestID(c *gin.Context) string {
+	if id, exists := c.Get(requestIDKey); exists {
+		if s, ok := id.(string); ok {
+			return s
+		}
+	}
+	return ""
 }
 
 // RegisterRoutes registers health check routes on the given Gin engine.

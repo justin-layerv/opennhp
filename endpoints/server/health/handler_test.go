@@ -37,6 +37,10 @@ func (m *handlerTestChecker) Check(_ context.Context) *CheckResult {
 }
 
 func setupTestHandler(checkers ...Checker) (*Handler, *gin.Engine) {
+	return setupTestHandlerWithMiddleware(nil, checkers...)
+}
+
+func setupTestHandlerWithMiddleware(mw gin.HandlerFunc, checkers ...Checker) (*Handler, *gin.Engine) {
 	cfg := &ManagerConfig{
 		Service:        "test-service",
 		Version:        "1.0.0",
@@ -50,9 +54,21 @@ func setupTestHandler(checkers ...Checker) (*Handler, *gin.Engine) {
 
 	handler := NewHandler(manager)
 	router := gin.New()
+	if mw != nil {
+		router.Use(mw)
+	}
 	handler.RegisterRoutes(router)
 
 	return handler, router
+}
+
+func testRequestIDMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if id := c.GetHeader("X-Request-ID"); id != "" {
+			c.Set(requestIDKey, id)
+		}
+		c.Next()
+	}
 }
 
 func TestHandler_Liveness(t *testing.T) {
@@ -290,7 +306,7 @@ func TestHandler_RegisterRoutes(t *testing.T) {
 func TestHandler_Liveness_RequestID(t *testing.T) {
 	t.Parallel()
 
-	_, router := setupTestHandler()
+	_, router := setupTestHandlerWithMiddleware(testRequestIDMiddleware())
 
 	req, _ := http.NewRequest("GET", "/health/live", nil)
 	req.Header.Set("X-Request-ID", "test-request-123")
@@ -319,7 +335,7 @@ func TestHandler_Readiness_RequestID(t *testing.T) {
 		status:   CheckStatusPass,
 		critical: true,
 	}
-	_, router := setupTestHandler(checker)
+	_, router := setupTestHandlerWithMiddleware(testRequestIDMiddleware(), checker)
 
 	req, _ := http.NewRequest("GET", "/health/ready", nil)
 	req.Header.Set("X-Request-ID", "test-request-456")
@@ -340,6 +356,35 @@ func TestHandler_Readiness_RequestID(t *testing.T) {
 	}
 }
 
+func TestHandler_Health_RequestID(t *testing.T) {
+	t.Parallel()
+
+	checker := &handlerTestChecker{
+		name:     "etcd",
+		status:   CheckStatusPass,
+		critical: true,
+	}
+	_, router := setupTestHandlerWithMiddleware(testRequestIDMiddleware(), checker)
+
+	req, _ := http.NewRequest("GET", "/health", nil)
+	req.Header.Set("X-Request-ID", "test-request-health")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+
+	// /health is an alias to readiness; request ID should propagate identically.
+	var resp ReadinessResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if resp.RequestID != "test-request-health" {
+		t.Errorf("expected request_id 'test-request-health', got '%s'", resp.RequestID)
+	}
+}
+
 func TestHandler_Startup_RequestID(t *testing.T) {
 	t.Parallel()
 
@@ -348,7 +393,7 @@ func TestHandler_Startup_RequestID(t *testing.T) {
 		status:   CheckStatusPass,
 		critical: true,
 	}
-	_, router := setupTestHandler(checker)
+	_, router := setupTestHandlerWithMiddleware(testRequestIDMiddleware(), checker)
 
 	req, _ := http.NewRequest("GET", "/health/startup", nil)
 	req.Header.Set("X-Request-ID", "test-request-789")
@@ -556,6 +601,26 @@ func TestHandler_Integration_RequestIDOmittedWhenEmpty(t *testing.T) {
 	}
 }
 
+func TestHandler_Integration_RequestIDHeaderIgnoredWithoutMiddleware(t *testing.T) {
+	t.Parallel()
+
+	_, router := setupTestHandler()
+
+	// Header alone is not enough; request ID must be injected into context by middleware.
+	req, _ := http.NewRequest("GET", "/health/live", nil)
+	req.Header.Set("X-Request-ID", "header-only-id")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if _, ok := resp["request_id"]; ok {
+		t.Error("expected request_id to be omitted without middleware context injection")
+	}
+}
+
 func TestBaseHealthResponse_JSONSerialization(t *testing.T) {
 	t.Parallel()
 
@@ -617,5 +682,46 @@ func TestBaseHealthResponse_JSONSerialization(t *testing.T) {
 	}
 	if parsed["checks"] == nil {
 		t.Error("expected checks field in ReadinessResponse")
+	}
+}
+
+func TestGetRequestID_FromContext(t *testing.T) {
+	t.Parallel()
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Set(requestIDKey, "context-id-123")
+
+	req, _ := http.NewRequest("GET", "/", nil)
+	req.Header.Set("X-Request-ID", "header-id-456")
+	c.Request = req
+
+	if id := GetRequestID(c); id != "context-id-123" {
+		t.Errorf("expected context ID, got %q", id)
+	}
+}
+
+func TestGetRequestID_EmptyContext(t *testing.T) {
+	t.Parallel()
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest("GET", "/", nil)
+
+	if id := GetRequestID(c); id != "" {
+		t.Errorf("expected empty request ID, got %q", id)
+	}
+}
+
+func TestGetRequestID_NonStringValue(t *testing.T) {
+	t.Parallel()
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Set(requestIDKey, 12345) // non-string value should be ignored
+	c.Request, _ = http.NewRequest("GET", "/", nil)
+
+	if id := GetRequestID(c); id != "" {
+		t.Errorf("expected empty request ID for non-string context value, got %q", id)
 	}
 }
