@@ -105,13 +105,16 @@ provider "aws" {
 }
 
 # Auth0 provider for identity management
-# Credentials MUST be passed via environment variables (required, no defaults):
-#   TF_VAR_auth0_tf_client_id     - M2M client ID with Management API access
-#   TF_VAR_auth0_tf_client_secret - M2M client secret
-# In CI: These are set from GitHub Secrets (AUTH0_CLIENT_ID, AUTH0_CLIENT_SECRET)
-# Locally: Export these env vars before running terraform
+# Uses EITHER api_token (CI) OR client_id+client_secret (local dev) — never both,
+# because the provider's schema marks them as ConflictsWith each other.
+#
+# CI: fetch-auth0-token.sh fetches one token, passed via TF_VAR_auth0_api_token.
+#     client_id/client_secret are still passed (for the variable definitions) but
+#     the ternary nulls them out so the provider only sees api_token.
+# Local: auth0_api_token defaults to "" so client_id/client_secret are used.
 provider "auth0" {
   domain        = var.auth0_domain
-  client_id     = var.auth0_tf_client_id
-  client_secret = var.auth0_tf_client_secret
+  api_token     = var.auth0_api_token != "" ? var.auth0_api_token : null
+  client_id     = var.auth0_api_token == "" ? var.auth0_tf_client_id : null
+  client_secret = var.auth0_api_token == "" ? var.auth0_tf_client_secret : null
 }

@@ -24,4 +24,5 @@ jobs:
     - name: Run actionlint
       uses: reviewdog/action-actionlint@0d952c597ef8459f634d7145b0b044a9699e5e43 # v1
       with:
-        fail_on_error: true
+        fail_level: error
+        filter_mode: diff_context

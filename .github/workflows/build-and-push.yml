@@ -106,14 +106,16 @@ jobs:
 
       - name: Change Detection Summary
         run: |
-          echo "## Change Detection Results" >> $GITHUB_STEP_SUMMARY
-          echo "| Category | Changed |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|---------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Any code | ${{ steps.filter.outputs.code }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| App (nhp, endpoints, docker) | ${{ steps.filter.outputs.app }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Infrastructure (terraform) | ${{ steps.filter.outputs.infra }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Tests | ${{ steps.filter.outputs.tests }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Lambdas | ${{ steps.filter.outputs.lambdas }} |" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Change Detection Results"
+            echo "| Category | Changed |"
+            echo "|----------|---------|"
+            echo "| Any code | ${{ steps.filter.outputs.code }} |"
+            echo "| App (nhp, endpoints, docker) | ${{ steps.filter.outputs.app }} |"
+            echo "| Infrastructure (terraform) | ${{ steps.filter.outputs.infra }} |"
+            echo "| Tests | ${{ steps.filter.outputs.tests }} |"
+            echo "| Lambdas | ${{ steps.filter.outputs.lambdas }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Annotate skipped jobs
         if: steps.filter.outputs.code == 'false'
@@ -136,14 +138,16 @@ jobs:
         id: meta
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+            echo "environment=${{ github.event.inputs.environment }}" >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            echo "environment=sandbox" >> $GITHUB_OUTPUT
+            echo "environment=sandbox" >> "$GITHUB_OUTPUT"
           else
-            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "environment=dev" >> "$GITHUB_OUTPUT"
           fi
-          echo "image_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
-          echo "start_time=$(date +%s)" >> $GITHUB_OUTPUT
+          {
+            echo "image_tag=${{ github.sha }}"
+            echo "start_time=$(date +%s)"
+          } >> "$GITHUB_OUTPUT"
 
   # ============================================================================
   # TEST - Runs after terraform validation/plan passes (or is skipped)
@@ -340,9 +344,9 @@ jobs:
           ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
           IMAGE_TAG="${{ needs.setup.outputs.image_tag }}"
           if [[ -n "$ECR_REGISTRY" ]]; then
-            echo "name=$ECR_REGISTRY/${{ matrix.repo }}:$IMAGE_TAG" >> $GITHUB_OUTPUT
+            echo "name=$ECR_REGISTRY/${{ matrix.repo }}:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
           else
-            echo "name=local/${{ matrix.repo }}:$IMAGE_TAG" >> $GITHUB_OUTPUT
+            echo "name=local/${{ matrix.repo }}:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Scan image
@@ -406,9 +410,9 @@ jobs:
           IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
           ENV_TAG: ${{ needs.setup.outputs.environment }}
         run: |
-          docker push $ECR_REGISTRY/${{ matrix.repo }}:$IMAGE_TAG
-          docker push $ECR_REGISTRY/${{ matrix.repo }}:$ENV_TAG
-          docker push $ECR_REGISTRY/${{ matrix.repo }}:latest
+          docker push "$ECR_REGISTRY/${{ matrix.repo }}:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/${{ matrix.repo }}:$ENV_TAG"
+          docker push "$ECR_REGISTRY/${{ matrix.repo }}:latest"
           echo "::notice::Image pushed: $ECR_REGISTRY/${{ matrix.repo }}:$IMAGE_TAG"
 
       # Update SSM parameter with the new image tag
@@ -466,10 +470,10 @@ jobs:
 
           # Check if any terraform files changed
           if git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -q '^terraform/'; then
-            echo "terraform_changed=true" >> $GITHUB_OUTPUT
+            echo "terraform_changed=true" >> "$GITHUB_OUTPUT"
             echo "Terraform files changed - running validation"
           else
-            echo "terraform_changed=false" >> $GITHUB_OUTPUT
+            echo "terraform_changed=false" >> "$GITHUB_OUTPUT"
             echo "No terraform files changed - skipping validation"
           fi
 
@@ -533,6 +537,14 @@ jobs:
         working-directory: terraform/environments/sandbox
         run: terraform validate
 
+      - name: Fetch Auth0 Token
+        id: auth0
+        if: steps.changes.outputs.terraform_changed == 'true'
+        env:
+          AUTH0_CLIENT_ID: ${{ secrets.AUTH0_CLIENT_ID }}
+          AUTH0_CLIENT_SECRET: ${{ secrets.AUTH0_CLIENT_SECRET }}
+        run: ./.github/scripts/fetch-auth0-token.sh terraform/environments/sandbox/terraform.tfvars sandbox
+
       - name: Terraform Plan
         id: plan
         if: steps.changes.outputs.terraform_changed == 'true'
@@ -545,13 +557,16 @@ jobs:
           # Auth0 Terraform provider credentials
           TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
           TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
+          TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
         run: |
           set -o pipefail
           terraform plan -no-color 2>&1 | tee plan.txt
-          echo "## Terraform Plan" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          tail -50 plan.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Terraform Plan"
+            echo '```'
+            tail -50 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment PR with Plan
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
@@ -583,14 +598,16 @@ jobs:
       - name: Skip Notice
         if: steps.changes.outputs.terraform_changed != 'true'
         run: |
-          echo "## Terraform Validation Skipped" >> $GITHUB_STEP_SUMMARY
-          echo "No terraform files changed in this PR." >> $GITHUB_STEP_SUMMARY
+          echo "## Terraform Validation Skipped" >> "$GITHUB_STEP_SUMMARY"
+          echo "No terraform files changed in this PR." >> "$GITHUB_STEP_SUMMARY"
 
   # ============================================================================
-  # TERRAFORM PLAN - Runs in parallel with test and build
+  # TERRAFORM VALIDATE (main) - Lightweight validation before deploy
+  # No terraform plan here — deploy-sandbox-infra runs plan+apply in one job,
+  # saving 1 M2M token per merge (the old plan artifact was never consumed).
   # ============================================================================
   terraform-plan:
-    name: Terraform Plan (${{ matrix.environment }})
+    name: Terraform Pre-Deploy Checks (${{ matrix.environment }})
     needs: [setup, terraform-validate]  # Validate must pass (or be skipped) before plan
     if: |
       always() &&
@@ -605,8 +622,6 @@ jobs:
     strategy:
       matrix:
         environment: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', github.event.inputs.environment)) || fromJSON('["sandbox"]') }}
-    outputs:
-      has_changes: ${{ steps.plan.outputs.has_changes }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -656,55 +671,6 @@ jobs:
       - name: Terraform Validate
         working-directory: terraform/environments/${{ matrix.environment }}
         run: terraform validate
-
-      - name: Validate Auth0 Credentials
-        env:
-          AUTH0_CLIENT_ID: ${{ secrets.AUTH0_CLIENT_ID }}
-          AUTH0_CLIENT_SECRET: ${{ secrets.AUTH0_CLIENT_SECRET }}
-        run: ./.github/scripts/validate-auth0-credentials.sh "terraform/environments/${{ matrix.environment }}/terraform.tfvars" "${{ matrix.environment }}"
-
-      - name: Terraform Plan
-        id: plan
-        working-directory: terraform/environments/${{ matrix.environment }}
-        env:
-          # Sensitive variables passed via TF_VAR_ environment variables
-          TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
-          TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
-          # AC license key (plaintext - stored in Secrets Manager)
-          TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
-          # Grafana Cloud API token for dashboard provisioning
-          TF_VAR_grafana_auth: ${{ secrets.GRAFANA_AUTH }}
-          # Auth0 Terraform provider credentials
-          TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
-          TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
-          # Deployment configuration - use commit SHA for immutable deployments
-          TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
-        run: |
-          set -o pipefail
-          terraform plan -out=tfplan -no-color 2>&1 | tee plan.txt
-
-          if grep -q "No changes" plan.txt; then
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-          else
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Upload Plan Artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: tfplan-${{ matrix.environment }}-${{ github.sha }}
-          path: |
-            terraform/environments/${{ matrix.environment }}/tfplan
-            terraform/environments/${{ matrix.environment }}/plan.txt
-          retention-days: 5
-
-      - name: Plan Summary
-        run: |
-          echo "## Terraform Plan (${{ matrix.environment }})" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          head -100 terraform/environments/${{ matrix.environment }}/plan.txt >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================================
   # DEPLOY SANDBOX - Split into parallel jobs for faster deploys
@@ -769,11 +735,12 @@ jobs:
           export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
           terraform init
 
-      - name: Validate Auth0 Credentials
+      - name: Fetch Auth0 Token
+        id: auth0
         env:
           AUTH0_CLIENT_ID: ${{ secrets.AUTH0_CLIENT_ID }}
           AUTH0_CLIENT_SECRET: ${{ secrets.AUTH0_CLIENT_SECRET }}
-        run: ./.github/scripts/validate-auth0-credentials.sh terraform/environments/sandbox/terraform.tfvars sandbox
+        run: ./.github/scripts/fetch-auth0-token.sh terraform/environments/sandbox/terraform.tfvars sandbox
 
       - name: Handle ASG Attachment Migrations
         working-directory: terraform/environments/sandbox
@@ -785,6 +752,7 @@ jobs:
           # Auth0 Terraform provider credentials
           TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
           TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
+          TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         run: |
           set -euo pipefail
@@ -844,6 +812,7 @@ jobs:
           # Auth0 Terraform provider credentials
           TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
           TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
+          TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
           # Deployment configuration - use commit SHA for immutable deployments
           TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
         # Apply the plan generated in previous step (or fresh if no migrations)
@@ -860,11 +829,13 @@ jobs:
         id: outputs
         working-directory: terraform/environments/sandbox
         run: |
-          echo "server_asg=$(terraform output -raw asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
-          echo "ac_asg=$(terraform output -raw ac_asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
-          echo "console_ec2_asg=$(terraform output -raw console_ec2_asg_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
-          echo "nlb_dns=$(terraform output -raw nlb_dns_name 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
-          echo "etcd_endpoint=$(terraform output -raw etcd_endpoint 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+          {
+            echo "server_asg=$(terraform output -raw asg_name 2>/dev/null || echo '')"
+            echo "ac_asg=$(terraform output -raw ac_asg_name 2>/dev/null || echo '')"
+            echo "console_ec2_asg=$(terraform output -raw console_ec2_asg_name 2>/dev/null || echo '')"
+            echo "nlb_dns=$(terraform output -raw nlb_dns_name 2>/dev/null || echo '')"
+            echo "etcd_endpoint=$(terraform output -raw etcd_endpoint 2>/dev/null || echo '')"
+          } >> "$GITHUB_OUTPUT"
 
   deploy-sandbox-server:
     name: Deploy Sandbox - NHP Server
@@ -1132,8 +1103,10 @@ jobs:
 
           # Extract domain from URL (strip https://)
           LOGIN_PORTAL_DOMAIN="${QURL_LINK_URL#https://}"
-          echo "qurl_link_url=$QURL_LINK_URL" >> $GITHUB_OUTPUT
-          echo "login_portal_domain=$LOGIN_PORTAL_DOMAIN" >> $GITHUB_OUTPUT
+          {
+            echo "qurl_link_url=$QURL_LINK_URL"
+            echo "login_portal_domain=$LOGIN_PORTAL_DOMAIN"
+          } >> "$GITHUB_OUTPUT"
           echo "Using QURL link URL: $QURL_LINK_URL"
 
       - name: Run E2E Tests (Demo Flow)
@@ -1175,25 +1148,27 @@ jobs:
             esac
           }
 
-          echo "## Sandbox Deployment Complete" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Infrastructure" >> $GITHUB_STEP_SUMMARY
-          echo "| Component | ASG | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|-----|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| NHP Server | ${{ needs.deploy-sandbox-infra.outputs.server_asg }} | Deployed ✓ |" >> $GITHUB_STEP_SUMMARY
-          echo "| AC | ${{ needs.deploy-sandbox-infra.outputs.ac_asg }} | $(friendly_status "$AC_RESULT") |" >> $GITHUB_STEP_SUMMARY
-          echo "| Console EC2 | ${{ needs.deploy-sandbox-infra.outputs.console_ec2_asg || 'N/A' }} | $(friendly_status "$CONSOLE_RESULT") |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Endpoints" >> $GITHUB_STEP_SUMMARY
-          echo "- **NHP NLB:** \`${{ needs.deploy-sandbox-infra.outputs.nlb_dns }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **etcd:** \`${{ needs.deploy-sandbox-infra.outputs.etcd_endpoint }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Image Tag:** \`${{ needs.setup.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Validation" >> $GITHUB_STEP_SUMMARY
-          echo "- Post-deployment validation script executed" >> $GITHUB_STEP_SUMMARY
-          echo "- Integration tests completed (etcd tests skipped without mTLS certs)" >> $GITHUB_STEP_SUMMARY
-          echo "- E2E demo flow tests executed" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Sandbox Deployment Complete"
+            echo ""
+            echo "### Infrastructure"
+            echo "| Component | ASG | Status |"
+            echo "|-----------|-----|--------|"
+            echo "| NHP Server | ${{ needs.deploy-sandbox-infra.outputs.server_asg }} | Deployed ✓ |"
+            echo "| AC | ${{ needs.deploy-sandbox-infra.outputs.ac_asg }} | $(friendly_status "$AC_RESULT") |"
+            echo "| Console EC2 | ${{ needs.deploy-sandbox-infra.outputs.console_ec2_asg || 'N/A' }} | $(friendly_status "$CONSOLE_RESULT") |"
+            echo ""
+            echo "### Endpoints"
+            echo "- **NHP NLB:** \`${{ needs.deploy-sandbox-infra.outputs.nlb_dns }}\`"
+            echo "- **etcd:** \`${{ needs.deploy-sandbox-infra.outputs.etcd_endpoint }}\`"
+            echo ""
+            echo "**Image Tag:** \`${{ needs.setup.outputs.image_tag }}\`"
+            echo ""
+            echo "### Validation"
+            echo "- Post-deployment validation script executed"
+            echo "- Integration tests completed (etcd tests skipped without mTLS certs)"
+            echo "- E2E demo flow tests executed"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Update Deployment Tracking
         run: |

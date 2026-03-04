@@ -141,7 +141,7 @@ jobs:
         run: |
           if [[ -n "$QURL_IMAGE_TAG_INPUT" ]]; then
             echo "Using provided QURL image tag: $QURL_IMAGE_TAG_INPUT"
-            echo "qurl_image_tag=$QURL_IMAGE_TAG_INPUT" >> $GITHUB_OUTPUT
+            echo "qurl_image_tag=$QURL_IMAGE_TAG_INPUT" >> "$GITHUB_OUTPUT"
           elif [[ "$ROLLBACK" == "true" && "$DEPLOY_QURL" == "true" ]]; then
             echo "::error::rollback=true with deploy_qurl=true requires an explicit qurl_image_tag."
             echo "::error::QURL is not tracked by deployed-commit, so automatic rollback is not possible."
@@ -154,10 +154,10 @@ jobs:
               --query "Parameter.Value" --output text 2>/dev/null || echo "")
             if [[ -z "$QURL_TAG" || "$QURL_TAG" == "latest" ]]; then
               echo "::warning::Could not resolve QURL image tag from sandbox SSM"
-              echo "qurl_image_tag=" >> $GITHUB_OUTPUT
+              echo "qurl_image_tag=" >> "$GITHUB_OUTPUT"
             else
               echo "Resolved QURL image tag from sandbox SSM: $QURL_TAG"
-              echo "qurl_image_tag=$QURL_TAG" >> $GITHUB_OUTPUT
+              echo "qurl_image_tag=$QURL_TAG" >> "$GITHUB_OUTPUT"
             fi
           fi
 
@@ -202,11 +202,13 @@ jobs:
             SOAK_DURATION="unknown"
           fi
 
-          echo "active_color=$SANDBOX_ACTIVE_COLOR" >> $GITHUB_OUTPUT
-          echo "server_tag=$SANDBOX_SERVER_TAG" >> $GITHUB_OUTPUT
-          echo "ac_tag=$SANDBOX_AC_TAG" >> $GITHUB_OUTPUT
-          echo "qurl_tag=$SANDBOX_QURL_TAG" >> $GITHUB_OUTPUT
-          echo "soak_duration=$SOAK_DURATION" >> $GITHUB_OUTPUT
+          {
+            echo "active_color=$SANDBOX_ACTIVE_COLOR"
+            echo "server_tag=$SANDBOX_SERVER_TAG"
+            echo "ac_tag=$SANDBOX_AC_TAG"
+            echo "qurl_tag=$SANDBOX_QURL_TAG"
+            echo "soak_duration=$SOAK_DURATION"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Get image metadata from ECR
         id: ecr-metadata
@@ -244,9 +246,11 @@ jobs:
             QURL_PUSHED="N/A"
           fi
 
-          echo "server_pushed=$SERVER_PUSHED" >> $GITHUB_OUTPUT
-          echo "ac_pushed=$AC_PUSHED" >> $GITHUB_OUTPUT
-          echo "qurl_pushed=$QURL_PUSHED" >> $GITHUB_OUTPUT
+          {
+            echo "server_pushed=$SERVER_PUSHED"
+            echo "ac_pushed=$AC_PUSHED"
+            echo "qurl_pushed=$QURL_PUSHED"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials (prod - for state read)
         uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
@@ -270,10 +274,12 @@ jobs:
             --name "/prod/nhp/deploy/deployed-commit" \
             --query "Parameter.Value" --output text 2>/dev/null || echo "not deployed")
 
-          echo "server_tag=$PROD_SERVER_TAG" >> $GITHUB_OUTPUT
-          echo "ac_tag=$PROD_AC_TAG" >> $GITHUB_OUTPUT
-          echo "qurl_tag=$PROD_QURL_TAG" >> $GITHUB_OUTPUT
-          echo "deployed_commit=$PROD_DEPLOYED_COMMIT" >> $GITHUB_OUTPUT
+          {
+            echo "server_tag=$PROD_SERVER_TAG"
+            echo "ac_tag=$PROD_AC_TAG"
+            echo "qurl_tag=$PROD_QURL_TAG"
+            echo "deployed_commit=$PROD_DEPLOYED_COMMIT"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Resolve rollback target
         id: resolve-rollback
@@ -290,13 +296,13 @@ jobs:
               --query "Parameter.Value" --output text 2>/dev/null || echo "")
             if [[ -n "$PREV_COMMIT" && "$PREV_COMMIT" != "initial" ]]; then
               echo "Previous deployed-commit: $PREV_COMMIT"
-              echo "effective_image_tag=$PREV_COMMIT" >> $GITHUB_OUTPUT
+              echo "effective_image_tag=$PREV_COMMIT" >> "$GITHUB_OUTPUT"
             else
               echo "::warning::No deployed-commit-previous in SSM. Falling back to provided image_tag."
-              echo "effective_image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+              echo "effective_image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
             fi
           else
-            echo "effective_image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+            echo "effective_image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Generate changelog
@@ -321,7 +327,7 @@ jobs:
             echo "changelog<<CHANGELOG_EOF"
             echo "$CHANGELOG"
             echo "CHANGELOG_EOF"
-          } >> $GITHUB_OUTPUT
+          } >> "$GITHUB_OUTPUT"
 
       - name: Write promotion manifest
         env:
@@ -468,7 +474,7 @@ jobs:
             echo "| Rollback | $ROLLBACK |"
             echo "| Source | \`$SANDBOX_ACCOUNT_ID\` (sandbox ECR) |"
             echo "| Target | \`$PROD_ACCOUNT_ID\` (prod) |"
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"
 
           # Print compact log summary
           echo "============================================="
@@ -719,6 +725,13 @@ jobs:
           export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
           terraform init
 
+      - name: Fetch Auth0 Token
+        id: auth0
+        env:
+          AUTH0_CLIENT_ID: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
+          AUTH0_CLIENT_SECRET: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
+        run: ./.github/scripts/fetch-auth0-token.sh terraform/environments/prod/terraform.tfvars prod
+
       - name: Terraform Apply
         working-directory: terraform/environments/prod
         env:
@@ -728,6 +741,7 @@ jobs:
           TF_VAR_grafana_auth: ${{ secrets.PROD_GRAFANA_AUTH }}
           TF_VAR_auth0_tf_client_id: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
           TF_VAR_auth0_tf_client_secret: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
+          TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
           TF_VAR_confirm_prod_deployment: "yes-deploy-to-production"
           TF_VAR_image_tag: ${{ needs.manifest.outputs.effective_image_tag }}
           TF_VAR_cell_id: ${{ inputs.cell_id }}
@@ -773,16 +787,16 @@ jobs:
             --query "Parameter.Value" --output text 2>/dev/null || echo "")
 
           if [[ -n "$STATE_MACHINE_ARN" && "$STATE_MACHINE_ARN" != "initial" ]]; then
-            echo "deploy_method=canary" >> $GITHUB_OUTPUT
+            echo "deploy_method=canary" >> "$GITHUB_OUTPUT"
             ./.github/scripts/dispatch-and-poll-canary.sh server "$IMAGE_TAG" prod "$CELL_ID"
           else
-            echo "deploy_method=direct" >> $GITHUB_OUTPUT
+            echo "deploy_method=direct" >> "$GITHUB_OUTPUT"
             echo "::notice::No canary state machine — using direct SSM + instance refresh (first deploy)"
             ./.github/scripts/update-ssm-image-tag.sh prod server "$IMAGE_TAG" --refresh
           fi
 
           DURATION=$(( $(date +%s) - START_TIME ))
-          echo "duration=${DURATION}s" >> $GITHUB_OUTPUT
+          echo "duration=${DURATION}s" >> "$GITHUB_OUTPUT"
 
       - name: Server deploy summary
         if: always() && steps.deploy-server-step.outcome != 'skipped'
@@ -805,7 +819,7 @@ jobs:
             if [[ -n "$RUN_URL" ]]; then
               echo "| Canary Run | [View]($RUN_URL) |"
             fi
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # =============================================================================
   # DEPLOY AC - Via canary (Step Functions) with first-deploy fallback
@@ -847,16 +861,16 @@ jobs:
             --query "Parameter.Value" --output text 2>/dev/null || echo "")
 
           if [[ -n "$STATE_MACHINE_ARN" && "$STATE_MACHINE_ARN" != "initial" ]]; then
-            echo "deploy_method=canary" >> $GITHUB_OUTPUT
+            echo "deploy_method=canary" >> "$GITHUB_OUTPUT"
             ./.github/scripts/dispatch-and-poll-canary.sh ac "$IMAGE_TAG" prod "$CELL_ID"
           else
-            echo "deploy_method=direct" >> $GITHUB_OUTPUT
+            echo "deploy_method=direct" >> "$GITHUB_OUTPUT"
             echo "::notice::No canary state machine — using direct SSM + instance refresh (first deploy)"
             ./.github/scripts/update-ssm-image-tag.sh prod ac "$IMAGE_TAG" --refresh
           fi
 
           DURATION=$(( $(date +%s) - START_TIME ))
-          echo "duration=${DURATION}s" >> $GITHUB_OUTPUT
+          echo "duration=${DURATION}s" >> "$GITHUB_OUTPUT"
 
       - name: AC deploy summary
         if: always() && steps.deploy-ac-step.outcome != 'skipped'
@@ -879,7 +893,7 @@ jobs:
             if [[ -n "$RUN_URL" ]]; then
               echo "| Canary Run | [View]($RUN_URL) |"
             fi
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # =============================================================================
   # DEPLOY QURL - ECS task definition re-registration
@@ -918,7 +932,7 @@ jobs:
           START_TIME=$(date +%s)
           ./.github/scripts/deploy-ecs-service.sh "$PROD_SSM_PREFIX" "$QURL_IMAGE_TAG"
           DURATION=$(( $(date +%s) - START_TIME ))
-          echo "duration=${DURATION}s" >> $GITHUB_OUTPUT
+          echo "duration=${DURATION}s" >> "$GITHUB_OUTPUT"
 
       - name: QURL deploy summary
         if: always() && steps.deploy-qurl-step.outcome != 'skipped'
@@ -938,7 +952,7 @@ jobs:
             echo "| Duration | ${DURATION:-unknown} |"
             echo "| Result | **$RESULT** |"
             echo "| Rollback | ECS circuit breaker (automatic) |"
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # =============================================================================
   # SMOKE TEST - Application-level validation
@@ -1005,7 +1019,7 @@ jobs:
                 echo "| Endpoint | HTTP Status | Result |"
                 echo "|----------|-------------|--------|"
                 echo "$RESULTS"
-              } >> $GITHUB_STEP_SUMMARY
+              } >> "$GITHUB_STEP_SUMMARY"
               exit 1
             fi
           done
@@ -1017,7 +1031,7 @@ jobs:
             echo "| Endpoint | HTTP Status | Result |"
             echo "|----------|-------------|--------|"
             echo "$RESULTS"
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # =============================================================================
   # QURL SMOKE TESTS - Comprehensive Go test suite from qurl repo
@@ -1114,7 +1128,7 @@ jobs:
                 echo ""
                 CW_URL="https://${AWS_REGION}.console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#alarmsV2:?~(alarmStateFilter~'ALARM)"
                 echo "[View alarms in CloudWatch Console]($CW_URL)"
-              } >> $GITHUB_STEP_SUMMARY
+              } >> "$GITHUB_STEP_SUMMARY"
               exit 1
             fi
 
@@ -1133,7 +1147,7 @@ jobs:
             echo "> :white_check_mark: **5-minute monitoring window passed** — no alarms triggered"
             echo ""
             echo "10 checks at 30s intervals. All \`layerv-nhp-prod*\` alarms remained in OK state."
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # =============================================================================
   # FINALIZE - Tracking, metrics, notifications, summary
@@ -1174,9 +1188,9 @@ jobs:
           done
 
           if [[ "$FAILED" == "true" ]]; then
-            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "status=failed" >> "$GITHUB_OUTPUT"
           else
-            echo "status=success" >> $GITHUB_OUTPUT
+            echo "status=success" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Release deployment lock
@@ -1374,4 +1388,4 @@ jobs:
             echo "- [CloudWatch Alarms](https://${AWS_REGION}.console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#alarmsV2:)"
             echo "- [Step Functions](https://${AWS_REGION}.console.aws.amazon.com/states/home?region=${AWS_REGION}#/statemachines)"
             echo "- [This workflow run]($WORKFLOW_URL)"
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"

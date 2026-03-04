@@ -999,6 +999,8 @@ variable "auth0_domain" {
   }
 }
 
+# Required for local dev (no default — must be set explicitly).
+# In CI these are still passed but the provider nulls them when api_token is set.
 variable "auth0_tf_client_id" {
   description = "Auth0 M2M client ID for Terraform provider. Set via TF_VAR_auth0_tf_client_id."
   type        = string
@@ -1019,6 +1021,14 @@ variable "auth0_tf_client_secret" {
     condition     = length(var.auth0_tf_client_secret) > 0
     error_message = "auth0_tf_client_secret must be set. Pass via TF_VAR_auth0_tf_client_secret environment variable or sensitive.auto.tfvars."
   }
+}
+
+# Optional — CI-only. When set, the provider uses this token and ignores client_id/client_secret.
+variable "auth0_api_token" {
+  description = "Pre-fetched Auth0 Management API token. When set, the Auth0 provider uses this instead of client_id/client_secret (saves 1 M2M token per plan/apply). Set via TF_VAR_auth0_api_token in CI."
+  type        = string
+  sensitive   = true
+  default     = ""
 }
 
 variable "auth0_enable_rotation" {
