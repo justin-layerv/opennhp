@@ -365,19 +365,11 @@ resource "aws_iam_role" "grafana_athena" {
 # NOTE: After activation, tags only appear in NEW CUR data (not retroactive).
 # It may take up to 24 hours for newly activated tags to appear.
 #
-# The Service tag is activated via CLI with error handling because it was
-# newly introduced in PR #450 (replaced Component) and AWS Cost Explorer
-# may not have indexed the tag key yet (takes up to 24h after first use).
-# The other tags (Environment, Project, Cell) use the native resource
-# because they were already indexed when first activated.
-#
-# TODO(#455): Replace with aws_ce_cost_allocation_tag once Service is indexed.
-# To retry activation manually:
-#   terraform apply -replace=module.cost_analytics[0].terraform_data.activate_service_tag
-resource "terraform_data" "activate_service_tag" {
-  provisioner "local-exec" {
-    command = "aws ce update-cost-allocation-tags-status --cost-allocation-tags-status '[{\"TagKey\":\"Service\",\"Status\":\"Active\"}]' 2>&1 || echo 'WARNING: Service tag not yet indexed by AWS Cost Explorer. Will succeed on next apply after 24h.'"
-  }
+# Service is now managed by the native Terraform CE resource to avoid masking
+# unexpected failures from a local-exec fallback.
+resource "aws_ce_cost_allocation_tag" "service" {
+  tag_key = "Service"
+  status  = "Active"
 }
 
 resource "aws_ce_cost_allocation_tag" "environment" {
