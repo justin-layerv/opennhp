@@ -397,8 +397,10 @@ module "auth0" {
   # Dedicated smoke test M2M client (system tier)
   enable_smoke_test_client = true
 
-  # Email templates
-  email_result_url = "https://layerv.ai"
+  # Email (SES) — layerv.ai domain needs SES verification for prod
+  email_from_address = "LayerV <noreply@layerv.ai>"
+  email_ses_region   = "us-east-2"
+  email_result_url   = "https://layerv.ai"
 }
 
 # ==============================================================================

@@ -405,8 +405,10 @@ module "auth0" {
   # Dedicated smoke test M2M client (system tier)
   enable_smoke_test_client = true
 
-  # Email templates
-  email_result_url = "https://staging.layerv.ai"
+  # Email (SES)
+  email_from_address = "LayerV <noreply@layerv.xyz>"
+  email_ses_region   = "us-east-2"
+  email_result_url   = "https://staging.layerv.ai"
 }
 
 # State migration: module.auth0 was previously deployed with count (as module.auth0[0])

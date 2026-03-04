@@ -287,9 +287,15 @@ variable "branding_page_background" {
 # ==============================================================================
 
 variable "email_from_address" {
-  description = "From address for Auth0 transactional emails. Note: this only takes effect when a custom email provider (SES) is configured."
+  description = "From address for Auth0 transactional emails via SES (e.g., LayerV <noreply@layerv.xyz>)"
   type        = string
-  default     = "LayerV <noreply@layerv.ai>"
+  default     = "LayerV <noreply@layerv.xyz>"
+}
+
+variable "email_ses_region" {
+  description = "AWS region where SES domain is verified"
+  type        = string
+  default     = "us-east-2"
 }
 
 variable "email_result_url" {

@@ -812,16 +812,78 @@ resource "auth0_branding_theme" "layerv" {
 }
 
 # ==============================================================================
+# Email Provider (SES)
+# ==============================================================================
+# IAM user with SES send permissions for Auth0 to send branded transactional
+# emails. Access keys are passed directly to Auth0 via the email provider
+# resource (stored in Terraform state, encrypted at rest via S3+KMS).
+#
+# Key rotation procedure:
+#   1. Create a second access key: aws iam create-access-key --user-name <user>
+#   2. Update Auth0 email provider credentials (terraform apply or Auth0 dashboard)
+#   3. Verify email delivery works with the new key
+#   4. Delete the old access key: aws iam delete-access-key --access-key-id <old-key>
+
+data "aws_caller_identity" "ses" {}
+
+resource "aws_iam_user" "auth0_ses" {
+  name = "${var.name_prefix}-auth0-ses"
+  tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_iam_user_policy" "auth0_ses_send" {
+  name = "ses-send-email"
+  user = aws_iam_user.auth0_ses.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "SESSendEmail"
+      Effect = "Allow"
+      Action = [
+        "ses:SendEmail",
+        "ses:SendRawEmail"
+      ]
+      Resource = [
+        "arn:aws:ses:${var.email_ses_region}:${data.aws_caller_identity.ses.account_id}:identity/layerv.xyz",
+        "arn:aws:ses:${var.email_ses_region}:${data.aws_caller_identity.ses.account_id}:identity/layerv.ai"
+      ]
+    }]
+  })
+}
+
+resource "aws_iam_access_key" "auth0_ses" {
+  user = aws_iam_user.auth0_ses.name
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "auth0_email_provider" "ses" {
+  name                 = "ses"
+  enabled              = true
+  default_from_address = var.email_from_address
+
+  credentials {
+    access_key_id     = aws_iam_access_key.auth0_ses.id
+    secret_access_key = aws_iam_access_key.auth0_ses.secret
+    region            = var.email_ses_region
+  }
+}
+
+# ==============================================================================
 # Email Templates
 # ==============================================================================
-# Branded email templates for Auth0 transactional emails. Uses Auth0's built-in
-# email provider until SES production access is granted.
-#
-# Note: The from address will remain Auth0's default (no-reply@auth0user.net)
-# until a custom email provider (SES) is configured. The template bodies are
-# branded with LayerV styling regardless.
+# Branded email templates for Auth0 transactional emails sent via SES.
 
 resource "auth0_email_template" "verify_email" {
+  depends_on = [auth0_email_provider.ses]
+
   template                = "verify_email"
   body                    = file("${path.module}/email-templates/verify_email.html")
   from                    = var.email_from_address
@@ -833,6 +895,8 @@ resource "auth0_email_template" "verify_email" {
 }
 
 resource "auth0_email_template" "welcome_email" {
+  depends_on = [auth0_email_provider.ses]
+
   template = "welcome_email"
   body = templatefile("${path.module}/email-templates/welcome_email.html", {
     dashboard_url = "${var.email_result_url}/qurl/dashboard/"
@@ -846,6 +910,8 @@ resource "auth0_email_template" "welcome_email" {
 }
 
 resource "auth0_email_template" "reset_email" {
+  depends_on = [auth0_email_provider.ses]
+
   template                = "reset_email"
   body                    = file("${path.module}/email-templates/reset_email.html")
   from                    = var.email_from_address

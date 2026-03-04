@@ -963,6 +963,27 @@ resource "aws_iam_policy" "terraform_apply_iam" {
         ]
       },
       {
+        Sid    = "IAMUsers"
+        Effect = "Allow"
+        Action = [
+          "iam:CreateUser",
+          "iam:DeleteUser",
+          "iam:GetUser",
+          "iam:TagUser",
+          "iam:UntagUser",
+          "iam:PutUserPolicy",
+          "iam:DeleteUserPolicy",
+          "iam:GetUserPolicy",
+          "iam:ListUserPolicies",
+          "iam:ListAccessKeys",
+          "iam:CreateAccessKey",
+          "iam:DeleteAccessKey"
+        ]
+        Resource = [
+          "arn:aws:iam::${local.account_id}:user/layerv-nhp-*"
+        ]
+      },
+      {
         # API Gateway v2 custom domains require a Service Linked Role on first use.
         # The SLR uses service principal ops.apigateway.amazonaws.com (NOT apigateway.amazonaws.com).
         Sid    = "ServiceLinkedRoles"
