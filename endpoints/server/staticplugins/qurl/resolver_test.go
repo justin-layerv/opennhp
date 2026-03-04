@@ -29,6 +29,9 @@ func TestQurlResolver_Resolve_Success(t *testing.T) {
 		if r.Header.Get("X-Service-Token") != "test-token" {
 			t.Errorf("unexpected service token: %s", r.Header.Get("X-Service-Token"))
 		}
+		if r.Header.Get("X-Request-ID") != "rid-test-123" {
+			t.Errorf("unexpected request ID header: %s", r.Header.Get("X-Request-ID"))
+		}
 
 		// Parse request body
 		var req ResolveRequest
@@ -79,6 +82,7 @@ func TestQurlResolver_Resolve_Success(t *testing.T) {
 		AccessToken: "test-access-token",
 		SrcIP:       "192.168.1.1",
 		UserAgent:   "TestAgent/1.0",
+		RequestID:   "rid-test-123",
 	}
 
 	resp, err := resolver.Resolve(context.Background(), req)

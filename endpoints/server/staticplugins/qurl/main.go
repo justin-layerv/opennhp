@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
+	nhpserver "github.com/OpenNHP/opennhp/endpoints/server"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/log"
 	"github.com/OpenNHP/opennhp/nhp/plugins"
@@ -87,6 +89,9 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		return nil, errors.New("authWithHTTP: helper is null")
 	}
 
+	requestID := getOrCreateRequestID(ctx)
+	ctx.Header(nhpserver.RequestIDHeader, requestID)
+
 	// Set CORS headers early so error responses are also CORS-enabled.
 	// This is important for cross-origin error handling in the qurl.link SPA.
 	ctx.SetSameSite(http.SameSiteNoneMode)
@@ -97,7 +102,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	// about token format requirements or server existence.
 	accessToken := ctx.Query("token")
 	if err := ValidateAccessToken(accessToken); err != nil {
-		log.Error("[QURL] Invalid access token from %s: %v", ctx.ClientIP(), err)
+		log.Error("[QURL] [req_id=%s] Invalid access token from %s: %v", requestID, ctx.ClientIP(), err)
 		nhpDrop(ctx)
 		return nil, fmt.Errorf("invalid access token: %w", err)
 	}
@@ -107,16 +112,17 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		AccessToken: accessToken,
 		SrcIP:       ctx.ClientIP(),
 		UserAgent:   ctx.Request.UserAgent(),
+		RequestID:   requestID,
 	}
 
 	resolveResp, err := resolver.Resolve(ctx.Request.Context(), resolveReq)
 	if err != nil {
-		log.Error("[QURL] Token resolution failed: %v", err)
+		log.Error("[QURL] [req_id=%s] Token resolution failed: %v", requestID, err)
 		handleResolveError(ctx, err)
 		return nil, err
 	}
 
-	log.Info("[QURL] Token resolved successfully: resource_id=%s, resources=%d", resolveResp.ResourceID, len(resolveResp.Resources))
+	log.Info("[QURL] [req_id=%s] Token resolved successfully: resource_id=%s, resources=%d", requestID, resolveResp.ResourceID, len(resolveResp.Resources))
 
 	// Build ResourceData from the resolved response
 	res := buildResourceData(resolveResp)
@@ -134,11 +140,11 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 			break
 		}
 		if attempt < knockMaxAttempts {
-			log.Warning("[QURL] NHP knock failed (attempt %d/%d): %v, retrying...", attempt, knockMaxAttempts, err)
+			log.Warning("[QURL] [req_id=%s] NHP knock failed (attempt %d/%d): %v, retrying...", requestID, attempt, knockMaxAttempts, err)
 			select {
 			case <-time.After(knockRetryDelay):
 			case <-reqCtx.Done():
-				log.Warning("[QURL] NHP knock retry canceled: %v", reqCtx.Err())
+				log.Warning("[QURL] [req_id=%s] NHP knock retry canceled: %v", requestID, reqCtx.Err())
 				err = fmt.Errorf("knock canceled: %w", reqCtx.Err())
 			}
 			if reqCtx.Err() != nil {
@@ -147,7 +153,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		}
 	}
 	if err != nil {
-		log.Error("[QURL] NHP knock failed after %d attempts: %v", knockMaxAttempts, err)
+		log.Error("[QURL] [req_id=%s] NHP knock failed after %d attempts: %v", requestID, knockMaxAttempts, err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "knock_failed",
 			"message": "Failed to open access to resource",
@@ -157,7 +163,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	}
 
 	if ackMsg == nil || len(ackMsg.ResourceHost) == 0 {
-		log.Error("[QURL] NHP knock returned no resource hosts")
+		log.Error("[QURL] [req_id=%s] NHP knock returned no resource hosts", requestID)
 		ctx.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "no_resource_hosts",
 			"message": "No resource hosts available",
@@ -165,12 +171,12 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		return nil, errors.New("no resource hosts available")
 	}
 
-	log.Info("[QURL] NHP knock succeeded: hosts=%v", ackMsg.ResourceHost)
+	log.Info("[QURL] [req_id=%s] NHP knock succeeded: hosts=%v", requestID, ackMsg.ResourceHost)
 
 	// Generate NHP tokens and set cookies
 	jwtSecret := nhpsdkutils.GetStringFromMap(res.ExInfo, "JWTSecret")
 	if jwtSecret == "" {
-		log.Error("[QURL] JWT secret is empty - cannot generate tokens")
+		log.Error("[QURL] [req_id=%s] JWT secret is empty - cannot generate tokens", requestID)
 		ctx.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "configuration_error",
 			"message": "JWT secret not configured",
@@ -184,7 +190,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 
 	nhpToken, refreshToken, err := jwt.GenerateAll(res.AuthServiceId, res)
 	if err != nil {
-		log.Error("[QURL] Failed to generate tokens: %v", err)
+		log.Error("[QURL] [req_id=%s] Failed to generate tokens: %v", requestID, err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "token_generation_failed",
 			"message": "Failed to generate access tokens",
@@ -195,7 +201,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	// Validate cookie domain and redirect URL BEFORE setting any cookies.
 	// This ensures we don't set cookies if either validation fails.
 	if err := ValidateCookieDomain(res.CookieDomain, resolver.AllowedRedirectDomain()); err != nil {
-		log.Error("[QURL] Invalid cookie domain from API: %v", err)
+		log.Error("[QURL] [req_id=%s] Invalid cookie domain from API: %v", requestID, err)
 		ctx.JSON(http.StatusBadGateway, gin.H{
 			"error":   "invalid_cookie_domain",
 			"message": "Invalid cookie domain from upstream service",
@@ -204,7 +210,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	}
 
 	if err := ValidateRedirectURL(resolveResp.QurlSiteURL, resolver.AllowedRedirectDomain()); err != nil {
-		log.Error("[QURL] Invalid redirect URL from API: %v", err)
+		log.Error("[QURL] [req_id=%s] Invalid redirect URL from API: %v", requestID, err)
 		ctx.JSON(http.StatusBadGateway, gin.H{
 			"error":   "invalid_redirect",
 			"message": "Invalid redirect URL from upstream service",
@@ -217,12 +223,25 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	ctx.SetCookie("nhp_token", nhpToken, tokenExpire, "/", res.CookieDomain, true, true)
 	ctx.SetCookie("nhp_refresh_token", refreshToken, tokenExpire, "/", res.CookieDomain, true, true)
 
-	log.Info("[QURL] Tokens generated and cookies set, redirecting to: %s", resolveResp.QurlSiteURL)
+	log.Info("[QURL] [req_id=%s] Tokens generated and cookies set, redirecting to: %s", requestID, resolveResp.QurlSiteURL)
 
 	// Redirect to the qurl.site URL (e.g., https://r_9f3a2c8e.qurl.site)
 	ctx.Redirect(http.StatusFound, resolveResp.QurlSiteURL)
 
 	return ackMsg, nil
+}
+
+// getOrCreateRequestID returns the request ID from the Gin context.
+// In production, the server's requestIDMiddleware has already validated and
+// set the ID before this handler runs. The UUID fallback is defensive — it
+// covers edge cases like direct handler invocation in tests.
+func getOrCreateRequestID(ctx *gin.Context) string {
+	if id := nhpserver.GetRequestID(ctx); id != "" {
+		return id
+	}
+	id := uuid.NewString()
+	ctx.Set(nhpserver.RequestIDKey, id)
+	return id
 }
 
 // buildResourceData constructs a ResourceData from the QURL API response

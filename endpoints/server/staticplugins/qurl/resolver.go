@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	nhpserver "github.com/OpenNHP/opennhp/endpoints/server"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
@@ -44,6 +45,8 @@ type ResolveRequest struct {
 	SrcIP string `json:"src_ip"`
 	// UserAgent is the client's user agent for logging/analytics
 	UserAgent string `json:"user_agent"`
+	// RequestID is propagated via HTTP header for trace correlation.
+	RequestID string `json:"-"`
 }
 
 // ResolveResponse represents the response from QURL API token resolution.
@@ -166,6 +169,9 @@ func (r *QurlResolver) Resolve(ctx context.Context, req *ResolveRequest) (*Resol
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
+	if req.RequestID != "" {
+		httpReq.Header.Set(nhpserver.RequestIDHeader, req.RequestID)
+	}
 
 	// Add service token authentication header
 	// Fail fast if token is empty - this should never happen due to config validation,
@@ -176,10 +182,10 @@ func (r *QurlResolver) Resolve(ctx context.Context, req *ResolveRequest) (*Resol
 	httpReq.Header.Set("X-Service-Token", r.serviceToken)
 
 	// Execute request
-	log.Debug("[QURL] Calling QURL API: %s", url)
+	log.Debug("[QURL] [req_id=%s] Calling QURL API: %s", req.RequestID, url)
 	resp, err := r.httpClient.Do(httpReq) //nolint:gosec // G704: URL from QURL_API_URL env var with schema validation
 	if err != nil {
-		log.Error("[QURL] HTTP request failed: %v", err)
+		log.Error("[QURL] [req_id=%s] HTTP request failed: %v", req.RequestID, err)
 		return nil, fmt.Errorf("failed to call QURL API: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -192,14 +198,14 @@ func (r *QurlResolver) Resolve(ctx context.Context, req *ResolveRequest) (*Resol
 
 	// Handle HTTP-level errors
 	if resp.StatusCode != http.StatusOK {
-		log.Error("[QURL] QURL API returned status %d: %s", resp.StatusCode, string(respBody))
+		log.Error("[QURL] [req_id=%s] QURL API returned status %d: %s", req.RequestID, resp.StatusCode, string(respBody))
 		return nil, r.parseErrorResponse(resp.StatusCode, respBody)
 	}
 
 	// Parse response
 	var internalResp internalResolveResponse
 	if err := json.Unmarshal(respBody, &internalResp); err != nil {
-		log.Error("[QURL] Failed to parse response: %v", err)
+		log.Error("[QURL] [req_id=%s] Failed to parse response: %v", req.RequestID, err)
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
@@ -216,7 +222,7 @@ func (r *QurlResolver) Resolve(ctx context.Context, req *ResolveRequest) (*Resol
 	}
 
 	if err := validateResolveResponse(internalResp.Data); err != nil {
-		log.Error("[QURL] Invalid resolve response: %v", err)
+		log.Error("[QURL] [req_id=%s] Invalid resolve response: %v", req.RequestID, err)
 		return nil, fmt.Errorf("%w: %s", ErrInvalidResolveResponse, err.Error())
 	}
 

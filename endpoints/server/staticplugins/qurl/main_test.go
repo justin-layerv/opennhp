@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
+	nhpserver "github.com/OpenNHP/opennhp/endpoints/server"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/plugins"
 )
@@ -271,6 +273,9 @@ func TestBuildResourceData(t *testing.T) {
 func TestAuthWithHttp_FullFlow(t *testing.T) {
 	// Create mock QURL API server
 	qurlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Request-ID"); got != "req-fullflow-123" {
+			t.Errorf("expected X-Request-ID=req-fullflow-123, got %q", got)
+		}
 		if r.URL.Path != "/internal/v1/resolve" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -324,6 +329,7 @@ func TestAuthWithHttp_FullFlow(t *testing.T) {
 	w := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(w)
 	ctx.Request = httptest.NewRequest(http.MethodGet, "/plugins/qurl?token=valid_test_token_123", nil)
+	ctx.Set(nhpserver.RequestIDKey, "req-fullflow-123") // simulate requestIDMiddleware
 
 	// Create mock helper with callback
 	callbackCalled := false
@@ -367,6 +373,9 @@ func TestAuthWithHttp_FullFlow(t *testing.T) {
 	if location != "https://r_test123.qurl.site" {
 		t.Errorf("expected redirect to https://r_test123.qurl.site, got %s", location)
 	}
+	if got := w.Header().Get("X-Request-ID"); got != "req-fullflow-123" {
+		t.Errorf("expected response X-Request-ID=req-fullflow-123, got %q", got)
+	}
 
 	// Verify cookies were set
 	cookies := w.Result().Cookies()
@@ -384,6 +393,72 @@ func TestAuthWithHttp_FullFlow(t *testing.T) {
 	}
 	if refreshTokenCookie == nil {
 		t.Error("nhp_refresh_token cookie not set")
+	}
+}
+
+func TestAuthWithHttp_GeneratesRequestIDWhenMissing(t *testing.T) {
+	var downstreamReqID string
+	qurlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downstreamReqID = r.Header.Get("X-Request-ID")
+		resp := internalResolveResponse{
+			Success: true,
+			Data: &ResolveResponse{
+				ResourceID:  "r_generated",
+				QurlSiteURL: "https://r_generated.qurl.site",
+				Resources: map[string]*common.ResourceInfo{
+					"default": {
+						ACId:     "ac-001",
+						Hostname: "backend.example.com",
+						Addr:     &common.NetAddress{Ip: "10.0.0.1", Port: 443},
+					},
+				},
+				JWTSecret:    "test-jwt-secret-key-for-signing",
+				TokenExpire:  3600,
+				OpenTime:     300,
+				CookieDomain: ".qurl.site",
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer qurlServer.Close()
+
+	oldResolver := resolver
+	resolver = &QurlResolver{
+		httpClient:            &http.Client{Timeout: 5 * time.Second},
+		baseURL:               qurlServer.URL,
+		serviceToken:          "test-service-token",
+		allowedRedirectDomain: "qurl.site",
+	}
+	defer func() { resolver = oldResolver }()
+
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/plugins/qurl?token=valid_generated_token_123", nil)
+
+	helper := &plugins.HttpServerPluginHelper{
+		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			return &common.ServerKnockAckMsg{
+				ResourceHost: map[string]string{"default": "10.0.0.1:443"},
+			}, nil
+		},
+	}
+
+	req := &common.HttpKnockRequest{}
+	_, err := AuthWithHttp(ctx, req, helper)
+	if err != nil {
+		t.Fatalf("AuthWithHttp returned unexpected error: %v", err)
+	}
+
+	respReqID := w.Header().Get("X-Request-ID")
+	if respReqID == "" {
+		t.Fatal("expected response X-Request-ID to be set")
+	}
+	if _, err := uuid.Parse(respReqID); err != nil {
+		t.Fatalf("expected generated X-Request-ID to be a UUID, got %q", respReqID)
+	}
+	if downstreamReqID != respReqID {
+		t.Fatalf("expected downstream X-Request-ID %q, got %q", respReqID, downstreamReqID)
 	}
 }
 
