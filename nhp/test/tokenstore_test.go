@@ -1,6 +1,7 @@
 package test
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -211,4 +212,76 @@ func TestTokenStore_TwoLevelIndexing(t *testing.T) {
 	if !found {
 		t.Error("expected Atoken5 to still exist")
 	}
+}
+
+// --- Benchmarks for performance profiling and regression detection ---
+
+const benchKeySpace = 1000
+
+func BenchmarkTokenStore_Store(b *testing.B) {
+	ts := common.NewTokenStore[*testEntry]()
+	entry := &testEntry{value: "test", expireTime: time.Now().Add(time.Hour)}
+	tokens := make([]string, benchKeySpace)
+	for i := range tokens {
+		tokens[i] = fmt.Sprintf("token-%d", i)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ts.Store(tokens[i%benchKeySpace], entry)
+	}
+}
+
+func BenchmarkTokenStore_Load(b *testing.B) {
+	ts := common.NewTokenStore[*testEntry]()
+	tokens := make([]string, benchKeySpace)
+	for i := range tokens {
+		tokens[i] = fmt.Sprintf("token-%d", i)
+		ts.Store(tokens[i], &testEntry{value: "test", expireTime: time.Now().Add(time.Hour)})
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ts.Load(tokens[i%benchKeySpace])
+	}
+}
+
+func BenchmarkTokenStore_Size(b *testing.B) {
+	ts := common.NewTokenStore[*testEntry]()
+	for i := 0; i < benchKeySpace; i++ {
+		ts.Store(fmt.Sprintf("token-%d", i), &testEntry{value: "test", expireTime: time.Now().Add(time.Hour)})
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ts.Size()
+	}
+}
+
+// BenchmarkTokenStore_ConcurrentAccess measures throughput under concurrent Store/Load/Delete.
+// Goroutines intentionally share the same key space to stress-test lock contention.
+func BenchmarkTokenStore_ConcurrentAccess(b *testing.B) {
+	ts := common.NewTokenStore[*testEntry]()
+	entry := &testEntry{value: "test", expireTime: time.Now().Add(time.Hour)}
+	tokens := make([]string, benchKeySpace)
+	for i := range tokens {
+		tokens[i] = fmt.Sprintf("token-%d", i)
+	}
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			token := tokens[i%benchKeySpace]
+			switch i % 3 {
+			case 0:
+				ts.Store(token, entry)
+			case 1:
+				ts.Load(token)
+			case 2:
+				ts.Delete(token)
+			}
+			i++
+		}
+	})
 }
