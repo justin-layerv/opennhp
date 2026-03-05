@@ -2,12 +2,14 @@ package metrics
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 )
 
@@ -39,9 +41,7 @@ func TestPublisher_NilSafety(t *testing.T) {
 
 func TestPublisher_SetHealthProbe(t *testing.T) {
 	// NOTE: client is intentionally nil — this test only exercises probeHealth(),
-	// which writes to the gauges map. Calling flush() on this Publisher would
-	// panic on the nil client. Tests that need flush behavior should use
-	// buildMetricData() instead.
+	// which writes to the gauges map.
 	mp := &Publisher{
 		counters:    make(map[string]float64),
 		dimCounters: make(map[string]*dimCounterEntry),
@@ -79,6 +79,12 @@ func TestPublisher_SetHealthProbe(t *testing.T) {
 	if val != 0.0 {
 		t.Errorf("expected StorageHealthy=0.0, got %v", val)
 	}
+}
+
+func TestPublisher_Flush_NoClientDoesNotPanic(t *testing.T) {
+	mp := newTestPublisher(t, nil)
+	mp.IncrCounter("KnockRequest")
+	mp.flush() // must not panic — nil client is handled gracefully
 }
 
 func TestPublisher_CounterAccumulation(t *testing.T) {
@@ -557,4 +563,122 @@ func indexByName(data []types.MetricDatum) map[string]types.MetricDatum {
 		m[*d.MetricName] = d
 	}
 	return m
+}
+
+// newTestPublisher creates a Publisher with initialized maps for testing.
+// Pass nil for client to test nil-client paths.
+func newTestPublisher(t *testing.T, client cloudWatchClient) *Publisher {
+	t.Helper()
+	return &Publisher{
+		client:      client,
+		namespace:   "LayerV/NHP",
+		counters:    make(map[string]float64),
+		dimCounters: make(map[string]*dimCounterEntry),
+		gauges:      make(map[string]float64),
+		latencies:   make(map[string][]float64),
+		stop:        make(chan struct{}),
+	}
+}
+
+type mockCloudWatchClient struct {
+	calls []*cloudwatch.PutMetricDataInput
+}
+
+func (m *mockCloudWatchClient) PutMetricData(_ context.Context, params *cloudwatch.PutMetricDataInput, _ ...func(*cloudwatch.Options)) (*cloudwatch.PutMetricDataOutput, error) {
+	// Deep-copy MetricData to avoid aliasing; flush() reuses the backing array.
+	m.calls = append(m.calls, &cloudwatch.PutMetricDataInput{
+		Namespace:  params.Namespace,
+		MetricData: append([]types.MetricDatum(nil), params.MetricData...),
+	})
+	return &cloudwatch.PutMetricDataOutput{}, nil
+}
+
+// errorCloudWatchClient always returns the configured error.
+type errorCloudWatchClient struct {
+	err error
+}
+
+func (e *errorCloudWatchClient) PutMetricData(_ context.Context, _ *cloudwatch.PutMetricDataInput, _ ...func(*cloudwatch.Options)) (*cloudwatch.PutMetricDataOutput, error) {
+	return nil, e.err
+}
+
+// TestPublisher_Flush_PutMetricDataPayload verifies the integration boundary:
+// metrics accumulated via public API are sent to CloudWatch with the correct
+// namespace and datum count. Datum-shape assertions live in TestPublisher_BuildMetricData.
+func TestPublisher_Flush_PutMetricDataPayload(t *testing.T) {
+	sharedDims := []types.Dimension{
+		{Name: aws.String("Environment"), Value: aws.String("sandbox")},
+		{Name: aws.String("Cell"), Value: aws.String("cell0")},
+	}
+
+	mockCW := &mockCloudWatchClient{}
+	mp := newTestPublisher(t, mockCW)
+	mp.dims = sharedDims
+
+	mp.IncrCounter("KnockRequest")
+	mp.IncrCounter("KnockRequest")
+	mp.AddCounterWithDims("RegistrationFailure", 3, []types.Dimension{
+		{Name: aws.String("ErrorCode"), Value: aws.String("timeout")},
+	})
+	mp.RecordLatency("KnockLatency", 10)
+	mp.RecordLatency("KnockLatency", 20)
+	mp.RecordLatency("KnockLatency", 30)
+
+	mp.flush()
+
+	if len(mockCW.calls) != 1 {
+		t.Fatalf("expected 1 PutMetricData call, got %d", len(mockCW.calls))
+	}
+	call := mockCW.calls[0]
+	if call.Namespace == nil || *call.Namespace != "LayerV/NHP" {
+		t.Fatalf("expected namespace LayerV/NHP, got %v", call.Namespace)
+	}
+	// 3 datums: KnockRequest (counter), RegistrationFailure (dimCounter), KnockLatency (latency)
+	if len(call.MetricData) != 3 {
+		t.Fatalf("expected 3 metric datums, got %d", len(call.MetricData))
+	}
+	byName := indexByName(call.MetricData)
+	for _, name := range []string{"KnockRequest", "RegistrationFailure", "KnockLatency"} {
+		if _, ok := byName[name]; !ok {
+			t.Errorf("missing expected metric %q in PutMetricData payload", name)
+		}
+	}
+}
+
+func TestPublisher_Flush_BatchingByBatchSize(t *testing.T) {
+	mockCW := &mockCloudWatchClient{}
+	mp := newTestPublisher(t, mockCW)
+
+	// Unique counter names so each produces a distinct MetricDatum.
+	for i := 0; i < batchSize+1; i++ {
+		mp.IncrCounter(fmt.Sprintf("Metric_%d", i))
+	}
+
+	mp.flush()
+
+	if len(mockCW.calls) != 2 {
+		t.Fatalf("expected 2 PutMetricData calls, got %d", len(mockCW.calls))
+	}
+	if len(mockCW.calls[0].MetricData) != batchSize {
+		t.Fatalf("expected first batch size %d, got %d", batchSize, len(mockCW.calls[0].MetricData))
+	}
+	if len(mockCW.calls[1].MetricData) != 1 {
+		t.Fatalf("expected second batch size 1, got %d", len(mockCW.calls[1].MetricData))
+	}
+}
+
+func TestPublisher_Flush_PutMetricDataError(t *testing.T) {
+	errClient := &errorCloudWatchClient{err: errors.New("throttled")}
+	mp := newTestPublisher(t, errClient)
+
+	mp.IncrCounter("KnockRequest")
+	mp.flush() // must not panic on API error
+
+	// Verify state was reset despite the error (metrics are best-effort)
+	mp.mu.Lock()
+	count := len(mp.counters)
+	mp.mu.Unlock()
+	if count != 0 {
+		t.Errorf("expected counters reset after flush, got %d entries", count)
+	}
 }

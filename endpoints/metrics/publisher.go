@@ -20,6 +20,11 @@ import (
 // Extracted as a variable so tests can simulate AWS unavailability.
 var loadAWSConfig = awsconfig.LoadDefaultConfig
 
+// cloudWatchClient is the subset of CloudWatch client behavior needed by Publisher.
+type cloudWatchClient interface {
+	PutMetricData(ctx context.Context, params *cloudwatch.PutMetricDataInput, optFns ...func(*cloudwatch.Options)) (*cloudwatch.PutMetricDataOutput, error)
+}
+
 const (
 	flushInterval = 60 * time.Second
 	apiTimeout    = 5 * time.Second
@@ -55,7 +60,7 @@ type dimCounterEntry struct {
 // Metrics are accumulated in-memory and flushed periodically to minimize
 // API calls and stay within CloudWatch PutMetricData limits.
 type Publisher struct {
-	client      *cloudwatch.Client
+	client      cloudWatchClient
 	namespace   string
 	mu          sync.RWMutex
 	counters    map[string]float64          // metric name → accumulated count (skipped when 0)
@@ -251,6 +256,10 @@ func (mp *Publisher) flush() {
 	metricData := mp.buildMetricData(counters, dimCounters, gauges, latencies)
 
 	if len(metricData) == 0 {
+		return
+	}
+	if mp.client == nil {
+		log.Warning("CloudWatch metrics skipped: client is nil (%d datums)", len(metricData))
 		return
 	}
 
