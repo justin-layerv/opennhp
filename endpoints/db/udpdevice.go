@@ -531,20 +531,56 @@ func (a *UdpDevice) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sy
 	defer discoveryRoutineWg.Done()
 
 	dbId := a.config.DbId
-	sendAddr := server.SendAddr()
-	if sendAddr == nil {
-		log.Error("[DB] cannot resolve server address for peer %s (ip=%s, port=%d)", server.Hostname, server.Ip, server.Port)
-		return
-	}
+	var lastAddrStr string // Track previous resolved address to detect DNS changes
 
-	addrStr := sendAddr.String()
-
-	defer log.Info("server discovery sub-routine at %s stopped", addrStr)
-	log.Info("server discovery sub-routine at %s started", addrStr)
+	defer func() {
+		if lastAddrStr != "" {
+			log.Info("server discovery sub-routine at %s stopped", lastAddrStr)
+		}
+	}()
+	log.Info("server discovery sub-routine started for %s", server.Hostname)
 
 	var failCount int
 
 	for {
+		// Re-resolve server address each iteration to pick up DNS changes (e.g., after server redeployment)
+		sendAddr := server.SendAddr()
+		if sendAddr == nil {
+			log.Error("[DB] cannot resolve server address for %s, will retry", server.Hostname)
+			select {
+			case <-a.signals.stop:
+				return
+			case <-quit:
+				return
+			case <-time.After(MinimalServerDiscoveryInterval * time.Second):
+				continue
+			}
+		}
+		addrStr := sendAddr.String()
+
+		// If address changed, close old connection and reset fail count
+		if lastAddrStr != "" && lastAddrStr != addrStr {
+			log.Info("db(%s)[ServerDiscovery] Server DNS changed: %s -> %s (hostname: %s). Resetting connection state.",
+				dbId, lastAddrStr, addrStr, server.Hostname)
+			var oldConn *UdpConn
+			a.remoteConnectionMutex.Lock()
+			if conn, found := a.remoteConnectionMap[lastAddrStr]; found {
+				oldConn = conn
+				delete(a.remoteConnectionMap, lastAddrStr)
+				log.Debug("db(%s)[ServerDiscovery] Removed old connection entry for %s", dbId, lastAddrStr)
+			}
+			a.remoteConnectionMutex.Unlock()
+			// Close outside lock to avoid blocking other operations, but synchronously to ensure cleanup completes
+			if oldConn != nil {
+				oldConn.Close()
+				log.Info("db(%s)[ServerDiscovery] Closed old connection to %s, will establish new connection to %s",
+					dbId, lastAddrStr, addrStr)
+			}
+			failCount = 0
+			atomic.StoreInt32(serverFailCount, 0)
+		}
+		lastAddrStr = addrStr
+
 		var lastSendTime int64
 		var lastRecvTime int64
 		var connected bool
@@ -619,19 +655,27 @@ func (a *UdpDevice) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sy
 						}
 
 						failCount += 1
+
 						if failCount%ServerDiscoveryRetryBeforeFail == 0 {
 							atomic.StoreInt32(serverFailCount, 1)
-							// remove failed connection
+							log.Warning("db(%s)[ServerDiscovery] %d consecutive failures to %s, invalidating DNS cache",
+								dbId, ServerDiscoveryRetryBeforeFail, addrStr)
+
+							// Remove failed connection
 							a.remoteConnectionMutex.Lock()
 							conn = a.remoteConnectionMap[addrStr]
 							if conn != nil {
-								log.Info("server discovery failed, close local connection: %s", conn.ConnData.LocalAddr.String())
+								log.Debug("db(%s)[ServerDiscovery] closing stale connection to %s (local: %s)",
+									dbId, addrStr, conn.ConnData.LocalAddr.String())
 								delete(a.remoteConnectionMap, addrStr)
+								conn.Close()
 							}
 							a.remoteConnectionMutex.Unlock()
-							conn.Close()
+
+							// Invalidate DNS cache to pick up potential IP changes (e.g., after server redeployment).
+							// This is rate-limited by ServerDiscoveryRetryBeforeFail (every N consecutive failures).
+							server.InvalidateDNSCache()
 						}
-						log.Error("db(%s#%d)[DBOnline] reporting to server %s failed", dbId, aolMd.TransactionId, addrStr)
 					}
 				}()
 
@@ -658,7 +702,13 @@ func (a *UdpDevice) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sy
 				failCount = 0
 				atomic.StoreInt32(serverFailCount, 0)
 				a.remoteConnectionMutex.Lock()
-				conn = a.remoteConnectionMap[addrStr] // conn must be available at this point
+				conn = a.remoteConnectionMap[addrStr]
+				if conn == nil {
+					a.remoteConnectionMutex.Unlock()
+					log.Error("db(%s#%d)[DBOnline] connection not found in map after successful handshake", dbId, aolMd.TransactionId)
+					err = errors.New("connection not found after handshake")
+					return
+				}
 				conn.connected.Store(true)
 				conn.externalAddr = aakMsg.DBAddr
 				a.remoteConnectionMutex.Unlock()
