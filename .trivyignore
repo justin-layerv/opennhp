@@ -57,6 +57,6 @@ CVE-2026-24051
 
 # docker/cli - Windows-only CLI plugin manager path traversal (CWE-427)
 # Not exploitable in Linux containers. Indirect dependency via cosign/sigstore.
-# Fixed in docker/cli v29.2.0 (this PR bumps to it), but Trivy DB hasn't registered the fix yet
+# Fixed in docker/cli v29.2.0 (PR #661), but Trivy DB hasn't registered the fix yet
 # https://vulnerability.circl.lu/vuln/cve-2025-15558
 CVE-2025-15558
