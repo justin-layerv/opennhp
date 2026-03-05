@@ -918,8 +918,8 @@ resource "auth0_branding_theme" "layerv" {
 # to observe traffic before enforcing. Brute force, suspicious IP throttling,
 # and breached password detection enforce immediately (low false-positive risk).
 #
-# Auth0 plan requirement: Bot Detection and Breached Password Detection
-# require B2C Essentials plan or higher.
+# Auth0 plan requirement: Bot Detection requires B2C Essentials plan or higher.
+# Breached Password Detection requires a higher-tier subscription — not available on current plan.
 
 resource "auth0_attack_protection" "protection" {
   bot_detection {
@@ -954,16 +954,8 @@ resource "auth0_attack_protection" "protection" {
     }
   }
 
-  breached_password_detection {
-    enabled                      = true
-    method                       = "standard"
-    shields                      = ["admin_notification", "block"]
-    admin_notification_frequency = ["daily"]
-
-    pre_user_registration {
-      shields = ["admin_notification", "block"]
-    }
-  }
+  # breached_password_detection requires a higher-tier Auth0 subscription.
+  # Re-enable if plan is upgraded.
 }
 
 # ==============================================================================
