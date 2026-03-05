@@ -54,3 +54,9 @@ CVE-2025-61730
 # Fixed in our code (PR #560), but Traefik v3.6.9 still bundles otel/sdk < v1.40.0
 # https://avd.aquasec.com/nvd/cve-2026-24051
 CVE-2026-24051
+
+# docker/cli - Windows-only CLI plugin manager path traversal (CWE-427)
+# Not exploitable in Linux containers. Indirect dependency via cosign/sigstore.
+# Fixed in docker/cli v29.2.0 (this PR bumps to it), but Trivy DB hasn't registered the fix yet
+# https://vulnerability.circl.lu/vuln/cve-2025-15558
+CVE-2025-15558
