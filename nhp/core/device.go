@@ -510,7 +510,6 @@ func (d *Device) LookupPeer(pk []byte) Peer {
 }
 
 func (d *Device) IsOverload() bool {
-	//return true // debug
 	return d.Overload.Load()
 }
 

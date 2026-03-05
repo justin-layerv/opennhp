@@ -68,7 +68,6 @@ func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
 		OpenTime: openTimeSec,
 	}
 	artMsg.ACToken = a.GenerateAccessToken(entry)
-	//log.Info("generate knock token: %s", artMsg.ACToken)
 
 	// send ac result
 	artBytes, marshalErr := json.Marshal(artMsg)
@@ -83,7 +82,6 @@ func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
 		PrevParserData: ppd,
 		Message:        artBytes,
 	}
-	//log.Info("ART result: %s", string(artBytes))
 
 	// forward to a specific transaction
 	transaction := ppd.ConnData.FindRemoteTransaction(transactionId)

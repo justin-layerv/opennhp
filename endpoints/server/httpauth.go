@@ -22,17 +22,6 @@ func (hs *HttpServer) authWithAspPlugin(c *gin.Context, req *common.HttpKnockReq
 	hs.runPluginAuth(c, req, handler)
 }
 
-func (hs *HttpServer) legacyAuthWithAspPlugin(c *gin.Context, req *common.HttpKnockRequest) {
-	handler := hs.FindPluginHandler(req.AuthServiceId)
-	if handler == nil {
-		log.Error("no auth handler provided")
-		c.JSON(http.StatusOK, gin.H{"errMsg": "no auth handler provided"})
-		return
-	}
-
-	hs.runPluginAuth(c, req, handler)
-}
-
 // runPluginAuth calls the plugin's AuthWithHttp and handles the result.
 // If the plugin aborted the context (e.g., NHP silent drop), no error
 // response is written — preserving NHP protocol silence.

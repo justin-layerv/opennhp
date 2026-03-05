@@ -43,7 +43,6 @@ type ConnectionData struct {
 func (c *ConnectionData) Equal(other *ConnectionData) bool {
 	// use nanosecond timestamp for comparison
 	return c.InitTime == other.InitTime
-	//return c.RemoteAddr.String() == other.RemoteAddr.String()
 }
 
 func (c *ConnectionData) SetTimeout(ms int) {

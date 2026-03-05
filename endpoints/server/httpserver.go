@@ -379,7 +379,7 @@ func (hs *HttpServer) initRouter() {
 			SrcIp:         ctx.ClientIP(),
 			Url:           ctx.Request.URL,
 		}
-		hs.legacyAuthWithAspPlugin(ctx, req)
+		hs.authWithAspPlugin(ctx, req)
 	})
 
 	hs.initStorageRouter()
