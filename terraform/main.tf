@@ -387,6 +387,9 @@ module "compute" {
   alerts_sns_topic_arn = module.monitoring.sns_topic_arn
   enable_sns_alerts    = true # Static boolean - monitoring module always creates SNS topic
 
+  # CORS allowed origins for NHP HTTP server
+  cors_allowed_origins = var.nhp_cors_allowed_origins
+
   # CloudFront trusted proxy CIDRs (for correct client IP extraction from X-Forwarded-For)
   cloudfront_cidrs_ssm_parameter = var.deploy_qurl_link && var.enable_resolve_cloudfront ? aws_ssm_parameter.cloudfront_cidrs[0].name : null
 

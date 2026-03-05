@@ -191,6 +191,12 @@ variable "dev_mode" {
   default = false
 }
 
+variable "nhp_cors_allowed_origins" {
+  description = "Comma-separated list of allowed CORS origins for NHP HTTP server"
+  type        = string
+  default     = ""
+}
+
 variable "resource_mode" {
   type    = string
   default = "local"

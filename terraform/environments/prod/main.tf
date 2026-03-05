@@ -61,12 +61,13 @@ module "nhp" {
   create_oidc_provider = var.create_oidc_provider
 
   # Server configuration
-  log_level        = var.log_level
-  dev_mode         = var.dev_mode
-  resource_mode    = var.resource_mode
-  auth_url         = var.auth_url
-  auth_signing_key = var.auth_signing_key
-  auth_aes_key     = var.auth_aes_key
+  log_level                = var.log_level
+  dev_mode                 = var.dev_mode
+  resource_mode            = var.resource_mode
+  auth_url                 = var.auth_url
+  auth_signing_key         = var.auth_signing_key
+  auth_aes_key             = var.auth_aes_key
+  nhp_cors_allowed_origins = var.nhp_cors_allowed_origins
 
   # Monitoring
   enable_slack_notifications = var.enable_slack_notifications

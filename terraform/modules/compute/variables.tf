@@ -391,6 +391,12 @@ variable "qurl_resolve_certificate_arn" {
 # Blue/Green Deployment Configuration
 # =============================================================================
 
+variable "cors_allowed_origins" {
+  description = "Comma-separated list of allowed CORS origins for NHP HTTP server. When empty, falls back to wildcard '*' (dev mode only)."
+  type        = string
+  default     = ""
+}
+
 variable "cloudfront_cidrs_ssm_parameter" {
   description = "SSM parameter containing CloudFront origin-facing CIDRs for trusted proxy config"
   type        = string

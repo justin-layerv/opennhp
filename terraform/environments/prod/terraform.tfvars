@@ -54,6 +54,11 @@ log_level     = 2 # Info for production (0=silent, 1=error, 2=info, 3=audit, 4=d
 dev_mode      = false
 resource_mode = "api"
 
+# CORS allowed origins for NHP HTTP server (browser-facing plugin endpoints)
+# Wildcard patterns (https://*.domain) match any single-level subdomain.
+# Needed because AC Traefik serves pages on dynamic {resId}.nhp.layerv.ai subdomains.
+nhp_cors_allowed_origins = "https://*.nhp.layerv.ai,https://*.qurl.site,https://qurl.link,https://layerv.ai,https://www.layerv.ai"
+
 # Termination cleanup
 enable_termination_cleanup = true
 

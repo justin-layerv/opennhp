@@ -104,7 +104,9 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 	store := cookie.NewStore(cookieKeys...)
 	hs.ginEngine.Use(requestIDMiddleware())
 	hs.ginEngine.Use(sessions.Sessions("nhpsessions", store))
-	hs.ginEngine.Use(corsMiddleware())
+	hs.ginEngine.Use(securityHeadersMiddleware())
+	corsOrigins := parseAllowedOrigins(os.Getenv("NHP_CORS_ALLOWED_ORIGINS"))
+	hs.ginEngine.Use(corsMiddleware(corsOrigins))
 	hs.ginEngine.Use(gin.LoggerWithConfig(gin.LoggerConfig{
 		Output:    us.log.Writer(),
 		Formatter: ginLogFormatter,
@@ -473,6 +475,77 @@ func parseTrustedCIDRs(raw string) []string {
 	return valid
 }
 
+// parseAllowedOrigins splits a comma-separated list of allowed CORS origins,
+// trims whitespace, and filters empty entries. Returns nil if input is empty.
+// Supports wildcard entries like "https://*.example.com" which match any
+// subdomain (e.g., "https://foo.example.com", "https://bar.example.com").
+func parseAllowedOrigins(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	var origins []string
+	for _, p := range parts {
+		if o := strings.TrimSpace(p); o != "" {
+			origins = append(origins, o)
+		}
+	}
+	return origins
+}
+
+// splitOriginPatterns separates a list of origin patterns into exact matches
+// and wildcard suffix patterns. Wildcard patterns use "https://*." prefix
+// (e.g., "https://*.nhp.layerv.xyz") and are returned as suffix strings
+// (e.g., ".nhp.layerv.xyz") with their required scheme.
+type wildcardPattern struct {
+	scheme string // "https" or "http"
+	suffix string // e.g., ".nhp.layerv.xyz"
+}
+
+func splitOriginPatterns(origins []string) (exact map[string]bool, wildcards []wildcardPattern) {
+	exact = make(map[string]bool, len(origins))
+	for _, o := range origins {
+		// Check for wildcard pattern: scheme://*.domain
+		for _, scheme := range []string{"https://", "http://"} {
+			if strings.HasPrefix(o, scheme+"*.") {
+				host := strings.TrimPrefix(o, scheme+"*")
+				wildcards = append(wildcards, wildcardPattern{
+					scheme: strings.TrimSuffix(scheme, "://"),
+					suffix: host, // e.g., ".nhp.layerv.xyz"
+				})
+				goto next
+			}
+		}
+		exact[o] = true
+	next:
+	}
+	return
+}
+
+// matchOrigin checks if an origin matches any exact origin or wildcard pattern.
+func matchOrigin(origin string, exact map[string]bool, wildcards []wildcardPattern) bool {
+	if exact[origin] {
+		return true
+	}
+	for _, w := range wildcards {
+		prefix := w.scheme + "://"
+		if !strings.HasPrefix(origin, prefix) {
+			continue
+		}
+		host := strings.TrimPrefix(origin, prefix)
+		// Host must end with the wildcard suffix and have at least one char before it.
+		// e.g., suffix=".nhp.layerv.xyz" matches "demo.nhp.layerv.xyz" but not ".nhp.layerv.xyz" or "nhp.layerv.xyz"
+		if strings.HasSuffix(host, w.suffix) && len(host) > len(w.suffix) {
+			// Ensure the subdomain part has no additional dots (single-level match).
+			sub := host[:len(host)-len(w.suffix)]
+			if !strings.Contains(sub, ".") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ginLogFormatter formats Gin access log lines with request ID and error context.
 func ginLogFormatter(param gin.LogFormatterParams) string {
 	reqID := ""
@@ -495,30 +568,74 @@ func ginLogFormatter(param gin.LogFormatterParams) string {
 	)
 }
 
-// corsMiddleware adds CORS headers to the HTTP response.
-// It allows cross-origin resource sharing, specifies allowed methods, exposes headers, and sets maximum age.
-// If the request method is OPTIONS, PUT, or DELETE, it aborts the request with a 204 status code.
-func corsMiddleware() gin.HandlerFunc {
+// securityHeadersMiddleware adds standard security headers to all responses.
+func securityHeadersMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// HTTP headers for CORS
-		// TODO: Make CORS origins configurable (see https://github.com/layervai/nhp/issues/219)
-		// Currently hardcoded to "*" which contradicts production CORS requirements in QURL.
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")                   // allow cross-origin resource sharing
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS, POST") // methods
-		c.Writer.Header().Set("Access-Control-Expose-Headers", "Content-Type, Content-Length, Set-Cookie, X-Request-ID")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Authorization, X-NHP-Ver, Cookie, X-Request-ID")
-		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-		c.Writer.Header().Set("Access-Control-Max-Age", "300")
-		// NHP headers
+		c.Writer.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+		c.Writer.Header().Set("X-Content-Type-Options", "nosniff")
+		c.Writer.Header().Set("X-Frame-Options", "DENY")
+		c.Writer.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		c.Next()
+	}
+}
+
+// corsMiddleware adds CORS headers to the HTTP response.
+// When allowedOrigins is configured, it validates the request Origin header against
+// the allowlist (supporting both exact matches and wildcard patterns like "https://*.example.com"),
+// echoes the matching origin back, and enables credentials.
+// When allowedOrigins is empty (dev mode), it allows all origins with wildcard "*"
+// but omits Access-Control-Allow-Credentials (wildcard + credentials is a spec violation).
+// For OPTIONS preflight requests with a non-matching origin, returns 403.
+func corsMiddleware(allowedOrigins []string) gin.HandlerFunc {
+	// Separate exact matches from wildcard suffix patterns.
+	exactSet, wildcards := splitOriginPatterns(allowedOrigins)
+
+	// Log a warning once if running with wildcard CORS (no origins configured).
+	var wildcardWarningOnce sync.Once
+
+	return func(c *gin.Context) {
+		// NHP version header is always set regardless of origin match.
 		c.Writer.Header().Set("Access-Control-NHP-Ver", version.Version+"/"+version.CommitId)
 
-		if c.Request.Method == "OPTIONS" {
-			c.Status(http.StatusOK)
-			return
+		origin := c.GetHeader("Origin")
+
+		// Determine allowed origin.
+		var allowOrigin string
+		if len(allowedOrigins) == 0 {
+			// Development mode: allow all origins.
+			allowOrigin = "*"
+			wildcardWarningOnce.Do(func() {
+				log.Warning("CORS: NHP_CORS_ALLOWED_ORIGINS is not set — using wildcard '*' (dev mode). Set allowed origins for production.")
+			})
+		} else if matchOrigin(origin, exactSet, wildcards) {
+			// Origin matches exact or wildcard pattern.
+			allowOrigin = origin
+		} else if origin != "" {
+			log.Debug("CORS: rejected origin %q (not in allowed list)", origin)
 		}
 
-		if c.Request.Method == "DELETE" || c.Request.Method == "PUT" {
-			c.AbortWithStatus(http.StatusNoContent)
+		if allowOrigin != "" {
+			c.Writer.Header().Set("Access-Control-Allow-Origin", allowOrigin)
+			c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS, POST")
+			c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Authorization, X-NHP-Ver, Cookie, X-Request-ID")
+			c.Writer.Header().Set("Access-Control-Expose-Headers", "Content-Type, Content-Length, Set-Cookie, X-Request-ID, Access-Control-NHP-Ver")
+			c.Writer.Header().Set("Access-Control-Max-Age", "300")
+
+			// Allow credentials only when not using wildcard (spec compliance).
+			if allowOrigin != "*" {
+				c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+				// Vary header is required when Access-Control-Allow-Origin is dynamic.
+				// This ensures proper caching by proxies/CDNs.
+				c.Writer.Header().Set("Vary", "Origin")
+			}
+		}
+
+		if c.Request.Method == "OPTIONS" {
+			if allowOrigin != "" {
+				c.AbortWithStatus(http.StatusNoContent)
+			} else {
+				c.AbortWithStatus(http.StatusForbidden)
+			}
 			return
 		}
 

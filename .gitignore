@@ -190,6 +190,10 @@ id_ed25519
 .aws/
 credentials
 
+# Plugin config files (may contain secrets)
+**/plugins/*/etc/config.toml
+!**/plugins/*/etc/config.example.toml
+
 # Secrets
 secrets/
 *.secret

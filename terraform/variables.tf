@@ -153,6 +153,12 @@ variable "dev_mode" {
   default     = false
 }
 
+variable "nhp_cors_allowed_origins" {
+  description = "Comma-separated list of allowed CORS origins for NHP HTTP server. When empty in non-dev mode, the server logs a warning and falls back to wildcard '*'."
+  type        = string
+  default     = ""
+}
+
 variable "resource_mode" {
   description = "Resource management mode: 'local' uses config files, 'api' uses external auth service"
   type        = string

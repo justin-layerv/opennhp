@@ -50,6 +50,11 @@ log_level     = 4 # Debug for sandbox (0=silent, 1=error, 2=info, 3=audit, 4=deb
 dev_mode      = true
 resource_mode = "api"
 
+# CORS allowed origins for NHP HTTP server (browser-facing plugin endpoints)
+# Wildcard patterns (https://*.domain) match any single-level subdomain.
+# Needed because AC Traefik serves pages on dynamic {resId}.nhp.layerv.xyz subdomains.
+nhp_cors_allowed_origins = "https://*.nhp.layerv.xyz,https://*.apps.layerv.xyz,https://*.qurl.site.layerv.xyz,https://qurl.link.layerv.xyz,https://staging.layerv.ai"
+
 # Termination cleanup: Lambda cleans stale DynamoDB assignments on server termination
 enable_termination_cleanup = true
 

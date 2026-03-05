@@ -2,8 +2,12 @@ package server
 
 import (
 	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestErrNoStorageBackend(t *testing.T) {
@@ -229,5 +233,351 @@ func TestParseCookieKeys_AES192EncryptKey(t *testing.T) {
 	_, err := parseCookieKeys(b64(j))
 	if err != nil {
 		t.Fatalf("unexpected error for 24-byte encrypt key: %v", err)
+	}
+}
+
+// ============================================================================
+// parseAllowedOrigins Tests
+// ============================================================================
+
+func TestParseAllowedOrigins_Empty(t *testing.T) {
+	t.Parallel()
+	result := parseAllowedOrigins("")
+	if result != nil {
+		t.Errorf("expected nil for empty input, got %v", result)
+	}
+}
+
+func TestParseAllowedOrigins_SingleOrigin(t *testing.T) {
+	t.Parallel()
+	result := parseAllowedOrigins("https://example.com")
+	if len(result) != 1 || result[0] != "https://example.com" {
+		t.Errorf("unexpected result: %v", result)
+	}
+}
+
+func TestParseAllowedOrigins_MultipleOrigins(t *testing.T) {
+	t.Parallel()
+	result := parseAllowedOrigins("https://a.com, https://b.com , https://c.com")
+	expected := []string{"https://a.com", "https://b.com", "https://c.com"}
+	if len(result) != len(expected) {
+		t.Fatalf("expected %d origins, got %d", len(expected), len(result))
+	}
+	for i, o := range result {
+		if o != expected[i] {
+			t.Errorf("origin[%d] = %q, want %q", i, o, expected[i])
+		}
+	}
+}
+
+func TestParseAllowedOrigins_TrailingComma(t *testing.T) {
+	t.Parallel()
+	result := parseAllowedOrigins("https://a.com,")
+	if len(result) != 1 || result[0] != "https://a.com" {
+		t.Errorf("expected 1 origin, got %v", result)
+	}
+}
+
+func TestParseAllowedOrigins_WhitespaceOnly(t *testing.T) {
+	t.Parallel()
+	result := parseAllowedOrigins("  ,  ,  ")
+	if len(result) != 0 {
+		t.Errorf("expected 0 origins for whitespace-only entries, got %v", result)
+	}
+}
+
+// ============================================================================
+// splitOriginPatterns + matchOrigin Tests
+// ============================================================================
+
+func TestSplitOriginPatterns_ExactOnly(t *testing.T) {
+	t.Parallel()
+	exact, wildcards := splitOriginPatterns([]string{"https://a.com", "https://b.com"})
+	if len(exact) != 2 || !exact["https://a.com"] || !exact["https://b.com"] {
+		t.Errorf("expected 2 exact origins, got %v", exact)
+	}
+	if len(wildcards) != 0 {
+		t.Errorf("expected no wildcards, got %v", wildcards)
+	}
+}
+
+func TestSplitOriginPatterns_WildcardOnly(t *testing.T) {
+	t.Parallel()
+	exact, wildcards := splitOriginPatterns([]string{"https://*.nhp.layerv.xyz", "https://*.qurl.site"})
+	if len(exact) != 0 {
+		t.Errorf("expected no exact origins, got %v", exact)
+	}
+	if len(wildcards) != 2 {
+		t.Fatalf("expected 2 wildcards, got %d", len(wildcards))
+	}
+	if wildcards[0].scheme != "https" || wildcards[0].suffix != ".nhp.layerv.xyz" {
+		t.Errorf("wildcard[0] = %+v, want scheme=https suffix=.nhp.layerv.xyz", wildcards[0])
+	}
+	if wildcards[1].scheme != "https" || wildcards[1].suffix != ".qurl.site" {
+		t.Errorf("wildcard[1] = %+v, want scheme=https suffix=.qurl.site", wildcards[1])
+	}
+}
+
+func TestSplitOriginPatterns_Mixed(t *testing.T) {
+	t.Parallel()
+	exact, wildcards := splitOriginPatterns([]string{
+		"https://layerv.ai",
+		"https://*.nhp.layerv.ai",
+		"https://qurl.link",
+	})
+	if len(exact) != 2 || !exact["https://layerv.ai"] || !exact["https://qurl.link"] {
+		t.Errorf("exact = %v", exact)
+	}
+	if len(wildcards) != 1 || wildcards[0].suffix != ".nhp.layerv.ai" {
+		t.Errorf("wildcards = %v", wildcards)
+	}
+}
+
+func TestMatchOrigin_ExactMatch(t *testing.T) {
+	t.Parallel()
+	exact, wildcards := splitOriginPatterns([]string{"https://layerv.ai"})
+	if !matchOrigin("https://layerv.ai", exact, wildcards) {
+		t.Error("expected exact match")
+	}
+	if matchOrigin("https://evil.com", exact, wildcards) {
+		t.Error("should not match non-listed origin")
+	}
+}
+
+func TestMatchOrigin_WildcardMatch(t *testing.T) {
+	t.Parallel()
+	exact, wildcards := splitOriginPatterns([]string{"https://*.nhp.layerv.xyz"})
+
+	cases := []struct {
+		origin string
+		want   bool
+	}{
+		{"https://demo.nhp.layerv.xyz", true},
+		{"https://console.nhp.layerv.xyz", true},
+		{"https://mini-app-demo.nhp.layerv.xyz", true},
+		{"https://nhp.layerv.xyz", false},               // no subdomain
+		{"http://demo.nhp.layerv.xyz", false},           // wrong scheme
+		{"https://evil.com.nhp.layerv.xyz", false},      // multi-level subdomain
+		{"https://a.b.nhp.layerv.xyz", false},           // multi-level subdomain
+		{"https://.nhp.layerv.xyz", false},              // empty subdomain
+		{"https://demo.nhp.layerv.xyz.evil.com", false}, // suffix attack
+	}
+	for _, tc := range cases {
+		got := matchOrigin(tc.origin, exact, wildcards)
+		if got != tc.want {
+			t.Errorf("matchOrigin(%q) = %v, want %v", tc.origin, got, tc.want)
+		}
+	}
+}
+
+func TestMatchOrigin_MixedExactAndWildcard(t *testing.T) {
+	t.Parallel()
+	exact, wildcards := splitOriginPatterns([]string{
+		"https://layerv.ai",
+		"https://*.nhp.layerv.ai",
+		"https://qurl.link",
+	})
+
+	if !matchOrigin("https://layerv.ai", exact, wildcards) {
+		t.Error("should match exact")
+	}
+	if !matchOrigin("https://demo.nhp.layerv.ai", exact, wildcards) {
+		t.Error("should match wildcard")
+	}
+	if !matchOrigin("https://qurl.link", exact, wildcards) {
+		t.Error("should match exact")
+	}
+	if matchOrigin("https://evil.com", exact, wildcards) {
+		t.Error("should not match")
+	}
+}
+
+func TestCORSMiddleware_WildcardPatternMatch(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	w := httptest.NewRecorder()
+	_, engine := gin.CreateTestContext(w)
+	engine.Use(corsMiddleware([]string{"https://*.nhp.layerv.xyz", "https://layerv.ai"}))
+	engine.GET("/test", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Origin", "https://demo.nhp.layerv.xyz")
+	engine.ServeHTTP(w, req)
+
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://demo.nhp.layerv.xyz" {
+		t.Errorf("Allow-Origin = %q, want %q", got, "https://demo.nhp.layerv.xyz")
+	}
+	if got := w.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Errorf("Allow-Credentials = %q, want %q", got, "true")
+	}
+}
+
+func TestCORSMiddleware_WildcardPatternReject(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	w := httptest.NewRecorder()
+	_, engine := gin.CreateTestContext(w)
+	engine.Use(corsMiddleware([]string{"https://*.nhp.layerv.xyz"}))
+	engine.GET("/test", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Origin", "https://evil.com")
+	engine.ServeHTTP(w, req)
+
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("Allow-Origin should be empty for rejected origin, got %q", got)
+	}
+}
+
+// ============================================================================
+// securityHeadersMiddleware Tests
+// ============================================================================
+
+func TestSecurityHeadersMiddleware(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	w := httptest.NewRecorder()
+	_, engine := gin.CreateTestContext(w)
+	engine.Use(securityHeadersMiddleware())
+	engine.GET("/test", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	engine.ServeHTTP(w, req)
+
+	expectations := map[string]string{
+		"Strict-Transport-Security": "max-age=63072000; includeSubDomains",
+		"X-Content-Type-Options":    "nosniff",
+		"X-Frame-Options":           "DENY",
+		"Referrer-Policy":           "strict-origin-when-cross-origin",
+	}
+	for header, want := range expectations {
+		got := w.Header().Get(header)
+		if got != want {
+			t.Errorf("%s = %q, want %q", header, got, want)
+		}
+	}
+}
+
+// ============================================================================
+// corsMiddleware Tests
+// ============================================================================
+
+func TestCORSMiddleware_WildcardWhenNoOrigins(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	w := httptest.NewRecorder()
+	_, engine := gin.CreateTestContext(w)
+	engine.Use(corsMiddleware(nil))
+	engine.GET("/test", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Origin", "https://anything.com")
+	engine.ServeHTTP(w, req)
+
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("Allow-Origin = %q, want %q", got, "*")
+	}
+	// Wildcard mode must NOT set credentials (spec violation).
+	if got := w.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+		t.Errorf("Allow-Credentials should be empty in wildcard mode, got %q", got)
+	}
+}
+
+func TestCORSMiddleware_AllowedOriginEchoed(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	w := httptest.NewRecorder()
+	_, engine := gin.CreateTestContext(w)
+	engine.Use(corsMiddleware([]string{"https://allowed.com", "https://also-ok.com"}))
+	engine.GET("/test", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Origin", "https://allowed.com")
+	engine.ServeHTTP(w, req)
+
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://allowed.com" {
+		t.Errorf("Allow-Origin = %q, want %q", got, "https://allowed.com")
+	}
+	if got := w.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Errorf("Allow-Credentials = %q, want %q", got, "true")
+	}
+	if got := w.Header().Get("Vary"); got != "Origin" {
+		t.Errorf("Vary = %q, want %q", got, "Origin")
+	}
+}
+
+func TestCORSMiddleware_RejectedOriginNoHeaders(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	w := httptest.NewRecorder()
+	_, engine := gin.CreateTestContext(w)
+	engine.Use(corsMiddleware([]string{"https://allowed.com"}))
+	engine.GET("/test", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Origin", "https://evil.com")
+	engine.ServeHTTP(w, req)
+
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("Allow-Origin should be empty for rejected origin, got %q", got)
+	}
+}
+
+func TestCORSMiddleware_PreflightAllowed(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	w := httptest.NewRecorder()
+	_, engine := gin.CreateTestContext(w)
+	engine.Use(corsMiddleware([]string{"https://allowed.com"}))
+	// OPTIONS routes are handled by the middleware before reaching handlers.
+	engine.GET("/test", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodOptions, "/test", nil)
+	req.Header.Set("Origin", "https://allowed.com")
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNoContent)
+	}
+}
+
+func TestCORSMiddleware_PreflightRejected(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	w := httptest.NewRecorder()
+	_, engine := gin.CreateTestContext(w)
+	engine.Use(corsMiddleware([]string{"https://allowed.com"}))
+	engine.GET("/test", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodOptions, "/test", nil)
+	req.Header.Set("Origin", "https://evil.com")
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusForbidden)
 	}
 }

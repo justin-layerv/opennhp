@@ -15,7 +15,7 @@
             --bg-card: rgba(15, 15, 25, 0.8);
             --bg-card-hover: rgba(25, 25, 40, 0.9);
             --bg-gradient: linear-gradient(135deg, #0a0a0f 0%, #0d1117 50%, #0a0a0f 100%);
-            
+
             /* Accent Colors */
             --accent-cyan: #00d4ff;
             --accent-blue: #3b82f6;
@@ -25,20 +25,20 @@
             --accent-gradient: linear-gradient(135deg, #00d4ff 0%, #3b82f6 50%, #8b5cf6 100%);
             --glow-cyan: rgba(0, 212, 255, 0.3);
             --glow-blue: rgba(59, 130, 246, 0.3);
-            
+
             /* Text Colors */
             --text-primary: #ffffff;
             --text-secondary: #a0aec0;
             --text-muted: #64748b;
-            
+
             /* Borders */
             --border-subtle: rgba(255, 255, 255, 0.08);
             --border-accent: rgba(0, 212, 255, 0.3);
-            
+
             /* Typography */
             --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
-            
+
             /* Transitions */
             --transition-fast: 0.15s ease;
             --transition-normal: 0.3s ease;
@@ -50,7 +50,7 @@
             box-sizing: border-box;
             font-family: var(--font-sans);
         }
-        
+
         body {
             background: var(--bg-gradient);
             min-height: 100vh;
@@ -60,7 +60,7 @@
             padding: 20px;
             color: var(--text-primary);
         }
-        
+
         .container {
             background: var(--bg-card);
             border: 1px solid var(--border-accent);
@@ -73,13 +73,13 @@
             position: relative;
             backdrop-filter: blur(10px);
         }
-        
+
         .language-selector {
             position: absolute;
             top: 20px;
             right: 20px;
         }
-        
+
         .language-selector select {
             padding: 8px 12px;
             border: 1px solid var(--border-subtle);
@@ -90,16 +90,16 @@
             cursor: pointer;
             transition: var(--transition-fast);
         }
-        
+
         .language-selector select:hover {
             border-color: var(--accent-cyan);
         }
-        
+
         .language-selector select:focus {
             outline: none;
             border-color: var(--accent-cyan);
         }
-        
+
         h1 {
             color: var(--text-primary);
             margin-bottom: 24px;
@@ -110,19 +110,19 @@
             -webkit-text-fill-color: transparent;
             background-clip: text;
         }
-        
+
         .description {
             color: var(--text-secondary);
             margin-bottom: 30px;
             line-height: 1.6;
             font-size: 15px;
         }
-        
+
         .form-group {
             margin-bottom: 25px;
             text-align: left;
         }
-        
+
         label {
             display: block;
             margin-bottom: 8px;
@@ -132,13 +132,13 @@
             text-transform: uppercase;
             letter-spacing: 0.05em;
         }
-        
+
         .input-wrapper {
             position: relative;
             display: flex;
             align-items: center;
         }
-        
+
         input[type="password"],
         input[type="text"] {
             width: 100%;
@@ -151,17 +151,17 @@
             font-family: var(--font-mono);
             transition: var(--transition-normal);
         }
-        
+
         input:focus {
             outline: none;
             border-color: var(--accent-cyan);
             box-shadow: 0 0 0 3px var(--glow-cyan);
         }
-        
+
         input::placeholder {
             color: var(--text-muted);
         }
-        
+
         .toggle-password {
             position: absolute;
             right: 12px;
@@ -175,17 +175,17 @@
             border-radius: 4px;
             transition: var(--transition-fast);
         }
-        
+
         .toggle-password:hover {
             background: rgba(255, 255, 255, 0.1);
         }
-        
+
         .toggle-password svg {
             width: 22px;
             height: 22px;
             color: var(--text-secondary);
         }
-        
+
         button[type="submit"] {
             background: linear-gradient(135deg, var(--accent-cyan) 0%, var(--accent-blue) 100%);
             color: var(--bg-dark);
@@ -199,12 +199,12 @@
             transition: var(--transition-normal);
             box-shadow: 0 4px 15px var(--glow-cyan);
         }
-        
+
         button[type="submit"]:hover {
             transform: translateY(-2px);
             box-shadow: 0 6px 25px var(--glow-cyan);
         }
-        
+
         .message {
             margin-top: 20px;
             padding: 14px;
@@ -212,13 +212,13 @@
             display: none;
             font-size: 14px;
         }
-        
+
         .error {
             background: rgba(239, 68, 68, 0.15);
             color: var(--accent-red);
             border: 1px solid rgba(239, 68, 68, 0.3);
         }
-        
+
         .success {
             background: rgba(16, 185, 129, 0.15);
             color: var(--accent-green);
@@ -254,18 +254,18 @@
             font-size: 0.95rem;
             color: var(--text-secondary);
         }
-        
+
         .note a {
             color: var(--accent-cyan);
             text-decoration: none;
             transition: var(--transition-fast);
         }
-        
+
         .note a:hover {
             color: var(--text-primary);
             text-decoration: underline;
         }
-        
+
         /* 模态对话框样式 */
         .modal-overlay {
             position: fixed;
@@ -281,7 +281,7 @@
             display: none;
             backdrop-filter: blur(4px);
         }
-        
+
         .modal {
             background: var(--bg-card);
             border: 1px solid var(--border-accent);
@@ -291,20 +291,20 @@
             max-width: 500px;
             padding: 30px;
         }
-        
+
         .modal-header {
             margin-bottom: 20px;
             display: flex;
             justify-content: space-between;
             align-items: center;
         }
-        
+
         .modal-title {
             font-size: 18px;
             font-weight: 700;
             color: var(--accent-red);
         }
-        
+
         .modal-close {
             background: none;
             border: none;
@@ -316,30 +316,30 @@
             line-height: 1;
             transition: var(--transition-fast);
         }
-        
+
         .modal-close:hover {
             color: var(--text-primary);
         }
-        
+
         .modal-body {
             margin-bottom: 25px;
             color: var(--text-secondary);
             line-height: 1.7;
             font-size: 0.95rem;
         }
-        
+
         .warning-text {
             color: var(--accent-red);
             font-weight: 500;
             margin-bottom: 15px;
         }
-        
+
         .modal-footer {
             display: flex;
             justify-content: flex-end;
             gap: 12px;
         }
-        
+
         .modal-button {
             width: auto;
             padding: 10px 20px;
@@ -349,35 +349,35 @@
             font-weight: 500;
             transition: var(--transition-normal);
         }
-        
+
         .modal-button-secondary {
             background: rgba(255, 255, 255, 0.1);
             color: var(--text-secondary);
             border: 1px solid var(--border-subtle);
         }
-        
+
         .modal-button-secondary:hover {
             background: rgba(255, 255, 255, 0.15);
             color: var(--text-primary);
         }
-        
+
         .modal-button-primary {
             background: linear-gradient(135deg, var(--accent-cyan) 0%, var(--accent-blue) 100%);
             color: var(--bg-dark);
             border: none;
         }
-        
+
         .modal-button-primary:hover {
             transform: translateY(-1px);
             box-shadow: 0 4px 15px var(--glow-cyan);
         }
-        
+
         .remember-checkbox {
             display: flex;
             align-items: center;
             margin-bottom: 20px;
         }
-        
+
         .remember-checkbox input[type="checkbox"] {
             width: 18px;
             height: 18px;
@@ -385,7 +385,7 @@
             accent-color: var(--accent-cyan);
             cursor: pointer;
         }
-        
+
         .remember-checkbox label {
             margin-bottom: 0;
             font-weight: normal;
@@ -394,7 +394,7 @@
             color: var(--text-secondary);
             cursor: pointer;
         }
-        
+
         /* Okta按钮样式 */
         .okta-button {
             background: linear-gradient(135deg, var(--accent-purple) 0%, var(--accent-blue) 100%);
@@ -402,35 +402,35 @@
             margin-top: 15px;
             box-shadow: 0 4px 15px rgba(139, 92, 246, 0.3);
         }
-        
+
         .okta-button:hover {
             transform: translateY(-2px);
             box-shadow: 0 6px 20px rgba(139, 92, 246, 0.4);
         }
-        
+
         .divider {
             display: flex;
             align-items: center;
             margin: 25px 0;
         }
-        
+
         .divider::before,
         .divider::after {
             content: "";
             flex: 1;
             border-bottom: 1px solid var(--border-subtle);
         }
-        
+
         .divider-text {
             padding: 0 15px;
             color: var(--text-muted);
             font-size: 14px;
         }
-        
+
         .hidden {
             display: none !important;
         }
-        
+
         .auto-fill-notice {
             background: rgba(16, 185, 129, 0.15);
             color: var(--accent-green);
@@ -441,36 +441,36 @@
             display: none;
             border: 1px solid rgba(16, 185, 129, 0.3);
         }
-        
+
         /* Invalid passcode modal styles */
         .error-title {
             display: flex;
             align-items: center;
             gap: 10px;
         }
-        
+
         .error-icon {
             width: 24px;
             height: 24px;
             color: var(--accent-red);
         }
-        
+
         .invalid-passcode-text {
             color: var(--text-primary);
             font-size: 1rem;
             margin-bottom: 12px;
         }
-        
+
         .invalid-passcode-hint {
             color: var(--text-muted);
             font-size: 0.9rem;
         }
-        
+
         /* Logo styles */
         .logo-container {
             margin-bottom: 24px;
         }
-        
+
         .logo-link {
             display: inline-flex;
             align-items: center;
@@ -478,17 +478,17 @@
             text-decoration: none;
             transition: var(--transition-fast);
         }
-        
+
         .logo-link:hover {
             opacity: 0.85;
         }
-        
+
         .logo-img {
             width: 48px;
             height: 48px;
             object-fit: contain;
         }
-        
+
         .logo-text {
             font-size: 1.75rem;
             font-weight: 700;
@@ -507,20 +507,20 @@
                 <option value="ko-KR">한국어</option>
             </select>
         </div>
-        
+
         <div class="logo-container">
             <a href="https://layerv.ai" target="_blank" class="logo-link">
                 <svg width="40" height="40" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs><linearGradient id="mantisGradient" x1="20" y1="0" x2="20" y2="40" gradientUnits="userSpaceOnUse"><stop stop-color="#0099FF"></stop><stop offset="1" stop-color="#0f172a"></stop></linearGradient><linearGradient id="mantisStroke" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse"><stop offset="0%" stop-color="#0099FF"></stop><stop offset="40%" stop-color="#D406B9"></stop><stop offset="70%" stop-color="purple"></stop><stop offset="100%" stop-color="purple"></stop></linearGradient></defs><path d="M15 6 L9 0 M25 6 L31 0" stroke="url(#mantisStroke)" stroke-width="1.5" stroke-linecap="round" opacity="0.8"></path><path d="M20 38 L2 11 L14 6 L26 6 L38 11 Z" fill="url(#mantisGradient)" fill-opacity="0.2"></path><path d="M20 38 L2 11 L14 6 L26 6 L38 11 Z" stroke="url(#mantisStroke)" stroke-width="2" stroke-linejoin="round"></path><path d="M17 33 L20 38 L23 33" stroke="#0099FF" stroke-width="1.5" fill="none"></path><ellipse cx="5" cy="11" rx="3" ry="5" fill="#0099FF"></ellipse><ellipse cx="35" cy="11" rx="3" ry="5" fill="#0099FF"></ellipse><path d="M20 18 L20 33" stroke="#0099FF" stroke-width="1" stroke-opacity="0.3"></path><path d="M20 18 L14 6 M20 18 L26 6" stroke="#0099FF" stroke-width="1" stroke-opacity="0.3"></path></svg>
                 <span class="logo-text">LayerV</span>
             </a>
         </div>
-        
+
         <h1 id="pageTitle">{{ .title }}</h1>
-        
+
         <div class="status">
             <p class="note">
-                <span id="protectedServerText">The protected server is</span> 
-                <a href="{{.redirectUrl}}" target="_blank">{{.redirectUrl}}</a>. 
+                <span id="protectedServerText">The protected server is</span>
+                <a href="{{.redirectUrl}}" target="_blank">{{.redirectUrl}}</a>.
                 (<a href="https://dnschecker.org/port-scanner.php?query={{.redirectUrl}}&ptype=server" target="_blank" id="scanPortsText">Port Scan >> </a>)
             </p>
             <br/>
@@ -532,13 +532,13 @@
                 <span class="status-label" id="afterLoginText">After Authorization: </span>
                 <span class="status-value success" id="successStatusText">Connection to the protected server should be <strong>successful. ✅</strong></span>
             </div>
-        </div>     
+        </div>
         <p class="description" id="descriptionText">Please enter NHP access passcode to continue</p>
-        
+
         <div class="auto-fill-notice" id="autoFillNotice">
             Passcode has been automatically filled from URL parameter
         </div>
-        
+
         <form id="passcodeForm">
             <div class="form-group">
                 <label for="passcode" id="passcodeLabel">Passcode</label>
@@ -562,13 +562,13 @@
             </div>
             <button type="submit" id="submitButton">Login</button>
         </form>
-        
+
         <div class="divider" id="dividerContainer">
             <span class="divider-text" id="dividerText">or</span>
         </div>
-        
+
         <button id="oktaLogin" class="okta-button">Okta Login</button>
-        
+
         <div id="message" class="message"></div>
     </div>
 
@@ -621,7 +621,7 @@
             const passcodeInput = document.getElementById('passcode');
             const eyeOpen = document.getElementById('eye-open');
             const eyeClosed = document.getElementById('eye-closed');
-            
+
             if (passcodeInput.type === 'password') {
                 passcodeInput.type = 'text';
                 eyeOpen.style.display = 'none';
@@ -632,7 +632,7 @@
                 eyeClosed.style.display = 'none';
             }
         }
-        
+
         // 多语言资源
         const resources = {
             'zh-CN': {
@@ -792,7 +792,7 @@
         // 更新页面文本内容
         function updateTextContent(lang) {
             const resource = resources[lang];
-            
+
             // 更新所有文本元素
             document.getElementById('pageTitle').textContent = resource.title;
             document.getElementById('protectedServerText').textContent = resource.protectedServer;
@@ -815,22 +815,22 @@
             document.getElementById('cancelRemember').textContent = resource.cancel;
             document.getElementById('confirmRemember').textContent = resource.confirm;
             document.getElementById('autoFillNotice').textContent = resource.autoFillNotice;
-            
+
             // Update invalid passcode modal text
-            document.getElementById('invalidPasscodeTitle').innerHTML = 
-                '<svg class="error-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>' + 
+            document.getElementById('invalidPasscodeTitle').innerHTML =
+                '<svg class="error-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>' +
                 resource.invalidPasscodeTitle;
             document.getElementById('invalidPasscodeText').textContent = resource.invalidPasscodeText;
             document.getElementById('invalidPasscodeHint').textContent = resource.invalidPasscodeHint;
             document.getElementById('closeInvalidBtn').textContent = resource.ok;
         }
-        
+
         // Show invalid passcode modal
         function showInvalidPasscodeModal() {
             const modal = document.getElementById('invalidPasscodeModal');
             modal.style.display = 'flex';
         }
-        
+
         // Close invalid passcode modal
         function closeInvalidPasscodeModal() {
             const modal = document.getElementById('invalidPasscodeModal');
@@ -849,56 +849,56 @@
             const languageSelect = document.getElementById('languageSelect');
             const dividerContainer = document.getElementById('dividerContainer');
             const autoFillNotice = document.getElementById('autoFillNotice');
-            
+
             // 初始化语言
             const currentLang = getCurrentLanguage();
             languageSelect.value = currentLang;
             setLanguage(currentLang);
-            
+
             // 根据oidc参数控制Okta Login按钮显示
             const oidcEnabled = getUrlParameter('oidc') === 'true';
             if (!oidcEnabled) {
                 dividerContainer.classList.add('hidden');
                 oktaLoginButton.classList.add('hidden');
             }
-             
+
             // 检查URL参数中的passcode
             const urlPasscode = getUrlParameter('passcode');
             if (urlPasscode) {
                 passcodeInput.value = urlPasscode;
                 autoFillNotice.style.display = 'block';
-                
+
                 // 自动提交表单（可选）
                 // setTimeout(() => {
                 //     submitForm();
                 // }, 500);
             }
-            
+
             // 语言切换事件
             languageSelect.addEventListener('change', function() {
                 setLanguage(this.value);
             });
-            
+
             // 检查是否有保存的密码
             const savedPasscode = localStorage.getItem('nhp_passcode');
             if (savedPasscode) {
                 passcodeInput.value = savedPasscode;
                 rememberCheckbox.checked = true;
             }
-            
+
             // 关闭模态对话框
             function closeRiskModal() {
                 riskModal.style.display = 'none';
             }
-            
+
             // 绑定关闭事件
             closeModal.addEventListener('click', closeRiskModal);
             cancelRemember.addEventListener('click', closeRiskModal);
-            
+
             // 绑定无效密钥模态框关闭事件
             document.getElementById('closeInvalidModal').addEventListener('click', closeInvalidPasscodeModal);
             document.getElementById('closeInvalidBtn').addEventListener('click', closeInvalidPasscodeModal);
-            
+
             // 确认记住密钥
             confirmRemember.addEventListener('click', function() {
                 // 设置记住标志并提交表单
@@ -906,19 +906,19 @@
                 closeRiskModal();
                 submitForm();
             });
-            
+
             // 表单提交事件
             passcodeForm.addEventListener('submit', async function(e) {
                 e.preventDefault();
-                
+
                 const passcode = passcodeInput.value;
                 const currentLang = getCurrentLanguage();
-                
+
                 if (!passcode) {
                     showMessage(resources[currentLang].enterPasscode, 'error');
                     return;
                 }
-                
+
                 // 如果用户选择了记住密钥但之前没有保存过，显示风险提示
                 if (rememberCheckbox.checked && !savedPasscode) {
                     riskModal.style.display = 'flex';
@@ -927,12 +927,12 @@
                     submitForm();
                 }
             });
-            
+
             // Okta登录按钮点击事件
             oktaLoginButton.addEventListener('click', function() {
-                    window.location.href = `https://{{.resId}}.secure.layerv.xyz/plugins/oktaoidc?resid={{.resId}}&action=oauth`;
+                    window.location.href = window.location.origin + '/plugins/oktaoidc?resid={{.resId}}&action=oauth';
             });
-            
+
             // 显示消息
             function showMessage(text, type) {
                 const messageEl = document.getElementById('message');
@@ -940,37 +940,37 @@
                 messageEl.className = 'message ' + type;
                 messageEl.style.display = 'block';
             }
-            
+
             // 提交表单的函数
             function submitForm() {
                 const passcode = passcodeInput.value;
                 const currentLang = getCurrentLanguage();
-                
+
                 if (!rememberCheckbox.checked) {
                     localStorage.removeItem('nhp_passcode'); // 清除存储
                 }
-                
+
                 // 清除之前的状态
                 const messageEl = document.getElementById('message');
                 messageEl.style.display = 'none';
                 messageEl.className = 'message';
-                
+
                 try {
-                    const nhpValidUrl = "https://{{.resId}}.secure.layerv.xyz/plugins/{{ .aspId }}?resid={{ .resId }}&action=valid" + 
+                    const nhpValidUrl = window.location.origin + "/plugins/{{ .aspId }}?resid={{ .resId }}&action=valid" +
                         "&format=json&passcode=" + encodeURIComponent(passcode);
-                    
+
                     fetch(nhpValidUrl)
                     .then(function(response) {
                         return response.json();
                     }).then(function(result) {
                         console.log(result);
-                        
+
                         // Check if errCode exists (invalid passcode)
                         if (result.errCode && result.errCode !== '') {
                             showInvalidPasscodeModal();
                             return;
                         }
-                        
+
                         if (result.nhpToken) {
                             setCookie("nhp_token", result.nhpToken, 1, "/", result.cookieDomain, true)
                             setCookie("nhp_refresh_token", result.nhpRefreshToken, 1, "/", result.cookieDomain, true)

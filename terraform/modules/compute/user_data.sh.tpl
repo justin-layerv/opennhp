@@ -683,6 +683,9 @@ QURL_IDLE_CONN_TIMEOUT=${qurl_idle_conn_timeout}
 %{ if cloudfront_cidrs_ssm_parameter != null ~}
 NHP_TRUSTED_PROXY_CIDRS=$CF_CIDRS
 %{ endif ~}
+%{ if cors_allowed_origins != "" ~}
+NHP_CORS_ALLOWED_ORIGINS=${cors_allowed_origins}
+%{ endif ~}
 ENVEOF
 chmod 644 /opt/layerv/nhp-server/etc/env
 echo "Created environment file with image tag: $IMAGE_TAG"
