@@ -333,7 +333,7 @@ grafana_tempo_datasource_uid      = "grafanacloud-traces"
 # CloudWatch datasource (Grafana Cloud assumes IAM role to read CloudWatch)
 grafana_cloudwatch_enabled   = true
 grafana_cloud_aws_account_id = "008923505280"
-grafana_cloud_external_id    = ""
+grafana_cloud_external_id    = null
 
 # Don't create dashboards from sandbox (prod owns them)
 grafana_create_dashboards = false

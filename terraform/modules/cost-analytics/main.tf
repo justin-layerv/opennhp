@@ -20,6 +20,10 @@ terraform {
 data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
 
+locals {
+  grafana_cloud_external_id = trimspace(var.grafana_cloud_external_id != null ? var.grafana_cloud_external_id : "")
+}
+
 # ==============================================================================
 # S3 Bucket for Cost Data
 # ==============================================================================
@@ -340,9 +344,9 @@ resource "aws_iam_role" "grafana_athena" {
           AWS = "arn:aws:iam::${var.grafana_cloud_aws_account_id}:root"
         }
         Action = "sts:AssumeRole"
-        Condition = var.grafana_cloud_external_id != "" ? {
+        Condition = local.grafana_cloud_external_id != "" ? {
           StringEquals = {
-            "sts:ExternalId" = var.grafana_cloud_external_id
+            "sts:ExternalId" = local.grafana_cloud_external_id
           }
         } : {}
       }

@@ -958,7 +958,7 @@ variable "grafana_cloud_aws_account_id" {
 variable "grafana_cloud_external_id" {
   description = "External ID for Grafana Cloud IAM assume role"
   type        = string
-  default     = ""
+  default     = null
 }
 
 variable "grafana_create_dashboards" {

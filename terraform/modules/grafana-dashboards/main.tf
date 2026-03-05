@@ -88,8 +88,9 @@ resource "grafana_dashboard" "webhooks" {
 # ==============================================================================
 
 locals {
-  create_cw_role = var.cloudwatch_datasource_enabled && var.cloudwatch_assume_role_arn == "" && var.grafana_cloud_aws_account_id != ""
-  cw_role_arn    = local.create_cw_role ? aws_iam_role.grafana_cloudwatch[0].arn : var.cloudwatch_assume_role_arn
+  grafana_cloud_external_id = trimspace(var.grafana_cloud_external_id != null ? var.grafana_cloud_external_id : "")
+  create_cw_role            = var.cloudwatch_datasource_enabled && var.cloudwatch_assume_role_arn == "" && var.grafana_cloud_aws_account_id != ""
+  cw_role_arn               = local.create_cw_role ? aws_iam_role.grafana_cloudwatch[0].arn : var.cloudwatch_assume_role_arn
 }
 
 resource "grafana_data_source" "cloudwatch" {
@@ -153,9 +154,9 @@ resource "aws_iam_role" "grafana_cloudwatch" {
           AWS = "arn:aws:iam::${var.grafana_cloud_aws_account_id}:root"
         }
         Action = "sts:AssumeRole"
-        Condition = var.grafana_cloud_external_id != "" ? {
+        Condition = local.grafana_cloud_external_id != "" ? {
           StringEquals = {
-            "sts:ExternalId" = var.grafana_cloud_external_id
+            "sts:ExternalId" = local.grafana_cloud_external_id
           }
         } : {}
       }
