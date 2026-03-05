@@ -167,7 +167,7 @@ qurl_router_enabled = true
 # CORS
 # Note: website origins appear here (QURL API) AND in dashboard_allowed_origins
 # (billing/developer-portal APIs) because they are separate CORS configurations.
-qurl_cors_allowed_origins = "https://console.nhp.layerv.ai,https://qurl.link,https://*.qurl.site,https://layerv.ai,https://www.layerv.ai"
+qurl_cors_allowed_origins = "https://qurl.link,https://*.qurl.site,https://layerv.ai,https://www.layerv.ai"
 
 # Dashboard CORS origins (shared by developer portal, billing API)
 dashboard_allowed_origins = ["https://layerv.ai", "https://www.layerv.ai"]
