@@ -10,22 +10,30 @@ name: Promote to Production
 #           → smoke-test → monitor → finalize
 #
 # Usage:
-#   # Standard promotion
+#   # Full promotion (all components)
+#   gh workflow run promote-to-prod.yml --ref main \
+#     -f image_tag=<commit-sha> -f deploy_server=true -f deploy_ac=true \
+#     -f deploy_qurl=true -f run_terraform=true
+#
+#   # Terraform-only (no service restarts — default behavior)
 #   gh workflow run promote-to-prod.yml --ref main \
 #     -f image_tag=<commit-sha>
 #
-#   # First-time (with infrastructure)
+#   # Terraform + QURL (e.g., new env vars in task definition)
 #   gh workflow run promote-to-prod.yml --ref main \
-#     -f image_tag=<commit-sha> -f run_terraform=true
+#     -f image_tag=<commit-sha> -f deploy_qurl=true
 #
 #   # QURL-only deployment
 #   gh workflow run promote-to-prod.yml --ref main \
-#     -f image_tag=<any-valid-sha> -f deploy_server=false -f deploy_ac=false \
-#     -f deploy_qurl=true -f qurl_image_tag=<qurl-tag>
+#     -f image_tag=<any-valid-sha> -f deploy_qurl=true \
+#     -f qurl_image_tag=<qurl-tag>
 #
 #   # Rollback to previous known-good state
 #   gh workflow run promote-to-prod.yml --ref main \
 #     -f image_tag=<any-valid-sha> -f rollback=true
+#
+#   # Recommended: use the trigger script for automatic change detection
+#   ./scripts/trigger-prod-deploy.sh
 
 on:
   workflow_dispatch:
@@ -41,23 +49,23 @@ on:
         type: string
       run_terraform:
         description: 'Run terraform apply (required for first deploy or infra changes)'
-        required: true
+        required: false
         default: true
         type: boolean
       deploy_server:
         description: 'Deploy NHP Server via canary'
-        required: true
-        default: true
+        required: false
+        default: false
         type: boolean
       deploy_ac:
         description: 'Deploy Access Controller via canary'
-        required: true
-        default: true
+        required: false
+        default: false
         type: boolean
       deploy_qurl:
         description: 'Deploy QURL Service via ECS task definition'
-        required: true
-        default: true
+        required: false
+        default: false
         type: boolean
       cell_id:
         description: 'Target cell identifier'
