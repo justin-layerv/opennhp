@@ -181,6 +181,18 @@ dashboard_allowed_origins = ["https://layerv.ai", "https://www.layerv.ai"]
 # billing_allowed_origins            = ["https://layerv.ai", "https://www.layerv.ai"]
 # billing_from_email                 = "billing@layerv.ai"
 
+# Webhooks configuration
+qurl_webhooks_enabled                       = true
+qurl_webhooks_worker_count                  = 4
+qurl_webhooks_max_webhooks_per_owner        = 10
+qurl_webhooks_delivery_timeout_seconds      = 30
+qurl_webhooks_max_retries                   = 5
+qurl_webhooks_event_channel_size            = 1000
+qurl_webhooks_retry_worker_interval_seconds = 30
+qurl_webhooks_drain_timeout_seconds         = 30
+qurl_webhooks_response_body_limit           = 8192 # 8KB
+qurl_webhooks_api_version                   = "2024-01-01"
+
 # Audit log retention (production: longer retention)
 qurl_audit_retention_days = 365
 
