@@ -367,10 +367,11 @@ module "acme_cert" {
 module "auth0" {
   source = "../../modules/auth0"
 
-  environment  = var.environment
-  name_prefix  = local.name_prefix
-  api_audience = var.qurl_auth0_audience
-  tags         = local.common_tags
+  environment             = var.environment
+  name_prefix             = local.name_prefix
+  api_audience            = var.qurl_auth0_audience
+  tags                    = local.common_tags
+  manage_tenant_resources = var.auth0_manage_tenant_resources
 
   enable_rotation             = var.auth0_enable_rotation
   rotation_days               = var.auth0_rotation_days

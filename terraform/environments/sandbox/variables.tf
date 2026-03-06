@@ -1248,6 +1248,12 @@ variable "auth0_api_token" {
 # Auth0 Secret Rotation Configuration
 # ==============================================================================
 
+variable "auth0_manage_tenant_resources" {
+  description = "Whether this environment manages shared Auth0 tenant resources (roles, branding, attack protection, email, social connections). Only one environment should set this to true per shared tenant."
+  type        = bool
+  default     = true
+}
+
 variable "auth0_enable_rotation" {
   description = "Enable automatic rotation for Auth0 M2M credentials"
   type        = bool

@@ -373,10 +373,11 @@ locals {
 module "auth0" {
   source = "../../modules/auth0"
 
-  environment  = var.environment
-  name_prefix  = local.name_prefix
-  api_audience = var.qurl_auth0_audience
-  tags         = local.common_tags
+  environment             = var.environment
+  name_prefix             = local.name_prefix
+  api_audience            = var.qurl_auth0_audience
+  tags                    = local.common_tags
+  manage_tenant_resources = var.auth0_manage_tenant_resources
   # secrets_kms_key_arn - uses AWS managed key (null default)
 
   # Secret rotation configuration

@@ -5,6 +5,12 @@ variable "environment" {
   type        = string
 }
 
+variable "manage_tenant_resources" {
+  description = "Whether this environment manages shared Auth0 tenant resources (role, branding, attack protection, email provider/templates). Only one environment should set this to true in a shared tenant."
+  type        = bool
+  default     = true
+}
+
 variable "name_prefix" {
   description = "Prefix for resource names (e.g., layerv-nhp-sandbox)"
   type        = string

@@ -78,12 +78,28 @@ resource "auth0_resource_server_scopes" "qurl_scopes" {
 # access immediately — no manual role assignment required.
 
 resource "auth0_role" "user" {
+  count       = var.manage_tenant_resources ? 1 : 0
   name        = "User"
-  description = "Default role for QURL dashboard users (${var.environment})"
+  description = "Default role for QURL dashboard users"
 }
 
+data "auth0_role" "user" {
+  count = var.manage_tenant_resources ? 0 : 1
+  name  = "User"
+}
+
+locals {
+  user_role_id = var.manage_tenant_resources ? auth0_role.user[0].id : data.auth0_role.user[0].id
+}
+
+# Only one environment manages role permissions to avoid drift.
+# auth0_role_permissions reads ALL permissions on the role during plan —
+# if both envs manage it, they fight (each removes the other's API scopes).
+# The post-login Action injects default permissions via custom claim for
+# all environments, so prod users still get access even without role_permissions.
 resource "auth0_role_permissions" "user" {
-  role_id = auth0_role.user.id
+  count   = var.manage_tenant_resources ? 1 : 0
+  role_id = local.user_role_id
 
   permissions {
     resource_server_identifier = auth0_resource_server.qurl_api.identifier
@@ -109,7 +125,8 @@ resource "auth0_role_permissions" "user" {
 # - The Action guarantees permissions from the very first token.
 
 resource "auth0_action" "default_permissions" {
-  name    = "Post-Login Security Gates (${var.environment})"
+  count   = var.manage_tenant_resources ? 1 : 0
+  name    = "Post-Login Security Gates"
   runtime = "node18"
   deploy  = true
 
@@ -156,11 +173,12 @@ resource "auth0_action" "default_permissions" {
 }
 
 resource "auth0_trigger_actions" "post_login" {
+  count   = var.manage_tenant_resources ? 1 : 0
   trigger = "post-login"
 
   actions {
-    id           = auth0_action.default_permissions.id
-    display_name = auth0_action.default_permissions.name
+    id           = auth0_action.default_permissions[0].id
+    display_name = auth0_action.default_permissions[0].name
   }
 }
 
@@ -689,7 +707,7 @@ resource "auth0_client_grant" "spa_qurl_api" {
 # corresponding OAuth credentials are provided.
 
 resource "auth0_connection" "google" {
-  count                = var.enable_spa_dashboard && var.google_oauth_client_id != null ? 1 : 0
+  count                = var.manage_tenant_resources && var.enable_spa_dashboard && var.google_oauth_client_id != null ? 1 : 0
   name                 = "google-oauth2"
   strategy             = "google-oauth2"
   is_domain_connection = false
@@ -715,7 +733,7 @@ resource "auth0_connection" "google" {
 }
 
 resource "auth0_connection_clients" "google" {
-  count         = var.enable_spa_dashboard && var.google_oauth_client_id != null ? 1 : 0
+  count         = var.manage_tenant_resources && var.enable_spa_dashboard && var.google_oauth_client_id != null ? 1 : 0
   connection_id = auth0_connection.google[0].id
   enabled_clients = [
     auth0_client.spa_dashboard[0].id,
@@ -723,7 +741,7 @@ resource "auth0_connection_clients" "google" {
 }
 
 resource "auth0_connection" "github" {
-  count                = var.enable_spa_dashboard && var.github_oauth_client_id != null ? 1 : 0
+  count                = var.manage_tenant_resources && var.enable_spa_dashboard && var.github_oauth_client_id != null ? 1 : 0
   name                 = "github"
   strategy             = "github"
   is_domain_connection = false
@@ -749,7 +767,7 @@ resource "auth0_connection" "github" {
 }
 
 resource "auth0_connection_clients" "github" {
-  count         = var.enable_spa_dashboard && var.github_oauth_client_id != null ? 1 : 0
+  count         = var.manage_tenant_resources && var.enable_spa_dashboard && var.github_oauth_client_id != null ? 1 : 0
   connection_id = auth0_connection.github[0].id
   enabled_clients = [
     auth0_client.spa_dashboard[0].id,
@@ -820,6 +838,7 @@ resource "aws_ssm_parameter" "spa_api_audience" {
 # and theme. This affects the login/signup flow users see.
 
 resource "auth0_branding" "layerv" {
+  count    = var.manage_tenant_resources ? 1 : 0
   logo_url = var.branding_logo_url
 
   colors {
@@ -829,6 +848,7 @@ resource "auth0_branding" "layerv" {
 }
 
 resource "auth0_branding_theme" "layerv" {
+  count      = var.manage_tenant_resources ? 1 : 0
   depends_on = [auth0_branding.layerv]
 
   borders {
@@ -922,6 +942,7 @@ resource "auth0_branding_theme" "layerv" {
 # Breached Password Detection requires a higher-tier subscription — not available on current plan.
 
 resource "auth0_attack_protection" "protection" {
+  count = var.manage_tenant_resources ? 1 : 0
   bot_detection {
     bot_detection_level             = var.bot_detection_level
     challenge_password_policy       = "when_risky"
@@ -974,8 +995,9 @@ resource "auth0_attack_protection" "protection" {
 data "aws_caller_identity" "ses" {}
 
 resource "aws_iam_user" "auth0_ses" {
-  name = "${var.name_prefix}-auth0-ses"
-  tags = var.tags
+  count = var.manage_tenant_resources ? 1 : 0
+  name  = "${var.name_prefix}-auth0-ses"
+  tags  = var.tags
 
   lifecycle {
     prevent_destroy = true
@@ -983,8 +1005,9 @@ resource "aws_iam_user" "auth0_ses" {
 }
 
 resource "aws_iam_user_policy" "auth0_ses_send" {
-  name = "ses-send-email"
-  user = aws_iam_user.auth0_ses.name
+  count = var.manage_tenant_resources ? 1 : 0
+  name  = "ses-send-email"
+  user  = aws_iam_user.auth0_ses[0].name
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -1004,7 +1027,8 @@ resource "aws_iam_user_policy" "auth0_ses_send" {
 }
 
 resource "aws_iam_access_key" "auth0_ses" {
-  user = aws_iam_user.auth0_ses.name
+  count = var.manage_tenant_resources ? 1 : 0
+  user  = aws_iam_user.auth0_ses[0].name
 
   lifecycle {
     prevent_destroy = true
@@ -1012,13 +1036,14 @@ resource "aws_iam_access_key" "auth0_ses" {
 }
 
 resource "auth0_email_provider" "ses" {
+  count                = var.manage_tenant_resources ? 1 : 0
   name                 = "ses"
   enabled              = true
   default_from_address = var.email_from_address
 
   credentials {
-    access_key_id     = aws_iam_access_key.auth0_ses.id
-    secret_access_key = aws_iam_access_key.auth0_ses.secret
+    access_key_id     = aws_iam_access_key.auth0_ses[0].id
+    secret_access_key = aws_iam_access_key.auth0_ses[0].secret
     region            = var.email_ses_region
   }
 }
@@ -1029,6 +1054,7 @@ resource "auth0_email_provider" "ses" {
 # Branded email templates for Auth0 transactional emails sent via SES.
 
 resource "auth0_email_template" "verify_email" {
+  count      = var.manage_tenant_resources ? 1 : 0
   depends_on = [auth0_email_provider.ses]
 
   template                = "verify_email"
@@ -1042,6 +1068,7 @@ resource "auth0_email_template" "verify_email" {
 }
 
 resource "auth0_email_template" "welcome_email" {
+  count      = var.manage_tenant_resources ? 1 : 0
   depends_on = [auth0_email_provider.ses]
 
   template = "welcome_email"
@@ -1057,6 +1084,7 @@ resource "auth0_email_template" "welcome_email" {
 }
 
 resource "auth0_email_template" "reset_email" {
+  count      = var.manage_tenant_resources ? 1 : 0
   depends_on = [auth0_email_provider.ses]
 
   template                = "reset_email"
@@ -1067,4 +1095,80 @@ resource "auth0_email_template" "reset_email" {
   url_lifetime_in_seconds = 432000 # 5 days
   enabled                 = true
   result_url              = var.email_result_url
+}
+
+# ==============================================================================
+# State Migration: manage_tenant_resources count addition
+# ==============================================================================
+# These moved blocks handle the migration from non-indexed to indexed resources
+# when `count` was added for the manage_tenant_resources pattern.
+
+moved {
+  from = auth0_action.default_permissions
+  to   = auth0_action.default_permissions[0]
+}
+
+moved {
+  from = auth0_role.user
+  to   = auth0_role.user[0]
+}
+
+moved {
+  from = auth0_role_permissions.user
+  to   = auth0_role_permissions.user[0]
+}
+
+moved {
+  from = auth0_trigger_actions.post_login
+  to   = auth0_trigger_actions.post_login[0]
+}
+
+moved {
+  from = auth0_branding.layerv
+  to   = auth0_branding.layerv[0]
+}
+
+moved {
+  from = auth0_branding_theme.layerv
+  to   = auth0_branding_theme.layerv[0]
+}
+
+moved {
+  from = auth0_attack_protection.protection
+  to   = auth0_attack_protection.protection[0]
+}
+
+moved {
+  from = aws_iam_user.auth0_ses
+  to   = aws_iam_user.auth0_ses[0]
+}
+
+moved {
+  from = aws_iam_user_policy.auth0_ses_send
+  to   = aws_iam_user_policy.auth0_ses_send[0]
+}
+
+moved {
+  from = aws_iam_access_key.auth0_ses
+  to   = aws_iam_access_key.auth0_ses[0]
+}
+
+moved {
+  from = auth0_email_provider.ses
+  to   = auth0_email_provider.ses[0]
+}
+
+moved {
+  from = auth0_email_template.verify_email
+  to   = auth0_email_template.verify_email[0]
+}
+
+moved {
+  from = auth0_email_template.welcome_email
+  to   = auth0_email_template.welcome_email[0]
+}
+
+moved {
+  from = auth0_email_template.reset_email
+  to   = auth0_email_template.reset_email[0]
 }

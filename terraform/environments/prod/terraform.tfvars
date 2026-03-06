@@ -11,9 +11,9 @@ hosted_zone    = "layerv.ai"            # Hosted in layerv-mgmt account - requir
 hosted_zone_id = "Z0748438C8EK6UAW94ST" # Bypass lookup - zone is in layerv-mgmt account
 multi_tenant   = true
 deploy_etcd    = false # Cloud deployment uses DynamoDB, not etcd
-min_capacity = 3
-max_capacity = 10
-vpc_cidr     = "10.200.0.0/16" # Different CIDR from sandbox
+min_capacity   = 3
+max_capacity   = 10
+vpc_cidr       = "10.200.0.0/16" # Different CIDR from sandbox
 
 # Multi-account config: prod pulls images from sandbox account's ECR
 is_primary_account = false
@@ -191,6 +191,9 @@ auth0_domain = "layerv.us.auth0.com"
 # Auth0 configuration for JWT validation (custom domain)
 qurl_auth0_domain   = "auth.layerv.ai"
 qurl_auth0_audience = "https://api.layerv.ai"
+
+# Auth0 shared tenant: prod references tenant-wide resources created by sandbox
+auth0_manage_tenant_resources = false
 
 # Auth0 M2M credential rotation (Phase 2: enable after auth0 management secret is created)
 auth0_enable_rotation = false
