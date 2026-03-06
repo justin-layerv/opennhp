@@ -11,9 +11,8 @@ hosted_zone    = "layerv.ai"            # Hosted in layerv-mgmt account - requir
 hosted_zone_id = "Z0748438C8EK6UAW94ST" # Bypass lookup - zone is in layerv-mgmt account
 multi_tenant   = true
 deploy_etcd    = false # Cloud deployment uses DynamoDB, not etcd
-# Minimal for initial deployment. Production-ready values: min=3, max=10
-min_capacity = 1
-max_capacity = 3
+min_capacity = 3
+max_capacity = 10
 vpc_cidr     = "10.200.0.0/16" # Different CIDR from sandbox
 
 # Multi-account config: prod pulls images from sandbox account's ECR
@@ -25,8 +24,8 @@ deploy_ac          = true
 acme_email         = "admin@layerv.ai"
 ac_auth_service_id = "layerv"
 ac_resource_ids    = ["qurl"] # Phase 2: QURL is the only service deployed initially
-ac_min_capacity    = 1        # Minimal for initial deployment. Production-ready: 2
-ac_max_capacity    = 3        # Production-ready: 6
+ac_min_capacity    = 3
+ac_max_capacity    = 10
 
 # Terraform state bucket for GitHub Actions permissions
 terraform_state_bucket = "layerv-terraform-state-235500187906"
@@ -103,8 +102,8 @@ ac_license_key_sha256 = "cd7f8df5284861a9ebfbe485085843b3631b8dbe325f272622473bf
 nhp_server_assignment_enabled        = true
 nhp_region                           = "us-east-2"
 nhp_cloudmap_service_name            = "server"
-nhp_assignment_servers_per_ac        = 1     # Minimal for initial deployment. Production-ready: 3
-nhp_assignment_require_distinct_azs  = false # Production-ready: true (requires servers_per_ac >= 3)
+nhp_assignment_servers_per_ac        = 3
+nhp_assignment_require_distinct_azs  = true
 nhp_health_monitor_check_interval    = 60
 nhp_health_monitor_operation_timeout = 30
 nhp_console_ac_enabled               = true
@@ -204,9 +203,9 @@ nhp_dynamodb_licenses_auth0_subject_index = "auth0_subject-index"
 # With ADOT sidecar: CPU = max(256,512) = 512, memory = ceil((1024+256)/1024)*1024 = 2048
 qurl_container_cpu            = 256  # 0.25 vCPU — ADOT bumps task CPU to 512
 qurl_container_memory         = 1024 # 1024 MB — module rounds up task memory to 2048 for Fargate validity
-qurl_desired_count            = 1    # Single task for initial low traffic
-qurl_autoscaling_min_capacity = 1    # Minimum tasks (scale to zero not supported)
-qurl_autoscaling_max_capacity = 4    # Allow burst scaling if traffic spikes
+qurl_desired_count            = 3
+qurl_autoscaling_min_capacity = 3
+qurl_autoscaling_max_capacity = 10
 
 # GeoIP database for geo-restriction policies (geo_allowlist/geo_denylist)
 qurl_geoip_s3_uri = "s3://layerv-nhp-prod-plugins/geoip/GeoLite2-Country.mmdb"
