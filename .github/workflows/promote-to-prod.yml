@@ -772,6 +772,13 @@ jobs:
           path: terraform/environments/prod/tfplan
           retention-days: 1
 
+      - name: Upload Lambda build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: lambda-acme-cert
+          path: terraform/modules/acme-cert/build/lambda-acme-cert.zip
+          retention-days: 1
+
   # =============================================================================
   # TERRAFORM APPLY - Apply reviewed plan (approval gate)
   # =============================================================================
@@ -804,8 +811,17 @@ jobs:
           role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Build Lambda Packages
-        uses: ./.github/actions/build-lambda-packages
+      - name: Download plan artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: tfplan-prod
+          path: terraform/environments/prod
+
+      - name: Download Lambda build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: lambda-acme-cert
+          path: terraform/modules/acme-cert/build
 
       - name: Terraform Init
         working-directory: terraform/environments/prod
@@ -820,12 +836,6 @@ jobs:
           AUTH0_CLIENT_ID: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
           AUTH0_CLIENT_SECRET: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
         run: ./.github/scripts/fetch-auth0-token.sh terraform/environments/prod/terraform.tfvars prod
-
-      - name: Download plan artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: tfplan-prod
-          path: terraform/environments/prod
 
       - name: Terraform Apply
         working-directory: terraform/environments/prod
