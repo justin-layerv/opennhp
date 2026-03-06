@@ -20,8 +20,9 @@
 #
 # What it does:
 #   1. Updates SSM image tag parameter
-#   2. Gets current task definition and replaces the image tag
-#   3. Registers new task definition revision
+#   2. Gets the LATEST task definition revision (not the one running on the service,
+#      since Terraform may have created a newer revision with updated env vars)
+#   3. Replaces the image tag and registers a new task definition revision
 #   4. Updates ECS service to use new task definition
 #   5. Waits for service stability (ECS circuit breaker handles rollback)
 
@@ -77,22 +78,39 @@ echo "  ECS Cluster: $ECS_CLUSTER"
 echo "  ECS Service: $ECS_SERVICE"
 echo ""
 
-# Step 3: Get current task definition
-echo "Step 3: Getting current task definition..."
-CURRENT_TASK_DEF_ARN=$(aws ecs describe-services \
+# Step 3: Get latest task definition revision
+# IMPORTANT: Use the latest revision (from describe-task-definition with family name),
+# NOT the one currently running on the service (from describe-services). Terraform may
+# have created a newer revision with updated env vars that the service hasn't adopted
+# yet (due to ignore_changes = [task_definition] on the ECS service resource).
+echo "Step 3: Getting latest task definition revision..."
+
+# Get the task definition family name from the running service
+RUNNING_TASK_DEF_ARN=$(aws ecs describe-services \
   --cluster "$ECS_CLUSTER" \
   --services "$ECS_SERVICE" \
   --query "services[0].taskDefinition" --output text \
   --region "$AWS_REGION")
 
-if [[ -z "$CURRENT_TASK_DEF_ARN" || "$CURRENT_TASK_DEF_ARN" == "None" ]]; then
-  echo "ERROR: Could not find current task definition for service $ECS_SERVICE"
+if [[ -z "$RUNNING_TASK_DEF_ARN" || "$RUNNING_TASK_DEF_ARN" == "None" ]]; then
+  echo "ERROR: Could not find task definition for service $ECS_SERVICE"
   exit 1
 fi
 
-echo "  Current task definition: $CURRENT_TASK_DEF_ARN"
+# Extract family name (everything before the last colon+revision)
+TASK_DEF_FAMILY=$(echo "$RUNNING_TASK_DEF_ARN" | sed 's/.*task-definition\///' | sed 's/:[0-9]*$//')
+echo "  Running task definition: $RUNNING_TASK_DEF_ARN"
+echo "  Task definition family: $TASK_DEF_FAMILY"
+
+# Fetch the LATEST revision (describe-task-definition with family name returns latest)
+CURRENT_TASK_DEF_ARN=$(aws ecs describe-task-definition \
+  --task-definition "$TASK_DEF_FAMILY" \
+  --query "taskDefinition.taskDefinitionArn" --output text \
+  --region "$AWS_REGION")
+echo "  Latest task definition: $CURRENT_TASK_DEF_ARN"
+
 CURRENT_TASK_DEF=$(aws ecs describe-task-definition \
-  --task-definition "$CURRENT_TASK_DEF_ARN" \
+  --task-definition "$TASK_DEF_FAMILY" \
   --query "taskDefinition" --output json \
   --region "$AWS_REGION")
 
