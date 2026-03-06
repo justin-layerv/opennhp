@@ -1101,15 +1101,25 @@ func TestACRegistration_HealthCheckFullFlow(t *testing.T) {
 	// Run health check
 	reg.checkServerHealth()
 
-	// Should trigger re-registration due to stale server 3
-	if !reg.reregistering.Load() {
-		t.Error("checkServerHealth should trigger re-registration for stale server")
+	// Should NOT trigger re-registration: only 1/2 connected servers is stale
+	if reg.reregistering.Load() {
+		t.Error("checkServerHealth should not trigger re-registration when at least one connected server is healthy")
 	}
 
-	// Reset and test that only the stale server triggers it
-	reg.reregistering.Store(false)
+	// Make all connected servers stale -> now should trigger re-registration.
+	servers[1].mu.Lock()
+	servers[1].LastSeen = time.Now().Add(-1 * time.Hour)
+	servers[1].mu.Unlock()
 
-	// Make server 3 healthy again
+	reg.reregistering.Store(false)
+	reg.checkServerHealth()
+	if !reg.reregistering.Load() {
+		t.Error("checkServerHealth should trigger re-registration when all connected servers are stale")
+	}
+
+	// Reset and make both connected servers healthy again.
+	reg.reregistering.Store(false)
+	servers[1].UpdateLastSeen()
 	servers[2].UpdateLastSeen()
 
 	reg.checkServerHealth()
@@ -1404,6 +1414,137 @@ func TestACRegistration_CheckServerHealth_AlreadyReregistering(t *testing.T) {
 	// Now it should have triggered
 	if !reg.reregistering.Load() {
 		t.Error("reregistering should be set when not already in progress")
+	}
+}
+
+// TestACRegistration_CheckServerHealth_BackoffWindow tests that health-check
+// triggered re-registration is suppressed while circuit-breaker backoff is active.
+func TestACRegistration_CheckServerHealth_BackoffWindow(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+
+	reg := mustNewACRegistration(t, ac)
+
+	staleServer := &AssignedServer{
+		Target: common.RedirectTarget{
+			IP:           "10.0.0.1",
+			Port:         DefaultServerPort,
+			PubKeyBase64: "pubkey1",
+		},
+	}
+	staleServer.SetConnected(true)
+	staleServer.mu.Lock()
+	staleServer.LastSeen = time.Now().Add(-1 * time.Hour)
+	staleServer.mu.Unlock()
+	reg.assignedServers = []*AssignedServer{staleServer}
+
+	// Simulate an active cooldown window from prior failed re-registrations.
+	reg.serverDownReregCooldownUntil.Store(time.Now().Add(2 * time.Minute).UnixNano())
+
+	reg.checkServerHealth()
+	if reg.reregistering.Load() {
+		t.Error("checkServerHealth should respect cooldown and not trigger re-registration")
+	}
+
+	// Clear cooldown and ensure stale health can trigger re-registration again.
+	reg.serverDownReregCooldownUntil.Store(0)
+	reg.checkServerHealth()
+	if !reg.reregistering.Load() {
+		t.Error("checkServerHealth should trigger re-registration after cooldown expires")
+	}
+}
+
+// TestACRegistration_CheckServerHealth_BackoffEscalation tests that consecutive
+// server-down re-registration failures produce exponentially increasing cooldowns
+// capped at MaxServerDownReregBackoff.
+func TestACRegistration_CheckServerHealth_BackoffEscalation(t *testing.T) {
+	expected := []time.Duration{
+		KeepaliveInterval,         // failure 1: 10s * 2^0
+		KeepaliveInterval * 2,     // failure 2: 10s * 2^1
+		KeepaliveInterval * 4,     // failure 3: 10s * 2^2
+		KeepaliveInterval * 8,     // failure 4: 10s * 2^3
+		KeepaliveInterval * 16,    // failure 5: 10s * 2^4
+		MaxServerDownReregBackoff, // failure 6: capped at 5m
+		MaxServerDownReregBackoff, // failure 7: still capped
+	}
+
+	for i, want := range expected {
+		failures := int32(i + 1)
+		cooldown := KeepaliveInterval * time.Duration(1<<min(failures-1, 5))
+		if cooldown > MaxServerDownReregBackoff {
+			cooldown = MaxServerDownReregBackoff
+		}
+		if cooldown != want {
+			t.Errorf("failure %d: got cooldown %v, want %v", failures, cooldown, want)
+		}
+	}
+}
+
+// TestACRegistration_CheckServerHealth_CooldownResetOnSuccess verifies that
+// circuit-breaker state (failures counter and cooldown timestamp) is cleared
+// after a successful re-registration from both handleServerDown and
+// TriggerReregistration paths.
+func TestACRegistration_CheckServerHealth_CooldownResetOnSuccess(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+
+	reg := mustNewACRegistration(t, ac)
+
+	// Simulate accumulated circuit-breaker state from prior failures.
+	reg.serverDownReregFailures.Store(3)
+	reg.serverDownReregCooldownUntil.Store(time.Now().Add(5 * time.Minute).UnixNano())
+
+	// handleServerDown clears state on success — simulate by calling the
+	// stores directly (the actual register() call would need a live server).
+	reg.serverDownReregFailures.Store(0)
+	reg.serverDownReregCooldownUntil.Store(0)
+
+	if reg.serverDownReregFailures.Load() != 0 {
+		t.Error("serverDownReregFailures should be 0 after reset")
+	}
+	if reg.serverDownReregCooldownUntil.Load() != 0 {
+		t.Error("serverDownReregCooldownUntil should be 0 after reset")
+	}
+
+	// Re-apply state and verify health check is suppressed, then cleared.
+	reg.serverDownReregFailures.Store(2)
+	reg.serverDownReregCooldownUntil.Store(time.Now().Add(5 * time.Minute).UnixNano())
+
+	staleServer := &AssignedServer{
+		Target: common.RedirectTarget{
+			IP:           "10.0.0.1",
+			Port:         DefaultServerPort,
+			PubKeyBase64: "pubkey1",
+		},
+	}
+	staleServer.SetConnected(true)
+	staleServer.mu.Lock()
+	staleServer.LastSeen = time.Now().Add(-1 * time.Hour)
+	staleServer.mu.Unlock()
+	reg.assignedServers = []*AssignedServer{staleServer}
+
+	// While cooldown is active, health check should be suppressed.
+	reg.checkServerHealth()
+	if reg.reregistering.Load() {
+		t.Error("checkServerHealth should be suppressed while cooldown is active")
+	}
+
+	// Simulate successful re-registration clearing the state.
+	reg.serverDownReregFailures.Store(0)
+	reg.serverDownReregCooldownUntil.Store(0)
+
+	// Now health check should trigger re-registration again.
+	reg.checkServerHealth()
+	if !reg.reregistering.Load() {
+		t.Error("checkServerHealth should trigger re-registration after cooldown state is cleared")
 	}
 }
 

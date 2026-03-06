@@ -64,6 +64,10 @@ const (
 	// peer state but the AC continues sending keep-alives.
 	// Set to 6 * KeepaliveInterval = 60 seconds.
 	RegistrationRefreshInterval = 6
+
+	// MaxServerDownReregBackoff caps circuit-breaker backoff when server-down
+	// re-registration keeps failing.
+	MaxServerDownReregBackoff = 5 * time.Minute
 )
 
 // CloudWatch metric names for AC registration lifecycle.
@@ -160,6 +164,14 @@ type ACRegistration struct {
 
 	// stopped prevents double Stop() calls from panicking (closing stopCh twice)
 	stopped atomic.Bool
+
+	// serverDownReregFailures tracks consecutive failures of server-down triggered
+	// re-registration attempts (used for circuit-breaker backoff).
+	serverDownReregFailures atomic.Int32
+
+	// serverDownReregCooldownUntil is a unix nano timestamp. While now < cooldown,
+	// health-check-triggered re-registration is suppressed to avoid tight loops.
+	serverDownReregCooldownUntil atomic.Int64
 
 	// registrationPeer tracks the peer from NHP_AAK response (the server that is
 	// assigned to us and will send NHP_AOP packets). This is separate from
@@ -1108,11 +1120,16 @@ func (r *ACRegistration) handleRefreshResponse(ppd *core.PacketParserData, serve
 	}
 }
 
-// checkServerHealth checks if any server is down and triggers re-registration.
+// checkServerHealth checks assigned-server health and triggers re-registration
+// only when all connected assigned servers appear unhealthy.
 func (r *ACRegistration) checkServerHealth() {
 	r.mu.RLock()
 	servers := slices.Clone(r.assignedServers)
 	r.mu.RUnlock()
+
+	connectedCount := 0
+	downConnectedCount := 0
+	var firstDownServer *AssignedServer
 
 	for _, server := range servers {
 		// Skip servers that were never connected - they have zero LastSeen
@@ -1122,29 +1139,52 @@ func (r *ACRegistration) checkServerHealth() {
 			continue
 		}
 
+		connectedCount++
+
 		if time.Since(server.GetLastSeen()) > KeepaliveInterval*KeepaliveMaxRetries {
-			// Check if already re-registering to prevent concurrent attempts
-			if r.reregistering.CompareAndSwap(false, true) {
-				log.Warning("Server %s appears down, triggering re-registration", server.Target.IP)
-
-				// Send server health failure metric.
-				// Only ACId as extra dimension — no ServerIP to keep cardinality bounded
-				// (server IPs change on every ASG launch).
-				r.metrics.IncrCounterWithDims(MetricServerHealthFailures, []types.Dimension{
-					r.acIdDimension(),
-				})
-
-				go r.handleServerDown(server)
-			} else {
-				log.Debug("Server %s appears down but re-registration already in progress", server.Target.IP)
+			downConnectedCount++
+			if firstDownServer == nil {
+				firstDownServer = server
 			}
-			return // Re-register once, not for each down server
 		}
+	}
+
+	// No connected servers means no reliable health signal from keepalive path.
+	if connectedCount == 0 {
+		log.Debug("Health check: no connected servers to monitor")
+		return
+	}
+
+	// Trigger re-registration only when all connected assigned servers are unhealthy.
+	// This avoids churn when only part of the assigned server set is degraded.
+	if downConnectedCount != connectedCount {
+		return
+	}
+
+	if cooldownUntil := time.Unix(0, r.serverDownReregCooldownUntil.Load()); time.Now().Before(cooldownUntil) {
+		log.Warning("All %d connected servers appear down, but re-registration is in backoff until %s", connectedCount, cooldownUntil.Format(time.RFC3339))
+		return
+	}
+
+	// Check if already re-registering to prevent concurrent attempts
+	if r.reregistering.CompareAndSwap(false, true) {
+		log.Warning("All %d connected servers appear down, triggering re-registration", connectedCount)
+
+		// Send server health failure metric.
+		// Only ACId as extra dimension — no ServerIP to keep cardinality bounded
+		// (server IPs change on every ASG launch).
+		r.metrics.IncrCounterWithDims(MetricServerHealthFailures, []types.Dimension{
+			r.acIdDimension(),
+		})
+
+		go r.handleServerDown(firstDownServer)
+	} else if firstDownServer != nil {
+		log.Debug("Server %s appears down but re-registration already in progress", firstDownServer.Target.IP)
 	}
 }
 
-// handleServerDown handles when a server is detected as down.
-// Per design doc: AC re-registers via FQDN on ANY server failure.
+// handleServerDown handles when assigned-server health degrades enough to
+// trigger a full re-registration attempt.
 func (r *ACRegistration) handleServerDown(deadServer *AssignedServer) {
 	// Always reset reregistering flag when done
 	defer r.reregistering.Store(false)
@@ -1170,6 +1210,8 @@ func (r *ACRegistration) handleServerDown(deadServer *AssignedServer) {
 		err := r.register()
 		if err == nil {
 			log.Info("Re-registration successful after %d attempt(s)", attempt)
+			r.serverDownReregFailures.Store(0)
+			r.serverDownReregCooldownUntil.Store(0)
 			// Reset iptables to restore port hiding after successful re-registration
 			r.resetIptables()
 			return
@@ -1186,7 +1228,16 @@ func (r *ACRegistration) handleServerDown(deadServer *AssignedServer) {
 		}
 	}
 
+	failures := r.serverDownReregFailures.Add(1)
+	cooldown := KeepaliveInterval * time.Duration(1<<min(failures-1, 5))
+	if cooldown > MaxServerDownReregBackoff {
+		cooldown = MaxServerDownReregBackoff
+	}
+	until := time.Now().Add(cooldown)
+	r.serverDownReregCooldownUntil.Store(until.UnixNano())
+
 	log.Error("Re-registration failed after %d attempts, continuing with remaining servers", MaxReregistrationAttempts)
+	log.Warning("Entering server-down re-registration backoff for %v after %d consecutive failure(s) (until %s)", cooldown, failures, until.Format(time.RFC3339))
 }
 
 // IsServerAddress checks if the given address belongs to an assigned server.
@@ -1259,6 +1310,10 @@ func (r *ACRegistration) TriggerReregistration(reason string) {
 			err := r.register()
 			if err == nil {
 				log.Info("Re-registration successful after %d attempt(s) (triggered by: %s)", attempt, reason)
+				// A successful re-registration from any trigger should clear server-down
+				// circuit-breaker state so future genuine outages are not suppressed.
+				r.serverDownReregFailures.Store(0)
+				r.serverDownReregCooldownUntil.Store(0)
 				r.resetIptables()
 				return
 			}
@@ -1273,6 +1328,10 @@ func (r *ACRegistration) TriggerReregistration(reason string) {
 			}
 		}
 
+		// NOTE: We intentionally do NOT increment serverDownReregFailures here.
+		// Connection-triggered re-registration has different semantics from the
+		// health-check path — it fires once per disconnect event, not on a timer,
+		// so applying circuit-breaker backoff would suppress legitimate retries.
 		log.Error("Re-registration failed after %d attempts (triggered by: %s)", MaxReregistrationAttempts, reason)
 	}()
 }
