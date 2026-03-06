@@ -944,3 +944,43 @@ resource "aws_dynamodb_table" "qurl_billing_audit" {
     Purpose   = "QURL billing audit trail"
   })
 }
+
+# qurl-idempotency: Distributed idempotency cache for multi-instance QURL
+# PK: pk (SHA-256 hash of owner_id:key:method:path)
+# TTL: ttl (auto-expire cached responses)
+resource "aws_dynamodb_table" "qurl_idempotency" {
+  count = var.deploy_qurl_tables ? 1 : 0
+
+  name                        = "${var.name_prefix}-${var.cell_id}-qurl-idempotency"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "pk"
+  deletion_protection_enabled = local.is_prod # Data is ephemeral but protect prod from accidental deletion
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  # TTL for automatic cleanup (entries expire after 24h by default)
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  # Server-side encryption with KMS
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-qurl-idempotency"
+    Cell      = var.cell_id
+    Component = "qurl-service"
+    Purpose   = "Distributed idempotency cache"
+  })
+}

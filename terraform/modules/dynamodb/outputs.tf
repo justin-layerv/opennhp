@@ -128,6 +128,16 @@ output "qurl_billing_audit_table_name" {
   value       = length(aws_dynamodb_table.qurl_billing_audit) > 0 ? aws_dynamodb_table.qurl_billing_audit[0].name : null
 }
 
+output "qurl_idempotency_table_arn" {
+  description = "ARN of the QURL idempotency DynamoDB table"
+  value       = length(aws_dynamodb_table.qurl_idempotency) > 0 ? aws_dynamodb_table.qurl_idempotency[0].arn : null
+}
+
+output "qurl_idempotency_table_name" {
+  description = "Name of the QURL idempotency DynamoDB table"
+  value       = length(aws_dynamodb_table.qurl_idempotency) > 0 ? aws_dynamodb_table.qurl_idempotency[0].name : null
+}
+
 # Note: All QURL tables are created together via the deploy_qurl_tables flag,
 # so checking only qurl_resources is sufficient for the conditional.
 output "qurl_table_arns" {
@@ -142,5 +152,6 @@ output "qurl_table_arns" {
     aws_dynamodb_table.qurl_api_keys[0].arn,
     aws_dynamodb_table.qurl_customers[0].arn,
     aws_dynamodb_table.qurl_billing_audit[0].arn,
+    aws_dynamodb_table.qurl_idempotency[0].arn,
   ] : []
 }

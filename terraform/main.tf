@@ -1194,7 +1194,9 @@ module "qurl_service" {
   # ALB access logs (required for production)
   alb_access_logs_bucket = var.qurl_alb_access_logs_bucket
 
-  # Idempotency cache
+  # Idempotency (distributed via DynamoDB)
+  idempotency_table_name               = module.dynamodb.qurl_idempotency_table_name
+  idempotency_table_arn                = module.dynamodb.qurl_idempotency_table_arn
   idempotency_cache_ttl_seconds        = var.qurl_idempotency_cache_ttl_seconds
   idempotency_cache_max_size           = var.qurl_idempotency_cache_max_size
   idempotency_cleanup_interval_seconds = var.qurl_idempotency_cleanup_interval_seconds
