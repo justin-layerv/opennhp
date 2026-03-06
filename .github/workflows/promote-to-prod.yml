@@ -4,9 +4,10 @@ name: Promote to Production
 # using proven deployment mechanisms (canary for server/AC, ECS task def for QURL).
 #
 # Deployment flow:
-#   manifest ──→ preflight (approval gate) ──→ terraform-apply
-#     ──→ deploy-server (canary) ──→ deploy-ac (canary) ──→ deploy-qurl (ECS)
-#     ──→ smoke-test ──→ monitor ──→ finalize
+#   manifest → preflight (approval) → terraform-plan (shows diff)
+#           → terraform-apply (approval) → deploy-server (canary)
+#           → deploy-ac (canary) → deploy-qurl (ECS)
+#           → smoke-test → monitor → finalize
 #
 # Usage:
 #   # Standard promotion
@@ -684,11 +685,99 @@ jobs:
           echo "  Lock acquired: /prod/nhp/deploy/state = deploying"
 
   # =============================================================================
-  # TERRAFORM APPLY - Create/update production infrastructure
+  # TERRAFORM PLAN - Show what will change (NO approval gate — runs automatically)
+  # =============================================================================
+  terraform-plan:
+    name: Terraform Plan (prod)
+    needs: [manifest, preflight]
+    if: inputs.run_terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@5e8dbf3c6d9deaf4193ca7a8fb23f2ac83bb6c85 # v4.0.0
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Cache Terraform plugins
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
+          restore-keys: terraform-plugins-
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build Lambda Packages
+        uses: ./.github/actions/build-lambda-packages
+
+      - name: Terraform Init
+        working-directory: terraform/environments/prod
+        run: |
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
+          terraform init
+
+      - name: Fetch Auth0 Token
+        id: auth0
+        env:
+          AUTH0_CLIENT_ID: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
+          AUTH0_CLIENT_SECRET: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
+        run: ./.github/scripts/fetch-auth0-token.sh terraform/environments/prod/terraform.tfvars prod
+
+      - name: Terraform Plan
+        working-directory: terraform/environments/prod
+        env:
+          TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
+          TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
+          TF_VAR_ac_license_key: ${{ secrets.PROD_AC_LICENSE_KEY }}
+          TF_VAR_grafana_auth: ${{ secrets.PROD_GRAFANA_AUTH }}
+          TF_VAR_auth0_tf_client_id: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
+          TF_VAR_auth0_tf_client_secret: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
+          TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
+          TF_VAR_confirm_prod_deployment: "yes-deploy-to-production"
+          TF_VAR_image_tag: ${{ needs.manifest.outputs.effective_image_tag }}
+          TF_VAR_cell_id: ${{ inputs.cell_id }}
+        run: |
+          terraform plan -no-color -out=tfplan 2>&1 | tee plan-output.txt
+
+          # Write plan to step summary so reviewer can see it before approving apply
+          {
+            echo "## Terraform Plan — Production"
+            echo ""
+            echo "<details><summary>Full plan output (click to expand)</summary>"
+            echo ""
+            echo '```'
+            cat plan-output.txt
+            echo '```'
+            echo ""
+            echo "</details>"
+            echo ""
+            # Extract the summary line (e.g., "Plan: 2 to add, 1 to change, 0 to destroy.")
+            SUMMARY=$(grep -E '^(Plan:|No changes\.)' plan-output.txt || echo "Unable to extract summary")
+            echo "**$SUMMARY**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tfplan-prod
+          path: terraform/environments/prod/tfplan
+          retention-days: 1
+
+  # =============================================================================
+  # TERRAFORM APPLY - Apply reviewed plan (approval gate)
   # =============================================================================
   terraform-apply:
     name: Terraform Apply (prod)
-    needs: [manifest, preflight]
+    needs: [manifest, preflight, terraform-plan]
     if: inputs.run_terraform
     runs-on: ubuntu-latest
     environment: production
@@ -732,6 +821,12 @@ jobs:
           AUTH0_CLIENT_SECRET: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
         run: ./.github/scripts/fetch-auth0-token.sh terraform/environments/prod/terraform.tfvars prod
 
+      - name: Download plan artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: tfplan-prod
+          path: terraform/environments/prod
+
       - name: Terraform Apply
         working-directory: terraform/environments/prod
         env:
@@ -745,17 +840,18 @@ jobs:
           TF_VAR_confirm_prod_deployment: "yes-deploy-to-production"
           TF_VAR_image_tag: ${{ needs.manifest.outputs.effective_image_tag }}
           TF_VAR_cell_id: ${{ inputs.cell_id }}
-        run: terraform apply -auto-approve
+        run: terraform apply -auto-approve tfplan
 
   # =============================================================================
   # DEPLOY SERVER - Via canary (Step Functions) with first-deploy fallback
   # =============================================================================
   deploy-server:
     name: Deploy NHP Server
-    needs: [manifest, preflight, terraform-apply]
+    needs: [manifest, preflight, terraform-plan, terraform-apply]
     if: |
       always() &&
       needs.preflight.result == 'success' &&
+      (needs.terraform-plan.result == 'success' || needs.terraform-plan.result == 'skipped') &&
       (needs.terraform-apply.result == 'success' || needs.terraform-apply.result == 'skipped') &&
       inputs.deploy_server
     runs-on: ubuntu-latest
@@ -826,10 +922,11 @@ jobs:
   # =============================================================================
   deploy-ac:
     name: Deploy Access Controller
-    needs: [manifest, preflight, terraform-apply, deploy-server]
+    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server]
     if: |
       always() &&
       needs.preflight.result == 'success' &&
+      (needs.terraform-plan.result == 'success' || needs.terraform-plan.result == 'skipped') &&
       (needs.terraform-apply.result == 'success' || needs.terraform-apply.result == 'skipped') &&
       (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
       inputs.deploy_ac
@@ -900,10 +997,11 @@ jobs:
   # =============================================================================
   deploy-qurl:
     name: Deploy QURL Service
-    needs: [manifest, preflight, terraform-apply, deploy-server, deploy-ac]
+    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server, deploy-ac]
     if: |
       always() &&
       needs.preflight.result == 'success' &&
+      (needs.terraform-plan.result == 'success' || needs.terraform-plan.result == 'skipped') &&
       (needs.terraform-apply.result == 'success' || needs.terraform-apply.result == 'skipped') &&
       (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
       (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
@@ -1155,7 +1253,7 @@ jobs:
   finalize:
     name: Finalize
     if: always()
-    needs: [manifest, preflight, terraform-apply, deploy-server, deploy-ac, deploy-qurl, smoke-test, qurl-smoke-tests, monitor]
+    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server, deploy-ac, deploy-qurl, smoke-test, qurl-smoke-tests, monitor]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -1170,6 +1268,7 @@ jobs:
         env:
           MANIFEST_RESULT: ${{ needs.manifest.result }}
           PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          TF_PLAN_RESULT: ${{ needs.terraform-plan.result }}
           TF_RESULT: ${{ needs.terraform-apply.result }}
           SERVER_RESULT: ${{ needs.deploy-server.result }}
           AC_RESULT: ${{ needs.deploy-ac.result }}
@@ -1180,7 +1279,7 @@ jobs:
         run: |
           # Check if any non-skipped job failed
           FAILED=false
-          for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$AC_RESULT" "$QURL_RESULT" "$SMOKE_RESULT" "$QURL_SMOKE_RESULT" "$MONITOR_RESULT"; do
+          for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_PLAN_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$AC_RESULT" "$QURL_RESULT" "$SMOKE_RESULT" "$QURL_SMOKE_RESULT" "$MONITOR_RESULT"; do
             if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
               FAILED=true
               break
@@ -1261,6 +1360,7 @@ jobs:
           DEPLOY_STATUS: ${{ steps.outcome.outputs.status }}
           MANIFEST_RESULT: ${{ needs.manifest.result }}
           PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          TF_PLAN_RESULT: ${{ needs.terraform-plan.result }}
           TF_RESULT: ${{ needs.terraform-apply.result }}
           SERVER_RESULT: ${{ needs.deploy-server.result }}
           AC_RESULT: ${{ needs.deploy-ac.result }}
@@ -1306,7 +1406,8 @@ jobs:
           MSG+="\n"
           MSG+="\n  Manifest:   $(result_icon "$MANIFEST_RESULT")"
           MSG+="\n  Preflight:  $(result_icon "$PREFLIGHT_RESULT")"
-          MSG+="\n  Terraform:  $(result_icon "$TF_RESULT")"
+          MSG+="\n  TF Plan:    $(result_icon "$TF_PLAN_RESULT")"
+          MSG+="\n  TF Apply:   $(result_icon "$TF_RESULT")"
           MSG+="\n  Server:     $(result_icon "$SERVER_RESULT")"
           MSG+="\n  AC:         $(result_icon "$AC_RESULT")"
           MSG+="\n  QURL:       $(result_icon "$QURL_RESULT")"
@@ -1330,6 +1431,7 @@ jobs:
           DEPLOY_STATUS: ${{ steps.outcome.outputs.status }}
           MANIFEST_RESULT: ${{ needs.manifest.result }}
           PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          TF_PLAN_RESULT: ${{ needs.terraform-plan.result }}
           TF_RESULT: ${{ needs.terraform-apply.result }}
           SERVER_RESULT: ${{ needs.deploy-server.result }}
           AC_RESULT: ${{ needs.deploy-ac.result }}
@@ -1368,6 +1470,7 @@ jobs:
             echo "|-----|--------|"
             echo "| Manifest | $(result_emoji "$MANIFEST_RESULT") $MANIFEST_RESULT |"
             echo "| Preflight | $(result_emoji "$PREFLIGHT_RESULT") $PREFLIGHT_RESULT |"
+            echo "| Terraform Plan | $(result_emoji "$TF_PLAN_RESULT") $TF_PLAN_RESULT |"
             echo "| Terraform Apply | $(result_emoji "$TF_RESULT") $TF_RESULT |"
             echo "| Deploy Server | $(result_emoji "$SERVER_RESULT") $SERVER_RESULT |"
             echo "| Deploy AC | $(result_emoji "$AC_RESULT") $AC_RESULT |"
