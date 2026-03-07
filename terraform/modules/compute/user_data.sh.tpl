@@ -227,6 +227,7 @@ Enabled = true
 Region = "${dynamodb_region}"
 NamespaceName = "${cloudmap_namespace_name}"
 ServiceName = "${cloudmap_service_name}"
+ServiceID = "${cloudmap_service_id}"
 CacheTTL = 30
 OperationTimeout = 5
 %{ endif ~}

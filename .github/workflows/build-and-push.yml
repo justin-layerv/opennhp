@@ -868,14 +868,17 @@ jobs:
           # Cancel any existing instance refresh from previous failed/cancelled runs
           ./.github/scripts/cancel-existing-refresh.sh "$ASG_NAME"
 
-          # Start instance refresh (1 instance at a time)
+          # SkipMatching must be false because the Docker image tag is stored in
+          # SSM and read at boot, not baked into the launch template. When the
+          # image tag changes, the launch template stays the same, so
+          # SkipMatching would incorrectly skip replacement.
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "$ASG_NAME" \
             --preferences '{
               "MinHealthyPercentage": 90,
               "InstanceWarmup": 180,
               "MaxHealthyPercentage": 110,
-              "SkipMatching": true
+              "SkipMatching": false
             }' \
             --query "InstanceRefreshId" \
             --output text)
@@ -929,13 +932,17 @@ jobs:
           # Cancel any existing instance refresh from previous failed/cancelled runs
           ./.github/scripts/cancel-existing-refresh.sh "$ASG_NAME"
 
+          # SkipMatching must be false because the Docker image tag is stored in
+          # SSM and read at boot, not baked into the launch template. When the
+          # image tag changes, the launch template stays the same, so
+          # SkipMatching would incorrectly skip replacement.
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "$ASG_NAME" \
             --preferences '{
               "MinHealthyPercentage": 50,
               "InstanceWarmup": 180,
               "MaxHealthyPercentage": 110,
-              "SkipMatching": true
+              "SkipMatching": false
             }' \
             --query "InstanceRefreshId" \
             --output text)

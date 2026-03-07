@@ -128,7 +128,10 @@ else
   MIN_HEALTHY=50
 fi
 
-# Start instance refresh
+# SkipMatching must be false because the Docker image tag is stored in SSM and
+# read at boot, not baked into the launch template. When the image tag changes,
+# the launch template stays the same, so SkipMatching would incorrectly skip
+# replacement.
 echo "Starting instance refresh..."
 REFRESH_ID=$(aws autoscaling start-instance-refresh \
   --auto-scaling-group-name "$ASG_NAME" \
@@ -136,7 +139,7 @@ REFRESH_ID=$(aws autoscaling start-instance-refresh \
     \"MinHealthyPercentage\": $MIN_HEALTHY,
     \"InstanceWarmup\": 180,
     \"MaxHealthyPercentage\": 110,
-    \"SkipMatching\": true
+    \"SkipMatching\": false
   }" \
   --query "InstanceRefreshId" \
   --output text \

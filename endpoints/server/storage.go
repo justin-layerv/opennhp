@@ -64,8 +64,8 @@ type StorageBackend interface {
 // Each AC is assigned to 3 servers in different AZs for resilience.
 type ACAssignment struct {
 	ACID            string       `json:"ac_id" dynamodbav:"ac_id"`
-	ResourceFQDN    string       `json:"resource_fqdn" dynamodbav:"resource_fqdn"`
-	CustomerID      string       `json:"customer_id" dynamodbav:"customer_id"`
+	ResourceFQDN    string       `json:"resource_fqdn,omitempty" dynamodbav:"resource_fqdn,omitempty"`
+	CustomerID      string       `json:"customer_id,omitempty" dynamodbav:"customer_id,omitempty"`
 	AssignedServers []ServerInfo `json:"assigned_servers" dynamodbav:"assigned_servers"`
 	Version         int          `json:"version" dynamodbav:"version"`             // For optimistic locking during reassignment
 	ReassignedAt    *int64       `json:"reassigned_at" dynamodbav:"reassigned_at"` // Unix timestamp, set when Console reassigns
