@@ -19,10 +19,6 @@ import (
 )
 
 func ReadWholeFile(fileName string) (string, error) {
-	if _, err := os.Stat(fileName); os.IsNotExist(err) {
-		return "", err
-	}
-
 	buf, err := os.ReadFile(fileName)
 	if err != nil {
 		return "", err

@@ -227,9 +227,28 @@ func (hs *HttpServer) initStorageRouter() {
 			return
 		}
 
-		// check file exists
-		if _, err := os.Stat(absPath); os.IsNotExist(err) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "file not exists"})
+		// Open file directly to eliminate TOCTOU race between stat and read.
+		// Using the open file descriptor for both validation and serving ensures
+		// the file cannot be swapped between check and use.
+		f, err := os.Open(absPath) //nolint:gosec // G304: absPath validated by prefix check above
+		if err != nil {
+			if os.IsNotExist(err) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "file not exists"})
+			} else {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			}
+			return
+		}
+		defer func() { _ = f.Close() }()
+
+		// Verify the opened file is a regular file (not a symlink, directory, etc.)
+		fi, err := f.Stat()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			return
+		}
+		if !fi.Mode().IsRegular() {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file"})
 			return
 		}
 
@@ -239,7 +258,7 @@ func (hs *HttpServer) initStorageRouter() {
 		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"",
 			strings.ReplaceAll(filename, "\"", "\\\"")))
 		c.Header("Content-Type", "application/octet-stream")
-		c.File(absPath)
+		http.ServeContent(c.Writer, c.Request, filename, fi.ModTime(), f)
 	})
 
 	// get file metadata
