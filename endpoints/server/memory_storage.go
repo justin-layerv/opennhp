@@ -204,6 +204,15 @@ func (m *MemoryStorage) GetResourceByACID(ctx context.Context, acID string) ([]R
 	return results, nil
 }
 
+// SaveACAssignment stores an AC assignment (interface-compliant wrapper around PutACAssignment).
+func (m *MemoryStorage) SaveACAssignment(ctx context.Context, assignment *ACAssignment) error {
+	if err := m.preamble(ctx, "SaveACAssignment"); err != nil {
+		return err
+	}
+	m.PutACAssignment(assignment)
+	return nil
+}
+
 // Close releases resources.
 func (m *MemoryStorage) Close() error {
 	m.mu.Lock()

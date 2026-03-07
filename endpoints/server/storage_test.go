@@ -235,6 +235,13 @@ func (m *mockStorageBackend) GetResourceByACID(ctx context.Context, acID string)
 	return nil, NewNotFoundError("not implemented")
 }
 
+func (m *mockStorageBackend) SaveACAssignment(ctx context.Context, assignment *ACAssignment) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.assignments[assignment.ACID] = assignment
+	return nil
+}
+
 func (m *mockStorageBackend) Close() error {
 	return nil
 }

@@ -17,7 +17,7 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 	defer s.wg.Done()
 
 	knockStart := time.Now()
-	s.metrics.IncrCounter("KnockRequest")
+	s.metrics.IncrCounter(MetricKnockRequest)
 
 	transactionId := ppd.SenderTrxId
 	addrStr := ppd.ConnData.RemoteAddr.String()
@@ -93,16 +93,16 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 		ackMsg, err = handler.AuthWithNHP(authReq, s.NewNhpServerHelper(ppd))
 		if err != nil {
 			log.Info("server-agent(%s#%d@%s)[HandleKnockRequest] failed: %+v", knkMsg.UserId, transactionId, addrStr, err)
-			s.metrics.IncrCounter("AuthFailure")
+			s.metrics.IncrCounter(MetricAuthFailure)
 			return
 		}
 
 		log.Info("server-agent(%s#%d@%s)[HandleKnockRequest] succeed: %+v", knkMsg.UserId, transactionId, addrStr)
-		s.metrics.IncrCounter("AuthSuccess")
+		s.metrics.IncrCounter(MetricAuthSuccess)
 	}()
 
 	// Record knock processing latency
-	s.metrics.RecordLatency("KnockLatency", float64(time.Since(knockStart).Milliseconds()))
+	s.metrics.RecordLatency(MetricKnockLatency, float64(time.Since(knockStart).Milliseconds()))
 
 	// send back knock ack response
 	ackBytes, marshalErr := json.Marshal(ackMsg)

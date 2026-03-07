@@ -53,6 +53,10 @@ func (m *MockHealthChecker) InvalidateCache() {
 	// No-op for mock
 }
 
+func (m *MockHealthChecker) IsNil() bool {
+	return m == nil
+}
+
 func (m *MockHealthChecker) SetError(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -289,17 +293,17 @@ func TestCloudMapConfig_GetOperationTimeout(t *testing.T) {
 
 func TestCloudMapClient_CacheExpiry(t *testing.T) {
 	client := &CloudMapClient{
-		cachedIPs: map[string]bool{
-			"10.0.0.1": true,
+		cachedInstances: []ServerInfo{
+			{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1"},
 		},
-		cacheExpiry: time.Now().Add(-1 * time.Minute), // Expired
+		instancesExpiry: time.Now().Add(-1 * time.Minute), // Expired
 	}
 
-	// With expired cache, GetHealthyServerIPs would normally call the API
+	// With expired cache, DiscoverServerInstances would normally call the API
 	// Since we don't have a real API to call, we just verify the cache logic
-	client.cacheMu.RLock()
-	isExpired := time.Now().After(client.cacheExpiry)
-	client.cacheMu.RUnlock()
+	client.instancesMu.RLock()
+	isExpired := time.Now().After(client.instancesExpiry)
+	client.instancesMu.RUnlock()
 
 	if !isExpired {
 		t.Error("Cache should be expired")
@@ -308,39 +312,39 @@ func TestCloudMapClient_CacheExpiry(t *testing.T) {
 
 func TestCloudMapClient_CacheValid(t *testing.T) {
 	client := &CloudMapClient{
-		cachedIPs: map[string]bool{
-			"10.0.0.1": true,
-			"10.0.0.2": true,
+		cachedInstances: []ServerInfo{
+			{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1"},
+			{ID: "srv-2", IP: "10.0.0.2", InternalIP: "10.0.0.2"},
 		},
-		cacheExpiry: time.Now().Add(1 * time.Minute), // Valid
+		instancesExpiry: time.Now().Add(1 * time.Minute), // Valid
 	}
 
-	client.cacheMu.RLock()
-	isValid := time.Now().Before(client.cacheExpiry)
-	cachedCount := len(client.cachedIPs)
-	client.cacheMu.RUnlock()
+	client.instancesMu.RLock()
+	isValid := time.Now().Before(client.instancesExpiry)
+	cachedCount := len(client.cachedInstances)
+	client.instancesMu.RUnlock()
 
 	if !isValid {
 		t.Error("Cache should be valid")
 	}
 	if cachedCount != 2 {
-		t.Errorf("Expected 2 cached IPs, got %d", cachedCount)
+		t.Errorf("Expected 2 cached instances, got %d", cachedCount)
 	}
 }
 
 func TestCloudMapClient_InvalidateCache(t *testing.T) {
 	client := &CloudMapClient{
-		cachedIPs: map[string]bool{
-			"10.0.0.1": true,
+		cachedInstances: []ServerInfo{
+			{ID: "srv-1", IP: "10.0.0.1", InternalIP: "10.0.0.1"},
 		},
-		cacheExpiry: time.Now().Add(1 * time.Minute), // Valid
+		instancesExpiry: time.Now().Add(1 * time.Minute), // Valid
 	}
 
 	client.InvalidateCache()
 
-	client.cacheMu.RLock()
-	isExpired := time.Now().After(client.cacheExpiry)
-	client.cacheMu.RUnlock()
+	client.instancesMu.RLock()
+	isExpired := time.Now().After(client.instancesExpiry)
+	client.instancesMu.RUnlock()
 
 	if !isExpired {
 		t.Error("Cache should be invalidated (expired)")

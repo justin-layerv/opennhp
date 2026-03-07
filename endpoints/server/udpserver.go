@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 
@@ -137,6 +139,14 @@ type UdpServer struct {
 	// Cloud Map client for server health discovery.
 	// Used to filter stale AC assignments pointing to terminated servers.
 	cloudMap *CloudMapClient
+
+	// EC2 instance identity (populated from IMDS in cloud mode)
+	instanceID string // EC2 instance ID (e.g., "i-0abc123")
+	instanceAZ string // Availability zone (e.g., "us-east-2a")
+
+	// TTL refresh throttle: tracks last refresh time per AC ID to prevent
+	// excessive DynamoDB writes from frequent AC re-registrations.
+	ttlRefreshTimes sync.Map // acID -> time.Time
 
 	// CloudWatch metrics publisher for NHP operational metrics.
 	metrics *metrics.Publisher
@@ -311,7 +321,7 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	// AC authentication will be done via license validation in HandleACOnline
 	// instead of requiring pre-registered public keys from etcd.
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md Section 6.2 for details.
-	cloudMode := s.storageConfig != nil && s.storageConfig.Backend == "dynamodb"
+	cloudMode := s.storageConfig != nil && s.storageConfig.Backend == StorageBackendDynamoDB
 	if cloudMode {
 		log.Info("Cloud mode (storage_backend=dynamodb): AC peer pre-validation disabled, will validate via DynamoDB")
 	}
@@ -332,6 +342,12 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		s.localIp = localAddr.String()
 	}
 	s.localMac = utils.GetMacAddress(s.localIp)
+
+	// In cloud mode, fetch instance identity from IMDS and register public key with Cloud Map
+	if cloudMode && s.cloudMap != nil {
+		s.registerWithCloudMap()
+	}
+
 	// load asp resources and plugins
 	s.pluginHandlerMap = make(map[string]plugins.PluginHandler)
 	if s.etcdConn != nil {
@@ -424,10 +440,8 @@ func (s *UdpServer) Stop() {
 	if s.webrtcServer != nil {
 		s.webrtcServer.Stop()
 	}
-	// Close storage backend
-	if s.storage != nil {
-		_ = s.storage.Close()
-	}
+	// Best-effort cleanup: remove this server from AC assignments
+	s.cleanupOwnedAssignments()
 	// Stop forwarder cleanup routine
 	if s.forwarder != nil {
 		s.forwarder.Stop()
@@ -441,6 +455,11 @@ func (s *UdpServer) Stop() {
 	s.device.Stop()
 	s.StopConfigWatch()
 	s.wg.Wait()
+	// Close storage backend AFTER wg.Wait() so in-flight goroutines
+	// (e.g., refreshAssignmentTTL) finish their storage operations first.
+	if s.storage != nil {
+		_ = s.storage.Close()
+	}
 	close(s.sendMsgCh)
 	s.ClosePlugins()
 
@@ -448,6 +467,168 @@ func (s *UdpServer) Stop() {
 	log.Info("=== NHP-Server stopped ===")
 	log.Info("==========================")
 	s.log.Close()
+}
+
+// cleanupOwnedAssignments is called during shutdown to best-effort remove this
+// server from AC assignments it's part of. This helps reduce stale forwarding
+// attempts while the 30-minute TTL and Cloud Map health checks provide the
+// primary staleness protection.
+func (s *UdpServer) cleanupOwnedAssignments() {
+	if s.storage == nil {
+		return
+	}
+
+	selfID := s.getServerID()
+	if selfID == "" {
+		return
+	}
+
+	// Collect AC IDs from current connections
+	s.acConnectionMapMutex.Lock()
+	acIDs := make([]string, 0, len(s.acConnectionMap))
+	for acID := range s.acConnectionMap {
+		acIDs = append(acIDs, acID)
+	}
+	s.acConnectionMapMutex.Unlock()
+
+	if len(acIDs) == 0 {
+		return
+	}
+
+	log.Info("Shutdown: cleaning up %d AC assignments", len(acIDs))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for _, acID := range acIDs {
+		assignment, err := s.storage.GetACAssignment(ctx, acID)
+		if err != nil {
+			continue
+		}
+
+		// Remove self from assigned servers
+		updated := make([]ServerInfo, 0, len(assignment.AssignedServers))
+		for _, srv := range assignment.AssignedServers {
+			if srv.ID != selfID {
+				updated = append(updated, srv)
+			}
+		}
+
+		if len(updated) == len(assignment.AssignedServers) {
+			continue // This server wasn't in the assignment
+		}
+
+		// Clone to avoid mutating cached pointer
+		newAssignment := assignment.Clone()
+		newAssignment.AssignedServers = updated
+		newAssignment.Version = assignment.Version + 1
+
+		if saveErr := s.storage.SaveACAssignment(ctx, newAssignment); saveErr != nil {
+			if IsVersionConflictError(saveErr) {
+				log.Debug("Shutdown: version conflict for AC %s (concurrent update), skipping", acID)
+				continue
+			}
+			log.Debug("Shutdown: failed to update assignment for AC %s: %v", acID, saveErr)
+		} else {
+			log.Debug("Shutdown: removed self from AC %s assignment (%d servers remaining)", acID, len(updated))
+		}
+	}
+
+	// Clear TTL refresh throttle map to release memory
+	s.ttlRefreshTimes.Range(func(key, _ any) bool {
+		s.ttlRefreshTimes.Delete(key)
+		return true
+	})
+}
+
+// registerWithCloudMap fetches EC2 instance identity from IMDS and registers
+// this server's public key with Cloud Map. This enables DiscoverServerInstances
+// to return full ServerInfo including the public key for NHP_ARD.
+func (s *UdpServer) registerWithCloudMap() {
+	imdsClient := &http.Client{Timeout: 2 * time.Second}
+
+	// Fetch instance ID (IMDSv2: token obtained per request)
+	instanceID, err := imdsV2Get(imdsClient, "http://169.254.169.254/latest/meta-data/instance-id")
+	if err != nil {
+		log.Error("Failed to get instance ID from IMDS: %v (Cloud Map registration skipped, auto-assignment will use hostname fallback)", err)
+		return
+	}
+	s.instanceID = instanceID
+
+	// Fetch AZ
+	az, err := imdsV2Get(imdsClient, "http://169.254.169.254/latest/meta-data/placement/availability-zone")
+	if err != nil {
+		log.Warning("Failed to get AZ from IMDS: %v", err)
+		az = "unknown"
+	}
+	s.instanceAZ = az
+
+	// Register with Cloud Map including PUBLIC_KEY
+	// IMPORTANT: RegisterInstance REPLACES all attributes. Must re-include IP, AZ, port.
+	attrs := map[string]string{
+		CloudMapAttrIPv4: s.localIp,
+		CloudMapAttrAZ:   az,
+		CloudMapAttrPort: strconv.Itoa(s.config.ListenPort),
+		CloudMapAttrKey:  s.device.PublicKeyBase64(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := s.cloudMap.RegisterInstanceAttributes(ctx, instanceID, attrs); err != nil {
+		log.Error("Failed to register public key with Cloud Map: %v (auto-assignment may not include this server's key)", err)
+		return
+	}
+
+	log.Info("Registered with Cloud Map: instance=%s, az=%s, pubkey=%s...",
+		instanceID, az, s.device.PublicKeyBase64()[:12])
+}
+
+// imdsV2Get fetches a metadata value from the EC2 Instance Metadata Service using IMDSv2.
+// It obtains a session token via PUT, then uses it to GET the specified metadata URL.
+// Both URLs must be hardcoded IMDS link-local addresses (169.254.169.254).
+func imdsV2Get(client *http.Client, metadataURL string) (string, error) {
+	// Step 1: Obtain IMDSv2 session token
+	tokenReq, err := http.NewRequest(http.MethodPut, "http://169.254.169.254/latest/api/token", nil)
+	if err != nil {
+		return "", fmt.Errorf("create token request: %w", err)
+	}
+	tokenReq.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", "21600")
+
+	tokenResp, err := client.Do(tokenReq) //nolint:gosec // hardcoded IMDS link-local address
+	if err != nil {
+		return "", fmt.Errorf("IMDS token request failed: %w", err)
+	}
+	defer tokenResp.Body.Close()
+	if tokenResp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("IMDS token request returned status %d", tokenResp.StatusCode)
+	}
+	tokenBody, err := io.ReadAll(tokenResp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read IMDS token: %w", err)
+	}
+	token := string(tokenBody)
+
+	// Step 2: Fetch metadata using the token
+	metaReq, err := http.NewRequest(http.MethodGet, metadataURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("create metadata request: %w", err)
+	}
+	metaReq.Header.Set("X-aws-ec2-metadata-token", token)
+
+	metaResp, err := client.Do(metaReq) //nolint:gosec // hardcoded IMDS link-local address
+	if err != nil {
+		return "", fmt.Errorf("IMDS metadata request failed: %w", err)
+	}
+	defer metaResp.Body.Close()
+	if metaResp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("IMDS returned status %d for %s", metaResp.StatusCode, metadataURL)
+	}
+	body, err := io.ReadAll(metaResp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read IMDS metadata: %w", err)
+	}
+	return string(body), nil
 }
 
 // GetListenPort returns the UDP listening port of the server
@@ -1364,7 +1545,7 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 			knkMsg.UserId, addrStr, forwardACId)
 
 		// Look up AC assignment from storage
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
 		defer cancel()
 
 		assignment, lookupErr := s.storage.GetACAssignment(ctx, forwardACId)

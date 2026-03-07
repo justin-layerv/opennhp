@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
+	"strconv"
 	"sync"
 	"time"
 
@@ -12,8 +12,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/servicediscovery"
 	sdtypes "github.com/aws/aws-sdk-go-v2/service/servicediscovery/types"
+
 	"golang.org/x/sync/singleflight"
 
+	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
@@ -39,6 +41,14 @@ const (
 
 	// DefaultCloudMapOperationTimeout is the default timeout for Cloud Map API calls.
 	DefaultCloudMapOperationTimeout = 5 * time.Second
+
+	// Cloud Map instance attribute keys — shared between registerWithCloudMap (writer)
+	// and refreshInstancesCache (reader).
+	CloudMapAttrIPv4 = "AWS_INSTANCE_IPV4"
+	CloudMapAttrIP   = "ip" // fallback IP attribute
+	CloudMapAttrAZ   = "AVAILABILITY_ZONE"
+	CloudMapAttrPort = "NHP_PORT"
+	CloudMapAttrKey  = "PUBLIC_KEY"
 )
 
 // HealthChecker is the interface for checking server health.
@@ -49,6 +59,11 @@ type HealthChecker interface {
 
 	// InvalidateCache forces the next GetHealthyServerIPs call to refresh.
 	InvalidateCache()
+
+	// IsNil returns true if the underlying implementation is nil.
+	// This avoids the Go typed-nil interface pitfall where a nil concrete
+	// pointer assigned to the interface makes the interface non-nil.
+	IsNil() bool
 }
 
 // CloudMapConfig configures the Cloud Map client.
@@ -65,6 +80,10 @@ type CloudMapConfig struct {
 	// Enabled controls whether Cloud Map health filtering is active.
 	// When false, all assigned servers are considered healthy.
 	Enabled bool `toml:"Enabled"`
+
+	// ServiceID is the Cloud Map service ID (srv-xxx) for RegisterInstance calls.
+	// Required for server-side auto-assignment to register public keys.
+	ServiceID string `toml:"ServiceID"`
 
 	// CacheTTL is how long to cache Cloud Map discovery results.
 	// Default: 30 seconds. Set to 0 to use default.
@@ -100,13 +119,15 @@ type CloudMapClient struct {
 	client           *servicediscovery.Client
 	namespaceName    string
 	serviceName      string
+	serviceID        string // srv-xxx for RegisterInstance
 	cacheTTL         time.Duration
 	operationTimeout time.Duration
 
-	// Cache
-	cacheMu     sync.RWMutex
-	cachedIPs   map[string]bool // Set of healthy server IPs
-	cacheExpiry time.Time
+	// Server instances cache (full ServerInfo with attributes).
+	// GetHealthyServerIPs derives from this cache, avoiding duplicate API calls.
+	instancesMu     sync.RWMutex
+	cachedInstances []ServerInfo
+	instancesExpiry time.Time
 
 	// Singleflight to deduplicate concurrent refresh requests
 	sfGroup singleflight.Group
@@ -142,9 +163,9 @@ func NewCloudMapClient(ctx context.Context, cfg CloudMapConfig) (*CloudMapClient
 		client:           client,
 		namespaceName:    cfg.NamespaceName,
 		serviceName:      cfg.ServiceName,
+		serviceID:        cfg.ServiceID,
 		cacheTTL:         cfg.GetCacheTTL(),
 		operationTimeout: cfg.GetOperationTimeout(),
-		cachedIPs:        make(map[string]bool),
 	}
 
 	log.Info("Cloud Map client initialized: namespace=%s, service=%s, cacheTTL=%v, timeout=%v",
@@ -154,90 +175,23 @@ func NewCloudMapClient(ctx context.Context, cfg CloudMapConfig) (*CloudMapClient
 }
 
 // GetHealthyServerIPs returns a set of IP addresses for currently healthy servers.
-// Results are cached to reduce API calls. Uses singleflight to deduplicate
-// concurrent refresh requests.
+// Derived from DiscoverServerInstances to avoid duplicate Cloud Map API calls.
 // Returns nil error and empty map if cache is fresh but no healthy servers found.
 func (c *CloudMapClient) GetHealthyServerIPs(ctx context.Context) (map[string]bool, error) {
-	// Check cache first (read lock)
-	c.cacheMu.RLock()
-	if time.Now().Before(c.cacheExpiry) && c.cachedIPs != nil {
-		// Cache hit - return copy to prevent caller modification
-		result := make(map[string]bool, len(c.cachedIPs))
-		for k, v := range c.cachedIPs {
-			result[k] = v
-		}
-		c.cacheMu.RUnlock()
-		log.Debug("Cloud Map cache hit: %d healthy servers", len(result))
-		return result, nil
-	}
-	c.cacheMu.RUnlock()
-
-	// Cache miss - use singleflight to deduplicate concurrent refresh requests
-	result, err, _ := c.sfGroup.Do("refresh", func() (any, error) {
-		return c.refreshCache()
-	})
-
+	instances, err := c.DiscoverServerInstances(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	// Return a copy of the result
-	ips, ok := result.(map[string]bool)
-	if !ok {
-		return nil, fmt.Errorf("unexpected result type %T from singleflight refresh", result)
-	}
-	ipsCopy := make(map[string]bool, len(ips))
-	for k, v := range ips {
-		ipsCopy[k] = v
-	}
-	return ipsCopy, nil
-}
-
-// refreshCache fetches fresh data from Cloud Map and updates the cache.
-// This is called via singleflight to prevent thundering herd.
-func (c *CloudMapClient) refreshCache() (map[string]bool, error) {
-	// Double-check cache under write lock (another goroutine in singleflight may have updated)
-	c.cacheMu.Lock()
-	defer c.cacheMu.Unlock()
-
-	if time.Now().Before(c.cacheExpiry) && c.cachedIPs != nil {
-		log.Debug("Cloud Map cache hit (after singleflight): %d healthy servers", len(c.cachedIPs))
-		return c.cachedIPs, nil
-	}
-
-	// Fetch from Cloud Map with fresh context (separate timeout from parent)
-	fetchCtx, cancel := context.WithTimeout(context.Background(), c.operationTimeout)
-	defer cancel()
-
-	result, err := c.client.DiscoverInstances(fetchCtx, &servicediscovery.DiscoverInstancesInput{
-		NamespaceName: aws.String(c.namespaceName),
-		ServiceName:   aws.String(c.serviceName),
-		HealthStatus:  sdtypes.HealthStatusFilterHealthy,
-	})
-	if err != nil {
-		log.Warning("Cloud Map DiscoverInstances failed: %v", err)
-		return nil, fmt.Errorf("cloud map discovery failed: %w", err)
-	}
-
-	// Build IP set from discovered instances
-	ips := make(map[string]bool)
-	for _, instance := range result.Instances {
-		// Cloud Map ECS/EC2 integrations typically use AWS_INSTANCE_IPV4
-		if ip, ok := instance.Attributes["AWS_INSTANCE_IPV4"]; ok && ip != "" {
-			ips[ip] = true
-			log.Debug("Cloud Map discovered healthy server: %s", ip)
+	ips := make(map[string]bool, len(instances))
+	for _, inst := range instances {
+		if inst.IP != "" {
+			ips[inst.IP] = true
 		}
-		// Also check the standard IP attribute
-		if ip, ok := instance.Attributes["ip"]; ok && ip != "" {
-			ips[ip] = true
+		if inst.InternalIP != "" && inst.InternalIP != inst.IP {
+			ips[inst.InternalIP] = true
 		}
 	}
-
-	// Update cache
-	c.cachedIPs = ips
-	c.cacheExpiry = time.Now().Add(c.cacheTTL)
-
-	log.Debug("Cloud Map cache refreshed: %d healthy servers", len(ips))
 	return ips, nil
 }
 
@@ -251,13 +205,129 @@ func (c *CloudMapClient) IsServerHealthy(ctx context.Context, serverIP string) (
 	return healthyIPs[serverIP], nil
 }
 
-// InvalidateCache forces the next GetHealthyServerIPs call to refresh from Cloud Map.
+// InvalidateCache forces the next call to refresh from Cloud Map.
 // Useful for testing or when an external event indicates the cache is stale.
+// IsNil returns true if the receiver is nil.
+func (c *CloudMapClient) IsNil() bool {
+	return c == nil
+}
+
 func (c *CloudMapClient) InvalidateCache() {
-	c.cacheMu.Lock()
-	defer c.cacheMu.Unlock()
-	c.cacheExpiry = time.Time{} // Zero time is always before Now()
+	c.instancesMu.Lock()
+	c.instancesExpiry = time.Time{} // Zero time is always before Now()
+	c.instancesMu.Unlock()
 	log.Debug("Cloud Map cache invalidated")
+}
+
+// DiscoverServerInstances returns full ServerInfo for all healthy servers.
+// Results are cached with the same TTL as GetHealthyServerIPs.
+func (c *CloudMapClient) DiscoverServerInstances(ctx context.Context) ([]ServerInfo, error) {
+	// Check instances cache first
+	c.instancesMu.RLock()
+	if time.Now().Before(c.instancesExpiry) && c.cachedInstances != nil {
+		result := make([]ServerInfo, len(c.cachedInstances))
+		copy(result, c.cachedInstances)
+		c.instancesMu.RUnlock()
+		return result, nil
+	}
+	c.instancesMu.RUnlock()
+
+	// Cache miss - refresh via singleflight
+	result, err, _ := c.sfGroup.Do("refresh-instances", func() (any, error) {
+		return c.refreshInstancesCache()
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	instances, ok := result.([]ServerInfo)
+	if !ok {
+		return nil, fmt.Errorf("unexpected result type %T from singleflight refresh-instances", result)
+	}
+	out := make([]ServerInfo, len(instances))
+	copy(out, instances)
+	return out, nil
+}
+
+// refreshInstancesCache fetches full server instance details from Cloud Map.
+func (c *CloudMapClient) refreshInstancesCache() ([]ServerInfo, error) {
+	c.instancesMu.Lock()
+	defer c.instancesMu.Unlock()
+
+	if time.Now().Before(c.instancesExpiry) && c.cachedInstances != nil {
+		return c.cachedInstances, nil
+	}
+
+	fetchCtx, cancel := context.WithTimeout(context.Background(), c.operationTimeout)
+	defer cancel()
+
+	result, err := c.client.DiscoverInstances(fetchCtx, &servicediscovery.DiscoverInstancesInput{
+		NamespaceName: aws.String(c.namespaceName),
+		ServiceName:   aws.String(c.serviceName),
+		HealthStatus:  sdtypes.HealthStatusFilterHealthy,
+	})
+	if err != nil {
+		log.Warning("Cloud Map DiscoverInstances (full) failed: %v", err)
+		return nil, fmt.Errorf("cloud map discovery failed: %w", err)
+	}
+
+	var servers []ServerInfo
+	for _, inst := range result.Instances {
+		ip := inst.Attributes[CloudMapAttrIPv4]
+		if ip == "" {
+			ip = inst.Attributes[CloudMapAttrIP]
+		}
+		if ip == "" {
+			continue
+		}
+
+		port := common.DefaultNHPPort
+		if portStr, ok := inst.Attributes[CloudMapAttrPort]; ok {
+			if p, err := strconv.Atoi(portStr); err == nil {
+				port = p
+			}
+		}
+
+		srv := ServerInfo{
+			ID:         aws.ToString(inst.InstanceId),
+			IP:         ip,
+			InternalIP: ip, // Cloud Map registers VPC IPs
+			AZ:         inst.Attributes[CloudMapAttrAZ],
+			Port:       port,
+			PubKey:     inst.Attributes[CloudMapAttrKey],
+		}
+		servers = append(servers, srv)
+	}
+
+	c.cachedInstances = servers
+	c.instancesExpiry = time.Now().Add(c.cacheTTL)
+
+	log.Debug("Cloud Map instances cache refreshed: %d servers", len(servers))
+	return servers, nil
+}
+
+// RegisterInstanceAttributes registers or updates this server's attributes in Cloud Map.
+// IMPORTANT: RegisterInstance REPLACES all attributes for the instance ID. Must include
+// all attributes (IP, AZ, port) alongside any new ones (PUBLIC_KEY).
+func (c *CloudMapClient) RegisterInstanceAttributes(ctx context.Context, instanceID string, attrs map[string]string) error {
+	if c.serviceID == "" {
+		return fmt.Errorf("cloud map service ID not configured (required for RegisterInstance)")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, c.operationTimeout)
+	defer cancel()
+
+	_, err := c.client.RegisterInstance(ctx, &servicediscovery.RegisterInstanceInput{
+		ServiceId:  aws.String(c.serviceID),
+		InstanceId: aws.String(instanceID),
+		Attributes: attrs,
+	})
+	if err != nil {
+		return fmt.Errorf("cloud map RegisterInstance failed: %w", err)
+	}
+
+	log.Info("Registered Cloud Map instance %s with %d attributes", instanceID, len(attrs))
+	return nil
 }
 
 // FilterHealthyServers filters a list of server assignments to only include
@@ -269,7 +339,7 @@ func FilterHealthyServers(ctx context.Context, healthChecker HealthChecker, serv
 	// Go interfaces can be non-nil while holding a nil concrete pointer.
 	// Example: var c *CloudMapClient = nil; var h HealthChecker = c
 	// In this case, h != nil (interface has type info) but h.Method() panics.
-	if healthChecker == nil || reflect.ValueOf(healthChecker).IsNil() {
+	if healthChecker == nil || healthChecker.IsNil() {
 		// Health checker not configured - return all servers
 		return servers
 	}

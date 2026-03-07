@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -20,6 +21,37 @@ import (
 	wasmEngine "github.com/OpenNHP/opennhp/nhp/core/wasm/engine"
 	"github.com/OpenNHP/opennhp/nhp/log"
 	utils "github.com/OpenNHP/opennhp/nhp/utils"
+)
+
+const (
+	// MaxServersPerAssignment is the maximum number of servers assigned to a single AC.
+	MaxServersPerAssignment = 3
+
+	// AssignmentTTLSeconds is the TTL for AC assignments (30 minutes).
+	AssignmentTTLSeconds int64 = 1800
+
+	// DefaultStorageTimeout is the default timeout for storage and Cloud Map operations.
+	DefaultStorageTimeout = 5 * time.Second
+
+	// DefaultForwardTimeout is the timeout for the full HTTP knock forward chain
+	// (DynamoDB lookup + Cloud Map health check + up to 3 HTTP round-trips at 2s each).
+	DefaultForwardTimeout = 10 * time.Second
+
+	// TTLRefreshMinInterval is the minimum time between TTL refreshes for the same AC.
+	// Prevents excessive DynamoDB writes from frequent AC re-registrations.
+	TTLRefreshMinInterval = 5 * time.Minute
+)
+
+// Metric counter names for CloudWatch. Using constants prevents typos
+// and enables discoverability across the codebase.
+const (
+	MetricKnockRequest        = "KnockRequest"
+	MetricKnockLatency        = "KnockLatency"
+	MetricAuthSuccess         = "AuthSuccess"
+	MetricAuthFailure         = "AuthFailure"
+	MetricAutoAssignment      = "AutoAssignment"
+	MetricKnockForwardSuccess = "KnockForwardSuccess"
+	MetricKnockForwardFailure = "KnockForwardFailure"
 )
 
 // forwardToTransaction finds the remote transaction and forwards the message to it.
@@ -251,7 +283,7 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	// In cloud mode (storage_backend=dynamodb), AC peers are not pre-registered.
 	// We need to validate the AC via license check and create the peer dynamically.
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md Section 6.2 for details.
-	cloudMode := s.storageConfig != nil && s.storageConfig.Backend == "dynamodb"
+	cloudMode := s.storageConfig != nil && s.storageConfig.Backend == StorageBackendDynamoDB
 	if acPeer == nil && cloudMode {
 		// Validate AC license before accepting connection
 		validationErr := s.validateACLicense(ppd, aolMsg, transactionId, addrStr)
@@ -393,10 +425,9 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 // Returns (false, nil) if this server should handle the AC (or AC not found in storage).
 // Returns (false, error) on storage error.
 //
-// IMPORTANT: Before redirecting, this function filters assignments to only include
-// servers that are currently healthy according to Cloud Map. This prevents ACs from
-// being redirected to terminated servers (stale assignments).
-// See docs/ARCHITECTURE.md "Stale DynamoDB Assignment Resilience" for details.
+// When an AC has no assignment in storage, this function auto-assigns the AC to
+// healthy servers discovered via Cloud Map, writes the assignment to storage,
+// and sends NHP_ARD so the AC connects to all assigned servers.
 func (s *UdpServer) handleACServerAssignment(
 	ppd *core.PacketParserData,
 	aolMsg *common.ACOnlineMsg,
@@ -404,42 +435,40 @@ func (s *UdpServer) handleACServerAssignment(
 	addrStr string,
 ) (redirected bool, err error) {
 	acId := aolMsg.ACId
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
 	defer cancel()
 
 	// Look up AC assignment from storage
 	assignment, err := s.storage.GetACAssignment(ctx, acId)
 	if err != nil {
 		if IsNotFoundError(err) {
-			// AC not found in storage - accept connection directly (no assignment exists yet)
-			log.Info("server-ac(%s#%d@%s)[HandleACOnline] AC not found in storage, accepting directly", acId, transactionId, addrStr)
-			return false, nil
+			// AC not found in storage — perform auto-assignment
+			log.Info("server-ac(%s#%d@%s)[HandleACOnline] AC not in storage, auto-assigning", acId, transactionId, addrStr)
+			return s.autoAssignAC(ppd, aolMsg, transactionId, addrStr)
 		}
 		log.Error("server-ac(%s#%d@%s)[HandleACOnline] storage error looking up AC assignment: %v", acId, transactionId, addrStr, err)
 		return false, err
 	}
 
+	// Check TTL expiry (DynamoDB TTL deletion is async)
+	if assignment.TTL != nil && *assignment.TTL < time.Now().Unix() {
+		log.Info("server-ac(%s#%d@%s)[HandleACOnline] assignment expired (TTL=%d), re-assigning", acId, transactionId, addrStr, *assignment.TTL)
+		return s.autoAssignAC(ppd, aolMsg, transactionId, addrStr)
+	}
+
 	// Filter assignment to only healthy servers (via Cloud Map health discovery).
-	// This prevents redirecting ACs to terminated servers (stale assignments).
-	// If Cloud Map is unavailable, all servers are considered healthy (fail-open).
-	// Note: Use a separate context for Cloud Map to avoid timeout cascading from DynamoDB.
-	cloudMapCtx, cloudMapCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	cloudMapCtx, cloudMapCancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
 	defer cloudMapCancel()
 	healthyServers := FilterHealthyServers(cloudMapCtx, s.cloudMap, assignment.AssignedServers)
 	if len(healthyServers) == 0 {
-		// All assigned servers are unhealthy - accept AC directly rather than
-		// redirecting to dead servers. This breaks the failure loop.
-		log.Warning("server-ac(%s#%d@%s)[HandleACOnline] all %d assigned servers unhealthy, accepting directly",
+		// All assigned servers are unhealthy — re-assign with fresh servers
+		log.Warning("server-ac(%s#%d@%s)[HandleACOnline] all %d assigned servers unhealthy, re-assigning",
 			acId, transactionId, addrStr, len(assignment.AssignedServers))
-		return false, nil
-	}
-	if len(healthyServers) < len(assignment.AssignedServers) {
-		log.Info("server-ac(%s#%d@%s)[HandleACOnline] filtered to %d/%d healthy servers",
-			acId, transactionId, addrStr, len(healthyServers), len(assignment.AssignedServers))
+		return s.autoAssignAC(ppd, aolMsg, transactionId, addrStr)
 	}
 
-	// Check if this server is assigned to the AC (using filtered healthy servers)
-	serverID := s.config.Hostname // Use hostname as server identifier
+	// Determine this server's identity
+	serverID := s.getServerID()
 	isAssigned := false
 	for _, srv := range healthyServers {
 		if srv.ID == serverID {
@@ -449,17 +478,242 @@ func (s *UdpServer) handleACServerAssignment(
 	}
 
 	if isAssigned {
+		// This server is assigned — refresh TTL and accept directly
+		s.refreshAssignmentTTL(acId)
 		log.Info("server-ac(%s#%d@%s)[HandleACOnline] this server (%s) is assigned to AC", acId, transactionId, addrStr, serverID)
 		return false, nil
 	}
 
-	// Not assigned - send NHP_ARD to redirect AC to healthy assigned servers
-	log.Info("server-ac(%s#%d@%s)[HandleACOnline] redirecting AC to %d healthy assigned servers", acId, transactionId, addrStr, len(healthyServers))
+	// This server is NOT in the assignment but the AC connected here.
+	// Update assignment: add self, keep existing healthy ones (up to 3 total).
+	// This rebuilds redundancy when assigned servers die and AC reconnects to a new server.
+	log.Info("server-ac(%s#%d@%s)[HandleACOnline] this server (%s) not assigned, updating assignment", acId, transactionId, addrStr, serverID)
+	updated := s.updateAssignmentWithSelf(assignment, healthyServers)
+	if updated != nil {
+		if ardErr := s.sendARD(ppd, acId, transactionId, addrStr, updated); ardErr != nil {
+			log.Warning("server-ac(%s#%d@%s)[HandleACOnline] failed to send ARD after assignment update: %v", acId, transactionId, addrStr, ardErr)
+		}
+	} else {
+		// Fallback: just redirect to existing healthy servers
+		if ardErr := s.sendARD(ppd, acId, transactionId, addrStr, healthyServers); ardErr != nil {
+			log.Warning("server-ac(%s#%d@%s)[HandleACOnline] failed to send ARD: %v", acId, transactionId, addrStr, ardErr)
+		}
+	}
 
-	targets := make([]common.RedirectTarget, len(healthyServers))
-	for i, srv := range healthyServers {
+	// Accept the AC locally since we added ourselves to the assignment
+	return false, nil
+}
+
+// autoAssignAC discovers healthy servers, picks up to 3 across AZs, writes the
+// assignment to storage, and sends NHP_ARD so the AC connects to all assigned servers.
+// Returns (false, nil) to let this server also handle the AC directly.
+func (s *UdpServer) autoAssignAC(
+	ppd *core.PacketParserData,
+	aolMsg *common.ACOnlineMsg,
+	transactionId uint64,
+	addrStr string,
+) (bool, error) {
+	acId := aolMsg.ACId
+
+	// Cloud Map required for auto-assignment
+	if s.cloudMap == nil {
+		log.Info("server-ac(%s#%d@%s)[autoAssignAC] no Cloud Map client, accepting directly", acId, transactionId, addrStr)
+		return false, nil
+	}
+
+	cloudMapCtx, cloudMapCancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+	defer cloudMapCancel()
+
+	allServers, err := s.cloudMap.DiscoverServerInstances(cloudMapCtx)
+	if err != nil {
+		log.Warning("server-ac(%s#%d@%s)[autoAssignAC] Cloud Map discovery failed: %v, accepting directly", acId, transactionId, addrStr, err)
+		return false, nil
+	}
+
+	if len(allServers) == 0 {
+		log.Warning("server-ac(%s#%d@%s)[autoAssignAC] no servers in Cloud Map, accepting directly", acId, transactionId, addrStr)
+		return false, nil
+	}
+
+	// Select up to 3 servers with AZ distribution, ensuring this server is included
+	selected := s.selectServersForAssignment(allServers, MaxServersPerAssignment)
+
+	// Build assignment
+	now := time.Now().Unix()
+	ttl := now + AssignmentTTLSeconds
+	assignment := &ACAssignment{
+		ACID:            acId,
+		CustomerID:      "", // populated from license if available
+		AssignedServers: selected,
+		Version:         1,
+		CreatedAt:       now,
+		LastSeen:        now,
+		TTL:             &ttl,
+	}
+
+	// Populate customer ID from license if available
+	if aolMsg.LicenseKey != "" {
+		licCtx, licCancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+		license, licErr := s.storage.GetLicense(licCtx, aolMsg.LicenseKey)
+		licCancel()
+		if licErr == nil {
+			assignment.CustomerID = license.CustomerID
+		}
+	}
+
+	// Write assignment to storage
+	saveCtx, saveCancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+	defer saveCancel()
+	if saveErr := s.storage.SaveACAssignment(saveCtx, assignment); saveErr != nil {
+		log.Warning("server-ac(%s#%d@%s)[autoAssignAC] failed to save assignment: %v, accepting directly", acId, transactionId, addrStr, saveErr)
+		return false, nil
+	}
+
+	log.Info("server-ac(%s#%d@%s)[autoAssignAC] assigned to %d servers (AZs: %v)",
+		acId, transactionId, addrStr, len(selected), serverAZs(selected))
+	s.metrics.IncrCounter(MetricAutoAssignment)
+
+	// Send NHP_ARD with all assigned servers (including this one)
+	// so the AC connects directly to each server's private IP
+	if ardErr := s.sendARD(ppd, acId, transactionId, addrStr, selected); ardErr != nil {
+		log.Warning("server-ac(%s#%d@%s)[autoAssignAC] failed to send ARD: %v", acId, transactionId, addrStr, ardErr)
+	}
+
+	// Return false so this server also processes the AC registration locally
+	return false, nil
+}
+
+// selectServersForAssignment picks up to maxCount servers with AZ distribution.
+// Ensures this server is included in the selection.
+func (s *UdpServer) selectServersForAssignment(allServers []ServerInfo, maxCount int) []ServerInfo {
+	selfID := s.getServerID()
+
+	// Group servers by AZ
+	byAZ := make(map[string][]ServerInfo)
+	var selfServer *ServerInfo
+	for i := range allServers {
+		srv := &allServers[i]
+		if srv.ID == selfID {
+			selfServer = srv
+		}
+		byAZ[srv.AZ] = append(byAZ[srv.AZ], *srv)
+	}
+
+	// Collect AZ keys for deterministic round-robin
+	azKeys := make([]string, 0, len(byAZ))
+	for az := range byAZ {
+		azKeys = append(azKeys, az)
+	}
+	sort.Strings(azKeys)
+
+	selected := make([]ServerInfo, 0, maxCount)
+	selectedIDs := make(map[string]bool)
+
+	// Always include this server first
+	if selfServer != nil {
+		selected = append(selected, *selfServer)
+		selectedIDs[selfServer.ID] = true
+	}
+
+	// Round-robin across AZs to distribute
+	azIdx := make(map[string]int)
+	for len(selected) < maxCount {
+		added := false
+		for _, az := range azKeys {
+			if len(selected) >= maxCount {
+				break
+			}
+			servers := byAZ[az]
+			idx := azIdx[az]
+			for idx < len(servers) {
+				srv := servers[idx]
+				idx++
+				azIdx[az] = idx
+				if !selectedIDs[srv.ID] {
+					selected = append(selected, srv)
+					selectedIDs[srv.ID] = true
+					added = true
+					break
+				}
+			}
+		}
+		if !added {
+			break // No more servers available
+		}
+	}
+
+	return selected
+}
+
+// getServerID returns this server's identifier for assignment matching.
+// In cloud mode, uses the EC2 instance ID (populated from IMDS).
+// Falls back to hostname if instance ID is not available.
+func (s *UdpServer) getServerID() string {
+	if s.instanceID != "" {
+		return s.instanceID
+	}
+	return s.config.Hostname
+}
+
+// refreshAssignmentTTL extends the TTL of an AC assignment in the background.
+// Throttled to at most once per TTLRefreshMinInterval per AC to prevent excessive writes.
+// Tracked by s.wg to prevent data races on storage during shutdown.
+func (s *UdpServer) refreshAssignmentTTL(acID string) {
+	// Throttle: skip if we refreshed recently for this AC
+	now := time.Now()
+	if v, loaded := s.ttlRefreshTimes.LoadOrStore(acID, now); loaded {
+		if now.Sub(v.(time.Time)) < TTLRefreshMinInterval {
+			return
+		}
+		// Optimistically update to prevent concurrent goroutines from also passing the check.
+		// On save failure, we delete the entry so the next call retries.
+		s.ttlRefreshTimes.Store(acID, now)
+	}
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+
+		getCtx, getCancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+		existing, err := s.storage.GetACAssignment(getCtx, acID)
+		getCancel()
+		if err != nil {
+			s.ttlRefreshTimes.Delete(acID) // allow retry on next call
+			return
+		}
+
+		// Clone to avoid mutating the cached pointer
+		ttl := time.Now().Unix() + AssignmentTTLSeconds
+		refreshed := existing.Clone()
+		refreshed.LastSeen = time.Now().Unix()
+		refreshed.TTL = &ttl
+
+		saveCtx, saveCancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+		defer saveCancel()
+		if err := s.storage.SaveACAssignment(saveCtx, refreshed); err != nil {
+			if IsVersionConflictError(err) {
+				// Another server refreshed TTL concurrently — safe to ignore
+				log.Debug("TTL refresh version conflict for AC %s (concurrent update)", acID)
+			} else {
+				log.Debug("Failed to refresh TTL for AC %s: %v", acID, err)
+				s.ttlRefreshTimes.Delete(acID) // allow retry on next call
+			}
+		}
+	}()
+}
+
+// sendARD sends NHP_ARD to redirect the AC to the given servers.
+func (s *UdpServer) sendARD(
+	ppd *core.PacketParserData,
+	acId string,
+	transactionId uint64,
+	addrStr string,
+	servers []ServerInfo,
+) error {
+	targets := make([]common.RedirectTarget, len(servers))
+	for i, srv := range servers {
 		targets[i] = common.RedirectTarget{
-			IP:           srv.IP,
+			IP:           srv.InternalIP, // Use VPC private IP for direct connectivity
 			Port:         srv.Port,
 			PubKeyBase64: srv.PubKey,
 			AZ:           srv.AZ,
@@ -473,15 +727,73 @@ func (s *UdpServer) handleACServerAssignment(
 	}
 	ardBytes, marshalErr := json.Marshal(ardMsg)
 	if marshalErr != nil {
-		log.Error("server-ac(%s#%d@%s)[HandleACOnline/ARD] failed to marshal ARD message: %v", acId, transactionId, addrStr, marshalErr)
-		return false, marshalErr
+		log.Error("server-ac(%s#%d@%s)[sendARD] failed to marshal ARD message: %v", acId, transactionId, addrStr, marshalErr)
+		return marshalErr
 	}
 	ardMd := makeMsgData(ppd, core.NHP_ARD, ardBytes)
 
-	if err := forwardToTransaction(ppd.ConnData, transactionId, ardMd, "server-ac", "HandleACOnline/ARD", acId, addrStr); err != nil {
-		return false, err
+	return forwardToTransaction(ppd.ConnData, transactionId, ardMd, "server-ac", "HandleACOnline/ARD", acId, addrStr)
+}
+
+// updateAssignmentWithSelf adds this server to an existing AC assignment,
+// keeping existing healthy servers up to a total of MaxServersPerAssignment.
+// Returns the updated server list on success, or nil on failure.
+func (s *UdpServer) updateAssignmentWithSelf(assignment *ACAssignment, healthyServers []ServerInfo) []ServerInfo {
+	selfID := s.getServerID()
+
+	// Construct this server's ServerInfo from local state (no Cloud Map call needed —
+	// the server knows its own identity)
+	selfInfo := ServerInfo{
+		ID:         selfID,
+		IP:         s.localIp,
+		InternalIP: s.localIp,
+		AZ:         s.instanceAZ,
+		Port:       s.config.ListenPort,
+		PubKey:     s.device.PublicKeyBase64(),
 	}
-	return true, nil
+
+	// Build updated list: self + existing healthy (up to max total)
+	updated := []ServerInfo{selfInfo}
+	for _, srv := range healthyServers {
+		if len(updated) >= MaxServersPerAssignment {
+			break
+		}
+		if srv.ID != selfID {
+			updated = append(updated, srv)
+		}
+	}
+
+	// Clone to avoid mutating the cached pointer.
+	// If Save fails, the cache retains the original unmodified assignment.
+	ttl := time.Now().Unix() + AssignmentTTLSeconds
+	newAssignment := assignment.Clone()
+	newAssignment.AssignedServers = updated
+	newAssignment.Version = assignment.Version + 1
+	newAssignment.LastSeen = time.Now().Unix()
+	newAssignment.TTL = &ttl
+
+	saveCtx, saveCancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+	defer saveCancel()
+	if err := s.storage.SaveACAssignment(saveCtx, newAssignment); err != nil {
+		if IsVersionConflictError(err) {
+			log.Info("updateAssignmentWithSelf: version conflict for %s (concurrent update), skipping", assignment.ACID)
+		} else {
+			log.Warning("updateAssignmentWithSelf: failed to save updated assignment for %s: %v", assignment.ACID, err)
+		}
+		return nil
+	}
+
+	log.Info("updateAssignmentWithSelf: AC %s updated to %d servers (AZs: %v)", assignment.ACID, len(updated), serverAZs(updated))
+	return updated
+}
+
+// serverAZs returns a list of AZs from a list of servers (for logging).
+func serverAZs(servers []ServerInfo) []string {
+	azs := make([]string, len(servers))
+	for i, s := range servers {
+		azs[i] = s.AZ
+	}
+	return azs
 }
 
 // dummyBcryptHash is used for constant-time license validation to prevent timing attacks.
@@ -527,7 +839,7 @@ func (s *UdpServer) validateACLicense(
 	keyPrefix := licenseKeyPrefix(aolMsg.LicenseKey)
 
 	// Look up license from storage using license key SHA256 as the partition key
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
 	defer cancel()
 
 	license, err := s.storage.GetLicense(ctx, aolMsg.LicenseKey)

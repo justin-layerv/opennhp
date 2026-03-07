@@ -319,7 +319,7 @@ resource "aws_dynamodb_table" "resources" {
 
 resource "aws_iam_policy" "dynamodb_read" {
   name        = "${var.name_prefix}-dynamodb-read"
-  description = "Read access to NHP DynamoDB tables for servers"
+  description = "Read access to NHP DynamoDB tables, plus write access to ac-assignments for server auto-assignment"
 
   # Use concat to conditionally include KMS statement (empty resource arrays are invalid)
   policy = jsonencode({
@@ -343,6 +343,16 @@ resource "aws_iam_policy" "dynamodb_read" {
           aws_dynamodb_table.server_ac_index.arn,
           aws_dynamodb_table.resources.arn,
           "${aws_dynamodb_table.resources.arn}/index/*"
+        ]
+      },
+      {
+        Sid    = "DynamoDBWriteACAssignments"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:PutItem"
+        ]
+        Resource = [
+          aws_dynamodb_table.ac_assignments.arn
         ]
       }
       ], var.kms_key_arn != null ? [{

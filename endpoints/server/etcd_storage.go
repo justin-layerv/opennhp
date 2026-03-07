@@ -150,6 +150,28 @@ func (e *EtcdStorage) GetACAssignment(ctx context.Context, acID string) (*ACAssi
 	return &assignment, nil
 }
 
+// SaveACAssignment stores or updates an AC assignment.
+func (e *EtcdStorage) SaveACAssignment(ctx context.Context, assignment *ACAssignment) error {
+	key := acAssignmentKey(assignment.ACID)
+
+	data, err := json.Marshal(assignment)
+	if err != nil {
+		log.Error("Failed to marshal AC assignment %s: %v", assignment.ACID, err)
+		return &StorageError{Code: ErrCodeValidationFailed, Message: "failed to marshal assignment", Err: err}
+	}
+
+	tempConn := *e.conn
+	tempConn.Key = key
+
+	if err := tempConn.SetValue(string(data)); err != nil {
+		log.Error("etcd SetKeyValue failed for AC %s: %v", assignment.ACID, err)
+		return NewServiceUnavailableError("etcd unavailable", err)
+	}
+
+	log.Info("Saved AC assignment %s with %d servers", assignment.ACID, len(assignment.AssignedServers))
+	return nil
+}
+
 // GetACsByServer retrieves all ACs assigned to a specific server.
 // This scans all AC assignments and filters by server ID.
 // Note: For large deployments, consider adding a secondary index.

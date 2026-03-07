@@ -1,6 +1,9 @@
 package common
 
-import "net/url"
+import (
+	"context"
+	"net/url"
+)
 
 // an object contains represent knocking user information
 type AgentUser struct {
@@ -99,19 +102,21 @@ type NhpListRequest struct {
 }
 
 type HttpKnockRequest struct {
-	UserId         string   `json:"usrId"`
-	DeviceId       string   `json:"devId"`
-	OrganizationId string   `json:"orgId,omitempty"`
-	AuthServiceId  string   `json:"aspId"`
-	ResourceId     string   `json:"resId"`
-	Token          string   `json:"token"`
-	Code           string   `json:"code"`
-	DstUrl         string   `json:"dstUrl"`
-	Command        string   `json:"command"`
-	Url            *url.URL `json:"-"`
-	UserAgent      string   `json:"-"`
-	SrcIp          string   `json:"-"`
-	SrcPort        int      `json:"-"`
+	UserId         string          `json:"usrId"`
+	DeviceId       string          `json:"devId"`
+	OrganizationId string          `json:"orgId,omitempty"`
+	AuthServiceId  string          `json:"aspId"`
+	ResourceId     string          `json:"resId"`
+	Token          string          `json:"token"`
+	Code           string          `json:"code"`
+	DstUrl         string          `json:"dstUrl"`
+	Command        string          `json:"command"`
+	Url            *url.URL        `json:"-"`
+	UserAgent      string          `json:"-"`
+	SrcIp          string          `json:"srcIp,omitempty"`
+	SrcPort        int             `json:"srcPort,omitempty"`
+	Forwarded      bool            `json:"forwarded,omitempty"` // Set by internal forwarding to prevent loops
+	Ctx            context.Context `json:"-"`                   // Request context for cancellation propagation
 }
 
 type HttpRefreshRequest struct {

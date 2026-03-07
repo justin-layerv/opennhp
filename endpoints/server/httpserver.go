@@ -38,6 +38,7 @@ type HttpServer struct {
 	ginEngine     *gin.Engine
 	listenAddr    *net.TCPAddr
 	healthManager *health.Manager
+	httpForwarder *HttpKnockForwarder
 
 	wg      sync.WaitGroup
 	running atomic.Bool
@@ -118,6 +119,12 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 		return err
 	}
 
+	// Initialize HTTP knock forwarder for server-to-server forwarding
+	if us.storage != nil && us.cloudMap != nil {
+		hs.httpForwarder = NewHttpKnockForwarder(us.storage, us.cloudMap, us.localIp, listenPort)
+		log.Info("HTTP knock forwarder initialized (localIP=%s, port=%d)", us.localIp, listenPort)
+	}
+
 	hs.initRouter()
 
 	hs.httpServer = &http.Server{
@@ -176,6 +183,11 @@ func (hs *HttpServer) Stop() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5500*time.Millisecond)
 	defer cancel() // Always cancel context to release resources
 	_ = hs.httpServer.Shutdown(ctx)
+
+	// Stop accepting new forwards and wait for in-flight ones to complete
+	if hs.httpForwarder != nil {
+		hs.httpForwarder.Stop()
+	}
 
 	hs.wg.Wait()
 	log.Info("==================================================")
@@ -381,6 +393,10 @@ func (hs *HttpServer) initRouter() {
 		}
 		hs.authWithAspPlugin(ctx, req)
 	})
+
+	// Internal knock forwarding endpoint (VPC-only, RFC 1918 source IP check)
+	nhpInternal := g.Group("/nhp/internal")
+	nhpInternal.POST("/knock", hs.handleInternalKnock)
 
 	hs.initStorageRouter()
 
@@ -717,6 +733,26 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 		}
 		s.acConnectionMapMutex.Unlock()
 		if !found || len(connsCopy) == 0 {
+			// No local AC connection — try HTTP forwarding to an assigned server
+			if hs.httpForwarder != nil && !req.Forwarded {
+				parentCtx := req.Ctx
+				if parentCtx == nil {
+					parentCtx = context.Background()
+				}
+				fwdCtx, fwdCancel := context.WithTimeout(parentCtx, DefaultForwardTimeout)
+				fwdAck, fwdErr := hs.httpForwarder.ForwardHttpKnock(fwdCtx, acId, req, res)
+				fwdCancel() // cancel immediately; defer would accumulate across loop iterations
+				if fwdErr == nil && fwdAck != nil && fwdAck.ErrCode == common.ErrSuccess.ErrorCode() {
+					log.Info("httpserver-agent(%s#%s@%s)-ac(%s)[HandleHttpKnockRequest] knock forwarded successfully", knkMsg.UserId, knkMsg.DeviceId, srcIp, acId)
+					s.metrics.IncrCounter(MetricKnockForwardSuccess)
+					return fwdAck, nil
+				}
+				if fwdErr != nil {
+					log.Warning("httpserver-agent(%s#%s@%s)-ac(%s)[HandleHttpKnockRequest] forward failed: %v", knkMsg.UserId, knkMsg.DeviceId, srcIp, acId, fwdErr)
+					s.metrics.IncrCounter(MetricKnockForwardFailure)
+				}
+			}
+
 			log.Warning("httpserver-agent(%s#%s@%s)-ac(%s)[HandleHttpKnockRequest] no ac connection is available", knkMsg.UserId, knkMsg.DeviceId, srcIp, acId)
 			artMsg := &common.ACOpsResultMsg{}
 			err = common.ErrACConnectionNotFound
@@ -797,4 +833,39 @@ func (hs *HttpServer) NewHttpServerHelper() *plugins.HttpServerPluginHelper {
 // It delegates the task to the underlying UDP server's FindPluginHandler method.
 func (hs *HttpServer) FindPluginHandler(aspId string) plugins.PluginHandler {
 	return hs.udpServer.FindPluginHandler(aspId)
+}
+
+// handleInternalKnock processes forwarded knock requests from other servers.
+// Security: Only accepts requests from VPC private IPs (port 8888 is open to 0.0.0.0/0 via NLB).
+func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
+	// Source IP check: reject non-RFC-1918 IPs
+	srcIP := ctx.ClientIP()
+	if !isPrivateIP(srcIP) {
+		log.Warning("Internal knock rejected: non-private source IP %s", srcIP)
+		ctx.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+
+	var fwdReq HttpKnockForwardRequest
+	if err := ctx.ShouldBindJSON(&fwdReq); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	if fwdReq.Request == nil || fwdReq.Resource == nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "missing request or resource"})
+		return
+	}
+
+	// Mark as forwarded to prevent recursive forwarding
+	fwdReq.Request.Forwarded = true
+	fwdReq.Request.Ctx = ctx.Request.Context()
+
+	ackMsg, err := hs.handleHttpOpenResource(fwdReq.Request, fwdReq.Resource)
+	resp := HttpKnockForwardResponse{AckMsg: ackMsg}
+	if err != nil {
+		resp.Error = err.Error()
+	}
+
+	ctx.JSON(http.StatusOK, resp)
 }

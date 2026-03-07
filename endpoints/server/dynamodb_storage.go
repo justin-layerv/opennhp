@@ -158,6 +158,49 @@ func (d *DynamoDBStorage) GetACAssignment(ctx context.Context, acID string) (*AC
 	return &assignment, nil
 }
 
+// SaveACAssignment stores or updates an AC assignment.
+func (d *DynamoDBStorage) SaveACAssignment(ctx context.Context, assignment *ACAssignment) error {
+	ctx, cancel := context.WithTimeout(ctx, DynamoDBOperationTimeout)
+	defer cancel()
+
+	item, err := attributevalue.MarshalMap(assignment)
+	if err != nil {
+		log.Error("Failed to marshal AC assignment %s: %v", assignment.ACID, err)
+		return &StorageError{Code: ErrCodeValidationFailed, Message: "failed to marshal assignment", Err: err}
+	}
+
+	input := &dynamodb.PutItemInput{
+		TableName: aws.String(d.config.ACAssignmentsTable),
+		Item:      item,
+	}
+
+	// Use conditional writes to prevent lost updates from concurrent modifications.
+	// Version 1: new assignment — only succeed if no assignment exists yet.
+	// Version >1: update — require the stored version to match the previous value.
+	if assignment.Version == 1 {
+		input.ConditionExpression = aws.String("attribute_not_exists(ac_id)")
+	} else {
+		input.ConditionExpression = aws.String("attribute_not_exists(ac_id) OR version = :expected_version")
+		input.ExpressionAttributeValues = map[string]types.AttributeValue{
+			":expected_version": &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", assignment.Version-1)},
+		}
+	}
+
+	_, err = d.client.PutItem(ctx, input)
+	if err != nil {
+		// Check for conditional check failure (version conflict)
+		var ccf *types.ConditionalCheckFailedException
+		if errors.As(err, &ccf) {
+			return NewVersionConflictError(fmt.Sprintf("version conflict for AC %s (expected version %d)", assignment.ACID, assignment.Version-1))
+		}
+		log.Error("DynamoDB PutItem failed for AC %s: %v", assignment.ACID, err)
+		return NewServiceUnavailableError("DynamoDB unavailable", err)
+	}
+
+	log.Info("Saved AC assignment %s with %d servers", assignment.ACID, len(assignment.AssignedServers))
+	return nil
+}
+
 // GetACsByServer retrieves all ACs assigned to a specific server.
 // NOTE: This is deferred to Phase 3 because assigned_servers is a List type
 // which cannot be indexed directly in DynamoDB. Options for Phase 3:

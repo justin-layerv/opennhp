@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"slices"
 	"sync"
@@ -79,7 +79,7 @@ type ServerHealthTracker struct {
 func NewServerForwarder(deps ForwarderDeps) *ServerForwarder {
 	// Initialize transaction ID with entropy to prevent collisions after restart
 	// and to make IDs unpredictable (security hardening)
-	initialTxID := uint64(time.Now().UnixNano()) ^ uint64(rand.Int63())
+	initialTxID := uint64(time.Now().UnixNano()) ^ uint64(rand.Int64())
 
 	return &ServerForwarder{
 		deps:        deps,

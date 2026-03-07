@@ -45,6 +45,10 @@ type StorageBackend interface {
 	// GetResourceByACID retrieves resources associated with a specific AC.
 	GetResourceByACID(ctx context.Context, acID string) ([]Resource, error)
 
+	// SaveACAssignment stores or updates an AC assignment.
+	// Used by server-side auto-assignment to persist AC-to-server mappings.
+	SaveACAssignment(ctx context.Context, assignment *ACAssignment) error
+
 	// Close releases any resources held by the storage backend.
 	Close() error
 
@@ -68,6 +72,22 @@ type ACAssignment struct {
 	CreatedAt       int64        `json:"created_at" dynamodbav:"created_at"`
 	LastSeen        int64        `json:"last_seen" dynamodbav:"last_seen"`
 	TTL             *int64       `json:"ttl,omitempty" dynamodbav:"ttl,omitempty"` // Unix timestamp for DynamoDB TTL
+}
+
+// Clone returns a copy of the assignment, safe to mutate without
+// affecting cached pointers. The AssignedServers slice and TTL pointer
+// are deep-copied; callers can freely modify the clone.
+func (a *ACAssignment) Clone() *ACAssignment {
+	clone := *a
+	if a.TTL != nil {
+		ttl := *a.TTL
+		clone.TTL = &ttl
+	}
+	if a.AssignedServers != nil {
+		clone.AssignedServers = make([]ServerInfo, len(a.AssignedServers))
+		copy(clone.AssignedServers, a.AssignedServers)
+	}
+	return &clone
 }
 
 // ServerInfo represents an assigned server's connection details.
@@ -135,6 +155,7 @@ const (
 	ErrCodeServiceUnavail   = "SERVICE_UNAVAILABLE"
 	ErrCodeValidationFailed = "VALIDATION_FAILED"
 	ErrCodeRateLimited      = "RATE_LIMITED"
+	ErrCodeVersionConflict  = "VERSION_CONFLICT"
 )
 
 // NewNotFoundError creates a new not-found error.
@@ -147,6 +168,11 @@ func NewServiceUnavailableError(msg string, err error) *StorageError {
 	return &StorageError{Code: ErrCodeServiceUnavail, Message: msg, Err: err}
 }
 
+// NewVersionConflictError creates a new version conflict error.
+func NewVersionConflictError(msg string) *StorageError {
+	return &StorageError{Code: ErrCodeVersionConflict, Message: msg}
+}
+
 // IsNotFoundError returns true if the error is a not-found error.
 func IsNotFoundError(err error) bool {
 	var se *StorageError
@@ -156,9 +182,24 @@ func IsNotFoundError(err error) bool {
 	return false
 }
 
+// IsVersionConflictError returns true if the error is a version conflict error.
+func IsVersionConflictError(err error) bool {
+	var se *StorageError
+	if errors.As(err, &se) {
+		return se.Code == ErrCodeVersionConflict
+	}
+	return false
+}
+
 // ============================================================================
 // Storage Configuration
 // ============================================================================
+
+// Storage backend type constants.
+const (
+	StorageBackendDynamoDB = "dynamodb"
+	StorageBackendEtcd     = "etcd"
+)
 
 // StorageConfig configures the storage backend.
 type StorageConfig struct {
@@ -294,6 +335,15 @@ func (cs *CachedStorage) GetResource(ctx context.Context, customerID, resourceID
 // GetResourceByACID retrieves resources by AC ID (could be cached in future).
 func (cs *CachedStorage) GetResourceByACID(ctx context.Context, acID string) ([]Resource, error) {
 	return cs.backend.GetResourceByACID(ctx, acID)
+}
+
+// SaveACAssignment stores an AC assignment (write-through: backend then cache).
+func (cs *CachedStorage) SaveACAssignment(ctx context.Context, assignment *ACAssignment) error {
+	if err := cs.backend.SaveACAssignment(ctx, assignment); err != nil {
+		return err
+	}
+	cs.cache.Set(assignment.ACID, assignment)
+	return nil
 }
 
 // Close releases resources.

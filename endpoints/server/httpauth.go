@@ -26,6 +26,10 @@ func (hs *HttpServer) authWithAspPlugin(c *gin.Context, req *common.HttpKnockReq
 // If the plugin aborted the context (e.g., NHP silent drop), no error
 // response is written — preserving NHP protocol silence.
 func (hs *HttpServer) runPluginAuth(c *gin.Context, req *common.HttpKnockRequest, handler plugins.PluginHandler) {
+	// Set request context once here so plugins don't each need to set req.Ctx
+	if c.Request != nil {
+		req.Ctx = c.Request.Context()
+	}
 	helper := hs.NewHttpServerHelper()
 	_, err := handler.AuthWithHttp(c, req, helper)
 	if err != nil {
