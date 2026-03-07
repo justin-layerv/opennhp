@@ -372,12 +372,30 @@ if [[ -n "$IMAGE_CI" && "$IMAGE_CI" != "[]" ]]; then
 
     if [[ -n "$MATCHING_RUN" ]]; then
         # Found the exact build that produced our images
-        IMG_CI_CONCLUSION=$(echo "$MATCHING_RUN" | jq -r '.conclusion // "unknown"')
         IMG_CI_ID=$(echo "$MATCHING_RUN" | jq -r '.databaseId // "?"')
+        IMG_CI_CONCLUSION=$(echo "$MATCHING_RUN" | jq -r '.conclusion // "unknown"')
+
         if [[ "$IMG_CI_CONCLUSION" == "success" ]]; then
             pass "CI run for image ${PROMOTION_TAG:0:7}: success (#${IMG_CI_ID})"
         else
-            fail "CI run for image ${PROMOTION_TAG:0:7}: ${IMG_CI_CONCLUSION} (#${IMG_CI_ID}). Images may be from a failed build."
+            # Run failed overall — check if the BUILD jobs specifically succeeded.
+            # A CI run can fail on deploy/test steps while images were built fine.
+            # Job names "Build server" and "Build ac" come from the build matrix in build-and-push.yml.
+            BUILD_STATUS=$(gh run view "$IMG_CI_ID" --json jobs \
+                --jq '[.jobs[] | select(.name | startswith("Build ")) | .conclusion]' 2>/dev/null || echo "[]")
+            BUILD_COUNT=$(echo "$BUILD_STATUS" | jq 'length' 2>/dev/null || echo "0")
+            BUILD_FAILURES=$(echo "$BUILD_STATUS" | jq '[.[] | select(. != "success")] | length' 2>/dev/null || echo "0")
+
+            if [[ "$BUILD_COUNT" -eq 0 ]]; then
+                fail "CI run for image ${PROMOTION_TAG:0:7}: ${IMG_CI_CONCLUSION} (#${IMG_CI_ID}). Could not find Build jobs to verify."
+            elif [[ "$BUILD_FAILURES" -eq 0 ]]; then
+                pass "Build jobs for image ${PROMOTION_TAG:0:7}: success (run #${IMG_CI_ID} overall: ${IMG_CI_CONCLUSION})"
+                msg="CI run #${IMG_CI_ID} failed on non-build steps (${IMG_CI_CONCLUSION}) but images were built successfully"
+                warn "$msg"
+                WARNINGS+=("$msg")
+            else
+                fail "CI run for image ${PROMOTION_TAG:0:7}: ${IMG_CI_CONCLUSION} (#${IMG_CI_ID}). Build jobs did not all succeed."
+            fi
         fi
     else
         # Image build is older than last 10 runs — fall back to latest run check
