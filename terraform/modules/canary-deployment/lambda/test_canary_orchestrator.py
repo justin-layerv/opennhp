@@ -9,7 +9,7 @@ import json
 import os
 import sys
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # Set environment variables before importing the module
 os.environ.update({
@@ -155,7 +155,8 @@ class TestPrepare(CanaryTestCase):
 class TestStartRefresh(CanaryTestCase):
     """Test the start_refresh action handler."""
 
-    def test_start_refresh_success(self):
+    def _setup_asg_mock(self):
+        """Common ASG mock setup for start_refresh tests."""
         self.mock_autoscaling.describe_auto_scaling_groups.return_value = {
             'AutoScalingGroups': [{
                 'AutoScalingGroupName': 'test-asg',
@@ -165,9 +166,15 @@ class TestStartRefresh(CanaryTestCase):
                 }
             }]
         }
+        self.mock_autoscaling.describe_instance_refreshes.return_value = {
+            'InstanceRefreshes': []
+        }
         self.mock_autoscaling.start_instance_refresh.return_value = {
             'InstanceRefreshId': 'refresh-123'
         }
+
+    def test_start_refresh_success(self):
+        self._setup_asg_mock()
 
         result = canary_orchestrator.handle_start_refresh(
             {'image_tag': 'sha-abc123'}, None
@@ -216,6 +223,83 @@ class TestStartRefresh(CanaryTestCase):
                 {'image_tag': 'sha-abc123'}, None
             )
         self.assertIn('no launch template', str(ctx.exception))
+
+    @patch('canary_orchestrator.time.sleep')
+    def test_start_refresh_cancels_existing_inprogress(self, mock_sleep):
+        self._setup_asg_mock()
+        self.mock_autoscaling.describe_instance_refreshes.side_effect = [
+            # Initial check: existing InProgress refresh
+            {'InstanceRefreshes': [{'InstanceRefreshId': 'old-123', 'Status': 'InProgress'}]},
+            # First poll after cancel: now Cancelled
+            {'InstanceRefreshes': [{'InstanceRefreshId': 'old-123', 'Status': 'Cancelled'}]},
+        ]
+
+        result = canary_orchestrator.handle_start_refresh(
+            {'image_tag': 'sha-abc123'}, None
+        )
+        self.assertEqual(result['instance_refresh_id'], 'refresh-123')
+        self.mock_autoscaling.cancel_instance_refresh.assert_called_once_with(
+            AutoScalingGroupName='test-asg'
+        )
+        mock_sleep.assert_called_with(5)
+
+    @patch('canary_orchestrator.time.sleep')
+    def test_start_refresh_cancels_existing_pending(self, mock_sleep):
+        self._setup_asg_mock()
+        self.mock_autoscaling.describe_instance_refreshes.side_effect = [
+            {'InstanceRefreshes': [{'InstanceRefreshId': 'old-456', 'Status': 'Pending'}]},
+            {'InstanceRefreshes': [{'InstanceRefreshId': 'old-456', 'Status': 'Cancelled'}]},
+        ]
+
+        result = canary_orchestrator.handle_start_refresh(
+            {'image_tag': 'sha-abc123'}, None
+        )
+        self.assertEqual(result['instance_refresh_id'], 'refresh-123')
+        self.mock_autoscaling.cancel_instance_refresh.assert_called_once()
+
+    def test_start_refresh_rollback_in_progress_raises(self):
+        self._setup_asg_mock()
+        self.mock_autoscaling.describe_instance_refreshes.return_value = {
+            'InstanceRefreshes': [{'InstanceRefreshId': 'rb-789', 'Status': 'RollbackInProgress'}]
+        }
+
+        with self.assertRaises(RuntimeError) as ctx:
+            canary_orchestrator.handle_start_refresh(
+                {'image_tag': 'sha-abc123'}, None
+            )
+        self.assertIn('rolling back', str(ctx.exception))
+        self.assertIn('rb-789', str(ctx.exception))
+        self.mock_autoscaling.cancel_instance_refresh.assert_not_called()
+        self.mock_autoscaling.start_instance_refresh.assert_not_called()
+
+    def test_start_refresh_cancel_already_completed(self):
+        self._setup_asg_mock()
+        self.mock_autoscaling.describe_instance_refreshes.return_value = {
+            'InstanceRefreshes': [{'InstanceRefreshId': 'old-999', 'Status': 'InProgress'}]
+        }
+        # Make the exception a real class so the except clause catches it
+        exc_class = type('ActiveInstanceRefreshNotFoundFault', (Exception,), {})
+        self.mock_autoscaling.exceptions.ActiveInstanceRefreshNotFoundFault = exc_class
+        self.mock_autoscaling.cancel_instance_refresh.side_effect = exc_class()
+
+        result = canary_orchestrator.handle_start_refresh(
+            {'image_tag': 'sha-abc123'}, None
+        )
+        self.assertEqual(result['instance_refresh_id'], 'refresh-123')
+
+    def test_start_refresh_describe_client_error_continues(self):
+        self._setup_asg_mock()
+        self.mock_autoscaling.describe_instance_refreshes.side_effect = MockClientError(
+            {'Error': {'Code': 'InternalFailure', 'Message': 'oops'}},
+            'DescribeInstanceRefreshes'
+        )
+
+        result = canary_orchestrator.handle_start_refresh(
+            {'image_tag': 'sha-abc123'}, None
+        )
+        # Should still proceed to start a new refresh
+        self.assertEqual(result['instance_refresh_id'], 'refresh-123')
+        self.mock_autoscaling.cancel_instance_refresh.assert_not_called()
 
 
 class TestCheckRefreshStatus(CanaryTestCase):

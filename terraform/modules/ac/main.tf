@@ -838,14 +838,6 @@ resource "aws_autoscaling_group" "ac" {
     "GroupTotalInstances",
   ]
 
-  instance_refresh {
-    strategy = "Rolling"
-    preferences {
-      min_healthy_percentage = 50
-      instance_warmup        = 180 # Reduced from 300s - aligns with health_check_grace_period
-    }
-  }
-
   tag {
     key                 = "Name"
     value               = "${var.name_prefix}-ac"

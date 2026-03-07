@@ -524,14 +524,6 @@ resource "aws_autoscaling_group" "console" {
     [aws_lb_target_group.protected.arn]
   )
 
-  instance_refresh {
-    strategy = "Rolling"
-    preferences {
-      min_healthy_percentage = 50
-      instance_warmup        = 360 # Match health_check_grace_period for Console EC2 startup time
-    }
-  }
-
   tag {
     key                 = "Name"
     value               = local.console_name

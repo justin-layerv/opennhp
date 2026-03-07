@@ -248,14 +248,6 @@ resource "aws_autoscaling_group" "ac_green" {
     "GroupTotalInstances",
   ]
 
-  instance_refresh {
-    strategy = "Rolling"
-    preferences {
-      min_healthy_percentage = 50
-      instance_warmup        = 180
-    }
-  }
-
   # Attach to green target group
   target_group_arns = [aws_lb_target_group.ac_tcp_green[0].arn]
 

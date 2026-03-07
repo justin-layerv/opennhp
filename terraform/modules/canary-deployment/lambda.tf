@@ -24,7 +24,7 @@ resource "aws_lambda_function" "orchestrator" {
   handler          = "canary_orchestrator.handler"
   source_code_hash = data.archive_file.orchestrator.output_base64sha256
   runtime          = "python3.12"
-  timeout          = 120
+  timeout          = 300
   memory_size      = 256
 
   environment {

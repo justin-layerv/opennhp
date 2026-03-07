@@ -19,6 +19,7 @@ Actions:
 import json
 import logging
 import os
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -164,6 +165,57 @@ def handle_start_refresh(event, _context):
         }
     }
     logger.info(f"DesiredConfiguration: {desired_config}")
+
+    # Cancel any existing in-progress or pending refresh (e.g., from TF apply).
+    # RollbackInProgress cannot be cancelled — fail early so the operator can
+    # wait for the rollback to finish and retry.
+    try:
+        existing = autoscaling.describe_instance_refreshes(
+            AutoScalingGroupName=ASG_NAME
+        )
+    except ClientError as e:
+        logger.warning(f"Error checking for existing refreshes: {e}")
+        existing = {'InstanceRefreshes': []}
+
+    existing_refreshes = existing.get('InstanceRefreshes', [])
+
+    rolling_back = [r for r in existing_refreshes
+                    if r['Status'] == 'RollbackInProgress']
+    if rolling_back:
+        rb_id = rolling_back[0]['InstanceRefreshId']
+        raise RuntimeError(
+            f"Refresh {rb_id} is rolling back — cannot start a new refresh. "
+            "Wait for the rollback to complete and retry."
+        )
+
+    active = [r for r in existing_refreshes
+              if r['Status'] in ('InProgress', 'Pending')]
+    if active:
+        existing_id = active[0]['InstanceRefreshId']
+        logger.warning(f"Found existing refresh {existing_id} ({active[0]['Status']}), cancelling...")
+        try:
+            autoscaling.cancel_instance_refresh(AutoScalingGroupName=ASG_NAME)
+        except autoscaling.exceptions.ActiveInstanceRefreshNotFoundFault:
+            logger.info("Refresh already completed/cancelled")
+        else:
+            # Wait for cancellation (up to 90s)
+            status = "unknown"
+            for _ in range(18):
+                time.sleep(5)
+                status_resp = autoscaling.describe_instance_refreshes(
+                    AutoScalingGroupName=ASG_NAME,
+                    InstanceRefreshIds=[existing_id]
+                )
+                refreshes = status_resp.get('InstanceRefreshes', [])
+                if not refreshes:
+                    logger.info(f"Refresh {existing_id} no longer found")
+                    break
+                status = refreshes[0]['Status']
+                if status in ('Cancelled', 'Failed', 'Successful'):
+                    logger.info(f"Previous refresh {existing_id} is now {status}")
+                    break
+            else:
+                logger.warning(f"Previous refresh {existing_id} still not cancelled after 90s (final status: {status})")
 
     response = autoscaling.start_instance_refresh(
         AutoScalingGroupName=ASG_NAME,
