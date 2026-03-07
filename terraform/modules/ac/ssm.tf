@@ -161,6 +161,71 @@ resource "aws_ssm_association" "disk_monitor" {
   }
 }
 
+# ==================== Custom Domain Cert Sync ====================
+# Syncs custom domain TLS certificates from Secrets Manager and rebuilds Traefik config
+
+resource "aws_ssm_document" "custom_domain_cert_sync" {
+  count = var.enable_ssm_maintenance ? 1 : 0
+
+  name            = "${var.name_prefix}-ac-custom-domain-cert-sync"
+  document_type   = "Command"
+  document_format = "YAML"
+
+  content = <<-DOC
+    schemaVersion: '2.2'
+    description: 'Sync custom domain TLS certificates from Secrets Manager'
+    parameters:
+      SecretsPrefix:
+        type: String
+        default: "custom-domain-cert"
+        description: "Secrets Manager prefix for custom domain certs"
+      AwsRegion:
+        type: String
+        default: "${data.aws_region.current.name}"
+        description: "AWS region for Secrets Manager"
+      TraefikDir:
+        type: String
+        default: "/home/ubuntu/traefik"
+        description: "Traefik configuration directory"
+    mainSteps:
+      - action: aws:runShellScript
+        name: syncCustomDomainCerts
+        inputs:
+          runCommand:
+            - |
+              #!/bin/bash
+              set -e
+              export SECRETS_PREFIX="{{ SecretsPrefix }}"
+              export AWS_REGION="{{ AwsRegion }}"
+              export TRAEFIK_DIR="{{ TraefikDir }}"
+              ${indent(14, file("${path.module}/scripts/custom-domain-cert-sync.sh"))}
+  DOC
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-ac-custom-domain-cert-sync"
+  })
+}
+
+resource "aws_ssm_association" "custom_domain_cert_sync" {
+  count = var.enable_ssm_maintenance ? 1 : 0
+
+  name             = aws_ssm_document.custom_domain_cert_sync[0].name
+  association_name = "${var.name_prefix}-ac-custom-domain-cert-sync"
+
+  targets {
+    key    = "tag:Name"
+    values = [var.ac_instance_tag]
+  }
+
+  schedule_expression = "rate(6 hours)"
+  compliance_severity = "HIGH"
+
+  parameters = {
+    SecretsPrefix = "custom-domain-cert"
+    AwsRegion     = data.aws_region.current.name
+  }
+}
+
 # ==================== CloudWatch Log Group for SSM ====================
 
 resource "aws_cloudwatch_log_group" "ssm_output" {

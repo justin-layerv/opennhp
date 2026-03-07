@@ -585,6 +585,23 @@ resource "aws_iam_role_policy" "ac" {
           Resource = ["*"]
         },
       ],
+      # Custom domain certificate access (for SSM cert sync script)
+      [
+        {
+          Sid      = "SecretsManagerCustomDomainCertsList"
+          Effect   = "Allow"
+          Action   = ["secretsmanager:ListSecrets"]
+          Resource = "*"
+        },
+        {
+          Sid    = "SecretsManagerCustomDomainCertsRead"
+          Effect = "Allow"
+          Action = ["secretsmanager:GetSecretValue"]
+          Resource = [
+            "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:custom-domain-cert/*"
+          ]
+        },
+      ],
       # Conditional: QURL service token access (only when configured)
       var.qurl_service_token_secret_arn != null ? [
         {
@@ -742,6 +759,8 @@ locals {
     centralized_cert_secret_arn = var.centralized_cert_secret_arn != null ? var.centralized_cert_secret_arn : ""
     centralized_cert_domains    = var.centralized_cert_domains
     acme_lambda_function_name   = var.acme_lambda_function_name
+    # Custom domain cert sync script (embedded in user_data so it's available on boot)
+    custom_domain_cert_sync_script = file("${path.module}/scripts/custom-domain-cert-sync.sh")
   }) : null # Validation failed - this branch never executes (tobool throws first)
 }
 

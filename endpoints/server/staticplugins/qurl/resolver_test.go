@@ -26,8 +26,8 @@ func TestQurlResolver_Resolve_Success(t *testing.T) {
 		if r.Header.Get("Content-Type") != "application/json" {
 			t.Errorf("unexpected content-type: %s", r.Header.Get("Content-Type"))
 		}
-		if r.Header.Get("X-Service-Token") != "test-token" {
-			t.Errorf("unexpected service token: %s", r.Header.Get("X-Service-Token"))
+		if r.Header.Get(ServiceTokenHeader) != "test-token" {
+			t.Errorf("unexpected service token: %s", r.Header.Get(ServiceTokenHeader))
 		}
 		if r.Header.Get("X-Request-ID") != "rid-test-123" {
 			t.Errorf("unexpected request ID header: %s", r.Header.Get("X-Request-ID"))

@@ -6,6 +6,12 @@ import (
 	"testing"
 )
 
+// longDomain253 returns a valid 253-character domain name (DNS maximum) for testing.
+func longDomain253() string {
+	// 3 labels of 63 chars (DNS max label) + 1 label of 61 chars + 3 dots = 253
+	return strings.Repeat("a", 63) + "." + strings.Repeat("a", 63) + "." + strings.Repeat("a", 63) + "." + strings.Repeat("a", 61)
+}
+
 func TestLoadConfig_AllRequired(t *testing.T) {
 	// Set all required env vars (t.Setenv auto-restores on test cleanup)
 	t.Setenv("QURL_API_URL", "https://qurl-api.example.com")
@@ -408,6 +414,174 @@ func TestValidateRedirectURL(t *testing.T) {
 				}
 			} else if err != nil {
 				t.Errorf("ValidateRedirectURL(%q, %q) = %v, want nil", tt.url, tt.allowedDomain, err)
+			}
+		})
+	}
+}
+
+func TestValidateCustomDomainRedirectURL(t *testing.T) {
+	tests := []struct {
+		name        string
+		url         string
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:    "valid HTTPS custom domain URL",
+			url:     "https://app.example.com/dashboard",
+			wantErr: false,
+		},
+		{
+			name:    "valid HTTPS custom domain root",
+			url:     "https://myapp.corp.io",
+			wantErr: false,
+		},
+		{
+			name:        "HTTP rejected",
+			url:         "http://app.example.com/",
+			wantErr:     true,
+			errContains: "must use HTTPS",
+		},
+		{
+			name:        "empty host rejected",
+			url:         "https:///path",
+			wantErr:     true,
+			errContains: "missing host",
+		},
+		{
+			name:        "no scheme",
+			url:         "app.example.com",
+			wantErr:     true,
+			errContains: "must use HTTPS",
+		},
+		{
+			name:        "empty URL rejected",
+			url:         "",
+			wantErr:     true,
+			errContains: "empty",
+		},
+		{
+			name:        "localhost rejected",
+			url:         "https://localhost/path",
+			wantErr:     true,
+			errContains: "not allowed",
+		},
+		{
+			name:        "loopback IP rejected",
+			url:         "https://127.0.0.1/path",
+			wantErr:     true,
+			errContains: "not allowed",
+		},
+		{
+			name:        "private IP rejected",
+			url:         "https://10.0.0.1/path",
+			wantErr:     true,
+			errContains: "not allowed",
+		},
+		{
+			name:        "link-local IP rejected",
+			url:         "https://169.254.169.254/latest",
+			wantErr:     true,
+			errContains: "not allowed",
+		},
+		{
+			name:        "CGNAT IP rejected",
+			url:         "https://100.64.0.1/path",
+			wantErr:     true,
+			errContains: "not allowed",
+		},
+		{
+			name:        "IPv6 loopback rejected",
+			url:         "https://[::1]/path",
+			wantErr:     true,
+			errContains: "not allowed",
+		},
+		{
+			name:        "IPv6 link-local rejected",
+			url:         "https://[fe80::1]/path",
+			wantErr:     true,
+			errContains: "not allowed",
+		},
+		{
+			name:        "IPv6 unique local rejected",
+			url:         "https://[fd12::1]/path",
+			wantErr:     true,
+			errContains: "not allowed",
+		},
+		{
+			name:    "punycode IDN domain accepted",
+			url:     "https://xn--nxasmq6b.example.com/path",
+			wantErr: false,
+		},
+		{
+			name:    "long domain name accepted (253 chars)",
+			url:     "https://" + longDomain253() + "/path",
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateCustomDomainRedirectURL(tt.url)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ValidateCustomDomainRedirectURL(%q) = nil, want error", tt.url)
+					return
+				}
+				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
+					t.Errorf("ValidateCustomDomainRedirectURL(%q) error = %q, want to contain %q", tt.url, err.Error(), tt.errContains)
+				}
+			} else if err != nil {
+				t.Errorf("ValidateCustomDomainRedirectURL(%q) = %v, want nil", tt.url, err)
+			}
+		})
+	}
+}
+
+func TestValidateCustomDomainCookieDomain(t *testing.T) {
+	tests := []struct {
+		name        string
+		domain      string
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:    "valid cookie domain with leading dot",
+			domain:  ".example.com",
+			wantErr: false,
+		},
+		{
+			name:    "valid subdomain cookie",
+			domain:  ".app.example.com",
+			wantErr: false,
+		},
+		{
+			name:        "empty domain",
+			domain:      "",
+			wantErr:     true,
+			errContains: "empty",
+		},
+		{
+			name:        "missing leading dot",
+			domain:      "example.com",
+			wantErr:     true,
+			errContains: "must start with dot",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateCustomDomainCookieDomain(tt.domain)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ValidateCustomDomainCookieDomain(%q) = nil, want error", tt.domain)
+					return
+				}
+				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
+					t.Errorf("ValidateCustomDomainCookieDomain(%q) error = %q, want to contain %q", tt.domain, err.Error(), tt.errContains)
+				}
+			} else if err != nil {
+				t.Errorf("ValidateCustomDomainCookieDomain(%q) = %v, want nil", tt.domain, err)
 			}
 		})
 	}

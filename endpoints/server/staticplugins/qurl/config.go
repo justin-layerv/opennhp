@@ -3,12 +3,30 @@ package qurl
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"unicode"
 )
+
+// ExInfo map keys for resource data passed between resolve and auth.
+// These keys form a contract between buildResourceData (writer) and
+// AuthWithHttp (reader). Also used by passcode and oidc plugins.
+const (
+	ExInfoKeyJWTSecret   = "JWTSecret"
+	ExInfoKeyTokenExpire = "TokenExpire"
+)
+
+// Cookie names for NHP authentication tokens.
+const (
+	CookieNHPToken        = "nhp_token"
+	CookieNHPRefreshToken = "nhp_refresh_token"
+)
+
+// ServiceTokenHeader is the HTTP header used to authenticate with the QURL API.
+const ServiceTokenHeader = "X-Service-Token"
 
 // Token validation constants
 const (
@@ -168,6 +186,66 @@ func ValidateRedirectURL(rawURL, allowedDomain string) error {
 	}
 
 	return nil
+}
+
+// ValidateCustomDomainRedirectURL validates a redirect URL for custom domains.
+// Custom domain URLs are returned by the QURL API (service-token authenticated),
+// so we trust the domain but still require HTTPS, a non-empty host, and block
+// internal/loopback addresses as defense-in-depth.
+func ValidateCustomDomainRedirectURL(rawURL string) error {
+	if rawURL == "" {
+		return errors.New("redirect URL is empty")
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid redirect URL: %w", err)
+	}
+	if parsed.Scheme != "https" {
+		return fmt.Errorf("redirect URL must use HTTPS: %s", rawURL)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("redirect URL missing host")
+	}
+
+	// Block internal/loopback addresses as defense-in-depth.
+	// Covers loopback, RFC 1918 private, link-local, and CGNAT (100.64.0.0/10)
+	// which is used in cloud environments (AWS NAT Gateway).
+	hostname := parsed.Hostname()
+	if hostname == "localhost" {
+		return fmt.Errorf("redirect URL hostname %q is not allowed", hostname)
+	}
+	if ip := net.ParseIP(hostname); ip != nil {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || isCGNAT(ip) {
+			return fmt.Errorf("redirect URL hostname %q is not allowed (internal/loopback)", hostname)
+		}
+	}
+
+	return nil
+}
+
+// ValidateCustomDomainCookieDomain validates a cookie domain for custom domains.
+// The cookie domain is returned by the QURL API (service-token authenticated),
+// so we trust it but require it to be non-empty and start with ".".
+func ValidateCustomDomainCookieDomain(cookieDomain string) error {
+	if cookieDomain == "" {
+		return errors.New("cookie domain is empty")
+	}
+	if !strings.HasPrefix(cookieDomain, ".") {
+		return fmt.Errorf("cookie domain must start with dot, got %q", cookieDomain)
+	}
+	return nil
+}
+
+// cgnatBlock is the CGNAT range 100.64.0.0/10, used by cloud providers (e.g., AWS NAT Gateway).
+var cgnatBlock = net.IPNet{
+	IP:   net.IP{100, 64, 0, 0},
+	Mask: net.CIDRMask(10, 32),
+}
+
+// isCGNAT returns true if the IP is in the Carrier-Grade NAT range (100.64.0.0/10).
+// IPv4 only — IPv6 unique-local addresses (fc00::/7) are handled by net.IP.IsPrivate().
+func isCGNAT(ip net.IP) bool {
+	return cgnatBlock.Contains(ip)
 }
 
 // ValidateAccessToken validates an access token for security

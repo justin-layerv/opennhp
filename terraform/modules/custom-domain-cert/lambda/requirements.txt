@@ -1,0 +1,29 @@
+# Custom Domain Certificate Manager Lambda Dependencies
+# Pinned versions for reproducible builds
+#
+# All packages must have manylinux2014_x86_64 wheels for Lambda compatibility.
+# Same dependencies as acme-cert module.
+
+# ACME client library (Let's Encrypt protocol)
+acme==2.11.0
+
+# JSON Object Signing and Encryption (ACME dependency)
+josepy==1.14.0
+
+# Cryptography for key generation and certificate handling
+cryptography==46.0.5
+
+# DNS resolver for propagation verification
+dnspython==2.7.0
+
+# Required transitive dependencies (with manylinux wheels)
+pyOpenSSL==25.3.0
+cffi>=2.0.0
+pycparser==2.22
+pyrfc3339==1.1
+pytz==2024.2
+requests==2.32.4
+certifi==2024.8.30
+charset-normalizer==3.4.0
+idna==3.10
+urllib3==2.6.3

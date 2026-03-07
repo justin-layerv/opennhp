@@ -262,11 +262,11 @@ func TestBuildResourceData(t *testing.T) {
 	}
 
 	// Check ExInfo
-	if res.ExInfo["JWTSecret"] != "test-secret" {
-		t.Errorf("ExInfo[JWTSecret] = %v, want %q", res.ExInfo["JWTSecret"], "test-secret")
+	if res.ExInfo[ExInfoKeyJWTSecret] != "test-secret" {
+		t.Errorf("ExInfo[JWTSecret] = %v, want %q", res.ExInfo[ExInfoKeyJWTSecret], "test-secret")
 	}
-	if res.ExInfo["TokenExpire"] != int64(3600) {
-		t.Errorf("ExInfo[TokenExpire] = %v, want %d", res.ExInfo["TokenExpire"], 3600)
+	if res.ExInfo[ExInfoKeyTokenExpire] != int64(3600) {
+		t.Errorf("ExInfo[TokenExpire] = %v, want %d", res.ExInfo[ExInfoKeyTokenExpire], 3600)
 	}
 }
 
@@ -382,9 +382,9 @@ func TestAuthWithHttp_FullFlow(t *testing.T) {
 	var nhpTokenCookie, refreshTokenCookie *http.Cookie
 	for _, c := range cookies {
 		switch c.Name {
-		case "nhp_token":
+		case CookieNHPToken:
 			nhpTokenCookie = c
-		case "nhp_refresh_token":
+		case CookieNHPRefreshToken:
 			refreshTokenCookie = c
 		}
 	}
@@ -393,6 +393,184 @@ func TestAuthWithHttp_FullFlow(t *testing.T) {
 	}
 	if refreshTokenCookie == nil {
 		t.Error("nhp_refresh_token cookie not set")
+	}
+}
+
+// customDomainTestSetup holds shared state for custom domain test cases.
+type customDomainTestSetup struct {
+	recorder *httptest.ResponseRecorder
+	ctx      *gin.Context
+}
+
+// setupCustomDomainTest creates a mock QURL API that returns the given response,
+// wires up the package-level resolver, and returns a gin test context.
+func setupCustomDomainTest(t *testing.T, resp *ResolveResponse) *customDomainTestSetup {
+	t.Helper()
+
+	qurlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(internalResolveResponse{Success: true, Data: resp})
+	}))
+
+	oldResolver := resolver
+	resolver = &QurlResolver{
+		httpClient:            &http.Client{Timeout: 5 * time.Second},
+		baseURL:               qurlServer.URL,
+		serviceToken:          "test-service-token",
+		allowedRedirectDomain: "qurl.site",
+	}
+
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/plugins/qurl?token=valid_test_token_123", nil)
+
+	t.Cleanup(func() {
+		qurlServer.Close()
+		resolver = oldResolver
+	})
+
+	return &customDomainTestSetup{
+		recorder: w,
+		ctx:      ctx,
+	}
+}
+
+// successKnockHelper returns a helper whose callback always succeeds.
+func successKnockHelper() *plugins.HttpServerPluginHelper {
+	return &plugins.HttpServerPluginHelper{
+		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			return &common.ServerKnockAckMsg{
+				ResourceHost: map[string]string{"default": "10.0.0.1:443"},
+			}, nil
+		},
+	}
+}
+
+func TestAuthWithHttp_CustomDomain_FullFlow(t *testing.T) {
+	setup := setupCustomDomainTest(t, &ResolveResponse{
+		ResourceID:  "r_custom123",
+		TargetURL:   "https://backend.example.com",
+		QurlSiteURL: "https://app.mycorp.com",
+		Resources: map[string]*common.ResourceInfo{
+			"default": {
+				ACId:     "ac-001",
+				Hostname: "backend.example.com",
+				Addr:     &common.NetAddress{Ip: "10.0.0.1", Port: 443},
+			},
+		},
+		JWTSecret:      "test-jwt-secret-key-for-signing",
+		TokenExpire:    3600,
+		OpenTime:       300,
+		CookieDomain:   ".mycorp.com",
+		IsCustomDomain: true,
+	})
+
+	helper := &plugins.HttpServerPluginHelper{
+		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			if res.CookieDomain != ".mycorp.com" {
+				t.Errorf("callback received wrong CookieDomain: %s", res.CookieDomain)
+			}
+			if res.RedirectUrl != "https://app.mycorp.com" {
+				t.Errorf("callback received wrong RedirectUrl: %s", res.RedirectUrl)
+			}
+			return &common.ServerKnockAckMsg{
+				ResourceHost: map[string]string{"default": "10.0.0.1:443"},
+			}, nil
+		},
+	}
+
+	ackMsg, err := AuthWithHttp(setup.ctx, &common.HttpKnockRequest{}, helper)
+
+	if err != nil {
+		t.Fatalf("AuthWithHttp returned unexpected error: %v", err)
+	}
+	if ackMsg == nil || len(ackMsg.ResourceHost) == 0 {
+		t.Fatal("expected resource hosts in ack message")
+	}
+
+	// Verify redirect to custom domain (not qurl.site)
+	if setup.recorder.Code != http.StatusFound {
+		t.Errorf("expected status %d, got %d", http.StatusFound, setup.recorder.Code)
+	}
+	location := setup.recorder.Header().Get("Location")
+	if location != "https://app.mycorp.com" {
+		t.Errorf("expected redirect to https://app.mycorp.com, got %s", location)
+	}
+
+	// Verify cookies were set with custom domain
+	// Note: Go's http.ReadSetCookies strips the leading dot from cookie domains,
+	// so ".mycorp.com" becomes "mycorp.com" when read back via w.Result().Cookies().
+	cookies := setup.recorder.Result().Cookies()
+	for _, c := range cookies {
+		if c.Name == CookieNHPToken || c.Name == CookieNHPRefreshToken {
+			if c.Domain != "mycorp.com" {
+				t.Errorf("cookie %s domain = %q, want %q", c.Name, c.Domain, "mycorp.com")
+			}
+		}
+	}
+}
+
+func TestAuthWithHttp_CustomDomain_RejectsHTTPRedirect(t *testing.T) {
+	setup := setupCustomDomainTest(t, &ResolveResponse{
+		ResourceID:  "r_custom_http",
+		TargetURL:   "https://backend.example.com",
+		QurlSiteURL: "http://app.mycorp.com", // HTTP - should be rejected
+		Resources: map[string]*common.ResourceInfo{
+			"default": {
+				ACId:     "ac-001",
+				Hostname: "backend.example.com",
+				Addr:     &common.NetAddress{Ip: "10.0.0.1", Port: 443},
+			},
+		},
+		JWTSecret:      "test-jwt-secret-key-for-signing",
+		TokenExpire:    3600,
+		OpenTime:       300,
+		CookieDomain:   ".mycorp.com",
+		IsCustomDomain: true,
+	})
+
+	_, err := AuthWithHttp(setup.ctx, &common.HttpKnockRequest{}, successKnockHelper())
+
+	if err == nil {
+		t.Fatal("expected error for HTTP custom domain redirect")
+	}
+	if setup.recorder.Code != http.StatusBadGateway {
+		t.Errorf("expected status %d, got %d", http.StatusBadGateway, setup.recorder.Code)
+	}
+	if !strings.Contains(err.Error(), "invalid redirect URL") {
+		t.Errorf("expected 'invalid redirect URL' error, got: %v", err)
+	}
+}
+
+func TestAuthWithHttp_CustomDomain_RejectsInvalidCookieDomain(t *testing.T) {
+	setup := setupCustomDomainTest(t, &ResolveResponse{
+		ResourceID:  "r_custom_bad_cookie",
+		TargetURL:   "https://backend.example.com",
+		QurlSiteURL: "https://app.mycorp.com",
+		Resources: map[string]*common.ResourceInfo{
+			"default": {
+				ACId:     "ac-001",
+				Hostname: "backend.example.com",
+				Addr:     &common.NetAddress{Ip: "10.0.0.1", Port: 443},
+			},
+		},
+		JWTSecret:      "test-jwt-secret-key-for-signing",
+		TokenExpire:    3600,
+		OpenTime:       300,
+		CookieDomain:   "mycorp.com", // missing leading dot
+		IsCustomDomain: true,
+	})
+
+	_, err := AuthWithHttp(setup.ctx, &common.HttpKnockRequest{}, successKnockHelper())
+
+	if err == nil {
+		t.Fatal("expected error for custom domain cookie domain without leading dot")
+	}
+	if setup.recorder.Code != http.StatusBadGateway {
+		t.Errorf("expected status %d, got %d", http.StatusBadGateway, setup.recorder.Code)
+	}
+	if !strings.Contains(err.Error(), "invalid cookie domain") {
+		t.Errorf("expected 'invalid cookie domain' error, got: %v", err)
 	}
 }
 

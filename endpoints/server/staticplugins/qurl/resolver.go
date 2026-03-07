@@ -51,6 +51,8 @@ type ResolveRequest struct {
 
 // ResolveResponse represents the response from QURL API token resolution.
 // It contains all data needed to perform the NHP knock and redirect the user.
+// For custom domains, IsCustomDomain is true and QurlSiteURL/CookieDomain
+// reflect the customer's domain instead of qurl.site.
 type ResolveResponse struct {
 	// ResourceID is the QURL resource identifier (e.g., "r_9f3a2c8e")
 	ResourceID string `json:"resource_id"`
@@ -75,6 +77,11 @@ type ResolveResponse struct {
 	OpenTime uint32 `json:"open_time"`
 	// CookieDomain is the domain for setting NHP cookies
 	CookieDomain string `json:"cookie_domain"`
+
+	// IsCustomDomain indicates the resource uses a custom domain instead of qurl.site.
+	// When true, the redirect URL and cookie domain come from the custom domain
+	// and should bypass the AllowedRedirectDomain check (only HTTPS is required).
+	IsCustomDomain bool `json:"is_custom_domain,omitempty"`
 
 	// AccessCount tracks how many times this token has been used
 	AccessCount int `json:"access_count"`
@@ -179,7 +186,7 @@ func (r *QurlResolver) Resolve(ctx context.Context, req *ResolveRequest) (*Resol
 	if r.serviceToken == "" {
 		return nil, errors.New("service token is empty - cannot authenticate with QURL API")
 	}
-	httpReq.Header.Set("X-Service-Token", r.serviceToken)
+	httpReq.Header.Set(ServiceTokenHeader, r.serviceToken)
 
 	// Execute request
 	log.Debug("[QURL] [req_id=%s] Calling QURL API: %s", req.RequestID, url)

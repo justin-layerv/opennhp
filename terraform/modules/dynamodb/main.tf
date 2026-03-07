@@ -335,7 +335,7 @@ resource "aws_iam_policy" "dynamodb_read" {
           "dynamodb:Scan",
           "dynamodb:BatchGetItem"
         ]
-        Resource = [
+        Resource = concat([
           aws_dynamodb_table.licenses.arn,
           "${aws_dynamodb_table.licenses.arn}/index/*",
           aws_dynamodb_table.ac_assignments.arn,
@@ -343,7 +343,10 @@ resource "aws_iam_policy" "dynamodb_read" {
           aws_dynamodb_table.server_ac_index.arn,
           aws_dynamodb_table.resources.arn,
           "${aws_dynamodb_table.resources.arn}/index/*"
-        ]
+          ], var.deploy_qurl_tables ? [
+          aws_dynamodb_table.qurl_domains[0].arn,
+          "${aws_dynamodb_table.qurl_domains[0].arn}/index/*",
+        ] : [])
       },
       {
         Sid    = "DynamoDBWriteACAssignments"
@@ -390,7 +393,7 @@ resource "aws_iam_policy" "dynamodb_write" {
           "dynamodb:BatchGetItem",
           "dynamodb:BatchWriteItem"
         ]
-        Resource = [
+        Resource = concat([
           aws_dynamodb_table.licenses.arn,
           "${aws_dynamodb_table.licenses.arn}/index/*",
           aws_dynamodb_table.ac_assignments.arn,
@@ -398,7 +401,10 @@ resource "aws_iam_policy" "dynamodb_write" {
           aws_dynamodb_table.server_ac_index.arn,
           aws_dynamodb_table.resources.arn,
           "${aws_dynamodb_table.resources.arn}/index/*"
-        ]
+          ], var.deploy_qurl_tables ? [
+          aws_dynamodb_table.qurl_domains[0].arn,
+          "${aws_dynamodb_table.qurl_domains[0].arn}/index/*",
+        ] : [])
       }
       ], var.kms_key_arn != null ? [{
         Sid    = "KMSEncryptDecrypt"
@@ -469,6 +475,18 @@ resource "aws_dynamodb_table" "qurl_resources" {
     name            = "owner-expires-index"
     hash_key        = "owner_id"
     range_key       = "expires_at"
+    projection_type = "ALL"
+  }
+
+  attribute {
+    name = "custom_domain"
+    type = "S"
+  }
+
+  # GSI: Find resource by custom domain (for domain-based routing)
+  global_secondary_index {
+    name            = "custom-domain-index"
+    hash_key        = "custom_domain"
     projection_type = "ALL"
   }
 
@@ -952,6 +970,89 @@ resource "aws_dynamodb_table" "qurl_billing_audit" {
     Cell      = var.cell_id
     Component = "qurl-service"
     Purpose   = "QURL billing audit trail"
+  })
+}
+
+# qurl-domains: Stores custom domain registrations
+# PK: domain (String) - the domain name (e.g., "secure.example.com")
+# GSI: owner-index (query domains by owner)
+# GSI: status-index (query domains by status for verification polling)
+resource "aws_dynamodb_table" "qurl_domains" {
+  count = var.deploy_qurl_tables ? 1 : 0
+
+  name                        = "${var.name_prefix}-${var.cell_id}-qurl-domains"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "domain"
+  deletion_protection_enabled = local.is_prod
+
+  attribute {
+    name = "domain"
+    type = "S"
+  }
+
+  attribute {
+    name = "owner_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "status"
+    type = "S"
+  }
+
+  attribute {
+    name = "cert_status"
+    type = "S"
+  }
+
+  # GSI: Find domains by owner
+  global_secondary_index {
+    name            = "owner-index"
+    hash_key        = "owner_id"
+    range_key       = "domain"
+    projection_type = "ALL"
+  }
+
+  # GSI: Find domains by status (for verification polling)
+  # Uses domain as sort key to distribute reads within status partitions
+  # and enable efficient key-condition queries.
+  global_secondary_index {
+    name            = "status-index"
+    hash_key        = "status"
+    range_key       = "domain"
+    projection_type = "ALL"
+  }
+
+  # GSI: Find domains by cert status (for renewal scanning and failure tracking)
+  global_secondary_index {
+    name            = "cert-status-index"
+    hash_key        = "cert_status"
+    range_key       = "domain"
+    projection_type = "KEYS_ONLY"
+  }
+
+  # Enable point-in-time recovery for production
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  # Server-side encryption with KMS
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  # TTL for cleaning up revoked domains after 30 days
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-qurl-domains"
+    Cell      = var.cell_id
+    Component = "qurl-service"
+    Purpose   = "Custom domain registrations"
   })
 }
 

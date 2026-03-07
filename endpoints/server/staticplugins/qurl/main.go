@@ -174,7 +174,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	log.Info("[QURL] [req_id=%s] NHP knock succeeded: hosts=%v", requestID, ackMsg.ResourceHost)
 
 	// Generate NHP tokens and set cookies
-	jwtSecret := nhpsdkutils.GetStringFromMap(res.ExInfo, "JWTSecret")
+	jwtSecret := nhpsdkutils.GetStringFromMap(res.ExInfo, ExInfoKeyJWTSecret)
 	if jwtSecret == "" {
 		log.Error("[QURL] [req_id=%s] JWT secret is empty - cannot generate tokens", requestID)
 		ctx.JSON(http.StatusInternalServerError, gin.H{
@@ -200,28 +200,37 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 
 	// Validate cookie domain and redirect URL BEFORE setting any cookies.
 	// This ensures we don't set cookies if either validation fails.
-	if err := ValidateCookieDomain(res.CookieDomain, resolver.AllowedRedirectDomain()); err != nil {
-		log.Error("[QURL] [req_id=%s] Invalid cookie domain from API: %v", requestID, err)
+	// When IsCustomDomain is true, the QURL API (authenticated via service token)
+	// tells us the domain is valid, so we only need to verify HTTPS and basic structure.
+	var cookieErr, redirectErr error
+	if resolveResp.IsCustomDomain {
+		cookieErr = ValidateCustomDomainCookieDomain(res.CookieDomain)
+		redirectErr = ValidateCustomDomainRedirectURL(resolveResp.QurlSiteURL)
+	} else {
+		cookieErr = ValidateCookieDomain(res.CookieDomain, resolver.AllowedRedirectDomain())
+		redirectErr = ValidateRedirectURL(resolveResp.QurlSiteURL, resolver.AllowedRedirectDomain())
+	}
+	if cookieErr != nil {
+		log.Error("[QURL] [req_id=%s] Invalid cookie domain from API: %v", requestID, cookieErr)
 		ctx.JSON(http.StatusBadGateway, gin.H{
 			"error":   "invalid_cookie_domain",
 			"message": "Invalid cookie domain from upstream service",
 		})
-		return nil, fmt.Errorf("invalid cookie domain: %w", err)
+		return nil, fmt.Errorf("invalid cookie domain: %w", cookieErr)
 	}
-
-	if err := ValidateRedirectURL(resolveResp.QurlSiteURL, resolver.AllowedRedirectDomain()); err != nil {
-		log.Error("[QURL] [req_id=%s] Invalid redirect URL from API: %v", requestID, err)
+	if redirectErr != nil {
+		log.Error("[QURL] [req_id=%s] Invalid redirect URL from API: %v", requestID, redirectErr)
 		ctx.JSON(http.StatusBadGateway, gin.H{
 			"error":   "invalid_redirect",
 			"message": "Invalid redirect URL from upstream service",
 		})
-		return nil, fmt.Errorf("invalid redirect URL: %w", err)
+		return nil, fmt.Errorf("invalid redirect URL: %w", redirectErr)
 	}
 
 	// Now safe to set cookies and redirect
-	tokenExpire := nhpsdkutils.GetIntFromMap(res.ExInfo, "TokenExpire")
-	ctx.SetCookie("nhp_token", nhpToken, tokenExpire, "/", res.CookieDomain, true, true)
-	ctx.SetCookie("nhp_refresh_token", refreshToken, tokenExpire, "/", res.CookieDomain, true, true)
+	tokenExpire := nhpsdkutils.GetIntFromMap(res.ExInfo, ExInfoKeyTokenExpire)
+	ctx.SetCookie(CookieNHPToken, nhpToken, tokenExpire, "/", res.CookieDomain, true, true)
+	ctx.SetCookie(CookieNHPRefreshToken, refreshToken, tokenExpire, "/", res.CookieDomain, true, true)
 
 	log.Info("[QURL] [req_id=%s] Tokens generated and cookies set, redirecting to: %s", requestID, resolveResp.QurlSiteURL)
 
@@ -254,8 +263,8 @@ func buildResourceData(resp *ResolveResponse) *common.ResourceData {
 			Resources:     resp.Resources,
 		},
 		ExInfo: map[string]any{
-			"JWTSecret":   resp.JWTSecret,
-			"TokenExpire": resp.TokenExpire,
+			ExInfoKeyJWTSecret:   resp.JWTSecret,
+			ExInfoKeyTokenExpire: resp.TokenExpire,
 		},
 		RedirectUrl:  resp.QurlSiteURL,
 		CookieDomain: resp.CookieDomain,

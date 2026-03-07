@@ -83,6 +83,30 @@ resource "aws_cloudwatch_metric_alarm" "server_connection_failure" {
   })
 }
 
+# ==================== Custom Domain Cert Sync Alarms ====================
+
+resource "aws_cloudwatch_metric_alarm" "cert_sync_failures" {
+  count = var.enable_ssm_maintenance && var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-cert-sync-failures"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "CertSyncFailures"
+  namespace           = "NHP/CustomDomainCerts"
+  period              = 21600 # 6 hours (matches SSM association interval)
+  statistic           = "Maximum"
+  threshold           = 0
+  alarm_description   = "Custom domain cert sync encountered failures on AC instances"
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-ac-cert-sync-failures"
+  })
+}
+
 # ==================== CloudWatch Dashboard ====================
 
 resource "aws_cloudwatch_dashboard" "ac_monitoring" {
