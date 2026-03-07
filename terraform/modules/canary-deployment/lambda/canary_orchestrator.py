@@ -91,7 +91,7 @@ def handler(event, context):
         raise
 
 
-def handle_prepare(event, context):
+def handle_prepare(event, _context):
     """Validate ASG exists and set deployment state to prevent concurrent deploys."""
     logger.info(f"Preparing canary deployment for ASG: {ASG_NAME}")
 
@@ -134,7 +134,7 @@ def handle_prepare(event, context):
     }
 
 
-def handle_start_refresh(event, context):
+def handle_start_refresh(event, _context):
     """Start an ASG instance refresh with checkpoint percentages."""
     image_tag = event.get('image_tag')
     if not image_tag:
@@ -186,7 +186,7 @@ def handle_start_refresh(event, context):
     }
 
 
-def handle_check_refresh_status(event, context):
+def handle_check_refresh_status(event, _context):
     """Check the current status of an instance refresh."""
     instance_refresh_id = event.get('instance_refresh_id')
     if not instance_refresh_id:
@@ -241,7 +241,7 @@ def handle_check_refresh_status(event, context):
     }
 
 
-def handle_check_health(event, context):
+def handle_check_health(_event, _context):
     """Check deployment health via CloudWatch metrics."""
     logger.info("Checking deployment health metrics")
 
@@ -342,7 +342,7 @@ def handle_check_health(event, context):
     }
 
 
-def handle_rollback(event, context):
+def handle_rollback(_event, _context):
     """Manually trigger a rollback of the instance refresh."""
     logger.info(f"Rolling back instance refresh for ASG: {ASG_NAME}")
 
@@ -370,7 +370,7 @@ def handle_rollback(event, context):
     }
 
 
-def handle_alarm_triggered_rollback(event, context):
+def handle_alarm_triggered_rollback(_event, _context):
     """
     EventBridge entry point for alarm-driven rollback.
     Idempotent: only proceeds if canary state is 'deploying'.
@@ -410,7 +410,7 @@ def handle_alarm_triggered_rollback(event, context):
     }
 
 
-def handle_notify(event, context):
+def handle_notify(event, _context):
     """Send deployment notification via SNS."""
     status = event.get('status', 'unknown')
     message = event.get('message', '')
@@ -445,7 +445,7 @@ def handle_notify(event, context):
     return {'notified': True}
 
 
-def handle_complete(event, context):
+def handle_complete(_event, _context):
     """Finalize deployment: reset canary state and clear execution ARN."""
     logger.info("Completing canary deployment")
 
