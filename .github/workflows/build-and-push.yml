@@ -38,6 +38,11 @@ on:
         required: false
         default: false
         type: boolean
+      force_build:
+        description: 'Force image build even without app code changes'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   id-token: write
@@ -67,8 +72,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     outputs:
-      code: ${{ steps.filter.outputs.code }}
-      app: ${{ steps.filter.outputs.app }}
+      code: ${{ steps.override.outputs.app || steps.filter.outputs.code }}
+      app: ${{ steps.override.outputs.app || steps.filter.outputs.app }}
       infra: ${{ steps.filter.outputs.infra }}
       tests: ${{ steps.filter.outputs.tests }}
       lambdas: ${{ steps.filter.outputs.lambdas }}
@@ -117,8 +122,15 @@ jobs:
             echo "| Lambdas | ${{ steps.filter.outputs.lambdas }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Force build override
+        id: override
+        if: github.event.inputs.force_build == 'true'
+        run: |
+          echo "app=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::force_build=true — overriding app change detection to force image build"
+
       - name: Annotate skipped jobs
-        if: steps.filter.outputs.code == 'false'
+        if: steps.filter.outputs.code == 'false' && github.event.inputs.force_build != 'true'
         run: |
           echo "::notice title=Jobs Skipped::No code changes detected (only docs/changelog). Test and Build jobs will be skipped but report success for branch protection."
 
