@@ -50,8 +50,8 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: nhp-${{ github.event.inputs.environment || 'sandbox' }}-${{ github.ref_name }}
-  cancel-in-progress: false
+  group: nhp-${{ github.event.inputs.environment || 'sandbox' }}-${{ github.ref_name }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 env:
   AWS_REGION: us-east-2
@@ -695,9 +695,10 @@ jobs:
 
   deploy-sandbox-infra:
     name: Deploy Sandbox - Infrastructure
-    needs: [setup, test, test-lambdas, build, terraform-plan]
+    needs: [changes, setup, test, test-lambdas, build, terraform-plan]
     if: |
       always() &&
+      (needs.changes.outputs.app == 'true' || needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch') &&
       (needs.test.result == 'success' || needs.test.result == 'skipped') &&
       (needs.test-lambdas.result == 'success' || needs.test-lambdas.result == 'skipped') &&
       needs.build.result == 'success' &&
