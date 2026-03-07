@@ -885,11 +885,14 @@ jobs:
 
           echo "Instance Refresh ID: $REFRESH_ID"
 
-          # Wait for instance refresh with health check
+          # Wait for instance refresh with health check.
+          # 90 iterations × 10s = 15 min. MinHealthyPercentage=90% forces sequential
+          # replacement (1 at a time), each needing 180s warmup = ~10-12 min for 3 instances.
           ./.github/scripts/wait-for-instance-refresh.sh \
             "$ASG_NAME" \
             "$REFRESH_ID" \
-            "docker ps | grep nhp-server && systemctl is-active nhp-server"
+            "docker ps | grep nhp-server && systemctl is-active nhp-server" \
+            90
 
       - name: Push Deployment Metric
         run: |
