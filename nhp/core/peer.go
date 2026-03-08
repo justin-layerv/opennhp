@@ -45,6 +45,10 @@ type UdpPeer struct {
 	name         string
 	pubKey       []byte
 
+	// LookupHostFunc overrides net.LookupHost for DNS resolution.
+	// If nil, net.LookupHost is used. Set this in tests to inject a mock resolver.
+	LookupHostFunc func(host string) ([]string, error)
+
 	// mutable fields
 	lastSendTime                     int64
 	lastRecvTime                     int64
@@ -110,7 +114,11 @@ func (p *UdpPeer) ResolveHost() string {
 	timeSinceLastLookup := currTime - p.lastNSLookupTime
 	if timeSinceLastLookup > MinimalNSLookupInterval*int64(time.Second) {
 		oldIp := p.primaryResolvedIp
-		addrs, err := net.LookupHost(p.Hostname)
+		lookupFn := p.LookupHostFunc
+		if lookupFn == nil {
+			lookupFn = net.LookupHost
+		}
+		addrs, err := lookupFn(p.Hostname)
 		if err == nil {
 			p.lastNSLookupTime = currTime
 			p.resolvedIpArr = addrs
