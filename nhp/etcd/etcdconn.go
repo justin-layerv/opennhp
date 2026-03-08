@@ -13,6 +13,13 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
+// Sentinel errors for etcd operations.
+var (
+	ErrClientNotInitialized = errors.New("etcd client not initialized")
+	ErrKeyNotFound          = errors.New("key not found")
+	ErrValueNotSet          = errors.New("value not set")
+)
+
 type EtcdConfig struct {
 	Key       string
 	Endpoints []string
@@ -77,25 +84,42 @@ func (conn *EtcdConn) InitClient() error {
 }
 
 func (conn *EtcdConn) GetValue() ([]byte, error) {
+	return conn.GetValueWithKey(conn.ctx, conn.Key)
+}
+
+func (conn *EtcdConn) SetValue(v string) error {
+	return conn.SetValueWithKey(conn.ctx, conn.Key, v)
+}
+
+// GetValueWithKey retrieves a value by explicit key, using the provided context
+// for timeout/cancellation. This avoids mutating the struct-level Key field
+// and is safe for concurrent use.
+func (conn *EtcdConn) GetValueWithKey(ctx context.Context, key string) ([]byte, error) {
 	if conn.client == nil {
-		return nil, errors.New("etcd client not initialized")
+		return nil, ErrClientNotInitialized
 	}
-	val, err := conn.client.Get(conn.ctx, conn.Key)
+	val, err := conn.client.Get(ctx, key)
 	if err != nil {
 		return nil, err
 	}
 
 	if len(val.Kvs) == 0 {
-		return nil, errors.New("key not found")
+		return nil, ErrKeyNotFound
 	}
 	if len(val.Kvs[0].Value) == 0 {
-		return nil, errors.New("value not set")
+		return nil, ErrValueNotSet
 	}
 	return val.Kvs[0].Value, nil
 }
 
-func (conn *EtcdConn) SetValue(v string) error {
-	_, err := conn.client.Put(conn.ctx, conn.Key, v)
+// SetValueWithKey stores a value at the explicit key, using the provided context
+// for timeout/cancellation. This avoids mutating the struct-level Key field
+// and is safe for concurrent use.
+func (conn *EtcdConn) SetValueWithKey(ctx context.Context, key string, value string) error {
+	if conn.client == nil {
+		return ErrClientNotInitialized
+	}
+	_, err := conn.client.Put(ctx, key, value)
 	return err
 }
 
@@ -141,12 +165,20 @@ func (conn *EtcdConn) Client() *clientv3.Client {
 	return conn.client
 }
 
-// GetPrefix retrieves all key-value pairs with the given prefix
+// GetPrefix retrieves all key-value pairs with the given prefix.
+// It uses the connection's background context. For caller-controlled
+// timeout/cancellation, use GetPrefixWithContext.
 func (conn *EtcdConn) GetPrefix(prefix string) (map[string][]byte, error) {
+	return conn.GetPrefixWithContext(conn.ctx, prefix)
+}
+
+// GetPrefixWithContext retrieves all key-value pairs with the given prefix,
+// using the provided context for timeout/cancellation.
+func (conn *EtcdConn) GetPrefixWithContext(ctx context.Context, prefix string) (map[string][]byte, error) {
 	if conn.client == nil {
-		return nil, errors.New("etcd client not initialized")
+		return nil, ErrClientNotInitialized
 	}
-	resp, err := conn.client.Get(conn.ctx, prefix, clientv3.WithPrefix())
+	resp, err := conn.client.Get(ctx, prefix, clientv3.WithPrefix())
 	if err != nil {
 		return nil, err
 	}

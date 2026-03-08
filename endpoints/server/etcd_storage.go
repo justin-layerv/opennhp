@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/OpenNHP/opennhp/nhp/etcd"
 	"github.com/OpenNHP/opennhp/nhp/log"
@@ -28,10 +27,9 @@ import (
 // The /nhp/resources-by-ac/ index is maintained by Console when writing resources.
 // This backend only reads from etcd; Console is responsible for write operations.
 //
-// Note on context handling:
-// The underlying EtcdConn uses a background context for operations. Passed context
-// parameters are currently not propagated to etcd calls. This is a limitation of
-// the EtcdConn API and may be addressed in a future refactor.
+// Context handling:
+// The GetValueWithKey/SetValueWithKey methods propagate the caller's context
+// to etcd operations, enabling proper timeout and cancellation support.
 // ============================================================================
 
 const (
@@ -99,7 +97,7 @@ func (e *EtcdStorage) Close() error {
 // This is used for health checks to verify the storage backend is available.
 func (e *EtcdStorage) Ping(ctx context.Context) error {
 	if e.conn == nil || e.conn.Client() == nil {
-		return errors.New("etcd client not initialized")
+		return etcd.ErrClientNotInitialized
 	}
 
 	// Get status from the first endpoint
@@ -128,13 +126,9 @@ func acAssignmentKey(acID string) string {
 func (e *EtcdStorage) GetACAssignment(ctx context.Context, acID string) (*ACAssignment, error) {
 	key := acAssignmentKey(acID)
 
-	// Use temporary connection with our key for GetValue
-	tempConn := *e.conn
-	tempConn.Key = key
-
-	data, err := tempConn.GetValue()
+	data, err := e.conn.GetValueWithKey(ctx, key)
 	if err != nil {
-		if strings.Contains(err.Error(), "key not found") || strings.Contains(err.Error(), "value not set") {
+		if errors.Is(err, etcd.ErrKeyNotFound) || errors.Is(err, etcd.ErrValueNotSet) {
 			return nil, NewNotFoundError(fmt.Sprintf("AC assignment not found: %s", acID))
 		}
 		log.Error("etcd GetValue failed for AC %s: %v", acID, err)
@@ -160,11 +154,8 @@ func (e *EtcdStorage) SaveACAssignment(ctx context.Context, assignment *ACAssign
 		return &StorageError{Code: ErrCodeValidationFailed, Message: "failed to marshal assignment", Err: err}
 	}
 
-	tempConn := *e.conn
-	tempConn.Key = key
-
-	if err := tempConn.SetValue(string(data)); err != nil {
-		log.Error("etcd SetKeyValue failed for AC %s: %v", assignment.ACID, err)
+	if err := e.conn.SetValueWithKey(ctx, key, string(data)); err != nil {
+		log.Error("etcd SetValueWithKey failed for AC %s: %v", assignment.ACID, err)
 		return NewServiceUnavailableError("etcd unavailable", err)
 	}
 
@@ -176,7 +167,7 @@ func (e *EtcdStorage) SaveACAssignment(ctx context.Context, assignment *ACAssign
 // This scans all AC assignments and filters by server ID.
 // Note: For large deployments, consider adding a secondary index.
 func (e *EtcdStorage) GetACsByServer(ctx context.Context, serverID string) ([]ACAssignment, error) {
-	allAssignments, err := e.conn.GetPrefix(etcdACAssignmentsPrefix)
+	allAssignments, err := e.conn.GetPrefixWithContext(ctx, etcdACAssignmentsPrefix)
 	if err != nil {
 		log.Error("etcd GetPrefix failed for AC assignments: %v", err)
 		return nil, NewServiceUnavailableError("etcd unavailable", err)
@@ -222,13 +213,9 @@ func (e *EtcdStorage) GetLicense(ctx context.Context, licenseKey string) (*Licen
 
 	key := licenseEtcdKey(licenseKeySHA256)
 
-	// Use temporary connection with our key for GetValue
-	tempConn := *e.conn
-	tempConn.Key = key
-
-	data, err := tempConn.GetValue()
+	data, err := e.conn.GetValueWithKey(ctx, key)
 	if err != nil {
-		if strings.Contains(err.Error(), "key not found") || strings.Contains(err.Error(), "value not set") {
+		if errors.Is(err, etcd.ErrKeyNotFound) || errors.Is(err, etcd.ErrValueNotSet) {
 			return nil, NewNotFoundError("license not found")
 		}
 		log.Error("etcd GetValue failed for license: %v", err)
@@ -262,13 +249,9 @@ func resourceByACPrefix(acID string) string {
 func (e *EtcdStorage) GetResource(ctx context.Context, customerID, resourceID string) (*Resource, error) {
 	key := resourceKey(customerID, resourceID)
 
-	// Use temporary connection with our key for GetValue
-	tempConn := *e.conn
-	tempConn.Key = key
-
-	data, err := tempConn.GetValue()
+	data, err := e.conn.GetValueWithKey(ctx, key)
 	if err != nil {
-		if strings.Contains(err.Error(), "key not found") || strings.Contains(err.Error(), "value not set") {
+		if errors.Is(err, etcd.ErrKeyNotFound) || errors.Is(err, etcd.ErrValueNotSet) {
 			return nil, NewNotFoundError(fmt.Sprintf("resource not found: %s/%s", customerID, resourceID))
 		}
 		log.Error("etcd GetValue failed for resource %s/%s: %v", customerID, resourceID, err)
@@ -289,7 +272,7 @@ func (e *EtcdStorage) GetResource(ctx context.Context, customerID, resourceID st
 func (e *EtcdStorage) GetResourceByACID(ctx context.Context, acID string) ([]Resource, error) {
 	prefix := resourceByACPrefix(acID)
 
-	allResources, err := e.conn.GetPrefix(prefix)
+	allResources, err := e.conn.GetPrefixWithContext(ctx, prefix)
 	if err != nil {
 		log.Error("etcd GetPrefix failed for resources by AC %s: %v", acID, err)
 		return nil, NewServiceUnavailableError("etcd unavailable", err)

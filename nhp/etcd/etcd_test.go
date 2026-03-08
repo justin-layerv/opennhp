@@ -1,6 +1,8 @@
 package etcd
 
 import (
+	"context"
+	"errors"
 	"testing"
 )
 
@@ -61,14 +63,38 @@ func TestEtcdConn_NoInit(t *testing.T) {
 
 	// GetValue should fail without client
 	_, err := conn.GetValue()
-	if err == nil {
-		t.Error("GetValue should fail without initialized client")
+	if !errors.Is(err, ErrClientNotInitialized) {
+		t.Errorf("GetValue: expected ErrClientNotInitialized, got %v", err)
+	}
+
+	// GetValueWithKey should fail without client
+	_, err = conn.GetValueWithKey(context.Background(), "/test/key")
+	if !errors.Is(err, ErrClientNotInitialized) {
+		t.Errorf("GetValueWithKey: expected ErrClientNotInitialized, got %v", err)
+	}
+
+	// SetValueWithKey should fail without client
+	err = conn.SetValueWithKey(context.Background(), "/test/key", "value")
+	if !errors.Is(err, ErrClientNotInitialized) {
+		t.Errorf("SetValueWithKey: expected ErrClientNotInitialized, got %v", err)
+	}
+
+	// SetValue should fail without client
+	err = conn.SetValue("value")
+	if !errors.Is(err, ErrClientNotInitialized) {
+		t.Errorf("SetValue: expected ErrClientNotInitialized, got %v", err)
 	}
 
 	// GetPrefix should fail without client
 	_, err = conn.GetPrefix("/test")
-	if err == nil {
-		t.Error("GetPrefix should fail without initialized client")
+	if !errors.Is(err, ErrClientNotInitialized) {
+		t.Errorf("GetPrefix: expected ErrClientNotInitialized, got %v", err)
+	}
+
+	// GetPrefixWithContext should fail without client
+	_, err = conn.GetPrefixWithContext(context.Background(), "/test")
+	if !errors.Is(err, ErrClientNotInitialized) {
+		t.Errorf("GetPrefixWithContext: expected ErrClientNotInitialized, got %v", err)
 	}
 }
 
