@@ -59,6 +59,12 @@ func requestIDMiddleware() gin.HandlerFunc {
 		c.Set(RequestIDKey, requestID)
 		c.Header(RequestIDHeader, requestID)
 
+		// Also inject into Go context so storage logging can extract it
+		// without needing a *gin.Context reference.
+		c.Request = c.Request.WithContext(
+			ContextWithRequestID(c.Request.Context(), requestID),
+		)
+
 		c.Next()
 	}
 }

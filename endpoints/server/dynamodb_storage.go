@@ -374,8 +374,9 @@ func CreateStorageBackend(ctx context.Context, cfg StorageConfig) (StorageBacken
 		if err != nil {
 			return nil, err
 		}
-		// Wrap with cache
-		return NewCachedStorage(backend, cfg.Cache), nil
+		// Wrap with logging, then cache
+		logged := NewLoggingStorage(backend)
+		return NewCachedStorage(logged, cfg.Cache), nil
 
 	case "etcd":
 		// etcd backend (feature flag for on-prem)
@@ -383,8 +384,9 @@ func CreateStorageBackend(ctx context.Context, cfg StorageConfig) (StorageBacken
 		if err != nil {
 			return nil, err
 		}
-		// Wrap with cache
-		return NewCachedStorage(backend, cfg.Cache), nil
+		// Wrap with logging, then cache
+		logged := NewLoggingStorage(backend)
+		return NewCachedStorage(logged, cfg.Cache), nil
 
 	default:
 		return nil, fmt.Errorf("unknown storage backend: %s", cfg.Backend)
