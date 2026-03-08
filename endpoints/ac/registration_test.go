@@ -270,72 +270,6 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 	}
 }
 
-// TestACRegistration_UpdateServerLastSeen tests the LastSeen update mechanism.
-func TestACRegistration_UpdateServerLastSeen(t *testing.T) {
-	ac := &UdpAC{
-		config: &Config{
-			ACId:           "test-ac-001",
-			ServerEndpoint: "server.nhp.test.internal",
-		},
-	}
-
-	reg := mustNewACRegistration(t, ac)
-
-	// Add some assigned servers manually
-	oldTime := time.Now().Add(-1 * time.Hour)
-	server1 := &AssignedServer{
-		Target: common.RedirectTarget{
-			IP:           "10.0.0.1",
-			Port:         DefaultServerPort,
-			PubKeyBase64: "pubkey1",
-		},
-	}
-	server1.LastSeen = oldTime
-	server1.FailCount = 3
-
-	server2 := &AssignedServer{
-		Target: common.RedirectTarget{
-			IP:           "10.0.0.2",
-			Port:         DefaultServerPort,
-			PubKeyBase64: "pubkey2",
-		},
-	}
-	server2.LastSeen = oldTime
-	server2.FailCount = 2
-
-	reg.assignedServers = []*AssignedServer{server1, server2}
-
-	// Test UpdateServerLastSeen by public key
-	reg.UpdateServerLastSeen("pubkey1")
-	newTime := server1.GetLastSeen()
-
-	if !newTime.After(oldTime) {
-		t.Error("LastSeen should be updated to a newer time")
-	}
-
-	server1.mu.RLock()
-	failCount := server1.FailCount
-	server1.mu.RUnlock()
-	if failCount != 0 {
-		t.Error("FailCount should be reset to 0")
-	}
-
-	// Test UpdateServerLastSeenByAddr
-	reg.UpdateServerLastSeenByAddr("10.0.0.2:62206")
-	newTime = server2.GetLastSeen()
-
-	if !newTime.After(oldTime) {
-		t.Error("LastSeen should be updated to a newer time")
-	}
-
-	server2.mu.RLock()
-	failCount = server2.FailCount
-	server2.mu.RUnlock()
-	if failCount != 0 {
-		t.Error("FailCount should be reset to 0")
-	}
-}
-
 // TestACRegistration_HasAssignedServers tests the HasAssignedServers method.
 func TestACRegistration_HasAssignedServers(t *testing.T) {
 	ac := &UdpAC{
@@ -390,7 +324,7 @@ func TestACRegistration_ConcurrentAccess(t *testing.T) {
 	// Run concurrent operations
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {
-		wg.Add(4)
+		wg.Add(2)
 
 		// Reader - registration level
 		go func() {
@@ -407,22 +341,6 @@ func TestACRegistration_ConcurrentAccess(t *testing.T) {
 			for j := 0; j < 100; j++ {
 				_ = server.GetLastSeen()
 				_ = server.IsConnected()
-			}
-		}()
-
-		// Writer - UpdateServerLastSeen
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 100; j++ {
-				reg.UpdateServerLastSeen("pubkey1")
-			}
-		}()
-
-		// Writer - UpdateServerLastSeenByAddr
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 100; j++ {
-				reg.UpdateServerLastSeenByAddr("10.0.0.1:62206")
 			}
 		}()
 	}
@@ -586,41 +504,6 @@ func TestACRegistration_GetAssignedServers(t *testing.T) {
 	servers = reg.GetAssignedServers()
 	if len(servers) != 2 {
 		t.Errorf("expected 2 servers, got %d", len(servers))
-	}
-}
-
-// TestACRegistration_UpdateServerLastSeen_NoMatch tests update with non-matching keys.
-func TestACRegistration_UpdateServerLastSeen_NoMatch(t *testing.T) {
-	ac := &UdpAC{
-		config: &Config{
-			ACId:           "test-ac-001",
-			ServerEndpoint: "server.nhp.test.internal",
-		},
-	}
-
-	reg := mustNewACRegistration(t, ac)
-
-	oldTime := time.Now().Add(-1 * time.Hour)
-	server := &AssignedServer{
-		Target: common.RedirectTarget{
-			IP:           "10.0.0.1",
-			Port:         DefaultServerPort,
-			PubKeyBase64: "actual-pubkey",
-		},
-	}
-	server.LastSeen = oldTime
-	reg.assignedServers = []*AssignedServer{server}
-
-	// Update with non-matching pubkey - should be no-op
-	reg.UpdateServerLastSeen("wrong-pubkey")
-	if !server.GetLastSeen().Equal(oldTime) {
-		t.Error("LastSeen should not change for non-matching pubkey")
-	}
-
-	// Update with non-matching address - should be no-op
-	reg.UpdateServerLastSeenByAddr("192.168.1.1:62206")
-	if !server.GetLastSeen().Equal(oldTime) {
-		t.Error("LastSeen should not change for non-matching address")
 	}
 }
 
@@ -910,17 +793,6 @@ func TestACRegistration_ConcurrentRedispatchAndHealthCheck(t *testing.T) {
 		for i := 0; i < iterations; i++ {
 			servers := reg.GetAssignedServers()
 			_ = len(servers) // Use the result
-			time.Sleep(time.Microsecond)
-		}
-	}()
-
-	// Goroutine 4: Repeatedly call UpdateServerLastSeen
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < iterations; i++ {
-			reg.UpdateServerLastSeen("pubkey1")
-			reg.UpdateServerLastSeenByAddr("10.0.0.1:62206")
 			time.Sleep(time.Microsecond)
 		}
 	}()
@@ -3468,12 +3340,9 @@ func TestACRegistration_ResetIptables(t *testing.T) {
 }
 
 // TestACRegistration_LastSeenUpdatePreventsReregistration tests that updating
-// LastSeen prevents false "server down" detection. This is a regression test
-// for the bug where NHP_KPL (unidirectional) responses were expected to update
-// LastSeen, causing constant re-registration every 30 seconds.
-//
-// The fix updates LastSeen when SENDING a keepalive, not when receiving a response.
-// This test verifies that pattern works correctly with the health check.
+// LastSeen via validated NHP_AOL refresh responses prevents false "server down"
+// detection. LastSeen is only updated when the server responds with a valid
+// NHP_AAK to a periodic NHP_AOL refresh — not on NHP_KPL send or raw packet receipt.
 func TestACRegistration_LastSeenUpdatePreventsReregistration(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
@@ -3484,7 +3353,8 @@ func TestACRegistration_LastSeenUpdatePreventsReregistration(t *testing.T) {
 
 	reg := mustNewACRegistration(t, ac)
 
-	// Create a connected server with recent LastSeen (simulating sendKeepalives behavior)
+	// Create a connected server with recent LastSeen (simulating a successful
+	// NHP_AOL refresh response via handleRefreshResponse)
 	server := &AssignedServer{
 		Target: common.RedirectTarget{
 			IP:           "10.0.0.1",
@@ -3493,7 +3363,7 @@ func TestACRegistration_LastSeenUpdatePreventsReregistration(t *testing.T) {
 		},
 	}
 	server.SetConnected(true)
-	server.UpdateLastSeen() // Simulates what sendKeepalives() now does
+	server.UpdateLastSeen() // Simulates handleRefreshResponse updating LastSeen on valid NHP_AAK
 
 	reg.assignedServers = []*AssignedServer{server}
 
@@ -3504,22 +3374,21 @@ func TestACRegistration_LastSeenUpdatePreventsReregistration(t *testing.T) {
 		t.Error("Health check should NOT trigger re-registration when LastSeen is recent")
 	}
 
-	// Simulate time passing but LastSeen being refreshed (like keepalive loop)
-	// Sleep a tiny bit to ensure time advances
+	// Simulate time passing but LastSeen being refreshed (like NHP_AOL refresh response)
 	time.Sleep(10 * time.Millisecond)
-	server.UpdateLastSeen() // Simulates another keepalive send
+	server.UpdateLastSeen() // Simulates another validated NHP_AAK response
 
 	reg.checkServerHealth()
 
 	if reg.reregistering.Load() {
-		t.Error("Health check should NOT trigger re-registration after LastSeen refresh")
+		t.Error("Health check should NOT trigger re-registration after validated LastSeen refresh")
 	}
 }
 
 // TestACRegistration_StaleLastSeenTriggersReregistration verifies that when
-// LastSeen is NOT updated (e.g., if keepalives fail to send), re-registration
-// is correctly triggered. This ensures the health check still works for
-// legitimate server failures.
+// LastSeen is NOT updated (e.g., if NHP_AOL refresh responses stop arriving),
+// re-registration is correctly triggered. This ensures the health check detects
+// server failures when the server stops responding to validated keepalives.
 func TestACRegistration_StaleLastSeenTriggersReregistration(t *testing.T) {
 	ac := &UdpAC{
 		config: &Config{
@@ -3591,10 +3460,11 @@ func TestACRegistration_SendKeepalives_SkipsInvalidServers(t *testing.T) {
 	noPeerLastSeen := serverNoPeer.GetLastSeen()
 	notConnectedLastSeen := serverNotConnected.GetLastSeen()
 
-	// sendKeepalives would normally update LastSeen, but these servers should be skipped
-	// We can verify this by checking the skip conditions in the code
+	// sendKeepalives sends NHP_KPL to keep the UDP path active but does NOT update
+	// LastSeen (only validated NHP_AOL responses do that). These servers should be
+	// skipped entirely since they have nil peer or are not connected.
 
-	// Server with nil peer should NOT have LastSeen updated
+	// Server with nil peer should NOT receive keepalives
 	if serverNoPeer.Peer != nil {
 		t.Error("Test setup error: serverNoPeer should have nil peer")
 	}
@@ -3841,19 +3711,19 @@ func TestACRegistration_TriggerReregistration_StopsOnShutdown(t *testing.T) {
 }
 
 // TestRegistrationRefreshInterval verifies the periodic refresh constant is set correctly.
-// The refresh interval determines how often NHP_AOL is re-sent to refresh server peer state,
-// handling server restarts where the server loses peer state but the AC continues
-// sending successful keep-alives.
+// The refresh interval determines how often NHP_AOL is re-sent to validate server liveness.
+// This is the primary health signal — NHP_KPL is unidirectional and cannot confirm receipt.
+// Only validated NHP_AAK responses to NHP_AOL update LastSeen.
 func TestRegistrationRefreshInterval(t *testing.T) {
-	// Verify refresh happens every 60 seconds (6 * 10s keepalive interval)
-	expectedTicks := 6
+	// Verify refresh happens every 30 seconds (3 * 10s keepalive interval)
+	expectedTicks := 3
 	if RegistrationRefreshInterval != expectedTicks {
 		t.Errorf("Expected RegistrationRefreshInterval to be %d, got %d", expectedTicks, RegistrationRefreshInterval)
 	}
 
-	// Verify the actual interval is 60 seconds
+	// Verify the actual interval is 30 seconds
 	actualInterval := time.Duration(RegistrationRefreshInterval) * KeepaliveInterval
-	expectedInterval := 60 * time.Second
+	expectedInterval := 30 * time.Second
 	if actualInterval != expectedInterval {
 		t.Errorf("Expected actual refresh interval to be %v, got %v", expectedInterval, actualInterval)
 	}
@@ -4127,4 +3997,148 @@ func TestHandleRefreshResponse_UnexpectedType(t *testing.T) {
 	if server.GetLastSeen() != oldLastSeen {
 		t.Error("Expected LastSeen to NOT be updated after unexpected response type")
 	}
+}
+
+// TestACRegistration_KeepaliveResponseValidation tests the full keepalive response
+// validation flow: NHP_KPL does NOT update LastSeen, only validated NHP_AAK responses
+// to NHP_AOL refresh requests update it. This prevents spoofed packets from masking
+// server failures (GitHub issue #124).
+func TestACRegistration_KeepaliveResponseValidation(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+
+	reg := mustNewACRegistration(t, ac)
+
+	server := &AssignedServer{
+		Target: common.RedirectTarget{
+			IP:   "10.0.1.100",
+			Port: DefaultServerPort,
+		},
+		Connected: true,
+		LastSeen:  time.Now().Add(-time.Minute), // Old LastSeen
+	}
+
+	sendAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.100"), Port: DefaultServerPort}
+
+	t.Run("valid NHP_AAK updates LastSeen", func(t *testing.T) {
+		oldLastSeen := server.GetLastSeen()
+
+		aakMsg := common.ServerACAckMsg{
+			ErrCode: common.ErrSuccess.ErrorCode(),
+		}
+		aakBytes, _ := json.Marshal(aakMsg)
+		ppd := &core.PacketParserData{
+			HeaderType:  core.NHP_AAK,
+			BodyMessage: aakBytes,
+		}
+
+		reg.handleRefreshResponse(ppd, server, sendAddr)
+
+		if !server.GetLastSeen().After(oldLastSeen) {
+			t.Error("Valid NHP_AAK should update LastSeen")
+		}
+	})
+
+	t.Run("rejected NHP_AAK does not update LastSeen", func(t *testing.T) {
+		// Reset LastSeen to old time
+		server.mu.Lock()
+		server.LastSeen = time.Now().Add(-time.Minute)
+		server.mu.Unlock()
+		oldLastSeen := server.GetLastSeen()
+
+		aakMsg := common.ServerACAckMsg{
+			ErrCode: "auth_failed",
+			ErrMsg:  "Authentication failed",
+		}
+		aakBytes, _ := json.Marshal(aakMsg)
+		ppd := &core.PacketParserData{
+			HeaderType:  core.NHP_AAK,
+			BodyMessage: aakBytes,
+		}
+
+		reg.handleRefreshResponse(ppd, server, sendAddr)
+
+		if server.GetLastSeen() != oldLastSeen {
+			t.Error("Rejected NHP_AAK should NOT update LastSeen")
+		}
+	})
+
+	t.Run("malformed NHP_AAK does not update LastSeen", func(t *testing.T) {
+		server.mu.Lock()
+		server.LastSeen = time.Now().Add(-time.Minute)
+		server.mu.Unlock()
+		oldLastSeen := server.GetLastSeen()
+
+		ppd := &core.PacketParserData{
+			HeaderType:  core.NHP_AAK,
+			BodyMessage: []byte("not json"),
+		}
+
+		reg.handleRefreshResponse(ppd, server, sendAddr)
+
+		if server.GetLastSeen() != oldLastSeen {
+			t.Error("Malformed NHP_AAK should NOT update LastSeen")
+		}
+	})
+
+	t.Run("error response does not update LastSeen", func(t *testing.T) {
+		server.mu.Lock()
+		server.LastSeen = time.Now().Add(-time.Minute)
+		server.mu.Unlock()
+		oldLastSeen := server.GetLastSeen()
+
+		ppd := &core.PacketParserData{
+			Error: fmt.Errorf("crypto validation failed"),
+		}
+
+		reg.handleRefreshResponse(ppd, server, sendAddr)
+
+		if server.GetLastSeen() != oldLastSeen {
+			t.Error("Error response should NOT update LastSeen")
+		}
+	})
+
+	t.Run("NHP_KPL response does not update LastSeen", func(t *testing.T) {
+		server.mu.Lock()
+		server.LastSeen = time.Now().Add(-time.Minute)
+		server.mu.Unlock()
+		oldLastSeen := server.GetLastSeen()
+
+		ppd := &core.PacketParserData{
+			HeaderType: core.NHP_KPL,
+		}
+
+		reg.handleRefreshResponse(ppd, server, sendAddr)
+
+		if server.GetLastSeen() != oldLastSeen {
+			t.Error("NHP_KPL response should NOT update LastSeen")
+		}
+	})
+
+	t.Run("stale server triggers reregistration", func(t *testing.T) {
+		// Server with LastSeen far in the past should trigger re-registration
+		staleServer := &AssignedServer{
+			Target: common.RedirectTarget{
+				IP:   "10.0.1.200",
+				Port: DefaultServerPort,
+			},
+			Connected: true,
+		}
+		staleServer.mu.Lock()
+		staleServer.LastSeen = time.Now().Add(-(KeepaliveInterval*KeepaliveMaxRetries + time.Hour))
+		staleServer.mu.Unlock()
+
+		reg2 := mustNewACRegistration(t, ac)
+		reg2.assignedServers = []*AssignedServer{staleServer}
+
+		reg2.checkServerHealth()
+
+		if !reg2.reregistering.Load() {
+			t.Error("Stale server should trigger re-registration")
+		}
+	})
 }

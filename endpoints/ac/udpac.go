@@ -415,13 +415,11 @@ func (a *UdpAC) recvPacketRoutine(conn *UdpConn) {
 
 		atomic.StoreInt64(&conn.ConnData.LastLocalRecvTime, time.Now().UnixNano())
 
-		// Address-based LastSeen update (fallback for direct connections without NAT).
-		// Note: For NAT scenarios, this may fail silently because the server's private IP
-		// (in ServerAddr) differs from the public NAT IP. The reliable update path is
-		// pubkey-based in recvMessageRoutine after crypto validation.
-		if a.registration != nil {
-			a.registration.UpdateServerLastSeenByAddr(actualSource)
-		}
+		// Do NOT update LastSeen on raw packet receipt. Updating on any received packet
+		// allows spoofed traffic to mask server failures. LastSeen is only updated when
+		// the AC receives a validated NHP_AAK response to a periodic NHP_AOL refresh
+		// (see handleRefreshResponse in registration.go). This ensures cryptographic
+		// proof that the server is alive and responding correctly.
 
 		conn.ConnData.ForwardInboundPacket(pkt)
 	}
@@ -536,13 +534,11 @@ func (a *UdpAC) recvMessageRoutine() {
 				continue
 			}
 
-			// Update LastSeen using the server's public key after crypto validation.
-			// This is more reliable than address matching for NAT scenarios where the
-			// server's private IP (in ServerAddr) differs from its public NAT IP.
-			if a.registration != nil && len(ppd.RemotePubKey) > 0 {
-				pubKeyBase64 := base64.StdEncoding.EncodeToString(ppd.RemotePubKey)
-				a.registration.UpdateServerLastSeen(pubKeyBase64)
-			}
+			// Do NOT update LastSeen on every received message. While the pubkey is
+			// cryptographically validated, blindly updating on any message type allows
+			// unrelated server traffic (e.g., NHP_AOP) to mask keepalive failures.
+			// LastSeen is only updated via validated NHP_AAK responses to periodic
+			// NHP_AOL refresh requests (see handleRefreshResponse in registration.go).
 
 			switch ppd.HeaderType {
 			case core.NHP_AOP:

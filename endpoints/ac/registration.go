@@ -64,10 +64,11 @@ const (
 	MaxReregistrationAttempts = 5
 
 	// RegistrationRefreshInterval is how often to re-send NHP_AOL to assigned servers
-	// to refresh server peer state. This handles server restarts where the server loses
-	// peer state but the AC continues sending keep-alives.
-	// Set to 6 * KeepaliveInterval = 60 seconds.
-	RegistrationRefreshInterval = 6
+	// to refresh server peer state and validate server health. This is the primary
+	// mechanism for confirming server liveness — NHP_KPL is unidirectional and cannot
+	// confirm receipt. Only validated NHP_AOL responses update LastSeen.
+	// Set to 3 * KeepaliveInterval = 30 seconds.
+	RegistrationRefreshInterval = 3
 
 	// MaxServerDownReregBackoff caps circuit-breaker backoff when server-down
 	// re-registration keeps failing.
@@ -331,41 +332,6 @@ func (r *ACRegistration) HasAssignedServers() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.assignedServers) > 0
-}
-
-// UpdateServerLastSeen updates the LastSeen time for a server based on its public key.
-// This should be called when any message is received from a server (NHP_AOP, NHP_AAK, etc.).
-func (r *ACRegistration) UpdateServerLastSeen(pubKeyBase64 string) {
-	r.mu.RLock()
-	servers := slices.Clone(r.assignedServers)
-	r.mu.RUnlock()
-
-	for _, server := range servers {
-		if server.Target.PubKeyBase64 == pubKeyBase64 {
-			server.UpdateLastSeen()
-			log.Debug("Updated LastSeen for server %s", server.Target.IP)
-			return
-		}
-	}
-}
-
-// UpdateServerLastSeenByAddr updates the LastSeen time for a server based on its address.
-// This is useful when we receive a message but don't have the public key readily available.
-func (r *ACRegistration) UpdateServerLastSeenByAddr(addr string) {
-	r.mu.RLock()
-	servers := slices.Clone(r.assignedServers)
-	r.mu.RUnlock()
-
-	for _, server := range servers {
-		serverAddr := net.JoinHostPort(server.Target.IP, strconv.Itoa(server.Target.Port))
-		if serverAddr == addr {
-			server.UpdateLastSeen()
-			log.Debug("Updated LastSeen for server at %s", addr)
-			return
-		}
-	}
-	// No matching server found - expected during NLB registration before server assignment
-	log.Debug("No assigned server matches address %s (have %d servers)", addr, len(servers))
 }
 
 // registrationLoop attempts registration and maintains connections.
@@ -975,7 +941,9 @@ func (r *ACRegistration) keepaliveLoop() {
 	}
 }
 
-// sendKeepalives sends keepalive to each assigned server.
+// sendKeepalives sends NHP_KPL to each assigned server to keep the UDP path active.
+// NHP_KPL is unidirectional (fire-and-forget) — it does NOT update LastSeen.
+// Server health is validated via periodic NHP_AOL refreshes (see refreshAssignedServerRegistrations).
 func (r *ACRegistration) sendKeepalives() {
 	r.mu.RLock()
 	servers := slices.Clone(r.assignedServers)
@@ -1008,12 +976,11 @@ func (r *ACRegistration) sendKeepalives() {
 
 		if r.ac.IsRunning() {
 			r.ac.sendMsgCh <- md
-			// Update LastSeen when we send a keepalive, not when receiving a response.
-			// NHP_KPL is unidirectional - the server receives but doesn't respond.
-			// This keeps the connection "alive" from the AC's perspective as long as
-			// we can queue sends. If the server is truly unreachable, registration
-			// will fail when we eventually try to re-register.
-			server.UpdateLastSeen()
+			// NHP_KPL is unidirectional — the server receives but doesn't respond.
+			// Do NOT update LastSeen here: we have no confirmation the server received
+			// the keepalive. LastSeen is only updated when we receive a validated
+			// NHP_AAK response to a periodic NHP_AOL refresh (see handleRefreshResponse).
+			// This prevents spoofed or unrelated packets from masking server failures.
 			log.Debug("Sent NHP_KPL to assigned server %s:%d", server.Target.IP, server.Target.Port)
 		}
 	}
@@ -1123,7 +1090,7 @@ func (r *ACRegistration) handleRefreshResponse(ppd *core.PacketParserData, serve
 			server.UpdateLastSeen()
 			log.Debug("Refreshed registration with server %s", sendAddr.String())
 		} else {
-			log.Warning("Refresh rejected by %s: %s - %s", sendAddr.String(), aakMsg.ErrCode, aakMsg.ErrMsg)
+			log.Warning("Refresh rejected by server %s at %s: %s - %s", server.Target.IP, sendAddr.String(), aakMsg.ErrCode, aakMsg.ErrMsg)
 		}
 
 	case core.NHP_ARD:
