@@ -83,6 +83,15 @@ func NormalizeIPSetEntry(ipType IPTYPE, entry string) string {
 	return strings.Join(parts, ",")
 }
 
+// ICMPEchoType returns the ipset ICMP echo-request type string for the given IP version.
+// ICMPv4 Echo Request = type 8, ICMPv6 Echo Request = type 128.
+func ICMPEchoType(ipType IPTYPE) string {
+	if ipType == IPV6 {
+		return "icmpv6:128/0"
+	}
+	return "icmp:8/0"
+}
+
 // GetCIDRMask returns the appropriate CIDR mask suffix for a given IP type and access mode.
 // If rangeMode is true, returns the range mask (128 addresses); otherwise returns single-host mask.
 func GetCIDRMask(ipType IPTYPE, rangeMode bool) string {
