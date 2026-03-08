@@ -56,6 +56,10 @@ const (
 	// OldServerKeepDuration is how long to keep old connections during reassignment.
 	OldServerKeepDuration = 2 * time.Minute
 
+	// cleanupChBufferSize is the buffer capacity for the cleanup worker channel.
+	// Accommodates bursts of rapid reassignments without blocking HandleRedispatch.
+	cleanupChBufferSize = 10
+
 	// MaxReregistrationAttempts is the max attempts for re-registration after server failure.
 	MaxReregistrationAttempts = 5
 
@@ -180,6 +184,11 @@ type ACRegistration struct {
 	// or re-registers to a different server.
 	registrationPeer *core.UdpPeer
 
+	// cleanupCh feeds old-server cleanup keys to a single worker goroutine,
+	// replacing the previous pattern of spawning an unbounded goroutine per
+	// HandleRedispatch call. See cleanupChBufferSize.
+	cleanupCh chan string
+
 	// CloudWatch metrics publisher (batched, shared package)
 	metrics *metrics.Publisher
 
@@ -232,6 +241,7 @@ func NewACRegistration(ac *UdpAC) (*ACRegistration, error) {
 		assignedServers: make([]*AssignedServer, 0),
 		oldServerSets:   make(map[string][]*AssignedServer),
 		stopCh:          make(chan struct{}),
+		cleanupCh:       make(chan string, cleanupChBufferSize),
 		cachedAOLBytes:  aolBytes,
 		cachedACIdDim:   types.Dimension{Name: dimNameACId, Value: aws.String(ac.config.ACId)},
 		metrics: metrics.NewPublisher(metrics.Config{
@@ -256,9 +266,10 @@ func (r *ACRegistration) Start() error {
 
 	log.Info("Starting AC registration with endpoint %s", r.ac.config.ServerEndpoint)
 
-	// Add to wait group BEFORE starting goroutine to prevent race with Stop()
-	r.wg.Add(1)
+	// Add to wait group BEFORE starting goroutines to prevent race with Stop()
+	r.wg.Add(2)
 	go r.registrationLoop()
+	go r.cleanupWorker()
 
 	return nil
 }
@@ -822,9 +833,15 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 		log.Info("Successfully connected to all %d assigned servers", successCount)
 	}
 
-	// Schedule old server cleanup (only if we had old servers to clean up)
+	// Schedule old server cleanup (only if we had old servers to clean up).
+	// Send to the cleanup worker channel instead of spawning a goroutine.
 	if hasOldServers {
-		go r.cleanupOldServers(cleanupKey)
+		select {
+		case r.cleanupCh <- cleanupKey:
+			log.Debug("Queued old server cleanup key %s", cleanupKey)
+		default:
+			log.Warning("Cleanup channel full, dropping cleanup key %s; old servers will be cleaned up on shutdown", cleanupKey)
+		}
 	}
 
 	// Send server connections metric
@@ -1336,12 +1353,38 @@ func (r *ACRegistration) TriggerReregistration(reason string) {
 	}()
 }
 
-// cleanupOldServers removes old server connections after grace period.
-// Each cleanup goroutine receives a unique key to identify which set of servers
-// to clean up, preventing race conditions with overlapping reassignments.
-func (r *ACRegistration) cleanupOldServers(cleanupKey string) {
-	time.Sleep(OldServerKeepDuration)
+// cleanupWorker is a single long-lived goroutine that processes old-server
+// cleanup requests from cleanupCh. It replaces the previous pattern of
+// spawning an unbounded goroutine per HandleRedispatch call, which could
+// accumulate many sleeping goroutines during rapid reassignments.
+func (r *ACRegistration) cleanupWorker() {
+	defer r.wg.Done()
+	for {
+		select {
+		case cleanupKey, ok := <-r.cleanupCh:
+			if !ok {
+				return
+			}
+			// Wait the grace period before cleaning up, but exit early on stop.
+			// Use time.NewTimer instead of time.After to avoid leaking the timer
+			// goroutine when stopCh fires before the grace period elapses.
+			timer := time.NewTimer(OldServerKeepDuration)
+			select {
+			case <-timer.C:
+				r.cleanupOldServers(cleanupKey)
+			case <-r.stopCh:
+				timer.Stop()
+				return
+			}
+		case <-r.stopCh:
+			return
+		}
+	}
+}
 
+// cleanupOldServers removes old server connections for the given cleanup key.
+// Called by the cleanupWorker after the grace period has elapsed.
+func (r *ACRegistration) cleanupOldServers(cleanupKey string) {
 	r.mu.Lock()
 	oldServers := r.oldServerSets[cleanupKey]
 	delete(r.oldServerSets, cleanupKey)
