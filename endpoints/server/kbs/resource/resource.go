@@ -24,6 +24,7 @@ import (
 
 	"github.com/OpenNHP/opennhp/endpoints/server/kbs/attest"
 	kbsError "github.com/OpenNHP/opennhp/endpoints/server/kbs/error"
+	"github.com/OpenNHP/opennhp/nhp/utils"
 )
 
 var (
@@ -185,7 +186,7 @@ func loadResource(resourceID string) ([]byte, error) {
 	}
 
 	// Check if the path is within the base directory to avoid path traversal attack.
-	if !strings.HasPrefix(absFullPath, absBaseDir+string(os.PathSeparator)) {
+	if !utils.IsPathWithinDir(absFullPath, absBaseDir) {
 		return nil, errors.New("invalid resource ID: potential path traversal attack")
 	}
 

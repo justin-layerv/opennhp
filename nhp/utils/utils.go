@@ -106,6 +106,19 @@ func GenerateTempFilePath(pattern string) (string, error) {
 	return tempPath, nil
 }
 
+// IsValidPathComponent checks that a sanitized path component (from filepath.Base)
+// is not empty or a special directory entry. Use after filepath.Base to validate
+// user-supplied filenames and path segments.
+func IsValidPathComponent(s string) bool {
+	return s != "" && s != "." && s != ".."
+}
+
+// IsPathWithinDir checks that absPath is a child of dirAbs (both must be absolute).
+// Use to prevent path traversal attacks after resolving paths with filepath.Abs.
+func IsPathWithinDir(absPath, dirAbs string) bool {
+	return strings.HasPrefix(absPath, dirAbs+string(os.PathSeparator))
+}
+
 func SaveStructAsJsonFile(filePath string, data any) error {
 	if data == nil {
 		return errors.New("data cannot be nil")

@@ -1156,15 +1156,7 @@ func SaveZdtoConfig(drgMsg *common.DRGMsg) error {
 		return fmt.Errorf("%v already exists, please delete it first", configFileName)
 	}
 
-	file, err := os.Create(configPath)
-	if err != nil {
-		return fmt.Errorf("failed to create config.json: %w", err)
-	}
-	defer func() { _ = file.Close() }()
-
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(drgMsg)
+	return utils.SaveStructAsJsonFile(configPath, drgMsg)
 }
 
 // read data-<doId>.json to DRGMsg Object
