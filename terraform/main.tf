@@ -767,6 +767,9 @@ module "ac" {
   ac_min_capacity = var.ac_min_capacity
   ac_max_capacity = var.ac_max_capacity
 
+  # Egress EIPs for stable public IPs (customer origin firewall whitelisting)
+  enable_egress_eips = var.enable_egress_eips
+
   # Blue/Green deployment configuration
   enable_blue_green      = var.enable_ac_blue_green
   green_standby_min_size = var.ac_green_standby_min_size

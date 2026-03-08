@@ -172,6 +172,9 @@ locals {
   account_id = data.aws_caller_identity.current.account_id
   region     = data.aws_region.current.id
 
+  resolved_max_capacity = coalesce(var.ac_max_capacity, local.is_prod ? 6 : 3)
+  eip_pool_tag          = "${var.name_prefix}-ac"
+
   # Validate that console_domain and console_backend_url are either both set or both null.
   # A mismatch would cause Traefik to create a router without a matching service (502 error).
   # This validation fails fast at plan time rather than silently misconfiguring Traefik.
@@ -620,6 +623,20 @@ resource "aws_iam_role_policy" "ac" {
           Resource = [var.centralized_cert_secret_arn]
         }
       ] : [],
+      # Conditional: EIP association for stable egress IPs (only when enabled)
+      # Note: ec2:DescribeAddresses and ec2:AssociateAddress do not support
+      # resource-level permissions — Resource: "*" is required by AWS.
+      var.enable_egress_eips ? [
+        {
+          Sid    = "EIPAssociation"
+          Effect = "Allow"
+          Action = [
+            "ec2:DescribeAddresses",
+            "ec2:AssociateAddress"
+          ]
+          Resource = "*"
+        }
+      ] : [],
       # Conditional: KMS for Secrets Manager (only when KMS key is configured)
       var.secrets_kms_key_arn != null ? [
         {
@@ -761,6 +778,9 @@ locals {
     acme_lambda_function_name   = var.acme_lambda_function_name
     # Custom domain cert sync script (embedded in user_data so it's available on boot)
     custom_domain_cert_sync_script = file("${path.module}/scripts/custom-domain-cert-sync.sh")
+    # Egress EIP configuration
+    enable_egress_eips = var.enable_egress_eips
+    eip_pool_tag       = local.eip_pool_tag
   }) : null # Validation failed - this branch never executes (tobool throws first)
 }
 
@@ -834,7 +854,7 @@ resource "aws_autoscaling_group" "ac" {
   name                = "${var.name_prefix}-ac"
   vpc_zone_identifier = var.public_subnet_ids
   min_size            = coalesce(var.ac_min_capacity, local.is_prod ? 2 : 1)
-  max_size            = coalesce(var.ac_max_capacity, local.is_prod ? 6 : 3)
+  max_size            = local.resolved_max_capacity
   desired_capacity    = coalesce(var.ac_min_capacity, local.is_prod ? 2 : 1)
 
   launch_template {

@@ -323,6 +323,17 @@ variable "ac_max_capacity" {
 }
 
 # ============================================================================
+# Egress EIP Configuration
+# Stable public IPs for customer origin firewall whitelisting
+# ============================================================================
+
+variable "enable_egress_eips" {
+  description = "Allocate Elastic IPs for AC instances to provide stable public IPs for customer origin firewall whitelisting. Creates N EIPs where N = max_capacity (or 2x max_capacity if blue/green is enabled). Requires AWS EIP quota >= N."
+  type        = bool
+  default     = false
+}
+
+# ============================================================================
 # Deployment Configuration
 # ============================================================================
 

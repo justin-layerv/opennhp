@@ -82,6 +82,20 @@ output "ssm_asg_name_parameter" {
 }
 
 # =============================================================================
+# Egress EIP Outputs
+# =============================================================================
+
+output "egress_eip_addresses" {
+  description = "Stable public IPs for customer origin firewall whitelisting"
+  value       = var.enable_egress_eips ? aws_eip.ac[*].public_ip : []
+}
+
+output "egress_eip_allocation_ids" {
+  description = "EIP allocation IDs for AC instances"
+  value       = var.enable_egress_eips ? aws_eip.ac[*].id : []
+}
+
+# =============================================================================
 # Blue/Green Deployment Outputs
 # =============================================================================
 

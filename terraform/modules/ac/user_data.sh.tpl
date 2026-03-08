@@ -170,6 +170,53 @@ LOCAL_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/
 PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)
 AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
 
+%{ if enable_egress_eips ~}
+# ============================================================================
+# Elastic IP Association
+# Claim an unassociated EIP from the pool for stable egress IP.
+# Customers whitelist these IPs on their origin firewalls.
+# ============================================================================
+echo "Attempting to claim an Elastic IP from pool ${eip_pool_tag}..."
+EIP_CLAIMED=false
+for attempt in 1 2 3 4 5; do
+  ALLOC_ID=$(aws ec2 describe-addresses \
+    --filters "Name=tag:EIPPool,Values=${eip_pool_tag}" \
+    --query 'Addresses[?AssociationId==`null`].AllocationId | [0]' \
+    --output text --region "$REGION")
+
+  if [ "$ALLOC_ID" = "None" ] || [ -z "$ALLOC_ID" ]; then
+    echo "WARNING: No available EIPs in pool (attempt $attempt/5)"
+    sleep $(( RANDOM % 3 + attempt * 2 ))
+    continue
+  fi
+
+  if aws ec2 associate-address \
+    --allocation-id "$ALLOC_ID" \
+    --instance-id "$INSTANCE_ID" \
+    --region "$REGION"; then
+    echo "Successfully claimed EIP allocation $ALLOC_ID"
+    sleep 2
+    PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+      http://169.254.169.254/latest/meta-data/public-ipv4)
+    echo "EIP associated. New public IP: $PUBLIC_IP"
+    EIP_CLAIMED=true
+    break
+  else
+    echo "EIP $ALLOC_ID was claimed by another instance (attempt $attempt/5), retrying..."
+    sleep $(( RANDOM % 3 + attempt * 2 ))
+  fi
+done
+
+if [ "$EIP_CLAIMED" = "false" ]; then
+  echo "FATAL: Could not claim an EIP after 5 attempts. Instance cannot serve traffic without a stable IP."
+  echo "Check that enough EIPs are allocated (ac_max_capacity) and AWS EIP quota is sufficient."
+  # Cooldown before exit to prevent ASG from rapidly cycling replacement instances
+  # when EIP pool is genuinely exhausted (e.g., all allocated EIPs are in use).
+  sleep 120
+  exit 1
+fi
+%{ endif ~}
+
 # Create directories
 mkdir -p /opt/layerv/nhp-ac/etc
 mkdir -p /opt/layerv/nhp-ac/log

@@ -26,6 +26,7 @@ ac_auth_service_id = "layerv"
 ac_resource_ids    = ["qurl"] # Phase 2: QURL is the only service deployed initially
 ac_min_capacity    = 3
 ac_max_capacity    = 10
+enable_egress_eips = true
 
 # Terraform state bucket for GitHub Actions permissions
 terraform_state_bucket = "layerv-terraform-state-235500187906"

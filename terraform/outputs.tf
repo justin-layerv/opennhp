@@ -59,6 +59,11 @@ output "ac_asg_name" {
   value       = var.deploy_ac ? module.ac[0].asg_name : null
 }
 
+output "ac_egress_eip_addresses" {
+  description = "Stable AC public IPs for customer origin firewall whitelisting"
+  value       = var.deploy_ac ? module.ac[0].egress_eip_addresses : []
+}
+
 # Plugin bucket (unified for all plugins)
 output "plugin_bucket_name" {
   description = "S3 bucket name for plugins (NHP Server and Traefik)"

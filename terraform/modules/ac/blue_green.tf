@@ -224,7 +224,7 @@ resource "aws_autoscaling_group" "ac_green" {
   name                = "${var.name_prefix}-ac-green"
   vpc_zone_identifier = var.public_subnet_ids
   min_size            = var.green_standby_min_size
-  max_size            = local.is_prod ? 6 : 3
+  max_size            = local.resolved_max_capacity
   desired_capacity    = var.green_standby_min_size
 
   # Uses same launch template as blue ASG
