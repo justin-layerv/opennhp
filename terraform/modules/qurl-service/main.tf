@@ -363,7 +363,6 @@ resource "aws_iam_role_policy" "task_dynamodb" {
           "dynamodb:Scan",
           "dynamodb:BatchGetItem",
           "dynamodb:BatchWriteItem",
-          "dynamodb:DescribeTable", # Health check requires this
         ]
         Resource = concat(
           var.dynamodb_table_arns,
@@ -378,7 +377,6 @@ resource "aws_iam_role_policy" "task_dynamodb" {
         Action = [
           "dynamodb:GetItem",
           "dynamodb:Query",
-          "dynamodb:DescribeTable", # Health check requires this
         ]
         Resource = [
           var.licenses_table_arn,

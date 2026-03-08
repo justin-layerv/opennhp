@@ -100,8 +100,11 @@ func (d *DynamoDBStorage) Close() error {
 	return nil
 }
 
-// Ping checks DynamoDB connectivity by describing one of the configured tables.
-// This is used for health checks in cloud mode deployments.
+// Ping checks DynamoDB connectivity using a lightweight GetItem call.
+// This uses a well-known non-existent key to verify the table is reachable
+// without requiring dynamodb:DescribeTable permission. GetItem on a
+// non-existent key returns an empty result (not an error), which confirms
+// connectivity and table access with only dynamodb:GetItem permission.
 func (d *DynamoDBStorage) Ping(ctx context.Context) error {
 	if d.client == nil {
 		return errors.New("dynamodb client not initialized")
@@ -119,8 +122,16 @@ func (d *DynamoDBStorage) Ping(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, DynamoDBOperationTimeout)
 	defer cancel()
 
-	_, err := d.client.DescribeTable(ctx, &dynamodb.DescribeTableInput{
+	// Use GetItem with a sentinel key that will never exist.
+	// A successful call (even with no item found) confirms DynamoDB connectivity.
+	// This only requires dynamodb:GetItem, which is already in the IAM policy.
+	_, err := d.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: aws.String(tableName),
+		Key: map[string]types.AttributeValue{
+			"ac_id": &types.AttributeValueMemberS{Value: "__healthcheck__"},
+		},
+		// Use consistent read for a true connectivity check
+		ConsistentRead: aws.Bool(true),
 	})
 	return err
 }

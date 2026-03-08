@@ -1,8 +1,12 @@
 package server
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -686,5 +690,256 @@ func TestMaxACConnsPerID(t *testing.T) {
 	lastConn := s.acConnectionMap[acId][maxConns-1]
 	if !lastConn.ConnData.RemoteAddr.IP.Equal(net.ParseIP("10.0.1.1")) {
 		t.Errorf("Expected newest connection (10.0.1.1) as last entry, got %s", lastConn.ConnData.RemoteAddr.IP)
+	}
+}
+
+// mockACResponder reads from sendMsgCh and sends mock AC responses.
+// delay controls how long before responding; if nil error, sends a success ART response.
+func mockACResponder(sendMsgCh <-chan *core.MsgData, delay time.Duration, respErr error) {
+	go func() {
+		for md := range sendMsgCh {
+			go func(md *core.MsgData) {
+				time.Sleep(delay)
+				ppd := &core.PacketParserData{
+					HeaderType: core.NHP_ART,
+					Error:      respErr,
+				}
+				if respErr == nil {
+					artMsg := &common.ACOpsResultMsg{
+						ErrCode: common.ErrSuccess.ErrorCode(),
+					}
+					ppd.BodyMessage, _ = json.Marshal(artMsg)
+				}
+				md.ResponseMsgCh <- ppd
+			}(md)
+		}
+	}()
+}
+
+// newTestServerForBroadcast creates a minimal UdpServer suitable for
+// processACOperation and processACOperationBroadcast tests.
+func newTestServerForBroadcast(t *testing.T) (*UdpServer, chan *core.MsgData) {
+	t.Helper()
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	t.Cleanup(func() { device.Stop() })
+
+	sendCh := make(chan *core.MsgData, core.SendQueueSize)
+
+	s := &UdpServer{
+		device:                 device,
+		sendMsgCh:              sendCh,
+		acPeerMap:              make(map[string]*core.UdpPeer),
+		acConnectionMap:        make(map[string][]*ACConn),
+		remoteConnectionMap:    make(map[string]*UdpConn),
+		srcIpAssociatedAddrMap: make(map[string][]*common.NetAddress),
+	}
+	s.running.Store(true)
+
+	return s, sendCh
+}
+
+// newTestACConn creates a mock ACConn with a valid peer for testing.
+// device is optional; if provided, ConnectionData.Close() won't panic on flush.
+func newTestACConn(t *testing.T, ip string, port int, acId string, device ...*core.Device) *ACConn {
+	t.Helper()
+	addr := &net.UDPAddr{IP: net.ParseIP(ip), Port: port}
+	peer := &core.UdpPeer{
+		Ip:           ip,
+		Port:         port,
+		PubKeyBase64: "dGVzdHB1YmtleQ==", // "testpubkey" - not a valid curve point but valid base64
+		ExpireTime:   common.FarFutureExpiry,
+	}
+	peer.Type = core.NHP_AC
+	peer.UpdateRecv(time.Now().UnixNano(), addr)
+
+	// Initialize all channels that ConnectionData.Close() needs to avoid nil-channel panics
+	connData := &core.ConnectionData{
+		RemoteAddr:       addr,
+		StopSignal:       make(chan struct{}),
+		SendQueue:        make(chan *core.Packet, 1),
+		RecvQueue:        make(chan *core.Packet, 1),
+		BlockSignal:      make(chan struct{}, 1),
+		SetTimeoutSignal: make(chan struct{}, 1),
+	}
+	if len(device) > 0 && device[0] != nil {
+		connData.Device = device[0]
+	}
+
+	return &ACConn{
+		ConnData: connData,
+		ACPeer:   peer,
+		ACId:     acId,
+	}
+}
+
+// TestBroadcastCancellation_FirstSuccessCancelsRemaining verifies that when
+// the first AC responds successfully, the remaining goroutines are canceled
+// via context cancellation and don't block indefinitely.
+func TestBroadcastCancellation_FirstSuccessCancelsRemaining(t *testing.T) {
+	s, sendCh := newTestServerForBroadcast(t)
+
+	// Track how many AOP messages are sent (one per goroutine)
+	var aopCount atomic.Int32
+
+	// Respond to AOP messages: first one fast, rest slow
+	go func() {
+		for md := range sendCh {
+			go func(md *core.MsgData) {
+				n := aopCount.Add(1)
+				if n == 1 {
+					// First AC responds immediately with success
+					artMsg := &common.ACOpsResultMsg{ErrCode: common.ErrSuccess.ErrorCode()}
+					body, _ := json.Marshal(artMsg)
+					md.ResponseMsgCh <- &core.PacketParserData{
+						HeaderType:  core.NHP_ART,
+						BodyMessage: body,
+					}
+				} else {
+					// Other ACs: wait for context cancellation or respond late
+					// The drain goroutine in processACOperation will handle this
+					select {
+					case <-time.After(5 * time.Second):
+						md.ResponseMsgCh <- &core.PacketParserData{
+							HeaderType:  core.NHP_ART,
+							BodyMessage: []byte(`{}`),
+						}
+					}
+				}
+			}(md)
+		}
+	}()
+
+	conns := []*ACConn{
+		newTestACConn(t, "10.0.0.1", 47051, "test-ac"),
+		newTestACConn(t, "10.0.0.2", 47051, "test-ac"),
+		newTestACConn(t, "10.0.0.3", 47051, "test-ac"),
+	}
+
+	knkMsg := &common.AgentKnockMsg{UserId: "test-user"}
+	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
+	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
+
+	// Should return quickly (not wait for all 3)
+	start := time.Now()
+	artMsg, err := s.processACOperationBroadcast(knkMsg, conns, srcAddr, dstAddrs, 60)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Expected success, got error: %v", err)
+	}
+	if artMsg == nil {
+		t.Fatal("Expected non-nil artMsg")
+	}
+	if artMsg.ErrCode != common.ErrSuccess.ErrorCode() {
+		t.Errorf("Expected success error code, got %s", artMsg.ErrCode)
+	}
+
+	// Should complete well under 5 seconds (the slow responder delay)
+	if elapsed > 2*time.Second {
+		t.Errorf("Broadcast took %v, expected < 2s (cancellation not working)", elapsed)
+	}
+
+	// All 3 goroutines should have been started
+	if aopCount.Load() < 3 {
+		t.Logf("Note: only %d of 3 AOP messages sent (goroutine scheduling)", aopCount.Load())
+	}
+}
+
+// TestBroadcastCancellation_AllFail verifies that when all ACs fail,
+// the broadcast returns the last error.
+func TestBroadcastCancellation_AllFail(t *testing.T) {
+	s, sendCh := newTestServerForBroadcast(t)
+
+	// All ACs respond with errors (use generic error, not timeout,
+	// to avoid triggering conn.Close() which needs a fully initialized Device)
+	go func() {
+		for md := range sendCh {
+			go func(md *core.MsgData) {
+				md.ResponseMsgCh <- &core.PacketParserData{
+					HeaderType: core.NHP_ART,
+					Error:      common.ErrServerACOpsFailed,
+				}
+			}(md)
+		}
+	}()
+
+	conns := []*ACConn{
+		newTestACConn(t, "10.0.0.1", 47051, "test-ac"),
+		newTestACConn(t, "10.0.0.2", 47051, "test-ac"),
+	}
+
+	knkMsg := &common.AgentKnockMsg{UserId: "test-user"}
+	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
+	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
+
+	_, err := s.processACOperationBroadcast(knkMsg, conns, srcAddr, dstAddrs, 60)
+
+	if err == nil {
+		t.Fatal("Expected error when all ACs fail")
+	}
+}
+
+// TestBroadcastCancellation_SingleConn verifies the single-connection
+// optimization (no broadcast overhead).
+func TestBroadcastCancellation_SingleConn(t *testing.T) {
+	s, sendCh := newTestServerForBroadcast(t)
+	mockACResponder(sendCh, 0, nil)
+
+	conns := []*ACConn{
+		newTestACConn(t, "10.0.0.1", 47051, "test-ac"),
+	}
+
+	knkMsg := &common.AgentKnockMsg{UserId: "test-user"}
+	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
+	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
+
+	artMsg, err := s.processACOperationBroadcast(knkMsg, conns, srcAddr, dstAddrs, 60)
+
+	if err != nil {
+		t.Fatalf("Expected success for single conn, got: %v", err)
+	}
+	if artMsg == nil {
+		t.Fatal("Expected non-nil artMsg")
+	}
+}
+
+// TestProcessACOperation_ContextAlreadyCanceled verifies that
+// processACOperation returns immediately when the context is already canceled.
+func TestProcessACOperation_ContextAlreadyCanceled(t *testing.T) {
+	s, sendCh := newTestServerForBroadcast(t)
+
+	// Slow responder — should not matter since context is already canceled
+	go func() {
+		for md := range sendCh {
+			go func(md *core.MsgData) {
+				time.Sleep(10 * time.Second)
+				md.ResponseMsgCh <- &core.PacketParserData{
+					HeaderType: core.NHP_ART,
+				}
+			}(md)
+		}
+	}()
+
+	conn := newTestACConn(t, "10.0.0.1", 47051, "test-ac")
+	knkMsg := &common.AgentKnockMsg{UserId: "test-user"}
+	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
+	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	start := time.Now()
+	_, err := s.processACOperation(ctx, knkMsg, conn, srcAddr, dstAddrs, 60)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Expected context.Canceled, got: %v", err)
+	}
+
+	if elapsed > 1*time.Second {
+		t.Errorf("Should have returned immediately, took %v", elapsed)
 	}
 }

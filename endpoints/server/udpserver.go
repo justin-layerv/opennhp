@@ -1330,7 +1330,7 @@ func (s *UdpServer) FindAuthSvcProvider(aspId string) *common.AuthServiceProvide
 	return nil
 }
 
-func (s *UdpServer) processACOperation(knkMsg *common.AgentKnockMsg, conn *ACConn, srcAddr *common.NetAddress, dstAddrs []*common.NetAddress, openTime uint32) (artMsg *common.ACOpsResultMsg, err error) {
+func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.AgentKnockMsg, conn *ACConn, srcAddr *common.NetAddress, dstAddrs []*common.NetAddress, openTime uint32) (artMsg *common.ACOpsResultMsg, err error) {
 	// should not happen
 	if knkMsg == nil || conn == nil {
 		log.Critical("processACOperation with nil input argument")
@@ -1406,9 +1406,27 @@ func (s *UdpServer) processACOperation(knkMsg *common.AgentKnockMsg, conn *ACCon
 	s.sendMsgCh <- aopMd
 
 	// wait for ac sending back operation result
-	// block until transaction completes
-	acPpd := <-aopMd.ResponseMsgCh
-	close(aopMd.ResponseMsgCh)
+	// block until transaction completes or context is canceled
+	var acPpd *core.PacketParserData
+	select {
+	case acPpd = <-aopMd.ResponseMsgCh:
+		close(aopMd.ResponseMsgCh)
+	case <-ctx.Done():
+		log.Debug("server-agent(%s@%s)-ac(%s#%d@%s)[processACOperation] canceled by context: %v",
+			knkMsg.UserId, srcAddr.String(), conn.ACId, aopMd.TransactionId, acAddrStr, ctx.Err())
+		// Drain the response channel in a background goroutine to prevent
+		// the transaction from leaking. The channel will eventually receive
+		// a response (or timeout) from the core layer.
+		go func() {
+			<-aopMd.ResponseMsgCh
+			close(aopMd.ResponseMsgCh)
+		}()
+		artMsg = &common.ACOpsResultMsg{}
+		err = ctx.Err()
+		artMsg.ErrCode = common.ErrServerACOpsFailed.ErrorCode()
+		artMsg.ErrMsg = err.Error()
+		return
+	}
 
 	if acPpd.Error != nil {
 		log.Error("server-agent(%s@%s)-ac(%s#%d@%s)[processACOperation] failed to receive response from ac: %v", knkMsg.UserId, srcAddr.String(), conn.ACId, aopMd.TransactionId, acAddrStr, acPpd.Error)
@@ -1454,6 +1472,9 @@ func (s *UdpServer) processACOperation(knkMsg *common.AgentKnockMsg, conn *ACCon
 // processACOperationBroadcast sends NHP-AOP to all AC connections in parallel.
 // Returns the first successful result. If all fail, returns the last error.
 // This supports blue/green deployments where multiple ACs register with the same AC ID.
+//
+// When the first AC responds successfully, remaining goroutines are canceled
+// via context cancellation to avoid unnecessary work.
 func (s *UdpServer) processACOperationBroadcast(
 	knkMsg *common.AgentKnockMsg,
 	conns []*ACConn,
@@ -1462,10 +1483,13 @@ func (s *UdpServer) processACOperationBroadcast(
 	openTime uint32,
 ) (*common.ACOpsResultMsg, error) {
 	if len(conns) == 1 {
-		return s.processACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+		return s.processACOperation(context.Background(), knkMsg, conns[0], srcAddr, dstAddrs, openTime)
 	}
 
 	log.Info("server-agent(%s@%s)[processACOperationBroadcast] broadcasting to %d ACs", knkMsg.UserId, srcAddr.String(), len(conns))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	type result struct {
 		artMsg *common.ACOpsResultMsg
@@ -1475,7 +1499,7 @@ func (s *UdpServer) processACOperationBroadcast(
 	results := make(chan result, len(conns))
 	for _, conn := range conns {
 		go func(c *ACConn) {
-			artMsg, err := s.processACOperation(knkMsg, c, srcAddr, dstAddrs, openTime)
+			artMsg, err := s.processACOperation(ctx, knkMsg, c, srcAddr, dstAddrs, openTime)
 			results <- result{artMsg, err, c.ACPeer.RecvAddr().String()}
 		}(conn)
 	}
@@ -1485,7 +1509,12 @@ func (s *UdpServer) processACOperationBroadcast(
 	for i := 0; i < len(conns); i++ {
 		r := <-results
 		if r.err == nil {
-			log.Info("server-agent(%s@%s)[processACOperationBroadcast] AC at %s succeeded", knkMsg.UserId, srcAddr.String(), r.acAddr)
+			log.Info("server-agent(%s@%s)[processACOperationBroadcast] AC at %s succeeded, canceling remaining", knkMsg.UserId, srcAddr.String(), r.acAddr)
+			cancel() // signal remaining goroutines to abort
+			// Remaining goroutines will drain their response channels
+			// asynchronously via the background goroutines spawned in
+			// processACOperation's ctx.Done() path, then exit cleanly.
+			// The buffered results channel ensures their sends don't block.
 			return r.artMsg, nil
 		}
 		lastErr = r.err
@@ -1855,7 +1884,7 @@ func (s *UdpServer) ProcessACOperation(
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
 ) (*common.ACOpsResultMsg, error) {
-	return s.processACOperation(knkMsg, acConn, srcAddr, dstAddrs, openTime)
+	return s.processACOperation(context.Background(), knkMsg, acConn, srcAddr, dstAddrs, openTime)
 }
 
 // ProcessACOperationBroadcast wraps the internal processACOperationBroadcast method.
