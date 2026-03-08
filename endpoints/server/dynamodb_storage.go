@@ -21,6 +21,11 @@ const (
 	// DynamoDBOperationTimeout is the maximum time for a single DynamoDB operation.
 	// This provides predictable latency and prevents hung requests.
 	DynamoDBOperationTimeout = 5 * time.Second
+
+	// healthCheckSentinelKey is the well-known key used for DynamoDB health checks.
+	// GetItem on this non-existent key returns an empty result (not an error),
+	// confirming connectivity and table access with only dynamodb:GetItem permission.
+	healthCheckSentinelKey = "__healthcheck__"
 )
 
 // ============================================================================
@@ -110,13 +115,13 @@ func (d *DynamoDBStorage) Ping(ctx context.Context) error {
 		return errors.New("dynamodb client not initialized")
 	}
 
-	// Use the AC assignments table for health check (most commonly accessed)
+	// Use the AC assignments table for health check (most commonly accessed).
+	// We do not fall back to other tables because they have different key schemas
+	// (e.g., LicensesTable uses "license_key_sha256", not "ac_id"), which would
+	// cause a ValidationException.
 	tableName := d.config.ACAssignmentsTable
 	if tableName == "" {
-		tableName = d.config.LicensesTable
-	}
-	if tableName == "" {
-		return errors.New("no dynamodb tables configured")
+		return errors.New("no ACAssignmentsTable configured for DynamoDB health check")
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, DynamoDBOperationTimeout)
@@ -128,10 +133,8 @@ func (d *DynamoDBStorage) Ping(ctx context.Context) error {
 	_, err := d.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: aws.String(tableName),
 		Key: map[string]types.AttributeValue{
-			"ac_id": &types.AttributeValueMemberS{Value: "__healthcheck__"},
+			"ac_id": &types.AttributeValueMemberS{Value: healthCheckSentinelKey},
 		},
-		// Use consistent read for a true connectivity check
-		ConsistentRead: aws.Bool(true),
 	})
 	return err
 }
