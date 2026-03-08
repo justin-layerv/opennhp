@@ -122,6 +122,12 @@ variable "ac_min_capacity" {
   default     = null
 }
 
+variable "enable_egress_eips" {
+  description = "Allocate Elastic IPs for AC instances for stable egress IPs (2x when blue/green enabled). Customers whitelist these on their origin firewalls."
+  type        = bool
+  default     = false
+}
+
 # Security services
 variable "enable_cloudtrail" {
   description = "Enable AWS CloudTrail. Set to false if SCP blocks cloudtrail operations."

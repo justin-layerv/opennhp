@@ -36,6 +36,7 @@ module "nhp" {
   ac_auth_service_id = var.ac_auth_service_id
   ac_resource_ids    = var.ac_resource_ids
   ac_min_capacity    = var.ac_min_capacity
+  enable_egress_eips = var.enable_egress_eips
 
   # Security services
   enable_cloudtrail          = var.enable_cloudtrail

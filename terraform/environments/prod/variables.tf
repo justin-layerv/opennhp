@@ -137,6 +137,12 @@ variable "ac_max_capacity" {
   default     = null
 }
 
+variable "enable_egress_eips" {
+  description = "Allocate Elastic IPs for AC instances for stable egress IPs (2x when blue/green enabled). Customers whitelist these on their origin firewalls."
+  type        = bool
+  default     = false
+}
+
 # AC configuration
 variable "ac_auth_service_id" {
   type    = string
