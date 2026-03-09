@@ -363,7 +363,6 @@ resource "aws_iam_role_policy" "task_dynamodb" {
           "dynamodb:Scan",
           "dynamodb:BatchGetItem",
           "dynamodb:BatchWriteItem",
-          "dynamodb:DescribeTable", # Health check uses this until Go code switches to GetItem
         ]
         Resource = concat(
           var.dynamodb_table_arns,
