@@ -20,10 +20,16 @@ import (
 
 const maxForwardResponseSize int64 = 64 << 10 // 64 KiB — ACK messages are typically < 1 KB
 
+// SourceAPI is the Source value set by API callers (e.g., qurl-service headless resolve).
+// When set, the receiving server may forward the knock to another server if the AC
+// isn't connected locally, unlike server-to-server forwards which set Forwarded=true.
+const SourceAPI = "api"
+
 // HttpKnockForwardRequest is the JSON body sent between servers for internal knock forwarding.
 type HttpKnockForwardRequest struct {
 	Request  *common.HttpKnockRequest `json:"request"`
 	Resource *common.ResourceData     `json:"resource"`
+	Source   string                   `json:"source,omitempty"` // See SourceAPI const
 }
 
 // HttpKnockForwardResponse is the JSON response from an internal knock forward.
@@ -167,6 +173,9 @@ func (f *HttpKnockForwarder) forwardToServer(
 		return nil, fmt.Errorf("refusing to forward to non-private IP %s", srv.InternalIP)
 	}
 
+	// Source is intentionally NOT propagated to the forwarded request.
+	// This ensures loop prevention: API→ServerA (Source="api", can forward)
+	// → ServerA→ServerB (Source="", Forwarded=true, cannot forward).
 	fwdReq := &HttpKnockForwardRequest{
 		Request:  req,
 		Resource: res,

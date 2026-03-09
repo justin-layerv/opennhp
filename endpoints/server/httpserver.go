@@ -857,8 +857,20 @@ func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
 		return
 	}
 
-	// Mark as forwarded to prevent recursive forwarding
-	fwdReq.Request.Forwarded = true
+	// Decide whether to mark as forwarded based on the request source.
+	// API callers (e.g., qurl-service) set Source="api" so the receiving server
+	// can forward to the correct server if the AC isn't connected locally.
+	// Server-to-server forwards (empty Source) set Forwarded=true to prevent loops.
+	switch fwdReq.Source {
+	case SourceAPI:
+		// API-originated: allow forwarding to find the correct server
+	case "":
+		// Server-to-server: block re-forwarding (loop prevention)
+		fwdReq.Request.Forwarded = true
+	default:
+		log.Warning("handleInternalKnock: unexpected Source value %q, treating as server-to-server", fwdReq.Source)
+		fwdReq.Request.Forwarded = true
+	}
 	fwdReq.Request.Ctx = ctx.Request.Context()
 
 	ackMsg, err := hs.handleHttpOpenResource(fwdReq.Request, fwdReq.Resource)
