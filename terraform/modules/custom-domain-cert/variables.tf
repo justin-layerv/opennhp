@@ -105,13 +105,13 @@ variable "alert_emails" {
 }
 
 # ------------------------------------------------------------------------------
-# Secrets Configuration
+# SSM Parameter Store Configuration
 # ------------------------------------------------------------------------------
 
-variable "secrets_prefix" {
-  description = "Prefix for Secrets Manager secrets storing custom domain certificates"
+variable "ssm_cert_prefix" {
+  description = "SSM Parameter Store path prefix for custom domain certificate params"
   type        = string
-  default     = "custom-domain-cert"
+  default     = "/nhp/certs"
 }
 
 # ------------------------------------------------------------------------------

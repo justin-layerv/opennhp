@@ -17,6 +17,16 @@
 # - Comprehensive audit logging via CloudTrail
 # - Automated renewal with alerting
 #
+# Prerequisites:
+# - qurl-domains DynamoDB table must have a GSI named 'status-index' with
+#   partition key 'status' (String). See terraform/modules/dynamodb/main.tf.
+#
+# Scaling notes:
+# - SSM Parameter Store standard tier: free, 4KB max value, 10K params/account/region.
+#   At ~3 params/domain, standard tier supports ~3,300 domains per account.
+# - Beyond that: upgrade to Advanced tier ($0.05/param/month) or request
+#   a standard tier limit increase from AWS.
+#
 # Usage:
 #   module "custom_domain_cert" {
 #     source = "../modules/custom-domain-cert"
@@ -154,8 +164,11 @@ resource "aws_lambda_function" "cert_manager" {
   handler          = "custom_domain_cert_manager.handler"
   runtime          = "python3.12"
   architectures    = ["x86_64"]
-  timeout          = 600
-  memory_size      = 512
+  # 10 min timeout accommodates ACME DNS-01 challenges (DNS propagation + validation).
+  # With 15-min EventBridge interval and reserved_concurrent_executions=1, a
+  # max-duration invocation leaves ~5 min gap before the next scheduled scan.
+  timeout     = 600
+  memory_size = 512
 
   environment {
     variables = {
@@ -167,7 +180,7 @@ resource "aws_lambda_function" "cert_manager" {
       ACME_DIRECTORY          = local.acme_directory
       SNS_TOPIC_ARN           = local.sns_topic_arn
       QURL_DOMAINS_TABLE      = var.qurl_domains_table_name
-      SECRETS_PREFIX          = var.secrets_prefix
+      SSM_CERT_PREFIX         = var.ssm_cert_prefix
       AC_INSTANCE_TAG         = var.ac_instance_tag
     }
   }
@@ -254,28 +267,19 @@ resource "aws_iam_role_policy" "lambda_permissions" {
         Resource = aws_secretsmanager_secret.acme_account.arn
       },
 
-      # Secrets Manager - Create/read/write custom domain cert secrets
+      # SSM Parameter Store - cert read/write
       {
-        Sid    = "SecretsManagerCustomDomainCerts"
+        Sid    = "SSMCertParams"
         Effect = "Allow"
         Action = [
-          "secretsmanager:CreateSecret",
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:PutSecretValue",
-          "secretsmanager:DescribeSecret",
-          "secretsmanager:TagResource"
+          "ssm:PutParameter",
+          "ssm:GetParameter",
+          "ssm:GetParametersByPath",
+          "ssm:DeleteParameter",
+          "ssm:ListTagsForResource",
+          "ssm:AddTagsToResource"
         ]
-        Resource = "arn:aws:secretsmanager:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:secret:${var.secrets_prefix}/*"
-      },
-
-      # Secrets Manager - ListSecrets (no resource restriction)
-      {
-        Sid    = "SecretsManagerList"
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:ListSecrets"
-        ]
-        Resource = "*"
+        Resource = "arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:parameter${var.ssm_cert_prefix}/*"
       },
 
       # Route53 - DNS-01 Challenge in ACME delegation zone
@@ -297,15 +301,19 @@ resource "aws_iam_role_policy" "lambda_permissions" {
         Resource = "arn:aws:route53:::change/*"
       },
 
-      # DynamoDB - Update domain status
+      # DynamoDB - Update domain status + query pending domains
       {
         Sid    = "DynamoDBDomainStatus"
         Effect = "Allow"
         Action = [
           "dynamodb:GetItem",
-          "dynamodb:UpdateItem"
+          "dynamodb:UpdateItem",
+          "dynamodb:Query"
         ]
-        Resource = var.qurl_domains_table_arn
+        Resource = [
+          var.qurl_domains_table_arn,
+          "${var.qurl_domains_table_arn}/index/status-index"
+        ]
       },
 
       # SNS - Publish alerts
@@ -392,15 +400,14 @@ resource "aws_iam_role_policy" "lambda_kms_wildcard" {
   name  = "${local.function_name}-kms"
   role  = aws_iam_role.lambda.id
 
-  # When no explicit KMS key is provided, Secrets Manager uses the AWS-managed
-  # key (aws/secretsmanager). We must use Resource="*" because the key ARN isn't
-  # known at plan time. ViaService + CallerAccount restrict to same-account
-  # Secrets Manager operations only.
+  # When no explicit KMS key is provided, AWS-managed keys are used.
+  # We must use Resource="*" because the key ARN isn't known at plan time.
+  # ViaService + CallerAccount restrict to same-account operations only.
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "KMSOperations"
+        Sid    = "KMSOperationsSecretsManager"
         Effect = "Allow"
         Action = [
           "kms:Decrypt",
@@ -414,22 +421,44 @@ resource "aws_iam_role_policy" "lambda_kms_wildcard" {
             "kms:CallerAccount" = data.aws_caller_identity.current.account_id
           }
         }
+      },
+      {
+        Sid    = "KMSOperationsSSM"
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt",
+          "kms:Encrypt",
+          "kms:GenerateDataKey"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "kms:ViaService"    = "ssm.${data.aws_region.current.id}.amazonaws.com"
+            "kms:CallerAccount" = data.aws_caller_identity.current.account_id
+          }
+        }
       }
     ]
   })
 }
 
 # ==============================================================================
-# EventBridge - Daily Renewal Scan
+# EventBridge - Periodic Scan (Renewal + Provisioning)
 # ==============================================================================
+# Runs every 15 minutes to balance provisioning latency (~15 min worst case)
+# against Lambda invocation cost. The scan is cheap when idle (single DynamoDB
+# query on status-index GSI + SSM GetParametersByPath for /meta params).
+# With reserved_concurrent_executions=1, overlapping invocations are throttled
+# (not queued) — a long ACME challenge (~60s) may delay the next scan by one
+# cycle, which is acceptable.
 
 resource "aws_cloudwatch_event_rule" "renewal_scan" {
-  name                = "${var.name_prefix}-custom-domain-cert-renewal"
-  description         = "Daily scan for custom domain certificates approaching expiry"
-  schedule_expression = "rate(1 day)"
+  name                = "${var.name_prefix}-custom-domain-cert-scan"
+  description         = "Periodic scan for cert renewal and pending domain provisioning"
+  schedule_expression = "rate(15 minutes)"
 
   tags = merge(local.common_tags, {
-    Name = "${var.name_prefix}-custom-domain-cert-renewal"
+    Name = "${var.name_prefix}-custom-domain-cert-scan"
   })
 }
 

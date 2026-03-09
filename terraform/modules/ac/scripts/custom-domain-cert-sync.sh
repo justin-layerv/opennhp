@@ -1,7 +1,11 @@
 #!/bin/bash
 # Custom Domain Certificate Sync
-# Fetches ALL active custom domain certs from Secrets Manager
+# Fetches custom domain certs from SSM Parameter Store
 # and rebuilds /home/ubuntu/traefik/custom-domains.toml
+#
+# Modes:
+#   Full sync (default): Fetches ALL certs, rebuilds config, cleans stale dirs
+#   Incremental (--domain <domain>): Fetches single domain cert, appends to config
 #
 # Triggered by:
 # - Custom Domain Cert Lambda (after provisioning/renewal)
@@ -9,41 +13,230 @@
 # - 6-hourly SSM association
 set -euo pipefail
 
-SECRETS_PREFIX="${SECRETS_PREFIX:-custom-domain-cert}"
+SSM_CERT_PREFIX="${SSM_CERT_PREFIX:-/nhp/certs}"
 TRAEFIK_DIR="${TRAEFIK_DIR:-/home/ubuntu/traefik}"
 CERT_DIR="${TRAEFIK_DIR}/certs/custom-domains"
 CONFIG_FILE="${TRAEFIK_DIR}/custom-domains.toml"
 REGION="${AWS_REGION:-us-east-2}"
 
-echo "Starting custom domain certificate sync at $(date)"
+# Parse args
+SYNC_MODE="full"
+TARGET_DOMAIN=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --domain) TARGET_DOMAIN="$2"; SYNC_MODE="incremental"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+
+echo "Starting custom domain certificate sync (mode: $SYNC_MODE) at $(date)"
 
 # Ensure snap binaries are in PATH (for AWS CLI)
 export PATH="/snap/bin:$PATH"
 
+# Clean up temp files on exit (TEMP_CONFIG set later in both incremental and full mode)
+trap 'rm -f "$TEMP_CONFIG" 2>/dev/null' EXIT
+TEMP_CONFIG=""
+
 # Create directories
 mkdir -p "$CERT_DIR"
 
-# List all custom domain cert secrets
-echo "Listing custom domain certificates..."
-SECRETS=$(aws secretsmanager list-secrets \
-  --region "$REGION" \
-  --filters Key=name,Values="$SECRETS_PREFIX/" \
-  --query 'SecretList[].Name' \
-  --output text 2>/dev/null || echo "")
+# ==============================================================================
+# Append a [[tls.certificates]] entry to a TOML config file
+# Args: $1=domain_cert_dir $2=config_file
+# ==============================================================================
+append_tls_entry() {
+    local DOMAIN_CERT_DIR="$1"
+    local CONFIG="$2"
+    cat >> "$CONFIG" << DOMAINEOF
 
-if [ -z "$SECRETS" ]; then
+[[tls.certificates]]
+  certFile = "${DOMAIN_CERT_DIR}/fullchain.pem"
+  keyFile = "${DOMAIN_CERT_DIR}/privkey.pem"
+DOMAINEOF
+}
+
+# ==============================================================================
+# Validate and write a single domain's cert to disk + TOML
+# Args: $1=domain $2=key_value $3=chain_value
+# Returns: 0 on success, 1 on failure
+# ==============================================================================
+process_domain_cert() {
+    local DOMAIN="$1"
+    local KEY_VALUE="$2"
+    local CHAIN_VALUE="$3"
+
+    # Validate domain is DNS-safe
+    if ! [[ "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?$ ]]; then
+        echo "WARNING: Invalid domain name format: $DOMAIN, skipping"
+        return 1
+    fi
+
+    # Reject path traversal sequences
+    if [[ "$DOMAIN" == *".."* ]]; then
+        echo "WARNING: Invalid domain path (contains '..'): $DOMAIN, skipping"
+        return 1
+    fi
+
+    # Reject wildcard domains
+    if [[ "$DOMAIN" == *"*"* ]]; then
+        echo "WARNING: Wildcard domains not supported: $DOMAIN, skipping"
+        return 1
+    fi
+
+    echo "Processing certificate for: $DOMAIN"
+
+    # Create domain cert directory
+    local DOMAIN_CERT_DIR="$CERT_DIR/$DOMAIN"
+    mkdir -p "$DOMAIN_CERT_DIR"
+
+    # Write cert files
+    echo "$CHAIN_VALUE" > "$DOMAIN_CERT_DIR/fullchain.pem"
+    echo "$KEY_VALUE" > "$DOMAIN_CERT_DIR/privkey.pem"
+
+    # Set permissions and ownership
+    chmod 600 "$DOMAIN_CERT_DIR/privkey.pem"
+    chmod 644 "$DOMAIN_CERT_DIR/fullchain.pem"
+    chown ubuntu:ubuntu "$DOMAIN_CERT_DIR/privkey.pem" "$DOMAIN_CERT_DIR/fullchain.pem"
+
+    # Verify cert is not expired and extract expiry date
+    local CERT_INFO
+    CERT_INFO=$(openssl x509 -in "$DOMAIN_CERT_DIR/fullchain.pem" -noout -checkend 0 -enddate 2>/dev/null) || {
+        echo "WARNING: Certificate for $DOMAIN is expired or invalid, skipping"
+        return 1
+    }
+    local CERT_EXPIRY
+    CERT_EXPIRY=$(echo "$CERT_INFO" | grep '^notAfter=' | cut -d= -f2)
+
+    # Verify private key matches certificate
+    local CERT_MOD KEY_MOD
+    CERT_MOD=$(openssl x509 -noout -modulus -in "$DOMAIN_CERT_DIR/fullchain.pem" 2>/dev/null) || {
+        echo "WARNING: Cannot read certificate modulus for $DOMAIN, skipping"
+        return 1
+    }
+    KEY_MOD=$(openssl rsa -noout -modulus -in "$DOMAIN_CERT_DIR/privkey.pem" 2>/dev/null) || {
+        echo "WARNING: Cannot read private key modulus for $DOMAIN, skipping"
+        return 1
+    }
+    if [ "$CERT_MOD" != "$KEY_MOD" ]; then
+        echo "WARNING: Certificate/key mismatch for $DOMAIN, skipping"
+        return 1
+    fi
+
+    echo "  Certificate loaded, expires: $CERT_EXPIRY"
+    return 0
+}
+
+# ==============================================================================
+# Fetch a single SSM parameter value (with decryption)
+# Args: $1=parameter_name
+# ==============================================================================
+fetch_ssm_param() {
+    aws ssm get-parameter \
+        --region "$REGION" \
+        --name "$1" \
+        --with-decryption \
+        --query 'Parameter.Value' --output text 2>/dev/null
+}
+
+# ==============================================================================
+# Incremental mode: fetch single domain, append to config
+# ==============================================================================
+if [ "$SYNC_MODE" = "incremental" ] && [ -n "$TARGET_DOMAIN" ]; then
+    echo "Incremental sync for domain: $TARGET_DOMAIN"
+
+    # Fetch key and chain params for this domain
+    KEY_VALUE=$(fetch_ssm_param "$SSM_CERT_PREFIX/$TARGET_DOMAIN/key") || {
+        echo "ERROR: Failed to fetch key param for $TARGET_DOMAIN"
+        exit 1
+    }
+
+    CHAIN_VALUE=$(fetch_ssm_param "$SSM_CERT_PREFIX/$TARGET_DOMAIN/chain") || {
+        echo "ERROR: Failed to fetch chain param for $TARGET_DOMAIN"
+        exit 1
+    }
+
+    # Guard against empty SSM parameter values (edge case)
+    if [ -z "$KEY_VALUE" ] || [ -z "$CHAIN_VALUE" ]; then
+        echo "ERROR: Empty cert data for $TARGET_DOMAIN"
+        exit 1
+    fi
+
+    if process_domain_cert "$TARGET_DOMAIN" "$KEY_VALUE" "$CHAIN_VALUE"; then
+        DOMAIN_CERT_DIR="$CERT_DIR/$TARGET_DOMAIN"
+
+        # Append TLS cert entry to config (or create if missing)
+        if [ ! -f "$CONFIG_FILE" ]; then
+            echo "# Custom Domain Traefik Configuration" > "$CONFIG_FILE"
+            echo "# Auto-generated by custom-domain-cert-sync.sh" >> "$CONFIG_FILE"
+        fi
+
+        # Remove existing entry for this domain if present, then append
+        # Use a temp file to avoid partial writes
+        TEMP_CONFIG=$(mktemp)
+
+        # Copy existing config, filtering out any existing entry for this domain
+        # -F treats pattern as fixed string (not regex) to avoid issues with dots in domain names
+        grep -vF "$DOMAIN_CERT_DIR" "$CONFIG_FILE" > "$TEMP_CONFIG" 2>/dev/null || true
+
+        append_tls_entry "$DOMAIN_CERT_DIR" "$TEMP_CONFIG"
+
+        chmod 644 "$TEMP_CONFIG"
+        chown ubuntu:ubuntu "$TEMP_CONFIG"
+        mv "$TEMP_CONFIG" "$CONFIG_FILE"
+
+        echo "Incremental sync complete for $TARGET_DOMAIN"
+    else
+        echo "ERROR: Failed to process cert for $TARGET_DOMAIN"
+        exit 1
+    fi
+
+    exit 0
+fi
+
+# ==============================================================================
+# Full mode: fetch all certs, rebuild config, clean stale dirs
+# ==============================================================================
+echo "Listing custom domain certificates from SSM..."
+
+# Fetch all params under the cert prefix (key, chain, meta)
+# get-parameters-by-path returns max 10 per page; the CLI handles pagination
+ALL_PARAMS=$(aws ssm get-parameters-by-path \
+    --region "$REGION" \
+    --path "$SSM_CERT_PREFIX/" \
+    --recursive \
+    --with-decryption \
+    --output json 2>/dev/null || echo '{"Parameters":[]}')
+
+# Filter to /key and /chain params only, group by domain, extract cert data
+# jq handles the filtering that JMESPath can't do reliably
+DOMAINS_JSON=$(echo "$ALL_PARAMS" | jq '
+    [.Parameters[] | select(.Name | (endswith("/key") or endswith("/chain")))]
+    | group_by(.Name | split("/")[:-1] | join("/"))
+    | map({
+        domain: (.[0].Name | split("/") | .[-2]),
+        key: (map(select(.Name | endswith("/key"))) | .[0].Value // ""),
+        chain: (map(select(.Name | endswith("/chain"))) | .[0].Value // "")
+      })
+    | map(select(.key != "" and .chain != ""))
+')
+if [ $? -ne 0 ]; then
+    echo "ERROR: Failed to parse SSM parameters with jq"
+    exit 1
+fi
+
+if [ "$(echo "$DOMAINS_JSON" | jq 'length')" = "0" ] || [ -z "$DOMAINS_JSON" ]; then
     echo "No custom domain certificates found"
-    # Write empty config file
     echo "# No custom domains configured" > "$CONFIG_FILE"
     chown ubuntu:ubuntu "$CONFIG_FILE"
     echo "Done"
     exit 0
 fi
 
+DOMAIN_COUNT_TOTAL=$(echo "$DOMAINS_JSON" | jq 'length')
+
 # Start building new config
 TEMP_CONFIG=$(mktemp)
-CERT_TEMP=""
-trap 'rm -f "$TEMP_CONFIG" "$CERT_TEMP" 2>/dev/null' EXIT
 echo "# Custom Domain Traefik Configuration" > "$TEMP_CONFIG"
 echo "# Auto-generated by custom-domain-cert-sync.sh at $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$TEMP_CONFIG"
 echo "# DO NOT EDIT MANUALLY" >> "$TEMP_CONFIG"
@@ -53,147 +246,26 @@ DOMAIN_COUNT=0
 FAILED_COUNT=0
 ACTIVE_DOMAINS=""
 
-for SECRET_NAME in $SECRETS; do
-    # Extract domain from secret name (prefix/domain.com -> domain.com)
-    DOMAIN="${SECRET_NAME#${SECRETS_PREFIX}/}"
+# Process each domain (per-element jq extraction required because PEM values are multi-line)
+for i in $(seq 0 $((DOMAIN_COUNT_TOTAL - 1))); do
+    DOMAIN=$(echo "$DOMAINS_JSON" | jq -r ".[$i].domain")
+    KEY_VALUE=$(echo "$DOMAINS_JSON" | jq -r ".[$i].key")
+    CHAIN_VALUE=$(echo "$DOMAINS_JSON" | jq -r ".[$i].chain")
 
-    if [ -z "$DOMAIN" ]; then
-        echo "WARNING: Empty domain from secret $SECRET_NAME, skipping"
-        continue
-    fi
+    if process_domain_cert "$DOMAIN" "$KEY_VALUE" "$CHAIN_VALUE"; then
+        DOMAIN_CERT_DIR="$CERT_DIR/$DOMAIN"
 
-    # Validate domain is DNS-safe before using in TOML config
-    if ! [[ "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?$ ]]; then
-        echo "WARNING: Invalid domain name format: $DOMAIN, skipping"
-        continue
-    fi
+        # Append TLS cert entry only (catch-all router handles routing)
+        append_tls_entry "$DOMAIN_CERT_DIR" "$TEMP_CONFIG"
 
-    # Reject path traversal sequences
-    if [[ "$DOMAIN" == *".."* ]]; then
-        echo "WARNING: Invalid domain path (contains '..'): $DOMAIN, skipping"
-        continue
-    fi
-
-    # Reject wildcard domains — redundant with regex above (which excludes *)
-    # but kept for a clearer log message when debugging.
-    if [[ "$DOMAIN" == *"*"* ]]; then
-        echo "WARNING: Wildcard domains not supported: $DOMAIN, skipping"
-        continue
-    fi
-
-    echo "Processing certificate for: $DOMAIN"
-
-    # Create domain cert directory
-    DOMAIN_CERT_DIR="$CERT_DIR/$DOMAIN"
-    mkdir -p "$DOMAIN_CERT_DIR"
-
-    # Fetch cert from Secrets Manager (retry with backoff for rate limiting)
-    CERT_TEMP=$(mktemp)
-    FETCH_OK=false
-    for RETRY in 1 2 3; do
-        if aws secretsmanager get-secret-value \
-            --region "$REGION" \
-            --secret-id "$SECRET_NAME" \
-            --query SecretString --output text > "$CERT_TEMP" 2>/dev/null; then
-            FETCH_OK=true
-            break
-        fi
-        [ "$RETRY" -lt 3 ] && sleep "$((RETRY * 2))"
-    done
-    if [ "$FETCH_OK" != "true" ]; then
-        echo "WARNING: Failed to fetch cert for $DOMAIN after 3 attempts, skipping"
-        rm -f "$CERT_TEMP"
+        ACTIVE_DOMAINS="$ACTIVE_DOMAINS $DOMAIN"
+        DOMAIN_COUNT=$((DOMAIN_COUNT + 1))
+    else
         FAILED_COUNT=$((FAILED_COUNT + 1))
-        continue
     fi
-
-    # Validate and extract cert data in a single jq pass
-    PARSED=$(jq -r '
-      if .certificate == null then "ERR_NO_CERT"
-      elif .private_key == null then "ERR_NO_KEY"
-      elif .status == "pending" then "ERR_PENDING"
-      else (.fullchain // .certificate) + "\n===SPLIT===\n" + .private_key
-      end
-    ' "$CERT_TEMP" 2>/dev/null) || PARSED="ERR_INVALID_JSON"
-    rm -f "$CERT_TEMP"
-
-    case "$PARSED" in
-        ERR_INVALID_JSON)
-            echo "WARNING: Invalid JSON for $DOMAIN, skipping"
-            FAILED_COUNT=$((FAILED_COUNT + 1)); continue ;;
-        ERR_NO_CERT)
-            echo "WARNING: Invalid cert data for $DOMAIN (missing certificate field), skipping"
-            FAILED_COUNT=$((FAILED_COUNT + 1)); continue ;;
-        ERR_NO_KEY)
-            echo "WARNING: Invalid cert data for $DOMAIN (missing private_key field), skipping"
-            FAILED_COUNT=$((FAILED_COUNT + 1)); continue ;;
-        ERR_PENDING)
-            echo "WARNING: Certificate for $DOMAIN is still pending, skipping"
-            continue ;;
-    esac
-
-    # Split extracted data into cert and key files
-    echo "$PARSED" | awk '/===SPLIT===/{found=1; next} !found' > "$DOMAIN_CERT_DIR/fullchain.pem"
-    echo "$PARSED" | awk '/===SPLIT===/{found=1; next} found' > "$DOMAIN_CERT_DIR/privkey.pem"
-
-    # Set permissions and ownership
-    chmod 600 "$DOMAIN_CERT_DIR/privkey.pem"
-    chmod 644 "$DOMAIN_CERT_DIR/fullchain.pem"
-    chown ubuntu:ubuntu "$DOMAIN_CERT_DIR/privkey.pem" "$DOMAIN_CERT_DIR/fullchain.pem"
-
-    # Verify cert is not expired and extract expiry date (single openssl call)
-    CERT_INFO=$(openssl x509 -in "$DOMAIN_CERT_DIR/fullchain.pem" -noout -checkend 0 -enddate 2>/dev/null) || {
-        echo "WARNING: Certificate for $DOMAIN is expired or invalid, skipping"
-        FAILED_COUNT=$((FAILED_COUNT + 1))
-        continue
-    }
-    CERT_EXPIRY=$(echo "$CERT_INFO" | grep '^notAfter=' | cut -d= -f2)
-
-    # Verify private key matches certificate (catches corrupted secrets).
-    # Commands are separated (not piped) so failures are caught individually
-    # under set -euo pipefail instead of aborting the entire script.
-    CERT_MOD=$(openssl x509 -noout -modulus -in "$DOMAIN_CERT_DIR/fullchain.pem" 2>/dev/null) || {
-        echo "WARNING: Cannot read certificate modulus for $DOMAIN, skipping"
-        FAILED_COUNT=$((FAILED_COUNT + 1))
-        continue
-    }
-    KEY_MOD=$(openssl rsa -noout -modulus -in "$DOMAIN_CERT_DIR/privkey.pem" 2>/dev/null) || {
-        echo "WARNING: Cannot read private key modulus for $DOMAIN, skipping"
-        FAILED_COUNT=$((FAILED_COUNT + 1))
-        continue
-    }
-    if [ "$CERT_MOD" != "$KEY_MOD" ]; then
-        echo "WARNING: Certificate/key mismatch for $DOMAIN, skipping"
-        FAILED_COUNT=$((FAILED_COUNT + 1))
-        continue
-    fi
-
-    # Sanitize domain for TOML key (replace dots with dashes)
-    TOML_KEY=$(echo "$DOMAIN" | tr '.' '-')
-
-    # Append router + TLS config for this domain
-    cat >> "$TEMP_CONFIG" << DOMAINEOF
-
-[http.routers.custom-${TOML_KEY}]
-  rule = "Host(\`${DOMAIN}\`)"
-  service = "qurl-backend"
-  entryPoints = ["https"]
-  priority = 25
-  middlewares = ["qurl-router"]
-  [http.routers.custom-${TOML_KEY}.tls]
-
-[[tls.certificates]]
-  certFile = "${DOMAIN_CERT_DIR}/fullchain.pem"
-  keyFile = "${DOMAIN_CERT_DIR}/privkey.pem"
-
-DOMAINEOF
-
-    ACTIVE_DOMAINS="$ACTIVE_DOMAINS $DOMAIN"
-    DOMAIN_COUNT=$((DOMAIN_COUNT + 1))
-    echo "  Certificate loaded, expires: $CERT_EXPIRY"
 done
 
-# Remove stale cert directories for domains no longer in Secrets Manager
+# Remove stale cert directories for domains no longer in SSM
 if [ -d "$CERT_DIR" ]; then
     for DIR in "$CERT_DIR"/*/; do
         [ -d "$DIR" ] || continue

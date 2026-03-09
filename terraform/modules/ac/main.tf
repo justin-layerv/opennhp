@@ -588,20 +588,17 @@ resource "aws_iam_role_policy" "ac" {
           Resource = ["*"]
         },
       ],
-      # Custom domain certificate access (for SSM cert sync script)
+      # Custom domain certificate access (for cert sync script — SSM Parameter Store)
       [
         {
-          Sid      = "SecretsManagerCustomDomainCertsList"
-          Effect   = "Allow"
-          Action   = ["secretsmanager:ListSecrets"]
-          Resource = "*"
-        },
-        {
-          Sid    = "SecretsManagerCustomDomainCertsRead"
+          Sid    = "SSMCustomDomainCertsRead"
           Effect = "Allow"
-          Action = ["secretsmanager:GetSecretValue"]
+          Action = [
+            "ssm:GetParameter",
+            "ssm:GetParametersByPath"
+          ]
           Resource = [
-            "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:custom-domain-cert/*"
+            "arn:aws:ssm:${local.region}:${local.account_id}:parameter/nhp/certs/*"
           ]
         },
       ],

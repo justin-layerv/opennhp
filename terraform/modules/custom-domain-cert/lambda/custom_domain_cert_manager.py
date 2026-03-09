@@ -8,11 +8,16 @@ Flow:
   1. Customer creates CNAME: _acme-challenge.secure.example.com -> secure--example--com.acme.layerv.xyz
   2. Lambda creates TXT record at secure--example--com.acme.layerv.xyz in our ACME zone
   3. Let's Encrypt follows CNAME, finds TXT, validates domain ownership
-  4. Certificate stored in Secrets Manager, domain status updated in DynamoDB
+  4. Certificate stored in SSM Parameter Store, domain status updated in DynamoDB
+
+Storage strategy:
+  - Cert key + chain stored as SecureString params in SSM Parameter Store
+  - Metadata (expiry, acme_subdomain) stored as plain String param (no KMS cost)
+  - ACME account key stays in Secrets Manager (single secret, no scale issue)
 
 Security considerations:
 - Private keys generated in Lambda, never exposed to Terraform state
-- All secrets encrypted with KMS CMK
+- Cert secrets encrypted with KMS CMK via SSM SecureString
 - Least privilege IAM permissions
 - No sensitive data in CloudWatch logs
 
@@ -23,9 +28,10 @@ import json
 import logging
 import os
 import re
+import shlex
 import time
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, Tuple
+from typing import Dict, Any, Tuple
 
 import boto3
 from botocore.exceptions import ClientError
@@ -38,25 +44,28 @@ logger.setLevel(logging.INFO)
 EVENT_PROVISION = 'provision'
 EVENT_RENEWAL_SCAN = 'renewal_scan'
 
-# Domain cert statuses (stored in qurl-domains DynamoDB table)
+# Domain statuses (must match qurl domain.Status constants)
 STATUS_ACTIVE = 'active'
-STATUS_CERT_FAILED = 'cert_failed'
-STATUS_PENDING = 'pending'
+STATUS_FAILED = 'failed'
+STATUS_PROVISIONING_TLS = 'provisioning_tls'
 
 # Provision result statuses (returned in Lambda response)
 RESULT_PROVISIONED = 'provisioned'
 
-# Secret JSON field names (contract between Lambda writer and cert-sync shell reader)
-FIELD_PRIVATE_KEY = 'private_key'
-FIELD_CERTIFICATE = 'certificate'
-FIELD_CHAIN = 'chain'
-FIELD_FULLCHAIN = 'fullchain'
+# Batch sync trigger identifiers (not real domain names)
+BATCH_SYNC_RENEWAL = 'renewal-scan-batch'
+BATCH_SYNC_PROVISION = 'provision-batch'
+
+# Domain name validation
+DOMAIN_REGEX = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?$')
+
+# ACME account secret field names (Secrets Manager — single secret, no scale issue)
+FIELD_ACCOUNT_KEY = 'account_key'
+
+# SSM Parameter Store metadata field names (stored as JSON in /meta param)
 FIELD_EXPIRES_AT = 'expires_at'
 FIELD_DOMAIN = 'domain'
 FIELD_ACME_SUBDOMAIN = 'acme_subdomain'
-FIELD_RENEWED_AT = 'renewed_at'
-FIELD_ACCOUNT_KEY = 'account_key'
-FIELD_STATUS = 'status'
 
 # CloudWatch metric constants (must match alarm definitions in main.tf)
 CW_NAMESPACE = 'NHP/CustomDomainCerts'
@@ -110,13 +119,23 @@ ACME_EMAIL = os.environ.get('ACME_EMAIL')
 ACME_DIRECTORY = os.environ.get('ACME_DIRECTORY', 'https://acme-v02.api.letsencrypt.org/directory')
 SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
 QURL_DOMAINS_TABLE = os.environ.get('QURL_DOMAINS_TABLE')
-SECRETS_PREFIX = os.environ.get('SECRETS_PREFIX', 'custom-domain-cert')
+SSM_CERT_PREFIX = os.environ.get('SSM_CERT_PREFIX', '/nhp/certs')
 
 # Cached ACME client (reused across multiple renewals in a single invocation)
 _cached_acme_client = None
 
 # Renewal threshold
 RENEWAL_DAYS_BEFORE_EXPIRY = 30
+
+
+def is_valid_domain(domain: str) -> bool:
+    """Validate domain name format. Rejects path traversal, wildcards, and injection."""
+    return bool(DOMAIN_REGEX.match(domain)) and '..' not in domain
+
+
+def domain_to_acme_subdomain(domain: str) -> str:
+    """Derive ACME subdomain from a domain name (e.g. 'a.b.com' -> 'a--b--com')."""
+    return domain.replace('.', '--')
 
 # AWS clients
 secrets_client = boto3.client('secretsmanager')
@@ -147,13 +166,15 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             if not domain or not acme_subdomain:
                 raise ValueError("provision event requires 'domain' and 'acme_subdomain' fields")
             # Validate domain format to prevent injection via malformed input
-            if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?$', domain) or '..' in domain:
+            if not is_valid_domain(domain):
                 raise ValueError(f"Invalid domain format: {domain}")
             if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9-]{0,251}[a-zA-Z0-9])?$', acme_subdomain):
                 raise ValueError(f"Invalid acme_subdomain format: {acme_subdomain}")
             return provision_certificate(domain, acme_subdomain)
         elif event_type == EVENT_RENEWAL_SCAN:
-            return renewal_scan()
+            results = renewal_scan()
+            results['pending'] = provision_pending_domains()
+            return results
         else:
             raise ValueError(f"Unknown event type: {event_type}")
 
@@ -209,11 +230,11 @@ def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = Fa
         )
         expires_at = cert.not_valid_after_utc.isoformat()
 
-        # Store certificate in Secrets Manager
-        secret_arn = store_certificate(domain, private_key_pem, cert_pem, chain_pem, expires_at, acme_subdomain)
+        # Store certificate in SSM Parameter Store
+        cert_param_prefix = store_certificate(domain, private_key_pem, cert_pem, chain_pem, expires_at, acme_subdomain)
 
         # Update DynamoDB domain status
-        update_domain_status(domain, STATUS_ACTIVE, secret_arn, expires_at)
+        update_domain_status(domain, STATUS_ACTIVE, cert_param_prefix, expires_at)
 
         # Trigger cert sync on AC instances (unless caller will batch it)
         if not skip_sync:
@@ -226,12 +247,12 @@ def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = Fa
             'status': RESULT_PROVISIONED,
             'domain': domain,
             'expires_at': expires_at,
-            'secret_arn': secret_arn
+            'cert_param_prefix': cert_param_prefix
         }
 
     except Exception as e:
         logger.error(f"Certificate provisioning failed for {domain}: {str(e)}", exc_info=True)
-        update_domain_status(domain, STATUS_CERT_FAILED, error=str(e))
+        update_domain_status(domain, STATUS_FAILED, error=str(e))
         send_alert(f"Certificate provisioning FAILED for {domain}: {str(e)}")
         publish_failure_metric()
         raise
@@ -240,6 +261,9 @@ def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = Fa
 def renewal_scan() -> Dict[str, Any]:
     """
     Scan all custom domain certificates and renew those approaching expiry.
+
+    Reads only /meta params (plain String, no KMS decryption) to check expiry.
+    Only decrypts key+chain for domains that actually need renewal.
 
     Returns:
         Status dict with scan results
@@ -254,24 +278,31 @@ def renewal_scan() -> Dict[str, Any]:
         'details': []
     }
 
-    # List all secrets with our prefix
-    secrets = list_custom_domain_secrets()
-    results['scanned'] = len(secrets)
+    # List all /meta params (non-encrypted) to check expiry without KMS cost
+    meta_params = list_cert_meta_params()
+    results['scanned'] = len(meta_params)
     expiry_metrics = []  # Batch metrics for a single put_metric_data call
 
-    for secret_info in secrets:
-        secret_name = secret_info['Name']
-        # Extract domain from secret name: {prefix}/{domain}
-        domain = secret_name.replace(f"{SECRETS_PREFIX}/", "", 1)
+    # Pre-compute prefix depth for domain extraction (constant across all params)
+    prefix_depth = len(SSM_CERT_PREFIX.strip('/').split('/')) + 1
+
+    for param in meta_params:
+        param_name = param['Name']
+        # Extract domain from param name: /nhp/certs/example.com/meta -> example.com
+        parts = param_name.split('/')
+        domain = '/'.join(parts[prefix_depth:-1])
+
+        if not domain:
+            logger.warning(f"Could not extract domain from param {param_name}, skipping")
+            results['skipped'] += 1
+            continue
 
         try:
-            # Get secret value to check expiry
-            response = secrets_client.get_secret_value(SecretId=secret_info['ARN'])
-            secret_data = json.loads(response['SecretString'])
+            meta_data = json.loads(param['Value'])
 
-            expires_at_str = secret_data.get(FIELD_EXPIRES_AT)
+            expires_at_str = meta_data.get(FIELD_EXPIRES_AT)
             if not expires_at_str:
-                logger.warning(f"No {FIELD_EXPIRES_AT} in secret for {domain}, skipping")
+                logger.warning(f"No {FIELD_EXPIRES_AT} in meta for {domain}, skipping")
                 results['skipped'] += 1
                 continue
 
@@ -292,11 +323,10 @@ def renewal_scan() -> Dict[str, Any]:
 
             if days_until_expiry <= RENEWAL_DAYS_BEFORE_EXPIRY:
                 logger.info(f"Certificate for {domain} expires in {days_until_expiry} days, renewing")
-                acme_subdomain = secret_data.get(FIELD_ACME_SUBDOMAIN)
+                acme_subdomain = meta_data.get(FIELD_ACME_SUBDOMAIN)
                 if not acme_subdomain:
-                    # Derive from domain: secure.example.com -> secure--example--com
-                    logger.warning(f"Secret for {domain} missing '{FIELD_ACME_SUBDOMAIN}' field, deriving from domain name")
-                    acme_subdomain = domain.replace('.', '--')
+                    logger.warning(f"Meta for {domain} missing '{FIELD_ACME_SUBDOMAIN}' field, deriving from domain name")
+                    acme_subdomain = domain_to_acme_subdomain(domain)
 
                 provision_certificate(domain, acme_subdomain, skip_sync=True)
                 results['renewed'] += 1
@@ -323,13 +353,15 @@ def renewal_scan() -> Dict[str, Any]:
                 'error': str(e)
             })
 
-    # Publish all expiry metrics in a single API call (max 1000 per call)
+    # Publish all expiry metrics in batches (max 1000 per API call)
     if expiry_metrics:
         try:
-            cloudwatch_client.put_metric_data(
-                Namespace=CW_NAMESPACE,
-                MetricData=expiry_metrics[:1000]
-            )
+            for i in range(0, len(expiry_metrics), 1000):
+                batch = expiry_metrics[i:i + 1000]
+                cloudwatch_client.put_metric_data(
+                    Namespace=CW_NAMESPACE,
+                    MetricData=batch,
+                )
             logger.info(f"Published {len(expiry_metrics)} expiry metrics")
         except Exception as e:
             logger.error(f"Failed to publish batched expiry metrics: {e}")
@@ -337,7 +369,7 @@ def renewal_scan() -> Dict[str, Any]:
     # Trigger a single cert sync after all renewals (instead of per-domain)
     if results['renewed'] > 0:
         logger.info(f"Triggering cert sync after {results['renewed']} renewal(s)")
-        trigger_cert_sync('renewal-scan-batch')
+        trigger_cert_sync(BATCH_SYNC_RENEWAL)
 
     logger.info(f"Renewal scan complete: {results['scanned']} scanned, "
                 f"{results['renewed']} renewed, {results['failed']} failed, "
@@ -349,24 +381,92 @@ def renewal_scan() -> Dict[str, Any]:
     return results
 
 
-def list_custom_domain_secrets() -> list:
-    """List all Secrets Manager secrets with our prefix."""
-    secrets = []
-    paginator = secrets_client.get_paginator('list_secrets')
+def list_cert_meta_params() -> list:
+    """List all /meta SSM parameters under the cert prefix.
+
+    Only fetches /meta params (plain String type, no decryption needed).
+    Used by renewal_scan to check expiry without KMS cost.
+    """
+    params = []
+    paginator = ssm_client.get_paginator('get_parameters_by_path')
 
     for page in paginator.paginate(
-        Filters=[
-            {
-                'Key': 'name',
-                'Values': [f"{SECRETS_PREFIX}/"]
-            }
-        ]
+        Path=f"{SSM_CERT_PREFIX}/",
+        Recursive=True,
+        WithDecryption=False,  # /meta params are String type, no decryption needed
     ):
-        for secret in page.get('SecretList', []):
-            secrets.append(secret)
+        for param in page.get('Parameters', []):
+            if param['Name'].endswith('/meta'):
+                params.append(param)
 
-    logger.info(f"Found {len(secrets)} custom domain certificate secrets")
-    return secrets
+    logger.info(f"Found {len(params)} custom domain certificate meta params")
+    return params
+
+
+def provision_pending_domains() -> Dict[str, Any]:
+    """Provision certs for domains in 'provisioning_tls' status.
+
+    Called alongside renewal_scan on every EventBridge trigger (every 15 min).
+    Queries DynamoDB for domains awaiting cert provisioning and provisions
+    each one. Triggers a single full cert sync after all provisioning.
+
+    Requires a GSI named 'status-index' on the qurl-domains DynamoDB table
+    with partition key 'status' (String). This GSI is defined in the nhp
+    repo's DynamoDB module (terraform/modules/dynamodb/main.tf).
+    """
+    if not QURL_DOMAINS_TABLE:
+        return {'provisioned': 0, 'failed': 0}
+
+    try:
+        # Query DynamoDB for domains awaiting cert provisioning
+        # Uses the status-index GSI on the status field
+        items = []
+        query_kwargs = {
+            'TableName': QURL_DOMAINS_TABLE,
+            'IndexName': 'status-index',
+            'KeyConditionExpression': '#s = :status',
+            'ExpressionAttributeNames': {'#s': 'status'},
+            'ExpressionAttributeValues': {':status': {'S': STATUS_PROVISIONING_TLS}},
+        }
+        while True:
+            response = dynamodb_client.query(**query_kwargs)
+            items.extend(response.get('Items', []))
+            last_key = response.get('LastEvaluatedKey')
+            if not last_key:
+                break
+            query_kwargs['ExclusiveStartKey'] = last_key
+    except Exception as e:
+        logger.error(f"Failed to query pending domains: {e}")
+        return {'provisioned': 0, 'failed': 0, 'error': str(e)}
+
+    if not items:
+        logger.info("No domains pending TLS provisioning")
+        return {'provisioned': 0, 'failed': 0}
+
+    logger.info(f"Found {len(items)} domains pending TLS provisioning")
+    provisioned = 0
+    failed = 0
+
+    for item in items:
+        domain_name = item['domain']['S']
+        if not is_valid_domain(domain_name):
+            logger.warning(f"Skipping invalid domain from DynamoDB: {domain_name}")
+            failed += 1
+            continue
+        acme_subdomain = domain_to_acme_subdomain(domain_name)
+
+        try:
+            provision_certificate(domain_name, acme_subdomain, skip_sync=True)
+            provisioned += 1
+        except Exception as e:
+            logger.error(f"Failed to provision {domain_name}: {e}")
+            failed += 1
+
+    if provisioned > 0:
+        logger.info(f"Triggering cert sync after provisioning {provisioned} domain(s)")
+        trigger_cert_sync(BATCH_SYNC_PROVISION)
+
+    return {'provisioned': provisioned, 'failed': failed}
 
 
 def get_or_create_acme_account() -> Any:
@@ -660,65 +760,60 @@ def wait_for_dns_propagation(record_name: str, expected_value: str, max_attempts
     logger.warning(f"Could not confirm DNS propagation after {max_attempts} attempts, proceeding anyway")
 
 
+def _put_ssm_secure_param(name: str, value: str):
+    """Store a SecureString parameter in SSM, optionally encrypted with KMS CMK."""
+    put_kwargs = {
+        'Name': name,
+        'Value': value,
+        'Type': 'SecureString',
+        'Overwrite': True,
+        'Tier': 'Standard',
+    }
+    if KMS_KEY_ARN:
+        put_kwargs['KeyId'] = KMS_KEY_ARN
+    ssm_client.put_parameter(**put_kwargs)
+
+
 def store_certificate(domain: str, private_key_pem: str, cert_pem: str, chain_pem: str,
                       expires_at: str, acme_subdomain: str = None) -> str:
     """
-    Store certificate in Secrets Manager.
+    Store certificate in SSM Parameter Store as three parameters.
 
-    Creates a new secret or updates an existing one at {prefix}/{domain}.
+    - {prefix}/{domain}/key — private key PEM (SecureString)
+    - {prefix}/{domain}/chain — fullchain PEM (SecureString)
+    - {prefix}/{domain}/meta — JSON metadata (String, no encryption)
 
     Returns:
-        ARN of the secret
+        The SSM parameter prefix for this domain's cert params
     """
-    secret_name = f"{SECRETS_PREFIX}/{domain}"
+    param_prefix = f"{SSM_CERT_PREFIX}/{domain}"
     fullchain = cert_pem + chain_pem
 
     if not acme_subdomain:
-        acme_subdomain = domain.replace('.', '--')
+        acme_subdomain = domain_to_acme_subdomain(domain)
 
-    secret_value = {
-        FIELD_PRIVATE_KEY: private_key_pem,
-        FIELD_CERTIFICATE: cert_pem,
-        FIELD_CHAIN: chain_pem,
-        FIELD_FULLCHAIN: fullchain,
-        FIELD_EXPIRES_AT: expires_at,
-        FIELD_DOMAIN: domain,
-        FIELD_ACME_SUBDOMAIN: acme_subdomain,
-        FIELD_RENEWED_AT: datetime.now(timezone.utc).isoformat(),
-        FIELD_STATUS: STATUS_ACTIVE,
-    }
+    logger.info(f"Storing certificate in SSM Parameter Store: {param_prefix}")
 
-    logger.info(f"Storing certificate in Secrets Manager: {secret_name}")
+    _put_ssm_secure_param(f"{param_prefix}/key", private_key_pem)
+    _put_ssm_secure_param(f"{param_prefix}/chain", fullchain)
 
-    try:
-        # Try to update existing secret
-        response = secrets_client.put_secret_value(
-            SecretId=secret_name,
-            SecretString=json.dumps(secret_value)
-        )
-        return response['ARN']
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'ResourceNotFoundException':
-            # Create new secret
-            create_kwargs = {
-                'Name': secret_name,
-                'Description': f"TLS certificate for custom domain {domain}",
-                'SecretString': json.dumps(secret_value),
-                'Tags': [
-                    {'Key': 'Module', 'Value': 'custom-domain-cert'},
-                    {'Key': 'Domain', 'Value': domain}
-                ]
-            }
-            if KMS_KEY_ARN:
-                create_kwargs['KmsKeyId'] = KMS_KEY_ARN
+    # Store metadata (plain String — not sensitive, no KMS cost)
+    ssm_client.put_parameter(
+        Name=f"{param_prefix}/meta",
+        Value=json.dumps({
+            FIELD_DOMAIN: domain,
+            FIELD_EXPIRES_AT: expires_at,
+            FIELD_ACME_SUBDOMAIN: acme_subdomain,
+        }),
+        Type='String',
+        Overwrite=True,
+    )
 
-            response = secrets_client.create_secret(**create_kwargs)
-            logger.info(f"Created new secret for {domain}")
-            return response['ARN']
-        raise
+    logger.info(f"Stored certificate params for {domain}")
+    return param_prefix
 
 
-def update_domain_status(domain: str, status: str, cert_secret_arn: str = None,
+def update_domain_status(domain: str, status: str, cert_param_prefix: str = None,
                          cert_expires_at: str = None, error: str = None):
     """Update domain status in the qurl-domains DynamoDB table."""
     if not QURL_DOMAINS_TABLE:
@@ -726,29 +821,35 @@ def update_domain_status(domain: str, status: str, cert_secret_arn: str = None,
         return
 
     try:
+        now_iso = datetime.now(timezone.utc).isoformat()
         update_expr_parts = ['#s = :status', '#ua = :updated_at']
         expr_names = {
-            '#s': 'cert_status',
+            '#s': 'status',
             '#ua': 'updated_at'
         }
         expr_values = {
             ':status': {'S': status},
-            ':updated_at': {'S': datetime.now(timezone.utc).isoformat()}
+            ':updated_at': {'S': now_iso}
         }
 
-        if cert_secret_arn:
-            update_expr_parts.append('#csa = :cert_secret_arn')
-            expr_names['#csa'] = 'cert_secret_arn'
-            expr_values[':cert_secret_arn'] = {'S': cert_secret_arn}
+        if cert_param_prefix:
+            update_expr_parts.append('#cpp = :cert_param_prefix')
+            expr_names['#cpp'] = 'cert_param_prefix'
+            expr_values[':cert_param_prefix'] = {'S': cert_param_prefix}
 
         if cert_expires_at:
             update_expr_parts.append('#cea = :cert_expires_at')
             expr_names['#cea'] = 'cert_expires_at'
             expr_values[':cert_expires_at'] = {'S': cert_expires_at}
 
+        if status == STATUS_ACTIVE:
+            update_expr_parts.append('#aa = :activated_at')
+            expr_names['#aa'] = 'activated_at'
+            expr_values[':activated_at'] = {'S': now_iso}
+
         if error:
             update_expr_parts.append('#err = :error')
-            expr_names['#err'] = 'cert_error'
+            expr_names['#err'] = 'failure_reason'
             expr_values[':error'] = {'S': error[:500]}
 
         dynamodb_client.update_item(
@@ -766,15 +867,30 @@ def update_domain_status(domain: str, status: str, cert_secret_arn: str = None,
 
 
 def trigger_cert_sync(domain: str):
-    """Trigger certificate sync on AC instances via SSM SendCommand."""
+    """Trigger certificate sync on AC instances via SSM SendCommand.
+
+    For single-domain provisioning, uses incremental mode (--domain flag)
+    to avoid a full rebuild. For batch operations (renewal-scan-batch,
+    provision-batch), triggers a full sync.
+    """
     try:
         ac_instance_tag = os.environ.get('AC_INSTANCE_TAG')
         if not ac_instance_tag:
             logger.info("No AC_INSTANCE_TAG configured, skipping cert sync trigger")
             return
 
-        # Parse tag name:value from the tag string
-        # Tag format is the Name tag value for the instances
+        # Batch triggers use full sync; single-domain uses incremental
+        if domain in (BATCH_SYNC_RENEWAL, BATCH_SYNC_PROVISION):
+            sync_cmd = '/home/ubuntu/scripts/custom-domain-cert-sync.sh'
+        else:
+            # Re-validate and shell-quote domain to prevent command injection.
+            # Domain is validated in handler() but passes through DynamoDB in
+            # provision_pending_domains(), so defense-in-depth matters here.
+            if not is_valid_domain(domain):
+                logger.error(f"Invalid domain format in trigger_cert_sync: {domain}")
+                return
+            sync_cmd = f'/home/ubuntu/scripts/custom-domain-cert-sync.sh --domain {shlex.quote(domain)}'
+
         response = ssm_client.send_command(
             Targets=[
                 {
@@ -786,7 +902,7 @@ def trigger_cert_sync(domain: str):
             Parameters={
                 'commands': [
                     'echo "Custom domain cert sync triggered"',
-                    '/home/ubuntu/scripts/custom-domain-cert-sync.sh || true'
+                    f'{sync_cmd} || true'
                 ]
             },
             TimeoutSeconds=120,

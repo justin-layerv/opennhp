@@ -162,7 +162,7 @@ resource "aws_ssm_association" "disk_monitor" {
 }
 
 # ==================== Custom Domain Cert Sync ====================
-# Syncs custom domain TLS certificates from Secrets Manager and rebuilds Traefik config
+# Syncs custom domain TLS certificates from SSM Parameter Store and rebuilds Traefik config
 
 resource "aws_ssm_document" "custom_domain_cert_sync" {
   count = var.enable_ssm_maintenance ? 1 : 0
@@ -173,16 +173,16 @@ resource "aws_ssm_document" "custom_domain_cert_sync" {
 
   content = <<-DOC
     schemaVersion: '2.2'
-    description: 'Sync custom domain TLS certificates from Secrets Manager'
+    description: 'Sync custom domain TLS certificates from SSM Parameter Store'
     parameters:
-      SecretsPrefix:
+      SsmCertPrefix:
         type: String
-        default: "custom-domain-cert"
-        description: "Secrets Manager prefix for custom domain certs"
+        default: "/nhp/certs"
+        description: "SSM Parameter Store prefix for custom domain certs"
       AwsRegion:
         type: String
         default: "${data.aws_region.current.name}"
-        description: "AWS region for Secrets Manager"
+        description: "AWS region for SSM Parameter Store"
       TraefikDir:
         type: String
         default: "/home/ubuntu/traefik"
@@ -195,7 +195,7 @@ resource "aws_ssm_document" "custom_domain_cert_sync" {
             - |
               #!/bin/bash
               set -e
-              export SECRETS_PREFIX="{{ SecretsPrefix }}"
+              export SSM_CERT_PREFIX="{{ SsmCertPrefix }}"
               export AWS_REGION="{{ AwsRegion }}"
               export TRAEFIK_DIR="{{ TraefikDir }}"
               ${indent(14, file("${path.module}/scripts/custom-domain-cert-sync.sh"))}
@@ -221,7 +221,7 @@ resource "aws_ssm_association" "custom_domain_cert_sync" {
   compliance_severity = "HIGH"
 
   parameters = {
-    SecretsPrefix = "custom-domain-cert"
+    SsmCertPrefix = "/nhp/certs"
     AwsRegion     = data.aws_region.current.name
   }
 }
