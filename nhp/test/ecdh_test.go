@@ -27,9 +27,9 @@ func TestPublicKeys(t *testing.T) {
 		fmt.Printf("Private key decode error\n")
 		return
 	}
-	curvee := core.ECDHFromKey(core.ECC_CURVE25519, prk)
-	if curvee == nil {
-		fmt.Printf("Wrong private key\n")
+	curvee, err2 := core.ECDHFromKey(core.ECC_CURVE25519, prk)
+	if err2 != nil {
+		fmt.Printf("Wrong private key: %v\n", err2)
 		return
 	}
 

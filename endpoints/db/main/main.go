@@ -150,9 +150,9 @@ func initApp() {
 			if err != nil {
 				return err
 			}
-			e := core.ECDHFromKey(core.ECC_CURVE25519, privKey)
-			if e == nil {
-				return errors.New("invalid input key")
+			e, err := core.ECDHFromKey(core.ECC_CURVE25519, privKey)
+			if err != nil {
+				return fmt.Errorf("invalid input key: %w", err)
 			}
 			pub := e.PublicKeyBase64()
 			fmt.Println("Public key: ", pub)
@@ -290,7 +290,12 @@ func runApp(params db.AppParams) error {
 					}
 				}
 
-				dataPbk := core.ECDHFromKey(dataKeyPairEccMode.ToEccType(), dataPrk).PublicKey()
+				dataEcdh, err := core.ECDHFromKey(dataKeyPairEccMode.ToEccType(), dataPrk)
+				if err != nil {
+					log.Error("failed to create ECDH from data key: %v", err)
+					return err
+				}
+				dataPbk := dataEcdh.PublicKey()
 				sa := ztdolib.NewSymmetricAgreement(dataKeyPairEccMode, true)
 				sa.SetMessagePatterns(dataMsgPattern)
 
@@ -360,9 +365,15 @@ func runApp(params db.AppParams) error {
 			fmt.Printf("Error: failed to decode data private key base64: %v\n", err)
 			os.Exit(1)
 		}
+		decryptEcdh, err := core.ECDHFromKey(dataKeyPairEccMode.ToEccType(), dataPrk)
+		if err != nil {
+			log.Error("failed to create ECDH from data key: %v", err)
+			fmt.Printf("Error: failed to create ECDH from data key: %v\n", err)
+			os.Exit(1)
+		}
 		sa := ztdolib.NewSymmetricAgreement(dataKeyPairEccMode, false)
 		sa.SetMessagePatterns(dataMsgPattern)
-		sa.SetStaticKeyPair(core.ECDHFromKey(dataKeyPairEccMode.ToEccType(), dataPrk))
+		sa.SetStaticKeyPair(decryptEcdh)
 
 		providerPublicKey, err := base64.StdEncoding.DecodeString(params.ProviderPublicKeyBase64)
 		if err != nil {

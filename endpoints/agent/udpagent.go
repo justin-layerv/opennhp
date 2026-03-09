@@ -836,7 +836,10 @@ func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOut
 	if err != nil {
 		return "", fmt.Errorf("failed to generate ephemeral ECDH: %w", err)
 	}
-	teeEcdh := a.config.GetTeeEcdh()
+	teeEcdh, err := a.config.GetTeeEcdh()
+	if err != nil {
+		return "", fmt.Errorf("failed to get TEE ECDH: %w", err)
+	}
 
 	darMsg := common.DARMsg{
 		DoId:                       ztdoId,
@@ -924,9 +927,13 @@ func (a *UdpAgent) RefreshDataAccess(ztdoId string, decrypted bool, decryptedOut
 			if err != nil {
 				return "", fmt.Errorf("failed to decode data private key base64: %w", err)
 			}
+			dataEcdh, err := core.ECDHFromKey(dataKeyPairEccMode.ToEccType(), dataPrk)
+			if err != nil {
+				return "", fmt.Errorf("failed to create ECDH from data key: %w", err)
+			}
 			saData := ztdolib.NewSymmetricAgreement(dataKeyPairEccMode, false)
 			saData.SetMessagePatterns(dataMsgPattern)
-			saData.SetStaticKeyPair(core.ECDHFromKey(dataKeyPairEccMode.ToEccType(), dataPrk))
+			saData.SetStaticKeyPair(dataEcdh)
 
 			providerPublicKey, err := base64.StdEncoding.DecodeString(dataPrkWrapping.ProviderPublicKeyBase64)
 			if err != nil {

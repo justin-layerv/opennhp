@@ -90,9 +90,10 @@ func NewDevice(t int, prk []byte, option *DeviceOptions) *Device {
 		d.option = defaultDeviceOptions(t)
 	}
 
-	d.staticEcdh = ECDHFromKey(ECC_CURVE25519, prk)
-	if d.staticEcdh == nil {
-		log.Critical("Failed to set private key")
+	var err error
+	d.staticEcdh, err = ECDHFromKey(ECC_CURVE25519, prk)
+	if err != nil {
+		log.Critical("Failed to set private key: %v", err)
 		return nil
 	}
 

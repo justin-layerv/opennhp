@@ -4,14 +4,13 @@ package core
 // This eliminates CGO dependency from the core package.
 const (
 	// General errors
-	errNhpSuccess                = 0
-	errNhpDeviceNotInitialized   = 30000
-	errNhpDeviceAlreadyCreated   = 30001
-	errNhpCipherNotSupported     = 30002
-	errNhpOperationNotApplicable = 30003
-	errNhpCreateDeviceFailed     = 30004
-	errNhpCloseDeviceFailed      = 30005
-	errNhpSdkRuntimePanic        = 30006
+	errNhpSuccess              = 0
+	errNhpDeviceNotInitialized = 30000
+	errNhpDeviceAlreadyCreated = 30001
+	errNhpCipherNotSupported   = 30002
+	errNhpCreateDeviceFailed   = 30004
+	errNhpCloseDeviceFailed    = 30005
+	errNhpSdkRuntimePanic      = 30006
 
 	// Encryption errors
 	errNhpWrongCipherScheme       = 31000

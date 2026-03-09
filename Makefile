@@ -218,7 +218,6 @@ test-all: test test-lambdas test-local ## Run all tests
 fuzz:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running fuzz tests...$(END_COLOUR)"
 	cd nhp && go test -fuzz=FuzzECDHFromKey -fuzztime=60s ./test/
-	cd nhp && go test -fuzz=FuzzAESDecrypt -fuzztime=60s ./test/
 	cd nhp && go test -fuzz=FuzzHeaderTypeToDeviceType -fuzztime=60s ./test/
 	cd nhp && go test -fuzz=FuzzAgentKnockMsg -fuzztime=60s ./test/
 	@echo "$(COLOUR_GREEN)[OpenNHP] Fuzz tests completed$(END_COLOUR)"
@@ -227,7 +226,7 @@ fuzz:
 fuzz-quick:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running quick fuzz tests...$(END_COLOUR)"
 	cd nhp && go test -fuzz=FuzzECDHFromKey -fuzztime=10s ./test/
-	cd nhp && go test -fuzz=FuzzAESDecrypt -fuzztime=10s ./test/
+	cd nhp && go test -fuzz=FuzzHeaderTypeToDeviceType -fuzztime=10s ./test/
 	cd nhp && go test -fuzz=FuzzAgentKnockMsg -fuzztime=10s ./test/
 	@echo "$(COLOUR_GREEN)[OpenNHP] Quick fuzz tests completed$(END_COLOUR)"
 

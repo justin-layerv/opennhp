@@ -243,11 +243,23 @@ func (a *UdpAgent) callFunction(c *gin.Context) {
 }
 
 func (a *UdpAgent) getAgentPublicKey(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"publicKey": a.config.GetAgentEcdh().PublicKeyBase64()})
+	ecdh, err := a.config.GetAgentEcdh()
+	if err != nil {
+		log.Error("failed to load agent key: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load agent key"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"publicKey": ecdh.PublicKeyBase64()})
 }
 
 func (a *UdpAgent) getTeePublicKey(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"publicKey": a.config.GetTeeEcdh().PublicKeyBase64()})
+	ecdh, err := a.config.GetTeeEcdh()
+	if err != nil {
+		log.Error("failed to load TEE key: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load TEE key"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"publicKey": ecdh.PublicKeyBase64()})
 }
 
 func (a *UdpAgent) configServer(c *gin.Context) {

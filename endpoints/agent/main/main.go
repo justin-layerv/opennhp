@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -68,9 +67,9 @@ func main() {
 			if err != nil {
 				return err
 			}
-			e := core.ECDHFromKey(core.ECC_CURVE25519, privKey)
-			if e == nil {
-				return errors.New("invalid input key")
+			e, err := core.ECDHFromKey(core.ECC_CURVE25519, privKey)
+			if err != nil {
+				return fmt.Errorf("invalid input key: %w", err)
 			}
 			pub := e.PublicKeyBase64()
 			fmt.Println("Public key: ", pub)

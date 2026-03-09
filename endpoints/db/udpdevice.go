@@ -86,6 +86,7 @@ type UdpDevice struct {
 	teeMap   map[string]*TEE // indexed by tee's public key
 
 	device  *core.Device
+	ownEcdh core.Ecdh // cached at startup, derived from config private key
 	wg      sync.WaitGroup
 	running atomic.Bool
 
@@ -145,6 +146,8 @@ func (a *UdpDevice) Start(dirPath string, logLevel int) (err error) {
 		log.Critical("failed to create device")
 		return errors.New("failed to create device")
 	}
+
+	a.ownEcdh = a.device.GetEcdhByCipherScheme(common.CIPHER_SCHEME_CURVE)
 
 	a.remoteConnectionMap = make(map[string]*UdpConn)
 	a.serverPeerMap = make(map[string]*core.UdpPeer)
@@ -860,8 +863,7 @@ func (a *UdpDevice) GetDataBrokerId() string {
 }
 
 func (a *UdpDevice) GetOwnEcdh() core.Ecdh {
-	prk, _ := base64.StdEncoding.DecodeString(a.config.PrivateKeyBase64)
-	return core.ECDHFromKey(core.ECC_CURVE25519, prk)
+	return a.ownEcdh
 }
 
 func (a *UdpDevice) isTEEAuthorized(teePbkBase64 string) bool {

@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -37,13 +38,19 @@ type DHPConfig struct {
 	TEEPrivateKeyBase64 string `json:"teePrivateKeyBase64"`
 }
 
-func (c *Config) GetAgentEcdh() core.Ecdh {
-	teePrk, _ := base64.StdEncoding.DecodeString(c.PrivateKeyBase64)
+func (c *Config) GetAgentEcdh() (core.Ecdh, error) {
+	teePrk, err := base64.StdEncoding.DecodeString(c.PrivateKeyBase64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode private key: %w", err)
+	}
 	return core.ECDHFromKey(core.ECC_CURVE25519, teePrk)
 }
 
-func (c *Config) GetTeeEcdh() core.Ecdh {
-	teePrk, _ := base64.StdEncoding.DecodeString(c.TEEPrivateKeyBase64)
+func (c *Config) GetTeeEcdh() (core.Ecdh, error) {
+	teePrk, err := base64.StdEncoding.DecodeString(c.TEEPrivateKeyBase64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode TEE private key: %w", err)
+	}
 	return core.ECDHFromKey(core.ECC_CURVE25519, teePrk)
 }
 

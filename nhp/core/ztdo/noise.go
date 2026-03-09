@@ -186,14 +186,6 @@ func NewDataKeyPairECCMode(eccMode core.EccTypeEnum) (DataKeyPairECCMode, error)
 	}
 }
 
-func (d DataKeyPairECCMode) ECDHFromKey(prk []byte) core.Ecdh {
-	return core.ECDHFromKey(d.ToEccType(), prk)
-}
-
-func (d DataKeyPairECCMode) PublicKeyFromKey(prk []byte) []byte {
-	return core.ECDHFromKey(d.ToEccType(), prk).PublicKey()
-}
-
 // MessagePattern defines a set of tokens which are used during symmetric key agreement
 type MessagePattern int
 

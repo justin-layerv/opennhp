@@ -80,7 +80,6 @@ var (
 
 	// device
 	ErrCipherNotSupported = newError(errNhpCipherNotSupported, "cipher scheme not supported")
-	ErrNotApplicable      = newError(errNhpOperationNotApplicable, "operation not applicable")
 	ErrCreateDeviceFailed = newError(errNhpCreateDeviceFailed, "failed to create nhp device")
 	ErrCloseDeviceFailed  = newError(errNhpCloseDeviceFailed, "attempt to close a non-initialized nhp device")
 	ErrRuntimePanic       = newError(errNhpSdkRuntimePanic, "runtime panic encountered")

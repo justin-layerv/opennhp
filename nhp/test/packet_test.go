@@ -28,7 +28,10 @@ func TestHMAC(t *testing.T) {
 
 	header := (*curve.HeaderCurve)(unsafe.Pointer(&buf[0]))
 	ciphers := core.NewCipherSuite()
-	serverEcdh := core.ECDHFromKey(ciphers.EccType, prk)
+	serverEcdh, err := core.ECDHFromKey(ciphers.EccType, prk)
+	if err != nil {
+		t.Fatalf("ECDHFromKey failed: %v", err)
+	}
 
 	hmacHash, err := core.NewHash(ciphers.HashType)
 	if err != nil {

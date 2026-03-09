@@ -445,8 +445,8 @@ func nhp_privkey_to_pubkey(privateBase64 *C.char) *C.char {
 		return nil
 	}
 
-	e := core.ECDHFromKey(core.ECC_CURVE25519, privKeyBytes)
-	if e == nil {
+	e, err := core.ECDHFromKey(core.ECC_CURVE25519, privKeyBytes)
+	if err != nil {
 		return nil
 	}
 	pub := e.PublicKeyBase64()
@@ -1425,8 +1425,8 @@ func NhpPrivkeyToPubkey(privateBase64 string) string {
 		return ""
 	}
 
-	e := core.ECDHFromKey(core.ECC_CURVE25519, privKeyBytes)
-	if e == nil {
+	e, err := core.ECDHFromKey(core.ECC_CURVE25519, privKeyBytes)
+	if err != nil {
 		return ""
 	}
 	pub := e.PublicKeyBase64()

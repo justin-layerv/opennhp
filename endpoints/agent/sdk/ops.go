@@ -244,8 +244,8 @@ func PrivkeyToPubkey(privateBase64 string) string {
 	if err != nil {
 		return ""
 	}
-	e := core.ECDHFromKey(core.ECC_CURVE25519, privKeyBytes)
-	if e == nil {
+	e, err := core.ECDHFromKey(core.ECC_CURVE25519, privKeyBytes)
+	if err != nil {
 		return ""
 	}
 	return e.PublicKeyBase64()
