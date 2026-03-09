@@ -87,7 +87,11 @@ echo "RDS credentials retrieved"
 echo "Setting up NHP Protection (true network-level hiding)..."
 
 # Install iptables and ipset for firewall rules
+# iptables-persistent is pre-seeded to skip interactive prompts during install
 apt_get_with_retry install -y iptables ipset python3-cryptography
+echo iptables-persistent iptables-persistent/autosave_v4 boolean false | debconf-set-selections
+echo iptables-persistent iptables-persistent/autosave_v6 boolean false | debconf-set-selections
+apt_get_with_retry install -y iptables-persistent
 
 # ============================================================================
 # NHP Firewall Setup - ipset and iptables rules for zero-trust access control
@@ -132,58 +136,57 @@ if [ -z "$LOCAL_IP" ]; then
 fi
 
 # Create ipsets for NHP traffic control
-# - defaultset: active sessions after successful knock (120s timeout)
-# - tempset: temporary entries for initial knock (5s timeout)
-ipset -exist create defaultset hash:ip,port,ip counters maxelem 1000000 timeout 120
-ipset -exist create defaultset_down hash:ip,port,ip counters maxelem 1000000 timeout 121
-ipset -exist create tempset hash:net,port counters maxelem 1000000 timeout 5
+# - defaultset: active sessions after successful knock (configurable timeout, default 120s)
+# - tempset: temporary entries for initial knock (configurable timeout, default 5s)
+ipset -exist create defaultset hash:ip,port,ip counters maxelem 1000000 timeout ${ipset_default_timeout}
+ipset -exist create defaultset_down hash:ip,port,ip counters maxelem 1000000 timeout $((${ipset_default_timeout} + 1))
+ipset -exist create tempset hash:net,port counters maxelem 1000000 timeout ${ipset_temp_timeout}
 
-echo "ipsets created successfully"
+echo "ipsets created successfully (defaultset timeout=${ipset_default_timeout}s, tempset timeout=${ipset_temp_timeout}s)"
 
-# Create NHP_DENY chain for logging and dropping unauthorized traffic
-iptables -N NHP_DENY 2>/dev/null || true
-iptables -F NHP_DENY
-iptables -A NHP_DENY -j LOG --log-prefix "[NHP-DENY] " --log-level 6 --log-ip-options
-iptables -A NHP_DENY -j DROP
+# Build iptables rules and apply atomically with iptables-restore.
+# This avoids the race condition where individual iptables commands leave
+# a brief window with incomplete rules, and ensures crash recovery leaves
+# either the old complete ruleset or the new complete ruleset in place.
+echo "Applying iptables rules atomically via iptables-restore..."
 
-# Clear existing rules to avoid duplicates
-iptables -F INPUT
+# Two-stage evaluation: Terraform's templatefile() substitutes ${vpc_cidr},
+# ${console_port}, etc. when rendering this template to the final user-data script.
+# The single-quoted heredoc delimiter (<<'IPTABLES_RULES') prevents bash from
+# expanding anything at runtime, but by that point Terraform has already replaced
+# all ${...} references with their literal values.
+if ! iptables-restore <<'IPTABLES_RULES'
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+:NHP_DENY - [0:0]
+-A NHP_DENY -j LOG --log-prefix "[NHP-DENY] " --log-level 6 --log-ip-options
+-A NHP_DENY -j DROP
+-A INPUT -i lo -j ACCEPT
+-A INPUT -p tcp -s ${vpc_cidr} --dport 22 -j ACCEPT
+-A INPUT -p tcp -s ${vpc_cidr} --dport ${console_port} -j ACCEPT
+-A INPUT -p udp -s ${vpc_cidr} --dport 62206 -j ACCEPT
+-A INPUT -m state --state ESTABLISHED -j ACCEPT
+-A INPUT -m set --match-set tempset src,dst -j SET --add-set defaultset src,dst,dst
+-A INPUT -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst
+-A INPUT -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT] " --log-level 6 --log-ip-options
+-A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT
+-A INPUT -m set --match-set tempset src,dst -j ACCEPT
+-A INPUT -p tcp --dport 443 -j NHP_DENY
+COMMIT
+IPTABLES_RULES
+then
+    echo "ERROR: iptables-restore failed — new rules not applied, previous rules retained"
+    exit 1
+fi
 
-# Setup INPUT chain rules
-echo "Configuring INPUT chain..."
+echo "NHP firewall setup complete - port 443 is DROP'd by default (applied atomically)"
 
-# Allow loopback
-iptables -A INPUT -i lo -j ACCEPT
-
-# Allow SSH from VPC (for management/debugging)
-iptables -A INPUT -p tcp -s "${vpc_cidr}" --dport 22 -j ACCEPT
-
-# Allow Console port from VPC (for internal NLB traffic from AC)
-iptables -A INPUT -p tcp -s "${vpc_cidr}" --dport ${console_port} -j ACCEPT
-
-# Allow NHP knock port from VPC (NHP Server sends knocks here)
-iptables -A INPUT -p udp -s "${vpc_cidr}" --dport 62206 -j ACCEPT
-
-# Allow established connections
-iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-# ipset rules: tempset -> defaultset promotion, then accept
-iptables -A INPUT -m set --match-set tempset src,dst -j SET --add-set defaultset src,dst,dst
-iptables -A INPUT -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst
-iptables -A INPUT -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT] " --log-level 6 --log-ip-options
-iptables -A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT
-iptables -A INPUT -m set --match-set tempset src,dst -j ACCEPT
-
-# Port 443 (protected) - DROP unless in ipset (handled by NHP_DENY)
-# Traffic must pass ipset check above to reach port 443
-iptables -A INPUT -p tcp --dport 443 -j NHP_DENY
-
-# Default policy
-iptables -P INPUT DROP
-iptables -P OUTPUT ACCEPT
-iptables -P FORWARD DROP
-
-echo "NHP firewall setup complete - port 443 is DROP'd by default"
+# Persist iptables rules across reboots via iptables-persistent
+mkdir -p /etc/iptables
+iptables-save > /etc/iptables/rules.v4
+echo "iptables rules persisted to /etc/iptables/rules.v4"
 
 # ============================================================================
 # rsyslog configuration for NHP logging
@@ -200,9 +203,9 @@ template(name="NHPFormat" type="string" string="%timegenerated:8:19% $LOCAL_IP %
 template(name="NHPAcceptFile" type="string" string="/opt/layerv/nhp-ac/logs/nhp_accept-%\$YEAR%-%\$MONTH%-%\$DAY%.log")
 template(name="NHPDenyFile" type="string" string="/opt/layerv/nhp-ac/logs/nhp_deny-%\$YEAR%-%\$MONTH%-%\$DAY%.log")
 
-:msg,contains,"[NHP-ACCEPT]" ?NHPAcceptFile;NHPFormat
+:msg,contains,"[NHP-ACCEPT" ?NHPAcceptFile;NHPFormat
 & stop
-:msg,contains,"[NHP-DENY]" ?NHPDenyFile;NHPFormat
+:msg,contains,"[NHP-DENY" ?NHPDenyFile;NHPFormat
 & stop
 RSYSLOGEOF
 

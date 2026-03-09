@@ -299,6 +299,28 @@ variable "log_level" {
 # user's IP to ipset.
 # ============================================================================
 
+variable "ipset_default_timeout" {
+  description = "Timeout in seconds for defaultset ipset entries (active sessions after NHP knock). Clients must re-knock after this period."
+  type        = number
+  default     = 120
+
+  validation {
+    condition     = var.ipset_default_timeout >= 10 && var.ipset_default_timeout <= 86400
+    error_message = "ipset_default_timeout must be between 10 and 86400 seconds."
+  }
+}
+
+variable "ipset_temp_timeout" {
+  description = "Timeout in seconds for tempset ipset entries (initial knock window). Short to limit exposure during knock handshake."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.ipset_temp_timeout >= 1 && var.ipset_temp_timeout <= 60
+    error_message = "ipset_temp_timeout must be between 1 and 60 seconds."
+  }
+}
+
 variable "internal_only" {
   description = "Make Console internal-only (behind AC/NHP protection). When true, uses internal NLB, private subnets, HTTP-only mode."
   type        = bool

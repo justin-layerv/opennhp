@@ -403,6 +403,8 @@ locals {
     nhp_server_cloudmap_dns = var.nhp_server_cloudmap_dns
     vpc_cidr                = var.vpc_cidr
     name_prefix             = var.name_prefix
+    ipset_default_timeout   = var.ipset_default_timeout
+    ipset_temp_timeout      = var.ipset_temp_timeout
     secrets_kms_key_arn     = var.secrets_kms_key_arn != null ? var.secrets_kms_key_arn : ""
     # etcd for Console AC registration
     etcd_endpoint       = var.etcd_endpoint

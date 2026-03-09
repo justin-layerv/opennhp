@@ -724,16 +724,18 @@ resource "aws_service_discovery_service" "ac" {
 # Note: Depends on local._validate_console_routing to force validation before template rendering
 locals {
   user_data = local._validate_console_routing ? templatefile("${path.module}/user_data.sh.tpl", {
-    region              = local.region
-    account_id          = local.account_id
-    ac_repo_url         = var.ac_repo_url
-    environment         = var.environment
-    domain_name         = var.domain_name
-    acme_email          = var.acme_email
-    acme_ca_server      = coalesce(var.use_production_acme, local.is_prod) ? "https://acme-v02.api.letsencrypt.org/directory" : "https://acme-staging-v02.api.letsencrypt.org/directory"
-    cloudmap_service_id = aws_service_discovery_service.ac.id
-    namespace_name      = var.namespace_name
-    vpc_cidr            = var.vpc_cidr
+    region                = local.region
+    account_id            = local.account_id
+    ac_repo_url           = var.ac_repo_url
+    environment           = var.environment
+    domain_name           = var.domain_name
+    acme_email            = var.acme_email
+    acme_ca_server        = coalesce(var.use_production_acme, local.is_prod) ? "https://acme-v02.api.letsencrypt.org/directory" : "https://acme-staging-v02.api.letsencrypt.org/directory"
+    cloudmap_service_id   = aws_service_discovery_service.ac.id
+    namespace_name        = var.namespace_name
+    vpc_cidr              = var.vpc_cidr
+    ipset_default_timeout = var.ipset_default_timeout
+    ipset_temp_timeout    = var.ipset_temp_timeout
     # Per-instance key generation
     name_prefix         = var.name_prefix
     secrets_kms_key_arn = var.secrets_kms_key_arn != null ? var.secrets_kms_key_arn : ""

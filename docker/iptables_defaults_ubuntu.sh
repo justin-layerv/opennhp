@@ -31,209 +31,71 @@ if [ -n "$IP6TABLES" ]; then
     fi
 fi
 
-### NHP_BLOCK chain ###
-echo "Setting up NHP_BLOCK chain ..."
-echo ""
-iptables -N NHP_BLOCK
-iptables -C NHP_BLOCK -j LOG --log-prefix "[NHP-BLOCK] " --log-level 6 --log-ip-options > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-    iptables -A NHP_BLOCK -j LOG --log-prefix "[NHP-BLOCK] " --log-level 6 --log-ip-options
-fi
-iptables -C NHP_BLOCK -j DROP > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-    iptables -A NHP_BLOCK -j DROP
-fi
-
-### INPUT chain ###
-echo "Setting up INPUT chain ..."
-echo ""
-# tempset -> defaultset
-iptables -C INPUT -m set --match-set tempset src,dst -j SET --add-set defaultset src,dst,dst > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-    iptables -A INPUT -m set --match-set tempset src,dst -j SET --add-set defaultset src,dst,dst
-fi
-
-# defaultset -> defaultset_down
-iptables -C INPUT -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-    iptables -A INPUT -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst
-fi
-
-# defaultset
-iptables -C INPUT -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT] " --log-level 6 --log-ip-options > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-    iptables -A INPUT -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT] " --log-level 6 --log-ip-options
-fi
-iptables -C INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-    iptables -A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT
-fi
-
-# tempset
-iptables -C INPUT -m set --match-set tempset src,dst -j ACCEPT > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-    iptables -A INPUT -m set --match-set tempset src,dst -j ACCEPT
-fi
-
-# loopback interface
-iptables -C INPUT -i lo -j ACCEPT > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-    iptables -I INPUT -i lo -j ACCEPT
-fi
-
-# ssh
-# iptables -C INPUT -p tcp --dport 22  -j ACCEPT > /dev/null 2>&1
-# if [ $? -ne 0 ]; then
-#     iptables -I INPUT -p tcp --dport 22  -j ACCEPT
-# fi
-
-# established connections
-iptables -C INPUT -m state --state ESTABLISHED -j ACCEPT > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-    iptables -A INPUT -m state --state ESTABLISHED -j ACCEPT
-fi
-
-# rest of INPUT
-iptables -C INPUT -j NHP_BLOCK > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-    iptables -A INPUT -j NHP_BLOCK
-fi
-
-### OUTPUT chain ###
-echo "Setting up OUTPUT chain ..."
-echo ""
-#iptables -A OUTPUT -m set --match-set defaultset_down dst,src,src -j SET --add-set defaultset_down dst,src,src
-
-### FORWARD chain ###
-echo "Setting up FORWARD chain ..."
+### IPv4 iptables rules (applied atomically via iptables-restore) ###
+echo "Applying IPv4 iptables rules atomically ..."
 echo ""
 
-# defaultset -> defaultset_down
-iptables -C FORWARD -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-    iptables -A FORWARD -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst
+if ! iptables-restore <<'IPTABLES_RULES'
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+:NHP_DENY - [0:0]
+-A NHP_DENY -j LOG --log-prefix "[NHP-DENY] " --log-level 6 --log-ip-options
+-A NHP_DENY -j DROP
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m state --state ESTABLISHED -j ACCEPT
+-A INPUT -m set --match-set tempset src,dst -j SET --add-set defaultset src,dst,dst
+-A INPUT -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst
+-A INPUT -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT] " --log-level 6 --log-ip-options
+-A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT
+-A INPUT -m set --match-set tempset src,dst -j ACCEPT
+-A INPUT -j NHP_DENY
+-A FORWARD -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst
+-A FORWARD -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-FORWARD] " --log-level 6 --log-ip-options
+-A FORWARD -m set --match-set defaultset src,dst,dst -j ACCEPT
+-A FORWARD -m state --state ESTABLISHED -j ACCEPT
+-A FORWARD -j NHP_DENY
+COMMIT
+IPTABLES_RULES
+then
+    echo "ERROR: iptables-restore failed — new IPv4 rules not applied, previous rules retained"
+    exit 1
 fi
 
-# defaultset
-iptables -C FORWARD -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-FORWARD] " --log-level 6 --log-ip-options > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-    iptables -A FORWARD -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-FORWARD] " --log-level 6 --log-ip-options
-fi
-iptables -C FORWARD -m set --match-set defaultset src,dst,dst -j ACCEPT > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-    iptables -A FORWARD -m set --match-set defaultset src,dst,dst -j ACCEPT
-fi
-
-# established connections
-iptables -C FORWARD -m state --state ESTABLISHED -j ACCEPT > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-    iptables -A FORWARD -m state --state ESTABLISHED -j ACCEPT
-fi
-
-# rest of FORWARD
-iptables -C FORWARD -j NHP_BLOCK > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-    iptables -A FORWARD -j NHP_BLOCK
-fi
-
-### chain policy (IPv4) ###
-iptables -P INPUT DROP
-iptables -P OUTPUT ACCEPT
-iptables -P FORWARD DROP
+echo "Setting IPv4 iptables OK ..."
 
 ### IPv6 firewall rules ###
 if [ -n "$IP6TABLES" ] && [ $IPSET6_OK -eq 1 ]; then
-    echo "Setting up IPv6 NHP_BLOCK chain ..."
-    ip6tables -N NHP_BLOCK 2>/dev/null || true
-    ip6tables -C NHP_BLOCK -j LOG --log-prefix "[NHP-BLOCK6] " --log-level 6 --log-ip-options > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        ip6tables -A NHP_BLOCK -j LOG --log-prefix "[NHP-BLOCK6] " --log-level 6 --log-ip-options 2>/dev/null || true
-    fi
-    ip6tables -C NHP_BLOCK -j DROP > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        ip6tables -A NHP_BLOCK -j DROP 2>/dev/null || true
-    fi
+    echo "Applying IPv6 iptables rules atomically ..."
 
-    echo "Setting up IPv6 INPUT chain ..."
-    # tempset_v6 -> defaultset_v6
-    ip6tables -C INPUT -m set --match-set tempset_v6 src,dst -j SET --add-set defaultset_v6 src,dst,dst > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        ip6tables -A INPUT -m set --match-set tempset_v6 src,dst -j SET --add-set defaultset_v6 src,dst,dst 2>/dev/null || true
+    if ! ip6tables-restore <<'IP6TABLES_RULES'
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+:NHP_DENY - [0:0]
+-A NHP_DENY -j LOG --log-prefix "[NHP-DENY6] " --log-level 6 --log-ip-options
+-A NHP_DENY -j DROP
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m state --state ESTABLISHED -j ACCEPT
+-A INPUT -m set --match-set tempset_v6 src,dst -j SET --add-set defaultset_v6 src,dst,dst
+-A INPUT -m set --match-set defaultset_v6 src,dst,dst -j SET --add-set defaultset_down_v6 src,dst,dst
+-A INPUT -m set --match-set defaultset_v6 src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT6] " --log-level 6 --log-ip-options
+-A INPUT -m set --match-set defaultset_v6 src,dst,dst -j ACCEPT
+-A INPUT -m set --match-set tempset_v6 src,dst -j ACCEPT
+-A INPUT -j NHP_DENY
+-A FORWARD -m set --match-set defaultset_v6 src,dst,dst -j SET --add-set defaultset_down_v6 src,dst,dst
+-A FORWARD -m set --match-set defaultset_v6 src,dst,dst -j LOG --log-prefix "[NHP-FORWARD6] " --log-level 6 --log-ip-options
+-A FORWARD -m set --match-set defaultset_v6 src,dst,dst -j ACCEPT
+-A FORWARD -m state --state ESTABLISHED -j ACCEPT
+-A FORWARD -j NHP_DENY
+COMMIT
+IP6TABLES_RULES
+    then
+        echo "ERROR: ip6tables-restore failed — new IPv6 rules not applied, previous rules retained"
+        exit 1
     fi
-
-    # defaultset_v6 -> defaultset_down_v6
-    ip6tables -C INPUT -m set --match-set defaultset_v6 src,dst,dst -j SET --add-set defaultset_down_v6 src,dst,dst > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        ip6tables -A INPUT -m set --match-set defaultset_v6 src,dst,dst -j SET --add-set defaultset_down_v6 src,dst,dst 2>/dev/null || true
-    fi
-
-    # defaultset_v6 accept with logging
-    ip6tables -C INPUT -m set --match-set defaultset_v6 src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT6] " --log-level 6 --log-ip-options > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        ip6tables -A INPUT -m set --match-set defaultset_v6 src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT6] " --log-level 6 --log-ip-options 2>/dev/null || true
-    fi
-    ip6tables -C INPUT -m set --match-set defaultset_v6 src,dst,dst -j ACCEPT > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        ip6tables -A INPUT -m set --match-set defaultset_v6 src,dst,dst -j ACCEPT 2>/dev/null || true
-    fi
-
-    # tempset_v6 accept
-    ip6tables -C INPUT -m set --match-set tempset_v6 src,dst -j ACCEPT > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        ip6tables -A INPUT -m set --match-set tempset_v6 src,dst -j ACCEPT 2>/dev/null || true
-    fi
-
-    # loopback interface
-    ip6tables -C INPUT -i lo -j ACCEPT > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        ip6tables -I INPUT -i lo -j ACCEPT
-    fi
-
-    # established connections
-    ip6tables -C INPUT -m state --state ESTABLISHED -j ACCEPT > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        ip6tables -A INPUT -m state --state ESTABLISHED -j ACCEPT
-    fi
-
-    # rest of INPUT
-    ip6tables -C INPUT -j NHP_BLOCK > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        ip6tables -A INPUT -j NHP_BLOCK 2>/dev/null || true
-    fi
-
-    echo "Setting up IPv6 FORWARD chain ..."
-    # defaultset_v6 -> defaultset_down_v6
-    ip6tables -C FORWARD -m set --match-set defaultset_v6 src,dst,dst -j SET --add-set defaultset_down_v6 src,dst,dst > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        ip6tables -A FORWARD -m set --match-set defaultset_v6 src,dst,dst -j SET --add-set defaultset_down_v6 src,dst,dst 2>/dev/null || true
-    fi
-
-    # defaultset_v6 forward with logging
-    ip6tables -C FORWARD -m set --match-set defaultset_v6 src,dst,dst -j LOG --log-prefix "[NHP-FORWARD6] " --log-level 6 --log-ip-options > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        ip6tables -A FORWARD -m set --match-set defaultset_v6 src,dst,dst -j LOG --log-prefix "[NHP-FORWARD6] " --log-level 6 --log-ip-options 2>/dev/null || true
-    fi
-    ip6tables -C FORWARD -m set --match-set defaultset_v6 src,dst,dst -j ACCEPT > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        ip6tables -A FORWARD -m set --match-set defaultset_v6 src,dst,dst -j ACCEPT 2>/dev/null || true
-    fi
-
-    # established connections
-    ip6tables -C FORWARD -m state --state ESTABLISHED -j ACCEPT > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        ip6tables -A FORWARD -m state --state ESTABLISHED -j ACCEPT
-    fi
-
-    # rest of FORWARD
-    ip6tables -C FORWARD -j NHP_BLOCK > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        ip6tables -A FORWARD -j NHP_BLOCK 2>/dev/null || true
-    fi
-
-    ### IPv6 chain policy ###
-    ip6tables -P INPUT DROP
-    ip6tables -P OUTPUT ACCEPT
-    ip6tables -P FORWARD DROP
 
     echo "Setting IPv6 iptables OK ..."
 fi
@@ -243,13 +105,13 @@ if [ -d /etc/rsyslog.d ] && [ ! -f /etc/rsyslog.d/10-nhplog.conf ]; then
     echo "Setting up rsyslog ..."
     mkdir -p logs
     chmod -R 777 logs/
-    echo ":msg,contains,\"[NHP-ACCEPT]\" -$CURRENT_DIR/logs/nhp_accept.log
+    echo ":msg,contains,\"[NHP-ACCEPT\" -$CURRENT_DIR/logs/nhp_accept.log
 
 & stop
-:msg,contains,\"[NHP-FORWARD]\" -$CURRENT_DIR/logs/nhp_forward.log
+:msg,contains,\"[NHP-FORWARD\" -$CURRENT_DIR/logs/nhp_forward.log
 
 & stop
-:msg,contains,\"[NHP-BLOCK]\" -$CURRENT_DIR/logs/nhp_block.log
+:msg,contains,\"[NHP-DENY\" -$CURRENT_DIR/logs/nhp_deny.log
 
 & stop" > /etc/rsyslog.d/10-nhplog.conf
     systemctl restart rsyslog

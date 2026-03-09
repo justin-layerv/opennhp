@@ -40,6 +40,10 @@ apt_get_with_retry() {
 apt_get_with_retry update -y
 # Note: awscli package deprecated in Ubuntu 24.04, using unzip + curl for AWS CLI v2
 apt_get_with_retry install -y jq curl docker.io gettext-base iptables ipset unzip
+# iptables-persistent is pre-seeded to skip interactive prompts during install
+echo iptables-persistent iptables-persistent/autosave_v4 boolean false | debconf-set-selections
+echo iptables-persistent iptables-persistent/autosave_v6 boolean false | debconf-set-selections
+apt_get_with_retry install -y iptables-persistent
 
 # Install AWS CLI v2 (works on all Ubuntu versions)
 if ! command -v aws &> /dev/null; then
@@ -405,14 +409,14 @@ echo "Binaries extracted successfully"
 echo "Setting up NHP firewall with ipset and iptables..."
 
 # Create ipsets for NHP traffic control
-# - tempset: temporary entries for initial knock (5s timeout)
-# - defaultset: active sessions after successful knock (120s timeout)
-# - defaultset_down: downstream tracking (121s timeout)
-ipset -exist create defaultset hash:ip,port,ip counters maxelem 1000000 timeout 120
-ipset -exist create defaultset_down hash:ip,port,ip counters maxelem 1000000 timeout 121
-ipset -exist create tempset hash:net,port counters maxelem 1000000 timeout 5
+# - tempset: temporary entries for initial knock (configurable timeout, default 5s)
+# - defaultset: active sessions after successful knock (configurable timeout, default 120s)
+# - defaultset_down: downstream tracking (defaultset timeout + 1s)
+ipset -exist create defaultset hash:ip,port,ip counters maxelem 1000000 timeout ${ipset_default_timeout}
+ipset -exist create defaultset_down hash:ip,port,ip counters maxelem 1000000 timeout $((${ipset_default_timeout} + 1))
+ipset -exist create tempset hash:net,port counters maxelem 1000000 timeout ${ipset_temp_timeout}
 
-echo "IPv4 ipsets created successfully"
+echo "IPv4 ipsets created successfully (defaultset timeout=${ipset_default_timeout}s, tempset timeout=${ipset_temp_timeout}s)"
 
 # Create IPv6 ipsets (required for clients connecting via IPv6)
 # The NHP AC code uses *_v6 suffixed sets for IPv6 addresses.
@@ -421,9 +425,9 @@ IP6TABLES=$(which ip6tables 2>/dev/null)
 IPSET6_OK=0
 if [ -n "$IP6TABLES" ]; then
     echo "Setting up IPv6 ipsets..."
-    ipset -exist create defaultset_v6 hash:ip,port,ip family inet6 counters maxelem 1000000 timeout 120 2>/dev/null || true
-    ipset -exist create defaultset_down_v6 hash:ip,port,ip family inet6 counters maxelem 1000000 timeout 121 2>/dev/null || true
-    ipset -exist create tempset_v6 hash:net,port family inet6 counters maxelem 1000000 timeout 5 2>/dev/null || true
+    ipset -exist create defaultset_v6 hash:ip,port,ip family inet6 counters maxelem 1000000 timeout ${ipset_default_timeout} 2>/dev/null || true
+    ipset -exist create defaultset_down_v6 hash:ip,port,ip family inet6 counters maxelem 1000000 timeout $((${ipset_default_timeout} + 1)) 2>/dev/null || true
+    ipset -exist create tempset_v6 hash:net,port family inet6 counters maxelem 1000000 timeout ${ipset_temp_timeout} 2>/dev/null || true
 
     # Verify IPv6 ipset creation
     IPSET6_OK=1
@@ -435,127 +439,96 @@ if [ -n "$IP6TABLES" ]; then
     fi
 fi
 
-# Create NHP_DENY chain for logging and dropping unauthorized traffic
-iptables -N NHP_DENY 2>/dev/null || true
-iptables -C NHP_DENY -d "$LOCAL_IP" -j LOG --log-prefix "[NHP-DENY] " --log-level 6 --log-ip-options 2>/dev/null || \
-    iptables -A NHP_DENY -d "$LOCAL_IP" -j LOG --log-prefix "[NHP-DENY] " --log-level 6 --log-ip-options
-iptables -C NHP_DENY -d "$LOCAL_IP" -j DROP 2>/dev/null || \
-    iptables -A NHP_DENY -d "$LOCAL_IP" -j DROP
+# Apply IPv4 iptables rules atomically via iptables-restore.
+# This avoids the race condition where individual iptables commands leave
+# a brief window with incomplete rules, and ensures crash recovery leaves
+# either the old complete ruleset or the new complete ruleset in place.
+echo "Applying IPv4 iptables rules atomically via iptables-restore..."
 
-# Setup INPUT chain rules
-echo "Configuring INPUT chain..."
+# Two-stage evaluation: Terraform's templatefile() substitutes ${vpc_cidr} and
+# ${ipset_*_timeout} when rendering this template to the final user-data script.
+# The single-quoted heredoc delimiter (<<'IPTABLES_RULES') prevents bash from
+# expanding anything at runtime, but by that point Terraform has already replaced
+# all ${...} references with their literal values.
+if ! iptables-restore <<'IPTABLES_RULES'
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+:NHP_DENY - [0:0]
+-A NHP_DENY -j LOG --log-prefix "[NHP-DENY] " --log-level 6 --log-ip-options
+-A NHP_DENY -j DROP
+-A INPUT -i lo -j ACCEPT
+-A INPUT -p tcp -s ${vpc_cidr} --dport 22 -j ACCEPT
+-A INPUT -p tcp -s ${vpc_cidr} --dport 8080 -j ACCEPT
+-A INPUT -p tcp -s ${vpc_cidr} --dport 8888 -j ACCEPT
+-A INPUT -m state --state ESTABLISHED -j ACCEPT
+-A INPUT -m set --match-set tempset src,dst -j SET --add-set defaultset src,dst,dst
+-A INPUT -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst
+-A INPUT -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT] " --log-level 6 --log-ip-options
+-A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT
+-A INPUT -m set --match-set tempset src,dst -j ACCEPT
+-A INPUT -j NHP_DENY
+-A FORWARD -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst
+-A FORWARD -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-FORWARD] " --log-level 6 --log-ip-options
+-A FORWARD -m set --match-set defaultset src,dst,dst -j ACCEPT
+-A FORWARD -m state --state ESTABLISHED -j ACCEPT
+-A FORWARD -j NHP_DENY
+COMMIT
+IPTABLES_RULES
+then
+    echo "ERROR: iptables-restore failed — new IPv4 rules not applied, previous rules retained"
+    exit 1
+fi
 
-# ipset rules: tempset -> defaultset promotion, then accept
-iptables -C INPUT -m set --match-set tempset src,dst -j SET --add-set defaultset src,dst,dst 2>/dev/null || \
-    iptables -A INPUT -m set --match-set tempset src,dst -j SET --add-set defaultset src,dst,dst
-iptables -C INPUT -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst 2>/dev/null || \
-    iptables -A INPUT -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst
-iptables -C INPUT -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT] " --log-level 6 --log-ip-options 2>/dev/null || \
-    iptables -A INPUT -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT] " --log-level 6 --log-ip-options
-iptables -C INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT 2>/dev/null || \
-    iptables -A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT
-iptables -C INPUT -m set --match-set tempset src,dst -j ACCEPT 2>/dev/null || \
-    iptables -A INPUT -m set --match-set tempset src,dst -j ACCEPT
+echo "IPv4 NHP firewall setup complete (applied atomically)"
 
-# Allow loopback
-iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || iptables -I INPUT -i lo -j ACCEPT
-
-# Allow SSH from VPC (for management/debugging)
-iptables -C INPUT -p tcp -s "${vpc_cidr}" --dport 22 -j ACCEPT 2>/dev/null || \
-    iptables -I INPUT -p tcp -s "${vpc_cidr}" --dport 22 -j ACCEPT
-
-# Allow Traefik health check (8080) from VPC - NLB health checks use this port
-# Port 443/80 are NOT opened here - they go through NHP ipset rules for port hiding
-iptables -C INPUT -p tcp -s "${vpc_cidr}" --dport 8080 -j ACCEPT 2>/dev/null || \
-    iptables -I INPUT -p tcp -s "${vpc_cidr}" --dport 8080 -j ACCEPT
-
-# NOTE: Ports 443 and 80 are intentionally NOT allowed by default.
-# Traffic to these ports must match NHP ipset rules (tempset/defaultset) after a valid knock.
-# This enforces true zero-trust network hiding - ports are invisible until authenticated.
-
-# Allow portal (8888) from VPC
-iptables -C INPUT -p tcp -s "${vpc_cidr}" --dport 8888 -j ACCEPT 2>/dev/null || \
-    iptables -I INPUT -p tcp -s "${vpc_cidr}" --dport 8888 -j ACCEPT
-
-# Allow established connections
-iptables -C INPUT -m state --state ESTABLISHED -j ACCEPT 2>/dev/null || \
-    iptables -A INPUT -m state --state ESTABLISHED -j ACCEPT
-
-# Default deny for INPUT (jump to NHP_DENY for logging)
-iptables -C INPUT -j NHP_DENY 2>/dev/null || iptables -A INPUT -j NHP_DENY
-
-# Setup FORWARD chain rules
-echo "Configuring FORWARD chain..."
-
-iptables -C FORWARD -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst 2>/dev/null || \
-    iptables -A FORWARD -m set --match-set defaultset src,dst,dst -j SET --add-set defaultset_down src,dst,dst
-iptables -C FORWARD -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-FORWARD] " --log-level 6 --log-ip-options 2>/dev/null || \
-    iptables -A FORWARD -m set --match-set defaultset src,dst,dst -j LOG --log-prefix "[NHP-FORWARD] " --log-level 6 --log-ip-options
-iptables -C FORWARD -m set --match-set defaultset src,dst,dst -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -m set --match-set defaultset src,dst,dst -j ACCEPT
-iptables -C FORWARD -m state --state ESTABLISHED -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -m state --state ESTABLISHED -j ACCEPT
-iptables -C FORWARD -j NHP_DENY 2>/dev/null || iptables -A FORWARD -j NHP_DENY
-
-# Set IPv4 chain policies
-iptables -P INPUT DROP
-iptables -P OUTPUT ACCEPT
-iptables -P FORWARD DROP
-
-echo "IPv4 NHP firewall setup complete"
+# Persist IPv4 rules across reboots via iptables-persistent
+mkdir -p /etc/iptables
+iptables-save > /etc/iptables/rules.v4
+echo "IPv4 iptables rules persisted to /etc/iptables/rules.v4"
 
 # ============================================================================
-# IPv6 firewall rules (mirrors IPv4 rules using *_v6 ipsets and ip6tables)
+# IPv6 firewall rules (mirrors IPv4 NHP ipset rules using *_v6 sets)
+# Applied atomically via ip6tables-restore for the same safety guarantees.
+#
+# Note: IPv4 VPC CIDR rules (SSH/8080/8888) are intentionally omitted here.
+# AWS VPC CIDRs are IPv4-only; internal traffic uses IPv4 addressing.
 # ============================================================================
 if [ -n "$IP6TABLES" ] && [ $IPSET6_OK -eq 1 ]; then
-    echo "Configuring IPv6 NHP firewall..."
+    echo "Applying IPv6 iptables rules atomically via ip6tables-restore..."
 
-    # NHP_DENY chain for IPv6
-    ip6tables -N NHP_DENY 2>/dev/null || true
-    ip6tables -C NHP_DENY -j LOG --log-prefix "[NHP-DENY6] " --log-level 6 --log-ip-options 2>/dev/null || \
-        ip6tables -A NHP_DENY -j LOG --log-prefix "[NHP-DENY6] " --log-level 6 --log-ip-options 2>/dev/null || true
-    ip6tables -C NHP_DENY -j DROP 2>/dev/null || \
-        ip6tables -A NHP_DENY -j DROP 2>/dev/null || true
+    if ! ip6tables-restore <<'IP6TABLES_RULES'
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+:NHP_DENY - [0:0]
+-A NHP_DENY -j LOG --log-prefix "[NHP-DENY6] " --log-level 6 --log-ip-options
+-A NHP_DENY -j DROP
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m state --state ESTABLISHED -j ACCEPT
+-A INPUT -m set --match-set tempset_v6 src,dst -j SET --add-set defaultset_v6 src,dst,dst
+-A INPUT -m set --match-set defaultset_v6 src,dst,dst -j SET --add-set defaultset_down_v6 src,dst,dst
+-A INPUT -m set --match-set defaultset_v6 src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT6] " --log-level 6 --log-ip-options
+-A INPUT -m set --match-set defaultset_v6 src,dst,dst -j ACCEPT
+-A INPUT -m set --match-set tempset_v6 src,dst -j ACCEPT
+-A INPUT -j NHP_DENY
+-A FORWARD -m set --match-set defaultset_v6 src,dst,dst -j SET --add-set defaultset_down_v6 src,dst,dst
+-A FORWARD -m set --match-set defaultset_v6 src,dst,dst -j LOG --log-prefix "[NHP-FORWARD6] " --log-level 6 --log-ip-options
+-A FORWARD -m set --match-set defaultset_v6 src,dst,dst -j ACCEPT
+-A FORWARD -m state --state ESTABLISHED -j ACCEPT
+-A FORWARD -j NHP_DENY
+COMMIT
+IP6TABLES_RULES
+    then
+        echo "ERROR: ip6tables-restore failed — new IPv6 rules not applied, previous rules retained"
+        exit 1
+    fi
 
-    # IPv6 INPUT chain
-    ip6tables -C INPUT -m set --match-set tempset_v6 src,dst -j SET --add-set defaultset_v6 src,dst,dst 2>/dev/null || \
-        ip6tables -A INPUT -m set --match-set tempset_v6 src,dst -j SET --add-set defaultset_v6 src,dst,dst 2>/dev/null || true
-    ip6tables -C INPUT -m set --match-set defaultset_v6 src,dst,dst -j SET --add-set defaultset_down_v6 src,dst,dst 2>/dev/null || \
-        ip6tables -A INPUT -m set --match-set defaultset_v6 src,dst,dst -j SET --add-set defaultset_down_v6 src,dst,dst 2>/dev/null || true
-    ip6tables -C INPUT -m set --match-set defaultset_v6 src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT6] " --log-level 6 --log-ip-options 2>/dev/null || \
-        ip6tables -A INPUT -m set --match-set defaultset_v6 src,dst,dst -j LOG --log-prefix "[NHP-ACCEPT6] " --log-level 6 --log-ip-options 2>/dev/null || true
-    ip6tables -C INPUT -m set --match-set defaultset_v6 src,dst,dst -j ACCEPT 2>/dev/null || \
-        ip6tables -A INPUT -m set --match-set defaultset_v6 src,dst,dst -j ACCEPT 2>/dev/null || true
-    ip6tables -C INPUT -m set --match-set tempset_v6 src,dst -j ACCEPT 2>/dev/null || \
-        ip6tables -A INPUT -m set --match-set tempset_v6 src,dst -j ACCEPT 2>/dev/null || true
-
-    # Allow loopback
-    ip6tables -C INPUT -i lo -j ACCEPT 2>/dev/null || ip6tables -I INPUT -i lo -j ACCEPT
-
-    # Allow established connections
-    ip6tables -C INPUT -m state --state ESTABLISHED -j ACCEPT 2>/dev/null || \
-        ip6tables -A INPUT -m state --state ESTABLISHED -j ACCEPT
-
-    # Default deny for IPv6 INPUT
-    ip6tables -C INPUT -j NHP_DENY 2>/dev/null || ip6tables -A INPUT -j NHP_DENY 2>/dev/null || true
-
-    # IPv6 FORWARD chain
-    ip6tables -C FORWARD -m set --match-set defaultset_v6 src,dst,dst -j SET --add-set defaultset_down_v6 src,dst,dst 2>/dev/null || \
-        ip6tables -A FORWARD -m set --match-set defaultset_v6 src,dst,dst -j SET --add-set defaultset_down_v6 src,dst,dst 2>/dev/null || true
-    ip6tables -C FORWARD -m set --match-set defaultset_v6 src,dst,dst -j LOG --log-prefix "[NHP-FORWARD6] " --log-level 6 --log-ip-options 2>/dev/null || \
-        ip6tables -A FORWARD -m set --match-set defaultset_v6 src,dst,dst -j LOG --log-prefix "[NHP-FORWARD6] " --log-level 6 --log-ip-options 2>/dev/null || true
-    ip6tables -C FORWARD -m set --match-set defaultset_v6 src,dst,dst -j ACCEPT 2>/dev/null || \
-        ip6tables -A FORWARD -m set --match-set defaultset_v6 src,dst,dst -j ACCEPT 2>/dev/null || true
-    ip6tables -C FORWARD -m state --state ESTABLISHED -j ACCEPT 2>/dev/null || \
-        ip6tables -A FORWARD -m state --state ESTABLISHED -j ACCEPT
-    ip6tables -C FORWARD -j NHP_DENY 2>/dev/null || ip6tables -A FORWARD -j NHP_DENY 2>/dev/null || true
-
-    # Set IPv6 chain policies
-    ip6tables -P INPUT DROP
-    ip6tables -P OUTPUT ACCEPT
-    ip6tables -P FORWARD DROP
-
-    echo "IPv6 NHP firewall setup complete"
+    # Persist IPv6 rules across reboots
+    ip6tables-save > /etc/iptables/rules.v6
+    echo "IPv6 NHP firewall setup complete (applied atomically)"
 else
     echo "Skipping IPv6 firewall setup (ip6tables not available or IPv6 ipsets failed)"
 fi
@@ -579,11 +552,11 @@ template(name="NHPAcceptFile" type="string" string="/opt/layerv/nhp-ac/logs/nhp_
 template(name="NHPForwardFile" type="string" string="/opt/layerv/nhp-ac/logs/nhp_forward-%\$YEAR%-%\$MONTH%-%\$DAY%.log")
 template(name="NHPDenyFile" type="string" string="/opt/layerv/nhp-ac/logs/nhp_deny-%\$YEAR%-%\$MONTH%-%\$DAY%.log")
 
-:msg,contains,"[NHP-ACCEPT]" ?NHPAcceptFile;NHPFormat
+:msg,contains,"[NHP-ACCEPT" ?NHPAcceptFile;NHPFormat
 & stop
-:msg,contains,"[NHP-FORWARD]" ?NHPForwardFile;NHPFormat
+:msg,contains,"[NHP-FORWARD" ?NHPForwardFile;NHPFormat
 & stop
-:msg,contains,"[NHP-DENY]" ?NHPDenyFile;NHPFormat
+:msg,contains,"[NHP-DENY" ?NHPDenyFile;NHPFormat
 & stop
 RSYSLOGEOF
 
