@@ -704,6 +704,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@5e8dbf3c6d9deaf4193ca7a8fb23f2ac83bb6c85 # v4.0.0
@@ -739,6 +741,89 @@ jobs:
           AUTH0_CLIENT_ID: ${{ secrets.PROD_AUTH0_CLIENT_ID }}
           AUTH0_CLIENT_SECRET: ${{ secrets.PROD_AUTH0_CLIENT_SECRET }}
         run: ./.github/scripts/fetch-auth0-token.sh terraform/environments/prod/terraform.tfvars prod
+
+      - name: Terraform change summary
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          # Read last successful prod terraform apply commit from SSM
+          LAST_TF_SHA=$(aws ssm get-parameter \
+            --name "/prod/nhp/deploy/last-terraform-apply-commit" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+
+          if [[ -z "$LAST_TF_SHA" || "$LAST_TF_SHA" == "initial" ]]; then
+            echo "::notice::No previous terraform apply commit tracked in SSM — skipping change summary"
+            exit 0
+          fi
+
+          if ! git rev-parse --verify "${LAST_TF_SHA}^{commit}" > /dev/null 2>&1; then
+            echo "::warning::Previous terraform apply commit $LAST_TF_SHA not found in repo history"
+            exit 0
+          fi
+
+          CURRENT_SHA="${GITHUB_SHA}"
+          echo "Comparing terraform changes: ${LAST_TF_SHA:0:8}..${CURRENT_SHA:0:8}"
+
+          # Check for shared module changes
+          MODULE_CHANGES=$(git diff --name-only "$LAST_TF_SHA..$CURRENT_SHA" -- terraform/modules/ || echo "")
+          ENV_CHANGES=$(git diff --name-only "$LAST_TF_SHA..$CURRENT_SHA" -- terraform/environments/prod/ || echo "")
+          MODULE_COMMITS=$(git log --oneline "$LAST_TF_SHA..$CURRENT_SHA" -- terraform/modules/ 2>/dev/null || echo "")
+          ENV_COMMITS=$(git log --oneline "$LAST_TF_SHA..$CURRENT_SHA" -- terraform/environments/prod/ 2>/dev/null || echo "")
+
+          if [[ -n "$MODULE_CHANGES" ]]; then
+            MODULE_COUNT=$(printf '%s' "$MODULE_CHANGES" | grep -c . || echo "0")
+            echo "::warning::Shared module changes detected: $MODULE_COUNT files changed in terraform/modules/ since last prod apply"
+          fi
+
+          {
+            echo "## Terraform Changes Since Last Prod Apply"
+            echo ""
+            echo "Comparing [\`${LAST_TF_SHA:0:8}\`](https://github.com/${{ github.repository }}/commit/$LAST_TF_SHA) → [\`${CURRENT_SHA:0:8}\`](https://github.com/${{ github.repository }}/commit/$CURRENT_SHA)"
+            echo ""
+
+            if [[ -n "$MODULE_CHANGES" ]]; then
+              echo "### :warning: Shared Module Changes"
+              echo "These affect ALL environments, not just prod:"
+              echo ""
+              echo "<details><summary>Module commits (click to expand)</summary>"
+              echo ""
+              echo '```'
+              echo "$MODULE_COMMITS"
+              echo '```'
+              echo ""
+              echo "</details>"
+              echo ""
+              echo "<details><summary>Changed module files ($MODULE_COUNT files)</summary>"
+              echo ""
+              echo '```'
+              echo "$MODULE_CHANGES"
+              echo '```'
+              echo ""
+              echo "</details>"
+              echo ""
+            else
+              echo "### :white_check_mark: No Shared Module Changes"
+              echo ""
+            fi
+
+            if [[ -n "$ENV_CHANGES" ]]; then
+              ENV_COUNT=$(printf '%s' "$ENV_CHANGES" | grep -c . || echo "0")
+              echo "### Prod Environment Changes ($ENV_COUNT files)"
+              echo ""
+              echo "<details><summary>Environment commits</summary>"
+              echo ""
+              echo '```'
+              echo "$ENV_COMMITS"
+              echo '```'
+              echo ""
+              echo "</details>"
+              echo ""
+            else
+              echo "### :white_check_mark: No Prod Environment Changes"
+              echo ""
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Terraform Plan
         working-directory: terraform/environments/prod
@@ -787,6 +872,13 @@ jobs:
           path: terraform/modules/acme-cert/build/lambda-acme-cert.zip
           retention-days: 1
 
+      - name: Upload canary orchestrator Lambda
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: lambda-canary-orchestrator
+          path: terraform/modules/canary-deployment/lambda/canary_orchestrator.zip
+          retention-days: 1
+
   # =============================================================================
   # TERRAFORM APPLY - Apply reviewed plan (approval gate)
   # =============================================================================
@@ -830,6 +922,12 @@ jobs:
         with:
           name: lambda-acme-cert
           path: terraform/modules/acme-cert/build
+
+      - name: Download canary orchestrator Lambda
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: lambda-canary-orchestrator
+          path: terraform/modules/canary-deployment/lambda
 
       - name: Terraform Init
         working-directory: terraform/environments/prod
@@ -1356,6 +1454,20 @@ jobs:
             --value "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --type String --overwrite \
             || echo "::warning::Failed to update deployed-at"
           echo "  Tracking updated: deployed-commit=$IMAGE_TAG"
+
+      - name: Update terraform apply tracking
+        if: needs.terraform-apply.result == 'success'
+        run: |
+          echo "Recording last successful terraform apply commit..."
+          aws ssm put-parameter \
+            --name "/prod/nhp/deploy/last-terraform-apply-commit" \
+            --value "${{ github.sha }}" --type String --overwrite \
+            || echo "::warning::Failed to update last-terraform-apply-commit"
+          aws ssm put-parameter \
+            --name "/prod/nhp/deploy/last-terraform-apply-at" \
+            --value "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --type String --overwrite \
+            || echo "::warning::Failed to update last-terraform-apply-at"
+          echo "  Terraform tracking: last-terraform-apply-commit=${{ github.sha }}"
 
       - name: Push CloudWatch deployment metric
         if: always()
