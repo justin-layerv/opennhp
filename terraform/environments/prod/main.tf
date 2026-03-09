@@ -402,7 +402,7 @@ module "auth0" {
 
   # Email (SES) — layerv.ai domain needs SES verification for prod
   email_from_address = "LayerV <noreply@layerv.ai>"
-  email_ses_region   = "us-east-2"
+  email_ses_region   = "us-east-1"
   email_result_url   = "https://layerv.ai"
 }
 

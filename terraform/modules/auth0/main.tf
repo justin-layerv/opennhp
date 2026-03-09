@@ -1035,6 +1035,14 @@ resource "aws_iam_access_key" "auth0_ses" {
   }
 }
 
+# Bump trigger to force Auth0 email provider re-creation (credentials aren't
+# read back by the provider, so Terraform can't detect external drift).
+# To force re-creation: change the input value and apply.
+resource "terraform_data" "email_provider_trigger" {
+  count = var.manage_tenant_resources ? 1 : 0
+  input = "2026-03-09-migrate-tenant-to-prod"
+}
+
 resource "auth0_email_provider" "ses" {
   count                = var.manage_tenant_resources ? 1 : 0
   name                 = "ses"
@@ -1045,6 +1053,10 @@ resource "auth0_email_provider" "ses" {
     access_key_id     = aws_iam_access_key.auth0_ses[0].id
     secret_access_key = aws_iam_access_key.auth0_ses[0].secret
     region            = var.email_ses_region
+  }
+
+  lifecycle {
+    replace_triggered_by = [terraform_data.email_provider_trigger[0]]
   }
 }
 

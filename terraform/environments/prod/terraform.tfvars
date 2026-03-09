@@ -205,8 +205,8 @@ auth0_domain = "layerv.us.auth0.com"
 qurl_auth0_domain   = "auth.layerv.ai"
 qurl_auth0_audience = "https://api.layerv.ai"
 
-# Auth0 shared tenant: prod references tenant-wide resources created by sandbox
-auth0_manage_tenant_resources = false
+# Prod owns shared Auth0 tenant resources (roles, branding, attack protection, email, social connections)
+auth0_manage_tenant_resources = true
 
 # Auth0 M2M credential rotation (Phase 2: enable after auth0 management secret is created)
 auth0_enable_rotation = false

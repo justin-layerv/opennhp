@@ -227,8 +227,8 @@ qurl_auth0_audience = "https://api.layerv.xyz"
 # but the Management API requires the actual tenant domain.
 # Both sandbox and prod share a single Auth0 tenant with the auth.layerv.ai custom
 # domain. They are distinguished by separate API audiences.
-# Sandbox owns shared Auth0 tenant resources (roles, branding, attack protection, email, social connections)
-auth0_manage_tenant_resources = true
+# Prod now owns shared Auth0 tenant resources (roles, branding, attack protection, email, social connections)
+auth0_manage_tenant_resources = false
 auth0_domain                  = "layerv.us.auth0.com"
 # auth0_tf_client_id and auth0_tf_client_secret are REQUIRED
 # Pass via: TF_VAR_auth0_tf_client_id and TF_VAR_auth0_tf_client_secret

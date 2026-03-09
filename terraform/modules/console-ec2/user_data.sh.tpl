@@ -150,11 +150,11 @@ echo "ipsets created successfully (defaultset timeout=${ipset_default_timeout}s,
 # either the old complete ruleset or the new complete ruleset in place.
 echo "Applying iptables rules atomically via iptables-restore..."
 
-# Two-stage evaluation: Terraform's templatefile() substitutes ${vpc_cidr},
-# ${console_port}, etc. when rendering this template to the final user-data script.
-# The single-quoted heredoc delimiter (<<'IPTABLES_RULES') prevents bash from
-# expanding anything at runtime, but by that point Terraform has already replaced
-# all ${...} references with their literal values.
+# Two-stage evaluation: Terraform's templatefile() substitutes variables like
+# vpc_cidr, console_port, etc. when rendering this template to the final
+# user-data script. The single-quoted heredoc delimiter (<<'IPTABLES_RULES')
+# prevents bash from expanding anything at runtime, but by that point Terraform
+# has already replaced all template references with their literal values.
 if ! iptables-restore <<'IPTABLES_RULES'
 *filter
 :INPUT DROP [0:0]
