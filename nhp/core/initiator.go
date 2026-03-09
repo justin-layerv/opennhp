@@ -350,9 +350,7 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 		}
 		if err != nil {
 			log.Critical("message compression failed: %v", err)
-			ErrDataCompressionFailed.SetExtraError(err)
-			err = ErrDataCompressionFailed
-			return err
+			return ErrDataCompressionFailed.WithExtra(err)
 		}
 		body = buf.Bytes()
 		//log.Debug("message compressed: %v -> %v", mad.bodyMessage, body)

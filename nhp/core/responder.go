@@ -442,9 +442,7 @@ func (ppd *PacketParserData) decryptBody() (err error) {
 	body, err := ppd.bodyAead.Open(ppd.basePacket.Content[ppd.header.Size():ppd.header.Size()], ppd.header.NonceBytes(), ppd.basePacket.Content[ppd.header.Size():], ppd.chainHash.Sum(nil))
 	if err != nil {
 		log.Critical("decrypt body failed: %v", err)
-		ErrAEADDecryptionFailed.SetExtraError(err)
-		err = ErrAEADDecryptionFailed
-		return err
+		return ErrAEADDecryptionFailed.WithExtra(err)
 	}
 
 	//log.Debug("decrypted body: %v, input: %v", body, ppd.basePacket.Content[ppd.header.Size():])
@@ -457,8 +455,7 @@ func (ppd *PacketParserData) decryptBody() (err error) {
 		r, err := zlib.NewReader(br)
 		if err != nil {
 			log.Critical("invalid compressed data: %v", err)
-			ErrDataDecompressionFailed.SetExtraError(err)
-			return ErrDataDecompressionFailed
+			return ErrDataDecompressionFailed.WithExtra(err)
 		}
 		defer func() { _ = r.Close() }()
 
@@ -468,13 +465,11 @@ func (ppd *PacketParserData) decryptBody() (err error) {
 		n, err := io.Copy(&buf, limitedReader)
 		if err != nil {
 			log.Critical("message decompression failed: %v", err)
-			ErrDataDecompressionFailed.SetExtraError(err)
-			return ErrDataDecompressionFailed
+			return ErrDataDecompressionFailed.WithExtra(err)
 		}
 		if n > maxDecompressedSize {
 			log.Critical("decompressed data exceeds maximum size limit (%d bytes)", maxDecompressedSize)
-			ErrDataDecompressionFailed.SetExtraError(fmt.Errorf("decompressed size %d exceeds limit %d", n, maxDecompressedSize))
-			return ErrDataDecompressionFailed
+			return ErrDataDecompressionFailed.WithExtra(fmt.Errorf("decompressed size %d exceeds limit %d", n, maxDecompressedSize))
 		}
 
 		ppd.BodyMessage = buf.Bytes() // separately allocated memory

@@ -53,19 +53,11 @@ func TestDecompressionSizeLimit(t *testing.T) {
 			originalData := bytes.Repeat([]byte("ABCDEFGHIJ"), tt.dataSize/10+1)
 			originalData = originalData[:tt.dataSize]
 
-			// Compress the data
-			var compressedBuf bytes.Buffer
-			w := zlib.NewWriter(&compressedBuf)
-			_, err := w.Write(originalData)
-			if err != nil {
-				t.Fatalf("failed to compress test data: %v", err)
-			}
-			if err := w.Close(); err != nil {
-				t.Fatalf("failed to close zlib writer: %v", err)
-			}
+			// Compress the data using shared helper (defined in decryptbody_test.go).
+			compressed := createZlibCompressed(t, originalData)
 
 			// Decompress with size limit (mirrors responder.go logic)
-			br := bytes.NewReader(compressedBuf.Bytes())
+			br := bytes.NewReader(compressed)
 			r, err := zlib.NewReader(br)
 			if err != nil {
 				t.Fatalf("failed to create zlib reader: %v", err)
@@ -164,19 +156,11 @@ func TestDecompressionInvalidData(t *testing.T) {
 func TestDecompressionValidData(t *testing.T) {
 	originalData := []byte("Hello, World! This is a test message for compression.")
 
-	// Compress
-	var compressedBuf bytes.Buffer
-	w := zlib.NewWriter(&compressedBuf)
-	_, err := w.Write(originalData)
-	if err != nil {
-		t.Fatalf("compression failed: %v", err)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("failed to close zlib writer: %v", err)
-	}
+	// Compress using shared helper (defined in decryptbody_test.go).
+	compressed := createZlibCompressed(t, originalData)
 
 	// Decompress
-	br := bytes.NewReader(compressedBuf.Bytes())
+	br := bytes.NewReader(compressed)
 	r, err := zlib.NewReader(br)
 	if err != nil {
 		t.Fatalf("failed to create zlib reader: %v", err)

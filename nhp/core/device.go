@@ -259,8 +259,7 @@ func (d *Device) MsgToPacket(md *MsgData) (mad *MsgAssemblerData, err error) {
 		if x := recover(); x != nil {
 			mad = nil
 			err = fmt.Errorf("!!!recovered from panic: %v\n%s", x, string(debug.Stack()))
-			ErrRuntimePanic.SetExtraError(err)
-			err = ErrRuntimePanic
+			err = ErrRuntimePanic.WithExtra(err)
 		}
 	}()
 
@@ -422,8 +421,7 @@ func (d *Device) PacketToMsg(pd *PacketData) (ppd *PacketParserData, err error) 
 		if x := recover(); x != nil {
 			ppd = nil
 			err = fmt.Errorf("!!!recovered from panic: %v\n%s", x, string(debug.Stack()))
-			ErrRuntimePanic.SetExtraError(err)
-			err = ErrRuntimePanic
+			err = ErrRuntimePanic.WithExtra(err)
 		}
 	}()
 

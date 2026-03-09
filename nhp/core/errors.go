@@ -8,24 +8,26 @@ import (
 var errorMap map[int]*Error = make(map[int]*Error)
 
 type Error struct {
-	num         int
-	msg         string
-	extraErr    error
-	hasExtraErr bool
+	num      int
+	msg      string
+	extraErr error
 }
 
-func (e *Error) SetExtraError(err error) {
-	e.extraErr = err
-	if err != nil {
-		e.hasExtraErr = true
+// WithExtra returns a new Error with the same code and message, carrying the
+// given extra error for context. Unlike the old SetExtraError, this does not
+// mutate the receiver, so package-level sentinel errors remain safe for
+// concurrent use.
+func (e *Error) WithExtra(err error) *Error {
+	return &Error{
+		num:      e.num,
+		msg:      e.msg,
+		extraErr: err,
 	}
 }
 
 // implment NhpError interface
 func (e *Error) Error() string {
-	if e.hasExtraErr {
-		e.hasExtraErr = false
-		defer e.SetExtraError(nil)
+	if e.extraErr != nil {
 		return e.msg + ": " + e.extraErr.Error()
 	}
 	return e.msg
