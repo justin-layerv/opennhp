@@ -152,6 +152,10 @@ use_production_acme = true
 centralized_cert_enabled = true
 centralized_cert_domains = ["nhp.layerv.xyz", "*.nhp.layerv.xyz", "apps.layerv.xyz", "*.apps.layerv.xyz", "qurl.site.layerv.xyz", "*.qurl.site.layerv.xyz", "qurl.link.layerv.xyz", "*.qurl.link.layerv.xyz"]
 
+# Custom domain certificate manager — provisions Let's Encrypt certs for
+# customer custom domains registered via the QURL API.
+deploy_custom_domain_cert = true
+
 # ==============================================================================
 # Console EC2 Configuration
 # Console API for portal site management (alternative to Fargate - more cost effective)

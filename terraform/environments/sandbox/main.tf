@@ -356,6 +356,44 @@ module "acme_cert" {
 }
 
 # ==============================================================================
+# Custom Domain Certificate Manager
+# ==============================================================================
+# Lambda that provisions Let's Encrypt certificates for custom domains registered
+# via the QURL API. Polls DynamoDB for domains in "provisioning_tls" status every
+# 15 minutes, provisions certs via ACME DNS-01 challenge, stores key/chain in SSM
+# Parameter Store, and triggers AC cert sync via SSM SendCommand.
+
+module "custom_domain_cert" {
+  count  = var.deploy_custom_domain_cert ? 1 : 0
+  source = "../../modules/custom-domain-cert"
+
+  name_prefix         = local.name_prefix
+  environment         = var.environment
+  acme_base_domain    = var.hosted_zone # layerv.xyz for sandbox
+  acme_email          = var.acme_email
+  use_production_acme = var.use_production_acme
+
+  # DynamoDB — Lambda queries status-index GSI for provisioning_tls domains
+  qurl_domains_table_name = module.nhp.dynamodb_qurl_domains_table_name
+  qurl_domains_table_arn  = module.nhp.dynamodb_qurl_domains_table_arn
+
+  # SSM SendCommand targeting — must match AC instance Name tag
+  ac_instance_tag = "${local.name_prefix}-ac"
+
+  # Encryption
+  kms_key_arn      = module.nhp.secrets_kms_key_arn
+  has_kms_key      = true
+  logs_kms_key_arn = module.nhp.logs_kms_key_arn
+
+  # Alerting — reuse existing SNS topic
+  existing_sns_topic_arn = module.nhp.sns_topic_arn
+  use_existing_sns_topic = true
+  alert_emails           = var.guardduty_alert_emails
+
+  tags = local.common_tags
+}
+
+# ==============================================================================
 # Auth0 Identity Management
 # ==============================================================================
 # Manages Auth0 resources for QURL API authentication.

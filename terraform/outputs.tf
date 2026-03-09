@@ -191,6 +191,16 @@ output "dynamodb_resources_table_arn" {
   value       = module.dynamodb.resources_table_arn
 }
 
+output "dynamodb_qurl_domains_table_name" {
+  description = "DynamoDB table name for QURL custom domains"
+  value       = module.dynamodb.qurl_domains_table_name
+}
+
+output "dynamodb_qurl_domains_table_arn" {
+  description = "DynamoDB table ARN for QURL custom domains"
+  value       = module.dynamodb.qurl_domains_table_arn
+}
+
 # DynamoDB IAM Policies
 output "dynamodb_read_policy_arn" {
   description = "IAM policy ARN for DynamoDB read access (for NHP Server)"

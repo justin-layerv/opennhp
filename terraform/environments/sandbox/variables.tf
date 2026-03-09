@@ -1300,6 +1300,12 @@ variable "centralized_cert_domains" {
   default     = []
 }
 
+variable "deploy_custom_domain_cert" {
+  description = "Deploy the custom domain certificate manager Lambda for QURL custom domains"
+  type        = bool
+  default     = false
+}
+
 # ==============================================================================
 # Blue/Green Deployment Configuration
 # ==============================================================================
