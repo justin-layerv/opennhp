@@ -10,7 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/cloudwatch v1.55.0
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.56.1
 	github.com/aws/aws-sdk-go-v2/service/servicediscovery v1.39.22
-	github.com/cilium/ebpf v0.20.0
+	github.com/cilium/ebpf v0.21.0
 	github.com/coreos/go-oidc/v3 v3.17.0
 	github.com/fengyily/nhp-plugins-sdk v0.1.30
 	github.com/fsnotify/fsnotify v1.9.0
