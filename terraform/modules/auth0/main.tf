@@ -68,6 +68,11 @@ resource "auth0_resource_server_scopes" "qurl_scopes" {
     name        = "qurl:admin"
     description = "Administrative access to all QURL resources"
   }
+
+  scopes {
+    name        = "qurl:resolve"
+    description = "Resolve QURL access tokens via headless API (POST /v1/resolve)"
+  }
 }
 
 # ==============================================================================
@@ -219,7 +224,7 @@ resource "auth0_client" "backend_service" {
 resource "auth0_client_grant" "backend_qurl_api" {
   client_id = auth0_client.backend_service.id
   audience  = auth0_resource_server.qurl_api.identifier
-  scopes    = ["qurl:read", "qurl:write", "qurl:admin"]
+  scopes    = ["qurl:read", "qurl:write", "qurl:admin", "qurl:resolve"]
 }
 
 # ==============================================================================
@@ -519,7 +524,7 @@ resource "auth0_client_grant" "smoke_test_qurl_api" {
   count     = var.enable_smoke_test_client ? 1 : 0
   client_id = auth0_client.smoke_test[0].id
   audience  = auth0_resource_server.qurl_api.identifier
-  scopes    = ["qurl:read", "qurl:write", "qurl:admin"]
+  scopes    = ["qurl:read", "qurl:write", "qurl:admin", "qurl:resolve"]
 }
 
 resource "aws_secretsmanager_secret" "smoke_test" {
