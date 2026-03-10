@@ -173,19 +173,38 @@ locals {
   ecr_repos      = var.deploy_qurl_ecr ? concat(local.core_ecr_repos, ["nhp-qurl"]) : local.core_ecr_repos
 
   # ECR lifecycle policy (shared across repos)
+  # Two rules: retain tagged images (git SHAs) for 90 days so prod ASGs can
+  # still pull them even when sandbox has moved on, and expire untagged
+  # (intermediate) images after 7 days to save storage.
   ecr_lifecycle_policy = jsonencode({
-    rules = [{
-      rulePriority = 1
-      description  = "Keep last 10 images"
-      selection = {
-        tagStatus   = "any"
-        countType   = "imageCountMoreThan"
-        countNumber = 10
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Expire untagged images after 7 days"
+        selection = {
+          tagStatus   = "untagged"
+          countType   = "sinceImagePushed"
+          countUnit   = "days"
+          countNumber = 7
+        }
+        action = {
+          type = "expire"
+        }
+      },
+      {
+        rulePriority = 2
+        description  = "Keep tagged images for 90 days (prod pulls from sandbox)"
+        selection = {
+          tagStatus   = "tagged"
+          countType   = "sinceImagePushed"
+          countUnit   = "days"
+          countNumber = 90
+        }
+        action = {
+          type = "expire"
+        }
       }
-      action = {
-        type = "expire"
-      }
-    }]
+    ]
   })
 
   # Cross-account ECR policy (shared across repos)
