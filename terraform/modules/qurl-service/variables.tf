@@ -629,6 +629,20 @@ variable "stripe_checkout_cancel_url" {
   default     = ""
 }
 
+# ==================== NHP Integration ====================
+
+variable "nhp_server_internal_url" {
+  description = "Internal URL of NHP server for headless resolve knock requests (e.g., http://server.nhp.sandbox.internal:8888). Enables POST /v1/resolve endpoint."
+  type        = string
+  default     = ""
+}
+
+variable "nhp_knock_timeout_seconds" {
+  description = "Timeout for NHP knock requests in seconds"
+  type        = number
+  default     = 15
+}
+
 variable "usage_events_enabled" {
   description = "Enable sending usage events to billing SQS queue"
   type        = bool

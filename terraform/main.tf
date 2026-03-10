@@ -892,6 +892,9 @@ module "qurl_service" {
   # KMS
   logs_kms_key_arn = module.kms.logs_key_arn
 
+  # NHP integration (headless resolve)
+  nhp_server_internal_url = var.deploy_ac ? "http://server.${module.data.namespace_name}:8888" : ""
+
   # QURL defaults
   cookie_domain        = var.qurl_cookie_domain
   qurl_link_domain     = var.qurl_link_domain

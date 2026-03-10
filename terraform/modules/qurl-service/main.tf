@@ -187,6 +187,11 @@ locals {
       { name = "CUSTOM_DOMAIN_ACME_SUFFIX", value = var.custom_domain_acme_suffix },
       { name = "CUSTOM_DOMAIN_NLB_TARGET", value = var.custom_domain_nlb_target },
     ] : [],
+    # NHP integration (headless resolve via POST /v1/resolve)
+    var.nhp_server_internal_url != "" ? [
+      { name = "NHP_SERVER_INTERNAL_URL", value = var.nhp_server_internal_url },
+      { name = "NHP_KNOCK_TIMEOUT", value = tostring(var.nhp_knock_timeout_seconds) },
+    ] : [],
     # GeoIP configuration (for geo-restriction policies)
     var.geoip_enabled ? concat([
       { name = "GEOIP_ENABLED", value = "true" },
