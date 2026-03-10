@@ -689,6 +689,58 @@ resource "aws_iam_role_policy" "ac_traefik_plugins_deploy" {
   })
 }
 
+# Upload user_data init script to S3 (rendered template exceeds EC2's 16KB user_data limit)
+resource "aws_s3_object" "init_script" {
+  count = var.plugin_bucket_name != null ? 1 : 0
+
+  bucket       = var.plugin_bucket_name
+  key          = "scripts/ac-init.sh"
+  content      = local.user_data
+  content_type = "text/x-shellscript"
+}
+
+# Shared helper library (retry, metrics) sourced by other scripts
+resource "aws_s3_object" "lib_script" {
+  count = var.plugin_bucket_name != null ? 1 : 0
+
+  bucket       = var.plugin_bucket_name
+  key          = "scripts/lib.sh"
+  source       = "${path.module}/scripts/lib.sh"
+  source_hash  = filemd5("${path.module}/scripts/lib.sh")
+  content_type = "text/x-shellscript"
+}
+
+# Custom domain cert sync script (downloaded at boot and by SSM)
+resource "aws_s3_object" "cert_sync_script" {
+  count = var.plugin_bucket_name != null ? 1 : 0
+
+  bucket       = var.plugin_bucket_name
+  key          = "scripts/custom-domain-cert-sync.sh"
+  source       = "${path.module}/scripts/custom-domain-cert-sync.sh"
+  source_hash  = filemd5("${path.module}/scripts/custom-domain-cert-sync.sh")
+  content_type = "text/x-shellscript"
+}
+
+# IAM policy for AC instances to download scripts from S3
+resource "aws_iam_role_policy" "ac_scripts_download" {
+  count = var.plugin_bucket_arn != null ? 1 : 0
+
+  name = "scripts-download"
+  role = aws_iam_role.ac.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "ScriptsS3Download"
+      Effect = "Allow"
+      Action = ["s3:GetObject"]
+      Resource = [
+        "${var.plugin_bucket_arn}/scripts/*"
+      ]
+    }]
+  })
+}
+
 resource "aws_iam_instance_profile" "ac" {
   name = "${var.name_prefix}-ac"
   role = aws_iam_role.ac.name
@@ -775,8 +827,9 @@ locals {
     centralized_cert_secret_arn = var.centralized_cert_secret_arn != null ? var.centralized_cert_secret_arn : ""
     centralized_cert_domains    = var.centralized_cert_domains
     acme_lambda_function_name   = var.acme_lambda_function_name
-    # Custom domain cert sync script (embedded in user_data so it's available on boot)
-    custom_domain_cert_sync_script = file("${path.module}/scripts/custom-domain-cert-sync.sh")
+    # Scripts downloaded from S3 to avoid user_data 16KB limit
+    lib_script_s3_uri       = var.plugin_bucket_name != null ? "s3://${var.plugin_bucket_name}/scripts/lib.sh" : ""
+    cert_sync_script_s3_uri = var.plugin_bucket_name != null ? "s3://${var.plugin_bucket_name}/scripts/custom-domain-cert-sync.sh" : ""
     # Egress EIP configuration
     enable_egress_eips = var.enable_egress_eips
     eip_pool_tag       = local.eip_pool_tag
@@ -809,8 +862,43 @@ resource "aws_launch_template" "ac" {
     }
   }
 
-  # Gzip compress user data to stay under 16KB limit (AWS auto-decompresses)
-  user_data = base64gzip(local.user_data)
+  # Full init script is stored in S3 (exceeds EC2's 16KB user_data limit).
+  # This bootstrap installs AWS CLI, downloads the init script, and executes it.
+  # The S3 object content hash is embedded to trigger launch template updates.
+  user_data = var.plugin_bucket_name != null ? base64encode(<<-BOOTSTRAP
+#!/bin/bash
+set -ex
+exec > >(tee /var/log/user-data.log | logger -t user-data) 2>&1
+# Init script hash: ${aws_s3_object.init_script[0].etag}
+# Report bootstrap failures to CloudWatch for operational visibility
+report_failure() {
+  echo "BOOTSTRAP FAILED: $1"
+  command -v aws &>/dev/null && aws cloudwatch put-metric-data \
+    --namespace "LayerV/NHP" \
+    --metric-name "BootstrapFailure" \
+    --value 1 --unit Count \
+    --dimensions "Component=ac,Environment=${var.environment}" \
+    --region "$REGION" 2>/dev/null || true
+}
+trap 'report_failure "unexpected error on line $LINENO"' ERR
+# Install AWS CLI v2
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+unzip -qo /tmp/awscliv2.zip -d /tmp && /tmp/aws/install --update
+rm -rf /tmp/awscliv2.zip /tmp/aws
+# Get region from IMDSv2
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+# Download full init script (retry on transient network failures)
+for i in 1 2 3; do
+  aws s3 cp "s3://${var.plugin_bucket_name}/scripts/ac-init.sh" /tmp/ac-init.sh --region "$REGION" && break
+  [[ $i -lt 3 ]] || { report_failure "S3 download failed after 3 retries"; exit 1; }
+  echo "Retry $i: S3 download failed, retrying in $((i * 5))s..."
+  sleep $((i * 5))
+done
+chmod +x /tmp/ac-init.sh
+exec /tmp/ac-init.sh
+BOOTSTRAP
+  ) : base64gzip(local.user_data) # WARNING: will fail if rendered template exceeds EC2's 16KB user_data limit
 
   monitoring {
     enabled = true

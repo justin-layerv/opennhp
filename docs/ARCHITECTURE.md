@@ -2005,6 +2005,24 @@ When code changes but user_data template doesn't change, the launch template ver
 stays the same. Without `SkipMatching: false`, AWS would skip instance replacement,
 leaving old code running. See PR #94 for the fix.
 
+**AC user_data 16KB Limit (S3 Bootstrap):**
+EC2 launch templates have a hard 16KB limit on user_data (after base64 encoding). The AC
+`user_data.sh.tpl` template renders to ~53KB raw (~19KB gzip+base64), which exceeds this limit.
+To work around this, the AC module uses a two-stage bootstrap:
+
+1. The launch template's user_data contains a minimal bootstrap script (~700 bytes) that
+   installs AWS CLI, downloads the full init script from S3, and `exec`s it.
+2. The full rendered init script is uploaded to the plugins S3 bucket as `scripts/ac-init.sh`.
+3. The S3 object's etag is embedded in the bootstrap as a comment, which triggers launch
+   template version updates when the init script content changes.
+
+If you add content to `user_data.sh.tpl`, it won't hit the 16KB limit because only the
+bootstrap is in user_data. However, if you add new scripts that need to be on the instance
+at boot time, upload them to S3 (like `scripts/custom-domain-cert-sync.sh`) and download
+them in the init script rather than embedding them inline.
+
+See `terraform/modules/ac/main.tf` — search for `aws_s3_object.init_script` and `BOOTSTRAP`.
+
 ---
 
 ## Observability

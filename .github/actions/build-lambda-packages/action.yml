@@ -19,7 +19,7 @@ runs:
       uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5
       with:
         path: ~/.cache/pip
-        key: lambda-pip-${{ runner.os }}-${{ hashFiles('terraform/modules/acme-cert/lambda/requirements.txt') }}
+        key: lambda-pip-${{ runner.os }}-${{ hashFiles('terraform/modules/acme-cert/lambda/requirements.txt', 'terraform/modules/custom-domain-cert/lambda/requirements.txt') }}
         restore-keys: |
           lambda-pip-${{ runner.os }}-
 
@@ -30,11 +30,22 @@ runs:
         bash terraform/modules/acme-cert/lambda/build.sh
         echo "::endgroup::"
 
+    - name: Build Custom Domain Certificate Lambda
+      shell: bash
+      run: |
+        echo "::group::Building Custom Domain Certificate Manager Lambda"
+        bash terraform/modules/custom-domain-cert/lambda/build.sh
+        echo "::endgroup::"
+
     - name: Verify Build
       shell: bash
       run: |
         echo "::group::Verifying Lambda Build"
         bash terraform/modules/acme-cert/lambda/test_build.sh
+        echo "Verifying custom-domain-cert Lambda build..."
+        test -f terraform/modules/custom-domain-cert/build/package/custom_domain_cert_manager.py \
+          || (echo "ERROR: custom-domain-cert Lambda build output missing" && exit 1)
+        echo "  [OK] custom_domain_cert_manager.py exists"
         echo "::endgroup::"
 
     - name: Run Python Unit Tests
@@ -43,4 +54,5 @@ runs:
         echo "::group::Running Python Unit Tests"
         pip install -q -r terraform/modules/acme-cert/lambda/requirements-dev.txt
         pytest terraform/modules/acme-cert/lambda/test_acme_cert_manager.py -v
+        pytest terraform/modules/custom-domain-cert/lambda/test_cert_manager.py -v
         echo "::endgroup::"

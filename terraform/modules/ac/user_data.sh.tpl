@@ -13,29 +13,20 @@ echo "Starting NHP AC installation at $(date)"
 
 export DEBIAN_FRONTEND=noninteractive
 
-# Retry apt-get commands with exponential backoff (Ubuntu runs unattended-upgrades on boot which holds locks)
-apt_get_with_retry() {
-    local max_attempts=10
-    local delay=2
-    local max_delay=60
+# Define retry helper inline (needed before AWS CLI and REGION are available)
+mkdir -p /home/ubuntu/scripts
+retry_with_backoff() {
+    local max_attempts=$1 delay=$2 max_delay=$3; shift 3
     local attempt=1
     while true; do
-        if apt-get "$@"; then
-            return 0
-        fi
-        if [ $attempt -ge $max_attempts ]; then
-            echo "ERROR: apt-get $* failed after $max_attempts attempts"
-            return 1
-        fi
-        echo "apt-get $* failed (attempt $attempt/$max_attempts), retrying in $${delay}s..."
-        sleep $delay
-        attempt=$((attempt + 1))
-        delay=$((delay * 2))
-        if [ $delay -gt $max_delay ]; then
-            delay=$max_delay
-        fi
+        if "$@"; then return 0; fi
+        if [ "$attempt" -ge "$max_attempts" ]; then echo "ERROR: $* failed after $max_attempts attempts"; return 1; fi
+        echo "$* failed (attempt $attempt/$max_attempts), retrying in $${delay}s..."
+        sleep "$delay"; attempt=$((attempt + 1)); delay=$((delay * 2))
+        if [ "$delay" -gt "$max_delay" ]; then delay=$max_delay; fi
     done
 }
+apt_get_with_retry() { retry_with_backoff 10 2 60 apt-get "$@"; }
 
 apt_get_with_retry update -y
 # Note: awscli package deprecated in Ubuntu 24.04, using unzip + curl for AWS CLI v2
@@ -167,6 +158,14 @@ fi
 
 REGION="${region}"
 ACCOUNT_ID="${account_id}"
+
+# Download shared helper library now that REGION is available
+%{ if lib_script_s3_uri != "" }
+aws s3 cp "${lib_script_s3_uri}" /home/ubuntu/scripts/lib.sh --region "$REGION" 2>/dev/null || true
+if [ -f /home/ubuntu/scripts/lib.sh ]; then
+    source /home/ubuntu/scripts/lib.sh
+fi
+%{ endif }
 
 TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
@@ -1265,15 +1264,17 @@ WantedBy=multi-user.target
 SVCEOF
 
 # ============================================================================
-# Install Custom Domain Cert Sync Script
+# Download Custom Domain Cert Sync Script from S3
 # This script is also run via SSM associations for periodic syncing.
+# Stored in S3 instead of inline to stay under the 16KB user_data limit.
 # ============================================================================
-mkdir -p /home/ubuntu/scripts
-cat > /home/ubuntu/scripts/custom-domain-cert-sync.sh << 'SYNCSCRIPTEOF'
-${custom_domain_cert_sync_script}
-SYNCSCRIPTEOF
+%{ if cert_sync_script_s3_uri != "" }
+aws s3 cp "${cert_sync_script_s3_uri}" /home/ubuntu/scripts/custom-domain-cert-sync.sh --region "$REGION"
 chmod +x /home/ubuntu/scripts/custom-domain-cert-sync.sh
 chown ubuntu:ubuntu /home/ubuntu/scripts/custom-domain-cert-sync.sh
+%{ else }
+echo "No cert sync script S3 URI configured, skipping download"
+%{ endif }
 
 # ============================================================================
 # Fetch Traefik Plugins from S3
