@@ -688,9 +688,7 @@ jobs:
   # DEPLOY SANDBOX - Split into parallel jobs for faster deploys
   # ============================================================================
   # Job dependency graph:
-  #   deploy-sandbox-infra → deploy-sandbox-server → deploy-sandbox-ac ─┬─→ deploy-sandbox-validate
-  #                                                 → deploy-sandbox-console ─┘
-  # AC and Console run in parallel after Server completes (~9 min savings)
+  #   deploy-sandbox-infra → deploy-sandbox-server → deploy-sandbox-ac → deploy-sandbox-validate
   # ============================================================================
 
   deploy-sandbox-infra:
@@ -713,7 +711,6 @@ jobs:
     outputs:
       server_asg: ${{ steps.outputs.outputs.server_asg }}
       ac_asg: ${{ steps.outputs.outputs.ac_asg }}
-      console_ec2_asg: ${{ steps.outputs.outputs.console_ec2_asg }}
       nlb_dns: ${{ steps.outputs.outputs.nlb_dns }}
       etcd_endpoint: ${{ steps.outputs.outputs.etcd_endpoint }}
     steps:
@@ -882,7 +879,6 @@ jobs:
           {
             echo "server_asg=$(terraform output -raw asg_name 2>/dev/null || echo '')"
             echo "ac_asg=$(terraform output -raw ac_asg_name 2>/dev/null || echo '')"
-            echo "console_ec2_asg=$(terraform output -raw console_ec2_asg_name 2>/dev/null || echo '')"
             echo "nlb_dns=$(terraform output -raw nlb_dns_name 2>/dev/null || echo '')"
             echo "etcd_endpoint=$(terraform output -raw etcd_endpoint 2>/dev/null || echo '')"
           } >> "$GITHUB_OUTPUT"
@@ -1018,77 +1014,14 @@ jobs:
             --unit Count
           echo "Deployment event pushed to LayerV/NHP namespace"
 
-  deploy-sandbox-console:
-    name: Deploy Sandbox - Console EC2
-    needs: [deploy-sandbox-server, deploy-sandbox-infra]
-    if: always() && needs.deploy-sandbox-server.result == 'success' && needs.deploy-sandbox-infra.outputs.console_ec2_asg != ''
-    runs-on: ubuntu-latest
-    environment: sandbox
-    timeout-minutes: 25
-    concurrency:
-      group: deploy-sandbox-console
-      cancel-in-progress: true
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Configure AWS credentials
-        uses: ./.github/actions/setup-deploy
-        with:
-          aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Instance Refresh - Console EC2
-        env:
-          ASG_NAME: ${{ needs.deploy-sandbox-infra.outputs.console_ec2_asg }}
-        run: |
-          echo "============================================"
-          echo "INSTANCE REFRESH - Console EC2"
-          echo "============================================"
-
-          # Cancel any existing instance refresh from previous failed/cancelled runs
-          ./.github/scripts/cancel-existing-refresh.sh "$ASG_NAME"
-
-          # SkipMatching must be false for Console EC2 because the binary is downloaded
-          # at boot via user_data, not baked into the AMI. When code changes, the launch
-          # template doesn't change, so SkipMatching would incorrectly skip replacement.
-          #
-          # InstanceWarmup must match the ASG health_check_grace_period (360s).
-          # If warmup < grace period, the refresh tries to evaluate health before
-          # the grace period allows ELB health checks to take effect, causing the
-          # refresh to hang at 25% until the grace period expires.
-          REFRESH_ID=$(aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name "$ASG_NAME" \
-            --preferences '{
-              "MinHealthyPercentage": 50,
-              "InstanceWarmup": 360,
-              "MaxHealthyPercentage": 110,
-              "SkipMatching": false
-            }' \
-            --query "InstanceRefreshId" \
-            --output text)
-
-          echo "Instance Refresh ID: $REFRESH_ID"
-
-          # Wait for instance refresh (no health check for Console)
-          # Console EC2 needs time for: apt install, Docker pull, service start,
-          # 360s health_check_grace_period, ELB health check convergence, 360s warmup.
-          # 120 iterations * 10s = 1200s (20 minutes), with 5 min margin in 25 min timeout.
-          ./.github/scripts/wait-for-instance-refresh.sh \
-            "$ASG_NAME" \
-            "$REFRESH_ID" \
-            "" \
-            120
-
   deploy-sandbox-validate:
     name: Deploy Sandbox - Validate
-    needs: [setup, deploy-sandbox-infra, deploy-sandbox-server, deploy-sandbox-ac, deploy-sandbox-console]
+    needs: [setup, deploy-sandbox-infra, deploy-sandbox-server, deploy-sandbox-ac]
     if: |
       always() &&
       needs.deploy-sandbox-infra.result == 'success' &&
       needs.deploy-sandbox-server.result == 'success' &&
-      (needs.deploy-sandbox-ac.result == 'success' || needs.deploy-sandbox-ac.result == 'skipped') &&
-      (needs.deploy-sandbox-console.result == 'success' || needs.deploy-sandbox-console.result == 'skipped')
+      (needs.deploy-sandbox-ac.result == 'success' || needs.deploy-sandbox-ac.result == 'skipped')
     runs-on: ubuntu-latest
     environment: sandbox
     timeout-minutes: 10
@@ -1195,7 +1128,6 @@ jobs:
       - name: Deployment Summary
         env:
           AC_RESULT: ${{ needs.deploy-sandbox-ac.result }}
-          CONSOLE_RESULT: ${{ needs.deploy-sandbox-console.result }}
         run: |
           # Map job result to friendly status
           friendly_status() {
@@ -1216,7 +1148,6 @@ jobs:
             echo "|-----------|-----|--------|"
             echo "| NHP Server | ${{ needs.deploy-sandbox-infra.outputs.server_asg }} | Deployed ✓ |"
             echo "| AC | ${{ needs.deploy-sandbox-infra.outputs.ac_asg }} | $(friendly_status "$AC_RESULT") |"
-            echo "| Console EC2 | ${{ needs.deploy-sandbox-infra.outputs.console_ec2_asg || 'N/A' }} | $(friendly_status "$CONSOLE_RESULT") |"
             echo ""
             echo "### Endpoints"
             echo "- **NHP NLB:** \`${{ needs.deploy-sandbox-infra.outputs.nlb_dns }}\`"
@@ -1263,7 +1194,6 @@ jobs:
       - deploy-sandbox-infra
       - deploy-sandbox-server
       - deploy-sandbox-ac
-      - deploy-sandbox-console
       - deploy-sandbox-validate
     if: always() && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -1280,7 +1210,6 @@ jobs:
           SANDBOX_INFRA: ${{ needs.deploy-sandbox-infra.result }}
           SANDBOX_SERVER: ${{ needs.deploy-sandbox-server.result }}
           SANDBOX_AC: ${{ needs.deploy-sandbox-ac.result }}
-          SANDBOX_CONSOLE: ${{ needs.deploy-sandbox-console.result }}
           SANDBOX_VALIDATE: ${{ needs.deploy-sandbox-validate.result }}
           # Metadata
           IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
@@ -1348,24 +1277,17 @@ jobs:
             SANDBOX_DEPLOYED="true"
           fi
 
-          # Build component status strings with visual pipeline (AC and Console run in parallel)
+          # Build component status strings with visual pipeline
           SANDBOX_STATUS=""
           if [[ "$SANDBOX_DEPLOYED" == "true" ]]; then
-            SANDBOX_STATUS="$(status_emoji "$SANDBOX_INFRA") Infra → $(status_emoji "$SANDBOX_SERVER") Server → "
-            if [[ "$SANDBOX_CONSOLE" != "skipped" ]]; then
-              # Show parallel execution: AC | Console
-              SANDBOX_STATUS="${SANDBOX_STATUS}$(status_emoji "$SANDBOX_AC") AC | $(status_emoji "$SANDBOX_CONSOLE") Console"
-            else
-              SANDBOX_STATUS="${SANDBOX_STATUS}$(status_emoji "$SANDBOX_AC") AC"
-            fi
-            SANDBOX_STATUS="${SANDBOX_STATUS} → $(status_emoji "$SANDBOX_VALIDATE") Validate"
+            SANDBOX_STATUS="$(status_emoji "$SANDBOX_INFRA") Infra → $(status_emoji "$SANDBOX_SERVER") Server → $(status_emoji "$SANDBOX_AC") AC → $(status_emoji "$SANDBOX_VALIDATE") Validate"
           fi
 
           # Determine overall status and header
           if [[ "$BUILD_RESULT" == "success" ]]; then
             # Check for any deploy or validation failures
             DEPLOY_FAILED="false"
-            for result in "$SANDBOX_INFRA" "$SANDBOX_SERVER" "$SANDBOX_AC" "$SANDBOX_CONSOLE" "$SANDBOX_VALIDATE"; do
+            for result in "$SANDBOX_INFRA" "$SANDBOX_SERVER" "$SANDBOX_AC" "$SANDBOX_VALIDATE"; do
               if [[ "$result" == "failure" ]]; then
                 DEPLOY_FAILED="true"
                 break
