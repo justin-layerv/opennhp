@@ -415,22 +415,6 @@ variable "traefik_plugins" {
 }
 
 # ============================================================================
-# Console Backend Configuration (for NHP-protected Console)
-# When Console is in internal_only mode, AC routes traffic to Console
-# ============================================================================
-
-variable "console_backend_url" {
-  description = "Console internal endpoint URL for AC to proxy to (e.g., http://nlb-dns:8888). Must be set together with console_domain."
-  type        = string
-  default     = null
-}
-
-variable "console_domain" {
-  description = "Console domain that AC should route to Console backend (e.g., console.nhp.layerv.xyz). Must be set together with console_backend_url."
-  type        = string
-  default     = null
-}
-
 # ============================================================================
 # QURL Router Plugin Configuration
 # Routes requests from *.qurl.site subdomains to their target backends

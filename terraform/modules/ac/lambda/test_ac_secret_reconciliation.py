@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 # Set required environment variables before importing the module
-os.environ.setdefault("SECRET_PREFIXES", '["nhp-sandbox-ac-i-", "nhp-sandbox-console-ac-i-"]')
+os.environ.setdefault("SECRET_PREFIXES", '["nhp-sandbox-ac-i-"]')
 os.environ.setdefault("RECOVERY_WINDOW_DAYS", "0")
 os.environ.setdefault("ENVIRONMENT", "sandbox")
 
@@ -63,13 +63,13 @@ class TestListAcSecrets:
         """Iterates over all prefixes and aggregates results."""
         pages_by_call = [
             [{"SecretList": [{"Name": "nhp-sandbox-ac-i-0abc123def456789a"}]}],
-            [{"SecretList": [{"Name": "nhp-sandbox-console-ac-i-0def456789abc1234"}]}],
+            [{"SecretList": [{"Name": "nhp-prod-ac-i-0def456789abc1234"}]}],
         ]
         paginator = MagicMock()
         paginator.paginate.side_effect = pages_by_call
         self.mock_sm.get_paginator.return_value = paginator
 
-        result = module.list_ac_secrets(["nhp-sandbox-ac-i-", "nhp-sandbox-console-ac-i-"])
+        result = module.list_ac_secrets(["nhp-sandbox-ac-i-", "nhp-prod-ac-i-"])
 
         assert len(result) == 2
         assert result[0]["instance_id"] == "i-0abc123def456789a"
@@ -365,10 +365,6 @@ class TestInstanceIdPattern:
         # This has a valid-looking ID in the middle but extra text after
         match = module.INSTANCE_ID_PATTERN.search("nhp-sandbox-ac-i-0abc123def456789a-extra")
         assert match is None
-
-    def test_console_ac_prefix(self):
-        match = module.INSTANCE_ID_PATTERN.search("nhp-sandbox-console-ac-i-0abc123def456789a")
-        assert match and match.group(1) == "i-0abc123def456789a"
 
 
 # ==================== Handler Integration ====================

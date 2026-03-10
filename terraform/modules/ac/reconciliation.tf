@@ -50,7 +50,7 @@ resource "aws_lambda_function" "secret_reconciliation" {
 
   environment {
     variables = {
-      SECRET_PREFIXES      = jsonencode(["${var.name_prefix}-ac-i-", "${var.name_prefix}-console-ac-i-"])
+      SECRET_PREFIXES      = jsonencode(["${var.name_prefix}-ac-i-"])
       RECOVERY_WINDOW_DAYS = local.is_prod ? "7" : "0"
       ENVIRONMENT          = var.environment
     }
@@ -106,8 +106,7 @@ resource "aws_iam_role_policy" "secret_reconciliation_secrets" {
         Effect = "Allow"
         Action = ["secretsmanager:DeleteSecret"]
         Resource = [
-          "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:${var.name_prefix}-ac-i-*",
-          "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:${var.name_prefix}-console-ac-i-*"
+          "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:${var.name_prefix}-ac-i-*"
         ]
       }
       ], var.secrets_kms_key_arn != null ? [{

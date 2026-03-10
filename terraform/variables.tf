@@ -318,7 +318,6 @@ variable "ac_resource_ids" {
 }
 
 # Standalone AC License Credentials (for customer-deployed ACs)
-# These are separate from console_ac_* which is for the Console's embedded AC
 
 variable "ac_customer_id" {
   description = "Customer ID (ULID format) for standalone AC license"
@@ -467,71 +466,6 @@ variable "enable_termination_cleanup" {
   default     = false
 }
 
-# ==================== RDS Configuration ====================
-
-variable "deploy_rds" {
-  description = "Deploy Aurora PostgreSQL Serverless for console application"
-  type        = bool
-  default     = false
-}
-
-variable "rds_database_name" {
-  description = "Name of the default database to create"
-  type        = string
-  default     = "portal"
-}
-
-variable "rds_min_capacity" {
-  description = "Minimum Aurora Serverless v2 capacity (ACUs)"
-  type        = number
-  default     = 0.5
-}
-
-variable "rds_max_capacity" {
-  description = "Maximum Aurora Serverless v2 capacity (ACUs)"
-  type        = number
-  default     = 4
-}
-
-variable "rds_deletion_protection" {
-  description = "Enable deletion protection for RDS"
-  type        = bool
-  default     = true
-}
-
-# ==================== Console Configuration ====================
-
-variable "deploy_console" {
-  description = "Deploy the Console application as ECS Fargate service"
-  type        = bool
-  default     = false
-}
-
-variable "console_domain" {
-  description = "Domain name for console (e.g., console.layerv.xyz)"
-  type        = string
-  default     = null
-}
-
-variable "console_acm_certificate_arn" {
-  description = "ACM certificate ARN for console HTTPS"
-  type        = string
-  default     = null
-}
-
-variable "console_cookie_domain" {
-  description = "Cookie domain for console portal sites"
-  type        = string
-  default     = ".layerv.ai"
-}
-
-variable "console_admin_password" {
-  description = "Admin user password for Console. If not provided, a random password will be generated and logged on first deployment."
-  type        = string
-  sensitive   = true
-  default     = null
-}
-
 # ==================== Deployment Configuration ====================
 
 variable "image_tag" {
@@ -677,169 +611,12 @@ variable "plugin_repos" {
   default     = ["traefik-plugins"]
 }
 
-# ==================== Console EC2 Configuration ====================
-
-variable "deploy_console_ec2" {
-  description = "Deploy the Console API on EC2 (alternative to ECS Fargate console)"
-  type        = bool
-  default     = false
-}
-
-variable "console_ec2_domain" {
-  description = "Domain for Console EC2 API (e.g., console.nhp.layerv.xyz)"
-  type        = string
-  default     = null
-}
-
-variable "console_internal_only" {
-  description = "Make Console internal-only (NHP-protected via AC). When true, Console is only accessible through AC after NHP authentication."
-  type        = bool
-  default     = false
-}
-
-variable "console_protected_hostname" {
-  description = "NHP-protected Console hostname (e.g., 'console2.apps.layerv.xyz'). Required when console_internal_only=true. This is where users are redirected after successful auth_code knock."
-  type        = string
-  default     = null
-}
-
-variable "console_ac_license_key_hash" {
-  description = "Bcrypt hash of the Console AC license key. Generate with: ./terraform/scripts/generate-console-ac-license.sh <environment>. REQUIRED - empty hash will cause AC registration to fail."
-  type        = string
-  sensitive   = true
-  default     = null
-}
-
-variable "console_ac_license_key_sha256" {
-  description = "SHA256 hash of the Console AC license key. Used as DynamoDB partition key for license lookup. Generate with: ./terraform/scripts/generate-console-ac-license.sh <environment>"
-  type        = string
-  sensitive   = true
-  default     = null
-}
-
-variable "console_ac_customer_id" {
-  description = "Customer ID (ULID format) for Console's embedded AC. LayerV system uses nil ULID: 00000000000000000000000000"
-  type        = string
-  default     = "00000000000000000000000000" # Nil ULID for LayerV system customer
-}
-
-# ==================== NHP Server Assignment Configuration ====================
-# These variables configure how Console manages AC-to-NHP-Server assignments.
-# All fields are required and must be explicitly configured (no defaults).
-
-variable "nhp_server_assignment_enabled" {
-  description = "Enable NHP server assignment for ACs. Required. Recommended: true"
-  type        = bool
-  # No default - must be explicitly configured
-}
-
-variable "nhp_region" {
-  description = "AWS region for NHP DynamoDB tables and CloudMap. Required. Recommended: match deployment region."
-  type        = string
-  # No default - must be explicitly configured
-}
+# ==================== CloudMap Configuration ====================
 
 variable "nhp_cloudmap_service_name" {
   description = "CloudMap service name for NHP servers. Required. Recommended: 'server'"
   type        = string
   # No default - must be explicitly configured
-}
-
-variable "nhp_assignment_servers_per_ac" {
-  description = "Number of NHP servers to assign per AC. Required. Recommended: 3 (one per AZ)"
-  type        = number
-  # No default - must be explicitly configured
-
-  validation {
-    condition     = var.nhp_assignment_servers_per_ac >= 1
-    error_message = "nhp_assignment_servers_per_ac must be at least 1"
-  }
-}
-
-variable "nhp_assignment_require_distinct_azs" {
-  description = "Require assigned servers to be in different AZs for HA. Required. Recommended: true"
-  type        = bool
-  # No default - must be explicitly configured
-}
-
-variable "nhp_health_monitor_check_interval" {
-  description = "Interval in seconds between health checks. Required. Recommended: 60"
-  type        = number
-  # No default - must be explicitly configured
-
-  validation {
-    condition     = var.nhp_health_monitor_check_interval >= 1
-    error_message = "nhp_health_monitor_check_interval must be at least 1 second"
-  }
-}
-
-variable "nhp_health_monitor_operation_timeout" {
-  description = "Timeout in seconds for health check operations. Required. Recommended: 30"
-  type        = number
-  # No default - must be explicitly configured
-
-  validation {
-    condition     = var.nhp_health_monitor_operation_timeout >= 1
-    error_message = "nhp_health_monitor_operation_timeout must be at least 1 second"
-  }
-}
-
-variable "nhp_console_ac_enabled" {
-  description = "Enable Console's embedded AC self-registration in DynamoDB. Required. Recommended: true"
-  type        = bool
-  # No default - must be explicitly configured
-}
-
-# ==================== Console License Lookup ====================
-
-variable "nhp_dynamodb_licenses_customer_index" {
-  description = "GSI name for querying licenses by customer_id. Required for license lookup. Recommended: 'customer_id-index'"
-  type        = string
-  default     = null
-}
-
-variable "nhp_dynamodb_licenses_auth0_subject_index" {
-  description = "GSI name for querying licenses by auth0_subject. Required for QURL quota lookup. Recommended: 'auth0_subject-index'"
-  type        = string
-  default     = null
-}
-
-# ==================== Console Internal Service Auth ====================
-
-variable "internal_service_token_secret_arn" {
-  description = "ARN of Secrets Manager secret containing the internal service token for Auth0 Actions to call Console API"
-  type        = string
-  default     = null
-}
-
-variable "provisioning_resource_id" {
-  description = "Resource ID for auto-provisioned licenses. Recommended: 'qurl-auto-provisioned'"
-  type        = string
-  default     = null
-}
-
-variable "provisioning_default_tier" {
-  description = "Default license tier for new customers. Must be: free, pro, enterprise, or system. Recommended: 'free'"
-  type        = string
-  default     = null
-
-  validation {
-    # Use ternary to avoid evaluating contains() when value is null
-    condition     = var.provisioning_default_tier == null ? true : contains(["free", "pro", "enterprise", "system"], var.provisioning_default_tier)
-    error_message = "provisioning_default_tier must be one of: free, pro, enterprise, system"
-  }
-}
-
-variable "provisioning_default_max_acs" {
-  description = "Default MaxACs limit for new customers. 0 = unlimited. Recommended: 1 (for free tier)"
-  type        = number
-  default     = null
-
-  validation {
-    # Use ternary to avoid evaluating >= when value is null
-    condition     = var.provisioning_default_max_acs == null ? true : var.provisioning_default_max_acs >= 0
-    error_message = "provisioning_default_max_acs must be non-negative"
-  }
 }
 
 # ==================== QURL Service ====================

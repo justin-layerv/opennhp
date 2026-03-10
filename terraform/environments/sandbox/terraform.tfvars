@@ -21,7 +21,7 @@ deploy_ac          = true
 acme_email         = "admin@layerv.xyz"
 ac_auth_service_id = "layerv"
 ac_min_capacity    = 3
-ac_resource_ids    = ["demo", "mini-app-demo", "console"]
+ac_resource_ids    = ["demo", "mini-app-demo"]
 enable_egress_eips = true
 
 # Terraform state bucket for GitHub Actions permissions
@@ -61,9 +61,7 @@ enable_termination_cleanup = true
 
 # Secret reconciliation: Lambda cleans orphaned per-instance AC secrets daily
 enable_secret_reconciliation = true
-# auth_url is set dynamically in main.tf to Console EC2 internal NLB endpoint
-# auth_signing_key and auth_aes_key are passed via GitHub Secrets (TF_VAR_auth_signing_key, TF_VAR_auth_aes_key)
-# IMPORTANT: auth_signing_key must match Console's jwt.signing-key in config.yaml
+# auth_url, auth_signing_key, and auth_aes_key are passed via GitHub Secrets (TF_VAR_*)
 
 # Slack notifications via AWS Chatbot
 enable_slack_notifications = true
@@ -76,13 +74,6 @@ guardduty_alert_emails = [
   "benc@layerv.ai",
   "joe@layerv.ai"
 ]
-
-# RDS configuration for console database
-deploy_rds              = true
-rds_database_name       = "portal"
-rds_min_capacity        = 0.5
-rds_max_capacity        = 4
-rds_deletion_protection = false # Allow deletion in sandbox
 
 # NHP Server plugins - statically compiled into server binary
 # This list specifies which AuthSvcIds are valid for authentication
@@ -118,7 +109,7 @@ traefik_plugins_deploy_bucket_arn = "arn:aws:s3:::traefik-plugins-deploy-7673978
 
 # Repos that can assume the GitHub Actions IAM role
 # NHP server plugins are now compiled in - only Traefik plugins use S3
-plugin_repos = ["traefik-plugins", "console"]
+plugin_repos = ["traefik-plugins"]
 
 # QURL domains for sandbox (subdomains of layerv.xyz, same-account DNS)
 # Production owns qurl.site and qurl.link directly
@@ -156,47 +147,8 @@ centralized_cert_domains = ["nhp.layerv.xyz", "*.nhp.layerv.xyz", "apps.layerv.x
 # customer custom domains registered via the QURL API.
 deploy_custom_domain_cert = true
 
-# ==============================================================================
-# Console EC2 Configuration
-# Console API for portal site management (alternative to Fargate - more cost effective)
-# ==============================================================================
-# Set to true to deploy Console on EC2 instead of ECS Fargate
-deploy_console_ec2    = true
-console_ec2_domain    = "console.nhp.layerv.xyz"
-console_cookie_domain = ".layerv.xyz"
-# Set to true to make Console internal-only (NHP-protected via AC)
-# When enabled: Console runs on private subnets, accessed via AC NLB after NHP auth
-# Traffic flow: Internet → AC NLB → Traefik → nhp-acd → Console internal NLB
-console_internal_only = true
-# Two-domain architecture for NHP Console:
-# - Login domain: console.nhp.layerv.xyz (Traefik bypass, unprotected)
-# - Protected domain: console2.apps.layerv.xyz (NHP-protected, where users land after auth)
-console_protected_hostname = "console2.apps.layerv.xyz"
-# Console AC license credentials for DynamoDB validation
-# Generated with: ./terraform/scripts/generate-console-ac-license.sh sandbox
-console_ac_license_key_hash   = "$2b$10$CtI9zvLpcpzt0JNscTwUIOSXL67YvC4sh1dkJsh0/Y6nytM41sWGm"
-console_ac_license_key_sha256 = "f011ddf4f224db6f583da60bb998ec8ac225659c539aac176ca0d6935e28708c"
-
-# Console license lookup GSI names
-nhp_dynamodb_licenses_customer_index      = "customer_id-index"
-nhp_dynamodb_licenses_auth0_subject_index = "auth0_subject-index"
-
-# NHP Server Assignment Configuration
-# All fields are required - no defaults (explicit configuration philosophy)
-nhp_server_assignment_enabled        = true
-nhp_region                           = "us-east-2"
-nhp_cloudmap_service_name            = "server"
-nhp_assignment_servers_per_ac        = 3
-nhp_assignment_require_distinct_azs  = true
-nhp_health_monitor_check_interval    = 60
-nhp_health_monitor_operation_timeout = 30
-nhp_console_ac_enabled               = true
-
-# Console customer provisioning (for Auth0 Post User Registration)
-# internal_service_token_secret_arn must be created in Secrets Manager first
-# provisioning_resource_id   = "qurl-auto-provisioned"
-# provisioning_default_tier  = "free"
-# provisioning_default_max_acs = 1
+# CloudMap configuration
+nhp_cloudmap_service_name = "server"
 
 # Standalone AC license credentials for DynamoDB validation
 # Generated with: ./terraform/scripts/generate-ac-license.sh sandbox
@@ -204,10 +156,6 @@ nhp_console_ac_enabled               = true
 ac_customer_id        = "00000000000000000000000000"
 ac_license_key_hash   = "$2b$10$DBTFv1FKlHIGC3PCcatuQuAnhxZzH8EgfZMCzOYEQZH4dAtAYFwve"
 ac_license_key_sha256 = "a762d8af6c774acf2d0560575658062f306cd2e872409ac52cf0baf0749f4e7e"
-
-# NHP network-level protection is always enabled on Console EC2.
-# Console runs its own nhp-acd with iptables DROP by default.
-# Port 443 is only accessible after NHP knock adds the user's IP to ipset.
 
 # ==============================================================================
 # QURL Service Configuration
@@ -267,7 +215,7 @@ qurl_audit_retention_days = 90
 # Note: staging.layerv.ai appears here (QURL API) AND in dashboard_allowed_origins
 # (billing/developer-portal APIs) because they are separate CORS configurations
 # on different services — QURL API (ECS) vs billing API (API Gateway).
-qurl_cors_allowed_origins = "https://console.nhp.layerv.xyz,https://qurl.link.layerv.xyz,https://*.qurl.site.layerv.xyz,https://staging.layerv.ai"
+qurl_cors_allowed_origins = "https://qurl.link.layerv.xyz,https://*.qurl.site.layerv.xyz,https://staging.layerv.ai"
 
 # Additional allowed hosts for DNS rebinding protection
 # ALB DNS name, localhost, and 127.0.0.1 are always included automatically.

@@ -99,15 +99,8 @@ ac_customer_id        = "00000000000000000000000000" # Nil ULID for LayerV syste
 ac_license_key_hash   = "$2b$10$DOiwRhVzk94ZSllcY0Arye1hON734.qydu1ou2d/RSTklnvEVcRcO"
 ac_license_key_sha256 = "cd7f8df5284861a9ebfbe485085843b3631b8dbe325f272622473bfb4991bdfe"
 
-# NHP Server Assignment Configuration (all required, no defaults)
-nhp_server_assignment_enabled        = true
-nhp_region                           = "us-east-2"
-nhp_cloudmap_service_name            = "server"
-nhp_assignment_servers_per_ac        = 3
-nhp_assignment_require_distinct_azs  = true
-nhp_health_monitor_check_interval    = 60
-nhp_health_monitor_operation_timeout = 30
-nhp_console_ac_enabled               = true
+# CloudMap
+nhp_cloudmap_service_name = "server"
 
 # Production domains
 production_domains = ["qurl.site", "qurl.link"]
@@ -210,10 +203,6 @@ auth0_manage_tenant_resources = true
 
 # Auth0 M2M credential rotation (Phase 2: enable after auth0 management secret is created)
 auth0_enable_rotation = false
-
-# Console license lookup GSIs (required for license validation even without Console EC2)
-nhp_dynamodb_licenses_customer_index      = "customer_id-index"
-nhp_dynamodb_licenses_auth0_subject_index = "auth0_subject-index"
 
 # QURL ECS Fargate capacity (right-sized for initial sporadic traffic)
 # With ADOT sidecar: CPU = max(256,512) = 512, memory = ceil((1024+256)/1024)*1024 = 2048

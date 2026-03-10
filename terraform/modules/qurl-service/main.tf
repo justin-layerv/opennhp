@@ -159,11 +159,6 @@ locals {
       { name = "REDIS_ENDPOINT", value = var.redis_endpoint },
       { name = "REDIS_TLS_ENABLED", value = "true" },
     ] : [],
-    # License events configuration (for cache invalidation)
-    var.license_events_enabled ? [
-      { name = "LICENSE_EVENTS_ENABLED", value = "true" },
-      { name = "LICENSE_EVENTS_QUEUE_URL", value = var.license_events_queue_url },
-    ] : [],
     # Usage events (billing metered usage reporting via SQS)
     var.usage_events_enabled ? [
       { name = "USAGE_EVENTS_ENABLED", value = "true" },
@@ -391,17 +386,7 @@ resource "aws_iam_role_policy" "task_dynamodb" {
         Action   = ["kms:Decrypt"]
         Resource = [var.secrets_kms_key_arn]
       }] : [],
-      # SQS access for license events
-      var.license_events_queue_arn != "" ? [{
-        Sid    = "SQSLicenseEvents"
-        Effect = "Allow"
-        Action = [
-          "sqs:ReceiveMessage",
-          "sqs:DeleteMessage",
-          "sqs:GetQueueAttributes",
-        ]
-        Resource = [var.license_events_queue_arn]
-    }] : [])
+    )
   })
 }
 

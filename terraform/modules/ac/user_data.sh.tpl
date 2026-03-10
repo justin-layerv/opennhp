@@ -2,10 +2,6 @@
 # NHP AC User Data Script - Standalone AC for customer deployments
 #
 # This template configures a standalone AC that protects customer resources.
-# For the Console's embedded AC, see: terraform/modules/console-ec2/user_data.sh.tpl
-#
-# Both templates share similar AC configuration patterns (config.toml, firewall rules).
-# When updating AC config structure, review both templates to keep them in sync.
 set -ex
 
 exec > >(tee /var/log/user-data.log | logger -t user-data) 2>&1
@@ -894,36 +890,10 @@ TRAEFIKEOF
 cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
 # Traefik Dynamic Configuration
 # Routes:
-%{ if console_domain != null && console_backend_url != null ~}
-# - Host(${console_domain}) → Console EC2 (BYPASSES nhp-acd for login page)
-%{ endif ~}
 # - /plugins/* → NHP Server HTTP (passcode login, auth endpoints)
 # - /* → nhp-acd (protected resource access, refresh)
 
 [http.routers]
-%{ if console_domain != null && console_backend_url != null ~}
-  # Console route - BYPASSES nhp-acd for login page access
-  # Console handles its own JWT auth, NHP integration is client-side after login
-  # See docs/ARCHITECTURE.md "Console NHP Integration" section
-  # NOTE: Both console_domain AND console_backend_url must be set to avoid 502 errors
-  # (a router without a matching service causes Traefik to return 502)
-  [http.routers.console]
-    rule = "Host(\`${console_domain}\`)"
-    service = "console"
-    entryPoints = ["https"]
-    priority = 20
-%{ if centralized_cert_enabled ~}
-    # TLS uses centralized certificate from default store
-    [http.routers.console.tls]
-%{ else ~}
-    [http.routers.console.tls]
-      certResolver = "letsencrypt"
-      [[http.routers.console.tls.domains]]
-        main = "${domain_name}"
-        sans = ["*.${domain_name}"]
-%{ endif ~}
-
-%{ endif ~}
   # Route /plugins to NHP Server for passcode login and auth
   [http.routers.nhp-plugins]
     rule = "PathPrefix(\`/plugins\`)"
@@ -959,15 +929,6 @@ cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
 %{ endif ~}
 
 [http.services]
-%{ if console_domain != null && console_backend_url != null ~}
-  # Console backend (bypasses nhp-acd)
-  # NOTE: This service is only created when both console_domain AND console_backend_url are set
-  # to ensure the router and service are always created together (prevents 502 errors)
-  [http.services.console.loadBalancer]
-    [[http.services.console.loadBalancer.servers]]
-      url = "${console_backend_url}"
-
-%{ endif ~}
   # NHP Server HTTP for plugin endpoints (passcode login, auth)
   # Note: NHP Server HTTP listens on 8888 (same port as nhp-acd uses for internal comms)
   [http.services.nhp-server.loadBalancer]
@@ -1082,7 +1043,7 @@ echo "QURL router configuration added"
 cat >> /home/ubuntu/traefik/dynamic.toml << 'CUSTOMDOMAINEOF'
 
 # Catch-all router for custom domains — lowest priority so it only matches
-# domains not handled by higher-priority routes (qurl.site, console, etc.).
+# domains not handled by higher-priority routes (qurl.site, etc.).
 # Domains without a matching TLS cert get Traefik's default self-signed cert,
 # causing a browser certificate mismatch warning (ERR_CERT_COMMON_NAME_INVALID).
 [http.routers.custom-domain-catchall]

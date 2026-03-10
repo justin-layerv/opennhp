@@ -47,26 +47,6 @@ provider "grafana" {
   retry_wait         = 10
 }
 
-# ==================== Validation ====================
-
-# Validate NHP protection prerequisites (always enabled)
-check "nhp_protection_prerequisites" {
-  assert {
-    condition = (
-      var.console_internal_only == true &&
-      var.console_protected_hostname != null &&
-      var.deploy_ac == true &&
-      var.hosted_zone != null
-    )
-    error_message = <<-EOT
-      NHP protection is always enabled. The following are required:
-        - console_internal_only = true
-        - console_protected_hostname must be set
-        - deploy_ac = true
-        - hosted_zone must be set (for DNS records)
-    EOT
-  }
-}
 
 # Validate standalone AC license credentials when deploy_ac is enabled
 check "ac_license_credentials" {
@@ -328,12 +308,10 @@ module "compute" {
   secrets_kms_key_arn = module.kms.secrets_key_arn
 
   # Server configuration options
-  log_level     = var.log_level
-  dev_mode      = var.dev_mode
-  resource_mode = var.resource_mode
-  # auth_url: Point to Console API for passcode validation
-  # Uses Console EC2 internal endpoint when deployed, otherwise falls back to var.auth_url
-  auth_url         = var.deploy_console_ec2 && var.deploy_rds ? module.console_ec2[0].internal_endpoint : (var.auth_url != null ? var.auth_url : "")
+  log_level        = var.log_level
+  dev_mode         = var.dev_mode
+  resource_mode    = var.resource_mode
+  auth_url         = var.auth_url != null ? var.auth_url : ""
   auth_signing_key = var.auth_signing_key != null ? var.auth_signing_key : ""
   auth_aes_key     = var.auth_aes_key != null ? var.auth_aes_key : ""
 
@@ -596,73 +574,6 @@ module "security" {
   guardduty_alert_emails  = var.guardduty_alert_emails
 }
 
-# RDS Module - Aurora PostgreSQL Serverless for console application
-module "rds" {
-  source = "./modules/rds"
-  count  = var.deploy_rds ? 1 : 0
-
-  environment        = var.environment
-  name_prefix        = local.name_prefix
-  vpc_id             = module.networking.vpc_id
-  vpc_cidr           = var.vpc_cidr
-  private_subnet_ids = module.networking.private_subnet_ids
-
-  database_name       = var.rds_database_name
-  min_capacity        = var.rds_min_capacity
-  max_capacity        = var.rds_max_capacity
-  deletion_protection = var.rds_deletion_protection
-  skip_final_snapshot = var.environment != "prod"
-
-  # KMS encryption
-  secrets_kms_key_arn = module.kms.secrets_key_arn
-  storage_kms_key_arn = module.kms.rds_key_arn
-
-  tags = local.common_tags
-}
-
-# Console Module - Portal management application
-module "console" {
-  source = "./modules/console"
-  count  = var.deploy_console && var.deploy_rds ? 1 : 0
-
-  environment        = var.environment
-  name_prefix        = local.name_prefix
-  vpc_id             = module.networking.vpc_id
-  vpc_cidr           = var.vpc_cidr
-  public_subnet_ids  = module.networking.public_subnet_ids
-  private_subnet_ids = module.networking.private_subnet_ids
-
-  console_image = "${module.ecr.console_repo_url}:latest"
-
-  # RDS configuration
-  rds_endpoint          = module.rds[0].cluster_endpoint
-  rds_port              = module.rds[0].cluster_port
-  rds_database_name     = module.rds[0].database_name
-  rds_secret_arn        = module.rds[0].secret_arn
-  rds_security_group_id = module.rds[0].security_group_id
-
-  # AC configuration - use NLB DNS for load-balanced access to AC instances
-  ac_configs = var.deploy_ac ? [
-    {
-      id       = "layerv-ac-tf"
-      host     = module.ac[0].nlb_dns_name
-      port     = 443
-      protocol = "tcp"
-    }
-  ] : []
-
-  # Domain configuration
-  domain_name         = var.console_domain
-  hosted_zone         = var.hosted_zone
-  acm_certificate_arn = var.console_acm_certificate_arn
-  cookie_domain       = var.console_cookie_domain
-
-  # KMS
-  logs_kms_key_arn = module.kms.logs_key_arn
-
-  tags = local.common_tags
-}
-
 # AC Module - Access Controller with embedded Traefik for TLS termination
 # Note: Traefik plugins are managed separately by the traefik-plugins project
 module "ac" {
@@ -736,11 +647,6 @@ module "ac" {
   # Traefik-plugins CI/CD bucket (for SSM-based plugin deployment)
   traefik_plugins_deploy_bucket_arn = var.traefik_plugins_deploy_bucket_arn
 
-  # Console backend routing (when Console is in internal_only mode)
-  # Routes Console domain directly to Console EC2, bypassing nhp-acd
-  console_backend_url = var.deploy_console_ec2 && var.console_internal_only ? module.console_ec2[0].internal_endpoint : null
-  console_domain      = var.deploy_console_ec2 && var.console_internal_only ? var.console_ec2_domain : null
-
   # QURL Router Plugin configuration (routes *.qurl.site to target backends)
   # Note: Uses public domain (api.layerv.xyz) because the ALB cert is issued for that domain,
   # not the internal ALB hostname. Could also use internal HTTP but ALB has HTTP->HTTPS redirect.
@@ -778,163 +684,8 @@ module "ac" {
   # Secret reconciliation (cleanup orphaned per-instance secrets)
   enable_secret_reconciliation = var.enable_secret_reconciliation
 }
-# ==================== Console Image Tag (SSM Parameter) ====================
-#
-# Console is built from a SEPARATE repository (layervai/console), not this repo.
-# Problem: Using NHP's image_tag (github.sha) for Console breaks deployments because
-# Console has different commit hashes than NHP.
-#
-# Solution: SSM Parameter Store as the source of truth for Console image tag.
-# - Console repo CI creates/updates the SSM parameter when deploying
-# - NHP terraform reads the current value via data source
-# - If the parameter doesn't exist, terraform fails fast (Console must deploy first)
-#
-# Flow:
-# 1. Console repo pushes image with tag "abc123" to ECR
-# 2. Console repo CI runs: aws ssm put-parameter --name /layerv-nhp-{env}/console-image-tag --value abc123
-# 3. Console repo CI triggers ASG refresh
-# 4. NHP deployments read current value from SSM - no interference
-#
-# SSM Parameter name: /${local.name_prefix}/console-image-tag
-# Example: /layerv-nhp-sandbox/console-image-tag
-#
 
-# Read the Console image tag from SSM (fails if parameter doesn't exist)
-data "aws_ssm_parameter" "console_image_tag" {
-  count = var.deploy_console_ec2 ? 1 : 0
-
-  name = "/${local.name_prefix}/console-image-tag"
-}
-
-# Console EC2 Module - Console API on EC2 with nginx + Docker
-# Serves the Console API for portal site management (createPortalSitesByURL, etc.)
-# When console_internal_only=true, Console is NHP-protected (traffic routed through AC)
-module "console_ec2" {
-  source = "./modules/console-ec2"
-  count  = var.deploy_console_ec2 && var.deploy_rds ? 1 : 0
-
-  environment        = var.environment
-  name_prefix        = local.name_prefix
-  vpc_id             = module.networking.vpc_id
-  vpc_cidr           = var.vpc_cidr
-  public_subnet_ids  = module.networking.public_subnet_ids
-  private_subnet_ids = module.networking.private_subnet_ids
-  tags               = local.common_tags
-
-  # Console image is resolved at boot time by reading tag from SSM
-  # This allows Console CI to deploy independently without terraform
-  console_image_repo          = module.ecr.console_repo_url
-  console_image_tag_ssm_param = data.aws_ssm_parameter.console_image_tag[0].name
-  domain_name                 = var.console_ec2_domain
-  acme_email                  = var.acme_email
-  cookie_domain               = var.console_cookie_domain
-
-  # NHP Protection: When enabled, Console is internal-only (behind AC)
-  # Traffic flows: Internet → AC NLB → Traefik → Console internal NLB
-  internal_only        = var.console_internal_only
-  ac_security_group_id = var.deploy_ac && var.console_internal_only ? module.ac[0].security_group_id : null
-
-  # NHP Server endpoint for /plugins/* routing (required for post-login NHP auth)
-  # When Console is internal-only, nginx routes /plugins/* to NHP Server
-  nhp_server_endpoint = var.console_internal_only ? "server.${module.data.namespace_name}:8888" : null
-
-  # RDS seeding for NHP Console resource
-  # Seeds the portal_sites table with Console config so NHP Server/AC know how to route
-  seed_console_resource = var.console_internal_only && var.deploy_ac
-  console_app_id        = "console"
-  ac_nlb_dns            = var.deploy_ac ? module.ac[0].nlb_dns_name : null
-  ac_domain             = ".${var.domain_name}"
-  # Two-domain architecture: protected_hostname is where users are redirected after auth_code knock
-  # Login domain (console.nhp.layerv.xyz) is unprotected via Traefik bypass
-  # Protected domain (console2.apps.layerv.xyz) is NHP-protected via AC
-  protected_hostname = var.console_protected_hostname
-
-  # RDS configuration
-  rds_endpoint          = module.rds[0].cluster_endpoint
-  rds_port              = module.rds[0].cluster_port
-  rds_database_name     = module.rds[0].database_name
-  rds_secret_arn        = module.rds[0].secret_arn
-  rds_security_group_id = module.rds[0].security_group_id
-
-  # AC configuration - use Terraform-managed AC
-  ac_configs = var.deploy_ac ? [
-    {
-      id       = "layerv-ac-tf"
-      host     = module.ac[0].nlb_dns_name
-      port     = 443
-      protocol = "tcp"
-    }
-  ] : []
-
-  # Route 53 for DNS (only used in external mode; internal mode DNS points to AC)
-  hosted_zone_id = local.main_zone_id
-
-  # ECR for pulling console image
-  ecr_repo_arn = module.ecr.console_repo_arn
-
-  # KMS encryption
-  ebs_kms_key_arn     = module.kms.ebs_key_arn
-  logs_kms_key_arn    = module.kms.logs_key_arn
-  secrets_kms_key_arn = module.kms.secrets_key_arn
-
-  # Admin credentials (migrations handle initialization, GVA_AUTO_INIT=false)
-  admin_password   = var.console_admin_password
-  auth_signing_key = var.auth_signing_key
-
-  # NHP Server Assignment - DynamoDB tables and CloudMap for AC assignments
-  # All fields explicitly configured (no defaults in module)
-  nhp_server_assignment_enabled        = var.nhp_server_assignment_enabled
-  nhp_region                           = var.nhp_region
-  nhp_dynamodb_ac_assignments_table    = module.dynamodb.ac_assignments_table_name
-  nhp_dynamodb_server_ac_index_table   = module.dynamodb.server_ac_index_table_name
-  nhp_dynamodb_licenses_table          = module.dynamodb.licenses_table_name
-  nhp_dynamodb_resources_table         = module.dynamodb.resources_table_name
-  nhp_cloudmap_namespace               = module.data.namespace_name
-  nhp_cloudmap_service_name            = var.nhp_cloudmap_service_name
-  nhp_assignment_servers_per_ac        = var.nhp_assignment_servers_per_ac
-  nhp_assignment_require_distinct_azs  = var.nhp_assignment_require_distinct_azs
-  nhp_health_monitor_check_interval    = var.nhp_health_monitor_check_interval
-  nhp_health_monitor_operation_timeout = var.nhp_health_monitor_operation_timeout
-  nhp_console_ac_enabled               = var.nhp_console_ac_enabled
-
-  # Console AC License - for DynamoDB license validation in cloud mode
-  # Generate with: ./terraform/scripts/generate-console-ac-license.sh <environment>
-  # REQUIRED: AC registration will fail without valid license key hash
-  nhp_console_ac_customer_id        = var.console_ac_customer_id
-  nhp_console_ac_license_key_hash   = var.console_ac_license_key_hash
-  nhp_console_ac_license_key_sha256 = var.console_ac_license_key_sha256
-  nhp_console_ac_license_secret_arn = var.console_ac_license_key_hash != null && var.console_ac_license_key_hash != "" ? "arn:aws:secretsmanager:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:secret:layerv-nhp-${var.environment}/console-ac-license-key" : null
-
-  # NHP AC log level
-  log_level = var.log_level
-
-  # NHP AC Daemon - Console always needs its own AC for login flow to work
-  # The AC registers with NHP Server and receives knock validations
-  nhp_server_secret_arn   = var.deploy_ac ? module.compute.server_secret_arn : null
-  nhp_server_cloudmap_dns = module.compute.cloudmap_service_dns
-  nhp_ac_repo_url         = module.ecr.ac_repo_url
-  nhp_ac_ecr_repo_arn     = module.ecr.ac_repo_arn
-  ac_image_tag_ssm_param  = var.deploy_ac ? module.ac[0].ssm_image_tag_parameter : "/${var.environment}/nhp/ac/image-tag"
-
-  # NHP Network-Level Protection (true network hiding with iptables DROP)
-  # Console EC2 configures iptables DROP by default.
-  # Port 443 is only accessible after NHP knock adds the user's IP to ipset.
-  # Reuse main hosted zone - apps.layerv.xyz is a subdomain of layerv.xyz
-  protected_hosted_zone_id = local.main_zone_id
-
-  # License lookup GSI names - required for QURL quota lookup
-  nhp_dynamodb_licenses_customer_index      = var.nhp_dynamodb_licenses_customer_index
-  nhp_dynamodb_licenses_auth0_subject_index = var.nhp_dynamodb_licenses_auth0_subject_index
-
-  # Internal service authentication and customer provisioning
-  # Used by Auth0 Post User Registration Action to create licenses for new users
-  internal_service_token_secret_arn = var.internal_service_token_secret_arn
-  provisioning_resource_id          = var.provisioning_resource_id
-  provisioning_default_tier         = var.provisioning_default_tier
-  provisioning_default_max_acs      = var.provisioning_default_max_acs
-}
-
-# Data source for hosted zone (used by console_ec2)
+# Data source for hosted zone
 # Skip lookup when hosted_zone_id is provided directly (cross-account zones)
 data "aws_route53_zone" "main" {
   count = var.hosted_zone_id == null && var.hosted_zone != null ? 1 : 0
@@ -943,24 +694,6 @@ data "aws_route53_zone" "main" {
 
 locals {
   main_zone_id = var.hosted_zone_id != null ? var.hosted_zone_id : try(data.aws_route53_zone.main[0].zone_id, null)
-}
-
-# Route 53 record for Console domain pointing to AC NLB (internal mode only)
-# When Console is NHP-protected, DNS should point to AC, not Console NLB
-# Uses route53_mgmt provider for cross-account DNS (prod: layerv.ai zone in mgmt account)
-resource "aws_route53_record" "console_via_ac" {
-  count    = var.deploy_console_ec2 && var.console_internal_only && var.deploy_ac && local.main_zone_id != null ? 1 : 0
-  provider = aws.route53_mgmt
-
-  zone_id = local.main_zone_id
-  name    = var.console_ec2_domain
-  type    = "A"
-
-  alias {
-    name                   = module.ac[0].nlb_dns_name
-    zone_id                = module.ac[0].nlb_zone_id
-    evaluate_target_health = true
-  }
 }
 
 # AC DNS records for cross-account zones

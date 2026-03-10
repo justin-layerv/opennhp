@@ -256,32 +256,6 @@ variable "server_plugins" {
   default     = []
 }
 
-# RDS configuration
-variable "deploy_rds" {
-  type    = bool
-  default = false
-}
-
-variable "rds_database_name" {
-  type    = string
-  default = "portal"
-}
-
-variable "rds_min_capacity" {
-  type    = number
-  default = 0.5
-}
-
-variable "rds_max_capacity" {
-  type    = number
-  default = 4
-}
-
-variable "rds_deletion_protection" {
-  type    = bool
-  default = true
-}
-
 # Production domains
 variable "production_domains" {
   type    = list(string)
@@ -833,104 +807,8 @@ variable "cross_account_route53_role_arn" {
   default = null
 }
 
-variable "deploy_console_ec2" {
-  type    = bool
-  default = false
-}
-
-variable "console_ec2_domain" {
-  type    = string
-  default = null
-}
-
-variable "console_cookie_domain" {
-  type    = string
-  default = null
-}
-
-variable "console_internal_only" {
-  type    = bool
-  default = false
-}
-
-variable "console_protected_hostname" {
-  type    = string
-  default = null
-}
-
-variable "console_ac_license_key_hash" {
-  type      = string
-  sensitive = true
-  default   = ""
-}
-
-variable "console_ac_license_key_sha256" {
-  type      = string
-  sensitive = true
-  default   = null
-}
-
-variable "nhp_dynamodb_licenses_customer_index" {
-  type    = string
-  default = null
-}
-
-variable "nhp_dynamodb_licenses_auth0_subject_index" {
-  type    = string
-  default = null
-}
-
-variable "internal_service_token_secret_arn" {
-  type    = string
-  default = null
-}
-
-variable "provisioning_resource_id" {
-  type    = string
-  default = null
-}
-
-variable "provisioning_default_tier" {
-  type    = string
-  default = null
-}
-
-variable "provisioning_default_max_acs" {
-  type    = number
-  default = null
-}
-
-# NHP Server Assignment Configuration (required, no defaults)
-variable "nhp_server_assignment_enabled" {
-  type = bool
-}
-
-variable "nhp_region" {
-  type = string
-}
-
 variable "nhp_cloudmap_service_name" {
   type = string
-}
-
-variable "nhp_assignment_servers_per_ac" {
-  type = number
-}
-
-variable "nhp_assignment_require_distinct_azs" {
-  type = bool
-}
-
-variable "nhp_health_monitor_check_interval" {
-  type = number
-}
-
-variable "nhp_health_monitor_operation_timeout" {
-  type = number
-}
-
-variable "nhp_console_ac_enabled" {
-  type = bool
 }
 
 variable "ac_customer_id" {

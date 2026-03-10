@@ -166,6 +166,9 @@ locals {
   oidc_provider_arn = var.create_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : data.aws_iam_openid_connect_provider.github[0].arn
 
   # ECR repository names (core repos + optional QURL)
+  # NOTE: nhp-console is retained because prevent_destroy blocks removal.
+  # To clean up: terraform state rm 'module.nhp.module.ecr.aws_ecr_repository.main["nhp-console"]'
+  # and the corresponding lifecycle_policy and cross_account resources, then remove from this list.
   core_ecr_repos = ["nhp-server", "nhp-ac", "nhp-console"]
   ecr_repos      = var.deploy_qurl_ecr ? concat(local.core_ecr_repos, ["nhp-qurl"]) : local.core_ecr_repos
 
@@ -663,15 +666,6 @@ resource "aws_iam_policy" "terraform_read" {
         Action = [
           "events:Describe*",
           "events:List*"
-        ]
-        Resource = "*"
-      },
-      {
-        Sid    = "RDSRead"
-        Effect = "Allow"
-        Action = [
-          "rds:Describe*",
-          "rds:List*"
         ]
         Resource = "*"
       },
@@ -1427,38 +1421,6 @@ resource "aws_iam_policy" "terraform_apply_data" {
         Resource = "*"
       },
       {
-        Sid    = "RDS"
-        Effect = "Allow"
-        Action = [
-          "rds:CreateDBSubnetGroup",
-          "rds:DeleteDBSubnetGroup",
-          "rds:ModifyDBSubnetGroup",
-          "rds:CreateDBClusterParameterGroup",
-          "rds:DeleteDBClusterParameterGroup",
-          "rds:ModifyDBClusterParameterGroup",
-          "rds:CreateDBParameterGroup",
-          "rds:DeleteDBParameterGroup",
-          "rds:ModifyDBParameterGroup",
-          "rds:CreateDBCluster",
-          "rds:DeleteDBCluster",
-          "rds:ModifyDBCluster",
-          "rds:CreateDBInstance",
-          "rds:DeleteDBInstance",
-          "rds:ModifyDBInstance",
-          "rds:AddTagsToResource",
-          "rds:RemoveTagsFromResource",
-          "rds:EnableHttpEndpoint",
-          "rds:DisableHttpEndpoint"
-        ]
-        Resource = [
-          "arn:aws:rds:${local.region}:${local.account_id}:subgrp:layerv-nhp-*",
-          "arn:aws:rds:${local.region}:${local.account_id}:cluster-pg:layerv-nhp-*",
-          "arn:aws:rds:${local.region}:${local.account_id}:pg:layerv-nhp-*",
-          "arn:aws:rds:${local.region}:${local.account_id}:cluster:layerv-nhp-*",
-          "arn:aws:rds:${local.region}:${local.account_id}:db:layerv-nhp-*"
-        ]
-      },
-      {
         Sid    = "LambdaLayer"
         Effect = "Allow"
         Action = [
@@ -1758,16 +1720,6 @@ output "ac_repo_url" {
 output "ac_repo_arn" {
   description = "NHP AC ECR repository ARN"
   value       = var.is_primary_account ? aws_ecr_repository.main["nhp-ac"].arn : "arn:aws:ecr:${local.region}:${var.primary_account_id}:repository/layerv/nhp-ac"
-}
-
-output "console_repo_url" {
-  description = "Console ECR repository URL"
-  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-console"].repository_url : "${var.primary_account_id}.dkr.ecr.${local.region}.amazonaws.com/layerv/nhp-console"
-}
-
-output "console_repo_arn" {
-  description = "Console ECR repository ARN"
-  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-console"].arn : "arn:aws:ecr:${local.region}:${var.primary_account_id}:repository/layerv/nhp-console"
 }
 
 output "github_actions_role_arn" {

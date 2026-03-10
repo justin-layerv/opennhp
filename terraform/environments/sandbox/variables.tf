@@ -217,32 +217,6 @@ variable "slack_channel_id" {
   default = ""
 }
 
-# RDS configuration
-variable "deploy_rds" {
-  type    = bool
-  default = false
-}
-
-variable "rds_database_name" {
-  type    = string
-  default = "portal"
-}
-
-variable "rds_min_capacity" {
-  type    = number
-  default = 0.5
-}
-
-variable "rds_max_capacity" {
-  type    = number
-  default = 4
-}
-
-variable "rds_deletion_protection" {
-  type    = bool
-  default = false # Allow deletion in sandbox
-}
-
 # Production domains
 variable "production_domains" {
   type    = list(string)
@@ -1041,129 +1015,10 @@ variable "cross_account_route53_role_arn" {
   default     = null
 }
 
-# Console EC2 configuration
-variable "deploy_console_ec2" {
-  description = "Deploy Console on EC2"
-  type        = bool
-  default     = false
-}
-
-variable "console_ec2_domain" {
-  description = "Domain name for Console EC2 (e.g., console.nhp.layerv.xyz)"
-  type        = string
-  default     = null
-}
-
-variable "console_cookie_domain" {
-  description = "Cookie domain for Console (e.g., .layerv.xyz)"
-  type        = string
-  default     = null
-}
-
-variable "console_internal_only" {
-  description = "Make Console internal-only (NHP-protected via AC)"
-  type        = bool
-  default     = false
-}
-
-variable "console_protected_hostname" {
-  description = "NHP-protected Console hostname (e.g., 'console2.apps.layerv.xyz'). Where users redirect after auth_code knock."
-  type        = string
-  default     = null
-}
-
-variable "console_ac_license_key_hash" {
-  description = "Bcrypt hash of Console AC license key for DynamoDB validation. Generate with: ./terraform/scripts/generate-console-ac-license.sh"
-  type        = string
-  sensitive   = true
-  default     = ""
-}
-
-variable "console_ac_license_key_sha256" {
-  description = "SHA256 hash of Console AC license key for DynamoDB lookup. Generate with: ./terraform/scripts/generate-console-ac-license.sh"
-  type        = string
-  sensitive   = true
-  default     = null
-}
-
-# Console license lookup GSI names
-variable "nhp_dynamodb_licenses_customer_index" {
-  description = "GSI name for querying licenses by customer_id. Recommended: 'customer_id-index'"
-  type        = string
-  default     = null
-}
-
-variable "nhp_dynamodb_licenses_auth0_subject_index" {
-  description = "GSI name for querying licenses by auth0_subject. Recommended: 'auth0_subject-index'"
-  type        = string
-  default     = null
-}
-
-# NHP Server Assignment Configuration
-# All fields are required - no defaults (explicit configuration philosophy)
-variable "nhp_server_assignment_enabled" {
-  description = "Enable NHP server assignment for ACs. Required. Recommended: true"
-  type        = bool
-}
-
-variable "nhp_region" {
-  description = "AWS region for NHP DynamoDB tables and CloudMap. Required. Recommended: match deployment region"
-  type        = string
-}
-
+# CloudMap configuration
 variable "nhp_cloudmap_service_name" {
   description = "CloudMap service name for NHP servers. Required. Recommended: 'server'"
   type        = string
-}
-
-variable "nhp_assignment_servers_per_ac" {
-  description = "Number of NHP servers to assign per AC. Required. Recommended: 3"
-  type        = number
-}
-
-variable "nhp_assignment_require_distinct_azs" {
-  description = "Require assigned servers to be in different AZs. Required. Recommended: true"
-  type        = bool
-}
-
-variable "nhp_health_monitor_check_interval" {
-  description = "Interval in seconds between health checks. Required. Recommended: 60"
-  type        = number
-}
-
-variable "nhp_health_monitor_operation_timeout" {
-  description = "Timeout in seconds for health check operations. Required. Recommended: 30"
-  type        = number
-}
-
-variable "nhp_console_ac_enabled" {
-  description = "Enable Console's embedded AC self-registration. Required. Recommended: true"
-  type        = bool
-}
-
-# Console internal service auth and customer provisioning
-variable "internal_service_token_secret_arn" {
-  description = "ARN of Secrets Manager secret for internal service token"
-  type        = string
-  default     = null
-}
-
-variable "provisioning_resource_id" {
-  description = "Resource ID for auto-provisioned licenses. Recommended: 'qurl-auto-provisioned'"
-  type        = string
-  default     = null
-}
-
-variable "provisioning_default_tier" {
-  description = "Default license tier for new customers. Recommended: 'free'"
-  type        = string
-  default     = null
-}
-
-variable "provisioning_default_max_acs" {
-  description = "Default MaxACs for new customers. Recommended: 1"
-  type        = number
-  default     = null
 }
 
 # Standalone AC license credentials (for cloud mode registration)

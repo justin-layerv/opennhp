@@ -600,15 +600,15 @@ echo "resource.toml created for plugins: ${join(", ", server_plugins)}"
 mkdir -p /opt/layerv/nhp-server/plugins/${plugin_name}/etc
 %{ endfor ~}
 
-# Passcode plugin config (uses API mode with Console as auth backend)
+# Passcode plugin config
 %{ if contains(server_plugins, "passcode") ~}
 cat > /opt/layerv/nhp-server/plugins/passcode/etc/config.toml << PLUGINEOF
 # Passcode plugin configuration
-# ResourceMode: "api" uses Console API, "file" uses local resource.toml
+# ResourceMode: "api" uses external auth API, "file" uses local resource.toml
 ResourceMode = "${resource_mode}"
-# AuthUrl: Console internal NLB for API mode
+# AuthUrl: Auth backend endpoint for API mode
 AuthUrl = "${auth_url}"
-# JWT/Encryption settings (optional, Console provides these)
+# JWT/Encryption settings
 %{ if auth_signing_key != null ~}
 SigningKey = "${auth_signing_key}"
 %{ endif ~}

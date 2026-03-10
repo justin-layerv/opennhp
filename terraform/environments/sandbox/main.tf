@@ -60,13 +60,6 @@ module "nhp" {
   slack_workspace_id         = var.slack_workspace_id
   slack_channel_id           = var.slack_channel_id
 
-  # RDS
-  deploy_rds              = var.deploy_rds
-  rds_database_name       = var.rds_database_name
-  rds_min_capacity        = var.rds_min_capacity
-  rds_max_capacity        = var.rds_max_capacity
-  rds_deletion_protection = var.rds_deletion_protection
-
   # QURL domains (sandbox uses layerv.xyz subdomains)
   production_domains     = var.production_domains
   production_zone_ids    = var.production_zone_ids
@@ -215,32 +208,8 @@ module "nhp" {
 
   cross_account_route53_role_arn = var.cross_account_route53_role_arn
 
-  # Console EC2
-  deploy_console_ec2            = var.deploy_console_ec2
-  console_ec2_domain            = var.console_ec2_domain
-  console_cookie_domain         = var.console_cookie_domain
-  console_internal_only         = var.console_internal_only
-  console_protected_hostname    = var.console_protected_hostname
-  console_ac_license_key_hash   = var.console_ac_license_key_hash
-  console_ac_license_key_sha256 = var.console_ac_license_key_sha256
-
-  # Console license lookup and customer provisioning
-  nhp_dynamodb_licenses_customer_index      = var.nhp_dynamodb_licenses_customer_index
-  nhp_dynamodb_licenses_auth0_subject_index = var.nhp_dynamodb_licenses_auth0_subject_index
-  internal_service_token_secret_arn         = var.internal_service_token_secret_arn
-  provisioning_resource_id                  = var.provisioning_resource_id
-  provisioning_default_tier                 = var.provisioning_default_tier
-  provisioning_default_max_acs              = var.provisioning_default_max_acs
-
-  # NHP Server Assignment configuration
-  nhp_server_assignment_enabled        = var.nhp_server_assignment_enabled
-  nhp_region                           = var.nhp_region
-  nhp_cloudmap_service_name            = var.nhp_cloudmap_service_name
-  nhp_assignment_servers_per_ac        = var.nhp_assignment_servers_per_ac
-  nhp_assignment_require_distinct_azs  = var.nhp_assignment_require_distinct_azs
-  nhp_health_monitor_check_interval    = var.nhp_health_monitor_check_interval
-  nhp_health_monitor_operation_timeout = var.nhp_health_monitor_operation_timeout
-  nhp_console_ac_enabled               = var.nhp_console_ac_enabled
+  # CloudMap
+  nhp_cloudmap_service_name = var.nhp_cloudmap_service_name
 
   # Standalone AC license credentials
   ac_customer_id        = var.ac_customer_id
@@ -530,41 +499,6 @@ output "plugin_bucket_name" {
 
 output "plugin_bucket_arn" {
   value = module.nhp.plugin_bucket_arn
-}
-
-# RDS outputs
-output "rds_endpoint" {
-  value = module.nhp.rds_endpoint
-}
-
-output "rds_secret_arn" {
-  value = module.nhp.rds_secret_arn
-}
-
-output "rds_database_name" {
-  value = module.nhp.rds_database_name
-}
-
-# Console EC2 outputs
-output "console_ec2_nlb_dns" {
-  value = module.nhp.console_ec2_nlb_dns
-}
-
-output "console_ec2_api_endpoint" {
-  value = module.nhp.console_ec2_api_endpoint
-}
-
-output "console_ec2_asg_name" {
-  value = module.nhp.console_ec2_asg_name
-}
-
-output "console_ec2_public_url" {
-  value = module.nhp.console_ec2_public_url
-}
-
-# Console repo
-output "console_repo_url" {
-  value = module.nhp.console_repo_url
 }
 
 # Auth0 outputs

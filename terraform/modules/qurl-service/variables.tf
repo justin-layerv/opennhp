@@ -309,26 +309,6 @@ variable "redis_security_group_id" {
   default     = null
 }
 
-# ==================== License Events ====================
-
-variable "license_events_enabled" {
-  description = "Enable license event subscription for cache invalidation"
-  type        = bool
-  default     = false
-}
-
-variable "license_events_queue_url" {
-  description = "SQS queue URL for license events"
-  type        = string
-  default     = ""
-}
-
-variable "license_events_queue_arn" {
-  description = "SQS queue ARN for IAM permissions"
-  type        = string
-  default     = ""
-}
-
 # ==================== Idempotency ====================
 
 variable "idempotency_table_arn" {
