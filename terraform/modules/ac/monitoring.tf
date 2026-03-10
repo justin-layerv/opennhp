@@ -92,12 +92,15 @@ resource "aws_cloudwatch_metric_alarm" "cert_sync_failures" {
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
   metric_name         = "CertSyncFailures"
-  namespace           = "NHP/CustomDomainCerts"
-  period              = 21600 # 6 hours (matches SSM association interval)
-  statistic           = "Maximum"
-  threshold           = 0
-  alarm_description   = "Custom domain cert sync encountered failures on AC instances"
-  treat_missing_data  = "notBreaching"
+  namespace           = "LayerV/NHP"
+  dimensions = {
+    Component = "AC"
+  }
+  period             = 21600 # 6 hours (matches SSM association interval)
+  statistic          = "Maximum"
+  threshold          = 0
+  alarm_description  = "Custom domain cert sync encountered failures on AC instances"
+  treat_missing_data = "notBreaching"
 
   alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
   ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
