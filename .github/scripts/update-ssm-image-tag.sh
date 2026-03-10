@@ -57,6 +57,13 @@ if [[ "$COMPONENT" != "server" && "$COMPONENT" != "ac" ]]; then
   exit 1
 fi
 
+# ECR repository names (images are always in the sandbox account ECR)
+declare -A ECR_REPOS=(
+  ["server"]="layerv/nhp-server"
+  ["ac"]="layerv/nhp-ac"
+)
+ECR_REPO="${ECR_REPOS[$COMPONENT]}"
+
 # SSM parameter paths
 SSM_IMAGE_TAG_PARAM="/${ENVIRONMENT}/nhp/${COMPONENT}/image-tag"
 SSM_ASG_NAME_PARAM="/${ENVIRONMENT}/nhp/${COMPONENT}/asg-name"
@@ -67,7 +74,27 @@ echo "============================================"
 echo "Environment: $ENVIRONMENT"
 echo "Component:   $COMPONENT"
 echo "Image Tag:   $IMAGE_TAG"
+echo "ECR Repo:    $ECR_REPO"
 echo "SSM Param:   $SSM_IMAGE_TAG_PARAM"
+echo ""
+
+# Verify image exists in ECR before updating SSM.
+# This prevents SSM poisoning when a build failed or an image was evicted
+# by lifecycle policies. Instances that boot with a missing image tag will
+# fail to start, causing ASG boot loops.
+echo "Verifying image exists in ECR: $ECR_REPO:$IMAGE_TAG..."
+if ! aws ecr describe-images \
+  --repository-name "$ECR_REPO" \
+  --image-ids imageTag="$IMAGE_TAG" \
+  --query "imageDetails[0].imagePushedAt" \
+  --output text \
+  --region "$AWS_REGION" > /dev/null 2>&1; then
+  echo "ERROR: Image $ECR_REPO:$IMAGE_TAG not found in ECR."
+  echo "The image may have been evicted by lifecycle policy or the build may have failed."
+  echo "SSM parameter NOT updated — this prevents ASG boot loops."
+  exit 1
+fi
+echo "Image verified: $ECR_REPO:$IMAGE_TAG exists in ECR"
 echo ""
 
 # Update SSM parameter with new image tag

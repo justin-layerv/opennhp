@@ -673,6 +673,8 @@ NHP_IMAGE_TAG=$IMAGE_TAG
 NHP_ECR_REPO=${server_repo_url}
 NHP_ENVIRONMENT=${environment}
 NHP_CELL_ID=${cell_id}
+AWS_REGION=${region}
+AWS_DEFAULT_REGION=${region}
 %{ if qurl_enabled ~}
 QURL_API_URL=${qurl_api_url}
 QURL_ALLOWED_REDIRECT_DOMAIN=${qurl_allowed_redirect_domain}
