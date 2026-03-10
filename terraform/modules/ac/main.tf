@@ -865,6 +865,23 @@ report_failure() {
     --region "$REGION" 2>/dev/null || true
 }
 trap 'report_failure "unexpected error on line $LINENO"' ERR
+# Retry helper (same as user_data.sh.tpl)
+retry_with_backoff() {
+  local max_attempts=$1 delay=$2 max_delay=$3; shift 3
+  local attempt=1
+  while true; do
+    if "$@"; then return 0; fi
+    if [ "$attempt" -ge "$max_attempts" ]; then echo "ERROR: $* failed after $max_attempts attempts"; return 1; fi
+    echo "$* failed (attempt $attempt/$max_attempts), retrying in $${delay}s..."
+    sleep "$delay"; attempt=$((attempt + 1)); delay=$((delay * 2))
+    if [ "$delay" -gt "$max_delay" ]; then delay=$max_delay; fi
+  done
+}
+apt_get_with_retry() { retry_with_backoff 10 2 60 apt-get "$@"; }
+# Install unzip (not present on Ubuntu 24.04 minimal AMI)
+export DEBIAN_FRONTEND=noninteractive
+apt_get_with_retry update -y
+apt_get_with_retry install -y unzip
 # Install AWS CLI v2
 curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
 unzip -qo /tmp/awscliv2.zip -d /tmp && /tmp/aws/install --update
@@ -872,13 +889,8 @@ rm -rf /tmp/awscliv2.zip /tmp/aws
 # Get region from IMDSv2
 TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
 REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
-# Download full init script (retry on transient network failures)
-for i in 1 2 3; do
-  aws s3 cp "s3://${var.plugin_bucket_name}/scripts/ac-init.sh" /tmp/ac-init.sh --region "$REGION" && break
-  [[ $i -lt 3 ]] || { report_failure "S3 download failed after 3 retries"; exit 1; }
-  echo "Retry $i: S3 download failed, retrying in $((i * 5))s..."
-  sleep $((i * 5))
-done
+# Download full init script from S3
+retry_with_backoff 3 5 30 aws s3 cp "s3://${var.plugin_bucket_name}/scripts/ac-init.sh" /tmp/ac-init.sh --region "$REGION"
 chmod +x /tmp/ac-init.sh
 exec /tmp/ac-init.sh
 BOOTSTRAP
