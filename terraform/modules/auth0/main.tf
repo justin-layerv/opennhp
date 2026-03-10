@@ -173,6 +173,14 @@ resource "auth0_action" "default_permissions" {
       const rbacPerms = event.authorization?.permissions || [];
       const merged = [...new Set([...rbacPerms, ...defaultPerms])];
       api.accessToken.setCustomClaim('https://layerv.ai/permissions', merged);
+
+      // --- Sync email claims into the access token ---
+      // By default Auth0 only includes email/email_verified in ID tokens.
+      // The QURL API needs these in the access token to sync customer email.
+      if (event.user.email) {
+        api.accessToken.setCustomClaim('email', event.user.email);
+        api.accessToken.setCustomClaim('email_verified', !!event.user.email_verified);
+      }
     };
   EOT
 }
