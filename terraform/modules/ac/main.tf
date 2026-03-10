@@ -83,7 +83,7 @@ resource "aws_lambda_function" "keygen" {
   function_name = "${var.name_prefix}-ac-keygen"
   role          = aws_iam_role.keygen_lambda.arn
   handler       = "index.handler"
-  runtime       = "nodejs20.x"
+  runtime       = "nodejs22.x"
   timeout       = 30
 
   filename         = data.archive_file.keygen_lambda.output_path

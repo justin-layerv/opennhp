@@ -664,7 +664,7 @@ resource "aws_lambda_function" "secrets_rotation" {
   function_name    = "${var.name_prefix}-secrets-rotation"
   role             = aws_iam_role.secrets_rotation[0].arn
   handler          = "index.handler"
-  runtime          = "nodejs20.x"
+  runtime          = "nodejs22.x"
   timeout          = 60
   filename         = data.archive_file.secrets_rotation[0].output_path
   source_code_hash = data.archive_file.secrets_rotation[0].output_base64sha256

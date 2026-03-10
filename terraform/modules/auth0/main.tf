@@ -132,7 +132,7 @@ resource "auth0_role_permissions" "user" {
 resource "auth0_action" "default_permissions" {
   count   = var.manage_tenant_resources ? 1 : 0
   name    = "Post-Login Security Gates"
-  runtime = "node18"
+  runtime = "node22"
   deploy  = true
 
   supported_triggers {
@@ -440,7 +440,7 @@ resource "aws_lambda_function" "auth0_rotation" {
   function_name    = "${var.name_prefix}-auth0-rotation"
   role             = aws_iam_role.auth0_rotation[0].arn
   handler          = "rotate_secret.handler"
-  runtime          = "nodejs20.x"
+  runtime          = "nodejs22.x"
   timeout          = 120 # Allow extra time for Auth0 API latency
   filename         = data.archive_file.auth0_rotation[0].output_path
   source_code_hash = data.archive_file.auth0_rotation[0].output_base64sha256
