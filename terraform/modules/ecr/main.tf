@@ -195,10 +195,11 @@ locals {
         rulePriority = 2
         description  = "Keep tagged images for 90 days (prod pulls from sandbox)"
         selection = {
-          tagStatus   = "tagged"
-          countType   = "sinceImagePushed"
-          countUnit   = "days"
-          countNumber = 90
+          tagStatus      = "tagged"
+          tagPatternList = ["*"]
+          countType      = "sinceImagePushed"
+          countUnit      = "days"
+          countNumber    = 90
         }
         action = {
           type = "expire"
