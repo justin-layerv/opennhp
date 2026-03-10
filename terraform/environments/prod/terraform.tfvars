@@ -134,6 +134,9 @@ qurl_hosted_zone_id             = "Z0748438C8EK6UAW94ST" # layerv.ai zone (in la
 qurl_jwt_secret_arn             = "arn:aws:secretsmanager:us-east-2:235500187906:secret:layerv-nhp-prod/qurl-jwt-secret-NRk5sw"
 qurl_internal_service_token_arn = "arn:aws:secretsmanager:us-east-2:235500187906:secret:layerv-nhp-prod/qurl-internal-service-token-ETbWzv"
 
+# QURL Custom Domains (enables /v1/domains endpoints)
+qurl_custom_domain_enabled = true
+
 # QURL Link (CloudFront redirect page)
 deploy_qurl_link          = true
 qurl_link_frontend_domain = "qurl.link"

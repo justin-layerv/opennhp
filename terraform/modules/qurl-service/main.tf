@@ -181,6 +181,12 @@ locals {
       { name = "WEBHOOKS_RESPONSE_BODY_LIMIT", value = tostring(var.webhooks_response_body_limit) },
       { name = "WEBHOOKS_API_VERSION", value = var.webhooks_api_version },
     ] : [],
+    # Custom domain management
+    var.custom_domain_enabled ? [
+      { name = "CUSTOM_DOMAIN_ENABLED", value = "true" },
+      { name = "CUSTOM_DOMAIN_ACME_SUFFIX", value = var.custom_domain_acme_suffix },
+      { name = "CUSTOM_DOMAIN_NLB_TARGET", value = var.custom_domain_nlb_target },
+    ] : [],
     # GeoIP configuration (for geo-restriction policies)
     var.geoip_enabled ? concat([
       { name = "GEOIP_ENABLED", value = "true" },

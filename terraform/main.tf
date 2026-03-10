@@ -963,6 +963,11 @@ module "qurl_service" {
   webhooks_response_body_limit           = var.qurl_webhooks_response_body_limit
   webhooks_api_version                   = var.qurl_webhooks_api_version
 
+  # Custom Domains
+  custom_domain_enabled     = var.qurl_custom_domain_enabled
+  custom_domain_acme_suffix = var.qurl_custom_domain_enabled ? "acme.${var.hosted_zone}" : ""
+  custom_domain_nlb_target  = var.qurl_custom_domain_enabled && var.deploy_ac ? module.ac[0].nlb_dns_name : ""
+
   # GeoIP
   geoip_enabled = var.qurl_geoip_enabled
   geoip_db_path = var.qurl_geoip_db_path

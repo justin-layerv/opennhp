@@ -752,6 +752,13 @@ variable "qurl_webhooks_api_version" {
   type        = string
 }
 
+# QURL Custom Domains
+variable "qurl_custom_domain_enabled" {
+  description = "Enable custom domain management endpoints in QURL service"
+  type        = bool
+  default     = false
+}
+
 # QURL GeoIP
 variable "qurl_geoip_enabled" {
   description = "Enable GeoIP lookups for geo-restriction policies"

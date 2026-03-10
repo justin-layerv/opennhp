@@ -190,6 +190,10 @@ auth0_domain                  = "layerv.us.auth0.com"
 qurl_jwt_secret_arn             = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/qurl-jwt-secret-i8a8OZ"
 qurl_internal_service_token_arn = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/qurl-internal-service-token-XgjoDM"
 
+# Custom domain management (enables GET/POST/DELETE /v1/domains endpoints)
+# ACME suffix and NLB target are derived from hosted_zone and AC module automatically
+qurl_custom_domain_enabled = true
+
 # GeoIP database for geo-restriction policies (geo_allowlist/geo_denylist)
 qurl_geoip_s3_uri = "s3://layerv-nhp-sandbox-plugins/geoip/GeoLite2-Country.mmdb"
 

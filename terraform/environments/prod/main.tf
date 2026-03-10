@@ -100,6 +100,9 @@ module "nhp" {
   qurl_ip_rate_limit              = var.qurl_ip_rate_limit
   qurl_ip_rate_burst              = var.qurl_ip_rate_burst
 
+  # QURL Custom Domains
+  qurl_custom_domain_enabled = var.qurl_custom_domain_enabled
+
   # QURL plugin configuration
   qurl_config                   = var.qurl_config
   qurl_cookie_domain            = var.qurl_cookie_domain

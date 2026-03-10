@@ -647,6 +647,26 @@ variable "usage_events_queue_arn" {
   default     = ""
 }
 
+# ==================== Custom Domains ====================
+
+variable "custom_domain_enabled" {
+  description = "Enable custom domain management endpoints (GET/POST/DELETE /v1/domains)"
+  type        = bool
+  default     = false
+}
+
+variable "custom_domain_acme_suffix" {
+  description = "ACME CNAME target suffix for DNS-01 challenge delegation (e.g., acme.layerv.xyz)"
+  type        = string
+  default     = ""
+}
+
+variable "custom_domain_nlb_target" {
+  description = "AC NLB hostname for custom domain traffic routing verification"
+  type        = string
+  default     = ""
+}
+
 variable "adot_collector_image" {
   description = "ADOT Collector container image. Uses AWS public ECR for the official ADOT image."
   type        = string

@@ -618,6 +618,12 @@ variable "qurl_webhooks_api_version" {
   default = "2024-01-01"
 }
 
+variable "qurl_custom_domain_enabled" {
+  description = "Enable custom domain management endpoints in QURL service"
+  type        = bool
+  default     = false
+}
+
 variable "qurl_geoip_enabled" {
   description = "Enable GeoIP lookups for geo-restriction policies"
   type        = bool

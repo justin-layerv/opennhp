@@ -150,6 +150,9 @@ module "nhp" {
   qurl_webhooks_response_body_limit           = var.qurl_webhooks_response_body_limit
   qurl_webhooks_api_version                   = var.qurl_webhooks_api_version
 
+  # QURL Custom Domains
+  qurl_custom_domain_enabled = var.qurl_custom_domain_enabled
+
   # QURL GeoIP
   qurl_geoip_enabled = var.qurl_geoip_enabled
   qurl_geoip_db_path = var.qurl_geoip_db_path

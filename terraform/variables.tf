@@ -969,6 +969,14 @@ variable "qurl_webhooks_api_version" {
   type        = string
 }
 
+# ==================== QURL Custom Domains ====================
+
+variable "qurl_custom_domain_enabled" {
+  description = "Enable custom domain management endpoints in QURL service. ACME suffix and NLB target are derived automatically from hosted_zone and AC module."
+  type        = bool
+  default     = false
+}
+
 # ==================== QURL GeoIP ====================
 
 variable "qurl_geoip_enabled" {
