@@ -880,12 +880,27 @@ resource "aws_dynamodb_table" "qurl_customers" {
     type = "S"
   }
 
+  attribute {
+    name = "email"
+    type = "S"
+  }
+
   # Webhook looks up auth0_subject (table PK) by stripe_customer_id.
   # KEYS_ONLY is sufficient — the PK is always projected.
   global_secondary_index {
     name            = "stripe-customer-id-index"
     hash_key        = "stripe_customer_id"
     projection_type = "KEYS_ONLY"
+  }
+
+  # Customer support lookup by email address.
+  # ALL projection so the full customer record is returned without a table fetch.
+  # Sparse index: only items with a non-empty email are indexed (M2M clients and
+  # bridge keys won't appear).
+  global_secondary_index {
+    name            = "email-index"
+    hash_key        = "email"
+    projection_type = "ALL"
   }
 
   # Enable point-in-time recovery for production
