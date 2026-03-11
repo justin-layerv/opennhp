@@ -39,10 +39,11 @@ type MemoryStorage struct {
 	mu sync.RWMutex
 
 	// Data stores
-	acAssignments map[string]*ACAssignment // ACID -> Assignment
-	licenses      map[string]*License      // licenseKeySHA256 -> License
-	resources     map[string]*Resource     // customerID:resourceID -> Resource
-	resourcesByAC map[string][]Resource    // ACID -> []Resource
+	acAssignments map[string]*ACAssignment   // ACID -> Assignment
+	acsByServer   map[string]map[string]bool // serverID -> set of ACIDs (secondary index)
+	licenses      map[string]*License        // licenseKeySHA256 -> License
+	resources     map[string]*Resource       // customerID:resourceID -> Resource
+	resourcesByAC map[string][]Resource      // ACID -> []Resource
 
 	// Test control: error injection
 	nextError     *StorageError
@@ -63,6 +64,7 @@ var _ StorageBackend = (*MemoryStorage)(nil)
 func NewMemoryStorage() *MemoryStorage {
 	return &MemoryStorage{
 		acAssignments: make(map[string]*ACAssignment),
+		acsByServer:   make(map[string]map[string]bool),
 		licenses:      make(map[string]*License),
 		resources:     make(map[string]*Resource),
 		resourcesByAC: make(map[string][]Resource),
@@ -101,16 +103,12 @@ func (m *MemoryStorage) GetACAssignment(ctx context.Context, acID string) (*ACAs
 		return nil, NewNotFoundError("AC assignment not found: " + acID)
 	}
 
-	// Return a copy to prevent mutation
-	copy := *assignment
-	copy.AssignedServers = make([]ServerInfo, len(assignment.AssignedServers))
-	for i, s := range assignment.AssignedServers {
-		copy.AssignedServers[i] = s
-	}
-	return &copy, nil
+	return assignment.Clone(), nil
 }
 
-// GetACsByServer retrieves all ACs assigned to a specific server.
+// GetACsByServer retrieves all ACs assigned to a specific server using the
+// acsByServer reverse index for O(k) lookups where k is the number of ACs
+// assigned to the server.
 func (m *MemoryStorage) GetACsByServer(ctx context.Context, serverID string) ([]ACAssignment, error) {
 	if err := m.preamble(ctx, "GetACsByServer"); err != nil {
 		return nil, err
@@ -119,20 +117,18 @@ func (m *MemoryStorage) GetACsByServer(ctx context.Context, serverID string) ([]
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	acIDs, ok := m.acsByServer[serverID]
+	if !ok || len(acIDs) == 0 {
+		return nil, nil
+	}
+
 	var results []ACAssignment
-	for _, assignment := range m.acAssignments {
-		for _, server := range assignment.AssignedServers {
-			if server.ID == serverID {
-				// Return a copy
-				copy := *assignment
-				copy.AssignedServers = make([]ServerInfo, len(assignment.AssignedServers))
-				for i, s := range assignment.AssignedServers {
-					copy.AssignedServers[i] = s
-				}
-				results = append(results, copy)
-				break
-			}
+	for acID := range acIDs {
+		assignment, exists := m.acAssignments[acID]
+		if !exists {
+			continue
 		}
+		results = append(results, *assignment.Clone())
 	}
 	return results, nil
 }
@@ -158,8 +154,8 @@ func (m *MemoryStorage) GetLicense(ctx context.Context, licenseKey string) (*Lic
 	}
 
 	// Return a copy
-	copy := *license
-	return &copy, nil
+	cp := *license
+	return &cp, nil
 }
 
 // GetResource retrieves resource definition.
@@ -178,8 +174,8 @@ func (m *MemoryStorage) GetResource(ctx context.Context, customerID, resourceID 
 	}
 
 	// Return a copy
-	copy := *resource
-	return &copy, nil
+	cp := *resource
+	return &cp, nil
 }
 
 // GetResourceByACID retrieves resources associated with an AC.
@@ -220,6 +216,7 @@ func (m *MemoryStorage) Close() error {
 	m.callCounts["Close"]++
 	// Clear all data
 	m.acAssignments = make(map[string]*ACAssignment)
+	m.acsByServer = make(map[string]map[string]bool)
 	m.licenses = make(map[string]*License)
 	m.resources = make(map[string]*Resource)
 	m.resourcesByAC = make(map[string][]Resource)
@@ -235,24 +232,48 @@ func (m *MemoryStorage) Name() string {
 // Test Data Management
 // ============================================================================
 
-// PutACAssignment stores an AC assignment.
+// removeACFromServerIndex removes the given AC from the acsByServer reverse
+// index. Must be called with m.mu held.
+func (m *MemoryStorage) removeACFromServerIndex(acID string) {
+	old, exists := m.acAssignments[acID]
+	if !exists {
+		return
+	}
+	for _, s := range old.AssignedServers {
+		if acSet, ok := m.acsByServer[s.ID]; ok {
+			delete(acSet, acID)
+			if len(acSet) == 0 {
+				delete(m.acsByServer, s.ID)
+			}
+		}
+	}
+}
+
+// PutACAssignment stores an AC assignment and maintains the acsByServer
+// reverse index for efficient server-based lookups.
 func (m *MemoryStorage) PutACAssignment(assignment *ACAssignment) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Store a copy
-	copy := *assignment
-	copy.AssignedServers = make([]ServerInfo, len(assignment.AssignedServers))
-	for i, s := range assignment.AssignedServers {
-		copy.AssignedServers[i] = s
+	m.removeACFromServerIndex(assignment.ACID)
+	stored := assignment.Clone()
+	m.acAssignments[assignment.ACID] = stored
+
+	// Add new index entries.
+	for _, s := range stored.AssignedServers {
+		if m.acsByServer[s.ID] == nil {
+			m.acsByServer[s.ID] = make(map[string]bool)
+		}
+		m.acsByServer[s.ID][assignment.ACID] = true
 	}
-	m.acAssignments[assignment.ACID] = &copy
 }
 
-// DeleteACAssignment removes an AC assignment.
+// DeleteACAssignment removes an AC assignment and cleans up the acsByServer index.
 func (m *MemoryStorage) DeleteACAssignment(acID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	m.removeACFromServerIndex(acID)
 	delete(m.acAssignments, acID)
 }
 
@@ -262,8 +283,8 @@ func (m *MemoryStorage) PutLicense(license *License) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	copy := *license
-	m.licenses[license.LicenseKeySHA256] = &copy
+	cp := *license
+	m.licenses[license.LicenseKeySHA256] = &cp
 }
 
 // PutLicenseWithKey stores a license and computes the SHA256 of the license key.
@@ -297,12 +318,12 @@ func (m *MemoryStorage) PutResource(resource *Resource) {
 	defer m.mu.Unlock()
 
 	key := resource.CustomerID + ":" + resource.ResourceID
-	copy := *resource
-	m.resources[key] = &copy
+	cp := *resource
+	m.resources[key] = &cp
 
 	// Also update resourcesByAC index
 	if resource.ACID != "" {
-		m.resourcesByAC[resource.ACID] = append(m.resourcesByAC[resource.ACID], copy)
+		m.resourcesByAC[resource.ACID] = append(m.resourcesByAC[resource.ACID], cp)
 	}
 }
 
@@ -319,6 +340,7 @@ func (m *MemoryStorage) Clear() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.acAssignments = make(map[string]*ACAssignment)
+	m.acsByServer = make(map[string]map[string]bool)
 	m.licenses = make(map[string]*License)
 	m.resources = make(map[string]*Resource)
 	m.resourcesByAC = make(map[string][]Resource)

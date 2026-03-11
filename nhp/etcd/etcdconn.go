@@ -123,6 +123,16 @@ func (conn *EtcdConn) SetValueWithKey(ctx context.Context, key string, value str
 	return err
 }
 
+// DeleteValueWithKey deletes a key, using the provided context for
+// timeout/cancellation. Safe for concurrent use.
+func (conn *EtcdConn) DeleteValueWithKey(ctx context.Context, key string) error {
+	if conn.client == nil {
+		return ErrClientNotInitialized
+	}
+	_, err := conn.client.Delete(ctx, key)
+	return err
+}
+
 func (conn *EtcdConn) WatchValue(callbackFunc func(val []byte)) {
 	// create etcd watcher
 	conn.watcher = clientv3.NewWatcher(conn.client)

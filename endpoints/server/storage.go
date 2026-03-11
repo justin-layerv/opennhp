@@ -75,13 +75,17 @@ type ACAssignment struct {
 }
 
 // Clone returns a copy of the assignment, safe to mutate without
-// affecting cached pointers. The AssignedServers slice and TTL pointer
-// are deep-copied; callers can freely modify the clone.
+// affecting cached pointers. Pointer fields and the AssignedServers
+// slice are deep-copied; callers can freely modify the clone.
 func (a *ACAssignment) Clone() *ACAssignment {
 	clone := *a
 	if a.TTL != nil {
 		ttl := *a.TTL
 		clone.TTL = &ttl
+	}
+	if a.ReassignedAt != nil {
+		ra := *a.ReassignedAt
+		clone.ReassignedAt = &ra
 	}
 	if a.AssignedServers != nil {
 		clone.AssignedServers = make([]ServerInfo, len(a.AssignedServers))

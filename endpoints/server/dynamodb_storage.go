@@ -216,14 +216,67 @@ func (d *DynamoDBStorage) SaveACAssignment(ctx context.Context, assignment *ACAs
 }
 
 // GetACsByServer retrieves all ACs assigned to a specific server.
-// NOTE: This is deferred to Phase 3 because assigned_servers is a List type
-// which cannot be indexed directly in DynamoDB. Options for Phase 3:
-// - Add a denormalized server_id attribute for GSI indexing
-// - Use DynamoDB Scan with filter (expensive, only for admin/console use)
-// - Implement in-memory tracking on the server side
+// This uses a DynamoDB Scan with client-side filtering because assigned_servers
+// is a List of Maps which cannot be indexed with a GSI. The scan is paginated
+// to handle tables larger than 1MB.
+//
+// Performance: O(n) where n is the total number of AC assignments. This is
+// acceptable for admin/operational use cases (server failover, load balancing
+// dashboards) but should not be used in hot paths. For high-frequency lookups,
+// use in-memory tracking on the server side.
 func (d *DynamoDBStorage) GetACsByServer(ctx context.Context, serverID string) ([]ACAssignment, error) {
-	log.Warning("GetACsByServer not yet implemented - deferred to Phase 3")
-	return nil, NewNotFoundError("GetACsByServer not yet implemented")
+	// Use longer timeout for scan operations (3x normal timeout)
+	ctx, cancel := context.WithTimeout(ctx, DynamoDBOperationTimeout*3)
+	defer cancel()
+
+	var results []ACAssignment
+	var lastEvaluatedKey map[string]types.AttributeValue
+
+	for {
+		// Check for context cancellation between pages
+		select {
+		case <-ctx.Done():
+			return results, ctx.Err()
+		default:
+		}
+
+		input := &dynamodb.ScanInput{
+			TableName: aws.String(d.config.ACAssignmentsTable),
+		}
+
+		if lastEvaluatedKey != nil {
+			input.ExclusiveStartKey = lastEvaluatedKey
+		}
+
+		result, err := d.client.Scan(ctx, input)
+		if err != nil {
+			log.Error("DynamoDB Scan failed for GetACsByServer: %v", err)
+			return nil, NewServiceUnavailableError("DynamoDB unavailable", err)
+		}
+
+		for _, item := range result.Items {
+			var assignment ACAssignment
+			if err := attributevalue.UnmarshalMap(item, &assignment); err != nil {
+				log.Warning("Failed to unmarshal AC assignment during scan: %v", err)
+				continue
+			}
+
+			// Client-side filter: check if this AC is assigned to the target server
+			for _, server := range assignment.AssignedServers {
+				if server.ID == serverID {
+					results = append(results, assignment)
+					break
+				}
+			}
+		}
+
+		if result.LastEvaluatedKey == nil {
+			break
+		}
+		lastEvaluatedKey = result.LastEvaluatedKey
+	}
+
+	return results, nil
 }
 
 // ============================================================================

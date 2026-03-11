@@ -22,10 +22,11 @@ import (
 // - /nhp/licenses/{license_key_sha256}: License validation (globally unique keys)
 // - /nhp/resources/{customer_id}/{resource_id}: Resource definitions per customer
 // - /nhp/resources-by-ac/{ac_id}/{resource_id}: Secondary index for resources by AC
+// - /nhp/acs-by-server/{server_id}/{ac_id}: Secondary index for ACs by server
 //
 // Note on secondary indexes:
 // The /nhp/resources-by-ac/ index is maintained by Console when writing resources.
-// This backend only reads from etcd; Console is responsible for write operations.
+// The /nhp/acs-by-server/ index is maintained by SaveACAssignment.
 //
 // Context handling:
 // The GetValueWithKey/SetValueWithKey methods propagate the caller's context
@@ -38,6 +39,7 @@ const (
 	etcdLicensesPrefix      = "/nhp/licenses/"
 	etcdResourcesPrefix     = "/nhp/resources/"
 	etcdResourcesByACPrefix = "/nhp/resources-by-ac/"
+	etcdACsByServerPrefix   = "/nhp/acs-by-server/"
 )
 
 // EtcdStorage implements StorageBackend using etcd.
@@ -122,6 +124,17 @@ func acAssignmentKey(acID string) string {
 	return etcdACAssignmentsPrefix + acID
 }
 
+// acsByServerKey returns the etcd key for the acs-by-server secondary index.
+// Format: /nhp/acs-by-server/{server_id}/{ac_id}
+func acsByServerKey(serverID, acID string) string {
+	return etcdACsByServerPrefix + serverID + "/" + acID
+}
+
+// acsByServerPrefixKey returns the etcd key prefix for all ACs assigned to a server.
+func acsByServerPrefixKey(serverID string) string {
+	return etcdACsByServerPrefix + serverID + "/"
+}
+
 // GetACAssignment retrieves the server assignment for an AC.
 func (e *EtcdStorage) GetACAssignment(ctx context.Context, acID string) (*ACAssignment, error) {
 	key := acAssignmentKey(acID)
@@ -144,7 +157,8 @@ func (e *EtcdStorage) GetACAssignment(ctx context.Context, acID string) (*ACAssi
 	return &assignment, nil
 }
 
-// SaveACAssignment stores or updates an AC assignment.
+// SaveACAssignment stores or updates an AC assignment and maintains
+// the /nhp/acs-by-server/ secondary index for efficient server-based lookups.
 func (e *EtcdStorage) SaveACAssignment(ctx context.Context, assignment *ACAssignment) error {
 	key := acAssignmentKey(assignment.ACID)
 
@@ -154,22 +168,94 @@ func (e *EtcdStorage) SaveACAssignment(ctx context.Context, assignment *ACAssign
 		return &StorageError{Code: ErrCodeValidationFailed, Message: "failed to marshal assignment", Err: err}
 	}
 
+	// Read old assignment to determine which index entries need to be removed.
+	oldServerIDs := make(map[string]bool)
+	oldData, oldErr := e.conn.GetValueWithKey(ctx, key)
+	if oldErr == nil {
+		var oldAssignment ACAssignment
+		if unmarshalErr := json.Unmarshal(oldData, &oldAssignment); unmarshalErr == nil {
+			for _, s := range oldAssignment.AssignedServers {
+				oldServerIDs[s.ID] = true
+			}
+		}
+	}
+
+	// Save the primary record.
 	if err := e.conn.SetValueWithKey(ctx, key, string(data)); err != nil {
 		log.Error("etcd SetValueWithKey failed for AC %s: %v", assignment.ACID, err)
 		return NewServiceUnavailableError("etcd unavailable", err)
+	}
+
+	// Build new server ID set.
+	newServerIDs := make(map[string]bool, len(assignment.AssignedServers))
+	for _, s := range assignment.AssignedServers {
+		newServerIDs[s.ID] = true
+	}
+
+	// Add index entries for newly assigned servers.
+	for sid := range newServerIDs {
+		if oldServerIDs[sid] {
+			continue // Already indexed, skip redundant write.
+		}
+		idxKey := acsByServerKey(sid, assignment.ACID)
+		if setErr := e.conn.SetValueWithKey(ctx, idxKey, assignment.ACID); setErr != nil {
+			log.Warning("Failed to write acs-by-server index %s: %v", idxKey, setErr)
+		}
+	}
+
+	// Remove stale index entries for servers that are no longer assigned.
+	for sid := range oldServerIDs {
+		if !newServerIDs[sid] {
+			idxKey := acsByServerKey(sid, assignment.ACID)
+			if delErr := e.conn.DeleteValueWithKey(ctx, idxKey); delErr != nil {
+				log.Warning("Failed to delete stale acs-by-server index %s: %v", idxKey, delErr)
+			}
+		}
 	}
 
 	log.Info("Saved AC assignment %s with %d servers", assignment.ACID, len(assignment.AssignedServers))
 	return nil
 }
 
-// GetACsByServer retrieves all ACs assigned to a specific server.
-// This scans all AC assignments and filters by server ID.
-// Note: For large deployments, consider adding a secondary index.
+// GetACsByServer retrieves all ACs assigned to a specific server using the
+// /nhp/acs-by-server/ secondary index for O(k) lookups where k is the number
+// of ACs assigned to the server (instead of scanning all assignments).
+//
+// If the secondary index is empty (e.g., assignments written before the index
+// was introduced), falls back to a full prefix scan with client-side filtering.
 func (e *EtcdStorage) GetACsByServer(ctx context.Context, serverID string) ([]ACAssignment, error) {
+	// Try the secondary index first.
+	prefix := acsByServerPrefixKey(serverID)
+	indexEntries, err := e.conn.GetPrefixWithContext(ctx, prefix)
+	if err != nil {
+		log.Error("etcd GetPrefix failed for acs-by-server index (server %s): %v", serverID, err)
+		return nil, NewServiceUnavailableError("etcd unavailable", err)
+	}
+
+	if len(indexEntries) > 0 {
+		// Index hit: fetch each AC assignment by ID.
+		results := make([]ACAssignment, 0, len(indexEntries))
+		for _, acIDBytes := range indexEntries {
+			acID := string(acIDBytes)
+			assignment, getErr := e.GetACAssignment(ctx, acID)
+			if getErr != nil {
+				if IsNotFoundError(getErr) {
+					// Stale index entry; AC was deleted but index not cleaned up.
+					log.Warning("Stale acs-by-server index entry for AC %s on server %s", acID, serverID)
+					continue
+				}
+				return nil, getErr
+			}
+			results = append(results, *assignment)
+		}
+		return results, nil
+	}
+
+	// Fallback: full scan (for backward compatibility with pre-index data).
+	log.Info("GetACsByServer: no index entries for server %s, falling back to full scan", serverID)
 	allAssignments, err := e.conn.GetPrefixWithContext(ctx, etcdACAssignmentsPrefix)
 	if err != nil {
-		log.Error("etcd GetPrefix failed for AC assignments: %v", err)
+		log.Error("etcd GetPrefix failed for AC assignments (server %s): %v", serverID, err)
 		return nil, NewServiceUnavailableError("etcd unavailable", err)
 	}
 
@@ -181,7 +267,7 @@ func (e *EtcdStorage) GetACsByServer(ctx context.Context, serverID string) ([]AC
 			continue
 		}
 
-		// Check if this AC is assigned to the specified server
+		// Check if this AC is assigned to the target server.
 		for _, server := range assignment.AssignedServers {
 			if server.ID == serverID {
 				results = append(results, assignment)
@@ -218,7 +304,7 @@ func (e *EtcdStorage) GetLicense(ctx context.Context, licenseKey string) (*Licen
 		if errors.Is(err, etcd.ErrKeyNotFound) || errors.Is(err, etcd.ErrValueNotSet) {
 			return nil, NewNotFoundError("license not found")
 		}
-		log.Error("etcd GetValue failed for license: %v", err)
+		log.Error("etcd GetValue failed for license %s: %v", licenseKeySHA256[:8], err)
 		return nil, NewServiceUnavailableError("etcd unavailable", err)
 	}
 

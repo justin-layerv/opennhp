@@ -569,6 +569,168 @@ func TestCreateTestResource(t *testing.T) {
 }
 
 // ============================================================================
+// GetACsByServer Index Maintenance Tests
+// ============================================================================
+
+func TestMemoryStorage_GetACsByServer_IndexUpdatedOnReassignment(t *testing.T) {
+	storage := NewMemoryStorage()
+	ctx := context.Background()
+
+	// Assign ac-1 to srv-a, srv-b, srv-c
+	storage.PutACAssignment(CreateTestACAssignment("ac-1", "srv-a", "srv-b", "srv-c"))
+
+	// Verify srv-a has ac-1
+	results, err := storage.GetACsByServer(ctx, "srv-a")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(results) != 1 || results[0].ACID != "ac-1" {
+		t.Fatal("Expected ac-1 on srv-a before reassignment")
+	}
+
+	// Reassign ac-1 to srv-x, srv-y, srv-z (completely different servers)
+	storage.PutACAssignment(CreateTestACAssignment("ac-1", "srv-x", "srv-y", "srv-z"))
+
+	// srv-a should no longer have any ACs
+	results, err = storage.GetACsByServer(ctx, "srv-a")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("Expected 0 ACs on srv-a after reassignment, got %d", len(results))
+	}
+
+	// srv-x should now have ac-1
+	results, err = storage.GetACsByServer(ctx, "srv-x")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(results) != 1 || results[0].ACID != "ac-1" {
+		t.Errorf("Expected ac-1 on srv-x after reassignment")
+	}
+}
+
+func TestMemoryStorage_GetACsByServer_IndexCleanedOnDelete(t *testing.T) {
+	storage := NewMemoryStorage()
+	ctx := context.Background()
+
+	storage.PutACAssignment(CreateTestACAssignment("ac-1", "srv-a", "srv-b"))
+	storage.PutACAssignment(CreateTestACAssignment("ac-2", "srv-a", "srv-c"))
+
+	// srv-a should have both ACs
+	results, err := storage.GetACsByServer(ctx, "srv-a")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("Expected 2 ACs on srv-a, got %d", len(results))
+	}
+
+	// Delete ac-1
+	storage.DeleteACAssignment("ac-1")
+
+	// srv-a should now have only ac-2
+	results, err = storage.GetACsByServer(ctx, "srv-a")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(results) != 1 || results[0].ACID != "ac-2" {
+		t.Errorf("Expected only ac-2 on srv-a after delete, got %v", results)
+	}
+
+	// srv-b should have no ACs (ac-1 was the only one)
+	results, err = storage.GetACsByServer(ctx, "srv-b")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("Expected 0 ACs on srv-b after delete, got %d", len(results))
+	}
+}
+
+func TestMemoryStorage_GetACsByServer_NonexistentServer(t *testing.T) {
+	storage := NewMemoryStorage()
+	ctx := context.Background()
+
+	storage.PutACAssignment(CreateTestACAssignment("ac-1", "srv-a"))
+
+	// Query a server that has no assignments
+	results, err := storage.GetACsByServer(ctx, "srv-nonexistent")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if results != nil && len(results) != 0 {
+		t.Errorf("Expected nil or empty slice, got %d results", len(results))
+	}
+}
+
+func TestMemoryStorage_GetACsByServer_PartialReassignment(t *testing.T) {
+	storage := NewMemoryStorage()
+	ctx := context.Background()
+
+	// Assign ac-1 to srv-a, srv-b, srv-c
+	storage.PutACAssignment(CreateTestACAssignment("ac-1", "srv-a", "srv-b", "srv-c"))
+
+	// Partial reassignment: keep srv-a, replace srv-b and srv-c with srv-x
+	storage.PutACAssignment(CreateTestACAssignment("ac-1", "srv-a", "srv-x"))
+
+	// srv-a should still have ac-1
+	results, err := storage.GetACsByServer(ctx, "srv-a")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Errorf("Expected ac-1 still on srv-a, got %d results", len(results))
+	}
+
+	// srv-b and srv-c should no longer have ac-1
+	results, err = storage.GetACsByServer(ctx, "srv-b")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("Expected srv-b to have no ACs after partial reassignment")
+	}
+	results, err = storage.GetACsByServer(ctx, "srv-c")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("Expected srv-c to have no ACs after partial reassignment")
+	}
+
+	// srv-x should now have ac-1
+	results, err = storage.GetACsByServer(ctx, "srv-x")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Errorf("Expected ac-1 on srv-x after partial reassignment")
+	}
+}
+
+func TestMemoryStorage_GetACsByServer_SaveACAssignment(t *testing.T) {
+	storage := NewMemoryStorage()
+	ctx := context.Background()
+
+	// Use SaveACAssignment (the interface method) instead of PutACAssignment
+	assignment := CreateTestACAssignment("ac-1", "srv-a", "srv-b")
+	err := storage.SaveACAssignment(ctx, assignment)
+	if err != nil {
+		t.Fatalf("SaveACAssignment failed: %v", err)
+	}
+
+	// Index should be maintained
+	results, err := storage.GetACsByServer(ctx, "srv-a")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(results) != 1 || results[0].ACID != "ac-1" {
+		t.Errorf("Expected ac-1 on srv-a via SaveACAssignment")
+	}
+}
+
+// ============================================================================
 // CachedStorage Error Handling Tests
 // ============================================================================
 
