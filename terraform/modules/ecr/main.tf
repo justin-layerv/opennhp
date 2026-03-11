@@ -1372,9 +1372,10 @@ resource "aws_iam_policy" "terraform_apply_data" {
           "dynamodb:TagResource",
           "dynamodb:UntagResource",
           # Item-level operations for aws_dynamodb_table_item resources
-          # (e.g., seeding Console AC license in licenses table)
+          # and terraform_data provisioners (e.g., seeding smoke test customer tier)
           "dynamodb:GetItem",
           "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
           "dynamodb:DeleteItem"
         ]
         Resource = "arn:aws:dynamodb:${local.region}:${local.account_id}:table/layerv-nhp-*"
