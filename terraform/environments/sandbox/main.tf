@@ -446,6 +446,30 @@ moved {
   to   = module.auth0.auth0_client_grant.backend_qurl_api
 }
 
+# ==============================================================================
+# Smoke Test Customer Record (system tier)
+# ==============================================================================
+# Seed the smoke test M2M client as a "system" tier customer in the
+# qurl_customers table. This ensures the tier-aware rate limiter treats
+# the smoke test client as enterprise-class (high limits) rather than
+# free tier (which would cause 429 errors during test runs).
+resource "aws_dynamodb_table_item" "smoke_test_customer" {
+  count      = module.auth0.smoke_test_client_id != null ? 1 : 0
+  table_name = module.nhp.dynamodb_qurl_customers_table_name
+  hash_key   = "auth0_subject"
+
+  item = jsonencode({
+    auth0_subject = { S = "${module.auth0.smoke_test_client_id}@clients" }
+    tier          = { S = "system" }
+    created_at    = { S = "2024-01-01T00:00:00Z" }
+    updated_at    = { S = "2024-01-01T00:00:00Z" }
+  })
+
+  lifecycle {
+    ignore_changes = [item]
+  }
+}
+
 # Re-export outputs
 output "vpc_id" {
   value = module.nhp.vpc_id
