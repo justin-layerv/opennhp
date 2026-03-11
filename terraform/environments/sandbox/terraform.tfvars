@@ -219,7 +219,7 @@ qurl_audit_retention_days = 90
 # Note: staging.layerv.ai appears here (QURL API) AND in dashboard_allowed_origins
 # (billing/developer-portal APIs) because they are separate CORS configurations
 # on different services — QURL API (ECS) vs billing API (API Gateway).
-qurl_cors_allowed_origins = "https://qurl.link.layerv.xyz,https://*.qurl.site.layerv.xyz,https://staging.layerv.ai"
+qurl_cors_allowed_origins = "https://qurl.link.layerv.xyz,https://*.qurl.site.layerv.xyz,https://staging.layerv.ai,http://localhost:3000"
 
 # Additional allowed hosts for DNS rebinding protection
 # ALB DNS name, localhost, and 127.0.0.1 are always included automatically.
