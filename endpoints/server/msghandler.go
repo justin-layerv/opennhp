@@ -444,16 +444,16 @@ func (s *UdpServer) handleACServerAssignment(
 		if IsNotFoundError(err) {
 			// AC not found in storage — perform auto-assignment
 			log.Info("server-ac(%s#%d@%s)[HandleACOnline] AC not in storage, auto-assigning", acId, transactionId, addrStr)
-			return s.autoAssignAC(ppd, aolMsg, transactionId, addrStr)
+			return s.autoAssignAC(ppd, aolMsg, transactionId, addrStr, 0)
 		}
 		log.Error("server-ac(%s#%d@%s)[HandleACOnline] storage error looking up AC assignment: %v", acId, transactionId, addrStr, err)
 		return false, err
 	}
 
-	// Check TTL expiry (DynamoDB TTL deletion is async)
+	// Check TTL expiry (DynamoDB TTL deletion is async — expired items may still exist)
 	if assignment.TTL != nil && *assignment.TTL < time.Now().Unix() {
 		log.Info("server-ac(%s#%d@%s)[HandleACOnline] assignment expired (TTL=%d), re-assigning", acId, transactionId, addrStr, *assignment.TTL)
-		return s.autoAssignAC(ppd, aolMsg, transactionId, addrStr)
+		return s.autoAssignAC(ppd, aolMsg, transactionId, addrStr, assignment.Version)
 	}
 
 	// Filter assignment to only healthy servers (via Cloud Map health discovery).
@@ -464,7 +464,7 @@ func (s *UdpServer) handleACServerAssignment(
 		// All assigned servers are unhealthy — re-assign with fresh servers
 		log.Warning("server-ac(%s#%d@%s)[HandleACOnline] all %d assigned servers unhealthy, re-assigning",
 			acId, transactionId, addrStr, len(assignment.AssignedServers))
-		return s.autoAssignAC(ppd, aolMsg, transactionId, addrStr)
+		return s.autoAssignAC(ppd, aolMsg, transactionId, addrStr, assignment.Version)
 	}
 
 	// Determine this server's identity
@@ -506,12 +506,16 @@ func (s *UdpServer) handleACServerAssignment(
 
 // autoAssignAC discovers healthy servers, picks up to 3 across AZs, writes the
 // assignment to storage, and sends NHP_ARD so the AC connects to all assigned servers.
+// existingVersion is the version of any existing assignment in storage (0 for new).
+// When replacing an expired or stale assignment, pass its version so the conditional
+// write uses the correct expected version instead of attribute_not_exists.
 // Returns (false, nil) to let this server also handle the AC directly.
 func (s *UdpServer) autoAssignAC(
 	ppd *core.PacketParserData,
 	aolMsg *common.ACOnlineMsg,
 	transactionId uint64,
 	addrStr string,
+	existingVersion int,
 ) (bool, error) {
 	acId := aolMsg.ACId
 
@@ -538,14 +542,17 @@ func (s *UdpServer) autoAssignAC(
 	// Select up to 3 servers with AZ distribution, ensuring this server is included
 	selected := s.selectServersForAssignment(allServers, MaxServersPerAssignment)
 
-	// Build assignment
+	// Build assignment. When replacing an existing (expired/stale) assignment,
+	// use its version + 1 so the conditional write succeeds against the existing item.
+	// For brand-new assignments (existingVersion == 0), Version 1 with attribute_not_exists works.
+	version := existingVersion + 1
 	now := time.Now().Unix()
 	ttl := now + AssignmentTTLSeconds
 	assignment := &ACAssignment{
 		ACID:            acId,
 		CustomerID:      "", // populated from license if available
 		AssignedServers: selected,
-		Version:         1,
+		Version:         version,
 		CreatedAt:       now,
 		LastSeen:        now,
 		TTL:             &ttl,

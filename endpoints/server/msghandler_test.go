@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
@@ -78,5 +79,75 @@ func TestTempFileCleanupOrder(t *testing.T) {
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Errorf("temp directory was not removed: %s", dir)
 		_ = os.RemoveAll(dir) // cleanup on failure
+	}
+}
+
+// TestAutoAssignAC_VersionIncrement verifies that when autoAssignAC replaces an
+// expired assignment (existingVersion > 0), the saved assignment uses
+// Version = existingVersion + 1 instead of hardcoded 1. This was the root cause
+// of the DynamoDB conditional write failure that caused 502 knock_failed errors.
+func TestAutoAssignAC_VersionIncrement(t *testing.T) {
+	// CloudMapClient with pre-populated cache — no real AWS API calls.
+	cloudMap := &CloudMapClient{
+		cachedInstances: []ServerInfo{
+			{ID: "i-test-1", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", Port: 62206},
+			{ID: "i-test-2", IP: "10.0.0.2", InternalIP: "10.0.0.2", AZ: "us-east-2b", Port: 62206},
+		},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+
+	// Minimal PacketParserData — sendARD will fail (no transaction) but
+	// autoAssignAC only logs the warning, so the test still passes.
+	ppd := &core.PacketParserData{
+		ConnData: &core.ConnectionData{
+			RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
+		},
+	}
+
+	aolMsg := &common.ACOnlineMsg{ACId: "layerv-ac-test"}
+
+	tests := []struct {
+		name            string
+		existingVersion int
+		wantVersion     int
+	}{
+		{"new assignment", 0, 1},
+		{"expired v5 replacement", 5, 6},
+		{"expired v1 replacement", 1, 2},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Fresh mock per subtest — reuses mockStorageBackend from storage_test.go
+			storage := newMockStorageBackend()
+			srv := &UdpServer{
+				storage:    storage,
+				cloudMap:   cloudMap,
+				instanceID: "i-test-1",
+				config:     &Config{Hostname: "test-server", ListenPort: 62206},
+			}
+
+			_, err := srv.autoAssignAC(ppd, aolMsg, 12345, "10.99.0.1:62206", tc.existingVersion)
+			if err != nil {
+				t.Fatalf("autoAssignAC returned error: %v", err)
+			}
+
+			storage.mu.Lock()
+			defer storage.mu.Unlock()
+
+			saved := storage.assignments["layerv-ac-test"]
+			if saved == nil {
+				t.Fatal("SaveACAssignment was not called")
+			}
+			if saved.Version != tc.wantVersion {
+				t.Errorf("Version = %d, want %d", saved.Version, tc.wantVersion)
+			}
+			if saved.TTL == nil {
+				t.Fatal("TTL should be set")
+			}
+			if *saved.TTL <= time.Now().Unix() {
+				t.Error("TTL should be in the future")
+			}
+		})
 	}
 }
