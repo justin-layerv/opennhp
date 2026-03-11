@@ -21,6 +21,11 @@ variable "acme_base_domain" {
   type        = string
 }
 
+variable "parent_zone_id" {
+  description = "Route53 hosted zone ID of the parent domain (e.g., the layerv.xyz zone) for NS delegation of the acme sub-zone"
+  type        = string
+}
+
 variable "acme_email" {
   description = "Email address for ACME account registration and expiry notifications"
   type        = string

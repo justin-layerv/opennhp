@@ -527,6 +527,12 @@ variable "qurl_session_ttl_seconds" {
   default = 86400
 }
 
+variable "deploy_custom_domain_cert" {
+  description = "Deploy the custom domain certificate manager Lambda for QURL custom domains"
+  type        = bool
+  default     = false
+}
+
 variable "qurl_default_list_limit" {
   type    = number
   default = 20

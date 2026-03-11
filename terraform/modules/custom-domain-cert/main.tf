@@ -103,6 +103,18 @@ resource "aws_route53_zone" "acme" {
   })
 }
 
+# NS delegation from parent zone to child ACME zone.
+# Without this record, the parent zone (e.g., layerv.xyz) does not know to
+# delegate queries for acme.layerv.xyz to the child zone's nameservers,
+# causing DNS-01 challenge TXT lookups to fail.
+resource "aws_route53_record" "acme_ns_delegation" {
+  zone_id = var.parent_zone_id
+  name    = local.acme_zone_name
+  type    = "NS"
+  ttl     = 300
+  records = aws_route53_zone.acme.name_servers
+}
+
 # ==============================================================================
 # Secrets Manager - ACME Account Key (Shared)
 # ==============================================================================
@@ -350,7 +362,8 @@ resource "aws_iam_role_policy" "lambda_permissions" {
           "ssm:GetCommandInvocation"
         ]
         Resource = [
-          "arn:aws:ssm:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:document/AWS-RunShellScript",
+          # AWS-managed documents have no account ID in their ARN
+          "arn:aws:ssm:${data.aws_region.current.id}::document/AWS-RunShellScript",
           "arn:aws:ec2:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:instance/*"
         ]
       },
