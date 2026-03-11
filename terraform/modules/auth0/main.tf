@@ -175,11 +175,12 @@ resource "auth0_action" "default_permissions" {
       api.accessToken.setCustomClaim('https://layerv.ai/permissions', merged);
 
       // --- Sync email claims into the access token ---
-      // By default Auth0 only includes email/email_verified in ID tokens.
-      // The QURL API needs these in the access token to sync customer email.
+      // Auth0 only includes email/email_verified in ID tokens by default.
+      // Custom API access tokens require namespaced claims.
+      // The QURL API needs these to sync customer email on first request.
       if (event.user.email) {
-        api.accessToken.setCustomClaim('email', event.user.email);
-        api.accessToken.setCustomClaim('email_verified', !!event.user.email_verified);
+        api.accessToken.setCustomClaim('https://layerv.ai/email', event.user.email);
+        api.accessToken.setCustomClaim('https://layerv.ai/email_verified', !!event.user.email_verified);
       }
     };
   EOT
