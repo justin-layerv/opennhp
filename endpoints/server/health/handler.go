@@ -18,12 +18,20 @@ const (
 
 // Handler handles health check HTTP endpoints.
 type Handler struct {
-	manager *Manager
+	manager      *Manager
+	knockManager *Manager // optional: includes AC peer checker for knock-traffic readiness
 }
 
 // NewHandler creates a new health handler.
 func NewHandler(manager *Manager) *Handler {
 	return &Handler{manager: manager}
+}
+
+// SetKnockManager sets a separate manager for the /health/knock-ready endpoint.
+// This manager should include the AC peer checker as a critical check, so the NLB
+// only routes knock traffic to servers with connected AC peers.
+func (h *Handler) SetKnockManager(m *Manager) {
+	h.knockManager = m
 }
 
 // BaseHealthResponse contains common fields for all health check responses.
@@ -75,12 +83,22 @@ func (h *Handler) Liveness(c *gin.Context) {
 //   - 200 if healthy or degraded (can accept traffic)
 //   - 503 if unhealthy (critical dependencies failed)
 func (h *Handler) Readiness(c *gin.Context) {
+	h.serveReadinessCheck(c, h.manager)
+}
+
+// Startup handles GET /health/startup - Kubernetes startup probe.
+// Startup probes (Kubernetes 1.16+) prevent liveness probes from killing
+// slow-starting containers.
+// Returns:
+//   - 200 if startup completed successfully
+//   - 503 if startup is still in progress or failed
+func (h *Handler) Startup(c *gin.Context) {
 	// Prevent caching of health check responses
 	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
 
 	// Extract request ID for distributed tracing
 	requestID := GetRequestID(c)
-	resp := h.manager.CheckReadinessWithRequestID(c.Request.Context(), requestID)
+	resp := h.manager.CheckStartupWithRequestID(c.Request.Context(), requestID)
 
 	httpStatus := http.StatusOK
 	if resp.Status == StatusUnhealthy {
@@ -99,19 +117,34 @@ func (h *Handler) Readiness(c *gin.Context) {
 	})
 }
 
-// Startup handles GET /health/startup - Kubernetes startup probe.
-// Startup probes (Kubernetes 1.16+) prevent liveness probes from killing
-// slow-starting containers.
+// KnockReadiness handles GET /health/knock-ready.
+// This checks whether the server can process knock requests, which requires
+// at least one connected AC peer in addition to storage being healthy.
+//
+// Used by the NLB HTTPS listener health check to prevent routing knock traffic
+// to servers that would fail every request. Separate from /health/ready so that
+// ASG/Docker health checks (which use /health/live) don't terminate servers
+// that are healthy but waiting for AC connections.
+//
 // Returns:
-//   - 200 if startup completed successfully
-//   - 503 if startup is still in progress or failed
-func (h *Handler) Startup(c *gin.Context) {
-	// Prevent caching of health check responses
+//   - 200 if all checks pass (storage + AC peers connected)
+//   - 503 if any critical check fails (no AC peers or storage down)
+func (h *Handler) KnockReadiness(c *gin.Context) {
+	if h.knockManager == nil {
+		// Fall back to regular readiness if knock manager not configured.
+		h.Readiness(c)
+		return
+	}
+	h.serveReadinessCheck(c, h.knockManager)
+}
+
+// serveReadinessCheck runs readiness checks on the given manager and writes
+// the JSON response. Shared by Readiness and KnockReadiness handlers.
+func (h *Handler) serveReadinessCheck(c *gin.Context, m *Manager) {
 	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
 
-	// Extract request ID for distributed tracing
 	requestID := GetRequestID(c)
-	resp := h.manager.CheckStartupWithRequestID(c.Request.Context(), requestID)
+	resp := m.CheckReadinessWithRequestID(c.Request.Context(), requestID)
 
 	httpStatus := http.StatusOK
 	if resp.Status == StatusUnhealthy {
@@ -158,5 +191,6 @@ func (h *Handler) RegisterRoutes(g *gin.Engine) {
 	g.GET("/health", h.Health)
 	g.GET("/health/live", h.Liveness)
 	g.GET("/health/ready", h.Readiness)
+	g.GET("/health/knock-ready", h.KnockReadiness)
 	g.GET("/health/startup", h.Startup)
 }

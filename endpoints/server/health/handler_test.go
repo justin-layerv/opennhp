@@ -290,7 +290,7 @@ func TestHandler_RegisterRoutes(t *testing.T) {
 
 	_, router := setupTestHandler()
 
-	routes := []string{"/health", "/health/live", "/health/ready", "/health/startup"}
+	routes := []string{"/health", "/health/live", "/health/ready", "/health/knock-ready", "/health/startup"}
 	for _, route := range routes {
 		req, _ := http.NewRequest("GET", route, nil)
 		w := httptest.NewRecorder()
@@ -300,6 +300,131 @@ func TestHandler_RegisterRoutes(t *testing.T) {
 		if w.Code == http.StatusNotFound {
 			t.Errorf("route %s not registered", route)
 		}
+	}
+}
+
+func TestHandler_KnockReadiness_NoPeers(t *testing.T) {
+	t.Parallel()
+
+	// Set up knock manager with AC peer checker that has 0 peers
+	knockManager := NewManager(&ManagerConfig{
+		Service: "test-service",
+		Version: "1.0.0",
+		Timeout: 5 * time.Second,
+	})
+	knockManager.Register(&handlerTestChecker{
+		name:     "ac_peers",
+		status:   CheckStatusFail,
+		critical: true,
+		message:  "no AC peers connected",
+	})
+
+	handler := NewHandler(NewManager(&ManagerConfig{
+		Service: "test-service",
+		Version: "1.0.0",
+		Timeout: 5 * time.Second,
+	}))
+	handler.SetKnockManager(knockManager)
+
+	router := gin.New()
+	handler.RegisterRoutes(router)
+
+	req, _ := http.NewRequest("GET", "/health/knock-ready", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected status 503, got %d", w.Code)
+	}
+
+	var resp ReadinessResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if resp.Status != string(StatusUnhealthy) {
+		t.Errorf("expected status %s, got %s", StatusUnhealthy, resp.Status)
+	}
+	if check, ok := resp.Checks["ac_peers"]; ok {
+		if check.Status != CheckStatusFail {
+			t.Errorf("expected ac_peers status %s, got %s", CheckStatusFail, check.Status)
+		}
+	} else {
+		t.Error("expected ac_peers check in response")
+	}
+}
+
+func TestHandler_KnockReadiness_WithPeers(t *testing.T) {
+	t.Parallel()
+
+	knockManager := NewManager(&ManagerConfig{
+		Service: "test-service",
+		Version: "1.0.0",
+		Timeout: 5 * time.Second,
+	})
+	knockManager.Register(&handlerTestChecker{
+		name:     "ac_peers",
+		status:   CheckStatusPass,
+		critical: true,
+		message:  "3 AC peer(s) connected",
+	})
+	knockManager.Register(&handlerTestChecker{
+		name:     "dynamodb",
+		status:   CheckStatusPass,
+		critical: true,
+	})
+
+	handler := NewHandler(NewManager(&ManagerConfig{
+		Service: "test-service",
+		Version: "1.0.0",
+		Timeout: 5 * time.Second,
+	}))
+	handler.SetKnockManager(knockManager)
+
+	router := gin.New()
+	handler.RegisterRoutes(router)
+
+	req, _ := http.NewRequest("GET", "/health/knock-ready", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+
+	var resp ReadinessResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if resp.Status != string(StatusHealthy) {
+		t.Errorf("expected status %s, got %s", StatusHealthy, resp.Status)
+	}
+}
+
+func TestHandler_KnockReadiness_FallbackToReadiness(t *testing.T) {
+	t.Parallel()
+
+	// No knock manager set — should fall back to regular readiness
+	checker := &handlerTestChecker{
+		name:     "dynamodb",
+		status:   CheckStatusPass,
+		critical: true,
+	}
+	_, router := setupTestHandler(checker)
+
+	req, _ := http.NewRequest("GET", "/health/knock-ready", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+
+	var resp ReadinessResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if resp.Status != string(StatusHealthy) {
+		t.Errorf("expected status %s, got %s", StatusHealthy, resp.Status)
 	}
 }
 

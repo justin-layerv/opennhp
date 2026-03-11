@@ -1688,8 +1688,11 @@ cat /home/ubuntu/traefik/dynamic.toml | grep -A5 "nhp-plugins"
 **4. Test connectivity from AC to NHP Server:**
 ```bash
 # On AC instance
-curl -s http://server.nhp.sandbox.internal:8888/health
-# 404 is OK (means HTTP is responding), timeout/connection refused is bad
+curl -s http://server.nhp.sandbox.internal:8888/health | jq .
+# Returns JSON with status "healthy"/"degraded"/"unhealthy" and individual checks
+
+# Knock-readiness (includes AC peer check — used by NLB for knock-traffic routing)
+curl -s http://server.nhp.sandbox.internal:8888/health/knock-ready | jq .
 ```
 
 ### SSM Diagnostic Commands

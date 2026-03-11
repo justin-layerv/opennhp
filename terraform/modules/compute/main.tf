@@ -927,15 +927,18 @@ resource "aws_lb_target_group" "https" {
   vpc_id      = var.vpc_id
   target_type = "instance"
 
-  # Health check on port 8888 (same as UDP target group)
+  # Health check on port 8888 — uses /health/knock-ready to verify the server
+  # has connected AC peers before routing knock traffic to it (H1 hardening).
+  # /health/live is still used by ASG/Docker to avoid terminating servers
+  # that are healthy but waiting for AC connections.
   health_check {
     enabled             = true
     protocol            = "HTTP"
     port                = "8888"
-    path                = "/health/live"
+    path                = "/health/knock-ready"
     healthy_threshold   = 2
     unhealthy_threshold = 2
-    interval            = 30
+    interval            = 10
     matcher             = "200"
   }
 

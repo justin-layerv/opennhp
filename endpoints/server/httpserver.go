@@ -38,6 +38,7 @@ type HttpServer struct {
 	ginEngine     *gin.Engine
 	listenAddr    *net.TCPAddr
 	healthManager *health.Manager
+	knockManager  *health.Manager // includes AC peer check for knock-traffic readiness
 	httpForwarder *HttpKnockForwarder
 
 	wg      sync.WaitGroup
@@ -230,21 +231,36 @@ func (hs *HttpServer) initHealthManager() error {
 		}
 	}
 
-	hs.healthManager = health.NewManager(&health.ManagerConfig{
+	managerCfg := &health.ManagerConfig{
 		Service:        "nhp-server",
 		Version:        version.Version,
 		Timeout:        timeout,
 		StartupTimeout: startupTimeout,
-	})
+	}
+	hs.healthManager = health.NewManager(managerCfg)
 
 	backendName := hs.udpServer.GetStorageBackendName()
 
+	// Create knock readiness manager — includes AC peer check for NLB knock-traffic routing.
+	// Separate from the main healthManager so /health/ready (used by ASG/Docker) doesn't
+	// mark servers unhealthy just because ACs haven't connected yet.
+	hs.knockManager = health.NewManager(managerCfg)
+
+	// AC peer checker — critical for knock readiness, not registered on the main manager.
+	acChecker := health.NewACPeerChecker(&health.ACPeerCheckerConfig{
+		Counter: hs.udpServer,
+	})
+	hs.knockManager.Register(acChecker)
+	log.Info("Health check: AC peer checker registered on knock-ready endpoint")
+
 	// Register etcd health checker for non-cloud mode
 	if pinger := hs.udpServer.GetEtcdPinger(); pinger != nil {
-		hs.healthManager.Register(health.NewEtcdChecker(&health.EtcdCheckerConfig{
+		etcdChecker := health.NewEtcdChecker(&health.EtcdCheckerConfig{
 			Client:  pinger,
 			Timeout: 5 * time.Second,
-		}))
+		})
+		hs.healthManager.Register(etcdChecker)
+		hs.knockManager.Register(etcdChecker)
 		// Wire storage health probe into metrics publisher for StorageHealthy metric
 		hs.udpServer.metrics.SetHealthProbe(func(ctx context.Context) bool {
 			return pinger.Ping(ctx) == nil
@@ -255,10 +271,12 @@ func (hs *HttpServer) initHealthManager() error {
 
 	// Register DynamoDB health checker for cloud mode
 	if pinger := hs.udpServer.GetDynamoDBPinger(); pinger != nil {
-		hs.healthManager.Register(health.NewDynamoDBChecker(&health.DynamoDBCheckerConfig{
+		dynamoChecker := health.NewDynamoDBChecker(&health.DynamoDBCheckerConfig{
 			Client:  pinger,
 			Timeout: 5 * time.Second,
-		}))
+		})
+		hs.healthManager.Register(dynamoChecker)
+		hs.knockManager.Register(dynamoChecker)
 		// Wire storage health probe into metrics publisher for StorageHealthy metric
 		hs.udpServer.metrics.SetHealthProbe(func(ctx context.Context) bool {
 			return pinger.Ping(ctx) == nil
@@ -331,8 +349,11 @@ func (hs *HttpServer) initRouter() {
 	// - Internal monitoring systems
 	if hs.healthManager != nil {
 		healthHandler := health.NewHandler(hs.healthManager)
+		if hs.knockManager != nil {
+			healthHandler.SetKnockManager(hs.knockManager)
+		}
 		healthHandler.RegisterRoutes(g)
-		log.Info("Health check endpoints registered: /health, /health/live, /health/ready, /health/startup")
+		log.Info("Health check endpoints registered: /health, /health/live, /health/ready, /health/knock-ready, /health/startup")
 	}
 
 	// load templates. won't trigger panic if file does not exist
@@ -718,7 +739,7 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 			continue
 		}
 		acId := resInfo.ACId
-		s.acConnectionMapMutex.Lock()
+		s.acConnectionMapMutex.RLock()
 		acConns, found := s.acConnectionMap[acId]
 		var connsCopy []*ACConn
 		if found {
@@ -731,7 +752,7 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 				}
 			}
 		}
-		s.acConnectionMapMutex.Unlock()
+		s.acConnectionMapMutex.RUnlock()
 		if !found || len(connsCopy) == 0 {
 			// No local AC connection — try HTTP forwarding to an assigned server
 			if hs.httpForwarder != nil && !req.Forwarded {

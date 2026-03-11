@@ -84,7 +84,7 @@ type UdpServer struct {
 	agentPeerMapMutex sync.Mutex
 	agentPeerMap      map[string]*core.UdpPeer // indexed by peer's public key base64 string
 
-	acConnectionMapMutex sync.Mutex
+	acConnectionMapMutex sync.RWMutex
 	acConnectionMap      map[string][]*ACConn // ac connections indexed by AC ID, multiple per ID for blue/green
 
 	acPeerMapMutex sync.Mutex
@@ -469,6 +469,17 @@ func (s *UdpServer) Stop() {
 	s.log.Close()
 }
 
+// ACPeerCount returns the number of unique AC peers with active connections.
+// This counts distinct AC IDs (not total connections per AC, which may be >1
+// during blue/green deployments). For health checking, at least one AC peer
+// means knock traffic can be processed.
+// Implements health.ACPeerCounter for the AC-aware health check.
+func (s *UdpServer) ACPeerCount() int {
+	s.acConnectionMapMutex.RLock()
+	defer s.acConnectionMapMutex.RUnlock()
+	return len(s.acConnectionMap)
+}
+
 // cleanupOwnedAssignments is called during shutdown to best-effort remove this
 // server from AC assignments it's part of. This helps reduce stale forwarding
 // attempts while the 30-minute TTL and Cloud Map health checks provide the
@@ -483,13 +494,13 @@ func (s *UdpServer) cleanupOwnedAssignments() {
 		return
 	}
 
-	// Collect AC IDs from current connections
-	s.acConnectionMapMutex.Lock()
+	// Collect AC IDs from current connections (read-only snapshot)
+	s.acConnectionMapMutex.RLock()
 	acIDs := make([]string, 0, len(s.acConnectionMap))
 	for acID := range s.acConnectionMap {
 		acIDs = append(acIDs, acID)
 	}
-	s.acConnectionMapMutex.Unlock()
+	s.acConnectionMapMutex.RUnlock()
 
 	if len(acIDs) == 0 {
 		return
@@ -1550,7 +1561,7 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 		if resInfo == nil {
 			continue
 		}
-		s.acConnectionMapMutex.Lock()
+		s.acConnectionMapMutex.RLock()
 		conns, found := s.acConnectionMap[resInfo.ACId]
 		liveCount := 0
 		if found {
@@ -1560,7 +1571,7 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 				}
 			}
 		}
-		s.acConnectionMapMutex.Unlock()
+		s.acConnectionMapMutex.RUnlock()
 		if !found || liveCount == 0 {
 			needsForwarding = true
 			forwardACId = resInfo.ACId
@@ -1621,7 +1632,7 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 			continue
 		}
 		acId := resInfo.ACId
-		s.acConnectionMapMutex.Lock()
+		s.acConnectionMapMutex.RLock()
 		acConns, found := s.acConnectionMap[acId]
 		var connsCopy []*ACConn
 		if found {
@@ -1634,7 +1645,7 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 				}
 			}
 		}
-		s.acConnectionMapMutex.Unlock()
+		s.acConnectionMapMutex.RUnlock()
 		if !found || len(connsCopy) == 0 {
 			log.Warning("server-agent(%s@%s)-ac(%s)[handleNhpOpenResource] no ac connection is available", knkMsg.UserId, addrStr, acId)
 			artMsg := &common.ACOpsResultMsg{}
@@ -1837,7 +1848,7 @@ func (s *UdpServer) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*A
 	}
 
 	// Look up all AC connections, filtering out stale (closed) ones
-	s.acConnectionMapMutex.Lock()
+	s.acConnectionMapMutex.RLock()
 	conns, found := s.acConnectionMap[acId]
 	var result []*ACConn
 	if found {
@@ -1847,7 +1858,7 @@ func (s *UdpServer) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*A
 			}
 		}
 	}
-	s.acConnectionMapMutex.Unlock()
+	s.acConnectionMapMutex.RUnlock()
 
 	if !found || len(result) == 0 {
 		log.Debug("FindACConnectionsForKnock: AC %s not connected", acId)
