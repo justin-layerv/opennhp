@@ -842,6 +842,18 @@ variable "qurl_health_startup_timeout_seconds" {
   type        = number
 }
 
+variable "qurl_customer_cache_ttl_seconds" {
+  description = "TTL for customer tier cache in seconds"
+  type        = number
+  default     = 300
+}
+
+variable "qurl_customer_cache_max_size" {
+  description = "Maximum entries in the customer tier cache"
+  type        = number
+  default     = 1000
+}
+
 # ==================== QURL Resource Config ====================
 # TTL Relationship:
 # - qurl_default_expires_in_seconds: How long a QURL is valid (user-facing)

@@ -342,6 +342,20 @@ variable "health_startup_timeout_seconds" {
   type        = number
 }
 
+# ==================== Customer Cache Config ====================
+
+variable "customer_cache_ttl_seconds" {
+  description = "TTL for customer tier cache in seconds"
+  type        = number
+  default     = 300
+}
+
+variable "customer_cache_max_size" {
+  description = "Maximum entries in the customer tier cache"
+  type        = number
+  default     = 1000
+}
+
 # ==================== QURL Resource Config ====================
 #
 # TTL Relationship:

@@ -143,6 +143,9 @@ locals {
     # Health check configuration
     { name = "HEALTH_CHECK_TIMEOUT", value = tostring(var.health_check_timeout_seconds) },
     { name = "HEALTH_STARTUP_TIMEOUT", value = tostring(var.health_startup_timeout_seconds) },
+    # Customer cache configuration (tier lookups for quota/rate-limiting)
+    { name = "CUSTOMER_CACHE_TTL", value = tostring(var.customer_cache_ttl_seconds) },
+    { name = "CUSTOMER_CACHE_MAX_SIZE", value = tostring(var.customer_cache_max_size) },
     # QURL resource configuration
     { name = "QURL_DEFAULT_EXPIRES_IN", value = tostring(var.qurl_default_expires_in_seconds) },
     { name = "QURL_RESOURCE_TTL_BUFFER", value = tostring(var.qurl_resource_ttl_buffer_seconds) },
