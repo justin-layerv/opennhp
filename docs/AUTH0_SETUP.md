@@ -377,7 +377,7 @@ curl -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"target_url": "https://example.com", "ttl_seconds": 3600}' \
-  https://api.qurl.link/v1/qurl
+  https://api.qurl.link/v1/qurls
 ```
 
 ### Step 4: Verify Health Check

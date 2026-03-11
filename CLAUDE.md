@@ -346,10 +346,10 @@ TOKEN_RESPONSE=$(curl -s --request POST \
   --data "{\"client_id\":\"$CLIENT_ID\",\"client_secret\":\"$CLIENT_SECRET\",\"audience\":\"$AUDIENCE\",\"grant_type\":\"client_credentials\"}")
 ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
 
-# 2. Create QURL (POST /v1/qurl)
+# 2. Create QURL (POST /v1/qurls)
 # IMPORTANT: expires_in is a DURATION STRING like "1h", "168h", NOT an integer
 curl -s --request POST \
-  --url "https://api.layerv.xyz/v1/qurl" \
+  --url "https://api.layerv.xyz/v1/qurls" \
   --header "Authorization: Bearer $ACCESS_TOKEN" \
   --header "Content-Type: application/json" \
   --data '{

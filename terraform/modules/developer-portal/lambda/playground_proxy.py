@@ -223,7 +223,7 @@ def handle_create_qurl(event):
         proxy_body['access_policy'] = policy
 
     # Proxy to QURL API
-    status, response_body = proxy_to_qurl_api('POST', '/v1/qurl', body=proxy_body)
+    status, response_body = proxy_to_qurl_api('POST', '/v1/qurls', body=proxy_body)
     return cors_response(event, status, response_body)
 
 

@@ -609,7 +609,7 @@ class TestEndpointRouting:
             mock_proxy.assert_called_once()
             call_args = mock_proxy.call_args
             assert call_args[0][0] == 'POST'
-            assert call_args[0][1] == '/v1/qurl'
+            assert call_args[0][1] == '/v1/qurls'
 
     def test_get_qurl_routed(self, mock_dynamodb, mock_proxy, get_event):
         """Verify GET /playground/qurl/{id} routes to get handler."""
@@ -1261,7 +1261,7 @@ class TestValidationCoverage:
             import playground_proxy as pp
 
             with patch('urllib.request.urlopen', side_effect=ConnectionError('Connection refused')):
-                status, body = pp.proxy_to_qurl_api('POST', '/v1/qurl', body={'target_url': 'https://example.com'})
+                status, body = pp.proxy_to_qurl_api('POST', '/v1/qurls', body={'target_url': 'https://example.com'})
 
             assert status == 502
             response_text = json.dumps(body)
