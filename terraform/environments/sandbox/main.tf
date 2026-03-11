@@ -449,24 +449,41 @@ moved {
 # ==============================================================================
 # Smoke Test Customer Record (system tier)
 # ==============================================================================
-# Seed the smoke test M2M client as a "system" tier customer in the
-# qurl_customers table. This ensures the tier-aware rate limiter treats
-# the smoke test client as enterprise-class (high limits) rather than
-# free tier (which would cause 429 errors during test runs).
-resource "aws_dynamodb_table_item" "smoke_test_customer" {
-  count      = module.auth0.smoke_test_client_id != null ? 1 : 0
-  table_name = module.nhp.dynamodb_qurl_customers_table_name
-  hash_key   = "auth0_subject"
+# Ensure the smoke test M2M client has "system" tier in the qurl_customers
+# table. Uses update-item (upsert) instead of aws_dynamodb_table_item because
+# the item is auto-provisioned by qurl-service on first API call, and
+# aws_dynamodb_table_item uses conditional PutItem which fails if the item
+# already exists (and doesn't support import).
+resource "terraform_data" "smoke_test_customer_tier" {
+  count = module.auth0.smoke_test_client_id != null ? 1 : 0
 
-  item = jsonencode({
-    auth0_subject = { S = "${module.auth0.smoke_test_client_id}@clients" }
-    tier          = { S = "system" }
-    created_at    = { S = "2024-01-01T00:00:00Z" }
-    updated_at    = { S = "2024-01-01T00:00:00Z" }
-  })
+  input = {
+    table_name = module.nhp.dynamodb_qurl_customers_table_name
+    subject    = "${module.auth0.smoke_test_client_id}@clients"
+    region     = var.aws_region
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -euo pipefail
+      aws dynamodb update-item \
+        --table-name '${self.input.table_name}' \
+        --key '{"auth0_subject": {"S": "${self.input.subject}"}}' \
+        --update-expression 'SET tier = :t' \
+        --expression-attribute-values '{":t": {"S": "system"}}' \
+        --region '${self.input.region}'
+    EOT
+  }
+}
+
+# Remove the old aws_dynamodb_table_item from state without destroying
+# the DynamoDB item. The resource was replaced by terraform_data above.
+removed {
+  from = aws_dynamodb_table_item.smoke_test_customer
 
   lifecycle {
-    ignore_changes = [item]
+    destroy = false
   }
 }
 

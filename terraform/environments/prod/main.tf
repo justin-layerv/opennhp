@@ -379,6 +379,37 @@ module "auth0" {
 }
 
 # ==============================================================================
+# Smoke Test Customer Record (system tier)
+# ==============================================================================
+# Ensure the smoke test M2M client has "system" tier in the qurl_customers
+# table. Uses update-item (upsert) instead of aws_dynamodb_table_item because
+# the item is auto-provisioned by qurl-service on first API call, and
+# aws_dynamodb_table_item uses conditional PutItem which fails if the item
+# already exists (and doesn't support import).
+resource "terraform_data" "smoke_test_customer_tier" {
+  count = module.auth0.smoke_test_client_id != null ? 1 : 0
+
+  input = {
+    table_name = module.nhp.dynamodb_qurl_customers_table_name
+    subject    = "${module.auth0.smoke_test_client_id}@clients"
+    region     = var.aws_region
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -euo pipefail
+      aws dynamodb update-item \
+        --table-name '${self.input.table_name}' \
+        --key '{"auth0_subject": {"S": "${self.input.subject}"}}' \
+        --update-expression 'SET tier = :t' \
+        --expression-attribute-values '{":t": {"S": "system"}}' \
+        --region '${self.input.region}'
+    EOT
+  }
+}
+
+# ==============================================================================
 # Outputs
 # ==============================================================================
 
