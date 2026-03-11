@@ -402,7 +402,7 @@ resource "terraform_data" "smoke_test_customer_tier" {
       aws dynamodb update-item \
         --table-name '${self.input.table_name}' \
         --key '{"auth0_subject": {"S": "${self.input.subject}"}}' \
-        --update-expression 'SET tier = :t' \
+        --update-expression 'SET tier = :t REMOVE email' \
         --expression-attribute-values '{":t": {"S": "system"}}' \
         --region '${self.input.region}'
     EOT
