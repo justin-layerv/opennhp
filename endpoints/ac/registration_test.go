@@ -3715,15 +3715,15 @@ func TestACRegistration_TriggerReregistration_StopsOnShutdown(t *testing.T) {
 // This is the primary health signal — NHP_KPL is unidirectional and cannot confirm receipt.
 // Only validated NHP_AAK responses to NHP_AOL update LastSeen.
 func TestRegistrationRefreshInterval(t *testing.T) {
-	// Verify refresh happens every 30 seconds (3 * 10s keepalive interval)
-	expectedTicks := 3
+	// Verify refresh happens every 20 seconds (2 * 10s keepalive interval)
+	expectedTicks := 2
 	if RegistrationRefreshInterval != expectedTicks {
 		t.Errorf("Expected RegistrationRefreshInterval to be %d, got %d", expectedTicks, RegistrationRefreshInterval)
 	}
 
-	// Verify the actual interval is 30 seconds
+	// Verify the actual interval is 20 seconds
 	actualInterval := time.Duration(RegistrationRefreshInterval) * KeepaliveInterval
-	expectedInterval := 30 * time.Second
+	expectedInterval := 20 * time.Second
 	if actualInterval != expectedInterval {
 		t.Errorf("Expected actual refresh interval to be %v, got %v", expectedInterval, actualInterval)
 	}

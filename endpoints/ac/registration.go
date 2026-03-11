@@ -67,8 +67,8 @@ const (
 	// to refresh server peer state and validate server health. This is the primary
 	// mechanism for confirming server liveness — NHP_KPL is unidirectional and cannot
 	// confirm receipt. Only validated NHP_AOL responses update LastSeen.
-	// Set to 3 * KeepaliveInterval = 30 seconds.
-	RegistrationRefreshInterval = 3
+	// Set to 2 * KeepaliveInterval = 20 seconds.
+	RegistrationRefreshInterval = 2
 
 	// MaxServerDownReregBackoff caps circuit-breaker backoff when server-down
 	// re-registration keeps failing.
