@@ -863,10 +863,6 @@ module "qurl_service" {
   dynamodb_table_arns   = module.dynamodb.qurl_table_arns
   dynamodb_table_prefix = "${local.name_prefix}-${var.cell_id}"
 
-  # Licenses table for quota lookup (enables license-based quotas)
-  licenses_table_arn  = module.dynamodb.licenses_table_arn
-  licenses_table_name = module.dynamodb.licenses_table_name
-
   # Auth0
   auth0_domain                     = var.qurl_auth0_domain
   auth0_audience                   = var.qurl_auth0_audience
@@ -943,10 +939,6 @@ module "qurl_service" {
   # Health check
   health_check_timeout_seconds   = var.qurl_health_check_timeout_seconds
   health_startup_timeout_seconds = var.qurl_health_startup_timeout_seconds
-
-  # License cache
-  license_cache_ttl_seconds = var.qurl_license_cache_ttl_seconds
-  license_cache_max_size    = var.qurl_license_cache_max_size
 
   # QURL Resource Config
   qurl_default_expires_in_seconds  = var.qurl_default_expires_in_seconds

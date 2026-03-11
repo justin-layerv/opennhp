@@ -107,16 +107,6 @@ variable "dynamodb_table_prefix" {
   default     = ""
 }
 
-variable "licenses_table_arn" {
-  description = "ARN of nhp_licenses table for quota lookup"
-  type        = string
-}
-
-variable "licenses_table_name" {
-  description = "Name of nhp_licenses table for quota lookup"
-  type        = string
-}
-
 # ==================== Auth0 ====================
 
 variable "auth0_domain" {
@@ -349,18 +339,6 @@ variable "health_check_timeout_seconds" {
 
 variable "health_startup_timeout_seconds" {
   description = "Timeout for startup health checks in seconds"
-  type        = number
-}
-
-# ==================== License Cache ====================
-
-variable "license_cache_ttl_seconds" {
-  description = "TTL for license cache entries in seconds"
-  type        = number
-}
-
-variable "license_cache_max_size" {
-  description = "Maximum number of license cache entries"
   type        = number
 }
 

@@ -83,10 +83,9 @@ resource "aws_dynamodb_table" "licenses" {
     projection_type = "KEYS_ONLY"
   }
 
-  # GSI: Find license by Auth0 subject (for QURL quota lookup)
-  # Query pattern: Query by auth0_subject to map Auth0 user to license/quota
+  # GSI: Find license by Auth0 subject
+  # Query pattern: Query by auth0_subject to map Auth0 user to license
   # Example: "Find license for Auth0 user auth0|507f1f77bcf86cd799439011"
-  # Used by QURL service to determine quota plan based on license tier.
   global_secondary_index {
     name            = "auth0_subject-index"
     hash_key        = "auth0_subject"

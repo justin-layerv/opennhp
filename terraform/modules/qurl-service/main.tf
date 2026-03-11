@@ -136,7 +136,6 @@ locals {
     { name = "AUDIT_RETENTION_DAYS", value = tostring(var.audit_retention_days) },
     { name = "CORS_ALLOWED_ORIGINS", value = var.cors_allowed_origins },
     { name = "ALLOWED_HOSTS", value = local.computed_allowed_hosts },
-    { name = "LICENSES_TABLE_NAME", value = var.licenses_table_name },
     # Idempotency cache configuration
     { name = "IDEMPOTENCY_CACHE_TTL", value = tostring(var.idempotency_cache_ttl_seconds) },
     { name = "IDEMPOTENCY_CACHE_MAX_SIZE", value = tostring(var.idempotency_cache_max_size) },
@@ -144,9 +143,6 @@ locals {
     # Health check configuration
     { name = "HEALTH_CHECK_TIMEOUT", value = tostring(var.health_check_timeout_seconds) },
     { name = "HEALTH_STARTUP_TIMEOUT", value = tostring(var.health_startup_timeout_seconds) },
-    # License cache configuration
-    { name = "LICENSE_CACHE_TTL", value = tostring(var.license_cache_ttl_seconds) },
-    { name = "LICENSE_CACHE_MAX_SIZE", value = tostring(var.license_cache_max_size) },
     # QURL resource configuration
     { name = "QURL_DEFAULT_EXPIRES_IN", value = tostring(var.qurl_default_expires_in_seconds) },
     { name = "QURL_RESOURCE_TTL_BUFFER", value = tostring(var.qurl_resource_ttl_buffer_seconds) },
@@ -377,18 +373,6 @@ resource "aws_iam_role_policy" "task_dynamodb" {
           var.idempotency_table_arn != "" ? [var.idempotency_table_arn] : []
         )
       },
-      {
-        Sid    = "LicensesTableReadAccess"
-        Effect = "Allow"
-        Action = [
-          "dynamodb:GetItem",
-          "dynamodb:Query",
-        ]
-        Resource = [
-          var.licenses_table_arn,
-          "${var.licenses_table_arn}/index/*",
-        ]
-      }
       ],
       # KMS decrypt for DynamoDB (tables are encrypted with KMS)
       var.secrets_kms_key_arn != null ? [{

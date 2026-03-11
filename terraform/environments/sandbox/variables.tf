@@ -522,27 +522,6 @@ variable "qurl_health_startup_timeout_seconds" {
   }
 }
 
-# QURL License Cache
-variable "qurl_license_cache_ttl_seconds" {
-  description = "TTL for license cache entries in seconds"
-  type        = number
-
-  validation {
-    condition     = var.qurl_license_cache_ttl_seconds > 0 && var.qurl_license_cache_ttl_seconds <= 86400
-    error_message = "qurl_license_cache_ttl_seconds must be between 1 and 86400 seconds (24 hours max)"
-  }
-}
-
-variable "qurl_license_cache_max_size" {
-  description = "Maximum number of license cache entries"
-  type        = number
-
-  validation {
-    condition     = var.qurl_license_cache_max_size > 0 && var.qurl_license_cache_max_size <= 100000
-    error_message = "qurl_license_cache_max_size must be between 1 and 100000 entries"
-  }
-}
-
 # QURL Resource Config
 # TTL Relationship:
 # - qurl_default_expires_in_seconds: How long a QURL is valid (user-facing)

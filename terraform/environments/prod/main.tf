@@ -134,10 +134,6 @@ module "nhp" {
   qurl_health_check_timeout_seconds   = var.qurl_health_check_timeout_seconds
   qurl_health_startup_timeout_seconds = var.qurl_health_startup_timeout_seconds
 
-  # QURL License Cache
-  qurl_license_cache_ttl_seconds = var.qurl_license_cache_ttl_seconds
-  qurl_license_cache_max_size    = var.qurl_license_cache_max_size
-
   # QURL Resource Config
   qurl_default_expires_in_seconds  = var.qurl_default_expires_in_seconds
   qurl_resource_ttl_buffer_seconds = var.qurl_resource_ttl_buffer_seconds

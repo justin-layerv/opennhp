@@ -502,16 +502,6 @@ variable "qurl_health_startup_timeout_seconds" {
   default = 30
 }
 
-variable "qurl_license_cache_ttl_seconds" {
-  type    = number
-  default = 300
-}
-
-variable "qurl_license_cache_max_size" {
-  type    = number
-  default = 1000
-}
-
 variable "qurl_default_expires_in_seconds" {
   type    = number
   default = 86400

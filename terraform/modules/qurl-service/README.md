@@ -77,8 +77,6 @@ module "qurl_service" {
 |----------|-------------|------|----------|
 | `dynamodb_table_arns` | List of DynamoDB table ARNs for IAM | `list(string)` | Yes |
 | `dynamodb_table_prefix` | Prefix for DynamoDB table names | `string` | No |
-| `licenses_table_arn` | ARN of nhp_licenses table | `string` | Yes |
-| `licenses_table_name` | Name of nhp_licenses table | `string` | Yes |
 
 ### Auth0
 
@@ -141,13 +139,6 @@ module "qurl_service" {
 |----------|-------------|------|-------------|
 | `health_check_timeout_seconds` | Health check timeout | `number` | `10` |
 | `health_startup_timeout_seconds` | Startup timeout | `number` | `30` |
-
-### License Cache
-
-| Variable | Description | Type | Recommended |
-|----------|-------------|------|-------------|
-| `license_cache_ttl_seconds` | Cache TTL | `number` | `300` (5 min) |
-| `license_cache_max_size` | Maximum cache entries | `number` | `1000` |
 
 ### Webhooks (Optional)
 

@@ -244,10 +244,6 @@ qurl_idempotency_cleanup_interval_seconds = 60 # 1 minute
 qurl_health_check_timeout_seconds   = 10
 qurl_health_startup_timeout_seconds = 30
 
-# License cache configuration
-qurl_license_cache_ttl_seconds = 300 # 5 minutes
-qurl_license_cache_max_size    = 1000
-
 # Auth0 JWKS cache configuration
 qurl_auth0_jwks_cache_ttl_seconds     = 3600 # 1 hour
 qurl_auth0_jwks_fetch_timeout_seconds = 10

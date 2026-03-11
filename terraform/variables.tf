@@ -842,18 +842,6 @@ variable "qurl_health_startup_timeout_seconds" {
   type        = number
 }
 
-# ==================== QURL License Cache ====================
-
-variable "qurl_license_cache_ttl_seconds" {
-  description = "TTL for license cache entries in seconds"
-  type        = number
-}
-
-variable "qurl_license_cache_max_size" {
-  description = "Maximum number of license cache entries"
-  type        = number
-}
-
 # ==================== QURL Resource Config ====================
 # TTL Relationship:
 # - qurl_default_expires_in_seconds: How long a QURL is valid (user-facing)
