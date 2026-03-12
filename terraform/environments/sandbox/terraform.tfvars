@@ -21,7 +21,7 @@ deploy_ac          = true
 acme_email         = "admin@layerv.xyz"
 ac_auth_service_id = "layerv"
 ac_min_capacity    = 3
-ac_resource_ids    = ["demo", "mini-app-demo"]
+ac_resource_ids    = ["qurl"]
 enable_egress_eips = true
 
 # Terraform state bucket for GitHub Actions permissions

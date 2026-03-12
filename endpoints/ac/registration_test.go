@@ -215,7 +215,7 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 				},
 			},
 			expectError:   true,
-			errorContains: "empty IP",
+			errorContains: "has no address",
 		},
 		{
 			name: "target with invalid port",
