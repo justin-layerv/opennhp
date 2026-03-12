@@ -372,21 +372,34 @@ type ServerForwardResultMsg struct {
 // RedirectTarget represents an assigned server that the AC should connect to.
 // Used in ACRedispatchMsg to redirect AC to its assigned servers.
 type RedirectTarget struct {
-	IP           string `json:"ip"`              // Server's public IP
-	Port         int    `json:"port"`            // Server's NHP UDP port
-	PubKeyBase64 string `json:"pubKey"`          // Server's public key for NHP_AOL encryption
-	AZ           string `json:"az,omitempty"`    // Availability Zone (for debugging/logging)
-	ServerID     string `json:"srvId,omitempty"` // Server ID (for debugging/logging)
+	IP           string `json:"ip"`                 // Server's public IP
+	Hostname     string `json:"hostname,omitempty"` // DNS hostname (for NLB drain redirects)
+	Port         int    `json:"port"`               // Server's NHP UDP port
+	PubKeyBase64 string `json:"pubKey"`             // Server's public key for NHP_AOL encryption
+	AZ           string `json:"az,omitempty"`       // Availability Zone (for debugging/logging)
+	ServerID     string `json:"srvId,omitempty"`    // Server ID (for debugging/logging)
+}
+
+// Address returns the best available address for display/logging:
+// IP if set, else Hostname, else ServerID.
+func (rt *RedirectTarget) Address() string {
+	if rt.IP != "" {
+		return rt.IP
+	}
+	if rt.Hostname != "" {
+		return rt.Hostname
+	}
+	return rt.ServerID
 }
 
 // ACRedispatchMsg redirects an AC to its assigned servers (NHP_ARD).
-// This is an NHP spec message (Type 30) sent in response to NHP_AOL when
-// the AC connects to a non-assigned server via NLB.
+// This is an NHP spec message (Type 30) sent in two contexts:
+//   - In response to NHP_AOL when the AC connects to a non-assigned server via NLB
+//   - Unsolicited during graceful server shutdown (drain), redirecting ACs to the NLB
 //
 // Protocol rules:
-// 1. Only sent in response to NHP_AOL - unsolicited NHP_ARD is prohibited
-// 2. No redirect chaining - assigned servers MUST respond with NHP_AAK, not NHP_ARD
-// 3. AC should terminate current connection and connect to targets in order
+// 1. No redirect chaining - assigned servers MUST respond with NHP_AAK, not NHP_ARD
+// 2. AC should terminate current connection and connect to targets in order
 type ACRedispatchMsg struct {
 	Targets []RedirectTarget `json:"targets"`           // Ordered list of assigned servers (typically 3)
 	ErrCode string           `json:"errCode,omitempty"` // Error code if assignment lookup failed

@@ -1056,3 +1056,130 @@ func TestProcessACOperation_ContextAlreadyCanceled(t *testing.T) {
 		t.Errorf("Should have returned immediately, took %v", elapsed)
 	}
 }
+
+// TestDrainACConnections verifies that drainACConnections sends NHP_ARD to all
+// connected ACs with the NLB hostname, and uses fire-and-forget (no ResponseMsgCh).
+func TestDrainACConnections(t *testing.T) {
+	s, sendCh := newTestServerForBroadcast(t)
+
+	// Set NLB config
+	s.config = &Config{
+		Hostname:   "test-nlb.example.com",
+		ListenPort: 62206,
+	}
+
+	// Add two AC connections
+	ac1 := newTestACConn(t, "10.0.0.1", 47051, "ac-1")
+	ac2 := newTestACConn(t, "10.0.0.2", 47051, "ac-2")
+	s.acConnectionMap["ac-1"] = []*ACConn{ac1}
+	s.acConnectionMap["ac-2"] = []*ACConn{ac2}
+
+	// Run drain in background (it sleeps 100ms at the end)
+	go s.drainACConnections()
+
+	// Collect sent messages
+	var msgs []*core.MsgData
+	timeout := time.After(2 * time.Second)
+	for i := 0; i < 2; i++ {
+		select {
+		case md := <-sendCh:
+			msgs = append(msgs, md)
+		case <-timeout:
+			t.Fatalf("expected 2 drain messages, got %d", len(msgs))
+		}
+	}
+
+	for _, md := range msgs {
+		if md.HeaderType != core.NHP_ARD {
+			t.Errorf("expected NHP_ARD header type, got %d", md.HeaderType)
+		}
+		if md.ResponseMsgCh != nil {
+			t.Error("drain should be fire-and-forget (nil ResponseMsgCh)")
+		}
+
+		var ardMsg common.ACRedispatchMsg
+		if err := json.Unmarshal(md.Message, &ardMsg); err != nil {
+			t.Fatalf("failed to unmarshal ARD: %v", err)
+		}
+		if len(ardMsg.Targets) != 1 {
+			t.Fatalf("expected 1 target, got %d", len(ardMsg.Targets))
+		}
+		target := ardMsg.Targets[0]
+		if target.Hostname != "test-nlb.example.com" {
+			t.Errorf("expected hostname test-nlb.example.com, got %s", target.Hostname)
+		}
+		if target.IP != "" {
+			t.Errorf("drain targets should use Hostname, not IP; got IP=%s", target.IP)
+		}
+		if target.Port != 62206 {
+			t.Errorf("expected port 62206, got %d", target.Port)
+		}
+	}
+}
+
+// TestDrainACConnections_NoACs verifies that drainACConnections is a no-op
+// when no ACs are connected.
+func TestDrainACConnections_NoACs(t *testing.T) {
+	s, sendCh := newTestServerForBroadcast(t)
+	s.config = &Config{
+		Hostname:   "test-nlb.example.com",
+		ListenPort: 62206,
+	}
+
+	// No ACs connected — drain should return immediately
+	done := make(chan struct{})
+	go func() {
+		s.drainACConnections()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// good — returned quickly
+	case <-time.After(1 * time.Second):
+		t.Fatal("drainACConnections should return immediately with no ACs")
+	}
+
+	// Verify nothing was sent
+	select {
+	case md := <-sendCh:
+		t.Fatalf("unexpected message sent: %+v", md)
+	default:
+		// good
+	}
+}
+
+// TestDrainACConnections_NoHostname verifies that drainACConnections returns
+// early when no Hostname is configured (e.g., local development).
+func TestDrainACConnections_NoHostname(t *testing.T) {
+	s, sendCh := newTestServerForBroadcast(t)
+	s.config = &Config{
+		Hostname:   "", // no NLB hostname
+		ListenPort: 62206,
+	}
+
+	// Add an AC so we can verify it's NOT drained
+	ac1 := newTestACConn(t, "10.0.0.1", 47051, "ac-1")
+	s.acConnectionMap["ac-1"] = []*ACConn{ac1}
+
+	done := make(chan struct{})
+	go func() {
+		s.drainACConnections()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// good — returned quickly
+	case <-time.After(1 * time.Second):
+		t.Fatal("drainACConnections should return immediately without Hostname")
+	}
+
+	// Verify nothing was sent despite having an AC
+	select {
+	case md := <-sendCh:
+		t.Fatalf("unexpected message sent: %+v", md)
+	default:
+		// good
+	}
+}

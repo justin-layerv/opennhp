@@ -755,8 +755,8 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 
 	// Validate all targets before proceeding
 	for i, target := range ardMsg.Targets {
-		if target.IP == "" {
-			return fmt.Errorf("target %d has empty IP", i)
+		if target.IP == "" && target.Hostname == "" {
+			return fmt.Errorf("target %d has no address", i)
 		}
 		if target.Port == 0 {
 			return fmt.Errorf("target %d has invalid port", i)
@@ -764,9 +764,11 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 		if target.PubKeyBase64 == "" {
 			return fmt.Errorf("target %d has empty public key", i)
 		}
-		// Validate IP address format
-		if ip := net.ParseIP(target.IP); ip == nil {
-			return fmt.Errorf("target %d has invalid IP address: %s", i, target.IP)
+		// Validate IP address format (only when IP is provided)
+		if target.IP != "" {
+			if ip := net.ParseIP(target.IP); ip == nil {
+				return fmt.Errorf("target %d has invalid IP address: %s", i, target.IP)
+			}
 		}
 	}
 
@@ -787,7 +789,7 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 			Target:    target,
 			Connected: false,
 		}
-		log.Info("Assigned server %d: %s:%d (AZ=%s)", i, target.IP, target.Port, target.AZ)
+		log.Info("Assigned server %d: %s:%d (AZ=%s)", i, target.Address(), target.Port, target.AZ)
 	}
 	// Capture slice reference before unlocking. This is safe because:
 	// 1. Each HandleRedispatch creates NEW *AssignedServer structs (not shared)
@@ -807,7 +809,7 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 		go func(s *AssignedServer) {
 			defer connectWg.Done()
 			if err := r.connectToServer(s); err != nil {
-				log.Warning("Failed to connect to assigned server %s: %v", s.Target.IP, err)
+				log.Warning("Failed to connect to assigned server %s: %v", s.Target.Address(), err)
 
 				// Track individual connection failures for alerting on partial connectivity.
 				r.metrics.IncrCounterWithDims(MetricServerConnectionFailure, []types.Dimension{
@@ -857,9 +859,15 @@ const ConnectionTimeout = 10 * time.Second
 
 // connectToServer establishes connection to an assigned server.
 func (r *ACRegistration) connectToServer(server *AssignedServer) error {
-	// Create peer for this server
+	// Create peer for this server.
+	// Hostname field is set from RedirectTarget.Hostname (for NLB drain redirects)
+	// or falls back to ServerID (for direct server connections).
+	hostname := server.Target.Hostname
+	if hostname == "" {
+		hostname = server.Target.ServerID
+	}
 	peer := &core.UdpPeer{
-		Hostname:     server.Target.ServerID,
+		Hostname:     hostname,
 		Ip:           server.Target.IP,
 		Port:         server.Target.Port,
 		PubKeyBase64: server.Target.PubKeyBase64,
@@ -870,7 +878,7 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 	// Resolve server address
 	sendAddr := peer.SendAddr()
 	if sendAddr == nil {
-		return fmt.Errorf("cannot resolve address for server %s", server.Target.IP)
+		return fmt.Errorf("cannot resolve address for server %s", hostname)
 	}
 
 	// Add peer to device
@@ -882,7 +890,7 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 	udpAddr, ok := sendAddr.(*net.UDPAddr)
 	if !ok {
 		r.ac.device.RemovePeer(peer.PublicKeyBase64())
-		return fmt.Errorf("unexpected address type %T for server %s", sendAddr, server.Target.IP)
+		return fmt.Errorf("unexpected address type %T for server %s", sendAddr, hostname)
 	}
 	md := &core.MsgData{
 		RemoteAddr:    udpAddr,
@@ -911,7 +919,7 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 	case <-time.After(ConnectionTimeout):
 		r.ac.device.RemovePeer(peer.PublicKeyBase64())
 		server.Peer = nil
-		return fmt.Errorf("connection to %s timed out", server.Target.IP)
+		return fmt.Errorf("connection to %s timed out", hostname)
 	case ppd := <-md.ResponseMsgCh:
 		if ppd.Error != nil {
 			r.ac.device.RemovePeer(peer.PublicKeyBase64())

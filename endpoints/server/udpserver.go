@@ -442,6 +442,9 @@ func (s *UdpServer) Stop() {
 	}
 	// Best-effort cleanup: remove this server from AC assignments
 	s.cleanupOwnedAssignments()
+	// Drain AC connections: send NHP_ARD redirecting ACs to NLB for immediate reconnect.
+	// Must run before close(s.signals.stop) because drain sends via s.sendMsgCh.
+	s.drainACConnections()
 	// Stop forwarder cleanup routine
 	if s.forwarder != nil {
 		s.forwarder.Stop()
@@ -550,6 +553,78 @@ func (s *UdpServer) cleanupOwnedAssignments() {
 		s.ttlRefreshTimes.Delete(key)
 		return true
 	})
+}
+
+// drainFlushDelay is how long to wait after queuing drain messages for the
+// encrypt→send pipeline to flush packets onto the wire. NHP_ARD is small
+// (~200 bytes) and the pipeline is non-blocking after enqueueing.
+const drainFlushDelay = 100 * time.Millisecond
+
+// drainACConnections sends NHP_ARD to all connected ACs, redirecting them
+// to the NLB so they reconnect to surviving servers immediately.
+// Called during shutdown, before sendMessageRoutine is stopped.
+func (s *UdpServer) drainACConnections() {
+	if s.config.Hostname == "" {
+		log.Warning("Shutdown: cannot drain without Hostname configured")
+		return
+	}
+
+	// Snapshot connections under read lock — check before doing any work
+	s.acConnectionMapMutex.RLock()
+	totalConns := 0
+	for _, acConns := range s.acConnectionMap {
+		totalConns += len(acConns)
+	}
+	conns := make([]*ACConn, 0, totalConns)
+	for _, acConns := range s.acConnectionMap {
+		conns = append(conns, acConns...)
+	}
+	s.acConnectionMapMutex.RUnlock()
+
+	if len(conns) == 0 {
+		return
+	}
+
+	nlbTarget := common.RedirectTarget{
+		Hostname:     s.config.Hostname,
+		Port:         s.config.ListenPort,
+		PubKeyBase64: s.device.PublicKeyBase64(),
+	}
+	ardMsg := &common.ACRedispatchMsg{
+		Targets: []common.RedirectTarget{nlbTarget},
+		ErrCode: common.ErrSuccess.ErrorCode(),
+	}
+	ardBytes, err := json.Marshal(ardMsg)
+	if err != nil {
+		log.Error("Shutdown: failed to marshal drain ARD: %v", err)
+		return
+	}
+
+	log.Info("Shutdown: draining %d AC connections to NLB", len(conns))
+
+	sent := 0
+	for _, conn := range conns {
+		md := &core.MsgData{
+			ConnData:      conn.ConnData,
+			HeaderType:    core.NHP_ARD,
+			CipherScheme:  conn.ACCipherScheme,
+			TransactionId: s.device.NextCounterIndex(),
+			Compress:      true,
+			PeerPk:        conn.ACPeer.PublicKey(),
+			Message:       ardBytes,
+			// No ResponseMsgCh — fire-and-forget
+		}
+		select {
+		case s.sendMsgCh <- md:
+			sent++
+		default:
+			log.Warning("Shutdown: sendMsgCh full, skipped drain for 1 AC")
+		}
+	}
+
+	time.Sleep(drainFlushDelay)
+
+	log.Info("Shutdown: drained %d/%d AC connections", sent, len(conns))
 }
 
 // registerWithCloudMap fetches EC2 instance identity from IMDS and registers
