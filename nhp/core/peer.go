@@ -220,11 +220,38 @@ func (p *UdpPeer) CheckRecvAddress(currTime int64, currAddr net.Addr) bool {
 		return true
 	}
 
-	if p.recvAddr.String() == currAddr.String() {
+	if p.recvAddr != nil && p.recvAddr.String() == currAddr.String() {
 		return true
 	}
 
 	return false
+}
+
+// matchesKnownAddr reports whether addrStr matches either the peer's
+// recv address or its static/cached send address. Unlike SendAddr(),
+// this never triggers DNS resolution, making it safe to call while
+// holding PeerGroup.mu on the per-packet receive path.
+func (p *UdpPeer) matchesKnownAddr(addrStr string) bool {
+	p.Lock()
+	defer p.Unlock()
+
+	if p.recvAddr != nil && p.recvAddr.String() == addrStr {
+		return true
+	}
+
+	// Build send address from static IP or cached resolved IP (no DNS).
+	ip := p.Ip
+	if ip == "" {
+		ip = p.primaryResolvedIp
+	}
+	if ip == "" {
+		return false
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	return (&net.UDPAddr{IP: parsed, Port: p.Port}).String() == addrStr
 }
 
 func (p *UdpPeer) RecvAddr() net.Addr {

@@ -474,11 +474,65 @@ func (d *Device) RecvPacketToMsg(pd *PacketData) {
 	}
 }
 
+// udpPeersShareAddress returns true if two UdpPeers point to the same
+// network endpoint. Compares IP+Port for IP-based peers, Hostname+Port
+// for hostname-only peers (e.g., NLB drain targets).
+func udpPeersShareAddress(a, b *UdpPeer) bool {
+	if a.Port != b.Port {
+		return false
+	}
+	if a.Ip != "" || b.Ip != "" {
+		return a.Ip == b.Ip
+	}
+	return a.Hostname == b.Hostname
+}
+
 func (d *Device) AddPeer(peer Peer) {
 	d.peerMapMutex.Lock()
 	defer d.peerMapMutex.Unlock()
 
-	d.peerMap[peer.PublicKeyBase64()] = peer
+	key := peer.PublicKeyBase64()
+	existing, found := d.peerMap[key]
+	if !found {
+		d.peerMap[key] = peer
+		return
+	}
+
+	udpPeer, isUdp := peer.(*UdpPeer)
+	if !isUdp {
+		d.peerMap[key] = peer
+		return
+	}
+
+	// Existing is already a PeerGroup — add the new member
+	if group, isGroup := existing.(*PeerGroup); isGroup {
+		group.AddMember(udpPeer)
+		log.Info("AddPeer: added member %s to peer group (size %d)", udpPeer.Host(), group.Len())
+		return
+	}
+
+	// Existing is a single UdpPeer — check if same address (re-registration)
+	existingUdp, isExistingUdp := existing.(*UdpPeer)
+	if isExistingUdp && udpPeersShareAddress(existingUdp, udpPeer) {
+		d.peerMap[key] = peer
+		return
+	}
+
+	// Different address, same key — promote to PeerGroup
+	if isExistingUdp {
+		group := NewPeerGroup(existingUdp, udpPeer)
+		d.peerMap[key] = group
+		keyPrefix := key
+		if len(keyPrefix) > 8 {
+			keyPrefix = keyPrefix[:8] + "..."
+		}
+		log.Info("AddPeer: promoted to peer group for key %s (%s + %s)",
+			keyPrefix, existingUdp.Host(), udpPeer.Host())
+		return
+	}
+
+	// Existing is some other Peer type — overwrite
+	d.peerMap[key] = peer
 }
 
 func (d *Device) RemovePeer(pubKey string) {
@@ -486,6 +540,33 @@ func (d *Device) RemovePeer(pubKey string) {
 	defer d.peerMapMutex.Unlock()
 
 	delete(d.peerMap, pubKey)
+}
+
+// RemovePeerByAddress removes a specific member from a PeerGroup.
+// If the group has only one member left, it is demoted back to a single peer.
+// If the entry is a single peer (not a group), the entire entry is removed.
+func (d *Device) RemovePeerByAddress(pubKey string, addr string) {
+	d.peerMapMutex.Lock()
+	defer d.peerMapMutex.Unlock()
+
+	existing, found := d.peerMap[pubKey]
+	if !found {
+		return
+	}
+
+	group, isGroup := existing.(*PeerGroup)
+	if !isGroup {
+		delete(d.peerMap, pubKey)
+		return
+	}
+
+	group.RemoveMember(addr)
+	switch group.Len() {
+	case 0:
+		delete(d.peerMap, pubKey)
+	case 1:
+		d.peerMap[pubKey] = group.Members()[0]
+	}
 }
 
 func (d *Device) ResetPeers() {
