@@ -302,13 +302,13 @@ func (r *ACRegistration) Stop() {
 	r.mu.Lock()
 	// Clean up registration peer (from NHP_AAK response)
 	if r.registrationPeer != nil {
-		r.ac.device.RemovePeer(r.registrationPeer.PublicKeyBase64())
+		r.ac.device.RemovePeerByAddress(r.registrationPeer.PublicKeyBase64(), r.registrationPeer.Host())
 		r.registrationPeer = nil
 	}
 	// Clean up connected server peers
 	for _, server := range r.assignedServers {
 		if server.Peer != nil {
-			r.ac.device.RemovePeer(server.Peer.PublicKeyBase64())
+			r.ac.device.RemovePeerByAddress(server.Peer.PublicKeyBase64(), server.Peer.Host())
 			server.Peer = nil
 		}
 	}
@@ -317,7 +317,7 @@ func (r *ACRegistration) Stop() {
 	for cleanupKey, oldServers := range r.oldServerSets {
 		for _, server := range oldServers {
 			if server.Peer != nil {
-				r.ac.device.RemovePeer(server.Peer.PublicKeyBase64())
+				r.ac.device.RemovePeerByAddress(server.Peer.PublicKeyBase64(), server.Peer.Host())
 				server.Peer = nil
 			}
 		}
@@ -442,7 +442,7 @@ func (r *ACRegistration) register() error {
 	// Use buffered channel (size 1) to prevent sender from blocking if we exit early
 	udpAddr, ok := sendAddr.(*net.UDPAddr)
 	if !ok {
-		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+		r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
 		return fmt.Errorf("unexpected address type %T for registration peer", sendAddr)
 	}
 	md := &core.MsgData{
@@ -457,7 +457,7 @@ func (r *ACRegistration) register() error {
 
 	// Send NHP_AOL
 	if !r.ac.IsRunning() {
-		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+		r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
 		return errors.New("AC not running")
 	}
 	r.ac.sendMsgCh <- md
@@ -473,14 +473,14 @@ func (r *ACRegistration) register() error {
 
 	select {
 	case <-r.stopCh:
-		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+		r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
 		r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
 			r.acIdDimension(),
 			{Name: dimNameErrorCode, Value: aws.String("canceled")},
 		})
 		return errors.New("registration canceled")
 	case <-regTimer.C:
-		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+		r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
 		r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
 			r.acIdDimension(),
 			{Name: dimNameErrorCode, Value: aws.String("timeout")},
@@ -504,7 +504,7 @@ func (r *ACRegistration) register() error {
 // but kept if NHP_AAK is received (this server will send us NHP_AOP packets).
 func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, registrationPeer *core.UdpPeer) error {
 	if ppd.Error != nil {
-		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+		r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
 
 		// Send registration failure metric with error category (not raw message)
 		// to keep dimension cardinality bounded.
@@ -520,7 +520,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 	case core.NHP_ARD:
 		// Server is not assigned to this AC - parse redispatch message
 		// Remove the registration peer since we'll connect to different servers
-		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+		r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
 
 		var ardMsg common.ACRedispatchMsg
 		if err := json.Unmarshal(ppd.BodyMessage, &ardMsg); err != nil {
@@ -545,12 +545,12 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 		// Server responded with ACK - this server is assigned to us
 		var aakMsg common.ServerACAckMsg
 		if err := json.Unmarshal(ppd.BodyMessage, &aakMsg); err != nil {
-			r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+			r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
 			return fmt.Errorf("failed to parse NHP_AAK: %w", err)
 		}
 
 		if !common.IsSuccessErrCode(aakMsg.ErrCode) {
-			r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+			r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
 
 			// Send registration failure metric with server's error code (bounded cardinality).
 			errCode := aakMsg.ErrCode
@@ -566,7 +566,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 		}
 
 		if !aakMsg.Registered {
-			r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+			r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
 
 			// Send registration failure metric for server-side rejection.
 			r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
@@ -609,7 +609,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 						// Keep using NLB address but update peer's public key to server's key.
 						// Must remove and re-add because device's peer map is keyed by public key.
 						oldPubKey := registrationPeer.PublicKeyBase64()
-						r.ac.device.RemovePeer(oldPubKey)
+						r.ac.device.RemovePeerByAddress(oldPubKey, registrationPeer.Host())
 						registrationPeer.PubKeyBase64 = aakMsg.ServerPubKey
 						r.ac.device.AddPeer(registrationPeer)
 						serverPeer = registrationPeer
@@ -630,7 +630,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 							// Add the new direct peer to the device
 							r.ac.device.AddPeer(serverPeer)
 							// Remove the old registration peer (connected to NLB)
-							r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+							r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
 							log.Info("Switched from NLB %s:%d to server direct address %s", registrationPeer.Ip, registrationPeer.Port, aakMsg.ServerAddr)
 						}
 					}
@@ -657,7 +657,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 			log.Warning("Server peer has nil SendAddr, cannot add to assignedServers for keepalive")
 			r.mu.Lock()
 			if r.registrationPeer != nil {
-				r.ac.device.RemovePeer(r.registrationPeer.PublicKeyBase64())
+				r.ac.device.RemovePeerByAddress(r.registrationPeer.PublicKeyBase64(), r.registrationPeer.Host())
 			}
 			r.registrationPeer = serverPeer
 			r.mu.Unlock()
@@ -671,7 +671,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 
 		udpAddr, ok := sendAddr.(*net.UDPAddr)
 		if !ok {
-			r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+			r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
 			return fmt.Errorf("unexpected address type %T for server peer", sendAddr)
 		}
 
@@ -697,7 +697,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 
 			// Remove the NLB registration peer only after HandleRedispatch
 			// succeeds — otherwise a failure would leave the AC with no connections.
-			r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+			r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
 
 			r.recordRegistrationSuccess(dimValPeerRedispatch)
 			return nil
@@ -706,7 +706,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 		r.mu.Lock()
 		// Clean up old registration peer if exists (re-registration case)
 		if r.registrationPeer != nil && r.registrationPeer.PublicKeyBase64() != serverPeer.PublicKeyBase64() {
-			r.ac.device.RemovePeer(r.registrationPeer.PublicKeyBase64())
+			r.ac.device.RemovePeerByAddress(r.registrationPeer.PublicKeyBase64(), r.registrationPeer.Host())
 		}
 		r.registrationPeer = serverPeer
 
@@ -738,7 +738,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 		return nil
 
 	default:
-		r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+		r.ac.device.RemovePeerByAddress(registrationPeer.PublicKeyBase64(), registrationPeer.Host())
 		return fmt.Errorf("unexpected response type: %s", core.HeaderTypeToString(ppd.HeaderType))
 	}
 }
@@ -860,14 +860,11 @@ const ConnectionTimeout = 10 * time.Second
 // connectToServer establishes connection to an assigned server.
 func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 	// Create peer for this server.
-	// Hostname field is set from RedirectTarget.Hostname (for NLB drain redirects)
-	// or falls back to ServerID (for direct server connections).
-	hostname := server.Target.Hostname
-	if hostname == "" {
-		hostname = server.Target.ServerID
-	}
+	// Hostname is set from RedirectTarget.Hostname (for NLB drain redirects).
+	// For direct IP connections, Hostname is empty — UdpPeer.ResolveHost()
+	// correctly uses Ip when Hostname is empty.
 	peer := &core.UdpPeer{
-		Hostname:     hostname,
+		Hostname:     server.Target.Hostname,
 		Ip:           server.Target.IP,
 		Port:         server.Target.Port,
 		PubKeyBase64: server.Target.PubKeyBase64,
@@ -878,7 +875,7 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 	// Resolve server address
 	sendAddr := peer.SendAddr()
 	if sendAddr == nil {
-		return fmt.Errorf("cannot resolve address for server %s", hostname)
+		return fmt.Errorf("cannot resolve address for server %s", server.Target.Address())
 	}
 
 	// Add peer to device
@@ -889,8 +886,8 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 	// Use buffered channel (size 1) to prevent sender from blocking if we exit early
 	udpAddr, ok := sendAddr.(*net.UDPAddr)
 	if !ok {
-		r.ac.device.RemovePeer(peer.PublicKeyBase64())
-		return fmt.Errorf("unexpected address type %T for server %s", sendAddr, hostname)
+		r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
+		return fmt.Errorf("unexpected address type %T for server %s", sendAddr, server.Target.Address())
 	}
 	md := &core.MsgData{
 		RemoteAddr:    udpAddr,
@@ -913,34 +910,34 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 	// and the channel will be garbage collected when no longer referenced.
 	select {
 	case <-r.stopCh:
-		r.ac.device.RemovePeer(peer.PublicKeyBase64())
+		r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
 		server.Peer = nil
 		return errors.New("connection canceled")
 	case <-time.After(ConnectionTimeout):
-		r.ac.device.RemovePeer(peer.PublicKeyBase64())
+		r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
 		server.Peer = nil
-		return fmt.Errorf("connection to %s timed out", hostname)
+		return fmt.Errorf("connection to %s timed out", server.Target.Address())
 	case ppd := <-md.ResponseMsgCh:
 		if ppd.Error != nil {
-			r.ac.device.RemovePeer(peer.PublicKeyBase64())
+			r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
 			server.Peer = nil
 			return fmt.Errorf("connection failed: %w", ppd.Error)
 		}
 		if ppd.HeaderType != core.NHP_AAK {
-			r.ac.device.RemovePeer(peer.PublicKeyBase64())
+			r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
 			server.Peer = nil
 			return fmt.Errorf("unexpected response type: %s", core.HeaderTypeToString(ppd.HeaderType))
 		}
 
 		var aakMsg common.ServerACAckMsg
 		if err := json.Unmarshal(ppd.BodyMessage, &aakMsg); err != nil {
-			r.ac.device.RemovePeer(peer.PublicKeyBase64())
+			r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
 			server.Peer = nil
 			return fmt.Errorf("failed to parse NHP_AAK: %w", err)
 		}
 
 		if !common.IsSuccessErrCode(aakMsg.ErrCode) {
-			r.ac.device.RemovePeer(peer.PublicKeyBase64())
+			r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
 			server.Peer = nil
 			return fmt.Errorf("server rejected: %s - %s", aakMsg.ErrCode, aakMsg.ErrMsg)
 		}
@@ -1401,7 +1398,7 @@ func (r *ACRegistration) cleanupOldServers(cleanupKey string) {
 
 	for _, server := range oldServers {
 		if server.Peer != nil {
-			r.ac.device.RemovePeer(server.Peer.PublicKeyBase64())
+			r.ac.device.RemovePeerByAddress(server.Peer.PublicKeyBase64(), server.Peer.Host())
 			log.Info("Cleaned up old server connection to %s", server.Target.IP)
 		}
 	}
