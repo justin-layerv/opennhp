@@ -120,11 +120,17 @@ func TestAutoAssignAC_VersionIncrement(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Fresh mock per subtest — reuses mockStorageBackend from storage_test.go
 			storage := newMockStorageBackend()
+			device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+			if device == nil {
+				t.Fatal("Failed to create device")
+			}
+			defer device.Stop()
 			srv := &UdpServer{
 				storage:    storage,
 				cloudMap:   cloudMap,
 				instanceID: "i-test-1",
 				config:     &Config{Hostname: "test-server", ListenPort: 62206},
+				device:     device,
 			}
 
 			_, err := srv.autoAssignAC(ppd, aolMsg, 12345, "10.99.0.1:62206", tc.existingVersion)

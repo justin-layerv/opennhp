@@ -108,13 +108,19 @@ type ServerInfo struct {
 
 // serverInfosToRedirectTargets converts a slice of ServerInfo to RedirectTarget,
 // using VPC private IPs for direct AC-to-server connectivity.
-func serverInfosToRedirectTargets(servers []ServerInfo) []common.RedirectTarget {
+// sharedPubKey is used as fallback when a server's pubkey is empty (e.g., during
+// rolling updates when Cloud Map cache hasn't picked up the new server's key yet).
+func serverInfosToRedirectTargets(servers []ServerInfo, sharedPubKey string) []common.RedirectTarget {
 	targets := make([]common.RedirectTarget, len(servers))
 	for i, srv := range servers {
+		pubKey := srv.PubKey
+		if pubKey == "" {
+			pubKey = sharedPubKey
+		}
 		targets[i] = common.RedirectTarget{
 			IP:           srv.InternalIP,
 			Port:         srv.Port,
-			PubKeyBase64: srv.PubKey,
+			PubKeyBase64: pubKey,
 			AZ:           srv.AZ,
 			ServerID:     srv.ID,
 		}

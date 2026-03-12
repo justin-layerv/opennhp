@@ -501,7 +501,7 @@ func (s *UdpServer) handleACServerAssignment(
 		s.refreshAssignmentTTL(acId)
 		log.Info("server-ac(%s#%d@%s)[HandleACOnline] this server (%s) is assigned to AC, returning %d peers",
 			acId, transactionId, addrStr, serverID, len(healthyServers))
-		return false, serverInfosToRedirectTargets(healthyServers), nil
+		return false, serverInfosToRedirectTargets(healthyServers, s.device.PublicKeyBase64()), nil
 	}
 
 	// This server is NOT in the assignment but the AC connected here.
@@ -738,7 +738,7 @@ func (s *UdpServer) sendARD(
 	servers []ServerInfo,
 ) error {
 	ardMsg := &common.ACRedispatchMsg{
-		Targets: serverInfosToRedirectTargets(servers),
+		Targets: serverInfosToRedirectTargets(servers, s.device.PublicKeyBase64()),
 		ErrCode: common.ErrSuccess.ErrorCode(),
 	}
 	ardBytes, marshalErr := json.Marshal(ardMsg)
