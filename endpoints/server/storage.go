@@ -7,6 +7,8 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+
+	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
 // ============================================================================
@@ -102,6 +104,22 @@ type ServerInfo struct {
 	AZ         string `json:"az,omitempty" dynamodbav:"az,omitempty"`                   // Availability Zone
 	Port       int    `json:"port" dynamodbav:"port"`                                   // NHP UDP port (default 62206)
 	PubKey     string `json:"pub_key,omitempty" dynamodbav:"pub_key,omitempty"`         // Server's public key (for forwarding)
+}
+
+// serverInfosToRedirectTargets converts a slice of ServerInfo to RedirectTarget,
+// using VPC private IPs for direct AC-to-server connectivity.
+func serverInfosToRedirectTargets(servers []ServerInfo) []common.RedirectTarget {
+	targets := make([]common.RedirectTarget, len(servers))
+	for i, srv := range servers {
+		targets[i] = common.RedirectTarget{
+			IP:           srv.InternalIP,
+			Port:         srv.Port,
+			PubKeyBase64: srv.PubKey,
+			AZ:           srv.AZ,
+			ServerID:     srv.ID,
+		}
+	}
+	return targets
 }
 
 // License represents customer license information.

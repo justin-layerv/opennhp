@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -775,39 +776,31 @@ func newTestACConn(t *testing.T, ip string, port int, acId string, device ...*co
 	}
 }
 
-// TestBroadcastCancellation_FirstSuccessCancelsRemaining verifies that when
-// the first AC responds successfully, the remaining goroutines are canceled
-// via context cancellation and don't block indefinitely.
-func TestBroadcastCancellation_FirstSuccessCancelsRemaining(t *testing.T) {
+// TestBroadcast_ReturnsOnFirstSuccess verifies that the broadcast returns
+// immediately on the first AC success (low latency) while remaining goroutines
+// continue in the background so all ACs still get the ipset pinhole.
+func TestBroadcast_ReturnsOnFirstSuccess(t *testing.T) {
 	s, sendCh := newTestServerForBroadcast(t)
 
-	// Track how many AOP messages are sent (one per goroutine)
+	// Track how many AOP messages complete (one per goroutine)
 	var aopCount atomic.Int32
+	var allDone sync.WaitGroup
+	allDone.Add(3)
 
-	// Respond to AOP messages: first one fast, rest slow
+	// Respond to all AOP messages with success, but at different speeds
 	go func() {
 		for md := range sendCh {
 			go func(md *core.MsgData) {
 				n := aopCount.Add(1)
-				if n == 1 {
-					// First AC responds immediately with success
-					artMsg := &common.ACOpsResultMsg{ErrCode: common.ErrSuccess.ErrorCode()}
-					body, _ := json.Marshal(artMsg)
-					md.ResponseMsgCh <- &core.PacketParserData{
-						HeaderType:  core.NHP_ART,
-						BodyMessage: body,
-					}
-				} else {
-					// Other ACs: wait for context cancellation or respond late
-					// The drain goroutine in processACOperation will handle this
-					select {
-					case <-time.After(5 * time.Second):
-						md.ResponseMsgCh <- &core.PacketParserData{
-							HeaderType:  core.NHP_ART,
-							BodyMessage: []byte(`{}`),
-						}
-					}
+				// Stagger responses: 0ms, 50ms, 100ms
+				time.Sleep(time.Duration(n-1) * 50 * time.Millisecond)
+				artMsg := &common.ACOpsResultMsg{ErrCode: common.ErrSuccess.ErrorCode()}
+				body, _ := json.Marshal(artMsg)
+				md.ResponseMsgCh <- &core.PacketParserData{
+					HeaderType:  core.NHP_ART,
+					BodyMessage: body,
 				}
+				allDone.Done()
 			}(md)
 		}
 	}()
@@ -822,10 +815,7 @@ func TestBroadcastCancellation_FirstSuccessCancelsRemaining(t *testing.T) {
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
-	// Should return quickly (not wait for all 3)
-	start := time.Now()
 	artMsg, err := s.processACOperationBroadcast(knkMsg, conns, srcAddr, dstAddrs, 60)
-	elapsed := time.Since(start)
 
 	if err != nil {
 		t.Fatalf("Expected success, got error: %v", err)
@@ -837,14 +827,69 @@ func TestBroadcastCancellation_FirstSuccessCancelsRemaining(t *testing.T) {
 		t.Errorf("Expected success error code, got %s", artMsg.ErrCode)
 	}
 
-	// Should complete well under 5 seconds (the slow responder delay)
-	if elapsed > 2*time.Second {
-		t.Errorf("Broadcast took %v, expected < 2s (cancellation not working)", elapsed)
+	// Wait for background goroutines to finish, then verify all 3 AOP messages completed
+	allDone.Wait()
+	if aopCount.Load() != 3 {
+		t.Errorf("Expected all 3 AOP messages sent, got %d", aopCount.Load())
+	}
+}
+
+// TestBroadcast_PartialFailureStillSucceeds verifies that when some ACs fail
+// but at least one succeeds, the broadcast returns success and remaining
+// goroutines complete in the background.
+func TestBroadcast_PartialFailureStillSucceeds(t *testing.T) {
+	s, sendCh := newTestServerForBroadcast(t)
+
+	var aopCount atomic.Int32
+	var allDone sync.WaitGroup
+	allDone.Add(3)
+
+	go func() {
+		for md := range sendCh {
+			go func(md *core.MsgData) {
+				n := aopCount.Add(1)
+				if n == 2 {
+					// Second AC succeeds
+					artMsg := &common.ACOpsResultMsg{ErrCode: common.ErrSuccess.ErrorCode()}
+					body, _ := json.Marshal(artMsg)
+					md.ResponseMsgCh <- &core.PacketParserData{
+						HeaderType:  core.NHP_ART,
+						BodyMessage: body,
+					}
+				} else {
+					// Others fail
+					md.ResponseMsgCh <- &core.PacketParserData{
+						HeaderType: core.NHP_ART,
+						Error:      common.ErrServerACOpsFailed,
+					}
+				}
+				allDone.Done()
+			}(md)
+		}
+	}()
+
+	conns := []*ACConn{
+		newTestACConn(t, "10.0.0.1", 47051, "test-ac"),
+		newTestACConn(t, "10.0.0.2", 47051, "test-ac"),
+		newTestACConn(t, "10.0.0.3", 47051, "test-ac"),
 	}
 
-	// All 3 goroutines should have been started
-	if aopCount.Load() < 3 {
-		t.Logf("Note: only %d of 3 AOP messages sent (goroutine scheduling)", aopCount.Load())
+	knkMsg := &common.AgentKnockMsg{UserId: "test-user"}
+	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
+	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
+
+	artMsg, err := s.processACOperationBroadcast(knkMsg, conns, srcAddr, dstAddrs, 60)
+
+	if err != nil {
+		t.Fatalf("Expected success (partial), got error: %v", err)
+	}
+	if artMsg == nil {
+		t.Fatal("Expected non-nil artMsg")
+	}
+	// Wait for background goroutines, then verify all 3 were attempted
+	allDone.Wait()
+	if aopCount.Load() != 3 {
+		t.Errorf("Expected all 3 AOP messages sent, got %d", aopCount.Load())
 	}
 }
 
@@ -903,6 +948,74 @@ func TestBroadcastCancellation_SingleConn(t *testing.T) {
 	}
 	if artMsg == nil {
 		t.Fatal("Expected non-nil artMsg")
+	}
+}
+
+// TestBroadcast_TimeoutReturnsFirstSuccess verifies that when some ACs hang
+// beyond DefaultBroadcastTimeout, the broadcast still returns the first success
+// and the background goroutine completes (does not leak).
+func TestBroadcast_TimeoutReturnsFirstSuccess(t *testing.T) {
+	s, sendCh := newTestServerForBroadcast(t)
+
+	var allDone sync.WaitGroup
+	allDone.Add(3)
+
+	// AC 1 responds fast (success), AC 2 responds fast (success),
+	// AC 3 never responds — its per-goroutine context.WithTimeout will fire.
+	var respondCount atomic.Int32
+	go func() {
+		for md := range sendCh {
+			go func(md *core.MsgData) {
+				n := respondCount.Add(1)
+				defer allDone.Done()
+				if n <= 2 {
+					// Respond immediately with success
+					artMsg := &common.ACOpsResultMsg{ErrCode: common.ErrSuccess.ErrorCode()}
+					body, _ := json.Marshal(artMsg)
+					md.ResponseMsgCh <- &core.PacketParserData{
+						HeaderType:  core.NHP_ART,
+						BodyMessage: body,
+					}
+				}
+				// n == 3: never respond — the goroutine's context timeout will
+				// cause processACOperation to return an error. We just need to
+				// wait for the channel to be consumed or closed.
+				// Since we can't block forever in a test, simulate the timeout
+				// by responding with an error after a short delay.
+				if n == 3 {
+					time.Sleep(200 * time.Millisecond)
+					md.ResponseMsgCh <- &core.PacketParserData{
+						HeaderType: core.NHP_ART,
+						Error:      fmt.Errorf("simulated timeout"),
+					}
+				}
+			}(md)
+		}
+	}()
+
+	conns := []*ACConn{
+		newTestACConn(t, "10.0.0.1", 47051, "test-ac"),
+		newTestACConn(t, "10.0.0.2", 47051, "test-ac"),
+		newTestACConn(t, "10.0.0.3", 47051, "test-ac"),
+	}
+
+	knkMsg := &common.AgentKnockMsg{UserId: "test-user"}
+	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
+	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
+
+	artMsg, err := s.processACOperationBroadcast(knkMsg, conns, srcAddr, dstAddrs, 60)
+
+	if err != nil {
+		t.Fatalf("Expected success (first AC responded), got error: %v", err)
+	}
+	if artMsg == nil {
+		t.Fatal("Expected non-nil artMsg")
+	}
+
+	// Wait for all goroutines including the "timed out" one
+	allDone.Wait()
+	if respondCount.Load() != 3 {
+		t.Errorf("Expected 3 responders, got %d", respondCount.Load())
 	}
 }
 

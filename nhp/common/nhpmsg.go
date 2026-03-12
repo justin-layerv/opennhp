@@ -166,6 +166,13 @@ type ServerACAckMsg struct {
 	// ServerPubKey is the server's public key (base64) for the direct connection.
 	// This may differ from the shared NLB endpoint key used for initial registration.
 	ServerPubKey string `json:"serverPubKey,omitempty"`
+
+	// Peers lists the AC's assigned servers (typically 3, one per AZ).
+	// When present, the AC should establish direct connections to each peer.
+	// This ensures knock fan-out works: each assigned server can send
+	// NHP-AOP to this AC, opening ipset pinholes across all AZs.
+	// Omitted when the server doesn't have assignment information.
+	Peers []RedirectTarget `json:"peers,omitempty"`
 }
 
 type ResourceInfo struct {

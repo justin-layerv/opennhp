@@ -1,6 +1,10 @@
 package server
 
-import "github.com/OpenNHP/opennhp/nhp/common"
+import (
+	"time"
+
+	"github.com/OpenNHP/opennhp/nhp/common"
+)
 
 const (
 	MaxACConnsPerID                 = 10 // max AC connections per AC ID (blue/green)
@@ -20,6 +24,15 @@ const (
 	DefaultHttpRequestReadTimeoutMs   = 4500 // millisecond
 	DefaultHttpResponseWriteTimeoutMs = 5500 // millisecond
 	DefaultHttpServerIdleTimeoutMs    = 6000 // millisecond
+)
+
+// broadcast
+const (
+	// DefaultBroadcastTimeout caps per-goroutine time in processACOperationBroadcast.
+	// Individual NHP transactions have their own ~4.7s timeout (HttpRequestReadTimeout +
+	// overhead). This 10s ceiling is ~2x that value to allow for network jitter while
+	// still bounding worst-case resource usage.
+	DefaultBroadcastTimeout = 10 * time.Second
 )
 
 // knock

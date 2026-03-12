@@ -45,13 +45,15 @@ const (
 // Metric counter names for CloudWatch. Using constants prevents typos
 // and enables discoverability across the codebase.
 const (
-	MetricKnockRequest        = "KnockRequest"
-	MetricKnockLatency        = "KnockLatency"
-	MetricAuthSuccess         = "AuthSuccess"
-	MetricAuthFailure         = "AuthFailure"
-	MetricAutoAssignment      = "AutoAssignment"
-	MetricKnockForwardSuccess = "KnockForwardSuccess"
-	MetricKnockForwardFailure = "KnockForwardFailure"
+	MetricKnockRequest         = "KnockRequest"
+	MetricKnockLatency         = "KnockLatency"
+	MetricAuthSuccess          = "AuthSuccess"
+	MetricAuthFailure          = "AuthFailure"
+	MetricAutoAssignment       = "AutoAssignment"
+	MetricKnockForwardSuccess  = "KnockForwardSuccess"
+	MetricKnockForwardFailure  = "KnockForwardFailure"
+	MetricBroadcastPartialFail = "BroadcastPartialFail"
+	MetricBroadcastDurationMs  = "BroadcastDurationMs"
 )
 
 // forwardToTransaction finds the remote transaction and forwards the message to it.
@@ -262,14 +264,17 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	// Check if AC should be redirected to its assigned servers (per-AC server assignment).
 	// This only applies when storage is configured and AC provides a license key.
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md section 6.2 for details.
+	var assignedPeers []common.RedirectTarget
 	if s.storage != nil && aolMsg.LicenseKey != "" {
-		redirected, ardErr := s.handleACServerAssignment(ppd, aolMsg, transactionId, addrStr)
+		redirected, peers, ardErr := s.handleACServerAssignment(ppd, aolMsg, transactionId, addrStr)
 		if ardErr != nil {
 			log.Error("server-ac(%s#%d@%s)[HandleACOnline] server assignment lookup error: %v", acId, transactionId, addrStr, ardErr)
 			// Fall through to direct registration on error
 		} else if redirected {
 			// AC was redirected via NHP_ARD to its assigned servers
 			return nil
+		} else {
+			assignedPeers = peers
 		}
 		// This server is assigned to handle this AC, continue with registration
 	}
@@ -409,6 +414,7 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		Registered:   true, // This server is handling the AC
 		ServerAddr:   serverAddr,
 		ServerPubKey: s.device.PublicKeyBase64(),
+		Peers:        assignedPeers, // All assigned servers so AC connects to each one
 	}
 	aakBytes, marshalErr := json.Marshal(aakMsg)
 	if marshalErr != nil {
@@ -421,9 +427,10 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 }
 
 // handleACServerAssignment checks if the AC should be redirected to its assigned servers.
-// Returns (true, nil) if AC was redirected via NHP_ARD.
-// Returns (false, nil) if this server should handle the AC (or AC not found in storage).
-// Returns (false, error) on storage error.
+// Returns (true, nil, nil) if AC was redirected via NHP_ARD.
+// Returns (false, peers, nil) if this server should handle the AC. peers contains
+// all assigned servers so the caller can include them in the NHP_AAK response.
+// Returns (false, nil, error) on storage error.
 //
 // When an AC has no assignment in storage, this function auto-assigns the AC to
 // healthy servers discovered via Cloud Map, writes the assignment to storage,
@@ -433,7 +440,7 @@ func (s *UdpServer) handleACServerAssignment(
 	aolMsg *common.ACOnlineMsg,
 	transactionId uint64,
 	addrStr string,
-) (redirected bool, err error) {
+) (redirected bool, peers []common.RedirectTarget, err error) {
 	acId := aolMsg.ACId
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
 	defer cancel()
@@ -444,16 +451,18 @@ func (s *UdpServer) handleACServerAssignment(
 		if IsNotFoundError(err) {
 			// AC not found in storage — perform auto-assignment
 			log.Info("server-ac(%s#%d@%s)[HandleACOnline] AC not in storage, auto-assigning", acId, transactionId, addrStr)
-			return s.autoAssignAC(ppd, aolMsg, transactionId, addrStr, 0)
+			redirected, autoErr := s.autoAssignAC(ppd, aolMsg, transactionId, addrStr, 0)
+			return redirected, nil, autoErr
 		}
 		log.Error("server-ac(%s#%d@%s)[HandleACOnline] storage error looking up AC assignment: %v", acId, transactionId, addrStr, err)
-		return false, err
+		return false, nil, err
 	}
 
 	// Check TTL expiry (DynamoDB TTL deletion is async — expired items may still exist)
 	if assignment.TTL != nil && *assignment.TTL < time.Now().Unix() {
 		log.Info("server-ac(%s#%d@%s)[HandleACOnline] assignment expired (TTL=%d), re-assigning", acId, transactionId, addrStr, *assignment.TTL)
-		return s.autoAssignAC(ppd, aolMsg, transactionId, addrStr, assignment.Version)
+		redirected, autoErr := s.autoAssignAC(ppd, aolMsg, transactionId, addrStr, assignment.Version)
+		return redirected, nil, autoErr
 	}
 
 	// Filter assignment to only healthy servers (via Cloud Map health discovery).
@@ -464,7 +473,8 @@ func (s *UdpServer) handleACServerAssignment(
 		// All assigned servers are unhealthy — re-assign with fresh servers
 		log.Warning("server-ac(%s#%d@%s)[HandleACOnline] all %d assigned servers unhealthy, re-assigning",
 			acId, transactionId, addrStr, len(assignment.AssignedServers))
-		return s.autoAssignAC(ppd, aolMsg, transactionId, addrStr, assignment.Version)
+		redirected, autoErr := s.autoAssignAC(ppd, aolMsg, transactionId, addrStr, assignment.Version)
+		return redirected, nil, autoErr
 	}
 
 	// Determine this server's identity
@@ -478,10 +488,20 @@ func (s *UdpServer) handleACServerAssignment(
 	}
 
 	if isAssigned {
-		// This server is assigned — refresh TTL and accept directly
+		// This server is assigned — refresh TTL and accept directly.
+		// Return the full list of assigned servers (including this one) so the
+		// caller can include them in the NHP_AAK response. The AC will connect
+		// to all of its assigned servers (typically 3, one per AZ). Without this,
+		// only the first AC (which triggers auto-assignment and receives NHP_ARD)
+		// connects to all its assigned servers; subsequent ACs only connect
+		// to the one server the NLB routed them to, breaking knock fan-out.
+		// Note: the responding server is included in the list. HandleRedispatch
+		// will attempt to connect to it at its direct IP (not the NLB VIP), which
+		// is harmless — the old NLB peer is removed after the new connections succeed.
 		s.refreshAssignmentTTL(acId)
-		log.Info("server-ac(%s#%d@%s)[HandleACOnline] this server (%s) is assigned to AC", acId, transactionId, addrStr, serverID)
-		return false, nil
+		log.Info("server-ac(%s#%d@%s)[HandleACOnline] this server (%s) is assigned to AC, returning %d peers",
+			acId, transactionId, addrStr, serverID, len(healthyServers))
+		return false, serverInfosToRedirectTargets(healthyServers), nil
 	}
 
 	// This server is NOT in the assignment but the AC connected here.
@@ -501,7 +521,7 @@ func (s *UdpServer) handleACServerAssignment(
 	}
 
 	// Accept the AC locally since we added ourselves to the assignment
-	return false, nil
+	return false, nil, nil
 }
 
 // autoAssignAC discovers healthy servers, picks up to 3 across AZs, writes the
@@ -717,19 +737,8 @@ func (s *UdpServer) sendARD(
 	addrStr string,
 	servers []ServerInfo,
 ) error {
-	targets := make([]common.RedirectTarget, len(servers))
-	for i, srv := range servers {
-		targets[i] = common.RedirectTarget{
-			IP:           srv.InternalIP, // Use VPC private IP for direct connectivity
-			Port:         srv.Port,
-			PubKeyBase64: srv.PubKey,
-			AZ:           srv.AZ,
-			ServerID:     srv.ID,
-		}
-	}
-
 	ardMsg := &common.ACRedispatchMsg{
-		Targets: targets,
+		Targets: serverInfosToRedirectTargets(servers),
 		ErrCode: common.ErrSuccess.ErrorCode(),
 	}
 	ardBytes, marshalErr := json.Marshal(ardMsg)

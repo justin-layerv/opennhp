@@ -142,14 +142,26 @@ func (s *AssignedServer) IncrementFailCount() int {
 	return s.FailCount
 }
 
-// Pre-allocated dimension name strings to avoid per-call heap allocations.
+// Pre-allocated dimension name/value strings to avoid per-call heap allocations.
 var (
 	dimNameACId             = aws.String("ACId")
 	dimNameErrorCode        = aws.String("ErrorCode")
 	dimNameRegistrationType = aws.String("RegistrationType")
 	dimNameConnectionType   = aws.String("ConnectionType")
 	dimNameReason           = aws.String("Reason")
+
+	dimValDirect         = aws.String("Direct")
+	dimValRedispatch     = aws.String("Redispatch")
+	dimValPeerRedispatch = aws.String("PeerRedispatch")
 )
+
+// recordRegistrationSuccess emits a MetricRegistrationSuccess counter with the
+// given registration type dimension (dimValDirect, dimValRedispatch, or dimValPeerRedispatch).
+func (r *ACRegistration) recordRegistrationSuccess(regType *string) {
+	r.metrics.IncrCounterWithDims(MetricRegistrationSuccess, []types.Dimension{
+		{Name: dimNameRegistrationType, Value: regType},
+	})
+}
 
 // ACRegistration manages AC registration with NHP servers.
 type ACRegistration struct {
@@ -525,9 +537,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 		log.Info("Successfully connected to assigned servers")
 
 		// Send registration success metric
-		r.metrics.IncrCounterWithDims(MetricRegistrationSuccess, []types.Dimension{
-			{Name: dimNameRegistrationType, Value: aws.String("Redispatch")},
-		})
+		r.recordRegistrationSuccess(dimValRedispatch)
 
 		return nil
 
@@ -654,9 +664,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 			log.Info("Received NHP_AAK: ACAddr=%s, Registered=%v (peer kept but no keepalive)", aakMsg.ACAddr, aakMsg.Registered)
 
 			// Send registration success metric
-			r.metrics.IncrCounterWithDims(MetricRegistrationSuccess, []types.Dimension{
-				{Name: dimNameRegistrationType, Value: aws.String("Direct")},
-			})
+			r.recordRegistrationSuccess(dimValDirect)
 
 			return nil
 		}
@@ -665,6 +673,34 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 		if !ok {
 			r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
 			return fmt.Errorf("unexpected address type %T for server peer", sendAddr)
+		}
+
+		// If the server included a full peer list (all assigned servers), use it
+		// to connect to every server. This ensures every AC reaches all servers
+		// so knock fan-out can open ipset pinholes across all AZs.
+		if len(aakMsg.Peers) > 0 {
+			log.Info("Received NHP_AAK with %d peers, connecting to all assigned servers", len(aakMsg.Peers))
+
+			ardMsg := &common.ACRedispatchMsg{
+				Targets: aakMsg.Peers,
+				ErrCode: common.ErrSuccess.ErrorCode(),
+			}
+			if err := r.HandleRedispatch(ardMsg); err != nil {
+				// HandleRedispatch only errors when zero connections succeeded.
+				// The AC still has its NLB registration peer, so it remains
+				// operational — log a warning and continue rather than failing
+				// the entire registration.
+				log.Warning("Failed to connect to assigned peers (%v), keeping NLB peer", err)
+				r.recordRegistrationSuccess(dimValDirect)
+				return nil
+			}
+
+			// Remove the NLB registration peer only after HandleRedispatch
+			// succeeds — otherwise a failure would leave the AC with no connections.
+			r.ac.device.RemovePeer(registrationPeer.PublicKeyBase64())
+
+			r.recordRegistrationSuccess(dimValPeerRedispatch)
+			return nil
 		}
 
 		r.mu.Lock()
@@ -697,9 +733,7 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 		}
 
 		// Send registration success metric
-		r.metrics.IncrCounterWithDims(MetricRegistrationSuccess, []types.Dimension{
-			{Name: dimNameRegistrationType, Value: aws.String("Direct")},
-		})
+		r.recordRegistrationSuccess(dimValDirect)
 
 		return nil
 
@@ -812,7 +846,7 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 
 	// Send server connections metric
 	r.metrics.AddCounterWithDims(MetricServerConnections, float64(successCount), []types.Dimension{
-		{Name: dimNameConnectionType, Value: aws.String("Redispatch")},
+		{Name: dimNameConnectionType, Value: dimValRedispatch},
 	})
 
 	return nil

@@ -1480,12 +1480,15 @@ func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.Agent
 	return artMsg, nil
 }
 
-// processACOperationBroadcast sends NHP-AOP to all AC connections in parallel.
-// Returns the first successful result. If all fail, returns the last error.
-// This supports blue/green deployments where multiple ACs register with the same AC ID.
+// processACOperationBroadcast sends NHP-AOP to ALL AC connections in parallel.
+// Each AC in a different AZ must receive the knock so its ipset pinhole is
+// opened for the client IP — the AC NLB round-robins the client's subsequent
+// HTTPS request, so every AC needs the entry.
 //
-// When the first AC responds successfully, remaining goroutines are canceled
-// via context cancellation to avoid unnecessary work.
+// Returns the first successful result immediately to minimize client-facing
+// latency. Unlike the pre-fix version, remaining goroutines are NOT canceled
+// — they continue in the background so all ACs still get the pinhole.
+// A background goroutine drains and logs the remaining results.
 func (s *UdpServer) processACOperationBroadcast(
 	knkMsg *common.AgentKnockMsg,
 	conns []*ACConn,
@@ -1494,44 +1497,92 @@ func (s *UdpServer) processACOperationBroadcast(
 	openTime uint32,
 ) (*common.ACOpsResultMsg, error) {
 	if len(conns) == 1 {
-		return s.processACOperation(context.Background(), knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), DefaultBroadcastTimeout)
+		defer cancel()
+		artMsg, err := s.processACOperation(ctx, knkMsg, conns[0], srcAddr, dstAddrs, openTime)
+		s.metrics.RecordLatency(MetricBroadcastDurationMs, float64(time.Since(start).Milliseconds()))
+		return artMsg, err
 	}
 
-	log.Info("server-agent(%s@%s)[processACOperationBroadcast] broadcasting to %d ACs", knkMsg.UserId, srcAddr.String(), len(conns))
+	userId := knkMsg.UserId
+	addrStr := srcAddr.String()
+	total := len(conns)
+	broadcastStart := time.Now()
+	log.Info("server-agent(%s@%s)[processACOperationBroadcast] broadcasting to %d ACs", userId, addrStr, total)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	type result struct {
+	// Each goroutine gets its own timeout context — NOT a shared cancellable
+	// context. When we return on first success, remaining goroutines must keep
+	// running so all ACs get the pinhole. The per-goroutine timeout ensures
+	// they don't leak if an AC is unreachable.
+	type broadcastResult struct {
 		artMsg *common.ACOpsResultMsg
 		err    error
 		acAddr string
 	}
-	results := make(chan result, len(conns))
+	results := make(chan broadcastResult, total)
 	for _, conn := range conns {
 		go func(c *ACConn) {
+			ctx, cancel := context.WithTimeout(context.Background(), DefaultBroadcastTimeout)
+			defer cancel()
 			artMsg, err := s.processACOperation(ctx, knkMsg, c, srcAddr, dstAddrs, openTime)
-			results <- result{artMsg, err, c.ACPeer.RecvAddr().String()}
+			results <- broadcastResult{artMsg, err, c.ACPeer.RecvAddr().String()}
 		}(conn)
 	}
 
+	// Wait for results. Return on first success to unblock the client, but
+	// let remaining goroutines finish in the background (fire-and-forget AOP).
+	// If all fail, return the last error.
 	var lastErr error
 	var lastArtMsg *common.ACOpsResultMsg
-	for i := 0; i < len(conns); i++ {
+	var failCount int
+	for i := 0; i < total; i++ {
 		r := <-results
 		if r.err == nil {
-			log.Info("server-agent(%s@%s)[processACOperationBroadcast] AC at %s succeeded, canceling remaining", knkMsg.UserId, srcAddr.String(), r.acAddr)
-			cancel() // signal remaining goroutines to abort
-			// Remaining goroutines will drain their response channels
-			// asynchronously via the background goroutines spawned in
-			// processACOperation's ctx.Done() path, then exit cleanly.
-			// The buffered results channel ensures their sends don't block.
+			log.Info("server-agent(%s@%s)[processACOperationBroadcast] AC at %s succeeded (1/%d), returning to caller",
+				userId, addrStr, r.acAddr, total)
+			// Drain remaining results in background — single summary log, emit metrics
+			remaining := total - i - 1
+			if remaining > 0 {
+				go func() {
+					var bgSuccess, bgFail int
+					var failedAddrs []string
+					for j := 0; j < remaining; j++ {
+						bgr := <-results
+						if bgr.err == nil {
+							bgSuccess++
+						} else {
+							bgFail++
+							failedAddrs = append(failedAddrs, bgr.acAddr)
+						}
+					}
+					elapsed := time.Since(broadcastStart)
+					s.metrics.RecordLatency(MetricBroadcastDurationMs, float64(elapsed.Milliseconds()))
+					if bgFail > 0 {
+						s.metrics.IncrCounter(MetricBroadcastPartialFail)
+						log.Warning("server-agent(%s@%s)[processACOperationBroadcast] broadcast done in %v: %d/%d ACs succeeded, failed: %v",
+							userId, addrStr, elapsed, bgSuccess+1, total, failedAddrs)
+					} else {
+						log.Info("server-agent(%s@%s)[processACOperationBroadcast] broadcast done in %v: %d/%d ACs succeeded",
+							userId, addrStr, elapsed, bgSuccess+1, total)
+					}
+				}()
+			} else {
+				elapsed := time.Since(broadcastStart)
+				s.metrics.RecordLatency(MetricBroadcastDurationMs, float64(elapsed.Milliseconds()))
+			}
 			return r.artMsg, nil
 		}
+		failCount++
+		log.Warning("server-agent(%s@%s)[processACOperationBroadcast] AC at %s failed: %v (%d/%d)",
+			userId, addrStr, r.acAddr, r.err, failCount, total)
 		lastErr = r.err
 		lastArtMsg = r.artMsg
 	}
-	log.Warning("server-agent(%s@%s)[processACOperationBroadcast] all %d ACs failed", knkMsg.UserId, srcAddr.String(), len(conns))
+
+	elapsed := time.Since(broadcastStart)
+	s.metrics.RecordLatency(MetricBroadcastDurationMs, float64(elapsed.Milliseconds()))
+	log.Warning("server-agent(%s@%s)[processACOperationBroadcast] all %d ACs failed in %v", userId, addrStr, total, elapsed)
 	return lastArtMsg, lastErr
 }
 
