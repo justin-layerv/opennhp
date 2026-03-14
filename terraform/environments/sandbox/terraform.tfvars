@@ -293,6 +293,10 @@ grafana_cloud_external_id    = null
 # Don't create dashboards from sandbox (prod owns them)
 grafana_create_dashboards = false
 
+# QURL Redis rate limiting
+# ElastiCache Serverless Redis for distributed rate limiting across ECS tasks.
+deploy_redis = true
+
 # Cost analytics: sandbox deploys the shared backend (S3, Glue, Athena) in mgmt account
 deploy_cost_analytics = true
 
