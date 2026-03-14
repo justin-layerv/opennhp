@@ -1042,15 +1042,15 @@ echo "QURL router configuration added"
 # for any domain that presents a matching TLS cert.
 cat >> /home/ubuntu/traefik/dynamic.toml << 'CUSTOMDOMAINEOF'
 
-# Catch-all router for custom domains — lowest priority so it only matches
-# domains not handled by higher-priority routes (qurl.site, etc.).
+# Catch-all router for custom domains — low priority (above nhp-ac at 1) so
+# custom domains hit qurl-router before falling through to nhp-acd.
 # Domains without a matching TLS cert get Traefik's default self-signed cert,
 # causing a browser certificate mismatch warning (ERR_CERT_COMMON_NAME_INVALID).
 [http.routers.custom-domain-catchall]
   rule = "HostRegexp(`^.+$`)"
   service = "qurl-backend"
   entryPoints = ["https"]
-  priority = 1
+  priority = 2
   middlewares = ["qurl-router"]
   [http.routers.custom-domain-catchall.tls]
 CUSTOMDOMAINEOF
