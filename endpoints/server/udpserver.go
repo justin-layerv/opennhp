@@ -150,6 +150,12 @@ type UdpServer struct {
 
 	// CloudWatch metrics publisher for NHP operational metrics.
 	metrics *metrics.Publisher
+
+	// Per-source-IP rate limiter for UDP knock packets.
+	// Drops packets that exceed the configured rate to mitigate DoS attacks
+	// before any cryptographic processing occurs.
+	rateLimiter    *IPRateLimiter
+	rateLimitDrops atomic.Int64 // total dropped packets, for sampled logging
 }
 
 type BlockAddr struct {
@@ -271,6 +277,14 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		Namespace:  "LayerV/NHP",
 		Dimensions: buildServerMetricDimensions(),
 	})
+
+	// Initialize per-source-IP rate limiter for UDP knock packets.
+	// Defense-in-depth alongside iptables rate limiting (see user_data.sh.tpl).
+	// Drops packets before cryptographic processing to reduce CPU cost of DoS.
+	rlCfg := DefaultRateLimiterConfig()
+	s.rateLimiter = NewIPRateLimiter(rlCfg)
+	log.Info("UDP rate limiter initialized: %.0f pps sustained, %d burst per source IP",
+		rlCfg.Rate, rlCfg.Burst)
 
 	// Initialize server-to-server forwarder
 	s.forwarder = NewServerForwarder(s)
@@ -452,6 +466,10 @@ func (s *UdpServer) Stop() {
 	// Flush remaining CloudWatch metrics
 	if s.metrics != nil {
 		s.metrics.Stop()
+	}
+	// Stop UDP rate limiter cleanup goroutine
+	if s.rateLimiter != nil {
+		s.rateLimiter.Stop()
 	}
 	close(s.signals.stop)
 	_ = s.listenConn.Close()
@@ -868,6 +886,20 @@ func (s *UdpServer) recvPacketRoutine() {
 		if s.IsBlockAddr(remoteAddr) {
 			s.device.ReleasePoolPacket(pkt)
 			log.Critical("Remote address %s is being blocked at the moment, discard.", addrStr)
+			continue
+		}
+
+		// Per-source-IP rate limiting: drop packets exceeding the configured
+		// rate before any cryptographic processing (HMAC, ECDH). This is the
+		// application-level defense-in-depth layer; iptables provides the
+		// kernel-level first line of defense.
+		if s.rateLimiter != nil && !s.rateLimiter.Allow(remoteAddr) {
+			s.device.ReleasePoolPacket(pkt)
+			drops := s.rateLimitDrops.Add(1)
+			// Log first drop and then every 1000th to avoid log flooding during attacks
+			if drops == 1 || drops%1000 == 0 {
+				log.Warning("[Server] rate limited UDP packet from %s (total drops: %d)", addrStr, drops)
+			}
 			continue
 		}
 

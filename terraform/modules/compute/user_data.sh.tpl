@@ -769,6 +769,45 @@ ExecStop=/usr/bin/docker stop nhp-server
 WantedBy=multi-user.target
 SVCEOF
 
+# ============================================================================
+# iptables Rate Limiting for NHP Knock Port (UDP 62206)
+#
+# Kernel-level rate limiting to mitigate UDP flood DoS attacks before packets
+# reach the application. This is the first line of defense; the Go server
+# has additional per-source-IP application-level rate limiting as defense-in-depth.
+#
+# Limits:
+# - 100 packets/sec sustained with burst of 50 (per source IP via hashlimit)
+# - Packets exceeding the limit are silently dropped (UDP convention)
+# IMPORTANT: These values must match DefaultRateLimiterConfig() in
+# endpoints/server/ratelimiter.go. Change both together.
+# ============================================================================
+echo "Configuring iptables rate limiting for UDP port 62206..."
+
+# Install iptables if not already present (usually pre-installed on Ubuntu)
+which iptables > /dev/null 2>&1 || apt_get_with_retry install -y iptables
+
+# Rate limit UDP knock packets per source IP using hashlimit module.
+# hashlimit tracks each source IP independently, preventing one abusive IP
+# from exhausting the rate limit for legitimate clients.
+# --hashlimit-upto: sustained rate (packets per second)
+# --hashlimit-burst: initial burst allowance
+# --hashlimit-mode srcip: track by source IP
+# --hashlimit-htable-expire: cleanup idle entries after 120s
+iptables -A INPUT -p udp --dport 62206 \
+  -m hashlimit \
+  --hashlimit-upto 100/sec \
+  --hashlimit-burst 50 \
+  --hashlimit-mode srcip \
+  --hashlimit-name nhp_knock \
+  --hashlimit-htable-expire 120000 \
+  -j ACCEPT
+
+# Drop UDP packets to port 62206 that exceed the rate limit
+iptables -A INPUT -p udp --dport 62206 -j DROP
+
+echo "iptables rate limiting configured: 100 pps sustained, burst 50 per source IP"
+
 systemctl daemon-reload
 systemctl enable nhp-cloudmap-register nhp-health-monitor nhp-server
 systemctl start nhp-cloudmap-register
