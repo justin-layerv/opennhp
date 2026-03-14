@@ -1465,3 +1465,9 @@ variable "billing_api_throttle_rate_limit" {
   type        = number
   default     = 25
 }
+
+variable "deploy_redis" {
+  description = "Deploy ElastiCache Serverless Redis for distributed QURL rate limiting"
+  type        = bool
+  default     = false
+}
