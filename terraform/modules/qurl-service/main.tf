@@ -153,11 +153,14 @@ locals {
     { name = "QURL_DEFAULT_LIST_LIMIT", value = tostring(var.qurl_default_list_limit) },
     ],
     # Redis configuration (for distributed rate limiting)
-    var.redis_enabled ? [
+    var.redis_enabled ? concat([
       { name = "REDIS_ENABLED", value = "true" },
       { name = "REDIS_ENDPOINT", value = var.redis_endpoint },
       { name = "REDIS_TLS_ENABLED", value = "true" },
-    ] : [],
+      ],
+      var.redis_pool_size > 0 ? [{ name = "REDIS_POOL_SIZE", value = tostring(var.redis_pool_size) }] : [],
+      var.redis_min_idle_conns > 0 ? [{ name = "REDIS_MIN_IDLE_CONNS", value = tostring(var.redis_min_idle_conns) }] : [],
+    ) : [],
     # Usage events (billing metered usage reporting via SQS)
     var.usage_events_enabled ? [
       { name = "USAGE_EVENTS_ENABLED", value = "true" },

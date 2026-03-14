@@ -299,6 +299,28 @@ variable "redis_security_group_id" {
   default     = null
 }
 
+variable "redis_pool_size" {
+  description = "Max connections in the Redis pool (0 = use application default)"
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.redis_pool_size >= 0
+    error_message = "redis_pool_size must be >= 0"
+  }
+}
+
+variable "redis_min_idle_conns" {
+  description = "Min idle connections kept open in the Redis pool (0 = use application default)"
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.redis_min_idle_conns >= 0
+    error_message = "redis_min_idle_conns must be >= 0"
+  }
+}
+
 # ==================== Idempotency ====================
 
 variable "idempotency_table_arn" {
