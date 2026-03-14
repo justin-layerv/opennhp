@@ -61,6 +61,10 @@ type UdpAC struct {
 	// Multi-server connection management
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md section 6.2
 	registration *ACRegistration
+
+	// dnsRateLimiter prevents reconnection storms when DNS flaps rapidly.
+	// See dns_rate_limiter.go for details.
+	dnsRateLimiter *DNSChangeRateLimiter
 }
 
 type UdpConn struct {
@@ -138,6 +142,7 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	a.remoteConnectionMap = make(map[string]*UdpConn)
 	a.serverPeerMap = make(map[string]*core.UdpPeer)
 	a.tokenStore = common.NewTokenStore[*AccessEntry]()
+	a.dnsRateLimiter = NewDNSChangeRateLimiter()
 
 	// Load http config and turn on http server if needed
 	if err := a.loadHttpConfig(); err != nil {
@@ -203,6 +208,9 @@ func (ac *UdpAC) Stop() {
 	}
 	ac.device.Stop()
 	ac.StopConfigWatch()
+	if ac.dnsRateLimiter != nil {
+		ac.dnsRateLimiter.ResetAll()
+	}
 	ac.wg.Wait()
 	close(ac.sendMsgCh)
 	close(ac.signals.serverMapUpdated)
@@ -686,27 +694,33 @@ func (a *UdpAC) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sync.W
 		}
 		addrStr := sendAddr.String()
 
-		// If address changed, close old connection and reset fail count
+		// If address changed, close old connection and reset fail count.
+		// Rate-limit rapid DNS changes to prevent reconnection storms during DNS flapping.
 		if lastAddrStr != "" && lastAddrStr != addrStr {
-			log.Info("ac(%s)[ServerDiscovery] Server DNS changed: %s -> %s (hostname: %s). Resetting connection state.",
-				acId, lastAddrStr, addrStr, server.Hostname)
-			var oldConn *UdpConn
-			a.remoteConnectionMutex.Lock()
-			if conn, found := a.remoteConnectionMap[lastAddrStr]; found {
-				oldConn = conn
-				delete(a.remoteConnectionMap, lastAddrStr)
-				log.Debug("ac(%s)[ServerDiscovery] Removed old connection entry for %s", acId, lastAddrStr)
+			if a.dnsRateLimiter != nil && !a.dnsRateLimiter.ShouldProcess(server.Hostname, lastAddrStr, addrStr) {
+				// DNS change suppressed — keep using the current address
+				addrStr = lastAddrStr
+			} else {
+				log.Info("ac(%s)[ServerDiscovery] Server DNS changed: %s -> %s (hostname: %s). Resetting connection state.",
+					acId, lastAddrStr, addrStr, server.Hostname)
+				var oldConn *UdpConn
+				a.remoteConnectionMutex.Lock()
+				if conn, found := a.remoteConnectionMap[lastAddrStr]; found {
+					oldConn = conn
+					delete(a.remoteConnectionMap, lastAddrStr)
+					log.Debug("ac(%s)[ServerDiscovery] Removed old connection entry for %s", acId, lastAddrStr)
+				}
+				a.remoteConnectionMutex.Unlock()
+				// Close outside lock to avoid blocking other operations, but synchronously
+				// to ensure cleanup completes before we proceed
+				if oldConn != nil {
+					oldConn.Close()
+					log.Info("ac(%s)[ServerDiscovery] Closed old connection to %s, will establish new connection to %s",
+						acId, lastAddrStr, addrStr)
+				}
+				failCount = 0
+				atomic.StoreInt32(serverFailCount, 0)
 			}
-			a.remoteConnectionMutex.Unlock()
-			// Close outside lock to avoid blocking other operations, but synchronously
-			// to ensure cleanup completes before we proceed
-			if oldConn != nil {
-				oldConn.Close()
-				log.Info("ac(%s)[ServerDiscovery] Closed old connection to %s, will establish new connection to %s",
-					acId, lastAddrStr, addrStr)
-			}
-			failCount = 0
-			atomic.StoreInt32(serverFailCount, 0)
 		}
 		lastAddrStr = addrStr
 		var lastSendTime int64
