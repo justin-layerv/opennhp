@@ -247,6 +247,9 @@ type StorageConfig struct {
 	// Used to filter stale AC assignments pointing to terminated servers.
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md for details.
 	CloudMap CloudMapConfig `toml:"CloudMap"`
+
+	// RateLimit configuration for license validation brute-force prevention.
+	RateLimit RateLimitConfig `toml:"RateLimit"`
 }
 
 // DynamoDBConfig configures the DynamoDB storage backend.

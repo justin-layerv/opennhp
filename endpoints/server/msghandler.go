@@ -45,15 +45,16 @@ const (
 // Metric counter names for CloudWatch. Using constants prevents typos
 // and enables discoverability across the codebase.
 const (
-	MetricKnockRequest         = "KnockRequest"
-	MetricKnockLatency         = "KnockLatency"
-	MetricAuthSuccess          = "AuthSuccess"
-	MetricAuthFailure          = "AuthFailure"
-	MetricAutoAssignment       = "AutoAssignment"
-	MetricKnockForwardSuccess  = "KnockForwardSuccess"
-	MetricKnockForwardFailure  = "KnockForwardFailure"
-	MetricBroadcastPartialFail = "BroadcastPartialFail"
-	MetricBroadcastDurationMs  = "BroadcastDurationMs"
+	MetricKnockRequest                 = "KnockRequest"
+	MetricKnockLatency                 = "KnockLatency"
+	MetricAuthSuccess                  = "AuthSuccess"
+	MetricAuthFailure                  = "AuthFailure"
+	MetricAutoAssignment               = "AutoAssignment"
+	MetricKnockForwardSuccess          = "KnockForwardSuccess"
+	MetricKnockForwardFailure          = "KnockForwardFailure"
+	MetricBroadcastPartialFail         = "BroadcastPartialFail"
+	MetricBroadcastDurationMs          = "BroadcastDurationMs"
+	MetricLicenseValidationRateLimited = "LicenseValidationRateLimited"
 )
 
 // forwardToTransaction finds the remote transaction and forwards the message to it.
@@ -850,6 +851,20 @@ func (s *UdpServer) validateACLicense(
 		return common.ErrServerACOpsFailed
 	}
 
+	// RATE LIMITING: Check if this source IP or AC ID has exceeded the failure threshold.
+	// This runs BEFORE the expensive bcrypt operation to save resources under attack.
+	// Rate-limited requests still return the generic error to avoid leaking information.
+	if s.licenseRateLimiter != nil {
+		if rlErr := s.licenseRateLimiter.CheckRateLimit(addrStr, acId); rlErr != nil {
+			log.Warning("server-ac(%s#%d@%s)[validateACLicense] %s",
+				acId, transactionId, addrStr, rlErr.Message)
+			if s.metrics != nil {
+				s.metrics.IncrCounter(MetricLicenseValidationRateLimited)
+			}
+			return common.ErrServerACOpsFailed
+		}
+	}
+
 	// Compute key prefix for log correlation (first 8 hex chars of SHA256)
 	// This helps operators debug without exposing full license keys
 	keyPrefix := licenseKeyPrefix(aolMsg.LicenseKey)
@@ -882,6 +897,7 @@ func (s *UdpServer) validateACLicense(
 			log.Error("server-ac(%s#%d@%s)[validateACLicense] storage error (key=%s...): %v",
 				acId, transactionId, addrStr, keyPrefix, err)
 		}
+		s.recordLicenseFailure(addrStr, acId)
 		return common.ErrServerACOpsFailed
 	}
 
@@ -889,6 +905,7 @@ func (s *UdpServer) validateACLicense(
 	if license.LicenseKeyHash == "" {
 		log.Error("server-ac(%s#%d@%s)[validateACLicense] license record has no key hash (key=%s..., misconfiguration)",
 			acId, transactionId, addrStr, keyPrefix)
+		s.recordLicenseFailure(addrStr, acId)
 		return common.ErrServerACOpsFailed
 	}
 
@@ -896,6 +913,7 @@ func (s *UdpServer) validateACLicense(
 	if !license.Active {
 		log.Warning("server-ac(%s#%d@%s)[validateACLicense] license inactive (key=%s...)",
 			acId, transactionId, addrStr, keyPrefix)
+		s.recordLicenseFailure(addrStr, acId)
 		return common.ErrServerACOpsFailed
 	}
 
@@ -903,6 +921,7 @@ func (s *UdpServer) validateACLicense(
 	if license.ExpiresAt > 0 && time.Now().Unix() > license.ExpiresAt {
 		log.Warning("server-ac(%s#%d@%s)[validateACLicense] license expired (key=%s..., at %d)",
 			acId, transactionId, addrStr, keyPrefix, license.ExpiresAt)
+		s.recordLicenseFailure(addrStr, acId)
 		return common.ErrServerACOpsFailed
 	}
 
@@ -910,12 +929,20 @@ func (s *UdpServer) validateACLicense(
 	if bcryptErr != nil {
 		log.Warning("server-ac(%s#%d@%s)[validateACLicense] license key mismatch (key=%s...)",
 			acId, transactionId, addrStr, keyPrefix)
+		s.recordLicenseFailure(addrStr, acId)
 		return common.ErrServerACOpsFailed
 	}
 
 	log.Info("server-ac(%s#%d@%s)[validateACLicense] license validated (key=%s...), tier=%s, customer=%s",
 		acId, transactionId, addrStr, keyPrefix, license.Tier, license.CustomerID)
 	return nil
+}
+
+// recordLicenseFailure records a failed license validation attempt for rate limiting.
+func (s *UdpServer) recordLicenseFailure(addrStr, acId string) {
+	if s.licenseRateLimiter != nil {
+		s.licenseRateLimiter.RecordFailure(addrStr, acId)
+	}
 }
 
 func (s *UdpServer) HandleDBOnline(ppd *core.PacketParserData) (err error) {

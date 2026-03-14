@@ -938,6 +938,12 @@ func (s *UdpServer) loadStorageConfig() (*StorageConfig, error) {
 		cfg.Cache.ReassignmentWindow = 300
 	}
 
+	// Apply rate limit defaults if the [RateLimit] section was not configured at all
+	if cfg.RateLimit.MaxFailuresPerIP == 0 && cfg.RateLimit.MaxFailuresPerACID == 0 &&
+		cfg.RateLimit.WindowSeconds == 0 {
+		cfg.RateLimit = DefaultRateLimitConfig()
+	}
+
 	log.Info("Loaded storage configuration: backend=%s", cfg.Backend)
 	return &cfg, nil
 }

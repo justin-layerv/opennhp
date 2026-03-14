@@ -156,6 +156,9 @@ type UdpServer struct {
 	// before any cryptographic processing occurs.
 	rateLimiter    *IPRateLimiter
 	rateLimitDrops atomic.Int64 // total dropped packets, for sampled logging
+
+	// Rate limiter for license validation (brute-force prevention).
+	licenseRateLimiter *LicenseRateLimiter
 }
 
 type BlockAddr struct {
@@ -252,6 +255,16 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		} else {
 			log.Info("Storage backend initialized: %s", s.storage.Name())
 		}
+	}
+
+	// Initialize license rate limiter for brute-force prevention.
+	// Defaults are applied in loadStorageConfig() if not configured.
+	if s.storageConfig != nil {
+		rlConfig := s.storageConfig.RateLimit
+		s.licenseRateLimiter = NewLicenseRateLimiter(rlConfig)
+		log.Info("License rate limiter initialized (enabled=%t, ip_limit=%d/%ds, ac_limit=%d/%ds)",
+			rlConfig.Enabled, rlConfig.MaxFailuresPerIP, rlConfig.WindowSeconds,
+			rlConfig.MaxFailuresPerACID, rlConfig.WindowSeconds)
 	}
 
 	// Initialize Cloud Map client for server health discovery (if configured).
@@ -462,6 +475,10 @@ func (s *UdpServer) Stop() {
 	// Stop forwarder cleanup routine
 	if s.forwarder != nil {
 		s.forwarder.Stop()
+	}
+	// Stop license rate limiter cleanup goroutine
+	if s.licenseRateLimiter != nil {
+		s.licenseRateLimiter.Stop()
 	}
 	// Flush remaining CloudWatch metrics
 	if s.metrics != nil {
