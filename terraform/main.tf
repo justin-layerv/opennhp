@@ -1369,6 +1369,59 @@ module "grafana_dashboards" {
   tags = local.common_tags
 }
 
+# ==================== Login Portal ====================
+# Hosts the login portal for Auth0 sign-in and access code redemption.
+# S3+CloudFront static site with OAC.
+
+module "login_portal" {
+  count  = var.deploy_login_portal ? 1 : 0
+  source = "./modules/login-portal"
+
+  domain_name         = var.login_portal_domain
+  bucket_name         = "${local.name_prefix}-login-portal"
+  acm_certificate_arn = var.login_portal_acm_certificate_arn
+  qurl_api_url        = "https://${var.qurl_service_domain}"
+  auth0_domain        = var.auth0_custom_domain
+  auth0_client_id     = var.login_portal_auth0_client_id
+  auth0_audience      = var.qurl_auth0_audience
+  auth0_redirect_uri  = var.login_portal_auth0_redirect_uri
+
+  tags = merge(local.common_tags, { Service = "qurl" })
+}
+
+# Route53 alias records for login portal
+resource "aws_route53_record" "login_portal" {
+  count    = var.deploy_login_portal ? 1 : 0
+  provider = aws.route53_mgmt
+
+  allow_overwrite = true
+  zone_id         = var.login_portal_hosted_zone_id
+  name            = var.login_portal_domain
+  type            = "A"
+
+  alias {
+    name                   = module.login_portal[0].cloudfront_domain_name
+    zone_id                = module.login_portal[0].cloudfront_hosted_zone_id
+    evaluate_target_health = false
+  }
+}
+
+resource "aws_route53_record" "login_portal_ipv6" {
+  count    = var.deploy_login_portal ? 1 : 0
+  provider = aws.route53_mgmt
+
+  allow_overwrite = true
+  zone_id         = var.login_portal_hosted_zone_id
+  name            = var.login_portal_domain
+  type            = "AAAA"
+
+  alias {
+    name                   = module.login_portal[0].cloudfront_domain_name
+    zone_id                = module.login_portal[0].cloudfront_hosted_zone_id
+    evaluate_target_health = false
+  }
+}
+
 # ==================== QURL Link Redirect Page ====================
 # Hosts the redirect page that extracts access tokens and sends users
 # to the NHP Server QURL plugin for authentication.

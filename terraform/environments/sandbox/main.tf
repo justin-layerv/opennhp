@@ -100,6 +100,15 @@ module "nhp" {
   qurl_link_enable_access_logs = var.qurl_link_enable_access_logs
   enable_resolve_cloudfront    = var.enable_resolve_cloudfront
 
+  # Login Portal
+  deploy_login_portal              = var.deploy_login_portal
+  login_portal_domain              = var.login_portal_domain
+  login_portal_hosted_zone_id      = var.login_portal_hosted_zone_id
+  login_portal_acm_certificate_arn = var.login_portal_acm_certificate_arn
+  login_portal_auth0_client_id     = var.login_portal_auth0_client_id
+  login_portal_auth0_redirect_uri  = var.login_portal_auth0_redirect_uri
+  auth0_custom_domain              = var.auth0_custom_domain
+
   # QURL Router plugin (Traefik)
   qurl_router_enabled            = var.qurl_router_enabled
   qurl_router_cache_ttl          = var.qurl_router_cache_ttl

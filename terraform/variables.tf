@@ -1504,6 +1504,67 @@ variable "billing_api_throttle_rate_limit" {
   default     = 25
 }
 
+# ==================== Auth0 Custom Domain ====================
+
+variable "auth0_custom_domain" {
+  description = "Auth0 custom domain for SPA login (e.g., auth.layerv.ai)"
+  type        = string
+  default     = ""
+}
+
+# ==================== Login Portal ====================
+
+variable "deploy_login_portal" {
+  description = "Whether to deploy the login portal static site"
+  type        = bool
+  default     = false
+}
+
+variable "login_portal_domain" {
+  description = "Domain name for the login portal (e.g., login.layerv.xyz)"
+  type        = string
+  default     = ""
+}
+
+variable "login_portal_hosted_zone_id" {
+  description = "Route53 hosted zone ID for the login portal domain"
+  type        = string
+  default     = ""
+}
+
+variable "login_portal_acm_certificate_arn" {
+  description = "ACM certificate ARN for the login portal (must be in us-east-1)"
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.deploy_login_portal || var.login_portal_acm_certificate_arn != ""
+    error_message = "login_portal_acm_certificate_arn is required when deploy_login_portal is true."
+  }
+}
+
+variable "login_portal_auth0_client_id" {
+  description = "Auth0 SPA client ID for login portal sign-in"
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.deploy_login_portal || var.login_portal_auth0_client_id != ""
+    error_message = "login_portal_auth0_client_id is required when deploy_login_portal is true."
+  }
+}
+
+variable "login_portal_auth0_redirect_uri" {
+  description = "Redirect URI after Auth0 login from the login portal"
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.deploy_login_portal || var.login_portal_auth0_redirect_uri != ""
+    error_message = "login_portal_auth0_redirect_uri is required when deploy_login_portal is true."
+  }
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {

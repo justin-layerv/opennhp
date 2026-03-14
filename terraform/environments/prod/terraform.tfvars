@@ -57,7 +57,7 @@ resource_mode = "api"
 # CORS allowed origins for NHP HTTP server (browser-facing plugin endpoints)
 # Wildcard patterns (https://*.domain) match any single-level subdomain.
 # Needed because AC Traefik serves pages on dynamic {resId}.nhp.layerv.ai subdomains.
-nhp_cors_allowed_origins = "https://*.nhp.layerv.ai,https://*.qurl.site,https://qurl.link,https://layerv.ai,https://www.layerv.ai"
+nhp_cors_allowed_origins = "https://*.nhp.layerv.ai,https://*.qurl.site,https://qurl.link,https://layerv.ai,https://www.layerv.ai,https://login.layerv.ai"
 
 # Termination cleanup
 enable_termination_cleanup = true
@@ -145,6 +145,14 @@ qurl_link_external_dns    = false                  # DNS via route53_mgmt cross-
 # CloudFront for resolve.qurl.link - ISP compatibility (AT&T WiFi blocks NLB IPs)
 enable_resolve_cloudfront = true
 
+# Login Portal
+deploy_login_portal              = true
+login_portal_domain              = "login.layerv.ai"
+login_portal_hosted_zone_id      = "Z0748438C8EK6UAW94ST" # layerv.ai zone (in layerv-mgmt account)
+login_portal_acm_certificate_arn = "arn:aws:acm:us-east-1:235500187906:certificate/d47ebc80-e8e6-4ed2-9d02-066a00882753"
+login_portal_auth0_client_id     = "EhwI8cJwqviPsDFxKnBMVn6xWgR769IW"
+login_portal_auth0_redirect_uri  = "https://layerv.ai/qurl/dashboard/callback/"
+
 # Traefik plugins (downloaded from S3 at boot time)
 # Plugin source files are uploaded by traefik-plugins repo CI to s3://layerv-nhp-prod-plugins/
 # Key names must match moduleName in traefik.toml for Traefik local plugin resolution
@@ -162,7 +170,7 @@ qurl_router_enabled = true
 # CORS
 # Note: website origins appear here (QURL API) AND in dashboard_allowed_origins
 # (billing/developer-portal APIs) because they are separate CORS configurations.
-qurl_cors_allowed_origins = "https://qurl.link,https://*.qurl.site,https://layerv.ai,https://www.layerv.ai"
+qurl_cors_allowed_origins = "https://qurl.link,https://*.qurl.site,https://layerv.ai,https://www.layerv.ai,https://login.layerv.ai"
 
 # Dashboard CORS origins (shared by developer portal, billing API)
 dashboard_allowed_origins = ["https://layerv.ai", "https://www.layerv.ai"]

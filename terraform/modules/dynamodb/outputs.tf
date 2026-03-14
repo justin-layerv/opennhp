@@ -138,6 +138,16 @@ output "qurl_domains_table_name" {
   value       = length(aws_dynamodb_table.qurl_domains) > 0 ? aws_dynamodb_table.qurl_domains[0].name : null
 }
 
+output "qurl_access_codes_table_arn" {
+  description = "ARN of the QURL access codes table"
+  value       = length(aws_dynamodb_table.qurl_access_codes) > 0 ? aws_dynamodb_table.qurl_access_codes[0].arn : null
+}
+
+output "qurl_access_codes_table_name" {
+  description = "Name of the QURL access codes table"
+  value       = length(aws_dynamodb_table.qurl_access_codes) > 0 ? aws_dynamodb_table.qurl_access_codes[0].name : null
+}
+
 output "qurl_idempotency_table_arn" {
   description = "ARN of the QURL idempotency DynamoDB table"
   value       = length(aws_dynamodb_table.qurl_idempotency) > 0 ? aws_dynamodb_table.qurl_idempotency[0].arn : null
@@ -164,5 +174,6 @@ output "qurl_table_arns" {
     aws_dynamodb_table.qurl_billing_audit[0].arn,
     aws_dynamodb_table.qurl_domains[0].arn,
     aws_dynamodb_table.qurl_idempotency[0].arn,
+    aws_dynamodb_table.qurl_access_codes[0].arn,
   ] : []
 }

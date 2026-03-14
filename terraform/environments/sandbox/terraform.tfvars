@@ -54,7 +54,7 @@ resource_mode = "api"
 # CORS allowed origins for NHP HTTP server (browser-facing plugin endpoints)
 # Wildcard patterns (https://*.domain) match any single-level subdomain.
 # Needed because AC Traefik serves pages on dynamic {resId}.nhp.layerv.xyz subdomains.
-nhp_cors_allowed_origins = "https://*.nhp.layerv.xyz,https://*.apps.layerv.xyz,https://*.qurl.site.layerv.xyz,https://qurl.link.layerv.xyz,https://staging.layerv.ai"
+nhp_cors_allowed_origins = "https://*.nhp.layerv.xyz,https://*.apps.layerv.xyz,https://*.qurl.site.layerv.xyz,https://qurl.link.layerv.xyz,https://staging.layerv.ai,https://login.layerv.xyz"
 
 # Termination cleanup: Lambda cleans stale DynamoDB assignments on server termination
 enable_termination_cleanup = true
@@ -219,7 +219,7 @@ qurl_audit_retention_days = 90
 # Note: staging.layerv.ai appears here (QURL API) AND in dashboard_allowed_origins
 # (billing/developer-portal APIs) because they are separate CORS configurations
 # on different services — QURL API (ECS) vs billing API (API Gateway).
-qurl_cors_allowed_origins = "https://qurl.link.layerv.xyz,https://*.qurl.site.layerv.xyz,https://staging.layerv.ai,http://localhost:3000"
+qurl_cors_allowed_origins = "https://qurl.link.layerv.xyz,https://*.qurl.site.layerv.xyz,https://staging.layerv.ai,http://localhost:3000,https://login.layerv.xyz"
 
 # Additional allowed hosts for DNS rebinding protection
 # ALB DNS name, localhost, and 127.0.0.1 are always included automatically.
@@ -330,6 +330,14 @@ qurl_link_external_dns    = false
 
 # CloudFront for resolve.qurl.link - ISP compatibility (AT&T WiFi blocks NLB IPs)
 enable_resolve_cloudfront = true
+
+# Login Portal
+deploy_login_portal              = true
+login_portal_domain              = "login.layerv.xyz"
+login_portal_hosted_zone_id      = "Z10394893FM38A1RXLL32" # layerv.xyz zone (same account)
+login_portal_acm_certificate_arn = "arn:aws:acm:us-east-1:767397897469:certificate/ae4f7d47-7c61-4504-a34b-b87f53080802"
+login_portal_auth0_client_id     = "fhtppYPLcNmItML0QmxGdOihFKU1UgiA"
+login_portal_auth0_redirect_uri  = "https://staging.layerv.ai/qurl/dashboard/callback/"
 
 # ==============================================================================
 # QURL Router Plugin Configuration

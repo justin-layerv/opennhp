@@ -344,6 +344,8 @@ resource "aws_iam_policy" "dynamodb_read" {
           ], var.deploy_qurl_tables ? [
           aws_dynamodb_table.qurl_domains[0].arn,
           "${aws_dynamodb_table.qurl_domains[0].arn}/index/*",
+          aws_dynamodb_table.qurl_access_codes[0].arn,
+          "${aws_dynamodb_table.qurl_access_codes[0].arn}/index/*",
         ] : [])
       },
       {
@@ -402,6 +404,8 @@ resource "aws_iam_policy" "dynamodb_write" {
           ], var.deploy_qurl_tables ? [
           aws_dynamodb_table.qurl_domains[0].arn,
           "${aws_dynamodb_table.qurl_domains[0].arn}/index/*",
+          aws_dynamodb_table.qurl_access_codes[0].arn,
+          "${aws_dynamodb_table.qurl_access_codes[0].arn}/index/*",
         ] : [])
       }
       ], var.kms_key_arn != null ? [{
@@ -1066,6 +1070,70 @@ resource "aws_dynamodb_table" "qurl_domains" {
     Cell      = var.cell_id
     Component = "qurl-service"
     Purpose   = "Custom domain registrations"
+  })
+}
+
+# qurl-access-codes: Access codes for login portal code redemption
+# PK: access_code_id
+# GSI: code-hash-index (lookup by hashed code), owner-index (list codes by owner)
+resource "aws_dynamodb_table" "qurl_access_codes" {
+  count = var.deploy_qurl_tables ? 1 : 0
+
+  name         = "${var.name_prefix}-${var.cell_id}-qurl-access-codes"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "access_code_id"
+
+  attribute {
+    name = "access_code_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "code_hash"
+    type = "S"
+  }
+
+  attribute {
+    name = "owner_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "created_at"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "code-hash-index"
+    hash_key        = "code_hash"
+    projection_type = "ALL"
+  }
+
+  global_secondary_index {
+    name            = "owner-index"
+    hash_key        = "owner_id"
+    range_key       = "created_at"
+    projection_type = "ALL"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  point_in_time_recovery {
+    enabled = var.environment == "prod"
+  }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-qurl-access-codes"
+    Component = "qurl"
+    Table     = "access-codes"
   })
 }
 
