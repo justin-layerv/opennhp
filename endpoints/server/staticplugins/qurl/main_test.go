@@ -150,8 +150,8 @@ func TestInit_Success(t *testing.T) {
 }
 
 func TestHandleResolveError_KnownErrors_Return403(t *testing.T) {
-	// Known token errors return generic 403 to avoid CloudFront 502s
-	// from silent connection drops behind CDN infrastructure.
+	// Known token errors return a branded HTML error page to avoid
+	// exposing raw JSON to end users in the browser.
 	testCases := []struct {
 		name string
 		err  error
@@ -173,12 +173,14 @@ func TestHandleResolveError_KnownErrors_Return403(t *testing.T) {
 				t.Errorf("handleResolveError(%v) status = %d, want %d", tt.err, w.Code, http.StatusForbidden)
 			}
 
-			var body map[string]string
-			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-				t.Fatalf("handleResolveError(%v) response not valid JSON: %v", tt.err, err)
+			contentType := w.Header().Get("Content-Type")
+			if contentType != "text/html; charset=utf-8" {
+				t.Errorf("handleResolveError(%v) Content-Type = %q, want text/html", tt.err, contentType)
 			}
-			if body["error"] != "access_denied" {
-				t.Errorf("handleResolveError(%v) error = %q, want \"access_denied\"", tt.err, body["error"])
+
+			body := w.Body.String()
+			if !strings.Contains(body, "Access Link Invalid") {
+				t.Errorf("handleResolveError(%v) body missing 'Access Link Invalid' title", tt.err)
 			}
 
 			if !ctx.IsAborted() {
@@ -188,8 +190,29 @@ func TestHandleResolveError_KnownErrors_Return403(t *testing.T) {
 	}
 }
 
-func TestHandleResolveError_UnknownErrors_NHPDrop(t *testing.T) {
-	// Unknown/unexpected errors still trigger NHP silent drop
+func TestHandleResolveError_InvalidResolve_Return502(t *testing.T) {
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+
+	handleResolveError(ctx, ErrInvalidResolveResponse)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("handleResolveError(ErrInvalidResolveResponse) status = %d, want %d", w.Code, http.StatusBadGateway)
+	}
+	contentType := w.Header().Get("Content-Type")
+	if contentType != "text/html; charset=utf-8" {
+		t.Errorf("Content-Type = %q, want text/html", contentType)
+	}
+	if !strings.Contains(w.Body.String(), "Access Link Invalid") {
+		t.Error("body missing Access Link Invalid title")
+	}
+	if !ctx.IsAborted() {
+		t.Error("context not aborted")
+	}
+}
+
+func TestHandleResolveError_UnknownErrors_ShowErrorPage(t *testing.T) {
+	// Unknown/unexpected errors also show branded error page (no info leaked)
 	testCases := []struct {
 		name string
 		err  error
@@ -204,9 +227,12 @@ func TestHandleResolveError_UnknownErrors_NHPDrop(t *testing.T) {
 
 			handleResolveError(ctx, tt.err)
 
-			// NHP silence: no response body written
-			if body := w.Body.String(); body != "" {
-				t.Errorf("handleResolveError(%v) wrote body %q, want empty (NHP silence)", tt.err, body)
+			if w.Code != http.StatusForbidden {
+				t.Errorf("handleResolveError(%v) status = %d, want %d", tt.err, w.Code, http.StatusForbidden)
+			}
+			body := w.Body.String()
+			if !strings.Contains(body, "Access Link Invalid") {
+				t.Errorf("handleResolveError(%v) should show branded error page", tt.err)
 			}
 
 			if !ctx.IsAborted() {
@@ -658,12 +684,16 @@ func TestAuthWithHttp_InvalidToken(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for empty token")
 	}
-	// NHP behavior: invalid token gets silent drop, no HTTP response
-	if body := w.Body.String(); body != "" {
-		t.Errorf("invalid token should produce NHP silence, got body: %s", body)
+	// Invalid tokens show the same branded error page as expired/consumed tokens
+	if w.Code != http.StatusForbidden {
+		t.Errorf("invalid token status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "Access Link Invalid") {
+		t.Errorf("invalid token should show branded error page, got: %s", body[:min(len(body), 200)])
 	}
 	if !ctx.IsAborted() {
-		t.Error("invalid token should abort context (NHP drop)")
+		t.Error("invalid token should abort context")
 	}
 }
 
@@ -725,16 +755,13 @@ func TestAuthWithHttp_ResolverError(t *testing.T) {
 	if err == nil {
 		t.Error("expected error when resolver fails")
 	}
-	// Known token errors return 403 (avoids CloudFront 502 from silent drop)
+	// Known token errors return branded HTML error page (avoids CloudFront 502 from silent drop)
 	if w.Code != http.StatusForbidden {
 		t.Errorf("resolver error status = %d, want %d", w.Code, http.StatusForbidden)
 	}
-	var body map[string]string
-	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-		t.Fatalf("failed to parse response body: %v", err)
-	}
-	if body["error"] != "access_denied" {
-		t.Errorf("expected error='access_denied', got %q", body["error"])
+	body := w.Body.String()
+	if !strings.Contains(body, "Access Link Invalid") {
+		t.Errorf("expected branded HTML error page, got: %s", body[:min(len(body), 200)])
 	}
 	if !ctx.IsAborted() {
 		t.Error("resolver error should abort context")
