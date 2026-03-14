@@ -889,9 +889,13 @@ TRAEFIKEOF
 # Create Traefik dynamic configuration (routes to nhp-acd and NHP Server)
 cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
 # Traefik Dynamic Configuration
-# Routes:
-# - /plugins/* → NHP Server HTTP (passcode login, auth endpoints)
-# - /* → nhp-acd (protected resource access, refresh)
+#
+# Router priority hierarchy (higher number = matched first):
+#   15 - qurl-site          *.qurl.site subdomain routing
+#   10 - nhp-plugins        /plugins/* to NHP Server
+#   10 - prod-*/addtls-*    production domain routes (when ACME enabled)
+#    2 - custom-domain-catchall  custom domains via qurl-router middleware
+#    1 - nhp-ac             fallback to nhp-acd for protected resource access
 
 [http.routers]
   # Route /plugins to NHP Server for passcode login and auth
