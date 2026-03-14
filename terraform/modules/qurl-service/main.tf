@@ -547,11 +547,11 @@ resource "aws_security_group_rule" "ecs_to_redis" {
 
   type                     = "ingress"
   from_port                = 6379
-  to_port                  = 6380
+  to_port                  = 6379
   protocol                 = "tcp"
   source_security_group_id = aws_security_group.ecs.id
   security_group_id        = var.redis_security_group_id
-  description              = "Redis from QURL ECS tasks"
+  description              = "Redis from QURL ECS tasks (ElastiCache Serverless port 6379)"
 }
 
 # ==================== ECS Task Definition ====================

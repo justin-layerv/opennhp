@@ -24,14 +24,15 @@ resource "aws_security_group" "redis" {
   vpc_id      = var.vpc_id
   description = "Security group for Redis ElastiCache"
 
-  # ElastiCache Serverless enforces TLS - only allow encrypted connections
-  # Port 6379 (non-TLS) is intentionally not exposed for security
+  # ElastiCache Serverless uses port 6379 with mandatory TLS.
+  # (Legacy non-serverless ElastiCache used 6380 for TLS, but Serverless
+  # standardized on 6379 for all connections.)
   ingress {
-    from_port   = 6380
-    to_port     = 6380
+    from_port   = 6379
+    to_port     = 6379
     protocol    = "tcp"
     cidr_blocks = [var.vpc_cidr]
-    description = "Redis TLS from VPC"
+    description = "Redis from VPC (ElastiCache Serverless, TLS enforced)"
   }
 
   # No egress rules - Redis (ElastiCache Serverless) does not initiate
