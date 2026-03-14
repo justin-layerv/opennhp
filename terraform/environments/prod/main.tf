@@ -345,6 +345,11 @@ module "custom_domain_cert" {
   count  = var.deploy_custom_domain_cert ? 1 : 0
   source = "../../modules/custom-domain-cert"
 
+  providers = {
+    aws            = aws
+    aws.parent_dns = aws.route53_mgmt # Parent zone (layerv.ai) is in mgmt account
+  }
+
   name_prefix         = local.name_prefix
   environment         = var.environment
   acme_base_domain    = var.hosted_zone         # layerv.ai for prod

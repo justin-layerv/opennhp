@@ -50,8 +50,9 @@ terraform {
 
   required_providers {
     aws = {
-      source  = "hashicorp/aws"
-      version = ">= 5.0"
+      source                = "hashicorp/aws"
+      version               = ">= 5.0"
+      configuration_aliases = [aws.parent_dns]
     }
     archive = {
       source  = "hashicorp/archive"
@@ -108,11 +109,12 @@ resource "aws_route53_zone" "acme" {
 # delegate queries for acme.layerv.xyz to the child zone's nameservers,
 # causing DNS-01 challenge TXT lookups to fail.
 resource "aws_route53_record" "acme_ns_delegation" {
-  zone_id = var.parent_zone_id
-  name    = local.acme_zone_name
-  type    = "NS"
-  ttl     = 300
-  records = aws_route53_zone.acme.name_servers
+  provider = aws.parent_dns
+  zone_id  = var.parent_zone_id
+  name     = local.acme_zone_name
+  type     = "NS"
+  ttl      = 300
+  records  = aws_route53_zone.acme.name_servers
 }
 
 # ==============================================================================

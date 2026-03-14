@@ -886,6 +886,14 @@ jobs:
           path: terraform/modules/developer-portal/lambda/playground_proxy.zip
           retention-days: 1
 
+      - name: Upload custom domain cert Lambda
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: lambda-custom-domain-cert
+          path: terraform/modules/custom-domain-cert/build/lambda-custom-domain-cert.zip
+          retention-days: 1
+          if-no-files-found: ignore
+
   # =============================================================================
   # TERRAFORM APPLY - Apply reviewed plan (approval gate)
   # =============================================================================
@@ -941,6 +949,13 @@ jobs:
         with:
           name: lambda-playground-proxy
           path: terraform/modules/developer-portal/lambda
+
+      - name: Download custom domain cert Lambda
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        continue-on-error: true
+        with:
+          name: lambda-custom-domain-cert
+          path: terraform/modules/custom-domain-cert/build
 
       - name: Terraform Init
         working-directory: terraform/environments/prod
