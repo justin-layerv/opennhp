@@ -66,8 +66,7 @@ enable_termination_cleanup = true
 enable_secret_reconciliation = true
 
 # Slack notifications via AWS Chatbot
-# TEMPORARY: Disabled until Slack workspace is authorized for prod account (235500187906)
-enable_slack_notifications = false
+enable_slack_notifications = true
 slack_workspace_id         = "T09UP622L90" # LayerV workspace
 slack_channel_id           = "C09UP62A8F4" # #all-layerv
 
@@ -78,7 +77,7 @@ guardduty_alert_emails = [
   "joe@layerv.ai"
 ]
 
-# CloudWatch alarm email notifications (B8 - interim until Slack is authorized)
+# CloudWatch alarm email notifications (complementary to Slack)
 # Each email must confirm the SNS subscription via email link
 alert_emails = [
   "justin@layerv.ai",
