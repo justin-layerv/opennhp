@@ -20,6 +20,7 @@ set -Eeuo pipefail
 # =============================================================================
 
 MODE="interactive"
+SKIP_SOAK=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -29,13 +30,17 @@ for arg in "$@"; do
         --json)
             MODE="json"
             ;;
+        --skip-soak)
+            SKIP_SOAK=true
+            ;;
         --help|-h)
             echo "NHP Production Deployment Helper"
             echo ""
             echo "Usage:"
-            echo "  ./scripts/trigger-prod-deploy.sh             # Interactive: show summary -> confirm -> deploy"
-            echo "  ./scripts/trigger-prod-deploy.sh --dry-run   # Show summary + command only (no prompt)"
-            echo "  ./scripts/trigger-prod-deploy.sh --json      # Machine-readable JSON output (no prompt)"
+            echo "  ./scripts/trigger-prod-deploy.sh               # Interactive: show summary -> confirm -> deploy"
+            echo "  ./scripts/trigger-prod-deploy.sh --dry-run     # Show summary + command only (no prompt)"
+            echo "  ./scripts/trigger-prod-deploy.sh --json        # Machine-readable JSON output (no prompt)"
+            echo "  ./scripts/trigger-prod-deploy.sh --skip-soak   # Skip the 30m sandbox soak time check"
             echo ""
             echo "Prerequisites:"
             echo "  - AWS CLI with profiles: layerv (sandbox), layerv-prod (prod)"
@@ -426,8 +431,11 @@ if [[ "$SANDBOX_DEPLOYED_AT" == "(not set)" ]]; then
     WARNINGS+=("Sandbox soak time unknown (deployed-at not set)")
 else
     SOAK_MINUTES=$(minutes_since "$SANDBOX_DEPLOYED_AT")
-    if (( SOAK_MINUTES < 30 )); then
-        fail "Sandbox deployed only ${SOAK_MINUTES}m ago. Minimum 30m soak required."
+    if (( SOAK_MINUTES < 30 )) && [[ "$SKIP_SOAK" != "true" ]]; then
+        fail "Sandbox deployed only ${SOAK_MINUTES}m ago. Minimum 30m soak required. Use --skip-soak to override."
+    elif (( SOAK_MINUTES < 30 )); then
+        warn "Sandbox deployed only ${SOAK_MINUTES}m ago (soak check skipped via --skip-soak)"
+        WARNINGS+=("Soak time skipped (${SOAK_MINUTES}m < 30m)")
     else
         pass "Sandbox soak time: $(time_ago "$SANDBOX_DEPLOYED_AT") (min: 30m)"
     fi
