@@ -100,18 +100,22 @@ jobs:
             SKIP_SOAK="true"
           fi
 
-          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          echo "skip_soak=$SKIP_SOAK" >> "$GITHUB_OUTPUT"
-          echo "soak_minutes=$SOAK_MINUTES" >> "$GITHUB_OUTPUT"
-          echo "force_redeploy=$FORCE" >> "$GITHUB_OUTPUT"
+          {
+            echo "mode=$MODE"
+            echo "skip_soak=$SKIP_SOAK"
+            echo "soak_minutes=$SOAK_MINUTES"
+            echo "force_redeploy=$FORCE"
+          } >> "$GITHUB_OUTPUT"
 
-          echo "### Parameters" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Parameter | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-----------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Mode | $MODE |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Skip Soak | $SKIP_SOAK |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Soak Minutes | $SOAK_MINUTES |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Force Redeploy | $FORCE |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Parameters"
+            echo "| Parameter | Value |"
+            echo "|-----------|-------|"
+            echo "| Mode | $MODE |"
+            echo "| Skip Soak | $SKIP_SOAK |"
+            echo "| Soak Minutes | $SOAK_MINUTES |"
+            echo "| Force Redeploy | $FORCE |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Configure AWS credentials (sandbox)
         uses: ./.github/actions/setup-deploy
@@ -152,10 +156,12 @@ jobs:
           HEAD_SHA=$(git rev-parse HEAD)
           HEAD_SHA_SHORT="${HEAD_SHA:0:7}"
 
-          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-          echo "head_sha_short=$HEAD_SHA_SHORT" >> "$GITHUB_OUTPUT"
-          echo "sandbox_deployed_commit=${SANDBOX_COMMIT}" >> "$GITHUB_OUTPUT"
-          echo "prod_deployed_commit=${PROD_COMMIT}" >> "$GITHUB_OUTPUT"
+          {
+            echo "head_sha=$HEAD_SHA"
+            echo "head_sha_short=$HEAD_SHA_SHORT"
+            echo "sandbox_deployed_commit=${SANDBOX_COMMIT}"
+            echo "prod_deployed_commit=${PROD_COMMIT}"
+          } >> "$GITHUB_OUTPUT"
 
           echo "HEAD SHA:               $HEAD_SHA"
           echo "Sandbox deployed:       ${SANDBOX_COMMIT:-never}"
@@ -206,15 +212,19 @@ jobs:
           # Annotate summary
           if [[ "$HAS_CHANGES" == "false" ]]; then
             echo "::notice::No pending changes to deploy. HEAD ($HEAD_SHA_SHORT) matches deployed state."
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "### Result: No Changes" >> "$GITHUB_STEP_SUMMARY"
-            echo "HEAD \`$HEAD_SHA_SHORT\` is already deployed. Pipeline will skip." >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo ""
+              echo "### Result: No Changes"
+              echo "HEAD \`$HEAD_SHA_SHORT\` is already deployed. Pipeline will skip."
+            } >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "### Pending Changes" >> "$GITHUB_STEP_SUMMARY"
-            echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
-            echo "${CHANGE_SUMMARY:-No previous deployment found}" >> "$GITHUB_STEP_SUMMARY"
-            echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo ""
+              echo "### Pending Changes"
+              echo "\`\`\`"
+              echo "${CHANGE_SUMMARY:-No previous deployment found}"
+              echo "\`\`\`"
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
   # ============================================================================
@@ -252,11 +262,13 @@ jobs:
 
       - name: Deployment Summary
         run: |
-          echo "### Sandbox Deployment" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Detail | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Image Tag | \`${{ steps.deploy.outputs.image_tag }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Method | ${{ steps.deploy.outputs.method }} |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Sandbox Deployment"
+            echo "| Detail | Value |"
+            echo "|--------|-------|"
+            echo "| Image Tag | \`${{ steps.deploy.outputs.image_tag }}\` |"
+            echo "| Method | ${{ steps.deploy.outputs.method }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ============================================================================
   # SOAK - Monitor sandbox health for configured duration
@@ -332,11 +344,13 @@ jobs:
 
       - name: Promotion Summary
         run: |
-          echo "### Production Promotion" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Detail | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Image Tag | \`${{ needs.ensure-sandbox-deployed.outputs.image_tag }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Method | ${{ steps.promote.outputs.method }} |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Production Promotion"
+            echo "| Detail | Value |"
+            echo "|--------|-------|"
+            echo "| Image Tag | \`${{ needs.ensure-sandbox-deployed.outputs.image_tag }}\` |"
+            echo "| Method | ${{ steps.promote.outputs.method }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ============================================================================
   # TAG AND TRACK - Create git tags and update deployment tracking
@@ -388,8 +402,10 @@ jobs:
           MODE: ${{ needs.check-pending-changes.outputs.mode }}
         run: |
           DATE=$(date -u +%Y-%m-%d)
-          echo "### Deployment Tags" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`deploy/sandbox/${DATE}-${HEAD_SHA_SHORT}\`" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Deployment Tags"
+            echo "- \`deploy/sandbox/${DATE}-${HEAD_SHA_SHORT}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
           if [[ "$MODE" != "sandbox-only" ]]; then
             echo "- \`deploy/prod/${DATE}-${HEAD_SHA_SHORT}\`" >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -548,18 +564,22 @@ jobs:
           PROD_METHOD: ${{ needs.promote-to-prod.outputs.method }}
           TAG_RESULT: ${{ needs.tag-and-track.result }}
         run: |
-          echo "## Scheduled Release Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Scheduled Release Summary"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
           if [[ "$HAS_CHANGES" == "false" ]]; then
             echo "**No pending changes.** HEAD \`${HEAD_SHA_SHORT}\` is already deployed." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
-          echo "| Stage | Result | Details |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-------|--------|---------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Sandbox Deploy | ${SANDBOX_RESULT:-skipped} | ${SANDBOX_METHOD:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Soak Period | ${SOAK_RESULT:-skipped} | |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "| Stage | Result | Details |"
+            echo "|-------|--------|---------|"
+            echo "| Sandbox Deploy | ${SANDBOX_RESULT:-skipped} | ${SANDBOX_METHOD:-n/a} |"
+            echo "| Soak Period | ${SOAK_RESULT:-skipped} | |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
           if [[ "$MODE" != "sandbox-only" ]]; then
             echo "| Prod Promotion | ${PROD_RESULT:-skipped} | ${PROD_METHOD:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
@@ -568,9 +588,11 @@ jobs:
           echo "| Tag & Track | ${TAG_RESULT:-skipped} | |" >> "$GITHUB_STEP_SUMMARY"
 
           if [[ -n "$CHANGE_SUMMARY" ]]; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "### Changes Deployed" >> "$GITHUB_STEP_SUMMARY"
-            echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
-            echo "$CHANGE_SUMMARY" >> "$GITHUB_STEP_SUMMARY"
-            echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo ""
+              echo "### Changes Deployed"
+              echo "\`\`\`"
+              echo "$CHANGE_SUMMARY"
+              echo "\`\`\`"
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
