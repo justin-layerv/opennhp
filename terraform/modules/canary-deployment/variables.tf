@@ -1,5 +1,6 @@
 # Canary Deployment Module - Variables
 # Step Functions-orchestrated canary deployment with ASG instance refresh checkpoints
+# Instantiate once per deployable component (server, ac).
 
 # ==============================================================================
 # Required Variables
@@ -18,6 +19,16 @@ variable "name_prefix" {
 variable "cell_id" {
   description = "Cell identifier for multi-cell deployments"
   type        = string
+}
+
+variable "component" {
+  description = "Component this canary deployment targets (server or ac). Used in resource names, SSM paths, and alarm names."
+  type        = string
+
+  validation {
+    condition     = contains(["server", "ac"], var.component)
+    error_message = "component must be 'server' or 'ac'."
+  }
 }
 
 variable "tags" {

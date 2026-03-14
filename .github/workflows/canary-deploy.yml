@@ -133,7 +133,7 @@ jobs:
           CELL_ID: ${{ inputs.cell_id }}
           STALE_THRESHOLD_SECONDS: '3900' # 65 minutes (state machine timeout is 60 min + 5 min buffer)
         run: |
-          SSM_PARAM="/${ENVIRONMENT}/nhp/${CELL_ID}/canary/state"
+          SSM_PARAM="/${ENVIRONMENT}/nhp/${CELL_ID}/canary/${{ inputs.component }}/state"
           echo "Checking canary state: $SSM_PARAM"
 
           STATE=$(aws ssm get-parameter \
@@ -187,7 +187,7 @@ jobs:
           ENVIRONMENT: ${{ inputs.environment }}
           CELL_ID: ${{ inputs.cell_id }}
         run: |
-          SSM_PARAM="/${ENVIRONMENT}/nhp/${CELL_ID}/canary/state-machine-arn"
+          SSM_PARAM="/${ENVIRONMENT}/nhp/${CELL_ID}/canary/${{ inputs.component }}/state-machine-arn"
           echo "Reading state machine ARN from: $SSM_PARAM"
 
           ARN=$(aws ssm get-parameter \
@@ -457,7 +457,7 @@ jobs:
           ENVIRONMENT: ${{ inputs.environment }}
           CELL_ID: ${{ inputs.cell_id }}
         run: |
-          SSM_PARAM="/${ENVIRONMENT}/nhp/${CELL_ID}/canary/state"
+          SSM_PARAM="/${ENVIRONMENT}/nhp/${CELL_ID}/canary/${{ inputs.component }}/state"
           CURRENT=$(aws ssm get-parameter \
             --name "$SSM_PARAM" \
             --query "Parameter.Value" --output text 2>/dev/null) || CURRENT=""

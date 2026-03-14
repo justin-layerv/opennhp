@@ -15,7 +15,7 @@ locals {
 # ==============================================================================
 
 resource "aws_sfn_state_machine" "canary_deploy" {
-  name     = "${var.name_prefix}-canary-deploy"
+  name     = "${var.name_prefix}-canary-deploy-${var.component}"
   role_arn = aws_iam_role.step_functions.arn
 
   definition = templatefile("${path.module}/state_machine.asl.json.tpl", {
@@ -29,7 +29,7 @@ resource "aws_sfn_state_machine" "canary_deploy" {
   }
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-canary-deploy"
+    Name      = "${var.name_prefix}-canary-deploy-${var.component}"
     Component = "canary"
     Cell      = var.cell_id
   })
@@ -40,7 +40,7 @@ resource "aws_sfn_state_machine" "canary_deploy" {
 # ==============================================================================
 
 resource "aws_iam_role" "step_functions" {
-  name = "${var.name_prefix}-canary-sfn-role"
+  name = "${var.name_prefix}-canary-sfn-${var.component}-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -56,14 +56,14 @@ resource "aws_iam_role" "step_functions" {
   })
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-canary-sfn-role"
+    Name      = "${var.name_prefix}-canary-sfn-${var.component}-role"
     Component = "canary"
     Cell      = var.cell_id
   })
 }
 
 resource "aws_iam_role_policy" "step_functions" {
-  name = "${var.name_prefix}-canary-sfn-policy"
+  name = "${var.name_prefix}-canary-sfn-${var.component}-policy"
   role = aws_iam_role.step_functions.id
 
   policy = jsonencode({
@@ -114,12 +114,12 @@ resource "aws_iam_role_policy" "step_functions" {
 # ==============================================================================
 
 resource "aws_cloudwatch_log_group" "step_functions" {
-  name              = "/aws/vendedlogs/states/${var.name_prefix}-canary-deploy"
+  name              = "/aws/vendedlogs/states/${var.name_prefix}-canary-deploy-${var.component}"
   retention_in_days = local.is_prod ? 90 : 14
   kms_key_id        = var.logs_kms_key_arn
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-canary-sfn-logs"
+    Name      = "${var.name_prefix}-canary-sfn-${var.component}-logs"
     Component = "canary"
     Cell      = var.cell_id
   })
@@ -131,12 +131,12 @@ resource "aws_cloudwatch_log_group" "step_functions" {
 
 # Canary deployment state: idle, deploying, rolling_back
 resource "aws_ssm_parameter" "canary_state" {
-  name  = "/${var.environment}/nhp/${var.cell_id}/canary/state"
+  name  = "/${var.environment}/nhp/${var.cell_id}/canary/${var.component}/state"
   type  = "String"
   value = "idle"
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-canary-state"
+    Name      = "${var.name_prefix}-canary-${var.component}-state"
     Component = "canary"
     Cell      = var.cell_id
   })
@@ -148,12 +148,12 @@ resource "aws_ssm_parameter" "canary_state" {
 
 # State machine ARN (for GitHub Actions workflow to find the correct state machine)
 resource "aws_ssm_parameter" "canary_state_machine_arn" {
-  name  = "/${var.environment}/nhp/${var.cell_id}/canary/state-machine-arn"
+  name  = "/${var.environment}/nhp/${var.cell_id}/canary/${var.component}/state-machine-arn"
   type  = "String"
   value = aws_sfn_state_machine.canary_deploy.arn
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-canary-state-machine-arn"
+    Name      = "${var.name_prefix}-canary-${var.component}-state-machine-arn"
     Component = "canary"
     Cell      = var.cell_id
   })
@@ -161,12 +161,12 @@ resource "aws_ssm_parameter" "canary_state_machine_arn" {
 
 # Active Step Functions execution ARN (for EventBridge rollback to find active execution)
 resource "aws_ssm_parameter" "canary_execution_arn" {
-  name  = "/${var.environment}/nhp/${var.cell_id}/canary/execution-arn"
+  name  = "/${var.environment}/nhp/${var.cell_id}/canary/${var.component}/execution-arn"
   type  = "String"
   value = "none"
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-canary-execution-arn"
+    Name      = "${var.name_prefix}-canary-${var.component}-execution-arn"
     Component = "canary"
     Cell      = var.cell_id
   })

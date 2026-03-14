@@ -570,6 +570,124 @@ class TestComplete(CanaryTestCase):
         self.assertEqual(calls[1][1]['Value'], 'none')
 
 
+class TestAsgNamePropagation(CanaryTestCase):
+    """Test that handlers use the event-provided asg_name over the env var default."""
+
+    CUSTOM_ASG = 'custom-ac-asg'
+
+    def test_start_refresh_uses_event_asg_name(self):
+        """handle_start_refresh targets the ASG from the event, not the env var."""
+        self.mock_autoscaling.describe_auto_scaling_groups.return_value = {
+            'AutoScalingGroups': [{
+                'AutoScalingGroupName': self.CUSTOM_ASG,
+                'LaunchTemplate': {
+                    'LaunchTemplateId': 'lt-ac123',
+                    'Version': '2',
+                }
+            }]
+        }
+        self.mock_autoscaling.describe_instance_refreshes.return_value = {
+            'InstanceRefreshes': []
+        }
+        self.mock_autoscaling.start_instance_refresh.return_value = {
+            'InstanceRefreshId': 'refresh-ac-001'
+        }
+
+        result = canary_orchestrator.handle_start_refresh(
+            {'image_tag': 'sha-ac', 'asg_name': self.CUSTOM_ASG}, None
+        )
+
+        self.assertEqual(result['instance_refresh_id'], 'refresh-ac-001')
+        # Verify the custom ASG was used in API calls
+        self.mock_autoscaling.describe_auto_scaling_groups.assert_called_with(
+            AutoScalingGroupNames=[self.CUSTOM_ASG]
+        )
+        call_args = self.mock_autoscaling.start_instance_refresh.call_args[1]
+        self.assertEqual(call_args['AutoScalingGroupName'], self.CUSTOM_ASG)
+
+    def test_check_refresh_status_uses_event_asg_name(self):
+        """handle_check_refresh_status targets the ASG from the event."""
+        self.mock_autoscaling.describe_instance_refreshes.return_value = {
+            'InstanceRefreshes': [{
+                'InstanceRefreshId': 'refresh-ac-001',
+                'Status': 'Successful',
+                'StatusReason': '',
+                'PercentageComplete': 100,
+                'InstancesToUpdate': 0,
+            }]
+        }
+        self.mock_autoscaling.describe_auto_scaling_groups.return_value = {
+            'AutoScalingGroups': [{'DesiredCapacity': 3}]
+        }
+
+        result = canary_orchestrator.handle_check_refresh_status(
+            {'instance_refresh_id': 'refresh-ac-001', 'asg_name': self.CUSTOM_ASG}, None
+        )
+
+        self.assertEqual(result['status'], 'Successful')
+        self.mock_autoscaling.describe_instance_refreshes.assert_called_with(
+            AutoScalingGroupName=self.CUSTOM_ASG,
+            InstanceRefreshIds=['refresh-ac-001'],
+        )
+
+    def test_check_health_uses_event_asg_name(self):
+        """handle_check_health uses event asg_name for CPU metric dimension."""
+        self.mock_cloudwatch.get_metric_data.return_value = {
+            'MetricDataResults': [
+                {'Id': 'healthy_hosts', 'Values': [3.0]},
+                {'Id': 'unhealthy_hosts', 'Values': [0.0]},
+                {'Id': 'cpu_utilization', 'Values': [10.0]},
+            ]
+        }
+
+        canary_orchestrator.handle_check_health(
+            {'asg_name': self.CUSTOM_ASG}, None
+        )
+
+        # Verify the CPU metric query uses the custom ASG name
+        call_args = self.mock_cloudwatch.get_metric_data.call_args[1]
+        cpu_query = [q for q in call_args['MetricDataQueries']
+                     if q['Id'] == 'cpu_utilization'][0]
+        asg_dim = [d for d in cpu_query['MetricStat']['Metric']['Dimensions']
+                   if d['Name'] == 'AutoScalingGroupName'][0]
+        self.assertEqual(asg_dim['Value'], self.CUSTOM_ASG)
+
+    def test_rollback_uses_event_asg_name(self):
+        """handle_rollback targets the ASG from the event."""
+        canary_orchestrator.handle_rollback(
+            {'asg_name': self.CUSTOM_ASG}, None
+        )
+
+        self.mock_autoscaling.rollback_instance_refresh.assert_called_with(
+            AutoScalingGroupName=self.CUSTOM_ASG
+        )
+
+    def test_handlers_fall_back_to_env_var_when_no_event_asg(self):
+        """Without asg_name in event, handlers use the ASG_NAME env var."""
+        self.mock_autoscaling.describe_instance_refreshes.return_value = {
+            'InstanceRefreshes': [{
+                'InstanceRefreshId': 'refresh-001',
+                'Status': 'Successful',
+                'StatusReason': '',
+                'PercentageComplete': 100,
+                'InstancesToUpdate': 0,
+            }]
+        }
+        self.mock_autoscaling.describe_auto_scaling_groups.return_value = {
+            'AutoScalingGroups': [{'DesiredCapacity': 3}]
+        }
+
+        canary_orchestrator.handle_check_refresh_status(
+            {'instance_refresh_id': 'refresh-001'}, None
+        )
+
+        # Should use the default ASG_NAME from env var ('test-asg')
+        self.mock_autoscaling.describe_instance_refreshes.assert_called_with(
+            AutoScalingGroupName='test-asg',
+            InstanceRefreshIds=['refresh-001'],
+        )
+
+
 class TestHelpers(CanaryTestCase):
     """Test helper functions."""
 

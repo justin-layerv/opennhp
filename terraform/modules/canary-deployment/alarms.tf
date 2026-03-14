@@ -7,8 +7,8 @@
 
 # Alarm: Unhealthy hosts detected in target group during canary deployment
 resource "aws_cloudwatch_metric_alarm" "canary_unhealthy" {
-  alarm_name          = "${var.name_prefix}-canary-unhealthy-hosts"
-  alarm_description   = "Canary deployment: unhealthy hosts detected in target group"
+  alarm_name          = "${var.name_prefix}-canary-${var.component}-unhealthy-hosts"
+  alarm_description   = "Canary deployment (${var.component}): unhealthy hosts detected in target group"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
   metric_name         = "UnHealthyHostCount"
@@ -24,7 +24,7 @@ resource "aws_cloudwatch_metric_alarm" "canary_unhealthy" {
   }
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-canary-unhealthy-alarm"
+    Name      = "${var.name_prefix}-canary-${var.component}-unhealthy-alarm"
     Component = "canary"
     Cell      = var.cell_id
   })
@@ -32,8 +32,8 @@ resource "aws_cloudwatch_metric_alarm" "canary_unhealthy" {
 
 # Alarm: High CPU utilization on ASG during canary deployment
 resource "aws_cloudwatch_metric_alarm" "canary_high_cpu" {
-  alarm_name          = "${var.name_prefix}-canary-high-cpu"
-  alarm_description   = "Canary deployment: CPU utilization exceeds ${var.max_cpu_percent}% threshold"
+  alarm_name          = "${var.name_prefix}-canary-${var.component}-high-cpu"
+  alarm_description   = "Canary deployment (${var.component}): CPU utilization exceeds ${var.max_cpu_percent}% threshold"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
   metric_name         = "CPUUtilization"
@@ -48,7 +48,7 @@ resource "aws_cloudwatch_metric_alarm" "canary_high_cpu" {
   }
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-canary-cpu-alarm"
+    Name      = "${var.name_prefix}-canary-${var.component}-cpu-alarm"
     Component = "canary"
     Cell      = var.cell_id
   })
@@ -56,8 +56,8 @@ resource "aws_cloudwatch_metric_alarm" "canary_high_cpu" {
 
 # Alarm: No healthy hosts in target group (CRITICAL safety net)
 resource "aws_cloudwatch_metric_alarm" "canary_low_healthy" {
-  alarm_name          = "${var.name_prefix}-canary-no-healthy-hosts"
-  alarm_description   = "CRITICAL: Canary deployment - no healthy hosts in target group"
+  alarm_name          = "${var.name_prefix}-canary-${var.component}-no-healthy-hosts"
+  alarm_description   = "CRITICAL: Canary deployment (${var.component}) - no healthy hosts in target group"
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 2
   metric_name         = "HealthyHostCount"
@@ -73,7 +73,7 @@ resource "aws_cloudwatch_metric_alarm" "canary_low_healthy" {
   }
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-canary-healthy-alarm"
+    Name      = "${var.name_prefix}-canary-${var.component}-healthy-alarm"
     Component = "canary"
     Cell      = var.cell_id
   })
@@ -85,8 +85,8 @@ resource "aws_cloudwatch_metric_alarm" "canary_low_healthy" {
 
 # Composite alarm: ANY canary health issue triggers rollback
 resource "aws_cloudwatch_composite_alarm" "canary_health" {
-  alarm_name        = "${var.name_prefix}-canary-health"
-  alarm_description = "Canary deployment health: triggers on unhealthy hosts, high CPU, or no healthy hosts"
+  alarm_name        = "${var.name_prefix}-canary-${var.component}-health"
+  alarm_description = "Canary deployment health (${var.component}): triggers on unhealthy hosts, high CPU, or no healthy hosts"
 
   alarm_rule = "ALARM(\"${aws_cloudwatch_metric_alarm.canary_unhealthy.alarm_name}\") OR ALARM(\"${aws_cloudwatch_metric_alarm.canary_high_cpu.alarm_name}\") OR ALARM(\"${aws_cloudwatch_metric_alarm.canary_low_healthy.alarm_name}\")"
 
@@ -94,7 +94,7 @@ resource "aws_cloudwatch_composite_alarm" "canary_health" {
   ok_actions    = [var.alerts_sns_topic_arn]
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-canary-health-composite"
+    Name      = "${var.name_prefix}-canary-${var.component}-health-composite"
     Component = "canary"
     Cell      = var.cell_id
   })
@@ -107,7 +107,7 @@ resource "aws_cloudwatch_composite_alarm" "canary_health" {
 # EventBridge rule: trigger Lambda rollback when composite alarm fires
 # This is a backup rollback mechanism independent of Step Functions
 resource "aws_cloudwatch_event_rule" "canary_alarm_rollback" {
-  name        = "${var.name_prefix}-canary-alarm-rollback"
+  name        = "${var.name_prefix}-canary-${var.component}-alarm-rollback"
   description = "Triggers canary rollback when health composite alarm fires"
 
   event_pattern = jsonencode({
@@ -122,7 +122,7 @@ resource "aws_cloudwatch_event_rule" "canary_alarm_rollback" {
   })
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-canary-alarm-rollback-rule"
+    Name      = "${var.name_prefix}-canary-${var.component}-alarm-rollback-rule"
     Component = "canary"
     Cell      = var.cell_id
   })

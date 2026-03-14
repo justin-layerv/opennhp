@@ -1,7 +1,7 @@
 """
 NHP Canary Deployment Orchestrator Lambda
 
-This Lambda function handles canary deployment orchestration for NHP Server ASGs.
+This Lambda function handles canary deployment orchestration for NHP ASGs (server and AC).
 It is invoked by Step Functions with action-based routing to manage the lifecycle
 of a rolling instance refresh with checkpoint-based health validation.
 
@@ -126,7 +126,7 @@ def handle_prepare(event, _context):
     deploy_timestamp = datetime.now(timezone.utc).isoformat()
     set_ssm_value(SSM_CANARY_STATE_PARAM, f'deploying:{deploy_timestamp}')
 
-    logger.info(f"Deployment {deployment_id} prepared: current_image_tag={current_image_tag}")
+    logger.info(f"Deployment {deployment_id} prepared: asg={ASG_NAME}, current_image_tag={current_image_tag}")
 
     return {
         'asg_name': ASG_NAME,
@@ -141,22 +141,23 @@ def handle_start_refresh(event, _context):
     if not image_tag:
         raise ValueError("Missing required field: image_tag")
 
-    logger.info(f"Starting instance refresh for ASG {ASG_NAME} with image_tag={image_tag}")
+    asg_name = event.get('asg_name', ASG_NAME)
+    logger.info(f"Starting instance refresh for ASG {asg_name} with image_tag={image_tag}")
 
     # Look up the ASG's current launch template to pass as DesiredConfiguration.
     # Without DesiredConfiguration, AWS rejects RollbackInstanceRefresh with
     # IrreversibleInstanceRefreshFault.
     asg_response = autoscaling.describe_auto_scaling_groups(
-        AutoScalingGroupNames=[ASG_NAME]
+        AutoScalingGroupNames=[asg_name]
     )
     groups = asg_response.get('AutoScalingGroups', [])
     if not groups:
-        raise ValueError(f"ASG not found: {ASG_NAME}")
+        raise ValueError(f"ASG not found: {asg_name}")
 
     asg = groups[0]
     launch_template = asg.get('LaunchTemplate', {})
     if not launch_template:
-        raise ValueError(f"ASG {ASG_NAME} has no launch template configured")
+        raise ValueError(f"ASG {asg_name} has no launch template configured")
 
     desired_config = {
         'LaunchTemplate': {
@@ -171,7 +172,7 @@ def handle_start_refresh(event, _context):
     # wait for the rollback to finish and retry.
     try:
         existing = autoscaling.describe_instance_refreshes(
-            AutoScalingGroupName=ASG_NAME
+            AutoScalingGroupName=asg_name
         )
     except ClientError as e:
         logger.warning(f"Error checking for existing refreshes: {e}")
@@ -194,7 +195,7 @@ def handle_start_refresh(event, _context):
         existing_id = active[0]['InstanceRefreshId']
         logger.warning(f"Found existing refresh {existing_id} ({active[0]['Status']}), cancelling...")
         try:
-            autoscaling.cancel_instance_refresh(AutoScalingGroupName=ASG_NAME)
+            autoscaling.cancel_instance_refresh(AutoScalingGroupName=asg_name)
         except autoscaling.exceptions.ActiveInstanceRefreshNotFoundFault:
             logger.info("Refresh already completed/cancelled")
         else:
@@ -203,7 +204,7 @@ def handle_start_refresh(event, _context):
             for _ in range(18):
                 time.sleep(5)
                 status_resp = autoscaling.describe_instance_refreshes(
-                    AutoScalingGroupName=ASG_NAME,
+                    AutoScalingGroupName=asg_name,
                     InstanceRefreshIds=[existing_id]
                 )
                 refreshes = status_resp.get('InstanceRefreshes', [])
@@ -218,7 +219,7 @@ def handle_start_refresh(event, _context):
                 logger.warning(f"Previous refresh {existing_id} still not cancelled after 90s (final status: {status})")
 
     response = autoscaling.start_instance_refresh(
-        AutoScalingGroupName=ASG_NAME,
+        AutoScalingGroupName=asg_name,
         Strategy='Rolling',
         DesiredConfiguration=desired_config,
         Preferences={
@@ -244,10 +245,11 @@ def handle_check_refresh_status(event, _context):
     if not instance_refresh_id:
         raise ValueError("Missing required field: instance_refresh_id")
 
+    asg_name = event.get('asg_name', ASG_NAME)
     logger.info(f"Checking instance refresh status: {instance_refresh_id}")
 
     response = autoscaling.describe_instance_refreshes(
-        AutoScalingGroupName=ASG_NAME,
+        AutoScalingGroupName=asg_name,
         InstanceRefreshIds=[instance_refresh_id],
     )
 
@@ -264,7 +266,7 @@ def handle_check_refresh_status(event, _context):
     # Calculate instances updated from percentage and total
     desired = 0
     asg_response = autoscaling.describe_auto_scaling_groups(
-        AutoScalingGroupNames=[ASG_NAME]
+        AutoScalingGroupNames=[asg_name]
     )
     groups = asg_response.get('AutoScalingGroups', [])
     if groups:
@@ -293,9 +295,10 @@ def handle_check_refresh_status(event, _context):
     }
 
 
-def handle_check_health(_event, _context):
+def handle_check_health(event, _context):
     """Check deployment health via CloudWatch metrics."""
-    logger.info("Checking deployment health metrics")
+    asg_name = event.get('asg_name', ASG_NAME)
+    logger.info(f"Checking deployment health metrics for ASG: {asg_name}")
 
     now = datetime.now(timezone.utc)
     start_time = now - timedelta(minutes=5)
@@ -338,7 +341,7 @@ def handle_check_health(_event, _context):
                     'Namespace': 'AWS/EC2',
                     'MetricName': 'CPUUtilization',
                     'Dimensions': [
-                        {'Name': 'AutoScalingGroupName', 'Value': ASG_NAME},
+                        {'Name': 'AutoScalingGroupName', 'Value': asg_name},
                     ],
                 },
                 'Period': 300,
@@ -394,13 +397,14 @@ def handle_check_health(_event, _context):
     }
 
 
-def handle_rollback(_event, _context):
+def handle_rollback(event, _context):
     """Manually trigger a rollback of the instance refresh."""
-    logger.info(f"Rolling back instance refresh for ASG: {ASG_NAME}")
+    asg_name = event.get('asg_name', ASG_NAME)
+    logger.info(f"Rolling back instance refresh for ASG: {asg_name}")
 
     try:
         autoscaling.rollback_instance_refresh(
-            AutoScalingGroupName=ASG_NAME
+            AutoScalingGroupName=asg_name
         )
     except ClientError as e:
         error_code = e.response['Error']['Code']
@@ -418,7 +422,7 @@ def handle_rollback(_event, _context):
 
     return {
         'status': 'rolling_back',
-        'message': f'Rollback initiated for ASG {ASG_NAME}',
+        'message': f'Rollback initiated for ASG {asg_name}',
     }
 
 
@@ -426,6 +430,8 @@ def handle_alarm_triggered_rollback(_event, _context):
     """
     EventBridge entry point for alarm-driven rollback.
     Idempotent: only proceeds if canary state is 'deploying'.
+    Uses the Lambda's configured ASG_NAME (set via Terraform per-component).
+    Each component's EventBridge rule only fires for its own composite alarm.
     """
     logger.info("Alarm-triggered rollback received")
 
@@ -472,7 +478,7 @@ def handle_notify(event, _context):
 
     notification = {
         'environment': ENVIRONMENT,
-        'asg_name': ASG_NAME,
+        'asg_name': event.get('asg_name', ASG_NAME),
         'status': status,
         'image_tag': image_tag,
         'stage': stage,

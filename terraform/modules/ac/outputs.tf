@@ -35,6 +35,16 @@ output "asg_arn" {
   value       = aws_autoscaling_group.ac.arn
 }
 
+output "launch_template_arn" {
+  description = "AC launch template ARN (for canary deployment IAM)"
+  value       = aws_launch_template.ac.arn
+}
+
+output "target_group_arn_suffix" {
+  description = "TCP target group ARN suffix for CloudWatch alarm dimensions"
+  value       = aws_lb_target_group.ac_tcp.arn_suffix
+}
+
 output "security_group_id" {
   description = "AC security group ID"
   value       = aws_security_group.ac.id

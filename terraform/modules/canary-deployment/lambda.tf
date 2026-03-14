@@ -19,7 +19,7 @@ resource "aws_lambda_function" "orchestrator" {
   depends_on = [aws_cloudwatch_log_group.orchestrator]
 
   filename         = data.archive_file.orchestrator.output_path
-  function_name    = "${var.name_prefix}-canary-orchestrator"
+  function_name    = "${var.name_prefix}-canary-orchestrator-${var.component}"
   role             = aws_iam_role.orchestrator.arn
   handler          = "canary_orchestrator.handler"
   source_code_hash = data.archive_file.orchestrator.output_base64sha256
@@ -45,7 +45,7 @@ resource "aws_lambda_function" "orchestrator" {
   }
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-canary-orchestrator"
+    Name      = "${var.name_prefix}-canary-orchestrator-${var.component}"
     Component = "canary"
     Cell      = var.cell_id
   })
@@ -56,12 +56,12 @@ resource "aws_lambda_function" "orchestrator" {
 # ==============================================================================
 
 resource "aws_cloudwatch_log_group" "orchestrator" {
-  name              = "/aws/lambda/${var.name_prefix}-canary-orchestrator"
+  name              = "/aws/lambda/${var.name_prefix}-canary-orchestrator-${var.component}"
   retention_in_days = local.is_prod ? 90 : 14
   kms_key_id        = var.logs_kms_key_arn
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-canary-orchestrator-logs"
+    Name      = "${var.name_prefix}-canary-orchestrator-${var.component}-logs"
     Component = "canary"
     Cell      = var.cell_id
   })
@@ -72,7 +72,7 @@ resource "aws_cloudwatch_log_group" "orchestrator" {
 # ==============================================================================
 
 resource "aws_iam_role" "orchestrator" {
-  name = "${var.name_prefix}-canary-orchestrator-role"
+  name = "${var.name_prefix}-canary-orchestrator-${var.component}-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -88,7 +88,7 @@ resource "aws_iam_role" "orchestrator" {
   })
 
   tags = merge(var.tags, {
-    Name      = "${var.name_prefix}-canary-orchestrator-role"
+    Name      = "${var.name_prefix}-canary-orchestrator-${var.component}-role"
     Component = "canary"
     Cell      = var.cell_id
   })
@@ -100,7 +100,7 @@ resource "aws_iam_role_policy_attachment" "orchestrator_basic" {
 }
 
 resource "aws_iam_role_policy" "orchestrator" {
-  name = "${var.name_prefix}-canary-orchestrator-policy"
+  name = "${var.name_prefix}-canary-orchestrator-${var.component}-policy"
   role = aws_iam_role.orchestrator.id
 
   policy = jsonencode({

@@ -1008,7 +1008,7 @@ jobs:
 
           # Check if canary state machine exists (indicates mature infra)
           STATE_MACHINE_ARN=$(aws ssm get-parameter \
-            --name "/prod/nhp/${CELL_ID}/canary/state-machine-arn" \
+            --name "/prod/nhp/${CELL_ID}/canary/server/state-machine-arn" \
             --query "Parameter.Value" --output text 2>/dev/null || echo "")
 
           if [[ -n "$STATE_MACHINE_ARN" && "$STATE_MACHINE_ARN" != "initial" ]]; then
@@ -1083,7 +1083,7 @@ jobs:
           START_TIME=$(date +%s)
 
           STATE_MACHINE_ARN=$(aws ssm get-parameter \
-            --name "/prod/nhp/${CELL_ID}/canary/state-machine-arn" \
+            --name "/prod/nhp/${CELL_ID}/canary/ac/state-machine-arn" \
             --query "Parameter.Value" --output text 2>/dev/null || echo "")
 
           if [[ -n "$STATE_MACHINE_ARN" && "$STATE_MACHINE_ARN" != "initial" ]]; then

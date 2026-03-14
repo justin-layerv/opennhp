@@ -409,6 +409,7 @@ module "canary_deployment" {
   environment = var.environment
   name_prefix = local.name_prefix
   cell_id     = var.cell_id
+  component   = "server"
   tags        = merge(local.common_tags, { Service = "nhp-server" })
 
   asg_name                = module.compute.asg_name
@@ -420,6 +421,31 @@ module "canary_deployment" {
   alerts_sns_topic_arn    = module.monitoring.sns_topic_arn
   logs_kms_key_arn        = module.kms.logs_key_arn
   ssm_image_tag_parameter = module.compute.ssm_image_tag_parameter
+
+  checkpoint_percentages   = var.canary_checkpoint_percentages
+  checkpoint_delay_seconds = var.canary_checkpoint_delay_seconds
+  instance_warmup_seconds  = var.canary_instance_warmup_seconds
+}
+
+module "canary_deployment_ac" {
+  source = "./modules/canary-deployment"
+  count  = var.enable_canary_deployment && var.deploy_ac ? 1 : 0
+
+  environment = var.environment
+  name_prefix = local.name_prefix
+  cell_id     = var.cell_id
+  component   = "ac"
+  tags        = merge(local.common_tags, { Service = "nhp-ac" })
+
+  asg_name                = module.ac[0].asg_name
+  asg_arn                 = module.ac[0].asg_arn
+  launch_template_arn     = module.ac[0].launch_template_arn
+  ebs_kms_key_arn         = module.kms.ebs_key_arn
+  nlb_arn_suffix          = module.ac[0].nlb_arn_suffix
+  target_group_arn_suffix = module.ac[0].target_group_arn_suffix
+  alerts_sns_topic_arn    = module.monitoring.sns_topic_arn
+  logs_kms_key_arn        = module.kms.logs_key_arn
+  ssm_image_tag_parameter = module.ac[0].ssm_image_tag_parameter
 
   checkpoint_percentages   = var.canary_checkpoint_percentages
   checkpoint_delay_seconds = var.canary_checkpoint_delay_seconds
