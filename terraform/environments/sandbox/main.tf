@@ -257,6 +257,9 @@ module "nhp" {
   status_page_domain         = var.status_page_domain
   status_page_hosted_zone_id = var.status_page_hosted_zone_id
 
+  # Redis (distributed rate limiting)
+  deploy_redis = var.deploy_redis
+
   # Billing
   deploy_billing                     = var.deploy_billing
   billing_stripe_secret_name         = var.billing_stripe_secret_name
