@@ -355,6 +355,10 @@ auth0_spa_web_origins = [
 # Store in GitHub Secrets: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET,
 #                          GITHUB_OAUTH_CLIENT_ID, GITHUB_OAUTH_CLIENT_SECRET
 
+# Custom domain certificate manager — provisions Let's Encrypt certs for
+# customer custom domains registered via the QURL API.
+deploy_custom_domain_cert = true
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"
