@@ -288,8 +288,10 @@ enable_canary_deployment = true
 deploy_redis = true
 
 # Cost analytics (CUR 2.0 → Athena → Grafana)
-# Shared mgmt resources (S3, Glue, Athena) are managed by sandbox environment only.
-# Both environments query the same consolidated billing data.
+# Cost analytics: disabled in prod because sandbox owns the shared backend
+# (S3 bucket, Glue crawler, Athena workgroup) in the mgmt account. Enabling
+# here would create duplicate resources. Both environments query the same
+# consolidated CUR 2.0 billing data via the cross-account role below.
 deploy_cost_analytics                 = false
 cross_account_cost_analytics_role_arn = "arn:aws:iam::165115313779:role/nhp-cost-analytics-access"
 
