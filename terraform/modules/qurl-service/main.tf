@@ -821,6 +821,10 @@ resource "aws_lb_target_group" "qurl" {
   vpc_id      = var.vpc_id
   target_type = "ip"
 
+  # Match compute/AC modules (30s). AWS default is 300s which delays
+  # post-deploy smoke tests — old tasks serve stale responses during draining.
+  deregistration_delay = 30
+
   # ALB health check - uses readiness probe (deep dependency checks)
   # /health/ready verifies all critical dependencies are healthy before routing traffic
   # Returns 200 for healthy/degraded, 503 for unhealthy (critical dependency failure)
