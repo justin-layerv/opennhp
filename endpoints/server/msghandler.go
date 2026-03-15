@@ -52,6 +52,8 @@ const (
 	MetricAutoAssignment               = "AutoAssignment"
 	MetricKnockForwardSuccess          = "KnockForwardSuccess"
 	MetricKnockForwardFailure          = "KnockForwardFailure"
+	MetricKnockNoAC                    = "KnockNoAC"
+	MetricACPeerCount                  = "ACPeerCount"
 	MetricBroadcastPartialFail         = "BroadcastPartialFail"
 	MetricBroadcastDurationMs          = "BroadcastDurationMs"
 	MetricLicenseValidationRateLimited = "LicenseValidationRateLimited"

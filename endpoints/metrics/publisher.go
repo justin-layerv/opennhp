@@ -43,6 +43,10 @@ const (
 // HealthProbe is a function that returns true if the storage backend is healthy.
 type HealthProbe func(ctx context.Context) bool
 
+// GaugeFunc is a function that returns the current value for a gauge metric.
+// Registered via RegisterGaugeFunc, called each flush interval.
+type GaugeFunc func() float64
+
 // Config configures a metrics Publisher.
 type Config struct {
 	Namespace  string            // CloudWatch namespace (e.g. "NHP/AC", "LayerV/NHP")
@@ -69,9 +73,10 @@ type Publisher struct {
 	latencies   map[string][]float64        // metric name → recorded latencies
 	dims        []types.Dimension
 	stop        chan struct{}
-	wg          sync.WaitGroup // tracks flushLoop goroutine for graceful shutdown
-	once        sync.Once      // ensures Stop is idempotent
-	healthProbe HealthProbe    // optional: emits StorageHealthy gauge each flush
+	wg          sync.WaitGroup       // tracks flushLoop goroutine for graceful shutdown
+	once        sync.Once            // ensures Stop is idempotent
+	healthProbe HealthProbe          // optional: emits StorageHealthy gauge each flush
+	gaugeFuncs  map[string]GaugeFunc // metric name → func called each flush
 }
 
 // NewPublisher creates a CloudWatch metrics publisher.
@@ -95,6 +100,7 @@ func NewPublisher(cfg Config) *Publisher {
 		latencies:   make(map[string][]float64),
 		dims:        cfg.Dimensions,
 		stop:        make(chan struct{}),
+		gaugeFuncs:  make(map[string]GaugeFunc),
 	}
 
 	mp.wg.Add(1)
@@ -152,6 +158,29 @@ func (mp *Publisher) AddCounterWithDims(name string, value float64, extraDims []
 	mp.mu.Unlock()
 }
 
+// SetGauge sets a gauge metric to the given value.
+// Gauges are always published (even when 0), making them suitable for
+// state indicators like peer counts or health status.
+func (mp *Publisher) SetGauge(name string, value float64) {
+	if mp == nil {
+		return
+	}
+	mp.mu.Lock()
+	mp.gauges[name] = value
+	mp.mu.Unlock()
+}
+
+// RegisterGaugeFunc registers a function that is called each flush interval
+// to update the named gauge metric. The function should return the current value.
+func (mp *Publisher) RegisterGaugeFunc(name string, fn GaugeFunc) {
+	if mp == nil {
+		return
+	}
+	mp.mu.Lock()
+	mp.gaugeFuncs[name] = fn
+	mp.mu.Unlock()
+}
+
 // SetHealthProbe registers a function that is called each flush interval.
 // The result is published as StorageHealthy (1.0 = healthy, 0.0 = unhealthy).
 func (mp *Publisher) SetHealthProbe(probe HealthProbe) {
@@ -203,12 +232,36 @@ func (mp *Publisher) flushLoop() {
 	for {
 		select {
 		case <-ticker.C:
+			mp.collectGauges()
 			mp.probeHealth()
 			mp.flush()
 		case <-mp.stop:
 			return
 		}
 	}
+}
+
+// collectGauges calls all registered gauge functions and updates their values.
+// Gauge funcs are called outside the lock to avoid holding it during potentially
+// slow operations (e.g., ACPeerCount acquires its own read lock).
+func (mp *Publisher) collectGauges() {
+	mp.mu.RLock()
+	funcs := make(map[string]GaugeFunc, len(mp.gaugeFuncs))
+	for name, fn := range mp.gaugeFuncs {
+		funcs[name] = fn
+	}
+	mp.mu.RUnlock()
+
+	values := make(map[string]float64, len(funcs))
+	for name, fn := range funcs {
+		values[name] = fn()
+	}
+
+	mp.mu.Lock()
+	for name, val := range values {
+		mp.gauges[name] = val
+	}
+	mp.mu.Unlock()
 }
 
 // probeHealth runs the health probe (if set) and records the result as a gauge.

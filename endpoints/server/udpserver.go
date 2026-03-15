@@ -1801,6 +1801,8 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 	ackMsg.ACTokens = make(map[string]string)
 	ackMsg.PreAccessActions = make(map[string]*common.PreAccessInfo)
 
+	knockHadNoAC := false
+
 	for resName, addrs := range acDstIpMap {
 		resInfo := res.Resources[resName]
 		if resInfo == nil {
@@ -1822,6 +1824,7 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 		}
 		s.acConnectionMapMutex.RUnlock()
 		if !found || len(connsCopy) == 0 {
+			knockHadNoAC = true
 			log.Warning("server-agent(%s@%s)-ac(%s)[handleNhpOpenResource] no ac connection is available", knkMsg.UserId, addrStr, acId)
 			artMsg := &common.ACOpsResultMsg{}
 			err = common.ErrACConnectionNotFound
@@ -1853,6 +1856,11 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 		}(resName, resInfo, addrs)
 	}
 	acWg.Wait()
+
+	// Increment once per knock request (not per resource) for alarm accuracy
+	if knockHadNoAC {
+		s.metrics.IncrCounter(MetricKnockNoAC)
+	}
 
 	var successCount int
 	for _, artMsg := range artMsgs {

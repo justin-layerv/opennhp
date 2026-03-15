@@ -283,7 +283,7 @@ func (us *UdpServer) registerSelfInAssignmentTable() {
 Week 1 (immediate, blocks nothing):
 ├── H1: AC-aware health checks (eliminates knock failures) ✅ DONE
 ├── H3: Faster re-registration interval (20s → reduces window) ✅ DONE
-└── H6: AC connection metrics (visibility)
+└── H6: AC connection metrics (visibility) ✅ DONE
 
 Week 2 (reduces recovery time):
 ├── H4: Graceful shutdown drain (eliminates planned-shutdown window)

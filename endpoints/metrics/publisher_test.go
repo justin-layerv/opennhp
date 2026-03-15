@@ -35,8 +35,72 @@ func TestPublisher_NilSafety(t *testing.T) {
 	mp.IncrCounterWithDims("test", nil)
 	mp.AddCounterWithDims("test", 5, nil)
 	mp.RecordLatency("test", 1.0)
+	mp.SetGauge("test", 42)
+	mp.RegisterGaugeFunc("test", func() float64 { return 1 })
 	mp.SetHealthProbe(func(ctx context.Context) bool { return true })
 	mp.Stop()
+}
+
+func TestPublisher_SetGauge(t *testing.T) {
+	mp := newTestPublisher(t, nil)
+
+	mp.SetGauge("ACPeerCount", 5)
+
+	mp.mu.Lock()
+	val, exists := mp.gauges["ACPeerCount"]
+	mp.mu.Unlock()
+
+	if !exists {
+		t.Fatal("expected ACPeerCount gauge to exist")
+	}
+	if val != 5 {
+		t.Errorf("expected ACPeerCount=5, got %v", val)
+	}
+
+	// Zero is a valid gauge value (always published)
+	mp.SetGauge("ACPeerCount", 0)
+	mp.mu.Lock()
+	val = mp.gauges["ACPeerCount"]
+	mp.mu.Unlock()
+	if val != 0 {
+		t.Errorf("expected ACPeerCount=0, got %v", val)
+	}
+}
+
+func TestPublisher_RegisterGaugeFunc(t *testing.T) {
+	mp := newTestPublisher(t, nil)
+
+	peerCount := 3
+	mp.RegisterGaugeFunc("ACPeerCount", func() float64 {
+		return float64(peerCount)
+	})
+
+	// Before collectGauges, gauge should not exist
+	mp.mu.Lock()
+	_, exists := mp.gauges["ACPeerCount"]
+	mp.mu.Unlock()
+	if exists {
+		t.Error("expected ACPeerCount gauge to not exist before collectGauges")
+	}
+
+	// After collectGauges, gauge should reflect the function's return value
+	mp.collectGauges()
+	mp.mu.Lock()
+	val := mp.gauges["ACPeerCount"]
+	mp.mu.Unlock()
+	if val != 3 {
+		t.Errorf("expected ACPeerCount=3, got %v", val)
+	}
+
+	// Change the underlying value and collect again
+	peerCount = 0
+	mp.collectGauges()
+	mp.mu.Lock()
+	val = mp.gauges["ACPeerCount"]
+	mp.mu.Unlock()
+	if val != 0 {
+		t.Errorf("expected ACPeerCount=0, got %v", val)
+	}
 }
 
 func TestPublisher_SetHealthProbe(t *testing.T) {
@@ -576,6 +640,7 @@ func newTestPublisher(t *testing.T, client cloudWatchClient) *Publisher {
 		dimCounters: make(map[string]*dimCounterEntry),
 		gauges:      make(map[string]float64),
 		latencies:   make(map[string][]float64),
+		gaugeFuncs:  make(map[string]GaugeFunc),
 		stop:        make(chan struct{}),
 	}
 }
