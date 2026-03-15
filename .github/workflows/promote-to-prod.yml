@@ -1021,22 +1021,32 @@ jobs:
           echo "--- Deploying NHP Server ---"
           START_TIME=$(date +%s)
 
+          # Stream startup logs to the console in the background
+          ./.github/scripts/tail-deploy-logs.sh server prod "$CELL_ID" &
+          LOG_TAIL_PID=$!
+
           # Check if canary state machine exists (indicates mature infra)
+          DEPLOY_EXIT=0
           STATE_MACHINE_ARN=$(aws ssm get-parameter \
             --name "/prod/nhp/${CELL_ID}/canary/server/state-machine-arn" \
             --query "Parameter.Value" --output text 2>/dev/null || echo "")
 
           if [[ -n "$STATE_MACHINE_ARN" && "$STATE_MACHINE_ARN" != "initial" ]]; then
             echo "deploy_method=canary" >> "$GITHUB_OUTPUT"
-            ./.github/scripts/dispatch-and-poll-canary.sh server "$IMAGE_TAG" prod "$CELL_ID"
+            ./.github/scripts/dispatch-and-poll-canary.sh server "$IMAGE_TAG" prod "$CELL_ID" || DEPLOY_EXIT=$?
           else
             echo "deploy_method=direct" >> "$GITHUB_OUTPUT"
             echo "::notice::No canary state machine — using direct SSM + instance refresh (first deploy)"
-            ./.github/scripts/update-ssm-image-tag.sh prod server "$IMAGE_TAG" --refresh
+            ./.github/scripts/update-ssm-image-tag.sh prod server "$IMAGE_TAG" --refresh || DEPLOY_EXIT=$?
           fi
+
+          # Stop log tailing and propagate the deploy exit code
+          kill "$LOG_TAIL_PID" 2>/dev/null || true
+          wait "$LOG_TAIL_PID" 2>/dev/null || true
 
           DURATION=$(( $(date +%s) - START_TIME ))
           echo "duration=${DURATION}s" >> "$GITHUB_OUTPUT"
+          exit "$DEPLOY_EXIT"
 
       - name: Server deploy summary
         if: always() && steps.deploy-server-step.outcome != 'skipped'
@@ -1097,21 +1107,32 @@ jobs:
           echo "--- Deploying Access Controller ---"
           START_TIME=$(date +%s)
 
+          # Stream startup logs to the console in the background
+          # AC log group has no cell_id: /layerv/nhp/{env}/ac (unlike server which includes cell)
+          ./.github/scripts/tail-deploy-logs.sh ac prod &
+          LOG_TAIL_PID=$!
+
+          DEPLOY_EXIT=0
           STATE_MACHINE_ARN=$(aws ssm get-parameter \
             --name "/prod/nhp/${CELL_ID}/canary/ac/state-machine-arn" \
             --query "Parameter.Value" --output text 2>/dev/null || echo "")
 
           if [[ -n "$STATE_MACHINE_ARN" && "$STATE_MACHINE_ARN" != "initial" ]]; then
             echo "deploy_method=canary" >> "$GITHUB_OUTPUT"
-            ./.github/scripts/dispatch-and-poll-canary.sh ac "$IMAGE_TAG" prod "$CELL_ID"
+            ./.github/scripts/dispatch-and-poll-canary.sh ac "$IMAGE_TAG" prod "$CELL_ID" || DEPLOY_EXIT=$?
           else
             echo "deploy_method=direct" >> "$GITHUB_OUTPUT"
             echo "::notice::No canary state machine — using direct SSM + instance refresh (first deploy)"
-            ./.github/scripts/update-ssm-image-tag.sh prod ac "$IMAGE_TAG" --refresh
+            ./.github/scripts/update-ssm-image-tag.sh prod ac "$IMAGE_TAG" --refresh || DEPLOY_EXIT=$?
           fi
+
+          # Stop log tailing and propagate the deploy exit code
+          kill "$LOG_TAIL_PID" 2>/dev/null || true
+          wait "$LOG_TAIL_PID" 2>/dev/null || true
 
           DURATION=$(( $(date +%s) - START_TIME ))
           echo "duration=${DURATION}s" >> "$GITHUB_OUTPUT"
+          exit "$DEPLOY_EXIT"
 
       - name: AC deploy summary
         if: always() && steps.deploy-ac-step.outcome != 'skipped'

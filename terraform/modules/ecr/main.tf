@@ -596,7 +596,9 @@ resource "aws_iam_policy" "terraform_read" {
           "cloudwatch:List*",
           "logs:Describe*",
           "logs:Get*",
-          "logs:List*"
+          "logs:List*",
+          "logs:FilterLogEvents",
+          "logs:StartLiveTail"
         ]
         Resource = "*"
       },
