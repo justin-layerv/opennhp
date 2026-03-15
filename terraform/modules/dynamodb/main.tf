@@ -1073,7 +1073,7 @@ resource "aws_dynamodb_table" "qurl_domains" {
   })
 }
 
-# qurl-access-codes: Access codes for login portal code redemption
+# qurl-access-codes: Access codes for resource sharing (redeemed via /login?tab=code)
 # PK: access_code_id
 # GSI: code-hash-index (lookup by hashed code), owner-index (list codes by owner)
 resource "aws_dynamodb_table" "qurl_access_codes" {

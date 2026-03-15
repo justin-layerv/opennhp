@@ -1608,10 +1608,9 @@ resource "aws_iam_role_policy_attachment" "qurl_ecs_deploy" {
   policy_arn = aws_iam_policy.qurl_ecs_deploy[0].arn
 }
 
-# Static site permissions (QURL Link + Login Portal)
+# Static site permissions (QURL Link)
 # Allows CI to create/manage CloudFront distributions and S3 buckets for static sites:
 # - qurl.link redirect page
-# - login portal (login.layerv.xyz / login.layerv.ai)
 #
 # Wildcard usage explanation:
 # - CloudFront uses Resource="*" because CloudFront resources are global and distribution
@@ -1715,9 +1714,7 @@ resource "aws_iam_policy" "qurl_link_static" {
         ]
         Resource = [
           "arn:aws:s3:::layerv-nhp-*-qurl-link",
-          "arn:aws:s3:::layerv-nhp-*-qurl-link/*",
-          "arn:aws:s3:::layerv-nhp-*-login-portal",
-          "arn:aws:s3:::layerv-nhp-*-login-portal/*"
+          "arn:aws:s3:::layerv-nhp-*-qurl-link/*"
         ]
       },
       {
