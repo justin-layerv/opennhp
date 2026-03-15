@@ -207,6 +207,17 @@ if [[ $WAIT_ELAPSED -ge $WAIT_TIMEOUT ]]; then
   exit 1
 fi
 
+# Step 8: Post-stability settling period
+# After ECS reports stability, ALB target deregistration and connection draining
+# may still be in progress. Old tasks can serve stale responses until
+# deregistration completes (configured to 30s in Terraform). A 30s settling
+# period ensures the ALB has fully shifted traffic to new targets.
+SETTLE_SECONDS=30
+echo ""
+echo "Step 8: Waiting ${SETTLE_SECONDS}s for ALB connection draining..."
+sleep "$SETTLE_SECONDS"
+echo "  Settling complete."
+
 echo ""
 echo "============================================"
 echo "ECS Service Deploy Complete"
