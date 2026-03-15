@@ -752,43 +752,6 @@ jobs:
           AUTH0_CLIENT_SECRET: ${{ secrets.AUTH0_CLIENT_SECRET }}
         run: ./.github/scripts/fetch-auth0-token.sh terraform/environments/sandbox/terraform.tfvars sandbox
 
-      - name: Migrate Auth0 tenant resources to prod
-        working-directory: terraform/environments/sandbox
-        env:
-          TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
-          TF_VAR_auth_aes_key: ${{ secrets.NHP_AUTH_AES_KEY }}
-          TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
-          TF_VAR_grafana_auth: ${{ secrets.GRAFANA_AUTH }}
-          TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
-          TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
-          TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
-          TF_VAR_image_tag: ${{ needs.setup.outputs.image_tag }}
-        run: |
-          set -euo pipefail
-          # One-time migration: remove Auth0 tenant resources from sandbox state.
-          # These resources are now managed by the prod environment.
-          # Safe to re-run — terraform state rm is a no-op if resource isn't in state.
-          TENANT_RESOURCES=(
-            "module.auth0.auth0_role.user[0]"
-            "module.auth0.auth0_role_permissions.user[0]"
-            "module.auth0.auth0_action.default_permissions[0]"
-            "module.auth0.auth0_trigger_actions.post_login[0]"
-            "module.auth0.auth0_branding.layerv[0]"
-            "module.auth0.auth0_branding_theme.layerv[0]"
-            "module.auth0.auth0_attack_protection.protection[0]"
-            "module.auth0.auth0_email_provider.ses[0]"
-            "module.auth0.auth0_email_template.verify_email[0]"
-            "module.auth0.auth0_email_template.welcome_email[0]"
-            "module.auth0.auth0_email_template.reset_email[0]"
-            "module.auth0.aws_iam_user.auth0_ses[0]"
-            "module.auth0.aws_iam_user_policy.auth0_ses_send[0]"
-            "module.auth0.aws_iam_access_key.auth0_ses[0]"
-            "module.auth0.terraform_data.email_provider_trigger[0]"
-          )
-          for resource in "${TENANT_RESOURCES[@]}"; do
-            terraform state rm "$resource" 2>/dev/null || true
-          done
-
       - name: Handle ASG Attachment Migrations
         working-directory: terraform/environments/sandbox
         env:
