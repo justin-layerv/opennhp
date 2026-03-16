@@ -4,10 +4,17 @@
 name: Build and Test Code on Ubuntu
 
 on:
-  push:
-    branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - 'LICENSE'
+      - 'docs/**'
+
+concurrency:
+  group: "ubuntu-build-${{ github.ref }}"
+  cancel-in-progress: true
 
 env:
   GO_VERSION: '1.25.7'
