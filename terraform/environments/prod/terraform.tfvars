@@ -215,8 +215,9 @@ qurl_autoscaling_min_capacity = 3
 qurl_autoscaling_max_capacity = 10
 
 # GeoIP database for geo-restriction policies (geo_allowlist/geo_denylist)
-qurl_geoip_enabled = true
-qurl_geoip_s3_uri  = "s3://layerv-nhp-prod-plugins/geoip/GeoLite2-Country.mmdb"
+qurl_geoip_enabled        = true
+qurl_geoip_s3_uri         = "s3://layerv-nhp-prod-plugins/geoip/GeoLite2-Country.mmdb"
+qurl_geoip_s3_kms_key_arn = "arn:aws:kms:us-east-2:235500187906:key/1a8cbf38-72ea-48a3-9a93-cb9762c83f50"
 
 # QURL AC Fleet defaults
 qurl_default_ac_id   = "layerv-ac-tf"

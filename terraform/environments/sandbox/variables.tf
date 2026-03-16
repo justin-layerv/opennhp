@@ -769,6 +769,12 @@ variable "qurl_geoip_s3_uri" {
   default     = ""
 }
 
+variable "qurl_geoip_s3_kms_key_arn" {
+  description = "KMS key ARN used to encrypt the GeoIP S3 bucket"
+  type        = string
+  default     = ""
+}
+
 # QURL Observability (OpenTelemetry)
 variable "qurl_otel_enabled" {
   description = "Enable OpenTelemetry instrumentation for QURL service"

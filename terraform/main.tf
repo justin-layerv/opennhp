@@ -994,9 +994,10 @@ module "qurl_service" {
   custom_domain_nlb_target  = var.qurl_custom_domain_enabled && var.deploy_ac ? module.ac[0].nlb_dns_name : ""
 
   # GeoIP
-  geoip_enabled = var.qurl_geoip_enabled
-  geoip_db_path = var.qurl_geoip_db_path
-  geoip_s3_uri  = var.qurl_geoip_s3_uri
+  geoip_enabled        = var.qurl_geoip_enabled
+  geoip_db_path        = var.qurl_geoip_db_path
+  geoip_s3_uri         = var.qurl_geoip_s3_uri
+  geoip_s3_kms_key_arn = var.qurl_geoip_s3_kms_key_arn
 
   # Observability (OpenTelemetry)
   otel_enabled           = var.qurl_otel_enabled

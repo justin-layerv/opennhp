@@ -399,12 +399,20 @@ resource "aws_iam_role_policy" "task_geoip_s3" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid      = "GeoIPDatabaseDownload"
-      Effect   = "Allow"
-      Action   = ["s3:GetObject"]
-      Resource = [replace(var.geoip_s3_uri, "s3://", "arn:aws:s3:::")]
-    }]
+    Statement = concat(
+      [{
+        Sid      = "GeoIPDatabaseDownload"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = [replace(var.geoip_s3_uri, "s3://", "arn:aws:s3:::")]
+      }],
+      var.geoip_s3_kms_key_arn != "" ? [{
+        Sid      = "GeoIPKMSDecrypt"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = [var.geoip_s3_kms_key_arn]
+      }] : [],
+    )
   })
 }
 

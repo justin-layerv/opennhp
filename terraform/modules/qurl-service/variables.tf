@@ -589,6 +589,12 @@ variable "geoip_s3_uri" {
   }
 }
 
+variable "geoip_s3_kms_key_arn" {
+  description = "KMS key ARN used to encrypt the GeoIP S3 bucket. Required if the bucket uses SSE-KMS."
+  type        = string
+  default     = ""
+}
+
 # ==================== Grafana Cloud (ADOT Sidecar) ====================
 
 variable "grafana_cloud_enabled" {

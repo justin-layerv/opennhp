@@ -154,9 +154,10 @@ module "nhp" {
   qurl_custom_domain_enabled = var.qurl_custom_domain_enabled
 
   # QURL GeoIP
-  qurl_geoip_enabled = var.qurl_geoip_enabled
-  qurl_geoip_db_path = var.qurl_geoip_db_path
-  qurl_geoip_s3_uri  = var.qurl_geoip_s3_uri
+  qurl_geoip_enabled        = var.qurl_geoip_enabled
+  qurl_geoip_db_path        = var.qurl_geoip_db_path
+  qurl_geoip_s3_uri         = var.qurl_geoip_s3_uri
+  qurl_geoip_s3_kms_key_arn = var.qurl_geoip_s3_kms_key_arn
 
   # QURL Observability (OpenTelemetry)
   qurl_otel_enabled           = var.qurl_otel_enabled
