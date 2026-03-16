@@ -4,9 +4,11 @@ name: Build Binaries
 
 on:
   push:
-    branches: ["main"]
     tags:
       - 'v*'
+  schedule:
+    # Weekly cross-platform regression check (Monday 6am UTC)
+    - cron: '0 6 * * 1'
   workflow_dispatch:  # Manual trigger support
 
 # Restrict default permissions for security
