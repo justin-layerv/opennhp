@@ -49,8 +49,11 @@ permissions:
   contents: read
   pull-requests: write
 
+# Push events get a unique group per run so rapid-fire merges (e.g. Dependabot batches)
+# never cancel each other — deploy jobs have their own concurrency groups to serialize.
+# Without this, pending push runs get cancelled by newer ones, silently skipping deploys.
 concurrency:
-  group: nhp-${{ github.event.inputs.environment || 'sandbox' }}-${{ github.ref_name }}-${{ github.event_name }}
+  group: ${{ github.event_name == 'push' && format('nhp-push-{0}', github.run_id) || format('nhp-{0}-{1}-{2}', github.event.inputs.environment || 'sandbox', github.ref_name, github.event_name) }}
   cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 env:
@@ -708,6 +711,9 @@ jobs:
     runs-on: ubuntu-latest
     environment: sandbox
     timeout-minutes: 30
+    concurrency:
+      group: deploy-sandbox-infra
+      cancel-in-progress: false  # Let current TF apply finish, queue the next
     outputs:
       server_asg: ${{ steps.outputs.outputs.server_asg }}
       ac_asg: ${{ steps.outputs.outputs.ac_asg }}
