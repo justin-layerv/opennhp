@@ -481,6 +481,32 @@ resource "aws_dynamodb_table" "qurl_resources" {
   }
 
   attribute {
+    name = "target_url"
+    type = "S"
+  }
+
+  # GSI: Find resource by owner + target URL for deduplication (find-or-create pattern)
+  global_secondary_index {
+    name            = "owner-target-index"
+    hash_key        = "owner_id"
+    range_key       = "target_url"
+    projection_type = "ALL"
+  }
+
+  attribute {
+    name = "status"
+    type = "S"
+  }
+
+  # GSI: Query active resources by expiration window (for expiring-soon gauge reconciliation)
+  global_secondary_index {
+    name            = "status-index"
+    hash_key        = "status"
+    range_key       = "expires_at"
+    projection_type = "KEYS_ONLY"
+  }
+
+  attribute {
     name = "custom_domain"
     type = "S"
   }
