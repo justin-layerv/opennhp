@@ -570,7 +570,7 @@ else
             # This means terraform changes were introduced after the last image build and
             # may not have been successfully applied to sandbox yet.
             if [[ "$PROMOTION_TAG" != "$SANDBOX_COMMIT" ]]; then
-                TF_UNCOMMITTED=$(git diff --name-only "${PROMOTION_TAG}..${SANDBOX_COMMIT}" 2>/dev/null | grep -c '^terraform/' || echo "0")
+                TF_UNCOMMITTED=$(git diff --name-only "${PROMOTION_TAG}..${SANDBOX_COMMIT}" 2>/dev/null | grep -c '^terraform/' || true)
                 if (( TF_UNCOMMITTED > 0 )); then
                     msg="Terraform has ${TF_UNCOMMITTED} file(s) changed after image build (${PROMOTION_TAG:0:7}..${SANDBOX_COMMIT:0:7}). These may not be validated in sandbox."
                     warn "$msg"
