@@ -147,8 +147,9 @@ centralized_cert_domains = ["nhp.layerv.xyz", "*.nhp.layerv.xyz", "apps.layerv.x
 # customer custom domains registered via the QURL API.
 deploy_custom_domain_cert = true
 
-# CloudMap configuration
+# CloudMap configuration — enables server health filtering for knock forwarding
 nhp_cloudmap_service_name = "server"
+cloudmap_enabled          = true
 
 # Standalone AC license credentials for DynamoDB validation
 # Generated with: ./terraform/scripts/generate-ac-license.sh sandbox

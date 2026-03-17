@@ -17,10 +17,11 @@ import (
 
 // MockHealthChecker implements the HealthChecker interface for testing.
 type MockHealthChecker struct {
-	healthyIPs  map[string]bool
-	returnError error
-	callCount   int32 // atomic counter for concurrent tests
-	mu          sync.RWMutex
+	healthyIPs       map[string]bool
+	returnError      error
+	callCount        int32 // atomic counter for concurrent tests
+	cacheInvalidated atomic.Bool
+	mu               sync.RWMutex
 }
 
 // Compile-time check that MockHealthChecker implements HealthChecker
@@ -50,7 +51,7 @@ func (m *MockHealthChecker) GetHealthyServerIPs(ctx context.Context) (map[string
 }
 
 func (m *MockHealthChecker) InvalidateCache() {
-	// No-op for mock
+	m.cacheInvalidated.Store(true)
 }
 
 func (m *MockHealthChecker) IsNil() bool {

@@ -120,10 +120,16 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 		return err
 	}
 
-	// Initialize HTTP knock forwarder for server-to-server forwarding
-	if us.storage != nil && us.cloudMap != nil {
-		hs.httpForwarder = NewHttpKnockForwarder(us.storage, us.cloudMap, us.localIp, listenPort)
-		log.Info("HTTP knock forwarder initialized (localIP=%s, port=%d)", us.localIp, listenPort)
+	// Initialize HTTP knock forwarder for server-to-server forwarding.
+	// Requires storage backend (for AC assignment lookup). CloudMap is optional
+	// (used for health filtering of stale assignments if enabled).
+	if us.storage != nil {
+		var emitMetric MetricCounter
+		if us.metrics != nil {
+			emitMetric = us.metrics.IncrCounter
+		}
+		hs.httpForwarder = NewHttpKnockForwarder(us.storage, us.cloudMap, us.localIp, listenPort, emitMetric)
+		log.Info("HTTP knock forwarder initialized (localIP=%s, port=%d, cloudMap=%t)", us.localIp, listenPort, us.cloudMap != nil)
 	}
 
 	hs.initRouter()

@@ -469,6 +469,17 @@ func (s *UdpServer) Stop() {
 	}
 	// Best-effort cleanup: remove this server from AC assignments
 	s.cleanupOwnedAssignments()
+	// Best-effort cleanup: deregister from Cloud Map so peers stop forwarding to us
+	if s.cloudMap != nil && s.instanceID != "" {
+		drCtx, drCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer drCancel()
+		if err := s.cloudMap.DeregisterInstance(drCtx, s.instanceID); err != nil {
+			log.Warning("Failed to deregister instance %s from Cloud Map: %v", s.instanceID, err)
+			if s.metrics != nil {
+				s.metrics.IncrCounter(MetricCloudMapDeregisterFailure)
+			}
+		}
+	}
 	// Drain AC connections: send NHP_ARD redirecting ACs to NLB for immediate reconnect.
 	// Must run before close(s.signals.stop) because drain sends via s.sendMsgCh.
 	s.drainACConnections()

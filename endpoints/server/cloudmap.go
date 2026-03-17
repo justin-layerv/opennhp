@@ -330,6 +330,29 @@ func (c *CloudMapClient) RegisterInstanceAttributes(ctx context.Context, instanc
 	return nil
 }
 
+// DeregisterInstance removes this server from Cloud Map.
+// Called on graceful shutdown so peers stop forwarding to us immediately
+// instead of waiting for the 2s HTTP timeout per forward attempt.
+func (c *CloudMapClient) DeregisterInstance(ctx context.Context, instanceID string) error {
+	if c.serviceID == "" {
+		return fmt.Errorf("cloud map service ID not configured")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, c.operationTimeout)
+	defer cancel()
+
+	_, err := c.client.DeregisterInstance(ctx, &servicediscovery.DeregisterInstanceInput{
+		ServiceId:  aws.String(c.serviceID),
+		InstanceId: aws.String(instanceID),
+	})
+	if err != nil {
+		return fmt.Errorf("cloud map DeregisterInstance failed: %w", err)
+	}
+
+	log.Info("Deregistered Cloud Map instance %s", instanceID)
+	return nil
+}
+
 // FilterHealthyServers filters a list of server assignments to only include
 // servers that are currently healthy according to the health checker.
 // If health check fails, returns the original list (fail-open).

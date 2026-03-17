@@ -98,8 +98,9 @@ ac_customer_id        = "00000000000000000000000000" # Nil ULID for LayerV syste
 ac_license_key_hash   = "$2b$10$DOiwRhVzk94ZSllcY0Arye1hON734.qydu1ou2d/RSTklnvEVcRcO"
 ac_license_key_sha256 = "cd7f8df5284861a9ebfbe485085843b3631b8dbe325f272622473bfb4991bdfe"
 
-# CloudMap
+# CloudMap — enables server health filtering for knock forwarding
 nhp_cloudmap_service_name = "server"
+cloudmap_enabled          = true
 
 # Production domains
 production_domains = ["qurl.site", "qurl.link"]

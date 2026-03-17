@@ -42,6 +42,23 @@ type HttpKnockForwardResponse struct {
 // the receiving server doesn't have a direct AC connection.
 var errForwarderStopped = errors.New("forwarder is shutting down")
 
+// httpForwardHealthDecay is how long a server is considered unhealthy after a
+// failed forward. Prevents wasting 2s per request on known-dead servers.
+// 30s is long enough to avoid retry storms on dead servers but short enough
+// that a recovered server (e.g., after AC reconnection) becomes eligible
+// quickly. Matches the NLB target group health check interval (2 × 10s).
+const httpForwardHealthDecay = 30 * time.Second
+
+// failedServersEvictThreshold is the map size above which markFailed scans
+// for expired entries. Below this threshold, expired entries are cleaned up
+// lazily when encountered in filterForwardTargets. Set to 20 because typical
+// fleet sizes are 3-10 servers; eviction overhead is irrelevant at that scale.
+const failedServersEvictThreshold = 20
+
+// MetricCounter is a callback for emitting counter metrics without
+// coupling the forwarder to a specific metrics implementation.
+type MetricCounter func(name string)
+
 type HttpKnockForwarder struct {
 	storage    StorageBackend
 	cloudMap   HealthChecker
@@ -50,10 +67,17 @@ type HttpKnockForwarder struct {
 	httpClient *http.Client
 	stopped    atomic.Bool
 	wg         sync.WaitGroup // tracks in-flight forwards for graceful shutdown
+	emitMetric MetricCounter  // optional; nil-safe
+
+	// failedServers tracks servers that recently failed forward attempts.
+	// Key: InternalIP, Value: time of last failure.
+	// Servers are considered unhealthy for httpForwardHealthDecay after failure.
+	failedMu      sync.RWMutex
+	failedServers map[string]time.Time
 }
 
 // NewHttpKnockForwarder creates a new HTTP knock forwarder.
-func NewHttpKnockForwarder(storage StorageBackend, cloudMap HealthChecker, localIP string, httpPort int) *HttpKnockForwarder {
+func NewHttpKnockForwarder(storage StorageBackend, cloudMap HealthChecker, localIP string, httpPort int, emitMetric MetricCounter) *HttpKnockForwarder {
 	return &HttpKnockForwarder{
 		storage:  storage,
 		cloudMap: cloudMap,
@@ -62,6 +86,8 @@ func NewHttpKnockForwarder(storage StorageBackend, cloudMap HealthChecker, local
 		httpClient: &http.Client{
 			Timeout: 2 * time.Second, // Per-request timeout; must be < parent context (10s) to allow retries
 		},
+		emitMetric:    emitMetric,
+		failedServers: make(map[string]time.Time),
 	}
 }
 
@@ -133,6 +159,7 @@ func (f *HttpKnockForwarder) ForwardHttpKnock(
 		ackMsg, err := f.forwardToServer(ctx, srv, req, res)
 		if err != nil {
 			log.Warning("HTTP knock forward to %s (%s) failed: %v", srv.ID, srv.InternalIP, err)
+			f.markFailed(srv.InternalIP)
 			lastErr = err
 			continue
 		}
@@ -140,25 +167,76 @@ func (f *HttpKnockForwarder) ForwardHttpKnock(
 		return ackMsg, nil
 	}
 
+	// All forwards failed — invalidate CloudMap cache so next attempt gets fresh data
+	if f.cloudMap != nil && !f.cloudMap.IsNil() {
+		f.cloudMap.InvalidateCache()
+	}
+
 	return nil, fmt.Errorf("all %d servers failed for AC %s: %w", len(servers), acID, lastErr)
 }
 
 // filterForwardTargets returns assigned servers that are healthy and not this server.
 func (f *HttpKnockForwarder) filterForwardTargets(ctx context.Context, servers []ServerInfo) []ServerInfo {
-	// Filter to healthy servers first
+	// Filter to healthy servers first (CloudMap, if available)
 	healthy := servers
 	if f.cloudMap != nil && !f.cloudMap.IsNil() {
 		healthy = FilterHealthyServers(ctx, f.cloudMap, servers)
 	}
 
-	// Exclude self
+	// Exclude self and recently-failed servers
+	f.failedMu.RLock()
+	now := time.Now()
 	var targets []ServerInfo
 	for _, srv := range healthy {
-		if srv.InternalIP != f.localIP {
-			targets = append(targets, srv)
+		if srv.InternalIP == f.localIP {
+			continue
+		}
+		if failedAt, failed := f.failedServers[srv.InternalIP]; failed && now.Sub(failedAt) < httpForwardHealthDecay {
+			log.Debug("Skipping recently-failed server %s (%s), failed %v ago", srv.ID, srv.InternalIP, now.Sub(failedAt))
+			f.metric(MetricKnockForwardSkippedDead)
+			continue
+		}
+		targets = append(targets, srv)
+	}
+	f.failedMu.RUnlock()
+
+	// If all servers were filtered out by failure tracking, fall back to trying
+	// all non-self servers. Better to retry a possibly-recovered server than fail.
+	if len(targets) == 0 {
+		for _, srv := range healthy {
+			if srv.InternalIP != f.localIP {
+				targets = append(targets, srv)
+			}
+		}
+		if len(targets) > 0 {
+			f.metric(MetricKnockForwardFallback)
 		}
 	}
 	return targets
+}
+
+// markFailed records a forward failure for a server IP. Evicts expired entries
+// when the map exceeds failedServersEvictThreshold to avoid O(n) scans on
+// every failure while still bounding memory.
+func (f *HttpKnockForwarder) markFailed(ip string) {
+	f.failedMu.Lock()
+	now := time.Now()
+	f.failedServers[ip] = now
+	if len(f.failedServers) > failedServersEvictThreshold {
+		for k, v := range f.failedServers {
+			if now.Sub(v) >= httpForwardHealthDecay {
+				delete(f.failedServers, k)
+			}
+		}
+	}
+	f.failedMu.Unlock()
+}
+
+// metric emits a counter metric if a callback is configured.
+func (f *HttpKnockForwarder) metric(name string) {
+	if f.emitMetric != nil {
+		f.emitMetric(name)
+	}
 }
 
 // forwardToServer sends the knock request to a specific server's internal endpoint.
