@@ -751,8 +751,12 @@ resource "aws_autoscaling_group" "server" {
     version = aws_launch_template.server.latest_version
   }
 
-  health_check_type         = "ELB"
-  health_check_grace_period = 300 # Must cover full startup + AC connection: instance launch (~60s) + user data (~90s) + container start (~15s) + AC registration (~30s) = ~195s, padded to 300s
+  health_check_type         = "EC2"
+  health_check_grace_period = 180 # Instance launch (~60s) + user data (~90s) + container start (~15s) = ~165s
+  # NOTE: ELB health check causes instance refresh deadlock. The HTTPS TG uses
+  # /health/knock-ready (requires AC peers), but new instances can't get AC
+  # peers until InService — deadlock. The HTTP forwarder fix handles knock
+  # failures by forwarding to peers that have AC connections.
 
   # Publish ASG group metrics to CloudWatch (AWS/AutoScaling namespace).
   # Without this, metrics like GroupInServiceInstances are not emitted.

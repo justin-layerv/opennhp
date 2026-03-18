@@ -327,8 +327,8 @@ resource "aws_autoscaling_group" "server_green" {
     version = "$Latest"
   }
 
-  health_check_type         = "ELB"
-  health_check_grace_period = 300
+  health_check_type         = "EC2"
+  health_check_grace_period = 180
 
   # Publish ASG group metrics to CloudWatch (AWS/AutoScaling namespace).
   # Without this, metrics like GroupInServiceInstances are not emitted.
