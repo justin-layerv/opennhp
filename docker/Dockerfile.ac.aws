@@ -2,7 +2,7 @@
 # For AWS deployment with Let's Encrypt DNS-01 challenge via Route53
 #
 # Stage 1: Build the NHP AC binary
-ARG GO_VERSION=1.25.7
+ARG GO_VERSION=1.25.8
 FROM golang:${GO_VERSION}-bookworm AS builder
 
 WORKDIR /nhp-server
