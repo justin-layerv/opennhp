@@ -32,31 +32,3 @@ CVE-2025-66382
 
 # sigstore/timestamp-authority - no fix available yet (v1.2.9 is latest)
 CVE-2025-66564
-
-# Go stdlib - published 2026-01-28, after Go 1.24.12 release (2026-01-15)
-# Waiting for Go 1.24.13 or 1.25.7
-# https://avd.aquasec.com/nvd/cve-2025-61726
-CVE-2025-61726
-
-# Go stdlib - archive/zip CPU exhaustion
-# https://avd.aquasec.com/nvd/cve-2025-61728
-CVE-2025-61728
-
-# Go stdlib - crypto/tls session resumption issue
-# https://avd.aquasec.com/nvd/cve-2025-68121
-CVE-2025-68121
-
-# Go stdlib - TLS 1.3 handshake issue
-# https://avd.aquasec.com/nvd/cve-2025-61730
-CVE-2025-61730
-
-# OpenTelemetry Go SDK - PATH hijacking on macOS/Darwin (not exploitable in Linux containers)
-# Fixed in our code (PR #560), but Traefik v3.6.9 still bundles otel/sdk < v1.40.0
-# https://avd.aquasec.com/nvd/cve-2026-24051
-CVE-2026-24051
-
-# docker/cli - Windows-only CLI plugin manager path traversal (CWE-427)
-# Not exploitable in Linux containers. Indirect dependency via cosign/sigstore.
-# Fixed in docker/cli v29.2.0 (PR #661), but Trivy DB hasn't registered the fix yet
-# https://vulnerability.circl.lu/vuln/cve-2025-15558
-CVE-2025-15558
