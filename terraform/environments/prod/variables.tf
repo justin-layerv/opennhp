@@ -524,7 +524,7 @@ variable "qurl_resource_ttl_buffer_seconds" {
 
 variable "qurl_session_ttl_seconds" {
   type    = number
-  default = 86400
+  default = 3600 # 1 hour — reduced from 24h to limit post-revocation access window
 }
 
 variable "deploy_custom_domain_cert" {

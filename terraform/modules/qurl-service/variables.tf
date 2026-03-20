@@ -413,7 +413,7 @@ variable "qurl_resource_ttl_buffer_seconds" {
 variable "qurl_session_ttl_seconds" {
   description = "Session TTL in seconds (60s min, 30 days max)"
   type        = number
-  default     = 86400 # 24 hours
+  default     = 3600 # 1 hour — reduced from 24h to limit post-revocation access window
 
   validation {
     condition     = var.qurl_session_ttl_seconds >= 60 && var.qurl_session_ttl_seconds <= 2592000
