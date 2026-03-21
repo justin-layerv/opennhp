@@ -73,6 +73,10 @@ type ResolveResponse struct {
 	JWTSecret string `json:"jwt_secret"` //nolint:gosec // G117: JSON tag required — received from QURL API response, never re-serialized
 	// TokenExpire is the token expiration time in seconds
 	TokenExpire int64 `json:"token_expire"`
+	// SessionDuration is the per-QURL session lifetime in seconds.
+	// 0 means use the global default (TokenExpire). When set, overrides
+	// TokenExpire for cookie MaxAge so the QURL creator controls access duration.
+	SessionDuration int `json:"session_duration,omitempty"`
 	// OpenTime is the firewall open time in seconds
 	OpenTime uint32 `json:"open_time"`
 	// CookieDomain is the domain for setting NHP cookies

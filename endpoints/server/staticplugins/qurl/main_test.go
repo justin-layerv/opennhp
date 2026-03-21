@@ -415,10 +415,17 @@ func TestAuthWithHttp_FullFlow(t *testing.T) {
 		}
 	}
 	if nhpTokenCookie == nil {
-		t.Error("nhp_token cookie not set")
+		t.Fatal("nhp_token cookie not set")
 	}
 	if refreshTokenCookie == nil {
-		t.Error("nhp_refresh_token cookie not set")
+		t.Fatal("nhp_refresh_token cookie not set")
+	}
+	// Cookie MaxAge should equal token_expire (3600) when session_duration is not set.
+	if nhpTokenCookie.MaxAge != 3600 {
+		t.Errorf("nhp_token MaxAge: expected 3600 (token_expire), got %d", nhpTokenCookie.MaxAge)
+	}
+	if refreshTokenCookie.MaxAge != 3600 {
+		t.Errorf("nhp_refresh_token MaxAge: expected 3600 (token_expire), got %d", refreshTokenCookie.MaxAge)
 	}
 }
 
@@ -906,5 +913,102 @@ func TestAuthWithHttp_KnockRetryExhausted(t *testing.T) {
 	}
 	if body["error"] != "knock_failed" {
 		t.Errorf("expected error='knock_failed', got %q", body["error"])
+	}
+}
+
+// TestBuildResourceData_ExInfoKeys verifies that buildResourceData includes
+// all required ExInfo keys, including SessionDuration for per-QURL session control.
+func TestBuildResourceData_ExInfoKeys(t *testing.T) {
+	resp := &ResolveResponse{
+		ResourceID:      "r_test",
+		JWTSecret:       "secret",
+		TokenExpire:     3600,
+		SessionDuration: 900,
+		OpenTime:        300,
+		CookieDomain:    ".qurl.site",
+		QurlSiteURL:     "https://r_test.qurl.site",
+		Resources:       map[string]*common.ResourceInfo{},
+	}
+
+	data := buildResourceData(resp)
+
+	// Verify all ExInfo keys are present
+	if data.ExInfo[ExInfoKeyJWTSecret] != "secret" {
+		t.Errorf("ExInfo[JWTSecret] = %v, want %q", data.ExInfo[ExInfoKeyJWTSecret], "secret")
+	}
+	if data.ExInfo[ExInfoKeyTokenExpire] != int64(3600) {
+		t.Errorf("ExInfo[TokenExpire] = %v, want 3600", data.ExInfo[ExInfoKeyTokenExpire])
+	}
+	if data.ExInfo[ExInfoKeySessionDuration] != 900 {
+		t.Errorf("ExInfo[SessionDuration] = %v, want 900", data.ExInfo[ExInfoKeySessionDuration])
+	}
+
+	// Verify SessionDuration=0 is also propagated (NHP server needs to see it)
+	resp.SessionDuration = 0
+	data = buildResourceData(resp)
+	if data.ExInfo[ExInfoKeySessionDuration] != 0 {
+		t.Errorf("ExInfo[SessionDuration] = %v, want 0", data.ExInfo[ExInfoKeySessionDuration])
+	}
+}
+
+// TestAuthWithHttp_SessionDuration verifies that per-QURL session_duration
+// overrides token_expire for the NHP cookie MaxAge.
+func TestAuthWithHttp_SessionDuration(t *testing.T) {
+	setup := setupCustomDomainTest(t, &ResolveResponse{
+		ResourceID:      "r_sessiondur",
+		TargetURL:       "https://backend.example.com",
+		QurlSiteURL:     "https://r_sessiondur.qurl.site",
+		Resources:       map[string]*common.ResourceInfo{"default": {ACId: "ac-001", Hostname: "backend.example.com", Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443}}},
+		JWTSecret:       "test-jwt-secret-key-for-signing",
+		TokenExpire:     3600, // 1 hour global default
+		SessionDuration: 900,  // 15 minutes per-QURL override
+		OpenTime:        300,
+		CookieDomain:    ".qurl.site",
+	})
+
+	_, err := AuthWithHttp(setup.ctx, &common.HttpKnockRequest{}, successKnockHelper())
+	if err != nil {
+		t.Fatalf("AuthWithHttp returned unexpected error: %v", err)
+	}
+
+	// Verify NHP cookies use session_duration (900s) not token_expire (3600s)
+	cookies := setup.recorder.Result().Cookies()
+	for _, c := range cookies {
+		if c.Name == CookieNHPToken || c.Name == CookieNHPRefreshToken {
+			if c.MaxAge != 900 {
+				t.Errorf("cookie %s: expected MaxAge=900 (session_duration), got %d", c.Name, c.MaxAge)
+			}
+		}
+	}
+}
+
+// TestAuthWithHttp_SessionDurationDefault verifies that when session_duration
+// is 0 (not set), the NHP cookie uses token_expire as MaxAge.
+func TestAuthWithHttp_SessionDurationDefault(t *testing.T) {
+	setup := setupCustomDomainTest(t, &ResolveResponse{
+		ResourceID:      "r_sessiondefault",
+		TargetURL:       "https://backend.example.com",
+		QurlSiteURL:     "https://r_sessiondefault.qurl.site",
+		Resources:       map[string]*common.ResourceInfo{"default": {ACId: "ac-001", Hostname: "backend.example.com", Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443}}},
+		JWTSecret:       "test-jwt-secret-key-for-signing",
+		TokenExpire:     3600, // 1 hour
+		SessionDuration: 0,    // not set — should fall back to token_expire
+		OpenTime:        300,
+		CookieDomain:    ".qurl.site",
+	})
+
+	_, err := AuthWithHttp(setup.ctx, &common.HttpKnockRequest{}, successKnockHelper())
+	if err != nil {
+		t.Fatalf("AuthWithHttp returned unexpected error: %v", err)
+	}
+
+	// Verify NHP cookies use token_expire (3600s) when session_duration is 0
+	cookies := setup.recorder.Result().Cookies()
+	for _, c := range cookies {
+		if c.Name == CookieNHPToken || c.Name == CookieNHPRefreshToken {
+			if c.MaxAge != 3600 {
+				t.Errorf("cookie %s: expected MaxAge=3600 (token_expire fallback), got %d", c.Name, c.MaxAge)
+			}
+		}
 	}
 }

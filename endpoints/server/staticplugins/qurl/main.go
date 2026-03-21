@@ -228,10 +228,16 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		return nil, fmt.Errorf("invalid redirect URL: %w", redirectErr)
 	}
 
-	// Now safe to set cookies and redirect
+	// Now safe to set cookies and redirect.
+	// Per-QURL session_duration overrides the global token_expire for cookie MaxAge
+	// so the QURL creator controls how long access lasts after clicking.
 	tokenExpire := nhpsdkutils.GetIntFromMap(res.ExInfo, ExInfoKeyTokenExpire)
-	ctx.SetCookie(CookieNHPToken, nhpToken, tokenExpire, "/", res.CookieDomain, true, true)
-	ctx.SetCookie(CookieNHPRefreshToken, refreshToken, tokenExpire, "/", res.CookieDomain, true, true)
+	cookieMaxAge := tokenExpire
+	if sessionDuration := nhpsdkutils.GetIntFromMap(res.ExInfo, ExInfoKeySessionDuration); sessionDuration > 0 {
+		cookieMaxAge = sessionDuration
+	}
+	ctx.SetCookie(CookieNHPToken, nhpToken, cookieMaxAge, "/", res.CookieDomain, true, true)
+	ctx.SetCookie(CookieNHPRefreshToken, refreshToken, cookieMaxAge, "/", res.CookieDomain, true, true)
 
 	log.Info("[QURL] [req_id=%s] Tokens generated and cookies set, redirecting to: %s", requestID, resolveResp.QurlSiteURL)
 
@@ -264,8 +270,9 @@ func buildResourceData(resp *ResolveResponse) *common.ResourceData {
 			Resources:     resp.Resources,
 		},
 		ExInfo: map[string]any{
-			ExInfoKeyJWTSecret:   resp.JWTSecret,
-			ExInfoKeyTokenExpire: resp.TokenExpire,
+			ExInfoKeyJWTSecret:       resp.JWTSecret,
+			ExInfoKeyTokenExpire:     resp.TokenExpire,
+			ExInfoKeySessionDuration: resp.SessionDuration,
 		},
 		RedirectUrl:  resp.QurlSiteURL,
 		CookieDomain: resp.CookieDomain,

@@ -15,8 +15,9 @@ import (
 // These keys form a contract between buildResourceData (writer) and
 // AuthWithHttp (reader). Also used by passcode and oidc plugins.
 const (
-	ExInfoKeyJWTSecret   = "JWTSecret"
-	ExInfoKeyTokenExpire = "TokenExpire"
+	ExInfoKeyJWTSecret       = "JWTSecret"
+	ExInfoKeyTokenExpire     = "TokenExpire"
+	ExInfoKeySessionDuration = "SessionDuration"
 )
 
 // Cookie names for NHP authentication tokens.
