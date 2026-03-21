@@ -59,6 +59,11 @@ BATCH_SYNC_PROVISION = 'provision-batch'
 # Domain name validation
 DOMAIN_REGEX = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?$')
 
+
+class DnsValidationError(Exception):
+    """Raised when DNS-01 challenge setup or propagation fails."""
+    pass
+
 # ACME account secret field names (Secrets Manager — single secret, no scale issue)
 FIELD_ACCOUNT_KEY = 'account_key'
 
@@ -71,6 +76,29 @@ FIELD_ACME_SUBDOMAIN = 'acme_subdomain'
 CW_NAMESPACE = 'NHP/CustomDomainCerts'
 CW_METRIC_DAYS_UNTIL_EXPIRY = 'DaysUntilExpiry'
 CW_METRIC_PROVISIONING_FAILURES = 'ProvisioningFailures'
+
+# Failure category constants — published as the FailureCategory dimension on
+# the ProvisioningFailures metric so alarms identify the root cause at a glance.
+#
+#   Category                 Trigger
+#   ──────────────────────── ───────────────────────────────────────────────────
+#   AcmeAccountError         Secrets Manager access or ACME account registration
+#   DnsValidationError       Route53 TXT record creation or DNS propagation
+#   AcmeChallengeError       Let's Encrypt challenge answer or cert finalization
+#   CertStorageError         SSM Parameter Store write (key/chain/meta)
+#   DynamoDBError            Domain status query or update
+#   CertSyncError            SSM SendCommand to AC instances
+#   DomainValidationError    Invalid domain format rejected at handler level
+#   RenewalScanError         Per-domain failure during renewal scan
+#
+FAILURE_ACME_ACCOUNT = 'AcmeAccountError'
+FAILURE_DNS_VALIDATION = 'DnsValidationError'
+FAILURE_ACME_CHALLENGE = 'AcmeChallengeError'
+FAILURE_CERT_STORAGE = 'CertStorageError'
+FAILURE_DYNAMODB = 'DynamoDBError'
+FAILURE_CERT_SYNC = 'CertSyncError'
+FAILURE_DOMAIN_VALIDATION = 'DomainValidationError'
+FAILURE_RENEWAL_SCAN = 'RenewalScanError'
 
 # Lazy imports for cryptography and DNS (Lambda layer)
 acme = None
@@ -178,6 +206,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         else:
             raise ValueError(f"Unknown event type: {event_type}")
 
+    except DnsValidationError:
+        # Already metricked with FAILURE_DNS_VALIDATION in provision_certificate()
+        raise
+    except ValueError as e:
+        logger.error(f"Custom domain cert manager validation failed: {str(e)}", exc_info=True)
+        send_alert(f"Custom domain cert manager FAILED: {str(e)}")
+        publish_failure_metric(FAILURE_DOMAIN_VALIDATION)
+        raise
     except Exception as e:
         logger.error(f"Custom domain cert manager failed: {str(e)}", exc_info=True)
         send_alert(f"Custom domain cert manager FAILED: {str(e)}")
@@ -200,6 +236,7 @@ def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = Fa
     """
     logger.info(f"Provisioning certificate for domain: {domain}")
 
+    failure_category = FAILURE_ACME_ACCOUNT
     try:
         lazy_import_acme()
 
@@ -214,6 +251,7 @@ def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = Fa
         acme_client = get_or_create_acme_account()
 
         # Request certificate via DNS-01 with CNAME delegation
+        failure_category = FAILURE_ACME_CHALLENGE
         cert_pem, chain_pem = request_certificate(acme_client, private_key, domain, acme_subdomain)
 
         # Serialize private key
@@ -231,12 +269,15 @@ def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = Fa
         expires_at = cert.not_valid_after_utc.isoformat()
 
         # Store certificate in SSM Parameter Store
+        failure_category = FAILURE_CERT_STORAGE
         cert_param_prefix = store_certificate(domain, private_key_pem, cert_pem, chain_pem, expires_at, acme_subdomain)
 
         # Update DynamoDB domain status
+        failure_category = FAILURE_DYNAMODB
         update_domain_status(domain, STATUS_ACTIVE, cert_param_prefix, expires_at)
 
         # Trigger cert sync on AC instances (unless caller will batch it)
+        failure_category = FAILURE_CERT_SYNC
         if not skip_sync:
             trigger_cert_sync(domain)
 
@@ -250,11 +291,17 @@ def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = Fa
             'cert_param_prefix': cert_param_prefix
         }
 
+    except DnsValidationError as e:
+        logger.error(f"Certificate provisioning failed for {domain}: {str(e)}", exc_info=True)
+        update_domain_status(domain, STATUS_FAILED, error=str(e))
+        send_alert(f"Certificate provisioning FAILED for {domain}: {str(e)}")
+        publish_failure_metric(FAILURE_DNS_VALIDATION)
+        raise
     except Exception as e:
         logger.error(f"Certificate provisioning failed for {domain}: {str(e)}", exc_info=True)
         update_domain_status(domain, STATUS_FAILED, error=str(e))
         send_alert(f"Certificate provisioning FAILED for {domain}: {str(e)}")
-        publish_failure_metric()
+        publish_failure_metric(failure_category)
         raise
 
 
@@ -346,6 +393,7 @@ def renewal_scan() -> Dict[str, Any]:
 
         except Exception as e:
             logger.error(f"Failed to process certificate for {domain}: {str(e)}", exc_info=True)
+            publish_failure_metric(FAILURE_RENEWAL_SCAN)
             results['failed'] += 1
             results['details'].append({
                 'domain': domain,
@@ -437,6 +485,7 @@ def provision_pending_domains() -> Dict[str, Any]:
             query_kwargs['ExclusiveStartKey'] = last_key
     except Exception as e:
         logger.error(f"Failed to query pending domains: {e}")
+        publish_failure_metric(FAILURE_DYNAMODB)
         return {'provisioned': 0, 'failed': 0, 'error': str(e)}
 
     if not items:
@@ -637,10 +686,11 @@ def request_certificate(acme_client, private_key, domain: str, acme_subdomain: s
 
         # Create TXT record in our ACME delegation zone
         logger.info(f"Creating TXT record: {txt_record_name}")
-        create_acme_txt_record(txt_record_name, validation)
-
-        # Wait for DNS propagation
-        wait_for_dns_propagation(txt_record_name, validation)
+        try:
+            create_acme_txt_record(txt_record_name, validation)
+            wait_for_dns_propagation(txt_record_name, validation)
+        except Exception as e:
+            raise DnsValidationError(f"DNS validation failed for {domain}: {e}") from e
 
         # Answer challenge
         acme_client.answer_challenge(dns_challenge, dns_challenge.response(acme_client.net.key))
@@ -912,6 +962,7 @@ def trigger_cert_sync(domain: str):
         logger.info(f"Triggered cert sync on AC instances, command: {command_id}")
     except Exception as e:
         logger.error(f"Failed to trigger cert sync: {e}")
+        publish_failure_metric(FAILURE_CERT_SYNC)
 
 
 def send_alert(message: str, is_error: bool = True):
@@ -956,6 +1007,17 @@ def publish_metric(metric_name: str, value: float, dimensions: list = None):
         logger.error(f"Failed to publish CloudWatch metric {metric_name}: {e}")
 
 
-def publish_failure_metric():
-    """Publish a provisioning failure metric to CloudWatch."""
+def publish_failure_metric(category: str = None):
+    """Publish a provisioning failure metric to CloudWatch.
+
+    Publishes two data points: one without dimensions (for the existing alarm)
+    and one with a FailureCategory dimension (for granular diagnosis).
+    """
+    # Always publish the aggregate metric (keeps existing alarm working)
     publish_metric(CW_METRIC_PROVISIONING_FAILURES, 1)
+    # Also publish with category dimension for diagnosis without logs
+    if category:
+        publish_metric(
+            CW_METRIC_PROVISIONING_FAILURES, 1,
+            dimensions=[{'Name': 'FailureCategory', 'Value': category}]
+        )

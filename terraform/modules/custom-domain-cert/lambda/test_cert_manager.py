@@ -381,5 +381,131 @@ class TestTriggerCertSync(unittest.TestCase):
             mock_send.assert_not_called()
 
 
+class TestFailureCategoryMetrics(unittest.TestCase):
+    """Tests for per-category failure metric routing."""
+
+    def _mock_cryptography(self):
+        """Return a mock cryptography dict that satisfies provision_certificate."""
+        mock_key = MagicMock()
+        mock_key.private_bytes.return_value = b'key-pem'
+        mock_rsa = MagicMock()
+        mock_rsa.generate_private_key.return_value = mock_key
+        mock_x509 = MagicMock()
+        mock_x509.load_pem_x509_certificate.return_value = MagicMock(
+            not_valid_after_utc=MagicMock(isoformat=MagicMock(return_value='2026-06-01T00:00:00+00:00'))
+        )
+        return {
+            'rsa': mock_rsa,
+            'default_backend': MagicMock(),
+            'serialization': MagicMock(
+                Encoding=MagicMock(PEM='PEM'),
+                PrivateFormat=MagicMock(TraditionalOpenSSL='PKCS1'),
+                NoEncryption=MagicMock(),
+            ),
+            'x509': mock_x509,
+            'hashes': MagicMock(),
+        }
+
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch('custom_domain_cert_manager.send_alert')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch('custom_domain_cert_manager.request_certificate')
+    @patch('custom_domain_cert_manager.get_or_create_acme_account')
+    @patch('custom_domain_cert_manager.lazy_import_acme')
+    def test_dns_validation_failure_publishes_correct_category(
+        self, mock_import, mock_acme, mock_request, mock_status, mock_alert, mock_metric
+    ):
+        """DNS validation failures should publish FAILURE_DNS_VALIDATION exactly once."""
+        mock_request.side_effect = cm.DnsValidationError("TXT record not found")
+
+        with patch.object(cm, 'cryptography', self._mock_cryptography()):
+            with self.assertRaises(cm.DnsValidationError):
+                cm.provision_certificate("example.com", "example--com")
+
+        mock_metric.assert_called_once_with(cm.FAILURE_DNS_VALIDATION)
+
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch('custom_domain_cert_manager.send_alert')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch('custom_domain_cert_manager.get_or_create_acme_account')
+    @patch('custom_domain_cert_manager.lazy_import_acme')
+    def test_acme_account_failure_publishes_correct_category(
+        self, mock_import, mock_acme, mock_status, mock_alert, mock_metric
+    ):
+        """ACME account failures should publish FAILURE_ACME_ACCOUNT."""
+        mock_acme.side_effect = Exception("ACME account error")
+
+        with self.assertRaises(Exception):
+            cm.provision_certificate("example.com", "example--com")
+
+        mock_metric.assert_called_once_with(cm.FAILURE_ACME_ACCOUNT)
+
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch('custom_domain_cert_manager.send_alert')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch('custom_domain_cert_manager.store_certificate')
+    @patch('custom_domain_cert_manager.request_certificate')
+    @patch('custom_domain_cert_manager.get_or_create_acme_account')
+    @patch('custom_domain_cert_manager.lazy_import_acme')
+    def test_cert_storage_failure_publishes_correct_category(
+        self, mock_import, mock_acme, mock_request, mock_store, mock_status, mock_alert, mock_metric
+    ):
+        """Certificate storage failures should publish FAILURE_CERT_STORAGE."""
+        mock_request.return_value = ('cert-pem', 'chain-pem')
+        mock_store.side_effect = Exception("SSM write failed")
+
+        with patch.object(cm, 'cryptography', self._mock_cryptography()):
+            with self.assertRaises(Exception):
+                cm.provision_certificate("example.com", "example--com")
+
+        mock_metric.assert_called_once_with(cm.FAILURE_CERT_STORAGE)
+
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch.object(cm.dynamodb_client, 'query')
+    def test_dynamodb_failure_in_provision_pending_publishes_metric(
+        self, mock_query, mock_metric
+    ):
+        """DynamoDB errors in provision_pending_domains should publish FAILURE_DYNAMODB."""
+        mock_query.side_effect = Exception("DynamoDB timeout")
+
+        result = cm.provision_pending_domains()
+        assert 'error' in result
+        mock_metric.assert_called_once_with(cm.FAILURE_DYNAMODB)
+
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch('custom_domain_cert_manager.send_alert')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch('custom_domain_cert_manager.lazy_import_acme')
+    def test_early_failure_publishes_acme_account_category(
+        self, mock_import, mock_status, mock_alert, mock_metric
+    ):
+        """Failures before first category reassignment default to FAILURE_ACME_ACCOUNT."""
+        mock_import.side_effect = Exception("import failed")
+
+        with self.assertRaises(Exception):
+            cm.provision_certificate("example.com", "example--com")
+
+        mock_metric.assert_called_once_with(cm.FAILURE_ACME_ACCOUNT)
+
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch('custom_domain_cert_manager.send_alert')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch('custom_domain_cert_manager.request_certificate')
+    @patch('custom_domain_cert_manager.get_or_create_acme_account')
+    @patch('custom_domain_cert_manager.lazy_import_acme')
+    def test_dns_validation_not_double_counted_in_handler(
+        self, mock_import, mock_acme, mock_request, mock_status, mock_alert, mock_metric
+    ):
+        """DnsValidationError should not cause double metric publishing through handler."""
+        mock_request.side_effect = cm.DnsValidationError("TXT record not found")
+
+        with patch.object(cm, 'cryptography', self._mock_cryptography()):
+            with self.assertRaises(cm.DnsValidationError):
+                cm.handler({'type': 'provision', 'domain': 'example.com', 'acme_subdomain': 'example--com'}, None)
+
+        # Should be called exactly once (in provision_certificate), not twice
+        mock_metric.assert_called_once_with(cm.FAILURE_DNS_VALIDATION)
+
+
 if __name__ == '__main__':
     unittest.main()

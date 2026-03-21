@@ -544,6 +544,70 @@ resource "aws_cloudwatch_metric_alarm" "cert_provisioning_failures" {
   })
 }
 
+# Per-category failure alarms for diagnosing provisioning issues without logs
+locals {
+  failure_categories = {
+    "AcmeAccountError" = {
+      slug        = "acme-account"
+      description = "ACME account creation or Secrets Manager access failure"
+    }
+    "DnsValidationError" = {
+      slug        = "dns-validation"
+      description = "Route53 TXT record creation or DNS propagation failure"
+    }
+    "AcmeChallengeError" = {
+      slug        = "acme-challenge"
+      description = "Let's Encrypt challenge or certificate finalization failure"
+    }
+    "CertStorageError" = {
+      slug        = "cert-storage"
+      description = "SSM Parameter Store write failure (key/chain/meta)"
+    }
+    "DynamoDBError" = {
+      slug        = "dynamodb"
+      description = "DynamoDB query or status update failure"
+    }
+    "CertSyncError" = {
+      slug        = "cert-sync"
+      description = "SSM SendCommand to AC instances failure"
+    }
+    "DomainValidationError" = {
+      slug        = "domain-validation"
+      description = "Invalid domain format rejected"
+    }
+    "RenewalScanError" = {
+      slug        = "renewal-scan"
+      description = "Certificate renewal scan processing failure"
+    }
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "cert_failure_by_category" {
+  for_each = local.failure_categories
+
+  alarm_name          = "${var.name_prefix}-cert-failure-${each.value.slug}"
+  alarm_description   = each.value.description
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ProvisioningFailures"
+  namespace           = "NHP/CustomDomainCerts"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    FailureCategory = each.key
+  }
+
+  alarm_actions = [local.sns_topic_arn]
+  ok_actions    = [local.sns_topic_arn]
+
+  tags = merge(local.common_tags, {
+    Name = "${var.name_prefix}-cert-failure-${each.value.slug}"
+  })
+}
+
 # ==============================================================================
 # Data Sources
 # ==============================================================================
