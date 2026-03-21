@@ -1518,6 +1518,14 @@ variable "auth0_custom_domain" {
   default     = ""
 }
 
+# ==================== E2E Testing ====================
+
+variable "deploy_e2e_echo_server" {
+  description = "Deploy E2E echo server Lambda for QURL integration tests"
+  type        = bool
+  default     = false
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {

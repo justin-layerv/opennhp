@@ -444,6 +444,12 @@ auth0_spa_web_origins = [
 # Store in GitHub Secrets: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET,
 #                          GITHUB_OAUTH_CLIENT_ID, GITHUB_OAUTH_CLIENT_SECRET
 
+# ==============================================================================
+# E2E Testing
+# Echo server Lambda for QURL E2E integration tests
+# ==============================================================================
+deploy_e2e_echo_server = true
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"

@@ -2029,3 +2029,14 @@ resource "aws_cloudwatch_metric_alarm" "cloudfront_cidr_drift_errors" {
     Component = "cloudfront"
   })
 }
+
+# ==================== E2E Echo Server ====================
+
+module "e2e_echo_server" {
+  count  = var.deploy_e2e_echo_server ? 1 : 0
+  source = "./modules/e2e-echo-server"
+
+  name_prefix = local.name_prefix
+  environment = var.environment
+  tags        = merge(local.common_tags, { Service = "e2e-testing" })
+}

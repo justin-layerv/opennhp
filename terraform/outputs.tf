@@ -329,3 +329,8 @@ output "billing_payment_grace_lambda_name" {
   description = "Billing payment grace Lambda function name"
   value       = var.deploy_billing ? module.billing[0].payment_grace_lambda_function_name : null
 }
+
+output "e2e_echo_url" {
+  description = "E2E echo server Lambda function URL"
+  value       = var.deploy_e2e_echo_server ? module.e2e_echo_server[0].echo_url : null
+}
