@@ -973,12 +973,25 @@ func TestAuthWithHttp_SessionDuration(t *testing.T) {
 
 	// Verify NHP cookies use session_duration (900s) not token_expire (3600s)
 	cookies := setup.recorder.Result().Cookies()
+	var foundTTLCookie bool
 	for _, c := range cookies {
 		if c.Name == CookieNHPToken || c.Name == CookieNHPRefreshToken {
 			if c.MaxAge != 900 {
 				t.Errorf("cookie %s: expected MaxAge=900 (session_duration), got %d", c.Name, c.MaxAge)
 			}
 		}
+		if c.Name == CookieNHPSessionTTL {
+			foundTTLCookie = true
+			if c.Value != "900" {
+				t.Errorf("cookie %s: expected value='900', got %q", c.Name, c.Value)
+			}
+			if c.MaxAge != 900 {
+				t.Errorf("cookie %s: expected MaxAge=900, got %d", c.Name, c.MaxAge)
+			}
+		}
+	}
+	if !foundTTLCookie {
+		t.Error("nhp_session_ttl cookie not set")
 	}
 }
 
@@ -1004,11 +1017,21 @@ func TestAuthWithHttp_SessionDurationDefault(t *testing.T) {
 
 	// Verify NHP cookies use token_expire (3600s) when session_duration is 0
 	cookies := setup.recorder.Result().Cookies()
+	var foundTTLCookie bool
 	for _, c := range cookies {
 		if c.Name == CookieNHPToken || c.Name == CookieNHPRefreshToken {
 			if c.MaxAge != 3600 {
 				t.Errorf("cookie %s: expected MaxAge=3600 (token_expire fallback), got %d", c.Name, c.MaxAge)
 			}
 		}
+		if c.Name == CookieNHPSessionTTL {
+			foundTTLCookie = true
+			if c.Value != "3600" {
+				t.Errorf("cookie %s: expected value='3600' (token_expire fallback), got %q", c.Name, c.Value)
+			}
+		}
+	}
+	if !foundTTLCookie {
+		t.Error("nhp_session_ttl cookie not set")
 	}
 }

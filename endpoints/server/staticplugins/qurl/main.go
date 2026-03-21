@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -238,6 +239,9 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	}
 	ctx.SetCookie(CookieNHPToken, nhpToken, cookieMaxAge, "/", res.CookieDomain, true, true)
 	ctx.SetCookie(CookieNHPRefreshToken, refreshToken, cookieMaxAge, "/", res.CookieDomain, true, true)
+	// Communicate session TTL to downstream middleware (hqdatamiddleware) so it
+	// can align its session_id cookie expiry with the NHP cookie.
+	ctx.SetCookie(CookieNHPSessionTTL, strconv.Itoa(cookieMaxAge), cookieMaxAge, "/", res.CookieDomain, true, true)
 
 	log.Info("[QURL] [req_id=%s] Tokens generated and cookies set, redirecting to: %s", requestID, resolveResp.QurlSiteURL)
 
