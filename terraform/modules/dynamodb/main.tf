@@ -485,11 +485,26 @@ resource "aws_dynamodb_table" "qurl_resources" {
     type = "S"
   }
 
+  attribute {
+    name = "target_url_hash"
+    type = "S"
+  }
+
   # GSI: Find resource by owner + target URL for deduplication (find-or-create pattern)
+  # Kept during migration — will be removed after backfill populates target_url_hash on all items
   global_secondary_index {
     name            = "owner-target-index"
     hash_key        = "owner_id"
     range_key       = "target_url"
+    projection_type = "ALL"
+  }
+
+  # GSI: Find resource by owner + target URL hash (replaces owner-target-index after backfill)
+  # Uses SHA-256 hash (64 bytes) instead of raw target_url to stay within DynamoDB's 1024-byte sort key limit
+  global_secondary_index {
+    name            = "owner-target-hash-index"
+    hash_key        = "owner_id"
+    range_key       = "target_url_hash"
     projection_type = "ALL"
   }
 
