@@ -1472,32 +1472,6 @@ resource "aws_iam_policy" "terraform_apply_data" {
           "arn:aws:elasticache:${local.region}:${local.account_id}:serverlesscache:layerv-nhp-*",
           "arn:aws:elasticache:${local.region}:${local.account_id}:subnetgroup:layerv-nhp-*"
         ]
-      },
-      {
-        # Temporary: needed so TF can destroy RDS resources left in state
-        # after the RDS module was removed in PR #736. Safe to remove once
-        # the RDS resources have been fully cleaned up from state.
-        Sid    = "RDSCleanup"
-        Effect = "Allow"
-        Action = [
-          "rds:DescribeDBClusters",
-          "rds:DescribeDBInstances",
-          "rds:DescribeDBSubnetGroups",
-          "rds:DescribeDBClusterParameterGroups",
-          "rds:DescribeDBClusterParameters",
-          "rds:DeleteDBCluster",
-          "rds:DeleteDBInstance",
-          "rds:DeleteDBSubnetGroup",
-          "rds:DeleteDBClusterParameterGroup",
-          "rds:ListTagsForResource",
-          "rds:RemoveTagsFromResource"
-        ]
-        Resource = [
-          "arn:aws:rds:${local.region}:${local.account_id}:cluster:layerv-nhp-*",
-          "arn:aws:rds:${local.region}:${local.account_id}:db:layerv-nhp-*",
-          "arn:aws:rds:${local.region}:${local.account_id}:subgrp:layerv-nhp-*",
-          "arn:aws:rds:${local.region}:${local.account_id}:cluster-pg:layerv-nhp-*"
-        ]
       }
     ]
   })
