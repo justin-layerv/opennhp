@@ -32,9 +32,3 @@ CVE-2025-66382
 
 # sigstore/timestamp-authority - no fix available yet (v1.2.9 is latest)
 CVE-2025-66564
-
-# grpc-go - authorization bypass via missing leading slash in :path
-# Fixed in v1.79.3 (which we're on), but Trivy DB hasn't registered the fix yet.
-# Remove once Trivy recognizes 1.79.3 as patched.
-# https://avd.aquasec.com/nvd/cve-2026-33186
-CVE-2026-33186
