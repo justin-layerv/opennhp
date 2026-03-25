@@ -118,6 +118,54 @@ variable "auth0_management_secret_arn" {
 }
 
 # ==============================================================================
+# Rotation Alarm Configuration
+# ==============================================================================
+
+variable "alarm_sns_topic_arn" {
+  description = "SNS topic ARN for CloudWatch alarm notifications. If null, rotation alarms are not created."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.alarm_sns_topic_arn == null || can(regex("^arn:aws:sns:", var.alarm_sns_topic_arn))
+    error_message = "alarm_sns_topic_arn must be a valid SNS topic ARN"
+  }
+}
+
+variable "rotation_alarm_duration_threshold_ms" {
+  description = "Duration threshold in milliseconds for Lambda duration alarm (default: 100000ms / 100s, timeout is 120s)"
+  type        = number
+  default     = 100000
+
+  validation {
+    condition     = var.rotation_alarm_duration_threshold_ms >= 1000 && var.rotation_alarm_duration_threshold_ms <= 120000
+    error_message = "rotation_alarm_duration_threshold_ms must be between 1000 and 120000"
+  }
+}
+
+variable "rotation_alarm_grace_days" {
+  description = "Grace period in days after rotation_days before the overdue alarm fires (default: 3)"
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = var.rotation_alarm_grace_days >= 1 && var.rotation_alarm_grace_days <= 30
+    error_message = "rotation_alarm_grace_days must be between 1 and 30"
+  }
+}
+
+variable "rotation_alarm_throttle_threshold" {
+  description = "Number of Lambda throttles in two consecutive 5-minute periods before alarming (default: 5)"
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.rotation_alarm_throttle_threshold >= 1 && var.rotation_alarm_throttle_threshold <= 100
+    error_message = "rotation_alarm_throttle_threshold must be between 1 and 100"
+  }
+}
+
+# ==============================================================================
 # Smoke Test M2M Configuration
 # ==============================================================================
 

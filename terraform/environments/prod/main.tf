@@ -396,6 +396,9 @@ module "auth0" {
   auth0_domain                = var.auth0_enable_rotation ? var.auth0_domain : null
   auth0_management_secret_arn = var.auth0_management_secret_arn
 
+  # Rotation monitoring — alarms sent to the shared SNS topic
+  alarm_sns_topic_arn = module.nhp.sns_topic_arn
+
   # Developer portal management M2M app (only create when portal is enabled)
   dev_portal_mgmt_secret_name = var.deploy_developer_portal ? var.developer_portal_auth0_mgmt_secret_name : null
   auth0_tenant_domain         = var.auth0_domain

@@ -31,6 +31,17 @@ output "rotation_enabled" {
   value       = var.enable_rotation
 }
 
+# Rotation alarm outputs
+output "rotation_alarm_arns" {
+  description = "ARNs of CloudWatch alarms for Auth0 secret rotation (empty list if rotation or alarms disabled)"
+  value = var.enable_rotation && var.alarm_sns_topic_arn != null ? [
+    aws_cloudwatch_metric_alarm.rotation_lambda_errors[0].arn,
+    aws_cloudwatch_metric_alarm.rotation_lambda_duration[0].arn,
+    aws_cloudwatch_metric_alarm.rotation_overdue[0].arn,
+    aws_cloudwatch_metric_alarm.rotation_lambda_throttles[0].arn,
+  ] : []
+}
+
 output "dev_portal_mgmt_secret_name" {
   description = "Name of the SM secret containing developer portal management credentials (null if not created)"
   value       = var.dev_portal_mgmt_secret_name != null ? aws_secretsmanager_secret.dev_portal_mgmt[0].name : null
