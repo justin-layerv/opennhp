@@ -890,7 +890,7 @@ variable "qurl_autoscaling_max_capacity" {
 variable "deploy_redis" {
   description = "Deploy ElastiCache Serverless Redis for distributed QURL rate limiting"
   type        = bool
-  default     = false
+  default     = true
 }
 
 # ==============================================================================
