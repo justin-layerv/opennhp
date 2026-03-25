@@ -20,6 +20,7 @@ Security considerations:
 - Cert secrets encrypted with KMS CMK via SSM SecureString
 - Least privilege IAM permissions
 - No sensitive data in CloudWatch logs
+- Idempotency lock prevents duplicate cert provisioning on concurrent invocations
 
 Author: LayerV Platform Team
 """
@@ -30,7 +31,7 @@ import os
 import re
 import shlex
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Tuple
 
 import boto3
@@ -51,6 +52,7 @@ STATUS_PROVISIONING_TLS = 'provisioning_tls'
 
 # Provision result statuses (returned in Lambda response)
 RESULT_PROVISIONED = 'provisioned'
+RESULT_SKIPPED = 'skipped'
 
 # Batch sync trigger identifiers (not real domain names)
 BATCH_SYNC_RENEWAL = 'renewal-scan-batch'
@@ -155,6 +157,12 @@ _cached_acme_client = None
 # Renewal threshold
 RENEWAL_DAYS_BEFORE_EXPIRY = 30
 
+# Idempotency lock: provisioning_started_at entries older than this are
+# considered stale (Lambda crashed or timed out without cleanup) and can
+# be overwritten by a new invocation. 30 minutes = 2x the Lambda timeout
+# (120s) plus generous buffer for ACME DNS propagation waits.
+PROVISIONING_LOCK_STALE_MINUTES = 30
+
 
 def is_valid_domain(domain: str) -> bool:
     """Validate domain name format. Rejects path traversal, wildcards, and injection."""
@@ -172,6 +180,76 @@ sns_client = boto3.client('sns')
 cloudwatch_client = boto3.client('cloudwatch')
 dynamodb_client = boto3.client('dynamodb')
 ssm_client = boto3.client('ssm')
+
+
+
+def _acquire_provisioning_lock(domain: str) -> bool:
+    """Acquire an idempotency lock for cert provisioning via DynamoDB conditional update.
+
+    Uses a conditional write on the ``provisioning_started_at`` attribute to
+    guarantee at-most-one concurrent provisioning per domain.  The condition
+    succeeds when:
+
+    * The attribute does not exist yet (first attempt), **or**
+    * The existing timestamp is older than PROVISIONING_LOCK_STALE_MINUTES
+      (previous invocation crashed / timed out without cleanup).
+
+    Returns True if the lock was acquired, False if another invocation already
+    holds an active lock for this domain.
+    """
+    if not QURL_DOMAINS_TABLE:
+        logger.warning("No QURL_DOMAINS_TABLE configured, skipping idempotency lock")
+        return True
+
+    now = datetime.now(timezone.utc)
+    stale_threshold = (now - timedelta(minutes=PROVISIONING_LOCK_STALE_MINUTES)).isoformat()
+
+    try:
+        dynamodb_client.update_item(
+            TableName=QURL_DOMAINS_TABLE,
+            Key={'domain': {'S': domain}},
+            UpdateExpression='SET provisioning_started_at = :now',
+            # String comparison works because ISO 8601 timestamps are lexicographically sortable.
+            ConditionExpression=(
+                'attribute_not_exists(provisioning_started_at) '
+                'OR provisioning_started_at < :stale'
+            ),
+            ExpressionAttributeValues={
+                ':now': {'S': now.isoformat()},
+                ':stale': {'S': stale_threshold},
+            },
+        )
+        logger.info(f"Acquired provisioning lock for {domain}")
+        return True
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+            logger.info(
+                f"Provisioning lock held by another invocation for {domain}, skipping"
+            )
+            return False
+        logger.error(f"Failed to acquire provisioning lock for {domain}: {e}")
+        raise
+
+
+def _release_provisioning_lock(domain: str):
+    """Release the idempotency lock by removing provisioning_started_at.
+
+    Called after successful provisioning so the next scheduled scan does not
+    see a stale lock.  Best-effort: failure to release is logged but does not
+    block the caller -- the stale-threshold fallback will recover automatically.
+    """
+    if not QURL_DOMAINS_TABLE:
+        return
+
+    try:
+        dynamodb_client.update_item(
+            TableName=QURL_DOMAINS_TABLE,
+            Key={'domain': {'S': domain}},
+            UpdateExpression='REMOVE provisioning_started_at',
+        )
+        logger.info(f"Released provisioning lock for {domain}")
+    except Exception as e:
+        logger.warning(f"Failed to release provisioning lock for {domain}: {e}")
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -225,6 +303,10 @@ def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = Fa
     """
     Provision a new TLS certificate for a custom domain.
 
+    Acquires an idempotency lock (DynamoDB conditional write) before starting
+    ACME operations to prevent duplicate cert provisioning when the Lambda is
+    invoked concurrently for the same domain.
+
     Args:
         domain: The custom domain (e.g., "secure.example.com")
         acme_subdomain: The subdomain in our ACME zone for the TXT record
@@ -235,6 +317,14 @@ def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = Fa
         Status dict with provisioning outcome
     """
     logger.info(f"Provisioning certificate for domain: {domain}")
+
+    if not _acquire_provisioning_lock(domain):
+        logger.info(f"Skipping {domain}: another invocation is already provisioning")
+        return {
+            'status': RESULT_SKIPPED,
+            'domain': domain,
+            'reason': 'concurrent provisioning in progress',
+        }
 
     failure_category = FAILURE_ACME_ACCOUNT
     try:
@@ -281,6 +371,9 @@ def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = Fa
         if not skip_sync:
             trigger_cert_sync(domain)
 
+        # Release the idempotency lock now that provisioning succeeded
+        _release_provisioning_lock(domain)
+
         logger.info(f"Certificate provisioned successfully for {domain}, expires: {expires_at}")
         send_alert(f"Certificate provisioned for {domain}. Expires: {expires_at}", is_error=False)
 
@@ -296,12 +389,14 @@ def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = Fa
         update_domain_status(domain, STATUS_FAILED, error=str(e))
         send_alert(f"Certificate provisioning FAILED for {domain}: {str(e)}")
         publish_failure_metric(FAILURE_DNS_VALIDATION)
+        _release_provisioning_lock(domain)
         raise
     except Exception as e:
         logger.error(f"Certificate provisioning failed for {domain}: {str(e)}", exc_info=True)
         update_domain_status(domain, STATUS_FAILED, error=str(e))
         send_alert(f"Certificate provisioning FAILED for {domain}: {str(e)}")
         publish_failure_metric(failure_category)
+        _release_provisioning_lock(domain)
         raise
 
 
@@ -375,13 +470,21 @@ def renewal_scan() -> Dict[str, Any]:
                     logger.warning(f"Meta for {domain} missing '{FIELD_ACME_SUBDOMAIN}' field, deriving from domain name")
                     acme_subdomain = domain_to_acme_subdomain(domain)
 
-                provision_certificate(domain, acme_subdomain, skip_sync=True)
-                results['renewed'] += 1
-                results['details'].append({
-                    'domain': domain,
-                    'action': 'renewed',
-                    'days_until_expiry': days_until_expiry
-                })
+                result = provision_certificate(domain, acme_subdomain, skip_sync=True)
+                if result.get('status') == RESULT_SKIPPED:
+                    results['skipped'] += 1
+                    results['details'].append({
+                        'domain': domain,
+                        'action': 'skipped_locked',
+                        'days_until_expiry': days_until_expiry
+                    })
+                else:
+                    results['renewed'] += 1
+                    results['details'].append({
+                        'domain': domain,
+                        'action': 'renewed',
+                        'days_until_expiry': days_until_expiry
+                    })
             else:
                 logger.info(f"Certificate for {domain} valid for {days_until_expiry} more days")
                 results['skipped'] += 1
@@ -486,15 +589,16 @@ def provision_pending_domains() -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Failed to query pending domains: {e}")
         publish_failure_metric(FAILURE_DYNAMODB)
-        return {'provisioned': 0, 'failed': 0, 'error': str(e)}
+        return {'provisioned': 0, 'failed': 0, 'skipped': 0, 'error': str(e)}
 
     if not items:
         logger.info("No domains pending TLS provisioning")
-        return {'provisioned': 0, 'failed': 0}
+        return {'provisioned': 0, 'failed': 0, 'skipped': 0}
 
     logger.info(f"Found {len(items)} domains pending TLS provisioning")
     provisioned = 0
     failed = 0
+    skipped = 0
 
     for item in items:
         domain_name = item['domain']['S']
@@ -505,8 +609,12 @@ def provision_pending_domains() -> Dict[str, Any]:
         acme_subdomain = domain_to_acme_subdomain(domain_name)
 
         try:
-            provision_certificate(domain_name, acme_subdomain, skip_sync=True)
-            provisioned += 1
+            result = provision_certificate(domain_name, acme_subdomain, skip_sync=True)
+            if result.get('status') == RESULT_SKIPPED:
+                logger.info(f"Skipped {domain_name}: {result.get('reason', 'unknown')}")
+                skipped += 1
+            else:
+                provisioned += 1
         except Exception as e:
             logger.error(f"Failed to provision {domain_name}: {e}")
             failed += 1
@@ -515,7 +623,7 @@ def provision_pending_domains() -> Dict[str, Any]:
         logger.info(f"Triggering cert sync after provisioning {provisioned} domain(s)")
         trigger_cert_sync(BATCH_SYNC_PROVISION)
 
-    return {'provisioned': provisioned, 'failed': failed}
+    return {'provisioned': provisioned, 'failed': failed, 'skipped': skipped}
 
 
 def get_or_create_acme_account() -> Any:

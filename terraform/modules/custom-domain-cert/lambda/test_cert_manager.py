@@ -1,14 +1,18 @@
 """Tests for custom_domain_cert_manager Lambda.
 
 Covers renewal_scan(), provision_pending_domains(), list_cert_meta_params(),
-store_certificate(), and trigger_cert_sync() command injection hardening.
+store_certificate(), trigger_cert_sync() command injection hardening, and
+_acquire/_release_provisioning_lock idempotency lock.
 
 Uses unittest.mock to patch boto3 clients — no moto dependency needed.
 """
 import json
 import os
 import unittest
-from unittest.mock import patch, MagicMock
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch, MagicMock, call
+
+from botocore.exceptions import ClientError
 
 
 # Set required env vars before import
@@ -406,14 +410,16 @@ class TestFailureCategoryMetrics(unittest.TestCase):
             'hashes': MagicMock(),
         }
 
+    @patch('custom_domain_cert_manager._release_provisioning_lock')
     @patch('custom_domain_cert_manager.publish_failure_metric')
     @patch('custom_domain_cert_manager.send_alert')
     @patch('custom_domain_cert_manager.update_domain_status')
     @patch('custom_domain_cert_manager.request_certificate')
     @patch('custom_domain_cert_manager.get_or_create_acme_account')
+    @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=True)
     @patch('custom_domain_cert_manager.lazy_import_acme')
     def test_dns_validation_failure_publishes_correct_category(
-        self, mock_import, mock_acme, mock_request, mock_status, mock_alert, mock_metric
+        self, mock_import, mock_lock, mock_acme, mock_request, mock_status, mock_alert, mock_metric, mock_release
     ):
         """DNS validation failures should publish FAILURE_DNS_VALIDATION exactly once."""
         mock_request.side_effect = cm.DnsValidationError("TXT record not found")
@@ -423,14 +429,17 @@ class TestFailureCategoryMetrics(unittest.TestCase):
                 cm.provision_certificate("example.com", "example--com")
 
         mock_metric.assert_called_once_with(cm.FAILURE_DNS_VALIDATION)
+        mock_release.assert_called_once_with("example.com")
 
+    @patch('custom_domain_cert_manager._release_provisioning_lock')
     @patch('custom_domain_cert_manager.publish_failure_metric')
     @patch('custom_domain_cert_manager.send_alert')
     @patch('custom_domain_cert_manager.update_domain_status')
     @patch('custom_domain_cert_manager.get_or_create_acme_account')
+    @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=True)
     @patch('custom_domain_cert_manager.lazy_import_acme')
     def test_acme_account_failure_publishes_correct_category(
-        self, mock_import, mock_acme, mock_status, mock_alert, mock_metric
+        self, mock_import, mock_lock, mock_acme, mock_status, mock_alert, mock_metric, mock_release
     ):
         """ACME account failures should publish FAILURE_ACME_ACCOUNT."""
         mock_acme.side_effect = Exception("ACME account error")
@@ -439,16 +448,19 @@ class TestFailureCategoryMetrics(unittest.TestCase):
             cm.provision_certificate("example.com", "example--com")
 
         mock_metric.assert_called_once_with(cm.FAILURE_ACME_ACCOUNT)
+        mock_release.assert_called_once_with("example.com")
 
+    @patch('custom_domain_cert_manager._release_provisioning_lock')
     @patch('custom_domain_cert_manager.publish_failure_metric')
     @patch('custom_domain_cert_manager.send_alert')
     @patch('custom_domain_cert_manager.update_domain_status')
     @patch('custom_domain_cert_manager.store_certificate')
     @patch('custom_domain_cert_manager.request_certificate')
     @patch('custom_domain_cert_manager.get_or_create_acme_account')
+    @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=True)
     @patch('custom_domain_cert_manager.lazy_import_acme')
     def test_cert_storage_failure_publishes_correct_category(
-        self, mock_import, mock_acme, mock_request, mock_store, mock_status, mock_alert, mock_metric
+        self, mock_import, mock_lock, mock_acme, mock_request, mock_store, mock_status, mock_alert, mock_metric, mock_release
     ):
         """Certificate storage failures should publish FAILURE_CERT_STORAGE."""
         mock_request.return_value = ('cert-pem', 'chain-pem')
@@ -459,6 +471,7 @@ class TestFailureCategoryMetrics(unittest.TestCase):
                 cm.provision_certificate("example.com", "example--com")
 
         mock_metric.assert_called_once_with(cm.FAILURE_CERT_STORAGE)
+        mock_release.assert_called_once_with("example.com")
 
     @patch('custom_domain_cert_manager.publish_failure_metric')
     @patch.object(cm.dynamodb_client, 'query')
@@ -472,12 +485,14 @@ class TestFailureCategoryMetrics(unittest.TestCase):
         assert 'error' in result
         mock_metric.assert_called_once_with(cm.FAILURE_DYNAMODB)
 
+    @patch('custom_domain_cert_manager._release_provisioning_lock')
     @patch('custom_domain_cert_manager.publish_failure_metric')
     @patch('custom_domain_cert_manager.send_alert')
     @patch('custom_domain_cert_manager.update_domain_status')
+    @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=True)
     @patch('custom_domain_cert_manager.lazy_import_acme')
     def test_early_failure_publishes_acme_account_category(
-        self, mock_import, mock_status, mock_alert, mock_metric
+        self, mock_import, mock_lock, mock_status, mock_alert, mock_metric, mock_release
     ):
         """Failures before first category reassignment default to FAILURE_ACME_ACCOUNT."""
         mock_import.side_effect = Exception("import failed")
@@ -486,15 +501,18 @@ class TestFailureCategoryMetrics(unittest.TestCase):
             cm.provision_certificate("example.com", "example--com")
 
         mock_metric.assert_called_once_with(cm.FAILURE_ACME_ACCOUNT)
+        mock_release.assert_called_once_with("example.com")
 
+    @patch('custom_domain_cert_manager._release_provisioning_lock')
     @patch('custom_domain_cert_manager.publish_failure_metric')
     @patch('custom_domain_cert_manager.send_alert')
     @patch('custom_domain_cert_manager.update_domain_status')
     @patch('custom_domain_cert_manager.request_certificate')
     @patch('custom_domain_cert_manager.get_or_create_acme_account')
+    @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=True)
     @patch('custom_domain_cert_manager.lazy_import_acme')
     def test_dns_validation_not_double_counted_in_handler(
-        self, mock_import, mock_acme, mock_request, mock_status, mock_alert, mock_metric
+        self, mock_import, mock_lock, mock_acme, mock_request, mock_status, mock_alert, mock_metric, mock_release
     ):
         """DnsValidationError should not cause double metric publishing through handler."""
         mock_request.side_effect = cm.DnsValidationError("TXT record not found")
@@ -505,6 +523,173 @@ class TestFailureCategoryMetrics(unittest.TestCase):
 
         # Should be called exactly once (in provision_certificate), not twice
         mock_metric.assert_called_once_with(cm.FAILURE_DNS_VALIDATION)
+
+
+
+class TestProvisioningIdempotencyLock(unittest.TestCase):
+    """Tests for _acquire_provisioning_lock() and _release_provisioning_lock()."""
+
+    @patch.object(cm.dynamodb_client, 'update_item')
+    def test_acquire_lock_succeeds_first_time(self, mock_update):
+        mock_update.return_value = {}
+        result = cm._acquire_provisioning_lock('example.com')
+        assert result is True
+        kw = mock_update.call_args.kwargs
+        assert 'attribute_not_exists(provisioning_started_at)' in kw['ConditionExpression']
+
+    @patch.object(cm.dynamodb_client, 'update_item')
+    def test_acquire_lock_fails_when_held(self, mock_update):
+        mock_update.side_effect = ClientError(
+            {'Error': {'Code': 'ConditionalCheckFailedException', 'Message': ''}}, 'UpdateItem')
+        assert cm._acquire_provisioning_lock('example.com') is False
+
+    @patch.object(cm.dynamodb_client, 'update_item')
+    def test_acquire_lock_propagates_unexpected_errors(self, mock_update):
+        mock_update.side_effect = ClientError(
+            {'Error': {'Code': 'InternalServerError', 'Message': ''}}, 'UpdateItem')
+        with self.assertRaises(ClientError):
+            cm._acquire_provisioning_lock('example.com')
+
+    def test_acquire_lock_skips_when_no_table(self):
+        orig = cm.QURL_DOMAINS_TABLE
+        cm.QURL_DOMAINS_TABLE = None
+        try:
+            assert cm._acquire_provisioning_lock('example.com') is True
+        finally:
+            cm.QURL_DOMAINS_TABLE = orig
+
+    @patch.object(cm.dynamodb_client, 'update_item')
+    def test_acquire_lock_stale_threshold(self, mock_update):
+        mock_update.return_value = {}
+        cm._acquire_provisioning_lock('example.com')
+        kw = mock_update.call_args.kwargs
+        now_dt = datetime.fromisoformat(kw['ExpressionAttributeValues'][':now']['S'])
+        stale_dt = datetime.fromisoformat(kw['ExpressionAttributeValues'][':stale']['S'])
+        assert abs((now_dt - stale_dt).total_seconds() - 1800) < 2
+
+    @patch.object(cm.dynamodb_client, 'update_item')
+    def test_release_lock_removes_attribute(self, mock_update):
+        mock_update.return_value = {}
+        cm._release_provisioning_lock('example.com')
+        assert mock_update.call_args.kwargs['UpdateExpression'] == 'REMOVE provisioning_started_at'
+
+    @patch.object(cm.dynamodb_client, 'update_item')
+    def test_release_lock_is_best_effort(self, mock_update):
+        mock_update.side_effect = Exception("fail")
+        cm._release_provisioning_lock('example.com')  # Should not raise
+
+    def test_release_lock_skips_when_no_table(self):
+        orig = cm.QURL_DOMAINS_TABLE
+        cm.QURL_DOMAINS_TABLE = None
+        try:
+            cm._release_provisioning_lock('example.com')
+        finally:
+            cm.QURL_DOMAINS_TABLE = orig
+
+    @patch('custom_domain_cert_manager._release_provisioning_lock')
+    @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=False)
+    def test_provision_skips_when_lock_held(self, mock_acquire, mock_release):
+        result = cm.provision_certificate('example.com', 'example--com')
+        assert result['status'] == cm.RESULT_SKIPPED
+        assert 'concurrent' in result['reason']
+        mock_release.assert_not_called()
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch.object(cm.dynamodb_client, 'query')
+    def test_pending_does_not_count_skipped(self, mock_query, mock_provision, mock_sync):
+        mock_query.return_value = {'Items': [{'domain': {'S': 'a.com'}}, {'domain': {'S': 'b.com'}}]}
+        mock_provision.side_effect = [
+            {'status': cm.RESULT_SKIPPED, 'domain': 'a.com', 'reason': 'concurrent'},
+            {'status': cm.RESULT_PROVISIONED, 'domain': 'b.com'},
+        ]
+        result = cm.provision_pending_domains()
+        assert result['provisioned'] == 1
+        assert result['failed'] == 0
+        assert result['skipped'] == 1
+
+
+class TestRenewalScanSkipped(unittest.TestCase):
+    """Tests for renewal_scan() handling of RESULT_SKIPPED."""
+
+    @patch('custom_domain_cert_manager.publish_metric')
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch('custom_domain_cert_manager.list_cert_meta_params')
+    def test_renewal_scan_does_not_count_skipped_as_renewed(
+        self, mock_list, mock_provision, mock_sync, mock_metric
+    ):
+        """Domains skipped due to lock should not inflate the renewed count."""
+        expiring = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+        mock_list.return_value = [
+            {'Name': '/nhp/certs/a.com/meta', 'Value': json.dumps({
+                'expires_at': expiring, 'acme_subdomain': 'a--com',
+            })},
+            {'Name': '/nhp/certs/b.com/meta', 'Value': json.dumps({
+                'expires_at': expiring, 'acme_subdomain': 'b--com',
+            })},
+        ]
+        mock_provision.side_effect = [
+            {'status': cm.RESULT_SKIPPED, 'domain': 'a.com', 'reason': 'concurrent'},
+            {'status': cm.RESULT_PROVISIONED, 'domain': 'b.com'},
+        ]
+
+        result = cm.renewal_scan()
+        assert result['renewed'] == 1
+        assert result['skipped'] >= 1  # At least 1 skipped due to lock
+
+
+class TestStaleLockRecovery(unittest.TestCase):
+    """Integration-style test: simulates a Lambda crash leaving a stale lock,
+    then verifies a subsequent invocation can acquire the lock after the
+    stale threshold expires."""
+
+    @patch.object(cm.dynamodb_client, 'update_item')
+    def test_stale_lock_allows_new_invocation(self, mock_update):
+        """First call acquires lock. Second call fails (lock held).
+        Third call succeeds because the lock timestamp is beyond the stale threshold."""
+
+        call_count = 0
+        captured_values = []
+
+        def side_effect(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            captured_values.append(kwargs.get('ExpressionAttributeValues', {}))
+
+            if call_count == 1:
+                # First invocation: lock acquired
+                return {}
+            elif call_count == 2:
+                # Second invocation: lock still held (not stale yet)
+                raise ClientError(
+                    {'Error': {'Code': 'ConditionalCheckFailedException', 'Message': ''}},
+                    'UpdateItem',
+                )
+            else:
+                # Third invocation: lock is stale, DynamoDB allows the conditional write
+                return {}
+
+        mock_update.side_effect = side_effect
+
+        # Invocation 1: acquires the lock
+        assert cm._acquire_provisioning_lock('example.com') is True
+
+        # Invocation 2: lock is held by invocation 1 (simulated crash — no release)
+        assert cm._acquire_provisioning_lock('example.com') is False
+
+        # Invocation 3: lock is now stale, new invocation can acquire
+        assert cm._acquire_provisioning_lock('example.com') is True
+
+        # Verify all 3 calls passed the correct stale threshold
+        for vals in captured_values:
+            stale_ts = vals.get(':stale', {}).get('S', '')
+            now_ts = vals.get(':now', {}).get('S', '')
+            assert stale_ts and now_ts
+            stale_dt = datetime.fromisoformat(stale_ts)
+            now_dt = datetime.fromisoformat(now_ts)
+            delta_seconds = (now_dt - stale_dt).total_seconds()
+            assert abs(delta_seconds - cm.PROVISIONING_LOCK_STALE_MINUTES * 60) < 2
 
 
 if __name__ == '__main__':
