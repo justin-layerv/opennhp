@@ -62,6 +62,17 @@ const (
 	MetricLicenseValidationRateLimited = "LicenseValidationRateLimited"
 )
 
+// Multi-AC broadcast observability metric names (issue #376).
+const (
+	MetricBroadcastTotal       = "BroadcastTotal"       // total broadcast invocations
+	MetricBroadcastSuccess     = "BroadcastSuccess"     // at least one AC succeeded
+	MetricBroadcastAllFail     = "BroadcastAllFail"     // every AC in the broadcast failed
+	MetricBroadcastACLatencyMs = "BroadcastACLatencyMs" // per-AC operation duration within a broadcast
+	MetricACConnsPerID         = "ACConnsPerID"         // gauge: max AC connections across all AC IDs
+	MetricTotalACConns         = "TotalACConns"         // gauge: total AC connections across all AC IDs
+	MetricACConnEviction       = "ACConnEviction"       // MaxACConnsPerID eviction events
+)
+
 // forwardToTransaction finds the remote transaction and forwards the message to it.
 // Returns common.ErrTransactionIdNotFound if the transaction is not available.
 //
@@ -386,6 +397,7 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		if len(existingConns) >= MaxACConnsPerID {
 			staleConn = existingConns[0]
 			existingConns = existingConns[1:]
+			s.metrics.IncrCounter(MetricACConnEviction)
 			log.Warning("server-ac(%s)[HandleACOnline] Max connections per AC ID reached (%d), evicting oldest",
 				acId, MaxACConnsPerID)
 		}

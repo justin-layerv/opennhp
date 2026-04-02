@@ -529,6 +529,32 @@ func (s *UdpServer) ACPeerCount() int {
 	return len(s.acConnectionMap)
 }
 
+// MaxACConnsForAnyID returns the maximum number of connections held by any
+// single AC ID. During blue/green deployments this is typically 2 (one per
+// color). A sustained value at MaxACConnsPerID indicates eviction pressure.
+func (s *UdpServer) MaxACConnsForAnyID() int {
+	s.acConnectionMapMutex.RLock()
+	defer s.acConnectionMapMutex.RUnlock()
+	maxConns := 0
+	for _, conns := range s.acConnectionMap {
+		if len(conns) > maxConns {
+			maxConns = len(conns)
+		}
+	}
+	return maxConns
+}
+
+// TotalACConns returns the total number of AC connections across all AC IDs.
+func (s *UdpServer) TotalACConns() int {
+	s.acConnectionMapMutex.RLock()
+	defer s.acConnectionMapMutex.RUnlock()
+	total := 0
+	for _, conns := range s.acConnectionMap {
+		total += len(conns)
+	}
+	return total
+}
+
 // cleanupOwnedAssignments is called during shutdown to best-effort remove this
 // server from AC assignments it's part of. This helps reduce stale forwarding
 // attempts while the 30-minute TTL and Cloud Map health checks provide the
@@ -1631,12 +1657,20 @@ func (s *UdpServer) processACOperationBroadcast(
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
 ) (*common.ACOpsResultMsg, error) {
+	s.metrics.IncrCounter(MetricBroadcastTotal)
 	if len(conns) == 1 {
 		start := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), DefaultBroadcastTimeout)
 		defer cancel()
 		artMsg, err := s.processACOperation(ctx, knkMsg, conns[0], srcAddr, dstAddrs, openTime)
-		s.metrics.RecordLatency(MetricBroadcastDurationMs, float64(time.Since(start).Milliseconds()))
+		elapsed := float64(time.Since(start).Milliseconds())
+		s.metrics.RecordLatency(MetricBroadcastDurationMs, elapsed)
+		s.metrics.RecordLatency(MetricBroadcastACLatencyMs, elapsed)
+		if err == nil {
+			s.metrics.IncrCounter(MetricBroadcastSuccess)
+		} else {
+			s.metrics.IncrCounter(MetricBroadcastAllFail)
+		}
 		return artMsg, err
 	}
 
@@ -1658,9 +1692,11 @@ func (s *UdpServer) processACOperationBroadcast(
 	results := make(chan broadcastResult, total)
 	for _, conn := range conns {
 		go func(c *ACConn) {
+			acStart := time.Now()
 			ctx, cancel := context.WithTimeout(context.Background(), DefaultBroadcastTimeout)
 			defer cancel()
 			artMsg, err := s.processACOperation(ctx, knkMsg, c, srcAddr, dstAddrs, openTime)
+			s.metrics.RecordLatency(MetricBroadcastACLatencyMs, float64(time.Since(acStart).Milliseconds()))
 			results <- broadcastResult{artMsg, err, c.ACPeer.RecvAddr().String()}
 		}(conn)
 	}
@@ -1706,6 +1742,7 @@ func (s *UdpServer) processACOperationBroadcast(
 				elapsed := time.Since(broadcastStart)
 				s.metrics.RecordLatency(MetricBroadcastDurationMs, float64(elapsed.Milliseconds()))
 			}
+			s.metrics.IncrCounter(MetricBroadcastSuccess)
 			return r.artMsg, nil
 		}
 		failCount++
@@ -1717,6 +1754,7 @@ func (s *UdpServer) processACOperationBroadcast(
 
 	elapsed := time.Since(broadcastStart)
 	s.metrics.RecordLatency(MetricBroadcastDurationMs, float64(elapsed.Milliseconds()))
+	s.metrics.IncrCounter(MetricBroadcastAllFail)
 	log.Warning("server-agent(%s@%s)[processACOperationBroadcast] all %d ACs failed in %v", userId, addrStr, total, elapsed)
 	return lastArtMsg, lastErr
 }

@@ -694,6 +694,65 @@ func TestMaxACConnsPerID(t *testing.T) {
 	}
 }
 
+// TestMaxACConnsForAnyID tests the gauge helper that returns the max
+// connection count across all AC IDs.
+func TestMaxACConnsForAnyID(t *testing.T) {
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	s := &UdpServer{
+		device:          device,
+		acConnectionMap: make(map[string][]*ACConn),
+	}
+
+	// Empty map → 0
+	if got := s.MaxACConnsForAnyID(); got != 0 {
+		t.Errorf("empty map: expected 0, got %d", got)
+	}
+
+	// One AC ID with 1 connection
+	s.acConnectionMap["ac-1"] = []*ACConn{{ACId: "ac-1"}}
+	if got := s.MaxACConnsForAnyID(); got != 1 {
+		t.Errorf("single conn: expected 1, got %d", got)
+	}
+
+	// Two AC IDs: ac-1 has 1, ac-2 has 3 → max is 3
+	s.acConnectionMap["ac-2"] = []*ACConn{{ACId: "ac-2"}, {ACId: "ac-2"}, {ACId: "ac-2"}}
+	if got := s.MaxACConnsForAnyID(); got != 3 {
+		t.Errorf("multi-AC: expected 3, got %d", got)
+	}
+}
+
+// TestTotalACConns tests the gauge helper that returns the total
+// connection count across all AC IDs.
+func TestTotalACConns(t *testing.T) {
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	s := &UdpServer{
+		device:          device,
+		acConnectionMap: make(map[string][]*ACConn),
+	}
+
+	// Empty map → 0
+	if got := s.TotalACConns(); got != 0 {
+		t.Errorf("empty map: expected 0, got %d", got)
+	}
+
+	// ac-1: 1 conn, ac-2: 2 conns → total 3
+	s.acConnectionMap["ac-1"] = []*ACConn{{ACId: "ac-1"}}
+	s.acConnectionMap["ac-2"] = []*ACConn{{ACId: "ac-2"}, {ACId: "ac-2"}}
+	if got := s.TotalACConns(); got != 3 {
+		t.Errorf("multi-AC: expected 3, got %d", got)
+	}
+}
+
 // mockACResponder reads from sendMsgCh and sends mock AC responses.
 // delay controls how long before responding; if nil error, sends a success ART response.
 func mockACResponder(sendMsgCh <-chan *core.MsgData, delay time.Duration, respErr error) {

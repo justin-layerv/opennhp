@@ -264,6 +264,14 @@ func (hs *HttpServer) initHealthManager() error {
 		return float64(hs.udpServer.ACPeerCount())
 	})
 
+	// Publish multi-AC broadcast gauges (issue #376).
+	hs.udpServer.metrics.RegisterGaugeFunc(MetricACConnsPerID, func() float64 {
+		return float64(hs.udpServer.MaxACConnsForAnyID())
+	})
+	hs.udpServer.metrics.RegisterGaugeFunc(MetricTotalACConns, func() float64 {
+		return float64(hs.udpServer.TotalACConns())
+	})
+
 	// Register etcd health checker for non-cloud mode
 	if pinger := hs.udpServer.GetEtcdPinger(); pinger != nil {
 		etcdChecker := health.NewEtcdChecker(&health.EtcdCheckerConfig{
