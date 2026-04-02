@@ -4,7 +4,7 @@ go 1.25.8
 
 require (
 	github.com/OpenNHP/opennhp/nhp v0.6.0
-	github.com/aws/aws-sdk-go-v2 v1.41.4
+	github.com/aws/aws-sdk-go-v2 v1.41.5
 	github.com/aws/aws-sdk-go-v2/config v1.32.12
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue v1.20.36
 	github.com/aws/aws-sdk-go-v2/service/cloudwatch v1.55.2
