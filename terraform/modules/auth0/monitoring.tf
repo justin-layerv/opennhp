@@ -120,6 +120,7 @@ resource "aws_cloudwatch_metric_alarm" "rotation_lambda_throttles" {
   alarm_name          = "${var.name_prefix}-auth0-rotation-throttles"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
+  datapoints_to_alarm = 2
   metric_name         = "Throttles"
   namespace           = "AWS/Lambda"
   period              = 300 # 5 minutes

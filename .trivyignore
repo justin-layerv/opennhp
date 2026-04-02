@@ -32,6 +32,3 @@ CVE-2025-66382
 
 # sigstore/timestamp-authority - no fix available yet (v1.2.9 is latest)
 CVE-2025-66564
-
-# grpc-go - fixed in v1.79.3 (which we use), but Trivy DB hasn't updated yet
-CVE-2026-33186
