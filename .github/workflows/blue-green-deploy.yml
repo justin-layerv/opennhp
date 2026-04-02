@@ -69,9 +69,11 @@ permissions:
   id-token: write
   contents: read
 
-# Only one blue/green deployment per environment+component at a time
+# Serialize ALL blue/green deploys per environment. Using environment-only
+# concurrency ensures component=both conflicts with component=server and
+# component=ac, preventing dangerous overlapping deploys (see #340).
 concurrency:
-  group: blue-green-${{ inputs.environment }}-${{ inputs.component }}
+  group: blue-green-${{ inputs.environment }}
   cancel-in-progress: false
 
 env:
