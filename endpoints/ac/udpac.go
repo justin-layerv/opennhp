@@ -679,10 +679,11 @@ func (a *UdpAC) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sync.W
 	var failCount int
 
 	for {
-		// Re-resolve server address each iteration to pick up DNS changes
+		// Re-resolve server address each iteration to pick up DNS changes.
+		// Note: ResolveHost() internally caches results for MinimalNSLookupInterval (300s)
 		sendAddr := server.SendAddr()
 		if sendAddr == nil {
-			log.Error("Cannot resolve server address for %s, will retry", server.Hostname)
+			log.Error("Cannot resolve server address for %s, will retry in %ds", server.Hostname, MinimalServerDiscoveryInterval)
 			select {
 			case <-a.signals.stop:
 				return
