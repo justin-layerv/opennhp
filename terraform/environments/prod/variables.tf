@@ -230,17 +230,17 @@ variable "auth_aes_key" {
 # Monitoring
 variable "enable_slack_notifications" {
   type    = bool
-  default = false
+  default = true
 }
 
 variable "slack_workspace_id" {
   type    = string
-  default = ""
+  default = "T09UP622L90"
 }
 
 variable "slack_channel_id" {
   type    = string
-  default = ""
+  default = "C09UP62A8F4"
 }
 
 # Deployment configuration
