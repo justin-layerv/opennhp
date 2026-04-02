@@ -51,13 +51,6 @@ func CatchPanicThenRun(catchFun func()) {
 	}
 }
 
-// Here's how to get the current date string in the format yyyyMMdd (like 20250210) in various programming languages:
-func GetCurrentDate() (date string) {
-	now := time.Now()
-	date = now.Format("20060102")
-	return date
-}
-
 func DownloadFileToTemp(fileUrl string, pattern string) (string, error) {
 	tempDir, err := os.MkdirTemp("", pattern)
 	if err != nil {

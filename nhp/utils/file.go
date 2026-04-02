@@ -1,15 +1,8 @@
 package utils
 
 import (
-	"crypto/md5"
-	"crypto/sha1"
-	"crypto/sha256"
-	"fmt"
-	"hash"
 	"io"
-	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -17,41 +10,6 @@ import (
 
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
-
-func ReadWholeFile(fileName string) (string, error) {
-	buf, err := os.ReadFile(fileName)
-	if err != nil {
-		return "", err
-	}
-
-	return string(buf), nil
-}
-
-func HashFile(method string, fileName string) (string, error) {
-	file, err := os.Open(fileName) // Open the file for reading
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = file.Close() }() // Be sure to close your file
-
-	var hash hash.Hash
-
-	switch {
-	case strings.EqualFold(method, "md5"):
-		hash = md5.New()
-
-	case strings.EqualFold(method, "sha1"):
-		hash = sha1.New()
-
-	case strings.EqualFold(method, "sha256"):
-		hash = sha256.New()
-	}
-
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%x", hash.Sum(nil)), nil // Get hex encoded hash sum
-}
 
 type fileWatcher struct {
 	filename string
