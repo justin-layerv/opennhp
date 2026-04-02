@@ -38,3 +38,13 @@ CVE-2025-66564
 # Traefik v3.6.11 does not yet bundle grpc >= v1.79.3
 # https://avd.aquasec.com/nvd/cve-2026-33186
 CVE-2026-33186
+
+# github.com/docker/docker - HIGH, AuthZ plugin bypass with oversized request bodies
+# AC image bundles Docker client libraries but does not expose AuthZ plugins
+# https://avd.aquasec.com/nvd/cve-2026-34040
+CVE-2026-34040
+
+# github.com/traefik/traefik/v3 - HIGH, in vendored Traefik binary
+# Waiting for Traefik v3 patch release
+# https://avd.aquasec.com/nvd/cve-2026-32305
+CVE-2026-32305
