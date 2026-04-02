@@ -32,3 +32,9 @@ CVE-2025-66382
 
 # sigstore/timestamp-authority - no fix available yet (v1.2.9 is latest)
 CVE-2025-66564
+
+# google.golang.org/grpc - CRITICAL, in vendored Traefik binary (not our code)
+# gRPC-Go authorization bypass via missing leading slash in :path
+# Traefik v3.6.11 does not yet bundle grpc >= v1.79.3
+# https://avd.aquasec.com/nvd/cve-2026-33186
+CVE-2026-33186
