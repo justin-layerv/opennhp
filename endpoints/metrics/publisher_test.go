@@ -1,9 +1,12 @@
 package metrics
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"testing"
 	"time"
 
@@ -642,7 +645,29 @@ func newTestPublisher(t *testing.T, client cloudWatchClient) *Publisher {
 		latencies:   make(map[string][]float64),
 		gaugeFuncs:  make(map[string]GaugeFunc),
 		stop:        make(chan struct{}),
+		emfWriter:   io.Discard,
 	}
+}
+
+func newTestPublisherWithEMF(t *testing.T, client cloudWatchClient) (*Publisher, *bytes.Buffer) {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	mp := &Publisher{
+		client:      client,
+		namespace:   "LayerV/NHP",
+		counters:    make(map[string]float64),
+		dimCounters: make(map[string]*dimCounterEntry),
+		gauges:      make(map[string]float64),
+		latencies:   make(map[string][]float64),
+		gaugeFuncs:  make(map[string]GaugeFunc),
+		stop:        make(chan struct{}),
+		emfWriter:   buf,
+		dims: []types.Dimension{
+			{Name: aws.String("Environment"), Value: aws.String("sandbox")},
+			{Name: aws.String("Cell"), Value: aws.String("cell0")},
+		},
+	}
+	return mp, buf
 }
 
 type mockCloudWatchClient struct {
@@ -746,4 +771,100 @@ func TestPublisher_Flush_PutMetricDataError(t *testing.T) {
 	if count != 0 {
 		t.Errorf("expected counters reset after flush, got %d entries", count)
 	}
+}
+
+func TestEmitEMF_SingleMetric(t *testing.T) {
+	mp, buf := newTestPublisherWithEMF(t, nil)
+	mp.emitEMF(map[string][]float64{"KnockLatency": {10.5, 20.3, 5.1}})
+	events := parseEMFLines(t, buf.Bytes())
+	if len(events) != 1 {
+		t.Fatalf("expected 1 EMF event, got %d", len(events))
+	}
+	event := events[0]
+	if _, ok := event["_aws"].(map[string]any); !ok {
+		t.Fatal("missing _aws block")
+	}
+	if event["Environment"] != "sandbox" {
+		t.Errorf("expected Environment=sandbox, got %v", event["Environment"])
+	}
+	vals, ok := event["KnockLatency"].([]any)
+	if !ok {
+		t.Fatalf("expected KnockLatency array, got %T", event["KnockLatency"])
+	}
+	if len(vals) != 3 {
+		t.Errorf("expected 3 values, got %d", len(vals))
+	}
+}
+
+func TestEmitEMF_SingleValue(t *testing.T) {
+	mp, buf := newTestPublisherWithEMF(t, nil)
+	mp.emitEMF(map[string][]float64{"KnockLatency": {42.5}})
+	events := parseEMFLines(t, buf.Bytes())
+	val, ok := events[0]["KnockLatency"].(float64)
+	if !ok {
+		t.Fatalf("expected float64, got %T", events[0]["KnockLatency"])
+	}
+	if val != 42.5 {
+		t.Errorf("expected 42.5, got %v", val)
+	}
+}
+
+func TestEmitEMF_ChunkingOver150(t *testing.T) {
+	mp, buf := newTestPublisherWithEMF(t, nil)
+	values := make([]float64, 200)
+	for i := range values {
+		values[i] = float64(i)
+	}
+	mp.emitEMF(map[string][]float64{"KnockLatency": values})
+	events := parseEMFLines(t, buf.Bytes())
+	if len(events) != 2 {
+		t.Fatalf("expected 2 EMF events, got %d", len(events))
+	}
+}
+
+func TestEmitEMF_NilWriter(t *testing.T) {
+	mp := newTestPublisher(t, nil)
+	mp.emfWriter = nil
+	mp.emitEMF(map[string][]float64{"KnockLatency": {10.0}})
+}
+
+func TestFlush_EmitsEMFAlongsideStatisticSets(t *testing.T) {
+	mockCW := &mockCloudWatchClient{}
+	mp, buf := newTestPublisherWithEMF(t, mockCW)
+	mp.RecordLatency("KnockLatency", 10)
+	mp.RecordLatency("KnockLatency", 20)
+	mp.IncrCounter("KnockRequest")
+	mp.flush()
+	if len(mockCW.calls) != 1 {
+		t.Fatalf("expected 1 PutMetricData call, got %d", len(mockCW.calls))
+	}
+	byName := indexByName(mockCW.calls[0].MetricData)
+	if byName["KnockLatency"].StatisticValues == nil {
+		t.Fatal("KnockLatency should have StatisticValues")
+	}
+	events := parseEMFLines(t, buf.Bytes())
+	if len(events) != 1 {
+		t.Fatalf("expected 1 EMF event, got %d", len(events))
+	}
+	vals := events[0]["KnockLatency"].([]any)
+	if len(vals) != 2 {
+		t.Errorf("expected 2 EMF values, got %d", len(vals))
+	}
+}
+
+func parseEMFLines(t *testing.T, data []byte) []map[string]any {
+	t.Helper()
+	var events []map[string]any
+	lines := bytes.Split(bytes.TrimSpace(data), []byte("\n"))
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal(line, &event); err != nil {
+			t.Fatalf("failed to parse EMF line: %v", err)
+		}
+		events = append(events, event)
+	}
+	return events
 }

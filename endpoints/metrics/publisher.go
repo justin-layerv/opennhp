@@ -2,6 +2,9 @@ package metrics
 
 import (
 	"context"
+	"encoding/json"
+	"io"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -77,6 +80,7 @@ type Publisher struct {
 	once        sync.Once            // ensures Stop is idempotent
 	healthProbe HealthProbe          // optional: emits StorageHealthy gauge each flush
 	gaugeFuncs  map[string]GaugeFunc // metric name → func called each flush
+	emfWriter   io.Writer            // destination for EMF JSON lines (defaults to os.Stdout)
 }
 
 // NewPublisher creates a CloudWatch metrics publisher.
@@ -101,6 +105,7 @@ func NewPublisher(cfg Config) *Publisher {
 		dims:        cfg.Dimensions,
 		stop:        make(chan struct{}),
 		gaugeFuncs:  make(map[string]GaugeFunc),
+		emfWriter:   os.Stdout,
 	}
 
 	mp.wg.Add(1)
@@ -110,7 +115,7 @@ func NewPublisher(cfg Config) *Publisher {
 	for i, d := range cfg.Dimensions {
 		dimDesc[i] = *d.Name + "=" + *d.Value
 	}
-	log.Info("CloudWatch metrics publisher started (namespace=%s, dims=[%s])",
+	log.Info("CloudWatch metrics publisher started (namespace=%s, dims=[%s], emf=enabled)",
 		cfg.Namespace, strings.Join(dimDesc, ", "))
 	return mp
 }
@@ -306,6 +311,8 @@ func (mp *Publisher) flush() {
 	mp.latencies = make(map[string][]float64)
 	mp.mu.Unlock()
 
+	mp.emitEMF(latencies)
+
 	metricData := mp.buildMetricData(counters, dimCounters, gauges, latencies)
 
 	if len(metricData) == 0 {
@@ -335,6 +342,86 @@ func (mp *Publisher) flush() {
 				end-i, err)
 		}
 	}
+}
+
+type emfMetricDefinition struct {
+	Name string `json:"Name"`
+	Unit string `json:"Unit"`
+}
+
+type emfMetricDirective struct {
+	Namespace  string                `json:"Namespace"`
+	Dimensions [][]string            `json:"Dimensions"`
+	Metrics    []emfMetricDefinition `json:"Metrics"`
+}
+
+type emfAWSBlock struct {
+	Timestamp         int64                `json:"Timestamp"`
+	CloudWatchMetrics []emfMetricDirective `json:"CloudWatchMetrics"`
+}
+
+const emfMaxValues = 150
+
+// emfUnitMilliseconds is the CloudWatch unit string for latency metrics emitted via EMF.
+const emfUnitMilliseconds = "Milliseconds"
+
+func (mp *Publisher) emitEMF(latencies map[string][]float64) {
+	if mp.emfWriter == nil {
+		return
+	}
+	ts := time.Now().UnixMilli()
+	dimNames := make([]string, len(mp.dims))
+	dimValues := make(map[string]string, len(mp.dims))
+	for i, d := range mp.dims {
+		dimNames[i] = *d.Name
+		dimValues[*d.Name] = *d.Value
+	}
+	for name, values := range latencies {
+		if len(values) == 0 {
+			continue
+		}
+		for i := 0; i < len(values); i += emfMaxValues {
+			end := i + emfMaxValues
+			if end > len(values) {
+				end = len(values)
+			}
+			chunk := values[i:end]
+			event := buildEMFEvent(mp.namespace, name, dimNames, dimValues, chunk, ts)
+			data, err := json.Marshal(event)
+			if err != nil {
+				log.Warning("Failed to marshal EMF event for %s: %v", name, err)
+				continue
+			}
+			data = append(data, 10)
+			if _, err := mp.emfWriter.Write(data); err != nil {
+				log.Warning("Failed to write EMF event for %s: %v", name, err)
+			}
+		}
+	}
+}
+
+func buildEMFEvent(namespace, metricName string, dimNames []string, dimValues map[string]string, values []float64, timestampMs int64) map[string]any {
+	event := map[string]any{
+		"_aws": emfAWSBlock{
+			Timestamp: timestampMs,
+			CloudWatchMetrics: []emfMetricDirective{
+				{
+					Namespace:  namespace,
+					Dimensions: [][]string{dimNames},
+					Metrics:    []emfMetricDefinition{{Name: metricName, Unit: emfUnitMilliseconds}},
+				},
+			},
+		},
+	}
+	for k, v := range dimValues {
+		event[k] = v
+	}
+	if len(values) == 1 {
+		event[metricName] = values[0]
+	} else {
+		event[metricName] = values
+	}
+	return event
 }
 
 // buildMetricData converts accumulated metrics into CloudWatch MetricDatum slices.
