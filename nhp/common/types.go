@@ -102,21 +102,32 @@ type NhpListRequest struct {
 }
 
 type HttpKnockRequest struct {
-	UserId         string          `json:"usrId"`
-	DeviceId       string          `json:"devId"`
-	OrganizationId string          `json:"orgId,omitempty"`
-	AuthServiceId  string          `json:"aspId"`
-	ResourceId     string          `json:"resId"`
-	Token          string          `json:"token"`
-	Code           string          `json:"code"`
-	DstUrl         string          `json:"dstUrl"`
-	Command        string          `json:"command"`
-	Url            *url.URL        `json:"-"`
-	UserAgent      string          `json:"-"`
-	SrcIp          string          `json:"srcIp,omitempty"`
-	SrcPort        int             `json:"srcPort,omitempty"`
-	Forwarded      bool            `json:"forwarded,omitempty"` // Set by internal forwarding to prevent loops
-	Ctx            context.Context `json:"-"`                   // Request context for cancellation propagation
+	UserId         string   `json:"usrId"`
+	DeviceId       string   `json:"devId"`
+	OrganizationId string   `json:"orgId,omitempty"`
+	AuthServiceId  string   `json:"aspId"`
+	ResourceId     string   `json:"resId"`
+	Token          string   `json:"token"`
+	Code           string   `json:"code"`
+	DstUrl         string   `json:"dstUrl"`
+	Command        string   `json:"command"`
+	Url            *url.URL `json:"-"`
+	UserAgent      string   `json:"-"`
+	SrcIp          string   `json:"srcIp,omitempty"`
+	SrcPort        int      `json:"srcPort,omitempty"`
+	Forwarded      bool     `json:"forwarded,omitempty"` // Set by internal forwarding to prevent loops
+
+	// Ctx carries the request context for downstream cancellation and value
+	// propagation (e.g., correlation IDs).
+	//
+	// DEPRECATED: storing context in a struct is a Go anti-pattern. The field
+	// is retained because the github.com/fengyily/nhp-plugins-sdk callback
+	// signature `HttpPluginPostAuthFunc` does not accept an explicit context
+	// parameter, so plugins built against that SDK have no other way to
+	// thread context through to handleHttpOpenResource. Internal nhp code
+	// should NOT add new readers of this field; once the SDK callback gains
+	// a context parameter (or is vendored/forked) this field can be removed.
+	Ctx context.Context `json:"-"`
 }
 
 type HttpRefreshRequest struct {

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -377,5 +378,161 @@ func TestLoggingStorage_RequestIDPropagated(t *testing.T) {
 	}
 	if assignment.ACID != "ac-rid" {
 		t.Errorf("Expected ACID 'ac-rid', got '%s'", assignment.ACID)
+	}
+}
+
+// contextCapturingStorage wraps a StorageBackend and records the context
+// passed to each method call, so tests can verify request ID propagation.
+type contextCapturingStorage struct {
+	StorageBackend
+	mu           sync.Mutex
+	capturedCtxs []context.Context
+}
+
+// Compile-time assertion that contextCapturingStorage satisfies StorageBackend.
+// The embedded StorageBackend provides this automatically, but the explicit
+// check makes the intent obvious and catches removal of the embedding.
+var _ StorageBackend = (*contextCapturingStorage)(nil)
+
+func (c *contextCapturingStorage) captureCtx(ctx context.Context) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.capturedCtxs = append(c.capturedCtxs, ctx)
+}
+
+func (c *contextCapturingStorage) lastCapturedCtx() context.Context {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.capturedCtxs) == 0 {
+		return nil
+	}
+	return c.capturedCtxs[len(c.capturedCtxs)-1]
+}
+
+func (c *contextCapturingStorage) GetACAssignment(ctx context.Context, acID string) (*ACAssignment, error) {
+	c.captureCtx(ctx)
+	return c.StorageBackend.GetACAssignment(ctx, acID)
+}
+
+func (c *contextCapturingStorage) GetACsByServer(ctx context.Context, serverID string) ([]ACAssignment, error) {
+	c.captureCtx(ctx)
+	return c.StorageBackend.GetACsByServer(ctx, serverID)
+}
+
+func (c *contextCapturingStorage) GetLicense(ctx context.Context, licenseKey string) (*License, error) {
+	c.captureCtx(ctx)
+	return c.StorageBackend.GetLicense(ctx, licenseKey)
+}
+
+func (c *contextCapturingStorage) GetResource(ctx context.Context, customerID, resourceID string) (*Resource, error) {
+	c.captureCtx(ctx)
+	return c.StorageBackend.GetResource(ctx, customerID, resourceID)
+}
+
+func (c *contextCapturingStorage) GetResourceByACID(ctx context.Context, acID string) ([]Resource, error) {
+	c.captureCtx(ctx)
+	return c.StorageBackend.GetResourceByACID(ctx, acID)
+}
+
+func (c *contextCapturingStorage) SaveACAssignment(ctx context.Context, assignment *ACAssignment) error {
+	c.captureCtx(ctx)
+	return c.StorageBackend.SaveACAssignment(ctx, assignment)
+}
+
+// TestLoggingStorage_RequestIDFlowsThroughToBackend verifies that a request ID
+// set via ContextWithRequestID is present in the context received by the
+// underlying storage backend. This proves the full propagation path:
+//
+//	HTTP middleware -> ContextWithRequestID -> LoggingStorage -> backend
+func TestLoggingStorage_RequestIDFlowsThroughToBackend(t *testing.T) {
+	t.Parallel()
+
+	mem := NewMemoryStorage()
+	mem.PutACAssignment(CreateTestACAssignment("ac-flow", "srv-1"))
+	mem.PutLicenseWithKey(CreateTestLicense("lic-flow"), "lic-flow")
+	mem.PutResource(CreateTestResource("cust-flow", "res-flow", "ac-flow"))
+
+	capturing := &contextCapturingStorage{StorageBackend: mem}
+	ls := NewLoggingStorage(capturing)
+
+	const expectedID = "req-flow-test-789"
+	ctx := ContextWithRequestID(context.Background(), expectedID)
+
+	// Exercise every storage method that accepts a context and verify the
+	// request ID is preserved in the context the backend receives.
+
+	tests := []struct {
+		name string
+		call func()
+	}{
+		{
+			name: "GetACAssignment",
+			call: func() { _, _ = ls.GetACAssignment(ctx, "ac-flow") },
+		},
+		{
+			name: "GetACsByServer",
+			call: func() { _, _ = ls.GetACsByServer(ctx, "srv-1") },
+		},
+		{
+			name: "GetLicense",
+			call: func() { _, _ = ls.GetLicense(ctx, "lic-flow") },
+		},
+		{
+			name: "GetResource",
+			call: func() { _, _ = ls.GetResource(ctx, "cust-flow", "res-flow") },
+		},
+		{
+			name: "GetResourceByACID",
+			call: func() { _, _ = ls.GetResourceByACID(ctx, "ac-flow") },
+		},
+		{
+			name: "SaveACAssignment",
+			call: func() { _ = ls.SaveACAssignment(ctx, CreateTestACAssignment("ac-save-flow", "srv-1")) },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.call()
+
+			capturedCtx := capturing.lastCapturedCtx()
+			if capturedCtx == nil {
+				t.Fatal("backend received no context")
+			}
+
+			got := requestIDFromCtx(capturedCtx)
+			if got != expectedID {
+				t.Errorf("request ID not propagated to backend: expected %q, got %q", expectedID, got)
+			}
+		})
+	}
+}
+
+// TestLoggingStorage_NilContextRequestIDDefaultsToDash verifies that when no
+// request ID is set in the context, requestIDFromCtx returns "-" (the default
+// sentinel). This ensures log lines always have a parseable req_id field.
+func TestLoggingStorage_NilContextRequestIDDefaultsToDash(t *testing.T) {
+	t.Parallel()
+
+	mem := NewMemoryStorage()
+	mem.PutACAssignment(CreateTestACAssignment("ac-nil", "srv-1"))
+
+	capturing := &contextCapturingStorage{StorageBackend: mem}
+	ls := NewLoggingStorage(capturing)
+
+	// Call with plain background context (no request ID).
+	_, err := ls.GetACAssignment(context.Background(), "ac-nil")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	capturedCtx := capturing.lastCapturedCtx()
+	if capturedCtx == nil {
+		t.Fatal("backend received no context")
+	}
+
+	got := requestIDFromCtx(capturedCtx)
+	if got != "-" {
+		t.Errorf("expected default sentinel %q for missing request ID, got %q", "-", got)
 	}
 }

@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
@@ -45,8 +47,13 @@ type ForwarderDeps interface {
 	) (*common.ACOpsResultMsg, error)
 
 	// ProcessACOperationBroadcast sends AOP to all AC connections in parallel.
+	// parentCtx carries context values (e.g., request ID) for log correlation
+	// but its cancellation is intentionally discarded — broadcast goroutines
+	// must run independently to open pinholes on every AC. Callers without a
+	// request context should pass context.Background(); never pass nil.
 	// Returns the first successful result.
 	ProcessACOperationBroadcast(
+		parentCtx context.Context,
 		knkMsg *common.AgentKnockMsg,
 		conns []*ACConn,
 		srcAddr *common.NetAddress,

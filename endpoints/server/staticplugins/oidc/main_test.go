@@ -8,11 +8,19 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
+	nhplog "github.com/OpenNHP/opennhp/nhp/log"
 	"github.com/OpenNHP/opennhp/nhp/plugins"
 )
 
 func init() {
 	gin.SetMode(gin.TestMode)
+	// The package-level `log` is normally wired up by plugins.Init() when
+	// the plugin is loaded at runtime. Tests call authOkta and friends
+	// directly, so we install a minimal logger here to avoid nil-pointer
+	// panics on error paths that want to log the underlying failure.
+	if log == nil {
+		log = nhplog.NewLogger("oidc-test", 3, "", "")
+	}
 }
 
 // newTestContext creates a gin test context with an optional Origin header.
@@ -78,18 +86,20 @@ func TestCorsMiddleware_WithoutOrigin(t *testing.T) {
 	}
 }
 
-func TestAuthRegular_NilAuthenticator(t *testing.T) {
+func TestAuthRegular_AuthenticatorUnavailable(t *testing.T) {
 	ctx, w := newTestContext("")
 	req := &common.HttpKnockRequest{}
 	res := &common.ResourceData{}
 	helper := &plugins.HttpServerPluginHelper{}
 
-	// Ensure oktaAuth is nil
-	oktaAuth = nil
+	// Empty AUTH0_DOMAIN forces NewAuthenticator to fail at provider
+	// discovery, which routes through getOrCreateAuthenticator and surfaces
+	// the "invalid authenticator" error path.
+	conf := config{AUTH0_DOMAIN: ""}
 
-	_, err := authRegular(ctx, req, res, helper)
+	_, err := authRegular(ctx, req, res, helper, conf)
 	if err == nil {
-		t.Fatal("expected error for nil authenticator")
+		t.Fatal("expected error when authenticator cannot be built")
 	}
 	if err.Error() != "invalid authenticator" {
 		t.Errorf("unexpected error: %v", err)
@@ -108,19 +118,18 @@ func TestAuthRegular_NilAuthenticator(t *testing.T) {
 func TestAuthOkta_InvalidConfig(t *testing.T) {
 	ctx, _ := newTestContext("")
 
-	// baseConf with empty domain will fail OIDC provider creation
-	baseConf = &config{
-		AUTH0_DOMAIN: "",
-	}
+	// Empty domain causes NewAuthenticator (and therefore
+	// getOrCreateAuthenticator) to fail at provider discovery.
+	conf := config{AUTH0_DOMAIN: ""}
 
-	err := authOkta(ctx)
+	err := authOkta(ctx, conf)
 	if err == nil {
 		t.Fatal("expected error for invalid config")
 	}
 	if err.Error() != "failed to initialize authenticator" {
 		t.Errorf("unexpected error: %v", err)
 	}
-	if oktaAuth != nil {
-		t.Error("expected oktaAuth to be nil after failed initialization")
+	if _, cached := authCache.Load(""); cached {
+		t.Error("expected failed authenticator NOT to be cached")
 	}
 }

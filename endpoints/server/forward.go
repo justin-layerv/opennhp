@@ -355,8 +355,11 @@ func (f *ServerForwarder) HandleForwardRequest(
 		openTime = 60 // Default open time
 	}
 
-	// Step 5: Broadcast AOP to all ACs (supports blue/green with same AC ID)
-	artMsg, err := f.deps.ProcessACOperationBroadcast(knkMsg, acConns, srcAddr, dstAddrs, openTime)
+	// Step 5: Broadcast AOP to all ACs (supports blue/green with same AC ID).
+	// HandleForwardRequest is invoked by the UDP server-to-server path, which
+	// does not have an HTTP request context, so pass Background here. The
+	// broadcast itself discards parent cancellation regardless.
+	artMsg, err := f.deps.ProcessACOperationBroadcast(context.Background(), knkMsg, acConns, srcAddr, dstAddrs, openTime)
 	if err != nil {
 		log.Error("AC operation failed for forwarded knock: %v", err)
 		errCode := "AC_OP_FAILED"

@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
@@ -57,6 +59,7 @@ func (m *MockForwarderDeps) ProcessACOperation(
 }
 
 func (m *MockForwarderDeps) ProcessACOperationBroadcast(
+	_ context.Context,
 	knkMsg *common.AgentKnockMsg,
 	conns []*ACConn,
 	srcAddr *common.NetAddress,

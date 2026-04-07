@@ -761,6 +761,7 @@ func (d *e2eForwarderDeps) ProcessACOperation(
 }
 
 func (d *e2eForwarderDeps) ProcessACOperationBroadcast(
+	_ context.Context,
 	knkMsg *common.AgentKnockMsg,
 	conns []*ACConn,
 	srcAddr *common.NetAddress,
@@ -974,6 +975,7 @@ func (d *capturingForwarderDeps) ProcessACOperation(
 }
 
 func (d *capturingForwarderDeps) ProcessACOperationBroadcast(
+	_ context.Context,
 	knkMsg *common.AgentKnockMsg,
 	conns []*ACConn,
 	srcAddr *common.NetAddress,
@@ -1198,6 +1200,7 @@ func (d *mockACForwarderDeps) ProcessACOperation(
 }
 
 func (d *mockACForwarderDeps) ProcessACOperationBroadcast(
+	_ context.Context,
 	knkMsg *common.AgentKnockMsg,
 	conns []*ACConn,
 	srcAddr *common.NetAddress,
@@ -1504,6 +1507,7 @@ func (d *errorACForwarderDeps) ProcessACOperation(
 }
 
 func (d *errorACForwarderDeps) ProcessACOperationBroadcast(
+	_ context.Context,
 	knkMsg *common.AgentKnockMsg,
 	conns []*ACConn,
 	srcAddr *common.NetAddress,
@@ -1687,6 +1691,7 @@ func (d *timeoutACForwarderDeps) ProcessACOperation(
 }
 
 func (d *timeoutACForwarderDeps) ProcessACOperationBroadcast(
+	_ context.Context,
 	knkMsg *common.AgentKnockMsg,
 	conns []*ACConn,
 	srcAddr *common.NetAddress,

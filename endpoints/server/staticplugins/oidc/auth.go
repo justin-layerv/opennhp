@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/gin-contrib/sessions"
@@ -13,16 +14,29 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// oidcDiscoveryTimeout bounds the OIDC provider discovery handshake
+// (.well-known/openid-configuration). Without this cap, a slow or hung Auth0
+// would burn the entire HTTP request budget on discovery and starve other
+// stages of the auth flow. The full HTTP request typically has a 30s budget;
+// 10s leaves headroom for token exchange and userinfo lookups.
+const oidcDiscoveryTimeout = 10 * time.Second
+
 // Authenticator is used to authenticate our users.
 type Authenticator struct {
 	*oidc.Provider
 	oauth2.Config
 }
 
-// NewAuthenticator instantiates the *Authenticator.
-func NewAuthenticator(conf config) (*Authenticator, error) {
+// NewAuthenticator instantiates the *Authenticator. The supplied ctx
+// controls cancellation of the discovery handshake; this function additionally
+// applies oidcDiscoveryTimeout so a slow Auth0 cannot stall the caller for
+// the full request budget.
+func NewAuthenticator(ctx context.Context, conf config) (*Authenticator, error) {
+	discoveryCtx, cancel := context.WithTimeout(ctx, oidcDiscoveryTimeout)
+	defer cancel()
+
 	provider, err := oidc.NewProvider(
-		context.Background(),
+		discoveryCtx,
 		"https://"+conf.AUTH0_DOMAIN,
 	)
 	if err != nil {

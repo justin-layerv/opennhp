@@ -705,6 +705,16 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 	s := hs.udpServer
 	srcIp := req.SrcIp
 
+	// req.Ctx is set by runPluginAuth and handleInternalKnock — every code
+	// path that reaches handleHttpOpenResource sets it. Fall back to
+	// context.Background() defensively rather than panicking on a future
+	// regression that forgets to populate the field.
+	ctx := req.Ctx
+	if ctx == nil {
+		log.Warning("httpserver-agent(%s#%s)[handleHttpOpenResource] req.Ctx unexpectedly nil; using Background()", req.UserId, req.DeviceId)
+		ctx = context.Background()
+	}
+
 	knkMsg := &common.AgentKnockMsg{
 		UserId:         req.UserId,
 		DeviceId:       req.DeviceId,
@@ -777,11 +787,7 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 		if !found || len(connsCopy) == 0 {
 			// No local AC connection — try HTTP forwarding to an assigned server
 			if hs.httpForwarder != nil && !req.Forwarded {
-				parentCtx := req.Ctx
-				if parentCtx == nil {
-					parentCtx = context.Background()
-				}
-				fwdCtx, fwdCancel := context.WithTimeout(parentCtx, DefaultForwardTimeout)
+				fwdCtx, fwdCancel := context.WithTimeout(ctx, DefaultForwardTimeout)
 				fwdAck, fwdErr := hs.httpForwarder.ForwardHttpKnock(fwdCtx, acId, req, res)
 				fwdCancel() // cancel immediately; defer would accumulate across loop iterations
 				if fwdErr == nil && fwdAck != nil && fwdAck.ErrCode == common.ErrSuccess.ErrorCode() {
@@ -815,7 +821,7 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 			if knkMsg.HeaderType == core.NHP_EXT {
 				openTime = 1 // timeout in 1 second
 			}
-			artMsg, err := s.processACOperationBroadcast(knkMsg, connsCopy, srcAddr, dstAddrs, openTime)
+			artMsg, err := s.processACOperationBroadcast(ctx, knkMsg, connsCopy, srcAddr, dstAddrs, openTime)
 			artMsgsMutex.Lock()
 			artMsgs[name] = artMsg
 			if err == nil {

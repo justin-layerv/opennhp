@@ -874,7 +874,7 @@ func TestBroadcast_ReturnsOnFirstSuccess(t *testing.T) {
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
-	artMsg, err := s.processACOperationBroadcast(knkMsg, conns, srcAddr, dstAddrs, 60)
+	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60)
 
 	if err != nil {
 		t.Fatalf("Expected success, got error: %v", err)
@@ -937,7 +937,7 @@ func TestBroadcast_PartialFailureStillSucceeds(t *testing.T) {
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
-	artMsg, err := s.processACOperationBroadcast(knkMsg, conns, srcAddr, dstAddrs, 60)
+	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60)
 
 	if err != nil {
 		t.Fatalf("Expected success (partial), got error: %v", err)
@@ -979,7 +979,7 @@ func TestBroadcastCancellation_AllFail(t *testing.T) {
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
-	_, err := s.processACOperationBroadcast(knkMsg, conns, srcAddr, dstAddrs, 60)
+	_, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60)
 
 	if err == nil {
 		t.Fatal("Expected error when all ACs fail")
@@ -1000,7 +1000,7 @@ func TestBroadcastCancellation_SingleConn(t *testing.T) {
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
-	artMsg, err := s.processACOperationBroadcast(knkMsg, conns, srcAddr, dstAddrs, 60)
+	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60)
 
 	if err != nil {
 		t.Fatalf("Expected success for single conn, got: %v", err)
@@ -1062,7 +1062,7 @@ func TestBroadcast_TimeoutReturnsFirstSuccess(t *testing.T) {
 	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
 	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
 
-	artMsg, err := s.processACOperationBroadcast(knkMsg, conns, srcAddr, dstAddrs, 60)
+	artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, conns, srcAddr, dstAddrs, 60)
 
 	if err != nil {
 		t.Fatalf("Expected success (first AC responded), got error: %v", err)
@@ -1075,6 +1075,65 @@ func TestBroadcast_TimeoutReturnsFirstSuccess(t *testing.T) {
 	allDone.Wait()
 	if respondCount.Load() != 3 {
 		t.Errorf("Expected 3 responders, got %d", respondCount.Load())
+	}
+}
+
+// TestBroadcast_ParentContextCancellationDoesNotAbort verifies the contract
+// that processACOperationBroadcast uses context.WithoutCancel on the parent
+// context so that broadcast goroutines continue even if the parent (e.g. HTTP
+// request) context is canceled mid-flight. The parent's values (request ID)
+// must still be preserved for log correlation.
+func TestBroadcast_ParentContextCancellationDoesNotAbort(t *testing.T) {
+	s, sendCh := newTestServerForBroadcast(t)
+
+	var aopCount atomic.Int32
+	var allDone sync.WaitGroup
+	allDone.Add(3)
+
+	// All ACs succeed immediately.
+	go func() {
+		for md := range sendCh {
+			go func(md *core.MsgData) {
+				defer allDone.Done()
+				aopCount.Add(1)
+				artMsg := &common.ACOpsResultMsg{ErrCode: common.ErrSuccess.ErrorCode()}
+				body, _ := json.Marshal(artMsg)
+				md.ResponseMsgCh <- &core.PacketParserData{
+					HeaderType:  core.NHP_ART,
+					BodyMessage: body,
+				}
+			}(md)
+		}
+	}()
+
+	conns := []*ACConn{
+		newTestACConn(t, "10.0.0.1", 47051, "test-ac"),
+		newTestACConn(t, "10.0.0.2", 47051, "test-ac"),
+		newTestACConn(t, "10.0.0.3", 47051, "test-ac"),
+	}
+
+	knkMsg := &common.AgentKnockMsg{UserId: "test-user"}
+	srcAddr := &common.NetAddress{Ip: "192.168.1.100", Port: 443}
+	dstAddrs := []*common.NetAddress{{Ip: "10.0.0.1", Port: 8080}}
+
+	// Build a parent context carrying a request ID, then cancel it before
+	// invoking the broadcast. A naive context.WithTimeout(parentCtx, ...) would
+	// inherit the cancellation and abort all goroutines immediately. With
+	// context.WithoutCancel the broadcast must still run to completion.
+	parentCtx, cancel := context.WithCancel(ContextWithRequestID(context.Background(), "req-broadcast-777"))
+	cancel()
+
+	artMsg, err := s.processACOperationBroadcast(parentCtx, knkMsg, conns, srcAddr, dstAddrs, 60)
+	if err != nil {
+		t.Fatalf("broadcast must succeed even with canceled parent ctx, got err=%v", err)
+	}
+	if artMsg == nil {
+		t.Fatal("expected non-nil artMsg from broadcast")
+	}
+
+	allDone.Wait()
+	if aopCount.Load() != 3 {
+		t.Errorf("expected all 3 ACs to complete, got %d", aopCount.Load())
 	}
 }
 

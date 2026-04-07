@@ -26,7 +26,11 @@ func (hs *HttpServer) authWithAspPlugin(c *gin.Context, req *common.HttpKnockReq
 // If the plugin aborted the context (e.g., NHP silent drop), no error
 // response is written — preserving NHP protocol silence.
 func (hs *HttpServer) runPluginAuth(c *gin.Context, req *common.HttpKnockRequest, handler plugins.PluginHandler) {
-	// Set request context once here so plugins don't each need to set req.Ctx
+	// Stamp the request context onto req.Ctx so handleHttpOpenResource can
+	// retrieve it later. The Ctx field is deprecated but retained for the
+	// fengyily/nhp-plugins-sdk callback (see HttpKnockRequest doc); since
+	// every HTTP path goes through here, downstream readers can rely on it
+	// being non-nil and skip nil-handling branches.
 	if c.Request != nil {
 		req.Ctx = c.Request.Context()
 	}

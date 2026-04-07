@@ -1,10 +1,12 @@
 package oidc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	nhpplugins "github.com/fengyily/nhp-plugins-sdk"
 	"github.com/fengyily/nhp-plugins-sdk/resource"
@@ -29,10 +31,51 @@ type config struct {
 
 var (
 	// Example Plugin Settings
-	log      *nhplog.Logger
-	oktaAuth *Authenticator
-	baseConf *config
+	log *nhplog.Logger
+
+	// authCache stores Authenticators keyed by AUTH0_DOMAIN. Each entry is
+	// built lazily by getOrCreateAuthenticator and reused across concurrent
+	// requests for the same Auth0 tenant. This replaces the prior package-
+	// level oktaAuth global which was overwritten on every authOkta call,
+	// causing a race where one request's authRegular could observe another
+	// request's authenticator.
+	authCache sync.Map // map[string]*Authenticator
 )
+
+// configFromResource builds an OIDC config from a resource's ExInfo map.
+// Each request constructs its own config from the resource being accessed,
+// so two concurrent requests for different resources cannot tread on each
+// other's state (the prior package-level baseConf global was racy).
+func configFromResource(res *common.ResourceData) config {
+	return config{
+		AUTH0_DOMAIN:       nhpsdkutils.GetStringFromMap(res.ExInfo, "AUTH0_DOMAIN"),
+		OIDC_CLIENTID:      nhpsdkutils.GetStringFromMap(res.ExInfo, "OIDC_CLIENTID"),
+		OIDC_CLIENTSECRET:  nhpsdkutils.GetStringFromMap(res.ExInfo, "OIDC_CLIENTSECRET"),
+		OIDC_AUTHORIZE_URL: nhpsdkutils.GetStringFromMap(res.ExInfo, "OIDC_AUTHORIZE_URL"),
+		OIDC_TOKEN_URL:     nhpsdkutils.GetStringFromMap(res.ExInfo, "OIDC_TOKEN_URL"),
+		AUTH0_CALLBACK_URL: nhpsdkutils.GetStringFromMap(res.ExInfo, "AUTH0_CALLBACK_URL"),
+	}
+}
+
+// getOrCreateAuthenticator returns the cached Authenticator for conf's
+// AUTH0_DOMAIN, building one (with bounded discovery) on cache miss. The
+// cache survives the lifetime of the process since the OIDC discovery
+// document is stable per tenant; the go-oidc library's remoteKeySet refreshes
+// signing keys on demand inside an existing Provider, so cached entries do
+// not go stale on Auth0 key rotation.
+func getOrCreateAuthenticator(ctx context.Context, conf config) (*Authenticator, error) {
+	if cached, ok := authCache.Load(conf.AUTH0_DOMAIN); ok {
+		return cached.(*Authenticator), nil
+	}
+	auth, err := NewAuthenticator(ctx, conf)
+	if err != nil {
+		return nil, err
+	}
+	// LoadOrStore so concurrent first-time creators converge on a single
+	// winner; losers discard their (otherwise valid) Authenticator.
+	actual, _ := authCache.LoadOrStore(conf.AUTH0_DOMAIN, auth)
+	return actual.(*Authenticator), nil
+}
 
 var (
 	name    = "oktaoidc"
@@ -97,25 +140,18 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		ctx.JSON(http.StatusOK, gin.H{"errMsg": fmt.Sprintf("resource error: %v", err)})
 		return
 	}
-	baseConf = &config{
-		AUTH0_DOMAIN:       nhpsdkutils.GetStringFromMap(res.ExInfo, "AUTH0_DOMAIN"),
-		OIDC_CLIENTID:      nhpsdkutils.GetStringFromMap(res.ExInfo, "OIDC_CLIENTID"),
-		OIDC_CLIENTSECRET:  nhpsdkutils.GetStringFromMap(res.ExInfo, "OIDC_CLIENTSECRET"),
-		OIDC_AUTHORIZE_URL: nhpsdkutils.GetStringFromMap(res.ExInfo, "OIDC_AUTHORIZE_URL"),
-		OIDC_TOKEN_URL:     nhpsdkutils.GetStringFromMap(res.ExInfo, "OIDC_TOKEN_URL"),
-		AUTH0_CALLBACK_URL: nhpsdkutils.GetStringFromMap(res.ExInfo, "AUTH0_CALLBACK_URL"),
-	}
+	conf := configFromResource(res)
 	corsMiddleware(ctx)
 
 	switch {
 	case strings.EqualFold(action, "valid"):
-		ackMsg, err = authRegular(ctx, req, res, helper)
+		ackMsg, err = authRegular(ctx, req, res, helper, conf)
 
 	case strings.EqualFold(action, "login"):
-		authAndShowLogin(ctx)
+		authAndShowLogin(ctx, conf)
 
 	case strings.EqualFold(action, "oauth"):
-		err = authOkta(ctx)
+		err = authOkta(ctx, conf)
 
 	default:
 		ackMsg = nil
@@ -124,7 +160,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	return
 }
 
-func authAndShowLogin(ctx *gin.Context) {
+func authAndShowLogin(ctx *gin.Context, conf config) {
 	session := sessions.Default(ctx)
 	t := session.Get("oauth_token")
 	resid := ctx.Query("resid")
@@ -132,8 +168,10 @@ func authAndShowLogin(ctx *gin.Context) {
 	s := session.Get("state")
 	state, ok2 := s.(string)
 	if ok1 && ok2 {
-		_, err := oktaAuth.VerifyIDToken(ctx.Request.Context(), &oauthToken)
-		if err == nil {
+		auth, err := getOrCreateAuthenticator(ctx.Request.Context(), conf)
+		if err != nil {
+			log.Error("OIDC authenticator unavailable in authAndShowLogin: %v", err)
+		} else if _, err := auth.VerifyIDToken(ctx.Request.Context(), &oauthToken); err == nil {
 			ctx.Redirect(http.StatusSeeOther, "/plugins/oktaoidc?resid="+resid+"&action=valid"+"&state="+state)
 			return
 		}
@@ -142,17 +180,19 @@ func authAndShowLogin(ctx *gin.Context) {
 	ctx.HTML(http.StatusOK, "oktaoidc/home.html", gin.H{})
 }
 
-func authOkta(ctx *gin.Context) error {
-	var err error
-	oktaAuth, err = NewAuthenticator(*baseConf)
+func authOkta(ctx *gin.Context, conf config) error {
+	auth, err := getOrCreateAuthenticator(ctx.Request.Context(), conf)
 	if err != nil {
+		// Log the underlying error for troubleshooting (provider discovery
+		// timeouts, DNS failures, invalid issuer, etc.) while returning a
+		// generic message to the client to avoid leaking internals.
+		log.Error("OIDC authenticator initialization failed: %v", err)
 		ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to initialize authenticator"})
-		oktaAuth = nil
 		return errors.New("failed to initialize authenticator")
 	}
 
-	err = oktaAuth.DoAuth(ctx)
-	if err != nil {
+	if err := auth.DoAuth(ctx); err != nil {
+		log.Error("OIDC DoAuth failed: %v", err)
 		ctx.JSON(http.StatusOK, gin.H{"errMsg": "user authentication failed"})
 		return errors.New("user authentication failed")
 	}
@@ -160,8 +200,10 @@ func authOkta(ctx *gin.Context) error {
 	return nil
 }
 
-func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
-	if oktaAuth == nil {
+func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.ResourceData, helper *plugins.HttpServerPluginHelper, conf config) (*common.ServerKnockAckMsg, error) {
+	auth, err := getOrCreateAuthenticator(ctx.Request.Context(), conf)
+	if err != nil {
+		log.Error("OIDC authenticator unavailable in authRegular: %v", err)
 		ctx.JSON(http.StatusOK, gin.H{"errMsg": "invalid authenticator"})
 		return nil, errors.New("invalid authenticator")
 	}
@@ -174,19 +216,18 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 	}
 
 	authorizeCode := ctx.Query("code")
-	var err error
 	var oktaToken *oauth2.Token
 
 	if len(authorizeCode) > 0 {
 		// when there is authorize code in query, it is a callback from okta
 		// Exchange an authorization code for a token.
-		oktaToken, err = oktaAuth.Exchange(ctx.Request.Context(), authorizeCode)
+		oktaToken, err = auth.Exchange(ctx.Request.Context(), authorizeCode)
 		if err != nil {
 			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to convert an authorization code into a token"})
 			return nil, errors.New("failed to convert an authorization code into a token")
 		}
 
-		idToken, err := oktaAuth.VerifyIDToken(ctx.Request.Context(), oktaToken)
+		idToken, err := auth.VerifyIDToken(ctx.Request.Context(), oktaToken)
 		if err != nil {
 			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to verify ID token"})
 			return nil, errors.New("failed to verify ID token")
@@ -215,7 +256,7 @@ func authRegular(ctx *gin.Context, req *common.HttpKnockRequest, res *common.Res
 		}
 		oktaToken = &t
 
-		idToken, err := oktaAuth.VerifyIDToken(ctx.Request.Context(), oktaToken)
+		idToken, err := auth.VerifyIDToken(ctx.Request.Context(), oktaToken)
 		if err != nil {
 			ctx.JSON(http.StatusOK, gin.H{"errMsg": "failed to verify ID token"})
 			session.Clear()

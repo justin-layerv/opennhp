@@ -1651,6 +1651,7 @@ func (s *UdpServer) processACOperation(ctx context.Context, knkMsg *common.Agent
 // — they continue in the background so all ACs still get the pinhole.
 // A background goroutine drains and logs the remaining results.
 func (s *UdpServer) processACOperationBroadcast(
+	parentCtx context.Context,
 	knkMsg *common.AgentKnockMsg,
 	conns []*ACConn,
 	srcAddr *common.NetAddress,
@@ -1658,9 +1659,16 @@ func (s *UdpServer) processACOperationBroadcast(
 	openTime uint32,
 ) (*common.ACOpsResultMsg, error) {
 	s.metrics.IncrCounter(MetricBroadcastTotal)
+
+	// Inherit context values (request ID) without inheriting cancellation —
+	// broadcast goroutines must run independently to open pinholes on all ACs.
+	// Callers MUST pass a non-nil parentCtx (context.Background() if they
+	// have nothing else); WithoutCancel handles Background fine.
+	baseCtx := context.WithoutCancel(parentCtx)
+
 	if len(conns) == 1 {
 		start := time.Now()
-		ctx, cancel := context.WithTimeout(context.Background(), DefaultBroadcastTimeout)
+		ctx, cancel := context.WithTimeout(baseCtx, DefaultBroadcastTimeout)
 		defer cancel()
 		artMsg, err := s.processACOperation(ctx, knkMsg, conns[0], srcAddr, dstAddrs, openTime)
 		elapsed := float64(time.Since(start).Milliseconds())
@@ -1693,7 +1701,7 @@ func (s *UdpServer) processACOperationBroadcast(
 	for _, conn := range conns {
 		go func(c *ACConn) {
 			acStart := time.Now()
-			ctx, cancel := context.WithTimeout(context.Background(), DefaultBroadcastTimeout)
+			ctx, cancel := context.WithTimeout(baseCtx, DefaultBroadcastTimeout)
 			defer cancel()
 			artMsg, err := s.processACOperation(ctx, knkMsg, c, srcAddr, dstAddrs, openTime)
 			s.metrics.RecordLatency(MetricBroadcastACLatencyMs, float64(time.Since(acStart).Milliseconds()))
@@ -1893,7 +1901,9 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 			if knkMsg.HeaderType == core.NHP_EXT {
 				openTime = 1 // timeout in 1 second
 			}
-			artMsg, err := s.processACOperationBroadcast(knkMsg, connsCopy, srcAddr, dstAddrs, openTime)
+			// UDP knock path: no request-scoped context exists, so pass Background.
+			// processACOperationBroadcast discards parent cancellation regardless.
+			artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, connsCopy, srcAddr, dstAddrs, openTime)
 			artMsgsMutex.Lock()
 			artMsgs[name] = artMsg
 			if err == nil {
@@ -2132,11 +2142,12 @@ func (s *UdpServer) ProcessACOperation(
 
 // ProcessACOperationBroadcast wraps the internal processACOperationBroadcast method.
 func (s *UdpServer) ProcessACOperationBroadcast(
+	parentCtx context.Context,
 	knkMsg *common.AgentKnockMsg,
 	conns []*ACConn,
 	srcAddr *common.NetAddress,
 	dstAddrs []*common.NetAddress,
 	openTime uint32,
 ) (*common.ACOpsResultMsg, error) {
-	return s.processACOperationBroadcast(knkMsg, conns, srcAddr, dstAddrs, openTime)
+	return s.processACOperationBroadcast(parentCtx, knkMsg, conns, srcAddr, dstAddrs, openTime)
 }
