@@ -73,6 +73,15 @@ const (
 	MetricACConnEviction       = "ACConnEviction"       // MaxACConnsPerID eviction events
 )
 
+// udpCorrelationCtx creates a context with a correlation ID derived from UDP handler
+// metadata (e.g. AC ID and NHP transaction ID). This enables storage log lines to be
+// correlated with specific NHP transactions instead of showing req_id=-.
+func udpCorrelationCtx(timeout time.Duration, id string, transactionId uint64) (context.Context, context.CancelFunc) {
+	correlationID := fmt.Sprintf("udp-%s-%d", id, transactionId)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	return ContextWithRequestID(ctx, correlationID), cancel
+}
+
 // forwardToTransaction finds the remote transaction and forwards the message to it.
 // Returns common.ErrTransactionIdNotFound if the transaction is not available.
 //
@@ -460,7 +469,7 @@ func (s *UdpServer) handleACServerAssignment(
 	addrStr string,
 ) (redirected bool, peers []common.RedirectTarget, err error) {
 	acId := aolMsg.ACId
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+	ctx, cancel := udpCorrelationCtx(DefaultStorageTimeout, acId, transactionId)
 	defer cancel()
 
 	// Look up AC assignment from storage
@@ -484,7 +493,7 @@ func (s *UdpServer) handleACServerAssignment(
 	}
 
 	// Filter assignment to only healthy servers (via Cloud Map health discovery).
-	cloudMapCtx, cloudMapCancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+	cloudMapCtx, cloudMapCancel := udpCorrelationCtx(DefaultStorageTimeout, acId, transactionId)
 	defer cloudMapCancel()
 	healthyServers := FilterHealthyServers(cloudMapCtx, s.cloudMap, assignment.AssignedServers)
 	if len(healthyServers) == 0 {
@@ -563,7 +572,7 @@ func (s *UdpServer) autoAssignAC(
 		return false, nil
 	}
 
-	cloudMapCtx, cloudMapCancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+	cloudMapCtx, cloudMapCancel := udpCorrelationCtx(DefaultStorageTimeout, acId, transactionId)
 	defer cloudMapCancel()
 
 	allServers, err := s.cloudMap.DiscoverServerInstances(cloudMapCtx)
@@ -598,7 +607,7 @@ func (s *UdpServer) autoAssignAC(
 
 	// Populate customer ID from license if available
 	if aolMsg.LicenseKey != "" {
-		licCtx, licCancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+		licCtx, licCancel := udpCorrelationCtx(DefaultStorageTimeout, acId, transactionId)
 		license, licErr := s.storage.GetLicense(licCtx, aolMsg.LicenseKey)
 		licCancel()
 		if licErr == nil {
@@ -607,7 +616,7 @@ func (s *UdpServer) autoAssignAC(
 	}
 
 	// Write assignment to storage
-	saveCtx, saveCancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+	saveCtx, saveCancel := udpCorrelationCtx(DefaultStorageTimeout, acId, transactionId)
 	defer saveCancel()
 	if saveErr := s.storage.SaveACAssignment(saveCtx, assignment); saveErr != nil {
 		log.Warning("server-ac(%s#%d@%s)[autoAssignAC] failed to save assignment: %v, accepting directly", acId, transactionId, addrStr, saveErr)
@@ -719,7 +728,9 @@ func (s *UdpServer) refreshAssignmentTTL(acID string) {
 	go func() {
 		defer s.wg.Done()
 
+		correlationID := fmt.Sprintf("udp-ttl-refresh-%s", acID)
 		getCtx, getCancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+		getCtx = ContextWithRequestID(getCtx, correlationID)
 		existing, err := s.storage.GetACAssignment(getCtx, acID)
 		getCancel()
 		if err != nil {
@@ -734,6 +745,7 @@ func (s *UdpServer) refreshAssignmentTTL(acID string) {
 		refreshed.TTL = &ttl
 
 		saveCtx, saveCancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+		saveCtx = ContextWithRequestID(saveCtx, correlationID)
 		defer saveCancel()
 		if err := s.storage.SaveACAssignment(saveCtx, refreshed); err != nil {
 			if IsVersionConflictError(err) {
@@ -806,7 +818,9 @@ func (s *UdpServer) updateAssignmentWithSelf(assignment *ACAssignment, healthySe
 	newAssignment.LastSeen = time.Now().Unix()
 	newAssignment.TTL = &ttl
 
+	correlationID := fmt.Sprintf("udp-assign-update-%s", assignment.ACID)
 	saveCtx, saveCancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+	saveCtx = ContextWithRequestID(saveCtx, correlationID)
 	defer saveCancel()
 	if err := s.storage.SaveACAssignment(saveCtx, newAssignment); err != nil {
 		if IsVersionConflictError(err) {
@@ -887,7 +901,7 @@ func (s *UdpServer) validateACLicense(
 	keyPrefix := licenseKeyPrefix(aolMsg.LicenseKey)
 
 	// Look up license from storage using license key SHA256 as the partition key
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+	ctx, cancel := udpCorrelationCtx(DefaultStorageTimeout, acId, transactionId)
 	defer cancel()
 
 	license, err := s.storage.GetLicense(ctx, aolMsg.LicenseKey)

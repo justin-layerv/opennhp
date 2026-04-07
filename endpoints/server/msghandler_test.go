@@ -157,3 +157,41 @@ func TestAutoAssignAC_VersionIncrement(t *testing.T) {
 		})
 	}
 }
+
+func TestUdpCorrelationCtx(t *testing.T) {
+	t.Run("sets correlation ID in context", func(t *testing.T) {
+		ctx, cancel := udpCorrelationCtx(time.Second, "ac-123", 456)
+		defer cancel()
+
+		got := requestIDFromCtx(ctx)
+		want := "udp-ac-123-456"
+		if got != want {
+			t.Errorf("request ID = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("sets deadline from timeout", func(t *testing.T) {
+		ctx, cancel := udpCorrelationCtx(100*time.Millisecond, "ac-xyz", 1)
+		defer cancel()
+
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("expected context to have deadline")
+		}
+		if time.Until(deadline) > 100*time.Millisecond {
+			t.Errorf("deadline should be within timeout, got %v", time.Until(deadline))
+		}
+	})
+
+	t.Run("cancel releases context", func(t *testing.T) {
+		ctx, cancel := udpCorrelationCtx(time.Hour, "ac-abc", 99)
+		cancel()
+
+		select {
+		case <-ctx.Done():
+			// expected
+		default:
+			t.Error("expected context to be canceled after cancel()")
+		}
+	})
+}
