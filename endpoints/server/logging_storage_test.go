@@ -278,10 +278,18 @@ func TestLoggingStorage_Ping_NonPinger(t *testing.T) {
 // pingableStorage embeds MemoryStorage and adds a Ping method to satisfy the Pinger interface.
 type pingableStorage struct {
 	*MemoryStorage
-	pingErr error
+	pingErr   error
+	pingDelay time.Duration
 }
 
 func (p *pingableStorage) Ping(ctx context.Context) error {
+	if p.pingDelay > 0 {
+		select {
+		case <-time.After(p.pingDelay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}

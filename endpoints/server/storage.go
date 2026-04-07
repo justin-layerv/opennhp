@@ -229,6 +229,11 @@ const (
 	StorageBackendEtcd     = "etcd"
 )
 
+// SlowOperationThreshold is the duration above which a storage operation is
+// considered slow. Used by both MetricsStorage (to increment a slow counter)
+// and LoggingStorage (to escalate log level to Warning).
+const SlowOperationThreshold = 500 * time.Millisecond
+
 // StorageConfig configures the storage backend.
 type StorageConfig struct {
 	// Backend specifies which storage backend to use: "dynamodb" or "etcd"

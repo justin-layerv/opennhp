@@ -28,12 +28,9 @@ import (
 // - Error: failed operations (with error details)
 // ============================================================================
 
-const (
-	// slowThresholdMs is the millisecond threshold above which a storage
-	// operation is logged at Warning level instead of Debug. This helps
-	// surface latency issues without overwhelming logs during normal operation.
-	slowThresholdMs int64 = 500
-)
+// slowThresholdMs is derived from SlowOperationThreshold for use in
+// millisecond-based comparisons within log statements.
+var slowThresholdMs = SlowOperationThreshold.Milliseconds()
 
 // contextKey is an unexported type for context keys to prevent collisions.
 type contextKey struct{}

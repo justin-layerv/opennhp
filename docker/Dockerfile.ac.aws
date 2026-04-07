@@ -44,7 +44,8 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Traefik v3 with retry logic for GitHub rate limits
-ARG TRAEFIK_VERSION=3.6.10
+# 3.6.12 fixes GHSA-46wh-3698-f2cx (Traefik HTTP/2 goroutine leak)
+ARG TRAEFIK_VERSION=3.6.12
 RUN set -ex && \
     for i in 1 2 3 4 5; do \
         curl -fsSL --retry 3 --retry-delay 5 \

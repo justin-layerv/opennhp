@@ -427,8 +427,9 @@ func CreateStorageBackend(ctx context.Context, cfg StorageConfig) (StorageBacken
 		if err != nil {
 			return nil, err
 		}
-		// Wrap with logging, then cache
-		logged := NewLoggingStorage(backend)
+		// Wrap with metrics, logging, then cache
+		metricsWrapped := NewMetricsStorage(backend)
+		logged := NewLoggingStorage(metricsWrapped)
 		return NewCachedStorage(logged, cfg.Cache), nil
 
 	case "etcd":
@@ -437,8 +438,9 @@ func CreateStorageBackend(ctx context.Context, cfg StorageConfig) (StorageBacken
 		if err != nil {
 			return nil, err
 		}
-		// Wrap with logging, then cache
-		logged := NewLoggingStorage(backend)
+		// Wrap with metrics, logging, then cache
+		metricsWrapped := NewMetricsStorage(backend)
+		logged := NewLoggingStorage(metricsWrapped)
 		return NewCachedStorage(logged, cfg.Cache), nil
 
 	default:

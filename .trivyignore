@@ -58,6 +58,7 @@ CVE-2026-32305
 # DoS panic on JWE decryption with certain key-wrap alg + empty encrypted_key.
 # Our endpoints module is already on go-jose v4.1.4 (the fixed version), but
 # the Traefik AMD64 binary downloaded in Dockerfile.ac.aws still ships v4.1.3.
+# Traefik v3.6.12 still bundles go-jose v4.1.3.
 # Wait for a Traefik release bundling go-jose >= v4.1.4 to remove this entry.
 # https://avd.aquasec.com/nvd/cve-2026-34986
 CVE-2026-34986
