@@ -604,68 +604,41 @@ jobs:
             exit 1
           fi
 
+      # Verify the newly-refreshed standby server instances are actually
+      # running before we let the pipeline switch traffic to them.
+      #
+      # We CANNOT use `aws elbv2 describe-target-health` here: during
+      # blue/green the standby target groups have no listener attached,
+      # and NLB returns "unused / Target.NotInUse" for any TG without a
+      # listener (see the listener-swap logic in Switch Traffic below).
+      # That made the previous version of this step spin forever until
+      # the health-check window timed out — the TGs could never possibly
+      # flip to "healthy" no matter how fit the instances were.
+      #
+      # Instead we probe each instance directly via SSM and ask the
+      # running nhp-server container for /health/live. We intentionally
+      # do NOT check /health/knock-ready on standby: that endpoint
+      # reports 503 while no AC peers are connected, and a standby
+      # server by definition has no ACs connected yet (ACs only start
+      # knocking it once the listener swap routes traffic its way).
+      # The existing "Verify Knock Readiness" step below runs against
+      # the ACTIVE ASG just before the swap and catches that case.
       - name: "[Server] Verify Standby Health"
         if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run != true
         env:
-          STANDBY_COLOR: ${{ needs.prepare.outputs.server_standby_color }}
-          GREEN_PRIMARY_TG: ${{ needs.prepare.outputs.server_green_primary_tg_arn }}
-          BLUE_PRIMARY_TG: ${{ needs.prepare.outputs.server_blue_primary_tg_arn }}
-          GREEN_SECONDARY_TG: ${{ needs.prepare.outputs.server_green_secondary_tg_arn }}
-          BLUE_SECONDARY_TG: ${{ needs.prepare.outputs.server_blue_secondary_tg_arn }}
+          STANDBY_ASG: ${{ needs.prepare.outputs.server_standby_asg }}
           HEALTH_CHECK_TIMEOUT_MINUTES: ${{ inputs.health_check_timeout_minutes }}
         run: |
-          verify_tg_health() {
-            local TG_ARN="$1" TG_NAME="$2" RESULT_FILE="$3"
-            local DEADLINE=$(($(date +%s) + HEALTH_CHECK_TIMEOUT_MINUTES * 60))
-            echo "[$TG_NAME] Verifying target group health: $TG_ARN"
-            local ITERATION=0
-            while [[ $(date +%s) -lt $DEADLINE ]]; do
-              ITERATION=$((ITERATION + 1))
-              local REMAINING=$(( (DEADLINE - $(date +%s)) / 60 ))
-              if ! HEALTH=$(aws elbv2 describe-target-health \
-                --target-group-arn "$TG_ARN" \
-                --query "TargetHealthDescriptions[*].TargetHealth.State" --output text 2>&1); then
-                echo "[$TG_NAME] Warning: Failed to get health: $HEALTH"; sleep 10; continue
-              fi
-              if [[ -z "$HEALTH" ]]; then HEALTHY_COUNT=0; TOTAL_COUNT=0
-              else
-                HEALTHY_COUNT=$(echo "$HEALTH" | awk '{for(i=1;i<=NF;i++) if($i=="healthy") c++} END{print c+0}')
-                TOTAL_COUNT=$(echo "$HEALTH" | awk '{print NF}')
-              fi
-              echo "[$TG_NAME] [iter $ITERATION, ${REMAINING}m left] $HEALTHY_COUNT/$TOTAL_COUNT healthy"
-              if [[ "$TOTAL_COUNT" -gt 0 && "$HEALTHY_COUNT" -eq "$TOTAL_COUNT" ]]; then
-                echo "[$TG_NAME] All targets healthy"
-                [[ -n "$RESULT_FILE" ]] && echo "success" > "$RESULT_FILE"
-                return 0
-              fi
-              sleep 10
-            done
-            echo "::error::[$TG_NAME] Targets not healthy after ${HEALTH_CHECK_TIMEOUT_MINUTES} minutes"
-            [[ -n "$RESULT_FILE" ]] && echo "failed" > "$RESULT_FILE"
-            return 1
-          }
-          if [[ "$STANDBY_COLOR" == "green" ]]; then
-            PRIMARY_TG="$GREEN_PRIMARY_TG"; SECONDARY_TG="$GREEN_SECONDARY_TG"
-          else
-            PRIMARY_TG="$BLUE_PRIMARY_TG"; SECONDARY_TG="$BLUE_SECONDARY_TG"
-          fi
-          if [[ -n "$SECONDARY_TG" ]]; then
-            echo "Running UDP and HTTPS health checks in parallel..."
-            UDP_RESULT=$(mktemp); HTTPS_RESULT=$(mktemp)
-            cleanup() { rm -f "$UDP_RESULT" "$HTTPS_RESULT"; }
-            trap cleanup EXIT INT TERM
-            verify_tg_health "$PRIMARY_TG" "UDP" "$UDP_RESULT" &
-            UDP_PID=$!
-            verify_tg_health "$SECONDARY_TG" "HTTPS" "$HTTPS_RESULT" &
-            HTTPS_PID=$!
-            UDP_EXIT=0; HTTPS_EXIT=0
-            wait $UDP_PID || UDP_EXIT=$?
-            wait $HTTPS_PID || HTTPS_EXIT=$?
-            if [[ $UDP_EXIT -ne 0 ]]; then echo "::error::Server UDP health check failed"; exit 1; fi
-            if [[ $HTTPS_EXIT -ne 0 ]]; then echo "::error::Server HTTPS health check failed"; exit 1; fi
-          else
-            verify_tg_health "$PRIMARY_TG" "Server-UDP" "" || exit 1
-          fi
+          # nhp-server runs with --net=host, so /health/live is reachable
+          # from the instance itself on 127.0.0.1:8888 — no `docker exec`
+          # needed, and more importantly the server container image does
+          # not ship with wget/curl.
+          chmod +x .github/scripts/verify-asg-instances-healthy.sh
+          .github/scripts/verify-asg-instances-healthy.sh \
+            "$STANDBY_ASG" \
+            "Server-Standby" \
+            "$HEALTH_CHECK_TIMEOUT_MINUTES" \
+            'curl -sfS -o /dev/null http://127.0.0.1:8888/health/live'
 
       # ---- AC Deploy Steps ----
       - name: "[AC] Validate Image Exists in ECR"
@@ -773,46 +746,25 @@ jobs:
             exit 1
           fi
 
+      # Same reasoning as the server verify step above: the AC standby
+      # target group has no listener, so NLB reports "unused" for every
+      # target forever. Probe the instances directly via SSM instead.
+      # nhp-acd + Traefik run natively on the AC host (not containerised),
+      # so the health endpoint is reached with a plain curl to Traefik's
+      # admin ping on port 8080 — the same check the NLB performs when
+      # the TG *is* attached to a listener.
       - name: "[AC] Verify Standby Health"
         if: needs.prepare.outputs.deploy_ac == 'true' && inputs.dry_run != true
         env:
-          STANDBY_COLOR: ${{ needs.prepare.outputs.ac_standby_color }}
-          GREEN_PRIMARY_TG: ${{ needs.prepare.outputs.ac_green_primary_tg_arn }}
-          BLUE_PRIMARY_TG: ${{ needs.prepare.outputs.ac_blue_primary_tg_arn }}
+          STANDBY_ASG: ${{ needs.prepare.outputs.ac_standby_asg }}
           HEALTH_CHECK_TIMEOUT_MINUTES: ${{ inputs.health_check_timeout_minutes }}
         run: |
-          if [[ "$STANDBY_COLOR" == "green" ]]; then
-            TG_ARN="$GREEN_PRIMARY_TG"
-          else
-            TG_ARN="$BLUE_PRIMARY_TG"
-          fi
-          echo "Verifying AC target group health: $TG_ARN"
-          DEADLINE=$(($(date +%s) + HEALTH_CHECK_TIMEOUT_MINUTES * 60))
-          ITERATION=0
-          while [[ $(date +%s) -lt $DEADLINE ]]; do
-            ITERATION=$((ITERATION + 1))
-            REMAINING=$(( (DEADLINE - $(date +%s)) / 60 ))
-            if ! HEALTH=$(aws elbv2 describe-target-health \
-              --target-group-arn "$TG_ARN" \
-              --query "TargetHealthDescriptions[*].TargetHealth.State" --output text 2>&1); then
-              echo "[AC-TCP] Warning: Failed to get health: $HEALTH"; sleep 10; continue
-            fi
-            if [[ -z "$HEALTH" ]]; then HEALTHY_COUNT=0; TOTAL_COUNT=0
-            else
-              HEALTHY_COUNT=$(echo "$HEALTH" | awk '{for(i=1;i<=NF;i++) if($i=="healthy") c++} END{print c+0}')
-              TOTAL_COUNT=$(echo "$HEALTH" | awk '{print NF}')
-            fi
-            echo "[AC-TCP] [iter $ITERATION, ${REMAINING}m left] $HEALTHY_COUNT/$TOTAL_COUNT healthy"
-            if [[ "$TOTAL_COUNT" -gt 0 && "$HEALTHY_COUNT" -eq "$TOTAL_COUNT" ]]; then
-              echo "[AC-TCP] All targets healthy"
-              break
-            fi
-            sleep 10
-          done
-          if [[ "$TOTAL_COUNT" -eq 0 || "$HEALTHY_COUNT" -ne "$TOTAL_COUNT" ]]; then
-            echo "::error::[AC-TCP] Targets not healthy after ${HEALTH_CHECK_TIMEOUT_MINUTES} minutes"
-            exit 1
-          fi
+          chmod +x .github/scripts/verify-asg-instances-healthy.sh
+          .github/scripts/verify-asg-instances-healthy.sh \
+            "$STANDBY_ASG" \
+            "AC-Standby" \
+            "$HEALTH_CHECK_TIMEOUT_MINUTES" \
+            'curl -sfS -o /dev/null http://127.0.0.1:8080/ping'
 
       # Knock-readiness gate: verify EVERY active server instance reports
       # AC peers connected before switching traffic. During blue/green AC
