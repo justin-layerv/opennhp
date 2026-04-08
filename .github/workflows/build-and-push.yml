@@ -273,39 +273,95 @@ jobs:
             echo "Skipping build — AMI exists and packer files unchanged"
           fi
 
-      - name: Setup Packer
+      # Verify Packer pin integrity BEFORE Setup Packer runs. This step
+      # catches three classes of pin breakage at the earliest possible moment:
+      #   1. Workflow setup-packer `version:` drifted to "latest"
+      #   2. Pkr.hcl plugin constraint drifted to floating
+      #   3. The setup-packer action SHA pin no longer resolves on GitHub
+      #      (the third class is what broke the first post-#252 main run —
+      #      a bad SHA was latent for 2.5 months because packer-build had
+      #      never actually run before the merge to main)
+      #
+      # Placement matters: this step MUST run before Setup Packer. If it
+      # ran after, a bad action SHA would fail Setup Packer first and the
+      # verifier would never get a chance to surface the cleaner error.
+      - name: Verify Packer pin integrity
         if: steps.should-build.outputs.build == 'true'
-        uses: hashicorp/setup-packer@1aa358be5cf73883571f47c4a0bb005b1a8de067 # v3
-        with:
-          # Pin a specific Packer version so a surprise upstream release
-          # can't change AMI build behaviour mid-rollout. Bump intentionally
-          # when upgrading (coordinate with packer/nhp-server-docker.pkr.hcl
-          # required_plugins). The "Verify Packer pin sync" step below
-          # asserts the runner Packer version is still pinned (not "latest")
-          # and that the template plugin pin is still present.
-          version: 1.14.4
-
-      - name: Verify Packer pin sync
-        if: steps.should-build.outputs.build == 'true'
+        env:
+          # gh CLI needs auth to call repos/.../git/commits/{sha}. The
+          # default GITHUB_TOKEN has read access to public repos which is
+          # sufficient for this check.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Both pins must remain explicit. If either drifts to "latest"
-          # we lose the reproducibility property the bump comments promise.
-          # This is a structural check, not a "do the versions match" check —
-          # the runner Packer version (e.g. 1.14.4) and the plugin
-          # constraint (e.g. amazon ~> 1.3) live in different version spaces
-          # and don't have to numerically agree, they just have to both
-          # be pinned-not-floating.
-          WORKFLOW_PIN=$(awk '/uses: hashicorp\/setup-packer/{f=1} f && /version:/{print $2; exit}' .github/workflows/build-and-push.yml)
+
+          # IMPORTANT: every grep/awk below must anchor to start-of-line
+          # (^[[:space:]]*uses:) to avoid matching the literal strings in
+          # this very script — earlier drafts of this verifier matched
+          # their own error messages before the real `uses:` directive.
+
+          # Check 1 — workflow setup-packer version pin is explicit (not
+          # "latest"). This is a structural check, not a numeric-equality
+          # check; the runner Packer version (e.g. 1.14.4) and the plugin
+          # constraint (e.g. amazon ~> 1.3) live in different version
+          # spaces and don't have to numerically agree, they just have to
+          # both be pinned-not-floating.
+          WORKFLOW_PIN=$(awk '/^[[:space:]]*uses:[[:space:]]*hashicorp\/setup-packer@/{f=1; next} f && /^[[:space:]]*version:/{print $2; exit}' .github/workflows/build-and-push.yml)
           if [ -z "$WORKFLOW_PIN" ] || [ "$WORKFLOW_PIN" = "latest" ]; then
             echo "::error::Workflow setup-packer version is missing or set to 'latest'. Pin it to a specific version (current: 1.14.4)."
             exit 1
           fi
+
+          # Check 2 — packer/*.pkr.hcl plugin constraint is pinned to a
+          # constrained range, not floating to whatever the latest plugin
+          # release happens to be at build time.
           if ! grep -q 'version *= *"~> *[0-9]' packer/nhp-server-docker.pkr.hcl; then
             echo "::error::packer/nhp-server-docker.pkr.hcl required_plugins.amazon.version is missing or floating. Pin it to a constrained range (current: \"~> 1.3\")."
             exit 1
           fi
-          echo "Packer pin sync OK: workflow pin=$WORKFLOW_PIN, plugin constraint pinned in pkr.hcl"
+
+          # Check 3 — the setup-packer action SHA pin actually resolves
+          # on GitHub. This is the check that would have caught the bad
+          # SHA the original PR shipped. Parses the `uses:` line to
+          # extract owner/repo and the SHA, then queries the GitHub API
+          # to confirm the commit exists. Catches typos, copy-paste
+          # errors, and force-pushed/garbage-collected SHAs.
+          ACTION_LINE=$(grep -E '^[[:space:]]*uses:[[:space:]]*hashicorp/setup-packer@' .github/workflows/build-and-push.yml | head -1)
+          if [ -z "$ACTION_LINE" ]; then
+            echo "::error::Could not find a 'uses: hashicorp/setup-packer@<sha>' line in the workflow."
+            exit 1
+          fi
+          ACTION_REF=$(echo "$ACTION_LINE" | sed -E 's/.*uses:[[:space:]]*([^[:space:]]+).*/\1/')
+          ACTION_REPO="${ACTION_REF%@*}"
+          ACTION_SHA="${ACTION_REF##*@}"
+          if [[ ! "$ACTION_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::setup-packer is pinned to '$ACTION_SHA' which does not look like a 40-char commit SHA. Pin to a full SHA (not a tag or branch) for supply-chain integrity."
+            exit 1
+          fi
+          if ! gh api "repos/${ACTION_REPO}/git/commits/${ACTION_SHA}" --silent 2>/tmp/gh-err; then
+            echo "::error::Pinned action SHA '${ACTION_REPO}@${ACTION_SHA}' does not resolve on GitHub. The pin is invalid (typo, force-push, or commit not in the repo). Look up the correct SHA via:"
+            echo "::error::  gh api repos/${ACTION_REPO}/git/ref/tags/v3 -q .object.sha"
+            cat /tmp/gh-err >&2 || true
+            exit 1
+          fi
+
+          echo "Packer pin integrity OK:"
+          echo "  workflow pin = $WORKFLOW_PIN"
+          echo "  plugin constraint pinned in pkr.hcl"
+          echo "  setup-packer SHA $ACTION_SHA resolves on $ACTION_REPO"
+
+      - name: Setup Packer
+        if: steps.should-build.outputs.build == 'true'
+        uses: hashicorp/setup-packer@1aa358be5cf73883762b302a3a03abd66e75b232 # v3.1.0
+        with:
+          # Pin a specific Packer version so a surprise upstream release
+          # can't change AMI build behaviour mid-rollout. Bump intentionally
+          # when upgrading (coordinate with packer/nhp-server-docker.pkr.hcl
+          # required_plugins). The "Verify Packer pin integrity" step
+          # above asserts the runner Packer version is still pinned (not
+          # "latest"), the template plugin pin is still present, AND the
+          # setup-packer action SHA actually resolves on GitHub.
+          version: 1.14.4
 
       - name: Packer Init
         if: steps.should-build.outputs.build == 'true'
