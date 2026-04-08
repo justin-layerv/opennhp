@@ -11,6 +11,12 @@ on:
       - 'terraform/**'
       - 'scripts/**'
       - 'tests/**'
+      # PR #252 introduced the packer-build job in this workflow but never
+      # added packer/** to the path filter. Result: a PR that only touches
+      # packer/* (e.g. #980's shebang fix) merges to main without triggering
+      # this workflow at all, and the new packer-build job is silently
+      # skipped. Adding the path here so packer-only changes still run.
+      - 'packer/**'
       - '.github/workflows/build-and-push.yml'
   pull_request:
     branches:
