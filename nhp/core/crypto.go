@@ -41,14 +41,19 @@ type CipherSuite struct {
 	GcmType  GcmTypeEnum
 }
 
-// init cipher suite
-func NewCipherSuite() (ciphers *CipherSuite) {
-	return &CipherSuite{
-		Scheme:   common.CIPHER_SCHEME_CURVE,
-		HashType: HASH_BLAKE2S,
-		EccType:  ECC_CURVE25519,
-		GcmType:  GCM_AES256,
-	}
+// defaultCipherSuite is a shared, read-only CipherSuite instance.
+// All fields are immutable after init, so concurrent reads are safe.
+var defaultCipherSuite = &CipherSuite{
+	Scheme:   common.CIPHER_SCHEME_CURVE,
+	HashType: HASH_BLAKE2S,
+	EccType:  ECC_CURVE25519,
+	GcmType:  GCM_AES256,
+}
+
+// NewCipherSuite returns the shared default CipherSuite. The returned
+// pointer must not be modified — all fields are treated as immutable.
+func NewCipherSuite() *CipherSuite {
+	return defaultCipherSuite
 }
 
 func NewHash(t HashTypeEnum) (hash.Hash, error) {
