@@ -1216,6 +1216,14 @@ jobs:
     # Job timeout = poll timeout (40m) + 5min buffer so the dispatch script
     # has room to print its final error before GitHub kills the job.
     timeout-minutes: 45
+    # actions: write is required so dispatch-and-poll-blue-green.sh can call
+    # the workflow dispatch REST API to trigger blue-green-deploy.yml. The
+    # workflow-level permissions block intentionally withholds this for
+    # least-privilege; only this job needs it.
+    permissions:
+      id-token: write
+      contents: read
+      actions: write
     concurrency:
       group: deploy-sandbox-blue-green
       cancel-in-progress: true
