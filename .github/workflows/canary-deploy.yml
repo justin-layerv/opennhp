@@ -211,16 +211,22 @@ jobs:
           STATE_MACHINE_ARN: ${{ steps.state-machine.outputs.arn }}
           ECR_REPO: ${{ steps.ecr-info.outputs.repo_name }}
         run: |
-          echo "## Canary Deployment - Validation" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Component | $COMPONENT |" >> $GITHUB_STEP_SUMMARY
-          echo "| Environment | $ENVIRONMENT |" >> $GITHUB_STEP_SUMMARY
-          echo "| Image | \`$ECR_REPO:$IMAGE_TAG\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| State Machine | \`${STATE_MACHINE_ARN##*:}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "All validation checks passed." >> $GITHUB_STEP_SUMMARY
+          # Wrap consecutive >> $GITHUB_STEP_SUMMARY redirects in a single
+          # block to satisfy shellcheck SC2129 (the validate-workflows job
+          # has been failing on every push touching .github/workflows for
+          # ~24h+ until this commit). Functionally identical, lints clean.
+          {
+            echo "## Canary Deployment - Validation"
+            echo ""
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| Component | $COMPONENT |"
+            echo "| Environment | $ENVIRONMENT |"
+            echo "| Image | \`$ECR_REPO:$IMAGE_TAG\` |"
+            echo "| State Machine | \`${STATE_MACHINE_ARN##*:}\` |"
+            echo ""
+            echo "All validation checks passed."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # =============================================================================
   # DEPLOY - Update SSM and execute Step Functions canary rollout
@@ -498,54 +504,63 @@ jobs:
           ACCOUNT_ID: ${{ needs.validate.outputs.account_id }}
           RUN_ID: ${{ github.run_id }}
         run: |
-          echo "## Canary Deployment Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Determine overall outcome
-          if [[ "$DEPLOY_RESULT" == "success" ]]; then
-            echo "> **Status: SUCCEEDED**" >> $GITHUB_STEP_SUMMARY
-          elif [[ "$VALIDATE_RESULT" != "success" ]]; then
-            echo "> **Status: VALIDATION FAILED**" >> $GITHUB_STEP_SUMMARY
-          elif [[ "$DEPLOY_RESULT" == "failure" ]]; then
-            echo "> **Status: DEPLOYMENT FAILED** ($DEPLOY_STATUS)" >> $GITHUB_STEP_SUMMARY
-          elif [[ "$DEPLOY_RESULT" == "cancelled" ]]; then
-            echo "> **Status: CANCELLED**" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "> **Status: UNKNOWN** ($DEPLOY_RESULT)" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Configuration" >> $GITHUB_STEP_SUMMARY
-          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Component | **$COMPONENT** |" >> $GITHUB_STEP_SUMMARY
-          echo "| Environment | **$ENVIRONMENT** |" >> $GITHUB_STEP_SUMMARY
-          echo "| Image Tag | \`$IMAGE_TAG\` |" >> $GITHUB_STEP_SUMMARY
-          if [[ -n "$ECR_REPO" ]]; then
-            echo "| ECR Repository | \`$ECR_REPO\` |" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "| Triggered By | \`${{ github.actor }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          echo "### Execution" >> $GITHUB_STEP_SUMMARY
-          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Validation | $VALIDATE_RESULT |" >> $GITHUB_STEP_SUMMARY
-          echo "| Deployment | $DEPLOY_RESULT |" >> $GITHUB_STEP_SUMMARY
-
+          # Wrap consecutive >> $GITHUB_STEP_SUMMARY redirects in a single
+          # block to satisfy shellcheck SC2129. The execution-name and SFN
+          # URL variables are computed before the block so they can be
+          # referenced inside it without losing the redirect grouping.
           if [[ -n "$EXECUTION_ARN" ]]; then
             # Extract execution name from ARN for display
             EXECUTION_NAME="${EXECUTION_ARN##*:}"
             # Build Step Functions console URL
             REGION="${AWS_REGION}"
             SFN_URL="https://${REGION}.console.aws.amazon.com/states/home?region=${REGION}#/v2/executions/details/${EXECUTION_ARN}"
-            echo "| Execution | [${EXECUTION_NAME}](${SFN_URL}) |" >> $GITHUB_STEP_SUMMARY
           fi
-          echo "" >> $GITHUB_STEP_SUMMARY
 
-          if [[ "$DEPLOY_RESULT" == "failure" ]]; then
-            echo "### Troubleshooting" >> $GITHUB_STEP_SUMMARY
-            echo "1. Check the [Step Functions execution](${SFN_URL}) for detailed error information" >> $GITHUB_STEP_SUMMARY
-            echo "2. Review CloudWatch logs for the canary Lambda functions" >> $GITHUB_STEP_SUMMARY
-            echo "3. Verify the canary state has been reset to \`idle\` before retrying" >> $GITHUB_STEP_SUMMARY
-          fi
+          {
+            echo "## Canary Deployment Summary"
+            echo ""
+
+            # Determine overall outcome
+            if [[ "$DEPLOY_RESULT" == "success" ]]; then
+              echo "> **Status: SUCCEEDED**"
+            elif [[ "$VALIDATE_RESULT" != "success" ]]; then
+              echo "> **Status: VALIDATION FAILED**"
+            elif [[ "$DEPLOY_RESULT" == "failure" ]]; then
+              echo "> **Status: DEPLOYMENT FAILED** ($DEPLOY_STATUS)"
+            elif [[ "$DEPLOY_RESULT" == "cancelled" ]]; then
+              echo "> **Status: CANCELLED**"
+            else
+              echo "> **Status: UNKNOWN** ($DEPLOY_RESULT)"
+            fi
+
+            echo ""
+            echo "### Configuration"
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| Component | **$COMPONENT** |"
+            echo "| Environment | **$ENVIRONMENT** |"
+            echo "| Image Tag | \`$IMAGE_TAG\` |"
+            if [[ -n "$ECR_REPO" ]]; then
+              echo "| ECR Repository | \`$ECR_REPO\` |"
+            fi
+            echo "| Triggered By | \`${{ github.actor }}\` |"
+            echo ""
+
+            echo "### Execution"
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| Validation | $VALIDATE_RESULT |"
+            echo "| Deployment | $DEPLOY_RESULT |"
+
+            if [[ -n "$EXECUTION_ARN" ]]; then
+              echo "| Execution | [${EXECUTION_NAME}](${SFN_URL}) |"
+            fi
+            echo ""
+
+            if [[ "$DEPLOY_RESULT" == "failure" ]]; then
+              echo "### Troubleshooting"
+              echo "1. Check the [Step Functions execution](${SFN_URL}) for detailed error information"
+              echo "2. Review CloudWatch logs for the canary Lambda functions"
+              echo "3. Verify the canary state has been reset to \`idle\` before retrying"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

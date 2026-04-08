@@ -65,10 +65,15 @@ jobs:
           COMMIT_TIME=$(git show -s --format=%cd --date=format:'%Y-%m-%d %H:%M:%S')
           BUILD_TIME=$(date "+%Y-%m-%d %H:%M:%S")
 
-          echo "version=${FULL_VERSION}" >> $GITHUB_OUTPUT
-          echo "commit_id=${COMMIT_ID}" >> $GITHUB_OUTPUT
-          echo "commit_time=${COMMIT_TIME}" >> $GITHUB_OUTPUT
-          echo "build_time=${BUILD_TIME}" >> $GITHUB_OUTPUT
+          # Wrap consecutive >> $GITHUB_OUTPUT redirects in a single block
+          # to satisfy shellcheck SC2129 (the validate-workflows job has
+          # been failing on this for ~24h+ until this commit).
+          {
+            echo "version=${FULL_VERSION}"
+            echo "commit_id=${COMMIT_ID}"
+            echo "commit_time=${COMMIT_TIME}"
+            echo "build_time=${BUILD_TIME}"
+          } >> "$GITHUB_OUTPUT"
 
           echo "Version: ${FULL_VERSION}"
           echo "Commit ID: ${COMMIT_ID}"
