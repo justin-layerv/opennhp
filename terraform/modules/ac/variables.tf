@@ -328,6 +328,29 @@ variable "alarm_sns_topic_arn" {
   default     = ""
 }
 
+variable "eip_pool_utilization_threshold_percent" {
+  description = <<-EOT
+    EIP pool utilization percentage threshold for the high-utilization alarm.
+    The alarm fires when the maximum observed pool utilization in any 5-minute
+    period exceeds this value.
+
+    Default of 80 is a balance between actionable warning and noise: it gives
+    operators time to widen ac_max_capacity before the pool exhausts, but
+    doesn't fire on routine scale-out. The lower bound of 50 prevents
+    accidentally setting an aggressive value that would alarm on every
+    scale-out event for small pools (e.g. a 2-EIP pool reports 50% with one
+    instance running). Set higher (e.g. 90) for very large pools where 80%
+    would trip too often during normal traffic.
+  EOT
+  type        = number
+  default     = 80
+
+  validation {
+    condition     = var.eip_pool_utilization_threshold_percent >= 50 && var.eip_pool_utilization_threshold_percent <= 100
+    error_message = "eip_pool_utilization_threshold_percent must be between 50 and 100."
+  }
+}
+
 # ============================================================================
 # ASG Capacity Configuration
 # ============================================================================

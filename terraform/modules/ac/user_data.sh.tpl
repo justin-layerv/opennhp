@@ -177,6 +177,7 @@ AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest
 # ============================================================================
 echo "Attempting to claim an Elastic IP from pool ${eip_pool_tag}..."
 EIP_CLAIMED=false
+EIP_CLAIM_START=$(date +%s)
 for attempt in 1 2 3 4 5; do
   ALLOC_ID=$(aws ec2 describe-addresses \
     --filters "Name=tag:EIPPool,Values=${eip_pool_tag}" \
@@ -199,6 +200,47 @@ for attempt in 1 2 3 4 5; do
       http://169.254.169.254/latest/meta-data/public-ipv4)
     echo "EIP associated. New public IP: $PUBLIC_IP"
     EIP_CLAIMED=true
+    EIP_CLAIM_END=$(date +%s)
+    EIP_CLAIM_DURATION=$(( EIP_CLAIM_END - EIP_CLAIM_START ))
+    # Structured log line for incident investigation. CloudWatch metric
+    # timestamps are aggregated to 1-minute periods, so when investigating
+    # an EIP pool spike operators want to correlate the metric peak with
+    # the exact instance and exact allocation that consumed the slot.
+    # JSON format so CloudWatch Logs Insights can query on individual
+    # fields without regex parsing.
+    #
+    # Construct via `jq -nc --arg` so any quote, backslash, or newline
+    # that ever sneaks into a string field is properly escaped instead of
+    # corrupting the JSON. Numeric fields use --argjson with explicit
+    # integer validation so a non-numeric value falls back to 0 rather
+    # than producing invalid JSON. jq is part of the AC base image
+    # (installed alongside the AWS CLI in user_data setup above).
+    if ! [[ "$EIP_CLAIM_DURATION" =~ ^[0-9]+$ ]]; then EIP_CLAIM_DURATION=0; fi
+    if ! [[ "$attempt" =~ ^[0-9]+$ ]]; then attempt=0; fi
+    if ! jq -nc \
+        --arg event "eip_claimed" \
+        --arg instance_id "$INSTANCE_ID" \
+        --arg allocation_id "$ALLOC_ID" \
+        --arg public_ip "$PUBLIC_IP" \
+        --argjson duration_seconds "$EIP_CLAIM_DURATION" \
+        --argjson attempts "$attempt" \
+        --arg az "$AZ" \
+        --arg environment "${environment}" \
+        '{event: $event, instance_id: $instance_id, allocation_id: $allocation_id, public_ip: $public_ip, duration_seconds: $duration_seconds, attempts: $attempts, az: $az, environment: $environment}'; then
+      echo "WARNING: failed to emit eip_claimed structured log line (boot continues)" >&2
+    fi
+    # Emit EIP claim success metrics to CloudWatch. Log on failure (but
+    # still proceed with boot) so a missing IAM grant or AWS API outage
+    # leaves a breadcrumb in cloud-init-output.log instead of silently
+    # producing an empty dashboard.
+    if ! aws cloudwatch put-metric-data \
+      --namespace "LayerV/NHP" \
+      --metric-data \
+        "MetricName=EIPClaimSuccess,Value=1,Unit=Count,Dimensions=[{Name=Component,Value=AC},{Name=Environment,Value=${environment}}]" \
+        "MetricName=EIPClaimDuration,Value=$EIP_CLAIM_DURATION,Unit=Seconds,Dimensions=[{Name=Component,Value=AC},{Name=Environment,Value=${environment}}]" \
+      --region "$REGION"; then
+      echo "WARNING: failed to publish EIP claim success metrics (boot continues)" >&2
+    fi
     break
   else
     echo "EIP $ALLOC_ID was claimed by another instance (attempt $attempt/5), retrying..."
@@ -209,10 +251,61 @@ done
 if [ "$EIP_CLAIMED" = "false" ]; then
   echo "FATAL: Could not claim an EIP after 5 attempts. Instance cannot serve traffic without a stable IP."
   echo "Check that enough EIPs are allocated (ac_max_capacity) and AWS EIP quota is sufficient."
+  # Emit EIP claim failure metric to CloudWatch. We deliberately log on
+  # failure (without aborting the cooldown / exit path) so the operator can
+  # tell apart "metric never published" from "metric published but no
+  # alarm" when triaging EIP exhaustion incidents.
+  if ! aws cloudwatch put-metric-data \
+    --namespace "LayerV/NHP" \
+    --metric-name "EIPClaimFailure" \
+    --value 1 --unit Count \
+    --dimensions "Component=AC,Environment=${environment}" \
+    --region "$REGION"; then
+    echo "WARNING: failed to publish EIPClaimFailure metric (still proceeding to terminate)" >&2
+  fi
   # Cooldown before exit to prevent ASG from rapidly cycling replacement instances
   # when EIP pool is genuinely exhausted (e.g., all allocated EIPs are in use).
   sleep 120
   exit 1
+fi
+
+# Report current EIP pool utilization to CloudWatch.
+# Note: these metrics are reported AFTER this instance has claimed its EIP,
+# so on first boot the utilization already includes this instance's claim.
+# Use a single describe-addresses call to atomically read both total and
+# associated counts (avoids a race window where another instance claims or
+# releases an EIP between two separate API calls).
+#
+# We do NOT discard stderr from describe-addresses or put-metric-data: a
+# silent failure here would hide a real IAM/credential regression and leave
+# the EIP pool dashboard empty with no breadcrumbs in /var/log/cloud-init-output.
+if EIP_COUNTS=$(aws ec2 describe-addresses \
+  --filters "Name=tag:EIPPool,Values=${eip_pool_tag}" \
+  --query '[length(Addresses), length(Addresses[?AssociationId!=`null`])]' \
+  --output text --region "$REGION"); then
+  EIP_TOTAL=$(echo "$EIP_COUNTS" | awk '{print $1}')
+  EIP_ASSOCIATED=$(echo "$EIP_COUNTS" | awk '{print $2}')
+  # Validate both values are non-empty positive integers before doing
+  # arithmetic. A regex check is more reliable than relying on `[ -gt ]`
+  # exit codes for non-numeric input (which return 2, not 1, on bash).
+  if [[ "$EIP_TOTAL" =~ ^[0-9]+$ ]] && [[ "$EIP_ASSOCIATED" =~ ^[0-9]+$ ]] && [ "$EIP_TOTAL" -gt 0 ]; then
+    EIP_UTILIZATION=$(( EIP_ASSOCIATED * 100 / EIP_TOTAL ))
+    EIP_AVAILABLE=$(( EIP_TOTAL - EIP_ASSOCIATED ))
+    if ! aws cloudwatch put-metric-data \
+      --namespace "LayerV/NHP" \
+      --metric-data \
+        "MetricName=EIPPoolUtilizationPercent,Value=$EIP_UTILIZATION,Unit=Percent,Dimensions=[{Name=Component,Value=AC},{Name=Environment,Value=${environment}}]" \
+        "MetricName=EIPPoolAvailable,Value=$EIP_AVAILABLE,Unit=Count,Dimensions=[{Name=Component,Value=AC},{Name=Environment,Value=${environment}}]" \
+        "MetricName=EIPPoolTotal,Value=$EIP_TOTAL,Unit=Count,Dimensions=[{Name=Component,Value=AC},{Name=Environment,Value=${environment}}]" \
+      --region "$REGION"; then
+      echo "WARNING: failed to publish EIP pool utilization metrics to CloudWatch (boot continues)" >&2
+    fi
+    echo "EIP pool utilization: $EIP_ASSOCIATED/$EIP_TOTAL ($EIP_UTILIZATION%) -- $EIP_AVAILABLE available"
+  else
+    echo "WARNING: EIP describe-addresses returned non-numeric counts (total='$EIP_TOTAL', associated='$EIP_ASSOCIATED'), skipping metric publish" >&2
+  fi
+else
+  echo "WARNING: aws ec2 describe-addresses for EIP pool failed, skipping utilization metrics" >&2
 fi
 %{ endif ~}
 
