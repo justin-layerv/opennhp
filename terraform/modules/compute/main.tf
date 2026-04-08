@@ -18,15 +18,32 @@
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
-# Ubuntu 24.04 LTS (Noble Numbat) - latest LTS
-data "aws_ssm_parameter" "ubuntu_ami" {
-  name = "/aws/service/canonical/ubuntu/server/noble/stable/current/amd64/hvm/ebs-gp3/ami-id"
+# AMI Selection (fail-fast, no fallback):
+# 1. If var.server_ami_id is set directly, use it
+# 2. Otherwise, read from SSM parameter /{environment}/nhp/server/ami-id
+#
+# The AMI must be pre-built with Docker installed. Without a custom AMI,
+# Terraform will fail at plan time with a clear error.
+#
+# Build and publish AMI:
+#   cd packer && packer build -var 'environment=sandbox' nhp-server-docker.pkr.hcl
+#   aws ssm put-parameter --name "/sandbox/nhp/server/ami-id" \
+#     --value "ami-xxx" --type String --overwrite
+#
+# Naming aligned with sibling /${env}/nhp/server/* parameters
+# (image-tag, asg-name, active-color, ...). See blue_green.tf for the rest.
+data "aws_ssm_parameter" "server_ami" {
+  count = var.server_ami_id == null ? 1 : 0
+  name  = "/${var.environment}/nhp/server/ami-id"
 }
 
 # ==================== Locals ====================
 
 locals {
   is_prod = var.environment == "prod"
+
+  # Fail fast: either var.server_ami_id is set, or SSM parameter must exist.
+  server_ami_id = var.server_ami_id != null ? var.server_ami_id : data.aws_ssm_parameter.server_ami[0].value
 }
 
 # Lambda for generating Curve25519 keys (same approach as CDK)
@@ -674,7 +691,7 @@ locals {
 # Launch Template
 resource "aws_launch_template" "server" {
   name_prefix   = "${var.name_prefix}-server-"
-  image_id      = data.aws_ssm_parameter.ubuntu_ami.value
+  image_id      = local.server_ami_id
   instance_type = local.is_prod ? "c6i.xlarge" : "t3.medium"
 
   iam_instance_profile {
@@ -751,12 +768,47 @@ resource "aws_autoscaling_group" "server" {
     version = aws_launch_template.server.latest_version
   }
 
-  health_check_type         = "EC2"
-  health_check_grace_period = 180 # Instance launch (~60s) + user data (~90s) + container start (~15s) = ~165s
-  # NOTE: ELB health check causes instance refresh deadlock. The HTTPS TG uses
-  # /health/knock-ready (requires AC peers), but new instances can't get AC
-  # peers until InService — deadlock. The HTTP forwarder fix handles knock
-  # failures by forwarding to peers that have AC connections.
+  # Use EC2 health checks (NOT ELB) for ASG lifecycle decisions. This is
+  # load-bearing and prevents a bootstrap deadlock — see "Bootstrap deadlock
+  # avoidance" below for the full chain.
+  health_check_type = "EC2"
+  # Docker is pre-baked into the AMI (see packer/nhp-server-docker.pkr.hcl),
+  # so apt-get install Docker (~90s) and AWS CLI install (~30s) are no longer
+  # in the critical path. Boot + user_data + container start now fit under
+  # ~60s (~15s launch, ~15s user_data, ~15-30s ECR pull + container start).
+  # 90s is ~1.5x the observed worst case to absorb slower ECR pulls when a
+  # new image tag is rolled out for the first time.
+  health_check_grace_period = 90
+  #
+  # Bootstrap deadlock avoidance:
+  #
+  # The HTTPS target group (aws_lb_target_group.https) uses /health/knock-ready
+  # — that endpoint only returns 200 once the server has at least one connected
+  # AC peer. That's intentional: HTTPS traffic on the QURL resolve listener
+  # actually needs an AC peer to do anything useful, so we keep half-baked
+  # servers out of the LB rotation.
+  #
+  # Naively, this would deadlock during bootstrap: the very first server has
+  # no AC peers (no ACs have registered yet), so /health/knock-ready returns
+  # non-200, the ELB marks it Unhealthy, and if the ASG were configured to
+  # terminate on ELB failures, it would loop terminating fresh instances
+  # forever — and ACs (which find servers via Cloud Map / DNS, not the LB)
+  # would never get the chance to register against them.
+  #
+  # Two pieces break the deadlock:
+  #   1. health_check_type = "EC2" above. The ASG only consults the EC2
+  #      instance state (running/not-running) for lifecycle decisions and
+  #      ignores the LB target group health entirely. Failing knock-ready
+  #      affects LB routing, not instance termination.
+  #   2. The HTTP forwarder fix in the server itself: when a knock arrives
+  #      on a server that has no AC peers, the server forwards the knock to
+  #      a peer server that does have AC peers, instead of failing. So
+  #      bootstrap traffic still works even before the new server's own AC
+  #      peers come up.
+  #
+  # The same /health/knock-ready path is used by the green HTTPS target group
+  # (blue_green.tf::aws_lb_target_group.https_green); the same reasoning
+  # applies. Keep this comment in sync if you ever change either.
 
   # Publish ASG group metrics to CloudWatch (AWS/AutoScaling namespace).
   # Without this, metrics like GroupInServiceInstances are not emitted.
@@ -1256,4 +1308,82 @@ resource "aws_cloudwatch_metric_alarm" "termination_cleanup_errors" {
     Component = "compute"
     Cell      = var.cell_id
   })
+}
+
+# ============================================================================
+# Bootstrap-deadlock invariant assertion
+#
+# The full deadlock-avoidance chain is documented at
+# aws_autoscaling_group.server above (search "Bootstrap deadlock avoidance").
+# Three conditions must all hold:
+#   1. Both ASGs use health_check_type = "EC2" (NOT ELB).
+#   2. The HTTPS target groups can use the strict /health/knock-ready path
+#      because (1) means failing it doesn't trigger termination.
+#   3. The server has an HTTP forwarder fallback that routes knocks to a
+#      peer when the local AC peer count is zero.
+#
+# This check fires at plan time if anyone changes either ASG to ELB-based
+# health checks. It is a non-blocking warning (Terraform `check` blocks
+# emit ::warning::, not ::error::) — sufficient because anyone running
+# `terraform plan` against this module will see the warning in CI output
+# and on the PR. The first two conditions are easy to assert from
+# Terraform; condition (3) is server-side Go code and is asserted in the
+# server's own test suite.
+# ============================================================================
+check "asg_ec2_health_check_invariant" {
+  assert {
+    condition     = aws_autoscaling_group.server.health_check_type == "EC2"
+    error_message = "BOOTSTRAP DEADLOCK RISK: aws_autoscaling_group.server.health_check_type must remain \"EC2\". Changing to ELB-based reintroduces the bootstrap deadlock documented at aws_autoscaling_group.server (search \"Bootstrap deadlock avoidance\"). If you genuinely need ELB health checks, update the documentation chain in main.tf and blue_green.tf, remove this check, AND verify the HTTP-forwarder fallback in the server still handles zero-AC-peers bootstrap correctly."
+  }
+
+  assert {
+    # The conditional handles count=0 when blue/green is disabled — without
+    # the guard the index lookup fails before the check runs.
+    condition     = !var.enable_blue_green || (length(aws_autoscaling_group.server_green) > 0 && aws_autoscaling_group.server_green[0].health_check_type == "EC2")
+    error_message = "BOOTSTRAP DEADLOCK RISK: aws_autoscaling_group.server_green.health_check_type must remain \"EC2\" when blue/green is enabled. Same reasoning as the blue ASG above; see aws_autoscaling_group.server in main.tf."
+  }
+}
+
+# ============================================================================
+# Blue/green HTTPS target group health-check drift detection
+#
+# The blue HTTPS target group (aws_lb_target_group.https in main.tf) and the
+# green HTTPS target group (aws_lb_target_group.https_green in blue_green.tf)
+# MUST have identical health check configurations. They serve the same
+# traffic from the same kind of instance — any divergence means a blue/green
+# swap will behave differently than blue/blue, which defeats the purpose of
+# blue/green deployments and is exactly the class of bug that's invisible
+# until you actually swap.
+#
+# Round-2 review of #252 caught a manual drift here (the green target group
+# was using /health/live while blue used /health/knock-ready). Round-5 review
+# asked for automated drift detection so the comment-only "keep these in
+# sync" reminder doesn't decay into a lie.
+#
+# This check fires at plan time if any field of the two health check blocks
+# diverges. Non-blocking warning (Terraform `check` blocks emit ::warning::,
+# not ::error::) — sufficient because anyone running `terraform plan` will
+# see the warning in CI output. To resolve the warning intentionally,
+# update both blocks together AND keep the documentation cross-reference at
+# blue_green.tf::https_green in sync.
+# ============================================================================
+check "https_target_group_health_check_drift" {
+  assert {
+    condition = (
+      !var.enable_blue_green ||
+      !var.enable_qurl_resolve_endpoint ||
+      length(aws_lb_target_group.https) == 0 ||
+      length(aws_lb_target_group.https_green) == 0 ||
+      (
+        aws_lb_target_group.https[0].health_check[0].path == aws_lb_target_group.https_green[0].health_check[0].path &&
+        aws_lb_target_group.https[0].health_check[0].port == aws_lb_target_group.https_green[0].health_check[0].port &&
+        aws_lb_target_group.https[0].health_check[0].protocol == aws_lb_target_group.https_green[0].health_check[0].protocol &&
+        aws_lb_target_group.https[0].health_check[0].matcher == aws_lb_target_group.https_green[0].health_check[0].matcher &&
+        aws_lb_target_group.https[0].health_check[0].interval == aws_lb_target_group.https_green[0].health_check[0].interval &&
+        aws_lb_target_group.https[0].health_check[0].healthy_threshold == aws_lb_target_group.https_green[0].health_check[0].healthy_threshold &&
+        aws_lb_target_group.https[0].health_check[0].unhealthy_threshold == aws_lb_target_group.https_green[0].health_check[0].unhealthy_threshold
+      )
+    )
+    error_message = "BLUE/GREEN HEALTH CHECK DRIFT: aws_lb_target_group.https.health_check (main.tf) and aws_lb_target_group.https_green.health_check (blue_green.tf) have diverged. Both target groups serve the same traffic and MUST have identical health check configurations or a blue/green swap will silently change health-check semantics. Diff the two health_check blocks and align them. If the divergence is intentional (e.g. green is being upgraded), update this check together with the change so the next reader knows it was deliberate."
+  }
 }

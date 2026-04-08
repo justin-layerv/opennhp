@@ -32,6 +32,12 @@ variable "deploy_etcd" {
   default     = null
 }
 
+variable "server_ami_id" {
+  description = "Docker-optimized AMI ID for NHP Server. If null, compute module reads from /sandbox/nhp/server/ami-id SSM parameter."
+  type        = string
+  default     = null
+}
+
 variable "min_capacity" {
   type = number
 }

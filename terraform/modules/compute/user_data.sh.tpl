@@ -30,22 +30,41 @@ apt_get_with_retry() {
     done
 }
 
-apt_get_with_retry update -y
+# =============================================================================
+# Package Installation - Skip if already present (for custom AMI optimization)
+# With base Ubuntu AMI: ~60-90 seconds for apt-get + installs
+# With custom AMI (Docker pre-installed): ~0 seconds
 # Note: awscli package deprecated in Ubuntu 24.04, using unzip + curl for AWS CLI v2
-apt_get_with_retry install -y jq docker.io curl unzip
+# =============================================================================
+declare -a PACKAGES_NEEDED=()
+command -v jq >/dev/null 2>&1 || PACKAGES_NEEDED+=("jq")
+command -v docker >/dev/null 2>&1 || PACKAGES_NEEDED+=("docker.io")
+command -v curl >/dev/null 2>&1 || PACKAGES_NEEDED+=("curl")
+command -v unzip >/dev/null 2>&1 || PACKAGES_NEEDED+=("unzip")
 
-# Install AWS CLI v2 (works on all Ubuntu versions)
-if ! command -v aws &> /dev/null; then
+if [ "$${#PACKAGES_NEEDED[@]}" -gt 0 ]; then
+  echo "Installing missing packages:$${PACKAGES_NEEDED[*]}"
+  apt_get_with_retry update -y
+  apt_get_with_retry install -y "$${PACKAGES_NEEDED[@]}"
+else
+  echo "All packages already installed, skipping apt-get (custom AMI detected)"
+fi
+
+# Install AWS CLI v2 if not present (works on all Ubuntu versions)
+if ! command -v aws >/dev/null 2>&1; then
   echo "Installing AWS CLI v2..."
   curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
   unzip -q /tmp/awscliv2.zip -d /tmp
   /tmp/aws/install
   rm -rf /tmp/aws /tmp/awscliv2.zip
+else
+  echo "AWS CLI already installed, skipping"
 fi
 aws --version
 
+# Start Docker (may already be running on custom AMI)
 systemctl enable docker
-systemctl start docker
+systemctl start docker || true
 
 for _ in {1..30}; do docker info && break || sleep 2; done
 
@@ -122,16 +141,55 @@ CWEOF
   fi
 fi
 
-# Fix DNS for Go's pure resolver (doesn't work with systemd-resolved stub)
-# Disable stub listener and point to real VPC DNS resolver
-mkdir -p /etc/systemd/resolved.conf.d
-cat > /etc/systemd/resolved.conf.d/disable-stub.conf << 'DNSEOF'
+# Fix DNS for Go's pure resolver (doesn't work with systemd-resolved stub).
+# The Docker-optimized AMI built by packer/nhp-server-docker.pkr.hcl bakes
+# this drop-in in, so the normal-boot path is the no-op branch below.
+#
+# The else branch is a recovery fallback, NOT an expected code path. If we
+# ever hit it on a real instance it means either (a) the AMI bake step was
+# accidentally removed, or (b) someone launched against a non-baked AMI
+# (the PR explicitly forbids this). We surface the failure four ways so it's
+# discoverable in production monitoring without needing log searches:
+#   1. Cloud-init-output WARNING line (visible in EC2 console + on-instance)
+#   2. /var/log/nhp-dns-fallback host stamp (grep-able from the host)
+#   3. syslog/journald entry via `logger -p user.alert` (collected by the
+#      CloudWatch agent + visible in `journalctl -t nhp-user-data`)
+#   4. CloudWatch custom metric LayerV/NHP/DnsFallbackHit so the team can
+#      build a dashboard panel + alarm that fires the moment any new
+#      instance hits this path. Best-effort: failure to emit the metric
+#      must NOT block the instance from coming up.
+# The work itself still runs so the instance comes up with working DNS
+# instead of failing.
+if [ -f /etc/systemd/resolved.conf.d/disable-stub.conf ] && grep -q '^DNSStubListener=no' /etc/systemd/resolved.conf.d/disable-stub.conf; then
+  echo "DNS already configured by baked AMI; skipping user_data DNS setup"
+else
+  echo "WARNING: DNS fallback path hit — AMI was expected to ship with /etc/systemd/resolved.conf.d/disable-stub.conf but it is missing. This indicates the Docker-optimized AMI bake step regressed or a non-baked AMI was launched. Investigate."
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) DNS fallback path hit on $(hostname)" >> /var/log/nhp-dns-fallback
+  logger -t nhp-user-data -p user.alert "DNS fallback path hit; AMI bake step missing disable-stub.conf"
+  # Emit a CloudWatch custom metric so dashboards/alarms can detect this
+  # without log-grepping. The instance role grants PutMetricData scoped to
+  # the LayerV/NHP namespace (compute/main.tf::aws_iam_role.server). The
+  # InstanceId dimension is fetched via IMDSv2; on the rare chance that
+  # also fails, we fall back to "unknown" so the metric still emits.
+  CW_TOKEN=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || echo "")
+  CW_INSTANCE_ID=$(curl -fsS -H "X-aws-ec2-metadata-token: $CW_TOKEN" "http://169.254.169.254/latest/meta-data/instance-id" 2>/dev/null || echo "unknown")
+  aws cloudwatch put-metric-data \
+    --region "${region}" \
+    --namespace "LayerV/NHP" \
+    --metric-name "DnsFallbackHit" \
+    --value 1 \
+    --unit Count \
+    --dimensions "InstanceId=$CW_INSTANCE_ID" \
+    || echo "WARNING: failed to emit DnsFallbackHit CloudWatch metric (continuing)"
+  mkdir -p /etc/systemd/resolved.conf.d
+  cat > /etc/systemd/resolved.conf.d/disable-stub.conf << 'DNSEOF'
 [Resolve]
 DNSStubListener=no
 DNSEOF
-ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
-systemctl restart systemd-resolved
-echo "DNS configured to use VPC resolver directly"
+  ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+  systemctl restart systemd-resolved
+  echo "DNS configured to use VPC resolver directly (user_data fallback — see warning above)"
+fi
 
 SECRET_ARN="${secret_arn}"
 REGION="${region}"
@@ -787,6 +845,13 @@ echo "Configuring iptables rate limiting for UDP port 62206..."
 # Install iptables if not already present (usually pre-installed on Ubuntu)
 which iptables > /dev/null 2>&1 || apt_get_with_retry install -y iptables
 
+# Idempotency: delete each rule first (best-effort, ignore errors if not
+# present) before appending. This prevents duplicate rules accumulating if
+# user_data runs more than once on the same instance — for example after
+# `cloud-init clean && cloud-init init` for debugging, or after a re-image
+# that bakes prior rules into the AMI. The delete must use the EXACT same
+# spec as the add or it won't match. Keep the two specs in lockstep below.
+
 # Rate limit UDP knock packets per source IP using hashlimit module.
 # hashlimit tracks each source IP independently, preventing one abusive IP
 # from exhausting the rate limit for legitimate clients.
@@ -794,6 +859,14 @@ which iptables > /dev/null 2>&1 || apt_get_with_retry install -y iptables
 # --hashlimit-burst: initial burst allowance
 # --hashlimit-mode srcip: track by source IP
 # --hashlimit-htable-expire: cleanup idle entries after 120s
+iptables -D INPUT -p udp --dport 62206 \
+  -m hashlimit \
+  --hashlimit-upto 100/sec \
+  --hashlimit-burst 50 \
+  --hashlimit-mode srcip \
+  --hashlimit-name nhp_knock \
+  --hashlimit-htable-expire 120000 \
+  -j ACCEPT 2>/dev/null || true
 iptables -A INPUT -p udp --dport 62206 \
   -m hashlimit \
   --hashlimit-upto 100/sec \
@@ -804,6 +877,7 @@ iptables -A INPUT -p udp --dport 62206 \
   -j ACCEPT
 
 # Drop UDP packets to port 62206 that exceed the rate limit
+iptables -D INPUT -p udp --dport 62206 -j DROP 2>/dev/null || true
 iptables -A INPUT -p udp --dport 62206 -j DROP
 
 echo "iptables rate limiting configured: 100 pps sustained, burst 50 per source IP"

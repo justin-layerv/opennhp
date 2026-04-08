@@ -14,6 +14,7 @@ module "nhp" {
   environment            = var.environment
   aws_region             = var.aws_region
   aws_account_id         = var.aws_account_id
+  server_ami_id          = var.server_ami_id
   domain_name            = var.domain_name
   hosted_zone            = var.hosted_zone
   multi_tenant           = var.multi_tenant

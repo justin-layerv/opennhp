@@ -3,6 +3,57 @@ variable "environment" {
   type        = string
 }
 
+# =============================================================================
+# AMI Configuration
+# =============================================================================
+
+variable "server_ami_id" {
+  description = <<-EOT
+    Docker-optimized AMI ID for NHP Server instances.
+
+    If not set, reads from SSM parameter: /{environment}/nhp/server/ami-id
+    If neither exists, Terraform fails at plan time (no fallback to vanilla Ubuntu).
+
+    Build and publish AMI:
+      cd packer && packer build -var 'environment=sandbox' nhp-server-docker.pkr.hcl
+      aws ssm put-parameter --name "/sandbox/nhp/server/ami-id" \
+        --value "ami-xxx" --type String --overwrite
+
+    Instance startup: ~30s (vs ~5-6 min without custom AMI)
+  EOT
+  type        = string
+  default     = null
+
+  # NOTE: there is intentionally no `validation` block rejecting the
+  # PR-validation placeholder ("ami-0000000000000abcd"). An earlier round of
+  # this PR added one and it self-defeats: variable validation fires at PLAN
+  # time, and the PR-validation step in build-and-push.yml IS a `terraform
+  # plan` run. A validation that rejected the placeholder rejected exactly
+  # the flow it was meant to coexist with, breaking CI on this branch.
+  #
+  # The actual safeguards against the placeholder reaching apply are
+  # structural and live outside this file:
+  #
+  #   1. The placeholder is hardcoded in exactly ONE place
+  #      (.github/workflows/build-and-push.yml::terraform-plan, the
+  #      TF_VAR_server_ami_id env var) and nothing else passes it. Anyone
+  #      wanting to misuse it would have to copy-paste from there.
+  #   2. That step runs `terraform plan` only, never `terraform apply`.
+  #   3. The actual deploy steps (deploy-sandbox-*, promote-to-prod) do NOT
+  #      pass TF_VAR_server_ami_id at all. With var.server_ami_id == null,
+  #      the compute module reads from SSM
+  #      (data.aws_ssm_parameter.server_ami in main.tf). The placeholder
+  #      cannot reach those code paths.
+  #   4. promote-to-prod additionally verifies the SSM value matches
+  #      ^ami-[0-9a-f]+$ AND the AMI is Available before any apply runs
+  #      (.github/workflows/promote-to-prod.yml::"Verify prod NHP Server
+  #      AMI is published to SSM"), so even an explicitly-bad SSM value
+  #      can't reach prod apply.
+  #
+  # If you ever need to add another path that passes a TF_VAR_server_ami_id
+  # value, audit it against the four safeguards above before merging.
+}
+
 variable "cell_id" {
   description = "Cell identifier for multi-cell deployments (e.g., cell0, cell1)"
   type        = string

@@ -281,15 +281,28 @@ resource "aws_lb_target_group" "https_green" {
   vpc_id      = var.vpc_id
   target_type = "instance"
 
-  # HTTP health check on port 8888 (same as blue)
+  # Health check on port 8888 — must match the blue HTTPS target group at
+  # main.tf::aws_lb_target_group.https. Both use /health/knock-ready (not
+  # /health/live) to verify the server has connected AC peers before routing
+  # knock traffic to it (H1 hardening). /health/live is still used by the
+  # ASG/UDP target groups so healthy-but-waiting servers are not terminated.
+  #
+  # Bootstrap-deadlock note: this strict path can't deadlock the green ASG
+  # because the green ASG also uses health_check_type = "EC2" (set in
+  # aws_autoscaling_group.server_green below) and the server itself has an
+  # HTTP forwarder fallback that routes knocks to a peer when the local AC
+  # peer count is zero. Full chain documented at main.tf::server ASG; search
+  # for "Bootstrap deadlock avoidance".
+  #
+  # Keep this in sync with main.tf::aws_lb_target_group.https.health_check.
   health_check {
     enabled             = true
     protocol            = "HTTP"
     port                = "8888"
-    path                = "/health/live"
+    path                = "/health/knock-ready"
     healthy_threshold   = 2
     unhealthy_threshold = 2
-    interval            = 30
+    interval            = 10
     matcher             = "200"
   }
 
@@ -327,8 +340,11 @@ resource "aws_autoscaling_group" "server_green" {
     version = "$Latest"
   }
 
-  health_check_type         = "EC2"
-  health_check_grace_period = 180
+  health_check_type = "EC2"
+  # Matches the server ASG grace period in main.tf. Docker is pre-baked
+  # into the AMI so the ~120s apt-get install is no longer in the critical
+  # path; 90s gives ~1.5x the observed worst-case boot-to-healthy time.
+  health_check_grace_period = 90
 
   # Publish ASG group metrics to CloudWatch (AWS/AutoScaling namespace).
   # Without this, metrics like GroupInServiceInstances are not emitted.

@@ -101,6 +101,19 @@ variable "deploy_etcd" {
   }
 }
 
+variable "server_ami_id" {
+  description = <<-EOT
+    Docker-optimized AMI ID for NHP Server instances. If null, the compute
+    module reads from SSM parameter /<environment>/nhp/server/ami-id (aligned
+    with sibling /<environment>/nhp/server/* parameters: image-tag, asg-name,
+    active-color, ...). Terraform fails at plan time if neither is set (no
+    fallback to vanilla Ubuntu). Set to a dummy value for PR validation so
+    plan does not depend on environment-specific SSM state.
+  EOT
+  type        = string
+  default     = null
+}
+
 variable "min_capacity" {
   description = "Minimum ASG capacity"
   type        = number

@@ -80,6 +80,7 @@ jobs:
       infra: ${{ steps.filter.outputs.infra }}
       tests: ${{ steps.filter.outputs.tests }}
       lambdas: ${{ steps.filter.outputs.lambdas }}
+      packer: ${{ steps.filter.outputs.packer }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -111,6 +112,8 @@ jobs:
               - 'endpoints/**'
             lambdas:
               - 'terraform/modules/**/lambda/**'
+            packer:
+              - 'packer/**'
 
       - name: Change Detection Summary
         run: |
@@ -123,6 +126,7 @@ jobs:
             echo "| Infrastructure (terraform) | ${{ steps.filter.outputs.infra }} |"
             echo "| Tests | ${{ steps.filter.outputs.tests }} |"
             echo "| Lambdas | ${{ steps.filter.outputs.lambdas }} |"
+            echo "| Packer | ${{ steps.filter.outputs.packer }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Force build override
@@ -163,6 +167,215 @@ jobs:
             echo "image_tag=${{ github.sha }}"
             echo "start_time=$(date +%s)"
           } >> "$GITHUB_OUTPUT"
+
+  # ============================================================================
+  # PACKER - Build Docker-optimized AMI if missing or packer files changed
+  # ============================================================================
+  # The AMI is required for Terraform — there is no fallback to vanilla Ubuntu.
+  # This job builds the AMI and publishes its ID to SSM Parameter Store.
+  # Terraform reads from SSM, so once built, subsequent deploys reuse it.
+  #
+  # This job always runs on pushes to main and workflow_dispatch (so that
+  # terraform-plan has a deterministic dependency). Internally it decides
+  # whether to actually build by checking two things:
+  #   1. Did packer/** files change on this commit?
+  #   2. Is the SSM parameter missing (fresh env bootstrap)?
+  # If either is true, we build. Otherwise the job is a no-op that succeeds
+  # immediately and terraform-plan continues.
+  # ============================================================================
+  packer-build:
+    name: Packer Build AMI (${{ matrix.environment }})
+    needs: [changes, setup]
+    runs-on: ubuntu-latest
+    # 30 minutes (was 20) gives headroom for the rare slow run: an
+    # apt mirror flap, ECR auth backoff, or a multi-region copy can each
+    # add a few minutes. The happy path is ~10 minutes; the extra 10 minute
+    # buffer is cheap insurance against an occasional flake forcing a
+    # full re-run. Bump again only if we observe sustained run times >25m.
+    timeout-minutes: 30
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      github.event_name == 'workflow_dispatch'
+    permissions:
+      id-token: write
+      contents: read
+    # Serialize concurrent runs against the same env to prevent two builds
+    # racing to overwrite the SSM parameter (the "winning" AMI is then
+    # consumed by the next instance refresh, leaving the loser as garbage).
+    concurrency:
+      group: packer-build-${{ matrix.environment }}
+      cancel-in-progress: false
+    strategy:
+      matrix:
+        environment: [sandbox, prod]
+      # Don't cancel one environment if the other fails — sandbox and prod
+      # builds are independent and a sandbox failure shouldn't block prod
+      # bootstrap on the first merge.
+      fail-fast: false
+      # Prerequisite: the AWS_PROD_ROLE_ARN GitHub Actions secret must be set
+      # to a role in the prod account that trusts this repo's OIDC issuer
+      # (configured in nhp Terraform). The conditional role-to-assume below
+      # picks AWS_PROD_ROLE_ARN for prod and AWS_ROLE_ARN for sandbox.
+    # AWS_REGION is inherited from the workflow-level `env:` block at the top
+    # of this file (currently us-east-2). All AWS-touching steps in this job
+    # — Configure AWS credentials, the Packer build itself, and the SSM
+    # publish post-processor — read from that single source of truth so
+    # changing the region is a one-line edit at the top of the workflow.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+        with:
+          role-to-assume: ${{ matrix.environment == 'prod' && secrets.AWS_PROD_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check if AMI already exists
+        id: check-ami
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          set -euo pipefail
+          SSM_PARAM="/${ENVIRONMENT}/nhp/server/ami-id"
+
+          # Distinguish "ParameterNotFound" (expected fresh-env case) from
+          # other errors (creds, region, network) so a transient failure
+          # doesn't silently force a rebuild on every run.
+          if PARAM_VALUE=$(aws ssm get-parameter --name "$SSM_PARAM" --query 'Parameter.Value' --output text 2>/tmp/ssm-err); then
+            echo "AMI exists in SSM: $PARAM_VALUE"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if grep -q "ParameterNotFound" /tmp/ssm-err; then
+            echo "No AMI found in SSM (ParameterNotFound) — will build"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::error::Unexpected SSM error checking $SSM_PARAM:"
+          cat /tmp/ssm-err
+          exit 1
+
+      - name: Decide whether to build
+        id: should-build
+        env:
+          PACKER_CHANGED: ${{ needs.changes.outputs.packer }}
+          AMI_EXISTS: ${{ steps.check-ami.outputs.exists }}
+        run: |
+          set -euo pipefail
+          if [[ "$PACKER_CHANGED" == "true" || "$AMI_EXISTS" == "false" ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "Will build AMI (packer_changed=$PACKER_CHANGED, ami_exists=$AMI_EXISTS)"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping build — AMI exists and packer files unchanged"
+          fi
+
+      - name: Setup Packer
+        if: steps.should-build.outputs.build == 'true'
+        uses: hashicorp/setup-packer@1aa358be5cf73883571f47c4a0bb005b1a8de067 # v3
+        with:
+          # Pin a specific Packer version so a surprise upstream release
+          # can't change AMI build behaviour mid-rollout. Bump intentionally
+          # when upgrading (coordinate with packer/nhp-server-docker.pkr.hcl
+          # required_plugins). The "Verify Packer pin sync" step below
+          # asserts the runner Packer version is still pinned (not "latest")
+          # and that the template plugin pin is still present.
+          version: 1.14.4
+
+      - name: Verify Packer pin sync
+        if: steps.should-build.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          # Both pins must remain explicit. If either drifts to "latest"
+          # we lose the reproducibility property the bump comments promise.
+          # This is a structural check, not a "do the versions match" check —
+          # the runner Packer version (e.g. 1.14.4) and the plugin
+          # constraint (e.g. amazon ~> 1.3) live in different version spaces
+          # and don't have to numerically agree, they just have to both
+          # be pinned-not-floating.
+          WORKFLOW_PIN=$(awk '/uses: hashicorp\/setup-packer/{f=1} f && /version:/{print $2; exit}' .github/workflows/build-and-push.yml)
+          if [ -z "$WORKFLOW_PIN" ] || [ "$WORKFLOW_PIN" = "latest" ]; then
+            echo "::error::Workflow setup-packer version is missing or set to 'latest'. Pin it to a specific version (current: 1.14.4)."
+            exit 1
+          fi
+          if ! grep -q 'version *= *"~> *[0-9]' packer/nhp-server-docker.pkr.hcl; then
+            echo "::error::packer/nhp-server-docker.pkr.hcl required_plugins.amazon.version is missing or floating. Pin it to a constrained range (current: \"~> 1.3\")."
+            exit 1
+          fi
+          echo "Packer pin sync OK: workflow pin=$WORKFLOW_PIN, plugin constraint pinned in pkr.hcl"
+
+      - name: Packer Init
+        if: steps.should-build.outputs.build == 'true'
+        working-directory: packer
+        run: packer init nhp-server-docker.pkr.hcl
+
+      - name: Packer Validate
+        if: steps.should-build.outputs.build == 'true'
+        working-directory: packer
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          AWS_BUILD_REGION: ${{ env.AWS_REGION }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Run packer validate before packer build so syntax / template errors
+          # surface in seconds, not after a 10-minute build attempt that ends
+          # with the same syntax error. Same -var set as the build step below
+          # so the validation matches the actual invocation.
+          packer validate \
+            -var "environment=${ENVIRONMENT}" \
+            -var "aws_region=${AWS_BUILD_REGION}" \
+            -var "git_sha=${GIT_SHA}" \
+            nhp-server-docker.pkr.hcl
+
+      - name: Packer Build
+        if: steps.should-build.outputs.build == 'true'
+        working-directory: packer
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          AWS_BUILD_REGION: ${{ env.AWS_REGION }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # -on-error=cleanup tells Packer to terminate the builder instance
+          # and remove any partial artifacts on failure, instead of leaving an
+          # orphan EC2 instance running until someone notices it. Without this
+          # a transient build failure leaves a billing surprise.
+          # git_sha is embedded in the AMI name and tags so an operator can
+          # grep an AMI back to the exact packer/* template version.
+          packer build \
+            -on-error=cleanup \
+            -var "environment=${ENVIRONMENT}" \
+            -var "aws_region=${AWS_BUILD_REGION}" \
+            -var "git_sha=${GIT_SHA}" \
+            nhp-server-docker.pkr.hcl
+
+      - name: Verify SSM Parameter
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          DID_BUILD: ${{ steps.should-build.outputs.build }}
+        run: |
+          set -euo pipefail
+          SSM_PARAM="/${ENVIRONMENT}/nhp/server/ami-id"
+          AMI_ID=$(aws ssm get-parameter --name "$SSM_PARAM" --query 'Parameter.Value' --output text)
+
+          # Defence in depth: even though the packer post-processor parses
+          # the manifest itself, double-check here that the SSM value is a
+          # bare ami-* identifier and not a "region:ami-*" string.
+          if ! echo "$AMI_ID" | grep -Eq '^ami-[0-9a-f]+$'; then
+            echo "::error::SSM parameter $SSM_PARAM contains invalid AMI ID '$AMI_ID' (expected ami-XXXX)"
+            exit 1
+          fi
+
+          echo "AMI ID: $AMI_ID"
+          {
+            echo "## Packer Build (${ENVIRONMENT})"
+            echo "AMI: \`${AMI_ID}\`"
+            echo "Built on this run: ${DID_BUILD}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ============================================================================
   # TEST - Runs after terraform validation/plan passes (or is skipped)
@@ -573,6 +786,19 @@ jobs:
           TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
           TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
           TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
+          # PR validation uses a dummy server AMI ID so terraform plan does
+          # not depend on the real SSM parameter (which is populated by the
+          # packer-build job on main, not in PRs). This lets PRs validate
+          # terraform config without requiring packer-built AMIs.
+          #
+          # This is the ONLY place this dummy value lives. It must NEVER reach
+          # apply against a real environment. The structural safeguards that
+          # ensure this — and the deliberate absence of a variable validation
+          # block (which would self-defeat at plan time) — are documented at
+          # terraform/modules/compute/variables.tf::server_ami_id. Read that
+          # comment before adding any other path that passes
+          # TF_VAR_server_ami_id.
+          TF_VAR_server_ami_id: "ami-0000000000000abcd"
         run: |
           set -o pipefail
           terraform plan -no-color 2>&1 | tee plan.txt
@@ -623,10 +849,11 @@ jobs:
   # ============================================================================
   terraform-plan:
     name: Terraform Pre-Deploy Checks (${{ matrix.environment }})
-    needs: [setup, terraform-validate]  # Validate must pass (or be skipped) before plan
+    needs: [setup, terraform-validate, packer-build]  # Validate and Packer must pass (or be skipped) before plan
     if: |
       always() &&
       (needs.terraform-validate.result == 'success' || needs.terraform-validate.result == 'skipped') &&
+      (needs.packer-build.result == 'success' || needs.packer-build.result == 'skipped') &&
       github.event_name != 'pull_request' &&
       (
         (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
@@ -887,11 +1114,15 @@ jobs:
           # SSM and read at boot, not baked into the launch template. When the
           # image tag changes, the launch template stays the same, so
           # SkipMatching would incorrectly skip replacement.
+          # Docker is pre-baked into the server AMI (see packer/nhp-server-docker.pkr.hcl),
+          # so instance warmup drops from ~180s (apt-get install Docker + AWS CLI) to
+          # ~60s (boot + user_data + ECR pull). Matches health_check_grace_period=90s
+          # in terraform/modules/compute/main.tf.
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "$ASG_NAME" \
             --preferences '{
               "MinHealthyPercentage": 90,
-              "InstanceWarmup": 180,
+              "InstanceWarmup": 60,
               "MaxHealthyPercentage": 110,
               "SkipMatching": false
             }' \
@@ -901,13 +1132,19 @@ jobs:
           echo "Instance Refresh ID: $REFRESH_ID"
 
           # Wait for instance refresh with health check.
-          # 90 iterations × 10s = 15 min. MinHealthyPercentage=90% forces sequential
-          # replacement (1 at a time), each needing 180s warmup = ~10-12 min for 3 instances.
+          # 45 iterations × 10s = 7.5 min. MinHealthyPercentage=90% forces sequential
+          # replacement (1 at a time), each needing 60s warmup = ~3-4 min for 3 instances.
+          # 7.5 min gives ~2x budget for slow ECR pulls or canary retries.
+          # NOTE: this is calibrated for the current min/max ASG capacity. If the
+          # max_capacity grows above ~5 instances (e.g. for a high-traffic event),
+          # the sequential 1-at-a-time replacement could exceed 7.5 min and the
+          # wait would time out even though the refresh is healthy. Bump the 45
+          # iterations or revisit the MinHealthyPercentage in that case.
           ./.github/scripts/wait-for-instance-refresh.sh \
             "$ASG_NAME" \
             "$REFRESH_ID" \
             "docker ps | grep nhp-server && systemctl is-active nhp-server" \
-            90
+            45
 
       - name: Push Deployment Metric
         run: |

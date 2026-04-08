@@ -484,12 +484,30 @@ Plugin repos (for Traefik plugins) are configured in `plugin_repos` variable.
 
 ### Packer Templates
 
-Packer templates build AMIs with plugins pre-installed:
+Packer templates build AMIs for NHP components:
 
 | Template | Purpose | Distribution |
 |----------|---------|--------------|
 | `nhp-ac.pkr.hcl` | AC with Traefik plugins | **AWS Marketplace** |
-| `nhp-server.pkr.hcl` | NHP Server | Internal only |
+| `nhp-server.pkr.hcl` | NHP Server (native binary) | Internal only |
+| `nhp-server-docker.pkr.hcl` | NHP Server (Docker runtime) | **Required for Terraform** |
+
+**NHP Server Docker AMI (Required):**
+
+Terraform-managed infrastructure requires the Docker-optimized AMI. Without it,
+Terraform fails at plan time — there is no fallback to vanilla Ubuntu.
+
+```bash
+# Build and publish AMI (one-time setup per environment)
+cd packer
+packer init nhp-server-docker.pkr.hcl
+AWS_PROFILE=layerv packer build -var 'environment=sandbox' nhp-server-docker.pkr.hcl
+```
+
+The AMI ID is automatically published to SSM Parameter Store
+(`/{env}/nhp/server/ami-id`). Terraform reads from this parameter.
+
+**AC AMI for Marketplace:**
 
 ```bash
 # Build AC AMI for Marketplace

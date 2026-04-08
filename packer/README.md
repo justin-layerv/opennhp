@@ -4,10 +4,154 @@ This directory contains Packer templates for building NHP AMIs.
 
 ## AMI Types
 
-| AMI | Purpose | Distribution |
-|-----|---------|--------------|
-| **NHP AC** | Access Controller with Traefik | **AWS Marketplace** + internal |
-| **NHP Server** | NHP Server (internal only) | Internal use only |
+| AMI | Purpose | Distribution | Startup Time |
+|-----|---------|--------------|--------------|
+| **NHP AC** | Access Controller with Traefik | **AWS Marketplace** + internal | ~30s |
+| **NHP Server** | NHP Server (native binary) | Internal use only | ~30s |
+| **NHP Server Docker** | NHP Server (Docker runtime) | Internal use only | ~30s |
+
+### NHP Server Docker AMI (Required for Terraform)
+
+The `nhp-server-docker.pkr.hcl` template builds an AMI optimized for the
+Terraform-managed infrastructure which uses Docker to run NHP Server. This
+AMI pre-installs:
+
+- Docker (docker.io)
+- AWS CLI v2
+- jq, curl, unzip
+- DNS configuration for Go's pure resolver
+
+**Without this AMI**: Terraform fails at plan time (no fallback to vanilla Ubuntu)
+**With this AMI**: Instance startup takes ~30 seconds
+
+```bash
+# Build Docker-optimized AMI (one-time setup per environment)
+cd packer
+packer init nhp-server-docker.pkr.hcl
+
+# For sandbox
+AWS_PROFILE=layerv packer build -var 'environment=sandbox' nhp-server-docker.pkr.hcl
+
+# For prod
+AWS_PROFILE=layerv-mgmt packer build -var 'environment=prod' nhp-server-docker.pkr.hcl
+```
+
+After building, the AMI ID is automatically published to SSM Parameter Store:
+- Sandbox: `/sandbox/nhp/server/ami-id`
+- Prod: `/prod/nhp/server/ami-id`
+
+These names align with the existing `/${env}/nhp/server/*` convention used by
+sibling parameters (`image-tag`, `asg-name`, `active-color`, ...). Terraform
+reads from this SSM parameter — no manual steps required.
+
+### First-time bootstrap (and emergency recovery)
+
+Sandbox and prod live in **separate AWS accounts** (sandbox: `layerv` profile,
+prod: `layerv-mgmt` profile), so each account has its own AMI and its own
+SSM parameter. AMIs are not automatically copied across accounts. Both
+accounts use the **us-east-2** region (matches `terraform/variables.tf`,
+`terraform/environments/{sandbox,prod}/terraform.tfvars`, and the workflow
+`AWS_REGION:` env var in `.github/workflows/build-and-push.yml`).
+
+The CI workflow (`.github/workflows/build-and-push.yml::packer-build`)
+handles steady-state builds: when packer files change on `main`, CI builds a
+new AMI in the target account and publishes the ID to SSM. The
+`promote-to-prod` workflow refuses to deploy if `/prod/nhp/server/ami-id`
+is missing — by design, since the compute module has no fallback to vanilla
+Ubuntu.
+
+You only need this section in two situations:
+
+1. **First-ever deploy to a new environment** (the SSM parameter has never
+   been populated and CI hasn't run a packer build yet for that env).
+2. **Emergency recovery** (the SSM parameter was deleted, or the AMI it
+   points to was deregistered, and you need to rebuild before the next
+   scheduled CI run).
+
+There are two paths. **Strongly prefer Option A.** Option B (cross-account
+AMI copy) involves a four-step IAM/snapshot/copy/wait dance that hits
+KMS-grant edge cases, and a wrong step leaves a half-shared snapshot
+behind. Only fall back to Option B if you genuinely cannot get
+packer-build credentials for the target account (e.g. it's blocked by an
+organization policy you can't temporarily lift).
+
+#### Option A — Build in the target account directly (strongly preferred)
+
+Easiest if you have packer-build credentials for the target account.
+
+```bash
+# Sandbox bootstrap
+cd packer
+packer init nhp-server-docker.pkr.hcl
+AWS_PROFILE=layerv packer build -var 'environment=sandbox' nhp-server-docker.pkr.hcl
+# The shell-local post-processor publishes the AMI ID to
+# /sandbox/nhp/server/ami-id automatically.
+
+# Prod bootstrap
+AWS_PROFILE=layerv-mgmt packer build -var 'environment=prod' nhp-server-docker.pkr.hcl
+# Publishes to /prod/nhp/server/ami-id.
+```
+
+This produces a freshly-built AMI in the target account and publishes the ID
+to that account's SSM parameter in one step. No cross-account copy needed.
+
+#### Option B — Copy an existing sandbox AMI into prod
+
+Useful if sandbox already has a known-good AMI and you want to mirror it
+into prod without re-running packer.
+
+```bash
+# 1. Read the sandbox AMI ID
+AWS_PROFILE=layerv aws ssm get-parameter \
+  --name /sandbox/nhp/server/ami-id --query 'Parameter.Value' --output text
+# → ami-0123456789abcdef0  (example)
+
+# 2. Share the snapshot from sandbox to prod
+SANDBOX_AMI=ami-0123456789abcdef0
+PROD_ACCOUNT=<prod-account-id>
+AWS_PROFILE=layerv aws ec2 modify-image-attribute \
+  --image-id "$SANDBOX_AMI" \
+  --launch-permission "Add=[{UserId=$PROD_ACCOUNT}]"
+# Also share the underlying snapshot (required for copy):
+SNAPSHOT_ID=$(AWS_PROFILE=layerv aws ec2 describe-images --image-ids "$SANDBOX_AMI" \
+  --query 'Images[0].BlockDeviceMappings[0].Ebs.SnapshotId' --output text)
+AWS_PROFILE=layerv aws ec2 modify-snapshot-attribute \
+  --snapshot-id "$SNAPSHOT_ID" \
+  --create-volume-permission "Add=[{UserId=$PROD_ACCOUNT}]"
+
+# 3. Copy the AMI into the prod account (run with prod credentials).
+# Region matches the rest of the deployment — see workflow AWS_REGION env var.
+PROD_AMI=$(AWS_PROFILE=layerv-mgmt aws ec2 copy-image \
+  --source-image-id "$SANDBOX_AMI" \
+  --source-region us-east-2 \
+  --region us-east-2 \
+  --name "nhp-server-docker-bootstrap-$(date +%Y%m%d%H%M%S)" \
+  --encrypted \
+  --query 'ImageId' --output text)
+
+# 4. Wait for the copy to become available, then publish to SSM
+AWS_PROFILE=layerv-mgmt aws ec2 wait image-available --image-ids "$PROD_AMI"
+AWS_PROFILE=layerv-mgmt aws ssm put-parameter \
+  --name /prod/nhp/server/ami-id \
+  --value "$PROD_AMI" --type String --overwrite
+```
+
+After either option, re-run the failing workflow (`promote-to-prod` or
+`terraform plan`). It will now find the SSM parameter and proceed.
+
+#### What CI does on a normal build
+
+For reference, the CI packer-build job is roughly:
+
+1. Detect if `packer/**` files changed on `main` (or if SSM parameter is missing).
+2. Run `packer build` in the target account using OIDC credentials.
+3. The Packer template's shell-local post-processor publishes the resulting
+   AMI ID to `/<env>/nhp/server/ami-id`.
+4. The terraform-plan job waits for packer-build to complete before reading
+   the SSM parameter.
+
+You should never need to run the bootstrap procedure under normal operation —
+if you do, file an issue so we can understand why CI didn't handle it.
 
 ## Use Cases
 

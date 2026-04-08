@@ -284,6 +284,7 @@ module "compute" {
 
   environment         = var.environment
   cell_id             = var.cell_id
+  server_ami_id       = var.server_ami_id
   domain_name         = var.domain_name
   multi_tenant        = var.multi_tenant
   min_capacity        = var.min_capacity
