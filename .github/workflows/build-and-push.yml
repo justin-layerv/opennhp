@@ -345,8 +345,39 @@ jobs:
             exit 1
           fi
 
+          # Check 4 — the Packer runner version (the one setup-packer
+          # downloads, e.g. "1.14.4") actually exists as a release on
+          # hashicorp/packer. The previous round shipped a pin to "1.14.4"
+          # which doesn't exist; setup-packer accepted the version string
+          # at config time and only failed at install time with
+          # "No matching version found". This check catches that failure
+          # mode at the verifier step instead.
+          if ! gh api "repos/hashicorp/packer/releases/tags/v${WORKFLOW_PIN}" --silent 2>/tmp/gh-err-pkv; then
+            echo "::error::Pinned Packer runner version 'v${WORKFLOW_PIN}' does not exist as a release on hashicorp/packer. Look up valid versions via:"
+            echo "::error::  gh api repos/hashicorp/packer/releases --paginate -q '.[] | select(.draft == false and .prerelease == false) | .tag_name' | head"
+            cat /tmp/gh-err-pkv >&2 || true
+            exit 1
+          fi
+
+          # Check 5 — the actual download binary at releases.hashicorp.com
+          # is reachable. Check 4 confirms the GitHub release exists, but
+          # setup-packer downloads from releases.hashicorp.com, NOT from
+          # GitHub. The two are usually atomic in HashiCorp's release
+          # process but they could diverge — a GitHub release tag could
+          # be created before the binary upload finishes, or the binary
+          # URL pattern could change. This probe closes that gap by
+          # actually HEAD-ing the download URL setup-packer will use.
+          # `curl -fsI` returns non-zero on any HTTP error (curl exit 22
+          # for 4xx, exit 56 for 404 specifically).
+          PACKER_URL="https://releases.hashicorp.com/packer/${WORKFLOW_PIN}/packer_${WORKFLOW_PIN}_linux_amd64.zip"
+          if ! curl -fsI "$PACKER_URL" >/dev/null 2>&1; then
+            echo "::error::Packer release v${WORKFLOW_PIN} is not downloadable from $PACKER_URL"
+            echo "::error::The release exists on GitHub (Check 4 passed) but the binary is missing from releases.hashicorp.com. This is rare but happens if a release tag is created before the binary upload completes. Wait a few minutes and retry, or pick a different version."
+            exit 1
+          fi
+
           echo "Packer pin integrity OK:"
-          echo "  workflow pin = $WORKFLOW_PIN"
+          echo "  workflow pin = $WORKFLOW_PIN (release exists, binary downloadable)"
           echo "  plugin constraint pinned in pkr.hcl"
           echo "  setup-packer SHA $ACTION_SHA resolves on $ACTION_REPO"
 
@@ -359,9 +390,15 @@ jobs:
           # when upgrading (coordinate with packer/nhp-server-docker.pkr.hcl
           # required_plugins). The "Verify Packer pin integrity" step
           # above asserts the runner Packer version is still pinned (not
-          # "latest"), the template plugin pin is still present, AND the
+          # "latest"), the version actually exists as a hashicorp/packer
+          # release, the template plugin pin is still present, AND the
           # setup-packer action SHA actually resolves on GitHub.
-          version: 1.14.4
+          #
+          # When bumping: the bump procedure is documented at
+          # packer/nhp-server-docker.pkr.hcl::"Pin the Amazon plugin..."
+          # and includes verifying the new release exists via:
+          #   gh api repos/hashicorp/packer/releases/tags/v<NEW> -q .tag_name
+          version: 1.15.1
 
       - name: Packer Init
         if: steps.should-build.outputs.build == 'true'
