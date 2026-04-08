@@ -918,7 +918,7 @@ jobs:
   # DEPLOY SANDBOX - Split into parallel jobs for faster deploys
   # ============================================================================
   # Job dependency graph:
-  #   deploy-sandbox-infra → deploy-sandbox-server → deploy-sandbox-ac → deploy-sandbox-validate
+  #   deploy-sandbox-infra → deploy-sandbox-blue-green → deploy-sandbox-validate
   # ============================================================================
 
   deploy-sandbox-infra:
@@ -1079,155 +1079,51 @@ jobs:
             echo "etcd_endpoint=$(terraform output -raw etcd_endpoint 2>/dev/null || echo '')"
           } >> "$GITHUB_OUTPUT"
 
-  deploy-sandbox-server:
-    name: Deploy Sandbox - NHP Server
-    needs: [deploy-sandbox-infra]
+  # Dispatch blue/green deployment instead of doing direct instance refresh.
+  # This ensures every CI deploy alternates between blue and green ASGs,
+  # includes the knock-readiness gate, and uses instant NLB listener
+  # switching instead of rolling replacement. The actual dispatch + poll
+  # logic lives in .github/scripts/dispatch-and-poll-blue-green.sh so it
+  # is shared with ensure-sandbox-deployed.sh (scheduled-release path).
+  deploy-sandbox-blue-green:
+    name: Deploy Sandbox - Blue/Green
+    needs: [setup, deploy-sandbox-infra]
     if: always() && needs.deploy-sandbox-infra.result == 'success' && needs.deploy-sandbox-infra.outputs.server_asg != ''
     runs-on: ubuntu-latest
     environment: sandbox
-    timeout-minutes: 25
+    # Job timeout = poll timeout (40m) + 5min buffer so the dispatch script
+    # has room to print its final error before GitHub kills the job.
+    timeout-minutes: 45
     concurrency:
-      group: deploy-sandbox-server
+      group: deploy-sandbox-blue-green
       cancel-in-progress: true
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Configure AWS credentials
-        uses: ./.github/actions/setup-deploy
-        with:
-          aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Instance Refresh - NHP Server
+      - name: Dispatch Blue/Green Deploy
         env:
-          ASG_NAME: ${{ needs.deploy-sandbox-infra.outputs.server_asg }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
+          # Poll budget MUST be lower than the job timeout above so the
+          # script can exit cleanly with an error message before GitHub
+          # kills the runner. 2400s (40m) leaves a 5min buffer under
+          # timeout-minutes: 45.
+          POLL_TIMEOUT: "2400"
         run: |
           echo "============================================"
-          echo "INSTANCE REFRESH - NHP Server"
+          echo "DISPATCHING BLUE/GREEN DEPLOYMENT"
           echo "============================================"
-
-          # Cancel any existing instance refresh from previous failed/cancelled runs
-          ./.github/scripts/cancel-existing-refresh.sh "$ASG_NAME"
-
-          # SkipMatching must be false because the Docker image tag is stored in
-          # SSM and read at boot, not baked into the launch template. When the
-          # image tag changes, the launch template stays the same, so
-          # SkipMatching would incorrectly skip replacement.
-          # Docker is pre-baked into the server AMI (see packer/nhp-server-docker.pkr.hcl),
-          # so instance warmup drops from ~180s (apt-get install Docker + AWS CLI) to
-          # ~60s (boot + user_data + ECR pull). Matches health_check_grace_period=90s
-          # in terraform/modules/compute/main.tf.
-          REFRESH_ID=$(aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name "$ASG_NAME" \
-            --preferences '{
-              "MinHealthyPercentage": 90,
-              "InstanceWarmup": 60,
-              "MaxHealthyPercentage": 110,
-              "SkipMatching": false
-            }' \
-            --query "InstanceRefreshId" \
-            --output text)
-
-          echo "Instance Refresh ID: $REFRESH_ID"
-
-          # Wait for instance refresh with health check.
-          # 45 iterations × 10s = 7.5 min. MinHealthyPercentage=90% forces sequential
-          # replacement (1 at a time), each needing 60s warmup = ~3-4 min for 3 instances.
-          # 7.5 min gives ~2x budget for slow ECR pulls or canary retries.
-          # NOTE: this is calibrated for the current min/max ASG capacity. If the
-          # max_capacity grows above ~5 instances (e.g. for a high-traffic event),
-          # the sequential 1-at-a-time replacement could exceed 7.5 min and the
-          # wait would time out even though the refresh is healthy. Bump the 45
-          # iterations or revisit the MinHealthyPercentage in that case.
-          ./.github/scripts/wait-for-instance-refresh.sh \
-            "$ASG_NAME" \
-            "$REFRESH_ID" \
-            "docker ps | grep nhp-server && systemctl is-active nhp-server" \
-            45
-
-      - name: Push Deployment Metric
-        run: |
-          aws cloudwatch put-metric-data \
-            --namespace "LayerV/NHP" \
-            --metric-name "DeploymentEvent" \
-            --dimensions "Environment=sandbox,Component=server,Strategy=instance-refresh" \
-            --value 1 \
-            --unit Count
-          echo "Deployment event pushed to LayerV/NHP namespace"
-
-  deploy-sandbox-ac:
-    name: Deploy Sandbox - AC
-    needs: [deploy-sandbox-server, deploy-sandbox-infra]
-    if: always() && needs.deploy-sandbox-server.result == 'success' && needs.deploy-sandbox-infra.outputs.ac_asg != ''
-    runs-on: ubuntu-latest
-    environment: sandbox
-    timeout-minutes: 15
-    concurrency:
-      group: deploy-sandbox-ac
-      cancel-in-progress: true
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Configure AWS credentials
-        uses: ./.github/actions/setup-deploy
-        with:
-          aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Instance Refresh - AC
-        env:
-          ASG_NAME: ${{ needs.deploy-sandbox-infra.outputs.ac_asg }}
-        run: |
-          echo "============================================"
-          echo "INSTANCE REFRESH - Access Controller"
-          echo "============================================"
-
-          # Cancel any existing instance refresh from previous failed/cancelled runs
-          ./.github/scripts/cancel-existing-refresh.sh "$ASG_NAME"
-
-          # SkipMatching must be false because the Docker image tag is stored in
-          # SSM and read at boot, not baked into the launch template. When the
-          # image tag changes, the launch template stays the same, so
-          # SkipMatching would incorrectly skip replacement.
-          REFRESH_ID=$(aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name "$ASG_NAME" \
-            --preferences '{
-              "MinHealthyPercentage": 50,
-              "InstanceWarmup": 180,
-              "MaxHealthyPercentage": 110,
-              "SkipMatching": false
-            }' \
-            --query "InstanceRefreshId" \
-            --output text)
-
-          echo "Instance Refresh ID: $REFRESH_ID"
-
-          # Wait for instance refresh with health check
-          ./.github/scripts/wait-for-instance-refresh.sh \
-            "$ASG_NAME" \
-            "$REFRESH_ID" \
-            "systemctl is-active traefik nhp-acd"
-
-      - name: Push Deployment Metric
-        run: |
-          aws cloudwatch put-metric-data \
-            --namespace "LayerV/NHP" \
-            --metric-name "DeploymentEvent" \
-            --dimensions "Environment=sandbox,Component=ac,Strategy=instance-refresh" \
-            --value 1 \
-            --unit Count
-          echo "Deployment event pushed to LayerV/NHP namespace"
+          ./.github/scripts/dispatch-and-poll-blue-green.sh sandbox both "$IMAGE_TAG"
 
   deploy-sandbox-validate:
     name: Deploy Sandbox - Validate
-    needs: [setup, deploy-sandbox-infra, deploy-sandbox-server, deploy-sandbox-ac]
+    needs: [setup, deploy-sandbox-infra, deploy-sandbox-blue-green]
     if: |
       always() &&
       needs.deploy-sandbox-infra.result == 'success' &&
-      needs.deploy-sandbox-server.result == 'success' &&
-      (needs.deploy-sandbox-ac.result == 'success' || needs.deploy-sandbox-ac.result == 'skipped')
+      needs.deploy-sandbox-blue-green.result == 'success'
     runs-on: ubuntu-latest
     environment: sandbox
     timeout-minutes: 10
@@ -1332,28 +1228,14 @@ jobs:
           }
 
       - name: Deployment Summary
-        env:
-          AC_RESULT: ${{ needs.deploy-sandbox-ac.result }}
         run: |
-          # Map job result to friendly status
-          friendly_status() {
-            case "$1" in
-              success) echo "Deployed ✓" ;;
-              failure) echo "Failed ✗" ;;
-              skipped) echo "Skipped" ;;
-              cancelled) echo "Cancelled" ;;
-              *) echo "$1" ;;
-            esac
-          }
-
           {
             echo "## Sandbox Deployment Complete"
             echo ""
             echo "### Infrastructure"
-            echo "| Component | ASG | Status |"
-            echo "|-----------|-----|--------|"
-            echo "| NHP Server | ${{ needs.deploy-sandbox-infra.outputs.server_asg }} | Deployed ✓ |"
-            echo "| AC | ${{ needs.deploy-sandbox-infra.outputs.ac_asg }} | $(friendly_status "$AC_RESULT") |"
+            echo "| Component | Strategy | Status |"
+            echo "|-----------|----------|--------|"
+            echo "| Server + AC | Blue/Green | Deployed ✓ |"
             echo ""
             echo "### Endpoints"
             echo "- **NHP NLB:** \`${{ needs.deploy-sandbox-infra.outputs.nlb_dns }}\`"
@@ -1398,8 +1280,7 @@ jobs:
       - build
       # Sandbox deploy jobs
       - deploy-sandbox-infra
-      - deploy-sandbox-server
-      - deploy-sandbox-ac
+      - deploy-sandbox-blue-green
       - deploy-sandbox-validate
     if: always() && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -1414,8 +1295,7 @@ jobs:
           BUILD_RESULT: ${{ needs.build.result }}
           # Sandbox deploy components
           SANDBOX_INFRA: ${{ needs.deploy-sandbox-infra.result }}
-          SANDBOX_SERVER: ${{ needs.deploy-sandbox-server.result }}
-          SANDBOX_AC: ${{ needs.deploy-sandbox-ac.result }}
+          SANDBOX_BLUE_GREEN: ${{ needs.deploy-sandbox-blue-green.result }}
           SANDBOX_VALIDATE: ${{ needs.deploy-sandbox-validate.result }}
           # Metadata
           IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
@@ -1486,14 +1366,14 @@ jobs:
           # Build component status strings with visual pipeline
           SANDBOX_STATUS=""
           if [[ "$SANDBOX_DEPLOYED" == "true" ]]; then
-            SANDBOX_STATUS="$(status_emoji "$SANDBOX_INFRA") Infra → $(status_emoji "$SANDBOX_SERVER") Server → $(status_emoji "$SANDBOX_AC") AC → $(status_emoji "$SANDBOX_VALIDATE") Validate"
+            SANDBOX_STATUS="$(status_emoji "$SANDBOX_INFRA") Infra → $(status_emoji "$SANDBOX_BLUE_GREEN") Blue/Green → $(status_emoji "$SANDBOX_VALIDATE") Validate"
           fi
 
           # Determine overall status and header
           if [[ "$BUILD_RESULT" == "success" ]]; then
             # Check for any deploy or validation failures
             DEPLOY_FAILED="false"
-            for result in "$SANDBOX_INFRA" "$SANDBOX_SERVER" "$SANDBOX_AC" "$SANDBOX_VALIDATE"; do
+            for result in "$SANDBOX_INFRA" "$SANDBOX_BLUE_GREEN" "$SANDBOX_VALIDATE"; do
               if [[ "$result" == "failure" ]]; then
                 DEPLOY_FAILED="true"
                 break

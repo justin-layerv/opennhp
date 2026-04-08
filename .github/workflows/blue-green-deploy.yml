@@ -814,6 +814,156 @@ jobs:
             exit 1
           fi
 
+      # Knock-readiness gate: verify EVERY active server instance reports
+      # AC peers connected before switching traffic. During blue/green AC
+      # deploy, new AC instances must establish NHP UDP connections to the
+      # server. NLB target health only checks TCP — it doesn't verify the
+      # NHP UDP registration. Without this gate, traffic can switch to new
+      # ACs before some servers have knocked them, causing
+      # "failed to find ac connection" errors for QURL resolve requests
+      # routed to those servers.
+      #
+      # We require ALL InService instances in the active server ASG to
+      # report healthy because the NLB will round-robin to all of them; if
+      # even one server lacks AC peers, requests routed there will fail.
+      - name: "[Server] Verify Knock Readiness (AC Peers Connected)"
+        if: needs.prepare.outputs.deploy_ac == 'true' && inputs.dry_run != true
+        env:
+          SERVER_ACTIVE_ASG: ${{ needs.prepare.outputs.server_active_asg }}
+          HEALTH_CHECK_TIMEOUT_MINUTES: ${{ inputs.health_check_timeout_minutes }}
+        run: |
+          set -euo pipefail
+          echo "Verifying ALL active server instances see AC peers before switching traffic..."
+
+          # Pull the full set of InService instances; we need quorum, not
+          # the first one we find. Sorting by instance id keeps log order
+          # stable across re-runs. The `grep -v '^$'` is required because
+          # AWS CLI emits a single empty line when the query returns no
+          # results — without the filter, mapfile creates a 1-element
+          # array containing "" and the count check below would pass with
+          # an invalid instance id.
+          mapfile -t INSTANCE_IDS < <(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$SERVER_ACTIVE_ASG" \
+            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService'].InstanceId" \
+            --output text | tr '\t' '\n' | grep -v '^$' | sort)
+
+          if [[ ${#INSTANCE_IDS[@]} -eq 0 ]]; then
+            echo "::error::No InService server instances found in ASG $SERVER_ACTIVE_ASG"
+            exit 1
+          fi
+          echo "Checking knock readiness on ${#INSTANCE_IDS[@]} server instance(s): ${INSTANCE_IDS[*]}"
+
+          # check_one INSTANCE_ID → echoes "ready" / "not_ready" / "ssm_failed"
+          check_one() {
+            local instance_id="$1"
+            local cmd_id status output
+
+            # --timeout-seconds 15 ensures the SSM command does not linger
+            # in the account command history if the instance is unreachable;
+            # combined with the 15s wait loop below, the worst-case latency
+            # per check is ~15s.
+            cmd_id=$(aws ssm send-command \
+              --instance-ids "$instance_id" \
+              --document-name "AWS-RunShellScript" \
+              --timeout-seconds 15 \
+              --parameters 'commands=["docker exec nhp-server wget -q -O - http://localhost:8888/health/knock-ready 2>/dev/null || echo KNOCK_NOT_READY"]' \
+              --query "Command.CommandId" --output text 2>/dev/null) || {
+              echo "ssm_failed"
+              return
+            }
+
+            # Wait up to 15s for SSM command completion. Treat any
+            # terminal SSM status (Success, Failed, TimedOut, Cancelled)
+            # as "stop polling" so we don't burn the full 15s window
+            # waiting on a command that has already given up.
+            sleep 3
+            for _ in 1 2 3 4; do
+              status=$(aws ssm get-command-invocation \
+                --command-id "$cmd_id" --instance-id "$instance_id" \
+                --query "Status" --output text 2>/dev/null) || status="Pending"
+              if [[ "$status" == "Success" || "$status" == "Failed" || "$status" == "TimedOut" || "$status" == "Cancelled" ]]; then
+                break
+              fi
+              sleep 3
+            done
+
+            if [[ "$status" != "Success" ]]; then
+              echo "ssm_failed"
+              return
+            fi
+
+            output=$(aws ssm get-command-invocation \
+              --command-id "$cmd_id" --instance-id "$instance_id" \
+              --query "StandardOutputContent" --output text 2>/dev/null) || output=""
+
+            # Fast path: server emits KNOCK_NOT_READY when the wget call
+            # fails (container not up, port not bound, etc.) so we can
+            # short-circuit without spawning jq.
+            if [[ "$output" == *"KNOCK_NOT_READY"* ]]; then
+              echo "not_ready"
+              return
+            fi
+
+            # Use jq to parse the ReadinessResponse JSON in a single pass.
+            # This is robust to field ordering and (unlike a regex) won't
+            # break if a future CheckResult gains nested objects in the
+            # Message field. Output is "<status>|<message>" so we can
+            # split it with bash parameter expansion below.
+            local parsed body_status ac_msg
+            parsed=$(echo "$output" | jq -r '"\(.status // "")|\(.checks.ac_peers.message // "no message")"' 2>/dev/null) || parsed=""
+            if [[ -z "$parsed" ]]; then
+              echo "not_ready"
+              return
+            fi
+            body_status="${parsed%%|*}"
+            ac_msg="${parsed#*|}"
+            if [[ "$body_status" == "healthy" ]]; then
+              echo "ready ${ac_msg}"
+              return
+            fi
+            echo "not_ready ${ac_msg}"
+          }
+
+          DEADLINE=$(($(date +%s) + HEALTH_CHECK_TIMEOUT_MINUTES * 60))
+          ITERATION=0
+          while [[ $(date +%s) -lt $DEADLINE ]]; do
+            ITERATION=$((ITERATION + 1))
+            REMAINING=$(( (DEADLINE - $(date +%s)) / 60 ))
+
+            ALL_READY=true
+            for inst in "${INSTANCE_IDS[@]}"; do
+              result=$(check_one "$inst")
+              kind="${result%% *}"
+              detail="${result#* }"
+              [[ "$kind" == "$detail" ]] && detail=""
+              case "$kind" in
+                ready)
+                  echo "[knock-ready] [iter $ITERATION, ${REMAINING}m left] $inst: ready ($detail)"
+                  ;;
+                not_ready)
+                  echo "[knock-ready] [iter $ITERATION, ${REMAINING}m left] $inst: not yet ($detail)"
+                  ALL_READY=false
+                  ;;
+                ssm_failed)
+                  echo "[knock-ready] [iter $ITERATION, ${REMAINING}m left] $inst: SSM unreachable, retrying"
+                  ALL_READY=false
+                  ;;
+                *)
+                  echo "[knock-ready] [iter $ITERATION, ${REMAINING}m left] $inst: unknown result '$result'"
+                  ALL_READY=false
+                  ;;
+              esac
+            done
+
+            if [[ "$ALL_READY" == "true" ]]; then
+              echo "[knock-ready] All ${#INSTANCE_IDS[@]} server instance(s) report AC peers connected — proceeding"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::[knock-ready] Not all server instances reported AC peers connected after ${HEALTH_CHECK_TIMEOUT_MINUTES} minutes"
+          exit 1
+
       - name: "[Server] Dry Run Notice"
         if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run == true
         run: |
@@ -825,6 +975,7 @@ jobs:
         run: |
           echo "[DRY RUN] [AC] Would start instance refresh and wait for completion"
           echo "[DRY RUN] [AC] Would verify target group health"
+          echo "[DRY RUN] [AC] Would verify server knock readiness (AC peers connected)"
 
   # =============================================================================
   # SWITCH TRAFFIC - Modify NLB listeners (instant, <1 second)

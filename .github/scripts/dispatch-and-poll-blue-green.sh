@@ -1,0 +1,175 @@
+#!/bin/bash
+# Dispatch a blue-green-deploy workflow and poll until completion.
+#
+# Mirrors dispatch-and-poll-canary.sh, but for the blue-green-deploy.yml
+# workflow. Centralises the dispatch + find-triggered-run + poll logic so
+# build-and-push.yml (sandbox) and ensure-sandbox-deployed.sh (manual /
+# scheduled-release) share a single implementation, instead of two near-
+# identical inline copies that drift over time.
+#
+# Usage: dispatch-and-poll-blue-green.sh <environment> <component> <image-tag>
+#
+# Required Environment Variables:
+#   GH_TOKEN or GITHUB_TOKEN: GitHub token for workflow dispatch
+#   GITHUB_REPOSITORY:        Owner/repo (e.g., layervai/nhp)
+#   GITHUB_OUTPUT:            GitHub Actions output file (optional; ignored if unset)
+#
+# Optional Environment Variables:
+#   POLL_TIMEOUT:             Total seconds to poll for completion (default 2400 = 40 min)
+#   POLL_INTERVAL:            Seconds between status polls (default 30)
+#   FIND_RETRIES:             How many ~10s attempts to find the dispatched run
+#                             (default 6 → 60s window)
+#
+# Outputs (via GITHUB_OUTPUT, when set):
+#   run_id:   Numeric run ID of the dispatched workflow
+#   run_url:  Web URL of the dispatched workflow run
+#
+# Exit codes:
+#   0 - Blue/green deploy succeeded
+#   1 - Blue/green deploy failed, timed out, or could not be found
+
+set -euo pipefail
+
+if [[ $# -lt 3 ]]; then
+  echo "Usage: $0 <environment> <component> <image-tag>" >&2
+  echo "  environment:  sandbox | prod" >&2
+  echo "  component:    server | ac | both" >&2
+  echo "  image-tag:    Docker image tag (commit SHA)" >&2
+  exit 1
+fi
+
+ENVIRONMENT="$1"
+COMPONENT="$2"
+IMAGE_TAG="$3"
+
+POLL_INTERVAL="${POLL_INTERVAL:-30}"
+POLL_TIMEOUT="${POLL_TIMEOUT:-2400}"  # 40 min default
+FIND_RETRIES="${FIND_RETRIES:-6}"
+
+if [[ -z "${GITHUB_REPOSITORY:-}" ]]; then
+  echo "::error::GITHUB_REPOSITORY must be set" >&2
+  exit 1
+fi
+
+echo "::notice::Dispatching blue/green deploy"
+echo "  environment: $ENVIRONMENT"
+echo "  component:   $COMPONENT"
+echo "  image_tag:   $IMAGE_TAG"
+echo "  timeout:     ${POLL_TIMEOUT}s"
+
+# --- Dispatch ---
+# Capture the dispatch time 10 seconds in the past so the createdAt filter
+# below tolerates clock skew between the runner and the GitHub API and the
+# sub-second window where a workflow can start within the same second as
+# the dispatch call. We'd rather over-include candidate runs (and let the
+# in_progress/queued/completed status filter narrow it down) than miss the
+# real run because of a few-millisecond race.
+DISPATCH_TIME=$(date -u -d '10 seconds ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+  || date -u -v-10S +%Y-%m-%dT%H:%M:%SZ)
+
+gh workflow run blue-green-deploy.yml \
+  --ref main \
+  -f environment="$ENVIRONMENT" \
+  -f component="$COMPONENT" \
+  -f action=deploy \
+  -f image_tag="$IMAGE_TAG"
+
+# --- Find triggered run ---
+echo "Waiting for blue-green-deploy run to appear..."
+RUN_ID=""
+for i in $(seq 1 "$FIND_RETRIES"); do
+  sleep 10
+  # Filter on createdAt >= DISPATCH_TIME and include `completed` so
+  # fast-failing workflows (input validation, missing perms) are not
+  # missed by a status filter that only sees in_progress/queued.
+  RUN_ID=$(gh run list \
+    --workflow blue-green-deploy.yml \
+    --json databaseId,createdAt,status \
+    --jq "[.[] | select(.createdAt >= \"$DISPATCH_TIME\") | select(.status == \"in_progress\" or .status == \"queued\" or .status == \"completed\")] | .[0].databaseId // empty" \
+    2>/dev/null || echo "")
+  if [[ -n "$RUN_ID" ]]; then
+    echo "Found run: $RUN_ID"
+    break
+  fi
+  echo "  Waiting for workflow run (attempt $i/$FIND_RETRIES)..."
+done
+
+if [[ -z "$RUN_ID" ]]; then
+  echo "::error::Could not find blue-green-deploy run after ${FIND_RETRIES} attempts" >&2
+  exit 1
+fi
+
+# Sanity check: RUN_ID must be numeric. The jq filter above is supposed to
+# return a databaseId (integer), but if the GitHub API ever returns
+# something unexpected we don't want to silently use it as a path argument
+# to `gh run view`.
+if ! [[ "$RUN_ID" =~ ^[0-9]+$ ]]; then
+  echo "::error::Got non-numeric run id from gh run list: '$RUN_ID'" >&2
+  exit 1
+fi
+
+RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID"
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+  {
+    echo "run_id=$RUN_ID"
+    echo "run_url=$RUN_URL"
+  } >> "$GITHUB_OUTPUT"
+fi
+echo "::notice::Blue/green deploy run: $RUN_URL"
+
+# --- Poll until completion ---
+echo "Polling blue/green deploy (run: $RUN_ID, timeout: ${POLL_TIMEOUT}s)..."
+ELAPSED=0
+LAST_STATUS=""
+LAST_ACTIVE_JOBS=""
+
+while [[ $ELAPSED -lt $POLL_TIMEOUT ]]; do
+  STATUS=$(gh run view "$RUN_ID" --json status --jq '.status' 2>/dev/null || echo "unknown")
+
+  if [[ "$STATUS" == "completed" ]]; then
+    CONCLUSION=$(gh run view "$RUN_ID" --json conclusion --jq '.conclusion' 2>/dev/null || echo "unknown")
+    if [[ "$CONCLUSION" == "success" ]]; then
+      echo "::notice::Blue/green deploy completed successfully"
+      exit 0
+    else
+      echo "::error::Blue/green deploy failed with conclusion: $CONCLUSION" >&2
+      echo "::error::Run URL: $RUN_URL" >&2
+      # Surface the failed job names so the operator can jump straight to
+      # the failing step in the dispatched workflow without having to open
+      # the run URL.
+      FAILED_JOBS=$(gh run view "$RUN_ID" --json jobs \
+        --jq '[.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out") | .name] | join(", ")' \
+        2>/dev/null || echo "")
+      if [[ -n "$FAILED_JOBS" ]]; then
+        echo "::error::Failed jobs: $FAILED_JOBS" >&2
+      fi
+      exit 1
+    fi
+  fi
+
+  # Only echo when status changes, to keep CI logs readable.
+  if [[ "$STATUS" != "$LAST_STATUS" ]]; then
+    REMAINING=$(( (POLL_TIMEOUT - ELAPSED) / 60 ))
+    echo "  Status: $STATUS (${REMAINING}m remaining)"
+    LAST_STATUS="$STATUS"
+  fi
+
+  # Job-level visibility: print which sub-jobs are currently in progress
+  # whenever that set changes. Mirrors dispatch-and-poll-canary.sh so
+  # operators tailing the log can see "we're in deploy-to-standby" rather
+  # than just "in_progress".
+  ACTIVE_JOBS=$(gh run view "$RUN_ID" --json jobs \
+    --jq '[.jobs[] | select(.status == "in_progress") | .name] | sort | join(", ")' \
+    2>/dev/null || echo "")
+  if [[ -n "$ACTIVE_JOBS" && "$ACTIVE_JOBS" != "$LAST_ACTIVE_JOBS" ]]; then
+    echo "    Active: $ACTIVE_JOBS"
+    LAST_ACTIVE_JOBS="$ACTIVE_JOBS"
+  fi
+
+  sleep "$POLL_INTERVAL"
+  ELAPSED=$((ELAPSED + POLL_INTERVAL))
+done
+
+echo "::error::Blue/green deploy timed out after ${POLL_TIMEOUT}s" >&2
+echo "::error::Run URL: $RUN_URL" >&2
+exit 1
