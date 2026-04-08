@@ -212,10 +212,23 @@ jobs:
       # builds are independent and a sandbox failure shouldn't block prod
       # bootstrap on the first merge.
       fail-fast: false
-      # Prerequisite: the AWS_PROD_ROLE_ARN GitHub Actions secret must be set
-      # to a role in the prod account that trusts this repo's OIDC issuer
-      # (configured in nhp Terraform). The conditional role-to-assume below
-      # picks AWS_PROD_ROLE_ARN for prod and AWS_ROLE_ARN for sandbox.
+      #
+      # IAM role prerequisites (one per environment):
+      #
+      #   AWS_PACKER_SANDBOX_ROLE_ARN — sandbox account, dedicated to this job
+      #   AWS_PACKER_PROD_ROLE_ARN    — prod account, dedicated to this job
+      #
+      # These roles are intentionally separate from the broader
+      # AWS_ROLE_ARN / AWS_PROD_ROLE_ARN that the rest of the workflow
+      # uses. They have only the amazon-ebs builder permissions plus a
+      # scoped ssm:PutParameter on /{env}/nhp/server/ami-id, defined in
+      # terraform/modules/ecr/packer.tf. See that file for the rationale
+      # on why packer-build is granted a separate role from the
+      # terraform-apply role.
+      #
+      # The Terraform output `github_actions_packer_role_arn` (in both
+      # terraform/environments/sandbox and terraform/environments/prod)
+      # exposes the ARN to put in the corresponding GitHub Actions secret.
     # AWS_REGION is inherited from the workflow-level `env:` block at the top
     # of this file (currently us-east-2). All AWS-touching steps in this job
     # — Configure AWS credentials, the Packer build itself, and the SSM
@@ -228,7 +241,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
         with:
-          role-to-assume: ${{ matrix.environment == 'prod' && secrets.AWS_PROD_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+          role-to-assume: ${{ matrix.environment == 'prod' && secrets.AWS_PACKER_PROD_ROLE_ARN || secrets.AWS_PACKER_SANDBOX_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Check if AMI already exists

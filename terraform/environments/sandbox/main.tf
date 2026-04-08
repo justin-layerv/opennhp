@@ -525,6 +525,11 @@ output "github_actions_role_arn" {
   value = module.nhp.github_actions_role_arn
 }
 
+output "github_actions_packer_role_arn" {
+  description = "ARN to put in GitHub Actions secret AWS_PACKER_SANDBOX_ROLE_ARN (see terraform/modules/ecr/packer.tf)."
+  value       = module.nhp.github_actions_packer_role_arn
+}
+
 output "etcd_endpoint" {
   value = module.nhp.etcd_endpoint
 }

@@ -490,6 +490,11 @@ output "github_actions_role_arn" {
   value       = module.nhp.github_actions_role_arn
 }
 
+output "github_actions_packer_role_arn" {
+  description = "Dedicated IAM role ARN for the build-and-push.yml::packer-build job. Store in GitHub Actions secret AWS_PACKER_PROD_ROLE_ARN."
+  value       = module.nhp.github_actions_packer_role_arn
+}
+
 output "etcd_endpoint" {
   description = "etcd cluster endpoint for NHP server config"
   value       = module.nhp.etcd_endpoint
