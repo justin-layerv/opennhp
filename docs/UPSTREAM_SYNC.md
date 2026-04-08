@@ -6,13 +6,13 @@ This document tracks the synchronization status between this fork (LayerV NHP) a
 
 | Field | Value |
 |-------|-------|
-| **Last reviewed upstream SHA** | 3344ab68 |
-| **Last review date** | 2026-01-23 |
+| **Last reviewed upstream SHA** | 7e71ebe8 |
+| **Last review date** | 2026-03-25 |
 | **Reviewer** | Claude Code |
 
 > **HOW TO USE:** When checking for updates, run:
 > ```bash
-> git log 3344ab68..upstream/main --oneline
+> git log 7e71ebe8..upstream/main --oneline
 > ```
 > This shows ONLY new commits since last review. Update the SHA after each review.
 
@@ -50,6 +50,23 @@ These are PERMANENTLY skipped. Don't waste time reviewing them:
 ---
 
 ## Sync History
+
+### 2026-03-25 - Iptables Security Fixes
+
+- **Reviewed up to:** 7e71ebe8
+- **Commits reviewed:** ~70 (non-merge)
+- **PRs created:** 1 (iptables security)
+- **Commits synced:** 3 (adapted, not cherry-picked due to fork Dockerfile differences)
+- **Summary:**
+  - ~25 Dependabot/dependency updates (auto-skipped)
+  - ~6 CI/GitHub Actions workflow changes (auto-skipped)
+  - ~4 GMSM dependency bumps (auto-skipped)
+  - ~3 Documentation changes (auto-skipped)
+  - ~20 OIDC plugin additions/fixes (upstream authenticator plugin, we use QURL - skipped)
+  - ~10 Plugin build/deploy workflow changes (upstream-specific - skipped)
+  - 3 iptables security fixes (`0110dbb`, `19348e7`, `dc3e709`) - **synced** (adapted)
+  - 1 command injection fix (`6c160c7`) in `quick_start.sh` - **skipped** (file doesn't exist in fork)
+  - 1 DefaultCipherScheme config fix (`78e5b37`) - **skipped** (upstream changed 0→1 for GMSM scheme; our fork correctly uses 0 for curve25519-only)
 
 ### 2026-01-23 - Routine Review (No Sync Required)
 
@@ -122,6 +139,14 @@ Non-obvious skips that don't fit Auto-Skip Categories:
 | 9b115972 | fix: OTP static key in templates | SKIP | Upstream authenticator plugin (we use QURL) | 2026-01-23 |
 | 320a90c4 | refactor: move server_plugin to basic/ | SKIP | Upstream example reorganization only | 2026-01-23 |
 | f32bd371 | refactor: rename qrauth to authenticator | SKIP | Upstream plugin rename (we use QURL) | 2026-01-23 |
+| 6c160c7 | fix: prevent command injection in quick_start.sh | SKIP | File doesn't exist in fork | 2026-03-25 |
+| 78e5b37 | fix: align DefaultCipherScheme with docker config | SKIP | Upstream 0→1 for GMSM; fork uses 0 for curve25519-only | 2026-03-25 |
+| 01362f4 | fix: clear ackMsg.RedirectUrl when no redirect | SKIP | Upstream OIDC plugin (we use QURL) | 2026-03-25 |
+| f8f4e43 | fix: return error state on OIDC redirect failure | SKIP | Upstream OIDC plugin (we use QURL) | 2026-03-25 |
+| 55db41f | fix: harden OIDC redirect with HTML error fallback | SKIP | Upstream OIDC plugin (we use QURL) | 2026-03-25 |
+| 63552e0 | fix: validate RedirectUrl in OIDC plugin | SKIP | Upstream OIDC plugin (we use QURL) | 2026-03-25 |
+| 978901f | refactor: standardize plugin module names | SKIP | Upstream plugin reorganization | 2026-03-25 |
+| 31206cc | feat(oidc): auto-redirect after auth | SKIP | Upstream OIDC plugin (we use QURL) | 2026-03-25 |
 
 ---
 

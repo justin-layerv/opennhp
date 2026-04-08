@@ -47,7 +47,7 @@ RUN if [ "$(uname -m)" = "x86_64" ]; then \
     rm -f /iptables_defaults_*.sh
 
 # Create startup script
-RUN echo '#!/bin/bash\n/iptables_defaults.sh\nexec /nhp-ac/nhp-acd run' > /start.sh && \
+RUN echo '#!/bin/bash\n/iptables_defaults.sh -f\nexec /nhp-ac/nhp-acd run' > /start.sh && \
     chmod +x /start.sh
 
 ENTRYPOINT ["/start.sh"]
