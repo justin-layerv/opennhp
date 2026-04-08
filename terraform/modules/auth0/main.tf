@@ -452,9 +452,10 @@ resource "aws_lambda_function" "auth0_rotation" {
 
   environment {
     variables = {
-      AUTH0_DOMAIN                = var.auth0_domain
-      AUTH0_MANAGEMENT_SECRET_ARN = var.auth0_management_secret_arn
-      AUTH0_API_AUDIENCE          = auth0_resource_server.qurl_api.identifier
+      AUTH0_DOMAIN                  = var.auth0_domain
+      AUTH0_MANAGEMENT_SECRET_ARN   = var.auth0_management_secret_arn
+      AUTH0_API_AUDIENCE            = auth0_resource_server.qurl_api.identifier
+      AUTH0_CLEANUP_OLD_CREDENTIALS = var.cleanup_old_credentials ? "true" : "false"
     }
   }
 

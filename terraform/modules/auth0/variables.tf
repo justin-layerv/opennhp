@@ -93,6 +93,28 @@ variable "rotation_days" {
   }
 }
 
+variable "cleanup_old_credentials" {
+  description = <<-EOT
+    When true, the rotation Lambda deletes old Auth0 credentials after
+    promoting the new one. Reduces the window where old credentials remain
+    valid.
+
+    Auth0 Management API scopes required on the management M2M client when
+    enabling this:
+      - read:client_credentials   (GET    /api/v2/clients/{id}/credentials)
+      - delete:client_credentials (DELETE /api/v2/clients/{id}/credentials/{id})
+
+    Without these scopes, cleanup will fail with an Auth0 403 and the rotation
+    Lambda will log a non-fatal error (the rotation itself still succeeds).
+
+    Operational note: any service still caching an old credential may briefly
+    fail authentication until it re-reads from Secrets Manager — ensure
+    consumers have short cache TTLs before enabling.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "auth0_domain" {
   description = "Auth0 tenant domain for Management API (e.g., dev-xxx.us.auth0.com). Required when enable_rotation is true."
   type        = string

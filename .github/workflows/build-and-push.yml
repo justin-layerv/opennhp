@@ -601,6 +601,9 @@ jobs:
           echo '::group::Custom Domain Cert Lambda Tests'
           (cd terraform/modules/custom-domain-cert/lambda && python -m pytest test_cert_manager.py -v)
           echo '::endgroup::'
+          echo '::group::Auth0 Rotation Lambda Tests (Node)'
+          node --test terraform/modules/auth0/lambda/rotate_secret.test.js
+          echo '::endgroup::'
 
   # ============================================================================
   # BUILD - Parallel matrix builds after terraform validation/plan passes (or is skipped)
