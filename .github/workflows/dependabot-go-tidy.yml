@@ -48,17 +48,17 @@ jobs:
 
       - name: Run go mod tidy on all modules
         run: |
-          cd $GITHUB_WORKSPACE/nhp && go mod tidy
-          cd $GITHUB_WORKSPACE/endpoints && go mod tidy
-          cd $GITHUB_WORKSPACE/examples/server_plugin && go mod tidy
+          cd "$GITHUB_WORKSPACE/nhp" && go mod tidy
+          cd "$GITHUB_WORKSPACE/endpoints" && go mod tidy
+          cd "$GITHUB_WORKSPACE/examples/server_plugin" && go mod tidy
 
       - name: Check for changes
         id: changes
         run: |
           if git diff --quiet; then
-            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "changed=false" >> "$GITHUB_OUTPUT"
           else
-            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "Changed files:"
             git diff --name-only
           fi

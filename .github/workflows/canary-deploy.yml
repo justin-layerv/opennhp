@@ -83,7 +83,7 @@ jobs:
         id: aws-info
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
-          echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+          echo "account_id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
           echo "AWS Account: $ACCOUNT_ID"
 
       - name: Verify Image Exists in ECR
@@ -106,18 +106,20 @@ jobs:
             echo "::warning::SSM parameter /${ENVIRONMENT}/nhp/${COMPONENT}/ecr-repo-name not found, using default: $REPO_NAME"
           fi
 
-          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+          echo "repo_name=$REPO_NAME" >> "$GITHUB_OUTPUT"
 
           # Prod pulls images from sandbox ECR (cross-account).
           # The ECR resource policy includes ecr:DescribeImages for secondary accounts.
-          ECR_REGISTRY_ARGS=""
+          # Use an array so each flag is passed as a separate argv entry — a
+          # quoted scalar would be parsed as one positional arg.
+          ECR_REGISTRY_ARGS=()
           if [[ "$ENVIRONMENT" == "prod" ]]; then
-            ECR_REGISTRY_ARGS="--registry-id $SANDBOX_ACCOUNT_ID"
+            ECR_REGISTRY_ARGS=(--registry-id "$SANDBOX_ACCOUNT_ID")
           fi
 
           echo "Verifying image $REPO_NAME:$IMAGE_TAG exists in ECR..."
           if ! aws ecr describe-images \
-            $ECR_REGISTRY_ARGS \
+            "${ECR_REGISTRY_ARGS[@]}" \
             --repository-name "$REPO_NAME" \
             --image-ids imageTag="$IMAGE_TAG" \
             --query "imageDetails[0].imageTags" \
@@ -200,7 +202,7 @@ jobs:
             exit 1
           fi
 
-          echo "arn=$ARN" >> $GITHUB_OUTPUT
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
           echo "State machine ARN: $ARN"
 
       - name: Validation Summary
@@ -279,7 +281,7 @@ jobs:
             --input "{\"image_tag\":\"$IMAGE_TAG\",\"component\":\"$COMPONENT\",\"environment\":\"$ENVIRONMENT\",\"triggered_by\":\"github-actions-$RUN_ID\"}" \
             --query 'executionArn' --output text)
 
-          echo "execution_arn=$EXECUTION_ARN" >> $GITHUB_OUTPUT
+          echo "execution_arn=$EXECUTION_ARN" >> "$GITHUB_OUTPUT"
           echo "Execution started: $EXECUTION_ARN"
 
       - name: Poll Execution Status
@@ -310,7 +312,7 @@ jobs:
                 ;;
               SUCCEEDED)
                 echo "Canary deployment succeeded!"
-                echo "status=SUCCEEDED" >> $GITHUB_OUTPUT
+                echo "status=SUCCEEDED" >> "$GITHUB_OUTPUT"
                 break
                 ;;
               FAILED)
@@ -327,17 +329,17 @@ jobs:
                 if [[ -n "$OUTPUT" && "$OUTPUT" != "None" ]]; then
                   echo "Output: $OUTPUT"
                 fi
-                echo "status=FAILED" >> $GITHUB_OUTPUT
+                echo "status=FAILED" >> "$GITHUB_OUTPUT"
                 exit 1
                 ;;
               TIMED_OUT)
                 echo "::error::Canary deployment TIMED OUT"
-                echo "status=TIMED_OUT" >> $GITHUB_OUTPUT
+                echo "status=TIMED_OUT" >> "$GITHUB_OUTPUT"
                 exit 1
                 ;;
               ABORTED)
                 echo "::error::Canary deployment was ABORTED"
-                echo "status=ABORTED" >> $GITHUB_OUTPUT
+                echo "status=ABORTED" >> "$GITHUB_OUTPUT"
                 exit 1
                 ;;
               *)

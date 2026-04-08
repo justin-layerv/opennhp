@@ -513,19 +513,19 @@ jobs:
 
           WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-          # Determine overall status
+          # Determine overall status. The Slack payload below uses COLOR,
+          # TITLE, and TEXT — the visual status ("Success"/"Failed"/...) is
+          # encoded in the title and colour, so there is no separate STATUS
+          # field to track here.
           if [[ "$HAS_CHANGES" == "false" ]]; then
-            STATUS="skipped"
             COLOR="#808080"
             TITLE="Scheduled Release - No Changes"
             TEXT="No pending changes to deploy. HEAD \`${HEAD_SHA_SHORT}\` is already deployed."
           elif [[ "$PROD_RESULT" == "success" || ("$MODE" == "sandbox-only" && "$SOAK_RESULT" == "success") ]]; then
-            STATUS="success"
             COLOR="#36a64f"
             TITLE="Scheduled Release - Success"
             TEXT="Deployment completed successfully."
           else
-            STATUS="failure"
             COLOR="#cc0000"
             TITLE="Scheduled Release - Failed"
             TEXT="Pipeline failed. Check workflow run for details."

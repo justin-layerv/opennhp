@@ -85,7 +85,7 @@ jobs:
         shell: bash
         run: |
           LD_FLAGS="-s -w -X '${GOMODULE}/version.Version=${{ steps.version.outputs.version }}' -X '${GOMODULE}/version.CommitId=${{ steps.version.outputs.commit_id }}' -X '${GOMODULE}/version.CommitTime=${{ steps.version.outputs.commit_time }}' -X '${GOMODULE}/version.BuildTime=${{ steps.version.outputs.build_time }}'"
-          echo "ldflags=${LD_FLAGS}" >> $GITHUB_OUTPUT
+          echo "ldflags=${LD_FLAGS}" >> "$GITHUB_OUTPUT"
 
       - name: Go mod tidy
         run: |
