@@ -255,9 +255,11 @@ module "nhp" {
   canary_instance_warmup_seconds  = var.canary_instance_warmup_seconds
 
   # Status page
-  deploy_status_page         = var.deploy_status_page
-  status_page_domain         = var.status_page_domain
-  status_page_hosted_zone_id = var.status_page_hosted_zone_id
+  deploy_status_page            = var.deploy_status_page
+  status_page_domain            = var.status_page_domain
+  status_page_hosted_zone_id    = var.status_page_hosted_zone_id
+  status_page_nhp_auth_enabled  = var.status_page_nhp_auth_enabled
+  status_page_nhp_auth_qurl_url = var.status_page_nhp_auth_qurl_url
 
   # Redis (distributed rate limiting)
   deploy_redis = var.deploy_redis

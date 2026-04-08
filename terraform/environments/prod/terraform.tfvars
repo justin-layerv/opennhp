@@ -281,6 +281,12 @@ deploy_status_page         = true
 status_page_domain         = "status.layerv.ai"
 status_page_hosted_zone_id = "Z0748438C8EK6UAW94ST" # layerv.ai zone
 
+# NHP Authentication (dogfooding) - protect status page with QURL
+# To enable: 1) Create a QURL via API with target_url=https://status.layerv.ai
+#            2) Set the QURL link URL below and enable auth
+# status_page_nhp_auth_enabled  = true
+# status_page_nhp_auth_qurl_url = "https://qurl.link/#at_REPLACE_WITH_TOKEN"
+
 # Canary deployment
 enable_canary_deployment = true
 

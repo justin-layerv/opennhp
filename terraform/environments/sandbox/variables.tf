@@ -1260,6 +1260,18 @@ variable "status_page_hosted_zone_id" {
   }
 }
 
+variable "status_page_nhp_auth_enabled" {
+  description = "Protect the status page with NHP authentication (dogfooding)"
+  type        = bool
+  default     = false
+}
+
+variable "status_page_nhp_auth_qurl_url" {
+  description = "QURL link URL for status page authentication. Required when status_page_nhp_auth_enabled is true."
+  type        = string
+  default     = null
+}
+
 # Developer Portal
 variable "deploy_developer_portal" {
   description = "Deploy developer portal infrastructure (playground proxy + credential provisioner)"

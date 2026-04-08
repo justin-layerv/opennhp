@@ -544,6 +544,10 @@ module "status_page" {
   dependent_service_urls = var.qurl_service_domain != null ? {
     qurl_api = "https://${var.qurl_service_domain}/health/ready"
   } : {}
+
+  # NHP Authentication (dogfooding)
+  enable_nhp_auth   = var.status_page_nhp_auth_enabled
+  nhp_auth_qurl_url = var.status_page_nhp_auth_qurl_url
 }
 
 # Status page DNS record for cross-account zones

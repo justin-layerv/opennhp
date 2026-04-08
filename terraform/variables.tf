@@ -1349,6 +1349,46 @@ variable "status_page_hosted_zone_id" {
   }
 }
 
+# ==================== Status Page NHP Auth ====================
+
+variable "status_page_nhp_auth_enabled" {
+  description = "Protect the status page with NHP authentication via QURL (dogfooding). Requires a QURL to be created for the status page URL."
+  type        = bool
+  default     = false
+}
+
+variable "status_page_nhp_auth_qurl_url" {
+  description = "QURL link URL for status page login (e.g., https://qurl.link.layerv.xyz/#at_xxx). Required when status_page_nhp_auth_enabled is true. Create via QURL API with target_url set to the status page URL."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.status_page_nhp_auth_qurl_url == null || can(regex("^https://", var.status_page_nhp_auth_qurl_url))
+    error_message = "status_page_nhp_auth_qurl_url must be a valid HTTPS URL."
+  }
+
+  # The URL is templated into the CloudFront Function JavaScript as a single-
+  # quoted string literal. Reject characters that would break out of the
+  # literal or trigger nested terraform interpolation.
+  validation {
+    condition = var.status_page_nhp_auth_qurl_url == null || (
+      !can(regex("['\\\\\n\r]", var.status_page_nhp_auth_qurl_url)) &&
+      !can(regex("\\$\\{", var.status_page_nhp_auth_qurl_url)) &&
+      !can(regex("%\\{", var.status_page_nhp_auth_qurl_url))
+    )
+    error_message = "status_page_nhp_auth_qurl_url must not contain single quotes, backslashes, newlines, or terraform interpolation sequences. These would break the CloudFront Function JavaScript template."
+  }
+
+  # Cross-variable check: enforce that a URL is supplied whenever the feature
+  # is enabled. The status_page module has its own resource-level
+  # precondition, but failing here surfaces the misconfiguration earlier in
+  # the plan and at the root variables level where users actually set them.
+  validation {
+    condition     = !var.status_page_nhp_auth_enabled || (var.status_page_nhp_auth_qurl_url != null && var.status_page_nhp_auth_qurl_url != "")
+    error_message = "status_page_nhp_auth_qurl_url is required when status_page_nhp_auth_enabled is true."
+  }
+}
+
 # ==================== Cost Analytics ====================
 
 variable "deploy_cost_analytics" {

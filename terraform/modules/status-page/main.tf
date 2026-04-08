@@ -6,6 +6,7 @@
 # - S3 + CloudFront hosts the static frontend
 # - Optional Route53 record for custom domain
 # - SSM parameter exports SNS topic ARN for CI/CD notifications
+# - Optional NHP authentication via CloudFront Function (dogfooding)
 
 terraform {
   required_version = ">= 1.5"
@@ -32,6 +33,15 @@ locals {
     api_url               = "${aws_apigatewayv2_stage.default.invoke_url}/status"
     grafana_dashboard_url = var.grafana_dashboard_url
   })
+
+  # NHP auth: CloudFront Function code with QURL URL and cookie name injected
+  nhp_auth_function_code = var.enable_nhp_auth ? templatefile(
+    "${path.module}/cloudfront-functions/nhp_auth.js",
+    {
+      qurl_url    = var.nhp_auth_qurl_url
+      cookie_name = var.nhp_auth_cookie_name
+    }
+  ) : null
 }
 
 # ==============================================================================
@@ -306,6 +316,44 @@ resource "aws_s3_object" "index" {
 }
 
 # ==============================================================================
+# NHP Authentication - CloudFront Function
+# ==============================================================================
+# Lightweight viewer-request function that checks for an NHP session cookie.
+# Unauthenticated requests are redirected to the QURL login portal, which
+# triggers the NHP knock flow and sets cookies before redirecting back.
+
+resource "aws_cloudfront_function" "nhp_auth" {
+  count = var.enable_nhp_auth ? 1 : 0
+
+  name    = replace("${var.name_prefix}-status-nhp-auth", ".", "-")
+  runtime = "cloudfront-js-2.0"
+  comment = "NHP auth gate for status page - redirects unauthenticated requests to QURL"
+  publish = true
+  code    = local.nhp_auth_function_code
+
+  # Enforce the dependency between enable_nhp_auth and nhp_auth_qurl_url at
+  # plan time. A `check` block would only emit a warning, which is too easy to
+  # miss in CI; a precondition fails the plan/apply outright. The terraform
+  # variable validation also catches this, but the precondition gives a clear
+  # message at the resource level.
+  lifecycle {
+    precondition {
+      condition     = var.nhp_auth_qurl_url != null && var.nhp_auth_qurl_url != ""
+      error_message = "nhp_auth_qurl_url is required when enable_nhp_auth is true."
+    }
+
+    # CloudFront Functions have a hard 10 KB code-size limit. Fail at plan
+    # time if the rendered function exceeds 8 KB so we have headroom against
+    # the limit and catch the regression before AWS rejects the deployment.
+    # length() returns characters, but the function is ASCII so 1 char = 1 byte.
+    precondition {
+      condition     = length(local.nhp_auth_function_code) <= 8192
+      error_message = "Rendered nhp_auth.js exceeds 8 KB safety floor (CloudFront Function hard limit is 10 KB). Trim the function before deploying."
+    }
+  }
+}
+
+# ==============================================================================
 # CloudFront Distribution
 # ==============================================================================
 
@@ -393,14 +441,33 @@ resource "aws_cloudfront_distribution" "status" {
 
     viewer_protocol_policy = "redirect-to-https"
     compress               = true
+
+    # NHP auth: CloudFront Function checks for nhp_token cookie on every request.
+    # Runs before cache lookup, so even cached responses require authentication.
+    dynamic "function_association" {
+      for_each = var.enable_nhp_auth ? [1] : []
+      content {
+        event_type   = "viewer-request"
+        function_arn = aws_cloudfront_function.nhp_auth[0].arn
+      }
+    }
   }
 
-  # Serve index.html for all paths
-  custom_error_response {
-    error_code            = 403
-    response_code         = 200
-    response_page_path    = "/index.html"
-    error_caching_min_ttl = 10
+  # Serve index.html for missing-file errors (S3 OAC returns 403 for missing
+  # objects, not 404). The 403 fallback is dropped when NHP auth is enabled
+  # because the auth gate's loop-detection branch returns its own 403 with a
+  # diagnostic body — CloudFront's custom_error_response would otherwise
+  # rewrite that 403 to a 200/index.html and strip the diagnostic, leaving
+  # operators without the cookie-domain-mismatch hint that loop detection is
+  # designed to surface.
+  dynamic "custom_error_response" {
+    for_each = var.enable_nhp_auth ? [] : [1]
+    content {
+      error_code            = 403
+      response_code         = 200
+      response_page_path    = "/index.html"
+      error_caching_min_ttl = 10
+    }
   }
 
   custom_error_response {
@@ -563,6 +630,72 @@ resource "aws_cloudwatch_metric_alarm" "api_gateway_5xx" {
 
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-status-api-5xx"
+    Component = "status-page"
+  })
+}
+
+# Alarm on CloudFront Function execution errors. Because the NHP auth gate
+# runs on every viewer-request, a spike in errors here means either a runtime
+# regression in nhp_auth.js or a CloudFront-side issue — both of which would
+# bypass authentication or 500 legitimate traffic.
+resource "aws_cloudwatch_metric_alarm" "nhp_auth_function_errors" {
+  count = var.enable_nhp_auth ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-status-nhp-auth-errors"
+  alarm_description   = "NHP auth CloudFront Function execution errors"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "FunctionExecutionErrors"
+  namespace           = "AWS/CloudFront"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 10
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    FunctionName = aws_cloudfront_function.nhp_auth[0].name
+    Region       = "Global"
+  }
+
+  alarm_actions = [var.sns_topic_arn]
+  ok_actions    = [var.sns_topic_arn]
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-status-nhp-auth-errors"
+    Component = "status-page"
+  })
+}
+
+# CloudFront also publishes FunctionValidationErrors when a function returns a
+# response that fails CloudFront's structural validation (missing required
+# fields, wrong types, etc.). Execution errors and validation errors are
+# different failure modes — a function can compile and run cleanly while still
+# returning a response CloudFront refuses to serve. Alarm on both so a future
+# refactor that breaks the response shape pages on the same SNS topic.
+resource "aws_cloudwatch_metric_alarm" "nhp_auth_function_validation_errors" {
+  count = var.enable_nhp_auth ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-status-nhp-auth-validation-errors"
+  alarm_description   = "NHP auth CloudFront Function validation errors (invalid response shape)"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "FunctionValidationErrors"
+  namespace           = "AWS/CloudFront"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    FunctionName = aws_cloudfront_function.nhp_auth[0].name
+    Region       = "Global"
+  }
+
+  alarm_actions = [var.sns_topic_arn]
+  ok_actions    = [var.sns_topic_arn]
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-status-nhp-auth-validation-errors"
     Component = "status-page"
   })
 }

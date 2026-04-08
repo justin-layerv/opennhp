@@ -39,3 +39,13 @@ output "ssm_sns_topic_arn_parameter" {
   description = "SSM parameter name storing the SNS topic ARN (for CI/CD notifications)"
   value       = aws_ssm_parameter.sns_topic_arn.name
 }
+
+output "nhp_auth_enabled" {
+  description = "Whether NHP authentication is enabled for the status page"
+  value       = var.enable_nhp_auth
+}
+
+output "nhp_auth_function_name" {
+  description = "CloudFront Function name for NHP auth (null if auth disabled)"
+  value       = var.enable_nhp_auth ? aws_cloudfront_function.nhp_auth[0].name : null
+}
