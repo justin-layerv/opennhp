@@ -50,14 +50,6 @@ func newError(number int, msg string) *Error {
 	return e
 }
 
-func ErrorToErrorNumber(err error) int {
-	var e *Error
-	if errors.As(err, &e) {
-		return e.ErrorNumber()
-	}
-	return -1
-}
-
 func ErrorToString(err error) string {
 	var e *Error
 	if errors.As(err, &e) {
