@@ -17,8 +17,14 @@
 # Optional Environment Variables:
 #   POLL_TIMEOUT:             Total seconds to poll for completion (default 2400 = 40 min)
 #   POLL_INTERVAL:            Seconds between status polls (default 30)
-#   FIND_RETRIES:             How many ~10s attempts to find the dispatched run
-#                             (default 6 → 60s window)
+#   FIND_RETRIES:             How many 5s attempts to find the dispatched run
+#                             (default 24 → 120s window). `gh run list` has an
+#                             empirically-observed ~30s eventual-consistency
+#                             delay before freshly-dispatched runs appear
+#                             (measured 2026-04-08: dispatch returns at t=2s,
+#                             run shows up in list at t=30s). Any retry window
+#                             under ~45s races the GitHub API and fails in
+#                             practice. 120s is 4x the observed worst case.
 #
 # Outputs (via GITHUB_OUTPUT, when set):
 #   run_id:   Numeric run ID of the dispatched workflow
@@ -44,7 +50,7 @@ IMAGE_TAG="$3"
 
 POLL_INTERVAL="${POLL_INTERVAL:-30}"
 POLL_TIMEOUT="${POLL_TIMEOUT:-2400}"  # 40 min default
-FIND_RETRIES="${FIND_RETRIES:-6}"
+FIND_RETRIES="${FIND_RETRIES:-24}"
 
 if [[ -z "${GITHUB_REPOSITORY:-}" ]]; then
   echo "::error::GITHUB_REPOSITORY must be set" >&2

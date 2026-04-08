@@ -36,7 +36,11 @@ CELL_ID="$4"
 
 POLL_INTERVAL=30
 POLL_TIMEOUT=2400  # 40 minutes (10-min buffer before 50-min job timeout)
-FIND_RETRIES=6
+# 24 retries × 5s delay = 120s window. `gh run list` has an
+# empirically-observed ~30s eventual-consistency delay before
+# freshly-dispatched runs appear, so anything under ~45s races the
+# API. Matches dispatch-and-poll-blue-green.sh.
+FIND_RETRIES=24
 
 echo "::notice::Deploying $COMPONENT via canary (Step Functions)"
 

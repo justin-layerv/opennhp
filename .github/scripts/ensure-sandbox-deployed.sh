@@ -178,8 +178,11 @@ gh workflow run blue-green-deploy.yml \
   -f image_tag="$HEAD_SHA" \
   -f correlation_id="$BG_CORRELATION_ID"
 
+# 24 retries × 5s = 120s window. gh run list has a ~30s
+# eventual-consistency delay before newly-dispatched runs appear;
+# anything under ~45s races the API. Matches dispatch-and-poll-*.sh.
 if ! BG_RUN_ID=$(./.github/scripts/find-dispatched-run.sh \
-    blue-green-deploy.yml "$BG_CORRELATION_ID" 12 5); then
+    blue-green-deploy.yml "$BG_CORRELATION_ID" 24 5); then
   echo "ERROR: Could not find blue-green-deploy run for correlation_id=$BG_CORRELATION_ID"
   exit 1
 fi

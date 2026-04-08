@@ -34,13 +34,20 @@
 #   workflow        — workflow filename (e.g. blue-green-deploy.yml)
 #   correlation_id  — exact string the dispatched run's displayTitle
 #                     must contain (typically "[corr:<id>]")
-#   retries         — max poll attempts before giving up (default 12)
+#   retries         — max poll attempts before giving up (default 24)
 #   delay_seconds   — sleep between attempts (default 5)
 #
 # Total worst-case wait is retries * delay_seconds. The default
-# 12 * 5 = 60s is enough for GitHub's UI to materialise a newly
-# dispatched run. Bump `retries` if a particular caller needs more
-# patience.
+# 24 * 5 = 120s covers the empirically-measured ~30s
+# eventual-consistency delay between `gh workflow run` returning and
+# the dispatched run showing up in `gh run list` (measured 2026-04-08
+# on this repo: dispatch returned at t=2s, run first visible in list
+# at t=30s — see this PR's description for the measurement script
+# and outcome).
+# Anything under ~45s races the GitHub API in practice and fails
+# intermittently; 120s is 4x the observed worst case. Bump `retries`
+# if a particular caller genuinely needs more patience, but do not
+# lower the default without re-measuring the latency.
 #
 # Writes the run's databaseId to stdout on success. Returns 1 with
 # an error message on timeout.
@@ -54,7 +61,7 @@ fi
 
 WORKFLOW="$1"
 CORRELATION_ID="$2"
-RETRIES="${3:-12}"
+RETRIES="${3:-24}"
 DELAY="${4:-5}"
 
 if [[ -z "${GITHUB_REPOSITORY:-}" ]]; then
