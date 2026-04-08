@@ -55,9 +55,16 @@ on:
         default: false
         type: boolean
       refresh_timeout_minutes:
-        description: 'Instance refresh timeout in minutes (5-60, default: 10)'
+        description: 'Instance refresh timeout in minutes (5-60, default: 15)'
         required: false
-        default: 10
+        # 3-instance refresh with per-instance warmup consistently takes
+        # 9-10 minutes in sandbox (one-at-a-time replacement + warmup +
+        # health-check grace). A 10-minute deadline was tipping over by
+        # 1 second, so CI marked the step failed even though the refresh
+        # itself was healthy and completed seconds later. 15 minutes
+        # gives a ~5-minute safety margin without bloating deploy time
+        # for the happy path.
+        default: 15
         type: number
       health_check_timeout_minutes:
         description: 'Target group health check timeout in minutes (2-30, default: 5)'
