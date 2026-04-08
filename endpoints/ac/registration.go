@@ -1,6 +1,8 @@
 package ac
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,6 +75,42 @@ const (
 	// MaxServerDownReregBackoff caps circuit-breaker backoff when server-down
 	// re-registration keeps failing.
 	MaxServerDownReregBackoff = 5 * time.Minute
+
+	// DefaultNLBReregistrationInterval is the default cadence for the
+	// periodic NLB re-registration safety net. It is intentionally long
+	// (every 30 minutes) because it is a defense-in-depth check for silent
+	// failures, not a primary recovery path. Operators can override this
+	// per-AC via Config.NLBReregistrationIntervalSeconds.
+	DefaultNLBReregistrationInterval = 30 * time.Minute
+
+	// MinNLBReregistrationInterval is the lower bound for the periodic NLB
+	// re-registration safety net. Going below this would defeat the
+	// "rate-limited safety net" intent and risks DoS-ing the registration
+	// fleet during a network blip. Any configured value below this is
+	// clamped up to it.
+	MinNLBReregistrationInterval = 5 * time.Minute
+
+	// DefaultAllUnconnectedThreshold is the default number of consecutive
+	// keepalive ticks during which ALL assigned servers must remain in
+	// "never connected" state before the all-unconnected detector triggers
+	// a re-registration. With KeepaliveInterval = 10s, the default of 3
+	// ticks gives a recovery latency of ~30s while requiring sustained
+	// failure to fire. Operators can override via Config.AllUnconnectedThresholdTicks.
+	DefaultAllUnconnectedThreshold = 3
+
+	// MinAllUnconnectedThreshold is the lower bound for the all-unconnected
+	// detector. We never accept zero/negative values: a single tick of
+	// allUnconnected would over-react to brief transient blips.
+	MinAllUnconnectedThreshold = 2
+
+	// NLBReregistrationJitterFraction is the maximum fractional jitter
+	// applied to NLBReregistrationInterval (and AllUnconnectedThreshold,
+	// when expressed as a duration via KeepaliveInterval). Each AC picks
+	// a deterministic offset within ±NLBReregistrationJitterFraction of
+	// the configured interval, derived from the AC public key hash, so
+	// many ACs booted at the same time do not all attempt re-registration
+	// in lock-step after a network blip ("thundering herd").
+	NLBReregistrationJitterFraction = 0.25
 )
 
 // CloudWatch metric names for AC registration lifecycle.
@@ -85,6 +123,12 @@ const (
 	MetricServerConnectionFailure = "ServerConnectionFailure"
 	MetricServerHealthFailures    = "ServerHealthFailures"
 	MetricReregistrationTriggers  = "ReregistrationTriggers"
+
+	// MetricAllUnconnectedDetected is incremented once per "all assigned
+	// servers are unconnected" incident (on the 0->1 tick transition only)
+	// so each incident counts once. It provides early visibility into a
+	// degraded AC before the threshold actually triggers re-registration.
+	MetricAllUnconnectedDetected = "AllUnconnectedDetected"
 )
 
 // Re-registration reason constants. These are the only values that
@@ -93,6 +137,19 @@ const (
 	ReasonRefreshRedirect         = "refresh_redirect"
 	ReasonServerConnectionTimeout = "server_connection_timeout"
 	ReasonConnectionTimeout       = "connection_timeout"
+
+	// ReasonAllServersUnconnected is emitted when checkAllUnconnected has
+	// observed every assigned server in "never connected" state for the
+	// configured number of consecutive ticks and trips a re-registration.
+	// This catches the case where all keepalive paths are silently dead
+	// (e.g. NAT rebinding broke every UDP flow simultaneously, or a
+	// transient registration response misconfigured the assigned slice).
+	ReasonAllServersUnconnected = "all_servers_unconnected"
+
+	// ReasonPeriodicNLBRefresh is emitted by checkPeriodicNLBReregistration
+	// every NLBReregistrationInterval as a defense-in-depth safety net
+	// independent of any per-server health signal.
+	ReasonPeriodicNLBRefresh = "periodic_nlb_refresh"
 )
 
 // AssignedServer represents a server assigned to this AC.
@@ -212,6 +269,37 @@ type ACRegistration struct {
 	// cachedAOLBytes is the pre-marshaled ACOnlineMsg. Config is immutable after
 	// startup, so we marshal once and reuse across register/connect/refresh calls.
 	cachedAOLBytes []byte
+
+	// lastNLBRegistrationNano is a monotonic-ish (UnixNano) timestamp of
+	// the last successful registration through the NLB endpoint. It is the
+	// reference time for the periodic NLB re-registration safety net
+	// (see checkPeriodicNLBReregistration). Stored as an atomic Int64
+	// because it is written from multiple goroutines (registrationLoop,
+	// handleServerDown, TriggerReregistration's go func) and read from
+	// keepaliveLoop — a plain time.Time read/write would race.
+	lastNLBRegistrationNano atomic.Int64
+
+	// allUnconnectedTicks counts consecutive keepalive ticks during which
+	// every assigned server is in "never connected" state (Connected=false).
+	// When the count reaches the effective threshold (default + jitter),
+	// the AC triggers a re-registration via the control plane and resets
+	// the counter. Atomic because keepaliveLoop increments/reads it while
+	// re-registration goroutines reset it.
+	allUnconnectedTicks atomic.Uint32
+
+	// nlbReregistrationInterval is the effective (config + per-AC jitter)
+	// interval for the periodic NLB re-registration safety net. Computed
+	// once at construction so the jitter is stable across the AC's
+	// lifetime — a stable jitter is what de-correlates a fleet, not a
+	// fresh random value every tick.
+	nlbReregistrationInterval time.Duration
+
+	// allUnconnectedThreshold is the effective (config + per-AC jitter)
+	// number of consecutive keepalive ticks the all-unconnected detector
+	// requires before tripping a re-registration. Computed once at
+	// construction for the same fleet-jitter reason as
+	// nlbReregistrationInterval.
+	allUnconnectedThreshold uint32
 }
 
 // NewACRegistration creates a new AC registration manager.
@@ -249,19 +337,137 @@ func NewACRegistration(ac *UdpAC) (*ACRegistration, error) {
 		dims = append(dims, types.Dimension{Name: aws.String("Region"), Value: aws.String(region)})
 	}
 
+	// Derive a per-AC jitter factor from the immutable config so that two
+	// ACs booted at the same second pick different (but stable) intervals
+	// for the safety-net mechanisms below. Stability across restarts is
+	// important: the jitter offsets exist to de-correlate the fleet, not
+	// to randomize each tick. ACId + PrivateKeyBase64 are both immutable
+	// and uniquely identify a particular AC instance.
+	jitterFactor := resilienceJitterFactor(ac.config.ACId, ac.config.PrivateKeyBase64)
+	nlbInterval := computeNLBReregistrationInterval(ac.config.NLBReregistrationIntervalSeconds, jitterFactor)
+	allUnconnected := computeAllUnconnectedThreshold(ac.config.AllUnconnectedThresholdTicks, jitterFactor)
+
 	return &ACRegistration{
-		ac:              ac,
-		assignedServers: make([]*AssignedServer, 0),
-		oldServerSets:   make(map[string][]*AssignedServer),
-		stopCh:          make(chan struct{}),
-		cleanupCh:       make(chan string, cleanupChBufferSize),
-		cachedAOLBytes:  aolBytes,
-		cachedACIdDim:   types.Dimension{Name: dimNameACId, Value: aws.String(ac.config.ACId)},
+		ac:                        ac,
+		assignedServers:           make([]*AssignedServer, 0),
+		oldServerSets:             make(map[string][]*AssignedServer),
+		stopCh:                    make(chan struct{}),
+		cleanupCh:                 make(chan string, cleanupChBufferSize),
+		cachedAOLBytes:            aolBytes,
+		cachedACIdDim:             types.Dimension{Name: dimNameACId, Value: aws.String(ac.config.ACId)},
+		nlbReregistrationInterval: nlbInterval,
+		allUnconnectedThreshold:   allUnconnected,
 		metrics: metrics.NewPublisher(metrics.Config{
 			Namespace:  "LayerV/NHP",
 			Dimensions: dims,
 		}),
 	}, nil
+}
+
+// resilienceJitterFactor returns a deterministic value in the inclusive
+// range [-1.0, +1.0] derived from the SHA-256 of the AC's identity. The
+// per-AC mechanisms (periodic NLB re-registration, all-unconnected
+// detector) multiply this factor by NLBReregistrationJitterFraction and
+// scale the resulting offset against the configured interval, so each AC
+// in the fleet picks a stable interval that is uniformly spread across
+// the configured baseline ± NLBReregistrationJitterFraction.
+//
+// The factor is stable across restarts of the same AC because both inputs
+// (ACId and PrivateKeyBase64) are immutable for an AC instance — this is
+// the property that prevents a thundering-herd retry every time the AC
+// process restarts.
+//
+// This function never returns a math/rand value; it is intentionally
+// deterministic per AC.
+func resilienceJitterFactor(acID, privateKeyBase64 string) float64 {
+	h := sha256.New()
+	h.Write([]byte(acID))
+	// Domain-separator so a future identifier change cannot accidentally
+	// produce a colliding factor with an empty ACId.
+	h.Write([]byte{0})
+	h.Write([]byte(privateKeyBase64))
+	sum := h.Sum(nil)
+
+	// Take the first 8 bytes as a uint64, then map to [-1.0, +1.0].
+	u := binary.BigEndian.Uint64(sum[:8])
+	// Mantissa precision: 53 bits is the max integer that survives
+	// float64 conversion exactly. Mask down before dividing.
+	const mantissaMask uint64 = (1 << 53) - 1
+	frac := float64(u&mantissaMask) / float64(mantissaMask) // [0, 1]
+	return frac*2.0 - 1.0                                   // [-1, +1]
+}
+
+// computeNLBReregistrationInterval returns the effective NLB
+// re-registration interval after applying configured override and
+// per-AC jitter. The minimum lower bound is enforced after jitter so
+// the jittered interval can never collapse to something pathologically
+// small.
+func computeNLBReregistrationInterval(configSeconds int, jitterFactor float64) time.Duration {
+	base := DefaultNLBReregistrationInterval
+	if configSeconds > 0 {
+		base = time.Duration(configSeconds) * time.Second
+	}
+	if base < MinNLBReregistrationInterval {
+		base = MinNLBReregistrationInterval
+	}
+
+	// jitterFactor is in [-1, +1]; scale by NLBReregistrationJitterFraction
+	// so the actual offset is in ±NLBReregistrationJitterFraction*base.
+	offset := time.Duration(float64(base) * NLBReregistrationJitterFraction * jitterFactor)
+	jittered := base + offset
+
+	// Hard floor: never go below MinNLBReregistrationInterval even after
+	// a worst-case negative jitter. This protects the registration fleet
+	// from a deterministically-low jitter pinning a particular AC into
+	// re-registering every couple of minutes.
+	if jittered < MinNLBReregistrationInterval {
+		jittered = MinNLBReregistrationInterval
+	}
+	return jittered
+}
+
+// computeAllUnconnectedThreshold returns the effective all-unconnected
+// detector threshold (in keepalive ticks) after applying configured
+// override and per-AC jitter. Like the NLB interval, the minimum bound
+// is enforced after jitter so a short jitter cannot make the detector
+// trigger on a single transient blip.
+//
+// All arithmetic is performed on positive values inside the bounded
+// range [MinAllUnconnectedThreshold, configTicks*(1+jitterFraction)],
+// so the final uint32 conversion is safe by construction.
+func computeAllUnconnectedThreshold(configTicks int, jitterFactor float64) uint32 {
+	base := DefaultAllUnconnectedThreshold
+	if configTicks > 0 {
+		base = configTicks
+	}
+	if base < MinAllUnconnectedThreshold {
+		base = MinAllUnconnectedThreshold
+	}
+
+	// Apply ±NLBReregistrationJitterFraction jitter, rounded away from
+	// zero so the threshold bias is symmetric across the fleet rather
+	// than systematically biased downward.
+	offset := float64(base) * NLBReregistrationJitterFraction * jitterFactor
+	rounded := int(offset + 0.5*signOf(offset))
+	jittered := base + rounded
+
+	if jittered < MinAllUnconnectedThreshold {
+		jittered = MinAllUnconnectedThreshold
+	}
+	// jittered is now guaranteed >= MinAllUnconnectedThreshold (>= 2),
+	// so the conversion to uint32 cannot wrap.
+	return uint32(jittered)
+}
+
+// signOf returns -1 for negative x, +1 for non-negative x. Used by the
+// rounding helper above so the threshold rounds away from zero rather
+// than truncating, which would systematically bias jittered thresholds
+// downward.
+func signOf(x float64) float64 {
+	if x < 0 {
+		return -1
+	}
+	return 1
 }
 
 // acIdDimension returns the cached CloudWatch dimension for this AC's ID.
@@ -366,6 +572,7 @@ func (r *ACRegistration) registrationLoop() {
 			// may have opened the firewall (AcceptAllInput) if serverPeerMap was empty.
 			// Now that cloud-mode registration succeeded, we must close it.
 			r.resetIptables()
+			r.lastNLBRegistrationNano.Store(time.Now().UnixNano())
 			break
 		}
 
@@ -952,6 +1159,24 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 // keepaliveLoop sends keepalives to all assigned servers and monitors their health.
 // Every RegistrationRefreshInterval ticks, it also sends NHP_AOL to refresh server
 // peer state (handles server restarts without AC knowing).
+//
+// Each tick also runs two complementary resilience checks that are layered
+// underneath the existing health-check path:
+//
+//  1. checkAllUnconnected — fast detection (~30s) for the case where every
+//     assigned server is in "never connected" state. The existing
+//     checkServerHealth path explicitly skips servers with Connected=false,
+//     so without this hook there is no signal to recover from when ALL
+//     of them are still in the never-connected state (silent NAT rebind,
+//     a transient network blip during the AC's bootstrap window, or a
+//     bug in the registration response that handed back targets the AC
+//     could never establish a flow with).
+//
+//  2. checkPeriodicNLBReregistration — slow defense-in-depth (~30min) that
+//     fires regardless of per-server health. checkServerHealth needs at
+//     least one previously-connected server to detect a problem; if every
+//     UDP path is silently dead but no health signal has flipped, this
+//     periodic refresh is the catch-all.
 func (r *ACRegistration) keepaliveLoop() {
 	ticker := time.NewTicker(KeepaliveInterval)
 	defer ticker.Stop()
@@ -975,6 +1200,19 @@ func (r *ACRegistration) keepaliveLoop() {
 			if tickCount >= RegistrationRefreshInterval {
 				tickCount = 0
 				r.refreshAssignedServerRegistrations()
+			}
+
+			// Resilience layer (see docstring above for what each one
+			// catches and why they don't overlap with checkServerHealth).
+			r.checkAllUnconnected()
+
+			// Skip the periodic NLB safety net when checkAllUnconnected
+			// already kicked off a re-registration this tick. The
+			// CompareAndSwap inside TriggerReregistration would make a
+			// duplicate call a no-op, but short-circuiting here avoids
+			// the redundant log line and the duplicate metric increment.
+			if !r.reregistering.Load() {
+				r.checkPeriodicNLBReregistration()
 			}
 		}
 	}
@@ -1235,6 +1473,8 @@ func (r *ACRegistration) handleServerDown(deadServer *AssignedServer) {
 			log.Info("Re-registration successful after %d attempt(s)", attempt)
 			r.serverDownReregFailures.Store(0)
 			r.serverDownReregCooldownUntil.Store(0)
+			r.lastNLBRegistrationNano.Store(time.Now().UnixNano())
+			r.allUnconnectedTicks.Store(0)
 			// Reset iptables to restore port hiding after successful re-registration
 			r.resetIptables()
 			return
@@ -1337,6 +1577,8 @@ func (r *ACRegistration) TriggerReregistration(reason string) {
 				// circuit-breaker state so future genuine outages are not suppressed.
 				r.serverDownReregFailures.Store(0)
 				r.serverDownReregCooldownUntil.Store(0)
+				r.lastNLBRegistrationNano.Store(time.Now().UnixNano())
+				r.allUnconnectedTicks.Store(0)
 				r.resetIptables()
 				return
 			}
@@ -1357,6 +1599,144 @@ func (r *ACRegistration) TriggerReregistration(reason string) {
 		// so applying circuit-breaker backoff would suppress legitimate retries.
 		log.Error("Re-registration failed after %d attempts (triggered by: %s)", MaxReregistrationAttempts, reason)
 	}()
+}
+
+// checkAllUnconnected catches the silent-failure mode where every assigned
+// server is in the "never connected" state for several consecutive keepalive
+// ticks. The existing checkServerHealth function explicitly skips servers
+// with Connected=false (their LastSeen is zero, which would otherwise look
+// like a stale connection), so when *every* assigned server is in that
+// state checkServerHealth has nothing to act on and the AC will sit
+// indefinitely with a fully-populated assigned-server slice but no
+// functioning UDP path.
+//
+// Concretely this catches:
+//   - Assigned servers that came back from registration but the AC's
+//     initial NHP_AOL never reached them (port unreachable swallowed
+//     somewhere upstream of the AC's socket).
+//   - All UDP flows torn down simultaneously by a NAT rebinding event,
+//     before any individual flow had a chance to trip the per-server
+//     keepalive failure path.
+//   - A future bug in the registration response that hands the AC
+//     targets it cannot establish a flow with — having a generic
+//     "we're stuck, ask the control plane again" mechanism is cheap
+//     insurance against the long tail of new failure modes.
+//
+// It does NOT clear r.assignedServers itself: the recovery path is
+// "trigger a fresh registration", and HandleRedispatch /
+// handleRegistrationResponse atomically replace the slice when the
+// response arrives, migrating the previous entries into oldServerSets
+// for cleanup. Clearing the slice from this goroutine would race with a
+// concurrent HandleRedispatch that might have just installed a fresh
+// set of valid servers and silently drop those legitimate assignments.
+func (r *ACRegistration) checkAllUnconnected() {
+	r.mu.RLock()
+	servers := slices.Clone(r.assignedServers)
+	r.mu.RUnlock()
+
+	if len(servers) == 0 {
+		// Initial registration hasn't completed yet (or we just stopped).
+		// Reset the counter so a brand-new bootstrap doesn't immediately
+		// trip the threshold based on stale state.
+		r.allUnconnectedTicks.Store(0)
+		return
+	}
+
+	for _, server := range servers {
+		if server.IsConnected() {
+			r.allUnconnectedTicks.Store(0)
+			return
+		}
+	}
+
+	newTicks := r.allUnconnectedTicks.Add(1)
+
+	// Emit the detection metric only on the 0->1 transition so each
+	// incident counts once instead of inflating the counter by up to
+	// allUnconnectedThreshold per occurrence. ACId dimension matches the
+	// convention used by MetricServerHealthFailures so operators can pivot
+	// on which AC is degraded.
+	if newTicks == 1 {
+		r.metrics.IncrCounterWithDims(MetricAllUnconnectedDetected, []types.Dimension{
+			r.acIdDimension(),
+		})
+		log.Warning("AC %s: all %d assigned servers are unconnected (tick %d/%d)",
+			r.ac.config.ACId, len(servers), newTicks, r.allUnconnectedThreshold)
+	} else {
+		// Continued detection: log at debug to avoid spamming production
+		// logs every keepalive tick while the condition persists.
+		log.Debug("AC %s: all %d assigned servers still unconnected (tick %d/%d)",
+			r.ac.config.ACId, len(servers), newTicks, r.allUnconnectedThreshold)
+	}
+
+	if newTicks < r.allUnconnectedThreshold {
+		return
+	}
+
+	// Threshold reached — trip a re-registration through the control
+	// plane. Reset the tick counter immediately so we don't re-fire on
+	// the next tick while the in-flight TriggerReregistration is still
+	// running. Note we do NOT touch r.assignedServers here; see the
+	// docstring above for why.
+	log.Warning("AC %s: all assigned servers unconnected for %d consecutive ticks, triggering NLB re-registration",
+		r.ac.config.ACId, newTicks)
+	r.allUnconnectedTicks.Store(0)
+	r.TriggerReregistration(ReasonAllServersUnconnected)
+}
+
+// timeSinceLastNLBRegistration returns the duration since the most recent
+// successful NLB re-registration. Reads the atomic timestamp once so the
+// caller sees a consistent value across the elapsed/threshold comparison.
+func (r *ACRegistration) timeSinceLastNLBRegistration() time.Duration {
+	return time.Since(time.Unix(0, r.lastNLBRegistrationNano.Load()))
+}
+
+// checkPeriodicNLBReregistration is the slow defense-in-depth safety net
+// that fires every nlbReregistrationInterval regardless of any per-server
+// health signal. It exists for the failure modes the per-server
+// keepalive path simply cannot see:
+//
+//   - The AC believes it has live connections (LastSeen recent because
+//     the NHP_AOL refresh path completed) but the underlying UDP flow
+//     was silently rebound somewhere in the network and the server is
+//     no longer receiving packets. The next NHP_AOP we'd send to that
+//     AC would silently fail.
+//   - A subset of servers in the assigned slice were quietly replaced
+//     between health checks: re-registering through the NLB pulls the
+//     authoritative current set without waiting for a per-server
+//     keepalive to flip Connected=false.
+//   - Any future failure mode where "the AC silently stops getting
+//     server updates" is the symptom — having a bounded recovery window
+//     prevents an indefinite paging incident.
+//
+// This is intentionally distinct from checkAllUnconnected:
+// checkAllUnconnected fires within ~30 seconds when the failure is
+// observable through Connected=false; this one fires once every
+// ~30 minutes regardless and is the catch-all for "looks fine, isn't".
+// Without both layers a bug whose symptom is "AC works for the first
+// minute then silently goes deaf" could page on-call instead of
+// self-healing.
+func (r *ACRegistration) checkPeriodicNLBReregistration() {
+	if r.timeSinceLastNLBRegistration() < r.nlbReregistrationInterval {
+		return
+	}
+
+	// Only trigger if we already have assigned servers — otherwise the
+	// initial registration loop is still running and we'd be racing with
+	// it for no good reason.
+	r.mu.RLock()
+	hasServers := len(r.assignedServers) > 0
+	r.mu.RUnlock()
+	if !hasServers {
+		return
+	}
+
+	log.Info("AC %s: periodic NLB re-registration triggered (last registration: %s ago, interval: %s)",
+		r.ac.config.ACId,
+		r.timeSinceLastNLBRegistration().Truncate(time.Second),
+		r.nlbReregistrationInterval)
+
+	r.TriggerReregistration(ReasonPeriodicNLBRefresh)
 }
 
 // cleanupWorker is a single long-lived goroutine that processes old-server
@@ -1502,7 +1882,9 @@ func classifyReason(reason string) string {
 	switch reason {
 	case ReasonRefreshRedirect,
 		ReasonServerConnectionTimeout,
-		ReasonConnectionTimeout:
+		ReasonConnectionTimeout,
+		ReasonAllServersUnconnected,
+		ReasonPeriodicNLBRefresh:
 		return reason
 	default:
 		return "other"

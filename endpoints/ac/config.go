@@ -51,6 +51,23 @@ type Config struct {
 	ServerPubKeyBase64 string `json:"serverPubKeyBase64"` // Required: Shared registration public key (all servers share this for NLB)
 	ServerPort         int    `json:"serverPort"`         // Server port for initial registration (default: 62206)
 	Environment        string `json:"environment"`        // Environment name for CloudWatch metrics (e.g., "sandbox", "prod")
+
+	// ============================================================================
+	// Resilience knobs (optional). The defaults are tuned for the standard
+	// NHP fleet — these overrides exist so an operator can dial the
+	// safety nets up or down per environment without a code change. See
+	// registration.go for the constants used when the value is zero.
+	// ============================================================================
+
+	// NLBReregistrationIntervalSeconds overrides
+	// DefaultNLBReregistrationInterval. Values below
+	// MinNLBReregistrationInterval (5min) are clamped up.
+	NLBReregistrationIntervalSeconds int `json:"nlbReregistrationIntervalSeconds"`
+
+	// AllUnconnectedThresholdTicks overrides DefaultAllUnconnectedThreshold.
+	// Values below MinAllUnconnectedThreshold (2) are clamped up so a
+	// single transient tick cannot trip a re-registration.
+	AllUnconnectedThresholdTicks int `json:"allUnconnectedThresholdTicks"`
 }
 
 type HttpConfig struct {
