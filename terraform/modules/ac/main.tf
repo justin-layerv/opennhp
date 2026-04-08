@@ -991,6 +991,13 @@ resource "aws_autoscaling_group" "ac" {
 
   lifecycle {
     create_before_destroy = true
+    # CI/CD manages capacity on this ASG during blue/green switches.
+    # See the matching comment on `aws_autoscaling_group.server` in
+    # compute/main.tf for the full rationale — short version: when
+    # blue-green-deploy.yml scales this ASG down to warm standby,
+    # the next `terraform apply` would reset desired_capacity/
+    # min_size back to `var.ac_min_capacity` unless we ignore them.
+    ignore_changes = [desired_capacity, min_size]
   }
 }
 
@@ -1054,6 +1061,15 @@ resource "aws_lb_listener" "https" {
   }
 
   tags = var.tags
+
+  lifecycle {
+    # blue-green-switch.sh flips default_action.target_group_arn on
+    # every traffic switch. Without this ignore, `terraform apply`
+    # resets the listener back to the blue TG within seconds of a
+    # successful green switch. See compute/main.tf::aws_lb_listener.udp
+    # for the full explanation of the drift mode.
+    ignore_changes = [default_action]
+  }
 }
 
 # Route 53 record for AC (points to NLB when CloudFront is disabled)

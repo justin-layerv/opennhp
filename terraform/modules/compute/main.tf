@@ -859,6 +859,25 @@ resource "aws_autoscaling_group" "server" {
 
   lifecycle {
     create_before_destroy = true
+    # CI/CD manages capacity on this ASG during blue/green switches.
+    # When traffic is switched to green, this (blue) ASG is scaled down
+    # to a warm standby by the `scale-down-previous` job in
+    # blue-green-deploy.yml. Without `ignore_changes` here, the next
+    # `terraform apply` — which runs on every main-push CI deploy — resets
+    # desired_capacity/min_size back to `var.min_capacity`, undoing the
+    # scale-down within seconds and silently leaving two full-size ASGs
+    # (2x cost, drift between TF state and reality).
+    #
+    # Matches the `aws_autoscaling_group.server_green` lifecycle in
+    # blue_green.tf; the asymmetry (blue not having it) was the bug —
+    # every CI deploy that ran a TF apply also reverted the blue/green
+    # state that CI had just established.
+    #
+    # Trade-off: operators cannot change capacity via `var.min_capacity`
+    # on an existing ASG through TF. Use the ASG API / console or a
+    # blue/green deploy to adjust scale. This is consistent with the
+    # green ASG's existing behaviour and matches how CI already operates.
+    ignore_changes = [desired_capacity, min_size]
   }
 }
 
@@ -959,6 +978,21 @@ resource "aws_lb_listener" "udp" {
     Component = "compute"
     Cell      = var.cell_id
   })
+
+  lifecycle {
+    # The Switch Traffic step in blue-green-deploy.yml points
+    # `default_action.target_group_arn` at the blue or green TG to
+    # flip which ASG serves production knocks. Without this ignore,
+    # every `terraform apply` resets the listener back to
+    # `aws_lb_target_group.udp.arn` (the blue TG), silently undoing
+    # the blue/green traffic switch within seconds of CI making it.
+    # The sandbox state-drift incident on 2026-04-08 was caused
+    # exactly by this: a green-active deploy landed, the next CI
+    # push ran a TF apply, and the apply reset the listener back to
+    # blue while SSM still said green → `Reconcile Listener and SSM
+    # State` validation step failed on the next dispatched deploy.
+    ignore_changes = [default_action]
+  }
 }
 
 # =============================================================================
@@ -1045,6 +1079,11 @@ resource "aws_lb_listener" "https" {
       condition     = var.qurl_resolve_certificate_arn != null
       error_message = "qurl_resolve_certificate_arn is required when enable_qurl_resolve_endpoint is true."
     }
+    # Same blue/green traffic-switch concern as the UDP listener above —
+    # blue-green-switch.sh flips `default_action.target_group_arn` on
+    # every traffic switch, and we do not want `terraform apply` to
+    # revert it.
+    ignore_changes = [default_action]
   }
 }
 
