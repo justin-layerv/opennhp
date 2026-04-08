@@ -19,10 +19,38 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-    - name: Run actionlint
-      uses: reviewdog/action-actionlint@6fb7acc99f4a1008869fa8a0f09cfca740837d9d # v1
-      with:
-        fail_level: error
-        filter_mode: diff_context
+      # Pin actionlint to a specific release so CI is reproducible and the
+      # step is not at the mercy of a third-party action's tag mutation.
+      # shellcheck is pre-installed on ubuntu-latest runners.
+      - name: Install actionlint
+        env:
+          # 1.7.12 is the minimum version that lifts the old "max 10 inputs
+          # for workflow_dispatch" rule — GitHub raised that limit upstream
+          # and actionlint tracked the change. Bumping if you bump this is
+          # fine; just update the sha256 from the release's checksums file.
+          ACTIONLINT_VERSION: "1.7.12"
+          # sha256 of actionlint_1.7.12_linux_amd64.tar.gz from the official GitHub release
+          ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/actionlint.tar.gz -C /usr/local/bin actionlint
+          actionlint -version
+          shellcheck --version
+
+      # Run actionlint directly (no reviewdog wrapper) so:
+      #   1. We scan every workflow on every push/PR, not just the diff —
+      #      accumulated drift in untouched files cannot hide.
+      #   2. Any finding fails the job immediately with the exact file+line
+      #      in the step log. There is no annotation cap (reviewdog hit
+      #      GitHub's 50/run limit and failed the job on volume alone — see
+      #      #987/#988 for the incident that prompted this).
+      #   3. No third-party action in the path between "lint fails" and
+      #      "CI fails".
+      - name: Run actionlint with shellcheck
+        run: |
+          actionlint -color -shellcheck "$(command -v shellcheck)" .github/workflows/*.yml

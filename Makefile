@@ -197,6 +197,28 @@ lint:
 	cd endpoints && golangci-lint run ./...
 	@echo "$(COLOUR_GREEN)[OpenNHP] Lint passed!$(END_COLOUR)"
 
+# Run the same check that CI runs for .github/workflows/**. Requires
+# actionlint and shellcheck on PATH:
+#   macOS:  brew install actionlint shellcheck
+#   Linux:  see https://github.com/rhysd/actionlint#install and
+#           your distro's shellcheck package (e.g. apt install shellcheck)
+# Fails on any finding — quote every variable, fix or explicitly
+# suppress shellcheck warnings. Matches `validate-workflows.yml` exactly
+# so "passes locally" == "passes in CI".
+.PHONY: lint-workflows
+lint-workflows:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Linting GitHub Actions workflows...$(END_COLOUR)"
+	@command -v actionlint >/dev/null 2>&1 || { \
+		echo "$(COLOUR_RED)[OpenNHP] actionlint not found. Install: brew install actionlint (macOS) or https://github.com/rhysd/actionlint#install (Linux)$(END_COLOUR)"; \
+		exit 1; \
+	}
+	@command -v shellcheck >/dev/null 2>&1 || { \
+		echo "$(COLOUR_RED)[OpenNHP] shellcheck not found. Install: brew install shellcheck (macOS) or apt install shellcheck (Debian/Ubuntu)$(END_COLOUR)"; \
+		exit 1; \
+	}
+	actionlint -color -shellcheck "$$(command -v shellcheck)" .github/workflows/*.yml
+	@echo "$(COLOUR_GREEN)[OpenNHP] Workflow lint passed!$(END_COLOUR)"
+
 test:
 	@echo "[OpenNHP] Running Unit Tests..."
 	cd endpoints && KBS_SKIP_INIT=1 go test -v ./server/... -run "Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry"
