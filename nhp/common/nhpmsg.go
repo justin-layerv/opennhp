@@ -2,7 +2,9 @@ package common
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 
@@ -390,6 +392,35 @@ func (rt *RedirectTarget) Address() string {
 		return rt.Hostname
 	}
 	return rt.ServerID
+}
+
+// Validate enforces the RedirectTarget contract: IP is REQUIRED, Port must
+// be in the valid range, and PubKeyBase64 must be present. Hostname is
+// optional metadata.
+//
+// Historically the AC accepted hostname-only targets because the server's
+// graceful-drain code emitted NHP_ARD messages with Hostname set but IP
+// empty. Downstream consumer code (refreshAssignedServerRegistrations,
+// IsServerAddress, log lines) used Target.IP as a stable identifier, so a
+// hostname-only entry silently broke keepalives and health checks without
+// tripping any recovery path. See issue #832 for the full trace.
+//
+// Callers that need to emit a hostname-based target (e.g. NLB drain) MUST
+// resolve the hostname to an IP at construction time and populate IP.
+func (rt *RedirectTarget) Validate() error {
+	if rt.IP == "" {
+		return fmt.Errorf("RedirectTarget.IP is required (Hostname=%q is not a substitute — see #832)", rt.Hostname)
+	}
+	if net.ParseIP(rt.IP) == nil {
+		return fmt.Errorf("RedirectTarget.IP=%q is not a valid IP address", rt.IP)
+	}
+	if rt.Port <= 0 || rt.Port > 65535 {
+		return fmt.Errorf("RedirectTarget.Port=%d out of range (must be 1-65535)", rt.Port)
+	}
+	if rt.PubKeyBase64 == "" {
+		return errors.New("RedirectTarget.PubKeyBase64 is required")
+	}
+	return nil
 }
 
 // ACRedispatchMsg redirects an AC to its assigned servers (NHP_ARD).

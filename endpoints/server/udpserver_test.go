@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1176,9 +1177,24 @@ func TestProcessACOperation_ContextAlreadyCanceled(t *testing.T) {
 }
 
 // TestDrainACConnections verifies that drainACConnections sends NHP_ARD to all
-// connected ACs with the NLB hostname, and uses fire-and-forget (no ResponseMsgCh).
+// connected ACs and uses fire-and-forget (no ResponseMsgCh). The drain ARD
+// must carry a RedirectTarget that passes RedirectTarget.Validate(): IP
+// populated (resolved from the NLB hostname), Port, and PubKeyBase64 all
+// set. See #832 — the previous behavior emitted a hostname-only target,
+// which downstream consumer code on the AC could not use.
 func TestDrainACConnections(t *testing.T) {
 	s, sendCh := newTestServerForBroadcast(t)
+
+	// Inject a deterministic hostname resolver so the test doesn't depend on
+	// real DNS for "test-nlb.example.com".
+	prevLookup := hostLookup
+	t.Cleanup(func() { hostLookup = prevLookup })
+	hostLookup = func(host string) ([]string, error) {
+		if host == "test-nlb.example.com" {
+			return []string{"198.51.100.42"}, nil
+		}
+		return nil, fmt.Errorf("unexpected lookup: %s", host)
+	}
 
 	// Set NLB config
 	s.config = &Config{
@@ -1226,11 +1242,14 @@ func TestDrainACConnections(t *testing.T) {
 		if target.Hostname != "test-nlb.example.com" {
 			t.Errorf("expected hostname test-nlb.example.com, got %s", target.Hostname)
 		}
-		if target.IP != "" {
-			t.Errorf("drain targets should use Hostname, not IP; got IP=%s", target.IP)
+		if target.IP != "198.51.100.42" {
+			t.Errorf("expected drain target IP 198.51.100.42 (resolved from NLB hostname), got %q", target.IP)
 		}
 		if target.Port != 62206 {
 			t.Errorf("expected port 62206, got %d", target.Port)
+		}
+		if err := target.Validate(); err != nil {
+			t.Errorf("drain target failed Validate(): %v", err)
 		}
 	}
 }
@@ -1264,6 +1283,84 @@ func TestDrainACConnections_NoACs(t *testing.T) {
 		t.Fatalf("unexpected message sent: %+v", md)
 	default:
 		// good
+	}
+}
+
+// TestUdpServer_DrainARD_PopulatesIP is the unit-level regression for #832.
+// It exercises buildDrainRedirectTarget directly to prove the drain code
+// path now emits a RedirectTarget that passes Validate() — i.e. IP is set
+// from DNS resolution, not left empty with only Hostname as a hint.
+func TestUdpServer_DrainARD_PopulatesIP(t *testing.T) {
+	prevLookup := hostLookup
+	t.Cleanup(func() { hostLookup = prevLookup })
+	hostLookup = func(host string) ([]string, error) {
+		if host == "nlb.example.com" {
+			return []string{"203.0.113.10"}, nil
+		}
+		return nil, fmt.Errorf("unexpected lookup: %s", host)
+	}
+
+	target, err := buildDrainRedirectTarget("nlb.example.com", 62206, "c2hhcmVkLWtleQ==")
+	if err != nil {
+		t.Fatalf("buildDrainRedirectTarget failed: %v", err)
+	}
+	if target.IP != "203.0.113.10" {
+		t.Errorf("Target.IP = %q, want %q (#832: IP must be populated)", target.IP, "203.0.113.10")
+	}
+	if target.Hostname != "nlb.example.com" {
+		t.Errorf("Target.Hostname = %q, want %q", target.Hostname, "nlb.example.com")
+	}
+	if target.Port != 62206 {
+		t.Errorf("Target.Port = %d, want 62206", target.Port)
+	}
+	if target.PubKeyBase64 == "" {
+		t.Error("Target.PubKeyBase64 should be set")
+	}
+	if err := target.Validate(); err != nil {
+		t.Errorf("drain target failed Validate(): %v", err)
+	}
+}
+
+// TestUdpServer_DrainARD_ResolverFailure verifies the drain returns an error
+// when DNS resolution fails, so the caller can skip the drain entirely
+// rather than emitting an invalid target.
+func TestUdpServer_DrainARD_ResolverFailure(t *testing.T) {
+	prevLookup := hostLookup
+	t.Cleanup(func() { hostLookup = prevLookup })
+	hostLookup = func(host string) ([]string, error) {
+		return nil, fmt.Errorf("no such host: %s", host)
+	}
+
+	_, err := buildDrainRedirectTarget("nlb.example.com", 62206, "c2hhcmVkLWtleQ==")
+	if err == nil {
+		t.Fatal("expected resolver failure to return error")
+	}
+	if !strings.Contains(err.Error(), "nlb.example.com") {
+		t.Errorf("expected error to mention hostname, got: %v", err)
+	}
+}
+
+// TestUdpServer_DrainARD_EmptyHostname verifies that an empty hostname is
+// rejected at the helper level rather than producing a bogus target.
+func TestUdpServer_DrainARD_EmptyHostname(t *testing.T) {
+	_, err := buildDrainRedirectTarget("", 62206, "c2hhcmVkLWtleQ==")
+	if err == nil {
+		t.Fatal("expected empty hostname to return error")
+	}
+}
+
+// TestUdpServer_DrainARD_EmptyResolverResult verifies that a resolver that
+// returns an empty slice with no error is still treated as a failure.
+func TestUdpServer_DrainARD_EmptyResolverResult(t *testing.T) {
+	prevLookup := hostLookup
+	t.Cleanup(func() { hostLookup = prevLookup })
+	hostLookup = func(host string) ([]string, error) {
+		return []string{}, nil
+	}
+
+	_, err := buildDrainRedirectTarget("nlb.example.com", 62206, "c2hhcmVkLWtleQ==")
+	if err == nil {
+		t.Fatal("expected empty resolver result to return error")
 	}
 }
 

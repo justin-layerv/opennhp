@@ -753,23 +753,23 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 		return errors.New("no targets in redispatch message")
 	}
 
-	// Validate all targets before proceeding
+	// Filter targets through RedirectTarget.Validate(). Invalid targets are
+	// skipped with a warning so a single malformed upstream entry cannot
+	// poison the whole redispatch, but if no valid targets remain we fail
+	// the redispatch rather than corrupting r.assignedServers with an
+	// unusable slice. See #832: hostname-only targets used to pass the old
+	// "IP == '' && Hostname == ''" check and then broke every downstream
+	// consumer that keyed on Target.IP.
+	validTargets := make([]common.RedirectTarget, 0, len(ardMsg.Targets))
 	for i, target := range ardMsg.Targets {
-		if target.IP == "" && target.Hostname == "" {
-			return fmt.Errorf("target %d has no address", i)
+		if err := target.Validate(); err != nil {
+			log.Warning("Skipping invalid redispatch target %d: %v", i, err)
+			continue
 		}
-		if target.Port == 0 {
-			return fmt.Errorf("target %d has invalid port", i)
-		}
-		if target.PubKeyBase64 == "" {
-			return fmt.Errorf("target %d has empty public key", i)
-		}
-		// Validate IP address format (only when IP is provided)
-		if target.IP != "" {
-			if ip := net.ParseIP(target.IP); ip == nil {
-				return fmt.Errorf("target %d has invalid IP address: %s", i, target.IP)
-			}
-		}
+		validTargets = append(validTargets, target)
+	}
+	if len(validTargets) == 0 {
+		return errors.New("no valid targets in redispatch message after filtering")
 	}
 
 	r.mu.Lock()
@@ -782,9 +782,9 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 		cleanupKey = time.Now().Format(time.RFC3339Nano)
 		r.oldServerSets[cleanupKey] = r.assignedServers
 	}
-	r.assignedServers = make([]*AssignedServer, len(ardMsg.Targets))
+	r.assignedServers = make([]*AssignedServer, len(validTargets))
 
-	for i, target := range ardMsg.Targets {
+	for i, target := range validTargets {
 		r.assignedServers[i] = &AssignedServer{
 			Target:    target,
 			Connected: false,

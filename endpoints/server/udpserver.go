@@ -632,6 +632,45 @@ func (s *UdpServer) cleanupOwnedAssignments() {
 // (~200 bytes) and the pipeline is non-blocking after enqueueing.
 const drainFlushDelay = 100 * time.Millisecond
 
+// hostLookup is the default DNS resolver used by buildDrainRedirectTarget.
+// It is a package-level variable so tests can inject a deterministic resolver
+// without touching the system resolver.
+var hostLookup = net.LookupHost
+
+// buildDrainRedirectTarget resolves the NLB hostname and constructs a
+// RedirectTarget suitable for an NHP_ARD drain message.
+//
+// The RedirectTarget contract requires IP to be populated (see #832). The
+// server's graceful-drain code previously emitted a hostname-only target,
+// which the AC accepted but downstream consumer code (refreshAssigned-
+// ServerRegistrations, IsServerAddress, logging) could not use because
+// Target.IP was empty. The returned target is guaranteed to pass
+// RedirectTarget.Validate() — callers should treat a non-nil error as
+// "skip the drain entirely" rather than attempting to fall back to a
+// hostname-only target.
+func buildDrainRedirectTarget(hostname string, port int, pubKey string) (common.RedirectTarget, error) {
+	if hostname == "" {
+		return common.RedirectTarget{}, errors.New("hostname is empty")
+	}
+	addrs, err := hostLookup(hostname)
+	if err != nil {
+		return common.RedirectTarget{}, fmt.Errorf("resolving %q: %w", hostname, err)
+	}
+	if len(addrs) == 0 {
+		return common.RedirectTarget{}, fmt.Errorf("resolver returned no addresses for %q", hostname)
+	}
+	target := common.RedirectTarget{
+		IP:           addrs[0],
+		Hostname:     hostname,
+		Port:         port,
+		PubKeyBase64: pubKey,
+	}
+	if err := target.Validate(); err != nil {
+		return common.RedirectTarget{}, fmt.Errorf("built invalid drain target: %w", err)
+	}
+	return target, nil
+}
+
 // drainACConnections sends NHP_ARD to all connected ACs, redirecting them
 // to the NLB so they reconnect to surviving servers immediately.
 // Called during shutdown, before sendMessageRoutine is stopped.
@@ -657,10 +696,17 @@ func (s *UdpServer) drainACConnections() {
 		return
 	}
 
-	nlbTarget := common.RedirectTarget{
-		Hostname:     s.config.Hostname,
-		Port:         s.config.ListenPort,
-		PubKeyBase64: s.device.PublicKeyBase64(),
+	// Resolve NLB hostname at construction time so Target.IP is populated.
+	// RedirectTarget.IP is required by the contract (#832): downstream
+	// consumer code (refreshAssignedServerRegistrations, IsServerAddress)
+	// uses Target.IP as a stable identifier. A hostname-only target would
+	// silently corrupt the AC's assignedServers slice. If resolution fails,
+	// skip the drain entirely — ACs will reconnect via NLB on the next
+	// keepalive failure.
+	nlbTarget, err := buildDrainRedirectTarget(s.config.Hostname, s.config.ListenPort, s.device.PublicKeyBase64())
+	if err != nil {
+		log.Warning("Shutdown: skipping drain ARD (ACs will reconnect via NLB on next keepalive failure): %v", err)
+		return
 	}
 	ardMsg := &common.ACRedispatchMsg{
 		Targets: []common.RedirectTarget{nlbTarget},

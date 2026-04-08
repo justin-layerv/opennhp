@@ -9,6 +9,7 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
+	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
 // ============================================================================
@@ -110,20 +111,31 @@ type ServerInfo struct {
 // using VPC private IPs for direct AC-to-server connectivity.
 // sharedPubKey is used as fallback when a server's pubkey is empty (e.g., during
 // rolling updates when Cloud Map cache hasn't picked up the new server's key yet).
+//
+// Servers with empty InternalIP are skipped loudly: emitting a hostname-only /
+// IP-less RedirectTarget would violate the RedirectTarget contract and corrupt
+// the AC's assignedServers slice (see #832). This should never happen in
+// practice — InternalIP is set at server startup by utils.GetLocalOutbound-
+// Address() — but we defend against it rather than silently emit an invalid
+// target.
 func serverInfosToRedirectTargets(servers []ServerInfo, sharedPubKey string) []common.RedirectTarget {
-	targets := make([]common.RedirectTarget, len(servers))
-	for i, srv := range servers {
+	targets := make([]common.RedirectTarget, 0, len(servers))
+	for _, srv := range servers {
+		if srv.InternalIP == "" {
+			log.Error("BUG: serverInfosToRedirectTargets skipping server %q with empty InternalIP (see #832)", srv.ID)
+			continue
+		}
 		pubKey := srv.PubKey
 		if pubKey == "" {
 			pubKey = sharedPubKey
 		}
-		targets[i] = common.RedirectTarget{
+		targets = append(targets, common.RedirectTarget{
 			IP:           srv.InternalIP,
 			Port:         srv.Port,
 			PubKeyBase64: pubKey,
 			AZ:           srv.AZ,
 			ServerID:     srv.ID,
-		}
+		})
 	}
 	return targets
 }

@@ -215,7 +215,7 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 				},
 			},
 			expectError:   true,
-			errorContains: "has no address",
+			errorContains: "no valid targets",
 		},
 		{
 			name: "target with invalid port",
@@ -225,7 +225,7 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 				},
 			},
 			expectError:   true,
-			errorContains: "invalid port",
+			errorContains: "no valid targets",
 		},
 		{
 			name: "target with empty public key",
@@ -235,7 +235,7 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 				},
 			},
 			expectError:   true,
-			errorContains: "empty public key",
+			errorContains: "no valid targets",
 		},
 		{
 			name: "target with invalid IP format",
@@ -245,7 +245,7 @@ func TestACRegistration_HandleRedispatch(t *testing.T) {
 				},
 			},
 			expectError:   true,
-			errorContains: "invalid IP address",
+			errorContains: "no valid targets",
 		},
 		// Note: We don't test "success code with targets" here because it requires
 		// a fully initialized device. That's tested in integration tests.
