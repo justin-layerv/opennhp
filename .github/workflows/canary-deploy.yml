@@ -14,6 +14,12 @@ name: "Canary Deploy (Production)"
 # - Gradual traffic shifting
 # - Automatic rollback on failure
 
+# run-name embeds an optional correlation_id so promote-to-prod.yml
+# (the only non-manual dispatcher) can reliably find this run via
+# find-dispatched-run.sh. See the blue-green-deploy.yml counterpart
+# for the full rationale.
+run-name: "Canary ${{ inputs.environment }} ${{ inputs.component }} ${{ inputs.cell_id }}${{ inputs.correlation_id && format(' [corr:{0}]', inputs.correlation_id) || '' }}"
+
 on:
   workflow_dispatch:
     inputs:
@@ -40,6 +46,11 @@ on:
         description: 'Cell identifier for multi-cell deployments'
         required: false
         default: 'cell0'
+        type: string
+      correlation_id:
+        description: 'Optional unique ID set by the parent dispatcher so it can reliably find this run (see find-dispatched-run.sh).'
+        required: false
+        default: ''
         type: string
 
 permissions:

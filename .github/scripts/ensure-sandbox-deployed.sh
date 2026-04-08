@@ -72,19 +72,29 @@ poll_workflow_run() {
   return 1
 }
 
-# Find a workflow run created after $dispatch_time.
+# Find a workflow run created after $dispatch_time, for dispatches that
+# don't carry a correlation_id yet (currently: build-and-push.yml — it
+# doesn't have a workflow_dispatch correlation input, so we fall back
+# to timestamp + status matching).
+#
+# The status filter accepts every non-terminal state GitHub reports
+# before jobs actually begin (queued, waiting, pending, in_progress)
+# plus completed, so a run held by a concurrency group or environment
+# approval gate isn't invisible here. See find-dispatched-run.sh for
+# the correlation_id approach, which is strictly better and is used
+# for blue-green-deploy and canary-deploy dispatches.
 find_triggered_run() {
   local workflow="$1"
   local dispatch_time="$2"
   local retries=6
   local run_id=""
 
-  for i in $(seq 1 $retries); do
+  for i in $(seq 1 "$retries"); do
     sleep 10
     run_id=$(gh run list \
       --workflow "$workflow" \
       --json databaseId,createdAt,status \
-      --jq "[.[] | select(.createdAt >= \"$dispatch_time\") | select(.status == \"in_progress\" or .status == \"queued\" or .status == \"completed\")] | .[0].databaseId // empty" \
+      --jq "[.[] | select(.createdAt >= \"$dispatch_time\") | select(.status == \"in_progress\" or .status == \"queued\" or .status == \"waiting\" or .status == \"pending\" or .status == \"completed\")] | .[0].databaseId // empty" \
       2>/dev/null || echo "")
 
     if [[ -n "$run_id" ]]; then
@@ -154,17 +164,23 @@ fi
 # Step 2: Deploy to sandbox via blue/green
 echo ""
 echo "--- Deploying to Sandbox (blue/green) ---"
-BG_DISPATCH_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Use a correlation_id + run-name match so the dispatched run is
+# unambiguously identifiable even if another dispatch lands in the
+# same window or the run is held by the blue-green-${env} concurrency
+# group. Format matches dispatch-and-poll-*.sh.
+BG_CORRELATION_ID="${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}-$(date +%s)-$$"
+echo "  correlation_id: $BG_CORRELATION_ID"
 gh workflow run blue-green-deploy.yml \
   --ref main \
   -f environment=sandbox \
   -f component=both \
   -f action=deploy \
-  -f image_tag="$HEAD_SHA"
+  -f image_tag="$HEAD_SHA" \
+  -f correlation_id="$BG_CORRELATION_ID"
 
-BG_RUN_ID=$(find_triggered_run "blue-green-deploy.yml" "$BG_DISPATCH_TIME")
-if [[ -z "$BG_RUN_ID" ]]; then
-  echo "ERROR: Could not find blue-green-deploy run"
+if ! BG_RUN_ID=$(./.github/scripts/find-dispatched-run.sh \
+    blue-green-deploy.yml "$BG_CORRELATION_ID" 12 5); then
+  echo "ERROR: Could not find blue-green-deploy run for correlation_id=$BG_CORRELATION_ID"
   exit 1
 fi
 echo "Triggered blue-green-deploy run: $BG_RUN_ID"

@@ -58,46 +58,41 @@ echo "  image_tag:   $IMAGE_TAG"
 echo "  timeout:     ${POLL_TIMEOUT}s"
 
 # --- Dispatch ---
-# Capture the dispatch time 10 seconds in the past so the createdAt filter
-# below tolerates clock skew between the runner and the GitHub API and the
-# sub-second window where a workflow can start within the same second as
-# the dispatch call. We'd rather over-include candidate runs (and let the
-# in_progress/queued/completed status filter narrow it down) than miss the
-# real run because of a few-millisecond race.
-DISPATCH_TIME=$(date -u -d '10 seconds ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
-  || date -u -v-10S +%Y-%m-%dT%H:%M:%SZ)
+# Generate a unique correlation id for this dispatch and pass it to
+# blue-green-deploy.yml as an input. The dispatched workflow encodes
+# the id into its run-name via `[corr:<id>]`, which find-dispatched-run.sh
+# then matches on exactly. This eliminates the timestamp/status race
+# that the previous createdAt + status filter had — a concurrent dispatch,
+# a run held by the concurrency group (status=waiting), and a run that
+# fast-fails before we get to poll it are all handled the same way,
+# because the correlation id is the single ground truth.
+#
+# Format: ${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}-$(epoch)-$$
+#   - GITHUB_RUN_ID makes the id traceable to the parent CI run
+#   - GITHUB_RUN_ATTEMPT covers re-runs of the same parent
+#   - epoch + PID cover manual invocations without CI vars
+# The `-$$` PID component is harmless noise in CI but lets a human
+# running this script twice in quick succession locally get two
+# distinct ids.
+CORRELATION_ID="${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}-$(date +%s)-$$"
+echo "correlation_id: $CORRELATION_ID"
 
 gh workflow run blue-green-deploy.yml \
   --ref main \
   -f environment="$ENVIRONMENT" \
   -f component="$COMPONENT" \
   -f action=deploy \
-  -f image_tag="$IMAGE_TAG"
+  -f image_tag="$IMAGE_TAG" \
+  -f correlation_id="$CORRELATION_ID"
 
 # --- Find triggered run ---
 echo "Waiting for blue-green-deploy run to appear..."
-RUN_ID=""
-for i in $(seq 1 "$FIND_RETRIES"); do
-  sleep 10
-  # Filter on createdAt >= DISPATCH_TIME and include `completed` so
-  # fast-failing workflows (input validation, missing perms) are not
-  # missed by a status filter that only sees in_progress/queued.
-  RUN_ID=$(gh run list \
-    --workflow blue-green-deploy.yml \
-    --json databaseId,createdAt,status \
-    --jq "[.[] | select(.createdAt >= \"$DISPATCH_TIME\") | select(.status == \"in_progress\" or .status == \"queued\" or .status == \"completed\")] | .[0].databaseId // empty" \
-    2>/dev/null || echo "")
-  if [[ -n "$RUN_ID" ]]; then
-    echo "Found run: $RUN_ID"
-    break
-  fi
-  echo "  Waiting for workflow run (attempt $i/$FIND_RETRIES)..."
-done
-
-if [[ -z "$RUN_ID" ]]; then
-  echo "::error::Could not find blue-green-deploy run after ${FIND_RETRIES} attempts" >&2
+if ! RUN_ID=$(./.github/scripts/find-dispatched-run.sh \
+    blue-green-deploy.yml "$CORRELATION_ID" "$FIND_RETRIES" 5); then
+  echo "::error::Could not find blue-green-deploy run for correlation_id=$CORRELATION_ID" >&2
   exit 1
 fi
+echo "Found run: $RUN_ID"
 
 # Sanity check: RUN_ID must be numeric. The jq filter above is supposed to
 # return a databaseId (integer), but if the GitHub API ever returns

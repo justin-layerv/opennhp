@@ -12,6 +12,14 @@ name: Blue/Green Deploy
 # - enable_blue_green = true (server) or enable_ac_blue_green = true (ac) in terraform.tfvars
 # - Green ASG and target groups created via terraform apply
 
+# run-name embeds an optional correlation_id so a parent workflow
+# dispatching this one can find its specific run via
+# `find-dispatched-run.sh` even if other dispatches land in the same
+# time window, or if the run is held by the concurrency group /
+# environment approval and reported as status=waiting. Shows up in
+# the GitHub UI as the run's title and in `gh run list --json displayTitle`.
+run-name: "Blue/Green ${{ inputs.environment }} ${{ inputs.component }} ${{ inputs.action }}${{ inputs.correlation_id && format(' [corr:{0}]', inputs.correlation_id) || '' }}"
+
 on:
   workflow_dispatch:
     inputs:
@@ -71,6 +79,11 @@ on:
         required: false
         default: 5
         type: number
+      correlation_id:
+        description: 'Optional unique ID set by the parent dispatcher so it can reliably find this run (see find-dispatched-run.sh).'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   id-token: write

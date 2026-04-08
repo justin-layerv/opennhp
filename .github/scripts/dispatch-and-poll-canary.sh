@@ -41,36 +41,31 @@ FIND_RETRIES=6
 echo "::notice::Deploying $COMPONENT via canary (Step Functions)"
 
 # --- Dispatch ---
-DISPATCH_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# See dispatch-and-poll-blue-green.sh for the full rationale on the
+# correlation_id pattern. Short version: identifying "the run we just
+# dispatched" by timestamp + status has two known failure modes
+# (concurrent dispatches, runs held by concurrency/env approval in
+# status=waiting). Passing a unique id through as a workflow input
+# and matching on it in the run's display title is unambiguous.
+CORRELATION_ID="${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}-$(date +%s)-$$"
+echo "::notice::correlation_id: $CORRELATION_ID"
 
 gh workflow run canary-deploy.yml \
   --ref main \
   -f component="$COMPONENT" \
   -f image_tag="$IMAGE_TAG" \
   -f environment="$ENVIRONMENT" \
-  -f cell_id="$CELL_ID"
+  -f cell_id="$CELL_ID" \
+  -f correlation_id="$CORRELATION_ID"
 
 # --- Find triggered run ---
 echo "Waiting for canary-deploy run to appear..."
-RUN_ID=""
-for i in $(seq 1 $FIND_RETRIES); do
-  sleep 10
-  RUN_ID=$(gh run list \
-    --workflow canary-deploy.yml \
-    --json databaseId,createdAt,status \
-    --jq "[.[] | select(.createdAt >= \"$DISPATCH_TIME\") | select(.status == \"in_progress\" or .status == \"queued\" or .status == \"completed\")] | .[0].databaseId // empty" \
-    2>/dev/null || echo "")
-  if [[ -n "$RUN_ID" ]]; then
-    echo "Found run: $RUN_ID"
-    break
-  fi
-  echo "  Waiting for workflow run (attempt $i/$FIND_RETRIES)..."
-done
-
-if [[ -z "$RUN_ID" ]]; then
-  echo "::error::Could not find canary-deploy run for $COMPONENT after ${FIND_RETRIES} attempts"
+if ! RUN_ID=$(./.github/scripts/find-dispatched-run.sh \
+    canary-deploy.yml "$CORRELATION_ID" "$FIND_RETRIES" 5); then
+  echo "::error::Could not find canary-deploy run for $COMPONENT (correlation_id=$CORRELATION_ID)"
   exit 1
 fi
+echo "Found run: $RUN_ID"
 
 RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID"
 echo "run_url=$RUN_URL" >> "$GITHUB_OUTPUT"
