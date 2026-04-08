@@ -1,21 +1,33 @@
 """Tests for custom_domain_cert_manager Lambda.
 
-Covers renewal_scan(), provision_pending_domains(), list_cert_meta_params(),
-store_certificate(), trigger_cert_sync() command injection hardening, and
-_acquire/_release_provisioning_lock idempotency lock.
+Covers verify_dns_ownership(), renewal_scan(), provision_pending_domains(),
+list_cert_meta_params(), store_certificate(), trigger_cert_sync() command
+injection hardening, and _acquire/_release_provisioning_lock idempotency lock.
 
 Uses unittest.mock to patch boto3 clients — no moto dependency needed.
 """
+
+# Lambda code is imported lazily because `custom_domain_cert_manager` creates
+# boto3 clients at import time, and AWS_DEFAULT_REGION must be set before that
+# happens. Pyright cannot resolve the import without the runtime side effect.
+# Tests that stack @patch decorators to suppress side effects (real boto3
+# calls) but don't assert on the resulting mocks use `del` to mark the
+# parameter as intentionally unused (Python idiom).
+# pyright: reportMissingImports=false
 import json
 import os
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
 
 from botocore.exceptions import ClientError
 
 
-# Set required env vars before import
+# Set required env vars before import. AWS_DEFAULT_REGION is required because
+# custom_domain_cert_manager creates boto3 clients at module load time, and
+# botocore raises NoRegionError when no region is configured anywhere on the
+# host (e.g. clean CI runners with no ~/.aws/config and no AWS_REGION env).
+os.environ.setdefault('AWS_DEFAULT_REGION', 'us-east-2')
 os.environ.setdefault('ACME_ZONE_ID', 'Z0000000000000')
 os.environ.setdefault('ACME_ZONE_NAME', 'acme.example.com')
 os.environ.setdefault('SSM_CERT_PREFIX', '/nhp/certs')
@@ -149,6 +161,7 @@ class TestProvisionPendingDomains(unittest.TestCase):
     @patch.object(cm.dynamodb_client, 'query')
     def test_skips_invalid_domains(self, mock_query, mock_provision, mock_sync):
         """Should skip domains that fail validation and count them as failures."""
+        del mock_sync  # @patch supplies this; assertion isn't needed for this case
         mock_query.return_value = {
             'Items': [
                 {'domain': {'S': 'good.com'}},
@@ -240,6 +253,7 @@ class TestRenewalScan(unittest.TestCase):
     @patch('custom_domain_cert_manager.list_cert_meta_params')
     def test_renews_expiring_certs(self, mock_list, mock_cw, mock_provision, mock_sync):
         """Should renew certs expiring within RENEWAL_DAYS_BEFORE_EXPIRY."""
+        del mock_cw  # @patch suppresses real CloudWatch calls; not asserted here
         mock_list.return_value = [
             {
                 'Name': '/nhp/certs/expiring.com/meta',
@@ -263,6 +277,7 @@ class TestRenewalScan(unittest.TestCase):
     @patch('custom_domain_cert_manager.list_cert_meta_params')
     def test_skips_valid_certs(self, mock_list, mock_cw, mock_provision, mock_sync):
         """Should skip certs that are not near expiry."""
+        del mock_cw  # @patch suppresses real CloudWatch calls; not asserted here
         mock_list.return_value = [
             {
                 'Name': '/nhp/certs/valid.com/meta',
@@ -283,6 +298,7 @@ class TestRenewalScan(unittest.TestCase):
     @patch('custom_domain_cert_manager.list_cert_meta_params')
     def test_handles_missing_expires_at(self, mock_list, mock_cw):
         """Should skip params with missing expires_at field."""
+        del mock_cw  # @patch suppresses real CloudWatch calls; not asserted here
         mock_list.return_value = [
             {
                 'Name': '/nhp/certs/broken.com/meta',
@@ -298,6 +314,7 @@ class TestRenewalScan(unittest.TestCase):
     @patch('custom_domain_cert_manager.list_cert_meta_params')
     def test_handles_malformed_meta(self, mock_list, mock_cw):
         """Should count params with invalid JSON as failures."""
+        del mock_cw  # @patch suppresses real CloudWatch calls; not asserted here
         mock_list.return_value = [
             {
                 'Name': '/nhp/certs/bad.com/meta',
@@ -314,6 +331,7 @@ class TestRenewalScan(unittest.TestCase):
     @patch('custom_domain_cert_manager.list_cert_meta_params')
     def test_derives_acme_subdomain_when_missing(self, mock_list, mock_cw, mock_provision, mock_sync):
         """Should derive acme_subdomain from domain name if not in meta."""
+        del mock_cw, mock_sync  # @patch suppresses side effects; not asserted here
         mock_list.return_value = [
             {
                 'Name': '/nhp/certs/no-acme.com/meta',
@@ -385,6 +403,333 @@ class TestTriggerCertSync(unittest.TestCase):
             mock_send.assert_not_called()
 
 
+class _StubDnsException(Exception):
+    """Base for stubbed dnspython exceptions used in unit tests."""
+
+
+class _StubNXDOMAIN(_StubDnsException):
+    pass
+
+
+class _StubNoAnswer(_StubDnsException):
+    pass
+
+
+class _StubTimeout(_StubDnsException):
+    pass
+
+
+def _install_dns_stubs():
+    """Install minimal dns_resolver / dns_exception stubs on the cert manager.
+
+    Mirrors the attributes that ``verify_dns_ownership`` actually touches
+    (Resolver class plus the NXDOMAIN/NoAnswer exception classes on the
+    resolver module, and Timeout/DNSException on dns.exception).
+    """
+    stub_resolver = MagicMock()
+    stub_resolver.NXDOMAIN = _StubNXDOMAIN
+    stub_resolver.NoAnswer = _StubNoAnswer
+
+    stub_exception = MagicMock()
+    stub_exception.Timeout = _StubTimeout
+    stub_exception.DNSException = _StubDnsException
+
+    cm.dns_resolver = stub_resolver
+    cm.dns_exception = stub_exception
+    return stub_resolver, stub_exception
+
+
+def _reset_dns_stubs():
+    cm.dns_resolver = None
+    cm.dns_exception = None
+
+
+class TestVerifyDnsOwnership(unittest.TestCase):
+    """Tests for verify_dns_ownership() TOCTOU mitigation."""
+
+    def tearDown(self):
+        # Always reset module-level DNS stubs so a failing test doesn't bleed
+        # into the next.
+        _reset_dns_stubs()
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_skips_when_no_table(self, mock_get):
+        original = cm.QURL_DOMAINS_TABLE
+        cm.QURL_DOMAINS_TABLE = None
+        try:
+            cm.verify_dns_ownership('example.com')
+            mock_get.assert_not_called()
+        finally:
+            cm.QURL_DOMAINS_TABLE = original
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_raises_when_domain_not_in_dynamodb(self, mock_get):
+        mock_get.return_value = {}
+        with self.assertRaises(cm.DnsOwnershipError) as ctx:
+            cm.verify_dns_ownership('missing.com')
+        assert 'not found in DynamoDB' in str(ctx.exception)
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_raises_when_verification_token_is_empty(self, mock_get):
+        # Attribute exists but the string is empty — stronger signal of
+        # active tampering than a missing attribute. Distinct error
+        # message so operators get the right incident-response path.
+        mock_get.return_value = {'Item': {'verification_token': {'S': ''}}}
+        with self.assertRaises(cm.DnsOwnershipError) as ctx:
+            cm.verify_dns_ownership('no-token.com')
+        msg = str(ctx.exception)
+        assert 'empty' in msg
+        assert 'tampering' in msg
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_raises_when_verification_token_attr_missing(self, mock_get):
+        # Item exists (domain key is always returned) but the projected
+        # verification_token attribute is absent — e.g. a legacy row written
+        # before the column existed, or a corrupted state. Distinct error
+        # message from the empty-string case.
+        mock_get.return_value = {'Item': {'domain': {'S': 'legacy.com'}}}
+        with self.assertRaises(cm.DnsOwnershipError) as ctx:
+            cm.verify_dns_ownership('legacy.com')
+        msg = str(ctx.exception)
+        assert 'attribute missing' in msg
+        assert 'legacy' in msg or 'corrupted' in msg
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_raises_when_dynamodb_fails_with_client_error(self, mock_get):
+        mock_get.side_effect = ClientError(
+            {'Error': {'Code': 'InternalServerError', 'Message': 'boom'}},
+            'GetItem',
+        )
+        with self.assertRaises(cm.DnsOwnershipError) as ctx:
+            cm.verify_dns_ownership('example.com')
+        msg = str(ctx.exception)
+        assert 'Failed to fetch' in msg
+        # AWS error code is surfaced for operators but the raw exception
+        # repr is NOT included in the customer-visible failure_reason.
+        assert 'InternalServerError' in msg
+        assert 'boom' not in msg
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_dynamodb_unexpected_exception_propagates(self, mock_get):
+        # Non-ClientError exceptions (e.g. unexpected botocore bug) should
+        # propagate so the caller's broader handler can publish the right
+        # metric — they are NOT silently re-wrapped as DnsOwnershipError.
+        mock_get.side_effect = RuntimeError("unexpected")
+        with self.assertRaises(RuntimeError):
+            cm.verify_dns_ownership('example.com')
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_raises_nxdomain_with_specific_message(self, mock_get):
+        mock_get.return_value = {'Item': {'verification_token': {'S': 'lv_verify_abc123'}}}
+        stub_resolver, _ = _install_dns_stubs()
+        stub_resolver.Resolver.return_value.resolve.side_effect = _StubNXDOMAIN()
+        with self.assertRaises(cm.DnsOwnershipError) as ctx:
+            cm.verify_dns_ownership('no-txt.com')
+        msg = str(ctx.exception)
+        assert 'NXDOMAIN' in msg
+        assert 'does not exist' in msg
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_raises_no_answer_with_specific_message(self, mock_get):
+        mock_get.return_value = {'Item': {'verification_token': {'S': 'lv_verify_abc123'}}}
+        stub_resolver, _ = _install_dns_stubs()
+        stub_resolver.Resolver.return_value.resolve.side_effect = _StubNoAnswer()
+        with self.assertRaises(cm.DnsOwnershipError) as ctx:
+            cm.verify_dns_ownership('no-answer.com')
+        assert 'no TXT records' in str(ctx.exception)
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_raises_timeout_with_specific_message(self, mock_get):
+        mock_get.return_value = {'Item': {'verification_token': {'S': 'lv_verify_abc123'}}}
+        stub_resolver, _ = _install_dns_stubs()
+        stub_resolver.Resolver.return_value.resolve.side_effect = _StubTimeout()
+        with self.assertRaises(cm.DnsOwnershipError) as ctx:
+            cm.verify_dns_ownership('slow.com')
+        assert 'timed out' in str(ctx.exception)
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_raises_generic_dns_exception(self, mock_get):
+        mock_get.return_value = {'Item': {'verification_token': {'S': 'lv_verify_abc123'}}}
+        stub_resolver, _ = _install_dns_stubs()
+
+        class _NoNameservers(_StubDnsException):
+            pass
+
+        stub_resolver.Resolver.return_value.resolve.side_effect = _NoNameservers()
+        with self.assertRaises(cm.DnsOwnershipError) as ctx:
+            cm.verify_dns_ownership('broken.com')
+        assert 'could not resolve' in str(ctx.exception)
+        # Type name surfaces but raw exception args do not.
+        assert '_NoNameservers' in str(ctx.exception)
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_raises_when_txt_mismatch(self, mock_get):
+        mock_get.return_value = {'Item': {'verification_token': {'S': 'lv_verify_expected'}}}
+        stub_resolver, _ = _install_dns_stubs()
+        mock_rdata = MagicMock()
+        mock_rdata.strings = (b'lv_verify_wrong',)
+        stub_resolver.Resolver.return_value.resolve.return_value = [mock_rdata]
+        with self.assertRaises(cm.DnsOwnershipError) as ctx:
+            cm.verify_dns_ownership('mismatch.com')
+        assert 'does not match' in str(ctx.exception)
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_passes_when_txt_matches(self, mock_get):
+        mock_get.return_value = {'Item': {'verification_token': {'S': 'lv_verify_abc123'}}}
+        stub_resolver, _ = _install_dns_stubs()
+        mock_rdata = MagicMock()
+        mock_rdata.strings = (b'lv_verify_abc123',)
+        stub_resolver.Resolver.return_value.resolve.return_value = [mock_rdata]
+        cm.verify_dns_ownership('good.com')
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_passes_with_multistring_txt(self, mock_get):
+        # RFC 7208 / RFC 1035: TXT can contain multiple character-strings
+        # that must be concatenated without separators.
+        mock_get.return_value = {'Item': {'verification_token': {'S': 'lv_verify_concatenated'}}}
+        stub_resolver, _ = _install_dns_stubs()
+        mock_rdata = MagicMock()
+        mock_rdata.strings = (b'lv_verify_', b'concatenated')
+        stub_resolver.Resolver.return_value.resolve.return_value = [mock_rdata]
+        cm.verify_dns_ownership('multi.com')
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_matches_among_multiple_txt_records(self, mock_get):
+        # If multiple TXT records exist on the name, only one needs to match.
+        mock_get.return_value = {'Item': {'verification_token': {'S': 'lv_verify_target'}}}
+        stub_resolver, _ = _install_dns_stubs()
+        wrong = MagicMock()
+        wrong.strings = (b'something-else',)
+        right = MagicMock()
+        right.strings = (b'lv_verify_target',)
+        stub_resolver.Resolver.return_value.resolve.return_value = [wrong, right]
+        cm.verify_dns_ownership('multirec.com')
+
+    @patch('custom_domain_cert_manager._release_provisioning_lock')
+    @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=True)
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch('custom_domain_cert_manager.send_alert')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_ownership_failure_publishes_correct_metric(
+        self, mock_get, mock_status, mock_alert, mock_metric, mock_lock, mock_release
+    ):
+        del mock_status, mock_alert, mock_lock  # @patch suppresses side effects only
+        mock_get.return_value = {}
+        with self.assertRaises(cm.DnsOwnershipError):
+            cm.provision_certificate("missing.com", "missing--com")
+        mock_metric.assert_called_once_with(cm.FAILURE_DNS_OWNERSHIP)
+        mock_release.assert_called_once_with("missing.com")
+
+    @patch('custom_domain_cert_manager._release_provisioning_lock')
+    @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=True)
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch('custom_domain_cert_manager.send_alert')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_ownership_failure_not_double_counted_in_handler(
+        self, mock_get, mock_status, mock_alert, mock_metric, mock_lock, mock_release
+    ):
+        del mock_status, mock_alert, mock_lock, mock_release  # @patch suppresses side effects only
+        mock_get.return_value = {}
+        with self.assertRaises(cm.DnsOwnershipError):
+            cm.handler({'type': 'provision', 'domain': 'missing.com', 'acme_subdomain': 'missing--com'}, None)
+        mock_metric.assert_called_once_with(cm.FAILURE_DNS_OWNERSHIP)
+
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_success_does_not_publish_failure_metric(self, mock_get, mock_metric):
+        """Success path must NOT publish FAILURE_DNS_OWNERSHIP. Guards against
+        accidental metric drift where a future refactor adds an unconditional
+        publish before the success return."""
+        mock_get.return_value = {'Item': {'verification_token': {'S': 'lv_verify_abc'}}}
+        stub_resolver, _ = _install_dns_stubs()
+        mock_rdata = MagicMock()
+        mock_rdata.strings = (b'lv_verify_abc',)
+        stub_resolver.Resolver.return_value.resolve.return_value = [mock_rdata]
+        cm.verify_dns_ownership('good.com')
+        mock_metric.assert_not_called()
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_raises_when_resolver_returns_empty_list(self, mock_get):
+        """dnspython usually raises NoAnswer for an empty rrset, but the
+        contract on resolve() does not strictly guarantee it. Make sure the
+        empty-list path produces an explicit operator-friendly message rather
+        than 'Found: []'."""
+        mock_get.return_value = {'Item': {'verification_token': {'S': 'lv_verify_abc'}}}
+        stub_resolver, _ = _install_dns_stubs()
+        # Resolver returns an iterable with zero rdata items. Bind __iter__
+        # via MagicMock.return_value so we don't need a lambda with an
+        # unused `self` parameter that static analyzers flag.
+        empty_answers = MagicMock()
+        empty_answers.__iter__.return_value = iter([])
+        empty_answers.rrset = None
+        stub_resolver.Resolver.return_value.resolve.return_value = empty_answers
+        with self.assertRaises(cm.DnsOwnershipError) as ctx:
+            cm.verify_dns_ownership('empty.com')
+        msg = str(ctx.exception)
+        assert 'no TXT values returned' in msg
+        # The default unspecific message must NOT be used here.
+        assert 'Found: []' not in msg
+
+
+class TestTxtRdataToString(unittest.TestCase):
+    """Tests for _txt_rdata_to_string TXT decoding helper."""
+
+    def test_single_string(self):
+        rdata = MagicMock()
+        rdata.strings = (b'lv_verify_abc',)
+        assert cm._txt_rdata_to_string(rdata) == 'lv_verify_abc'
+
+    def test_multistring_concatenates_without_separator(self):
+        rdata = MagicMock()
+        rdata.strings = (b'foo', b'bar', b'baz')
+        assert cm._txt_rdata_to_string(rdata) == 'foobarbaz'
+
+    def test_falls_back_to_str_when_no_strings_attr(self):
+        # Plain object with __str__ returning quoted form. Used as a safety
+        # net for any rdata-like object that doesn't expose .strings.
+        class _LegacyRdata:
+            def __str__(self):
+                return '"legacy"'
+
+        assert cm._txt_rdata_to_string(_LegacyRdata()) == 'legacy'
+
+    def test_handles_invalid_utf8(self):
+        rdata = MagicMock()
+        rdata.strings = (b'\xff\xfe', b'invalid')
+        # Should not raise; replace bad bytes
+        result = cm._txt_rdata_to_string(rdata)
+        assert 'invalid' in result
+        # The Python codec contract guarantees U+FFFD is the replacement
+        # character used by errors='replace'.
+        assert '\ufffd' in result
+
+    def test_warns_on_replacement_character(self):
+        """Operators should see a WARNING when a TXT record contains
+        invalid UTF-8 — that's almost always a customer copy-paste error
+        and being able to point at it from logs saves a support round."""
+        rdata = MagicMock()
+        rdata.strings = (b'\xff\xfe', b'_v=test')
+        # The lambda logs to the root logger (Lambda runtime convention)
+        # so assertLogs has to target the root logger to catch it.
+        with self.assertLogs(level='WARNING') as logs:
+            cm._txt_rdata_to_string(rdata)
+        joined = '\n'.join(logs.output)
+        assert 'invalid UTF-8' in joined
+        assert 'replacement characters' in joined
+
+    def test_no_warning_on_clean_utf8(self):
+        """Clean ASCII TXT records must NOT trigger the replacement
+        warning — the warning is only for genuinely-broken records."""
+        rdata = MagicMock()
+        rdata.strings = (b'lv_verify_clean_token',)
+        # The lambda logs to the root logger; assertNoLogs (Python 3.10+)
+        # against the root logger catches any warning anywhere.
+        with self.assertNoLogs(level='WARNING'):
+            cm._txt_rdata_to_string(rdata)
+
+
 class TestFailureCategoryMetrics(unittest.TestCase):
     """Tests for per-category failure metric routing."""
 
@@ -418,10 +763,12 @@ class TestFailureCategoryMetrics(unittest.TestCase):
     @patch('custom_domain_cert_manager.get_or_create_acme_account')
     @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=True)
     @patch('custom_domain_cert_manager.lazy_import_acme')
+    @patch('custom_domain_cert_manager.verify_dns_ownership')
     def test_dns_validation_failure_publishes_correct_category(
-        self, mock_import, mock_lock, mock_acme, mock_request, mock_status, mock_alert, mock_metric, mock_release
+        self, mock_verify, mock_import, mock_lock, mock_acme, mock_request, mock_status, mock_alert, mock_metric, mock_release
     ):
         """DNS validation failures should publish FAILURE_DNS_VALIDATION exactly once."""
+        del mock_verify, mock_import, mock_lock, mock_acme, mock_status, mock_alert  # @patch suppresses side effects only
         mock_request.side_effect = cm.DnsValidationError("TXT record not found")
 
         with patch.object(cm, 'cryptography', self._mock_cryptography()):
@@ -438,10 +785,12 @@ class TestFailureCategoryMetrics(unittest.TestCase):
     @patch('custom_domain_cert_manager.get_or_create_acme_account')
     @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=True)
     @patch('custom_domain_cert_manager.lazy_import_acme')
+    @patch('custom_domain_cert_manager.verify_dns_ownership')
     def test_acme_account_failure_publishes_correct_category(
-        self, mock_import, mock_lock, mock_acme, mock_status, mock_alert, mock_metric, mock_release
+        self, mock_verify, mock_import, mock_lock, mock_acme, mock_status, mock_alert, mock_metric, mock_release
     ):
         """ACME account failures should publish FAILURE_ACME_ACCOUNT."""
+        del mock_verify, mock_import, mock_lock, mock_status, mock_alert  # @patch suppresses side effects only
         mock_acme.side_effect = Exception("ACME account error")
 
         with self.assertRaises(Exception):
@@ -459,10 +808,12 @@ class TestFailureCategoryMetrics(unittest.TestCase):
     @patch('custom_domain_cert_manager.get_or_create_acme_account')
     @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=True)
     @patch('custom_domain_cert_manager.lazy_import_acme')
+    @patch('custom_domain_cert_manager.verify_dns_ownership')
     def test_cert_storage_failure_publishes_correct_category(
-        self, mock_import, mock_lock, mock_acme, mock_request, mock_store, mock_status, mock_alert, mock_metric, mock_release
+        self, mock_verify, mock_import, mock_lock, mock_acme, mock_request, mock_store, mock_status, mock_alert, mock_metric, mock_release
     ):
         """Certificate storage failures should publish FAILURE_CERT_STORAGE."""
+        del mock_verify, mock_import, mock_lock, mock_acme, mock_status, mock_alert  # @patch suppresses side effects only
         mock_request.return_value = ('cert-pem', 'chain-pem')
         mock_store.side_effect = Exception("SSM write failed")
 
@@ -491,10 +842,12 @@ class TestFailureCategoryMetrics(unittest.TestCase):
     @patch('custom_domain_cert_manager.update_domain_status')
     @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=True)
     @patch('custom_domain_cert_manager.lazy_import_acme')
+    @patch('custom_domain_cert_manager.verify_dns_ownership')
     def test_early_failure_publishes_acme_account_category(
-        self, mock_import, mock_lock, mock_status, mock_alert, mock_metric, mock_release
+        self, mock_verify, mock_import, mock_lock, mock_status, mock_alert, mock_metric, mock_release
     ):
         """Failures before first category reassignment default to FAILURE_ACME_ACCOUNT."""
+        del mock_verify, mock_lock, mock_status, mock_alert  # @patch suppresses side effects only
         mock_import.side_effect = Exception("import failed")
 
         with self.assertRaises(Exception):
@@ -511,10 +864,12 @@ class TestFailureCategoryMetrics(unittest.TestCase):
     @patch('custom_domain_cert_manager.get_or_create_acme_account')
     @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=True)
     @patch('custom_domain_cert_manager.lazy_import_acme')
+    @patch('custom_domain_cert_manager.verify_dns_ownership')
     def test_dns_validation_not_double_counted_in_handler(
-        self, mock_import, mock_lock, mock_acme, mock_request, mock_status, mock_alert, mock_metric, mock_release
+        self, mock_verify, mock_import, mock_lock, mock_acme, mock_request, mock_status, mock_alert, mock_metric, mock_release
     ):
         """DnsValidationError should not cause double metric publishing through handler."""
+        del mock_verify, mock_import, mock_lock, mock_acme, mock_status, mock_alert, mock_release  # @patch suppresses side effects only
         mock_request.side_effect = cm.DnsValidationError("TXT record not found")
 
         with patch.object(cm, 'cryptography', self._mock_cryptography()):
@@ -589,6 +944,7 @@ class TestProvisioningIdempotencyLock(unittest.TestCase):
     @patch('custom_domain_cert_manager._release_provisioning_lock')
     @patch('custom_domain_cert_manager._acquire_provisioning_lock', return_value=False)
     def test_provision_skips_when_lock_held(self, mock_acquire, mock_release):
+        del mock_acquire  # @patch return_value=False is the only contract needed
         result = cm.provision_certificate('example.com', 'example--com')
         assert result['status'] == cm.RESULT_SKIPPED
         assert 'concurrent' in result['reason']
@@ -598,6 +954,7 @@ class TestProvisioningIdempotencyLock(unittest.TestCase):
     @patch('custom_domain_cert_manager.provision_certificate')
     @patch.object(cm.dynamodb_client, 'query')
     def test_pending_does_not_count_skipped(self, mock_query, mock_provision, mock_sync):
+        del mock_sync  # @patch suppresses real cert sync; not asserted here
         mock_query.return_value = {'Items': [{'domain': {'S': 'a.com'}}, {'domain': {'S': 'b.com'}}]}
         mock_provision.side_effect = [
             {'status': cm.RESULT_SKIPPED, 'domain': 'a.com', 'reason': 'concurrent'},
@@ -620,6 +977,7 @@ class TestRenewalScanSkipped(unittest.TestCase):
         self, mock_list, mock_provision, mock_sync, mock_metric
     ):
         """Domains skipped due to lock should not inflate the renewed count."""
+        del mock_sync, mock_metric  # @patch suppresses side effects only
         expiring = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
         mock_list.return_value = [
             {'Name': '/nhp/certs/a.com/meta', 'Value': json.dumps({

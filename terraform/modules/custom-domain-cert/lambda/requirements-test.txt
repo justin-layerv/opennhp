@@ -1,0 +1,13 @@
+# Test-only dependencies for custom-domain-cert Lambda unit tests.
+#
+# These are NOT bundled into the Lambda zip — they're only installed in
+# CI and on developer machines. The runtime dependencies live in
+# requirements.txt.
+#
+# Pin versions explicitly so CI runs are reproducible across re-triggers
+# and so that an upstream pytest/boto3 release can't cause a surprise
+# test failure during a security-critical merge window.
+
+pytest==8.3.4
+boto3==1.36.7
+botocore==1.36.7

@@ -561,7 +561,14 @@ jobs:
 
       - name: Install test dependencies
         if: needs.changes.outputs.lambdas == 'true'
-        run: pip install pytest boto3
+        # custom-domain-cert tests need botocore (for ClientError) which
+        # isn't a dev tool — install it from the lambda's pinned test
+        # requirements file so the CI environment matches what developers
+        # use locally and so an upstream botocore release can't break the
+        # test job during a merge window.
+        run: |
+          pip install pytest boto3
+          pip install -r terraform/modules/custom-domain-cert/lambda/requirements-test.txt
 
       - name: Run Lambda unit tests
         if: needs.changes.outputs.lambdas == 'true'
@@ -571,6 +578,9 @@ jobs:
           echo '::endgroup::'
           echo '::group::Developer Portal Lambda Tests'
           python -m pytest terraform/modules/developer-portal/lambda/test_*.py -v
+          echo '::endgroup::'
+          echo '::group::Custom Domain Cert Lambda Tests'
+          (cd terraform/modules/custom-domain-cert/lambda && python -m pytest test_cert_manager.py -v)
           echo '::endgroup::'
 
   # ============================================================================

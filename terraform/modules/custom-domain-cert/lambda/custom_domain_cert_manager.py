@@ -5,6 +5,11 @@ Manages TLS certificates for customer custom domains using Let's Encrypt
 with DNS-01 challenge via CNAME delegation pattern.
 
 Flow:
+  0. Lambda re-verifies DNS ownership by checking that _layerv-verify.{domain}
+     TXT still matches the verification_token in DynamoDB. This closes the
+     TOCTOU gap between the Go service's initial verification (where the
+     domain was first registered) and cert issuance here (which may happen
+     up to ~15 minutes later).
   1. Customer creates CNAME: _acme-challenge.secure.example.com -> secure--example--com.acme.layerv.xyz
   2. Lambda creates TXT record at secure--example--com.acme.layerv.xyz in our ACME zone
   3. Let's Encrypt follows CNAME, finds TXT, validates domain ownership
@@ -20,10 +25,31 @@ Security considerations:
 - Cert secrets encrypted with KMS CMK via SSM SecureString
 - Least privilege IAM permissions
 - No sensitive data in CloudWatch logs
+- DNS ownership re-verified before cert issuance to close TOCTOU gap
 - Idempotency lock prevents duplicate cert provisioning on concurrent invocations
 
 Author: LayerV Platform Team
 """
+
+# Heavy crypto/ACME/DNS deps are loaded lazily via lazy_import_*() to keep
+# cold start small. Two consequences for static analysis:
+#
+# 1. The `acme`, `josepy`, `dns.resolver`, and `dns.exception` packages
+#    are Lambda-layer-only and not installed in the dev environment, so
+#    Pyright reports them as missing imports. We silence reportMissingImports
+#    at file level rather than per-line because the imports happen inside
+#    helper functions and per-line suppressions would clutter the import
+#    sites.
+#
+# 2. The lazy globals (`acme`, `josepy`, `cryptography`, `dns_resolver`,
+#    `dns_exception`) start as `None` and the lazy_import_*() functions
+#    set them to real modules before any access. Pyright cannot follow
+#    that runtime invariant. reportOptionalMemberAccess and
+#    reportOptionalSubscript are silenced at file level for the same
+#    reason — every access site would otherwise need an inline ignore,
+#    and any new access would need its own ignore. The runtime contract
+#    is enforced by the lazy_import_*() helpers, not the type checker.
+# pyright: reportMissingImports=false, reportOptionalMemberAccess=false, reportOptionalSubscript=false
 
 import json
 import logging
@@ -32,7 +58,7 @@ import re
 import shlex
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
 from botocore.exceptions import ClientError
@@ -66,6 +92,16 @@ class DnsValidationError(Exception):
     """Raised when DNS-01 challenge setup or propagation fails."""
     pass
 
+
+class DnsOwnershipError(Exception):
+    """Raised when DNS ownership re-verification fails before cert issuance.
+
+    This closes the TOCTOU gap between the Go service's initial DNS verification
+    and the Lambda's certificate issuance. If DNS ownership cannot be confirmed
+    at issuance time, the cert request is rejected.
+    """
+    pass
+
 # ACME account secret field names (Secrets Manager — single secret, no scale issue)
 FIELD_ACCOUNT_KEY = 'account_key'
 
@@ -85,6 +121,7 @@ CW_METRIC_PROVISIONING_FAILURES = 'ProvisioningFailures'
 #   Category                 Trigger
 #   ──────────────────────── ───────────────────────────────────────────────────
 #   AcmeAccountError         Secrets Manager access or ACME account registration
+#   DnsOwnershipError        DNS ownership re-verification failed before cert issuance
 #   DnsValidationError       Route53 TXT record creation or DNS propagation
 #   AcmeChallengeError       Let's Encrypt challenge answer or cert finalization
 #   CertStorageError         SSM Parameter Store write (key/chain/meta)
@@ -94,6 +131,7 @@ CW_METRIC_PROVISIONING_FAILURES = 'ProvisioningFailures'
 #   RenewalScanError         Per-domain failure during renewal scan
 #
 FAILURE_ACME_ACCOUNT = 'AcmeAccountError'
+FAILURE_DNS_OWNERSHIP = 'DnsOwnershipError'
 FAILURE_DNS_VALIDATION = 'DnsValidationError'
 FAILURE_ACME_CHALLENGE = 'AcmeChallengeError'
 FAILURE_CERT_STORAGE = 'CertStorageError'
@@ -102,11 +140,45 @@ FAILURE_CERT_SYNC = 'CertSyncError'
 FAILURE_DOMAIN_VALIDATION = 'DomainValidationError'
 FAILURE_RENEWAL_SCAN = 'RenewalScanError'
 
+# DNS ownership re-verification tunables. Centralized so the resolver
+# behaviour is easy to change without hunting through the function body.
+#
+# DNS_NAMESERVERS — public recursive resolvers used to verify the
+#   _layerv-verify TXT record. We deliberately use four independent
+#   providers (Google, Cloudflare, Quad9, OpenDNS) so a regional outage
+#   at any one of them — including a simultaneous Google + Cloudflare
+#   incident, which has happened — doesn't fail certificate provisioning
+#   for our customers. dnspython tries them in order until one answers,
+#   so the per-resolver order is also a soft preference (Google and
+#   Cloudflare have historically had the highest reachability from AWS
+#   us-east-2).
+# DNS_QUERY_TIMEOUT_SECONDS — per-query timeout. dnspython default is 2s;
+#   we allow more headroom because we go to public resolvers over NAT,
+#   which is slower than a VPC resolver.
+# DNS_QUERY_LIFETIME_SECONDS — total time across all retries. Sized to
+#   allow each of the DNS_NAMESERVERS to be tried once with a buffer:
+#   len(nameservers) * DNS_QUERY_TIMEOUT_SECONDS. With 4 resolvers and
+#   a 5s per-query timeout, the lifetime is 20s.
+# DNS_SLOW_WARNING_SECONDS — log a warning when a single resolution takes
+#   longer than this. Set just under DNS_QUERY_LIFETIME_SECONDS so
+#   legitimate retries don't generate noise, but slow enough that any
+#   warning is worth investigating (resolver pathology, NAT saturation).
+DNS_NAMESERVERS = [
+    '8.8.8.8',         # Google Public DNS
+    '1.1.1.1',         # Cloudflare
+    '9.9.9.9',         # Quad9
+    '208.67.222.222',  # OpenDNS
+]
+DNS_QUERY_TIMEOUT_SECONDS = 5
+DNS_QUERY_LIFETIME_SECONDS = len(DNS_NAMESERVERS) * DNS_QUERY_TIMEOUT_SECONDS
+DNS_SLOW_WARNING_SECONDS = DNS_QUERY_LIFETIME_SECONDS - 2
+
 # Lazy imports for cryptography and DNS (Lambda layer)
 acme = None
 josepy = None
 cryptography = None
 dns_resolver = None
+dns_exception = None
 
 
 def lazy_import_crypto():
@@ -132,9 +204,18 @@ def lazy_import_acme():
     global acme, josepy
     lazy_import_crypto()
     if acme is None:
+        import importlib
+
         import acme as acme_lib
-        from acme import client, messages, challenges
         import josepy as josepy_lib
+
+        # Force the acme submodules to load so callers can reach them
+        # via `acme_lib.client`, `acme_lib.messages`, `acme_lib.challenges`.
+        # Plain `import acme` does NOT automatically import submodules,
+        # so we use importlib to trigger the side effect without binding
+        # any names that static analyzers would flag as unused.
+        for _submodule in ('acme.client', 'acme.messages', 'acme.challenges'):
+            importlib.import_module(_submodule)
 
         acme = acme_lib
         josepy = josepy_lib
@@ -262,6 +343,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     - renewal_scan: Scan all custom domain certs and renew those approaching expiry
       {"type": "renewal_scan"}
     """
+    del context  # Required by the Lambda contract; not used here.
     try:
         event_type = event.get('type', EVENT_RENEWAL_SCAN)
         logger.info(f"Custom domain cert manager invoked with event type: {event_type}")
@@ -284,8 +366,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         else:
             raise ValueError(f"Unknown event type: {event_type}")
 
-    except DnsValidationError:
-        # Already metricked with FAILURE_DNS_VALIDATION in provision_certificate()
+    except (DnsValidationError, DnsOwnershipError):
+        # Already metricked in provision_certificate()
         raise
     except ValueError as e:
         logger.error(f"Custom domain cert manager validation failed: {str(e)}", exc_info=True)
@@ -297,6 +379,209 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         send_alert(f"Custom domain cert manager FAILED: {str(e)}")
         publish_failure_metric()
         raise
+
+
+def _txt_rdata_to_string(rdata: Any) -> str:
+    """Decode a dnspython TXT rdata into a single string.
+
+    TXT records can contain multiple character-strings concatenated. dnspython
+    exposes them via ``rdata.strings`` (a tuple of bytes objects). Joining the
+    strings without a separator matches RFC 7208 / RFC 1035 semantics. Falls
+    back to ``str(rdata)`` (with quote stripping) only if the ``strings``
+    attribute is unavailable, e.g. when a unit test passes a MagicMock.
+    """
+    strings = getattr(rdata, 'strings', None)
+    if strings:
+        try:
+            decoded = b''.join(strings).decode('utf-8', errors='replace')
+        except (TypeError, AttributeError, UnicodeDecodeError):
+            # TypeError/AttributeError: rdata.strings was not a tuple of
+            #   bytes-like objects (corrupted record or unexpected mock).
+            # UnicodeDecodeError: shouldn't fire because errors='replace',
+            #   but listed defensively in case the underlying codec changes.
+            # Anything else means a bug — let it propagate so we notice.
+            return str(rdata).strip('"')
+        # Surface the case where errors='replace' actually replaced
+        # something. The Unicode REPLACEMENT CHARACTER (U+FFFD) appearing
+        # in a TXT record means the customer's DNS provider stored binary
+        # garbage in the record — usually a copy-paste error. Logging it
+        # at WARNING level lets support point at the cause without having
+        # to reproduce the failure locally.
+        if '\ufffd' in decoded:
+            logger.warning(
+                "TXT record contained invalid UTF-8 bytes; replacement "
+                "characters substituted (decoded value: %r)",
+                decoded,
+            )
+        return decoded
+    return str(rdata).strip('"')
+
+
+def verify_dns_ownership(domain: str) -> None:
+    """Re-verify DNS ownership before certificate issuance (TOCTOU mitigation).
+
+    Resolves _layerv-verify.{domain} TXT record and confirms it still matches
+    the verification_token stored in the qurl-domains DynamoDB table. This
+    closes the time-of-check-time-of-use gap between the Go service's initial
+    DNS verification and the Lambda's certificate issuance.
+
+    Note: this check runs on **every** call to provision_certificate, including
+    renewals scheduled by renewal_scan(). Customers must therefore keep the
+    _layerv-verify TXT record in place for the lifetime of the domain — not
+    only during initial onboarding. This is an intentional security property:
+    if a domain changes hands, the new owner cannot inherit our certificate
+    issuance just by leaving the ACME CNAME in place.
+
+    Args:
+        domain: The custom domain to verify ownership of.
+
+    Raises:
+        DnsOwnershipError: If the TXT record is missing, mismatched, or the
+            verification token cannot be retrieved from DynamoDB.
+    """
+    if not QURL_DOMAINS_TABLE:
+        logger.warning("No QURL_DOMAINS_TABLE configured, skipping DNS ownership re-verification")
+        return
+
+    # 1. Fetch the expected verification token from DynamoDB.
+    # Use ConsistentRead so we never race against an in-flight Update from the
+    # Go service that just rotated the token (e.g. operator-initiated reset).
+    try:
+        response = dynamodb_client.get_item(
+            TableName=QURL_DOMAINS_TABLE,
+            Key={'domain': {'S': domain}},
+            ProjectionExpression='verification_token',
+            ConsistentRead=True,
+        )
+    except ClientError as e:
+        # Surface the AWS error code in logs but keep the customer-visible
+        # error message generic so we never leak account/table identifiers.
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        logger.error(
+            f"DynamoDB GetItem failed during DNS ownership re-verification for {domain}: "
+            f"code={error_code} err={e}"
+        )
+        raise DnsOwnershipError(
+            f"Failed to fetch verification token from DynamoDB for {domain} "
+            f"(code={error_code})"
+        ) from e
+
+    item = response.get('Item')
+    if not item:
+        raise DnsOwnershipError(
+            f"Domain {domain} not found in DynamoDB during DNS ownership re-verification"
+        )
+
+    # Distinguish "attribute was never written" from "attribute exists but
+    # is empty." The first state should be impossible for any domain that
+    # went through the Go service's registration handler — it indicates
+    # corruption, a manual table edit, or a legacy row that pre-dates the
+    # verification_token column. The second state is a stronger signal of
+    # active tampering (someone cleared the value). Operators get distinct
+    # error messages so they can choose the right incident response.
+    token_attr = item.get('verification_token')
+    if token_attr is None:
+        raise DnsOwnershipError(
+            f"verification_token attribute missing for {domain} in DynamoDB "
+            f"(legacy row or corrupted state)"
+        )
+    expected_token = token_attr.get('S', '') if isinstance(token_attr, dict) else ''
+    if not expected_token:
+        raise DnsOwnershipError(
+            f"verification_token stored for {domain} in DynamoDB is empty "
+            f"(possible tampering — investigate)"
+        )
+
+    # 2. Resolve _layerv-verify.{domain} TXT record via public DNS.
+    # We deliberately bypass the VPC resolver here to mirror the path Let's
+    # Encrypt itself uses (public recursive resolvers) — anything reachable
+    # only from inside our VPC would be a false positive. Timeout values
+    # are module-level constants (DNS_QUERY_TIMEOUT_SECONDS / _LIFETIME /
+    # _SLOW_WARNING) so they're easy to tune without hunting through the
+    # function body.
+    lazy_import_dns()
+    verify_name = f"_layerv-verify.{domain}"
+    res = dns_resolver.Resolver()
+    res.nameservers = list(DNS_NAMESERVERS)
+    res.timeout = DNS_QUERY_TIMEOUT_SECONDS
+    res.lifetime = DNS_QUERY_LIFETIME_SECONDS
+
+    resolve_started = time.monotonic()
+    try:
+        answers = res.resolve(verify_name, 'TXT')
+    except dns_resolver.NXDOMAIN as e:
+        raise DnsOwnershipError(
+            f"DNS ownership check failed for {domain}: "
+            f"{verify_name} does not exist (NXDOMAIN)"
+        ) from e
+    except dns_resolver.NoAnswer as e:
+        raise DnsOwnershipError(
+            f"DNS ownership check failed for {domain}: "
+            f"{verify_name} has no TXT records"
+        ) from e
+    except dns_exception.Timeout as e:
+        raise DnsOwnershipError(
+            f"DNS ownership check failed for {domain}: "
+            f"timed out resolving {verify_name} TXT record"
+        ) from e
+    except dns_exception.DNSException as e:
+        # Catch-all for other dnspython errors (NoNameservers, ServFail, etc).
+        raise DnsOwnershipError(
+            f"DNS ownership check failed for {domain}: "
+            f"could not resolve {verify_name} TXT record: {type(e).__name__}"
+        ) from e
+    finally:
+        elapsed = time.monotonic() - resolve_started
+        # Warn close to the lifetime budget rather than at the per-query
+        # timeout: legitimate retries can run a few seconds without indicating
+        # a real problem, but anything beyond DNS_SLOW_WARNING_SECONDS is
+        # approaching the lifetime ceiling and is worth surfacing in
+        # CloudWatch.
+        if elapsed > DNS_SLOW_WARNING_SECONDS:
+            logger.warning(
+                f"Slow DNS ownership resolution for {domain}: {elapsed:.1f}s "
+                f"(threshold {DNS_SLOW_WARNING_SECONDS}s, lifetime {DNS_QUERY_LIFETIME_SECONDS}s)"
+            )
+
+    # 3. Compare resolved TXT value against expected token.
+    #
+    # Comparison is byte-for-byte case-sensitive on purpose. The Go service
+    # generates verification tokens via crypto/rand and base64-url-encodes
+    # them, so the alphabet is mixed case. A case-insensitive compare here
+    # would let an attacker who guessed (or partially observed) a token
+    # bypass verification by toggling case. The cost of strict matching is
+    # zero — legitimate clients echo the token verbatim into the TXT record.
+    expected_ttl = getattr(answers.rrset, 'ttl', None) if getattr(answers, 'rrset', None) else None
+    for rdata in answers:
+        txt_value = _txt_rdata_to_string(rdata)
+        if txt_value == expected_token:
+            # Log the TTL on success too: operators tracking cache behaviour
+            # during normal operations want to see the same field they see
+            # on the failure path, not have to dig it out of CloudTrail.
+            logger.info(
+                f"DNS ownership re-verified for {domain} (TTL: {expected_ttl})"
+            )
+            return
+
+    # Collect what we found for the error message. expected_ttl was already
+    # computed above so the operator sees the same value regardless of
+    # whether the comparison succeeded or failed; the TTL helps distinguish
+    # a slow-propagating cache (high TTL) from an actively-removed record.
+    found_values = [_txt_rdata_to_string(rdata) for rdata in answers]
+    if not found_values:
+        # dnspython usually raises NoAnswer for an empty TXT rrset, but the
+        # contract on `resolve()` does not strictly guarantee it — be explicit
+        # so the operator-facing error doesn't say "Found: []" without
+        # explanation.
+        raise DnsOwnershipError(
+            f"DNS ownership check failed for {domain}: "
+            f"no TXT values returned for _layerv-verify (TTL: {expected_ttl})"
+        )
+    raise DnsOwnershipError(
+        f"DNS ownership check failed for {domain}: "
+        f"_layerv-verify TXT record does not match verification token. "
+        f"Found: {found_values} (TTL: {expected_ttl})"
+    )
 
 
 def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = False) -> Dict[str, Any]:
@@ -326,8 +611,19 @@ def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = Fa
             'reason': 'concurrent provisioning in progress',
         }
 
-    failure_category = FAILURE_ACME_ACCOUNT
+    # Start with DNS ownership as the default failure category since the
+    # re-verification below is the first fallible step. Once DNS ownership
+    # is confirmed, we transition to FAILURE_ACME_ACCOUNT for ACME/issuance
+    # failures downstream.
+    failure_category = FAILURE_DNS_OWNERSHIP
     try:
+        # Re-verify DNS ownership before proceeding (closes TOCTOU gap).
+        # This confirms that _layerv-verify.{domain} TXT still matches the
+        # token in DynamoDB, preventing cert issuance if DNS changed since
+        # the Go service's initial verification.
+        verify_dns_ownership(domain)
+
+        failure_category = FAILURE_ACME_ACCOUNT
         lazy_import_acme()
 
         # Generate new RSA 4096 private key
@@ -384,6 +680,13 @@ def provision_certificate(domain: str, acme_subdomain: str, skip_sync: bool = Fa
             'cert_param_prefix': cert_param_prefix
         }
 
+    except DnsOwnershipError as e:
+        logger.error(f"DNS ownership re-verification failed for {domain}: {str(e)}", exc_info=True)
+        update_domain_status(domain, STATUS_FAILED, error=str(e))
+        send_alert(f"Certificate provisioning BLOCKED for {domain}: {str(e)}")
+        publish_failure_metric(FAILURE_DNS_OWNERSHIP)
+        _release_provisioning_lock(domain)
+        raise
     except DnsValidationError as e:
         logger.error(f"Certificate provisioning failed for {domain}: {str(e)}", exc_info=True)
         update_domain_status(domain, STATUS_FAILED, error=str(e))
@@ -887,11 +1190,13 @@ def delete_acme_txt_record(record_name: str):
 
 
 def lazy_import_dns():
-    """Lazy import dns.resolver to reduce cold start when DNS checks aren't needed."""
-    global dns_resolver
+    """Lazy import dns.resolver/dns.exception to reduce cold start when DNS checks aren't needed."""
+    global dns_resolver, dns_exception
     if dns_resolver is None:
         import dns.resolver as _dns_resolver
+        import dns.exception as _dns_exception
         dns_resolver = _dns_resolver
+        dns_exception = _dns_exception
 
 
 def wait_for_dns_propagation(record_name: str, expected_value: str, max_attempts: int = 30, delay: int = 10):
@@ -933,7 +1238,7 @@ def _put_ssm_secure_param(name: str, value: str):
 
 
 def store_certificate(domain: str, private_key_pem: str, cert_pem: str, chain_pem: str,
-                      expires_at: str, acme_subdomain: str = None) -> str:
+                      expires_at: str, acme_subdomain: Optional[str] = None) -> str:
     """
     Store certificate in SSM Parameter Store as three parameters.
 
@@ -971,8 +1276,8 @@ def store_certificate(domain: str, private_key_pem: str, cert_pem: str, chain_pe
     return param_prefix
 
 
-def update_domain_status(domain: str, status: str, cert_param_prefix: str = None,
-                         cert_expires_at: str = None, error: str = None):
+def update_domain_status(domain: str, status: str, cert_param_prefix: Optional[str] = None,
+                         cert_expires_at: Optional[str] = None, error: Optional[str] = None):
     """Update domain status in the qurl-domains DynamoDB table."""
     if not QURL_DOMAINS_TABLE:
         logger.info("No QURL_DOMAINS_TABLE configured, skipping status update")
@@ -1095,7 +1400,7 @@ def send_alert(message: str, is_error: bool = True):
         logger.error(f"Failed to send SNS alert: {e}")
 
 
-def publish_metric(metric_name: str, value: float, dimensions: list = None):
+def publish_metric(metric_name: str, value: float, dimensions: Optional[List[Dict[str, str]]] = None):
     """Publish a metric to CloudWatch."""
     try:
         metric_data = {
@@ -1115,7 +1420,7 @@ def publish_metric(metric_name: str, value: float, dimensions: list = None):
         logger.error(f"Failed to publish CloudWatch metric {metric_name}: {e}")
 
 
-def publish_failure_metric(category: str = None):
+def publish_failure_metric(category: Optional[str] = None):
     """Publish a provisioning failure metric to CloudWatch.
 
     Publishes two data points: one without dimensions (for the existing alarm)
