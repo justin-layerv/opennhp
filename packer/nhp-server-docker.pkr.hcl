@@ -269,12 +269,30 @@ build {
     }
 
     post-processor "shell-local" {
-      inline_shebang = "/bin/bash -euo pipefail"
+      # IMPORTANT: do NOT use a multi-arg shebang here.
+      #
+      # An earlier version of this block had:
+      #   inline_shebang = "/bin/bash -euo pipefail"
+      # which works on macOS but FAILS on Linux. The Linux kernel passes
+      # everything after the interpreter as ONE argument, so when bash
+      # runs it sees "-euo pipefail" (single string with embedded space)
+      # as a single token and rejects it with:
+      #   /bin/bash: line 0: /bin/bash: ...: invalid option name
+      # That's exactly what broke the post-#967 main run on the first
+      # build that ever reached this post-processor (#252's earlier
+      # latent bugs masked it for the entire #252 → #961 → #965 → #967
+      # hotfix chain).
+      #
+      # Use a single-arg shebang and put `set -euo pipefail` as the
+      # first inline command instead. Same strict-mode semantics, no
+      # platform-specific shebang parsing.
+      inline_shebang = "/bin/bash"
       environment_vars = [
         "AWS_REGION=${var.aws_region}",
         "ENVIRONMENT=${var.environment}",
       ]
       inline = [
+        "set -euo pipefail",
         "echo '=== Publishing AMI ID to SSM ==='",
         "MANIFEST=\"manifest-$ENVIRONMENT.json\"",
         # Always clean up the manifest on exit, including the failure paths
