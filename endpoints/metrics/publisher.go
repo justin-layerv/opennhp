@@ -3,12 +3,17 @@ package metrics
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"maps"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -17,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 
 	"github.com/OpenNHP/opennhp/nhp/log"
+	"github.com/OpenNHP/opennhp/nhp/utils"
 )
 
 // loadAWSConfig is the function used to load AWS configuration.
@@ -41,6 +47,36 @@ const (
 	// Under sustained high load (~170 knocks/sec), the slice would grow to ~10k entries
 	// per 60s flush interval. Beyond this cap, new samples are dropped to bound memory.
 	maxLatencySamples = 10000
+
+	// defaultCheckpointInterval is how often metrics state is saved to disk.
+	// 15s is a quarter of flushInterval (60s): a crash loses at most 15s of
+	// accumulated metrics, while the per-tick cost (one snapshot + one
+	// fsynced rename of a small JSON file) stays well under a millisecond
+	// on SSD. Shorter intervals reduce loss further but burn more disk;
+	// longer intervals risk losing more between checkpoints.
+	defaultCheckpointInterval = 15 * time.Second
+
+	// checkpointFileName is the file name within the checkpoint directory.
+	checkpointFileName = "nhp-metrics-checkpoint.json"
+
+	// checkpointTempFileName is the staging file name used by saveCheckpoint
+	// before atomically renaming over checkpointFileName. A fixed name keeps
+	// the on-disk path statically derivable from the validated parent dir
+	// (no random suffix from os.CreateTemp), which lets the rename target be
+	// trivially provable as residing inside the checkpoint directory.
+	checkpointTempFileName = "nhp-metrics-checkpoint.json.tmp"
+
+	// checkpointSchemaVersion identifies the on-disk checkpoint schema.
+	// Bump this any time the checkpoint struct is extended or changed
+	// in a way that would silently misinterpret older files.
+	checkpointSchemaVersion = 1
+
+	// MetricCheckpointWriteFailure is incremented every time the periodic
+	// checkpoint writer fails to persist a snapshot to disk (e.g. disk full,
+	// permission revoked, parent directory unmounted). It is published as a
+	// regular CloudWatch counter on the next flush so operators can alarm on
+	// "checkpointing has been silently broken for N intervals".
+	MetricCheckpointWriteFailure = "CheckpointWriteFailure"
 )
 
 // HealthProbe is a function that returns true if the storage backend is healthy.
@@ -54,6 +90,14 @@ type GaugeFunc func() float64
 type Config struct {
 	Namespace  string            // CloudWatch namespace (e.g. "NHP/AC", "LayerV/NHP")
 	Dimensions []types.Dimension // Shared dimensions attached to all metrics
+
+	// CheckpointDir is the directory for metric checkpoint files.
+	// If empty, checkpointing is disabled.
+	CheckpointDir string
+
+	// CheckpointInterval controls how often metrics state is saved to disk.
+	// Defaults to 15 seconds if CheckpointDir is set and this is zero.
+	CheckpointInterval time.Duration
 }
 
 // dimCounterEntry holds a counter with custom dimensions.
@@ -81,10 +125,63 @@ type Publisher struct {
 	healthProbe HealthProbe          // optional: emits StorageHealthy gauge each flush
 	gaugeFuncs  map[string]GaugeFunc // metric name → func called each flush
 	emfWriter   io.Writer            // destination for EMF JSON lines (defaults to os.Stdout)
+
+	// Checkpoint fields (empty checkpointDir means checkpointing disabled)
+	checkpointDir      string
+	checkpointInterval time.Duration
+}
+
+// checkpointEnabled reports whether the publisher persists periodic
+// checkpoints to disk. Centralizes the empty-string check used at every
+// checkpoint call site so the invariant lives in one place.
+func (mp *Publisher) checkpointEnabled() bool {
+	return mp.checkpointDir != ""
+}
+
+// recoverFromCheckpoint loads any existing checkpoint and merges it into the
+// publisher's in-memory state. Stale checkpoints (older than 2*flushInterval)
+// are dropped without merging. No-op when checkpointing is disabled.
+//
+// Safe to call without holding mp.mu: NewPublisher invokes this before the
+// flushLoop goroutine starts, so there are no other readers or writers yet.
+//
+// The on-disk file is removed only AFTER mergeCheckpoint completes, so a
+// crash between load and merge leaves the file in place for the next start
+// to retry instead of silently dropping the metrics it contained.
+func (mp *Publisher) recoverFromCheckpoint() {
+	if !mp.checkpointEnabled() {
+		return
+	}
+	cp, loadErr := loadCheckpoint(mp.checkpointDir)
+	if loadErr != nil {
+		log.Warning("failed to load metrics checkpoint: %v", loadErr)
+		return
+	}
+	if cp == nil {
+		return
+	}
+	cpAge := time.Since(cp.Timestamp)
+	stalenessThreshold := 2 * flushInterval
+	if cpAge > stalenessThreshold {
+		log.Warning("discarding stale metrics checkpoint (age=%s, threshold=%s)",
+			cpAge.Truncate(time.Second), stalenessThreshold)
+		// Stale data can never be replayed safely. Remove it so the
+		// next start does not log the same warning forever.
+		removeCheckpoint(mp.checkpointDir)
+		return
+	}
+	mp.mergeCheckpoint(cp)
+	// Merge succeeded; the on-disk copy has been absorbed into in-memory
+	// state and any subsequent flush will publish (or re-checkpoint) it.
+	removeCheckpoint(mp.checkpointDir)
+	log.Info("recovered metrics checkpoint from %s (age=%s)",
+		mp.checkpointDir, cpAge.Truncate(time.Second))
 }
 
 // NewPublisher creates a CloudWatch metrics publisher.
 // Returns nil if AWS config cannot be loaded (e.g., running locally without IAM).
+// If CheckpointDir is set, the publisher loads any existing checkpoint from a
+// previous crash and periodically saves metric state to disk.
 func NewPublisher(cfg Config) *Publisher {
 	ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
 	defer cancel()
@@ -95,18 +192,43 @@ func NewPublisher(cfg Config) *Publisher {
 		return nil
 	}
 
-	mp := &Publisher{
-		client:      cloudwatch.NewFromConfig(awsCfg),
-		namespace:   cfg.Namespace,
-		counters:    make(map[string]float64),
-		dimCounters: make(map[string]*dimCounterEntry),
-		gauges:      make(map[string]float64),
-		latencies:   make(map[string][]float64),
-		dims:        cfg.Dimensions,
-		stop:        make(chan struct{}),
-		gaugeFuncs:  make(map[string]GaugeFunc),
-		emfWriter:   os.Stdout,
+	cpInterval := cfg.CheckpointInterval
+	cpDir := cfg.CheckpointDir
+	if cpDir != "" {
+		if cpInterval == 0 {
+			cpInterval = defaultCheckpointInterval
+		}
+		// Validate the checkpoint directory at construction so a misconfig
+		// (path doesn't exist, isn't writable, fails the path-traversal
+		// guard) surfaces as a startup warning instead of a silent
+		// MetricCheckpointWriteFailure increment 15s into the process. We
+		// disable checkpointing for this publisher on failure rather than
+		// failing the whole metrics pipeline — losing checkpointing is much
+		// better than losing all metrics.
+		if _, _, _, resolveErr := resolveCheckpointTarget(cpDir); resolveErr != nil {
+			log.Warning("CloudWatch metrics: CheckpointDir %q rejected (%v) — checkpointing disabled for this publisher",
+				cpDir, resolveErr)
+			cpDir = ""
+			cpInterval = 0
+		}
 	}
+
+	mp := &Publisher{
+		client:             cloudwatch.NewFromConfig(awsCfg),
+		namespace:          cfg.Namespace,
+		counters:           make(map[string]float64),
+		dimCounters:        make(map[string]*dimCounterEntry),
+		gauges:             make(map[string]float64),
+		latencies:          make(map[string][]float64),
+		dims:               cfg.Dimensions,
+		stop:               make(chan struct{}),
+		gaugeFuncs:         make(map[string]GaugeFunc),
+		emfWriter:          os.Stdout,
+		checkpointDir:      cpDir,
+		checkpointInterval: cpInterval,
+	}
+
+	mp.recoverFromCheckpoint()
 
 	mp.wg.Add(1)
 	go mp.flushLoop()
@@ -115,8 +237,13 @@ func NewPublisher(cfg Config) *Publisher {
 	for i, d := range cfg.Dimensions {
 		dimDesc[i] = *d.Name + "=" + *d.Value
 	}
-	log.Info("CloudWatch metrics publisher started (namespace=%s, dims=[%s], emf=enabled)",
-		cfg.Namespace, strings.Join(dimDesc, ", "))
+
+	cpStatus := "disabled"
+	if mp.checkpointEnabled() {
+		cpStatus = mp.checkpointDir + " every " + mp.checkpointInterval.String()
+	}
+	log.Info("CloudWatch metrics publisher started (namespace=%s, dims=[%s], emf=enabled, checkpoint=%s)",
+		cfg.Namespace, strings.Join(dimDesc, ", "), cpStatus)
 	return mp
 }
 
@@ -218,6 +345,8 @@ func (mp *Publisher) RecordLatency(name string, ms float64) {
 // Stop gracefully shuts down the publisher, flushing remaining metrics.
 // It waits for the flushLoop goroutine to exit before performing the final flush
 // to prevent concurrent flush operations. Safe to call multiple times.
+// On graceful shutdown the checkpoint file is removed since the final flush
+// captures all pending metrics.
 func (mp *Publisher) Stop() {
 	if mp == nil {
 		return
@@ -231,18 +360,51 @@ func (mp *Publisher) Stop() {
 
 func (mp *Publisher) flushLoop() {
 	defer mp.wg.Done()
-	ticker := time.NewTicker(flushInterval)
-	defer ticker.Stop()
+	flushTicker := time.NewTicker(flushInterval)
+	defer flushTicker.Stop()
 
+	// Checkpoint ticker: only active when checkpointing is enabled.
+	var cpTickerC <-chan time.Time
+	if mp.checkpointEnabled() {
+		cpTicker := time.NewTicker(mp.checkpointInterval)
+		defer cpTicker.Stop()
+		cpTickerC = cpTicker.C
+	}
+
+	// flush and writeCheckpoint share this single goroutine via the select
+	// below, so they cannot run concurrently during normal operation. That
+	// property is what lets flush() drop the checkpoint file outside its
+	// write lock without any inter-goroutine synchronization.
+	//
+	// Stop() also calls flush() once after wg.Wait() returns; that call is
+	// safe because the flushLoop goroutine has already exited by then, so
+	// no concurrent writeCheckpoint can be in flight.
 	for {
 		select {
-		case <-ticker.C:
+		case <-flushTicker.C:
 			mp.collectGauges()
 			mp.probeHealth()
 			mp.flush()
+		case <-cpTickerC:
+			mp.writeCheckpoint()
 		case <-mp.stop:
 			return
 		}
+	}
+}
+
+// writeCheckpoint snapshots current in-memory metrics to disk. Persistent
+// failures (disk full, perms revoked, etc.) are surfaced via the
+// MetricCheckpointWriteFailure counter so operators can alarm on a
+// checkpointing outage in addition to seeing the warning logs.
+func (mp *Publisher) writeCheckpoint() {
+	mp.mu.RLock()
+	cp := mp.snapshotToCheckpoint()
+	mp.mu.RUnlock()
+
+	if err := saveCheckpoint(mp.checkpointDir, cp); err != nil {
+		log.Warning("failed to write metrics checkpoint: %v", err)
+		mp.IncrCounter(MetricCheckpointWriteFailure)
 	}
 }
 
@@ -310,6 +472,24 @@ func (mp *Publisher) flush() {
 	mp.gauges = make(map[string]float64)
 	mp.latencies = make(map[string][]float64)
 	mp.mu.Unlock()
+
+	// Drop the checkpoint after the swap so a crash *between this point and
+	// the next writeCheckpoint* cannot replay metrics that have just been
+	// flushed: on recovery there is no checkpoint file, so we start from a
+	// clean in-memory state. We deliberately remove BEFORE attempting the
+	// CloudWatch publish below to bias toward "lose a few datapoints on a
+	// publish-failure-then-crash" instead of "double-count on every crash
+	// after a successful publish". Metric over-counting can fire alarms
+	// spuriously, which is operationally worse than the small loss window.
+	//
+	// Runs outside the write lock because writeCheckpoint and flush share
+	// the flushLoop goroutine (or, during shutdown, the flushLoop has
+	// already exited before Stop() invokes flush()), so they cannot race.
+	// Holding the write lock here would only block recorders (IncrCounter
+	// etc.) for the duration of an unrelated unlink syscall.
+	if mp.checkpointEnabled() {
+		removeCheckpoint(mp.checkpointDir)
+	}
 
 	mp.emitEMF(latencies)
 
@@ -537,4 +717,309 @@ func dimsSorted(dims []types.Dimension) bool {
 		}
 	}
 	return true
+}
+
+// ============================================================================
+// Crash-Resilient Metric Checkpointing
+// ============================================================================
+
+// checkpointDimension is a JSON-friendly representation of types.Dimension.
+type checkpointDimension struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// checkpointDimCounter is a JSON-friendly representation of dimCounterEntry.
+type checkpointDimCounter struct {
+	MetricName string                `json:"metric_name"`
+	Dims       []checkpointDimension `json:"dims"`
+	Value      float64               `json:"value"`
+}
+
+// checkpoint is the on-disk representation of accumulated metrics state.
+// Bump checkpointSchemaVersion any time a field is added, removed, or
+// reinterpreted so older files are discarded on load instead of being
+// silently merged with missing fields.
+type checkpoint struct {
+	Version     int                             `json:"version"`
+	Timestamp   time.Time                       `json:"timestamp"`
+	Counters    map[string]float64              `json:"counters,omitempty"`
+	DimCounters map[string]checkpointDimCounter `json:"dim_counters,omitempty"`
+	Gauges      map[string]float64              `json:"gauges,omitempty"`
+	Latencies   map[string][]float64            `json:"latencies,omitempty"`
+}
+
+// resolveCheckpointTarget validates the checkpoint directory and returns the
+// resolved absolute final and temp paths. Callers only pass the trusted
+// service-owned CheckpointDir today, but this guard keeps any future caller
+// from inducing a traversal via the directory argument by funneling every
+// checkpoint path through the same nhp/utils traversal helpers used in
+// httpstorage.go and kbs/resource.go.
+func resolveCheckpointTarget(dir string) (absDir, target, tmpTarget string, err error) {
+	absDir, err = filepath.Abs(dir)
+	if err != nil {
+		return "", "", "", fmt.Errorf("resolve checkpoint dir: %w", err)
+	}
+	absDir = filepath.Clean(absDir)
+
+	target, err = checkpointChildPath(absDir, checkpointFileName)
+	if err != nil {
+		return "", "", "", err
+	}
+	tmpTarget, err = checkpointChildPath(absDir, checkpointTempFileName)
+	if err != nil {
+		return "", "", "", err
+	}
+	return absDir, target, tmpTarget, nil
+}
+
+// checkpointChildPath joins parent and name, asserting that name is a plain
+// basename and that the resulting absolute path stays inside parent.
+func checkpointChildPath(parent, name string) (string, error) {
+	if !utils.IsValidPathComponent(name) {
+		return "", fmt.Errorf("invalid checkpoint file name %q", name)
+	}
+	p := filepath.Join(parent, name)
+	if !utils.IsPathWithinDir(p, parent) {
+		return "", fmt.Errorf("checkpoint path %q escapes parent %q", p, parent)
+	}
+	return p, nil
+}
+
+func saveCheckpoint(dir string, cp *checkpoint) error {
+	data, err := json.Marshal(cp)
+	if err != nil {
+		return fmt.Errorf("marshal checkpoint: %w", err)
+	}
+
+	absDir, target, tmpName, err := resolveCheckpointTarget(dir)
+	if err != nil {
+		return err
+	}
+
+	// Clear any temp leftover from a previous run that crashed between
+	// open and rename. Once cleared, the O_EXCL on the open below means a
+	// pre-existing symlink at tmpName cannot be followed: the open will
+	// fail rather than write through the symlink to an attacker-chosen
+	// path.
+	if removeErr := os.Remove(tmpName); removeErr != nil && !os.IsNotExist(removeErr) {
+		return fmt.Errorf("clear stale temp checkpoint file %q: %w", tmpName, removeErr)
+	}
+
+	// Unconditional cleanup: harmless after a successful rename (os.Remove
+	// returns ENOENT, which we ignore) and prevents temp-file leaks on any
+	// error path between here and the rename.
+	defer func() {
+		if removeErr := os.Remove(tmpName); removeErr != nil && !os.IsNotExist(removeErr) {
+			log.Warning("failed to remove temp checkpoint file %q: %v", tmpName, removeErr)
+		}
+	}()
+
+	// O_EXCL closes the symlink-following hole: if anything pre-creates a
+	// symlink at tmpName between the os.Remove above and this open, the
+	// open will fail with EEXIST instead of writing through the symlink.
+	tmp, err := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("create temp checkpoint file: %w", err)
+	}
+
+	// On Write/Sync failure we still need to close the handle to release
+	// the fd, but the close itself can also fail (e.g. on a networked
+	// filesystem when the underlying connection drops). errors.Join
+	// surfaces both errors when close fails and degrades cleanly to just
+	// the original error when close succeeds — errors.Join with a nil
+	// argument returns the non-nil one. CodeQL would otherwise flag the
+	// dropped close error as a potential data-loss path on these branches.
+	if _, werr := tmp.Write(data); werr != nil {
+		return errors.Join(fmt.Errorf("write checkpoint data: %w", werr), tmp.Close())
+	}
+	if syncErr := tmp.Sync(); syncErr != nil {
+		return errors.Join(fmt.Errorf("sync checkpoint data to disk: %w", syncErr), tmp.Close())
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp checkpoint file: %w", err)
+	}
+
+	if err := os.Rename(tmpName, target); err != nil {
+		return fmt.Errorf("rename checkpoint file: %w", err)
+	}
+
+	// Fsync the parent directory so the rename's metadata is durable on a
+	// hard crash. Without this the file's contents are on disk (we synced
+	// earlier) but the directory entry pointing at them may not survive a
+	// power loss, leaving the checkpoint as a phantom file the next start
+	// cannot find. Best-effort: directory fsync is widely supported on
+	// POSIX filesystems but not all platforms (e.g. Windows) implement it,
+	// so we log and continue rather than failing the save.
+	if dirF, dirErr := os.Open(absDir); dirErr == nil {
+		if syncErr := dirF.Sync(); syncErr != nil && !errors.Is(syncErr, syscall.EINVAL) {
+			log.Warning("failed to fsync checkpoint dir %q: %v", absDir, syncErr)
+		}
+		dirF.Close()
+	} else {
+		log.Warning("failed to open checkpoint dir %q for fsync: %v", absDir, dirErr)
+	}
+
+	return nil
+}
+
+// loadCheckpoint reads and removes the checkpoint file at dir, returning the
+// parsed contents. Returns (nil, nil) when there is nothing safe to merge —
+// either the file does not exist or it carries an incompatible schema
+// version (in which case the file is also deleted and a warning is logged).
+// A non-nil error indicates a real I/O or unmarshal failure that the caller
+// should surface.
+//
+// NOTE: the file is removed inside this function only on the *incompatible
+// schema* path. On the happy path the caller (recoverFromCheckpoint) is
+// responsible for removing the file via removeCheckpoint after the merge
+// succeeds, so a panic between load and merge does not silently lose data.
+func loadCheckpoint(dir string) (*checkpoint, error) {
+	// Funnel the read through the same path validator that saveCheckpoint
+	// uses so a future caller passing a hostile dir cannot induce a read
+	// outside the trusted directory.
+	_, target, _, err := resolveCheckpointTarget(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := os.ReadFile(target)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read checkpoint file: %w", err)
+	}
+
+	var cp checkpoint
+	if err := json.Unmarshal(data, &cp); err != nil {
+		return nil, fmt.Errorf("unmarshal checkpoint: %w", err)
+	}
+
+	// Schema version guard: any value other than checkpointSchemaVersion
+	// (including zero from an untagged file) means the on-disk layout is
+	// from an incompatible schema and must not be merged into live state.
+	// Remove the file here because we know it can never be useful — leaving
+	// it on disk would just trip the same warning on every restart.
+	if cp.Version != checkpointSchemaVersion {
+		log.Warning("discarding metrics checkpoint with unsupported version (got=%d, want=%d)",
+			cp.Version, checkpointSchemaVersion)
+		if removeErr := os.Remove(target); removeErr != nil && !os.IsNotExist(removeErr) {
+			log.Warning("failed to remove incompatible checkpoint file: %v", removeErr)
+		}
+		return nil, nil
+	}
+
+	return &cp, nil
+}
+
+func removeCheckpoint(dir string) {
+	// Funnel the unlink through the same path validator that
+	// saveCheckpoint and loadCheckpoint use, so all three checkpoint
+	// I/O paths share one trust boundary.
+	_, target, _, err := resolveCheckpointTarget(dir)
+	if err != nil {
+		log.Warning("failed to resolve checkpoint dir for removal: %v", err)
+		return
+	}
+	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+		log.Warning("failed to remove checkpoint file: %v", err)
+	}
+}
+
+// snapshotToCheckpoint copies the in-memory metric state into a serialisable
+// checkpoint. The caller must be holding mp.mu so the maps cannot mutate
+// underneath us.
+//
+// gaugeFuncs is intentionally NOT included: gauge functions are pure
+// closures that re-derive their value from live process state on every
+// flush, so they cannot meaningfully survive a process crash. Whatever
+// gauge functions exist after restart are re-registered by the same setup
+// code that registered them the first time, and the next flush will pick
+// up their current values.
+func (mp *Publisher) snapshotToCheckpoint() *checkpoint {
+	cp := &checkpoint{
+		Version:   checkpointSchemaVersion,
+		Timestamp: time.Now(),
+		// Counters and gauges are scalar maps, so maps.Clone is a correct
+		// deep copy. dimCounters and latencies hold pointers/slices and
+		// must be cloned by hand below.
+		Counters: maps.Clone(mp.counters),
+		Gauges:   maps.Clone(mp.gauges),
+	}
+
+	if len(mp.dimCounters) > 0 {
+		cp.DimCounters = make(map[string]checkpointDimCounter, len(mp.dimCounters))
+		for k, entry := range mp.dimCounters {
+			dims := make([]checkpointDimension, len(entry.dims))
+			for i, dd := range entry.dims {
+				dims[i] = checkpointDimension{
+					Name:  aws.ToString(dd.Name),
+					Value: aws.ToString(dd.Value),
+				}
+			}
+			cp.DimCounters[k] = checkpointDimCounter{
+				MetricName: entry.metricName,
+				Dims:       dims,
+				Value:      entry.value,
+			}
+		}
+	}
+
+	if len(mp.latencies) > 0 {
+		cp.Latencies = make(map[string][]float64, len(mp.latencies))
+		for k, v := range mp.latencies {
+			cp.Latencies[k] = slices.Clone(v)
+		}
+	}
+
+	return cp
+}
+
+func (mp *Publisher) mergeCheckpoint(cp *checkpoint) {
+	if cp == nil {
+		return
+	}
+
+	for k, v := range cp.Counters {
+		mp.counters[k] += v
+	}
+
+	for k, cpEntry := range cp.DimCounters {
+		existing, exists := mp.dimCounters[k]
+		if exists {
+			existing.value += cpEntry.Value
+		} else {
+			dims := make([]types.Dimension, len(cpEntry.Dims))
+			for i, dd := range cpEntry.Dims {
+				dims[i] = types.Dimension{
+					Name:  aws.String(dd.Name),
+					Value: aws.String(dd.Value),
+				}
+			}
+			mp.dimCounters[k] = &dimCounterEntry{
+				metricName: cpEntry.MetricName,
+				dims:       dims,
+				value:      cpEntry.Value,
+			}
+		}
+	}
+
+	for k, v := range cp.Gauges {
+		if _, exists := mp.gauges[k]; !exists {
+			mp.gauges[k] = v
+		}
+	}
+
+	for k, v := range cp.Latencies {
+		existing := mp.latencies[k]
+		remaining := maxLatencySamples - len(existing)
+		if remaining <= 0 {
+			continue
+		}
+		if len(v) > remaining {
+			v = v[:remaining]
+		}
+		mp.latencies[k] = append(existing, v...)
+	}
 }

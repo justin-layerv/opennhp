@@ -29,9 +29,9 @@ import (
 
 // Plugin manifest structure (matches Terraform output)
 type PluginManifest struct {
-	GeneratedAt   string                    `json:"generated_at"`
-	Environment   string                    `json:"environment"`
-	ServerPlugins map[string]ServerPlugin   `json:"server_plugins"`
+	GeneratedAt    string                   `json:"generated_at"`
+	Environment    string                   `json:"environment"`
+	ServerPlugins  map[string]ServerPlugin  `json:"server_plugins"`
 	TraefikPlugins map[string]TraefikPlugin `json:"traefik_plugins"`
 }
 
@@ -246,9 +246,9 @@ func TestPlugins_BucketStructure(t *testing.T) {
 	for _, prefix := range expectedPrefixes {
 		t.Run(prefix, func(t *testing.T) {
 			resp, err := cfg.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-				Bucket:    aws.String(cfg.bucketName),
-				Prefix:    aws.String(prefix),
-				MaxKeys:   aws.Int32(1),
+				Bucket:  aws.String(cfg.bucketName),
+				Prefix:  aws.String(prefix),
+				MaxKeys: aws.Int32(1),
 			})
 			if err != nil {
 				t.Errorf("Failed to list %s: %v", prefix, err)
