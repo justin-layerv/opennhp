@@ -147,6 +147,12 @@ variable "vpc_cidr" {
   }
 }
 
+variable "deploy_vpc_endpoints" {
+  description = "Deploy additional VPC endpoints for QURL service AWS dependencies (DynamoDB gateway, SQS interface). Default false to avoid cost in environments that don't need them."
+  type        = bool
+  default     = false
+}
+
 # ==================== Server Configuration Options ====================
 
 variable "log_level" {

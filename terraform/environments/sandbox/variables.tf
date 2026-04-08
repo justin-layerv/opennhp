@@ -1483,3 +1483,9 @@ variable "deploy_redis" {
   type        = bool
   default     = false
 }
+
+variable "deploy_vpc_endpoints" {
+  description = "Deploy additional VPC endpoints for QURL service AWS dependencies (DynamoDB gateway, SQS interface)"
+  type        = bool
+  default     = false
+}

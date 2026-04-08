@@ -217,6 +217,9 @@ module "networking" {
   # NHP protection requires NACL to allow port 443 from internet
   # so NLB can route to private subnets (iptables enforces access)
   allow_private_ingress_443 = true
+
+  # QURL service VPC endpoints (DynamoDB gateway, SQS interface)
+  deploy_vpc_endpoints = var.deploy_vpc_endpoints
 }
 
 # Data Module - etcd, EFS, Secrets, Service Discovery

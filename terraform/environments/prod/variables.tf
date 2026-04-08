@@ -899,6 +899,12 @@ variable "deploy_redis" {
   default     = true
 }
 
+variable "deploy_vpc_endpoints" {
+  description = "Deploy additional VPC endpoints for QURL service AWS dependencies (DynamoDB gateway, SQS interface)"
+  type        = bool
+  default     = false
+}
+
 # ==============================================================================
 # Auth0 Configuration
 # ==============================================================================

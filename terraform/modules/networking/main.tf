@@ -15,17 +15,25 @@ locals {
   azs     = slice(data.aws_availability_zones.available.names, 0, 3)
   is_prod = var.environment == "prod"
 
-  # Interface VPC endpoints to create
-  interface_endpoints = {
-    "ecr-api"          = "ecr.api"
-    "ecr-dkr"          = "ecr.dkr"
-    "guardduty-data"   = "guardduty-data" # Required for Runtime Monitoring agent on EC2
-    "logs"             = "logs"
-    "secretsmanager"   = "secretsmanager"
-    "servicediscovery" = "servicediscovery"
-    "ssm"              = "ssm"
-    "ssmmessages"      = "ssmmessages"
-  }
+  # Interface VPC endpoints to create. Always-on endpoints cover the
+  # shared AWS services every workload in the VPC depends on; optional
+  # endpoints gated by var.deploy_vpc_endpoints are for QURL-specific
+  # services we're willing to pay the per-AZ hourly cost for.
+  interface_endpoints = merge(
+    {
+      "ecr-api"          = "ecr.api"
+      "ecr-dkr"          = "ecr.dkr"
+      "guardduty-data"   = "guardduty-data" # Required for Runtime Monitoring agent on EC2
+      "logs"             = "logs"
+      "secretsmanager"   = "secretsmanager"
+      "servicediscovery" = "servicediscovery"
+      "ssm"              = "ssm"
+      "ssmmessages"      = "ssmmessages"
+    },
+    var.deploy_vpc_endpoints ? {
+      "sqs" = "sqs" # QURL license event queue
+    } : {},
+  )
 }
 
 # VPC

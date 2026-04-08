@@ -30,3 +30,9 @@ variable "logs_kms_key_arn" {
   type        = string
   default     = null
 }
+
+variable "deploy_vpc_endpoints" {
+  description = "Deploy additional VPC endpoints for QURL service AWS dependencies (DynamoDB gateway, SQS interface). Reduces NAT gateway costs and improves security by keeping AWS traffic within VPC."
+  type        = bool
+  default     = false
+}

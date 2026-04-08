@@ -262,6 +262,9 @@ module "nhp" {
   # Redis (distributed rate limiting)
   deploy_redis = var.deploy_redis
 
+  # VPC endpoints for QURL service AWS dependencies
+  deploy_vpc_endpoints = var.deploy_vpc_endpoints
+
   # Billing
   deploy_billing                     = var.deploy_billing
   billing_stripe_secret_name         = var.billing_stripe_secret_name

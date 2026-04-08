@@ -294,6 +294,9 @@ module "nhp" {
   # Redis (distributed rate limiting)
   deploy_redis = var.deploy_redis
 
+  # VPC endpoints for QURL service AWS dependencies
+  deploy_vpc_endpoints = var.deploy_vpc_endpoints
+
   # Cost analytics
   deploy_cost_analytics                 = var.deploy_cost_analytics
   cross_account_cost_analytics_role_arn = var.cross_account_cost_analytics_role_arn
