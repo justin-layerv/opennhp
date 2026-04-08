@@ -1212,17 +1212,25 @@ jobs:
   # is shared with ensure-sandbox-deployed.sh (scheduled-release path).
   deploy-sandbox-blue-green:
     name: Deploy Sandbox - Blue/Green
-    needs: [setup, deploy-sandbox-infra]
+    needs: [changes, setup, deploy-sandbox-infra]
     if: always() && needs.deploy-sandbox-infra.result == 'success' && needs.deploy-sandbox-infra.outputs.server_asg != ''
     runs-on: ubuntu-latest
     environment: sandbox
     # Job timeout = poll timeout (40m) + 5min buffer so the dispatch script
     # has room to print its final error before GitHub kills the job.
     timeout-minutes: 45
-    # actions: write is required so dispatch-and-poll-blue-green.sh can call
-    # the workflow dispatch REST API to trigger blue-green-deploy.yml. The
-    # workflow-level permissions block intentionally withholds this for
-    # least-privilege; only this job needs it.
+    # Job-level permissions REPLACE the workflow-level block in GitHub
+    # Actions, so every scope this job needs has to be re-listed here even
+    # if the workflow-level grants it.
+    #
+    # actions: write   — dispatch-and-poll-blue-green.sh calls the workflow
+    #                    dispatch REST API. Workflow-level intentionally
+    #                    withholds this for least-privilege; only this job
+    #                    needs it.
+    # id-token: write  — required to assume the AWS OIDC role so the
+    #                    "Resolve Image Tag" step (and any future SSM /
+    #                    AWS API call here) can authenticate.
+    # contents: read   — checkout.
     permissions:
       id-token: write
       contents: read
@@ -1234,11 +1242,115 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Resolve the image tag to deploy.
+      #
+      #   - App-changing commits: every CI run on main rebuilds and pushes
+      #     layerv/nhp-server:${github.sha} + layerv/nhp-ac:${github.sha}
+      #     via the `build` matrix, so github.sha is guaranteed to exist
+      #     in ECR and is the right thing to deploy.
+      #
+      #   - Infra-only commits: `Build server` / `Build ac` step-level-skip
+      #     (needs.changes.outputs.app == 'false'), so github.sha is NEVER
+      #     pushed to ECR. Dispatching blue/green with that tag explodes in
+      #     the downstream "Validate Image Exists in ECR" step. The right
+      #     behaviour is to dispatch with the *currently-deployed* tag so
+      #     instance refresh still runs — which is the mechanism by which
+      #     terraform changes to user_data / systemd env file / launch
+      #     template propagate from HCL into running instances. Silently
+      #     skipping the blue/green step (as PR #994 did) breaks that
+      #     propagation, re-introducing the drift problem PR #820 was
+      #     built to avoid.
+      #
+      # Server and AC have independent active colours in SSM, so we read
+      # each one's current active tag separately. If they disagree, bail
+      # loudly — blue-green-deploy.yml only accepts a single image_tag
+      # input today, and the correct recovery is a manual dispatch with
+      # explicit per-component tags.
+      - name: Resolve Image Tag
+        id: resolve-tag
+        env:
+          APP_CHANGED: ${{ needs.changes.outputs.app }}
+          GITHUB_SHA_INPUT: ${{ needs.setup.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+
+          resolve_active_tag() {
+            local component="$1"
+            local base="/sandbox/nhp/${component}"
+            local color
+            if ! color=$(aws ssm get-parameter \
+                --name "${base}/active-color" \
+                --query "Parameter.Value" --output text 2>&1); then
+              echo "::error::Failed to read ${base}/active-color from SSM: $color" >&2
+              return 1
+            fi
+
+            # Reject any value other than the two known good colours so a
+            # corrupted / partially-written / typo'd active-color cannot
+            # silently fall through to the green branch and resolve to the
+            # wrong tag. Same shape of defense as the cross-component
+            # divergence check below: surface bad state loudly.
+            if [[ "$color" != "blue" && "$color" != "green" ]]; then
+              echo "::error::Unexpected ${base}/active-color value: '$color' (expected 'blue' or 'green')" >&2
+              return 1
+            fi
+
+            # Legacy naming: blue tag lives at ${base}/image-tag, green tag
+            # at ${base}/green-image-tag. Mirrors the scheme in
+            # blue-green-switch.sh and the server-state step of
+            # blue-green-deploy.yml.
+            local param
+            if [[ "$color" == "blue" ]]; then
+              param="${base}/image-tag"
+            else
+              param="${base}/green-image-tag"
+            fi
+
+            local tag
+            if ! tag=$(aws ssm get-parameter \
+                --name "$param" \
+                --query "Parameter.Value" --output text 2>&1); then
+              echo "::error::Failed to read $param from SSM: $tag" >&2
+              return 1
+            fi
+            printf '%s' "$tag"
+          }
+
+          if [[ "$APP_CHANGED" == "true" ]]; then
+            IMAGE_TAG="$GITHUB_SHA_INPUT"
+            echo "App code changed on this commit — dispatching with freshly-built tag: $IMAGE_TAG"
+            echo "source=github-sha" >> "$GITHUB_OUTPUT"
+          else
+            echo "No app code changes on this commit — resolving current active image tags from SSM so the blue/green refresh picks up any launch-template / user_data / boot-config changes from terraform apply."
+            SERVER_TAG=$(resolve_active_tag server)
+            AC_TAG=$(resolve_active_tag ac)
+            echo "  server active tag: $SERVER_TAG"
+            echo "  ac     active tag: $AC_TAG"
+            if [[ "$SERVER_TAG" != "$AC_TAG" ]]; then
+              echo "::error::Server and AC active image tags differ (server=$SERVER_TAG, ac=$AC_TAG)."
+              echo "::error::blue-green-deploy.yml only accepts a single image_tag input today."
+              echo "::error::Dispatch blue-green-deploy.yml manually with the correct per-component tag, or bring the two colours back in sync with a component=both deploy."
+              exit 1
+            fi
+            IMAGE_TAG="$SERVER_TAG"
+            echo "Dispatching with resolved current tag: $IMAGE_TAG"
+            echo "source=ssm-current" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
       - name: Dispatch Blue/Green Deploy
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
+          IMAGE_TAG: ${{ steps.resolve-tag.outputs.image_tag }}
+          IMAGE_TAG_SOURCE: ${{ steps.resolve-tag.outputs.source }}
           # Poll budget MUST be lower than the job timeout above so the
           # script can exit cleanly with an error message before GitHub
           # kills the runner. 2400s (40m) leaves a 5min buffer under
@@ -1247,6 +1359,8 @@ jobs:
         run: |
           echo "============================================"
           echo "DISPATCHING BLUE/GREEN DEPLOYMENT"
+          echo "  image_tag: $IMAGE_TAG"
+          echo "  source:    $IMAGE_TAG_SOURCE"
           echo "============================================"
           ./.github/scripts/dispatch-and-poll-blue-green.sh sandbox both "$IMAGE_TAG"
 
