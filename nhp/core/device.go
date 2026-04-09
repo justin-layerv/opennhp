@@ -577,12 +577,28 @@ func (d *Device) ResetPeers() {
 }
 
 func (d *Device) LookupPeer(pk []byte) Peer {
-	pkStr := base64.StdEncoding.EncodeToString(pk)
+	// Encode into a stack-allocated buffer and use string(buf[:n]) directly
+	// as the map index. The Go compiler elides the string allocation in map
+	// lookups (since Go 1.12), avoiding the heap allocation that
+	// EncodeToString would cause.
+	var buf [PublicKeyBase64SizeEx]byte // fits both PublicKeySize (44 B) and PublicKeySizeEx (88 B)
+	n := base64.StdEncoding.EncodedLen(len(pk))
+	if n > len(buf) {
+		// Unexpected key size; fall back to the allocating path.
+		key := base64.StdEncoding.EncodeToString(pk)
+		d.peerMapMutex.Lock()
+		defer d.peerMapMutex.Unlock()
+		if peer, found := d.peerMap[key]; found {
+			return peer
+		}
+		return nil
+	}
+	base64.StdEncoding.Encode(buf[:n], pk)
 
 	d.peerMapMutex.Lock()
 	defer d.peerMapMutex.Unlock()
 
-	peer, found := d.peerMap[pkStr]
+	peer, found := d.peerMap[string(buf[:n])]
 	if found {
 		return peer
 	}
