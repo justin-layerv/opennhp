@@ -15,6 +15,13 @@ import "fmt"
 type derivedEndpoints struct {
 	NHPServerBaseURL string
 	QURLAPIBaseURL   string
+
+	// QURLSiteDomain is the parent domain of per-resource qurl.site
+	// hostnames (e.g., qurl.site.layerv.xyz in sandbox — every
+	// resource gets r_{id}.qurl.site.layerv.xyz). Tier 2 resolve
+	// tests assert cookies are scoped to this domain and that the
+	// 302 Location host has this as its suffix.
+	QURLSiteDomain string
 }
 
 // deriveEndpoints returns the default URL set for the named environment.
@@ -26,11 +33,13 @@ func deriveEndpoints(env string) (derivedEndpoints, error) {
 		return derivedEndpoints{
 			NHPServerBaseURL: "https://resolve.qurl.link.layerv.xyz",
 			QURLAPIBaseURL:   "https://api.layerv.xyz",
+			QURLSiteDomain:   "qurl.site.layerv.xyz",
 		}, nil
 	case "prod":
 		return derivedEndpoints{
 			NHPServerBaseURL: "https://resolve.qurl.link",
 			QURLAPIBaseURL:   "https://api.layerv.ai",
+			QURLSiteDomain:   "qurl.site.layerv.ai",
 		}, nil
 	default:
 		return derivedEndpoints{}, fmt.Errorf("unknown environment %q (want sandbox or prod)", env)

@@ -68,6 +68,7 @@ func TestSSMProbeRejectList(t *testing.T) {
 func TestSSMProbeNamedCommandsPassRejectList(t *testing.T) {
 	allowed := []string{
 		cmdHealthLiveFromHost,
+		cmdHealthKnockReadyFromHost,
 		cmdDockerNhpServerRunning,
 		cmdDockerImageTag,
 	}

@@ -60,6 +60,13 @@ const (
 	// the blue/green deploy would not flip.
 	cmdHealthLiveFromHost = "curl -sf -m 5 http://127.0.0.1:8888/health/live"
 
+	// cmdHealthKnockReadyFromHost is the per-instance knock-readiness
+	// probe. Used by Tier 2 tests to verify every server instance
+	// reports ≥ 1 AC peer — the single-endpoint Tier 1 test hits
+	// whichever instance the NLB picks, which is not enough to catch
+	// "one instance stuck at zero peers" fleet drift.
+	cmdHealthKnockReadyFromHost = "curl -sf -m 5 http://127.0.0.1:8888/health/knock-ready"
+
 	cmdDockerNhpServerRunning = "docker ps --filter name=nhp-server --format '{{.Status}}'"
 	cmdDockerImageTag         = "docker inspect --format '{{.Config.Image}}' nhp-server"
 )
@@ -202,6 +209,15 @@ func sendShellScript(ctx context.Context, instanceID, cmd string) (string, error
 func probeHealthLiveFromHost(ctx context.Context, instanceID string) error {
 	_, err := sendShellScript(ctx, instanceID, cmdHealthLiveFromHost)
 	return err
+}
+
+// probeHealthKnockReadyFromHost fetches /health/knock-ready from
+// the host loopback and returns the JSON body on success. An error
+// is returned when curl exits non-zero (4xx/5xx), which callers
+// should surface per-instance rather than fatal the test — the
+// caller iterates every instance and wants to accumulate errors.
+func probeHealthKnockReadyFromHost(ctx context.Context, instanceID string) (string, error) {
+	return sendShellScript(ctx, instanceID, cmdHealthKnockReadyFromHost)
 }
 
 // probeDockerNhpServerRunning returns the nhp-server container's

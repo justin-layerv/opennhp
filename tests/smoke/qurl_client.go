@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -36,24 +37,30 @@ type MintOptions struct {
 }
 
 // QURLResponse holds the fields we care about from the QURL create
-// response. Extra fields are ignored by the JSON decoder.
+// response. Extra fields (meta.request_id, qurl_id, qurl_site,
+// etc.) are ignored by the JSON decoder.
 //
 // qurl-service wraps responses in { "data": { ... } }, so the
-// top-level Data field captures the nested shape.
+// top-level Data field captures the nested shape. Verified 2026-04-09
+// against sandbox.
 type QURLResponse struct {
 	Data struct {
 		ResourceID string `json:"resource_id"`
-		QURLLink   string `json:"qurl_link"`
-		QURLSite   string `json:"qurl_site"`
+		QURLLink   string `json:"qurl_link"` // e.g. https://qurl.link.layerv.xyz/#at_xxx
 		ExpiresAt  string `json:"expires_at"`
 	} `json:"data"`
 }
 
-// ResourceID is a convenience accessor for the nested data field.
-func (r *QURLResponse) ResourceID() string { return r.Data.ResourceID }
-
-// QURLLink returns the full qurl.link URL with the fragment token.
-func (r *QURLResponse) QURLLink() string { return r.Data.QURLLink }
+// AccessToken extracts the "at_..." access token from the fragment
+// of QURLLink. Returns empty string if the link has no fragment.
+// The access token is what gets passed to /plugins/qurl?token=...
+func (r *QURLResponse) AccessToken() string {
+	link := r.Data.QURLLink
+	if i := strings.Index(link, "#"); i >= 0 {
+		return link[i+1:]
+	}
+	return ""
+}
 
 // MintQURL calls POST /v1/qurls on qurl-service with the cached Auth0
 // bearer. Every smoke-minted QURL has label prefix "smoke-" so the

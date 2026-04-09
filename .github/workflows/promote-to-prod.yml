@@ -1453,7 +1453,12 @@ jobs:
     uses: ./.github/workflows/nhp-smoke-tests.yml
     with:
       environment: prod
-      tier: tier1
+      # tier1+tier2 runs the Tier 2 HTTP-based tests (resolve,
+      # plugins, internal-api negative fence) in prod. Tier 2's
+      # SSM-dependent tests (knock per-instance) will skip
+      # cleanly because allow_ssm_probes=false. Tier 3 lands in
+      # PR3.
+      tier: tier1+tier2
       allow_ssm_probes: false
     secrets:
       AWS_ROLE_ARN: ${{ secrets.AWS_PROD_ROLE_ARN }}

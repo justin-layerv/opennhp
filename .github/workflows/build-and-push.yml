@@ -1530,7 +1530,7 @@ jobs:
     uses: ./.github/workflows/nhp-smoke-tests.yml
     with:
       environment: sandbox
-      tier: tier1
+      tier: tier1+tier2
       allow_ssm_probes: true
     secrets:
       AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}

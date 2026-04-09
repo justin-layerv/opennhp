@@ -115,20 +115,25 @@ func TestHealthReady_NoCriticalFailures(t *testing.T) {
 // downstream consumers learn that the contract shape changed.
 var knockReadyPeerCountPattern = regexp.MustCompile(`^(\d+) AC peer\(s\) connected$`)
 
-// Retry budget for knock-ready convergence after a blue/green flip.
+// Post-flip convergence retry budget. Shared between the
+// knock-ready health tests (Tier 1) and the resolve happy-path
+// tests (Tier 2 in 10_resolve_test.go). The names are neutral
+// ("postFlip*") because the same 10-15s convergence window affects
+// both code paths — after a blue/green flip, the NLB may route
+// to servers that haven't fully registered their AC peers yet.
 //
 // The window is sized for the worst-case observed at 2026-04-08 on
-// sandbox: a freshly-flipped active color can take 10-15s for all
-// of its servers to complete the first round of AC registrations
-// and start reporting peer_count >= 1 on /health/knock-ready.
+// sandbox. maxWait=20s gives headroom without masking a genuinely
+// broken flip. pollInterval=5s produces 4 attempts, enough to
+// distinguish "mid-flip" from "broken" while keeping log output
+// legible.
 //
-// maxWait=20s gives headroom for that window without masking a
-// genuinely broken flip. pollInterval=5s produces 4 attempts over
-// the window, which is enough to distinguish "mid-flip" from
-// "broken" while keeping log output legible.
+// Negative-path tests (unknown/malformed tokens, access-denied
+// pages) do NOT get a retry budget — their expected behavior (403)
+// is always active and a single flaky fire is itself a signal.
 const (
-	knockReadyMaxWait      = 20 * time.Second
-	knockReadyPollInterval = 5 * time.Second
+	postFlipMaxWait      = 20 * time.Second
+	postFlipPollInterval = 5 * time.Second
 )
 
 // TestHealthKnockReady_ReflectsACPeerCount fences the load-bearing
@@ -143,13 +148,13 @@ const (
 // message format, assertion (3) catches it even if (1) and (2) keep
 // reporting healthy for the wrong reason.
 //
-// Retries with knockReadyMaxWait/knockReadyPollInterval to tolerate
+// Retries with postFlipMaxWait/postFlipPollInterval to tolerate
 // transient post-flip windows where the new servers are still
 // seeing their first AC connections.
 //
 // Regression fence for PRs #991, #1005, #1006.
 func TestHealthKnockReady_ReflectsACPeerCount(t *testing.T) {
-	assertEventually(t, knockReadyMaxWait, knockReadyPollInterval, func() error {
+	assertEventually(t, postFlipMaxWait, postFlipPollInterval, func() error {
 		resp, body := doGet(t, testConfig.NHPServerBaseURL, "/health/knock-ready", nil)
 		if resp.StatusCode != 200 {
 			return fmt.Errorf("status=%d body=%s", resp.StatusCode, truncate(body, 256))

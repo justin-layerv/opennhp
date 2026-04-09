@@ -43,6 +43,12 @@ type TestConfig struct {
 	// resolve tests call to mint QURLs.
 	QURLAPIBaseURL string
 
+	// QURLSiteDomain is the parent domain of per-resource qurl.site
+	// hostnames. Tier 2 resolve tests assert:
+	//   - cookie Domain attribute equals this
+	//   - 302 Location host has this as its suffix
+	QURLSiteDomain string
+
 	Auth0Domain       string
 	Auth0Audience     string
 	Auth0ClientID     string

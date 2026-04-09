@@ -51,6 +51,7 @@ func TestMain(m *testing.M) {
 		Environment:       env,
 		NHPServerBaseURL:  getEnvOrDefault("NHP_SERVER_BASE_URL", derived.NHPServerBaseURL),
 		QURLAPIBaseURL:    getEnvOrDefault("QURL_API_BASE_URL", derived.QURLAPIBaseURL),
+		QURLSiteDomain:    getEnvOrDefault("QURL_SITE_DOMAIN", derived.QURLSiteDomain),
 		Auth0Domain:       getEnvOrDefault("AUTH0_DOMAIN", "auth.layerv.ai"),
 		Auth0Audience:     getEnvOrDefault("AUTH0_AUDIENCE", derived.QURLAPIBaseURL),
 		Auth0ClientID:     os.Getenv("AUTH0_CLIENT_ID"),
