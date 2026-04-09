@@ -154,18 +154,27 @@ resource "aws_cloudwatch_metric_alarm" "cert_sync_failures" {
 # Both are out of scope for this PR. Tracked in issue #946 alongside the
 # RegistrationSuccess dimension-mismatch follow-up.
 
-# Alarm: EIP pool utilization exceeds threshold (default 80%)
-# Fires when pool usage is high, warning before exhaustion blocks instance launches.
-# Metric is pushed by each instance at boot (user_data) AFTER it has already
-# claimed its EIP, so by the time an alert fires the instance that triggered
-# it is past the danger window. The signal is for capacity planning, not for
-# rescuing the launching instance.
+# Alarm: EIP pool utilization exceeds threshold (default 80%) for 15 min.
+# Fires when pool usage is SUSTAINED high, warning before exhaustion blocks
+# instance launches. Metric is pushed by each instance at boot (user_data)
+# AFTER it has already claimed its EIP, so by the time an alert fires the
+# instance that triggered it is past the danger window. The signal is for
+# capacity planning, not for rescuing the launching instance.
+#
+# evaluation_periods=3 (15 minutes at period=300) is load-bearing: a
+# blue/green deploy with both colours at full capacity briefly pushes
+# the pool to 85-92% utilization (see eip.tf: `+1` refresh slack means
+# (max*2)/(max*2+1), so 6/7 = 86% in sandbox and 12/13 = 92% in prod).
+# That transient lasts 1-2 of these 5-minute windows — not 3
+# consecutive ones — so the alarm does not fire during a normal deploy.
+# The alarm only fires if utilization stays above 80% for 15 minutes
+# straight, which corresponds to a real steady-state capacity shortfall.
 resource "aws_cloudwatch_metric_alarm" "eip_pool_utilization_high" {
   count = var.enable_egress_eips && var.enable_cloudwatch_alarms ? 1 : 0
 
   alarm_name          = "${var.name_prefix}-ac-eip-pool-utilization-high"
   comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
+  evaluation_periods  = 3
   metric_name         = "EIPPoolUtilizationPercent"
   namespace           = "LayerV/NHP"
   period              = 300 # 5 minutes

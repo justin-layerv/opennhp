@@ -10,8 +10,27 @@
 
 locals {
   # Blue/green needs 2x EIPs: during a switch, both ASGs run at full capacity.
-  # Blue holds its EIPs, green needs its own. After switch, blue scales down and releases.
-  eip_count = var.enable_blue_green ? local.resolved_max_capacity * 2 : local.resolved_max_capacity
+  # Blue holds its EIPs, green needs its own. After switch, blue scales down
+  # and releases.
+  #
+  # The `+ 1` slack is load-bearing, not cosmetic. During an instance refresh
+  # on either color's ASG, AWS terminates one instance and launches its
+  # replacement in a rolling fashion. For a brief window the terminating
+  # instance is still associated with its EIP (AWS disassociates on
+  # termination *initiation*, but the release is eventually-consistent) while
+  # the new instance has already booted and is running user_data that tries
+  # to claim an EIP from the pool. If the pool is sized exactly at
+  # `max_capacity * 2`, that transient moment has zero free EIPs and the new
+  # instance's claim script races its ~33s retry budget against the
+  # disassociation. When the race is lost, user_data FATAL-exits and the
+  # instance comes up with no EIP → traefik and nhp-acd never start → the
+  # blue/green workflow's Verify Standby Health step correctly rejects the
+  # ASG and the whole deploy halts. Observed 2026-04-08 on sandbox: every
+  # component=both refresh failed at the same step until this `+ 1` landed.
+  # One extra EIP is enough because ASG instance refresh only replaces one
+  # instance at a time when MinHealthyPercentage >= 100 - (1 / desired) * 100
+  # (true for the default 90 with desired=3, and for all higher MHP values).
+  eip_count = var.enable_blue_green ? local.resolved_max_capacity * 2 + 1 : local.resolved_max_capacity
 }
 
 resource "aws_eip" "ac" {

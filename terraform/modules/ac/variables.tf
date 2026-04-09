@@ -331,16 +331,28 @@ variable "alarm_sns_topic_arn" {
 variable "eip_pool_utilization_threshold_percent" {
   description = <<-EOT
     EIP pool utilization percentage threshold for the high-utilization alarm.
-    The alarm fires when the maximum observed pool utilization in any 5-minute
-    period exceeds this value.
+    The alarm fires when utilization exceeds this value for
+    `evaluation_periods` consecutive 5-minute windows (see
+    monitoring.tf::aws_cloudwatch_metric_alarm.eip_pool_utilization_high).
 
-    Default of 80 is a balance between actionable warning and noise: it gives
-    operators time to widen ac_max_capacity before the pool exhausts, but
-    doesn't fire on routine scale-out. The lower bound of 50 prevents
-    accidentally setting an aggressive value that would alarm on every
-    scale-out event for small pools (e.g. a 2-EIP pool reports 50% with one
-    instance running). Set higher (e.g. 90) for very large pools where 80%
-    would trip too often during normal traffic.
+    Default of 80 is a balance between actionable warning and noise: it
+    gives operators time to widen ac_max_capacity before the pool exhausts,
+    but doesn't fire on routine scale-out.
+
+    Note on blue/green peak transients: with the refresh slack from
+    eip.tf (`eip_count = resolved_max_capacity * 2 + 1`), peak utilization
+    during a blue/green deploy with both colours at full capacity is:
+      - sandbox (max=3, pool=7):  6/7  = 85.7%
+      - prod    (max=6, pool=13): 12/13 = 92.3%
+    Both exceed 80% briefly (1-2 five-minute windows) during each deploy.
+    The alarm's `evaluation_periods = 3` is what keeps this from crying
+    wolf — only SUSTAINED >80% (15 min) trips the alarm, which happens
+    if and only if the pool is actually exhausting at steady state. Do
+    NOT lower evaluation_periods without rethinking this trade-off.
+
+    The lower bound of 50 prevents accidentally setting an aggressive
+    value that would alarm on every scale-out event for small pools
+    (e.g. a 2-EIP pool reports 50% with one instance running).
   EOT
   type        = number
   default     = 80
