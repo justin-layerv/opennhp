@@ -114,7 +114,7 @@ class TestProvisionPendingDomains(unittest.TestCase):
         cm.QURL_DOMAINS_TABLE = None
         try:
             result = cm.provision_pending_domains()
-            assert result == {'provisioned': 0, 'failed': 0}
+            assert result == {'provisioned': 0, 'failed': 0, 'timed_out': 0, 'skipped': 0}
         finally:
             cm.QURL_DOMAINS_TABLE = original
 
@@ -156,12 +156,14 @@ class TestProvisionPendingDomains(unittest.TestCase):
         # Should trigger a single batch sync
         mock_sync.assert_called_once_with(cm.BATCH_SYNC_PROVISION)
 
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch('custom_domain_cert_manager.update_domain_status')
     @patch('custom_domain_cert_manager.trigger_cert_sync')
     @patch('custom_domain_cert_manager.provision_certificate')
     @patch.object(cm.dynamodb_client, 'query')
-    def test_skips_invalid_domains(self, mock_query, mock_provision, mock_sync):
-        """Should skip domains that fail validation and count them as failures."""
-        del mock_sync  # @patch supplies this; assertion isn't needed for this case
+    def test_skips_invalid_domains(self, mock_query, mock_provision, mock_sync, mock_status, mock_metric):
+        """Should auto-fail domains that fail validation and count them as failures."""
+        del mock_sync  # @patch supplies this; the test asserts on mock_status / mock_metric instead
         mock_query.return_value = {
             'Items': [
                 {'domain': {'S': 'good.com'}},
@@ -175,6 +177,12 @@ class TestProvisionPendingDomains(unittest.TestCase):
         assert result['provisioned'] == 2
         assert result['failed'] == 1
         assert mock_provision.call_count == 2
+        # The invalid domain should be marked failed so it leaves the
+        # provisioning_tls partition.
+        mock_status.assert_called_once()
+        assert mock_status.call_args.args[0] == '../../etc/passwd'
+        assert mock_status.call_args.args[1] == cm.STATUS_FAILED
+        mock_metric.assert_called_once_with(cm.FAILURE_DOMAIN_VALIDATION)
 
     @patch('custom_domain_cert_manager.trigger_cert_sync')
     @patch('custom_domain_cert_manager.provision_certificate')
@@ -196,6 +204,129 @@ class TestProvisionPendingDomains(unittest.TestCase):
         assert result['provisioned'] == 1
         assert result['failed'] == 1
         mock_sync.assert_called_once()
+
+
+
+class TestProvisioningTimeout(unittest.TestCase):
+    """Tests for the auto-fail-on-stuck-provisioning behavior."""
+
+    @patch('custom_domain_cert_manager.send_alert')
+    @patch('custom_domain_cert_manager.publish_failure_metric')
+    @patch('custom_domain_cert_manager.update_domain_status')
+    @patch.object(cm.dynamodb_client, 'query')
+    def test_auto_fails_stuck_domain(self, mock_query, mock_status, mock_metric, mock_alert):
+        old_time = (datetime.now(timezone.utc) - timedelta(minutes=45)).isoformat()
+        mock_query.return_value = {
+            'Items': [
+                {
+                    'domain': {'S': 'stuck.example.com'},
+                    'provisioning_started_at': {'S': old_time},
+                }
+            ]
+        }
+        result = cm.provision_pending_domains()
+        assert result['timed_out'] == 1
+        assert result['provisioned'] == 0
+        mock_status.assert_called_once()
+        assert mock_status.call_args.args[0] == 'stuck.example.com'
+        assert mock_status.call_args.args[1] == cm.STATUS_FAILED
+        # Customer-facing reason: plain English, actionable, no
+        # implementation details. The customer sees this in the
+        # dashboard so it must be readable.
+        customer_reason = mock_status.call_args.kwargs['error']
+        assert "Certificate provisioning didn't complete within" in customer_reason
+        assert 'DNS records' in customer_reason
+        assert 'try again' in customer_reason
+        # Customer reason MUST NOT leak operational details.
+        assert 'started_at' not in customer_reason
+        assert 'threshold' not in customer_reason
+        mock_metric.assert_called_once_with(cm.FAILURE_PROVISIONING_TIMEOUT)
+        mock_alert.assert_called_once()
+        # Operator-facing reason: implementation details for triage,
+        # delivered via SNS alert. Goes to on-call, not the customer.
+        operator_reason = mock_alert.call_args.args[0]
+        assert 'auto-failed' in operator_reason.lower()
+        assert 'timed out after' in operator_reason
+        assert 'started_at' in operator_reason
+        assert 'threshold' in operator_reason
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch.object(cm.dynamodb_client, 'query')
+    def test_provisions_domain_within_timeout(self, mock_query, mock_provision, mock_sync):
+        recent_time = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        mock_query.return_value = {
+            'Items': [
+                {
+                    'domain': {'S': 'recent.example.com'},
+                    'provisioning_started_at': {'S': recent_time},
+                }
+            ]
+        }
+        mock_provision.return_value = {'status': 'provisioned'}
+        result = cm.provision_pending_domains()
+        assert result['provisioned'] == 1
+        assert result['timed_out'] == 0
+        mock_provision.assert_called_once()
+        assert mock_provision.call_args.args[0] == 'recent.example.com'
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch.object(cm.dynamodb_client, 'query')
+    def test_provisions_domain_without_timestamp(self, mock_query, mock_provision, mock_sync):
+        mock_query.return_value = {'Items': [{'domain': {'S': 'new.example.com'}}]}
+        mock_provision.return_value = {'status': 'provisioned'}
+        result = cm.provision_pending_domains()
+        assert result['provisioned'] == 1
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch.object(cm.dynamodb_client, 'query')
+    def test_handles_invalid_timestamp(self, mock_query, mock_provision, mock_sync):
+        mock_query.return_value = {
+            'Items': [
+                {
+                    'domain': {'S': 'bad.example.com'},
+                    'provisioning_started_at': {'S': 'not-a-date'},
+                }
+            ]
+        }
+        mock_provision.return_value = {'status': 'provisioned'}
+        result = cm.provision_pending_domains()
+        assert result['provisioned'] == 1
+        assert result['timed_out'] == 0
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch.object(cm.dynamodb_client, 'query')
+    @patch.object(cm.dynamodb_client, 'update_item')
+    def test_does_not_pre_write_provisioning_started_at(self, mock_update, mock_query, mock_sync):
+        """Regression test: provision_pending_domains must not write
+        provisioning_started_at before calling provision_certificate.
+
+        Doing so would defeat the conditional write in
+        _acquire_provisioning_lock and cause every invocation to be skipped.
+        Here we verify that the only update_item calls observed during a normal
+        provisioning attempt come from inside _acquire_provisioning_lock /
+        update_domain_status, never as a pre-write to set the timestamp.
+        """
+        mock_query.return_value = {'Items': [{'domain': {'S': 'example.com'}}]}
+
+        # Make _acquire_provisioning_lock succeed (first update_item) but
+        # then short-circuit by raising in lazy_import_acme so we don't call
+        # the real ACME stack.
+        with patch('custom_domain_cert_manager.lazy_import_acme', side_effect=Exception('stop')):
+            with patch('custom_domain_cert_manager.send_alert'):
+                with patch('custom_domain_cert_manager.publish_failure_metric'):
+                    cm.provision_pending_domains()
+
+        # The first update_item must be the conditional lock acquisition,
+        # NOT a plain SET that would clobber the lock.
+        assert mock_update.call_count >= 1
+        first_call = mock_update.call_args_list[0]
+        assert 'ConditionExpression' in first_call.kwargs, (
+            "First update_item must be the conditional lock acquisition; "
+            "got an unconditional update which would defeat the lock."
+        )
 
 
 class TestStoreCertificate(unittest.TestCase):

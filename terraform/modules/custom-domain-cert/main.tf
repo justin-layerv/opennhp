@@ -579,6 +579,10 @@ locals {
       slug        = "renewal-scan"
       description = "Certificate renewal scan processing failure"
     }
+    "ProvisioningTimeoutError" = {
+      slug        = "provisioning-timeout"
+      description = "Domain stuck in provisioning_tls status past timeout threshold"
+    }
   }
 }
 

@@ -129,6 +129,7 @@ CW_METRIC_PROVISIONING_FAILURES = 'ProvisioningFailures'
 #   CertSyncError            SSM SendCommand to AC instances
 #   DomainValidationError    Invalid domain format rejected at handler level
 #   RenewalScanError         Per-domain failure during renewal scan
+#   ProvisioningTimeoutError Domain stuck in provisioning_tls past timeout
 #
 FAILURE_ACME_ACCOUNT = 'AcmeAccountError'
 FAILURE_DNS_OWNERSHIP = 'DnsOwnershipError'
@@ -139,6 +140,7 @@ FAILURE_DYNAMODB = 'DynamoDBError'
 FAILURE_CERT_SYNC = 'CertSyncError'
 FAILURE_DOMAIN_VALIDATION = 'DomainValidationError'
 FAILURE_RENEWAL_SCAN = 'RenewalScanError'
+FAILURE_PROVISIONING_TIMEOUT = 'ProvisioningTimeoutError'
 
 # DNS ownership re-verification tunables. Centralized so the resolver
 # behaviour is easy to change without hunting through the function body.
@@ -238,11 +240,22 @@ _cached_acme_client = None
 # Renewal threshold
 RENEWAL_DAYS_BEFORE_EXPIRY = 30
 
+# Auto-fail timeout: domains stuck in provisioning_tls longer than this
+# are automatically failed by provision_pending_domains(). Sourced from
+# the PROVISIONING_TIMEOUT_MINUTES Lambda environment variable so ops
+# can tune it without a code deploy — for example to widen the window
+# during a known DNS-propagation incident. Defaults to 30 minutes.
+PROVISIONING_TIMEOUT_MINUTES = int(os.environ.get('PROVISIONING_TIMEOUT_MINUTES', '30'))
+
 # Idempotency lock: provisioning_started_at entries older than this are
 # considered stale (Lambda crashed or timed out without cleanup) and can
 # be overwritten by a new invocation. 30 minutes = 2x the Lambda timeout
-# (120s) plus generous buffer for ACME DNS propagation waits.
-PROVISIONING_LOCK_STALE_MINUTES = 30
+# (120s) plus generous buffer for ACME DNS propagation waits. Sourced
+# from the PROVISIONING_LOCK_STALE_MINUTES env var, also defaulting to
+# 30. The two values are independent so ops can widen one without the
+# other if needed (e.g. extend the timeout while keeping the lock
+# stale-detection on its existing schedule).
+PROVISIONING_LOCK_STALE_MINUTES = int(os.environ.get('PROVISIONING_LOCK_STALE_MINUTES', '30'))
 
 
 def is_valid_domain(domain: str) -> bool:
@@ -864,16 +877,17 @@ def provision_pending_domains() -> Dict[str, Any]:
     Queries DynamoDB for domains awaiting cert provisioning and provisions
     each one. Triggers a single full cert sync after all provisioning.
 
+    Domains stuck in provisioning_tls longer than PROVISIONING_TIMEOUT_MINUTES
+    are auto-failed (status -> 'failed') with an alert and metric emission.
+
     Requires a GSI named 'status-index' on the qurl-domains DynamoDB table
     with partition key 'status' (String). This GSI is defined in the nhp
     repo's DynamoDB module (terraform/modules/dynamodb/main.tf).
     """
     if not QURL_DOMAINS_TABLE:
-        return {'provisioned': 0, 'failed': 0}
+        return {'provisioned': 0, 'failed': 0, 'timed_out': 0, 'skipped': 0}
 
     try:
-        # Query DynamoDB for domains awaiting cert provisioning
-        # Uses the status-index GSI on the status field
         items = []
         query_kwargs = {
             'TableName': QURL_DOMAINS_TABLE,
@@ -892,25 +906,56 @@ def provision_pending_domains() -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Failed to query pending domains: {e}")
         publish_failure_metric(FAILURE_DYNAMODB)
-        return {'provisioned': 0, 'failed': 0, 'skipped': 0, 'error': str(e)}
+        return {'provisioned': 0, 'failed': 0, 'timed_out': 0, 'skipped': 0, 'error': str(e)}
 
     if not items:
         logger.info("No domains pending TLS provisioning")
-        return {'provisioned': 0, 'failed': 0, 'skipped': 0}
+        return {'provisioned': 0, 'failed': 0, 'timed_out': 0, 'skipped': 0}
 
     logger.info(f"Found {len(items)} domains pending TLS provisioning")
     provisioned = 0
     failed = 0
+    timed_out_domains: List[str] = []
     skipped = 0
+    now = datetime.now(timezone.utc)
 
     for item in items:
         domain_name = item['domain']['S']
         if not is_valid_domain(domain_name):
-            logger.warning(f"Skipping invalid domain from DynamoDB: {domain_name}")
+            # Invalid domain rows can never succeed; mark them failed so they
+            # leave the provisioning_tls partition and stop being scanned.
+            # update_domain_status() catches its own exceptions internally,
+            # so a DynamoDB failure here will be logged but not raised.
+            logger.warning(f"Auto-failing invalid domain from DynamoDB: {domain_name}")
+            update_domain_status(
+                domain_name,
+                STATUS_FAILED,
+                error="Domain failed format validation in cert manager",
+            )
+            publish_failure_metric(FAILURE_DOMAIN_VALIDATION)
             failed += 1
             continue
-        acme_subdomain = domain_to_acme_subdomain(domain_name)
 
+        started_at_str = item.get('provisioning_started_at', {}).get('S')
+        timeout_check = _check_provisioning_timeout(domain_name, started_at_str, now)
+        if timeout_check is not None:
+            customer_reason, operator_reason = timeout_check
+            # customer_reason → DynamoDB → dashboard. Plain English, actionable.
+            update_domain_status(domain_name, STATUS_FAILED, error=customer_reason)
+            publish_failure_metric(FAILURE_PROVISIONING_TIMEOUT)
+            # operator_reason → SNS alert. Carries elapsed time / threshold /
+            # started_at timestamp for on-call triage.
+            send_alert(f"Domain {domain_name} auto-failed: {operator_reason}")
+            timed_out_domains.append(domain_name)
+            continue
+
+        acme_subdomain = domain_to_acme_subdomain(domain_name)
+        # NOTE: We intentionally do NOT pre-write provisioning_started_at here.
+        # _acquire_provisioning_lock() inside provision_certificate() performs the
+        # timestamped conditional write that *both* enforces concurrency control
+        # and starts the timeout clock used by the auto-fail check above. Writing
+        # the attribute before calling the lock would defeat the conditional and
+        # cause every invocation to be skipped.
         try:
             result = provision_certificate(domain_name, acme_subdomain, skip_sync=True)
             if result.get('status') == RESULT_SKIPPED:
@@ -926,7 +971,60 @@ def provision_pending_domains() -> Dict[str, Any]:
         logger.info(f"Triggering cert sync after provisioning {provisioned} domain(s)")
         trigger_cert_sync(BATCH_SYNC_PROVISION)
 
-    return {'provisioned': provisioned, 'failed': failed, 'skipped': skipped}
+    timed_out = len(timed_out_domains)
+    if timed_out > 0:
+        logger.warning(
+            f"Auto-failed {timed_out} domain(s) stuck in provisioning_tls past timeout: "
+            f"{', '.join(timed_out_domains)}"
+        )
+
+    return {'provisioned': provisioned, 'failed': failed, 'timed_out': timed_out, 'skipped': skipped}
+
+
+def _check_provisioning_timeout(
+    domain_name: str,
+    started_at_str: Optional[str],
+    now: datetime,
+) -> Optional[Tuple[str, str]]:
+    """Return (customer_reason, operator_reason) if the domain has exceeded
+    the provisioning timeout, otherwise None.
+
+    Two strings are returned because they go to two different places:
+
+    - customer_reason is written to DynamoDB as `failure_reason` and is what
+      the customer sees in the dashboard. It must be plain English with an
+      actionable next step and zero implementation details (no ISO timestamps,
+      no thresholds, no internal jargon).
+    - operator_reason is logged at WARNING and included in the SNS alert.
+      It carries the implementation details (elapsed minutes, started_at
+      timestamp, threshold) that the on-call needs to triage the incident.
+
+    Malformed/missing timestamps return None so the domain proceeds to a
+    normal provisioning attempt.
+    """
+    if not started_at_str:
+        return None
+    try:
+        started_at = datetime.fromisoformat(started_at_str)
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Invalid provisioning_started_at for {domain_name}: {e}, proceeding")
+        return None
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    elapsed = now - started_at
+    if elapsed <= timedelta(minutes=PROVISIONING_TIMEOUT_MINUTES):
+        return None
+    elapsed_min = int(elapsed.total_seconds() / 60)
+    customer_reason = (
+        f"Certificate provisioning didn't complete within {PROVISIONING_TIMEOUT_MINUTES} minutes. "
+        f"Check that the DNS records you set up are still in place and try again."
+    )
+    operator_reason = (
+        f"TLS provisioning timed out after {elapsed_min} minutes "
+        f"(started_at: {started_at_str}, threshold: {PROVISIONING_TIMEOUT_MINUTES}m)"
+    )
+    logger.warning(f"Domain {domain_name} stuck in provisioning_tls: {operator_reason}")
+    return customer_reason, operator_reason
 
 
 def get_or_create_acme_account() -> Any:
@@ -1278,7 +1376,11 @@ def store_certificate(domain: str, private_key_pem: str, cert_pem: str, chain_pe
 
 def update_domain_status(domain: str, status: str, cert_param_prefix: Optional[str] = None,
                          cert_expires_at: Optional[str] = None, error: Optional[str] = None):
-    """Update domain status in the qurl-domains DynamoDB table."""
+    """Update domain status in the qurl-domains DynamoDB table.
+
+    Clears provisioning_started_at when transitioning to active or failed
+    so the idempotency lock is released for any subsequent attempt.
+    """
     if not QURL_DOMAINS_TABLE:
         logger.info("No QURL_DOMAINS_TABLE configured, skipping status update")
         return
@@ -1286,6 +1388,7 @@ def update_domain_status(domain: str, status: str, cert_param_prefix: Optional[s
     try:
         now_iso = datetime.now(timezone.utc).isoformat()
         update_expr_parts = ['#s = :status', '#ua = :updated_at']
+        remove_expr_parts = []
         expr_names = {
             '#s': 'status',
             '#ua': 'updated_at'
@@ -1315,12 +1418,20 @@ def update_domain_status(domain: str, status: str, cert_param_prefix: Optional[s
             expr_names['#err'] = 'failure_reason'
             expr_values[':error'] = {'S': error[:500]}
 
+        if status in (STATUS_ACTIVE, STATUS_FAILED):
+            remove_expr_parts.append('#psa')
+            expr_names['#psa'] = 'provisioning_started_at'
+
+        update_expression = 'SET ' + ', '.join(update_expr_parts)
+        if remove_expr_parts:
+            update_expression += ' REMOVE ' + ', '.join(remove_expr_parts)
+
         dynamodb_client.update_item(
             TableName=QURL_DOMAINS_TABLE,
             Key={
                 'domain': {'S': domain}
             },
-            UpdateExpression='SET ' + ', '.join(update_expr_parts),
+            UpdateExpression=update_expression,
             ExpressionAttributeNames=expr_names,
             ExpressionAttributeValues=expr_values
         )
