@@ -1427,6 +1427,38 @@ jobs:
       AUTH0_SMOKE_TEST_CLIENT_SECRET: ${{ secrets.AUTH0_SMOKE_TEST_CLIENT_SECRET }}
 
   # =============================================================================
+  # NHP SMOKE TESTS - Tier 1 regression guards against deployed prod
+  #
+  # Runs the nhp/tests/smoke suite against the freshly-deployed prod
+  # environment. Sibling of qurl-smoke-tests.
+  #
+  # Rollout posture (matches build-and-push.yml nhp-smoke-sandbox):
+  #   PR1: tier=tier1,            allow_ssm_probes=false (30d SSM burn-in)
+  #   PR2: tier=tier1+tier2,      allow_ssm_probes=false
+  #   PR3: tier=tier1+tier2+tier3-no-ssm, allow_ssm_probes=false
+  #
+  # After 30 days of green sandbox runs, smoke-burn-in-unlock.yml
+  # auto-opens a PR flipping allow_ssm_probes to true for prod.
+  # =============================================================================
+  nhp-smoke-tests:
+    name: NHP Smoke Tests
+    needs: [manifest, preflight, deploy-server, deploy-ac, deploy-qurl]
+    if: |
+      always() &&
+      needs.preflight.result == 'success' &&
+      (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
+      (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
+      (needs.deploy-qurl.result == 'success' || needs.deploy-qurl.result == 'skipped') &&
+      (needs.deploy-server.result == 'success' || needs.deploy-ac.result == 'success' || needs.deploy-qurl.result == 'success')
+    uses: ./.github/workflows/nhp-smoke-tests.yml
+    with:
+      environment: prod
+      tier: tier1
+      allow_ssm_probes: false
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_PROD_ROLE_ARN }}
+
+  # =============================================================================
   # MONITOR - Post-deploy CloudWatch alarm watch
   # =============================================================================
   monitor:
@@ -1526,7 +1558,7 @@ jobs:
   finalize:
     name: Finalize
     if: always()
-    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server, deploy-ac, deploy-qurl, smoke-test, qurl-smoke-tests, monitor]
+    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server, deploy-ac, deploy-qurl, smoke-test, qurl-smoke-tests, nhp-smoke-tests, monitor]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -1548,9 +1580,15 @@ jobs:
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
           QURL_SMOKE_RESULT: ${{ needs.qurl-smoke-tests.result }}
+          # NHP_SMOKE_RESULT is tracked for reporting but intentionally
+          # not included in the FAILED loop below — PR1 ships smoke as
+          # report-only. PR3 moves it into the FAILED loop once the
+          # harness has burned in.
+          NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-tests.result }}
           MONITOR_RESULT: ${{ needs.monitor.result }}
         run: |
-          # Check if any non-skipped job failed
+          # Check if any non-skipped job failed. nhp-smoke-tests is
+          # deliberately excluded during the PR1/PR2 burn-in.
           FAILED=false
           for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_PLAN_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$AC_RESULT" "$QURL_RESULT" "$SMOKE_RESULT" "$QURL_SMOKE_RESULT" "$MONITOR_RESULT"; do
             if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
@@ -1558,6 +1596,7 @@ jobs:
               break
             fi
           done
+          echo "NHP smoke (informational): $NHP_SMOKE_RESULT"
 
           if [[ "$FAILED" == "true" ]]; then
             echo "status=failed" >> "$GITHUB_OUTPUT"
@@ -1654,6 +1693,7 @@ jobs:
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
           QURL_SMOKE_RESULT: ${{ needs.qurl-smoke-tests.result }}
+          NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-tests.result }}
           MONITOR_RESULT: ${{ needs.monitor.result }}
           ROLLBACK: ${{ inputs.rollback }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -1700,6 +1740,7 @@ jobs:
           MSG+="\n  QURL:       $(result_icon "$QURL_RESULT")"
           MSG+="\n  Smoke Test: $(result_icon "$SMOKE_RESULT")"
           MSG+="\n  QURL Smoke: $(result_icon "$QURL_SMOKE_RESULT")"
+          MSG+="\n  NHP Smoke:  $(result_icon "$NHP_SMOKE_RESULT")"
           MSG+="\n  Monitor:    $(result_icon "$MONITOR_RESULT")"
           MSG+="\n"
           MSG+="\n  Run: ${WORKFLOW_URL}"
@@ -1725,6 +1766,7 @@ jobs:
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
           QURL_SMOKE_RESULT: ${{ needs.qurl-smoke-tests.result }}
+          NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-tests.result }}
           MONITOR_RESULT: ${{ needs.monitor.result }}
           ROLLBACK: ${{ inputs.rollback }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -1764,6 +1806,7 @@ jobs:
             echo "| Deploy QURL | $(result_emoji "$QURL_RESULT") $QURL_RESULT |"
             echo "| Smoke Test | $(result_emoji "$SMOKE_RESULT") $SMOKE_RESULT |"
             echo "| QURL Smoke Tests | $(result_emoji "$QURL_SMOKE_RESULT") $QURL_SMOKE_RESULT |"
+            echo "| NHP Smoke Tests (report-only) | $(result_emoji "$NHP_SMOKE_RESULT") $NHP_SMOKE_RESULT |"
             echo "| Monitor | $(result_emoji "$MONITOR_RESULT") $MONITOR_RESULT |"
             echo ""
             echo "### Deployed Artifacts"

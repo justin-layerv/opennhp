@@ -363,6 +363,96 @@ curl -s --request POST \
 
 **Response structure:** `{ "data": { "resource_id": "...", "qurl_link": "https://qurl.link/#at_xxx", "qurl_site": "..." } }`
 
+## Smoke Test Suite
+
+Location: `tests/smoke/` (own Go module, build tag `smoke`).
+
+The smoke suite runs against the **deployed** sandbox or prod
+environment after a deploy completes. It fences NHP's own contract —
+every guarantee the server and AC make to their consumers (QURL
+plugin, Traefik plugin, the NHP wire protocol, the blue/green deploy
+workflow). Unlike unit/local/integration/e2e tests, smoke exercises
+the actual binary that is running in production.
+
+### When to run
+
+- CI: `.github/workflows/build-and-push.yml` runs it against sandbox
+  after `deploy-sandbox-validate`. `.github/workflows/promote-to-prod.yml`
+  runs it against prod alongside `qurl-smoke-tests`. Both paths
+  currently run in report-only mode (burn-in).
+- Manual: `gh workflow run nhp-smoke-tests.yml --ref <branch> -f environment=sandbox -f tier=tier1 -f allow_ssm_probes=true`
+- Local: `make test-smoke-sandbox` (reads AWS credentials from the
+  `layerv` profile and fetches Auth0 from Secrets Manager).
+
+### Tiers
+
+Tests are organized by file-name prefix so `go test` runs them in a
+deterministic order:
+
+| Prefix | Tier | Purpose |
+|---|---|---|
+| `01_`–`09_` | Tier 1 | Regression guards for fenced bug classes |
+| `10_`–`19_` | Tier 2 | Consumer contract (guarantees NHP makes) |
+| `20_`–`29_` | Tier 3 | NHP capability coverage + informational telemetry |
+
+PR1 ships Tier 1 only. PR2 adds Tier 2. PR3 adds Tier 3 + flips
+`continue-on-error` to false in the CI wiring so smoke becomes a
+required check.
+
+### Maintenance rules (enforced at review)
+
+1. **One file per NHP capability.** File name = capability in
+   snake_case + `_test.go`. New capability ⇒ new file; retired
+   capability ⇒ deleted file. If deleting the file would orphan
+   assertions about other capabilities, the file is too broad and
+   needs to split.
+2. **Every test name references a capability or a bug class.**
+   `TestHealth_KnockReadyReflectsACPeerCount` passes.
+   `TestHealth_Works` fails review.
+3. **Every Tier 1 test has a Go comment tagging the PR whose
+   regression it fences.** Format: `// Regression fence for PR #1005
+   (knock-ready gate used docker exec wget).`
+4. **Every Tier 3 timing test has an SLO it fences.** No SLO
+   documented in CLAUDE.md or code comments, no timing test.
+5. **Deletion is a valid PR.** When a bug class is structurally
+   eliminated, the Tier 1 test is **deleted** — not updated to
+   point at a new class. The new mechanism gets its own test.
+6. **CODEOWNERS.** Every PR that adds or changes a smoke test
+   requires sign-off from `justin@layerv.ai` (see
+   `.github/CODEOWNERS`).
+7. **Banned file names**: `coverage_test.go`, `advanced_test.go`,
+   `features_test.go`. These give no information. If the right file
+   name isn't obvious, the capability doesn't exist yet.
+8. **SSM probes are named helpers.** No `runCommand(cmd, args)` API.
+   Every new probe is a reviewed function in `ssm_probe.go` with the
+   command baked in as a Go constant. The reject-list in
+   `ssm_probe.go` is defense in depth — it must never be the only
+   thing catching a bad command.
+9. **When shipping a new NHP capability, the same PR ships its
+   Tier 2 contract test.**
+10. **No test-only endpoints in production binaries.** If a contract
+    can't be tested from smoke without test-mode code, it's an
+    integration test, not a smoke test.
+11. **30-day SSM burn-in.** Prod starts with `allow_ssm_probes: false`
+    until the scheduled unlock workflow confirms 30 days of green
+    sandbox runs.
+
+### Shipping a new NHP capability
+
+If you add a new NHP capability (endpoint, protocol message, deploy
+gate, etc.), the PR that ships it should also:
+
+1. Add a new `XX_<capability>_test.go` file under `tests/smoke/`.
+2. Pick the appropriate tier:
+   - Tier 1 if it fences a specific bug class fresh from a fixed PR.
+   - Tier 2 if it's a consumer contract clause.
+   - Tier 3 if it's capability observation or timing.
+3. Cross-reference the PR number in Go comments (`// Regression
+   fence for PR #NNNN` or `// Capability added in PR #NNNN`).
+4. If the test needs SSM, add the probe as a named helper in
+   `ssm_probe.go` with the command as a Go constant. Get review
+   from `justin@layerv.ai`.
+
 ## Security Notes
 
 - Never commit secrets - use AWS Secrets Manager

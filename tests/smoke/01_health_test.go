@@ -1,0 +1,222 @@
+//go:build smoke
+
+package smoke
+
+// Tier 1: NHP server health endpoints.
+//
+// Capability: the /health/* endpoints the NLB and ASG use to gate traffic
+// and lifecycle decisions. This file fences:
+//
+//	PR #991  — knock-ready must reflect AC peer count (not ready's shape)
+//	PR #1005 — knock-ready was used as the deploy gate but was wired
+//	           against a Docker image that couldn't run its own health probe
+//	PR #1006 — AC EIP pool deadlock surfaced as knock-ready flapping after
+//	           blue/green flip
+//
+// Every assertion here is checked against the /health endpoints of the
+// deployed nhp-server over public HTTPS. No SSM probes — this file is
+// safe to run in prod on day 1.
+
+import (
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"testing"
+	"time"
+)
+
+// healthLiveResponse matches the minimum shape the server returns from
+// /health/live. Extra fields are ignored.
+type healthLiveResponse struct {
+	Status  string `json:"status"`
+	Service string `json:"service"`
+}
+
+// healthReadyResponse matches /health/ready and /health/knock-ready.
+type healthReadyResponse struct {
+	Status string                      `json:"status"`
+	Checks map[string]*healthCheckItem `json:"checks"`
+}
+
+type healthCheckItem struct {
+	Name     string `json:"name"`
+	Status   string `json:"status"`
+	Message  string `json:"message"`
+	Critical bool   `json:"critical"`
+}
+
+// TestHealthLive_Returns200 fences the "/health/live is the simplest
+// possible liveness check" contract: it must always return 200 with
+// status=healthy, regardless of dependencies, middleware ordering, or
+// AC peer count.
+//
+// Regression fence for PR #991 (middleware ordering bugs could move
+// health behind auth; this is the canary that surfaces it immediately).
+func TestHealthLive_Returns200(t *testing.T) {
+	resp, body := doGet(t, testConfig.NHPServerBaseURL, "/health/live", nil)
+	assertStatusCode(t, resp, 200)
+
+	var parsed healthLiveResponse
+	unmarshalJSON(t, body, &parsed)
+
+	if parsed.Status != "healthy" {
+		t.Fatalf("status = %q, want healthy", parsed.Status)
+	}
+	if parsed.Service == "" {
+		t.Fatalf("service field is empty — the server isn't identifying itself")
+	}
+}
+
+// TestHealthReady_NoCriticalFailures fences the /health/ready
+// contract: the endpoint returns 200, top-level status is in
+// {healthy, degraded}, and no critical check has status "fail".
+// Deliberately does NOT hardcode a specific check name (like
+// "storage" or "etcd") so this test doesn't need updating every
+// time the health manager's checker registration changes — the
+// invariant is "zero critical failures", not "this specific check
+// exists."
+func TestHealthReady_NoCriticalFailures(t *testing.T) {
+	resp, body := doGet(t, testConfig.NHPServerBaseURL, "/health/ready", nil)
+	assertStatusCode(t, resp, 200)
+
+	var parsed healthReadyResponse
+	unmarshalJSON(t, body, &parsed)
+
+	if parsed.Status != "healthy" && parsed.Status != "degraded" {
+		t.Fatalf("status = %q, want healthy or degraded\nbody: %s", parsed.Status, truncate(body, 512))
+	}
+
+	if len(parsed.Checks) == 0 {
+		t.Fatalf("/health/ready has no checks registered — the readiness manager is empty\nbody: %s", truncate(body, 512))
+	}
+
+	for name, c := range parsed.Checks {
+		if c.Critical && c.Status == "fail" {
+			t.Fatalf("critical check %q is failing: status=%q message=%q\nbody: %s",
+				name, c.Status, c.Message, truncate(body, 512))
+		}
+	}
+}
+
+// Note: /health/startup returning 200 is NOT currently fenced. The
+// deployed nhp-server's startup probe stays at "unhealthy" with
+// startup_timeout=fail indefinitely (observed 2026-04-08 sandbox),
+// but no deploy gate consumes the signal — ASG uses EC2 instance
+// health, not a Kubernetes-style startup probe. Fencing this from
+// smoke would produce noise without surfacing an actionable
+// regression. Follow-up: investigate whether startup probe should
+// ever return 200 in the current deployment shape, and either fix
+// the server or remove the endpoint.
+
+// knockReadyPeerCountPattern matches the ac_peers check's message
+// field, e.g. "3 AC peer(s) connected". The server formats this string
+// in endpoints/server/health/acpeer.go:68-69. Any drift there breaks
+// this regex — that's intentional: the smoke suite is the place
+// downstream consumers learn that the contract shape changed.
+var knockReadyPeerCountPattern = regexp.MustCompile(`^(\d+) AC peer\(s\) connected$`)
+
+// Retry budget for knock-ready convergence after a blue/green flip.
+//
+// The window is sized for the worst-case observed at 2026-04-08 on
+// sandbox: a freshly-flipped active color can take 10-15s for all
+// of its servers to complete the first round of AC registrations
+// and start reporting peer_count >= 1 on /health/knock-ready.
+//
+// maxWait=20s gives headroom for that window without masking a
+// genuinely broken flip. pollInterval=5s produces 4 attempts over
+// the window, which is enough to distinguish "mid-flip" from
+// "broken" while keeping log output legible.
+const (
+	knockReadyMaxWait      = 20 * time.Second
+	knockReadyPollInterval = 5 * time.Second
+)
+
+// TestHealthKnockReady_ReflectsACPeerCount fences the load-bearing
+// invariant that knock-ready returns 200 iff at least one AC peer is
+// connected. Three overlapping assertions:
+//
+//  1. HTTP 200
+//  2. ac_peers.status == "pass"
+//  3. message regex matches AND the captured count is > 0
+//
+// The triple-check is deliberate: if someone changes the server's
+// message format, assertion (3) catches it even if (1) and (2) keep
+// reporting healthy for the wrong reason.
+//
+// Retries with knockReadyMaxWait/knockReadyPollInterval to tolerate
+// transient post-flip windows where the new servers are still
+// seeing their first AC connections.
+//
+// Regression fence for PRs #991, #1005, #1006.
+func TestHealthKnockReady_ReflectsACPeerCount(t *testing.T) {
+	assertEventually(t, knockReadyMaxWait, knockReadyPollInterval, func() error {
+		resp, body := doGet(t, testConfig.NHPServerBaseURL, "/health/knock-ready", nil)
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("status=%d body=%s", resp.StatusCode, truncate(body, 256))
+		}
+
+		var parsed healthReadyResponse
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return fmt.Errorf("parse body: %v; body=%s", err, truncate(body, 256))
+		}
+
+		ac, ok := parsed.Checks["ac_peers"]
+		if !ok {
+			return fmt.Errorf("ac_peers check missing; body=%s", truncate(body, 256))
+		}
+		if ac.Status != "pass" {
+			return fmt.Errorf("ac_peers.status=%q want pass (message=%q)", ac.Status, ac.Message)
+		}
+
+		m := knockReadyPeerCountPattern.FindStringSubmatch(ac.Message)
+		if m == nil {
+			return fmt.Errorf("ac_peers.message=%q does not match %q", ac.Message, knockReadyPeerCountPattern.String())
+		}
+		if m[1] == "0" {
+			return fmt.Errorf("ac_peers count is zero (message=%q)", ac.Message)
+		}
+		return nil
+	})
+}
+
+// TestHealthKnockReady_ACPeerCheckerIsCritical fences the structural
+// guard that the ac_peers check is registered with critical=true.
+// Without this, the endpoint could silently return 200 with an
+// ac_peers=fail child when zero ACs are connected, which is exactly
+// the false-healthy state we can't afford.
+func TestHealthKnockReady_ACPeerCheckerIsCritical(t *testing.T) {
+	_, body := doGet(t, testConfig.NHPServerBaseURL, "/health/knock-ready", nil)
+
+	var parsed healthReadyResponse
+	unmarshalJSON(t, body, &parsed)
+
+	ac, ok := parsed.Checks["ac_peers"]
+	if !ok {
+		t.Fatalf("ac_peers check missing from knock-ready body: %s", truncate(body, 512))
+	}
+	if !ac.Critical {
+		t.Fatalf("ac_peers.critical = false, want true — structural guard for PR #1005 regression class")
+	}
+}
+
+// TestHealthKnockReady_DistinctFromReady fences the invariant that
+// /health/knock-ready and /health/ready have distinct JSON shapes:
+// knock-ready includes the ac_peers check, ready does not. A silent
+// alias of knock-ready to ready would regress the whole NLB gating
+// strategy. Both endpoints returning 200 is fine; their bodies
+// differing is the test.
+func TestHealthKnockReady_DistinctFromReady(t *testing.T) {
+	_, readyBody := doGet(t, testConfig.NHPServerBaseURL, "/health/ready", nil)
+	_, knockBody := doGet(t, testConfig.NHPServerBaseURL, "/health/knock-ready", nil)
+
+	var ready, knock healthReadyResponse
+	unmarshalJSON(t, readyBody, &ready)
+	unmarshalJSON(t, knockBody, &knock)
+
+	if _, ok := ready.Checks["ac_peers"]; ok {
+		t.Fatalf("/health/ready should NOT include ac_peers check (found in body: %s)", truncate(readyBody, 512))
+	}
+	if _, ok := knock.Checks["ac_peers"]; !ok {
+		t.Fatalf("/health/knock-ready MUST include ac_peers check (body: %s)", truncate(knockBody, 512))
+	}
+}

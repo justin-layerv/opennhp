@@ -1,0 +1,19 @@
+# NHP repository CODEOWNERS
+#
+# This file designates code owners for specific paths. Owners are
+# automatically requested for review when a PR modifies paths they
+# own. The review is advisory unless a branch protection rule makes
+# the review required.
+
+# Smoke test suite: every PR that adds, modifies, or deletes a smoke
+# test requires sign-off from the designated NHP smoke owner. The maintenance
+# rules in nhp/CLAUDE.md "Smoke Test Suite" are enforced at review
+# time — owners should check tier, capability mapping, and bug-class
+# fence comments.
+#
+# Especially important: every change to tests/smoke/ssm_probe.go is a
+# security-sensitive edit. The command reject-list is the only thing
+# keeping a bad refactor from sending mutating commands to production
+# instances.
+/tests/smoke/                 justin@layerv.ai
+/.github/workflows/nhp-smoke-tests.yml  justin@layerv.ai

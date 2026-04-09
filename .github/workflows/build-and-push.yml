@@ -1511,6 +1511,31 @@ jobs:
           echo "::notice::Deployment tracking updated: deployed-commit = ${{ github.sha }}"
 
   # ============================================================================
+  # NHP SMOKE TESTS (Sandbox)
+  #
+  # Runs the nhp/tests/smoke suite against the freshly-deployed sandbox.
+  # Calls the reusable workflow at .github/workflows/nhp-smoke-tests.yml.
+  #
+  # Rollout posture:
+  #   PR1: tier=tier1, continue-on-error=true (report-only, burn-in)
+  #   PR2: tier=tier1+tier2, continue-on-error=true
+  #   PR3: tier=all,  continue-on-error=false (required check)
+  # ============================================================================
+  nhp-smoke-sandbox:
+    name: NHP Smoke (sandbox)
+    needs: [deploy-sandbox-validate]
+    if: |
+      always() &&
+      needs.deploy-sandbox-validate.result == 'success'
+    uses: ./.github/workflows/nhp-smoke-tests.yml
+    with:
+      environment: sandbox
+      tier: tier1
+      allow_ssm_probes: true
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+  # ============================================================================
   # PROD DEPLOY - Handled exclusively by promote-to-prod.yml
   # Use ./scripts/trigger-prod-deploy.sh to deploy to production.
   # ============================================================================

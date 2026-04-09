@@ -1722,6 +1722,29 @@ resource "aws_iam_role_policy_attachment" "qurl_link_static" {
 }
 
 # ============================================================================
+# Smoke Test Policy
+#
+# INTENTIONALLY EMPTY: nhp/tests/smoke reuses the existing permissions
+# already attached to aws_iam_role.github_actions. Every API call the
+# Tier 1 tests make is covered by:
+#
+#   - terraform_read:      ec2:Describe*, autoscaling:Describe*,
+#                          elasticloadbalancing:Describe*,
+#                          cloudwatch:Describe*/Get*/List*,
+#                          ssm:Describe*/Get*/List*,
+#                          secretsmanager:Get* (scoped layerv-nhp-*)
+#   - context_lookups:     ssm:SendCommand + ssm:GetCommandInvocation
+#                          (scoped AWS-RunShellScript + instance ARNs)
+#   - SSMACMLambda:        ssm:PutParameter (for M2M token cache)
+#   - terraform_apply_*:   cloudwatch:PutMetricData (for smoke metric)
+#
+# If PR2 or PR3 introduces a call that needs a NEW action (e.g.,
+# logs:StartQuery for CloudWatch Logs Insights), add a dedicated
+# aws_iam_role_policy resource scoped to just that action — do not
+# recreate the broad smoke_test_read policy this block replaces.
+# ============================================================================
+
+# ============================================================================
 # OUTPUTS - Unified interface regardless of primary/secondary account
 # ============================================================================
 

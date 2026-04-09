@@ -1,6 +1,16 @@
 #!/bin/bash
 # Verify every InService instance in an ASG responds to a local health check.
 #
+# Linked invariants in Go tests: nhp/tests/smoke/03_ssm_runbook_test.go
+# fences the two regressions this script has already hit:
+#   - TestSSMRunbook_TimeoutMeetsAPIMinimum pins --timeout-seconds 30
+#     as the API minimum (PR #1005 used 15 and silently failed).
+#   - TestSSMRunbook_ShellCmdHasNoDoubleQuotes Go-side-checks the
+#     runtime guard at line 86 below, so a future edit that tries to
+#     embed `"` inside commands=[...] is caught at PR time.
+# Keep the two files in sync: changes here should trigger a review of
+# the corresponding smoke test.
+#
 # Why this exists (and why we can't use `aws elbv2 describe-target-health`
 # for the standby side of blue/green):
 #

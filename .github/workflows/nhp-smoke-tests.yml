@@ -1,0 +1,237 @@
+name: NHP Smoke Tests
+
+# Reusable workflow for running NHP smoke tests against a deployed
+# sandbox or prod environment. Called by:
+#   - build-and-push.yml (sandbox, after deploy-sandbox-validate)
+#   - promote-to-prod.yml (prod, alongside qurl-smoke-tests)
+#   - workflow_dispatch (manual for debugging)
+#
+# The caller provides AWS credentials; this workflow owns the test
+# logic, Go version, environment config, and execution. Auth0 smoke
+# credentials are fetched from Secrets Manager — no caller wiring
+# beyond the AWS OIDC role is needed.
+#
+# PR1 runs tier=tier1 only. PR2 bumps to tier=tier1+tier2. PR3 flips
+# to tier=all and removes continue-on-error from the callers.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Target environment (sandbox or prod)'
+        required: true
+        type: string
+      tier:
+        description: 'Test tier filter (tier1, tier1+tier2, tier3-no-ssm, all)'
+        required: false
+        type: string
+        default: 'tier1'
+      allow_ssm_probes:
+        description: 'Whether SSM RunShellScript probes are allowed in this environment'
+        required: false
+        type: boolean
+        default: false
+      aws_region:
+        description: 'AWS region for the smoke run'
+        required: false
+        type: string
+        default: 'us-east-2'
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+
+  # Manual dispatch for debugging a specific environment/tier
+  # combination without waiting for a deploy.
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - sandbox
+          - prod
+        default: sandbox
+      tier:
+        description: 'Test tier filter'
+        required: false
+        type: choice
+        options:
+          - tier1
+          - tier1+tier2
+          - tier3-no-ssm
+          - all
+        default: tier1
+      allow_ssm_probes:
+        description: 'Allow SSM RunShellScript probes'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  smoke-test:
+    name: NHP Smoke (${{ inputs.environment }}, ${{ inputs.tier }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: tests/smoke/go.mod
+          cache-dependency-path: tests/smoke/go.sum
+
+      - name: Configure AWS credentials
+        uses: ./.github/actions/setup-deploy
+        with:
+          aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Fetch Auth0 smoke credentials from Secrets Manager
+        id: auth0
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          SECRET_ID="layerv-nhp-${ENVIRONMENT}-auth0-smoke-test-credentials"
+          SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id "$SECRET_ID" \
+            --query 'SecretString' --output text)
+          CLIENT_ID=$(echo "$SECRET" | jq -r '.client_id')
+          CLIENT_SECRET=$(echo "$SECRET" | jq -r '.client_secret')
+          if [ -z "$CLIENT_ID" ] || [ "$CLIENT_ID" = "null" ]; then
+            echo "::error::Auth0 client_id missing from $SECRET_ID"
+            exit 1
+          fi
+          echo "::add-mask::$CLIENT_ID"
+          echo "::add-mask::$CLIENT_SECRET"
+          echo "client_id=$CLIENT_ID" >> "$GITHUB_OUTPUT"
+          echo "client_secret=$CLIENT_SECRET" >> "$GITHUB_OUTPUT"
+
+      - name: Run smoke tests
+        id: run-tests
+        env:
+          NHP_ENVIRONMENT: ${{ inputs.environment }}
+          # Base URLs + Auth0 audience are derived inside the Go
+          # suite from NHP_ENVIRONMENT (see tests/smoke/dns.go).
+          # Blue/green ASG names, TG ARNs, and listener ARNs are
+          # read directly from SSM at test time.
+          AUTH0_CLIENT_ID: ${{ steps.auth0.outputs.client_id }}
+          AUTH0_CLIENT_SECRET: ${{ steps.auth0.outputs.client_secret }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          NHP_SMOKE_ALLOW_SSM_PROBES: ${{ inputs.allow_ssm_probes }}
+          TIER: ${{ inputs.tier }}
+        run: |
+          set -euo pipefail
+          case "$TIER" in
+            tier1)
+              RUN_FILTER='^Test(Health|DockerImage|SSMRunbook|BlueGreen|ACEIPPool|SSMProbe)_'
+              ;;
+            tier1+tier2)
+              RUN_FILTER='^Test(Health|DockerImage|SSMRunbook|BlueGreen|ACEIPPool|SSMProbe|Resolve|Knock|Forward|Plugins|InternalAPI)_'
+              ;;
+            tier3-no-ssm)
+              RUN_FILTER='^Test(Health|BlueGreen|ACEIPPool|Resolve|Knock|Plugins|Protocol|ServerLogs|Timing)_'
+              ;;
+            all)
+              RUN_FILTER=''
+              ;;
+            *)
+              echo "::error::Unknown tier: $TIER"
+              exit 1
+              ;;
+          esac
+
+          cd tests/smoke
+          if [ -n "$RUN_FILTER" ]; then
+            go test -tags=smoke -v -count=1 -timeout 15m -run "$RUN_FILTER" ./... 2>&1 | tee test-output.txt
+          else
+            go test -tags=smoke -v -count=1 -timeout 15m ./... 2>&1 | tee test-output.txt
+          fi
+          TEST_EXIT=${PIPESTATUS[0]}
+          echo "test_exit=$TEST_EXIT" >> "$GITHUB_OUTPUT"
+          exit "$TEST_EXIT"
+
+      - name: Verify Auth0 tests were not skipped for auth reasons
+        if: always() && steps.run-tests.outcome != 'skipped'
+        run: |
+          set -euo pipefail
+          cd tests/smoke
+          if [ ! -f test-output.txt ]; then
+            exit 0
+          fi
+          # Auth0-dependent tests skipping with "Auth0 token not
+          # available" means credentials are broken. Fail the job.
+          SKIPPED=$(grep -c 'SKIP.*Auth0 token' test-output.txt || true)
+          if [ "$SKIPPED" -gt 0 ]; then
+            echo "::error::$SKIPPED Auth0-dependent tests SKIPPED — credentials missing or invalid"
+            grep 'SKIP.*Auth0 token' test-output.txt || true
+            exit 1
+          fi
+
+      - name: Test summary
+        if: always() && steps.run-tests.outcome != 'skipped'
+        env:
+          TIER: ${{ inputs.tier }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          cd tests/smoke
+          if [ ! -f test-output.txt ]; then
+            exit 0
+          fi
+          PASSED=$(grep -c '^--- PASS' test-output.txt || true)
+          FAILED=$(grep -c '^--- FAIL' test-output.txt || true)
+          SKIPPED=$(grep -c '^--- SKIP' test-output.txt || true)
+          {
+            echo "## NHP Smoke Tests ($ENVIRONMENT, $TIER)"
+            echo ""
+            echo "| Metric | Count |"
+            echo "|--------|-------|"
+            echo "| Passed | $PASSED |"
+            echo "| Failed | $FAILED |"
+            echo "| Skipped | $SKIPPED |"
+            echo ""
+            if [ "$FAILED" -gt 0 ]; then
+              echo "### Failures"
+              echo '```'
+              grep -A 5 '^--- FAIL' test-output.txt || true
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Emit CloudWatch metric
+        if: always() && steps.run-tests.outcome != 'skipped'
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          TIER: ${{ inputs.tier }}
+          RESULT: ${{ steps.run-tests.outcome }}
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          set -euo pipefail
+          # Emit a single data point per run. Pass-rate panels etc are
+          # explicitly out of scope for Phase 1 — we just want the
+          # raw signal recorded so the burn-in unlock workflow can
+          # query it later.
+          VALUE=0
+          if [ "$RESULT" = "success" ]; then VALUE=1; fi
+          aws cloudwatch put-metric-data \
+            --namespace "LayerV/NHP" \
+            --metric-name "NHPSmokeTestResult" \
+            --unit "Count" \
+            --value "$VALUE" \
+            --dimensions Environment="$ENVIRONMENT",Tier="$TIER" \
+            || echo "::warning::CloudWatch metric emission failed (non-fatal)"
+
+      - name: Upload test output on failure
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: nhp-smoke-test-output-${{ inputs.environment }}-${{ inputs.tier }}
+          path: tests/smoke/test-output.txt
+          retention-days: 7

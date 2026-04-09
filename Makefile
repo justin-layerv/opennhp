@@ -234,6 +234,52 @@ test-local: ## Run local e2e tests (requires: docker compose -f tests/local/dock
 	cd tests/local && go test -v -tags=local ./...
 	@echo "$(COLOUR_GREEN)[OpenNHP] Local E2E Tests Done!$(END_COLOUR)"
 
+# Smoke tests run against a LIVE environment. See tests/smoke/doc.go
+# for the full environment variable matrix and tests/smoke/README (if
+# added) for the capability map.
+#
+# test-smoke-sandbox uses AWS_PROFILE=layerv and fetches Auth0
+# credentials from Secrets Manager. Requires AWS CLI + jq installed.
+test-smoke-sandbox: ## Run smoke tests against sandbox (uses AWS_PROFILE=layerv)
+	@echo "[OpenNHP] Running smoke tests against sandbox..."
+	@command -v jq >/dev/null 2>&1 || { echo "$(COLOUR_RED)[OpenNHP] jq not found — install with: brew install jq$(END_COLOUR)"; exit 1; }
+	@SECRET=$$(AWS_PROFILE=layerv aws secretsmanager get-secret-value \
+		--secret-id "layerv-nhp-sandbox-auth0-smoke-test-credentials" \
+		--query SecretString --output text) && \
+	cd tests/smoke && \
+	NHP_ENVIRONMENT=sandbox \
+	NHP_SMOKE_ALLOW_SSM_PROBES=true \
+	AWS_PROFILE=layerv \
+	AWS_REGION=us-east-2 \
+	AUTH0_CLIENT_ID=$$(echo "$$SECRET" | jq -r '.client_id') \
+	AUTH0_CLIENT_SECRET=$$(echo "$$SECRET" | jq -r '.client_secret') \
+	AUTH0_DOMAIN=auth.layerv.ai \
+	AUTH0_AUDIENCE=https://api.layerv.xyz \
+	go test -tags=smoke -v -count=1 -timeout 15m ./...
+	@echo "$(COLOUR_GREEN)[OpenNHP] Sandbox smoke tests done!$(END_COLOUR)"
+
+# test-smoke-prod uses AWS_PROFILE=layerv-prod. SSM probes are OFF by
+# default during the 30-day burn-in; pass NHP_SMOKE_ALLOW_SSM_PROBES=true
+# on the command line to override.
+test-smoke-prod: ## Run smoke tests against prod (uses AWS_PROFILE=layerv-prod)
+	@echo "[OpenNHP] Running smoke tests against PROD..."
+	@command -v jq >/dev/null 2>&1 || { echo "$(COLOUR_RED)[OpenNHP] jq not found — install with: brew install jq$(END_COLOUR)"; exit 1; }
+	@SECRET=$$(AWS_PROFILE=layerv-prod aws secretsmanager get-secret-value \
+		--secret-id "layerv-nhp-prod-auth0-smoke-test-credentials" \
+		--region us-east-2 \
+		--query SecretString --output text) && \
+	cd tests/smoke && \
+	NHP_ENVIRONMENT=prod \
+	NHP_SMOKE_ALLOW_SSM_PROBES=$${NHP_SMOKE_ALLOW_SSM_PROBES:-false} \
+	AWS_PROFILE=layerv-prod \
+	AWS_REGION=us-east-2 \
+	AUTH0_CLIENT_ID=$$(echo "$$SECRET" | jq -r '.client_id') \
+	AUTH0_CLIENT_SECRET=$$(echo "$$SECRET" | jq -r '.client_secret') \
+	AUTH0_DOMAIN=auth.layerv.ai \
+	AUTH0_AUDIENCE=https://api.layerv.ai \
+	go test -tags=smoke -v -count=1 -timeout 15m ./...
+	@echo "$(COLOUR_GREEN)[OpenNHP] Prod smoke tests done!$(END_COLOUR)"
+
 test-all: test test-lambdas test-local ## Run all tests
 
 # Run fuzz tests (60 seconds each by default)
@@ -257,4 +303,4 @@ archive:
 	@cd release && mkdir -p archive && tar -czvf ./archive/$(PACKAGE_FILE) nhp-agent nhp-ac nhp-db nhp-server
 	@echo "$(COLOUR_GREEN)[OpenNHP] Package ${PACKAGE_FILE} archived!$(END_COLOUR)"
 
-.PHONY: all generate-version-and-build init agentd acd serverd db linuxagentsdk androidagentsdk macosagentsdk iosagentsdk devicesdk plugins lint test test-lambdas test-local test-all fuzz fuzz-quick archive ebpf clean_ebpf
+.PHONY: all generate-version-and-build init agentd acd serverd db linuxagentsdk androidagentsdk macosagentsdk iosagentsdk devicesdk plugins lint test test-lambdas test-local test-smoke-sandbox test-smoke-prod test-all fuzz fuzz-quick archive ebpf clean_ebpf
