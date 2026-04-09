@@ -1375,6 +1375,17 @@ module "grafana_dashboards" {
   athena_database           = local.grafana_athena_database
   athena_region             = local.grafana_athena_region
 
+  # QURL alert rules — see docs/slo.md and docs/runbooks/qurl-*.md.
+  # Routes alerts through the existing monitoring SNS topic so the new
+  # qurl-api alerts land in the same Slack/email channels as every other
+  # prod alert. Ships paused; flip qurl_alerts_paused after 24h soak.
+  qurl_alerts_enabled             = var.qurl_alerts_enabled
+  qurl_alerts_paused              = var.qurl_alerts_paused
+  qurl_alerts_sns_topic_arn       = module.monitoring.sns_topic_arn
+  qurl_alerts_runbook_base_url    = var.qurl_alerts_runbook_base_url
+  qurl_alerts_slo_target_percent  = var.qurl_alerts_slo_target_percent
+  qurl_alerts_loki_datasource_uid = var.grafana_loki_datasource_uid
+
   tags = local.common_tags
 }
 

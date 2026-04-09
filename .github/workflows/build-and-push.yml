@@ -890,6 +890,17 @@ jobs:
         working-directory: terraform/environments/sandbox
         run: terraform validate
 
+      - name: Check qurl SLO lockstep (variables.tf vs dashboard JSON)
+        if: steps.changes.outputs.terraform_changed == 'true'
+        # Asserts that the qurl_alerts_slo_target_percent default in
+        # terraform/variables.tf matches the slo_target template variable
+        # in terraform/modules/grafana-dashboards/dashboards/qurl-operations.json.
+        # The two values feed the same burn-rate computation; a typo in
+        # either silently shifts the burn-rate denominator by orders of
+        # magnitude. The contract used to be enforced by a comment in
+        # alerts.tf — same failure mode as the 2026-03-24 GSI incident.
+        run: ./.github/scripts/check-qurl-slo-lockstep.sh
+
       - name: Fetch Auth0 Token
         id: auth0
         if: steps.changes.outputs.terraform_changed == 'true'

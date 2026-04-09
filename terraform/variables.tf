@@ -1175,6 +1175,51 @@ variable "grafana_cloud_external_id" {
   default     = null
 }
 
+variable "grafana_loki_datasource_uid" {
+  description = "UID of the Loki datasource in Grafana Cloud. Used by the qurl-error-logs-spike alert rule."
+  type        = string
+  default     = "grafanacloud-logs"
+}
+
+# ==================== QURL Alerting (Grafana → SNS) ====================
+# Grafana alert rules for the qurl-api SLO. Routes alerts through the
+# existing CloudWatch SNS topic from the monitoring module so the new
+# qurl-api alerts land in the same Slack/email channels as every other
+# prod alert. See docs/slo.md and docs/runbooks/qurl-*.md.
+#
+# Background: 2026-03-24 incident — every POST /v1/qurls returned 500 for
+# over a week before any human noticed. The dashboard had burn-rate panels
+# but no alert rules. This closes that gap.
+
+variable "qurl_alerts_enabled" {
+  description = "Create the Grafana alert rules and SNS contact point for qurl-api. Set true only for prod cells."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_alerts_paused" {
+  description = "Ship Grafana alert rules paused so they soak for 24h before going live. Flip to false after the soak period to begin paging."
+  type        = bool
+  default     = true
+}
+
+variable "qurl_alerts_runbook_base_url" {
+  description = "Base URL for the alert runbooks. Default points at the layervai/nhp main branch."
+  type        = string
+  default     = "https://github.com/layervai/nhp/blob/main/docs/runbooks"
+}
+
+variable "qurl_alerts_slo_target_percent" {
+  description = "Availability SLO target as a percentage. Must match the dashboard's slo_target template variable default (qurl-operations.json line 99) so panels and alerts stay in lockstep. A typo here silently changes the burn-rate denominator by orders of magnitude — the validation block guards against that."
+  type        = number
+  default     = 99.99
+
+  validation {
+    condition     = var.qurl_alerts_slo_target_percent >= 90 && var.qurl_alerts_slo_target_percent <= 99.999
+    error_message = "qurl_alerts_slo_target_percent must be between 90 and 99.999 (e.g., 99.99 for four nines). Values outside this range produce nonsensical burn-rate denominators and are almost certainly a typo."
+  }
+}
+
 # ==================== QURL Router Plugin ====================
 # Configuration for the Traefik QURL Router plugin that routes *.qurl.site requests
 
