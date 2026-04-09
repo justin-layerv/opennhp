@@ -371,6 +371,15 @@ resource "aws_iam_role_policy" "task_dynamodb" {
           "dynamodb:Scan",
           "dynamodb:BatchGetItem",
           "dynamodb:BatchWriteItem",
+          # DescribeTable is required by the periodic schema reconciler
+          # in qurl-service (internal/health/dynamodb_schema.go) which
+          # calls DescribeTable every 60s on each table in the registry
+          # to detect GSI drift. Without this permission the reconciler
+          # fails with AccessDenied, /health/ready flips to 503, and
+          # the ALB de-registers every task. Added to close the
+          # 2026-03-24 incident class (nhp PR #877) at runtime as the
+          # belt-and-suspenders to the workflow gate in promote-to-prod.
+          "dynamodb:DescribeTable",
         ]
         Resource = concat(
           var.dynamodb_table_arns,
