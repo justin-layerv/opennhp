@@ -554,16 +554,26 @@ resource "aws_cloudwatch_metric_alarm" "high_latency" {
 
 # ==================== AC Registration Health (issue #239) ====================
 
+# evaluation_periods=2 at period=600 (20 minutes total) is load-bearing:
+# a single blue/green AC deploy produces ~15 minutes of zero peers while
+# old ACs disconnect and new ACs boot + register (observed 2026-04-09:
+# 15:49–16:04 UTC, single deploy). Back-to-back deploys extend this to
+# ~35 minutes. The 20-minute window rides through a single deploy with
+# margin but fires within 20 minutes if peers genuinely stay at zero
+# outside of a deploy cycle.
+#
+# The previous threshold (3×60s = 3 minutes) fired on every deploy,
+# generating false alarms during normal operations.
 resource "aws_cloudwatch_metric_alarm" "ac_peer_count_low" {
   alarm_name          = "${var.name_prefix}-${var.cell_id}-ac-peer-count-low"
   comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 3
+  evaluation_periods  = 2
   metric_name         = "ACPeerCount"
   namespace           = "LayerV/NHP"
-  period              = 60
+  period              = 600
   statistic           = "Minimum"
   threshold           = 1
-  alarm_description   = "Server has zero connected AC peers for 3 minutes. Knock requests will fail."
+  alarm_description   = "Server has zero connected AC peers for 20 minutes. Knock requests will fail. If this coincides with a deploy, the alarm should auto-resolve once ACs re-register."
   alarm_actions       = [aws_sns_topic.alerts.arn]
   ok_actions          = [aws_sns_topic.alerts.arn]
   treat_missing_data  = "notBreaching"
