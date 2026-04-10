@@ -77,54 +77,90 @@ func mintSmokeQURL(ctx context.Context, t *testing.T, targetURL string) *QURLRes
 	return resp
 }
 
+// resolveRetryBudget is the total wall-clock time resolveWithRetries
+// will spend retrying before giving up. Longer than postFlipMaxWait
+// because each attempt uses a per-attempt timeout that eats into the
+// budget — ~4 attempts if every one times out (5s timeout + 5s poll
+// = 10s each), up to ~8 if failures are fast (sub-second + 5s poll).
+const resolveRetryBudget = 45 * time.Second
+
+// resolvePerAttemptTimeout bounds each individual resolve HTTP call.
+// Short enough to fit multiple retries into resolveRetryBudget, long
+// enough to tolerate a slow NLB target registration (~2-3s typical).
+const resolvePerAttemptTimeout = 5 * time.Second
+
 // resolveWithRetries performs the happy-path resolve GET against
 // /plugins/qurl?token=... and returns the response on success or
-// an error on retry-exhausted failure.
+// fails the test on retry-exhausted failure.
 //
-// Retry policy: retry on 5xx responses (flake class during
-// blue/green flips), fail immediately on 4xx (that's a real
-// token/access decision the server made, not a flake). Transport
-// errors from the underlying doGetNoRedirect are surfaced via
-// t.Fatalf immediately (they indicate a DNS/TLS/network failure
-// that retrying won't help). This prevents a genuine access
-// regression — e.g., a broken resolve lookup returning 403 for
-// every valid token — from being masked by retries.
+// Retry policy: retry on transport errors (timeouts during
+// blue/green flips) and 5xx responses. Fail immediately on 4xx
+// (that's a real token/access decision the server made, not a
+// flake). This prevents a genuine access regression — e.g., a
+// broken resolve lookup returning 403 for every valid token —
+// from being masked by retries.
 //
 // Because each resolve consumes the single-use access token
 // (max_sessions=1), the caller must mint a fresh QURL on every
 // retry. resolveWithRetries takes a mintFunc instead of a
 // pre-minted token to enforce this.
+//
+// Callers receive an *http.Response with headers intact but body
+// drained and closed — only header/cookie inspection is valid.
 func resolveWithRetries(ctx context.Context, t *testing.T, mintFunc func() *QURLResponse) *http.Response {
 	t.Helper()
 
-	deadline := time.Now().Add(postFlipMaxWait)
+	deadline := time.Now().Add(resolveRetryBudget)
 	var lastErr error
 	attempt := 0
 
 	for {
 		attempt++
 		minted := mintFunc()
-		resp, _ := doGetNoRedirect(t, testConfig.NHPServerBaseURL,
-			"/plugins/qurl?token="+minted.AccessToken(), nil)
 
-		switch {
-		case resp.StatusCode == http.StatusFound:
-			if attempt > 1 {
-				t.Logf("resolveWithRetries: succeeded on attempt %d", attempt)
+		reqCtx, cancel := context.WithTimeout(ctx, resolvePerAttemptTimeout)
+		reqURL := testConfig.NHPServerBaseURL + "/plugins/qurl?token=" + minted.AccessToken()
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			cancel()
+			t.Fatalf("resolveWithRetries: build request: %v", err)
+		}
+		resp, err := testConfig.NoRedirectClient.Do(req)
+
+		if err != nil {
+			cancel()
+			// Transport error (timeout, connection refused, etc.) —
+			// retryable during blue/green flips.
+			lastErr = fmt.Errorf("attempt %d: transport error: %w", attempt, err)
+			t.Logf("resolveWithRetries: %v", lastErr)
+		} else {
+			// Drain body before cancelling the context so the
+			// connection returns to the pool instead of being torn
+			// down by the cancelled context.
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			cancel()
+
+			switch {
+			case resp.StatusCode == http.StatusFound:
+				if attempt > 1 {
+					t.Logf("resolveWithRetries: succeeded on attempt %d", attempt)
+				}
+				return resp
+			case resp.StatusCode >= 500:
+				lastErr = fmt.Errorf("attempt %d: 5xx status %d (retryable)", attempt, resp.StatusCode)
+				t.Logf("resolveWithRetries: %v", lastErr)
+			default:
+				// 4xx or unexpected: the server made a decision. Fail
+				// immediately — do not mask an access regression with
+				// retries.
+				t.Fatalf("resolveWithRetries: non-retryable status %d on attempt %d", resp.StatusCode, attempt)
 			}
-			return resp
-		case resp.StatusCode >= 500:
-			lastErr = fmt.Errorf("attempt %d: 5xx status %d (retryable)", attempt, resp.StatusCode)
-		default:
-			// 4xx or unexpected: the server made a decision. Fail
-			// immediately — do not mask an access regression with
-			// retries.
-			t.Fatalf("resolveWithRetries: non-retryable status %d on attempt %d", resp.StatusCode, attempt)
 		}
 
 		if time.Now().After(deadline) {
 			t.Fatalf("resolveWithRetries: exhausted %s budget after %d attempts: %v",
-				postFlipMaxWait, attempt, lastErr)
+				resolveRetryBudget, attempt, lastErr)
 		}
 		time.Sleep(postFlipPollInterval)
 	}
