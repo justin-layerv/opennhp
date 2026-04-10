@@ -123,6 +123,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       qurl_image_tag: ${{ steps.resolve-qurl-tag.outputs.qurl_image_tag }}
+      current_prod_qurl_tag: ${{ steps.prod-state.outputs.qurl_tag }}
       effective_image_tag: ${{ steps.resolve-rollback.outputs.effective_image_tag }}
       changelog: ${{ steps.changelog.outputs.changelog }}
     steps:
@@ -973,6 +974,23 @@ jobs:
           path: terraform/environments/prod/tfplan
           retention-days: 1
 
+      # Convert the binary plan to JSON for the qurl-schema-compat job to
+      # consume. Doing the conversion here (where terraform is already set
+      # up and the providers are already initialized) means the
+      # qurl-schema-compat job stays slim — it just downloads the JSON,
+      # pulls the qurl image, and runs the schema-check binary. No
+      # terraform install in the gate.
+      - name: Convert plan to JSON
+        working-directory: terraform/environments/prod
+        run: terraform show -json tfplan > tfplan.json
+
+      - name: Upload plan JSON artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: tfplan-prod-json
+          path: terraform/environments/prod/tfplan.json
+          retention-days: 1
+
       - name: Upload Lambda build artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -1003,11 +1021,156 @@ jobs:
           if-no-files-found: ignore
 
   # =============================================================================
+  # QURL SCHEMA COMPAT - Refuse destructive terraform if the deployed
+  # qurl-service code still depends on a GSI the plan would remove.
+  # =============================================================================
+  #
+  # This is the gate that closes the 2026-03-24 incident class (nhp PR #877:
+  # owner-target-index removed while the deployed qurl-service still queried
+  # it; POST /v1/qurls returned 500 for >1 week before customers noticed).
+  #
+  # The job runs the qurl-schema-check binary (built into the same Docker
+  # image as the qurl-api server in layervai/qurl-service#247) against the
+  # terraform plan that terraform-apply is about to apply. The binary
+  # compares the plan's post-apply DynamoDB schema against the deployed
+  # binary's compiled-in registry of (table, GSI) pairs. If any registered
+  # GSI would be missing in the post-apply state, the binary exits 1 and
+  # this job fails, blocking terraform-apply.
+  #
+  # CRITICAL: the gate must validate the qurl image that will be RUNNING
+  # IN PROD AFTER THE DEPLOY COMPLETES, not the latest sandbox build. The
+  # 2026-03-24 incident's smoking gun was deploy_qurl=false with
+  # run_terraform=true — terraform applied while prod kept running its old
+  # image. So:
+  #
+  #   - if deploy_qurl == true: validate the new image being deployed
+  #     (manifest.outputs.qurl_image_tag)
+  #   - if deploy_qurl == false: validate the image already running in
+  #     prod (manifest.outputs.current_prod_qurl_tag, read from SSM by
+  #     the manifest job so this gate doesn't need prod credentials)
+  #
+  # Either way, the validation matches reality: whichever image will be
+  # serving qurl-api requests after the apply is what gets checked.
+  #
+  # Tracked in #1013.
+  qurl-schema-compat:
+    name: QURL Schema Compatibility Check
+    needs: [manifest, preflight, terraform-plan]
+    if: inputs.run_terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download plan JSON artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tfplan-prod-json
+          path: .
+
+      - name: Resolve effective qurl image tag
+        id: resolve
+        env:
+          DEPLOY_QURL: ${{ inputs.deploy_qurl }}
+          NEW_QURL_TAG: ${{ needs.manifest.outputs.qurl_image_tag }}
+          CURRENT_PROD_QURL_TAG: ${{ needs.manifest.outputs.current_prod_qurl_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$DEPLOY_QURL" == "true" ]]; then
+            if [[ -z "$NEW_QURL_TAG" ]]; then
+              echo "::error::deploy_qurl=true but manifest produced no qurl_image_tag — cannot validate schema."
+              exit 1
+            fi
+            echo "Validating against new qurl image being deployed: $NEW_QURL_TAG"
+            EFFECTIVE_TAG="$NEW_QURL_TAG"
+          else
+            # Use the currently-deployed prod tag already read by the
+            # manifest job (from /${PROD_SSM_PREFIX}/qurl-api-image-tag).
+            # This is the image that will continue to serve traffic after
+            # the destructive terraform applies — it must NOT depend on
+            # any GSI the plan removes.
+            if [[ -z "$CURRENT_PROD_QURL_TAG" || "$CURRENT_PROD_QURL_TAG" == "not deployed" || "$CURRENT_PROD_QURL_TAG" == "latest" ]]; then
+              echo "::error::deploy_qurl=false but the manifest could not resolve the current prod qurl image tag (got '${CURRENT_PROD_QURL_TAG:-<empty>}'). Without knowing what's running, schema compatibility cannot be verified — refusing to advance the deploy."
+              exit 1
+            fi
+            echo "Validating against currently-deployed prod qurl image: $CURRENT_PROD_QURL_TAG"
+            EFFECTIVE_TAG="$CURRENT_PROD_QURL_TAG"
+          fi
+          echo "effective_tag=$EFFECTIVE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (sandbox - ECR pull)
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to sandbox ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
+      - name: Pull qurl-service image and run schema-check
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ECR_QURL_REPO: ${{ env.ECR_QURL_REPO }}
+          EFFECTIVE_TAG: ${{ steps.resolve.outputs.effective_tag }}
+        run: |
+          set -euo pipefail
+          IMAGE="$ECR_REGISTRY/$ECR_QURL_REPO:$EFFECTIVE_TAG"
+          echo "Pulling $IMAGE..."
+          docker pull "$IMAGE"
+
+          echo ""
+          echo "Running qurl-schema-check against the prod terraform plan..."
+          echo "  Image:    $IMAGE"
+          echo "  Plan:     tfplan.json"
+          echo ""
+
+          # The schema-check binary writes a precise (table, index, reason)
+          # report to its own stderr on failure; surface its full output in
+          # the workflow log so operators see exactly which GSI is missing
+          # without having to re-run anything.
+          set +e
+          docker run --rm \
+            -v "$PWD/tfplan.json:/tmp/tfplan.json:ro" \
+            "$IMAGE" \
+            /app/qurl-schema-check --plan /tmp/tfplan.json
+          EXIT=$?
+          set -e
+
+          case "$EXIT" in
+            0)
+              echo ""
+              echo "::notice::qurl-schema-check passed: every required GSI is present in the post-apply state."
+              ;;
+            1)
+              echo ""
+              echo "::error::qurl-schema-check failed: a registered GSI is missing in the post-apply terraform state. The deployed qurl-service code still queries that GSI; applying this plan would break production. See the diagnostic above for the exact (table, index) pair and remediation steps."
+              exit 1
+              ;;
+            2)
+              echo ""
+              echo "::error::qurl-schema-check could not validate the plan (exit 2). This usually means the terraform plan JSON is malformed, an aws_dynamodb_table block is structurally broken, or two tables in the plan ambiguously map to the same logical name. Refusing to advance the deploy until the operator investigates."
+              exit 1
+              ;;
+            126|127)
+              # 126 = permission denied; 127 = binary not found. Most
+              # likely the effective qurl image predates layervai/qurl-service#247
+              # which added /app/qurl-schema-check to the Docker image.
+              echo ""
+              echo "::error::qurl-schema-check binary not found or not executable in image $IMAGE (exit $EXIT). The effective qurl image (tag $EFFECTIVE_TAG) likely predates qurl-service#247 which added the schema-check binary. Either deploy a newer qurl image (deploy_qurl=true with a post-#247 tag) or, if this is intentional, verify GSI compatibility manually before applying."
+              exit 1
+              ;;
+            *)
+              echo ""
+              echo "::error::qurl-schema-check returned unexpected exit code $EXIT. Refusing to advance the deploy."
+              exit 1
+              ;;
+          esac
+
+  # =============================================================================
   # TERRAFORM APPLY - Apply reviewed plan (approval gate)
   # =============================================================================
   terraform-apply:
     name: Terraform Apply (prod)
-    needs: [manifest, preflight, terraform-plan]
+    needs: [manifest, preflight, terraform-plan, qurl-schema-compat]
     if: inputs.run_terraform
     runs-on: ubuntu-latest
     environment: production
