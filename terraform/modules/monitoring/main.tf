@@ -297,6 +297,25 @@ resource "aws_cloudwatch_dashboard" "main" {
           stat   = "p99"
           view   = "timeSeries"
         }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 18
+        width  = 12
+        height = 6
+        properties = {
+          title  = "AC Registration Health"
+          region = data.aws_region.current.id
+          metrics = [
+            ["LayerV/NHP", "ACPeerCount", "Environment", var.environment, "Cell", var.cell_id, { "stat" : "Average", "label" : "AC Peers" }],
+            ["LayerV/NHP", "ACRegistrationSuccess", "Environment", var.environment, "Cell", var.cell_id, { "stat" : "Sum", "label" : "Reg Success" }],
+            ["LayerV/NHP", "ACRegistrationFailure", "Environment", var.environment, "Cell", var.cell_id, { "stat" : "Sum", "label" : "Reg Failure" }]
+          ]
+          period  = 300
+          view    = "timeSeries"
+          stacked = false
+        }
       }
     ]
   })
@@ -518,6 +537,58 @@ resource "aws_cloudwatch_metric_alarm" "high_latency" {
   extended_statistic  = "p99"
   threshold           = 500
   alarm_description   = "NHP knock latency p99 exceeded 500ms"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# ==================== AC Registration Health (issue #239) ====================
+
+resource "aws_cloudwatch_metric_alarm" "ac_peer_count_low" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-ac-peer-count-low"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 3
+  metric_name         = "ACPeerCount"
+  namespace           = "LayerV/NHP"
+  period              = 60
+  statistic           = "Minimum"
+  threshold           = 1
+  alarm_description   = "Server has zero connected AC peers for 3 minutes. Knock requests will fail."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+resource "aws_cloudwatch_metric_alarm" "ac_registration_latency" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-ac-registration-latency"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  metric_name         = "ACRegistrationLatency"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  extended_statistic  = "p99"
+  threshold           = 1000
+  alarm_description   = "AC registration latency p99 exceeded 1s on server side."
   alarm_actions       = [aws_sns_topic.alerts.arn]
   ok_actions          = [aws_sns_topic.alerts.arn]
   treat_missing_data  = "notBreaching"

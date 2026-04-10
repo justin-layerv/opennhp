@@ -57,6 +57,9 @@ const (
 	MetricCloudMapDeregisterFailure    = "CloudMapDeregisterFailure"
 	MetricKnockNoAC                    = "KnockNoAC"
 	MetricACPeerCount                  = "ACPeerCount"
+	MetricACRegistrationSuccess        = "ACRegistrationSuccess"
+	MetricACRegistrationFailure        = "ACRegistrationFailure"
+	MetricACRegistrationLatency        = "ACRegistrationLatency"
 	MetricBroadcastPartialFail         = "BroadcastPartialFail"
 	MetricBroadcastDurationMs          = "BroadcastDurationMs"
 	MetricLicenseValidationRateLimited = "LicenseValidationRateLimited"
@@ -275,6 +278,7 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	s.wg.Add(1)
 	defer s.wg.Done()
 
+	regStart := time.Now()
 	transactionId := ppd.SenderTrxId
 	addrStr := ppd.ConnData.RemoteAddr.String()
 	aolMsg := &common.ACOnlineMsg{}
@@ -282,6 +286,7 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	err = json.Unmarshal(ppd.BodyMessage, aolMsg)
 	if err != nil {
 		log.Error("server-ac(#%d@%s)[HandleACOnline] failed to parse %s message: %v", transactionId, addrStr, core.HeaderTypeToString(ppd.HeaderType), err)
+		s.metrics.IncrCounter(MetricACRegistrationFailure)
 		return err
 	}
 
@@ -327,12 +332,14 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 			aakBytes, marshalErr := json.Marshal(aakMsg)
 			if marshalErr != nil {
 				log.Error("server-ac(%s#%d@%s)[HandleACOnline] failed to marshal AAK error message: %v", acId, transactionId, addrStr, marshalErr)
+				s.metrics.IncrCounter(MetricACRegistrationFailure)
 				return validationErr
 			}
 			aakMd := makeMsgData(ppd, core.NHP_AAK, aakBytes)
 			if transaction := ppd.ConnData.FindRemoteTransaction(transactionId); transaction != nil {
 				transaction.NextMsgCh <- aakMd
 			}
+			s.metrics.IncrCounter(MetricACRegistrationFailure)
 			return validationErr
 		}
 
@@ -446,9 +453,18 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	aakBytes, marshalErr := json.Marshal(aakMsg)
 	if marshalErr != nil {
 		log.Error("server-ac(%s#%d@%s)[HandleACOnline] failed to marshal AAK message: %v", acId, transactionId, addrStr, marshalErr)
+		s.metrics.IncrCounter(MetricACRegistrationFailure)
 		return marshalErr
 	}
 	aakMd := makeMsgData(ppd, core.NHP_AAK, aakBytes)
+
+	// Emit server-side AC registration metrics (issue #239).
+	// Counted here because the server's registration work (validation,
+	// assignment, peer list) is complete. If forwardToTransaction fails
+	// to deliver the AAK, the AC will re-register via its retry loop;
+	// the AC-side metrics capture that perspective independently.
+	s.metrics.IncrCounter(MetricACRegistrationSuccess)
+	s.metrics.RecordLatency(MetricACRegistrationLatency, float64(time.Since(regStart).Milliseconds()))
 
 	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-ac", "HandleACOnline", acId, addrStr)
 }

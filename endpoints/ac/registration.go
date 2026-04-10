@@ -129,6 +129,11 @@ const (
 	// so each incident counts once. It provides early visibility into a
 	// degraded AC before the threshold actually triggers re-registration.
 	MetricAllUnconnectedDetected = "AllUnconnectedDetected"
+
+	// Gauge metrics for AC-to-Server registration health monitoring (issue #239).
+	// Published every flush interval via RegisterGaugeFunc.
+	MetricServersConnected = "ServersConnected"
+	MetricServersHealthy   = "ServersHealthy"
 )
 
 // Re-registration reason constants. These are the only values that
@@ -191,6 +196,16 @@ func (s *AssignedServer) GetLastSeen() time.Time {
 	return s.LastSeen
 }
 
+// IsHealthy reports whether the server is currently connected and has
+// been seen within the supplied healthWindow. Both Connected and LastSeen
+// are read under a single lock acquisition so the two values are always
+// consistent with respect to each other.
+func (s *AssignedServer) IsHealthy(healthWindow time.Duration) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Connected && time.Since(s.LastSeen) <= healthWindow
+}
+
 // IncrementFailCount safely increments the FailCount.
 func (s *AssignedServer) IncrementFailCount() int {
 	s.mu.Lock()
@@ -214,7 +229,18 @@ var (
 
 // recordRegistrationSuccess emits a MetricRegistrationSuccess counter with the
 // given registration type dimension (dimValDirect, dimValRedispatch, or dimValPeerRedispatch).
+//
+// It also emits an unbreakdown base counter (no RegistrationType dim) so the
+// registration_stale alarm — keyed on the publisher base dimension set
+// [Component, Environment, Region] — has a matching metric stream to evaluate.
+// The breakdown variant remains queryable for dashboards that want a
+// per-RegistrationType view.
+//
+// This results in two CloudWatch datapoints per successful registration; the
+// extra cost is acceptable in exchange for being able to alarm on the absence
+// of *any* successful registration.
 func (r *ACRegistration) recordRegistrationSuccess(regType *string) {
+	r.metrics.IncrCounter(MetricRegistrationSuccess)
 	r.metrics.IncrCounterWithDims(MetricRegistrationSuccess, []types.Dimension{
 		{Name: dimNameRegistrationType, Value: regType},
 	})
@@ -485,6 +511,11 @@ func (r *ACRegistration) Start() error {
 
 	log.Info("Starting AC registration with endpoint %s", r.ac.config.ServerEndpoint)
 
+	// Register gauge functions for AC-to-Server registration health (issue #239).
+	// These are evaluated every flush interval (60s) by the metrics publisher.
+	r.metrics.RegisterGaugeFunc(MetricServersConnected, r.connectedServerCount)
+	r.metrics.RegisterGaugeFunc(MetricServersHealthy, r.healthyServerCount)
+
 	// Add to wait group BEFORE starting goroutines to prevent race with Stop()
 	r.wg.Add(2)
 	go r.registrationLoop()
@@ -550,6 +581,37 @@ func (r *ACRegistration) HasAssignedServers() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.assignedServers) > 0
+}
+
+// connectedServerCount returns the number of assigned servers in Connected state.
+// Used as a GaugeFunc for the ServersConnected CloudWatch metric.
+func (r *ACRegistration) connectedServerCount() float64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	count := 0
+	for _, s := range r.assignedServers {
+		if s.IsConnected() {
+			count++
+		}
+	}
+	return float64(count)
+}
+
+// healthyServerCount returns the number of assigned servers that are both
+// connected and have responded within the keepalive health window
+// (KeepaliveInterval * KeepaliveMaxRetries = 30s).
+// Used as a GaugeFunc for the ServersHealthy CloudWatch metric.
+func (r *ACRegistration) healthyServerCount() float64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	count := 0
+	healthWindow := KeepaliveInterval * KeepaliveMaxRetries
+	for _, s := range r.assignedServers {
+		if s.IsHealthy(healthWindow) {
+			count++
+		}
+	}
+	return float64(count)
 }
 
 // registrationLoop attempts registration and maintains connections.

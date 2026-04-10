@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
@@ -1396,5 +1397,37 @@ func TestDrainACConnections_NoHostname(t *testing.T) {
 		t.Fatalf("unexpected message sent: %+v", md)
 	default:
 		// good
+	}
+}
+
+// TestHandleACOnline_MalformedBodyEmitsFailureMetric verifies that the
+// JSON-unmarshal failure path in HandleACOnline emits MetricACRegistrationFailure
+// and does NOT emit MetricACRegistrationSuccess. This is a regression test for
+// the server-side AC registration metrics added in #870; the alarm
+// `registration_stale` requires that any failure path observably increments
+// the failure counter.
+func TestHandleACOnline_MalformedBodyEmitsFailureMetric(t *testing.T) {
+	publisher := metrics.NewPublisherForTest(t)
+	s := &UdpServer{metrics: publisher}
+
+	ppd := &core.PacketParserData{
+		SenderTrxId: 42,
+		HeaderType:  core.NHP_AOL,
+		BodyMessage: []byte("not-valid-json"),
+		ConnData: &core.ConnectionData{
+			RemoteAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 4567},
+		},
+	}
+
+	if err := s.HandleACOnline(ppd); err == nil {
+		t.Fatal("HandleACOnline should return error on malformed body")
+	}
+
+	counters, _ := publisher.CountersForTest(t)
+	if got := counters[MetricACRegistrationFailure]; got != 1 {
+		t.Errorf("MetricACRegistrationFailure = %v, want 1", got)
+	}
+	if got := counters[MetricACRegistrationSuccess]; got != 0 {
+		t.Errorf("MetricACRegistrationSuccess = %v, want 0 on failure path", got)
 	}
 }

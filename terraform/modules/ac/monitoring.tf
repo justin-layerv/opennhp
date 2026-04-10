@@ -31,6 +31,15 @@ resource "aws_cloudwatch_metric_alarm" "disk_usage_high" {
   })
 }
 
+# NOTE: This alarm and `server_connection_failure` below intentionally use the
+# loose `{Component = "AC"}` dimension set rather than the full
+# `{Component, Environment, Region}` set that the newer registration health
+# alarms use. The reason is historical: these counters were emitted via the AC
+# publisher BEFORE the publisher was given Environment/Region dimensions, so
+# the loose dimension set is the only metric stream that has data going back
+# in time. Aligning them with the full dimension set is tracked as cleanup
+# follow-up work — see issue #239 — and would lose historical alarm continuity
+# if done in this PR.
 resource "aws_cloudwatch_metric_alarm" "registration_failure" {
   count = var.enable_cloudwatch_alarms ? 1 : 0
 
@@ -110,26 +119,6 @@ resource "aws_cloudwatch_metric_alarm" "cert_sync_failures" {
   })
 }
 
-# Note: an earlier draft of this PR added two AC-to-server registration health
-# alarms (`servers_healthy_low` and `registration_stale`). They were dropped
-# during staff review because:
-#
-#   1. `ServersHealthy` is not published by any AC code path. The closest
-#      candidate is the `connectedCount` calculated inside checkServerHealth(),
-#      but it is only logged, not exposed as a CloudWatch metric. The alarm
-#      would never have fired.
-#
-#   2. `RegistrationSuccess` is published with an additional `RegistrationType`
-#      dimension via IncrCounterWithDims, so the metric in CloudWatch lives at
-#      [Environment, Component, RegistrationType], not [Environment, Component].
-#      A two-dimension alarm cannot match a three-dimension metric, so the
-#      stale-registration alarm would also never have fired.
-#
-# Adding non-functional alarms is worse than no alarms at all because it
-# creates false confidence in coverage. The follow-up work is tracked in a
-# dedicated issue so the metric publishers and alarm dimensions can be
-# designed together.
-
 # ==================== EIP Pool Monitoring ====================
 #
 # Dimension schema note: the EIP alarms below use [Component, Environment]
@@ -180,9 +169,8 @@ resource "aws_cloudwatch_metric_alarm" "eip_pool_utilization_high" {
   period              = 300 # 5 minutes
   statistic           = "Maximum"
   threshold           = var.eip_pool_utilization_threshold_percent
-  # Note: local.eip_count is defined in eip.tf (accounts for blue/green 2x multiplier).
-  alarm_description  = "AC EIP pool utilization exceeds ${var.eip_pool_utilization_threshold_percent}%. Pool exhaustion will prevent new instances from launching. Total EIPs allocated: ${local.eip_count}."
-  treat_missing_data = "notBreaching"
+  alarm_description   = "AC EIP pool utilization exceeds ${var.eip_pool_utilization_threshold_percent}%. Pool exhaustion will prevent new instances from launching. Total EIPs allocated: ${local.eip_count}."
+  treat_missing_data  = "notBreaching"
 
   dimensions = {
     Component   = "AC"
@@ -229,6 +217,69 @@ resource "aws_cloudwatch_metric_alarm" "eip_claim_failure" {
 
   tags = merge(var.tags, {
     Name = "${var.name_prefix}-ac-eip-claim-failure"
+  })
+}
+
+# ==================== AC-to-Server Registration Health (issue #239) ====================
+
+# NOTE on alarm dimensions: the AC publisher (endpoints/ac/registration.go
+# NewACRegistration) emits metrics with the *exact* dimension set
+# [Component=AC, Environment=<env>, Region=<region>]. CloudWatch alarms must
+# match this dimension set EXACTLY — a partial dimension set selects a different
+# (non-existent) metric stream and the alarm sits in INSUFFICIENT_DATA forever.
+resource "aws_cloudwatch_metric_alarm" "servers_healthy_low" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-servers-healthy-low"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ServersHealthy"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Minimum"
+  threshold           = 2
+  alarm_description   = "AC has fewer than 2 healthy server connections for 5 minutes. Target is 3 (one per AZ)."
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Component   = "AC"
+    Environment = var.environment
+    Region      = data.aws_region.current.id
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-ac-servers-healthy-low"
+  })
+}
+
+resource "aws_cloudwatch_metric_alarm" "registration_stale" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-registration-stale"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "RegistrationSuccess"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "No AC registration success events in 10 minutes. ACs may be unable to reach any server."
+  treat_missing_data  = "breaching"
+
+  dimensions = {
+    Component   = "AC"
+    Environment = var.environment
+    Region      = data.aws_region.current.id
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-ac-registration-stale"
   })
 }
 
@@ -422,6 +473,8 @@ resource "aws_cloudwatch_dashboard" "ac_monitoring" {
             aws_cloudwatch_metric_alarm.disk_usage_high[0].arn,
             aws_cloudwatch_metric_alarm.registration_failure[0].arn,
             aws_cloudwatch_metric_alarm.server_connection_failure[0].arn,
+            aws_cloudwatch_metric_alarm.servers_healthy_low[0].arn,
+            aws_cloudwatch_metric_alarm.registration_stale[0].arn,
             ],
             var.enable_egress_eips ? [
               aws_cloudwatch_metric_alarm.eip_pool_utilization_high[0].arn,
@@ -444,6 +497,51 @@ resource "aws_cloudwatch_dashboard" "ac_monitoring" {
 
             Disk metrics are collected every 30 minutes via SSM State Manager. Log rotation runs daily at 3 AM UTC.
           EOT
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 11
+        width  = 12
+        height = 6
+        properties = {
+          title  = "AC Server Connections"
+          region = data.aws_region.current.id
+          # Gauges are emitted with the publisher base dims
+          # [Component, Environment, Region]; the dimension order in the
+          # widget metric tuples must match exactly or no data is returned.
+          metrics = [
+            ["LayerV/NHP", "ServersConnected", "Component", "AC", "Environment", var.environment, "Region", data.aws_region.current.id, { "stat" : "Average", "label" : "Connected" }],
+            ["LayerV/NHP", "ServersHealthy", "Component", "AC", "Environment", var.environment, "Region", data.aws_region.current.id, { "stat" : "Average", "label" : "Healthy" }]
+          ]
+          view    = "timeSeries"
+          stacked = false
+          period  = 60
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 11
+        width  = 12
+        height = 6
+        properties = {
+          title  = "AC Registration Events"
+          region = data.aws_region.current.id
+          # RegistrationSuccess is emitted twice by recordRegistrationSuccess:
+          # once via IncrCounter (base dims, matched here) and once via
+          # IncrCounterWithDims with a RegistrationType breakdown.
+          # RegistrationFailure is only emitted with extra ACId dimension —
+          # use a SEARCH expression so the widget aggregates across all ACs
+          # without hard-coding instance IDs.
+          metrics = [
+            ["LayerV/NHP", "RegistrationSuccess", "Component", "AC", "Environment", var.environment, "Region", data.aws_region.current.id, { "stat" : "Sum", "label" : "Success" }],
+            [{ "expression" : "SUM(SEARCH('{LayerV/NHP,Component,Environment,Region,ACId} MetricName=\"RegistrationFailure\" Component=\"AC\" Environment=\"${var.environment}\" Region=\"${data.aws_region.current.id}\"', 'Sum', 300))", "label" : "Failure", "id" : "regfail" }]
+          ]
+          view    = "timeSeries"
+          stacked = false
+          period  = 300
         }
       }
       ],

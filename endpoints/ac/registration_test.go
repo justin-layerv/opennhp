@@ -478,6 +478,154 @@ func TestAssignedServer_Accessors(t *testing.T) {
 	}
 }
 
+func TestAssignedServer_IsHealthy(t *testing.T) {
+	window := 30 * time.Second
+
+	// Not connected -> not healthy even with fresh LastSeen
+	s := &AssignedServer{}
+	s.UpdateLastSeen()
+	if s.IsHealthy(window) {
+		t.Error("disconnected server should not be healthy")
+	}
+
+	// Connected and recently seen -> healthy
+	s.SetConnected(true)
+	if !s.IsHealthy(window) {
+		t.Error("connected server with recent LastSeen should be healthy")
+	}
+
+	// Connected but LastSeen beyond window -> not healthy
+	stale := &AssignedServer{Connected: true, LastSeen: time.Now().Add(-2 * window)}
+	if stale.IsHealthy(window) {
+		t.Error("connected server past health window should not be healthy")
+	}
+
+	// Connected but zero LastSeen -> not healthy
+	zeroSeen := &AssignedServer{Connected: true}
+	if zeroSeen.IsHealthy(window) {
+		t.Error("connected server with zero LastSeen should not be healthy")
+	}
+}
+
+func TestACRegistration_ConnectedServerCount(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+	reg := mustNewACRegistration(t, ac)
+
+	if got := reg.connectedServerCount(); got != 0 {
+		t.Errorf("expected 0 connected servers, got %v", got)
+	}
+
+	reg.mu.Lock()
+	reg.assignedServers = []*AssignedServer{
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort}, Connected: true, LastSeen: time.Now()},
+		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: DefaultServerPort}, Connected: false},
+		{Target: common.RedirectTarget{IP: "10.0.0.3", Port: DefaultServerPort}, Connected: true, LastSeen: time.Now()},
+	}
+	reg.mu.Unlock()
+
+	if got := reg.connectedServerCount(); got != 2 {
+		t.Errorf("expected 2 connected servers, got %v", got)
+	}
+
+	// Disconnecting one brings count down.
+	reg.assignedServers[0].SetConnected(false)
+	if got := reg.connectedServerCount(); got != 1 {
+		t.Errorf("expected 1 connected server after disconnect, got %v", got)
+	}
+}
+
+func TestACRegistration_HealthyServerCount(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+	reg := mustNewACRegistration(t, ac)
+
+	if got := reg.healthyServerCount(); got != 0 {
+		t.Errorf("expected 0 healthy servers with empty list, got %v", got)
+	}
+
+	healthWindow := KeepaliveInterval * KeepaliveMaxRetries
+	now := time.Now()
+
+	reg.mu.Lock()
+	reg.assignedServers = []*AssignedServer{
+		// Fresh + connected -> healthy.
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort}, Connected: true, LastSeen: now},
+		// Connected but LastSeen outside the window -> not healthy.
+		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: DefaultServerPort}, Connected: true, LastSeen: now.Add(-2 * healthWindow)},
+		// Not connected -> not healthy.
+		{Target: common.RedirectTarget{IP: "10.0.0.3", Port: DefaultServerPort}, Connected: false, LastSeen: now},
+		// Fresh + connected -> healthy.
+		{Target: common.RedirectTarget{IP: "10.0.0.4", Port: DefaultServerPort}, Connected: true, LastSeen: now.Add(-healthWindow / 2)},
+	}
+	reg.mu.Unlock()
+
+	if got := reg.healthyServerCount(); got != 2 {
+		t.Errorf("expected 2 healthy servers, got %v", got)
+	}
+
+	// Mark the stale server as recently seen -> becomes healthy.
+	reg.assignedServers[1].UpdateLastSeen()
+	if got := reg.healthyServerCount(); got != 3 {
+		t.Errorf("expected 3 healthy servers after UpdateLastSeen, got %v", got)
+	}
+}
+
+// TestRecordRegistrationSuccess_EmitsBothBaseAndTypedCounters verifies that
+// recordRegistrationSuccess emits BOTH the base counter (no extra dimensions)
+// and the breakdown counter (with RegistrationType).
+//
+// Regression test for the registration_stale alarm: that alarm matches the
+// publisher base dimension set [Component, Environment, Region], so the base
+// counter must always fire on success or the alarm sits in INSUFFICIENT_DATA
+// even when ACs are healthy.
+func TestRecordRegistrationSuccess_EmitsBothBaseAndTypedCounters(t *testing.T) {
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-001",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
+	}
+	reg := mustNewACRegistration(t, ac)
+
+	reg.recordRegistrationSuccess(dimValDirect)
+	reg.recordRegistrationSuccess(dimValRedispatch)
+	reg.recordRegistrationSuccess(dimValDirect)
+
+	counters, dimCounters := reg.metrics.CountersForTest(t)
+	if got := counters[MetricRegistrationSuccess]; got != 3 {
+		t.Errorf("base RegistrationSuccess counter: want 3, got %v", got)
+	}
+
+	// Breakdown counter: 2 for Direct, 1 for Redispatch.
+	var directCount, redispatchCount float64
+	for key, v := range dimCounters {
+		if !strings.Contains(key, MetricRegistrationSuccess) {
+			continue
+		}
+		if strings.Contains(key, "RegistrationType="+*dimValDirect) {
+			directCount += v
+		}
+		if strings.Contains(key, "RegistrationType="+*dimValRedispatch) {
+			redispatchCount += v
+		}
+	}
+	if directCount != 2 {
+		t.Errorf("Direct breakdown counter: want 2, got %v", directCount)
+	}
+	if redispatchCount != 1 {
+		t.Errorf("Redispatch breakdown counter: want 1, got %v", redispatchCount)
+	}
+}
+
 // TestACRegistration_GetAssignedServers tests the GetAssignedServers method.
 func TestACRegistration_GetAssignedServers(t *testing.T) {
 	ac := &UdpAC{
