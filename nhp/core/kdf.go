@@ -6,39 +6,53 @@ import (
 	"hash"
 )
 
-type NoiseFactory struct {
-	HashType HashTypeEnum
-}
-
-// HMAC1 performs HMAC with a single input.
-// PANICS if NewHash fails - this indicates a programming error since HashType
-// is set from hardcoded values in the codebase. If this panic occurs, it means
-// the NoiseFactory was misconfigured, which is a bug that should be caught during development.
-func (n *NoiseFactory) HMAC1(dst *[HashSize]byte, key, in0 []byte) {
-	newHash := func() hash.Hash {
-		h, err := NewHash(n.HashType)
+// makeHashFunc wraps NewHash into a panic-on-error constructor suitable for
+// hmac.New. Using a package-level function value (rather than an inline
+// closure) avoids a heap allocation on every HMAC call — the KDF chain
+// invokes HMAC ~13 times per packet.
+func makeHashFunc(t HashTypeEnum) func() hash.Hash {
+	return func() hash.Hash {
+		h, err := NewHash(t)
 		if err != nil {
 			panic("NewHash failed: " + err.Error())
 		}
 		return h
 	}
-	mac := hmac.New(newHash, key)
+}
+
+// hashNewFuncs holds pre-allocated hash constructor functions keyed by
+// HashTypeEnum. Must be kept in sync with HashTypeEnum values — adding a
+// new hash type without extending this array causes an index-out-of-range
+// panic at runtime.
+var hashNewFuncs = [...]func() hash.Hash{
+	HASH_BLAKE2S: makeHashFunc(HASH_BLAKE2S),
+	HASH_SHA256:  makeHashFunc(HASH_SHA256),
+}
+
+type NoiseFactory struct {
+	HashType HashTypeEnum
+}
+
+// hashFunc returns the pre-allocated hash constructor for this factory's
+// HashType. Panics if HashType is out of range (programming error).
+func (n *NoiseFactory) hashFunc() func() hash.Hash {
+	return hashNewFuncs[n.HashType]
+}
+
+// HMAC1 performs HMAC with a single input.
+// PANICS if HashType is invalid — this indicates a programming error since
+// HashType is set from hardcoded values in the codebase.
+func (n *NoiseFactory) HMAC1(dst *[HashSize]byte, key, in0 []byte) {
+	mac := hmac.New(n.hashFunc(), key)
 	mac.Write(in0)
 	mac.Sum(dst[:0])
 	mac.Reset()
 }
 
 // HMAC2 performs HMAC with two inputs.
-// PANICS if NewHash fails - see HMAC1 for rationale.
+// PANICS if HashType is invalid — see HMAC1 for rationale.
 func (n *NoiseFactory) HMAC2(dst *[HashSize]byte, key, in0, in1 []byte) {
-	newHash := func() hash.Hash {
-		h, err := NewHash(n.HashType)
-		if err != nil {
-			panic("NewHash failed: " + err.Error())
-		}
-		return h
-	}
-	mac := hmac.New(newHash, key)
+	mac := hmac.New(n.hashFunc(), key)
 	mac.Write(in0)
 	mac.Write(in1)
 	mac.Sum(dst[:0])
@@ -72,12 +86,9 @@ func (n *NoiseFactory) MixKey(dst *[SymmetricKeySize]byte, key []byte, input []b
 }
 
 // MixHash combines key and input into a hash output.
-// PANICS if NewHash fails - see HMAC1 for rationale.
+// PANICS if HashType is invalid — see HMAC1 for rationale.
 func (n *NoiseFactory) MixHash(dst *[HashSize]byte, key []byte, input []byte) {
-	h, err := NewHash(n.HashType)
-	if err != nil {
-		panic("NewHash failed: " + err.Error())
-	}
+	h := n.hashFunc()()
 	h.Write(key)
 	h.Write(input)
 	h.Sum(dst[:0])
