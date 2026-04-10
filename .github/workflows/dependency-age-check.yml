@@ -57,6 +57,14 @@ jobs:
             while IFS=' ' read -r module version; do
               [[ "$version" =~ ^v ]] || continue
 
+              # Pseudo-versions (v0.0.0-YYYYMMDDHHMMSS-hash) are pinned commits,
+              # not published releases. The proxy may 404 or return misleading
+              # timestamps. Skip them — they are not supply chain attack vectors.
+              if [[ "$version" =~ ^v0\.0\.0-[0-9]{14}- ]]; then
+                echo "  SKIP: ${module}@${version} (pseudo-version)"
+                continue
+              fi
+
               # Go module proxy encoding: uppercase letters become !lowercase
               # per https://pkg.go.dev/cmd/go#hdr-Module_proxy_protocol
               # shellcheck disable=SC2001
