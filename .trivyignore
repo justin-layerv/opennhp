@@ -62,3 +62,10 @@ CVE-2026-32305
 # Wait for a Traefik release bundling go-jose >= v4.1.4 to remove this entry.
 # https://avd.aquasec.com/nvd/cve-2026-34986
 CVE-2026-34986
+
+# go.opentelemetry.io/otel/sdk - FALSE POSITIVE
+# CVE-2026-39883 (PATH hijacking via kenv on BSD) is fixed in v1.43.0.
+# We are on v1.43.0. Trivy's database incorrectly flags it — the affected
+# range is < 1.43.0. Remove this entry once Trivy's DB is corrected.
+# https://avd.aquasec.com/nvd/cve-2026-39883
+CVE-2026-39883
