@@ -81,6 +81,12 @@ variable "secondary_account_ids" {
   default     = []
 }
 
+variable "enable_replication" {
+  description = "Enable ECR cross-account replication to secondary accounts"
+  type        = bool
+  default     = false
+}
+
 variable "github_org" {
   type    = string
   default = "layervai"

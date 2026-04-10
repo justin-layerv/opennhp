@@ -72,6 +72,12 @@ variable "secondary_account_ids" {
   }
 }
 
+variable "enable_replication" {
+  description = "Enable ECR cross-account replication from primary to secondary accounts. When true, images pushed to sandbox ECR are automatically replicated to prod, eliminating prod's runtime dependency on sandbox."
+  type        = bool
+  default     = false
+}
+
 # ==================== NHP Configuration ====================
 
 variable "domain_name" {

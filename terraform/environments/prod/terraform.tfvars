@@ -15,9 +15,10 @@ min_capacity   = 3
 max_capacity   = 10
 vpc_cidr       = "10.200.0.0/16" # Different CIDR from sandbox
 
-# Multi-account config: prod pulls images from sandbox account's ECR
+# Multi-account config: images replicated from sandbox ECR to local prod registry
 is_primary_account = false
 primary_account_id = "767397897469" # Sandbox (layerv) account ID
+enable_replication = true           # Receive replicated images from sandbox ECR
 
 # AC configuration (Traefik with Let's Encrypt for TLS)
 deploy_ac          = true

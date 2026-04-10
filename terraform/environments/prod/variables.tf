@@ -100,6 +100,12 @@ variable "primary_account_id" {
   default = ""
 }
 
+variable "enable_replication" {
+  description = "Enable ECR cross-account replication (receive images from primary account)"
+  type        = bool
+  default     = false
+}
+
 variable "github_org" {
   type    = string
   default = "layervai"

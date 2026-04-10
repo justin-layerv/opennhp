@@ -1,6 +1,7 @@
 # ECR Module
-# Creates ECR repositories in primary account (sandbox)
-# For prod account, references cross-account ECR
+# Creates ECR repositories in primary account (sandbox) and replicates to secondary accounts (prod).
+# With replication enabled, each account has its own copy of every image -- prod has no runtime
+# dependency on sandbox ECR.
 #
 # ==================== GitHub Actions CI/CD Permissions ====================
 #
@@ -84,6 +85,42 @@ variable "secondary_account_ids" {
   description = "List of AWS account IDs that can pull from ECR (for cross-account access)"
   type        = list(string)
   default     = []
+}
+
+variable "enable_replication" {
+  description = <<-EOT
+    Enable ECR cross-account replication from primary to secondary accounts.
+
+    When true (primary account only):
+    - Creates an ECR replication configuration that copies all images under
+      the 'layerv/' repository prefix to each secondary account.
+    - Images are replicated automatically on push (one-time copy per tag).
+    - Secondary accounts pull from their own local registry at runtime,
+      eliminating any runtime dependency on the primary account.
+
+    When true (secondary account only):
+    - Creates an ECR registry policy that allows the primary account's
+      replication service to write images into the local registry.
+  EOT
+  type        = bool
+  default     = false
+
+  # Catch the obvious misconfiguration "I'm the primary AND I'm pretending to
+  # have a primary upstream" early. The replication code paths are
+  # mutually exclusive between primary and secondary, and silently letting
+  # both flags be set produces confusing apply-time errors much later.
+  validation {
+    condition     = !(var.enable_replication && var.is_primary_account && var.primary_account_id != "")
+    error_message = "When enable_replication=true on the primary account, primary_account_id must be empty (a primary account does not have a primary upstream)."
+  }
+  validation {
+    condition     = !(var.enable_replication && !var.is_primary_account && var.primary_account_id == "")
+    error_message = "When enable_replication=true on a secondary account, primary_account_id is required (the registry policy must trust a specific primary account)."
+  }
+  validation {
+    condition     = !(var.enable_replication && !var.is_primary_account && length(var.secondary_account_ids) > 0)
+    error_message = "secondary_account_ids must be empty on a secondary account; it is only meaningful in the primary account that drives replication outbound."
+  }
 }
 
 variable "traefik_plugins_github_repo" {
@@ -193,7 +230,7 @@ locals {
       },
       {
         rulePriority = 2
-        description  = "Keep tagged images for 90 days (prod pulls from sandbox)"
+        description  = "Keep tagged images for 90 days (rollback window)"
         selection = {
           tagStatus      = "tagged"
           tagPatternList = ["*"]
@@ -226,6 +263,14 @@ locals {
       ]
     }]
   }) : null
+
+  # Account ID to use in ECR URLs and IAM resource ARNs for SECONDARY accounts:
+  # - With replication enabled: use the local account (images live here, replicated
+  #   from the primary account by aws_ecr_replication_configuration).
+  # - Without replication: fall back to the primary account (cross-account pull).
+  # Defined here (rather than in a second locals block) so all account/region
+  # derived values stay in one place.
+  secondary_ecr_account_id = var.enable_replication ? local.account_id : var.primary_account_id
 }
 
 # ============================================================================
@@ -260,13 +305,135 @@ resource "aws_ecr_lifecycle_policy" "main" {
   policy     = local.ecr_lifecycle_policy
 }
 
-# Cross-account pull policy (allows specific accounts to pull)
-# Only created when secondary_account_ids is provided
+# Cross-account pull policy (allows specific accounts to pull).
+#
+# Kept active even when var.enable_replication is true so that:
+#   - secondary accounts can still pull from the primary registry as a
+#     fall-back during the rollout window before replication has copied
+#     every image they need;
+#   - operators can manually pull a specific image from the source registry
+#     for diagnostics without needing to wait for replication.
+# Once every secondary account has been on its local replicated registry
+# for at least one full rollback window (90 days, see local.ecr_lifecycle_policy)
+# this resource can be removed in a follow-up PR -- track in the same
+# follow-up that adds destination-side lifecycle policies (issue #901).
 resource "aws_ecr_repository_policy" "cross_account" {
   for_each = var.is_primary_account && length(var.secondary_account_ids) > 0 ? toset(local.ecr_repos) : []
 
   repository = aws_ecr_repository.main[each.key].name
   policy     = local.ecr_cross_account_policy
+}
+
+# ============================================================================
+# ECR CROSS-ACCOUNT REPLICATION
+# ============================================================================
+#
+# Replicates images from the primary account (sandbox) to secondary accounts
+# (prod) so each account has its own copy. This eliminates sandbox as a
+# production runtime dependency.
+#
+# Two resources work together:
+#
+# 1. Replication Configuration (PRIMARY account):
+#    - aws_ecr_replication_configuration pushes images to secondary registries
+#    - Uses a repository_filter to scope replication to "layerv/" prefix
+#    - One rule per secondary account (same region)
+#
+# 2. Registry Policy (SECONDARY account):
+#    - aws_ecr_registry_policy grants the primary account's ECR replication
+#      service permission to create repositories and push images
+#    - Without this, replication attempts from the primary account are denied
+#
+# Singleton resources -- IMPORTANT
+# --------------------------------
+# Both aws_ecr_replication_configuration and aws_ecr_registry_policy are
+# *registry-wide singletons* per (account, region). Terraform will overwrite
+# any existing replication configuration or registry policy in the target
+# account/region. Before enabling this in a new account, run
+# `aws ecr describe-registry` and `aws ecr get-registry-policy` to confirm
+# nothing else owns these resources, otherwise you will silently clobber
+# unrelated rules.
+#
+# Lifecycle policies are NOT replicated -- IMPORTANT
+# --------------------------------------------------
+# Replicated repositories are created automatically in the destination account
+# but DO NOT inherit any lifecycle policies from the source. Without an
+# explicit destination-side lifecycle policy, replicated images will accumulate
+# indefinitely. Tracked as follow-up in issue #901; that PR will add a
+# destination-side lifecycle policy resource so secondary accounts retain only
+# the same 90-day rollback window the source uses.
+#
+# Rollout order
+# -------------
+# Because replication writes from PRIMARY -> SECONDARY, the destination must
+# trust the source BEFORE the source starts pushing. Apply in this order:
+#
+#   1. terraform apply on the SECONDARY account with `enable_replication=true`
+#      (creates the registry policy that allows the primary account in).
+#   2. terraform apply on the PRIMARY account with `enable_replication=true`
+#      (creates the replication configuration that starts copying images).
+#   3. Push or re-tag a known image in the primary account and confirm it
+#      shows up in the secondary account's ECR within ~5 minutes.
+#   4. Only then is it safe to flip secondary-account services to pull from
+#      the local registry (via `enable_replication=true` propagating into the
+#      IAM role policy resource ARNs below).
+#
+# Reverting is the inverse: turn off replication on the primary first so
+# nothing is in flight, then on the secondary.
+# ============================================================================
+
+# Primary account: replicate images to each secondary account
+resource "aws_ecr_replication_configuration" "cross_account" {
+  count = var.is_primary_account && var.enable_replication && length(var.secondary_account_ids) > 0 ? 1 : 0
+
+  replication_configuration {
+    rule {
+      dynamic "destination" {
+        for_each = var.secondary_account_ids
+        content {
+          region      = local.region
+          registry_id = destination.value
+        }
+      }
+
+      repository_filter {
+        filter      = "layerv/"
+        filter_type = "PREFIX_MATCH"
+      }
+    }
+  }
+}
+
+# Secondary account: allow primary account's ECR replication service to push images.
+# The aws:SourceAccount condition is defense-in-depth in case the AWS principal
+# evaluation drifts -- it ensures only requests originating in the primary
+# account can use the policy even though we already pinned the principal to
+# that account's root.
+resource "aws_ecr_registry_policy" "replication" {
+  count = !var.is_primary_account && var.enable_replication && var.primary_account_id != "" ? 1 : 0
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowReplicationFromPrimary"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${var.primary_account_id}:root"
+        }
+        Action = [
+          "ecr:CreateRepository",
+          "ecr:ReplicateImage"
+        ]
+        Resource = "arn:aws:ecr:${local.region}:${local.account_id}:repository/layerv/*"
+        Condition = {
+          StringEquals = {
+            "aws:SourceAccount" = var.primary_account_id
+          }
+        }
+      }
+    ]
+  })
 }
 
 # ============================================================================
@@ -415,7 +582,7 @@ resource "aws_iam_role_policy" "ecr_push" {
       }
     ]
     }) : jsonencode({
-    # Secondary account - cross-account ECR pull only
+    # Secondary account - ECR pull (local registry when replicated, cross-account otherwise)
     Version = "2012-10-17"
     Statement = [
       {
@@ -434,7 +601,7 @@ resource "aws_iam_role_policy" "ecr_push" {
           "ecr:DescribeRepositories",
           "ecr:DescribeImages"
         ]
-        Resource = [for repo in local.ecr_repos : "arn:aws:ecr:${local.region}:${var.primary_account_id}:repository/layerv/${repo}"]
+        Resource = [for repo in local.ecr_repos : "arn:aws:ecr:${local.region}:${local.secondary_ecr_account_id}:repository/layerv/${repo}"]
       }
     ]
   })
@@ -1747,25 +1914,33 @@ resource "aws_iam_role_policy_attachment" "qurl_link_static" {
 # ============================================================================
 # OUTPUTS - Unified interface regardless of primary/secondary account
 # ============================================================================
+#
+# When replication is enabled, secondary accounts pull from their own local
+# registry (images are replicated from primary). When replication is disabled,
+# secondary accounts pull cross-account from the primary registry (legacy).
+#
+# The local.secondary_ecr_account_id helper used below is defined alongside
+# the rest of the module locals near the top of this file.
+# ============================================================================
 
 output "server_repo_url" {
   description = "NHP Server ECR repository URL"
-  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-server"].repository_url : "${var.primary_account_id}.dkr.ecr.${local.region}.amazonaws.com/layerv/nhp-server"
+  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-server"].repository_url : "${local.secondary_ecr_account_id}.dkr.ecr.${local.region}.amazonaws.com/layerv/nhp-server"
 }
 
 output "server_repo_arn" {
   description = "NHP Server ECR repository ARN"
-  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-server"].arn : "arn:aws:ecr:${local.region}:${var.primary_account_id}:repository/layerv/nhp-server"
+  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-server"].arn : "arn:aws:ecr:${local.region}:${local.secondary_ecr_account_id}:repository/layerv/nhp-server"
 }
 
 output "ac_repo_url" {
   description = "NHP AC ECR repository URL"
-  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-ac"].repository_url : "${var.primary_account_id}.dkr.ecr.${local.region}.amazonaws.com/layerv/nhp-ac"
+  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-ac"].repository_url : "${local.secondary_ecr_account_id}.dkr.ecr.${local.region}.amazonaws.com/layerv/nhp-ac"
 }
 
 output "ac_repo_arn" {
   description = "NHP AC ECR repository ARN"
-  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-ac"].arn : "arn:aws:ecr:${local.region}:${var.primary_account_id}:repository/layerv/nhp-ac"
+  value       = var.is_primary_account ? aws_ecr_repository.main["nhp-ac"].arn : "arn:aws:ecr:${local.region}:${local.secondary_ecr_account_id}:repository/layerv/nhp-ac"
 }
 
 output "github_actions_role_arn" {
@@ -1785,10 +1960,10 @@ output "github_oidc_provider_arn" {
 
 output "qurl_repo_url" {
   description = "QURL Service ECR repository URL"
-  value       = var.deploy_qurl_ecr && var.is_primary_account ? aws_ecr_repository.main["nhp-qurl"].repository_url : var.deploy_qurl_ecr ? "${var.primary_account_id}.dkr.ecr.${local.region}.amazonaws.com/layerv/nhp-qurl" : null
+  value       = var.deploy_qurl_ecr && var.is_primary_account ? aws_ecr_repository.main["nhp-qurl"].repository_url : var.deploy_qurl_ecr ? "${local.secondary_ecr_account_id}.dkr.ecr.${local.region}.amazonaws.com/layerv/nhp-qurl" : null
 }
 
 output "qurl_repo_arn" {
   description = "QURL Service ECR repository ARN"
-  value       = var.deploy_qurl_ecr && var.is_primary_account ? aws_ecr_repository.main["nhp-qurl"].arn : var.deploy_qurl_ecr ? "arn:aws:ecr:${local.region}:${var.primary_account_id}:repository/layerv/nhp-qurl" : null
+  value       = var.deploy_qurl_ecr && var.is_primary_account ? aws_ecr_repository.main["nhp-qurl"].arn : var.deploy_qurl_ecr ? "arn:aws:ecr:${local.region}:${local.secondary_ecr_account_id}:repository/layerv/nhp-qurl" : null
 }

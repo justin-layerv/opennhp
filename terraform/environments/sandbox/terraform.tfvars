@@ -15,6 +15,7 @@ vpc_cidr       = "10.100.0.0/16"
 # Multi-account config: sandbox owns ECR repositories
 is_primary_account    = true
 secondary_account_ids = ["235500187906"] # Prod account - enables cross-account ECR pull
+enable_replication    = true             # Replicate images to prod so prod has no runtime dependency on sandbox
 
 # AC configuration (Traefik with Let's Encrypt for TLS)
 deploy_ac          = true

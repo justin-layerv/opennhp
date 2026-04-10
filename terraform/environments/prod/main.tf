@@ -39,6 +39,7 @@ module "nhp" {
   tags                        = var.tags
   is_primary_account          = var.is_primary_account
   primary_account_id          = var.primary_account_id
+  enable_replication          = var.enable_replication
   github_org                  = var.github_org
   github_repo                 = var.github_repo
   deploy_ac                   = var.deploy_ac
