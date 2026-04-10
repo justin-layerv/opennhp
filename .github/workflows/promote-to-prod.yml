@@ -602,6 +602,80 @@ jobs:
           role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Verify images replicated from sandbox ECR to prod ECR.
+      # ECR cross-account replication is asynchronous and can fail silently
+      # (IAM drift, registry policy removal, AWS service issue). Without
+      # this gate, broken replication is only discovered when a deploy
+      # fails at image pull time.
+      - name: Verify images replicated to prod ECR
+        env:
+          IMAGE_TAG: ${{ needs.manifest.outputs.effective_image_tag }}
+          QURL_IMAGE_TAG: ${{ needs.manifest.outputs.qurl_image_tag }}
+          DEPLOY_SERVER: ${{ inputs.deploy_server }}
+          DEPLOY_AC: ${{ inputs.deploy_ac }}
+          DEPLOY_QURL: ${{ inputs.deploy_qurl }}
+        run: |
+          set -euo pipefail
+          echo "Verifying images in prod ECR (replicated from sandbox)..."
+          FAILED=0
+
+          if [[ "$DEPLOY_SERVER" == "true" ]]; then
+            echo "Checking prod $ECR_SERVER_REPO:$IMAGE_TAG..."
+            if aws ecr describe-images \
+              --repository-name "$ECR_SERVER_REPO" \
+              --image-ids imageTag="$IMAGE_TAG" \
+              --query "imageDetails[0].imagePushedAt" \
+              --output text > /dev/null 2>&1; then
+              echo "  Found in prod ECR: $ECR_SERVER_REPO:$IMAGE_TAG"
+            else
+              echo "::error::Image $ECR_SERVER_REPO:$IMAGE_TAG not found in prod ECR. ECR cross-account replication may have failed."
+              echo "::error::See runbook: docs/runbooks/ecr-replication-failure.md"
+              FAILED=1
+            fi
+          fi
+
+          if [[ "$DEPLOY_AC" == "true" ]]; then
+            echo "Checking prod $ECR_AC_REPO:$IMAGE_TAG..."
+            if aws ecr describe-images \
+              --repository-name "$ECR_AC_REPO" \
+              --image-ids imageTag="$IMAGE_TAG" \
+              --query "imageDetails[0].imagePushedAt" \
+              --output text > /dev/null 2>&1; then
+              echo "  Found in prod ECR: $ECR_AC_REPO:$IMAGE_TAG"
+            else
+              echo "::error::Image $ECR_AC_REPO:$IMAGE_TAG not found in prod ECR. ECR cross-account replication may have failed."
+              echo "::error::See runbook: docs/runbooks/ecr-replication-failure.md"
+              FAILED=1
+            fi
+          fi
+
+          if [[ "$DEPLOY_QURL" == "true" && -n "$QURL_IMAGE_TAG" ]]; then
+            echo "Checking prod $ECR_QURL_REPO:$QURL_IMAGE_TAG..."
+            if aws ecr describe-images \
+              --repository-name "$ECR_QURL_REPO" \
+              --image-ids imageTag="$QURL_IMAGE_TAG" \
+              --query "imageDetails[0].imagePushedAt" \
+              --output text > /dev/null 2>&1; then
+              echo "  Found in prod ECR: $ECR_QURL_REPO:$QURL_IMAGE_TAG"
+            else
+              echo "::error::Image $ECR_QURL_REPO:$QURL_IMAGE_TAG not found in prod ECR. ECR cross-account replication may have failed."
+              echo "::error::See runbook: docs/runbooks/ecr-replication-failure.md"
+              FAILED=1
+            fi
+          elif [[ "$DEPLOY_QURL" == "true" ]]; then
+            echo "::error::deploy_qurl=true but no QURL image tag available (provide qurl_image_tag or ensure sandbox SSM has a value)"
+            FAILED=1
+          fi
+
+          if [[ $FAILED -eq 1 ]]; then
+            echo ""
+            echo "::error::One or more images missing from prod ECR. This usually means ECR cross-account replication is broken."
+            echo "  Manual workaround: pull the image from sandbox ECR and push to prod ECR via docker CLI."
+            echo "  See: docs/runbooks/ecr-replication-failure.md"
+            exit 1
+          fi
+          echo "All required images verified in prod ECR."
+
       - name: Verify prod NHP Server AMI is published to SSM
         if: inputs.run_terraform || inputs.deploy_server
         env:
