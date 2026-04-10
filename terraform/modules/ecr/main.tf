@@ -588,6 +588,17 @@ resource "aws_iam_role_policy" "ecr_push" {
           "ecr:DescribeRegistry"
         ]
         Resource = "*"
+      },
+      {
+        Sid      = "ECRReplicationSLR"
+        Effect   = "Allow"
+        Action   = ["iam:CreateServiceLinkedRole"]
+        Resource = "arn:aws:iam::*:role/aws-service-role/replication.ecr.amazonaws.com/*"
+        Condition = {
+          StringEquals = {
+            "iam:AWSServiceName" = "replication.ecr.amazonaws.com"
+          }
+        }
       }
     ]
     }) : jsonencode({
