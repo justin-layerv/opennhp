@@ -937,7 +937,11 @@ jobs:
           TF_VAR_server_ami_id: "ami-0000000000000abcd"
         run: |
           set -o pipefail
-          terraform plan -no-color 2>&1 | tee plan.txt
+          # -lock=false: PR plans are informational (posted as PR comment, never
+          # applied). Skipping the lock eliminates S3 state-lock contention when
+          # multiple PRs plan concurrently. The real plan happens at apply time
+          # (deploy-sandbox-infra job) which keeps the lock. See issue #972.
+          terraform plan -no-color -lock=false 2>&1 | tee plan.txt
           {
             echo "## Terraform Plan"
             echo '```'
