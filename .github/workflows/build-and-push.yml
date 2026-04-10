@@ -1666,43 +1666,43 @@ jobs:
             if [[ "$SANDBOX_VALIDATE" == "success" ]]; then
               COLOR="#36a64f"
               EMOJI="white_check_mark"
-              HEADER="LayerV.ai Sandbox Deploy"
+              HEADER="NHP Server + AC Sandbox Deploy"
               STATUS_TEXT="successful"
             elif [[ "$DEPLOY_FAILED" == "true" ]]; then
               COLOR="#dc3545"
               EMOJI="x"
-              HEADER="LayerV.ai Sandbox Deploy"
+              HEADER="NHP Server + AC Sandbox Deploy"
               STATUS_TEXT="failed"
             elif [[ "$SANDBOX_DEPLOYED" == "false" ]]; then
               COLOR="#36a64f"
               EMOJI="white_check_mark"
-              HEADER="LayerV.ai Build"
+              HEADER="NHP Build"
               STATUS_TEXT="successful"
             elif [[ "$SANDBOX_INFRA" == "cancelled" ]]; then
               COLOR="#ffc107"
               EMOJI="warning"
-              HEADER="LayerV.ai Deploy"
+              HEADER="NHP Server + AC Deploy"
               STATUS_TEXT="cancelled"
             else
               COLOR="#dc3545"
               EMOJI="x"
-              HEADER="LayerV.ai Deploy"
+              HEADER="NHP Server + AC Deploy"
               STATUS_TEXT="incomplete"
             fi
           elif [[ "$BUILD_RESULT" == "failure" || "$TEST_RESULT" == "failure" ]]; then
             COLOR="#dc3545"
             EMOJI="x"
-            HEADER="LayerV.ai Build"
+            HEADER="NHP Build"
             STATUS_TEXT="failed"
           elif [[ "$BUILD_RESULT" == "cancelled" ]]; then
             COLOR="#ffc107"
             EMOJI="warning"
-            HEADER="LayerV.ai Build"
+            HEADER="NHP Build"
             STATUS_TEXT="cancelled"
           else
             COLOR="#ffc107"
             EMOJI="warning"
-            HEADER="LayerV.ai"
+            HEADER="NHP"
             STATUS_TEXT="incomplete"
           fi
 
@@ -1732,7 +1732,7 @@ jobs:
                 },
                 {
                   \"type\": \"mrkdwn\",
-                  \"text\": \"*Build:*\n$(status_emoji "$BUILD_RESULT")\"
+                  \"text\": \"*Build (Server + AC):*\n$(status_emoji "$BUILD_RESULT")\"
                 }
               ]
             }"
@@ -1745,6 +1745,19 @@ jobs:
               \"text\": {
                 \"type\": \"mrkdwn\",
                 \"text\": \"*Sandbox:* $SANDBOX_STATUS\"
+              }
+            }"
+          fi
+
+          # Add commit message (first line, truncated to 100 chars, backticks escaped)
+          COMMIT_FIRST_LINE=$(echo "$COMMIT_MESSAGE" | head -n1 | cut -c1-100 | sed 's/`/'"'"'/g')
+          if [[ -n "$COMMIT_FIRST_LINE" ]]; then
+            BLOCKS="$BLOCKS,
+            {
+              \"type\": \"section\",
+              \"text\": {
+                \"type\": \"mrkdwn\",
+                \"text\": \"*Commit:* \`$COMMIT_FIRST_LINE\`\"
               }
             }"
           fi
