@@ -579,6 +579,15 @@ resource "aws_iam_role_policy" "ecr_push" {
           "ecr:DescribeImages"
         ]
         Resource = [for repo in local.ecr_repos : aws_ecr_repository.main[repo].arn]
+      },
+      {
+        Sid    = "ECRReplication"
+        Effect = "Allow"
+        Action = [
+          "ecr:PutReplicationConfiguration",
+          "ecr:DescribeRegistry"
+        ]
+        Resource = "*"
       }
     ]
     }) : jsonencode({
@@ -602,6 +611,17 @@ resource "aws_iam_role_policy" "ecr_push" {
           "ecr:DescribeImages"
         ]
         Resource = [for repo in local.ecr_repos : "arn:aws:ecr:${local.region}:${local.secondary_ecr_account_id}:repository/layerv/${repo}"]
+      },
+      {
+        Sid    = "ECRRegistryPolicy"
+        Effect = "Allow"
+        Action = [
+          "ecr:PutRegistryPolicy",
+          "ecr:GetRegistryPolicy",
+          "ecr:DeleteRegistryPolicy",
+          "ecr:DescribeRegistry"
+        ]
+        Resource = "*"
       }
     ]
   })
