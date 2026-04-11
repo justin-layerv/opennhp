@@ -41,7 +41,7 @@ SSM_CANARY_STATE_PARAM = os.environ.get('SSM_CANARY_STATE_PARAM', '')
 SSM_CANARY_EXECUTION_ARN_PARAM = os.environ.get('SSM_CANARY_EXECUTION_ARN_PARAM', '')
 MAX_CPU_PERCENT = float(os.environ.get('MAX_CPU_PERCENT', '80'))
 CHECKPOINT_PERCENTAGES = json.loads(os.environ.get('CHECKPOINT_PERCENTAGES', '[20, 50, 100]'))
-INSTANCE_WARMUP = int(os.environ.get('INSTANCE_WARMUP', '180'))
+INSTANCE_WARMUP = int(os.environ.get('INSTANCE_WARMUP', '60'))
 CHECKPOINT_DELAY = int(os.environ.get('CHECKPOINT_DELAY', '300'))
 
 # Initialize clients

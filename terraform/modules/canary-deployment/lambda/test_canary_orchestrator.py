@@ -24,7 +24,7 @@ os.environ.update({
     'MAX_CPU_PERCENT': '90',
     'CHECKPOINT_PERCENTAGES': '[20, 50, 100]',
     'CHECKPOINT_DELAY': '300',
-    'INSTANCE_WARMUP': '180',
+    'INSTANCE_WARMUP': '60',
 })
 
 # Create separate mock clients for each boto3 service
@@ -186,7 +186,7 @@ class TestStartRefresh(CanaryTestCase):
         self.assertEqual(call_args['Strategy'], 'Rolling')
         self.assertEqual(call_args['Preferences']['CheckpointPercentages'], [20, 50, 100])
         self.assertEqual(call_args['Preferences']['CheckpointDelay'], 300)
-        self.assertEqual(call_args['Preferences']['InstanceWarmup'], 180)
+        self.assertEqual(call_args['Preferences']['InstanceWarmup'], 60)
         self.assertEqual(call_args['Preferences']['MinHealthyPercentage'], 90)
         self.assertEqual(
             call_args['DesiredConfiguration']['LaunchTemplate']['LaunchTemplateId'],

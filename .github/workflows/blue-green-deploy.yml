@@ -600,7 +600,7 @@ jobs:
           fi
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "$STANDBY_ASG" \
-            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 180, "SkipMatching": false}' \
+            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 60, "SkipMatching": false}' \
             --query "InstanceRefreshId" --output text)
           echo "Instance refresh started: $REFRESH_ID"
           DEADLINE=$(($(date +%s) + REFRESH_TIMEOUT_MINUTES * 60))
@@ -742,7 +742,7 @@ jobs:
           fi
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "$STANDBY_ASG" \
-            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 180, "SkipMatching": false}' \
+            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 60, "SkipMatching": false}' \
             --query "InstanceRefreshId" --output text)
           echo "Instance refresh started: $REFRESH_ID"
           DEADLINE=$(($(date +%s) + REFRESH_TIMEOUT_MINUTES * 60))
