@@ -867,15 +867,101 @@ jobs:
           chmod +x .github/scripts/blue-green-switch.sh
           .github/scripts/blue-green-switch.sh "$ENVIRONMENT" "$STANDBY_COLOR" ac
 
+      # After the server NLB switch, ACs are still connected to the OLD
+      # servers via existing UDP sessions. NLB doesn't break existing UDP
+      # flows when the target group changes. Restarting nhp-acd on the
+      # active AC instances drops the old sessions and forces reconnection
+      # through the NLB, which now routes to the NEW servers.
+      #
+      # Without this, the new servers report "no AC peers connected" until
+      # the old servers are terminated (which could be minutes later),
+      # causing a user-facing outage window for knock requests.
+      # Runs whenever servers were deployed, regardless of whether ACs were
+      # also deployed. Server-only deploys still switch the server NLB,
+      # leaving ACs connected to old servers via stale UDP sessions.
+      - name: "[AC] Restart nhp-acd to Reconnect to New Servers"
+        if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run != true
+        env:
+          # When ACs were also deployed, standby became active after the switch.
+          # When server-only, the current active AC ASG is unchanged.
+          DEPLOY_AC: ${{ needs.prepare.outputs.deploy_ac }}
+          AC_STANDBY_ASG: ${{ needs.prepare.outputs.ac_standby_asg }}
+          AC_ACTIVE_ASG: ${{ needs.prepare.outputs.ac_active_asg }}
+        run: |
+          set -euo pipefail
+
+          # Determine which AC ASG to restart: if ACs were deployed, the
+          # standby became active after the AC NLB switch. If server-only,
+          # the existing active AC ASG is unchanged.
+          if [[ "$DEPLOY_AC" == "true" ]]; then
+            TARGET_ASG="$AC_STANDBY_ASG"
+          else
+            TARGET_ASG="$AC_ACTIVE_ASG"
+          fi
+          echo "Restarting nhp-acd on AC ASG: $TARGET_ASG (deploy_ac=$DEPLOY_AC)"
+
+          mapfile -t AC_INSTANCES < <(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$TARGET_ASG" \
+            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService'].InstanceId" \
+            --output text | tr '\t' '\n' | grep -v '^$' | sort)
+
+          if [[ ${#AC_INSTANCES[@]} -eq 0 ]]; then
+            echo "::warning::No InService AC instances found in $TARGET_ASG — skipping restart"
+            exit 0
+          fi
+          echo "Restarting nhp-acd on ${#AC_INSTANCES[@]} AC instance(s): ${AC_INSTANCES[*]}"
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${AC_INSTANCES[@]}" \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 30 \
+            --max-errors "100%" \
+            --parameters 'commands=["systemctl restart nhp-acd && echo RESTART_OK"]' \
+            --query "Command.CommandId" --output text)
+          echo "SSM command sent: $CMD_ID"
+
+          # Wait for all instances to complete
+          sleep 5
+          FAILED=false
+          for inst in "${AC_INSTANCES[@]}"; do
+            STATUS="Pending"
+            for attempt in 1 2 3 4; do
+              STATUS=$(aws ssm get-command-invocation \
+                --command-id "$CMD_ID" --instance-id "$inst" \
+                --query "Status" --output text 2>/dev/null) || STATUS="Pending"
+              case "$STATUS" in
+                Success) echo "[ac-restart] $inst: restarted successfully"; break ;;
+                Failed|TimedOut|Cancelled) echo "::error::[ac-restart] $inst: $STATUS"; FAILED=true; break ;;
+                *) echo "[ac-restart] $inst: attempt $attempt, status=$STATUS, retrying..."; sleep 3 ;;
+              esac
+            done
+            # If loop exhausted without terminal status, treat as failure
+            if [[ "$STATUS" != "Success" && "$STATUS" != "Failed" && "$STATUS" != "TimedOut" && "$STATUS" != "Cancelled" ]]; then
+              echo "::error::[ac-restart] $inst: timed out polling (last status: $STATUS)"
+              FAILED=true
+            fi
+          done
+          if [[ "$FAILED" == "true" ]]; then
+            echo "::error::Some AC instances failed to restart nhp-acd"
+            exit 1
+          fi
+          echo "All AC instances restarted — ACs will reconnect to new servers via NLB"
+          # AC peer registration typically completes in 5-10s (observed in
+          # sandbox). 15s provides a buffer so the knock-ready check in
+          # validate passes on the first iteration rather than polling.
+          echo "Waiting 15s for AC peer registration..."
+          sleep 15
+
   # =============================================================================
   # SCALE DOWN PREVIOUS - Reduce previous active to warm standby
   # =============================================================================
   scale-down-previous:
     name: Scale Down Previous
     needs: [prepare, switch-traffic, validate]
-    # Wait for validate (post-switch knock-ready) before scaling down the
-    # previous active ASG. Without this, blue servers get terminated while
-    # ACs are still migrating from blue to green, causing brief knock failures.
+    # Wait for validate (knock-ready confirmed) before scaling down. The
+    # AC restart in switch-traffic makes this pass quickly (~seconds), but
+    # keeping validate as a gate ensures we never scale down old servers
+    # before confirming ACs are connected to the new ones.
     if: always() && needs.switch-traffic.result == 'success' && (needs.validate.result == 'success' || needs.validate.result == 'skipped') && inputs.action == 'deploy' && inputs.dry_run != true
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
@@ -1019,17 +1105,15 @@ jobs:
             exit 1
           fi
 
-      # After the traffic switch, the old standby servers are now active.
-      # Verify every newly-active server instance has AC peers connected
-      # before the workflow completes. Without this gate, downstream
-      # consumers (smoke tests, build-and-push validation) can start
-      # before all instances are knock-ready, causing transient failures.
-      # Condition: deploy_ac (not deploy_server) is intentional. Knock-ready
-      # checks whether AC peers are connected. If only servers were deployed
-      # (no AC change), existing ACs are already registered — no re-registration
-      # window to wait for. We only need this gate when ACs were deployed.
+      # After the traffic switch, the AC restart step forces ACs to
+      # reconnect to the new servers. Verify every newly-active server
+      # instance has AC peers connected before downstream consumers
+      # (smoke tests, build-and-push validation) start.
+      # Condition: deploy_server — the AC restart runs whenever servers
+      # are deployed (it handles both server-only and server+AC deploys),
+      # so the knock-ready check must also run in both cases.
       - name: "[Server] Verify Post-Switch Knock Readiness"
-        if: needs.prepare.outputs.deploy_ac == 'true' && inputs.dry_run != true
+        if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run != true
         env:
           NEW_ACTIVE_ASG: ${{ needs.prepare.outputs.server_standby_asg }}
           HEALTH_CHECK_TIMEOUT_MINUTES: ${{ inputs.health_check_timeout_minutes }}
