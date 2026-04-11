@@ -77,11 +77,17 @@ func Close() error {
 // AuthWithHttp handles HTTP-based QURL token resolution and NHP knock
 //
 // Flow:
-// 1. User visits qurl.link/#<access_token>
-// 2. qurl.link SPA extracts fragment and redirects to /plugins/qurl?token=<access_token>
-// 3. This handler validates the token via QURL API
-// 4. On success, triggers NHP knock via helper callback
-// 5. Sets NHP cookies and redirects to qurl.site resource
+//  1. User visits qurl.link/#<access_token>
+//  2. qurl.link SPA extracts fragment and submits a form POST to /plugins/qurl
+//     with token=<access_token> in the request body (not the URL)
+//  3. This handler validates the token via QURL API
+//  4. On success, triggers NHP knock via helper callback
+//  5. Sets NHP cookies and redirects to qurl.site resource
+//
+// The POST body path is preferred because it keeps the access token out of
+// URL query strings, which appear in CloudFront access logs, NHP access logs,
+// and any intermediary that captures request URIs. The GET query parameter
+// path is retained for backward compatibility but logs a deprecation warning.
 //
 // Security note: Rate limiting should be handled at infrastructure level (NLB, WAF)
 // to protect against brute-force token guessing attacks.
@@ -98,10 +104,22 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	ctx.SetSameSite(http.SameSiteNoneMode)
 	nhpplugins.CorsMiddleware(ctx)
 
-	// Extract and validate access token from query parameter.
-	// Invalid tokens get the same branded error page as expired/consumed tokens —
-	// no information is leaked about token format or server state.
-	accessToken := ctx.Query("token")
+	// Extract access token: prefer POST form body, fall back to query parameter.
+	// POST body keeps the token out of access logs (CloudFront, NHP, intermediaries).
+	// Query parameter is deprecated regardless of HTTP method — the token appears
+	// in the URL either way, and URLs are logged by every intermediary.
+	// Note: PostForm requires Content-Type: application/x-www-form-urlencoded.
+	// The qurl.link SPA uses a hidden <form> submit which sets this automatically.
+	var accessToken string
+	if ctx.Request.Method == http.MethodPost {
+		accessToken = ctx.PostForm("token")
+	}
+	if accessToken == "" {
+		accessToken = ctx.Query("token")
+		if accessToken != "" {
+			log.Warning("[QURL] [req_id=%s] [client=%s] DEPRECATED: token passed as query param — migrate to POST body", requestID, ctx.ClientIP())
+		}
+	}
 	if err := ValidateAccessToken(accessToken); err != nil {
 		log.Error("[QURL] [req_id=%s] Invalid access token from %s: %v", requestID, ctx.ClientIP(), err)
 		ctx.Data(http.StatusForbidden, "text/html; charset=utf-8", []byte(accessDeniedHTML))

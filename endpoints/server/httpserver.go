@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 
@@ -382,11 +383,12 @@ func (hs *HttpServer) initRouter() {
 	LoadFilesRecursively(g, templatePath)
 
 	pluginGrp := g.Group("plugins")
-	// display login page with templates
-	pluginGrp.GET("/:aspid", func(ctx *gin.Context) {
+	// Plugin handler supports both GET (legacy, deprecated) and POST (preferred).
+	// POST keeps the access token out of URL query strings and server access logs.
+	pluginHandler := func(ctx *gin.Context) {
 		var err error
 		aspId := ctx.Param("aspid")
-		log.Info("get plugins request. aspId: %s, query: %v", aspId, ctx.Request.URL.RawQuery)
+		log.Info("plugins request. aspId: %s, method: %s, query: %v", aspId, ctx.Request.Method, redactSensitiveQuery(ctx.Request.URL.RawQuery))
 
 		if len(aspId) == 0 {
 			err = common.ErrUrlPathInvalid
@@ -403,7 +405,9 @@ func (hs *HttpServer) initRouter() {
 		}
 
 		hs.authWithAspPlugin(ctx, req)
-	})
+	}
+	pluginGrp.GET("/:aspid", pluginHandler)
+	pluginGrp.POST("/:aspid", pluginHandler)
 
 	// legacy api
 	pluginGrp.GET("/:aspid/:resid/valid", func(ctx *gin.Context) {
@@ -600,6 +604,23 @@ func matchOrigin(origin string, exact map[string]bool, wildcards []wildcardPatte
 		}
 	}
 	return false
+}
+
+// redactSensitiveQuery replaces the value of the "token" query parameter with
+// "[REDACTED]" to prevent access tokens from leaking into server logs during
+// the GET→POST migration period.
+func redactSensitiveQuery(rawQuery string) string {
+	if rawQuery == "" || !strings.Contains(rawQuery, "token=") {
+		return rawQuery
+	}
+	v, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return rawQuery
+	}
+	if v.Get("token") != "" {
+		v.Set("token", "[REDACTED]")
+	}
+	return v.Encode()
 }
 
 // ginLogFormatter formats Gin access log lines with request ID and error context.

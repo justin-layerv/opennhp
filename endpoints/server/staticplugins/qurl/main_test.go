@@ -296,7 +296,7 @@ func TestBuildResourceData(t *testing.T) {
 	}
 }
 
-func TestAuthWithHttp_FullFlow(t *testing.T) {
+func TestAuthWithHttp_FullFlow_POST(t *testing.T) {
 	// Create mock QURL API server
 	qurlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("X-Request-ID"); got != "req-fullflow-123" {
@@ -354,7 +354,9 @@ func TestAuthWithHttp_FullFlow(t *testing.T) {
 	// Create gin test context
 	w := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(w)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/plugins/qurl?token=valid_test_token_123", nil)
+	form := "token=valid_test_token_123"
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/plugins/qurl", strings.NewReader(form))
+	ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	ctx.Set(nhpserver.RequestIDKey, "req-fullflow-123") // simulate requestIDMiddleware
 
 	// Create mock helper with callback
@@ -429,6 +431,136 @@ func TestAuthWithHttp_FullFlow(t *testing.T) {
 	}
 }
 
+// TestAuthWithHttp_FullFlow_GET_BackwardCompat verifies the deprecated GET
+// query parameter path still works (backward compatibility).
+func TestAuthWithHttp_FullFlow_GET_BackwardCompat(t *testing.T) {
+	// Create mock QURL API server
+	qurlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := internalResolveResponse{
+			Success: true,
+			Data: &ResolveResponse{
+				ResourceID:  "r_test123",
+				TargetURL:   "https://backend.example.com",
+				QurlSiteURL: "https://r_test123.qurl.site",
+				Resources: map[string]*common.ResourceInfo{
+					"default": {
+						ACId:     "ac-001",
+						Hostname: "backend.example.com",
+						Addr:     &common.NetAddress{Ip: "10.0.0.1", Port: 443},
+					},
+				},
+				JWTSecret:    "test-jwt-secret-key-for-signing",
+				TokenExpire:  3600,
+				OpenTime:     300,
+				CookieDomain: ".qurl.site",
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer qurlServer.Close()
+
+	oldResolver := resolver
+	resolver = &QurlResolver{
+		httpClient:            &http.Client{Timeout: 5 * time.Second},
+		baseURL:               qurlServer.URL,
+		serviceToken:          "test-service-token",
+		allowedRedirectDomain: "qurl.site",
+	}
+	defer func() { resolver = oldResolver }()
+
+	// Create gin test context with GET query param (deprecated path)
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/plugins/qurl?token=valid_test_token_123", nil)
+
+	helper := successKnockHelper()
+	_, err := AuthWithHttp(ctx, &common.HttpKnockRequest{}, helper)
+	if err != nil {
+		t.Fatalf("AuthWithHttp GET backward compat returned unexpected error: %v", err)
+	}
+	if w.Code != http.StatusFound {
+		t.Errorf("expected status %d, got %d", http.StatusFound, w.Code)
+	}
+}
+
+// TestAuthWithHttp_POST_EmptyBody_FallsBackToQuery verifies that a POST with
+// an empty body falls back to the query parameter. This path still works but
+// logs a deprecation warning — the token is in the URL regardless of method.
+func TestAuthWithHttp_POST_EmptyBody_FallsBackToQuery(t *testing.T) {
+	qurlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := internalResolveResponse{
+			Success: true,
+			Data: &ResolveResponse{
+				ResourceID:  "r_test123",
+				TargetURL:   "https://backend.example.com",
+				QurlSiteURL: "https://r_test123.qurl.site",
+				Resources: map[string]*common.ResourceInfo{
+					"default": {
+						ACId:     "ac-001",
+						Hostname: "backend.example.com",
+						Addr:     &common.NetAddress{Ip: "10.0.0.1", Port: 443},
+					},
+				},
+				JWTSecret:    "test-jwt-secret-key-for-signing",
+				TokenExpire:  3600,
+				OpenTime:     300,
+				CookieDomain: ".qurl.site",
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer qurlServer.Close()
+
+	oldResolver := resolver
+	resolver = &QurlResolver{
+		httpClient:            &http.Client{Timeout: 5 * time.Second},
+		baseURL:               qurlServer.URL,
+		serviceToken:          "test-service-token",
+		allowedRedirectDomain: "qurl.site",
+	}
+	defer func() { resolver = oldResolver }()
+
+	// POST with empty body but token in query param
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/plugins/qurl?token=valid_test_token_123", nil)
+
+	helper := successKnockHelper()
+	_, err := AuthWithHttp(ctx, &common.HttpKnockRequest{}, helper)
+	if err != nil {
+		t.Fatalf("POST with query param fallback returned error: %v", err)
+	}
+	if w.Code != http.StatusFound {
+		t.Errorf("expected status %d, got %d", http.StatusFound, w.Code)
+	}
+}
+
+// TestAuthWithHttp_POST_InvalidToken verifies POST with invalid token returns 403.
+func TestAuthWithHttp_POST_InvalidToken(t *testing.T) {
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+	form := "token=invalid"
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/plugins/qurl", strings.NewReader(form))
+	ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	helper := &plugins.HttpServerPluginHelper{
+		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			t.Error("callback should not be called for invalid token")
+			return nil, nil
+		},
+	}
+
+	_, err := AuthWithHttp(ctx, &common.HttpKnockRequest{}, helper)
+	if err == nil {
+		t.Error("expected error for invalid POST token")
+	}
+	if w.Code != http.StatusForbidden {
+		t.Errorf("invalid POST token status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+}
+
 // customDomainTestSetup holds shared state for custom domain test cases.
 type customDomainTestSetup struct {
 	recorder *httptest.ResponseRecorder
@@ -455,7 +587,9 @@ func setupCustomDomainTest(t *testing.T, resp *ResolveResponse) *customDomainTes
 
 	w := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(w)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/plugins/qurl?token=valid_test_token_123", nil)
+	form := "token=valid_test_token_123"
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/plugins/qurl", strings.NewReader(form))
+	ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	t.Cleanup(func() {
 		qurlServer.Close()
@@ -645,7 +779,9 @@ func TestAuthWithHttp_GeneratesRequestIDWhenMissing(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(w)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/plugins/qurl?token=valid_generated_token_123", nil)
+	form := "token=valid_generated_token_123"
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/plugins/qurl", strings.NewReader(form))
+	ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	helper := &plugins.HttpServerPluginHelper{
 		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
@@ -676,7 +812,9 @@ func TestAuthWithHttp_GeneratesRequestIDWhenMissing(t *testing.T) {
 func TestAuthWithHttp_InvalidToken(t *testing.T) {
 	w := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(w)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/plugins/qurl?token=", nil)
+	form := "token="
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/plugins/qurl", strings.NewReader(form))
+	ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	helper := &plugins.HttpServerPluginHelper{
 		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
@@ -747,7 +885,9 @@ func TestAuthWithHttp_ResolverError(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(w)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/plugins/qurl?token=unknown_token_123", nil)
+	form := "token=unknown_token_123"
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/plugins/qurl", strings.NewReader(form))
+	ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	helper := &plugins.HttpServerPluginHelper{
 		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
@@ -813,7 +953,9 @@ func TestAuthWithHttp_KnockRetrySuccess(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(w)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/plugins/qurl?token=valid_test_token_123", nil)
+	form := "token=valid_test_token_123"
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/plugins/qurl", strings.NewReader(form))
+	ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	// First knock fails, second succeeds
 	var attempts int
@@ -884,7 +1026,9 @@ func TestAuthWithHttp_KnockRetryExhausted(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(w)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/plugins/qurl?token=valid_test_token_123", nil)
+	form := "token=valid_test_token_123"
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/plugins/qurl", strings.NewReader(form))
+	ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	// Both knock attempts fail
 	var attempts int

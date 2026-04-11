@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -64,6 +65,19 @@ func doGet(t *testing.T, baseURL, path string, headers map[string]string) (*http
 func doGetNoRedirect(t *testing.T, baseURL, path string, headers map[string]string) (*http.Response, []byte) {
 	t.Helper()
 	return doRequest(t, testConfig.NoRedirectClient, http.MethodGet, baseURL+path, nil, headers)
+}
+
+// doPostFormNoRedirect sends a POST with application/x-www-form-urlencoded
+// body using the no-redirect client, so 3xx responses are surfaced to the
+// caller instead of being followed. Used for resolve flows where the token
+// must be in the request body (not URL query params) to avoid log exposure.
+func doPostFormNoRedirect(t *testing.T, baseURL, path string, formData string, headers map[string]string) (*http.Response, []byte) {
+	t.Helper()
+	if headers == nil {
+		headers = make(map[string]string)
+	}
+	headers["Content-Type"] = "application/x-www-form-urlencoded"
+	return doRequest(t, testConfig.NoRedirectClient, http.MethodPost, baseURL+path, strings.NewReader(formData), headers)
 }
 
 // doRequest performs an HTTP request with the given client and returns

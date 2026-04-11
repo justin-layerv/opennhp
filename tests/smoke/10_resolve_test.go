@@ -3,12 +3,14 @@
 package smoke
 
 // Tier 2: QURL resolve flow — the customer-critical path from
-// /plugins/qurl?token=... to a 302 redirect to the proxied resource.
+// POST /plugins/qurl (token in form body) to a 302 redirect to
+// the proxied resource.
 //
 // Capability: the NHP server's static qurl plugin, registered at
 // /plugins/qurl, which:
 //
-//  1. Extracts the access token from the query parameter
+//  1. Extracts the access token from the POST form body (preferred)
+//     or GET query parameter (deprecated, backward compat)
 //  2. Calls qurl-service's POST /internal/v1/resolve to look up the
 //     resource metadata
 //  3. Emits a knock to the AC (opening the client IP in ipset)
@@ -89,9 +91,10 @@ const resolveRetryBudget = 45 * time.Second
 // enough to tolerate a slow NLB target registration (~2-3s typical).
 const resolvePerAttemptTimeout = 5 * time.Second
 
-// resolveWithRetries performs the happy-path resolve GET against
-// /plugins/qurl?token=... and returns the response on success or
-// fails the test on retry-exhausted failure.
+// resolveWithRetries performs the happy-path resolve POST against
+// /plugins/qurl with the token in the form body (not URL query string)
+// and returns the response on success or fails the test on
+// retry-exhausted failure.
 //
 // Retry policy: retry on transport errors (timeouts during
 // blue/green flips) and 5xx responses. Fail immediately on 4xx
@@ -119,12 +122,14 @@ func resolveWithRetries(ctx context.Context, t *testing.T, mintFunc func() *QURL
 		minted := mintFunc()
 
 		reqCtx, cancel := context.WithTimeout(ctx, resolvePerAttemptTimeout)
-		reqURL := testConfig.NHPServerBaseURL + "/plugins/qurl?token=" + minted.AccessToken()
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, reqURL, nil)
+		reqURL := testConfig.NHPServerBaseURL + "/plugins/qurl"
+		formData := "token=" + url.QueryEscape(minted.AccessToken())
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, reqURL, strings.NewReader(formData))
 		if err != nil {
 			cancel()
 			t.Fatalf("resolveWithRetries: build request: %v", err)
 		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		resp, err := testConfig.NoRedirectClient.Do(req)
 
 		if err != nil {
@@ -282,7 +287,7 @@ func TestResolve_CookiesHaveExpectedDomain(t *testing.T) {
 //
 // If this test passes, the full flow works end-to-end:
 //
-//	(runner) → /plugins/qurl?token=... → 302
+//	(runner) → POST /plugins/qurl (token in body) → 302
 //	        → r_{id}.qurl.site.* (AC proxies) → target → 200 body
 //
 // A failure in this test with 02_docker_image_test and the health
@@ -318,11 +323,13 @@ func TestResolve_FollowsRedirectAndReachesProtectedResource(t *testing.T) {
 		attempt++
 		minted := mintSmokeQURL(ctx, t, "https://example.com")
 
-		reqURL := testConfig.NHPServerBaseURL + "/plugins/qurl?token=" + minted.AccessToken()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		reqURL := testConfig.NHPServerBaseURL + "/plugins/qurl"
+		formData := "token=" + url.QueryEscape(minted.AccessToken())
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, strings.NewReader(formData))
 		if err != nil {
 			t.Fatalf("build request: %v", err)
 		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -360,22 +367,30 @@ func TestResolve_FollowsRedirectAndReachesProtectedResource(t *testing.T) {
 	}
 }
 
-// TestResolve_UnknownTokenReturns403 fences the access-denied
-// path for a syntactically well-formed but nonexistent access
-// token. Real access tokens are at_ + 22 chars of base62 (25
-// chars total, verified 2026-04-09 against sandbox: e.g.
-// at_5an_tpqwyh5kwaz539mykg). The bogus token below matches that
+// TestResolve_UnknownTokenReturns403_POST fences the access-denied
+// path via POST (preferred path) for a syntactically well-formed but
+// nonexistent access token. Real access tokens are at_ + 22 chars of
+// base62 (25 chars total). The bogus token below matches that
 // length/shape so if the server has a length-precheck it still
 // reaches the store-lookup path, where the lookup fails and the
 // handler returns the branded 403.
-//
-// A companion test (TestResolve_MalformedTokenReturns403) uses a
-// completely invalid shape to fence the handler's early-reject
-// path. Both currently return the same 403, but via different
-// server code paths — the redundancy is intentional.
-func TestResolve_UnknownTokenReturns403(t *testing.T) {
-	// 25-char token shape: at_ + 22-char body. The body contains
-	// "nonexistent" as a hint for anyone reading sandbox logs.
+func TestResolve_UnknownTokenReturns403_POST(t *testing.T) {
+	bogus := "at_nonexistentyyyyyyyyyyy" // at_ + 22 chars
+
+	resp, body := doPostFormNoRedirect(t, testConfig.NHPServerBaseURL,
+		"/plugins/qurl", "token="+bogus, nil)
+	assertStatusCode(t, resp, http.StatusForbidden)
+
+	marker := accessLinkInvalidMarker
+	if !strings.Contains(string(body), marker) {
+		t.Fatalf("403 body does not contain %q (body: %s)", marker, truncate(body, 400))
+	}
+}
+
+// TestResolve_UnknownTokenReturns403_GET_BackwardCompat verifies the
+// deprecated GET query parameter path still returns a proper 403 for
+// unknown tokens (backward compatibility).
+func TestResolve_UnknownTokenReturns403_GET_BackwardCompat(t *testing.T) {
 	bogus := "at_nonexistentyyyyyyyyyyy" // at_ + 22 chars
 
 	resp, body := doGetNoRedirect(t, testConfig.NHPServerBaseURL,
@@ -394,7 +409,7 @@ func TestResolve_UnknownTokenReturns403(t *testing.T) {
 func TestResolve_MalformedTokenReturns403(t *testing.T) {
 	garbage := "definitely-not-a-token"
 
-	resp, _ := doGetNoRedirect(t, testConfig.NHPServerBaseURL,
-		"/plugins/qurl?token="+garbage, nil)
+	resp, _ := doPostFormNoRedirect(t, testConfig.NHPServerBaseURL,
+		"/plugins/qurl", "token="+garbage, nil)
 	assertStatusCode(t, resp, http.StatusForbidden)
 }

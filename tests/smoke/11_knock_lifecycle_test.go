@@ -169,8 +169,8 @@ func attemptMintAndResolve(ctx context.Context, t *testing.T) error {
 		DeleteQURL(context.Background(), t, minted.Data.ResourceID)
 	})
 
-	resolveResp, _ := doGetNoRedirect(t, testConfig.NHPServerBaseURL,
-		"/plugins/qurl?token="+minted.AccessToken(), nil)
+	resolveResp, _ := doPostFormNoRedirect(t, testConfig.NHPServerBaseURL,
+		"/plugins/qurl", "token="+minted.AccessToken(), nil)
 	if resolveResp.StatusCode != 302 {
 		return fmt.Errorf("resolve status=%d, want 302", resolveResp.StatusCode)
 	}
