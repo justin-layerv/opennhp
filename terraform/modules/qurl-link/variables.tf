@@ -16,6 +16,11 @@ variable "acm_certificate_arn" {
 variable "nhp_resolve_url" {
   description = "NHP Server QURL plugin URL (e.g., https://ac.nhp.layerv.xyz/plugins/qurl)"
   type        = string
+
+  validation {
+    condition     = can(regex("^https://", var.nhp_resolve_url))
+    error_message = "nhp_resolve_url must use HTTPS"
+  }
 }
 
 variable "enable_access_logs" {

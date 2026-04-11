@@ -17,6 +17,10 @@ terraform {
 }
 
 locals {
+  # Extract the origin (scheme + host) from the resolve URL for the CSP form-action directive.
+  # e.g., "https://resolve.qurl.link.layerv.xyz/plugins/qurl" → "https://resolve.qurl.link.layerv.xyz"
+  resolve_origin = regex("^(https://[^/]+)", var.nhp_resolve_url)[0]
+
   # Generate the redirect page HTML with the configured resolve URL
   index_html = <<-HTML
 <!DOCTYPE html>
@@ -88,9 +92,20 @@ locals {
         document.getElementById('error').style.display = 'block';
         return;
       }
-      // Brief delay to show loading spinner for better UX feedback
+      // Submit token via form POST to keep it out of URL query strings
+      // and access logs (CloudFront, NHP server).
+      // Brief delay shows the loading spinner for UX feedback.
       setTimeout(function() {
-        window.location.href = RESOLVE_URL + '?token=' + encodeURIComponent(token);
+        var form = document.createElement('form');
+        form.method = 'POST';
+        form.action = RESOLVE_URL;
+        var input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = 'token';
+        input.value = token;
+        form.appendChild(input);
+        document.body.appendChild(form);
+        form.submit();
       }, 500);
     })();
   </script>
@@ -253,7 +268,7 @@ resource "aws_cloudfront_response_headers_policy" "qurl_link" {
 
   security_headers_config {
     content_security_policy {
-      content_security_policy = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
+      content_security_policy = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; form-action 'self' ${local.resolve_origin}"
       override                = true
     }
     strict_transport_security {
