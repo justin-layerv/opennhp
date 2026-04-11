@@ -312,20 +312,7 @@ resource "aws_autoscaling_policy" "cpu_green" {
   }
 }
 
-resource "aws_autoscaling_policy" "network_green" {
-  count = var.enable_blue_green ? 1 : 0
-
-  name                   = "${var.name_prefix}-ac-network-green"
-  autoscaling_group_name = aws_autoscaling_group.ac_green[0].name
-  policy_type            = "TargetTrackingScaling"
-
-  target_tracking_configuration {
-    predefined_metric_specification {
-      predefined_metric_type = "ASGAverageNetworkIn"
-    }
-    target_value = 10485760 # 10 MB/s
-  }
-}
+# Network scaling policy removed — see compute/main.tf for rationale.
 
 # =============================================================================
 # CloudWatch Alarms for Blue/Green Deployment Monitoring

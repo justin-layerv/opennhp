@@ -431,20 +431,7 @@ resource "aws_autoscaling_policy" "cpu_green" {
   }
 }
 
-resource "aws_autoscaling_policy" "network_green" {
-  count = var.enable_blue_green ? 1 : 0
-
-  name                   = "${var.name_prefix}-network-green"
-  autoscaling_group_name = aws_autoscaling_group.server_green[0].name
-  policy_type            = "TargetTrackingScaling"
-
-  target_tracking_configuration {
-    predefined_metric_specification {
-      predefined_metric_type = "ASGAverageNetworkIn"
-    }
-    target_value = 10485760 # 10 MB/s
-  }
-}
+# Network scaling policy removed — see compute/main.tf for rationale.
 
 # =============================================================================
 # Green Termination Cleanup (conditional on enable_termination_cleanup)

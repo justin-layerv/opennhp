@@ -895,18 +895,11 @@ resource "aws_autoscaling_policy" "cpu" {
   }
 }
 
-resource "aws_autoscaling_policy" "network" {
-  name                   = "${var.name_prefix}-network"
-  autoscaling_group_name = aws_autoscaling_group.server.name
-  policy_type            = "TargetTrackingScaling"
-
-  target_tracking_configuration {
-    predefined_metric_specification {
-      predefined_metric_type = "ASGAverageNetworkIn"
-    }
-    target_value = 10485760 # 10 MB/s
-  }
-}
+# Network scaling policy removed: the 10MB threshold was too low —
+# deploy-time Docker image pulls (~50-100MB) triggered scale-up from 3→4,
+# breaking AZ balance (3 instances = 1 per AZ). The blue-green workflow
+# copies DesiredCapacity to the standby ASG, so the spurious 4 propagated
+# permanently. CPU target-tracking (70%) is sufficient for real load scaling.
 
 # Network Load Balancer
 resource "aws_lb" "server" {
