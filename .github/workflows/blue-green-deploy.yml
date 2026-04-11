@@ -799,201 +799,8 @@ jobs:
           SERVER_ACTIVE_ASG: ${{ needs.prepare.outputs.server_active_asg }}
           HEALTH_CHECK_TIMEOUT_MINUTES: ${{ inputs.health_check_timeout_minutes }}
         run: |
-          set -euo pipefail
-          echo "Verifying ALL active server instances see AC peers before switching traffic..."
-
-          # Pull the full set of InService instances; we need quorum, not
-          # the first one we find. Sorting by instance id keeps log order
-          # stable across re-runs. The `grep -v '^$'` is required because
-          # AWS CLI emits a single empty line when the query returns no
-          # results — without the filter, mapfile creates a 1-element
-          # array containing "" and the count check below would pass with
-          # an invalid instance id.
-          mapfile -t INSTANCE_IDS < <(aws autoscaling describe-auto-scaling-groups \
-            --auto-scaling-group-names "$SERVER_ACTIVE_ASG" \
-            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService'].InstanceId" \
-            --output text | tr '\t' '\n' | grep -v '^$' | sort)
-
-          if [[ ${#INSTANCE_IDS[@]} -eq 0 ]]; then
-            echo "::error::No InService server instances found in ASG $SERVER_ACTIVE_ASG"
-            exit 1
-          fi
-          echo "Checking knock readiness on ${#INSTANCE_IDS[@]} server instance(s): ${INSTANCE_IDS[*]}"
-
-          # check_one INSTANCE_ID → echoes "ready <detail>"
-          #                                  / "not_ready <detail>"
-          #                                  / "ssm_failed <detail>"
-          # Detail is a short diagnostic string appended to the log line
-          # so operators can tell apart "ACs not yet connected" from
-          # "curl: (7) Failed to connect" from "ssm send-command:
-          # ParamValidation: ..." without digging into logs.
-          check_one() {
-            local instance_id="$1"
-            local cmd_id status output stderr_file captured_err
-
-            # Capture stderr from AWS CLI calls so real errors surface
-            # in the log line instead of being swallowed by 2>/dev/null.
-            # The hard-to-diagnose half of today's outage was an
-            # AWS API-level ParamValidation error on --timeout-seconds
-            # that the old code threw away, then misreported as "SSM
-            # unreachable" — make that class of bug impossible to hide
-            # the next time.
-            stderr_file=$(mktemp)
-
-            # --timeout-seconds 30 is the SSM API minimum. 15 is
-            # rejected at the AWS API boundary before the command ever
-            # reaches the instance.
-            #
-            # Command: curl on the host (not `docker exec nhp-server
-            # wget`). nhp-server runs with --net=host so
-            # /health/knock-ready is reachable on 127.0.0.1:8888 from
-            # the instance itself, and the container image ships
-            # neither wget nor curl. `curl -sS` without -f is
-            # deliberate: /health/knock-ready returns 503 with a
-            # not-ready-status JSON body when ACs aren't connected,
-            # and we want jq below to parse BOTH the 200 and 503
-            # bodies so the log line can surface `ac_peers.message`.
-            # With -f, curl would exit non-zero on 503 and the
-            # `|| echo KNOCK_NOT_READY` fallback would clobber the
-            # body we wanted.
-            #
-            # `2>&1` merges curl's own stderr (e.g. "curl: (7) Failed
-            # to connect...") into stdout so the fallback branch below
-            # can surface the real reason in the "not_ready" log line.
-            if ! cmd_id=$(aws ssm send-command \
-                --instance-ids "$instance_id" \
-                --document-name "AWS-RunShellScript" \
-                --timeout-seconds 30 \
-                --parameters 'commands=["curl -sS http://127.0.0.1:8888/health/knock-ready 2>&1 || echo KNOCK_NOT_READY"]' \
-                --query "Command.CommandId" --output text 2>"$stderr_file"); then
-              captured_err=$(tr '\n' ' ' < "$stderr_file")
-              rm -f "$stderr_file"
-              # Trim to keep the per-iteration log line readable;
-              # the full error is still in the job log if needed.
-              echo "ssm_failed send-command: ${captured_err:0:200}"
-              return
-            fi
-
-            # Wait up to 15s for SSM command completion. Treat any
-            # terminal SSM status (Success, Failed, TimedOut, Cancelled)
-            # as "stop polling".
-            sleep 3
-            status="Pending"
-            for _ in 1 2 3 4; do
-              status=$(aws ssm get-command-invocation \
-                --command-id "$cmd_id" --instance-id "$instance_id" \
-                --query "Status" --output text 2>"$stderr_file") || status="Pending"
-              case "$status" in
-                Success|Failed|TimedOut|Cancelled) break ;;
-              esac
-              sleep 3
-            done
-
-            if [[ "$status" != "Success" ]]; then
-              captured_err=$(tr '\n' ' ' < "$stderr_file")
-              rm -f "$stderr_file"
-              if [[ -n "$captured_err" ]]; then
-                echo "ssm_failed status=$status: ${captured_err:0:200}"
-              else
-                echo "ssm_failed status=$status"
-              fi
-              return
-            fi
-
-            output=$(aws ssm get-command-invocation \
-              --command-id "$cmd_id" --instance-id "$instance_id" \
-              --query "StandardOutputContent" --output text 2>/dev/null) || output=""
-            rm -f "$stderr_file"
-
-            # Fast path: the curl wrapper above echoes KNOCK_NOT_READY
-            # when curl itself fails (connection refused / timeout /
-            # instance not yet listening). `2>&1` on the curl means
-            # curl's error message is also in $output, so surface it
-            # in the detail string — otherwise a hung deploy shows
-            # nothing diagnosable in the log.
-            if [[ "$output" == *"KNOCK_NOT_READY"* ]]; then
-              local curl_err
-              curl_err=$(printf '%s' "$output" \
-                | grep -v '^KNOCK_NOT_READY$' \
-                | tr '\n' ' ' \
-                | head -c 200)
-              if [[ -n "$curl_err" ]]; then
-                echo "not_ready ${curl_err}"
-              else
-                echo "not_ready"
-              fi
-              return
-            fi
-
-            # Use jq to parse the ReadinessResponse JSON in a single pass.
-            # This is robust to field ordering and (unlike a regex) won't
-            # break if a future CheckResult gains nested objects in the
-            # Message field. Output is "<status>|<message>" so we can
-            # split it with bash parameter expansion below.
-            local parsed body_status ac_msg
-            parsed=$(echo "$output" | jq -r '"\(.status // "")|\(.checks.ac_peers.message // "no message")"' 2>/dev/null) || parsed=""
-            if [[ -z "$parsed" ]]; then
-              echo "not_ready"
-              return
-            fi
-            body_status="${parsed%%|*}"
-            ac_msg="${parsed#*|}"
-            if [[ "$body_status" == "healthy" ]]; then
-              echo "ready ${ac_msg}"
-              return
-            fi
-            echo "not_ready ${ac_msg}"
-          }
-
-          DEADLINE=$(($(date +%s) + HEALTH_CHECK_TIMEOUT_MINUTES * 60))
-          ITERATION=0
-          while [[ $(date +%s) -lt $DEADLINE ]]; do
-            ITERATION=$((ITERATION + 1))
-            REMAINING=$(( (DEADLINE - $(date +%s)) / 60 ))
-
-            ALL_READY=true
-            for inst in "${INSTANCE_IDS[@]}"; do
-              result=$(check_one "$inst")
-              kind="${result%% *}"
-              detail="${result#* }"
-              [[ "$kind" == "$detail" ]] && detail=""
-              case "$kind" in
-                ready)
-                  echo "[knock-ready] [iter $ITERATION, ${REMAINING}m left] $inst: ready ($detail)"
-                  ;;
-                not_ready)
-                  echo "[knock-ready] [iter $ITERATION, ${REMAINING}m left] $inst: not yet ($detail)"
-                  ALL_READY=false
-                  ;;
-                ssm_failed)
-                  # Use the actual failure detail from check_one
-                  # instead of the previous hardcoded "SSM unreachable"
-                  # message — the latter was actively misleading when
-                  # the real failure was a ParamValidation error or a
-                  # `docker exec: wget not found` that never reached
-                  # the SSM transport at all.
-                  if [[ -n "$detail" ]]; then
-                    echo "[knock-ready] [iter $ITERATION, ${REMAINING}m left] $inst: SSM failed ($detail), retrying"
-                  else
-                    echo "[knock-ready] [iter $ITERATION, ${REMAINING}m left] $inst: SSM failed, retrying"
-                  fi
-                  ALL_READY=false
-                  ;;
-                *)
-                  echo "[knock-ready] [iter $ITERATION, ${REMAINING}m left] $inst: unknown result '$result'"
-                  ALL_READY=false
-                  ;;
-              esac
-            done
-
-            if [[ "$ALL_READY" == "true" ]]; then
-              echo "[knock-ready] All ${#INSTANCE_IDS[@]} server instance(s) report AC peers connected — proceeding"
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "::error::[knock-ready] Not all server instances reported AC peers connected after ${HEALTH_CHECK_TIMEOUT_MINUTES} minutes"
-          exit 1
+          .github/scripts/verify-knock-ready.sh \
+            "$SERVER_ACTIVE_ASG" "pre-switch" "$HEALTH_CHECK_TIMEOUT_MINUTES"
 
       - name: "[Server] Dry Run Notice"
         if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run == true
@@ -1065,8 +872,11 @@ jobs:
   # =============================================================================
   scale-down-previous:
     name: Scale Down Previous
-    needs: [prepare, switch-traffic]
-    if: always() && needs.switch-traffic.result == 'success' && inputs.action == 'deploy' && inputs.dry_run != true
+    needs: [prepare, switch-traffic, validate]
+    # Wait for validate (post-switch knock-ready) before scaling down the
+    # previous active ASG. Without this, blue servers get terminated while
+    # ACs are still migrating from blue to green, causing brief knock failures.
+    if: always() && needs.switch-traffic.result == 'success' && (needs.validate.result == 'success' || needs.validate.result == 'skipped') && inputs.action == 'deploy' && inputs.dry_run != true
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     timeout-minutes: 5
@@ -1208,6 +1018,23 @@ jobs:
             echo "::error::AC state inconsistency! SSM=$SSM_COLOR, listener=$LISTENER_COLOR"
             exit 1
           fi
+
+      # After the traffic switch, the old standby servers are now active.
+      # Verify every newly-active server instance has AC peers connected
+      # before the workflow completes. Without this gate, downstream
+      # consumers (smoke tests, build-and-push validation) can start
+      # before all instances are knock-ready, causing transient failures.
+      # Condition: deploy_ac (not deploy_server) is intentional. Knock-ready
+      # checks whether AC peers are connected. If only servers were deployed
+      # (no AC change), existing ACs are already registered — no re-registration
+      # window to wait for. We only need this gate when ACs were deployed.
+      - name: "[Server] Verify Post-Switch Knock Readiness"
+        if: needs.prepare.outputs.deploy_ac == 'true' && inputs.dry_run != true
+        env:
+          NEW_ACTIVE_ASG: ${{ needs.prepare.outputs.server_standby_asg }}
+          HEALTH_CHECK_TIMEOUT_MINUTES: ${{ inputs.health_check_timeout_minutes }}
+        run: |
+          .github/scripts/verify-knock-ready.sh "$NEW_ACTIVE_ASG" "post-switch" "$HEALTH_CHECK_TIMEOUT_MINUTES"
 
       - name: Run Validation Script
         env:
