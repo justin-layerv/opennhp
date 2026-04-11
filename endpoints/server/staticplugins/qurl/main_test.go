@@ -393,9 +393,12 @@ func TestAuthWithHttp_FullFlow_POST(t *testing.T) {
 		t.Error("ackMsg has no resource hosts")
 	}
 
-	// Verify redirect response
-	if w.Code != http.StatusFound {
-		t.Errorf("expected status %d, got %d", http.StatusFound, w.Code)
+	// Verify redirect response.
+	// Use ctx.Writer.Status() instead of w.Code: for POST requests, http.Redirect
+	// skips the response body, so gin's wrapper never flushes the status to the
+	// underlying httptest.ResponseRecorder (w.Code stays at default 200).
+	if ctx.Writer.Status() != http.StatusFound {
+		t.Errorf("expected status %d, got %d", http.StatusFound, ctx.Writer.Status())
 	}
 	location := w.Header().Get("Location")
 	if location != "https://r_test123.qurl.site" {
@@ -532,8 +535,8 @@ func TestAuthWithHttp_POST_EmptyBody_FallsBackToQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST with query param fallback returned error: %v", err)
 	}
-	if w.Code != http.StatusFound {
-		t.Errorf("expected status %d, got %d", http.StatusFound, w.Code)
+	if ctx.Writer.Status() != http.StatusFound {
+		t.Errorf("expected status %d, got %d", http.StatusFound, ctx.Writer.Status())
 	}
 }
 
@@ -656,8 +659,8 @@ func TestAuthWithHttp_CustomDomain_FullFlow(t *testing.T) {
 	}
 
 	// Verify redirect to custom domain (not qurl.site)
-	if setup.recorder.Code != http.StatusFound {
-		t.Errorf("expected status %d, got %d", http.StatusFound, setup.recorder.Code)
+	if setup.ctx.Writer.Status() != http.StatusFound {
+		t.Errorf("expected status %d, got %d", http.StatusFound, setup.ctx.Writer.Status())
 	}
 	location := setup.recorder.Header().Get("Location")
 	if location != "https://app.mycorp.com" {
@@ -983,8 +986,8 @@ func TestAuthWithHttp_KnockRetrySuccess(t *testing.T) {
 	if ackMsg == nil || len(ackMsg.ResourceHost) == 0 {
 		t.Error("expected resource hosts in ack message")
 	}
-	if w.Code != http.StatusFound {
-		t.Errorf("expected redirect (302), got %d", w.Code)
+	if ctx.Writer.Status() != http.StatusFound {
+		t.Errorf("expected redirect (302), got %d", ctx.Writer.Status())
 	}
 }
 
