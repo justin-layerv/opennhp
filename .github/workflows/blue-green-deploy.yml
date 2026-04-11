@@ -504,10 +504,9 @@ jobs:
     if: inputs.action == 'deploy'
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
-    # Steps run sequentially even for component=both.
+    # Server and AC instance refreshes run in parallel when component=both.
     # Per-component timeout: refresh (max 60m) + health check (max 30m) + buffer (5m) = 95m.
-    # For component=both, two sequential components (2 * 95m = 190m) + extra buffer (10m) = 200m.
-    timeout-minutes: ${{ inputs.component == 'both' && 200 || 95 }}
+    timeout-minutes: 95
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -582,85 +581,7 @@ jobs:
               --min-size "$ACTIVE_CAPACITY" --desired-capacity "$ACTIVE_CAPACITY"
           fi
 
-      - name: "[Server] Instance Refresh on Standby"
-        if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run != true
-        env:
-          STANDBY_ASG: ${{ needs.prepare.outputs.server_standby_asg }}
-          REFRESH_TIMEOUT_MINUTES: ${{ inputs.refresh_timeout_minutes }}
-        run: |
-          echo "Starting instance refresh on server standby ASG: $STANDBY_ASG"
-          EXISTING=$(aws autoscaling describe-instance-refreshes \
-            --auto-scaling-group-name "$STANDBY_ASG" \
-            --query "InstanceRefreshes[?Status=='InProgress' || Status=='Pending'].InstanceRefreshId" \
-            --output text 2>/dev/null) || true
-          if [[ -n "$EXISTING" ]]; then
-            echo "Cancelling existing refresh: $EXISTING"
-            aws autoscaling cancel-instance-refresh --auto-scaling-group-name "$STANDBY_ASG" || true
-            sleep 10
-          fi
-          REFRESH_ID=$(aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name "$STANDBY_ASG" \
-            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 60, "SkipMatching": false}' \
-            --query "InstanceRefreshId" --output text)
-          echo "Instance refresh started: $REFRESH_ID"
-          DEADLINE=$(($(date +%s) + REFRESH_TIMEOUT_MINUTES * 60))
-          ITERATION=0
-          while [[ $(date +%s) -lt $DEADLINE ]]; do
-            ITERATION=$((ITERATION + 1))
-            REMAINING=$(( (DEADLINE - $(date +%s)) / 60 ))
-            STATUS=$(aws autoscaling describe-instance-refreshes \
-              --auto-scaling-group-name "$STANDBY_ASG" \
-              --instance-refresh-ids "$REFRESH_ID" \
-              --query "InstanceRefreshes[0].Status" --output text)
-            echo "[Server] [iter $ITERATION, ${REMAINING}m remaining] Refresh status: $STATUS"
-            case "$STATUS" in
-              Successful) echo "Server instance refresh completed successfully"; break ;;
-              Failed|Cancelled) echo "::error::Server instance refresh $STATUS"; exit 1 ;;
-              *) sleep 10 ;;
-            esac
-          done
-          if [[ "$STATUS" != "Successful" ]]; then
-            echo "::error::Server instance refresh timed out after ${REFRESH_TIMEOUT_MINUTES} minutes (status: $STATUS)"
-            exit 1
-          fi
-
-      # Verify the newly-refreshed standby server instances are actually
-      # running before we let the pipeline switch traffic to them.
-      #
-      # We CANNOT use `aws elbv2 describe-target-health` here: during
-      # blue/green the standby target groups have no listener attached,
-      # and NLB returns "unused / Target.NotInUse" for any TG without a
-      # listener (see the listener-swap logic in Switch Traffic below).
-      # That made the previous version of this step spin forever until
-      # the health-check window timed out — the TGs could never possibly
-      # flip to "healthy" no matter how fit the instances were.
-      #
-      # Instead we probe each instance directly via SSM and ask the
-      # running nhp-server container for /health/live. We intentionally
-      # do NOT check /health/knock-ready on standby: that endpoint
-      # reports 503 while no AC peers are connected, and a standby
-      # server by definition has no ACs connected yet (ACs only start
-      # knocking it once the listener swap routes traffic its way).
-      # The existing "Verify Knock Readiness" step below runs against
-      # the ACTIVE ASG just before the swap and catches that case.
-      - name: "[Server] Verify Standby Health"
-        if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run != true
-        env:
-          STANDBY_ASG: ${{ needs.prepare.outputs.server_standby_asg }}
-          HEALTH_CHECK_TIMEOUT_MINUTES: ${{ inputs.health_check_timeout_minutes }}
-        run: |
-          # nhp-server runs with --net=host, so /health/live is reachable
-          # from the instance itself on 127.0.0.1:8888 — no `docker exec`
-          # needed, and more importantly the server container image does
-          # not ship with wget/curl.
-          chmod +x .github/scripts/verify-asg-instances-healthy.sh
-          .github/scripts/verify-asg-instances-healthy.sh \
-            "$STANDBY_ASG" \
-            "Server-Standby" \
-            "$HEALTH_CHECK_TIMEOUT_MINUTES" \
-            'curl -sfS -o /dev/null http://127.0.0.1:8888/health/live'
-
-      # ---- AC Deploy Steps ----
+      # ---- AC Setup Steps (moved before refresh to enable parallel refresh) ----
       - name: "[AC] Validate Image Exists in ECR"
         if: needs.prepare.outputs.deploy_ac == 'true'
         env:
@@ -724,67 +645,141 @@ jobs:
               --min-size "$ACTIVE_CAPACITY" --desired-capacity "$ACTIVE_CAPACITY"
           fi
 
-      - name: "[AC] Instance Refresh on Standby"
-        if: needs.prepare.outputs.deploy_ac == 'true' && inputs.dry_run != true
+      # ---- Parallel Instance Refresh ----
+      # Server and AC standby refreshes run in parallel because neither
+      # serves traffic during refresh. AC standby instances connect to the
+      # ACTIVE server (not the standby being refreshed), so there is no
+      # ordering dependency between the two refreshes.
+      - name: "[Parallel] Instance Refresh on Standby (Server + AC)"
+        if: (needs.prepare.outputs.deploy_server == 'true' || needs.prepare.outputs.deploy_ac == 'true') && inputs.dry_run != true
         env:
-          STANDBY_ASG: ${{ needs.prepare.outputs.ac_standby_asg }}
+          SERVER_STANDBY_ASG: ${{ needs.prepare.outputs.server_standby_asg }}
+          AC_STANDBY_ASG: ${{ needs.prepare.outputs.ac_standby_asg }}
+          DEPLOY_SERVER: ${{ needs.prepare.outputs.deploy_server }}
+          DEPLOY_AC: ${{ needs.prepare.outputs.deploy_ac }}
           REFRESH_TIMEOUT_MINUTES: ${{ inputs.refresh_timeout_minutes }}
         run: |
-          echo "Starting instance refresh on AC standby ASG: $STANDBY_ASG"
-          EXISTING=$(aws autoscaling describe-instance-refreshes \
-            --auto-scaling-group-name "$STANDBY_ASG" \
-            --query "InstanceRefreshes[?Status=='InProgress' || Status=='Pending'].InstanceRefreshId" \
-            --output text 2>/dev/null) || true
-          if [[ -n "$EXISTING" ]]; then
-            echo "Cancelling existing refresh: $EXISTING"
-            aws autoscaling cancel-instance-refresh --auto-scaling-group-name "$STANDBY_ASG" || true
-            sleep 10
-          fi
-          REFRESH_ID=$(aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name "$STANDBY_ASG" \
-            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 60, "SkipMatching": false}' \
-            --query "InstanceRefreshId" --output text)
-          echo "Instance refresh started: $REFRESH_ID"
+          set -euo pipefail
+
+          start_refresh() {
+            local asg=$1 label=$2
+            echo "Starting instance refresh on $label standby ASG: $asg" >&2
+            EXISTING=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$asg" \
+              --query "InstanceRefreshes[?Status=='InProgress' || Status=='Pending'].InstanceRefreshId" \
+              --output text 2>/dev/null) || true
+            if [[ -n "$EXISTING" ]]; then
+              echo "Cancelling existing refresh on $asg: $EXISTING" >&2
+              aws autoscaling cancel-instance-refresh --auto-scaling-group-name "$asg" || true
+              sleep 10
+            fi
+            aws autoscaling start-instance-refresh \
+              --auto-scaling-group-name "$asg" \
+              --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 60, "SkipMatching": false}' \
+              --query "InstanceRefreshId" --output text
+          }
+
+          poll_refresh() {
+            local asg=$1 refresh_id=$2 label=$3 deadline=$4
+            local iteration=0
+            while [[ $(date +%s) -lt $deadline ]]; do
+              iteration=$((iteration + 1))
+              remaining=$(( (deadline - $(date +%s)) / 60 ))
+              status=$(aws autoscaling describe-instance-refreshes \
+                --auto-scaling-group-name "$asg" \
+                --instance-refresh-ids "$refresh_id" \
+                --query "InstanceRefreshes[0].Status" --output text)
+              echo "[$label] [iter $iteration, ${remaining}m remaining] Refresh status: $status"
+              case "$status" in
+                Successful) echo "$label instance refresh completed successfully"; return 0 ;;
+                Failed|Cancelled) echo "::error::$label instance refresh $status"; return 1 ;;
+                *) sleep 10 ;;
+              esac
+            done
+            echo "::error::$label instance refresh timed out after ${REFRESH_TIMEOUT_MINUTES} minutes"
+            return 1
+          }
+
           DEADLINE=$(($(date +%s) + REFRESH_TIMEOUT_MINUTES * 60))
-          ITERATION=0
-          while [[ $(date +%s) -lt $DEADLINE ]]; do
-            ITERATION=$((ITERATION + 1))
-            REMAINING=$(( (DEADLINE - $(date +%s)) / 60 ))
-            STATUS=$(aws autoscaling describe-instance-refreshes \
-              --auto-scaling-group-name "$STANDBY_ASG" \
-              --instance-refresh-ids "$REFRESH_ID" \
-              --query "InstanceRefreshes[0].Status" --output text)
-            echo "[AC] [iter $ITERATION, ${REMAINING}m remaining] Refresh status: $STATUS"
-            case "$STATUS" in
-              Successful) echo "AC instance refresh completed successfully"; break ;;
-              Failed|Cancelled) echo "::error::AC instance refresh $STATUS"; exit 1 ;;
-              *) sleep 10 ;;
-            esac
-          done
-          if [[ "$STATUS" != "Successful" ]]; then
-            echo "::error::AC instance refresh timed out after ${REFRESH_TIMEOUT_MINUTES} minutes (status: $STATUS)"
-            exit 1
+          echo "Starting parallel refresh: server=$DEPLOY_SERVER ac=$DEPLOY_AC"
+
+          # Start refreshes
+          SERVER_REFRESH_ID=""
+          AC_REFRESH_ID=""
+          if [[ "$DEPLOY_SERVER" == "true" ]]; then
+            SERVER_REFRESH_ID=$(start_refresh "$SERVER_STANDBY_ASG" "Server")
+            echo "Server refresh started: $SERVER_REFRESH_ID" >&2
+          fi
+          if [[ "$DEPLOY_AC" == "true" ]]; then
+            AC_REFRESH_ID=$(start_refresh "$AC_STANDBY_ASG" "AC")
+            echo "AC refresh started: $AC_REFRESH_ID" >&2
           fi
 
-      # Same reasoning as the server verify step above: the AC standby
-      # target group has no listener, so NLB reports "unused" for every
-      # target forever. Probe the instances directly via SSM instead.
-      # nhp-acd + Traefik run natively on the AC host (not containerised),
-      # so the health endpoint is reached with a plain curl to Traefik's
-      # admin ping on port 8080 — the same check the NLB performs when
-      # the TG *is* attached to a listener.
-      - name: "[AC] Verify Standby Health"
-        if: needs.prepare.outputs.deploy_ac == 'true' && inputs.dry_run != true
+          # Poll in parallel using background processes
+          SERVER_PID=""
+          AC_PID=""
+          if [[ -n "$SERVER_REFRESH_ID" ]]; then
+            poll_refresh "$SERVER_STANDBY_ASG" "$SERVER_REFRESH_ID" "Server" "$DEADLINE" &
+            SERVER_PID=$!
+          fi
+          if [[ -n "$AC_REFRESH_ID" ]]; then
+            poll_refresh "$AC_STANDBY_ASG" "$AC_REFRESH_ID" "AC" "$DEADLINE" &
+            AC_PID=$!
+          fi
+
+          # Wait for both to complete
+          FAILED=false
+          if [[ -n "$SERVER_PID" ]]; then
+            if ! wait "$SERVER_PID"; then FAILED=true; echo "::error::Server refresh failed"; fi
+          fi
+          if [[ -n "$AC_PID" ]]; then
+            if ! wait "$AC_PID"; then FAILED=true; echo "::error::AC refresh failed"; fi
+          fi
+          if [[ "$FAILED" == "true" ]]; then exit 1; fi
+
+      # ---- Parallel Standby Health Verification ----
+      # Verify newly-refreshed standby instances via SSM (not NLB target
+      # health, which reports "unused" for standby TGs with no listener).
+      # Server and AC verifications run in parallel for the same reason
+      # as the refresh: neither serves traffic during standby.
+      - name: "[Parallel] Verify Standby Health (Server + AC)"
+        if: (needs.prepare.outputs.deploy_server == 'true' || needs.prepare.outputs.deploy_ac == 'true') && inputs.dry_run != true
         env:
-          STANDBY_ASG: ${{ needs.prepare.outputs.ac_standby_asg }}
+          SERVER_STANDBY_ASG: ${{ needs.prepare.outputs.server_standby_asg }}
+          AC_STANDBY_ASG: ${{ needs.prepare.outputs.ac_standby_asg }}
+          DEPLOY_SERVER: ${{ needs.prepare.outputs.deploy_server }}
+          DEPLOY_AC: ${{ needs.prepare.outputs.deploy_ac }}
           HEALTH_CHECK_TIMEOUT_MINUTES: ${{ inputs.health_check_timeout_minutes }}
         run: |
+          set -euo pipefail
           chmod +x .github/scripts/verify-asg-instances-healthy.sh
-          .github/scripts/verify-asg-instances-healthy.sh \
-            "$STANDBY_ASG" \
-            "AC-Standby" \
-            "$HEALTH_CHECK_TIMEOUT_MINUTES" \
-            'curl -sfS -o /dev/null http://127.0.0.1:8080/ping'
+          FAILED=false
+          SERVER_PID=""
+          AC_PID=""
+
+          if [[ "$DEPLOY_SERVER" == "true" ]]; then
+            # nhp-server runs with --net=host, so /health/live is on 127.0.0.1:8888
+            .github/scripts/verify-asg-instances-healthy.sh \
+              "$SERVER_STANDBY_ASG" "Server-Standby" "$HEALTH_CHECK_TIMEOUT_MINUTES" \
+              'curl -sfS -o /dev/null http://127.0.0.1:8888/health/live' &
+            SERVER_PID=$!
+          fi
+
+          if [[ "$DEPLOY_AC" == "true" ]]; then
+            # Traefik admin ping on port 8080
+            .github/scripts/verify-asg-instances-healthy.sh \
+              "$AC_STANDBY_ASG" "AC-Standby" "$HEALTH_CHECK_TIMEOUT_MINUTES" \
+              'curl -sfS -o /dev/null http://127.0.0.1:8080/ping' &
+            AC_PID=$!
+          fi
+
+          if [[ -n "$SERVER_PID" ]]; then
+            if ! wait "$SERVER_PID"; then FAILED=true; echo "::error::Server standby health check failed"; fi
+          fi
+          if [[ -n "$AC_PID" ]]; then
+            if ! wait "$AC_PID"; then FAILED=true; echo "::error::AC standby health check failed"; fi
+          fi
+          if [[ "$FAILED" == "true" ]]; then exit 1; fi
 
       # Knock-readiness gate: verify EVERY active server instance reports
       # AC peers connected before switching traffic. During blue/green AC
