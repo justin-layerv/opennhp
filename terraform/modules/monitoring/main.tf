@@ -373,16 +373,22 @@ resource "aws_cloudwatch_metric_alarm" "unhealthy_hosts" {
 }
 
 # No Healthy Hosts Alarm (Critical)
+# Requires 3 consecutive minutes at zero to fire, which filters out transient
+# blips during instance refresh (sandbox blue/green swaps typically recover in
+# ~2 minutes). A real outage still alerts within 3 minutes. Safe for prod
+# canary deploys too — canary replaces one instance at a time, so
+# HealthyHostCount never hits zero during normal prod deployments.
 resource "aws_cloudwatch_metric_alarm" "no_healthy_hosts" {
   alarm_name          = "${var.name_prefix}-${var.cell_id}-no-healthy-hosts"
   comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 1
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
   metric_name         = "HealthyHostCount"
   namespace           = "AWS/NetworkELB"
   period              = 60
   statistic           = "Minimum"
   threshold           = 1
-  alarm_description   = "CRITICAL: No healthy hosts available"
+  alarm_description   = "CRITICAL: No healthy hosts for 3 consecutive minutes"
   alarm_actions       = [aws_sns_topic.alerts.arn]
   ok_actions          = [aws_sns_topic.alerts.arn]
   treat_missing_data  = local.alarm_missing_data
