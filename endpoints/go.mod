@@ -26,7 +26,7 @@ require (
 	github.com/sigstore/cosign/v2 v2.6.2
 	github.com/spf13/viper v1.21.0
 	github.com/urfave/cli/v2 v2.27.7
-	go.etcd.io/etcd/client/v3 v3.6.9
+	go.etcd.io/etcd/client/v3 v3.6.10
 	go.opentelemetry.io/otel v1.43.0
 	go.opentelemetry.io/otel/metric v1.43.0
 	go.opentelemetry.io/otel/sdk/metric v1.43.0
@@ -186,8 +186,8 @@ require (
 	github.com/wlynxg/anet v0.0.5 // indirect
 	github.com/xrash/smetrics v0.0.0-20250705151800-55b8f293f342 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
-	go.etcd.io/etcd/api/v3 v3.6.9 // indirect
-	go.etcd.io/etcd/client/pkg/v3 v3.6.9 // indirect
+	go.etcd.io/etcd/api/v3 v3.6.10 // indirect
+	go.etcd.io/etcd/client/pkg/v3 v3.6.10 // indirect
 	go.mongodb.org/mongo-driver/v2 v2.5.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.67.0 // indirect
