@@ -105,6 +105,7 @@ type ServerInfo struct {
 	AZ         string `json:"az,omitempty" dynamodbav:"az,omitempty"`                   // Availability Zone
 	Port       int    `json:"port" dynamodbav:"port"`                                   // NHP UDP port (default 62206)
 	PubKey     string `json:"pub_key,omitempty" dynamodbav:"pub_key,omitempty"`         // Server's public key (for forwarding)
+	ASGName    string `json:"asg_name,omitempty" dynamodbav:"asg_name,omitempty"`       // ASG name for blue/green filtering
 }
 
 // serverInfosToRedirectTargets converts a slice of ServerInfo to RedirectTarget,

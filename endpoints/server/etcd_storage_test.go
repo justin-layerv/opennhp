@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"testing"
@@ -139,6 +140,44 @@ func TestEtcdStorage_JSONSerialization(t *testing.T) {
 		}
 		if decoded.AssignedServers[0].ID != "srv-1" {
 			t.Errorf("First server ID mismatch: expected srv-1, got %s", decoded.AssignedServers[0].ID)
+		}
+	})
+
+	t.Run("ServerInfo_ASGName_roundtrip", func(t *testing.T) {
+		srv := ServerInfo{
+			ID: "srv-1", IP: "10.0.0.1", InternalIP: "192.168.1.1",
+			AZ: "us-east-2a", Port: common.DefaultNHPPort, PubKey: "key1",
+			ASGName: "layerv-nhp-sandbox-server",
+		}
+		data, err := json.Marshal(srv)
+		if err != nil {
+			t.Fatalf("Failed to marshal ServerInfo: %v", err)
+		}
+		var decoded ServerInfo
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatalf("Failed to unmarshal ServerInfo: %v", err)
+		}
+		if decoded.ASGName != "layerv-nhp-sandbox-server" {
+			t.Errorf("ASGName mismatch: expected 'layerv-nhp-sandbox-server', got %q", decoded.ASGName)
+		}
+	})
+
+	t.Run("ServerInfo_ASGName_omitempty", func(t *testing.T) {
+		srv := ServerInfo{ID: "srv-1", IP: "10.0.0.1", Port: common.DefaultNHPPort}
+		data, err := json.Marshal(srv)
+		if err != nil {
+			t.Fatalf("Failed to marshal ServerInfo: %v", err)
+		}
+		var decoded ServerInfo
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatalf("Failed to unmarshal ServerInfo: %v", err)
+		}
+		if decoded.ASGName != "" {
+			t.Errorf("Expected empty ASGName, got %q", decoded.ASGName)
+		}
+		// Verify the key is not present in JSON output
+		if bytes.Contains(data, []byte("asg_name")) {
+			t.Error("Expected asg_name to be omitted from JSON when empty")
 		}
 	})
 

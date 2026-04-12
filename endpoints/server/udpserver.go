@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"strconv"
 	"sync"
@@ -143,6 +144,7 @@ type UdpServer struct {
 	// EC2 instance identity (populated from IMDS in cloud mode)
 	instanceID string // EC2 instance ID (e.g., "i-0abc123")
 	instanceAZ string // Availability zone (e.g., "us-east-2a")
+	asgName    string // ASG name from IMDS Name tag (blue/green filtering)
 
 	// TTL refresh throttle: tracks last refresh time per AC ID to prevent
 	// excessive DynamoDB writes from frequent AC re-registrations.
@@ -751,48 +753,77 @@ func (s *UdpServer) drainACConnections() {
 func (s *UdpServer) registerWithCloudMap() {
 	imdsClient := &http.Client{Timeout: 2 * time.Second}
 
-	// Fetch instance ID (IMDSv2: token obtained per request)
-	instanceID, err := imdsV2Get(imdsClient, "http://169.254.169.254/latest/meta-data/instance-id")
+	// Obtain a single IMDS token and reuse it for all metadata fetches
+	// (avoids 3 separate token PUT requests).
+	token, err := imdsV2Token(imdsClient)
+	if err != nil {
+		log.Error("Failed to get IMDS token: %v (Cloud Map registration skipped, auto-assignment will use hostname fallback)", err)
+		return
+	}
+
+	// Fetch instance ID
+	instanceID, err := imdsV2GetWithToken(imdsClient, token, "http://169.254.169.254/latest/meta-data/instance-id")
 	if err != nil {
 		log.Error("Failed to get instance ID from IMDS: %v (Cloud Map registration skipped, auto-assignment will use hostname fallback)", err)
 		return
 	}
-	s.instanceID = instanceID
+	s.instanceID = strings.TrimSpace(instanceID)
 
 	// Fetch AZ
-	az, err := imdsV2Get(imdsClient, "http://169.254.169.254/latest/meta-data/placement/availability-zone")
+	az, err := imdsV2GetWithToken(imdsClient, token, "http://169.254.169.254/latest/meta-data/placement/availability-zone")
 	if err != nil {
 		log.Warning("Failed to get AZ from IMDS: %v", err)
 		az = "unknown"
 	}
-	s.instanceAZ = az
+	s.instanceAZ = strings.TrimSpace(az)
+
+	// Fetch ASG name from IMDS Name tag for blue/green filtering.
+	// The Name tag matches the ASG name (e.g., "layerv-nhp-sandbox-server" vs
+	// "layerv-nhp-sandbox-server-green"). AWS-prefixed tags like
+	// aws:autoscaling:groupName are NOT accessible via IMDS.
+	// COUPLING: Requires ASG tag propagation to set Name = ASG name
+	// (configured via propagate_at_launch in terraform/modules/compute/main.tf
+	// and terraform/modules/ac/main.tf). If the Name tag diverges from the
+	// ASG name, filtering silently degrades to fail-open (no outage, but no
+	// blue/green protection). Escape hatch: ec2:DescribeTags API has the
+	// authoritative aws:autoscaling:groupName but requires IAM permissions.
+	asgName, err := imdsV2GetWithToken(imdsClient, token, "http://169.254.169.254/latest/meta-data/tags/instance/Name")
+	if err != nil {
+		log.Warning("Failed to get Name tag from IMDS: %v (blue/green filtering disabled)", err)
+	} else if trimmed := strings.TrimSpace(asgName); trimmed == "" {
+		log.Warning("IMDS Name tag is empty/whitespace (blue/green filtering disabled)")
+	} else {
+		s.asgName = trimmed
+	}
 
 	// Register with Cloud Map including PUBLIC_KEY
 	// IMPORTANT: RegisterInstance REPLACES all attributes. Must re-include IP, AZ, port.
 	attrs := map[string]string{
 		CloudMapAttrIPv4: s.localIp,
-		CloudMapAttrAZ:   az,
+		CloudMapAttrAZ:   s.instanceAZ,
 		CloudMapAttrPort: strconv.Itoa(s.config.ListenPort),
 		CloudMapAttrKey:  s.device.PublicKeyBase64(),
+	}
+	if s.asgName != "" {
+		attrs[CloudMapAttrASG] = s.asgName
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := s.cloudMap.RegisterInstanceAttributes(ctx, instanceID, attrs); err != nil {
+	if err := s.cloudMap.RegisterInstanceAttributes(ctx, s.instanceID, attrs); err != nil {
 		log.Error("Failed to register public key with Cloud Map: %v (auto-assignment may not include this server's key)", err)
 		return
 	}
 
-	log.Info("Registered with Cloud Map: instance=%s, az=%s, pubkey=%s...",
-		instanceID, az, s.device.PublicKeyBase64()[:12])
+	log.Info("Registered with Cloud Map: instance=%s, az=%s, asg=%s, pubkey=%s...",
+		s.instanceID, s.instanceAZ, s.asgName, s.device.PublicKeyBase64()[:12])
 }
 
-// imdsV2Get fetches a metadata value from the EC2 Instance Metadata Service using IMDSv2.
-// It obtains a session token via PUT, then uses it to GET the specified metadata URL.
-// Both URLs must be hardcoded IMDS link-local addresses (169.254.169.254).
-func imdsV2Get(client *http.Client, metadataURL string) (string, error) {
-	// Step 1: Obtain IMDSv2 session token
+// imdsV2Token obtains an IMDSv2 session token via PUT.
+// The token can be reused across multiple imdsV2GetWithToken calls to avoid
+// redundant token requests (each PUT is an HTTP round-trip to the link-local address).
+func imdsV2Token(client *http.Client) (string, error) {
 	tokenReq, err := http.NewRequest(http.MethodPut, "http://169.254.169.254/latest/api/token", nil)
 	if err != nil {
 		return "", fmt.Errorf("create token request: %w", err)
@@ -811,9 +842,12 @@ func imdsV2Get(client *http.Client, metadataURL string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read IMDS token: %w", err)
 	}
-	token := string(tokenBody)
+	return string(tokenBody), nil
+}
 
-	// Step 2: Fetch metadata using the token
+// imdsV2GetWithToken fetches a metadata value using a pre-obtained IMDSv2 token.
+// The metadataURL must be a hardcoded IMDS link-local address (169.254.169.254).
+func imdsV2GetWithToken(client *http.Client, token, metadataURL string) (string, error) {
 	metaReq, err := http.NewRequest(http.MethodGet, metadataURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("create metadata request: %w", err)

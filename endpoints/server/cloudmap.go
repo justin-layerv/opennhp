@@ -49,6 +49,7 @@ const (
 	CloudMapAttrAZ   = "AVAILABILITY_ZONE"
 	CloudMapAttrPort = "NHP_PORT"
 	CloudMapAttrKey  = "PUBLIC_KEY"
+	CloudMapAttrASG  = "ASG_NAME"
 )
 
 // HealthChecker is the interface for checking server health.
@@ -295,6 +296,7 @@ func (c *CloudMapClient) refreshInstancesCache() ([]ServerInfo, error) {
 			AZ:         inst.Attributes[CloudMapAttrAZ],
 			Port:       port,
 			PubKey:     inst.Attributes[CloudMapAttrKey],
+			ASGName:    inst.Attributes[CloudMapAttrASG],
 		}
 		servers = append(servers, srv)
 	}
@@ -395,4 +397,40 @@ func FilterHealthyServers(ctx context.Context, healthChecker HealthChecker, serv
 
 	log.Debug("Health filter: %d/%d servers healthy", len(healthy), len(servers))
 	return healthy
+}
+
+// filterServersByASG filters servers to only those in the same ASG as this server.
+// This prevents blue/green cross-color assignment during deploys where both ASGs
+// register instances in the same CloudMap service.
+//
+// Returns the filtered list and a bool indicating whether fail-open was triggered
+// (all servers were cross-color, so the original list was returned unfiltered).
+//
+// Backward-compat rules (fail-open):
+//   - selfASG == "": this server doesn't know its ASG (IMDS failed) → no filtering
+//   - srv.ASGName == "": that server hasn't been updated yet → include it (gradual rollout)
+//   - No matches after filtering: edge case safety → return all servers
+func filterServersByASG(servers []ServerInfo, selfASG string) ([]ServerInfo, bool) {
+	if selfASG == "" {
+		return servers, false
+	}
+	filtered := make([]ServerInfo, 0, len(servers))
+	for _, srv := range servers {
+		if srv.ASGName == selfASG || srv.ASGName == "" {
+			filtered = append(filtered, srv)
+		}
+	}
+	if len(filtered) == 0 {
+		if len(servers) == 0 {
+			return servers, false
+		}
+		log.Info("ASG filter: all %d servers are cross-color (selfASG=%s), failing open", len(servers), selfASG)
+		return servers, true
+	}
+	if len(filtered) < len(servers) {
+		log.Info("ASG filter: %d/%d servers match ASG %s (removed %d cross-color)", len(filtered), len(servers), selfASG, len(servers)-len(filtered))
+	} else {
+		log.Debug("ASG filter: %d/%d servers match ASG %s", len(filtered), len(servers), selfASG)
+	}
+	return filtered, false
 }

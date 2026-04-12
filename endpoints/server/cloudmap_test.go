@@ -447,6 +447,159 @@ func TestFilterHealthyServers_ConcurrentAccess(t *testing.T) {
 }
 
 // ============================================================================
+// filterServersByASG Tests
+// ============================================================================
+
+func TestFilterServersByASG_EmptySelfASG(t *testing.T) {
+	// When this server doesn't know its ASG (IMDS failed), no filtering occurs
+	servers := []ServerInfo{
+		{ID: "srv-1", IP: "10.0.0.1", ASGName: "blue-asg"},
+		{ID: "srv-2", IP: "10.0.0.2", ASGName: "green-asg"},
+	}
+	result, failOpen := filterServersByASG(servers, "")
+	if len(result) != 2 {
+		t.Errorf("Expected 2 servers (no filtering), got %d", len(result))
+	}
+	if failOpen {
+		t.Error("Expected failOpen=false when selfASG is empty")
+	}
+}
+
+func TestFilterServersByASG_MatchesSameASG(t *testing.T) {
+	servers := []ServerInfo{
+		{ID: "srv-1", IP: "10.0.0.1", ASGName: "layerv-nhp-sandbox-server"},
+		{ID: "srv-2", IP: "10.0.0.2", ASGName: "layerv-nhp-sandbox-server"},
+		{ID: "srv-3", IP: "10.0.0.3", ASGName: "layerv-nhp-sandbox-server-green"},
+		{ID: "srv-4", IP: "10.0.0.4", ASGName: "layerv-nhp-sandbox-server-green"},
+	}
+	result, failOpen := filterServersByASG(servers, "layerv-nhp-sandbox-server")
+	if len(result) != 2 {
+		t.Errorf("Expected 2 same-ASG servers, got %d", len(result))
+	}
+	if failOpen {
+		t.Error("Expected failOpen=false when same-ASG servers exist")
+	}
+	for _, srv := range result {
+		if srv.ASGName != "layerv-nhp-sandbox-server" {
+			t.Errorf("Expected ASG 'layerv-nhp-sandbox-server', got %q for server %s", srv.ASGName, srv.ID)
+		}
+	}
+}
+
+func TestFilterServersByASG_IncludesEmptyASGServers(t *testing.T) {
+	// Servers without ASGName (not yet updated) should be included for gradual rollout
+	servers := []ServerInfo{
+		{ID: "srv-1", IP: "10.0.0.1", ASGName: "layerv-nhp-sandbox-server"},
+		{ID: "srv-2", IP: "10.0.0.2", ASGName: ""},
+		{ID: "srv-3", IP: "10.0.0.3", ASGName: "layerv-nhp-sandbox-server-green"},
+	}
+	result, failOpen := filterServersByASG(servers, "layerv-nhp-sandbox-server")
+	if len(result) != 2 {
+		t.Errorf("Expected 2 servers (same ASG + empty ASG), got %d", len(result))
+	}
+	if failOpen {
+		t.Error("Expected failOpen=false when matching servers exist")
+	}
+	for _, srv := range result {
+		if srv.ASGName != "layerv-nhp-sandbox-server" && srv.ASGName != "" {
+			t.Errorf("Unexpected server %s with ASG %q in results", srv.ID, srv.ASGName)
+		}
+	}
+}
+
+func TestFilterServersByASG_FailOpenWhenAllCrossColor(t *testing.T) {
+	// If filtering would remove ALL servers, fail-open and return all
+	servers := []ServerInfo{
+		{ID: "srv-1", IP: "10.0.0.1", ASGName: "layerv-nhp-sandbox-server-green"},
+		{ID: "srv-2", IP: "10.0.0.2", ASGName: "layerv-nhp-sandbox-server-green"},
+	}
+	result, failOpen := filterServersByASG(servers, "layerv-nhp-sandbox-server")
+	if len(result) != 2 {
+		t.Errorf("Expected 2 servers (fail-open), got %d", len(result))
+	}
+	if !failOpen {
+		t.Error("Expected failOpen=true when all servers are cross-color")
+	}
+}
+
+func TestFilterServersByASG_EmptyServerList(t *testing.T) {
+	// Empty input with non-empty selfASG should return empty, failOpen=false
+	// (nothing to fail-open to — caller pre-screens empty in autoAssignAC).
+	result, failOpen := filterServersByASG([]ServerInfo{}, "layerv-nhp-sandbox-server")
+	if len(result) != 0 {
+		t.Errorf("Expected 0 servers, got %d", len(result))
+	}
+	if failOpen {
+		t.Error("Expected failOpen=false for empty input")
+	}
+}
+
+func TestFilterServersByASG_NilServerList(t *testing.T) {
+	// nil slice behaves the same as empty — range is safe, len is 0
+	result, failOpen := filterServersByASG(nil, "layerv-nhp-sandbox-server")
+	if len(result) != 0 {
+		t.Errorf("Expected 0 servers, got %d", len(result))
+	}
+	if failOpen {
+		t.Error("Expected failOpen=false for nil input")
+	}
+}
+
+func TestFilterServersByASG_AllPeersEmptyASG(t *testing.T) {
+	// Gradual rollout midpoint: this server is updated (has ASGName) but all
+	// peers are still on old code (empty ASGName). All should be included.
+	servers := []ServerInfo{
+		{ID: "srv-1", IP: "10.0.0.1", ASGName: ""},
+		{ID: "srv-2", IP: "10.0.0.2", ASGName: ""},
+		{ID: "srv-3", IP: "10.0.0.3", ASGName: ""},
+	}
+	result, failOpen := filterServersByASG(servers, "layerv-nhp-sandbox-server")
+	if len(result) != 3 {
+		t.Errorf("Expected 3 servers (all included via empty ASGName), got %d", len(result))
+	}
+	if failOpen {
+		t.Error("Expected failOpen=false when peers match via empty ASGName")
+	}
+}
+
+func TestFilterServersByASG_AllSameASG(t *testing.T) {
+	// Prod scenario: single ASG, all servers match — no-op
+	servers := []ServerInfo{
+		{ID: "srv-1", IP: "10.0.0.1", ASGName: "layerv-nhp-prod-server"},
+		{ID: "srv-2", IP: "10.0.0.2", ASGName: "layerv-nhp-prod-server"},
+		{ID: "srv-3", IP: "10.0.0.3", ASGName: "layerv-nhp-prod-server"},
+	}
+	result, failOpen := filterServersByASG(servers, "layerv-nhp-prod-server")
+	if len(result) != 3 {
+		t.Errorf("Expected 3 servers (all same ASG), got %d", len(result))
+	}
+	if failOpen {
+		t.Error("Expected failOpen=false when all servers match")
+	}
+}
+
+func TestFilterServersByASG_SingleMatch(t *testing.T) {
+	// During scale-in, only 1 server may match the ASG. Verify the filter
+	// returns a single-element slice (not fail-open to all).
+	servers := []ServerInfo{
+		{ID: "srv-1", IP: "10.0.0.1", ASGName: "layerv-nhp-sandbox-server"},
+		{ID: "srv-2", IP: "10.0.0.2", ASGName: "layerv-nhp-sandbox-server-green"},
+		{ID: "srv-3", IP: "10.0.0.3", ASGName: "layerv-nhp-sandbox-server-green"},
+		{ID: "srv-4", IP: "10.0.0.4", ASGName: "layerv-nhp-sandbox-server-green"},
+	}
+	result, failOpen := filterServersByASG(servers, "layerv-nhp-sandbox-server")
+	if len(result) != 1 {
+		t.Errorf("Expected 1 server (single match), got %d", len(result))
+	}
+	if failOpen {
+		t.Error("Expected failOpen=false when a match exists")
+	}
+	if result[0].ID != "srv-1" {
+		t.Errorf("Expected srv-1, got %s", result[0].ID)
+	}
+}
+
+// ============================================================================
 // Integration Test Scenarios (Documented for Manual Testing)
 // ============================================================================
 //

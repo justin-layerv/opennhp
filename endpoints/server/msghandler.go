@@ -63,6 +63,7 @@ const (
 	MetricBroadcastPartialFail         = "BroadcastPartialFail"
 	MetricBroadcastDurationMs          = "BroadcastDurationMs"
 	MetricLicenseValidationRateLimited = "LicenseValidationRateLimited"
+	MetricASGFilterFailOpen            = "ASGFilterFailOpen"
 )
 
 // Multi-AC broadcast observability metric names (issue #376).
@@ -602,8 +603,24 @@ func (s *UdpServer) autoAssignAC(
 		return false, nil
 	}
 
+	// Filter to same-ASG servers to prevent blue/green cross-color assignment.
+	// Must happen before selectServersForAssignment but after DiscoverServerInstances
+	// because the CloudMap cache is also used by HTTP forwarding where cross-color
+	// forwarding is legitimate during transitions.
+	var asgFailOpen bool
+	allServers, asgFailOpen = filterServersByASG(allServers, s.asgName)
+	if asgFailOpen && s.metrics != nil {
+		s.metrics.IncrCounter(MetricASGFilterFailOpen)
+	}
+
 	// Select up to 3 servers with AZ distribution, ensuring this server is included
 	selected := s.selectServersForAssignment(allServers, MaxServersPerAssignment)
+
+	// Strip ASGName from selected servers before persisting — it's a server-side
+	// filtering concern, not needed by ACs or in DynamoDB.
+	for i := range selected {
+		selected[i].ASGName = ""
+	}
 
 	// Build assignment. When replacing an existing (expired/stale) assignment,
 	// use its version + 1 so the conditional write succeeds against the existing item.
