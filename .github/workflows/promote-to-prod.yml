@@ -1042,7 +1042,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload plan artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tfplan-prod
           path: terraform/environments/prod/tfplan
@@ -1059,35 +1059,35 @@ jobs:
         run: terraform show -json tfplan > tfplan.json
 
       - name: Upload plan JSON artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tfplan-prod-json
           path: terraform/environments/prod/tfplan.json
           retention-days: 1
 
       - name: Upload Lambda build artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lambda-acme-cert
           path: terraform/modules/acme-cert/build/lambda-acme-cert.zip
           retention-days: 1
 
       - name: Upload canary orchestrator Lambda
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lambda-canary-orchestrator
           path: terraform/modules/canary-deployment/lambda/canary_orchestrator.zip
           retention-days: 1
 
       - name: Upload playground proxy Lambda
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lambda-playground-proxy
           path: terraform/modules/developer-portal/lambda/playground_proxy.zip
           retention-days: 1
 
       - name: Upload custom domain cert Lambda
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lambda-custom-domain-cert
           path: terraform/modules/custom-domain-cert/build/lambda-custom-domain-cert.zip
