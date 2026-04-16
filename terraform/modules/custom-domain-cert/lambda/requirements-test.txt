@@ -8,6 +8,6 @@
 # and so that an upstream pytest/boto3 release can't cause a surprise
 # test failure during a security-critical merge window.
 
-pytest==8.3.4
+pytest==9.0.3
 boto3==1.36.7
 botocore==1.36.7
