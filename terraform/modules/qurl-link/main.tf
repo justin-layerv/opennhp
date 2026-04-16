@@ -17,10 +17,6 @@ terraform {
 }
 
 locals {
-  # Extract the origin (scheme + host) from the resolve URL for the CSP form-action directive.
-  # e.g., "https://resolve.qurl.link.layerv.xyz/plugins/qurl" → "https://resolve.qurl.link.layerv.xyz"
-  resolve_origin = regex("^(https://[^/]+)", var.nhp_resolve_url)[0]
-
   # Generate the redirect page HTML with the configured resolve URL
   index_html = <<-HTML
 <!DOCTYPE html>
@@ -268,7 +264,15 @@ resource "aws_cloudfront_response_headers_policy" "qurl_link" {
 
   security_headers_config {
     content_security_policy {
-      content_security_policy = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; form-action 'self' ${local.resolve_origin}"
+      # No form-action directive: the SPA submits a form POST to the NHP resolve
+      # endpoint, which responds with a 302 to the protected resource host
+      # (*.qurl.site.<env> or a customer-registered custom domain). Browsers
+      # enforce form-action on every hop of the redirect chain per the CSP spec,
+      # and custom domains are dynamic — they can't be enumerated in a static
+      # allowlist — so restricting form-action here breaks the post-resolve
+      # redirect. Auth is gated by the NHP knock (source-IP firewall open) plus
+      # the qurl-router authorize check at the resource host, not by this CSP.
+      content_security_policy = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
       override                = true
     }
     strict_transport_security {
