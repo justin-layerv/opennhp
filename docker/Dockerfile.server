@@ -1,6 +1,6 @@
 # Multi-stage build for NHP Server
 # Stage 1: Build the NHP server binary
-ARG GO_VERSION=1.25.8
+ARG GO_VERSION=1.25.9
 FROM golang:${GO_VERSION}-bookworm AS builder
 
 WORKDIR /nhp-server

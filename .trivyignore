@@ -63,6 +63,15 @@ CVE-2026-32305
 # https://avd.aquasec.com/nvd/cve-2026-34986
 CVE-2026-34986
 
+# Go stdlib CVEs in vendored Traefik v3.6.12 binary (Dockerfile.ac.aws).
+# Our binaries are built with Go 1.25.9 (which fixes both CVEs), but the
+# pre-built Traefik binary was compiled with Go 1.25.8. Wait for a Traefik
+# release built with Go >= 1.25.9 to remove these entries.
+# https://avd.aquasec.com/nvd/cve-2026-32280
+CVE-2026-32280
+# https://avd.aquasec.com/nvd/cve-2026-32282
+CVE-2026-32282
+
 # go.opentelemetry.io/otel/sdk - FALSE POSITIVE
 # CVE-2026-39883 (PATH hijacking via kenv on BSD) is fixed in v1.43.0.
 # We are on v1.43.0. Trivy's database incorrectly flags it — the affected
