@@ -879,6 +879,21 @@ jobs:
       # Runs whenever servers were deployed, regardless of whether ACs were
       # also deployed. Server-only deploys still switch the server NLB,
       # leaving ACs connected to old servers via stale UDP sessions.
+      # Clear stale AC-to-server assignments from DynamoDB before restarting
+      # ACs. Without this, the restarted AC process retains its old
+      # assignedServers state (pointing to blue server private IPs) and
+      # never reconnects through the NLB to green servers. This caused
+      # 7 consecutive deploy failures between 2026-04-11 and 2026-04-16.
+      - name: "[AC] Clear DynamoDB AC Assignments (stale server IPs)"
+        if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run != true
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          CELL_ID="cell0"  # Single cell today; parameterize when multi-cell ships
+          chmod +x .github/scripts/clear-ac-assignments.sh
+          .github/scripts/clear-ac-assignments.sh "$ENVIRONMENT" "$CELL_ID"
+
       - name: "[AC] Restart nhp-acd to Reconnect to New Servers"
         if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run != true
         env:
