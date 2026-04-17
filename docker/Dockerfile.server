@@ -5,8 +5,14 @@ FROM golang:${GO_VERSION}-bookworm AS builder
 
 WORKDIR /nhp-server
 
-# Install build dependencies (minimal - no CGO needed)
-RUN apt-get update && apt-get install -y \
+# Install build dependencies (minimal - no CGO needed).
+# -o Acquire::Retries=3 + short timeout so a transient APT mirror
+# outage retries instead of failing the Docker build. This stage hits
+# deb.debian.org (golang:bookworm base); the runtime stage's
+# ubuntu:24.04 apt calls apply the same hardening. See Dockerfile.ac.aws
+# for the CI-flake instance (run 24548987311) that motivated this.
+RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
+    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y \
     make \
     && rm -rf /var/lib/apt/lists/*
 
@@ -32,8 +38,8 @@ RUN make init serverd
 FROM ubuntu:24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && \
-    apt-get install -y \
+RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
+    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y \
     ca-certificates \
     iptables \
     ipset \

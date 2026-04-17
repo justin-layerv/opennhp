@@ -7,8 +7,15 @@ FROM golang:${GO_VERSION}-bookworm AS builder
 
 WORKDIR /nhp-server
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y \
+# Install build dependencies.
+# -o Acquire::Retries=3 + short timeout so a transient APT mirror
+# outage retries instead of failing the whole Docker build. This
+# stage uses deb.debian.org (golang:bookworm base) but the flags
+# are mirror-agnostic — the runtime stage's ubuntu:24.04 apt calls
+# apply the same hardening. Real CI flake: see run 24548987311
+# (2026-04-17), archive.ubuntu.com outage in the runtime stage.
+RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
+    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y \
     make \
     clang \
     llvm \
@@ -33,14 +40,18 @@ FROM ubuntu:24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && \
-    apt-get install -y \
+# All runtime apt packages in one layer:
+#   ca-certificates, iptables, ipset, curl, file, supervisor — base
+#   gettext-base — provides envsubst used by the entrypoint script below
+RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
+    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y \
     ca-certificates \
     iptables \
     ipset \
     curl \
     file \
     supervisor \
+    gettext-base \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Traefik v3 with retry logic for GitHub rate limits
@@ -196,9 +207,6 @@ chmod 600 /acme/acme.json
 exec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
 ENTRYPOINT
 RUN chmod +x /entrypoint.sh
-
-# Install envsubst
-RUN apt-get update && apt-get install -y gettext-base && rm -rf /var/lib/apt/lists/*
 
 # Expose ports
 # 443: HTTPS (Traefik TLS termination)
