@@ -12,6 +12,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 )
 
 // ssm_probe.go is the single place in the smoke suite that sends SSM
@@ -180,17 +181,18 @@ func sendShellScript(ctx context.Context, instanceID, cmd string) (string, error
 			continue
 		}
 
-		status := string(getResp.Status)
-		switch status {
-		case "Success":
+		switch getResp.Status {
+		case ssmtypes.CommandInvocationStatusSuccess:
 			return strings.TrimSpace(aws.ToString(getResp.StandardOutputContent)), nil
-		case "Failed", "Cancelled", "TimedOut":
+		case ssmtypes.CommandInvocationStatusFailed,
+			ssmtypes.CommandInvocationStatusCancelled,
+			ssmtypes.CommandInvocationStatusTimedOut:
 			return "", fmt.Errorf("ssm command %s status=%s stderr=%q",
-				cmdID, status, aws.ToString(getResp.StandardErrorContent))
+				cmdID, getResp.Status, aws.ToString(getResp.StandardErrorContent))
 		}
 
 		if time.Now().After(deadline) {
-			return "", fmt.Errorf("ssm command %s timed out in status=%s", cmdID, status)
+			return "", fmt.Errorf("ssm command %s timed out in status=%s", cmdID, getResp.Status)
 		}
 		if wait < maxWait {
 			wait *= 2

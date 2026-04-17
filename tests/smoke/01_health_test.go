@@ -162,7 +162,7 @@ func TestHealthKnockReady_ReflectsACPeerCount(t *testing.T) {
 
 		var parsed healthReadyResponse
 		if err := json.Unmarshal(body, &parsed); err != nil {
-			return fmt.Errorf("parse body: %v; body=%s", err, truncate(body, 256))
+			return fmt.Errorf("parse body: %w; body=%s", err, truncate(body, 256))
 		}
 
 		ac, ok := parsed.Checks["ac_peers"]

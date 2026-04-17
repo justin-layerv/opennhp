@@ -101,6 +101,34 @@ linters:
           - gosec
         text: "G306:"
         path: "endpoints/server/webrtcserver\\.go"
+      # Smoke tests are a trusted CI harness: URLs come from TestConfig
+      # (env vars + derived defaults), not untrusted input.
+      #
+      # G107 fires on variable URLs in client.Do(req) — that's the whole
+      # point of the suite.
+      #
+      # G704 is catalog-defined as "errors unhandled" but the installed
+      # gosec version emits it on the same client.Do(req) pattern with the
+      # message "SSRF via taint analysis"; the errors ARE handled at every
+      # call site, so suppress alongside G107.
+      #
+      # The _test.go exclusion above covers the actual test files; these
+      # are the shared harness helpers.
+      - linters:
+          - gosec
+        text: "G107:"
+        path: "tests/smoke/"
+      - linters:
+          - gosec
+        text: "G704:"
+        path: "tests/smoke/"
+      # G117 fires because the struct field receives an OAuth access
+      # token from Auth0. The field name is the correct domain term —
+      # renaming it to hide from the linter would be worse.
+      - linters:
+          - gosec
+        text: "G117:"
+        path: "tests/smoke/auth0\\.go"
     paths:
       - "nhp/core/wasm/policy/"  # Exclude generated WASM policy code
       - "third_party/"

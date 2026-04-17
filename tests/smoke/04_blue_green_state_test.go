@@ -142,7 +142,7 @@ func TestBlueGreen_ActiveListenersPointToActiveColorTGs(t *testing.T) {
 				ListenerArns: []string{listenerARN},
 			})
 			if err != nil {
-				return fmt.Errorf("%s: describe listener %s: %v", c.label, listenerARN, err)
+				return fmt.Errorf("%s: describe listener %s: %w", c.label, listenerARN, err)
 			}
 			if len(resp.Listeners) == 0 {
 				return fmt.Errorf("%s: listener %s not found", c.label, listenerARN)

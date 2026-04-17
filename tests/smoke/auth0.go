@@ -14,7 +14,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
-	"github.com/aws/aws-sdk-go-v2/service/ssm/types"
+	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 )
 
 // Auth0 M2M token cost mitigation: rather than minting a fresh bearer
@@ -117,7 +117,7 @@ func writeTokenCache(ctx context.Context, cfg *TestConfig, token string, expires
 	if _, err := cfg.SSMClient.PutParameter(ctx, &ssm.PutParameterInput{
 		Name:      aws.String(tokenParam),
 		Value:     aws.String(token),
-		Type:      types.ParameterTypeSecureString,
+		Type:      ssmtypes.ParameterTypeSecureString,
 		Overwrite: aws.Bool(true),
 	}); err != nil {
 		return fmt.Errorf("put token: %w", err)
@@ -126,7 +126,7 @@ func writeTokenCache(ctx context.Context, cfg *TestConfig, token string, expires
 	if _, err := cfg.SSMClient.PutParameter(ctx, &ssm.PutParameterInput{
 		Name:      aws.String(expParam),
 		Value:     aws.String(expiresAt.UTC().Format(time.RFC3339)),
-		Type:      types.ParameterTypeString,
+		Type:      ssmtypes.ParameterTypeString,
 		Overwrite: aws.Bool(true),
 	}); err != nil {
 		return fmt.Errorf("put expiry: %w", err)

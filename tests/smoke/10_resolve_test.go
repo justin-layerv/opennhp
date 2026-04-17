@@ -139,9 +139,9 @@ func resolveWithRetries(ctx context.Context, t *testing.T, mintFunc func() *QURL
 			lastErr = fmt.Errorf("attempt %d: transport error: %w", attempt, err)
 			t.Logf("resolveWithRetries: %v", lastErr)
 		} else {
-			// Drain body before cancelling the context so the
+			// Drain body before canceling the context so the
 			// connection returns to the pool instead of being torn
-			// down by the cancelled context.
+			// down by the canceled context.
 			_, _ = io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 			cancel()
