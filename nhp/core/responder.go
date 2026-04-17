@@ -120,11 +120,11 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 		if err != nil {
 			return nil, fmt.Errorf("failed to create chain hash: %w", err)
 		}
-		ppd.chainHash.Write([]byte(InitialHashString))
+		ppd.chainHash.Write(initialHashBytes)
 
 		// init chain key -> ChainKey0
 		ppd.noise.HashType = ppd.Ciphers.HashType
-		ppd.noise.MixKey(&ppd.chainKey, ppd.chainHash.Sum(nil), []byte(InitialChainKeyString))
+		ppd.noise.MixKey(&ppd.chainKey, ppd.chainHash.Sum(nil), initialChainKeyBytes)
 	}
 
 	ppd.HeaderType, ppd.BodySize = ppd.header.TypeAndPayloadSize()
@@ -134,7 +134,7 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 	if err != nil {
 		return nil, fmt.Errorf("failed to create hmac hash: %w", err)
 	}
-	ppd.hmacHash.Write([]byte(InitialHashString))
+	ppd.hmacHash.Write(initialHashBytes)
 
 	// evolve hmac hash HmacHash0 -> HmacHash1
 	ppd.hmacHash.Write(ppd.deviceEcdh.PublicKey())
@@ -206,7 +206,7 @@ func (ppd *PacketParserData) deriveMsgAssemblerData(t int, compress bool, messag
 	if err != nil {
 		return nil, fmt.Errorf("failed to create chain hash: %w", err)
 	}
-	mad.chainHash.Write([]byte(InitialHashString))
+	mad.chainHash.Write(initialHashBytes)
 
 	// continue with responder's chain key -> ChainKey4
 	mad.noise.HashType = ppd.Ciphers.HashType

@@ -137,11 +137,11 @@ func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err
 		if err != nil {
 			return nil, fmt.Errorf("failed to create chain hash: %w", err)
 		}
-		mad.chainHash.Write([]byte(InitialHashString))
+		mad.chainHash.Write(initialHashBytes)
 
 		// init chain key -> ChainKey0
 		mad.noise.HashType = mad.ciphers.HashType
-		mad.noise.MixKey(&mad.chainKey, mad.chainHash.Sum(nil), []byte(InitialChainKeyString))
+		mad.noise.MixKey(&mad.chainKey, mad.chainHash.Sum(nil), initialChainKeyBytes)
 	}
 
 	// init timestamp
@@ -155,7 +155,7 @@ func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err
 	if err != nil {
 		return nil, fmt.Errorf("failed to create hmac hash: %w", err)
 	}
-	mad.hmacHash.Write([]byte(InitialHashString))
+	mad.hmacHash.Write(initialHashBytes)
 
 	// create ephermeral key
 	ephermalEccType := mad.ciphers.EccType
@@ -188,7 +188,7 @@ func (mad *MsgAssemblerData) derivePacketParserData(pkt *Packet, initTime int64)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create chain hash: %w", err)
 	}
-	ppd.chainHash.Write([]byte(InitialHashString))
+	ppd.chainHash.Write(initialHashBytes)
 
 	// continue with initiator's chain key -> ChainKey4
 	ppd.noise.HashType = mad.ciphers.HashType

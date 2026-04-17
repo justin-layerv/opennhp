@@ -254,3 +254,27 @@ func TestECDHSharedSecret(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// Noise init material
+// ---------------------------------------------------------------------------
+
+// TestNoiseInitBytesMatchStrings guards the byte-identity invariant between
+// the exported string constants and the precomputed []byte slices used on
+// the crypto hot path. Divergence (e.g. a future refactor that swaps the
+// initializer) would silently change the noise handshake for every packet;
+// this test catches that at test time.
+//
+// Transposition between initialHashBytes and initialChainKeyBytes at a use
+// site is separately covered by TestDecryptBodyRoundTrip in
+// decryptbody_test.go — any swap fails HMAC validation on decrypt.
+func TestNoiseInitBytesMatchStrings(t *testing.T) {
+	if !bytes.Equal(initialHashBytes, []byte(InitialHashString)) {
+		t.Fatalf("initialHashBytes diverged from InitialHashString: got %q want %q",
+			initialHashBytes, InitialHashString)
+	}
+	if !bytes.Equal(initialChainKeyBytes, []byte(InitialChainKeyString)) {
+		t.Fatalf("initialChainKeyBytes diverged from InitialChainKeyString: got %q want %q",
+			initialChainKeyBytes, InitialChainKeyString)
+	}
+}

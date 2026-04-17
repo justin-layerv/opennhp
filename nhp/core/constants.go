@@ -64,3 +64,18 @@ const (
 	InitialChainKeyString = "NHP keygen v.20230421@clouddeep.cn"
 	InitialHashString     = "NHP hashgen v.20230421@deepcloudsdp.com"
 )
+
+// Precomputed []byte views of the noise init strings. Both values are written
+// into hash.Hash.Write / MixKey on every packet encrypt and decrypt, and the
+// (string -> []byte) conversion otherwise allocates a fresh copy per packet.
+// Keeping the package-level slices read-only avoids that per-packet allocation
+// in the hot crypto path.
+//
+// Unexported on purpose: these hold cryptographic init material, and Go has no
+// immutable slices — exporting them would let any importer silently corrupt
+// every subsequent handshake via core.InitialHashBytes[0] = 0xFF. External
+// callers that need the value can still use the exported string constants.
+var (
+	initialHashBytes     = []byte(InitialHashString)
+	initialChainKeyBytes = []byte(InitialChainKeyString)
+)
