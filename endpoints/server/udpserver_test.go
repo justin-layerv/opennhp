@@ -1431,3 +1431,180 @@ func TestHandleACOnline_MalformedBodyEmitsFailureMetric(t *testing.T) {
 		t.Errorf("MetricACRegistrationSuccess = %v, want 0 on failure path", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// BlockAddr: IsBlockAddr / isBlockAddrStr / AddBlockAddr / RefreshBlockAddr
+// ---------------------------------------------------------------------------
+
+// newBlockAddrTestServer returns a minimally-initialized UdpServer suitable
+// for exercising the block-address map in isolation (no network, no routines).
+// Only blockAddrMap is initialized — other maps (remoteConnectionMap,
+// authServiceMap, …) are nil and will panic if touched, so this helper is
+// scoped to block-address tests only.
+func newBlockAddrTestServer() *UdpServer {
+	return &UdpServer{
+		blockAddrMap: make(map[string]*BlockAddr),
+	}
+}
+
+func mustResolveUDP(t *testing.T, hostport string) *net.UDPAddr {
+	t.Helper()
+	addr, err := net.ResolveUDPAddr("udp", hostport)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr(%q): %v", hostport, err)
+	}
+	return addr
+}
+
+func TestIsBlockAddr_Empty(t *testing.T) {
+	t.Parallel()
+	s := newBlockAddrTestServer()
+	addr := mustResolveUDP(t, "203.0.113.1:62206")
+	if s.IsBlockAddr(addr) {
+		t.Fatal("expected empty map to report address not blocked")
+	}
+	if s.isBlockAddrStr(addr.String()) {
+		t.Fatal("isBlockAddrStr should agree with IsBlockAddr on empty map")
+	}
+}
+
+func TestAddBlockAddr_ThenIsBlockAddr(t *testing.T) {
+	t.Parallel()
+	s := newBlockAddrTestServer()
+	addr := mustResolveUDP(t, "203.0.113.2:62206")
+
+	s.AddBlockAddr(addr)
+
+	if !s.IsBlockAddr(addr) {
+		t.Fatal("IsBlockAddr should return true after AddBlockAddr")
+	}
+	if !s.isBlockAddrStr(addr.String()) {
+		t.Fatal("isBlockAddrStr should return true after AddBlockAddr")
+	}
+
+	other := mustResolveUDP(t, "203.0.113.3:62206")
+	if s.IsBlockAddr(other) {
+		t.Fatal("unrelated address should not be reported as blocked")
+	}
+}
+
+func TestIsBlockAddrStr_MatchesIsBlockAddr(t *testing.T) {
+	t.Parallel()
+	// Guards the invariant the refactor relies on: the public and private
+	// forms must agree on blocked/unblocked for any given address.
+	s := newBlockAddrTestServer()
+	blocked := mustResolveUDP(t, "203.0.113.4:62206")
+	unblocked := mustResolveUDP(t, "203.0.113.5:62206")
+
+	s.AddBlockAddr(blocked)
+
+	for _, addr := range []*net.UDPAddr{blocked, unblocked} {
+		if got, want := s.isBlockAddrStr(addr.String()), s.IsBlockAddr(addr); got != want {
+			t.Fatalf("isBlockAddrStr(%s)=%v IsBlockAddr(%s)=%v — must agree",
+				addr, got, addr, want)
+		}
+	}
+}
+
+func TestRefreshBlockAddr_RemovesExpiredOnly(t *testing.T) {
+	t.Parallel()
+	s := newBlockAddrTestServer()
+
+	fresh := mustResolveUDP(t, "203.0.113.6:62206")
+	stale := mustResolveUDP(t, "203.0.113.7:62206")
+
+	// Seed directly to control expireTime — AddBlockAddr uses the real clock.
+	now := time.Now()
+	s.blockAddrMap[fresh.String()] = &BlockAddr{expireTime: now.Add(time.Hour)}
+	s.blockAddrMap[stale.String()] = &BlockAddr{expireTime: now.Add(-time.Hour)}
+
+	s.RefreshBlockAddr()
+
+	if !s.IsBlockAddr(fresh) {
+		t.Fatal("fresh entry should survive RefreshBlockAddr")
+	}
+	if s.IsBlockAddr(stale) {
+		t.Fatal("expired entry should be purged by RefreshBlockAddr")
+	}
+}
+
+// TestIsBlockAddrStr_ConcurrentReaders exercises the sync.RWMutex change:
+// many readers must proceed concurrently without deadlock or data race.
+// Run with `go test -race` to catch locking regressions.
+func TestIsBlockAddrStr_ConcurrentReaders(t *testing.T) {
+	s := newBlockAddrTestServer()
+	addr := mustResolveUDP(t, "203.0.113.8:62206")
+	s.AddBlockAddr(addr)
+	addrStr := addr.String()
+
+	const readers = 32
+	const itersPerReader = 1000
+
+	var wg sync.WaitGroup
+	wg.Add(readers)
+	for i := 0; i < readers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < itersPerReader; j++ {
+				if !s.isBlockAddrStr(addrStr) {
+					t.Errorf("concurrent read saw address as not blocked")
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// TestBlockAddr_ConcurrentReadWrite exercises reads interleaved with writes —
+// the scenario the RWMutex upgrade actually unlocks. A misuse of RLock where
+// Lock is required (or vice versa) would surface as a race under -race here,
+// where the reader-only test cannot catch it.
+//
+// The writer continuously re-seeds already-expired entries under the write
+// lock so RefreshBlockAddr has something to delete on every iteration,
+// exercising the delete-while-read path (not just lock contention).
+//
+// Assertions: this test has no explicit value checks — correctness is
+// validated by the -race detector flagging unsynchronised access. Run with
+// `go test -race` or a regression will pass silently.
+func TestBlockAddr_ConcurrentReadWrite(t *testing.T) {
+	s := newBlockAddrTestServer()
+	probe := mustResolveUDP(t, "203.0.113.9:62206")
+	probeStr := probe.String()
+
+	const iters = 500
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	// Re-seeder: plants stale entries under Lock for Refresh to reap.
+	// Takes the raw mutex directly because AddBlockAddr uses time.Now() and
+	// so can't produce pre-expired entries via the public API.
+	go func() {
+		defer wg.Done()
+		stalePast := time.Now().Add(-time.Hour)
+		for i := 0; i < iters; i++ {
+			staleStr := (&net.UDPAddr{IP: net.IPv4(203, 0, 113, 50), Port: 62206 + (i % 16)}).String()
+			s.blockAddrMapMutex.Lock()
+			s.blockAddrMap[staleStr] = &BlockAddr{expireTime: stalePast}
+			s.blockAddrMapMutex.Unlock()
+		}
+	}()
+	// Refresher: deletes expired entries (write path).
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			s.RefreshBlockAddr()
+		}
+	}()
+	// Reader: hot-path check must not race with either writer.
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			_ = s.isBlockAddrStr(probeStr)
+		}
+	}()
+
+	wg.Wait()
+}

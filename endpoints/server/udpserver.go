@@ -97,7 +97,8 @@ type UdpServer struct {
 	tokenStore *common.TokenStore[*ACTokenEntry]
 
 	// block address management
-	blockAddrMapMutex sync.Mutex
+	// RWMutex so per-packet reads don't serialize with concurrent readers.
+	blockAddrMapMutex sync.RWMutex
 	blockAddrMap      map[string]*BlockAddr // indexed by remote UDP address, need lock for dynamic change
 
 	// address association map
@@ -164,7 +165,6 @@ type UdpServer struct {
 }
 
 type BlockAddr struct {
-	addr       *net.UDPAddr
 	expireTime time.Time
 }
 
@@ -1017,7 +1017,7 @@ func (s *UdpServer) recvPacketRoutine() {
 		}
 
 		// check if it is from blocked address
-		if s.IsBlockAddr(remoteAddr) {
+		if s.isBlockAddrStr(addrStr) {
 			s.device.ReleasePoolPacket(pkt)
 			log.Critical("Remote address %s is being blocked at the moment, discard.", addrStr)
 			continue
@@ -1049,7 +1049,7 @@ func (s *UdpServer) recvPacketRoutine() {
 			// threat plus 1
 			preCheckThreats[addrStr]++
 			if preCheckThreats[addrStr] > PreCheckThreatCountBeforeBlock {
-				s.AddBlockAddr(remoteAddr)
+				s.addBlockAddrStr(addrStr)
 			}
 			s.device.ReleasePoolPacket(pkt)
 			log.Warning("Receive [%s] packet (%s -> %s), precheck error: %v", msgType, addrStr, s.listenAddr.String(), err)
@@ -1257,37 +1257,74 @@ func (s *UdpServer) BlockAddrRefreshRoutine() {
 }
 
 func (s *UdpServer) IsBlockAddr(addr *net.UDPAddr) bool {
-	s.blockAddrMapMutex.Lock()
-	defer s.blockAddrMapMutex.Unlock()
+	return s.isBlockAddrStr(addr.String())
+}
 
-	_, found := s.blockAddrMap[addr.String()]
+// isBlockAddrStr is the string-keyed form of IsBlockAddr, for hot-path reuse
+// when the caller already computed addr.String().
+func (s *UdpServer) isBlockAddrStr(addrStr string) bool {
+	s.blockAddrMapMutex.RLock()
+	defer s.blockAddrMapMutex.RUnlock()
+
+	_, found := s.blockAddrMap[addrStr]
 	return found
 }
 
 func (s *UdpServer) AddBlockAddr(addr *net.UDPAddr) {
+	s.addBlockAddrStr(addr.String())
+}
+
+// addBlockAddrStr is the string-keyed form of AddBlockAddr, for hot-path reuse
+// when the caller already computed addr.String().
+func (s *UdpServer) addBlockAddrStr(addrStr string) {
 	s.blockAddrMapMutex.Lock()
-	defer s.blockAddrMapMutex.Unlock()
+	poolFull := len(s.blockAddrMap) >= MaxConcurrentConnection
+	if !poolFull {
+		s.blockAddrMap[addrStr] = &BlockAddr{time.Now().Add(BlockAddrExpireTime * time.Second)}
+	}
+	s.blockAddrMapMutex.Unlock()
 
-	addrStr := addr.String()
-	log.Critical("add blocking address %s", addrStr)
-
-	if len(s.blockAddrMap) < MaxConcurrentConnection {
-		s.blockAddrMap[addrStr] = &BlockAddr{addr, time.Now().Add(BlockAddrExpireTime * time.Second)}
-	} else {
+	// Log outside the lock so a blocked log I/O (disk pressure, stderr pipe)
+	// can't extend the hold time and stall packet readers.
+	if poolFull {
 		log.Warning("block address pool is full")
+	} else {
+		log.Critical("add blocking address %s", addrStr)
 	}
 }
 
 func (s *UdpServer) RefreshBlockAddr() {
-	s.blockAddrMapMutex.Lock()
-	defer s.blockAddrMapMutex.Unlock()
-
 	now := time.Now()
+
+	// Phase 1: collect expired keys under RLock so concurrent packet readers
+	// (isBlockAddrStr) proceed in parallel with the scan. Under sustained
+	// attack the map can approach MaxConcurrentConnection entries, and the
+	// old single-phase exclusive Lock held during the full iteration would
+	// stall every reader for the duration of the scan.
+	var expired []string
+	s.blockAddrMapMutex.RLock()
 	for k, v := range s.blockAddrMap {
 		if v.expireTime.Before(now) {
+			expired = append(expired, k)
+		}
+	}
+	s.blockAddrMapMutex.RUnlock()
+
+	if len(expired) == 0 {
+		return
+	}
+
+	// Phase 2: delete under exclusive Lock. Re-check expiry in case a key was
+	// re-added between the two critical sections — if AddBlockAddr ran with
+	// the same addrStr, its fresh expireTime would be in the future and we
+	// must not delete it.
+	s.blockAddrMapMutex.Lock()
+	for _, k := range expired {
+		if v, ok := s.blockAddrMap[k]; ok && v.expireTime.Before(now) {
 			delete(s.blockAddrMap, k)
 		}
 	}
+	s.blockAddrMapMutex.Unlock()
 }
 
 func (s *UdpServer) sendMessageRoutine() {
