@@ -9,6 +9,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
@@ -74,11 +75,12 @@ type TestConfig struct {
 	HTTPClient       *http.Client
 	NoRedirectClient *http.Client
 
-	SSMClient *ssm.Client
-	EC2Client *ec2.Client
-	ASGClient *autoscaling.Client
-	CWClient  *cloudwatch.Client
-	ELBClient *elasticloadbalancingv2.Client
+	SSMClient    *ssm.Client
+	EC2Client    *ec2.Client
+	ASGClient    *autoscaling.Client
+	CWClient     *cloudwatch.Client
+	CWLogsClient *cloudwatchlogs.Client
+	ELBClient    *elasticloadbalancingv2.Client
 }
 
 // testConfig is the package-global config populated in TestMain.
@@ -106,6 +108,16 @@ func requireAuth0(t *testing.T) string {
 		t.Fatal("Auth0 token not available — AUTH0_CLIENT_ID/AUTH0_CLIENT_SECRET missing or token fetch failed")
 	}
 	return testConfig.CachedAuth0Token
+}
+
+// requireCWLogs fails the test if the CloudWatch Logs client is not
+// initialized. Setup unconditionally sets this, so nil indicates a
+// broken harness — fail hard, not skip (matches requireAuth0).
+func requireCWLogs(t *testing.T) {
+	t.Helper()
+	if testConfig.CWLogsClient == nil {
+		t.Fatal("CWLogsClient not initialized — setup did not run or AWS config failed")
+	}
 }
 
 // skipIfNoSSMProbes is named "skip..." (not "require...") because

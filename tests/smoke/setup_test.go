@@ -14,6 +14,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
@@ -80,6 +81,7 @@ func TestMain(m *testing.M) {
 	testConfig.EC2Client = ec2.NewFromConfig(awsCfg)
 	testConfig.ASGClient = autoscaling.NewFromConfig(awsCfg)
 	testConfig.CWClient = cloudwatch.NewFromConfig(awsCfg)
+	testConfig.CWLogsClient = cloudwatchlogs.NewFromConfig(awsCfg)
 	testConfig.ELBClient = elasticloadbalancingv2.NewFromConfig(awsCfg)
 
 	// Pre-fetch (or cache-hit) the Auth0 bearer. Failure is non-fatal

@@ -1670,9 +1670,9 @@ jobs:
   # environment. Sibling of qurl-smoke-tests.
   #
   # Rollout posture (matches build-and-push.yml nhp-smoke-sandbox):
-  #   PR1: tier=tier1,            allow_ssm_probes=false (30d SSM burn-in)
-  #   PR2: tier=tier1+tier2,      allow_ssm_probes=false
-  #   PR3: tier=tier1+tier2+tier3-no-ssm, allow_ssm_probes=false
+  #   PR1: tier=tier1,       allow_ssm_probes=false (30d SSM burn-in)
+  #   PR2: tier=tier1+tier2, allow_ssm_probes=false
+  #   PR3: tier=all,         allow_ssm_probes=false (required check)
   #
   # After 30 days of green sandbox runs, smoke-burn-in-unlock.yml
   # auto-opens a PR flipping allow_ssm_probes to true for prod.
@@ -1690,12 +1690,12 @@ jobs:
     uses: ./.github/workflows/nhp-smoke-tests.yml
     with:
       environment: prod
-      # tier1+tier2 runs the Tier 2 HTTP-based tests (resolve,
-      # plugins, internal-api negative fence) in prod. Tier 2's
-      # SSM-dependent tests (knock per-instance) will skip
-      # cleanly because allow_ssm_probes=false. Tier 3 lands in
-      # PR3.
-      tier: tier1+tier2
+      # Tier 3 runs in prod with SSM probes disabled. SSM-dependent
+      # tests (per-instance knock, docker image, ssm runbook) skip
+      # cleanly. The 30-day burn-in unlock workflow will auto-open
+      # a PR to flip allow_ssm_probes to true after 30 days of
+      # green sandbox runs.
+      tier: all
       allow_ssm_probes: false
     secrets:
       AWS_ROLE_ARN: ${{ secrets.AWS_PROD_ROLE_ARN }}
@@ -1822,23 +1822,18 @@ jobs:
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
           QURL_SMOKE_RESULT: ${{ needs.qurl-smoke-tests.result }}
-          # NHP_SMOKE_RESULT is tracked for reporting but intentionally
-          # not included in the FAILED loop below — PR1 ships smoke as
-          # report-only. PR3 moves it into the FAILED loop once the
-          # harness has burned in.
           NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-tests.result }}
           MONITOR_RESULT: ${{ needs.monitor.result }}
         run: |
-          # Check if any non-skipped job failed. nhp-smoke-tests is
-          # deliberately excluded during the PR1/PR2 burn-in.
+          # Check if any non-skipped job failed. As of PR3, nhp-smoke-tests
+          # is included in the FAILED loop — no longer report-only.
           FAILED=false
-          for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_PLAN_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$AC_RESULT" "$QURL_RESULT" "$SMOKE_RESULT" "$QURL_SMOKE_RESULT" "$MONITOR_RESULT"; do
+          for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_PLAN_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$AC_RESULT" "$QURL_RESULT" "$SMOKE_RESULT" "$QURL_SMOKE_RESULT" "$NHP_SMOKE_RESULT" "$MONITOR_RESULT"; do
             if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
               FAILED=true
               break
             fi
           done
-          echo "NHP smoke (informational): $NHP_SMOKE_RESULT"
 
           if [[ "$FAILED" == "true" ]]; then
             echo "status=failed" >> "$GITHUB_OUTPUT"
@@ -2048,7 +2043,7 @@ jobs:
             echo "| Deploy QURL | $(result_emoji "$QURL_RESULT") $QURL_RESULT |"
             echo "| Smoke Test | $(result_emoji "$SMOKE_RESULT") $SMOKE_RESULT |"
             echo "| QURL Smoke Tests | $(result_emoji "$QURL_SMOKE_RESULT") $QURL_SMOKE_RESULT |"
-            echo "| NHP Smoke Tests (report-only) | $(result_emoji "$NHP_SMOKE_RESULT") $NHP_SMOKE_RESULT |"
+            echo "| NHP Smoke Tests | $(result_emoji "$NHP_SMOKE_RESULT") $NHP_SMOKE_RESULT |"
             echo "| Monitor | $(result_emoji "$MONITOR_RESULT") $MONITOR_RESULT |"
             echo ""
             echo "### Deployed Artifacts"

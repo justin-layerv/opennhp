@@ -12,7 +12,8 @@ name: NHP Smoke Tests
 # beyond the AWS OIDC role is needed.
 #
 # PR1 runs tier=tier1 only. PR2 bumps to tier=tier1+tier2. PR3 flips
-# to tier=all and removes continue-on-error from the callers.
+# to tier=all and makes smoke a required signal (the job is in the
+# caller's `needs` array and its result feeds the FAILED check).
 
 on:
   workflow_call:
@@ -67,6 +68,11 @@ on:
         required: false
         type: boolean
         default: true
+      aws_region:
+        description: 'AWS region for the smoke run'
+        required: false
+        type: string
+        default: 'us-east-2'
 
 jobs:
   smoke-test:

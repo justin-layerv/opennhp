@@ -1545,7 +1545,7 @@ jobs:
     uses: ./.github/workflows/nhp-smoke-tests.yml
     with:
       environment: sandbox
-      tier: tier1+tier2
+      tier: all
       allow_ssm_probes: true
     secrets:
       AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
@@ -1569,6 +1569,7 @@ jobs:
       - deploy-sandbox-infra
       - deploy-sandbox-blue-green
       - deploy-sandbox-validate
+      - nhp-smoke-sandbox
     if: always() && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1584,6 +1585,7 @@ jobs:
           SANDBOX_INFRA: ${{ needs.deploy-sandbox-infra.result }}
           SANDBOX_BLUE_GREEN: ${{ needs.deploy-sandbox-blue-green.result }}
           SANDBOX_VALIDATE: ${{ needs.deploy-sandbox-validate.result }}
+          NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-sandbox.result }}
           # Metadata
           IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
           ENVIRONMENT: ${{ needs.setup.outputs.environment }}
@@ -1653,19 +1655,27 @@ jobs:
           # Build component status strings with visual pipeline
           SANDBOX_STATUS=""
           if [[ "$SANDBOX_DEPLOYED" == "true" ]]; then
-            SANDBOX_STATUS="$(status_emoji "$SANDBOX_INFRA") Infra → $(status_emoji "$SANDBOX_BLUE_GREEN") Blue/Green → $(status_emoji "$SANDBOX_VALIDATE") Validate"
+            SANDBOX_STATUS="$(status_emoji "$SANDBOX_INFRA") Infra → $(status_emoji "$SANDBOX_BLUE_GREEN") Blue/Green → $(status_emoji "$SANDBOX_VALIDATE") Validate → $(status_emoji "$NHP_SMOKE_RESULT") Smoke"
           fi
 
           # Determine overall status and header
           if [[ "$BUILD_RESULT" == "success" ]]; then
             # Check for any deploy or validation failures
             DEPLOY_FAILED="false"
-            for result in "$SANDBOX_INFRA" "$SANDBOX_BLUE_GREEN" "$SANDBOX_VALIDATE"; do
+            for result in "$SANDBOX_INFRA" "$SANDBOX_BLUE_GREEN" "$SANDBOX_VALIDATE" "$NHP_SMOKE_RESULT"; do
               if [[ "$result" == "failure" ]]; then
                 DEPLOY_FAILED="true"
                 break
               fi
             done
+            # Smoke is a required signal — a cancelled smoke means we
+            # never confirmed post-deploy health. Treat as failure.
+            # Other components have dedicated cancelled-handling branches
+            # below (infra -> yellow, blue-green -> Notify skipped via
+            # job if:), so only smoke needs this here.
+            if [[ "$NHP_SMOKE_RESULT" == "cancelled" ]]; then
+              DEPLOY_FAILED="true"
+            fi
 
             if [[ "$SANDBOX_VALIDATE" == "success" ]]; then
               COLOR="#36a64f"
