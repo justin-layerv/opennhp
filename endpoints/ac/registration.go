@@ -140,6 +140,7 @@ const (
 // classifyReason passes through; all others map to "other".
 const (
 	ReasonRefreshRedirect         = "refresh_redirect"
+	ReasonRefreshPeerChange       = "refresh_peer_change"
 	ReasonServerConnectionTimeout = "server_connection_timeout"
 	ReasonConnectionTimeout       = "connection_timeout"
 
@@ -248,7 +249,12 @@ func (r *ACRegistration) recordRegistrationSuccess(regType *string) {
 
 // ACRegistration manages AC registration with NHP servers.
 type ACRegistration struct {
-	ac              *UdpAC
+	ac *UdpAC
+	// assignedServers is the current set of servers this AC is connected to.
+	// INVARIANT: replace-only (copy-on-write). Never append or mutate in place —
+	// always assign a new slice. Readers (peersChanged, checkServerHealth, etc.)
+	// snapshot the slice header under RLock and iterate outside the lock, relying
+	// on this invariant for safe concurrent access.
 	assignedServers []*AssignedServer
 	// oldServerSets tracks multiple sets of old servers during overlapping reassignments.
 	// Key is a unique cleanup ID (timestamp-based), value is the servers to clean up.
@@ -1426,6 +1432,25 @@ func (r *ACRegistration) handleRefreshResponse(ppd *core.PacketParserData, serve
 		}
 
 		if common.IsSuccessErrCode(aakMsg.ErrCode) {
+			// If the server included an updated peer list, check whether it
+			// differs from our current assignedServers. A mismatch means the
+			// server reassigned this AC (e.g., after a blue-green switch) and
+			// we need to reconnect to the correct set of servers.
+			// Check before UpdateLastSeen to avoid a wasted write when
+			// re-registration replaces the entire assignedServers slice.
+			//
+			// Validate peers first to avoid spurious re-registration from
+			// malformed entries (same bug class as issue #832).
+			validPeers := filterValidPeers(aakMsg.Peers, sendAddr.String())
+			if len(validPeers) > 0 {
+				if changed, currentAddrs := r.peersChanged(validPeers); changed {
+					log.Info("Refresh NHP_AAK from %s: peer list changed, triggering re-registration (current=%s, new=%s)",
+						sendAddr.String(), currentAddrs, formatPeerAddrs(validPeers))
+					r.TriggerReregistration(ReasonRefreshPeerChange)
+					return
+				}
+			}
+
 			server.UpdateLastSeen()
 			log.Debug("Refreshed registration with server %s", sendAddr.String())
 		} else {
@@ -1441,6 +1466,89 @@ func (r *ACRegistration) handleRefreshResponse(ppd *core.PacketParserData, serve
 	default:
 		log.Warning("Unexpected response type %d from %s during refresh", ppd.HeaderType, sendAddr.String())
 	}
+}
+
+// peersChanged returns true if the server-provided peer list differs from
+// the AC's current assignedServers, plus a formatted string of the current
+// addresses for logging (from the same snapshot, avoiding TOCTOU with the
+// comparison). Comparison is by IP:Port since public keys can rotate
+// independently.
+//
+// Assumes neither list contains duplicate addresses — the server builds
+// peers from DynamoDB assignments which are unique per AC.
+func (r *ACRegistration) peersChanged(peers []common.RedirectTarget) (bool, string) {
+	r.mu.RLock()
+	current := r.assignedServers
+	r.mu.RUnlock()
+
+	// Build a set of current server addresses for O(n) comparison.
+	// net.JoinHostPort handles IPv6 bracket formatting correctly.
+	currentAddrs := make(map[string]struct{}, len(current))
+	for _, s := range current {
+		currentAddrs[net.JoinHostPort(s.Target.IP, strconv.Itoa(s.Target.Port))] = struct{}{}
+	}
+
+	if len(peers) != len(current) {
+		return true, formatAssignedAddrs(current)
+	}
+
+	for _, p := range peers {
+		if _, ok := currentAddrs[net.JoinHostPort(p.IP, strconv.Itoa(p.Port))]; !ok {
+			return true, formatAssignedAddrs(current)
+		}
+	}
+
+	// No change — skip the log-string allocation entirely (99.99% path).
+	return false, ""
+}
+
+// formatAssignedAddrs builds a human-readable address list from the snapshot
+// used by peersChanged. Only called on the change path to avoid allocating
+// on every refresh cycle.
+func formatAssignedAddrs(servers []*AssignedServer) string {
+	addrs := make([]string, len(servers))
+	for i, s := range servers {
+		addrs[i] = net.JoinHostPort(s.Target.IP, strconv.Itoa(s.Target.Port))
+	}
+	return "[" + strings.Join(addrs, ", ") + "]"
+}
+
+// filterValidPeers returns only peers that pass RedirectTarget.Validate().
+// Invalid entries are logged and dropped to prevent malformed peers from
+// causing spurious re-registration on every refresh cycle (see issue #832).
+func filterValidPeers(peers []common.RedirectTarget, source string) []common.RedirectTarget {
+	if len(peers) == 0 {
+		return nil
+	}
+	// First pass: check if all peers are valid (common case — zero alloc).
+	allValid := true
+	for i := range peers {
+		if err := peers[i].Validate(); err != nil {
+			log.Warning("Dropping invalid peer from refresh response (source=%s): %v", source, err)
+			allValid = false
+		}
+	}
+	if allValid {
+		return peers
+	}
+
+	// Second pass: build filtered slice (rare — only when server sends bad data).
+	valid := make([]common.RedirectTarget, 0, len(peers))
+	for i := range peers {
+		if peers[i].Validate() == nil {
+			valid = append(valid, peers[i])
+		}
+	}
+	return valid
+}
+
+// formatPeerAddrs returns a human-readable list of RedirectTarget addresses for logging.
+func formatPeerAddrs(peers []common.RedirectTarget) string {
+	addrs := make([]string, len(peers))
+	for i, p := range peers {
+		addrs[i] = net.JoinHostPort(p.IP, strconv.Itoa(p.Port))
+	}
+	return "[" + strings.Join(addrs, ", ") + "]"
 }
 
 // checkServerHealth checks assigned-server health and triggers re-registration
@@ -1943,6 +2051,7 @@ func classifyError(err error) string {
 func classifyReason(reason string) string {
 	switch reason {
 	case ReasonRefreshRedirect,
+		ReasonRefreshPeerChange,
 		ReasonServerConnectionTimeout,
 		ReasonConnectionTimeout,
 		ReasonAllServersUnconnected,

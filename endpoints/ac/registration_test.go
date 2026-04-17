@@ -92,6 +92,7 @@ func TestClassifyReason(t *testing.T) {
 		expected string
 	}{
 		{"refresh redirect", ReasonRefreshRedirect, ReasonRefreshRedirect},
+		{"refresh peer change", ReasonRefreshPeerChange, ReasonRefreshPeerChange},
 		{"server connection timeout", ReasonServerConnectionTimeout, ReasonServerConnectionTimeout},
 		{"connection timeout", ReasonConnectionTimeout, ReasonConnectionTimeout},
 		{"unknown reason", "some_random_reason", "other"},
@@ -4289,4 +4290,332 @@ func TestACRegistration_KeepaliveResponseValidation(t *testing.T) {
 			t.Error("Stale server should trigger re-registration")
 		}
 	})
+}
+
+// newRegWithServers creates an ACRegistration with pre-populated assignedServers
+// for peersChanged tests. Encapsulates the lock/assign/unlock pattern.
+func newRegWithServers(t *testing.T, acID string, servers []*AssignedServer) *ACRegistration {
+	t.Helper()
+	ac := &UdpAC{
+		config:    &Config{ACId: acID, ServerEndpoint: "server.test"},
+		sendMsgCh: make(chan *core.MsgData, 10),
+	}
+	reg := mustNewACRegistration(t, ac)
+	reg.mu.Lock()
+	reg.assignedServers = servers
+	reg.mu.Unlock()
+	return reg
+}
+
+func TestACRegistration_PeersChanged(t *testing.T) {
+	t.Parallel()
+
+	threeBlue := []*AssignedServer{
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: 62206}},
+		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: 62206}},
+		{Target: common.RedirectTarget{IP: "10.0.0.3", Port: 62206}},
+	}
+
+	tests := []struct {
+		name     string
+		assigned []*AssignedServer
+		peers    []common.RedirectTarget
+		want     bool
+	}{
+		{
+			name:     "same peers",
+			assigned: threeBlue,
+			peers: []common.RedirectTarget{
+				{IP: "10.0.0.1", Port: 62206, PubKeyBase64: "key1"},
+				{IP: "10.0.0.2", Port: 62206, PubKeyBase64: "key2"},
+				{IP: "10.0.0.3", Port: 62206, PubKeyBase64: "key3"},
+			},
+			want: false,
+		},
+		{
+			name:     "different IPs (blue-green switch)",
+			assigned: threeBlue,
+			peers: []common.RedirectTarget{
+				{IP: "10.0.1.1", Port: 62206, PubKeyBase64: "key1"},
+				{IP: "10.0.1.2", Port: 62206, PubKeyBase64: "key2"},
+				{IP: "10.0.1.3", Port: 62206, PubKeyBase64: "key3"},
+			},
+			want: true,
+		},
+		{
+			name: "count mismatch (2 assigned, 3 peers)",
+			assigned: []*AssignedServer{
+				{Target: common.RedirectTarget{IP: "10.0.0.1", Port: 62206}},
+				{Target: common.RedirectTarget{IP: "10.0.0.2", Port: 62206}},
+			},
+			peers: []common.RedirectTarget{
+				{IP: "10.0.0.1", Port: 62206, PubKeyBase64: "key1"},
+				{IP: "10.0.0.2", Port: 62206, PubKeyBase64: "key2"},
+				{IP: "10.0.0.3", Port: 62206, PubKeyBase64: "key3"},
+			},
+			want: true,
+		},
+		{
+			name:     "empty assigned",
+			assigned: nil,
+			peers: []common.RedirectTarget{
+				{IP: "10.0.0.1", Port: 62206, PubKeyBase64: "key1"},
+			},
+			want: true,
+		},
+		{
+			name: "port difference",
+			assigned: []*AssignedServer{
+				{Target: common.RedirectTarget{IP: "10.0.0.1", Port: 62206}},
+			},
+			peers: []common.RedirectTarget{
+				{IP: "10.0.0.1", Port: 62207, PubKeyBase64: "key1"},
+			},
+			want: true,
+		},
+		{
+			name:     "same peers different order",
+			assigned: threeBlue,
+			peers: []common.RedirectTarget{
+				{IP: "10.0.0.3", Port: 62206, PubKeyBase64: "key3"},
+				{IP: "10.0.0.1", Port: 62206, PubKeyBase64: "key1"},
+				{IP: "10.0.0.2", Port: 62206, PubKeyBase64: "key2"},
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			reg := newRegWithServers(t, "test-"+tt.name, tt.assigned)
+			got, addrLog := reg.peersChanged(tt.peers)
+			if got != tt.want {
+				t.Errorf("peersChanged() = %v, want %v", got, tt.want)
+			}
+			if got && addrLog == "" {
+				t.Error("peersChanged() returned changed=true but empty addrLog")
+			}
+		})
+	}
+}
+
+// newAAKPacket marshals a ServerACAckMsg into a PacketParserData for handleRefreshResponse tests.
+func newAAKPacket(t *testing.T, msg common.ServerACAckMsg) *core.PacketParserData {
+	t.Helper()
+	body, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal ServerACAckMsg: %v", err)
+	}
+	return &core.PacketParserData{
+		HeaderType:  core.NHP_AAK,
+		BodyMessage: body,
+	}
+}
+
+// TestHandleRefreshResponse_PeerReconciliation exercises the full
+// handleRefreshResponse → filterValidPeers → peersChanged → TriggerReregistration path.
+func TestHandleRefreshResponse_PeerReconciliation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		assigned         []*AssignedServer
+		aak              common.ServerACAckMsg
+		wantReregistered bool
+	}{
+		{
+			name: "changed peers triggers re-registration",
+			assigned: []*AssignedServer{
+				{Target: common.RedirectTarget{IP: "10.0.0.1", Port: 62206}},
+				{Target: common.RedirectTarget{IP: "10.0.0.2", Port: 62206}},
+				{Target: common.RedirectTarget{IP: "10.0.0.3", Port: 62206}},
+			},
+			aak: common.ServerACAckMsg{
+				ErrCode: common.ErrSuccess.ErrorCode(), Registered: true,
+				Peers: []common.RedirectTarget{
+					{IP: "10.0.1.1", Port: 62206, PubKeyBase64: "greenkey1"},
+					{IP: "10.0.1.2", Port: 62206, PubKeyBase64: "greenkey2"},
+					{IP: "10.0.1.3", Port: 62206, PubKeyBase64: "greenkey3"},
+				},
+			},
+			wantReregistered: true,
+		},
+		{
+			name: "same peers does not trigger re-registration",
+			assigned: []*AssignedServer{
+				{Target: common.RedirectTarget{IP: "10.0.0.1", Port: 62206}},
+				{Target: common.RedirectTarget{IP: "10.0.0.2", Port: 62206}},
+			},
+			aak: common.ServerACAckMsg{
+				ErrCode: common.ErrSuccess.ErrorCode(), Registered: true,
+				Peers: []common.RedirectTarget{
+					{IP: "10.0.0.1", Port: 62206, PubKeyBase64: "key1"},
+					{IP: "10.0.0.2", Port: 62206, PubKeyBase64: "key2"},
+				},
+			},
+			wantReregistered: false,
+		},
+		{
+			name: "no peers falls through to UpdateLastSeen",
+			assigned: []*AssignedServer{
+				{Target: common.RedirectTarget{IP: "10.0.0.1", Port: 62206}},
+			},
+			aak: common.ServerACAckMsg{
+				ErrCode: common.ErrSuccess.ErrorCode(), Registered: true,
+				// Peers intentionally omitted
+			},
+			wantReregistered: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			reg := newRegWithServers(t, "test-"+tt.name, tt.assigned)
+			server := &AssignedServer{Target: tt.assigned[0].Target}
+			sendAddr := &net.UDPAddr{IP: net.ParseIP(tt.assigned[0].Target.IP), Port: tt.assigned[0].Target.Port}
+
+			reg.handleRefreshResponse(newAAKPacket(t, tt.aak), server, sendAddr)
+
+			if got := reg.reregistering.Load(); got != tt.wantReregistered {
+				t.Errorf("reregistering = %v, want %v", got, tt.wantReregistered)
+			}
+		})
+	}
+}
+
+// TestPeersChanged_DuplicatePeers documents the behavior when the server
+// sends duplicate peer addresses. With current=[A,B] and peers=[A,A],
+// len matches (2==2) and both A's are in the set, so peersChanged returns
+// false. This is documented as "assumed not to happen" since DynamoDB
+// assignments are unique, but this test guards the behavior if it ever does.
+func TestPeersChanged_DuplicatePeers(t *testing.T) {
+	t.Parallel()
+
+	reg := newRegWithServers(t, "test-dup-peers", []*AssignedServer{
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: 62206}},
+		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: 62206}},
+	})
+
+	// Server sends [A, A] instead of [A, B] — a bug, but what does peersChanged do?
+	peers := []common.RedirectTarget{
+		{IP: "10.0.0.1", Port: 62206, PubKeyBase64: "key1"},
+		{IP: "10.0.0.1", Port: 62206, PubKeyBase64: "key1"},
+	}
+
+	got, _ := reg.peersChanged(peers)
+	// Both entries match set member A, and len(2)==len(2), so no change detected.
+	// This is a known false-negative for duplicate inputs. The no-duplicates
+	// assumption is documented on peersChanged.
+	if got {
+		t.Error("peersChanged with duplicate peers matching a subset should return false (known limitation)")
+	}
+}
+
+func TestFilterValidPeers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		peers     []common.RedirectTarget
+		wantCount int
+	}{
+		{
+			name: "all valid",
+			peers: []common.RedirectTarget{
+				{IP: "10.0.0.1", Port: 62206, PubKeyBase64: "key1"},
+				{IP: "10.0.0.2", Port: 62206, PubKeyBase64: "key2"},
+			},
+			wantCount: 2,
+		},
+		{
+			name: "empty IP dropped",
+			peers: []common.RedirectTarget{
+				{IP: "10.0.0.1", Port: 62206, PubKeyBase64: "key1"},
+				{IP: "", Port: 62206, PubKeyBase64: "key2"},
+			},
+			wantCount: 1,
+		},
+		{
+			name: "bad port dropped",
+			peers: []common.RedirectTarget{
+				{IP: "10.0.0.1", Port: 0, PubKeyBase64: "key1"},
+				{IP: "10.0.0.2", Port: 62206, PubKeyBase64: "key2"},
+			},
+			wantCount: 1,
+		},
+		{
+			name: "missing pubkey dropped",
+			peers: []common.RedirectTarget{
+				{IP: "10.0.0.1", Port: 62206, PubKeyBase64: ""},
+				{IP: "10.0.0.2", Port: 62206, PubKeyBase64: "key2"},
+			},
+			wantCount: 1,
+		},
+		{
+			name: "all invalid returns empty",
+			peers: []common.RedirectTarget{
+				{IP: "", Port: 0, PubKeyBase64: ""},
+			},
+			wantCount: 0,
+		},
+		{
+			name:      "nil input",
+			peers:     nil,
+			wantCount: 0,
+		},
+		{
+			name: "all valid returns original slice",
+			peers: []common.RedirectTarget{
+				{IP: "10.0.0.1", Port: 62206, PubKeyBase64: "key1"},
+			},
+			wantCount: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := filterValidPeers(tt.peers, "test")
+			if len(got) != tt.wantCount {
+				t.Errorf("filterValidPeers() returned %d peers, want %d", len(got), tt.wantCount)
+			}
+		})
+	}
+}
+
+// TestHandleRefreshResponse_MixedValidInvalidPeers verifies that when
+// the server sends a mix of valid and invalid peers, only the valid ones
+// are compared. 3 current servers + 2 valid peers (out of 3 sent) →
+// count mismatch → re-registration triggered.
+func TestHandleRefreshResponse_MixedValidInvalidPeers(t *testing.T) {
+	t.Parallel()
+
+	assigned := []*AssignedServer{
+		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: 62206}},
+		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: 62206}},
+		{Target: common.RedirectTarget{IP: "10.0.0.3", Port: 62206}},
+	}
+	reg := newRegWithServers(t, "test-mixed-peers", assigned)
+
+	// Server sends 3 peers but one has empty IP (invalid per #832)
+	aak := common.ServerACAckMsg{
+		ErrCode: common.ErrSuccess.ErrorCode(), Registered: true,
+		Peers: []common.RedirectTarget{
+			{IP: "10.0.1.1", Port: 62206, PubKeyBase64: "key1"},
+			{IP: "", Port: 62206, PubKeyBase64: "key2"}, // invalid — dropped by filterValidPeers
+			{IP: "10.0.1.3", Port: 62206, PubKeyBase64: "key3"},
+		},
+	}
+
+	server := &AssignedServer{Target: assigned[0].Target}
+	sendAddr := &net.UDPAddr{IP: net.ParseIP(assigned[0].Target.IP), Port: assigned[0].Target.Port}
+
+	reg.handleRefreshResponse(newAAKPacket(t, aak), server, sendAddr)
+
+	// 2 valid peers vs 3 assigned → count mismatch → re-registration
+	if !reg.reregistering.Load() {
+		t.Error("handleRefreshResponse with mixed valid/invalid peers should trigger re-registration (count mismatch after filtering)")
+	}
 }
