@@ -516,16 +516,42 @@ jobs:
         if: needs.changes.outputs.code == 'true' && github.event.inputs.skip_tests != 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      # Sets up Go on the runner solely to manage the module/build cache
+      # across runs. Tests themselves still execute in the pinned
+      # golang:${GO_VERSION}-bookworm container below; we bind-mount the
+      # runner's GOMODCACHE and GOCACHE into the container so cache state
+      # persists across runs without rebuilding the module graph or
+      # recompiling every package from scratch.
+      #
+      # Cache-dependency-path matches the Integration Tests step's
+      # setup-go invocation later in this workflow (both go.sum files),
+      # so the cache key and scope are consistent across jobs.
+      - name: Setup Go (module + build cache for docker tests)
+        if: needs.changes.outputs.code == 'true' && github.event.inputs.skip_tests != 'true'
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            nhp/go.sum
+            endpoints/go.sum
+
       - name: Run tests (privileged container for iptables)
         if: needs.changes.outputs.code == 'true' && github.event.inputs.skip_tests != 'true'
         run: |
           # Run tests in privileged container to allow iptables access
-          # This is required for NHP tests that manipulate firewall rules
+          # This is required for NHP tests that manipulate firewall rules.
+          #
+          # GOMODCACHE and GOCACHE are bind-mounted from the runner so
+          # subsequent runs (and the Go vet step below) skip module
+          # downloads and recompilation of unchanged packages.
+          mkdir -p "$HOME/go/pkg/mod" "$HOME/.cache/go-build"
           docker run --rm \
             --privileged \
             --cap-add=NET_ADMIN \
             --cap-add=NET_RAW \
             -v "${{ github.workspace }}:/workspace" \
+            -v "$HOME/go/pkg/mod:/root/go/pkg/mod" \
+            -v "$HOME/.cache/go-build:/root/.cache/go-build" \
             -w /workspace \
             -e KBS_SKIP_INIT=1 \
             golang:${{ env.GO_VERSION }}-bookworm \
@@ -547,8 +573,13 @@ jobs:
       - name: Go vet
         if: needs.changes.outputs.code == 'true' && github.event.inputs.skip_tests != 'true'
         run: |
+          # Shares the runner's GOMODCACHE/GOCACHE with the Run tests
+          # step, so vet reuses test-compiled packages instead of doing
+          # a cold rebuild.
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
+            -v "$HOME/go/pkg/mod:/root/go/pkg/mod" \
+            -v "$HOME/.cache/go-build:/root/.cache/go-build" \
             -w /workspace \
             golang:${{ env.GO_VERSION }}-bookworm \
             bash -c "cd nhp && go vet ./... && cd ../endpoints && go vet ./..."
