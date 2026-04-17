@@ -734,6 +734,18 @@ resource "aws_iam_role_policy" "context_lookups" {
           "arn:aws:ssm:${local.region}::document/AWS-RunShellScript",
           "arn:aws:ssm:${local.region}:${local.account_id}:document/AWS-RunShellScript"
         ]
+      },
+      {
+        # Blue/green Switch Traffic clears stale AC-to-server assignments so the
+        # next AC registration builds fresh assignments pointing at the new active
+        # servers. See .github/scripts/clear-ac-assignments.sh.
+        Sid    = "DynamoDBClearACAssignments"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:Scan",
+          "dynamodb:DeleteItem"
+        ]
+        Resource = "arn:aws:dynamodb:${local.region}:${local.account_id}:table/layerv-nhp-${var.environment}-*-ac-assignments"
       }
     ]
   })
