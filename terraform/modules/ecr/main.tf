@@ -1934,9 +1934,9 @@ resource "aws_iam_role_policy_attachment" "qurl_link_static" {
 # ============================================================================
 # Smoke Test Policy
 #
-# INTENTIONALLY EMPTY: nhp/tests/smoke reuses the existing permissions
-# already attached to aws_iam_role.github_actions. Every API call the
-# Tier 1 tests make is covered by:
+# nhp/tests/smoke mostly reuses the existing permissions already attached
+# to aws_iam_role.github_actions. Every API call the Tier 1/2 tests make
+# is covered by:
 #
 #   - terraform_read:      ec2:Describe*, autoscaling:Describe*,
 #                          elasticloadbalancing:Describe*,
@@ -1948,11 +1948,40 @@ resource "aws_iam_role_policy_attachment" "qurl_link_static" {
 #   - SSMACMLambda:        ssm:PutParameter (for M2M token cache)
 #   - terraform_apply_*:   cloudwatch:PutMetricData (for smoke metric)
 #
-# If PR2 or PR3 introduces a call that needs a NEW action (e.g.,
-# logs:StartQuery for CloudWatch Logs Insights), add a dedicated
-# aws_iam_role_policy resource scoped to just that action — do not
-# recreate the broad smoke_test_read policy this block replaces.
+# Tier 3 (22_server_logs_test.go) uses CloudWatch Logs Insights, which
+# requires actions not granted by the broad CloudWatchRead statement
+# (Describe/Get/List/FilterLogEvents/StartLiveTail). The policy below
+# grants those actions narrowly: StartQuery is scoped to the nhp-server
+# log group ARN; GetQueryResults/StopQuery operate on query IDs (not
+# resources) so remain unscoped.
+#
+# If a future test introduces another new action, add another dedicated
+# aws_iam_role_policy scoped to just that action — do not recreate the
+# broad smoke_test_read policy this block replaces.
 # ============================================================================
+
+resource "aws_iam_role_policy" "smoke_test_cwl_insights" {
+  name = "smoke-test-cwl-insights"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "StartInsightsQueryOnNHPServerLogGroup"
+        Effect   = "Allow"
+        Action   = ["logs:StartQuery"]
+        Resource = ["arn:aws:logs:${local.region}:${local.account_id}:log-group:/layerv/nhp/${var.environment}/cell0/server:*"]
+      },
+      {
+        Sid      = "ReadAndStopInsightsQuery"
+        Effect   = "Allow"
+        Action   = ["logs:GetQueryResults", "logs:StopQuery"]
+        Resource = "*"
+      },
+    ]
+  })
+}
 
 # ============================================================================
 # OUTPUTS - Unified interface regardless of primary/secondary account
