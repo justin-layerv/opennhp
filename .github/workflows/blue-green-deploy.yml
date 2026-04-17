@@ -1271,9 +1271,14 @@ jobs:
   # =============================================================================
   # NOTIFY - Send deployment notification to SNS (Slack via AWS Chatbot)
   # =============================================================================
+  #
+  # Gated to main because the OIDC role's trust policy scopes
+  # sts:AssumeRoleWithWebIdentity to refs/heads/main. Notify publishes
+  # to the shared deploy-signal Slack channel — feature-branch
+  # dispatches shouldn't post there.
   notify:
     name: Notify
-    if: always()
+    if: always() && github.ref == 'refs/heads/main'
     needs: [prepare, deploy-to-standby, switch-traffic, scale-down-previous, validate]
     runs-on: ubuntu-latest
     timeout-minutes: 5
