@@ -1570,7 +1570,15 @@ jobs:
       - deploy-sandbox-blue-green
       - deploy-sandbox-validate
       - nhp-smoke-sandbox
-    if: always() && github.event_name != 'pull_request'
+    # Skip Slack when the waiter was cancelled (concurrency preempt or
+    # manual). The dispatched blue/green sub-workflow runs to completion
+    # on its own concurrency group and emits its own SNS-routed Slack
+    # (see blue-green-deploy.yml:notify) — silence from here is more
+    # accurate than a guess. See PR #1082 for the full rationale.
+    if: |
+      always() &&
+      github.event_name != 'pull_request' &&
+      needs.deploy-sandbox-blue-green.result != 'cancelled'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
