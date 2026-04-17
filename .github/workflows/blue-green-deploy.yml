@@ -74,9 +74,29 @@ on:
         # for the happy path.
         default: 15
         type: number
-      health_check_timeout_minutes:
-        description: 'Target group health check timeout in minutes (2-30, default: 5)'
+      # Timeout budgets below fall into three categories (boot / convergence /
+      # regression-detection). Full rationale, distribution, and follow-up in
+      # docs/deploy-timeouts.md — update that file when changing defaults.
+      standby_health_timeout_minutes:
+        description: 'Standby SSM probe (/ping) timeout in minutes (2-60, default: 15)'
         required: false
+        # Boot budget — covers standby user_data + service bind.
+        # Upper bound mirrors refresh_timeout_minutes (60) rather than
+        # the probe ceiling (30) because this is a boot budget, not a
+        # convergence/regression budget. See docs/deploy-timeouts.md.
+        default: 15
+        type: number
+      pre_switch_knock_ready_timeout_minutes:
+        description: 'Pre-switch knock-ready timeout in minutes (2-30, default: 5)'
+        required: false
+        # Convergence budget — standby is already up; gate is waiting
+        # on NHP-AOL/NHP-AAK settling on the active server fleet.
+        default: 5
+        type: number
+      post_switch_knock_ready_timeout_minutes:
+        description: 'Post-switch knock-ready timeout in minutes (2-30, default: 5)'
+        required: false
+        # Regression-detection budget — traffic is live; keep tight.
         default: 5
         type: number
       correlation_id:
@@ -383,18 +403,29 @@ jobs:
           SERVER_STANDBY_TAG: ${{ steps.server-state.outputs.standby_image_tag }}
           AC_ACTIVE_TAG: ${{ steps.ac-state.outputs.active_image_tag }}
           AC_STANDBY_TAG: ${{ steps.ac-state.outputs.standby_image_tag }}
-          REFRESH_TIMEOUT: ${{ inputs.refresh_timeout_minutes }}
-          HEALTH_TIMEOUT: ${{ inputs.health_check_timeout_minutes }}
+          REFRESH_TIMEOUT_MINUTES: ${{ inputs.refresh_timeout_minutes }}
+          STANDBY_HEALTH_TIMEOUT_MINUTES: ${{ inputs.standby_health_timeout_minutes }}
+          PRE_SWITCH_KNOCK_READY_TIMEOUT_MINUTES: ${{ inputs.pre_switch_knock_ready_timeout_minutes }}
+          POST_SWITCH_KNOCK_READY_TIMEOUT_MINUTES: ${{ inputs.post_switch_knock_ready_timeout_minutes }}
         run: |
-          # Validate timeout bounds
-          if [[ "$REFRESH_TIMEOUT" -lt 5 || "$REFRESH_TIMEOUT" -gt 60 ]]; then
-            echo "::error::refresh_timeout_minutes must be between 5 and 60 (got: $REFRESH_TIMEOUT)"
-            exit 1
-          fi
-          if [[ "$HEALTH_TIMEOUT" -lt 2 || "$HEALTH_TIMEOUT" -gt 30 ]]; then
-            echo "::error::health_check_timeout_minutes must be between 2 and 30 (got: $HEALTH_TIMEOUT)"
-            exit 1
-          fi
+          # Validate timeout bounds. Env var names are upper-case of their
+          # workflow input names so ::error:: messages can lower-case and
+          # tell a dispatcher exactly which input to fix. Boot-budget
+          # inputs (refresh, standby_health) share a 2-60 / 5-60 window;
+          # knock-ready probes (convergence, regression-detection) share
+          # a tighter 2-30 window. See docs/deploy-timeouts.md.
+          check_bounds() {
+            local var="$1" min="$2" max="$3"
+            local val="${!var:-}"
+            if ! [[ "$val" =~ ^[0-9]+$ ]] || (( val < min || val > max )); then
+              echo "::error::${var,,} must be between $min and $max (got: '$val')"
+              exit 1
+            fi
+          }
+          check_bounds REFRESH_TIMEOUT_MINUTES 5 60
+          check_bounds STANDBY_HEALTH_TIMEOUT_MINUTES 2 60
+          check_bounds PRE_SWITCH_KNOCK_READY_TIMEOUT_MINUTES 2 30
+          check_bounds POST_SWITCH_KNOCK_READY_TIMEOUT_MINUTES 2 30
 
           if [[ "$ACTION" == "deploy" ]]; then
             if [[ -z "$IMAGE_TAG" ]]; then
@@ -749,7 +780,9 @@ jobs:
           AC_STANDBY_ASG: ${{ needs.prepare.outputs.ac_standby_asg }}
           DEPLOY_SERVER: ${{ needs.prepare.outputs.deploy_server }}
           DEPLOY_AC: ${{ needs.prepare.outputs.deploy_ac }}
-          HEALTH_CHECK_TIMEOUT_MINUTES: ${{ inputs.health_check_timeout_minutes }}
+          # Boot budget — covers standby instance user_data + service
+          # bind. See docs/deploy-timeouts.md.
+          STANDBY_HEALTH_TIMEOUT_MINUTES: ${{ inputs.standby_health_timeout_minutes }}
         run: |
           set -euo pipefail
           chmod +x .github/scripts/verify-asg-instances-healthy.sh
@@ -760,7 +793,7 @@ jobs:
           if [[ "$DEPLOY_SERVER" == "true" ]]; then
             # nhp-server runs with --net=host, so /health/live is on 127.0.0.1:8888
             .github/scripts/verify-asg-instances-healthy.sh \
-              "$SERVER_STANDBY_ASG" "Server-Standby" "$HEALTH_CHECK_TIMEOUT_MINUTES" \
+              "$SERVER_STANDBY_ASG" "Server-Standby" "$STANDBY_HEALTH_TIMEOUT_MINUTES" \
               'curl -sfS -o /dev/null http://127.0.0.1:8888/health/live' &
             SERVER_PID=$!
           fi
@@ -768,7 +801,7 @@ jobs:
           if [[ "$DEPLOY_AC" == "true" ]]; then
             # Traefik admin ping on port 8080
             .github/scripts/verify-asg-instances-healthy.sh \
-              "$AC_STANDBY_ASG" "AC-Standby" "$HEALTH_CHECK_TIMEOUT_MINUTES" \
+              "$AC_STANDBY_ASG" "AC-Standby" "$STANDBY_HEALTH_TIMEOUT_MINUTES" \
               'curl -sfS -o /dev/null http://127.0.0.1:8080/ping' &
             AC_PID=$!
           fi
@@ -797,10 +830,12 @@ jobs:
         if: needs.prepare.outputs.deploy_ac == 'true' && inputs.dry_run != true
         env:
           SERVER_ACTIVE_ASG: ${{ needs.prepare.outputs.server_active_asg }}
-          HEALTH_CHECK_TIMEOUT_MINUTES: ${{ inputs.health_check_timeout_minutes }}
+          # Convergence budget — standby is already up, waiting on knock
+          # protocol convergence on the active server fleet.
+          KNOCK_READY_TIMEOUT_MINUTES: ${{ inputs.pre_switch_knock_ready_timeout_minutes }}
         run: |
           .github/scripts/verify-knock-ready.sh \
-            "$SERVER_ACTIVE_ASG" "pre-switch" "$HEALTH_CHECK_TIMEOUT_MINUTES"
+            "$SERVER_ACTIVE_ASG" "pre-switch" "$KNOCK_READY_TIMEOUT_MINUTES"
 
       - name: "[Server] Dry Run Notice"
         if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run == true
@@ -1131,9 +1166,11 @@ jobs:
         if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run != true
         env:
           NEW_ACTIVE_ASG: ${{ needs.prepare.outputs.server_standby_asg }}
-          HEALTH_CHECK_TIMEOUT_MINUTES: ${{ inputs.health_check_timeout_minutes }}
+          # Regression-detection budget — traffic is already live here.
+          # See docs/deploy-timeouts.md.
+          KNOCK_READY_TIMEOUT_MINUTES: ${{ inputs.post_switch_knock_ready_timeout_minutes }}
         run: |
-          .github/scripts/verify-knock-ready.sh "$NEW_ACTIVE_ASG" "post-switch" "$HEALTH_CHECK_TIMEOUT_MINUTES"
+          .github/scripts/verify-knock-ready.sh "$NEW_ACTIVE_ASG" "post-switch" "$KNOCK_READY_TIMEOUT_MINUTES"
 
       - name: Run Validation Script
         env:
