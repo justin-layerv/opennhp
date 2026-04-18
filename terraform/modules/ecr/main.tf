@@ -1317,6 +1317,12 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "logs:PutResourcePolicy",
           "logs:DescribeResourcePolicies",
           "logs:DescribeLogGroups",
+          # Log-metric filters (PR #1098: ServerPanic / ServerStartupEvent).
+          # TF manages the lifecycle end-to-end, so all three verbs must be
+          # present: create/update, delete on destroy, read on plan diff.
+          "logs:PutMetricFilter",
+          "logs:DeleteMetricFilter",
+          "logs:DescribeMetricFilters",
           "cloudwatch:PutMetricAlarm",
           "cloudwatch:PutMetricData",
           "cloudwatch:DeleteAlarms",
