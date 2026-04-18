@@ -409,7 +409,7 @@ func NewIPSet(wait bool) (*IPSet, error) {
 }
 
 func (ipset *IPSet) Add(ipType IPTYPE, t int, expire int, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.TODO(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	name := ipset.GetIpsetName(ipType, t)
