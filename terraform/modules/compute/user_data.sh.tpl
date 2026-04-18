@@ -197,10 +197,28 @@ SECRET=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --region 
 PRIVATE_KEY=$(echo "$SECRET" | jq -r ".privateKey")
 HOSTNAME=$(echo "$SECRET" | jq -r ".hostname")
 
-TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+# Fail fast at each IMDS stage with a precise diagnostic so the operator
+# can tell token-fetch failures apart from metadata-fetch failures. The
+# downstream consumers of $INSTANCE_ID (the docker --log-opt
+# awslogs-stream flag below, Cloud Map registration, etc.) produce
+# cryptic cascading errors if the value is empty, so we die here
+# instead. `set -ex` propagates the exit; echo first so the reason is
+# visible in /var/log/user-data.log.
+if [ -z "$TOKEN" ]; then
+  echo "FATAL: IMDS token fetch returned empty; cannot retrieve instance metadata"
+  exit 1
+fi
+
 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
 LOCAL_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
 AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+
+if [ -z "$INSTANCE_ID" ]; then
+  echo "FATAL: IMDS returned empty instance-id (token ok but metadata fetch failed); cannot continue"
+  exit 1
+fi
 
 mkdir -p /opt/layerv/nhp-server/etc
 mkdir -p /opt/layerv/nhp-server/log
@@ -731,6 +749,19 @@ NHP_IMAGE_TAG=$IMAGE_TAG
 NHP_ECR_REPO=${server_repo_url}
 NHP_ENVIRONMENT=${environment}
 NHP_CELL_ID=${cell_id}
+# Instance identity and stderr log target for the docker awslogs driver.
+# The docker --log-driver=awslogs flags in the systemd unit (below)
+# reference these at container start so runtime panics written to
+# os.Stderr land in CloudWatch Logs instead of being dropped to
+# /var/lib/docker/containers/*/json.log on the host.
+#
+# NHP_STDERR_LOG_GROUP is passed directly from Terraform
+# (aws_cloudwatch_log_group.server_stderr.name in compute/main.tf)
+# so the group name cannot drift between the TF-managed resource
+# and the docker --log-opt value. If the naming convention changes,
+# only the TF resource needs updating.
+INSTANCE_ID=$INSTANCE_ID
+NHP_STDERR_LOG_GROUP=${server_stderr_log_group}
 AWS_REGION=${region}
 AWS_DEFAULT_REGION=${region}
 %{ if qurl_enabled ~}
@@ -815,6 +846,11 @@ ExecStartPre=-/usr/bin/docker stop nhp-server
 ExecStartPre=-/usr/bin/docker rm nhp-server
 ExecStart=/bin/bash -c "docker run --rm --name nhp-server \
   --net=host \
+  --log-driver=awslogs \
+  --log-opt awslogs-region=$${AWS_REGION} \
+  --log-opt awslogs-group=$${NHP_STDERR_LOG_GROUP} \
+  --log-opt awslogs-stream=$${INSTANCE_ID} \
+  --log-opt awslogs-create-group=false \
   -v /opt/layerv/nhp-server/etc:/nhp-server/etc:ro \
   -v /opt/layerv/nhp-server/log:/nhp-server/logs \
   -v /opt/layerv/nhp-server/plugins:/nhp-server/plugins:ro \

@@ -24,6 +24,11 @@ variable "asg_name" {
   type        = string
 }
 
+variable "server_stderr_log_group_name" {
+  description = "CloudWatch log group that receives the nhp-server container's stdout/stderr via the docker awslogs driver. Metric filters on this group drive the ServerPanic and ServerStartupEvent alarms."
+  type        = string
+}
+
 variable "name_prefix" {
   description = "Name prefix for resources"
   type        = string

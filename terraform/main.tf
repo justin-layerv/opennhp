@@ -387,13 +387,14 @@ module "compute" {
 module "monitoring" {
   source = "./modules/monitoring"
 
-  environment             = var.environment
-  cell_id                 = var.cell_id
-  nlb_arn_suffix          = module.compute.nlb_arn_suffix
-  target_group_arn_suffix = module.compute.target_group_arn_suffix
-  asg_name                = module.compute.asg_name
-  name_prefix             = local.name_prefix
-  tags                    = local.common_tags
+  environment                  = var.environment
+  cell_id                      = var.cell_id
+  nlb_arn_suffix               = module.compute.nlb_arn_suffix
+  target_group_arn_suffix      = module.compute.target_group_arn_suffix
+  asg_name                     = module.compute.asg_name
+  server_stderr_log_group_name = module.compute.log_group_stderr_name
+  name_prefix                  = local.name_prefix
+  tags                         = local.common_tags
 
   # Slack integration
   enable_slack_notifications = var.enable_slack_notifications

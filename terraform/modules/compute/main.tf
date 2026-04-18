@@ -281,6 +281,28 @@ resource "aws_cloudwatch_log_group" "server" {
   })
 }
 
+# CloudWatch Log Group for the server container's stdout/stderr. Routed
+# by the docker --log-driver=awslogs on the systemd unit, so any panic
+# or runtime error that Go writes directly to os.Stderr -- bypassing the
+# structured file logger that feeds `aws_cloudwatch_log_group.server` --
+# is captured here instead of being dropped to the host's docker json
+# log file. This closes the observability gap that let the "panic: send
+# on closed channel" crash loop (fixed in PR #1096) live undetected
+# through every blue/green deploy. Retention is short on purpose: this
+# group is an alert surface, not an archive; long-term diagnostics live
+# in the structured `server` group alongside context.
+resource "aws_cloudwatch_log_group" "server_stderr" {
+  name              = "/layerv/nhp/${var.environment}/${var.cell_id}/server-stderr"
+  retention_in_days = 7
+  kms_key_id        = var.logs_kms_key_arn
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-logs-server-stderr"
+    Component = "compute"
+    Cell      = var.cell_id
+  })
+}
+
 # =============================================================================
 # SSM Parameters for Deployment State
 # These parameters enable CI/CD to update image tags without Terraform apply.
@@ -491,7 +513,10 @@ resource "aws_iam_role_policy" "server" {
           "logs:CreateLogStream",
           "logs:PutLogEvents"
         ]
-        Resource = "${aws_cloudwatch_log_group.server.arn}:*"
+        Resource = [
+          "${aws_cloudwatch_log_group.server.arn}:*",
+          "${aws_cloudwatch_log_group.server_stderr.arn}:*",
+        ]
       },
       {
         Effect   = "Allow"
@@ -646,6 +671,10 @@ locals {
     multi_tenant        = var.multi_tenant
     etcd_endpoint       = var.etcd_endpoint
     etcd_tls_secret_arn = var.etcd_tls_secret_arn
+    # Pass the stderr log group name directly from the TF resource so
+    # it cannot drift from the Terraform-managed resource. Consumed by
+    # the docker --log-opt awslogs-group flag in the systemd unit.
+    server_stderr_log_group = aws_cloudwatch_log_group.server_stderr.name
     # Server configuration options
     log_level        = var.log_level
     dev_mode         = var.dev_mode

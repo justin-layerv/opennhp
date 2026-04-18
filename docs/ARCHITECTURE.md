@@ -1458,6 +1458,17 @@ The system publishes metrics to CloudWatch under the `LayerV/NHP` namespace from
 
 Grafana dashboards consume these metrics via a CloudWatch datasource. See `docs/grafana-dashboard-improvements.md` for the phased dashboard improvement plan and `terraform/modules/grafana-dashboards/` for dashboard JSON definitions.
 
+### Alarms Coupled to Fleet Size
+
+A small number of CloudWatch alarms in `terraform/modules/monitoring/` have thresholds that encode an assumption about the number of server instances in the cell. These **must be revisited during capacity-planning changes** — if you scale the fleet past its current size without retuning, the alarm either false-positives on every deploy or becomes deaf to real regressions.
+
+| Alarm | Assumption | Must revisit when |
+|-------|-----------|-------------------|
+| `server-crash-loop` | Fleet of 3 servers × 1 start per blue/green deploy = 3 startup events in a 5-min window; threshold of 4 catches the first crash-loop restart | Fleet grows past 3 (bump threshold to N+1, or land the per-instance EMF alarm from PR #1099 which is dimensionally scalable) |
+| `ac-peer-count-low` | Evaluation window is tuned to ride through a single blue/green AC deploy (~15 min of zero peers) with margin | Deploy cadence or AC bring-up time changes materially |
+
+The inline Terraform comments on each alarm reference this table and the relevant PR history. Search for `regression class PR #1096` in `terraform/modules/monitoring/main.tf` for the detailed threshold derivations.
+
 ### Cost Analytics (Shared Athena Backend)
 
 AWS cost data flows through a single pipeline deployed by **sandbox only**:

@@ -53,6 +53,11 @@ output "log_group_name" {
   value       = aws_cloudwatch_log_group.server.name
 }
 
+output "log_group_stderr_name" {
+  description = "CloudWatch log group name for container stdout/stderr (panics, runtime errors). Consumed by the monitoring module to attach metric filters that drive the ServerPanic and ServerStartupEvent alarms."
+  value       = aws_cloudwatch_log_group.server_stderr.name
+}
+
 output "target_group_arn_suffix" {
   description = "Target group ARN suffix for CloudWatch"
   value       = aws_lb_target_group.udp.arn_suffix

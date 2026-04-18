@@ -703,3 +703,183 @@ resource "aws_cloudwatch_metric_alarm" "dynamodb_read_latency" {
     Cell      = var.cell_id
   })
 }
+
+# ============================================================================
+# Server process observability: ServerPanic / ServerStartupEvent
+#
+# The nhp-server container's docker awslogs driver routes its stdout and
+# stderr to var.server_stderr_log_group_name. Go's runtime writes panics
+# directly to os.Stderr, bypassing the server's structured file logger,
+# so the existing /server log group will not see a panic; this log group
+# is where they surface.
+#
+# The two metric filters below convert specific line patterns in that
+# stream into CloudWatch metrics in LayerV/NHP. The patterns are:
+#
+#   ServerPanic          - matches "panic:" which is what the Go
+#                          runtime emits at the start of every panic
+#                          stack trace (package runtime, gopanic).
+#   ServerStartupEvent   - matches "NHP-Server is running!" which is
+#                          the fixed banner emitted once per process
+#                          start from main.go (see nhp-server banner).
+#
+# Both are strings we emit ourselves (Go runtime + our own main banner),
+# so they are low-churn and maintained by the same team that owns the
+# alarms. Any intentional change to either string updates the filter in
+# the same PR.
+# ============================================================================
+
+resource "aws_cloudwatch_log_metric_filter" "server_panic" {
+  name           = "${var.name_prefix}-${var.cell_id}-server-panic"
+  log_group_name = var.server_stderr_log_group_name
+  # Quoted to match the literal "panic:" prefix that Go's runtime
+  # writes at the start of every panic. Avoids matching the word
+  # "panic" used elsewhere (e.g., in application log messages).
+  #
+  # Coupling note: this filter assumes no application code in
+  # endpoints/server/ writes the literal "panic:" to stdout. Verified
+  # today — all panic-recovery paths in nhp/core/device.go route
+  # through fmt.Errorf / the structured file logger, not stdout. If
+  # a future contributor adds a fmt.Printf("...panic: %s...", ...)
+  # call reaching stdout, this alarm will fire as a false positive.
+  # The 7-day retention on the stderr group and the alarm's SNS
+  # routing make such a regression noisy and quickly diagnosable.
+  pattern = "\"panic:\""
+
+  metric_transformation {
+    name          = "ServerPanic"
+    namespace     = "LayerV/NHP"
+    value         = "1"
+    default_value = "0"
+    dimensions = {
+      Environment = var.environment
+      Cell        = var.cell_id
+    }
+  }
+}
+
+resource "aws_cloudwatch_log_metric_filter" "server_startup_event" {
+  name           = "${var.name_prefix}-${var.cell_id}-server-startup-event"
+  log_group_name = var.server_stderr_log_group_name
+  # Match the banner printed once per process start. The banner is
+  # written as `fmt.Printf("  %s🚀 NHP-Server%s is running!\n",
+  # colorBold, colorReset)` in endpoints/server/main/main.go, so the
+  # actual bytes on stdout are
+  #   "  \033[1m🚀 NHP-Server\033[0m is running!\n"
+  # The ANSI reset (`\033[0m`) sits between "NHP-Server" and
+  # " is running!", breaking the contiguous substring. A single-quoted
+  # filter for the literal phrase therefore never matches.
+  # CloudWatch Logs treats space-separated quoted terms as AND, so
+  # splitting into two terms catches the banner regardless of any
+  # ANSI bytes (or future ornamentation) sitting between them. This
+  # is the only line in the binary's output where the bold "NHP-Server"
+  # substring co-occurs with "is running!", so false positives are not
+  # a concern.
+  pattern = "\"NHP-Server\" \"is running!\""
+
+  metric_transformation {
+    name          = "ServerStartupEvent"
+    namespace     = "LayerV/NHP"
+    value         = "1"
+    default_value = "0"
+    dimensions = {
+      Environment = var.environment
+      Cell        = var.cell_id
+    }
+  }
+}
+
+# Any panic at all is actionable. treat_missing_data=notBreaching means
+# a quiet log group (no "panic:" lines) does not fire the alarm -- the
+# metric filter emits 0 on each log event that does not match, which
+# keeps the time series populated, but in periods with no log events at
+# all the series is missing rather than zero.
+resource "aws_cloudwatch_metric_alarm" "server_panic" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-server-panic"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = aws_cloudwatch_log_metric_filter.server_panic.metric_transformation[0].name
+  namespace           = aws_cloudwatch_log_metric_filter.server_panic.metric_transformation[0].namespace
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 1
+  # Kept under ~160 chars so CloudWatch console list views do not
+  # truncate the description; full rationale lives in the comment
+  # block above the resource.
+  alarm_description = "nhp-server panic in last minute. Each panic kills the process (systemd restarts). Regression class: PR #1096."
+  alarm_actions     = [aws_sns_topic.alerts.arn]
+  ok_actions        = [aws_sns_topic.alerts.arn]
+  # INSUFFICIENT_DATA also routes to SNS: for this alarm, the
+  # stderr log group being silent for >1 minute means either no
+  # instances are running (a separate deploy/capacity issue worth
+  # paging on) or the awslogs driver stopped reporting, which is
+  # exactly the "we can't see panics anymore" failure mode this
+  # PR closes. treat_missing_data=notBreaching prevents the alarm
+  # state from flipping to ALARM, but insufficient_data_actions
+  # still notifies so we know about the blackout.
+  insufficient_data_actions = [aws_sns_topic.alerts.arn]
+  treat_missing_data        = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# Fleet-wide startup counter. Threshold of 4 is chosen so a normal
+# blue/green deploy (3 new instances, 3 startup events in the window)
+# does not trip, while a real crash loop (observed at 5-8 restarts per
+# instance per 5-minute window in the PR #1096 incident) does.
+#
+# If the fleet scales past 3 servers, revisit this threshold alongside
+# buildServerMetricDimensions(). Per-instance alarming is a follow-up
+# that requires SetGaugeFuncWithDims on the metric publisher.
+#
+# Known overlap scenario: if a Terraform instance refresh on the blue
+# fleet coincides with a blue/green deploy spinning up the green fleet,
+# the 5-minute window could see 6 startup events (3 replaced blue + 3
+# new green) and trip the threshold as a false positive. The per-
+# instance alarm in PR #1099 covers the same failure class without
+# being sensitive to fleet-wide start bursts, so in practice that one
+# is the source of truth for single-instance crash loops.
+# datapoints_to_alarm = 2 below also absorbs this by requiring the
+# high-startup state to persist for two consecutive 5-minute windows
+# (+5 min detection latency) before paging — a real crash loop at
+# 5-8 starts per instance per 5 minutes sustains comfortably above
+# the threshold across both windows.
+resource "aws_cloudwatch_metric_alarm" "server_crash_loop" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-server-crash-loop"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  datapoints_to_alarm = 2
+  metric_name         = aws_cloudwatch_log_metric_filter.server_startup_event.metric_transformation[0].name
+  namespace           = aws_cloudwatch_log_metric_filter.server_startup_event.metric_transformation[0].namespace
+  period              = 300
+  statistic           = "Sum"
+  # Fleet of N servers × 1 start per blue/green deploy = N startup
+  # events in the window. Currently N = 3, so threshold of 4 catches
+  # the first crash-loop restart beyond a normal deploy. If the fleet
+  # scales to N=4 this alarm must be re-tuned to N+1; a per-instance
+  # alarm driven by the EMF-emitted ServerStartupEvent counter
+  # (follow-up PR) will obsolete this tuning.
+  threshold          = 4
+  alarm_description  = "nhp-server >4 starts in 5-min window, sustained 2 windows (crash-loop; PR #1096). Normal blue/green produces 3 starts."
+  alarm_actions      = [aws_sns_topic.alerts.arn]
+  ok_actions         = [aws_sns_topic.alerts.arn]
+  treat_missing_data = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
