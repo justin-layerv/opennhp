@@ -705,7 +705,7 @@ resource "aws_cloudwatch_metric_alarm" "dynamodb_read_latency" {
 }
 
 # ============================================================================
-# Server process observability: ServerPanic / ServerStartupEvent
+# Server process observability: ServerPanic / ServerStartupEvent (fleet-wide)
 #
 # The nhp-server container's docker awslogs driver routes its stdout and
 # stderr to var.server_stderr_log_group_name. Go's runtime writes panics
@@ -837,17 +837,15 @@ resource "aws_cloudwatch_metric_alarm" "server_panic" {
 # instance per 5-minute window in the PR #1096 incident) does.
 #
 # If the fleet scales past 3 servers, revisit this threshold alongside
-# buildServerMetricDimensions(). Per-instance alarming is a follow-up
-# that requires SetGaugeFuncWithDims on the metric publisher.
+# buildServerMetricDimensions(). The server_instance_restart alarm
+# below (PR #1099) is per-instance and insensitive to fleet size, so
+# it catches single-instance crash loops without this tuning.
 #
 # Known overlap scenario: if a Terraform instance refresh on the blue
 # fleet coincides with a blue/green deploy spinning up the green fleet,
 # the 5-minute window could see 6 startup events (3 replaced blue + 3
-# new green) and trip the threshold as a false positive. The per-
-# instance alarm in PR #1099 covers the same failure class without
-# being sensitive to fleet-wide start bursts, so in practice that one
-# is the source of truth for single-instance crash loops.
-# datapoints_to_alarm = 2 below also absorbs this by requiring the
+# new green) and trip the threshold as a false positive.
+# datapoints_to_alarm = 2 below absorbs this by requiring the
 # high-startup state to persist for two consecutive 5-minute windows
 # (+5 min detection latency) before paging — a real crash loop at
 # 5-8 starts per instance per 5 minutes sustains comfortably above
@@ -864,9 +862,7 @@ resource "aws_cloudwatch_metric_alarm" "server_crash_loop" {
   # Fleet of N servers × 1 start per blue/green deploy = N startup
   # events in the window. Currently N = 3, so threshold of 4 catches
   # the first crash-loop restart beyond a normal deploy. If the fleet
-  # scales to N=4 this alarm must be re-tuned to N+1; a per-instance
-  # alarm driven by the EMF-emitted ServerStartupEvent counter
-  # (follow-up PR) will obsolete this tuning.
+  # scales to N=4 this alarm must be re-tuned to N+1.
   threshold          = 4
   alarm_description  = "nhp-server >4 starts in 5-min window, sustained 2 windows (crash-loop; PR #1096). Normal blue/green produces 3 starts."
   alarm_actions      = [aws_sns_topic.alerts.arn]
@@ -876,6 +872,74 @@ resource "aws_cloudwatch_metric_alarm" "server_crash_loop" {
   dimensions = {
     Environment = var.environment
     Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# ============================================================================
+# Per-instance server startup alarm (PR #1099)
+#
+# The server emits a ServerStartupEvent counter with an InstanceId
+# dimension once per process start (see endpoints/server/udpserver.go,
+# gated on cloud mode where IMDS provides the instance ID). This alarm
+# fires when any single instance's startup count exceeds 1 in a
+# 5-minute window -- i.e., the process restarted. A healthy instance
+# emits one ServerStartupEvent at launch and nothing else; a crash
+# loop emits 5+ in 5 minutes. The server_crash_loop alarm above needs
+# the whole cell to see more than 4 events in two consecutive windows,
+# which masks a single instance crash-looping quietly. This alarm
+# catches that case.
+#
+# Metric math SEARCH picks up every time series with the InstanceId
+# dimension set. MAX over the search collapses a multi-instance fleet
+# into a single "worst instance" signal for the alarm to evaluate.
+# This form scales as instances are added or replaced without TF
+# changes; we never have to pre-declare instance IDs.
+#
+# Complements (does not replace) the server_panic and server_crash_loop
+# log-filter alarms above. If the docker stderr log driver breaks and
+# those stop receiving data, this alarm (fed by PutMetricData from the
+# Go process) still fires.
+# ============================================================================
+resource "aws_cloudwatch_metric_alarm" "server_instance_restart" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-server-instance-restart"
+  comparison_operator = "GreaterThanThreshold"
+  # threshold=1 and evaluation_periods=1 together mean: a single
+  # instance emitting >1 ServerStartupEvent inside one 5-minute
+  # window pages immediately. An instance replacement during a normal
+  # instance refresh produces a separate InstanceId (the replaced +
+  # the replacement each emit exactly 1), so MAX over the per-
+  # InstanceId series stays at 1 -- a real crash loop that restarts
+  # the same instance ID 2+ times in 5 min is what trips this.
+  evaluation_periods = 1
+  threshold          = 1
+  # Keep under ~160 chars so CloudWatch console views do not truncate
+  # the description; full rationale lives in the comment block above.
+  alarm_description  = "nhp-server instance restarted more than once in 5 min (crash-loop; regression class PR #1096). Fires independent of the log-driver pipeline."
+  alarm_actions      = [aws_sns_topic.alerts.arn]
+  ok_actions         = [aws_sns_topic.alerts.arn]
+  treat_missing_data = "notBreaching"
+
+  metric_query {
+    id = "per_instance_starts"
+    # MetricName="ServerStartupEvent" must stay in sync with
+    # MetricServerStartupEvent in endpoints/server/msghandler.go.
+    # The 300-second period matches the "5-minute window" phrasing
+    # in alarm_description and the rationale above.
+    expression  = "SEARCH('{LayerV/NHP,Environment,Cell,InstanceId} MetricName=\"ServerStartupEvent\" Environment=\"${var.environment}\" Cell=\"${var.cell_id}\"', 'Sum', 300)"
+    return_data = false
+    label       = "Per-instance startup events (5m)"
+  }
+
+  metric_query {
+    id          = "worst_instance"
+    expression  = "MAX(per_instance_starts)"
+    return_data = true
+    label       = "Max startup events across instances"
   }
 
   tags = merge(var.tags, {

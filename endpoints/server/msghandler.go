@@ -14,6 +14,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
@@ -72,6 +74,14 @@ const (
 	// race that used to panic the server; a sudden spike is a
 	// regression signal worth alarming on.
 	MetricTransactionClosed = "TransactionClosed"
+
+	// MetricServerStartupEvent is incremented once per server process
+	// start, emitted with an InstanceId dimension so alarms can fire
+	// per-instance (see terraform/modules/monitoring). Complements the
+	// fleet-wide log-metric-filter path that runs off the docker
+	// stderr log group (PR #1098). Two orthogonal pipelines feed the
+	// same alerting outcome; if one breaks, the other still fires.
+	MetricServerStartupEvent = "ServerStartupEvent"
 )
 
 // Multi-AC broadcast observability metric names (issue #376).
@@ -103,6 +113,22 @@ func (s *UdpServer) recordTransactionClosed(err error) {
 	if err != nil && s.metrics != nil && errors.Is(err, common.ErrTransactionClosed) {
 		s.metrics.IncrCounter(MetricTransactionClosed)
 	}
+}
+
+// recordServerStartup emits MetricServerStartupEvent with an InstanceId
+// dimension. Called once per process start from Start() before plugin
+// loading / listener setup so init crashes still register. No-ops when
+// s.instanceID is empty (IMDS unreachable at boot) or metrics are
+// unavailable (non-cloud local testing); the fleet-wide log-filter
+// alarm in terraform/modules/monitoring covers those instances via the
+// docker stderr pipeline instead.
+func (s *UdpServer) recordServerStartup() {
+	if s.instanceID == "" || s.metrics == nil {
+		return
+	}
+	s.metrics.IncrCounterWithDims(MetricServerStartupEvent, []types.Dimension{
+		{Name: dimNameInstanceId, Value: aws.String(s.instanceID)},
+	})
 }
 
 // forwardToTransaction finds the remote transaction and forwards the message to it.

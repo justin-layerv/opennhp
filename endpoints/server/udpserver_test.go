@@ -1608,3 +1608,62 @@ func TestBlockAddr_ConcurrentReadWrite(t *testing.T) {
 
 	wg.Wait()
 }
+
+// TestRecordServerStartup verifies that recordServerStartup emits
+// exactly one counter with the InstanceId dimension when both the
+// instance ID and the metrics publisher are available, and no-ops in
+// the expected edge cases (empty instance ID, nil metrics).
+//
+// Fences the regression class of "unexpected process restarts go
+// undetected" by confirming the per-instance alarm pipeline actually
+// emits its signal.
+func TestRecordServerStartup(t *testing.T) {
+	t.Run("emits one counter with InstanceId dim", func(t *testing.T) {
+		mp := metrics.NewPublisherForTest(t)
+		s := &UdpServer{
+			instanceID: "i-0abc123def456",
+			metrics:    mp,
+		}
+
+		s.recordServerStartup()
+
+		_, dimCounters := mp.CountersForTest(t)
+		// The publisher helper keys dimCounters by
+		// "<metric>|<dim>=<value>|..." — assert by substring so we do
+		// not depend on exact key formatting.
+		var found bool
+		for key, value := range dimCounters {
+			if strings.Contains(key, MetricServerStartupEvent) &&
+				strings.Contains(key, "InstanceId=i-0abc123def456") {
+				if value != 1 {
+					t.Errorf("counter value = %v, want 1", value)
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected counter %q with InstanceId=i-0abc123def456, got dimCounters=%v",
+				MetricServerStartupEvent, dimCounters)
+		}
+	})
+
+	t.Run("no-op when instanceID empty", func(t *testing.T) {
+		mp := metrics.NewPublisherForTest(t)
+		s := &UdpServer{instanceID: "", metrics: mp}
+
+		s.recordServerStartup()
+
+		counters, dimCounters := mp.CountersForTest(t)
+		if len(counters) != 0 || len(dimCounters) != 0 {
+			t.Errorf("expected no counters when instanceID is empty; got counters=%v dimCounters=%v",
+				counters, dimCounters)
+		}
+	})
+
+	t.Run("no-op when metrics nil", func(t *testing.T) {
+		s := &UdpServer{instanceID: "i-test", metrics: nil}
+
+		// Must not panic.
+		s.recordServerStartup()
+	})
+}

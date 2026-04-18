@@ -37,6 +37,12 @@ var (
 	ExeDirPath string
 )
 
+// dimNameInstanceId is the canonical CloudWatch dimension name for
+// per-instance metrics. Single source of truth so a typo (e.g.,
+// "InstanceID") can't silently split the time series across two
+// dimension values.
+var dimNameInstanceId = aws.String("InstanceId")
+
 // buildServerMetricDimensions returns the CloudWatch dimensions derived from environment
 // variables. Dimensions: [Environment, Cell]. CloudWatch alarms and Grafana dashboard
 // panels match on this exact set. Adding or removing dimensions creates a separate
@@ -376,6 +382,8 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	if cloudMode && s.cloudMap != nil {
 		s.registerWithCloudMap()
 	}
+
+	s.recordServerStartup()
 
 	// load asp resources and plugins
 	s.pluginHandlerMap = make(map[string]plugins.PluginHandler)
