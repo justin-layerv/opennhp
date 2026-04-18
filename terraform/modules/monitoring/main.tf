@@ -775,9 +775,12 @@ resource "aws_cloudwatch_log_metric_filter" "server_panic" {
 # via CloudWatch Embedded Metric Format from recordServerStartup() in
 # endpoints/server/msghandler.go; CloudWatch auto-extracts the
 # dimensioned metric from stdout-captured log events without a filter.
-# server_crash_loop (fleet-wide) was retired in the same migration --
-# server_instance_restart below catches single-instance crash loops
-# earlier and without fleet-size tuning.
+# server_crash_loop (fleet-wide) was retired in the same migration.
+# server_instance_restart below picks up that fleet-wide crash-loop
+# detection role (PR #1109 reshaped it from an attempted per-instance
+# SEARCH+MAX design to a classic aggregate alarm after AWS rejected
+# SEARCH in metric alarms). See ARCHITECTURE.md "Alarms Coupled to
+# Fleet Size" for the threshold rationale.
 
 # Any panic at all is actionable. The filter emits 1 on each match
 # and 0 otherwise (default_value = "0"), so every evaluation window
