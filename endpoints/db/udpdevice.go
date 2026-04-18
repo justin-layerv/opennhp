@@ -344,10 +344,13 @@ func (a *UdpDevice) recvPacketRoutine(conn *UdpConn) {
 		// add total recv bytes
 		atomic.AddUint64(&a.stats.totalRecvBytes, uint64(n))
 
-		// check minimal length
-		if n < pkt.MinimalLength() {
+		// Snapshot MinimalLength() before ReleasePoolPacket: the release
+		// nils pkt.Content, so a post-release call panics via unsafe.Pointer
+		// deref. Fenced by TestPacketMinimalLengthPanicsAfterRelease.
+		minLen := pkt.MinimalLength()
+		if n < minLen {
 			a.device.ReleasePoolPacket(pkt)
-			log.Error("[DB] received UDP packet from %s is too short (%d bytes, min %d), discarding", addrStr, n, pkt.MinimalLength())
+			log.Error("[DB] received UDP packet from %s is too short (%d bytes, min %d), discarding", addrStr, n, minLen)
 			continue
 		}
 
