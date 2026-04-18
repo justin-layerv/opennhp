@@ -8,6 +8,7 @@ package metrics
 // test-only APIs.
 
 import (
+	"bytes"
 	"io"
 	"testing"
 )
@@ -31,6 +32,19 @@ func NewPublisherForTest(t testing.TB) *Publisher {
 		stop:        make(chan struct{}),
 		emfWriter:   io.Discard,
 	}
+}
+
+// NewPublisherForTestWithEMFBuffer is like NewPublisherForTest but routes
+// EMF output to the returned bytes.Buffer so tests can assert on EMF
+// events emitted via EmitEMFCounterNow (or the flush-driven emitEMF
+// path). Use this when the code under test emits metrics via EMF
+// rather than IncrCounter / IncrCounterWithDims.
+func NewPublisherForTestWithEMFBuffer(t testing.TB) (*Publisher, *bytes.Buffer) {
+	t.Helper()
+	mp := NewPublisherForTest(t)
+	buf := &bytes.Buffer{}
+	mp.emfWriter = buf
+	return mp, buf
 }
 
 // CountersForTest returns snapshots of the in-memory counter state. It is

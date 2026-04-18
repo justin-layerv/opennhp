@@ -54,7 +54,7 @@ output "log_group_name" {
 }
 
 output "log_group_stderr_name" {
-  description = "CloudWatch log group name for container stdout/stderr (panics, runtime errors). Consumed by the monitoring module to attach metric filters that drive the ServerPanic and ServerStartupEvent alarms."
+  description = "CloudWatch log group name for container stdout/stderr (panics, runtime errors, EMF metric emissions). Consumed by the monitoring module: a metric filter drives the ServerPanic alarm, and CloudWatch auto-extracts ServerStartupEvent from EMF JSON lines emitted by the Go server at startup (#1107)."
   value       = aws_cloudwatch_log_group.server_stderr.name
 }
 

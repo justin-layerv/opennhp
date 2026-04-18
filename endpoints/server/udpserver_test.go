@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1610,16 +1611,16 @@ func TestBlockAddr_ConcurrentReadWrite(t *testing.T) {
 }
 
 // TestRecordServerStartup verifies that recordServerStartup emits
-// exactly one counter with the InstanceId dimension when both the
-// instance ID and the metrics publisher are available, and no-ops in
-// the expected edge cases (empty instance ID, nil metrics).
+// exactly one EMF counter event with the InstanceId dimension when
+// both the instance ID and the metrics publisher are available, and
+// no-ops in the expected edge cases (empty instance ID, nil metrics).
 //
 // Fences the regression class of "unexpected process restarts go
 // undetected" by confirming the per-instance alarm pipeline actually
-// emits its signal.
+// emits its signal via EMF (post-#1106 migration).
 func TestRecordServerStartup(t *testing.T) {
-	t.Run("emits one counter with InstanceId dim", func(t *testing.T) {
-		mp := metrics.NewPublisherForTest(t)
+	t.Run("emits one EMF event with InstanceId dim", func(t *testing.T) {
+		mp, buf := metrics.NewPublisherForTestWithEMFBuffer(t)
 		s := &UdpServer{
 			instanceID: "i-0abc123def456",
 			metrics:    mp,
@@ -1627,36 +1628,90 @@ func TestRecordServerStartup(t *testing.T) {
 
 		s.recordServerStartup()
 
-		_, dimCounters := mp.CountersForTest(t)
-		// The publisher helper keys dimCounters by
-		// "<metric>|<dim>=<value>|..." — assert by substring so we do
-		// not depend on exact key formatting.
-		var found bool
-		for key, value := range dimCounters {
-			if strings.Contains(key, MetricServerStartupEvent) &&
-				strings.Contains(key, "InstanceId=i-0abc123def456") {
-				if value != 1 {
-					t.Errorf("counter value = %v, want 1", value)
+		// Parse the single EMF JSON line written to the buffer.
+		raw := bytes.TrimSpace(buf.Bytes())
+		if len(raw) == 0 {
+			t.Fatalf("expected one EMF line, got empty buffer")
+		}
+		if bytes.Count(raw, []byte{'\n'}) != 0 {
+			t.Fatalf("expected exactly one EMF line, got multiple: %s", raw)
+		}
+		var event map[string]any
+		if err := json.Unmarshal(raw, &event); err != nil {
+			t.Fatalf("EMF line is not valid JSON: %v\nraw=%s", err, raw)
+		}
+		// Dimension value + metric value must both be present and correct.
+		if got := event["InstanceId"]; got != "i-0abc123def456" {
+			t.Errorf("InstanceId = %v, want i-0abc123def456", got)
+		}
+		if got := event[MetricServerStartupEvent]; got != float64(1) {
+			t.Errorf("%s = %v, want 1", MetricServerStartupEvent, got)
+		}
+		// Structural invariants on the _aws envelope: CloudWatch will
+		// silently fail to extract the metric if any of these are wrong.
+		awsBlock, ok := event["_aws"].(map[string]any)
+		if !ok {
+			t.Fatalf("missing _aws CloudWatchMetrics block in EMF event: %v", event)
+		}
+		// Scan CloudWatchMetrics for the expected directive rather
+		// than pinning list lengths -- if AWS adds optional EMF fields
+		// or we later emit a second Metrics entry in the same event,
+		// the load-bearing assertions still pass.
+		cwm, ok := awsBlock["CloudWatchMetrics"].([]any)
+		if !ok || len(cwm) == 0 {
+			t.Fatalf("_aws.CloudWatchMetrics missing or empty: %v", awsBlock["CloudWatchMetrics"])
+		}
+		var foundMetric, foundInstanceId, namespaceOK bool
+		for _, dirAny := range cwm {
+			directive, ok := dirAny.(map[string]any)
+			if !ok {
+				continue
+			}
+			if directive["Namespace"] == "LayerV/NHP" {
+				namespaceOK = true
+			}
+			metrics, _ := directive["Metrics"].([]any)
+			for _, mAny := range metrics {
+				m, ok := mAny.(map[string]any)
+				if !ok {
+					continue
 				}
-				found = true
+				if m["Name"] == MetricServerStartupEvent && m["Unit"] == "Count" {
+					foundMetric = true
+				}
+			}
+			dimSets, _ := directive["Dimensions"].([]any)
+			for _, set := range dimSets {
+				names, ok := set.([]any)
+				if !ok {
+					continue
+				}
+				for _, n := range names {
+					if n == "InstanceId" {
+						foundInstanceId = true
+					}
+				}
 			}
 		}
-		if !found {
-			t.Errorf("expected counter %q with InstanceId=i-0abc123def456, got dimCounters=%v",
-				MetricServerStartupEvent, dimCounters)
+		if !namespaceOK {
+			t.Errorf("no CloudWatchMetrics directive with Namespace=LayerV/NHP in %v", cwm)
+		}
+		if !foundMetric {
+			t.Errorf("no Metrics entry with Name=%s, Unit=Count in %v", MetricServerStartupEvent, cwm)
+		}
+		if !foundInstanceId {
+			t.Errorf("InstanceId not in any Dimensions list in %v", cwm)
 		}
 	})
 
 	t.Run("no-op when instanceID empty", func(t *testing.T) {
-		mp := metrics.NewPublisherForTest(t)
+		mp, buf := metrics.NewPublisherForTestWithEMFBuffer(t)
 		s := &UdpServer{instanceID: "", metrics: mp}
 
 		s.recordServerStartup()
 
-		counters, dimCounters := mp.CountersForTest(t)
-		if len(counters) != 0 || len(dimCounters) != 0 {
-			t.Errorf("expected no counters when instanceID is empty; got counters=%v dimCounters=%v",
-				counters, dimCounters)
+		if buf.Len() != 0 {
+			t.Errorf("expected no EMF emission when instanceID is empty; got %q", buf.String())
 		}
 	})
 

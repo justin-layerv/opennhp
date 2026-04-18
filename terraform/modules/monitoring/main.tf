@@ -712,35 +712,23 @@ resource "aws_cloudwatch_metric_alarm" "dynamodb_read_latency" {
 }
 
 # ============================================================================
-# Server process observability: ServerPanic / ServerStartupEvent (fleet-wide)
+# Server process observability: ServerPanic (log-filter) + ServerStartupEvent (EMF)
 #
-# The nhp-server container's docker awslogs driver routes its stdout and
-# stderr to var.server_stderr_log_group_name. Go's runtime writes panics
-# directly to os.Stderr, bypassing the server's structured file logger,
-# so the existing /server log group will not see a panic; this log group
-# is where they surface.
+# The nhp-server container's docker awslogs driver routes stdout+stderr
+# to var.server_stderr_log_group_name.
 #
-# The two metric filters below convert specific line patterns in that
-# stream into CloudWatch metrics in LayerV/NHP. The patterns are:
+# ServerPanic
+#   Matches "panic:" written by Go's runtime (package runtime, gopanic)
+#   at the start of every panic stack trace, bypassing the structured
+#   file logger. MUST stay on the log-metric-filter path because a
+#   panicking process can't emit its own metric.
 #
-#   ServerPanic          - matches "panic:" which is what the Go
-#                          runtime emits at the start of every panic
-#                          stack trace (package runtime, gopanic).
-#   ServerStartupEvent   - matches "NHP-Server is running!" which is
-#                          the fixed banner emitted once per process
-#                          start from main.go (see nhp-server banner).
-#
-# Both are strings we emit ourselves (Go runtime + our own main banner),
-# so they are low-churn and maintained by the same team that owns the
-# alarms. Any intentional change to either string updates the filter in
-# the same PR.
-#
-# ServerStartupEvent is also emitted by the Go publisher as a
-# dimensioned metric (see endpoints/server/msghandler.go, drives
-# server_instance_restart below). When adding a new log-filter
-# metric here, pick the baked-in name path; for dimensioned
-# per-instance metrics, use the Go publisher. Don't cross the
-# streams — both paths collapse into one once #1107 (EMF) lands.
+# ServerStartupEvent
+#   Emitted as CloudWatch Embedded Metric Format (EMF) JSON from
+#   recordServerStartup() in endpoints/server/msghandler.go at process
+#   start. CloudWatch auto-extracts the dimensioned metric from the
+#   log stream without a filter resource -- this is the single source
+#   of truth. See #1106 for the migration rationale.
 # ============================================================================
 
 resource "aws_cloudwatch_log_metric_filter" "server_panic" {
@@ -775,33 +763,15 @@ resource "aws_cloudwatch_log_metric_filter" "server_panic" {
   }
 }
 
-resource "aws_cloudwatch_log_metric_filter" "server_startup_event" {
-  name           = "${var.name_prefix}-${var.cell_id}-server-startup-event"
-  log_group_name = var.server_stderr_log_group_name
-  # Match the banner printed once per process start. The banner is
-  # written as `fmt.Printf("  %s🚀 NHP-Server%s is running!\n",
-  # colorBold, colorReset)` in endpoints/server/main/main.go, so the
-  # actual bytes on stdout are
-  #   "  \033[1m🚀 NHP-Server\033[0m is running!\n"
-  # The ANSI reset (`\033[0m`) sits between "NHP-Server" and
-  # " is running!", breaking the contiguous substring. A single-quoted
-  # filter for the literal phrase therefore never matches.
-  # CloudWatch Logs treats space-separated quoted terms as AND, so
-  # splitting into two terms catches the banner regardless of any
-  # ANSI bytes (or future ornamentation) sitting between them. This
-  # is the only line in the binary's output where the bold "NHP-Server"
-  # substring co-occurs with "is running!", so false positives are not
-  # a concern.
-  pattern = "\"NHP-Server\" \"is running!\""
-
-  metric_transformation {
-    # Cell-scoped metric name. See server_panic above for rationale.
-    name          = "ServerStartupEvent-${local.metric_name_suffix}"
-    namespace     = "LayerV/NHP"
-    value         = "1"
-    default_value = "0"
-  }
-}
+# NOTE: The ServerStartupEvent log-metric-filter that previously lived
+# here (substring match on the startup banner) was removed in the EMF
+# migration (issue #1106). The Go server now emits the metric directly
+# via CloudWatch Embedded Metric Format from recordServerStartup() in
+# endpoints/server/msghandler.go; CloudWatch auto-extracts the
+# dimensioned metric from stdout-captured log events without a filter.
+# server_crash_loop (fleet-wide) was retired in the same migration --
+# server_instance_restart below catches single-instance crash loops
+# earlier and without fleet-size tuning.
 
 # Any panic at all is actionable. The filter emits 1 on each match
 # and 0 otherwise (default_value = "0"), so every evaluation window
@@ -846,66 +816,19 @@ resource "aws_cloudwatch_metric_alarm" "server_panic" {
   })
 }
 
-# Fleet-wide startup counter. Threshold of 4 is chosen so a normal
-# blue/green deploy (3 new instances, 3 startup events in the window)
-# does not trip, while a real crash loop (observed at 5-8 restarts per
-# instance per 5-minute window in the PR #1096 incident) does.
-#
-# If the fleet scales past 3 servers, revisit this threshold alongside
-# buildServerMetricDimensions(). The server_instance_restart alarm
-# below (PR #1099) is per-instance and insensitive to fleet size, so
-# it catches single-instance crash loops without this tuning.
-#
-# Known overlap scenario: if a Terraform instance refresh on the blue
-# fleet coincides with a blue/green deploy spinning up the green fleet,
-# the 5-minute window could see 6 startup events (3 replaced blue + 3
-# new green) and trip the threshold as a false positive.
-# datapoints_to_alarm = 2 below absorbs this by requiring the
-# high-startup state to persist for two consecutive 5-minute windows
-# (+5 min detection latency) before paging — a real crash loop at
-# 5-8 starts per instance per 5 minutes sustains comfortably above
-# the threshold across both windows.
-resource "aws_cloudwatch_metric_alarm" "server_crash_loop" {
-  alarm_name          = "${var.name_prefix}-${var.cell_id}-server-crash-loop"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 2
-  datapoints_to_alarm = 2
-  metric_name         = aws_cloudwatch_log_metric_filter.server_startup_event.metric_transformation[0].name
-  namespace           = aws_cloudwatch_log_metric_filter.server_startup_event.metric_transformation[0].namespace
-  period              = 300
-  statistic           = "Sum"
-  # Fleet of N servers × 1 start per blue/green deploy = N startup
-  # events in the window. Currently N = 3, so threshold of 4 catches
-  # the first crash-loop restart beyond a normal deploy. If the fleet
-  # scales to N=4 this alarm must be re-tuned to N+1.
-  threshold          = 4
-  alarm_description  = "nhp-server >4 starts in 5-min window, sustained 2 windows (crash-loop; PR #1096). Normal blue/green produces 3 starts."
-  alarm_actions      = [aws_sns_topic.alerts.arn]
-  ok_actions         = [aws_sns_topic.alerts.arn]
-  treat_missing_data = "notBreaching"
-
-  # No dimensions block: env/cell are baked into the metric_name
-  # (see server_startup_event filter's metric_transformation above).
-
-  tags = merge(var.tags, {
-    Component = "monitoring"
-    Cell      = var.cell_id
-  })
-}
-
 # ============================================================================
-# Per-instance server startup alarm (PR #1099)
+# Per-instance server startup alarm (PR #1099, EMF-migrated in #1106)
 #
 # The server emits a ServerStartupEvent counter with an InstanceId
-# dimension once per process start (see endpoints/server/udpserver.go,
-# gated on cloud mode where IMDS provides the instance ID). This alarm
-# fires when any single instance's startup count exceeds 1 in a
-# 5-minute window -- i.e., the process restarted. A healthy instance
-# emits one ServerStartupEvent at launch and nothing else; a crash
-# loop emits 5+ in 5 minutes. The server_crash_loop alarm above needs
-# the whole cell to see more than 4 events in two consecutive windows,
-# which masks a single instance crash-looping quietly. This alarm
-# catches that case.
+# dimension once per process start. Source: EMF JSON written to stdout
+# by recordServerStartup() in endpoints/server/msghandler.go; docker
+# captures the line, CloudWatch auto-extracts it as a metric in
+# LayerV/NHP. Gated on cloud mode where IMDS provides the instance ID.
+#
+# This alarm fires when any single instance's startup count exceeds 1
+# in a 5-minute window -- i.e., the process restarted. A healthy
+# instance emits exactly one ServerStartupEvent at launch; a crash
+# loop emits 5+ in 5 minutes.
 #
 # Metric math SEARCH picks up every time series with the InstanceId
 # dimension set. MAX over the search collapses a multi-instance fleet
@@ -913,10 +836,14 @@ resource "aws_cloudwatch_metric_alarm" "server_crash_loop" {
 # This form scales as instances are added or replaced without TF
 # changes; we never have to pre-declare instance IDs.
 #
-# Complements (does not replace) the server_panic and server_crash_loop
-# log-filter alarms above. If the docker stderr log driver breaks and
-# those stop receiving data, this alarm (fed by PutMetricData from the
-# Go process) still fires.
+# Shares transport with server_panic (both flow through docker
+# awslogs → CloudWatch Logs → metric extraction) but uses a
+# different detection mechanism: this one relies on CloudWatch's
+# EMF parser reading a structured JSON line the Go process emits
+# at startup; server_panic uses a substring-match metric filter on
+# "panic:" lines the Go runtime writes on its way out. A docker
+# awslogs outage darkens both; an EMF parser regression darkens
+# only this one.
 # ============================================================================
 resource "aws_cloudwatch_metric_alarm" "server_instance_restart" {
   alarm_name          = "${var.name_prefix}-${var.cell_id}-server-instance-restart"
@@ -932,7 +859,7 @@ resource "aws_cloudwatch_metric_alarm" "server_instance_restart" {
   threshold          = 1
   # Keep under ~160 chars so CloudWatch console views do not truncate
   # the description; full rationale lives in the comment block above.
-  alarm_description  = "nhp-server instance restarted more than once in 5 min (crash-loop; regression class PR #1096). Fires independent of the log-driver pipeline."
+  alarm_description  = "nhp-server instance restarted more than once in 5 min (crash-loop; regression class PR #1096). EMF-extracted from docker stderr; shares transport with server_panic."
   alarm_actions      = [aws_sns_topic.alerts.arn]
   ok_actions         = [aws_sns_topic.alerts.arn]
   treat_missing_data = "notBreaching"

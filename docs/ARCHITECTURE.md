@@ -1452,7 +1452,7 @@ The system publishes metrics to CloudWatch under the `LayerV/NHP` namespace from
 
 | Source | Metrics | How |
 |--------|---------|-----|
-| NHP Server (Go) | `KnockRequest`, `AuthSuccess`, `AuthFailure`, `KnockLatency` | Custom `MetricsPublisher` in `endpoints/server/metrics.go` — batches and flushes every 60s via `PutMetricData` with StatisticSets |
+| NHP Server (Go) | `KnockRequest`, `AuthSuccess`, `AuthFailure`, `KnockLatency`, `ServerStartupEvent`, `TransactionClosed` | `Publisher` in `endpoints/metrics/publisher.go` — counters and gauges flush every 60 s via `PutMetricData`; latency distributions and one-shot signals (startup, panic detection) emit CloudWatch Embedded Metric Format (EMF) JSON to stdout, auto-extracted at log ingestion (#1107) |
 | CloudWatch Agent | `mem_used_percent`, `disk_used_percent` | Installed on Server and AC instances via user_data; config in `/opt/aws/amazon-cloudwatch-agent/etc/` |
 | CI Workflows | `DeploymentEvent` | `put-metric-data` in blue-green, canary, and build-and-push workflows with Environment/Component/Strategy dimensions |
 
@@ -1464,8 +1464,9 @@ A small number of CloudWatch alarms in `terraform/modules/monitoring/` have thre
 
 | Alarm | Assumption | Must revisit when |
 |-------|-----------|-------------------|
-| `server-crash-loop` | Fleet of 3 servers × 1 start per blue/green deploy = 3 startup events in a 5-min window; threshold of 4 catches the first crash-loop restart | Fleet grows past 3 (bump threshold to N+1, or land the per-instance EMF alarm from PR #1099 which is dimensionally scalable) |
 | `ac-peer-count-low` | Evaluation window is tuned to ride through a single blue/green AC deploy (~15 min of zero peers) with margin | Deploy cadence or AC bring-up time changes materially |
+
+The previous fleet-coupled `server-crash-loop` alarm was retired in #1107; `server-instance-restart` catches the same class per-instance and is dimensionally scalable — no fleet-size tuning required.
 
 The inline Terraform comments on each alarm reference this table and the relevant PR history. Search for `regression class PR #1096` in `terraform/modules/monitoring/main.tf` for the detailed threshold derivations.
 

@@ -75,13 +75,18 @@ const (
 	// regression signal worth alarming on.
 	MetricTransactionClosed = "TransactionClosed"
 
-	// MetricServerStartupEvent is emitted once per server process
-	// start with an InstanceId dimension so server_instance_restart
-	// (terraform/modules/monitoring) can page per-instance via a
-	// SEARCH+MAX expression. A parallel non-dimensioned metric of
-	// the same logical event lives as a log-filter output
-	// "ServerStartupEvent-<env>-<cell>" until #1107 (EMF) collapses
-	// the two into one.
+	// MetricServerStartupEvent fires once per server process start,
+	// emitted via CloudWatch Embedded Metric Format (EMF). The Go
+	// server writes a JSON line to stdout at startup; docker's
+	// awslogs driver ships it to the nhp-server stderr log group,
+	// and CloudWatch auto-extracts the metric into LayerV/NHP with
+	// Environment / Cell / InstanceId dimensions. No metric filter
+	// or SDK PutMetricData call is involved -- CloudWatch's EMF
+	// parser handles both sides.
+	//
+	// Drives the server_instance_restart alarm in
+	// terraform/modules/monitoring (SEARCH+MAX over the per-
+	// InstanceId series).
 	MetricServerStartupEvent = "ServerStartupEvent"
 )
 
@@ -116,18 +121,22 @@ func (s *UdpServer) recordTransactionClosed(err error) {
 	}
 }
 
-// recordServerStartup emits MetricServerStartupEvent with an InstanceId
-// dimension. Called once per process start from Start() before plugin
-// loading / listener setup so init crashes still register. No-ops when
-// s.instanceID is empty (IMDS unreachable at boot) or metrics are
-// unavailable (non-cloud local testing); the fleet-wide log-filter
-// alarm in terraform/modules/monitoring covers those instances via the
-// docker stderr pipeline instead.
+// recordServerStartup emits MetricServerStartupEvent as a one-shot
+// EMF counter with an InstanceId dimension, writing to the publisher's
+// EMF output (docker-captured stdout). CloudWatch auto-extracts it
+// into LayerV/NHP. Called once per process start from Start() before
+// plugin loading / listener setup so init crashes still register.
+//
+// No-ops when s.instanceID is empty (IMDS unreachable at boot) or
+// when the publisher is unavailable (non-cloud local testing). The
+// log-filter panic alarm in terraform/modules/monitoring still covers
+// Go runtime panics that bypass this path entirely -- those can't
+// EMF-emit because the process is already dying.
 func (s *UdpServer) recordServerStartup() {
 	if s.instanceID == "" || s.metrics == nil {
 		return
 	}
-	s.metrics.IncrCounterWithDims(MetricServerStartupEvent, []types.Dimension{
+	s.metrics.EmitEMFCounterNow(MetricServerStartupEvent, []types.Dimension{
 		{Name: dimNameInstanceId, Value: aws.String(s.instanceID)},
 	})
 }

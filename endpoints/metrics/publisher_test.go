@@ -649,23 +649,19 @@ func newTestPublisher(t *testing.T, client cloudWatchClient) *Publisher {
 	}
 }
 
+// newTestPublisherWithEMF wraps NewPublisherForTestWithEMFBuffer with the
+// fields the in-package EMF tests need: an injected cloudWatchClient (which
+// NewPublisher* deliberately can't take because its type is unexported)
+// and the canonical Environment/Cell base dims. Keeps the struct literal
+// in one place (publisher_testhelpers.go) so a new Publisher field added
+// there doesn't silently diverge here.
 func newTestPublisherWithEMF(t *testing.T, client cloudWatchClient) (*Publisher, *bytes.Buffer) {
 	t.Helper()
-	buf := &bytes.Buffer{}
-	mp := &Publisher{
-		client:      client,
-		namespace:   "LayerV/NHP",
-		counters:    make(map[string]float64),
-		dimCounters: make(map[string]*dimCounterEntry),
-		gauges:      make(map[string]float64),
-		latencies:   make(map[string][]float64),
-		gaugeFuncs:  make(map[string]GaugeFunc),
-		stop:        make(chan struct{}),
-		emfWriter:   buf,
-		dims: []types.Dimension{
-			{Name: aws.String("Environment"), Value: aws.String("sandbox")},
-			{Name: aws.String("Cell"), Value: aws.String("cell0")},
-		},
+	mp, buf := NewPublisherForTestWithEMFBuffer(t)
+	mp.client = client
+	mp.dims = []types.Dimension{
+		{Name: aws.String("Environment"), Value: aws.String("sandbox")},
+		{Name: aws.String("Cell"), Value: aws.String("cell0")},
 	}
 	return mp, buf
 }

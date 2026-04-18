@@ -25,7 +25,7 @@ variable "asg_name" {
 }
 
 variable "server_stderr_log_group_name" {
-  description = "CloudWatch log group that receives the nhp-server container's stdout/stderr via the docker awslogs driver. Metric filters on this group drive the ServerPanic and ServerStartupEvent alarms."
+  description = "CloudWatch log group that receives the nhp-server container's stdout/stderr via the docker awslogs driver. A metric filter on this group drives the ServerPanic alarm; ServerStartupEvent is EMF-auto-extracted from JSON lines the Go server emits on startup (#1107)."
   type        = string
 }
 

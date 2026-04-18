@@ -542,20 +542,47 @@ type emfAWSBlock struct {
 
 const emfMaxValues = 150
 
-// emfUnitMilliseconds is the CloudWatch unit string for latency metrics emitted via EMF.
-const emfUnitMilliseconds = "Milliseconds"
+// CloudWatch unit strings for EMF emissions.
+const (
+	emfUnitMilliseconds = "Milliseconds"
+	emfUnitCount        = "Count"
+)
+
+// packDims splits a Dimension slice into the parallel (names slice, name→value map)
+// shapes that buildEMFEvent expects. Shared between emitEMF and EmitEMFMetricNow.
+func packDims(dims []types.Dimension) (names []string, values map[string]string) {
+	names = make([]string, len(dims))
+	values = make(map[string]string, len(dims))
+	for i, d := range dims {
+		names[i] = *d.Name
+		values[*d.Name] = *d.Value
+	}
+	return names, values
+}
+
+// writeEMFEvent marshals one EMF event and writes it plus a newline to the
+// publisher's emfWriter. Logs a warning on marshal or write errors tagged
+// with `warnContext` so the flush-loop and one-shot paths produce
+// distinguishable log lines. Shared inner helper for emitEMF and
+// EmitEMFMetricNow.
+func (mp *Publisher) writeEMFEvent(event map[string]any, warnContext string) {
+	data, err := json.Marshal(event)
+	if err != nil {
+		log.Warning("Failed to marshal %s: %v", warnContext, err)
+		return
+	}
+	data = append(data, '\n')
+	if _, err := mp.emfWriter.Write(data); err != nil {
+		log.Warning("Failed to write %s: %v", warnContext, err)
+	}
+}
 
 func (mp *Publisher) emitEMF(latencies map[string][]float64) {
 	if mp.emfWriter == nil {
 		return
 	}
 	ts := time.Now().UnixMilli()
-	dimNames := make([]string, len(mp.dims))
-	dimValues := make(map[string]string, len(mp.dims))
-	for i, d := range mp.dims {
-		dimNames[i] = *d.Name
-		dimValues[*d.Name] = *d.Value
-	}
+	dimNames, dimValues := packDims(mp.dims)
 	for name, values := range latencies {
 		if len(values) == 0 {
 			continue
@@ -565,22 +592,46 @@ func (mp *Publisher) emitEMF(latencies map[string][]float64) {
 			if end > len(values) {
 				end = len(values)
 			}
-			chunk := values[i:end]
-			event := buildEMFEvent(mp.namespace, name, dimNames, dimValues, chunk, ts)
-			data, err := json.Marshal(event)
-			if err != nil {
-				log.Warning("Failed to marshal EMF event for %s: %v", name, err)
-				continue
-			}
-			data = append(data, 10)
-			if _, err := mp.emfWriter.Write(data); err != nil {
-				log.Warning("Failed to write EMF event for %s: %v", name, err)
-			}
+			event := buildEMFEvent(mp.namespace, name, emfUnitMilliseconds, dimNames, dimValues, values[i:end], ts)
+			mp.writeEMFEvent(event, "EMF latency event for "+name)
 		}
 	}
 }
 
-func buildEMFEvent(namespace, metricName string, dimNames []string, dimValues map[string]string, values []float64, timestampMs int64) map[string]any {
+// EmitEMFMetricNow writes one EMF metric event immediately, bypassing the
+// flush loop. Namespace and base dimensions come from the Publisher;
+// extraDims are appended for this event only. Use for one-shot signals
+// (e.g., startup events) where the next flush window would be too late
+// and where CloudWatch EMF auto-extraction keeps the pipeline decoupled
+// from SDK credential / network state at the emission site.
+//
+// Concurrency: one marshaled JSON line per call. os.Stdout writes under
+// PIPE_BUF are atomic; callers routing emfWriter elsewhere must ensure
+// the destination's Write is concurrent-safe with the flush loop's
+// own emitEMF writes.
+//
+// No-op on a nil Publisher or nil emfWriter.
+func (mp *Publisher) EmitEMFMetricNow(name, unit string, value float64, extraDims []types.Dimension) {
+	if mp == nil || mp.emfWriter == nil {
+		return
+	}
+	allDims := make([]types.Dimension, 0, len(mp.dims)+len(extraDims))
+	allDims = append(allDims, mp.dims...)
+	allDims = append(allDims, extraDims...)
+	dimNames, dimValues := packDims(allDims)
+	event := buildEMFEvent(mp.namespace, name, unit, dimNames, dimValues, []float64{value}, time.Now().UnixMilli())
+	mp.writeEMFEvent(event, "EMF "+unit+" event for "+name)
+}
+
+// EmitEMFCounterNow is a convenience wrapper around EmitEMFMetricNow for
+// the common "increment once, Unit=Count" case. Retained for call-site
+// readability at startup/shutdown signals; more general callers should
+// use EmitEMFMetricNow directly.
+func (mp *Publisher) EmitEMFCounterNow(name string, extraDims []types.Dimension) {
+	mp.EmitEMFMetricNow(name, emfUnitCount, 1, extraDims)
+}
+
+func buildEMFEvent(namespace, metricName, unit string, dimNames []string, dimValues map[string]string, values []float64, timestampMs int64) map[string]any {
 	event := map[string]any{
 		"_aws": emfAWSBlock{
 			Timestamp: timestampMs,
@@ -588,7 +639,7 @@ func buildEMFEvent(namespace, metricName string, dimNames []string, dimValues ma
 				{
 					Namespace:  namespace,
 					Dimensions: [][]string{dimNames},
-					Metrics:    []emfMetricDefinition{{Name: metricName, Unit: emfUnitMilliseconds}},
+					Metrics:    []emfMetricDefinition{{Name: metricName, Unit: unit}},
 				},
 			},
 		},

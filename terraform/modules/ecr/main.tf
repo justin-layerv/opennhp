@@ -1317,9 +1317,12 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "logs:PutResourcePolicy",
           "logs:DescribeResourcePolicies",
           "logs:DescribeLogGroups",
-          # Log-metric filters (PR #1098: ServerPanic / ServerStartupEvent).
-          # TF manages the lifecycle end-to-end, so all three verbs must be
-          # present: create/update, delete on destroy, read on plan diff.
+          # Log-metric filter for ServerPanic (PR #1098). ServerStartupEvent
+          # moved to EMF in #1107 and no longer needs a filter resource,
+          # but the panic filter remains because a panicking process
+          # can't emit its own metric. TF manages the lifecycle end-to-
+          # end, so all three verbs must be present: create/update,
+          # delete on destroy, read on plan diff.
           "logs:PutMetricFilter",
           "logs:DeleteMetricFilter",
           "logs:DescribeMetricFilters",
