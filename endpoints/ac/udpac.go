@@ -231,6 +231,19 @@ func (a *UdpAC) IsRunning() bool {
 	return a.running.Load()
 }
 
+// recordTransactionClosed increments MetricTransactionClosed on the AC
+// registration's publisher iff err is common.ErrTransactionClosed. Nil-
+// safe on registration and its publisher, so call sites in the UDP
+// message handlers don't have to guard.
+func (a *UdpAC) recordTransactionClosed(err error) {
+	if err == nil || a.registration == nil || a.registration.metrics == nil {
+		return
+	}
+	if errors.Is(err, common.ErrTransactionClosed) {
+		a.registration.metrics.IncrCounter(MetricTransactionClosed)
+	}
+}
+
 func (a *UdpAC) newConnection(addr *net.UDPAddr) (conn *UdpConn) {
 	conn = &UdpConn{}
 	var err error
@@ -503,7 +516,9 @@ func (a *UdpAC) connectionRoutine(conn *UdpConn) {
 				transactionId := pkt.Counter()
 				transaction := a.device.FindLocalTransaction(transactionId)
 				if transaction != nil {
-					transaction.NextPacketCh <- pkt
+					if err := transaction.SendPacket(pkt); err != nil {
+						log.Warning("recvPacketRoutine: local transaction %d closed before forward: %v", transactionId, err)
+					}
 					continue
 				}
 			}

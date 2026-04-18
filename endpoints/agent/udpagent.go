@@ -524,7 +524,9 @@ func (a *UdpAgent) connectionRoutine(conn *UdpConn) {
 				transactionId := pkt.Counter()
 				transaction := a.device.FindLocalTransaction(transactionId)
 				if transaction != nil {
-					transaction.NextPacketCh <- pkt
+					if err := transaction.SendPacket(pkt); err != nil {
+						log.Warning("recvPacketRoutine: local transaction %d closed before forward: %v", transactionId, err)
+					}
 					continue
 				}
 			}

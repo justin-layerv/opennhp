@@ -1,6 +1,7 @@
 package core
 
 import (
+	"sync"
 	"time"
 
 	common "github.com/OpenNHP/opennhp/nhp/common"
@@ -13,7 +14,9 @@ type LocalTransaction struct {
 	mad           *MsgAssemblerData
 	NextPacketCh  chan *Packet           // higher level entities should redirect packet to this channel
 	ExternalMsgCh chan *PacketParserData // a channel to receive an external msg to complete the transaction
+	done          chan struct{}          // closed by Run() on exit; used by Send*() to avoid sending on a closed channel
 	timeout       int
+	testCloseOnce *sync.Once // test-only; nil for real transactions (see NewLocalTransactionForTest)
 }
 
 type RemoteTransaction struct {
@@ -21,7 +24,82 @@ type RemoteTransaction struct {
 	connData      *ConnectionData
 	parserData    *PacketParserData
 	NextMsgCh     chan *MsgData // higher level entities should redirect message to this channel
+	done          chan struct{} // closed by Run() on exit; used by SendMessage() to avoid sending on a closed channel
 	timeout       int
+	testCloseOnce *sync.Once // test-only; nil for real transactions (see NewRemoteTransactionForTest)
+}
+
+// newLocalTransaction is the single production constructor for
+// LocalTransaction. It enforces that done is non-nil so SendPacket /
+// SendExternalMsg's select can never degrade to the pre-fix blocking
+// send (a receive on a nil channel blocks forever inside select).
+func newLocalTransaction(id uint64, connData *ConnectionData, mad *MsgAssemblerData, timeout int) *LocalTransaction {
+	return &LocalTransaction{
+		transactionId: id,
+		connData:      connData,
+		mad:           mad,
+		NextPacketCh:  make(chan *Packet),
+		ExternalMsgCh: make(chan *PacketParserData),
+		done:          make(chan struct{}),
+		timeout:       timeout,
+	}
+}
+
+// newRemoteTransaction mirrors newLocalTransaction for RemoteTransaction.
+func newRemoteTransaction(id uint64, connData *ConnectionData, parserData *PacketParserData, timeout int) *RemoteTransaction {
+	return &RemoteTransaction{
+		transactionId: id,
+		connData:      connData,
+		parserData:    parserData,
+		NextMsgCh:     make(chan *MsgData),
+		done:          make(chan struct{}),
+		timeout:       timeout,
+	}
+}
+
+// SendMessage forwards md to the transaction's Run() goroutine, or
+// returns common.ErrTransactionClosed if the transaction has exited.
+// Safe to call concurrently; blocks until delivered or closed.
+func (t *RemoteTransaction) SendMessage(md *MsgData) error {
+	select {
+	case t.NextMsgCh <- md:
+		return nil
+	case <-t.done:
+		return common.ErrTransactionClosed
+	}
+}
+
+// Done returns a channel that is closed when the transaction exits.
+func (t *RemoteTransaction) Done() <-chan struct{} {
+	return t.done
+}
+
+// SendPacket forwards pkt to the local transaction's Run() goroutine,
+// or returns common.ErrTransactionClosed if it has exited.
+func (t *LocalTransaction) SendPacket(pkt *Packet) error {
+	select {
+	case t.NextPacketCh <- pkt:
+		return nil
+	case <-t.done:
+		return common.ErrTransactionClosed
+	}
+}
+
+// SendExternalMsg forwards ppd to the local transaction's Run() goroutine
+// via ExternalMsgCh, or returns common.ErrTransactionClosed if it has
+// exited.
+func (t *LocalTransaction) SendExternalMsg(ppd *PacketParserData) error {
+	select {
+	case t.ExternalMsgCh <- ppd:
+		return nil
+	case <-t.done:
+		return common.ErrTransactionClosed
+	}
+}
+
+// Done returns a channel that is closed when the transaction exits.
+func (t *LocalTransaction) Done() <-chan struct{} {
+	return t.done
 }
 
 func (d *Device) IsTransactionRequest(t int) bool {
@@ -143,16 +221,17 @@ func (t *LocalTransaction) Run() {
 	device := t.mad.device
 	var err error
 
-	t.ExternalMsgCh = make(chan *PacketParserData)
-
 	// clear up
 	defer func() {
 		t.mad.Destroy()
-		close(t.NextPacketCh)
-		close(t.ExternalMsgCh)
 
+		// delete + close(done) under the same mutex: Find*() returning
+		// non-nil implies done is still open, so Send*() either delivers
+		// or takes the done branch — never races a close on a message
+		// channel (that's why we don't close NextPacketCh/ExternalMsgCh).
 		device.localTransactionMutex.Lock()
 		delete(device.localTransactionMap, t.transactionId)
+		close(t.done)
 		device.localTransactionMutex.Unlock()
 
 		// if local transaction is expecting a response, return an error
@@ -235,10 +314,14 @@ func (t *RemoteTransaction) Run() {
 
 	defer func() {
 		t.parserData.Destroy()
-		close(t.NextMsgCh)
 
+		// delete + close(done) under the same mutex: Find*() returning
+		// non-nil implies done is still open, so SendMessage either
+		// delivers or takes the done branch — never races a close on
+		// NextMsgCh (that's why we don't close the message channel).
 		conn.RemoteTransactionMutex.Lock()
 		delete(conn.RemoteTransactionMap, t.transactionId)
+		close(t.done)
 		conn.RemoteTransactionMutex.Unlock()
 
 		conn.Done()

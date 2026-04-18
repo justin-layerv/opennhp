@@ -341,8 +341,12 @@ func (n *E2ETestNode) processReceivedPacket(data []byte, from *net.UDPAddr) {
 		transactionId := pkt.Counter()
 		transaction := n.device.FindLocalTransaction(transactionId)
 		if transaction != nil {
-			// Route to transaction - it will handle decryption with PrevAssemblerData
-			transaction.NextPacketCh <- pkt
+			// Route to transaction - it will handle decryption with PrevAssemblerData.
+			// Use SendPacket so a transaction that exits concurrently cannot race
+			// the channel close (mirrors production code paths post PR #1096).
+			if err := transaction.SendPacket(pkt); err != nil {
+				n.t.Logf("Node %s: transaction %d closed before forward: %v", n.id, transactionId, err)
+			}
 			return
 		}
 		// No matching transaction - fall through to normal processing

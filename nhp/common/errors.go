@@ -81,6 +81,7 @@ var (
 	ErrPacketToMessageRoutineStopped       = newError("50007", "packet to message routine stopped")
 	ErrInvalidIpAddress                    = newError("50008", "invalid ip address")
 	ErrPacketEncryptionFailed              = newError("50009", "packet encryption failed")
+	ErrTransactionClosed                   = newError("50010", "transaction closed before message could be forwarded")
 
 	// agent
 	ErrKnockUserNotSpecified   = newError("51001", "knock user not specified")

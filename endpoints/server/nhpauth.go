@@ -122,5 +122,5 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 
 	ackMd := makeMsgData(ppd, core.NHP_ACK, ackBytes)
 
-	return forwardToTransaction(ppd.ConnData, transactionId, ackMd, "server-agent", "HandleKnockRequest", knkMsg.UserId, addrStr)
+	return s.forwardToTransaction(ppd.ConnData, transactionId, ackMd, "server-agent", "HandleKnockRequest", knkMsg.UserId, addrStr)
 }

@@ -7,18 +7,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
 
 func TestForwardToTransaction(t *testing.T) {
 	t.Run("transaction not found returns error", func(t *testing.T) {
+		s := &UdpServer{}
 		connData := &core.ConnectionData{
 			RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
 		}
 
 		md := &core.MsgData{}
-		err := forwardToTransaction(connData, 42, md, "server-agent", "TestHandler", "user1", "1.2.3.4:5678")
+		err := s.forwardToTransaction(connData, 42, md, "server-agent", "TestHandler", "user1", "1.2.3.4:5678")
 
 		if !errors.Is(err, common.ErrTransactionIdNotFound) {
 			t.Errorf("expected ErrTransactionIdNotFound, got %v", err)
@@ -26,6 +28,7 @@ func TestForwardToTransaction(t *testing.T) {
 	})
 
 	t.Run("transaction found forwards message", func(t *testing.T) {
+		s := &UdpServer{}
 		connData := &core.ConnectionData{
 			RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
 		}
@@ -36,7 +39,7 @@ func TestForwardToTransaction(t *testing.T) {
 		md := &core.MsgData{
 			HeaderType: core.NHP_ACK,
 		}
-		err := forwardToTransaction(connData, 99, md, "server-agent", "TestHandler", "user1", "1.2.3.4:5678")
+		err := s.forwardToTransaction(connData, 99, md, "server-agent", "TestHandler", "user1", "1.2.3.4:5678")
 
 		if err != nil {
 			t.Fatalf("expected nil error, got %v", err)
@@ -49,6 +52,29 @@ func TestForwardToTransaction(t *testing.T) {
 			}
 		default:
 			t.Error("expected message to be sent to NextMsgCh")
+		}
+	})
+
+	t.Run("closed transaction increments MetricTransactionClosed", func(t *testing.T) {
+		mp := metrics.NewPublisherForTest(t)
+		s := &UdpServer{metrics: mp}
+
+		connData := &core.ConnectionData{
+			RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
+		}
+		msgCh := make(chan *core.MsgData) // unbuffered, no reader
+		tx := core.NewRemoteTransactionForTest(7, msgCh)
+		connData.RemoteTransactionMap[7] = tx
+		tx.CloseForTest() // simulate Run() exit between Find and Send
+
+		err := s.forwardToTransaction(connData, 7, &core.MsgData{}, "server-agent", "TestHandler", "user1", "1.2.3.4:5678")
+		if !errors.Is(err, common.ErrTransactionClosed) {
+			t.Fatalf("expected ErrTransactionClosed, got %v", err)
+		}
+
+		counters, _ := mp.CountersForTest(t)
+		if counters[MetricTransactionClosed] != 1 {
+			t.Errorf("expected %s=1, got %v", MetricTransactionClosed, counters[MetricTransactionClosed])
 		}
 	})
 }

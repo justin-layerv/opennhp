@@ -64,6 +64,14 @@ const (
 	MetricBroadcastDurationMs          = "BroadcastDurationMs"
 	MetricLicenseValidationRateLimited = "LicenseValidationRateLimited"
 	MetricASGFilterFailOpen            = "ASGFilterFailOpen"
+
+	// MetricTransactionClosed counts every SendMessage / SendPacket
+	// call that returns common.ErrTransactionClosed because the
+	// RemoteTransaction exited between FindRemoteTransaction and the
+	// channel send. Post PR #1096 this is the observable rate of the
+	// race that used to panic the server; a sudden spike is a
+	// regression signal worth alarming on.
+	MetricTransactionClosed = "TransactionClosed"
 )
 
 // Multi-AC broadcast observability metric names (issue #376).
@@ -86,17 +94,34 @@ func udpCorrelationCtx(timeout time.Duration, id string, transactionId uint64) (
 	return ContextWithRequestID(ctx, correlationID), cancel
 }
 
+// recordTransactionClosed increments MetricTransactionClosed iff err is
+// the transaction-closed race (not ErrTransactionIdNotFound and not a
+// random transport error). Single helper so every forward site that
+// calls a Send*() helper emits the same counter under the same
+// condition — callers never have to remember the errors.Is check.
+func (s *UdpServer) recordTransactionClosed(err error) {
+	if err != nil && s.metrics != nil && errors.Is(err, common.ErrTransactionClosed) {
+		s.metrics.IncrCounter(MetricTransactionClosed)
+	}
+}
+
 // forwardToTransaction finds the remote transaction and forwards the message to it.
-// Returns common.ErrTransactionIdNotFound if the transaction is not available.
+// Returns common.ErrTransactionIdNotFound if the transaction is not available,
+// or common.ErrTransactionClosed if the transaction exited between lookup and
+// delivery.
 //
 // Log format follows the codebase convention: component(id#txn@addr)[handler] message
-func forwardToTransaction(connData *core.ConnectionData, transactionId uint64, md *core.MsgData, component, handler, id, addrStr string) error {
+func (s *UdpServer) forwardToTransaction(connData *core.ConnectionData, transactionId uint64, md *core.MsgData, component, handler, id, addrStr string) error {
 	transaction := connData.FindRemoteTransaction(transactionId)
 	if transaction == nil {
 		log.Error("%s(%s#%d@%s)[%s] transaction is not available", component, id, transactionId, addrStr, handler)
 		return common.ErrTransactionIdNotFound
 	}
-	transaction.NextMsgCh <- md
+	if err := transaction.SendMessage(md); err != nil {
+		log.Error("%s(%s#%d@%s)[%s] transaction closed before message could be forwarded: %v", component, id, transactionId, addrStr, handler, err)
+		s.recordTransactionClosed(err)
+		return err
+	}
 	return nil
 }
 
@@ -208,7 +233,7 @@ func (s *UdpServer) HandleRegisterRequest(ppd *core.PacketParserData) (err error
 	}
 	rakMd := makeMsgData(ppd, core.NHP_RAK, rakBytes)
 
-	if fwdErr := forwardToTransaction(ppd.ConnData, transactionId, rakMd, "server-agent", "HandleRegisterRequest", regMsg.UserId, addrStr); fwdErr != nil {
+	if fwdErr := s.forwardToTransaction(ppd.ConnData, transactionId, rakMd, "server-agent", "HandleRegisterRequest", regMsg.UserId, addrStr); fwdErr != nil {
 		return fwdErr
 	}
 	return err
@@ -269,7 +294,7 @@ func (s *UdpServer) HandleListRequest(ppd *core.PacketParserData) (err error) {
 	}
 	ackMd := makeMsgData(ppd, core.NHP_LRT, lrtBytes)
 
-	if fwdErr := forwardToTransaction(ppd.ConnData, transactionId, ackMd, "server-agent", "HandleListRequest", lstMsg.UserId, addrStr); fwdErr != nil {
+	if fwdErr := s.forwardToTransaction(ppd.ConnData, transactionId, ackMd, "server-agent", "HandleListRequest", lstMsg.UserId, addrStr); fwdErr != nil {
 		return fwdErr
 	}
 	return err
@@ -338,7 +363,15 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 			}
 			aakMd := makeMsgData(ppd, core.NHP_AAK, aakBytes)
 			if transaction := ppd.ConnData.FindRemoteTransaction(transactionId); transaction != nil {
-				transaction.NextMsgCh <- aakMd
+				// Best-effort: license validation has already failed, so we
+				// return validationErr regardless of whether the AAK delivers.
+				// A SendMessage failure here means the transaction exited
+				// before we could send the error response (e.g., timeout);
+				// the AC will observe the transaction timeout and retry.
+				if sendErr := transaction.SendMessage(aakMd); sendErr != nil {
+					log.Error("server-ac(%s#%d@%s)[HandleACOnline] failed to forward license-validation AAK: %v", acId, transactionId, addrStr, sendErr)
+					s.recordTransactionClosed(sendErr)
+				}
 			}
 			s.metrics.IncrCounter(MetricACRegistrationFailure)
 			return validationErr
@@ -467,7 +500,7 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	s.metrics.IncrCounter(MetricACRegistrationSuccess)
 	s.metrics.RecordLatency(MetricACRegistrationLatency, float64(time.Since(regStart).Milliseconds()))
 
-	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-ac", "HandleACOnline", acId, addrStr)
+	return s.forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-ac", "HandleACOnline", acId, addrStr)
 }
 
 // handleACServerAssignment checks if the AC should be redirected to its assigned servers.
@@ -811,7 +844,7 @@ func (s *UdpServer) sendARD(
 	}
 	ardMd := makeMsgData(ppd, core.NHP_ARD, ardBytes)
 
-	return forwardToTransaction(ppd.ConnData, transactionId, ardMd, "server-ac", "HandleACOnline/ARD", acId, addrStr)
+	return s.forwardToTransaction(ppd.ConnData, transactionId, ardMd, "server-ac", "HandleACOnline/ARD", acId, addrStr)
 }
 
 // updateAssignmentWithSelf adds this server to an existing AC assignment,
@@ -1051,7 +1084,7 @@ func (s *UdpServer) HandleDBOnline(ppd *core.PacketParserData) (err error) {
 	}
 	aakMd := makeMsgData(ppd, core.NHP_DBA, aakBytes)
 
-	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-db", "HandleDBOnline", dbId, addrStr)
+	return s.forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-db", "HandleDBOnline", dbId, addrStr)
 }
 
 func (s *UdpServer) HandleDHPDARMessage(ppd *core.PacketParserData) (err error) {
@@ -1090,7 +1123,7 @@ func (s *UdpServer) HandleDHPDARMessage(ppd *core.PacketParserData) (err error) 
 	}
 	log.Debug("dagMsg:%s", (string)(aakBytes))
 	aakMd := makeMsgData(ppd, core.NHP_DSA, aakBytes)
-	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-agent", "HandleDHPDARMessage", doId, addrStr)
+	return s.forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-agent", "HandleDHPDARMessage", doId, addrStr)
 }
 
 func (s *UdpServer) HandleDHPDAVMessage(ppd *core.PacketParserData) (err error) {
@@ -1160,7 +1193,7 @@ func (s *UdpServer) HandleDHPDAVMessage(ppd *core.PacketParserData) (err error) 
 	}
 	log.Debug("dagMsg:%s", (string)(aakBytes))
 	aakMd := makeMsgData(ppd, core.NHP_DAG, aakBytes)
-	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-agent", "HandleDHPDAVMessage", doId, addrStr)
+	return s.forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-agent", "HandleDHPDAVMessage", doId, addrStr)
 }
 
 // HandleDHPDRGMessage
@@ -1202,7 +1235,7 @@ func (s *UdpServer) HandleDHPDRGMessage(ppd *core.PacketParserData) (err error) 
 	}
 	aakMd := makeMsgData(ppd, core.NHP_DAK, aakBytes)
 
-	return forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-db", "HandleDHPDRGMessage", doId, addrStr)
+	return s.forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-db", "HandleDHPDRGMessage", doId, addrStr)
 }
 
 func (s *UdpServer) onAttestationVerify(spo *common.SmartPolicy, attestation string) error {

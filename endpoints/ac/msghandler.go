@@ -79,13 +79,16 @@ func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
 	transaction := ppd.ConnData.FindRemoteTransaction(transactionId)
 	if transaction == nil {
 		log.Error("ac(%s#%d)[HandleUdpACOperations] transaction is not available", acId, transactionId)
-		err = common.ErrTransactionIdNotFound
-		return err
+		return common.ErrTransactionIdNotFound
 	}
 
-	transaction.NextMsgCh <- md
+	if sendErr := transaction.SendMessage(md); sendErr != nil {
+		log.Error("ac(%s#%d)[HandleUdpACOperations] transaction closed before forward: %v", acId, transactionId, sendErr)
+		a.recordTransactionClosed(sendErr)
+		return sendErr
+	}
 
-	return err
+	return nil
 }
 
 func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.NetAddress, dstAddrs []*common.NetAddress, openTimeSec int, artMsgIn *common.ACOpsResultMsg) (artMsg *common.ACOpsResultMsg, err error) {

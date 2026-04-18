@@ -115,10 +115,17 @@ const (
 
 // CloudWatch metric names for AC registration lifecycle.
 const (
-	MetricRegistrationAttempts    = "RegistrationAttempts"
-	MetricRegistrationSuccess     = "RegistrationSuccess"
-	MetricRegistrationFailure     = "RegistrationFailure"
-	MetricRegistrationLatency     = "RegistrationLatency"
+	MetricRegistrationAttempts = "RegistrationAttempts"
+	MetricRegistrationSuccess  = "RegistrationSuccess"
+	MetricRegistrationFailure  = "RegistrationFailure"
+	MetricRegistrationLatency  = "RegistrationLatency"
+
+	// MetricTransactionClosed counts forward-race hits on the AC side
+	// (transaction.SendMessage returned common.ErrTransactionClosed).
+	// Emitted in the same LayerV/NHP namespace as the server-side
+	// counter; separated by AC dimensions so AC and server rates are
+	// distinguishable in alarms / dashboards.
+	MetricTransactionClosed       = "TransactionClosed"
 	MetricServerConnections       = "ServerConnections"
 	MetricServerConnectionFailure = "ServerConnectionFailure"
 	MetricServerHealthFailures    = "ServerHealthFailures"
