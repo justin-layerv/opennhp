@@ -834,8 +834,14 @@ jobs:
           # protocol convergence on the active server fleet.
           KNOCK_READY_TIMEOUT_MINUTES: ${{ inputs.pre_switch_knock_ready_timeout_minutes }}
         run: |
+          # check-nrestarts=false: SERVER_ACTIVE_ASG is the long-lived
+          # active color; its NRestarts counter accumulates across
+          # historical incidents that aren't part of this deploy.
+          # Post-switch verification below passes check-nrestarts=true
+          # against the freshly-refreshed fleet where NRestarts=0 at
+          # launch is the right invariant.
           .github/scripts/verify-knock-ready.sh \
-            "$SERVER_ACTIVE_ASG" "pre-switch" "$KNOCK_READY_TIMEOUT_MINUTES"
+            "$SERVER_ACTIVE_ASG" "pre-switch" "$KNOCK_READY_TIMEOUT_MINUTES" "false"
 
       - name: "[Server] Dry Run Notice"
         if: needs.prepare.outputs.deploy_server == 'true' && inputs.dry_run == true

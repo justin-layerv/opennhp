@@ -3,11 +3,21 @@
 # all report AC peers connected via /health/knock-ready, then verify the
 # server process did not crash during the deploy window.
 #
-# Usage: verify-knock-ready.sh <asg-name> <label> <timeout-minutes>
+# Usage: verify-knock-ready.sh <asg-name> <label> <timeout-minutes> [check-nrestarts]
 #
 # Exits 0 if all instances report healthy across two consecutive
-# iterations AND none have a non-zero systemd NRestarts counter.
-# Exits 1 otherwise.
+# iterations AND (when check-nrestarts=true, the default) none have
+# a non-zero systemd NRestarts counter. Exits 1 otherwise.
+#
+# check-nrestarts (4th arg, default "true"): pass "false" when the
+# target ASG is long-lived (e.g., pre-switch invocations against the
+# active color). NRestarts is a per-boot counter that persists for
+# the instance's lifetime, so on a fleet that's been up for hours
+# or days it accumulates across unrelated incidents and the probe
+# returns stale data. Keep the default "true" when the fleet was
+# just refreshed (post-switch against the newly-active color);
+# NRestarts=0 at launch means any non-zero reading is this deploy's
+# window and the probe is semantically correct.
 #
 # Uses SSM RunShellScript to curl each instance's /health/knock-ready
 # endpoint. Captures stderr from AWS CLI calls to surface real errors
@@ -31,9 +41,14 @@
 
 set -euo pipefail
 
-ASG_NAME="${1:?Usage: verify-knock-ready.sh <asg-name> <label> <timeout-minutes>}"
+ASG_NAME="${1:?Usage: verify-knock-ready.sh <asg-name> <label> <timeout-minutes> [check-nrestarts]}"
 LABEL="${2:?}"
 TIMEOUT_MINUTES="${3:?}"
+CHECK_NRESTARTS="${4:-true}"
+if [[ "$CHECK_NRESTARTS" != "true" && "$CHECK_NRESTARTS" != "false" ]]; then
+  echo "::error::check-nrestarts must be 'true' or 'false'; got '$CHECK_NRESTARTS'"
+  exit 2
+fi
 
 # Discover InService instances
 mapfile -t INSTANCE_IDS < <(aws autoscaling describe-auto-scaling-groups \
@@ -229,11 +244,15 @@ check_nrestarts() {
 # clean without the counter).
 #
 # NRestarts is a per-boot counter (systemd resets it when the unit is
-# first started on the host). Blue/green always launches fresh EC2
-# instances for the target color, so NRestarts begins at 0 on every
-# instance this probe runs against -- any non-zero value means the
-# nhp-server process exited unexpectedly since this instance booted,
-# which is what we want to catch.
+# first started on the host). The "fresh instance" invariant (NRestarts
+# begins at 0 on launch) only holds when the target ASG was just
+# refreshed -- hence the caller-side gate: this function is only
+# invoked when check-nrestarts=true (default, post-switch). Pre-switch
+# callers pass "false" because they target the long-lived active ASG
+# whose NRestarts accumulates unrelated historical crashes. When the
+# gate is honored, any non-zero reading means the nhp-server process
+# exited unexpectedly during THIS deploy window, which is the signal
+# we want to catch.
 #
 # Probes run in parallel -- one background subshell per instance,
 # each capturing its single-line result to a per-instance tempfile --
@@ -338,6 +357,10 @@ while [[ $(date +%s) -lt $DEADLINE ]]; do
     CONSECUTIVE_READY=$((CONSECUTIVE_READY + 1))
     echo "[$LABEL] iter $ITERATION: all ${#INSTANCE_IDS[@]} instance(s) ready (consecutive=$CONSECUTIVE_READY/$CONSECUTIVE_REQUIRED)"
     if [[ $CONSECUTIVE_READY -ge $CONSECUTIVE_REQUIRED ]]; then
+      if [[ "$CHECK_NRESTARTS" == "false" ]]; then
+        echo "[$LABEL] Reached $CONSECUTIVE_REQUIRED consecutive all-ready iterations; crash probe disabled (check-nrestarts=false -- target ASG is long-lived, NRestarts reflects accumulated history not this deploy window)"
+        exit 0
+      fi
       echo "[$LABEL] Reached $CONSECUTIVE_REQUIRED consecutive all-ready iterations; verifying no crash occurred during the deploy window"
       if verify_no_crashes; then
         echo "[$LABEL] All ${#INSTANCE_IDS[@]} instance(s) stable and crash-free"
