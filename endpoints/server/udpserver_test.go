@@ -1618,9 +1618,9 @@ func TestBlockAddr_ConcurrentReadWrite(t *testing.T) {
 // edge cases (empty instance ID, nil metrics).
 //
 // Fences the regression class of "unexpected process restarts go
-// undetected" by confirming the per-instance alarm pipeline actually
-// emits its signal via EMF (post-#1106 migration) and that the
-// fleet-wide series the period_anchor queries (#1108) is also emitted.
+// undetected" by confirming EMF emission of both the per-instance
+// series (used by dashboards) and the fleet-wide series (drives the
+// server_instance_restart alarm after #1109).
 func TestRecordServerStartup(t *testing.T) {
 	t.Run("emits per-instance and fleet-wide EMF events", func(t *testing.T) {
 		mp, buf := metrics.NewPublisherForTestWithEMFBuffer(t)
@@ -1658,10 +1658,9 @@ func TestRecordServerStartup(t *testing.T) {
 		if fleetWide == nil {
 			t.Fatalf("no fleet-wide EMF event (no InstanceId) in buffer: %s", buf.String())
 		}
-		// Use the per-instance event as the anchor for the remaining
-		// structural assertions -- the fleet-wide one is a strict
-		// subset of its dim sets and isn't what the alarm's SEARCH
-		// targets.
+		// Assert structural invariants against the per-instance event;
+		// the fleet-wide event is a strict subset of its dim sets and
+		// gets its own narrower checks further down.
 		event := perInstance
 		// Dimension value + metric value must both be present and correct.
 		if got := event["InstanceId"]; got != "i-0abc123def456" {
@@ -1671,7 +1670,7 @@ func TestRecordServerStartup(t *testing.T) {
 			t.Errorf("%s = %v, want 1", MetricServerStartupEvent, got)
 		}
 		// Fleet-wide event must also carry the metric (drives the
-		// alarm's period_anchor).
+		// server_instance_restart alarm).
 		if got := fleetWide[MetricServerStartupEvent]; got != float64(1) {
 			t.Errorf("fleet-wide %s = %v, want 1", MetricServerStartupEvent, got)
 		}
@@ -1731,11 +1730,11 @@ func TestRecordServerStartup(t *testing.T) {
 			t.Errorf("InstanceId not in any Dimensions list in %v", cwm)
 		}
 
-		// The fleet-wide event is what the alarm's period_anchor
-		// queries. It must (a) carry the Namespace CloudWatch
+		// The fleet-wide event is what the server_instance_restart
+		// alarm consumes. It must (a) carry the Namespace CloudWatch
 		// expects and (b) EXCLUDE InstanceId from its dim sets -- a
 		// stray InstanceId here would route the series to a
-		// different metric identity and break the anchor silently.
+		// different metric identity and break the alarm silently.
 		fleetAWS, ok := fleetWide["_aws"].(map[string]any)
 		if !ok {
 			t.Fatalf("fleet-wide event missing _aws block: %v", fleetWide)
@@ -1780,13 +1779,13 @@ func TestRecordServerStartup(t *testing.T) {
 						hasCell = true
 					}
 				}
-				// The alarm's period_anchor queries with
+				// The server_instance_restart alarm queries with
 				// dimensions = { Environment, Cell }. If either
 				// goes missing from the EMF event's dim set, the
-				// anchor silently misses and the alarm loses its
-				// period.
+				// alarm's metric lookup silently misses and it
+				// stops firing on crash loops.
 				if !hasEnv || !hasCell {
-					t.Errorf("fleet-wide event Dimensions must include Environment + Cell so the alarm's period_anchor resolves; got %v", names)
+					t.Errorf("fleet-wide event Dimensions must include Environment + Cell so the server_instance_restart alarm resolves; got %v", names)
 				}
 			}
 		}

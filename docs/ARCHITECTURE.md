@@ -1464,9 +1464,10 @@ A small number of CloudWatch alarms in `terraform/modules/monitoring/` have thre
 
 | Alarm | Assumption | Must revisit when |
 |-------|-----------|-------------------|
+| `server-instance-restart` | Fleet of N servers × 1 start per blue/green deploy = N startup events in a 5-min window; threshold of N (with `GreaterThanThreshold`) fires on the first extra restart. Currently N=3 | Fleet grows past 3 (bump threshold to the new N) |
 | `ac-peer-count-low` | Evaluation window is tuned to ride through a single blue/green AC deploy (~15 min of zero peers) with margin | Deploy cadence or AC bring-up time changes materially |
 
-The previous fleet-coupled `server-crash-loop` alarm was retired in #1107; `server-instance-restart` catches the same class per-instance and is dimensionally scalable — no fleet-size tuning required.
+Historical note: an earlier design tried per-instance detection via metric_math `SEARCH+MAX` (#1099, #1108). AWS CloudWatch metric alarms reject the `SEARCH` expression (`ValidationError: SEARCH is not supported on Metric Alarms`), and ASG churn rules out enumerating InstanceIds in TF. The fleet-wide `Sum` form above is the only tractable alarm shape; per-InstanceId resolution is still emitted by `recordServerStartup` (endpoints/server/msghandler.go) and queryable from dashboards for investigation.
 
 The inline Terraform comments on each alarm reference this table and the relevant PR history. Search for `regression class PR #1096` in `terraform/modules/monitoring/main.tf` for the detailed threshold derivations.
 

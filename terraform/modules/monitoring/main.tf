@@ -22,12 +22,10 @@ locals {
   # stay on one convention without drifting into ad-hoc interpolations.
   metric_name_suffix = "${var.environment}-${var.cell_id}"
 
-  # Evaluation window for the server_instance_restart alarm, shared
-  # between the SEARCH expression's period arg and the period_anchor
-  # metric_query's period attribute. They MUST match -- the SEARCH
-  # arg controls the per-instance bucket width while the anchor
-  # supplies PutMetricAlarm's required Period; drift produces
-  # windows that skew against each other.
+  # Evaluation window for the server_instance_restart alarm's period
+  # attribute. Sized to fit a single blue/green deploy (~3 min) with
+  # margin, so a clean deploy produces one bucket of startup events
+  # rather than smearing across two.
   server_restart_period_seconds = 300
 }
 
@@ -825,102 +823,62 @@ resource "aws_cloudwatch_metric_alarm" "server_panic" {
 }
 
 # ============================================================================
-# Per-instance server startup alarm (PR #1099, EMF-migrated in #1106)
+# Server restart alarm (crash-loop detection; #1099 origin, reshaped in #1109)
 #
-# The server emits a ServerStartupEvent counter with an InstanceId
-# dimension once per process start. Source: EMF JSON written to stdout
-# by recordServerStartup() in endpoints/server/msghandler.go; docker
-# captures the line, CloudWatch auto-extracts it as a metric in
-# LayerV/NHP. Gated on cloud mode where IMDS provides the instance ID.
+# The alarm watches the FLEET-WIDE ServerStartupEvent sum in a 5-min
+# window and pages when it exceeds what a normal deploy produces.
 #
-# This alarm fires when any single instance's startup count exceeds 1
-# in a 5-minute window -- i.e., the process restarted. A healthy
-# instance emits exactly one ServerStartupEvent at launch; a crash
-# loop emits 5+ in 5 minutes.
+# We originally tried a per-instance design (SEARCH+MAX over the
+# per-InstanceId series). AWS CloudWatch metric alarms don't accept
+# the SEARCH expression -- it's dashboards/console only -- so every
+# apply of the per-instance form failed with
+#   ValidationError: SEARCH is not supported on Metric Alarms
+# Since ASG churn means we can't pre-enumerate InstanceIds in TF,
+# per-instance alarming via metric alarms isn't possible at all.
+# The per-InstanceId series is still emitted by recordServerStartup
+# (endpoints/server/msghandler.go) and available for dashboard /
+# ad-hoc investigation; this alarm is the automated page.
 #
-# Metric math SEARCH picks up every time series with the InstanceId
-# dimension set. MAX over the search collapses a multi-instance fleet
-# into a single "worst instance" signal for the alarm to evaluate.
-# This form scales as instances are added or replaced without TF
-# changes; we never have to pre-declare instance IDs.
+# Threshold: fleet of N server instances × 1 startup per blue/green
+# deploy = N events in the window. Current N=3, so threshold=3 with
+# GreaterThanThreshold trips on the first crash-loop restart beyond
+# a normal deploy (4th event). If the fleet grows past 3, bump to
+# the new N (see docs/ARCHITECTURE.md "Alarms Coupled to Fleet Size").
 #
-# Shares transport with server_panic (both flow through docker
-# awslogs → CloudWatch Logs → metric extraction) but uses a
-# different detection mechanism: this one relies on CloudWatch's
-# EMF parser reading a structured JSON line the Go process emits
-# at startup; server_panic uses a substring-match metric filter on
-# "panic:" lines the Go runtime writes on its way out. A docker
-# awslogs outage darkens both; an EMF parser regression darkens
-# only this one.
+# datapoints_to_alarm = evaluation_periods = 2 absorbs the known
+# overlap scenario where a Terraform instance refresh on blue
+# coincides with a blue/green deploy spinning up green -- the
+# 5-min window could see up to 2N = 6 starts once, not sustained,
+# so we require two consecutive breaches before paging.
+#
+# Shares transport with server_panic (docker awslogs → CWL → metric
+# extraction); different detection mechanism (EMF auto-extract vs
+# substring log filter). Awslogs outage darkens both; EMF parser
+# regression darkens only this one.
 # ============================================================================
 resource "aws_cloudwatch_metric_alarm" "server_instance_restart" {
   alarm_name          = "${var.name_prefix}-${var.cell_id}-server-instance-restart"
   comparison_operator = "GreaterThanThreshold"
-  # threshold=1 and evaluation_periods=1 together mean: a single
-  # instance emitting >1 ServerStartupEvent inside one 5-minute
-  # window pages immediately. An instance replacement during a normal
-  # instance refresh produces a separate InstanceId (the replaced +
-  # the replacement each emit exactly 1), so MAX over the per-
-  # InstanceId series stays at 1 -- a real crash loop that restarts
-  # the same instance ID 2+ times in 5 min is what trips this.
-  evaluation_periods = 1
-  threshold          = 1
-  # Keep under ~160 chars so CloudWatch console views do not truncate
-  # the description; full rationale lives in the comment block above.
-  alarm_description  = "nhp-server instance restarted more than once in 5 min (crash-loop; regression class PR #1096). EMF-extracted from docker stdout; shares transport with server_panic."
+  evaluation_periods  = 2
+  datapoints_to_alarm = 2
+  metric_name         = "ServerStartupEvent"
+  namespace           = "LayerV/NHP"
+  period              = local.server_restart_period_seconds
+  statistic           = "Sum"
+  # threshold = 3 + comparison_operator = GreaterThanThreshold means
+  # the alarm fires on the 4th start in a 5-min window -- i.e., the
+  # FIRST crash-loop restart beyond a normal blue/green deploy of 3
+  # instances. threshold = 4 here would require a second extra
+  # restart to trip, a silent off-by-one.
+  threshold          = 3
+  alarm_description  = "nhp-server fleet >3 starts in 5-min window, sustained 2 windows (crash-loop; PR #1096). Normal blue/green produces 3 starts; the 4th is a restart."
   alarm_actions      = [aws_sns_topic.alerts.arn]
   ok_actions         = [aws_sns_topic.alerts.arn]
   treat_missing_data = "notBreaching"
 
-  # Period anchor: an expression-only metric_math alarm leaves
-  # PutMetricAlarm's Period null and AWS rejects with
-  #   ValidationError: Period must not be null
-  # even though the SEARCH string below embeds its own 300s period.
-  # The AWS provider's schema ALSO forbids `period` at the alarm
-  # root alongside `metric_query`, so the period must travel inside
-  # a metric_query block with a concrete `metric {}` child.
-  # Upstream bug, closed unfixed:
-  #   https://github.com/hashicorp/terraform-provider-aws/issues/28617
-  #
-  # This anchor targets the fleet-wide ServerStartupEvent series
-  # (no InstanceId dim) that recordServerStartup() in
-  # endpoints/server/msghandler.go emits alongside the per-instance
-  # series. It carries return_data = false so it contributes only
-  # a period, not a threshold input. The fleet-wide series is also
-  # available for ad-hoc queries -- no wasted CloudWatch metric.
-  metric_query {
-    id = "period_anchor"
-    metric {
-      metric_name = "ServerStartupEvent"
-      namespace   = "LayerV/NHP"
-      period      = local.server_restart_period_seconds
-      stat        = "Sum"
-      dimensions = {
-        Environment = var.environment
-        Cell        = var.cell_id
-      }
-    }
-    return_data = false
-    label       = "Period anchor (fleet-wide ServerStartupEvent sum)"
-  }
-
-  metric_query {
-    id = "per_instance_starts"
-    # MetricName="ServerStartupEvent" must stay in sync with
-    # MetricServerStartupEvent in endpoints/server/msghandler.go.
-    # The 300-second period in the SEARCH arg + period_anchor above
-    # together satisfy both the CloudWatch query plan and the
-    # PutMetricAlarm API's Period requirement.
-    expression  = "SEARCH('{LayerV/NHP,Environment,Cell,InstanceId} MetricName=\"ServerStartupEvent\" Environment=\"${var.environment}\" Cell=\"${var.cell_id}\"', 'Sum', ${local.server_restart_period_seconds})"
-    return_data = false
-    label       = "Per-instance startup events (5m)"
-  }
-
-  metric_query {
-    id          = "worst_instance"
-    expression  = "MAX(per_instance_starts)"
-    return_data = true
-    label       = "Max startup events across instances"
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
   }
 
   tags = merge(var.tags, {

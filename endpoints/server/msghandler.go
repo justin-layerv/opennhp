@@ -79,14 +79,13 @@ const (
 	// emitted via CloudWatch Embedded Metric Format (EMF). The Go
 	// server writes a JSON line to stdout at startup; docker's
 	// awslogs driver ships it to the nhp-server stderr log group,
-	// and CloudWatch auto-extracts the metric into LayerV/NHP with
-	// Environment / Cell / InstanceId dimensions. No metric filter
-	// or SDK PutMetricData call is involved -- CloudWatch's EMF
-	// parser handles both sides.
+	// and CloudWatch auto-extracts the metric into LayerV/NHP.
 	//
-	// Drives the server_instance_restart alarm in
-	// terraform/modules/monitoring (SEARCH+MAX over the per-
-	// InstanceId series).
+	// Emitted in two dim-set variants (see recordServerStartup):
+	// a per-instance series (Environment/Cell/InstanceId, used by
+	// dashboards and ad-hoc investigation) and a fleet-wide series
+	// (Environment/Cell, drives the server_instance_restart alarm
+	// via a classic Sum-over-5min threshold).
 	MetricServerStartupEvent = "ServerStartupEvent"
 )
 
@@ -122,25 +121,29 @@ func (s *UdpServer) recordTransactionClosed(err error) {
 }
 
 // recordServerStartup emits MetricServerStartupEvent as two EMF counter
-// events: one with the InstanceId dim set (per-instance series, drives
-// server_instance_restart via SEARCH+MAX) and one without (fleet-wide
-// series, anchors the alarm's period and is available for ad-hoc queries).
+// events: one with the InstanceId dim set (per-instance series, used
+// by dashboards and ad-hoc incident investigation) and one without
+// (fleet-wide series, drives the server_instance_restart alarm in
+// terraform/modules/monitoring).
+//
 // Both fire from the publisher's EMF output (docker-captured stdout);
-// CloudWatch auto-extracts them into LayerV/NHP. Called once per process
-// start from Start() before plugin loading / listener setup so init
-// crashes still register.
+// CloudWatch auto-extracts them into LayerV/NHP. Called once per
+// process start from Start() before plugin loading / listener setup
+// so init crashes still register.
 //
-// The two-series shape exists because the server_instance_restart alarm
-// uses expression-only metric_query blocks (SEARCH + MAX) and AWS
-// PutMetricAlarm rejects such alarms with "Period must not be null"
-// (hashicorp/terraform-provider-aws#28617, closed unfixed). The alarm
-// carries a concrete metric_query referencing the fleet-wide series to
-// supply the required period without affecting threshold evaluation.
+// The fleet-wide series is what the alarm consumes because AWS
+// CloudWatch metric alarms reject the SEARCH expression ("SEARCH is
+// not supported on Metric Alarms"), so a per-InstanceId metric_math
+// alarm is not possible. ASG churn also rules out enumerating
+// InstanceIds in TF. Fleet-wide sum + threshold tuned to fleet size
+// is the only tractable form; per-instance resolution is available
+// from the other series for investigation only.
 //
-// No-ops when s.instanceID is empty (IMDS unreachable at boot) or when
-// the publisher is unavailable (non-cloud local testing). The log-filter
-// panic alarm still covers Go runtime panics that bypass this path --
-// those can't EMF-emit because the process is already dying.
+// No-ops when s.instanceID is empty (IMDS unreachable at boot) or
+// when the publisher is unavailable (non-cloud local testing). The
+// log-filter panic alarm still covers Go runtime panics that bypass
+// this path -- those can't EMF-emit because the process is already
+// dying.
 func (s *UdpServer) recordServerStartup() {
 	if s.instanceID == "" || s.metrics == nil {
 		return
