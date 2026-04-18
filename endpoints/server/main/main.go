@@ -12,6 +12,7 @@ import (
 
 	"github.com/urfave/cli/v2"
 
+	"github.com/OpenNHP/opennhp/endpoints/internal/termout"
 	"github.com/OpenNHP/opennhp/endpoints/server"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/version"
@@ -24,16 +25,18 @@ import (
 	_ "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/qurl"
 )
 
-// ANSI color codes
-const (
-	colorReset  = "\033[0m"
-	colorCyan   = "\033[36m"
-	colorGreen  = "\033[32m"
-	colorYellow = "\033[33m"
-	colorBlue   = "\033[34m"
-	colorPurple = "\033[35m"
-	colorBold   = "\033[1m"
-	colorDim    = "\033[2m"
+// Local aliases for the shared terminal-aware color vars; see
+// endpoints/internal/termout. The vars below capture the post-init
+// values at runtime (string values, not memory addresses).
+var (
+	colorReset  = termout.Reset
+	colorCyan   = termout.Cyan
+	colorGreen  = termout.Green
+	colorYellow = termout.Yellow
+	colorBlue   = termout.Blue
+	colorPurple = termout.Purple
+	colorBold   = termout.Bold
+	colorDim    = termout.Dim
 )
 
 func main() {
