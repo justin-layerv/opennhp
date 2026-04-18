@@ -747,10 +747,13 @@ resource "aws_cloudwatch_log_metric_filter" "server_panic" {
   pattern = "\"panic:\""
 
   metric_transformation {
-    name          = "ServerPanic"
-    namespace     = "LayerV/NHP"
-    value         = "1"
-    default_value = "0"
+    name      = "ServerPanic"
+    namespace = "LayerV/NHP"
+    value     = "1"
+    # default_value must not be set alongside dimensions -- AWS
+    # rejects PutMetricFilter with "dimensions and default value are
+    # mutually exclusive". Treating missing data as notBreaching on
+    # the alarm covers the "no panics in this window" case.
     dimensions = {
       Environment = var.environment
       Cell        = var.cell_id
@@ -778,10 +781,12 @@ resource "aws_cloudwatch_log_metric_filter" "server_startup_event" {
   pattern = "\"NHP-Server\" \"is running!\""
 
   metric_transformation {
-    name          = "ServerStartupEvent"
-    namespace     = "LayerV/NHP"
-    value         = "1"
-    default_value = "0"
+    name      = "ServerStartupEvent"
+    namespace = "LayerV/NHP"
+    value     = "1"
+    # default_value omitted -- AWS rejects it alongside dimensions.
+    # treat_missing_data=notBreaching on the crash-loop alarm
+    # handles quiet windows.
     dimensions = {
       Environment = var.environment
       Cell        = var.cell_id
@@ -789,11 +794,12 @@ resource "aws_cloudwatch_log_metric_filter" "server_startup_event" {
   }
 }
 
-# Any panic at all is actionable. treat_missing_data=notBreaching means
-# a quiet log group (no "panic:" lines) does not fire the alarm -- the
-# metric filter emits 0 on each log event that does not match, which
-# keeps the time series populated, but in periods with no log events at
-# all the series is missing rather than zero.
+# Any panic at all is actionable. The filter emits a datapoint only
+# when "panic:" is matched (default_value is not set -- it would
+# conflict with the dimensions block); periods with no matching
+# lines have no metric datapoint at all. treat_missing_data =
+# notBreaching collapses those quiet windows into the non-alarming
+# state, so the alarm only fires on an actual match.
 resource "aws_cloudwatch_metric_alarm" "server_panic" {
   alarm_name          = "${var.name_prefix}-${var.cell_id}-server-panic"
   comparison_operator = "GreaterThanOrEqualToThreshold"
