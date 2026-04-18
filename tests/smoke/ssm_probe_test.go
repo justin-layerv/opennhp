@@ -71,6 +71,7 @@ func TestSSMProbeNamedCommandsPassRejectList(t *testing.T) {
 		cmdHealthKnockReadyFromHost,
 		cmdDockerNhpServerRunning,
 		cmdDockerImageTag,
+		cmdSystemdNRestartsNhpServer,
 	}
 	for _, cmd := range allowed {
 		t.Run(cmd, func(t *testing.T) {

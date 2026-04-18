@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -70,6 +71,15 @@ const (
 
 	cmdDockerNhpServerRunning = "docker ps --filter name=nhp-server --format '{{.Status}}'"
 	cmdDockerImageTag         = "docker inspect --format '{{.Config.Image}}' nhp-server"
+
+	// cmdSystemdNRestartsNhpServer reads systemd's NRestarts counter
+	// for the nhp-server unit. systemd increments NRestarts only when
+	// the unit exits unexpectedly and is re-executed by Restart=; a
+	// user-driven `systemctl restart` does not bump it. Reading the
+	// counter is therefore a crisp signal for "did the server process
+	// crash during its current lifetime?" Zero is the only healthy
+	// value.
+	cmdSystemdNRestartsNhpServer = "systemctl show nhp-server --property=NRestarts --value"
 )
 
 // rejectPatterns are command substrings that must never appear in any
@@ -234,6 +244,26 @@ func probeDockerNhpServerRunning(ctx context.Context, instanceID string) (string
 // container was launched from (e.g. "layerv/nhp-server:abc123...").
 func probeDockerImageTag(ctx context.Context, instanceID string) (string, error) {
 	return sendShellScript(ctx, instanceID, cmdDockerImageTag)
+}
+
+// probeServerNRestarts returns systemd's NRestarts counter for the
+// nhp-server unit. Zero is the only healthy value; any non-zero means
+// the process panicked or exited non-zero during this instance's
+// lifetime and systemd re-executed it. Under normal operation the
+// server does not self-restart, so a non-zero counter is a direct
+// regression signal — most prominently for the class fixed in PR #1096
+// (panic: send on closed channel in RemoteTransaction.Run cleanup).
+func probeServerNRestarts(ctx context.Context, instanceID string) (int, error) {
+	out, err := sendShellScript(ctx, instanceID, cmdSystemdNRestartsNhpServer)
+	if err != nil {
+		return 0, err
+	}
+	out = strings.TrimSpace(out)
+	n, err := strconv.Atoi(out)
+	if err != nil {
+		return 0, fmt.Errorf("parse NRestarts %q: %w", out, err)
+	}
+	return n, nil
 }
 
 // sendShellScriptRaw is an UNEXPORTED test-only helper that lets
