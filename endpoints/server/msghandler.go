@@ -75,12 +75,13 @@ const (
 	// regression signal worth alarming on.
 	MetricTransactionClosed = "TransactionClosed"
 
-	// MetricServerStartupEvent is incremented once per server process
-	// start, emitted with an InstanceId dimension so alarms can fire
-	// per-instance (see terraform/modules/monitoring). Complements the
-	// fleet-wide log-metric-filter path that runs off the docker
-	// stderr log group (PR #1098). Two orthogonal pipelines feed the
-	// same alerting outcome; if one breaks, the other still fires.
+	// MetricServerStartupEvent is emitted once per server process
+	// start with an InstanceId dimension so server_instance_restart
+	// (terraform/modules/monitoring) can page per-instance via a
+	// SEARCH+MAX expression. A parallel non-dimensioned metric of
+	// the same logical event lives as a log-filter output
+	// "ServerStartupEvent-<env>-<cell>" until #1107 (EMF) collapses
+	// the two into one.
 	MetricServerStartupEvent = "ServerStartupEvent"
 )
 

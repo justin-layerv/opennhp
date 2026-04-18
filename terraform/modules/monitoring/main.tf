@@ -14,6 +14,13 @@ locals {
   alarm_missing_data = var.alarm_on_missing_data != null ? (
     var.alarm_on_missing_data ? "breaching" : "notBreaching"
   ) : (var.environment == "prod" ? "breaching" : "notBreaching")
+
+  # Suffix for log-filter-emitted metric names that need per-cell
+  # isolation when CloudWatch Dimensions aren't available (AWS
+  # rejects dimensions on substring-match filter patterns). Kept in
+  # a local so the two filter blocks below, plus any future ones,
+  # stay on one convention without drifting into ad-hoc interpolations.
+  metric_name_suffix = "${var.environment}-${var.cell_id}"
 }
 
 # SNS Topic for Alerts
@@ -727,6 +734,13 @@ resource "aws_cloudwatch_metric_alarm" "dynamodb_read_latency" {
 # so they are low-churn and maintained by the same team that owns the
 # alarms. Any intentional change to either string updates the filter in
 # the same PR.
+#
+# ServerStartupEvent is also emitted by the Go publisher as a
+# dimensioned metric (see endpoints/server/msghandler.go, drives
+# server_instance_restart below). When adding a new log-filter
+# metric here, pick the baked-in name path; for dimensioned
+# per-instance metrics, use the Go publisher. Don't cross the
+# streams — both paths collapse into one once #1107 (EMF) lands.
 # ============================================================================
 
 resource "aws_cloudwatch_log_metric_filter" "server_panic" {
@@ -747,17 +761,17 @@ resource "aws_cloudwatch_log_metric_filter" "server_panic" {
   pattern = "\"panic:\""
 
   metric_transformation {
-    name      = "ServerPanic"
-    namespace = "LayerV/NHP"
-    value     = "1"
-    # default_value must not be set alongside dimensions -- AWS
-    # rejects PutMetricFilter with "dimensions and default value are
-    # mutually exclusive". Treating missing data as notBreaching on
-    # the alarm covers the "no panics in this window" case.
-    dimensions = {
-      Environment = var.environment
-      Cell        = var.cell_id
-    }
+    # Cell-scoped metric name (not "ServerPanic" + dimensions) because
+    # AWS rejects dimensions on quoted-string filter patterns --
+    # "The specified filter pattern does not support dimensions".
+    # Dimensions would need to come from extracted log fields, but the
+    # Environment/Cell values are intrinsic to the log group, not the
+    # log content. Baking them into the metric name keeps per-cell
+    # isolation without the extractor.
+    name          = "ServerPanic-${local.metric_name_suffix}"
+    namespace     = "LayerV/NHP"
+    value         = "1"
+    default_value = "0"
   }
 }
 
@@ -781,25 +795,22 @@ resource "aws_cloudwatch_log_metric_filter" "server_startup_event" {
   pattern = "\"NHP-Server\" \"is running!\""
 
   metric_transformation {
-    name      = "ServerStartupEvent"
-    namespace = "LayerV/NHP"
-    value     = "1"
-    # default_value omitted -- AWS rejects it alongside dimensions.
-    # treat_missing_data=notBreaching on the crash-loop alarm
-    # handles quiet windows.
-    dimensions = {
-      Environment = var.environment
-      Cell        = var.cell_id
-    }
+    # Cell-scoped metric name. See server_panic above for rationale.
+    name          = "ServerStartupEvent-${local.metric_name_suffix}"
+    namespace     = "LayerV/NHP"
+    value         = "1"
+    default_value = "0"
   }
 }
 
-# Any panic at all is actionable. The filter emits a datapoint only
-# when "panic:" is matched (default_value is not set -- it would
-# conflict with the dimensions block); periods with no matching
-# lines have no metric datapoint at all. treat_missing_data =
-# notBreaching collapses those quiet windows into the non-alarming
-# state, so the alarm only fires on an actual match.
+# Any panic at all is actionable. The filter emits 1 on each match
+# and 0 otherwise (default_value = "0"), so every evaluation window
+# produces a datapoint -- the alarm fires on real matches, never on
+# the absence of log events. treat_missing_data = notBreaching is a
+# safety net for the edge where the log group itself goes silent
+# (no instances running, awslogs driver failure); insufficient_data
+# still pages via the alarm's insufficient_data_actions so we learn
+# about the blackout.
 resource "aws_cloudwatch_metric_alarm" "server_panic" {
   alarm_name          = "${var.name_prefix}-${var.cell_id}-server-panic"
   comparison_operator = "GreaterThanOrEqualToThreshold"
@@ -826,10 +837,8 @@ resource "aws_cloudwatch_metric_alarm" "server_panic" {
   insufficient_data_actions = [aws_sns_topic.alerts.arn]
   treat_missing_data        = "notBreaching"
 
-  dimensions = {
-    Environment = var.environment
-    Cell        = var.cell_id
-  }
+  # No dimensions block: env/cell are baked into the metric_name
+  # (see server_panic filter's metric_transformation above).
 
   tags = merge(var.tags, {
     Component = "monitoring"
@@ -875,10 +884,8 @@ resource "aws_cloudwatch_metric_alarm" "server_crash_loop" {
   ok_actions         = [aws_sns_topic.alerts.arn]
   treat_missing_data = "notBreaching"
 
-  dimensions = {
-    Environment = var.environment
-    Cell        = var.cell_id
-  }
+  # No dimensions block: env/cell are baked into the metric_name
+  # (see server_startup_event filter's metric_transformation above).
 
   tags = merge(var.tags, {
     Component = "monitoring"
