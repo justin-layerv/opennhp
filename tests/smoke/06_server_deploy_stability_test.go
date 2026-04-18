@@ -4,6 +4,7 @@ package smoke
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -63,8 +64,19 @@ func TestServerDeployStability_NRestartsZero(t *testing.T) {
 	// deploy is untrustworthy until SSM comes back. If the test
 	// ever evolves to need per-instance timeout isolation, give
 	// each subtest its own context.WithTimeout inside the t.Run body.
+	//
+	// MUST use t.Cleanup(cancel), not defer cancel(): t.Parallel()
+	// subtests below PAUSE until this parent function body returns,
+	// then run in parallel. A defer'd cancel fires on parent return,
+	// BEFORE the subtests start, handing them an already-canceled
+	// context. t.Cleanup fires after the test AND all its subtests
+	// complete -- the correct scope here. See pkg.go.dev docs on
+	// testing.T.Cleanup ("Cleanup registers a function to be called
+	// when the test (or subtest) and ALL ITS SUBTESTS complete").
+	// TestParallelSubtestsDontInheritCanceledCtx below locks this
+	// invariant in with no SSM dependency.
 	ctx, cancel := context.WithTimeout(context.Background(), nRestartsProbeBudget)
-	defer cancel()
+	t.Cleanup(cancel)
 
 	// Probe every instance in parallel — each SSM round-trip is
 	// ~4-10s, and a Tier 1 test that could cost ~fleet-size × 10s
@@ -74,6 +86,17 @@ func TestServerDeployStability_NRestartsZero(t *testing.T) {
 	for _, inst := range instances {
 		t.Run(inst, func(t *testing.T) {
 			t.Parallel()
+
+			// Load-bearing sanity check: if someone reverts the parent's
+			// t.Cleanup(cancel) back to defer cancel(), every SSM
+			// SendCommand below will fail with "context canceled" before
+			// any real probe runs, which produces a noisy but misleading
+			// error message. Short-circuit with a specific pointer at the
+			// root cause so the next reader doesn't chase an SSM red
+			// herring.
+			if err := ctx.Err(); err != nil {
+				t.Fatalf("parent ctx canceled before subtest started (ctx.Err=%v); parent must use t.Cleanup(cancel), not defer cancel(), when subtests call t.Parallel() -- see comment above on context creation", err)
+			}
 
 			n, err := probeServerNRestarts(ctx, inst)
 			if err != nil {
@@ -87,6 +110,40 @@ func TestServerDeployStability_NRestartsZero(t *testing.T) {
 					"Investigate journalctl -u nhp-server on this instance before re-deploying.", n, n)
 			}
 			t.Logf("NRestarts=0 (OK)")
+		})
+	}
+}
+
+// TestParallelSubtestsDontInheritCanceledCtx is a regression fence for
+// the specific bug class that broke TestServerDeployStability_NRestartsZero
+// (smoke run 24612063961 against main-post-#1112).
+//
+// The broken pattern: parent test builds a ctx with context.WithTimeout
+// and defers cancel; loop creates subtests that call t.Parallel() and
+// reference the parent ctx. t.Parallel() subtests pause until the parent
+// FUNCTION BODY returns; defer cancel fires on that return, BEFORE the
+// subtests unblock; subtests then run with an already-canceled context
+// and every network/SSM call fails immediately.
+//
+// Fix: use t.Cleanup(cancel) instead. Cleanup fires after the test AND
+// all its subtests complete (per testing.T.Cleanup godoc).
+//
+// This fence reproduces the lifecycle without any SSM/AWS dependency:
+// if a future edit swaps t.Cleanup back to defer, every subtest below
+// hits ctx.Err() != nil and the whole suite fails loudly with the same
+// root-cause pointer as the smoke path above.
+func TestParallelSubtestsDontInheritCanceledCtx(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	t.Cleanup(cancel)
+
+	for i := 0; i < 3; i++ {
+		t.Run(fmt.Sprintf("subtest-%d", i), func(t *testing.T) {
+			t.Parallel()
+			if err := ctx.Err(); err != nil {
+				t.Fatalf("parent ctx was canceled before subtest ran (ctx.Err=%v); parent must use t.Cleanup(cancel), not defer cancel(), when subtests call t.Parallel()", err)
+			}
 		})
 	}
 }
