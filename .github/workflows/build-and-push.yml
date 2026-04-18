@@ -544,6 +544,15 @@ jobs:
           # GOMODCACHE and GOCACHE are bind-mounted from the runner so
           # subsequent runs (and the Go vet step below) skip module
           # downloads and recompilation of unchanged packages.
+          #
+          # UID note: the runner owns $HOME/go/pkg/mod as the runner
+          # user, but golang:bookworm runs as root inside the container
+          # and writes cache entries as UID 0. Go's on-disk cache format
+          # is UID-agnostic so reads / writes interoperate cleanly, and
+          # actions/cache's post-save step uses sudo tar to archive
+          # root-owned files. If this image ever switches to a non-root
+          # user, the `mkdir -p` below plus the bind-mount owner will
+          # need to agree on the target UID (chown or --user).
           mkdir -p "$HOME/go/pkg/mod" "$HOME/.cache/go-build"
           docker run --rm \
             --privileged \
