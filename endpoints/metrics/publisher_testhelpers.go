@@ -9,8 +9,11 @@ package metrics
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 )
 
 // NewPublisherForTest constructs a Publisher with initialized in-memory maps
@@ -45,6 +48,37 @@ func NewPublisherForTestWithEMFBuffer(t testing.TB) (*Publisher, *bytes.Buffer) 
 	buf := &bytes.Buffer{}
 	mp.emfWriter = buf
 	return mp, buf
+}
+
+// SetBaseDimsForTest overrides the publisher's base dimensions so external-
+// package tests can exercise EMF / counter emission with a realistic dim set
+// (Environment, Cell) instead of the empty default that NewPublisherForTest
+// returns. Must be called before the code under test emits.
+func (mp *Publisher) SetBaseDimsForTest(t testing.TB, dims []types.Dimension) {
+	t.Helper()
+	mp.dims = dims
+}
+
+// ParseEMFLinesForTest splits a newline-separated EMF stream (e.g., the
+// bytes.Buffer returned by NewPublisherForTestWithEMFBuffer) into parsed
+// events. Empty lines are skipped; a JSON decode failure fails the test
+// immediately -- EMF lines that don't parse are a pipeline bug CloudWatch
+// would also fail to extract, so there's no useful "soft failure" mode.
+func ParseEMFLinesForTest(t testing.TB, data []byte) []map[string]any {
+	t.Helper()
+	lines := bytes.Split(bytes.TrimSpace(data), []byte{'\n'})
+	events := make([]map[string]any, 0, len(lines))
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal(line, &ev); err != nil {
+			t.Fatalf("invalid EMF JSON line: %v\nraw=%s", err, line)
+		}
+		events = append(events, ev)
+	}
+	return events
 }
 
 // CountersForTest returns snapshots of the in-memory counter state. It is

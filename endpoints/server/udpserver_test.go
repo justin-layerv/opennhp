@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +11,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 
 	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
@@ -1611,16 +1613,24 @@ func TestBlockAddr_ConcurrentReadWrite(t *testing.T) {
 }
 
 // TestRecordServerStartup verifies that recordServerStartup emits
-// exactly one EMF counter event with the InstanceId dimension when
-// both the instance ID and the metrics publisher are available, and
-// no-ops in the expected edge cases (empty instance ID, nil metrics).
+// both EMF counter events (per-instance + fleet-wide) when the instance
+// ID and the metrics publisher are available, and no-ops in the expected
+// edge cases (empty instance ID, nil metrics).
 //
 // Fences the regression class of "unexpected process restarts go
 // undetected" by confirming the per-instance alarm pipeline actually
-// emits its signal via EMF (post-#1106 migration).
+// emits its signal via EMF (post-#1106 migration) and that the
+// fleet-wide series the period_anchor queries (#1108) is also emitted.
 func TestRecordServerStartup(t *testing.T) {
-	t.Run("emits one EMF event with InstanceId dim", func(t *testing.T) {
+	t.Run("emits per-instance and fleet-wide EMF events", func(t *testing.T) {
 		mp, buf := metrics.NewPublisherForTestWithEMFBuffer(t)
+		// Mirror the production publisher's base dims so the fleet-wide
+		// assertion (Environment + Cell must be present) exercises the
+		// real emission shape, not an empty-dim test stub.
+		mp.SetBaseDimsForTest(t, []types.Dimension{
+			{Name: aws.String("Environment"), Value: aws.String("sandbox")},
+			{Name: aws.String("Cell"), Value: aws.String("cell0")},
+		})
 		s := &UdpServer{
 			instanceID: "i-0abc123def456",
 			metrics:    mp,
@@ -1628,24 +1638,42 @@ func TestRecordServerStartup(t *testing.T) {
 
 		s.recordServerStartup()
 
-		// Parse the single EMF JSON line written to the buffer.
-		raw := bytes.TrimSpace(buf.Bytes())
-		if len(raw) == 0 {
-			t.Fatalf("expected one EMF line, got empty buffer")
+		// Two EMF events expected: per-instance (with InstanceId) and
+		// fleet-wide (no InstanceId).
+		events := metrics.ParseEMFLinesForTest(t, buf.Bytes())
+		if len(events) != 2 {
+			t.Fatalf("expected exactly 2 EMF events (per-instance + fleet-wide), got %d: %s", len(events), buf.String())
 		}
-		if bytes.Count(raw, []byte{'\n'}) != 0 {
-			t.Fatalf("expected exactly one EMF line, got multiple: %s", raw)
+		var perInstance, fleetWide map[string]any
+		for _, ev := range events {
+			if _, hasID := ev["InstanceId"]; hasID {
+				perInstance = ev
+			} else {
+				fleetWide = ev
+			}
 		}
-		var event map[string]any
-		if err := json.Unmarshal(raw, &event); err != nil {
-			t.Fatalf("EMF line is not valid JSON: %v\nraw=%s", err, raw)
+		if perInstance == nil {
+			t.Fatalf("no per-instance EMF event (carrying InstanceId) in buffer: %s", buf.String())
 		}
+		if fleetWide == nil {
+			t.Fatalf("no fleet-wide EMF event (no InstanceId) in buffer: %s", buf.String())
+		}
+		// Use the per-instance event as the anchor for the remaining
+		// structural assertions -- the fleet-wide one is a strict
+		// subset of its dim sets and isn't what the alarm's SEARCH
+		// targets.
+		event := perInstance
 		// Dimension value + metric value must both be present and correct.
 		if got := event["InstanceId"]; got != "i-0abc123def456" {
 			t.Errorf("InstanceId = %v, want i-0abc123def456", got)
 		}
 		if got := event[MetricServerStartupEvent]; got != float64(1) {
 			t.Errorf("%s = %v, want 1", MetricServerStartupEvent, got)
+		}
+		// Fleet-wide event must also carry the metric (drives the
+		// alarm's period_anchor).
+		if got := fleetWide[MetricServerStartupEvent]; got != float64(1) {
+			t.Errorf("fleet-wide %s = %v, want 1", MetricServerStartupEvent, got)
 		}
 		// Structural invariants on the _aws envelope: CloudWatch will
 		// silently fail to extract the metric if any of these are wrong.
@@ -1701,6 +1729,72 @@ func TestRecordServerStartup(t *testing.T) {
 		}
 		if !foundInstanceId {
 			t.Errorf("InstanceId not in any Dimensions list in %v", cwm)
+		}
+
+		// The fleet-wide event is what the alarm's period_anchor
+		// queries. It must (a) carry the Namespace CloudWatch
+		// expects and (b) EXCLUDE InstanceId from its dim sets -- a
+		// stray InstanceId here would route the series to a
+		// different metric identity and break the anchor silently.
+		fleetAWS, ok := fleetWide["_aws"].(map[string]any)
+		if !ok {
+			t.Fatalf("fleet-wide event missing _aws block: %v", fleetWide)
+		}
+		fleetCwm, ok := fleetAWS["CloudWatchMetrics"].([]any)
+		if !ok || len(fleetCwm) == 0 {
+			t.Fatalf("fleet-wide _aws.CloudWatchMetrics missing or empty: %v", fleetAWS)
+		}
+		var fleetNamespaceOK, fleetMetricOK bool
+		for _, dirAny := range fleetCwm {
+			directive, ok := dirAny.(map[string]any)
+			if !ok {
+				continue
+			}
+			if directive["Namespace"] == "LayerV/NHP" {
+				fleetNamespaceOK = true
+			}
+			fleetMetrics, _ := directive["Metrics"].([]any)
+			for _, mAny := range fleetMetrics {
+				m, ok := mAny.(map[string]any)
+				if !ok {
+					continue
+				}
+				if m["Name"] == MetricServerStartupEvent && m["Unit"] == "Count" {
+					fleetMetricOK = true
+				}
+			}
+			dimSets, _ := directive["Dimensions"].([]any)
+			for _, set := range dimSets {
+				names, ok := set.([]any)
+				if !ok {
+					continue
+				}
+				var hasEnv, hasCell bool
+				for _, n := range names {
+					switch n {
+					case "InstanceId":
+						t.Errorf("fleet-wide event unexpectedly declares InstanceId in Dimensions: %v", names)
+					case "Environment":
+						hasEnv = true
+					case "Cell":
+						hasCell = true
+					}
+				}
+				// The alarm's period_anchor queries with
+				// dimensions = { Environment, Cell }. If either
+				// goes missing from the EMF event's dim set, the
+				// anchor silently misses and the alarm loses its
+				// period.
+				if !hasEnv || !hasCell {
+					t.Errorf("fleet-wide event Dimensions must include Environment + Cell so the alarm's period_anchor resolves; got %v", names)
+				}
+			}
+		}
+		if !fleetNamespaceOK {
+			t.Errorf("fleet-wide event missing Namespace=LayerV/NHP: %v", fleetCwm)
+		}
+		if !fleetMetricOK {
+			t.Errorf("fleet-wide event missing Metrics entry Name=%s, Unit=Count: %v", MetricServerStartupEvent, fleetCwm)
 		}
 	})
 

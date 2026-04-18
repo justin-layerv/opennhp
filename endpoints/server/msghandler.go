@@ -121,17 +121,26 @@ func (s *UdpServer) recordTransactionClosed(err error) {
 	}
 }
 
-// recordServerStartup emits MetricServerStartupEvent as a one-shot
-// EMF counter with an InstanceId dimension, writing to the publisher's
-// EMF output (docker-captured stdout). CloudWatch auto-extracts it
-// into LayerV/NHP. Called once per process start from Start() before
-// plugin loading / listener setup so init crashes still register.
+// recordServerStartup emits MetricServerStartupEvent as two EMF counter
+// events: one with the InstanceId dim set (per-instance series, drives
+// server_instance_restart via SEARCH+MAX) and one without (fleet-wide
+// series, anchors the alarm's period and is available for ad-hoc queries).
+// Both fire from the publisher's EMF output (docker-captured stdout);
+// CloudWatch auto-extracts them into LayerV/NHP. Called once per process
+// start from Start() before plugin loading / listener setup so init
+// crashes still register.
 //
-// No-ops when s.instanceID is empty (IMDS unreachable at boot) or
-// when the publisher is unavailable (non-cloud local testing). The
-// log-filter panic alarm in terraform/modules/monitoring still covers
-// Go runtime panics that bypass this path entirely -- those can't
-// EMF-emit because the process is already dying.
+// The two-series shape exists because the server_instance_restart alarm
+// uses expression-only metric_query blocks (SEARCH + MAX) and AWS
+// PutMetricAlarm rejects such alarms with "Period must not be null"
+// (hashicorp/terraform-provider-aws#28617, closed unfixed). The alarm
+// carries a concrete metric_query referencing the fleet-wide series to
+// supply the required period without affecting threshold evaluation.
+//
+// No-ops when s.instanceID is empty (IMDS unreachable at boot) or when
+// the publisher is unavailable (non-cloud local testing). The log-filter
+// panic alarm still covers Go runtime panics that bypass this path --
+// those can't EMF-emit because the process is already dying.
 func (s *UdpServer) recordServerStartup() {
 	if s.instanceID == "" || s.metrics == nil {
 		return
@@ -139,6 +148,7 @@ func (s *UdpServer) recordServerStartup() {
 	s.metrics.EmitEMFCounterNow(MetricServerStartupEvent, []types.Dimension{
 		{Name: dimNameInstanceId, Value: aws.String(s.instanceID)},
 	})
+	s.metrics.EmitEMFCounterNow(MetricServerStartupEvent, nil)
 }
 
 // forwardToTransaction finds the remote transaction and forwards the message to it.

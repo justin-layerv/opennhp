@@ -21,6 +21,14 @@ locals {
   # a local so the two filter blocks below, plus any future ones,
   # stay on one convention without drifting into ad-hoc interpolations.
   metric_name_suffix = "${var.environment}-${var.cell_id}"
+
+  # Evaluation window for the server_instance_restart alarm, shared
+  # between the SEARCH expression's period arg and the period_anchor
+  # metric_query's period attribute. They MUST match -- the SEARCH
+  # arg controls the per-instance bucket width while the anchor
+  # supplies PutMetricAlarm's required Period; drift produces
+  # windows that skew against each other.
+  server_restart_period_seconds = 300
 }
 
 # SNS Topic for Alerts
@@ -859,18 +867,51 @@ resource "aws_cloudwatch_metric_alarm" "server_instance_restart" {
   threshold          = 1
   # Keep under ~160 chars so CloudWatch console views do not truncate
   # the description; full rationale lives in the comment block above.
-  alarm_description  = "nhp-server instance restarted more than once in 5 min (crash-loop; regression class PR #1096). EMF-extracted from docker stderr; shares transport with server_panic."
+  alarm_description  = "nhp-server instance restarted more than once in 5 min (crash-loop; regression class PR #1096). EMF-extracted from docker stdout; shares transport with server_panic."
   alarm_actions      = [aws_sns_topic.alerts.arn]
   ok_actions         = [aws_sns_topic.alerts.arn]
   treat_missing_data = "notBreaching"
+
+  # Period anchor: an expression-only metric_math alarm leaves
+  # PutMetricAlarm's Period null and AWS rejects with
+  #   ValidationError: Period must not be null
+  # even though the SEARCH string below embeds its own 300s period.
+  # The AWS provider's schema ALSO forbids `period` at the alarm
+  # root alongside `metric_query`, so the period must travel inside
+  # a metric_query block with a concrete `metric {}` child.
+  # Upstream bug, closed unfixed:
+  #   https://github.com/hashicorp/terraform-provider-aws/issues/28617
+  #
+  # This anchor targets the fleet-wide ServerStartupEvent series
+  # (no InstanceId dim) that recordServerStartup() in
+  # endpoints/server/msghandler.go emits alongside the per-instance
+  # series. It carries return_data = false so it contributes only
+  # a period, not a threshold input. The fleet-wide series is also
+  # available for ad-hoc queries -- no wasted CloudWatch metric.
+  metric_query {
+    id = "period_anchor"
+    metric {
+      metric_name = "ServerStartupEvent"
+      namespace   = "LayerV/NHP"
+      period      = local.server_restart_period_seconds
+      stat        = "Sum"
+      dimensions = {
+        Environment = var.environment
+        Cell        = var.cell_id
+      }
+    }
+    return_data = false
+    label       = "Period anchor (fleet-wide ServerStartupEvent sum)"
+  }
 
   metric_query {
     id = "per_instance_starts"
     # MetricName="ServerStartupEvent" must stay in sync with
     # MetricServerStartupEvent in endpoints/server/msghandler.go.
-    # The 300-second period matches the "5-minute window" phrasing
-    # in alarm_description and the rationale above.
-    expression  = "SEARCH('{LayerV/NHP,Environment,Cell,InstanceId} MetricName=\"ServerStartupEvent\" Environment=\"${var.environment}\" Cell=\"${var.cell_id}\"', 'Sum', 300)"
+    # The 300-second period in the SEARCH arg + period_anchor above
+    # together satisfy both the CloudWatch query plan and the
+    # PutMetricAlarm API's Period requirement.
+    expression  = "SEARCH('{LayerV/NHP,Environment,Cell,InstanceId} MetricName=\"ServerStartupEvent\" Environment=\"${var.environment}\" Cell=\"${var.cell_id}\"', 'Sum', ${local.server_restart_period_seconds})"
     return_data = false
     label       = "Per-instance startup events (5m)"
   }
