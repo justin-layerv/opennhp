@@ -51,7 +51,6 @@ jobs:
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
           # Note: --thinking-budget is not supported by the Claude Code CLI
-          # bundled in claude-code-action v1.0.93. Opus 4.6 uses extended
+          # bundled in claude-code-action v1.0.93. Opus 4.7 uses extended
           # thinking by default, so omitting the flag is fine.
-          claude_args: '--model claude-opus-4-6 --allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
-
+          claude_args: '--model claude-opus-4-7 --allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
