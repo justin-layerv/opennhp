@@ -303,6 +303,14 @@ FUZZ_TARGETS := \
 	FuzzACOpsResultMsg \
 	FuzzDARMsg
 
+# Endpoints-side fuzz targets (live in endpoints/server/, need
+# KBS_SKIP_INIT=1 to avoid the private-key init path firing during
+# test binary startup).
+FUZZ_TARGETS_ENDPOINTS := \
+	FuzzHttpKnockForwardRequest \
+	FuzzHttpKnockRequest \
+	FuzzHandleInternalKnockBypass
+
 # Run fuzz tests (full budget per target, for nightly / manual runs).
 # -run='^$$' skips every Test* in nhp/test/ so the fuzz runner only does
 # fuzz work — the regular tests are already covered by `make test` in
@@ -316,6 +324,10 @@ fuzz:
 	done
 	@echo "[OpenNHP]   -> FuzzNewVerifier"
 	@cd nhp && go test -run='^$$' -fuzz=FuzzNewVerifier -fuzztime=$(FUZZTIME_LONG) ./core/verifier/
+	@cd endpoints && for t in $(FUZZ_TARGETS_ENDPOINTS); do \
+		echo "[OpenNHP]   -> $$t"; \
+		KBS_SKIP_INIT=1 go test -run='^$$' -fuzz=$$t -fuzztime=$(FUZZTIME_LONG) ./server/ || exit 1; \
+	done
 	@echo "$(COLOUR_GREEN)[OpenNHP] Fuzz tests completed$(END_COLOUR)"
 
 # Run fuzz tests at a shortened budget (CI default; see fuzz: above for
@@ -328,6 +340,10 @@ fuzz-quick:
 	done
 	@echo "[OpenNHP]   -> FuzzNewVerifier"
 	@cd nhp && go test -run='^$$' -fuzz=FuzzNewVerifier -fuzztime=$(FUZZTIME_QUICK) ./core/verifier/
+	@cd endpoints && for t in $(FUZZ_TARGETS_ENDPOINTS); do \
+		echo "[OpenNHP]   -> $$t"; \
+		KBS_SKIP_INIT=1 go test -run='^$$' -fuzz=$$t -fuzztime=$(FUZZTIME_QUICK) ./server/ || exit 1; \
+	done
 	@echo "$(COLOUR_GREEN)[OpenNHP] Quick fuzz tests completed$(END_COLOUR)"
 
 archive:
