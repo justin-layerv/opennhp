@@ -160,8 +160,12 @@ make lint             # Run golangci-lint on nhp/ and endpoints/
 make lint-workflows   # Run actionlint + shellcheck on .github/workflows/ (mirrors CI)
 make test             # Run unit tests
 make test-local       # Run local e2e tests (requires etcd container)
-make fuzz-quick       # Run fuzz tests (10s each, for CI)
-make fuzz             # Run fuzz tests (60s each)
+make fuzz-quick       # Run fuzz tests briefly (FUZZTIME_QUICK, default 15s)
+make fuzz             # Run fuzz tests at full budget (FUZZTIME_LONG, default 60s)
+
+# Override the per-target fuzz budget (e.g., fast local smoke or long manual run):
+FUZZTIME_QUICK=2s make fuzz-quick
+FUZZTIME_LONG=5m  make fuzz
 ```
 
 ### Go (Manual)

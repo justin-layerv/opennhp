@@ -282,20 +282,48 @@ test-smoke-prod: ## Run smoke tests against prod (uses AWS_PROFILE=layerv-prod)
 
 test-all: test test-lambdas test-local ## Run all tests
 
-# Run fuzz tests (60 seconds each by default)
+# Fuzz parameters. 15s (not 10s) because an initial 10s CI run surfaced
+# "context deadline exceeded" as a test FAIL instead of a graceful stop
+# when -fuzztime expired mid-iteration on a 2-worker GitHub runner. See
+# qurl-service CI run 24648851303 (nhp#1188, qurl-service#325):
+#   https://github.com/layervai/qurl-service/actions/runs/24648851303
+# The 5s headroom is defensive padding. Override via FUZZTIME_QUICK /
+# FUZZTIME_LONG for longer nightly runs.
+FUZZTIME_QUICK ?= 15s
+FUZZTIME_LONG  ?= 60s
+
+# Single source of truth for the fuzz target list — `fuzz` and
+# `fuzz-quick` both iterate this. Adding a new fuzzer is one line here,
+# not one line in each recipe (the latter is how nhp#1175 happened).
+FUZZ_TARGETS := \
+	FuzzECDHFromKey \
+	FuzzHeaderTypeToDeviceType \
+	FuzzAgentKnockMsg \
+	FuzzServerKnockAckMsg \
+	FuzzACOpsResultMsg \
+	FuzzDARMsg
+
+# Run fuzz tests (full budget per target, for nightly / manual runs).
+# -run='^$$' skips every Test* in nhp/test/ so the fuzz runner only does
+# fuzz work — the regular tests are already covered by `make test` in
+# the build job, and a flaky unit test in that package would otherwise
+# flip this target red for reasons unrelated to fuzzing.
 fuzz:
-	@echo "$(COLOUR_BLUE)[OpenNHP] Running fuzz tests...$(END_COLOUR)"
-	cd nhp && go test -fuzz=FuzzECDHFromKey -fuzztime=60s ./test/
-	cd nhp && go test -fuzz=FuzzHeaderTypeToDeviceType -fuzztime=60s ./test/
-	cd nhp && go test -fuzz=FuzzAgentKnockMsg -fuzztime=60s ./test/
+	@echo "$(COLOUR_BLUE)[OpenNHP] Running fuzz tests (fuzztime=$(FUZZTIME_LONG))...$(END_COLOUR)"
+	@cd nhp && for t in $(FUZZ_TARGETS); do \
+		echo "[OpenNHP]   -> $$t"; \
+		go test -run='^$$' -fuzz=$$t -fuzztime=$(FUZZTIME_LONG) ./test/ || exit 1; \
+	done
 	@echo "$(COLOUR_GREEN)[OpenNHP] Fuzz tests completed$(END_COLOUR)"
 
-# Run fuzz tests briefly (for CI)
+# Run fuzz tests at a shortened budget (CI default; see fuzz: above for
+# the -run='^$$' rationale).
 fuzz-quick:
-	@echo "$(COLOUR_BLUE)[OpenNHP] Running quick fuzz tests...$(END_COLOUR)"
-	cd nhp && go test -fuzz=FuzzECDHFromKey -fuzztime=10s ./test/
-	cd nhp && go test -fuzz=FuzzHeaderTypeToDeviceType -fuzztime=10s ./test/
-	cd nhp && go test -fuzz=FuzzAgentKnockMsg -fuzztime=10s ./test/
+	@echo "$(COLOUR_BLUE)[OpenNHP] Running quick fuzz tests (fuzztime=$(FUZZTIME_QUICK))...$(END_COLOUR)"
+	@cd nhp && for t in $(FUZZ_TARGETS); do \
+		echo "[OpenNHP]   -> $$t"; \
+		go test -run='^$$' -fuzz=$$t -fuzztime=$(FUZZTIME_QUICK) ./test/ || exit 1; \
+	done
 	@echo "$(COLOUR_GREEN)[OpenNHP] Quick fuzz tests completed$(END_COLOUR)"
 
 archive:

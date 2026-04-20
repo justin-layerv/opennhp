@@ -93,3 +93,48 @@ jobs:
     - name: Run Local E2E Tests
       run: make test-local
       # testcontainers-go automatically manages the etcd container lifecycle
+
+  fuzz-quick:
+    # Runs every fuzz target under `make fuzz-quick` for ~15s each
+    # (default FUZZTIME_QUICK=15s in Makefile; overridable via env). The
+    # fuzzer list lives in the FUZZ_TARGETS variable in the Makefile —
+    # adding a new fuzzer is one line there, and this job picks it up
+    # automatically with no workflow change. Catches panics and assertion
+    # regressions on the parser / gate / validator surfaces.
+    runs-on: ubuntu-latest
+    # 10 min cap = ~6× headroom over the nominal 6 targets × 15s budget,
+    # defensive against a pathological input that wedges one iteration.
+    # Revisit if the fuzzer list grows past ~15.
+    timeout-minutes: 10
+    env:
+      # Avoid the private-key-dir creation path; see CLAUDE.md ("Test panic
+      # 'private key'").
+      KBS_SKIP_INIT: '1'
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - name: Set up Go
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        cache-dependency-path: nhp/go.sum
+
+    - name: Run quick fuzz pass
+      run: make fuzz-quick
+
+    # When go test -fuzz finds a crasher it writes the reproducer to
+    # <pkg>/testdata/fuzz/<FuzzName>/<hash>. That file would be destroyed
+    # with the runner; upload it as an artifact so whoever investigates
+    # the failure has the input without re-running fuzz. Glob covers any
+    # future fuzz target that lands in a package outside nhp/test/.
+    # overwrite: true so a rerun-failed-jobs attempt doesn't swallow the
+    # reproducer on the collision with the first attempt's artifact.
+    - name: Upload fuzz failure corpus
+      if: failure()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: fuzz-failure-corpus
+        path: nhp/**/testdata/fuzz/
+        if-no-files-found: ignore
+        retention-days: 14
+        overwrite: true
