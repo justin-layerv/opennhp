@@ -315,6 +315,40 @@ func TestManager_MarkStartupComplete(t *testing.T) {
 	}
 }
 
+// TestManager_StartupTimeoutGetter fences the contract that
+// HttpServer.warmStartupProbe relies on: the manager exposes its
+// configured StartupTimeout so the warmer can bound its polling loop
+// without re-deriving the value from env vars. See #1011.
+func TestManager_StartupTimeoutGetter(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		cfg  *ManagerConfig
+		want time.Duration
+	}{
+		{
+			name: "explicit startup timeout returned verbatim",
+			cfg:  &ManagerConfig{Service: "test", StartupTimeout: 90 * time.Second},
+			want: 90 * time.Second,
+		},
+		{
+			name: "default applied when StartupTimeout is zero",
+			cfg:  &ManagerConfig{Service: "test"},
+			want: 60 * time.Second,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			m := NewManager(tc.cfg)
+			if got := m.StartupTimeout(); got != tc.want {
+				t.Errorf("StartupTimeout() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestManager_IsHealthy(t *testing.T) {
 	t.Parallel()
 

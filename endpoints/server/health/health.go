@@ -217,6 +217,14 @@ func (m *Manager) CheckStartupWithRequestID(ctx context.Context, requestID strin
 	return resp
 }
 
+// StartupTimeout returns the configured startup grace period — the window
+// during which CheckStartup will still run readiness probes to flip
+// startupReady. Callers typically use this to bound a startup-probe
+// warming loop (see HttpServer.warmStartupProbe).
+func (m *Manager) StartupTimeout() time.Duration {
+	return m.startupTimeout
+}
+
 // IsStartupComplete returns true if the service has completed startup successfully.
 func (m *Manager) IsStartupComplete() bool {
 	return m.startupReady.Load()

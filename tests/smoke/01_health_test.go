@@ -20,6 +20,7 @@ package smoke
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"regexp"
 	"testing"
 	"time"
@@ -98,15 +99,32 @@ func TestHealthReady_NoCriticalFailures(t *testing.T) {
 	}
 }
 
-// Note: /health/startup returning 200 is NOT currently fenced. The
-// deployed nhp-server's startup probe stays at "unhealthy" with
-// startup_timeout=fail indefinitely (observed 2026-04-08 sandbox),
-// but no deploy gate consumes the signal — ASG uses EC2 instance
-// health, not a Kubernetes-style startup probe. Fencing this from
-// smoke would produce noise without surfacing an actionable
-// regression. Follow-up: investigate whether startup probe should
-// ever return 200 in the current deployment shape, and either fix
-// the server or remove the endpoint.
+// TestHealthStartup_Returns200 fences the contract the Kubernetes-style
+// startup probe is supposed to provide: once the server has finished
+// booting, /health/startup returns 200. Before #1011's fix, nothing
+// flipped startupReady from inside the process — the readiness checks
+// auto-flip it but only when CheckStartup is called within the
+// StartupTimeout window, and the first external probe typically arrives
+// after that window has elapsed. The fix added an in-process warmer
+// (HttpServer.warmStartupProbe) that polls CheckStartup until it
+// succeeds or the deadline passes.
+//
+// Regression fence for PR #1119 (warmStartupProbe goroutine).
+//
+// Wrapped in assertEventually because the warmer's first probe + the
+// 2s tick + a freshly-rolled instance landing inside its 60s startup
+// window can produce a single-shot 503 even on a healthy fleet. The
+// retry budget aligns this test with TestHealthKnockReady_ReflectsACPeerCount
+// below, which absorbs the same convergence window.
+func TestHealthStartup_Returns200(t *testing.T) {
+	assertEventually(t, postFlipMaxWait, postFlipPollInterval, func() error {
+		resp, body := doGet(t, testConfig.NHPServerBaseURL, "/health/startup", nil)
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("/health/startup = %d; body=%s", resp.StatusCode, truncate(body, 512))
+		}
+		return nil
+	})
+}
 
 // knockReadyPeerCountPattern matches the ac_peers check's message
 // field, e.g. "3 AC peer(s) connected". The server formats this string

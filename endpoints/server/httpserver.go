@@ -172,8 +172,109 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 		}
 	}()
 
+	// Warm the startup probe. The health manager's startupReady flag is
+	// only flipped from inside CheckStartup when readiness comes back
+	// healthy, and after StartupTimeout elapses CheckStartup short-circuits
+	// to 503 forever without running the probes. Without an in-process
+	// warmer, /health/startup never reaches a healthy state because the
+	// first external call typically arrives after the 60s grace window.
+	// Closes #1011.
+	//
+	// Add to WaitGroup BEFORE flipping running=true to avoid a race where
+	// Stop() observes running=true, calls wg.Wait() with the counter still
+	// zero, and the warmer's wg.Add(1) lands concurrently with Wait —
+	// sync.WaitGroup documents that combination as misuse and may panic.
+	// Same ordering as the http-server goroutine wg.Add(1) earlier in Start.
+	hs.wg.Add(1)
+	go hs.warmStartupProbe()
+
 	hs.running.Store(true)
 	return nil
+}
+
+// Startup warmer cadence. Tick interval is fast enough that a healthy
+// server flips ready well before any external prober's first call;
+// per-probe timeout bounds the storage check (etcd / DynamoDB) latency
+// independently of the outer StartupTimeout deadline.
+const (
+	startupWarmerTickInterval = 2 * time.Second
+	startupWarmerProbeTimeout = 5 * time.Second
+)
+
+// warmStartupProbe polls CheckStartup on the main healthManager every
+// startupWarmerTickInterval during the StartupTimeout window so that the
+// readiness probes have a chance to flip startupReady. Returns once startup
+// is marked complete, the deadline passes, or shutdown fires. Knock
+// readiness has its own gating via the AC peer checker on knockManager, so
+// we deliberately do NOT warm that one — it must stay failing until ACs
+// actually connect.
+//
+// healthManager is guaranteed non-nil here: Start() calls initHealthManager
+// (which always assigns it) before spawning the warmer goroutine, and
+// returns early if init failed.
+func (hs *HttpServer) warmStartupProbe() {
+	defer hs.wg.Done()
+
+	// Probe context derives from a parent that's canceled on shutdown,
+	// so a Stop() landing mid-probe propagates immediately into the in-
+	// flight CheckStartup instead of waiting up to startupWarmerProbeTimeout.
+	probeCtx, cancelProbeCtx := context.WithCancel(context.Background())
+	defer cancelProbeCtx()
+	go func() {
+		select {
+		case <-hs.signals.stop:
+			cancelProbeCtx()
+		case <-probeCtx.Done():
+		}
+	}()
+
+	timeout := hs.healthManager.StartupTimeout()
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(startupWarmerTickInterval)
+	defer ticker.Stop()
+
+	// First probe immediately so a fast-booting server doesn't wait the
+	// full tick interval before flipping ready.
+	if hs.checkStartupOnce(probeCtx) {
+		log.Info("Startup probe complete on first check")
+		return
+	}
+
+	for {
+		select {
+		case <-hs.signals.stop:
+			return
+		case <-ticker.C:
+			// Check the deadline before probing: once `Manager.startedAt +
+			// startupTimeout` has elapsed, CheckStartup short-circuits to
+			// 503 unconditionally (health.go: CheckStartupWithRequestID),
+			// so a post-deadline probe is wasted work that doesn't change
+			// the warmer's outcome.
+			if time.Now().After(deadline) {
+				log.Warning("Startup probe did not become healthy within %v; /health/startup will return 503 until next process restart", timeout)
+				return
+			}
+			if hs.checkStartupOnce(probeCtx) {
+				log.Info("Startup probe complete")
+				return
+			}
+		}
+	}
+}
+
+// checkStartupOnce runs CheckStartup with a bounded context and returns
+// whether startup is now marked complete. The CheckStartup return is
+// intentionally discarded — its side effect (flipping startupReady when
+// readiness comes back healthy) is what we care about; IsStartupComplete
+// reads the resulting flag.
+func (hs *HttpServer) checkStartupOnce(parent context.Context) bool {
+	if hs.healthManager.IsStartupComplete() {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(parent, startupWarmerProbeTimeout)
+	defer cancel()
+	_ = hs.healthManager.CheckStartup(ctx)
+	return hs.healthManager.IsStartupComplete()
 }
 
 // Stop stops the HttpServer by setting the running flag to false,
