@@ -328,6 +328,8 @@ fuzz:
 		echo "[OpenNHP]   -> $$t"; \
 		KBS_SKIP_INIT=1 go test -run='^$$' -fuzz=$$t -fuzztime=$(FUZZTIME_LONG) ./server/ || exit 1; \
 	done
+	@echo "[OpenNHP]   -> FuzzAccessTokenValidationDifferential"
+	@cd endpoints && KBS_SKIP_INIT=1 go test -run='^$$' -fuzz=FuzzAccessTokenValidationDifferential -fuzztime=$(FUZZTIME_LONG) ./server/staticplugins/qurl/
 	@echo "$(COLOUR_GREEN)[OpenNHP] Fuzz tests completed$(END_COLOUR)"
 
 # Run fuzz tests at a shortened budget (CI default; see fuzz: above for
@@ -344,6 +346,8 @@ fuzz-quick:
 		echo "[OpenNHP]   -> $$t"; \
 		KBS_SKIP_INIT=1 go test -run='^$$' -fuzz=$$t -fuzztime=$(FUZZTIME_QUICK) ./server/ || exit 1; \
 	done
+	@echo "[OpenNHP]   -> FuzzAccessTokenValidationDifferential"
+	@cd endpoints && KBS_SKIP_INIT=1 go test -run='^$$' -fuzz=FuzzAccessTokenValidationDifferential -fuzztime=$(FUZZTIME_QUICK) ./server/staticplugins/qurl/
 	@echo "$(COLOUR_GREEN)[OpenNHP] Quick fuzz tests completed$(END_COLOUR)"
 
 archive:
