@@ -13,6 +13,17 @@
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
+# Subnet lookups for the ALB — used below to compute QURL_TRUSTED_PROXY_CIDRS
+# from each subnet's cidr_block. This is the authoritative source for the
+# "what addresses does the ALB actually originate from" question, and keeps
+# the env var correct through any VPC resize or subnet remap without a
+# separate Terraform variable to keep in sync. See local.alb_subnet_cidrs
+# for how this is consumed.
+data "aws_subnet" "alb" {
+  for_each = toset(var.public_subnet_ids)
+  id       = each.value
+}
+
 # SSM parameter for image tag - created with default, updated by CI
 # The CI pipeline updates this parameter after pushing a new image to ECR.
 # Using lifecycle ignore_changes so CI updates don't cause drift.
@@ -113,6 +124,25 @@ locals {
     "http://${aws_lb.qurl.dns_name}"
   )
 
+  # Trusted-proxy CIDRs for Gin's SetTrustedProxies, derived from the ALB's
+  # own subnets (aws_lb.qurl.subnets = var.public_subnet_ids). This is the
+  # *exact* set of origin IPs the ALB can present to the container, so it's
+  # both necessary and sufficient — tighter than the VPC CIDR (which would
+  # also trust peers/workers) and auto-correct through any subnet resize.
+  # Consumed by qurl-service via the QURL_TRUSTED_PROXY_CIDRS env var below.
+  # See qurl-service PR #323 (fix #296): this variable MUST be set on the
+  # task definition before that PR can deploy to prod — prod hard-fails
+  # startup if it's empty. Sorted so Terraform doesn't show a spurious
+  # diff when AWS reorders subnet API responses.
+  #
+  # IPv4 only: aws_subnet.cidr_block returns the v4 CIDR. If the ALB ever
+  # becomes dual-stack or IPv6-only (aws_lb.qurl currently has no
+  # ip_address_type so it defaults to ipv4), extend this with
+  # `s.ipv6_cidr_block` filtered to non-empty — otherwise c.ClientIP()
+  # silently falls back to the TCP source for v6 connections with no
+  # operator signal.
+  alb_subnet_cidrs = sort([for s in data.aws_subnet.alb : s.cidr_block])
+
   # Container environment variables
   container_env = concat([
     { name = "QURL_ENV", value = local.is_prod ? "production" : "development" },
@@ -136,6 +166,15 @@ locals {
     { name = "AUDIT_RETENTION_DAYS", value = tostring(var.audit_retention_days) },
     { name = "CORS_ALLOWED_ORIGINS", value = var.cors_allowed_origins },
     { name = "ALLOWED_HOSTS", value = local.computed_allowed_hosts },
+    # Tells qurl-service which upstream IPs are allowed to set X-Forwarded-*
+    # headers. Without this set, the service treats XFF as untrusted
+    # caller-supplied data and falls back to the TCP source for c.ClientIP()
+    # — which is wrong when the ALB is terminating the connection. Prod
+    # (qurl-service cfg.IsProduction()) hard-fails startup on an empty
+    # value, so this env var is a deploy-order prerequisite for
+    # qurl-service PR #323. Derived from the ALB's own subnets so it
+    # stays correct through VPC/subnet changes.
+    { name = "QURL_TRUSTED_PROXY_CIDRS", value = join(",", local.alb_subnet_cidrs) },
     # Idempotency cache configuration
     { name = "IDEMPOTENCY_CACHE_TTL", value = tostring(var.idempotency_cache_ttl_seconds) },
     { name = "IDEMPOTENCY_CACHE_MAX_SIZE", value = tostring(var.idempotency_cache_max_size) },
@@ -795,6 +834,17 @@ resource "aws_ecs_task_definition" "qurl" {
       condition     = var.environment != "prod" || startswith(local.computed_api_base_url, "https://")
       error_message = "Production requires HTTPS: API_BASE_URL must use https:// in prod environment. Either provide certificate_arn or set api_base_url to an https:// URL."
     }
+
+    # Fails at plan time if QURL_TRUSTED_PROXY_CIDRS would be empty —
+    # qurl-service prod hard-fails startup on that condition, so catching
+    # it here gives operators a pre-apply error instead of a mid-rollout
+    # container crash. Relies on local.alb_subnet_cidrs being derived
+    # from var.public_subnet_ids, so a misconfigured module call surfaces
+    # here before it reaches the running service.
+    precondition {
+      condition     = length(local.alb_subnet_cidrs) > 0
+      error_message = "QURL_TRUSTED_PROXY_CIDRS would be empty: var.public_subnet_ids must resolve to at least one subnet with a cidr_block (qurl-service hard-fails startup in prod on an empty trust list)."
+    }
   }
 }
 
@@ -805,7 +855,12 @@ resource "aws_lb" "qurl" {
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
-  subnets            = var.public_subnet_ids
+  # The set of subnets here is also the source for QURL_TRUSTED_PROXY_CIDRS
+  # (see data.aws_subnet.alb + local.alb_subnet_cidrs). If you change this
+  # binding — e.g. move the ALB to a different subnet set — also re-point
+  # data.aws_subnet.alb, or the trust list will silently drift from the
+  # actual ALB origin IPs and reopen a narrow XFF-spoofing class.
+  subnets = var.public_subnet_ids
 
   # Access logging for production audit compliance
   dynamic "access_logs" {
