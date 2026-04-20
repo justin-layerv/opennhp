@@ -25,16 +25,6 @@ func NewUUID() (string, error) {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", uuid[0:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:]), nil
 }
 
-func RandNumber() int {
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	randomNumber := rng.Intn(10000)
-	if randomNumber < 1000 {
-		randomNumber += 1000
-	}
-
-	return randomNumber
-}
-
 // GenerateUUIDv4 creates a random UUID (version 4)
 func GenerateUUIDv4() (string, error) {
 	u, err := uuid.NewRandom()
