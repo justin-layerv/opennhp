@@ -28,19 +28,24 @@ func FuzzECDHFromKey(f *testing.F) {
 	})
 }
 
-// FuzzHeaderTypeToDeviceType tests header type to device type mapping.
+// FuzzHeaderTypeToDeviceType fuzzes the header type to device type mapping
+// and the corresponding string lookup. Asserts HeaderTypeToString never
+// returns "" — empty would be a regression of the out-of-range fallback
+// and would silently corrupt any caller that logs header type names.
 func FuzzHeaderTypeToDeviceType(f *testing.F) {
-	// Seed with known valid types
-	f.Add(0)  // NHP_KPL
-	f.Add(1)  // NHP_KNK
-	f.Add(10) // NHP_AOL
-	f.Add(100)
 	f.Add(-1)
-	f.Add(1000000)
+	f.Add(0)
+	f.Add(core.NHP_KNK)
+	f.Add(core.NHP_AOP)
+	f.Add(core.NHP_ARD) // table high-end — update this seed when adding a new NHP header type
+	f.Add(99)
+	f.Add(1 << 16)
 
 	f.Fuzz(func(t *testing.T, headerType int) {
-		// Should not panic on any input
 		_ = core.HeaderTypeToDeviceType(headerType)
-		_ = core.HeaderTypeToString(headerType)
+		s := core.HeaderTypeToString(headerType)
+		if s == "" {
+			t.Fatalf("HeaderTypeToString(%d) returned empty string; expected \"UNKNOWN\" or a known type label", headerType)
+		}
 	})
 }

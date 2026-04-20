@@ -298,6 +298,7 @@ FUZZTIME_LONG  ?= 60s
 FUZZ_TARGETS := \
 	FuzzECDHFromKey \
 	FuzzHeaderTypeToDeviceType \
+	FuzzHeaderTypeAndSize \
 	FuzzAgentKnockMsg \
 	FuzzServerKnockAckMsg \
 	FuzzACOpsResultMsg \
