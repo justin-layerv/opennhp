@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
 
@@ -207,5 +208,118 @@ func TestProgressReader(t *testing.T) {
 	}
 	if progress.BytesRead != int64(len(data)) {
 		t.Errorf("expected BytesRead=%d, got %d", len(data), progress.BytesRead)
+	}
+}
+
+// DoId validation at the DB boundary — defense-in-depth #1161.
+// HandleDHPDAVMessage already validates before forwarding, but these
+// are the functions that actually build the filesystem path, and a
+// future caller that forgets to validate would reopen the sink. The
+// shared validator lives in nhp/common so server and db stay in sync.
+//
+// Mutates common.ExeDirPath via t.Cleanup; cannot run with t.Parallel.
+func TestDataPrivateKeyStore_DoIdValidation(t *testing.T) {
+	origExeDir := common.ExeDirPath
+	t.Cleanup(func() { common.ExeDirPath = origExeDir })
+	common.ExeDirPath = t.TempDir()
+
+	cases := []struct {
+		name string
+		doId string
+	}{
+		{"parent traversal", "../etc/evil"},
+		{"bare forward slash", "foo/bar"},
+		{"null byte", "evil\x00json"},
+		{"empty", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"/NewDataPrivateKeyStoreWith", func(t *testing.T) {
+			_, err := NewDataPrivateKeyStoreWith(tc.doId)
+			if !errors.Is(err, common.ErrInvalidDoID) {
+				t.Errorf("NewDataPrivateKeyStoreWith(%q) returned %v, want ErrInvalidDoID", tc.doId, err)
+			}
+		})
+		t.Run(tc.name+"/Save", func(t *testing.T) {
+			d := NewDataPrivateKeyStore("pubkey")
+			if err := d.Save(tc.doId); !errors.Is(err, common.ErrInvalidDoID) {
+				t.Errorf("Save(%q) returned %v, want ErrInvalidDoID", tc.doId, err)
+			}
+		})
+		t.Run(tc.name+"/Delete", func(t *testing.T) {
+			d := NewDataPrivateKeyStore("pubkey")
+			if err := d.Delete(tc.doId); !errors.Is(err, common.ErrInvalidDoID) {
+				t.Errorf("Delete(%q) returned %v, want ErrInvalidDoID", tc.doId, err)
+			}
+		})
+	}
+
+	// Filesystem fence — rejection cases short-circuit before any
+	// MkdirAll/Create, so the tempdir MUST be empty. A future regex
+	// loosening that let "foo/bar" through would show up as a
+	// data-key-foo/ entry under ExeDirPath; tighter than the earlier
+	// "only 'etc' allowed" fence, which would pass if the validator
+	// ever created a stray <ExeDirPath>/etc/ztdo/data-key-foo.json.
+	entries, err := os.ReadDir(common.ExeDirPath)
+	if err != nil {
+		t.Fatalf("ReadDir(%q): %v", common.ExeDirPath, err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("rejection cases should have created no filesystem entries; got %d: %v", len(entries), names)
+	}
+}
+
+// Happy-path round-trip: Save writes the key store under
+// <ExeDirPath>/etc/ztdo/data-key-<doId>.json, NewDataPrivateKeyStoreWith
+// reads it back with the same field values, Delete removes it.
+//
+// Catches the pre-existing MkdirAll bug that this PR also fixed: Save
+// used to pass the bare relative "etc/ztdo" to os.MkdirAll while
+// os.Create used the absolute path, so Save only worked when something
+// else (server.SaveZdtoConfig) had already created the absolute dir.
+// This test now asserts Save works in isolation.
+func TestDataPrivateKeyStore_SaveReadRoundTrip(t *testing.T) {
+	origExeDir := common.ExeDirPath
+	t.Cleanup(func() { common.ExeDirPath = origExeDir })
+	common.ExeDirPath = t.TempDir()
+
+	const doId = "roundtrip-object-1"
+	orig := NewDataPrivateKeyStore("test-provider-public-key-base64")
+	orig.DataPrivateKeyBase64 = "test-private-key-base64"
+
+	if err := orig.Save(doId); err != nil {
+		t.Fatalf("Save(%q) failed: %v", doId, err)
+	}
+
+	expectedPath := filepath.Join(common.ExeDirPath, "etc", "ztdo", "data-key-"+doId+".json")
+	if _, err := os.Stat(expectedPath); err != nil {
+		t.Fatalf("expected file at %q, stat failed: %v", expectedPath, err)
+	}
+
+	loaded, err := NewDataPrivateKeyStoreWith(doId)
+	if err != nil {
+		t.Fatalf("NewDataPrivateKeyStoreWith(%q) failed: %v", doId, err)
+	}
+	if loaded.DataPrivateKeyBase64 != orig.DataPrivateKeyBase64 {
+		t.Errorf("DataPrivateKeyBase64: got %q, want %q", loaded.DataPrivateKeyBase64, orig.DataPrivateKeyBase64)
+	}
+	if loaded.ProviderPublicKeyBase64 != orig.ProviderPublicKeyBase64 {
+		t.Errorf("ProviderPublicKeyBase64: got %q, want %q", loaded.ProviderPublicKeyBase64, orig.ProviderPublicKeyBase64)
+	}
+
+	if err := orig.Delete(doId); err != nil {
+		t.Fatalf("Delete(%q) failed: %v", doId, err)
+	}
+	if _, err := os.Stat(expectedPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("file should be gone after Delete, stat err: %v", err)
+	}
+
+	// Post-delete read returns the scrubbed sentinel, not the raw
+	// *PathError from os.Open — pins the scrub contract on the db side.
+	if _, err := NewDataPrivateKeyStoreWith(doId); !errors.Is(err, common.ErrDataPrivateKeyStore) {
+		t.Errorf("post-delete read: got %v, want common.ErrDataPrivateKeyStore", err)
 	}
 }

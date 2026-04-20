@@ -31,27 +31,47 @@ func NewDataPrivateKeyStore(providerPublicKeyBase64 string) *DataPrivateKeyStore
 	}
 }
 
-// NewDataPrivateKeyStoreWith create a new DataPrivateKeyStore with doId
+// NewDataPrivateKeyStoreWith create a new DataPrivateKeyStore with doId.
+//
+// Defense-in-depth #1161: doId arrives on the wire via DWRMsg.DoId and
+// is concatenated into a filesystem path below. ReadZdtoConfig (called
+// from HandleDHPDAVMessage) already validates before forwarding, but
+// this is the boundary that actually builds the path — a new caller
+// forgetting to validate would reopen the traversal sink here.
+// Validate at the boundary.
+//
+// Non-validation errors collapse to common.ErrDataPrivateKeyStore so a
+// new caller that forgets to re-wrap (like udpdevice.go:904 already
+// does) can't leak os.Open's *PathError — the raw cause is kept in
+// the server log.
 func NewDataPrivateKeyStoreWith(doId string) (d *DataPrivateKeyStore, err error) {
-	etcDir := "etc/ztdo"
-	fileName := "data-key-" + doId + ".json"
+	if err := common.ValidateDoID(doId); err != nil {
+		log.Warning("db[NewDataPrivateKeyStoreWith] rejected DoId=%q: %v", doId, err)
+		return nil, err
+	}
 
-	fullPath := filepath.Join(common.ExeDirPath, etcDir, fileName)
+	etcDir := filepath.Join(common.ExeDirPath, "etc", "ztdo")
+	fileName := "data-key-" + doId + ".json"
+	fullPath := filepath.Join(etcDir, fileName)
 
 	// open and read all the content in file
 	file, err := os.Open(fullPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %w", err)
+		log.Error("db[NewDataPrivateKeyStoreWith] DoId=%q open: %v", doId, err)
+		return nil, common.ErrDataPrivateKeyStore
 	}
+	defer func() { _ = file.Close() }()
 
 	fileContentByte, err := io.ReadAll(file)
 	if err != nil {
-		return nil, fmt.Errorf("error reading file: %w", err)
+		log.Error("db[NewDataPrivateKeyStoreWith] DoId=%q read: %v", doId, err)
+		return nil, common.ErrDataPrivateKeyStore
 	}
 
 	d = &DataPrivateKeyStore{}
 	if err := d.fromJson(fileContentByte); err != nil {
-		return nil, fmt.Errorf("failed to parse data key store: %w", err)
+		log.Error("db[NewDataPrivateKeyStoreWith] DoId=%q unmarshal: %v", doId, err)
+		return nil, common.ErrDataPrivateKeyStore
 	}
 
 	return
@@ -68,41 +88,66 @@ func (d *DataPrivateKeyStore) Generate(mode ztdolib.DataKeyPairECCMode) ([]byte,
 
 // Save saves the dataPrivateKeyBase64 to a file, the format of file name is data-<doId>.json
 // Notes: this default way to store data private key is not safe. In the wild environment, need to use a secure way to store data private key.
+//
+// Defense-in-depth #1161: see NewDataPrivateKeyStoreWith for the
+// rationale. Validate at the boundary so a new caller can't reopen
+// the traversal sink, and collapse non-validation errors to
+// common.ErrDataPrivateKeyStore so filesystem paths can't leak.
 func (d *DataPrivateKeyStore) Save(doId string) error {
-	// Make sure the etc directory exists
-	etcDir := "etc/ztdo"
+	if err := common.ValidateDoID(doId); err != nil {
+		log.Warning("db[DataPrivateKeyStore.Save] rejected DoId=%q: %v", doId, err)
+		return err
+	}
+
+	// Make sure the etc directory exists. MkdirAll runs against the
+	// absolute ztdo path — before #1161 this used the bare relative
+	// "etc/ztdo" against CWD while os.Create below used the absolute
+	// path, so Save only worked when something else had already
+	// created <ExeDirPath>/etc/ztdo first (server.SaveZdtoConfig did
+	// in practice).
+	etcDir := filepath.Join(common.ExeDirPath, "etc", "ztdo")
 	if err := os.MkdirAll(etcDir, 0755); err != nil {
-		return fmt.Errorf("failed to create etc directory: %w", err)
+		log.Error("db[DataPrivateKeyStore.Save] DoId=%q mkdir: %v", doId, err)
+		return common.ErrDataPrivateKeyStore
 	}
 
 	fileName := "data-key-" + doId + ".json"
-	fullPath := filepath.Join(common.ExeDirPath, etcDir, fileName)
+	fullPath := filepath.Join(etcDir, fileName)
 	if _, err := os.Stat(fullPath); err == nil {
-		return fmt.Errorf("%v already exists, please delete it first", fullPath)
+		log.Error("db[DataPrivateKeyStore.Save] DoId=%q already exists at %s", doId, fullPath)
+		return common.ErrDataPrivateKeyStore
 	}
 
 	file, err := os.Create(fullPath)
 	if err != nil {
-		return fmt.Errorf("failed to create file: %w", err)
+		log.Error("db[DataPrivateKeyStore.Save] DoId=%q create: %v", doId, err)
+		return common.ErrDataPrivateKeyStore
 	}
 	defer func() { _ = file.Close() }()
 
 	if _, err := file.Write(d.toJson()); err != nil {
-		return fmt.Errorf("failed to write data key store: %w", err)
+		log.Error("db[DataPrivateKeyStore.Save] DoId=%q write: %v", doId, err)
+		return common.ErrDataPrivateKeyStore
 	}
 
 	return nil
 }
 
+// Defense-in-depth #1161: see NewDataPrivateKeyStoreWith.
 func (d *DataPrivateKeyStore) Delete(doId string) error {
-	etcDir := "etc/ztdo"
+	if err := common.ValidateDoID(doId); err != nil {
+		log.Warning("db[DataPrivateKeyStore.Delete] rejected DoId=%q: %v", doId, err)
+		return err
+	}
+
+	etcDir := filepath.Join(common.ExeDirPath, "etc", "ztdo")
 	fileName := "data-key-" + doId + ".json"
-	fullPath := filepath.Join(common.ExeDirPath, etcDir, fileName)
+	fullPath := filepath.Join(etcDir, fileName)
 
 	// delete the file
-	err := os.Remove(fullPath)
-	if err != nil {
-		return fmt.Errorf("failed to delete file: %w", err)
+	if err := os.Remove(fullPath); err != nil {
+		log.Error("db[DataPrivateKeyStore.Delete] DoId=%q remove: %v", doId, err)
+		return common.ErrDataPrivateKeyStore
 	}
 	return nil
 }

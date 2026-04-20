@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1152,13 +1153,16 @@ func (s *UdpServer) HandleDHPDARMessage(ppd *core.PacketParserData) (err error) 
 
 	doId := darMsg.DoId
 	config, err := ReadZdtoConfig(doId)
-	dsaMsg := &common.DSAMsg{}
+	dsaMsg := &common.DSAMsg{DoId: doId}
 	if err != nil {
-		dsaMsg.DoId = doId
+		// err is either common.ErrInvalidDoID or errReadConfigFailed —
+		// both fixed sentinels with no attacker-controlled bytes, so
+		// echoing err.Error() on the wire is safe. The raw cause was
+		// already logged at WARN / ERROR inside ReadZdtoConfig.
+		log.Error("server-agent(#%d@%s)[HandleDHPDARMessage] read ztdo config for DoId=%q: %v", transactionId, addrStr, doId, err)
 		dsaMsg.ErrCode = 1
 		dsaMsg.ErrMsg = err.Error()
 	} else {
-		dsaMsg.DoId = doId
 		dsaMsg.SpoId = config.Spo.PolicyId
 		dsaMsg.Spo = &config.Spo
 		dsaMsg.TTL = int((30 * time.Minute).Milliseconds())
@@ -1167,7 +1171,7 @@ func (s *UdpServer) HandleDHPDARMessage(ppd *core.PacketParserData) (err error) 
 
 	aakBytes, marshalErr := json.Marshal(dsaMsg)
 	if marshalErr != nil {
-		log.Error("server-agent(%s#%d@%s)[HandleDHPDARMessage] failed to marshal DSA message: %v", doId, transactionId, addrStr, marshalErr)
+		log.Error("server-agent(DoId=%q,trx=#%d@%s)[HandleDHPDARMessage] failed to marshal DSA message: %v", doId, transactionId, addrStr, marshalErr)
 		return marshalErr
 	}
 	log.Debug("dagMsg:%s", (string)(aakBytes))
@@ -1190,20 +1194,27 @@ func (s *UdpServer) HandleDHPDAVMessage(ppd *core.PacketParserData) (err error) 
 	}
 
 	doId := davMsg.DoId
-	config, err := ReadZdtoConfig(doId)
+	config, configErr := ReadZdtoConfig(doId)
 
-	if err := s.onAttestationVerify(&config.Spo, davMsg.Evidence); err != nil {
-		log.Error("server-agent(#%d@%s)[HandleDHPDAVMessage] failed to verify attesation: %s with error: %s", transactionId, addrStr, davMsg.Evidence, err.Error())
-		return err
-	}
-
-	dagMsg := &common.DAGMsg{}
-	if err != nil {
-		dagMsg.DoId = doId
+	// dagMsg is populated below and always sent via forwardToTransaction —
+	// mirror the DAR handler's pattern so a legitimate agent asking for a
+	// missing / malformed DoId gets an explicit DAG error response, not a
+	// hung request. Pre-PR this path had a shadowed err that silently ran
+	// onAttestationVerify against a zero-value Spo; that's closed here by
+	// skipping the attestation branch when configErr != nil.
+	dagMsg := &common.DAGMsg{DoId: doId}
+	if configErr != nil {
+		// configErr is either common.ErrInvalidDoID or errReadConfigFailed —
+		// both fixed sentinels, so echoing on the wire is safe. Raw cause
+		// logged inside ReadZdtoConfig.
+		log.Error("server-agent(#%d@%s)[HandleDHPDAVMessage] read ztdo config for DoId=%q: %v", transactionId, addrStr, doId, configErr)
 		dagMsg.ErrCode = 1
-		dagMsg.ErrMsg = err.Error()
+		dagMsg.ErrMsg = configErr.Error()
 	} else {
-		dagMsg.DoId = doId
+		if attestErr := s.onAttestationVerify(&config.Spo, davMsg.Evidence); attestErr != nil {
+			log.Error("server-agent(#%d@%s)[HandleDHPDAVMessage] failed to verify attestation: %s with error: %s", transactionId, addrStr, davMsg.Evidence, attestErr.Error())
+			return attestErr
+		}
 
 		teePublicKey, consumerEphemeralPublicKey := s.GetTeePublicKeyBase64AndConsumerEphemeralPublicKeyBase64(ppd.RemotePubKey)
 
@@ -1215,29 +1226,60 @@ func (s *UdpServer) HandleDHPDAVMessage(ppd *core.PacketParserData) (err error) 
 
 		dbConn, found := s.dbConnectionMap[config.DbId]
 		if !found {
-			log.Critical("dbConn not found for dbId:%s", config.DbId)
-			err = common.ErrDBOffline
+			log.Critical("dbConn not found for dbId:%q", config.DbId)
 			dagMsg.ErrCode = 1
-			dagMsg.ErrMsg = err.Error()
+			dagMsg.ErrMsg = common.ErrDBOffline.Error()
 		} else {
-			dwaMsg, err := s.ProcessDataPrivateKeyWrapping(dwrMsg, dbConn)
-			if err != nil || dwaMsg.ErrCode != 0 {
-				dagMsg.ErrCode = dwaMsg.ErrCode
-				dagMsg.ErrMsg = dwaMsg.ErrMsg
+			dwaMsg, dwaErr := s.ProcessDataPrivateKeyWrapping(dwrMsg, dbConn)
+			// ProcessDataPrivateKeyWrapping can return (nil, err) on a
+			// marshal failure in its upstream chain. Derefing dwaMsg
+			// below would panic the handler; handle that path first.
+			// The nil branch catches any dwaMsg==nil shape — including
+			// the (nil, nil) case today's implementation shouldn't produce
+			// but a future refactor could, and the narrower condition
+			// would otherwise fall through to the default Kao deref.
+			switch {
+			case dwaMsg == nil:
+				// Scrub dwaErr on the wire — upstream marshal failures
+				// can wrap filesystem paths or other internal detail.
+				// Operator signal stays in the log.
+				log.Error("server-agent(#%d@%s)[HandleDHPDAVMessage] dwaMsg nil for DoId=%q: %v", transactionId, addrStr, doId, dwaErr)
+				dagMsg.ErrCode = 1
+				dagMsg.ErrMsg = "data private key wrapping failed"
+			case dwaErr != nil || dwaMsg.ErrCode != 0:
+				// Error branch — do NOT populate success fields (Kao,
+				// Spo, DataSourceType, ...). Pre-fix this block fell
+				// through to the success population below, shipping
+				// partial config alongside an error code.
+				// Belt-and-suspenders on ErrCode: every error path in
+				// ProcessDataPrivateKeyWrapping that returns non-nil
+				// dwaMsg also sets ErrCode != 0; the dwaErr!=nil slot
+				// is a guard against a future error path forgetting.
+				// TODO(#1161): retire the else-branch once the
+				// (dwaErr != nil) => (dwaMsg.ErrCode != 0) invariant
+				// is codified upstream (e.g. via dwaMsg.Validate()).
+				if dwaMsg.ErrCode != 0 {
+					dagMsg.ErrCode = dwaMsg.ErrCode
+					dagMsg.ErrMsg = dwaMsg.ErrMsg
+				} else {
+					log.Error("server-agent(#%d@%s)[HandleDHPDAVMessage] dwaErr with zero ErrCode for DoId=%q: %v", transactionId, addrStr, doId, dwaErr)
+					dagMsg.ErrCode = 1
+					dagMsg.ErrMsg = "data private key wrapping failed"
+				}
+			default:
+				dagMsg.Kao = dwaMsg.Kao
+				dagMsg.Spo = &config.Spo
+				dagMsg.DataSourceType = config.DataSourceType
+				dagMsg.AccessUrl = config.AccessUrl
+				dagMsg.AccessByNHP = config.AccessByNHP
+				dagMsg.DoType = config.DoType
 			}
-
-			dagMsg.Kao = dwaMsg.Kao
-			dagMsg.Spo = &config.Spo
-			dagMsg.DataSourceType = config.DataSourceType
-			dagMsg.AccessUrl = config.AccessUrl
-			dagMsg.AccessByNHP = config.AccessByNHP
-			dagMsg.DoType = config.DoType
 		}
 	}
 
 	aakBytes, marshalErr := json.Marshal(dagMsg)
 	if marshalErr != nil {
-		log.Error("server-agent(%s#%d@%s)[HandleDHPDAVMessage] failed to marshal DAG message: %v", doId, transactionId, addrStr, marshalErr)
+		log.Error("server-agent(DoId=%q,trx=#%d@%s)[HandleDHPDAVMessage] failed to marshal DAG message: %v", doId, transactionId, addrStr, marshalErr)
 		return marshalErr
 	}
 	log.Debug("dagMsg:%s", (string)(aakBytes))
@@ -1268,6 +1310,10 @@ func (s *UdpServer) HandleDHPDRGMessage(ppd *core.PacketParserData) (err error) 
 	errMsg := ""
 
 	if err != nil {
+		// err is either common.ErrInvalidDoID or errSaveConfigFailed —
+		// both fixed sentinels, echoing on the wire is safe. Raw cause
+		// already logged inside SaveZdtoConfig.
+		log.Error("server-db(#%d@%s)[HandleDHPDRGMessage] save ztdo config for DoId=%q: %v", transactionId, addrStr, doId, err)
 		errCode = 1
 		errMsg = err.Error()
 	}
@@ -1279,7 +1325,7 @@ func (s *UdpServer) HandleDHPDRGMessage(ppd *core.PacketParserData) (err error) 
 	}
 	aakBytes, marshalErr := json.Marshal(aakMsg)
 	if marshalErr != nil {
-		log.Error("server-db(%s#%d@%s)[HandleDHPDRGMessage] failed to marshal DAK message: %v", doId, transactionId, addrStr, marshalErr)
+		log.Error("server-db(DoId=%q,trx=#%d@%s)[HandleDHPDRGMessage] failed to marshal DAK message: %v", doId, transactionId, addrStr, marshalErr)
 		return marshalErr
 	}
 	aakMd := makeMsgData(ppd, core.NHP_DAK, aakBytes)
@@ -1318,8 +1364,32 @@ func (s *UdpServer) onAttestationVerify(spo *common.SmartPolicy, attestation str
 	return errors.New("attestation verification failed")
 }
 
+// errReadConfigFailed / errSaveConfigFailed are fixed sentinels returned
+// from ReadZdtoConfig / SaveZdtoConfig when a non-validation error fires
+// (os.Open / os.MkdirAll / utils.SaveStructAsJsonFile all wrap
+// *PathError with the full filesystem path, which would leak ExeDirPath
+// if echoed on the wire). The raw underlying error goes to the server
+// log; callers echo these sentinels to the wire without further scrub.
+// Kept unexported — only in-package callers (HandleDHPDRGMessage /
+// HandleDHPDAVMessage) distinguish invalid-input vs. read vs. save, and
+// they do so by the call site, not errors.Is. Promote to nhp/common
+// alongside ErrInvalidDoID if a cross-package caller ever needs the
+// classification.
+var (
+	errReadConfigFailed = errors.New("ztdo config read failed")
+	errSaveConfigFailed = errors.New("ztdo config save failed")
+)
+
 func SaveZdtoConfig(drgMsg *common.DRGMsg) error {
 	objectId := drgMsg.DoId
+	if err := common.ValidateDoID(objectId); err != nil {
+		// Intrusion-detection signal: post-auth malformed DoId is either
+		// an agent bug or an attack attempt. Log %q of the raw value for
+		// operator triage; the sentinel returned to the caller carries
+		// none of the attacker bytes.
+		log.Warning("server[SaveZdtoConfig] rejected DoId=%q: %v", objectId, err)
+		return err
+	}
 	configFileName := "data-" + objectId + ".json"
 
 	etcDir := filepath.Join(ExeDirPath, "etc", "ztdo")
@@ -1336,38 +1406,66 @@ func SaveZdtoConfig(drgMsg *common.DRGMsg) error {
 		_ = os.Remove(configPath)
 	}
 
-	// Make sure the etc directory exists
+	// All non-validation errors below wrap *PathError with the full
+	// filesystem path. Log raw with DoId context for triage, return the
+	// scrubbed sentinel on the wire.
 	if err := os.MkdirAll(etcDir, 0755); err != nil {
-		return fmt.Errorf("failed to create etc directory: %w", err)
+		log.Error("server[SaveZdtoConfig] DoId=%q mkdir: %v", objectId, err)
+		return errSaveConfigFailed
 	}
 
 	if _, err := os.Stat(configPath); err == nil {
-		return fmt.Errorf("%v already exists, please delete it first", configFileName)
+		log.Error("server[SaveZdtoConfig] DoId=%q already exists at %s", objectId, configPath)
+		return errSaveConfigFailed
 	}
 
-	return utils.SaveStructAsJsonFile(configPath, drgMsg)
+	if err := utils.SaveStructAsJsonFile(configPath, drgMsg); err != nil {
+		log.Error("server[SaveZdtoConfig] DoId=%q write: %v", objectId, err)
+		return errSaveConfigFailed
+	}
+	return nil
 }
 
-// read data-<doId>.json to DRGMsg Object
+// ReadZdtoConfig reads data-<doId>.json into a DRGMsg. Validates doId
+// before touching the filesystem and scrubs filesystem-path errors
+// before returning — callers may echo the returned error on the wire
+// without leaking ExeDirPath.
 func ReadZdtoConfig(doId string) (common.DRGMsg, error) {
+	if err := common.ValidateDoID(doId); err != nil {
+		log.Warning("server[ReadZdtoConfig] rejected DoId=%q: %v", doId, err)
+		return common.DRGMsg{}, err
+	}
 	etcDir := filepath.Join(ExeDirPath, "etc", "ztdo")
 	configFilePath := filepath.Join(etcDir, "data-"+doId+".json")
 	file, err := os.Open(configFilePath)
 	if err != nil {
-		return common.DRGMsg{}, fmt.Errorf("could not open file: %w", err)
+		// os.ErrNotExist is the normal happy-path result on a first save —
+		// SaveZdtoConfig probes via ReadZdtoConfig to decide whether to
+		// carry forward the prior DataSourceType. Logging those at ERROR
+		// polluted the server error log with "no such file" on every new
+		// DoId and made real read failures harder to triage. Demote the
+		// not-exist case to DEBUG; keep everything else at ERROR since
+		// those are genuine failures (permission denied, partial FS, etc).
+		if errors.Is(err, fs.ErrNotExist) {
+			log.Debug("server[ReadZdtoConfig] DoId=%q not found: %v", doId, err)
+		} else {
+			log.Error("server[ReadZdtoConfig] DoId=%q open: %v", doId, err)
+		}
+		return common.DRGMsg{}, errReadConfigFailed
 	}
 	defer func() { _ = file.Close() }()
 
 	fileContentByte, err := io.ReadAll(file)
 	if err != nil {
-		return common.DRGMsg{}, fmt.Errorf("error reading file: %w", err)
+		log.Error("server[ReadZdtoConfig] DoId=%q read: %v", doId, err)
+		return common.DRGMsg{}, errReadConfigFailed
 	}
 
 	var config common.DRGMsg
 
-	err = json.Unmarshal(fileContentByte, &config)
-	if err != nil {
-		return common.DRGMsg{}, fmt.Errorf("json parsing error: %w", err)
+	if err := json.Unmarshal(fileContentByte, &config); err != nil {
+		log.Error("server[ReadZdtoConfig] DoId=%q unmarshal: %v", doId, err)
+		return common.DRGMsg{}, errReadConfigFailed
 	}
 	return config, nil
 }
