@@ -402,7 +402,7 @@ jobs:
 
       - name: Setup Packer
         if: steps.should-build.outputs.build == 'true'
-        uses: hashicorp/setup-packer@1aa358be5cf73883762b302a3a03abd66e75b232 # v3.1.0
+        uses: hashicorp/setup-packer@c3d53c525d422944e50ee27b840746d6522b08de # v3.2.0
         with:
           # Pin a specific Packer version so a surprise upstream release
           # can't change AMI build behaviour mid-rollout. Bump intentionally
