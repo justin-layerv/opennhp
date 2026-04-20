@@ -282,9 +282,6 @@ type Logger struct {
 	subLoggers []*Logger
 }
 
-// Function for use in Logger for discarding logged lines.
-func BlackholeLogf(format string, args ...any) {}
-
 // logJSON writes a structured JSON log record to the given handler.
 func (l *Logger) logJSON(handler slog.Handler, level slog.Level, format string, args ...any) {
 	if l.stopped.Load() {
