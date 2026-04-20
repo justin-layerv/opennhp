@@ -1552,18 +1552,36 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Update Deployment Tracking
+        env:
+          NEW_SHA: ${{ github.sha }}
         run: |
+          # Save the current deployed-commit as -previous before overwriting,
+          # so sandbox rollback tooling can target the actual previous version
+          # (not the current — possibly broken — one). Mirrors the prod pattern
+          # in promote-to-prod.yml. Closes the gap surfaced by smoke test
+          # TestBlueGreen_DeployedCommitPreviousExists.
+          # Region is inherited from the job-level configure-aws-credentials
+          # step (line 1304), matching the prod pattern in promote-to-prod.yml.
+          CURRENT=$(aws ssm get-parameter \
+            --name "/sandbox/nhp/deploy/deployed-commit" \
+            --query "Parameter.Value" --output text 2>/dev/null || echo "")
+          if [[ -n "$CURRENT" && "$CURRENT" != "initial" && "$CURRENT" != "$NEW_SHA" ]]; then
+            aws ssm put-parameter \
+              --name "/sandbox/nhp/deploy/deployed-commit-previous" \
+              --value "$CURRENT" --type String --overwrite \
+              || echo "::warning::Failed to update SSM /sandbox/nhp/deploy/deployed-commit-previous"
+            echo "  Previous commit saved: deployed-commit-previous = $CURRENT"
+          fi
+
           aws ssm put-parameter \
             --name "/sandbox/nhp/deploy/deployed-commit" \
-            --value "${{ github.sha }}" --type String --overwrite \
-            --region "$AWS_REGION" \
+            --value "$NEW_SHA" --type String --overwrite \
             || echo "::warning::Failed to update SSM /sandbox/nhp/deploy/deployed-commit"
           aws ssm put-parameter \
             --name "/sandbox/nhp/deploy/deployed-at" \
             --value "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --type String --overwrite \
-            --region "$AWS_REGION" \
             || echo "::warning::Failed to update SSM /sandbox/nhp/deploy/deployed-at"
-          echo "::notice::Deployment tracking updated: deployed-commit = ${{ github.sha }}"
+          echo "::notice::Deployment tracking updated: deployed-commit = $NEW_SHA"
 
   # ============================================================================
   # NHP SMOKE TESTS (Sandbox)

@@ -17,8 +17,9 @@ package smoke
 //	                     (or warm-standby min_size) or it can steal
 //	                     traffic.
 //	MEMORY gotcha #32 — deployed-commit-previous records the rollback
-//	                    target. Currently sandbox-skipped — see
-//	                    follow-up issue #1010.
+//	                    target. Maintained by both prod
+//	                    (promote-to-prod.yml) and sandbox
+//	                    (build-and-push.yml, since #1010 was fixed).
 //
 // All tests in this file read state from SSM parameters under
 // /{env}/nhp/{server,ac}/* which the blue/green deploy workflow
@@ -53,20 +54,11 @@ func TestBlueGreen_DeployedCommitSSMParamExists(t *testing.T) {
 }
 
 // TestBlueGreen_DeployedCommitPreviousExists fences MEMORY gotcha #32.
-// The promote-to-prod pipeline writes deployed-commit-previous before
-// overwriting deployed-commit, giving rollback tooling a recorded
-// target.
-//
-// Currently skipped in sandbox because the sandbox deploy workflow
-// does not write this param (observed 2026-04-08: only
-// deployed-commit + deployed-at are written by build-and-push.yml).
-// Tracked as follow-up in issue #1010 — sandbox should match the
-// prod invariant so a sandbox rollback has the same ergonomics as
-// a prod rollback.
+// The deploy pipeline writes deployed-commit-previous before overwriting
+// deployed-commit, giving rollback tooling a recorded target. Both prod
+// (promote-to-prod.yml) and sandbox (build-and-push.yml, since #1010 was
+// fixed) maintain this invariant — the test runs in both environments.
 func TestBlueGreen_DeployedCommitPreviousExists(t *testing.T) {
-	if testConfig.Environment == "sandbox" {
-		t.Skip("sandbox deploy pipeline does not currently write deployed-commit-previous — follow-up needed")
-	}
 	name := "/" + testConfig.Environment + "/nhp/deploy/deployed-commit-previous"
 	val, ok := getSSMParameter(t, name)
 	if !ok {
