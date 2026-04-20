@@ -314,6 +314,8 @@ fuzz:
 		echo "[OpenNHP]   -> $$t"; \
 		go test -run='^$$' -fuzz=$$t -fuzztime=$(FUZZTIME_LONG) ./test/ || exit 1; \
 	done
+	@echo "[OpenNHP]   -> FuzzNewVerifier"
+	@cd nhp && go test -run='^$$' -fuzz=FuzzNewVerifier -fuzztime=$(FUZZTIME_LONG) ./core/verifier/
 	@echo "$(COLOUR_GREEN)[OpenNHP] Fuzz tests completed$(END_COLOUR)"
 
 # Run fuzz tests at a shortened budget (CI default; see fuzz: above for
@@ -324,6 +326,8 @@ fuzz-quick:
 		echo "[OpenNHP]   -> $$t"; \
 		go test -run='^$$' -fuzz=$$t -fuzztime=$(FUZZTIME_QUICK) ./test/ || exit 1; \
 	done
+	@echo "[OpenNHP]   -> FuzzNewVerifier"
+	@cd nhp && go test -run='^$$' -fuzz=FuzzNewVerifier -fuzztime=$(FUZZTIME_QUICK) ./core/verifier/
 	@echo "$(COLOUR_GREEN)[OpenNHP] Quick fuzz tests completed$(END_COLOUR)"
 
 archive:
