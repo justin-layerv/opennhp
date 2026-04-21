@@ -86,20 +86,32 @@ func TestKnock_ReadyPerInstanceReflectsACPeers(t *testing.T) {
 	}
 }
 
-// TestKnock_ReadyConsistentWithUserResolve is the lie detector.
-// It probes the public /health/knock-ready endpoint once, then
-// immediately attempts a full mint → resolve round-trip. The two
-// outcomes must be consistent:
+// TestKnock_ReadyConsistentWithUserResolve is the lie detector for the
+// "knock-ready=200 but resolve fails" direction — i.e., the gate
+// promises NLB the server can serve a knock, then doesn't.
+//
+// Both the knock-ready probe and the resolve attempt go through the
+// public NLB. AWS NLB hashes each new TCP connection by 5-tuple (or
+// 3-tuple for UDP) over the healthy-target set — so two independent
+// HTTPS calls from the same client are independent hashes and not
+// guaranteed to land on the same server instance. That asymmetry
+// shapes the outcomes:
 //
 //	knock-ready = 200 AND resolve succeeds → healthy (pass)
 //	knock-ready = 503 AND resolve fails    → consistent unhealthy (pass)
 //	knock-ready = 200 AND resolve fails    → the server is lying
 //	                                         to the NLB (FAIL)
-//	knock-ready = 503 AND resolve succeeds → the gate is overcautious
-//	                                         (fail, but different class)
+//	knock-ready = 503 AND resolve succeeds → NLB routed resolve to a
+//	                                         healthier instance than
+//	                                         the one knock-ready
+//	                                         landed on; expected
+//	                                         multi-instance behavior,
+//	                                         informational only.
 //
-// A lying-to-NLB outcome is the class we care most about — it
-// means the deploy gate and the customer see different states.
+// The fourth case is informational because the two probes are
+// routed by NLB independently — the asymmetry is a property of the
+// routing, not of the gate. Sustained per-instance failures are
+// surfaced by TestKnock_ReadyPerInstanceReflectsACPeers via SSM.
 func TestKnock_ReadyConsistentWithUserResolve(t *testing.T) {
 	ctx := context.Background()
 
@@ -110,6 +122,13 @@ func TestKnock_ReadyConsistentWithUserResolve(t *testing.T) {
 		t.Fatalf("knock-ready returned unexpected status %d (body: %s)",
 			resp.StatusCode, truncate(body, 200))
 	}
+	// X-Request-ID is set by endpoints/server/requestid.go's middleware
+	// on every HTTP response; it links this probe to the matching
+	// server-side request log line in CloudWatch. NLB itself doesn't
+	// add a target-identifying header, so this server-generated ID is
+	// the best handle the client has without SSM-probing every
+	// instance.
+	knockReadyRequestID := extractRequestID(resp)
 
 	// Attempt a full mint → resolve → 302 flow. We call MintQURL
 	// and doGetNoRedirect directly (not mintSmokeQURL) because both
@@ -125,33 +144,68 @@ func TestKnock_ReadyConsistentWithUserResolve(t *testing.T) {
 	// a broken setup. If Auth0 is missing, this test must fatal
 	// loudly — the workflow's Auth0-skip guard handles the outer
 	// surface.
-	resolveErr := attemptMintAndResolve(ctx, t)
+	resolveRequestID, resolveErr := attemptMintAndResolve(ctx, t)
 
+	// All four quadrants are named explicitly (no `default:`) so the
+	// switch body reads 1:1 with the diagnostic table in the test doc.
+	// Both request IDs are included in every arm because NLB can route
+	// knock-ready and resolve to different instances — the pair of IDs
+	// is what lets an operator grep the two instance-side log lines
+	// that participated in the observation.
 	switch {
 	case knockReady200 && resolveErr == nil:
-		t.Logf("consistent: knock-ready 200 AND resolve succeeded")
+		t.Logf("consistent: knock-ready 200 AND resolve succeeded (knock-ready req_id=%s, resolve req_id=%s)",
+			knockReadyRequestID, resolveRequestID)
 	case !knockReady200 && resolveErr != nil:
-		t.Logf("consistent: knock-ready 503 AND resolve failed (%v)", resolveErr)
+		t.Logf("consistent: knock-ready 503 AND resolve failed (knock-ready req_id=%s, resolve req_id=%s, resolve err=%v)",
+			knockReadyRequestID, resolveRequestID, resolveErr)
 	case knockReady200 && resolveErr != nil:
-		t.Fatalf("inconsistent: knock-ready 200 but resolve FAILED — the server is lying to the NLB. resolve err: %v", resolveErr)
-	default:
-		t.Fatalf("inconsistent: knock-ready 503 but resolve succeeded — the gate is over-cautious")
+		t.Fatalf("inconsistent: knock-ready 200 but resolve FAILED — the server is lying to the NLB. knock-ready req_id=%s, resolve req_id=%s, resolve err: %v",
+			knockReadyRequestID, resolveRequestID, resolveErr)
+	case !knockReady200 && resolveErr == nil:
+		// NLB routed each call to a different instance, and the resolve
+		// target was healthy. Not a bug. Logged with both req_ids so
+		// flake investigations can correlate against CloudWatch and
+		// the per-instance test's output. The nlbAsymmetryTag prefix
+		// lets CI aggregation grep frequency without re-parsing (#1214).
+		//
+		// Note on req_ids: endpoints/server/requestid.go generates a
+		// fresh random 16-char hex ID per request when no upstream
+		// traceparent / X-Request-ID is provided (the smoke client
+		// sends neither), so two probes to the same instance still
+		// get different IDs.
+		t.Logf("informational %s: knock-ready 503 AND resolve succeeded — NLB routed resolve around the 503 instance (knock-ready req_id=%s, resolve req_id=%s)",
+			nlbAsymmetryTag, knockReadyRequestID, resolveRequestID)
 	}
 }
 
+// nlbAsymmetryTag is the grep-tag prefix emitted by the informational
+// "knock-ready 503 AND resolve succeeded" log line. Named so CI
+// aggregation in #1214 has a single definition to align against; any
+// change here should land alongside a change to the aggregator.
+const nlbAsymmetryTag = "nlb_asymmetry=1"
+
 // attemptMintAndResolve mints a QURL and attempts to resolve it,
-// returning a non-nil error on any failure short of a hard fatal.
-// Used only by TestKnock_ReadyConsistentWithUserResolve, which
-// needs to compare the resolve outcome against an independent
-// knock-ready probe. The mint is via MintQURL (not the
-// test-fataling mintSmokeQURL wrapper) so that a transient mint
-// failure can be captured as part of the "resolve fails" side of
-// the lie-detector comparison.
+// returning the resolve response's X-Request-ID (for CloudWatch
+// correlation) plus a non-nil error on any failure short of a hard
+// fatal. Used only by TestKnock_ReadyConsistentWithUserResolve,
+// which needs to compare the resolve outcome against an independent
+// knock-ready probe and — crucially on a multi-instance NLB fleet —
+// log the resolve-side instance handle even when resolve fails.
+//
+// The mint is via MintQURL (not the test-fataling mintSmokeQURL
+// wrapper) so that a transient mint failure can be captured as part
+// of the "resolve fails" side of the lie-detector comparison.
 //
 // Callers must invoke this from a test that has Auth0 set up —
 // if Auth0 is missing, MintQURL's internal requireAuth0 call
 // will t.Fatal, which is the intended behavior.
-func attemptMintAndResolve(ctx context.Context, t *testing.T) error {
+//
+// On mint failure, returns requestIDMissing (the same sentinel used
+// for "response had no X-Request-ID"): the caller's log always carries
+// the accompanying err, so a single sentinel keeps the log grammar
+// uniform.
+func attemptMintAndResolve(ctx context.Context, t *testing.T) (requestID string, err error) {
 	t.Helper()
 	// 120s TTL matches the happy-path tests in 10_resolve_test.go
 	// (mintSmokeQURL uses the same value). The test body completes
@@ -163,16 +217,22 @@ func attemptMintAndResolve(ctx context.Context, t *testing.T) error {
 		ExpiresIn: "120s",
 	})
 	if err != nil {
-		return fmt.Errorf("mint: %w", err)
+		return requestIDMissing, fmt.Errorf("mint: %w", err)
 	}
 	t.Cleanup(func() {
 		DeleteQURL(context.Background(), t, minted.Data.ResourceID)
 	})
 
-	resolveResp, _ := doPostFormNoRedirect(t, testConfig.NHPServerBaseURL,
+	resolveResp, resolveBody := doPostFormNoRedirect(t, testConfig.NHPServerBaseURL,
 		"/plugins/qurl", "token="+minted.AccessToken(), nil)
+	requestID = extractRequestID(resolveResp)
 	if resolveResp.StatusCode != 302 {
-		return fmt.Errorf("resolve status=%d, want 302", resolveResp.StatusCode)
+		// Include a truncated body in the error so the load-bearing
+		// "lying to NLB" fatal carries enough context to diagnose
+		// without a CloudWatch trip. 256 bytes is enough to surface
+		// a typical JSON error body's status/code/message fields.
+		return requestID, fmt.Errorf("resolve status=%d body=%s, want 302",
+			resolveResp.StatusCode, truncate(resolveBody, 256))
 	}
-	return nil
+	return requestID, nil
 }

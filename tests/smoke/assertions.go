@@ -132,3 +132,24 @@ func truncate(body []byte, n int) string {
 	}
 	return string(body[:n]) + "...[truncated]"
 }
+
+// requestIDMissing is the sentinel emitted in log lines when a smoke
+// probe's response does not carry an X-Request-ID header or no
+// response was produced at all. Kept as a single sentinel so downstream
+// CloudWatch grep/aggregation doesn't have to special-case several
+// spellings.
+const requestIDMissing = "<missing>"
+
+// extractRequestID returns the X-Request-ID header or requestIDMissing
+// if resp is nil or the header is absent. Smoke logs use the value
+// directly for CloudWatch correlation; requestIDMissing is legible in
+// those logs without ambiguity about the probe outcome.
+func extractRequestID(resp *http.Response) string {
+	if resp == nil {
+		return requestIDMissing
+	}
+	if id := resp.Header.Get("X-Request-ID"); id != "" {
+		return id
+	}
+	return requestIDMissing
+}
