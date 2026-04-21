@@ -1927,18 +1927,10 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 		if resInfo == nil {
 			continue
 		}
-		s.acConnectionMapMutex.RLock()
-		conns, found := s.acConnectionMap[resInfo.ACId]
-		liveCount := 0
-		if found {
-			for _, c := range conns {
-				if !c.ConnData.IsClosed() {
-					liveCount++
-				}
-			}
-		}
-		s.acConnectionMapMutex.RUnlock()
-		if !found || liveCount == 0 {
+		// Cheap predicate; the broadcast loop below snapshots and emits
+		// MetricACConnStaleFiltered for the same acId. Calling
+		// snapshotLiveACConns here would double-count.
+		if !s.hasLiveACConn(resInfo.ACId) {
 			needsForwarding = true
 			forwardACId = resInfo.ACId
 			break
@@ -2000,21 +1992,12 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 			continue
 		}
 		acId := resInfo.ACId
-		s.acConnectionMapMutex.RLock()
-		acConns, found := s.acConnectionMap[acId]
-		var connsCopy []*ACConn
-		if found {
-			// Filter out connections that have already been closed to avoid
-			// sending NHP-AOP on stale connections (which would fail immediately
-			// with ErrTransactionFailedByClosedConnection).
-			for _, c := range acConns {
-				if !c.ConnData.IsClosed() {
-					connsCopy = append(connsCopy, c)
-				}
-			}
+		connsCopy, droppedStale := s.snapshotLiveACConns(acId)
+		if droppedStale > 0 {
+			log.Warning("server-agent(%s@%s)-ac(%s)[handleNhpOpenResource] filtered %d stale/closed AC connection(s) (threshold=%v)",
+				knkMsg.UserId, addrStr, acId, droppedStale, s.staleACConnThreshold())
 		}
-		s.acConnectionMapMutex.RUnlock()
-		if !found || len(connsCopy) == 0 {
+		if len(connsCopy) == 0 {
 			knockHadNoAC = true
 			log.Warning("server-agent(%s@%s)-ac(%s)[handleNhpOpenResource] no ac connection is available", knkMsg.UserId, addrStr, acId)
 			artMsg := &common.ACOpsResultMsg{}
@@ -2223,20 +2206,16 @@ func (s *UdpServer) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*A
 		return nil
 	}
 
-	// Look up all AC connections, filtering out stale (closed) ones
-	s.acConnectionMapMutex.RLock()
-	conns, found := s.acConnectionMap[acId]
-	var result []*ACConn
-	if found {
-		for _, c := range conns {
-			if !c.ConnData.IsClosed() {
-				result = append(result, c)
-			}
-		}
+	// Look up all live AC connections. The forwarder consumes this slice
+	// for NHP-AOP fan-out, so a stale conn here would drain the forwarded
+	// knock's transaction timeout the same way it would drain a local one.
+	result, droppedStale := s.snapshotLiveACConns(acId)
+	if droppedStale > 0 {
+		log.Warning("FindACConnectionsForKnock: AC %s filtered %d stale/closed connection(s) (threshold=%v)",
+			acId, droppedStale, s.staleACConnThreshold())
 	}
-	s.acConnectionMapMutex.RUnlock()
 
-	if !found || len(result) == 0 {
+	if len(result) == 0 {
 		log.Debug("FindACConnectionsForKnock: AC %s not connected", acId)
 		return nil
 	}

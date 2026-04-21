@@ -14,7 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -909,6 +909,112 @@ func corsMiddleware(allowedOrigins []string) gin.HandlerFunc {
 	}
 }
 
+// filterLiveACConns returns the subset of conns safe to broadcast NHP-AOP
+// on: not IsClosed(), and received a packet within the staleness threshold.
+// Also returns the count of dropped entries so the caller can emit a metric
+// and log once without re-walking the slice.
+//
+// Pure function — callers hold the map mutex only for the lookup, not the
+// filter. The server holds AC connections until something explicitly closes
+// them, but an AC instance can disappear silently (ASG replace, NAT rebind,
+// EC2 shutdown without clean teardown) and the server has no inbound signal
+// to prune it. Including those dead connections in the broadcast wastes the
+// transaction timeout (~5s) per dead peer, draining the budget on peers
+// that will never ACK. Callers that drop every connection fall through to
+// the no-AC path and retry via the HTTP knock forwarder.
+func filterLiveACConns(conns []*ACConn, threshold time.Duration) (kept []*ACConn, dropped int) {
+	if len(conns) == 0 {
+		return nil, 0
+	}
+	cutoffNanos := time.Now().Add(-threshold).UnixNano()
+	kept = make([]*ACConn, 0, len(conns))
+	for _, c := range conns {
+		if c == nil || c.ConnData == nil || c.ConnData.IsClosed() {
+			dropped++
+			continue
+		}
+		if atomic.LoadInt64(&c.ConnData.LastLocalRecvTime) < cutoffNanos {
+			dropped++
+			continue
+		}
+		kept = append(kept, c)
+	}
+	return kept, dropped
+}
+
+// staleACConnThreshold returns the effective staleness threshold for this
+// server, applying the Config.StaleACConnThresholdSeconds override (if > 0)
+// and clamping up to MinStaleACConnThreshold so a misconfiguration cannot
+// filter every connection on every knock. nil-safe so tests that construct
+// a bare UdpServer without a Config get the default behavior.
+func (s *UdpServer) staleACConnThreshold() time.Duration {
+	if s.config == nil || s.config.StaleACConnThresholdSeconds <= 0 {
+		return DefaultStaleACConnThreshold
+	}
+	t := time.Duration(s.config.StaleACConnThresholdSeconds) * time.Second
+	if t < MinStaleACConnThreshold {
+		return MinStaleACConnThreshold
+	}
+	return t
+}
+
+// snapshotLiveACConns is the lock-aware wrapper around filterLiveACConns
+// used by NHP-AOP broadcast sites. Reads s.acConnectionMap[acId] under
+// RLock, clones the backing slice (removeACConnectionRecord mutates the
+// underlying slice in place via append(conns[:i], conns[i+1:]...) under
+// the write lock — a reference held past RUnlock would otherwise observe
+// a shifted slice), runs the filter, and emits MetricACConnStaleFiltered
+// once with the dropped count.
+//
+// Returns (kept, droppedCount). Callers add their own context-rich log
+// line; the metric is emitted here so call sites cannot forget it.
+//
+// For pre-broadcast liveness checks (e.g., a UDP-knock forwarding gate
+// that only needs to know whether *any* live conn exists), use the cheap
+// hasLiveACConn predicate instead — calling snapshotLiveACConns there
+// would double-emit the metric for the same acId on the same knock.
+//
+// Race window with hasLiveACConn: the gate can return true (a live conn
+// exists at time T0) and a subsequent snapshotLiveACConns can return zero
+// (every live conn was closed/removed between T0 and T1). This is
+// intentional and bounded: the broadcast loop's `len(connsCopy) == 0`
+// check then falls through to the no-AC path, which forwards the knock.
+// The window is bounded by KeepaliveInterval since the AC will have to
+// re-register before its next conn is removed.
+func (s *UdpServer) snapshotLiveACConns(acId string) (kept []*ACConn, droppedCount int) {
+	s.acConnectionMapMutex.RLock()
+	snapshot := slices.Clone(s.acConnectionMap[acId])
+	s.acConnectionMapMutex.RUnlock()
+
+	kept, droppedCount = filterLiveACConns(snapshot, s.staleACConnThreshold())
+	if droppedCount > 0 {
+		s.metrics.AddCounterWithDims(MetricACConnStaleFiltered, float64(droppedCount), nil)
+	}
+	return kept, droppedCount
+}
+
+// hasLiveACConn reports whether s.acConnectionMap[acId] contains at least
+// one connection that would survive snapshotLiveACConns's filter. Used by
+// pre-broadcast decision points (e.g., UDP-knock forwarding gate) that
+// only need a yes/no liveness signal — short-circuits on the first live
+// conn, allocates nothing, and does not emit the staleness metric (the
+// matching broadcast call will do that if it runs).
+func (s *UdpServer) hasLiveACConn(acId string) bool {
+	s.acConnectionMapMutex.RLock()
+	defer s.acConnectionMapMutex.RUnlock()
+
+	cutoffNanos := time.Now().Add(-s.staleACConnThreshold()).UnixNano()
+	for _, c := range s.acConnectionMap[acId] {
+		if c == nil || c.ConnData == nil || c.ConnData.IsClosed() {
+			continue
+		}
+		if atomic.LoadInt64(&c.ConnData.LastLocalRecvTime) >= cutoffNanos {
+			return true
+		}
+	}
+	return false
+}
+
 func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *common.ResourceData) (ackMsg *common.ServerKnockAckMsg, err error) {
 	hs.wg.Add(1)
 	defer hs.wg.Done()
@@ -980,21 +1086,12 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 			continue
 		}
 		acId := resInfo.ACId
-		s.acConnectionMapMutex.RLock()
-		acConns, found := s.acConnectionMap[acId]
-		var connsCopy []*ACConn
-		if found {
-			// Filter out connections that have already been closed to avoid
-			// sending NHP-AOP on stale connections (which would fail immediately
-			// with ErrTransactionFailedByClosedConnection).
-			for _, c := range acConns {
-				if !c.ConnData.IsClosed() {
-					connsCopy = append(connsCopy, c)
-				}
-			}
+		connsCopy, droppedStale := s.snapshotLiveACConns(acId)
+		if droppedStale > 0 {
+			log.Warning("httpserver-agent(%s#%s@%s)-ac(%s)[handleHttpOpenResource] filtered %d stale/closed AC connection(s) (threshold=%v)",
+				knkMsg.UserId, knkMsg.DeviceId, srcIp, acId, droppedStale, s.staleACConnThreshold())
 		}
-		s.acConnectionMapMutex.RUnlock()
-		if !found || len(connsCopy) == 0 {
+		if len(connsCopy) == 0 {
 			// No local AC connection — try HTTP forwarding to an assigned server
 			if hs.httpForwarder != nil && !req.Forwarded {
 				fwdCtx, fwdCancel := context.WithTimeout(ctx, DefaultForwardTimeout)

@@ -40,6 +40,29 @@ const (
 	// (DynamoDB lookup + Cloud Map health check + up to 3 HTTP round-trips at 2s each).
 	DefaultForwardTimeout = 10 * time.Second
 
+	// DefaultStaleACConnThreshold is the default duration after which an AC
+	// connection is considered dead for broadcast purposes. Set to the same
+	// window the AC itself uses to decide a server is down: KeepaliveInterval
+	// (10s) × KeepaliveMaxRetries (3) = 30s (see endpoints/ac/registration.go).
+	// Past that point the AC will have entered its own re-registration path,
+	// so NHP-AOP sent on a connection silent this long will sit until the
+	// server-side transaction timeout — wasting the broadcast budget on a
+	// peer that will not ACK. recvPacketRoutine updates
+	// ConnectionData.LastLocalRecvTime on every inbound packet (including
+	// keepalives), so a live connection stays fresh without extra work.
+	//
+	// Override per-server via Config.StaleACConnThresholdSeconds; the floor
+	// MinStaleACConnThreshold (5s) is enforced on the resolved value to
+	// prevent a misconfiguration from filtering every connection on every
+	// knock.
+	DefaultStaleACConnThreshold = 30 * time.Second
+
+	// MinStaleACConnThreshold is the floor enforced when resolving the
+	// effective threshold from Config.StaleACConnThresholdSeconds. A value
+	// below this would filter out connections that haven't quite finished
+	// their first keepalive cycle (KeepaliveInterval = 10s on the AC side).
+	MinStaleACConnThreshold = 5 * time.Second
+
 	// TTLRefreshMinInterval is the minimum time between TTL refreshes for the same AC.
 	// Prevents excessive DynamoDB writes from frequent AC re-registrations.
 	TTLRefreshMinInterval = 5 * time.Minute
@@ -110,6 +133,25 @@ const (
 	MetricACConnsPerID         = "ACConnsPerID"         // gauge: max AC connections across all AC IDs
 	MetricTotalACConns         = "TotalACConns"         // gauge: total AC connections across all AC IDs
 	MetricACConnEviction       = "ACConnEviction"       // MaxACConnsPerID eviction events
+
+	// MetricACConnStaleFiltered counts AC connections skipped by the
+	// broadcast-time staleness filter (DefaultStaleACConnThreshold or its
+	// per-server override). A non-zero rate is expected during AC
+	// reconnects (blue/green switch, EC2 refresh, NAT rebind); a sustained
+	// rate against a healthy AC means the server is not clearing stale
+	// entries on disconnect. Emitted once per call site per knock with the
+	// dropped count (not once per dropped connection), so a single
+	// broadcast filtering three stale entries adds 3.
+	//
+	// Operator guidance:
+	//   - Burst spikes during deploys/refresh: expected, no action.
+	//   - Sustained > N/min against a single AC ID for > 5 minutes outside
+	//     a deploy window: investigate. The AC has likely rotated keys or
+	//     IPs without a clean disconnect; check AC logs for recent
+	//     re-registration events and CloudMap deregister history.
+	//   - Threshold for an alarm depends on knock volume; suggest starting
+	//     with "rate > 60/min sustained for 10 min" once a baseline exists.
+	MetricACConnStaleFiltered = "ACConnStaleFiltered"
 )
 
 // udpCorrelationCtx creates a context with a correlation ID derived from UDP handler

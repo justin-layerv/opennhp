@@ -71,6 +71,16 @@ type Config struct {
 	DisableAgentValidation bool         `json:"disableAgentValidation"`
 	WebRTC                 WebRTCConfig `toml:"webrtc"`
 
+	// StaleACConnThresholdSeconds overrides the default DefaultStaleACConnThreshold
+	// (30s) for filtering AC connections out of NHP-AOP broadcast targeting.
+	// A connection that has not received a packet in this window is treated
+	// as dead. Lowering this aggressively risks filtering out a healthy AC
+	// that has briefly stopped responding (e.g., GC pause); raising it gives
+	// the broadcast more time on dead peers. Tune from MetricACConnStaleFiltered
+	// rate against demonstrably-live ACs. Zero / negative values fall back
+	// to the default.
+	StaleACConnThresholdSeconds int `json:"staleACConnThresholdSeconds"`
+
 	// ACPeerGracePeriodSeconds overrides the default grace window for the
 	// /health/knock-ready AC peer check. The check returns pass-with-cached-
 	// count for this long after the live AC connection count drops to zero,
