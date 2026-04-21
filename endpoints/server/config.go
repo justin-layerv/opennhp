@@ -70,6 +70,29 @@ type Config struct {
 	DefaultCipherScheme    int          `json:"defaultCipherScheme"`
 	DisableAgentValidation bool         `json:"disableAgentValidation"`
 	WebRTC                 WebRTCConfig `toml:"webrtc"`
+
+	// ACPeerGracePeriodSeconds overrides the default grace window for the
+	// /health/knock-ready AC peer check. The check returns pass-with-cached-
+	// count for this long after the live AC connection count drops to zero,
+	// so single-keepalive-cycle flickers (the per-AC-ID slice momentarily
+	// emptying before the next NHP_AOL re-registers it) do not flap NLB
+	// target health or false-fail per-instance smoke probes. Past this
+	// window a sustained zero flips to fail honestly.
+	//
+	// Zero or unset → DefaultACPeerGracePeriod (30s, == AC's
+	// KeepaliveInterval × KeepaliveMaxRetries). Negative disables the
+	// grace window entirely (legacy immediate-fail behavior); use only
+	// when intentionally testing the underlying counter contract.
+	//
+	// Positive values outside [MinACPeerGracePeriod, MaxACPeerGracePeriod]
+	// (10s–5m) are clamped into that range, with a boot-log warning
+	// — see acPeerGracePeriodFromConfig in httpserver.go.
+	//
+	// Restart required: the checker is built once at initHealthManager
+	// and hot-reload (SIGHUP) does not re-thread this value into the
+	// active checker. Changes to config.toml take effect at process
+	// restart.
+	ACPeerGracePeriodSeconds int `json:"acPeerGracePeriodSeconds"`
 }
 
 type RemoteConfig struct {

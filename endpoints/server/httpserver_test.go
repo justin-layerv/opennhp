@@ -2,13 +2,101 @@ package server
 
 import (
 	"encoding/base64"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/OpenNHP/opennhp/endpoints/server/health"
 )
+
+func TestACPeerGracePeriodFromConfig(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		input       int
+		wantDur     time.Duration
+		wantWarning bool
+	}{
+		{"zero → 0 (checker picks default)", 0, 0, false},
+		{"negative → -1s sentinel (disabled)", -1, -time.Second, false},
+		{"any negative normalizes to -1s", -30, -time.Second, false},
+		{"below floor → clamped up with warning", 3, health.MinACPeerGracePeriod, true},
+		{"at floor → unchanged", int(health.MinACPeerGracePeriod / time.Second), health.MinACPeerGracePeriod, false},
+		{"within range → unchanged", 45, 45 * time.Second, false},
+		{"at ceiling → unchanged", int(health.MaxACPeerGracePeriod / time.Second), health.MaxACPeerGracePeriod, false},
+		{"above ceiling → clamped down with warning", 3600, health.MaxACPeerGracePeriod, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var warned bool
+			logf := func(string, ...any) { warned = true }
+			got := acPeerGracePeriodFromConfig(tc.input, logf)
+			if got != tc.wantDur {
+				t.Errorf("duration = %v, want %v", got, tc.wantDur)
+			}
+			if warned != tc.wantWarning {
+				t.Errorf("warn=%v, want %v (input=%d)", warned, tc.wantWarning, tc.input)
+			}
+		})
+	}
+
+	t.Run("nil logf is safe", func(t *testing.T) {
+		// Clamp path without a logger must not panic; tests and
+		// operators running in contexts without a plumbed logger
+		// should still get a correctly-clamped result.
+		got := acPeerGracePeriodFromConfig(3, nil)
+		if got != health.MinACPeerGracePeriod {
+			t.Errorf("nil logf: got %v, want %v", got, health.MinACPeerGracePeriod)
+		}
+	})
+
+	t.Run("overflow → clamped to max with distinct warning", func(t *testing.T) {
+		// A configSeconds value that would wrap time.Duration's int64
+		// nanos (>~9.2e9 seconds). Before the overflow guard, the
+		// wrapped value fell through to the "below floor" branch and
+		// emitted a misleading warning. The guard should detect this
+		// explicitly, clamp to Max, and emit a warning that mentions
+		// overflow.
+		var warning string
+		logf := func(format string, args ...any) {
+			warning = format
+		}
+		const overflowing = math.MaxInt // int, large enough to overflow int64 nanos
+		got := acPeerGracePeriodFromConfig(overflowing, logf)
+		if got != health.MaxACPeerGracePeriod {
+			t.Errorf("overflow: got %v, want %v", got, health.MaxACPeerGracePeriod)
+		}
+		if !strings.Contains(warning, "overflow") {
+			t.Errorf("warning = %q, should mention overflow (input=%d)",
+				warning, overflowing)
+		}
+	})
+}
+
+func TestFormatGraceLabel(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		in   time.Duration
+		want string
+	}{
+		{0, "disabled"},
+		{30 * time.Second, "30s"},
+		{5 * time.Minute, "5m0s"},
+	}
+	for _, tc := range cases {
+		if got := formatGraceLabel(tc.in); got != tc.want {
+			t.Errorf("formatGraceLabel(%v) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
 
 func TestErrNoStorageBackend(t *testing.T) {
 	t.Parallel()

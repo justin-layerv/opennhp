@@ -68,6 +68,55 @@ func TestACRegistryPrefix(t *testing.T) {
 	}
 }
 
+// TestUpdateBaseConfig_DoesNotHotReloadACPeerGracePeriodSeconds fences
+// the "restart required" contract documented on
+// Config.ACPeerGracePeriodSeconds. updateBaseConfig's reload branch
+// does NOT propagate ACPeerGracePeriodSeconds — the ACPeerChecker is
+// built once at initHealthManager. If a future contributor adds
+// propagation here without also wiring a checker-side Set through so
+// the live checker adopts the new value, or adds checker propagation
+// but leaves the restart-required docstring in place, this test
+// surfaces the mismatch.
+//
+// Defensive recover: the test deliberately instantiates a bare
+// UdpServer (no log, device, or webrtc server) and relies on the
+// current reload branches all being delta-guarded. If a future
+// contributor adds an unconditional s.log.* / s.device.* /
+// s.webrtcServer.* call to updateBaseConfig, a nil-pointer deref
+// would otherwise mask the contract assertion. The recover
+// converts that panic into a clear diagnostic that still points at
+// the propagation contract.
+func TestUpdateBaseConfig_DoesNotHotReloadACPeerGracePeriodSeconds(t *testing.T) {
+	const initialGrace = 60
+	const newGrace = 120
+
+	s := &UdpServer{
+		config: &Config{ACPeerGracePeriodSeconds: initialGrace},
+	}
+	incoming := Config{ACPeerGracePeriodSeconds: newGrace}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("updateBaseConfig panicked (likely nil-deref on a newly-unconditional "+
+				"s.log/s.device/s.webrtcServer call); the hot-reload propagation contract for "+
+				"ACPeerGracePeriodSeconds is unverified. Either harden this test by plumbing "+
+				"a real server, or restore the delta-guard on your new branch. panic: %v", r)
+		}
+	}()
+
+	if err := s.updateBaseConfig(incoming); err != nil {
+		t.Fatalf("updateBaseConfig: %v", err)
+	}
+
+	if got := s.config.ACPeerGracePeriodSeconds; got != initialGrace {
+		t.Errorf("s.config.ACPeerGracePeriodSeconds = %d after hot-reload, want %d "+
+			"(restart-required contract). If propagation was intentionally added, "+
+			"also wire a checker-side Set so the live checker adopts the new value, "+
+			"and drop the restart-required docstring on Config.ACPeerGracePeriodSeconds.",
+			got, initialGrace)
+	}
+}
+
 func TestUpdateResources_NilAspData(t *testing.T) {
 	// This test verifies that updateResources handles nil aspData entries gracefully.
 	// TOML unmarshals empty tables (e.g., "[passcode]" with no fields) as nil pointers.

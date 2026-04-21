@@ -127,11 +127,26 @@ func TestHealthStartup_Returns200(t *testing.T) {
 }
 
 // knockReadyPeerCountPattern matches the ac_peers check's message
-// field, e.g. "3 AC peer(s) connected". The server formats this string
-// in endpoints/server/health/acpeer.go:68-69. Any drift there breaks
-// this regex — that's intentional: the smoke suite is the place
-// downstream consumers learn that the contract shape changed.
-var knockReadyPeerCountPattern = regexp.MustCompile(`^(\d+) AC peer\(s\) connected$`)
+// field. The server emits exactly two shapes today, both expressed as
+// anchored alternates so drift on either side breaks the regex
+// instead of silently matching a mutated suffix:
+//
+//	"3 AC peer(s) connected"
+//	"3 AC peer(s) connected (cached, live=0 for 5s, within 30s grace)"
+//
+// The cached-suffix variant is emitted by ACPeerChecker during its
+// debounce grace window, when the live count has briefly dropped to 0
+// but a previously-seen non-zero count is still within the window.
+// The captured digit is the cached count in that variant (the "live"
+// count when the grace marker is absent), so the existing
+// m[1] != "0" assertion retains the same semantic in both shapes.
+//
+// The server formats both variants in endpoints/server/health/acpeer.go.
+// Any drift there breaks this regex — that's intentional: the smoke
+// suite is the place downstream consumers learn the contract changed.
+var knockReadyPeerCountPattern = regexp.MustCompile(
+	`^(\d+) AC peer\(s\) connected( \(cached, live=0 for \d+[^,]+, within \S+ grace\))?$`,
+)
 
 // Post-flip convergence retry budget. Shared between the
 // knock-ready health tests (Tier 1) and the resolve happy-path

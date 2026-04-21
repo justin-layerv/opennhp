@@ -48,18 +48,29 @@ const (
 // Metric counter names for CloudWatch. Using constants prevents typos
 // and enables discoverability across the codebase.
 const (
-	MetricKnockRequest                 = "KnockRequest"
-	MetricKnockLatency                 = "KnockLatency"
-	MetricAuthSuccess                  = "AuthSuccess"
-	MetricAuthFailure                  = "AuthFailure"
-	MetricAutoAssignment               = "AutoAssignment"
-	MetricKnockForwardSuccess          = "KnockForwardSuccess"
-	MetricKnockForwardFailure          = "KnockForwardFailure"
-	MetricKnockForwardSkippedDead      = "KnockForwardSkippedDead"
-	MetricKnockForwardFallback         = "KnockForwardFallback"
-	MetricCloudMapDeregisterFailure    = "CloudMapDeregisterFailure"
-	MetricKnockNoAC                    = "KnockNoAC"
-	MetricACPeerCount                  = "ACPeerCount"
+	MetricKnockRequest              = "KnockRequest"
+	MetricKnockLatency              = "KnockLatency"
+	MetricAuthSuccess               = "AuthSuccess"
+	MetricAuthFailure               = "AuthFailure"
+	MetricAutoAssignment            = "AutoAssignment"
+	MetricKnockForwardSuccess       = "KnockForwardSuccess"
+	MetricKnockForwardFailure       = "KnockForwardFailure"
+	MetricKnockForwardSkippedDead   = "KnockForwardSkippedDead"
+	MetricKnockForwardFallback      = "KnockForwardFallback"
+	MetricCloudMapDeregisterFailure = "CloudMapDeregisterFailure"
+	MetricKnockNoAC                 = "KnockNoAC"
+	MetricACPeerCount               = "ACPeerCount"
+	// MetricACGraceAbsorbed increments once per /health/knock-ready probe
+	// where ACPeerChecker returned pass from the grace-window branch
+	// (live count was zero but the last-non-zero timestamp was inside
+	// ACPeerGracePeriodSeconds). A rising rate means the debounce is
+	// doing real work (single-keepalive flickers) rather than hiding
+	// sustained AC-side degradation. Pair with KnockNoAC to distinguish:
+	//   - GraceAbsorbed up AND KnockNoAC flat → debounce is absorbing
+	//     transients as designed; rollout is healthy.
+	//   - GraceAbsorbed up AND KnockNoAC up   → AC cluster is actually
+	//     broken and the grace window is masking it; page oncall.
+	MetricACGraceAbsorbed              = "ACGraceAbsorbed"
 	MetricACRegistrationSuccess        = "ACRegistrationSuccess"
 	MetricACRegistrationFailure        = "ACRegistrationFailure"
 	MetricACRegistrationLatency        = "ACRegistrationLatency"

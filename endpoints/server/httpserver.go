@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html/template"
 	"io/fs"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -355,11 +356,32 @@ func (hs *HttpServer) initHealthManager() error {
 	hs.knockManager = health.NewManager(managerCfg)
 
 	// AC peer checker — critical for knock readiness, not registered on the main manager.
+	// Grace period from Config.ACPeerGracePeriodSeconds absorbs single-keepalive-cycle
+	// flickers (see ACPeerChecker doc); zero/unset uses the package default.
+	// acPeerGracePeriodFromConfig clamps into [Min, Max] and warns on clamp.
+	acGrace := acPeerGracePeriodFromConfig(hs.udpServer.config.ACPeerGracePeriodSeconds, log.Warning)
+	// MetricACGraceAbsorbed fires once per grace-window pass so operators
+	// can separate "debounce is absorbing single-keepalive flickers"
+	// (rollout healthy) from "AC cluster is actually broken and the grace
+	// window is hiding it" (page oncall — pair with KnockNoAC trend).
+	// Nil-safe if metrics is unplumbed (tests).
+	var onGraceAbsorbed func()
+	if hs.udpServer.metrics != nil {
+		onGraceAbsorbed = func() {
+			hs.udpServer.metrics.IncrCounter(MetricACGraceAbsorbed)
+		}
+	}
 	acChecker := health.NewACPeerChecker(&health.ACPeerCheckerConfig{
-		Counter: hs.udpServer,
+		Counter:         hs.udpServer,
+		GracePeriod:     acGrace,
+		OnGraceAbsorbed: onGraceAbsorbed,
 	})
 	hs.knockManager.Register(acChecker)
-	log.Info("Health check: AC peer checker registered on knock-ready endpoint")
+	// Log the effective value — clamp/disabled/default handling may have
+	// adjusted the configured input, so the runtime-truth source is the
+	// checker itself, not the config int.
+	log.Info("Health check: AC peer checker registered on knock-ready endpoint (grace=%s)",
+		formatGraceLabel(acChecker.GracePeriod()))
 
 	// Publish ACPeerCount gauge every flush interval for CloudWatch monitoring.
 	hs.udpServer.metrics.RegisterGaugeFunc(MetricACPeerCount, func() float64 {
@@ -409,6 +431,72 @@ func (hs *HttpServer) initHealthManager() error {
 	// Fail-fast: no storage backend means the server cannot function properly
 	log.Error("Health check: no storage checker registered (storage backend: %s) - server cannot start without storage", backendName)
 	return ErrNoStorageBackend
+}
+
+// acPeerGracePeriodFromConfig maps Config.ACPeerGracePeriodSeconds to
+// the duration passed into health.ACPeerCheckerConfig.GracePeriod. The
+// checker honors the tri-valued semantic on its input (0 → default, <0
+// → disabled, >0 → as-is); this function owns the operator-safety
+// clamp into [health.MinACPeerGracePeriod, health.MaxACPeerGracePeriod]
+// and logs a warning on clamp so misconfigurations surface at boot.
+//
+//   - configSeconds == 0               → 0 (checker picks DefaultACPeerGracePeriod)
+//   - configSeconds  < 0               → -time.Second (checker treats as disabled)
+//   - 0 < val < Min                    → clamped up to Min, warn
+//   - Min <= val <= Max                → as-is
+//   - val > Max                        → clamped down to Max, warn
+//
+// logf receives the warning; pass nil to suppress (tests).
+func acPeerGracePeriodFromConfig(configSeconds int, logf func(string, ...any)) time.Duration {
+	if configSeconds == 0 {
+		return 0 // checker picks DefaultACPeerGracePeriod
+	}
+	if configSeconds < 0 {
+		// Any negative signals disabled. Normalize to -1s so the checker
+		// sees a consistent sentinel; tests can assert this exact value
+		// when they need to verify "disabled was requested."
+		return -time.Second
+	}
+	// Overflow guard: time.Duration is int64 nanoseconds, so values above
+	// MaxInt64 / 1e9 (~9.2e9 seconds, ~292 years) wrap to negative when
+	// multiplied. Without this, the wrapped value would fall through to the
+	// "below floor" branch and emit a misleading warning, instead of
+	// surfacing the actual problem (malformed / fat-fingered config).
+	const maxSafeSeconds = int(math.MaxInt64 / int64(time.Second))
+	if configSeconds > maxSafeSeconds {
+		if logf != nil {
+			logf("Config.ACPeerGracePeriodSeconds=%d overflows time.Duration (max safe value is %d seconds); clamped to %s",
+				configSeconds, maxSafeSeconds, health.MaxACPeerGracePeriod)
+		}
+		return health.MaxACPeerGracePeriod
+	}
+	d := time.Duration(configSeconds) * time.Second
+	switch {
+	case d < health.MinACPeerGracePeriod:
+		if logf != nil {
+			logf("Config.ACPeerGracePeriodSeconds=%d below floor %s, clamped to %s",
+				configSeconds, health.MinACPeerGracePeriod, health.MinACPeerGracePeriod)
+		}
+		return health.MinACPeerGracePeriod
+	case d > health.MaxACPeerGracePeriod:
+		if logf != nil {
+			logf("Config.ACPeerGracePeriodSeconds=%d above ceiling %s, clamped to %s",
+				configSeconds, health.MaxACPeerGracePeriod, health.MaxACPeerGracePeriod)
+		}
+		return health.MaxACPeerGracePeriod
+	default:
+		return d
+	}
+}
+
+// formatGraceLabel renders the effective grace window for the boot log.
+// Reads the checker's actual value rather than reformatting the config
+// input so label and behavior can't diverge.
+func formatGraceLabel(d time.Duration) string {
+	if d == 0 {
+		return "disabled"
+	}
+	return d.String()
 }
 
 // LoadFilesRecursively loads HTML and template files recursively from the specified directory and adds them to the given gin.Engine.

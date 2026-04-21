@@ -275,9 +275,13 @@ func TestFailureInjection_StorageBackendFailure(t *testing.T) {
 func TestFailureInjection_ACPeerDisconnection(t *testing.T) {
 	t.Parallel()
 
-	// Use the real ACPeerChecker with a controllable counter
-	counter := &mutableACPeerCounter{count: 3}
-	acChecker := NewACPeerChecker(&ACPeerCheckerConfig{Counter: counter})
+	// Use the real ACPeerChecker with a controllable counter.
+	// GracePeriod=-1 disables the debounce window so this test exercises
+	// the underlying counter-drives-status contract directly. The
+	// with-grace behavior (transient zero is absorbed; sustained zero
+	// fails) has its own dedicated tests in acpeer_test.go.
+	counter := newCounterAt(3)
+	acChecker := NewACPeerChecker(&ACPeerCheckerConfig{Counter: counter, GracePeriod: -1})
 
 	m := NewManager(&ManagerConfig{
 		Service: "nhp-server",
@@ -318,24 +322,6 @@ func TestFailureInjection_ACPeerDisconnection(t *testing.T) {
 	if resp.Status != StatusHealthy {
 		t.Fatalf("expected healthy after AC peers reconnect, got %s", resp.Status)
 	}
-}
-
-// mutableACPeerCounter is an ACPeerCounter whose count can be changed at runtime.
-type mutableACPeerCounter struct {
-	mu    sync.RWMutex
-	count int
-}
-
-func (m *mutableACPeerCounter) ACPeerCount() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.count
-}
-
-func (m *mutableACPeerCounter) set(n int) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.count = n
 }
 
 // ============================================================================
@@ -861,8 +847,11 @@ func TestFailureInjection_HTTPHandlerStatusCodes(t *testing.T) {
 func TestFailureInjection_KnockReadinessDuringACFailure(t *testing.T) {
 	t.Parallel()
 
-	counter := &mutableACPeerCounter{count: 3}
-	acChecker := NewACPeerChecker(&ACPeerCheckerConfig{Counter: counter})
+	// GracePeriod=-1 disables the debounce window so this failure-
+	// injection test exercises the immediate counter-drives-status path.
+	// The with-grace behavior is covered in acpeer_test.go.
+	counter := newCounterAt(3)
+	acChecker := NewACPeerChecker(&ACPeerCheckerConfig{Counter: counter, GracePeriod: -1})
 
 	storageChecker := newFailingChecker("dynamodb", true)
 
@@ -1083,7 +1072,7 @@ func TestFailureInjection_FullServerLifecycle(t *testing.T) {
 	// 5. New instance launches and passes startup
 
 	storage := newFailingChecker("dynamodb", true)
-	counter := &mutableACPeerCounter{count: 0}
+	counter := newCounterAt(0)
 	acChecker := NewACPeerChecker(&ACPeerCheckerConfig{Counter: counter})
 
 	// Boot phase: create manager with startup checks
