@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
+	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
 func TestParseACRegistryEntry(t *testing.T) {
@@ -71,38 +72,43 @@ func TestACRegistryPrefix(t *testing.T) {
 // TestUpdateBaseConfig_DoesNotHotReloadACPeerGracePeriodSeconds fences
 // the "restart required" contract documented on
 // Config.ACPeerGracePeriodSeconds. updateBaseConfig's reload branch
-// does NOT propagate ACPeerGracePeriodSeconds — the ACPeerChecker is
-// built once at initHealthManager. If a future contributor adds
-// propagation here without also wiring a checker-side Set through so
-// the live checker adopts the new value, or adds checker propagation
-// but leaves the restart-required docstring in place, this test
-// surfaces the mismatch.
+// does NOT propagate the value — the ACPeerChecker is built once at
+// initHealthManager. If a future contributor adds propagation here
+// without also wiring a checker-side Set, or adds checker propagation
+// without dropping the restart-required docstring, this test fails.
 //
-// Defensive recover: the test deliberately instantiates a bare
-// UdpServer (no log, device, or webrtc server) and relies on the
-// current reload branches all being delta-guarded. If a future
-// contributor adds an unconditional s.log.* / s.device.* /
-// s.webrtcServer.* call to updateBaseConfig, a nil-pointer deref
-// would otherwise mask the contract assertion. The recover
-// converts that panic into a clear diagnostic that still points at
-// the propagation contract.
+// Plumbs a real *log.Logger onto the UdpServer so any future
+// unconditional s.log.* call inside updateBaseConfig (e.g. a new
+// info-log on every reload) doesn't nil-deref and mask the actual
+// contract assertion. The logger writes to no directory (empty dir
+// arg) and is Closed via t.Cleanup so its background writer
+// goroutines don't outlive the test.
 func TestUpdateBaseConfig_DoesNotHotReloadACPeerGracePeriodSeconds(t *testing.T) {
 	const initialGrace = 60
 	const newGrace = 120
 
+	// Level 0 (silent) gates every log-writing method
+	// (Info/Warning/Error/…) before the write path, so this plumbing
+	// only guards the nil-method-ref boundary — the test's intent.
+	// A future contributor who adds an unconditional s.log.Info(...)
+	// to the reload branch will exercise the method lookup (no
+	// panic), and the contract assertion below runs on its merits.
+	// Setter methods on the logger (e.g., SetLogLevel) aren't level-
+	// gated, but they also don't nil-deref on a real *log.Logger.
+	//
+	// Defense-in-depth: dir is t.TempDir() rather than "", so any
+	// future test-level change that bumps the log level above 0 (or
+	// any change to NewLogger's silent-level gating) won't leave
+	// evaluate/audit log files littering the test's working
+	// directory. t.TempDir cleans up automatically.
+	logger := log.NewLogger("test", 0, t.TempDir(), "")
+	t.Cleanup(logger.Close)
+
 	s := &UdpServer{
+		log:    logger,
 		config: &Config{ACPeerGracePeriodSeconds: initialGrace},
 	}
 	incoming := Config{ACPeerGracePeriodSeconds: newGrace}
-
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("updateBaseConfig panicked (likely nil-deref on a newly-unconditional "+
-				"s.log/s.device/s.webrtcServer call); the hot-reload propagation contract for "+
-				"ACPeerGracePeriodSeconds is unverified. Either harden this test by plumbing "+
-				"a real server, or restore the delta-guard on your new branch. panic: %v", r)
-		}
-	}()
 
 	if err := s.updateBaseConfig(incoming); err != nil {
 		t.Fatalf("updateBaseConfig: %v", err)

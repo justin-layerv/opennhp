@@ -82,13 +82,21 @@ const (
 // exact contract the cached-count message is supposed to preserve.
 //
 // Concurrent-writer caveat: two concurrent non-zero writers can
-// produce a reader-visible cross-pair (timestamp from writer A,
-// count from writer B). Both values are still non-zero, so the
-// grace-window message stays truthful — the count is a valid
-// non-zero snapshot from a recent write, just possibly not the
-// one paired with the timestamp. Acceptable because the check's
-// contract is "is there a recent non-zero count?", not "exactly
-// which write produced the timestamp?".
+// produce a reader-visible cross-pair (timestamp from one writer,
+// count from the other). Both values are still non-zero, so the
+// grace-window message stays truthful — but the reader can observe
+// the OLDER count paired with the NEWER timestamp. Example: writers
+// W1 (count=5, timestamp T1) and W2 (count=3, timestamp T2 > T1)
+// interleave as:
+//
+//	W2.count.Store(3); W2.at.Store(T2); W1.count.Store(5); [reader]; W1.at.Store(T1)
+//
+// The reader loads at=T2 (from W2) then count=5 (from W1's earlier
+// Store), so the message renders "5 AC peer(s) connected (cached, …)"
+// even though the most recent non-zero observation was actually 3.
+// Acceptable because the check's contract is "is there a recent
+// non-zero count?", not "exactly which write produced the timestamp?"
+// — NLB and the smoke regex both only assert m[1] != "0".
 type ACPeerChecker struct {
 	counter     ACPeerCounter
 	gracePeriod time.Duration

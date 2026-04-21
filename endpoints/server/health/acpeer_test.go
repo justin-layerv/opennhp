@@ -285,6 +285,40 @@ func TestACPeerChecker_Check_GraceWindow_NilCallbackIsSafe(t *testing.T) {
 	}
 }
 
+// TestACPeerChecker_Check_GraceWindow_BoundaryIsInclusive fences the
+// `<=` choice at acpeer.go's grace-window comparison. Exactly
+// gracePeriod must still pass; gracePeriod + 1ns must fail. Without
+// this test the inclusive/exclusive choice would be incidental
+// (the 15s/31s points in the other tests land nowhere near the
+// boundary), and a future refactor to `<` would silently narrow the
+// debounce window by up to one probe interval on the exact case
+// the invariant tries to absorb (a flicker whose recovery lands
+// right at the boundary).
+func TestACPeerChecker_Check_GraceWindow_BoundaryIsInclusive(t *testing.T) {
+	t.Parallel()
+
+	const grace = 30 * time.Second
+
+	counter := newCounterAt(1)
+	c, clk := newCheckerWithFakeClock(t, counter, grace)
+	c.Check(context.Background()) // seed lastNonZeroAt
+	counter.set(0)
+
+	// Exactly at the boundary — must pass.
+	clk.Advance(grace)
+	if got := c.Check(context.Background()); got.Status != CheckStatusPass {
+		t.Fatalf("boundary (age == gracePeriod): got status=%q msg=%q, want pass — <=/< choice regressed",
+			got.Status, got.Message)
+	}
+
+	// One nanosecond past — must fail.
+	clk.Advance(time.Nanosecond)
+	if got := c.Check(context.Background()); got.Status != CheckStatusFail {
+		t.Fatalf("boundary + 1ns: got status=%q msg=%q, want fail",
+			got.Status, got.Message)
+	}
+}
+
 // TestACPeerChecker_Check_GraceWindow_FailsAfterExpiry fences the
 // other side: a sustained zero past the grace window flips to fail
 // honestly, so NLB and operators see the real state.
