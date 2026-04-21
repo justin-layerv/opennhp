@@ -912,6 +912,25 @@ variable "deploy_vpc_endpoints" {
 }
 
 # ==============================================================================
+# Website Email-Capture API DNS
+# ==============================================================================
+
+variable "deploy_website_api_dns" {
+  type    = bool
+  default = false
+}
+
+variable "website_api_domain" {
+  type    = string
+  default = null
+}
+
+variable "website_api_cfn_stack_name" {
+  type    = string
+  default = null
+}
+
+# ==============================================================================
 # Auth0 Configuration
 # ==============================================================================
 

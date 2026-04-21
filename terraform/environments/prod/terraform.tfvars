@@ -135,6 +135,15 @@ qurl_hosted_zone_id             = "Z0748438C8EK6UAW94ST" # layerv.ai zone (in la
 qurl_jwt_secret_arn             = "arn:aws:secretsmanager:us-east-2:235500187906:secret:layerv-nhp-prod/qurl-jwt-secret-NRk5sw"
 qurl_internal_service_token_arn = "arn:aws:secretsmanager:us-east-2:235500187906:secret:layerv-nhp-prod/qurl-internal-service-token-ETbWzv"
 
+# Website email-capture API DNS — A-alias for the APIGW custom domain that the
+# website CDK provisions in layerv-prod us-east-1. Replaces the old broken wiring
+# where the site's tracker hit api.layerv.ai (now QURL). See layervai/website#188.
+# The A-alias target is read from the CDK stack's CloudFormation outputs
+# (ApiCustomDomainRegionalDomainName + ApiCustomDomainRegionalHostedZoneId).
+deploy_website_api_dns     = true
+website_api_domain         = "web-api.layerv.ai"
+website_api_cfn_stack_name = "LayerV-production-Api"
+
 # QURL Custom Domains (enables /v1/domains endpoints)
 qurl_custom_domain_enabled = true
 

@@ -852,6 +852,111 @@ resource "aws_route53_record" "qurl_api" {
   }
 }
 
+# ==================== Website Email-Capture API (web-api.layerv.ai) ====================
+# The APIGW v2 custom domain is provisioned in layerv-prod us-east-1 by the
+# website CDK stack (LayerV-production-Api → ApiDomainName). This terraform
+# root owns the Route 53 A-alias only, because the layerv.ai zone lives in
+# the layerv-mgmt account and is managed here.
+#
+# Split rationale: the website repo has S3/CloudFront/Lambda/APIGW IAM but
+# no cross-account Route 53 perms; this repo has the mgmt-account provider.
+# See layervai/website#188 (api.layerv.ai was taken over by QURL and the
+# website tracker silently 404'd for weeks until a new hostname was carved
+# out). Source of truth for `apiDomain` is
+# layervai/website/infra/lib/config.ts.
+#
+# The alias target is read from the website CDK stack's CloudFormation outputs
+# (ApiCustomDomainRegionalDomainName + ApiCustomDomainRegionalHostedZoneId).
+# The AWS provider does not ship an aws_apigatewayv2_domain_name data source,
+# so reading CFN stack outputs is the supported path. This creates a plan-time
+# (not just apply-time) dependency on the website CDK stack: if it is torn
+# down, `terraform plan` here fails until deploy_website_api_dns is flipped
+# off. Longer-term: have the website stack publish these to SSM so this repo
+# reads data.aws_ssm_parameter instead of a CFN stack lookup.
+
+locals {
+  # All four inputs are load-bearing. Gate count on every one so the data
+  # source and record never try to evaluate with null inputs — ugly provider
+  # errors are replaced by clean precondition errors on the terraform_data
+  # block below. If any input is unset while deploy_website_api_dns = true,
+  # count here is 0 and the precondition fires first with a readable message.
+  website_api_dns_enabled = (
+    var.deploy_website_api_dns &&
+    var.website_api_domain != null &&
+    var.qurl_hosted_zone_id != null &&
+    var.website_api_cfn_stack_name != null
+  )
+}
+
+# Fail plan loudly if deploy_website_api_dns is flipped on without its inputs
+# wired up. Mirrors the billing_preconditions pattern above.
+resource "terraform_data" "website_api_preconditions" {
+  count = var.deploy_website_api_dns ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = var.website_api_domain != null
+      error_message = "website_api_domain is required when deploy_website_api_dns = true."
+    }
+    precondition {
+      condition     = var.qurl_hosted_zone_id != null
+      error_message = "qurl_hosted_zone_id is required when deploy_website_api_dns = true (the layerv.ai zone in mgmt account)."
+    }
+    precondition {
+      condition     = var.website_api_cfn_stack_name != null
+      error_message = "website_api_cfn_stack_name is required when deploy_website_api_dns = true (the website CDK stack name, e.g. LayerV-production-Api)."
+    }
+  }
+}
+
+# NOTE: no depends_on here. A data source with depends_on on a not-yet-created
+# managed resource gets deferred to apply, which would make the route53 record
+# alias render as `(known after apply)` on the first plan and weaken the
+# review signal. The gate lives on the consumer (aws_route53_record.website_api)
+# instead — same pattern as billing_preconditions → module.billing above.
+data "aws_cloudformation_stack" "website_api" {
+  count    = local.website_api_dns_enabled ? 1 : 0
+  provider = aws.us_east_1
+  name     = var.website_api_cfn_stack_name
+
+  lifecycle {
+    # Defend against the CDK output-key contract drifting under us. CDK
+    # autogenerates output logical IDs unless the construct pins them;
+    # assert the two keys we consume exist and are non-empty so a silent
+    # rename in the website repo surfaces as a plan-time error rather
+    # than as a 500 on web-api.layerv.ai weeks later. Issue #1218 (SSM
+    # decoupling) removes this contract entirely when it lands.
+    postcondition {
+      condition     = try(length(self.outputs["ApiCustomDomainRegionalDomainName"]) > 0, false)
+      error_message = "Website CDK stack ${var.website_api_cfn_stack_name} must expose ApiCustomDomainRegionalDomainName as a non-empty output (see layervai/website/infra/lib/api-stack.ts)."
+    }
+    postcondition {
+      condition     = try(length(self.outputs["ApiCustomDomainRegionalHostedZoneId"]) > 0, false)
+      error_message = "Website CDK stack ${var.website_api_cfn_stack_name} must expose ApiCustomDomainRegionalHostedZoneId as a non-empty output (see layervai/website/infra/lib/api-stack.ts)."
+    }
+  }
+}
+
+resource "aws_route53_record" "website_api" {
+  count    = local.website_api_dns_enabled ? 1 : 0
+  provider = aws.route53_mgmt
+
+  zone_id = var.qurl_hosted_zone_id # layerv.ai zone in mgmt account
+  name    = var.website_api_domain
+  type    = "A"
+
+  alias {
+    name                   = data.aws_cloudformation_stack.website_api[0].outputs["ApiCustomDomainRegionalDomainName"]
+    zone_id                = data.aws_cloudformation_stack.website_api[0].outputs["ApiCustomDomainRegionalHostedZoneId"]
+    evaluate_target_health = false # APIGW custom domains don't expose health to Route 53
+  }
+
+  # Keep the precondition gate inline with apply ordering even though
+  # local.website_api_dns_enabled already short-circuits count — belt-and-
+  # suspenders against a future edit that loosens the count predicate.
+  depends_on = [terraform_data.website_api_preconditions]
+}
+
 # ==================== Redis (Distributed Rate Limiting) ====================
 
 module "redis" {

@@ -102,6 +102,11 @@ module "nhp" {
   qurl_ip_rate_limit              = var.qurl_ip_rate_limit
   qurl_ip_rate_burst              = var.qurl_ip_rate_burst
 
+  # Website email-capture API DNS (cross-account A-alias for web-api.layerv.ai)
+  deploy_website_api_dns     = var.deploy_website_api_dns
+  website_api_domain         = var.website_api_domain
+  website_api_cfn_stack_name = var.website_api_cfn_stack_name
+
   # QURL Custom Domains
   qurl_custom_domain_enabled = var.qurl_custom_domain_enabled
 

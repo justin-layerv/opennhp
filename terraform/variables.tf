@@ -838,6 +838,43 @@ variable "qurl_github_repo" {
   default     = "qurl-service"
 }
 
+# ==============================================================================
+# Website Email-Capture API DNS
+# ==============================================================================
+# Route 53 A-alias for the website email-capture API, pointing at an APIGW v2
+# custom domain provisioned by the layervai/website CDK stack. The alias lives
+# in this repo because the layerv.ai zone is in the layerv-mgmt account and is
+# only reachable via the route53_mgmt provider. See layervai/website#188 and
+# the resource block in terraform/main.tf for the full rationale.
+
+variable "deploy_website_api_dns" {
+  description = "Create the Route 53 A-alias for the website email-capture API. The APIGW custom domain is provisioned in the layervai/website CDK repo (LayerV-production-Api → ApiDomainName); this flag turns on the cross-account DNS record pointing at it. Requires website_api_domain, qurl_hosted_zone_id (mgmt-account layerv.ai zone), and website_api_cfn_stack_name to all be set."
+  type        = bool
+  default     = false
+}
+
+variable "website_api_domain" {
+  description = "FQDN for the website email-capture API (e.g. web-api.layerv.ai). Must match apiDomain in layervai/website infra/lib/config.ts. Required when deploy_website_api_dns = true."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.website_api_domain == null || can(regex("^[a-z0-9][a-z0-9.-]*[a-z0-9]\\.[a-z]{2,}$", var.website_api_domain))
+    error_message = "website_api_domain must be a valid FQDN (e.g., web-api.layerv.ai)."
+  }
+}
+
+variable "website_api_cfn_stack_name" {
+  description = "Name of the website CDK CloudFormation stack in layerv-prod us-east-1 that provisions the APIGW v2 custom domain (e.g. LayerV-production-Api). The stack's ApiCustomDomainRegionalDomainName and ApiCustomDomainRegionalHostedZoneId outputs are consumed as the A-alias target. Required when deploy_website_api_dns = true."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.website_api_cfn_stack_name == null || length(var.website_api_cfn_stack_name) > 0
+    error_message = "website_api_cfn_stack_name must be null or a non-empty string."
+  }
+}
+
 # ==================== QURL Idempotency Cache ====================
 
 variable "qurl_idempotency_cache_ttl_seconds" {
