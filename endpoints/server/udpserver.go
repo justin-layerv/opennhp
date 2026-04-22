@@ -1464,73 +1464,95 @@ func (s *UdpServer) recvMessageRoutine() {
 				continue
 			}
 
-			switch ppd.HeaderType {
-			case core.NHP_KNK, core.NHP_RKN, core.NHP_EXT, core.DHP_KNK:
-				// aynchronously process knock messages with ack response
-				go func() {
-					if knockErr := s.HandleKnockRequest(ppd); knockErr != nil {
-						log.Error("[Server] HandleKnockRequest failed: %v", knockErr)
-					}
-				}()
-
-			case core.NHP_AOL:
-				// synchronously block and deal with NHP_DOL to ensure future ac messages will be correctly processed. Don't use go routine
-				if err := s.HandleACOnline(ppd); err != nil {
-					log.Error("[Server] HandleACOnline failed: %v", err)
-				}
-
-			case core.NHP_DOL:
-				if err := s.HandleDBOnline(ppd); err != nil {
-					log.Error("[Server] HandleDBOnline failed: %v", err)
-				}
-
-			case core.NHP_OTP:
-				go func() {
-					if otpErr := s.HandleOTPRequest(ppd); otpErr != nil {
-						log.Error("[Server] HandleOTPRequest failed: %v", otpErr)
-					}
-				}()
-
-			case core.NHP_REG:
-				go func() {
-					if regErr := s.HandleRegisterRequest(ppd); regErr != nil {
-						log.Error("[Server] HandleRegisterRequest failed: %v", regErr)
-					}
-				}()
-
-			case core.NHP_LST:
-				go func() {
-					if listErr := s.HandleListRequest(ppd); listErr != nil {
-						log.Error("[Server] HandleListRequest failed: %v", listErr)
-					}
-				}()
-			case core.NHP_DAR:
-				go func() {
-					if darErr := s.HandleDHPDARMessage(ppd); darErr != nil {
-						log.Error("[Server] HandleDHPDARMessage failed: %v", darErr)
-					}
-				}()
-			case core.NHP_DRG:
-				go func() {
-					if drgErr := s.HandleDHPDRGMessage(ppd); drgErr != nil {
-						log.Error("[Server] HandleDHPDRGMessage failed: %v", drgErr)
-					}
-				}()
-			case core.NHP_DAV:
-				go func() {
-					if davErr := s.HandleDHPDAVMessage(ppd); davErr != nil {
-						log.Error("[Server] HandleDHPDAVMessage failed: %v", davErr)
-					}
-				}()
-
-			// Server-to-server forwarding
-			case core.NHP_FWD:
-				go s.HandleForwardRequest(ppd)
-			case core.NHP_FRT:
-				go s.HandleForwardResult(ppd)
-			}
-
+			s.dispatchReceivedMessage(ppd)
 		}
+	}
+}
+
+// dispatchReceivedMessage routes a decrypted PPD to its handler.
+// Every handler arm dispatches asynchronously via a goroutine:
+// recvMsgCh feeds packetToMsgRoutine, and a slow handler on this
+// goroutine would head-of-line-block the queue and cause
+// packetToMsgRoutine to silently drop legitimate knocks (#1163).
+// Handlers guard their own shared state with per-map mutexes, so
+// concurrent dispatch is safe. The default arm logs without
+// spawning — there's no handler to run. The extraction also makes
+// the async-dispatch property directly testable without standing
+// up a full listener loop.
+func (s *UdpServer) dispatchReceivedMessage(ppd *core.PacketParserData) {
+	switch ppd.HeaderType {
+	case core.NHP_KNK, core.NHP_RKN, core.NHP_EXT, core.DHP_KNK:
+		go func() {
+			if knockErr := s.HandleKnockRequest(ppd); knockErr != nil {
+				log.Error("[Server] HandleKnockRequest failed: %v", knockErr)
+			}
+		}()
+
+	case core.NHP_AOL:
+		go func() {
+			if aolErr := s.HandleACOnline(ppd); aolErr != nil {
+				log.Error("[Server] HandleACOnline failed: %v", aolErr)
+			}
+		}()
+
+	case core.NHP_DOL:
+		go func() {
+			if dolErr := s.HandleDBOnline(ppd); dolErr != nil {
+				log.Error("[Server] HandleDBOnline failed: %v", dolErr)
+			}
+		}()
+
+	case core.NHP_OTP:
+		go func() {
+			if otpErr := s.HandleOTPRequest(ppd); otpErr != nil {
+				log.Error("[Server] HandleOTPRequest failed: %v", otpErr)
+			}
+		}()
+
+	case core.NHP_REG:
+		go func() {
+			if regErr := s.HandleRegisterRequest(ppd); regErr != nil {
+				log.Error("[Server] HandleRegisterRequest failed: %v", regErr)
+			}
+		}()
+
+	case core.NHP_LST:
+		go func() {
+			if listErr := s.HandleListRequest(ppd); listErr != nil {
+				log.Error("[Server] HandleListRequest failed: %v", listErr)
+			}
+		}()
+	case core.NHP_DAR:
+		go func() {
+			if darErr := s.HandleDHPDARMessage(ppd); darErr != nil {
+				log.Error("[Server] HandleDHPDARMessage failed: %v", darErr)
+			}
+		}()
+	case core.NHP_DRG:
+		go func() {
+			if drgErr := s.HandleDHPDRGMessage(ppd); drgErr != nil {
+				log.Error("[Server] HandleDHPDRGMessage failed: %v", drgErr)
+			}
+		}()
+	case core.NHP_DAV:
+		go func() {
+			if davErr := s.HandleDHPDAVMessage(ppd); davErr != nil {
+				log.Error("[Server] HandleDHPDAVMessage failed: %v", davErr)
+			}
+		}()
+
+	// Server-to-server forwarding
+	case core.NHP_FWD:
+		go s.HandleForwardRequest(ppd)
+	case core.NHP_FRT:
+		go s.HandleForwardResult(ppd)
+
+	default:
+		// An unknown HeaderType reaching here means the upstream
+		// parser accepted a type this dispatcher doesn't route —
+		// either a protocol-version mismatch or a parser/dispatcher
+		// drift. Log so ops can grep for it rather than drop silently.
+		log.Warning("[Server] dispatchReceivedMessage: unhandled HeaderType %d", ppd.HeaderType)
 	}
 }
 
