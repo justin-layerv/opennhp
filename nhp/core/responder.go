@@ -2,7 +2,6 @@ package core
 
 import (
 	"bytes"
-	"compress/zlib"
 	"crypto/cipher"
 	"encoding/base64"
 	"encoding/binary"
@@ -449,20 +448,30 @@ func (ppd *PacketParserData) decryptBody() (err error) {
 
 	// Note: ppd.BodyMessage must be a separate []byte slice because ppd.BasePacket.Buf will be released later
 	if ppd.BodyCompress {
-		// decompress with size limit to prevent decompression bombs
-		var buf bytes.Buffer
-		br := bytes.NewReader(body)
-		r, err := zlib.NewReader(br)
+		buf := getBytesBuffer()
+		defer putBytesBuffer(buf)
+
+		r, err := getZlibReader(bytes.NewReader(body))
 		if err != nil {
 			log.Critical("invalid compressed data: %v", err)
 			return ErrDataDecompressionFailed.WithExtra(err)
 		}
-		defer func() { _ = r.Close() }()
+		// Close + pool-return on every exit. Close-then-Put is safe:
+		// the next Get() calls zlib.Resetter.Reset which re-points the
+		// reader at a fresh source regardless of prior Close state.
+		// The Close error (which reports Adler-32 checksum mismatch) is
+		// intentionally discarded: the ciphertext we just decrypted was
+		// already authenticated by bodyAead.Open above, so the AEAD tag
+		// rules out the tampering that a checksum would catch here.
+		defer func() {
+			_ = r.Close()
+			putZlibReader(r)
+		}()
 
-		// Limit decompressed size to 10MB to prevent DoS via decompression bomb
+		// Limit decompressed size to 10MB to prevent DoS via decompression bomb.
 		const maxDecompressedSize = 10 * 1024 * 1024
 		limitedReader := io.LimitReader(r, maxDecompressedSize+1) // +1 to detect overflow
-		n, err := io.Copy(&buf, limitedReader)
+		n, err := io.Copy(buf, limitedReader)
 		if err != nil {
 			log.Critical("message decompression failed: %v", err)
 			return ErrDataDecompressionFailed.WithExtra(err)
@@ -472,10 +481,11 @@ func (ppd *PacketParserData) decryptBody() (err error) {
 			return ErrDataDecompressionFailed.WithExtra(fmt.Errorf("decompressed size %d exceeds limit %d", n, maxDecompressedSize))
 		}
 
-		ppd.BodyMessage = buf.Bytes() // separately allocated memory
-		//log.Debug("message decompressed %v -> %v", body, ppd.BodyMessage)
+		// Deep-copy out of the pooled buffer; buf.Bytes() aliases pool storage.
+		ppd.BodyMessage = bytes.Clone(buf.Bytes())
 	} else {
-		ppd.BodyMessage = append(ppd.BodyMessage, body...) // deep copy
+		// Deep-copy; body aliases ppd.basePacket.Buf which may be released later.
+		ppd.BodyMessage = bytes.Clone(body)
 	}
 
 	return nil

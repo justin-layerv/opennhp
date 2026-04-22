@@ -1,8 +1,6 @@
 package core
 
 import (
-	"bytes"
-	"compress/zlib"
 	"crypto/cipher"
 	"encoding/binary"
 	"errors"
@@ -340,9 +338,15 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 	var body []byte
 
 	if mad.BodyCompress {
-		// compress
-		var buf bytes.Buffer
-		w := zlib.NewWriter(&buf)
+		buf := getBytesBuffer()
+		defer putBytesBuffer(buf)
+		w := getZlibWriter(buf)
+		// Defer order matters: LIFO unwinds putZlibWriter first, which
+		// calls Reset(io.Discard) and detaches the writer from buf
+		// before putBytesBuffer scrubs buf's backing array. Swapping
+		// the two defers would leave the pooled writer briefly
+		// pointing at a zeroed caller buffer.
+		defer putZlibWriter(w)
 
 		_, err = w.Write(mad.bodyMessage)
 		if cerr := w.Close(); err == nil {
@@ -352,8 +356,11 @@ func (mad *MsgAssemblerData) encryptBody() (err error) {
 			log.Critical("message compression failed: %v", err)
 			return ErrDataCompressionFailed.WithExtra(err)
 		}
+		// No bytes.Clone needed here: body aliases pool storage, but
+		// bodyAead.Seal below consumes it synchronously and does not
+		// retain a reference. The deferred putBytesBuffer runs only
+		// after Seal finishes, so the aliasing is safe.
 		body = buf.Bytes()
-		//log.Debug("message compressed: %v -> %v", mad.bodyMessage, body)
 		mad.BodySize = len(body) + GCMTagSize
 
 		// set header flag
