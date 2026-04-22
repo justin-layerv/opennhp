@@ -62,8 +62,22 @@ func (a *UdpAgent) knockRequest(res *KnockTarget, useCookie bool) (ackMsg *commo
 	}
 	addrStr := addr.String()
 
+	// #1154 invariant: body.HeaderType MUST equal the wire
+	// HeaderType passed to newMsgData below. Keeping both uses of
+	// `headerType` from this single local variable is the
+	// mechanical enforcement — a future refactor that reassigns
+	// one but not the other will silently break all knocks under
+	// strict mode (agent body says KNK, wire says RKN, server
+	// rejects). If you split the two sites, add an explicit
+	// `require.Equal(body.HeaderType, wireHeaderType)` pin.
+	headerType := core.NHP_KNK
+	if useCookie {
+		headerType = core.NHP_RKN
+	}
+
 	a.knockUserMutex.RLock()
 	knkMsg := &common.AgentKnockMsg{
+		HeaderType:     headerType, // #1154 invariant: must equal newMsgData wire arg below
 		UserId:         a.knockUser.UserId,
 		DeviceId:       a.deviceId,
 		OrganizationId: a.knockUser.OrganizationId,
@@ -79,10 +93,7 @@ func (a *UdpAgent) knockRequest(res *KnockTarget, useCookie bool) (ackMsg *commo
 		log.Error("agent(%s)[Knock] failed to marshal KNK message: %v", knkMsg.UserId, marshalErr)
 		return nil, marshalErr
 	}
-	headerType := core.NHP_KNK
-	if useCookie {
-		headerType = core.NHP_RKN
-	}
+	// #1154 invariant: wire arg here MUST equal knkMsg.HeaderType above.
 	knkMd := a.newMsgData(addr, headerType, knkBytes, serverPeer.PublicKey())
 	knkMd.ResponseMsgCh = make(chan *core.PacketParserData)
 
@@ -152,8 +163,17 @@ func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnoc
 	}
 	addrStr := addr.String()
 
+	// #1154 invariant: a single local variable drives BOTH the
+	// body.HeaderType and the wire HeaderType passed to
+	// newMsgData, so the two can't drift. See knockRequest above
+	// for the same pattern — both call sites enforce the
+	// invariant structurally (variable reuse) rather than by
+	// review-time comment on literal constants.
+	headerType := core.NHP_EXT
+
 	a.knockUserMutex.RLock()
 	knkMsg := &common.AgentKnockMsg{
+		HeaderType:     headerType, // #1154 invariant: must equal newMsgData wire arg below
 		UserId:         a.knockUser.UserId,
 		DeviceId:       a.deviceId,
 		OrganizationId: a.knockUser.OrganizationId,
@@ -169,7 +189,8 @@ func (a *UdpAgent) ExitKnockRequest(res *KnockTarget) (ackMsg *common.ServerKnoc
 		log.Error("agent(%s)[ExitKnockRequest] failed to marshal EXT message: %v", knkMsg.UserId, marshalErr)
 		return nil, marshalErr
 	}
-	knkMd := a.newMsgData(addr, core.NHP_EXT, knkBytes, serverPeer.PublicKey())
+	// #1154 invariant: wire arg here MUST equal knkMsg.HeaderType above.
+	knkMd := a.newMsgData(addr, headerType, knkBytes, serverPeer.PublicKey())
 	knkMd.ResponseMsgCh = make(chan *core.PacketParserData)
 
 	ackMsg = &common.ServerKnockAckMsg{}

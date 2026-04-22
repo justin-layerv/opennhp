@@ -56,8 +56,46 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 			return
 		}
 
-		// determine knock type
-		knkMsg.HeaderType = ppd.HeaderType
+		// Determine knock type. Compare the AEAD-authenticated
+		// body.HeaderType against the (unauthenticated) wire
+		// ppd.HeaderType. A mismatch is the #1154 attack signature —
+		// MitM flipped the wire type byte and recomputed the unkeyed
+		// "HMAC". See knock_headertype_gate.go for policy details.
+		//
+		// Expected wire types at this point are the knock family:
+		// NHP_KNK, NHP_RKN, NHP_EXT (DHP_KNK was carved off at the
+		// early branch above). If a future refactor routes additional
+		// wire types through this handler, the gate's body==wire
+		// comparison stays correct as long as agents populate
+		// body.HeaderType for those new types — agent-side
+		// KnockRequest/ExitKnockRequest are the two places to update.
+		useType, verdict := verifyKnockHeaderType(knkMsg.HeaderType, ppd.HeaderType, s.knockHeaderTypeVerifyRequire)
+		proceed, rejectErr := s.applyKnockHeaderTypeVerdict(verdict, knkMsg.HeaderType, ppd.HeaderType, transactionId, addrStr)
+		if !proceed {
+			// applyKnockHeaderTypeVerdict is the single source of
+			// truth for both "proceed?" and "which error to ack":
+			// verdictLegacy→52010, verdictMismatch→52009, and
+			// (unreachable today but fail-closed) unknown-verdict
+			// →52011. Centralizing the error in the side-effect
+			// wrapper means the caller can't get the mapping
+			// wrong on a future refactor.
+			err = rejectErr
+			ackMsg.ErrCode = rejectErr.ErrorCode()
+			ackMsg.ErrMsg = err.Error()
+			// Closure return: the outer HandleKnockRequest flow still
+			// marshals ackMsg and forwards NHP_ACK via the normal ack
+			// path. A legitimate agent sees 52009/52010/52011 and
+			// self-diagnoses; a MitM sees an AEAD-encrypted ACK it
+			// can't read. The ack carries the AgentAddr field pre-
+			// populated at HandleKnockRequest entry (the agent's
+			// own peer address), which is not an info disclosure
+			// because the AEAD envelope to the initiator's static
+			// pubkey is what makes the ack readable only by that
+			// agent. If a future refactor collapses this closure,
+			// the ack-still-flows property must be preserved.
+			return
+		}
+		knkMsg.HeaderType = useType
 
 		// find out auth service provider
 		aspData := s.FindAuthSvcProvider(knkMsg.AuthServiceId)

@@ -83,6 +83,23 @@ type UdpServer struct {
 	wg           sync.WaitGroup
 	running      atomic.Bool
 
+	// knockHeaderTypeVerifyRequire gates strict-mode rejection of
+	// knocks whose AEAD-authenticated body.HeaderType disagrees with
+	// the wire HeaderType (or is the zero-value NHP_KPL sentinel for
+	// legacy agents). Read once at Start from
+	// KnockHeaderTypeVerifyEnvVar — see knock_headertype_gate.go for
+	// the gate policy and #1154 for the threat model.
+	//
+	// Concurrency: written once in Start before any UDP packet
+	// dispatch, read lock-free from HandleKnockRequest's hot path.
+	// Safe today because Start's env parse happens-before the
+	// listener starts. A future refactor that allows live reconfig
+	// (e.g., SIGHUP to re-read env) MUST promote this to
+	// atomic.Bool or protect it behind a mutex; a bare read against
+	// a concurrent write would be a Go memory-model violation even
+	// if it happens to work on most architectures.
+	knockHeaderTypeVerifyRequire bool
+
 	// connection and remote transaction management
 
 	remoteConnectionMapMutex sync.Mutex
@@ -244,6 +261,24 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	err = s.loadBaseConfig()
 	if err != nil {
 		return err
+	}
+
+	// Parse NHP_KNOCK_HEADERTYPE_VERIFY (#1154). Fail Start on an
+	// unrecognized token so an operator typo cannot silently leave
+	// the gate in permit mode. See knock_headertype_gate.go.
+	s.knockHeaderTypeVerifyRequire, err = parseKnockHeaderTypeVerify(os.Getenv(KnockHeaderTypeVerifyEnvVar))
+	if err != nil {
+		return fmt.Errorf("%s: %w", KnockHeaderTypeVerifyEnvVar, err)
+	}
+	if s.knockHeaderTypeVerifyRequire {
+		log.Info("Knock HeaderType verify gate: strict mode (#1154); mismatches reject with 52009, legacy agents with 52010")
+	} else {
+		// Echo the dashboard keys an operator should alarm on before
+		// flipping strict. The rollout playbook is "watch legacy
+		// drain to zero, then watch mismatch stay at zero in burn-in,
+		// then flip NHP_KNOCK_HEADERTYPE_VERIFY=true."
+		log.Info("Knock HeaderType verify gate: permit mode (#1154); watch %s (rollout) and %s (attack) before flipping NHP_KNOCK_HEADERTYPE_VERIFY=true",
+			MetricKnockHeaderTypeLegacy, MetricKnockHeaderTypeMismatch)
 	}
 
 	// Initialize pluggable storage backend (DynamoDB or etcd)
@@ -2014,6 +2049,15 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 		go func(name string, info *common.ResourceInfo, dstAddrs []*common.NetAddress) {
 			defer acWg.Done()
 
+			// openTime=1 here is the attack payoff a MitM
+			// type-flip (#1154) would exploit. The knock HeaderType
+			// gate in nhpauth.go (verifyKnockHeaderType — upstream
+			// of this call site) ensures knkMsg.HeaderType was
+			// body-authenticated before we reach this branch. In
+			// strict mode a mismatch is rejected entirely; in
+			// permit mode the pre-fix behavior is preserved (wire
+			// value used). See knock_headertype_gate.go for the
+			// full policy.
 			openTime := res.OpenTime
 			if knkMsg.HeaderType == core.NHP_EXT {
 				openTime = 1 // timeout in 1 second

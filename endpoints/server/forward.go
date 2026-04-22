@@ -350,6 +350,17 @@ func (f *ServerForwarder) HandleForwardRequest(
 		},
 	}
 
+	// #1154 invariant: the forward receiver sources openTime from
+	// resData ONLY — never from knkMsg.HeaderType or the inner
+	// knockPpd wire HeaderType. This is what makes it safe to skip
+	// the Knock HeaderType gate here (see knock_headertype_gate.go
+	// scope section). If you ever add a branch that consults
+	// HeaderType to alter openTime (e.g., porting the
+	// "NHP_EXT ⇒ openTime=1" short-circuit from the local path),
+	// you MUST re-apply verifyKnockHeaderType +
+	// applyKnockHeaderTypeVerdict against
+	// (knockPpd.HeaderType, knkMsg.HeaderType) —
+	// otherwise the forward path re-opens the #1154 attack.
 	openTime := resData.OpenTime
 	if openTime == 0 {
 		openTime = 60 // Default open time

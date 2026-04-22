@@ -54,6 +54,22 @@ type ServerRegisterAckMsg struct {
 	AuthServiceId string `json:"aspId"`
 }
 
+// AgentKnockMsg is the JSON-encoded body the agent places inside the
+// AEAD-encrypted NHP knock payload. The body (but NOT the wire
+// HeaderCommon preamble) is authenticated against the initiator
+// chain-hash state, so every field here is integrity-protected end
+// to end between the agent and server.
+//
+// HeaderType mirrors the wire-level header type (core.NHP_KNK /
+// core.NHP_RKN / core.NHP_EXT) inside the AEAD body. Pre-#1154 the
+// server trusted only the unauthenticated wire header type byte, so
+// a MitM could flip NHP_KNK → NHP_EXT on the wire and (after a
+// trivial unkeyed-BLAKE2s recomputation) cause the server to close
+// the victim's access. Carrying HeaderType in the body lets the
+// server compare and reject any packet where the two disagree. A
+// zero value here indicates a legacy agent that predates the fix —
+// see endpoints/server/knock_headertype_gate.go for the server-side
+// verification policy.
 type AgentKnockMsg struct {
 	HeaderType     int            `json:"headerType"`
 	UserId         string         `json:"usrId"`
@@ -331,6 +347,15 @@ type ServerDBAckMsg struct {
 	DBAddr  string `json:"dbAddr"`
 }
 
+// DHPKnockMsg — DHP variant of the knock payload carrying
+// attestation evidence. If you add a field here with a JSON
+// tag that overlaps AgentKnockMsg (specifically `headerType`
+// or `aspId`), the #1154 DHP→NHP wire-flip self-limiting
+// property may no longer hold — the gate relies on
+// FindAuthSvcProvider("") rejecting the malformed
+// cross-decoded packet before broadcast. See
+// TestDHPKnockMsg_UnmarshalAsAgentKnockMsg_SelfLimits for the
+// mechanical fence.
 type DHPKnockMsg struct {
 	UserId         string         `json:"usrId"`
 	DeviceId       string         `json:"devId"`

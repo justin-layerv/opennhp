@@ -181,18 +181,32 @@ func newInternalKnockRouter() *gin.Engine {
 // read), this helper falls out of sync and the fuzz assertion silently
 // weakens — TestInternalKnockRejectsPublicSource above is the loud canary.
 func isRemoteAddrPrivate(remoteAddr string) bool {
-	// Match Gin's RemoteIP() pre-processing: it trims whitespace before
-	// SplitHostPort. Without the trim, an input like "  10.0.0.1:80  "
-	// would fail SplitHostPort here and be treated as not-private, while
-	// the handler sees a private IP — sending the fuzz body into the real
-	// handler with a zero-value HttpServer (nil-panic).
+	// Match the production handler's pre-processing at
+	// httpserver.go:1366-1372: SplitHostPort first, but FALL THROUGH
+	// to the raw string on error rather than short-circuiting to
+	// "not private." Without the fallthrough, a fuzz-generated
+	// input like "10.0.0.0" (no port) would be treated as not-
+	// private here but as private by the production isPrivateIP
+	// check — driving the fuzzer to assert 403 against a real
+	// response that correctly continues past the gate to body
+	// parse (returning 400 on invalid JSON).
+	//
+	// The whitespace trim is kept because Gin's RemoteIP() also
+	// trims — matching Gin means the fuzzer's skip aligns with
+	// the gate observed through Gin, not with the raw
+	// ctx.Request.RemoteAddr at httpserver.go:1366-1372 (which
+	// does NOT trim). Real net/http never puts whitespace in
+	// RemoteAddr, so the divergence is untriggerable from real
+	// traffic; the trim just removes a false-negative for
+	// fuzz-generated whitespace inputs the handler would
+	// coincidentally accept.
 	remoteAddr = strings.TrimSpace(remoteAddr)
 	if remoteAddr == "" {
 		return false
 	}
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
-		return false
+		host = remoteAddr // match production fallthrough
 	}
 	return isPrivateIP(host)
 }

@@ -101,6 +101,31 @@ var (
 	ErrAuthHandlerNotFound         = newError("52006", "failed to find auth handler")
 	ErrBackendAuthRequired         = newError("52007", "server backend auth required")
 	ErrUrlPathInvalid              = newError("52008", "client request url path is invalid")
+	// ErrKnockHeaderTypeMismatch — emitted by the server-side Knock
+	// HeaderType gate (#1154) when the AEAD-authenticated
+	// body.HeaderType disagrees with the wire HeaderType. Signals
+	// a potential MitM type-flip attack (or a misconfigured client
+	// that deliberately lies about its own headerType). Kept
+	// issue-number-free in the user-visible error text so agent
+	// logs stay grep-friendly.
+	ErrKnockHeaderTypeMismatch = newError("52009", "knock body HeaderType does not match wire HeaderType")
+	// ErrKnockHeaderTypeLegacy — emitted by the same gate when the
+	// body.HeaderType is the zero value (NHP_KPL sentinel), which
+	// means the agent predates #1154 and isn't populating the
+	// field. Distinct from the mismatch code so agent-side logs
+	// can self-diagnose "upgrade your agent" vs "something is
+	// tampering" without cross-referencing server-side metrics.
+	// Kept issue-number-free in the user-visible error text (like
+	// the mismatch code) so agent logs stay grep-friendly.
+	ErrKnockHeaderTypeLegacy = newError("52010", "knock body HeaderType missing — upgrade agent")
+	// ErrKnockHeaderTypeInternal — emitted by the Knock HeaderType
+	// gate's fail-closed default branch (unknown verdict). Today
+	// that branch is unreachable, but if a future PR adds a new
+	// knockHeaderTypeVerdict constant and forgets to register it
+	// in the switch, the gate rejects fail-closed AND surfaces a
+	// distinct error so the agent log doesn't blame tampering for
+	// what is actually a server-side dispatch-table bug.
+	ErrKnockHeaderTypeInternal = newError("52011", "knock HeaderType gate internal error (unknown verdict)")
 
 	// ac
 	ErrACOperationFailed       = newError("53001", "ac operation failed")

@@ -847,19 +847,13 @@ func loadInternalAuthConfig(envSecret, envRequire string) (*common.InternalAuthS
 }
 
 // parseInternalAuthRequire decodes the NHP_INTERNAL_AUTH_REQUIRE env
-// var. Accepts the usual truthy / falsy tokens (plus empty = false)
-// and rejects anything else — this flag gates a fail-closed posture,
-// so an unrecognized value (operator typo in Terraform) must not
-// silently leave the knock API in permit-mode.
+// var. Thin wrapper around parsePermitStrictEnv so the two
+// fail-closed gates on the server (NHP_INTERNAL_AUTH_REQUIRE and
+// NHP_KNOCK_HEADERTYPE_VERIFY) share a single token grammar —
+// operators editing one gate's Terraform value don't need to re-
+// learn the accepted tokens for the other.
 func parseInternalAuthRequire(raw string) (bool, error) {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "", "false", "0", "no", "off":
-		return false, nil
-	case "true", "1", "yes", "on":
-		return true, nil
-	default:
-		return false, fmt.Errorf("unrecognized value %q; expected true/false/1/0/yes/no/on/off", raw)
-	}
+	return parsePermitStrictEnv(raw)
 }
 
 // parseAllowedOrigins splits a comma-separated list of allowed CORS origins,
