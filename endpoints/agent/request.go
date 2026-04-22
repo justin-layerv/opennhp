@@ -54,7 +54,27 @@ func (a *UdpAgent) RequestOtp(target *KnockTarget) error {
 		UserData:       a.knockUser.UserData,
 	}
 	a.knockUserMutex.RUnlock()
-	otpBytes, marshalErr := json.Marshal(otpMsg)
+	// G117 (secret-in-json): AgentOTPMsg's struct type carries a
+	// Passcode field ("pass" on the wire) that has its own struct-tag
+	// `//nolint:gosec // G117` at nhp/common/nhpmsg.go:38. Newer
+	// gosec versions flag the Marshal callsite via taint analysis
+	// even when the field carries its own suppression, so the
+	// callsite needs its own nolint for the scan to pass. Same
+	// shape of suppression as the ResolveRequest Marshal in
+	// endpoints/server/staticplugins/qurl/resolver.go:174.
+	//
+	// In THIS RequestOtp path Passcode is deliberately not populated
+	// (the literal above omits it) — the OTP is being *requested*,
+	// not presented — so the taint flag is type-based on the struct,
+	// not evidence of a secret in this particular marshal.
+	//
+	// Asymmetry note: the sibling RegisterPublicKey below marshals
+	// AgentRegisterMsg, which carries an OTP field that IS
+	// populated on the wire. gosec v2.11.4's G117 pattern matches
+	// "pass"/"passcode" but not "otp", so that callsite isn't
+	// flagged today — if a future gosec version tightens the
+	// pattern, the analogous suppression belongs there too.
+	otpBytes, marshalErr := json.Marshal(otpMsg) //nolint:gosec // G117
 	if marshalErr != nil {
 		log.Error("agent(%s)[RequestOtp] failed to marshal OTP message: %v", otpMsg.UserId, marshalErr)
 		return marshalErr
@@ -91,7 +111,15 @@ func (a *UdpAgent) RegisterPublicKey(otp string, target *KnockTarget) (rakMsg *c
 		UserData:       a.knockUser.UserData,
 	}
 	a.knockUserMutex.RUnlock()
-	regBytes, marshalErr := json.Marshal(regMsg)
+	// G117 (secret-in-json): preemptive suppression. gosec v2.11.4's
+	// pattern matches "pass"/"passcode" but not "otp", so this
+	// callsite isn't flagged today. A future gosec version that
+	// tightens the pattern would fire on AgentRegisterMsg.OTP being
+	// marshaled into the wire; adding the suppression now avoids a
+	// CI break on a future lint bump. Same rationale as the sibling
+	// RequestOtp callsite above; the OTP is necessarily on the wire
+	// here (REG carries the OTP returned from the prior OTP request).
+	regBytes, marshalErr := json.Marshal(regMsg) //nolint:gosec // G117
 	if marshalErr != nil {
 		log.Error("agent(%s)[RegisterPublicKey] failed to marshal REG message: %v", regMsg.UserId, marshalErr)
 		return nil, marshalErr

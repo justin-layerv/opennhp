@@ -64,13 +64,26 @@ CVE-2026-32305
 CVE-2026-34986
 
 # Go stdlib CVEs in vendored Traefik v3.6.12 binary (Dockerfile.ac.aws).
-# Our binaries are built with Go 1.25.9 (which fixes both CVEs), but the
-# pre-built Traefik binary was compiled with Go 1.25.8. Wait for a Traefik
-# release built with Go >= 1.25.9 to remove these entries.
+# Our binaries are built with Go 1.26.2, but the pre-built Traefik binary
+# was compiled with an older Go. Wait for a Traefik release built with
+# Go >= 1.26.2 (covering all four CVEs) to remove these entries.
+# Re-check after 2026-05-15 if no Traefik release has shipped by then.
 # https://avd.aquasec.com/nvd/cve-2026-32280
 CVE-2026-32280
+# https://avd.aquasec.com/nvd/cve-2026-32281
+CVE-2026-32281
 # https://avd.aquasec.com/nvd/cve-2026-32282
 CVE-2026-32282
+# https://avd.aquasec.com/nvd/cve-2026-32283
+CVE-2026-32283
+
+# github.com/go-acme/lego/v4 - HIGH, in vendored Traefik binary.
+# Our endpoints module does not import lego; it's compiled into the
+# Traefik binary downloaded in Dockerfile.ac.aws. Wait for a Traefik
+# release bundling the patched lego version to remove this entry.
+# Re-check after 2026-05-15 if no Traefik release has shipped by then.
+# https://avd.aquasec.com/nvd/cve-2026-40611
+CVE-2026-40611
 
 # go.opentelemetry.io/otel/sdk - FALSE POSITIVE
 # CVE-2026-39883 (PATH hijacking via kenv on BSD) is fixed in v1.43.0.

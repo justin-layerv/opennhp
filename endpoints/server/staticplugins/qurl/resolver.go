@@ -166,8 +166,12 @@ func (r *QurlResolver) Close() error {
 // Resolve validates an access token and returns resource data
 // This calls the QURL API internal endpoint: POST /internal/v1/resolve
 func (r *QurlResolver) Resolve(ctx context.Context, req *ResolveRequest) (*ResolveResponse, error) {
-	// Build request body
-	body, err := json.Marshal(req)
+	// Build request body. G117 (secret-in-json): ResolveRequest carries
+	// AccessToken — marshaling into the /internal/v1/resolve POST is
+	// the whole point of this call. Newer gosec flags the Marshal
+	// callsite via taint analysis even when the field has its own
+	// nolint; suppress here with the protocol-required rationale.
+	body, err := json.Marshal(req) //nolint:gosec // G117
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
