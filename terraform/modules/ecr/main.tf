@@ -502,20 +502,31 @@ resource "aws_iam_role" "github_actions" {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
         }
-        # Allow main branch, environment-based deployments, and pull requests for:
+        # Allow main branch and environment-based deployments for:
         # - Main NHP repo
         # - Traefik plugins repo
         # - NHP server plugin repos (nhp-plugins-passcode, nhp-plugins-oidc, etc.)
         # Environment-based: used by deploy jobs with `environment: sandbox/production`
-        # Pull requests: used by terraform-validate job for PR validation
+        #
+        # SECURITY (#1121): the `pull_request` sub claim was removed
+        # from the main NHP repo entry (below) — PR-time workflows
+        # must NOT be able to assume this role. Any PR can run
+        # arbitrary code during `terraform plan` (provider hooks,
+        # external data sources) which could exfil short-lived STS
+        # creds and pivot to full IAM admin via
+        # iam:UpdateAssumeRolePolicy on this very role. The
+        # terraform-validate PR job has been moved to a lint-only
+        # shape that needs no AWS at all. Note: the traefik-plugins,
+        # plugin-repos, and qurl-service entries never listed
+        # `pull_request` and are unchanged; do not add it to any of
+        # them without revisiting this threat model.
         StringLike = {
           "token.actions.githubusercontent.com:sub" = concat(
             # Main NHP repo
             [
               "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main",
               "repo:${var.github_org}/${var.github_repo}:environment:sandbox",
-              "repo:${var.github_org}/${var.github_repo}:environment:production",
-              "repo:${var.github_org}/${var.github_repo}:pull_request"
+              "repo:${var.github_org}/${var.github_repo}:environment:production"
             ],
             # Traefik plugins repo
             var.traefik_plugins_github_repo != "" ? [

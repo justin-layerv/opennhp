@@ -843,16 +843,42 @@ jobs:
   # ============================================================================
   terraform-validate:
     name: Terraform Validate (PR)
-    # Skip for Dependabot PRs and when no terraform files changed
-    # External PRs (from forks or automated tools) can't assume AWS OIDC role
-    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
+    # Skip for Dependabot PRs and when no terraform files changed.
+    #
+    # SECURITY (#1121): this job runs WITHOUT AWS credentials. PR authors
+    # can run arbitrary code during `terraform plan` (external data sources,
+    # provider hooks) — so minting short-lived STS creds on every PR handed
+    # any contributor a one-step IAM privesc against the sandbox account.
+    # The job now does lint-only checks (fmt, init -backend=false, validate,
+    # static lockstep guards) that do not require AWS at all. Plan output
+    # with real state is produced on push-to-main in deploy-sandbox-infra,
+    # where the role assumption is already gated by branch protection on
+    # main. A readonly-plan role for PR-time plan visibility is a tracked
+    # follow-up (#1221).
+    # No dependabot filter: this job mints no AWS creds, so Dependabot's
+    # restricted token scope is sufficient — let dependabot PRs that touch
+    # terraform get the same fmt/validate coverage as human-authored PRs.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      # Validate both envs so env-specific config (prod-only overrides,
+      # provider version pins in terraform/environments/prod/...) catches
+      # a typo at PR time instead of at apply-on-merge.
+      matrix:
+        environment: [sandbox, prod]
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        # fetch-depth: 2 is enough: the "Check for Terraform changes" step
+        # below uses `git diff BASE_SHA HEAD_SHA`. For a PR branch, HEAD_SHA
+        # is the tip and BASE_SHA is reachable via the merge-base fetched
+        # explicitly by the step.
         with:
-          fetch-depth: 0
+          fetch-depth: 2
 
       - name: Check for Terraform changes
         id: changes
@@ -860,6 +886,10 @@ jobs:
           # Get the base branch
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          # Ensure BASE_SHA is present locally (checkout@v6 with fetch-depth: 2
+          # only gives us HEAD + parent).
+          git fetch --depth 1 origin "$BASE_SHA" >/dev/null 2>&1 || true
 
           # Check if any terraform files changed
           if git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -q '^terraform/'; then
@@ -884,16 +914,10 @@ jobs:
           key: terraform-plugins-${{ hashFiles('terraform/**/.terraform.lock.hcl') }}
           restore-keys: terraform-plugins-
 
-      - name: Configure AWS credentials
-        if: steps.changes.outputs.terraform_changed == 'true'
-        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
-        with:
-          # Hardcoded for dependabot PRs (secrets not available)
-          role-to-assume: arn:aws:iam::767397897469:role/nhp-sandbox-github-actions
-          aws-region: ${{ env.AWS_REGION }}
-
       - name: Check for stale import blocks
-        if: steps.changes.outputs.terraform_changed == 'true'
+        # Run on the sandbox leg only; this check scans the whole
+        # terraform/environments/ tree and has no per-env dependency.
+        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
         run: |
           # Import blocks are declarative and re-evaluate on every plan/apply.
           # They should be removed after the initial import succeeds, otherwise
@@ -909,29 +933,33 @@ jobs:
           fi
 
       - name: Terraform Format Check
-        if: steps.changes.outputs.terraform_changed == 'true'
+        # fmt is repo-wide; run it once on the sandbox leg to avoid
+        # double-failures on the same typo.
+        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
         working-directory: terraform/environments/sandbox
         run: terraform fmt -check -recursive ../../
 
-      - name: Build Lambda Packages
+      - name: Terraform Init (no backend)
         if: steps.changes.outputs.terraform_changed == 'true'
-        uses: ./.github/actions/build-lambda-packages
-
-      - name: Terraform Init
-        if: steps.changes.outputs.terraform_changed == 'true'
-        working-directory: terraform/environments/sandbox
-        run: |
-          mkdir -p "$HOME/.terraform.d/plugin-cache"
-          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
-          terraform init
+        working-directory: terraform/environments/${{ matrix.environment }}
+        # -backend=false: skip S3/DynamoDB state backend setup (no AWS creds
+        # available in this job by design). Providers still download so
+        # `terraform validate` can exercise provider-side schema checks.
+        # The Cache Terraform plugins step above creates the plugin-cache
+        # dir on restore-miss; TF_PLUGIN_CACHE_DIR lets terraform reuse it.
+        env:
+          TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
+        run: terraform init -backend=false
 
       - name: Terraform Validate
         if: steps.changes.outputs.terraform_changed == 'true'
-        working-directory: terraform/environments/sandbox
+        working-directory: terraform/environments/${{ matrix.environment }}
         run: terraform validate
 
       - name: Check qurl SLO lockstep (variables.tf vs dashboard JSON)
-        if: steps.changes.outputs.terraform_changed == 'true'
+        # Repo-wide invariant check; run once on the sandbox leg so a
+        # mismatch fails once, not twice.
+        if: steps.changes.outputs.terraform_changed == 'true' && matrix.environment == 'sandbox'
         # Asserts that the qurl_alerts_slo_target_percent default in
         # terraform/variables.tf matches the slo_target template variable
         # in terraform/modules/grafana-dashboards/dashboards/qurl-operations.json.
@@ -940,81 +968,6 @@ jobs:
         # magnitude. The contract used to be enforced by a comment in
         # alerts.tf — same failure mode as the 2026-03-24 GSI incident.
         run: ./.github/scripts/check-qurl-slo-lockstep.sh
-
-      - name: Fetch Auth0 Token
-        id: auth0
-        if: steps.changes.outputs.terraform_changed == 'true'
-        env:
-          AUTH0_CLIENT_ID: ${{ secrets.AUTH0_CLIENT_ID }}
-          AUTH0_CLIENT_SECRET: ${{ secrets.AUTH0_CLIENT_SECRET }}
-        run: ./.github/scripts/fetch-auth0-token.sh terraform/environments/sandbox/terraform.tfvars sandbox
-
-      - name: Terraform Plan
-        id: plan
-        if: steps.changes.outputs.terraform_changed == 'true'
-        working-directory: terraform/environments/sandbox
-        env:
-          # AC license credentials (from GitHub Secrets)
-          TF_VAR_ac_license_key: ${{ secrets.AC_LICENSE_KEY }}
-          # Grafana Cloud API token for dashboard provisioning
-          TF_VAR_grafana_auth: ${{ secrets.GRAFANA_AUTH }}
-          # Auth0 Terraform provider credentials
-          TF_VAR_auth0_tf_client_id: ${{ secrets.AUTH0_CLIENT_ID }}
-          TF_VAR_auth0_tf_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
-          TF_VAR_auth0_api_token: ${{ steps.auth0.outputs.auth0_token }}
-          # PR validation uses a dummy server AMI ID so terraform plan does
-          # not depend on the real SSM parameter (which is populated by the
-          # packer-build job on main, not in PRs). This lets PRs validate
-          # terraform config without requiring packer-built AMIs.
-          #
-          # This is the ONLY place this dummy value lives. It must NEVER reach
-          # apply against a real environment. The structural safeguards that
-          # ensure this — and the deliberate absence of a variable validation
-          # block (which would self-defeat at plan time) — are documented at
-          # terraform/modules/compute/variables.tf::server_ami_id. Read that
-          # comment before adding any other path that passes
-          # TF_VAR_server_ami_id.
-          TF_VAR_server_ami_id: "ami-0000000000000abcd"
-        run: |
-          set -o pipefail
-          # -lock=false: PR plans are informational (posted as PR comment, never
-          # applied). Skipping the lock eliminates S3 state-lock contention when
-          # multiple PRs plan concurrently. The real plan happens at apply time
-          # (deploy-sandbox-infra job) which keeps the lock. See issue #972.
-          terraform plan -no-color -lock=false 2>&1 | tee plan.txt
-          {
-            echo "## Terraform Plan"
-            echo '```'
-            tail -50 plan.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Comment PR with Plan
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        if: always() && steps.changes.outputs.terraform_changed == 'true'
-        with:
-          script: |
-            const fs = require('fs');
-            const planPath = 'terraform/environments/sandbox/plan.txt';
-            if (!fs.existsSync(planPath)) {
-              console.log('plan.txt not found - terraform plan may have failed before producing output');
-              return;
-            }
-            const plan = fs.readFileSync(planPath, 'utf8');
-            const lines = plan.split('\n');
-            const summary = lines.slice(-30).join('\n');
-
-            const planFailed = '${{ steps.plan.outcome }}' === 'failure';
-            const header = planFailed
-              ? '## ❌ Terraform Plan Failed (sandbox)'
-              : '## Terraform Plan (sandbox)';
-
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: `${header}\n\`\`\`\n${summary}\n\`\`\``
-            });
 
       - name: Skip Notice
         if: steps.changes.outputs.terraform_changed != 'true'
