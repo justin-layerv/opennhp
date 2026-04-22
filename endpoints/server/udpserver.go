@@ -1051,7 +1051,15 @@ func (s *UdpServer) recvPacketRoutine() {
 
 	log.Debug("recvPacketRoutine started")
 
-	preCheckThreats := make(map[string]int32)
+	// IP-keyed, size-capped, TTL-expiring counter of RecvPrecheck
+	// failures. Replaces a previously unbounded map[IP:port]int32 that
+	// an IP-spoofing flood could grow without limit (#1158). See
+	// precheck_threat_cache.go for keying + sizing rationale.
+	preCheckThreats := newPreCheckThreatCache(
+		PreCheckThreatCacheSize,
+		PreCheckThreatCacheTTL,
+		func() { s.metrics.IncrCounter(MetricPreCheckThreatEviction) },
+	)
 
 	for {
 		select {
@@ -1120,18 +1128,17 @@ func (s *UdpServer) recvPacketRoutine() {
 		log.Info("Receive [%s] packet (%s -> %s), %d bytes", msgType, addrStr, s.listenAddr.String(), n)
 		log.Evaluate("Receive [%s] packet (%s -> %s), %d bytes", msgType, addrStr, s.listenAddr.String(), n)
 		if err != nil {
-			// threat plus 1
-			preCheckThreats[addrStr]++
-			if preCheckThreats[addrStr] > PreCheckThreatCountBeforeBlock {
-				s.addBlockAddrStr(addrStr)
-			}
+			s.recordPreCheckThreat(preCheckThreats, remoteAddr)
 			s.device.ReleasePoolPacket(pkt)
 			log.Warning("Receive [%s] packet (%s -> %s), precheck error: %v", msgType, addrStr, s.listenAddr.String(), err)
 			log.Evaluate("Receive [%s] packet (%s -> %s) precheck error: %v", msgType, addrStr, s.listenAddr.String(), err)
 			continue
 		}
-		// clear threat
-		delete(preCheckThreats, addrStr)
+		// Any successful precheck from this IP clears the IP's counter:
+		// if any port from a source looks legitimate, the source isn't
+		// a scanner. Semantics change from the old IP:port keying,
+		// where one port succeeding didn't affect others.
+		preCheckThreats.Clear(remoteAddr.IP.String())
 
 		s.remoteConnectionMapMutex.Lock()
 		conn, found := s.remoteConnectionMap[addrStr]
