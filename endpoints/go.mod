@@ -38,7 +38,6 @@ require (
 )
 
 require (
-	cloud.google.com/go/kms v1.26.0 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.14 // indirect
@@ -102,7 +101,7 @@ require (
 	github.com/go-openapi/validate v0.25.2 // indirect
 	github.com/go-playground/locales v0.14.1 // indirect
 	github.com/go-playground/universal-translator v0.18.1 // indirect
-	github.com/go-playground/validator/v10 v10.30.1 // indirect
+	github.com/go-playground/validator/v10 v10.30.2 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/goccy/go-yaml v1.19.2 // indirect
@@ -112,7 +111,6 @@ require (
 	github.com/google/certificate-transparency-go v1.3.3 // indirect
 	github.com/google/go-containerregistry v0.21.3 // indirect
 	github.com/google/jsonschema-go v0.4.2 // indirect
-	github.com/googleapis/gax-go/v2 v2.19.0 // indirect
 	github.com/gorilla/context v1.1.2 // indirect
 	github.com/gorilla/securecookie v1.1.2 // indirect
 	github.com/gorilla/sessions v1.4.0 // indirect
@@ -164,9 +162,9 @@ require (
 	github.com/sigstore/protobuf-specs v0.5.0 // indirect
 	github.com/sigstore/rekor v1.5.1 // indirect
 	github.com/sigstore/rekor-tiles/v2 v2.2.1 // indirect
-	github.com/sigstore/sigstore v1.10.4 // indirect
+	github.com/sigstore/sigstore v1.10.5 // indirect
 	github.com/sigstore/sigstore-go v1.1.4 // indirect
-	github.com/sigstore/timestamp-authority/v2 v2.0.5 // indirect
+	github.com/sigstore/timestamp-authority/v2 v2.0.6 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/spf13/afero v1.15.0 // indirect
 	github.com/spf13/cast v1.10.0 // indirect
@@ -198,14 +196,12 @@ require (
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/arch v0.25.0 // indirect
 	golang.org/x/mod v0.34.0 // indirect
-	golang.org/x/net v0.52.0 // indirect
+	golang.org/x/net v0.53.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/term v0.42.0 // indirect
 	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.43.0 // indirect
-	google.golang.org/api v0.272.0 // indirect
-	google.golang.org/genproto v0.0.0-20260316180232-0b37fe3546d5 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260316180232-0b37fe3546d5 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260316180232-0b37fe3546d5 // indirect
 	google.golang.org/grpc v1.79.3 // indirect
