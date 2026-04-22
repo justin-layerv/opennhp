@@ -141,6 +141,31 @@ const (
 	// Published every flush interval via RegisterGaugeFunc.
 	MetricServersConnected = "ServersConnected"
 	MetricServersHealthy   = "ServersHealthy"
+
+	// NHP_ARD pubkey-allowlist telemetry (#1156).
+	//
+	// MetricARDPubkeyPermitUnknown fires once per ARD target whose
+	// pubkey is not in the AC's allowlist while the AC is running in
+	// permit mode. Operators must verify this counter is flat before
+	// flipping RequireServerPubKeyAllowlist=true: a non-zero rate in
+	// permit mode would translate directly to a knock-path outage
+	// under strict mode.
+	//
+	// MetricARDPubkeyRejected fires once per ARD target rejected in
+	// strict mode. A non-zero rate in strict mode indicates either
+	// (a) stale AC config (operator missed a server pubkey rotation)
+	// or (b) an active attacker attempting the exfil described in
+	// #1156. Either case is a page-worthy alert.
+	//
+	// Both metrics carry the ACId dimension only — intentional,
+	// for CloudWatch cost. Forensic detail (which pubkey prefix
+	// triggered the counter) lives in the Warning summary line
+	// emitted by filterRedispatchTargets alongside the counter,
+	// not in the metric dimension. An alarm triggered on either
+	// counter should cross-reference the log stream at the same
+	// timestamp to get the sample prefixes.
+	MetricARDPubkeyPermitUnknown = "ARDPubkeyPermitUnknown"
+	MetricARDPubkeyRejected      = "ARDPubkeyRejected"
 )
 
 // Re-registration reason constants. These are the only values that
@@ -1025,7 +1050,110 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 	}
 }
 
-// HandleRedispatch processes an NHP_ARD message and connects to assigned servers.
+// filterRedispatchTargets is the single gate that decides which NHP_ARD
+// targets become assigned servers. It runs two filters in order:
+//
+//  1. Shape validation via RedirectTarget.Validate() — drops malformed
+//     entries (empty IP, bad port, missing pubkey) so one bad upstream
+//     entry cannot poison the whole redispatch. See #832.
+//
+//  2. Pubkey allowlist check via ardTrustSnapshot.contains — drops
+//     (strict mode) or logs+counts (permit mode) entries whose pubkey
+//     is not in the AC's trusted server-pubkey set. See #1156.
+//
+// Extracted from HandleRedispatch so the filter decisions are unit-
+// testable without needing a live core.Device. The returned slice is
+// always a fresh allocation (caller may retain it for assignedServers
+// without aliasing the input).
+func (r *ACRegistration) filterRedispatchTargets(targets []common.RedirectTarget) []common.RedirectTarget {
+	// Snapshot the trusted-pubkey set + strict flag once per ARD so
+	// concurrent config reload cannot flip the mode mid-batch (race
+	// fix from PR #1239 review). The snapshot is a fresh map; an
+	// ARD has a handful of targets so allocating it is cheaper than
+	// re-acquiring the lock per target.
+	snap := r.ac.ardTrustSnapshot()
+
+	valid := make([]common.RedirectTarget, 0, len(targets))
+
+	// Summary buffer for the per-batch Warning. Per-target lines
+	// live at Debug to cap log-amplification from a large ARD
+	// (reviewer concern: a malicious or buggy server shipping many
+	// unknown targets could flood Warning otherwise). The first
+	// few prefixes stay on the summary line so forensics still
+	// see "which pubkeys did the AC reject".
+	var unknownCount int
+	samplePrefixes := make([]string, 0, maxPubkeyLogSamples)
+
+	for i, target := range targets {
+		if err := target.Validate(); err != nil {
+			log.Warning("Skipping invalid redispatch target %d: %v", i, err)
+			continue
+		}
+		if !snap.contains(target.PubKeyBase64) {
+			unknownCount++
+			if len(samplePrefixes) < maxPubkeyLogSamples {
+				samplePrefixes = append(samplePrefixes, pubKeyPrefix(target.PubKeyBase64))
+			}
+			log.Debug("Redispatch target %d (%s:%d) pubkey %s not in allowlist",
+				i, target.Address(), target.Port, pubKeyPrefix(target.PubKeyBase64))
+
+			if snap.strict {
+				continue
+			}
+		}
+		valid = append(valid, target)
+	}
+
+	if unknownCount > 0 {
+		// Dedicated counter per mode so CloudWatch alarms can
+		// distinguish "config drift" (permit-mode signal — operator
+		// should update the allowlist before flipping to strict)
+		// from "attack or stale config in prod" (strict-mode signal
+		// — page-worthy).
+		//
+		// Batched AddCounter instead of N IncrCounter calls: a
+		// malicious or buggy upstream shipping an ARD with N
+		// unknown pubkeys used to emit N metric publishes. Batching
+		// is cheap today and cheap-forever even if metrics.Publisher
+		// ever gains a sync or network cost.
+		action := "allowing (permit mode — flip RequireServerPubKeyAllowlist=true once this signal is flat)"
+		metric := MetricARDPubkeyPermitUnknown
+		if snap.strict {
+			action = "rejecting (strict mode)"
+			metric = MetricARDPubkeyRejected
+		}
+		r.metrics.AddCounterWithDims(metric, float64(unknownCount), []types.Dimension{r.acIdDimension()})
+		log.Warning("NHP_ARD: %d target(s) with unknown pubkey, %s; sample prefixes=%v",
+			unknownCount, action, samplePrefixes)
+	}
+
+	return valid
+}
+
+// HandleRedispatch processes an NHP_ARD message and connects to
+// assigned servers.
+//
+// Entry points — every NHP_ARD-shaped message flows through this
+// function, making it the single choke point for the #1156
+// pubkey-allowlist filter. A future code path that needs to
+// provision assigned-server connections from an ARD MUST call
+// HandleRedispatch (or filterRedispatchTargets directly) rather
+// than bypassing to connectToServer, or the allowlist gate is
+// silently lost.
+//
+//  1. Initial registration NHP_ARD response — startRegistration's
+//     handleOnlineResponse branch on NHP_ARD (see call near
+//     registration.go:832).
+//  2. NHP_AAK with an embedded peer list — handleOnlineResponse
+//     wraps aakMsg.Peers as a synthetic ACRedispatchMsg and calls
+//     HandleRedispatch (see call near registration.go:987).
+//  3. Out-of-band NHP_ARD from the server — udpac.go's
+//     HandleACRedispatch forwards to r.registration.HandleRedispatch
+//     (see udpac.go:987).
+//
+// Refresh-triggered re-registrations route through TriggerReregistration
+// → a new startRegistration cycle, which again lands in entry
+// point 1 or 2 above — not a distinct path.
 func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error {
 	if !common.IsSuccessErrCode(ardMsg.ErrCode) {
 		return errors.New("redispatch failed: " + ardMsg.ErrMsg)
@@ -1035,21 +1163,15 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 		return errors.New("no targets in redispatch message")
 	}
 
-	// Filter targets through RedirectTarget.Validate(). Invalid targets are
-	// skipped with a warning so a single malformed upstream entry cannot
-	// poison the whole redispatch, but if no valid targets remain we fail
-	// the redispatch rather than corrupting r.assignedServers with an
-	// unusable slice. See #832: hostname-only targets used to pass the old
+	// Filter targets through RedirectTarget.Validate() and the pubkey
+	// allowlist (#1156). Invalid targets are skipped with a warning so
+	// a single malformed upstream entry cannot poison the whole
+	// redispatch, but if no valid targets remain we fail the redispatch
+	// rather than corrupting r.assignedServers with an unusable slice.
+	// See #832: hostname-only targets used to pass the old
 	// "IP == '' && Hostname == ''" check and then broke every downstream
 	// consumer that keyed on Target.IP.
-	validTargets := make([]common.RedirectTarget, 0, len(ardMsg.Targets))
-	for i, target := range ardMsg.Targets {
-		if err := target.Validate(); err != nil {
-			log.Warning("Skipping invalid redispatch target %d: %v", i, err)
-			continue
-		}
-		validTargets = append(validTargets, target)
-	}
+	validTargets := r.filterRedispatchTargets(ardMsg.Targets)
 	if len(validTargets) == 0 {
 		return errors.New("no valid targets in redispatch message after filtering")
 	}

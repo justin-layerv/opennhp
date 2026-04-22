@@ -43,6 +43,13 @@ type UdpAC struct {
 	serverPeerMutex sync.RWMutex
 	serverPeerMap   map[string]*core.UdpPeer // indexed by server's public key
 
+	// serverPubKeyAllowlist is the NHP_ARD pubkey-allowlist "extras"
+	// set (#1156). Protected by serverPeerMutex above so a concurrent
+	// config reload cannot rebuild this while an ARD evaluation is in
+	// flight. Sourced from Config.ServerPubKeyAllowlist; see
+	// ard_allowlist.go for the lookup and rebuild helpers.
+	serverPubKeyAllowlist map[string]struct{}
+
 	tokenStore *common.TokenStore[*AccessEntry]
 
 	device     *core.Device
@@ -141,6 +148,11 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 
 	a.remoteConnectionMap = make(map[string]*UdpConn)
 	a.serverPeerMap = make(map[string]*core.UdpPeer)
+	// serverPubKeyAllowlist is allocated earlier in Start via
+	// loadBaseConfig → updateBaseConfig's first-load path;
+	// re-initializing here would wipe the operator-supplied
+	// ServerPubKeyAllowlist entries and leave source 3 of the
+	// allowlist dead until the next config.toml touch (see #1239).
 	a.tokenStore = common.NewTokenStore[*AccessEntry]()
 	a.dnsRateLimiter = NewDNSChangeRateLimiter()
 
