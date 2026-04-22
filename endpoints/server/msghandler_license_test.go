@@ -8,14 +8,22 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
 
 // testServer creates a minimal UdpServer for testing validateACLicense.
-// It sets up cloud mode (DynamoDB storage) with the provided MemoryStorage.
-func testServer(storage *MemoryStorage) *UdpServer {
+// It sets up cloud mode (DynamoDB storage) with the provided MemoryStorage
+// and always wires a test metrics publisher. The metrics handle is
+// non-nil in production (initialized at NewUdpServer) and the #1154
+// gate assumes that invariant — see the cr round 2 thread on #1261 on
+// the pattern-consistency decision to not defensively nil-guard
+// s.metrics inside gate hot paths. Test helpers mirror that invariant.
+func testServer(t *testing.T, storage *MemoryStorage) *UdpServer {
+	t.Helper()
 	return &UdpServer{
+		metrics: metrics.NewPublisherForTest(t),
 		storage: storage,
 		storageConfig: &StorageConfig{
 			Backend: "dynamodb",
@@ -40,7 +48,7 @@ func generateBcryptHash(key string) string {
 
 func TestValidateACLicense_ValidLicense(t *testing.T) {
 	storage := NewMemoryStorage()
-	s := testServer(storage)
+	s := testServer(t, storage)
 
 	// Create license with bcrypt hash
 	licenseKey := "test-license-key-12345"
@@ -64,7 +72,7 @@ func TestValidateACLicense_ValidLicense(t *testing.T) {
 	}
 
 	// Validate
-	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206")
+	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206", "")
 	if err != nil {
 		t.Fatalf("Expected validation to succeed, got error: %v", err)
 	}
@@ -72,14 +80,14 @@ func TestValidateACLicense_ValidLicense(t *testing.T) {
 
 func TestValidateACLicense_MissingCredentials_LicenseKey(t *testing.T) {
 	storage := NewMemoryStorage()
-	s := testServer(storage)
+	s := testServer(t, storage)
 
 	aolMsg := &common.ACOnlineMsg{
 		ACId:       "ac-1",
 		LicenseKey: "", // Missing
 	}
 
-	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206")
+	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206", "")
 	if err == nil {
 		t.Fatal("Expected error for missing LicenseKey")
 	}
@@ -87,14 +95,14 @@ func TestValidateACLicense_MissingCredentials_LicenseKey(t *testing.T) {
 
 func TestValidateACLicense_LicenseNotFound(t *testing.T) {
 	storage := NewMemoryStorage()
-	s := testServer(storage)
+	s := testServer(t, storage)
 
 	aolMsg := &common.ACOnlineMsg{
 		ACId:       "ac-1",
 		LicenseKey: "nonexistent-key",
 	}
 
-	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206")
+	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206", "")
 	if err == nil {
 		t.Fatal("Expected error for nonexistent license")
 	}
@@ -102,7 +110,7 @@ func TestValidateACLicense_LicenseNotFound(t *testing.T) {
 
 func TestValidateACLicense_InactiveLicense(t *testing.T) {
 	storage := NewMemoryStorage()
-	s := testServer(storage)
+	s := testServer(t, storage)
 
 	licenseKey := "some-key"
 	license := &License{
@@ -118,7 +126,7 @@ func TestValidateACLicense_InactiveLicense(t *testing.T) {
 		LicenseKey: licenseKey,
 	}
 
-	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206")
+	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206", "")
 	if err == nil {
 		t.Fatal("Expected error for inactive license")
 	}
@@ -126,7 +134,7 @@ func TestValidateACLicense_InactiveLicense(t *testing.T) {
 
 func TestValidateACLicense_ExpiredLicense(t *testing.T) {
 	storage := NewMemoryStorage()
-	s := testServer(storage)
+	s := testServer(t, storage)
 
 	licenseKey := "some-key"
 	license := &License{
@@ -143,7 +151,7 @@ func TestValidateACLicense_ExpiredLicense(t *testing.T) {
 		LicenseKey: licenseKey,
 	}
 
-	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206")
+	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206", "")
 	if err == nil {
 		t.Fatal("Expected error for expired license")
 	}
@@ -151,7 +159,7 @@ func TestValidateACLicense_ExpiredLicense(t *testing.T) {
 
 func TestValidateACLicense_WrongLicenseKey(t *testing.T) {
 	storage := NewMemoryStorage()
-	s := testServer(storage)
+	s := testServer(t, storage)
 
 	// Create license with specific key hash
 	correctKey := "correct-key"
@@ -172,7 +180,7 @@ func TestValidateACLicense_WrongLicenseKey(t *testing.T) {
 		LicenseKey: "wrong-key", // Wrong key
 	}
 
-	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206")
+	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206", "")
 	if err == nil {
 		t.Fatal("Expected error for wrong license key")
 	}
@@ -180,7 +188,7 @@ func TestValidateACLicense_WrongLicenseKey(t *testing.T) {
 
 func TestValidateACLicense_NoHashInDB_Rejected(t *testing.T) {
 	storage := NewMemoryStorage()
-	s := testServer(storage)
+	s := testServer(t, storage)
 
 	// License has no hash - this is a misconfiguration that must be rejected
 	licenseKey := "some-key"
@@ -200,7 +208,7 @@ func TestValidateACLicense_NoHashInDB_Rejected(t *testing.T) {
 		LicenseKey: licenseKey,
 	}
 
-	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206")
+	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206", "")
 	if err == nil {
 		t.Fatal("Expected failure for license without hash (misconfiguration), got success")
 	}
@@ -208,7 +216,7 @@ func TestValidateACLicense_NoHashInDB_Rejected(t *testing.T) {
 
 func TestValidateACLicense_NoExpiration(t *testing.T) {
 	storage := NewMemoryStorage()
-	s := testServer(storage)
+	s := testServer(t, storage)
 
 	licenseKey := "test-key"
 	hash := generateBcryptHash(licenseKey)
@@ -229,7 +237,7 @@ func TestValidateACLicense_NoExpiration(t *testing.T) {
 		LicenseKey: licenseKey,
 	}
 
-	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206")
+	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206", "")
 	if err != nil {
 		t.Fatalf("Expected success for license without expiration, got: %v", err)
 	}
@@ -237,7 +245,7 @@ func TestValidateACLicense_NoExpiration(t *testing.T) {
 
 func TestValidateACLicense_StorageError(t *testing.T) {
 	storage := NewMemoryStorage()
-	s := testServer(storage)
+	s := testServer(t, storage)
 
 	// Inject storage error
 	storage.SetErrorOnNextCall(ErrCodeServiceUnavail, "DynamoDB unavailable")
@@ -247,7 +255,7 @@ func TestValidateACLicense_StorageError(t *testing.T) {
 		LicenseKey: "some-key",
 	}
 
-	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206")
+	err := s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206", "")
 	if err == nil {
 		t.Fatal("Expected error for storage failure")
 	}
@@ -282,7 +290,7 @@ func TestValidateACLicense_TimingAttackPrevention(t *testing.T) {
 	)
 
 	storage := NewMemoryStorage()
-	s := testServer(storage)
+	s := testServer(t, storage)
 
 	// Create test licenses with different states
 	validKey := "valid-license-key"
@@ -335,7 +343,7 @@ func TestValidateACLicense_TimingAttackPrevention(t *testing.T) {
 				LicenseKey: tc.licenseKey,
 			}
 			start := time.Now()
-			_ = s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206")
+			_ = s.validateACLicense(testPacketParserData(), aolMsg, 1, "192.168.1.1:62206", "")
 			elapsed := time.Since(start)
 
 			// Skip warmup runs

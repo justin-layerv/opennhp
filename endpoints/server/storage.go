@@ -154,6 +154,34 @@ type License struct {
 	Active           bool   `json:"active" dynamodbav:"active"`
 	CreatedAt        int64  `json:"created_at" dynamodbav:"created_at"` // Unix timestamp
 	UpdatedAt        int64  `json:"updated_at" dynamodbav:"updated_at"` // Unix timestamp
+	// BoundPubKeys is the allowlist of base64-encoded AC static public
+	// keys permitted to register under this license (#1155).
+	//
+	// Pre-#1155 a license was an unbound bearer token: anyone holding
+	// the key could register with any keypair for any acId, and the
+	// server dumped plaintext NHP_AOP to the attacker's connection.
+	// This field bolts identity onto the license — the server-side
+	// gate rejects registrations whose ppd.RemotePubKey doesn't appear
+	// in this list.
+	//
+	// Empty list = legacy / unprovisioned. Permit mode logs a legacy
+	// warning and accepts (so the gate can roll out without breaking
+	// existing deployments); strict mode rejects with 52013 so
+	// operators can't quietly keep shipping unbound licenses once the
+	// gate is flipped. Populate via the console / admin tooling
+	// (separate workstream — follow-up issue on provisioning UX).
+	//
+	// Canonical encoding: entries MUST be padded standard base64
+	// (RFC 4648 §4 — alphabet A-Z a-z 0-9 + /, with = padding). The
+	// server compares entries against base64.StdEncoding.EncodeToString
+	// of ppd.RemotePubKey with exact string equality. URL-safe base64
+	// (RFC 4648 §5 — alphabet with - _), unpadded base64, or entries
+	// with leading/trailing whitespace will NOT match a legitimate
+	// registration and the AC will be rejected with
+	// ErrLicensePubkeyMismatch — indistinguishable from an actual
+	// attack. Admin tooling / provisioning UX must enforce this at
+	// write-time (tracked in #1262).
+	BoundPubKeys []string `json:"bound_pubkeys,omitempty" dynamodbav:"bound_pubkeys,omitempty"`
 }
 
 // Resource represents a protected resource definition.

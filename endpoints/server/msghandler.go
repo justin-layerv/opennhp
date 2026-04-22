@@ -462,8 +462,23 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md Section 6.2 for details.
 	cloudMode := s.storageConfig != nil && s.storageConfig.Backend == StorageBackendDynamoDB
 	if acPeer == nil && cloudMode {
-		// Validate AC license before accepting connection
-		validationErr := s.validateACLicense(ppd, aolMsg, transactionId, addrStr)
+		// Validate AC license before accepting connection.
+		//
+		// #1155 invariant: the last arg MUST be the base64 form of
+		// ppd.RemotePubKey — the same value already computed above
+		// into acPubkeyBase64. The pubkey-binding gate inside
+		// validateACLicense uses this value to look up
+		// License.BoundPubKeys; passing the wrong string (e.g.,
+		// acId, or a hostname) would silently bypass the gate for
+		// all registrations — the attack break would be gone and
+		// no test in license_pubkey_gate_test.go would catch it
+		// because those tests call validateACLicense directly with
+		// a matching literal. A future refactor that moves this
+		// call site or changes the signature MUST preserve the
+		// "last arg = base64(ppd.RemotePubKey)" contract. See
+		// follow-up #1266 for the smoke Tier 2 test that would
+		// fence this at the integration layer.
+		validationErr := s.validateACLicense(ppd, aolMsg, transactionId, addrStr, acPubkeyBase64)
 		if validationErr != nil {
 			// Send error response
 			aakMsg := &common.ServerACAckMsg{
@@ -1052,6 +1067,7 @@ func (s *UdpServer) validateACLicense(
 	aolMsg *common.ACOnlineMsg,
 	transactionId uint64,
 	addrStr string,
+	presentedPubkey string,
 ) *common.Error {
 	acId := aolMsg.ACId
 
@@ -1143,6 +1159,31 @@ func (s *UdpServer) validateACLicense(
 			acId, transactionId, addrStr, keyPrefix)
 		s.recordLicenseFailure(addrStr, acId)
 		return common.ErrServerACOpsFailed
+	}
+
+	// #1155 pubkey binding gate. Runs AFTER all license-record
+	// checks (active, expired, bcrypt) — at this point we know the
+	// license key is genuine, so the only remaining question is
+	// "is the AC presenting it allowed to register under it?" The
+	// gate compares the AEAD-authenticated peer pubkey against the
+	// License.BoundPubKeys allowlist. See license_pubkey_gate.go
+	// for the permit→strict policy and threat model.
+	//
+	// presentedPubkey is the base64 form of ppd.RemotePubKey, already
+	// computed by HandleACOnline before this call — threading it
+	// through avoids a second base64-encode on the registration
+	// path. ppd.RemotePubKey itself is populated by the noise
+	// responder during packet validation before any handler runs,
+	// so the value is AEAD-authenticated; no further authentication
+	// is needed here.
+	verdict := verifyLicensePubkey(presentedPubkey, license.BoundPubKeys)
+	proceed, rejectErr := s.applyLicensePubkeyVerdict(verdict, acId, presentedPubkey, transactionId, addrStr, keyPrefix)
+	if !proceed {
+		// Reuse the license-failure rate-limit counter: an
+		// attacker spamming stolen keys under non-listed pubkeys
+		// should trip the same defense as other license failures.
+		s.recordLicenseFailure(addrStr, acId)
+		return rejectErr
 	}
 
 	log.Info("server-ac(%s#%d@%s)[validateACLicense] license validated (key=%s...), tier=%s, customer=%s",

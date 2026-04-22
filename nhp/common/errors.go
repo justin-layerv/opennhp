@@ -126,6 +126,31 @@ var (
 	// distinct error so the agent log doesn't blame tampering for
 	// what is actually a server-side dispatch-table bug.
 	ErrKnockHeaderTypeInternal = newError("52011", "knock HeaderType gate internal error (unknown verdict)")
+	// ErrLicensePubkeyMismatch — emitted by the server-side AC-license
+	// pubkey-binding gate (#1155) when the AC's presented static
+	// pubkey is not in the License.BoundPubKeys allowlist. Signals
+	// that either (a) a stolen license key is being presented with
+	// an attacker-chosen keypair, or (b) the license's allowlist is
+	// out of date for a legitimate AC (rotation / new instance).
+	// Agent-visible string stays issue-number-free so agent logs
+	// are grep-friendly; the server log line carries the #1155
+	// reference.
+	ErrLicensePubkeyMismatch = newError("52012", "license does not permit this AC pubkey")
+	// ErrLicensePubkeyUnbound — emitted by the same gate under strict
+	// mode when the License.BoundPubKeys allowlist is empty. Empty
+	// means the license was never provisioned with an expected
+	// pubkey; permit mode accepts with a legacy warning, strict
+	// rejects so operators cannot quietly keep shipping unbound
+	// licenses once the gate is flipped.
+	ErrLicensePubkeyUnbound = newError("52013", "license has no bound pubkey — provision BoundPubKeys")
+	// ErrLicensePubkeyInternal — emitted by the gate's fail-closed
+	// default branch (unknown verdict). Same mechanical pattern as
+	// ErrKnockHeaderTypeInternal: a future PR adds a new verdict
+	// constant and forgets to register it in the switch → gate
+	// rejects fail-closed AND surfaces a distinct error so the
+	// agent log doesn't blame the license for what is actually a
+	// server-side dispatch-table bug.
+	ErrLicensePubkeyInternal = newError("52014", "license pubkey gate internal error (unknown verdict)")
 
 	// ac
 	ErrACOperationFailed       = newError("53001", "ac operation failed")

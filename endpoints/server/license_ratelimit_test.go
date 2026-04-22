@@ -7,6 +7,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
@@ -237,8 +238,10 @@ func TestRateLimiter_ConcurrentAccess(t *testing.T) {
 // Integration: validateACLicense with Rate Limiting
 // ============================================================================
 
-func testServerWithRateLimiter(storage *MemoryStorage, rl *LicenseRateLimiter) *UdpServer {
+func testServerWithRateLimiter(t *testing.T, storage *MemoryStorage, rl *LicenseRateLimiter) *UdpServer {
+	t.Helper()
 	return &UdpServer{
+		metrics: metrics.NewPublisherForTest(t),
 		storage: storage,
 		storageConfig: &StorageConfig{
 			Backend: "dynamodb",
@@ -258,7 +261,7 @@ func TestValidateACLicense_RateLimited(t *testing.T) {
 	})
 	defer rl.Stop()
 
-	s := testServerWithRateLimiter(storage, rl)
+	s := testServerWithRateLimiter(t, storage, rl)
 
 	// Create a valid license for later
 	validKey := "valid-license-key"
@@ -278,7 +281,7 @@ func TestValidateACLicense_RateLimited(t *testing.T) {
 			ACId:       "ac-1",
 			LicenseKey: "wrong-key",
 		}
-		_ = s.validateACLicense(&core.PacketParserData{}, aolMsg, 1, "192.168.1.1:62206")
+		_ = s.validateACLicense(&core.PacketParserData{}, aolMsg, 1, "192.168.1.1:62206", "")
 	}
 
 	// Next attempt should be rate limited, even with valid key
@@ -286,14 +289,14 @@ func TestValidateACLicense_RateLimited(t *testing.T) {
 		ACId:       "ac-1",
 		LicenseKey: validKey,
 	}
-	err := s.validateACLicense(&core.PacketParserData{}, aolMsg, 1, "192.168.1.1:62206")
+	err := s.validateACLicense(&core.PacketParserData{}, aolMsg, 1, "192.168.1.1:62206", "")
 	if err == nil {
 		t.Fatal("Expected rate limit error after exceeding failure threshold")
 	}
 	// The error should be returned (rate limited requests still return generic error)
 
 	// Different IP should still be allowed with valid key
-	err = s.validateACLicense(&core.PacketParserData{}, aolMsg, 1, "192.168.1.2:62206")
+	err = s.validateACLicense(&core.PacketParserData{}, aolMsg, 1, "192.168.1.2:62206", "")
 	if err != nil {
 		t.Fatalf("Expected success from different IP, got: %v", err)
 	}
@@ -310,7 +313,7 @@ func TestValidateACLicense_RateLimitByACID(t *testing.T) {
 	})
 	defer rl.Stop()
 
-	s := testServerWithRateLimiter(storage, rl)
+	s := testServerWithRateLimiter(t, storage, rl)
 
 	// Fail twice for the same AC ID from different IPs
 	for i := 0; i < 2; i++ {
@@ -319,7 +322,7 @@ func TestValidateACLicense_RateLimitByACID(t *testing.T) {
 			LicenseKey: "wrong-key",
 		}
 		addr := fmt.Sprintf("192.168.1.%d:62206", i+1)
-		_ = s.validateACLicense(&core.PacketParserData{}, aolMsg, 1, addr)
+		_ = s.validateACLicense(&core.PacketParserData{}, aolMsg, 1, addr, "")
 	}
 
 	// Same AC ID from new IP should be rate limited
@@ -327,7 +330,7 @@ func TestValidateACLicense_RateLimitByACID(t *testing.T) {
 		ACId:       "target-ac",
 		LicenseKey: "any-key",
 	}
-	err := s.validateACLicense(&core.PacketParserData{}, aolMsg, 1, "10.0.0.1:62206")
+	err := s.validateACLicense(&core.PacketParserData{}, aolMsg, 1, "10.0.0.1:62206", "")
 	if err == nil {
 		t.Fatal("Expected rate limit error for AC ID over limit")
 	}
@@ -337,7 +340,7 @@ func TestValidateACLicense_RateLimitByACID(t *testing.T) {
 		ACId:       "other-ac",
 		LicenseKey: "any-key",
 	}
-	err = s.validateACLicense(&core.PacketParserData{}, aolMsg2, 1, "10.0.0.1:62206")
+	err = s.validateACLicense(&core.PacketParserData{}, aolMsg2, 1, "10.0.0.1:62206", "")
 	if err == nil {
 		t.Fatal("Expected validation error (not-found), but got nil")
 	}
@@ -349,7 +352,7 @@ func TestValidateACLicense_NilRateLimiter(t *testing.T) {
 	// Verify that validateACLicense works when rate limiter is nil
 	// (backward compatibility)
 	storage := NewMemoryStorage()
-	s := testServer(storage) // Uses original testServer without rate limiter
+	s := testServer(t, storage) // Uses original testServer without rate limiter
 
 	aolMsg := &common.ACOnlineMsg{
 		ACId:       "ac-1",
@@ -357,7 +360,7 @@ func TestValidateACLicense_NilRateLimiter(t *testing.T) {
 	}
 
 	// Should not panic with nil rate limiter
-	err := s.validateACLicense(&core.PacketParserData{}, aolMsg, 1, "192.168.1.1:62206")
+	err := s.validateACLicense(&core.PacketParserData{}, aolMsg, 1, "192.168.1.1:62206", "")
 	if err == nil {
 		t.Fatal("Expected validation error for nonexistent key")
 	}
@@ -374,7 +377,7 @@ func TestValidateACLicense_SuccessDoesNotCount(t *testing.T) {
 	})
 	defer rl.Stop()
 
-	s := testServerWithRateLimiter(storage, rl)
+	s := testServerWithRateLimiter(t, storage, rl)
 
 	// Create valid license
 	validKey := "valid-key-12345"
@@ -394,7 +397,7 @@ func TestValidateACLicense_SuccessDoesNotCount(t *testing.T) {
 			ACId:       "ac-1",
 			LicenseKey: validKey,
 		}
-		err := s.validateACLicense(&core.PacketParserData{}, aolMsg, 1, "192.168.1.1:62206")
+		err := s.validateACLicense(&core.PacketParserData{}, aolMsg, 1, "192.168.1.1:62206", "")
 		if err != nil {
 			t.Fatalf("Validation %d failed unexpectedly: %v", i, err)
 		}

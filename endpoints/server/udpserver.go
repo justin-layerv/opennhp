@@ -100,6 +100,20 @@ type UdpServer struct {
 	// if it happens to work on most architectures.
 	knockHeaderTypeVerifyRequire bool
 
+	// licensePubkeyVerifyRequire gates strict-mode rejection of AC
+	// registrations whose presented static pubkey is not in the
+	// License.BoundPubKeys allowlist (or whose license has no
+	// allowlist). Read once at Start from LicensePubkeyVerifyEnvVar
+	// — see license_pubkey_gate.go for the gate policy and #1155
+	// for the threat model.
+	//
+	// Concurrency: same contract as knockHeaderTypeVerifyRequire —
+	// written once in Start before any UDP packet dispatch, read
+	// lock-free from validateACLicense's hot path. A future refactor
+	// that allows live reconfig MUST promote this to atomic.Bool
+	// or protect it behind a mutex.
+	licensePubkeyVerifyRequire bool
+
 	// connection and remote transaction management
 
 	remoteConnectionMapMutex sync.Mutex
@@ -279,6 +293,20 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		// then flip NHP_KNOCK_HEADERTYPE_VERIFY=true."
 		log.Info("Knock HeaderType verify gate: permit mode (#1154); watch %s (rollout) and %s (attack) before flipping NHP_KNOCK_HEADERTYPE_VERIFY=true",
 			MetricKnockHeaderTypeLegacy, MetricKnockHeaderTypeMismatch)
+	}
+
+	// Parse NHP_LICENSE_PUBKEY_VERIFY (#1155). Fail Start on an
+	// unrecognized token so an operator typo cannot silently leave
+	// the gate in permit mode. See license_pubkey_gate.go.
+	s.licensePubkeyVerifyRequire, err = parseLicensePubkeyVerify(os.Getenv(LicensePubkeyVerifyEnvVar))
+	if err != nil {
+		return fmt.Errorf("%s: %w", LicensePubkeyVerifyEnvVar, err)
+	}
+	if s.licensePubkeyVerifyRequire {
+		log.Info("License pubkey verify gate: strict mode (#1155); pubkey mismatch rejects with 52012, unbound license with 52013")
+	} else {
+		log.Info("License pubkey verify gate: permit mode (#1155); watch %s (rollout) and %s (attack) before flipping NHP_LICENSE_PUBKEY_VERIFY=true",
+			MetricLicensePubkeyUnbound, MetricLicensePubkeyMismatch)
 	}
 
 	// Initialize pluggable storage backend (DynamoDB or etcd)
