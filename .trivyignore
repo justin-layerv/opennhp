@@ -79,8 +79,11 @@ CVE-2026-32283
 
 # github.com/go-acme/lego/v4 - HIGH, in vendored Traefik binary.
 # Our endpoints module does not import lego; it's compiled into the
-# Traefik binary downloaded in Dockerfile.ac.aws. Wait for a Traefik
-# release bundling the patched lego version to remove this entry.
+# Traefik binary downloaded in Dockerfile.ac.aws. The vulnerable code
+# path is the Webroot HTTP-01 ACME provider; Dockerfile.ac.aws uses
+# the DNS-01 challenge (certificatesResolvers.letsencrypt.acme.dnsChallenge),
+# so not reachable. Wait for a Traefik release that bumps lego
+# (>= v4.22.3) to remove this entry.
 # Re-check after 2026-05-15 if no Traefik release has shipped by then.
 # https://avd.aquasec.com/nvd/cve-2026-40611
 CVE-2026-40611

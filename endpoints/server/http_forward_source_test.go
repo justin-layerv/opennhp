@@ -23,7 +23,7 @@ func newForwardingTestServer(storage StorageBackend) *HttpServer {
 	}
 	hs := &HttpServer{
 		udpServer:     udpSrv,
-		httpForwarder: NewHttpKnockForwarder(storage, nil, "10.0.0.1", 8888, nil),
+		httpForwarder: NewHttpKnockForwarder(storage, nil, "10.0.0.1", 8888, nil, nil),
 	}
 	return hs
 }

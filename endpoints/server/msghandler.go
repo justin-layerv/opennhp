@@ -82,7 +82,19 @@ const (
 	MetricKnockForwardFallback      = "KnockForwardFallback"
 	MetricCloudMapDeregisterFailure = "CloudMapDeregisterFailure"
 	MetricKnockNoAC                 = "KnockNoAC"
-	MetricACPeerCount               = "ACPeerCount"
+	// MetricInternalAuthFailPermit / MetricInternalAuthFailStrict count
+	// /nhp/internal/knock requests whose HMAC verification failed.
+	// Permit-mode failures still pass through (warn + allow); strict-
+	// mode failures get 401. Operators alarm on Permit > 0 to know
+	// when it's safe to flip require=true (signals all callers signing).
+	MetricInternalAuthFailPermit = "InternalAuthFailPermit"
+	MetricInternalAuthFailStrict = "InternalAuthFailStrict"
+	// MetricInternalAuthSuccess pairs with the Fail counters above.
+	// FailPermit → 0 alone can mean "everyone signed" OR "no traffic".
+	// Watching Success rise while FailPermit drops is the positive
+	// signal operators need before flipping NHP_INTERNAL_AUTH_REQUIRE=true.
+	MetricInternalAuthSuccess = "InternalAuthSuccess"
+	MetricACPeerCount         = "ACPeerCount"
 	// MetricACGraceAbsorbed increments once per /health/knock-ready probe
 	// where ACPeerChecker returned pass from the grace-window branch
 	// (live count was zero but the last-non-zero timestamp was inside

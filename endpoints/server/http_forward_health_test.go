@@ -21,7 +21,7 @@ import (
 // ============================================================================
 
 func TestMarkFailed_RecordsFailure(t *testing.T) {
-	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil)
+	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil, nil)
 
 	f.markFailed("10.0.0.2")
 
@@ -35,7 +35,7 @@ func TestMarkFailed_RecordsFailure(t *testing.T) {
 }
 
 func TestMarkFailed_EvictsExpiredEntriesAboveThreshold(t *testing.T) {
-	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil)
+	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil, nil)
 
 	// Fill the map above the eviction threshold with expired entries
 	f.failedMu.Lock()
@@ -72,7 +72,7 @@ func TestMarkFailed_EvictsExpiredEntriesAboveThreshold(t *testing.T) {
 }
 
 func TestMarkFailed_SkipsEvictionBelowThreshold(t *testing.T) {
-	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil)
+	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil, nil)
 
 	// Insert a few expired entries (below threshold)
 	f.failedMu.Lock()
@@ -97,7 +97,7 @@ func TestMarkFailed_SkipsEvictionBelowThreshold(t *testing.T) {
 }
 
 func TestMarkFailed_ConcurrentSafe(t *testing.T) {
-	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil)
+	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil, nil)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
@@ -121,7 +121,7 @@ func TestMarkFailed_ConcurrentSafe(t *testing.T) {
 // ============================================================================
 
 func TestFilterForwardTargets_SkipsRecentlyFailed(t *testing.T) {
-	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil)
+	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil, nil)
 
 	// Mark srv-2 as recently failed
 	f.markFailed("10.0.0.2")
@@ -142,7 +142,7 @@ func TestFilterForwardTargets_SkipsRecentlyFailed(t *testing.T) {
 }
 
 func TestFilterForwardTargets_AllowsRecoveredServers(t *testing.T) {
-	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil)
+	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil, nil)
 
 	// Mark srv-2 as failed long ago (beyond decay window)
 	f.failedMu.Lock()
@@ -162,7 +162,7 @@ func TestFilterForwardTargets_AllowsRecoveredServers(t *testing.T) {
 }
 
 func TestFilterForwardTargets_FallbackWhenAllFailed(t *testing.T) {
-	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil)
+	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil, nil)
 
 	// Mark ALL non-self servers as failed
 	f.markFailed("10.0.0.2")
@@ -183,7 +183,7 @@ func TestFilterForwardTargets_FallbackWhenAllFailed(t *testing.T) {
 }
 
 func TestFilterForwardTargets_NoFallbackWhenOnlySelf(t *testing.T) {
-	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil)
+	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil, nil)
 
 	servers := []ServerInfo{
 		{ID: "srv-1", InternalIP: "10.0.0.1"}, // self only
@@ -204,7 +204,7 @@ func TestFilterForwardTargets_CombinesCloudMapAndFailureTracking(t *testing.T) {
 		// 10.0.0.4 is unhealthy in CloudMap
 	})
 
-	f := NewHttpKnockForwarder(newMockStorageBackend(), mock, "10.0.0.1", 8888, nil)
+	f := NewHttpKnockForwarder(newMockStorageBackend(), mock, "10.0.0.1", 8888, nil, nil)
 
 	// Mark srv-2 as failed (even though CloudMap says healthy)
 	f.markFailed("10.0.0.2")
@@ -253,7 +253,7 @@ func TestForwardHttpKnock_MarksFailedServers(t *testing.T) {
 		},
 	}
 
-	f := NewHttpKnockForwarder(storage, nil, "10.0.0.99", port, nil)
+	f := NewHttpKnockForwarder(storage, nil, "10.0.0.99", port, nil, nil)
 
 	_, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err == nil {
@@ -290,7 +290,7 @@ func TestForwardHttpKnock_InvalidatesCacheOnTotalFailure(t *testing.T) {
 	}
 
 	mock := NewMockHealthChecker(map[string]bool{"127.0.0.1": true})
-	f := NewHttpKnockForwarder(storage, mock, "10.0.0.99", port, nil)
+	f := NewHttpKnockForwarder(storage, mock, "10.0.0.99", port, nil, nil)
 
 	_, _ = f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
 
@@ -333,7 +333,7 @@ func TestForwardHttpKnock_DoesNotInvalidateCacheOnPartialSuccess(t *testing.T) {
 	}
 
 	mock := NewMockHealthChecker(map[string]bool{"127.0.0.1": true})
-	f := NewHttpKnockForwarder(storage, mock, "10.0.0.99", port, nil)
+	f := NewHttpKnockForwarder(storage, mock, "10.0.0.99", port, nil, nil)
 
 	ack, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err != nil {
@@ -354,7 +354,7 @@ func TestForwardHttpKnock_DoesNotInvalidateCacheOnPartialSuccess(t *testing.T) {
 // ============================================================================
 
 func TestForwardHttpKnock_RejectsWhenStopped(t *testing.T) {
-	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil)
+	f := NewHttpKnockForwarder(newMockStorageBackend(), nil, "10.0.0.1", 8888, nil, nil)
 	f.Stop()
 
 	_, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
@@ -385,7 +385,7 @@ func TestForwardHttpKnock_RespectsContextCancellation(t *testing.T) {
 		},
 	}
 
-	f := NewHttpKnockForwarder(storage, nil, "10.0.0.99", port, nil)
+	f := NewHttpKnockForwarder(storage, nil, "10.0.0.99", port, nil, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -485,7 +485,7 @@ func TestForwardHttpKnock_SecondRequestSkipsDeadServer(t *testing.T) {
 		},
 	}
 
-	f := NewHttpKnockForwarder(storage, nil, "10.0.0.99", healthyPort, nil)
+	f := NewHttpKnockForwarder(storage, nil, "10.0.0.99", healthyPort, nil, nil)
 
 	// Pre-mark the dead server as failed (simulating a previous failed forward)
 	f.markFailed("10.0.0.2")
@@ -529,7 +529,7 @@ func TestForwardHttpKnock_NilCloudMapDoesNotPanic(t *testing.T) {
 	}
 
 	// Explicitly pass nil CloudMap (the prod scenario)
-	f := NewHttpKnockForwarder(storage, nil, "10.0.0.99", port, nil)
+	f := NewHttpKnockForwarder(storage, nil, "10.0.0.99", port, nil, nil)
 
 	ack, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err != nil {
@@ -571,7 +571,7 @@ func TestForwardHttpKnock_AllFailedThenCacheInvalidatedThenRetrySucceeds(t *test
 	}
 
 	mock := NewMockHealthChecker(map[string]bool{"127.0.0.1": true})
-	f := NewHttpKnockForwarder(storage, mock, "10.0.0.99", port, nil)
+	f := NewHttpKnockForwarder(storage, mock, "10.0.0.99", port, nil, nil)
 
 	// First attempt: all fail → cache invalidated
 	_, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})

@@ -1,12 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"math"
 	"net"
@@ -42,6 +44,35 @@ type HttpServer struct {
 	healthManager *health.Manager
 	knockManager  *health.Manager // includes AC peer check for knock-traffic readiness
 	httpForwarder *HttpKnockForwarder
+
+	// internalAuthSigner and internalAuthRequire together specify the
+	// internal-auth rollout state for /nhp/internal/*. Both are set
+	// once in Start before request serving begins and read concurrently
+	// by request-handler goroutines thereafter. The happens-before edge
+	// is the `go func(){ ListenAndServe() }()` launch in Start — the
+	// Go memory model guarantees that every write sequenced before a
+	// `go` statement is visible to the launched goroutine, so the
+	// field writes at the top of Start synchronize-with every handler
+	// invocation the server dispatches afterwards. `running.Store(true)`
+	// at the bottom of Start is a ready-probe signal for Stop(), not
+	// the synchronization primitive for these fields.
+	//
+	// Three effective modes:
+	//   signer == nil              → legacy (source-IP gate only)
+	//   signer != nil, require=false → permit (verify + warn + allow)
+	//   signer != nil, require=true  → strict (verify + reject unsigned)
+	// The {signer=nil, require=true} combo is unreachable — Start only
+	// reads internalAuthRequire when a signer was constructed successfully
+	// — but even if it were reached, handleInternalKnock short-circuits
+	// on the signer==nil check before consulting require.
+	internalAuthSigner  *common.InternalAuthSigner
+	internalAuthRequire bool
+	// internalAuthEmit is the counter-emit callback for the three
+	// /nhp/internal/knock metrics. In production it's bound to
+	// us.metrics.IncrCounter at Start time; tests plumb a capturing
+	// function to assert increment counts without spinning up a real
+	// metrics Publisher. Nil is fine (no-op).
+	internalAuthEmit MetricCounter
 
 	wg      sync.WaitGroup
 	running atomic.Bool
@@ -101,6 +132,35 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 		_ = hs.ginEngine.SetTrustedProxies(nil)
 	}
 
+	// Internal service auth for /nhp/internal/*. Three modes:
+	//   secret unset                         → legacy (no verification)
+	//   secret set, require unset/false      → permit (verify + warn)
+	//   secret set, require=true             → strict (verify + reject)
+	// Rollout order is secret-first-on-both-services (nhp-server and
+	// qurl-service), confirm no permit-mode warn logs, then flip
+	// require=true. Ship permit as default so the first deploy of
+	// either side doesn't break the other.
+	signer, require, mode, authCfgErr := loadInternalAuthConfig(
+		os.Getenv("NHP_INTERNAL_AUTH_SECRET"),
+		os.Getenv("NHP_INTERNAL_AUTH_REQUIRE"),
+	)
+	if authCfgErr != nil {
+		return authCfgErr
+	}
+	hs.internalAuthSigner = signer
+	hs.internalAuthRequire = require
+	switch mode {
+	case "legacy":
+		log.Warning("NHP_INTERNAL_AUTH_SECRET unset — /nhp/internal/* uses the RFC-1918 source-IP check only (legacy mode)")
+	default:
+		// "strict" / "permit" — line up with the rest of the operator-visible
+		// surface: "strict" matches MetricInternalAuthFailStrict, the
+		// reject-path log line ("rejected (strict)"), and the PR docs.
+		// "permit" matches MetricInternalAuthFailPermit and the warn-
+		// path log. Operators grep one token across logs + metrics.
+		log.Info("internal auth enabled (mode=%s)", mode)
+	}
+
 	cookieKeys, err := parseCookieKeys(os.Getenv("NHP_COOKIE_KEYS"))
 	if err != nil {
 		return fmt.Errorf("NHP_COOKIE_KEYS: %w", err)
@@ -122,6 +182,12 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 		return err
 	}
 
+	// Bind the internal-auth metric emitter now that udpServer is plumbed.
+	// Nil-safe: handleInternalKnock guards on hs.internalAuthEmit == nil.
+	if us.metrics != nil {
+		hs.internalAuthEmit = us.metrics.IncrCounter
+	}
+
 	// Initialize HTTP knock forwarder for server-to-server forwarding.
 	// Requires storage backend (for AC assignment lookup). CloudMap is optional
 	// (used for health filtering of stale assignments if enabled).
@@ -130,8 +196,8 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 		if us.metrics != nil {
 			emitMetric = us.metrics.IncrCounter
 		}
-		hs.httpForwarder = NewHttpKnockForwarder(us.storage, us.cloudMap, us.localIp, listenPort, emitMetric)
-		log.Info("HTTP knock forwarder initialized (localIP=%s, port=%d, cloudMap=%t)", us.localIp, listenPort, us.cloudMap != nil)
+		hs.httpForwarder = NewHttpKnockForwarder(us.storage, us.cloudMap, us.localIp, listenPort, emitMetric, hs.internalAuthSigner)
+		log.Info("HTTP knock forwarder initialized (localIP=%s, port=%d, cloudMap=%t, signed=%t)", us.localIp, listenPort, us.cloudMap != nil, hs.internalAuthSigner != nil)
 	}
 
 	hs.initRouter()
@@ -724,6 +790,78 @@ func parseTrustedCIDRs(raw string) []string {
 	return valid
 }
 
+// loadInternalAuthConfig decodes the env pair that configures the
+// /nhp/internal/knock auth gate. Returns (signer, require, mode, err)
+// where mode is one of {"legacy", "permit", "strict"} for operator
+// logging. Separated from Start so the three misconfiguration paths
+// — empty secret under require=true, malformed require token, short
+// secret — can be fenced in unit tests without stubbing the whole
+// server bring-up.
+//
+// Read once at Start: flipping NHP_INTERNAL_AUTH_REQUIRE via Terraform
+// takes effect ONLY on the next ECS task revision deploy, not on a
+// running process. That's intentional (no in-process env re-read
+// surface to spoof), but operators should know the Terraform apply
+// itself cycles tasks — if the flip needs to be immediate during an
+// incident rollback, trigger a manual service update after apply.
+// See #1233.
+func loadInternalAuthConfig(envSecret, envRequire string) (*common.InternalAuthSigner, bool, string, error) {
+	// Trim the secret at the loader boundary (not at the os.Getenv
+	// call site) so every entry point — Start, tests, a hypothetical
+	// second bootstrap caller — gets the same whitespace semantics.
+	// A Secrets Manager template with a trailing '\n' or leading
+	// whitespace would otherwise produce a subtly-wrong HMAC on both
+	// sides (sender and receiver agree, but the operator can't
+	// reproduce the signature by hand). Whitespace-only values are
+	// treated as empty → legacy mode, consistent with the REQUIRE
+	// parser's whitespace tolerance.
+	envSecret = strings.TrimSpace(envSecret)
+	require, parseErr := parseInternalAuthRequire(envRequire)
+	if parseErr != nil {
+		// Fail loud on an unrecognized value rather than silently
+		// defaulting to permit — an operator who types =1 or =yes
+		// in Terraform thinks they flipped to strict and must not
+		// end up with the VPC-wide bypass still live.
+		return nil, false, "", fmt.Errorf("NHP_INTERNAL_AUTH_REQUIRE: %w", parseErr)
+	}
+	if require && envSecret == "" {
+		// Same class as the typo guard above — the operator thinks
+		// they enabled strict mode but the runtime would fall back
+		// to legacy (no verification) because no signer is constructed.
+		// Fail Start so the misconfig surfaces in the deploy log
+		// instead of as a silent VPC-wide bypass.
+		return nil, false, "", fmt.Errorf("NHP_INTERNAL_AUTH_REQUIRE=true requires NHP_INTERNAL_AUTH_SECRET to be set")
+	}
+	if envSecret == "" {
+		return nil, false, "legacy", nil
+	}
+	signer, authErr := common.NewInternalAuthSigner(envSecret)
+	if authErr != nil {
+		return nil, false, "", fmt.Errorf("NHP_INTERNAL_AUTH_SECRET: %w", authErr)
+	}
+	mode := "permit"
+	if require {
+		mode = "strict"
+	}
+	return signer, require, mode, nil
+}
+
+// parseInternalAuthRequire decodes the NHP_INTERNAL_AUTH_REQUIRE env
+// var. Accepts the usual truthy / falsy tokens (plus empty = false)
+// and rejects anything else — this flag gates a fail-closed posture,
+// so an unrecognized value (operator typo in Terraform) must not
+// silently leave the knock API in permit-mode.
+func parseInternalAuthRequire(raw string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "false", "0", "no", "off":
+		return false, nil
+	case "true", "1", "yes", "on":
+		return true, nil
+	default:
+		return false, fmt.Errorf("unrecognized value %q; expected true/false/1/0/yes/no/on/off", raw)
+	}
+}
+
 // parseAllowedOrigins splits a comma-separated list of allowed CORS origins,
 // trims whitespace, and filters empty entries. Returns nil if input is empty.
 // Supports wildcard entries like "https://*.example.com" which match any
@@ -1050,6 +1188,15 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 	}
 
 	if len(res.Resources) == 0 {
+		// Load-bearing for TestInternalKnock_LegacyMode_NoSignerSet:
+		// the legacy-mode handler test passes a zero-value HttpServer{}
+		// (nil udpServer, nil storage), which means *any* deref past
+		// this early return would nil-panic. The test relies on this
+		// short-circuit to avoid wiring a full UdpServer mock just to
+		// fence the nil-signer code path. If a future refactor moves
+		// resource loading or any UdpServer access ABOVE this return,
+		// also update the legacy-mode test to plumb the dependency it
+		// now needs.
 		err = common.ErrResourceNotFound
 		ackMsg.ErrCode = common.ErrResourceNotFound.ErrorCode()
 		ackMsg.ErrMsg = err.Error()
@@ -1196,15 +1343,166 @@ func (hs *HttpServer) FindPluginHandler(aspId string) plugins.PluginHandler {
 	return hs.udpServer.FindPluginHandler(aspId)
 }
 
-// handleInternalKnock processes forwarded knock requests from other servers.
-// Security: Only accepts requests from VPC private IPs (port 8888 is open to 0.0.0.0/0 via NLB).
+// handleInternalKnock processes forwarded knock requests from other
+// servers and service-to-server callers (e.g., qurl-service).
+//
+// Auth layers, in order of application:
+//  1. RFC-1918 / loopback source-IP check (defense in depth; port 8888
+//     is open to 0.0.0.0/0 via NLB with preserve_client_ip=true).
+//  2. HMAC verification of the X-Nhp-Auth header. Permit- or strict-
+//     mode per NHP_INTERNAL_AUTH_REQUIRE; see the Start-time config
+//     block that initializes internalAuthSigner / internalAuthRequire.
+//
+// The layer-1 check alone is not an auth gate — any VPC workload can
+// hit this path with a private source IP. Layer 2 binds requests to
+// parties holding the shared secret. Removing either without replacing
+// it would open the knock API to the full VPC attack surface.
 func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
-	// Source IP check: reject non-RFC-1918 IPs
-	srcIP := ctx.ClientIP()
+	// Source IP check: reject non-RFC-1918 IPs.
+	//
+	// Deliberately uses RemoteAddr (not ctx.ClientIP()) because this
+	// endpoint receives only same-VPC traffic and must not trust any
+	// X-Forwarded-For header regardless of the server-wide
+	// NHP_TRUSTED_PROXY_CIDRS setting. If an operator ever configures
+	// a VPC-wide CIDR as trusted, ctx.ClientIP() would walk an
+	// attacker-supplied XFF and a workload at 8.8.8.8 could spoof
+	// 10.0.0.1, passing this gate. RemoteAddr is the socket peer —
+	// unspoofable at layer 4 — which is the correct primitive for
+	// the internal surface.
+	host, _, splitErr := net.SplitHostPort(ctx.Request.RemoteAddr)
+	srcIP := host
+	if splitErr != nil {
+		// If SplitHostPort fails the address is malformed; just log
+		// and fall through to isPrivateIP which rejects empty.
+		srcIP = ctx.Request.RemoteAddr
+	}
 	if !isPrivateIP(srcIP) {
-		log.Warning("Internal knock rejected: non-private source IP %s", srcIP)
+		log.Warning("internal knock rejected: non-private source IP %s", srcIP)
 		ctx.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
 		return
+	}
+
+	// Query and fragment are not part of the signed string (see
+	// InternalAuthSigner godoc). Reject requests that carry them
+	// rather than silently accept an un-protected segment — closes
+	// the footgun class where a future endpoint consumes a query
+	// param and would have it unsigned. If query-signing is ever
+	// required, bump InternalAuthScheme and add the field to the
+	// signing string on both halves.
+	//
+	// The Fragment clause is defensive-only: fragments are client-
+	// side per RFC 3986 and don't traverse the wire. It catches
+	// programmatic callers that build http.Request directly with
+	// a populated URL.Fragment (tests, library misuse) — cheaper
+	// to reject up front than to audit every client library's
+	// fragment-handling behavior.
+	if ctx.Request.URL.RawQuery != "" || ctx.Request.URL.Fragment != "" {
+		log.Warning("internal knock rejected: URL must have no query or fragment (got query=%q fragment=%q)", ctx.Request.URL.RawQuery, ctx.Request.URL.Fragment)
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "bad request"})
+		return
+	}
+
+	// In legacy mode (no signer configured — initial rollout state),
+	// skip the full-body buffer. ShouldBindJSON downstream streams
+	// directly off ctx.Request.Body; the 413 cap is still enforced
+	// via MaxBytesReader, which is O(1) extra memory.
+	//
+	// In permit/strict mode we must buffer so the HMAC verify sees
+	// exactly the bytes JSON bind will see — otherwise a streaming
+	// reader could let the verifier and parser diverge on partially-
+	// read input.
+	//
+	// Response-code asymmetry: legacy-mode oversized body surfaces as
+	// 400 "invalid request body" (MaxBytesReader's error hits
+	// ShouldBindJSON, not the 413 branch below), while permit/strict
+	// mode returns 413. Acceptable for the rollout window — legacy is
+	// transitional and operators see 413 on the post-flip steady
+	// state. Unifying would require read-and-measure in legacy mode.
+	if hs.internalAuthSigner == nil {
+		ctx.Request.Body = http.MaxBytesReader(ctx.Writer, ctx.Request.Body, maxInternalKnockRequestSize)
+	} else {
+		// We close the original reader explicitly so the lifecycle is
+		// independent of the net/http server's post-handler Close; a
+		// future transport wrapping the body in a pooled-buffer closer
+		// still frees its resources. Gin's post-handler cleanup closes
+		// the swapped NopCloser (no-op); origBody.Close() covers the
+		// real reader regardless of which arm below fires.
+		origBody := ctx.Request.Body
+		defer origBody.Close()
+		body, err := io.ReadAll(io.LimitReader(origBody, maxInternalKnockRequestSize+1))
+		if err != nil {
+			ctx.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+			return
+		}
+		if int64(len(body)) > maxInternalKnockRequestSize {
+			// Log src=<ip> + reqID symmetric with the strict-reject log line so
+			// "is one caller misbehaving or are we under a wave?" stays
+			// answerable from logs alone.
+			log.Warning("internal knock rejected: body over limit src=%s reqID=%s size=%d limit=%d",
+				srcIP, GetRequestID(ctx), len(body), maxInternalKnockRequestSize)
+			ctx.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "body too large"})
+			return
+		}
+		// Reset both the body reader and ContentLength so any downstream
+		// consumer that trusts ContentLength sees the buffered length.
+		ctx.Request.Body = io.NopCloser(bytes.NewReader(body))
+		ctx.Request.ContentLength = int64(len(body))
+
+		// HMAC verification. In permit-mode (signer set, require=false) a
+		// verification failure logs a warning but allows the request
+		// through — this is the rollout-window behavior that lets unsigned
+		// callers continue working while operators confirm the signing
+		// path is live before flipping to strict. Strict mode rejects
+		// with 401; the response body carries only ErrInternalAuth so the
+		// attacker learns nothing about which sub-check failed.
+		authErr := hs.internalAuthSigner.Verify(
+			ctx.GetHeader(common.InternalAuthHeader),
+			ctx.Request.Method,
+			ctx.Request.URL.Path,
+			body,
+			0, // use default skew window
+		)
+		if authErr != nil {
+			// Log stage-only to avoid creating a sub-check oracle for
+			// anyone with read access to the log stack. The sentinel-
+			// only 401 body already hides which arm failed; echoing
+			// the full wrapped error here would partially undo that.
+			stage := common.ClassifyAuthFailure(authErr)
+			reqID := GetRequestID(ctx)
+			if hs.internalAuthRequire {
+				log.Warning("internal knock rejected (strict): src=%s stage=%s reqID=%s", srcIP, stage, reqID)
+				if hs.internalAuthEmit != nil {
+					hs.internalAuthEmit(MetricInternalAuthFailStrict)
+				}
+				ctx.JSON(http.StatusUnauthorized, gin.H{"error": common.ErrInternalAuth.Error()})
+				return
+			}
+			// Counter (MetricInternalAuthFailPermit) is the alarm
+			// signal for the rollout; this log line is for per-
+			// request debugging only — don't plumb it into a
+			// regex alert. Logged at Info (not Warning) because
+			// during the rollout window every pre-upgrade caller
+			// emits one per request, and that volume at Warning
+			// severity would either drown real warnings or train
+			// operators to ignore them. Phrased as "unverified"
+			// not "failed" so a log aggregator grepping for
+			// "auth failed" doesn't trip on rollout-window noise —
+			// the grep should hit the strict-mode reject line only.
+			log.Info("internal knock permit-mode unverified (allowing through): src=%s stage=%s reqID=%s", srcIP, stage, reqID)
+			// Counter is the rollout signal: alarm on Permit > 0
+			// during the qurl-service signing rollout. When it
+			// drops to zero across a stable window, it's safe to
+			// flip NHP_INTERNAL_AUTH_REQUIRE=true.
+			if hs.internalAuthEmit != nil {
+				hs.internalAuthEmit(MetricInternalAuthFailPermit)
+			}
+		} else if hs.internalAuthEmit != nil {
+			// Success paired with FailPermit/FailStrict. Operators
+			// watching the rollout need a positive signal ("signed
+			// traffic arriving") to distinguish "everyone signed"
+			// from "no traffic" before flipping require=true.
+			hs.internalAuthEmit(MetricInternalAuthSuccess)
+		}
 	}
 
 	var fwdReq HttpKnockForwardRequest

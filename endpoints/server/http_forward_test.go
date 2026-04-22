@@ -164,7 +164,7 @@ func TestForwardHttpKnock_NoStorage(t *testing.T) {
 
 func TestForwardHttpKnock_AssignmentNotFound(t *testing.T) {
 	storage := newMockStorageBackend()
-	f := NewHttpKnockForwarder(storage, nil, "10.0.0.1", 8888, nil)
+	f := NewHttpKnockForwarder(storage, nil, "10.0.0.1", 8888, nil, nil)
 
 	_, err := f.ForwardHttpKnock(context.Background(), "ac-not-found", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err == nil {
@@ -180,7 +180,7 @@ func TestForwardHttpKnock_AssignmentExpired(t *testing.T) {
 		AssignedServers: []ServerInfo{{ID: "srv-1", InternalIP: "10.0.0.2"}},
 		TTL:             &expired,
 	}
-	f := NewHttpKnockForwarder(storage, nil, "10.0.0.1", 8888, nil)
+	f := NewHttpKnockForwarder(storage, nil, "10.0.0.1", 8888, nil, nil)
 
 	_, err := f.ForwardHttpKnock(context.Background(), "ac-expired", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err == nil {
@@ -194,7 +194,7 @@ func TestForwardHttpKnock_NoAvailableServers(t *testing.T) {
 		ACID:            "ac-self-only",
 		AssignedServers: []ServerInfo{{ID: "srv-1", InternalIP: "10.0.0.1"}}, // only self
 	}
-	f := NewHttpKnockForwarder(storage, nil, "10.0.0.1", 8888, nil)
+	f := NewHttpKnockForwarder(storage, nil, "10.0.0.1", 8888, nil, nil)
 
 	_, err := f.ForwardHttpKnock(context.Background(), "ac-self-only", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err == nil {
@@ -235,7 +235,7 @@ func TestForwardHttpKnock_SuccessfulForward(t *testing.T) {
 	_, portStr, _ := net.SplitHostPort(mockServer.Listener.Addr().String())
 	port, _ := strconv.Atoi(portStr)
 
-	f := NewHttpKnockForwarder(storage, nil, "10.0.0.99", port, nil) // different IP than 127.0.0.1
+	f := NewHttpKnockForwarder(storage, nil, "10.0.0.99", port, nil, nil) // different IP than 127.0.0.1
 
 	ack, err := f.ForwardHttpKnock(context.Background(), "ac-test", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err != nil {
@@ -268,7 +268,7 @@ func TestForwardHttpKnock_ServerReturnsError(t *testing.T) {
 	_, portStr, _ := net.SplitHostPort(mockServer.Listener.Addr().String())
 	port, _ := strconv.Atoi(portStr)
 
-	f := NewHttpKnockForwarder(storage, nil, "10.0.0.99", port, nil)
+	f := NewHttpKnockForwarder(storage, nil, "10.0.0.99", port, nil, nil)
 
 	_, err := f.ForwardHttpKnock(context.Background(), "ac-err", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err == nil {
@@ -284,7 +284,7 @@ func TestForwardHttpKnock_RejectsPublicIP(t *testing.T) {
 			{ID: "srv-2", InternalIP: "54.1.2.3"}, // public IP
 		},
 	}
-	f := NewHttpKnockForwarder(storage, nil, "10.0.0.1", 8888, nil)
+	f := NewHttpKnockForwarder(storage, nil, "10.0.0.1", 8888, nil, nil)
 
 	_, err := f.ForwardHttpKnock(context.Background(), "ac-public", &common.HttpKnockRequest{}, &common.ResourceData{})
 	if err == nil {
@@ -484,5 +484,14 @@ func TestACAssignment_Clone(t *testing.T) {
 func TestMaxForwardResponseSize(t *testing.T) {
 	if maxForwardResponseSize != 64<<10 {
 		t.Errorf("Expected maxForwardResponseSize to be 64 KiB (65536), got %d", maxForwardResponseSize)
+	}
+	if maxInternalKnockRequestSize != 64<<10 {
+		t.Errorf("Expected maxInternalKnockRequestSize to be 64 KiB (65536), got %d", maxInternalKnockRequestSize)
+	}
+	// Pin that the two caps are equal TODAY. Declared separately on
+	// purpose so a future tuning of one doesn't silently propagate;
+	// if they diverge intentionally, update this assertion to match.
+	if maxInternalKnockRequestSize != maxForwardResponseSize {
+		t.Errorf("request/response caps drifted: request=%d response=%d — if intentional, update this test; if not, fix the const", maxInternalKnockRequestSize, maxForwardResponseSize)
 	}
 }

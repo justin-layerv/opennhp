@@ -18,7 +18,21 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
+// maxForwardResponseSize bounds the outbound ACK read. Sibling of
+// maxInternalKnockRequestSize (request side); both are 64 KiB today
+// and kept in sync by the TestMaxForwardResponseSize assertion —
+// intentional divergence would update the test at the same time.
+// The two literals are declared separately (not aliased) so a
+// tuning PR that diverges them produces a diff in both places
+// rather than silently propagating through the alias.
 const maxForwardResponseSize int64 = 64 << 10 // 64 KiB — ACK messages are typically < 1 KB
+
+// maxInternalKnockRequestSize caps the POST body /nhp/internal/knock
+// accepts, used by handleInternalKnock to trip a 413 before the HMAC
+// compute. Kept equal to maxForwardResponseSize via the test below;
+// separate literal so a future tuning PR that intentionally
+// diverges them produces an explicit test update.
+const maxInternalKnockRequestSize int64 = 64 << 10 // 64 KiB — knock-forward request envelope
 
 // SourceAPI is the Source value set by API callers (e.g., qurl-service headless resolve).
 // When set, the receiving server may forward the knock to another server if the AC
@@ -69,6 +83,14 @@ type HttpKnockForwarder struct {
 	wg         sync.WaitGroup // tracks in-flight forwards for graceful shutdown
 	emitMetric MetricCounter  // optional; nil-safe
 
+	// internalAuthSigner, when non-nil, signs outgoing /nhp/internal/knock
+	// forwards so the receiving nhp-server can verify the request came
+	// from a party holding the shared secret. Nil in legacy mode (the
+	// pre-HMAC-gate posture). Must be the same signer the verifier
+	// uses — both sides construct it from the same
+	// NHP_INTERNAL_AUTH_SECRET env var.
+	internalAuthSigner *common.InternalAuthSigner
+
 	// failedServers tracks servers that recently failed forward attempts.
 	// Key: InternalIP, Value: time of last failure.
 	// Servers are considered unhealthy for httpForwardHealthDecay after failure.
@@ -76,8 +98,12 @@ type HttpKnockForwarder struct {
 	failedServers map[string]time.Time
 }
 
-// NewHttpKnockForwarder creates a new HTTP knock forwarder.
-func NewHttpKnockForwarder(storage StorageBackend, cloudMap HealthChecker, localIP string, httpPort int, emitMetric MetricCounter) *HttpKnockForwarder {
+// NewHttpKnockForwarder creates a new HTTP knock forwarder. Pass nil
+// for internalAuthSigner in legacy mode (no internal-auth secret configured);
+// callers that want the forwarder to sign outgoing requests must
+// thread the same signer used by the incoming verifier
+// (handleInternalKnock).
+func NewHttpKnockForwarder(storage StorageBackend, cloudMap HealthChecker, localIP string, httpPort int, emitMetric MetricCounter, internalAuthSigner *common.InternalAuthSigner) *HttpKnockForwarder {
 	return &HttpKnockForwarder{
 		storage:  storage,
 		cloudMap: cloudMap,
@@ -85,9 +111,20 @@ func NewHttpKnockForwarder(storage StorageBackend, cloudMap HealthChecker, local
 		httpPort: httpPort,
 		httpClient: &http.Client{
 			Timeout: 2 * time.Second, // Per-request timeout; must be < parent context (10s) to allow retries
+			// Refuse redirects explicitly. The signature covers the
+			// original Method+URL.Path; if a redirect landed at a
+			// different URL, the Client would silently re-issue the
+			// request without re-signing and the receiver would 401.
+			// Returning ErrUseLastResponse surfaces the first
+			// response as-is so a misconfigured target produces a
+			// loud failure, not a silent stale-signature reject.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
-		emitMetric:    emitMetric,
-		failedServers: make(map[string]time.Time),
+		emitMetric:         emitMetric,
+		internalAuthSigner: internalAuthSigner,
+		failedServers:      make(map[string]time.Time),
 	}
 }
 
@@ -270,6 +307,22 @@ func (f *HttpKnockForwarder) forwardToServer(
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if f.internalAuthSigner != nil {
+		// Sign over (method, path, body) so a VPC-local attacker that
+		// intercepts the request can't swap Resource / SrcIp before it
+		// reaches the peer server. httpReq.URL.Path is the path the
+		// server will see on the other side (no query string is used
+		// on this endpoint today — if one is added, the signer must
+		// be updated on both sides to include it in the signed input).
+		//
+		// Use httpReq.Method / httpReq.URL.Path (not http.MethodPost /
+		// the url literal) so the signed input is structurally coupled
+		// to what the HTTP client will actually transmit. A future
+		// refactor that flips the NewRequestWithContext method without
+		// updating the Sign literal would otherwise produce a silent 401
+		// instead of a compile break.
+		httpReq.Header.Set(common.InternalAuthHeader, f.internalAuthSigner.Sign(httpReq.Method, httpReq.URL.Path, body))
+	}
 
 	resp, err := f.httpClient.Do(httpReq) //nolint:gosec // validated as private IP above
 	if err != nil {
