@@ -198,15 +198,27 @@ lint:
 	cd endpoints && golangci-lint run ./...
 	@echo "$(COLOUR_GREEN)[OpenNHP] Lint passed!$(END_COLOUR)"
 
-# Run the same check that CI runs for .github/workflows/**,
+# Run the same checks CI runs for .github/workflows/**,
 # .github/ISSUE_TEMPLATE/**, and CLAUDE.md's Scopes table.
+# CI splits these across two workflows:
+#   - validate-workflows.yml       → actionlint + shellcheck + scope-drift
+#   - validate-issue-templates.yml → shim to ops-routines-workflows reusable
+# `make lint-workflows` runs the equivalent of both locally.
 # Requires actionlint, shellcheck, check-jsonschema, and python3+PyYAML
 # on PATH:
-#   macOS:  brew install actionlint shellcheck && pipx install check-jsonschema
+#   macOS:  brew install actionlint shellcheck && pipx install 'check-jsonschema==0.37.1'
 #           && python3 -m pip install pyyaml
 #   Linux:  see https://github.com/rhysd/actionlint#install,
 #           your distro's shellcheck + python3-yaml packages, and
-#           `pipx install check-jsonschema` (or `pip install --user`)
+#           `pipx install 'check-jsonschema==0.37.1'` (or `pip install --user`)
+# NB: check-jsonschema version is pinned in lockstep with the reusable
+# (layervai/ops-routines-workflows validate-issue-templates.yml); the
+# script will fail loud on version mismatch. Bump alongside the reusable.
+# Bump sites (keep in sync):
+#   1. scripts/lint-issue-templates.sh  CHECK_JSONSCHEMA_VERSION
+#   2. Makefile (this block)            two `pipx install` hints above
+#   3. Makefile                         `command -v` error message below
+#   4. The reusable's default input     ops-routines-workflows .github/…
 # Fails on any finding — quote every variable, fix or explicitly
 # suppress shellcheck warnings. Matches `validate-workflows.yml` exactly
 # so "passes locally" == "passes in CI".
@@ -222,7 +234,7 @@ lint-workflows:
 		exit 1; \
 	}
 	@command -v check-jsonschema >/dev/null 2>&1 || { \
-		echo "$(COLOUR_RED)[OpenNHP] check-jsonschema not found. Install: pipx install check-jsonschema$(END_COLOUR)"; \
+		echo "$(COLOUR_RED)[OpenNHP] check-jsonschema not found. Install: pipx install 'check-jsonschema==0.37.1' (version pinned to match the ops-routines reusable)$(END_COLOUR)"; \
 		exit 1; \
 	}
 	@actionlint -color -shellcheck "$$(command -v shellcheck)" .github/workflows/*.yml

@@ -10,12 +10,31 @@
 # only `*.yml` would silently skip a contributor's `*.yaml` file — the
 # exact silent-skip class this lint is designed to catch.
 #
-# Called by both `make lint-workflows` (local) and
-# `.github/workflows/validate-workflows.yml` (CI) so the two stay in
-# lockstep by construction. Requires `check-jsonschema` on PATH.
+# LOCAL use only. CI runs the equivalent check via the
+# `layervai/ops-routines-workflows/.github/workflows/validate-issue-templates.yml`
+# reusable (shimmed from `.github/workflows/validate-issue-templates.yml`),
+# which is the canonical fleet-wide source. This script exists solely so
+# `make lint-workflows` gives fast local feedback without spinning up a
+# GitHub Actions runner. Keep the two in behavioural lockstep; bump the
+# reusable SHA in the shim when logic changes here, or vice versa.
+#
+# Drift guard: enforces the local `check-jsonschema` version matches the
+# version pinned in the reusable (see `CHECK_JSONSCHEMA_VERSION` below).
+# Bump both in lockstep with the reusable. Catches the common local↔CI
+# tool-version drift that would otherwise mask a version-sensitive fail.
+# Requires `check-jsonschema` on PATH.
 # ============================================================================
 
 set -euo pipefail
+
+# Pinned to match the reusable's `check-jsonschema-version` default at
+# layervai/ops-routines-workflows/.github/workflows/validate-issue-templates.yml.
+# Bump BOTH in lockstep. Mismatch here means a version that passes locally
+# could fail CI (or vice versa) — the drift class the shim was meant to
+# eliminate. If you bump the reusable's default, bump this, update the
+# SHA pin in `.github/workflows/validate-issue-templates.yml`, and confirm
+# in that PR's test plan.
+CHECK_JSONSCHEMA_VERSION="0.37.1"
 
 # Resolve template dir relative to this script, not CWD. A dev running
 # `bash scripts/lint-issue-templates.sh` from `scripts/` would otherwise
@@ -29,8 +48,23 @@ TEMPLATE_DIR="$REPO_ROOT/.github/ISSUE_TEMPLATE"
 # "command not found" mid-execution with no install hint.
 if ! command -v check-jsonschema >/dev/null 2>&1; then
   echo "ERROR: check-jsonschema not found on PATH." >&2
-  echo "  Install (local):  pipx install check-jsonschema" >&2
-  echo "  Install (CI):     see .github/workflows/validate-workflows.yml" >&2
+  echo "  Install (local):  pipx install 'check-jsonschema==${CHECK_JSONSCHEMA_VERSION}'" >&2
+  echo "  Install (CI):     see .github/workflows/validate-issue-templates.yml" >&2
+  exit 1
+fi
+
+# Version drift guard — see header comment. `check-jsonschema --version`
+# prints `check-jsonschema, version <x.y.z>` on stdout. Discard stderr
+# so a pipx/pip deprecation warning (which interleaves ahead of the
+# version line when `2>&1`-merged) can't corrupt $NF extraction. Pin
+# to line 1 for belt-and-suspenders in case the tool ever emits a
+# multi-line version block.
+ACTUAL_VERSION="$(check-jsonschema --version 2>/dev/null | awk 'NR==1 {print $NF; exit}')"
+if [[ "$ACTUAL_VERSION" != "$CHECK_JSONSCHEMA_VERSION" ]]; then
+  echo "ERROR: check-jsonschema version mismatch." >&2
+  echo "  Found:    $ACTUAL_VERSION" >&2
+  echo "  Required: $CHECK_JSONSCHEMA_VERSION (matches the ops-routines reusable)" >&2
+  echo "  Fix:      pipx install --force 'check-jsonschema==${CHECK_JSONSCHEMA_VERSION}'" >&2
   exit 1
 fi
 
