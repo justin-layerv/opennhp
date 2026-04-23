@@ -667,6 +667,23 @@ AC_SECRET_NAME="${name_prefix}-ac-$INSTANCE_ID"
 
 echo "Checking for existing AC keypair in Secrets Manager..."
 
+# SECURITY: same xtrace-leak class as the SERVER_SECRET / QURL_SERVICE_TOKEN
+# blocks below. Under `set -x` the assignment `EXISTING_SECRET=$(aws …)`
+# traces `+ EXISTING_SECRET='{"privateKey":"…"}'` (bash expands captured
+# stdout into the assignment's trace line). The downstream
+# `echo "$EXISTING_SECRET" | python3 …`, `echo "$KEYPAIR" | python3 …`,
+# `SECRET_VALUE=$(cat << … SECRETEOF)`, and
+# `aws secretsmanager create-secret --secret-string "$SECRET_VALUE"` all
+# emit the AC's X25519 private key into user-data.log → CloudWatch.
+# Bracket the whole fetch/generate/store block with `set +x` / `set -x`.
+# Scrub intermediates afterwards; `$PRIVATE_KEY` is only consumed by the
+# config.toml heredoc below, which is safe (bash does not xtrace heredoc
+# bodies), so we leave it set and `unset` it immediately after the
+# heredoc writes. Heredoc-safety applies to here-*documents* (`<<`) only;
+# here-strings (`<<<`) *are* traced with expansion, so any future edit
+# switching to `<<<` would need its own `set +x` bracket.
+set +x
+
 # Try to get existing secret for this instance
 EXISTING_SECRET=$(aws secretsmanager get-secret-value --secret-id "$AC_SECRET_NAME" --region "$REGION" --query SecretString --output text 2>/dev/null || echo "")
 
@@ -738,14 +755,26 @@ SECRETEOF
     --region "$REGION" 2>/dev/null; then
     echo "Created new secret: $AC_SECRET_NAME"
   else
-    # Secret might already exist (from previous failed boot), update it
+    # Secret might already exist (from previous failed boot), update it.
+    # Fail-fast re-enables `set -x` so the FATAL trace hits user-data.log
+    # with xtrace on (matches the SERVER_SECRET / QURL_SERVICE_TOKEN
+    # failure-path pattern for uniform on-call observability).
     aws secretsmanager put-secret-value \
       --secret-id "$AC_SECRET_NAME" \
       --secret-string "$SECRET_VALUE" \
-      --region "$REGION"
+      --region "$REGION" || {
+        set -x
+        echo "FATAL: Failed to put-secret-value for $AC_SECRET_NAME"
+        exit 1
+    }
     echo "Updated existing secret: $AC_SECRET_NAME"
   fi
 fi
+# $KEYPAIR and $SECRET_VALUE only exist on the generate-new branch;
+# `unset` is a no-op for variables that were never set, so the single
+# call handles both branches safely.
+unset EXISTING_SECRET KEYPAIR SECRET_VALUE
+set -x
 
 echo "AC keypair ready (public key: $${PUBLIC_KEY:0:20}...)"
 
@@ -754,8 +783,25 @@ echo "AC keypair ready (public key: $${PUBLIC_KEY:0:20}...)"
 # Required for AC to communicate with NHP servers via cloud registration
 # ============================================================================
 echo "Fetching NHP Server public key from Secrets Manager..."
-SERVER_SECRET=$(aws secretsmanager get-secret-value --secret-id "${server_secret_arn}" --region "$REGION" --query SecretString --output text)
+# SECURITY: this script runs under `set -ex`; the top-level `exec` redirect
+# ships stderr (including xtrace) to user-data.log → CloudWatch Logs (30 day
+# sandbox / 365 day prod retention; see the `retention_in_days` ternary in
+# modules/ac/main.tf). Under `set -x` the `SERVER_SECRET=$(aws …)` assignment
+# traces `+ SERVER_SECRET='{"privateKey":"…"}'` (bash expands the captured
+# stdout into the assignment's trace line), and the `echo "$SERVER_SECRET" |
+# python3 …` pipeline below traces the same JSON again. Bracket fetch +
+# extract with `set +x` / `set -x`, and scrub the private half after extract
+# as defence-in-depth. (See the AC keypair block comment above for the
+# `<<<` here-string future-regression trap — same invariant applies here.)
+set +x
+SERVER_SECRET=$(aws secretsmanager get-secret-value --secret-id "${server_secret_arn}" --region "$REGION" --query SecretString --output text) || {
+  set -x
+  echo "FATAL: Could not fetch server secret from Secrets Manager"
+  exit 1
+}
 SERVER_PUBLIC_KEY=$(echo "$SERVER_SECRET" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('publicKey', d.get('PubKeyBase64', '')))" 2>/dev/null || echo "")
+unset SERVER_SECRET
+set -x
 if [ -z "$SERVER_PUBLIC_KEY" ]; then
   echo "FATAL: Could not extract server public key from secret"
   exit 1
@@ -789,6 +835,12 @@ LicenseKey = "${license_key}"
 ServerEndpoint = "${server_endpoint}"
 ServerPubKeyBase64 = "$SERVER_PUBLIC_KEY"
 CONFIGEOF
+# Scrub $PRIVATE_KEY now that it's landed in config.toml — it has no further
+# consumer in this script, and unsetting it prevents any future downstream
+# edit (e.g. a `<<<` here-string or a `--key "$PRIVATE_KEY"` invocation,
+# neither of which are heredoc-trace-safe) from silently reintroducing the
+# xtrace-leak class this PR closes.
+unset PRIVATE_KEY
 echo "NHP-ACD config.toml created (cloud mode)"
 
 # HTTP server config for NHP-ACD
@@ -809,17 +861,27 @@ echo "NHP-ACD HTTP config created"
 %{ if qurl_router_enabled && qurl_service_token_secret_arn != null ~}
 echo "Fetching QURL service token from Secrets Manager..."
 # Use timeout to prevent hanging if Secrets Manager is unreachable (30s is sufficient for retries)
+# SECURITY: xtrace-leak guard — see SERVER_SECRET block above (and the AC
+# keypair block further above for the `<<<` here-string trap). The
+# `[ -z "$QURL_SERVICE_TOKEN" ]` test would otherwise trace the token value.
+# The token is later materialised into Traefik's dynamic config via a
+# heredoc; bash does not xtrace heredoc bodies, so that line stays safe
+# under the re-enabled `set -x`.
+set +x
 QURL_SERVICE_TOKEN=$(timeout 30 aws secretsmanager get-secret-value \
   --secret-id "${qurl_service_token_secret_arn}" \
   --region "$REGION" \
   --query SecretString --output text) || {
+    set -x
     echo "ERROR: Failed to fetch QURL service token from Secrets Manager (timeout or auth failure)"
     exit 1
 }
 if [ -z "$QURL_SERVICE_TOKEN" ]; then
+  set -x
   echo "ERROR: QURL service token is empty"
   exit 1
 fi
+set -x
 echo "QURL service token retrieved successfully"
 %{ endif ~}
 
