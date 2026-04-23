@@ -33,6 +33,21 @@ updates:
       - "dependencies"
       - "go"
 
+  # Go modules - tests/local
+  # Separate module (testcontainers-go + etcd client) with its own indirect
+  # graph. Without coverage here, supply-chain CVEs on anything transitively
+  # pulled in by testcontainers-go land silently — which is how docker/docker
+  # CVE-2026-34040 / -33997 got here without a PR.
+  - package-ecosystem: "gomod"
+    directory: "/tests/local"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "go"
+
   # GitHub Actions
   - package-ecosystem: "github-actions"
     directory: "/"

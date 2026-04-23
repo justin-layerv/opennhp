@@ -45,12 +45,14 @@ jobs:
             nhp/go.sum
             endpoints/go.sum
             examples/server_plugin/go.sum
+            tests/local/go.sum
 
       - name: Run go mod tidy on all modules
         run: |
           cd "$GITHUB_WORKSPACE/nhp" && go mod tidy
           cd "$GITHUB_WORKSPACE/endpoints" && go mod tidy
           cd "$GITHUB_WORKSPACE/examples/server_plugin" && go mod tidy
+          cd "$GITHUB_WORKSPACE/tests/local" && go mod tidy
 
       - name: Check for changes
         id: changes

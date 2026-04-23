@@ -66,7 +66,7 @@ tests/               # local/, integration/, e2e/
 release/             # Build output (gitignored)
 ```
 
-**Multi-Module Workspace:** Three Go modules with `replace` directives pointing to local paths. Always run `go mod tidy` in all three when updating dependencies.
+**Multi-Module Workspace:** Four Go modules — `nhp/`, `endpoints/`, `examples/server_plugin/`, `tests/local/`. The first three are wired with `replace` directives pointing to local paths. Always run `go mod tidy` in all four when updating dependencies; `make init` does this. Other Go modules (`tests/e2e/`, `tests/integration/`, `tests/smoke/`, `docker/web-app/`) have their own lifecycle and aren't auto-tidied — tracked in #1290.
 
 **Related Repos:** `console` (UI/API), `website` (layerv.ai), `traefik-plugins` (middleware)
 

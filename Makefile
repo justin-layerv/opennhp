@@ -96,6 +96,7 @@ init:
 	cd nhp && go mod tidy
 	cd endpoints && go mod tidy
 	cd examples/server_plugin && go mod tidy
+	cd tests/local && go mod tidy
 
 agentd:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building nhp-agent... $(END_COLOUR)"
