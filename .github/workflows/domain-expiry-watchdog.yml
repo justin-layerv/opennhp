@@ -1,0 +1,329 @@
+name: Domain Expiry Watchdog
+
+# Weekly WHOIS sweep of every LayerV-owned domain. Catches the failure mode
+# from nhp#1147 (layerv.xyz + layerv.org expiring ~same day under
+# clientRenewProhibited, no one noticed) before the next occurrence.
+#
+# Fires:
+#   - expiry < 60 days on any domain
+#   - expiry < 90 days on any domain flagged clientRenewProhibited (manual-
+#     renewal registrar setting, the common cause of missed renewals)
+#
+# On fire, opens a tracking issue (title-dedup'd) and edits its body with
+# the current status table on each subsequent fire. Comments are reserved
+# for meaningful status changes — new domain in firing list or warn→critical
+# escalation — so the issue isn't drowned in "same 4 domains, week 12" noise.
+
+on:
+  schedule:
+    # Mondays 12:00 UTC — same slot other fleet watchdogs use.
+    - cron: "0 12 * * 1"
+  workflow_dispatch:
+
+# Serialize cron + manual dispatches so two runs can't race on issues.create.
+concurrency:
+  group: domain-expiry-watchdog
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: WHOIS sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      # `whois` ships pre-installed on ubuntu-latest; no install step
+      # needed. If the runner image ever drops it, the `whois` calls
+      # below produce empty output (their non-zero exit is swallowed by
+      # the retry helper), which flows into the parse-error branch — a
+      # row of `error` rendered in the tracker, plus an empty-bodied
+      # entry in GITHUB_STEP_SUMMARY pointing the on-call at this comment.
+      - name: Scan
+        id: scan
+        # Report format is one tab-delimited line per domain:
+        #   status<TAB>domain<TAB>expiry-date<TAB>days-remaining<TAB>client-renew-prohibited
+        # status in {ok, warn, critical, error}. "warn" is expiring < 90d with
+        # clientRenewProhibited; "critical" is expiring < 60d regardless.
+        # Tab delimiter (not pipe) because WHOIS content occasionally includes
+        # `|` in free-text fields — a tab is less likely to appear and sidesteps
+        # `split()` mis-counting fields in the github-script step.
+        run: |
+          set -euo pipefail
+
+          DOMAINS=(
+            layerv.ai
+            layerv.xyz
+            layerv.org
+            qurl.link
+            qurl.site
+          )
+
+          # Single retry with a 10 s backoff so a transient WHOIS rate-limit
+          # doesn't fire `error` and spam the tracking issue. Real rate limits
+          # usually clear within seconds; persistent failures still surface.
+          run_whois() {
+            local out
+            out=$(whois "$1" 2>/dev/null || true)
+            if [ -z "$out" ]; then
+              sleep 10
+              out=$(whois "$1" 2>/dev/null || true)
+            fi
+            printf '%s\n' "$out"
+          }
+
+          fire=0
+          report=""
+          today_epoch=$(date -u +%s)
+
+          for d in "${DOMAINS[@]}"; do
+            whois_out=$(run_whois "$d")
+            # Capture the value after the FIRST ": " — an ISO 8601 timestamp
+            # like `2026-05-15T22:52:24Z` contains its own colons, so a
+            # greedy `.*:` would strip everything up to the last one.
+            # Strip any tab so the delimiter can't collide with WHOIS content.
+            # `|| true` lives INSIDE the substitution so pipefail propagation
+            # from grep / head / sed is contained locally rather than leaking
+            # to the outer script.
+            #
+            # Prefer `Registry Expiry Date` (the authoritative, registry-
+            # level expiry present on modern gTLDs + .ai) and fall back to
+            # the registrar-level / legacy field names only if absent.
+            # Thick-WHOIS ccTLDs sometimes emit both and the first line
+            # isn't always the authoritative one.
+            expiry=""
+            for pattern in 'Registry Expiry Date' 'Registrar Registration Expiration Date' 'Expiration Date'; do
+              expiry=$({ printf '%s\n' "$whois_out" \
+                | grep -iE "^[[:space:]]*${pattern}:" \
+                | head -n1 \
+                | sed -E 's/^[^:]+: *//' \
+                | tr -d '\r\t'; } || true)
+              [ -n "$expiry" ] && break
+            done
+            if [ -z "$expiry" ]; then
+              report+="error"$'\t'"${d}"$'\t'"unknown"$'\t'"-"$'\t'"unknown"$'\n'
+              fire=1
+              # Surface the raw WHOIS output in the run summary so an
+              # operator clicking through from the tracker has enough to
+              # diagnose without re-running whois locally.
+              {
+                echo "## WHOIS parse error: \`${d}\`"
+                echo
+                echo '```'
+                printf '%s\n' "$whois_out" | head -n 60
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            expiry_epoch=$(date -u -d "$expiry" +%s 2>/dev/null || echo 0)
+            if [ "$expiry_epoch" -eq 0 ]; then
+              report+="error"$'\t'"${d}"$'\t'"unparsed:${expiry}"$'\t'"-"$'\t'"unknown"$'\n'
+              fire=1
+              {
+                echo "## WHOIS parse error: \`${d}\` (unparseable expiry \`${expiry}\`)"
+                echo
+                echo '```'
+                printf '%s\n' "$whois_out" | head -n 60
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            # Integer truncation: a domain 59.9 days out reports as 59,
+            # but 60.5 days out reports as 60 and won't fire `critical`.
+            # Effective threshold is therefore "expiry < 61 wall-clock
+            # days" — one day wider than the advertised `< 60`. Close
+            # enough; widening the comparison to `-le 60` would nudge
+            # the other direction and isn't worth the off-by-one flip.
+            days=$(( (expiry_epoch - today_epoch) / 86400 ))
+            client_renew_prohibited=false
+            if printf '%s\n' "$whois_out" | grep -qi 'clientRenewProhibited'; then
+              client_renew_prohibited=true
+            fi
+            status=ok
+            if [ "$days" -lt 60 ]; then
+              status=critical
+              fire=1
+            elif [ "$client_renew_prohibited" = true ] && [ "$days" -lt 90 ]; then
+              status=warn
+              fire=1
+            fi
+            report+="${status}"$'\t'"${d}"$'\t'"${expiry}"$'\t'"${days}"$'\t'"${client_renew_prohibited}"$'\n'
+          done
+
+          printf '%s' "$report"
+          delim="REPORT_$(openssl rand -hex 16)"
+          {
+            echo "report<<$delim"
+            printf '%s' "$report"
+            echo "$delim"
+          } >> "$GITHUB_OUTPUT"
+          echo "fire=$fire" >> "$GITHUB_OUTPUT"
+
+      - name: Open / update / close tracking issue
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        env:
+          FIRE: ${{ steps.scan.outputs.fire }}
+          REPORT: ${{ steps.scan.outputs.report }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const title = 'Domain expiry watchdog: domain(s) need attention';
+            const { owner, repo } = context.repo;
+
+            // Find the existing tracker — used by both the firing
+            // path (update body) and the clean path (auto-close).
+            //
+            // Use the search API rather than paginating every issue in the
+            // repo (1200+ items on `nhp` already). `in:title` is exact enough
+            // for our single-title case; we still post-filter on an exact
+            // title match to defend against partial matches. Search is
+            // eventually consistent (~a few seconds of index lag) which is
+            // fine for a weekly cron.
+            const { data: search } = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${owner}/${repo} is:issue in:title "${title}"`,
+              per_page: 10,
+            });
+            const match = search.items.find(i => i.title === title);
+
+            // Clean-run path: if nothing is firing this run, close any
+            // OPEN tracker with a confirmation comment. Without this
+            // the issue stays open indefinitely after a renewal and the
+            // next on-call can't tell renewal-completed from still-firing.
+            // If the tracker is already closed, no-op.
+            if (process.env.FIRE !== '1') {
+              if (match && match.state === 'open') {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: match.number,
+                  body: `All domains returned to OK on ${new Date().toISOString()}. Auto-closing. Run: ${process.env.RUN_URL}`,
+                });
+                await github.rest.issues.update({
+                  owner, repo, issue_number: match.number, state: 'closed',
+                });
+              }
+              return;
+            }
+
+            const firing = (process.env.REPORT || '').trim().split('\n')
+              .map(line => {
+                const [status, domain, expiry, daysRaw, flag] = line.split('\t');
+                return { status, domain, expiry, days: daysRaw, flag };
+              })
+              .filter(r => r.status && r.status !== 'ok');
+
+            // Belt-and-suspenders: `FIRE=1` from bash should always match a
+            // non-empty firing array. If they ever drift (bash change landing
+            // without the JS-side filter updated), fail safe rather than
+            // opening a tracker with a "one or more domains" preamble and
+            // zero rows.
+            if (firing.length === 0) {
+              core.warning('FIRE=1 but no firing rows parsed — skipping.');
+              return;
+            }
+
+            // Stable key used to detect meaningful state changes. Order by
+            // domain so reordering in the source list doesn't look like a
+            // change. `days` is deliberately excluded — counting down day
+            // by day is NOT the kind of change worth a re-ping; only a
+            // new domain in the firing list or a warn→critical escalation is.
+            const stateKey = JSON.stringify(
+              firing
+                .slice()
+                .sort((a, b) => a.domain.localeCompare(b.domain))
+                .map(r => `${r.domain}:${r.status}:${r.flag}`)
+            );
+
+            const daysCell = d => {
+              const n = parseInt(d, 10);
+              if (!Number.isFinite(n)) return d;
+              return n < 0 ? `EXPIRED (${n})` : String(n);
+            };
+            const rows = firing.map(r => {
+              const icon = r.status === 'critical' ? ':rotating_light:' :
+                           r.status === 'warn' ? ':warning:' :
+                           r.status === 'error' ? ':question:' : ':white_check_mark:';
+              const flagCell = r.flag === 'true' ? 'yes' :
+                               r.flag === 'false' ? 'no' : r.flag;
+              // Always backtick-wrap the expiry cell — the value is WHOIS
+              // output and we don't want a locale-format date (or any future
+              // registrar schema change) to render as table pipes / HTML /
+              // other markdown regardless of row status.
+              return `| ${icon} ${r.status} | \`${r.domain}\` | \`${r.expiry}\` | ${daysCell(r.days)} | ${flagCell} |`;
+            });
+
+            // State marker embedded in the body so the next run can compare
+            // without re-parsing the markdown table. HTML comment keeps it
+            // invisible to human readers. The body is only rewritten when
+            // stateKey changes, so edit history stays useful as an audit
+            // trail instead of being padded with 52 noise edits/year;
+            // run-specific context (URL, timestamp) lives in the
+            // state-change comment only.
+            //
+            // Subtle: a registrar REMOVING `clientRenewProhibited` while
+            // a domain is in the 60-90d window causes a warn row to silently
+            // transition to ok and disappear from the table. The stateKey
+            // flips (flag changed), which fires a "State changed" comment —
+            // the disappearance has provenance even without a narrative.
+            const markerOpen = '<!-- watchdog:state ';
+            const markerClose = ' -->';
+            const body = [
+              `${markerOpen}${stateKey}${markerClose}`,
+              'Weekly WHOIS sweep flagged one or more LayerV-owned domains.',
+              '',
+              '| status | domain | expiry (UTC) | days remaining | clientRenewProhibited |',
+              '| --- | --- | --- | --- | --- |',
+              ...rows,
+              '',
+              'Thresholds:',
+              '- `critical` — expiry < 60 days.',
+              '- `warn` — expiry < 90 days AND `clientRenewProhibited` is set (manual-renewal registrar setting).',
+              '- `error` — WHOIS response unparseable (registrar blocked / rate-limited / schema changed). A single retry with backoff runs inside the scan, so transient rate-limits are already absorbed; a persistent `error` row needs a human look.',
+              '',
+              'Renewal runbook: https://github.com/layervai/ops-routines/blob/main/runbooks/domain-renewal.md',
+              '',
+              '> Do not rename this issue — the watchdog uses the title as the dedup key. A renamed title spawns a duplicate on the next fire.',
+            ].join('\n');
+
+            if (!match) {
+              // No prior tracker — create one.
+              await github.rest.issues.create({
+                owner, repo, title, body,
+                labels: ['type: security', 'area: terraform', 'priority: high'],
+              });
+              return;
+            }
+
+            // Compare prior stateKey against the new one. Only touch the
+            // body + post a comment on a meaningful change; otherwise the
+            // weekly run is a silent confirmation-of-still-firing that
+            // doesn't pollute the issue's audit trail.
+            const priorMarker = (match.body || '').match(
+              /<!-- watchdog:state (.*?) -->/
+            );
+            const priorStateKey = priorMarker ? priorMarker[1] : null;
+            const wasClosed = match.state === 'closed';
+            const stateChanged = priorStateKey !== stateKey;
+
+            if (wasClosed || stateChanged) {
+              await github.rest.issues.update({
+                owner, repo, issue_number: match.number,
+                body,
+                // Re-open if the tracker was manually closed while a domain
+                // is still firing — avoids spawning a duplicate tracker.
+                ...(wasClosed ? { state: 'open' } : {}),
+              });
+            }
+            if (wasClosed) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: match.number,
+                body: `Re-opened: watchdog fired again while this tracker was closed. See body for current table. Run: ${process.env.RUN_URL}`,
+              });
+            } else if (stateChanged) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: match.number,
+                body: `State changed since last run. See issue body for the current table. Run: ${process.env.RUN_URL}`,
+              });
+            }
