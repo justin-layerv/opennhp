@@ -5,10 +5,18 @@ on:
     branches: [ "main" ]
     paths:
       - ".github/workflows/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - "CLAUDE.md"
+      - "scripts/check-scope-drift.sh"
+      - "tests/scripts/**"
   pull_request:
     branches: [ "main" ]
     paths:
       - ".github/workflows/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - "CLAUDE.md"
+      - "scripts/check-scope-drift.sh"
+      - "tests/scripts/**"
 
 # Restrict default permissions for security
 permissions:
@@ -54,3 +62,27 @@ jobs:
       - name: Run actionlint with shellcheck
         run: |
           actionlint -color -shellcheck "$(command -v shellcheck)" .github/workflows/*.yml
+
+      # PyYAML is preinstalled on ubuntu-latest today, but runner images
+      # are a moving target — be explicit rather than rely on the default.
+      # `python3 -m pip` so the invocation is unambiguous regardless of
+      # which `pip` shim happens to be first on PATH.
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet pyyaml
+
+      # Run the fixture tests BEFORE the real check. If the extractors
+      # regress in a way that happens to parse both real files to a
+      # matching empty set, the real check would pass false-positive
+      # green. Running the fixture tests first catches parser
+      # regressions against known inputs before the real inputs run.
+      - name: Test check-scope-drift.sh
+        run: bash tests/scripts/check-scope-drift_test.sh
+
+      # Prevent drift between the Component dropdown in the bug-report
+      # form and the Scopes table in CLAUDE.md. The bug form tells
+      # reporters which component to pick; CLAUDE.md is the source of
+      # truth for valid commit scopes. If they disagree, either the
+      # form offers a scope that won't pass commit-convention
+      # enforcement, or CLAUDE.md lists a scope reporters can't pick.
+      - name: Check scope drift (bug form ↔ CLAUDE.md)
+        run: bash scripts/check-scope-drift.sh

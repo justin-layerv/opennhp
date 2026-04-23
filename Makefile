@@ -218,6 +218,8 @@ lint-workflows:
 		exit 1; \
 	}
 	actionlint -color -shellcheck "$$(command -v shellcheck)" .github/workflows/*.yml
+	@bash tests/scripts/check-scope-drift_test.sh
+	@bash scripts/check-scope-drift.sh
 	@echo "$(COLOUR_GREEN)[OpenNHP] Workflow lint passed!$(END_COLOUR)"
 
 test:

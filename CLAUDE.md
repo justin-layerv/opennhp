@@ -132,6 +132,12 @@ BREAKING CHANGE: JWT tokens now require audience claim
 | `docker` | Container configuration |
 | `ci` | GitHub Actions workflows |
 
+> Keep this table in lockstep with the Component dropdown in
+> `.github/ISSUE_TEMPLATE/bug_report.yml`. Drift is enforced at CI by
+> `scripts/check-scope-drift.sh` (invoked from `make lint-workflows` and
+> `.github/workflows/validate-workflows.yml`); add a new scope to both
+> places in the same PR.
+
 ### Examples
 
 ```bash
