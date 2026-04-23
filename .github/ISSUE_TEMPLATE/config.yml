@@ -1,5 +1,19 @@
-blank_issues_enabled: true
+# `blank_issues_enabled: false` forces reporters through the bug-report
+# or feature-request forms, which carry a required Priority dropdown.
+# Blank issues would bypass that and land in the priority-enforcement
+# workflow's fail path. Better to prevent the state than surface it.
+blank_issues_enabled: false
 contact_links:
+  # Fork-specific security issues (endpoints/, terraform/, deploy
+  # pipeline, console integration) must disclose to layerv — the
+  # upstream OpenNHP team can't ship a patch to consumers of this
+  # fork. Upstream protocol-level issues are the second entry below.
+  - name: Report a fork-specific security vulnerability (layerv)
+    url: https://github.com/layervai/nhp/security/advisories/new
+    about: Do NOT open a public bug report for security issues in layerv-specific code (endpoints/, terraform/, deploy, console). Private disclosure via layerv GHSA.
+  - name: Report an upstream OpenNHP protocol-level vulnerability
+    url: https://github.com/OpenNHP/opennhp/security/advisories/new
+    about: Issues in the core NHP protocol / upstream code go to the OpenNHP maintainers. See SECURITY.md.
   - name: Documentation
     url: https://opennhp.org/docs
     about: Check the documentation before opening an issue

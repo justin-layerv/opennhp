@@ -2,11 +2,17 @@
 
 ## Reporting Security Issues
 
-The OpenNHP team and community take security bugs in OpenNHP seriously. We appreciate your efforts to responsibly disclose your findings, and will make every effort to acknowledge your contributions.
+This repository is a fork of [OpenNHP](https://github.com/OpenNHP/opennhp) maintained by layerv.ai. Route disclosures by scope:
 
-To report a security issue, please use the GitHub Security Advisory ["Report a Vulnerability"](https://github.com/opennhp/opennhp/security/advisories/new) tab.
+### Fork-specific issues
 
-The OpenNHP team will send a response indicating the next steps in handling your report. After the initial reply to your report, the security team will keep you informed of the progress towards a fix and full announcement, and may ask for additional information or guidance.
+Vulnerabilities in code that is unique to this fork — anything under `endpoints/`, `terraform/`, deploy workflows, plugin code, or console integration — disclose privately via the layerv GHSA tab: <https://github.com/layervai/nhp/security/advisories/new>. The layerv team can ship a patch directly to consumers of this fork.
+
+### Upstream OpenNHP issues
+
+Vulnerabilities in the core NHP protocol or upstream shared code disclose to the upstream OpenNHP maintainers: <https://github.com/OpenNHP/opennhp/security/advisories/new>. When in doubt (e.g., the vuln touches both layerv-specific and upstream code), file both — the layerv team will coordinate.
+
+The respective security team (layerv or OpenNHP, based on routing above) will send a response indicating the next steps in handling your report and keep you informed of progress toward a fix and full announcement.
 
 Report security bugs in third-party modules to the person or team maintaining the module.
 

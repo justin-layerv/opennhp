@@ -1,0 +1,110 @@
+name: Bug Report
+description: Report a bug to help us improve. Do NOT use this for security vulnerabilities — see SECURITY.md.
+title: "[BUG] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **Security vulnerabilities: stop.** Fork-specific issues (anything under `endpoints/`, `terraform/`, the deploy pipeline, or console integration) → [layerv GHSA](https://github.com/layervai/nhp/security/advisories/new). Upstream protocol-level issues → [OpenNHP GHSA](https://github.com/OpenNHP/opennhp/security/advisories/new). See `SECURITY.md`.
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: |
+        - **critical** — production outage potential, data loss risk, live-customer breakage
+        - **high** — significant user impact, blocker for other work, correctness bug in shipped feature
+        - **medium** — standard bug, non-urgent
+        - **low** — polish, minor fix, tech debt
+      options:
+        - critical
+        - high
+        - medium
+        - low
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear description of the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      # This list MUST stay in lockstep with the Scopes table in
+      # CLAUDE.md, EXCEPT for `other` — that's a reporter-UX escape
+      # hatch (not a valid commit scope). Adding a new scope? Update
+      # both places in the same PR so triagers and commit-convention
+      # enforcement don't drift. Don't propagate `other` to CLAUDE.md.
+      description: Match one of the commit scopes in CLAUDE.md (or pick `other` for cross-cutting). Keeps downstream triage scriptable.
+      options:
+        - agent
+        - server
+        - ac
+        - db
+        - nhp
+        - terraform
+        - docker
+        - ci
+        - other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Release tag or commit SHA
+      description: The layerv/nhp release you're on, or the upstream OpenNHP tag, or a raw commit SHA from a sandbox/prod deploy.
+      placeholder: e.g. v0.6.0, OpenNHP v0.6.0, or commit abcd1234
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: e.g. Ubuntu 22.04, macOS 14
+  - type: input
+    id: go_version
+    attributes:
+      label: Go version
+      description: Only needed if the bug is build- or runtime-related.
+      placeholder: e.g. 1.24
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        AC (native binary): `/opt/layerv/nhp-ac/logs/ac-YYYY-MM-DD.log`.
+        Server (Docker): `docker exec nhp-server cat /nhp-server/logs/server-YYYY-MM-DD.log`.
+        See "Quick Debugging → Logs" in CLAUDE.md.
+      # No `render:` — `render: shell` shell-highlights content, which
+      # miscolors Go stack traces and JSON-structured log lines.
+      # Monospace plain-text is the sane default.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
