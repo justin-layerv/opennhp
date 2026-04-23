@@ -31,18 +31,30 @@ permissions:
 jobs:
   scan:
     name: WHOIS sweep
-    runs-on: ubuntu-latest
+    # Pin the image explicitly. `ubuntu-latest` is how the whois-dropped-
+    # from-preinstall regression landed: GitHub rolled the alias to 24.04
+    # and our implicit dependency on the 22.04 package set broke silently.
+    # Pinning makes the next image bump a reviewed PR.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
       issues: write
     steps:
-      # `whois` ships pre-installed on ubuntu-latest; no install step
-      # needed. If the runner image ever drops it, the `whois` calls
-      # below produce empty output (their non-zero exit is swallowed by
-      # the retry helper), which flows into the parse-error branch — a
-      # row of `error` rendered in the tracker, plus an empty-bodied
-      # entry in GITHUB_STEP_SUMMARY pointing the on-call at this comment.
+      # `whois` is NOT in the ubuntu-24.04 runner image (was in
+      # ubuntu-22.04). Without this install, every domain reports
+      # `error` and the tracker fills with false positives — which
+      # is exactly what the first post-merge dispatch did. Install
+      # explicitly so the behavior doesn't depend on runner-image
+      # drift. Quiet + no-install-recommends to keep the step log
+      # clean and skip the suggested Debian extras.
+      - name: Install whois
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends whois
+          command -v whois >/dev/null || { echo "whois missing after install — apt layout changed?"; exit 1; }
+
       - name: Scan
         id: scan
         # Report format is one tab-delimited line per domain:
