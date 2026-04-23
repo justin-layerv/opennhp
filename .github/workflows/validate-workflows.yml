@@ -8,6 +8,7 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
       - "CLAUDE.md"
       - "scripts/check-scope-drift.sh"
+      - "scripts/lint-issue-templates.sh"
       - "tests/scripts/**"
   pull_request:
     branches: [ "main" ]
@@ -16,6 +17,7 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
       - "CLAUDE.md"
       - "scripts/check-scope-drift.sh"
+      - "scripts/lint-issue-templates.sh"
       - "tests/scripts/**"
 
 # Restrict default permissions for security
@@ -63,15 +65,42 @@ jobs:
         run: |
           actionlint -color -shellcheck "$(command -v shellcheck)" .github/workflows/*.yml
 
-      # PyYAML is preinstalled on ubuntu-latest today, but runner images
-      # are a moving target — be explicit rather than rely on the default.
-      # `python3 -m pip` so the invocation is unambiguous regardless of
-      # which `pip` shim happens to be first on PATH.
-      - name: Install PyYAML
-        run: python3 -m pip install --quiet pyyaml
+      # Pin Python so transitive-dep resolution for check-jsonschema + PyYAML
+      # is reproducible independent of the runner image's default Python.
+      # Both the issue-form schema check (#1302) and the scope-drift check
+      # (#1303) need Python; single setup step feeds both.
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
 
-      # Run the fixture tests BEFORE the real check. If the extractors
-      # regress in a way that happens to parse both real files to a
+      # check-jsonschema for the issue-form schema validation below.
+      # PyYAML for the scope-drift extractor (scripts/check-scope-drift.sh).
+      # Pinned \`check-jsonschema\` so bumps are intentional.
+      - name: Install Python dependencies
+        env:
+          CHECK_JSONSCHEMA_VERSION: "0.37.1"
+        run: |
+          set -euo pipefail
+          python3 -m pip --version
+          python3 -m pip install --no-cache-dir \
+            "check-jsonschema==${CHECK_JSONSCHEMA_VERSION}" \
+            pyyaml
+          check-jsonschema --version
+
+      # Issue forms use a schema distinct from GitHub Actions workflows, so
+      # actionlint can't validate them. A malformed form silently falls
+      # back to the blank-issue path — and blank_issues_enabled: false
+      # means a rendering regression would hide issue creation entirely
+      # until a human reported the breakage externally.
+      # scripts/lint-issue-templates.sh dispatches forms vs config to
+      # the right built-in schema; same script `make lint-workflows`
+      # runs locally so CI and local stay in lockstep.
+      - name: Validate issue templates
+        run: bash scripts/lint-issue-templates.sh
+
+      # Run the scope-drift fixture tests BEFORE the real check. If the
+      # extractors regress in a way that parses both real files to a
       # matching empty set, the real check would pass false-positive
       # green. Running the fixture tests first catches parser
       # regressions against known inputs before the real inputs run.

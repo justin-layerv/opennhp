@@ -198,11 +198,15 @@ lint:
 	cd endpoints && golangci-lint run ./...
 	@echo "$(COLOUR_GREEN)[OpenNHP] Lint passed!$(END_COLOUR)"
 
-# Run the same check that CI runs for .github/workflows/**. Requires
-# actionlint and shellcheck on PATH:
-#   macOS:  brew install actionlint shellcheck
-#   Linux:  see https://github.com/rhysd/actionlint#install and
-#           your distro's shellcheck package (e.g. apt install shellcheck)
+# Run the same check that CI runs for .github/workflows/**,
+# .github/ISSUE_TEMPLATE/**, and CLAUDE.md's Scopes table.
+# Requires actionlint, shellcheck, check-jsonschema, and python3+PyYAML
+# on PATH:
+#   macOS:  brew install actionlint shellcheck && pipx install check-jsonschema
+#           && python3 -m pip install pyyaml
+#   Linux:  see https://github.com/rhysd/actionlint#install,
+#           your distro's shellcheck + python3-yaml packages, and
+#           `pipx install check-jsonschema` (or `pip install --user`)
 # Fails on any finding — quote every variable, fix or explicitly
 # suppress shellcheck warnings. Matches `validate-workflows.yml` exactly
 # so "passes locally" == "passes in CI".
@@ -217,7 +221,12 @@ lint-workflows:
 		echo "$(COLOUR_RED)[OpenNHP] shellcheck not found. Install: brew install shellcheck (macOS) or apt install shellcheck (Debian/Ubuntu)$(END_COLOUR)"; \
 		exit 1; \
 	}
-	actionlint -color -shellcheck "$$(command -v shellcheck)" .github/workflows/*.yml
+	@command -v check-jsonschema >/dev/null 2>&1 || { \
+		echo "$(COLOUR_RED)[OpenNHP] check-jsonschema not found. Install: pipx install check-jsonschema$(END_COLOUR)"; \
+		exit 1; \
+	}
+	@actionlint -color -shellcheck "$$(command -v shellcheck)" .github/workflows/*.yml
+	@bash scripts/lint-issue-templates.sh
 	@bash tests/scripts/check-scope-drift_test.sh
 	@bash scripts/check-scope-drift.sh
 	@echo "$(COLOUR_GREEN)[OpenNHP] Workflow lint passed!$(END_COLOUR)"
