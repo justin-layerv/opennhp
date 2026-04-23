@@ -137,7 +137,7 @@ variable "guardduty_alert_emails" {
 }
 
 variable "guardduty_alert_severity_threshold" {
-  description = "Minimum severity for GuardDuty alerts (1-8, where 7+ is High, 4-6.9 is Medium)"
+  description = "Minimum severity for GuardDuty alerts (1-8, where 7+ is High, 4-6.9 is Medium). Shared with the stale-finding watchdog (#1137) — raising this silences the initial alert AND the re-alert, so tune with both in mind."
   type        = number
   default     = 4 # Medium and above
 
@@ -151,4 +151,33 @@ variable "enable_slack_target" {
   description = "Enable separate Slack-optimized EventBridge target (requires AWS Chatbot integration)"
   type        = bool
   default     = true
+}
+
+# GuardDuty stale-finding watchdog (#1137)
+variable "enable_stale_finding_watchdog" {
+  description = "Enable weekly watchdog Lambda that re-alerts on non-archived GuardDuty findings (#1137). Requires enable_guardduty."
+  type        = bool
+  default     = true
+}
+
+variable "stale_finding_age_days" {
+  description = "Days a non-archived finding must be un-touched before the watchdog re-alerts. Shorter = louder, longer = quieter. 7 matches the ops SLO for HIGH severity triage. GuardDuty's finding retention is 90 days, so values above ~90 are rarely meaningful; the 365-day upper bound is a sanity check, not a policy."
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.stale_finding_age_days >= 1 && var.stale_finding_age_days <= 365
+    error_message = "stale_finding_age_days must be between 1 and 365."
+  }
+}
+
+variable "stale_finding_watchdog_schedule" {
+  description = "EventBridge schedule expression for the stale-finding watchdog. Default is weekly on Monday at 13:00 UTC (timezone-fixed — US/Eastern drifts between 08:00 and 09:00 with DST). Weekly is enough given the 7-day staleness threshold, and avoids alert-fatigue from daily re-pings on the same unarchived finding."
+  type        = string
+  default     = "cron(0 13 ? * MON *)"
+
+  validation {
+    condition     = can(regex("^(cron|rate)\\(", var.stale_finding_watchdog_schedule))
+    error_message = "stale_finding_watchdog_schedule must start with cron(...) or rate(...). See https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-scheduled-rule-pattern.html"
+  }
 }
