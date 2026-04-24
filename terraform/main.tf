@@ -2167,3 +2167,130 @@ module "e2e_echo_server" {
   environment = var.environment
   tags        = merge(local.common_tags, { Service = "e2e-testing" })
 }
+
+# ==================== QURL Integrations DNS ====================
+# Cross-account A records (not alias) for `layervai/qurl-integrations-
+# infra` prod EC2 instances. The integrations repo owns EC2 + EIP
+# creation; DNS lives here because `layerv.ai` is in the mgmt-account
+# Route 53 zone reached via `aws.route53_mgmt` (same pattern as
+# `qurl_api` — plain A record on the same provider). Plain A records
+# — the workloads are single-instance EC2 + Caddy, not ALB/NLB-backed.
+#
+# Caddy's ACME HTTP-01 flow needs public DNS to succeed, so without
+# these records Caddy has no valid cert and the hostnames are
+# unreachable.
+#
+# EIP source of truth: the EIPs attached to the instances in
+# integrations-prod (account 886375649402). Read either from
+# qurl-integrations-infra's TF outputs (`instance_public_ip`,
+# `viewer_public_ip`) or `aws ec2 describe-addresses` — both are
+# authoritative for the same live AWS state. If an EIP is ever
+# reallocated, update the tfvars with the new value — the record
+# destroy+recreate is equivalent to an intentional DNS update.
+#
+# Subdomain-takeover note: if the integrations repo ever *releases*
+# (not just disassociates) one of these EIPs without this record
+# being updated first, the IP returns to the AWS pool and can be
+# re-leased to another tenant, who then gets ACME-issued TLS on
+# these hostnames. EIP release is a destructive change in the
+# integrations repo — flag a coordinated DNS delete PR here first.
+
+locals {
+  # All six inputs are load-bearing. Single gate dedups the six-way
+  # AND repeated on each record's `count`. Matches the
+  # `website_api_dns_enabled` local in the website email-capture
+  # section above. The terraform_data below gates on just the flag
+  # so preconditions still fire with named error messages when only
+  # the flag is set.
+  qurl_integrations_dns_enabled = (
+    var.deploy_qurl_integrations_dns &&
+    var.qurl_s3_connector_domain != null &&
+    var.qurl_s3_connector_eip != null &&
+    var.qurl_fileviewer_domain != null &&
+    var.qurl_fileviewer_eip != null &&
+    var.qurl_hosted_zone_id != null
+  )
+}
+
+# Fail plan loudly if deploy_qurl_integrations_dns is flipped on
+# without its inputs wired up. Mirrors website_api_preconditions.
+resource "terraform_data" "qurl_integrations_dns_preconditions" {
+  count = var.deploy_qurl_integrations_dns ? 1 : 0
+
+  # Feature inputs first, zone last — matches website_api_preconditions
+  # ordering so grep across preconditions groups the feature-scoped
+  # vars together.
+  lifecycle {
+    precondition {
+      condition     = var.qurl_s3_connector_domain != null
+      error_message = "qurl_s3_connector_domain is required when deploy_qurl_integrations_dns = true."
+    }
+    precondition {
+      condition     = var.qurl_s3_connector_eip != null
+      error_message = "qurl_s3_connector_eip is required when deploy_qurl_integrations_dns = true."
+    }
+    precondition {
+      condition     = var.qurl_fileviewer_domain != null
+      error_message = "qurl_fileviewer_domain is required when deploy_qurl_integrations_dns = true."
+    }
+    precondition {
+      condition     = var.qurl_fileviewer_eip != null
+      error_message = "qurl_fileviewer_eip is required when deploy_qurl_integrations_dns = true."
+    }
+    precondition {
+      condition     = var.qurl_hosted_zone_id != null
+      error_message = "qurl_hosted_zone_id is required when deploy_qurl_integrations_dns = true (the layerv.ai zone in mgmt account)."
+    }
+  }
+}
+
+resource "aws_route53_record" "qurl_s3_connector" {
+  # Gate via the shared `qurl_integrations_dns_enabled` local so a
+  # future edit adding an input can't forget to widen both records'
+  # count predicates. Preconditions on the terraform_data above
+  # still fire first when only the flag is set.
+  count      = local.qurl_integrations_dns_enabled ? 1 : 0
+  provider   = aws.route53_mgmt
+  depends_on = [terraform_data.qurl_integrations_dns_preconditions]
+
+  # Omit allow_overwrite (matches plain-record `qurl_api`): these are
+  # new records with no mgmt-account consumers; failing on a pre-
+  # existing conflict is louder than clobbering one.
+  zone_id = var.qurl_hosted_zone_id
+  name    = var.qurl_s3_connector_domain
+  type    = "A"
+  ttl     = 300
+  records = [var.qurl_s3_connector_eip]
+
+  lifecycle {
+    # Flipping deploy_qurl_integrations_dns off (or nulling the
+    # inputs) would otherwise destroy this record and sever all
+    # traffic to the hostname. prevent_destroy makes `terraform
+    # plan` itself fail with "Instance cannot be destroyed" the
+    # moment count flips to 0 — not just apply. Retiring the record
+    # intentionally is a three-step dance: (1) `terraform state rm
+    # aws_route53_record.qurl_s3_connector[0]`, (2) remove this
+    # resource block and/or null the inputs, (3) plan+apply.
+    # Mirrors the safety rail captured for the backing EIPs in
+    # layervai/qurl-integrations-infra#247. In-place updates
+    # (rotating the EIP via tfvars) are unaffected — `records`
+    # changes are treated as updates, not destroys.
+    prevent_destroy = true
+  }
+}
+
+resource "aws_route53_record" "qurl_fileviewer" {
+  count      = local.qurl_integrations_dns_enabled ? 1 : 0
+  provider   = aws.route53_mgmt
+  depends_on = [terraform_data.qurl_integrations_dns_preconditions]
+
+  zone_id = var.qurl_hosted_zone_id
+  name    = var.qurl_fileviewer_domain
+  type    = "A"
+  ttl     = 300
+  records = [var.qurl_fileviewer_eip]
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}

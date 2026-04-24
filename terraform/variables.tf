@@ -1673,6 +1673,62 @@ variable "deploy_e2e_echo_server" {
   default     = false
 }
 
+# ==================== QURL Integrations DNS ====================
+# Cross-account A records for qurl-integrations-infra prod EC2
+# instances. Rationale + source-of-truth note in main.tf under
+# "QURL Integrations DNS".
+
+variable "deploy_qurl_integrations_dns" {
+  description = "Create the cross-account A records for the qurl-integrations-infra prod EC2 instances. When true, requires qurl_hosted_zone_id + all four qurl_{s3_connector,fileviewer}_{domain,eip} inputs (enforced by terraform_data.qurl_integrations_dns_preconditions). Flipping to false after records exist would destroy them — but both records carry lifecycle.prevent_destroy = true, so retiring them requires an explicit terraform state rm in coordination with qurl-integrations-infra."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_s3_connector_domain" {
+  description = "FQDN for the qurl-s3-connector upload endpoint (e.g., getqurllink.layerv.ai). Must live under the zone referenced by qurl_hosted_zone_id. Required when deploy_qurl_integrations_dns = true."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.qurl_s3_connector_domain == null || can(regex("^[a-z0-9][a-z0-9.-]*[a-z0-9]\\.[a-z]{2,}$", var.qurl_s3_connector_domain))
+    error_message = "qurl_s3_connector_domain must be a valid FQDN (e.g., getqurllink.layerv.ai)."
+  }
+}
+
+variable "qurl_s3_connector_eip" {
+  description = "IPv4 EIP attached to the qurl-s3-connector EC2 instance. Read from qurl-integrations-infra's `instance_public_ip` output or `aws ec2 describe-addresses` in the integrations-prod account — both are authoritative for the same live AWS state. Required when deploy_qurl_integrations_dns = true."
+  type        = string
+  default     = null
+
+  validation {
+    # cidrnetmask rejects octets >255 (a regex-only IPv4 check accepts 999.999.999.999)
+    condition     = var.qurl_s3_connector_eip == null || can(cidrnetmask("${var.qurl_s3_connector_eip}/32"))
+    error_message = "qurl_s3_connector_eip must be a valid IPv4 address or null."
+  }
+}
+
+variable "qurl_fileviewer_domain" {
+  description = "FQDN for the fileviewer endpoint (e.g., fileviewer.layerv.ai). Must live under the zone referenced by qurl_hosted_zone_id. Required when deploy_qurl_integrations_dns = true."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.qurl_fileviewer_domain == null || can(regex("^[a-z0-9][a-z0-9.-]*[a-z0-9]\\.[a-z]{2,}$", var.qurl_fileviewer_domain))
+    error_message = "qurl_fileviewer_domain must be a valid FQDN (e.g., fileviewer.layerv.ai)."
+  }
+}
+
+variable "qurl_fileviewer_eip" {
+  description = "IPv4 EIP attached to the fileviewer EC2 instance. Read from qurl-integrations-infra's `viewer_public_ip` output or `aws ec2 describe-addresses` in the integrations-prod account — both are authoritative for the same live AWS state. Required when deploy_qurl_integrations_dns = true."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.qurl_fileviewer_eip == null || can(cidrnetmask("${var.qurl_fileviewer_eip}/32"))
+    error_message = "qurl_fileviewer_eip must be a valid IPv4 address or null."
+  }
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {

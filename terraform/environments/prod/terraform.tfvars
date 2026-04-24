@@ -379,6 +379,20 @@ auth0_spa_web_origins = [
 # customer custom domains registered via the QURL API.
 deploy_custom_domain_cert = true
 
+# qurl-integrations-infra cross-account DNS. See main.tf QURL
+# Integrations DNS section for rationale.
+#
+# EIPs sourced 2026-04-23 from the integrations-prod account via
+# `aws ec2 describe-addresses`. EIPs are stable across instance
+# replacement; if ever intentionally reallocated, update here and
+# re-apply in coordination with a qurl-integrations-infra PR (see
+# the subdomain-takeover note in main.tf and issue #247).
+deploy_qurl_integrations_dns = true
+qurl_s3_connector_domain     = "getqurllink.layerv.ai"
+qurl_s3_connector_eip        = "3.132.101.16"
+qurl_fileviewer_domain       = "fileviewer.layerv.ai"
+qurl_fileviewer_eip          = "3.13.11.40"
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"

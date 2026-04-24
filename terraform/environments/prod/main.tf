@@ -107,6 +107,13 @@ module "nhp" {
   website_api_domain         = var.website_api_domain
   website_api_cfn_stack_name = var.website_api_cfn_stack_name
 
+  # qurl-integrations-infra cross-account DNS — see main.tf for context.
+  deploy_qurl_integrations_dns = var.deploy_qurl_integrations_dns
+  qurl_s3_connector_domain     = var.qurl_s3_connector_domain
+  qurl_s3_connector_eip        = var.qurl_s3_connector_eip
+  qurl_fileviewer_domain       = var.qurl_fileviewer_domain
+  qurl_fileviewer_eip          = var.qurl_fileviewer_eip
+
   # QURL Custom Domains
   qurl_custom_domain_enabled = var.qurl_custom_domain_enabled
 

@@ -1342,3 +1342,36 @@ variable "github_oauth_client_secret" {
   default     = null
   sensitive   = true
 }
+
+# ==================== QURL Integrations DNS ====================
+# See root terraform/variables.tf + main.tf for full rationale.
+
+variable "deploy_qurl_integrations_dns" {
+  description = "Create the cross-account A records for qurl-integrations-infra prod EC2 instances."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_s3_connector_domain" {
+  description = "FQDN for the qurl-s3-connector upload endpoint."
+  type        = string
+  default     = null
+}
+
+variable "qurl_s3_connector_eip" {
+  description = "IPv4 EIP attached to the qurl-s3-connector EC2 instance."
+  type        = string
+  default     = null
+}
+
+variable "qurl_fileviewer_domain" {
+  description = "FQDN for the fileviewer endpoint."
+  type        = string
+  default     = null
+}
+
+variable "qurl_fileviewer_eip" {
+  description = "IPv4 EIP attached to the fileviewer EC2 instance."
+  type        = string
+  default     = null
+}
