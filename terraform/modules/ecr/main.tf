@@ -405,10 +405,20 @@ resource "aws_ecr_replication_configuration" "cross_account" {
 }
 
 # Secondary account: allow primary account's ECR replication service to push images.
-# The aws:SourceAccount condition is defense-in-depth in case the AWS principal
-# evaluation drifts -- it ensures only requests originating in the primary
-# account can use the policy even though we already pinned the principal to
-# that account's root.
+#
+# NOTE: previous revisions of this policy included a defense-in-depth
+#   Condition.StringEquals: { "aws:SourceAccount": var.primary_account_id }
+# ECR's cross-account replication does not populate aws:SourceAccount in the
+# authorization context, so that Condition always evaluated to the implicit
+# deny and all replication attempts failed with DESTINATION_REGISTRY_ACCESS_DENIED
+# (observed empirically during the 2026-04-24 prod release incident; registry
+# was manually corrected and this change brings terraform back in sync).
+#
+# The Principal scoping alone is load-bearing: only identities in the
+# primary account can match, and AWS's own reference policy examples for
+# cross-account ECR replication omit any aws:SourceAccount / aws:SourceArn
+# condition for the same reason (ECR replication doesn't populate either
+# key). See docs/runbooks/ecr-replication-failure.md "Known gotcha".
 resource "aws_ecr_registry_policy" "replication" {
   count = !var.is_primary_account && var.enable_replication && var.primary_account_id != "" ? 1 : 0
 
@@ -426,11 +436,6 @@ resource "aws_ecr_registry_policy" "replication" {
           "ecr:ReplicateImage"
         ]
         Resource = "arn:aws:ecr:${local.region}:${local.account_id}:repository/layerv/*"
-        Condition = {
-          StringEquals = {
-            "aws:SourceAccount" = var.primary_account_id
-          }
-        }
       }
     ]
   })

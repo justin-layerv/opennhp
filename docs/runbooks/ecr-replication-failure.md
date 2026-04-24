@@ -45,6 +45,7 @@ ECR cross-account replication from sandbox to prod is broken or delayed. Images 
 | `get-registry-policy` returns "no policy" | Prod registry policy was removed | Re-apply Terraform in prod with `enable_replication=true` |
 | Replication status shows `FAILED` with `REPOSITORY_NOT_FOUND` | The repo doesn't exist in prod yet (first-time replication) | ECR creates repos automatically on replication — check IAM permissions |
 | Replication status shows `FAILED` with `PERMISSION_DENIED` | IAM or registry policy mismatch | Compare the sandbox replication config with the prod registry policy; check for recent IAM changes |
+| Replication status shows `FAILED` with `DESTINATION_REGISTRY_ACCESS_DENIED` despite a policy that *looks* correct | See "Known gotcha: aws:SourceAccount / aws:SourceArn" below | Remove those Condition keys from the destination registry policy |
 | Images exist in sandbox but `describe-image-replication-status` shows no entries | Replication was never attempted — the image was pushed before replication was enabled, or the repo doesn't match the `layerv/` filter | Manually push the image to prod (see mitigations) |
 
 ## Mitigations (in order of preference)
@@ -86,6 +87,20 @@ ECR cross-account replication from sandbox to prod is broken or delayed. Images 
    Then re-run promote-to-prod.
 
 3. **Skip the gate** — only if the image is already confirmed to exist in prod by other means. Comment out the step and re-run. This should be an absolute last resort.
+
+## Known gotcha: `aws:SourceAccount` / `aws:SourceArn`
+
+ECR cross-account replication uses a service-internal authorization context that **does not populate the `aws:SourceAccount` or `aws:SourceArn` condition keys**. If the destination registry policy includes a `Condition.StringEquals` block keyed on either one, the statement fails to match at evaluation time and the implicit deny takes over — so replication fails with `DESTINATION_REGISTRY_ACCESS_DENIED` even though the policy *looks* like it should allow the call.
+
+This is specific to ECR replication. Other AWS service-to-service integrations (S3 → SNS/SQS, EventBridge, etc.) *do* populate these keys and the common defense-in-depth pattern of pinning them is correct there. Copying that pattern into an ECR registry policy silently breaks replication.
+
+**Symptom:** `describe-image-replication-status` returns `FAILED` / `DESTINATION_REGISTRY_ACCESS_DENIED` for every digest, even freshly-pushed ones, despite a registry policy whose Principal and Action appear correct.
+
+**Diagnostic:** `aws ecr get-registry-policy --region us-east-2 --query 'policyText' --output text | jq` and look for a `Condition.StringEquals.aws:SourceAccount` or `aws:SourceArn` block. If present, that's the bug.
+
+**Fix:** Remove the Condition block. The Principal scoping (`arn:aws:iam::<primary>:root`) is load-bearing and sufficient — it's what AWS's own [cross-account ECR replication reference policies](https://docs.aws.amazon.com/AmazonECR/latest/userguide/registry-permissions-cross-account-examples.html) use.
+
+**Incident:** 2026-04-24 prod release was blocked by this for ~30 min of debugging; see `terraform/modules/ecr/main.tf` comment for the root-cause story. Fixed in PR #1316.
 
 ## After the fact
 
