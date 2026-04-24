@@ -1197,6 +1197,42 @@ jobs:
           echo "  Plan:     tfplan.json"
           echo ""
 
+          # Pre-gate smoke + rationale for --entrypoint (shared by both
+          # docker runs below): the qurl-service image ENTRYPOINT is a
+          # wrapper that unconditionally execs qurl-api (see
+          # qurl-service/docker/entrypoint-api.sh). Without the override,
+          # `docker run $IMAGE /app/qurl-schema-check ...` becomes
+          # `qurl-api /app/qurl-schema-check ...` — qurl-api silently
+          # ignores the positional args and dies on "AWS_REGION is
+          # required" from its own config validator. The binary we want
+          # is a sibling in /app, reached via --entrypoint.
+          #
+          # The smoke catches the same class at an unambiguous exit code
+          # (0 when the binary runs; 126/127 when it can't). On failure
+          # we surface the captured output so operators see the real
+          # error instead of the generic annotation. Without this pre-gate
+          # the verdict step below misattributes an unrelated exit 1 to
+          # "GSI missing" — the exact misdiagnosis that blocked today's
+          # prod release until the Dockerfile bug was traced by hand.
+          #
+          # Runtime contract: `qurl-schema-check --version` must short-
+          # circuit before AWS config / any framework init. If a future
+          # qurl-service revision re-orders the binary's startup so
+          # --version runs later, the smoke will false-fail and block
+          # deploys on a healthy binary. qurl-service#247 and later
+          # revisions to cmd/qurl-schema-check/main.go must preserve
+          # this property. Structural follow-up tracked in #1318.
+          SMOKE_OUT=$(docker run --rm --entrypoint /app/qurl-schema-check "$IMAGE" --version 2>&1) || {
+            echo "::group::qurl-schema-check --version output"
+            echo "$SMOKE_OUT"
+            echo "::endgroup::"
+            echo "::error::qurl-schema-check --version smoke failed in image $IMAGE. The binary is not runnable (missing, not executable, or crashes on startup) — see the grouped output above for the real error. The per-plan verdict step below is not trustworthy until this passes."
+            exit 1
+          }
+          # Pin the binary build in the run log so a future incident can
+          # correlate the verdict with a specific schema-check version.
+          echo "qurl-schema-check smoke OK: $SMOKE_OUT"
+
           # The schema-check binary writes a precise (table, index, reason)
           # report to its own stderr on failure; surface its full output in
           # the workflow log so operators see exactly which GSI is missing
@@ -1204,8 +1240,9 @@ jobs:
           set +e
           docker run --rm \
             -v "$PWD/tfplan.json:/tmp/tfplan.json:ro" \
+            --entrypoint /app/qurl-schema-check \
             "$IMAGE" \
-            /app/qurl-schema-check --plan /tmp/tfplan.json
+            --plan /tmp/tfplan.json
           EXIT=$?
           set -e
 
@@ -1228,8 +1265,12 @@ jobs:
               # 126 = permission denied; 127 = binary not found. Most
               # likely the effective qurl image predates layervai/qurl-service#247
               # which added /app/qurl-schema-check to the Docker image.
+              # This case should normally be caught by the --version smoke
+              # above — reaching here means either the smoke was removed
+              # (investigate) or the image mutated between the smoke and
+              # this run (effectively impossible on a single runner).
               echo ""
-              echo "::error::qurl-schema-check binary not found or not executable in image $IMAGE (exit $EXIT). The effective qurl image (tag $EFFECTIVE_TAG) likely predates qurl-service#247 which added the schema-check binary. Either deploy a newer qurl image (deploy_qurl=true with a post-#247 tag) or, if this is intentional, verify GSI compatibility manually before applying."
+              echo "::error::qurl-schema-check binary not found or not executable in image $IMAGE (exit $EXIT). This should have been caught by the --version smoke above — investigate why it wasn't. The effective qurl image (tag $EFFECTIVE_TAG) likely predates qurl-service#247 which added the schema-check binary. Either deploy a newer qurl image (deploy_qurl=true with a post-#247 tag) or, if this is intentional, verify GSI compatibility manually before applying."
               exit 1
               ;;
             *)
