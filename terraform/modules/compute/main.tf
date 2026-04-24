@@ -458,7 +458,8 @@ resource "aws_iam_role_policy" "server" {
           [aws_secretsmanager_secret.cookie_secret.arn],
           [var.etcd_secret_arn],
           [var.etcd_tls_secret_arn],
-          [var.qurl_service_token_secret_arn]
+          [var.qurl_service_token_secret_arn],
+          [var.nhp_internal_auth_secret_arn]
         ))
       },
       {
@@ -710,6 +711,8 @@ locals {
     enable_blue_green = var.enable_blue_green
     # Cookie signing secret (shared across all instances)
     cookie_secret_arn = aws_secretsmanager_secret.cookie_secret.arn
+    # Shared HMAC secret for /nhp/internal/knock verification (matches qurl-service signer)
+    nhp_internal_auth_secret_arn = var.nhp_internal_auth_secret_arn
     # CORS allowed origins for NHP HTTP server
     cors_allowed_origins = var.cors_allowed_origins
     # CloudFront trusted proxy CIDRs (for correct client IP via X-Forwarded-For)

@@ -426,6 +426,18 @@ variable "qurl_service_token_secret_arn" {
   default     = null
 }
 
+variable "nhp_internal_auth_secret_arn" {
+  description = "Secrets Manager ARN for the NHP internal auth HMAC secret. Injected as NHP_INTERNAL_AUTH_SECRET on the server; shared with qurl-service."
+  type        = string
+
+  validation {
+    # arn:aws[-partition]:secretsmanager:<region>:<account>:secret:<name> —
+    # accepts commercial (aws), GovCloud (aws-us-gov), and China (aws-cn).
+    condition     = can(regex("^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]+:secret:.+$", var.nhp_internal_auth_secret_arn))
+    error_message = "nhp_internal_auth_secret_arn must be a valid Secrets Manager ARN."
+  }
+}
+
 variable "enable_qurl_resolve_endpoint" {
   description = "Enable the QURL resolve endpoint (TLS listener on port 443). When true, adds infrastructure for resolve.qurl.link to route directly to the NHP Server plugin endpoint."
   type        = bool

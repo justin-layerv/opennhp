@@ -469,3 +469,29 @@ gate, etc.), the PR that ships it should also:
 - All storage encrypted with KMS CMKs
 - IMDSv2 required on EC2
 - AC private keys NEVER in etcd - only Secrets Manager
+- `NHP_INTERNAL_AUTH_SECRET` (≥ 32 bytes) signs `/nhp/internal/knock` requests
+  between qurl-service and nhp-server. Terraform provisions and seeds the
+  value (`aws_secretsmanager_secret.nhp_internal_auth`); the app-layer gate
+  defaults to permit mode — flip `NHP_INTERNAL_AUTH_REQUIRE=true` only after
+  the permit-mode mismatch counter stays at zero through a full deploy cycle.
+  Operational notes:
+  - **Plan-role permissions:** the `check` block that asserts the secret is
+    populated refreshes `data.aws_secretsmanager_secret_version` on every
+    plan, so the caller's role needs `secretsmanager:GetSecretValue` (and
+    `kms:Decrypt` on the secrets CMK). The runtime IAM grants already cover
+    this on the ECS task + EC2 roles; laptop/CI plans need it on the
+    terraform principal. **Security implication:** any principal permitted
+    to run `terraform plan` can now read this HMAC secret's cleartext (held
+    briefly in plan-time memory; sensitive-marked so it doesn't land in
+    state or diff output, but reachable via a custom `output`). Scope the
+    plan role to trusted CI runners / operators accordingly.
+  - **First plan on a greenfield env** fires a warning from the `check`
+    block because the secret doesn't exist yet. Post-apply plans are clean.
+    Any CI workflow that fails on terraform warnings should ignore the
+    `nhp_internal_auth_secret_populated` check until the first apply lands.
+  - **Rotation ≠ dynamic pickup.** nhp-server reads the secret once at
+    instance boot in `user_data.sh.tpl`. Rotating the Secrets Manager value
+    without an ASG instance refresh will break knock verification on
+    existing instances. qurl-service is fine — ECS `valueFrom` re-resolves
+    per task start, so a rolling deploy (or stop-task) picks up the new
+    value. #1312 tracks a proper current/previous rotation envelope.

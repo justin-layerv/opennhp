@@ -283,6 +283,81 @@ module "nhp_keypair" {
   kms_key_arn = module.kms.secrets_key_arn
 }
 
+# HMAC secret for /nhp/internal/knock; signed by qurl-service, verified by
+# nhp-server. 32-byte floor enforced on both sides.
+resource "aws_secretsmanager_secret" "nhp_internal_auth" {
+  name                    = "${local.name_prefix}-nhp-internal-auth"
+  description             = "HMAC secret for /nhp/internal/knock — shared by nhp-server and qurl-service"
+  recovery_window_in_days = var.environment == "prod" ? 30 : 0
+  kms_key_id              = module.kms.secrets_key_arn
+
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-nhp-internal-auth"
+    Component = "nhp-internal-auth"
+  })
+}
+
+# 48 bytes > the 32-byte floor both sides enforce. The value never appears in
+# Terraform state — it is written directly via the AWS CLI.
+#
+# NOTE: --exclude-punctuation is load-bearing. Both consumers write this
+# value raw into env files (ECS task def + nhp-server secrets.env) without
+# escaping. The [A-Za-z0-9] alphabet produced here is the only shape that's
+# safe through those env-file transports. If a future change widens the
+# alphabet for higher entropy, the env-file write paths must base64-encode
+# the value (mirror the NHP_COOKIE_KEYS treatment in user_data.sh.tpl).
+#
+# Recovery: if the local-exec fails mid-apply the secret exists but is
+# unpopulated and both services will refuse to start. Re-run with
+# `terraform apply -replace=terraform_data.nhp_internal_auth_seed`.
+resource "terraform_data" "nhp_internal_auth_seed" {
+  triggers_replace = [aws_secretsmanager_secret.nhp_internal_auth.arn]
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    # --region is explicit so a local apply from a laptop with a
+    # different AWS_REGION doesn't silently target the wrong region.
+    # The -z guard is belt-and-suspenders against get-random-password
+    # ever returning empty — the check block downstream catches this,
+    # but failing here is the cheaper signal.
+    command = <<-EOT
+      set -euo pipefail
+      SECRET_VALUE=$(aws secretsmanager get-random-password \
+        --region "${data.aws_region.current.name}" \
+        --password-length 48 \
+        --exclude-punctuation \
+        --query RandomPassword --output text)
+      if [ -z "$SECRET_VALUE" ]; then
+        echo "ERROR: get-random-password returned empty" >&2
+        exit 1
+      fi
+      aws secretsmanager put-secret-value \
+        --region "${data.aws_region.current.name}" \
+        --secret-id "${aws_secretsmanager_secret.nhp_internal_auth.id}" \
+        --secret-string "$SECRET_VALUE" > /dev/null
+    EOT
+  }
+}
+
+# Early diagnostic: confirm the secret has a populated version. If the seed's
+# local-exec failed on first apply, this fires a warning at every subsequent
+# plan/apply until `terraform apply -replace=terraform_data.nhp_internal_auth_seed`
+# reseeds. check blocks are advisory (warn, not fail), so they don't break
+# subsequent applies that don't depend on a populated value — but they do
+# surface the failure so operators aren't relying on a mid-rollout container
+# crash to discover it.
+check "nhp_internal_auth_secret_populated" {
+  data "aws_secretsmanager_secret_version" "nhp_internal_auth" {
+    secret_id  = aws_secretsmanager_secret.nhp_internal_auth.id
+    depends_on = [terraform_data.nhp_internal_auth_seed]
+  }
+
+  assert {
+    condition     = length(data.aws_secretsmanager_secret_version.nhp_internal_auth.secret_string) >= 32
+    error_message = "NHP internal auth secret is shorter than the 32-byte floor both sides enforce. Re-run: terraform apply -replace=terraform_data.nhp_internal_auth_seed"
+  }
+}
+
 # Compute Module - ASG, NLB, Launch Template
 module "compute" {
   source = "./modules/compute"
@@ -331,6 +406,9 @@ module "compute" {
   # QURL plugin configuration
   qurl_config                   = var.qurl_config
   qurl_service_token_secret_arn = var.qurl_service_token_secret_arn
+
+  # Shared HMAC secret; seed ordering enforced via depends_on below.
+  nhp_internal_auth_secret_arn = aws_secretsmanager_secret.nhp_internal_auth.arn
 
   # QURL resolve endpoint - TLS listener for resolve.qurl.link
   # Routes HTTPS traffic directly to NHP Server plugin endpoint
@@ -381,6 +459,11 @@ module "compute" {
   enable_blue_green               = var.enable_blue_green
   green_standby_min_size          = var.green_standby_min_size
   deployment_stale_threshold_days = var.deployment_stale_threshold_days
+
+  # Ensure the secret is populated before launch templates are created.
+  # Without this, instances may come up reading an unseeded (empty) secret
+  # and fail-closed at NHP_INTERNAL_AUTH_SECRET constructor time.
+  depends_on = [terraform_data.nhp_internal_auth_seed]
 }
 
 # Monitoring Module - CloudWatch Dashboard, Alarms, Slack Notifications
@@ -1016,6 +1099,10 @@ module "qurl_service" {
   jwt_secret_arn             = var.qurl_jwt_secret_arn
   internal_service_token_arn = var.qurl_internal_service_token_arn
 
+  # Shared HMAC secret for signing outbound /nhp/internal/knock requests.
+  # Must match the value nhp-server reads on the verifier side.
+  nhp_internal_auth_secret_arn = aws_secretsmanager_secret.nhp_internal_auth.arn
+
   # Stripe billing
   stripe_secret_arn           = var.billing_stripe_secret_name != null ? data.aws_secretsmanager_secret.billing_stripe[0].arn : ""
   stripe_growth_price_id      = var.billing_growth_price_id
@@ -1133,6 +1220,9 @@ module "qurl_service" {
   grafana_cloud_enabled = var.qurl_grafana_cloud_enabled
   grafana_secret_arn    = var.qurl_grafana_secret_arn
   adot_collector_image  = var.qurl_adot_collector_image
+
+  # Ensure the HMAC secret is seeded before the ECS task pulls it via valueFrom.
+  depends_on = [terraform_data.nhp_internal_auth_seed]
 }
 
 # =============================================================================

@@ -339,3 +339,8 @@ output "e2e_echo_url" {
   description = "E2E echo server Lambda function URL"
   value       = var.deploy_e2e_echo_server ? module.e2e_echo_server[0].echo_url : null
 }
+
+output "nhp_internal_auth_secret_arn" {
+  description = "Secrets Manager ARN for the NHP internal auth HMAC secret. Exposed for ad-hoc operator inspection and rotation tooling (#1312)."
+  value       = aws_secretsmanager_secret.nhp_internal_auth.arn
+}

@@ -818,15 +818,54 @@ assert 'encrypt_key' in d['current'], 'missing current.encrypt_key'
 # Base64-encode for safe transport through env file and docker --env-file
 NHP_COOKIE_KEYS=$(echo -n "$COOKIE_KEYS_JSON" | base64 -w 0)
 
+# Fetch the NHP internal auth HMAC secret (signed by qurl-service on outbound
+# /nhp/internal/knock requests; verified by this server). Fail-closed if the
+# secret is missing or shorter than the 32-byte floor the verifier enforces —
+# an undersized secret would pass docker start only to crash at construction.
+echo "Fetching NHP internal auth secret from Secrets Manager..."
+# SECURITY: xtrace-leak guard. This script runs under `set -ex` with the
+# top-level `exec > >(tee /var/log/user-data.log ...)`, so `set -x` trace
+# lines land in CloudWatch. The `NHP_INTERNAL_AUTH_SECRET=$(aws …)`
+# assignment would otherwise trace as `+ NHP_INTERNAL_AUTH_SECRET='<48-char
+# HMAC key>'` — bash expands command-substitution stdout into the
+# assignment's trace line. Mirrors the AC-module fix landed in PR #1304
+# (issue #1268).
+set +x
+NHP_INTERNAL_AUTH_SECRET=$(aws secretsmanager get-secret-value \
+  --secret-id "${nhp_internal_auth_secret_arn}" \
+  --region "$REGION" \
+  --query SecretString --output text) || {
+    set -x
+    echo "ERROR: Failed to fetch NHP internal auth secret from Secrets Manager"
+    exit 1
+}
+if [ "$${#NHP_INTERNAL_AUTH_SECRET}" -lt 32 ]; then
+  set -x
+  echo "ERROR: NHP internal auth secret is shorter than the 32-byte floor (got $${#NHP_INTERNAL_AUTH_SECRET}); aborting."
+  exit 1
+fi
+set -x
+
 cat > /opt/layerv/nhp-server/etc/secrets.env << SECRETSEOF
 NHP_COOKIE_KEYS=$NHP_COOKIE_KEYS
+# NHP_INTERNAL_AUTH_SECRET is written raw. The seed in terraform/main.tf
+# uses `--exclude-punctuation` so the alphabet is [A-Za-z0-9] only; that's
+# the contract that makes this safe through the env file and docker
+# --env-file transports. Widening the alphabet requires base64-encoding
+# here and decoding on the server side (mirror NHP_COOKIE_KEYS above).
+NHP_INTERNAL_AUTH_SECRET=$NHP_INTERNAL_AUTH_SECRET
 %{ if qurl_enabled ~}
 # QURL service authentication token - fetched from Secrets Manager
 # This file contains sensitive credentials and should NOT be readable by other users
 QURL_SERVICE_TOKEN=$QURL_SERVICE_TOKEN
 %{ endif ~}
 SECRETSEOF
-echo "Created secrets file with cookie keys and service credentials"
+# Defense-in-depth: NHP_INTERNAL_AUTH_SECRET is no longer needed in the
+# shell environment after the heredoc writes it. Unset so a future edit
+# that accidentally references it can't resurrect the xtrace-leak class.
+# Matches the PR #1304 treatment of EXISTING_SECRET / KEYPAIR / SECRET_VALUE.
+unset NHP_INTERNAL_AUTH_SECRET
+echo "Created secrets file with cookie keys, internal auth secret, and service credentials"
 
 cat > /etc/systemd/system/nhp-server.service << 'SVCEOF'
 [Unit]

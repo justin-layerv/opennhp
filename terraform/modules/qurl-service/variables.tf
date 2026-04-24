@@ -148,6 +148,18 @@ variable "internal_service_token_arn" {
   }
 }
 
+variable "nhp_internal_auth_secret_arn" {
+  description = "Secrets Manager ARN for the shared HMAC secret used to sign outbound /nhp/internal/knock requests. Must match the value read by nhp-server."
+  type        = string
+
+  validation {
+    # arn:aws[-partition]:secretsmanager:<region>:<account>:secret:<name> —
+    # accepts commercial (aws), GovCloud (aws-us-gov), and China (aws-cn).
+    condition     = can(regex("^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]+:secret:.+$", var.nhp_internal_auth_secret_arn))
+    error_message = "nhp_internal_auth_secret_arn must be a valid Secrets Manager ARN."
+  }
+}
+
 # ==================== KMS ====================
 
 variable "logs_kms_key_arn" {
