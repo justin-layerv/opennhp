@@ -517,7 +517,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       # Sets up Go on the runner solely to manage the module/build cache
-      # across runs. Tests themselves still execute in the pinned
+      # across runs. Tests themselves still execute in the
       # golang:${GO_VERSION}-bookworm container below; we bind-mount the
       # runner's GOMODCACHE and GOCACHE into the container so cache state
       # persists across runs without rebuilding the module graph or

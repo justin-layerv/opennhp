@@ -1695,7 +1695,7 @@ jobs:
       (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
       (needs.deploy-qurl.result == 'success' || needs.deploy-qurl.result == 'skipped') &&
       (needs.deploy-server.result == 'success' || needs.deploy-ac.result == 'success' || needs.deploy-qurl.result == 'success')
-    uses: layervai/qurl-service/.github/workflows/smoke-tests.yml@main
+    uses: layervai/qurl-service/.github/workflows/smoke-tests.yml@eafec9fe74f298e4ffee28411866d0432c6f5676 # main as of 2026-04-24
     with:
       environment: prod
     secrets:
