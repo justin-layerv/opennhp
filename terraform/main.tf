@@ -692,6 +692,12 @@ module "security" {
   enable_guardduty_alerts = length(var.guardduty_alert_emails) > 0
   alerts_sns_topic_arn    = module.monitoring.sns_topic_arn
   guardduty_alert_emails  = var.guardduty_alert_emails
+
+  # 2026-04-24 hot-patch: disable until promote-to-prod.yml wires the
+  # stale_finding_watchdog.zip lambda artifact between the split plan/apply
+  # jobs (sandbox builds it in the same job so works; prod apply runner
+  # has no zip). Tracked in #1326. Re-enable once the workflow fix lands.
+  enable_stale_finding_watchdog = false
 }
 
 # AC Module - Access Controller with embedded Traefik for TLS termination
