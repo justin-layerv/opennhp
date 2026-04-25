@@ -22,6 +22,12 @@ type derivedEndpoints struct {
 	// tests assert cookies are scoped to this domain and that the
 	// 302 Location host has this as its suffix.
 	QURLSiteDomain string
+
+	// QURLLinkOrigin is the origin (scheme + host) of the qurl.link
+	// page that the SPA loads from. Tier 2 negotiation tests use it
+	// as the Origin header on cross-origin fetch() simulations and
+	// assert the server echoes it back in Access-Control-Allow-Origin.
+	QURLLinkOrigin string
 }
 
 // deriveEndpoints returns the default URL set for the named environment.
@@ -34,12 +40,14 @@ func deriveEndpoints(env string) (derivedEndpoints, error) {
 			NHPServerBaseURL: "https://resolve.qurl.link.layerv.xyz",
 			QURLAPIBaseURL:   "https://api.layerv.xyz",
 			QURLSiteDomain:   "qurl.site.layerv.xyz",
+			QURLLinkOrigin:   "https://qurl.link.layerv.xyz",
 		}, nil
 	case "prod":
 		return derivedEndpoints{
 			NHPServerBaseURL: "https://resolve.qurl.link",
 			QURLAPIBaseURL:   "https://api.layerv.ai",
 			QURLSiteDomain:   "qurl.site.layerv.ai",
+			QURLLinkOrigin:   "https://qurl.link",
 		}, nil
 	default:
 		return derivedEndpoints{}, fmt.Errorf("unknown environment %q (want sandbox or prod)", env)

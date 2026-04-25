@@ -3,8 +3,10 @@ package qurl
 import (
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +35,14 @@ const (
 	// This gives time for AC connections to re-establish during blue/green
 	// deployments or transient connectivity gaps.
 	knockRetryDelay = 2 * time.Second
+
+	// redirectURLField names the JSON field on the JSON branch of
+	// /plugins/qurl. MIRROR: redirectURLField in
+	// tests/smoke/15_resolve_accept_negotiation_test.go must rename
+	// in lockstep — they live in separate Go modules so an import
+	// would create a worse coupling. Same name on both sides reduces
+	// #1325's CI grep guard to a literal grep. Tracked in #1325.
+	redirectURLField = "redirect_url"
 )
 
 var (
@@ -89,10 +99,33 @@ func Close() error {
 // and any intermediary that captures request URIs. The GET query parameter
 // path is retained for backward compatibility but logs a deprecation warning.
 //
+// Response shape (only the success branch honors Accept; error paths
+// keep their existing shapes for backward compatibility with form-POST
+// callers). Each row maps a (status, Content-Type) pair to a body shape;
+// SPAs MUST discriminate on that pair, not on the fact that they sent
+// Accept: application/json — both success and inline-5xx errors are JSON,
+// so a blind JSON.parse on every 200 is wrong without the Content-Type
+// gate.
+//
+//	200 + application/json   {redirect_url: ...}        (Accept: application/json)
+//	302 + Location header    no body                    (any other Accept)
+//	403 + text/html          branded error page         (token validation OR handleResolveError)
+//	502 + text/html          branded error page         (handleResolveError, ErrInvalidResolveResponse)
+//	5xx + application/json   {error, message, detail}   (inline failures: knock_failed, configuration_error, etc.)
+//
+// Fenced by TestAuthWithHttp_AcceptJSON_ErrorStaysHTML (HTML 403 from
+// token validation), TestHandleResolveError_InvalidResolve_Return502
+// (HTML 502 from handleResolveError), and
+// TestAuthWithHttp_AcceptJSON_KnockFailedStaysJSON (JSON 500 from inline knock).
+//
 // Security note: Rate limiting should be handled at infrastructure level (NLB, WAF)
 // to protect against brute-force token guessing attacks.
 func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugins.HttpServerPluginHelper) (ackMsg *common.ServerKnockAckMsg, err error) {
 	if helper == nil {
+		// Defensive wiring check; unreachable in production (the
+		// dispatcher always passes a real helper). This branch
+		// returns before any header is written, so it doesn't
+		// carry Vary: Accept.
 		return nil, errors.New("authWithHTTP: helper is null")
 	}
 
@@ -103,6 +136,20 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	// This is important for cross-origin error handling in the qurl.link SPA.
 	ctx.SetSameSite(http.SameSiteNoneMode)
 	nhpplugins.CorsMiddleware(ctx)
+
+	// Vary: Accept on every response past CORS so any caching intermediary
+	// keys on the negotiated shape, not just the URL. Add (not Set) to
+	// append; placed after nhpplugins.CorsMiddleware so a future SDK
+	// version that touches Vary can't silently clobber the Accept value.
+	//
+	// As of nhp-plugins-sdk v0.1.30, CorsMiddleware (plugins.go:224) does
+	// not set or add the Vary header — it only writes Access-Control-*
+	// headers and handles OPTIONS preflight. The placement here is
+	// forward-defense; today the upstream platform CORS middleware's
+	// Vary: Origin survives, and our Add appends Accept. If the SDK
+	// is ever upgraded, run TestAuthWithHttp_AcceptJSON_VaryAddDoesNotClobberPreexisting
+	// to confirm the invariant.
+	ctx.Writer.Header().Add("Vary", "Accept")
 
 	// Extract access token: prefer POST form body, fall back to query parameter.
 	// POST body keeps the token out of access logs (CloudFront, NHP, intermediaries).
@@ -261,12 +308,93 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	// can align its session_id cookie expiry with the NHP cookie.
 	ctx.SetCookie(CookieNHPSessionTTL, strconv.Itoa(cookieMaxAge), cookieMaxAge, "/", res.CookieDomain, true, true)
 
-	log.Info("[QURL] [req_id=%s] Tokens generated and cookies set, redirecting to: %s", requestID, resolveResp.QurlSiteURL)
-
-	// Redirect to the qurl.site URL (e.g., https://r_9f3a2c8e.qurl.site)
-	ctx.Redirect(http.StatusFound, resolveResp.QurlSiteURL)
+	// Negotiate response shape from the Accept header.
+	// Form-POST (legacy SPA) gets a 302; fetch() callers that want progressive
+	// UI send Accept: application/json and receive {"redirect_url": "..."} so
+	// they can stay on the qurl.link page until the knock is confirmed.
+	//
+	// Note: error paths above (token-invalid 403, knock_failed 500, etc.)
+	// keep their existing shapes — branded HTML for 403 token errors, JSON
+	// {error, message, detail} for 5xx — even when the caller asked for
+	// JSON. Consumers that send Accept: application/json must handle both
+	// the success {redirect_url} body and the existing error shapes.
+	// Unified log prefix so an operator can `grep "[QURL] resolved ->"` to
+	// see every successful resolve and trivially aggregate by shape during
+	// the SPA rollout.
+	if wantsJSON(ctx) {
+		log.Info("[QURL] [req_id=%s] resolved -> %s (shape=json)", requestID, resolveResp.QurlSiteURL)
+		ctx.JSON(http.StatusOK, gin.H{redirectURLField: resolveResp.QurlSiteURL})
+	} else {
+		log.Info("[QURL] [req_id=%s] resolved -> %s (shape=302)", requestID, resolveResp.QurlSiteURL)
+		ctx.Redirect(http.StatusFound, resolveResp.QurlSiteURL)
+	}
 
 	return ackMsg, nil
+}
+
+// wantsJSON returns true when the client signaled (via Accept) that it wants
+// a JSON body instead of a 302. We only return JSON when application/json is
+// explicitly requested — the wildcard "*/*" still gets the 302 path so legacy
+// form-POST callers (with no explicit Accept) keep their existing behavior.
+//
+// Parsing uses mime.ParseMediaType per comma-separated segment, which handles
+// quoted-string parameters, folded whitespace, and case normalization (the
+// returned media type is lowercased) without bespoke logic. Malformed
+// segments are skipped silently — we only need one valid match.
+//
+// Multiple Accept headers are folded into one comma-separated value via
+// Header.Values, matching RFC 7230's equivalence rule. Real clients
+// (browsers, fetch, every SDK) emit a single header; the fold covers the
+// rare case where a Go SDK uses Header.Add("Accept", ...) twice.
+//
+// Known RFC simplifications (consciously chosen for parser simplicity, not
+// merely because browsers + fetch() don't emit them today):
+//   - q=0 is treated as accept, not reject. RFC 7231 §5.3.1 says q=0 means
+//     "not acceptable"; we ignore the q value entirely. The tradeoff is
+//     deliberate: a strict client doing
+//     `Accept: application/json;q=0, text/html` will receive JSON it
+//     didn't want. The redirect_url body is the same value the 302
+//     Location would have leaked, so the surprise is annoying but not
+//     security-impacting. If/when a real client legitimately uses q=0
+//     to deselect application/json, file an issue and we'll switch to
+//     a q-aware parser.
+//   - Preference order is ignored. "text/html;q=1, application/json;q=0.1"
+//     returns true; we don't sort by quality.
+//   - +json structured-syntax suffixes (application/vnd.api+json,
+//     application/hal+json, etc.) do NOT match. Only application/json
+//     itself triggers the JSON branch. If a future caller needs +json
+//     types, replace the equality check below with
+//     strings.HasSuffix(mt, "+json") — mt is already lowercased by
+//     mime.ParseMediaType so no ToLower is needed.
+//   - Commas inside quoted media-type parameters (e.g.
+//     `application/json;param="a,b"`) split the segment incorrectly:
+//     strings.Split is comma-naive, mime.ParseMediaType then fails
+//     on each fragment, and we fall through to the legacy 302 path.
+//     No real Accept header uses quoted-string parameters with
+//     commas; flagged here so the next bug-tracer doesn't have to
+//     re-derive it.
+//
+// If a future client legitimately needs strict negotiation, swap to a parser
+// that honors q-values (e.g. github.com/elnormous/contenttype). Until then,
+// matching by presence is faster, simpler, and correct for every real caller.
+func wantsJSON(ctx *gin.Context) bool {
+	values := ctx.Request.Header.Values("Accept")
+	if len(values) == 0 {
+		return false
+	}
+	accept := strings.Join(values, ",")
+	for _, part := range strings.Split(accept, ",") {
+		mt, _, err := mime.ParseMediaType(part)
+		if err != nil {
+			continue
+		}
+		// mime.ParseMediaType lowercases the media type, so a literal
+		// equality check is sufficient — no EqualFold needed.
+		if mt == "application/json" {
+			return true
+		}
+	}
+	return false
 }
 
 // getOrCreateRequestID returns the request ID from the Gin context.

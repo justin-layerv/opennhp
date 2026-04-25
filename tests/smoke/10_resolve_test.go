@@ -110,6 +110,12 @@ const resolvePerAttemptTimeout = 5 * time.Second
 //
 // Callers receive an *http.Response with headers intact but body
 // drained and closed — only header/cookie inspection is valid.
+//
+// Intentionally NOT consolidated with postResolveWithAccept in
+// 15_resolve_accept_negotiation_test.go: that helper returns the body
+// for shape assertions and takes a parametric Accept + wantStatus.
+// This one hard-codes "expect 302" and discards the body. Keeping
+// them separate keeps both call sites locally clear.
 func resolveWithRetries(ctx context.Context, t *testing.T, mintFunc func() *QURLResponse) *http.Response {
 	t.Helper()
 
@@ -163,6 +169,14 @@ func resolveWithRetries(ctx context.Context, t *testing.T, mintFunc func() *QURL
 			}
 		}
 
+		// Two guards: wall-clock budget catches slow failures, attempt
+		// cap catches fast-failing 5xx that would otherwise thrash
+		// Auth0+qurl-service. maxResolveAttempts is shared via
+		// assertions.go.
+		if attempt >= maxResolveAttempts {
+			t.Fatalf("resolveWithRetries: exhausted %d attempts: %v",
+				maxResolveAttempts, lastErr)
+		}
 		if time.Now().After(deadline) {
 			t.Fatalf("resolveWithRetries: exhausted %s budget after %d attempts: %v",
 				resolveRetryBudget, attempt, lastErr)

@@ -50,6 +50,12 @@ type TestConfig struct {
 	//   - 302 Location host has this as its suffix
 	QURLSiteDomain string
 
+	// QURLLinkOrigin is the origin (scheme + host) of the qurl.link
+	// page that the SPA loads from. Tier 2 negotiation tests use it
+	// as the Origin header on cross-origin fetch() simulations and
+	// assert the server echoes it back in Access-Control-Allow-Origin.
+	QURLLinkOrigin string
+
 	Auth0Domain       string
 	Auth0Audience     string
 	Auth0ClientID     string

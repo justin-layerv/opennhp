@@ -12,6 +12,15 @@ import (
 	"time"
 )
 
+// maxResolveAttempts caps the number of mints a resolve retry loop will
+// burn before giving up. The wall-clock budget (resolveRetryBudget,
+// 45s) catches slow failures; this cap catches fast-failing 5xx that
+// would otherwise burn ~9 mints inside the wall-clock window via
+// Auth0 + qurl-service round-trips. Both helpers (resolveWithRetries
+// in 10_resolve_test.go and postResolveWithAccept in
+// 15_resolve_accept_negotiation_test.go) reference this constant.
+const maxResolveAttempts = 5
+
 // assertEventually polls check until it returns nil or maxWait elapses.
 // Polls at pollInterval. Logs elapsed-on-success at INFO level; fails
 // only on timeout. This is the standard shape for "the system needs a

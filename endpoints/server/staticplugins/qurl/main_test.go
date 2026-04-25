@@ -1063,6 +1063,519 @@ func TestAuthWithHttp_KnockRetryExhausted(t *testing.T) {
 	}
 }
 
+// TestAuthWithHttp_AcceptJSON_InvalidRedirectStays502JSON fences the
+// invalid_redirect 502 branch (handler emits inline JSON, not branded
+// HTML, when the QURL API returns a malformed redirect URL). The
+// existing TestAuthWithHttp_CustomDomain_RejectsHTTPRedirect covers
+// the same code path under default Accept; this row pins that
+// Accept: application/json doesn't change the 502 + JSON shape.
+func TestAuthWithHttp_AcceptJSON_InvalidRedirectStays502JSON(t *testing.T) {
+	setup := setupCustomDomainTest(t, &ResolveResponse{
+		ResourceID:     "r_bad_redirect",
+		TargetURL:      "https://backend.example.com",
+		QurlSiteURL:    "http://app.mycorp.com", // HTTP — rejected by ValidateCustomDomainRedirectURL
+		Resources:      map[string]*common.ResourceInfo{"default": {ACId: "ac-001", Hostname: "backend.example.com", Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443}}},
+		JWTSecret:      "test-jwt-secret-key-for-signing",
+		TokenExpire:    3600,
+		OpenTime:       300,
+		CookieDomain:   ".mycorp.com",
+		IsCustomDomain: true,
+	})
+	setup.ctx.Request.Header.Set("Accept", "application/json")
+
+	_, err := AuthWithHttp(setup.ctx, &common.HttpKnockRequest{}, successKnockHelper())
+	if err == nil {
+		t.Fatal("expected error for HTTP custom domain redirect")
+	}
+	if setup.recorder.Code != http.StatusBadGateway {
+		t.Errorf("expected 502, got %d", setup.recorder.Code)
+	}
+	ct := setup.recorder.Header().Get("Content-Type")
+	if !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("invalid_redirect Content-Type with Accept: application/json = %q, want application/json (inline 5xx contract)", ct)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(setup.recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode JSON body: %v", err)
+	}
+	if body["error"] != "invalid_redirect" {
+		t.Errorf("error field = %q, want %q", body["error"], "invalid_redirect")
+	}
+}
+
+// TestAuthWithHttp_AcceptJSON_KnockFailedStaysJSON pins the contract
+// that the 5xx knock-failed branch keeps its existing JSON
+// {error,message,detail} shape even when the caller sent
+// Accept: application/json. The handler godoc promises this; a future
+// refactor that wraps the 5xx in branded HTML (or vice versa) for any
+// reason would silently break the SPA's error-rendering branch.
+func TestAuthWithHttp_AcceptJSON_KnockFailedStaysJSON(t *testing.T) {
+	qurlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(internalResolveResponse{
+			Success: true,
+			Data: &ResolveResponse{
+				ResourceID:   "r_knockfail",
+				QurlSiteURL:  "https://r_knockfail.qurl.site",
+				Resources:    map[string]*common.ResourceInfo{"default": {ACId: "ac-001", Hostname: "backend.example.com", Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443}}},
+				JWTSecret:    "test-jwt-secret-key-for-signing",
+				TokenExpire:  3600,
+				OpenTime:     300,
+				CookieDomain: ".qurl.site",
+			},
+		})
+	}))
+	defer qurlServer.Close()
+
+	oldResolver := resolver
+	resolver = &QurlResolver{
+		httpClient:            &http.Client{Timeout: 5 * time.Second},
+		baseURL:               qurlServer.URL,
+		serviceToken:          "test-service-token",
+		allowedRedirectDomain: "qurl.site",
+	}
+	defer func() { resolver = oldResolver }()
+
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/plugins/qurl",
+		strings.NewReader("token=at_validknock1234567890123"))
+	ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	ctx.Request.Header.Set("Accept", "application/json")
+
+	// Helper that always fails the knock — exhausts retries and
+	// triggers the 5xx knock_failed branch.
+	helper := &plugins.HttpServerPluginHelper{
+		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			return nil, errors.New("AC connection closed")
+		},
+	}
+
+	_, err := AuthWithHttp(ctx, &common.HttpKnockRequest{}, helper)
+	if err == nil {
+		t.Fatal("expected error after knock retries exhausted")
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", w.Code)
+	}
+	ct := w.Header().Get("Content-Type")
+	if !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("knock_failed Content-Type = %q, want application/json (existing 5xx contract)", ct)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode 5xx JSON body: %v", err)
+	}
+	if body["error"] != "knock_failed" {
+		t.Errorf("error field = %q, want %q", body["error"], "knock_failed")
+	}
+}
+
+// TestAuthWithHttp_AcceptJSON_ErrorStaysHTML is the unit-level twin of
+// TestResolve_AcceptJSON_ErrorPathStaysHTML in tests/smoke. It pins the
+// SPA contract: even when the caller sends Accept: application/json,
+// error paths (token-invalid 403) keep their existing branded-HTML
+// shape. Catches the regression at unit-test time so a future refactor
+// that wraps the 403 in JSON fails fast instead of waiting for sandbox.
+func TestAuthWithHttp_AcceptJSON_ErrorStaysHTML(t *testing.T) {
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/plugins/qurl",
+		strings.NewReader("token="))
+	ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	ctx.Request.Header.Set("Accept", "application/json")
+
+	helper := &plugins.HttpServerPluginHelper{
+		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			t.Error("callback should not be called on token-invalid path")
+			return nil, nil
+		},
+	}
+
+	_, err := AuthWithHttp(ctx, &common.HttpKnockRequest{}, helper)
+	if err == nil {
+		t.Fatal("expected error for empty token")
+	}
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", w.Code)
+	}
+	ct := w.Header().Get("Content-Type")
+	if !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("error-path Content-Type with Accept: application/json = %q, want text/html (SPA branches on this)", ct)
+	}
+	if !strings.Contains(w.Body.String(), "Access Link Invalid") {
+		t.Errorf("error-path body missing branded marker")
+	}
+}
+
+// TestAuthWithHttp_AcceptJSON_HeaderValuesNotGet fences the documented
+// Header.Values fold in wantsJSON: a client that emits Accept twice via
+// Header.Add (instead of one comma-separated header) still triggers the
+// JSON branch. Real clients always send one header; this row covers a
+// future Go SDK that uses Header.Add naively.
+func TestAuthWithHttp_AcceptJSON_HeaderValuesNotGet(t *testing.T) {
+	setup := setupCustomDomainTest(t, &ResolveResponse{
+		ResourceID:   "r_multihdr",
+		TargetURL:    "https://backend.example.com",
+		QurlSiteURL:  "https://r_multihdr.qurl.site",
+		Resources:    map[string]*common.ResourceInfo{"default": {ACId: "ac-001", Hostname: "backend.example.com", Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443}}},
+		JWTSecret:    "test-jwt-secret-key-for-signing",
+		TokenExpire:  3600,
+		OpenTime:     300,
+		CookieDomain: ".qurl.site",
+	})
+	// Two Accept headers via Header.Add — equivalent under RFC 7230 to
+	// one comma-separated header, but Header.Get returns only the first.
+	// wantsJSON uses Header.Values to fold them.
+	setup.ctx.Request.Header.Add("Accept", "text/html")
+	setup.ctx.Request.Header.Add("Accept", "application/json")
+
+	if _, err := AuthWithHttp(setup.ctx, &common.HttpKnockRequest{}, successKnockHelper()); err != nil {
+		t.Fatalf("AuthWithHttp returned unexpected error: %v", err)
+	}
+	if setup.ctx.Writer.Status() != http.StatusOK {
+		t.Errorf("expected 200 (JSON branch via folded Accept headers), got %d", setup.ctx.Writer.Status())
+	}
+}
+
+// TestAuthWithHttp_AcceptJSON_VaryAddDoesNotClobberPreexisting fences the
+// production layering: the platform CORS middleware in httpserver.go
+// runs Set("Vary", "Origin") upstream of this handler, and the SDK
+// CorsMiddleware called from inside this handler must not clobber that.
+// Pre-seeds Vary: Origin on the response writer (simulating the
+// upstream middleware) before calling AuthWithHttp and asserts both
+// values survive.
+func TestAuthWithHttp_AcceptJSON_VaryAddDoesNotClobberPreexisting(t *testing.T) {
+	setup := setupCustomDomainTest(t, &ResolveResponse{
+		ResourceID:   "r_origin",
+		TargetURL:    "https://backend.example.com",
+		QurlSiteURL:  "https://r_origin.qurl.site",
+		Resources:    map[string]*common.ResourceInfo{"default": {ACId: "ac-001", Hostname: "backend.example.com", Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443}}},
+		JWTSecret:    "test-jwt-secret-key-for-signing",
+		TokenExpire:  3600,
+		OpenTime:     300,
+		CookieDomain: ".qurl.site",
+	})
+	// Pre-seed Vary: Origin to simulate the upstream platform CORS
+	// middleware (endpoints/server/httpserver.go:corsMiddleware).
+	setup.ctx.Writer.Header().Set("Vary", "Origin")
+	setup.ctx.Request.Header.Set("Accept", "application/json")
+	setup.ctx.Request.Header.Set("Origin", "https://qurl.link")
+
+	if _, err := AuthWithHttp(setup.ctx, &common.HttpKnockRequest{}, successKnockHelper()); err != nil {
+		t.Fatalf("AuthWithHttp returned unexpected error: %v", err)
+	}
+	// Vary is multi-valued (slice on the underlying http.Header). Header.Get
+	// would only return the first entry; Values returns all so we can assert
+	// both Origin (from upstream Set) and Accept (from our Add) survive.
+	got := strings.Join(setup.recorder.Header().Values("Vary"), ", ")
+	if !strings.Contains(got, "Accept") {
+		t.Errorf("Vary = %q, want it to contain Accept", got)
+	}
+	if !strings.Contains(got, "Origin") {
+		t.Errorf("Vary = %q, want upstream Origin to survive", got)
+	}
+}
+
+// TestAuthWithHttp_VaryAcceptOnResolveErrorPath complements
+// TestAuthWithHttp_VaryAcceptOnErrorPath: the latter covers the
+// empty-token validation branch; this one covers the resolve-failure
+// branch (handleResolveError). Both paths emit branded HTML 403 with
+// different code routes, and both must carry Vary: Accept symmetrically.
+//
+// Not safe to run with t.Parallel(): mutates the package-global
+// resolver. Same caveat applies to TestAuthWithHttp_AcceptJSON_KnockFailedStaysJSON
+// and to the existing tests in this file that swap the resolver.
+// Migrate to context-injected resolver before parallelizing.
+func TestAuthWithHttp_VaryAcceptOnResolveErrorPath(t *testing.T) {
+	// Mock QURL API that always returns "token not found"
+	qurlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(internalResolveResponse{
+			Success: false,
+			Error:   &resolveError{Code: "token_not_found", Message: "Token not found"},
+		})
+	}))
+	defer qurlServer.Close()
+
+	oldResolver := resolver
+	resolver = &QurlResolver{
+		httpClient:            &http.Client{Timeout: 5 * time.Second},
+		baseURL:               qurlServer.URL,
+		serviceToken:          "test-service-token",
+		allowedRedirectDomain: "qurl.site",
+	}
+	defer func() { resolver = oldResolver }()
+
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/plugins/qurl",
+		strings.NewReader("token=at_unknown1234567890123456"))
+	ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	ctx.Request.Header.Set("Accept", "application/json")
+
+	_, err := AuthWithHttp(ctx, &common.HttpKnockRequest{}, successKnockHelper())
+	if err == nil {
+		t.Fatal("expected error for unknown token")
+	}
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", w.Code)
+	}
+	if got := w.Header().Get("Vary"); !strings.Contains(got, "Accept") {
+		t.Errorf("Vary on resolve-error path = %q, want it to contain Accept", got)
+	}
+}
+
+// TestAuthWithHttp_VaryAcceptOnErrorPath fences the symmetry of the
+// Vary: Accept defense — every response from this handler past the
+// CORS middleware, including the branded 403 token-invalid path, must
+// carry it. Asymmetric Vary would defeat its own purpose: a cache
+// that stored a JSON-less error could later serve it to a JSON-asking
+// client.
+func TestAuthWithHttp_VaryAcceptOnErrorPath(t *testing.T) {
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+	form := "token="
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/plugins/qurl", strings.NewReader(form))
+	ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	ctx.Request.Header.Set("Accept", "application/json")
+
+	helper := &plugins.HttpServerPluginHelper{
+		AuthWithHttpCallbackFunc: func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
+			t.Error("callback should not be called on token-invalid path")
+			return nil, nil
+		},
+	}
+
+	_, err := AuthWithHttp(ctx, &common.HttpKnockRequest{}, helper)
+	if err == nil {
+		t.Fatal("expected error for empty token")
+	}
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 token error, got %d", w.Code)
+	}
+	if got := w.Header().Get("Vary"); !strings.Contains(got, "Accept") {
+		t.Errorf("Vary on error path = %q, want it to contain Accept", got)
+	}
+}
+
+// TestAuthWithHttp_AcceptJSON_ReturnsJSONNotRedirect verifies that callers
+// with Accept: application/json receive a 200 + JSON body containing the
+// redirect URL, instead of the legacy 302 redirect. The qurl.link SPA uses
+// this branch to render progressive UI without the browser blanking the tab.
+func TestAuthWithHttp_AcceptJSON_ReturnsJSONNotRedirect(t *testing.T) {
+	setup := setupCustomDomainTest(t, &ResolveResponse{
+		ResourceID:   "r_jsonflow",
+		TargetURL:    "https://backend.example.com",
+		QurlSiteURL:  "https://r_jsonflow.qurl.site",
+		Resources:    map[string]*common.ResourceInfo{"default": {ACId: "ac-001", Hostname: "backend.example.com", Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443}}},
+		JWTSecret:    "test-jwt-secret-key-for-signing",
+		TokenExpire:  3600,
+		OpenTime:     300,
+		CookieDomain: ".qurl.site",
+	})
+	setup.ctx.Request.Header.Set("Accept", "application/json")
+
+	_, err := AuthWithHttp(setup.ctx, &common.HttpKnockRequest{}, successKnockHelper())
+	if err != nil {
+		t.Fatalf("AuthWithHttp returned unexpected error: %v", err)
+	}
+
+	if setup.ctx.Writer.Status() != http.StatusOK {
+		t.Errorf("expected 200 for JSON path, got %d", setup.ctx.Writer.Status())
+	}
+	if got := setup.recorder.Header().Get("Location"); got != "" {
+		t.Errorf("expected no Location header on JSON path, got %q", got)
+	}
+	contentType := setup.recorder.Header().Get("Content-Type")
+	if !strings.HasPrefix(contentType, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json", contentType)
+	}
+
+	body := map[string]any{}
+	if err := json.Unmarshal(setup.recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("failed to decode JSON body: %v", err)
+	}
+	if got := body[redirectURLField]; got != "https://r_jsonflow.qurl.site" {
+		t.Errorf("%s = %v, want %q", redirectURLField, got, "https://r_jsonflow.qurl.site")
+	}
+
+	// Cookies must still be set on the JSON path with the same security
+	// attributes the 302 path uses — Domain/HttpOnly/Secure/SameSite. If
+	// a future refactor accidentally moved the SetCookie calls into the
+	// 302 arm, the SPA would do window.location.replace(redirect_url) and
+	// land unauthenticated. Asserting the attributes here, not just
+	// presence, fences that regression.
+	//
+	// Counting matches (rather than overwriting on each loop iteration)
+	// also catches a future bug that emits two nhp_token Set-Cookie
+	// headers, which a "last-wins" assignment would silently inspect
+	// only the second of.
+	cookies := setup.recorder.Result().Cookies()
+	var nhpToken *http.Cookie
+	var nhpTokenCount int
+	for _, c := range cookies {
+		if c.Name == CookieNHPToken {
+			nhpTokenCount++
+			nhpToken = c
+		}
+	}
+	if nhpTokenCount == 0 {
+		t.Fatal("nhp_token cookie not set on JSON response path")
+	}
+	if nhpTokenCount > 1 {
+		t.Errorf("nhp_token cookie emitted %d times, want 1", nhpTokenCount)
+	}
+	if nhpToken.Value == "" {
+		t.Error("nhp_token cookie on JSON path has empty value — a SetCookie arg-order regression would land here")
+	}
+	if !nhpToken.HttpOnly {
+		t.Error("nhp_token cookie on JSON path missing HttpOnly")
+	}
+	if !nhpToken.Secure {
+		t.Error("nhp_token cookie on JSON path missing Secure")
+	}
+	if nhpToken.SameSite != http.SameSiteNoneMode {
+		t.Errorf("nhp_token cookie on JSON path SameSite = %v, want SameSiteNoneMode (cross-subdomain flow needs this)", nhpToken.SameSite)
+	}
+	// Go's http.ReadSetCookies strips the leading dot from cookie domains,
+	// so ".qurl.site" set by SetCookie comes back as "qurl.site" here.
+	if nhpToken.Domain != "qurl.site" {
+		t.Errorf("nhp_token cookie on JSON path Domain = %q, want %q", nhpToken.Domain, "qurl.site")
+	}
+}
+
+// TestAuthWithHttp_AcceptJSONVariants exercises the parser surface: every
+// header form a real client might send that should land on the JSON branch
+// (with a non-empty redirect_url) or stay on the 302 path. Unifies the q,
+// charset, uppercase, and multi-value cases under one table so adding a
+// new variant is a one-line edit.
+func TestAuthWithHttp_AcceptJSONVariants(t *testing.T) {
+	tests := []struct {
+		name       string
+		accept     string
+		wantStatus int
+	}{
+		{"plain", "application/json", http.StatusOK},
+		{"with q-param", "application/json;q=0.9, */*;q=0.5", http.StatusOK},
+		{"with charset", "application/json; charset=utf-8", http.StatusOK},
+		{"uppercase media type", "APPLICATION/JSON", http.StatusOK},
+		{"json first, multi-value, no q", "application/json, text/html", http.StatusOK},
+		{"json after html, no q", "text/html, application/json", http.StatusOK},
+		// "json + wildcard" is the most likely real fetch() default header
+		// shape (Accept: application/json,*/*); pin it so the parser
+		// doesn't get fooled into matching the wildcard first.
+		{"json plus wildcard", "application/json,*/*", http.StatusOK},
+		// q=0 is RFC 7231 "not acceptable", but wantsJSON's godoc declares
+		// this a deliberate simplification — q values are ignored entirely.
+		// This row pins the documented behavior so a future refactor that
+		// honors q=0 would fail this test, surfacing the doc/code drift
+		// instead of silently changing the contract.
+		{"q=0 deliberately accepted", "application/json;q=0", http.StatusOK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setup := setupCustomDomainTest(t, &ResolveResponse{
+				ResourceID:   "r_variants",
+				TargetURL:    "https://backend.example.com",
+				QurlSiteURL:  "https://r_variants.qurl.site",
+				Resources:    map[string]*common.ResourceInfo{"default": {ACId: "ac-001", Hostname: "backend.example.com", Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443}}},
+				JWTSecret:    "test-jwt-secret-key-for-signing",
+				TokenExpire:  3600,
+				OpenTime:     300,
+				CookieDomain: ".qurl.site",
+			})
+			setup.ctx.Request.Header.Set("Accept", tt.accept)
+
+			if _, err := AuthWithHttp(setup.ctx, &common.HttpKnockRequest{}, successKnockHelper()); err != nil {
+				t.Fatalf("AuthWithHttp returned unexpected error: %v", err)
+			}
+			if setup.ctx.Writer.Status() != tt.wantStatus {
+				t.Errorf("status = %d, want %d", setup.ctx.Writer.Status(), tt.wantStatus)
+			}
+			// Body assertion: a status-only assertion would silently pass if
+			// wantsJSON returned true but ctx.JSON wrote garbage, so decode
+			// the body and check the redirect_url survived.
+			body := map[string]any{}
+			if err := json.Unmarshal(setup.recorder.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode JSON body: %v", err)
+			}
+			if got := body[redirectURLField]; got != "https://r_variants.qurl.site" {
+				t.Errorf("%s = %v, want %q", redirectURLField, got, "https://r_variants.qurl.site")
+			}
+
+			// Vary: Accept must be set so any caching intermediary keys on
+			// the negotiated shape rather than the URL alone.
+			if got := setup.recorder.Header().Get("Vary"); !strings.Contains(got, "Accept") {
+				t.Errorf("Vary header = %q, want it to contain Accept", got)
+			}
+		})
+	}
+}
+
+// TestAuthWithHttp_AcceptWildcard_StaysOn302 verifies Accept: */* (or no
+// Accept header) still gets the legacy 302 path so existing form-POST callers
+// — including any other intermediary that doesn't ask for JSON — keep working.
+func TestAuthWithHttp_AcceptWildcard_StaysOn302(t *testing.T) {
+	tests := []struct {
+		name   string
+		accept string
+	}{
+		{"wildcard", "*/*"},
+		{"text/html", "text/html,application/xhtml+xml"},
+		{"empty", ""},
+		// Malformed Accept must fall through to the 302 path rather than
+		// panic or accidentally matching JSON. The parser treats unknown
+		// media types as "not application/json" and stays on legacy.
+		{"malformed", "not-a-mediatype"},
+		// Subtype wildcard (RFC 7231 §5.3.2 syntax for "any application
+		// type") does NOT match per the documented simplifications in
+		// wantsJSON's godoc — only literal application/json triggers
+		// the JSON branch. This row pins that boundary so a future
+		// refactor can't quietly start matching application/*.
+		{"subtype wildcard", "application/*"},
+		// Pin the "only literal application/json" boundary against
+		// nearby-but-not-equal types: a prefix-only string and a
+		// +json suffix type. Both must stay on 302 per the
+		// documented simplifications.
+		{"json prefix only", "application/jsonfoo"},
+		{"+json suffix", "application/hal+json"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setup := setupCustomDomainTest(t, &ResolveResponse{
+				ResourceID:   "r_legacy",
+				TargetURL:    "https://backend.example.com",
+				QurlSiteURL:  "https://r_legacy.qurl.site",
+				Resources:    map[string]*common.ResourceInfo{"default": {ACId: "ac-001", Hostname: "backend.example.com", Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443}}},
+				JWTSecret:    "test-jwt-secret-key-for-signing",
+				TokenExpire:  3600,
+				OpenTime:     300,
+				CookieDomain: ".qurl.site",
+			})
+			if tt.accept != "" {
+				setup.ctx.Request.Header.Set("Accept", tt.accept)
+			}
+
+			if _, err := AuthWithHttp(setup.ctx, &common.HttpKnockRequest{}, successKnockHelper()); err != nil {
+				t.Fatalf("AuthWithHttp returned unexpected error: %v", err)
+			}
+			if setup.ctx.Writer.Status() != http.StatusFound {
+				t.Errorf("expected 302 for legacy path, got %d", setup.ctx.Writer.Status())
+			}
+			if got := setup.recorder.Header().Get("Location"); got != "https://r_legacy.qurl.site" {
+				t.Errorf("Location = %q, want %q", got, "https://r_legacy.qurl.site")
+			}
+			// Vary: Accept must also be set on the 302 branch so a cache
+			// can't serve a stored 302 to a later request that asks for
+			// JSON. Symmetric with the JSON branch's assertion.
+			if got := setup.recorder.Header().Get("Vary"); !strings.Contains(got, "Accept") {
+				t.Errorf("Vary header on 302 branch = %q, want it to contain Accept", got)
+			}
+		})
+	}
+}
+
 // TestBuildResourceData_ExInfoKeys verifies that buildResourceData includes
 // all required ExInfo keys, including SessionDuration for per-QURL session control.
 func TestBuildResourceData_ExInfoKeys(t *testing.T) {
