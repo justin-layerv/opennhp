@@ -102,3 +102,11 @@ jobs:
       # enforcement, or CLAUDE.md lists a scope reporters can't pick.
       - name: Check scope drift (bug form ↔ CLAUDE.md)
         run: bash scripts/check-scope-drift.sh
+
+      # Structural fence for the promote-to-prod gate logic that closed
+      # issue #1322 (deploy-* must require terraform-apply success when
+      # run_terraform=true; finalize must roll qurl-schema-compat into its
+      # FAILED loop). actionlint can't catch a silent loosening of the
+      # if-expressions, so this is the regression guard.
+      - name: Test promote-to-prod gating (issue #1322)
+        run: python3 tests/scripts/test_promote_to_prod_gating.py

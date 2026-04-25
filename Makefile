@@ -241,6 +241,14 @@ lint-workflows:
 	@bash scripts/lint-issue-templates.sh
 	@bash tests/scripts/check-scope-drift_test.sh
 	@bash scripts/check-scope-drift.sh
+	@python3 -c 'import yaml' 2>/dev/null || { \
+		echo "$(COLOUR_RED)[OpenNHP] PyYAML missing.$(END_COLOUR)"; \
+		echo "$(COLOUR_RED)  Match the CI install: python3 -m pip install --no-cache-dir pyyaml$(END_COLOUR)"; \
+		echo "$(COLOUR_RED)  (See .github/workflows/validate-workflows.yml's 'Install PyYAML' step.)$(END_COLOUR)"; \
+		echo "$(COLOUR_RED)  Most laptops also need --user, --break-system-packages, or a venv depending on python install.$(END_COLOUR)"; \
+		exit 1; \
+	}
+	@python3 tests/scripts/test_promote_to_prod_gating.py
 	@echo "$(COLOUR_GREEN)[OpenNHP] Workflow lint passed!$(END_COLOUR)"
 
 test:

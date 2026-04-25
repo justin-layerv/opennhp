@@ -73,7 +73,7 @@ on:
         default: 'cell0'
         type: string
       rollback:
-        description: 'Rollback to previous deployed-commit from SSM'
+        description: 'Rollback to previous deployed-commit from SSM. Auto-bypasses the stale-terraform check (rolling back app code typically wants existing infra; the diff is still emitted inline). Requires at least one deploy_*=true to confirm which artifact to roll back. See docs/runbooks/promote-to-prod-partial-deploy.md "Bypasses you should know about" for the runtime caveat (a pre-infra-change image against post-infra-change resources can still fail at runtime).'
         required: false
         default: false
         type: boolean
@@ -92,11 +92,30 @@ on:
         required: false
         default: false
         type: boolean
+      allow_stale_terraform:
+        description: 'Bypass the stale-terraform check that fails when run_terraform=false but terraform/** has changed since the last successful prod apply. ONLY consulted when run_terraform=false; a no-op otherwise (run_terraform=true runs terraform-plan + terraform-apply, which lands the diff). Use only for intentional rollbacks or when you have already verified the diff is benign.'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   id-token: write
   contents: read
   actions: write  # needed for gh workflow run dispatch
+  # Note: the preflight force-push-protection check needs
+  # `administration: read` to read branch-protection. That scope IS a
+  # valid `permissions:` key (per GitHub docs), but two separate
+  # constraints currently keep us from declaring it here:
+  # (a) actionlint's permission whitelist (older versions) flags it,
+  #     so a YAML grant would fail `make lint-workflows`;
+  # (b) GITHUB_TOKEN scope elevation also requires the repo/org's
+  #     "Workflow permissions" settings to allow elevated default-
+  #     token scopes (Settings → Actions → General).
+  # Until both are addressed (or a fine-grained PAT is provisioned),
+  # the check downgrades to a ::warning:: + `protection_status:
+  # unverified` SNS row when `gh api` returns 403. Operator path to
+  # fail-loud: bump actionlint, then add `administration: read` here,
+  # then ensure repo settings allow it. Tracked separately in #1362.
 
 concurrency:
   group: promote-to-prod
@@ -145,6 +164,47 @@ jobs:
             exit 1
           fi
           echo "Image tag valid: $IMAGE_TAG (commit exists in repo)"
+
+      # Reject a no-op dispatch: run_terraform=false + every deploy_*=
+      # false would proceed through preflight, skip every job, and
+      # finalize would write LOCK_VALUE=deployed even though prod state
+      # is unchanged. The runbook's lock-state table reads "deployed"
+      # as "prod is now running the new artifacts," which would be a
+      # lie. Reject at the earliest possible moment so the operator
+      # gets a clear error rather than an inscrutable green checkmark.
+      - name: Reject no-op dispatch
+        env:
+          RUN_TERRAFORM: ${{ inputs.run_terraform }}
+          DEPLOY_SERVER: ${{ inputs.deploy_server }}
+          DEPLOY_AC: ${{ inputs.deploy_ac }}
+          DEPLOY_QURL: ${{ inputs.deploy_qurl }}
+          ROLLBACK: ${{ inputs.rollback }}
+          ALLOW_STALE_TERRAFORM: ${{ inputs.allow_stale_terraform }}
+          FORCE_UNLOCK: ${{ inputs.force_unlock }}
+        run: |
+          if [[ "$RUN_TERRAFORM" != "true" \
+             && "$DEPLOY_SERVER" != "true" \
+             && "$DEPLOY_AC" != "true" \
+             && "$DEPLOY_QURL" != "true" ]]; then
+            # Compose: enumerate every set-but-meaningless flag so an
+            # operator who set both rollback=true AND force_unlock=true
+            # sees both diagnostics, not just the first matching elif.
+            BYPASS_FLAGS=()
+            [[ "$ROLLBACK" == "true" ]] && BYPASS_FLAGS+=("rollback=true (a rollback intent flag; needs at least one of run_terraform / deploy_*=true to specify which surface to roll back — terraform-only rollback is valid via run_terraform=true alone)")
+            [[ "$ALLOW_STALE_TERRAFORM" == "true" ]] && BYPASS_FLAGS+=("allow_stale_terraform=true (a bypass for the stale-terraform check, not a deploy directive)")
+            [[ "$FORCE_UNLOCK" == "true" ]] && BYPASS_FLAGS+=("force_unlock=true (a lock-bypass for clearing a stale 'deploying' state, not a deploy directive)")
+            if (( ${#BYPASS_FLAGS[@]} > 0 )); then
+              echo "::error::No-op dispatch: every deploy_*=false AND run_terraform=false, but the following bypass/intent flags are set without a deploy target:"
+              for flag in "${BYPASS_FLAGS[@]}"; do
+                echo "  - $flag"
+              done
+              echo "::error::Set at least one of run_terraform / deploy_server / deploy_ac / deploy_qurl to true (the bypass flags apply to the run that actually deploys, not on their own)."
+              echo "::error::See docs/runbooks/promote-to-prod-partial-deploy.md \"Bypasses you should know about\" for the manual-SSM stuck-lock-clear path if you need to reset state without redeploying."
+            else
+              echo "::error::No-op dispatch: run_terraform=false AND every deploy_*=false. Set at least one to true (run_terraform=true is the typical full-promote default)."
+            fi
+            exit 1
+          fi
 
       - name: Configure AWS credentials (sandbox - read-only)
         uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
@@ -314,11 +374,34 @@ jobs:
             PREV_COMMIT=$(aws ssm get-parameter \
               --name "/prod/nhp/deploy/deployed-commit-previous" \
               --query "Parameter.Value" --output text 2>/dev/null || echo "")
-            if [[ -n "$PREV_COMMIT" && "$PREV_COMMIT" != "initial" ]]; then
+            # Triple-sentinel check matching the stale-tf guard +
+            # `Update deployment tracking`: "" / "initial" / "None"
+            # all map to "no real prior commit." Without the "None"
+            # branch, an AWS-CLI null-text return (`Parameter.Value`
+            # null → literal "None") would slip past `!= "initial"`
+            # and hard-fail the SHA-shape regex below — surfacing as
+            # a confusing rollback rejection where every other call
+            # site warn-passes the same value.
+            if [[ -n "$PREV_COMMIT" \
+               && "$PREV_COMMIT" != "initial" \
+               && "$PREV_COMMIT" != "None" ]]; then
+              # SHA shape validation: /prod/nhp/deploy/* is operator-
+              # writable (IAM-gated by AWS_PROD_ROLE_ARN, but a misuse
+              # could land arbitrary text). Mirror the same regex
+              # `manifest.Validate image_tag format` applies to
+              # `inputs.image_tag` so a garbage SSM value fails here
+              # with a clear diagnostic instead of cascading into a
+              # confusing ECR-image-not-found at preflight.
+              if ! [[ "$PREV_COMMIT" =~ ^[0-9a-f]{7,40}$ ]]; then
+                echo "::error::deployed-commit-previous in SSM does not look like a commit SHA: '$PREV_COMMIT'"
+                echo "  Expected: 7-40 character hex (e.g., 89a6c6e4 or 89a6c6e4f0...)"
+                echo "  Manually re-seed via: aws ssm put-parameter --name /prod/nhp/deploy/deployed-commit-previous --value <sha> --overwrite"
+                exit 1
+              fi
               echo "Previous deployed-commit: $PREV_COMMIT"
               echo "effective_image_tag=$PREV_COMMIT" >> "$GITHUB_OUTPUT"
             else
-              echo "::warning::No deployed-commit-previous in SSM. Falling back to provided image_tag."
+              echo "::warning::No deployed-commit-previous in SSM (or sentinel value). Falling back to provided image_tag."
               echo "effective_image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
             fi
           else
@@ -525,9 +608,18 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 10
+    # Expose force-push protection state to finalize so the SNS
+    # notification surfaces it — without this, warn-and-proceed paths
+    # are buried in step logs (round 44).
+    outputs:
+      protection_status: ${{ steps.verify-protection.outputs.status }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # Need full history so the stale-terraform guard can `git diff`
+          # against the last applied SHA stored in SSM. Mirrors terraform-plan.
+          fetch-depth: 0
 
       - name: Configure AWS credentials (sandbox - for ECR check)
         uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
@@ -846,6 +938,476 @@ jobs:
           fi
           echo "All GitHub secrets verified."
 
+      # Force-push protection on prod main is a prod-deploy invariant
+      # in its own right, not just a stale-tf prerequisite. We verify
+      # it on every promote (regardless of `run_terraform`) so a quiet
+      # GitHub-UI change to the protection settings surfaces here, not
+      # as a partial-deploy two months later. The stale-terraform
+      # OrphanedAncestor branch (below) is one specific consumer of
+      # this invariant — it fails OPEN only because protection is
+      # verified — but disabled protection on a `run_terraform=true`
+      # run is also a deploy-class concern (force-push history
+      # rewrites can break rollback semantics, audit trails, and the
+      # `last-terraform-apply-commit` SSM anchor used for forensics).
+      # Hard-failing early on `disabled` is correct on every dispatch.
+      - name: Verify prod main has force-push protection
+        id: verify-protection
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Bind via env: for consistency with the rest of this file's
+          # shell steps; `${{ github.repository }}` is trusted (no
+          # injection risk) but mixing styles is a footgun.
+          REPO: ${{ github.repository }}
+        run: |
+          # `set -uo pipefail` (NOT -e): the `if !` below explicitly
+          # catches gh-api failure so we can warn-and-proceed on 403.
+          # DO NOT add `-e` here — it would short-circuit the gh-api
+          # capture and turn warn-pass into hard-fail on every
+          # `administration:read` 403 (the common path until the scope
+          # is granted). Other preflight steps use `-euo pipefail`
+          # because they want -e behavior; this one explicitly does not.
+          set -uo pipefail
+          # Best-effort: needs `administration: read` which the default
+          # GITHUB_TOKEN lacks (and actionlint's whitelist excludes from
+          # `permissions:`). Operator can grant it via repo Settings →
+          # Actions → General → Workflow permissions for fail-loud;
+          # until then, warn-and-proceed and surface to SNS via the
+          # `protection_status` output. Endpoint is the legacy branch-
+          # protection model; on a future Rulesets migration it returns
+          # 404 and we warn-pass — tracked in #1354.
+          # Stderr to a temp file (NOT 2>&1) so a successful gh-api
+          # call emitting a deprecation banner doesn't contaminate JSON.
+          # Pre-declare empty + register trap BEFORE mktemp so a signal
+          # between mktemp and trap registration can't leak the file
+          # (mirrors the deploy-ecs-service.sh pattern).
+          PROT_ERR_FILE=""
+          # `EXIT INT TERM` matches deploy-ecs-service.sh's pattern —
+          # CI runners rarely see signals, but symmetry prevents a
+          # future maintainer from wondering which trap shape to use.
+          trap 'rm -f "${PROT_ERR_FILE:-}"' EXIT INT TERM
+          PROT_ERR_FILE=$(mktemp)
+          # Helper so each exit point reads as `set_status X; exit N`
+          # instead of duplicating the GITHUB_OUTPUT plumbing.
+          set_status() { echo "status=$1" >> "$GITHUB_OUTPUT"; }
+          if ! PROTECTION=$(gh api "repos/${REPO}/branches/main/protection" 2>"$PROT_ERR_FILE"); then
+            echo "::warning::Could not read branch protection for main (missing administration:read scope, transient gh-api failure, or Rulesets migration). The stale-terraform OrphanedAncestor branch's fail-open assumption is unverified for this run — manually confirm via: gh api repos/${REPO}/branches/main/protection"
+            if [[ -s "$PROT_ERR_FILE" ]]; then
+              while IFS= read -r line; do
+                printf '  %s\n' "$line"
+              done < "$PROT_ERR_FILE"
+            fi
+            set_status unverified
+            exit 0
+          fi
+          # Helper: a jq-extraction that distinguishes "field present
+          # with value X" from "jq failed / field missing". We want
+          # malformed-but-non-empty PROTECTION to map to unverified
+          # (warn-path), not disabled (error-path) — the step is best-
+          # effort, and a transient jq glitch shouldn't fail a deploy.
+          jq_get() {
+            local field="$1" out
+            # `-n "$out"` guards against an empty $PROTECTION (jq exits
+            # 0 with no output) so callers can't get a silent empty
+            # success. JSON `null` is also treated as failure — both
+            # map to the unverified warn-path, which is the intent.
+            if out=$(jq -r "$field" <<< "$PROTECTION" 2>/dev/null) \
+                 && [[ -n "$out" && "$out" != "null" ]]; then
+              echo "$out"
+              return 0
+            fi
+            return 1
+          }
+          if ! ALLOW_FP=$(jq_get '.allow_force_pushes.enabled'); then
+            echo "::warning::Could not parse allow_force_pushes from branch protection JSON (malformed response or missing field — possible Rulesets migration, see #1354). Treating as unverified."
+            set_status unverified
+            exit 0
+          fi
+          if [[ "$ALLOW_FP" != "false" ]]; then
+            echo "::error::Force-push protection on main is disabled (allow_force_pushes.enabled=$ALLOW_FP). The stale-terraform OrphanedAncestor branch fails OPEN under this assumption — re-enable force-push protection or flip the branch to fail-CLOSED before re-running this workflow. See docs/runbooks/promote-to-prod-partial-deploy.md."
+            set_status disabled
+            exit 1
+          fi
+          # `enforce_admins=false` is a soft signal: an admin can also
+          # temporarily disable+re-enable protection without ever
+          # tripping this check, so hard-failing would be
+          # disproportionate. The SSM `last-terraform-apply-commit` is
+          # the strong anchor; this just surfaces drift to SNS.
+          if ! ENFORCE_ADMINS=$(jq_get '.enforce_admins.enabled'); then
+            echo "::warning::Could not parse enforce_admins from branch protection JSON (malformed response or missing field). Treating as unverified."
+            set_status unverified
+            exit 0
+          fi
+          if [[ "$ENFORCE_ADMINS" != "true" ]]; then
+            echo "::warning::Branch protection on main does not enforce admins (enforce_admins.enabled=$ENFORCE_ADMINS). An admin force-push could still orphan the last-applied SHA — for full confidence in the OrphanedAncestor fail-OPEN assumption, enable enforce_admins on main."
+            set_status admin-bypass
+            exit 0
+          fi
+          echo "Force-push protection on main: enabled (allow_force_pushes=false, enforce_admins=true)."
+          set_status verified
+
+      # When run_terraform=false but a deploy_* is true, refuse to roll new
+      # app code onto stale infra (issue #1322). Skipped when run_terraform
+      # =true (terraform-plan + terraform-apply will land any drift) or when
+      # no deploy_* is true (terraform-only run).
+      #
+      # Runs BEFORE deployment-lock acquisition so a stale-tf failure does
+      # not dirty the lock (the asymmetry with image/AMI/secret checks
+      # would surprise operators reading the lock history). Lock release
+      # by finalize.if-always() also handles cleanup.
+      - name: Verify terraform is current with deployed code
+        if: |
+          !inputs.run_terraform &&
+          (inputs.deploy_server || inputs.deploy_ac || inputs.deploy_qurl)
+        env:
+          ALLOW_STALE_TERRAFORM: ${{ inputs.allow_stale_terraform }}
+          ROLLBACK: ${{ inputs.rollback }}
+          # Round-61 escalation: if the verify-protection step found
+          # admin-bypass (enforce_admins=false) AND this step's
+          # OrphanedAncestor branch fires, escalate to hard-fail.
+          # An admin force-push could orphan last-terraform-apply-
+          # commit; with admin-bypass + OrphanedAncestor coinciding,
+          # the fail-OPEN assumption is genuinely violated and a
+          # stale-tf deploy would silently land.
+          PROTECTION_STATUS: ${{ steps.verify-protection.outputs.status }}
+        run: |
+          set -euo pipefail
+          # Helper: emit a CloudWatch counter every time the stale-tf check
+          # falls through to a "could not verify — proceeding" warning. If
+          # this metric ever fires in prod, the operator wants to know —
+          # the warning paths are escape hatches that should be vanishingly
+          # rare on a force-push-protected main branch.
+          # `--region` is explicit because this helper is a copy-paste
+          # candidate; keeping it self-contained means callers don't
+          # have to wire `AWS_REGION` separately. Inline AWS calls in
+          # the same step body rely on the job-level env var.
+          # TODO(#1346): a CloudWatch alarm on this metric is filed but
+          # not yet wired; until then, the metric is observable only
+          # from the metric explorer.
+          #
+          # IAM coverage: the prod role already has cloudwatch:PutMetricData
+          # on the LayerV/NHP namespace via the terraform_apply_services
+          # policy in terraform/modules/ecr/main.tf. The existing
+          # LayerV/NHP::DeploymentEvent push in finalize.send-notification
+          # exercises the same permission; if that ever stops working,
+          # this helper will too — which is the right coupling.
+          push_could_not_verify_metric() {
+            local reason="${1:-Unspecified}"
+            # `:-Unspecified` defends against a future caller passing
+            # an empty string — a CloudWatch metric with a literal
+            # empty Value dimension would silently break aggregation
+            # alarms. Today's four call sites pass non-empty strings,
+            # so the default never fires; it's defense-in-depth.
+            # Best-effort: a metric-push failure must NOT fail the deploy
+            # — that would block a real promote on a CloudWatch outage,
+            # which trades the partial-deploy class (#1322) for a
+            # CloudWatch-availability class. Once the alarm in #1346 is
+            # wired, a missed metric is observable downstream (no fire +
+            # the operator notices the workflow run log warning).
+            # Consistent with the existing LayerV/NHP::DeploymentEvent
+            # push in finalize.send-notification.
+            #
+            # Dimensions use the AWS-canonical Name=/Value= pair-of-args
+            # form (NOT the comma-joined shorthand). Comma-joined breaks
+            # the moment a future Reason value contains a comma or space
+            # (e.g., "Throttled (transient)"); the pair form survives any
+            # value the shell can quote.
+            aws cloudwatch put-metric-data \
+              --region "$AWS_REGION" \
+              --namespace "LayerV/NHP" \
+              --metric-name "StaleTerraformCheckCouldNotVerify" \
+              --dimensions Name=Environment,Value=prod Name=Reason,Value="$reason" \
+              --value 1 \
+              --unit Count \
+              || echo "::warning::Failed to push StaleTerraformCheckCouldNotVerify metric (reason=$reason)"
+          }
+
+          # The SSM parameter is created+overwritten by the finalize job's
+          # "Update terraform apply tracking" step (below), so it only
+          # exists once a successful prod terraform-apply has run. On
+          # greenfield envs the read returns ParameterNotFound. The
+          # "initial" sentinel is a MANUAL escape hatch — the workflow
+          # itself never writes "initial" anywhere; an operator can pre-
+          # seed `aws ssm put-parameter --value initial` to suppress the
+          # check during a planned bootstrap. Defensive code below treats
+          # "initial" the same as ParameterNotFound for that reason
+          # (consistent with the rest of this workflow — search for
+          # `"initial"`).
+          #
+          # Fail-CLOSED on any other error (IAM denial, network, throttle):
+          # silently skipping the check on a transient AWS error would
+          # green-light the exact partial-deploy class #1322 is meant to
+          # prevent. AWS_PROD_ROLE_ARN is already in scope from the
+          # earlier preflight steps and has ssm:GetParameter on
+          # /prod/nhp/* — if a future scope-down breaks this read, the
+          # operator gets a loud error instead of a silent fail-open.
+          #
+          # Stderr is captured to a separate temp file (NOT 2>&1) so an
+          # AWS-CLI warning written to stderr on a successful read does
+          # not contaminate the parameter value — the value is otherwise
+          # used directly in `git merge-base --is-ancestor`. GIT_ERR_FILE
+          # is set later (in the merge-base block); cover it in the trap
+          # via parameter-default expansion so a signal between mktemp
+          # and the inner cleanup can't leak the temp file.
+          #
+          # AWS_REGION env contract: this inline `aws ssm get-parameter`
+          # relies on the workflow-level AWS_REGION (set in env: at the
+          # top of the file). The push_could_not_verify_metric helper
+          # below passes --region explicitly because it's a copy-paste
+          # candidate; this inline call is ergonomic. If a future
+          # refactor runs preflight steps in a different shell context,
+          # add explicit --region here too.
+          # Pre-declare both tempfiles as empty BEFORE registering the
+          # trap, then mktemp into SSM_ERR_FILE — mirrors the
+          # deploy-ecs-service.sh pattern so a signal between mktemp
+          # and trap registration can't leak the file. `${VAR:-}`
+          # in the trap body handles the still-empty path safely.
+          SSM_ERR_FILE=""
+          GIT_ERR_FILE=""
+          trap 'rm -f "${SSM_ERR_FILE:-}" "${GIT_ERR_FILE:-}"' EXIT INT TERM
+          SSM_ERR_FILE=$(mktemp)
+          LAST_TF_SHA=""
+          if SSM_OUT=$(aws ssm get-parameter \
+              --name "/prod/nhp/deploy/last-terraform-apply-commit" \
+              --query "Parameter.Value" --output text 2>"$SSM_ERR_FILE"); then
+            LAST_TF_SHA="$SSM_OUT"
+          else
+            SSM_ERR=$(cat "$SSM_ERR_FILE")
+            if grep -q "ParameterNotFound" <<< "$SSM_ERR"; then
+              echo "::warning::No previous terraform-apply commit recorded in SSM (ParameterNotFound — first-deploy environment). Cannot detect drift; proceeding."
+              push_could_not_verify_metric "ParameterNotFound"
+              exit 0
+            fi
+            echo "::error::Failed to read /prod/nhp/deploy/last-terraform-apply-commit from SSM. Refusing to fail-open on a transient AWS error."
+            while IFS= read -r line; do
+              printf '  %s\n' "$line"
+            done <<< "$SSM_ERR"
+            exit 1
+          fi
+
+          # Empty / "initial" / "None" all map to first-deploy sentinel.
+          # "None" is the AWS-CLI literal when --output text encounters a
+          # null field (asymmetric with our deploy-ecs-service.sh checks
+          # for the same sentinel; safer to mirror).
+          if [[ -z "$LAST_TF_SHA" || "$LAST_TF_SHA" == "initial" || "$LAST_TF_SHA" == "None" ]]; then
+            echo "::warning::SSM parameter is empty / 'initial' / 'None' — first-deploy sentinel. Cannot detect drift; proceeding."
+            push_could_not_verify_metric "FirstDeploySentinel"
+            exit 0
+          fi
+
+          # SHA shape validation: the value comes from SSM (anyone with
+          # ssm:PutParameter on /prod/nhp/deploy/* could write arbitrary
+          # text). The workflow's tracking step always writes the full
+          # 40-char `github.sha`, so this read accepts only 40-char
+          # hex — tighter than the `image_tag` 7-40 regex (which has
+          # to accept short SHAs from operator dispatch). A 7-char
+          # operator re-seed would still be caught by this check;
+          # operators should re-seed with the full 40-char SHA.
+          if ! [[ "$LAST_TF_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::SSM parameter /prod/nhp/deploy/last-terraform-apply-commit contains a value that doesn't look like a 40-char commit SHA: '$LAST_TF_SHA'"
+            echo "  Expected: 40-character hex (the workflow always writes the full github.sha)"
+            echo "  Manually re-seed via: aws ssm put-parameter --name /prod/nhp/deploy/last-terraform-apply-commit --value <40-char-sha> --overwrite"
+            exit 1
+          fi
+
+          # `git merge-base --is-ancestor` checks BOTH presence in the
+          # local repo AND reachability from CURRENT_SHA. A force-push
+          # that orphaned the last-applied commit but kept it referenced
+          # elsewhere (very unlikely on prod main, which has force-push
+          # protection) would have failed `git rev-parse --verify` but
+          # produced a misleadingly noisy `git diff A..B` since diff works
+          # on disjoint trees. is-ancestor closes that gap.
+          # Stderr is captured so git's actual error reaches the run log
+          # instead of guessed text — avoids "why is this firing?" being
+          # answerable only by re-running locally.
+          #
+          # Asymmetry note: this branch is fail-OPEN (warn + proceed +
+          # metric) while every other not-verifiable branch is fail-
+          # closed (e.g., a non-ParameterNotFound SSM error fails the
+          # deploy). Rationale: an orphaned-ancestor state is operator-
+          # caused (force-push or shallow checkout) rather than an AWS
+          # outage, and the operator can re-trigger after fixing the
+          # ref state. The CloudWatch counter on this branch surfaces
+          # the asymmetry in telemetry. If force-push protection on
+          # prod main were ever removed, flip to `exit 1` here and
+          # direct the operator at allow_stale_terraform=true via the
+          # runbook.
+          # GIT_ERR_FILE is in the EXIT trap (set above) so an early-
+          # exit between mktemp and the inner cleanup can't leak.
+          GIT_ERR_FILE=$(mktemp)
+          # `is-ancestor` is documented to use distinct exit codes:
+          #   0   = is ancestor
+          #   1   = NOT an ancestor (the OrphanedAncestor case)
+          #   128 = git error (missing ref, repo corruption, etc.)
+          # Use exit-code dispatch (NOT stderr-string matching) — exit
+          # codes are stable contract; stderr text changes with git
+          # version + locale, and grep alternatives like "fatal:" /
+          # "bad object" are localization-fragile.
+          # `set +e` around the call so $? survives `set -euo pipefail`
+          # at the top of the step; restore -e immediately after.
+          set +e
+          git merge-base --is-ancestor "$LAST_TF_SHA" "$GITHUB_SHA" 2>"$GIT_ERR_FILE"
+          GIT_RC=$?
+          set -e
+          if [[ $GIT_RC -ne 0 ]]; then
+            GIT_ERR=$(cat "$GIT_ERR_FILE")
+            if [[ $GIT_RC -eq 1 ]]; then
+              # Conjunction escalation: OrphanedAncestor fail-OPEN is
+              # justified by force-push protection. Two conjunctions
+              # violate that justification — fail-CLOSED on either:
+              #
+              # - admin-bypass + OrphanedAncestor: enforce_admins=false
+              #   means an admin force-push could legitimately orphan
+              #   the SHA without tripping the hard-fail
+              #   allow_force_pushes path.
+              # - unverified + OrphanedAncestor: we don't KNOW whether
+              #   protection is on (gh-api 403 / Rulesets migration /
+              #   transient failure), so we can't justify the fail-OPEN.
+              #   Operator can use allow_stale_terraform=true after
+              #   manually verifying.
+              if [[ "${PROTECTION_STATUS:-}" == "admin-bypass" \
+                 || "${PROTECTION_STATUS:-}" == "unverified" ]]; then
+                echo "::error::OrphanedAncestor + protection_status=${PROTECTION_STATUS}: $LAST_TF_SHA is not an ancestor of $GITHUB_SHA AND force-push protection is either bypassable (admin-bypass) or unverifiable (unverified). The fail-OPEN assumption is violated. Either fix the protection state, or use allow_stale_terraform=true after manually verifying the drift. See docs/runbooks/promote-to-prod-partial-deploy.md."
+                push_could_not_verify_metric "OrphanedAncestor"
+                exit 1
+              fi
+              echo "::warning::Last applied terraform commit $LAST_TF_SHA is not an ancestor of $GITHUB_SHA (force-pushed, orphaned, or branch rewritten). Cannot verify drift — proceeding."
+              push_could_not_verify_metric "OrphanedAncestor"
+            else
+              # exit 128+ = git environment failure
+              echo "::warning::git invocation failed (rc=$GIT_RC): $LAST_TF_SHA may be missing from local repo or there's a git environment issue. Cannot verify drift — proceeding."
+              if [[ -n "$GIT_ERR" ]]; then
+                echo "git stderr:"
+                while IFS= read -r line; do
+                  printf '  %s\n' "$line"
+                done <<< "$GIT_ERR"
+              fi
+              push_could_not_verify_metric "GitError"
+            fi
+            exit 0
+          fi
+
+          # Compare against GITHUB_SHA (the workflow's checked-out ref)
+          # rather than inputs.image_tag. An operator dispatching a
+          # rollback (image_tag=<old SHA>, run_terraform=false, no
+          # rollback=true) sees the diff for every prod-affecting tf
+          # change since the last apply — which is correct: the binary
+          # they're rolling to predates the applied infra, so they need
+          # to read that diff before bypassing. The runbook (Case C)
+          # documents this; rollback discipline > convenience here.
+          CURRENT_SHA="$GITHUB_SHA"
+          if [[ "$LAST_TF_SHA" == "$CURRENT_SHA" ]]; then
+            echo "Terraform is current: last-apply == ${CURRENT_SHA:0:8}."
+            exit 0
+          fi
+
+          # Scope to prod-affecting paths so a sandbox-only terraform
+          # change does not trip the prod check; mirrors terraform-plan's
+          # change-summary scope. (Dedupe tracked in #1343.)
+          # Two-arg form `A B` for clarity. `git diff A..B` is equivalent
+          # for `git diff` (the `..` is identical-to-space here, not the
+          # git-log range form), but the bare two-arg form is unambiguous
+          # at a glance with `A...B` (symmetric-diff).
+          TF_DIFF=$(git diff --name-only "$LAST_TF_SHA" "$CURRENT_SHA" -- \
+            terraform/environments/prod/ terraform/modules/)
+          if [[ -z "$TF_DIFF" ]]; then
+            echo "No prod-affecting terraform changes between ${LAST_TF_SHA:0:8} and ${CURRENT_SHA:0:8} — safe to deploy app code without re-applying."
+            exit 0
+          fi
+
+          # awk 'NF' counts non-empty lines portably — `grep -c .` semantics
+          # around no-trailing-newline are GNU-grep-version-dependent.
+          DIFF_COUNT=$(awk 'NF' <<< "$TF_DIFF" | wc -l | tr -d ' ')
+
+          # The shared diff body — every branch (bypass or fail) renders
+          # this details block; only the leading header + footer differ
+          # so the step summary visually matches the actual outcome.
+          # The code fence uses ```text so any future TF_DIFF content
+          # (even one containing literal triple-backticks, which would
+          # be unusual but not impossible in a path) renders cleanly.
+          # NOTE: this helper is defined inside the same `run:` block as
+          # its callers because each step is a fresh shell. If a future
+          # refactor splits the stale-tf check across multiple steps,
+          # extract this to .github/scripts/ and source it.
+          render_diff_details() {
+            echo "Scope: \`terraform/environments/prod/\` + \`terraform/modules/\`. $DIFF_COUNT prod-affecting terraform file(s) changed between last applied commit \`${LAST_TF_SHA:0:8}\` and deploy SHA \`${CURRENT_SHA:0:8}\`."
+            echo ""
+            echo "<details><summary>Changed files</summary>"
+            echo ""
+            echo '```text'
+            echo "$TF_DIFF"
+            echo '```'
+            echo ""
+            echo "</details>"
+          }
+
+          if [[ "$ALLOW_STALE_TERRAFORM" == "true" ]]; then
+            {
+              echo "## :warning: Stale terraform — bypassed via allow_stale_terraform"
+              echo ""
+              render_diff_details
+              echo ""
+              echo "Operator passed \`allow_stale_terraform=true\` — proceeding without re-applying terraform."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Stale terraform detected ($DIFF_COUNT prod-affecting files changed since ${LAST_TF_SHA:0:8}) — bypass enabled via allow_stale_terraform=true. Proceeding."
+            exit 0
+          fi
+
+          if [[ "$ROLLBACK" == "true" ]]; then
+            # Rollback is auto-bypassed (rolling back app code typically
+            # wants existing infra). Surface the diff inline so the operator
+            # at least sees what they're bypassing — the runbook (Case C)
+            # asks them to read it before proceeding, but if we never
+            # show it they can't.
+            #
+            # Caveat the runbook also covers: a rollback to a pre-infra-
+            # change image when post-infra-change resources have already
+            # been created can still fail at runtime (e.g., new env var
+            # the old binary doesn't read, or a missing secret reference
+            # whose IAM was tightened by the infra change). The bypass
+            # is convenience, not safety.
+            #
+            # The DIFF_PRINT_CAP below caps only the inline run-log echo —
+            # the GITHUB_STEP_SUMMARY <details> block from
+            # render_diff_details intentionally renders the full diff
+            # (collapsed by default, so it does not flood visually) so an
+            # operator verifying-then-bypassing has the complete file list.
+            {
+              echo "## :warning: Stale terraform — bypassed via rollback=true"
+              echo ""
+              render_diff_details
+              echo ""
+              echo "\`rollback=true\` auto-bypasses (rolling back app code typically wants existing infra)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            DIFF_PRINT_CAP=50
+            echo "::warning::Stale terraform detected ($DIFF_COUNT prod-affecting files changed since ${LAST_TF_SHA:0:8}) — rollback=true auto-bypasses. Diff (showing first $DIFF_PRINT_CAP):"
+            head -n "$DIFF_PRINT_CAP" <<< "$TF_DIFF" | while IFS= read -r line; do
+              printf '  %s\n' "$line"
+            done
+            if (( DIFF_COUNT > DIFF_PRINT_CAP )); then
+              echo "  ... ($((DIFF_COUNT - DIFF_PRINT_CAP)) more file(s) — full list in the GITHUB_STEP_SUMMARY rendered above)"
+            fi
+            exit 0
+          fi
+
+          # Failure path — reaches here only when neither bypass applied.
+          {
+            echo "## :x: Stale terraform check"
+            echo ""
+            render_diff_details
+            echo ""
+            echo "Two ways forward:"
+            echo "1. Re-run with \`run_terraform=true\` (recommended — applies the pending infra change before the deploy)."
+            echo "2. Re-run with \`allow_stale_terraform=true\` if you have verified the diff is benign or you are intentionally rolling back app code."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Stale terraform: $DIFF_COUNT prod-affecting file(s) changed between last-apply ${LAST_TF_SHA:0:8} and deploy SHA ${CURRENT_SHA:0:8}. Re-run with run_terraform=true (preferred) or allow_stale_terraform=true to bypass."
+          exit 1
+
+      # Lock acquisition runs LAST in preflight so any failing earlier
+      # check leaves the lock untouched (failures during preflight don't
+      # ever flip /prod/nhp/deploy/state to "deploying"). The finalize
+      # release step uses `put-parameter --overwrite`, which has no
+      # acquired-lock precondition, so a failed-preflight run still
+      # cleanly writes `failed` and never errors on a never-acquired lock.
       - name: Check and acquire deployment lock
         env:
           FORCE_UNLOCK: ${{ inputs.force_unlock }}
@@ -1130,6 +1692,15 @@ jobs:
   qurl-schema-compat:
     name: QURL Schema Compatibility Check
     needs: [manifest, preflight, terraform-plan]
+    # Schema-compat is a guard for the *apply* — it asserts the post-
+    # apply schema matches what the deployed qurl image expects. On a
+    # `run_terraform=false` deploy, terraform isn't applying, so there
+    # is no post-apply schema to compare against; the check would have
+    # nothing to do. Operators wanting to deploy a new qurl image
+    # against existing infra are responsible for confirming schema
+    # compatibility ahead of time (the runbook's Case B step 1 spells
+    # this out explicitly). The structural test pins this gate;
+    # `_assert_terraform_apply_needs_schema_compat` asserts the intent.
     if: inputs.run_terraform
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1370,7 +1941,9 @@ jobs:
           TF_VAR_confirm_prod_deployment: "yes-deploy-to-production"
           TF_VAR_image_tag: ${{ needs.manifest.outputs.effective_image_tag }}
           TF_VAR_cell_id: ${{ inputs.cell_id }}
-        run: terraform apply -auto-approve tfplan
+        # `-no-color` matches the plan step's flag so apply output stays
+        # readable in `gh run view --log` (no embedded ANSI escapes).
+        run: terraform apply -auto-approve -no-color tfplan
 
   # =============================================================================
   # DEPLOY SERVER - Via canary (Step Functions) with first-deploy fallback
@@ -1378,11 +1951,20 @@ jobs:
   deploy-server:
     name: Deploy NHP Server
     needs: [manifest, preflight, terraform-plan, terraform-apply]
+    # When run_terraform=true a skipped terraform-apply (e.g., qurl-schema-
+    # compat blocked it) must NOT release new binaries onto stale infra —
+    # only honor a skipped apply when the operator explicitly opted out
+    # via run_terraform=false (issue #1322).
+    # Asserted by tests/scripts/test_promote_to_prod_gating.py; update
+    # that test's APPLY_SUCCESS_RE / APPLY_SKIPPED_RE / DEAD_PERMISSIVE_RE
+    # constants if the gate phrasing here changes.
     if: |
       always() &&
       needs.preflight.result == 'success' &&
-      (needs.terraform-plan.result == 'success' || needs.terraform-plan.result == 'skipped') &&
-      (needs.terraform-apply.result == 'success' || needs.terraform-apply.result == 'skipped') &&
+      (
+        (inputs.run_terraform && needs.terraform-apply.result == 'success') ||
+        (!inputs.run_terraform && needs.terraform-apply.result == 'skipped')
+      ) &&
       inputs.deploy_server
     runs-on: ubuntu-latest
     timeout-minutes: 50
@@ -1463,11 +2045,20 @@ jobs:
   deploy-ac:
     name: Deploy Access Controller
     needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server]
+    # Same terraform-apply rule as deploy-server (issue #1322). The
+    # deploy-server clause preserves the chained-deploy contract: AC can
+    # run when only AC was selected, but not when server failed mid-chain.
+    # Asserted by tests/scripts/test_promote_to_prod_gating.py — a 4th
+    # image-deploy job needs the floor bumped in _assert_image_deploys
+    # AND must inherit the gate shape covered by APPLY_SUCCESS_RE /
+    # APPLY_SKIPPED_RE.
     if: |
       always() &&
       needs.preflight.result == 'success' &&
-      (needs.terraform-plan.result == 'success' || needs.terraform-plan.result == 'skipped') &&
-      (needs.terraform-apply.result == 'success' || needs.terraform-apply.result == 'skipped') &&
+      (
+        (inputs.run_terraform && needs.terraform-apply.result == 'success') ||
+        (!inputs.run_terraform && needs.terraform-apply.result == 'skipped')
+      ) &&
       (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
       inputs.deploy_ac
     runs-on: ubuntu-latest
@@ -1549,11 +2140,19 @@ jobs:
   deploy-qurl:
     name: Deploy QURL Service
     needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server, deploy-ac]
+    # Same terraform-apply rule as deploy-server (issue #1322). The
+    # deploy-server / deploy-ac clauses preserve the chained-deploy contract.
+    # Asserted by tests/scripts/test_promote_to_prod_gating.py — a 4th
+    # image-deploy job needs the floor bumped in _assert_image_deploys
+    # AND must inherit the gate shape covered by APPLY_SUCCESS_RE /
+    # APPLY_SKIPPED_RE.
     if: |
       always() &&
       needs.preflight.result == 'success' &&
-      (needs.terraform-plan.result == 'success' || needs.terraform-plan.result == 'skipped') &&
-      (needs.terraform-apply.result == 'success' || needs.terraform-apply.result == 'skipped') &&
+      (
+        (inputs.run_terraform && needs.terraform-apply.result == 'success') ||
+        (!inputs.run_terraform && needs.terraform-apply.result == 'skipped')
+      ) &&
       (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
       (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
       inputs.deploy_qurl
@@ -1841,7 +2440,7 @@ jobs:
   finalize:
     name: Finalize
     if: always()
-    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server, deploy-ac, deploy-qurl, smoke-test, qurl-smoke-tests, nhp-smoke-tests, monitor]
+    needs: [manifest, preflight, terraform-plan, qurl-schema-compat, terraform-apply, deploy-server, deploy-ac, deploy-qurl, smoke-test, qurl-smoke-tests, nhp-smoke-tests, monitor]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -1851,12 +2450,16 @@ jobs:
           role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # The `id: outcome` and `SCHEMA_COMPAT_RESULT` env wiring are
+      # asserted by tests/scripts/test_promote_to_prod_gating.py — renaming
+      # either will fail that test until both sides update together.
       - name: Determine deployment outcome
         id: outcome
         env:
           MANIFEST_RESULT: ${{ needs.manifest.result }}
           PREFLIGHT_RESULT: ${{ needs.preflight.result }}
           TF_PLAN_RESULT: ${{ needs.terraform-plan.result }}
+          SCHEMA_COMPAT_RESULT: ${{ needs.qurl-schema-compat.result }}
           TF_RESULT: ${{ needs.terraform-apply.result }}
           SERVER_RESULT: ${{ needs.deploy-server.result }}
           AC_RESULT: ${{ needs.deploy-ac.result }}
@@ -1867,9 +2470,23 @@ jobs:
           MONITOR_RESULT: ${{ needs.monitor.result }}
         run: |
           # Check if any non-skipped job failed. As of PR3, nhp-smoke-tests
-          # is included in the FAILED loop — no longer report-only.
+          # is included in the FAILED loop — no longer report-only. As of
+          # issue #1322, qurl-schema-compat is also in the loop so a failed
+          # schema check produces an unambiguous workflow failure (it would
+          # otherwise cascade to skipped terraform-apply / skipped deploys
+          # and finalize would silently report success).
+          #
+          # SCHEMA_COMPAT_RESULT=skipped is expected and benign when
+          # run_terraform=false (qurl-schema-compat itself has
+          # `if: inputs.run_terraform`); the FAILED loop only flags
+          # `failure` / `cancelled`, so the skipped path is already
+          # correct — no extra branch needed here. SCHEMA_COMPAT_RESULT=
+          # cancelled (operator hit Cancel mid-run) IS caught: the
+          # `cancelled` arm of the loop fails the workflow so a half-
+          # cancelled run does not silently report success, matching the
+          # treatment of every other job's cancelled state.
           FAILED=false
-          for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_PLAN_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$AC_RESULT" "$QURL_RESULT" "$SMOKE_RESULT" "$QURL_SMOKE_RESULT" "$NHP_SMOKE_RESULT" "$MONITOR_RESULT"; do
+          for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_PLAN_RESULT" "$SCHEMA_COMPAT_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$AC_RESULT" "$QURL_RESULT" "$SMOKE_RESULT" "$QURL_SMOKE_RESULT" "$NHP_SMOKE_RESULT" "$MONITOR_RESULT"; do
             if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
               FAILED=true
               break
@@ -1882,14 +2499,175 @@ jobs:
             echo "status=success" >> "$GITHUB_OUTPUT"
           fi
 
+      # Tracking-write step runs BEFORE lock release so a tracking-put
+      # failure cleanly propagates to the lock + SNS via the conditional
+      # status expression `(tracking failed → 'failed' else outcome)`.
+      # Pre-round-38, tracking ran AFTER lock release: a failed tracking
+      # put left the lock saying "deployed" while the workflow conclusion
+      # was "failure" — the runbook documented the recovery, but the
+      # divergence was a real footgun on-call would hit.
+      - name: Update terraform apply tracking
+        id: tracking
+        if: needs.terraform-apply.result == 'success'
+        env:
+          # Bind interpolated values via env: rather than splicing
+          # ${{ ... }} directly into the script body. github.sha is
+          # trusted (hex-only), so this is style consistency, not a
+          # security concern — but every other shell step in this file
+          # uses env-binding, and mixing styles is a footgun for the
+          # next maintainer.
+          COMMIT_SHA: ${{ github.sha }}
+        # last-terraform-apply-commit feeds the next promote's stale-tf
+        # gate (#1322). Fail the job on a silent put failure so the
+        # operator notices on this deploy, not the next one.
+        #
+        # 3 retries with linear backoff (3s, 6s) absorb a transient
+        # SSM throttle without softening the invariant.
+        #
+        # Backoff trade-off: a sustained throttle (rare; would need a
+        # cross-region SSM degradation) won't be absorbed in 9s
+        # worst-case. We accept that — recovery is the manual re-seed
+        # documented in the runbook. Adding a 4th attempt with longer
+        # backoff or jitter would help in the rare sustained-throttle
+        # case, but we'd be optimizing for a failure mode that has
+        # never been observed in this workflow's history; revisit if
+        # CloudWatch ever shows sustained `RetryPut` patterns.
+        #
+        # Atomicity: write COMMIT first (load-bearing for the gate),
+        # then the timestamp (informational). A throttled timestamp put
+        # after a successful commit put fails finalize — accepted over
+        # a silent partial-update because the gate consumes only the
+        # commit, recovery is just re-dispatching the workflow, and
+        # splitting into two steps loses the atomic invariant. Revisit
+        # if AWS service degradation makes the false-failure routine.
+        run: |
+          set -euo pipefail
+          echo "Recording last successful terraform apply commit..."
+
+          retry_put() {
+            local name="$1"
+            local value="$2"
+            local err_file
+            err_file=$(mktemp)
+            for attempt in 1 2 3; do
+              : > "$err_file"
+              if aws ssm put-parameter \
+                  --name "$name" \
+                  --value "$value" \
+                  --type String \
+                  --overwrite 2>"$err_file" >/dev/null; then
+                rm -f "$err_file"
+                return 0
+              fi
+              if [[ $attempt -lt 3 ]]; then
+                local backoff=$((attempt * 3))
+                echo "  put-parameter $name attempt $attempt failed, retrying in ${backoff}s..."
+                sleep "$backoff"
+              fi
+            done
+            echo "::error::Failed to update SSM parameter $name after 3 attempts:"
+            while IFS= read -r line; do
+              printf '  %s\n' "$line"
+            done < "$err_file"
+            rm -f "$err_file"
+            return 1
+          }
+
+          # Order matters: write the COMMIT first (load-bearing for the
+          # next run's gate) then the timestamp (informational). The
+          # success log line below only prints if BOTH succeeded under
+          # `set -e` — if the second put fails after retries, the
+          # script exits before this echo, so the run log doesn't
+          # falsely claim success.
+          retry_put "/prod/nhp/deploy/last-terraform-apply-commit" "$COMMIT_SHA"
+          retry_put "/prod/nhp/deploy/last-terraform-apply-at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "  Terraform tracking: last-terraform-apply-commit=$COMMIT_SHA"
+
+      # Resolve the final status ONCE so downstream steps (lock release,
+      # metric, SNS, summary) can reference `steps.final_status.outputs.value`
+      # instead of repeating the conditional expression at each callsite.
+      # Pre-round-43, the conditional `tracking.outcome == 'failure' &&
+      # 'failed' || outcome.outputs.status` was duplicated four times —
+      # a refactor that demoted on a different signal would have needed
+      # four updates.
+      - name: Resolve final status
+        id: final_status
+        if: always()
+        env:
+          TRACKING_OUTCOME: ${{ steps.tracking.outcome }}
+          OUTCOME_STATUS: ${{ steps.outcome.outputs.status }}
+        run: |
+          if [[ "$TRACKING_OUTCOME" == "failure" ]]; then
+            echo "value=failed" >> "$GITHUB_OUTPUT"
+          elif [[ -z "$OUTCOME_STATUS" ]]; then
+            # Defensive: if `outcome` ever skips (e.g., a future
+            # maintainer adds an `if:` to it), OUTCOME_STATUS arrives
+            # empty and downstream consumers would write LOCK_VALUE=
+            # (empty). Default to `failed` so the workflow conclusion,
+            # SNS, lock, and metric stay aligned with "something went
+            # wrong" rather than silently degrading to an empty string.
+            echo "::warning::Resolve final status: outcome step did not produce a status; defaulting to failed."
+            echo "value=failed" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=$OUTCOME_STATUS" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Release deployment lock
         if: always()
         env:
-          DEPLOY_STATUS: ${{ steps.outcome.outputs.status }}
+          # Conditional: if the tracking step failed (post-round-38
+          # ordering puts it before this step), treat the run as failed
+          # for lock-state purposes. Otherwise honor the outcome step's
+          # status. `steps.tracking.outcome == 'skipped'` (terraform-apply
+          # didn't run) returns the original outcome.status — no false
+          # demotion.
+          DEPLOY_STATUS: ${{ steps.final_status.outputs.value }}
+          TF_RESULT: ${{ needs.terraform-apply.result }}
+          SERVER_RESULT: ${{ needs.deploy-server.result }}
+          AC_RESULT: ${{ needs.deploy-ac.result }}
+          QURL_RESULT: ${{ needs.deploy-qurl.result }}
+        # Lock layering: the SSM `/prod/nhp/deploy/state` parameter is
+        # informational/post-hoc. Real concurrency enforcement is the
+        # workflow-level `concurrency: group: promote-to-prod, cancel-
+        # in-progress: false` at the top of this file, which serializes
+        # runs at the GHA scheduler. The SSM lock is for cross-tooling
+        # observability (operator inspecting state outside a workflow
+        # run) and the force_unlock input is for the rare case where
+        # GHA's concurrency state diverges from SSM's. A finalize that
+        # runs concurrently with another finalize would still both
+        # write to SSM in some order — but cancel-in-progress=false
+        # plus the deploy-state read in preflight prevent the race in
+        # practice.
         run: |
+          # State machine for /prod/nhp/deploy/state:
+          # - success → "deployed"
+          # - failure where terraform-apply OR any deploy-* job ran
+          #   (success or failure) → "failed". This covers the case
+          #   where terraform-apply failed mid-graph and left prod in
+          #   a partially-converged state — labelling that "rejected"
+          #   would be a lie since some resources DID land.
+          # - failure where terraform-apply AND every deploy-* job
+          #   were skipped (preflight reject / stale-tf reject /
+          #   schema-compat block / schema-compat cancelled /
+          #   terraform-plan failure cascading a skipped apply) →
+          #   "rejected". The previous deploy-state remains the
+          #   authoritative description of prod.
+          #
+          # Schema-compat cancellation note: an operator-cancelled
+          # qurl-schema-compat job produces TF=skipped + deploys=
+          # skipped (same shape as a schema-compat failure), so this
+          # branch correctly maps to "rejected". The runbook's
+          # vocabulary entry for "rejected" describes this state
+          # accurately ("nothing landed").
           echo "Releasing deployment lock..."
-          LOCK_VALUE="deployed"
-          if [[ "$DEPLOY_STATUS" != "success" ]]; then
+          if [[ "$DEPLOY_STATUS" == "success" ]]; then
+            LOCK_VALUE="deployed"
+          elif [[ "$TF_RESULT" == "skipped" \
+               && "$SERVER_RESULT" == "skipped" \
+               && "$AC_RESULT" == "skipped" \
+               && "$QURL_RESULT" == "skipped" ]]; then
+            LOCK_VALUE="rejected"
+          else
             LOCK_VALUE="failed"
           fi
           aws ssm put-parameter \
@@ -1899,6 +2677,16 @@ jobs:
             --overwrite || echo "::warning::Failed to release deployment lock"
           echo "  Lock released: /prod/nhp/deploy/state = $LOCK_VALUE"
 
+      # Intentionally NOT demoted via final_status: this step writes
+      # `deployed-commit` (what binary is currently running), and that
+      # claim is true even if the tracking step (which writes
+      # `last-terraform-apply-commit`) failed afterwards. Demoting on
+      # tracking failure here would make the next rollback's
+      # `deployed-commit-previous` resolution incorrect — prod IS
+      # running the new binaries; only the side-tracking write failed.
+      # The other 4 status-flow callsites (lock/metric/SNS/summary)
+      # use final_status because they describe the run, not the
+      # deployed binaries.
       - name: Update deployment tracking
         if: steps.outcome.outputs.status == 'success'
         env:
@@ -1906,52 +2694,80 @@ jobs:
         run: |
           echo "Updating deployment tracking..."
 
+          # Mirror the retry_put helper from `Update terraform apply tracking`
+          # so transient SSM throttle on these writes degrades gracefully
+          # (warn-only here — these are post-success informational writes,
+          # not gate-relevant; the load-bearing tracking writes already
+          # ran before lock release).
+          retry_put_warn() {
+            local name="$1"
+            local value="$2"
+            local err_file
+            err_file=$(mktemp)
+            for attempt in 1 2 3; do
+              : > "$err_file"
+              if aws ssm put-parameter \
+                  --name "$name" \
+                  --value "$value" \
+                  --type String \
+                  --overwrite 2>"$err_file" >/dev/null; then
+                rm -f "$err_file"
+                return 0
+              fi
+              if [[ $attempt -lt 3 ]]; then
+                local backoff=$((attempt * 3))
+                echo "  put-parameter $name attempt $attempt failed, retrying in ${backoff}s..."
+                sleep "$backoff"
+              fi
+            done
+            echo "::warning::Failed to update SSM parameter $name after 3 attempts:"
+            while IFS= read -r line; do
+              printf '  %s\n' "$line"
+            done < "$err_file"
+            rm -f "$err_file"
+            return 0
+          }
+
           # Save the current deployed-commit as previous before overwriting,
           # so rollback can target the actual previous version (not current)
           CURRENT=$(aws ssm get-parameter \
             --name "/prod/nhp/deploy/deployed-commit" \
             --query "Parameter.Value" --output text 2>/dev/null || echo "")
-          if [[ -n "$CURRENT" && "$CURRENT" != "initial" && "$CURRENT" != "$IMAGE_TAG" ]]; then
-            aws ssm put-parameter \
-              --name "/prod/nhp/deploy/deployed-commit-previous" \
-              --value "$CURRENT" --type String --overwrite \
-              || echo "::warning::Failed to update deployed-commit-previous"
+          # Triple-sentinel check matching the stale-tf guard: "" /
+          # "initial" / "None" all map to "no real prior commit". The
+          # AWS-CLI `--output text` literal `None` slips through a
+          # bare `!= "initial"` check; mirror the stale-tf check at
+          # line 1097 so the asymmetry can't produce a "deployed-
+          # commit-previous=None" forensic landmine.
+          if [[ -n "$CURRENT" \
+             && "$CURRENT" != "initial" \
+             && "$CURRENT" != "None" \
+             && "$CURRENT" != "$IMAGE_TAG" ]]; then
+            retry_put_warn "/prod/nhp/deploy/deployed-commit-previous" "$CURRENT"
             echo "  Previous commit saved: deployed-commit-previous=$CURRENT"
           fi
 
-          aws ssm put-parameter \
-            --name "/prod/nhp/deploy/deployed-commit" \
-            --value "$IMAGE_TAG" --type String --overwrite \
-            || echo "::warning::Failed to update deployed-commit"
-          aws ssm put-parameter \
-            --name "/prod/nhp/deploy/deployed-at" \
-            --value "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --type String --overwrite \
-            || echo "::warning::Failed to update deployed-at"
+          retry_put_warn "/prod/nhp/deploy/deployed-commit" "$IMAGE_TAG"
+          retry_put_warn "/prod/nhp/deploy/deployed-at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           echo "  Tracking updated: deployed-commit=$IMAGE_TAG"
-
-      - name: Update terraform apply tracking
-        if: needs.terraform-apply.result == 'success'
-        run: |
-          echo "Recording last successful terraform apply commit..."
-          aws ssm put-parameter \
-            --name "/prod/nhp/deploy/last-terraform-apply-commit" \
-            --value "${{ github.sha }}" --type String --overwrite \
-            || echo "::warning::Failed to update last-terraform-apply-commit"
-          aws ssm put-parameter \
-            --name "/prod/nhp/deploy/last-terraform-apply-at" \
-            --value "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --type String --overwrite \
-            || echo "::warning::Failed to update last-terraform-apply-at"
-          echo "  Terraform tracking: last-terraform-apply-commit=${{ github.sha }}"
 
       - name: Push CloudWatch deployment metric
         if: always()
         env:
-          DEPLOY_STATUS: ${{ steps.outcome.outputs.status }}
+          # Same conditional as Release deployment lock: a tracking
+          # failure demotes status to "failed" so the metric reflects
+          # the workflow's actual outcome.
+          DEPLOY_STATUS: ${{ steps.final_status.outputs.value }}
         run: |
+          # Pair-of-args dimensions form (NOT comma-joined shorthand)
+          # to match push_could_not_verify_metric in the preflight job.
+          # Today $DEPLOY_STATUS is constrained to success/failed, but
+          # the form is forward-defensive against any future Status
+          # value containing a comma or space.
           aws cloudwatch put-metric-data \
             --namespace "LayerV/NHP" \
             --metric-name "DeploymentEvent" \
-            --dimensions "Environment=prod,Strategy=promote,Status=$DEPLOY_STATUS" \
+            --dimensions Name=Environment,Value=prod Name=Strategy,Value=promote Name=Status,Value="$DEPLOY_STATUS" \
             --value 1 \
             --unit Count \
             || echo "::warning::Failed to push deployment metric"
@@ -1961,10 +2777,15 @@ jobs:
         if: always()
         env:
           IMAGE_TAG: ${{ needs.manifest.outputs.effective_image_tag }}
-          DEPLOY_STATUS: ${{ steps.outcome.outputs.status }}
+          # Same conditional as Release deployment lock + Push metric:
+          # tracking failure demotes status so SNS reflects the
+          # workflow's actual outcome (no false-success notification
+          # while the workflow conclusion is failure).
+          DEPLOY_STATUS: ${{ steps.final_status.outputs.value }}
           MANIFEST_RESULT: ${{ needs.manifest.result }}
           PREFLIGHT_RESULT: ${{ needs.preflight.result }}
           TF_PLAN_RESULT: ${{ needs.terraform-plan.result }}
+          SCHEMA_COMPAT_RESULT: ${{ needs.qurl-schema-compat.result }}
           TF_RESULT: ${{ needs.terraform-apply.result }}
           SERVER_RESULT: ${{ needs.deploy-server.result }}
           AC_RESULT: ${{ needs.deploy-ac.result }}
@@ -1973,8 +2794,14 @@ jobs:
           QURL_SMOKE_RESULT: ${{ needs.qurl-smoke-tests.result }}
           NHP_SMOKE_RESULT: ${{ needs.nhp-smoke-tests.result }}
           MONITOR_RESULT: ${{ needs.monitor.result }}
+          # Force-push protection state surfaced from preflight so
+          # operators see "Protection: unverified" in the notification
+          # rather than relying on a buried ::warning::. Empty when
+          # preflight is skipped (e.g., manifest rejected).
+          PROTECTION_STATUS: ${{ needs.preflight.outputs.protection_status }}
           ROLLBACK: ${{ inputs.rollback }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TRIGGERED_BY: ${{ github.actor }}
         run: |
           SNS_ARN=$(aws ssm get-parameter \
             --name "/prod/nhp/monitoring/sns-topic-arn" \
@@ -2003,30 +2830,104 @@ jobs:
             esac
           }
 
-          MSG="Production Promotion Notification${MODE}"
-          MSG+="\n"
-          MSG+="\n  Status:    ${STATUS_UPPER}"
-          MSG+="\n  Image Tag: ${IMAGE_TAG}"
-          MSG+="\n  Triggered: ${{ github.actor }}"
-          MSG+="\n"
-          MSG+="\n  Manifest:   $(result_icon "$MANIFEST_RESULT")"
-          MSG+="\n  Preflight:  $(result_icon "$PREFLIGHT_RESULT")"
-          MSG+="\n  TF Plan:    $(result_icon "$TF_PLAN_RESULT")"
-          MSG+="\n  TF Apply:   $(result_icon "$TF_RESULT")"
-          MSG+="\n  Server:     $(result_icon "$SERVER_RESULT")"
-          MSG+="\n  AC:         $(result_icon "$AC_RESULT")"
-          MSG+="\n  QURL:       $(result_icon "$QURL_RESULT")"
-          MSG+="\n  Smoke Test: $(result_icon "$SMOKE_RESULT")"
-          MSG+="\n  QURL Smoke: $(result_icon "$QURL_SMOKE_RESULT")"
-          MSG+="\n  NHP Smoke:  $(result_icon "$NHP_SMOKE_RESULT")"
-          MSG+="\n  Monitor:    $(result_icon "$MONITOR_RESULT")"
-          MSG+="\n"
-          MSG+="\n  Run: ${WORKFLOW_URL}"
+          # Auto-pad the result rows so a future row addition longer than
+          # the longest current label doesn't silently break alignment.
+          # The literal space in the format string supplies the gap before
+          # the icon — `%-Ns` left-pads the label to its own width, no
+          # implicit margin. The structural test asserts every label-with-
+          # colon fits within LABEL_WIDTH; bump LABEL_WIDTH if a future
+          # row has a longer label.
+          #
+          # IMPORTANT: the format string has NO trailing newline. The
+          # `\n` is at the START. Callers use `MSG+=$(row ...)`, and
+          # `$()` strips trailing newlines — adding a trailing `\n` to
+          # the format would silently swallow it and break alignment.
+          # If you want a trailing newline, append `$'\n'` to the
+          # caller, not the format.
+          # 20 = 14 chars (longest current label "Schema Compat:") + 6
+          # chars of headroom so a future row label like "Image
+          # Replication:" (17 chars) lands without restructuring.
+          # The structural test asserts every label-with-colon fits;
+          # bumping further requires a paired test bump.
+          LABEL_WIDTH=20
+          row() {
+            local label="$1"
+            local result="$2"
+            printf '\n  %-*s %s' "$LABEL_WIDTH" "$label:" "$(result_icon "$result")"
+          }
 
+          # Newline policy: every line below uses real newlines via
+          # ANSI-C `$'\n'` to match the row() helper's `printf '\n...'`.
+          # The earlier mixed `MSG+="\n..."` form interpreted via
+          # `echo -e` worked, but mixing literal-backslash-n and real
+          # newlines in the same buffer is a footgun for the next
+          # maintainer.
+          MSG="Production Promotion Notification${MODE}"
+          MSG+=$'\n'
+          MSG+=$'\n  Status:    '"${STATUS_UPPER}"
+          MSG+=$'\n  Image Tag: '"${IMAGE_TAG}"
+          MSG+=$'\n  Triggered: '"$TRIGGERED_BY"
+          MSG+=$'\n'
+          # Bumping a label here? Bump LABEL_WIDTH (above) and re-run
+          # `make lint-workflows` — _assert_sns_row_widths fails loudly
+          # if any label-with-colon exceeds the width.
+          MSG+=$(row "Manifest"      "$MANIFEST_RESULT")
+          MSG+=$(row "Preflight"     "$PREFLIGHT_RESULT")
+          MSG+=$(row "TF Plan"       "$TF_PLAN_RESULT")
+          MSG+=$(row "Schema Compat" "$SCHEMA_COMPAT_RESULT")
+          MSG+=$(row "TF Apply"      "$TF_RESULT")
+          MSG+=$(row "Server"        "$SERVER_RESULT")
+          MSG+=$(row "AC"            "$AC_RESULT")
+          MSG+=$(row "QURL"          "$QURL_RESULT")
+          MSG+=$(row "Smoke Test"    "$SMOKE_RESULT")
+          MSG+=$(row "QURL Smoke"    "$QURL_SMOKE_RESULT")
+          MSG+=$(row "NHP Smoke"     "$NHP_SMOKE_RESULT")
+          MSG+=$(row "Monitor"       "$MONITOR_RESULT")
+          MSG+=$'\n'
+          # Pull last-terraform-apply-at out of SSM so the notification
+          # footer surfaces the value (would otherwise be dead-write).
+          # Best-effort with silent fallback to "unknown" — this is the
+          # ONE place in this PR where we accept a silent SSM read
+          # failure, and the inconsistency is intentional. Rationale:
+          # this is a footer enrichment for a notification that has
+          # already correctly reported the deploy status. If SSM is
+          # genuinely down here, the message degrades gracefully (the
+          # operator sees "unknown" and knows to read the full SSM
+          # parameter directly) — making it fail-loud would block the
+          # SNS notification entirely, which is a worse failure mode
+          # than degraded text.
+          LAST_TF_APPLY_AT=$(aws ssm get-parameter \
+            --name "/prod/nhp/deploy/last-terraform-apply-at" \
+            --query "Parameter.Value" --output text 2>/dev/null \
+            || echo "unknown")
+          # Belt-and-suspenders: strip newlines that could break SNS
+          # message formatting. The path is operator-writable (gated
+          # by AWS_PROD_ROLE_ARN); a value with embedded \n would
+          # corrupt the multi-line MSG layout below.
+          LAST_TF_APPLY_AT="${LAST_TF_APPLY_AT//$'\n'/ }"
+          MSG+=$'\n  Last TF Apply: '"$LAST_TF_APPLY_AT"
+          # Empty when preflight was skipped (e.g., manifest rejected),
+          # OR if verify-protection ever reaches a code path without
+          # set_status (defense-in-depth — the step always sets one
+          # today, but a future maintainer adding a branch could miss
+          # the call). Show literal so on-call can distinguish the two
+          # cases by job result: preflight=success + (unset) implies a
+          # bug; preflight=skipped + (preflight skipped) is expected.
+          if [[ "${PREFLIGHT_RESULT}" == "skipped" ]]; then
+            PROTECTION_DISPLAY="(preflight skipped)"
+          else
+            PROTECTION_DISPLAY="${PROTECTION_STATUS:-(unset)}"
+          fi
+          MSG+=$'\n  Protection: '"$PROTECTION_DISPLAY"
+          MSG+=$'\n  Run: '"${WORKFLOW_URL}"
+
+          # MSG now contains real newlines throughout, so `--message`
+          # passes it through directly — no `echo -e` interpretation
+          # needed.
           aws sns publish \
             --topic-arn "$SNS_ARN" \
             --subject "$SUBJECT" \
-            --message "$(echo -e "$MSG")" \
+            --message "$MSG" \
             || echo "::warning::SNS notification failed"
 
       - name: Deployment summary
@@ -2034,10 +2935,12 @@ jobs:
         env:
           IMAGE_TAG: ${{ needs.manifest.outputs.effective_image_tag }}
           QURL_IMAGE_TAG: ${{ needs.manifest.outputs.qurl_image_tag }}
-          DEPLOY_STATUS: ${{ steps.outcome.outputs.status }}
+          # Same conditional as the lock release + metric + SNS steps.
+          DEPLOY_STATUS: ${{ steps.final_status.outputs.value }}
           MANIFEST_RESULT: ${{ needs.manifest.result }}
           PREFLIGHT_RESULT: ${{ needs.preflight.result }}
           TF_PLAN_RESULT: ${{ needs.terraform-plan.result }}
+          SCHEMA_COMPAT_RESULT: ${{ needs.qurl-schema-compat.result }}
           TF_RESULT: ${{ needs.terraform-apply.result }}
           SERVER_RESULT: ${{ needs.deploy-server.result }}
           AC_RESULT: ${{ needs.deploy-ac.result }}
@@ -2078,6 +2981,7 @@ jobs:
             echo "| Manifest | $(result_emoji "$MANIFEST_RESULT") $MANIFEST_RESULT |"
             echo "| Preflight | $(result_emoji "$PREFLIGHT_RESULT") $PREFLIGHT_RESULT |"
             echo "| Terraform Plan | $(result_emoji "$TF_PLAN_RESULT") $TF_PLAN_RESULT |"
+            echo "| QURL Schema Compat | $(result_emoji "$SCHEMA_COMPAT_RESULT") $SCHEMA_COMPAT_RESULT |"
             echo "| Terraform Apply | $(result_emoji "$TF_RESULT") $TF_RESULT |"
             echo "| Deploy Server | $(result_emoji "$SERVER_RESULT") $SERVER_RESULT |"
             echo "| Deploy AC | $(result_emoji "$AC_RESULT") $AC_RESULT |"
