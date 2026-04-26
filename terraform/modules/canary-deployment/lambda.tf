@@ -5,6 +5,16 @@
 # Lambda Package
 # ==============================================================================
 
+# NOTE: this module is re-instantiated as `module.canary_deployment_ac`
+# in terraform/main.tf; both instances resolve `${path.module}` to the
+# same source dir, so both write to the same `output_path`. The writes
+# are idempotent today because the source content is identical. Adding
+# component-specific Lambda code (e.g. `if component == "ac"` in
+# `canary_orchestrator.py`) would make the two writes diverge AND race
+# under terraform's default `-parallelism=10`. If you need per-component
+# behavior, also split the `archive_file` (and add a second workflow
+# upload/download pair). See terraform/main.tf NOTE on
+# `module.canary_deployment_ac` and #1380.
 data "archive_file" "orchestrator" {
   type        = "zip"
   source_file = "${path.module}/lambda/canary_orchestrator.py"

@@ -47,6 +47,21 @@ silently.
 Runs from `make lint-workflows` (so it gates the same CI path as
 actionlint). Exits 0 on success, 1 on first failure.
 
+REPORTING CONVENTION
+====================
+
+Every primary assertion uses two channels in lockstep:
+
+  - `_check(label, ok, detail="")` prints `ok` / `FAIL` lines so a
+    human reading the test output can scan for the failure and see
+    the structured `detail` directly.
+  - `failures.append(message)` accumulates the structural-failure
+    list that `main()` exits 1 on.
+
+Both channels must be updated together when extending an assertion —
+emitting one without the other either swallows the failure (no
+non-zero exit) or produces output that doesn't match the exit code.
+
 ARCHITECTURE
 ============
 
@@ -102,11 +117,13 @@ from __future__ import annotations
 
 import contextlib
 import io
+import posixpath
 import re
 import sys
 import textwrap
-from pathlib import Path
+from collections import Counter
 from collections.abc import Callable
+from pathlib import Path
 
 try:
     import yaml
@@ -123,6 +140,19 @@ __test__ = False
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "promote-to-prod.yml"
+
+# Load-bearing convention: artifact names participating in the prod
+# `archive_file` plan→apply pass MUST start with this prefix. The two
+# Lambda-related assertions filter on it; a future Lambda artifact
+# named e.g. `watchdog-lambda` would silently bypass the gates. The
+# runbook documents the convention; #1380 tracks options to fence it
+# structurally.
+#
+# NOTE: the `_BAD_FIXTURE_LAMBDA_*` YAML fixtures below hard-code the
+# string literal `"lambda-"` (since textwrap-dedent doesn't substitute
+# Python identifiers). If this prefix is ever changed, update the
+# fixtures by hand alongside this constant.
+_LAMBDA_ARTIFACT_PREFIX = "lambda-"
 
 # Gate matchers — anchored regexes, NOT plain substrings. The naïve
 # `"inputs.run_terraform && success" in gate` test passes false-positively
@@ -331,6 +361,12 @@ def _check(label: str, ok: bool, detail: str = "") -> bool:
         for line in detail.splitlines():
             print(f"        {line}")
     return False
+
+
+def _info(label: str) -> None:
+    """Informational line — same channel as `_check` but not grep-able
+    as `ok`/`FAIL`. See the REPORTING CONVENTION docstring."""
+    print(f"  \033[36mℹ\033[0m    {label}")
 
 
 def _all_deploy_prefix_jobs(jobs: dict) -> list[str]:
@@ -985,6 +1021,445 @@ def _assert_force_push_verify_step(jobs: dict, failures: list[str]) -> None:
         )
 
 
+def _assert_lambda_artifact_symmetry(jobs: dict, failures: list[str]) -> None:
+    """Every `lambda-*` upload in terraform-plan has a matching download in terraform-apply.
+
+    promote-to-prod splits plan and apply into separate jobs on separate
+    runners; Lambdas built via terraform's `data "archive_file"` need
+    every zip uploaded by plan to be downloaded by apply (and vice
+    versa — an orphan download fails at runtime).
+
+    Performs five sub-checks against the plan/apply step lists:
+
+    1. **Job resolution** — `terraform-plan` and `terraform-apply`
+       resolve to jobs with steps (catches a job rename).
+    2. **Stray-step guard** — `lambda-*` uploads don't appear in
+       `terraform-apply` and downloads don't appear in
+       `terraform-plan` (catches cargo-cult into the wrong job).
+    3. **Duplicate detection** — no `lambda-*` artifact name
+       appears twice in the same job (set semantics elsewhere
+       would otherwise mask a missing pair).
+    4. **Name symmetry** — every uploaded name has a matching
+       downloaded name (and vice versa).
+    5. **Path correctness** — each download `path:` is the parent
+       directory of the matching upload `path:`, with a defensive
+       glob-rejection on the upload side so the comparison only
+       runs against single-file paths.
+    """
+    plan_steps = (jobs.get("terraform-plan") or {}).get("steps") or []
+    apply_steps = (jobs.get("terraform-apply") or {}).get("steps") or []
+
+    # Per-job lookup so a *half*-rename surfaces with the renamed job
+    # named in the failure rather than misleadingly reporting every
+    # upload as `upload_only`. Collect ALL missing jobs (rather than
+    # early-returning on the first) so an operator who renamed both at
+    # once gets both failures from a single CI cycle.
+    found_job_names = sorted(jobs)
+    any_missing = False
+    for job_name, steps in (("terraform-plan", plan_steps), ("terraform-apply", apply_steps)):
+        if not _check(
+            f"`{job_name}` job resolves to a job with steps",
+            bool(steps),
+            f"job `{job_name}` is missing or has no steps — name may have been renamed. "
+            f"Found jobs: {found_job_names}",
+        ):
+            failures.append(
+                f"_assert_lambda_artifact_symmetry: `{job_name}` did not "
+                f"resolve to a job with steps (found jobs: {found_job_names}). "
+                f"Either this assertion's job-name pin is stale, or "
+                f"promote-to-prod.yml renamed the job — investigate which "
+                f"side is canonical and update the other in lockstep."
+            )
+            any_missing = True
+    if any_missing:
+        # Downstream symmetry/duplicate/stray checks would compare
+        # against an empty list and produce noise; bail once we've
+        # surfaced every missing job.
+        return
+
+    def _lambda_artifact_steps(steps: list, action: str) -> list[tuple[str, str]]:
+        """Return (name, path) tuples from steps using `action`, filtered by `_LAMBDA_ARTIFACT_PREFIX`.
+
+        See the constant's module-top definition for the load-bearing
+        convention and the omission-gap tracker (#1380).
+        """
+        # Developer-error guard (not a workflow-content invariant —
+        # see REPORTING CONVENTION docstring): a typo in `action`
+        # would silently return `[]` and mask a genuine missing pair.
+        # Raise (not assert) so `python3 -O` can't strip the guard.
+        if action not in {"actions/upload-artifact", "actions/download-artifact"}:
+            raise RuntimeError(f"unexpected action prefix: {action!r}")
+        prefix = action + "@"
+        result: list[tuple[str, str]] = []
+        for step in steps:
+            if not str(step.get("uses", "")).startswith(prefix):
+                continue
+            with_block = step.get("with") or {}
+            name = with_block.get("name", "")
+            path = with_block.get("path", "")
+            if isinstance(name, str) and name.startswith(_LAMBDA_ARTIFACT_PREFIX):
+                result.append((name, str(path)))
+        return result
+
+    plan_uploads = _lambda_artifact_steps(plan_steps, "actions/upload-artifact")
+    apply_downloads = _lambda_artifact_steps(apply_steps, "actions/download-artifact")
+    plan_downloads = _lambda_artifact_steps(plan_steps, "actions/download-artifact")
+    apply_uploads = _lambda_artifact_steps(apply_steps, "actions/upload-artifact")
+
+    # Lists (not sets) so duplicates can be detected. Set semantics
+    # below would collapse two same-named uploads and silently mask a
+    # missing pair.
+    upload_list = [name for name, _ in plan_uploads]
+    download_list = [name for name, _ in apply_downloads]
+
+    # Stray-step guard: `lambda-*` uploads only belong in terraform-plan
+    # (the runner that materializes the zip from `data "archive_file"`),
+    # and downloads only in terraform-apply (the runner that consumes
+    # them). A cargo-culted upload in apply or download in plan would
+    # be a no-op or silently pass on the wrong runner; surface it.
+    stray_uploads = [name for name, _ in apply_uploads]
+    stray_downloads = [name for name, _ in plan_downloads]
+    stray_detail = "\n".join(
+        f"{label}: {names}"
+        for label, names in (
+            ("upload steps misplaced in terraform-apply", sorted(set(stray_uploads))),
+            ("download steps misplaced in terraform-plan", sorted(set(stray_downloads))),
+        )
+        if names
+    )
+    _check(
+        "`lambda-*` upload steps live in terraform-plan and download steps in terraform-apply",
+        not (stray_uploads or stray_downloads),
+        stray_detail,
+    )
+    if stray_uploads:
+        failures.append(
+            f"`lambda-*` upload step(s) misplaced in terraform-apply: "
+            f"{sorted(set(stray_uploads))} — uploads belong in terraform-plan"
+        )
+    if stray_downloads:
+        failures.append(
+            f"`lambda-*` download step(s) misplaced in terraform-plan: "
+            f"{sorted(set(stray_downloads))} — downloads belong in terraform-apply"
+        )
+
+    duplicate_uploads = sorted(n for n, c in Counter(upload_list).items() if c > 1)
+    duplicate_downloads = sorted(n for n, c in Counter(download_list).items() if c > 1)
+    duplicate_detail = "\n".join(
+        f"duplicate {label} names: {names}"
+        for label, names in (("upload", duplicate_uploads), ("download", duplicate_downloads))
+        if names
+    )
+    _check(
+        "every `lambda-*` artifact name appears at most once per job",
+        not (duplicate_uploads or duplicate_downloads),
+        duplicate_detail,
+    )
+    for label, names in (("upload", duplicate_uploads), ("download", duplicate_downloads)):
+        if names:
+            failures.append(f"duplicate `lambda-*` {label} artifact name(s): {names}")
+
+    uploaded = set(upload_list)
+    downloaded = set(download_list)
+    upload_only = sorted(uploaded - downloaded)
+    download_only = sorted(downloaded - uploaded)
+    symmetry_detail = "\n".join(
+        f"{label}: {names}"
+        for label, names in (
+            ("uploaded but never downloaded", upload_only),
+            ("downloaded but never uploaded", download_only),
+        )
+        if names
+    )
+    _check(
+        "every `lambda-*` upload in terraform-plan has a matching download in terraform-apply",
+        not (upload_only or download_only),
+        symmetry_detail,
+    )
+    if upload_only:
+        failures.append(
+            f"`lambda-*` artifact(s) uploaded in terraform-plan but "
+            f"missing a download in terraform-apply: {upload_only}"
+        )
+    if download_only:
+        failures.append(
+            f"`lambda-*` artifact(s) downloaded in terraform-apply "
+            f"but never uploaded in terraform-plan: {download_only}"
+        )
+
+    # Path-correctness check: each download `path:` must equal the
+    # parent directory of the matching upload `path:`. Without this,
+    # a typo like `terraform/modules/ac/lamda/` (missing `b`) on the
+    # download side passes the name-symmetry check above and re-
+    # introduces the exact `reading ZIP file ... no such file or
+    # directory` error #1326 closes. Closes #1381's name-vs-path
+    # asymmetry within this assertion's scope.
+    #
+    # Single-file-path assumption (enforced below): `actions/upload-
+    # artifact` accepts globs, but the convention for `lambda-*`
+    # artifacts is one zip per upload. The defensive check on
+    # upload paths catches the introduction of a glob/multi-line
+    # path before it can pass through `posixpath.dirname` and
+    # produce a misleading parent-dir comparison.
+    upload_path_by_name = dict(plan_uploads)
+    download_path_by_name = dict(apply_downloads)
+    # Reject non-scalar / glob / multi-line upload paths up front —
+    # the parent-dir comparison below assumes a single concrete file
+    # path. A glob like `terraform/modules/foo/*.zip` would dirname
+    # to `terraform/modules/foo` and pass the comparison while
+    # behavior diverges (download wouldn't match a glob-uploaded
+    # artifact). YAML's list form (`path: [a, b]`) parses to a Python
+    # list, so test scalar-string-ness explicitly to give an
+    # actionable diagnostic instead of a `TypeError` from `c in path`.
+    non_scalar_uploads = sorted(
+        name
+        for name, path in upload_path_by_name.items()
+        if not isinstance(path, str)
+    )
+    glob_uploads = sorted(
+        name
+        for name, path in upload_path_by_name.items()
+        if isinstance(path, str)
+        and any(c in path for c in ("*", "?", "\n"))
+    )
+    _check(
+        "`lambda-*` upload paths are scalar strings (no YAML lists)",
+        not non_scalar_uploads,
+        f"non-scalar upload path(s): {non_scalar_uploads}",
+    )
+    if non_scalar_uploads:
+        failures.append(
+            f"`lambda-*` upload(s) using non-scalar `path:` "
+            f"(YAML list / mapping): {non_scalar_uploads} — the path-drift "
+            f"check assumes a single concrete file. If you genuinely need "
+            f"a list, generalize the check."
+        )
+    _check(
+        "`lambda-*` upload paths are single-file (no globs / multi-line lists)",
+        not glob_uploads,
+        f"glob/multi-line upload path(s): {glob_uploads}",
+    )
+    if glob_uploads:
+        failures.append(
+            f"`lambda-*` upload(s) using glob/multi-line paths: {glob_uploads} "
+            f"— the path-drift check assumes a single concrete file. If you "
+            f"genuinely need a glob pattern here, generalize the check."
+        )
+
+    path_drift: list[tuple[str, str, str, str]] = []
+    for name in sorted(uploaded & downloaded):
+        upload_path = upload_path_by_name.get(name, "")
+        download_path = download_path_by_name.get(name, "")
+        # Skip the empty-path edge case: `posixpath.normpath("")` returns
+        # `"."`, so two empty `path:` values would compare equal and
+        # spuriously pass. The name-symmetry check upstream catches the
+        # typical "step missing `path:`" failure mode; this short-circuit
+        # is belt-and-braces against a YAML schema regression that lets
+        # an empty `path:` slip through.
+        if not upload_path or not download_path:
+            continue
+        # `posixpath.normpath` collapses both trailing slashes
+        # (`terraform/modules/ac/` ↔ `terraform/modules/ac`) and any
+        # `./` prefixes, so two paths that resolve to the same on-disk
+        # dir compare equal regardless of stylistic differences.
+        expected_dir = posixpath.normpath(posixpath.dirname(upload_path))
+        actual_dir = posixpath.normpath(download_path)
+        if expected_dir != actual_dir:
+            path_drift.append((name, upload_path, expected_dir, actual_dir))
+    path_detail = "\n".join(
+        f"  - `{name}`: upload `path: {up}` → expected download `path: "
+        f"{exp}`, got `{got}`"
+        for name, up, exp, got in path_drift
+    )
+    _check(
+        "each `lambda-*` download `path:` is the parent dir of its upload `path:`",
+        not path_drift,
+        path_detail,
+    )
+    if path_drift:
+        failures.append(
+            f"`lambda-*` path drift between upload and download: "
+            f"{[name for name, *_ in path_drift]} — a typo in `path:` "
+            f"would re-introduce the #1326 `reading ZIP file` error"
+        )
+
+
+# DEPRECATED — DO NOT EXTEND. Historical exception predating the loud-
+# fail policy; migration to empty tracked in #1383. The size guard
+# below ratchets growth (CODEOWNERS catches review-time, this catches
+# import-time). When #1383 lands, tighten to `== 0` and delete this
+# block. Raise (not assert) so `python3 -O` can't strip the guard.
+_LAMBDA_LOUD_FAIL_ALLOWLIST = frozenset({"lambda-custom-domain-cert"})
+if len(_LAMBDA_LOUD_FAIL_ALLOWLIST) > 1:
+    raise RuntimeError(
+        f"_LAMBDA_LOUD_FAIL_ALLOWLIST grew: {sorted(_LAMBDA_LOUD_FAIL_ALLOWLIST)}. "
+        f"DEPRECATED — see #1383 and the 'Loud-fail policy' section of "
+        f"`docs/runbooks/promote-to-prod-lambda-artifacts.md` for why this "
+        f"allowlist must shrink to empty, not grow."
+    )
+
+
+def _assert_lambda_loud_fail_policy(jobs: dict, failures: list[str]) -> None:
+    """Loud-fail policy: non-optional uploads use `error`; allowlisted
+    downloads use `continue-on-error: true`.
+
+    The upload half: every non-allowlisted `lambda-*` upload must use
+    `if-no-files-found: error`, so a future PR adding a Lambda with
+    the action's default `warn` (or an unjustified `ignore`) can't
+    silently drift from the runbook's documented policy.
+
+    The download half (paired): if a Lambda IS allowlisted (i.e. its
+    upload uses `if-no-files-found: ignore`), the matching download
+    must use `continue-on-error: true` so the toggle-off case
+    proceeds cleanly. Without this assertion a future contributor
+    could allowlist the upload, forget the matching download flag,
+    and hard-fail prod when the toggle goes off — exactly the
+    asymmetry this assertion fences.
+
+    Single allowlist (`_LAMBDA_LOUD_FAIL_ALLOWLIST`) drives both
+    halves so they stay in lockstep.
+    """
+    plan_steps = (jobs.get("terraform-plan") or {}).get("steps") or []
+    apply_steps = (jobs.get("terraform-apply") or {}).get("steps") or []
+
+    # Surface the allowlist contents in CI logs so growth is visible
+    # at a glance (CODEOWNERS catches it at PR review; this catches it
+    # in the run output too). `_info` rather than `_check` so the
+    # assertion-grep semantics stay clean — every `ok` line should be
+    # an asserted invariant per the REPORTING CONVENTION docstring.
+    _info(
+        f"loud-fail allowlist (current entries): "
+        f"{sorted(_LAMBDA_LOUD_FAIL_ALLOWLIST)}"
+    )
+
+    # Upload half:
+    #   - non-allowlisted uploads must be `error`
+    #   - allowlisted uploads must be `ignore` (the runbook documents the
+    #     pair as `ignore` + `continue-on-error: true`; if a future
+    #     change kept the name on the allowlist but flipped the upload
+    #     to `error`, the workflow still works — `error` is stricter —
+    #     but the convention would silently drift)
+    drifted_uploads: list[tuple[str, str]] = []
+    for step in plan_steps:
+        if not str(step.get("uses", "")).startswith("actions/upload-artifact@"):
+            continue
+        with_block = step.get("with") or {}
+        name = with_block.get("name", "")
+        if not (isinstance(name, str) and name.startswith(_LAMBDA_ARTIFACT_PREFIX)):
+            continue
+        # Default for `if-no-files-found` (per actions/upload-artifact docs)
+        # is `warn`; record what we actually saw for a useful failure
+        # message rather than just "missing". Lowercase the value so a
+        # future PR using `IGNORE` / `Error` (or a `${{ ... }}` expression
+        # resolving to either case) doesn't silently bypass the check —
+        # mirrors the defensive normalization on the download side.
+        if_no_files_raw = with_block.get("if-no-files-found", "warn")
+        if_no_files = (
+            if_no_files_raw.lower()
+            if isinstance(if_no_files_raw, str)
+            else str(if_no_files_raw)
+        )
+        expected = "ignore" if name in _LAMBDA_LOUD_FAIL_ALLOWLIST else "error"
+        if if_no_files != expected:
+            drifted_uploads.append((name, str(if_no_files_raw)))
+    drifted_uploads.sort()
+
+    # Download half:
+    #   - allowlisted downloads must have `continue-on-error: true`
+    #     (paired with the upload's `if-no-files-found: ignore`)
+    #   - non-allowlisted downloads must NOT have `continue-on-error:
+    #     true` (it would silently swallow the very loud-fail this
+    #     policy establishes; a future copy-paste from the lone
+    #     allowlisted block would be the most likely way to hit this)
+    drifted_downloads_missing_coe: list[str] = []
+    drifted_downloads_extra_coe: list[str] = []
+    for step in apply_steps:
+        if not str(step.get("uses", "")).startswith("actions/download-artifact@"):
+            continue
+        with_block = step.get("with") or {}
+        name = with_block.get("name", "")
+        if not (isinstance(name, str) and name.startswith(_LAMBDA_ARTIFACT_PREFIX)):
+            continue
+        # `continue-on-error` is a step-level field (sibling of `uses`/
+        # `with`/`name`), NOT inside `with:`. A future refactor that
+        # moves it under `with:` would silently bypass this check —
+        # the raise below catches that misplacement explicitly.
+        # Accept both bool `True` (PyYAML's resolution of unquoted
+        # `true`) and the string `"true"` (quoted, or a `${{ ... }}`
+        # expression that resolved to a string).
+        # Raise (not assert) so `python3 -O` can't strip the guard.
+        if "continue-on-error" in with_block:
+            raise RuntimeError(
+                f"step `{name}` has `continue-on-error` inside `with:` — it "
+                f"belongs at the step level (sibling of `uses`). Fix the "
+                f"workflow before re-running this check."
+            )
+        coe_raw = step.get("continue-on-error")
+        coe_set = coe_raw is True or (isinstance(coe_raw, str) and coe_raw.lower() == "true")
+        if name in _LAMBDA_LOUD_FAIL_ALLOWLIST:
+            if not coe_set:
+                drifted_downloads_missing_coe.append(name)
+        else:
+            if coe_set:
+                drifted_downloads_extra_coe.append(name)
+    drifted_downloads_missing_coe.sort()
+    drifted_downloads_extra_coe.sort()
+
+    upload_detail = "\n".join(
+        f"  - `{name}` has `if-no-files-found: {value}` (expected "
+        f"`{'ignore' if name in _LAMBDA_LOUD_FAIL_ALLOWLIST else 'error'}`)"
+        for name, value in drifted_uploads
+    )
+    _check(
+        "`lambda-*` uploads use the policy-correct `if-no-files-found` "
+        "(`error` for non-allowlisted; `ignore` for allowlisted)",
+        not drifted_uploads,
+        upload_detail,
+    )
+    if drifted_uploads:
+        failures.append(
+            f"`lambda-*` upload(s) drifted from the loud-fail policy: "
+            f"{[name for name, _ in drifted_uploads]} (allowlist: "
+            f"{sorted(_LAMBDA_LOUD_FAIL_ALLOWLIST)})"
+        )
+
+    download_detail_missing = "\n".join(
+        f"  - `{name}` (allowlisted) download missing `continue-on-error: true`"
+        for name in drifted_downloads_missing_coe
+    )
+    _check(
+        "allowlisted `lambda-*` downloads use `continue-on-error: true`",
+        not drifted_downloads_missing_coe,
+        download_detail_missing,
+    )
+    if drifted_downloads_missing_coe:
+        failures.append(
+            f"allowlisted `lambda-*` download(s) missing "
+            f"`continue-on-error: true`: {drifted_downloads_missing_coe} — "
+            f"the upload-side `if-no-files-found: ignore` and the "
+            f"download-side `continue-on-error: true` must stay paired "
+            f"so the toggle-off case proceeds cleanly"
+        )
+
+    download_detail_extra = "\n".join(
+        f"  - `{name}` (non-allowlisted) download has `continue-on-error: true`"
+        for name in drifted_downloads_extra_coe
+    )
+    _check(
+        "non-allowlisted `lambda-*` downloads do NOT have `continue-on-error: true`",
+        not drifted_downloads_extra_coe,
+        download_detail_extra,
+    )
+    if drifted_downloads_extra_coe:
+        failures.append(
+            f"non-allowlisted `lambda-*` download(s) have "
+            f"`continue-on-error: true`: {drifted_downloads_extra_coe} — "
+            f"this silently swallows the very loud-fail the policy "
+            f"establishes (most likely a copy-paste from the lone "
+            f"allowlisted block)"
+        )
+
+
 def _assert_preflight(jobs: dict, failures: list[str]) -> None:
     preflight = jobs.get("preflight", {})
     stale_step = next(
@@ -1614,6 +2089,446 @@ _BAD_FIXTURE_TERRAFORM_APPLY_NEEDS = textwrap.dedent(
 )
 
 
+_BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_UPLOAD_ONLY = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      terraform-plan:
+        runs-on: ubuntu-latest
+        steps:
+          # Synthetic placeholder SHA — the assertion matches on
+          # `step["uses"].startswith("actions/upload-artifact")`, so any
+          # form is fine. Placeholder (not a real SHA) to keep the
+          # un-pinned-action skim of this file from snagging on fixtures.
+          - uses: actions/upload-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-orphan
+              path: terraform/modules/orphan/lambda/orphan.zip
+      terraform-apply:
+        runs-on: ubuntu-latest
+        steps:
+          # Bug: no matching `actions/download-artifact` for `lambda-orphan` —
+          # apply runner won't have the zip on disk, terraform apply will
+          # fail with `reading ZIP file ... no such file or directory`.
+          # This is exactly the #1326 footgun the assertion is meant to
+          # prevent.
+          - run: ":"
+    """
+)
+
+
+_BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_STRAY_STEPS = textwrap.dedent(
+    """
+    # Single fixture covers both stray directions (upload-in-apply,
+    # download-in-plan) deliberately — both are symmetric one-liners
+    # in the assertion, and the guard's failure-list path appends
+    # one entry per direction with `if names:` so a fixture exercising
+    # both at once canaries both code paths.
+    on: workflow_dispatch
+    jobs:
+      terraform-plan:
+        runs-on: ubuntu-latest
+        steps:
+          # Bug: a download step in terraform-plan is meaningless — the
+          # zip materializes here, it doesn't get pulled from artifacts.
+          # The cargo-cult guard should surface it.
+          - uses: actions/download-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/foo
+          - uses: actions/upload-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/foo/foo.zip
+      terraform-apply:
+        runs-on: ubuntu-latest
+        steps:
+          # Bug: a second upload in terraform-apply where it can't help —
+          # the apply runner has nothing useful to upload.
+          - uses: actions/upload-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/foo/foo.zip
+          - uses: actions/download-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/foo
+    """
+)
+
+
+_BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_DUPLICATE_DOWNLOADS = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      terraform-plan:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/upload-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/foo/foo.zip
+      terraform-apply:
+        runs-on: ubuntu-latest
+        steps:
+          # Bug: two download steps with the same `name`. The second
+          # one's `path:` wins on disk, which would silently override the
+          # first. The duplicate check fences this just like the
+          # duplicate-uploads case.
+          - uses: actions/download-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/foo
+          - uses: actions/download-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/bar
+    """
+)
+
+
+_BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_DUPLICATE_UPLOADS = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      terraform-plan:
+        runs-on: ubuntu-latest
+        steps:
+          # Bug: two upload steps with the same `name` (lambda-foo). The
+          # second one wins on the apply runner, but the set-based
+          # comparison in `_assert_lambda_artifact_symmetry` would
+          # collapse them to one and pass — masking that one of the two
+          # paths never makes it to apply. The duplicate check catches
+          # this independently of the symmetry check (both run on the
+          # same input; either can append to `failures`).
+          - uses: actions/upload-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/foo/foo.zip
+          - uses: actions/upload-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/bar/bar.zip
+      terraform-apply:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/download-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/foo
+    """
+)
+
+
+_BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_HALF_RENAME = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      # Bug: only `terraform-apply` was renamed (here to `tf-apply`).
+      # The defensive job-lookup check fires the per-job assertion path
+      # for `terraform-apply`, producing a clear "this specific job
+      # doesn't resolve" message rather than misleadingly reporting
+      # every upload as `upload_only`. Locks the half-rename diagnostic.
+      terraform-plan:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/upload-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/foo/foo.zip
+      tf-apply:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/download-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/foo
+    """
+)
+
+
+_BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_GLOB_UPLOAD = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      terraform-plan:
+        runs-on: ubuntu-latest
+        steps:
+          # Bug: glob upload path. `posixpath.dirname("terraform/modules/
+          # foo/*.zip")` returns `terraform/modules/foo`, which would
+          # pass the path-drift check spuriously even though
+          # download semantics diverge (download wouldn't match a
+          # glob-uploaded artifact). The defensive glob-rejection
+          # check fails before the path-drift comparison runs.
+          - uses: actions/upload-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-glob
+              path: terraform/modules/foo/*.zip
+              if-no-files-found: error
+      terraform-apply:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/download-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-glob
+              path: terraform/modules/foo
+    """
+)
+
+
+_BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_NON_SCALAR_UPLOAD = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      terraform-plan:
+        runs-on: ubuntu-latest
+        steps:
+          # Bug: YAML list `path:` value. Without the explicit
+          # scalar-string guard, `c in path` would raise `TypeError`
+          # on the list (giving a stack trace, not an actionable
+          # diagnostic). The non-scalar guard fails first with a
+          # named report.
+          - uses: actions/upload-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-multi
+              path:
+                - terraform/modules/foo/foo.zip
+                - terraform/modules/foo/bar.zip
+              if-no-files-found: error
+      terraform-apply:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/download-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-multi
+              path: terraform/modules/foo
+    """
+)
+
+
+_BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_PATH_DRIFT = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      terraform-plan:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/upload-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/foo/lambda/foo.zip
+              if-no-files-found: error
+      terraform-apply:
+        runs-on: ubuntu-latest
+        steps:
+          # Bug: download path's directory (`lamda/`, missing `b`)
+          # doesn't match the upload path's parent
+          # (`terraform/modules/foo/lambda/`). The name-symmetry check
+          # passes; the path-correctness check fails and surfaces the
+          # typo before terraform-apply hits `reading ZIP file ...
+          # no such file or directory`.
+          - uses: actions/download-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/foo/lamda
+    """
+)
+
+
+_BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_HALF_RENAME_PLAN = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      # Mirror of the half-rename fixture above: only `terraform-plan`
+      # renamed (to `tf-plan`). Pairs with the apply-side fixture so
+      # each per-job branch has its own canary — without the mirror, a
+      # future refactor that swapped the loop's job-tuple order could
+      # regress one branch's diagnostic silently.
+      tf-plan:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/upload-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/foo/foo.zip
+      terraform-apply:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/download-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/foo
+    """
+)
+
+
+_BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_RENAMED_JOBS = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      # Bug: `terraform-plan` and `terraform-apply` have been renamed
+      # (here to `tf-plan`/`tf-apply`). Without the defensive job-name
+      # check, the assertion would silently compare two empty sets and
+      # pass — a rename in promote-to-prod.yml would silently disable
+      # the entire gate.
+      tf-plan:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/upload-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/foo/lambda/foo.zip
+      tf-apply:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/download-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-foo
+              path: terraform/modules/foo/lambda
+    """
+)
+
+
+_BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_DOWNLOAD_ONLY = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      terraform-plan:
+        runs-on: ubuntu-latest
+        steps:
+          # Bug: no `actions/upload-artifact` for `lambda-orphan` — but
+          # the apply job tries to download it. `actions/download-artifact`
+          # would fail at runtime with "Unable to find any artifacts". The
+          # symmetry assertion catches it without needing to actually run
+          # the workflow.
+          - run: ":"
+      terraform-apply:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/download-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-orphan
+              path: terraform/modules/orphan/lambda
+    """
+)
+
+
+_BAD_FIXTURE_LAMBDA_LOUD_FAIL_POLICY = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      terraform-plan:
+        runs-on: ubuntu-latest
+        steps:
+          # Bug: a non-allowlisted `lambda-*` upload using the action's
+          # default `warn` (no explicit `if-no-files-found`). The
+          # loud-fail policy assertion should catch this drift.
+          - uses: actions/upload-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-warn-drift
+              path: terraform/modules/foo/foo.zip
+          # And another with explicit `ignore` outside the allowlist —
+          # also a drift, surfaces the same way.
+          - uses: actions/upload-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-ignore-drift
+              path: terraform/modules/bar/bar.zip
+              if-no-files-found: ignore
+    """
+)
+
+
+_BAD_FIXTURE_LAMBDA_LOUD_FAIL_DOWNLOAD_HALF = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      terraform-plan:
+        runs-on: ubuntu-latest
+        steps:
+          # Allowlisted upload paired with a download that's missing
+          # `continue-on-error: true`. The upload-side ignore + download-
+          # side continue-on-error pairing keeps the toggle-off case
+          # benign; with the download-side flag missing, an off-toggle
+          # run hard-fails apply on a Lambda the upload deliberately
+          # skipped.
+          - uses: actions/upload-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-custom-domain-cert
+              path: terraform/modules/custom-domain-cert/build/lambda-custom-domain-cert.zip
+              if-no-files-found: ignore
+      terraform-apply:
+        runs-on: ubuntu-latest
+        steps:
+          # Bug: missing `continue-on-error: true` on the matching
+          # allowlisted download.
+          - uses: actions/download-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-custom-domain-cert
+              path: terraform/modules/custom-domain-cert/build
+    """
+)
+
+
+_BAD_FIXTURE_LAMBDA_LOUD_FAIL_NON_ALLOWLISTED_COE = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      terraform-plan:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/upload-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-strict-foo
+              path: terraform/modules/foo/foo.zip
+              if-no-files-found: error
+      terraform-apply:
+        runs-on: ubuntu-latest
+        steps:
+          # Bug: a non-allowlisted `lambda-*` download with
+          # `continue-on-error: true`. The upload uses `error` (correct)
+          # but the download silently swallows any failure — defeating
+          # the loud-fail intent. Most likely a copy-paste from the
+          # lone allowlisted custom-domain-cert block.
+          - uses: actions/download-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            continue-on-error: true
+            with:
+              name: lambda-strict-foo
+              path: terraform/modules/foo
+    """
+)
+
+
+_BAD_FIXTURE_LAMBDA_LOUD_FAIL_ALLOWLIST_UPLOAD_DRIFT = textwrap.dedent(
+    """
+    on: workflow_dispatch
+    jobs:
+      terraform-plan:
+        runs-on: ubuntu-latest
+        steps:
+          # Bug: `lambda-custom-domain-cert` is on the allowlist (so its
+          # upload is supposed to use `if-no-files-found: ignore`), but
+          # this fixture has it on `error`. The workflow would still
+          # work — `error` is stricter than `ignore` — but the runbook's
+          # documented `ignore` + `continue-on-error: true` pairing
+          # convention would silently drift from the code. The upload
+          # half of `_assert_lambda_loud_fail_policy` catches this.
+          - uses: actions/upload-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            with:
+              name: lambda-custom-domain-cert
+              path: terraform/modules/custom-domain-cert/build/lambda-custom-domain-cert.zip
+              if-no-files-found: error
+      terraform-apply:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/download-artifact@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  # fixture placeholder (not a real SHA)
+            continue-on-error: true
+            with:
+              name: lambda-custom-domain-cert
+              path: terraform/modules/custom-domain-cert/build
+    """
+)
+
+
 _BAD_FIXTURE_PREFLIGHT = textwrap.dedent(
     """
     on: workflow_dispatch
@@ -1799,6 +2714,81 @@ def _assert_negative_fixtures_reject_bad_input() -> bool:
             _BAD_FIXTURE_SCHEMA_COMPAT_NEGATED,
         ),
         ("preflight", _assert_preflight, _BAD_FIXTURE_PREFLIGHT),
+        (
+            "lambda-artifact symmetry (upload without matching download)",
+            _assert_lambda_artifact_symmetry,
+            _BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_UPLOAD_ONLY,
+        ),
+        (
+            "lambda-artifact symmetry (download without matching upload)",
+            _assert_lambda_artifact_symmetry,
+            _BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_DOWNLOAD_ONLY,
+        ),
+        (
+            "lambda-artifact symmetry (terraform-plan/apply jobs renamed)",
+            _assert_lambda_artifact_symmetry,
+            _BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_RENAMED_JOBS,
+        ),
+        (
+            "lambda-artifact symmetry (only terraform-apply renamed — half-rename diagnostic)",
+            _assert_lambda_artifact_symmetry,
+            _BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_HALF_RENAME,
+        ),
+        (
+            "lambda-artifact symmetry (only terraform-plan renamed — mirror half-rename)",
+            _assert_lambda_artifact_symmetry,
+            _BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_HALF_RENAME_PLAN,
+        ),
+        (
+            "lambda-artifact symmetry (duplicate upload names)",
+            _assert_lambda_artifact_symmetry,
+            _BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_DUPLICATE_UPLOADS,
+        ),
+        (
+            "lambda-artifact symmetry (duplicate download names)",
+            _assert_lambda_artifact_symmetry,
+            _BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_DUPLICATE_DOWNLOADS,
+        ),
+        (
+            "lambda-artifact symmetry (stray steps in wrong job)",
+            _assert_lambda_artifact_symmetry,
+            _BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_STRAY_STEPS,
+        ),
+        (
+            "lambda-artifact symmetry (path drift between upload and download)",
+            _assert_lambda_artifact_symmetry,
+            _BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_PATH_DRIFT,
+        ),
+        (
+            "lambda-artifact symmetry (glob/multi-line upload path)",
+            _assert_lambda_artifact_symmetry,
+            _BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_GLOB_UPLOAD,
+        ),
+        (
+            "lambda-artifact symmetry (non-scalar / YAML-list upload path)",
+            _assert_lambda_artifact_symmetry,
+            _BAD_FIXTURE_LAMBDA_ARTIFACT_SYMMETRY_NON_SCALAR_UPLOAD,
+        ),
+        (
+            "lambda loud-fail policy (non-allowlisted upload drifted off `error`)",
+            _assert_lambda_loud_fail_policy,
+            _BAD_FIXTURE_LAMBDA_LOUD_FAIL_POLICY,
+        ),
+        (
+            "lambda loud-fail policy (allowlisted download missing continue-on-error)",
+            _assert_lambda_loud_fail_policy,
+            _BAD_FIXTURE_LAMBDA_LOUD_FAIL_DOWNLOAD_HALF,
+        ),
+        (
+            "lambda loud-fail policy (allowlisted upload drifted off `ignore`)",
+            _assert_lambda_loud_fail_policy,
+            _BAD_FIXTURE_LAMBDA_LOUD_FAIL_ALLOWLIST_UPLOAD_DRIFT,
+        ),
+        (
+            "lambda loud-fail policy (non-allowlisted download has continue-on-error)",
+            _assert_lambda_loud_fail_policy,
+            _BAD_FIXTURE_LAMBDA_LOUD_FAIL_NON_ALLOWLISTED_COE,
+        ),
     )
     all_rejected = True
     for label, assertion, fixture in cases:
@@ -1825,6 +2815,8 @@ def _assert_negative_fixtures_reject_bad_input() -> bool:
         _assert_finalize_step_order,
         _assert_final_status_consumed,
         _assert_force_push_verify_step,
+        _assert_lambda_artifact_symmetry,
+        _assert_lambda_loud_fail_policy,
         _assert_manifest_rejects_no_op,
         _assert_preflight,
         _assert_terraform_apply_needs_schema_compat,
@@ -1876,6 +2868,8 @@ def main() -> int:
         _assert_image_deploys,
         _assert_manifest_rejects_no_op,
         _assert_terraform_apply_needs_schema_compat,
+        _assert_lambda_artifact_symmetry,
+        _assert_lambda_loud_fail_policy,
         _assert_finalize,
         _assert_finalize_step_order,
         _assert_final_status_consumed,

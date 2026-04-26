@@ -17,3 +17,12 @@
 # instances.
 /tests/smoke/                 justin@layerv.ai
 /.github/workflows/nhp-smoke-tests.yml  justin@layerv.ai
+
+# Promote-to-prod artifact-pass gate (#1326): the workflow file + the
+# structural test that fences upload↔download symmetry and the loud-
+# fail-at-plan policy. Allowlist growth (`_LAMBDA_LOUD_FAIL_ALLOWLIST`
+# in the test file) is gated by this owner per the runbook's
+# "intentional disable" section.
+/.github/workflows/promote-to-prod.yml              justin@layerv.ai
+/tests/scripts/test_promote_to_prod_gating.py       justin@layerv.ai
+/docs/runbooks/promote-to-prod-lambda-artifacts.md  justin@layerv.ai

@@ -74,6 +74,10 @@ resource "aws_iam_role_policy" "keygen_lambda_ssm" {
   })
 }
 
+# Adding a `count` here (or wrapping `module "nhp_keypair"` in a toggle)
+# requires removing the matching `lambda-nhp-keypair-keygen` upload+download
+# pair in promote-to-prod.yml in the same patch — see
+# docs/runbooks/promote-to-prod-lambda-artifacts.md (loud-fail policy).
 data "archive_file" "keygen_lambda" {
   type        = "zip"
   output_path = "${path.module}/keygen_lambda.zip"

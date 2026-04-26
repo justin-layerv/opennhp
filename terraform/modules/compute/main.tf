@@ -110,6 +110,10 @@ resource "aws_lambda_function" "keygen" {
   tags = var.tags
 }
 
+# Adding a `count` here (or wrapping `module "compute"` in a toggle)
+# requires removing the matching `lambda-compute-keygen` upload+download
+# pair in promote-to-prod.yml in the same patch — see
+# docs/runbooks/promote-to-prod-lambda-artifacts.md (loud-fail policy).
 data "archive_file" "keygen_lambda" {
   type        = "zip"
   output_path = "${path.module}/keygen_lambda.zip"

@@ -517,6 +517,18 @@ module "canary_deployment" {
   instance_warmup_seconds  = var.canary_instance_warmup_seconds
 }
 
+# NOTE: this re-instantiates ./modules/canary-deployment, which means
+# its `data "archive_file" "orchestrator"` resolves to the same
+# `${path.module}/lambda/canary_orchestrator.zip` as the server-side
+# `module.canary_deployment` above. The writes are idempotent today
+# because both produce **byte-identical content** (same `source_file`,
+# same packaging) — NOT because terraform serializes them. Terraform's
+# default `-parallelism=10` evaluates independent data sources
+# concurrently; the safety here comes from content-equality. If
+# `canary_deployment_ac` ever needs AC-specific orchestrator code, the
+# two writes diverge AND race, AND it also needs its own upload/
+# download pair in the workflow — the structural-symmetry test won't
+# catch either omission. See #1380.
 module "canary_deployment_ac" {
   source = "./modules/canary-deployment"
   count  = var.enable_canary_deployment && var.deploy_ac ? 1 : 0
@@ -692,12 +704,6 @@ module "security" {
   enable_guardduty_alerts = length(var.guardduty_alert_emails) > 0
   alerts_sns_topic_arn    = module.monitoring.sns_topic_arn
   guardduty_alert_emails  = var.guardduty_alert_emails
-
-  # 2026-04-24 hot-patch: disable until promote-to-prod.yml wires the
-  # stale_finding_watchdog.zip lambda artifact between the split plan/apply
-  # jobs (sandbox builds it in the same job so works; prod apply runner
-  # has no zip). Tracked in #1326. Re-enable once the workflow fix lands.
-  enable_stale_finding_watchdog = false
 }
 
 # AC Module - Access Controller with embedded Traefik for TLS termination
