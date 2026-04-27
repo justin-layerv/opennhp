@@ -17,10 +17,12 @@ type derivedEndpoints struct {
 	QURLAPIBaseURL   string
 
 	// QURLSiteDomain is the parent domain of per-resource qurl.site
-	// hostnames (e.g., qurl.site.layerv.xyz in sandbox — every
-	// resource gets r_{id}.qurl.site.layerv.xyz). Tier 2 resolve
-	// tests assert cookies are scoped to this domain and that the
-	// 302 Location host has this as its suffix.
+	// hostnames. The shape differs by environment: sandbox uses the
+	// sub-FQDN `qurl.site.layerv.xyz` (so per-resource hosts are
+	// r_{id}.qurl.site.layerv.xyz); prod uses the registered apex
+	// `qurl.site` directly (so per-resource hosts are r_{id}.qurl.site).
+	// Tier 2 resolve tests assert cookies are scoped to this domain
+	// and that the 302 Location host has this as its suffix.
 	QURLSiteDomain string
 
 	// QURLLinkOrigin is the origin (scheme + host) of the qurl.link
@@ -46,8 +48,12 @@ func deriveEndpoints(env string) (derivedEndpoints, error) {
 		return derivedEndpoints{
 			NHPServerBaseURL: "https://resolve.qurl.link",
 			QURLAPIBaseURL:   "https://api.layerv.ai",
-			QURLSiteDomain:   "qurl.site.layerv.ai",
-			QURLLinkOrigin:   "https://qurl.link",
+			// Prod uses the registered apex `qurl.site` directly, so
+			// per-resource hosts are r_{id}.qurl.site (not the
+			// sandbox-style `qurl.site.layerv.xyz`). Mirrors the
+			// terraform/environments/prod qurl_site_domain value.
+			QURLSiteDomain: "qurl.site",
+			QURLLinkOrigin: "https://qurl.link",
 		}, nil
 	default:
 		return derivedEndpoints{}, fmt.Errorf("unknown environment %q (want sandbox or prod)", env)
