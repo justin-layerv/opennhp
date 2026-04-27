@@ -189,6 +189,12 @@ variable "nhp_cors_allowed_origins" {
   default     = ""
 }
 
+variable "nhp_knock_headertype_verify_require" {
+  description = "Wrapper passthrough for the root nhp_knock_headertype_verify_require — see ../../variables.tf and ../../modules/compute/variables.tf for gate semantics and burn-in criteria."
+  type        = bool
+  default     = false
+}
+
 variable "resource_mode" {
   type    = string
   default = "local"

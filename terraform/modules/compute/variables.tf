@@ -451,7 +451,9 @@ variable "qurl_resolve_certificate_arn" {
 }
 
 # =============================================================================
-# Blue/Green Deployment Configuration
+# NHP Server Env-Var Passthroughs
+# Variables that flow into /opt/layerv/nhp-server/etc/env via user_data.sh.tpl
+# and are consumed by the server binary at process start.
 # =============================================================================
 
 variable "cors_allowed_origins" {
@@ -465,6 +467,37 @@ variable "cloudfront_cidrs_ssm_parameter" {
   type        = string
   default     = null
 }
+
+variable "knock_headertype_verify_require" {
+  description = <<-EOT
+    Set NHP_KNOCK_HEADERTYPE_VERIFY=true on the server to enforce
+    strict-mode rejection of the NHP_KNK→NHP_EXT type-flip attack
+    (#1154 / #1257). Default false leaves the gate in permit mode:
+    the server records MetricKnockHeaderTypeMismatch on each attack
+    knock but does not reject; the local AC mitigation gap stays open.
+
+    Flip strict only after MetricKnockHeaderTypeLegacy has drained to
+    zero across the burn-in window. Legacy must be zero so that
+    flipping strict does not lock out legitimate legacy agents AND so
+    that the mismatch counter is trustworthy as a per-attack signal
+    (under a majority-legacy fleet, an active attack against a legacy
+    agent surfaces as Legacy, not Mismatch — see the
+    "Additional alarm-semantics caveat" block in
+    endpoints/server/knock_headertype_gate.go).
+    MetricKnockHeaderTypeMismatch being non-zero is the attack signal
+    itself, not a contraindication for flipping strict.
+
+    Variable name uses `_require` to match the shared permit/strict
+    gate convention (cf. NHP_INTERNAL_AUTH_REQUIRE); the env var
+    keeps the upstream NHP_KNOCK_HEADERTYPE_VERIFY name.
+  EOT
+  type        = bool
+  default     = false
+}
+
+# =============================================================================
+# Blue/Green Deployment Configuration
+# =============================================================================
 
 variable "enable_blue_green" {
   description = "Enable blue/green deployment infrastructure. Creates a second ASG (green) and SSM parameters for traffic switching."

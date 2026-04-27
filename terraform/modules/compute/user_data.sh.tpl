@@ -879,6 +879,9 @@ NHP_TRUSTED_PROXY_CIDRS=$CF_CIDRS
 %{ if cors_allowed_origins != "" ~}
 NHP_CORS_ALLOWED_ORIGINS=${cors_allowed_origins}
 %{ endif ~}
+%{ if knock_headertype_verify_require ~}
+NHP_KNOCK_HEADERTYPE_VERIFY=true
+%{ endif ~}
 ENVEOF
 chmod 644 /opt/layerv/nhp-server/etc/env
 echo "Created environment file with image tag: $IMAGE_TAG"

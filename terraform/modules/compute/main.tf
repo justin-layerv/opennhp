@@ -720,7 +720,8 @@ locals {
     # CORS allowed origins for NHP HTTP server
     cors_allowed_origins = var.cors_allowed_origins
     # CloudFront trusted proxy CIDRs (for correct client IP via X-Forwarded-For)
-    cloudfront_cidrs_ssm_parameter = var.cloudfront_cidrs_ssm_parameter
+    cloudfront_cidrs_ssm_parameter  = var.cloudfront_cidrs_ssm_parameter
+    knock_headertype_verify_require = var.knock_headertype_verify_require
   })
 }
 

@@ -184,6 +184,12 @@ variable "nhp_cors_allowed_origins" {
   default     = ""
 }
 
+variable "nhp_knock_headertype_verify_require" {
+  description = "Root passthrough for the compute module's knock_headertype_verify_require — see modules/compute/variables.tf for the gate semantics and burn-in criteria. Flip true only after MetricKnockHeaderTypeLegacy has drained to zero (see #1257). Variable name uses `_require` to match the shared permit/strict gate convention (cf. NHP_INTERNAL_AUTH_REQUIRE); the env var keeps the upstream NHP_KNOCK_HEADERTYPE_VERIFY name."
+  type        = bool
+  default     = false
+}
+
 variable "resource_mode" {
   description = "Resource management mode: 'local' uses config files, 'api' uses external auth service"
   type        = string

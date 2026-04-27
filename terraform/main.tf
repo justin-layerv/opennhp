@@ -457,6 +457,8 @@ module "compute" {
   # CloudFront trusted proxy CIDRs (for correct client IP extraction from X-Forwarded-For)
   cloudfront_cidrs_ssm_parameter = var.deploy_qurl_link && var.enable_resolve_cloudfront ? aws_ssm_parameter.cloudfront_cidrs[0].name : null
 
+  knock_headertype_verify_require = var.nhp_knock_headertype_verify_require
+
   # Blue/Green deployment configuration
   enable_blue_green               = var.enable_blue_green
   green_standby_min_size          = var.green_standby_min_size
