@@ -40,6 +40,11 @@ on:
     secrets:
       AWS_ROLE_ARN:
         required: true
+      # Only consumed when dispatched with environment=prod (#1331).
+      # Declared for actionlint; callers shouldn't pass this — wiring
+      # it through workflow_call defeats the per-env role selection.
+      AWS_PROD_ROLE_ARN:
+        required: false
 
   # Manual dispatch for debugging a specific environment/tier
   # combination without waiting for a deploy.
@@ -74,6 +79,10 @@ on:
         type: string
         default: 'us-east-2'
 
+env:
+  PROD_ACCOUNT_ID: '235500187906'
+  SANDBOX_ACCOUNT_ID: '767397897469'
+
 jobs:
   smoke-test:
     name: NHP Smoke (${{ inputs.environment }}, ${{ inputs.tier }})
@@ -95,8 +104,33 @@ jobs:
       - name: Configure AWS credentials
         uses: ./.github/actions/setup-deploy
         with:
-          aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          # workflow_dispatch only sees repo-level secrets, so a
+          # prod dispatch needs explicit role selection (#1331).
+          aws-role-arn: ${{ inputs.environment == 'prod' && secrets.AWS_PROD_ROLE_ARN || secrets.AWS_ROLE_ARN }}
           aws-region: ${{ inputs.aws_region }}
+
+      # Catches: unsupported environment input (workflow_call accepts
+      # arbitrary strings, so a typo would otherwise fall into the
+      # sandbox branch and fail later); AWS_PROD_ROLE_ARN unset on a
+      # prod dispatch (silent fallthrough to sandbox role); or set but
+      # pointing at the wrong account. Each case fails before tests
+      # run.
+      - name: Assert assumed role matches target environment
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          case "$ENVIRONMENT" in
+            prod)    EXPECTED="$PROD_ACCOUNT_ID" ;;
+            sandbox) EXPECTED="$SANDBOX_ACCOUNT_ID" ;;
+            *) echo "::error::unsupported environment: $ENVIRONMENT (expected sandbox|prod)"; exit 1 ;;
+          esac
+          ACTUAL_ACCOUNT=$(aws sts get-caller-identity --query 'Account' --output text)
+          if [ "$ACTUAL_ACCOUNT" != "$EXPECTED" ]; then
+            echo "::error::Assumed account $ACTUAL_ACCOUNT does not match expected $EXPECTED for environment=$ENVIRONMENT"
+            exit 1
+          fi
+          echo "Assumed account $ACTUAL_ACCOUNT for environment=$ENVIRONMENT"
 
       - name: Fetch Auth0 smoke credentials from Secrets Manager
         id: auth0
