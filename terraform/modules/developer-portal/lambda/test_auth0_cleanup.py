@@ -213,6 +213,151 @@ class TestCleanupOrphanedApps:
 
 
 # ---------------------------------------------------------------------------
+# Get Management Token Tests
+# ---------------------------------------------------------------------------
+
+# Tenant canonical-domain audience that Terraform writes into the auth0-mgmt
+# secret. Used as both the factory default and the round-trip assertion target
+# so they can't silently drift apart. This is the literal prod value, not a
+# placeholder — Auth0's Management API rejects any other audience with 403.
+_TENANT_MGMT_AUDIENCE = 'https://layerv.us.auth0.com/api/v2/'
+
+
+def _make_secret(**overrides):
+    """Build a mocked Secrets Manager client returning a fake auth0-mgmt secret."""
+    payload = {
+        'client_id': 'cid',
+        'client_secret': 'csec',
+        'audience': _TENANT_MGMT_AUDIENCE,
+    }
+    payload.update(overrides)
+    sm = MagicMock()
+    sm.get_secret_value.return_value = {'SecretString': json.dumps(payload)}
+    return sm
+
+
+class TestGetMgmtToken:
+    """Tests for _get_mgmt_token() audience handling and caching."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_module_token_cache(self):
+        """Isolate every test from the module-level token cache."""
+        with patch('boto3.client'):
+            import auth0_cleanup as ac
+        ac._mgmt_token = None
+        ac._mgmt_token_expires_at = 0
+        yield
+        ac._mgmt_token = None
+        ac._mgmt_token_expires_at = 0
+
+    def test_audience_comes_from_secret_not_env(self):
+        """OAuth payload must use the audience from the secret, not AUTH0_DOMAIN.
+
+        Auth0's Management API requires the tenant canonical domain audience
+        (e.g. layerv.us.auth0.com). The custom login domain (auth.layerv.ai)
+        returns 403 access_denied. Terraform writes the correct audience into
+        the secret; the Lambda must forward it verbatim.
+        """
+        captured = {}
+        token_response = MagicMock()
+        token_response.read.return_value = json.dumps(
+            {'access_token': 'tok', 'expires_in': 3600}
+        ).encode()
+        token_response.__enter__.return_value = token_response
+
+        def fake_urlopen(req, timeout=None):
+            captured['data'] = req.data
+            captured['url'] = req.full_url
+            return token_response
+
+        with patch('boto3.client', return_value=_make_secret()):
+            import auth0_cleanup as ac
+            with patch('auth0_cleanup.urllib.request.urlopen', side_effect=fake_urlopen):
+                token = ac._get_mgmt_token()
+
+        assert token == 'tok'
+        # Token endpoint URL stays on the custom login domain (Auth0 accepts
+        # /oauth/token there); it's only the audience claim that has to be
+        # the canonical tenant domain. Pin both so a future refactor can't
+        # over-correct one without the other.
+        assert captured['url'] == 'https://auth.layerv.ai/oauth/token'
+        body = json.loads(captured['data'])
+        assert body['audience'] == _TENANT_MGMT_AUDIENCE
+        assert body['client_id'] == 'cid'
+        assert body['client_secret'] == 'csec'
+        assert body['grant_type'] == 'client_credentials'
+
+    @pytest.mark.parametrize(
+        'missing_key', ['audience', 'client_id', 'client_secret'],
+    )
+    def test_missing_required_key_raises_without_network(self, missing_key):
+        """Fail loudly with an actionable message if the secret is missing
+        any of (client_id, client_secret, audience) — and never make an OAuth
+        request with a half-built payload."""
+        payload = {
+            'client_id': 'cid',
+            'client_secret': 'csec',
+            'audience': _TENANT_MGMT_AUDIENCE,
+        }
+        del payload[missing_key]
+        sm = MagicMock()
+        sm.get_secret_value.return_value = {'SecretString': json.dumps(payload)}
+
+        with patch('boto3.client', return_value=sm):
+            import auth0_cleanup as ac
+            with patch('auth0_cleanup.urllib.request.urlopen') as mock_urlopen:
+                # The three required keys (audience, client_id, client_secret)
+                # don't share substrings, so a bare-name match is unambiguous
+                # and doesn't couple this test to the error message's format.
+                with pytest.raises(RuntimeError, match=missing_key):
+                    ac._get_mgmt_token()
+                mock_urlopen.assert_not_called()
+
+    def test_cached_token_skips_secrets_manager(self):
+        """A still-valid cached token must short-circuit both the Secrets
+        Manager fetch and the OAuth round-trip — Auth0 rate-limits Mgmt-API
+        token issuance, and re-fetching the secret per call is wasteful."""
+        sm = _make_secret()
+        with patch('boto3.client', return_value=sm):
+            import auth0_cleanup as ac
+            ac._mgmt_token = 'cached-tok'
+            ac._mgmt_token_expires_at = time.time() + 300
+            with patch('auth0_cleanup.urllib.request.urlopen') as mock_urlopen:
+                token = ac._get_mgmt_token()
+
+        assert token == 'cached-tok'
+        sm.get_secret_value.assert_not_called()
+        mock_urlopen.assert_not_called()
+
+    def test_expired_cache_refreshes_token(self):
+        """An expired cached token must be discarded and a fresh one fetched
+        — otherwise a Lambda warm-container that survives 24h+ would keep
+        sending Auth0 a stale Bearer and 401 indefinitely."""
+        token_response = MagicMock()
+        token_response.read.return_value = json.dumps(
+            {'access_token': 'fresh-tok', 'expires_in': 3600}
+        ).encode()
+        token_response.__enter__.return_value = token_response
+
+        sm = _make_secret()
+        with patch('boto3.client', return_value=sm):
+            import auth0_cleanup as ac
+            ac._mgmt_token = 'stale-tok'
+            ac._mgmt_token_expires_at = time.time() - 60  # already expired
+            with patch(
+                'auth0_cleanup.urllib.request.urlopen', return_value=token_response,
+            ) as mock_urlopen:
+                token = ac._get_mgmt_token()
+
+        assert token == 'fresh-tok'
+        # The expired-cache path must reach BOTH Secrets Manager and Auth0;
+        # asserting only the OAuth POST would let a regression that pre-
+        # populated the token from elsewhere pass undetected.
+        sm.get_secret_value.assert_called_once()
+        mock_urlopen.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # Delete Client Tests (429 retry)
 # ---------------------------------------------------------------------------
 

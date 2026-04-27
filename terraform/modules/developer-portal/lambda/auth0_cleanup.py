@@ -152,10 +152,32 @@ def _get_mgmt_token():
         sm.get_secret_value(SecretId=AUTH0_MGMT_SECRET_NAME)['SecretString']
     )
 
+    missing = [
+        k for k in ('client_id', 'client_secret', 'audience') if not secret.get(k)
+    ]
+    if missing:
+        raise RuntimeError(
+            f"Auth0 mgmt secret '{AUTH0_MGMT_SECRET_NAME}' missing or empty "
+            f"required key(s) {missing}. The secret is written by "
+            f"aws_secretsmanager_secret_version.dev_portal_mgmt in "
+            f"terraform/modules/auth0, but its lifecycle has "
+            f"ignore_changes=[secret_string], so a plain `terraform apply` "
+            f"will NOT repopulate it. Repair with one of: "
+            f"`terraform apply -replace='module.auth0."
+            f"aws_secretsmanager_secret_version.dev_portal_mgmt[0]'`, OR "
+            f"`aws secretsmanager put-secret-value --secret-id "
+            f"{AUTH0_MGMT_SECRET_NAME} --secret-string ...`."
+        )
+
+    # The audience must be `secret['audience']`, not constructed from
+    # AUTH0_DOMAIN. Auth0's Management API only accepts the tenant's canonical
+    # domain (e.g. layerv.us.auth0.com); the custom login domain
+    # (auth.layerv.ai) returns 403 access_denied. Terraform writes the
+    # canonical-domain audience into the secret — forward it verbatim.
     payload = json.dumps({
         'client_id': secret['client_id'],
         'client_secret': secret['client_secret'],
-        'audience': f'https://{AUTH0_DOMAIN}/api/v2/',
+        'audience': secret['audience'],
         'grant_type': 'client_credentials',
     }).encode()
 
