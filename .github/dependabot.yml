@@ -80,3 +80,29 @@ updates:
     labels:
       - "dependencies"
       - "terraform"
+
+  # Python — terraform-prod-drift lint dependencies (#1324). Tracks
+  # python-hcl2 so the exact-pin in the lint requirements doesn't rot
+  # silently (cr round 10). Patch + minor only — major bumps need a
+  # human read of the changelog because hcl2 grammar regressions would
+  # break the lint silently.
+  #
+  # Verification (cr round 17): after the first scheduled scan, confirm
+  # Dependabot discovered the file via Insights → Dependency graph →
+  # Dependabot tab. The pip ecosystem auto-discovers any `*.txt` file
+  # whose contents look like pip requirements, but the custom name
+  # (`terraform-prod-drift-requirements.txt`) is uncommon enough that
+  # silent non-discovery would let the pin rot — the exact silent-miss
+  # class this PR exists to prevent.
+  - package-ecosystem: "pip"
+    directory: "/.github/scripts"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 1
+    labels:
+      - "dependencies"
+      - "ci"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]

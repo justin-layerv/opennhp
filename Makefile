@@ -251,6 +251,30 @@ lint-workflows:
 	@python3 tests/scripts/test_promote_to_prod_gating.py
 	@echo "$(COLOUR_GREEN)[OpenNHP] Workflow lint passed!$(END_COLOUR)"
 
+# Run the terraform-prod-drift detectors (#1324). Static, AWS-creds-free
+# lints that fence the regression classes from #1316 and #1323. CI runs
+# the same scripts in the dedicated `terraform-prod-drift-lint` job in
+# build-and-push.yml.
+# Requires python-hcl2 — install via:
+#   python3 -m pip install -r .github/scripts/terraform-prod-drift-requirements.txt
+# Mirrors the CI step's install (same pinned version).
+.PHONY: lint-terraform-drift
+lint-terraform-drift:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Running terraform-prod-drift detectors (#1324)...$(END_COLOUR)"
+	@python3 -c 'import hcl2' >/dev/null || { \
+		echo "$(COLOUR_RED)[OpenNHP] python-hcl2 missing. Install: python3 -m pip install -r .github/scripts/terraform-prod-drift-requirements.txt$(END_COLOUR)"; \
+		exit 1; \
+	}
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck tests/lints/terraform-prod-drift/run-fixtures.sh; \
+	else \
+		echo "$(COLOUR_BLUE)[OpenNHP] shellcheck not installed; skipping run-fixtures.sh check$(END_COLOUR)"; \
+	fi
+	@./tests/lints/terraform-prod-drift/run-fixtures.sh
+	@python3 .github/scripts/check-terraform-iam-coverage.py
+	@python3 .github/scripts/check-terraform-policy-conditions.py
+	@echo "$(COLOUR_GREEN)[OpenNHP] terraform-prod-drift checks passed!$(END_COLOUR)"
+
 test:
 	@echo "[OpenNHP] Running Unit Tests..."
 	cd endpoints && KBS_SKIP_INIT=1 go test -v ./server/... -run "Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry"

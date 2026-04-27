@@ -979,6 +979,64 @@ jobs:
           echo "No terraform files changed in this PR." >> "$GITHUB_STEP_SUMMARY"
 
   # ============================================================================
+  # TERRAFORM PROD-DRIFT LINT - Static fences for #1316 / #1323 (#1324)
+  #
+  # No matrix — the lints walk the same terraform tree in every environment
+  # so running once is sufficient. Lifted out of `terraform-validate` so a
+  # future change to that job's matrix can't silently disable the fences.
+  # No AWS credentials at any point — preserves the #1121 PR-time privesc
+  # gate. See docs/design/TERRAFORM_PROD_DRIFT_DETECTOR.md.
+  # ============================================================================
+  terraform-prod-drift-lint:
+    name: Terraform Prod-Drift Lint (PR)
+    # PR-only by design: main is branch-protected (CLAUDE.md "never push
+    # directly to main") so every code path lands on main reaches a PR
+    # first and the lint runs there. Admin force-merges that bypass PR
+    # are NOT covered — if that posture changes, drop the `if:` so the
+    # lint also runs on push to catch admin-bypass drift. (cr round 10.)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+          # Cache the pip wheel between runs — install drops from a few
+          # seconds to <1s once the cache is warm.
+          cache: pip
+          cache-dependency-path: .github/scripts/terraform-prod-drift-requirements.txt
+
+      - name: Install python-hcl2
+        run: python3 -m pip install -r .github/scripts/terraform-prod-drift-requirements.txt
+
+      - name: Shellcheck the fixture runner
+        # validate-workflows.yml's actionlint -shellcheck only covers
+        # .github/workflows/*.yml. The runner script lives under tests/;
+        # cover it explicitly here so a typo lands at PR time, not later.
+        run: shellcheck ./tests/lints/terraform-prod-drift/run-fixtures.sh
+
+      - name: Run terraform-prod-drift fixture suite
+        # Regression fences for #1316 (resource-policy Condition denylist)
+        # and #1323 (data-source IAM coverage). Runs unconditionally so a
+        # PR that weakens the lint scripts or fixtures without touching
+        # terraform/ can't slip past.
+        run: ./tests/lints/terraform-prod-drift/run-fixtures.sh
+
+      - name: Check terraform IAM coverage (#1323 regression fence)
+        run: python3 ./.github/scripts/check-terraform-iam-coverage.py
+
+      - name: Check terraform policy-condition denylist (#1316 regression fence)
+        run: python3 ./.github/scripts/check-terraform-policy-conditions.py
+
+  # ============================================================================
   # TERRAFORM VALIDATE (main) - Lightweight validation before deploy
   # No terraform plan here — deploy-sandbox-infra runs plan+apply in one job,
   # saving 1 M2M token per merge (the old plan artifact was never consumed).

@@ -1,0 +1,6 @@
+# Pinned dependencies for the terraform-prod-drift lints (#1324).
+# Used by:
+#   - .github/workflows/build-and-push.yml (Install python-hcl2 step)
+#   - Makefile (lint-terraform-drift target — install hint)
+# Bump in lockstep with python-hcl2 upstream releases.
+python-hcl2==8.1.2

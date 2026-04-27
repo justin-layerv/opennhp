@@ -45,4 +45,9 @@ repos:
         #
         # These modules are validated in CI via full environment init (terraform validate
         # runs from terraform/environments/{sandbox,prod}/ where providers are configured).
-        exclude: '^terraform/(modules/(ac|grafana-dashboards)/|main\.tf$|variables\.tf$|outputs\.tf$)'
+        #
+        # tests/lints/terraform-prod-drift/fixtures/heredoc-jsonencode-error/:
+        # Intentionally has a `jsonencode(<<EOT ...)` body that terraform-validate
+        # rejects (it's the exact malformed shape the lint exists to hard-fail on).
+        # The lint's regression fence is in `run-fixtures.sh`, not `terraform validate`.
+        exclude: '^(terraform/(modules/(ac|grafana-dashboards)/|main\.tf$|variables\.tf$|outputs\.tf$)|tests/lints/terraform-prod-drift/fixtures/heredoc-jsonencode-error/)'
