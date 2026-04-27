@@ -2,13 +2,39 @@ name: Dependabot Go Mod Tidy
 
 # Runs go mod tidy across all Go modules when dependabot updates dependencies.
 #
-# Uses pull_request_target (not pull_request) so the GITHUB_TOKEN has write
-# permissions to the repo. Commits are pushed via the GitHub Git Data API
-# (not git push) so they are signed by GitHub — satisfying the repository's
-# "Require signed commits" ruleset.
+# Uses `pull_request_target` because dependabot bumps run from a fork-context
+# branch and the `pull_request` event doesn't expose secrets there — and we
+# need secrets to mint the GitHub App token below.
 #
-# Security: The job-level `if: github.actor == 'dependabot[bot]'` check ensures
-# the PR branch checkout only happens for dependabot PRs, not arbitrary forks.
+# The push back is performed with a GitHub App token (NOT GITHUB_TOKEN) — per
+# GitHub's anti-loop policy, events created by GITHUB_TOKEN don't trigger
+# further workflow runs. Using the App token (ops-routines-reader, installed
+# org-wide and selected to this repo) means the resulting commit re-fires
+# `pull_request` workflows on the new head SHA, so required checks report
+# status against the SHA dependabot will actually merge (PR #1300).
+#
+# Commits are still created via the GitHub Git Data API (not `git push`) so
+# GitHub signs them — satisfying the repository's "Require signed commits"
+# ruleset.
+#
+# Security: The job-level `if: github.actor == 'dependabot[bot]'` check
+# ensures the PR branch checkout only happens for dependabot PRs, not
+# arbitrary forks. The app token is scoped to this repository only.
+#
+# Loop prevention (the math is non-obvious — three pieces interact):
+#   - Dependabot pushes head SHA A → this workflow fires (actor == dependabot[bot]).
+#   - This workflow's App-attributed push lands SHA B → re-fires
+#     `pull_request_target` (synchronize), but `github.actor` is now
+#     `ops-routines-reader[bot]`, which the job-level `if` filters out.
+#   - The same App-attributed push DOES re-fire ordinary `pull_request`
+#     workflows on SHA B (the goal — fixes PR #1300's auto-merge gate).
+# Don't refactor any of those three (actor gate, App-token push, pull_request
+# vs pull_request_target distinction) without re-deriving the loop-prevention.
+#
+# App-installation prereqs (ops-routines-reader on layervai/nhp):
+# `contents: write` (Git Data API push) and `metadata: read` (preflight
+# `gh api /user`). If either is missing the trap-emitted error points at
+# App installation / permissions — start there before suspecting auth flow.
 
 on:
   pull_request_target:
@@ -21,7 +47,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   go-mod-tidy:
@@ -29,6 +55,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: github.actor == 'dependabot[bot]'
+    env:
+      # Single source of truth for the bot-attribution invariant
+      # asserted before pushing. If the App is renamed or swapped,
+      # update here and the header comment in lockstep.
+      EXPECTED_BOT_USER: ops-routines-reader[bot]
 
     steps:
       - name: Checkout PR branch
@@ -48,7 +79,12 @@ jobs:
             tests/local/go.sum
 
       - name: Run go mod tidy on all modules
+        # Explicit `set -euo pipefail` rather than relying on GH Actions'
+        # default `bash -eo pipefail` — defends against a future `shell:`
+        # override silently dropping `-e` and letting a partial-failure
+        # tidy (one module errors, the next succeeds) land in the commit.
         run: |
+          set -euo pipefail
           cd "$GITHUB_WORKSPACE/nhp" && go mod tidy
           cd "$GITHUB_WORKSPACE/endpoints" && go mod tidy
           cd "$GITHUB_WORKSPACE/examples/server_plugin" && go mod tidy
@@ -57,34 +93,81 @@ jobs:
       - name: Check for changes
         id: changes
         run: |
-          if git diff --quiet; then
+          # Capture the file list at detection time and pass it to the
+          # commit step via $GITHUB_OUTPUT, so the commit step doesn't
+          # have to re-run `git diff` and risk picking up anything an
+          # intervening step might have written into the workspace.
+          FILES=$(git diff --name-only)
+          if [ -z "$FILES" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "files<<EOF"
+              echo "$FILES"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
             echo "Changed files:"
-            git diff --name-only
+            echo "$FILES"
           fi
 
-      - name: Commit via GitHub API (signed)
+      # Mint AFTER tidy so no-op runs (most dependabot Go bumps) don't
+      # consume an installation token. Auto-revoked at job end.
+      - name: Mint GitHub App token (scoped to this repo)
+        id: app_token
+        if: steps.changes.outputs.changed == 'true'
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          app-id: ${{ secrets.OPS_ROUTINES_APP_ID }}
+          private-key: ${{ secrets.OPS_ROUTINES_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Commit via GitHub API (signed, App-attributed)
         if: steps.changes.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
           BRANCH: ${{ github.head_ref }}
           REPO: ${{ github.repository }}
+          FILES: ${{ steps.changes.outputs.files }}
         run: |
           # Push via the GitHub Git Data API so commits are signed by GitHub.
           # Regular git push produces unsigned commits → GH013 ruleset rejection.
+          # `trap` registered before `set -e` so a failure on `set` itself still surfaces.
+          trap 'echo "::error::Failed to create signed commit via GitHub API. Check App installation status, API rate limits, or permissions. Concurrent branch advance after preflight is also possible (non-fast-forward PATCH)."' ERR
           set -euo pipefail
-          trap 'echo "::error::Failed to create signed commit via GitHub API. Check API rate limits and permissions."' ERR
+
+          AUTH_USER=$(gh api /user --jq '.login')
+          echo "Authenticated as: $AUTH_USER"
+          if [ "$AUTH_USER" != "$EXPECTED_BOT_USER" ]; then
+            echo "::error::Token resolved to '$AUTH_USER', expected '$EXPECTED_BOT_USER'. Bot identity invariant broken — refusing to push so the audit trail stays consistent."
+            exit 1
+          fi
 
           # 1. Get current branch HEAD
-          HEAD_SHA=$(gh api "repos/$REPO/git/ref/heads/$BRANCH" --jq '.object.sha')
-          BASE_TREE=$(gh api "repos/$REPO/git/commits/$HEAD_SHA" --jq '.tree.sha')
-          echo "HEAD: $HEAD_SHA  Tree: $BASE_TREE"
+          REMOTE_HEAD_SHA=$(gh api "repos/$REPO/git/ref/heads/$BRANCH" --jq '.object.sha')
+          BASE_TREE=$(gh api "repos/$REPO/git/commits/$REMOTE_HEAD_SHA" --jq '.tree.sha')
+          echo "HEAD: $REMOTE_HEAD_SHA  Tree: $BASE_TREE"
 
-          # 2. Create blobs for each changed file and build tree entries
+          # If the remote branch advanced during our run (dependabot rebase,
+          # maintainer fixup, etc.), our `go mod tidy` produced blobs against
+          # the OLD tree but we'd now be PATCHing onto the NEW tree's parent —
+          # silently overwriting whatever the new commits changed in the
+          # tidied paths. The non-fast-forward defense doesn't catch this
+          # because we always parent on the freshly-read HEAD. Refuse to push
+          # so a human (or the next dependabot rebase) can resolve.
+          LOCAL_HEAD_SHA=$(git rev-parse HEAD)
+          if [ "$LOCAL_HEAD_SHA" != "$REMOTE_HEAD_SHA" ]; then
+            echo "::error::Local checkout ($LOCAL_HEAD_SHA) does not match remote HEAD ($REMOTE_HEAD_SHA). Branch advanced during run — refusing to push to avoid silently overwriting upstream changes."
+            exit 1
+          fi
+
+          # 2. Create blobs for each changed file and build tree entries.
+          # Iterate the captured file list (not a fresh git diff) so the
+          # commit matches what change-detection saw.
           TREE_ENTRIES="[]"
           while IFS= read -r file; do
+            [ -z "$file" ] && continue
             BLOB_SHA=$(gh api "repos/$REPO/git/blobs" \
               -f content="$(base64 -w 0 "$file")" \
               -f encoding="base64" \
@@ -93,7 +176,7 @@ jobs:
               --arg path "$file" --arg sha "$BLOB_SHA" \
               '. + [{"path":$path,"mode":"100644","type":"blob","sha":$sha}]')
             echo "  blob $file → $BLOB_SHA"
-          done < <(git diff --name-only)
+          done <<< "$FILES"
 
           # 3. Create new tree
           NEW_TREE=$(jq -n --arg base "$BASE_TREE" --argjson tree "$TREE_ENTRIES" \
@@ -105,7 +188,7 @@ jobs:
           NEW_COMMIT=$(jq -n \
             --arg msg "chore(deps): sync go.mod/go.sum files [automated]" \
             --arg tree "$NEW_TREE" \
-            --arg parent "$HEAD_SHA" \
+            --arg parent "$REMOTE_HEAD_SHA" \
             '{message:$msg, tree:$tree, parents:[$parent]}' \
             | gh api "repos/$REPO/git/commits" --input - --jq '.sha')
           echo "Commit: $NEW_COMMIT"
