@@ -1,6 +1,12 @@
 # Dependency Age Check (Docker)
 # Thin shim calling shared reusable workflow.
 # Source: https://github.com/layervai/ops-routines-workflows/blob/main/.github/workflows/age-check-docker.yml
+#
+# Bypass label (apply to PR; rationale required in PR description):
+#   age-check-bypass         — skip ALL ecosystems (docker, go, actions)
+#
+# `age-check-bypass-docker` exists as a label but is NOT yet enforced
+# anywhere. Per-ecosystem bypass requires upstream reusable support.
 name: Dependency Age Check (Docker)
 
 # Fires on every PR (no path filter) so the status check always reports.
@@ -21,17 +27,18 @@ permissions:
 
 jobs:
   age-check:
-    # Honor `age-check-bypass` at the shim level AS WELL AS inside the
-    # reusable workflow. Defense-in-depth: if the reusable workflow
-    # implementation ever drops the label check (or the reusable ref
-    # is bumped to a version that doesn't respect it), the shim still
-    # skips consistently.
+    # Bypass is handled INSIDE the reusable workflow's job-level `if:`
+    # (it honors `age-check-bypass`). This shim must always invoke the
+    # reusable — if the shim's `if:` short-circuits before invoking, the
+    # reusable's `check-docker-age` job never materializes, and branch
+    # protection's required check `age-check / check-docker-age` reports
+    # as Expected/missing rather than Skipped, blocking merge.
     #
-    # On `workflow_dispatch`, `github.event.pull_request` is null — the
-    # labels array evaluates empty and `contains(...)` is false, so the
-    # job always runs. That's the desired behavior: manual runs
-    # shouldn't be bypassable via PR labels.
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'age-check-bypass') }}
+    # The per-ecosystem `age-check-bypass-docker` label is aspirational:
+    # it exists in the repo but is NOT yet honored anywhere — the
+    # reusable doesn't know about it, and we can't enforce it at the
+    # shim level without breaking the required-check name. Tracked for
+    # upstream support in layervai/ops-routines-workflows.
     # Note: `timeout-minutes` is intentionally NOT set here. Per GH
     # docs (https://docs.github.com/en/actions/using-workflows/reusing-workflows#supported-keywords-for-jobs-that-call-a-reusable-workflow)
     # only if/name/needs/permissions/secrets/strategy/uses/with/concurrency

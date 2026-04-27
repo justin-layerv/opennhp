@@ -2,8 +2,10 @@
 # For AWS deployment with Let's Encrypt DNS-01 challenge via Route53
 #
 # Stage 1: Build the NHP AC binary
-ARG GO_VERSION=1.26.2
-FROM golang:${GO_VERSION}-bookworm AS builder
+# Tag participates in the GO_VERSION lockstep (see #1337). Canonical
+# source of all locations is .github/workflows/build-and-push.yml's
+# env.GO_VERSION block.
+FROM golang:1.26.2-bookworm@sha256:47ce5636e9936b2c5cbf708925578ef386b4f8872aec74a67bd13a627d242b19 AS builder
 
 WORKDIR /nhp-server
 
@@ -36,7 +38,7 @@ COPY . .
 RUN make init acd
 
 # Stage 2: Runtime image with Traefik
-FROM ubuntu:24.04 AS runtime
+FROM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 

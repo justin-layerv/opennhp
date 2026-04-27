@@ -65,6 +65,16 @@ concurrency:
 env:
   AWS_REGION: us-east-2
   TF_VERSION: '1.14.3'
+  # Bumping this requires lockstep updates across:
+  #   - env.GO_VERSION in build-and-push.yml, ubuntu-build.yml,
+  #     codeql.yml, build-binaries.yml
+  #   - FROM tags in docker/Dockerfile.{server,ac,ac.aws}
+  #   - bind-mounted golang:${GO_VERSION}-bookworm container refs in
+  #     this file (search for "GO_VERSION-LOCKSTEP" anchor below)
+  #   - `go` directive in nhp/go.mod and endpoints/go.mod
+  # NOTE: `make lint-workflows` does NOT currently catch drift here —
+  # #1337 tracks the lockstep lint that will. Until it lands, bumpers
+  # must walk this list manually.
   GO_VERSION: '1.26.2'
 
 jobs:
@@ -554,6 +564,9 @@ jobs:
           # user, the `mkdir -p` below plus the bind-mount owner will
           # need to agree on the target UID (chown or --user).
           mkdir -p "$HOME/go/pkg/mod" "$HOME/.cache/go-build"
+          # GO_VERSION-LOCKSTEP: golang:${{ env.GO_VERSION }}-bookworm
+          # below tracks env.GO_VERSION at the top of this file. When
+          # bumping Go, both must move together; see env block comment.
           docker run --rm \
             --privileged \
             --cap-add=NET_ADMIN \
@@ -585,6 +598,9 @@ jobs:
           # Shares the runner's GOMODCACHE/GOCACHE with the Run tests
           # step, so vet reuses test-compiled packages instead of doing
           # a cold rebuild.
+          # GO_VERSION-LOCKSTEP: golang:${{ env.GO_VERSION }}-bookworm
+          # below tracks env.GO_VERSION at the top of this file. When
+          # bumping Go, both must move together; see env block comment.
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
             -v "$HOME/go/pkg/mod:/root/go/pkg/mod" \
@@ -720,8 +736,6 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-          build-args: |
-            GO_VERSION=${{ env.GO_VERSION }}
           secrets: |
             github_token=${{ secrets.PLUGIN_REPO_TOKEN }}
           # Cache strategy:
