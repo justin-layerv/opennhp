@@ -193,9 +193,59 @@ fi
 
 SECRET_ARN="${secret_arn}"
 REGION="${region}"
-SECRET=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --region "$REGION" --query SecretString --output text)
-PRIVATE_KEY=$(echo "$SECRET" | jq -r ".privateKey")
-HOSTNAME=$(echo "$SECRET" | jq -r ".hostname")
+# SECURITY: this script runs under `set -ex`; the top-level `exec` redirect
+# ships stderr (including xtrace) to user-data.log → CloudWatch Logs (30 day
+# sandbox / 365 day prod retention; see the `retention_in_days` ternary in
+# modules/compute/main.tf). Under `set -x` the `SECRET=$(aws …)` assignment
+# would otherwise trace `+ SECRET='{"privateKey":"…"}'` (bash expands the
+# captured stdout into the assignment's trace line), and the two `jq`
+# pipelines below would trace the same JSON again. This is the **fleet-wide**
+# server private key — leakage would force a whole-fleet AC re-key.
+# Bracket fetch + extract with `set +x` / `set -x`, scrub `$SECRET`, and
+# `unset $PRIVATE_KEY` after the config.toml heredoc lands it on disk
+# (the heredoc body itself is not traced by bash). Mirrors the
+# EXISTING_SECRET / KEYPAIR block in modules/ac/user_data.sh.tpl (PR #1304,
+# issue #1268) — that block is AC reading its own per-instance private key
+# from Secrets Manager; this block is the structural equivalent for the
+# server (fleet-wide private key, higher blast radius). Heredoc safety
+# applies to here-*documents* (`<<`) only; here-strings (`<<<`)
+# *are* traced with expansion, so any future edit switching to `<<<`
+# would need its own `set +x` bracket.
+# Note on the `|| { set -x; echo FATAL; exit 1; }` catches in this and
+# the QURL/COOKIE blocks below. The FATAL echo itself lands in
+# user-data.log regardless of xtrace state via the top-of-script
+# `exec > >(tee …)` redirect — the `set -x` re-enable only adds the
+# `+ echo 'FATAL: …'` trace line for stream symmetry. The `||` catch
+# itself is the load-bearing piece: under `set -e`, a failed `aws ...`
+# inside a `set +x` bracket would otherwise terminate the script with
+# xtrace off, so any future cleanup or logging added between the catch
+# and `exit 1` would run untraced. Keep the catch + `set -x` even if
+# the body is just an `exit 1`.
+#
+# Pipefail caveat: this script does not set `pipefail`, so the `echo
+# "$VAR" | jq -er '.field'` pipelines below catch jq failure only
+# because jq is the rightmost command. Any future edit that adds a
+# post-jq filter (`| sed`, `| tr`, `| tee`, etc.) would mask jq's exit
+# even with `-e`. Either preserve the rightmost-jq invariant or add
+# `set -o pipefail` here. #1305's CI lint is the structural fence.
+set +x
+SECRET=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --region "$REGION" --query SecretString --output text) || {
+  set -x
+  echo "FATAL: Could not fetch server secret from Secrets Manager"
+  exit 1
+}
+PRIVATE_KEY=$(echo "$SECRET" | jq -er ".privateKey") || {
+  set -x
+  echo "FATAL: Could not extract privateKey from server secret JSON (missing or null)"
+  exit 1
+}
+HOSTNAME=$(echo "$SECRET" | jq -er ".hostname") || {
+  set -x
+  echo "FATAL: Could not extract hostname from server secret JSON (missing or null)"
+  exit 1
+}
+unset SECRET
+set -x
 
 TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 
@@ -250,6 +300,14 @@ AesKey = "${auth_aes_key}"
 [webrtc]
 Enable = false
 CONFIGEOF
+# Scrub $PRIVATE_KEY: prevents any future edit (e.g. `<<<` here-string or
+# `--key "$PRIVATE_KEY"` invocation, neither of which are heredoc-trace-safe)
+# from silently reintroducing the xtrace-leak class this PR closes.
+# Mirrors the AC user_data PRIVATE_KEY scrub in PR #1304. $HOSTNAME is not
+# sensitive and has no consumer past this heredoc — left alone (an `unset`
+# here would not restore bash's auto-populated built-in, just leave it
+# empty for any subsequent read).
+unset PRIVATE_KEY
 
 # ============================================================================
 # Storage Backend Configuration - Separate file (storage.toml)
@@ -333,19 +391,51 @@ mkdir -p /opt/layerv/nhp-server/etc/tls
 # Fetch etcd TLS certificates from Secrets Manager (CA + client certs for mTLS)
 %{ if etcd_tls_secret_arn != "" }
 echo "Fetching etcd TLS certificates..."
-ETCD_TLS_SECRET=$(aws secretsmanager get-secret-value --secret-id "${etcd_tls_secret_arn}" --region "$REGION" --query SecretString --output text)
+# SECURITY: xtrace-leak guard — see SERVER fetch above. The
+# `ETCD_TLS_SECRET=$(aws …)` assignment would otherwise trace the full
+# JSON envelope, and each `echo "$ETCD_TLS_SECRET" | jq -r '.<field>'`
+# pipeline would trace it again. Anyone with CloudWatch Logs read on
+# this server's user-data log group could impersonate the server
+# against etcd for the configured retention window and read/write
+# /nhp/config and /nhp/ac-registry/*. Bracket fetch + extract with
+# `set +x` / `set -x`, scrub `$ETCD_TLS_SECRET` after the cert files
+# land on disk.
+set +x
+ETCD_TLS_SECRET=$(aws secretsmanager get-secret-value --secret-id "${etcd_tls_secret_arn}" --region "$REGION" --query SecretString --output text) || {
+  set -x
+  echo "FATAL: Could not fetch etcd TLS bundle from Secrets Manager"
+  exit 1
+}
 
-# Extract CA certificate
-echo "$ETCD_TLS_SECRET" | jq -r '.caCert' > /opt/layerv/nhp-server/etc/tls/ca.crt
+# Extract CA certificate. `jq -er` exits non-zero on null/missing field
+# (vs `jq -r` which writes the literal string "null" and exits 0) — the
+# `||` catch below relies on that to surface a malformed secret as a
+# FATAL line rather than silently writing "null" into ca.crt and failing
+# later in mTLS handshake.
+echo "$ETCD_TLS_SECRET" | jq -er '.caCert' > /opt/layerv/nhp-server/etc/tls/ca.crt || {
+  set -x
+  echo "FATAL: Could not extract caCert from etcd TLS secret (missing or null)"
+  exit 1
+}
 chmod 644 /opt/layerv/nhp-server/etc/tls/ca.crt
 echo "etcd CA certificate installed"
 
 # Extract client certificate and key for mTLS authentication
-echo "$ETCD_TLS_SECRET" | jq -r '.clientCert' > /opt/layerv/nhp-server/etc/tls/client.crt
+echo "$ETCD_TLS_SECRET" | jq -er '.clientCert' > /opt/layerv/nhp-server/etc/tls/client.crt || {
+  set -x
+  echo "FATAL: Could not extract clientCert from etcd TLS secret (missing or null)"
+  exit 1
+}
 chmod 644 /opt/layerv/nhp-server/etc/tls/client.crt
-echo "$ETCD_TLS_SECRET" | jq -r '.clientKey' > /opt/layerv/nhp-server/etc/tls/client.key
+echo "$ETCD_TLS_SECRET" | jq -er '.clientKey' > /opt/layerv/nhp-server/etc/tls/client.key || {
+  set -x
+  echo "FATAL: Could not extract clientKey from etcd TLS secret (missing or null)"
+  exit 1
+}
 chmod 600 /opt/layerv/nhp-server/etc/tls/client.key
 echo "etcd client certificate and key installed for mTLS"
+unset ETCD_TLS_SECRET
+set -x
 %{ endif }
 
 # Create remote.toml for etcd connection
@@ -706,17 +796,28 @@ echo "No plugins configured, skipping resource.toml creation"
 # ============================================================================
 %{ if qurl_enabled ~}
 echo "Fetching QURL service token from Secrets Manager..."
+# SECURITY: xtrace-leak guard — see SERVER fetch above. The
+# `QURL_SERVICE_TOKEN=$(aws …)` assignment and the `[ -z "$QURL_SERVICE_TOKEN" ]`
+# test would otherwise trace the bearer token. The token is later
+# materialised into the `SECRETSEOF` heredoc below; bash does not xtrace
+# heredoc bodies, so that line stays safe under the re-enabled `set -x`.
+# Re-enable `set -x` inside the FATAL branches so the failure trace hits
+# user-data.log under xtrace.
+set +x
 QURL_SERVICE_TOKEN=$(aws secretsmanager get-secret-value \
   --secret-id "${qurl_service_token_secret_arn}" \
   --region "$REGION" \
   --query SecretString --output text) || {
+    set -x
     echo "ERROR: Failed to fetch QURL service token from Secrets Manager"
     exit 1
 }
 if [ -z "$QURL_SERVICE_TOKEN" ]; then
+  set -x
   echo "ERROR: QURL service token is empty"
   exit 1
 fi
+set -x
 echo "QURL plugin configured: api_url=${qurl_api_url}, allowed_domain=${qurl_allowed_redirect_domain}"
 %{ endif ~}
 
@@ -791,19 +892,40 @@ chmod 600 /opt/layerv/nhp-server/etc/secrets.env
 # Secret contains JSON with current + optional previous key pairs for rotation.
 # Base64-encoded before writing to env file to avoid shell/heredoc quoting issues.
 echo "Fetching cookie session keys from Secrets Manager..."
+# SECURITY: xtrace-leak guard — see SERVER fetch above. The
+# `COOKIE_KEYS_JSON=$(aws …)` assignment, the `[ -z "$COOKIE_KEYS_JSON" ]`
+# test, the `echo "$COOKIE_KEYS_JSON" | python3 -c "…"` validation pipe,
+# and the `base64 -w 0` pipeline would all trace the cookie-signing /
+# encryption keys under `set -x`. Leakage lets an attacker forge session
+# cookies for the full CloudWatch Logs retention window. `$NHP_COOKIE_KEYS`
+# is consumed by the `SECRETSEOF` heredoc below — bash does not xtrace
+# heredoc bodies, so we leave it set; `$COOKIE_KEYS_JSON` has no
+# downstream consumer once base64 lands, so we scrub it. Re-enable
+# `set -x` inside FATAL branches so the failure trace hits user-data.log
+# under xtrace.
+set +x
 COOKIE_KEYS_JSON=$(aws secretsmanager get-secret-value \
   --secret-id "${cookie_secret_arn}" \
   --region "$REGION" \
   --query SecretString --output text) || {
+    set -x
     echo "ERROR: Failed to fetch cookie session keys from Secrets Manager"
     exit 1
 }
 if [ -z "$COOKIE_KEYS_JSON" ]; then
+  set -x
   echo "ERROR: Cookie session keys secret is empty"
   exit 1
 fi
 
-# Validate JSON structure has required fields
+# Validate JSON structure has required fields. Safe under `set +x`: the
+# python3 stdin pipe is not traced (xtrace off), and python3's stderr is
+# bounded — AssertionError emits the literal assertion message
+# ('missing current key set' etc.) plus a traceback referencing <string>
+# line numbers, and JSONDecodeError emits position info ('Expecting value:
+# line N column M (char K)') with at most a single character of context,
+# never the full document. Future edits that add `print(d)` for debugging
+# would defeat that invariant — keep the validator output-free.
 echo "$COOKIE_KEYS_JSON" | python3 -c "
 import json, sys
 d = json.loads(sys.stdin.read())
@@ -811,12 +933,15 @@ assert 'current' in d, 'missing current key set'
 assert 'auth_key' in d['current'], 'missing current.auth_key'
 assert 'encrypt_key' in d['current'], 'missing current.encrypt_key'
 " || {
+  set -x
   echo "ERROR: Cookie secret JSON missing required fields (current.auth_key, current.encrypt_key)"
   exit 1
 }
 
 # Base64-encode for safe transport through env file and docker --env-file
 NHP_COOKIE_KEYS=$(echo -n "$COOKIE_KEYS_JSON" | base64 -w 0)
+unset COOKIE_KEYS_JSON
+set -x
 
 # Fetch the NHP internal auth HMAC secret (signed by qurl-service on outbound
 # /nhp/internal/knock requests; verified by this server). Fail-closed if the
@@ -860,11 +985,14 @@ NHP_INTERNAL_AUTH_SECRET=$NHP_INTERNAL_AUTH_SECRET
 QURL_SERVICE_TOKEN=$QURL_SERVICE_TOKEN
 %{ endif ~}
 SECRETSEOF
-# Defense-in-depth: NHP_INTERNAL_AUTH_SECRET is no longer needed in the
-# shell environment after the heredoc writes it. Unset so a future edit
-# that accidentally references it can't resurrect the xtrace-leak class.
-# Matches the PR #1304 treatment of EXISTING_SECRET / KEYPAIR / SECRET_VALUE.
-unset NHP_INTERNAL_AUTH_SECRET
+# Defense-in-depth: these secrets are no longer needed in the shell
+# environment after the heredoc writes them. Unset so a future edit that
+# accidentally references one of them can't resurrect the xtrace-leak class.
+# `NHP_COOKIE_KEYS` is base64-encoded — encoding obscures from casual log
+# scanning but is fully reversible; treat the variable as still-sensitive
+# session-key material. `QURL_SERVICE_TOKEN` is the raw bearer token.
+# Matches the PR #1304 defense-in-depth scrub pattern.
+unset NHP_INTERNAL_AUTH_SECRET NHP_COOKIE_KEYS QURL_SERVICE_TOKEN
 echo "Created secrets file with cookie keys, internal auth secret, and service credentials"
 
 cat > /etc/systemd/system/nhp-server.service << 'SVCEOF'
