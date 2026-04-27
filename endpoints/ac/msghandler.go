@@ -52,14 +52,16 @@ func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
 		log.Error("ac(%s#%d)[HandleUdpACOperations] HandleAccessControl failed, err: %v", acId, transactionId, err)
 	}
 
-	// generate ac token and save user and access information
-	entry := &AccessEntry{
+	// Token issuance is gated on ErrCode == success — see
+	// IssueACTokenIfSuccess for the threat-model rationale (post-nhp#1124
+	// the token is the entire auth secret; do not mint one for failed ops
+	// that would only surface via leaky %+v error logs on the server).
+	a.IssueACTokenIfSuccess(artMsg, &AccessEntry{
 		User:     agentUser,
 		SrcAddrs: srcAddrs,
 		DstAddrs: dstAddrs,
 		OpenTime: openTimeSec,
-	}
-	artMsg.ACToken = a.GenerateAccessToken(entry)
+	})
 
 	// send ac result
 	artBytes, marshalErr := json.Marshal(artMsg)
@@ -548,6 +550,17 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 			DstAddrs: dstAddrs,
 			OpenTime: tempOpenTimeSec,
 		}
+		// INVARIANT: this token issuance is not gated by IssueACTokenIfSuccess
+		// because PreAccessAction is reached only after every error return in
+		// HandleAccessControl above, and ErrCode is unconditionally set to
+		// success at the bottom of this function. Any future error branch
+		// added between this line and the `ErrCode = ErrSuccess` assignment
+		// below would mint a token paired with a failure code and leak it via
+		// the server's `%+v` artMsg logs (the leak-logger predicate uses the
+		// strict `ErrCode != ErrSuccess.ErrorCode()` check). Post-nhp#1124
+		// the token is the entire auth secret; preserve the
+		// issuance-immediately-before-success pairing or move to a gated
+		// helper. Code-level enforcement tracked in #1420.
 		artMsg.PreAccessAction = &common.PreAccessInfo{
 			AccessPort:     strconv.Itoa(pickedPort),
 			ACPubKey:       a.device.PublicKeyBase64(),

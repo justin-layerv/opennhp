@@ -140,7 +140,6 @@ func (ha *HttpAC) initRouter() {
 	refreshGrp.GET("/:token", func(ctx *gin.Context) {
 		var err error
 		token := ctx.Param("token")
-		log.Info("get refresh request. token: %s, query: %v", token, ctx.Request.URL.RawQuery)
 
 		if len(token) == 0 {
 			err = common.ErrUrlPathInvalid
@@ -155,6 +154,14 @@ func (ha *HttpAC) initRouter() {
 			ctx.JSON(http.StatusOK, gin.H{"errMsg": fmt.Sprintf("token error: %v", err)})
 			return
 		}
+
+		// Redact post-unescape: base64-StdEncoding tokens contain '+' and
+		// '/' which arrive percent-encoded ('%2B' / '%2F'), so logging the
+		// raw URL parameter would burn the first two characters of the
+		// redaction prefix on a single base64 byte and weaken the entropy
+		// budget the tokenLogPrefixLen comment commits to. Post-1124 the
+		// token is the entire auth secret — see common.RedactToken.
+		log.Info("get refresh request. token: %s, query: %v", common.RedactToken(token), ctx.Request.URL.RawQuery)
 
 		req := &common.HttpRefreshRequest{
 			Token: token,

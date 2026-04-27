@@ -1,6 +1,7 @@
 package test
 
 import (
+	"encoding/base64"
 	"fmt"
 	"sync"
 	"testing"
@@ -211,6 +212,165 @@ func TestTokenStore_TwoLevelIndexing(t *testing.T) {
 	_, found = ts.Load("Atoken5")
 	if !found {
 		t.Error("expected Atoken5 to still exist")
+	}
+}
+
+// TestGenerateOpaqueToken_Shape pins the wire-compatible shape consumers
+// depend on: 44 ASCII chars, base64-StdEncoding charset with trailing '='.
+// Regression fence for nhp#1124 (replace SHA-256-over-public-inputs with
+// crypto/rand) — if shape ever changes, downstream regex/fixed-length
+// validators (qurl-service, traefik-plugins, agent SDKs) will silently
+// reject tokens.
+func TestGenerateOpaqueToken_Shape(t *testing.T) {
+	const expectedLen = 44 // 32 bytes base64-StdEncoding-encoded
+	for i := 0; i < 1000; i++ {
+		token := common.GenerateOpaqueToken()
+		if len(token) != expectedLen {
+			t.Fatalf("token %d: len=%d, want %d (token=%q)", i, len(token), expectedLen, token)
+		}
+		if token[expectedLen-1] != '=' {
+			t.Fatalf("token %d: missing base64 padding (token=%q)", i, token)
+		}
+		for _, c := range token[:expectedLen-1] {
+			ok := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+				(c >= '0' && c <= '9') || c == '+' || c == '/'
+			if !ok {
+				t.Fatalf("token %d: invalid base64 char %q (token=%q)", i, c, token)
+			}
+		}
+	}
+}
+
+// TestGenerateOpaqueToken_NeverEmpty pins the panic-vs-empty contract:
+// GenerateOpaqueToken's response to crypto/rand failure is to panic, not
+// to return empty. A regression that swapped the panic for `return ""`
+// would silently hand out the empty token; TokenStore.Store ignores
+// empty tokens (so no entry is recorded), but a downstream consumer
+// that compared against the issued empty value would gain valid access
+// to nothing — confusing, and ripe for follow-on bugs. Pin the
+// non-empty postcondition explicitly.
+func TestGenerateOpaqueToken_NeverEmpty(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		if got := common.GenerateOpaqueToken(); got == "" {
+			t.Fatalf("token %d was empty", i)
+		}
+	}
+}
+
+// TestGenerateOpaqueToken_NoCollisions asserts uniqueness across a large
+// batch — birthday probability for 32-byte values is ~10⁻⁶⁰, so any
+// collision indicates a regression to a low-entropy construction.
+func TestGenerateOpaqueToken_NoCollisions(t *testing.T) {
+	const n = 10_000
+	seen := make(map[string]struct{}, n)
+	for i := 0; i < n; i++ {
+		token := common.GenerateOpaqueToken()
+		if _, dup := seen[token]; dup {
+			t.Fatalf("collision after %d tokens: %q", i, token)
+		}
+		seen[token] = struct{}{}
+	}
+}
+
+// TestGenerateOpaqueToken_ByteEntropy decodes a large batch and asserts every
+// byte value 0x00–0xFF appears at least once. A regression to a hashed-
+// metadata construction with low timestamp variance would skew the
+// distribution; this is a coarse but cheap canary that catches the obvious
+// failure modes without pulling in a NIST-style suite. 10_000 tokens × 32
+// bytes = 320KB, so each of 256 byte values is expected ~1250 times by
+// chance — missing any value is a strong signal of non-randomness.
+func TestGenerateOpaqueToken_ByteEntropy(t *testing.T) {
+	const n = 10_000
+	var seen [256]bool
+	for i := 0; i < n; i++ {
+		// EncodeToString output always round-trips through DecodeString
+		// without error; the err check is defense-in-depth against a
+		// future refactor that switches the encoding.
+		raw, err := base64.StdEncoding.DecodeString(common.GenerateOpaqueToken())
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+		for _, b := range raw {
+			seen[b] = true
+		}
+	}
+	for v, ok := range seen {
+		if !ok {
+			t.Fatalf("byte value 0x%02x never appeared in %d tokens — entropy regressed", v, n)
+		}
+	}
+}
+
+// TestGenerateOpaqueToken_ConcurrentNoCollisions fences a future change
+// that accidentally introduces shared state in the generation path (a
+// per-process counter, a token-formatter pool). Today the primitive is
+// stateless, so this is belt-and-suspenders.
+//
+// Concurrency pattern: each goroutine writes to its own pre-sized slot
+// in `results`, never appending to a shared slice. A future change that
+// switches to `append` on a shared `[]string` would be a data race; if
+// you refactor this test, preserve the fixed-slot write pattern.
+func TestGenerateOpaqueToken_ConcurrentNoCollisions(t *testing.T) {
+	const goroutines = 16
+	const tokensPerGoroutine = 1000
+
+	results := make([][]string, goroutines)
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			batch := make([]string, tokensPerGoroutine)
+			for i := 0; i < tokensPerGoroutine; i++ {
+				batch[i] = common.GenerateOpaqueToken()
+			}
+			results[idx] = batch
+		}(g)
+	}
+	wg.Wait()
+
+	seen := make(map[string]int, goroutines*tokensPerGoroutine)
+	for g, batch := range results {
+		for i, token := range batch {
+			if prev, dup := seen[token]; dup {
+				t.Fatalf("collision: goroutine=%d index=%d token=%q (also seen at flat index %d)",
+					g, i, token, prev)
+			}
+			seen[token] = g*tokensPerGoroutine + i
+		}
+	}
+}
+
+// TestRedactToken pins the log-redaction contract: a real 44-char access
+// token must keep its leading 8 chars and lose the rest, and pathologically
+// short inputs must not be re-formatted (they will fail the wire-shape
+// check downstream regardless). This is what stops a future caller from
+// re-introducing full-token logging via copy-paste from a pre-1124 code
+// path that treated the token as derivable-from-public-inputs.
+//
+// SECURITY: the "abcdefgh..." cases below also fence the value of
+// common.tokenLogPrefixLen — bumping it (e.g. to 16) would silently
+// reveal more token entropy in logs and require a new threat-model
+// review. The doc comment on tokenLogPrefixLen quantifies the bits
+// revealed at 8 chars; if you change either, change both.
+func TestRedactToken(t *testing.T) {
+	cases := []struct {
+		name  string
+		token string
+		want  string
+	}{
+		{"empty", "", ""},
+		{"short_kept_verbatim", "abc", "abc"},
+		{"exactly_prefix_len_kept_verbatim", "abcdefgh", "abcdefgh"},
+		{"truncated", "abcdefghij", "abcdefgh..."},
+		{"full_44char_token", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH", "abcdefgh..."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := common.RedactToken(tc.token); got != tc.want {
+				t.Fatalf("RedactToken(%q) = %q, want %q", tc.token, got, tc.want)
+			}
+		})
 	}
 }
 

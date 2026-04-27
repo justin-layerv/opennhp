@@ -1,9 +1,6 @@
 package server
 
 import (
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/binary"
 	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
@@ -23,22 +20,19 @@ func (e *ACTokenEntry) GetExpireTime() time.Time {
 	return e.ExpireTime
 }
 
-// GenerateAccessToken creates a new access token for the given entry.
+// GenerateAccessToken issues an opaque random access token for the given
+// entry, stores the entry under that token, and returns the token.
+//
+// The token is opaque random bytes (see common.GenerateOpaqueToken) — not a
+// hash of metadata. This closes nhp#1124: the prior SHA-256-over-public-inputs
+// construction was offline-grindable given any timing signal.
+//
+// Token retention is exactly OpenTime — the server is the issuer, not the
+// gate, so it has no equivalent of the AC's accessTokenLatePacketBufferSeconds.
 func (s *UdpServer) GenerateAccessToken(entry *ACTokenEntry) string {
-	var tsBytes [8]byte
-	currTime := time.Now().UnixNano()
-
-	hash := sha256.New()
-	binary.BigEndian.PutUint64(tsBytes[:], uint64(currTime))
-	au := entry.User
-	hash.Write([]byte(s.config.Hostname + au.UserId + au.DeviceId + au.OrganizationId + au.AuthServiceId))
-	hash.Write(tsBytes[:])
-	token := base64.StdEncoding.EncodeToString(hash.Sum(nil))
-	hash.Reset()
-
+	token := common.GenerateOpaqueToken()
 	entry.ExpireTime = time.Now().Add(time.Duration(entry.OpenTime) * time.Second)
 	s.tokenStore.Store(token, entry)
-
 	return token
 }
 
