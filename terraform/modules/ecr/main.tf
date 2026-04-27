@@ -180,6 +180,17 @@ variable "qurl_github_repo" {
   default     = "qurl-service"
 }
 
+variable "website_api_cfn_stack_name" {
+  description = "Website CDK CloudFormation stack name (e.g. LayerV-production-Api). Non-null grants the github_actions role read access on the stack so data.aws_cloudformation_stack.website_api works at plan time. Should track deploy_website_api_dns enablement. See terraform/variables.tf for the consumer-side framing of the same variable."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.website_api_cfn_stack_name == null || length(var.website_api_cfn_stack_name) > 0
+    error_message = "website_api_cfn_stack_name must be null or a non-empty string (an empty value would render an unscoped CFN stack ARN)."
+  }
+}
+
 # ==================== Data Sources ====================
 
 data "aws_caller_identity" "current" {}
@@ -1715,6 +1726,44 @@ resource "aws_iam_policy" "terraform_apply_data" {
 resource "aws_iam_role_policy_attachment" "terraform_apply_data" {
   role       = aws_iam_role.github_actions.name
   policy_arn = aws_iam_policy.terraform_apply_data.arn
+}
+
+# Region pinned to us-east-1 because the website CDK app always deploys
+# there regardless of nhp's region — the data source uses
+# provider = aws.us_east_1 for the same reason. Reconciles the manual
+# incident-2026-04-24-cfn-describe-website-api inline grant from the
+# prod release incident (#1323); the manual inline is tracked for
+# deletion in #1415 (the two grants overlap until then — IAM
+# allow-union is fine but leaves attribution ambiguous in CloudTrail).
+#
+# Gated on website_api_cfn_stack_name alone — narrower than the
+# data source's local.website_api_dns_enabled (which also requires
+# deploy_website_api_dns / website_api_domain / qurl_hosted_zone_id).
+# Keying off the stack-name variable maps cleanly to "the role needs
+# this permission" and avoids drift if the data source's gate later
+# adds another input. The root precondition at terraform/main.tf:994
+# enforces the four inputs travel together for prod plans, so the
+# practical state space is unchanged.
+resource "aws_iam_role_policy" "cloudformation_website_api" {
+  count = var.website_api_cfn_stack_name == null ? 0 : 1
+
+  name = "cloudformation-website-api"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "WebsiteAPIStackRead"
+        Effect = "Allow"
+        Action = [
+          "cloudformation:DescribeStacks",
+          "cloudformation:GetTemplate"
+        ]
+        Resource = "arn:aws:cloudformation:us-east-1:${local.account_id}:stack/${var.website_api_cfn_stack_name}/*"
+      }
+    ]
+  })
 }
 
 # S3 write permissions for Traefik plugins bucket

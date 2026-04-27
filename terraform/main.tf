@@ -204,6 +204,8 @@ module "ecr" {
   # QURL Service ECR repository
   deploy_qurl_ecr  = var.deploy_qurl_service
   qurl_github_repo = var.qurl_github_repo
+
+  website_api_cfn_stack_name = var.website_api_cfn_stack_name
 }
 
 # Networking Module - VPC, Subnets, Security Groups
