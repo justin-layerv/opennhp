@@ -235,8 +235,13 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		ctx.JSON(http.StatusOK, gin.H{"errMsg": fmt.Sprintf("resource error: %v", err)})
 		return
 	}
+	// CORS headers are set by the engine-level corsMiddleware in
+	// httpserver.go. Do NOT call nhpplugins.CorsMiddleware(ctx) here:
+	// in nhp-plugins-sdk v0.1.30 it overwrites
+	// Access-Control-Expose-Headers with a stale default
+	// ("Content-Length, Content-Type, Authorization") that drops
+	// Set-Cookie. See #1394.
 	ctx.SetSameSite(http.SameSiteNoneMode)
-	nhpplugins.CorsMiddleware(ctx)
 
 	switch {
 	case strings.EqualFold(action, "valid"):
@@ -330,7 +335,23 @@ func AuthWithHttpRefresh(ctx *gin.Context, action string, req *common.HttpKnockR
 		return nil, errors.New("nhp token is invalid")
 	}
 
-	nhpplugins.CorsMiddleware(ctx)
+	// CORS headers are set by the engine-level corsMiddleware in
+	// httpserver.go. Do NOT call nhpplugins.CorsMiddleware(ctx) here:
+	// in nhp-plugins-sdk v0.1.30 it overwrites
+	// Access-Control-Expose-Headers with a stale default
+	// ("Content-Length, Content-Type, Authorization") that drops
+	// Set-Cookie. See #1394.
+
+	// SameSite=None for cross-origin cookies is NOT set at this level.
+	// Today the existing branches don't need it here:
+	//   action=refresh    → refreshToken → exchangeAndKnock, which
+	//                       calls SetSameSite(None) before every
+	//                       SetCookie.
+	//   action=nhp-refresh → authAndShowRefresh, renders HTML, never
+	//                       sets cookies.
+	// If you add a third branch that calls ctx.SetCookie, call
+	// ctx.SetSameSite(http.SameSiteNoneMode) first — gin's default
+	// (Lax) breaks cross-origin SPA cookie pickup.
 	if strings.EqualFold(action, "refresh") {
 		startTime := time.Now()
 		ackMsg, err = refreshToken(ctx, req, res, helper)

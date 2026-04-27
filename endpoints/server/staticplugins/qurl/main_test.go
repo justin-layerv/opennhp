@@ -1240,8 +1240,8 @@ func TestAuthWithHttp_AcceptJSON_HeaderValuesNotGet(t *testing.T) {
 
 // TestAuthWithHttp_AcceptJSON_VaryAddDoesNotClobberPreexisting fences the
 // production layering: the platform CORS middleware in httpserver.go
-// runs Set("Vary", "Origin") upstream of this handler, and the SDK
-// CorsMiddleware called from inside this handler must not clobber that.
+// runs Set("Vary", "Origin") upstream of this handler, and code in
+// this handler must Add (not Set) Vary so that value survives.
 // Pre-seeds Vary: Origin on the response writer (simulating the
 // upstream middleware) before calling AuthWithHttp and asserts both
 // values survive.
@@ -1274,6 +1274,48 @@ func TestAuthWithHttp_AcceptJSON_VaryAddDoesNotClobberPreexisting(t *testing.T) 
 	}
 	if !strings.Contains(got, "Origin") {
 		t.Errorf("Vary = %q, want upstream Origin to survive", got)
+	}
+}
+
+// TestAuthWithHttp_AcceptJSON_DoesNotClobberExposeHeaders fences the
+// regression caught by smoke test TestResolve_AcceptJSON_CORSCredentialsHeaders:
+// the engine-level corsMiddleware in httpserver.go writes
+// Access-Control-Expose-Headers (with Set-Cookie) before this handler
+// runs, and nothing in this handler may touch that header. Browsers
+// only surface Set-Cookie on a credentialed fetch when its name appears
+// in the engine's value, so a handler-side clobber silently breaks
+// SPA cookie pickup.
+//
+// Seeds a sentinel value rather than the production literal so the
+// fence is decoupled from httpserver.go's Expose-Headers list — any
+// handler write to this header at all (clobber, append, partial
+// preserve) flips the exact-match assertion. The sibling passcode-side
+// test TestAuthWithHttp_DoesNotClobberExposeHeaders uses the same
+// pattern so #1394's lint can grep both with one substring.
+func TestAuthWithHttp_AcceptJSON_DoesNotClobberExposeHeaders(t *testing.T) {
+	setup := setupCustomDomainTest(t, &ResolveResponse{
+		ResourceID:   "r_origin",
+		TargetURL:    "https://backend.example.com",
+		QurlSiteURL:  "https://r_origin.qurl.site",
+		Resources:    map[string]*common.ResourceInfo{"default": {ACId: "ac-001", Hostname: "backend.example.com", Addr: &common.NetAddress{Ip: "10.0.0.1", Port: 443}}},
+		JWTSecret:    "test-jwt-secret-key-for-signing",
+		TokenExpire:  3600,
+		OpenTime:     300,
+		CookieDomain: ".qurl.site",
+	})
+	const sentinel = "X-Sentinel-DoNotTouch"
+	// Seed via the recorder so it surfaces that the engine middleware
+	// would have written here in production. Matches the stub style
+	// in passcode/auth_with_http_cors_test.go.
+	setup.recorder.Header().Set("Access-Control-Expose-Headers", sentinel)
+	setup.ctx.Request.Header.Set("Accept", "application/json")
+
+	if _, err := AuthWithHttp(setup.ctx, &common.HttpKnockRequest{}, successKnockHelper()); err != nil {
+		t.Fatalf("AuthWithHttp returned unexpected error: %v", err)
+	}
+	got := setup.recorder.Header().Get("Access-Control-Expose-Headers")
+	if got != sentinel {
+		t.Errorf("Access-Control-Expose-Headers = %q, want %q unchanged (handler must not touch this header)", got, sentinel)
 	}
 }
 

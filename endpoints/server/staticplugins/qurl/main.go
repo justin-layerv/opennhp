@@ -132,23 +132,24 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	requestID := getOrCreateRequestID(ctx)
 	ctx.Header(nhpserver.RequestIDHeader, requestID)
 
-	// Set CORS headers early so error responses are also CORS-enabled.
-	// This is important for cross-origin error handling in the qurl.link SPA.
-	ctx.SetSameSite(http.SameSiteNoneMode)
-	nhpplugins.CorsMiddleware(ctx)
-
-	// Vary: Accept on every response past CORS so any caching intermediary
-	// keys on the negotiated shape, not just the URL. Add (not Set) to
-	// append; placed after nhpplugins.CorsMiddleware so a future SDK
-	// version that touches Vary can't silently clobber the Accept value.
+	// SameSite=None for cross-origin cookies set later in this handler
+	// (nhp_token, nhp_refresh_token, nhp_session_ttl) — the qurl.link.*
+	// SPA needs them on a credentialed fetch to a different host.
 	//
-	// As of nhp-plugins-sdk v0.1.30, CorsMiddleware (plugins.go:224) does
-	// not set or add the Vary header — it only writes Access-Control-*
-	// headers and handles OPTIONS preflight. The placement here is
-	// forward-defense; today the upstream platform CORS middleware's
-	// Vary: Origin survives, and our Add appends Accept. If the SDK
-	// is ever upgraded, run TestAuthWithHttp_AcceptJSON_VaryAddDoesNotClobberPreexisting
-	// to confirm the invariant.
+	// CORS headers are written by the engine-level corsMiddleware in
+	// httpserver.go, which runs before this handler and covers every
+	// route including error paths. Do NOT call nhpplugins.CorsMiddleware
+	// here: in nhp-plugins-sdk v0.1.30 it overwrites
+	// Access-Control-Expose-Headers with a stale default
+	// ("Content-Length, Content-Type, Authorization") that drops
+	// Set-Cookie, silently breaking the SPA's credentialed-fetch cookie
+	// pickup. See #1394 for the lint that prevents reintroduction.
+	ctx.SetSameSite(http.SameSiteNoneMode)
+
+	// Vary: Accept on every response so caching intermediaries key on
+	// the negotiated shape, not just the URL. Add (not Set) to append
+	// to the Vary: Origin written by the engine middleware. Fenced by
+	// TestAuthWithHttp_AcceptJSON_VaryAddDoesNotClobberPreexisting.
 	ctx.Writer.Header().Add("Vary", "Accept")
 
 	// Extract access token: prefer POST form body, fall back to query parameter.
