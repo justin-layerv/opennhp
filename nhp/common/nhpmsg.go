@@ -128,12 +128,6 @@ type AgentAccessMsg struct {
 	UserData       map[string]any `json:"usrData,omitempty"`
 }
 
-type ACAccessAckMsg struct {
-	ErrCode   string `json:"errCode"`
-	ErrMsg    string `json:"errMsg,omitempty"`
-	AgentAddr string `json:"agentAddr,omitempty"` // optional
-}
-
 // ac <-> server
 type ServerACOpsMsg struct {
 	UserId           string        `json:"usrId"`
@@ -162,11 +156,6 @@ type ACOnlineMsg struct {
 	// License key is globally unique and sufficient for lookup and validation
 	LicenseKey string `json:"licKey,omitempty"`  // License key for validation (globally unique)
 	ACVersion  string `json:"version,omitempty"` // AC software version
-}
-
-type ACRefreshMsg struct {
-	NhpToken   string      `json:"nhpToken"`
-	SourceAddr *NetAddress `json:"srcAddr"`
 }
 
 type ServerACAckMsg struct {

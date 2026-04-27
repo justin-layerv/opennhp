@@ -13,16 +13,6 @@ type AgentUser struct {
 	AuthServiceId  string
 }
 
-// authsvcprovider and resource
-type LoginPageContext struct {
-	Title              string `json:"title,omitempty"`
-	ClientId           string `json:"clientId,omitempty"`
-	AppKey             string `json:"appKey,omitempty"`
-	AppSecret          string `json:"appSecret,omitempty"`
-	RedirectUrl        string `json:"redirectUrl,omitempty"`
-	RedirectWithParams bool   `json:"redirectWithParams,omitempty"`
-}
-
 type ResourceData struct {
 	ResourceGroup `mapstructure:",squash"`
 	// optional extension data
