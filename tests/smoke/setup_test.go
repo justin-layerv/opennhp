@@ -85,6 +85,25 @@ func TestMain(m *testing.M) {
 	testConfig.CWLogsClient = cloudwatchlogs.NewFromConfig(awsCfg)
 	testConfig.ELBClient = elasticloadbalancingv2.NewFromConfig(awsCfg)
 
+	// Resolve deploy mode + cell ID from SSM in one batch. Fail
+	// loudly on missing or unknown values — silently defaulting to
+	// blue_green would let a misconfigured prod look healthy while
+	// running every blue/green-specific assertion against a canary
+	// environment that doesn't have the prerequisite SSM keys.
+	discovery, err := fetchDeployDiscovery(ctx, testConfig.SSMClient, env)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: resolve deploy discovery for %s: %v\n", env, err)
+		os.Exit(2)
+	}
+	testConfig.DeployMode = discovery.Mode
+	testConfig.CellID = discovery.CellID
+
+	// Log the resolved discovery so CI logs can distinguish
+	// "mode/cell resolution wrong" from "test logic wrong" without
+	// re-running locally.
+	fmt.Fprintf(os.Stderr, "smoke: env=%s mode=%s cell_id=%s region=%s\n",
+		env, discovery.Mode, discovery.CellID, region)
+
 	// Pre-fetch (or cache-hit) the Auth0 bearer. Failure is non-fatal
 	// for Tier 1 — Auth0-dependent tests will call requireAuth0 and
 	// fail explicitly if the token is missing.

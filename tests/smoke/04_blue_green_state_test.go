@@ -7,6 +7,9 @@ package smoke
 // Capability: the small set of invariants the blue/green flip
 // maintains between SSM, ASGs, and the NLB listener config.
 //
+// Sibling of 04_canary_state_test.go — same tier, same level of
+// fence, but for the canary deploy regime that prod uses (#1330).
+//
 // Regression fences:
 //
 //	PR #997 — TF apply could silently undo the blue/green flip by
@@ -91,6 +94,7 @@ type listenerToTGCheck struct {
 //
 // Regression fence for PR #997.
 func TestBlueGreen_ActiveListenersPointToActiveColorTGs(t *testing.T) {
+	skipIfNotBlueGreen(t)
 	active := requireActiveColor(t)
 	env := testConfig.Environment
 
@@ -169,6 +173,7 @@ func TestBlueGreen_ActiveListenersPointToActiveColorTGs(t *testing.T) {
 // ASG names come from /{env}/nhp/{server,ac}/{blue,green}-asg-name.
 // No env vars needed.
 func TestBlueGreen_InactiveASGScaledToZeroOrMin(t *testing.T) {
+	skipIfNotBlueGreen(t)
 	inactive := inactiveColor(t)
 	env := testConfig.Environment
 

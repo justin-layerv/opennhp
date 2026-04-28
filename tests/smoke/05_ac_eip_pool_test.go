@@ -5,15 +5,18 @@ package smoke
 // Tier 1: AC Elastic IP pool sizing and coverage.
 //
 // Capability: the pool of EIPs the AC ASG draws from on instance
-// launch. The pool is sized to `2 * max_capacity + 1` so that an
-// instance refresh that launches a new instance before terminating an
-// old one (the default refresh strategy) always has a free EIP to
-// claim, avoiding the refresh deadlock.
+// launch. The pool is sized per terraform/modules/ac/eip.tf:33 —
+// `2 * max_capacity + 1` in blue/green envs (the +1 prevents an
+// instance refresh from deadlocking on the EIP-disassociation
+// eventual-consistency window) and `max_capacity` in canary envs
+// (single ASG, no parallel-color scenario).
 //
-// Regression fence for PR #1006: pre-#1006 the pool was sized to
-// max_capacity, which meant every instance refresh deadlocked on a
-// tight pool. The test asserts the post-#1006 minimum so no future
-// size edit re-introduces the deadlock.
+// In blue/green mode the post-#1006 minimum is what's being fenced
+// (pre-#1006 the pool was sized to max_capacity, which deadlocked
+// every refresh). In canary mode there's no equivalent regression
+// PR — the assertion just fences that the formula keeps matching
+// the TF source of truth. #1454 tracks whether canary actually needs
+// the +1 slack too (suspect yes, but the test mirrors TF either way).
 
 import (
 	"context"
@@ -48,9 +51,16 @@ func TestACEIPPool_AllActiveACsHaveEIP(t *testing.T) {
 }
 
 // TestACEIPPool_PoolSizeMeetsMinimum fences PR #1006. Reads the pool
-// size via tag filter and asserts it is at least `2 * max_capacity + 1`
-// when blue/green is enabled (which is the only configuration we
-// currently run).
+// size via tag filter and asserts it meets the deploy-mode-specific
+// minimum from terraform/modules/ac/eip.tf:
+//
+//	enable_blue_green ? max_capacity * 2 + 1 : max_capacity
+//
+// In blue/green envs the +1 slack is what keeps an instance refresh
+// from deadlocking on EIP claim during the AWS-side EIP-disassociation
+// eventual-consistency window (PR #1006). In canary envs there's a
+// single ASG and no parallel-color scenario, so max_capacity is the
+// floor.
 //
 // Tag key and value are load-bearing and come from the terraform
 // source at terraform/modules/ac/eip.tf:
@@ -97,18 +107,40 @@ func TestACEIPPool_PoolSizeMeetsMinimum(t *testing.T) {
 		t.Fatalf("AC ASG %s has max_size=%d", asgName, maxCap)
 	}
 
-	// Formula from terraform/modules/ac/eip.tf:
-	//   enable_blue_green ? max_capacity * 2 + 1 : max_capacity
-	// Sandbox and prod both have blue/green enabled. If the count
-	// ever drops below max*2+1, the refresh deadlock #1006 fenced is
-	// back. If blue/green is ever disabled this test needs to be
-	// updated to branch on an env-var signal.
-	minRequired := int(2*maxCap + 1)
-	if poolSize < minRequired {
-		t.Fatalf("EIP pool %s=%s has %d EIPs, minimum is %d (2*max_cap+1 where max_cap=%d) — PR #1006 regression",
-			poolTagKey, poolTagValue, poolSize, minRequired, maxCap)
+	// Formula must mirror terraform/modules/ac/eip.tf:33 exactly,
+	// paired with the regression-class reference for the right
+	// deploy mode. #1006 is the blue/green parallel-color refresh
+	// deadlock; canary has no historical bug class for this
+	// assertion yet (see #1454 for whether the +1 slack should mirror).
+	//
+	// Branching on testConfig.DeployMode (server-side regime) is
+	// safe even though the TF formula keys on var.enable_ac_blue_green
+	// because the second precondition on aws_ssm_parameter.deploy_mode
+	// asserts var.enable_blue_green == var.enable_ac_blue_green at
+	// plan time. A half-flip would fail terraform plan, not silently
+	// mis-fence here.
+	//
+	// Single switch (not two) so the {minRequired, ref} pair stays in
+	// lockstep — adding a future mode requires one edit, not two.
+	var (
+		minRequired int
+		ref         string
+	)
+	switch testConfig.DeployMode {
+	case DeployModeBlueGreen:
+		minRequired = int(2*maxCap + 1)
+		ref = "PR #1006 regression"
+	case DeployModeCanary:
+		minRequired = int(maxCap)
+		ref = "TF formula drift (eip.tf:33 vs smoke; see #1454 for whether canary should mirror #1006's +1)"
+	default:
+		t.Fatalf("unexpected DeployMode %q (want %s or %s)", testConfig.DeployMode, DeployModeBlueGreen, DeployModeCanary)
 	}
-	t.Logf("EIP pool %s=%s: size=%d, minimum=%d (max_cap=%d)", poolTagKey, poolTagValue, poolSize, minRequired, maxCap)
+	if poolSize < minRequired {
+		t.Fatalf("EIP pool %s=%s has %d EIPs, minimum is %d (deploy_mode=%s, max_cap=%d) — %s",
+			poolTagKey, poolTagValue, poolSize, minRequired, testConfig.DeployMode, maxCap, ref)
+	}
+	t.Logf("EIP pool %s=%s: size=%d, minimum=%d (deploy_mode=%s, max_cap=%d)", poolTagKey, poolTagValue, poolSize, minRequired, testConfig.DeployMode, maxCap)
 }
 
 // TestACEIPPool_AlarmEvaluationPeriodsAtLeast3 reads the CloudWatch

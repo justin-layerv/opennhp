@@ -409,6 +409,54 @@ PR1 ships Tier 1 only. PR2 adds Tier 2. PR3 adds Tier 3 + flips
 `continue-on-error` to false in the CI wiring so smoke becomes a
 required check.
 
+### Deploy-mode tier mapping
+
+NHP runs two deployment regimes side-by-side. The runtime source of
+truth is the SSM parameter `/{env}/nhp/deploy/mode` (Terraform-owned,
+see `terraform/main.tf::aws_ssm_parameter.deploy_mode`); the table
+below is just the current tfvars snapshot — flipping any env's
+toggles updates SSM on the next `terraform apply` and smoke adapts
+automatically. The TF preconditions on `deploy_mode` reject
+half-flips (e.g., `enable_blue_green=true, enable_ac_blue_green=false`)
+at plan time so smoke's mode-keyed assertions can't silently
+mis-fence.
+
+| Environment | `enable_blue_green` | `enable_canary_deployment` | Mode (today) |
+|---|---|---|---|
+| sandbox | `true` | `false` | `blue_green` |
+| prod | `false` | `true` | `canary` |
+
+The smoke suite reads the SSM key once in `TestMain` and uses it to
+route mode-specific tests:
+
+- `skipIfNotBlueGreen(t)` — skip cleanly on canary envs. Used by
+  `TestBlueGreen_*` tests that fence active/inactive ASG color flips,
+  color-coded TG ARNs, and listener default-action switching.
+- `skipIfNotCanary(t)` — skip cleanly on blue/green envs. Used by
+  `TestCanary_*` tests that fence the canary state machine's
+  post-deploy invariants (state == idle, state-machine ARN exists).
+
+The `requireActive*ASG` helpers are deploy-mode-aware: in blue/green
+they resolve to the active-color ASG via SSM; in canary they resolve
+to the single ASG name. Tests that just want "the ASG currently
+serving traffic" can call these without caring about the mode.
+
+When adding new tests:
+- A bug class in blue/green-only state goes in a `TestBlueGreen_*`
+  test gated by `skipIfNotBlueGreen`.
+- A bug class in canary-only state goes in a `TestCanary_*` test
+  gated by `skipIfNotCanary`.
+- Mode-agnostic invariants (listener health, deployed-commit SSM,
+  AC EIPs are present) skip neither and use `requireActive*ASG`
+  to find the serving ASG.
+
+Greenfield envs must explicitly set exactly one of
+`enable_blue_green` (with matching `enable_ac_blue_green`) or
+`enable_canary_deployment` in tfvars — both default to `false` and
+the precondition on `aws_ssm_parameter.deploy_mode` will reject the
+first plan otherwise. The same precondition asserts AC and server
+blue/green flags agree, so smoke's mode-keyed assertions stay valid.
+
 ### Maintenance rules (enforced at review)
 
 1. **One file per NHP capability.** File name = capability in

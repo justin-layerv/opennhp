@@ -17,6 +17,17 @@ variable "cell_id" {
   description = "Cell identifier for multi-cell deployments (e.g., cell0, cell1). Used for resource naming and tagging."
   type        = string
   default     = "cell0"
+
+  validation {
+    # Lowercase alphanumeric with optional internal dashes,
+    # bounded length. Rejects leading/trailing/double dashes (legal
+    # in some AWS resource names but produces ugly SSM paths like
+    # /sandbox/nhp/-cell0/canary/server/state) and rejects values
+    # long enough to cause Cell-tag bloat or hit AWS resource-name
+    # ceilings before downstream limits would.
+    condition     = can(regex("^[a-z0-9]+(-[a-z0-9]+)*$", var.cell_id)) && length(var.cell_id) <= 32
+    error_message = "cell_id must be lowercase alphanumeric (max 32 chars) with optional internal single dashes (e.g., cell0, cell-01); leading/trailing dashes and double-dashes are rejected."
+  }
 }
 
 # ==================== AWS Configuration ====================

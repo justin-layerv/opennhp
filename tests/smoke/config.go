@@ -15,6 +15,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 )
 
+// Deploy-mode constants. Wire-level values matching what
+// terraform/main.tf::aws_ssm_parameter.deploy_mode writes to
+// /{env}/nhp/deploy/mode. Use these constants in switch statements
+// and skip helpers; bare literals only at the wire-contract
+// validation site in fetchDeployDiscovery.
+const (
+	DeployModeBlueGreen = "blue_green"
+	DeployModeCanary    = "canary"
+)
+
 // TestConfig holds configuration shared across smoke tests. Populated
 // once in TestMain (setup_test.go) and then read — never mutated — by
 // every test.
@@ -25,6 +35,23 @@ import (
 // identifiers from regular .go" compile rule.
 type TestConfig struct {
 	Environment string // "sandbox" or "prod"
+
+	// DeployMode is the deployment model in effect for this
+	// environment: DeployModeBlueGreen or DeployModeCanary. Sourced
+	// from the SSM parameter /{env}/nhp/deploy/mode (Terraform-owned,
+	// see terraform/main.tf::aws_ssm_parameter.deploy_mode). Used by
+	// skipIfNotBlueGreen / skipIfNotCanary to gate mode-specific
+	// tests, and by the require*ASG helpers to pick the right
+	// SSM-backed ASG name (active-color in blue/green vs the single
+	// asg-name in canary).
+	DeployMode string
+
+	// CellID is the active cell identifier for this environment.
+	// Sourced from /{env}/nhp/deploy/cell-id (Terraform-owned, see
+	// terraform/main.tf::aws_ssm_parameter.cell_id). Today every env
+	// is single-cell with cell_id = "cell0"; #1448 tracks multi-cell
+	// discovery.
+	CellID string
 
 	// NHPServerBaseURL is the NHP server's publicly-reachable NLB
 	// endpoint (resolve.qurl.link.layerv.xyz in sandbox,
@@ -140,6 +167,28 @@ func skipIfNoSSMProbes(t *testing.T) {
 	}
 }
 
+// skipIfNotBlueGreen skips the test cleanly when DeployMode is not
+// blue/green. Use at the top of tests that fence blue/green-specific
+// invariants (active/inactive ASGs, color-coded TGs, listener
+// default-action flips). The canary equivalents — when one exists —
+// live in a sibling _canary_ test file and gate on skipIfNotCanary.
+func skipIfNotBlueGreen(t *testing.T) {
+	t.Helper()
+	if testConfig.DeployMode != DeployModeBlueGreen {
+		t.Skipf("skipped: env %q uses %s deploys, not blue/green", testConfig.Environment, testConfig.DeployMode)
+	}
+}
+
+// skipIfNotCanary is the symmetric counterpart to skipIfNotBlueGreen.
+// Use at the top of canary-specific tests (state-machine state, single
+// ASG-only invariants).
+func skipIfNotCanary(t *testing.T) {
+	t.Helper()
+	if testConfig.DeployMode != DeployModeCanary {
+		t.Skipf("skipped: env %q uses %s deploys, not canary", testConfig.Environment, testConfig.DeployMode)
+	}
+}
+
 // requireActiveColor reads /{env}/nhp/server/active-color from SSM
 // and fails the test (not skip) if it is missing or not one of
 // {blue, green}.
@@ -149,8 +198,18 @@ func skipIfNoSSMProbes(t *testing.T) {
 // smoke IAM role can't read it (broken role). Either way, silently
 // skipping the whole Tier 1 suite is the wrong signal — we want
 // CI to turn red.
+//
+// Defensive mode check: callers in canary envs are supposed to gate
+// with skipIfNotBlueGreen first. A forgotten gate would otherwise
+// surface as a confusing "active-color SSM is missing" error in
+// canary mode; the explicit fatal points the operator at the
+// missing gate instead.
 func requireActiveColor(t *testing.T) string {
 	t.Helper()
+	if testConfig.DeployMode != DeployModeBlueGreen {
+		t.Fatalf("requireActiveColor called in deploy mode %q — gate the caller with skipIfNotBlueGreen(t) first",
+			testConfig.DeployMode)
+	}
 	name := "/" + testConfig.Environment + "/nhp/server/active-color"
 	val, ok := getSSMParameter(t, name)
 	if !ok {
@@ -163,7 +222,7 @@ func requireActiveColor(t *testing.T) string {
 }
 
 // inactiveColor returns the color opposite to the active color.
-// Fails loudly if ActiveColor is not {blue, green}.
+// Fails loudly if ActiveColor is not {blue, green}. Blue/green only.
 func inactiveColor(t *testing.T) string {
 	t.Helper()
 	active := requireActiveColor(t)
@@ -178,19 +237,59 @@ func inactiveColor(t *testing.T) string {
 	}
 }
 
-// requireActiveServerASG returns the active-color server ASG name
-// from SSM at /{env}/nhp/server/{active}-asg-name. Fails loudly if
-// missing.
+// requireActiveServerASG returns the ASG name for the currently-serving
+// server ASG. In blue/green mode it resolves to the active-color ASG via
+// /{env}/nhp/server/{active}-asg-name. In canary mode there is only one
+// ASG and it lives at /{env}/nhp/server/asg-name. Fails loudly if the
+// expected SSM key is missing.
 func requireActiveServerASG(t *testing.T) string {
 	t.Helper()
-	return requireColoredASG(t, "server", requireActiveColor(t))
+	return requireServingASG(t, "server")
 }
 
-// requireActiveACASG returns the active-color AC ASG name from SSM
-// at /{env}/nhp/ac/{active}-asg-name. Fails loudly if missing.
+// requireActiveACASG returns the ASG name for the currently-serving
+// AC ASG. Same blue_green-vs-canary resolution as requireActiveServerASG.
 func requireActiveACASG(t *testing.T) string {
 	t.Helper()
-	return requireColoredASG(t, "ac", requireActiveColor(t))
+	return requireServingASG(t, "ac")
+}
+
+// requireServingASG dispatches to the right SSM lookup for the
+// component based on testConfig.DeployMode. It exists so the rest of
+// the suite stays mode-agnostic — every test that wants "the ASG
+// currently taking traffic" calls require*ASG without caring whether
+// the env is blue/green or canary.
+func requireServingASG(t *testing.T, component string) string {
+	t.Helper()
+	switch testConfig.DeployMode {
+	case DeployModeBlueGreen:
+		return requireColoredASG(t, component, requireActiveColor(t))
+	case DeployModeCanary:
+		// /{env}/nhp/{component}/asg-name is created in BOTH modes
+		// (terraform/modules/compute/main.tf::aws_ssm_parameter.asg_name
+		// and modules/ac/main.tf::aws_ssm_parameter.asg_name), but
+		// in blue/green it points at one specific color ASG and
+		// doesn't follow active-color flips — that's why the
+		// blue/green branch above goes through requireColoredASG.
+		//
+		// TODO(#1448): this lookup is env-scoped, but the canary
+		// state tests use cell-scoped keys (/{env}/nhp/{cell_id}/...).
+		// Multi-cell rollout needs both shapes migrated together.
+		name := "/" + testConfig.Environment + "/nhp/" + component + "/asg-name"
+		val, ok := getSSMParameter(t, name)
+		if !ok {
+			t.Fatalf("SSM parameter %s is missing — cannot locate %s ASG in canary env", name, component)
+		}
+		return val
+	default:
+		// Unreachable under normal test invariants — TestMain's
+		// fetchDeployDiscovery validates the same enum and exits
+		// the process before any test runs. This branch only fires
+		// if a test explicitly mutates testConfig.DeployMode mid-run,
+		// which the suite doesn't do.
+		t.Fatalf("unexpected DeployMode %q (want %s or %s)", testConfig.DeployMode, DeployModeBlueGreen, DeployModeCanary)
+		return ""
+	}
 }
 
 // requireColoredASG reads /{env}/nhp/{component}/{color}-asg-name

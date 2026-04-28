@@ -5,6 +5,8 @@ package smoke
 import (
 	"context"
 	"errors"
+	"fmt"
+	"regexp"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +19,21 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 )
+
+// cellIDPattern mirrors the validation block on var.cell_id in
+// terraform/variables.tf — lowercase alphanumeric with optional
+// internal single dashes, leading/trailing/double dashes rejected.
+// TF enforces this at apply time; we re-check here as defense in
+// depth against an out-of-band `aws ssm put-parameter` overwrite,
+// since CellID gets concatenated into SSM paths in the canary tests
+// and a "../foo" value would produce surprising lookups.
+//
+// cellIDMaxLen mirrors `length(var.cell_id) <= 32` in
+// terraform/variables.tf. Drift-prevention cross-link is tracked in
+// #1452 (TF↔smoke duplicated-constant cross-references).
+var cellIDPattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
+const cellIDMaxLen = 32
 
 // aws_helpers.go collects the read-only AWS API calls used across
 // tests. All helpers fail the test on error; they never silently skip
@@ -159,14 +176,86 @@ func describeElasticIPPool(t *testing.T, tagKey, tagValue string) int {
 	return len(resp.Addresses)
 }
 
+// deployDiscovery is the pair of values smoke needs to read at
+// startup before any test runs. Both keys are Terraform-owned (see
+// terraform/main.tf::aws_ssm_parameter.deploy_mode and ::cell_id);
+// shape validation lives in terraform/variables.tf::cell_id.
+type deployDiscovery struct {
+	Mode   string
+	CellID string
+}
+
+// fetchDeployDiscovery reads /{env}/nhp/deploy/{mode,cell-id} in a
+// single GetParameters round-trip. Called from TestMain — failure
+// here (missing param, unknown value, infra error) means smoke is
+// pointed at a non-deployed env or one whose terraform is out of
+// date, and a hard error is the right signal.
+//
+// One batch call instead of two serial GetParameter calls keeps
+// suite startup snappy when the SSM endpoint is slow, and it
+// consolidates the "missing — env not deployed or terraform out of
+// date" error path so the message can't drift between callers.
+func fetchDeployDiscovery(ctx context.Context, client *ssm.Client, env string) (deployDiscovery, error) {
+	modeName := "/" + env + "/nhp/deploy/mode"
+	cellName := "/" + env + "/nhp/deploy/cell-id"
+
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	resp, err := client.GetParameters(cctx, &ssm.GetParametersInput{
+		Names:          []string{modeName, cellName},
+		WithDecryption: aws.Bool(false),
+	})
+	if err != nil {
+		return deployDiscovery{}, fmt.Errorf("ssm get-parameters %v: %w", []string{modeName, cellName}, err)
+	}
+	if len(resp.InvalidParameters) > 0 {
+		return deployDiscovery{}, fmt.Errorf("SSM parameters missing %v — env not deployed or terraform out of date", resp.InvalidParameters)
+	}
+
+	out := deployDiscovery{}
+	for _, p := range resp.Parameters {
+		if p.Name == nil || p.Value == nil {
+			continue
+		}
+		switch *p.Name {
+		case modeName:
+			out.Mode = *p.Value
+		case cellName:
+			out.CellID = *p.Value
+		}
+	}
+	// Distinguish absent-from-response from value-validation failures.
+	// InvalidParameters above catches names AWS rejected; this catches
+	// the residual case where a parameter was returned with a nil
+	// Name/Value (or, defensively, didn't match either expected key)
+	// so operators don't chase a confusing "want blue_green or canary"
+	// when the real issue is an empty response slot.
+	if out.Mode == "" {
+		return deployDiscovery{}, fmt.Errorf("SSM parameter %s absent from response", modeName)
+	}
+	if out.CellID == "" {
+		return deployDiscovery{}, fmt.Errorf("SSM parameter %s absent from response", cellName)
+	}
+	switch out.Mode {
+	case DeployModeBlueGreen, DeployModeCanary:
+	default:
+		return deployDiscovery{}, fmt.Errorf("SSM parameter %s = %q, want %s or %s", modeName, out.Mode, DeployModeBlueGreen, DeployModeCanary)
+	}
+	if len(out.CellID) > cellIDMaxLen || !cellIDPattern.MatchString(out.CellID) {
+		return deployDiscovery{}, fmt.Errorf("SSM parameter %s = %q does not match terraform/variables.tf::cell_id shape (lowercase alphanumeric, optional internal single dashes, 1..%d chars) — out-of-band overwrite?", cellName, out.CellID, cellIDMaxLen)
+	}
+	return out, nil
+}
+
 // getSSMParameter reads a single plain-text SSM parameter. Returns
 // (value, true) on success, ("", false) if the parameter is missing.
 // Any OTHER AWS error (permissions, network) fails the test — those
 // are bugs in the smoke-suite setup, not missing-data conditions.
 //
-// This helper intentionally does NOT decrypt SecureStrings — tests
-// that need to read secrets should fail loudly rather than silently
-// dragging them into test output.
+// Intentionally does NOT decrypt SecureStrings — tests that need to
+// read secrets should fail loudly rather than silently dragging them
+// into test output.
 func getSSMParameter(t *testing.T, name string) (string, bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

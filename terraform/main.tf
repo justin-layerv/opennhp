@@ -495,6 +495,96 @@ module "monitoring" {
   dynamodb_table_names = module.dynamodb.all_table_names
 }
 
+# Deploy-mode marker: lets out-of-band tooling (smoke tests, runbooks)
+# discover whether this environment uses blue/green or canary deploys
+# without re-deriving the toggle. Read by tests/smoke (#1330).
+#
+# Owned entirely by Terraform — never written by CI. No
+# `lifecycle.ignore_changes` so a `terraform apply` always converges
+# the value if the underlying toggles ever flip.
+#
+# The lifecycle.preconditions fence the truth table for the three
+# independent toggles smoke depends on. The SSM value is derived from
+# `enable_canary_deployment` only, but smoke's AC-side assertions
+# (e.g., the EIP pool formula at terraform/modules/ac/eip.tf:33)
+# branch on `enable_ac_blue_green`. Mixed configurations would let
+# the SSM say "canary" while the AC infra is actually blue/green
+# (or vice versa) — those silently mis-fence smoke. We require:
+#
+#   enable_canary_deployment XOR enable_blue_green     (server)
+#   enable_blue_green        ==  enable_ac_blue_green  (server <-> AC symmetry)
+#
+# Together these collapse the eight-cell truth table to two valid
+# states: {blue_green=true, ac_blue_green=true, canary=false} or
+# {blue_green=false, ac_blue_green=false, canary=true}. A future
+# split where AC and server run different regimes would need the
+# SSM key shape revisited — see #1448 for the multi-cell parallel.
+resource "aws_ssm_parameter" "deploy_mode" {
+  name        = "/${var.environment}/nhp/deploy/mode"
+  description = "Deployment model in effect: blue_green or canary"
+  type        = "String"
+  value       = var.enable_canary_deployment ? "canary" : "blue_green"
+
+  # No Cell tag: this key is env-scoped, not cell-scoped. When #1448
+  # ships multi-cell, it'll need a per-cell SSM tree and that tree
+  # carries the Cell tag — not this env-level marker.
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-ssm-deploy-mode"
+    Component = "deploy"
+  })
+
+  lifecycle {
+    precondition {
+      condition     = var.enable_canary_deployment != var.enable_blue_green
+      error_message = "Exactly one of enable_canary_deployment / enable_blue_green must be true; got canary=${var.enable_canary_deployment} blue_green=${var.enable_blue_green}. New envs: pick one in tfvars (see CLAUDE.md \"Deploy-mode tier mapping\")."
+    }
+    # Symmetry fence (not redundancy): smoke's AC-side assertions
+    # (e.g., the EIP pool formula) read the deploy-mode SSM, which
+    # only encodes a single regime. A half-flip would let smoke
+    # mis-fence silently; this precondition rejects it at plan time.
+    precondition {
+      condition     = var.enable_blue_green == var.enable_ac_blue_green
+      error_message = "enable_blue_green (${var.enable_blue_green}) and enable_ac_blue_green (${var.enable_ac_blue_green}) must agree — the deploy-mode SSM only encodes a single regime, and smoke's AC EIP formula reads it. Set them to the same value."
+    }
+    # Canary requires deploy_ac because module.canary_deployment_ac
+    # is gated on `enable_canary_deployment && deploy_ac`. Without
+    # it, the AC canary state SSM keys smoke's TestCanary_StateIdle
+    # depends on don't exist. A future server-only canary env would
+    # need the canary smoke tests + this assertion revisited.
+    precondition {
+      condition     = !var.enable_canary_deployment || var.deploy_ac
+      error_message = "enable_canary_deployment=true requires deploy_ac=true; got deploy_ac=${var.deploy_ac}. Server-only canary envs need the canary smoke tests revisited (see tests/smoke/04_canary_state_test.go)."
+    }
+    # Same dependency on the blue/green side: requireActiveACASG
+    # reads /{env}/nhp/ac/{color}-asg-name, which only exists when
+    # the AC module is deployed. Symmetric with the canary fence
+    # above; both paths fail at plan time rather than test time.
+    precondition {
+      condition     = !var.enable_blue_green || var.deploy_ac
+      error_message = "enable_blue_green=true requires deploy_ac=true; got deploy_ac=${var.deploy_ac}. Server-only blue/green envs need the AC smoke tests revisited (see tests/smoke/05_ac_eip_pool_test.go)."
+    }
+  }
+}
+
+# Cell ID marker: smoke discovers the active cell from this SSM key
+# rather than hardcoding "cell0" (#1448). Today every env defaults to
+# cell0; this still gets a single env-level SSM key (no multi-cell
+# fan-out) — when multi-cell ships, this needs to become a list or a
+# per-cell SSM tree. Shape validation lives upstream in
+# terraform/variables.tf::cell_id.
+resource "aws_ssm_parameter" "cell_id" {
+  name        = "/${var.environment}/nhp/deploy/cell-id"
+  description = "Active cell ID (today: single-cell, see #1448 for multi-cell)"
+  type        = "String"
+  value       = var.cell_id
+
+  # No Cell tag: env-scoped marker, see deploy_mode rationale above.
+  tags = merge(local.common_tags, {
+    Name      = "${local.name_prefix}-ssm-cell-id"
+    Component = "deploy"
+  })
+}
+
 # Canary Deployment Module - Step Functions-orchestrated progressive rollout
 module "canary_deployment" {
   source = "./modules/canary-deployment"

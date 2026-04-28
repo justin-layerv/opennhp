@@ -170,13 +170,13 @@ jobs:
           set -euo pipefail
           case "$TIER" in
             tier1)
-              RUN_FILTER='^Test(Health|DockerImage|SSMRunbook|BlueGreen|ACEIPPool|SSMProbe)_'
+              RUN_FILTER='^Test(Health|DockerImage|SSMRunbook|BlueGreen|Canary|ACEIPPool|SSMProbe)_'
               ;;
             tier1+tier2)
-              RUN_FILTER='^Test(Health|DockerImage|SSMRunbook|BlueGreen|ACEIPPool|SSMProbe|Resolve|Knock|Forward|Plugins|InternalAPI)_'
+              RUN_FILTER='^Test(Health|DockerImage|SSMRunbook|BlueGreen|Canary|ACEIPPool|SSMProbe|Resolve|Knock|Forward|Plugins|InternalAPI)_'
               ;;
             tier3-no-ssm)
-              RUN_FILTER='^Test(Health|BlueGreen|ACEIPPool|Resolve|Knock|Plugins|Protocol|ServerLogs|Timing)_'
+              RUN_FILTER='^Test(Health|BlueGreen|Canary|ACEIPPool|Resolve|Knock|Plugins|Protocol|ServerLogs|Timing)_'
               ;;
             all)
               RUN_FILTER=''
