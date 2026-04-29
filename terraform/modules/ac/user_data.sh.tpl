@@ -1046,6 +1046,7 @@ cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
 # Traefik Dynamic Configuration
 #
 # Router priority hierarchy (higher number = matched first):
+#   20 - frp-control        /.well-known/layerv-frp → FRP WebSocket (when deploy_frps)
 #   15 - qurl-site          *.qurl.site subdomain routing
 #   10 - nhp-plugins        /plugins/* to NHP Server
 #   10 - prod-*/addtls-*    production domain routes (when ACME enabled)
@@ -1165,6 +1166,9 @@ cat >> /home/ubuntu/traefik/dynamic.toml << QURLDYNAMICEOF
   circuitBreakerThreshold = 5
   circuitBreakerTimeout = 30
   evictionPercent = 10
+%{ if frp_server_host != "" ~}
+  frpServerUrl = "http://${frp_server_host}:${frp_vhost_http_port}"
+%{ endif ~}
 
 [http.routers.qurl-site]
   rule = "HostRegexp(\`^.+\\\\.${qurl_router_base_domain}\$\`)"
@@ -1214,6 +1218,58 @@ cat >> /home/ubuntu/traefik/dynamic.toml << 'CUSTOMDOMAINEOF'
   [http.routers.custom-domain-catchall.tls]
 CUSTOMDOMAINEOF
 echo "Custom domain routing enabled (catch-all router + TLS certs via custom-domains.toml)"
+%{ endif ~}
+
+%{ if frp_server_host != "" && qurl_router_enabled ~}
+# FRP tunnel server routes - WebSocket control channel and vhost HTTP
+#
+# Guard: both `frp_server_host` AND `qurl_router_enabled`. The FRP control
+# channel without the qurl-router plugin would be half-wired — clients can
+# connect and register tunnels, but vhost HTTP (customer subdomain routing
+# through the plugin to frps:8080) would be missing. Without both, don't
+# advertise the control endpoint.
+cat >> /home/ubuntu/traefik/dynamic.toml << FRPDYNAMICEOF
+
+# FRP WebSocket control channel
+#
+# Externally we expose /.well-known/layerv-frp (RFC 8615 reserved namespace —
+# customer apps are not expected to register under /.well-known/, so a
+# catch-all on / can't hijack FRP control traffic). Internally FRP's
+# WebSocket upgrade handler is hardcoded to /~!frp (github.com/fatedier/frp),
+# so we apply a `replacePath` middleware to rewrite before forwarding.
+# Clients talk to /.well-known/layerv-frp; frps sees /~!frp. If the internal
+# path changes in a future FRP version, update BOTH:
+#   - http.middlewares.frp-path-rewrite.replacePath.path
+#   - The qurl-frpc client config template
+#
+# Note: Traefik 3.x forwards `Upgrade` and `Connection` headers for WebSocket
+# handshakes by default. If anyone ever adds a `headers` middleware to this
+# router chain, both headers must be preserved or the FRP control channel
+# breaks.
+[http.middlewares.frp-path-rewrite.replacePath]
+  path = "/~!frp"
+
+[http.routers.frp-control]
+  rule = "Path(\`/.well-known/layerv-frp\`)"
+  service = "frp-control"
+  middlewares = ["frp-path-rewrite"]
+  entryPoints = ["https"]
+  priority = 20
+%{ if centralized_cert_enabled ~}
+  [http.routers.frp-control.tls]
+%{ else ~}
+  [http.routers.frp-control.tls]
+    certResolver = "letsencrypt"
+    [[http.routers.frp-control.tls.domains]]
+      main = "${domain_name}"
+      sans = ["*.${domain_name}"]
+%{ endif ~}
+
+[http.services.frp-control.loadBalancer]
+  [[http.services.frp-control.loadBalancer.servers]]
+    url = "http://${frp_server_host}:${frp_control_port}"
+FRPDYNAMICEOF
+echo "FRP tunnel server routes added (ingress /.well-known/layerv-frp -> rewrite /~!frp -> ${frp_server_host}:${frp_control_port})"
 %{ endif ~}
 
 %{ if !centralized_cert_enabled ~}

@@ -817,6 +817,10 @@ locals {
     # Egress EIP configuration
     enable_egress_eips = var.enable_egress_eips
     eip_pool_tag       = local.eip_pool_tag
+    # FRP tunnel server integration
+    frp_server_host     = var.frp_server_host
+    frp_control_port    = var.frp_control_port
+    frp_vhost_http_port = var.frp_vhost_http_port
   })
 }
 

@@ -1690,6 +1690,38 @@ variable "deploy_e2e_echo_server" {
   default     = false
 }
 
+# ==================== QURL FRP Server ====================
+
+variable "deploy_frps" {
+  description = "Deploy the QURL FRP tunnel server for proxying traffic to customer backends. Requires `deploy_ac = true`, `deploy_qurl_service = true`, `qurl_internal_service_token_arn` set, and `qurl_service_domain` set — all four are enforced by `terraform_data.frps_preconditions` at plan time so that FRPS never boots with tunnel auth disabled."
+  type        = bool
+  default     = false
+}
+
+variable "frps_instance_type" {
+  description = "EC2 instance type for FRP server"
+  type        = string
+  default     = "t3.small"
+}
+
+variable "frps_image_tag" {
+  description = "qurl-frps binary version tag. Separate from NHP image_tag since frps has its own release cadence. Defaults to a placeholder tag that CI must overwrite on first deploy — a Terraform-only operator can't accidentally install a moving `latest` that slipped between applies."
+  type        = string
+  default     = "v0.0.0-bootstrap"
+}
+
+variable "frps_bind_port" {
+  description = "FRP server control port. Shared between qurl-frps module (bind port) and AC module (Traefik route target) so they can't drift."
+  type        = number
+  default     = 7000
+}
+
+variable "frps_vhost_http_port" {
+  description = "FRP vhost HTTP port. Shared between qurl-frps module (bind port) and AC module (qurl-router plugin target) so they can't drift."
+  type        = number
+  default     = 8080
+}
+
 # ==================== QURL Integrations DNS ====================
 # Cross-account A records for qurl-integrations-infra prod EC2
 # instances. Rationale + source-of-truth note in main.tf under
@@ -1745,7 +1777,6 @@ variable "qurl_fileviewer_eip" {
     error_message = "qurl_fileviewer_eip must be a valid IPv4 address or null."
   }
 }
-
 # ==================== Common Tags ====================
 
 variable "tags" {

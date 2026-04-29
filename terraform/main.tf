@@ -909,6 +909,11 @@ module "ac" {
 
   # Secret reconciliation (cleanup orphaned per-instance secrets)
   enable_secret_reconciliation = var.enable_secret_reconciliation
+
+  # FRP tunnel server integration (conditional: only when FRP is deployed alongside AC)
+  frp_server_host     = var.deploy_frps ? "frps.${module.data.namespace_name}" : ""
+  frp_control_port    = var.frps_bind_port
+  frp_vhost_http_port = var.frps_vhost_http_port
 }
 
 # Data source for hosted zone
@@ -976,6 +981,126 @@ resource "aws_route53_record" "qurl_site_wildcard" {
     zone_id                = module.ac[0].nlb_zone_id
     evaluate_target_health = true
   }
+}
+
+# ==================== QURL FRP Server ====================
+# FRP tunnel server for proxying traffic to customer backends via qurl-reverse-proxy.
+# Runs in private subnets, reachable only from AC security group.
+
+# Validate that everything the FRP auth plugin needs is wired before the
+# module is instantiated. Without these, `qurl-frps` would boot with the
+# built-in tunnel-auth plugin disabled and any client could register
+# arbitrary proxies — an open relay on a publicly-reachable path.
+resource "terraform_data" "frps_preconditions" {
+  count = var.deploy_frps ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = var.deploy_ac
+      error_message = "deploy_frps requires deploy_ac = true (the AC Traefik is the only way into the FRP control channel)."
+    }
+    precondition {
+      condition     = var.deploy_qurl_service
+      error_message = "deploy_frps requires deploy_qurl_service = true — the FRP auth plugin validates tunnel tokens against the QURL API."
+    }
+    precondition {
+      # Treat both `null` and the empty string as "not set" — the downstream
+      # module pass-through folds them together into "", and an empty ARN
+      # would silently skip the Secrets Manager IAM policy + token-fetch
+      # branch, undoing the whole point of this precondition.
+      condition     = var.qurl_internal_service_token_arn != null && var.qurl_internal_service_token_arn != ""
+      error_message = "deploy_frps requires qurl_internal_service_token_arn to be set to a non-empty value — without it, the FRP auth plugin has no token to present and tunnel auth is effectively disabled."
+    }
+    precondition {
+      # Same null-vs-empty concern as the token above.
+      condition     = var.qurl_service_domain != null && var.qurl_service_domain != ""
+      error_message = "deploy_frps requires qurl_service_domain to be set to a non-empty value — the FRP auth plugin needs a URL to validate tunnel tokens against."
+    }
+    precondition {
+      # Reject the bootstrap placeholder at plan time when `deploy_frps` is
+      # on. The placeholder exists so a Terraform-only operator can't
+      # accidentally install a moving `latest`; once CI has overwritten the
+      # SSM image-tag parameter, `lifecycle { ignore_changes = [value] }` on
+      # that parameter means this variable only drives the *initial* apply.
+      # If CI fails between the terraform apply and the tag overwrite, the
+      # ASG would roll an instance that tries to `docker pull
+      # layerv/qurl-frps:v0.0.0-bootstrap` and crash-loop — catch it louder
+      # at plan time instead. The regex rejects near-misses too
+      # (`v0.0.0-bootstrap-foo`, `v0.0.0-bootstrap2`, etc.) so a typo'd
+      # tfvars value can't slip past an exact-match check.
+      condition     = !can(regex("^v0\\.0\\.0-bootstrap", var.frps_image_tag))
+      error_message = "deploy_frps requires frps_image_tag to be overridden from the bootstrap placeholder. Set it to the real tag CI is publishing."
+    }
+  }
+}
+
+module "qurl_frps" {
+  source = "./modules/qurl-frps"
+  # `deploy_ac` is already enforced by `terraform_data.frps_preconditions`
+  # above, so the module count only needs to key off `deploy_frps`.
+  count = var.deploy_frps ? 1 : 0
+
+  depends_on = [terraform_data.frps_preconditions]
+
+  environment        = var.environment
+  name_prefix        = local.name_prefix
+  vpc_id             = module.networking.vpc_id
+  private_subnet_ids = module.networking.private_subnet_ids
+  namespace_id       = module.data.namespace_id
+  namespace_name     = module.data.namespace_name
+  tags               = merge(local.common_tags, { Service = "qurl-frps" })
+
+  # Security: only AC instances can reach the FRP server
+  ac_security_group_id = module.ac[0].security_group_id
+
+  # QURL API for FRP auth plugin (built-in tunnel auth in nhp-frps binary).
+  # Note: despite the `internal` in the variable name, this is the PUBLIC edge
+  # URL (`https://api.layerv.xyz` or equivalent) — FRP server instances live
+  # in private subnets and reach the QURL API via NAT → CloudFront → Fargate.
+  # "Internal" refers to the *use-case* (service-to-service auth validation),
+  # not the network path. If a true VPC-internal URL ever becomes available
+  # (VPC endpoint or internal ALB), prefer it over the public edge and update
+  # both this wiring and the FRP-side variable description together.
+  # Match the `frps_preconditions` null-vs-empty semantics above so these
+  # stay consistent: when `deploy_frps = false` the precondition's count=0
+  # disables it and these ternaries become the only guard.
+  qurl_api_internal_url     = var.deploy_qurl_service && var.qurl_service_domain != null && var.qurl_service_domain != "" ? "https://${var.qurl_service_domain}" : ""
+  qurl_api_token_secret_arn = var.deploy_qurl_service && var.qurl_internal_service_token_arn != null && var.qurl_internal_service_token_arn != "" ? var.qurl_internal_service_token_arn : ""
+
+  # Instance configuration
+  instance_type = var.frps_instance_type
+
+  # Port configuration (shared with AC module via root variables)
+  frps_bind_port       = var.frps_bind_port
+  frps_vhost_http_port = var.frps_vhost_http_port
+  # FRP's `subDomainHost` must match qurl-router's customer-vhost domain
+  # for tunnel registrations to resolve to the right `<customer>.<base>`
+  # FQDN. qurl_router_config.base_domain is wired from var.qurl_site_domain
+  # (terraform/main.tf's qurl_router_config local above), so thread from
+  # the same source of truth here — avoids the sandbox/prod drift that
+  # would happen with a hardcoded default (sandbox runs on
+  # qurl.site.layerv.xyz, prod on qurl.site).
+  frps_subdomain_host = var.qurl_site_domain
+
+  # KMS encryption keys
+  logs_kms_key_arn = module.kms.logs_key_arn
+  ebs_kms_key_arn  = module.kms.ebs_key_arn
+
+  # Deployment configuration (frps has its own release cadence, separate from NHP server/AC)
+  image_tag = var.frps_image_tag
+
+  # Plugin bucket for the S3 fallback binary download path in user_data.
+  # Consistent with how the AC module is wired (see `plugin_bucket_arn` on
+  # the ac module above); same bucket scoped to the qurl-frps subtree.
+  # Both arn and name are threaded: arn scopes the IAM grant, name is
+  # baked into user_data's `aws s3 cp` command via templatefile — keeping
+  # them in lockstep from a single source of truth.
+  plugin_bucket_arn  = module.plugins.bucket_arn
+  plugin_bucket_name = module.plugins.bucket_name
+
+  # Monitoring
+  enable_cloudwatch_alarms = true
+  alarm_sns_topic_arn      = module.monitoring.sns_topic_arn
 }
 
 # ==================== QURL Service ====================
