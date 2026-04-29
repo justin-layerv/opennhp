@@ -128,6 +128,7 @@ jobs:
               - 'endpoints/**'
             lambdas:
               - 'terraform/modules/**/lambda/**'
+              - 'terraform/lambda/**'
             packer:
               - 'packer/**'
 
@@ -659,6 +660,12 @@ jobs:
           echo '::endgroup::'
           echo '::group::Security Lambda Tests'
           (cd terraform/modules/security/lambda && python -m pytest test_stale_finding_watchdog.py -v)
+          echo '::endgroup::'
+          echo '::group::ECR Replication Check Lambda Tests'
+          # Suite is serial-only — module re-imports per test for
+          # region-resolution coverage. See `lambda_module` fixture
+          # in test_ecr_replication_check.py for the xdist caveat.
+          (cd terraform/lambda && python -m pytest test_ecr_replication_check.py -v)
           echo '::endgroup::'
           echo '::group::Auth0 Rotation Lambda Tests (Node)'
           node --test terraform/modules/auth0/lambda/rotate_secret.test.js

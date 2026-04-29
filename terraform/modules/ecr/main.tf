@@ -217,23 +217,73 @@ locals {
   # NOTE: nhp-console is retained because prevent_destroy blocks removal.
   # To clean up: terraform state rm 'module.nhp.module.ecr.aws_ecr_repository.main["nhp-console"]'
   # and the corresponding lifecycle_policy and cross_account resources, then remove from this list.
+  #
+  # TAG-ROTATION CAVEAT: the replication-failure probe in
+  # `terraform/ecr_replication_check.tf` filters `describe_images` to
+  # `tagStatus == "TAGGED"`. Today every push carries an immutable
+  # git-SHA tag alongside any rotating `latest` / `environment` tags,
+  # so each digest stays TAGGED-visible for the lifecycle window
+  # via its SHA backbone. If a future workflow ever introduces a
+  # push that tags a digest ONLY with a mutable tag (no SHA backbone),
+  # the probe goes blind on rotated-away digests within the look-back
+  # window — see "Bonus failure mode: tag rotation" in
+  # docs/runbooks/ecr-replication-failure.md. **#1489 tracks a CI lint
+  # to enforce the SHA-backbone convention** so this prose guard
+  # doesn't rot.
   core_ecr_repos = ["nhp-server", "nhp-ac", "nhp-console"]
   ecr_repos      = var.deploy_qurl_ecr ? concat(local.core_ecr_repos, ["nhp-qurl"]) : local.core_ecr_repos
+
+  # Single source of truth for "this account is the source of cross-
+  # account ECR replication." Referenced by both
+  # `aws_ecr_replication_configuration.cross_account.count` and the
+  # `is_replication_source` output, so the two stay in mechanical
+  # lockstep — a future change (e.g., adding a `var.replication_paused`
+  # flag to the gate) only has to update this local. Replaces the
+  # earlier output-precondition assertion approach.
+  is_replication_source = var.is_primary_account && var.enable_replication && length(var.secondary_account_ids) > 0
+
+  # Hoisted so consumers (the replication-check Lambda's `lifecycle.
+  # precondition`) can enforce the lookback↔expiry cushion at plan
+  # time instead of relying on prose. Bumping this value here AND
+  # bumping `var.ecr_replication_check_lookback_hours` past it in the
+  # same plan would otherwise silently re-open the silent-failure
+  # window the lockstep comment fences.
+  ecr_untagged_expiry_days = 7
 
   # ECR lifecycle policy (shared across repos)
   # Two rules: retain tagged images (git SHAs) for 90 days so prod ASGs can
   # still pull them even when sandbox has moved on, and expire untagged
-  # (intermediate) images after 7 days to save storage.
+  # (intermediate) images after `ecr_untagged_expiry_days` to save storage.
+  #
+  # DRIFT-CHECK: untagged-image expiry MUST stay larger than the ECR
+  # replication-check Lambda's `LOOKBACK_HOURS` (default 25h, see
+  # `terraform/variables.tf::var.ecr_replication_check_lookback_hours`).
+  # If lifecycle ever runs faster than the look-back, an image could be
+  # deleted before the probe inspects it — silently dropping it from the
+  # failure-count metric. The Lambda's precondition (in
+  # `terraform/ecr_replication_check.tf`) enforces the cushion at plan
+  # time using `local.ecr_untagged_expiry_days * 24` from the output
+  # below; #1476 tracks broadening this to a fleet-wide CI check.
+  #
+  # COST-CHECK: tagged-image expiry (90d) drives the `describe_images`
+  # page-walk size on every probe tick — see the steady-state cost
+  # numerics block in `terraform/lambda/ecr_replication_check.py`. The
+  # docstring's "few-thousand calls/day" estimate assumes today's
+  # tagged retention; bumping this to (e.g.) 180d would 2× the
+  # per-tick API count even with `LOOKBACK_HOURS` unchanged, since
+  # the look-back is applied client-side after pagination. Still
+  # under ECR throttle today; revisit alongside #1474 if tagged
+  # retention grows or `layerv/` broadens past ~10 repos.
   ecr_lifecycle_policy = jsonencode({
     rules = [
       {
         rulePriority = 1
-        description  = "Expire untagged images after 7 days"
+        description  = "Expire untagged images after ${local.ecr_untagged_expiry_days} days"
         selection = {
           tagStatus   = "untagged"
           countType   = "sinceImagePushed"
           countUnit   = "days"
-          countNumber = 7
+          countNumber = local.ecr_untagged_expiry_days
         }
         action = {
           type = "expire"
@@ -393,9 +443,11 @@ resource "aws_ecr_repository_policy" "cross_account" {
 # nothing is in flight, then on the secondary.
 # ============================================================================
 
-# Primary account: replicate images to each secondary account
+# Primary account: replicate images to each secondary account.
+# Gate is in `local.is_replication_source` so the `is_replication_source`
+# output stays mechanically aligned with whether this resource fires.
 resource "aws_ecr_replication_configuration" "cross_account" {
-  count = var.is_primary_account && var.enable_replication && length(var.secondary_account_ids) > 0 ? 1 : 0
+  count = local.is_replication_source ? 1 : 0
 
   replication_configuration {
     rule {
@@ -2114,4 +2166,56 @@ output "qurl_repo_url" {
 output "qurl_repo_arn" {
   description = "QURL Service ECR repository ARN"
   value       = var.deploy_qurl_ecr && var.is_primary_account ? aws_ecr_repository.main["nhp-qurl"].arn : var.deploy_qurl_ecr ? "arn:aws:ecr:${local.region}:${local.secondary_ecr_account_id}:repository/layerv/nhp-qurl" : null
+}
+
+output "repository_names" {
+  description = "Fully qualified ECR repo names with `layerv/` prefix; empty on secondary accounts."
+  # Computed from `local.ecr_repos` rather than `aws_ecr_repository.main[r].name`
+  # so the value is plan-time-known. Consumers using this in `for_each`
+  # (e.g. the per-repo replication-failure alarms in
+  # `terraform/ecr_replication_check.tf`) need the keys at plan time, and
+  # a resource attribute would be `(known after apply)` on a greenfield
+  # bootstrap. The literal pattern matches the resource name format at
+  # `aws_ecr_repository.main` (line ~295: `name = "layerv/${each.key}"`);
+  # the precondition below locks them in lockstep so a future format
+  # change can't silently desync the two sites.
+  precondition {
+    condition = !var.is_primary_account || alltrue([
+      for r in local.ecr_repos :
+      aws_ecr_repository.main[r].name == "layerv/${r}"
+    ])
+    error_message = "ECR repository name format has diverged from `layerv/<repo>` — the literal pattern in this output's value is now stale. Update both `aws_ecr_repository.main.name` and this output's `value` together."
+  }
+  # Uniqueness fence on `local.ecr_repos`. The static list is trivially
+  # injective today, but a future change that derives the list from a
+  # variable concat (e.g. `concat(core, var.extra_repos)`) could
+  # introduce a duplicate that would silently collapse `for_each` keys
+  # downstream — including the per-repo failure-count alarms in
+  # `terraform/ecr_replication_check.tf`. Catches the collision at
+  # plan time rather than at apply.
+  precondition {
+    condition     = length(distinct(local.ecr_repos)) == length(local.ecr_repos)
+    error_message = "ECR repo names in `local.ecr_repos` collide: ${jsonencode(local.ecr_repos)}. A duplicate would silently collapse `for_each` keys on every consumer. De-dup the list (or its source variables) before re-applying."
+  }
+  value = var.is_primary_account ? [for r in local.ecr_repos : "layerv/${r}"] : []
+}
+
+output "repository_arns" {
+  description = "ECR repo ARNs in 1:1 order with `repository_names`; empty on secondary accounts."
+  value       = var.is_primary_account ? [for r in local.ecr_repos : aws_ecr_repository.main[r].arn] : []
+}
+
+output "is_replication_source" {
+  description = "True iff this account is the primary AND replication is configured outbound."
+  # Shared with `aws_ecr_replication_configuration.cross_account.count`
+  # via `local.is_replication_source`, so the output and the resource
+  # gate are mechanically in lockstep — a future broadening of the
+  # gate (e.g., adding `var.replication_paused`) only has to update
+  # the local declaration above.
+  value = local.is_replication_source
+}
+
+output "untagged_expiry_hours" {
+  description = "Untagged-image lifecycle expiry in hours; consumed by the replication-check Lambda's lookback fence."
+  value       = local.ecr_untagged_expiry_days * 24
 }

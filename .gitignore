@@ -87,6 +87,7 @@ terraform/**/*.zip
 # Lambda build artifacts (keep structure, ignore contents)
 terraform/**/build/package/*
 !terraform/**/build/package/.gitkeep
+terraform/**/.build/
 
 # ============================================================================
 # IDE / Editors

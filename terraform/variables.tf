@@ -1795,6 +1795,52 @@ variable "qurl_fileviewer_eip" {
     error_message = "qurl_fileviewer_eip must be a valid IPv4 address or null."
   }
 }
+
+# `ecr_replication_check_lookback_hours` — see comment block above
+# `variable` declaration for tuning guidance / cost & timeout coupling
+# notes. Kept inline so the durable rationale lives next to the variable
+# but the `description` field stays one line for terraform-docs / LSP
+# hover / console UI render quality.
+#
+# **Tuning summary**
+# - Default 25 sized for daily deploys with a 1h cushion. Raise if
+#   deploy cadence drops below daily — see runbook "Adjusting the
+#   look-back window".
+# - This is the durable control surface; the Lambda's `LOOKBACK_HOURS`
+#   env entry is set from this value, so a console edit reverts on the
+#   next apply.
+# - **Cost scaling:** the dominant per-tick cost is `describe_images`
+#   paginating across the *tagged-retention* window (90d), NOT
+#   `LOOKBACK_HOURS`. The look-back is a client-side filter applied
+#   AFTER pagination, since ECR has no server-side `imagePushedAt`
+#   filter. A future bump of tagged-retention (e.g. to 180d) silently
+#   2× the per-tick API count without touching this variable; see
+#   `terraform/modules/ecr/main.tf::COST-CHECK` for the upstream
+#   knob.
+# - **Timeout coupling:** at >200h the per-tick API count under
+#   sustained throttling can blow the 120s Lambda timeout. Bumping
+#   look-back past ~200h should pair with bumping the Lambda's
+#   `timeout` past 120s AND the not-invoking alarm's
+#   `evaluation_periods` past 3 so long-running ticks don't page.
+variable "ecr_replication_check_lookback_hours" {
+  description = "Hours of recent pushes the ECR replication-failure probe inspects per invocation. See comment above for tuning + cost coupling."
+  type        = number
+  default     = 25
+
+  # Lockstep with the Lambda's runtime range fence at
+  # `terraform/lambda/ecr_replication_check.py::LOOKBACK_HOURS_{MIN,MAX}`.
+  # TF's `validation` block can't reference cross-module values, so the
+  # range bounds are duplicated by necessity; both sites must move
+  # together, and the Lambda-side test
+  # `test_out_of_range_lookback_hours_raises_runtime_error` asserts
+  # against the Python constants so a TF-only bump that forgets to
+  # update Python surfaces in CI.
+  validation {
+    condition     = var.ecr_replication_check_lookback_hours >= 1 && var.ecr_replication_check_lookback_hours <= 720
+    error_message = "ecr_replication_check_lookback_hours must be between 1 and 720. Effective runtime cap is `< module.ecr.untagged_expiry_hours` (currently 168h), enforced by a precondition on the Lambda. Lockstep with `terraform/lambda/ecr_replication_check.py::LOOKBACK_HOURS_{MIN,MAX}` — bumping this range needs a coordinated change there. See docs/runbooks/ecr-replication-failure.md."
+  }
+}
+
 # ==================== Common Tags ====================
 
 variable "tags" {
