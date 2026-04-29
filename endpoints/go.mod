@@ -5,7 +5,7 @@ go 1.26.2
 require (
 	github.com/OpenNHP/opennhp/nhp v0.6.0
 	github.com/aws/aws-sdk-go-v2 v1.41.6
-	github.com/aws/aws-sdk-go-v2/config v1.32.14
+	github.com/aws/aws-sdk-go-v2/config v1.32.16
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue v1.20.37
 	github.com/aws/aws-sdk-go-v2/service/cloudwatch v1.56.2
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.57.1
@@ -40,19 +40,19 @@ require (
 require (
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
-	github.com/aws/aws-sdk-go-v2/credentials v1.19.14 // indirect
-	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.21 // indirect
+	github.com/aws/aws-sdk-go-v2/credentials v1.19.15 // indirect
+	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.22 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.22 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.22 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/ini v1.8.6 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.23 // indirect
 	github.com/aws/aws-sdk-go-v2/service/dynamodbstreams v1.32.14 // indirect
-	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.7 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.8 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/endpoint-discovery v1.11.21 // indirect
-	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.21 // indirect
-	github.com/aws/aws-sdk-go-v2/service/signin v1.0.9 // indirect
-	github.com/aws/aws-sdk-go-v2/service/sso v1.30.15 // indirect
-	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.19 // indirect
-	github.com/aws/aws-sdk-go-v2/service/sts v1.41.10 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.22 // indirect
+	github.com/aws/aws-sdk-go-v2/service/signin v1.0.10 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sso v1.30.16 // indirect
+	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.20 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sts v1.42.0 // indirect
 	github.com/aws/smithy-go v1.25.0 // indirect
 	github.com/blang/semver v3.5.1+incompatible // indirect
 	github.com/bytedance/gopkg v0.1.4 // indirect
