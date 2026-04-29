@@ -192,11 +192,30 @@ plugins:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building plugins... $(END_COLOUR)"
 	@if test -d $(NHP_SERVER_PLUGINS); then $(MAKE) -C $(NHP_SERVER_PLUGINS); fi
 
-lint:
+lint: lint-redirect-url-drift
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running linters...$(END_COLOUR)"
 	cd nhp && golangci-lint run ./...
 	cd endpoints && golangci-lint run ./...
 	@echo "$(COLOUR_GREEN)[OpenNHP] Lint passed!$(END_COLOUR)"
+
+# Fence drift between the `redirectURLField` constant in the plugin
+# handler and the smoke test that verifies the wire contract (#1325).
+# Wired into `make lint` so a one-sided rename trips locally before CI.
+# CI runs the same script + fixtures in `redirect-url-drift-lint` in
+# build-and-push.yml. The fixture suite runs first so a script regression
+# (e.g., a regex tightening that drops a covered case) surfaces before
+# the production paths are checked.
+.PHONY: lint-redirect-url-drift
+lint-redirect-url-drift:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Checking redirect_url drift (#1325)...$(END_COLOUR)"
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck scripts/check-redirect-url-drift.sh tests/lints/redirect-url-drift/run-fixtures.sh; \
+	else \
+		echo "$(COLOUR_BLUE)[OpenNHP] shellcheck not installed; skipping script check$(END_COLOUR)"; \
+	fi
+	@./tests/lints/redirect-url-drift/run-fixtures.sh
+	@./scripts/check-redirect-url-drift.sh
+	@echo "$(COLOUR_GREEN)[OpenNHP] redirect_url drift check passed!$(END_COLOUR)"
 
 # Run the same checks CI runs for .github/workflows/**,
 # .github/ISSUE_TEMPLATE/**, and CLAUDE.md's Scopes table.
