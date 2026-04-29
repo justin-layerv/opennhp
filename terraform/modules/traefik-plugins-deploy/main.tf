@@ -414,6 +414,17 @@ resource "aws_iam_role_policy" "deploy" {
             "ec2:DescribeTags"
           ]
           Resource = "*"
+        },
+        {
+          # Lets the deploy workflow filter discovered AC instances by ASG
+          # LifecycleState (InService) so we don't SSM-deploy onto instances
+          # mid-refresh whose user-data hasn't installed the AWS CLI yet.
+          Sid    = "AutoScalingDescribeInstances"
+          Effect = "Allow"
+          Action = [
+            "autoscaling:DescribeAutoScalingInstances"
+          ]
+          Resource = "*"
         }
     ])
   })
