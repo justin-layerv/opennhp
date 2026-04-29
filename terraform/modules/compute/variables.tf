@@ -496,6 +496,106 @@ variable "knock_headertype_verify_require" {
 }
 
 # =============================================================================
+# Knock-port DoS hardening (#1159)
+# =============================================================================
+
+variable "knock_global_rate_limit_pps" {
+  description = <<-EOT
+    Per-instance packets-per-second cap on UDP knock traffic, layered
+    on top of the existing per-source-IP hashlimit (#1159). The per-IP
+    limit handles a single noisy client; the global cap handles a
+    distributed flood (e.g., 100k-source botnet under per-IP budget
+    aggregating to >>ECDH throughput). Drops above this rate happen
+    in the kernel before any cryptographic work — that's the point.
+
+    Scope reminder: this is PER INSTANCE. An ASG of N instances has
+    aggregate cap N × this value; the NLB hash-distributes flood
+    traffic across them, so a 5000 pps cap × 4 instances = 20k pps
+    aggregate. Size against per-instance ECDH ops/sec (measured on
+    the deployed instance type), not against fleet headroom.
+
+    Pick a value at 50–75% of measured ECDH ops/sec. 5000 pps is the
+    conservative default from #1159 ("server's ECDH cost is ~200-400k
+    ops/sec on 4 cores"); a follow-up issue (#1495) tracks adding a
+    repeatable benchmark + a CloudWatch alarm at 90% so this default
+    can be tuned from data instead of estimation.
+
+    Set to 0 to disable the global cap — useful only for environments
+    where iptables is provisioned externally (the per-IP rule still
+    applies). Disabling here is a hardening regression; document the
+    reason in the consuming env's tfvars.
+  EOT
+  type        = number
+  default     = 5000
+
+  validation {
+    condition     = var.knock_global_rate_limit_pps >= 0
+    error_message = "knock_global_rate_limit_pps must be non-negative (0 disables, positive is the cap)."
+  }
+}
+
+variable "knock_global_rate_limit_burst" {
+  description = <<-EOT
+    Burst allowance for the global knock-rate cap (#1159). Default
+    is 2× the sustained rate (10000 burst, 5000 pps). The per-IP rule
+    intentionally runs the inverse ratio (50 burst, 100 pps = 0.5×):
+    a single source spiking above 100 pps is almost always abuse, so
+    its burst is tight. The aggregate, by contrast, sums many
+    legitimate clients whose simultaneous handshake retries can
+    spike well above the steady-state mean — a 2× burst absorbs
+    those legitimate spikes without dropping.
+
+    Pathological if 0 with knock_global_rate_limit_pps > 0 (every
+    packet at the limit drops, no headroom for legitimate
+    microbursts), so the validation below requires a positive burst
+    when the cap is active.
+
+    Incident-response breadcrumb: at the defaults, an attacker can
+    push up to burst/pps = 2 seconds of above-rate traffic before
+    drops engage. An operator running `iptables -L INPUT -n -v`
+    during an active flood may see counters above the configured
+    rate during that window — the cap is working, the burst is
+    just absorbing the leading edge. After ~2s the steady-state
+    drop count climbs and the rate stabilizes at the cap.
+  EOT
+  type        = number
+  default     = 10000
+
+  validation {
+    condition     = var.knock_global_rate_limit_burst >= 0
+    error_message = "knock_global_rate_limit_burst must be non-negative."
+  }
+
+  validation {
+    condition     = var.knock_global_rate_limit_pps == 0 || var.knock_global_rate_limit_burst > 0
+    error_message = "knock_global_rate_limit_burst must be > 0 when knock_global_rate_limit_pps > 0 (a 0-burst hashlimit drops every packet at the steady-state limit; pathological)."
+  }
+}
+
+variable "udp_recv_buffer_bytes" {
+  description = <<-EOT
+    Target SO_RCVBUF for the NHP knock listen socket (#1159). The
+    kernel default (~208 KiB on Ubuntu) fills quickly under flood,
+    causing the kernel to drop legitimate packets first. 8 MiB gives
+    a few hundred ms of headroom for the receive goroutine.
+
+    user_data raises net.core.rmem_max to this value via a sysctl
+    drop-in so SetReadBuffer takes effect — without that, the kernel
+    silently clamps the syscall to ~208 KiB and the Go log emits a
+    clamp warning at boot.
+
+    Plumbed into the server as NHP_UDP_RECV_BUFFER_BYTES.
+  EOT
+  type        = number
+  default     = 8388608
+
+  validation {
+    condition     = var.udp_recv_buffer_bytes > 0
+    error_message = "udp_recv_buffer_bytes must be positive."
+  }
+}
+
+# =============================================================================
 # Blue/Green Deployment Configuration
 # =============================================================================
 

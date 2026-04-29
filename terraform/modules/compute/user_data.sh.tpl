@@ -882,6 +882,11 @@ NHP_CORS_ALLOWED_ORIGINS=${cors_allowed_origins}
 %{ if knock_headertype_verify_require ~}
 NHP_KNOCK_HEADERTYPE_VERIFY=true
 %{ endif ~}
+# Knock-port DoS hardening (#1159): UDP receive buffer target (bytes).
+# Paired with the net.core.rmem_max sysctl below; bumping just one side
+# lets the kernel silently clamp the socket back to the default. Boot
+# log emits a clamp warning if rmem_max is lower than this target.
+NHP_UDP_RECV_BUFFER_BYTES=${udp_recv_buffer_bytes}
 ENVEOF
 chmod 644 /opt/layerv/nhp-server/etc/env
 echo "Created environment file with image tag: $IMAGE_TAG"
@@ -1034,17 +1039,73 @@ WantedBy=multi-user.target
 SVCEOF
 
 # ============================================================================
+# Kernel UDP receive-buffer ceiling (#1159)
+#
+# SetReadBuffer(8 MiB) in the Go server is silently clamped to
+# net.core.rmem_max — a small buffer fills under flood and the kernel
+# starts dropping LEGITIMATE knocks first, giving the attacker a free
+# amplifier. Raise the ceiling here; the server then bumps the listen
+# socket and logs a Warning if the ceiling is still too low (so a
+# regression that drops this drop-in stays loud, not silent).
+#
+# Container note: nhp-server runs with --net=host so the listen socket
+# uses the host's net namespace and inherits these sysctls. If the
+# server is ever moved off host networking, switch to per-namespace
+# tuning or use SO_RCVBUFFORCE with CAP_NET_ADMIN.
+# ============================================================================
+mkdir -p /etc/sysctl.d
+cat > /etc/sysctl.d/60-nhp-knock-rcvbuf.conf << SYSCTLEOF
+# Managed by terraform/modules/compute/user_data.sh.tpl (#1159).
+# Paired with NHP_UDP_RECV_BUFFER_BYTES in the server env file.
+# Only rmem_max is required for SetReadBuffer to take effect; we
+# intentionally do NOT raise rmem_default to avoid bumping the kernel
+# default for unrelated UDP sockets on this host (chronyd, dhcp, etc).
+net.core.rmem_max = ${udp_recv_buffer_bytes}
+SYSCTLEOF
+# Apply live so the running server picks it up on this boot — without
+# this, the values land only on the next reboot and the in-progress
+# server start clamps. `|| true` because user_data runs under set -ex
+# and we want a hardened-kernel / namespace surprise to surface as the
+# Go-side clamp Warning, not as a fatal cloud-init exit. The drop-in
+# above persists, so any future reboot still gets the raised ceiling.
+sysctl -w "net.core.rmem_max=${udp_recv_buffer_bytes}" || true
+# Echo the kernel's actual rmem_max into the cloud-init log so a
+# post-mortem doesn't have to SSM into the host to see whether the
+# bump took. If sysctl -w failed silently above, the printed value
+# will be the kernel default (e.g. ~212992 on Ubuntu) — same signal
+# the Go-side clamp Warning will emit later, surfaced earlier.
+RMEM_MAX_ACTUAL=$(cat /proc/sys/net/core/rmem_max 2>/dev/null || echo "<read-failed>")
+echo "Configured UDP receive-buffer ceiling: requested ${udp_recv_buffer_bytes}, kernel rmem_max=$${RMEM_MAX_ACTUAL}"
+
+# ============================================================================
 # iptables Rate Limiting for NHP Knock Port (UDP 62206)
 #
 # Kernel-level rate limiting to mitigate UDP flood DoS attacks before packets
 # reach the application. This is the first line of defense; the Go server
 # has additional per-source-IP application-level rate limiting as defense-in-depth.
 #
-# Limits:
-# - 100 packets/sec sustained with burst of 50 (per source IP via hashlimit)
-# - Packets exceeding the limit are silently dropped (UDP convention)
-# IMPORTANT: These values must match DefaultRateLimiterConfig() in
-# endpoints/server/ratelimiter.go. Change both together.
+# Layered limits, evaluated top-down (first match wins):
+# 1. Global cap: drop all UDP knock packets above ${knock_global_rate_limit_pps}
+#    pps aggregate, burst ${knock_global_rate_limit_burst}. Defends against
+#    distributed low-rate floods that stay under per-IP limits but aggregate
+#    above the server's ECDH throughput (#1159). Uses --hashlimit-above
+#    --hashlimit-mode dstip — the bucket key is the packet destination IP,
+#    which on a single-ENI instance is one value, so this is effectively a
+#    single-bucket cap. (A multi-IP / dual-stack instance would split into
+#    one bucket per dst IP; iptables is IPv4-only here so v6 is a follow-up
+#    item — see #1498.) -m limit was the alternative but has no
+#    "match-above-rate" inverse, only "match-up-to-rate", so a distinct
+#    ABOVE-limit DROP rule needs the hashlimit module's --hashlimit-above
+#    operator.
+# 2. Per-source-IP cap: 100 pps sustained, burst 50, via -m hashlimit srcip.
+#    Falls through to ACCEPT when under the per-IP budget. Defends against
+#    a single noisy client.
+# 3. Default DROP: anything that didn't ACCEPT above gets dropped.
+#
+# IMPORTANT: per-IP values must match DefaultRateLimiterConfig() in
+# endpoints/server/ratelimiter.go. Change both together. The global cap
+# has no app-level mirror today (iptables-only); see #1159 for the
+# rationale and the standing follow-up for an app-level global limiter.
 # ============================================================================
 echo "Configuring iptables rate limiting for UDP port 62206..."
 
@@ -1055,8 +1116,55 @@ which iptables > /dev/null 2>&1 || apt_get_with_retry install -y iptables
 # present) before appending. This prevents duplicate rules accumulating if
 # user_data runs more than once on the same instance — for example after
 # `cloud-init clean && cloud-init init` for debugging, or after a re-image
-# that bakes prior rules into the AMI. The delete must use the EXACT same
-# spec as the add or it won't match. Keep the two specs in lockstep below.
+# that bakes prior rules into the AMI. The per-IP and default-DROP rules
+# below have a fixed spec, so a literal `iptables -D` with the same spec
+# always matches and is enough.
+#
+# The global cap is parameterized (rate + burst), so a literal `-D` would
+# fail to match if the operator changes knock_global_rate_limit_pps
+# between user_data runs (or flips it to 0). The result would be the OLD
+# rule sitting at a lower line number than the new one — old rate fires
+# first, new rate never takes effect. Walk INPUT by --line-numbers and
+# delete every rule referencing the global hashlimit name BEFORE the
+# conditional add, so changes and disable both work cleanly.
+#
+# State note: --hashlimit-name keys persist in /proc/net/ipt_hashlimit/
+# across delete-add cycles. The line-walk above only removes the rule;
+# stale bucket state lingers until the xt_hashlimit module is unloaded
+# (or reboot). Not a correctness problem — the new rule is what matters —
+# but if you're debugging counters, `cat /proc/net/ipt_hashlimit/<name>`
+# is where they live.
+
+# Always remove every prior nhp_knock_global rule from INPUT — survives
+# both rate changes between runs and the pps=0 disable case. Sort
+# descending so each delete leaves earlier line numbers stable.
+for line in $(iptables -L INPUT --line-numbers -n 2>/dev/null | awk '/nhp_knock_global/ {print $1}' | sort -rn); do
+  iptables -D INPUT "$line" 2>/dev/null || true
+done
+
+%{ if knock_global_rate_limit_pps > 0 ~}
+# Global cap: drop knocks above the aggregate rate, regardless of source IP.
+# Placed BEFORE the per-IP rule so a distributed flood (each source under
+# the per-IP 100 pps budget but aggregating above ECDH throughput) is shed
+# here. Operators who want per-IP-only fallback set
+# knock_global_rate_limit_pps = 0; this whole block compiles out and the
+# walk-and-delete above already cleared any prior rule.
+#
+# --hashlimit-above + --hashlimit-mode dstip: matches only when the
+# aggregate rate (counted against the single fixed dstip = listen IP)
+# exceeds the limit. Matched packets are DROPped; packets within the
+# aggregate budget fall through to the per-IP rule below.
+iptables -A INPUT -p udp --dport 62206 \
+  -m hashlimit \
+  --hashlimit-above ${knock_global_rate_limit_pps}/sec \
+  --hashlimit-burst ${knock_global_rate_limit_burst} \
+  --hashlimit-mode dstip \
+  --hashlimit-name nhp_knock_global \
+  -j DROP
+echo "iptables global cap: ${knock_global_rate_limit_pps} pps sustained, burst ${knock_global_rate_limit_burst}"
+%{ else ~}
+echo "iptables global cap: DISABLED (knock_global_rate_limit_pps=0)"
+%{ endif ~}
 
 # Rate limit UDP knock packets per source IP using hashlimit module.
 # hashlimit tracks each source IP independently, preventing one abusive IP
@@ -1086,7 +1194,7 @@ iptables -A INPUT -p udp --dport 62206 \
 iptables -D INPUT -p udp --dport 62206 -j DROP 2>/dev/null || true
 iptables -A INPUT -p udp --dport 62206 -j DROP
 
-echo "iptables rate limiting configured: 100 pps sustained, burst 50 per source IP"
+echo "iptables per-IP rate limiting configured: 100 pps sustained, burst 50 per source IP"
 
 systemctl daemon-reload
 systemctl enable nhp-cloudmap-register nhp-health-monitor nhp-server

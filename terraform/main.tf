@@ -459,6 +459,11 @@ module "compute" {
 
   knock_headertype_verify_require = var.nhp_knock_headertype_verify_require
 
+  # Knock-port DoS hardening (#1159)
+  knock_global_rate_limit_pps   = var.nhp_knock_global_rate_limit_pps
+  knock_global_rate_limit_burst = var.nhp_knock_global_rate_limit_burst
+  udp_recv_buffer_bytes         = var.nhp_udp_recv_buffer_bytes
+
   # Blue/Green deployment configuration
   enable_blue_green               = var.enable_blue_green
   green_standby_min_size          = var.green_standby_min_size

@@ -201,6 +201,24 @@ variable "nhp_knock_headertype_verify_require" {
   default     = false
 }
 
+variable "nhp_knock_global_rate_limit_pps" {
+  description = "Root passthrough for the compute module's knock_global_rate_limit_pps (#1159). Aggregate UDP knock pps cap; defends against distributed low-rate floods that stay under the per-IP limit but aggregate above ECDH throughput. 0 disables. See modules/compute/variables.tf."
+  type        = number
+  default     = 5000
+}
+
+variable "nhp_knock_global_rate_limit_burst" {
+  description = "Root passthrough for the compute module's knock_global_rate_limit_burst (#1159). Burst allowance for the global aggregate cap."
+  type        = number
+  default     = 10000
+}
+
+variable "nhp_udp_recv_buffer_bytes" {
+  description = "Root passthrough for the compute module's udp_recv_buffer_bytes (#1159). Target SO_RCVBUF for the NHP knock listen socket; user_data raises net.core.rmem_max to match so SetReadBuffer takes effect."
+  type        = number
+  default     = 8388608
+}
+
 variable "resource_mode" {
   description = "Resource management mode: 'local' uses config files, 'api' uses external auth service"
   type        = string

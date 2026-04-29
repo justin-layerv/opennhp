@@ -73,6 +73,11 @@ module "nhp" {
   nhp_cors_allowed_origins            = var.nhp_cors_allowed_origins
   nhp_knock_headertype_verify_require = var.nhp_knock_headertype_verify_require
 
+  # Knock-port DoS hardening (#1159)
+  nhp_knock_global_rate_limit_pps   = var.nhp_knock_global_rate_limit_pps
+  nhp_knock_global_rate_limit_burst = var.nhp_knock_global_rate_limit_burst
+  nhp_udp_recv_buffer_bytes         = var.nhp_udp_recv_buffer_bytes
+
   # Monitoring
   enable_slack_notifications = var.enable_slack_notifications
   slack_workspace_id         = var.slack_workspace_id

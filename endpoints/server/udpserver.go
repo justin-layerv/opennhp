@@ -401,6 +401,18 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		return fmt.Errorf("listen error: %w", err)
 	}
 
+	// SO_RCVBUF tuning. Rationale + sysctl coupling live in
+	// udp_recv_buffer.go; failures here are non-fatal so a misconfigured
+	// sysctl can't keep the server out of rotation.
+	rcvBufTarget, err := parseUDPRecvBufferSize(os.Getenv(UDPRecvBufferEnvVar))
+	if err != nil {
+		// listenConn was created above; close it before returning so
+		// the OS doesn't carry the FD past Start() failure.
+		_ = s.listenConn.Close()
+		return err
+	}
+	tuneUDPRecvBuffer(s.listenConn, rcvBufTarget)
+
 	// retrieve local port
 	laddr := s.listenConn.LocalAddr()
 	s.listenAddr, err = net.ResolveUDPAddr(laddr.Network(), laddr.String())

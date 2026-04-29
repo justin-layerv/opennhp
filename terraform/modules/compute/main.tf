@@ -722,6 +722,10 @@ locals {
     # CloudFront trusted proxy CIDRs (for correct client IP via X-Forwarded-For)
     cloudfront_cidrs_ssm_parameter  = var.cloudfront_cidrs_ssm_parameter
     knock_headertype_verify_require = var.knock_headertype_verify_require
+    # Knock-port DoS hardening (#1159): global rate cap + receive-buffer tuning.
+    knock_global_rate_limit_pps   = var.knock_global_rate_limit_pps
+    knock_global_rate_limit_burst = var.knock_global_rate_limit_burst
+    udp_recv_buffer_bytes         = var.udp_recv_buffer_bytes
   })
 }
 

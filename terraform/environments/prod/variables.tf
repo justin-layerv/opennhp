@@ -221,6 +221,24 @@ variable "nhp_knock_headertype_verify_require" {
   default     = false
 }
 
+variable "nhp_knock_global_rate_limit_pps" {
+  description = "Wrapper passthrough for the root nhp_knock_global_rate_limit_pps (#1159). Aggregate UDP knock pps cap."
+  type        = number
+  default     = 5000
+}
+
+variable "nhp_knock_global_rate_limit_burst" {
+  description = "Wrapper passthrough for the root nhp_knock_global_rate_limit_burst (#1159). Burst allowance for the aggregate cap."
+  type        = number
+  default     = 10000
+}
+
+variable "nhp_udp_recv_buffer_bytes" {
+  description = "Wrapper passthrough for the root nhp_udp_recv_buffer_bytes (#1159). Target SO_RCVBUF for the NHP knock listen socket."
+  type        = number
+  default     = 8388608
+}
+
 variable "resource_mode" {
   type    = string
   default = "local"

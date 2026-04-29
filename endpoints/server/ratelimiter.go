@@ -75,8 +75,11 @@ type RateLimiterConfig struct {
 // 100 pps sustained with burst of 50 is generous for legitimate knock traffic
 // (a normal client sends ~3-5 packets per knock) while blocking volumetric DoS.
 //
-// IMPORTANT: These defaults must match the iptables hashlimit rules in
-// terraform/modules/compute/user_data.sh.tpl. Change both together.
+// IMPORTANT: These defaults must match the per-source-IP iptables hashlimit
+// rule in terraform/modules/compute/user_data.sh.tpl. Change both together.
+// The aggregate global cap added for #1159 is iptables-only today (no
+// app-level mirror) — see the comment block in user_data.sh.tpl for the
+// rationale and follow-up.
 func DefaultRateLimiterConfig() RateLimiterConfig {
 	return RateLimiterConfig{
 		Rate:            100,
