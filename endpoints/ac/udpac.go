@@ -52,6 +52,16 @@ type UdpAC struct {
 
 	tokenStore *common.TokenStore[*AccessEntry]
 
+	// aopReplay dedupes recently observed NHP_AOP packets by
+	// (sender_pubkey, txid, send_time) so a captured-and-replayed
+	// packet cannot re-open ipset entries on a fresh connection.
+	// Initialized in Start(); tests that construct &UdpAC{} without
+	// going through Start MUST wire `aopReplay: newAOPReplayCache()`
+	// manually before invoking HandleUdpACOperations, or the call
+	// will nil-deref on MarkSeen. See aop_replay_cache.go for the
+	// threat model and sizing.
+	aopReplay *aopReplayCache
+
 	device     *core.Device
 	httpServer *HttpAC
 	wg         sync.WaitGroup
@@ -155,6 +165,7 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	// allowlist dead until the next config.toml touch (see #1239).
 	a.tokenStore = common.NewTokenStore[*AccessEntry]()
 	a.dnsRateLimiter = NewDNSChangeRateLimiter()
+	a.aopReplay = newAOPReplayCache()
 
 	// Load http config and turn on http server if needed
 	if err := a.loadHttpConfig(); err != nil {
@@ -584,6 +595,16 @@ func (a *UdpAC) recvMessageRoutine() {
 				a.wg.Add(1)
 				go func() {
 					if err := a.HandleUdpACOperations(ppd); err != nil {
+						// HandleUdpACOperations already logs both the
+						// duplicate drop (Warning) and the
+						// missing-pubkey upstream-invariant violation
+						// (Critical) with full context (acId, txid,
+						// header type). Re-logging at this seam adds
+						// noise without information.
+						if errors.Is(err, common.ErrACDuplicateTransaction) ||
+							errors.Is(err, common.ErrACMissingPeerPubkey) {
+							return
+						}
 						log.Error("HandleUdpACOperations failed: %v", err)
 					}
 				}()

@@ -159,6 +159,24 @@ var (
 	ErrACIPSetOperationFailed  = newError("53004", "ipset operation failed")
 	ErrACTempPortListenFailed  = newError("53005", "temporary port listening failed")
 	ErrACResolveTempPortFailed = newError("53006", "resolve temporary port failed")
+	// ErrACDuplicateTransaction — emitted by the AC's NHP_AOP replay
+	// dedupe (#1123) when the (sender_pubkey, txid, sendTime) triple
+	// was already processed inside the cache TTL. The handler drops
+	// the packet without sending NHP_ART so the response channel
+	// cannot be used as a replay-success oracle. Message reads
+	// "replayed packet" rather than "duplicate transaction id" alone
+	// so an oncall reading the error doesn't infer the dedupe key
+	// is txid-only and chase the wrong direction.
+	ErrACDuplicateTransaction = newError("53007", "ac duplicate transaction (replayed packet)")
+	// ErrACMissingPeerPubkey — fail-closed on the upstream invariant
+	// that core.responder.validatePeer populates ppd.RemotePubKey
+	// before the AC handler runs. A zero-length pubkey here means
+	// either a parser regression or a test harness that bypasses
+	// validatePeer; in both cases the AC cannot scope replay-dedupe
+	// state and so refuses to process the packet. Distinct from
+	// ErrACDuplicateTransaction so an oncall chasing a duplicate-
+	// spike alert is not misled by an upstream invariant violation.
+	ErrACMissingPeerPubkey = newError("53008", "missing peer pubkey on ac transaction")
 
 	// api
 	ErrHttpRequestFailed           = newError("54001", "http request failed")
