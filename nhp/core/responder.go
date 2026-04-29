@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -363,19 +362,19 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 		peer = ppd.device.LookupPeer(peerPk)
 		if peer == nil {
 			log.Error("peer not found in peer pool")
-			err = errors.New("peer not found in peer pool")
+			err = ErrPeerNotFound
 			return err
 		}
 
 		if peer.IsExpired() {
 			log.Error("peer expired")
-			err = errors.New("peer expired")
+			err = ErrPeerExpired
 			return err
 		}
 
 		if !peer.CheckRecvAddress(ppd.LocalInitTime, ppd.ConnData.RemoteAddr) {
 			log.Error("peer does not match its previous address")
-			err = errors.New("peer does not match its previous address")
+			err = ErrPeerAddressMismatch
 			return err
 		}
 		peer.UpdateRecv(ppd.LocalInitTime, ppd.ConnData.RemoteAddr)
@@ -429,7 +428,7 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 				// block source address
 				ppd.ConnData.SendBlockSignal()
 			}
-			err = errors.New("received replay packet")
+			err = ErrReplayPacketReceived
 			return err
 		}
 	}
@@ -445,7 +444,7 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 				// block source address
 				ppd.ConnData.SendBlockSignal()
 			}
-			err = errors.New("received flood packet")
+			err = ErrFloodPacketReceived
 			return err
 		}
 	}
@@ -460,7 +459,7 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 			// block source address
 			ppd.ConnData.SendBlockSignal()
 		}
-		err = errors.New("received stale packet")
+		err = ErrStalePacketReceived
 		return err
 	}
 

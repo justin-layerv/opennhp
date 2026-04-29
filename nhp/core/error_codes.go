@@ -37,4 +37,7 @@ const (
 	errNhpReplayPacketReceived           = 32013
 	errNhpFloodPacketReceived            = 32014
 	errNhpStalePacketReceived            = 32015
+	errNhpPeerNotFound                   = 32016
+	errNhpPeerExpired                    = 32017
+	errNhpPeerAddressMismatch            = 32018
 )

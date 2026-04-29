@@ -101,4 +101,7 @@ var (
 	ErrReplayPacketReceived           = newError(errNhpReplayPacketReceived, "received replay packet, drop")
 	ErrFloodPacketReceived            = newError(errNhpFloodPacketReceived, "received flood packet, drop")
 	ErrStalePacketReceived            = newError(errNhpStalePacketReceived, "received stale packet, drop")
+	ErrPeerNotFound                   = newError(errNhpPeerNotFound, "peer not found in peer pool")
+	ErrPeerExpired                    = newError(errNhpPeerExpired, "peer expired")
+	ErrPeerAddressMismatch            = newError(errNhpPeerAddressMismatch, "peer does not match its previous address")
 )
