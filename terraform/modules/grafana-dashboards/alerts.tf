@@ -284,6 +284,8 @@ resource "grafana_contact_point" "qurl_aws_sns" {
     # external_id matches the trust policy condition above. Empty when
     # var.grafana_cloud_external_id is unset, in which case the trust
     # policy condition is also absent — no external ID is required.
+    # Tightening tracked in #1462 (degraded-trust mode when external_id
+    # is unset; surfaced by the #1319 audit).
     external_id    = local.grafana_cloud_external_id
     auth_provider  = "arn"
     message_format = "json"

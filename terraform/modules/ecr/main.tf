@@ -429,7 +429,9 @@ resource "aws_ecr_replication_configuration" "cross_account" {
 # primary account can match, and AWS's own reference policy examples for
 # cross-account ECR replication omit any aws:SourceAccount / aws:SourceArn
 # condition for the same reason (ECR replication doesn't populate either
-# key). See docs/runbooks/ecr-replication-failure.md "Known gotcha".
+# key). See docs/runbooks/ecr-replication-failure.md "Known gotcha"
+# and docs/incidents/2026-04-24-ecr-source-account-trap.md for the
+# reviewer-facing rule + audit of the same pattern across modules.
 resource "aws_ecr_registry_policy" "replication" {
   count = !var.is_primary_account && var.enable_replication && var.primary_account_id != "" ? 1 : 0
 

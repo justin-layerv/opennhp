@@ -166,6 +166,7 @@ for findings is in `docs/runbooks/terraform-prod-drift.md`.
 
 - #1212 — added `aws_cloudformation_stack.website_api` (failure 2 origin).
 - #1316 — fix for failure 1 (ECR Condition removal).
+- #1319 → [`docs/incidents/2026-04-24-ecr-source-account-trap.md`](2026-04-24-ecr-source-account-trap.md) — companion artifact: full audit of `aws:SourceAccount`/`aws:SourceArn` use across `terraform/modules/`, plus the reviewer-facing `Principal.Service` vs `Principal.AWS` rule.
 - #1322 — sibling incident in the same release window (image-deploy DAG).
 - #1323 → #1414 — terraform reconciliation of the manual IAM grant.
 - #1415 — cleanup of the legacy inline IAM policy (post-apply).

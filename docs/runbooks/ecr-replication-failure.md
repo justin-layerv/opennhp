@@ -94,13 +94,15 @@ ECR cross-account replication uses a service-internal authorization context that
 
 This is specific to ECR replication. Other AWS service-to-service integrations (S3 → SNS/SQS, EventBridge, etc.) *do* populate these keys and the common defense-in-depth pattern of pinning them is correct there. Copying that pattern into an ECR registry policy silently breaks replication.
 
+**Reviewer rule of thumb (resource policies only):** if `Principal.Service` is set, pin `aws:SourceAccount`. If `Principal.AWS` is set (cross-account IAM), don't — the principal pin is the enforcement. For IAM trust policies (`assume_role_policy`) the cross-account analogue is `sts:ExternalId`, not `aws:SourceAccount`. (Canonical version, with the full audit and out-of-scope cases like KMS, `Principal.Federated`, and mixed principals, lives in [`docs/incidents/2026-04-24-ecr-source-account-trap.md`](../incidents/2026-04-24-ecr-source-account-trap.md) — the rule is duplicated here for in-incident readability; if it ever needs refining, refine it there and re-sync this paragraph.)
+
 **Symptom:** `describe-image-replication-status` returns `FAILED` / `DESTINATION_REGISTRY_ACCESS_DENIED` for every digest, even freshly-pushed ones, despite a registry policy whose Principal and Action appear correct.
 
 **Diagnostic:** `aws ecr get-registry-policy --region us-east-2 --query 'policyText' --output text | jq` and look for a `Condition.StringEquals.aws:SourceAccount` or `aws:SourceArn` block. If present, that's the bug.
 
 **Fix:** Remove the Condition block. The Principal scoping (`arn:aws:iam::<primary>:root`) is load-bearing and sufficient — it's what AWS's own [cross-account ECR replication reference policies](https://docs.aws.amazon.com/AmazonECR/latest/userguide/registry-permissions-cross-account-examples.html) use.
 
-**Incident:** 2026-04-24 prod release was blocked by this for ~30 min of debugging; see `terraform/modules/ecr/main.tf` comment for the root-cause story. Fixed in PR #1316.
+**Incident:** 2026-04-24 prod release was blocked by this for ~30 min of debugging; see `terraform/modules/ecr/main.tf` comment for the root-cause story. Fixed in PR #1316; pattern-level audit referenced in the rule paragraph above.
 
 ## After the fact
 

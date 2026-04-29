@@ -29,6 +29,9 @@ verified case where AWS doesn't populate this key in the auth path", not
 "this looks suspicious".
 
 See `docs/runbooks/terraform-prod-drift.md` for what to do when this fires.
+The reviewer-facing companion (when to pin `aws:SourceAccount` vs not,
+plus the per-module audit) lives in
+`docs/incidents/2026-04-24-ecr-source-account-trap.md`.
 """
 
 from __future__ import annotations
@@ -195,12 +198,19 @@ def main() -> int:
         sys.stdout.write("\n")
     else:
         for f in findings:
+            # The reviewer-rule path below is duplicated in the docstring
+            # at the top of this file and in
+            # docs/runbooks/ecr-replication-failure.md. If the reviewer
+            # artifact is ever moved or renamed, all three sites need
+            # updating in lockstep.
             error(
                 f"resource `{f['type']}.{f['name']}` contains banned "
                 f"Condition key `{f['key']}` — AWS does not populate "
                 f"this key in the auth path for this resource type and "
                 f"the Condition will silently deny in prod. See "
-                f"{f['citation']}. Reference: {f['incident']}.",
+                f"{f['citation']}. Reference: {f['incident']}. "
+                f"Reviewer rule: docs/incidents/"
+                f"2026-04-24-ecr-source-account-trap.md.",
                 file=Path(f["file"]),
             )
         if findings:
