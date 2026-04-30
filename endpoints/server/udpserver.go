@@ -1271,16 +1271,11 @@ func (s *UdpServer) recvPacketRoutine() {
 
 		} else {
 			// create new connection if there is room
-			s.remoteConnectionMapMutex.Lock()
-			if len(s.remoteConnectionMap) > OverloadConnectionThreshold {
-				s.device.SetOverload(true)
-			} else if len(s.remoteConnectionMap) >= MaxConcurrentConnection {
-				s.remoteConnectionMapMutex.Unlock()
+			if !s.globalCapAdmits() {
 				log.Critical("Reached maximum concurrent connection. Discard new packet from addr: %s", addrStr)
 				s.device.ReleasePoolPacket(pkt)
 				continue
 			}
-			s.remoteConnectionMapMutex.Unlock()
 
 			// Classify only on header type AND source-IP match against a
 			// configured peer. RecvPrecheck only validates header bytes,
@@ -1371,6 +1366,46 @@ func (s *UdpServer) isKnownDBPeerIP(ipStr string) bool {
 		}
 	}
 	return false
+}
+
+// globalCapAdmits reports whether the global MaxConcurrentConnection
+// cap admits a new connection, and as a side effect flips overload
+// mode on when the map crosses OverloadConnectionThreshold.
+//
+// Use two independent `if` statements, not `if/else if`. The
+// pre-fix bug was `if overload { ... } else if cap { reject }`,
+// which made the cap branch unreachable once the map crossed the
+// (lower) overload threshold. With independent `if`s the order is
+// not load-bearing for the admit/reject decision (both checks see
+// the same n) but IS load-bearing for the overload flag's accuracy
+// on the rejection path — see the next paragraph. Fusing them back
+// into `if/else if` re-introduces #1525 — do not fuse.
+//
+// Overload is checked BEFORE the cap reject so the flag still
+// reflects map size on the rejection path. recvPacketRoutine alone
+// would always set overload on a prior admit before reaching the
+// cap; webrtcserver's DataChannel admit (#1569) bypasses this
+// helper entirely, so the map can land above OverloadConnectionThreshold
+// without recvPacketRoutine ever running. Doing the overload flip
+// first means a recv packet that lands the cap-reject path still
+// updates the flag honestly. Revisit when #1569 lands and webrtc
+// routes through this helper — at that point the rationale weakens.
+//
+// "Admits" not "reserves": the function does not insert into the
+// map. admitNewConnection re-acquires remoteConnectionMapMutex
+// before mutating it; the brief unlocked window between is the same
+// TOCTOU window that lived inline in recvPacketRoutine.
+func (s *UdpServer) globalCapAdmits() bool {
+	s.remoteConnectionMapMutex.Lock()
+	defer s.remoteConnectionMapMutex.Unlock()
+	n := len(s.remoteConnectionMap)
+	if n > OverloadConnectionThreshold {
+		s.device.SetOverload(true)
+	}
+	if n >= MaxConcurrentConnection {
+		return false
+	}
+	return true
 }
 
 // admitNewConnection registers conn in remoteConnectionMap. For agent

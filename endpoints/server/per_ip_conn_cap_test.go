@@ -17,7 +17,7 @@ import (
 // so cleanup-defer side effects (e.g. evicted conns leaving the global
 // map) are not observed here.
 
-func newTestServerForPerIPCap(t *testing.T) *UdpServer {
+func newTestUdpServer(t *testing.T) *UdpServer {
 	t.Helper()
 	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
 	if device == nil {
@@ -56,7 +56,7 @@ func makeConn(ip string, port int, kind connKind) *UdpConn {
 
 // 50 source ports from one IP must allocate at most MaxAgentConnsPerIP.
 func TestAdmitNewConnection_AgentCapEnforced(t *testing.T) {
-	s := newTestServerForPerIPCap(t)
+	s := newTestUdpServer(t)
 	const ip = "10.0.0.5"
 	conns := make([]*UdpConn, 0, 50)
 	for port := 30000; port < 30050; port++ {
@@ -86,7 +86,7 @@ func TestAdmitNewConnection_AgentCapEnforced(t *testing.T) {
 }
 
 func TestAdmitNewConnection_EvictsOldestFirst(t *testing.T) {
-	s := newTestServerForPerIPCap(t)
+	s := newTestUdpServer(t)
 	const ip = "10.0.0.6"
 	first := makeConn(ip, 40000, kindAgent)
 	s.admitNewConnection(first, first.ConnData.RemoteAddr.String())
@@ -118,7 +118,7 @@ func TestAdmitNewConnection_EvictsOldestFirst(t *testing.T) {
 }
 
 func TestAdmitNewConnection_ACBypassesCap(t *testing.T) {
-	s := newTestServerForPerIPCap(t)
+	s := newTestUdpServer(t)
 	const ip = "10.0.0.7"
 	for i := 0; i < MaxAgentConnsPerIP+5; i++ {
 		c := makeConn(ip, 50000+i, kindAC)
@@ -133,7 +133,7 @@ func TestAdmitNewConnection_ACBypassesCap(t *testing.T) {
 }
 
 func TestAdmitNewConnection_DBBypassesCap(t *testing.T) {
-	s := newTestServerForPerIPCap(t)
+	s := newTestUdpServer(t)
 	const ip = "10.0.0.8"
 	for i := 0; i < MaxAgentConnsPerIP+5; i++ {
 		c := makeConn(ip, 60000+i, kindDB)
@@ -146,7 +146,7 @@ func TestAdmitNewConnection_DBBypassesCap(t *testing.T) {
 
 // 32 conns from 2 IPs (16 each) admit cleanly: cap is per-IP, not global.
 func TestAdmitNewConnection_DistinctIPsIndependent(t *testing.T) {
-	s := newTestServerForPerIPCap(t)
+	s := newTestUdpServer(t)
 	for _, ip := range []string{"10.0.0.10", "10.0.0.11"} {
 		for i := 0; i < MaxAgentConnsPerIP; i++ {
 			c := makeConn(ip, 30000+i, kindAgent)
@@ -172,7 +172,7 @@ func TestAdmitNewConnection_DistinctIPsIndependent(t *testing.T) {
 }
 
 func TestRemoveConnection_DropsBucketWhenEmpty(t *testing.T) {
-	s := newTestServerForPerIPCap(t)
+	s := newTestUdpServer(t)
 	const ip = "10.0.0.12"
 	c := makeConn(ip, 30000, kindAgent)
 	addrStr := c.ConnData.RemoteAddr.String()
@@ -198,7 +198,7 @@ func TestRemoveConnection_DropsBucketWhenEmpty(t *testing.T) {
 // safe — pinned because admit clears perIPElem, then the cleanup defer
 // runs and would double-pop without the nil guard.
 func TestRemoveConnection_AfterEvictionIsNoOpForBucket(t *testing.T) {
-	s := newTestServerForPerIPCap(t)
+	s := newTestUdpServer(t)
 	const ip = "10.0.0.13"
 	first := makeConn(ip, 30000, kindAgent)
 	s.admitNewConnection(first, first.ConnData.RemoteAddr.String())
@@ -228,7 +228,7 @@ func TestRemoveConnection_AfterEvictionIsNoOpForBucket(t *testing.T) {
 // after eviction — pins option-A reply-path correctness against any
 // future drift back toward IP-only keying.
 func TestAdmitNewConnection_ReplyAddrPreservedAfterEviction(t *testing.T) {
-	s := newTestServerForPerIPCap(t)
+	s := newTestUdpServer(t)
 	const ip = "10.0.0.14"
 	a := makeConn(ip, 30000, kindAgent)
 	b := makeConn(ip, 30001, kindAgent)
@@ -262,7 +262,7 @@ func TestAdmitNewConnection_ReplyAddrPreservedAfterEviction(t *testing.T) {
 // AC admission from an IP that's already at the agent cap must not
 // trigger eviction — AC bypasses the bucket entirely.
 func TestAdmitNewConnection_ACAdmittedWhenAgentBucketFull(t *testing.T) {
-	s := newTestServerForPerIPCap(t)
+	s := newTestUdpServer(t)
 	const ip = "10.0.0.15"
 	for i := 0; i < MaxAgentConnsPerIP; i++ {
 		c := makeConn(ip, 30000+i, kindAgent)
@@ -288,7 +288,7 @@ func TestAdmitNewConnection_ACAdmittedWhenAgentBucketFull(t *testing.T) {
 // MaxAgentConnsPerIP without panic or double-close, and exactly
 // total - cap evictSignals must be closed.
 func TestAdmitNewConnection_ConcurrentSameIP(t *testing.T) {
-	s := newTestServerForPerIPCap(t)
+	s := newTestUdpServer(t)
 	const ip = "10.0.0.16"
 	const total = 200
 
@@ -344,7 +344,7 @@ func TestAdmitNewConnection_ConcurrentSameIP(t *testing.T) {
 // rather than poking internals so the test stays meaningful if admit's
 // bookkeeping changes.
 func TestRemoveConnection_AddrStrReuseDoesNotOrphanNewConn(t *testing.T) {
-	s := newTestServerForPerIPCap(t)
+	s := newTestUdpServer(t)
 	const ip = "10.0.0.50"
 	const port = 30000
 	addrStr := (&net.UDPAddr{IP: net.ParseIP(ip), Port: port}).String()
@@ -390,7 +390,7 @@ func TestRemoveConnection_AddrStrReuseDoesNotOrphanNewConn(t *testing.T) {
 // inherit the AC/DB cleanup behavior and cap bypass — defeating the
 // fix.
 func TestIsKnownPeerIP_GatesACDBClassification(t *testing.T) {
-	s := newTestServerForPerIPCap(t)
+	s := newTestUdpServer(t)
 	s.acPeerMap = make(map[string]*core.UdpPeer)
 	s.dbPeerMap = make(map[string]*core.UdpPeer)
 
@@ -466,7 +466,7 @@ func TestIsKnownPeerIP_GatesACDBClassification(t *testing.T) {
 	// for any IP. Done as a separate fixture-construction so we don't
 	// pollute the populated server's maps.
 	t.Run("empty AC map returns false", func(t *testing.T) {
-		s2 := newTestServerForPerIPCap(t)
+		s2 := newTestUdpServer(t)
 		s2.acPeerMap = map[string]*core.UdpPeer{}
 		if s2.isKnownACPeerIP("10.0.0.30") {
 			t.Errorf("expected false for empty acPeerMap")
@@ -479,7 +479,7 @@ func TestIsKnownPeerIP_GatesACDBClassification(t *testing.T) {
 // global-map entry. Pins the end-to-end teardown chain that the unit
 // tests above stub out.
 func TestConnectionRoutine_ExitsOnEvictSignal(t *testing.T) {
-	s := newTestServerForPerIPCap(t)
+	s := newTestUdpServer(t)
 	s.signals.stop = make(chan struct{})
 	s.acConnectionMap = make(map[string][]*ACConn)
 	s.dbConnectionMap = make(map[string]*DBConn)
@@ -533,7 +533,7 @@ func TestConnectionRoutine_ExitsOnEvictSignal(t *testing.T) {
 // conns out of the per-IP cap. Pinned because future UdpConn literals
 // might forget the field.
 func TestAdmitNewConnection_PanicsOnNilEvictSignal(t *testing.T) {
-	s := newTestServerForPerIPCap(t)
+	s := newTestUdpServer(t)
 	conn := &UdpConn{
 		ConnData: &core.ConnectionData{RemoteAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.60"), Port: 30000}},
 		// evictSignal intentionally nil
@@ -551,7 +551,7 @@ func TestAdmitNewConnection_PanicsOnNilEvictSignal(t *testing.T) {
 // here would be a programming-bug class same as nil evictSignal.
 // Both should fail loudly at admit rather than later.
 func TestAdmitNewConnection_PanicsOnNilRemoteAddr(t *testing.T) {
-	s := newTestServerForPerIPCap(t)
+	s := newTestUdpServer(t)
 	conn := &UdpConn{
 		ConnData:    &core.ConnectionData{}, // RemoteAddr nil
 		evictSignal: make(chan struct{}),
@@ -570,7 +570,7 @@ func TestAdmitNewConnection_PanicsOnNilRemoteAddr(t *testing.T) {
 // removeConnection is the only thing keeping distinct-IP keys from
 // accumulating.
 func TestConnectionsByIP_NoLeakUnderChurn(t *testing.T) {
-	s := newTestServerForPerIPCap(t)
+	s := newTestUdpServer(t)
 	for cycle := 0; cycle < 100; cycle++ {
 		ip := fmt.Sprintf("10.1.%d.%d", cycle/256, cycle%256)
 		c := makeConn(ip, 30000, kindAgent)
@@ -587,7 +587,7 @@ func TestConnectionsByIP_NoLeakUnderChurn(t *testing.T) {
 }
 
 func TestAdmitNewConnection_EmitsEvictionMetric(t *testing.T) {
-	s := newTestServerForPerIPCap(t)
+	s := newTestUdpServer(t)
 	const ip = "10.0.0.17"
 	for i := 0; i < MaxAgentConnsPerIP; i++ {
 		c := makeConn(ip, 30000+i, kindAgent)
