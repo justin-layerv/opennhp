@@ -8,10 +8,13 @@
 # - AC Traefik -> frps:7000 (FRP control channel, WebSocket)
 # - AC Traefik -> frps:8080 (vhost HTTP, proxied to customer backends)
 #
-# v1: Single instance (min=1, max=1). Acceptable for initial deployment
-# because FRP clients reconnect automatically on server restart. The ASG
-# provides self-healing (auto-replace on instance failure). Multi-instance
-# with sticky sessions is a future enhancement.
+# v1: Single instance by default (min/max/desired all default to 1; the
+# values are exposed as module variables but env tfvars do not override
+# them yet — see #1499). Acceptable for initial deployment because FRP
+# clients reconnect automatically on server restart. The ASG provides
+# self-healing (auto-replace on instance failure). Multi-instance with
+# sticky sessions / shared registry is a future enhancement tracked in
+# #1499.
 #
 # Cloud Map lifecycle during ASG replacement: with `create_before_destroy`
 # and min=max=1, a brief window (up to the 30s DNS TTL) exists where both
@@ -24,6 +27,11 @@
 # `aws_autoscaling_lifecycle_hook` on `Terminating:Wait` blocking until
 # deregister completes — is tracked in #1089 alongside the custom
 # health-check work.
+#
+# At N>1 the same TTL window applies but with N concurrent registrations on
+# each side, which compounds the routing problem (in-memory tunnel state on
+# only one of the new instances). #1499 covers the registry-coherence work
+# that makes the N>1 case correct, not just survivable.
 
 # ==================== Data Sources ====================
 
@@ -405,14 +413,15 @@ resource "aws_launch_template" "frps" {
 }
 
 # ==================== Auto Scaling Group ====================
-# Single instance — see module header for v1 rationale.
+# Single instance by default — see module header for v1 rationale and
+# #1499 for the work required before raising min/max/desired above 1.
 
 resource "aws_autoscaling_group" "frps" {
   name                = "${var.name_prefix}-frps"
   vpc_zone_identifier = var.private_subnet_ids
-  min_size            = 1
-  max_size            = 1
-  desired_capacity    = 1
+  min_size            = var.min_size
+  max_size            = var.max_size
+  desired_capacity    = var.desired_capacity
 
   launch_template {
     id      = aws_launch_template.frps.id
@@ -471,6 +480,13 @@ resource "aws_autoscaling_group" "frps" {
       # rejection.
       condition     = length(toset([var.frps_bind_port, var.frps_vhost_http_port, var.frps_dashboard_port])) == 3
       error_message = "frps_bind_port, frps_vhost_http_port, and frps_dashboard_port must all be distinct — frps binds each independently."
+    }
+
+    precondition {
+      # min <= desired <= max. Catch tfvars typos at plan time rather than
+      # letting the ASG API reject them in the middle of an apply.
+      condition     = var.min_size <= var.desired_capacity && var.desired_capacity <= var.max_size
+      error_message = "qurl-frps ASG sizing must satisfy min_size <= desired_capacity <= max_size."
     }
   }
 }

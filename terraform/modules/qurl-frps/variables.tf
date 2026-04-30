@@ -181,3 +181,46 @@ variable "qurl_api_token_secret_arn" {
   type        = string
   default     = ""
 }
+
+# ==================== ASG Sizing ====================
+# Defaults are 1/1/1 because nhp-frps holds tunnel registrations in memory per
+# instance and Cloud Map uses MULTIVALUE routing — scaling beyond 1 today would
+# route ~(N-1)/N of tunnel requests to instances that don't have the
+# registration. Tracked in #1499 (consistent-hash routing in qurl-router OR
+# shared registry in nhp-frps). When that lands, override these from the root
+# (one instance per AZ in both sandbox and prod).
+
+variable "min_size" {
+  description = "ASG minimum size. Defaults to 1; do not raise without resolving #1499 (multi-AZ tunnel routing)."
+  type        = number
+  default     = 1
+
+  validation {
+    # `floor(...) == ...` rejects non-integers — `type = number` on its own
+    # accepts 1.5, which would only fail at AWS-API time mid-apply.
+    condition     = var.min_size >= 1 && floor(var.min_size) == var.min_size
+    error_message = "min_size must be an integer >= 1 — qurl-frps is the only path for tunnel traffic; N=0 means tunnel resources 502."
+  }
+}
+
+variable "max_size" {
+  description = "ASG maximum size. Defaults to 1; see min_size and #1499 before raising."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.max_size >= 1 && floor(var.max_size) == var.max_size
+    error_message = "max_size must be an integer >= 1 — see min_size for rationale (qurl-frps is the only path for tunnel traffic)."
+  }
+}
+
+variable "desired_capacity" {
+  description = "ASG desired capacity. Defaults to 1; see min_size and #1499 before raising."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.desired_capacity >= 1 && floor(var.desired_capacity) == var.desired_capacity
+    error_message = "desired_capacity must be an integer >= 1 — see min_size for rationale (qurl-frps is the only path for tunnel traffic)."
+  }
+}

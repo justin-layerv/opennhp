@@ -992,6 +992,21 @@ resource "aws_route53_record" "qurl_site_wildcard" {
 # FRP tunnel server for proxying traffic to customer backends via qurl-reverse-proxy.
 # Runs in private subnets, reachable only from AC security group.
 
+# Cross-variable invariant for the qurl-frps ASG sizing knobs. Unconditional
+# (no `count = deploy_frps ? 1 : 0`) so a typo like `frps_min_size = 3,
+# frps_max_size = 1` in tfvars fails plan even while `deploy_frps = false` —
+# matching the rationale on the per-variable `>= 1` validations. The module's
+# own ASG-resource precondition (`min_size <= desired_capacity <= max_size`)
+# stays in place as a second line of defense for module-direct consumers.
+resource "terraform_data" "frps_asg_sizing" {
+  lifecycle {
+    precondition {
+      condition     = var.frps_min_size <= var.frps_desired_capacity && var.frps_desired_capacity <= var.frps_max_size
+      error_message = "qurl-frps ASG sizing must satisfy frps_min_size <= frps_desired_capacity <= frps_max_size (root-level guard so a typo fails plan even when deploy_frps = false)."
+    }
+  }
+}
+
 # Validate that everything the FRP auth plugin needs is wired before the
 # module is instantiated. Without these, `qurl-frps` would boot with the
 # built-in tunnel-auth plugin disabled and any client could register
@@ -1074,6 +1089,13 @@ module "qurl_frps" {
 
   # Instance configuration
   instance_type = var.frps_instance_type
+
+  # ASG sizing — defaults to 1/1/1 because tunnel registrations are
+  # in-memory per instance. Tracked in #1499; once that lands, env tfvars
+  # flip to one-per-AZ.
+  min_size         = var.frps_min_size
+  max_size         = var.frps_max_size
+  desired_capacity = var.frps_desired_capacity
 
   # Port configuration (shared with AC module via root variables)
   frps_bind_port       = var.frps_bind_port

@@ -1740,6 +1740,51 @@ variable "frps_vhost_http_port" {
   default     = 8080
 }
 
+# nhp-frps holds tunnel registrations in memory per instance and Cloud Map
+# uses MULTIVALUE routing, so scaling beyond 1 today drops ~(N-1)/N of tunnel
+# requests. Tracked in #1499 (consistent-hash routing in qurl-router OR shared
+# registry in nhp-frps). Leave the defaults at 1 in env tfvars until #1499 is
+# resolved; the variables exist now so that the eventual scale-up is a tfvars
+# diff and not a module change.
+
+variable "frps_min_size" {
+  description = "ASG minimum size for qurl-frps. Default 1; do not raise without resolving #1499."
+  type        = number
+  default     = 1
+
+  validation {
+    # Mirror the module-level validation at the root: a typo like
+    # `frps_min_size = 0` while `deploy_frps = false` would otherwise sit
+    # unchallenged until the next time frps is deployed. `floor(...) == ...`
+    # rejects non-integers (`type = number` on its own accepts 1.5, which
+    # would only fail at AWS-API time).
+    condition     = var.frps_min_size >= 1 && floor(var.frps_min_size) == var.frps_min_size
+    error_message = "frps_min_size must be an integer >= 1 — qurl-frps is the only path for tunnel traffic; N=0 means tunnel resources 502."
+  }
+}
+
+variable "frps_max_size" {
+  description = "ASG maximum size for qurl-frps. Default 1; do not raise without resolving #1499."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.frps_max_size >= 1 && floor(var.frps_max_size) == var.frps_max_size
+    error_message = "frps_max_size must be an integer >= 1 — see frps_min_size."
+  }
+}
+
+variable "frps_desired_capacity" {
+  description = "ASG desired capacity for qurl-frps. Default 1; do not raise without resolving #1499."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.frps_desired_capacity >= 1 && floor(var.frps_desired_capacity) == var.frps_desired_capacity
+    error_message = "frps_desired_capacity must be an integer >= 1 — see frps_min_size."
+  }
+}
+
 # ==================== QURL Integrations DNS ====================
 # Cross-account A records for qurl-integrations-infra prod EC2
 # instances. Rationale + source-of-truth note in main.tf under
