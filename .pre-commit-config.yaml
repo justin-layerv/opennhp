@@ -40,8 +40,11 @@ repos:
         #   for CloudFront ACM certs and WAF (must be in us-east-1).
         # - terraform/modules/grafana-dashboards/: uses configuration_aliases = [grafana]
         #   (non-AWS provider, configured in environment modules).
-        # - terraform/{main,variables,outputs}.tf: root module uses
+        # - terraform/*.tf (root module .tf files): root module uses
         #   configuration_aliases = [aws.us_east_1, aws.route53_mgmt, aws.billing_mgmt].
+        #   All root-level .tf files share these aliases, so the exclude
+        #   matches every direct child .tf rather than enumerating filenames
+        #   (which silently missed ecr_replication_check.tf when added in PR #1471).
         #
         # These modules are validated in CI via full environment init (terraform validate
         # runs from terraform/environments/{sandbox,prod}/ where providers are configured).
@@ -50,4 +53,4 @@ repos:
         # Intentionally has a `jsonencode(<<EOT ...)` body that terraform-validate
         # rejects (it's the exact malformed shape the lint exists to hard-fail on).
         # The lint's regression fence is in `run-fixtures.sh`, not `terraform validate`.
-        exclude: '^(terraform/(modules/(ac|grafana-dashboards)/|main\.tf$|variables\.tf$|outputs\.tf$)|tests/lints/terraform-prod-drift/fixtures/heredoc-jsonencode-error/)'
+        exclude: '^(terraform/(modules/(ac|grafana-dashboards)/|[^/]+\.tf$)|tests/lints/terraform-prod-drift/fixtures/heredoc-jsonencode-error/)'

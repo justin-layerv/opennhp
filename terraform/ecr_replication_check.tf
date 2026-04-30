@@ -266,12 +266,16 @@ resource "aws_cloudwatch_event_target" "ecr_replication_check" {
   # 24h / 185 attempts). Paired with `aws_lambda_function_event_invoke_
   # config { maximum_retry_attempts = 0 }` below, no failed delivery
   # can accumulate and land while the next 15-min tick is also running.
-  # `maximum_event_age_in_seconds` would be a no-op alongside
-  # `maximum_retry_attempts = 0` (no retries means no aging) so it's
-  # omitted; the Lambda-side `event_invoke_config` carries the
-  # corresponding 60s bound where it actually applies.
+  # `maximum_event_age_in_seconds` is behaviorally a no-op alongside
+  # `maximum_retry_attempts = 0` (no retries means no aging), but
+  # PutTargets validation rejects values < 60 and the AWS provider
+  # sends the int zero-value when the field is omitted from a present
+  # `retry_policy` block. Set to the API minimum (60s) to satisfy
+  # validation; the Lambda-side `event_invoke_config` below carries
+  # the bound that actually applies.
   retry_policy {
-    maximum_retry_attempts = 0
+    maximum_retry_attempts       = 0
+    maximum_event_age_in_seconds = 60
   }
 }
 
