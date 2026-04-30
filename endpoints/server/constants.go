@@ -7,20 +7,16 @@ import (
 )
 
 const (
-	MaxACConnsPerID = 10 // max AC connections per AC ID (blue/green)
-	// MaxConcurrentConnection caps both remoteConnectionMap (keyed by
-	// IP:port — counts unique connection tuples) and blockAddrMap
-	// (keyed by IP only post-#1160 T3-12 — counts unique source IPs).
-	// Under the old IP:port keying for blockAddrMap, a port-rotating
-	// attacker on a single source IP could singlehandedly fill the
-	// block-map cap; the IP-only keying made this constant's name
-	// closer to its effective semantics for the block-map case.
-	// NOTE(#1504): remoteConnectionMap still keys on IP:port and is
-	// still vulnerable to the same pattern. When #1504 lands and
-	// re-keys remoteConnectionMap, this comment block should be
-	// trimmed to the steady-state "both maps key on IP" form.
-	MaxConcurrentConnection         = 20480
-	OverloadConnectionThreshold     = MaxConcurrentConnection * 4 / 5      // 80%
+	MaxACConnsPerID             = 10                              // max AC connections per AC ID (blue/green)
+	MaxConcurrentConnection     = 20480                           // global cap on remoteConnectionMap and blockAddrMap entries; per-IP fairness via MaxAgentConnsPerIP
+	OverloadConnectionThreshold = MaxConcurrentConnection * 4 / 5 // 80%
+	// MaxAgentConnsPerIP: per-source-IP cap on agent UdpConn entries
+	// (AC/DB bypass via the IP gate in admitNewConnection). 16 leaves
+	// headroom for a small-office NAT (~10 simultaneous knockers);
+	// evictions on legit traffic should be near-zero. Sustained
+	// MetricAgentConnPerIPEvictions on a known-NAT IP argues for
+	// raising the cap once #1526 makes it configurable.
+	MaxAgentConnsPerIP              = 16
 	BlockAddrRefreshRate            = 20                                   // 20 seconds
 	BlockAddrExpireTime             = 90                                   // 90 seconds
 	PreCheckThreatCountBeforeBlock  = 5                                    // block source address if packet precheck errors exceeds this count
@@ -29,6 +25,13 @@ const (
 	DefaultDBConnectionTimeoutMs    = common.ServerSideConnectionTimeoutMs // 300 seconds to delete idle connection
 	PacketQueueSizePerConnection    = 256
 )
+
+// Compile-time assertion that MaxAgentConnsPerIP ≥ 1. The eviction
+// loop in admitNewConnection assumes a non-empty bucket implies a
+// non-nil Front; if the cap is ever set to 0, this constant fails to
+// compile. Replace with a config-load clamp once #1526 makes the cap
+// dynamic.
+const _ = uint(MaxAgentConnsPerIP - 1)
 
 // http APIs
 const (

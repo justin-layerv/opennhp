@@ -511,6 +511,29 @@ gate, etc.), the PR that ships it should also:
    `ssm_probe.go` with the command as a Go constant. Get review
    from `justin@layerv.ai`.
 
+## Lock Order (server)
+
+When acquiring multiple mutexes in `endpoints/server/`, follow this order
+to prevent deadlocks. New code that takes locks in a different order
+must update this list and audit all existing call sites.
+
+- **Peer maps before peers**: `acPeerMapMutex` / `dbPeerMapMutex` /
+  `agentPeerMapMutex` are acquired before any `peer.Lock()` (which
+  `MatchesIP`, `RecvAddr`, `UpdateRecv`, `LastSendTime`, etc. take
+  internally). Do not invert: `isKnownPeerIP` (`udpserver.go`) holds
+  the map mutex while iterating peers, and a reverse-order site would
+  deadlock against it.
+- **`remoteConnectionMapMutex` is leaf-most for the conn lifecycle**:
+  no other mutex is acquired while holding it. The connection
+  routine's defer takes it briefly to remove the global-map entry.
+- **`acConnectionMapMutex` then `remoteConnectionMapMutex`, never
+  reversed.** `HandleACOnline`'s stale-conn cleanup acquires
+  `acConnectionMapMutex` first to find the stale entry, releases it,
+  then acquires `remoteConnectionMapMutex` to remove the global-map
+  entry. Holding both at once would invert against the connection
+  routine's defer (which removes from `acConnectionMap` first, then
+  from `remoteConnectionMap` via `removeConnection`).
+
 ## Security Notes
 
 - Never commit secrets - use AWS Secrets Manager

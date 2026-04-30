@@ -107,7 +107,11 @@ func (w *WebRTCServer) setupDataChannel(dc *webrtc.DataChannel) {
 		log.Info("WebRTC data channel %d open", dc.ID())
 		recvTime := time.Now().UnixNano()
 		addr := &net.UDPAddr{IP: net.IPv4zero, Port: int(*dc.ID())}
-		conn := &UdpConn{isWebRTC: true, dc: dc}
+		// evictSignal is required for connectionRoutine's select to be
+		// well-formed but is intentionally unused for WebRTC: WebRTC
+		// conns bypass admitNewConnection and never enter the per-IP
+		// bucket, so the channel is never closed.
+		conn := &UdpConn{isWebRTC: true, dc: dc, evictSignal: make(chan struct{})}
 		conn.ConnData = &core.ConnectionData{
 			InitTime:             recvTime,
 			LastLocalRecvTime:    recvTime,

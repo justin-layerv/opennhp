@@ -139,13 +139,14 @@ const (
 
 // Multi-AC broadcast observability metric names (issue #376).
 const (
-	MetricBroadcastTotal       = "BroadcastTotal"       // total broadcast invocations
-	MetricBroadcastSuccess     = "BroadcastSuccess"     // at least one AC succeeded
-	MetricBroadcastAllFail     = "BroadcastAllFail"     // every AC in the broadcast failed
-	MetricBroadcastACLatencyMs = "BroadcastACLatencyMs" // per-AC operation duration within a broadcast
-	MetricACConnsPerID         = "ACConnsPerID"         // gauge: max AC connections across all AC IDs
-	MetricTotalACConns         = "TotalACConns"         // gauge: total AC connections across all AC IDs
-	MetricACConnEviction       = "ACConnEviction"       // MaxACConnsPerID eviction events
+	MetricBroadcastTotal          = "BroadcastTotal"          // total broadcast invocations
+	MetricBroadcastSuccess        = "BroadcastSuccess"        // at least one AC succeeded
+	MetricBroadcastAllFail        = "BroadcastAllFail"        // every AC in the broadcast failed
+	MetricBroadcastACLatencyMs    = "BroadcastACLatencyMs"    // per-AC operation duration within a broadcast
+	MetricACConnsPerID            = "ACConnsPerID"            // gauge: max AC connections across all AC IDs
+	MetricTotalACConns            = "TotalACConns"            // gauge: total AC connections across all AC IDs
+	MetricACConnEviction          = "ACConnEviction"          // MaxACConnsPerID eviction events
+	MetricAgentConnPerIPEvictions = "AgentConnPerIPEvictions" // MaxAgentConnsPerIP eviction events
 
 	// MetricACConnStaleFiltered counts AC connections skipped by the
 	// broadcast-time staleness filter (DefaultStaleACConnThreshold or its
@@ -653,7 +654,15 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	s.acConnectionMap[acId] = existingConns
 	s.acConnectionMapMutex.Unlock()
 
-	// Clean up stale connection outside the lock (if any)
+	// Clean up stale connection outside the lock (if any). The
+	// connectionRoutine defer's `perIPElem != nil` branch handles
+	// connectionsByIP cleanup for any conn that was bucketed at
+	// admit — AC, DB, or agent. In the cloud-mode dynamic-AC
+	// corner (#1533), an AC's first NHP_AOL packet from an
+	// unknown IP misclassifies as agent and lands in the bucket;
+	// that conn's perIPElem is non-nil and the routine's defer
+	// will pop it correctly. The direct delete here only touches
+	// remoteConnectionMap.
 	if staleConn != nil {
 		oldAddrStr := staleConn.ConnData.RemoteAddr.String()
 		s.remoteConnectionMapMutex.Lock()

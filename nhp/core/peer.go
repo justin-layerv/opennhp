@@ -227,6 +227,25 @@ func (p *UdpPeer) CheckRecvAddress(currTime int64, currAddr net.Addr) bool {
 	return false
 }
 
+// MatchesIP reports whether ipStr matches the peer's static configured
+// IP, last cached resolved IP, or last-known recv IP. No DNS, no port
+// comparison — used by the per-IP cap gate (#1504) to verify that a
+// packet claiming to be from a known peer (AC/DB header type) actually
+// originates from that peer's IP, before the conn is granted bypass
+// from MaxAgentConnsPerIP.
+func (p *UdpPeer) MatchesIP(ipStr string) bool {
+	p.Lock()
+	defer p.Unlock()
+
+	if p.Ip == ipStr || p.primaryResolvedIp == ipStr {
+		return true
+	}
+	if p.recvAddr != nil && p.recvAddr.IP.String() == ipStr {
+		return true
+	}
+	return false
+}
+
 // matchesKnownAddr reports whether addrStr matches either the peer's
 // recv address or its static/cached send address. Unlike SendAddr(),
 // this never triggers DNS resolution, making it safe to call while

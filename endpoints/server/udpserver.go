@@ -1,6 +1,7 @@
 package server
 
 import (
+	"container/list"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -137,7 +138,8 @@ type UdpServer struct {
 	// connection and remote transaction management
 
 	remoteConnectionMapMutex sync.Mutex
-	remoteConnectionMap      map[string]*UdpConn // indexed by remote UDP address
+	remoteConnectionMap      map[string]*UdpConn   // indexed by remote UDP address
+	connectionsByIP          map[string]*list.List // per-IP FIFO of agent *UdpConn for MaxAgentConnsPerIP eviction; AC/DB excluded
 
 	agentPeerMapMutex sync.Mutex
 	agentPeerMap      map[string]*core.UdpPeer // indexed by peer's public key base64 string
@@ -221,6 +223,11 @@ type UdpServer struct {
 	rateLimiter    *IPRateLimiter
 	rateLimitDrops atomic.Int64 // total dropped packets, for sampled logging
 
+	// Per-IP agent-conn eviction warning counter, for sampled logging.
+	// MetricAgentConnPerIPEvictions is the source of truth; this counter
+	// just throttles the warn-log to 1 + every 1000th eviction.
+	perIPEvictionWarns atomic.Int64
+
 	// Rate limiter for license validation (brute-force prevention).
 	licenseRateLimiter *LicenseRateLimiter
 }
@@ -235,6 +242,23 @@ type UdpConn struct {
 	isDBConnection bool // Immutable. Don't change it after creation. Conn object is also stored in dbConnectionMap which is indexed by DBId
 	isWebRTC       bool
 	dc             *webrtc.DataChannel
+
+	// perIPElem is the conn's slot in connectionsByIP[ip]; nil for AC/DB.
+	// Cleared on eviction so the cleanup defer doesn't double-pop.
+	perIPElem *list.Element
+
+	// evictSignal contract:
+	//   - MUST be non-nil for any UdpConn passed to connectionRoutine
+	//     or admitNewConnection. admitNewConnection panics on nil.
+	//   - Closed exactly once by admitNewConnection on per-IP cap
+	//     eviction; never closed by any other path.
+	//   - For AC/DB conns and WebRTC conns, the channel is allocated
+	//     for select-shape consistency but never closed (those paths
+	//     bypass the per-IP cap).
+	// Dedicated channel (rather than reusing SetTimeoutSignal) so the
+	// receive loop doesn't hold the map mutex across a connection
+	// routine that may be mid-WriteToUDP.
+	evictSignal chan struct{}
 }
 
 type ACConn struct {
@@ -564,6 +588,7 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	}
 
 	s.remoteConnectionMap = make(map[string]*UdpConn)
+	s.connectionsByIP = make(map[string]*list.List)
 	s.acConnectionMap = make(map[string][]*ACConn)
 	s.dbConnectionMap = make(map[string]*DBConn)
 	s.tokenStore = common.NewTokenStore[*ACTokenEntry]()
@@ -1224,11 +1249,20 @@ func (s *UdpServer) recvPacketRoutine() {
 			}
 			s.remoteConnectionMapMutex.Unlock()
 
-			isACConn := pkt.HeaderType == core.NHP_AOL
-			isDBConn := pkt.HeaderType == core.NHP_DOL
+			// Classify only on header type AND source-IP match against a
+			// configured peer. RecvPrecheck only validates header bytes,
+			// so an attacker can set NHP_AOL/NHP_DOL on rotated-port
+			// packets — without the IP gate they would bypass the per-IP
+			// cap and inherit the AC/DB 300s idle timeout. The crypto
+			// identity check (HMAC/ECDH) runs later in HandleACOnline /
+			// HandleDBOnline, after this Conn is already allocated, so
+			// the gate has to live here at admit. See #1504.
+			isACConn := pkt.HeaderType == core.NHP_AOL && s.isKnownACPeerIP(ipStr)
+			isDBConn := pkt.HeaderType == core.NHP_DOL && s.isKnownDBPeerIP(ipStr)
 			conn = &UdpConn{
 				isACConnection: isACConn,
 				isDBConnection: isDBConn,
+				evictSignal:    make(chan struct{}),
 			}
 			// setup new routine for connection
 			conn.ConnData = &core.ConnectionData{
@@ -1255,9 +1289,7 @@ func (s *UdpServer) recvPacketRoutine() {
 				conn.ConnData.TimeoutMs = DefaultDBConnectionTimeoutMs
 				log.Debug("Received new db connection from %s", addrStr)
 			}
-			s.remoteConnectionMapMutex.Lock()
-			s.remoteConnectionMap[addrStr] = conn
-			s.remoteConnectionMapMutex.Unlock()
+			s.admitNewConnection(conn, addrStr)
 
 			conn.ConnData.RecvQueue <- pkt
 
@@ -1270,7 +1302,174 @@ func (s *UdpServer) recvPacketRoutine() {
 	}
 }
 
+// isKnownACPeerIP reports whether ipStr matches the configured IP,
+// last resolved IP, or last recv IP of any peer in acPeerMap. Used at
+// admit time to gate the per-IP cap bypass for NHP_AOL header types
+// so an attacker can't claim AC status from a random source IP.
+//
+// The s.acPeerMap field is read inside the lock — config.go's
+// updatePeers reassigns the field (`*peerMap = newMap`) under the
+// same mutex on reload, so reading the field before acquiring the
+// mutex would race. This is why the helper takes no map argument
+// and reads the field directly.
+//
+// Lock order: acPeerMapMutex first, then peer.Lock() inside MatchesIP.
+// O(n_peers) scan is fine today (n < 50 in prod) but consider an
+// IP-keyed sibling map if the peer count grows — see #1529.
+func (s *UdpServer) isKnownACPeerIP(ipStr string) bool {
+	s.acPeerMapMutex.Lock()
+	defer s.acPeerMapMutex.Unlock()
+	for _, peer := range s.acPeerMap {
+		if peer.MatchesIP(ipStr) {
+			return true
+		}
+	}
+	return false
+}
+
+// isKnownDBPeerIP is the DB equivalent of isKnownACPeerIP. Same race
+// considerations apply to s.dbPeerMap.
+func (s *UdpServer) isKnownDBPeerIP(ipStr string) bool {
+	s.dbPeerMapMutex.Lock()
+	defer s.dbPeerMapMutex.Unlock()
+	for _, peer := range s.dbPeerMap {
+		if peer.MatchesIP(ipStr) {
+			return true
+		}
+	}
+	return false
+}
+
+// admitNewConnection registers conn in remoteConnectionMap. For agent
+// conns it also enforces MaxAgentConnsPerIP via a FIFO list per source
+// IP, closing the oldest entry's evictSignal when the bucket is full.
+// AC and DB conns bypass the per-IP cap because (a) they pass an
+// identity gate before being trusted and (b) capping them would risk
+// evicting the live AC during blue/green NAT churn from one source IP.
+// The caller is responsible for the global MaxConcurrentConnection
+// check upstream.
+//
+// Eviction is asynchronous: closing evictSignal wakes the evictee's
+// routine, which removes the global-map entry on its defer. Until that
+// runs, packets arriving at the evictee's addrStr still resolve to the
+// evictee and land in its (no-longer-drained) RecvQueue, where they're
+// released by Close()'s flush. This is intentional — a synchronous
+// delete here would race the evictee mid-WriteToUDP, which is exactly
+// the case the dedicated channel was chosen to avoid. Steady-state
+// per-IP live agent conns are bounded by MaxAgentConnsPerIP; transient
+// in-flight cleanup may briefly add to global-map size by an amount
+// bounded by goroutine scheduling latency plus Go's pseudo-random
+// select bias when multiple cases are ready (RecvQueue plus
+// evictSignal both fire under sustained traffic to the evicted addr,
+// so the routine may drain a few packets before the evictSignal case
+// wins).
+//
+// Eviction policy is FIFO (oldest-by-admit-time) rather than LRU. A
+// legit client that connected first behind a NAT shared with an
+// attacker will be evicted before the attacker's later conns. The
+// trade-off was made explicitly in #1504 — LRU-on-last-recv is a
+// follow-up if the eviction-of-legit-clients pattern shows up in
+// MetricAgentConnPerIPEvictions correlated with a known-NAT'd IP.
+//
+// Cloud-mode dynamic AC registration corner: a brand-new AC whose IP
+// isn't yet in acPeerMap (no static config, no prior recv, no resolved
+// hostname) misclassifies as agent on its first NHP_AOL packet. Under
+// concurrent same-IP attack it can be FIFO-evicted before
+// HandleACOnline registers it. The AC retries; once registered, the
+// IP gate succeeds. Watch MetricAgentConnPerIPEvictions correlated
+// with AC IPs after rollout — sustained eviction of cloud-mode ACs
+// would argue for a registration-bootstrap exception.
+func (s *UdpServer) admitNewConnection(conn *UdpConn, addrStr string) {
+	if conn.evictSignal == nil {
+		// Defense in depth: a nil evictSignal would silently disable
+		// eviction (select on nil never fires), so a future UdpConn
+		// literal that forgets the field would leak conns out of the
+		// per-IP cap. Panic at admit so the bug surfaces immediately
+		// instead of as a slow conn leak under attack.
+		panic("admitNewConnection: conn.evictSignal must be initialized")
+	}
+	var evictedAddr string
+	s.remoteConnectionMapMutex.Lock()
+	s.remoteConnectionMap[addrStr] = conn
+	if !conn.isACConnection && !conn.isDBConnection {
+		ipStr := conn.ConnData.RemoteAddr.IP.String()
+		bucket, ok := s.connectionsByIP[ipStr]
+		if !ok {
+			bucket = list.New()
+			s.connectionsByIP[ipStr] = bucket
+		}
+		if bucket.Len() >= MaxAgentConnsPerIP {
+			// MaxAgentConnsPerIP ≥ 1 is enforced at compile time
+			// (constants.go) so Front is always non-nil here.
+			front := bucket.Front()
+			evicted := front.Value.(*UdpConn)
+			bucket.Remove(front)
+			evicted.perIPElem = nil
+			evictedAddr = evicted.ConnData.RemoteAddr.String()
+			close(evicted.evictSignal)
+		}
+		conn.perIPElem = bucket.PushBack(conn)
+	}
+	s.remoteConnectionMapMutex.Unlock()
+
+	if evictedAddr != "" {
+		// evictedAddr is set only when the lock-held branch popped a
+		// front entry from a full bucket — i.e. an eviction occurred.
+		// Sample the log: under sustained port-rotation an attacker
+		// can drive evictions at the rate-limit ceiling (~25/s/IP);
+		// MetricAgentConnPerIPEvictions is the source of truth, the
+		// log just gives operators an entry point. Same shape as
+		// rateLimitDrops.
+		evictions := s.perIPEvictionWarns.Add(1)
+		if evictions == 1 || evictions%1000 == 0 {
+			log.Warning("Per-IP agent connection cap (%d) reached, evicting oldest %s (total: %d)",
+				MaxAgentConnsPerIP, evictedAddr, evictions)
+		}
+		s.metrics.IncrCounter(MetricAgentConnPerIPEvictions)
+	}
+}
+
+// removeConnection drops conn from remoteConnectionMap and (if it's an
+// agent conn that wasn't already evicted) from connectionsByIP. Called
+// only from the connection routine's defer. The map delete is gated on
+// pointer equality: between eviction-close and this defer, a new conn
+// can be admitted at the same addrStr (NAT/CGNAT rebinding to the same
+// (srcIP, srcPort) tuple after the evictee's perceived flow ends, or
+// any path that allocates a fresh tuple at the same key). Without the
+// guard the evictee's defer would orphan the new conn from the lookup
+// map.
+func (s *UdpServer) removeConnection(conn *UdpConn, addrStr string) {
+	s.remoteConnectionMapMutex.Lock()
+	defer s.remoteConnectionMapMutex.Unlock()
+
+	if existing, ok := s.remoteConnectionMap[addrStr]; ok && existing == conn {
+		delete(s.remoteConnectionMap, addrStr)
+	}
+	if conn.perIPElem != nil {
+		ipKey := conn.ConnData.RemoteAddr.IP.String()
+		if bucket := s.connectionsByIP[ipKey]; bucket != nil {
+			bucket.Remove(conn.perIPElem)
+			if bucket.Len() == 0 {
+				delete(s.connectionsByIP, ipKey)
+			}
+		}
+		conn.perIPElem = nil
+	}
+	if len(s.remoteConnectionMap) <= OverloadConnectionThreshold {
+		s.device.SetOverload(false)
+	}
+}
+
 func (s *UdpServer) connectionRoutine(conn *UdpConn) {
+	if conn.evictSignal == nil {
+		// Defense in depth: if a future code path constructs a UdpConn
+		// and starts a routine without going through admitNewConnection
+		// (which has its own nil-check), a nil evictSignal would silently
+		// disable the eviction case in the select below — select on nil
+		// channel never fires. See evictSignal contract on UdpConn.
+		panic("connectionRoutine: conn.evictSignal must be initialized")
+	}
+
 	addrStr := conn.ConnData.RemoteAddr.String()
 
 	defer s.wg.Done()
@@ -1303,13 +1502,7 @@ func (s *UdpServer) connectionRoutine(conn *UdpConn) {
 			s.dbConnectionMapMutex.Unlock()
 		}
 
-		// remove the udp conn from remoteConnectionMap
-		s.remoteConnectionMapMutex.Lock()
-		delete(s.remoteConnectionMap, addrStr)
-		if len(s.remoteConnectionMap) <= OverloadConnectionThreshold {
-			s.device.SetOverload(false)
-		}
-		s.remoteConnectionMapMutex.Unlock()
+		s.removeConnection(conn, addrStr)
 
 		conn.Close()
 	}()
@@ -1317,6 +1510,10 @@ func (s *UdpServer) connectionRoutine(conn *UdpConn) {
 	for {
 		select {
 		case <-s.signals.stop:
+			return
+
+		case <-conn.evictSignal:
+			log.Debug("Connection routine: %s evicted by per-IP cap", addrStr)
 			return
 
 		case <-conn.ConnData.SetTimeoutSignal:
