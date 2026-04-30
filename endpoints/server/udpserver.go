@@ -135,6 +135,16 @@ type UdpServer struct {
 	// Concurrency: same contract as licensePubkeyVerifyRequire.
 	licenseACIDCustomerVerifyRequire bool
 
+	// acPubkeyRevokeVerifyRequire gates strict-mode rejection of AC
+	// registrations whose presented static pubkey appears in
+	// ACAssignment.RevokedPubKeys for the claimed acId. Read once at
+	// Start from ACPubkeyRevokeVerifyEnvVar — see
+	// ac_pubkey_revoke_gate.go for the gate policy and #1507 (parent
+	// #1157 F5) for the threat model.
+	//
+	// Concurrency: same contract as licensePubkeyVerifyRequire.
+	acPubkeyRevokeVerifyRequire bool
+
 	// connection and remote transaction management
 
 	remoteConnectionMapMutex sync.Mutex
@@ -383,6 +393,29 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	} else {
 		log.Info("License-customer cross-check gate: permit mode (#1157 F4); watch %s (attack) and %s (storage flap) before flipping NHP_LICENSE_ACID_CUSTOMER_VERIFY=true",
 			MetricLicenseCustomerMismatch, MetricLicenseCustomerLookupErr)
+	}
+
+	// Parse NHP_AC_PUBKEY_REVOKE_VERIFY (#1507, parent #1157 F5).
+	// Fail Start on an unrecognized token so an operator typo cannot
+	// silently leave the gate in permit mode. See
+	// ac_pubkey_revoke_gate.go.
+	s.acPubkeyRevokeVerifyRequire, err = parseACPubkeyRevokeVerify(os.Getenv(ACPubkeyRevokeVerifyEnvVar))
+	if err != nil {
+		return fmt.Errorf("%s: %w", ACPubkeyRevokeVerifyEnvVar, err)
+	}
+	if s.acPubkeyRevokeVerifyRequire {
+		// Strict-flip prerequisites (see docs/runbooks/f5-revoked-pubkey-paging.md):
+		// 1. ACPubkeyRevoked metric stays at zero through a full
+		//    permit-mode deploy cycle.
+		// 2. CloudWatch alarms (#1543) on ACPubkeyRevoked,
+		//    ACPubkeyRevokedLookupErr, ACPubkeyRevokeListOversize,
+		//    LicenseValidationRateLimited are provisioned and OK.
+		// 3. ACAssignment pre-provisioning (#1262) lands so F4 + F5
+		//    strict can flip together without the TOFU race.
+		log.Info("AC pubkey revoke gate: strict mode (#1507); revoked pubkey rejects with 52019")
+	} else {
+		log.Info("AC pubkey revoke gate: permit mode (#1507); watch %s (revoked-pubkey hits) and %s (storage flap) before flipping NHP_AC_PUBKEY_REVOKE_VERIFY=true",
+			MetricACPubkeyRevoked, MetricACPubkeyRevokedLookupErr)
 	}
 
 	// Initialize pluggable storage backend (DynamoDB or etcd)

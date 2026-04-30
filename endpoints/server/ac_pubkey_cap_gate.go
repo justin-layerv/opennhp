@@ -110,6 +110,15 @@ func parseACPubkeyCapVerify(raw string) (bool, error) {
 // RLock) and the F3 in-lock authoritative check (under Lock); the
 // kernel below dedupes, so duplicates from blue/green re-registration
 // don't perturb the verdict.
+//
+// Cross-test dependency: TestHandleACOnline_F5_BypassedInNonCloudMode
+// (handle_ac_online_f5_test.go) relies on the in-lock F3 cap reject
+// as the early-exit driver for the non-cloud case. If a future
+// refactor hoists the in-lock check out of cloudMode, changes the
+// strict-mode default, or otherwise alters the cap-reject behavior,
+// pair-debug that test — its load-bearing assertion
+// (mem.GetCallCount("GetACAssignment") == 0) survives, but the
+// errors.Is(err, ErrACPubkeyCapExceeded) assertion would mis-fire.
 func extractPubkeysFromConns(conns []*ACConn) []string {
 	out := make([]string, 0, len(conns))
 	for _, c := range conns {

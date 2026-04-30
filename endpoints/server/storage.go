@@ -75,6 +75,24 @@ type ACAssignment struct {
 	CreatedAt       int64        `json:"created_at" dynamodbav:"created_at"`
 	LastSeen        int64        `json:"last_seen" dynamodbav:"last_seen"`
 	TTL             *int64       `json:"ttl,omitempty" dynamodbav:"ttl,omitempty"` // Unix timestamp for DynamoDB TTL
+	// RevokedPubKeys is the per-acId denylist of padded standard
+	// base64 AC static public keys rejected at registration (#1507).
+	//
+	// DDB encoding: `,stringset` forces a String Set (SS) so the
+	// operator runbook can use idempotent ADD / DELETE update
+	// expressions. Round-trip is fenced by
+	// TestACAssignment_RevokedPubKeys_RoundTripsAsStringSet — a
+	// future tag-edit that flips encoding back to L (List) would
+	// silently fail to unmarshal hand-written SS rows, so the test
+	// surfaces the regression at PR time.
+	//
+	// Construction contract: callers MUST use nil for the empty
+	// case, NOT []string{}. The SDK encodes nil as "attribute
+	// omitted" and []string{} as "attribute NULL"; both are
+	// DDB-accepted but create silent shape divergence between rows.
+	// Clone() normalizes empty → nil; #1536's CLI must do the same
+	// on the write path so this isn't load-bearing.
+	RevokedPubKeys []string `json:"revoked_pubkeys,omitempty" dynamodbav:"revoked_pubkeys,omitempty,stringset"`
 }
 
 // Clone returns a copy of the assignment, safe to mutate without
@@ -93,6 +111,16 @@ func (a *ACAssignment) Clone() *ACAssignment {
 	if a.AssignedServers != nil {
 		clone.AssignedServers = make([]ServerInfo, len(a.AssignedServers))
 		copy(clone.AssignedServers, a.AssignedServers)
+	}
+	// Normalize empty → nil per the RevokedPubKeys construction
+	// contract above. The `clone := *a` above shallow-copies the
+	// slice header, so a non-nil empty input would otherwise survive
+	// as a non-nil empty slice in the clone.
+	if len(a.RevokedPubKeys) > 0 {
+		clone.RevokedPubKeys = make([]string, len(a.RevokedPubKeys))
+		copy(clone.RevokedPubKeys, a.RevokedPubKeys)
+	} else {
+		clone.RevokedPubKeys = nil
 	}
 	return &clone
 }

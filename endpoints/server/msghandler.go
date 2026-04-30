@@ -106,14 +106,32 @@ const (
 	//     transients as designed; rollout is healthy.
 	//   - GraceAbsorbed up AND KnockNoAC up   → AC cluster is actually
 	//     broken and the grace window is masking it; page oncall.
-	MetricACGraceAbsorbed              = "ACGraceAbsorbed"
-	MetricACRegistrationSuccess        = "ACRegistrationSuccess"
-	MetricACRegistrationFailure        = "ACRegistrationFailure"
-	MetricACRegistrationLatency        = "ACRegistrationLatency"
-	MetricBroadcastPartialFail         = "BroadcastPartialFail"
-	MetricBroadcastDurationMs          = "BroadcastDurationMs"
-	MetricLicenseValidationRateLimited = "LicenseValidationRateLimited"
-	MetricASGFilterFailOpen            = "ASGFilterFailOpen"
+	MetricACGraceAbsorbed       = "ACGraceAbsorbed"
+	MetricACRegistrationSuccess = "ACRegistrationSuccess"
+	MetricACRegistrationFailure = "ACRegistrationFailure"
+	MetricACRegistrationLatency = "ACRegistrationLatency"
+	MetricBroadcastPartialFail  = "BroadcastPartialFail"
+	MetricBroadcastDurationMs   = "BroadcastDurationMs"
+	// MetricLicenseValidationRateLimited fires from BOTH call sites:
+	// the hoisted preflight check (closes the F5 amplification
+	// surface) AND the deeper in-validateACLicense check. It's the
+	// aggregate signal — operators tracking total rate-limited AOL
+	// volume read this counter. Both emissions go through
+	// CheckRateLimit so a single rate-limited packet fires the
+	// counter exactly once.
+	//
+	// MetricLicenseValidationRateLimitedAtPreflight is the
+	// preflight-only split, so an operator can tell whether a
+	// LicenseValidationRateLimited spike during the F5 burn-in is
+	// the new hoist behavior catching shared-NAT noise (preflight
+	// counter rises) or a real attack pattern hitting the deeper
+	// check too (gap between the two counters narrows). Both fire
+	// for the same packet at the preflight site (so preflight
+	// counter <= aggregate counter); the difference is the spike
+	// signature.
+	MetricLicenseValidationRateLimited            = "LicenseValidationRateLimited"
+	MetricLicenseValidationRateLimitedAtPreflight = "LicenseValidationRateLimitedAtPreflight"
+	MetricASGFilterFailOpen                       = "ASGFilterFailOpen"
 
 	// MetricTransactionClosed counts every SendMessage / SendPacket
 	// call that returns common.ErrTransactionClosed because the
@@ -438,6 +456,14 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	// Check if AC should be redirected to its assigned servers (per-AC server assignment).
 	// This only applies when storage is configured and AC provides a license key.
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md section 6.2 for details.
+	//
+	// TODO(#1541): handleACServerAssignment runs BEFORE the rate-limit
+	// hoist below and calls GetACAssignment unconditionally when
+	// LicenseKey != "". CachedStorage doesn't cache NotFound, so an
+	// attacker spamming AOL with a non-empty LicenseKey + unknown
+	// acId can drive one DDB read per packet through this path —
+	// the F5 hoist closes the empty-LicenseKey amplification but not
+	// this one. Tracked as a hardening follow-up.
 	var assignedPeers []common.RedirectTarget
 	if s.storage != nil && aolMsg.LicenseKey != "" {
 		redirected, peers, ardErr := s.handleACServerAssignment(ppd, aolMsg, transactionId, addrStr)
@@ -510,6 +536,81 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 			s.recordLicenseFailure(addrStr, acId)
 			s.sendACOnlineRejectAAK(ppd, transactionId, capRejectErr, acId, addrStr, "cap-reject")
 			return capRejectErr
+		}
+	}
+
+	// #1507 F5 pubkey-revocation pre-check. Runs before
+	// validateACLicense so a revoked pubkey doesn't pay bcrypt cost
+	// (same no-bcrypt-on-attack invariant as F3). The lookup runs
+	// in permit mode too — operators rely on the metric as the
+	// rollout signal, so gating it on strict (as F3 does) would
+	// silence the very signal the rollout window depends on. See
+	// ac_pubkey_revoke_gate.go for threat model and storage-error
+	// policy.
+	//
+	// Rate-limit hoist: CachedStorage does not cache NotFound, so
+	// an attacker spamming AOL with random unknown acIds and empty
+	// LicenseKey would otherwise drive one DDB read per packet via
+	// F5 before validateACLicense's rate-limiter threw them out.
+	// Hoisting CheckRateLimit BEFORE F5's lookup caps per-source
+	// DDB cost at MaxFailuresPerIP. The hoist runs on every
+	// cloudMode AOL — including the acPeer != nil re-registration
+	// path that previously skipped rate-limiting entirely. That's
+	// deliberate: a source IP the rate limiter is throttling is the
+	// right population to throttle on re-register too, AND
+	// re-registration is the precise moment a revocation must take
+	// effect. validateACLicense keeps its own check as a redundant
+	// safety net — DO NOT remove this hoist on the assumption that
+	// the deeper check covers it: removing the hoist re-opens the
+	// per-packet DDB amplification surface for unknown acIds.
+	// Fenced by TestHandleACOnline_F5RateLimitHoist_SkipsLookupOnRateLimited.
+	//
+	// handleACServerAssignment above also calls GetACAssignment
+	// (gated on LicenseKey != ""); that path is pre-existing and
+	// not covered by this hoist — tracked as #1541.
+	if cloudMode {
+		if s.licenseRateLimiter != nil {
+			if rlErr := s.licenseRateLimiter.CheckRateLimit(addrStr, acId); rlErr != nil {
+				// Tag as [ac-online/preflight] — this is a
+				// rate-limiter reject, not an F5 reject.
+				log.Warning("server-ac(%s#%d@%s)[ac-online/preflight] %s",
+					acId, transactionId, addrStr, rlErr.Message)
+				s.metrics.IncrCounter(MetricLicenseValidationRateLimited)
+				s.metrics.IncrCounter(MetricLicenseValidationRateLimitedAtPreflight)
+				s.sendACOnlineRejectAAK(ppd, transactionId, common.ErrServerACOpsFailed, acId, addrStr, "rate-limited")
+				return common.ErrServerACOpsFailed
+			}
+		}
+		f5Ctx, f5Cancel := udpCorrelationCtx(DefaultStorageTimeout, acId, transactionId)
+		f5Verdict := s.evaluateACPubkeyRevokeVerdict(f5Ctx, acId, acPubkeyBase64, transactionId, addrStr)
+		// Inline cancel after the lookup — the ctx is not used past
+		// this point. udpCorrelationCtx uses context.WithTimeout
+		// which arms a time.AfterFunc; defer-until-function-return
+		// would leave that timer pending through validateACLicense
+		// (bcrypt), the in-lock F3 check, AddACPeer, and the rest of
+		// registration. Inline cancel disarms the timer at the
+		// natural boundary.
+		f5Cancel()
+		f5Proceed, f5RejectErr := s.applyACPubkeyRevokeVerdict(f5Verdict, acId, acPubkeyBase64, transactionId, addrStr)
+		if !f5Proceed {
+			// Feed the license rate limiter on a real revocation
+			// reject so an attacker burning a stolen pubkey against a
+			// revoked entry is throttled by the same per-source /
+			// per-acId throttle as F3 / validateACLicense rejects. Do
+			// NOT feed it on the fail-closed default branch
+			// (ErrACPubkeyRevokedInternal): that error fires only
+			// when a future verdict constant is added but not
+			// registered in applyACPubkeyRevokeVerdict's switch — a
+			// server-side dispatch-table bug. Coupling that signal to
+			// the rate limiter would dilute the
+			// LicenseValidationRateLimited alarm with bug-driven
+			// throttling and mislead an operator into reading "spike
+			// during a 52020 storm" as attacker activity.
+			if errors.Is(f5RejectErr, common.ErrACPubkeyRevoked) {
+				s.recordLicenseFailure(addrStr, acId)
+			}
+			s.sendACOnlineRejectAAK(ppd, transactionId, f5RejectErr, acId, addrStr, "revoke-reject")
+			return f5RejectErr
 		}
 	}
 
@@ -1366,6 +1467,20 @@ func (s *UdpServer) validateACLicense(
 	// RATE LIMITING: Check if this source IP or AC ID has exceeded the failure threshold.
 	// This runs BEFORE the expensive bcrypt operation to save resources under attack.
 	// Rate-limited requests still return the generic error to avoid leaking information.
+	//
+	// Post-#1507: this check is functionally redundant with the
+	// cloud-mode F5 hoist at HandleACOnline (msghandler.go ~570),
+	// which runs the same check before validateACLicense is even
+	// reached. validateACLicense itself is invoked only from the
+	// `acPeer == nil && cloudMode` branch, so any cloud-mode
+	// AOL that gets here has already passed the hoist's
+	// CheckRateLimit. The check is kept anyway as a redundant
+	// safety net in case the F5 hoist is ever removed in a future
+	// refactor — defense-in-depth at the cost of one extra
+	// CheckRateLimit on the cold-registration path (cheap, in-
+	// memory). Removing it would force a future refactor to revert
+	// the hoist atomically; keeping it lets the two checks be
+	// audited and modified independently.
 	if s.licenseRateLimiter != nil {
 		if rlErr := s.licenseRateLimiter.CheckRateLimit(addrStr, acId); rlErr != nil {
 			log.Warning("server-ac(%s#%d@%s)[validateACLicense] %s",

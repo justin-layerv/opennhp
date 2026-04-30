@@ -180,6 +180,25 @@ var (
 	// ErrLicenseCustomerInternal — emitted by the same gate's
 	// fail-closed default branch (unknown verdict).
 	ErrLicenseCustomerInternal = newError("52018", "license customer gate internal error (unknown verdict)")
+	// ErrACPubkeyRevoked — emitted by the AC-pubkey runtime-revocation
+	// gate (#1507, follow-up from #1157 F5) under strict mode when the
+	// presented static pubkey appears in ACAssignment.RevokedPubKeys
+	// for the claimed acId. Lets an operator yank a specific AC
+	// instance at runtime without rotating the entire license — the
+	// pre-#1507 close-the-license workflow took effect only at the
+	// next AC re-registration AND was an all-or-nothing toggle that
+	// kicked legitimate ACs sharing the license. Agent-visible string
+	// stays issue-number-free so agent logs are grep-friendly; the
+	// server log line carries the #1507 reference.
+	ErrACPubkeyRevoked = newError("52019", "AC pubkey revoked for this AC ID")
+	// ErrACPubkeyRevokedInternal — emitted by the same gate's
+	// fail-closed default branch (unknown verdict). Same mechanical
+	// pattern as ErrACPubkeyCapInternal / ErrLicensePubkeyInternal: a
+	// future PR adds a new verdict constant and forgets to register
+	// it in the switch → gate rejects fail-closed AND surfaces a
+	// distinct error so the agent log doesn't blame revocation for
+	// what is actually a server-side dispatch-table bug.
+	ErrACPubkeyRevokedInternal = newError("52020", "AC pubkey revoke gate internal error (unknown verdict)")
 
 	// ac
 	ErrACOperationFailed       = newError("53001", "ac operation failed")

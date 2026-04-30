@@ -267,6 +267,20 @@ const permitModeLogSampleMod = 100
 // still handles it correctly: 0 % N == 0 means "log the first
 // attempt" — a benign overstate if ever reached.
 //
+// Distribution note: transaction IDs come from a monotonic
+// counter (NextCounterIndex / atomic.AddUint64), so the
+// trxId-mod-N sampling slot is uniform under any monotonically-
+// increasing source — every Nth transaction across the whole
+// process samples regardless of which AC, which gate, or which
+// header type produced it. A pathological case where one AC's
+// trxIDs always landed on non-sample slots would require that
+// AC's trxIDs to be aligned to N's complement (N=100, txIDs
+// always ≡ {1..99}), which can't happen with a global monotonic
+// counter. The per-process sync.Once anchors (firstPermitAC*,
+// firstLookupErrLog) bound the worst case at "at least one entry
+// per process per gate." If permitModeLogSampleMod ever moves
+// off a global counter to a per-AC source, revisit.
+//
 // The previous revision of this function had an explicit guard
 // against permitModeLogSampleMod==0 (divide-by-zero). A reviewer
 // correctly noted that with a compile-time constant the guard is
