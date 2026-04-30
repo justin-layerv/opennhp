@@ -500,11 +500,18 @@ echo "Setting up NHP firewall with ipset and iptables..."
 # - tempset: temporary entries for initial knock (configurable timeout, default 5s)
 # - defaultset: active sessions after successful knock (configurable timeout, default 120s)
 # - defaultset_down: downstream tracking (defaultset timeout + 1s)
-ipset -exist create defaultset hash:ip,port,ip counters maxelem 1000000 timeout ${ipset_default_timeout}
-ipset -exist create defaultset_down hash:ip,port,ip counters maxelem 1000000 timeout $((${ipset_default_timeout} + 1))
-ipset -exist create tempset hash:net,port counters maxelem 1000000 timeout ${ipset_temp_timeout}
+# maxelem caps kernel memory consumption from ipset population attacks
+# (#1160 T3-08); was 1,000,000. Default of 10,000 sized to the worst-case
+# legitimate ceiling: 80 pps sustained × 120s defaultset timeout ≈ 9,600
+# concurrent entries, rounded up. Sandbox/prod observe 0 at steady state;
+# the cap exists to bound the attack ceiling, not to track typical load.
+# Applied per-ipset; AC creates 6 sets (3 IPv4 + 3 IPv6), so worst-case
+# kernel residency per instance is 6 × ipset_max_elements.
+ipset -exist create defaultset hash:ip,port,ip counters maxelem ${ipset_max_elements} timeout ${ipset_default_timeout}
+ipset -exist create defaultset_down hash:ip,port,ip counters maxelem ${ipset_max_elements} timeout $((${ipset_default_timeout} + 1))
+ipset -exist create tempset hash:net,port counters maxelem ${ipset_max_elements} timeout ${ipset_temp_timeout}
 
-echo "IPv4 ipsets created successfully (defaultset timeout=${ipset_default_timeout}s, tempset timeout=${ipset_temp_timeout}s)"
+echo "IPv4 ipsets created successfully (defaultset timeout=${ipset_default_timeout}s, tempset timeout=${ipset_temp_timeout}s, maxelem=${ipset_max_elements})"
 
 # Create IPv6 ipsets (required for clients connecting via IPv6)
 # The NHP AC code uses *_v6 suffixed sets for IPv6 addresses.
@@ -513,9 +520,9 @@ IP6TABLES=$(which ip6tables 2>/dev/null)
 IPSET6_OK=0
 if [ -n "$IP6TABLES" ]; then
     echo "Setting up IPv6 ipsets..."
-    ipset -exist create defaultset_v6 hash:ip,port,ip family inet6 counters maxelem 1000000 timeout ${ipset_default_timeout} 2>/dev/null || true
-    ipset -exist create defaultset_down_v6 hash:ip,port,ip family inet6 counters maxelem 1000000 timeout $((${ipset_default_timeout} + 1)) 2>/dev/null || true
-    ipset -exist create tempset_v6 hash:net,port family inet6 counters maxelem 1000000 timeout ${ipset_temp_timeout} 2>/dev/null || true
+    ipset -exist create defaultset_v6 hash:ip,port,ip family inet6 counters maxelem ${ipset_max_elements} timeout ${ipset_default_timeout} 2>/dev/null || true
+    ipset -exist create defaultset_down_v6 hash:ip,port,ip family inet6 counters maxelem ${ipset_max_elements} timeout $((${ipset_default_timeout} + 1)) 2>/dev/null || true
+    ipset -exist create tempset_v6 hash:net,port family inet6 counters maxelem ${ipset_max_elements} timeout ${ipset_temp_timeout} 2>/dev/null || true
 
     # Verify IPv6 ipset creation
     IPSET6_OK=1

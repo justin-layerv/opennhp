@@ -146,6 +146,28 @@ variable "ipset_temp_timeout" {
   }
 }
 
+variable "ipset_max_elements" {
+  description = "Maximum number of entries per ipset (defaultset, tempset, etc.). Applied per-ipset; AC creates 6 sets (3 IPv4 + 3 IPv6), so worst-case kernel residency per instance is 6 × ipset_max_elements. Caps kernel memory consumption from ipset population attacks; was 1,000,000 before #1160 T3-08. Default of 10,000 sized to the worst-case legitimate ceiling: 80 pps sustained × 120s defaultset timeout ≈ 9,600 concurrent entries, rounded up. Sandbox and prod both observe 0 entries at steady state; the cap bounds the attack ceiling, not typical load."
+  type        = number
+  default     = 10000
+
+  validation {
+    # Lower bound 1,000: at the AC's tempset 5s timeout, 1k entries
+    # absorbs sustained ~200 pps of legitimate authorized clients —
+    # below that, a CPU-constrained dev environment would start
+    # evicting authorized clients via the tempset path under modest
+    # legitimate load. Floor signals an obvious typo (e.g., 100 or 0)
+    # rather than a sensible operational choice.
+    # Upper bound 1,000,000: pre-#1160 T3-08 default. Kernel handles
+    # this fine memory-wise but the cap loses its point as a
+    # population-attack backstop above this; raising further requires
+    # auditing the kernel allocator behavior for the specific ipset
+    # type (hash:ip,port,ip).
+    condition     = var.ipset_max_elements >= 1000 && var.ipset_max_elements <= 1000000
+    error_message = "ipset_max_elements must be between 1,000 (floor signals an obvious typo; below this the tempset evicts authorized clients under modest legitimate load) and 1,000,000 (pre-#1160 default; raising further loses the population-attack backstop the cap exists to provide)."
+  }
+}
+
 # ============================================================================
 # Cloud Mode Registration
 # AC registers with NHP servers using credentials for DynamoDB license validation

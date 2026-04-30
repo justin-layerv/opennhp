@@ -1,205 +1,212 @@
 package server
 
 import (
-	"net"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/hashicorp/golang-lru/v2/expirable"
 )
 
-// IPRateLimiter provides per-source-IP rate limiting for UDP packets using
-// a token bucket algorithm. It is designed for the hot path of packet
-// reception, so it minimizes allocations and lock contention.
+// IPRateLimiter is a per-source-IP token-bucket rate limiter for the UDP
+// receive path. It is the application-layer fallback for environments
+// without iptables hashlimit; the iptables hashlimit-burst and the app
+// burst should track each other in *config* (see user_data.sh.tpl) but
+// note the two layers diverge on *fresh-IP starter capacity*: iptables
+// grants the full configured burst on first sight, the app limiter
+// grants burst/2 (see #1160 T3-04 and the starter-capacity note below).
+// This limiter has no aggregate cap — the burst/2 starter still admits
+// 25 packets per fresh IP, so a sufficiently fast IP-rotating attacker
+// extracts O(rotation-rate × 25) packets that the app layer can't
+// stop. The iptables hashlimit aggregate cap (#1159) is the layer
+// that bounds the rotation budget; this file only defends the
+// per-IP envelope.
 //
-// This is the second layer of defense against UDP flood attacks. The first
-// layer is iptables hashlimit rules (configured in Terraform user_data
-// templates) which drop packets in the kernel before they reach userspace.
-// This application-level limiter serves as a fallback for environments where
-// iptables isn't configured and as defense-in-depth against iptables bugs.
-// Both layers use the same rate/burst defaults for consistency.
+// Buckets are lazily created on first packet from an IP and live in an
+// expirable.LRU keyed by IP string. The caller must pass
+// addr.IP.String() (which normalizes IPv4-mapped-IPv6) as the key;
+// note that net.IP.String drops the IPv6 zone identifier, so
+// link-local addresses from different interfaces collide — fine on
+// the production NLB path (link-local doesn't traverse it) but
+// surprising under local debugging. Same caveat as
+// preCheckThreatCache. The LRU bounds memory at MaxBuckets and ages
+// idle entries out at IdleTTL — same pattern as the precheck threat
+// cache (see precheck_threat_cache.go for the lifecycle caveat that
+// expirable.LRU does not expose Stop, so its sweep goroutine outlives
+// any individual UdpServer instance).
 //
-// Each source IP gets an independent token bucket. Buckets are lazily created
-// on first packet and periodically cleaned up when idle.
+// Behavior at MaxBuckets: when full, the LRU evicts its oldest entry
+// to admit a new IP. This is a deliberate change from a fail-closed
+// "drop new IPs once full" policy: under that policy, an IP-rotation
+// attacker who fills the table would lock out every subsequent legitimate
+// fresh source. Under LRU eviction, an evicted legitimate client
+// re-arriving simply gets a fresh burst/2 starter bucket — degraded
+// first-knock latency under pressure, but no lockout.
 //
-// Thread-safety: all methods are safe for concurrent use.
+// Fresh-IP starter capacity is half the burst rather than the full
+// burst (#1160 T3-04): an attacker rotating source IPs cannot extract
+// the full burst on first sight from each fresh IP. Half-burst was
+// chosen over a zero-token start because the agent retry loop sleeps
+// FailureRetryInterval (10s, nhp/core/constants.go) on each failed
+// transaction, so a strict zero-start would add a full 10s wait
+// before the first legitimate knock from an unseen IP would succeed
+// — unacceptable for interactive flows. The per-knock transaction
+// timeout (AgentLocalTransactionResponseTimeoutMs, 5s) bounds how
+// long the agent waits for a response before declaring failure.
+// With Burst=1
+// the starter math goes negative (starterTokens = 0.5, then -0.5
+// after consuming the current packet); the first packet still
+// returns true, but subsequent packets need to refill from a
+// negative balance — slightly stricter than nominal but not a bug,
+// and not a configuration that arises in production.
+//
+// Thread-safety: expirable.LRU is internally synchronized, but a
+// limiter-wide mutex still guards each Get-then-update sequence
+// against concurrent updaters racing on the same IP — without it,
+// two callers can each read tokens=N, each refill, and both write
+// the post-decrement value, double-counting.
 type IPRateLimiter struct {
 	mu      sync.Mutex
-	buckets map[string]*tokenBucket
+	buckets *expirable.LRU[string, *tokenBucket]
 
-	// Configuration (immutable after construction)
-	rate       float64 // tokens per second
-	burst      int     // max tokens (bucket capacity)
-	maxBuckets int     // max tracked IPs; beyond this, new IPs are dropped
-	idleTTL    time.Duration
-	stopCh     chan struct{}
-	stopped    atomic.Bool
+	rate  float64
+	burst int
 }
 
-// tokenBucket implements a token bucket rate limiter for a single IP.
-// It uses a lazy refill strategy: tokens are computed on-demand based on
-// elapsed time since the last check, avoiding per-tick goroutines.
+// tokenBucket is a single IP's lazy-refill token bucket. Tokens are
+// recomputed on demand from the elapsed wall-clock interval so there's
+// no per-bucket goroutine.
 type tokenBucket struct {
 	tokens   float64
 	lastTime time.Time
-	lastSeen time.Time // for idle cleanup
 }
 
-// RateLimiterConfig holds configuration for the per-IP rate limiter.
+// RateLimiterConfig holds tunables for the per-IP rate limiter.
 type RateLimiterConfig struct {
-	// Rate is the sustained packet rate (packets per second) allowed per source IP.
-	// Default: 100 pps.
+	// Rate is the sustained packet rate (pps) allowed per source IP.
 	Rate float64
 
-	// Burst is the maximum number of packets allowed in a single burst above
-	// the sustained rate. This accommodates legitimate traffic spikes (e.g.,
-	// NHP handshake involves multiple rapid packets).
-	// Default: 50 packets.
+	// Burst is the maximum bucket capacity. Legitimate NHP knocks send
+	// 3-5 rapid packets, so burst > 3 is required for normal operation.
 	Burst int
 
-	// CleanupInterval is how often idle buckets are swept.
-	// Default: 30 seconds.
-	CleanupInterval time.Duration
-
-	// IdleTTL is how long a bucket is kept after the last packet from that IP.
-	// Default: 120 seconds.
+	// IdleTTL is how long a bucket lives without a packet from the IP
+	// before expirable.LRU sweeps it. Bounded above by the LRU's own
+	// internal sweep cadence.
 	IdleTTL time.Duration
 
-	// MaxBuckets is the maximum number of tracked source IPs. When exceeded,
-	// packets from new (unseen) IPs are dropped. This caps memory usage during
-	// volumetric attacks with many spoofed source IPs.
-	// Default: 100,000 (~5MB at ~48 bytes per bucket).
+	// MaxBuckets caps tracked source IPs. Beyond this, expirable.LRU
+	// evicts the least-recently-used IP — a rotating attacker cannot
+	// lock out fresh legitimate sources by filling the table.
+	//
+	// Sized at 10_000 (#1160 T3-04, was 100_000): smaller than
+	// MaxConcurrentConnection (20_480, the blockAddrMap cap) because
+	// every fresh source IP visits this LRU but only repeat offenders
+	// (≥ PreCheckThreatCountBeforeBlock failures from one IP) reach
+	// the block map, so the rate-limiter table churns faster under
+	// IP rotation. Memory cost ~120 B/bucket → ~1-2 MiB at full
+	// 10k occupancy. Worst case for a large enterprise tenant with
+	// mobile/CGN churn (>10k unique IPs in a 120s window) is
+	// recoverable: one degraded first knock per re-admit, not a
+	// lockout. Revisit once #1505 telemetry lands.
 	MaxBuckets int
 }
 
-// DefaultRateLimiterConfig returns sensible defaults for NHP knock rate limiting.
-// 100 pps sustained with burst of 50 is generous for legitimate knock traffic
-// (a normal client sends ~3-5 packets per knock) while blocking volumetric DoS.
+// DefaultRateLimiterConfig returns the production defaults for NHP
+// knock rate limiting. 100 pps sustained with burst of 50 is generous
+// for legitimate clients in steady state (a knock is 3-5 packets);
+// fresh-IP starter capacity is burst/2 = 25 packets per the type
+// doc on IPRateLimiter (#1160 T3-04). 100 pps is well below the
+// rate at which volumetric DoS becomes interesting.
 //
-// IMPORTANT: These defaults must match the per-source-IP iptables hashlimit
-// rule in terraform/modules/compute/user_data.sh.tpl. Change both together.
-// The aggregate global cap added for #1159 is iptables-only today (no
-// app-level mirror) — see the comment block in user_data.sh.tpl for the
-// rationale and follow-up.
+// Rate and Burst should be kept in sync with the per-source-IP
+// iptables hashlimit rule in terraform/modules/compute/user_data.sh.tpl
+// — change both together. Note the *behavioral* asymmetry on a fresh
+// IP: iptables grants the full hashlimit-burst (50) on first sight,
+// the app limiter grants burst/2 (25). They converge once an IP has
+// been seen, so steady-state behavior matches; the divergence only
+// shows up in the "first knock from a never-seen-before IP under
+// active rotation flood" scenario, which is precisely when the app
+// limiter's stricter starter is doing useful work. The aggregate
+// global cap added for #1159 is iptables-only; see the comment
+// block in user_data.sh.tpl for follow-up.
 func DefaultRateLimiterConfig() RateLimiterConfig {
 	return RateLimiterConfig{
-		Rate:            100,
-		Burst:           50,
-		CleanupInterval: 30 * time.Second,
-		IdleTTL:         120 * time.Second,
-		MaxBuckets:      100_000,
+		Rate:       100,
+		Burst:      50,
+		IdleTTL:    120 * time.Second,
+		MaxBuckets: 10_000,
 	}
 }
 
-// NewIPRateLimiter creates a new per-IP rate limiter and starts its cleanup goroutine.
-// Call Stop() to release resources.
+// NewIPRateLimiter constructs a rate limiter from cfg. Zero-valued
+// fields fall back to DefaultRateLimiterConfig values.
+//
+// Lifecycle: each limiter starts an internal expirable.LRU sweep
+// goroutine that lives for the process — there is no Stop hook.
+// Production has one limiter per UdpServer, so this is a non-issue;
+// tests that construct many limiters in a loop will leak one
+// goroutine per construction. Same caveat as preCheckThreatCache.
+// Tracking issue #1515 covers a Close-able shim or upstream PR.
 func NewIPRateLimiter(cfg RateLimiterConfig) *IPRateLimiter {
+	defaults := DefaultRateLimiterConfig()
 	if cfg.Rate <= 0 {
-		cfg.Rate = 100
+		cfg.Rate = defaults.Rate
 	}
 	if cfg.Burst <= 0 {
-		cfg.Burst = 50
-	}
-	if cfg.CleanupInterval <= 0 {
-		cfg.CleanupInterval = 30 * time.Second
+		cfg.Burst = defaults.Burst
 	}
 	if cfg.IdleTTL <= 0 {
-		cfg.IdleTTL = 120 * time.Second
+		cfg.IdleTTL = defaults.IdleTTL
 	}
 	if cfg.MaxBuckets <= 0 {
-		cfg.MaxBuckets = 100_000
+		cfg.MaxBuckets = defaults.MaxBuckets
 	}
 
-	rl := &IPRateLimiter{
-		buckets:    make(map[string]*tokenBucket),
-		rate:       cfg.Rate,
-		burst:      cfg.Burst,
-		maxBuckets: cfg.MaxBuckets,
-		idleTTL:    cfg.IdleTTL,
-		stopCh:     make(chan struct{}),
+	return &IPRateLimiter{
+		buckets: expirable.NewLRU[string, *tokenBucket](cfg.MaxBuckets, nil, cfg.IdleTTL),
+		rate:    cfg.Rate,
+		burst:   cfg.Burst,
 	}
-
-	go rl.cleanupLoop(cfg.CleanupInterval)
-	return rl
 }
 
-// Allow checks whether a packet from the given address should be accepted.
-// Returns true if the packet is within rate limits, false if it should be dropped.
-//
-// The addr parameter should be the remote UDP address. Only the IP portion is
-// used for rate limiting (port is ignored) since NAT may assign different
-// source ports to packets from the same host.
-func (rl *IPRateLimiter) Allow(addr *net.UDPAddr) bool {
-	ip := addr.IP.String()
+// Allow returns true iff a packet from ip is within the configured
+// rate. Caller is the UDP recv loop, which has already converted
+// remoteAddr.IP to a stable string once per packet — passing it as a
+// string here keeps the conversion off this function (it would
+// otherwise run twice in close succession alongside isBlockedIP).
+func (rl *IPRateLimiter) Allow(ip string) bool {
 	now := time.Now()
 
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	b, exists := rl.buckets[ip]
-	if !exists {
-		// Cap tracked IPs to prevent memory exhaustion from spoofed source attacks
-		if len(rl.buckets) >= rl.maxBuckets {
-			return false
+	if b, ok := rl.buckets.Get(ip); ok {
+		elapsed := now.Sub(b.lastTime).Seconds()
+		b.tokens += elapsed * rl.rate
+		if b.tokens > float64(rl.burst) {
+			b.tokens = float64(rl.burst)
 		}
-		// First packet from this IP: create bucket with full tokens minus 1
-		b = &tokenBucket{
-			tokens:   float64(rl.burst) - 1, // consume one token for this packet
-			lastTime: now,
-			lastSeen: now,
+		b.lastTime = now
+
+		if b.tokens >= 1 {
+			b.tokens--
+			return true
 		}
-		rl.buckets[ip] = b
-		return true
+		return false
 	}
 
-	// Refill tokens based on elapsed time
-	elapsed := now.Sub(b.lastTime).Seconds()
-	b.tokens += elapsed * rl.rate
-	if b.tokens > float64(rl.burst) {
-		b.tokens = float64(rl.burst)
-	}
-	b.lastTime = now
-	b.lastSeen = now
-
-	if b.tokens >= 1 {
-		b.tokens--
-		return true
-	}
-
-	return false
+	// Fresh IP: see type doc for why starter is burst/2 rather than
+	// 0 or burst. Bucket admits this packet immediately (tokens -1).
+	rl.buckets.Add(ip, &tokenBucket{
+		tokens:   float64(rl.burst)/2 - 1,
+		lastTime: now,
+	})
+	return true
 }
 
-// Stop shuts down the cleanup goroutine. Safe to call multiple times.
-func (rl *IPRateLimiter) Stop() {
-	if rl.stopped.CompareAndSwap(false, true) {
-		close(rl.stopCh)
-	}
-}
-
-// Len returns the number of tracked IPs. Useful for monitoring/metrics.
+// Len returns the number of currently tracked IPs. For metrics/tests.
+// expirable.LRU.Len() is internally synchronized; rl.mu only serializes
+// Get-then-update sequences in Allow, not single reads.
 func (rl *IPRateLimiter) Len() int {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	return len(rl.buckets)
-}
-
-// cleanupLoop periodically removes idle token buckets to prevent memory leaks
-// from IPs that sent traffic once but never again.
-func (rl *IPRateLimiter) cleanupLoop(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-rl.stopCh:
-			return
-		case now := <-ticker.C:
-			rl.mu.Lock()
-			for ip, b := range rl.buckets {
-				if now.Sub(b.lastSeen) > rl.idleTTL {
-					delete(rl.buckets, ip)
-				}
-			}
-			rl.mu.Unlock()
-		}
-	}
+	return rl.buckets.Len()
 }

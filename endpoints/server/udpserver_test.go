@@ -1436,7 +1436,7 @@ func TestHandleACOnline_MalformedBodyEmitsFailureMetric(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// BlockAddr: IsBlockAddr / isBlockAddrStr / AddBlockAddr / RefreshBlockAddr
+// BlockAddr: IsBlockAddr / isBlockedIP / AddBlockAddr / RefreshBlockAddr
 // ---------------------------------------------------------------------------
 
 // newBlockAddrTestServer returns a minimally-initialized UdpServer suitable
@@ -1466,8 +1466,8 @@ func TestIsBlockAddr_Empty(t *testing.T) {
 	if s.IsBlockAddr(addr) {
 		t.Fatal("expected empty map to report address not blocked")
 	}
-	if s.isBlockAddrStr(addr.String()) {
-		t.Fatal("isBlockAddrStr should agree with IsBlockAddr on empty map")
+	if s.isBlockedIP(addr.IP.String()) {
+		t.Fatal("isBlockedIP should agree with IsBlockAddr on empty map")
 	}
 }
 
@@ -1481,8 +1481,8 @@ func TestAddBlockAddr_ThenIsBlockAddr(t *testing.T) {
 	if !s.IsBlockAddr(addr) {
 		t.Fatal("IsBlockAddr should return true after AddBlockAddr")
 	}
-	if !s.isBlockAddrStr(addr.String()) {
-		t.Fatal("isBlockAddrStr should return true after AddBlockAddr")
+	if !s.isBlockedIP(addr.IP.String()) {
+		t.Fatal("isBlockedIP should return true after AddBlockAddr")
 	}
 
 	other := mustResolveUDP(t, "203.0.113.3:62206")
@@ -1491,7 +1491,34 @@ func TestAddBlockAddr_ThenIsBlockAddr(t *testing.T) {
 	}
 }
 
-func TestIsBlockAddrStr_MatchesIsBlockAddr(t *testing.T) {
+// TestBlockAddr_PortRotationStaysBlocked is the regression fence for
+// #1160 T3-12: a blocked source must remain blocked even when it
+// rotates source ports. Old IP:port keying allowed an attacker to
+// dodge the block by switching ports.
+func TestBlockAddr_PortRotationStaysBlocked(t *testing.T) {
+	t.Parallel()
+	s := newBlockAddrTestServer()
+
+	// Block the source on port 1000.
+	blocked := mustResolveUDP(t, "203.0.113.10:1000")
+	s.AddBlockAddr(blocked)
+
+	// Different ports on the same IP must also be flagged as blocked.
+	for _, port := range []int{1, 2, 1000, 32767, 65535} {
+		probe := &net.UDPAddr{IP: blocked.IP, Port: port}
+		if !s.IsBlockAddr(probe) {
+			t.Errorf("port %d on blocked source IP must remain blocked (#1160 T3-12)", port)
+		}
+	}
+
+	// A different IP must NOT be blocked.
+	other := mustResolveUDP(t, "203.0.113.11:1000")
+	if s.IsBlockAddr(other) {
+		t.Fatal("unrelated IP must not be blocked")
+	}
+}
+
+func TestIsBlockedIP_MatchesIsBlockAddr(t *testing.T) {
 	t.Parallel()
 	// Guards the invariant the refactor relies on: the public and private
 	// forms must agree on blocked/unblocked for any given address.
@@ -1502,9 +1529,9 @@ func TestIsBlockAddrStr_MatchesIsBlockAddr(t *testing.T) {
 	s.AddBlockAddr(blocked)
 
 	for _, addr := range []*net.UDPAddr{blocked, unblocked} {
-		if got, want := s.isBlockAddrStr(addr.String()), s.IsBlockAddr(addr); got != want {
-			t.Fatalf("isBlockAddrStr(%s)=%v IsBlockAddr(%s)=%v — must agree",
-				addr, got, addr, want)
+		if got, want := s.isBlockedIP(addr.IP.String()), s.IsBlockAddr(addr); got != want {
+			t.Fatalf("isBlockedIP(%s)=%v IsBlockAddr(%s)=%v — must agree",
+				addr.IP, got, addr, want)
 		}
 	}
 }
@@ -1518,8 +1545,8 @@ func TestRefreshBlockAddr_RemovesExpiredOnly(t *testing.T) {
 
 	// Seed directly to control expireTime — AddBlockAddr uses the real clock.
 	now := time.Now()
-	s.blockAddrMap[fresh.String()] = &BlockAddr{expireTime: now.Add(time.Hour)}
-	s.blockAddrMap[stale.String()] = &BlockAddr{expireTime: now.Add(-time.Hour)}
+	s.blockAddrMap[fresh.IP.String()] = &BlockAddr{expireTime: now.Add(time.Hour)}
+	s.blockAddrMap[stale.IP.String()] = &BlockAddr{expireTime: now.Add(-time.Hour)}
 
 	s.RefreshBlockAddr()
 
@@ -1531,14 +1558,14 @@ func TestRefreshBlockAddr_RemovesExpiredOnly(t *testing.T) {
 	}
 }
 
-// TestIsBlockAddrStr_ConcurrentReaders exercises the sync.RWMutex change:
+// TestIsBlockedIP_ConcurrentReaders exercises the sync.RWMutex change:
 // many readers must proceed concurrently without deadlock or data race.
 // Run with `go test -race` to catch locking regressions.
-func TestIsBlockAddrStr_ConcurrentReaders(t *testing.T) {
+func TestIsBlockedIP_ConcurrentReaders(t *testing.T) {
 	s := newBlockAddrTestServer()
 	addr := mustResolveUDP(t, "203.0.113.8:62206")
 	s.AddBlockAddr(addr)
-	addrStr := addr.String()
+	ip := addr.IP.String()
 
 	const readers = 32
 	const itersPerReader = 1000
@@ -1549,7 +1576,7 @@ func TestIsBlockAddrStr_ConcurrentReaders(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < itersPerReader; j++ {
-				if !s.isBlockAddrStr(addrStr) {
+				if !s.isBlockedIP(ip) {
 					t.Errorf("concurrent read saw address as not blocked")
 					return
 				}
@@ -1574,7 +1601,7 @@ func TestIsBlockAddrStr_ConcurrentReaders(t *testing.T) {
 func TestBlockAddr_ConcurrentReadWrite(t *testing.T) {
 	s := newBlockAddrTestServer()
 	probe := mustResolveUDP(t, "203.0.113.9:62206")
-	probeStr := probe.String()
+	probeIP := probe.IP.String()
 
 	const iters = 500
 
@@ -1588,9 +1615,14 @@ func TestBlockAddr_ConcurrentReadWrite(t *testing.T) {
 		defer wg.Done()
 		stalePast := time.Now().Add(-time.Hour)
 		for i := 0; i < iters; i++ {
-			staleStr := (&net.UDPAddr{IP: net.IPv4(203, 0, 113, 50), Port: 62206 + (i % 16)}).String()
+			// Spread across the full TEST-NET-3 /24 (203.0.113.0/24)
+			// so the loop pressures the map's growth path with up to
+			// 256 distinct keys, not the same 16 keys overwritten
+			// 31× — the IP-only block-map keying made the prior
+			// (i%16) loop a no-op past the first 16 iterations.
+			staleIP := net.IPv4(203, 0, 113, byte(i%256)).String()
 			s.blockAddrMapMutex.Lock()
-			s.blockAddrMap[staleStr] = &BlockAddr{expireTime: stalePast}
+			s.blockAddrMap[staleIP] = &BlockAddr{expireTime: stalePast}
 			s.blockAddrMapMutex.Unlock()
 		}
 	}()
@@ -1605,7 +1637,7 @@ func TestBlockAddr_ConcurrentReadWrite(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < iters; i++ {
-			_ = s.isBlockAddrStr(probeStr)
+			_ = s.isBlockedIP(probeIP)
 		}
 	}()
 

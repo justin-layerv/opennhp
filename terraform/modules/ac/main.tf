@@ -772,6 +772,7 @@ locals {
     vpc_cidr              = var.vpc_cidr
     ipset_default_timeout = var.ipset_default_timeout
     ipset_temp_timeout    = var.ipset_temp_timeout
+    ipset_max_elements    = var.ipset_max_elements
     # Per-instance key generation
     name_prefix         = var.name_prefix
     secrets_kms_key_arn = var.secrets_kms_key_arn != null ? var.secrets_kms_key_arn : ""

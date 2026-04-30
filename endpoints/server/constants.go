@@ -7,7 +7,18 @@ import (
 )
 
 const (
-	MaxACConnsPerID                 = 10 // max AC connections per AC ID (blue/green)
+	MaxACConnsPerID = 10 // max AC connections per AC ID (blue/green)
+	// MaxConcurrentConnection caps both remoteConnectionMap (keyed by
+	// IP:port — counts unique connection tuples) and blockAddrMap
+	// (keyed by IP only post-#1160 T3-12 — counts unique source IPs).
+	// Under the old IP:port keying for blockAddrMap, a port-rotating
+	// attacker on a single source IP could singlehandedly fill the
+	// block-map cap; the IP-only keying made this constant's name
+	// closer to its effective semantics for the block-map case.
+	// NOTE(#1504): remoteConnectionMap still keys on IP:port and is
+	// still vulnerable to the same pattern. When #1504 lands and
+	// re-keys remoteConnectionMap, this comment block should be
+	// trimmed to the steady-state "both maps key on IP" form.
 	MaxConcurrentConnection         = 20480
 	OverloadConnectionThreshold     = MaxConcurrentConnection * 4 / 5      // 80%
 	BlockAddrRefreshRate            = 20                                   // 20 seconds

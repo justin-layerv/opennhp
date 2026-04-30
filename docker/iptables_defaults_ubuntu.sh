@@ -19,11 +19,17 @@ if [ "$1" = "-f" ];then
     fi
 fi
 ### ipset (IPv4) ###
+# maxelem caps kernel memory consumption from ipset population attacks
+# (#1160 T3-08); was 1,000,000 with no observed utilization above zero.
+# Production AC ipsets are sized via the ipset_max_elements terraform
+# variable in terraform/modules/ac/variables.tf — that's the source of
+# truth. This dev-mode docker harness hardcodes the same default (10k)
+# so local testing matches production sizing; if you tune one, tune both.
 echo "Setting up IPv4 ipset"
 echo ""
-ipset -exist create defaultset hash:ip,port,ip counters maxelem 1000000 timeout 120
-ipset -exist create defaultset_down hash:ip,port,ip counters maxelem 1000000 timeout 121
-ipset -exist create tempset hash:net,port counters maxelem 1000000 timeout 5
+ipset -exist create defaultset hash:ip,port,ip counters maxelem 10000 timeout 120
+ipset -exist create defaultset_down hash:ip,port,ip counters maxelem 10000 timeout 121
+ipset -exist create tempset hash:net,port counters maxelem 10000 timeout 5
 echo ""
 echo "Setting IPv4 ipset OK ..."
 
@@ -32,9 +38,9 @@ IP6TABLES=$(which ip6tables 2>/dev/null)
 IPSET6_OK=0
 if [ -n "$IP6TABLES" ]; then
     echo "Setting up IPv6 ipset"
-    ipset -exist create defaultset_v6 hash:ip,port,ip family inet6 counters maxelem 1000000 timeout 120 2>/dev/null || true
-    ipset -exist create defaultset_down_v6 hash:ip,port,ip family inet6 counters maxelem 1000000 timeout 121 2>/dev/null || true
-    ipset -exist create tempset_v6 hash:net,port family inet6 counters maxelem 1000000 timeout 5 2>/dev/null || true
+    ipset -exist create defaultset_v6 hash:ip,port,ip family inet6 counters maxelem 10000 timeout 120 2>/dev/null || true
+    ipset -exist create defaultset_down_v6 hash:ip,port,ip family inet6 counters maxelem 10000 timeout 121 2>/dev/null || true
+    ipset -exist create tempset_v6 hash:net,port family inet6 counters maxelem 10000 timeout 5 2>/dev/null || true
 
     # Verify IPv6 ipset creation
     IPSET6_OK=1

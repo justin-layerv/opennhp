@@ -256,7 +256,7 @@ func TestPreCheckThreatCache_IPv4MappedIPv6CollapsesToOneSlot(t *testing.T) {
 
 // newTestServerForPreCheck wires the minimal UdpServer fields that
 // recordPreCheckThreat touches — metrics publisher (for eviction
-// cb) and blockAddrMap (target of addBlockAddrStr). Mirrors
+// cb) and blockAddrMap (target of addBlockedIP). Mirrors
 // newTestServerForGate's style.
 func newTestServerForPreCheck(t *testing.T) *UdpServer {
 	t.Helper()
@@ -280,14 +280,14 @@ func TestRecordPreCheckThreat_BlocksOnFailureAfterThreshold(t *testing.T) {
 	addr := &net.UDPAddr{IP: net.ParseIP("192.0.2.42"), Port: 12345}
 
 	for i := 0; i < PreCheckThreatCountBeforeBlock; i++ {
-		s.recordPreCheckThreat(cache, addr)
+		s.recordPreCheckThreat(cache, addr.IP.String())
 	}
-	if s.isBlockAddrStr(addr.String()) {
+	if s.IsBlockAddr(addr) {
 		t.Fatalf("blocked at or below threshold (%d failures) — should only block when count > threshold", PreCheckThreatCountBeforeBlock)
 	}
 
-	s.recordPreCheckThreat(cache, addr)
-	if !s.isBlockAddrStr(addr.String()) {
+	s.recordPreCheckThreat(cache, addr.IP.String())
+	if !s.IsBlockAddr(addr) {
 		t.Fatalf("not blocked after %d failures (threshold is %d)", PreCheckThreatCountBeforeBlock+1, PreCheckThreatCountBeforeBlock)
 	}
 }
@@ -296,9 +296,10 @@ func TestRecordPreCheckThreat_BlocksOnFailureAfterThreshold(t *testing.T) {
 // regression fence for PR #1273 (#1158 port-rotation
 // amplification): a scanner bouncing across ports on one IP must
 // see its failures counted against the IP, not scattered across
-// per-port slots. Under the old IP:port keying this test passed
-// without blocking; under IP-only keying the 6th distinct port
-// blocks.
+// per-port slots. Under IP-only keying (#1273 for the threat
+// counter, #1160 T3-12 for the block map), the 6th distinct port
+// trips the block on the IP — and the block applies to all
+// previously-seen ports too.
 func TestRecordPreCheckThreat_PortRotationSharesIPCounter(t *testing.T) {
 	s := newTestServerForPreCheck(t)
 	cache := newTestThreatCache(nil)
@@ -310,17 +311,18 @@ func TestRecordPreCheckThreat_PortRotationSharesIPCounter(t *testing.T) {
 	var last *net.UDPAddr
 	for i := 0; i <= PreCheckThreatCountBeforeBlock; i++ {
 		last = &net.UDPAddr{IP: ip, Port: 10000 + i}
-		s.recordPreCheckThreat(cache, last)
+		s.recordPreCheckThreat(cache, last.IP.String())
 	}
-	if !s.isBlockAddrStr(last.String()) {
+	if !s.IsBlockAddr(last) {
 		t.Fatal("port-rotation amplification regressed — threats not accumulated at IP level")
 	}
-	// Only the final (IP:port) is in the block map — earlier ports
-	// each produced count <= threshold before the 6th one tripped it.
+	// Block map is IP-keyed: every port from the same IP must now
+	// be flagged as blocked. Old IP:port-keyed behavior left earlier
+	// ports unblocked even when the IP tripped the threshold.
 	for i := 0; i < PreCheckThreatCountBeforeBlock; i++ {
-		earlier := (&net.UDPAddr{IP: ip, Port: 10000 + i}).String()
-		if s.isBlockAddrStr(earlier) {
-			t.Errorf("unexpected pre-threshold block for %s", earlier)
+		earlier := &net.UDPAddr{IP: ip, Port: 10000 + i}
+		if !s.IsBlockAddr(earlier) {
+			t.Errorf("port %d on blocked IP must be blocked under IP-only keying (#1160 T3-12)", earlier.Port)
 		}
 	}
 }
@@ -336,16 +338,16 @@ func TestRecordPreCheckThreat_ClearAllowsFurtherTraffic(t *testing.T) {
 
 	// A few failures, then a clear (simulates a valid precheck).
 	for i := 0; i < PreCheckThreatCountBeforeBlock; i++ {
-		s.recordPreCheckThreat(cache, addr)
+		s.recordPreCheckThreat(cache, addr.IP.String())
 	}
 	cache.Clear(addr.IP.String())
 
 	// Same number of failures again — still not blocked because
 	// the counter reset on Clear.
 	for i := 0; i < PreCheckThreatCountBeforeBlock; i++ {
-		s.recordPreCheckThreat(cache, addr)
+		s.recordPreCheckThreat(cache, addr.IP.String())
 	}
-	if s.isBlockAddrStr(addr.String()) {
+	if s.IsBlockAddr(addr) {
 		t.Fatal("Clear did not reset counter — legitimate traffic would be blocked after a single transient failure cluster")
 	}
 }

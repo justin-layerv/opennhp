@@ -153,10 +153,14 @@ type UdpServer struct {
 
 	tokenStore *common.TokenStore[*ACTokenEntry]
 
-	// block address management
+	// block address management.
 	// RWMutex so per-packet reads don't serialize with concurrent readers.
+	// Keyed by remote IP only (not IP:port) — an attacker rotating source
+	// ports cannot bypass a block by switching ports (#1160 T3-12). The
+	// BlockSignal hot path passes the originating *net.UDPAddr; helpers
+	// extract IP for keying.
 	blockAddrMapMutex sync.RWMutex
-	blockAddrMap      map[string]*BlockAddr // indexed by remote UDP address, need lock for dynamic change
+	blockAddrMap      map[string]*BlockAddr // indexed by remote IP
 
 	// address association map
 	srcIpAssociatedAddrMapMutex sync.Mutex
@@ -627,10 +631,6 @@ func (s *UdpServer) Stop() {
 	// Flush remaining CloudWatch metrics
 	if s.metrics != nil {
 		s.metrics.Stop()
-	}
-	// Stop UDP rate limiter cleanup goroutine
-	if s.rateLimiter != nil {
-		s.rateLimiter.Stop()
 	}
 	close(s.signals.stop)
 	_ = s.listenConn.Close()
@@ -1144,6 +1144,10 @@ func (s *UdpServer) recvPacketRoutine() {
 			continue
 		}
 		addrStr := remoteAddr.String()
+		// IP-only key for blockAddrMap (#1160 T3-12), rate limiter, and
+		// preCheckThreats — computed once per packet so the hot path
+		// doesn't re-stringify on every consumer.
+		ipStr := remoteAddr.IP.String()
 
 		// add total recv bytes
 		atomic.AddUint64(&s.stats.totalRecvBytes, uint64(n))
@@ -1158,8 +1162,7 @@ func (s *UdpServer) recvPacketRoutine() {
 			continue
 		}
 
-		// check if it is from blocked address
-		if s.isBlockAddrStr(addrStr) {
+		if s.isBlockedIP(ipStr) {
 			s.device.ReleasePoolPacket(pkt)
 			log.Critical("Remote address %s is being blocked at the moment, discard.", addrStr)
 			continue
@@ -1169,10 +1172,9 @@ func (s *UdpServer) recvPacketRoutine() {
 		// rate before any cryptographic processing (HMAC, ECDH). This is the
 		// application-level defense-in-depth layer; iptables provides the
 		// kernel-level first line of defense.
-		if s.rateLimiter != nil && !s.rateLimiter.Allow(remoteAddr) {
+		if s.rateLimiter != nil && !s.rateLimiter.Allow(ipStr) {
 			s.device.ReleasePoolPacket(pkt)
 			drops := s.rateLimitDrops.Add(1)
-			// Log first drop and then every 1000th to avoid log flooding during attacks
 			if drops == 1 || drops%1000 == 0 {
 				log.Warning("[Server] rate limited UDP packet from %s (total drops: %d)", addrStr, drops)
 			}
@@ -1188,7 +1190,7 @@ func (s *UdpServer) recvPacketRoutine() {
 		log.Info("Receive [%s] packet (%s -> %s), %d bytes", msgType, addrStr, s.listenAddr.String(), n)
 		log.Evaluate("Receive [%s] packet (%s -> %s), %d bytes", msgType, addrStr, s.listenAddr.String(), n)
 		if err != nil {
-			s.recordPreCheckThreat(preCheckThreats, remoteAddr)
+			s.recordPreCheckThreat(preCheckThreats, ipStr)
 			s.device.ReleasePoolPacket(pkt)
 			log.Warning("Receive [%s] packet (%s -> %s), precheck error: %v", msgType, addrStr, s.listenAddr.String(), err)
 			log.Evaluate("Receive [%s] packet (%s -> %s) precheck error: %v", msgType, addrStr, s.listenAddr.String(), err)
@@ -1198,7 +1200,7 @@ func (s *UdpServer) recvPacketRoutine() {
 		// if any port from a source looks legitimate, the source isn't
 		// a scanner. Semantics change from the old IP:port keying,
 		// where one port succeeding didn't affect others.
-		preCheckThreats.Clear(remoteAddr.IP.String())
+		preCheckThreats.Clear(ipStr)
 
 		s.remoteConnectionMapMutex.Lock()
 		conn, found := s.remoteConnectionMap[addrStr]
@@ -1400,31 +1402,40 @@ func (s *UdpServer) BlockAddrRefreshRoutine() {
 	}
 }
 
+// IsBlockAddr reports whether the source IP of addr is currently
+// blocked. Only addr.IP is consulted — addr.Port is ignored, since
+// the block map keys on IP only (#1160 T3-12) so a port-rotating
+// attacker cannot bypass an existing block by minting a fresh
+// IP:port tuple.
 func (s *UdpServer) IsBlockAddr(addr *net.UDPAddr) bool {
-	return s.isBlockAddrStr(addr.String())
+	return s.isBlockedIP(addr.IP.String())
 }
 
-// isBlockAddrStr is the string-keyed form of IsBlockAddr, for hot-path reuse
-// when the caller already computed addr.String().
-func (s *UdpServer) isBlockAddrStr(addrStr string) bool {
+// isBlockedIP is the IP-keyed lookup used by the hot path. The map keys
+// on remote IP only — port rotation from a blocked source must not
+// re-admit packets (#1160 T3-12).
+func (s *UdpServer) isBlockedIP(ip string) bool {
 	s.blockAddrMapMutex.RLock()
 	defer s.blockAddrMapMutex.RUnlock()
 
-	_, found := s.blockAddrMap[addrStr]
+	_, found := s.blockAddrMap[ip]
 	return found
 }
 
+// AddBlockAddr blocks the source IP of addr. Only addr.IP is
+// recorded — addr.Port is ignored. See IsBlockAddr for the IP-only
+// keying rationale (#1160 T3-12).
 func (s *UdpServer) AddBlockAddr(addr *net.UDPAddr) {
-	s.addBlockAddrStr(addr.String())
+	s.addBlockedIP(addr.IP.String())
 }
 
-// addBlockAddrStr is the string-keyed form of AddBlockAddr, for hot-path reuse
-// when the caller already computed addr.String().
-func (s *UdpServer) addBlockAddrStr(addrStr string) {
+// addBlockedIP records a block keyed by remote IP only. See isBlockedIP for
+// the IP:port → IP keying rationale.
+func (s *UdpServer) addBlockedIP(ip string) {
 	s.blockAddrMapMutex.Lock()
 	poolFull := len(s.blockAddrMap) >= MaxConcurrentConnection
 	if !poolFull {
-		s.blockAddrMap[addrStr] = &BlockAddr{time.Now().Add(BlockAddrExpireTime * time.Second)}
+		s.blockAddrMap[ip] = &BlockAddr{time.Now().Add(BlockAddrExpireTime * time.Second)}
 	}
 	s.blockAddrMapMutex.Unlock()
 
@@ -1433,7 +1444,7 @@ func (s *UdpServer) addBlockAddrStr(addrStr string) {
 	if poolFull {
 		log.Warning("block address pool is full")
 	} else {
-		log.Critical("add blocking address %s", addrStr)
+		log.Critical("add blocking source IP %s", ip)
 	}
 }
 
@@ -1441,7 +1452,7 @@ func (s *UdpServer) RefreshBlockAddr() {
 	now := time.Now()
 
 	// Phase 1: collect expired keys under RLock so concurrent packet readers
-	// (isBlockAddrStr) proceed in parallel with the scan. Under sustained
+	// (isBlockedIP) proceed in parallel with the scan. Under sustained
 	// attack the map can approach MaxConcurrentConnection entries, and the
 	// old single-phase exclusive Lock held during the full iteration would
 	// stall every reader for the duration of the scan.

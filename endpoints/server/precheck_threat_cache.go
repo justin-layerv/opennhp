@@ -2,7 +2,6 @@ package server
 
 import (
 	"math"
-	"net"
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
@@ -44,7 +43,7 @@ import (
 // attacker stretches up to roughly cache_TTL/block_window (~3.3×).
 // This is strictly better than the designed block duration.
 // Note: Increment is NOT called while a source is blocked —
-// isBlockAddrStr short-circuits in recvPacketRoutine before
+// isBlockedIP short-circuits in recvPacketRoutine before
 // RecvPrecheck runs — so TTL does not refresh during the block
 // window. Only pre-block failures and post-unblock packets keep
 // the entry warm.
@@ -185,23 +184,19 @@ func (c *preCheckThreatCache) Len() int {
 }
 
 // recordPreCheckThreat increments the per-IP counter in cache for
-// the source of remoteAddr and, when the counter exceeds
-// PreCheckThreatCountBeforeBlock, moves the (IP:port) into the
-// block map. Separated from recvPacketRoutine so the threshold
-// semantics are testable without driving the full UDP socket —
-// cache is passed explicitly (not stored on UdpServer) so tests
-// can construct an isolated cache without wiring up a full
-// server. remoteAddr is assumed non-nil with a non-nil IP; the
-// UDP stack delivers valid addresses via ReadFromUDP, so there
-// is no validation here.
+// ip and, when the counter exceeds PreCheckThreatCountBeforeBlock,
+// moves the IP into the block map. Separated from recvPacketRoutine
+// so the threshold semantics are testable without driving the full
+// UDP socket — cache is passed explicitly (not stored on UdpServer)
+// so tests can construct an isolated cache without wiring up a full
+// server. ip is assumed non-empty; the UDP stack delivers valid
+// addresses via ReadFromUDP, so there is no validation here.
 //
-// Block map is still keyed by (IP:port) — a port-rotating
-// attacker therefore produces one block-map entry per port rather
-// than one per source. blockAddrMap has its own cap at
-// MaxConcurrentConnection so this is not a new memory-DoS
-// primitive; IP-level blocking is tracked in #1271.
-func (s *UdpServer) recordPreCheckThreat(cache *preCheckThreatCache, remoteAddr *net.UDPAddr) {
-	if cache.Increment(remoteAddr.IP.String()) > PreCheckThreatCountBeforeBlock {
-		s.addBlockAddrStr(remoteAddr.String())
+// Block map is keyed by remote IP only (#1160 T3-12), so a single
+// port-rotating source produces one block entry rather than one
+// per port — port rotation can no longer bypass an existing block.
+func (s *UdpServer) recordPreCheckThreat(cache *preCheckThreatCache, ip string) {
+	if cache.Increment(ip) > PreCheckThreatCountBeforeBlock {
+		s.addBlockedIP(ip)
 	}
 }
