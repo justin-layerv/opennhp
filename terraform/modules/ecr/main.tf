@@ -963,15 +963,46 @@ resource "aws_iam_policy" "terraform_read" {
         Resource = "*"
       },
       {
-        Sid    = "KMSRead"
+        # SECURITY (#1125): scope resource-scoped metadata actions
+        # (kms:DescribeKey, kms:GetKeyPolicy, kms:ListGrants, etc.) to keys
+        # owned by this account. Uses StringEqualsIfExists because some
+        # actions in this block (kms:ListKeys, kms:ListAliases) are
+        # non-resource-scoped — aws:ResourceAccount resolves absent for
+        # those, and IfExists permits them; a plain StringEquals would
+        # deny them. A proper key-ARN allowlist that retires this whole
+        # IfExists shape is tracked in #1521.
+        Sid    = "KMSMetadataRead"
         Effect = "Allow"
         Action = [
           "kms:Describe*",
           "kms:Get*",
-          "kms:List*",
+          "kms:List*"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEqualsIfExists = {
+            "aws:ResourceAccount" = local.account_id
+          }
+        }
+      },
+      {
+        # SECURITY (#1125): block kms:Decrypt against keys owned by other
+        # accounts via aws:ResourceAccount (resolves to the account of the
+        # *resource*; kms:CallerAccount would resolve to the role's own
+        # account and be a tautology in an identity-based policy).
+        # Tightened further by #1521, which replaces Resource = "*" with
+        # an explicit ARN allowlist after a CloudTrail audit.
+        Sid    = "KMSDecryptInAccount"
+        Effect = "Allow"
+        Action = [
           "kms:Decrypt"
         ]
         Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:ResourceAccount" = local.account_id
+          }
+        }
       },
       {
         Sid    = "EventBridgeRead"
@@ -1335,6 +1366,14 @@ resource "aws_iam_policy" "terraform_apply_iam" {
         Resource = "*"
       },
       {
+        # SECURITY (#1125): same threat model as KMSDecryptInAccount /
+        # KMSForEncryption — block mutating actions against keys owned by
+        # other accounts (alias hijack, policy rewrite, schedule-delete).
+        # Uses StringEqualsIfExists because kms:CreateKey is
+        # non-resource-scoped (the key doesn't exist yet at request time);
+        # IfExists permits it while still bounding the resource-scoped
+        # actions (ScheduleKeyDeletion, *Alias, *Tag, PutKeyPolicy) to
+        # in-account keys.
         Sid    = "KMS"
         Effect = "Allow"
         Action = [
@@ -1348,6 +1387,11 @@ resource "aws_iam_policy" "terraform_apply_iam" {
           "kms:PutKeyPolicy"
         ]
         Resource = "*"
+        Condition = {
+          StringEqualsIfExists = {
+            "aws:ResourceAccount" = local.account_id
+          }
+        }
       }
     ]
   })
@@ -1685,6 +1729,10 @@ resource "aws_iam_policy" "terraform_apply_data" {
       {
         # KMS permissions for DynamoDB/RDS encryption with customer-managed keys
         # CreateGrant is required when creating DynamoDB tables with CMK encryption
+        # SECURITY (#1125): condition uses aws:ResourceAccount (not
+        # kms:CallerAccount) so it actually blocks cross-account KMS use —
+        # see KMSDecryptInAccount in the terraform_read policy above for
+        # the full rationale.
         Sid    = "KMSForEncryption"
         Effect = "Allow"
         Action = [
@@ -1697,7 +1745,7 @@ resource "aws_iam_policy" "terraform_apply_data" {
         Resource = "*"
         Condition = {
           StringEquals = {
-            "kms:CallerAccount" = local.account_id
+            "aws:ResourceAccount" = local.account_id
           }
         }
       },

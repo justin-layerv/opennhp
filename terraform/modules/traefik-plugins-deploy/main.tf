@@ -23,6 +23,18 @@ locals {
   deploy_doc_name   = "traefik-plugins-${var.environment}-deploy-plugin"
   rollback_doc_name = "traefik-plugins-${var.environment}-rollback-plugin"
 
+  # GitHub Environment name in the deploy workflow's `environment:` directive
+  # (https://github.com/layervai/traefik-plugins/blob/main/.github/workflows/deploy.yml).
+  # The map IS the allow-list — Terraform fails with "Invalid index" at plan
+  # time if a future PR adds a new value to var.environment's validation
+  # without updating this map. A workflow-side rename is out of band and
+  # tracked at traefik-plugins#99.
+  github_environment_by_env = {
+    sandbox = "sandbox"
+    prod    = "production"
+  }
+  github_environment_name = local.github_environment_by_env[var.environment]
+
   module_tags = merge(var.tags, {
     Component = "traefik-plugins-deploy"
   })
@@ -34,6 +46,16 @@ resource "aws_iam_role" "github_actions" {
   name        = local.role_name
   description = "GitHub Actions role for ${var.github_org}/${var.github_repo} (${var.environment})"
 
+  # SECURITY (#1125, same threat model as #1121): the `sub` is pinned to
+  # the single GH-Environment-scoped token this per-env workflow emits.
+  # The previous `repo:<owner>/<repo>:*` wildcard accepted PR-event
+  # tokens — a malicious PR could have assumed the role unmerged.
+  # Per-env scoping (via `local.github_environment_name`) also blocks
+  # cross-env assumption: a sandbox token cannot assume the prod role,
+  # which the previous shape relied on workflow-side pinning to enforce.
+  # Intentionally tighter than the broader nhp role's redundant
+  # `traefik_plugins_github_repo` entries (`terraform/modules/ecr/main.tf`);
+  # retiring those is tracked in #1522.
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -45,9 +67,7 @@ resource "aws_iam_role" "github_actions" {
       Condition = {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-        }
-        StringLike = {
-          "token.actions.githubusercontent.com:sub" = "repo:${var.github_org}/${var.github_repo}:*"
+          "token.actions.githubusercontent.com:sub" = "repo:${var.github_org}/${var.github_repo}:environment:${local.github_environment_name}"
         }
       }
     }]
