@@ -192,11 +192,30 @@ plugins:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building plugins... $(END_COLOUR)"
 	@if test -d $(NHP_SERVER_PLUGINS); then $(MAKE) -C $(NHP_SERVER_PLUGINS); fi
 
-lint: lint-redirect-url-drift
+lint: lint-redirect-url-drift lint-disable-agent-validation
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running linters...$(END_COLOUR)"
 	cd nhp && golangci-lint run ./...
 	cd endpoints && golangci-lint run ./...
 	@echo "$(COLOUR_GREEN)[OpenNHP] Lint passed!$(END_COLOUR)"
+
+# Fence DisableAgentValidation=true from any deployable config (#1157 F9).
+# The flag turns off agent static-pubkey validation entirely; setting
+# it true in any prod path is a security regression that produces no
+# runtime signal. The script is string-grep based so it stays runnable
+# in a fresh CI image with no parser deps. Wired into `make lint` AND
+# .github/workflows/validate-workflows.yml so a one-sided edit trips
+# both locally and on PR.
+.PHONY: lint-disable-agent-validation
+lint-disable-agent-validation:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Checking DisableAgentValidation flag (#1157 F9)...$(END_COLOUR)"
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck scripts/check-disable-agent-validation.sh tests/lints/disable-agent-validation/run-fixtures.sh; \
+	else \
+		echo "$(COLOUR_BLUE)[OpenNHP] shellcheck not installed; skipping script check$(END_COLOUR)"; \
+	fi
+	@./tests/lints/disable-agent-validation/run-fixtures.sh
+	@./scripts/check-disable-agent-validation.sh
+	@echo "$(COLOUR_GREEN)[OpenNHP] DisableAgentValidation check passed!$(END_COLOUR)"
 
 # Fence drift between the `redirectURLField` constant in the plugin
 # handler and the smoke test that verifies the wire contract (#1325).

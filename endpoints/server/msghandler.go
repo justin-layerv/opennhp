@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
@@ -461,6 +462,56 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	// We need to validate the AC via license check and create the peer dynamically.
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md Section 6.2 for details.
 	cloudMode := s.storageConfig != nil && s.storageConfig.Backend == StorageBackendDynamoDB
+	// addedNewPeer scopes the in-lock TOCTOU cleanup to peers we
+	// insert in *this* call. Without it the cleanup would also evict
+	// pre-existing acPeerMap entries (a prior AddACPeer whose ACConn
+	// was later cleaned up by removeACConnectionRecord), turning a
+	// transient race-induced reject into a legitimate-AC disconnect.
+	// Set true ONLY after the actual AddACPeer call below, so an
+	// early-return from validateACLicense (which short-circuits before
+	// AddACPeer) cannot leave addedNewPeer in a state that would
+	// trigger the cleanup on a peer we never inserted.
+	var addedNewPeer bool
+
+	// #1157 F3 pre-check. Authoritative F3 gate runs inside the
+	// acConnectionMapMutex.Lock() further below; pre-fix that path was
+	// only reached AFTER validateACLicense (bcrypt) and AddACPeer in
+	// cloud mode, so a strict reject leaked the attacker's pubkey into
+	// acPeerMap permanently AND paid bcrypt cost per attack packet.
+	// The pre-check fixes both. Gated on cloudMode + strict-mode so we
+	// don't pay an RLock+alloc on every NHP_AOL during permit-mode
+	// rollout or non-cloud deployments. See ac_pubkey_cap_gate.go.
+	//
+	// Permit-mode trade-off: with acPubkeyCapVerifyRequire=false the
+	// pre-check is skipped, so the burn-in window preserves every
+	// pre-fix attack surface — FIFO eviction still works, attacker
+	// pubkeys still leak into acPeerMap permanently, bcrypt is still
+	// paid per attack packet. Permit mode buys observability (metric
+	// + log via the in-lock check), nothing else. Operators must
+	// flip acPubkeyCapVerifyRequire=true to land actual protection;
+	// staying in permit indefinitely is a security regression
+	// disguised as a careful rollout. See PR description rollout
+	// section + #1514 acceptance criteria.
+	//
+	// Trade-off: a snapshot taken outside the lock can see "cap
+	// exceeded" when a concurrent removeACConnectionRecord is about to
+	// bring the count back below cap. The result is a rare, transient
+	// strict-mode reject that the AC's transaction-retry loop absorbs.
+	if cloudMode && s.acPubkeyCapVerifyRequire {
+		s.acConnectionMapMutex.RLock()
+		preCheckPubkeys := extractPubkeysFromConns(s.acConnectionMap[acId])
+		s.acConnectionMapMutex.RUnlock()
+		preVerdict, preDistinct := verifyACPubkeyCap(acPubkeyBase64, preCheckPubkeys, MaxACConnsPerID)
+		if preVerdict == verdictACPubkeyCapExceeded {
+			_, capRejectErr := s.applyACPubkeyCapVerdict(preVerdict, acId, acPubkeyBase64, preDistinct, transactionId, addrStr)
+			// Mirror validateACLicense rejects in feeding the license
+			// rate limiter — see TestHandleACOnline_F3StrictReject_FeedsLicenseRateLimiter.
+			s.recordLicenseFailure(addrStr, acId)
+			s.sendACOnlineRejectAAK(ppd, transactionId, capRejectErr, acId, addrStr, "cap-reject")
+			return capRejectErr
+		}
+	}
+
 	if acPeer == nil && cloudMode {
 		// Validate AC license before accepting connection.
 		//
@@ -480,30 +531,7 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		// fence this at the integration layer.
 		validationErr := s.validateACLicense(ppd, aolMsg, transactionId, addrStr, acPubkeyBase64)
 		if validationErr != nil {
-			// Send error response
-			aakMsg := &common.ServerACAckMsg{
-				ErrCode: validationErr.ErrorCode(),
-				ErrMsg:  validationErr.Error(),
-			}
-			aakBytes, marshalErr := json.Marshal(aakMsg)
-			if marshalErr != nil {
-				log.Error("server-ac(%s#%d@%s)[HandleACOnline] failed to marshal AAK error message: %v", acId, transactionId, addrStr, marshalErr)
-				s.metrics.IncrCounter(MetricACRegistrationFailure)
-				return validationErr
-			}
-			aakMd := makeMsgData(ppd, core.NHP_AAK, aakBytes)
-			if transaction := ppd.ConnData.FindRemoteTransaction(transactionId); transaction != nil {
-				// Best-effort: license validation has already failed, so we
-				// return validationErr regardless of whether the AAK delivers.
-				// A SendMessage failure here means the transaction exited
-				// before we could send the error response (e.g., timeout);
-				// the AC will observe the transaction timeout and retry.
-				if sendErr := transaction.SendMessage(aakMd); sendErr != nil {
-					log.Error("server-ac(%s#%d@%s)[HandleACOnline] failed to forward license-validation AAK: %v", acId, transactionId, addrStr, sendErr)
-					s.recordTransactionClosed(sendErr)
-				}
-			}
-			s.metrics.IncrCounter(MetricACRegistrationFailure)
+			s.sendACOnlineRejectAAK(ppd, transactionId, validationErr, acId, addrStr, "license-validation")
 			return validationErr
 		}
 
@@ -522,6 +550,7 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		// Without this, processACOperation fails with nil peer address.
 		acPeer.UpdateRecv(ppd.LocalInitTime, ppd.ConnData.RemoteAddr)
 		s.AddACPeer(acPeer)
+		addedNewPeer = true
 		log.Info("server-ac(%s#%d@%s)[HandleACOnline] Cloud mode: created AC peer after license validation", acId, transactionId, addrStr)
 	} else if acPeer != nil {
 		// Existing peer found - update its receive address to handle re-registration
@@ -552,6 +581,35 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	s.acConnectionMapMutex.Lock()
 	existingConns := s.acConnectionMap[acId]
 
+	// #1157 F3 distinct-pubkey cap. Snapshot the existing pubkeys
+	// under the existing mutex so the gate's kernel stays
+	// lock-free. The kernel handles the in-place re-registration
+	// case (same pubkey → no new slot consumed). See
+	// ac_pubkey_cap_gate.go for the threat model. Permit-mode
+	// behavior preserves the legacy FIFO eviction below; strict
+	// mode rejects before any state mutation.
+	existingPubkeys := extractPubkeysFromConns(existingConns)
+	capVerdict, distinctCount := verifyACPubkeyCap(acPubkeyBase64, existingPubkeys, MaxACConnsPerID)
+	capProceed, capRejectErr := s.applyACPubkeyCapVerdict(capVerdict, acId, acPubkeyBase64, distinctCount, transactionId, addrStr)
+	if !capProceed {
+		// TOCTOU re-check rejection: the pre-check above let us
+		// through but a concurrent registration to this acId pushed
+		// the distinct count past the cap before we acquired the
+		// write lock. acConnectionMap[acId] is unchanged at this
+		// point (we haven't written yet), but if THIS call inserted
+		// a new acPeerMap entry above (cloud mode + prior absence),
+		// remove it. Don't gate on `cloudMode && acPeer != nil` —
+		// that would also evict a pre-existing peer whose ACConn
+		// was cleaned up earlier (legitimate AC reconnect).
+		s.acConnectionMapMutex.Unlock()
+		if addedNewPeer {
+			s.removeACPeer(acPubkeyBase64)
+		}
+		s.recordLicenseFailure(addrStr, acId)
+		s.sendACOnlineRejectAAK(ppd, transactionId, capRejectErr, acId, addrStr, "cap-reject")
+		return capRejectErr
+	}
+
 	updated := false
 	var staleConn *ACConn
 	for i, existing := range existingConns {
@@ -575,6 +633,14 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		log.Info("server-ac(%s#%d@%s)[HandleACOnline] New AC instance registered (total: %d)",
 			acId, transactionId, addrStr, len(existingConns)+1)
 		if len(existingConns) >= MaxACConnsPerID {
+			// F3 (#1157) has already passed at this point — the
+			// distinct-pubkey cap is the attack-break gate. This
+			// FIFO eviction enforces the legitimate connection-count
+			// cap (e.g., a blue/green stretch that legitimately
+			// stretches one pubkey across MaxACConnsPerID instances
+			// still trips this branch and evicts the oldest IP).
+			// Don't consolidate the two checks: F3 fences impostors,
+			// this fences the live-connection table.
 			staleConn = existingConns[0]
 			existingConns = existingConns[1:]
 			s.metrics.IncrCounter(MetricACConnEviction)
@@ -631,6 +697,42 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 	s.metrics.RecordLatency(MetricACRegistrationLatency, float64(time.Since(regStart).Milliseconds()))
 
 	return s.forwardToTransaction(ppd.ConnData, transactionId, aakMd, "server-ac", "HandleACOnline", acId, addrStr)
+}
+
+// sendACOnlineRejectAAK marshals and forwards an AAK reject to the
+// AC, increments MetricACRegistrationFailure, and tolerates a
+// post-rejection forward failure (the AC's transaction will time out
+// and retry). callerLabel appears in log lines so a forensic search
+// can distinguish the rejection source (e.g., "license-validation",
+// "cap-reject"). Unifies the AAK reject contract across HandleACOnline
+// rejection sites — license-validation, F3 cap-exceeded pre-check,
+// and F3 cap-exceeded in-lock TOCTOU re-check all share this path so
+// the AC observes one consistent wire shape.
+func (s *UdpServer) sendACOnlineRejectAAK(
+	ppd *core.PacketParserData,
+	transactionId uint64,
+	rejectErr *common.Error,
+	acId string,
+	addrStr string,
+	callerLabel string,
+) {
+	s.metrics.IncrCounter(MetricACRegistrationFailure)
+	aakMsg := &common.ServerACAckMsg{
+		ErrCode: rejectErr.ErrorCode(),
+		ErrMsg:  rejectErr.Error(),
+	}
+	aakBytes, marshalErr := json.Marshal(aakMsg)
+	if marshalErr != nil {
+		log.Error("server-ac(%s#%d@%s)[HandleACOnline] failed to marshal %s AAK: %v", acId, transactionId, addrStr, callerLabel, marshalErr)
+		return
+	}
+	aakMd := makeMsgData(ppd, core.NHP_AAK, aakBytes)
+	if transaction := ppd.ConnData.FindRemoteTransaction(transactionId); transaction != nil {
+		if sendErr := transaction.SendMessage(aakMd); sendErr != nil {
+			log.Error("server-ac(%s#%d@%s)[HandleACOnline] failed to forward %s AAK: %v", acId, transactionId, addrStr, callerLabel, sendErr)
+			s.recordTransactionClosed(sendErr)
+		}
+	}
 }
 
 // handleACServerAssignment checks if the AC should be redirected to its assigned servers.
@@ -801,7 +903,20 @@ func (s *UdpServer) autoAssignAC(
 		TTL:             &ttl,
 	}
 
-	// Populate customer ID from license if available
+	// Populate customer ID from license if available.
+	//
+	// #1157 F4 trust contract: console-side License.Validate rejects
+	// empty CustomerID at write-time, so a license read here with
+	// non-empty CustomerID is the production invariant. If a future
+	// caller bypasses console validation and writes a license with
+	// empty CustomerID, the assignment persisted here would have an
+	// empty CustomerID — and verifyACIDCustomer's `existingCustomerID
+	// == "" → Unbound` branch would treat that as a never-bound
+	// assignment forever (TOFU never re-fires for the same acId).
+	// Detection lives upstream (console validation); this kernel
+	// trusts that invariant rather than re-validating per packet.
+	// If console validation is ever loosened, the F4 kernel must
+	// tighten in the same PR.
 	if aolMsg.LicenseKey != "" {
 		licCtx, licCancel := udpCorrelationCtx(DefaultStorageTimeout, acId, transactionId)
 		license, licErr := s.storage.GetLicense(licCtx, aolMsg.LicenseKey)
@@ -811,10 +926,29 @@ func (s *UdpServer) autoAssignAC(
 		}
 	}
 
-	// Write assignment to storage
-	saveCtx, saveCancel := udpCorrelationCtx(DefaultStorageTimeout, acId, transactionId)
-	defer saveCancel()
-	if saveErr := s.storage.SaveACAssignment(saveCtx, assignment); saveErr != nil {
+	// Write assignment to storage with bounded retry on optimistic-
+	// lock conflict (#1157 F7). Pre-#1157 a VersionConflictError fell
+	// through to "accept directly" without retry — under contention
+	// (multiple servers racing to claim the same acId slot), the
+	// loser's view of "no assignment in storage" persisted and
+	// subsequent registrations could trip on stale state. The retry
+	// re-reads the current assignment, recomputes Version+1, and
+	// tries again, capped at saveAssignmentMaxAttempts.
+	//
+	// Retry policy: only on VersionConflictError. Any other storage
+	// error (DDB unavailable, marshal failure, throttling) preserves
+	// the legacy fallthrough — degrading to "accept directly" is the
+	// availability fallback, and rejecting on a transient outage
+	// would weaponize a storage flap into an outage. Cap-exhausted
+	// also falls through to accept; the metric is the operator
+	// signal that contention is sustained.
+	// MUTATES assignment.Version: each retry sets Version to the
+	// freshly-observed-version+1, so the local `assignment` struct
+	// is no longer authoritative for the original Version after this
+	// call returns (success or failure). Don't reuse the same
+	// `assignment` value as a retry input elsewhere — see
+	// saveAssignmentWithRetry's docstring.
+	if saveErr := s.saveAssignmentWithRetry(acId, transactionId, addrStr, assignment); saveErr != nil {
 		log.Warning("server-ac(%s#%d@%s)[autoAssignAC] failed to save assignment: %v, accepting directly", acId, transactionId, addrStr, saveErr)
 		return false, nil
 	}
@@ -831,6 +965,147 @@ func (s *UdpServer) autoAssignAC(
 
 	// Return false so this server also processes the AC registration locally
 	return false, nil
+}
+
+// saveAssignmentMaxAttempts caps the autoAssignAC retry loop on
+// optimistic-lock conflicts (#1157 F7). Three attempts is enough to
+// converge under expected contention (a small fleet racing to claim
+// the same acId slot at startup) while bounding worst-case storage
+// load under a thundering-herd scenario. Each retry is a re-read +
+// re-write so worst-case is 3 GET + 3 PUT to DDB per registration.
+//
+// Each retry uses a small random sleep (saveAssignmentRetryBaseDelay
+// + jitter) so all racing attempts don't synchronize and re-collide.
+const (
+	saveAssignmentMaxAttempts    = 3
+	saveAssignmentRetryBaseDelay = 25 * time.Millisecond
+	saveAssignmentRetryJitter    = 75 * time.Millisecond
+)
+
+// MetricACAssignmentVersionConflictRetry fires once per retry
+// attempt triggered by a VersionConflictError on SaveACAssignment.
+// A non-zero rate is the rollout signal that two servers are
+// racing to claim the same acId slot; sustained at high volume,
+// it's a contention-load alarm.
+//
+// MetricACAssignmentVersionConflictExhausted fires when the retry
+// loop is exhausted without converging — falls through to "accept
+// directly" per the legacy availability contract. Page-worthy if
+// non-zero in burn-in.
+//
+// MetricACAssignmentSaveError fires once per non-conflict storage
+// error from SaveACAssignment (DDB throttling, marshal failure,
+// timeout, etc.). Distinct from the conflict counters so operators
+// can tell "DDB is sick" from "contention is high" without grepping
+// logs. Sustained non-zero is the storage-flap signal.
+const (
+	MetricACAssignmentVersionConflictRetry     = "ACAssignmentVersionConflictRetry"
+	MetricACAssignmentVersionConflictExhausted = "ACAssignmentVersionConflictExhausted"
+	MetricACAssignmentSaveError                = "ACAssignmentSaveError"
+)
+
+// saveAssignmentWithRetry performs a bounded retry loop around
+// SaveACAssignment to converge under optimistic-lock contention
+// (#1157 F7). The first attempt uses the assignment's current
+// Version; each retry GETs the current version from storage,
+// increments by 1, and tries again.
+//
+// Returns nil on success. Returns the last error on exhaustion or
+// on any non-VersionConflict storage error (preserves the legacy
+// availability fallthrough — caller turns the error into "accept
+// directly").
+//
+// saveAssignmentWithRetry mutates assignment.Version on each retry
+// to the freshly observed-version+1, so the function is NOT
+// idempotent against the same struct after a non-nil return —
+// callers should not retry it externally.
+//
+// Worst-case latency budget: under sustained DDB throttling each
+// Save+GET pair can take up to DefaultStorageTimeout (5s today) per
+// attempt, so 3 conflicts in a row → ~30s of wall-clock retry
+// (jitter is the small term). The AC's NHP_AOL transaction will have
+// timed out long before then, but the assignment-write completing
+// in the background is still useful state — the AC retries the
+// whole NHP_AOL on its next attempt and observes the converged row.
+// #1516 tracks plumbing parent ctx through here to short-circuit
+// the retry on caller-side deadline.
+func (s *UdpServer) saveAssignmentWithRetry(
+	acId string,
+	transactionId uint64,
+	addrStr string,
+	assignment *ACAssignment,
+) error {
+	var lastErr error
+	for attempt := 1; attempt <= saveAssignmentMaxAttempts; attempt++ {
+		saveCtx, saveCancel := udpCorrelationCtx(DefaultStorageTimeout, acId, transactionId)
+		err := s.storage.SaveACAssignment(saveCtx, assignment)
+		saveCancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !IsVersionConflictError(err) {
+			// Non-conflict error: don't retry. Caller falls through
+			// to "accept directly" per the legacy availability
+			// contract. Emit MetricACAssignmentSaveError so a sick
+			// DDB (throttling, timeout) shows up on the dashboard
+			// without operators having to grep logs to distinguish
+			// it from the conflict counters.
+			s.metrics.IncrCounter(MetricACAssignmentSaveError)
+			return err
+		}
+		// Optimistic-lock conflict. Re-read current version + retry.
+		// The retry counter increments only when a retry is about
+		// to be attempted (i.e., NOT on the last failed attempt) so
+		// the counter's semantics is "retries scheduled" rather
+		// than "failed attempts." Exhaustion is recorded separately
+		// via MetricACAssignmentVersionConflictExhausted, so the
+		// two counters add up to "total failed attempts" without
+		// double-counting the terminal one.
+		log.Info("server-ac(%s#%d@%s)[autoAssignAC] version conflict on attempt %d/%d, retrying",
+			acId, transactionId, addrStr, attempt, saveAssignmentMaxAttempts)
+		if attempt == saveAssignmentMaxAttempts {
+			// Last attempt failed — don't increment retry counter
+			// (no retry will follow) and don't sleep before
+			// returning.
+			break
+		}
+		s.metrics.IncrCounter(MetricACAssignmentVersionConflictRetry)
+		// Backoff with jitter so racing attempts decorrelate. Use
+		// math/rand here (NOT crypto/rand): jitter is purely a
+		// scheduling decorrelation primitive — it picks a value
+		// uniformly from [0, saveAssignmentRetryJitter) so two
+		// processes that hit the conflict at the same instant
+		// don't immediately re-collide on the retry. Cryptographic
+		// unpredictability is irrelevant here; an attacker who
+		// could predict the jitter still cannot force a conflict
+		// they don't already control. Using crypto/rand would just
+		// burn entropy for nothing.
+		// #nosec G404 -- decorrelation only; not security-sensitive.
+		jitter := time.Duration(rand.Int63n(int64(saveAssignmentRetryJitter)))
+		time.Sleep(saveAssignmentRetryBaseDelay + jitter)
+		// Re-read the assignment to get the latest version.
+		readCtx, readCancel := udpCorrelationCtx(DefaultStorageTimeout, acId, transactionId)
+		current, readErr := s.storage.GetACAssignment(readCtx, acId)
+		readCancel()
+		if readErr != nil && !IsNotFoundError(readErr) {
+			// Re-read failed transiently. Try again with the
+			// previously-incremented version; if it still
+			// conflicts, the next iteration will re-read again.
+			continue
+		}
+		if current == nil || IsNotFoundError(readErr) {
+			// Item disappeared (concurrent delete / TTL). Treat as
+			// "no assignment" and try Version=1.
+			assignment.Version = 1
+		} else {
+			assignment.Version = current.Version + 1
+		}
+	}
+	s.metrics.IncrCounter(MetricACAssignmentVersionConflictExhausted)
+	log.Warning("server-ac(%s#%d@%s)[autoAssignAC] version conflict retries exhausted (%d attempts), accepting directly",
+		acId, transactionId, addrStr, saveAssignmentMaxAttempts)
+	return lastErr
 }
 
 // selectServersForAssignment picks up to maxCount servers with AZ distribution.
@@ -1186,12 +1461,100 @@ func (s *UdpServer) validateACLicense(
 		return rejectErr
 	}
 
+	// #1157 F4 license-customer cross-check. Runs AFTER the
+	// pubkey-binding gate so a forged-pubkey registration is
+	// rejected first (avoids a storage round-trip on attacker
+	// traffic). Looks up ACAssignment.CustomerID for the claimed
+	// acId; if a populated CustomerID exists and disagrees with
+	// license.CustomerID, this is cross-customer impersonation
+	// (#1157 F4 attack signature). See license_customer_gate.go.
+	//
+	// Storage-error policy: a transient storage outage MUST NOT
+	// reject legitimate registrations. We treat lookup-err as
+	// "skip the cross-check" and emit MetricLicenseCustomerLookupErr
+	// for observability — same availability fallback as
+	// autoAssignAC's "fall through to accept directly" branch.
+	//
+	// Fresh context (rather than reusing the validateACLicense ctx
+	// from L1349): the upstream GetLicense + bcrypt could have
+	// drained most of the 5s DefaultStorageTimeout under DDB
+	// throttling or slow-path bcrypt. If the F4 GetACAssignment
+	// then hits a near-expired ctx, it returns a transient error
+	// and the storage-error policy degrades to Unbound — a SILENT
+	// strict-mode bypass with only MetricLicenseCustomerLookupErr
+	// as the operator signal. Decoupling the F4 deadline from
+	// upstream latency removes that bypass surface; the alarm on
+	// LicenseCustomerLookupErr (#1514) still catches a real DDB
+	// outage. Mirrors autoAssignAC's per-call ctx pattern at L892.
+	f4Ctx, f4Cancel := udpCorrelationCtx(DefaultStorageTimeout, acId, transactionId)
+	customerVerdict, existingCustomerID := s.evaluateACIDCustomerVerdict(f4Ctx, acId, license.CustomerID, transactionId, addrStr)
+	f4Cancel()
+	customerProceed, customerRejectErr := s.applyACIDCustomerVerdict(customerVerdict, acId, license.CustomerID, existingCustomerID, transactionId, addrStr, keyPrefix)
+	if !customerProceed {
+		s.recordLicenseFailure(addrStr, acId)
+		return customerRejectErr
+	}
+
 	log.Info("server-ac(%s#%d@%s)[validateACLicense] license validated (key=%s...), tier=%s, customer=%s",
 		acId, transactionId, addrStr, keyPrefix, license.Tier, license.CustomerID)
 	return nil
 }
 
-// recordLicenseFailure records a failed license validation attempt for rate limiting.
+// evaluateACIDCustomerVerdict performs the storage lookup half of
+// the #1157 F4 gate and returns (verdict, existingCustomerID).
+// Pulled out of validateACLicense so the cross-check can be tested
+// independently of bcrypt + pubkey-binding setup. Returns the
+// observed CustomerID alongside the verdict so the caller can
+// pass it into applyACIDCustomerVerdict for log context without a
+// second storage round-trip.
+//
+// Storage-error policy: a transient lookup error fires
+// MetricLicenseCustomerLookupErr and returns
+// verdictACIDCustomerUnbound (skip-the-cross-check). Same
+// availability contract as autoAssignAC's fallthrough branch — a
+// flaky DDB cannot weaponize legitimate registrations into
+// strict-mode rejects.
+func (s *UdpServer) evaluateACIDCustomerVerdict(
+	ctx context.Context,
+	acId string,
+	licenseCustomerID string,
+	transactionId uint64,
+	addrStr string,
+) (licenseACIDCustomerVerdict, string) {
+	if s.storage == nil {
+		return verdictACIDCustomerUnbound, ""
+	}
+	assignment, err := s.storage.GetACAssignment(ctx, acId)
+	if err != nil {
+		if IsNotFoundError(err) {
+			return verdictACIDCustomerUnbound, ""
+		}
+		// Transient storage error. Don't escalate to a strict-mode
+		// reject — degrade gracefully and emit the lookup-err
+		// counter so operators can spot a sustained flap. No
+		// nil-guard: UdpServer.metrics is initialized by NewUdpServer
+		// (mirrors applyACPubkeyCapVerdict / applyACIDCustomerVerdict).
+		s.metrics.IncrCounter(MetricLicenseCustomerLookupErr)
+		log.Warning("server-ac(%s#%d@%s)[LicenseCustomer] ACAssignment lookup failed: %v (skipping cross-check; see %s)",
+			acId, transactionId, addrStr, err, MetricLicenseCustomerLookupErr)
+		return verdictACIDCustomerUnbound, ""
+	}
+	if assignment == nil {
+		return verdictACIDCustomerUnbound, ""
+	}
+	return verifyACIDCustomer(assignment.CustomerID, licenseCustomerID), assignment.CustomerID
+}
+
+// recordLicenseFailure feeds the per-source/per-acId rate limiter on
+// any validateACLicense-class registration reject. The name is
+// historical (#1155 introduced it for License.BoundPubKeys mismatches);
+// since #1157 F3 it is the shared throttle for ALL registration-time
+// reject classes that an attacker could burn to DoS the registration
+// path: license-pubkey gate rejects, license-customer gate rejects,
+// and AC-pubkey-cap gate rejects (both pre-check and in-lock). A
+// future reject class added on the registration path should call this
+// too — the rate limiter doesn't distinguish reject classes, and
+// leaving any path unwired re-opens the burn-without-throttle attack.
 func (s *UdpServer) recordLicenseFailure(addrStr, acId string) {
 	if s.licenseRateLimiter != nil {
 		s.licenseRateLimiter.RecordFailure(addrStr, acId)

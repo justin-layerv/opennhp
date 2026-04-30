@@ -14,7 +14,14 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
       - "CLAUDE.md"
       - "scripts/check-scope-drift.sh"
+      - "scripts/check-disable-agent-validation.sh"
       - "tests/scripts/**"
+      - "tests/lints/disable-agent-validation/**"
+      - "terraform/modules/compute/user_data.sh.tpl"
+      - "terraform/environments/prod/**"
+      - "terraform/environments/sandbox/**"
+      - "docker/nhp-server/etc/config.toml"
+      - "endpoints/server/main/etc/config.toml"
   pull_request:
     branches: [ "main" ]
     paths:
@@ -22,7 +29,14 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
       - "CLAUDE.md"
       - "scripts/check-scope-drift.sh"
+      - "scripts/check-disable-agent-validation.sh"
       - "tests/scripts/**"
+      - "tests/lints/disable-agent-validation/**"
+      - "terraform/modules/compute/user_data.sh.tpl"
+      - "terraform/environments/prod/**"
+      - "terraform/environments/sandbox/**"
+      - "docker/nhp-server/etc/config.toml"
+      - "endpoints/server/main/etc/config.toml"
 
 # Restrict default permissions for security
 permissions:
@@ -110,3 +124,19 @@ jobs:
       # if-expressions, so this is the regression guard.
       - name: Test promote-to-prod gating (issue #1322)
         run: python3 tests/scripts/test_promote_to_prod_gating.py
+
+      # Structural fence against DisableAgentValidation=true creeping
+      # into a deployable config (#1157 F9). The flag turns off agent
+      # static-pubkey validation entirely; setting it true in any
+      # prod path is a security regression with no runtime signal.
+      # The check is string-grep based so it stays runnable without
+      # parser deps.
+      #
+      # The fixture suite runs first so a regex regression (e.g., a
+      # tightening that drops a covered case) surfaces before the
+      # production paths run.
+      - name: Test check-disable-agent-validation.sh (#1157 F9 fixtures)
+        run: bash tests/lints/disable-agent-validation/run-fixtures.sh
+
+      - name: Check DisableAgentValidation flag (#1157 F9)
+        run: bash scripts/check-disable-agent-validation.sh

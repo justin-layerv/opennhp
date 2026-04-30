@@ -151,6 +151,35 @@ var (
 	// agent log doesn't blame the license for what is actually a
 	// server-side dispatch-table bug.
 	ErrLicensePubkeyInternal = newError("52014", "license pubkey gate internal error (unknown verdict)")
+	// ErrACPubkeyCapExceeded — emitted by the AC pubkey-cap gate
+	// (#1157 F3) under strict mode when registering this peer would
+	// push the count of distinct static pubkeys for an acId above
+	// MaxACConnsPerID. Pre-#1157 the cap was on total connections,
+	// so an attacker presenting MaxACConnsPerID distinct pubkeys
+	// (one per source IP) under one acId could FIFO-evict the
+	// legitimate AC. The fix counts distinct pubkeys instead so the
+	// cap costs an attacker N pubkeys per evicted slot and exposes N
+	// attacker identities in the logs. Agent-visible string stays
+	// issue-number-free so agent logs are grep-friendly.
+	ErrACPubkeyCapExceeded = newError("52015", "AC pubkey cap exceeded for this AC ID")
+	// ErrACPubkeyCapInternal — emitted by the same gate's
+	// fail-closed default branch (unknown verdict). Same mechanical
+	// pattern as ErrLicensePubkeyInternal / ErrKnockHeaderTypeInternal.
+	ErrACPubkeyCapInternal = newError("52016", "AC pubkey cap gate internal error (unknown verdict)")
+	// ErrLicenseCustomerMismatch — emitted by the license-vs-acId
+	// customer cross-check gate (#1157 F4) under strict mode when
+	// the License.CustomerID disagrees with the previously bound
+	// CustomerID for the claimed acId. Pre-#1157 a license issued
+	// to customer A could be presented with an acId that belongs to
+	// customer B and would be accepted; the cross-check breaks
+	// cross-customer impersonation by binding acId→customer at
+	// first-registration (TOFU) and rejecting subsequent licenses
+	// from a different customer. Agent-visible string stays
+	// issue-number-free so agent logs are grep-friendly.
+	ErrLicenseCustomerMismatch = newError("52017", "license customer does not own this AC ID")
+	// ErrLicenseCustomerInternal — emitted by the same gate's
+	// fail-closed default branch (unknown verdict).
+	ErrLicenseCustomerInternal = newError("52018", "license customer gate internal error (unknown verdict)")
 
 	// ac
 	ErrACOperationFailed       = newError("53001", "ac operation failed")

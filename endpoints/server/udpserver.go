@@ -114,6 +114,26 @@ type UdpServer struct {
 	// or protect it behind a mutex.
 	licensePubkeyVerifyRequire bool
 
+	// acPubkeyCapVerifyRequire gates strict-mode rejection of AC
+	// registrations whose presented static pubkey would push the
+	// distinct-pubkey count for the claimed acId above
+	// MaxACConnsPerID. Read once at Start from
+	// ACPubkeyCapVerifyEnvVar — see ac_pubkey_cap_gate.go for the
+	// gate policy and #1157 F3 for the threat model.
+	//
+	// Concurrency: same contract as licensePubkeyVerifyRequire.
+	acPubkeyCapVerifyRequire bool
+
+	// licenseACIDCustomerVerifyRequire gates strict-mode rejection of
+	// AC registrations whose license CustomerID disagrees with the
+	// ACAssignment-recorded CustomerID for the claimed acId. Read
+	// once at Start from LicenseACIDCustomerVerifyEnvVar — see
+	// license_customer_gate.go for the gate policy and #1157 F4 for
+	// the threat model.
+	//
+	// Concurrency: same contract as licensePubkeyVerifyRequire.
+	licenseACIDCustomerVerifyRequire bool
+
 	// connection and remote transaction management
 
 	remoteConnectionMapMutex sync.Mutex
@@ -307,6 +327,34 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	} else {
 		log.Info("License pubkey verify gate: permit mode (#1155); watch %s (rollout) and %s (attack) before flipping NHP_LICENSE_PUBKEY_VERIFY=true",
 			MetricLicensePubkeyUnbound, MetricLicensePubkeyMismatch)
+	}
+
+	// Parse NHP_AC_PUBKEY_CAP_VERIFY (#1157 F3). Fail Start on an
+	// unrecognized token so an operator typo cannot silently leave
+	// the gate in permit mode. See ac_pubkey_cap_gate.go.
+	s.acPubkeyCapVerifyRequire, err = parseACPubkeyCapVerify(os.Getenv(ACPubkeyCapVerifyEnvVar))
+	if err != nil {
+		return fmt.Errorf("%s: %w", ACPubkeyCapVerifyEnvVar, err)
+	}
+	if s.acPubkeyCapVerifyRequire {
+		log.Info("AC pubkey-cap gate: strict mode (#1157 F3); distinct-pubkey cap exceeded rejects with 52015")
+	} else {
+		log.Info("AC pubkey-cap gate: permit mode (#1157 F3); watch %s before flipping NHP_AC_PUBKEY_CAP_VERIFY=true",
+			MetricACPubkeyCapExceeded)
+	}
+
+	// Parse NHP_LICENSE_ACID_CUSTOMER_VERIFY (#1157 F4). Fail Start
+	// on an unrecognized token so an operator typo cannot silently
+	// leave the gate in permit mode. See license_customer_gate.go.
+	s.licenseACIDCustomerVerifyRequire, err = parseLicenseACIDCustomerVerify(os.Getenv(LicenseACIDCustomerVerifyEnvVar))
+	if err != nil {
+		return fmt.Errorf("%s: %w", LicenseACIDCustomerVerifyEnvVar, err)
+	}
+	if s.licenseACIDCustomerVerifyRequire {
+		log.Info("License-customer cross-check gate: strict mode (#1157 F4); customer mismatch rejects with 52017")
+	} else {
+		log.Info("License-customer cross-check gate: permit mode (#1157 F4); watch %s (attack) and %s (storage flap) before flipping NHP_LICENSE_ACID_CUSTOMER_VERIFY=true",
+			MetricLicenseCustomerMismatch, MetricLicenseCustomerLookupErr)
 	}
 
 	// Initialize pluggable storage backend (DynamoDB or etcd)
@@ -1622,6 +1670,20 @@ func (s *UdpServer) AddACPeer(acPeer *core.UdpPeer) {
 		s.acPeerMap[acPeer.PublicKeyBase64()] = acPeer
 		s.acPeerMapMutex.Unlock()
 	}
+}
+
+// removeACPeer is the symmetric undo of AddACPeer: it removes the
+// pubkey from BOTH core.Device's peer table and acPeerMap. Today's
+// only caller is HandleACOnline's in-lock TOCTOU cleanup branch
+// (#1157 F3) where a peer was just added but the registration is
+// being rejected; if a future caller adds another write target to
+// AddACPeer, this helper must be widened in lockstep — the matching
+// fence is TestRemoveACPeer in handle_ac_online_f3_test.go.
+func (s *UdpServer) removeACPeer(acPubkeyBase64 string) {
+	s.device.RemovePeer(acPubkeyBase64)
+	s.acPeerMapMutex.Lock()
+	delete(s.acPeerMap, acPubkeyBase64)
+	s.acPeerMapMutex.Unlock()
 }
 
 func (s *UdpServer) AddAddressAssociation(srcIp string, addrs []*common.NetAddress) {

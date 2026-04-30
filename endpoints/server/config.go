@@ -62,12 +62,23 @@ type SrcIpMap struct {
 }
 
 type Config struct {
-	PrivateKeyBase64       string       `json:"privateKey"` //nolint:gosec // G117: config struct, never JSON-marshaled — TOML input only
-	Hostname               string       `json:"hostname"`
-	ListenIp               string       `json:"listenIp"`
-	ListenPort             int          `json:"listenPort"`
-	LogLevel               int          `json:"logLevel"`
-	DefaultCipherScheme    int          `json:"defaultCipherScheme"`
+	PrivateKeyBase64    string `json:"privateKey"` //nolint:gosec // G117: config struct, never JSON-marshaled — TOML input only
+	Hostname            string `json:"hostname"`
+	ListenIp            string `json:"listenIp"`
+	ListenPort          int    `json:"listenPort"`
+	LogLevel            int    `json:"logLevel"`
+	DefaultCipherScheme int    `json:"defaultCipherScheme"`
+	// #1157 F9: pelletier/go-toml/v2 (this project's TOML decoder)
+	// matches struct fields case-INsensitively regardless of whether
+	// a toml: tag is present — verified empirically with v2.3.0
+	// against `DisableAgentValidation`, `disableagentvalidation`,
+	// `DISABLEAGENTVALIDATION`, and `disableAgentValidation`, all of
+	// which parsed to true even with `toml:"DisableAgentValidation"`
+	// set. This means an explicit toml tag does NOT close the
+	// case-bypass door at runtime — the case-insensitive lint at
+	// scripts/check-disable-agent-validation.sh is the structural
+	// fence (intentionally `grep -Ei`). Do not add a toml: tag here
+	// expecting defense in depth; it provides none.
 	DisableAgentValidation bool         `json:"disableAgentValidation"`
 	WebRTC                 WebRTCConfig `toml:"webrtc"`
 
