@@ -47,7 +47,7 @@ resource "aws_route53_record" "discord_bot_cert_validation" {
   # CNAME directly in the zone; without `allow_overwrite`, Terraform
   # refuses to claim an existing record and the apply errors. Matches
   # the `aws_route53_record.cloudfront_cert_validation` posture in
-  # `terraform/modules/ac/main.tf:1123` — idempotent against console
+  # `terraform/modules/ac/main.tf` — idempotent against console
   # pre-staging.
   allow_overwrite = true
 
