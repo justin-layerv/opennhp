@@ -33,6 +33,7 @@ locals {
   # record (post-ALB-apply) will reference the same domain, and the
   # validation `name` below is built from it.
   discord_bot_domain = "discord.layerv.xyz"
+  slack_bot_domain   = "slackbot.layerv.xyz"
 }
 
 # Validates ACM cert in qurl-integrations sandbox account
@@ -71,6 +72,26 @@ resource "aws_route53_record" "discord_bot_cert_validation" {
   #     `terraform state rm aws_route53_record.discord_bot_cert_validation`,
   #     update `name`/`records` here, plan+apply (resource is
   #     re-created with prevent_destroy on the new instance).
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Validates ACM cert in qurl-integrations sandbox account
+# (730883236711, us-east-2):
+#   arn:aws:acm:us-east-2:730883236711:certificate/f6e26ea7-aea9-4d02-b06b-feb7679ff064
+# Same posture as the discord record above — hardcoded validation
+# tokens (cross-account ACM, no provider alias), `prevent_destroy`
+# guard, idempotent against console pre-staging.
+resource "aws_route53_record" "slack_bot_cert_validation" {
+  allow_overwrite = true
+
+  zone_id = var.qurl_hosted_zone_id
+  name    = "_fdbfa14f3d659c2d1586d6f833d90bfc.${local.slack_bot_domain}"
+  type    = "CNAME"
+  ttl     = 60
+  records = ["_be6d56f1f7df4a79161075db80592027.jkddzztszm.acm-validations.aws."]
+
   lifecycle {
     prevent_destroy = true
   }
