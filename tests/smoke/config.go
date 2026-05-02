@@ -186,6 +186,19 @@ func skipIfNoSSMProbes(t *testing.T) {
 	}
 }
 
+// skipIfQurlInternalALBDisabled skips the test cleanly when the
+// qurl-service internal ALB is not yet live in this env (rollout in
+// progress between PR1 stage-1A apply and PR2/PR3 consumer flips, or
+// during a rollback). Like skipIfNoSSMProbes, this is a POLICY state
+// — both PR1 and PR2 must apply before the gate flips on — not a
+// broken-setup state.
+func skipIfQurlInternalALBDisabled(t *testing.T) {
+	t.Helper()
+	if !testConfig.QURLInternalALBEnabled {
+		t.Skip("NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED not set — internal ALB not yet live in this env (rollout in progress, or rolled back)")
+	}
+}
+
 // skipIfNotBlueGreen skips the test cleanly when DeployMode is not
 // blue/green. Use at the top of tests that fence blue/green-specific
 // invariants (active/inactive ASGs, color-coded TGs, listener

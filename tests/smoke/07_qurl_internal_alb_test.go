@@ -78,9 +78,7 @@ var publicResolvers = []string{
 // if it explicitly bypasses any in-band resolver). Three independent
 // resolvers must agree on NXDOMAIN.
 func TestQurlInternalALB_NotPubliclyResolvable(t *testing.T) {
-	if !testConfig.QURLInternalALBEnabled {
-		t.Skip("NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED not set — internal ALB not yet live in this env (rollout in progress, or rolled back)")
-	}
+	skipIfQurlInternalALBDisabled(t)
 
 	for _, resolverAddr := range publicResolvers {
 		t.Run(resolverAddr, func(t *testing.T) {
@@ -152,9 +150,7 @@ func isPrivateOrCGN(ip net.IP) bool {
 // has stale resolver state" — fleet-wide iteration is the only way
 // to catch it, mirroring TestKnockLifecycle_AllServersReportACPeers.
 func TestQurlInternalALB_ResolvesToPrivateIPsFromVPC(t *testing.T) {
-	if !testConfig.QURLInternalALBEnabled {
-		t.Skip("NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED not set — internal ALB not yet live in this env (rollout in progress, or rolled back)")
-	}
+	skipIfQurlInternalALBDisabled(t)
 	skipIfNoSSMProbes(t)
 
 	asgName := requireActiveServerASG(t)
@@ -233,9 +229,7 @@ func TestQurlInternalALB_ResolvesToPrivateIPsFromVPC(t *testing.T) {
 // Iterates every InService instance to catch per-instance regressions
 // (resolver cache drift, TLS trust store skew).
 func TestQurlInternalALB_HandlerReachableFromVPC(t *testing.T) {
-	if !testConfig.QURLInternalALBEnabled {
-		t.Skip("NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED not set — internal ALB not yet live in this env (rollout in progress, or rolled back)")
-	}
+	skipIfQurlInternalALBDisabled(t)
 	skipIfNoSSMProbes(t)
 
 	asgName := requireActiveServerASG(t)
@@ -259,7 +253,6 @@ func TestQurlInternalALB_HandlerReachableFromVPC(t *testing.T) {
 			// ASG × 2-endpoint × ~45s SSM-wait grid runs concurrently
 			// rather than serially. Same shape as TestKnockLifecycle_*.
 			for _, instance := range instances {
-				instance := instance // capture before t.Parallel
 				t.Run(instance, func(t *testing.T) {
 					t.Parallel()
 

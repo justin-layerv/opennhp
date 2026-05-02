@@ -158,6 +158,27 @@ const (
 	// crash during its current lifetime?" Zero is the only healthy
 	// value.
 	cmdSystemdNRestartsNhpServer = "systemctl show nhp-server --property=NRestarts --value"
+
+	// nhpServerEnvFilePath is the systemd EnvironmentFile that
+	// user_data.sh.tpl renders into for the nhp-server unit. Centralized
+	// so probes, error wrappers, and tests share one source of truth.
+	nhpServerEnvFilePath = "/opt/layerv/nhp-server/etc/env"
+
+	// cmdGrepQurlAPIURL reads the QURL_API_URL line from the nhp-server
+	// systemd EnvironmentFile. The line is written by
+	// terraform/modules/compute/user_data.sh.tpl ('QURL_API_URL=' line)
+	// from var.qurl_config.api_url. A regression here means a tfvars
+	// revert pointed the plugin back at the public ALB — defeating the
+	// network-isolation guarantee from qurl-service #335.
+	//
+	// `-m1` returns the FIRST match. systemd EnvironmentFile semantics
+	// take the LAST occurrence when a key is duplicated, so the
+	// invariant load-bearing for probe correctness is "user_data
+	// renders exactly one QURL_API_URL= line." If a future template
+	// ever writes a placeholder followed by an override, this probe
+	// silently asserts on the wrong value. (`tail -1` would match
+	// systemd's resolution rule, but `|` is in the reject-list.)
+	cmdGrepQurlAPIURL = "grep -m1 '^QURL_API_URL=' " + nhpServerEnvFilePath
 )
 
 // rejectPatterns are command substrings that must never appear in any
@@ -233,6 +254,15 @@ var errCommandRejected = errors.New("ssm_probe: command rejected by reject-list"
 // this as "transport reachability failure" rather than HTTP status 0.
 var errCurlNoResponse = errors.New("ssm_probe: curl received no HTTP response (TCP timeout or unreachable)")
 
+// ssmFailedErrorFmt is the format sendShellScript uses for terminal
+// non-success SSM states (Failed, Canceled, TimedOut). Pulled out as
+// a constant so classifyQurlAPIURLError's substring match is coupled
+// to exactly one place — a refactor that changes this format trips
+// TestSSMFailedErrorFmtLockMatchesClassifier in the same package, so
+// the silent-regression class the cr called out (#1597) is fenced
+// even before the typed-error refactor lands.
+const ssmFailedErrorFmt = "ssm command %s status=%s stderr=%q"
+
 // sendShellScript is the ONLY function in this package that actually
 // calls SSM. It is unexported; callers are the named probe functions
 // below. Tests must not call it directly.
@@ -304,7 +334,7 @@ func sendShellScript(ctx context.Context, instanceID, cmd string) (string, error
 		case ssmtypes.CommandInvocationStatusFailed,
 			ssmtypes.CommandInvocationStatusCancelled,
 			ssmtypes.CommandInvocationStatusTimedOut:
-			return "", fmt.Errorf("ssm command %s status=%s stderr=%q",
+			return "", fmt.Errorf(ssmFailedErrorFmt,
 				cmdID, getResp.Status, aws.ToString(getResp.StandardErrorContent))
 		}
 
@@ -445,6 +475,85 @@ func probeCurlInternalQurlEndpointStatus(ctx context.Context, instanceID, hostna
 		return 0, fmt.Errorf("parse http status %q: %w", out, err)
 	}
 	return code, nil
+}
+
+// probeQurlAPIURL reads the QURL_API_URL value from the nhp-server
+// systemd EnvironmentFile on the host. Returns the URL on success,
+// or an error if the file is missing, the line is missing, or the
+// SSM call fails.
+//
+// Regression fence for qurl-service #335 PR2 — the value should be
+// the workload-account internal-ALB hostname, not the public
+// api.layerv.* hostname. A revert here means either tfvars regressed
+// to the public URL or the user_data templating broke.
+func probeQurlAPIURL(ctx context.Context, instanceID string) (string, error) {
+	out, err := sendShellScript(ctx, instanceID, cmdGrepQurlAPIURL)
+	if err != nil {
+		return "", classifyQurlAPIURLError(err)
+	}
+	return parseQurlAPIURLValue(out)
+}
+
+// parseQurlAPIURLValue extracts the RHS of a "QURL_API_URL=..." env
+// file line. The unexpected-shape branch is unreachable from the
+// production probe path because cmdGrepQurlAPIURL anchors on
+// `^QURL_API_URL=` — but a transient SSM agent bug or a future probe
+// that bypasses the anchor would surface here as a clear shape error
+// rather than a silent empty-value drift hint at the classifier layer.
+// Pulled out as a pure function so the malformed-line branch can be
+// pinned by TestParseQurlAPIURLValue without an SSM round-trip.
+func parseQurlAPIURLValue(line string) (string, error) {
+	line = strings.TrimSpace(line)
+	const prefix = "QURL_API_URL="
+	if !strings.HasPrefix(line, prefix) {
+		return "", fmt.Errorf("unexpected env file line shape: %q", line)
+	}
+	return strings.TrimPrefix(line, prefix), nil
+}
+
+// classifyQurlAPIURLError turns sendShellScript's generic error into a
+// triage-ready diagnostic for the two grep failure modes the
+// QURL_API_URL probe cares about:
+//
+//   - exit 2 (env file missing): stderr carries "No such file or
+//     directory". Render as "nhp-server env file missing".
+//   - exit 1 (line missing): SSM returns Failed with empty stderr,
+//     surfacing here as `status=Failed stderr=""`. Render as
+//     "QURL_API_URL line missing".
+//
+// All other shapes pass through untouched. Pulled out as a pure
+// function so the dispatch contract is unit-testable in
+// ssm_probe_test.go without an SSM round-trip.
+//
+// Note: sendShellScript uses the same `status=%s stderr=%q` format
+// for the canceled and timed-out command paths. Those could match
+// `stderr=""` if their stderr is empty, but they explicitly do NOT
+// match this branch because we anchor on `status=Failed`. SSM-side
+// cancel/timeout falls through to the pass-through path — the right
+// outcome.
+//
+// String-matching on sendShellScript's own format string is brittle
+// by construction; #1597 tracks moving sendShellScript to typed
+// errors so this dispatcher can switch on category instead.
+//
+// Branch order is informational priority, not correctness. The two
+// matching substrings are mutually exclusive in practice — empty
+// stderr cannot also contain "No such file or directory" — so they
+// can never both match. If a future grep variant ever did emit both,
+// the file-missing branch wins because it is the more informative
+// diagnostic. Do not reorder expecting different semantics.
+func classifyQurlAPIURLError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "No such file or directory"):
+		return fmt.Errorf("nhp-server env file missing at %s — qurl-plugin not provisioned or user_data dropped the env-file write: %w", nhpServerEnvFilePath, err)
+	case strings.Contains(msg, `status=Failed stderr=""`):
+		return fmt.Errorf("QURL_API_URL line missing in %s — qurl_config.enabled=false in tfvars, or user_data template regressed the qurl block: %w", nhpServerEnvFilePath, err)
+	}
+	return err
 }
 
 // probeServerNRestarts returns systemd's NRestarts counter for the

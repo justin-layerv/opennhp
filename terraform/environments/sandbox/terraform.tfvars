@@ -322,9 +322,19 @@ deploy_cost_analytics = true
 # ==============================================================================
 # QURL plugin handles token resolution: SPA redirects to /plugins/qurl
 # which validates tokens via QURL API and performs NHP knock
+# api_url points at the internal-ALB hostname (workload-account PHZ
+# alias). NHP server is in private subnets and resolves the PHZ via the
+# VPC Route 53 Resolver. The plugin only calls /internal/v1/*, which is
+# exactly the surface served by the internal ALB. See qurl-service #335
+# for the network-isolation rationale.
 qurl_config = {
-  enabled                 = true
-  api_url                 = "https://api.layerv.xyz"
+  enabled = true
+  # TODO(#1605): qurl_config.api_url is free-form here but is required to
+  # match the workload-account PHZ alias built from the soon-to-be-introduced
+  # var.qurl_internal_service_domain. Once #1605 lands, this field is
+  # derived in TF rather than hand-written, eliminating the configuration-
+  # drift class that tests/smoke/08_qurl_api_url_internal_test.go fences.
+  api_url                 = "https://internal-api.qurl.layerv.xyz"
   allowed_redirect_domain = "qurl.site.layerv.xyz"
   api_timeout             = 10
   max_idle_conns          = 10
