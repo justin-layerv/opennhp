@@ -617,7 +617,7 @@ resource "aws_security_group" "ecs" {
       to_port     = var.container_port
       protocol    = "tcp"
       cidr_blocks = [var.vpc_cidr]
-      description = "HTTP from VPC (legacy bypass — to be removed via enforce_internal_alb_only=true)"
+      description = "HTTP from VPC (legacy bypass - to be removed via enforce_internal_alb_only=true)"
     }
   }
 
