@@ -72,6 +72,84 @@ const (
 	cmdDockerNhpServerRunning = "docker ps --filter name=nhp-server --format '{{.Status}}'"
 	cmdDockerImageTag         = "docker inspect --format '{{.Config.Image}}' nhp-server"
 
+	// cmdDigInternalQurlAPI resolves the qurl-service internal ALB
+	// hostname from the NHP server's view. Successful resolution to an
+	// RFC1918 address proves: (a) the workload-account private hosted
+	// zone exists, (b) the zone is associated with the VPC, (c) the
+	// A-alias to the internal ALB is wired correctly. The result is
+	// parsed by probeDigInternalQurlAPI, which validates the answer is
+	// non-empty and starts with a private-IP byte. `+short` returns
+	// only the answer-section A records, one per line.
+	//
+	// `dig` is preinstalled on Amazon Linux 2023 (bind-utils package).
+	// Do NOT switch to nslookup or getent — both have quieter failure
+	// modes that hide NXDOMAIN-vs-empty-answer drift, exactly the
+	// regression class this probe exists to catch.
+	//
+	// Hostname is interpolated at probe-call time (see
+	// probeDigInternalQurlAPI) since it varies per environment. The
+	// reject-list is checked on the FINAL command string, so the
+	// interpolated form must still pass — keeping the format string
+	// here as a constant lets the reject-list catch tampering.
+	//
+	// +time=3 +tries=1 keeps a misconfigured PHZ from hanging the
+	// probe through dig's default 5-second-per-try, three-try retry
+	// budget. A clean-fail diagnostic in 3s beats a flaky-looking
+	// timeout at 15s.
+	cmdDigInternalQurlAPIFmt = "dig +short +time=3 +tries=1 %s"
+
+	// cmdCurlInternalQurlAPIFmt curls the qurl-service internal ALB
+	// /internal/v1/resource/<id>/target endpoint without an auth token.
+	// We expect 401 from the auth middleware. Reaching 401 is stronger
+	// than reaching 200 because it proves: (a) DNS resolves, (b) TLS
+	// handshakes correctly with the new cert, (c) ALB SG accepts the
+	// connection, (d) HostValidation passes (otherwise 400), (e) the
+	// auth middleware actually runs (otherwise the handler 404s the
+	// missing resource and we miss the auth gate).
+	//
+	// The resource ID is a structurally-valid `r_` + 11 base64url
+	// chars literal so a future refactor that moves resource-ID format
+	// validation into middleware (above auth) doesn't flip this probe
+	// from 401 to 400 and silently break the diagnosis. Today the
+	// format check lives inside the handler (resolve.go:225), AFTER
+	// InternalServiceAuth in the middleware chain, so an unauthenticated
+	// caller hits the 401 first regardless of ID shape — but pinning a
+	// valid shape is cheap belt-and-suspenders.
+	//
+	// `-sS` is silent on success, errors on failure. `-o /dev/null`
+	// discards body. `-w '%%{http_code}'` prints just the status code
+	// to stdout, which the probe parses as int. `--max-time 10` is a
+	// generous request timeout — the internal ALB lives on the same
+	// VPC ENI subnet as the caller, so anything above 1s is a problem.
+	// `--insecure` is NOT used; a cert-validation failure is a real
+	// regression we want to catch.
+	//
+	// Hostname interpolation: the only %s slot is the qurl-service
+	// internal hostname, sourced from var.qurl_internal_service_domain
+	// in tfvars (validated by a regex precondition on that var). It is
+	// operator-controlled config, NOT user input. The reject-list in
+	// sendShellScript is defense-in-depth; the primary gate against
+	// hostile hostnames is the variable validation.
+	cmdCurlInternalQurlAPIFmt = "curl -sS -o /dev/null -w '%%{http_code}' --max-time 10 https://%s/internal/v1/resource/r_smokeprobe1/target"
+
+	// cmdCurlInternalQurlResolveFmt is the parallel probe to
+	// cmdCurlInternalQurlAPIFmt but hits POST /internal/v1/resolve
+	// directly — the actual endpoint that issue qurl-service#335
+	// names. If a future refactor changes middleware order on /resolve
+	// specifically (e.g., parses the body before InternalServiceAuth),
+	// the /resource/.../target probe alone wouldn't catch it. Today
+	// both endpoints share the InternalServiceAuth middleware, so
+	// POST with an empty body and no token returns 401 from auth
+	// before any body parsing happens.
+	//
+	// `-d '{}'` triggers POST automatically and sends a structurally
+	// valid (but semantically empty) JSON body, so a regression that
+	// makes the body-parse step run before auth fails differently
+	// (400 invalid_request_body) than a HostValidation-rejected one
+	// (400 invalid_host) — the test's existing 400 diagnostic
+	// mentions both possibilities.
+	cmdCurlInternalQurlResolveFmt = "curl -sS -o /dev/null -w '%%{http_code}' --max-time 10 -H 'Content-Type: application/json' -d '{}' https://%s/internal/v1/resolve"
+
 	// cmdSystemdNRestartsNhpServer reads systemd's NRestarts counter
 	// for the nhp-server unit. systemd increments NRestarts only when
 	// the unit exits unexpectedly and is re-executed by Restart=; a
@@ -118,6 +196,29 @@ var rejectPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\bapt(-get)?\s+(install|remove|purge|upgrade)\b`),
 	regexp.MustCompile(`\byum\s+(install|remove|update)\b`),
 	regexp.MustCompile(`\bdpkg\s+-i\b`),
+
+	// Shell control chars: command chaining and substitution. Reject any
+	// probe containing these — every legitimate probe today is a single
+	// command with no chaining or substitution. If a future probe needs
+	// piping or chaining, write it as a multi-line script invoked via
+	// the named-helper API and audit it explicitly. The regex on
+	// operator-controlled inputs (e.g., qurl_internal_service_domain)
+	// already prevents these chars from being interpolated, so this is
+	// pure defense-in-depth: it catches probes typed by future
+	// contributors before the named-helper review can.
+	//
+	// Stricter than just shell metachars: this also rejects `;`/`|`/etc.
+	// inside quoted args and JSON bodies. A future probe that needs to
+	// carry one of these in a payload (e.g. a header `Cookie: a;b`,
+	// or a JSON literal containing a backtick) cannot use the named
+	// curl/dig helpers above — it must use a different transport
+	// (separate Go HTTP/DNS client routed through the SSM session, or
+	// base64-encode the payload and decode in a server-side script).
+	regexp.MustCompile(`;`),
+	regexp.MustCompile(`\|`),
+	regexp.MustCompile(`&&`),
+	regexp.MustCompile(`\$\(`),
+	regexp.MustCompile("`"),
 }
 
 // errCommandRejected is returned by sendShellScript when a probe string
@@ -125,6 +226,12 @@ var rejectPatterns = []*regexp.Regexp{
 // the reject-list is overreaching, or a new probe was added that should
 // not exist.
 var errCommandRejected = errors.New("ssm_probe: command rejected by reject-list")
+
+// errCurlNoResponse is returned when curl writes "000" — its sentinel
+// for "no HTTP response observed" (TCP timeout, --max-time exceeded,
+// connection refused before any response bytes). Callers should render
+// this as "transport reachability failure" rather than HTTP status 0.
+var errCurlNoResponse = errors.New("ssm_probe: curl received no HTTP response (TCP timeout or unreachable)")
 
 // sendShellScript is the ONLY function in this package that actually
 // calls SSM. It is unexported; callers are the named probe functions
@@ -244,6 +351,100 @@ func probeDockerNhpServerRunning(ctx context.Context, instanceID string) (string
 // container was launched from (e.g. "layerv/nhp-server:abc123...").
 func probeDockerImageTag(ctx context.Context, instanceID string) (string, error) {
 	return sendShellScript(ctx, instanceID, cmdDockerImageTag)
+}
+
+// probeDigInternalQurlAPI runs `dig +short <hostname>` on the NHP
+// server EC2 (in private subnets) and returns the raw output (one IP
+// per line, possibly empty). Callers parse and validate that the
+// returned addresses are RFC1918.
+//
+// Hostname is interpolated by the caller; we re-check the assembled
+// command against the reject-list inside sendShellScript so a typo or
+// hostile injection still fails closed. The hostname format itself is
+// constrained by terraform's qurl_internal_service_domain validation
+// (see terraform/variables.tf), so reaching here with a malformed
+// hostname is impossible under normal operation.
+//
+// Regression fence for qurl-service #335 rollout: PR1 introduces the
+// internal ALB + private hosted zone; this probe pins that DNS works
+// from inside the VPC. A regression here fires when the PHZ
+// VPC-association is dropped, the A-alias is broken, or the workload
+// account loses its Route 53 Resolver wiring.
+func probeDigInternalQurlAPI(ctx context.Context, instanceID, hostname string) (string, error) {
+	cmd := fmt.Sprintf(cmdDigInternalQurlAPIFmt, hostname)
+	return sendShellScript(ctx, instanceID, cmd)
+}
+
+// internalQurlEndpoint identifies which internal API endpoint a probe
+// targets. Used by probeCurlInternalQurlEndpointStatus to pick the
+// command format — keeps two parallel probe functions from drifting.
+type internalQurlEndpoint int
+
+const (
+	// internalQurlEndpointResourceTarget hits GET
+	// /internal/v1/resource/r_smokeprobe1/target. Fences general stack
+	// reachability (DNS/TLS/SG/HostValidation/auth).
+	internalQurlEndpointResourceTarget internalQurlEndpoint = iota
+	// internalQurlEndpointResolve hits POST /internal/v1/resolve with
+	// an empty JSON body. Fences the actual endpoint named by issue
+	// qurl-service#335 — auth-middleware-runs-before-body-parse.
+	internalQurlEndpointResolve
+)
+
+// path returns the request path each enum value corresponds to. Test
+// error messages read this rather than maintaining a parallel literal —
+// keeps the enum, the format-string constant, and the diagnostic
+// description from drifting silently.
+func (e internalQurlEndpoint) path() string {
+	switch e {
+	case internalQurlEndpointResourceTarget:
+		return "/internal/v1/resource/r_smokeprobe1/target"
+	case internalQurlEndpointResolve:
+		return "/internal/v1/resolve"
+	default:
+		return fmt.Sprintf("<unknown endpoint %d>", e)
+	}
+}
+
+// probeCurlInternalQurlEndpointStatus curls a qurl-service internal
+// API endpoint from the host loopback (via the internal ALB) without
+// auth and returns the HTTP status code. 401 is the expected healthy
+// value (proves auth middleware reached); 400 means HostValidation
+// rejected (or, on /resolve, that the body parser ran before auth —
+// itself a regression worth catching); 502/504 mean SG/ALB path is
+// broken; anything else is a new regression class.
+//
+// Regression fence for qurl-service #335 rollout: PR1 stands up the
+// internal ALB and PR1's sub-step 1B closes the in-VPC ECS-SG bypass.
+// Whichever stage we're in, both endpoints should return 401 from
+// inside the VPC.
+func probeCurlInternalQurlEndpointStatus(ctx context.Context, instanceID, hostname string, endpoint internalQurlEndpoint) (int, error) {
+	var cmd string
+	switch endpoint {
+	case internalQurlEndpointResourceTarget:
+		cmd = fmt.Sprintf(cmdCurlInternalQurlAPIFmt, hostname)
+	case internalQurlEndpointResolve:
+		cmd = fmt.Sprintf(cmdCurlInternalQurlResolveFmt, hostname)
+	default:
+		return 0, fmt.Errorf("unknown internal qurl endpoint: %d", endpoint)
+	}
+	out, err := sendShellScript(ctx, instanceID, cmd)
+	if err != nil {
+		return 0, err
+	}
+	out = strings.TrimSpace(out)
+	// curl writes "000" when --max-time is exceeded or the connection
+	// fails before any HTTP response. Surface this as errCurlNoResponse
+	// so the caller can render a clear "ALB unreachable / TCP timeout"
+	// diagnostic instead of treating it as an unexpected status 0.
+	if out == "000" {
+		return 0, errCurlNoResponse
+	}
+	code, err := strconv.Atoi(out)
+	if err != nil {
+		return 0, fmt.Errorf("parse http status %q: %w", out, err)
+	}
+	return code, nil
 }
 
 // probeServerNRestarts returns systemd's NRestarts counter for the

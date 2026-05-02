@@ -291,6 +291,60 @@ variable "certificate_arn" {
   default     = null
 }
 
+# ==================== Internal ALB ====================
+# A second, internal-only ALB serves /internal/v1/* to in-VPC consumers
+# (NHP server, AC Traefik plugin). The public ALB still serves /v1/*
+# from the internet; PR4 of the rollout adds a listener rule that 404s
+# /internal/* on the public ALB.
+#
+# Trust model and multi-PR rollout sequence are documented in the
+# nhp PR that introduced these variables (network-isolate qurl-service
+# /internal/v1/*, qurl-service #335) and tracked in nhp follow-up
+# issues #1589 / #1590 / #1591 / #1592.
+
+variable "internal_alb_enabled" {
+  description = "When true, stand up an internal ALB (internal=true, private subnets) that forwards to the same target group as the public ALB. Consumers point at internal_alb_dns_name (or the workload-account private hosted zone alias). Default false so the resource is opt-in and tfvars must be set explicitly per-env."
+  type        = bool
+  default     = false
+}
+
+variable "internal_domain_name" {
+  description = "Hostname served by the internal ALB (e.g., internal-api.qurl.layerv.xyz). Added to ALLOWED_HOSTS so HostValidation accepts it. Required when internal_alb_enabled = true."
+  type        = string
+  default     = null
+
+  # RFC1035 label-shape FQDN check: each label starts/ends with an
+  # alphanumeric, hyphens allowed only internally, labels separated
+  # by dots, at least two labels. Mirrors the root variable
+  # qurl_internal_service_domain regex for consistency.
+  validation {
+    condition     = var.internal_domain_name == null || can(regex("^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\\.)+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$", var.internal_domain_name))
+    error_message = "internal_domain_name must be a valid RFC1035 FQDN (e.g., internal-api.qurl.layerv.xyz): each label 1-63 chars, alphanumeric edges, hyphens only internally, at least two labels, no leading/trailing dot."
+  }
+}
+
+variable "internal_certificate_arn" {
+  description = "ACM certificate ARN for the internal ALB HTTPS listener. Required when internal_alb_enabled = true. Must cover internal_domain_name. Independent of the public ALB cert (no SAN coupling)."
+  type        = string
+  default     = null
+
+  # Structural ACM ARN check: catches the copy-pasted-wrong-cert class
+  # at plan time rather than mid-apply when the listener attach fails.
+  # Doesn't verify the cert covers internal_domain_name (ACM SAN list is
+  # not cleanly available via TF data sources); SNI mismatch surfaces in
+  # the smoke fence's TLS leg instead.
+  validation {
+    condition     = var.internal_certificate_arn == null || can(regex("^arn:aws:acm:[a-z0-9-]+:[0-9]+:certificate/[a-zA-Z0-9-]+$", var.internal_certificate_arn))
+    error_message = "internal_certificate_arn must be a valid ACM certificate ARN (e.g., arn:aws:acm:us-east-2:123456789012:certificate/abc-...)."
+  }
+}
+
+variable "enforce_internal_alb_only" {
+  description = "When true, removes the legacy 'HTTP from VPC (cidr_blocks)' ingress rule on the ECS task SG, leaving only ingress from the public-ALB SG and (if internal_alb_enabled) internal-ALB SG. Closes the in-VPC bypass identified in qurl-service #335 architecture review. Apply with `false` first, verify the new path serves traffic, then flip to `true` and apply again."
+  type        = bool
+  default     = false
+}
+
 # ==================== Redis ====================
 
 variable "redis_enabled" {

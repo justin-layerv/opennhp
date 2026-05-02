@@ -108,11 +108,16 @@ locals {
   task_cpu    = var.grafana_cloud_enabled ? max(var.container_cpu, 512) : var.container_cpu
   task_memory = ceil((var.grafana_cloud_enabled ? var.container_memory + 256 : var.container_memory) / 1024) * 1024
 
-  # Compute allowed hosts: ALB DNS + domain + localhost for health checks + any additional hosts
-  # Note: aws_lb.qurl.dns_name is referenced later, terraform handles the dependency
+  # Compute allowed hosts: ALB DNS + domain + localhost for health checks + any additional hosts.
+  # When the internal ALB is enabled, its DNS name and the operator-supplied
+  # internal_domain_name are also accepted so HostValidation doesn't 400 the
+  # internal callers. aws_lb.{qurl,qurl_internal}.dns_name are referenced
+  # later; terraform handles the dependency.
   computed_allowed_hosts = join(",", compact(concat(
     [aws_lb.qurl.dns_name, "localhost", "127.0.0.1"],
     var.domain_name != null ? [var.domain_name] : [],
+    var.internal_alb_enabled ? [aws_lb.qurl_internal[0].dns_name] : [],
+    var.internal_alb_enabled && var.internal_domain_name != null ? [var.internal_domain_name] : [],
     var.additional_allowed_hosts
   )))
 
@@ -141,6 +146,17 @@ locals {
   # `s.ipv6_cidr_block` filtered to non-empty — otherwise c.ClientIP()
   # silently falls back to the TCP source for v6 connections with no
   # operator signal.
+  #
+  # Internal ALB asymmetry: this list is derived from public_subnet_ids
+  # only (aws_lb.qurl.subnets). The internal ALB (aws_lb.qurl_internal)
+  # lives in private_subnet_ids and its ENI source IPs are NOT in this
+  # list. Consequence: requests routed via the internal ALB fall back to
+  # the TCP source for c.ClientIP(), so XFF is NOT trusted on
+  # internal-ALB traffic. This is intentional — /internal/v1/* is the
+  # only consumer of the internal ALB and its trust model uses the
+  # request-body src_ip as authoritative (see PR #1588 trust-model
+  # table). If a future internal endpoint needs trustworthy XFF, extend
+  # alb_subnet_cidrs with private_subnet_ids when var.internal_alb_enabled.
   alb_subnet_cidrs = sort([for s in data.aws_subnet.alb : s.cidr_block])
 
   # Container environment variables
@@ -562,22 +578,64 @@ resource "aws_security_group" "ecs" {
   vpc_id      = var.vpc_id
   description = "Security group for QURL API ECS tasks"
 
-  # HTTP from ALB
+  lifecycle {
+    create_before_destroy = true
+
+    # Without the internal ALB live, flipping enforce_internal_alb_only
+    # to true removes the cidr_blocks rule and leaves ECS reachable only
+    # from the public-ALB SG — internal callers (NHP server, AC Traefik)
+    # lose their path entirely. Reject the combination at plan time.
+    # The flip is reversible: setting enforce_internal_alb_only back to
+    # false and re-applying restores the legacy bypass via in-place
+    # AuthorizeSecurityGroupIngress.
+    precondition {
+      condition     = !var.enforce_internal_alb_only || var.internal_alb_enabled
+      error_message = "enforce_internal_alb_only = true requires internal_alb_enabled = true. Stand up the internal ALB first (set qurl_internal_service_domain), verify, then flip enforce_internal_alb_only on a second apply. ROLLBACK: to disable the internal ALB entirely, you must flip BOTH qurl_enforce_internal_alb_only=false AND qurl_internal_service_domain=null in the same apply — flipping just the domain to null while enforce stays true trips this same precondition."
+    }
+  }
+
+  # HTTP from public ALB (internet-facing)
   ingress {
     from_port       = var.container_port
     to_port         = var.container_port
     protocol        = "tcp"
     security_groups = [aws_security_group.alb.id]
-    description     = "HTTP from ALB"
+    description     = "HTTP from public ALB"
   }
 
-  # Also allow from VPC for internal service calls (NHP Server, Traefik)
-  ingress {
-    from_port   = var.container_port
-    to_port     = var.container_port
-    protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-    description = "HTTP from VPC (internal services)"
+  # Legacy in-VPC bypass — kept while enforce_internal_alb_only = false so
+  # operators can run sub-step 1A of the qurl-service-#335 rollout
+  # non-disruptively (introduce internal ALB, verify, then flip
+  # enforce_internal_alb_only to true to close the bypass on a second
+  # apply). When this rule is gone, ECS tasks are reachable only from
+  # the two ALB SGs (public + internal). The flip is in-place
+  # (RevokeSecurityGroupIngress); no SG replacement.
+  dynamic "ingress" {
+    for_each = var.enforce_internal_alb_only ? [] : [1]
+    content {
+      from_port   = var.container_port
+      to_port     = var.container_port
+      protocol    = "tcp"
+      cidr_blocks = [var.vpc_cidr]
+      description = "HTTP from VPC (legacy bypass — to be removed via enforce_internal_alb_only=true)"
+    }
+  }
+
+  # Internal ALB ingress — kept inline alongside the public-ALB ingress
+  # so all rules on this SG live in one block. AWS provider docs warn
+  # that mixing inline ingress on aws_security_group with standalone
+  # aws_security_group_rule resources targeting the same SG can cause
+  # silent oscillation across applies; keeping everything inline
+  # avoids that class entirely.
+  dynamic "ingress" {
+    for_each = var.internal_alb_enabled ? [1] : []
+    content {
+      from_port       = var.container_port
+      to_port         = var.container_port
+      protocol        = "tcp"
+      security_groups = [aws_security_group.alb_internal[0].id]
+      description     = "HTTP from internal ALB"
+    }
   }
 
   # All outbound (DynamoDB, Secrets Manager, Redis, etc.)
@@ -591,6 +649,44 @@ resource "aws_security_group" "ecs" {
 
   tags = merge(var.tags, {
     Name      = "${local.service_name}-ecs-sg"
+    Component = "qurl-service"
+    Cell      = var.cell_id
+  })
+}
+
+# Internal ALB security group. Lives in private subnets, accepts only
+# in-VPC traffic on 443. Distinct from aws_security_group.alb so the
+# public-vs-internal trust boundary is structural, not just commentary.
+resource "aws_security_group" "alb_internal" {
+  count       = var.internal_alb_enabled ? 1 : 0
+  name_prefix = "${local.service_name}-alb-internal-"
+  vpc_id      = var.vpc_id
+  description = "Security group for QURL API internal ALB (VPC-only)"
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+    description = "HTTPS from VPC"
+  }
+
+  # Egress scoped to vpc_cidr because the only legitimate next hop is
+  # the qurl-service ECS task ENIs, which live in this VPC. If the
+  # service ever grows a cross-VPC peering / TGW path (e.g. backend in
+  # a peered VPC), extend this with the additional reachable CIDRs —
+  # otherwise the failure shows up as the ALB silently 504-ing health
+  # checks with no SG-level signal.
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = [var.vpc_cidr]
+    description = "Outbound to VPC only"
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${local.service_name}-alb-internal-sg"
     Component = "qurl-service"
     Cell      = var.cell_id
   })
@@ -989,6 +1085,113 @@ resource "aws_lb_listener" "http" {
 
   tags = merge(var.tags, {
     Name      = "${local.service_name}-http"
+    Component = "qurl-service"
+    Cell      = var.cell_id
+  })
+}
+
+# ==================== Internal ALB ====================
+# Second ALB, internal=true, in private subnets. Serves the same target
+# group as the public ALB, so ECS service registration is unchanged
+# (target groups can be referenced by listeners on multiple ALBs;
+# the listener-to-TG association is what binds, not the LB-to-TG link).
+#
+# Consumers (NHP server, AC Traefik plugin) hit this ALB via the
+# workload-account private hosted zone alias (set up in root TF).
+# PR4 of the rollout adds a 404 listener rule on the public ALB for
+# /internal/* paths, completing the network-isolation.
+#
+# Trust model and rollout sequence are in the nhp PR body that
+# introduced these resources (qurl-service #335 network isolation).
+
+resource "aws_lb" "qurl_internal" {
+  count = var.internal_alb_enabled ? 1 : 0
+  # ALB name limit is 32 chars. short_name is `${name_prefix}-${cell_id}-qurl`
+  # which is already 26 chars in prod and 29 in sandbox; appending "-int"
+  # would push sandbox to 33 and fail apply (terraform validate doesn't
+  # catch this — only AWS rejects). "-i" leaves headroom for any future
+  # name_prefix that grows, while still distinguishing from the public ALB
+  # in the AWS console.
+  name               = "${replace(local.short_name, "_", "-")}-i"
+  internal           = true
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb_internal[0].id]
+  subnets            = var.private_subnet_ids
+
+  # Set explicitly here as a security default for the internal ALB. The
+  # public ALB at aws_lb.qurl does NOT set this and inherits the AWS
+  # default of false. The two ALBs are intentionally not symmetric on
+  # this attr while layervai/nhp#1589 (harden the public ALB to match)
+  # is pending; this is stricter, not laxer.
+  drop_invalid_header_fields = true
+
+  # Internal ALB intentionally has no access_logs configured. In-VPC
+  # traffic is logged via VPC Flow Logs and ECS-side request logs.
+  # See layervai/nhp#1592 for turning ALB-level logs on if audit policy
+  # demands them.
+
+  tags = merge(var.tags, {
+    Name      = "${local.service_name}-internal-alb"
+    Component = "qurl-service"
+    Cell      = var.cell_id
+  })
+
+  lifecycle {
+    precondition {
+      condition     = !var.internal_alb_enabled || var.internal_domain_name != null
+      error_message = "internal_alb_enabled = true requires internal_domain_name to be set."
+    }
+    precondition {
+      condition     = !var.internal_alb_enabled || var.internal_certificate_arn != null
+      error_message = "internal_alb_enabled = true requires internal_certificate_arn to be set."
+    }
+    # AWS rejects ALB names > 32 chars. Catch the overflow at plan time
+    # rather than at apply (terraform validate doesn't see this), so a
+    # future name_prefix that grows fails the plan with a clear message
+    # instead of a midway-through-apply API error.
+    precondition {
+      condition     = !var.internal_alb_enabled || length("${replace(local.short_name, "_", "-")}-i") <= 32
+      error_message = "Internal ALB name '${replace(local.short_name, "_", "-")}-i' exceeds AWS 32-char limit. Shorten name_prefix or cell_id."
+    }
+  }
+}
+
+# HTTPS listener on the internal ALB. Forwards to the same target group
+# as the public ALB. No HTTP listener — internal callers must use HTTPS
+# (NHP plugin and Traefik plugin both default to https://).
+#
+# Path scope: the internal ALB serves *every* path the shared target
+# group serves — including /v1/* (Auth0-protected user endpoints) and
+# /healthz, not just /internal/v1/*. The "internal-only" property is
+# enforced by reachability (NXDOMAIN externally + internal=true), not
+# by path filtering at this listener. PR4 of the rollout adds the
+# complementary public-side restriction (404 on /internal/* at the
+# *public* ALB). Until then, both ALBs route the same paths.
+#
+# Note: the internal and public ALBs each independently health-check
+# the shared target group's ECS task ENIs. With desired_count low, the
+# doubled per-target health-check rate (one probe per ALB every 30s by
+# default) is invisible, but if you scale targets up later, this is
+# the seam that makes "ECS task health flap on one ALB but not the
+# other" possible. Future readers debugging that class: the answer is
+# that target groups can be referenced by listeners on multiple ALBs;
+# each ALB owns its own health-check schedule.
+resource "aws_lb_listener" "qurl_internal_https" {
+  count = var.internal_alb_enabled ? 1 : 0
+
+  load_balancer_arn = aws_lb.qurl_internal[0].arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = var.internal_certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.qurl.arn
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${local.service_name}-internal-https"
     Component = "qurl-service"
     Cell      = var.cell_id
   })

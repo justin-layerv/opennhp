@@ -16,6 +16,11 @@ type derivedEndpoints struct {
 	NHPServerBaseURL string
 	QURLAPIBaseURL   string
 
+	// QURLInternalAPIHostname is the qurl-service internal ALB hostname.
+	// Empty when the internal ALB is not yet enabled (allowing the new
+	// fence tests to skip cleanly in pre-rollout environments).
+	QURLInternalAPIHostname string
+
 	// QURLSiteDomain is the parent domain of per-resource qurl.site
 	// hostnames. The shape differs by environment: sandbox uses the
 	// sub-FQDN `qurl.site.layerv.xyz` (so per-resource hosts are
@@ -39,15 +44,17 @@ func deriveEndpoints(env string) (derivedEndpoints, error) {
 	switch env {
 	case "sandbox":
 		return derivedEndpoints{
-			NHPServerBaseURL: "https://resolve.qurl.link.layerv.xyz",
-			QURLAPIBaseURL:   "https://api.layerv.xyz",
-			QURLSiteDomain:   "qurl.site.layerv.xyz",
-			QURLLinkOrigin:   "https://qurl.link.layerv.xyz",
+			NHPServerBaseURL:        "https://resolve.qurl.link.layerv.xyz",
+			QURLAPIBaseURL:          "https://api.layerv.xyz",
+			QURLInternalAPIHostname: "internal-api.qurl.layerv.xyz",
+			QURLSiteDomain:          "qurl.site.layerv.xyz",
+			QURLLinkOrigin:          "https://qurl.link.layerv.xyz",
 		}, nil
 	case "prod":
 		return derivedEndpoints{
-			NHPServerBaseURL: "https://resolve.qurl.link",
-			QURLAPIBaseURL:   "https://api.layerv.ai",
+			NHPServerBaseURL:        "https://resolve.qurl.link",
+			QURLAPIBaseURL:          "https://api.layerv.ai",
+			QURLInternalAPIHostname: "internal-api.qurl.layerv.ai",
 			// Prod uses the registered apex `qurl.site` directly, so
 			// per-resource hosts are r_{id}.qurl.site (not the
 			// sandbox-style `qurl.site.layerv.xyz`). Mirrors the

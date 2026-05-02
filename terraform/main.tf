@@ -1193,6 +1193,137 @@ resource "aws_route53_record" "qurl_api" {
   }
 }
 
+# ==================== QURL Service — internal ALB cert + private DNS ====================
+# Split-horizon DNS for the internal-only QURL API surface.
+#
+# Public mgmt zone (layerv.{xyz,ai}) gets ONLY the ACM DNS-01 validation
+# CNAME — no A record. External resolvers return NXDOMAIN for
+# internal-api.qurl.layerv.*.
+#
+# A workload-account private hosted zone of the same name is attached
+# to the workload VPC; its A-alias points at the internal ALB. VPC
+# Route 53 Resolver consults the PHZ regardless of caller subnet, so
+# AC instances in public subnets and NHP server in private subnets
+# both resolve to ENI IPs without leaving the VPC.
+#
+# This pattern lets ACM validate without the cert ever existing
+# publicly: ACM only needs the challenge CNAME, not an A record.
+# See PR #1588 body for the trust-model rationale.
+locals {
+  # Internal-ALB enablement is implicit: a non-null
+  # qurl_internal_service_domain means "stand up the internal ALB and
+  # everything that goes with it." To disable, null out the domain
+  # variable in tfvars (and re-apply). Chosen over an explicit boolean
+  # because every consumer the internal ALB serves needs the hostname
+  # anyway, and a "domain set but enabled=false" combination would be
+  # nonsensical / a config-drift trap.
+  qurl_internal_alb_enabled = var.deploy_qurl_service && var.qurl_internal_service_domain != null
+}
+
+resource "aws_acm_certificate" "qurl_internal" {
+  count             = local.qurl_internal_alb_enabled ? 1 : 0
+  domain_name       = var.qurl_internal_service_domain
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-qurl-internal-cert"
+  })
+}
+
+# DNS-01 validation record on the public mgmt-account zone. Mirrors the
+# qurl_api_cert_validation pattern; same provider, same IAM perms,
+# same shape.
+resource "aws_route53_record" "qurl_internal_cert_validation" {
+  provider = aws.route53_mgmt
+  for_each = local.qurl_internal_alb_enabled ? {
+    for dvo in aws_acm_certificate.qurl_internal[0].domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  } : {}
+
+  allow_overwrite = true
+  name            = each.value.name
+  records         = [each.value.record]
+  ttl             = 60
+  type            = each.value.type
+  zone_id         = var.qurl_hosted_zone_id
+}
+
+resource "aws_acm_certificate_validation" "qurl_internal" {
+  count                   = local.qurl_internal_alb_enabled ? 1 : 0
+  certificate_arn         = aws_acm_certificate.qurl_internal[0].arn
+  validation_record_fqdns = [for record in aws_route53_record.qurl_internal_cert_validation : record.fqdn]
+}
+
+# Private hosted zone in the workload account, attached to the workload
+# VPC. The zone name IS the FQDN (apex zone for the FQDN itself), which
+# is load-bearing for the whole split-horizon design: every in-VPC
+# query for $domain or any subdomain (including _acme-challenge.$domain)
+# is answered authoritatively by this zone. Sibling records can't leak
+# in, and a future operator running `terraform destroy
+# aws_route53_zone.qurl_internal_private` can't accidentally take down
+# any unrelated internal-DNS records.
+resource "aws_route53_zone" "qurl_internal_private" {
+  count   = local.qurl_internal_alb_enabled ? 1 : 0
+  name    = var.qurl_internal_service_domain
+  comment = "Workload-account PHZ for the QURL API internal ALB (qurl-service #335 network isolation). External resolvers return NXDOMAIN."
+
+  vpc {
+    vpc_id = module.networking.vpc_id
+  }
+
+  # Because this PHZ is the apex zone for ${qurl_internal_service_domain},
+  # in-VPC queries for _acme-challenge.${qurl_internal_service_domain}
+  # are answered by this zone authoritatively as NXDOMAIN ("no record in
+  # zone"). ACM cert renewal validates externally and is unaffected. Any
+  # future in-VPC tooling that tries to verify the cert validation CNAME
+  # (cert-manager, internal probes, etc.) will need to either query the
+  # public mgmt zone directly or add a passthrough record to this PHZ.
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-qurl-internal-phz"
+  })
+
+  # Single-record zone, but a future rename would otherwise destroy
+  # before recreate and briefly NXDOMAIN the internal hostname from
+  # inside the VPC — breaking every in-flight NHP plugin / Traefik
+  # plugin call.
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# A-alias from the internal hostname to the internal ALB. Lives in the
+# private zone above, NOT in the public mgmt zone — leaking this record
+# publicly would announce a private IP space to the internet.
+resource "aws_route53_record" "qurl_internal_alias" {
+  count   = local.qurl_internal_alb_enabled ? 1 : 0
+  zone_id = aws_route53_zone.qurl_internal_private[0].id
+  name    = var.qurl_internal_service_domain
+  type    = "A"
+
+  alias {
+    name                   = module.qurl_service[0].internal_alb_dns_name
+    zone_id                = module.qurl_service[0].internal_alb_zone_id
+    evaluate_target_health = true
+  }
+
+  # The PHZ above uses create_before_destroy to avoid a NXDOMAIN window
+  # on rename — that protection is incomplete unless this record also
+  # creates before destroy. Without CBD here, a rename forces this
+  # record through destroy→create even though the zone itself swapped
+  # cleanly, briefly NXDOMAINing in-VPC callers.
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
 # ==================== Website Email-Capture API (web-api.layerv.ai) ====================
 # The APIGW v2 custom domain is provisioned in layerv-prod us-east-1 by the
 # website CDK stack (LayerV-production-Api → ApiDomainName). This terraform
@@ -1412,6 +1543,13 @@ module "qurl_service" {
   domain_name     = var.qurl_service_domain
   hosted_zone_id  = null
   certificate_arn = var.qurl_service_domain != null ? aws_acm_certificate_validation.qurl_api[0].certificate_arn : null
+
+  # Internal ALB opt-in. enforce_internal_alb_only is a second-stage
+  # flip — see the variable's description for the rollout sequence.
+  internal_alb_enabled      = local.qurl_internal_alb_enabled
+  internal_domain_name      = var.qurl_internal_service_domain
+  internal_certificate_arn  = local.qurl_internal_alb_enabled ? aws_acm_certificate_validation.qurl_internal[0].certificate_arn : null
+  enforce_internal_alb_only = var.qurl_enforce_internal_alb_only
 
   # ALB access logs (required for production)
   alb_access_logs_bucket = var.qurl_alb_access_logs_bucket

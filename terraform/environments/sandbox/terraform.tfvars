@@ -171,6 +171,18 @@ deploy_qurl_service = true
 qurl_service_domain = "api.layerv.xyz"
 qurl_hosted_zone_id = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone
 
+# Internal ALB hostname (qurl-service #335 network isolation).
+# Served on a workload-account private hosted zone; external resolvers
+# return NXDOMAIN. Cert validation CNAME publishes on the public mgmt
+# zone (qurl_hosted_zone_id above) but no public A record exists.
+qurl_internal_service_domain = "internal-api.qurl.layerv.xyz"
+
+# Stage-2 of the rollout: when true, removes the in-VPC bypass on the
+# qurl-service ECS-task SG. Apply with false first (creates internal
+# ALB, leaves bypass), verify the new path, then flip to true and
+# re-apply to close the bypass. Plan: PR1's sub-step 1B.
+qurl_enforce_internal_alb_only = false
+
 # Auth0 configuration for JWT validation
 qurl_auth0_domain   = "auth.layerv.ai"
 qurl_auth0_audience = "https://api.layerv.xyz"

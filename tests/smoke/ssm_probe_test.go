@@ -4,6 +4,7 @@ package smoke
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -46,6 +47,11 @@ func TestSSMProbeRejectList(t *testing.T) {
 		"apt install wget",
 		"yum install httpd",
 		"dpkg -i pkg.deb",
+		// shell control: chaining and substitution
+		"true; rm /tmp/x",
+		"echo $(whoami)",
+		"echo `whoami`",
+		"true && echo bad",
 	}
 
 	for _, cmd := range bad {
@@ -66,12 +72,16 @@ func TestSSMProbeRejectList(t *testing.T) {
 // regression where someone tightens the reject-list and accidentally
 // breaks an existing probe.
 func TestSSMProbeNamedCommandsPassRejectList(t *testing.T) {
+	const benignHostname = "internal-api.qurl.layerv.xyz"
 	allowed := []string{
 		cmdHealthLiveFromHost,
 		cmdHealthKnockReadyFromHost,
 		cmdDockerNhpServerRunning,
 		cmdDockerImageTag,
 		cmdSystemdNRestartsNhpServer,
+		fmt.Sprintf(cmdDigInternalQurlAPIFmt, benignHostname),
+		fmt.Sprintf(cmdCurlInternalQurlAPIFmt, benignHostname),
+		fmt.Sprintf(cmdCurlInternalQurlResolveFmt, benignHostname),
 	}
 	for _, cmd := range allowed {
 		t.Run(cmd, func(t *testing.T) {

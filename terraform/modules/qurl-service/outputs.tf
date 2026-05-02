@@ -35,6 +35,16 @@ output "alb_arn" {
   value       = aws_lb.qurl.arn
 }
 
+output "internal_alb_dns_name" {
+  description = "Internal ALB DNS name (null when internal_alb_enabled = false). Root TF aliases internal_domain_name to this hostname."
+  value       = var.internal_alb_enabled ? aws_lb.qurl_internal[0].dns_name : null
+}
+
+output "internal_alb_zone_id" {
+  description = "Internal ALB hosted zone ID for Route 53 alias targets (null when internal_alb_enabled = false)."
+  value       = var.internal_alb_enabled ? aws_lb.qurl_internal[0].zone_id : null
+}
+
 output "security_group_id" {
   description = "ECS tasks security group ID"
   value       = aws_security_group.ecs.id

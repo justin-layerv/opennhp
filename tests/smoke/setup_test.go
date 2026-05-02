@@ -49,21 +49,32 @@ func TestMain(m *testing.M) {
 	}
 
 	testConfig = &TestConfig{
-		Environment:       env,
-		NHPServerBaseURL:  getEnvOrDefault("NHP_SERVER_BASE_URL", derived.NHPServerBaseURL),
-		QURLAPIBaseURL:    getEnvOrDefault("QURL_API_BASE_URL", derived.QURLAPIBaseURL),
-		QURLSiteDomain:    getEnvOrDefault("QURL_SITE_DOMAIN", derived.QURLSiteDomain),
-		QURLLinkOrigin:    getEnvOrDefault("QURL_LINK_ORIGIN", derived.QURLLinkOrigin),
-		Auth0Domain:       getEnvOrDefault("AUTH0_DOMAIN", "auth.layerv.ai"),
-		Auth0Audience:     getEnvOrDefault("AUTH0_AUDIENCE", derived.QURLAPIBaseURL),
-		Auth0ClientID:     os.Getenv("AUTH0_CLIENT_ID"),
-		Auth0ClientSecret: os.Getenv("AUTH0_CLIENT_SECRET"),
-		AllowSSMProbes:    strings.EqualFold(os.Getenv("NHP_SMOKE_ALLOW_SSM_PROBES"), "true"),
-		AWSRegion:         region,
+		Environment:             env,
+		NHPServerBaseURL:        getEnvOrDefault("NHP_SERVER_BASE_URL", derived.NHPServerBaseURL),
+		QURLAPIBaseURL:          getEnvOrDefault("QURL_API_BASE_URL", derived.QURLAPIBaseURL),
+		QURLInternalAPIHostname: getEnvOrDefault("QURL_INTERNAL_API_HOSTNAME", derived.QURLInternalAPIHostname),
+		QURLSiteDomain:          getEnvOrDefault("QURL_SITE_DOMAIN", derived.QURLSiteDomain),
+		QURLLinkOrigin:          getEnvOrDefault("QURL_LINK_ORIGIN", derived.QURLLinkOrigin),
+		Auth0Domain:             getEnvOrDefault("AUTH0_DOMAIN", "auth.layerv.ai"),
+		Auth0Audience:           getEnvOrDefault("AUTH0_AUDIENCE", derived.QURLAPIBaseURL),
+		Auth0ClientID:           os.Getenv("AUTH0_CLIENT_ID"),
+		Auth0ClientSecret:       os.Getenv("AUTH0_CLIENT_SECRET"),
+		AllowSSMProbes:          strings.EqualFold(os.Getenv("NHP_SMOKE_ALLOW_SSM_PROBES"), "true"),
+		QURLInternalALBEnabled:  strings.EqualFold(os.Getenv("NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED"), "true"),
+		AWSRegion:               region,
 	}
 
 	testConfig.NHPServerBaseURL = strings.TrimSuffix(testConfig.NHPServerBaseURL, "/")
 	testConfig.QURLAPIBaseURL = strings.TrimSuffix(testConfig.QURLAPIBaseURL, "/")
+
+	// Catch the misconfigured combo "ALB enabled but no hostname" before
+	// any test runs. Without this, smoke probes interpolate the empty
+	// string into `dig ` and `curl https:///...`, producing confusing
+	// errors instead of a clear config-mismatch failure.
+	if testConfig.QURLInternalALBEnabled && testConfig.QURLInternalAPIHostname == "" {
+		fmt.Fprintln(os.Stderr, "ERROR: NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED=true but QURLInternalAPIHostname is empty — set QURL_INTERNAL_API_HOSTNAME or pick an env that defines it in deriveEndpoints")
+		os.Exit(2)
+	}
 
 	testConfig.HTTPClient = &http.Client{Timeout: 30 * time.Second}
 	testConfig.NoRedirectClient = &http.Client{

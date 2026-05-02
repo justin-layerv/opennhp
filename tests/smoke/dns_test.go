@@ -35,6 +35,12 @@ func TestDeriveEndpoints_ProdQurlHostsAreRegisteredApexes(t *testing.T) {
 	}{
 		{"QURLSiteDomain", prod.QURLSiteDomain, "qurl.site"},
 		{"QURLLinkOrigin", prod.QURLLinkOrigin, "https://qurl.link"},
+		// Pin the qurl-service #335 internal-ALB hostname so a
+		// rebrand like "internal-api" → "private-api" doesn't slip
+		// past review. The hostname must stay under qurl.layerv.ai
+		// so the public DNS-01 cert validation continues to work
+		// against the layerv.ai mgmt zone.
+		{"QURLInternalAPIHostname", prod.QURLInternalAPIHostname, "internal-api.qurl.layerv.ai"},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
@@ -64,6 +70,7 @@ func TestDeriveEndpoints_SandboxValuesArePinned(t *testing.T) {
 	}{
 		{"NHPServerBaseURL", sandbox.NHPServerBaseURL, "https://resolve.qurl.link.layerv.xyz"},
 		{"QURLAPIBaseURL", sandbox.QURLAPIBaseURL, "https://api.layerv.xyz"},
+		{"QURLInternalAPIHostname", sandbox.QURLInternalAPIHostname, "internal-api.qurl.layerv.xyz"},
 		{"QURLSiteDomain", sandbox.QURLSiteDomain, "qurl.site.layerv.xyz"},
 		{"QURLLinkOrigin", sandbox.QURLLinkOrigin, "https://qurl.link.layerv.xyz"},
 	}

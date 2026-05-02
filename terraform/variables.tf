@@ -693,6 +693,32 @@ variable "qurl_service_domain" {
   default     = null
 }
 
+variable "qurl_internal_service_domain" {
+  description = "Hostname for the QURL API internal ALB (e.g., internal-api.qurl.layerv.xyz). Served only on the internal=true ALB and resolved via the workload-account private hosted zone — public DNS returns NXDOMAIN. Set to null (default) to disable the internal ALB; the qurl-service module's internal_alb_enabled gate keys off this. The split-horizon design relies on this being a hostname under qurl_hosted_zone (parent zone in mgmt account) so ACM DNS-01 validation can publish a CNAME on the public zone without leaking an A record."
+  type        = string
+  default     = null
+
+  # RFC1035 label-shape FQDN check: each label starts/ends with an
+  # alphanumeric, hyphens allowed only internally, labels separated
+  # by dots, at least two labels (FQDN form, no bare label, no
+  # leading/trailing dot, no double dot). Catches typos and
+  # confused-deputy cases at plan time rather than at ACM apply or
+  # smoke probe execution. The hostname flows into smoke-test SSM
+  # probe format strings; the reject-list in ssm_probe.go is
+  # defense-in-depth, but a structural check on the
+  # operator-controlled input is the primary gate.
+  validation {
+    condition     = var.qurl_internal_service_domain == null || can(regex("^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\\.)+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$", var.qurl_internal_service_domain))
+    error_message = "qurl_internal_service_domain must be a valid RFC1035 FQDN (e.g., internal-api.qurl.layerv.xyz): each label 1-63 chars, alphanumeric edges, hyphens only internally, at least two labels, no leading/trailing dot."
+  }
+}
+
+variable "qurl_enforce_internal_alb_only" {
+  description = "When true, removes the legacy in-VPC bypass on the qurl-service ECS task SG (the cidr_blocks=[var.vpc_cidr] ingress rule). Apply with false first to introduce the internal ALB non-disruptively, verify the new path, then flip to true and re-apply to close the bypass. After PR4 of the rollout, the ECS tasks are reachable only from the public-ALB SG and (when internal_alb_enabled) the internal-ALB SG."
+  type        = bool
+  default     = false
+}
+
 variable "qurl_auth0_domain" {
   description = "Auth0 domain for QURL API JWT validation (e.g., 'layerv.us.auth0.com')"
   type        = string

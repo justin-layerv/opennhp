@@ -71,6 +71,25 @@ type TestConfig struct {
 	// resolve tests call to mint QURLs.
 	QURLAPIBaseURL string
 
+	// QURLInternalAPIHostname is the bare hostname for the qurl-service
+	// internal ALB (internal-api.qurl.layerv.{xyz,ai}). Resolves to
+	// RFC1918 addresses via the workload-account private hosted zone
+	// from inside the VPC and to NXDOMAIN from the public internet.
+	// Used by qurl-service #335 rollout fence tests in
+	// 07_qurl_internal_alb_test.go. Stored as a hostname (not URL) so
+	// tests can both `dig` it directly and concat into URLs.
+	QURLInternalAPIHostname string
+
+	// QURLInternalALBEnabled gates the 07_qurl_internal_alb_test.go
+	// fences. The hostname is pinned in dns.go regardless (so
+	// dns_test.go can fence the per-env value), but the live-system
+	// assertions only run once the deploy job confirms the ALB is up.
+	// During the rollout window between PR1 merge and the sandbox 1A
+	// apply — and during any future rollback to a state without the
+	// internal ALB — this stays false and the fences skip cleanly.
+	// Sourced from NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED env var.
+	QURLInternalALBEnabled bool
+
 	// QURLSiteDomain is the parent domain of per-resource qurl.site
 	// hostnames. Tier 2 resolve tests assert:
 	//   - cookie Domain attribute equals this

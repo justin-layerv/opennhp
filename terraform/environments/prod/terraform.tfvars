@@ -135,6 +135,16 @@ qurl_hosted_zone_id             = "Z0748438C8EK6UAW94ST" # layerv.ai zone (in la
 qurl_jwt_secret_arn             = "arn:aws:secretsmanager:us-east-2:235500187906:secret:layerv-nhp-prod/qurl-jwt-secret-NRk5sw"
 qurl_internal_service_token_arn = "arn:aws:secretsmanager:us-east-2:235500187906:secret:layerv-nhp-prod/qurl-internal-service-token-ETbWzv"
 
+# Internal ALB hostname (qurl-service #335 network isolation).
+# Workload-account private hosted zone; external resolvers NXDOMAIN.
+# Cert validation CNAME on the public layerv.ai mgmt zone above.
+qurl_internal_service_domain = "internal-api.qurl.layerv.ai"
+
+# Stage-2 of the rollout — sandbox MUST flip to true and verify before
+# prod follows. Keep false at PR1 merge time; flip only after PR2/PR3
+# have moved consumers to the internal hostname.
+qurl_enforce_internal_alb_only = false
+
 # Website email-capture API DNS — A-alias for the APIGW custom domain that the
 # website CDK provisions in layerv-prod us-east-1. Replaces the old broken wiring
 # where the site's tracker hit api.layerv.ai (now QURL). See layervai/website#188.
