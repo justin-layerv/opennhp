@@ -96,3 +96,42 @@ resource "aws_route53_record" "slack_bot_cert_validation" {
     prevent_destroy = true
   }
 }
+
+# Public alias for the slack bot — points slackbot.layerv.xyz at the
+# `qurl-bot-slack-sandbox` ALB in the qurl-integrations sandbox
+# account (730883236711, us-east-2). Cross-account, no provider alias
+# wired up, so the ALB DNSName + the ELB hosted-zone ID are hardcoded
+# (same posture as the cert validation records above).
+#
+# `Z3AADJGX6KTTL2` is the AWS-published hosted-zone ID for ALBs in
+# us-east-2 — constant across all ALBs in that region per
+# https://docs.aws.amazon.com/general/latest/gr/elb.html. ALB DNSName
+# is auto-generated and stable for the life of the ALB resource; if
+# the ALB is ever recreated in qurl-integrations-infra, the DNSName
+# rotates and this value needs to be updated. Verifiable via:
+#   AWS_PROFILE=layerv-integrations aws elbv2 describe-load-balancers \
+#     --names qurl-bot-slack-sandbox --region us-east-2
+#
+# `allow_overwrite = true` is load-bearing: a stale A record
+# (3.138.131.15) from the deleted Python-era slack stack still
+# resolves under this name. Without this, the first apply errors
+# with a name-collision; with it, TF claims and replaces the
+# existing record cleanly.
+#
+# No `prevent_destroy` (unlike the cert validation records above):
+# the alias is the consumer-facing endpoint and a deliberate
+# `terraform destroy` of this stack should be allowed to remove it
+# alongside the ALB it points at, not require a state-rm escape.
+resource "aws_route53_record" "slack_bot_alias" {
+  allow_overwrite = true
+
+  zone_id = var.qurl_hosted_zone_id
+  name    = local.slack_bot_domain
+  type    = "A"
+
+  alias {
+    name                   = "qurl-bot-slack-sandbox-64404749.us-east-2.elb.amazonaws.com"
+    zone_id                = "Z3AADJGX6KTTL2"
+    evaluate_target_health = false
+  }
+}
