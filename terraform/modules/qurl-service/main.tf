@@ -100,6 +100,12 @@ locals {
   service_name = "${var.name_prefix}-${var.cell_id}-qurl-api"
   # Shorter name for resources with 32-char limit (ALB/NLB names)
   short_name = "${var.name_prefix}-${var.cell_id}-qurl"
+  # DNS-safe form used as the base for AWS resources subject to the 32-char
+  # name ceiling (ALB, TG). Computed once so name + length-precondition +
+  # error message can't drift across the resources that share the limit.
+  short_name_dash    = replace(local.short_name, "_", "-")
+  internal_alb_name  = "${local.short_name_dash}-i"
+  internal_name_fits = length(local.internal_alb_name) <= 32
 
   # Task-level CPU/memory with ADOT sidecar overhead.
   # Fargate requires specific CPU/memory combinations (memory in 1024 MB increments
@@ -1091,28 +1097,21 @@ resource "aws_lb_listener" "http" {
 }
 
 # ==================== Internal ALB ====================
-# Second ALB, internal=true, in private subnets. Serves the same target
-# group as the public ALB, so ECS service registration is unchanged
-# (target groups can be referenced by listeners on multiple ALBs;
-# the listener-to-TG association is what binds, not the LB-to-TG link).
-#
-# Consumers (NHP server, AC Traefik plugin) hit this ALB via the
-# workload-account private hosted zone alias (set up in root TF).
-# PR4 of the rollout adds a 404 listener rule on the public ALB for
-# /internal/* paths, completing the network-isolation.
-#
-# Trust model and rollout sequence are in the nhp PR body that
-# introduced these resources (qurl-service #335 network isolation).
+# Second ALB, internal=true, in private subnets. Forwards to its own
+# target group (`aws_lb_target_group.qurl_internal`) — AWS rejects
+# associating one TG with more than one LB (`TargetGroupAssociationLimit`),
+# so the public and internal ALBs each own a TG and ECS registers tasks
+# in both via paired `load_balancer` blocks below. Future readers: do
+# not consolidate the TGs.
 
 resource "aws_lb" "qurl_internal" {
   count = var.internal_alb_enabled ? 1 : 0
-  # ALB name limit is 32 chars. short_name is `${name_prefix}-${cell_id}-qurl`
-  # which is already 26 chars in prod and 29 in sandbox; appending "-int"
-  # would push sandbox to 33 and fail apply (terraform validate doesn't
-  # catch this — only AWS rejects). "-i" leaves headroom for any future
-  # name_prefix that grows, while still distinguishing from the public ALB
-  # in the AWS console.
-  name               = "${replace(local.short_name, "_", "-")}-i"
+  # `-i` (not `-int`) keeps the name within AWS's 32-char ALB-name limit:
+  # local.short_name is 29 chars in sandbox; `-int` would push to 33 and
+  # only fail at apply time, not validate. local.internal_alb_name is the
+  # single-source-of-truth value used here, by aws_lb_target_group.qurl_internal,
+  # and by both name-length preconditions.
+  name               = local.internal_alb_name
   internal           = true
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb_internal[0].id]
@@ -1145,37 +1144,59 @@ resource "aws_lb" "qurl_internal" {
       condition     = !var.internal_alb_enabled || var.internal_certificate_arn != null
       error_message = "internal_alb_enabled = true requires internal_certificate_arn to be set."
     }
-    # AWS rejects ALB names > 32 chars. Catch the overflow at plan time
-    # rather than at apply (terraform validate doesn't see this), so a
-    # future name_prefix that grows fails the plan with a clear message
-    # instead of a midway-through-apply API error.
+    # Catch the 32-char overflow at plan time — terraform validate doesn't
+    # see this, so a future name_prefix that grows would otherwise fail
+    # mid-apply with an opaque AWS API error.
     precondition {
-      condition     = !var.internal_alb_enabled || length("${replace(local.short_name, "_", "-")}-i") <= 32
-      error_message = "Internal ALB name '${replace(local.short_name, "_", "-")}-i' exceeds AWS 32-char limit. Shorten name_prefix or cell_id."
+      condition     = !var.internal_alb_enabled || local.internal_name_fits
+      error_message = "Internal ALB name '${local.internal_alb_name}' exceeds AWS 32-char limit. Shorten name_prefix or cell_id."
     }
   }
 }
 
-# HTTPS listener on the internal ALB. Forwards to the same target group
-# as the public ALB. No HTTP listener — internal callers must use HTTPS
-# (NHP plugin and Traefik plugin both default to https://).
-#
-# Path scope: the internal ALB serves *every* path the shared target
-# group serves — including /v1/* (Auth0-protected user endpoints) and
-# /healthz, not just /internal/v1/*. The "internal-only" property is
-# enforced by reachability (NXDOMAIN externally + internal=true), not
-# by path filtering at this listener. PR4 of the rollout adds the
-# complementary public-side restriction (404 on /internal/* at the
-# *public* ALB). Until then, both ALBs route the same paths.
-#
-# Note: the internal and public ALBs each independently health-check
-# the shared target group's ECS task ENIs. With desired_count low, the
-# doubled per-target health-check rate (one probe per ALB every 30s by
-# default) is invisible, but if you scale targets up later, this is
-# the seam that makes "ECS task health flap on one ALB but not the
-# other" possible. Future readers debugging that class: the answer is
-# that target groups can be referenced by listeners on multiple ALBs;
-# each ALB owns its own health-check schedule.
+resource "aws_lb_target_group" "qurl_internal" {
+  count = var.internal_alb_enabled ? 1 : 0
+
+  # Shares local.internal_alb_name with aws_lb.qurl_internal — AWS allows
+  # an LB and TG to share a name (different resource types, distinct ARNs).
+  name        = local.internal_alb_name
+  port        = var.container_port
+  protocol    = "HTTP"
+  vpc_id      = var.vpc_id
+  target_type = "ip"
+
+  deregistration_delay = 30
+
+  health_check {
+    enabled             = true
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    timeout             = 5
+    interval            = 30
+    path                = "/health/ready"
+    matcher             = "200"
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${local.service_name}-internal-tg"
+    Component = "qurl-service"
+    Cell      = var.cell_id
+  })
+
+  lifecycle {
+    create_before_destroy = true
+
+    precondition {
+      condition     = !var.internal_alb_enabled || local.internal_name_fits
+      error_message = "Internal TG name '${local.internal_alb_name}' exceeds AWS 32-char limit. Shorten name_prefix or cell_id."
+    }
+  }
+}
+
+# Internal-only is enforced by reachability (NXDOMAIN externally +
+# internal=true), not by path filtering at this listener — the internal
+# ALB serves every path the TG serves. PR4 adds the symmetric 404 rule
+# on the *public* ALB for /internal/* paths.
 resource "aws_lb_listener" "qurl_internal_https" {
   count = var.internal_alb_enabled ? 1 : 0
 
@@ -1187,7 +1208,7 @@ resource "aws_lb_listener" "qurl_internal_https" {
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.qurl.arn
+    target_group_arn = aws_lb_target_group.qurl_internal[0].arn
   }
 
   tags = merge(var.tags, {
@@ -1218,6 +1239,18 @@ resource "aws_ecs_service" "qurl" {
     container_port   = var.container_port
   }
 
+  # Register the same task IPs in the internal-ALB target group. Adding
+  # this block is in-place on AWS provider 4+ (terraform-provider-aws
+  # #23600 + #23786, merged 2022-03), so no Fargate service replacement.
+  dynamic "load_balancer" {
+    for_each = var.internal_alb_enabled ? [1] : []
+    content {
+      target_group_arn = aws_lb_target_group.qurl_internal[0].arn
+      container_name   = "qurl-api"
+      container_port   = var.container_port
+    }
+  }
+
   # Prevent premature unhealthy marking during slow container startups
   health_check_grace_period_seconds = 60
 
@@ -1242,7 +1275,10 @@ resource "aws_ecs_service" "qurl" {
     Cell      = var.cell_id
   })
 
-  depends_on = [aws_lb_listener.http]
+  # Listener-before-service ordering: ECS rejects RegisterTargets on a TG
+  # not yet attached to a listener. The qurl_internal_https reference is
+  # safe when internal_alb_enabled = false (count=0 → empty dep set).
+  depends_on = [aws_lb_listener.http, aws_lb_listener.qurl_internal_https]
 }
 
 # ==================== Route53 Record ====================
