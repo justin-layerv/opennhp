@@ -354,6 +354,12 @@ variable "qurl_internal_service_token_arn" {
   default     = null
 }
 
+variable "qurl_internal_service_domain" {
+  description = "Hostname for the QURL API internal ALB (e.g., internal-api.qurl.layerv.xyz). See canonical doc + RFC1035 validation on the root variable of the same name."
+  type        = string
+  default     = null
+}
+
 variable "qurl_cookie_domain" {
   description = "Cookie domain for NHP tokens (must match qurl_site_domain with leading dot)"
   type        = string

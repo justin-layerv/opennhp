@@ -86,6 +86,7 @@ module "nhp" {
   qurl_hosted_zone_id             = var.qurl_hosted_zone_id
   qurl_jwt_secret_arn             = var.qurl_jwt_secret_arn
   qurl_internal_service_token_arn = var.qurl_internal_service_token_arn
+  qurl_internal_service_domain    = var.qurl_internal_service_domain
   qurl_additional_allowed_hosts   = var.qurl_additional_allowed_hosts
   qurl_cors_allowed_origins       = var.qurl_cors_allowed_origins
   qurl_audit_retention_days       = var.qurl_audit_retention_days

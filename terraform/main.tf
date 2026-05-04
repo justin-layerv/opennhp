@@ -90,9 +90,14 @@ resource "null_resource" "account_validation" {
   }
 }
 
-# Validate qurl_router requires qurl_service_domain for HTTPS API calls
-# The qurl-router plugin uses HTTPS to call the QURL API, which requires a valid
-# TLS certificate. The ALB cert is issued for qurl_service_domain, not the ALB hostname.
+# Validate qurl_router requires qurl_service_domain.
+# qurl_service_domain remains required even after qurl-service #335 introduced
+# the internal-ALB path: it's the public ALB cert hostname AND the fallback
+# api_url for greenfield envs that haven't set qurl_internal_service_domain
+# (see the qurl_router_config.api_url ternary in the ac module wiring below).
+# The internal-ALB path uses qurl_internal_service_domain with its own ACM cert.
+# There is no symmetric check for qurl_internal_service_domain: its absence
+# falls through to the public domain by design (greenfield safety).
 resource "null_resource" "qurl_router_domain_validation" {
   count = var.qurl_router_enabled && var.qurl_service_domain == null ? 1 : 0
 
@@ -878,12 +883,21 @@ module "ac" {
   # Traefik-plugins CI/CD bucket (for SSM-based plugin deployment)
   traefik_plugins_deploy_bucket_arn = var.traefik_plugins_deploy_bucket_arn
 
-  # QURL Router Plugin configuration (routes *.qurl.site to target backends)
-  # Note: Uses public domain (api.layerv.xyz) because the ALB cert is issued for that domain,
-  # not the internal ALB hostname. Could also use internal HTTP but ALB has HTTP->HTTPS redirect.
+  # QURL Router Plugin configuration (routes *.qurl.site to target backends).
+  # api_url prefers the workload-account internal-ALB hostname when
+  # qurl_internal_service_domain is set; that path's TLS uses the dedicated
+  # internal-ALB ACM cert from qurl-service #335 PR1. Falls back to the
+  # public domain on greenfield envs that haven't stood up the internal
+  # ALB yet — that branch keeps the historical constraint that the public
+  # ALB cert is the one that matches qurl_service_domain. Either branch is
+  # cert-valid; the choice is reachability + isolation, not TLS.
   qurl_router_config = var.deploy_qurl_service && var.qurl_router_enabled ? {
-    enabled            = true
-    api_url            = "https://${var.qurl_service_domain}"
+    enabled = true
+    # Predicate routes through local.qurl_internal_alb_enabled so the
+    # api_url branch and the cert/PHZ/alias resources stay in lockstep.
+    # If the local ever evolves (extra feature gate, etc.), this stays
+    # consistent without a second edit.
+    api_url            = "https://${local.qurl_internal_alb_enabled ? var.qurl_internal_service_domain : var.qurl_service_domain}"
     base_domain        = var.qurl_site_domain
     cache_ttl          = var.qurl_router_cache_ttl
     negative_cache_ttl = var.qurl_router_negative_cache_ttl
@@ -919,6 +933,27 @@ module "ac" {
   frp_server_host     = var.deploy_frps ? "frps.${module.data.namespace_name}" : ""
   frp_control_port    = var.frps_bind_port
   frp_vhost_http_port = var.frps_vhost_http_port
+
+  # Order the AC launch-template render after the internal-ALB stack is
+  # reachable. The module's qurl_router_config.api_url points at
+  # internal-api.qurl.layerv.{xyz,ai} when qurl_internal_service_domain is
+  # set; the cert-validation + alias resources below are count-gated on the
+  # same condition (local.qurl_internal_alb_enabled), so when the variable
+  # is unset both depend_on entries collapse to empty resource sets and
+  # this is a no-op. When set, AC ASG instances refresh only after TLS+DNS
+  # are live, eliminating a first-apply window where Traefik would render
+  # an api_url that NXDOMAINs.
+  #
+  # Granularity: module-wide depends_on rather than per-resource. Terraform
+  # doesn't expose per-output depends_on, and gating only the launch
+  # template would require restructuring module.ac to expose internal
+  # resources. Module-wide serializes a few unrelated AC resources behind
+  # cert validation on first apply (minutes, not hours); accepted as the
+  # cost of the simpler boundary.
+  depends_on = [
+    aws_acm_certificate_validation.qurl_internal,
+    aws_route53_record.qurl_internal_alias,
+  ]
 }
 
 # Data source for hosted zone
