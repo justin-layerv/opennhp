@@ -188,8 +188,24 @@ def _get_mgmt_token():
         method='POST',
     )
 
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        data = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        # Auth0 returns the actual reason (e.g. access_denied + a specific
+        # error_description) in the response body. urllib's default behavior
+        # discards it, leaving only "HTTP Error 403: Forbidden" — useless for
+        # diagnosing IP throttling, bot detection, grant revocation, etc.
+        body = ''
+        try:
+            body = e.read().decode('utf-8', errors='replace')
+        except Exception:
+            pass
+        logger.error(
+            'Auth0 token request failed',
+            extra={'status': e.code, 'response_body': body[:2000]},
+        )
+        raise
 
     _mgmt_token = data['access_token']
     _mgmt_token_expires_at = time.time() + data.get('expires_in', 86400) - 60

@@ -5,7 +5,9 @@ Run with: pytest terraform/modules/developer-portal/lambda/test_auth0_cleanup.py
 """
 
 import pytest
+import io
 import json
+import logging
 import time
 import urllib.error
 from unittest.mock import MagicMock, patch, call
@@ -355,6 +357,36 @@ class TestGetMgmtToken:
         # populated the token from elsewhere pass undetected.
         sm.get_secret_value.assert_called_once()
         mock_urlopen.assert_called_once()
+
+    def test_http_error_logs_response_body(self, caplog):
+        """A 4xx from /oauth/token must surface Auth0's response body in
+        CloudWatch — without it, operators see only "HTTP Error 403:
+        Forbidden" and can't tell IP throttling from bot detection from a
+        revoked grant."""
+        body = (
+            b'{"error":"access_denied",'
+            b'"error_description":"Service not enabled within domain"}'
+        )
+        error = urllib.error.HTTPError(
+            'https://auth.layerv.ai/oauth/token',
+            403, 'Forbidden', {}, io.BytesIO(body),
+        )
+
+        with patch('boto3.client', return_value=_make_secret()):
+            import auth0_cleanup as ac
+            with patch(
+                'auth0_cleanup.urllib.request.urlopen', side_effect=error,
+            ):
+                with caplog.at_level(logging.ERROR, logger=ac.logger.name):
+                    with pytest.raises(urllib.error.HTTPError):
+                        ac._get_mgmt_token()
+
+        record = next(
+            r for r in caplog.records if r.message == 'Auth0 token request failed'
+        )
+        assert record.status == 403
+        assert 'access_denied' in record.response_body
+        assert 'Service not enabled within domain' in record.response_body
 
 
 # ---------------------------------------------------------------------------
