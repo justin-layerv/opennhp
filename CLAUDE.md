@@ -174,6 +174,8 @@ FUZZTIME_QUICK=2s make fuzz-quick
 FUZZTIME_LONG=5m  make fuzz
 ```
 
+Both fuzz targets route through `scripts/run-fuzz.sh`, which distinguishes a real crasher (writes `testdata/fuzz/<NAME>/<sha>`) from the upstream Go-fuzz coordinator deadline-race flake (no reproducer file). If `fuzz-quick` ever goes red on a PR that didn't touch Go code, check the wrapper first — and after a Go toolchain bump, re-validate the deadline-race signature it greps for. The wrapper's decision tree is fenced by `tests/lints/run-fuzz/run-fixtures.sh`.
+
 ### Go (Manual)
 
 ```bash

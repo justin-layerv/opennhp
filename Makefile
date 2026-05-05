@@ -192,7 +192,7 @@ plugins:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Building plugins... $(END_COLOUR)"
 	@if test -d $(NHP_SERVER_PLUGINS); then $(MAKE) -C $(NHP_SERVER_PLUGINS); fi
 
-lint: lint-redirect-url-drift lint-disable-agent-validation
+lint: lint-redirect-url-drift lint-disable-agent-validation lint-run-fuzz
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running linters...$(END_COLOUR)"
 	cd nhp && golangci-lint run ./...
 	cd endpoints && golangci-lint run ./...
@@ -235,6 +235,23 @@ lint-redirect-url-drift:
 	@./tests/lints/redirect-url-drift/run-fixtures.sh
 	@./scripts/check-redirect-url-drift.sh
 	@echo "$(COLOUR_GREEN)[OpenNHP] redirect_url drift check passed!$(END_COLOUR)"
+
+# Fence the decision tree of scripts/run-fuzz.sh (#1653). The wrapper
+# is the only thing distinguishing a real Go-fuzz crasher from the
+# upstream coordinator deadline-race flake on the `fuzz-quick` job —
+# a silent regression in it would re-introduce false-red on every PR
+# OR mask a real crasher. The fixture suite emulates each go-test
+# outcome via a PATH-shimmed `go` and asserts the wrapper's exit code.
+.PHONY: lint-run-fuzz
+lint-run-fuzz:
+	@echo "$(COLOUR_BLUE)[OpenNHP] Checking run-fuzz wrapper (#1653)...$(END_COLOUR)"
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck scripts/run-fuzz.sh tests/lints/run-fuzz/run-fixtures.sh; \
+	else \
+		echo "$(COLOUR_BLUE)[OpenNHP] shellcheck not installed; skipping script check$(END_COLOUR)"; \
+	fi
+	@./tests/lints/run-fuzz/run-fixtures.sh
+	@echo "$(COLOUR_GREEN)[OpenNHP] run-fuzz wrapper check passed!$(END_COLOUR)"
 
 # Run the same checks CI runs for .github/workflows/**,
 # .github/ISSUE_TEMPLATE/**, and CLAUDE.md's Scopes table.
@@ -376,13 +393,13 @@ test-smoke-prod: ## Run smoke tests against prod (uses AWS_PROFILE=layerv-prod)
 
 test-all: test test-lambdas test-local ## Run all tests
 
-# Fuzz parameters. 15s (not 10s) because an initial 10s CI run surfaced
-# "context deadline exceeded" as a test FAIL instead of a graceful stop
-# when -fuzztime expired mid-iteration on a 2-worker GitHub runner. See
-# qurl-service CI run 24648851303 (nhp#1188, qurl-service#325):
-#   https://github.com/layervai/qurl-service/actions/runs/24648851303
-# The 5s headroom is defensive padding. Override via FUZZTIME_QUICK /
-# FUZZTIME_LONG for longer nightly runs.
+# Fuzz parameters. The fuzz recipes route through scripts/run-fuzz.sh,
+# which distinguishes a real crasher (writes testdata/fuzz/<NAME>/<sha>)
+# from the upstream Go-fuzz coordinator deadline-race flake (no
+# reproducer file). Prior history: nhp#1188 / qurl-service#325 papered
+# over the race by raising FUZZTIME_QUICK from 10s to 15s; nhp#1649
+# tripped it again, which is what motivated the structural workaround.
+# Override FUZZTIME_QUICK / FUZZTIME_LONG for longer nightly runs.
 FUZZTIME_QUICK ?= 15s
 FUZZTIME_LONG  ?= 60s
 
@@ -415,16 +432,16 @@ fuzz:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running fuzz tests (fuzztime=$(FUZZTIME_LONG))...$(END_COLOUR)"
 	@cd nhp && for t in $(FUZZ_TARGETS); do \
 		echo "[OpenNHP]   -> $$t"; \
-		go test -run='^$$' -fuzz=$$t -fuzztime=$(FUZZTIME_LONG) ./test/ || exit 1; \
+		../scripts/run-fuzz.sh ./test/ $$t $(FUZZTIME_LONG) || exit $$?; \
 	done
 	@echo "[OpenNHP]   -> FuzzNewVerifier"
-	@cd nhp && go test -run='^$$' -fuzz=FuzzNewVerifier -fuzztime=$(FUZZTIME_LONG) ./core/verifier/
+	@cd nhp && ../scripts/run-fuzz.sh ./core/verifier/ FuzzNewVerifier $(FUZZTIME_LONG)
 	@cd endpoints && for t in $(FUZZ_TARGETS_ENDPOINTS); do \
 		echo "[OpenNHP]   -> $$t"; \
-		KBS_SKIP_INIT=1 go test -run='^$$' -fuzz=$$t -fuzztime=$(FUZZTIME_LONG) ./server/ || exit 1; \
+		KBS_SKIP_INIT=1 ../scripts/run-fuzz.sh ./server/ $$t $(FUZZTIME_LONG) || exit $$?; \
 	done
 	@echo "[OpenNHP]   -> FuzzAccessTokenValidationDifferential"
-	@cd endpoints && KBS_SKIP_INIT=1 go test -run='^$$' -fuzz=FuzzAccessTokenValidationDifferential -fuzztime=$(FUZZTIME_LONG) ./server/staticplugins/qurl/
+	@cd endpoints && KBS_SKIP_INIT=1 ../scripts/run-fuzz.sh ./server/staticplugins/qurl/ FuzzAccessTokenValidationDifferential $(FUZZTIME_LONG)
 	@echo "$(COLOUR_GREEN)[OpenNHP] Fuzz tests completed$(END_COLOUR)"
 
 # Run fuzz tests at a shortened budget (CI default; see fuzz: above for
@@ -433,16 +450,16 @@ fuzz-quick:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running quick fuzz tests (fuzztime=$(FUZZTIME_QUICK))...$(END_COLOUR)"
 	@cd nhp && for t in $(FUZZ_TARGETS); do \
 		echo "[OpenNHP]   -> $$t"; \
-		go test -run='^$$' -fuzz=$$t -fuzztime=$(FUZZTIME_QUICK) ./test/ || exit 1; \
+		../scripts/run-fuzz.sh ./test/ $$t $(FUZZTIME_QUICK) || exit $$?; \
 	done
 	@echo "[OpenNHP]   -> FuzzNewVerifier"
-	@cd nhp && go test -run='^$$' -fuzz=FuzzNewVerifier -fuzztime=$(FUZZTIME_QUICK) ./core/verifier/
+	@cd nhp && ../scripts/run-fuzz.sh ./core/verifier/ FuzzNewVerifier $(FUZZTIME_QUICK)
 	@cd endpoints && for t in $(FUZZ_TARGETS_ENDPOINTS); do \
 		echo "[OpenNHP]   -> $$t"; \
-		KBS_SKIP_INIT=1 go test -run='^$$' -fuzz=$$t -fuzztime=$(FUZZTIME_QUICK) ./server/ || exit 1; \
+		KBS_SKIP_INIT=1 ../scripts/run-fuzz.sh ./server/ $$t $(FUZZTIME_QUICK) || exit $$?; \
 	done
 	@echo "[OpenNHP]   -> FuzzAccessTokenValidationDifferential"
-	@cd endpoints && KBS_SKIP_INIT=1 go test -run='^$$' -fuzz=FuzzAccessTokenValidationDifferential -fuzztime=$(FUZZTIME_QUICK) ./server/staticplugins/qurl/
+	@cd endpoints && KBS_SKIP_INIT=1 ../scripts/run-fuzz.sh ./server/staticplugins/qurl/ FuzzAccessTokenValidationDifferential $(FUZZTIME_QUICK)
 	@echo "$(COLOUR_GREEN)[OpenNHP] Quick fuzz tests completed$(END_COLOUR)"
 
 archive:
