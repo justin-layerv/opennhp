@@ -197,6 +197,11 @@ locals {
     # qurl-service PR #323. Derived from the ALB's own subnets so it
     # stays correct through VPC/subnet changes.
     { name = "QURL_TRUSTED_PROXY_CIDRS", value = join(",", local.alb_subnet_cidrs) },
+    # Tunnel-auth feature gate (qurl-service PR #277). Default false keeps
+    # the new code paths inert in prod until the POST /v1/resources type=tunnel
+    # creation endpoint (#405) and the per-AZ FRPS assignment (#396) deploy
+    # together. Flipped to true per-env via tfvars once those land.
+    { name = "TUNNEL_AUTH_ENABLED", value = var.tunnel_auth_enabled ? "true" : "false" },
     # Idempotency cache configuration
     { name = "IDEMPOTENCY_CACHE_TTL", value = tostring(var.idempotency_cache_ttl_seconds) },
     { name = "IDEMPOTENCY_CACHE_MAX_SIZE", value = tostring(var.idempotency_cache_max_size) },

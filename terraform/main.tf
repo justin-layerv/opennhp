@@ -1691,6 +1691,9 @@ module "qurl_service" {
   grafana_secret_arn    = var.qurl_grafana_secret_arn
   adot_collector_image  = var.qurl_adot_collector_image
 
+  # Tunnel auth feature gate (qurl-service PR #277; default false until #405/#396 land)
+  tunnel_auth_enabled = var.qurl_tunnel_auth_enabled
+
   # Ensure the HMAC secret is seeded before the ECS task pulls it via valueFrom.
   depends_on = [terraform_data.nhp_internal_auth_seed]
 }

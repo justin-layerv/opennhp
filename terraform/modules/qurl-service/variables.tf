@@ -772,3 +772,11 @@ variable "adot_collector_image" {
   type        = string
   default     = "public.ecr.aws/aws-observability/aws-otel-collector:v0.40.0"
 }
+
+# ==================== Tunnel Auth ====================
+
+variable "tunnel_auth_enabled" {
+  description = "Enable the qurl-service tunnel-auth code paths (POST /internal/v1/tunnel/auth + type=tunnel branches in CreateQurl/CreateResource). Default false keeps the new surface inert in prod until the creation endpoint (qurl-service #405) and per-AZ FRPS assignment (qurl-service #396) are both deployed. See PR #277 for the gate; flip per-env via tfvars after the dependent qurl-service work ships."
+  type        = bool
+  default     = false
+}
