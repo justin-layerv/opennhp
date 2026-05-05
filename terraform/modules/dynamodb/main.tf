@@ -1203,3 +1203,53 @@ resource "aws_dynamodb_table" "qurl_idempotency" {
     Purpose   = "Distributed idempotency cache"
   })
 }
+
+# qurl-apikey-idempotency: dedicated idempotency cache for the
+# `POST /v1/api-keys` mint path. Separated from the generic
+# `qurl-idempotency` table because:
+#   1. The stored response envelope contains the plaintext API key (one-
+#      time-only return on a successful mint). Tighter IAM blast radius
+#      means the api-key-management code can read replays without
+#      granting it access to every cached qurl-service response.
+#   2. The mint path uses TransactWriteItems across (qurl-api-keys,
+#      this table) so either both rows land or neither does — orphan-on-
+#      crash becomes structurally impossible at the service layer.
+#      Generic post-hoc response caching in the qurl-idempotency table
+#      can't make that guarantee.
+#
+# PK: pk (SHA-256 hash of owner_id:idempotency_key, scoped per discord
+#         OAuth state mint). TTL: 24h (matches qurl-idempotency).
+resource "aws_dynamodb_table" "qurl_apikey_idempotency" {
+  count = var.deploy_qurl_tables ? 1 : 0
+
+  name                        = "${var.name_prefix}-${var.cell_id}-qurl-apikey-idempotency"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "pk"
+  deletion_protection_enabled = local.is_prod
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-qurl-apikey-idempotency"
+    Cell      = var.cell_id
+    Component = "qurl-service"
+    Purpose   = "Idempotency cache for POST /v1/api-keys mint"
+  })
+}

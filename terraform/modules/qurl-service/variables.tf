@@ -401,6 +401,18 @@ variable "idempotency_table_name" {
   default     = ""
 }
 
+variable "apikey_idempotency_table_arn" {
+  description = "DynamoDB table ARN for API key mint idempotency storage"
+  type        = string
+  default     = ""
+}
+
+variable "apikey_idempotency_table_name" {
+  description = "DynamoDB table name for API key mint idempotency storage"
+  type        = string
+  default     = ""
+}
+
 # ==================== Idempotency Cache ====================
 
 variable "idempotency_cache_ttl_seconds" {

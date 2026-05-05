@@ -1635,6 +1635,9 @@ module "qurl_service" {
   idempotency_cache_max_size           = var.qurl_idempotency_cache_max_size
   idempotency_cleanup_interval_seconds = var.qurl_idempotency_cleanup_interval_seconds
 
+  apikey_idempotency_table_name = module.dynamodb.qurl_apikey_idempotency_table_name
+  apikey_idempotency_table_arn  = module.dynamodb.qurl_apikey_idempotency_table_arn
+
   # Health check
   health_check_timeout_seconds   = var.qurl_health_check_timeout_seconds
   health_startup_timeout_seconds = var.qurl_health_startup_timeout_seconds

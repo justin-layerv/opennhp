@@ -236,6 +236,10 @@ locals {
     var.idempotency_table_name != "" ? [
       { name = "IDEMPOTENCY_TABLE_NAME", value = var.idempotency_table_name },
     ] : [],
+    # API key idempotency table (dedicated for POST /v1/api-keys mint)
+    var.apikey_idempotency_table_name != "" ? [
+      { name = "APIKEY_IDEMPOTENCY_TABLE_NAME", value = var.apikey_idempotency_table_name },
+    ] : [],
     # Webhooks configuration
     var.webhooks_enabled ? [
       { name = "WEBHOOKS_ENABLED", value = "true" },
@@ -454,7 +458,9 @@ resource "aws_iam_role_policy" "task_dynamodb" {
           var.dynamodb_table_arns,
           [for arn in var.dynamodb_table_arns : "${arn}/index/*"],
           # Idempotency table (if configured)
-          var.idempotency_table_arn != "" ? [var.idempotency_table_arn] : []
+          var.idempotency_table_arn != "" ? [var.idempotency_table_arn] : [],
+          # API key idempotency table (if configured)
+          var.apikey_idempotency_table_arn != "" ? [var.apikey_idempotency_table_arn] : []
         )
       },
       ],
