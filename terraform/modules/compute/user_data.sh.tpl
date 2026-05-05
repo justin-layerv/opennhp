@@ -273,6 +273,18 @@ fi
 mkdir -p /opt/layerv/nhp-server/etc
 mkdir -p /opt/layerv/nhp-server/log
 
+# SECURITY: config.toml carries the **fleet-wide** NHP server PrivateKeyBase64
+# (and, in api mode, $auth_signing_key / $auth_aes_key — both `sensitive=true`
+# in modules/compute/variables.tf). Cloud-init's default umask leaves files
+# created by `cat > …` at mode 644; a co-tenant or non-root host process
+# would observe the private key on disk between heredoc-write and any later
+# tightening. Mirror the secrets.env pattern (`grep -n 'touch.*secrets.env'`
+# in this file): create the inode + chmod 600 *before* any secret content
+# lands. chmod 600 set on
+# the inode persists across the heredoc's truncate-and-rewrite — bash's
+# `>` does not reset mode. Closes #1389.
+touch /opt/layerv/nhp-server/etc/config.toml
+chmod 600 /opt/layerv/nhp-server/etc/config.toml
 cat > /opt/layerv/nhp-server/etc/config.toml << CONFIGEOF
 PrivateKeyBase64 = "$PRIVATE_KEY"
 DefaultCipherScheme = 0
@@ -768,6 +780,13 @@ mkdir -p /opt/layerv/nhp-server/plugins/${plugin_name}/etc
 
 # Passcode plugin config
 %{ if contains(server_plugins, "passcode") ~}
+# SECURITY: in api mode this file holds $auth_signing_key and $auth_aes_key
+# (both `sensitive=true` in modules/compute/variables.tf). chmod 600 the
+# inode before the heredoc writes so the keys never land at the default
+# cloud-init umask (644). Same class as the server config.toml fix above
+# (#1389).
+touch /opt/layerv/nhp-server/plugins/passcode/etc/config.toml
+chmod 600 /opt/layerv/nhp-server/plugins/passcode/etc/config.toml
 cat > /opt/layerv/nhp-server/plugins/passcode/etc/config.toml << PLUGINEOF
 # Passcode plugin configuration
 # ResourceMode: "api" uses external auth API, "file" uses local resource.toml
