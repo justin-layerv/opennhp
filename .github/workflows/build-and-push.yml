@@ -1104,6 +1104,14 @@ jobs:
   # TERRAFORM VALIDATE (main) - Lightweight validation before deploy
   # No terraform plan here — deploy-sandbox-infra runs plan+apply in one job,
   # saving 1 M2M token per merge (the old plan artifact was never consumed).
+  #
+  # Note: this job runs `validate` + `fmt -check` only, so plan-time
+  # preconditions (e.g. the `^v0\\.0\\.0-bootstrap` reject at
+  # terraform/main.tf:1051) are NOT evaluated here. If anyone ever extends
+  # this job to run `terraform plan`, also port the
+  # `Resolve qurl-reverse-tunnel-server Image Tag` step from
+  # `deploy-sandbox-infra` so the precondition has a real tag to evaluate
+  # against. See PR #1551.
   # ============================================================================
   terraform-plan:
     name: Terraform Pre-Deploy Checks (${{ matrix.environment }})
@@ -1243,6 +1251,124 @@ jobs:
           AUTH0_CLIENT_SECRET: ${{ secrets.AUTH0_CLIENT_SECRET }}
         run: ./.github/scripts/fetch-auth0-token.sh terraform/environments/sandbox/terraform.tfvars sandbox
 
+      # Resolve the qurl-reverse-tunnel-server image tag from SSM so terraform
+      # plan/apply picks up the live tag the release pipeline (separate repo)
+      # most recently published. The SSM parameter is created by Terraform and
+      # updated out-of-band by the qurl-reverse-tunnel-server repo's CI
+      # (`/sandbox/nhp/reverse-tunnel-server/image-tag`,
+      # `lifecycle.ignore_changes = [value]`).
+      #
+      # Fallback: this step does NOT export `TF_VAR_frps_image_tag` when
+      # the parameter does not exist yet (greenfield env, or
+      # `deploy_frps = false` and the resource was never created), or when
+      # it still holds the bootstrap placeholder. In both cases terraform
+      # falls back to the tfvars pin if `terraform/environments/sandbox/
+      # terraform.tfvars` sets `frps_image_tag`, or otherwise to the
+      # `var.frps_image_tag` default (`v0.0.0-bootstrap`, which the
+      # precondition then rejects loudly when `deploy_frps = true`).
+      # Setting `TF_VAR_frps_image_tag=""` would override tfvars with an
+      # empty string and silently bypass the bootstrap-placeholder
+      # precondition.
+      #
+      # Sandbox-only: this step lives in `deploy-sandbox-infra`. Prod's
+      # `TF_VAR_frps_image_tag` always comes from
+      # `terraform/environments/prod/terraform.tfvars`; the prod release
+      # pipeline does not auto-resolve from SSM (intentional — prod has
+      # stricter change-control). Parity tracked in #1561.
+      #
+      # The plan-time precondition at terraform/main.tf rejects the bootstrap
+      # placeholder when `deploy_frps = true`, so pinning a real tag in
+      # tfvars is what unblocks first apply; this step just keeps subsequent
+      # applies tracking the live SSM value without a code change.
+      #
+      # First-apply runbook (when an operator flips `deploy_frps = true`):
+      # 1. Pin a real `frps_image_tag = "<tag>"` in
+      #    `terraform/environments/sandbox/terraform.tfvars`.
+      # 2. Apply. Terraform writes the SSM parameter as a side effect.
+      # 3. Subsequent applies: this step takes over from tfvars.
+      # See #1561 for prod-side parity discussion.
+      #
+      # Error handling mirrors the AMI-check step earlier in this file: we
+      # capture stderr and distinguish `ParameterNotFound` (expected
+      # greenfield case) from real failures (IAM denied, expired creds,
+      # region misconfigured, throttling). Real failures `exit 1` so a CI
+      # misconfiguration cannot silently fall through to "tfvars wins."
+      #
+      # Blast radius of `exit 1` here: blocks the entire `deploy-sandbox-infra`
+      # job, not just the qurl-frps module. This is intentional — silent
+      # drift on a cross-repo contract surface is worse than a loud failure
+      # that pages whoever pushed the bad SSM value. If the
+      # qurl-reverse-tunnel-server release pipeline writes a malformed tag,
+      # it should fail loudly here, not land in apply.
+      - name: Resolve qurl-reverse-tunnel-server Image Tag
+        run: |
+          set -euo pipefail
+
+          SSM_PARAM="/sandbox/nhp/reverse-tunnel-server/image-tag"
+          SSM_ERR_FILE="/tmp/frps-ssm-err"
+
+          # Belts-and-suspenders: bash's `2>"$SSM_ERR_FILE"` already
+          # truncates the file on open, so the AWS call itself can't be
+          # confused by stale content. This `rm -f` covers the narrower
+          # case where someone refactors the script to read or grep the
+          # file before the AWS call runs — a no-op today on GitHub-hosted
+          # ephemeral runners, cheap insurance otherwise. The AMI-check
+          # step earlier in this file does NOT do this pre-clear yet —
+          # asymmetry tracked in #1575 (apply same hygiene + tag-shape
+          # validation symmetrically across both SSM-read steps).
+          rm -f "$SSM_ERR_FILE"
+
+          # Docker/OCI reference grammar restricts tags to
+          # `[A-Za-z0-9_][A-Za-z0-9._-]{0,127}` — leading char restricted,
+          # 1–128 chars total. Source: distribution/reference/regexp.go in
+          # the Docker distribution project (TagRegexp).
+          # We require this shape before writing to GITHUB_ENV so a future SSM
+          # scribbler (manual edit, malformed release pipeline write) can't smuggle
+          # newlines or shell metacharacters into the env file. Bootstrap placeholder
+          # is rejected separately by the bootstrap-prefix branch in the
+          # conditional below.
+          TAG_RE='^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'
+
+          # `--region "$AWS_REGION"` is explicit so the lookup is pinned to
+          # the env's region even if a future workflow edit drops the
+          # job-level AWS_REGION (the `aws-actions/configure-aws-credentials`
+          # action already exports it from the role config; this just
+          # belts-and-suspenders the dependency).
+          if FRPS_TAG=$(aws ssm get-parameter \
+              --region "$AWS_REGION" \
+              --name "$SSM_PARAM" \
+              --query "Parameter.Value" --output text 2>"$SSM_ERR_FILE"); then
+            # `aws ... --output text` can render a missing scalar as "None".
+            if [[ -z "$FRPS_TAG" || "$FRPS_TAG" == "None" ]]; then
+              echo "::notice::SSM $SSM_PARAM returned empty/None; falling back to tfvars."
+            elif [[ "$FRPS_TAG" =~ ^v0\.0\.0-bootstrap ]]; then
+              echo "::notice::SSM $SSM_PARAM still holds bootstrap placeholder ($FRPS_TAG); falling back to tfvars."
+            elif [[ ! "$FRPS_TAG" =~ $TAG_RE ]]; then
+              echo "::error::SSM $SSM_PARAM holds a value that is not a valid Docker tag: $(printf %q "$FRPS_TAG")"
+              exit 1
+            else
+              echo "::notice::Resolved qurl-reverse-tunnel-server image tag from SSM: $FRPS_TAG"
+              echo "TF_VAR_frps_image_tag=$FRPS_TAG" >> "$GITHUB_ENV"
+            fi
+            # Success path complete — the rest of this script is the
+            # unexpected-error path. Any future success-path steps must go
+            # ABOVE this `exit 0`, not after it.
+            exit 0
+          fi
+
+          if grep -q "ParameterNotFound" "$SSM_ERR_FILE"; then
+            echo "::notice::SSM $SSM_PARAM not found (greenfield or deploy_frps=false); falling back to tfvars."
+            exit 0
+          fi
+
+          echo "::error::Unexpected SSM error reading $SSM_PARAM:"
+          cat "$SSM_ERR_FILE"
+          exit 1
+
+      # The `Resolve qurl-reverse-tunnel-server Image Tag` step above conditionally exports
+      # TF_VAR_frps_image_tag to GITHUB_ENV; it is inherited by this step
+      # automatically. When SSM has the bootstrap placeholder or no value,
+      # it stays unset and tfvars wins. See that step for the contract.
       - name: Handle ASG Attachment Migrations
         working-directory: terraform/environments/sandbox
         env:
@@ -1300,6 +1426,10 @@ jobs:
             fi
           fi
 
+      # TF_VAR_frps_image_tag (when SSM has a non-bootstrap value) was
+      # exported to GITHUB_ENV by the
+      # "Resolve qurl-reverse-tunnel-server Image Tag" step earlier in this
+      # job, so it is inherited here automatically.
       - name: Terraform Apply
         working-directory: terraform/environments/sandbox
         env:
