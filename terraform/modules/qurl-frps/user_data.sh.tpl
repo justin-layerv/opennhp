@@ -13,10 +13,14 @@
 #   re-extract the binary (e.g., swap image_tag by hand for a hotfix), run
 #   `sudo systemctl enable --now docker` first before re-running the
 #   extraction block.
-# - The binary is pulled from either `/usr/local/bin/nhp-frps` or `/nhp-frps`
-#   inside the image (first path tried, fall back to the second). If the
-#   qurl-frps image layout changes again, BOTH paths below need to track;
-#   the image's CI should pin its own path so this stays in lockstep.
+# - The binary is pulled from `/usr/local/bin/qurl-frps` (canonical, matches
+#   the qurl-reverse-tunnel-server Dockerfile) with fallback to the legacy
+#   `/usr/local/bin/nhp-frps` and `/nhp-frps` paths for older images still
+#   pinned in SSM history. If the qurl-frps image layout changes again, ALL
+#   THREE paths below need to track; the image's CI should pin its own path
+#   so this stays in lockstep. A `WARN: legacy fallback ...` line is logged
+#   when a non-canonical path hits — query CloudWatch for it before dropping
+#   the legacy branches.
 set -ex
 
 exec > >(tee /var/log/user-data.log | logger -t user-data) 2>&1
@@ -217,16 +221,31 @@ FRPS_IMAGE="$ECR_REGISTRY/layerv/qurl-frps:$IMAGE_TAG"
 # Binary permissions are set to 0755 by the `chmod` below (after ownership
 # transfer), so the ECR and S3 branches just drop the file in place.
 if docker pull "$FRPS_IMAGE"; then
-  # Extract binary from container image. If BOTH `docker cp` branches fail,
-  # the chained `||` collapses to a non-zero exit and `set -e` trips before
-  # the `docker rm` below — leaving an orphan container behind. Install a
-  # scoped EXIT trap that force-removes the container regardless of which
-  # path we take out. Traps nest by subshell scope; we pop it on the normal
-  # path after `docker rm` so the rest of the script isn't affected.
+  # Extract binary from container image. If ALL three `docker cp` branches
+  # fail, the chained `||` collapses to a non-zero exit and `set -e` trips
+  # before the `docker rm` below — leaving an orphan container behind.
+  # Install a scoped EXIT trap that force-removes the container regardless
+  # of which path we take out. Traps nest by subshell scope; we pop it on
+  # the normal path after `docker rm` so the rest of the script isn't
+  # affected.
   CONTAINER_ID=$(docker create "$FRPS_IMAGE")
   trap 'docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true' EXIT
-  docker cp "$CONTAINER_ID:/usr/local/bin/nhp-frps" /opt/layerv/qurl-frps/nhp-frps || \
+  # Container path: the qurl-reverse-tunnel-server Dockerfile installs the
+  # binary at /usr/local/bin/qurl-frps (canonical binary name across the
+  # qurl-reverse-tunnel-server source repo and the systemd unit; the ECR
+  # repo it ships in is `layerv/qurl-reverse-tunnel-server`). The
+  # /usr/local/bin/nhp-frps and /nhp-frps fallbacks remain for older
+  # bootstrap images that pre-date the rename. Each legacy hit emits a
+  # `WARN: legacy fallback ...` line to user-data.log → CloudWatch so a
+  # single Logs Insights query gates the eventual cleanup; without that
+  # signal "nobody complained" is the only proxy for safe-to-drop.
+  docker cp "$CONTAINER_ID:/usr/local/bin/qurl-frps" /opt/layerv/qurl-frps/nhp-frps || {
+    echo "WARN: legacy fallback to /usr/local/bin/nhp-frps — image is pre-rename"
+    docker cp "$CONTAINER_ID:/usr/local/bin/nhp-frps" /opt/layerv/qurl-frps/nhp-frps
+  } || {
+    echo "WARN: legacy fallback to /nhp-frps — image is even older"
     docker cp "$CONTAINER_ID:/nhp-frps" /opt/layerv/qurl-frps/nhp-frps
+  }
   docker rm "$CONTAINER_ID"
   trap - EXIT
   # Reclaim the image layers (best-effort). Each instance only ever pulls once
