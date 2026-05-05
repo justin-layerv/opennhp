@@ -22,9 +22,12 @@ const (
 	PASS_PRE_ACCESS_IP
 )
 
+// HandleUdpACOperations processes a single NHP_AOP packet. Synchronous —
+// callers own goroutine and wg accounting. The production caller is the
+// NHP_AOP arm of recvMessageRoutine in udpac.go, which spawns this in a
+// goroutine wrapped by `defer a.wg.Done(); defer a.recoverUDPHandler(...)`.
+// Tests call this directly without a wg ceremony.
 func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
-	defer a.wg.Done()
-
 	acId := a.config.ACId
 	dopMsg := &common.ServerACOpsMsg{}
 	artMsg := &common.ACOpsResultMsg{}
@@ -635,6 +638,11 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 
 func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, dstAddrs []*common.NetAddress, openTimeSec int) {
 	defer a.wg.Done()
+	// Spawned from HandleAccessControl on the NHP_AOP path; same
+	// blast radius as the per-packet recover seam in
+	// recvMessageRoutine — a panic here would crash nhp-acd and
+	// take out every in-flight knock transaction. See #1423.
+	defer a.recoverUDPHandler(core.NHP_AOP)
 	defer func() { _ = listener.Close() }()
 
 	// accept only the first incoming tcp connection
@@ -769,6 +777,8 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 
 func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs []*common.NetAddress, openTimeSec int) {
 	defer a.wg.Done()
+	// Same per-packet panic-recover discipline as tcpTempAccessHandler.
+	defer a.recoverUDPHandler(core.NHP_AOP)
 	defer func() { _ = conn.Close() }()
 	// listen to accept and handle only one incoming connection
 	startTime := time.Now()
@@ -932,6 +942,13 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 }
 
 func (a *UdpAC) tempConnTerminator(conn net.Conn, ctx context.Context) {
+	// Spawned by tcpTempAccessHandler / udpTempAccessHandler on the
+	// NHP_AOP path; the body is small and conn.Close() is the only
+	// realistic panic site, but the asymmetric "panic-here-kills-the-AC"
+	// math from #1423 still applies. The recover keeps the AC alive
+	// regardless. (Note: tempConnTerminator is NOT a.wg-tracked today,
+	// so it can leak past Stop(); that's tracked in #1658, not this PR.)
+	defer a.recoverUDPHandler(core.NHP_AOP)
 	select {
 	case <-a.signals.stop:
 		_ = conn.Close()

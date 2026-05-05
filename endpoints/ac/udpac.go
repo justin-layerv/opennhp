@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -225,7 +226,28 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 func (ac *UdpAC) Stop() {
 	ac.running.Store(false)
 	close(ac.signals.stop)
-	// Stop registration manager
+	// Stop registration manager.
+	//
+	// Ordering note: ac.registration.Stop() runs BEFORE ac.wg.Wait()
+	// below, which means an in-flight NHP_ARD goroutine spawned by
+	// recvMessageRoutine can still call into a stopped registration
+	// manager during its remaining execution. The wg-tracking added
+	// in #1655 ensures the goroutine cannot outlive Stop() entirely,
+	// but the use-after-stop window inside the goroutine is
+	// unchanged. Tracked separately in #1657 — the obvious one-line
+	// reorder (move wg.Wait above this) introduces a NEW deadlock
+	// surface: serverDiscovery does a bare `sendMsgCh <- aolMd`
+	// followed by a bare `<-aolMd.ResponseMsgCh`, neither of which
+	// selects on signals.stop. Today device.Stop() (see
+	// nhp/core/device.go::(*Device).Stop — closes the device's
+	// transaction map and drains pending response channels) is what
+	// resolves the response wait; reversing the order leaves
+	// serverDiscovery blocked on the response with no path to wake
+	// it. The proper fix is gating the sends on signals.stop (or
+	// moving HandleRedispatch behind a stopped check on the
+	// manager) — see #1657 options A/B. If
+	// nhp/core/device.go::(*Device).Stop ever changes its drain
+	// semantics, revisit this ordering.
 	if ac.registration != nil {
 		ac.registration.Stop()
 	}
@@ -254,17 +276,80 @@ func (a *UdpAC) IsRunning() bool {
 	return a.running.Load()
 }
 
-// recordTransactionClosed increments MetricTransactionClosed on the AC
-// registration's publisher iff err is common.ErrTransactionClosed. Nil-
-// safe on registration and its publisher, so call sites in the UDP
-// message handlers don't have to guard.
+// incrMetric is the centralized increment site for AC counters,
+// nil-safe on both a.registration and the publisher (the latter is
+// guaranteed by Publisher.IncrCounter's nil-receiver check). Every
+// metric-publishing call site in this file should route through
+// here so the nil-discipline lives in one place.
+func (a *UdpAC) incrMetric(name string) {
+	if reg := a.registration; reg != nil {
+		reg.metrics.IncrCounter(name)
+	}
+}
+
+// recordTransactionClosed increments MetricTransactionClosed iff err
+// is common.ErrTransactionClosed. Nil-safety is delegated to
+// incrMetric.
 func (a *UdpAC) recordTransactionClosed(err error) {
-	if err == nil || a.registration == nil || a.registration.metrics == nil {
+	if err == nil {
 		return
 	}
 	if errors.Is(err, common.ErrTransactionClosed) {
-		a.registration.metrics.IncrCounter(MetricTransactionClosed)
+		a.incrMetric(MetricTransactionClosed)
 	}
+}
+
+// recoverUDPHandler catches panics on every per-packet goroutine on
+// the AC's UDP message-handler path: the recvMessageRoutine entries
+// (NHP_AOP, NHP_ARD) and every goroutine they transitively spawn
+// (HandleAccessControl's tcpTempAccessHandler / udpTempAccessHandler
+// and the tempConnTerminator nested inside each of those). It logs
+// the panic value + stack at Error and increments
+// MetricUDPHandlerPanic so the alarm in
+// terraform/modules/ac/monitoring.tf fires on the next flush.
+//
+// Both defers (a.wg.Done and a.recoverUDPHandler) must be at the
+// goroutine ENTRY, not nested inside the handler — pushing the
+// recover into HandleUdpACOperations would silently swallow panics
+// in msghandler_test.go's direct test callers. The relative order
+// of the two defers is functionally equivalent (Go runs every
+// deferred function in LIFO order even if an earlier defer panicked,
+// and a recovered panic does not propagate), so wg.Done is reached
+// either way; the convention here is wg.Done first → recover second
+// purely for grep-symmetry across spawn sites.
+//
+// headerType is the NHP message type that triggered the goroutine
+// (matches the type of core.PacketParserData.HeaderType used by the
+// inner handlers); core.HeaderTypeToString stringifies it for the
+// log line. Goroutines spawned downstream (the temp-access handlers)
+// re-use NHP_AOP since that's the message type that initiated the
+// access-control flow.
+func (a *UdpAC) recoverUDPHandler(headerType int) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	// Read ACId via a local with a nil fallback because this is the
+	// one place in the codebase where being more defensive than the
+	// surrounding code has asymmetric value: a panic inside this
+	// deferred handler is itself unrecovered and would kill the
+	// process — exactly what the PR exists to prevent. The rest of
+	// udpac.go derefs both a.config and a.registration freely; in
+	// practice both are read-once-and-never-reassigned (set during
+	// Start() / NewACRegistration() and not mutated thereafter), so
+	// the nil-guards here (and the matching `if reg := a.registration`
+	// in incrMetric) are defense-in-depth against a hypothetical
+	// future hot-reload-style refactor, not against a concurrent
+	// nil. If config ever becomes hot-reloadable, the nil-fallback
+	// here also fences the racing-mutation case — the field is read
+	// once into the local without holding any lock.
+	acId := "<nil-config>"
+	if a.config != nil {
+		acId = a.config.ACId
+	}
+	log.Error("ac(%s)[%s] panic recovered: %v\n%s",
+		acId, core.HeaderTypeToString(headerType), r, string(debug.Stack()))
+	a.incrMetric(MetricUDPHandlerPanic)
 }
 
 func (a *UdpAC) newConnection(addr *net.UDPAddr) (conn *UdpConn) {
@@ -594,6 +679,13 @@ func (a *UdpAC) recvMessageRoutine() {
 				// deal with NHP_AOP message
 				a.wg.Add(1)
 				go func() {
+					defer a.wg.Done()
+					defer a.recoverUDPHandler(core.NHP_AOP)
+					// Note: this errors.Is filter is bypassed when
+					// HandleUdpACOperations panics — control jumps
+					// straight to the deferred recoverUDPHandler.
+					// That's the intended behavior; the filter only
+					// shapes the *error-returning* path here.
 					if err := a.HandleUdpACOperations(ppd); err != nil {
 						// HandleUdpACOperations already logs both the
 						// duplicate drop (Warning) and the
@@ -610,8 +702,20 @@ func (a *UdpAC) recvMessageRoutine() {
 				}()
 
 			case core.NHP_ARD:
-				// Handle AC redispatch to assigned servers
-				go a.HandleACRedispatch(ppd)
+				// Handle AC redispatch to assigned servers. wg-track
+				// so Stop()'s wg.Wait() blocks until in-flight
+				// redispatches return; pre-fix the goroutine could
+				// outlive Stop() entirely. Note this does NOT close
+				// the use-after-stop window on a stopped registration
+				// manager — Stop() tears down ac.registration before
+				// wg.Wait() — see the matching note in Stop() and
+				// the tracking issue #1657.
+				a.wg.Add(1)
+				go func() {
+					defer a.wg.Done()
+					defer a.recoverUDPHandler(core.NHP_ARD)
+					a.HandleACRedispatch(ppd)
+				}()
 			}
 		}
 	}

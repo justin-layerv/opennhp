@@ -47,7 +47,6 @@ func TestHandleUdpACOperations_DedupeRunsBeforeUnmarshal(t *testing.T) {
 		// BodyMessage left nil — json.Unmarshal would error on it.
 	}
 
-	a.wg.Add(1)
 	err := a.HandleUdpACOperations(ppd)
 
 	if !errors.Is(err, common.ErrACDuplicateTransaction) {
@@ -74,7 +73,6 @@ func TestHandleUdpACOperations_EmptyPubkeyDistinct(t *testing.T) {
 		HeaderType:     core.NHP_AOP,
 	}
 
-	a.wg.Add(1)
 	err := a.HandleUdpACOperations(ppd)
 
 	if !errors.Is(err, common.ErrACMissingPeerPubkey) {
@@ -109,7 +107,6 @@ func TestHandleUdpACOperations_WrongLengthPubkeyDistinct(t *testing.T) {
 				RemoteSendTime: testSendTime,
 				HeaderType:     core.NHP_AOP,
 			}
-			a.wg.Add(1)
 			err := a.HandleUdpACOperations(ppd)
 
 			if !errors.Is(err, common.ErrACMissingPeerPubkey) {
@@ -157,7 +154,6 @@ func TestHandleUdpACOperations_FirstSeenProceedsToUnmarshal(t *testing.T) {
 		ConnData:       &core.ConnectionData{},
 	}
 
-	a.wg.Add(1)
 	err := a.HandleUdpACOperations(ppd)
 
 	if err == nil {

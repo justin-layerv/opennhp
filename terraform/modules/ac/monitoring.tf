@@ -92,6 +92,101 @@ resource "aws_cloudwatch_metric_alarm" "server_connection_failure" {
   })
 }
 
+# ==================== UDP Handler Panic Alarm ====================
+#
+# Pages on any panic recovered by the top-level guard on the AC's UDP
+# message-handler goroutines (NHP_AOP / NHP_ARD entry points in
+# endpoints/ac/udpac.go::recvMessageRoutine). The guard exists because
+# a single panic on a per-packet goroutine would otherwise crash
+# nhp-acd, taking down all in-flight knock transactions on the
+# instance and triggering an ASG instance refresh. Any non-zero value
+# is a page-worthy signal: it indicates a reachable panic site on the
+# UDP path that needs a root-cause fix, not a tuning change. See
+# nhp#1423.
+resource "aws_cloudwatch_metric_alarm" "udp_handler_panic" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-udp-handler-panic"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "UDPHandlerPanic"
+  namespace           = "LayerV/NHP"
+  period              = 300 # 5 minutes
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "AC nhp-acd recovered a panic on a UDP message-handler goroutine. Investigate the panic stack in CloudWatch logs and fix the root cause — ack-and-resolve before fixing means the next OK→ALARM transition will page again."
+  treat_missing_data  = "notBreaching"
+
+  # Match the publisher's full base-dim set — Component, Environment,
+  # Region — exactly. CloudWatch alarms select metric streams by exact
+  # dimension match; a partial set silently lands in INSUFFICIENT_DATA
+  # forever. The older `registration_failure` / `server_connection_failure`
+  # alarms in this file ship with the partial-set bug (issue #239); the
+  # newer `servers_healthy_low` / `registration_stale` block above is the
+  # correct precedent. See `IncrCounter` in metrics/publisher.go and
+  # `buildMetricData` for the emit path that establishes these dims.
+  dimensions = {
+    Component   = "AC"
+    Environment = var.environment
+    Region      = data.aws_region.current.id
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-ac-udp-handler-panic"
+  })
+}
+
+# Region-less backstop for the UDP handler panic alarm.
+#
+# The publisher in endpoints/ac/registration.go appends the Region dim
+# only when AWS_REGION is set in the environment. If a deploy ever
+# ships an AC with AWS_REGION unset (greenfield env, dev box, future
+# user_data regression), every Region-keyed alarm above sits in
+# INSUFFICIENT_DATA forever and the operator never gets paged on a
+# real fault — exactly the worst failure mode for a "should never
+# fire" counter that the runbook depends on.
+#
+# This backstop matches the {Component, Environment} dim set the
+# publisher emits in that case (mirroring eip_pool_utilization_high's
+# pattern), so at least ONE of the two alarms always covers a
+# recovered panic regardless of AWS_REGION state. Mutually exclusive
+# with the primary by design — the publisher emits exactly one of the
+# two dim shapes per environment, so when one alarm has data the
+# other sits in INSUFFICIENT_DATA. notBreaching keeps the inactive
+# one quiet.
+#
+# Tracked separately as #1659 for the underlying AWS_REGION
+# silent-fail concern; this alarm is the immediate mitigation.
+resource "aws_cloudwatch_metric_alarm" "udp_handler_panic_no_region" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-udp-handler-panic-no-region"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "UDPHandlerPanic"
+  namespace           = "LayerV/NHP"
+  period              = 300 # 5 minutes
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "AC nhp-acd recovered a panic on a UDP message-handler goroutine, AND AWS_REGION is unset on the AC environment (the primary alarm requires the Region dim and won't fire). Same response as the primary alarm — investigate the panic stack — plus fix AWS_REGION on the AC user_data path."
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Component   = "AC"
+    Environment = var.environment
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-ac-udp-handler-panic-no-region"
+  })
+}
+
 # ==================== Custom Domain Cert Sync Alarms ====================
 
 resource "aws_cloudwatch_metric_alarm" "cert_sync_failures" {
@@ -475,6 +570,8 @@ resource "aws_cloudwatch_dashboard" "ac_monitoring" {
             aws_cloudwatch_metric_alarm.server_connection_failure[0].arn,
             aws_cloudwatch_metric_alarm.servers_healthy_low[0].arn,
             aws_cloudwatch_metric_alarm.registration_stale[0].arn,
+            aws_cloudwatch_metric_alarm.udp_handler_panic[0].arn,
+            aws_cloudwatch_metric_alarm.udp_handler_panic_no_region[0].arn,
             ],
             var.enable_egress_eips ? [
               aws_cloudwatch_metric_alarm.eip_pool_utilization_high[0].arn,

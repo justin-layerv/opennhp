@@ -166,6 +166,19 @@ const (
 	// timestamp to get the sample prefixes.
 	MetricARDPubkeyPermitUnknown = "ARDPubkeyPermitUnknown"
 	MetricARDPubkeyRejected      = "ARDPubkeyRejected"
+
+	// MetricUDPHandlerPanic counts panics recovered by the top-level
+	// guard on the AC's UDP message-handler goroutines (NHP_AOP and
+	// NHP_ARD entry points in udpac.go::recvMessageRoutine; see
+	// recoverUDPHandler in udpac.go for the increment site). Without
+	// the guard a single panic on any per-packet goroutine would
+	// crash nhp-acd; with it the panic is contained and surfaced as
+	// this counter so the corresponding alarm in
+	// terraform/modules/ac/monitoring.tf can page operators on the
+	// next flush. Any non-zero value is page-worthy: it indicates a
+	// reachable panic site somewhere on the UDP path that needs a
+	// root-cause fix, not a tuning change.
+	MetricUDPHandlerPanic = "UDPHandlerPanic"
 )
 
 // Re-registration reason constants. These are the only values that
