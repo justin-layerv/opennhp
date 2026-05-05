@@ -204,6 +204,14 @@ auth0_domain                  = "layerv.us.auth0.com"
 qurl_jwt_secret_arn             = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/qurl-jwt-secret-i8a8OZ"
 qurl_internal_service_token_arn = "arn:aws:secretsmanager:us-east-2:767397897469:secret:layerv-nhp-sandbox/qurl-internal-service-token-XgjoDM"
 
+# Tunnel-auth feature gate (qurl-service PR #277). Flipping this to true
+# wires TUNNEL_AUTH_ENABLED=true into the qurl-service ECS task, which:
+#   - mounts POST /internal/v1/tunnel/auth (consumed by qurl-frps' httpPlugin)
+#   - allows POST /v1/qurls and POST /v1/resources to accept type=tunnel
+# Pre-req for the qurl-frps deploy (deploy_frps=true) to actually serve
+# tunnels — without it, FRPS clients would 404 on Login/NewProxy.
+qurl_tunnel_auth_enabled = true
+
 # Custom domain management (enables GET/POST/DELETE /v1/domains endpoints)
 # ACME suffix and NLB target are derived from hosted_zone and AC module automatically
 qurl_custom_domain_enabled = true
