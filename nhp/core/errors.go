@@ -1,11 +1,8 @@
 package core
 
 import (
-	"errors"
 	"strconv"
 )
-
-var errorMap map[int]*Error = make(map[int]*Error)
 
 type Error struct {
 	num      int
@@ -42,28 +39,10 @@ func (e *Error) ErrorNumber() int {
 }
 
 func newError(number int, msg string) *Error {
-	e := &Error{
+	return &Error{
 		num: number,
 		msg: msg,
 	}
-	errorMap[e.num] = e
-	return e
-}
-
-func ErrorToString(err error) string {
-	var e *Error
-	if errors.As(err, &e) {
-		return e.Error()
-	}
-	return ""
-}
-
-func ErrorCodeToError(number int) *Error {
-	e, found := errorMap[number]
-	if found {
-		return e
-	}
-	return nil // should not happen
 }
 
 // device sdk errors

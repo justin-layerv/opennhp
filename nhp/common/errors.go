@@ -1,7 +1,6 @@
 package common
 
 import (
-	"errors"
 	"strconv"
 )
 
@@ -33,22 +32,6 @@ func newError(code string, msg string) *Error {
 	}
 	errorMap[code] = e
 	return e
-}
-
-func ErrorToErrorCode(err error) string {
-	var e *Error
-	if errors.As(err, &e) {
-		return e.ErrorCode()
-	}
-	return ""
-}
-
-func ErrorToString(err error) string {
-	var e *Error
-	if errors.As(err, &e) {
-		return e.Error()
-	}
-	return ""
 }
 
 func ErrorCodeToError(code string) *Error {
