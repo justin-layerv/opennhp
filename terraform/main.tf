@@ -893,11 +893,11 @@ module "ac" {
   # cert-valid; the choice is reachability + isolation, not TLS.
   qurl_router_config = var.deploy_qurl_service && var.qurl_router_enabled ? {
     enabled = true
-    # Predicate routes through local.qurl_internal_alb_enabled so the
-    # api_url branch and the cert/PHZ/alias resources stay in lockstep.
-    # If the local ever evolves (extra feature gate, etc.), this stays
-    # consistent without a second edit.
-    api_url            = "https://${local.qurl_internal_alb_enabled ? var.qurl_internal_service_domain : var.qurl_service_domain}"
+    # Routed through local.qurl_consumer_api_url so the AC qurl-router
+    # consumer and the FRP auth-plugin consumer share one host-selection
+    # rule (predicate + URL prefix). Local is the single edit point if
+    # the gating evolves or a third internal consumer appears.
+    api_url            = local.qurl_consumer_api_url
     base_domain        = var.qurl_site_domain
     cache_ttl          = var.qurl_router_cache_ttl
     negative_cache_ttl = var.qurl_router_negative_cache_ttl
@@ -1095,7 +1095,20 @@ module "qurl_frps" {
   # above, so the module count only needs to key off `deploy_frps`.
   count = var.deploy_frps ? 1 : 0
 
-  depends_on = [terraform_data.frps_preconditions]
+  # Mirror module.ac's depends_on (terraform/main.tf:953-956): the FRP
+  # launch template renders local.qurl_consumer_api_url, which can
+  # interpolate the internal-ALB hostname; on first apply the cert+DNS
+  # must be live before any FRP instance reads its env. Today this is
+  # latent because the FRP ASG has no instance_refresh block (#1629)
+  # so launch template version bumps don't move fleet without operator
+  # action — but adding the dependency now removes the foot-gun for
+  # when #1629 lands. No-op when qurl_internal_service_domain is null
+  # (count-gated resources collapse to empty).
+  depends_on = [
+    terraform_data.frps_preconditions,
+    aws_acm_certificate_validation.qurl_internal,
+    aws_route53_record.qurl_internal_alias,
+  ]
 
   environment        = var.environment
   name_prefix        = local.name_prefix
@@ -1109,17 +1122,14 @@ module "qurl_frps" {
   ac_security_group_id = module.ac[0].security_group_id
 
   # QURL API for FRP auth plugin (built-in tunnel auth in nhp-frps binary).
-  # Note: despite the `internal` in the variable name, this is the PUBLIC edge
-  # URL (`https://api.layerv.xyz` or equivalent) — FRP server instances live
-  # in private subnets and reach the QURL API via NAT → CloudFront → Fargate.
-  # "Internal" refers to the *use-case* (service-to-service auth validation),
-  # not the network path. If a true VPC-internal URL ever becomes available
-  # (VPC endpoint or internal ALB), prefer it over the public edge and update
-  # both this wiring and the FRP-side variable description together.
-  # Match the `frps_preconditions` null-vs-empty semantics above so these
-  # stay consistent: when `deploy_frps = false` the precondition's count=0
-  # disables it and these ternaries become the only guard.
-  qurl_api_internal_url     = var.deploy_qurl_service && var.qurl_service_domain != null && var.qurl_service_domain != "" ? "https://${var.qurl_service_domain}" : ""
+  # Routed through local.qurl_consumer_api_url, shared with the AC
+  # qurl-router consumer above — single edit point for the host-
+  # selection rule. Outer guard is just `deploy_qurl_service` because
+  # `frps_preconditions` (line 1071) already enforces
+  # `qurl_service_domain != null && != ""` whenever `deploy_frps = true`,
+  # and the qurl-frps module's `^https://[^[:space:]]+$` validation
+  # backstops the structural shape on the URL itself.
+  qurl_api_internal_url     = var.deploy_qurl_service ? local.qurl_consumer_api_url : ""
   qurl_api_token_secret_arn = var.deploy_qurl_service && var.qurl_internal_service_token_arn != null && var.qurl_internal_service_token_arn != "" ? var.qurl_internal_service_token_arn : ""
 
   # Instance configuration
@@ -1245,14 +1255,43 @@ resource "aws_route53_record" "qurl_api" {
 # publicly: ACM only needs the challenge CNAME, not an A record.
 # See PR #1588 body for the trust-model rationale.
 locals {
-  # Internal-ALB enablement is implicit: a non-null
+  # Internal-ALB enablement is implicit: a non-null, non-empty
   # qurl_internal_service_domain means "stand up the internal ALB and
   # everything that goes with it." To disable, null out the domain
   # variable in tfvars (and re-apply). Chosen over an explicit boolean
   # because every consumer the internal ALB serves needs the hostname
   # anyway, and a "domain set but enabled=false" combination would be
-  # nonsensical / a config-drift trap.
-  qurl_internal_alb_enabled = var.deploy_qurl_service && var.qurl_internal_service_domain != null
+  # nonsensical / a config-drift trap. The empty-string guard is
+  # defense-in-depth — the variable's RFC1035 validation already
+  # rejects "" (terraform/variables.tf:710-713) — but keeping the check
+  # local-side means a future loosening of the variable validation
+  # can't silently flip this to true on "".
+  qurl_internal_alb_enabled = var.deploy_qurl_service && var.qurl_internal_service_domain != null && var.qurl_internal_service_domain != ""
+
+  # Internal-preferring URL for /internal/v1/* consumers (AC qurl-router
+  # plugin and FRP auth plugin). Single source of truth for "where do
+  # internal consumers reach the QURL service": prefer the workload-
+  # account internal-ALB hostname when up, fall back to the public
+  # domain on greenfield envs. Centralized so adding the next consumer
+  # doesn't need to re-derive the host-selection rule.
+  #
+  # Preconditions for evaluation:
+  # - When local.qurl_internal_alb_enabled = true: var.qurl_internal_service_domain is non-empty (enforced above).
+  # - When false: var.qurl_service_domain must be set non-null AND
+  #   non-empty. Today's protection is uneven — null_resource.qurl_
+  #   router_domain_validation catches `null` only (not `""`), and
+  #   var.qurl_service_domain has no variable-level validation, so
+  #   each consumer carries its own guard:
+  #     - AC: relies on var.qurl_router_enabled gating + the
+  #       null-only null_resource above; if an operator sets
+  #       qurl_router_enabled=true and qurl_service_domain="", the
+  #       local resolves to "https://" and is passed straight through
+  #       (#1630 will harden empty-string handling at the variable
+  #       level).
+  #     - FRP: has its own explicit `!= null && != ""` ternary at the
+  #       consume site (terraform/main.tf:1125).
+  #   The asymmetry is documented at the FRP consume site.
+  qurl_consumer_api_url = "https://${local.qurl_internal_alb_enabled ? var.qurl_internal_service_domain : var.qurl_service_domain}"
 }
 
 resource "aws_acm_certificate" "qurl_internal" {

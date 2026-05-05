@@ -43,7 +43,7 @@ variable "ac_security_group_id" {
 }
 
 variable "qurl_api_internal_url" {
-  description = "Internal URL for QURL API (used by FRP auth plugin for token validation). Empty string means 'not configured'; the ASG precondition enforces that this must be set whenever qurl_api_token_secret_arn is set."
+  description = "URL for the QURL API used by the FRP auth plugin for token validation. Prefers the workload-account internal-ALB hostname when qurl_internal_service_domain is set (qurl-service #335); falls back to the public domain on greenfield envs. Empty string means 'not configured'; the ASG precondition enforces that this must be set whenever qurl_api_token_secret_arn is set."
   type        = string
   default     = ""
 
@@ -57,10 +57,11 @@ variable "qurl_api_internal_url" {
     # whitespace / embedded CR from tfvars — user_data is careful about
     # whitespace in the token but treats the URL as a plan-time literal,
     # so this is the only guard on operator typo at config time. The
-    # root-level comment on the wiring leaves the door open to a true
-    # VPC-internal URL later (VPC endpoint / internal ALB) — if that
-    # lands and it's plain http, relax this to `^https?://` at the same
-    # time.
+    # qurl-service #335 internal-ALB lift terminates HTTPS with its own
+    # ACM cert (validated via the cross-account mgmt zone), so this
+    # stays at `^https://`. Relax to `^https?://` only if a future
+    # plain-HTTP path (VPC endpoint terminating at the service, etc.)
+    # becomes the preferred consumer route.
     condition     = var.qurl_api_internal_url == "" || can(regex("^https://[^[:space:]]+$", var.qurl_api_internal_url))
     error_message = "qurl_api_internal_url must be empty or a well-formed https:// URL with no embedded whitespace. (See variable comment for rationale on disallowing http://.)"
   }

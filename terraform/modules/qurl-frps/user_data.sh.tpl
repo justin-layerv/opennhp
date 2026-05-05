@@ -400,6 +400,10 @@ esac
 (
   umask 077
   : > /opt/layerv/qurl-frps/etc/env
+  # QURL_API_URL <- module variable `qurl_api_internal_url` (root
+  # wiring at terraform/main.tf, routed through
+  # local.qurl_consumer_api_url). The variable name describes the use
+  # case; the env-var name is what nhp-frps reads at runtime.
   printf 'QURL_API_URL=%s\n' '${qurl_api_internal_url}' >> /opt/layerv/qurl-frps/etc/env
   printf 'QURL_API_TOKEN=%s\n' "$QURL_API_TOKEN" >> /opt/layerv/qurl-frps/etc/env
 )
