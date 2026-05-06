@@ -160,7 +160,7 @@ variable "frps_subdomain_host" {
 }
 
 variable "frps_ecr_repo_arn" {
-  description = "Override for the ECR repository ARN that scopes qurl-frps IAM pull permissions. Defaults to a computed `arn:aws:ecr:<region>:<account>:repository/layerv/qurl-frps` when unset — matching the repo name the ECR module will create in a follow-up PR. Set explicitly to pin to a different repo."
+  description = "Override for the ECR repository ARN that scopes qurl-frps IAM pull permissions. Defaults to a computed `arn:aws:ecr:<region>:<account>:repository/layerv/qurl-reverse-tunnel-server` when unset — matching the repo name created by the ECR module's `core_ecr_repos`. Set explicitly to pin to a different repo."
   type        = string
   default     = null
 }

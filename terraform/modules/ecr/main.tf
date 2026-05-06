@@ -257,7 +257,7 @@ locals {
   # docs/runbooks/ecr-replication-failure.md. **#1489 tracks a CI lint
   # to enforce the SHA-backbone convention** so this prose guard
   # doesn't rot.
-  core_ecr_repos = ["nhp-server", "nhp-ac", "nhp-console"]
+  core_ecr_repos = ["nhp-server", "nhp-ac", "nhp-console", "qurl-reverse-tunnel-server"]
   ecr_repos      = var.deploy_qurl_ecr ? concat(local.core_ecr_repos, ["nhp-qurl"]) : local.core_ecr_repos
 
   # Single source of truth for "this account is the source of cross-

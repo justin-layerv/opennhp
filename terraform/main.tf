@@ -1082,7 +1082,7 @@ resource "terraform_data" "frps_preconditions" {
       # that parameter means this variable only drives the *initial* apply.
       # If CI fails between the terraform apply and the tag overwrite, the
       # ASG would roll an instance that tries to `docker pull
-      # layerv/qurl-frps:v0.0.0-bootstrap` and crash-loop — catch it louder
+      # layerv/qurl-reverse-tunnel-server:v0.0.0-bootstrap` and crash-loop — catch it louder
       # at plan time instead. The regex rejects near-misses too
       # (`v0.0.0-bootstrap-foo`, `v0.0.0-bootstrap2`, etc.) so a typo'd
       # tfvars value can't slip past an exact-match check.

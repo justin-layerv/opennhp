@@ -5,6 +5,9 @@
 # duplicate copies in SSM risks them diverging from the rendered script.
 
 resource "aws_ssm_parameter" "image_tag" {
+  # Path intentionally stays /<env>/nhp/frps/* (not /<env>/nhp/reverse-tunnel-server/*):
+  # aws_ssm_parameter.name is force-new + lifecycle.ignore_changes = [value] would
+  # destroy the CI-published image_tag on rename. Tracked by #1668.
   name        = "/${var.environment}/nhp/frps/image-tag"
   description = "QURL FRP server binary version tag. Read by user_data at boot; CI/CD updates it between releases without a Terraform apply."
   type        = "String"
@@ -22,6 +25,8 @@ resource "aws_ssm_parameter" "image_tag" {
 }
 
 resource "aws_ssm_parameter" "asg_name" {
+  # Path intentionally stays /<env>/nhp/frps/* — same force-new rationale as
+  # aws_ssm_parameter.image_tag above. Tracked by #1668.
   name        = "/${var.environment}/nhp/frps/asg-name"
   description = "QURL FRP server Auto Scaling Group name - used by CI/CD for instance refresh after an image_tag update."
   type        = "String"

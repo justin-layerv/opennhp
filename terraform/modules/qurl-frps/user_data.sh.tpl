@@ -213,7 +213,7 @@ echo "Downloading qurl-frps binary..."
 ECR_REGISTRY="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-FRPS_IMAGE="$ECR_REGISTRY/layerv/qurl-frps:$IMAGE_TAG"
+FRPS_IMAGE="$ECR_REGISTRY/layerv/qurl-reverse-tunnel-server:$IMAGE_TAG"
 # Let docker's stderr flow to user-data.log (via `exec 2>&1` at the top) so
 # on-call sees the root cause (expired token / image not found / timeout)
 # instead of a bare "Could not pull from ECR" falling through to the S3

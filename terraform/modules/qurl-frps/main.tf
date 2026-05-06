@@ -157,9 +157,11 @@ resource "aws_iam_role_policy" "frps" {
       # least-privilege, and widening is a one-line change if a future need
       # arises.
       {
-        Sid      = "SSMParameterRead"
-        Effect   = "Allow"
-        Action   = ["ssm:GetParameter"]
+        Sid    = "SSMParameterRead"
+        Effect = "Allow"
+        Action = ["ssm:GetParameter"]
+        # ARN pattern stays /<env>/nhp/frps/* to align with the SSM paths in ssm.tf
+        # (renaming those would destroy the CI-published image_tag). Tracked by #1668.
         Resource = "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/frps/*"
       },
       # Cloud Map registration
@@ -188,7 +190,7 @@ resource "aws_iam_role_policy" "frps" {
           "ecr:GetDownloadUrlForLayer",
           "ecr:BatchGetImage"
         ]
-        Resource = coalesce(var.frps_ecr_repo_arn, "arn:aws:ecr:${local.region}:${local.account_id}:repository/layerv/qurl-frps")
+        Resource = coalesce(var.frps_ecr_repo_arn, "arn:aws:ecr:${local.region}:${local.account_id}:repository/layerv/qurl-reverse-tunnel-server")
       },
     ]
   })
