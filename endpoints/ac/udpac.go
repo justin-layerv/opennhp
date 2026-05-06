@@ -229,23 +229,18 @@ func (ac *UdpAC) Stop() {
 	// Stop registration manager.
 	//
 	// Ordering note: ac.registration.Stop() runs BEFORE ac.wg.Wait()
-	// below, which means an in-flight NHP_ARD goroutine spawned by
-	// recvMessageRoutine can still call into a stopped registration
-	// manager during its remaining execution. The wg-tracking added
-	// in #1655 ensures the goroutine cannot outlive Stop() entirely,
-	// but the use-after-stop window inside the goroutine is
-	// unchanged. Tracked separately in #1657 — the obvious one-line
-	// reorder (move wg.Wait above this) introduces a NEW deadlock
-	// surface: serverDiscovery does a bare `sendMsgCh <- aolMd`
-	// followed by a bare `<-aolMd.ResponseMsgCh`, neither of which
-	// selects on signals.stop. Today device.Stop() (see
-	// nhp/core/device.go::(*Device).Stop — closes the device's
-	// transaction map and drains pending response channels) is what
-	// resolves the response wait; reversing the order leaves
-	// serverDiscovery blocked on the response with no path to wake
-	// it. The proper fix is gating the sends on signals.stop (or
-	// moving HandleRedispatch behind a stopped check on the
-	// manager) — see #1657 options A/B. If
+	// below, so an in-flight NHP_ARD goroutine spawned by
+	// recvMessageRoutine can still re-enter the registration manager
+	// after its teardown begins. The wg-tracking added in #1655 keeps
+	// the goroutine inside ac.wg.Wait(); the use-after-stop window
+	// itself is closed by ACRegistration.HandleRedispatch's
+	// r.stopped.Load() gate (#1657). The obvious reorder — moving
+	// ac.wg.Wait() above this call — introduces a new deadlock
+	// surface in serverDiscovery (bare `sendMsgCh <- aolMd` and a
+	// bare `<-aolMd.ResponseMsgCh`, neither selecting on
+	// signals.stop). Today nhp/core/device.go::(*Device).Stop is
+	// what resolves the response wait; reversing the order leaves
+	// serverDiscovery blocked with no path to wake. If
 	// nhp/core/device.go::(*Device).Stop ever changes its drain
 	// semantics, revisit this ordering.
 	if ac.registration != nil {
@@ -704,12 +699,10 @@ func (a *UdpAC) recvMessageRoutine() {
 			case core.NHP_ARD:
 				// Handle AC redispatch to assigned servers. wg-track
 				// so Stop()'s wg.Wait() blocks until in-flight
-				// redispatches return; pre-fix the goroutine could
-				// outlive Stop() entirely. Note this does NOT close
-				// the use-after-stop window on a stopped registration
-				// manager — Stop() tears down ac.registration before
-				// wg.Wait() — see the matching note in Stop() and
-				// the tracking issue #1657.
+				// redispatches return (#1655); pre-fix the goroutine
+				// could outlive Stop() entirely. The use-after-stop
+				// window is closed inside ACRegistration.HandleRedispatch
+				// via an r.stopped.Load() gate (#1657).
 				a.wg.Add(1)
 				go func() {
 					defer a.wg.Done()
@@ -1110,7 +1103,14 @@ func (a *UdpAC) HandleACRedispatch(ppd *core.PacketParserData) {
 
 	if a.registration != nil {
 		if err := a.registration.HandleRedispatch(&ardMsg); err != nil {
-			log.Error("ac(%s)[HandleACRedispatch] failed to process redispatch: %v", a.config.ACId, err)
+			// ARDs that arrive during teardown are expected and bounded
+			// by the in-flight count at Stop; logging them at Error
+			// would noise up alerting during rolling deploys.
+			if errors.Is(err, ErrRegistrationStopped) {
+				log.Debug("ac(%s)[HandleACRedispatch] dropped post-stop ARD with %d targets", a.config.ACId, len(ardMsg.Targets))
+			} else {
+				log.Error("ac(%s)[HandleACRedispatch] failed to process redispatch: %v", a.config.ACId, err)
+			}
 		}
 	} else {
 		log.Warning("ac(%s)[HandleACRedispatch] registration manager not initialized", a.config.ACId)

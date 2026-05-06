@@ -273,6 +273,32 @@ var (
 	dimValPeerRedispatch = aws.String("PeerRedispatch")
 )
 
+// ErrRegistrationStopped is returned by public ACRegistration entry points
+// when called after Stop has begun teardown. Callers can discriminate via
+// errors.Is to distinguish a torn-down manager from a transient error.
+// This sentinel is part of the package's public API surface — external
+// callers may errors.Is against it, so renames must update every
+// errors.Is site (in this package and any future consumers).
+//
+// As of #1657 the only entry point that needs this gate is HandleRedispatch.
+// The other public mutating paths self-protect: TriggerReregistration's
+// spawned goroutine selects on r.stopCh at every blocking step, and the
+// register/connectToServer chain checks IsRunning + selects on r.stopCh.
+// Start is one-shot — Stop is terminal, not pause/resume; a stopped
+// manager cannot be restarted, so Start sits outside this audit.
+// Read-only methods (GetAssignedServers, HasAssignedServers,
+// IsServerAddress, connectedServerCount, healthyServerCount) do not
+// need a gate — they take r.mu.RLock to seal Stop's slice mutation,
+// so "no gate" does not mean "lock-free." Internal routines
+// (keepaliveLoop, cleanupWorker,
+// handleServerDown, refreshAssignedServerRegistrations, etc.) are
+// reachable only via the gated public methods listed above or via
+// wg-tracked loops that exit on r.stopCh, so they sit outside this
+// audit. New public state-mutating entry points should return
+// ErrRegistrationStopped early when r.stopped.Load() is true to keep
+// this invariant.
+var ErrRegistrationStopped = errors.New("registration manager stopped")
+
 // recordRegistrationSuccess emits a MetricRegistrationSuccess counter with the
 // given registration type dimension (dimValDirect, dimValRedispatch, or dimValPeerRedispatch).
 //
@@ -293,6 +319,10 @@ func (r *ACRegistration) recordRegistrationSuccess(regType *string) {
 }
 
 // ACRegistration manages AC registration with NHP servers.
+//
+// New public state-mutating methods on this type must add an
+// r.stopped.Load() gate at entry — see ErrRegistrationStopped's
+// audit-invariant comment for the full rule.
 type ACRegistration struct {
 	ac *UdpAC
 	// assignedServers is the current set of servers this AC is connected to.
@@ -575,7 +605,11 @@ func (r *ACRegistration) Start() error {
 	return nil
 }
 
-// Stop stops the registration manager. Safe to call multiple times.
+// Stop stops the registration manager. Safe to call multiple times,
+// and safe to call without a prior Start — tests rely on this
+// invariant to drive ACRegistration.stopped=true without spinning up
+// the real registrationLoop. Adding a started.Load() precondition
+// here would silently mask any regression fence keyed on it.
 func (r *ACRegistration) Stop() {
 	// Prevent double Stop() from panicking (closing stopCh twice)
 	if r.stopped.Swap(true) {
@@ -687,6 +721,18 @@ func (r *ACRegistration) registrationLoop() {
 			r.resetIptables()
 			r.lastNLBRegistrationNano.Store(time.Now().UnixNano())
 			break
+		}
+
+		// Post-stop teardown is the expected exit path here — short-circuit
+		// rather than falling through to the jitter select. Falling
+		// through is functionally equivalent (the next iteration's
+		// <-r.stopCh would exit deterministically since stopCh is
+		// already closed), but adds one Warning log line for an
+		// expected condition. Debug here keeps alerting noise off
+		// rolling deploys.
+		if errors.Is(err, ErrRegistrationStopped) {
+			log.Debug("AC stopping during registration loop, exiting: %v", err)
+			return
 		}
 
 		// Add ±20% jitter to prevent thundering herd
@@ -810,6 +856,18 @@ func (r *ACRegistration) register() error {
 		err := r.handleRegistrationResponse(ppd, registrationPeer)
 		if err == nil {
 			r.metrics.RecordLatency(MetricRegistrationLatency, float64(time.Since(startTime).Milliseconds()))
+		} else if code := classifyResponseError(err); code != "" {
+			// Account for teardown drops in the failure metric so they
+			// are not silently absorbed by the attempts counter. Bounded
+			// by in-flight count at Stop; the dimension keeps cardinality
+			// flat alongside "canceled" / "timeout". Other pre-existing
+			// wrap-and-return paths (e.g., NHP_ARD's fmt.Errorf "failed
+			// to handle redispatch") still leak attempts; #1672 tracks
+			// closing those gaps.
+			r.metrics.IncrCounterWithDims(MetricRegistrationFailure, []types.Dimension{
+				r.acIdDimension(),
+				{Name: dimNameErrorCode, Value: aws.String(code)},
+			})
 		}
 		return err
 	}
@@ -849,8 +907,15 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 
 		log.Info("Received NHP_ARD with %d assigned servers", len(ardMsg.Targets))
 
-		// Connect to all assigned servers
+		// Connect to all assigned servers. Demote post-stop errors to Debug
+		// — bounded by in-flight count at Stop and not alert-worthy; the
+		// returned error keeps registrationLoop in retry-mode where its
+		// stopCh select will exit cleanly.
 		if err := r.HandleRedispatch(&ardMsg); err != nil {
+			if errors.Is(err, ErrRegistrationStopped) {
+				log.Debug("AC stopping during initial-registration NHP_ARD handling, %d targets: %v", len(ardMsg.Targets), err)
+				return err
+			}
 			return fmt.Errorf("failed to handle redispatch: %w", err)
 		}
 
@@ -1006,10 +1071,30 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 				ErrCode: common.ErrSuccess.ErrorCode(),
 			}
 			if err := r.HandleRedispatch(ardMsg); err != nil {
-				// HandleRedispatch only errors when zero connections succeeded.
-				// The AC still has its NLB registration peer, so it remains
-				// operational — log a warning and continue rather than failing
-				// the entire registration.
+				// ErrRegistrationStopped means the manager is being torn
+				// down — there is no "operational" state to preserve, so
+				// don't record success. Mirror the NHP_ARD branch above
+				// and propagate the error so registrationLoop's stopCh
+				// select exits cleanly.
+				//
+				// Peer-leak note: registrationPeer (and serverPeer if the
+				// direct-address branch ran above) remain in the device
+				// peer map on this early-return — Stop's own cleanup
+				// loop walks r.assignedServers and r.registrationPeer
+				// (the struct field, not yet assigned at this point), so
+				// it does not catch them. Bounded by in-flight count at
+				// Stop and harmless until process GC since device.Stop
+				// halts traffic processing. Tracked as concern 1c on
+				// #1670; the structural fence there closes this surface.
+				if errors.Is(err, ErrRegistrationStopped) {
+					log.Debug("AC stopping during NHP_AAK peer handling, %d peers: %v", len(aakMsg.Peers), err)
+					return err
+				}
+				// Genuine connection failure — HandleRedispatch only errors
+				// when zero connections succeeded. The AC still has its NLB
+				// registration peer, so it remains operational; log a
+				// warning and record a (degraded) success rather than
+				// failing the whole registration.
 				log.Warning("Failed to connect to assigned peers (%v), keeping NLB peer", err)
 				r.recordRegistrationSuccess(dimValDirect)
 				return nil
@@ -1155,19 +1240,40 @@ func (r *ACRegistration) filterRedispatchTargets(targets []common.RedirectTarget
 // silently lost.
 //
 //  1. Initial registration NHP_ARD response — startRegistration's
-//     handleOnlineResponse branch on NHP_ARD (see call near
-//     registration.go:832).
+//     handleOnlineResponse branch on NHP_ARD.
 //  2. NHP_AAK with an embedded peer list — handleOnlineResponse
 //     wraps aakMsg.Peers as a synthetic ACRedispatchMsg and calls
-//     HandleRedispatch (see call near registration.go:987).
+//     HandleRedispatch.
 //  3. Out-of-band NHP_ARD from the server — udpac.go's
-//     HandleACRedispatch forwards to r.registration.HandleRedispatch
-//     (see udpac.go:987).
+//     HandleACRedispatch forwards to r.registration.HandleRedispatch.
 //
 // Refresh-triggered re-registrations route through TriggerReregistration
 // → a new startRegistration cycle, which again lands in entry
 // point 1 or 2 above — not a distinct path.
+//
+// Returns ErrRegistrationStopped after Stop has begun teardown (#1657);
+// callers should errors.Is(err, ErrRegistrationStopped) to discriminate
+// the post-stop case from genuine redispatch errors. See udpac.go::Stop
+// for the ordering rationale. The gate fences this function's own
+// state mutations and goroutine spawns; callers may have already
+// performed side effects (e.g., handleRegistrationResponse's NHP_ARD
+// branch removes the registration peer before reaching here) — those
+// are the desired teardown behaviors and not gated by
+// ErrRegistrationStopped.
+//
+// A goroutine that reads r.stopped == false just before Stop's Swap
+// can still pass the gate. The fallout is bounded: connectToServer's
+// downstream goroutines exit on r.stopCh, so no panic; r.assignedServers
+// may be repopulated post-Stop and any peers AddPeer'd in that window
+// stay in the device peer map until process GC. core.Device.Stop's
+// "tolerant of concurrent AddPeer" contract is load-bearing for the
+// in-flight wg-tracked goroutines that #1655 introduced; the structural
+// fence for the in-flight TOCTOU is tracked in #1670.
 func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error {
+	if r.stopped.Load() {
+		return ErrRegistrationStopped
+	}
+
 	if !common.IsSuccessErrCode(ardMsg.ErrCode) {
 		return errors.New("redispatch failed: " + ardMsg.ErrMsg)
 	}
@@ -1792,6 +1898,10 @@ func (r *ACRegistration) handleServerDown(deadServer *AssignedServer) {
 			return
 		}
 
+		if errors.Is(err, ErrRegistrationStopped) {
+			log.Debug("AC stopping during server-down re-registration, exiting: %v", err)
+			return
+		}
 		backoff := time.Duration(attempt*attempt) * time.Second
 		log.Warning("Re-registration attempt %d failed: %v, retrying in %v", attempt, err, backoff)
 
@@ -1895,6 +2005,10 @@ func (r *ACRegistration) TriggerReregistration(reason string) {
 				return
 			}
 
+			if errors.Is(err, ErrRegistrationStopped) {
+				log.Debug("AC stopping during connection-triggered re-registration, exiting: %v", err)
+				return
+			}
 			backoff := time.Duration(attempt*attempt) * time.Second
 			log.Warning("Re-registration attempt %d failed: %v, retrying in %v", attempt, err, backoff)
 
@@ -2136,6 +2250,28 @@ func (r *ACRegistration) resetIptables() {
 		log.Info("Resetting iptables after successful registration for AC %s", r.ac.config.ACId)
 		r.ac.iptables.ResetAllInput()
 	}
+}
+
+// classifyResponseError returns the MetricRegistrationFailure ErrorCode
+// dimension for an error surfaced after the response was received in
+// register's receive case, or "" if the error doesn't have a known
+// post-response attribution at this site (today, only ErrRegistrationStopped).
+// Extracted so the dispatch logic is unit-testable without a counter
+// reader on metrics.Publisher (see #1672).
+//
+// Dimension semantics: the "stopped" code (this function) fires when
+// ErrRegistrationStopped surfaces after a response was received. The
+// pre-existing "canceled" code (in register's select on r.stopCh) fires
+// when r.stopCh closes BEFORE a response arrives. Both are teardown-
+// bounded drops with the same operational consequence (AC is tearing
+// down); they distinguish only when in the AOL→AAK/ARD round-trip the
+// teardown landed. Dashboards keying on either should treat them as
+// the same alerting class.
+func classifyResponseError(err error) string {
+	if errors.Is(err, ErrRegistrationStopped) {
+		return "stopped"
+	}
+	return ""
 }
 
 // classifyError maps an error to a bounded category string for use as a

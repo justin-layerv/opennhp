@@ -127,6 +127,11 @@ func (d *Device) Start() {
 	}
 }
 
+// Stop halts the message routines but intentionally does NOT iterate
+// or invalidate peerMap — concurrent callers may still call AddPeer
+// during teardown. peerMap is reclaimed when the Device itself is
+// garbage-collected. Stop must remain tolerant of concurrent AddPeer
+// for any caller relying on this contract.
 func (d *Device) Stop() {
 	close(d.signals.stop)
 	d.wg.Wait()
