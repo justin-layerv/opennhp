@@ -287,9 +287,6 @@ func shouldCheckFlood(deviceType int, peerType int, msgType int) bool {
 }
 
 func (ppd *PacketParserData) validatePeer() (err error) {
-
-	log.Debug("headType:%s,validatePeer pubkey: %s,EphermeralBytes:%s", HeaderTypeToString(ppd.HeaderType), base64.StdEncoding.EncodeToString(ppd.deviceEcdh.PublicKey()),
-		base64.StdEncoding.EncodeToString(ppd.header.EphermeralBytes()))
 	// evolve chain hash ChainHash0 -> ChainHash1
 	ppd.chainHash.Write(ppd.deviceEcdh.PublicKey())
 	ppd.chainHash.Write(ppd.header.EphermeralBytes())
@@ -312,8 +309,6 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 	ppd.noise.KeyGen2(&ppd.chainKey, &key, ppd.chainKey[:], ess[:])
 	SetZero(ess[:])
 	peerPk := make([]byte, PublicKeySize)
-	KeyByteSlice := key[:]
-	log.Debug("ppd.Ciphers.GcmType:%d,&key:%s,NonceBytes:%s,StaticBytes:%s", ppd.Ciphers.GcmType, base64.StdEncoding.EncodeToString(KeyByteSlice), base64.StdEncoding.EncodeToString(ppd.header.NonceBytes()), base64.StdEncoding.EncodeToString(ppd.header.StaticBytes()))
 	aead, err = AeadFromKey(ppd.Ciphers.GcmType, &key)
 	if err != nil {
 		log.Error("failed to create AEAD for peer pubkey decryption: %v", err)

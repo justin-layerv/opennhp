@@ -6,13 +6,13 @@ This document tracks the synchronization status between this fork (LayerV NHP) a
 
 | Field | Value |
 |-------|-------|
-| **Last reviewed upstream SHA** | 7e71ebe8 |
-| **Last review date** | 2026-03-25 |
+| **Last reviewed upstream SHA** | f53b7e2d |
+| **Last review date** | 2026-05-01 |
 | **Reviewer** | Claude Code |
 
 > **HOW TO USE:** When checking for updates, run:
 > ```bash
-> git log 7e71ebe8..upstream/main --oneline
+> git log f53b7e2d..upstream/main --oneline
 > ```
 > This shows ONLY new commits since last review. Update the SHA after each review.
 
@@ -50,6 +50,26 @@ These are PERMANENTLY skipped. Don't waste time reviewing them:
 ---
 
 ## Sync History
+
+### 2026-05-01 - Crypto Key Material Log Leak
+
+- **Reviewed up to:** f53b7e2d
+- **Commits reviewed:** ~129 (non-merge)
+- **PRs created:** 1 (security)
+- **Commits synced:** 1 (adapted from `dd8a86dd`)
+- **Summary:**
+  - ~30 Dependabot/dependency updates (auto-skipped)
+  - ~15 CI/GitHub Actions workflow changes (auto-skipped)
+  - ~35 Documentation/README/branding changes (auto-skipped)
+  - ~3 GMSM dependency bumps (auto-skipped)
+  - ~25 Demo infrastructure/deploy changes (upstream-specific, skipped)
+  - ~15 NHP-Relay new feature (upstream relay component, skipped — fork doesn't use relay)
+  - ~5 Terraform demo stack (upstream-specific, skipped)
+  - 1 security fix in `nhp/core/responder.go` (`dd8a86dd`) — **synced** (adapted): removed debug log lines that dumped Noise chain key and AES-GCM symmetric key material to disk on every packet when debug logging enabled
+  - 1 security info-leak fix in `nhp/core/responder.go` (`6547b3d5`) — **already fixed** in fork (our validatePeer doesn't log registered peer keys)
+  - 1 server db.toml optional fix (`50726ad8`) — **already fixed** in fork
+  - 1 webrtc removal (`757c6476`) — **skipped** (fork still has webrtc; separate decision)
+  - 1 server relay DoS protection (`e2c5336a`) — **skipped** (relay-specific; fork doesn't use HandleRelayForward)
 
 ### 2026-03-25 - Iptables Security Fixes
 
@@ -147,6 +167,15 @@ Non-obvious skips that don't fit Auto-Skip Categories:
 | 63552e0 | fix: validate RedirectUrl in OIDC plugin | SKIP | Upstream OIDC plugin (we use QURL) | 2026-03-25 |
 | 978901f | refactor: standardize plugin module names | SKIP | Upstream plugin reorganization | 2026-03-25 |
 | 31206cc | feat(oidc): auto-redirect after auth | SKIP | Upstream OIDC plugin (we use QURL) | 2026-03-25 |
+| dd8a86dd | fix: remove debug key material logging | SYNCED | Adapted — removed debug log lines dumping crypto keys | 2026-05-01 |
+| 6547b3d5 | fix: stop logging registered peer pubkeys | SKIP | Already fixed in fork (our validatePeer doesn't log peer list) | 2026-05-01 |
+| 50726ad8 | fix(server): make db.toml optional | SKIP | Already fixed independently in fork | 2026-05-01 |
+| 757c6476 | chore(server): remove webrtc transport | SKIP | Fork still uses webrtc; separate design decision | 2026-05-01 |
+| e2c5336a | fix(security): relay DoS + source IP validation | SKIP | Relay-specific; fork doesn't use HandleRelayForward | 2026-05-01 |
+| ad98e1f4 | fix(server-http): tighten XFF defence | SKIP | Relay-specific nginx/XFF changes; fork has own proxy setup | 2026-05-01 |
+| bf927049 | feat(relay): add nhp-relay component | SKIP | New upstream feature; fork doesn't need relay | 2026-05-01 |
+| 2c4e5859 | fix(plugin): align plugin deps with endpoints | SKIP | Upstream example plugin (basic/); fork has own plugin layout | 2026-05-01 |
+| 8813ca76 | fix(infra): drop nhp-acd from root | SKIP | Upstream demo infra; fork has own Terraform | 2026-05-01 |
 
 ---
 
