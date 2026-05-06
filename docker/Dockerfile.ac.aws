@@ -42,6 +42,19 @@ FROM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Default AWS_REGION to empty so supervisord's `%(ENV_AWS_REGION)s`
+# substitution succeeds when the image is run directly (`docker run`)
+# without `-e AWS_REGION=...`. Empty value still trips nhp-acd's
+# startup guard, but at the friendly Go-layer error message instead of
+# an opaque supervisord config-expansion failure. The prod path doesn't
+# run the container — the binary is `docker cp`'d out at boot — so this
+# only affects local dev / debugging. Note: traefik's DNS-01 / Route53
+# path also reads AWS_REGION via this expansion; running the container
+# without `-e AWS_REGION=...` will start traefik in a state where ACME
+# DNS challenges can't issue certs (acceptable for local-dev paths
+# that don't exercise ACME).
+ENV AWS_REGION=""
+
 # Swap archive.ubuntu.com for Canonical's Azure mirror before installing.
 # GitHub Actions runners are Azure-hosted, so azure.archive.ubuntu.com is
 # geo-local and far faster + more reliable than the general archive that
@@ -203,6 +216,11 @@ stdout_logfile=/var/log/supervisor/traefik.log
 stderr_logfile=/var/log/supervisor/traefik-err.log
 environment=ACME_EMAIL="%(ENV_ACME_EMAIL)s",ACME_CA_SERVER="%(ENV_ACME_CA_SERVER)s",NHP_DOMAIN="%(ENV_NHP_DOMAIN)s",AWS_REGION="%(ENV_AWS_REGION)s"
 
+# nhp-acd hard-fails without AWS_REGION (see endpoints/ac/registration.go,
+# issue #1659). The prod path extracts this binary via `docker cp` and runs
+# it under systemd, so this supervisord block is build-only — but if anyone
+# ever runs the image directly (`docker run`), AWS_REGION must be plumbed
+# through here too. Mirrors the traefik block above.
 [program:nhp-ac]
 command=/nhp-ac/nhp-acd run
 autostart=true
@@ -211,6 +229,7 @@ priority=20
 stdout_logfile=/var/log/supervisor/nhp-ac.log
 stderr_logfile=/var/log/supervisor/nhp-ac-err.log
 directory=/nhp-ac
+environment=AWS_REGION="%(ENV_AWS_REGION)s"
 EOF
 
 # Create entrypoint that processes environment variables

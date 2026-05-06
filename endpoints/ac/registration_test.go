@@ -145,28 +145,104 @@ func TestACRegistration_NewACRegistration(t *testing.T) {
 	}
 }
 
-// TestACRegistration_NewACRegistration_RegionDimension tests that AWS_REGION
-// env var adds a Region dimension to shared metrics dimensions.
-func TestACRegistration_NewACRegistration_RegionDimension(t *testing.T) {
-	t.Setenv("AWS_REGION", "us-west-2")
+// TestACRegistration_NewACRegistration_RequiresAWSRegion asserts that
+// NewACRegistration returns an error when neither AWS_REGION nor
+// AWS_DEFAULT_REGION is set (#1659).
+//
+// Must NOT call t.Parallel: t.Setenv panics in parallel tests.
+func TestACRegistration_NewACRegistration_RequiresAWSRegion(t *testing.T) {
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
 
 	ac := &UdpAC{
 		config: &Config{
-			ACId:           "test-ac-region",
+			ACId:           "test-ac-no-region",
 			ServerEndpoint: "server.nhp.test.internal",
 		},
 	}
 
-	reg := mustNewACRegistration(t, ac)
-	if reg.metrics == nil {
-		t.Skip("metrics publisher nil (AWS config unavailable)")
+	reg, err := NewACRegistration(ac)
+	if err == nil {
+		t.Fatal("NewACRegistration with AWS_REGION unset: got nil error, want non-nil")
+	}
+	if reg != nil {
+		t.Error("NewACRegistration with AWS_REGION unset: got non-nil registration")
+	}
+	if !strings.Contains(err.Error(), "AWS_REGION") {
+		t.Errorf("error %q does not mention AWS_REGION", err)
+	}
+}
+
+// TestACRegistration_NewACRegistration_AcceptsAWSDefaultRegion asserts the
+// SDK-compatible fallback: a process with only AWS_DEFAULT_REGION set still
+// constructs.
+//
+// Must NOT call t.Parallel: t.Setenv panics in parallel tests.
+func TestACRegistration_NewACRegistration_AcceptsAWSDefaultRegion(t *testing.T) {
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "us-west-2")
+
+	ac := &UdpAC{
+		config: &Config{
+			ACId:           "test-ac-default-region",
+			ServerEndpoint: "server.nhp.test.internal",
+		},
 	}
 
-	// Emit a counter and check that the Region dimension is present
-	// by verifying the publisher was created with the region dimension.
-	// Since the publisher is opaque, we verify indirectly by checking
-	// that NewACRegistration didn't error (Region dim was appended).
-	// The actual dimension is tested via buildMetricData in publisher_test.go.
+	if _, err := NewACRegistration(ac); err != nil {
+		t.Fatalf("NewACRegistration with only AWS_DEFAULT_REGION set: %v", err)
+	}
+}
+
+// TestResolveRegion_AWSRegionWins fences the documented precedence:
+// AWS_REGION takes priority over AWS_DEFAULT_REGION when both are set.
+//
+// Must NOT call t.Parallel: t.Setenv panics in parallel tests.
+func TestResolveRegion_AWSRegionWins(t *testing.T) {
+	t.Setenv("AWS_REGION", "us-east-2")
+	t.Setenv("AWS_DEFAULT_REGION", "us-west-2")
+	if got := resolveRegion(); got != "us-east-2" {
+		t.Errorf("resolveRegion() = %q, want us-east-2", got)
+	}
+}
+
+// TestResolveRegion_WhitespaceFallsThrough fences the TrimSpace defense
+// against `Environment="AWS_REGION= "` typos: a whitespace-only value
+// must fall through to AWS_DEFAULT_REGION rather than passing the guard.
+//
+// Must NOT call t.Parallel: t.Setenv panics in parallel tests.
+func TestResolveRegion_WhitespaceFallsThrough(t *testing.T) {
+	t.Setenv("AWS_REGION", "  ")
+	t.Setenv("AWS_DEFAULT_REGION", "us-west-2")
+	if got := resolveRegion(); got != "us-west-2" {
+		t.Errorf("resolveRegion() with whitespace AWS_REGION = %q, want us-west-2", got)
+	}
+}
+
+// TestACBaseDims fences the publisher base dim set against accidental
+// regression — every AC metric is keyed on these three dims and the
+// alarms in terraform/modules/ac/monitoring.tf require an exact match.
+func TestACBaseDims(t *testing.T) {
+	dims := acBaseDims("test-env", "us-west-2")
+
+	got := make(map[string]string, len(dims))
+	for _, d := range dims {
+		got[*d.Name] = *d.Value
+	}
+
+	want := map[string]string{
+		"Environment": "test-env",
+		"Component":   "AC",
+		"Region":      "us-west-2",
+	}
+	for name, value := range want {
+		if got[name] != value {
+			t.Errorf("dim %s = %q, want %q", name, got[name], value)
+		}
+	}
+	if len(dims) != len(want) {
+		t.Errorf("got %d dims, want %d (%v)", len(dims), len(want), got)
+	}
 }
 
 // TestACRegistration_HandleRedispatch tests handling of NHP_ARD messages.

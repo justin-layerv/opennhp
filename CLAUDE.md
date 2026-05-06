@@ -513,6 +513,45 @@ gate, etc.), the PR that ships it should also:
    `ssm_probe.go` with the command as a Go constant. Get review
    from `justin@layerv.ai`.
 
+## Metric / Alarm Dim-Set Rules
+
+CloudWatch alarms select their metric stream by **exact** dimension match. A
+publisher that emits a partial dim set selects a different (non-existent)
+stream and the alarm sits in `INSUFFICIENT_DATA` forever — the operator never
+gets paged on a real fault.
+
+The AC publisher's base dim set is `{Component, Environment, Region}` (see
+`endpoints/ac/registration.go::NewACRegistration` and `metrics/publisher.go`).
+Every alarm in `terraform/modules/ac/monitoring.tf` that keys on the AC
+publisher's metrics MUST list those three dims exactly. Metrics emitted from
+user_data scripts via the `aws cloudwatch put-metric-data` CLI (e.g.
+`CertSyncFailures`) follow their own dim conventions and are out of scope
+for this rule.
+
+- **AWS_REGION is required at AC startup.** `NewACRegistration` returns an
+  error when `AWS_REGION` is unset (issue #1659). The AWS SDK can't resolve
+  the CloudWatch endpoint without a region, and the alarm dim-set guarantee
+  above breaks if Region is missing. The live prod startup path is the
+  `nhp-acd.service` systemd unit in `terraform/modules/ac/user_data.sh.tpl`
+  — `Environment="AWS_REGION=${region}"` must be on that unit, because
+  systemd does **not** inherit env from the boot shell. The AC docker image
+  (`docker/Dockerfile.ac.aws`) is built and the binary extracted via
+  `docker cp` at boot; the supervisord config inside the image never runs
+  in prod, so its env wiring is not load-bearing.
+
+- **New AC alarms must mirror the publisher's dim set.** When adding a new
+  Region-keyed alarm, audit the metric's emit path and confirm it lands on
+  `IncrCounter` / `IncrCounterWithDims` with the publisher base dims. If a
+  metric is emitted with extra dims (e.g., `ACId` on failure metrics), the
+  alarm must either match all dims exactly, use a SEARCH expression (what
+  the registration-event widgets do), or aggregate via `MetricMath` to
+  collapse the extra dim into a fleet-wide series.
+
+- **Older AC alarms with the partial-set bug** (`registration_failure`,
+  `server_connection_failure`) are tracked in issue #239. Don't add new
+  alarms in that style; the `servers_healthy_low` / `registration_stale`
+  block is the correct precedent.
+
 ## Lock Order (server)
 
 When acquiring multiple mutexes in `endpoints/server/`, follow this order

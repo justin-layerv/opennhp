@@ -1347,7 +1347,11 @@ Environment="AWS_ASSUME_ROLE_ARN=${cross_account_route53_role_arn}"
 WantedBy=multi-user.target
 SVCEOF
 
-# nhp-acd systemd service (listens on localhost:8888 for HTTP, localhost:62206 for NHP)
+# nhp-acd systemd service (listens on localhost:8888 for HTTP, localhost:62206 for NHP).
+# Environment="AWS_REGION=..." is required: nhp-acd hard-fails without it,
+# and systemd does not inherit env from the boot shell. Roll out via ASG
+# instance refresh — a binary swap on a live instance without re-rendering
+# this unit will crash-loop the AC.
 cat > /etc/systemd/system/nhp-acd.service << SVCEOF
 [Unit]
 Description=NHP Access Controller Daemon
@@ -1360,6 +1364,7 @@ WorkingDirectory=/opt/layerv/nhp-ac
 ExecStart=/opt/layerv/nhp-ac/nhp-acd run
 Restart=always
 RestartSec=10
+Environment="AWS_REGION=${region}"
 
 [Install]
 WantedBy=multi-user.target

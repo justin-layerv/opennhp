@@ -409,11 +409,41 @@ type ACRegistration struct {
 	allUnconnectedThreshold uint32
 }
 
-// NewACRegistration creates a new AC registration manager.
-// Returns an error if the ACOnlineMsg cannot be marshaled (indicates a
-// programmer error in the Config struct — json.Marshal should never fail
-// on these simple fields).
+// resolveRegion mirrors the AWS SDK's region resolution chain (AWS_REGION
+// then AWS_DEFAULT_REGION) so a process configured the CLI-style way still
+// passes the AC's startup guard. TrimSpace defends against stray whitespace
+// (e.g. `Environment="AWS_REGION= "` or a heredoc-mangled unit file) that
+// would otherwise pass the empty-check and fail later inside the AWS SDK
+// with a less obvious error.
+func resolveRegion() string {
+	if r := strings.TrimSpace(os.Getenv("AWS_REGION")); r != "" {
+		return r
+	}
+	return strings.TrimSpace(os.Getenv("AWS_DEFAULT_REGION"))
+}
+
+// acBaseDims is the shared dim set every AC metric carries. Region is
+// load-bearing: alarms in terraform/modules/ac/monitoring.tf select streams
+// by exact dimension match, so dropping it would silently lose alerting.
+// Order mirrors the alarm dim block in monitoring.tf for cross-file diff.
+func acBaseDims(env, region string) []types.Dimension {
+	return []types.Dimension{
+		{Name: aws.String("Component"), Value: aws.String("AC")},
+		{Name: aws.String("Environment"), Value: aws.String(env)},
+		{Name: aws.String("Region"), Value: aws.String(region)},
+	}
+}
+
+// NewACRegistration creates a new AC registration manager. AWS_REGION (or
+// AWS_DEFAULT_REGION) must be set; without it the CloudWatch SDK can't
+// resolve an endpoint and the publisher's dim set wouldn't match the
+// Region-keyed alarms in terraform/modules/ac/monitoring.tf (see #1659).
 func NewACRegistration(ac *UdpAC) (*ACRegistration, error) {
+	region := resolveRegion()
+	if region == "" {
+		return nil, errors.New("AWS_REGION (or AWS_DEFAULT_REGION) must be set: required for CloudWatch metric publishing and Region-keyed alarms (e.g. AWS_REGION=us-east-2 or AWS_DEFAULT_REGION=us-east-2; see issue #1659)")
+	}
+
 	env := ac.config.Environment
 	if env == "" {
 		env = "unknown"
@@ -432,17 +462,7 @@ func NewACRegistration(ac *UdpAC) (*ACRegistration, error) {
 		return nil, fmt.Errorf("failed to marshal ACOnlineMsg: %w", err)
 	}
 
-	// Build shared dimensions for all metrics.
-	// ACId is included as an extra dimension on failure/debug metrics only.
-	dims := []types.Dimension{
-		{Name: aws.String("Environment"), Value: aws.String(env)},
-		{Name: aws.String("Component"), Value: aws.String("AC")},
-	}
-	// Include Region when available (set by AWS SDK or user data scripts).
-	// Enables querying metrics across regions in multi-region deployments.
-	if region := os.Getenv("AWS_REGION"); region != "" {
-		dims = append(dims, types.Dimension{Name: aws.String("Region"), Value: aws.String(region)})
-	}
+	dims := acBaseDims(env, region)
 
 	// Derive a per-AC jitter factor from the immutable config so that two
 	// ACs booted at the same second pick different (but stable) intervals
