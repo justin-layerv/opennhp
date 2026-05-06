@@ -899,6 +899,12 @@ variable "qurl_github_repo" {
   default     = "qurl-service"
 }
 
+variable "qurl_reverse_tunnel_server_github_repo" {
+  description = "GitHub repository for the qurl-reverse-tunnel-server source. Threaded into the ECR module's github_actions OIDC trust policy. See `modules/ecr/main.tf`'s variable description for the full blast-radius warning — the threaded role is terraform-apply-equivalent, not just ECR push. Empty disables."
+  type        = string
+  default     = "qurl-reverse-tunnel-server"
+}
+
 # ==============================================================================
 # Website Email-Capture API DNS
 # ==============================================================================

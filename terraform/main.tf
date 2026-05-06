@@ -210,6 +210,9 @@ module "ecr" {
   deploy_qurl_ecr  = var.deploy_qurl_service
   qurl_github_repo = var.qurl_github_repo
 
+  # qurl-reverse-tunnel-server source repo (for ECR publish workflow OIDC trust)
+  qurl_reverse_tunnel_server_github_repo = var.qurl_reverse_tunnel_server_github_repo
+
   website_api_cfn_stack_name = var.website_api_cfn_stack_name
 }
 

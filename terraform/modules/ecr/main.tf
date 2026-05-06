@@ -178,6 +178,33 @@ variable "qurl_github_repo" {
   description = "GitHub repository for QURL service (for GitHub Actions trust policy)"
   type        = string
   default     = "qurl-service"
+
+  # Bare GitHub repo name only — empty disables, otherwise letters/digits/dots/
+  # underscores/dashes per GitHub's repo-name rules. Catches typos (trailing
+  # spaces, accidental `org/` prefix, full URLs) at plan time rather than as a
+  # confusing 401-at-assume-role post-deploy. Same shape as
+  # `qurl_reverse_tunnel_server_github_repo` below.
+  validation {
+    condition     = var.qurl_github_repo == "" || can(regex("^[A-Za-z0-9._-]+$", var.qurl_github_repo))
+    error_message = "qurl_github_repo must be empty or a bare GitHub repo name (e.g. \"qurl-service\") — no `org/` prefix, no URL, no whitespace."
+  }
+}
+
+variable "qurl_reverse_tunnel_server_github_repo" {
+  description = <<-EOT
+    GitHub repository for the qurl-reverse-tunnel-server source. Threaded into the github_actions OIDC trust policy.
+
+    BLAST RADIUS: trusting a repo here grants its workflows the entire `nhp-<env>-github-actions` role, NOT just `layerv/qurl-reverse-tunnel-server` ECR push. The role currently carries terraform-apply-equivalent permissions on the env: ECR push to ALL `local.ecr_repos`, full Terraform state + apply across compute/IAM/services/data, ECS / S3 deploys, and broad `ssm:PutParameter`. The publish workflow's documented use case (push `layerv/qurl-reverse-tunnel-server`, update SSM `/<env>/nhp/reverse-tunnel-server/image-tag`) is a tiny subset; a compromised trusted repo can pivot to full env control. See the SECURITY (#1121) comment block on `aws_iam_role.github_actions` for the threat model and the narrower-role refactor follow-up.
+
+    Empty disables (useful for envs that don't yet wire the publish workflow on the source repo side). Each new entry is additive — every trusted repo MUST have branch protection on `main`, required reviews, and (for prod) a `production` GitHub Environment approval gate configured on the source repo before merging trust here.
+  EOT
+  type        = string
+  default     = "qurl-reverse-tunnel-server"
+
+  validation {
+    condition     = var.qurl_reverse_tunnel_server_github_repo == "" || can(regex("^[A-Za-z0-9._-]+$", var.qurl_reverse_tunnel_server_github_repo))
+    error_message = "qurl_reverse_tunnel_server_github_repo must be empty or a bare GitHub repo name (e.g. \"qurl-reverse-tunnel-server\") — no `org/` prefix, no URL, no whitespace."
+  }
 }
 
 variable "website_api_cfn_stack_name" {
@@ -618,6 +645,44 @@ resource "aws_iam_role" "github_actions" {
               "repo:${var.github_org}/${var.qurl_github_repo}:ref:refs/heads/main",
               "repo:${var.github_org}/${var.qurl_github_repo}:environment:sandbox",
               "repo:${var.github_org}/${var.qurl_github_repo}:environment:production"
+            ] : [],
+            # qurl-reverse-tunnel-server repo (publishes its image to ECR).
+            #
+            # Intentionally NOT gated on a `deploy_frps`-style flag (asymmetric
+            # vs. the `qurl_github_repo` entry above, which is gated on
+            # `deploy_qurl_ecr`). The trust grant must precede `deploy_frps =
+            # true` in any env: the publish workflow has to push at least one
+            # `layerv/qurl-reverse-tunnel-server` image into ECR before the
+            # ASG can boot (otherwise instances crash-loop on `docker pull` of
+            # the `v0.0.0-bootstrap` placeholder — see `frps_image_tag` in
+            # `terraform/variables.tf`). The companion ECR repo creation in
+            # nhp #1555 lands `qurl-reverse-tunnel-server` in
+            # `local.core_ecr_repos` for the same reason — present in every
+            # primary account regardless of whether `deploy_frps` is on yet.
+            #
+            # Sub-claim shape is intentionally narrower than the four legacy
+            # entries above: only `:environment:` claims, no bare
+            # `:ref:refs/heads/main`. A bare main-branch claim would defeat
+            # the GH Environment approval gates — any workflow run on the
+            # trusted repo's main that omits `environment:` would still
+            # satisfy that sub claim and get the full
+            # `nhp-<env>-github-actions` role (terraform-apply-equivalent on
+            # the env). With upstream qurl-reverse-tunnel-server #82
+            # declaring `environment: ${{ github.event_name != 'pull_request'
+            # && 'sandbox' || null }}`, the bare-main entry would cover zero
+            # real workflow runs that `:environment:sandbox` doesn't already
+            # cover. This is the shape #1574 is converging the legacy
+            # entries to.
+            #
+            # The `:environment:production` arm is forward-looking — upstream
+            # #82's publish job currently only emits `environment: sandbox`,
+            # so nothing in qurl-reverse-tunnel-server matches the production
+            # claim today. Kept here so a future prod publish job lands
+            # without a Terraform round-trip; don't grep for a workflow that
+            # doesn't exist yet.
+            var.qurl_reverse_tunnel_server_github_repo != "" ? [
+              "repo:${var.github_org}/${var.qurl_reverse_tunnel_server_github_repo}:environment:sandbox",
+              "repo:${var.github_org}/${var.qurl_reverse_tunnel_server_github_repo}:environment:production"
             ] : []
           )
         }
