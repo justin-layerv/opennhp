@@ -231,7 +231,11 @@ resource "aws_cloudwatch_metric_alarm" "secret_reconciliation_errors" {
   })
 }
 
-# Alarm on unexpected deletion spikes (could indicate mass instance termination or misconfiguration)
+# Alarm on unexpected deletion spikes (could indicate mass instance termination or misconfiguration).
+# Threshold is env-aware: sandbox runs blue/green with 2-4 deploy cycles/day, each cycle terminates
+# multiple AC instances, so steady-state daily orphans of 15-25 are normal. Prod runs canary with
+# much lower instance churn. See variables.tf::secret_reconciliation_deletion_spike_threshold for
+# the calibration baseline and re-tuning procedure.
 resource "aws_cloudwatch_metric_alarm" "secret_reconciliation_deletion_spike" {
   count = var.enable_secret_reconciliation && var.alerts_sns_topic_arn != null ? 1 : 0
 
@@ -242,8 +246,8 @@ resource "aws_cloudwatch_metric_alarm" "secret_reconciliation_deletion_spike" {
   namespace           = "LayerV/NHP"
   period              = 86400 # 1 day (matches Lambda schedule)
   statistic           = "Sum"
-  threshold           = 10
-  alarm_description   = "Unusually high number of orphaned AC secrets deleted - may indicate mass termination or misconfiguration"
+  threshold           = local.resolved_deletion_spike_threshold
+  alarm_description   = "AC orphan-secret deletions exceeded ${local.resolved_deletion_spike_threshold}/day. May indicate mass termination or ASG misconfiguration. See terraform/modules/ac/variables.tf::secret_reconciliation_deletion_spike_threshold for baseline + re-tuning procedure."
   treat_missing_data  = "notBreaching"
 
   dimensions = {

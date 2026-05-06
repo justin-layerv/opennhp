@@ -172,8 +172,9 @@ locals {
   account_id = data.aws_caller_identity.current.account_id
   region     = data.aws_region.current.id
 
-  resolved_max_capacity = coalesce(var.ac_max_capacity, local.is_prod ? 6 : 3)
-  eip_pool_tag          = "${var.name_prefix}-ac"
+  resolved_max_capacity             = coalesce(var.ac_max_capacity, local.is_prod ? 6 : 3)
+  resolved_deletion_spike_threshold = coalesce(var.secret_reconciliation_deletion_spike_threshold, local.is_prod ? 10 : 60)
+  eip_pool_tag                      = "${var.name_prefix}-ac"
 
 }
 

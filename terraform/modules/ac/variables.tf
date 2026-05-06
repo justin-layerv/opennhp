@@ -551,6 +551,51 @@ variable "enable_secret_reconciliation" {
   default     = true
 }
 
+variable "secret_reconciliation_deletion_spike_threshold" {
+  description = <<-EOT
+    Threshold for the OrphanedSecretsDeleted-per-day alarm
+    (`<name_prefix>-ac-secret-reconciliation-deletion-spike`).
+
+    The reconciliation Lambda runs daily and emits one datapoint
+    counting orphaned per-instance AC secrets it cleaned up. This
+    threshold sets when that count is treated as anomalous.
+
+    `null` selects an env-aware default:
+      sandbox -> 60   prod -> 10
+
+    Calibration (sandbox, 15-day window 2026-04-20..05-04):
+      datapoints: 37,15,18,8,15,3,25,11,10,26,14,6,6,8,23
+      mean ~15  median 14  p95 ~30  max 37
+    With 60, all 15 days are clean; ceiling absorbs the observed
+    blue/green peak (2-4 cycles/day x 2-instance scale-3-to-1
+    + 1 refresh ~= 25-40 terminations) plus headroom. Threshold 10
+    fired on 9 of 15 days — pure noise.
+
+    Prod uses canary (not blue/green) and steady-state instance
+    churn is much lower; 10 stays appropriate there.
+
+    Re-tune via observed datapoints, not gut feel — query
+    `aws cloudwatch get-metric-statistics --namespace LayerV/NHP
+    --metric-name OrphanedSecretsDeleted` for the trailing month and
+    pick a value above p95 + max(observed deploy burst).
+  EOT
+  type        = number
+  default     = null
+
+  validation {
+    # Bounds rationale lives in the variable description above. tl;dr: 1 is the
+    # smallest threshold that doesn't alarm on every Lambda run; 500 is where
+    # this metric loses discriminating power vs. CloudTrail TerminateInstances.
+    # Integer-only: the metric is a whole-secret count.
+    condition = var.secret_reconciliation_deletion_spike_threshold == null || (
+      var.secret_reconciliation_deletion_spike_threshold >= 1 &&
+      var.secret_reconciliation_deletion_spike_threshold <= 500 &&
+      var.secret_reconciliation_deletion_spike_threshold == floor(var.secret_reconciliation_deletion_spike_threshold)
+    )
+    error_message = "secret_reconciliation_deletion_spike_threshold must be null (env-aware default) or an integer between 1 and 500."
+  }
+}
+
 # ============================================================================
 # FRP Tunnel Server Integration
 # When set, AC Traefik routes FRP WebSocket and vhost traffic to the FRP server.
