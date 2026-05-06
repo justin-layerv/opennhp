@@ -279,6 +279,12 @@ variable "slack_channel_id" {
   default = "C09UP62A8F4"
 }
 
+variable "chatbot_owned_externally" {
+  description = "Prod's #all-layerv Chatbot config is owned by website CDK's LayerV-Monitoring stack (us-east-1, ProdSlackChannel), which subscribes our layerv-nhp-prod-cell0-alerts SNS topic. Default true keeps NHP from re-colliding on the (workspace, channel) pair. See website repo CLAUDE.md *Cross-repo handoff*."
+  type        = bool
+  default     = true
+}
+
 # Deployment configuration
 variable "image_tag" {
   description = "Docker image tag for NHP server and AC"

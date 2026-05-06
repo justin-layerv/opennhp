@@ -66,10 +66,31 @@ enable_termination_cleanup = true
 # Secret reconciliation: Lambda cleans orphaned per-instance AC secrets daily
 enable_secret_reconciliation = true
 
-# Slack notifications via AWS Chatbot
+# Slack notifications via AWS Chatbot.
+#
+# slack_workspace_id and slack_channel_id are documentation-only while
+# chatbot_owned_externally = true — local.enable_slack short-circuits and
+# nothing here actually wires them to a Chatbot config. They mirror the
+# (workspace, channel) pair that website CDK's LayerV-Monitoring stack owns;
+# keep these values in sync with that stack if either side rotates so a
+# future re-takeover doesn't land on stale identifiers.
 enable_slack_notifications = true
 slack_workspace_id         = "T09UP622L90" # LayerV workspace
 slack_channel_id           = "C09UP62A8F4" # #all-layerv
+
+# The (T09UP622L90, C09UP62A8F4) Chatbot config is owned by website CDK's
+# LayerV-Monitoring stack (ProdSlackChannel, us-east-1), which subscribes our
+# us-east-2 alerts topic. NHP terraform skips creating its own Chatbot config
+# here so the account-wide (workspace, channel) uniqueness constraint stays
+# satisfied. See website repo CLAUDE.md *Cross-repo handoff*.
+#
+# OPERATOR NOTE: the first prod apply after this lands will plan a destroy
+# on `module.monitoring.aws_chatbot_slack_channel_configuration.alerts[0]`
+# and the dedicated IAM role/policy. Do NOT apply that destroy until the
+# website CDK's `LayerV-Monitoring` stack is deployed and subscribed —
+# follow the website repo runbook (steps 0–4) which runs `terraform state rm`
+# on the chatbot config before any prod apply touches it.
+chatbot_owned_externally = true
 
 # GuardDuty security alerts
 guardduty_alert_emails = [

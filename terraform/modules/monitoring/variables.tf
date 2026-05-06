@@ -59,6 +59,30 @@ variable "enable_slack_notifications" {
   default     = false
 }
 
+variable "chatbot_owned_externally" {
+  description = <<-EOT
+    Whether the AWS Chatbot Slack channel configuration for
+    `(slack_workspace_id, slack_channel_id)` is owned by another stack
+    (e.g., website CDK's `LayerV-Monitoring`, which subscribes this module's
+    `aws_sns_topic.alerts` to its own `ProdSlackChannel`).
+
+    Chatbot enforces `(workspace, channel)` uniqueness account-wide, so two
+    repos can't both create a config for the same pair. When this is set to
+    true, this module:
+      - skips creating `aws_chatbot_slack_channel_configuration.alerts`
+      - skips the dedicated IAM role/policy (the external owner has its own)
+      - still creates `aws_sns_topic.alerts` (the external owner subscribes
+        it) and adds an explicit `chatbot.amazonaws.com` allow to the topic
+        policy so the cross-region subscribe is authorized by policy text.
+
+    Production sets this to true after the cross-repo handoff (see website
+    repo `CLAUDE.md` *Cross-repo handoff*). Non-prod envs leave it false so
+    they keep their own self-contained Chatbot config.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "alarm_on_missing_data" {
   description = <<-EOT
     How to treat missing metric data for availability alarms.

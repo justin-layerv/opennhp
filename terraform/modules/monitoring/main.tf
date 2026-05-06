@@ -5,7 +5,11 @@ data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
 locals {
-  enable_slack = var.enable_slack_notifications && var.slack_workspace_id != "" && var.slack_channel_id != ""
+  # When chatbot_owned_externally is true (prod after cross-repo handoff), the
+  # external Chatbot config in another stack subscribes our SNS topic and we
+  # skip creating our own — Chatbot's (workspace, channel) uniqueness is
+  # account-wide, so two configs for the same pair can't co-exist.
+  enable_slack = var.enable_slack_notifications && var.slack_workspace_id != "" && var.slack_channel_id != "" && !var.chatbot_owned_externally
 
   # Alarm behavior for missing data:
   # - prod: default to "breaching" (alert when metrics stop)
@@ -109,6 +113,38 @@ data "aws_iam_policy_document" "alerts_policy" {
       "sns:ListSubscriptionsByTopic"
     ]
     resources = [aws_sns_topic.alerts.arn]
+  }
+
+  # Allow AWS Chatbot to subscribe this topic. Required when
+  # chatbot_owned_externally = true so an external Chatbot configuration
+  # (e.g., website CDK's ProdSlackChannel in us-east-1) can subscribe this
+  # topic in us-east-2. The same-account-root statement above probably also
+  # covers this in practice, but service-principal authority for cross-region
+  # subscribes isn't formally guaranteed by the account-root path — making it
+  # explicit removes that ambiguity. Statement is unconditional (also active
+  # when chatbot_owned_externally = false) so an in-module Chatbot config
+  # subscribe path is identically authorized.
+  statement {
+    sid    = "AllowChatbotSubscribe"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["chatbot.amazonaws.com"]
+    }
+
+    actions = [
+      "sns:Subscribe",
+      "sns:GetTopicAttributes",
+      "sns:ListSubscriptionsByTopic"
+    ]
+    resources = [aws_sns_topic.alerts.arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
   }
 }
 

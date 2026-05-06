@@ -518,6 +518,12 @@ variable "slack_channel_id" {
   default     = ""
 }
 
+variable "chatbot_owned_externally" {
+  description = "Whether the AWS Chatbot config for (slack_workspace_id, slack_channel_id) is owned by another stack. See modules/monitoring/variables.tf for the full ownership story and the (workspace, channel) account-wide uniqueness rationale."
+  type        = bool
+  default     = false
+}
+
 # ==================== ASG Lifecycle Hook ====================
 
 variable "enable_termination_cleanup" {

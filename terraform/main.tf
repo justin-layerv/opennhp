@@ -500,6 +500,7 @@ module "monitoring" {
   enable_slack_notifications = var.enable_slack_notifications
   slack_workspace_id         = var.slack_workspace_id
   slack_channel_id           = var.slack_channel_id
+  chatbot_owned_externally   = var.chatbot_owned_externally
 
   # Email alert subscriptions (B8 - interim until Slack is authorized for prod)
   alert_emails = var.alert_emails
