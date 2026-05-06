@@ -5,37 +5,56 @@ package smoke
 // Tier 2: NHP server plugin dispatcher surface.
 //
 // Capability: /plugins/:aspid routes requests to registered static
-// plugin handlers (today: only "qurl"). This file fences the
-// publicly-visible error surface — the access-denied page that
-// every no-token or bad-token request hits.
+// plugin handlers (today: only "qurl"). This file fences:
+//   - the unknown-aspid path returns 404 (issue #1017)
+//   - the publicly-visible error surface — the access-denied page
+//     that every no-token or bad-token request hits.
 //
 // Source of truth: endpoints/server/staticplugins/qurl/main.go and
 // endpoints/server/httpserver.go's plugin route registration.
 //
-// Notes on coverage not in PR2:
-//
-//  1. Unknown aspid (/plugins/nonexistent) currently returns HTTP
-//     200 with {"errMsg":"no auth handler provided"} instead of
-//     404. This is a regression class worth a dedicated fence —
-//     filed as a follow-up. Not testable here until the server
-//     returns the right status code.
-//
-//  2. /plugins/qurl with no token currently returns 403 WITHOUT
-//     a Cache-Control header. CDN-side error caching masks this
-//     today (x-cache: Error from cloudfront), but an explicit
-//     Cache-Control: no-cache is still the belt-and-suspenders
-//     posture the plan called for. Filed as a follow-up.
-//
-// The remaining coverage in this file is the access-denied page
-// assertion itself: the 403 HTML is branded and should keep its
-// marker across releases so a regression to a generic 500 or a
-// whitelabel error page would fire the test.
+// Deferred to follow-up: /plugins/qurl with no token currently
+// returns 403 WITHOUT a Cache-Control header. CDN-side error
+// caching masks this today (x-cache: Error from cloudfront), but
+// an explicit Cache-Control: no-cache is still the belt-and-
+// suspenders posture the plan called for. Tracked in issue #1018.
 
 import (
 	"net/http"
 	"strings"
 	"testing"
 )
+
+// TestPlugins_UnknownASPIDReturns404 fences issue #1017: a request
+// for /plugins/{unknown} must return 404, not 200. A 200 lets any
+// downstream consumer that treats status_code == 200 as "succeeded"
+// silently treat a missing plugin as success.
+//
+// Asserts on the dispatcher's JSON body (not just status) so a
+// future regression where some upstream layer (NLB, ALB rule, an
+// errant gin middleware) starts answering 404 with a different
+// body would still fire the test.
+//
+// GET-only is sufficient: gin registers one closure for both GET
+// and POST on /plugins/:aspid (httpserver.go:664-665) and the
+// no-handler branch is method-agnostic, so a method-split would
+// be a separate regression class with its own fence.
+func TestPlugins_UnknownASPIDReturns404(t *testing.T) {
+	resp, body := doGetNoRedirect(t, testConfig.NHPServerBaseURL, "/plugins/nonexistent", nil)
+	assertStatusCode(t, resp, http.StatusNotFound)
+
+	if !strings.Contains(string(body), `"errMsg"`) {
+		// Surface CDN/proxy headers so the failure points at the right
+		// layer when an upstream (NLB rule, errant middleware, future
+		// CDN) — not the NHP dispatcher — is the one answering 404.
+		t.Logf("x-cache=%q via=%q server=%q",
+			resp.Header.Get("X-Cache"),
+			resp.Header.Get("Via"),
+			resp.Header.Get("Server"))
+		t.Fatalf("404 body is not the dispatcher's JSON error shape (missing errMsg key)\nbody: %s",
+			truncate(body, 200))
+	}
+}
 
 // TestPlugins_NoTokenReturnsBranded403 fences the
 // no-token-or-bad-token path for the qurl plugin. A GET to

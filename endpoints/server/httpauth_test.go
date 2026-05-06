@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
@@ -48,6 +49,17 @@ func newTestHttpServer() *HttpServer {
 	return hs
 }
 
+// newTestHttpServerWithPlugins returns a test HttpServer whose
+// FindPluginHandler is wired through a real UdpServer with the
+// supplied plugin map. Pass an empty map to fence the
+// no-handler-found path. Encapsulates the udpServer field-init so
+// callers don't depend on UdpServer's internal layout.
+func newTestHttpServerWithPlugins(handlers map[string]plugins.PluginHandler) *HttpServer {
+	hs := newTestHttpServer()
+	hs.udpServer = &UdpServer{pluginHandlerMap: handlers}
+	return hs
+}
+
 func TestRunPluginAuth_AbortedContext_NoResponseWritten(t *testing.T) {
 	hs := newTestHttpServer()
 
@@ -88,6 +100,27 @@ func TestRunPluginAuth_ErrorWithoutAbort_WritesError(t *testing.T) {
 	expected := `{"errMsg":"auth error: some plugin error"}`
 	if body := w.Body.String(); body != expected {
 		t.Errorf("expected %q, got %q", expected, body)
+	}
+}
+
+// TestAuthWithAspPlugin_UnknownASPID_Returns404 fences issue #1017:
+// /plugins/{unknown-aspid} previously returned 200 with a JSON
+// errMsg, which let downstream callers treating status_code==200
+// as "succeeded" silently treat a missing plugin as success.
+func TestAuthWithAspPlugin_UnknownASPID_Returns404(t *testing.T) {
+	hs := newTestHttpServerWithPlugins(map[string]plugins.PluginHandler{})
+
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+
+	hs.authWithAspPlugin(ctx, &common.HttpKnockRequest{AuthServiceId: "nonexistent"})
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+	expected := `{"errMsg":"no auth handler provided"}`
+	if body := w.Body.String(); body != expected {
+		t.Errorf("body = %q, want %q", body, expected)
 	}
 }
 
