@@ -235,43 +235,119 @@ Verifying this layer requires actually breaking the sandbox qurl-service so it s
 
 ### Step 3.1 — Disable the periodic reconciler temporarily
 
-The reconciler is gated by the `QURL_SCHEMA_RECONCILER_ENABLED` env var on the qurl-service ECS task definition (default `false`; set to `true` per environment after the IAM grant is confirmed). To exercise layer 3 cleanly, temporarily flip it back to `false` in the sandbox cell only:
+The reconciler is gated by the `QURL_SCHEMA_RECONCILER_ENABLED` env var on the qurl-service ECS task definition. The terraform module hardcodes this to `"true"` in [`terraform/modules/qurl-service/main.tf`](../../terraform/modules/qurl-service/main.tf), so the kill-switch path is a manual ECS task-definition override, not a tfvar flip.
+
+**Before applying the override, pause every workflow that runs `terraform apply` against this environment AND every workflow that runs an ECS service deploy against the qurl-api service.** Quick reference for what to pause and why:
+
+- **Lifecycle interaction:** `aws_ecs_service.qurl` has `lifecycle { ignore_changes = [desired_count, task_definition] }` (the `task_definition` element is the relevant one here). A `terraform apply` during the override does NOT immediately revert the running task — it just registers a new task-definition revision with the module default (`"true"`). The kill switch silently drops on the **next service deploy** that picks up the latest revision. So the failure window is "any service deploy following a terraform-apply during the override," not the terraform-apply itself.
+- **What to pause (sandbox):** `build-and-push.yml` (auto-applies on every push to `main`) plus the `qurl-service` repo's own `build-and-deploy.yml` (auto-deploys on every qurl-service push to `main`).
+- **What to pause (prod):** `scheduled-release.yml` (cron, weekdays 07:00 UTC) plus `promote-to-prod.yml` (manual `trigger-prod-deploy.sh` runs).
+- **Multi-cell:** these workflows apply across all cells in their environment, not per-cell, so disabling them halts drift-revert for every cell — that's expected for the override window. Today only `cell0` exists in each env, so this is operationally fine; revisit when the fleet expands beyond cell0 ([nhp#1697](https://github.com/layervai/nhp/issues/1697)).
+- **Out-of-band paths:** a laptop-driven `terraform apply` or a `trigger-prod-deploy.sh` run with `run_terraform=true` will do the same — coordinate on Slack before either.
+
+To exercise layer 3 cleanly, temporarily flip the env var to `false` in the sandbox cell only.
+
+Run the block below as a single paste. Each path is its own function so any abort inside it (`return 1`) leaves your interactive shell intact — `$TASK_DEF_FAMILY` / `$CELL_ID` survive a failed step. The describe/register/update/wait pattern intentionally re-implements (rather than reuses) `.github/scripts/deploy-ecs-service.sh` because the runbook needs (a) env-var mutation, (b) capturing the pre-override TD ARN for an exact-ARN restore, and (c) disk persist — none of which the script exposes.
 
 ```bash
 export TASK_DEF_FAMILY="layerv-nhp-sandbox-${CELL_ID}-qurl-api"
 
-# Read current task definition.
-AWS_PROFILE=layerv aws ecs describe-task-definition \
-  --task-definition "$TASK_DEF_FAMILY" \
-  --query 'taskDefinition' > /tmp/sandbox-task-def.json
+# Internal helper. Reads the running TD, asserts the env var is
+# present, mutates it to $1, registers the new revision, and rolls
+# the service. Used by both disable (§3.1) and enable (§3.5 fallback)
+# paths. Caller is responsible for capture+persist; this helper does
+# not touch shell state outside its own jq tempfiles.
+_register_qurl_td_with_reconciler_val() {
+  local desired="$1"
+  local td_json="/tmp/${TASK_DEF_FAMILY}-task-def.json"
+  local td_clean="/tmp/${TASK_DEF_FAMILY}-task-def-clean.json"
 
-# Strip the read-only fields ECS rejects on register-task-definition,
-# then flip QURL_SCHEMA_RECONCILER_ENABLED to "false" on the qurl-api
-# container's environment array.
-jq '
-  del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
-  | .containerDefinitions |= map(
-      if .name == "qurl-api" then
-        .environment |= map(
-          if .name == "QURL_SCHEMA_RECONCILER_ENABLED" then .value = "false" else . end
-        )
-      else . end
-    )
-' /tmp/sandbox-task-def.json > /tmp/sandbox-task-def-clean.json
+  AWS_PROFILE=layerv aws ecs describe-task-definition \
+    --task-definition "$TASK_DEF_FAMILY" \
+    --query 'taskDefinition' > "$td_json"
 
-AWS_PROFILE=layerv aws ecs register-task-definition \
-  --cli-input-json file:///tmp/sandbox-task-def-clean.json
+  # Loud-fail if the source TD doesn't already carry
+  # QURL_SCHEMA_RECONCILER_ENABLED — the jq below only mutates an
+  # existing entry (its `map` is not an append). Catches the case
+  # where someone runs the block against an old rolled-back TD
+  # revision that pre-dates the env var.
+  if ! jq -e '.containerDefinitions[] | select(.name == "qurl-api") | .environment | map(select(.name == "QURL_SCHEMA_RECONCILER_ENABLED")) | length == 1' \
+       "$td_json" > /dev/null; then
+    echo "QURL_SCHEMA_RECONCILER_ENABLED not present in source TD — refusing to no-op" >&2
+    return 1
+  fi
 
-AWS_PROFILE=layerv aws ecs update-service \
-  --cluster "layerv-nhp-sandbox-${CELL_ID}" \
-  --service "${TASK_DEF_FAMILY}" \
-  --task-definition "$TASK_DEF_FAMILY" \
-  --force-new-deployment
+  jq --arg val "$desired" '
+    del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)
+    | .containerDefinitions |= map(
+        if .name == "qurl-api" then
+          .environment |= map(
+            if .name == "QURL_SCHEMA_RECONCILER_ENABLED" then .value = $val else . end
+          )
+        else . end
+      )
+  ' "$td_json" > "$td_clean"
 
-# Wait for the new task to be RUNNING and STEADY before proceeding to 3.2.
-AWS_PROFILE=layerv aws ecs wait services-stable \
-  --cluster "layerv-nhp-sandbox-${CELL_ID}" \
-  --services "$TASK_DEF_FAMILY"
+  AWS_PROFILE=layerv aws ecs register-task-definition \
+    --cli-input-json "file://$td_clean" > /dev/null
+  AWS_PROFILE=layerv aws ecs update-service \
+    --cluster "$TASK_DEF_FAMILY" --service "$TASK_DEF_FAMILY" \
+    --task-definition "$TASK_DEF_FAMILY" --force-new-deployment > /dev/null
+  AWS_PROFILE=layerv aws ecs wait services-stable \
+    --cluster "$TASK_DEF_FAMILY" --services "$TASK_DEF_FAMILY" || {
+      echo "services-stable wait timed out after deploy — investigate the new tasks via 'aws ecs describe-services ... --query services[0].deployments' before retrying" >&2
+      return 1
+  }
+}
+
+# §3.1 entry point: capture the running TD ARN, persist it for §3.5,
+# then flip the env var to "false". Splitting capture from the §3.5
+# fallback avoids re-capturing a false-flipped TD on re-entry.
+disable_qurl_schema_reconciler() {
+  # Wait for steady state — if a previous deploy is in-flight (e.g.,
+  # a circuit-breaker rollback is settling), services[0].taskDefinition
+  # returns the configured TD, not the running one. Polls 15s up to
+  # a 10-min ceiling.
+  AWS_PROFILE=layerv aws ecs wait services-stable \
+    --cluster "$TASK_DEF_FAMILY" --services "$TASK_DEF_FAMILY" || {
+      echo "services-stable wait timed out before capture — refusing to proceed" >&2
+      return 1
+  }
+
+  local pre_override_td_arn
+  pre_override_td_arn=$(AWS_PROFILE=layerv aws ecs describe-services \
+    --cluster "$TASK_DEF_FAMILY" --services "$TASK_DEF_FAMILY" \
+    --query 'services[0].taskDefinition' --output text)
+
+  # AWS CLI returns the literal "None" on null fields and empty on
+  # --query miss. Either way, refuse to proceed rather than persist
+  # garbage and surprise §3.5 with `update-service --task-definition None`.
+  if [[ -z "$pre_override_td_arn" || "$pre_override_td_arn" == "None" ]]; then
+    echo "Failed to capture pre-override TD ARN (got: '$pre_override_td_arn') — refusing to proceed" >&2
+    return 1
+  fi
+  PRE_OVERRIDE_TD_ARN="$pre_override_td_arn"
+
+  # Persist to disk so the §3.5 restore survives tmux detach / terminal
+  # crash / hour-long context switch. Filename namespaced by family so a
+  # future prod-side dry-run won't collide. /tmp is tmpfs on most
+  # modern distros and clears on reboot — the §3.5 fallback covers that.
+  local persist_path="/tmp/${TASK_DEF_FAMILY}-pre-override-td-arn"
+  echo "$PRE_OVERRIDE_TD_ARN" > "$persist_path"
+  echo "Pre-override TD: $PRE_OVERRIDE_TD_ARN (also written to $persist_path)"
+
+  _register_qurl_td_with_reconciler_val "false"
+}
+
+# §3.5 fallback entry point: re-register a fresh true-bearing TD
+# revision and roll the service. No capture (the running TD is the
+# false-flipped one); no persist (the §3.1 capture is what §3.5
+# wants to restore from).
+enable_qurl_schema_reconciler() {
+  _register_qurl_td_with_reconciler_val "true"
+}
+
+disable_qurl_schema_reconciler
 ```
 
 Step 3.5 restores the env var to `true` and force-deploys again.
@@ -316,7 +392,36 @@ Both alerts should:
 ### Step 3.5 — Layer 3 cleanup
 
 1. Restore the GSI per step 2.5
-2. If you disabled the reconciler in step 3.1, re-enable it: re-run the `register-task-definition` flow with `QURL_SCHEMA_RECONCILER_ENABLED=true`, force a new deploy, and `services-stable` wait
+2. If you disabled the reconciler in step 3.1, re-enable it by pointing the service back at the exact TD ARN you captured at the start of §3.1. The shell variable falls back to the disk persist so this works across tmux detach / terminal crash. The block is wrapped in a function so any abort leaves the interactive shell intact:
+   ```bash
+   restore_qurl_pre_override_td() {
+     local arn="${PRE_OVERRIDE_TD_ARN:-$(cat "/tmp/${TASK_DEF_FAMILY}-pre-override-td-arn" 2>/dev/null)}"
+     if [[ -z "$arn" ]]; then
+       echo "PRE_OVERRIDE_TD_ARN unavailable from shell or disk — use the fallback below" >&2
+       return 1
+     fi
+     AWS_PROFILE=layerv aws ecs update-service \
+       --cluster "$TASK_DEF_FAMILY" --service "$TASK_DEF_FAMILY" \
+       --task-definition "$arn" --force-new-deployment > /dev/null
+     AWS_PROFILE=layerv aws ecs wait services-stable \
+       --cluster "$TASK_DEF_FAMILY" --services "$TASK_DEF_FAMILY" || {
+         echo "services-stable wait timed out — deploy is not stabilizing; investigate before retrying" >&2
+         return 1
+     }
+   }
+   restore_qurl_pre_override_td
+   ```
+   This restore is positional-index-free and family-match-free by construction — `$PRE_OVERRIDE_TD_ARN` was the ARN running before the override, so re-pointing at it is unambiguous regardless of how many revisions registered in between or whether any sibling families exist.
+
+   `aws ecs wait services-stable` polls every 15 seconds with a 40-poll (10-minute) ceiling; if it hangs to the timeout the deploy is not stabilizing — investigate the new tasks via `aws ecs describe-services ... --query 'services[0].deployments'` and the ECS event stream before retrying.
+
+   **Fallback (only if `restore_qurl_pre_override_td` returned 1 because both the shell variable and the disk persist are gone — e.g., reboot lost both shell *and* tmpfs):**
+   ```bash
+   enable_qurl_schema_reconciler
+   ```
+   `enable_qurl_schema_reconciler` is the §3.1 helper that re-registers a fresh task-definition revision with `QURL_SCHEMA_RECONCILER_ENABLED=true` and rolls the service — no capture, no persist, just registers + deploys + waits. Re-pasting §3.1 will re-define it.
+
+   Note: the §3.5 simple-restore block above and §3.1 both use `--cluster "$TASK_DEF_FAMILY"` because in this module the cluster name, ECS service name, and task-definition family name are all derived from `local.service_name` — see `aws_ecs_cluster.qurl`, `aws_ecs_service.qurl`, and `aws_ecs_task_definition.qurl` in `terraform/modules/qurl-service/main.tf` (grep for `local.service_name` to find them).
 3. Confirm `/health/ready` returns to `healthy` (the `dynamodb_schema` checker should reappear with `status: pass`)
 4. Confirm the alerts auto-resolve (Grafana rule status returns to `Normal` within the rule's `for:` window)
 
@@ -329,6 +434,20 @@ The runbook PASSES if **all three layers fired independently**:
 - [ ] **Layer 3**: Grafana alerts fired in the existing prod-alerts channel within 5 minutes of the first 500
 
 If any layer fails, file an issue tagged `area: qurl`, `area: terraform`, or `area: monitoring` as appropriate, link this runbook, and include the failing layer's logs.
+
+## Failure modes worth recognizing during activation
+
+1. **Reconciler still dormant after a rolled-back deploy (specific to the first promote-to-prod after #1690 lands).** Delete this entry after the first successful post-#1690 prod deploy lands; tracked in [#1698](https://github.com/layervai/nhp/issues/1698).
+
+   _TL;DR for incident-time skim: if a post-#1690 prod deploy hits the circuit breaker before any post-#1690 deploy succeeds, the running TD predates the env var and `/health/ready` won't show the `dynamodb_schema` checker — re-deploy and verify._
+
+   **Mechanism.** The first post-#1690 `promote-to-prod` run lands `terraform-apply`, which registers a new task definition with `QURL_SCHEMA_RECONCILER_ENABLED=true`. If the subsequent ECS deploy's circuit breaker rolls back for an unrelated reason (new image crashloops, ALB unhealthy threshold reached during rollout, etc.), ECS reverts the service to the *previous* task-definition revision — which was registered before the env var was added. The reconciler stays dormant; `/health/ready` does not show the `dynamodb_schema` checker.
+
+   **When the symptom stops recurring.** Once at least one post-#1690 deploy has fully succeeded, both the running revision and the rollback target carry the env var, and subsequent rolled-back deploys do not reproduce the symptom. If two or more consecutive deploys all hit the circuit breaker before any succeeds, the running revision stays at pre-#1690 and the symptom recurs.
+
+   **Diagnostic.** If `/health/ready` doesn't show the checker after a deploy you believe succeeded, confirm the deploy actually completed (ECS service `runningCount == desiredCount` on the new revision, not stuck on the prior one) before assuming the activation itself failed.
+
+2. **Reconciler still dormant in sandbox after the nhp PR merges.** `aws_ecs_service.qurl` has `lifecycle { ignore_changes = [task_definition] }`. nhp's `build-and-push.yml` runs `terraform apply` on push to `main` and registers a new task-definition revision with the env var, but does **not** call `update-service` on the qurl-api service (that's the qurl-service repo's responsibility). So `/health/ready` won't show the `dynamodb_schema` checker until the next qurl-service push-to-main runs `build-and-deploy.yml` (which calls `update-service --force-new-deployment` and picks up the latest revision), or an operator runs `aws ecs update-service --cluster layerv-nhp-sandbox-cell0-qurl-api --service layerv-nhp-sandbox-cell0-qurl-api --force-new-deployment` against the sandbox cluster.
 
 ## When to run this runbook
 

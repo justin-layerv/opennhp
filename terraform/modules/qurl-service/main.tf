@@ -173,6 +173,13 @@ locals {
     { name = "SERVER_PORT", value = tostring(var.container_port) },
     { name = "API_BASE_URL", value = local.computed_api_base_url },
     { name = "DYNAMODB_TABLE_PREFIX", value = var.dynamodb_table_prefix },
+    # Hardcoded "true" — every cell running this module must have the
+    # periodic DynamoDB schema reconciler on; no per-env opt-out.
+    # Defense-in-depth layer against GSI drift (incident class #877).
+    # Kill switch on misfire is a manual ECS task-def override + force
+    # deploy (see docs/runbooks/verify-qurl-schema-prevention.md §3.1);
+    # terraform-apply is too slow for incident rollback.
+    { name = "QURL_SCHEMA_RECONCILER_ENABLED", value = "true" },
     { name = "AUTH0_DOMAIN", value = var.auth0_domain },
     { name = "AUTH0_AUDIENCE", value = var.auth0_audience },
     { name = "AUTH0_JWKS_CACHE_TTL", value = tostring(var.auth0_jwks_cache_ttl_seconds) },
