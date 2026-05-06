@@ -35,6 +35,99 @@ func createTestAC(t *testing.T) *UdpAC {
 	return ac
 }
 
+// connRoutineHarness drives ac.connectionRoutine against a stub AC; see TestConnectionRoutine_*.
+type connRoutineHarness struct {
+	t       *testing.T
+	ac      *UdpAC
+	conn    *UdpConn
+	addrStr string
+}
+
+// newConnRoutineHarness wires AC + UDP socket + UdpConn with timeoutMs and starts connectionRoutine.
+// NOTE: a.device is left nil. Callers must drive paths that don't deref it (NHP_KPL with non-pool-allocated pkts; SendQueue with KeepAfterSend=true).
+func newConnRoutineHarness(t *testing.T, timeoutMs int) *connRoutineHarness {
+	t.Helper()
+	ac := &UdpAC{
+		remoteConnectionMap:   make(map[string]*UdpConn),
+		remoteConnectionMutex: sync.Mutex{},
+		wg:                    sync.WaitGroup{},
+	}
+	ac.signals.stop = make(chan struct{})
+
+	localAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}
+	netConn, err := net.ListenUDP("udp", localAddr)
+	if err != nil {
+		t.Fatalf("Failed to create UDP socket: %v", err)
+	}
+	remoteAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 49999} // ephemeral; nothing listens; sends drop silently
+	netConnLocalAddr, ok := netConn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("expected *net.UDPAddr, got %T", netConn.LocalAddr())
+	}
+	addrStr := remoteAddr.String()
+
+	conn := &UdpConn{
+		netConn: netConn,
+		ConnData: &core.ConnectionData{
+			RemoteAddr:       remoteAddr,
+			LocalAddr:        netConnLocalAddr,
+			SendQueue:        make(chan *core.Packet, 16),
+			RecvQueue:        make(chan *core.Packet, 16),
+			BlockSignal:      make(chan struct{}),
+			StopSignal:       make(chan struct{}),
+			SetTimeoutSignal: make(chan struct{}), // matches production (unbuffered)
+		},
+	}
+	conn.ConnData.InitTimeoutMs(timeoutMs)
+	// No ConnData.Add(1): no recvPacketRoutine here, so Close() must not block on Wait.
+	ac.remoteConnectionMap[addrStr] = conn
+
+	ac.wg.Add(1)
+	go ac.connectionRoutine(conn)
+
+	return &connRoutineHarness{t: t, ac: ac, conn: conn, addrStr: addrStr}
+}
+
+// assertPresent fails the test if the connection is no longer in the map.
+func (h *connRoutineHarness) assertPresent(msg string) {
+	h.t.Helper()
+	h.ac.remoteConnectionMutex.Lock()
+	_, present := h.ac.remoteConnectionMap[h.addrStr]
+	h.ac.remoteConnectionMutex.Unlock()
+	if !present {
+		h.t.Fatal(msg)
+	}
+}
+
+// waitRemoved polls until the conn leaves the map; t.Fatal on timeout.
+func (h *connRoutineHarness) waitRemoved(timeout time.Duration, msg string) {
+	h.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		h.ac.remoteConnectionMutex.Lock()
+		_, stillPresent := h.ac.remoteConnectionMap[h.addrStr]
+		h.ac.remoteConnectionMutex.Unlock()
+		if !stillPresent {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	h.t.Fatal(msg)
+}
+
+// shutdown closes signals.stop and bounded-waits for the routine; t.Errorf on timeout.
+func (h *connRoutineHarness) shutdown(timeout time.Duration) {
+	h.t.Helper()
+	close(h.ac.signals.stop)
+	done := make(chan struct{})
+	go func() { h.ac.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		h.t.Errorf("connectionRoutine did not exit within %s after stop signal", timeout)
+	}
+}
+
 // TestNewConnection_UnconnectedSocket verifies that newConnection creates an
 // unconnected UDP socket (via ListenUDP) rather than a connected socket (DialUDP).
 // Unconnected sockets are required to accept packets from any source address,
@@ -554,8 +647,8 @@ func TestConnection_QueuesInitialized(t *testing.T) {
 	}
 
 	// Verify timeout is set
-	if conn.ConnData.TimeoutMs != DefaultConnectionTimeoutMs {
-		t.Errorf("TimeoutMs: got %d, want %d", conn.ConnData.TimeoutMs, DefaultConnectionTimeoutMs)
+	if got := conn.ConnData.TimeoutMs(); got != DefaultConnectionTimeoutMs {
+		t.Errorf("TimeoutMs: got %d, want %d", got, DefaultConnectionTimeoutMs)
 	}
 
 	t.Log("All queues and references properly initialized")
@@ -786,7 +879,6 @@ func TestConnectionTimeout_TriggersReregistration(t *testing.T) {
 		ConnData: &core.ConnectionData{
 			RemoteAddr:       remoteAddr,
 			LocalAddr:        netConnLocalAddr,
-			TimeoutMs:        50, // Very short timeout
 			SendQueue:        make(chan *core.Packet, 16),
 			RecvQueue:        make(chan *core.Packet, 16),
 			BlockSignal:      make(chan struct{}),
@@ -794,7 +886,8 @@ func TestConnectionTimeout_TriggersReregistration(t *testing.T) {
 			SetTimeoutSignal: make(chan struct{}),
 		},
 	}
-	conn.ConnData.Add(1) // For recvPacketRoutine (will be Done'd on close)
+	conn.ConnData.InitTimeoutMs(50) // Very short timeout
+	conn.ConnData.Add(1)            // For recvPacketRoutine (will be Done'd on close)
 
 	// Store connection in map
 	ac.remoteConnectionMap[serverAddr] = conn
@@ -882,7 +975,6 @@ func TestConnectionTimeout_NonServerConnection(t *testing.T) {
 		ConnData: &core.ConnectionData{
 			RemoteAddr:       remoteAddr,
 			LocalAddr:        netConnLocalAddr,
-			TimeoutMs:        50,
 			SendQueue:        make(chan *core.Packet, 16),
 			RecvQueue:        make(chan *core.Packet, 16),
 			BlockSignal:      make(chan struct{}),
@@ -890,6 +982,7 @@ func TestConnectionTimeout_NonServerConnection(t *testing.T) {
 			SetTimeoutSignal: make(chan struct{}),
 		},
 	}
+	conn.ConnData.InitTimeoutMs(50)
 	conn.ConnData.Add(1)
 
 	// Store connection in map
@@ -928,6 +1021,73 @@ func TestConnectionTimeout_NonServerConnection(t *testing.T) {
 	// Clean up
 	close(ac.signals.stop)
 	reg.Stop()
+}
+
+// TestConnectionRoutine_PacketActivityResetsIdleTimer: SendQueue activity must reset the idle timer.
+func TestConnectionRoutine_PacketActivityResetsIdleTimer(t *testing.T) {
+	h := newConnRoutineHarness(t, 500) // 500ms timeout: headroom for routine drain + GC + race-instrumentation latency on shared CI
+
+	// KeepAfterSend: true so SendPacket doesn't release pkt to a nil device pool.
+	activityDone := make(chan struct{})
+	go func() {
+		defer close(activityDone)
+		deadline := time.Now().Add(600 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			pkt := &core.Packet{Content: []byte{0}, KeepAfterSend: true}
+			select {
+			case h.conn.ConnData.SendQueue <- pkt:
+			case <-time.After(50 * time.Millisecond):
+				return // routine exited or queue full — bail
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+	}()
+
+	time.Sleep(400 * time.Millisecond)
+	h.assertPresent("connection removed during packet activity — idle timer was not reset on send")
+
+	<-activityDone
+
+	h.waitRemoved(2*time.Second, "connection not removed within 2s after activity ceased — idle timeout did not fire")
+	h.shutdown(time.Second)
+}
+
+// TestConnectionRoutine_KeepalivePacketsResetIdleTimer: NHP_KPL early-continue must still reset the timer (otherwise AC conns with only 10s keepalives idle out at 300s).
+func TestConnectionRoutine_KeepalivePacketsResetIdleTimer(t *testing.T) {
+	h := newConnRoutineHarness(t, 500)
+
+	activityDone := make(chan struct{})
+	go func() {
+		defer close(activityDone)
+		deadline := time.Now().Add(600 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			pkt := &core.Packet{HeaderType: core.NHP_KPL, Content: []byte{0}}
+			select {
+			case h.conn.ConnData.RecvQueue <- pkt:
+			case <-time.After(50 * time.Millisecond):
+				return
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+	}()
+
+	time.Sleep(400 * time.Millisecond)
+	h.assertPresent("connection removed during keepalive activity — KPL did not reset idle timer (early-continue regression)")
+
+	<-activityDone
+
+	h.waitRemoved(2*time.Second, "connection not removed within 2s after keepalives ceased")
+	h.shutdown(time.Second)
+}
+
+// TestConnectionRoutine_SetTimeoutSignalAppliesNewTimeout: SetTimeout(80ms) on a 10s-armed routine must re-arm immediately (not wait for next packet).
+// SetTimeout's unbuffered send blocks until the routine selects on SetTimeoutSignal, so no separate "wait for routine to arm timer" sleep is required.
+func TestConnectionRoutine_SetTimeoutSignalAppliesNewTimeout(t *testing.T) {
+	h := newConnRoutineHarness(t, 10000)
+	h.conn.ConnData.SetTimeout(80)
+
+	h.waitRemoved(time.Second, "connection not removed within 1s of SetTimeout(80) — SetTimeoutSignal did not re-arm the idle timer")
+	h.shutdown(time.Second)
 }
 
 // TestCloudModeSkipsFailOpen verifies that in cloud mode (where no servers are

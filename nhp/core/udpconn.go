@@ -4,16 +4,31 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
+// NewStoppedTimer returns a stopped timer; caller must Reset(d) before use. The 1h placeholder is arbitrary — immediately stopped. (Go 1.23+: bare Reset is correct.)
+//
+// Reset-placement conventions in this repo:
+//   - Reset before any early-`continue` if every code path in the case must count as activity (connectionRoutine recv/send).
+//   - Reset after work if the desired cycle is interval+work_time (BlockAddrRefreshRoutine).
+//   - Reset before the bottom select if the cycle is fixed-interval and work above is variable (serverDiscovery, knock loops).
+func NewStoppedTimer() *time.Timer {
+	t := time.NewTimer(time.Hour)
+	t.Stop()
+	return t
+}
+
 type ConnectionData struct {
-	// atomic data, keep 64bit(8-bytes) alignment for 32-bit system compatibility
+	// 8-byte-aligned block: the int64 fields below are accessed via package-level atomic.LoadInt64/StoreInt64
+	// and require manual alignment on 32-bit systems. timeoutMs (atomic.Int64) self-aligns; grouped here for locality.
 	InitTime           int64 // local connection setup time. immutable after created
 	LastRemoteSendTime int64
 	LastLocalSendTime  int64
 	LastLocalRecvTime  int64
+	timeoutMs          atomic.Int64 // unexported: write via SetTimeout or InitTimeoutMs only.
 
 	sync.Mutex
 	sync.WaitGroup
@@ -23,7 +38,6 @@ type ConnectionData struct {
 	LocalAddr        *net.UDPAddr
 	RemoteAddr       *net.UDPAddr
 	CookieStore      *CookieStore
-	TimeoutMs        int
 	SendQueue        chan *Packet
 	RecvQueue        chan *Packet
 	BlockSignal      chan struct{}
@@ -45,8 +59,17 @@ func (c *ConnectionData) Equal(other *ConnectionData) bool {
 	return c.InitTime == other.InitTime
 }
 
+// TimeoutMs returns the connection idle timeout in milliseconds.
+func (c *ConnectionData) TimeoutMs() int { return int(c.timeoutMs.Load()) }
+
+// InitTimeoutMs sets the timeout at construction. Use SetTimeout once connectionRoutine is running.
+func (c *ConnectionData) InitTimeoutMs(ms int) { c.timeoutMs.Store(int64(ms)) }
+
+// SetTimeout updates the timeout and signals connectionRoutine to re-arm; blocks until the routine selects.
+// TODO(#1675): not safe to call concurrently with Close() — send panics on closed channel.
+// No production callers as of PR #1491; retained as the documented re-arm contract for #1675.
 func (c *ConnectionData) SetTimeout(ms int) {
-	c.TimeoutMs = ms
+	c.timeoutMs.Store(int64(ms))
 	c.SetTimeoutSignal <- struct{}{}
 }
 

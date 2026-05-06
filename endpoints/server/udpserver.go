@@ -1292,6 +1292,16 @@ func (s *UdpServer) recvPacketRoutine() {
 				isDBConnection: isDBConn,
 				evictSignal:    make(chan struct{}),
 			}
+			timeoutMs := DefaultAgentConnectionTimeoutMs
+			switch {
+			case conn.isACConnection:
+				timeoutMs = DefaultACConnectionTimeoutMs
+				log.Debug("Received new ac connection from %s", addrStr)
+			case conn.isDBConnection:
+				timeoutMs = DefaultDBConnectionTimeoutMs
+				log.Debug("Received new db connection from %s", addrStr)
+			}
+
 			// setup new routine for connection
 			conn.ConnData = &core.ConnectionData{
 				InitTime:             recvTime,
@@ -1301,22 +1311,13 @@ func (s *UdpServer) recvPacketRoutine() {
 				RemoteAddr:           remoteAddr,
 				CookieStore:          &core.CookieStore{},
 				RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
-				TimeoutMs:            DefaultAgentConnectionTimeoutMs,
 				SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 				RecvQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 				BlockSignal:          make(chan struct{}),
 				SetTimeoutSignal:     make(chan struct{}),
 				StopSignal:           make(chan struct{}),
 			}
-
-			if conn.isACConnection {
-				conn.ConnData.TimeoutMs = DefaultACConnectionTimeoutMs
-				log.Debug("Received new ac connection from %s", addrStr)
-			}
-			if conn.isDBConnection {
-				conn.ConnData.TimeoutMs = DefaultDBConnectionTimeoutMs
-				log.Debug("Received new db connection from %s", addrStr)
-			}
+			conn.ConnData.InitTimeoutMs(timeoutMs)
 			s.admitNewConnection(conn, addrStr)
 
 			conn.ConnData.RecvQueue <- pkt
@@ -1575,6 +1576,11 @@ func (s *UdpServer) connectionRoutine(conn *UdpConn) {
 		conn.Close()
 	}()
 
+	// See endpoints/ac/udpac.go::connectionRoutine — canonical placement + fences.
+	idleTimeout := time.Duration(conn.ConnData.TimeoutMs()) * time.Millisecond
+	idleTimer := time.NewTimer(idleTimeout)
+	defer idleTimer.Stop()
+
 	for {
 		select {
 		case <-s.signals.stop:
@@ -1585,12 +1591,15 @@ func (s *UdpServer) connectionRoutine(conn *UdpConn) {
 			return
 
 		case <-conn.ConnData.SetTimeoutSignal:
-			if conn.ConnData.TimeoutMs <= 0 {
+			newTimeoutMs := conn.ConnData.TimeoutMs()
+			if newTimeoutMs <= 0 {
 				log.Debug("Connection routine closed immediately")
 				return
 			}
+			idleTimeout = time.Duration(newTimeoutMs) * time.Millisecond
+			idleTimer.Reset(idleTimeout)
 
-		case <-time.After(time.Duration(conn.ConnData.TimeoutMs) * time.Millisecond):
+		case <-idleTimer.C:
 			// timeout, quit routine
 			log.Debug("Connection routine idle timeout")
 			return
@@ -1603,6 +1612,7 @@ func (s *UdpServer) connectionRoutine(conn *UdpConn) {
 			if !ok {
 				return
 			}
+			idleTimer.Reset(idleTimeout)
 			if pkt == nil {
 				continue
 			}
@@ -1640,6 +1650,7 @@ func (s *UdpServer) connectionRoutine(conn *UdpConn) {
 			if !ok {
 				return
 			}
+			idleTimer.Reset(idleTimeout)
 			if pkt == nil {
 				continue
 			}
@@ -1656,13 +1667,19 @@ func (s *UdpServer) BlockAddrRefreshRoutine() {
 
 	log.Info("BlockedAddrRoutine started")
 
+	// Armed at construction so the first refresh fires after one interval (matches prior time.After timing).
+	refreshTimer := time.NewTimer(BlockAddrRefreshRate * time.Second)
+	defer refreshTimer.Stop()
 	for {
 		select {
 		case <-s.signals.stop:
 			return
 
-		case <-time.After(BlockAddrRefreshRate * time.Second):
+		case <-refreshTimer.C:
 			s.RefreshBlockAddr()
+			// Reset after work: no early-continue here. If RefreshBlockAddr ever grows an
+			// early-return path, move the Reset above it so cycle stays interval+work_time.
+			refreshTimer.Reset(BlockAddrRefreshRate * time.Second)
 		}
 	}
 }

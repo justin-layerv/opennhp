@@ -317,13 +317,13 @@ func (a *UdpAgent) newConnection(addr *net.UDPAddr) (conn *UdpConn) {
 		RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
 		LocalAddr:            localAddr,
 		RemoteAddr:           addr,
-		TimeoutMs:            DefaultConnectionTimeoutMs,
 		SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 		RecvQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 		BlockSignal:          make(chan struct{}),
 		SetTimeoutSignal:     make(chan struct{}),
 		StopSignal:           make(chan struct{}),
 	}
+	conn.ConnData.InitTimeoutMs(DefaultConnectionTimeoutMs)
 
 	conn.ConnData.Add(1)
 	go a.recvPacketRoutine(conn)
@@ -479,18 +479,26 @@ func (a *UdpAgent) connectionRoutine(conn *UdpConn) {
 		conn.Close()
 	}()
 
+	// See endpoints/ac/udpac.go::connectionRoutine — canonical placement + fences.
+	idleTimeout := time.Duration(conn.ConnData.TimeoutMs()) * time.Millisecond
+	idleTimer := time.NewTimer(idleTimeout)
+	defer idleTimer.Stop()
+
 	for {
 		select {
 		case <-a.signals.stop:
 			return
 
 		case <-conn.ConnData.SetTimeoutSignal:
-			if conn.ConnData.TimeoutMs <= 0 {
+			newTimeoutMs := conn.ConnData.TimeoutMs()
+			if newTimeoutMs <= 0 {
 				log.Debug("Connection routine closed immediately")
 				return
 			}
+			idleTimeout = time.Duration(newTimeoutMs) * time.Millisecond
+			idleTimer.Reset(idleTimeout)
 
-		case <-time.After(time.Duration(conn.ConnData.TimeoutMs) * time.Millisecond):
+		case <-idleTimer.C:
 			// timeout, quit routine
 			log.Debug("Connection routine idle timeout")
 			return
@@ -499,6 +507,7 @@ func (a *UdpAgent) connectionRoutine(conn *UdpConn) {
 			if !ok {
 				return
 			}
+			idleTimer.Reset(idleTimeout)
 			if pkt == nil {
 				continue
 			}
@@ -510,6 +519,7 @@ func (a *UdpAgent) connectionRoutine(conn *UdpConn) {
 			if !ok {
 				return
 			}
+			idleTimer.Reset(idleTimeout)
 			if pkt == nil {
 				continue
 			}
@@ -609,6 +619,9 @@ func (a *UdpAgent) knockResourceRoutine() {
 
 				log.Info("knock %s sub-routine started", knockStr)
 
+				openTimer := core.NewStoppedTimer()
+				defer openTimer.Stop()
+
 				for {
 					select {
 					case <-a.signals.knockTargetStop:
@@ -626,12 +639,13 @@ func (a *UdpAgent) knockResourceRoutine() {
 					}
 
 					log.Info("knock %s succeeded, next knock in %d seconds", knockStr, ackMsg.OpenTime)
+					openTimer.Reset(time.Second * time.Duration(ackMsg.OpenTime))
 					select {
 					case <-a.signals.knockTargetStop:
 						return
 					case <-quit:
 						return
-					case <-time.After(time.Second * time.Duration(ackMsg.OpenTime)):
+					case <-openTimer.C:
 						// continue knock
 					}
 				}
@@ -660,6 +674,9 @@ func (a *UdpAgent) dhpKnockResourceRoutine() {
 
 	log.Info("dhpKnockResourceRoutine started")
 
+	openTimer := core.NewStoppedTimer()
+	defer openTimer.Stop()
+
 	for {
 		select {
 		case <-a.signals.stop:
@@ -681,10 +698,11 @@ func (a *UdpAgent) dhpKnockResourceRoutine() {
 		log.Info("knock succeeded, next knock in %d seconds", ackMsg.OpenTime)
 		a.safeTee.Store(true)
 
+		openTimer.Reset(time.Second * time.Duration(ackMsg.OpenTime))
 		select {
 		case <-a.signals.stop:
 			return
-		case <-time.After(time.Second * time.Duration(ackMsg.OpenTime)):
+		case <-openTimer.C:
 			// continue knock
 		}
 	}

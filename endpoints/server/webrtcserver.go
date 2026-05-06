@@ -120,13 +120,13 @@ func (w *WebRTCServer) setupDataChannel(dc *webrtc.DataChannel) {
 			RemoteAddr:           addr,
 			CookieStore:          &core.CookieStore{},
 			RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
-			TimeoutMs:            DefaultAgentConnectionTimeoutMs,
 			SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 			RecvQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 			BlockSignal:          make(chan struct{}),
 			SetTimeoutSignal:     make(chan struct{}),
 			StopSignal:           make(chan struct{}),
 		}
+		conn.ConnData.InitTimeoutMs(DefaultAgentConnectionTimeoutMs)
 
 		key := addr.String()
 		w.us.remoteConnectionMapMutex.Lock()

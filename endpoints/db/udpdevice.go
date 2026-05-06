@@ -229,13 +229,13 @@ func (a *UdpDevice) newConnection(addr *net.UDPAddr) (conn *UdpConn) {
 		RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
 		LocalAddr:            localAddr,
 		RemoteAddr:           addr,
-		TimeoutMs:            DefaultConnectionTimeoutMs,
 		SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 		RecvQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 		BlockSignal:          make(chan struct{}),
 		SetTimeoutSignal:     make(chan struct{}),
 		StopSignal:           make(chan struct{}),
 	}
+	conn.ConnData.InitTimeoutMs(DefaultConnectionTimeoutMs)
 
 	conn.ConnData.Add(1)
 	go a.recvPacketRoutine(conn)
@@ -391,18 +391,26 @@ func (a *UdpDevice) connectionRoutine(conn *UdpConn) {
 		conn.Close()
 	}()
 
+	// See endpoints/ac/udpac.go::connectionRoutine — canonical placement + fences.
+	idleTimeout := time.Duration(conn.ConnData.TimeoutMs()) * time.Millisecond
+	idleTimer := time.NewTimer(idleTimeout)
+	defer idleTimer.Stop()
+
 	for {
 		select {
 		case <-a.signals.stop:
 			return
 
 		case <-conn.ConnData.SetTimeoutSignal:
-			if conn.ConnData.TimeoutMs <= 0 {
+			newTimeoutMs := conn.ConnData.TimeoutMs()
+			if newTimeoutMs <= 0 {
 				log.Debug("Connection routine closed immediately")
 				return
 			}
+			idleTimeout = time.Duration(newTimeoutMs) * time.Millisecond
+			idleTimer.Reset(idleTimeout)
 
-		case <-time.After(time.Duration(conn.ConnData.TimeoutMs) * time.Millisecond):
+		case <-idleTimer.C:
 			// timeout, quit routine
 			log.Debug("Connection routine idle timeout")
 			return
@@ -411,6 +419,7 @@ func (a *UdpDevice) connectionRoutine(conn *UdpConn) {
 			if !ok {
 				return
 			}
+			idleTimer.Reset(idleTimeout)
 			if pkt == nil {
 				continue
 			}
@@ -422,6 +431,7 @@ func (a *UdpDevice) connectionRoutine(conn *UdpConn) {
 			if !ok {
 				return
 			}
+			idleTimer.Reset(idleTimeout)
 			if pkt == nil {
 				continue
 			}
@@ -550,17 +560,21 @@ func (a *UdpDevice) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sy
 
 	var failCount int
 
+	discoveryTimer := core.NewStoppedTimer()
+	defer discoveryTimer.Stop()
+
 	for {
 		// Re-resolve server address each iteration to pick up DNS changes (e.g., after server redeployment)
 		sendAddr := server.SendAddr()
 		if sendAddr == nil {
 			log.Error("[DB] cannot resolve server address for %s, will retry", server.Hostname)
+			discoveryTimer.Reset(MinimalServerDiscoveryInterval * time.Second)
 			select {
 			case <-a.signals.stop:
 				return
 			case <-quit:
 				return
-			case <-time.After(MinimalServerDiscoveryInterval * time.Second):
+			case <-discoveryTimer.C:
 				continue
 			}
 		}
@@ -743,13 +757,14 @@ func (a *UdpDevice) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sy
 			}
 		}
 
+		discoveryTimer.Reset(MinimalServerDiscoveryInterval * time.Second)
 		select {
 		case <-a.signals.stop:
 			log.Info("server discovery sub-routine at %s receives stop signal", addrStr)
 			return
 		case <-quit:
 			return
-		case <-time.After(MinimalServerDiscoveryInterval * time.Second):
+		case <-discoveryTimer.C:
 			// wait for ServerConnectionDiscoveryInterval
 		}
 	}

@@ -392,13 +392,13 @@ func (a *UdpAC) newConnection(addr *net.UDPAddr) (conn *UdpConn) {
 		RemoteTransactionMap: make(map[uint64]*core.RemoteTransaction),
 		LocalAddr:            localAddr,
 		RemoteAddr:           addr,
-		TimeoutMs:            DefaultConnectionTimeoutMs,
 		SendQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 		RecvQueue:            make(chan *core.Packet, PacketQueueSizePerConnection),
 		BlockSignal:          make(chan struct{}),
 		SetTimeoutSignal:     make(chan struct{}),
 		StopSignal:           make(chan struct{}),
 	}
+	conn.ConnData.InitTimeoutMs(DefaultConnectionTimeoutMs)
 
 	// start connection receive routine
 	conn.ConnData.Add(1)
@@ -569,18 +569,32 @@ func (a *UdpAC) connectionRoutine(conn *UdpConn) {
 		conn.Close()
 	}()
 
+	// Cached read of TimeoutMs(); refreshed on SetTimeoutSignal.
+	// Pre-existing race at the boundary: select is uniformly random when
+	// multiple cases ready, so idleTimer.C can win over a ready queue case.
+	// Recovery differs per endpoint: AC re-establishes via serverDiscovery
+	// (this routine), DB likewise; server/agent rely on the peer reconnecting
+	// (agent re-knock; server has no client side, the next AC/DB AOL/DOL
+	// builds a fresh conn).
+	idleTimeout := time.Duration(conn.ConnData.TimeoutMs()) * time.Millisecond
+	idleTimer := time.NewTimer(idleTimeout)
+	defer idleTimer.Stop()
+
 	for {
 		select {
 		case <-a.signals.stop:
 			return
 
 		case <-conn.ConnData.SetTimeoutSignal:
-			if conn.ConnData.TimeoutMs <= 0 {
+			newTimeoutMs := conn.ConnData.TimeoutMs()
+			if newTimeoutMs <= 0 {
 				log.Debug("Connection routine closed immediately")
 				return
 			}
+			idleTimeout = time.Duration(newTimeoutMs) * time.Millisecond
+			idleTimer.Reset(idleTimeout)
 
-		case <-time.After(time.Duration(conn.ConnData.TimeoutMs) * time.Millisecond):
+		case <-idleTimer.C:
 			// timeout, quit routine
 			log.Debug("Connection routine idle timeout for %s", addrStr)
 			// If this is a server connection in cloud mode, trigger re-registration
@@ -595,6 +609,8 @@ func (a *UdpAC) connectionRoutine(conn *UdpConn) {
 			if !ok {
 				return
 			}
+			// Reset before any early-`continue` (nil/KPL/matched-tx) so all paths count as activity, deliberately matching pre-PR per-iteration time.After. Fence: udpac_test.go.
+			idleTimer.Reset(idleTimeout)
 			if pkt == nil {
 				continue
 			}
@@ -606,6 +622,7 @@ func (a *UdpAC) connectionRoutine(conn *UdpConn) {
 			if !ok {
 				return
 			}
+			idleTimer.Reset(idleTimeout)
 			if pkt == nil {
 				continue
 			}
@@ -764,13 +781,19 @@ func (a *UdpAC) maintainServerConnectionRoutine() {
 		go func() {
 			defer discoveryRoutineWg.Done()
 
+			checkTimer := time.NewTimer(MinimalServerDiscoveryInterval * time.Second)
+			defer checkTimer.Stop()
 			for {
 				select {
 				case <-a.signals.stop:
 					return
 				case <-quitCheck:
 					return
-				case <-time.After(MinimalServerDiscoveryInterval * time.Second):
+				case <-checkTimer.C:
+					// Reset before work: cloud-mode `continue` below would skip a reset placed at the bottom.
+					// Cycle ≈ interval (vs interval+work_time pre-PR). iptables fork+exec is 10-50ms — well under
+					// the 5s interval. If work ever approaches the interval, move Reset to the bottom.
+					checkTimer.Reset(MinimalServerDiscoveryInterval * time.Second)
 					// Skip fail-open logic if no servers configured (cloud mode uses registration, not discovery)
 					if len(discoveryFailStatusArr) == 0 {
 						log.Debug("Cloud mode: skipping fail-open check (no static servers configured)")
@@ -826,18 +849,22 @@ func (a *UdpAC) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sync.W
 
 	var failCount int
 
+	discoveryTimer := core.NewStoppedTimer()
+	defer discoveryTimer.Stop()
+
 	for {
 		// Re-resolve server address each iteration to pick up DNS changes.
 		// Note: ResolveHost() internally caches results for MinimalNSLookupInterval (300s)
 		sendAddr := server.SendAddr()
 		if sendAddr == nil {
 			log.Error("Cannot resolve server address for %s, will retry in %ds", server.Hostname, MinimalServerDiscoveryInterval)
+			discoveryTimer.Reset(MinimalServerDiscoveryInterval * time.Second)
 			select {
 			case <-a.signals.stop:
 				return
 			case <-quit:
 				return
-			case <-time.After(MinimalServerDiscoveryInterval * time.Second):
+			case <-discoveryTimer.C:
 				continue
 			}
 		}
@@ -1040,12 +1067,13 @@ func (a *UdpAC) serverDiscovery(server *core.UdpPeer, discoveryRoutineWg *sync.W
 			}
 		}
 
+		discoveryTimer.Reset(MinimalServerDiscoveryInterval * time.Second)
 		select {
 		case <-a.signals.stop:
 			return
 		case <-quit:
 			return
-		case <-time.After(MinimalServerDiscoveryInterval * time.Second):
+		case <-discoveryTimer.C:
 			// wait for ServerConnectionDiscoveryInterval
 		}
 	}

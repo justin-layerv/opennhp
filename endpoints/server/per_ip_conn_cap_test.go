@@ -492,7 +492,7 @@ func TestConnectionRoutine_ExitsOnEvictSignal(t *testing.T) {
 	conn.ConnData.LocalAddr = &net.UDPAddr{IP: net.IPv4zero, Port: 0}
 	conn.ConnData.CookieStore = &core.CookieStore{}
 	conn.ConnData.RemoteTransactionMap = make(map[uint64]*core.RemoteTransaction)
-	conn.ConnData.TimeoutMs = DefaultAgentConnectionTimeoutMs
+	conn.ConnData.InitTimeoutMs(DefaultAgentConnectionTimeoutMs)
 	conn.ConnData.SendQueue = make(chan *core.Packet, PacketQueueSizePerConnection)
 	conn.ConnData.RecvQueue = make(chan *core.Packet, PacketQueueSizePerConnection)
 	conn.ConnData.BlockSignal = make(chan struct{})
