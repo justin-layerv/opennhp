@@ -34,6 +34,15 @@ locals {
   # validation `name` below is built from it.
   discord_bot_domain = "discord.layerv.xyz"
   slack_bot_domain   = "slackbot.layerv.xyz"
+
+  # ALB DNSName for `discord_bot_alias` below. Centralized in a local
+  # so the `lifecycle.precondition` can reference it — `self` isn't
+  # valid in precondition blocks (only postcondition + check). Matches
+  # the `discord_bot_validation_name` / `discord_bot_validation_target`
+  # pattern in the prod sibling. Looked up post-PR-A apply via
+  # `aws elbv2 describe-load-balancers` or `terraform output -raw
+  # alb_dns_name` against qurl-integrations-infra#421's workspace.
+  discord_bot_alb_dns_name = "qurl-bot-discord-sandbox-2094914143.us-east-2.elb.amazonaws.com"
 }
 
 # Validates ACM cert in qurl-integrations sandbox account
@@ -133,5 +142,47 @@ resource "aws_route53_record" "slack_bot_alias" {
     name                   = "qurl-bot-slack-sandbox-64404749.us-east-2.elb.amazonaws.com"
     zone_id                = "Z3AADJGX6KTTL2"
     evaluate_target_health = false
+  }
+}
+
+# Public alias for the discord bot — points discord.layerv.xyz at the
+# `qurl-bot-discord-sandbox` ALB in the qurl-integrations sandbox
+# account (730883236711, us-east-2). Same posture as the slack alias
+# above: cross-account, no provider alias, ALB DNSName + ELB hosted-
+# zone ID hardcoded.
+#
+# `Z3AADJGX6KTTL2` is AWS's published ALB hosted-zone ID for us-east-2
+# (constant per https://docs.aws.amazon.com/general/latest/gr/elb.html).
+#
+# ALB DNSName lookup post-PR-A apply (qurl-integrations-infra#421):
+#   AWS_PROFILE=layerv-integrations aws elbv2 describe-load-balancers \
+#     --names qurl-bot-discord-sandbox --region us-east-2 \
+#     --query 'LoadBalancers[0].DNSName' --output text
+# OR from the qurl-integrations-infra workspace:
+#   `terraform output -raw alb_dns_name`  (PR A added this output)
+#
+# `allow_overwrite` is OMITTED here (unlike the slack alias above):
+# discord.layerv.xyz is a fresh record with no known stale predecessor,
+# so a name collision at first apply should fail loudly rather than
+# silently overwrite a record we don't know about.
+resource "aws_route53_record" "discord_bot_alias" {
+  zone_id = var.qurl_hosted_zone_id
+  name    = local.discord_bot_domain
+  type    = "A"
+
+  alias {
+    name                   = local.discord_bot_alb_dns_name
+    zone_id                = "Z3AADJGX6KTTL2"
+    evaluate_target_health = false
+  }
+
+  lifecycle {
+    precondition {
+      condition = (
+        !strcontains(local.discord_bot_alb_dns_name, "PLACEHOLDER") &&
+        endswith(local.discord_bot_alb_dns_name, ".us-east-2.elb.amazonaws.com")
+      )
+      error_message = "local.discord_bot_alb_dns_name must be a real us-east-2 ALB DNSName (currently looks unreplaced or wrong-region). Get it via `aws elbv2 describe-load-balancers --names qurl-bot-discord-sandbox --region us-east-2 --query 'LoadBalancers[0].DNSName' --output text` (or `terraform output -raw alb_dns_name` against the qurl-integrations-infra sandbox workspace)."
+    }
   }
 }
