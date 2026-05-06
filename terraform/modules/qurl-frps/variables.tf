@@ -183,6 +183,46 @@ variable "qurl_api_token_secret_arn" {
   default     = ""
 }
 
+variable "qurl_tunnel_auth_mode" {
+  description = <<-EOT
+    Selects which qurl-frps auth mode the deployed instance runs in. One of:
+
+      ""             - Legacy api mode (default). qurl-frps validates each
+                       NewProxy by calling qurl-service GET /resources/{id}
+                       and matching FRP run_id against resource.connector_id.
+                       The token in qurl_api_token_secret_arn is written to
+                       the env as QURL_API_TOKEN.
+
+      "tunnel-auth"  - Per-user API-key mode (qurl-reverse-tunnel-server PR
+                       #83). qurl-frps reads the user's lv_live_* API key
+                       from FRP Login.Metas[qurl_api_key] (or PrivilegeKey
+                       fallback) and forwards it to qurl-service POST
+                       /internal/v1/tunnel/auth. Requires the
+                       qurl-reverse-tunnel-client follow-up
+                       (layervai/qurl-reverse-tunnel-client#114) so qurl-frpc
+                       actually populates the meta. The token in
+                       qurl_api_token_secret_arn is written to the env as
+                       QURL_INTERNAL_SERVICE_TOKEN, and
+                       QURL_TUNNEL_AUTH_MODE=tunnel-auth is also exported.
+
+    Defaults to "" (legacy mode) so this module change is a no-op for
+    existing deploys; the env-shape flip only happens when the root
+    explicitly opts into tunnel-auth mode for a given environment.
+
+    "noop" is intentionally not exposed here — single-tenant deploys
+    that want to disable auth should leave qurl_api_token_secret_arn
+    empty, which produces the noop env shape via the existing branches
+    in user_data.sh.tpl.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.qurl_tunnel_auth_mode == "" || var.qurl_tunnel_auth_mode == "tunnel-auth"
+    error_message = "qurl_tunnel_auth_mode must be \"\" (legacy api mode) or \"tunnel-auth\". Other values are rejected at startup by qurl-frps; reject here to surface the typo at plan time instead of at boot."
+  }
+}
+
 # ==================== ASG Sizing ====================
 # Defaults are 1/1/1 because nhp-frps holds tunnel registrations in memory per
 # instance and Cloud Map uses MULTIVALUE routing — scaling beyond 1 today would

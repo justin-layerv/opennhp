@@ -416,6 +416,28 @@ esac
 # is written via `printf` so a rotated token containing `$`, backticks, or
 # backslashes is treated as a literal value — not re-interpreted by the
 # shell the way an unquoted `cat <<EOF` heredoc would.
+#
+# Env shape depends on qurl_tunnel_auth_mode:
+#   ""             - legacy api mode: QURL_API_URL + QURL_API_TOKEN.
+#                    qurl-frps validates each NewProxy by calling
+#                    GET /resources/{id} on qurl-service.
+#   "tunnel-auth"  - per-user API-key mode (qurl-reverse-tunnel-server #83):
+#                    QURL_API_URL + QURL_INTERNAL_SERVICE_TOKEN +
+#                    QURL_TUNNEL_AUTH_MODE=tunnel-auth. qurl-frps reads
+#                    the user's lv_live_* key from FRP Login.Metas (set
+#                    by qurl-reverse-tunnel-client #114) and forwards
+#                    it to qurl-service POST /internal/v1/tunnel/auth.
+#                    The fetched token in $QURL_API_TOKEN is the static
+#                    internal-service shared secret — both modes use the
+#                    same Secrets Manager source, just under different
+#                    env-var names downstream. The rename is a labeling
+#                    convention: it signals which qurl-frps code path
+#                    consumes the secret (/resources/{id} vs
+#                    /internal/v1/tunnel/auth) so a future refactor that
+#                    splits these credentials into separately-rotatable
+#                    secrets can land without a Terraform re-roll. The
+#                    actual trust boundary is enforced server-side by
+#                    qurl-service's per-endpoint scoping, not by this name.
 (
   umask 077
   : > /opt/layerv/qurl-frps/etc/env
@@ -424,7 +446,22 @@ esac
   # local.qurl_consumer_api_url). The variable name describes the use
   # case; the env-var name is what nhp-frps reads at runtime.
   printf 'QURL_API_URL=%s\n' '${qurl_api_internal_url}' >> /opt/layerv/qurl-frps/etc/env
+%{ if qurl_tunnel_auth_mode == "tunnel-auth" ~}
+  # Reaching this branch with $QURL_API_TOKEN unset/empty would write
+  # QURL_INTERNAL_SERVICE_TOKEN= silently — qurl-frps would then boot
+  # in tunnel-auth mode with no shared secret, surfacing as opaque
+  # 401s on /internal/v1/tunnel/auth at runtime. The token-fetch +
+  # JSON/whitespace/empty-string validation block above is gated on
+  # qurl_api_token_secret_arn != "", so what keeps this branch from
+  # ever running with an empty token is the ASG precondition in
+  # ../main.tf ("tunnel-auth requires qurl_api_token_secret_arn").
+  # If you ever loosen that precondition, also extend the validation
+  # block above to fire in tunnel-auth mode regardless of ARN.
+  printf 'QURL_TUNNEL_AUTH_MODE=tunnel-auth\n' >> /opt/layerv/qurl-frps/etc/env
+  printf 'QURL_INTERNAL_SERVICE_TOKEN=%s\n' "$QURL_API_TOKEN" >> /opt/layerv/qurl-frps/etc/env
+%{ else ~}
   printf 'QURL_API_TOKEN=%s\n' "$QURL_API_TOKEN" >> /opt/layerv/qurl-frps/etc/env
+%{ endif ~}
 )
 # Re-enable xtrace now that the secret is no longer on any command line.
 set -x

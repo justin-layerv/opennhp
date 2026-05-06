@@ -1135,6 +1135,14 @@ module "qurl_frps" {
   # backstops the structural shape on the URL itself.
   qurl_api_internal_url     = var.deploy_qurl_service ? local.qurl_consumer_api_url : ""
   qurl_api_token_secret_arn = var.deploy_qurl_service && var.qurl_internal_service_token_arn != null && var.qurl_internal_service_token_arn != "" ? var.qurl_internal_service_token_arn : ""
+  # Per-environment opt-in to qurl-frps tunnel-auth mode (per-user API-key
+  # auth via /internal/v1/tunnel/auth). Default "" keeps every existing
+  # env on legacy api mode unchanged. Sandbox flips first via
+  # `qurl_frps_tunnel_auth_mode = "tunnel-auth"` in
+  # terraform/environments/sandbox/terraform.tfvars once both
+  # consumer-side PRs land (qurl-reverse-tunnel-server #83 + #114).
+  # See module variable doc for the full env-shape contract.
+  qurl_tunnel_auth_mode = var.qurl_frps_tunnel_auth_mode
 
   # Instance configuration
   instance_type = var.frps_instance_type

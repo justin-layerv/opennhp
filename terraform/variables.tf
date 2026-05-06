@@ -1762,6 +1762,48 @@ variable "deploy_frps" {
   default     = false
 }
 
+variable "qurl_frps_tunnel_auth_mode" {
+  description = <<-EOT
+    Selects which qurl-frps auth mode the deployed FRP server runs in.
+
+      ""             - Legacy api mode. qurl-frps validates each NewProxy
+                       by calling qurl-service GET /resources/{id} and
+                       matching FRP run_id against resource.connector_id.
+                       Default — preserves existing behavior for every
+                       env that hasn't opted in.
+
+      "tunnel-auth"  - Per-user API-key mode. qurl-frps reads the user's
+                       lv_live_* API key from FRP Login.Metas[qurl_api_key]
+                       and forwards it to qurl-service POST
+                       /internal/v1/tunnel/auth. Enables per-key
+                       revocation, per-key rate limit, and quota-at-auth-
+                       time. Required for the qurl-integrations Slack-bot
+                       use case (Slack bot connects with its own API key
+                       and gets scoped subdomains).
+
+    Hard cross-repo prerequisites before flipping a non-sandbox env to
+    "tunnel-auth":
+      * qurl-reverse-tunnel-server #83 merged AND `frps_image_tag` bumped
+        to a build that includes it. Without this the qurl-frps binary
+        rejects QURL_TUNNEL_AUTH_MODE=tunnel-auth as an unknown mode and
+        the ASG instance fails startup.
+      * qurl-reverse-tunnel-client #114 released AND fleet upgraded.
+        Without this qurl-frpc still ships md5-hashed PrivilegeKey
+        instead of populating Login.Metas[qurl_api_key]; the server
+        rejects every Login with `owner_missing`.
+
+    See `terraform/modules/qurl-frps/variables.tf::qurl_tunnel_auth_mode`
+    for the env-shape this drives in user_data.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.qurl_frps_tunnel_auth_mode == "" || var.qurl_frps_tunnel_auth_mode == "tunnel-auth"
+    error_message = "qurl_frps_tunnel_auth_mode must be \"\" (legacy api mode) or \"tunnel-auth\". Other values are rejected at startup by qurl-frps; reject here to surface the typo at plan time."
+  }
+}
+
 variable "frps_instance_type" {
   description = "EC2 instance type for FRP server"
   type        = string

@@ -66,6 +66,7 @@ locals {
     frps_subdomain_host       = var.frps_subdomain_host
     qurl_api_internal_url     = var.qurl_api_internal_url
     qurl_api_token_secret_arn = var.qurl_api_token_secret_arn
+    qurl_tunnel_auth_mode     = var.qurl_tunnel_auth_mode
     ssm_image_tag_param       = aws_ssm_parameter.image_tag.name
     # The user_data fallback command and the IAM grant must point at the
     # same bucket. Threading both from root (plugin_bucket_name + _arn)
@@ -473,6 +474,24 @@ resource "aws_autoscaling_group" "frps" {
       # QURL_API_URL, which silently misconfigures the FRP auth plugin.
       condition     = var.qurl_api_token_secret_arn == "" || var.qurl_api_internal_url != ""
       error_message = "qurl_api_internal_url must be set when qurl_api_token_secret_arn is configured — otherwise the FRP auth plugin has a token but no URL to validate against."
+    }
+
+    precondition {
+      # tunnel-auth mode requires the internal-service shared secret. The
+      # user_data token-fetch + JSON/whitespace/empty-string validation
+      # block is gated on qurl_api_token_secret_arn != "", so a caller that
+      # opts into tunnel-auth without a token ARN would skip every check
+      # and write QURL_INTERNAL_SERVICE_TOKEN= (empty) to the env. The
+      # qurl-frps resolver then can't authenticate /internal/v1/tunnel/auth
+      # calls, surfacing as opaque 401s at runtime — fail at plan time
+      # instead, mirroring the qurl_api_internal_url precondition above.
+      #
+      # Transitively requires qurl_api_internal_url too: forcing the token
+      # ARN non-empty here triggers the precondition above, which in turn
+      # demands the URL. So tunnel-auth mode is fenced against both an
+      # empty token AND an empty URL without an explicit third check here.
+      condition     = var.qurl_tunnel_auth_mode != "tunnel-auth" || var.qurl_api_token_secret_arn != ""
+      error_message = "qurl_tunnel_auth_mode = \"tunnel-auth\" requires qurl_api_token_secret_arn — the per-user-key resolver still needs the internal-service shared secret to call qurl-service /internal/v1/tunnel/auth."
     }
 
     precondition {
