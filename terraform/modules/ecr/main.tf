@@ -2192,14 +2192,17 @@ resource "aws_iam_role_policy_attachment" "qurl_link_static" {
 #   - SSMACMLambda:        ssm:PutParameter (for M2M token cache)
 #   - terraform_apply_*:   cloudwatch:PutMetricData (for smoke metric)
 #
-# Tier 3 (22_server_logs_test.go) uses CloudWatch Logs Insights, which
-# requires actions not granted by the broad CloudWatchRead statement
+# Tier 1/3 smoke tests use CloudWatch Logs Insights, which requires
+# actions not granted by the broad CloudWatchRead statement
 # (Describe/Get/List/FilterLogEvents/StartLiveTail). The policy below
-# grants those actions narrowly: StartQuery is scoped to the nhp-server
-# log group ARN; GetQueryResults/StopQuery operate on query IDs (not
-# resources) so remain unscoped.
+# grants those actions narrowly: StartQuery is scoped to the per-log-group
+# ARNs the smoke suite queries (nhp-server cell0 log group + AC log group);
+# GetQueryResults/StopQuery operate on query IDs (not resources) so remain
+# unscoped.
 #
-# If a future test introduces another new action, add another dedicated
+# When a new smoke test introduces a query against a log group not listed
+# below, extend the StartQuery Resource list — do NOT widen to "*".
+# When a new smoke test needs a brand-new action, add another dedicated
 # aws_iam_role_policy scoped to just that action — do not recreate the
 # broad smoke_test_read policy this block replaces.
 # ============================================================================
@@ -2212,10 +2215,13 @@ resource "aws_iam_role_policy" "smoke_test_cwl_insights" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "StartInsightsQueryOnNHPServerLogGroup"
-        Effect   = "Allow"
-        Action   = ["logs:StartQuery"]
-        Resource = ["arn:aws:logs:${local.region}:${local.account_id}:log-group:/layerv/nhp/${var.environment}/cell0/server:*"]
+        Sid    = "StartInsightsQueryOnNHPLogGroups"
+        Effect = "Allow"
+        Action = ["logs:StartQuery"]
+        Resource = [
+          "arn:aws:logs:${local.region}:${local.account_id}:log-group:/layerv/nhp/${var.environment}/cell0/server:*",
+          "arn:aws:logs:${local.region}:${local.account_id}:log-group:/layerv/nhp/${var.environment}/ac:*",
+        ]
       },
       {
         Sid      = "ReadAndStopInsightsQuery"
