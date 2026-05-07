@@ -366,6 +366,13 @@ locals {
 # ============================================================================
 
 # ECR Repositories - consolidated with for_each
+#
+# `depends_on` forces the IAM perms granted in
+# `aws_iam_policy.terraform_apply_services` (notably `ecr:CreateRepository`)
+# to land before any first-time repo create on this for_each. Without it,
+# Terraform schedules the policy update and the new repo create in parallel
+# and the create races against IAM propagation. Existing repos see no churn
+# from the dependency — `depends_on` doesn't trigger replacement.
 resource "aws_ecr_repository" "main" {
   for_each = var.is_primary_account ? toset(local.ecr_repos) : []
 
@@ -384,6 +391,8 @@ resource "aws_ecr_repository" "main" {
   lifecycle {
     prevent_destroy = true
   }
+
+  depends_on = [aws_iam_role_policy_attachment.terraform_apply_services]
 }
 
 resource "aws_ecr_lifecycle_policy" "main" {
@@ -1692,10 +1701,20 @@ resource "aws_iam_policy" "terraform_apply_services" {
         Resource = "arn:aws:s3:::layerv-nhp-*-status-page-*/*"
       },
       {
-        # ECR lifecycle and repository policy management for terraform-managed repos
+        # ECR lifecycle and repository policy management for terraform-managed repos.
+        #
+        # CreateRepository is scoped to the `layerv/` namespace so this role can
+        # add new repos to `local.ecr_repos` without out-of-band manual bootstrap.
+        # Matches the rest of `terraform_apply_services` (terraform-apply-equivalent
+        # within the env). Apply ordering: `aws_ecr_repository.main` declares
+        # `depends_on` on this attachment so the new perm is in place before any
+        # CreateRepository call. See blast-radius comment in
+        # `terraform/variables.tf::qurl_reverse_tunnel_server_github_repo` for the
+        # threat model on the role's overall scope.
         Sid    = "ECRManagement"
         Effect = "Allow"
         Action = [
+          "ecr:CreateRepository",
           "ecr:PutLifecyclePolicy",
           "ecr:DeleteLifecyclePolicy",
           "ecr:SetRepositoryPolicy",
