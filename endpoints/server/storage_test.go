@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -200,6 +201,12 @@ type mockStorageBackend struct {
 	assignments map[string]*ACAssignment
 	callCount   int
 	mu          sync.Mutex
+
+	// saveOverride, when non-nil, is called instead of the normal CAS save
+	// path. Lets tests inject deterministic SaveACAssignment outcomes
+	// (e.g., simulated VersionConflictError on the refresh path) without
+	// racing two goroutines for timing.
+	saveOverride func(*ACAssignment) error
 }
 
 func newMockStorageBackend() *mockStorageBackend {
@@ -238,6 +245,21 @@ func (m *mockStorageBackend) GetResourceByACID(ctx context.Context, acID string)
 func (m *mockStorageBackend) SaveACAssignment(ctx context.Context, assignment *ACAssignment) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.saveOverride != nil {
+		return m.saveOverride(assignment)
+	}
+	// Mirror DynamoDBStorage's optimistic-locking conditional so tests
+	// structurally fence the version-bump invariant: a Save with Version
+	// not equal to existing.Version+1 (or != 1 for a brand-new row) is a
+	// VersionConflictError. Without this, refreshAssignmentTTL's silent
+	// Version-not-bumped no-op (the latent bug fixed in #1681) would
+	// pass tests against this mock even though prod DDB rejected the
+	// write.
+	if existing, ok := m.assignments[assignment.ACID]; ok {
+		if assignment.Version != existing.Version+1 {
+			return NewVersionConflictError(fmt.Sprintf("expected version %d, got %d", existing.Version+1, assignment.Version))
+		}
+	}
 	m.assignments[assignment.ACID] = assignment
 	return nil
 }

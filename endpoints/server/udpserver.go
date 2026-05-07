@@ -215,10 +215,17 @@ type UdpServer struct {
 	// Used to filter stale AC assignments pointing to terminated servers.
 	cloudMap *CloudMapClient
 
-	// EC2 instance identity (populated from IMDS in cloud mode)
-	instanceID string // EC2 instance ID (e.g., "i-0abc123")
-	instanceAZ string // Availability zone (e.g., "us-east-2a")
-	asgName    string // ASG name from IMDS Name tag (blue/green filtering)
+	// EC2 instance identity (populated from IMDS in cloud mode).
+	// Boot may write a partial set if AZ/Name fetch hiccups; the refresh
+	// goroutine re-fetches in that case via fetchInstanceIdentityFromIMDS,
+	// so these are NOT effectively-immutable post-Start. Read concurrently
+	// by packet-handler goroutines (every NHP_AAK reads instanceAZ and
+	// instanceID). Always go through InstanceID()/InstanceAZ()/ASGName() —
+	// the bare field is unprotected. Issue #1681 cr round 3.
+	instanceIdentityMu sync.RWMutex
+	instanceID         string // EC2 instance ID (e.g., "i-0abc123")
+	instanceAZ         string // Availability zone (e.g., "us-east-2a")
+	asgName            string // ASG name from IMDS Name tag (blue/green filtering)
 
 	// TTL refresh throttle: tracks last refresh time per AC ID to prevent
 	// excessive DynamoDB writes from frequent AC re-registrations.
@@ -562,9 +569,12 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	}
 	s.localMac = utils.GetMacAddress(s.localIp)
 
-	// In cloud mode, fetch instance identity from IMDS and register public key with Cloud Map
+	// In cloud mode, fetch instance identity from IMDS and register public key with Cloud Map.
+	// Boot-time call retries on transient failures; the refresh routine started below
+	// re-asserts every cloudMapRegisterRefreshInterval so a registration drop (issue #1681)
+	// self-heals.
 	if cloudMode && s.cloudMap != nil {
-		s.registerWithCloudMap()
+		s.registerWithCloudMapWithRetry()
 	}
 
 	s.recordServerStartup()
@@ -642,6 +652,13 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	go s.sendMessageRoutine()
 	go s.recvMessageRoutine()
 
+	// Cloud Map registration self-healing routine. Started after s.signals.stop
+	// is initialized so the select inside the routine isn't reading a nil channel.
+	if cloudMode && s.cloudMap != nil {
+		s.wg.Add(1)
+		go s.cloudMapRegisterRefreshRoutine()
+	}
+
 	s.running.Store(true)
 	return nil
 }
@@ -665,11 +682,11 @@ func (s *UdpServer) Stop() {
 	// Best-effort cleanup: remove this server from AC assignments
 	s.cleanupOwnedAssignments()
 	// Best-effort cleanup: deregister from Cloud Map so peers stop forwarding to us
-	if s.cloudMap != nil && s.instanceID != "" {
+	if instanceID := s.InstanceID(); s.cloudMap != nil && instanceID != "" {
 		drCtx, drCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer drCancel()
-		if err := s.cloudMap.DeregisterInstance(drCtx, s.instanceID); err != nil {
-			log.Warning("Failed to deregister instance %s from Cloud Map: %v", s.instanceID, err)
+		if err := s.cloudMap.DeregisterInstance(drCtx, instanceID); err != nil {
+			log.Warning("Failed to deregister instance %s from Cloud Map: %v", instanceID, err)
 			if s.metrics != nil {
 				s.metrics.IncrCounter(MetricCloudMapDeregisterFailure)
 			}
@@ -936,35 +953,142 @@ func (s *UdpServer) drainACConnections() {
 	log.Info("Shutdown: drained %d/%d AC connections", sent, len(conns))
 }
 
-// registerWithCloudMap fetches EC2 instance identity from IMDS and registers
-// this server's public key with Cloud Map. This enables DiscoverServerInstances
-// to return full ServerInfo including the public key for NHP_ARD.
-func (s *UdpServer) registerWithCloudMap() {
+// Cloud Map registration self-healing tunables (issue #1681). Boot retry +
+// periodic refresh together ensure a transient IMDS / Cloud Map failure at
+// boot doesn't leave the server permanently absent from auto-assignment.
+// Per-call timeout bounds a hung API so the refresh goroutine can't wedge.
+// Worst-case boot delay if Cloud Map is fully down: attempts × timeout +
+// (attempts-1) × backoff = 3 × 5s + 2 × 2s = 19s.
+const (
+	cloudMapRegisterInitialAttempts = 3
+	cloudMapRegisterInitialBackoff  = 2 * time.Second
+	cloudMapRegisterRefreshInterval = 5 * time.Minute
+	cloudMapRegisterTimeout         = 5 * time.Second
+)
+
+// registerWithCloudMap fetches EC2 instance identity from IMDS (once)
+// and asserts this server's public key in Cloud Map. Safe to call
+// repeatedly: IMDS values are cached on the receiver after the first
+// successful fetch, and RegisterInstance is idempotent under identical
+// attributes. Returns nil on success, or the first non-recoverable
+// error encountered. The boot-time caller retries on error; the
+// refresh routine logs and continues on error.
+//
+// Re-fetches IMDS when AZ is empty even if instanceID is set: a partial
+// IMDS fetch (instance-id succeeded, AZ failed) would otherwise leave
+// the server registered with an empty AZ for its lifetime, breaking
+// the AZ-distribution heuristic in maybeGrowAssignedServers downstream.
+func (s *UdpServer) registerWithCloudMap() error {
+	instanceID, instanceAZ, asgName := s.snapshotInstanceIdentity()
+	if instanceID == "" || instanceAZ == "" {
+		if err := s.fetchInstanceIdentityFromIMDS(); err != nil {
+			return err
+		}
+		instanceID, instanceAZ, asgName = s.snapshotInstanceIdentity()
+	}
+
+	// Re-assert with current attributes. RegisterInstance REPLACES all
+	// attributes for the instance ID, so we must include IP, AZ, port,
+	// pubkey on every call.
+	attrs := map[string]string{
+		CloudMapAttrIPv4: s.localIp,
+		CloudMapAttrAZ:   instanceAZ,
+		CloudMapAttrPort: strconv.Itoa(s.config.ListenPort),
+		CloudMapAttrKey:  s.device.PublicKeyBase64(),
+	}
+	if asgName != "" {
+		attrs[CloudMapAttrASG] = asgName
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cloudMapRegisterTimeout)
+	defer cancel()
+
+	if err := s.cloudMap.RegisterInstanceAttributes(ctx, instanceID, attrs); err != nil {
+		return fmt.Errorf("Cloud Map RegisterInstance: %w", err)
+	}
+	return nil
+}
+
+// InstanceID returns the EC2 instance ID, or "" if IMDS hasn't completed.
+// Safe for concurrent reads alongside refresh-time IMDS re-fetch.
+func (s *UdpServer) InstanceID() string {
+	s.instanceIdentityMu.RLock()
+	defer s.instanceIdentityMu.RUnlock()
+	return s.instanceID
+}
+
+// InstanceAZ returns the EC2 availability zone, or "" if IMDS hasn't
+// completed (or partially completed without AZ — the refresh routine
+// re-fetches in that case).
+func (s *UdpServer) InstanceAZ() string {
+	s.instanceIdentityMu.RLock()
+	defer s.instanceIdentityMu.RUnlock()
+	return s.instanceAZ
+}
+
+// ASGName returns the ASG name from the IMDS Name tag, or "" if IMDS
+// hasn't completed or the Name tag was unset. Used by blue/green ASG
+// filtering on the auto-assign and refresh-grow paths.
+func (s *UdpServer) ASGName() string {
+	s.instanceIdentityMu.RLock()
+	defer s.instanceIdentityMu.RUnlock()
+	return s.asgName
+}
+
+// snapshotInstanceIdentity returns all three identity fields under a single
+// RLock, so callers that read multiple fields together (e.g.
+// registerWithCloudMap) get a consistent snapshot rather than three
+// independently-acquired reads that could straddle a writer.
+func (s *UdpServer) snapshotInstanceIdentity() (instanceID, instanceAZ, asgName string) {
+	s.instanceIdentityMu.RLock()
+	defer s.instanceIdentityMu.RUnlock()
+	return s.instanceID, s.instanceAZ, s.asgName
+}
+
+// fetchInstanceIdentityFromIMDS populates s.instanceID, s.instanceAZ,
+// and s.asgName from EC2 IMDSv2. Splits the IMDS reads off of
+// registerWithCloudMap so the registration path can re-assert without
+// re-polling IMDS once identity is known. Returns an error iff the
+// instance ID could not be fetched — without it Cloud Map registration
+// cannot proceed. AZ and ASG fall back to defaults on failure (the
+// server still registers with reduced metadata).
+//
+// Holds instanceIdentityMu for the entire IMDS fetch + commit so concurrent
+// readers (msghandler.go's NHP_AAK path reads instanceAZ on every knock)
+// never observe a torn snapshot mid-fetch. The Lock is held across HTTP
+// round-trips to IMDS link-local (169.254.169.254), which the imdsV2*
+// helpers cap at the 2s client timeout — bounded, and the alternative
+// (pre-fetch under no lock, commit under lock) would still need a Lock
+// for the commit and would not measurably help reader contention.
+func (s *UdpServer) fetchInstanceIdentityFromIMDS() error {
+	s.instanceIdentityMu.Lock()
+	defer s.instanceIdentityMu.Unlock()
+
 	imdsClient := &http.Client{Timeout: 2 * time.Second}
 
 	// Obtain a single IMDS token and reuse it for all metadata fetches
 	// (avoids 3 separate token PUT requests).
 	token, err := imdsV2Token(imdsClient)
 	if err != nil {
-		log.Error("Failed to get IMDS token: %v (Cloud Map registration skipped, auto-assignment will use hostname fallback)", err)
-		return
+		return fmt.Errorf("IMDS token: %w", err)
 	}
 
-	// Fetch instance ID
 	instanceID, err := imdsV2GetWithToken(imdsClient, token, "http://169.254.169.254/latest/meta-data/instance-id")
 	if err != nil {
-		log.Error("Failed to get instance ID from IMDS: %v (Cloud Map registration skipped, auto-assignment will use hostname fallback)", err)
-		return
+		return fmt.Errorf("IMDS instance-id: %w", err)
 	}
 	s.instanceID = strings.TrimSpace(instanceID)
 
-	// Fetch AZ
 	az, err := imdsV2GetWithToken(imdsClient, token, "http://169.254.169.254/latest/meta-data/placement/availability-zone")
 	if err != nil {
-		log.Warning("Failed to get AZ from IMDS: %v", err)
-		az = "unknown"
+		// Leave s.instanceAZ unchanged so the next refresh re-tries the fetch.
+		// The registerWithCloudMap gate keys on s.instanceAZ == "" to retry
+		// IMDS rather than persisting an "unknown" sentinel for the process
+		// lifetime (which would break AZ-distribution downstream).
+		log.Warning("Failed to get AZ from IMDS: %v (will retry on next refresh)", err)
+	} else if trimmed := strings.TrimSpace(az); trimmed != "" {
+		s.instanceAZ = trimmed
 	}
-	s.instanceAZ = strings.TrimSpace(az)
 
 	// Fetch ASG name from IMDS Name tag for blue/green filtering.
 	// The Name tag matches the ASG name (e.g., "layerv-nhp-sandbox-server" vs
@@ -984,29 +1108,90 @@ func (s *UdpServer) registerWithCloudMap() {
 	} else {
 		s.asgName = trimmed
 	}
+	return nil
+}
 
-	// Register with Cloud Map including PUBLIC_KEY
-	// IMPORTANT: RegisterInstance REPLACES all attributes. Must re-include IP, AZ, port.
-	attrs := map[string]string{
-		CloudMapAttrIPv4: s.localIp,
-		CloudMapAttrAZ:   s.instanceAZ,
-		CloudMapAttrPort: strconv.Itoa(s.config.ListenPort),
-		CloudMapAttrKey:  s.device.PublicKeyBase64(),
+// registerWithCloudMapWithRetry calls registerWithCloudMap with bounded
+// retries at process start. The retry budget covers a transient IMDS or
+// Cloud Map hiccup that would otherwise leave the server permanently
+// absent from auto-assignment until the next deploy (issue #1681). After
+// exhaustion, the periodic refresh routine takes over.
+func (s *UdpServer) registerWithCloudMapWithRetry() {
+	s.runRegisterWithRetry(s.registerWithCloudMap, cloudMapRegisterInitialAttempts, cloudMapRegisterInitialBackoff)
+}
+
+// runRegisterWithRetry is the parameterized retry loop that
+// registerWithCloudMapWithRetry delegates to. Split out so tests can
+// drive the loop with a fake register fn and a near-zero backoff
+// without paying boot timing in the test path.
+func (s *UdpServer) runRegisterWithRetry(register func() error, attempts int, backoff time.Duration) {
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err := register()
+		if err == nil {
+			instanceID, instanceAZ, asgName := s.snapshotInstanceIdentity()
+			// %.12s safely truncates to 12 chars without panicking on a
+			// shorter pubkey (a 32-byte key always exceeds 12 base64 chars,
+			// but guarded against future encoding changes anyway).
+			log.Info("Registered with Cloud Map: instance=%s, az=%s, asg=%s, pubkey=%.12s...",
+				instanceID, instanceAZ, asgName, s.device.PublicKeyBase64())
+			return
+		}
+		if attempt == attempts {
+			log.Error("Cloud Map registration failed after %d attempts: %v (refresh routine will continue retrying every %s; auto-assignment falls back to hostname-only identity until then)",
+				attempts, err, cloudMapRegisterRefreshInterval)
+			if s.metrics != nil {
+				s.metrics.IncrCounter(MetricCloudMapRegisterFailure)
+			}
+			return
+		}
+		log.Warning("Cloud Map registration attempt %d/%d failed: %v (retrying in %s)",
+			attempt, attempts, err, backoff)
+		time.Sleep(backoff)
 	}
-	if s.asgName != "" {
-		attrs[CloudMapAttrASG] = s.asgName
+}
+
+// cloudMapRegisterRefreshRoutine periodically re-asserts the Cloud Map
+// registration so a one-shot boot failure (or external drift) recovers
+// without operator intervention (issue #1681). Cadence is
+// cloudMapRegisterRefreshInterval. Exits on s.signals.stop.
+func (s *UdpServer) cloudMapRegisterRefreshRoutine() {
+	ticker := time.NewTicker(cloudMapRegisterRefreshInterval)
+	defer ticker.Stop()
+	s.runRefreshLoop(ticker.C, s.registerWithCloudMap)
+}
+
+// runRefreshLoop is the parameterized body that cloudMapRegisterRefreshRoutine
+// delegates to. Split out so tests can drive ticks via a buffered channel and
+// inject a stub register func instead of waiting on a real 5-minute timer and
+// hitting the AWS SDK.
+func (s *UdpServer) runRefreshLoop(tickCh <-chan time.Time, register func() error) {
+	defer s.wg.Done()
+	for {
+		select {
+		case <-s.signals.stop:
+			return
+		case <-tickCh:
+			// Don't re-register after Stop() has begun — Stop() sets
+			// s.running=false before calling DeregisterInstance, and
+			// drainACConnections holds the close(stop) until the drain
+			// completes. A tick landing in that window would silently
+			// re-assert the registration after deregister, negating the
+			// "deregister before terminating" guarantee.
+			if !s.running.Load() {
+				return
+			}
+			if err := register(); err != nil {
+				log.Warning("Cloud Map registration refresh failed: %v", err)
+				if s.metrics != nil {
+					s.metrics.IncrCounter(MetricCloudMapRegisterRefreshFailure)
+				}
+				continue
+			}
+			if s.metrics != nil {
+				s.metrics.IncrCounter(MetricCloudMapRegisterRefresh)
+			}
+		}
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if err := s.cloudMap.RegisterInstanceAttributes(ctx, s.instanceID, attrs); err != nil {
-		log.Error("Failed to register public key with Cloud Map: %v (auto-assignment may not include this server's key)", err)
-		return
-	}
-
-	log.Info("Registered with Cloud Map: instance=%s, az=%s, asg=%s, pubkey=%s...",
-		s.instanceID, s.instanceAZ, s.asgName, s.device.PublicKeyBase64()[:12])
 }
 
 // imdsV2Token obtains an IMDSv2 session token via PUT.

@@ -328,7 +328,11 @@ func (c *CloudMapClient) RegisterInstanceAttributes(ctx context.Context, instanc
 		return fmt.Errorf("cloud map RegisterInstance failed: %w", err)
 	}
 
-	log.Info("Registered Cloud Map instance %s with %d attributes", instanceID, len(attrs))
+	// Debug-level: this is called on every refresh tick (every 5 min per
+	// server). The boot-time INFO "Registered with Cloud Map: ..." in
+	// registerWithCloudMapWithRetry is the once-per-process audit log.
+	// Refresh-tick failures still log at WARNING / increment a metric.
+	log.Debug("Registered Cloud Map instance %s with %d attributes", instanceID, len(attrs))
 	return nil
 }
 

@@ -86,7 +86,278 @@ func testPrivateKey() []byte {
 	return key
 }
 
-// TestAddACPeer_NilMap tests that AddACPeer initializes the map when nil.
+// TestRunRegisterWithRetry_FirstCallSucceeds fences the happy path:
+// a single successful register call returns immediately with no
+// MetricCloudMapRegisterFailure increment.
+func TestRunRegisterWithRetry_FirstCallSucceeds(t *testing.T) {
+	mp := metrics.NewPublisherForTest(t)
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("NewDevice returned nil")
+	}
+	defer device.Stop()
+	s := &UdpServer{metrics: mp, device: device}
+
+	calls := 0
+	register := func() error {
+		calls++
+		return nil
+	}
+	s.runRegisterWithRetry(register, 3, time.Millisecond)
+
+	if calls != 1 {
+		t.Errorf("expected 1 register call, got %d", calls)
+	}
+	counters, _ := mp.CountersForTest(t)
+	if counters[MetricCloudMapRegisterFailure] != 0 {
+		t.Errorf("expected no failure metric on first-call success, got %v", counters[MetricCloudMapRegisterFailure])
+	}
+}
+
+// TestRunRegisterWithRetry_RetriesThenSucceeds fences the transient-hiccup
+// recovery path: register errors twice then succeeds on attempt 3 — exactly
+// the prod scenario that #1681 was vulnerable to. No failure metric should
+// fire because the budget didn't exhaust.
+func TestRunRegisterWithRetry_RetriesThenSucceeds(t *testing.T) {
+	mp := metrics.NewPublisherForTest(t)
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("NewDevice returned nil")
+	}
+	defer device.Stop()
+	s := &UdpServer{metrics: mp, device: device}
+
+	calls := 0
+	register := func() error {
+		calls++
+		if calls < 3 {
+			return fmt.Errorf("transient failure %d", calls)
+		}
+		return nil
+	}
+	s.runRegisterWithRetry(register, 3, time.Millisecond)
+
+	if calls != 3 {
+		t.Errorf("expected 3 register calls (2 fail + 1 success), got %d", calls)
+	}
+	counters, _ := mp.CountersForTest(t)
+	if counters[MetricCloudMapRegisterFailure] != 0 {
+		t.Errorf("expected no failure metric when budget didn't exhaust, got %v", counters[MetricCloudMapRegisterFailure])
+	}
+}
+
+// TestRunRegisterWithRetry_ExhaustsBudget fences the prod-degraded path:
+// every attempt fails. The failure metric must increment exactly once
+// (page-worthy signal) and the loop must exit so the refresh routine can
+// take over.
+func TestRunRegisterWithRetry_ExhaustsBudget(t *testing.T) {
+	mp := metrics.NewPublisherForTest(t)
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("NewDevice returned nil")
+	}
+	defer device.Stop()
+	s := &UdpServer{metrics: mp, device: device}
+
+	calls := 0
+	register := func() error {
+		calls++
+		return errors.New("Cloud Map down")
+	}
+	s.runRegisterWithRetry(register, 3, time.Millisecond)
+
+	if calls != 3 {
+		t.Errorf("expected 3 register calls (full budget), got %d", calls)
+	}
+	counters, _ := mp.CountersForTest(t)
+	if counters[MetricCloudMapRegisterFailure] != 1 {
+		t.Errorf("expected MetricCloudMapRegisterFailure=1 on exhaustion, got %v", counters[MetricCloudMapRegisterFailure])
+	}
+}
+
+// TestCloudMapRegisterRefreshRoutine_ExitsOnStop fences the shutdown path:
+// the refresh goroutine must return promptly when s.signals.stop is closed,
+// even mid-tick. Without this, server shutdown would be blocked on the
+// 5-minute ticker for any AC currently in the refresh loop.
+func TestCloudMapRegisterRefreshRoutine_ExitsOnStop(t *testing.T) {
+	s := &UdpServer{}
+	s.signals.stop = make(chan struct{})
+	close(s.signals.stop) // pre-close so the routine exits on first iteration
+
+	s.wg.Add(1)
+	done := make(chan struct{})
+	go func() {
+		s.cloudMapRegisterRefreshRoutine()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// expected
+	case <-time.After(time.Second):
+		t.Fatal("cloudMapRegisterRefreshRoutine did not exit within 1s after stop closed")
+	}
+	s.wg.Wait()
+}
+
+// TestRunRefreshLoop_TickEmitsMetrics fences the refresh goroutine's per-tick
+// behavior: a successful register call increments
+// MetricCloudMapRegisterRefresh; a failing call increments
+// MetricCloudMapRegisterRefreshFailure (without exiting the loop). Without
+// this fence a regression in the per-tick handling would only be visible in
+// CloudWatch — the heartbeat alarm would catch it eventually but not at
+// review time.
+func TestRunRefreshLoop_TickEmitsMetrics(t *testing.T) {
+	mp := metrics.NewPublisherForTest(t)
+	s := &UdpServer{metrics: mp}
+	s.signals.stop = make(chan struct{})
+	s.running.Store(true) // simulate post-Start state so tick handler doesn't early-return
+
+	tickCh := make(chan time.Time, 2)
+	var calls int32
+	register := func() error {
+		n := atomic.AddInt32(&calls, 1)
+		if n == 2 {
+			return errors.New("simulated Cloud Map RegisterInstance failure")
+		}
+		return nil
+	}
+
+	s.wg.Add(1)
+	done := make(chan struct{})
+	go func() {
+		s.runRefreshLoop(tickCh, register)
+		close(done)
+	}()
+
+	tickCh <- time.Now() // success tick
+	tickCh <- time.Now() // failure tick
+
+	// Wait for both ticks to be drained. The select's ordering is
+	// nondeterministic, but with 2 ticks queued and stop still open, the
+	// loop drains both before it can pick stop. Poll the call count to
+	// avoid sleeping past tick processing.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&calls) >= 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("expected 2 register calls, got %d", got)
+	}
+
+	close(s.signals.stop)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("runRefreshLoop did not exit within 1s after stop closed")
+	}
+	s.wg.Wait()
+
+	counters, _ := mp.CountersForTest(t)
+	if counters[MetricCloudMapRegisterRefresh] != 1 {
+		t.Errorf("expected MetricCloudMapRegisterRefresh=1, got %v", counters[MetricCloudMapRegisterRefresh])
+	}
+	if counters[MetricCloudMapRegisterRefreshFailure] != 1 {
+		t.Errorf("expected MetricCloudMapRegisterRefreshFailure=1, got %v", counters[MetricCloudMapRegisterRefreshFailure])
+	}
+}
+
+// TestRunRefreshLoop_SkipsWhenNotRunning fences the Stop()-race guard: a
+// tick that lands after s.running has been set to false (Stop has begun
+// but stop channel not yet closed) must NOT call the registrar — that
+// would re-assert the registration after Stop's DeregisterInstance,
+// negating the "deregister before terminating" guarantee.
+func TestRunRefreshLoop_SkipsWhenNotRunning(t *testing.T) {
+	mp := metrics.NewPublisherForTest(t)
+	s := &UdpServer{metrics: mp}
+	s.signals.stop = make(chan struct{})
+	// running is false (zero value); represents post-Stop, pre-stop-close window
+
+	tickCh := make(chan time.Time, 1)
+	var calls int32
+	register := func() error {
+		atomic.AddInt32(&calls, 1)
+		return nil
+	}
+
+	s.wg.Add(1)
+	done := make(chan struct{})
+	go func() {
+		s.runRefreshLoop(tickCh, register)
+		close(done)
+	}()
+
+	tickCh <- time.Now()
+
+	select {
+	case <-done:
+		// Expected: tick handler sees !s.running and returns
+	case <-time.After(time.Second):
+		t.Fatal("runRefreshLoop did not exit within 1s after tick with running=false")
+	}
+	s.wg.Wait()
+
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Errorf("expected 0 register calls when running=false, got %d", got)
+	}
+	counters, _ := mp.CountersForTest(t)
+	if counters[MetricCloudMapRegisterRefresh] != 0 {
+		t.Errorf("expected no refresh metric when running=false, got %v", counters[MetricCloudMapRegisterRefresh])
+	}
+}
+
+// TestInstanceIdentityAccessors_NoDataRace fences the cr round-3 fix for the
+// data race on s.instanceID/instanceAZ/asgName: refresh-time IMDS re-fetch
+// is concurrent with packet-handler reads of these fields. Without the
+// instanceIdentityMu, `go test -race` flags this; with it, the test is a
+// quiet pass (and would catch a future change that drops the lock).
+func TestInstanceIdentityAccessors_NoDataRace(t *testing.T) {
+	s := &UdpServer{}
+	stop := make(chan struct{})
+	var readers, writers sync.WaitGroup
+
+	// 4 reader goroutines hammer the getters (the same pattern used by
+	// every NHP_AAK on the AAK handler path).
+	for i := 0; i < 4; i++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_ = s.InstanceID()
+					_ = s.InstanceAZ()
+					_ = s.ASGName()
+					_, _, _ = s.snapshotInstanceIdentity()
+				}
+			}
+		}()
+	}
+
+	// 1 writer goroutine simulates fetchInstanceIdentityFromIMDS by taking
+	// the write lock and updating all three fields together.
+	writers.Add(1)
+	go func() {
+		defer writers.Done()
+		for i := 0; i < 200; i++ {
+			s.instanceIdentityMu.Lock()
+			s.instanceID = fmt.Sprintf("i-%016x", i)
+			s.instanceAZ = "us-east-2a"
+			s.asgName = "layerv-nhp-test-server"
+			s.instanceIdentityMu.Unlock()
+		}
+	}()
+
+	writers.Wait()
+	close(stop)
+	readers.Wait()
+}
+
 // This is critical for cloud mode where ac.toml is not loaded and updateACPeers
 // is never called, leaving acPeerMap nil.
 func TestAddACPeer_NilMap(t *testing.T) {

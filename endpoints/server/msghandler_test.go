@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -293,6 +294,410 @@ func TestAutoAssignAC_FiltersByASG(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestRefreshAssignmentTTL_GrowsUnderfilledAssignment fences issue #1681.
+// When a stored assignment has fewer than MaxServersPerAssignment servers
+// and Cloud Map shows additional healthy servers (e.g., a us-east-2c that
+// registered after the assignment was created), the next TTL refresh must
+// converge by adding the new server. Without growth, an assignment created
+// when only N<3 servers were healthy stays at N forever — re-registrations
+// to the assigned servers see "this server is in the set, return the set"
+// and the missing server never gets added (the prod symptom in #1681).
+func TestRefreshAssignmentTTL_GrowsUnderfilledAssignment(t *testing.T) {
+	cloudMap := &CloudMapClient{
+		cachedInstances: []ServerInfo{
+			{ID: "i-a", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-a"},
+			{ID: "i-b", IP: "10.0.0.2", InternalIP: "10.0.0.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-b"},
+			{ID: "i-c", IP: "10.0.0.3", InternalIP: "10.0.0.3", AZ: "us-east-2c", Port: 62206, PubKey: "pk-c"},
+		},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+
+	storage := newMockStorageBackend()
+	now := time.Now().Unix()
+	ttl := now + AssignmentTTLSeconds
+	storage.assignments["ac-grow"] = &ACAssignment{
+		ACID:    "ac-grow",
+		Version: 5,
+		AssignedServers: []ServerInfo{
+			{ID: "i-a", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-a"},
+			{ID: "i-b", IP: "10.0.0.2", InternalIP: "10.0.0.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-b"},
+		},
+		LastSeen: now,
+		TTL:      &ttl,
+	}
+
+	srv := &UdpServer{
+		storage:    storage,
+		cloudMap:   cloudMap,
+		instanceID: "i-a",
+		config:     &Config{Hostname: "test", ListenPort: 62206},
+	}
+
+	srv.refreshAssignmentTTL("ac-grow")
+	srv.wg.Wait() // refresh runs in a goroutine
+
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	saved := storage.assignments["ac-grow"]
+	if len(saved.AssignedServers) != MaxServersPerAssignment {
+		t.Fatalf("expected %d assigned servers after grow, got %d", MaxServersPerAssignment, len(saved.AssignedServers))
+	}
+	ids := map[string]bool{}
+	for _, s := range saved.AssignedServers {
+		ids[s.ID] = true
+	}
+	for _, want := range []string{"i-a", "i-b", "i-c"} {
+		if !ids[want] {
+			t.Errorf("expected grown assignment to contain %s, got %v", want, ids)
+		}
+	}
+	if saved.Version != 6 {
+		t.Errorf("expected Version=6 (existing+1), got %d", saved.Version)
+	}
+}
+
+// TestRefreshAssignmentTTL_NoGrowAtMax verifies the no-op path: once the
+// assignment is at MaxServersPerAssignment, refresh bumps version+TTL only
+// (no Cloud Map call needed beyond the discovery cache check).
+func TestRefreshAssignmentTTL_NoGrowAtMax(t *testing.T) {
+	cloudMap := &CloudMapClient{
+		cachedInstances: []ServerInfo{
+			{ID: "i-a", IP: "10.0.0.1", InternalIP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-a"},
+			{ID: "i-b", IP: "10.0.0.2", InternalIP: "10.0.0.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-b"},
+			{ID: "i-c", IP: "10.0.0.3", InternalIP: "10.0.0.3", AZ: "us-east-2c", Port: 62206, PubKey: "pk-c"},
+			{ID: "i-d", IP: "10.0.0.4", InternalIP: "10.0.0.4", AZ: "us-east-2a", Port: 62206, PubKey: "pk-d"},
+		},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+
+	storage := newMockStorageBackend()
+	now := time.Now().Unix()
+	ttl := now + AssignmentTTLSeconds
+	original := []ServerInfo{
+		{ID: "i-a", IP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-a"},
+		{ID: "i-b", IP: "10.0.0.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-b"},
+		{ID: "i-c", IP: "10.0.0.3", AZ: "us-east-2c", Port: 62206, PubKey: "pk-c"},
+	}
+	storage.assignments["ac-full"] = &ACAssignment{
+		ACID:            "ac-full",
+		Version:         3,
+		AssignedServers: original,
+		LastSeen:        now,
+		TTL:             &ttl,
+	}
+
+	srv := &UdpServer{
+		storage:    storage,
+		cloudMap:   cloudMap,
+		instanceID: "i-a",
+		config:     &Config{Hostname: "test", ListenPort: 62206},
+	}
+
+	srv.refreshAssignmentTTL("ac-full")
+	srv.wg.Wait()
+
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	saved := storage.assignments["ac-full"]
+	if len(saved.AssignedServers) != MaxServersPerAssignment {
+		t.Errorf("expected len unchanged at %d, got %d", MaxServersPerAssignment, len(saved.AssignedServers))
+	}
+	if saved.Version != 4 {
+		t.Errorf("expected Version=4 (existing+1), got %d", saved.Version)
+	}
+}
+
+// TestRefreshAssignmentTTL_SkipsCrossASGCandidates verifies growth respects
+// the blue/green ASG filter — a green-color server must not be added to a
+// blue-color assignment during a deploy when both ASGs share Cloud Map.
+func TestRefreshAssignmentTTL_SkipsCrossASGCandidates(t *testing.T) {
+	cloudMap := &CloudMapClient{
+		cachedInstances: []ServerInfo{
+			{ID: "i-blue-a", IP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-a", ASGName: "layerv-nhp-prod-server"},
+			{ID: "i-blue-b", IP: "10.0.0.2", AZ: "us-east-2b", Port: 62206, PubKey: "pk-b", ASGName: "layerv-nhp-prod-server"},
+			{ID: "i-green-a", IP: "10.0.0.3", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ga", ASGName: "layerv-nhp-prod-server-green"},
+			{ID: "i-green-c", IP: "10.0.0.4", AZ: "us-east-2c", Port: 62206, PubKey: "pk-gc", ASGName: "layerv-nhp-prod-server-green"},
+		},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+
+	storage := newMockStorageBackend()
+	now := time.Now().Unix()
+	ttl := now + AssignmentTTLSeconds
+	storage.assignments["ac-blue"] = &ACAssignment{
+		ACID:    "ac-blue",
+		Version: 1,
+		AssignedServers: []ServerInfo{
+			{ID: "i-blue-a", IP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-a"},
+		},
+		LastSeen: now,
+		TTL:      &ttl,
+	}
+
+	srv := &UdpServer{
+		storage:    storage,
+		cloudMap:   cloudMap,
+		instanceID: "i-blue-a",
+		asgName:    "layerv-nhp-prod-server",
+		config:     &Config{Hostname: "test", ListenPort: 62206},
+	}
+
+	srv.refreshAssignmentTTL("ac-blue")
+	srv.wg.Wait()
+
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	saved := storage.assignments["ac-blue"]
+	for _, s := range saved.AssignedServers {
+		if s.ID == "i-green-a" || s.ID == "i-green-c" {
+			t.Errorf("cross-ASG server %s leaked into blue assignment", s.ID)
+		}
+	}
+	// Should have grown to include i-blue-b (the only blue candidate)
+	wantIDs := map[string]bool{"i-blue-a": true, "i-blue-b": true}
+	for _, s := range saved.AssignedServers {
+		if !wantIDs[s.ID] {
+			t.Errorf("unexpected server %s in blue assignment", s.ID)
+		}
+	}
+	if len(saved.AssignedServers) != 2 {
+		t.Errorf("expected 2 blue servers (no green leakage), got %d: %v", len(saved.AssignedServers), saved.AssignedServers)
+	}
+}
+
+// TestRefreshAssignmentTTL_SkipsCandidatesWithoutPubKey verifies that
+// growth never persists a server whose Cloud Map registration hasn't
+// completed (PUBLIC_KEY attribute empty). serverInfosToRedirectTargets
+// would otherwise hand the AC a target it would drop on validation.
+func TestRefreshAssignmentTTL_SkipsCandidatesWithoutPubKey(t *testing.T) {
+	cloudMap := &CloudMapClient{
+		cachedInstances: []ServerInfo{
+			{ID: "i-a", IP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-a"},
+			{ID: "i-no-key", IP: "10.0.0.99", AZ: "us-east-2c", Port: 62206 /* PubKey deliberately empty */},
+		},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+
+	storage := newMockStorageBackend()
+	now := time.Now().Unix()
+	ttl := now + AssignmentTTLSeconds
+	storage.assignments["ac-no-key"] = &ACAssignment{
+		ACID:    "ac-no-key",
+		Version: 1,
+		AssignedServers: []ServerInfo{
+			{ID: "i-a", IP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-a"},
+		},
+		LastSeen: now,
+		TTL:      &ttl,
+	}
+
+	srv := &UdpServer{
+		storage:    storage,
+		cloudMap:   cloudMap,
+		instanceID: "i-a",
+		config:     &Config{Hostname: "test", ListenPort: 62206},
+	}
+
+	srv.refreshAssignmentTTL("ac-no-key")
+	srv.wg.Wait()
+
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	saved := storage.assignments["ac-no-key"]
+	for _, s := range saved.AssignedServers {
+		if s.ID == "i-no-key" {
+			t.Errorf("server with empty PubKey leaked into assignment")
+		}
+	}
+}
+
+// TestSaveACAssignment_MockEnforcesVersionConflict fences the regression
+// class that #1681 surfaced: refreshAssignmentTTL pre-fix did not bump
+// Version, so SaveACAssignment with the same Version was a silent no-op
+// against real DDB but appeared to succeed against an unconditional mock.
+// The mock now mirrors DDB's `version = expected-1` invariant, so any
+// future refresh-path code path that forgets the bump fails its tests.
+func TestSaveACAssignment_MockEnforcesVersionConflict(t *testing.T) {
+	storage := newMockStorageBackend()
+	ctx := context.Background()
+	if err := storage.SaveACAssignment(ctx, &ACAssignment{ACID: "ac-cas", Version: 1}); err != nil {
+		t.Fatalf("first save (Version=1): %v", err)
+	}
+	// Save with same Version must conflict (mirrors DDB rejection of a
+	// Version-not-bumped overwrite).
+	err := storage.SaveACAssignment(ctx, &ACAssignment{ACID: "ac-cas", Version: 1})
+	if !IsVersionConflictError(err) {
+		t.Errorf("expected VersionConflictError on Save without bump, got %v", err)
+	}
+	// Save with correct +1 bump succeeds.
+	if err := storage.SaveACAssignment(ctx, &ACAssignment{ACID: "ac-cas", Version: 2}); err != nil {
+		t.Errorf("expected Save with bumped Version to succeed, got %v", err)
+	}
+}
+
+// TestRefreshAssignmentTTL_RefusesGrowOnASGFailOpen verifies the fail-open
+// safety check: when filterServersByASG would fail open (Cloud Map shows
+// only cross-color servers, e.g. during the blue-rotates-out / green-rotates-in
+// transition of a deploy), maybeGrowAssignedServers must refuse to grow
+// rather than persisting cross-color contamination across the TTL window.
+// Symmetric to TestRefreshAssignmentTTL_SkipsCrossASGCandidates, which
+// covers the *normal* (mixed cross-color) case.
+func TestRefreshAssignmentTTL_RefusesGrowOnASGFailOpen(t *testing.T) {
+	cloudMap := &CloudMapClient{
+		cachedInstances: []ServerInfo{
+			// Only green servers visible — blue siblings rotated out.
+			{ID: "i-green-a", IP: "10.0.0.3", AZ: "us-east-2a", Port: 62206, PubKey: "pk-ga", ASGName: "layerv-nhp-prod-server-green"},
+			{ID: "i-green-c", IP: "10.0.0.4", AZ: "us-east-2c", Port: 62206, PubKey: "pk-gc", ASGName: "layerv-nhp-prod-server-green"},
+		},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+
+	storage := newMockStorageBackend()
+	now := time.Now().Unix()
+	ttl := now + AssignmentTTLSeconds
+	storage.assignments["ac-blue"] = &ACAssignment{
+		ACID:    "ac-blue",
+		Version: 1,
+		AssignedServers: []ServerInfo{
+			{ID: "i-blue-a", IP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-a"},
+		},
+		LastSeen: now,
+		TTL:      &ttl,
+	}
+
+	srv := &UdpServer{
+		storage:    storage,
+		cloudMap:   cloudMap,
+		instanceID: "i-blue-a",
+		asgName:    "layerv-nhp-prod-server",
+		config:     &Config{Hostname: "test", ListenPort: 62206},
+	}
+
+	srv.refreshAssignmentTTL("ac-blue")
+	srv.wg.Wait()
+
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	saved := storage.assignments["ac-blue"]
+	if len(saved.AssignedServers) != 1 {
+		t.Errorf("expected no growth under ASG fail-open, got %d servers: %v", len(saved.AssignedServers), saved.AssignedServers)
+	}
+	for _, s := range saved.AssignedServers {
+		if s.ID != "i-blue-a" {
+			t.Errorf("cross-ASG server %s leaked into blue assignment under fail-open", s.ID)
+		}
+	}
+}
+
+// TestRefreshAssignmentTTL_NoGrowWhenNoNewCandidates verifies the cleanly-
+// no-grow path: when every server Cloud Map returns is already in the
+// assignment, additions stays empty and the function returns (current, false)
+// so refreshAssignmentTTL still bumps version+TTL but doesn't churn the
+// AssignedServers list. Behaviorally equivalent to the discovery-error path
+// (both exit at the no-additions early return), so this test fences both.
+func TestRefreshAssignmentTTL_NoGrowWhenNoNewCandidates(t *testing.T) {
+	cloudMap := &CloudMapClient{
+		cachedInstances: []ServerInfo{
+			{ID: "i-a", IP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-a"},
+		},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+
+	storage := newMockStorageBackend()
+	now := time.Now().Unix()
+	ttl := now + AssignmentTTLSeconds
+	storage.assignments["ac-noop"] = &ACAssignment{
+		ACID:    "ac-noop",
+		Version: 1,
+		AssignedServers: []ServerInfo{
+			{ID: "i-a", IP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-a"},
+		},
+		LastSeen: now,
+		TTL:      &ttl,
+	}
+
+	srv := &UdpServer{
+		storage:    storage,
+		cloudMap:   cloudMap,
+		instanceID: "i-a",
+		config:     &Config{Hostname: "test", ListenPort: 62206},
+	}
+
+	srv.refreshAssignmentTTL("ac-noop")
+	srv.wg.Wait()
+
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	saved := storage.assignments["ac-noop"]
+	// Assignment should be unchanged in size; version should still bump
+	// (TTL refresh succeeded even though growth had nothing to add).
+	if len(saved.AssignedServers) != 1 {
+		t.Errorf("expected unchanged size when no growth candidates, got %d", len(saved.AssignedServers))
+	}
+	if saved.Version != 2 {
+		t.Errorf("expected Version=2 (TTL refresh still bumps), got %d", saved.Version)
+	}
+}
+
+// TestRefreshAssignmentTTL_VersionConflictEmitsRefreshMetric fences the
+// cr round-3 metric split: when SaveACAssignment returns a VersionConflictError
+// in the refresh path (another server raced ahead), the refresh path swallows
+// the error and emits MetricACAssignmentRefreshVersionConflict — NOT
+// MetricACAssignmentVersionConflictRetry (which is scoped to the retry-loop
+// in saveAssignmentWithRetry). Without this fence a future refactor that
+// regresses to the shared metric would silently inflate the contention-load
+// alarm.
+func TestRefreshAssignmentTTL_VersionConflictEmitsRefreshMetric(t *testing.T) {
+	cloudMap := &CloudMapClient{
+		cachedInstances: []ServerInfo{
+			{ID: "i-a", IP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-a"},
+		},
+		instancesExpiry: time.Now().Add(time.Hour),
+	}
+
+	storage := newMockStorageBackend()
+	now := time.Now().Unix()
+	ttl := now + AssignmentTTLSeconds
+	storage.assignments["ac-conflict"] = &ACAssignment{
+		ACID:    "ac-conflict",
+		Version: 3,
+		AssignedServers: []ServerInfo{
+			{ID: "i-a", IP: "10.0.0.1", AZ: "us-east-2a", Port: 62206, PubKey: "pk-a"},
+		},
+		LastSeen: now,
+		TTL:      &ttl,
+	}
+	// Inject a deterministic VersionConflict on Save — simulates a racing
+	// server that bumped Version between this refresh's GetACAssignment and
+	// SaveACAssignment.
+	storage.saveOverride = func(_ *ACAssignment) error {
+		return NewVersionConflictError("simulated concurrent refresh from another server")
+	}
+
+	mp := metrics.NewPublisherForTest(t)
+	srv := &UdpServer{
+		storage:    storage,
+		cloudMap:   cloudMap,
+		instanceID: "i-a",
+		config:     &Config{Hostname: "test", ListenPort: 62206},
+		metrics:    mp,
+	}
+
+	srv.refreshAssignmentTTL("ac-conflict")
+	srv.wg.Wait()
+
+	counters, _ := mp.CountersForTest(t)
+	if c := counters[MetricACAssignmentRefreshVersionConflict]; c != 1 {
+		t.Errorf("expected MetricACAssignmentRefreshVersionConflict=1 on refresh-time conflict, got %v", c)
+	}
+	if c := counters[MetricACAssignmentVersionConflictRetry]; c != 0 {
+		t.Errorf("retry-scoped metric must not fire from refresh path, got %v", c)
+	}
+	if c := counters[MetricACAssignmentSaveError]; c != 0 {
+		t.Errorf("save-error metric must not fire on a VersionConflict (separate counter), got %v", c)
 	}
 }
 

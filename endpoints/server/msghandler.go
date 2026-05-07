@@ -82,7 +82,24 @@ const (
 	MetricKnockForwardSkippedDead   = "KnockForwardSkippedDead"
 	MetricKnockForwardFallback      = "KnockForwardFallback"
 	MetricCloudMapDeregisterFailure = "CloudMapDeregisterFailure"
-	MetricKnockNoAC                 = "KnockNoAC"
+	// MetricCloudMapRegisterFailure fires once per process when boot-time
+	// Cloud Map registration exhausts its retry budget. Page-worthy if
+	// non-zero in burn-in: the server is running but invisible to the
+	// auto-assignment fan-out. See issue #1681 for the prod incident this
+	// counter fences.
+	MetricCloudMapRegisterFailure = "CloudMapRegisterFailure"
+	// MetricCloudMapRegisterRefresh fires once per successful periodic
+	// re-assertion. Steady-state non-zero is healthy (refresh loop is
+	// running); a sudden drop to zero with a live process is the signal
+	// that the refresh goroutine has wedged.
+	MetricCloudMapRegisterRefresh = "CloudMapRegisterRefresh"
+	// MetricCloudMapRegisterRefreshFailure fires once per failed periodic
+	// re-assertion. Sustained non-zero in steady state means Cloud Map is
+	// rejecting our updates (auth, quota, or service down) — the server
+	// will be increasingly stale in DiscoverInstances and may drop out of
+	// new assignments.
+	MetricCloudMapRegisterRefreshFailure = "CloudMapRegisterRefreshFailure"
+	MetricKnockNoAC                      = "KnockNoAC"
 	// MetricInternalAuthFailPermit / MetricInternalAuthFailStrict count
 	// /nhp/internal/knock requests whose HMAC verification failed.
 	// Permit-mode failures still pass through (warn + allow); strict-
@@ -131,7 +148,15 @@ const (
 	// signature.
 	MetricLicenseValidationRateLimited            = "LicenseValidationRateLimited"
 	MetricLicenseValidationRateLimitedAtPreflight = "LicenseValidationRateLimitedAtPreflight"
-	MetricASGFilterFailOpen                       = "ASGFilterFailOpen"
+	// MetricASGFilterFailOpen fires when filterServersByASG would
+	// fail open (every Cloud Map server is cross-color). Emitted from
+	// two sites: autoAssignAC (accepts the fail-open list because no
+	// assignment is worse than cross-color) and maybeGrowAssignedServers
+	// (refuses to grow because durable cross-color contamination is
+	// worse than no growth). Operators triaging dashboard spikes should
+	// pair this with new-AC volume vs. AC re-registration volume to
+	// distinguish initial-assign noise from grow-time deploy windows.
+	MetricASGFilterFailOpen = "ASGFilterFailOpen"
 
 	// MetricTransactionClosed counts every SendMessage / SendPacket
 	// call that returns common.ErrTransactionClosed because the
@@ -225,17 +250,18 @@ func (s *UdpServer) recordTransactionClosed(err error) {
 // is the only tractable form; per-instance resolution is available
 // from the other series for investigation only.
 //
-// No-ops when s.instanceID is empty (IMDS unreachable at boot) or
+// No-ops when InstanceID is empty (IMDS unreachable at boot) or
 // when the publisher is unavailable (non-cloud local testing). The
 // log-filter panic alarm still covers Go runtime panics that bypass
 // this path -- those can't EMF-emit because the process is already
 // dying.
 func (s *UdpServer) recordServerStartup() {
-	if s.instanceID == "" || s.metrics == nil {
+	instanceID := s.InstanceID()
+	if instanceID == "" || s.metrics == nil {
 		return
 	}
 	s.metrics.EmitEMFCounterNow(MetricServerStartupEvent, []types.Dimension{
-		{Name: dimNameInstanceId, Value: aws.String(s.instanceID)},
+		{Name: dimNameInstanceId, Value: aws.String(instanceID)},
 	})
 	s.metrics.EmitEMFCounterNow(MetricServerStartupEvent, nil)
 }
@@ -983,7 +1009,7 @@ func (s *UdpServer) autoAssignAC(
 	// because the CloudMap cache is also used by HTTP forwarding where cross-color
 	// forwarding is legitimate during transitions.
 	var asgFailOpen bool
-	allServers, asgFailOpen = filterServersByASG(allServers, s.asgName)
+	allServers, asgFailOpen = filterServersByASG(allServers, s.ASGName())
 	if asgFailOpen && s.metrics != nil {
 		s.metrics.IncrCounter(MetricASGFilterFailOpen)
 	}
@@ -1093,15 +1119,28 @@ const (
 )
 
 // MetricACAssignmentVersionConflictRetry fires once per retry
-// attempt triggered by a VersionConflictError on SaveACAssignment.
-// A non-zero rate is the rollout signal that two servers are
-// racing to claim the same acId slot; sustained at high volume,
-// it's a contention-load alarm.
+// attempt triggered by a VersionConflictError on SaveACAssignment
+// inside saveAssignmentWithRetry. A non-zero rate is the rollout
+// signal that two servers are racing to claim the same acId slot;
+// sustained at high volume, it's a contention-load alarm. NOTE:
+// scoped to the retry-loop path. The refresh path (which swallows
+// a single conflict without retrying) emits
+// MetricACAssignmentRefreshVersionConflict instead so operators can
+// distinguish per-retry contention from refresh-edge overlap.
 //
 // MetricACAssignmentVersionConflictExhausted fires when the retry
 // loop is exhausted without converging — falls through to "accept
 // directly" per the legacy availability contract. Page-worthy if
 // non-zero in burn-in.
+//
+// MetricACAssignmentRefreshVersionConflict fires once per refresh
+// path that observed a VersionConflictError on SaveACAssignment.
+// The refresh path swallows the conflict (another server got there
+// first; safe — the assignment was extended either way) and does NOT
+// retry, so the count is naturally one-per-conflict. Distinct from
+// the retry-scoped counter so dashboards can show refresh-edge
+// overlap as a steady low-rate signal without inflating the
+// contention-load alarm.
 //
 // MetricACAssignmentSaveError fires once per non-conflict storage
 // error from SaveACAssignment (DDB throttling, marshal failure,
@@ -1111,7 +1150,16 @@ const (
 const (
 	MetricACAssignmentVersionConflictRetry     = "ACAssignmentVersionConflictRetry"
 	MetricACAssignmentVersionConflictExhausted = "ACAssignmentVersionConflictExhausted"
+	MetricACAssignmentRefreshVersionConflict   = "ACAssignmentRefreshVersionConflict"
 	MetricACAssignmentSaveError                = "ACAssignmentSaveError"
+
+	// MetricACAssignmentGrew fires once per refreshAssignmentTTL call that
+	// successfully grew an under-filled assignment to include a newly
+	// discovered healthy server (issue #1681). Sustained non-zero is the
+	// signal that the convergence path is doing real work; the rate should
+	// fall to ~0 in steady state once all assignments reach
+	// MaxServersPerAssignment.
+	MetricACAssignmentGrew = "ACAssignmentGrew"
 )
 
 // saveAssignmentWithRetry performs a bounded retry loop around
@@ -1284,15 +1332,35 @@ func (s *UdpServer) selectServersForAssignment(allServers []ServerInfo, maxCount
 // In cloud mode, uses the EC2 instance ID (populated from IMDS).
 // Falls back to hostname if instance ID is not available.
 func (s *UdpServer) getServerID() string {
-	if s.instanceID != "" {
-		return s.instanceID
+	if id := s.InstanceID(); id != "" {
+		return id
 	}
 	return s.config.Hostname
 }
 
-// refreshAssignmentTTL extends the TTL of an AC assignment in the background.
-// Throttled to at most once per TTLRefreshMinInterval per AC to prevent excessive writes.
+// refreshAssignmentTTL extends the TTL of an AC assignment in the background
+// and opportunistically grows the assignment to MaxServersPerAssignment when
+// new healthy servers have appeared in Cloud Map (issue #1681). Throttled to
+// at most once per TTLRefreshMinInterval per AC to prevent excessive writes.
 // Tracked by s.wg to prevent data races on storage during shutdown.
+//
+// Version semantics: SaveACAssignment uses optimistic locking conditional on
+// `version = expected-1`, so every successful refresh must bump Version. Two
+// servers racing to refresh the same AC's assignment will see one succeed and
+// one return VersionConflictError (silently ignored — the winner's write is
+// the converged state).
+//
+// Stickiness vs. recycle: pre-fix, refresh was a silent no-op (the
+// `existing.Clone()` preserved Version, so SaveACAssignment's
+// `version = expected-1` always conflicted and was swallowed). Assignments
+// effectively only lived as long as DDB-side TTL eviction allowed (~30 min),
+// then autoAssignAC recreated them. That implicit recycle was the only path
+// that re-fetched license CustomerID for the F4 (TOFU) flow per #1157.
+// With this fix, assignments are long-lived; the F4 CustomerID stays sticky
+// across the assignment's life — consistent with the F4 model (once bound,
+// never silently rebound). Future readers chasing F4 stickiness questions:
+// the recycle-driven refresh is gone, growth happens here, F4 binding does
+// not.
 func (s *UdpServer) refreshAssignmentTTL(acID string) {
 	// Throttle: skip if we refreshed recently for this AC
 	now := time.Now()
@@ -1324,20 +1392,182 @@ func (s *UdpServer) refreshAssignmentTTL(acID string) {
 		refreshed := existing.Clone()
 		refreshed.LastSeen = time.Now().Unix()
 		refreshed.TTL = &ttl
+		// SaveACAssignment is conditional on `version = expected-1`. Without
+		// the bump, every refresh returns VersionConflictError and the
+		// assignment stays frozen at its initial AssignedServers for the
+		// whole TTL window (issue #1681).
+		refreshed.Version = existing.Version + 1
+
+		// Issue #1681: opportunistically grow under-filled assignments when
+		// new healthy servers have appeared in Cloud Map since the assignment
+		// was created. Without this, an assignment created when only N<3
+		// servers were healthy stays at N forever — re-registrations to the
+		// assigned servers see "this server is in the set, return the set"
+		// and never converge to MaxServersPerAssignment.
+		// Pass the cloned slice rather than existing.AssignedServers so the
+		// no-aliasing-of-cache property is syntactically obvious, not just
+		// contractually documented on maybeGrowAssignedServers.
+		grown, didGrow := s.maybeGrowAssignedServers(refreshed.AssignedServers)
+		if didGrow {
+			refreshed.AssignedServers = grown
+		}
 
 		saveCtx, saveCancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
 		saveCtx = ContextWithRequestID(saveCtx, correlationID)
 		defer saveCancel()
 		if err := s.storage.SaveACAssignment(saveCtx, refreshed); err != nil {
 			if IsVersionConflictError(err) {
-				// Another server refreshed TTL concurrently — safe to ignore
+				// Another server refreshed TTL concurrently — safe to ignore.
+				// Emit a refresh-scoped metric (not the retry-loop one) so
+				// dashboards can distinguish refresh-edge overlap (low,
+				// expected) from saveAssignmentWithRetry contention (which
+				// can spike under load).
 				log.Debug("TTL refresh version conflict for AC %s (concurrent update)", acID)
+				if s.metrics != nil {
+					s.metrics.IncrCounter(MetricACAssignmentRefreshVersionConflict)
+				}
 			} else {
 				log.Debug("Failed to refresh TTL for AC %s: %v", acID, err)
-				s.ttlRefreshTimes.Delete(acID) // allow retry on next call
+				if s.metrics != nil {
+					s.metrics.IncrCounter(MetricACAssignmentSaveError)
+				}
+				s.refreshCooldownAfterError(acID)
 			}
+			return
+		}
+		if didGrow {
+			if s.metrics != nil {
+				s.metrics.IncrCounter(MetricACAssignmentGrew)
+			}
+			log.Info("refreshAssignmentTTL: AC %s grew from %d to %d servers (AZs: %v)",
+				acID, len(existing.AssignedServers), len(grown), serverAZs(grown))
 		}
 	}()
+}
+
+// refreshCooldownAfterError installs a 30-second cooldown via the
+// ttlRefreshTimes throttle map after a non-version-conflict failure
+// (issue #1681). Pre-fix, the error path called Delete() which let
+// the next AC re-registration retry immediately; with refresh now
+// doing real work (Cloud Map + DDB), unrestricted retry would
+// amplify a storage flap into a refresh storm.
+//
+// The throttle gate (in refreshAssignmentTTL above) is
+// `now.Sub(stored) < TTLRefreshMinInterval` — i.e. release when at least
+// TTLRefreshMinInterval has elapsed since `stored`. To make the gate
+// release in errorCooldown rather than TTLRefreshMinInterval we store
+// a timestamp back-dated by `(errorCooldown - TTLRefreshMinInterval)`:
+//
+//	release_time = stored + TTLRefreshMinInterval
+//	             = (now + errorCooldown - TTLRefreshMinInterval) + TTLRefreshMinInterval
+//	             = now + errorCooldown   ✓
+//
+// Robust regardless of which constant is larger:
+//   - errorCooldown < TTLRefreshMinInterval (the current case, 30s vs 5m):
+//     `(errorCooldown - TTLRefreshMinInterval)` is negative, stored time
+//     is in the past, gate releases at now + errorCooldown.
+//   - errorCooldown > TTLRefreshMinInterval (hypothetical): the offset
+//     is positive, `stored` is in the future, `now.Sub(future)` is
+//     negative which is < TTLRefreshMinInterval, gate stays held until
+//     now reaches stored + TTLRefreshMinInterval = now + errorCooldown.
+//
+// The fragile-looking arithmetic is correct in both directions; the
+// formulation just leans on the existing gate's `Sub < TTL` shape so
+// we don't need a parallel "cooldown end time" path through the map.
+func (s *UdpServer) refreshCooldownAfterError(acID string) {
+	const errorCooldown = 30 * time.Second
+	s.ttlRefreshTimes.Store(acID, time.Now().Add(errorCooldown-TTLRefreshMinInterval))
+}
+
+// maybeGrowAssignedServers returns a list extended with up to
+// (MaxServersPerAssignment - len(current)) new healthy Cloud Map servers,
+// preferring new AZs for distribution. Returns (current, false) when no
+// growth is possible (already at max, Cloud Map unavailable, or no new
+// candidates). Issue #1681.
+//
+// Contract: callers may pass a slice that aliases a cache pointer. This
+// function reads `current` without mutating it; growth produces a fresh
+// slice via the explicit `append(grown, current...)` copy below. A future
+// change that mutates `current` in-place would corrupt the cache and must
+// be caught at review.
+func (s *UdpServer) maybeGrowAssignedServers(current []ServerInfo) ([]ServerInfo, bool) {
+	if len(current) >= MaxServersPerAssignment || s.cloudMap == nil {
+		return current, false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultStorageTimeout)
+	defer cancel()
+	discovered, err := s.cloudMap.DiscoverServerInstances(ctx)
+	if err != nil || len(discovered) == 0 {
+		return current, false
+	}
+	// Refuse to grow when ASG filtering fails open — autoAssignAC accepts
+	// fail-open because *no assignment* is worse than a cross-color one,
+	// but growth is opportunistic. Persisting a green server into a blue
+	// assignment (or vice versa) makes that cross-color contamination
+	// durable across the TTL window. Skip; the next refresh will retry.
+	discovered, failOpen := filterServersByASG(discovered, s.ASGName())
+	if failOpen {
+		if s.metrics != nil {
+			s.metrics.IncrCounter(MetricASGFilterFailOpen)
+		}
+		return current, false
+	}
+
+	haveID := make(map[string]bool, len(current))
+	haveAZ := make(map[string]bool, len(current))
+	for _, srv := range current {
+		haveID[srv.ID] = true
+		if srv.AZ != "" {
+			haveAZ[srv.AZ] = true
+		}
+	}
+
+	// Prefer candidates in AZs not already represented; break ties by ID
+	// for deterministic convergence under concurrent racing servers.
+	// Sorting `discovered` in place is safe: DiscoverServerInstances
+	// returns a fresh copy of its cache (cloudmap.go: `out := make(...);
+	// copy(out, instances)`), so this slice does not alias the cache.
+	sort.SliceStable(discovered, func(i, j int) bool {
+		iNew := !haveAZ[discovered[i].AZ]
+		jNew := !haveAZ[discovered[j].AZ]
+		if iNew != jNew {
+			return iNew
+		}
+		return discovered[i].ID < discovered[j].ID
+	})
+
+	// Defer the seed copy until at least one candidate is confirmed addable —
+	// the steady-state case (assignment already converged) returns without
+	// allocating a copy of `current` just to discard it.
+	var additions []ServerInfo
+	room := MaxServersPerAssignment - len(current)
+	for _, cand := range discovered {
+		if len(additions) >= room {
+			break
+		}
+		if haveID[cand.ID] {
+			continue
+		}
+		// PubKey from Cloud Map (CloudMapAttrKey) is what serverInfosToRedirectTargets
+		// hands to the AC — skip candidates whose registration hasn't yet populated
+		// it, otherwise the AC would drop the RedirectTarget on validation.
+		if cand.PubKey == "" {
+			continue
+		}
+		// Strip ASGName before persisting (server-side filter concern, not AC-facing).
+		cand.ASGName = ""
+		additions = append(additions, cand)
+		haveID[cand.ID] = true
+		haveAZ[cand.AZ] = true
+	}
+	if len(additions) == 0 {
+		return current, false
+	}
+	grown := make([]ServerInfo, 0, len(current)+len(additions))
+	grown = append(grown, current...)
+	grown = append(grown, additions...)
+	return grown, true
 }
 
 // sendARD sends NHP_ARD to redirect the AC to the given servers.
@@ -1374,7 +1604,7 @@ func (s *UdpServer) updateAssignmentWithSelf(assignment *ACAssignment, healthySe
 		ID:         selfID,
 		IP:         s.localIp,
 		InternalIP: s.localIp,
-		AZ:         s.instanceAZ,
+		AZ:         s.InstanceAZ(),
 		Port:       s.config.ListenPort,
 		PubKey:     s.device.PublicKeyBase64(),
 	}

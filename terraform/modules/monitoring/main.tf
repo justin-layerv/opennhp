@@ -925,3 +925,120 @@ resource "aws_cloudwatch_metric_alarm" "server_instance_restart" {
     Cell      = var.cell_id
   })
 }
+
+# ============================================================================
+# Cloud Map registration self-healing alarms (issue #1681)
+#
+# Each nhp-server instance asserts its presence in Cloud Map at boot,
+# then re-asserts every 5 minutes via cloudMapRegisterRefreshRoutine
+# (endpoints/server/udpserver.go). The prod #1681 incident: us-east-2c
+# server failed to register at boot, no retry/refresh, sat invisible
+# to auto-assignment for ~2 weeks until a deploy. These three alarms
+# fence the failure modes the self-healing introduces:
+#
+#   - CloudMapRegisterFailure       boot retry budget exhausted
+#   - CloudMapRegisterRefreshFailure  refresh loop hitting Cloud Map errors
+#   - CloudMapRegisterRefresh         success heartbeat (alarm on absence)
+#
+# Dim set {Environment, Cell} matches buildServerMetricDimensions
+# (endpoints/server/udpserver.go::buildServerMetricDimensions). Adding or
+# removing a dim here breaks the metric stream selector silently.
+# ============================================================================
+resource "aws_cloudwatch_metric_alarm" "server_cloudmap_register_failure" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-server-cloudmap-register-failure"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "CloudMapRegisterFailure"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "nhp-server boot Cloud Map register exhausted retry budget; instance invisible to auto-assignment until refresh recovers (#1681)."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# Heartbeat alarm: CloudMapRegisterRefresh fires once per successful tick of
+# every server's refresh loop, so in steady state the fleet-wide Sum over a
+# 10-min window is ≈ N_servers × 2 ticks × <success rate>. Zero across two
+# consecutive 10-min windows (20 min) means every server's refresh goroutine
+# has wedged or every server is dead — both are page-worthy and neither is a
+# normal deploy footprint. treat_missing_data = "breaching" is intentional:
+# the publisher only emits counters that were incremented this interval, so
+# a wedged refresh routine (or a dead fleet) produces missing data, not
+# zero data — treating missing as breaching catches that blackout case.
+#
+# Greenfield caveat: a fresh `terraform apply` on a brand-new env creates
+# this alarm before any server has run a refresh tick (first tick fires at
+# +5min after server boot). On a one-shot greenfield create, this alarm
+# may transit ALARM for the first 20 minutes while servers come up; ack
+# during the bring-up. Operationally rare enough that the simpler config
+# wins over the alternatives (notBreaching loses real failure visibility;
+# disabling actions during burn-in adds drift risk). For an existing env
+# this is a pure additive deploy and there is no missing-data window.
+resource "aws_cloudwatch_metric_alarm" "server_cloudmap_register_refresh_heartbeat" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-server-cloudmap-register-refresh-heartbeat"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  datapoints_to_alarm = 2
+  metric_name         = "CloudMapRegisterRefresh"
+  namespace           = "LayerV/NHP"
+  period              = 600
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "nhp-server fleet emitted zero Cloud Map register refreshes for 20 min; refresh goroutine wedged or fleet dark (#1681)."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "breaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# Sustained refresh failures point at Cloud Map auth, quota, or service-level
+# issues — the self-heal mechanism is in place but losing ground. Threshold of
+# 3 in a 15-min window distinguishes a single transient hiccup from a real
+# upstream regression.
+resource "aws_cloudwatch_metric_alarm" "server_cloudmap_register_refresh_failure" {
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-server-cloudmap-register-refresh-failure"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
+  metric_name         = "CloudMapRegisterRefreshFailure"
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "nhp-server Cloud Map register refresh failed in 3 consecutive 5-min windows; investigate Cloud Map auth/quota/availability (#1681)."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
