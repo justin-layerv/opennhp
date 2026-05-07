@@ -354,6 +354,25 @@ deploy_redis = true
 deploy_cost_analytics                 = false
 cross_account_cost_analytics_role_arn = "arn:aws:iam::165115313779:role/nhp-cost-analytics-access"
 
+# ==============================================================================
+# qurl-reverse-tunnel-server (per-AZ tunnel routing)
+# ==============================================================================
+# Multi-AZ ASG sizing for the per-AZ qurl-reverse-tunnel-server fleet (#1499).
+# qurl-service hashes OwnerID to one of frps_az_suffixes and emits the matching
+# DNS name as `frps_addr` in API responses, so frpc and qurl-router converge on
+# the same instance. The ASG runs at desired = 3 (one instance per AZ); each
+# instance reads its AZ from IMDS at boot and registers with the matching
+# Cloud Map service. Module defaults remain 1/1/1 so the module can still
+# be consumed in isolation; the override here is what flips on multi-AZ.
+#
+# Note: this PR ships the Terraform side; `deploy_frps = true` is left
+# unchanged (still false / default) and will flip in a coordinated
+# follow-up after the qurl-service and frpc PRs land. Setting these size
+# vars now is harmless — they only take effect when deploy_frps is true.
+frps_min_size         = 3
+frps_max_size         = 3
+frps_desired_capacity = 3
+
 # Athena config for Grafana cost dashboard — points to sandbox-deployed resources in mgmt account.
 # These values come from sandbox's cost_analytics module outputs (terraform/modules/cost-analytics/outputs.tf).
 # If sandbox's cost_analytics config changes (name_prefix, region, etc.), update these values to match.

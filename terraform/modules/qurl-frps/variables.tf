@@ -223,16 +223,56 @@ variable "qurl_tunnel_auth_mode" {
   }
 }
 
+# ==================== Per-AZ Cloud Map ====================
+# Each suffix produces a Cloud Map service `frps-${suffix}.${namespace_name}`.
+# Each ASG instance reads its AZ from IMDS at boot and registers with the
+# matching service, so qurl-service can hash an OwnerID to a fixed AZ and
+# both `frpc` and qurl-router converge on the same instance. See #1499.
+#
+# Default `["a", "b", "c"]` matches us-east-2{a,b,c} and us-east-1{a,b,c} —
+# the regions sandbox and prod run in. The validation rejects entries that
+# aren't a single lowercase letter so a typo (e.g. `"us-east-2a"`,
+# `"A"`, `"a "`) fails plan instead of producing a Cloud Map service named
+# `frps-us-east-2a` whose registrations the qurl-service hash never targets.
+variable "frps_az_suffixes" {
+  description = "AZ suffix letters for per-AZ Cloud Map services. One Cloud Map service `frps-$${suffix}.$${namespace_name}` is created per entry, and each ASG instance registers with the service whose suffix matches the trailing letter of its IMDS-reported AZ. Default `[\"a\", \"b\", \"c\"]` matches us-east-{1,2}{a,b,c}. Must agree with qurl-service's QURL_FRPS_AZ_SUFFIXES env var (see cross-repo contract in #1499)."
+  type        = list(string)
+  default     = ["a", "b", "c"]
+
+  # NOTE: these two validation blocks are intentionally duplicated on the
+  # root variable `var.frps_az_suffixes` in `terraform/variables.tf`. The
+  # root copy fails plan even when `deploy_frps = false` keeps this module
+  # out of the graph; the module copy fails for module-direct consumers
+  # (smoke fixtures, isolated tests). Keep both in lockstep.
+  validation {
+    # Single lowercase letter — last char of an AWS AZ name (`us-east-2a` →
+    # `a`). `length(...) > 0` makes the empty list explicit (zero AZ suffixes
+    # would produce zero Cloud Map services and a silently-broken module).
+    condition     = length(var.frps_az_suffixes) > 0 && alltrue([for s in var.frps_az_suffixes : can(regex("^[a-z]$", s))])
+    error_message = "frps_az_suffixes must be a non-empty list of single lowercase letters (e.g., [\"a\", \"b\", \"c\"]) — each entry is the trailing letter of an AWS AZ name."
+  }
+
+  validation {
+    # `toset` collapses duplicates; comparing lengths catches `["a","a","b"]`
+    # which would otherwise produce a `for_each` collision on the Cloud Map
+    # services. Phrased as a separate validation block so the error message
+    # is unambiguous.
+    condition     = length(toset(var.frps_az_suffixes)) == length(var.frps_az_suffixes)
+    error_message = "frps_az_suffixes must not contain duplicates (each suffix maps to a distinct Cloud Map service)."
+  }
+}
+
 # ==================== ASG Sizing ====================
-# Defaults are 1/1/1 because nhp-frps holds tunnel registrations in memory per
-# instance and Cloud Map uses MULTIVALUE routing — scaling beyond 1 today would
-# route ~(N-1)/N of tunnel requests to instances that don't have the
-# registration. Tracked in #1499 (consistent-hash routing in qurl-router OR
-# shared registry in nhp-frps). When that lands, override these from the root
-# (one instance per AZ in both sandbox and prod).
+# Module defaults remain 1/1/1 so the module is consumable in isolation
+# (e.g., a smoke test fixture or single-AZ debug deploy). Production envs
+# override to N/N/N where N == length(frps_az_suffixes) — the per-AZ Cloud
+# Map fanout above means each ASG instance lands on its own AZ-keyed
+# service, eliminating the in-memory-tunnel-registration split-brain that
+# the old MULTIVALUE single-service config caused at N>1. See module
+# header for the full per-AZ contract (#1499).
 
 variable "min_size" {
-  description = "ASG minimum size. Defaults to 1; do not raise without resolving #1499 (multi-AZ tunnel routing)."
+  description = "ASG minimum size. Module default 1; production envs override to length(frps_az_suffixes) for one-instance-per-AZ via the per-AZ Cloud Map fanout."
   type        = number
   default     = 1
 
@@ -245,7 +285,7 @@ variable "min_size" {
 }
 
 variable "max_size" {
-  description = "ASG maximum size. Defaults to 1; see min_size and #1499 before raising."
+  description = "ASG maximum size. Module default 1; production envs override to match min_size and length(frps_az_suffixes)."
   type        = number
   default     = 1
 
@@ -256,7 +296,7 @@ variable "max_size" {
 }
 
 variable "desired_capacity" {
-  description = "ASG desired capacity. Defaults to 1; see min_size and #1499 before raising."
+  description = "ASG desired capacity. Module default 1; production envs override to length(frps_az_suffixes) for one-instance-per-AZ steady state."
   type        = number
   default     = 1
 

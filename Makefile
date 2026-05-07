@@ -296,6 +296,7 @@ lint-workflows:
 	@bash scripts/lint-issue-templates.sh
 	@bash tests/scripts/check-scope-drift_test.sh
 	@bash scripts/check-scope-drift.sh
+	@bash scripts/check-frps-az-suffixes-validation-drift.sh
 	@python3 -c 'import yaml' 2>/dev/null || { \
 		echo "$(COLOUR_RED)[OpenNHP] PyYAML missing.$(END_COLOUR)"; \
 		echo "$(COLOUR_RED)  Match the CI install: python3 -m pip install --no-cache-dir pyyaml$(END_COLOUR)"; \

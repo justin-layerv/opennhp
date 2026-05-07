@@ -563,14 +563,31 @@ if [ "$FRP_READY" != "true" ]; then
 fi
 
 # ============================================================================
-# Cloud Map registration/deregistration (matches AC module pattern)
+# Cloud Map registration/deregistration (per-AZ, see module header for rationale)
 # Uses a systemd oneshot service with ExecStop so Cloud Map is cleaned up
 # on instance shutdown/termination, preventing stale DNS records.
+#
+# The AZ -> service ID map is rendered by Terraform's templatefile() at plan
+# time and baked into both scripts (the heredoc delimiter is shell-quoted --
+# 'REGEOF' -- which suppresses bash dollar-expansion at runtime, but
+# Terraform's templating runs before the heredoc is ever written to disk,
+# so the AZ-keyed values get burned into the file). The instance reads its
+# AZ from IMDS at runtime, looks up the matching service ID, and registers.
 # ============================================================================
 cat > /opt/layerv/qurl-frps/cloudmap-register.sh << 'REGEOF'
 #!/bin/bash
 set -e
-SERVICE_ID="${cloudmap_service_id}"
+# Bash 4+ associative array. Ubuntu 24.04 ships bash 5.x so this is safe.
+# Rendered by Terraform templatefile() -- keys are AZ suffixes ("a","b",...),
+# values are the per-AZ Cloud Map service IDs. The 'REGEOF' heredoc
+# delimiter is shell-quoted so bash doesn't try to expand dollar-vars at
+# 'cat' time; Terraform templating runs before the heredoc is written to
+# disk, so the AZ-keyed values still get burned in.
+declare -A CLOUDMAP_SERVICE_IDS=(
+%{ for suffix, service_id in cloudmap_service_ids ~}
+  ["${suffix}"]="${service_id}"
+%{ endfor ~}
+)
 # IMDSv2 calls get --max-time + --retry. Without them, a slow/flaky IMDS on
 # shutdown would hang `ExecStop=cloudmap-deregister.sh` until systemd's
 # TimeoutStopSec kicked in (default 90s), extending the ASG terminate path
@@ -581,7 +598,31 @@ INSTANCE_ID=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://16
 LOCAL_IP=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
 AZ=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
 REGION=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
-echo "Registering FRPS instance $INSTANCE_ID ($LOCAL_IP) with Cloud Map service $SERVICE_ID"
+# Trailing AZ letter ("us-east-2a" -> "a"). Bash 4+ negative substring.
+# IMPORTANT: the leading space inside `: -1` is REQUIRED -- without the
+# space, $${AZ:-1} is the default-value operator and would silently set
+# AZ_SUFFIX="1" if AZ were empty. The empty-AZ case is also caught
+# below by the empty-SERVICE_ID FATAL, but don't compress this space.
+AZ_SUFFIX="$${AZ: -1}"
+# Defensive: AZ_SUFFIX must be a single lowercase letter. Standard AWS AZ
+# names match (`us-east-2a`, `us-east-2b`, ...). Local Zone / Wavelength
+# names like `us-east-1-bos-1a` happen to extract a valid letter, while
+# `us-east-1-wl1-bos-wlz-1` extracts `1` — explicit regex check makes
+# the failure mode unambiguous in the boot log instead of falling through
+# as "no service configured for suffix '1'".
+if ! [[ "$AZ_SUFFIX" =~ ^[a-z]$ ]]; then
+  echo "FATAL: AZ_SUFFIX '$AZ_SUFFIX' (extracted from AZ '$AZ') is not a single lowercase letter — qurl-reverse-tunnel-server only supports standard AWS AZs (us-east-2a etc.)."
+  exit 1
+fi
+SERVICE_ID="$${CLOUDMAP_SERVICE_IDS[$AZ_SUFFIX]:-}"
+if [ -z "$SERVICE_ID" ]; then
+  # FATAL on register — better to crash-loop the instance and page on
+  # no-healthy-instance than to silently boot an instance that no
+  # qurl-service hash will ever target.
+  echo "FATAL: no Cloud Map service configured for AZ suffix '$AZ_SUFFIX' (full AZ '$AZ'). Configured suffixes: $${!CLOUDMAP_SERVICE_IDS[*]}"
+  exit 1
+fi
+echo "Registering qurl-reverse-tunnel-server instance $INSTANCE_ID ($LOCAL_IP, AZ=$AZ) with Cloud Map service $SERVICE_ID (suffix $AZ_SUFFIX)"
 aws servicediscovery register-instance \
   --service-id "$SERVICE_ID" \
   --instance-id "$INSTANCE_ID" \
@@ -593,14 +634,45 @@ chmod +x /opt/layerv/qurl-frps/cloudmap-register.sh
 
 cat > /opt/layerv/qurl-frps/cloudmap-deregister.sh << 'DEREGEOF'
 #!/bin/bash
-set -e
-SERVICE_ID="${cloudmap_service_id}"
+# Intentionally NOT `set -e`: this script's contract is "warn and exit 0
+# whenever the AZ-suffix lookup is unworkable" (missing mapping, malformed
+# suffix). With `set -e`, a failed IMDS curl would exit non-zero before
+# AZ_SUFFIX is computed, so the WARN branches below would be unreachable
+# in exactly the IMDS-hung-on-shutdown scenario where leniency matters
+# most. Each IMDS curl below has its own `|| { WARN; exit 0 }` so the
+# warn-and-skip story is uniform across "missing suffix", "malformed
+# suffix", and "IMDS dead". Register-side keeps `set -e` (FATAL on
+# register is the right call — see cloudmap-register.sh).
+declare -A CLOUDMAP_SERVICE_IDS=(
+%{ for suffix, service_id in cloudmap_service_ids ~}
+  ["${suffix}"]="${service_id}"
+%{ endfor ~}
+)
 # See cloudmap-register.sh for rationale on --max-time / --retry.
 IMDS_CURL=(curl -sf --max-time 5 --retry 3)
-TOKEN=$("$${IMDS_CURL[@]}" -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-INSTANCE_ID=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
-REGION=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
-echo "Deregistering FRPS instance $INSTANCE_ID from Cloud Map service $SERVICE_ID"
+TOKEN=$("$${IMDS_CURL[@]}" -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600") || { echo "WARN: IMDS token request failed; skipping deregister"; exit 0; }
+INSTANCE_ID=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id) || { echo "WARN: IMDS instance-id lookup failed; skipping deregister"; exit 0; }
+AZ=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone) || { echo "WARN: IMDS AZ lookup failed; skipping deregister"; exit 0; }
+REGION=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region) || { echo "WARN: IMDS region lookup failed; skipping deregister"; exit 0; }
+AZ_SUFFIX="$${AZ: -1}"
+# Same defensive check as cloudmap-register.sh (see comment there).
+# WARN-and-continue here matches the existing deregister leniency:
+# missing-suffix is one of several reasons we'd skip the AWS call.
+if ! [[ "$AZ_SUFFIX" =~ ^[a-z]$ ]]; then
+  echo "WARN: AZ_SUFFIX '$AZ_SUFFIX' (extracted from AZ '$AZ') is not a single lowercase letter; skipping deregister"
+  exit 0
+fi
+SERVICE_ID="$${CLOUDMAP_SERVICE_IDS[$AZ_SUFFIX]:-}"
+if [ -z "$SERVICE_ID" ]; then
+  # Don't FATAL on deregister — `|| true` below already swallows the
+  # AWS-side error so a missing mapping shouldn't take down ExecStop.
+  # Just log and exit clean; the ASG replace cycle will eventually
+  # reap the stale registration via TTL or the planned #1089 health
+  # check work.
+  echo "WARN: no Cloud Map service configured for AZ suffix '$AZ_SUFFIX' (full AZ '$AZ'); skipping deregister"
+  exit 0
+fi
+echo "Deregistering qurl-reverse-tunnel-server instance $INSTANCE_ID from Cloud Map service $SERVICE_ID (suffix $AZ_SUFFIX)"
 aws servicediscovery deregister-instance \
   --service-id "$SERVICE_ID" \
   --instance-id "$INSTANCE_ID" \

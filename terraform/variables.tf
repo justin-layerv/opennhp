@@ -1828,15 +1828,14 @@ variable "frps_vhost_http_port" {
   default     = 8080
 }
 
-# nhp-frps holds tunnel registrations in memory per instance and Cloud Map
-# uses MULTIVALUE routing, so scaling beyond 1 today drops ~(N-1)/N of tunnel
-# requests. Tracked in #1499 (consistent-hash routing in qurl-router OR shared
-# registry in nhp-frps). Leave the defaults at 1 in env tfvars until #1499 is
-# resolved; the variables exist now so that the eventual scale-up is a tfvars
-# diff and not a module change.
+# Per-AZ Cloud Map fanout (#1499) decouples tunnel routing from MULTIVALUE
+# DNS by putting each ASG instance on its own AZ-keyed service. Sandbox
+# and prod both override sizing to length(frps_az_suffixes) (default 3)
+# so the steady-state distribution is one instance per AZ. Module defaults
+# stay at 1 to keep the module consumable in isolation.
 
 variable "frps_min_size" {
-  description = "ASG minimum size for qurl-frps. Default 1; do not raise without resolving #1499."
+  description = "ASG minimum size for qurl-reverse-tunnel-server. Default 1; production envs set this to length(frps_az_suffixes) for one-instance-per-AZ via the per-AZ Cloud Map fanout."
   type        = number
   default     = 1
 
@@ -1852,7 +1851,7 @@ variable "frps_min_size" {
 }
 
 variable "frps_max_size" {
-  description = "ASG maximum size for qurl-frps. Default 1; do not raise without resolving #1499."
+  description = "ASG maximum size for qurl-reverse-tunnel-server. Default 1; production envs match min_size and length(frps_az_suffixes)."
   type        = number
   default     = 1
 
@@ -1863,13 +1862,42 @@ variable "frps_max_size" {
 }
 
 variable "frps_desired_capacity" {
-  description = "ASG desired capacity for qurl-frps. Default 1; do not raise without resolving #1499."
+  description = "ASG desired capacity for qurl-reverse-tunnel-server. Default 1; production envs set this to length(frps_az_suffixes) for one-instance-per-AZ steady state."
   type        = number
   default     = 1
 
   validation {
     condition     = var.frps_desired_capacity >= 1 && floor(var.frps_desired_capacity) == var.frps_desired_capacity
     error_message = "frps_desired_capacity must be an integer >= 1 — see frps_min_size."
+  }
+}
+
+# Per-AZ Cloud Map services for the qurl-reverse-tunnel-server. Threaded
+# into BOTH the qurl-frps module (which creates the Cloud Map services)
+# and the qurl-service module (whose `QURL_FRPS_AZ_SUFFIXES` env var
+# drives the OwnerID-to-AZ hash) from the same source of truth so they
+# can't drift.
+# See `terraform/modules/qurl-frps/main.tf` header for the full cross-repo
+# contract — the parallel qurl-service and frpc PRs consume this same set
+# of suffixes via their own config surfaces.
+variable "frps_az_suffixes" {
+  description = "AZ suffix letters that qurl-frps creates per-AZ Cloud Map services for, and that qurl-service hashes OwnerID into. Default `[\"a\", \"b\", \"c\"]` matches us-east-{1,2}{a,b,c}. Each entry must be a single lowercase letter."
+  type        = list(string)
+  default     = ["a", "b", "c"]
+
+  # NOTE: validation logic duplicated from
+  # `terraform/modules/qurl-frps/variables.tf` (module-level
+  # `frps_az_suffixes`). The root copy fences a typo at plan time even when
+  # `deploy_frps = false` keeps the module out of the graph; the module
+  # copy covers module-direct consumers. Keep both in lockstep.
+  validation {
+    condition     = length(var.frps_az_suffixes) > 0 && alltrue([for s in var.frps_az_suffixes : can(regex("^[a-z]$", s))])
+    error_message = "frps_az_suffixes must be a non-empty list of single lowercase letters (e.g., [\"a\", \"b\", \"c\"]) — each entry is the trailing letter of an AWS AZ name."
+  }
+
+  validation {
+    condition     = length(toset(var.frps_az_suffixes)) == length(var.frps_az_suffixes)
+    error_message = "frps_az_suffixes must not contain duplicates (each suffix maps to a distinct Cloud Map service)."
   }
 }
 

@@ -8,30 +8,49 @@
 # - AC Traefik -> frps:7000 (FRP control channel, WebSocket)
 # - AC Traefik -> frps:8080 (vhost HTTP, proxied to customer backends)
 #
-# v1: Single instance by default (min/max/desired all default to 1; the
-# values are exposed as module variables but env tfvars do not override
-# them yet — see #1499). Acceptable for initial deployment because FRP
-# clients reconnect automatically on server restart. The ASG provides
-# self-healing (auto-replace on instance failure). Multi-instance with
-# sticky sessions / shared registry is a future enhancement tracked in
-# #1499.
+# Multi-AZ tunnel routing (#1499): nhp-frps holds tunnel registrations in
+# memory per process, so we can't put N instances behind one Cloud Map
+# service and expect tunnel routing to work — DNS would return IPs in
+# random order and ~(N-1)/N of requests would hit instances without the
+# registration. Instead, we publish ONE Cloud Map service per AZ
+# (`frps-a.${namespace}`, `frps-b.${namespace}`, ...) and qurl-service
+# hashes `OwnerID` to a fixed AZ when emitting `frps_addr` in
+# CreateResource / GetResourceTarget responses. Both `frpc` (registering
+# tunnels) and the AC's qurl-router (forwarding vhost traffic) read the
+# same `frps_addr` and converge on the same instance.
 #
-# Cloud Map lifecycle during ASG replacement: with `create_before_destroy`
-# and min=max=1, a brief window (up to the 30s DNS TTL) exists where both
-# the new and old instances are registered in the frps Cloud Map service
-# using MULTIVALUE routing. Traefik will round-robin between them until
-# the old instance's systemd shutdown runs `ExecStop=cloudmap-deregister`
-# (`BindsTo=qurl-frps.service` guarantees this fires when the ASG
-# terminate sends SIGTERM). Reconnecting FRP clients retry on failure
-# so the ~30s split-brain is not user-visible. A stricter approach —
-# `aws_autoscaling_lifecycle_hook` on `Terminating:Wait` blocking until
-# deregister completes — is tracked in #1089 alongside the custom
-# health-check work.
+# Cross-repo contract enforced by:
+# - frps_az_suffixes default `["a", "b", "c"]` (this module)
+# - QURL_FRPS_AZ_SUFFIXES on qurl-service (must agree)
+# - QURL_FRPS_DOMAIN     = "${namespace_name}"
+# - QURL_FRPS_PORT       = ${frps_vhost_http_port}  (default 8080)
+# Backend URL pattern: http://frps-${az_suffix}.${namespace_name}:${port}
 #
-# At N>1 the same TTL window applies but with N concurrent registrations on
-# each side, which compounds the routing problem (in-memory tunnel state on
-# only one of the new instances). #1499 covers the registry-coherence work
-# that makes the N>1 case correct, not just survivable.
+# Cloud Map lifecycle during instance replacement (two distinct mechanisms):
+#
+# - The launch template's `lifecycle { create_before_destroy = true }`
+#   (below) covers LT-version churn: a Terraform-driven LT change
+#   provisions the new LT version before destroying the old one, so the
+#   ASG never references a deleted version mid-apply.
+# - The ASG's instance-refresh policy covers per-instance replacement
+#   on a running fleet: each instance is launched, drained, and
+#   terminated in series.
+#
+# Both paths produce a brief window (up to the 30s DNS TTL) where the
+# new and old instances are registered against the same per-AZ Cloud
+# Map service. Each per-AZ service has only ONE registration at steady
+# state, so a replacement creates a transient pair. With WEIGHTED
+# routing on a DNS-namespace service, the Route 53 resolver returns
+# ONE A record per query (weight-biased; `1` default weight ⇒ uniform
+# random) — `frpc` and `qurl-router` both consume `frps_addr` via DNS
+# rather than the `DiscoverInstances` API, so each reconnect lands on
+# one or the other instance until the old instance's systemd shutdown
+# runs `ExecStop=cloudmap-deregister` (`BindsTo=qurl-frps.service`
+# guarantees this fires when the ASG terminate sends SIGTERM). FRP
+# clients reconnect on failure, so the ~30s split-brain isn't user-
+# visible. A stricter approach — `aws_autoscaling_lifecycle_hook` on
+# `Terminating:Wait` blocking until deregister completes — is tracked
+# in #1089 alongside the custom health-check work.
 
 # ==================== Data Sources ====================
 
@@ -47,6 +66,36 @@ data "aws_ssm_parameter" "ubuntu_ami" {
   name = "/aws/service/canonical/ubuntu/server/noble/stable/current/amd64/hvm/ebs-gp3/ami-id"
 }
 
+# Resolve the AZ of each private subnet so we can fence
+# `frps_az_suffixes` against the actual AZ coverage of the VPC. Without
+# this fence, an environment with subnets in only `[a, b]` paired with
+# `frps_az_suffixes = ["a","b","c"]` would silently apply, create a
+# `frps-c` Cloud Map service, and never register a single instance
+# against it — every OwnerID hashing to `c` would resolve NXDOMAIN.
+data "aws_subnet" "private" {
+  for_each = toset(var.private_subnet_ids)
+  id       = each.value
+}
+
+# Subnet/AZ alignment fence (#1499). Plan-time, so a misconfigured VPC
+# fails on PR review rather than at runtime when the empty Cloud Map
+# service starts returning NXDOMAIN.
+resource "terraform_data" "subnet_az_alignment" {
+  lifecycle {
+    precondition {
+      # Trailing letter of each subnet's AZ name. AWS AZ names are
+      # `{region}{letter}`; we extract the same single-letter suffix
+      # the user_data extracts at boot from IMDS so the two views
+      # agree by construction.
+      condition = length(setsubtract(
+        toset(var.frps_az_suffixes),
+        toset([for s in data.aws_subnet.private : substr(s.availability_zone, length(s.availability_zone) - 1, 1)])
+      )) == 0
+      error_message = "private_subnet_ids must include at least one subnet in every AZ listed in frps_az_suffixes — otherwise the corresponding Cloud Map service will never get a registration and OwnerIDs hashing to that suffix will resolve NXDOMAIN."
+    }
+  }
+}
+
 # ==================== Locals ====================
 
 locals {
@@ -54,10 +103,23 @@ locals {
   region     = data.aws_region.current.id
 
   user_data = templatefile("${path.module}/user_data.sh.tpl", {
-    region                    = local.region
-    account_id                = local.account_id
-    environment               = var.environment
-    cloudmap_service_id       = aws_service_discovery_service.frps.id
+    region      = local.region
+    account_id  = local.account_id
+    environment = var.environment
+    # Per-AZ Cloud Map service IDs, keyed by AZ suffix (`a` → service ID).
+    # User_data renders these into a Bash associative array and looks up
+    # the right service ID by the instance's IMDS-reported AZ at boot.
+    # A bare for-expression (not a sorted list) is fine: templatefile
+    # iterates the map deterministically (Terraform sorts string keys),
+    # so the rendered Bash array is stable across plans for the same
+    # input set. The deterministic-rendering note matters because the
+    # whole user_data string flows through `base64gzip` — a non-stable
+    # ordering would force the launch template to bump its
+    # latest_version every plan.
+    cloudmap_service_ids = {
+      for s, svc in aws_service_discovery_service.frps_per_az : s => svc.id
+    }
+    frps_az_suffixes          = var.frps_az_suffixes
     namespace_name            = var.namespace_name
     log_group_name            = aws_cloudwatch_log_group.frps.name
     frps_bind_port            = var.frps_bind_port
@@ -165,7 +227,15 @@ resource "aws_iam_role_policy" "frps" {
         # (renaming those would destroy the CI-published image_tag). Tracked by #1668.
         Resource = "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/frps/*"
       },
-      # Cloud Map registration
+      # Cloud Map registration. Scoped to ALL per-AZ services rather than
+      # just the one matching this instance's AZ — the instance picks its
+      # service at boot from IMDS, and we don't know the AZ at IAM-policy
+      # time. The set is bounded (one ARN per AZ suffix, default 3) and
+      # the only privilege granted is to (de)register the instance's own
+      # IP, so the scope here is still strictly tighter than `Resource =
+      # "*"`. The `for ... : svc.arn` projection produces a deterministic
+      # list (Terraform sorts string keys when iterating a `for_each` map),
+      # which IAM then treats as a set — sorting is unnecessary.
       {
         Sid    = "CloudMapRegister"
         Effect = "Allow"
@@ -173,7 +243,7 @@ resource "aws_iam_role_policy" "frps" {
           "servicediscovery:RegisterInstance",
           "servicediscovery:DeregisterInstance"
         ]
-        Resource = aws_service_discovery_service.frps.arn
+        Resource = [for svc in aws_service_discovery_service.frps_per_az : svc.arn]
       },
       # ECR access (split: GetAuthorizationToken must be * per AWS docs;
       # pull actions scoped to specific repo ARN, consistent with AC module)
@@ -321,11 +391,24 @@ resource "aws_vpc_security_group_egress_rule" "frps_all" {
   })
 }
 
-# ==================== Cloud Map Service Discovery ====================
+# ==================== Cloud Map Service Discovery (per-AZ) ====================
+#
+# One Cloud Map service per AZ suffix. qurl-service hashes OwnerID to one of
+# these suffixes and emits the matching `frps-${suffix}.${namespace_name}`
+# DNS name as `frps_addr` in CreateResource / GetResourceTarget responses,
+# so frpc and qurl-router converge on the same instance. See module header
+# and #1499 for the full cross-repo contract.
+#
+# Routing policy: WEIGHTED with 1 instance per service at steady state. The
+# old single-service config used MULTIVALUE because the service held N
+# instances; with one-per-AZ each service holds 1, and WEIGHTED returns
+# that single record without the round-robin bias MULTIVALUE imposes. Both
+# work in practice for N=1 but WEIGHTED matches intent.
+resource "aws_service_discovery_service" "frps_per_az" {
+  for_each = toset(var.frps_az_suffixes)
 
-resource "aws_service_discovery_service" "frps" {
-  name        = "frps"
-  description = "QURL FRP tunnel server"
+  name        = "frps-${each.key}"
+  description = "qurl-reverse-tunnel-server — AZ suffix '${each.key}'"
 
   dns_config {
     namespace_id = var.namespace_id
@@ -335,7 +418,7 @@ resource "aws_service_discovery_service" "frps" {
       type = "A"
     }
 
-    routing_policy = "MULTIVALUE"
+    routing_policy = "WEIGHTED"
   }
 
   # Custom health check config: registering this block enables Cloud Map to
@@ -416,8 +499,37 @@ resource "aws_launch_template" "frps" {
 }
 
 # ==================== Auto Scaling Group ====================
-# Single instance by default — see module header for v1 rationale and
-# #1499 for the work required before raising min/max/desired above 1.
+# Module default is 1/1/1 so the module is still consumable in isolation,
+# but env tfvars override to N/N/N where N == length(frps_az_suffixes) to
+# get one instance per AZ at steady state. AWS ASG balances launches
+# across distinct subnets-per-AZ; capacity events (ICE in one AZ, instance
+# refresh, single-AZ outage) can leave the steady-state distribution
+# briefly skewed.
+#
+# Alarm coverage today: monitoring.tf has `instance_status_check_failed`
+# (PAGE: fleet drops below 1 in-service) and `fleet_undersized` (TICKET:
+# fleet count < desired_capacity for 15 min). Neither catches *intra-fleet
+# AZ skew*: a fleet of 3 with distribution `(a=2, b=1, c=0)` satisfies
+# both alarms while `frps-c.${var.namespace_name}` returns NXDOMAIN for
+# ~1/3 of OwnerIDs. Two coverage layers exist for that bug class:
+#
+#   - Detection: an empty-AZ alarm (synthetic DNS canary or per-service
+#     `DiscoverInstances` Lambda) tracked in #1542. Catches the skew
+#     within a few minutes of it occurring; cheap to ship.
+#   - Structural fence: an ASG-per-AZ refactor (one ASG pinned to one
+#     subnet, each `min=max=desired=1`) eliminates the bug class entirely
+#     by removing single-ASG distribution from the picture. Larger
+#     refactor; tracked under parent #1499 (no PR filed yet).
+#
+# Deploy gating policy:
+#   - Sandbox flip (`deploy_frps = true`, see #1544): #1542 is the minimum
+#     bar — the alarm is the only fence between an `(a=2,b=1,c=0)`
+#     rebalance and silent NXDOMAIN, but blast radius is sandbox-only and
+#     #1542 surfaces the skew within minutes.
+#   - Prod flip: requires the ASG-per-AZ refactor in addition to #1542.
+#     Detection-only is acceptable for a single-env burn-in; it is not
+#     acceptable for production where the failure mode is silent
+#     ~1/N customer-traffic loss.
 
 resource "aws_autoscaling_group" "frps" {
   name                = "${var.name_prefix}-frps"

@@ -1191,9 +1191,15 @@ cat >> /home/ubuntu/traefik/dynamic.toml << QURLDYNAMICEOF
   circuitBreakerThreshold = 5
   circuitBreakerTimeout = 30
   evictionPercent = 10
-%{ if frp_server_host != "" ~}
-  frpServerUrl = "http://${frp_server_host}:${frp_vhost_http_port}"
-%{ endif ~}
+  # frpServerUrl deliberately empty: with the per-AZ qurl-reverse-tunnel-server
+  # fleet (#1499), there's no single backend to point at — each customer's
+  # tunnel lives on a specific AZ-pinned instance, and qurl-router reads the
+  # per-resource `frps_addr` from the QURL API to route there. The plugin
+  # already accepts an empty `frpServerUrl` (traefik-plugins #95) and
+  # uses the API-supplied address exclusively. The `frp_server_host`
+  # input variable is preserved as a no-op for module-API stability;
+  # see the variable description for the full deprecation note.
+  frpServerUrl = ""
 
 [http.routers.qurl-site]
   rule = "HostRegexp(\`^.+\\\\.${qurl_router_base_domain}\$\`)"
@@ -1248,11 +1254,25 @@ echo "Custom domain routing enabled (catch-all router + TLS certs via custom-dom
 %{ if frp_server_host != "" && qurl_router_enabled ~}
 # FRP tunnel server routes - WebSocket control channel and vhost HTTP
 #
-# Guard: both `frp_server_host` AND `qurl_router_enabled`. The FRP control
-# channel without the qurl-router plugin would be half-wired — clients can
-# connect and register tunnels, but vhost HTTP (customer subdomain routing
-# through the plugin to frps:8080) would be missing. Without both, don't
-# advertise the control endpoint.
+# DEAD CODE as of #1499. The only in-tree caller (terraform/main.tf) welds
+# `frp_server_host = ""`, so this `if frp_server_host != ""` branch never
+# evaluates true under the current root wiring. With the per-AZ
+# qurl-reverse-tunnel-server fleet, frpc connects to its assigned per-AZ
+# instance directly via the API-supplied `frps_addr` (no Traefik FRP-control
+# router needed), and the qurl-router plugin reads the same `frps_addr`
+# for vhost HTTP forwarding (no `frpServerUrl` fallback needed — see
+# traefik-plugins #95). This block plus the `frp_server_host` /
+# `frp_control_port` / `frp_vhost_http_port` variables are all slated for
+# deletion in a follow-up cleanup PR once the per-AZ rollout is verified
+# in prod; retained here only because this PR is scope-limited to the
+# cross-repo plumbing.
+#
+# Original guard rationale (still accurate if the variable is ever
+# re-wired): both `frp_server_host` AND `qurl_router_enabled`. The FRP
+# control channel without the qurl-router plugin would be half-wired —
+# clients can connect and register tunnels, but vhost HTTP (customer
+# subdomain routing through the plugin to frps:8080) would be missing.
+# Without both, don't advertise the control endpoint.
 cat >> /home/ubuntu/traefik/dynamic.toml << FRPDYNAMICEOF
 
 # FRP WebSocket control channel

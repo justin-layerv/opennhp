@@ -933,8 +933,19 @@ module "ac" {
   # Secret reconciliation (cleanup orphaned per-instance secrets)
   enable_secret_reconciliation = var.enable_secret_reconciliation
 
-  # FRP tunnel server integration (conditional: only when FRP is deployed alongside AC)
-  frp_server_host     = var.deploy_frps ? "frps.${module.data.namespace_name}" : ""
+  # qurl-reverse-tunnel-server integration. With the per-AZ fleet (#1499),
+  # there's no single tunnel-server host to point Traefik at — frpc connects
+  # directly to the per-AZ instance via the API-supplied `frps_addr`, and
+  # the AC's qurl-router plugin reads the same per-resource `frps_addr`
+  # from the QURL API for vhost forwarding. Setting `frp_server_host = ""`
+  # disables both the legacy `/.well-known/layerv-frp` Traefik control-
+  # channel router and the legacy `frpServerUrl` plugin fallback (the
+  # plugin already accepts an empty value — traefik-plugins #95).
+  # `frp_control_port` / `frp_vhost_http_port` are still threaded for
+  # module-API stability; a follow-up may delete the AC-side variables
+  # and the `if frp_server_host != ""` branch entirely once the per-AZ
+  # rollout is verified in prod.
+  frp_server_host     = ""
   frp_control_port    = var.frps_bind_port
   frp_vhost_http_port = var.frps_vhost_http_port
 
@@ -1090,6 +1101,28 @@ resource "terraform_data" "frps_preconditions" {
       condition     = !can(regex("^v0\\.0\\.0-bootstrap", var.frps_image_tag))
       error_message = "deploy_frps requires frps_image_tag to be overridden from the bootstrap placeholder. Set it to the real tag CI is publishing."
     }
+    precondition {
+      # ASG sizing must match the per-AZ Cloud Map fanout (#1499). With
+      # one instance per AZ at steady state, frps_desired_capacity must
+      # equal length(frps_az_suffixes); a mismatch — e.g. 4 instances
+      # with 3 AZ suffixes — would inevitably double-register some AZ's
+      # Cloud Map service or leave another empty (NXDOMAIN for any
+      # OwnerID hashing into the empty AZ). Plan-time fence so the
+      # operator hits the typo on PR review, not on the deploy-flip.
+      condition     = var.frps_desired_capacity == length(var.frps_az_suffixes)
+      error_message = "deploy_frps requires frps_desired_capacity == length(frps_az_suffixes) — one instance per AZ Cloud Map service. Mismatch double-registers some AZ or leaves another empty."
+    }
+    precondition {
+      # min == max == desired keeps the ASG at a fixed size that matches
+      # the Cloud Map fanout; allowing min < desired means a scale-up
+      # event would land an instance in some AZ as a duplicate. ASG-per-
+      # AZ is the structurally correct fence (one ASG pinned to one
+      # subnet, each min=max=desired=1), but until that lands this
+      # tighter equality at least keeps the runtime drift down to "ASG
+      # rebalance" rather than "ASG rebalance + scale-up race".
+      condition     = var.frps_min_size == var.frps_max_size && var.frps_max_size == var.frps_desired_capacity
+      error_message = "deploy_frps requires frps_min_size == frps_max_size == frps_desired_capacity — fixed-size fleet matches the per-AZ Cloud Map fanout. Allowing scale-up would let a rebalance double-register an AZ."
+    }
   }
 }
 
@@ -1147,12 +1180,17 @@ module "qurl_frps" {
   # Instance configuration
   instance_type = var.frps_instance_type
 
-  # ASG sizing — defaults to 1/1/1 because tunnel registrations are
-  # in-memory per instance. Tracked in #1499; once that lands, env tfvars
-  # flip to one-per-AZ.
+  # ASG sizing — env tfvars flip to one-per-AZ (3/3/3) once the
+  # cross-repo per-AZ contract lands (#1499). Module defaults remain
+  # 1/1/1 so the module can still be consumed in isolation.
   min_size         = var.frps_min_size
   max_size         = var.frps_max_size
   desired_capacity = var.frps_desired_capacity
+
+  # Per-AZ Cloud Map suffixes — must agree with the qurl-service env vars
+  # below (QURL_FRPS_AZ_SUFFIXES) and with the frpc consumption side. See
+  # the qurl-frps module header for the cross-repo contract.
+  frps_az_suffixes = var.frps_az_suffixes
 
   # Port configuration (shared with AC module via root variables)
   frps_bind_port       = var.frps_bind_port
@@ -1594,6 +1632,19 @@ module "qurl_service" {
 
   # NHP integration (headless resolve)
   nhp_server_internal_url = var.deploy_ac ? "http://server.${module.data.namespace_name}:8888" : ""
+
+  # qurl-reverse-tunnel-server per-AZ routing (#1499). Threaded from the
+  # SAME root source of truth that the qurl-frps module reads above
+  # (`var.frps_az_suffixes`, `module.data.namespace_name`,
+  # `var.frps_vhost_http_port`) so the qurl-service env vars can never
+  # drift from what the tunnel server actually publishes. Empty/zero when
+  # `deploy_frps = false` so qurl-service falls back to its previous
+  # behavior (no `frps_addr` in API responses), and the qurl-service
+  # module's own ternary in `container_env` skips the env vars
+  # entirely.
+  frps_az_suffixes = var.deploy_frps ? join(",", var.frps_az_suffixes) : ""
+  frps_domain      = var.deploy_frps ? module.data.namespace_name : ""
+  frps_port        = var.deploy_frps ? var.frps_vhost_http_port : 0
 
   # QURL defaults
   cookie_domain        = var.qurl_cookie_domain

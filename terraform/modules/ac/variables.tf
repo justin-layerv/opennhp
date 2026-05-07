@@ -602,7 +602,7 @@ variable "secret_reconciliation_deletion_spike_threshold" {
 # ============================================================================
 
 variable "frp_server_host" {
-  description = "Internal DNS hostname for the FRP server (e.g., 'frps.nhp.sandbox.internal'). When non-empty, Traefik routes are added for FRP WebSocket control and vhost HTTP traffic."
+  description = "DEPRECATED — dead-code gate as of the per-AZ qurl-reverse-tunnel-server fleet (#1499). The only in-tree caller (terraform/main.tf) sets this to \"\" unconditionally, so the `if frp_server_host != \"\"` guards on both the qurl-router plugin's `frpServerUrl` and the legacy `/.well-known/layerv-frp` Traefik FRP-control router are welded shut from the root. The plugin now reads per-resource `frps_addr` from the QURL API for vhost forwarding, and frpc connects to the per-AZ instance directly via the API-supplied `frps_addr` for the control channel — neither path touches this variable any more. Retained as a module input for API stability; the variable and the gated user_data branches are slated for deletion in a follow-up cleanup PR once the per-AZ rollout is verified in prod (#1499)."
   type        = string
   default     = ""
 }

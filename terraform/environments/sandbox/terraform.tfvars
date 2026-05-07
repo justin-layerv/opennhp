@@ -325,6 +325,36 @@ deploy_redis = true
 deploy_cost_analytics = true
 
 # ==============================================================================
+# qurl-reverse-tunnel-server (per-AZ tunnel routing)
+# ==============================================================================
+# Multi-AZ ASG sizing for the per-AZ qurl-reverse-tunnel-server fleet (#1499).
+# qurl-service hashes OwnerID to one of frps_az_suffixes and emits the matching
+# DNS name as `frps_addr` in API responses, so frpc and qurl-router converge on
+# the same instance. The ASG runs at desired = 3 (one instance per AZ); each
+# instance reads its AZ from IMDS at boot and registers with the matching
+# Cloud Map service. Module defaults remain 1/1/1 so the module can still
+# be consumed in isolation; the override here is what flips on multi-AZ.
+#
+# Sandbox is the first env to flip `deploy_frps = true`. The structural
+# risks (single-ASG distribution skew, intra-fleet AZ-empty NXDOMAIN) and
+# the alarm-coverage gaps that motivate the per-AZ refactor + #1542
+# detection alarm are documented in the long-form comment in
+# `modules/qurl-frps/main.tf` above `aws_autoscaling_group.frps`. The
+# cross-repo gating list (qurl-service, traefik-plugins, frpc, etc.) lives
+# in the PR description for #1544 — it's release-time coordination, not
+# an invariant worth duplicating here.
+deploy_frps = true
+# Pinned at the env level (matches the module default in
+# `terraform/variables.tf`) so a future default change can't silently
+# flip sandbox onto a different suffix set — the OwnerID-hash ↔
+# frps-${suffix}.${namespace} mapping must stay stable across
+# qurl-service, frpc, and traefik-plugins.
+frps_az_suffixes      = ["a", "b", "c"]
+frps_min_size         = 3
+frps_max_size         = 3
+frps_desired_capacity = 3
+
+# ==============================================================================
 # QURL Plugin Configuration (NHP Server)
 # Enables qurl.link.layerv.xyz → qurl.site.layerv.xyz authentication flow in NHP Server
 # ==============================================================================

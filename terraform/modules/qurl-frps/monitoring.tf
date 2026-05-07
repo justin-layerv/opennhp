@@ -8,8 +8,14 @@ locals {
 # ==================== CloudWatch Alarms ====================
 
 # No in-service instances - PAGE severity
-# If the single FRP server instance is terminated (e.g., failed status check),
-# GroupInServiceInstances drops to 0 and all tunnel traffic is disrupted.
+# Fleet-level survival check: fires when the qurl-reverse-tunnel-server
+# fleet drops below 1 in-service instance and ALL tunnel traffic is
+# disrupted. Per-AZ blast radius is finer-grained than this alarm covers
+# — losing 1 of 3 instances under the per-AZ fanout already disrupts
+# ~1/3 of tunnels (the Cloud Map service for the lost instance's AZ goes
+# empty, NXDOMAIN for any OwnerID hashing there). Per-AZ skew detection
+# is tracked in #1542 and must land before the deploy_frps flip; this
+# alarm stays as the fleet-survival backstop underneath that finer alarm.
 # Note: StatusCheckFailed in AWS/EC2 uses InstanceId as its dimension and
 # cannot be aggregated by AutoScalingGroupName. GroupInServiceInstances in
 # AWS/AutoScaling is the correct ASG-level health signal.
@@ -18,10 +24,10 @@ resource "aws_cloudwatch_metric_alarm" "instance_status_check_failed" {
 
   alarm_name          = "${var.name_prefix}-frps-no-healthy-instance"
   comparison_operator = "LessThanThreshold"
-  # 3 × 60s tolerance: the min=max=1 ASG briefly drops to 0 in-service
-  # instances during every instance refresh (no surge capacity possible).
-  # 3 evaluation periods is enough to ride through a normal ~2 min refresh
-  # gap without paging, while still firing within 3-4 min for real outages.
+  # 3 × 60s tolerance: ASG briefly drops below desired during every
+  # instance refresh; 3 evaluation periods rides through a normal ~2 min
+  # refresh gap without paging, while still firing within 3-4 min for
+  # real outages.
   evaluation_periods = 3
   metric_name        = "GroupInServiceInstances"
   namespace          = "AWS/AutoScaling"
@@ -41,6 +47,75 @@ resource "aws_cloudwatch_metric_alarm" "instance_status_check_failed" {
   tags = merge(var.tags, {
     Name     = "${var.name_prefix}-frps-no-healthy-instance"
     Severity = "page"
+  })
+}
+
+# Fleet undersized - TICKET severity
+# Per-AZ Cloud Map fanout (#1499) requires one ASG instance per AZ
+# suffix at steady state. When `desired_capacity > 1` (the production
+# multi-AZ posture), GroupInServiceInstances persistently below the
+# desired capacity indicates a stuck launch / capacity error / ICE in
+# one AZ — qurl-service's hash will route some OwnerIDs to a Cloud Map
+# service with zero registrations, returning NXDOMAIN. The pure
+# "no-healthy-instance" alarm above only fires at < 1, which misses
+# the partial-degradation case.
+#
+# Skipped when desired_capacity == 1 to avoid noise on the module's
+# default sizing (single-AZ test fixtures, isolated-module deploys).
+# Threshold = desired_capacity, evaluated as "below" — so a fleet of 3
+# with only 2 in-service trips this alarm even though
+# GroupInServiceInstances >= 1 (the page alarm) is satisfied.
+#
+# Avoiding flap on instance refresh: the smoothing in this alarm comes
+# from `evaluation_periods = 15`, NOT from `statistic = Average`.
+# `AWS/AutoScaling::GroupInServiceInstances` publishes at 1-minute
+# resolution, so with `period = 60` there is exactly one sample per
+# period — Average ≡ Minimum ≡ Maximum at this granularity. Requiring
+# 15 consecutive sub-threshold periods (CloudWatch's default M-of-N is
+# N-of-N) is what lets a 3-instance rolling refresh ride through: the
+# refresh briefly drops to 2 in-service for ~1-2 min per instance,
+# total ~6-10 min, which trips at most 6-10 of the 15 periods → no
+# alarm. A degenerate stuck launch sustains 2 for 16+ min and fires.
+# `Average` is retained for forward compatibility should AWS ever
+# publish `GroupInServiceInstances` at sub-minute resolution via
+# `GroupMetricsCollection`; today it is functionally equivalent to
+# `Minimum`, and the alarm semantics depend on the evaluation_periods
+# count, not on the statistic.
+#
+# `treat_missing_data = "notBreaching"` here is intentionally asymmetric
+# with the page-severity `instance_status_check_failed` alarm above
+# (which uses `"breaching"`). Rationale: a metric publication gap on
+# `GroupInServiceInstances` is itself an AWS/AutoScaling outage — the
+# page alarm correctly escalates that, since "is the fleet alive" is
+# unknown and the safe default is to wake someone up. The ticket alarm
+# would just generate noise on the same gap (we'd open a ticket about
+# fleet capacity when the underlying signal is missing, not when the
+# fleet is actually undersized). If you're tempted to "fix" this to
+# match the page alarm, don't — keep them asymmetric.
+resource "aws_cloudwatch_metric_alarm" "fleet_undersized" {
+  count = var.enable_cloudwatch_alarms && var.desired_capacity > 1 ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-frps-fleet-undersized"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 15
+  metric_name         = "GroupInServiceInstances"
+  namespace           = "AWS/AutoScaling"
+  period              = 60
+  statistic           = "Average"
+  threshold           = var.desired_capacity
+  alarm_description   = "qurl-reverse-tunnel-server fleet is below desired capacity (${var.desired_capacity}) for 15 consecutive minutes. Per-AZ Cloud Map fanout requires one instance per AZ — partial degradation routes some OwnerIDs to NXDOMAIN. Check ASG activity history for capacity errors / ICE / failed launches."
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.frps.name
+  }
+
+  alarm_actions = local.sns_actions
+  ok_actions    = local.sns_actions
+
+  tags = merge(var.tags, {
+    Name     = "${var.name_prefix}-frps-fleet-undersized"
+    Severity = "ticket"
   })
 }
 

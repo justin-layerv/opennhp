@@ -24,6 +24,30 @@ data "aws_subnet" "alb" {
   id       = each.value
 }
 
+# Per-AZ FRPS env-var triple must be set as an all-or-nothing group. The
+# `container_env` ternary in `local.container_env` already gates emission
+# on `frps_port != 0 && frps_domain != "" && frps_az_suffixes != ""`, but
+# a partial-config typo (e.g., a follow-up PR that only sets two of the
+# three) would silently fall back to qurl-service's pre-FRPS behavior
+# instead of failing closed. Plan-time fence so partial wiring is
+# rejected at PR review.
+resource "terraform_data" "frps_env_var_triple" {
+  lifecycle {
+    precondition {
+      # XOR of "all set" vs "all unset". `frps_port != 0` reads as "set"
+      # because the variable's "unset" sentinel is 0 (paired with empty-
+      # string sentinels for the other two). The booleans below collapse
+      # to true only when the trio agrees.
+      condition = (
+        var.frps_port == 0 && var.frps_domain == "" && var.frps_az_suffixes == ""
+        ) || (
+        var.frps_port != 0 && var.frps_domain != "" && var.frps_az_suffixes != ""
+      )
+      error_message = "qurl-service FRPS env vars (frps_az_suffixes, frps_domain, frps_port) must be set together or all unset. Partial wiring silently falls back to no `frps_addr` in API responses."
+    }
+  }
+}
+
 # SSM parameter for image tag - created with default, updated by CI
 # The CI pipeline updates this parameter after pushing a new image to ECR.
 # Using lifecycle ignore_changes so CI updates don't cause drift.
@@ -270,6 +294,18 @@ locals {
     var.nhp_server_internal_url != "" ? [
       { name = "NHP_SERVER_INTERNAL_URL", value = var.nhp_server_internal_url },
       { name = "NHP_KNOCK_TIMEOUT", value = tostring(var.nhp_knock_timeout_seconds) },
+    ] : [],
+    # FRPS per-AZ integration (#1499). qurl-service hashes OwnerID to a
+    # suffix and emits `frps-${suffix}.${domain}:${port}` as `frps_addr`
+    # in CreateResource / GetResourceTarget responses. All three vars
+    # must be set together — gated on `frps_port != 0` because Terraform
+    # comparisons of empty string in `concat([...], cond ? [...] : [])`
+    # are easy to typo, and a numeric `!= 0` reads unambiguously. The
+    # root module wires this only when `deploy_frps = true`.
+    var.frps_port != 0 && var.frps_domain != "" && var.frps_az_suffixes != "" ? [
+      { name = "QURL_FRPS_AZ_SUFFIXES", value = var.frps_az_suffixes },
+      { name = "QURL_FRPS_DOMAIN", value = var.frps_domain },
+      { name = "QURL_FRPS_PORT", value = tostring(var.frps_port) },
     ] : [],
     # GeoIP configuration (for geo-restriction policies)
     var.geoip_enabled ? concat([
