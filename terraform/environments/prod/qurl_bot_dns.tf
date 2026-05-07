@@ -18,11 +18,13 @@
 # Pairs with qurl-integrations-infra#440 (cert.tf prod domain switch).
 # Apply order:
 #   1. Merge this PR + dispatch promote-to-prod (run_terraform=true).
-#      The `moved {}` + `removed {}` blocks below rename the old state
-#      entry and drop it from state without destroying the AWS record
-#      (`lifecycle.destroy = false` on the removed block). The new
-#      `discord_bot_cert_validation` resource creates the new
-#      validation CNAME at the new name.
+#      The `moved {}` + `removed {}` blocks below drop the old state
+#      entry without destroying the AWS record (`destroy = false`).
+#      New resource takes the `_v2` suffix because both the original
+#      and `_legacy` names are still bound by HCL blocks above —
+#      not semantic versioning, just a name-collision dodge. The
+#      `moved`/`removed` blocks are inert post-apply and can be
+#      cleaned up later; the `_v2` suffix is permanent.
 #   2. ACM flips new cert to ISSUED within ~5-30 min once the new
 #      CNAME resolves. 72-hour ceiling on the validation window —
 #      see qurl-integrations-infra cert.tf header.
@@ -73,7 +75,7 @@ removed {
 # matches the `aws_route53_record.cloudfront_cert_validation` posture
 # in `terraform/modules/ac/main.tf` (idempotent against the ACM
 # console "Add record in Route 53" pre-staging button).
-resource "aws_route53_record" "discord_bot_cert_validation" {
+resource "aws_route53_record" "discord_bot_cert_validation_v2" {
   provider = aws.route53_mgmt
 
   allow_overwrite = true
@@ -86,8 +88,12 @@ resource "aws_route53_record" "discord_bot_cert_validation" {
   # Cert re-issuance escape hatch (token rotates → name change →
   # replace, blocked by prevent_destroy): use the same `moved {}` +
   # `removed { lifecycle { destroy = false } }` pattern as the header
-  # docblock above. Laptop `terraform state rm` is the fallback only
-  # when the operator can't ship a PR (e.g., emergency rollback).
+  # docblock above, but with FRESH suffixes — `_legacy` and `_v2` are
+  # already bound by HCL blocks in this file, so the next rotation
+  # needs e.g. `_legacy_v2` + `_v3` to avoid the same name-collision
+  # validator error this hotfix addressed.
+  # Laptop `terraform state rm` is the fallback only when the operator
+  # can't ship a PR (e.g., emergency rollback).
   lifecycle {
     prevent_destroy = true
 
