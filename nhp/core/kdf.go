@@ -9,7 +9,7 @@ import (
 // makeHashFunc wraps NewHash into a panic-on-error constructor suitable for
 // hmac.New. Using a package-level function value (rather than an inline
 // closure) avoids a heap allocation on every HMAC call — the KDF chain
-// invokes HMAC ~13 times per packet.
+// invokes HMAC ~10 times per packet.
 func makeHashFunc(t HashTypeEnum) func() hash.Hash {
 	return func() hash.Hash {
 		h, err := NewHash(t)
@@ -67,17 +67,30 @@ func (n *NoiseFactory) KeyGen1(dst0 *[HashSize]byte, key, input []byte) {
 func (n *NoiseFactory) KeyGen2(dst0, dst1 *[HashSize]byte, key, input []byte) {
 	var prk [HashSize]byte
 	n.HMAC1(&prk, key, input)
-	n.HMAC1(dst0, prk[:], []byte{0x1})
-	n.HMAC2(dst1, prk[:], dst0[:], []byte{0x2})
+	mac := hmac.New(n.hashFunc(), prk[:])
+	mac.Write([]byte{0x1})
+	mac.Sum(dst0[:0])
+	mac.Reset()
+	mac.Write(dst0[:])
+	mac.Write([]byte{0x2})
+	mac.Sum(dst1[:0])
 	SetZero(prk[:])
 }
 
 func (n *NoiseFactory) KeyGen3(dst0, dst1, dst2 *[HashSize]byte, key, input []byte) {
 	var prk [HashSize]byte
 	n.HMAC1(&prk, key, input)
-	n.HMAC1(dst0, prk[:], []byte{0x1})
-	n.HMAC2(dst1, prk[:], dst0[:], []byte{0x2})
-	n.HMAC2(dst2, prk[:], dst1[:], []byte{0x3})
+	mac := hmac.New(n.hashFunc(), prk[:])
+	mac.Write([]byte{0x1})
+	mac.Sum(dst0[:0])
+	mac.Reset()
+	mac.Write(dst0[:])
+	mac.Write([]byte{0x2})
+	mac.Sum(dst1[:0])
+	mac.Reset()
+	mac.Write(dst1[:])
+	mac.Write([]byte{0x3})
+	mac.Sum(dst2[:0])
 	SetZero(prk[:])
 }
 
