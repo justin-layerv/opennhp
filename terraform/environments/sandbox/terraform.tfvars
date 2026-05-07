@@ -206,9 +206,9 @@ qurl_internal_service_token_arn = "arn:aws:secretsmanager:us-east-2:767397897469
 
 # Tunnel-auth feature gate (qurl-service PR #277). Flipping this to true
 # wires TUNNEL_AUTH_ENABLED=true into the qurl-service ECS task, which:
-#   - mounts POST /internal/v1/tunnel/auth (consumed by qurl-frps' httpPlugin)
+#   - mounts POST /internal/v1/tunnel/auth (consumed by qurl-reverse-tunnel-server's httpPlugin)
 #   - allows POST /v1/qurls and POST /v1/resources to accept type=tunnel
-# Pre-req for the qurl-frps deploy (deploy_frps=true) to actually serve
+# Pre-req for the qurl-reverse-tunnel-server deploy (deploy_frps=true) to actually serve
 # tunnels — without it, FRPS clients would 404 on Login/NewProxy.
 qurl_tunnel_auth_enabled = true
 
@@ -339,7 +339,7 @@ deploy_cost_analytics = true
 # risks (single-ASG distribution skew, intra-fleet AZ-empty NXDOMAIN) and
 # the alarm-coverage gaps that motivate the per-AZ refactor + #1542
 # detection alarm are documented in the long-form comment in
-# `modules/qurl-frps/main.tf` above `aws_autoscaling_group.frps`. The
+# `modules/qurl-reverse-tunnel-server/main.tf` above `aws_autoscaling_group.frps`. The
 # cross-repo gating list (qurl-service, traefik-plugins, frpc, etc.) lives
 # in the PR description for #1544 — it's release-time coordination, not
 # an invariant worth duplicating here.

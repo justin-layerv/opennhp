@@ -219,7 +219,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 def _count_instances(service_name: str) -> int:
     # We pass `HealthStatus='ALL'` to future-proof the empty-detection
     # contract. Today every registered instance is implicitly HEALTHY
-    # (the qurl-frps module declares `health_check_custom_config` on
+    # (the qurl-reverse-tunnel-server module declares `health_check_custom_config` on
     # `aws_service_discovery_service.frps_per_az` in main.tf but no
     # caller invokes `UpdateInstanceCustomHealthStatus` yet — that's
     # tracked in #1089), so `ALL` and `HEALTHY` return the same set

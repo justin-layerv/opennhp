@@ -220,10 +220,10 @@ resource "aws_cloudwatch_log_metric_filter" "frps_errors" {
   #
   # FRP version assumption: this pattern targets the bracket-tag log
   # format used by FRP ≤ v0.51. Structured JSON logging is available
-  # since v0.52 and is the default in later versions. If the qurl-frps
+  # since v0.52 and is the default in later versions. If the qurl-reverse-tunnel-server
   # image pins or upgrades to FRP ≥ v0.52 with structured JSON, this
   # filter will stop matching and the alarm will silently green — pin
-  # the FRP version in the qurl-frps image CI, and when it bumps, update
+  # the FRP version in the qurl-reverse-tunnel-server image CI, and when it bumps, update
   # this filter together (or revisit #1091 to switch to JSON).
   pattern = "\"[E]\""
 

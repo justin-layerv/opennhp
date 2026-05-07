@@ -1,5 +1,5 @@
 # QURL FRP Server Module Variables
-# FRP tunnel server for proxying traffic to customer backends via qurl-reverse-proxy
+# FRP tunnel server for proxying traffic to customer backends via qurl-reverse-tunnel-client
 
 variable "environment" {
   description = "Environment name"
@@ -86,7 +86,7 @@ variable "ebs_kms_key_arn" {
 }
 
 variable "image_tag" {
-  description = "qurl-frps binary version tag (used to download from S3 or ECR). Default is a placeholder CI must overwrite on first deploy rather than `latest`, to prevent an unattended Terraform apply from pulling a moving tag."
+  description = "qurl-reverse-tunnel-server binary version tag (used to download from S3 or ECR). Default is a placeholder CI must overwrite on first deploy rather than `latest`, to prevent an unattended Terraform apply from pulling a moving tag."
   type        = string
   default     = "v0.0.0-bootstrap"
 }
@@ -157,7 +157,7 @@ variable "frps_bind_port" {
   default     = 7000
 
   validation {
-    # Floor at 1024: the qurl-frps systemd unit runs as the unprivileged
+    # Floor at 1024: the qurl-reverse-tunnel-server systemd unit runs as the unprivileged
     # `frps` user with no `AmbientCapabilities=CAP_NET_BIND_SERVICE`, so a
     # privileged port would fail `bindPort` setup with an opaque systemd
     # "Permission denied" at boot instead of a clear plan-time rejection.
@@ -208,7 +208,7 @@ variable "frps_subdomain_host" {
 }
 
 variable "frps_ecr_repo_arn" {
-  description = "Override for the ECR repository ARN that scopes qurl-frps IAM pull permissions. Defaults to a computed `arn:aws:ecr:<region>:<account>:repository/layerv/qurl-reverse-tunnel-server` when unset — matching the repo name created by the ECR module's `core_ecr_repos`. Set explicitly to pin to a different repo."
+  description = "Override for the ECR repository ARN that scopes qurl-reverse-tunnel-server IAM pull permissions. Defaults to a computed `arn:aws:ecr:<region>:<account>:repository/layerv/qurl-reverse-tunnel-server` when unset — matching the repo name created by the ECR module's `core_ecr_repos`. Set explicitly to pin to a different repo."
   type        = string
   default     = null
 }
@@ -233,21 +233,21 @@ variable "qurl_api_token_secret_arn" {
 
 variable "qurl_tunnel_auth_mode" {
   description = <<-EOT
-    Selects which qurl-frps auth mode the deployed instance runs in. One of:
+    Selects which qurl-reverse-tunnel-server auth mode the deployed instance runs in. One of:
 
-      ""             - Legacy api mode (default). qurl-frps validates each
+      ""             - Legacy api mode (default). qurl-reverse-tunnel-server validates each
                        NewProxy by calling qurl-service GET /resources/{id}
                        and matching FRP run_id against resource.connector_id.
                        The token in qurl_api_token_secret_arn is written to
                        the env as QURL_API_TOKEN.
 
       "tunnel-auth"  - Per-user API-key mode (qurl-reverse-tunnel-server PR
-                       #83). qurl-frps reads the user's lv_live_* API key
+                       #83). qurl-reverse-tunnel-server reads the user's lv_live_* API key
                        from FRP Login.Metas[qurl_api_key] (or PrivilegeKey
                        fallback) and forwards it to qurl-service POST
                        /internal/v1/tunnel/auth. Requires the
                        qurl-reverse-tunnel-client follow-up
-                       (layervai/qurl-reverse-tunnel-client#114) so qurl-frpc
+                       (layervai/qurl-reverse-tunnel-client#114) so qurl-reverse-tunnel-client
                        actually populates the meta. The token in
                        qurl_api_token_secret_arn is written to the env as
                        QURL_INTERNAL_SERVICE_TOKEN, and
@@ -267,7 +267,7 @@ variable "qurl_tunnel_auth_mode" {
 
   validation {
     condition     = var.qurl_tunnel_auth_mode == "" || var.qurl_tunnel_auth_mode == "tunnel-auth"
-    error_message = "qurl_tunnel_auth_mode must be \"\" (legacy api mode) or \"tunnel-auth\". Other values are rejected at startup by qurl-frps; reject here to surface the typo at plan time instead of at boot."
+    error_message = "qurl_tunnel_auth_mode must be \"\" (legacy api mode) or \"tunnel-auth\". Other values are rejected at startup by qurl-reverse-tunnel-server; reject here to surface the typo at plan time instead of at boot."
   }
 }
 
@@ -328,7 +328,7 @@ variable "min_size" {
     # `floor(...) == ...` rejects non-integers — `type = number` on its own
     # accepts 1.5, which would only fail at AWS-API time mid-apply.
     condition     = var.min_size >= 1 && floor(var.min_size) == var.min_size
-    error_message = "min_size must be an integer >= 1 — qurl-frps is the only path for tunnel traffic; N=0 means tunnel resources 502."
+    error_message = "min_size must be an integer >= 1 — qurl-reverse-tunnel-server is the only path for tunnel traffic; N=0 means tunnel resources 502."
   }
 }
 
@@ -339,7 +339,7 @@ variable "max_size" {
 
   validation {
     condition     = var.max_size >= 1 && floor(var.max_size) == var.max_size
-    error_message = "max_size must be an integer >= 1 — see min_size for rationale (qurl-frps is the only path for tunnel traffic)."
+    error_message = "max_size must be an integer >= 1 — see min_size for rationale (qurl-reverse-tunnel-server is the only path for tunnel traffic)."
   }
 }
 
@@ -350,6 +350,6 @@ variable "desired_capacity" {
 
   validation {
     condition     = var.desired_capacity >= 1 && floor(var.desired_capacity) == var.desired_capacity
-    error_message = "desired_capacity must be an integer >= 1 — see min_size for rationale (qurl-frps is the only path for tunnel traffic)."
+    error_message = "desired_capacity must be an integer >= 1 — see min_size for rationale (qurl-reverse-tunnel-server is the only path for tunnel traffic)."
   }
 }

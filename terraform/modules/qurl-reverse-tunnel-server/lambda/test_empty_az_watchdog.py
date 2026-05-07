@@ -2,7 +2,7 @@
 Tests for the qurl-reverse-tunnel-server per-AZ Cloud Map empty-registration watchdog (#1542).
 
 Run with:
-    python3 -m unittest discover -s terraform/modules/qurl-frps/lambda \
+    python3 -m unittest discover -s terraform/modules/qurl-reverse-tunnel-server/lambda \
         -p "test_*.py" -v
 
 No external dependencies - stdlib unittest.mock drives boto3.

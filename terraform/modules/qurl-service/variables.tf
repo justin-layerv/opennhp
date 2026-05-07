@@ -746,25 +746,25 @@ variable "nhp_knock_timeout_seconds" {
 # matching `frps-${suffix}.${frps_domain}:${frps_port}` as `frps_addr` in
 # CreateResource / GetResourceTarget responses. frpc and the AC's qurl-router
 # both consume this `frps_addr` so they converge on the same instance. All
-# three of these vars MUST agree with the qurl-frps module's own
+# three of these vars MUST agree with the qurl-reverse-tunnel-server module's own
 # frps_az_suffixes / namespace_name / frps_vhost_http_port (the root module
 # threads them from the same source of truth — see the cross-repo contract
-# in the qurl-frps module header).
+# in the qurl-reverse-tunnel-server module header).
 
 variable "frps_az_suffixes" {
-  description = "Comma-separated AZ suffixes that qurl-service hashes OwnerID into (e.g., \"a,b,c\"). The qurl-service Go consumer splits on `,` and trims whitespace per entry; each entry must be a single lowercase letter matching the regex `^[a-z]$` (same shape as the qurl-frps module's list-form `frps_az_suffixes` validation). Empty disables FRPS env-var threading entirely (the env vars below get omitted), which is the behavior when deploy_frps = false at the root. Must agree with qurl-frps module's frps_az_suffixes input — the root module joins from the same source of truth so drift is structurally impossible."
+  description = "Comma-separated AZ suffixes that qurl-service hashes OwnerID into (e.g., \"a,b,c\"). The qurl-service Go consumer splits on `,` and trims whitespace per entry; each entry must be a single lowercase letter matching the regex `^[a-z]$` (same shape as the qurl-reverse-tunnel-server module's list-form `frps_az_suffixes` validation). Empty disables FRPS env-var threading entirely (the env vars below get omitted), which is the behavior when deploy_frps = false at the root. Must agree with qurl-reverse-tunnel-server module's frps_az_suffixes input — the root module joins from the same source of truth so drift is structurally impossible."
   type        = string
   default     = ""
 }
 
 variable "frps_domain" {
-  description = "DNS namespace for per-AZ FRPS Cloud Map services (e.g., \"nhp.sandbox.internal\"). qurl-service constructs `frps-$${suffix}.$${frps_domain}:$${frps_port}` per resource. Empty disables FRPS env-var threading. Must agree with the namespace_name passed to qurl-frps."
+  description = "DNS namespace for per-AZ FRPS Cloud Map services (e.g., \"nhp.sandbox.internal\"). qurl-service constructs `frps-$${suffix}.$${frps_domain}:$${frps_port}` per resource. Empty disables FRPS env-var threading. Must agree with the namespace_name passed to qurl-reverse-tunnel-server."
   type        = string
   default     = ""
 }
 
 variable "frps_port" {
-  description = "FRPS vhost HTTP port qurl-service emits in `frps_addr`. Must agree with qurl-frps module's frps_vhost_http_port. Default 0 disables the env-var threading entirely (paired with the empty-string defaults above for the case where deploy_frps = false at the root)."
+  description = "FRPS vhost HTTP port qurl-service emits in `frps_addr`. Must agree with qurl-reverse-tunnel-server module's frps_vhost_http_port. Default 0 disables the env-var threading entirely (paired with the empty-string defaults above for the case where deploy_frps = false at the root)."
   type        = number
   default     = 0
 }

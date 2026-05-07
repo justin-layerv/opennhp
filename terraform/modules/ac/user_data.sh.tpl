@@ -1284,7 +1284,7 @@ cat >> /home/ubuntu/traefik/dynamic.toml << FRPDYNAMICEOF
 #      traffic. Reaches FRPS via the `frp-path-rewrite` middleware.
 #   2. /~!frp — the path FRP's WebSocket upgrade handler hardcodes
 #      (`pkg/util/net/websocket.go::FrpWebsocketPath` in
-#      github.com/fatedier/frp). Stock qurl-frpc clients use this path
+#      github.com/fatedier/frp). Stock qurl-reverse-tunnel-client clients use this path
 #      directly (FRP v0.68 has no `transport.subPath` config option to
 #      override it), so without an explicit router for this path the
 #      WebSocket request would fall through to the customer catch-all

@@ -667,7 +667,7 @@ jobs:
           # from another test file's conftest can't fire the runtime
           # check at the top of the test module.
           echo '::group::qurl-reverse-tunnel-server Empty-AZ Watchdog Lambda Tests'
-          (cd terraform/modules/qurl-frps/lambda && python -m pytest test_empty_az_watchdog.py -v)
+          (cd terraform/modules/qurl-reverse-tunnel-server/lambda && python -m pytest test_empty_az_watchdog.py -v)
           echo '::endgroup::'
           echo '::group::ECR Replication Check Lambda Tests'
           # Suite is serial-only — module re-imports per test for
@@ -1303,7 +1303,7 @@ jobs:
       # misconfiguration cannot silently fall through to "tfvars wins."
       #
       # Blast radius of `exit 1` here: blocks the entire `deploy-sandbox-infra`
-      # job, not just the qurl-frps module. This is intentional — silent
+      # job, not just the qurl-reverse-tunnel-server module. This is intentional — silent
       # drift on a cross-repo contract surface is worse than a loud failure
       # that pages whoever pushed the bad SSM value. If the
       # qurl-reverse-tunnel-server release pipeline writes a malformed tag,

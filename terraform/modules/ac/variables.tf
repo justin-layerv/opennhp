@@ -608,13 +608,13 @@ variable "frp_server_host" {
 }
 
 variable "frp_control_port" {
-  description = "FRP server control port (for WebSocket control channel routing). MUST match qurl-frps module's frps_bind_port — when both modules are composed via the root (terraform/main.tf) the same root variable `var.frps_bind_port` is threaded to both, which prevents drift. The default here exists only so the AC module can be consumed in isolation for testing; in production the root override is the source of truth."
+  description = "FRP server control port (for WebSocket control channel routing). MUST match qurl-reverse-tunnel-server module's frps_bind_port — when both modules are composed via the root (terraform/main.tf) the same root variable `var.frps_bind_port` is threaded to both, which prevents drift. The default here exists only so the AC module can be consumed in isolation for testing; in production the root override is the source of truth."
   type        = number
   default     = 7000
 }
 
 variable "frp_vhost_http_port" {
-  description = "FRP vhost HTTP port (for proxied customer traffic). MUST match qurl-frps module's frps_vhost_http_port — same root-variable threading story as `frp_control_port`."
+  description = "FRP vhost HTTP port (for proxied customer traffic). MUST match qurl-reverse-tunnel-server module's frps_vhost_http_port — same root-variable threading story as `frp_control_port`."
   type        = number
   default     = 8080
 }

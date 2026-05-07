@@ -1,7 +1,7 @@
 # QURL FRP Server Module
 #
-# Deploys the FRP tunnel server (qurl-frps) as an EC2 Auto Scaling Group.
-# The FRP server accepts connections from qurl-frpc clients and proxies
+# Deploys the FRP tunnel server (qurl-reverse-tunnel-server) as an EC2 Auto Scaling Group.
+# The FRP server accepts connections from qurl-reverse-tunnel-client instances and proxies
 # HTTP traffic to customer backends via vhost-based routing.
 #
 # Traffic flows:
@@ -45,7 +45,7 @@
 # random) — `frpc` and `qurl-router` both consume `frps_addr` via DNS
 # rather than the `DiscoverInstances` API, so each reconnect lands on
 # one or the other instance until the old instance's systemd shutdown
-# runs `ExecStop=cloudmap-deregister` (`BindsTo=qurl-frps.service`
+# runs `ExecStop=cloudmap-deregister` (`BindsTo=qurl-reverse-tunnel-server.service`
 # guarantees this fires when the ASG terminate sends SIGTERM). FRP
 # clients reconnect on failure, so the ~30s split-brain isn't user-
 # visible. A stricter approach — `aws_autoscaling_lifecycle_hook` on
@@ -302,7 +302,7 @@ resource "aws_iam_role_policy" "frps_secrets" {
 # Conditional on the bucket ARN being threaded from root: an empty value
 # means "ECR-only, no fallback" (the `aws s3 cp` branch will still fire
 # on ECR failure but will AccessDenied, which matches the script's
-# existing FATAL behavior). Scoped to the qurl-frps subtree of the
+# existing FATAL behavior). Scoped to the qurl-reverse-tunnel-server subtree of the
 # plugins bucket — consistent with how `modules/ac/main.tf:715` scopes
 # its own script-download grant. Integrity verification (#1258) layers
 # on top of this grant in a follow-up PR.
@@ -315,10 +315,21 @@ resource "aws_iam_role_policy" "frps_s3_fallback" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "BinaryS3Fallback"
-        Effect   = "Allow"
-        Action   = ["s3:GetObject"]
-        Resource = "${var.plugin_bucket_arn}/binaries/qurl-frps/*"
+        Sid    = "BinaryS3Fallback"
+        Effect = "Allow"
+        Action = ["s3:GetObject"]
+        # The legacy `binaries/qurl-frps/*` prefix is intentionally retained
+        # alongside the canonical `binaries/qurl-reverse-tunnel-server/*` for
+        # one rebrand-transition cycle. user_data's `aws s3 cp` chain falls
+        # back from canonical → legacy on 404; without the legacy grant the
+        # fallback would AccessDenied if the publishing pipeline hasn't
+        # migrated yet. Drop the legacy entry in lockstep with the user_data
+        # legacy branch once at least one cycle of S3 objects under the new
+        # prefix has been published.
+        Resource = [
+          "${var.plugin_bucket_arn}/binaries/qurl-reverse-tunnel-server/*",
+          "${var.plugin_bucket_arn}/binaries/qurl-frps/*",
+        ]
       }
     ]
   })
@@ -594,7 +605,7 @@ resource "aws_autoscaling_group" "frps" {
       # block is gated on qurl_api_token_secret_arn != "", so a caller that
       # opts into tunnel-auth without a token ARN would skip every check
       # and write QURL_INTERNAL_SERVICE_TOKEN= (empty) to the env. The
-      # qurl-frps resolver then can't authenticate /internal/v1/tunnel/auth
+      # qurl-reverse-tunnel-server resolver then can't authenticate /internal/v1/tunnel/auth
       # calls, surfacing as opaque 401s at runtime — fail at plan time
       # instead, mirroring the qurl_api_internal_url precondition above.
       #
@@ -619,7 +630,7 @@ resource "aws_autoscaling_group" "frps" {
       # min <= desired <= max. Catch tfvars typos at plan time rather than
       # letting the ASG API reject them in the middle of an apply.
       condition     = var.min_size <= var.desired_capacity && var.desired_capacity <= var.max_size
-      error_message = "qurl-frps ASG sizing must satisfy min_size <= desired_capacity <= max_size."
+      error_message = "qurl-reverse-tunnel-server ASG sizing must satisfy min_size <= desired_capacity <= max_size."
     }
   }
 }

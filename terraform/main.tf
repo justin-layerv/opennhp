@@ -1039,10 +1039,10 @@ resource "aws_route53_record" "qurl_site_wildcard" {
 }
 
 # ==================== QURL FRP Server ====================
-# FRP tunnel server for proxying traffic to customer backends via qurl-reverse-proxy.
+# FRP tunnel server for proxying traffic to customer backends via qurl-reverse-tunnel-client.
 # Runs in private subnets, reachable only from AC security group.
 
-# Cross-variable invariant for the qurl-frps ASG sizing knobs. Unconditional
+# Cross-variable invariant for the qurl-reverse-tunnel-server ASG sizing knobs. Unconditional
 # (no `count = deploy_frps ? 1 : 0`) so a typo like `frps_min_size = 3,
 # frps_max_size = 1` in tfvars fails plan even while `deploy_frps = false` —
 # matching the rationale on the per-variable `>= 1` validations. The module's
@@ -1052,13 +1052,13 @@ resource "terraform_data" "frps_asg_sizing" {
   lifecycle {
     precondition {
       condition     = var.frps_min_size <= var.frps_desired_capacity && var.frps_desired_capacity <= var.frps_max_size
-      error_message = "qurl-frps ASG sizing must satisfy frps_min_size <= frps_desired_capacity <= frps_max_size (root-level guard so a typo fails plan even when deploy_frps = false)."
+      error_message = "qurl-reverse-tunnel-server ASG sizing must satisfy frps_min_size <= frps_desired_capacity <= frps_max_size (root-level guard so a typo fails plan even when deploy_frps = false)."
     }
   }
 }
 
 # Validate that everything the FRP auth plugin needs is wired before the
-# module is instantiated. Without these, `qurl-frps` would boot with the
+# module is instantiated. Without these, `qurl-reverse-tunnel-server` would boot with the
 # built-in tunnel-auth plugin disabled and any client could register
 # arbitrary proxies — an open relay on a publicly-reachable path.
 resource "terraform_data" "frps_preconditions" {
@@ -1126,8 +1126,8 @@ resource "terraform_data" "frps_preconditions" {
   }
 }
 
-module "qurl_frps" {
-  source = "./modules/qurl-frps"
+module "qurl_reverse_tunnel_server" {
+  source = "./modules/qurl-reverse-tunnel-server"
   # `deploy_ac` is already enforced by `terraform_data.frps_preconditions`
   # above, so the module count only needs to key off `deploy_frps`.
   count = var.deploy_frps ? 1 : 0
@@ -1153,7 +1153,7 @@ module "qurl_frps" {
   private_subnet_ids = module.networking.private_subnet_ids
   namespace_id       = module.data.namespace_id
   namespace_name     = module.data.namespace_name
-  tags               = merge(local.common_tags, { Service = "qurl-frps" })
+  tags               = merge(local.common_tags, { Service = "qurl-reverse-tunnel-server" })
 
   # Security: only AC instances can reach the FRP server
   ac_security_group_id = module.ac[0].security_group_id
@@ -1164,18 +1164,18 @@ module "qurl_frps" {
   # selection rule. Outer guard is just `deploy_qurl_service` because
   # `frps_preconditions` (line 1071) already enforces
   # `qurl_service_domain != null && != ""` whenever `deploy_frps = true`,
-  # and the qurl-frps module's `^https://[^[:space:]]+$` validation
+  # and the qurl-reverse-tunnel-server module's `^https://[^[:space:]]+$` validation
   # backstops the structural shape on the URL itself.
   qurl_api_internal_url     = var.deploy_qurl_service ? local.qurl_consumer_api_url : ""
   qurl_api_token_secret_arn = var.deploy_qurl_service && var.qurl_internal_service_token_arn != null && var.qurl_internal_service_token_arn != "" ? var.qurl_internal_service_token_arn : ""
-  # Per-environment opt-in to qurl-frps tunnel-auth mode (per-user API-key
+  # Per-environment opt-in to qurl-reverse-tunnel-server tunnel-auth mode (per-user API-key
   # auth via /internal/v1/tunnel/auth). Default "" keeps every existing
   # env on legacy api mode unchanged. Sandbox flips first via
-  # `qurl_frps_tunnel_auth_mode = "tunnel-auth"` in
+  # `qurl_reverse_tunnel_server_tunnel_auth_mode = "tunnel-auth"` in
   # terraform/environments/sandbox/terraform.tfvars once both
   # consumer-side PRs land (qurl-reverse-tunnel-server #83 + #114).
   # See module variable doc for the full env-shape contract.
-  qurl_tunnel_auth_mode = var.qurl_frps_tunnel_auth_mode
+  qurl_tunnel_auth_mode = var.qurl_reverse_tunnel_server_tunnel_auth_mode
 
   # Instance configuration
   instance_type = var.frps_instance_type
@@ -1188,8 +1188,9 @@ module "qurl_frps" {
   desired_capacity = var.frps_desired_capacity
 
   # Per-AZ Cloud Map suffixes — must agree with the qurl-service env vars
-  # below (QURL_FRPS_AZ_SUFFIXES) and with the frpc consumption side. See
-  # the qurl-frps module header for the cross-repo contract.
+  # below (QURL_FRPS_AZ_SUFFIXES) and with the upstream `frpc` consumption
+  # side (i.e. the FRP client embedded in qurl-reverse-tunnel-client). See
+  # the qurl-reverse-tunnel-server module header for the cross-repo contract.
   frps_az_suffixes = var.frps_az_suffixes
 
   # Port configuration (shared with AC module via root variables)
@@ -1213,7 +1214,7 @@ module "qurl_frps" {
 
   # Plugin bucket for the S3 fallback binary download path in user_data.
   # Consistent with how the AC module is wired (see `plugin_bucket_arn` on
-  # the ac module above); same bucket scoped to the qurl-frps subtree.
+  # the ac module above); same bucket scoped to the qurl-reverse-tunnel-server subtree.
   # Both arn and name are threaded: arn scopes the IAM grant, name is
   # baked into user_data's `aws s3 cp` command via templatefile — keeping
   # them in lockstep from a single source of truth.
@@ -1223,6 +1224,15 @@ module "qurl_frps" {
   # Monitoring
   enable_cloudwatch_alarms = true
   alarm_sns_topic_arn      = module.monitoring.sns_topic_arn
+}
+
+# State move for the qurl-frps → qurl-reverse-tunnel-server rebrand. Address
+# changed from `module.qurl_frps[*]` to `module.qurl_reverse_tunnel_server[*]`
+# without rebuilding any resources. Safe to remove once every workspace has
+# applied this commit.
+moved {
+  from = module.qurl_frps
+  to   = module.qurl_reverse_tunnel_server
 }
 
 # ==================== QURL Service ====================
@@ -1634,7 +1644,7 @@ module "qurl_service" {
   nhp_server_internal_url = var.deploy_ac ? "http://server.${module.data.namespace_name}:8888" : ""
 
   # qurl-reverse-tunnel-server per-AZ routing (#1499). Threaded from the
-  # SAME root source of truth that the qurl-frps module reads above
+  # SAME root source of truth that the qurl-reverse-tunnel-server module reads above
   # (`var.frps_az_suffixes`, `module.data.namespace_name`,
   # `var.frps_vhost_http_port`) so the qurl-service env vars can never
   # drift from what the tunnel server actually publishes. Empty/zero when

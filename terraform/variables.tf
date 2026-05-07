@@ -1762,17 +1762,17 @@ variable "deploy_frps" {
   default     = false
 }
 
-variable "qurl_frps_tunnel_auth_mode" {
+variable "qurl_reverse_tunnel_server_tunnel_auth_mode" {
   description = <<-EOT
-    Selects which qurl-frps auth mode the deployed FRP server runs in.
+    Selects which qurl-reverse-tunnel-server auth mode the deployed FRP server runs in.
 
-      ""             - Legacy api mode. qurl-frps validates each NewProxy
+      ""             - Legacy api mode. qurl-reverse-tunnel-server validates each NewProxy
                        by calling qurl-service GET /resources/{id} and
                        matching FRP run_id against resource.connector_id.
                        Default — preserves existing behavior for every
                        env that hasn't opted in.
 
-      "tunnel-auth"  - Per-user API-key mode. qurl-frps reads the user's
+      "tunnel-auth"  - Per-user API-key mode. qurl-reverse-tunnel-server reads the user's
                        lv_live_* API key from FRP Login.Metas[qurl_api_key]
                        and forwards it to qurl-service POST
                        /internal/v1/tunnel/auth. Enables per-key
@@ -1784,23 +1784,23 @@ variable "qurl_frps_tunnel_auth_mode" {
     Hard cross-repo prerequisites before flipping a non-sandbox env to
     "tunnel-auth":
       * qurl-reverse-tunnel-server #83 merged AND `frps_image_tag` bumped
-        to a build that includes it. Without this the qurl-frps binary
+        to a build that includes it. Without this the qurl-reverse-tunnel-server binary
         rejects QURL_TUNNEL_AUTH_MODE=tunnel-auth as an unknown mode and
         the ASG instance fails startup.
       * qurl-reverse-tunnel-client #114 released AND fleet upgraded.
-        Without this qurl-frpc still ships md5-hashed PrivilegeKey
+        Without this qurl-reverse-tunnel-client still ships md5-hashed PrivilegeKey
         instead of populating Login.Metas[qurl_api_key]; the server
         rejects every Login with `owner_missing`.
 
-    See `terraform/modules/qurl-frps/variables.tf::qurl_tunnel_auth_mode`
+    See `terraform/modules/qurl-reverse-tunnel-server/variables.tf::qurl_tunnel_auth_mode`
     for the env-shape this drives in user_data.
   EOT
   type        = string
   default     = ""
 
   validation {
-    condition     = var.qurl_frps_tunnel_auth_mode == "" || var.qurl_frps_tunnel_auth_mode == "tunnel-auth"
-    error_message = "qurl_frps_tunnel_auth_mode must be \"\" (legacy api mode) or \"tunnel-auth\". Other values are rejected at startup by qurl-frps; reject here to surface the typo at plan time."
+    condition     = var.qurl_reverse_tunnel_server_tunnel_auth_mode == "" || var.qurl_reverse_tunnel_server_tunnel_auth_mode == "tunnel-auth"
+    error_message = "qurl_reverse_tunnel_server_tunnel_auth_mode must be \"\" (legacy api mode) or \"tunnel-auth\". Other values are rejected at startup by qurl-reverse-tunnel-server; reject here to surface the typo at plan time."
   }
 }
 
@@ -1811,19 +1811,19 @@ variable "frps_instance_type" {
 }
 
 variable "frps_image_tag" {
-  description = "qurl-frps binary version tag. Separate from NHP image_tag since frps has its own release cadence. Defaults to a placeholder tag that CI must overwrite on first deploy — a Terraform-only operator can't accidentally install a moving `latest` that slipped between applies."
+  description = "qurl-reverse-tunnel-server binary version tag. Separate from NHP image_tag since frps has its own release cadence. Defaults to a placeholder tag that CI must overwrite on first deploy — a Terraform-only operator can't accidentally install a moving `latest` that slipped between applies."
   type        = string
   default     = "v0.0.0-bootstrap"
 }
 
 variable "frps_bind_port" {
-  description = "FRP server control port. Shared between qurl-frps module (bind port) and AC module (Traefik route target) so they can't drift."
+  description = "FRP server control port. Shared between qurl-reverse-tunnel-server module (bind port) and AC module (Traefik route target) so they can't drift."
   type        = number
   default     = 7000
 }
 
 variable "frps_vhost_http_port" {
-  description = "FRP vhost HTTP port. Shared between qurl-frps module (bind port) and AC module (qurl-router plugin target) so they can't drift."
+  description = "FRP vhost HTTP port. Shared between qurl-reverse-tunnel-server module (bind port) and AC module (qurl-router plugin target) so they can't drift."
   type        = number
   default     = 8080
 }
@@ -1846,7 +1846,7 @@ variable "frps_min_size" {
     # rejects non-integers (`type = number` on its own accepts 1.5, which
     # would only fail at AWS-API time).
     condition     = var.frps_min_size >= 1 && floor(var.frps_min_size) == var.frps_min_size
-    error_message = "frps_min_size must be an integer >= 1 — qurl-frps is the only path for tunnel traffic; N=0 means tunnel resources 502."
+    error_message = "frps_min_size must be an integer >= 1 — qurl-reverse-tunnel-server is the only path for tunnel traffic; N=0 means tunnel resources 502."
   }
 }
 
@@ -1873,20 +1873,20 @@ variable "frps_desired_capacity" {
 }
 
 # Per-AZ Cloud Map services for the qurl-reverse-tunnel-server. Threaded
-# into BOTH the qurl-frps module (which creates the Cloud Map services)
+# into BOTH the qurl-reverse-tunnel-server module (which creates the Cloud Map services)
 # and the qurl-service module (whose `QURL_FRPS_AZ_SUFFIXES` env var
 # drives the OwnerID-to-AZ hash) from the same source of truth so they
 # can't drift.
-# See `terraform/modules/qurl-frps/main.tf` header for the full cross-repo
+# See `terraform/modules/qurl-reverse-tunnel-server/main.tf` header for the full cross-repo
 # contract — the parallel qurl-service and frpc PRs consume this same set
 # of suffixes via their own config surfaces.
 variable "frps_az_suffixes" {
-  description = "AZ suffix letters that qurl-frps creates per-AZ Cloud Map services for, and that qurl-service hashes OwnerID into. Default `[\"a\", \"b\", \"c\"]` matches us-east-{1,2}{a,b,c}. Each entry must be a single lowercase letter."
+  description = "AZ suffix letters that qurl-reverse-tunnel-server creates per-AZ Cloud Map services for, and that qurl-service hashes OwnerID into. Default `[\"a\", \"b\", \"c\"]` matches us-east-{1,2}{a,b,c}. Each entry must be a single lowercase letter."
   type        = list(string)
   default     = ["a", "b", "c"]
 
   # NOTE: validation logic duplicated from
-  # `terraform/modules/qurl-frps/variables.tf` (module-level
+  # `terraform/modules/qurl-reverse-tunnel-server/variables.tf` (module-level
   # `frps_az_suffixes`). The root copy fences a typo at plan time even when
   # `deploy_frps = false` keeps the module out of the graph; the module
   # copy covers module-direct consumers. Keep both in lockstep.

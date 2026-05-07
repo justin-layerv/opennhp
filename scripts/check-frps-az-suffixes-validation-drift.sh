@@ -3,7 +3,7 @@
 # ----------------------------------------------------------------------------
 # Fail if the `frps_az_suffixes` validation blocks in the root variable
 # (`terraform/variables.tf`) drift from the module variable
-# (`terraform/modules/qurl-frps/variables.tf`).
+# (`terraform/modules/qurl-reverse-tunnel-server/variables.tf`).
 #
 # Why this exists: the same variable is declared twice — once at the
 # module so module-direct consumers (smoke fixtures, isolated tests)
@@ -58,7 +58,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT_VARS="${REPO_ROOT}/terraform/variables.tf"
-MODULE_VARS="${REPO_ROOT}/terraform/modules/qurl-frps/variables.tf"
+MODULE_VARS="${REPO_ROOT}/terraform/modules/qurl-reverse-tunnel-server/variables.tf"
 
 if [ ! -f "$ROOT_VARS" ]; then
   echo "ERROR: missing $ROOT_VARS" >&2

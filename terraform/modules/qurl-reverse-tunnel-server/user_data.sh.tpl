@@ -1,22 +1,22 @@
 #!/bin/bash
 # QURL FRP Server User Data Script
 #
-# Bootstraps a qurl-frps instance: installs dependencies, writes frps.toml
+# Bootstraps a qurl-reverse-tunnel-server instance: installs dependencies, writes frps.toml
 # config (values resolved by Terraform templatefile() at plan time), starts
 # the FRP server as a systemd service, and registers with Cloud Map for
 # service discovery.
 #
 # Debugging notes for on-call:
-# - Docker is installed, used ONCE to pull the qurl-frps image and extract
+# - Docker is installed, used ONCE to pull the qurl-reverse-tunnel-server image and extract
 #   the binary, then `systemctl disable --now docker` is run to free ~150MB
 #   RSS on the t3.small and shrink the attack surface. If you need to
 #   re-extract the binary (e.g., swap image_tag by hand for a hotfix), run
 #   `sudo systemctl enable --now docker` first before re-running the
 #   extraction block.
-# - The binary is pulled from `/usr/local/bin/qurl-frps` (canonical, matches
+# - The binary is pulled from `/usr/local/bin/qurl-reverse-tunnel-server` (canonical, matches
 #   the qurl-reverse-tunnel-server Dockerfile) with fallback to the legacy
 #   `/usr/local/bin/nhp-frps` and `/nhp-frps` paths for older images still
-#   pinned in SSM history. If the qurl-frps image layout changes again, ALL
+#   pinned in SSM history. If the qurl-reverse-tunnel-server image layout changes again, ALL
 #   THREE paths below need to track; the image's CI should pin its own path
 #   so this stays in lockstep. A `WARN: legacy fallback ...` line is logged
 #   when a non-canonical path hits — query CloudWatch for it before dropping
@@ -139,7 +139,7 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWEO
       "files": {
         "collect_list": [
           {
-            "file_path": "/opt/layerv/qurl-frps/logs/frps.log",
+            "file_path": "/opt/layerv/qurl-reverse-tunnel-server/logs/frps.log",
             "log_group_name": "${log_group_name}",
             "log_stream_name": "{instance_id}/frps",
             "timezone": "UTC"
@@ -184,8 +184,8 @@ if ! id -u frps >/dev/null 2>&1; then
   useradd --system --no-create-home --shell /usr/sbin/nologin frps
 fi
 
-mkdir -p /opt/layerv/qurl-frps/etc
-mkdir -p /opt/layerv/qurl-frps/logs
+mkdir -p /opt/layerv/qurl-reverse-tunnel-server/etc
+mkdir -p /opt/layerv/qurl-reverse-tunnel-server/logs
 
 # ============================================================================
 # Read image tag from SSM (for downloading the correct binary version).
@@ -199,17 +199,17 @@ IMAGE_TAG=$(aws ssm get-parameter \
   --query "Parameter.Value" \
   --output text \
   --region "$REGION") || {
-  echo "FATAL: Could not read qurl-frps image tag from SSM parameter ${ssm_image_tag_param}"
+  echo "FATAL: Could not read qurl-reverse-tunnel-server image tag from SSM parameter ${ssm_image_tag_param}"
   exit 1
 }
 
-echo "Using qurl-frps image tag: $IMAGE_TAG"
+echo "Using qurl-reverse-tunnel-server image tag: $IMAGE_TAG"
 
 # ============================================================================
-# Download qurl-frps binary
+# Download qurl-reverse-tunnel-server binary
 # Pull from ECR as a Docker image and extract the binary.
 # ============================================================================
-echo "Downloading qurl-frps binary..."
+echo "Downloading qurl-reverse-tunnel-server binary..."
 ECR_REGISTRY="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
@@ -231,7 +231,7 @@ if docker pull "$FRPS_IMAGE"; then
   CONTAINER_ID=$(docker create "$FRPS_IMAGE")
   trap 'docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true' EXIT
   # Container path: the qurl-reverse-tunnel-server Dockerfile installs the
-  # binary at /usr/local/bin/qurl-frps (canonical binary name across the
+  # binary at /usr/local/bin/qurl-reverse-tunnel-server (canonical binary name across the
   # qurl-reverse-tunnel-server source repo and the systemd unit; the ECR
   # repo it ships in is `layerv/qurl-reverse-tunnel-server`). The
   # /usr/local/bin/nhp-frps and /nhp-frps fallbacks remain for older
@@ -239,12 +239,12 @@ if docker pull "$FRPS_IMAGE"; then
   # `WARN: legacy fallback ...` line to user-data.log → CloudWatch so a
   # single Logs Insights query gates the eventual cleanup; without that
   # signal "nobody complained" is the only proxy for safe-to-drop.
-  docker cp "$CONTAINER_ID:/usr/local/bin/qurl-frps" /opt/layerv/qurl-frps/nhp-frps || {
+  docker cp "$CONTAINER_ID:/usr/local/bin/qurl-reverse-tunnel-server" /opt/layerv/qurl-reverse-tunnel-server/nhp-frps || {
     echo "WARN: legacy fallback to /usr/local/bin/nhp-frps — image is pre-rename"
-    docker cp "$CONTAINER_ID:/usr/local/bin/nhp-frps" /opt/layerv/qurl-frps/nhp-frps
+    docker cp "$CONTAINER_ID:/usr/local/bin/nhp-frps" /opt/layerv/qurl-reverse-tunnel-server/nhp-frps
   } || {
     echo "WARN: legacy fallback to /nhp-frps — image is even older"
-    docker cp "$CONTAINER_ID:/nhp-frps" /opt/layerv/qurl-frps/nhp-frps
+    docker cp "$CONTAINER_ID:/nhp-frps" /opt/layerv/qurl-reverse-tunnel-server/nhp-frps
   }
   docker rm "$CONTAINER_ID"
   trap - EXIT
@@ -259,18 +259,32 @@ else
   echo "WARNING: Could not pull from ECR, checking if binary exists on S3..."
 %{ if plugin_bucket_name != "" ~}
   # Bucket name is threaded from root (module.plugins.bucket_name) — kept in
-  # lockstep with the frps_s3_fallback IAM grant (which scopes to
-  # ${plugin_bucket_name}/binaries/qurl-frps/*) so the two can't diverge.
+  # lockstep with the frps_s3_fallback IAM grant (which scopes to BOTH
+  # ${plugin_bucket_name}/binaries/qurl-reverse-tunnel-server/* AND the
+  # legacy ${plugin_bucket_name}/binaries/qurl-frps/* prefix) so the
+  # canonical-then-legacy fallback chain below can't AccessDenied on the
+  # legacy branch. The legacy grant + branch exist to keep the S3
+  # fallback usable across the rebrand transition: if qurl-reverse-tunnel-
+  # server's publishing CI is still writing to `binaries/qurl-frps/`
+  # when an instance boots and ECR is degraded, we don't want to be
+  # stuck. Drop both the legacy grant and the legacy branch in lockstep
+  # once the publish target has migrated and at least one cycle of S3
+  # objects under the new prefix has been written.
   # `--expected-bucket-owner` defends against a misconfigured bucket policy
   # (or rewritten plugin_bucket_name var) ever pointing at a foreign
   # bucket; AWS will fail the request with 403 AccessDenied rather than
   # serving content from an attacker-controlled bucket. sha256 integrity
   # verification for the object itself is tracked in #1258.
-  aws s3 cp "s3://${plugin_bucket_name}/binaries/qurl-frps/$IMAGE_TAG/nhp-frps" \
-    /opt/layerv/qurl-frps/nhp-frps --region "$REGION" \
+  aws s3 cp "s3://${plugin_bucket_name}/binaries/qurl-reverse-tunnel-server/$IMAGE_TAG/nhp-frps" \
+    /opt/layerv/qurl-reverse-tunnel-server/nhp-frps --region "$REGION" \
     --expected-bucket-owner "$ACCOUNT_ID" || {
-    echo "FATAL: Could not download qurl-frps binary"
-    exit 1
+    echo "WARN: legacy fallback to s3://.../binaries/qurl-frps/ — publish target is pre-rename"
+    aws s3 cp "s3://${plugin_bucket_name}/binaries/qurl-frps/$IMAGE_TAG/nhp-frps" \
+      /opt/layerv/qurl-reverse-tunnel-server/nhp-frps --region "$REGION" \
+      --expected-bucket-owner "$ACCOUNT_ID" || {
+      echo "FATAL: Could not download qurl-reverse-tunnel-server binary from either prefix"
+      exit 1
+    }
   }
   echo "Binary downloaded from S3"
 %{ else ~}
@@ -286,8 +300,8 @@ fi
 # here and FATAL before the service ever starts. The `aws s3 cp` branch
 # exits non-zero on most failure modes, but a 0-byte object slipping
 # through would be caught here too.
-if [ ! -s /opt/layerv/qurl-frps/nhp-frps ]; then
-  echo "FATAL: Binary at /opt/layerv/qurl-frps/nhp-frps is missing or zero-byte after extraction."
+if [ ! -s /opt/layerv/qurl-reverse-tunnel-server/nhp-frps ]; then
+  echo "FATAL: Binary at /opt/layerv/qurl-reverse-tunnel-server/nhp-frps is missing or zero-byte after extraction."
   exit 1
 fi
 
@@ -306,7 +320,7 @@ echo "Writing frps.toml configuration..."
 # resolves all $${} references (frps_bind_port, etc.) at plan time,
 # before this script ever reaches the instance. This is intentional.
 # WARNING: heredoc below is NOT shell-interpolated — $VAR at runtime is literal.
-cat > /opt/layerv/qurl-frps/etc/frps.toml << 'FRPSEOF'
+cat > /opt/layerv/qurl-reverse-tunnel-server/etc/frps.toml << 'FRPSEOF'
 # QURL FRP Server Configuration
 # Generated by user_data.sh.tpl at boot time
 
@@ -315,7 +329,7 @@ vhostHTTPPort = ${frps_vhost_http_port}
 subDomainHost = "${frps_subdomain_host}"
 
 # Logging
-log.to = "/opt/layerv/qurl-frps/logs/frps.log"
+log.to = "/opt/layerv/qurl-reverse-tunnel-server/logs/frps.log"
 log.level = "info"
 log.maxDays = 7
 
@@ -331,13 +345,13 @@ FRPSEOF
 # frps.toml has no secrets (bindPort, vhostHTTPPort, subDomainHost, log/
 # transport/webServer knobs). Standard config-file perms — reserve 0600
 # for the env file, which does carry the QURL API token.
-chmod 644 /opt/layerv/qurl-frps/etc/frps.toml
+chmod 644 /opt/layerv/qurl-reverse-tunnel-server/etc/frps.toml
 echo "frps.toml written"
 
 # Transfer ownership to the frps service user now that config + binary exist.
 # The logs dir needs write access; etc/ and the binary need read/execute.
-chown -R frps:frps /opt/layerv/qurl-frps
-chmod 755 /opt/layerv/qurl-frps/nhp-frps
+chown -R frps:frps /opt/layerv/qurl-reverse-tunnel-server
+chmod 755 /opt/layerv/qurl-reverse-tunnel-server/nhp-frps
 
 # ============================================================================
 # Fetch QURL API token and create systemd service
@@ -419,11 +433,11 @@ esac
 #
 # Env shape depends on qurl_tunnel_auth_mode:
 #   ""             - legacy api mode: QURL_API_URL + QURL_API_TOKEN.
-#                    qurl-frps validates each NewProxy by calling
+#                    qurl-reverse-tunnel-server validates each NewProxy by calling
 #                    GET /resources/{id} on qurl-service.
 #   "tunnel-auth"  - per-user API-key mode (qurl-reverse-tunnel-server #83):
 #                    QURL_API_URL + QURL_INTERNAL_SERVICE_TOKEN +
-#                    QURL_TUNNEL_AUTH_MODE=tunnel-auth. qurl-frps reads
+#                    QURL_TUNNEL_AUTH_MODE=tunnel-auth. qurl-reverse-tunnel-server reads
 #                    the user's lv_live_* key from FRP Login.Metas (set
 #                    by qurl-reverse-tunnel-client #114) and forwards
 #                    it to qurl-service POST /internal/v1/tunnel/auth.
@@ -431,7 +445,7 @@ esac
 #                    internal-service shared secret — both modes use the
 #                    same Secrets Manager source, just under different
 #                    env-var names downstream. The rename is a labeling
-#                    convention: it signals which qurl-frps code path
+#                    convention: it signals which qurl-reverse-tunnel-server code path
 #                    consumes the secret (/resources/{id} vs
 #                    /internal/v1/tunnel/auth) so a future refactor that
 #                    splits these credentials into separately-rotatable
@@ -440,15 +454,15 @@ esac
 #                    qurl-service's per-endpoint scoping, not by this name.
 (
   umask 077
-  : > /opt/layerv/qurl-frps/etc/env
+  : > /opt/layerv/qurl-reverse-tunnel-server/etc/env
   # QURL_API_URL <- module variable `qurl_api_internal_url` (root
   # wiring at terraform/main.tf, routed through
   # local.qurl_consumer_api_url). The variable name describes the use
   # case; the env-var name is what nhp-frps reads at runtime.
-  printf 'QURL_API_URL=%s\n' '${qurl_api_internal_url}' >> /opt/layerv/qurl-frps/etc/env
+  printf 'QURL_API_URL=%s\n' '${qurl_api_internal_url}' >> /opt/layerv/qurl-reverse-tunnel-server/etc/env
 %{ if qurl_tunnel_auth_mode == "tunnel-auth" ~}
   # Reaching this branch with $QURL_API_TOKEN unset/empty would write
-  # QURL_INTERNAL_SERVICE_TOKEN= silently — qurl-frps would then boot
+  # QURL_INTERNAL_SERVICE_TOKEN= silently — qurl-reverse-tunnel-server would then boot
   # in tunnel-auth mode with no shared secret, surfacing as opaque
   # 401s on /internal/v1/tunnel/auth at runtime. The token-fetch +
   # JSON/whitespace/empty-string validation block above is gated on
@@ -457,17 +471,17 @@ esac
   # ../main.tf ("tunnel-auth requires qurl_api_token_secret_arn").
   # If you ever loosen that precondition, also extend the validation
   # block above to fire in tunnel-auth mode regardless of ARN.
-  printf 'QURL_TUNNEL_AUTH_MODE=tunnel-auth\n' >> /opt/layerv/qurl-frps/etc/env
-  printf 'QURL_INTERNAL_SERVICE_TOKEN=%s\n' "$QURL_API_TOKEN" >> /opt/layerv/qurl-frps/etc/env
+  printf 'QURL_TUNNEL_AUTH_MODE=tunnel-auth\n' >> /opt/layerv/qurl-reverse-tunnel-server/etc/env
+  printf 'QURL_INTERNAL_SERVICE_TOKEN=%s\n' "$QURL_API_TOKEN" >> /opt/layerv/qurl-reverse-tunnel-server/etc/env
 %{ else ~}
-  printf 'QURL_API_TOKEN=%s\n' "$QURL_API_TOKEN" >> /opt/layerv/qurl-frps/etc/env
+  printf 'QURL_API_TOKEN=%s\n' "$QURL_API_TOKEN" >> /opt/layerv/qurl-reverse-tunnel-server/etc/env
 %{ endif ~}
 )
 # Re-enable xtrace now that the secret is no longer on any command line.
 set -x
-chown frps:frps /opt/layerv/qurl-frps/etc/env
+chown frps:frps /opt/layerv/qurl-reverse-tunnel-server/etc/env
 
-cat > /etc/systemd/system/qurl-frps.service << 'SERVICEEOF'
+cat > /etc/systemd/system/qurl-reverse-tunnel-server.service << 'SERVICEEOF'
 [Unit]
 Description=QURL FRP Server
 After=network-online.target
@@ -485,8 +499,8 @@ StartLimitIntervalSec=60
 Type=simple
 User=frps
 Group=frps
-ExecStart=/opt/layerv/qurl-frps/nhp-frps -c /opt/layerv/qurl-frps/etc/frps.toml
-EnvironmentFile=/opt/layerv/qurl-frps/etc/env
+ExecStart=/opt/layerv/qurl-reverse-tunnel-server/nhp-frps -c /opt/layerv/qurl-reverse-tunnel-server/etc/frps.toml
+EnvironmentFile=/opt/layerv/qurl-reverse-tunnel-server/etc/env
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -496,7 +510,7 @@ StandardError=journal
 # Defense-in-depth sandbox: the process doesn't need write access outside
 # its own logs dir, doesn't need /home, and shouldn't see other processes.
 # ProtectSystem=strict covers /usr /boot /efi but leaves /opt writable for
-# the process's own UID — since frps owns /opt/layerv/qurl-frps (via the
+# the process's own UID — since frps owns /opt/layerv/qurl-reverse-tunnel-server (via the
 # `chown -R frps:frps` earlier), a compromised process could otherwise
 # rewrite its own binary on disk. ReadOnlyPaths pins the code path + config
 # read-only while still allowing writes under ReadWritePaths (logs only).
@@ -504,8 +518,8 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadOnlyPaths=/opt/layerv/qurl-frps/nhp-frps /opt/layerv/qurl-frps/etc
-ReadWritePaths=/opt/layerv/qurl-frps/logs
+ReadOnlyPaths=/opt/layerv/qurl-reverse-tunnel-server/nhp-frps /opt/layerv/qurl-reverse-tunnel-server/etc
+ReadWritePaths=/opt/layerv/qurl-reverse-tunnel-server/logs
 
 [Install]
 WantedBy=multi-user.target
@@ -518,8 +532,8 @@ SERVICEEOF
 # unbounded within 7 days and fill the 30GB root volume. logrotate caps size.
 # CloudWatch Agent ships logs to CW Logs independently; this only guards disk.
 # ============================================================================
-cat > /etc/logrotate.d/qurl-frps << 'LOGROTATEEOF'
-/opt/layerv/qurl-frps/logs/frps.log {
+cat > /etc/logrotate.d/qurl-reverse-tunnel-server << 'LOGROTATEEOF'
+/opt/layerv/qurl-reverse-tunnel-server/logs/frps.log {
     size 100M
     rotate 5
     compress
@@ -531,9 +545,9 @@ cat > /etc/logrotate.d/qurl-frps << 'LOGROTATEEOF'
 LOGROTATEEOF
 
 systemctl daemon-reload
-systemctl enable qurl-frps
-systemctl start qurl-frps
-echo "qurl-frps systemd service started"
+systemctl enable qurl-reverse-tunnel-server
+systemctl start qurl-reverse-tunnel-server
+echo "qurl-reverse-tunnel-server systemd service started"
 
 # Wait for FRP server to be ready (fail boot if it never starts).
 # Probes the dashboard port written into frps.toml above — both come from
@@ -574,7 +588,7 @@ fi
 # so the AZ-keyed values get burned into the file). The instance reads its
 # AZ from IMDS at runtime, looks up the matching service ID, and registers.
 # ============================================================================
-cat > /opt/layerv/qurl-frps/cloudmap-register.sh << 'REGEOF'
+cat > /opt/layerv/qurl-reverse-tunnel-server/cloudmap-register.sh << 'REGEOF'
 #!/bin/bash
 set -e
 # Bash 4+ associative array. Ubuntu 24.04 ships bash 5.x so this is safe.
@@ -630,9 +644,9 @@ aws servicediscovery register-instance \
   --region "$REGION"
 echo "FRPS instance registered successfully"
 REGEOF
-chmod +x /opt/layerv/qurl-frps/cloudmap-register.sh
+chmod +x /opt/layerv/qurl-reverse-tunnel-server/cloudmap-register.sh
 
-cat > /opt/layerv/qurl-frps/cloudmap-deregister.sh << 'DEREGEOF'
+cat > /opt/layerv/qurl-reverse-tunnel-server/cloudmap-deregister.sh << 'DEREGEOF'
 #!/bin/bash
 # Intentionally NOT `set -e`: this script's contract is "warn and exit 0
 # whenever the AZ-suffix lookup is unworkable" (missing mapping, malformed
@@ -679,25 +693,25 @@ aws servicediscovery deregister-instance \
   --region "$REGION" || true
 echo "FRPS instance deregistered"
 DEREGEOF
-chmod +x /opt/layerv/qurl-frps/cloudmap-deregister.sh
+chmod +x /opt/layerv/qurl-reverse-tunnel-server/cloudmap-deregister.sh
 
 cat > /etc/systemd/system/frps-cloudmap-register.service << SVCEOF
 [Unit]
 Description=Register QURL FRP Server with Cloud Map
-After=network-online.target qurl-frps.service
-# BindsTo ties registration lifecycle to qurl-frps: if the FRP service stops
+After=network-online.target qurl-reverse-tunnel-server.service
+# BindsTo ties registration lifecycle to qurl-reverse-tunnel-server: if the FRP service stops
 # (crash-loop exhausted, manual stop), systemd will also stop this unit,
 # which triggers ExecStop (deregister). Without this, a dead FRP process
 # leaves a stale Cloud Map record serving traffic until ASG replaces the
 # instance.
-BindsTo=qurl-frps.service
+BindsTo=qurl-reverse-tunnel-server.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/opt/layerv/qurl-frps/cloudmap-register.sh
+ExecStart=/opt/layerv/qurl-reverse-tunnel-server/cloudmap-register.sh
 RemainAfterExit=yes
-ExecStop=/opt/layerv/qurl-frps/cloudmap-deregister.sh
+ExecStop=/opt/layerv/qurl-reverse-tunnel-server/cloudmap-deregister.sh
 
 [Install]
 WantedBy=multi-user.target
