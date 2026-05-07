@@ -1688,8 +1688,10 @@ jobs:
       # the upload↔download pairing; the runbook documents the invariant.
       # ---------------------------------------------------------------------
 
-      # Module-level toggle: `var.deploy_ac`.
+      # Module-level toggle: `var.deploy_ac` (count=0 → archive_file
+      # unevaluated → no zip on disk). `if:` matches the toggle.
       - name: Upload AC keygen Lambda
+        if: inputs.deploy_ac
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lambda-ac-keygen
@@ -1697,10 +1699,14 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-      # Conditional toggles: `var.enable_secret_reconciliation` (direct,
-      # on the `archive_file`) + `var.deploy_ac` (transitive, via
-      # `module.ac`'s count). Both must be true for the zip to materialize.
+      # Toggle chain: BOTH `var.deploy_ac` (transitive) AND
+      # `var.enable_secret_reconciliation` (direct on archive_file)
+      # must be true for the zip to materialize. `if:` gates only on
+      # the outer toggle; `enable_secret_reconciliation=false` while
+      # `deploy_ac=true` would still hit the same upload failure
+      # (latent — prod has both true today).
       - name: Upload AC secret reconciliation Lambda
+        if: inputs.deploy_ac
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lambda-ac-secret-reconciliation
@@ -2045,13 +2051,16 @@ jobs:
       # uploaded above. Names + paths must stay in lockstep with the
       # upload steps; the structural-symmetry test in
       # tests/scripts/test_promote_to_prod_gating.py enforces it.
+      # Mirrors the upload gate above (`inputs.deploy_ac`).
       - name: Download AC keygen Lambda
+        if: inputs.deploy_ac
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: lambda-ac-keygen
           path: terraform/modules/ac
 
       - name: Download AC secret reconciliation Lambda
+        if: inputs.deploy_ac
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: lambda-ac-secret-reconciliation
