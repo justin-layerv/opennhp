@@ -1801,6 +1801,14 @@ jobs:
   #   PR1: tier=tier1, continue-on-error=true (report-only, burn-in)
   #   PR2: tier=tier1+tier2, continue-on-error=true
   #   PR3: tier=all,  continue-on-error=false (required check)
+  #
+  # GATE: `tier:` and `continue-on-error:` here are load-bearing.
+  # Changing either (or adding a `continue-on-error: true` override) needs
+  # #1694's threshold recalibration in flight or landed — the Tier 1 fence
+  # in tests/smoke/09_ac_redispatch_loop_test.go has an acknowledged
+  # 75–125 matches/15min false-negative window during burn-in.
+  # CODEOWNERS gates the reusable workflow file (.github/CODEOWNERS); a
+  # job-level extraction so the call site here is also gated is in #1721.
   # ============================================================================
   nhp-smoke-sandbox:
     name: NHP Smoke (sandbox)

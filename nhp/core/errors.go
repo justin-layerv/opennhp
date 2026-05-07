@@ -80,7 +80,18 @@ var (
 	ErrReplayPacketReceived           = newError(errNhpReplayPacketReceived, "received replay packet, drop")
 	ErrFloodPacketReceived            = newError(errNhpFloodPacketReceived, "received flood packet, drop")
 	ErrStalePacketReceived            = newError(errNhpStalePacketReceived, "received stale packet, drop")
-	ErrPeerNotFound                   = newError(errNhpPeerNotFound, "peer not found in peer pool")
-	ErrPeerExpired                    = newError(errNhpPeerExpired, "peer expired")
-	ErrPeerAddressMismatch            = newError(errNhpPeerAddressMismatch, "peer does not match its previous address")
+	// ErrPeerNotFound's message text "peer not found in peer pool" is
+	// LOAD-BEARING for the smoke regression fence in
+	// tests/smoke/09_ac_redispatch_loop_test.go (regex:
+	// /Refresh NHP_AOL to .* failed: peer not found in peer pool/).
+	// A wording change here will silently break the #1680 regression
+	// smoke fence — endpoints/ac/registration_reconcile_test.go's
+	// TestACRegistration_SmokeLogSubstringsPresent reads this file
+	// and asserts the substring is present at unit-test time, so
+	// the build/lint will fail if the wording changes without a
+	// lockstep update of the smoke regex. #1714 tracks replacing
+	// the substring fence with stable structured tags.
+	ErrPeerNotFound        = newError(errNhpPeerNotFound, "peer not found in peer pool")
+	ErrPeerExpired         = newError(errNhpPeerExpired, "peer expired")
+	ErrPeerAddressMismatch = newError(errNhpPeerAddressMismatch, "peer does not match its previous address")
 )

@@ -737,6 +737,12 @@ func (mp *Publisher) buildMetricData(
 // buildDimCounterKey builds a deterministic map key from a metric name and its dimensions.
 // Null bytes (\x00) are used as internal separators. This is safe because CloudWatch
 // dimension names and values are restricted to printable UTF-8 and cannot contain null bytes.
+//
+// Key format is part of the CountersForTest contract. Test helpers
+// (e.g., countDimCountersWithPrefix in endpoints/ac) anchor on the
+// metric_name + "\x00" prefix to count entries by exact metric name
+// without colliding on a future metric whose name shares the prefix.
+// If the separator changes, those test helpers must change in lockstep.
 func buildDimCounterKey(name string, dims []types.Dimension) string {
 	// Sort by dimension name for deterministic key, but skip the sort
 	// if dimensions are already in order (common case: shared dims are

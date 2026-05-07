@@ -136,10 +136,6 @@ func TestACRegistration_NewACRegistration(t *testing.T) {
 		t.Error("assignedServers should be empty initially")
 	}
 
-	if reg.oldServerSets == nil {
-		t.Error("oldServerSets map should be initialized")
-	}
-
 	if reg.stopCh == nil {
 		t.Error("stopCh should be initialized")
 	}
@@ -456,46 +452,6 @@ func TestConfig_RegistrationFields(t *testing.T) {
 
 	if config.ServerPort != 62206 {
 		t.Errorf("ServerPort = %d, want %d", config.ServerPort, 62206)
-	}
-}
-
-// TestACRegistration_OldServerSetsCleanup tests the old server set cleanup mechanism.
-func TestACRegistration_OldServerSetsCleanup(t *testing.T) {
-	ac := &UdpAC{
-		config: &Config{
-			ACId:           "test-ac-001",
-			ServerEndpoint: "server.nhp.test.internal",
-		},
-	}
-
-	reg := mustNewACRegistration(t, ac)
-
-	// Simulate having old server sets
-	key1 := time.Now().Add(-3 * time.Minute).Format(time.RFC3339Nano)
-	key2 := time.Now().Add(-1 * time.Minute).Format(time.RFC3339Nano)
-
-	reg.oldServerSets[key1] = []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort}},
-	}
-	reg.oldServerSets[key2] = []*AssignedServer{
-		{Target: common.RedirectTarget{IP: "10.0.0.2", Port: DefaultServerPort}},
-	}
-
-	if len(reg.oldServerSets) != 2 {
-		t.Errorf("expected 2 old server sets, got %d", len(reg.oldServerSets))
-	}
-
-	// Manually trigger cleanup for key1
-	reg.mu.Lock()
-	delete(reg.oldServerSets, key1)
-	reg.mu.Unlock()
-
-	if len(reg.oldServerSets) != 1 {
-		t.Errorf("expected 1 old server set after cleanup, got %d", len(reg.oldServerSets))
-	}
-
-	if _, exists := reg.oldServerSets[key2]; !exists {
-		t.Error("key2 should still exist after key1 cleanup")
 	}
 }
 
@@ -1024,67 +980,6 @@ func TestACRegistration_ConcurrentRedispatchAndHealthCheck(t *testing.T) {
 
 	wg.Wait()
 	// If we get here without race detector issues or panics, the test passes
-}
-
-// TestACRegistration_RapidRedispatchOldServerSets tests that rapid redispatches
-// correctly manage oldServerSets without interference.
-func TestACRegistration_RapidRedispatchOldServerSets(t *testing.T) {
-	ac := &UdpAC{
-		config: &Config{
-			ACId:           "test-ac-001",
-			ServerEndpoint: "server.nhp.test.internal",
-		},
-	}
-
-	reg := mustNewACRegistration(t, ac)
-
-	// Simulate multiple rapid redispatches by directly manipulating state
-	// (bypassing connectToServer which needs network)
-	numRedispatches := 5
-
-	for i := 0; i < numRedispatches; i++ {
-		reg.mu.Lock()
-		// Move current to old (like HandleRedispatch does)
-		if len(reg.assignedServers) > 0 {
-			key := time.Now().Add(time.Duration(i) * time.Nanosecond).Format(time.RFC3339Nano)
-			reg.oldServerSets[key] = reg.assignedServers
-		}
-
-		// Create new servers
-		reg.assignedServers = []*AssignedServer{
-			{Target: common.RedirectTarget{IP: fmt.Sprintf("10.%d.0.1", i), Port: DefaultServerPort}},
-			{Target: common.RedirectTarget{IP: fmt.Sprintf("10.%d.0.2", i), Port: DefaultServerPort}},
-		}
-		reg.mu.Unlock()
-
-		// Small delay to ensure unique timestamps
-		time.Sleep(time.Millisecond)
-	}
-
-	reg.mu.RLock()
-	oldSetsCount := len(reg.oldServerSets)
-	currentCount := len(reg.assignedServers)
-	reg.mu.RUnlock()
-
-	// Should have numRedispatches-1 old sets (first redispatch has no old servers)
-	expectedOldSets := numRedispatches - 1
-	if oldSetsCount != expectedOldSets {
-		t.Errorf("expected %d old server sets, got %d", expectedOldSets, oldSetsCount)
-	}
-
-	// Should have 2 current servers
-	if currentCount != 2 {
-		t.Errorf("expected 2 current servers, got %d", currentCount)
-	}
-
-	// Verify each old set is independent
-	reg.mu.RLock()
-	for key, servers := range reg.oldServerSets {
-		if len(servers) != 2 {
-			t.Errorf("old server set %s should have 2 servers, got %d", key, len(servers))
-		}
-	}
-	reg.mu.RUnlock()
 }
 
 // TestACRegistration_HandleServerDownRespectStopChannel tests that handleServerDown
@@ -1643,54 +1538,6 @@ func TestACRegistration_CheckServerHealth_CooldownResetOnSuccess(t *testing.T) {
 	if !reg.reregistering.Load() {
 		t.Error("checkServerHealth should trigger re-registration after cooldown state is cleared")
 	}
-}
-
-// TestACRegistration_CleanupOldServers_NilPeer tests that cleanup handles servers
-// with nil peers gracefully.
-func TestACRegistration_CleanupOldServers_NilPeer(t *testing.T) {
-	ac := &UdpAC{
-		config: &Config{
-			ACId:           "test-ac-001",
-			ServerEndpoint: "server.nhp.test.internal",
-		},
-	}
-
-	reg := mustNewACRegistration(t, ac)
-
-	// Create old servers - some with nil peer
-	cleanupKey := "test-cleanup-key"
-	reg.oldServerSets[cleanupKey] = []*AssignedServer{
-		{
-			Target: common.RedirectTarget{IP: "10.0.0.1", Port: DefaultServerPort},
-			Peer:   nil, // No peer - should be handled gracefully
-		},
-		{
-			Target: common.RedirectTarget{IP: "10.0.0.2", Port: DefaultServerPort},
-			Peer:   nil, // No peer
-		},
-	}
-
-	// This should not panic even with nil peers
-	// We can't wait 2 minutes, so we'll directly test the cleanup logic
-	reg.mu.Lock()
-	oldServers := reg.oldServerSets[cleanupKey]
-	delete(reg.oldServerSets, cleanupKey)
-	reg.mu.Unlock()
-
-	// Simulate what cleanupOldServers does - should handle nil peer gracefully
-	for _, server := range oldServers {
-		if server.Peer != nil {
-			// Would call r.ac.device.RemovePeer() - but peer is nil so this is skipped
-			t.Error("should not reach here - peer is nil")
-		}
-	}
-
-	// Verify the set was cleaned up
-	reg.mu.RLock()
-	if _, exists := reg.oldServerSets[cleanupKey]; exists {
-		t.Error("cleanup key should have been deleted")
-	}
-	reg.mu.RUnlock()
 }
 
 // TestACRegistration_Constants tests that important constants have expected values.

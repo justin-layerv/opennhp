@@ -55,13 +55,6 @@ const (
 	// ReregistrationJitter is random jitter before re-registration (0-5s).
 	ReregistrationJitter = 5 * time.Second
 
-	// OldServerKeepDuration is how long to keep old connections during reassignment.
-	OldServerKeepDuration = 2 * time.Minute
-
-	// cleanupChBufferSize is the buffer capacity for the cleanup worker channel.
-	// Accommodates bursts of rapid reassignments without blocking HandleRedispatch.
-	cleanupChBufferSize = 10
-
 	// MaxReregistrationAttempts is the max attempts for re-registration after server failure.
 	MaxReregistrationAttempts = 5
 
@@ -136,6 +129,98 @@ const (
 	// so each incident counts once. It provides early visibility into a
 	// degraded AC before the threshold actually triggers re-registration.
 	MetricAllUnconnectedDetected = "AllUnconnectedDetected"
+
+	// MetricReconcileOverlap is incremented when reconcileDevicePeers enters
+	// while another reconcile is already in flight — i.e., the orphan-
+	// precondition for the synchronous-reconcile model (#1680). Wired into
+	// reconcileDevicePeers itself so both call sites (HandleRedispatch and
+	// handleRegistrationResponse's direct-AAK branch) feed the same counter
+	// and the metric stays a true family-wide signal: HandleRedispatch ↔
+	// HandleRedispatch, HandleRedispatch ↔ direct-AAK, and direct-AAK ↔
+	// direct-AAK overlaps all bump it.
+	//
+	// Counting model: emits N-1 events per overlap window of N concurrent
+	// entrants — every reconcile past the first entrant bumps the counter
+	// once. So 3 simultaneous reconcilers produce 2 metric events, not 1.
+	// Alarm thresholds in #1693 should treat this as a rate signal, not as
+	// a count of distinct overlap incidents.
+	//
+	// Each AC publishes its own per-ACId dim-stream, so any individual
+	// AC sees per-AC overlap events. Fleet-aggregate views (CloudWatch
+	// SUM/COUNT across ACId dims) are the right shape for fleet-wide
+	// alarms; per-AC alarms can be tight since the empty-prior early
+	// return means an AC's own first redispatch doesn't bump this
+	// counter (cr round-38 #2 — the sibling reconcile that DOES have
+	// work catches the overlap when it enters). #1693's alarms should
+	// pick the appropriate view per use case.
+	//
+	// A non-zero rate in production is the signal to invest in a stronger
+	// mitigation (e.g., serialize reconcile under r.mu, add a periodic
+	// device-pool sweep against the live assignedServers, or land the
+	// (pubkey, address) tuple-identity refactor in #1682 that structurally
+	// eliminates the whole bug family).
+	//
+	// Coverage limit: this metric surfaces the orphan-precondition (two
+	// reconciles in-flight). It does NOT directly surface the data-race
+	// family on .Peer field reads under HandleRedispatch overlap (a
+	// sibling connectToServer's .Peer write racing a reconcile's .Peer
+	// read). The two families share the precondition but a partial
+	// pointer read on .Peer doesn't necessarily emit an overlap event for
+	// that exact occurrence — the metric covers the orphan family in
+	// aggregate, not the data-race family in particular. #1670 is the
+	// structural fix for the AssignedServer.Peer field-locking question.
+	MetricReconcileOverlap = "ReconcileOverlap"
+
+	// MetricUnaddressedTarget is incremented when targetActiveKey falls
+	// through to the <unaddressed> sentinel — i.e., a RedirectTarget with
+	// no IP and no Hostname reached reconcileDevicePeers despite
+	// RedirectTarget.Validate (#832). Should be flat in steady state; a
+	// non-zero rate is a Validate regression. Paired with the per-pass
+	// log.Warning emitted from reconcileDevicePeers (deliberately loud —
+	// this is a bug-class signal, not a noise source, because Validate is
+	// supposed to make the branch unreachable). The metric exists so
+	// alarms can surface the regression without log-grep. If this rate
+	// ever becomes non-zero in steady state, the Validate fix lands first
+	// and only then is rate-limiting on the warning revisited.
+	//
+	// Counting model: the per-pass aggregation in reconcileDevicePeers
+	// sums sentinel observations across both newServers and priorServers
+	// loops, so a single broken target that appears in both sides of one
+	// reconcile pass produces 2 events. Alarms in #1693 should treat this
+	// as "sentinel observations per pass" rather than "distinct broken
+	// targets" — the difference doesn't matter for a flat-line steady
+	// state, but it does for thresholds expressed in target counts.
+	//
+	// Log/metric correlation: ONE log.Warning per pass + ONE metric
+	// emission per pass that increments by N (where N is the per-pass
+	// observation count). An alarm author should NOT pattern-match on
+	// "1 log line == 1 metric increment" — those are correlated 1:1 at
+	// the event level, but the metric value scales with target count
+	// while the log line is a single event. The log line carries
+	// "total=N (prior=N1 new=N2)" so log-grepping reproduces the
+	// metric breakdown.
+	MetricUnaddressedTarget = "UnaddressedTarget"
+
+	// MetricNilNewServersReconcile is incremented when reconcileDevicePeers
+	// runs with newServers=nil — i.e., HandleRedispatch's all-fail
+	// (successCount == 0) eviction branch — AND actually evicts at least
+	// one prior peer. The branch is correct (avoids the orphan leak
+	// Stop()'s invariant assumes away) but it widens the address-aliasing
+	// race window for sibling redispatches: every prior is eligible for
+	// removal, no active-set save can rescue it. Splitting this out from
+	// MetricReconcileOverlap lets soak observation answer whether all-fail
+	// entries dominate the overlap signal during partial-outage incidents
+	// — if they do, the orphan-creation rate from this branch is the
+	// load-bearing question rather than the overlap signal itself. Per-AC
+	// dim so cross-AC alarms can isolate.
+	//
+	// Emitted from inside reconcileDevicePeers (not at the call site) so
+	// the race-clean post-snapshot .Peer values gate the eviction count
+	// (cr round-38 #3 — the previous shape did a duplicate racy scan in
+	// the caller). One Incr per all-fail reconcile that did real work,
+	// regardless of how many priors were evicted: branch-entry signal,
+	// not per-element count.
+	MetricNilNewServersReconcile = "NilNewServersReconcile"
 
 	// Gauge metrics for AC-to-Server registration health monitoring (issue #239).
 	// Published every flush interval via RegisterGaugeFunc.
@@ -290,8 +375,8 @@ var (
 // IsServerAddress, connectedServerCount, healthyServerCount) do not
 // need a gate — they take r.mu.RLock to seal Stop's slice mutation,
 // so "no gate" does not mean "lock-free." Internal routines
-// (keepaliveLoop, cleanupWorker,
-// handleServerDown, refreshAssignedServerRegistrations, etc.) are
+// (keepaliveLoop, handleServerDown,
+// refreshAssignedServerRegistrations, etc.) are
 // reachable only via the gated public methods listed above or via
 // wg-tracked loops that exit on r.stopCh, so they sit outside this
 // audit. New public state-mutating entry points should return
@@ -331,17 +416,20 @@ type ACRegistration struct {
 	// snapshot the slice header under RLock and iterate outside the lock, relying
 	// on this invariant for safe concurrent access.
 	assignedServers []*AssignedServer
-	// oldServerSets tracks multiple sets of old servers during overlapping reassignments.
-	// Key is a unique cleanup ID (timestamp-based), value is the servers to clean up.
-	// This prevents a race condition where rapid reassignments could cause the wrong
-	// servers to be cleaned up. See cleanupOldServers for details.
-	oldServerSets map[string][]*AssignedServer
-	mu            sync.RWMutex
-	stopCh        chan struct{}
-	wg            sync.WaitGroup
+	mu              sync.RWMutex
+	stopCh          chan struct{}
+	wg              sync.WaitGroup
 
 	// reregistering prevents concurrent re-registration attempts
 	reregistering atomic.Bool
+
+	// reconcileInFlight counts the number of reconcileDevicePeers calls
+	// currently executing. Surfaces the orphan-precondition for
+	// MetricReconcileOverlap. Bumped by recordReconcileEntry inside
+	// reconcileDevicePeers itself so both reconcile call sites
+	// (HandleRedispatch and handleRegistrationResponse's direct-AAK
+	// branch) feed the same family-wide signal.
+	reconcileInFlight atomic.Int32
 
 	// stopped prevents double Stop() calls from panicking (closing stopCh twice)
 	stopped atomic.Bool
@@ -360,11 +448,6 @@ type ACRegistration struct {
 	// directly, not NHP_ARD. We need to track it for cleanup when AC stops
 	// or re-registers to a different server.
 	registrationPeer *core.UdpPeer
-
-	// cleanupCh feeds old-server cleanup keys to a single worker goroutine,
-	// replacing the previous pattern of spawning an unbounded goroutine per
-	// HandleRedispatch call. See cleanupChBufferSize.
-	cleanupCh chan string
 
 	// CloudWatch metrics publisher (batched, shared package)
 	metrics *metrics.Publisher
@@ -477,9 +560,7 @@ func NewACRegistration(ac *UdpAC) (*ACRegistration, error) {
 	return &ACRegistration{
 		ac:                        ac,
 		assignedServers:           make([]*AssignedServer, 0),
-		oldServerSets:             make(map[string][]*AssignedServer),
 		stopCh:                    make(chan struct{}),
-		cleanupCh:                 make(chan string, cleanupChBufferSize),
 		cachedAOLBytes:            aolBytes,
 		cachedACIdDim:             types.Dimension{Name: dimNameACId, Value: aws.String(ac.config.ACId)},
 		nlbReregistrationInterval: nlbInterval,
@@ -618,9 +699,8 @@ func (r *ACRegistration) Start() error {
 	r.metrics.RegisterGaugeFunc(MetricServersHealthy, r.healthyServerCount)
 
 	// Add to wait group BEFORE starting goroutines to prevent race with Stop()
-	r.wg.Add(2)
+	r.wg.Add(1)
 	go r.registrationLoop()
-	go r.cleanupWorker()
 
 	return nil
 }
@@ -647,7 +727,37 @@ func (r *ACRegistration) Stop() {
 		r.ac.device.RemovePeerByAddress(r.registrationPeer.PublicKeyBase64(), r.registrationPeer.Host())
 		r.registrationPeer = nil
 	}
-	// Clean up connected server peers
+	// Clean up connected server peers. HandleRedispatch reconciles the device
+	// peer pool synchronously, so the live assignedServers slice is the
+	// principal reference path at Stop() time.
+	//
+	// Concurrency: Stop ↔ in-flight redispatch.
+	//
+	// Edge case: if a redispatch is between r.mu.Unlock() and connectWg.Wait()
+	// when Stop runs, Stop sees the freshly-installed assignedServers (the
+	// new ones) and evicts those; the prior set is held only by
+	// HandleRedispatch's local priorServers slice, which its in-flight
+	// reconcile then evicts. What ensures the device pool ends fully cleared
+	// is the prior+new disjointness (no peer pointer is shared between Stop's
+	// view and the goroutine's local), not reconcile idempotency on its own
+	// — both halves of the cleanup run against disjoint sets and serialize
+	// through peerMapMutex.
+	//
+	// Stop does not block on an in-flight reconcile (HandleRedispatch is
+	// not in r.wg). If Stop returns while a redispatch is mid-loop, the
+	// AC is shutting down and the device is going with it — residual
+	// peer-pool state on a dying device is not observable, so abandoned
+	// mid-loop evictions don't leave the system in a bad state.
+	//
+	// Concurrency: metric drop semantics.
+	//
+	// An in-flight reconcile that calls IncrCounterWithDims after
+	// r.metrics.Stop() (below) bumps an in-memory counter that is never
+	// flushed. Best-effort by design — the AC is shutting down,
+	// MetricReconcileOverlap is a precondition signal not a correctness
+	// signal, and a metric that doesn't make it to CloudWatch on the
+	// dying-process path is acceptable. #1693's alarms work on
+	// rate-of-arrival and tolerate the rare drop.
 	for _, server := range r.assignedServers {
 		if server.Peer != nil {
 			r.ac.device.RemovePeerByAddress(server.Peer.PublicKeyBase64(), server.Peer.Host())
@@ -655,16 +765,6 @@ func (r *ACRegistration) Stop() {
 		}
 	}
 	r.assignedServers = nil
-	// Clean up any pending old server sets (from overlapping reassignments)
-	for cleanupKey, oldServers := range r.oldServerSets {
-		for _, server := range oldServers {
-			if server.Peer != nil {
-				r.ac.device.RemovePeerByAddress(server.Peer.PublicKeyBase64(), server.Peer.Host())
-				server.Peer = nil
-			}
-		}
-		delete(r.oldServerSets, cleanupKey)
-	}
 	r.mu.Unlock()
 
 	// Flush remaining CloudWatch metrics
@@ -1137,6 +1237,9 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 
 		// Replace assignedServers with the server for keepalive management.
 		// We replace (not append) to avoid duplicate entries on re-registration.
+		// Snapshot the prior set so the device peer pool gets reconciled
+		// consistently with the HandleRedispatch path (#1680).
+		priorServers := r.assignedServers
 		assignedServer := &AssignedServer{
 			Target: common.RedirectTarget{
 				IP:           udpAddr.IP.String(),
@@ -1148,6 +1251,32 @@ func (r *ACRegistration) handleRegistrationResponse(ppd *core.PacketParserData, 
 			LastSeen:  time.Now(),
 		}
 		r.assignedServers = []*AssignedServer{assignedServer}
+		newServers := r.assignedServers
+
+		// Hold r.mu across reconcile. Cost analysis (cr round-38):
+		// reconcileDevicePeers does at most len(priorServers) ×
+		// RemovePeerByAddress device-pool calls (each O(1) under
+		// peerMapMutex), so for typical N≈3 the lock-held window is a
+		// few µs of RLock-reader blocking. Releasing the lock here
+		// (the previous shape) admitted an "orphan-until-process-restart"
+		// hole on a racing HandleRedispatch — strictly worse than
+		// blocking three readers for µs.
+		//
+		// serverPeer was added to the device pool earlier in this
+		// response path, so reconcile sees the post-AddPeer state and
+		// only evicts addresses that genuinely retired between the prior
+		// assignment and the new one.
+		//
+		// Direct-AAK is authoritative. NHP_AAK from a registration
+		// server is the canonical answer to "where is this AC assigned
+		// now"; sibling-installed peers from a partial-redispatch
+		// in-flight at NHP_AAK arrival time are evicted by design (not
+		// merged additively). If a future operator sees
+		// MetricReconcileOverlap correlate with multi-target →
+		// single-target collapses on the direct-AAK path, that is the
+		// expected shape — the multi-target redispatch's peers are
+		// retired in favor of the AAK's authoritative single assignment.
+		r.reconcileDevicePeers(priorServers, newServers)
 		r.mu.Unlock()
 
 		log.Info("Set server as assignedServer for keepalive: %s:%d", udpAddr.IP.String(), udpAddr.Port)
@@ -1316,17 +1445,12 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 	}
 
 	r.mu.Lock()
-	// Move current servers to old servers map for graceful transition.
-	// Using a unique key ensures each cleanup goroutine only cleans up its own set,
-	// preventing a race condition with rapid reassignments.
-	var cleanupKey string
-	hasOldServers := len(r.assignedServers) > 0
-	if hasOldServers {
-		cleanupKey = time.Now().Format(time.RFC3339Nano)
-		r.oldServerSets[cleanupKey] = r.assignedServers
-	}
+	// Snapshot the previous assignment so we can reconcile the device peer
+	// pool after the new connections are established. Each HandleRedispatch
+	// creates fresh *AssignedServer structs, so the old slice is independent
+	// of the new — connectToServer mutates only the new structs.
+	priorServers := r.assignedServers
 	r.assignedServers = make([]*AssignedServer, len(validTargets))
-
 	for i, target := range validTargets {
 		r.assignedServers[i] = &AssignedServer{
 			Target:    target,
@@ -1334,12 +1458,6 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 		}
 		log.Info("Assigned server %d: %s:%d (AZ=%s)", i, target.Address(), target.Port, target.AZ)
 	}
-	// Capture slice reference before unlocking. This is safe because:
-	// 1. Each HandleRedispatch creates NEW *AssignedServer structs (not shared)
-	// 2. connectToServer modifies only these new structs (Connected, Peer, LastSeen)
-	// 3. cleanupOldServers sleeps 2min before accessing old servers - by then
-	//    connectToServer (non-blocking channel send) has long finished
-	// 4. Concurrent HandleRedispatch calls get their own independent structs
 	serversToConnect := r.assignedServers
 	r.mu.Unlock()
 
@@ -1366,8 +1484,36 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 	}
 	connectWg.Wait()
 
-	// Fail if no connections succeeded - AC would be unreachable
+	// Fail if no connections succeeded — AC would be unreachable.
+	// Evict prior peers anyway: none of the new connects succeeded, so no
+	// address overlap can save them, and r.assignedServers has already been
+	// replaced with the failed new entries. By the time the next redispatch
+	// runs, its priorServers snapshot loops over those failed entries,
+	// skips them via srv.Peer == nil, and the genuinely-retired peers
+	// would be orphaned in the device pool — unreachable from any code
+	// path, not just skipped. Pass nil newServers so the active-set check
+	// evicts the whole prior set, restoring the invariant Stop()'s comment
+	// relies on (assignedServers is the only place peers are referenced).
+	//
+	// Overlap-family note: this nil-newServers reconcile makes every prior
+	// eligible for removal, which widens the window for the address-aliasing
+	// race documented in reconcileDevicePeers' doc comment — a sibling
+	// redispatch's just-AddPeer'd shared-pubkey peer at a prior's address
+	// can be collateral-evicted (PeerGroup.RemoveMember matches by address;
+	// the LookupPeer defense covers only the non-PeerGroup branch). Same
+	// MetricReconcileOverlap signal applies; #1682 is the structural fix.
+	// Bump MetricNilNewServersReconcile separately so soak observation can
+	// answer whether all-fail entries dominate the overlap signal during
+	// partial-outage incidents.
 	if successCount == 0 {
+		// nil newServers → activeKeys is empty → every prior is removal-
+		// eligible. The active-set check trivially fails, the LookupPeer
+		// defense still runs, and reconcile evicts the whole prior set.
+		// MetricNilNewServersReconcile is emitted from reconcileDevicePeers
+		// itself when nil newServers actually evicts at least one prior —
+		// using the same race-clean .Peer snapshot the loop already takes
+		// (cr round-38 #3: avoids a duplicate racy scan here).
+		r.reconcileDevicePeers(priorServers, nil)
 		return errors.New("failed to connect to any assigned servers")
 	}
 
@@ -1378,16 +1524,10 @@ func (r *ACRegistration) HandleRedispatch(ardMsg *common.ACRedispatchMsg) error 
 		log.Info("Successfully connected to all %d assigned servers", successCount)
 	}
 
-	// Schedule old server cleanup (only if we had old servers to clean up).
-	// Send to the cleanup worker channel instead of spawning a goroutine.
-	if hasOldServers {
-		select {
-		case r.cleanupCh <- cleanupKey:
-			log.Debug("Queued old server cleanup key %s", cleanupKey)
-		default:
-			log.Warning("Cleanup channel full, dropping cleanup key %s; old servers will be cleaned up on shutdown", cleanupKey)
-		}
-	}
+	// Reconcile the device peer pool: remove any (pubkey, address) entries that
+	// were in the prior assignment but are not in the new one. Synchronous and
+	// without a grace period — see reconcileDevicePeers and #1680 for why.
+	r.reconcileDevicePeers(priorServers, serversToConnect)
 
 	// Send server connections metric
 	r.metrics.AddCounterWithDims(MetricServerConnections, float64(successCount), []types.Dimension{
@@ -1443,6 +1583,15 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 	}
 
 	if !r.ac.IsRunning() {
+		// Mirror the cleanup of the other error returns below: the new
+		// successCount==0 branch in HandleRedispatch made an IsRunning
+		// flap during redispatch leak the just-AddPeer'd peer into the
+		// device pool with no live AssignedServer pointing at it (no
+		// other reconcile path picks it up because it's on a fresh
+		// pubkey not in priorServers). Closes the leak that was
+		// pre-existing but reachability-amplified by this PR.
+		r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
+		server.Peer = nil
 		return errors.New("AC not running")
 	}
 	r.ac.sendMsgCh <- md
@@ -1686,6 +1835,12 @@ func (r *ACRegistration) refreshSingleServer(server *AssignedServer, sendAddr *n
 // handleRefreshResponse handles the server's response to refresh NHP_AOL.
 func (r *ACRegistration) handleRefreshResponse(ppd *core.PacketParserData, server *AssignedServer, sendAddr *net.UDPAddr) {
 	if ppd.Error != nil {
+		// LOAD-BEARING WORDING: tests/smoke/09_ac_redispatch_loop_test.go
+		// substring-matches /Refresh NHP_AOL to .* failed: peer not found
+		// in peer pool/ as the AC-side half of the #1680 regression
+		// fence. A wording change here will silently break that fence
+		// (no compile-time link). Until #1714 lands a stable structured
+		// tag, treat this phrasing as part of the AC log surface contract.
 		log.Warning("Refresh NHP_AOL to %s failed: %v", sendAddr.String(), ppd.Error)
 		return
 	}
@@ -1867,6 +2022,13 @@ func (r *ACRegistration) checkServerHealth() {
 
 	// Check if already re-registering to prevent concurrent attempts
 	if r.reregistering.CompareAndSwap(false, true) {
+		// LOAD-BEARING WORDING: tests/smoke/09_ac_redispatch_loop_test.go
+		// substring-matches /servers appear down, triggering
+		// re-registration/ as one half of the #1680 regression fence
+		// (the other half is in handleRefreshResponse). A wording change
+		// here silently breaks that fence — no compile-time link. Until
+		// #1714 lands a stable structured tag, treat this phrasing as
+		// part of the AC log surface contract.
 		log.Warning("All %d connected servers appear down, triggering re-registration", connectedCount)
 
 		// Send server health failure metric.
@@ -2071,10 +2233,11 @@ func (r *ACRegistration) TriggerReregistration(reason string) {
 // It does NOT clear r.assignedServers itself: the recovery path is
 // "trigger a fresh registration", and HandleRedispatch /
 // handleRegistrationResponse atomically replace the slice when the
-// response arrives, migrating the previous entries into oldServerSets
-// for cleanup. Clearing the slice from this goroutine would race with a
-// concurrent HandleRedispatch that might have just installed a fresh
-// set of valid servers and silently drop those legitimate assignments.
+// response arrives, then reconcile the device peer pool synchronously
+// (see reconcileDevicePeers). Clearing the slice from this goroutine
+// would race with a concurrent HandleRedispatch that might have just
+// installed a fresh set of valid servers and silently drop those
+// legitimate assignments.
 func (r *ACRegistration) checkAllUnconnected() {
 	r.mu.RLock()
 	servers := slices.Clone(r.assignedServers)
@@ -2185,48 +2348,332 @@ func (r *ACRegistration) checkPeriodicNLBReregistration() {
 	r.TriggerReregistration(ReasonPeriodicNLBRefresh)
 }
 
-// cleanupWorker is a single long-lived goroutine that processes old-server
-// cleanup requests from cleanupCh. It replaces the previous pattern of
-// spawning an unbounded goroutine per HandleRedispatch call, which could
-// accumulate many sleeping goroutines during rapid reassignments.
-func (r *ACRegistration) cleanupWorker() {
-	defer r.wg.Done()
-	for {
-		select {
-		case cleanupKey, ok := <-r.cleanupCh:
-			if !ok {
-				return
-			}
-			// Wait the grace period before cleaning up, but exit early on stop.
-			// Use time.NewTimer instead of time.After to avoid leaking the timer
-			// goroutine when stopCh fires before the grace period elapses.
-			timer := time.NewTimer(OldServerKeepDuration)
-			select {
-			case <-timer.C:
-				r.cleanupOldServers(cleanupKey)
-			case <-r.stopCh:
-				timer.Stop()
-				return
-			}
-		case <-r.stopCh:
-			return
-		}
+// recordReconcileEntry increments the in-flight counter at the point where
+// reconcileDevicePeers begins mutating peer-pool state and returns the
+// matching exit hook to defer. inFlight > 1 emits MetricReconcileOverlap —
+// the orphan-precondition documented on reconcileDevicePeers.
+//
+// Called from inside reconcileDevicePeers (not from its callers), so every
+// reconcile call site contributes to the same family-wide signal. A future
+// third call site that goes through reconcileDevicePeers gets the metric
+// for free; a future reconcile bypass that doesn't would silently miss it.
+//
+// Use as:
+//
+//	exit := r.recordReconcileEntry()
+//	defer exit()
+func (r *ACRegistration) recordReconcileEntry() func() {
+	// entrants is the count AFTER our increment, including ourselves.
+	// We're an overlap-causing entrant when entrants > 1 (i.e., at
+	// least one other reconcile was already in flight when we arrived).
+	// Off-by-one trap to watch for: a future refactor that switches to
+	// CompareAndSwap or pre-increment-compare must keep the
+	// "we're the second-or-later entrant" semantic, not "we observed
+	// any other entrant at any point."
+	if entrants := r.reconcileInFlight.Add(1); entrants > 1 {
+		r.metrics.IncrCounterWithDims(MetricReconcileOverlap, []types.Dimension{r.acIdDimension()})
 	}
+	return func() { r.reconcileInFlight.Add(-1) }
 }
 
-// cleanupOldServers removes old server connections for the given cleanup key.
-// Called by the cleanupWorker after the grace period has elapsed.
-func (r *ACRegistration) cleanupOldServers(cleanupKey string) {
-	r.mu.Lock()
-	oldServers := r.oldServerSets[cleanupKey]
-	delete(r.oldServerSets, cleanupKey)
-	r.mu.Unlock()
+// targetActiveKey returns a canonical (pubkey, address) key for active-set
+// membership tests, plus a bool flagging the <unaddressed> sentinel branch.
+//
+// Contract. Keys on RedirectTarget.IP (preferred) or Hostname; both prior
+// and new sets are keyed consistently because RedirectTarget.Validate (#832)
+// requires one of them. PeerGroup.RemoveMember matches on
+// m.Ip == addr || m.Host() == addr; passing peer.Host() at remove time
+// (which prefers Hostname when set and includes the port suffix as
+// "host:port") resolves the correct member via the m.Host() == addr branch.
+// The m.Ip == addr branch does not fire for typical peers because m.Ip is
+// the IP without a port and peer.Host() includes one — the load-bearing
+// match is m.Host() == addr.
+//
+// INVARIANT: callers must ensure both prior and new targets have IP
+// populated. RedirectTarget.Validate (#832) requires IP specifically and
+// explicitly rejects hostname-only targets ("Hostname is not a substitute"
+// — see nhp/common/nhpmsg.go). Hostname is optional metadata. The
+// Hostname fallback below and the IP→Hostname transition test
+// (TestACRegistration_ReconcileDevicePeers_IPToHostnameTransition) are
+// defense-in-depth: they exercise paths that bypass Validate (today only
+// reachable via direct test invocation), and the <unaddressed> sentinel +
+// MetricUnaddressedTarget surface a Validate regression that did let
+// such a target through.
+//
+// DNS-flip semantics. Drain-redirect targets (#1239) are emitted with
+// Hostname set on the wire; the AC's pre-Validate adapter must resolve
+// Hostname to IP before construction so the produced RedirectTarget
+// satisfies Validate. If the resolved IP changes between prior and new
+// (NLB address rotation), the keys differ and the prior is evicted —
+// correct, because the new peer is at the new resolved address and is
+// already in newServers, so the active member is preserved while the
+// stale one drops.
+//
+// Sentinel + reporting. Returns (key, true) when input has neither IP nor
+// Hostname — belt-and-suspenders against a regression in
+// RedirectTarget.Validate. Callers (reconcileDevicePeers) aggregate the
+// bool over a single reconcile pass and emit one log.Warning per pass +
+// one MetricUnaddressedTarget bump PER SENTINEL OBSERVATION (the metric
+// uses AddCounterWithDims with the per-pass count, so the time-series
+// counts observations, not passes). Aggregation is the deliberate rate
+// limit on the warning: Validate is supposed to make this branch
+// unreachable, so the signal must be loud, but a per-target log.Warning
+// would scale with offending target count and reconcile frequency.
+// Per-pass log + per-observation metric keeps the loud-on-regression
+// signal while bounding log volume.
+func targetActiveKey(t common.RedirectTarget) (key string, sentinel bool) {
+	addr := t.IP
+	if addr == "" {
+		addr = t.Hostname
+	}
+	if addr == "" {
+		addr = "<unaddressed>"
+		sentinel = true
+	}
+	// Use \x00 as the field separator. PubKeyBase64 is RFC 4648 base64
+	// (alphabet [A-Za-z0-9+/=]) so "|" would also work, but Hostname is
+	// not similarly constrained — a future test/regression injecting a
+	// hostname containing "|" would ambiguate "k|host|with|pipes:port"
+	// vs "k|host:port|with|pipes" (cr round-38 #8). The null-byte
+	// separator is unambiguous against any printable input and matches
+	// the convention buildDimCounterKey uses in endpoints/metrics.
+	key = fmt.Sprintf("%s\x00%s:%d", t.PubKeyBase64, addr, t.Port)
+	return key, sentinel
+}
 
-	for _, server := range oldServers {
-		if server.Peer != nil {
-			r.ac.device.RemovePeerByAddress(server.Peer.PublicKeyBase64(), server.Peer.Host())
-			log.Info("Cleaned up old server connection to %s", server.Target.IP)
+// reconcileDevicePeers removes from the device cipher pool the
+// (pubkey, address) entries present in priorServers but absent from
+// newServers. Called synchronously from HandleRedispatch after the new
+// connections have been established.
+//
+// Behavior. Two invariants keep this safe with the *core.PeerGroup model
+// that ASGs with shared keypairs land in (issue #1680):
+//
+//  1. Set difference. Only addresses that are NOT in newServers are
+//     candidates for removal. An address that re-appears in the new
+//     assignment is skipped here, preventing the previous async cleanup's
+//     self-inflicted eviction loop.
+//
+//  2. Order. connectToServer (which calls device.AddPeer for each new
+//     target) runs BEFORE this function. Addresses removed here are
+//     therefore addresses that have NOT been re-AddPeer'd in this
+//     redispatch — the *UdpPeer member sitting at that address inside
+//     the PeerGroup is still the prior one, so RemovePeerByAddress
+//     evicts the correct peer.
+//
+// Replaces the previous oldServerSets + 2-minute-grace-period cleanupWorker.
+// The grace period was non-load-bearing (the only packets that could rely
+// on it were leftovers from a server already disowned by this AC, whose
+// validation outcome no longer affects the user-facing flow), so deleting
+// the async machinery removes a bug surface without changing behavior.
+//
+// Concurrency: overlap windows.
+//
+// In the rare case where a second
+// redispatch starts and finishes its reconcile while the first redispatch's
+// connectToServer is still running, the first's late AddPeer can reintroduce
+// a peer at an address the second redispatch had just removed. The resulting
+// orphan sits in the device peer pool with no live AssignedServer pointing
+// at it; nothing routes traffic to it, and the next non-overlapping
+// redispatch evicts it via this function's normal delta path. The symmetric
+// failure is also possible: between this function's targetActiveKey
+// enumeration and its RemovePeerByAddress call, a sibling redispatch can
+// AddPeer at the to-be-removed address — and we then evict that fresh peer.
+// connectToServer's own failure path (AddPeer-then-RemovePeerByAddress on
+// timeout/error) admits the same family of races against a sibling's fresh
+// AddPeer at the same address. All three are the original incident's
+// pointer-aliasing failure mode in miniature; fully eliminating them
+// requires (pubkey, address) tuple identity in core.Device (tracked in
+// #1682), so a non-zero MetricReconcileOverlap rate is the signal for the
+// whole family — not just orphans from this function. Acceptable given
+// that re-registration is gated by reregistering.CompareAndSwap, so
+// HandleRedispatch overlap requires an out-of-band NHP_ARD landing during
+// an in-progress register cycle. Direct-AAK ↔ direct-AAK overlap (two
+// NHP_AAK responses arriving in quick succession) is gated only by network
+// arrival ordering — not by the CAS, which sits on TriggerReregistration
+// rather than the response handler. MetricReconcileOverlap covers both.
+//
+// Concurrency: single-peer branch hazard.
+//
+// core.Device.RemovePeerByAddress's single-peer (non-PeerGroup)
+// branch ignores the addr argument and unconditionally deletes peerMap[K].
+// Under the documented overlap precondition, this means a sibling's just-
+// AddPeer'd single peer at K can be wholesale evicted when this function
+// thinks it's removing the prior K|A — the active-set check above
+// prevents the in-set case but cannot rescue the cross-redispatch race.
+// Tightening that branch to honor addr is part of #1682's tuple-identity
+// surface.
+//
+// Concurrency: field reads under overlap.
+//
+// reconcileDevicePeers reads Target on both priorServers and
+// newServers (immutable after AssignedServer construction in
+// HandleRedispatch), and reads .Peer on priorServers for the
+// RemovePeerByAddress call. Under the documented HandleRedispatch overlap
+// precondition a sibling redispatch's connectToServer can still be writing
+// .Peer on those structs — the read here is intentionally racy in that
+// rare case (the AssignedServer.Peer field-locking question is tracked in
+// #1670). MetricReconcileOverlap surfaces the precondition; if it fires
+// in production, #1670 / #1682 are the structural fixes.
+//
+// priorServers' .Peer fields are also read after handleRegistrationResponse's
+// pre-existing registrationPeer cleanup may have mutated peerMap entries
+// under r.mu; the .Peer reads here are of immutable fields on *core.UdpPeer
+// (PublicKeyBase64, Host()), not of peerMap state, so the device-side
+// cleanup above does not invalidate the captured pointers — the cleanup
+// only changes what's *in* the device pool, not what those pointers refer
+// to.
+//
+// Failure shapes: partial-success / address-aliasing.
+//
+// When HandleRedispatch's
+// connectToServer fails on a target whose address aliases a prior server,
+// connectToServer's failure path calls RemovePeerByAddress on the new
+// peer's pubkey/host — which is the same address as the prior under
+// shared pubkey, so the prior is collateral-evicted. Reconcile here then
+// sees activeKeys including that address (the new entry is in
+// serversToConnect regardless of connect success) and skips the prior,
+// so the device pool ends up missing both peers. Bounded by the next
+// non-overlapping cycle; same family the overlap doc describes; #1688
+// is the right place to track the fix once test-harness work supports
+// driving the partial-failure path deterministically.
+func (r *ACRegistration) reconcileDevicePeers(priorServers, newServers []*AssignedServer) {
+	if len(priorServers) == 0 {
+		// Empty priors → nothing to evict. MetricReconcileOverlap is an
+		// orphan-precondition signal (concurrent reconciles that *could*
+		// evict — i.e., have priors), not a generic data-race detector;
+		// a reconcile with no priors cannot be the orphan-creator, so
+		// returning here without bumping the counter keeps the metric's
+		// semantics tight. cr round-38 #2: the previously-hoisted
+		// recordReconcileEntry produced fleet-warmup baseline noise on
+		// cold-start ACs without adding coverage (the racing
+		// connectToServer-vs-sibling-reconcile case is caught by the
+		// SIBLING reconcile's own entry, not by this empty-prior one).
+		return
+	}
+
+	// Track concurrent reconcile entries — the orphan precondition for the
+	// whole bug family this function admits. Wired here (not at the
+	// HandleRedispatch / handleRegistrationResponse callers) so every
+	// reconcile call site contributes to MetricReconcileOverlap, including
+	// the realistic HandleRedispatch ↔ direct-AAK overlap that an
+	// out-of-band NHP_ARD landing during a register cycle produces.
+	exitReconcile := r.recordReconcileEntry()
+	defer exitReconcile()
+	var unaddressedNew, unaddressedPrior int
+	var anyEvicted bool // tracks whether any prior was actually RemovePeerByAddress'd; gates MetricNilNewServersReconcile
+	activeKeys := make(map[string]struct{}, len(newServers))
+	for _, srv := range newServers {
+		if srv == nil {
+			continue
 		}
+		k, sentinel := targetActiveKey(srv.Target)
+		if sentinel {
+			unaddressedNew++
+		}
+		activeKeys[k] = struct{}{}
+	}
+	for _, srv := range priorServers {
+		if srv == nil {
+			continue
+		}
+		// Single-load .Peer into a local. On the direct-AAK reconcile
+		// path priorServers shares the same *AssignedServer pool a
+		// still-running sibling HandleRedispatch.connectToServer may
+		// be writing .Peer into (the failure path nils server.Peer).
+		// A nil-check on srv.Peer followed by srv.Peer.PublicKey()
+		// would crash on a sibling write of nil between check and
+		// dereference. Snapshot the pointer here so the rest of the
+		// loop body is consistent regardless of concurrent writes.
+		// Structural fix is field-level locking on AssignedServer.Peer
+		// via #1715 / #1670; this local-load is the minimum defense
+		// for the immediate nil-deref hazard (cr round-31 #3).
+		peer := srv.Peer
+		if peer == nil {
+			continue
+		}
+		// unaddressedPrior counts only priors that survived the
+		// nil-Peer guard above — which is intentional. A prior with
+		// .Peer == nil is one this reconcile would skip anyway (no
+		// peer-pool work to do), so its sentinel observation isn't
+		// telemetry-relevant. Keeps the metric tied to "broken target
+		// on a prior we'd touch," not "broken target in any
+		// AssignedServer slot."
+		k, sentinel := targetActiveKey(srv.Target)
+		if sentinel {
+			unaddressedPrior++
+		}
+		if _, active := activeKeys[k]; active {
+			continue
+		}
+		// Defense against core.Device.RemovePeerByAddress's single-peer
+		// (non-PeerGroup) branch ignoring addr: if the device's current
+		// entry for this pubkey is a *UdpPeer that is NOT the one we
+		// captured at snapshot time, a concurrent AddPeer landed in the
+		// snapshot-to-reconcile window — wholesale deleting peerMap[K]
+		// would wipe that sibling's fresh peer (the original incident's
+		// bug class in miniature, but reachable without two overlapping
+		// reconciles). Skip the device call in that case.
+		//
+		// Single-peer branch only. PeerGroup entries pass through (the
+		// type assertion fails, so the !ok arm of the if leaves us
+		// proceeding to RemoveMember). RemoveMember matches by address,
+		// so under shared-pubkey ASGs (the original incident's shape)
+		// what saves us is invariant 1 — set difference — not this
+		// defense. Single-peer is protected by invariant 1 + this
+		// LookupPeer check; PeerGroup is protected by invariant 1 alone
+		// in the same-redispatch case. The cross-redispatch case
+		// (sibling AddPeer between this enumeration and its
+		// RemovePeerByAddress) is genuinely undefended on the PeerGroup
+		// branch — invariant 1 only saves you when the sibling's
+		// address is in YOUR newServers activeKeys, which it isn't in
+		// cross-redispatch. That residual is part of the overlap family
+		// surfaced by MetricReconcileOverlap; the symmetric
+		// PeerGroup-side LookupMember-style defense is tracked in #1711.
+		//
+		// TOCTOU residual on the single-peer branch too: LookupPeer
+		// releases peerMapMutex before RemovePeerByAddress re-acquires
+		// it. A sibling AddPeer landing in that gap can swap peerMap[K]
+		// to a fresh peer between our identity check and our remove —
+		// and we then evict the fresh peer. The defense closes the
+		// "swap already happened before we checked" case but not the
+		// "swap happens between check and remove" case. Same overlap
+		// family, surfaced by MetricReconcileOverlap; #1682 closes both
+		// cases by making the remove tuple-keyed and atomic.
+		current := r.ac.device.LookupPeer(peer.PublicKey())
+		if current == nil {
+			continue
+		}
+		if udp, ok := current.(*core.UdpPeer); ok && udp != peer {
+			log.Debug("Skipping device cleanup for retired server %s: pubkey now references a different peer", srv.Target.Address())
+			continue
+		}
+		r.ac.device.RemovePeerByAddress(peer.PublicKeyBase64(), peer.Host())
+		log.Info("Removed device peer for retired server %s", srv.Target.Address())
+		anyEvicted = true
+	}
+	// Emit one log + one metric event per reconcile pass that observed any
+	// unaddressed-sentinel target. Aggregating here keeps the signal loud on
+	// regression (every reconcile after a Validate break logs once) without
+	// scaling log volume by target count or reconcile rate. The prior/new
+	// split in the log line lets a 3am operator distinguish "Validate
+	// regression in NHP_ARD parsing path" (unaddressedNew > 0) from
+	// "leftover broken target in r.assignedServers" (unaddressedPrior > 0).
+	unaddressedHits := unaddressedNew + unaddressedPrior
+	if unaddressedHits > 0 {
+		log.Warning("targetActiveKey fallback to <unaddressed> sentinel: %d total (prior=%d new=%d) in this reconcile pass — RedirectTarget.Validate (#832) regressed?", unaddressedHits, unaddressedPrior, unaddressedNew)
+		r.metrics.AddCounterWithDims(MetricUnaddressedTarget, float64(unaddressedHits), []types.Dimension{r.acIdDimension()})
+	}
+
+	// MetricNilNewServersReconcile fires when the all-fail eviction
+	// branch (HandleRedispatch's successCount == 0 path) actually evicts
+	// at least one prior. Detected here, not at the call site, so the
+	// race-clean post-snapshot .Peer values are used and the duplicate
+	// scan in the caller is eliminated (cr round-38 #3). Branch-entry
+	// signal: one event per all-fail reconcile that did real eviction
+	// work, regardless of how many priors were evicted.
+	if newServers == nil && anyEvicted {
+		r.metrics.IncrCounterWithDims(MetricNilNewServersReconcile, []types.Dimension{r.acIdDimension()})
 	}
 }
 
