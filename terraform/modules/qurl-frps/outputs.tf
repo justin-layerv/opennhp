@@ -40,3 +40,15 @@ output "ssm_image_tag_parameter" {
   description = "SSM parameter name for the deployed image tag"
   value       = aws_ssm_parameter.image_tag.name
 }
+
+# Per-AZ empty-registration alarms (#1542). Map keyed by AZ suffix so root
+# wiring / dashboards can target the alarm for a specific suffix without
+# index-arithmetic or list-order assumptions. Empty map when the watchdog
+# is disabled (var.frps_empty_az_alarm_enabled = false).
+output "cloud_map_empty_az_alarm_arns" {
+  description = "Map of AZ suffix → CloudWatch alarm ARN for the per-AZ Cloud Map empty-registration alarms (#1542). Empty when either var.frps_empty_az_alarm_enabled or var.enable_cloudwatch_alarms is false (the watchdog is gated on the AND of both — see local.enable_empty_az_watchdog in monitoring_empty_az.tf)."
+  value = {
+    for s, alarm in aws_cloudwatch_metric_alarm.empty_az_per_suffix :
+    s => alarm.arn
+  }
+}

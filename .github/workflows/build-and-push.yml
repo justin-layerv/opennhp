@@ -661,6 +661,14 @@ jobs:
           echo '::group::Security Lambda Tests'
           (cd terraform/modules/security/lambda && python -m pytest test_stale_finding_watchdog.py -v)
           echo '::endgroup::'
+          # qurl-reverse-tunnel-server empty-AZ watchdog (#1542). Same sys.modules-swap
+          # pattern as security/test_stale_finding_watchdog.py — runs
+          # in its own pytest invocation so a transitive boto3 import
+          # from another test file's conftest can't fire the runtime
+          # check at the top of the test module.
+          echo '::group::qurl-reverse-tunnel-server Empty-AZ Watchdog Lambda Tests'
+          (cd terraform/modules/qurl-frps/lambda && python -m pytest test_empty_az_watchdog.py -v)
+          echo '::endgroup::'
           echo '::group::ECR Replication Check Lambda Tests'
           # Suite is serial-only — module re-imports per test for
           # region-resolution coverage. See `lambda_module` fixture

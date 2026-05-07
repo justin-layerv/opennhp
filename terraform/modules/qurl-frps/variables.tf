@@ -103,6 +103,54 @@ variable "alarm_sns_topic_arn" {
   default     = ""
 }
 
+# Per-AZ Cloud Map empty-registration watchdog (#1542) — detection layer
+# that catches the (a=2, b=1, c=0) ASG distribution that satisfies
+# `GroupInServiceInstances < 1` while leaving one AZ's Cloud Map service
+# empty. PR #1549 ships the structural fence (one ASG per AZ); this
+# watchdog stays in place after #1549 as defense in depth.
+variable "frps_empty_az_alarm_enabled" {
+  description = <<-EOT
+    Deploy the per-AZ Cloud Map empty-registration watchdog. Default true.
+
+    First apply after this PR adds (per env where deploy_frps = true):
+      - 1 Lambda function (empty_az_watchdog, ~2 KB packaged, python3.12)
+      - 1 IAM role + 1 inline policy + 1 managed-policy attachment
+      - 1 EventBridge rule + 1 target + 1 lambda:InvokeFunction permission
+      - 1 CloudWatch log group (KMS-encrypted)
+      - length(frps_az_suffixes) per-AZ alarms (3 by default; PAGE)
+      - 1 Lambda Errors self-failure alarm (TICKET)
+      - 1 EventBridge FailedInvocations self-failure alarm (TICKET)
+    Cost ≈ $1.40/month at the default 3-AZ fanout (see monitoring_empty_az.tf
+    cost note).
+
+    Detection-only — no traffic-path coupling. Set to `false` to opt out
+    (e.g., for module-isolated test fixtures where iterating Cloud Map
+    services per AZ is not desired).
+
+    Note: this watchdog is also gated on `enable_cloudwatch_alarms` (see
+    `monitoring_empty_az.tf` `local.enable_empty_az_watchdog`). Disabling
+    `enable_cloudwatch_alarms` removes the entire detection layer
+    (Lambda, EventBridge rule, IAM, alarms) — there's no value in
+    running the metric-emitting Lambda when no alarms consume the
+    metric. If you ever want metrics for a dashboard but no paging,
+    add a separate gate.
+
+    Greenfield flap expectation: on a fresh apply where `deploy_frps =
+    true` flips for the first time, the per-AZ alarms create in the
+    same plan as the ASG/Cloud Map services. EventBridge first-fires
+    at ~rate(5 min); Cloud Map registration takes 30-90s post-launch;
+    cold AMI pull adds ~5-7 min. Total >~10-15 min from apply to
+    first non-zero datapoint per AZ is plausible. The per-AZ alarm's
+    `evaluation_periods = 2 × period 300s` (10-min floor) may
+    transition to ALARM and page once before the first
+    PerAZRegistrationCount publish lands. Existing-env applies
+    don't see this (instances already registered); greenfield envs
+    should expect a possible one-shot flap on first apply and ack.
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "frps_bind_port" {
   description = "FRP server control port (frpc connects here)"
   type        = number
