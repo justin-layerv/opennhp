@@ -1071,7 +1071,7 @@ cat > /home/ubuntu/traefik/dynamic.toml << DYNAMICEOF
 # Traefik Dynamic Configuration
 #
 # Router priority hierarchy (higher number = matched first):
-#   20 - frp-control        /.well-known/layerv-frp → FRP WebSocket (when deploy_frps)
+#   20 - frp-control        /.well-known/layerv-frp or /~!frp → FRP WebSocket (when deploy_frps)
 #   15 - qurl-site          *.qurl.site subdomain routing
 #   10 - nhp-plugins        /plugins/* to NHP Server
 #   10 - prod-*/addtls-*    production domain routes (when ACME enabled)
@@ -1257,15 +1257,25 @@ cat >> /home/ubuntu/traefik/dynamic.toml << FRPDYNAMICEOF
 
 # FRP WebSocket control channel
 #
-# Externally we expose /.well-known/layerv-frp (RFC 8615 reserved namespace —
-# customer apps are not expected to register under /.well-known/, so a
-# catch-all on / can't hijack FRP control traffic). Internally FRP's
-# WebSocket upgrade handler is hardcoded to /~!frp (github.com/fatedier/frp),
-# so we apply a `replacePath` middleware to rewrite before forwarding.
-# Clients talk to /.well-known/layerv-frp; frps sees /~!frp. If the internal
-# path changes in a future FRP version, update BOTH:
+# Two paths reach the same FRPS service:
+#
+#   1. /.well-known/layerv-frp — RFC 8615 reserved namespace, originally
+#      added so a customer-app catch-all on / couldn't hijack FRP control
+#      traffic. Reaches FRPS via the `frp-path-rewrite` middleware.
+#   2. /~!frp — the path FRP's WebSocket upgrade handler hardcodes
+#      (`pkg/util/net/websocket.go::FrpWebsocketPath` in
+#      github.com/fatedier/frp). Stock qurl-frpc clients use this path
+#      directly (FRP v0.68 has no `transport.subPath` config option to
+#      override it), so without an explicit router for this path the
+#      WebSocket request would fall through to the customer catch-all
+#      (`nhp-ac` priority 1) and 404. The `replacePath` middleware is
+#      a no-op when the incoming path is already `/~!frp`, so the same
+#      service + middleware chain handles both inputs.
+#
+# If the internal FRP WebSocket path changes in a future FRP version,
+# update BOTH:
 #   - http.middlewares.frp-path-rewrite.replacePath.path
-#   - The qurl-frpc client config template
+#   - The Path() match for the direct route below
 #
 # Note: Traefik 3.x forwards `Upgrade` and `Connection` headers for WebSocket
 # handshakes by default. If anyone ever adds a `headers` middleware to this
@@ -1275,7 +1285,7 @@ cat >> /home/ubuntu/traefik/dynamic.toml << FRPDYNAMICEOF
   path = "/~!frp"
 
 [http.routers.frp-control]
-  rule = "Path(\`/.well-known/layerv-frp\`)"
+  rule = "Path(\`/.well-known/layerv-frp\`) || Path(\`/~!frp\`)"
   service = "frp-control"
   middlewares = ["frp-path-rewrite"]
   entryPoints = ["https"]
@@ -1294,7 +1304,7 @@ cat >> /home/ubuntu/traefik/dynamic.toml << FRPDYNAMICEOF
   [[http.services.frp-control.loadBalancer.servers]]
     url = "http://${frp_server_host}:${frp_control_port}"
 FRPDYNAMICEOF
-echo "FRP tunnel server routes added (ingress /.well-known/layerv-frp -> rewrite /~!frp -> ${frp_server_host}:${frp_control_port})"
+echo "FRP tunnel server routes added (ingress /.well-known/layerv-frp or /~!frp -> ${frp_server_host}:${frp_control_port})"
 %{ endif ~}
 
 %{ if !centralized_cert_enabled ~}
