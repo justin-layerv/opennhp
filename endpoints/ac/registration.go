@@ -44,6 +44,12 @@ const (
 	RegistrationTimeout = 30 * time.Second
 
 	// KeepaliveInterval is how often to send keepalives to each server.
+	// MinNLBReregistrationInterval (= 3 × this) derives from this value, and
+	// DefaultAllUnconnectedThreshold (= 3) is a tick count whose duration is
+	// also (3 × this) — keepalive cadence drives both, not the reverse. A
+	// bump here proportionally raises both durations, so re-validate the
+	// deploy-gate fences (TestNLBReregistration_BoundedByDeployGate) before
+	// raising it.
 	KeepaliveInterval = 10 * time.Second
 
 	// KeepaliveTimeout is the timeout for keepalive response.
@@ -70,18 +76,76 @@ const (
 	MaxServerDownReregBackoff = 5 * time.Minute
 
 	// DefaultNLBReregistrationInterval is the default cadence for the
-	// periodic NLB re-registration safety net. It is intentionally long
-	// (every 30 minutes) because it is a defense-in-depth check for silent
-	// failures, not a primary recovery path. Operators can override this
-	// per-AC via Config.NLBReregistrationIntervalSeconds.
-	DefaultNLBReregistrationInterval = 30 * time.Minute
+	// periodic NLB re-registration safety net. It must fit within the
+	// blue/green deploy gate (post_switch_knock_ready_timeout_minutes
+	// in .github/workflows/blue-green-deploy.yml, default 5 min;
+	// driven by .github/scripts/verify-knock-ready.sh) so a
+	// wrong-color latch caused by NLB UDP listener propagation lag
+	// heals before the gate gives up. The worst-case interval
+	// (default + max positive jitter) is fenced against the gate by
+	// TestNLBReregistration_BoundedByDeployGate.
+	//
+	// No faster path catches the "AC has at least one connected server,
+	// but it's the wrong color" case (checkAllUnconnected requires
+	// *all* servers unconnected); the safety net is the primary
+	// recovery path for that bug class, not a once-in-a-while hedge.
+	//
+	// Per cycle each AC sends 1 NLB-routed NHP_AOL plus N direct
+	// NHP_AOLs to its assigned servers (HandleRedispatch always
+	// re-handshakes; #1727 tracks short-circuiting on stable peer list).
+	// At single-digit fleet sizes that's a few handshakes per minute —
+	// well below NLB and per-server registration capacity *at single-
+	// digit fleet sizes*. Larger fleets scale linearly with N_ac × N_servers
+	// per AC; #1727's stable-peer-list short-circuit is the prerequisite
+	// for raising fleet count without retuning. Keepalives stay on the
+	// direct-IP path (every KeepaliveInterval per assigned server) because
+	// routing them via NLB would amplify listener-fanout load without
+	// buying additional self-healing.
+	//
+	// Operators can override per-AC via Config.NLBReregistrationIntervalSeconds.
+	DefaultNLBReregistrationInterval = 90 * time.Second
+
+	// periodicNLBRefreshLogSubstring is the load-bearing substring of
+	// the log.Info message emitted by checkPeriodicNLBReregistration.
+	// Pinned as a package-private constant so:
+	//   - the unit fence (TestCheckPeriodicNLBReregistration_LogFormatStable)
+	//     anchors directly against this symbol rather than a duplicated
+	//     literal;
+	//   - a refactor that reformats the log line is forced to either
+	//     update this constant (which lights up the unit fence and,
+	//     by symmetry, the smoke fence's regex) or live with a stale
+	//     reference (which the unit test catches at compile time).
+	//
+	// The smoke test in tests/smoke/01_ac_nlb_reregistration_cadence_test.go
+	// duplicates this literal in its CloudWatch Logs Insights query —
+	// a cross-module import would add wiring without buying additional
+	// safety because the unit test catches drift here. Replace with
+	// #1714's structured tag at the emission site (and DELETE this
+	// constant in the same PR) when the tag lands.
+	periodicNLBRefreshLogSubstring = "periodic NLB re-registration triggered"
 
 	// MinNLBReregistrationInterval is the lower bound for the periodic NLB
-	// re-registration safety net. Going below this would defeat the
-	// "rate-limited safety net" intent and risks DoS-ing the registration
-	// fleet during a network blip. Any configured value below this is
-	// clamped up to it.
-	MinNLBReregistrationInterval = 5 * time.Minute
+	// re-registration safety net. Going below ~3 × KeepaliveInterval
+	// risks dogpiling under network blips even with the single-flight
+	// guard in TriggerReregistration. Any configured value below this
+	// is clamped up. Defined in terms of KeepaliveInterval so a future
+	// retune of the keepalive cadence carries this floor along
+	// proportionally rather than silently falling out of sync.
+	//
+	// Operator-config behavior change (PR #1726): pre-PR the floor was
+	// 5 min, so any NLBReregistrationIntervalSeconds value between 60s
+	// and 300s was silently clamped up to 300s. Post-PR the floor is
+	// 30s, so those configs now take effect verbatim — a 5× nominal
+	// rate increase from configs that were previously dead-zoned.
+	//
+	// This bounds the *steady-state* cadence. Under sustained
+	// registration outages the inner retry loop in TriggerReregistration
+	// (MaxReregistrationAttempts × n²-second backoff) governs cadence
+	// instead — lastNLBRegistrationNano only advances on success, so a
+	// failing periodic tick is not "spent" against this floor. The
+	// inner exponential backoff is the intentional dogpile guard for
+	// the failure path; this floor governs the success path.
+	MinNLBReregistrationInterval = 3 * KeepaliveInterval
 
 	// DefaultAllUnconnectedThreshold is the default number of consecutive
 	// keepalive ticks during which ALL assigned servers must remain in
@@ -482,13 +546,19 @@ type ACRegistration struct {
 	// once at construction so the jitter is stable across the AC's
 	// lifetime — a stable jitter is what de-correlates a fleet, not a
 	// fresh random value every tick.
+	//
+	// IMMUTABLE after NewACRegistration. checkPeriodicNLBReregistration
+	// reads it without a lock, relying on goroutine-start
+	// happens-before. A future SIGHUP-style reload path that mutates
+	// this field must serialize the read or switch to atomic.
 	nlbReregistrationInterval time.Duration
 
 	// allUnconnectedThreshold is the effective (config + per-AC jitter)
 	// number of consecutive keepalive ticks the all-unconnected detector
 	// requires before tripping a re-registration. Computed once at
 	// construction for the same fleet-jitter reason as
-	// nlbReregistrationInterval.
+	// nlbReregistrationInterval. IMMUTABLE after NewACRegistration on
+	// the same terms (see comment above).
 	allUnconnectedThreshold uint32
 }
 
@@ -1657,11 +1727,13 @@ func (r *ACRegistration) connectToServer(server *AssignedServer) error {
 //     bug in the registration response that handed back targets the AC
 //     could never establish a flow with).
 //
-//  2. checkPeriodicNLBReregistration — slow defense-in-depth (~30min) that
-//     fires regardless of per-server health. checkServerHealth needs at
-//     least one previously-connected server to detect a problem; if every
-//     UDP path is silently dead but no health signal has flipped, this
-//     periodic refresh is the catch-all.
+//  2. checkPeriodicNLBReregistration — bounded NLB re-registration
+//     that fires regardless of per-server health. Catches both
+//     "every UDP path is silently dead" (the original
+//     defense-in-depth motivation) and "AC connected to the
+//     wrong-color server after a deploy switch" (the primary recovery
+//     path checkAllUnconnected cannot see when at least one server
+//     is connected). See DefaultNLBReregistrationInterval.
 func (r *ACRegistration) keepaliveLoop() {
 	ticker := time.NewTicker(KeepaliveInterval)
 	defer ticker.Stop()
@@ -2300,10 +2372,10 @@ func (r *ACRegistration) timeSinceLastNLBRegistration() time.Duration {
 	return time.Since(time.Unix(0, r.lastNLBRegistrationNano.Load()))
 }
 
-// checkPeriodicNLBReregistration is the slow defense-in-depth safety net
-// that fires every nlbReregistrationInterval regardless of any per-server
-// health signal. It exists for the failure modes the per-server
-// keepalive path simply cannot see:
+// checkPeriodicNLBReregistration is the bounded NLB re-registration
+// path that fires every nlbReregistrationInterval regardless of any
+// per-server health signal. It exists for the failure modes the
+// per-server keepalive path simply cannot see:
 //
 //   - The AC believes it has live connections (LastSeen recent because
 //     the NHP_AOL refresh path completed) but the underlying UDP flow
@@ -2318,13 +2390,10 @@ func (r *ACRegistration) timeSinceLastNLBRegistration() time.Duration {
 //     server updates" is the symptom — having a bounded recovery window
 //     prevents an indefinite paging incident.
 //
-// This is intentionally distinct from checkAllUnconnected:
-// checkAllUnconnected fires within ~30 seconds when the failure is
-// observable through Connected=false; this one fires once every
-// ~30 minutes regardless and is the catch-all for "looks fine, isn't".
-// Without both layers a bug whose symptom is "AC works for the first
-// minute then silently goes deaf" could page on-call instead of
-// self-healing.
+// Distinct from checkAllUnconnected: that one fires within ~30s
+// when *every* server is in Connected=false. This one fires every
+// nlbReregistrationInterval regardless. See
+// DefaultNLBReregistrationInterval for cadence rationale.
 func (r *ACRegistration) checkPeriodicNLBReregistration() {
 	if r.timeSinceLastNLBRegistration() < r.nlbReregistrationInterval {
 		return
@@ -2340,7 +2409,7 @@ func (r *ACRegistration) checkPeriodicNLBReregistration() {
 		return
 	}
 
-	log.Info("AC %s: periodic NLB re-registration triggered (last registration: %s ago, interval: %s)",
+	log.Info("AC %s: "+periodicNLBRefreshLogSubstring+" (last registration: %s ago, interval: %s)",
 		r.ac.config.ACId,
 		r.timeSinceLastNLBRegistration().Truncate(time.Second),
 		r.nlbReregistrationInterval)

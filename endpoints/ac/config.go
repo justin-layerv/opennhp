@@ -100,7 +100,10 @@ type Config struct {
 
 	// NLBReregistrationIntervalSeconds overrides
 	// DefaultNLBReregistrationInterval. Values below
-	// MinNLBReregistrationInterval (5min) are clamped up.
+	// MinNLBReregistrationInterval are clamped up. The floor itself
+	// is defined symbolically against KeepaliveInterval — see
+	// MinNLBReregistrationInterval in registration.go for the current
+	// resolved value.
 	NLBReregistrationIntervalSeconds int `json:"nlbReregistrationIntervalSeconds"`
 
 	// AllUnconnectedThresholdTicks overrides DefaultAllUnconnectedThreshold.

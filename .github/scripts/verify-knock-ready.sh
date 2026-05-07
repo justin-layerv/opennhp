@@ -375,6 +375,14 @@ while [[ $(date +%s) -lt $DEADLINE ]]; do
     fi
     CONSECUTIVE_READY=0
   fi
+  # LOAD-BEARING: this 10s inter-iteration sleep, combined with
+  # CONSECUTIVE_REQUIRED=2, defines the gate's full convergence cost
+  # (≈10s sleep + handshake RTT) that's mirrored as
+  # blueGreenGateConvergenceCost in
+  # endpoints/ac/registration_resilience_test.go's
+  # worst_case_fire_plus_convergence_fits_workflow_minimum_gate
+  # subtest. A bump here without a matching bump there silently
+  # narrows the override-regime safety margin — see PR #1726.
   sleep 10
 done
 

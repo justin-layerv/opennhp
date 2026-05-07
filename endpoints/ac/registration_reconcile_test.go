@@ -2,9 +2,6 @@ package ac
 
 import (
 	"encoding/base64"
-	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -927,23 +924,13 @@ func TestACRegistration_RecordReconcileEntry(t *testing.T) {
 // #1714 tracks adding stable structured tags to the emission sites,
 // after which this fence becomes redundant.
 func TestACRegistration_SmokeLogSubstringsPresent(t *testing.T) {
-	// Resolve paths relative to this test file so the fence works from
-	// any go test invocation cwd (cr round-34 #1: don't depend on the
-	// implicit cwd-is-package-dir assumption that os.ReadFile bare-name
-	// would impose).
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller(0) failed; cannot resolve test file path")
-	}
-	pkgDir := filepath.Dir(thisFile)
-
 	// (filepath, required substrings) pairs. Each substring is part of
 	// a smoke regex in tests/smoke/09_ac_redispatch_loop_test.go and a
 	// rename in either file would silently zero out the smoke query.
 	// Both files MUST stay in lockstep with the smoke regexes until
 	// #1714's structured-tag replacement lands.
 	cases := []struct {
-		path     string // relative to pkgDir
+		path     string // relative to package dir
 		required []string
 	}{
 		{
@@ -963,12 +950,7 @@ func TestACRegistration_SmokeLogSubstringsPresent(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		full := filepath.Join(pkgDir, c.path)
-		src, err := os.ReadFile(full)
-		if err != nil {
-			t.Fatalf("read %s: %v", full, err)
-		}
-		source := string(src)
+		source := string(pkgFileBytes(t, c.path))
 		for _, s := range c.required {
 			if !strings.Contains(source, s) {
 				t.Errorf("smoke fence regression: %s no longer contains substring %q — the smoke test's CloudWatch Logs Insights query will silently zero out. Either restore the wording or land #1714's structured-tag replacement and update tests/smoke/09_ac_redispatch_loop_test.go's queries in lockstep.", c.path, s)

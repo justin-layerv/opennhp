@@ -167,6 +167,60 @@ If the post-switch gate fails, the standard response is a rollback
 `blue-green-deploy.yml action=rollback`. This is fast (<1 s listener
 flip) and returns to a known-good state.
 
+### Interaction with the AC's NLB re-registration cadence
+
+If an AC's first registration after restart lands on the old color
+(NLB UDP listener propagation race), the `nhp-acd` keepalive path
+goes direct-to-IP and stays latched on the wrong color until the
+periodic NLB re-registration safety net fires. That safety net's
+cadence (`DefaultNLBReregistrationInterval` in
+`endpoints/ac/registration.go`) must fit inside this gate so the
+latch heals before the gate gives up — see PR #1726 and
+`TestNLBReregistration_BoundedByDeployGate` for the compile-time
+fence.
+
+The workflow's lower bound on `post_switch_knock_ready_timeout_minutes`
+is **3 min**, raised from 2 in PR #1726 so the safety net's worst-case
+fire interval (90 s + 25 % jitter = 112.5 s) plus the gate's own
+2-consecutive-iterations convergence cost (~12-20 s) fits inside the
+budget. The compile-time fence
+`worst_case_fire_plus_convergence_fits_workflow_minimum_gate`
+asserts this relationship so a future PR that lowers either side
+past the safe envelope fails before shipping.
+
+### Manual escape hatch: AC re-bounce after a stuck deploy
+
+If the post-switch gate fails because ACs latched onto the
+old-color server fleet (race window described above), the
+remediation is to restart `nhp-acd` on the active AC ASG so each
+AC re-registers fresh through the NLB. Once the new color is
+serving the listener, the fresh registration lands on the new
+color and the gate clears on the next iteration.
+
+Sandbox:
+
+```
+AWS_PROFILE=layerv aws ssm send-command \
+  --document-name AWS-RunShellScript \
+  --targets Key=tag:Name,Values=layerv-nhp-sandbox-ac \
+  --parameters 'commands=["systemctl restart nhp-acd"]' \
+  --comment "PR #1726 chicken-and-egg AC bounce"
+```
+
+Prod:
+
+```
+AWS_PROFILE=layerv-prod aws ssm send-command \
+  --document-name AWS-RunShellScript \
+  --targets Key=tag:Name,Values=layerv-nhp-prod-ac \
+  --parameters 'commands=["systemctl restart nhp-acd"]' \
+  --comment "PR #1726 chicken-and-egg AC bounce"
+```
+
+Then re-run `verify-knock-ready` against the active server ASG
+(or just dispatch `blue-green-deploy.yml` again — the new binary
+self-heals via the periodic NLB safety net within ~2 min).
+
 ## Precedence
 
 When the standby health gate is the bottleneck, the order of magnitude

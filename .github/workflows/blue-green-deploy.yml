@@ -94,9 +94,17 @@ on:
         default: 5
         type: number
       post_switch_knock_ready_timeout_minutes:
-        description: 'Post-switch knock-ready timeout in minutes (2-30, default: 5)'
+        description: 'Post-switch knock-ready timeout in minutes (3-30, default: 5)'
         required: false
         # Regression-detection budget — traffic is live; keep tight.
+        # Mirrors blueGreenDeployGateWindow (5 min default) and
+        # blueGreenDeployGateMinimum (3 min) in
+        # endpoints/ac/registration_resilience_test.go; tracked in
+        # #1729 (scripts/check-deploy-gate-drift.sh, not yet landed)
+        # for a script-based fence on this duplication. The 3 min
+        # lower bound (raised from 2) fits the AC NLB safety net's
+        # worst-case fire interval (112.5s) plus the gate's own
+        # convergence cost (~12-20s) inside the budget — see PR #1726.
         default: 5
         type: number
       correlation_id:
@@ -425,7 +433,10 @@ jobs:
           check_bounds REFRESH_TIMEOUT_MINUTES 5 60
           check_bounds STANDBY_HEALTH_TIMEOUT_MINUTES 2 60
           check_bounds PRE_SWITCH_KNOCK_READY_TIMEOUT_MINUTES 2 30
-          check_bounds POST_SWITCH_KNOCK_READY_TIMEOUT_MINUTES 2 30
+          # post_switch lower bound is 3 (not 2): the AC NLB safety net's
+          # 112.5s worst-case fire interval plus the gate's own ~12-20s
+          # convergence cost fits inside 3 min but not 2. See PR #1726.
+          check_bounds POST_SWITCH_KNOCK_READY_TIMEOUT_MINUTES 3 30
 
           if [[ "$ACTION" == "deploy" ]]; then
             if [[ -z "$IMAGE_TAG" ]]; then
