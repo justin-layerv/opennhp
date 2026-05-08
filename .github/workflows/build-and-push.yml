@@ -18,6 +18,10 @@ on:
       # skipped. Adding the path here so packer-only changes still run.
       - 'packer/**'
       - '.github/workflows/build-and-push.yml'
+      # See the matching entry in the changes:app filter — .trivyignore
+      # gates the image-scan job, so pushes that edit it must trigger
+      # this workflow on main too.
+      - '.trivyignore'
   pull_request:
     branches:
       - main
@@ -120,6 +124,10 @@ jobs:
               - 'nhp/**'
               - 'endpoints/**'
               - 'docker/**'
+              # .trivyignore is consumed by the image-scan job; without it
+              # in the path filter, a PR that only edits the ignore file
+              # skips the trivy gate entirely and silently "passes."
+              - '.trivyignore'
             infra:
               - 'terraform/**'
             tests:
