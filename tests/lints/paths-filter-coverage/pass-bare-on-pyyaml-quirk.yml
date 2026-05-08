@@ -1,0 +1,23 @@
+# Pass: bare `on:` block (no quotes) — PyYAML follows YAML 1.1, so
+# `on/off/yes/no` are parsed as booleans (the "fuzzy bool" rule).
+# A bare `on:` therefore becomes the True key. PyYAML doesn't ship
+# a YAML-1.2 mode (that's ruamel.yaml), so the True-keyed branch
+# is the live one in CI today. The string-"on" branch is reachable
+# only via a quoted `'on':` in the source workflow; defensive code
+# in _extract_trigger_paths handles both via dict.get fallback.
+# This fixture pins the True-keyed path; if the repo ever migrates
+# off PyYAML, the fallback continues to cover the "on"-keyed case.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            app:
+              - 'nhp/**'

@@ -1,0 +1,16 @@
+# Pass: `dir/**` in push.paths covers nested `dir/sub/**` in inner filter.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            lambdas:
+              - 'terraform/lambda/**'
+              - 'terraform/modules/foo/lambda/**'

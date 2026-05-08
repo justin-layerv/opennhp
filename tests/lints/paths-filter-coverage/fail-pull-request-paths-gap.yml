@@ -1,0 +1,26 @@
+# Fail: the same coverage gap on `on.pull_request.paths` skips PR-time
+# validation jobs silently — same failure class as the push.paths gap, just
+# gated on pull_request events instead of merge events. The lint must
+# check both triggers; this fixture pins the pull_request side.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+      - '.trivyignore'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+      # .trivyignore intentionally omitted on the PR side — push covers
+      # it, PR doesn't, and the lint must surface that asymmetry.
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            app:
+              - 'nhp/**'
+              - '.trivyignore'

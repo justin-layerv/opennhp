@@ -1,0 +1,21 @@
+# Bad input: `**/foo/**` ends with `/**` and contains `**` (so it
+# slipped past the trailing-glob and bare-`**` checks), but the
+# leading `**/` makes it a "match anywhere" pattern in minimatch
+# semantics. covers() would compute root='**/foo' and ask
+# inner.startswith('**/foo/'), which is nonsense path-wise. Pin the
+# rejection so a refactor that loosens `_is_supported_pattern` doesn't
+# silently flip this to passing.
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/foo/**'
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            app:
+              - 'nhp/**'

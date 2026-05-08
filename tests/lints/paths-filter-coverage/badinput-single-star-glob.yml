@@ -1,0 +1,21 @@
+# Bad input: single-`*` globs (`*.go`, `dir/*`) aren't supported.
+# covers() handles literal paths, `dir/**`, and bare `**`. A
+# single-`*` pattern would silently fall into the "no-match"
+# branch and get reported as uncovered against any `dir/**`
+# push pattern even when the underlying minimatch semantics
+# would cover. Reject up front (exit 2) so the operator
+# extends covers() rather than chasing a phantom gap.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            app:
+              - 'nhp/*.go'

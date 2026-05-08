@@ -1,0 +1,11 @@
+# Skip: workflow has no `dorny/paths-filter` step — lint isn't applicable.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "no paths-filter here"

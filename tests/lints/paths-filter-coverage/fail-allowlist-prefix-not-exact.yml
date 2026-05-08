@@ -1,0 +1,21 @@
+# Fail: `lint-allow: paths-filter-coverage-strict` is a hypothetical
+# future stricter variant — it must NOT silently inherit the relaxed
+# variant's exemption. Pins `_is_allow_token`'s exact-or-token+space
+# rule. A regression that loosened it to a substring/prefix match
+# would silently flip this to passing.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            # lint-allow: paths-filter-coverage-strict
+            app:
+              - 'nhp/**'
+              - '.trivyignore'

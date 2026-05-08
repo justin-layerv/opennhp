@@ -1,0 +1,27 @@
+# Pass: a workflow with two `dorny/paths-filter` steps gets BOTH checked.
+# An earlier shape returned on the first step found, silently skipping the
+# second. _extract_filter_blocks now iterates every step; this fixture
+# pins that contract.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+      - 'docker/**'
+jobs:
+  detect-app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            app:
+              - 'nhp/**'
+  detect-docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            docker:
+              - 'docker/**'

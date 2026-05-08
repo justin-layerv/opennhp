@@ -1,0 +1,24 @@
+# Pass: the allowlist annotation is allowed to be separated from its
+# group key by blank lines or unrelated comments. `_parse_allowlist`
+# keeps `pending = True` across blanks/comments and only resets on a
+# non-empty, non-comment, non-key line. Pin the contract so a
+# tightening refactor doesn't silently flip behavior in real workflows
+# that have spacing/prose between the annotation and the key.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            # lint-allow: paths-filter-coverage
+
+            # diagnostics-only meta-filter; not load-bearing on any job.
+            app:
+              - 'nhp/**'
+              - '.trivyignore'

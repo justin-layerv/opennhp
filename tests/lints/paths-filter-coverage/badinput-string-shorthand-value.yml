@@ -1,0 +1,20 @@
+# Bad input: filter group value is a string instead of a list.
+# dorny's spec is list-of-strings (`app: ['nhp/**']`); a writer who
+# puts a single bare string (`app: 'nhp/**'`) would previously hit
+# `list('nhp/**')` and silently produce per-character glob patterns,
+# trip downstream checks with an unrelated/confusing message.
+# The explicit `isinstance(v, list)` check now flags this with a
+# clear ValueError naming the group key and the wrong type.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            app: 'nhp/**'

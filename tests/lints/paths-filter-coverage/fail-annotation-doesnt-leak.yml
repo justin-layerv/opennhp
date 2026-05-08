@@ -1,0 +1,23 @@
+# Fail: `# lint-allow:` annotates ONLY the next group key — adjacent groups
+# are still checked. Pins _parse_allowlist's pending-then-reset behaviour:
+# annotation above `code:` exempts code, but `app:` (which has an uncovered
+# pattern) must still flag.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            # lint-allow: paths-filter-coverage
+            code:
+              - 'nhp/**'
+              - '.github/workflows/**'
+            app:
+              - 'nhp/**'
+              - '.trivyignore'

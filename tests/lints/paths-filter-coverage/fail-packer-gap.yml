@@ -1,0 +1,16 @@
+# Fail: pre-#252/#980 packer-gap state — inner filter has packer/**, push.paths doesn't.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+      - 'terraform/**'
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            packer:
+              - 'packer/**'

@@ -1,0 +1,20 @@
+# Bad input: `paths-ignore` is the opposite-polarity failure class
+# (a pattern under paths-ignore that's also referenced by an inner
+# filter would silently skip on edits to that path). The lint
+# doesn't yet model paths-ignore — fail loud (#1786) rather than
+# silently skip the workflow, since fail-silent is the exact
+# failure mode this lint exists to prevent.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            app:
+              - 'nhp/**'

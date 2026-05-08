@@ -1,0 +1,20 @@
+# Fail: `dir/**` in push.paths does NOT cover a literal `dir` in the
+# inner filter — minimatch treats them as different, and a consumer
+# that wrote `dir` expecting `dir/**` to cover it would get silently
+# skipped pushes. Pins covers()'s `inner_pat.startswith(root + "/")`
+# rule (no `inner_pat == root` self-equal clause) — a refactor that
+# loosened it would silently flip this to passing.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            app:
+              - 'nhp'

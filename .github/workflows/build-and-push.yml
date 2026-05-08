@@ -112,6 +112,20 @@ jobs:
         id: filter
         with:
           filters: |
+            # lint-allow: paths-filter-coverage
+            # `code` lists '.github/workflows/**' (broader than
+            # push.paths, which has only the single
+            # 'build-and-push.yml' entry) so that, *once the
+            # workflow has fired*, any workflow change is detected
+            # by the Test job's `if: needs.changes.outputs.code`
+            # gate. The coverage gap is structurally harmless:
+            # changes to other workflow files don't trigger this
+            # workflow at all (push.paths gate), so a stale
+            # `code=false` output never reaches a job. Remove this
+            # allowlist annotation if push.paths ever loses its
+            # 'build-and-push.yml' entry — at that point the gap
+            # stops being inert and starts skipping tests on
+            # workflow-only edits.
             code:
               - 'nhp/**'
               - 'endpoints/**'
@@ -178,6 +192,27 @@ jobs:
       environment: ${{ steps.meta.outputs.environment }}
       start_time: ${{ steps.meta.outputs.start_time }}
     steps:
+      # Fail fast on workflow_dispatch from a non-main ref. This is
+      # UX only: the load-bearing fence is the OIDC trust policy in
+      # terraform/modules/ecr/{main,packer}.tf, which rejects
+      # feature-branch sub claims (#1121). Without this guard the
+      # AWS-using jobs spin for ~2 min on opaque STS retries.
+      # Body in scripts/print-dispatch-ref-error.sh — separate file
+      # for fixture-testability (see tests/lints/dispatch-ref-error/).
+      # The Checkout step is required because the script lives in
+      # the repo; both steps share the same `if:` so they fire as
+      # one unit on the rare invalid-dispatch path. Job-level `if:`
+      # would skip the rest of `setup` (Set metadata, etc.) which
+      # we don't want.
+      - name: Checkout (guard only)
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Validate dispatch ref
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        env:
+          GITHUB_REF: ${{ github.ref }}
+        run: bash scripts/print-dispatch-ref-error.sh
+
       - name: Set metadata
         id: meta
         run: |

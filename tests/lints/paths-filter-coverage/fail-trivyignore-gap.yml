@@ -1,0 +1,18 @@
+# Fail: pre-#1776 trivyignore-gap state — inner filter has .trivyignore, push.paths doesn't.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+      - 'docker/**'
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            app:
+              - 'nhp/**'
+              - 'docker/**'
+              - '.trivyignore'

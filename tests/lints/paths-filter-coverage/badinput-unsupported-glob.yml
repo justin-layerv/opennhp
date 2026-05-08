@@ -1,0 +1,15 @@
+# Bad input: negation/braces/character classes aren't supported — lint refuses to guess.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            app:
+              - '!nhp/vendor/**'

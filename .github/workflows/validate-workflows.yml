@@ -15,8 +15,12 @@ on:
       - "CLAUDE.md"
       - "scripts/check-scope-drift.sh"
       - "scripts/check-disable-agent-validation.sh"
+      - "scripts/check-paths-filter-coverage.py"
+      - "scripts/print-dispatch-ref-error.sh"
       - "tests/scripts/**"
       - "tests/lints/disable-agent-validation/**"
+      - "tests/lints/paths-filter-coverage/**"
+      - "tests/lints/dispatch-ref-error/**"
       - "terraform/modules/compute/user_data.sh.tpl"
       - "terraform/environments/prod/**"
       - "terraform/environments/sandbox/**"
@@ -30,8 +34,12 @@ on:
       - "CLAUDE.md"
       - "scripts/check-scope-drift.sh"
       - "scripts/check-disable-agent-validation.sh"
+      - "scripts/check-paths-filter-coverage.py"
+      - "scripts/print-dispatch-ref-error.sh"
       - "tests/scripts/**"
       - "tests/lints/disable-agent-validation/**"
+      - "tests/lints/paths-filter-coverage/**"
+      - "tests/lints/dispatch-ref-error/**"
       - "terraform/modules/compute/user_data.sh.tpl"
       - "terraform/environments/prod/**"
       - "terraform/environments/sandbox/**"
@@ -140,3 +148,30 @@ jobs:
 
       - name: Check DisableAgentValidation flag (#1157 F9)
         run: bash scripts/check-disable-agent-validation.sh
+
+      # Structural fence for the two-layer path filter pattern
+      # (push.paths + dorny/paths-filter inside a job). Every
+      # inner-filter pattern that gates a real job must be covered
+      # by an on.push.paths pattern, otherwise a path-only merge
+      # to main silently skips the workflow. Drove the gaps in
+      # #1775/#1776 (.trivyignore) and #252/#980 (packer/**).
+      #
+      # Fixtures run first so a regression in covers() (e.g., an
+      # accidental tightening that lets the real production gap
+      # through) surfaces against synthetic inputs with known
+      # answers, not against the real workflows whose state can
+      # drift.
+      - name: Test check-paths-filter-coverage.py fixtures
+        run: bash tests/lints/paths-filter-coverage/run-fixtures.sh
+
+      - name: Check path-filter coverage across all workflows
+        run: python3 scripts/check-paths-filter-coverage.py
+
+      # Contract tests for scripts/print-dispatch-ref-error.sh
+      # (the message body of build-and-push.yml's dispatch-ref
+      # guard). Pin the load-bearing strings — gh command,
+      # refs/heads/main requirement, #1121 cross-reference — so
+      # a regression that drops them silently degrades the
+      # operator's first explanation of why the dispatch failed.
+      - name: Test dispatch-ref-error fixtures
+        run: bash tests/lints/dispatch-ref-error/run-fixtures.sh

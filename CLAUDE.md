@@ -261,6 +261,26 @@ gh pr create --title "feat(scope): description" --body "..."
 ./scripts/trigger-prod-deploy.sh --json
 ```
 
+### Sandbox dispatch contract
+
+`build-and-push.yml`'s `workflow_dispatch` is **only valid from
+`refs/heads/main`**. The OIDC trust policy on the AWS roles
+(`terraform/modules/ecr/{main,packer}.tf`) accepts only main-branch
+or environment-scoped sub claims; a dispatch from any feature
+branch produces `repo:layervai/nhp:ref:refs/heads/<branch>` and is
+rejected with `sts:AssumeRoleWithWebIdentity` denial. This is
+intentional security per #1121 (PR-time terraform plan can exfil
+short-lived STS credentials). The setup job's `Validate dispatch
+ref` step fails fast with this guidance; don't loosen the trust
+policy to "fix" a feature-branch dispatch.
+
+```bash
+# Force a sandbox build/deploy after a path-only merge (e.g.,
+# .trivyignore-only PRs that didn't trigger the workflow on push):
+gh workflow run build-and-push.yml --ref main \
+  -f environment=sandbox -f force_build=true -f deploy=true
+```
+
 ## Key Ports
 
 | Port | Protocol | Component | Purpose |

@@ -1,0 +1,18 @@
+# Pass: trailing same-line `# lint-allow:` annotation also exempts the group.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            code:  # lint-allow: paths-filter-coverage
+              - 'nhp/**'
+              - '.github/workflows/**'
+            app:
+              - 'nhp/**'

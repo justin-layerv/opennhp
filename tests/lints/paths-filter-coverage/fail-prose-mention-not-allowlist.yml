@@ -1,0 +1,21 @@
+# Fail: prose mention of `lint-allow: paths-filter-coverage` doesn't
+# count as an annotation. Pin the contract — the token must be the
+# first non-whitespace content after `#`, not appear mid-sentence.
+# Without this fixture, a regression that loosened the substring match
+# would silently let prose-mentions exempt groups they shouldn't.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            # the lint-allow: paths-filter-coverage convention is documented in CLAUDE.md
+            app:
+              - 'nhp/**'
+              - '.trivyignore'

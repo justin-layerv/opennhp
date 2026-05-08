@@ -1,0 +1,19 @@
+# Bad input: dorny supports loading filter spec from a separate file
+# via `filters_from_source_file:` instead of inline `filters:`. We
+# don't support that form — the lint can't reason about an external
+# YAML it can't see, and silent skipping is worse than fail-loud
+# (exit 2). Pins the docstring claim that this form raises EXIT_BAD_INPUT.
+# A future workflow that legitimately needs this form should add
+# parser support, not a silent bypass.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters_from_source_file: .github/path-filters.yml

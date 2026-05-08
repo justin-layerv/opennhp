@@ -1,0 +1,28 @@
+# Fail: in a multi-step workflow, the SECOND `dorny/paths-filter` step's gap
+# must still be flagged. Pairs with pass-multiple-paths-filter-steps.yml: a
+# regression that only checked the first step would silently pass this
+# fixture (the first job's filter is covered).
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+      # docker/** intentionally omitted — the second job's filter has an
+      # uncovered pattern that the lint must surface.
+jobs:
+  detect-app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            app:
+              - 'nhp/**'
+  detect-docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            docker:
+              - 'docker/**'

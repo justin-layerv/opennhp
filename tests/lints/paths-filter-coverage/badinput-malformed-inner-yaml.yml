@@ -1,0 +1,22 @@
+# Bad input: malformed YAML *inside* the inner `filters:` block-scalar.
+# The outer workflow YAML parses fine; the inner block-scalar (a string,
+# re-parsed as YAML) does not. Pins the contract that a stray tab,
+# mismatched quote, or missing colon inside the filter spec surfaces
+# as a clean EXIT_BAD_INPUT — not an unhandled Python traceback.
+# Without the explicit `yaml.YAMLError → ValueError` wrap in
+# `_extract_filter_blocks`, this would crash.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nhp/**'
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        with:
+          filters: |
+            app:
+              - 'nhp/**
+              - 'unterminated string above
