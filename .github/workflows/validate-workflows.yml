@@ -133,6 +133,14 @@ jobs:
       - name: Test promote-to-prod gating (issue #1322)
         run: python3 tests/scripts/test_promote_to_prod_gating.py
 
+      # Structural fence for the dependabot-go-tidy bot-identity preflight
+      # (PR #1777). PR #1384 used `gh api /user`, which 403s on App
+      # installation tokens; PR #1777 swapped to the action's `app-slug`
+      # output. The bug stayed latent because no non-no-op tidy ever
+      # exercised the path. actionlint can't catch a re-introduction.
+      - name: Test dependabot-go-tidy preflight (PR #1777)
+        run: bash tests/scripts/dependabot-go-tidy_test.sh
+
       # Structural fence against DisableAgentValidation=true creeping
       # into a deployable config (#1157 F9). The flag turns off agent
       # static-pubkey validation entirely; setting it true in any

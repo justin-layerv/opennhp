@@ -32,9 +32,14 @@ name: Dependabot Go Mod Tidy
 # vs pull_request_target distinction) without re-deriving the loop-prevention.
 #
 # App-installation prereqs (ops-routines-reader on layervai/nhp):
-# `contents: write` (Git Data API push) and `metadata: read` (preflight
-# `gh api /user`). If either is missing the trap-emitted error points at
-# App installation / permissions — start there before suspecting auth flow.
+# `contents: write` (Git Data API push) and `metadata: read` (mandatory
+# baseline). If either is missing the trap-emitted error points at App
+# installation / permissions — start there before suspecting auth flow.
+#
+# Bot-identity invariant uses the action's `app-slug` output (computed
+# from the resolved App ID), NOT `gh api /user`. The /user endpoint is
+# unsupported on App installation tokens (returns 403 "Resource not
+# accessible by integration") — see PR #1777.
 
 on:
   pull_request_target:
@@ -113,6 +118,14 @@ jobs:
 
       # Mint AFTER tidy so no-op runs (most dependabot Go bumps) don't
       # consume an installation token. Auto-revoked at job end.
+      #
+      # Load-bearing output for the bot-identity preflight: the
+      # `app-slug` output is consumed by the `APP_SLUG` env binding
+      # in the next step's `env:` block, which feeds AUTH_USER. If a
+      # future SHA bump drops `app-slug` (the action has emitted it
+      # since v1.x, so this is unlikely — the planned `app-id` →
+      # `client-id` deprecation doesn't affect outputs), the runtime
+      # push will fail loud against `EXPECTED_BOT_USER`.
       - name: Mint GitHub App token (scoped to this repo)
         id: app_token
         if: steps.changes.outputs.changed == 'true'
@@ -127,6 +140,8 @@ jobs:
         if: steps.changes.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          # See header comment for why this replaces `gh api /user`.
+          APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
           BRANCH: ${{ github.head_ref }}
           REPO: ${{ github.repository }}
           FILES: ${{ steps.changes.outputs.files }}
@@ -137,7 +152,8 @@ jobs:
           trap 'echo "::error::Failed to create signed commit via GitHub API. Check App installation status, API rate limits, or permissions. Concurrent branch advance after preflight is also possible (non-fast-forward PATCH)."' ERR
           set -euo pipefail
 
-          AUTH_USER=$(gh api /user --jq '.login')
+          # GitHub App login convention: <slug>[bot].
+          AUTH_USER="${APP_SLUG}[bot]"
           echo "Authenticated as: $AUTH_USER"
           if [ "$AUTH_USER" != "$EXPECTED_BOT_USER" ]; then
             echo "::error::Token resolved to '$AUTH_USER', expected '$EXPECTED_BOT_USER'. Bot identity invariant broken — refusing to push so the audit trail stays consistent."
