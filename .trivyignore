@@ -30,34 +30,6 @@ CVE-2025-45582
 # libexpat1 - waiting for Ubuntu patches
 CVE-2025-66382
 
-# sigstore/timestamp-authority - no fix available yet (v1.2.9 is latest)
-CVE-2025-66564
-
-# google.golang.org/grpc - CRITICAL, in vendored Traefik binary (not our code)
-# gRPC-Go authorization bypass via missing leading slash in :path.
-# Verify removal eligibility on Traefik v3.6.16 (ships grpc v1.80.0) — see
-# PR #1673 follow-ups. Patched at grpc >= v1.79.3 per upstream advisory.
-# https://avd.aquasec.com/nvd/cve-2026-33186
-CVE-2026-33186
-# Trivy surfaces the same issue under Traefik's downstream advisory ID.
-# Keep this entry alongside the CVE so both aliases are suppressed until
-# Traefik ships a patched release.
-# https://github.com/advisories/GHSA-46wh-3698-f2cx
-GHSA-46wh-3698-f2cx
-
-# github.com/docker/docker - HIGH, AuthZ plugin bypass with oversized request bodies.
-# AC image bundles Docker client libraries but does not expose AuthZ plugins.
-# Traefik v3.6.16 migrated to github.com/moby/moby/{api,client}; verify removal
-# eligibility on the new module path — see PR #1673 follow-ups.
-# https://avd.aquasec.com/nvd/cve-2026-34040
-CVE-2026-34040
-
-# github.com/traefik/traefik/v3 - HIGH, in vendored Traefik binary.
-# Verify removal eligibility on v3.6.16 — see PR #1673 follow-ups.
-# Upstream advisory says fixed in v3.6.11, so this entry may already be a no-op.
-# https://avd.aquasec.com/nvd/cve-2026-32305
-CVE-2026-32305
-
 # Go stdlib CVEs in vendored Traefik v3.6.16 binary (Dockerfile.ac.aws).
 # Our binaries are built with Go 1.26.2, but the pre-built Traefik binary
 # is still compiled with Go 1.25.0. Wait for a Traefik release built with
