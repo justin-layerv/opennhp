@@ -117,6 +117,25 @@ module "nhp" {
   qurl_router_api_timeout        = var.qurl_router_api_timeout
   qurl_router_proxy_timeout      = var.qurl_router_proxy_timeout
   qurl_router_cache_shards       = var.qurl_router_cache_shards
+  enable_instance_hrw            = var.enable_instance_hrw
+  instance_discovery_ttl_seconds = var.instance_discovery_ttl_seconds
+
+  # qurl-reverse-tunnel-server. PR 3 wires only the NEW
+  # variables introduced by this PR (per-AZ sizing, blue/green, canary,
+  # MULTIVALUE flip). Existing tfvars values for `deploy_frps`,
+  # `frps_image_tag`, `frps_az_suffixes`, and the legacy
+  # `frps_min_size`/`max_size`/`desired_capacity` triple were already
+  # latent no-ops in env tfvars (the existing env main.tf never
+  # forwarded them) and are left unwired here so PR 3 doesn't
+  # change deploy state. PR 4 can re-thread the legacy passthrough
+  # alongside the value flip.
+  qurl_reverse_tunnel_server_min_size_per_az               = var.qurl_reverse_tunnel_server_min_size_per_az
+  qurl_reverse_tunnel_server_max_size_per_az               = var.qurl_reverse_tunnel_server_max_size_per_az
+  qurl_reverse_tunnel_server_desired_capacity_per_az       = var.qurl_reverse_tunnel_server_desired_capacity_per_az
+  qurl_reverse_tunnel_server_cloud_map_routing_policy      = var.qurl_reverse_tunnel_server_cloud_map_routing_policy
+  enable_qurl_reverse_tunnel_server_blue_green             = var.enable_qurl_reverse_tunnel_server_blue_green
+  qurl_reverse_tunnel_server_green_standby_capacity_per_az = var.qurl_reverse_tunnel_server_green_standby_capacity_per_az
+  enable_qurl_reverse_tunnel_server_canary                 = var.enable_qurl_reverse_tunnel_server_canary
 
   # QURL Idempotency Cache
   qurl_idempotency_cache_ttl_seconds        = var.qurl_idempotency_cache_ttl_seconds

@@ -369,6 +369,16 @@ cross_account_cost_analytics_role_arn = "arn:aws:iam::165115313779:role/nhp-cost
 # unchanged (still false / default) and will flip in a coordinated
 # follow-up after the qurl-service and frpc PRs land. Setting these size
 # vars now is harmless — they only take effect when deploy_frps is true.
+#
+# `frps_az_suffixes` is intentionally NOT pinned here yet: the env
+# `module "nhp"` block in `main.tf` doesn't forward `frps_az_suffixes`
+# (or any of the legacy `frps_*` triple), so an env-level pin would be
+# silently a no-op until PR 4 re-threads the legacy passthrough. The
+# module default in `terraform/variables.tf` (`["a", "b", "c"]`) is the
+# single load-bearing source of truth for now; PR 4 will add the env
+# pin alongside the value flip so the OwnerID-hash ↔
+# frps-${suffix}.${namespace} mapping stays stable when the legacy
+# passthrough is re-wired.
 frps_min_size         = 3
 frps_max_size         = 3
 frps_desired_capacity = 3

@@ -102,22 +102,90 @@ locals {
   account_id = data.aws_caller_identity.current.account_id
   region     = data.aws_region.current.id
 
+  # ==================== Effective ASG Sizing ====================
+  # Resolve the legacy explicit triple (`min_size`/`max_size`/
+  # `desired_capacity`) against the new per-AZ form (`min_size_per_az`/
+  # `max_size_per_az`/`desired_capacity_per_az`). When the per-AZ var is
+  # non-null, it wins and the effective fleet size is computed as
+  # `per_az * length(frps_az_suffixes)`. When null, the legacy explicit
+  # value is used unchanged.
+  #
+  # Backward compat note: callers that have `min_size = 3`, `max_size = 3`,
+  # `desired_capacity = 3` set in tfvars (current sandbox/prod behavior)
+  # produce effective `min/max/desired = 3` because the per-AZ vars default
+  # to null. Switching to the per-AZ form is opt-in by setting
+  # `desired_capacity_per_az = 1` (and friends) — same effective sizing,
+  # but the source of truth is now "1 instance per AZ" instead of an
+  # arithmetic product hand-baked into tfvars.
+  az_count           = length(var.frps_az_suffixes)
+  effective_min_size = var.min_size_per_az != null ? var.min_size_per_az * local.az_count : var.min_size
+  effective_max_size = var.max_size_per_az != null ? var.max_size_per_az * local.az_count : var.max_size
+  effective_desired_capacity = (
+    var.desired_capacity_per_az != null
+    ? var.desired_capacity_per_az * local.az_count
+    : var.desired_capacity
+  )
+
+  # Shared ASG enabled_metrics list. Both blue and green ASGs publish the
+  # same metric set (canary orchestrator's NLB-disabled health path reads
+  # GroupInServiceInstances + GroupTotalInstances). Keep this in one
+  # place so a future addition lands on both sides at once.
+  #
+  # `GroupUnHealthyInstanceCount` is REQUIRED for the canary's
+  # `canary_asg_unhealthy` alarm (modules/canary-deployment/alarms.tf)
+  # AND the green-side `frps_green_asg_unhealthy` alarm
+  # (blue_green.tf). AWS optional ASG group metrics only publish when
+  # explicitly listed in `enabled_metrics`; without this entry the
+  # metric never lands in CloudWatch and `treat_missing_data =
+  # "notBreaching"` keeps the alarm silently green — exactly the
+  # failure mode the canary auto-rollback is meant to close on the
+  # NLB-disabled path. cr round 20 confirmed.
+  asg_enabled_metrics = [
+    "GroupInServiceInstances",
+    "GroupDesiredCapacity",
+    "GroupMinSize",
+    "GroupMaxSize",
+    "GroupPendingInstances",
+    "GroupTerminatingInstances",
+    "GroupTotalInstances",
+    "GroupUnHealthyInstanceCount",
+  ]
+
   user_data = templatefile("${path.module}/user_data.sh.tpl", {
     region      = local.region
     account_id  = local.account_id
     environment = var.environment
-    # Per-AZ Cloud Map service IDs, keyed by AZ suffix (`a` → service ID).
-    # User_data renders these into a Bash associative array and looks up
-    # the right service ID by the instance's IMDS-reported AZ at boot.
+    # Per-color, per-AZ Cloud Map service IDs. user_data picks the right
+    # color at boot by reading the `DeployColor` IMDS instance tag
+    # (`instance_metadata_tags = "enabled"` on the launch template makes
+    # ASG-propagated tags reachable via IMDS). Default is "blue" when the
+    # tag is absent — preserves the existing single-color contract for
+    # callers that haven't enabled blue/green.
+    #
     # A bare for-expression (not a sorted list) is fine: templatefile
     # iterates the map deterministically (Terraform sorts string keys),
     # so the rendered Bash array is stable across plans for the same
     # input set. The deterministic-rendering note matters because the
     # whole user_data string flows through `base64gzip` — a non-stable
     # ordering would force the launch template to bump its
-    # latest_version every plan.
-    cloudmap_service_ids = {
+    # `latest_version` every plan.
+    #
+    # When `enable_blue_green = false`, the green map is empty;
+    # `DEPLOY_COLOR` defaults to "blue" so the green map is never
+    # consulted. The launch template diff between blue/green-enabled
+    # vs disabled is ONLY the green map's emptiness, so disabling
+    # blue/green on a previously-enabled deploy doesn't churn user_data
+    # against blue-tagged instances.
+    cloudmap_service_ids_blue = {
       for s, svc in aws_service_discovery_service.frps_per_az : s => svc.id
+    }
+    # When `var.enable_blue_green = false`, the green for_each
+    # collapses to `toset([])` and this for-expression naturally
+    # yields `{}` — user_data renders an empty bash associative
+    # array for the green map and never reads it (DEPLOY_COLOR
+    # defaults to "blue" without the IMDS instance tag).
+    cloudmap_service_ids_green = {
+      for s, svc in aws_service_discovery_service.frps_per_az_green : s => svc.id
     }
     frps_az_suffixes          = var.frps_az_suffixes
     namespace_name            = var.namespace_name
@@ -410,11 +478,41 @@ resource "aws_vpc_security_group_egress_rule" "frps_all" {
 # so frpc and qurl-router converge on the same instance. See module header
 # and #1499 for the full cross-repo contract.
 #
-# Routing policy: WEIGHTED with 1 instance per service at steady state. The
-# old single-service config used MULTIVALUE because the service held N
-# instances; with one-per-AZ each service holds 1, and WEIGHTED returns
-# that single record without the round-robin bias MULTIVALUE imposes. Both
-# work in practice for N=1 but WEIGHTED matches intent.
+# Routing policy: configurable via `var.cloud_map_routing_policy`.
+#
+# - WEIGHTED   (default, backwards compatible): each query returns ONE
+#   A record. Correct for 1-instance-per-AZ; both frpc and qurl-router
+#   converge on the per-resource `frps_addr` from the QURL API.
+# - MULTIVALUE: each query returns the FULL set of healthy A records
+#   (up to 8). Required when running >1 instance per AZ so that
+#   router-side HRW (traefik-plugins #134) can resolve the boundary
+#   hostname and hash a resource_id to a specific instance IP, and so
+#   that frpc can do the same on the dial side.
+#
+# A precondition below rejects "WEIGHTED + effective desired > N AZ
+# suffixes" so a 2/AZ rollout can't ship before the routing flip.
+#
+# IMPORTANT: AWS Cloud Map's `UpdateService` API does NOT support
+# changing `routing_policy` in place — only Description, DnsRecords,
+# and HealthCheckConfig.FailureThreshold are mutable. The provider
+# therefore marks `dns_config.routing_policy` as ForceNew. Flipping
+# `var.cloud_map_routing_policy` from WEIGHTED to MULTIVALUE in PR 4
+# will appear in the plan as REPLACEMENT of every per-AZ
+# `aws_service_discovery_service.frps_per_az[*]` resource (and, if
+# blue/green is enabled, of every `frps_per_az_green[*]` too):
+#   - Each replacement issues new service IDs, churning the
+#     `cloudmap_service_ids_blue` / `..._green` template inputs and
+#     bumping the launch template's `latest_version` (instance refresh
+#     fires).
+#   - Existing instance registrations on the old services are dropped
+#     when the old services delete; new instances must register with
+#     the new services as user_data picks up the new IDs.
+#   - The qurl-service `frps_addr` emitter must pick up the new ARNs
+#     out-of-band before traffic shifts.
+# PR 4's runbook needs to sequence these; the blue/green path
+# (sandbox) and the canary path (prod) BOTH have to plan for this
+# replacement window. Documented here so the requirement isn't
+# discovered at PR-4 plan time.
 resource "aws_service_discovery_service" "frps_per_az" {
   for_each = toset(var.frps_az_suffixes)
 
@@ -429,7 +527,22 @@ resource "aws_service_discovery_service" "frps_per_az" {
       type = "A"
     }
 
-    routing_policy = "WEIGHTED"
+    routing_policy = var.cloud_map_routing_policy
+  }
+
+  lifecycle {
+    precondition {
+      # Catch the dangerous misconfig where WEIGHTED routing is paired with
+      # >1 instance per AZ. WEIGHTED returns a single A record per query;
+      # the router would see only one of N instances at a time, defeating
+      # router-side HRW (traefik-plugins #134) which needs to enumerate
+      # the full set of healthy IPs to make a deterministic dispatch
+      # decision. Plan-time fence — if you bump `desired_capacity_per_az`
+      # to 2 without flipping `cloud_map_routing_policy`, you hit this
+      # error on the PR review, not on a half-applied deploy.
+      condition     = var.cloud_map_routing_policy == "MULTIVALUE" || local.effective_desired_capacity <= local.az_count
+      error_message = "cloud_map_routing_policy = \"WEIGHTED\" only supports up to one instance per AZ (effective desired_capacity ≤ length(frps_az_suffixes)). Got effective desired_capacity = ${local.effective_desired_capacity}, length(frps_az_suffixes) = ${local.az_count}. Flip cloud_map_routing_policy to \"MULTIVALUE\" before raising desired_capacity_per_az above 1 — see traefik-plugins #134 for the router-side HRW that consumes the full A-record set."
+    }
   }
 
   # Custom health check config: registering this block enables Cloud Map to
@@ -442,14 +555,13 @@ resource "aws_service_discovery_service" "frps_per_az" {
   # for the ASG replace cycle. On first boot, user_data verifies FRP is ready
   # before calling cloudmap-register.sh, so only healthy instances ever register.
   #
-  # failure_threshold = 2: the AWS provider marks this argument deprecated
-  # ("AWS ignores the value and always uses 1") so `terraform validate` emits a
-  # deprecation warning. AWS still accepts the field on the wire; keeping it
-  # explicit documents intent and matches the reviewer request. Once the
-  # provider removes it entirely, simply delete the line.
-  health_check_custom_config {
-    failure_threshold = 2
-  }
+  # `health_check_custom_config` block deliberately omitted. The
+  # provider used to accept `failure_threshold = N` here, but AWS now
+  # ignores the value and always uses 1; the provider marks the
+  # argument deprecated, surfacing as a `terraform validate` warning
+  # and a future hard removal. Cloud Map registrations land healthy on
+  # the first user_data registration call (the AWS-side default of 1
+  # is correct here), so dropping the block has no behavior change.
 
   tags = var.tags
 }
@@ -545,9 +657,11 @@ resource "aws_launch_template" "frps" {
 resource "aws_autoscaling_group" "frps" {
   name                = "${var.name_prefix}-frps"
   vpc_zone_identifier = var.private_subnet_ids
-  min_size            = var.min_size
-  max_size            = var.max_size
-  desired_capacity    = var.desired_capacity
+  # Effective sizing resolved from per-AZ vars when set, falling back to
+  # the legacy explicit triple. See `local.effective_*` in main.tf locals.
+  min_size         = local.effective_min_size
+  max_size         = local.effective_max_size
+  desired_capacity = local.effective_desired_capacity
 
   launch_template {
     id      = aws_launch_template.frps.id
@@ -557,15 +671,7 @@ resource "aws_autoscaling_group" "frps" {
   health_check_type         = "EC2"
   health_check_grace_period = 180
 
-  enabled_metrics = [
-    "GroupInServiceInstances",
-    "GroupDesiredCapacity",
-    "GroupMinSize",
-    "GroupMaxSize",
-    "GroupPendingInstances",
-    "GroupTerminatingInstances",
-    "GroupTotalInstances",
-  ]
+  enabled_metrics = local.asg_enabled_metrics
 
   tag {
     key                 = "Name"
@@ -579,6 +685,20 @@ resource "aws_autoscaling_group" "frps" {
     propagate_at_launch = true
   }
 
+  # DeployColor: only emitted when blue/green is enabled so a fleet that
+  # has never run blue/green doesn't see a benign-but-churn-y ASG diff
+  # to add the tag. user_data's `DEPLOY_COLOR` defaults to "blue" when
+  # the IMDS instance tag is absent, so the missing-tag and
+  # tag="blue" cases are equivalent at runtime.
+  dynamic "tag" {
+    for_each = var.enable_blue_green ? [1] : []
+    content {
+      key                 = "DeployColor"
+      value               = "blue"
+      propagate_at_launch = true
+    }
+  }
+
   dynamic "tag" {
     for_each = var.tags
     content {
@@ -590,6 +710,31 @@ resource "aws_autoscaling_group" "frps" {
 
   lifecycle {
     create_before_destroy = true
+    # CI/CD manages capacity during blue/green switches and canary
+    # rollouts; ignore `desired_capacity`/`min_size` here so a Terraform
+    # plan after a flip doesn't try to revert it. Matches the AC module
+    # pattern (`modules/ac/main.tf:1022`) and the green-side
+    # `aws_autoscaling_group.frps_green` block in `blue_green.tf`.
+    #
+    # The cr-flagged scenario this closes: after a blue→green flip, CI
+    # scales the (now-standby) blue ASG down. Without `ignore_changes`,
+    # the next `terraform apply` would plan to revert blue back to
+    # `local.effective_desired_capacity` and fight CI on every plan.
+    #
+    # **Deliberate behavior change for non-BG/non-canary deploys.**
+    # `lifecycle.ignore_changes` does not accept dynamic content, so
+    # this block applies even when both `enable_blue_green = false` AND
+    # `enable_qurl_reverse_tunnel_server_canary = false`. In that
+    # regime the Terraform initial value is what CI would also set, so
+    # it's a no-op AT FIRST APPLY — but until this PR a manual `aws
+    # autoscaling update-auto-scaling-group` (or unrelated workflow)
+    # would be reverted on the next plan. Starting with this PR, an
+    # operator-side change wins until something else flips it back.
+    # Matches the AC module's existing posture (`modules/ac/main.tf:1022`
+    # has the same unconditional `ignore_changes`); this is the
+    # project's deliberate policy for ASGs whose capacity is co-owned
+    # by Terraform-at-create and CI-at-deploy.
+    ignore_changes = [desired_capacity, min_size]
 
     precondition {
       # If a QURL API token is configured, the API URL must also be set.
@@ -627,10 +772,42 @@ resource "aws_autoscaling_group" "frps" {
     }
 
     precondition {
-      # min <= desired <= max. Catch tfvars typos at plan time rather than
-      # letting the ASG API reject them in the middle of an apply.
-      condition     = var.min_size <= var.desired_capacity && var.desired_capacity <= var.max_size
-      error_message = "qurl-reverse-tunnel-server ASG sizing must satisfy min_size <= desired_capacity <= max_size."
+      # min <= desired <= max on the EFFECTIVE values, regardless of which
+      # form (legacy triple or per-AZ vars) supplied them. Catches tfvars
+      # typos at plan time rather than letting the ASG API reject them
+      # in the middle of an apply. A half-mix during a migration plan
+      # (e.g., per-AZ desired set, per-AZ min unset) hits this same
+      # error path because the locals fall back to the legacy var
+      # whose default is 1.
+      condition     = local.effective_min_size <= local.effective_desired_capacity && local.effective_desired_capacity <= local.effective_max_size
+      error_message = "qurl-reverse-tunnel-server ASG effective sizing must satisfy min_size <= desired_capacity <= max_size. Resolved: min=${local.effective_min_size}, desired=${local.effective_desired_capacity}, max=${local.effective_max_size}. (Per-AZ vars × length(frps_az_suffixes) when set; legacy triple otherwise.)"
+    }
+
+    precondition {
+      # Module-level mirror of the root-level half-mix fence in
+      # terraform/main.tf::frps_preconditions. The root fence catches
+      # the typo for callers that compose this module via root tfvars;
+      # this mirror catches module-direct consumers (smoke fixtures,
+      # isolated tests, future module reuse). Without it, a half-mix
+      # like `desired_capacity_per_az = 2` paired with
+      # `min_size_per_az = null` silently falls back to `var.min_size`
+      # (default 1) for the unset half, breaks the fixed-size guarantee,
+      # and produces the more generic min<=desired<=max failure above
+      # rather than an actionable "pick one form fully" message.
+      condition = (
+        var.desired_capacity_per_az != null
+        ? (
+          var.min_size_per_az != null
+          && var.max_size_per_az != null
+          && var.min_size_per_az == var.desired_capacity_per_az
+          && var.max_size_per_az == var.desired_capacity_per_az
+        )
+        : (
+          var.min_size_per_az == null
+          && var.max_size_per_az == null
+        )
+      )
+      error_message = "Pick exactly one ASG-sizing form: per-AZ form requires ALL THREE of {min_size_per_az, max_size_per_az, desired_capacity_per_az} to be set AND equal; legacy form requires *_per_az to be null AND uses {min_size, max_size, desired_capacity}. Half-mixes (e.g., only desired_capacity_per_az set) silently fall back to legacy `min_size` for the unset half."
     }
   }
 }

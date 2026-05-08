@@ -591,14 +591,24 @@ fi
 cat > /opt/layerv/qurl-reverse-tunnel-server/cloudmap-register.sh << 'REGEOF'
 #!/bin/bash
 set -e
-# Bash 4+ associative array. Ubuntu 24.04 ships bash 5.x so this is safe.
+# Bash 4+ associative arrays. Ubuntu 24.04 ships bash 5.x so this is safe.
 # Rendered by Terraform templatefile() -- keys are AZ suffixes ("a","b",...),
 # values are the per-AZ Cloud Map service IDs. The 'REGEOF' heredoc
 # delimiter is shell-quoted so bash doesn't try to expand dollar-vars at
 # 'cat' time; Terraform templating runs before the heredoc is written to
 # disk, so the AZ-keyed values still get burned in.
-declare -A CLOUDMAP_SERVICE_IDS=(
-%{ for suffix, service_id in cloudmap_service_ids ~}
+#
+# Two parallel maps for blue/green. When `enable_blue_green = false` the
+# green map is empty; the script never tries to read it because
+# DEPLOY_COLOR defaults to "blue" when the IMDS instance tag is absent
+# (the only case for non-blue-green deploys).
+declare -A CLOUDMAP_SERVICE_IDS_BLUE=(
+%{ for suffix, service_id in cloudmap_service_ids_blue ~}
+  ["${suffix}"]="${service_id}"
+%{ endfor ~}
+)
+declare -A CLOUDMAP_SERVICE_IDS_GREEN=(
+%{ for suffix, service_id in cloudmap_service_ids_green ~}
   ["${suffix}"]="${service_id}"
 %{ endfor ~}
 )
@@ -612,6 +622,82 @@ INSTANCE_ID=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://16
 LOCAL_IP=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
 AZ=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
 REGION=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+# DeployColor IMDS tag — propagated at launch by both ASGs when
+# `var.enable_blue_green = true`: green via the always-propagate `tag`
+# block in blue_green.tf, blue via the dynamic `tag` block in main.tf
+# gated on `var.enable_blue_green`. When blue/green is DISABLED the
+# blue ASG omits the tag entirely (no resource diff for non-blue/green
+# deploys), and the IMDS read returns 404; we default to blue in that
+# case so the existing single-color contract isn't perturbed.
+#
+# CR-flagged failure mode this addresses: a green-tagged instance hitting
+# a transient IMDS hiccup during boot (network timeout, missing token)
+# used to fall through to "blue" via `|| echo "blue"`, registering
+# against the WRONG Cloud Map service since the blue map is populated.
+#
+# We distinguish three outcomes by inspecting the HTTP status code (not
+# curl's exit-22 catch-all): an unauthenticated 401 / forbidden 403 from
+# IMDS — token expired or refused — would also map to curl exit 22 under
+# `-f`, and silently defaulting those to "blue" would re-open the same
+# fault class. Only a literal 404 means "tag legitimately absent on this
+# instance".
+#   - HTTP 200 → tag is present, DEPLOY_COLOR holds the value.
+#   - HTTP 404 → tag absent (non-blue/green deploys), default to "blue".
+#   - any other status (401/403/5xx) or curl-level failure (DNS, connect,
+#     timeout) → IMDS is unreachable or rejecting. We've already retried
+#     (--retry 3 in IMDS_CURL); refuse to guess a color and exit 1.
+#     Better to crash-loop the instance and page on no-healthy than to
+#     silently register against the wrong color's Cloud Map service. The
+#     empty-AZ watchdog (#1542) catches the resulting empty-AZ
+#     registration count.
+DEPLOY_COLOR_TMP="$(mktemp)"
+# Bash `trap` does not compose — a second `trap ... EXIT` silently
+# replaces this one. If you add another EXIT trap later in this
+# script, fold the cleanup commands together (e.g.,
+# `trap 'rm -f "$DEPLOY_COLOR_TMP"; <other-cleanup>' EXIT`) rather
+# than emitting a separate trap statement.
+trap 'rm -f "$DEPLOY_COLOR_TMP"' EXIT
+set +e
+DEPLOY_COLOR_HTTP=$(curl -s --max-time 5 --retry 3 -o "$DEPLOY_COLOR_TMP" -w '%%{http_code}' \
+  -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/tags/instance/DeployColor)
+DEPLOY_COLOR_RC=$?
+set -e
+if [ $DEPLOY_COLOR_RC -ne 0 ]; then
+  echo "FATAL: IMDS curl for DeployColor tag failed at the transport layer (curl exit $DEPLOY_COLOR_RC, http=$DEPLOY_COLOR_HTTP) after retries — refusing to guess a color and silently mis-register against the wrong Cloud Map service."
+  exit 1
+fi
+if [ "$DEPLOY_COLOR_HTTP" = "200" ]; then
+  DEPLOY_COLOR=$(cat "$DEPLOY_COLOR_TMP")
+  # Empty-body 200 is treated as FATAL, not a fall-through to "blue".
+  # IMDS shouldn't return 200 with an empty body for an existing tag,
+  # but a future IMDS regression or a misconfigured tag value would
+  # otherwise mis-register a green-tagged instance against the blue
+  # Cloud Map service via the empty-DEPLOY_COLOR fallback below.
+  # Matches the non-200/non-404 branch posture: refuse to guess.
+  if [ -z "$DEPLOY_COLOR" ]; then
+    echo "FATAL: IMDS DeployColor tag returned HTTP 200 with an empty body — refusing to guess a color. This shouldn't happen; the tag is either present (200 + value) or absent (404). An empty 200 likely means an IMDS regression or a deploy that mis-set the tag value."
+    exit 1
+  fi
+elif [ "$DEPLOY_COLOR_HTTP" = "404" ]; then
+  DEPLOY_COLOR="blue" # tag legitimately absent (non-blue/green deploys)
+else
+  echo "FATAL: IMDS DeployColor tag returned HTTP $DEPLOY_COLOR_HTTP (not 200 or 404) — refusing to guess a color. 401/403 likely means the IMDSv2 token expired or was rejected; 5xx means IMDS is degraded. Either way, defaulting to 'blue' would silently mis-register a green-tagged instance against the blue Cloud Map service."
+  exit 1
+fi
+# Defense in depth: this used to be the catch-all for the
+# `|| echo "blue"` fallback the script previously had. The HTTP-status
+# branching above now handles the 404 case explicitly and FATALs on
+# empty-200, so this is unreachable in normal flow. Kept as a final
+# safety net in case a future refactor reintroduces a default-blue
+# path without going through HTTP-status branching.
+if [ -z "$DEPLOY_COLOR" ]; then
+  DEPLOY_COLOR="blue"
+fi
+if [[ "$DEPLOY_COLOR" != "blue" && "$DEPLOY_COLOR" != "green" ]]; then
+  echo "FATAL: DeployColor IMDS tag is '$DEPLOY_COLOR' — must be 'blue' or 'green' (or absent for blue)."
+  exit 1
+fi
 # Trailing AZ letter ("us-east-2a" -> "a"). Bash 4+ negative substring.
 # IMPORTANT: the leading space inside `: -1` is REQUIRED -- without the
 # space, $${AZ:-1} is the default-value operator and would silently set
@@ -628,15 +714,21 @@ if ! [[ "$AZ_SUFFIX" =~ ^[a-z]$ ]]; then
   echo "FATAL: AZ_SUFFIX '$AZ_SUFFIX' (extracted from AZ '$AZ') is not a single lowercase letter — qurl-reverse-tunnel-server only supports standard AWS AZs (us-east-2a etc.)."
   exit 1
 fi
-SERVICE_ID="$${CLOUDMAP_SERVICE_IDS[$AZ_SUFFIX]:-}"
+if [ "$DEPLOY_COLOR" = "green" ]; then
+  SERVICE_ID="$${CLOUDMAP_SERVICE_IDS_GREEN[$AZ_SUFFIX]:-}"
+  CONFIGURED_SUFFIXES="$${!CLOUDMAP_SERVICE_IDS_GREEN[*]}"
+else
+  SERVICE_ID="$${CLOUDMAP_SERVICE_IDS_BLUE[$AZ_SUFFIX]:-}"
+  CONFIGURED_SUFFIXES="$${!CLOUDMAP_SERVICE_IDS_BLUE[*]}"
+fi
 if [ -z "$SERVICE_ID" ]; then
   # FATAL on register — better to crash-loop the instance and page on
   # no-healthy-instance than to silently boot an instance that no
   # qurl-service hash will ever target.
-  echo "FATAL: no Cloud Map service configured for AZ suffix '$AZ_SUFFIX' (full AZ '$AZ'). Configured suffixes: $${!CLOUDMAP_SERVICE_IDS[*]}"
+  echo "FATAL: no Cloud Map service configured for color '$DEPLOY_COLOR', AZ suffix '$AZ_SUFFIX' (full AZ '$AZ'). Configured suffixes for this color: $CONFIGURED_SUFFIXES"
   exit 1
 fi
-echo "Registering qurl-reverse-tunnel-server instance $INSTANCE_ID ($LOCAL_IP, AZ=$AZ) with Cloud Map service $SERVICE_ID (suffix $AZ_SUFFIX)"
+echo "Registering qurl-reverse-tunnel-server instance $INSTANCE_ID ($LOCAL_IP, AZ=$AZ, color=$DEPLOY_COLOR) with Cloud Map service $SERVICE_ID (suffix $AZ_SUFFIX)"
 aws servicediscovery register-instance \
   --service-id "$SERVICE_ID" \
   --instance-id "$INSTANCE_ID" \
@@ -657,8 +749,13 @@ cat > /opt/layerv/qurl-reverse-tunnel-server/cloudmap-deregister.sh << 'DEREGEOF
 # warn-and-skip story is uniform across "missing suffix", "malformed
 # suffix", and "IMDS dead". Register-side keeps `set -e` (FATAL on
 # register is the right call — see cloudmap-register.sh).
-declare -A CLOUDMAP_SERVICE_IDS=(
-%{ for suffix, service_id in cloudmap_service_ids ~}
+declare -A CLOUDMAP_SERVICE_IDS_BLUE=(
+%{ for suffix, service_id in cloudmap_service_ids_blue ~}
+  ["${suffix}"]="${service_id}"
+%{ endfor ~}
+)
+declare -A CLOUDMAP_SERVICE_IDS_GREEN=(
+%{ for suffix, service_id in cloudmap_service_ids_green ~}
   ["${suffix}"]="${service_id}"
 %{ endfor ~}
 )
@@ -668,6 +765,43 @@ TOKEN=$("$${IMDS_CURL[@]}" -X PUT "http://169.254.169.254/latest/api/token" -H "
 INSTANCE_ID=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id) || { echo "WARN: IMDS instance-id lookup failed; skipping deregister"; exit 0; }
 AZ=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone) || { echo "WARN: IMDS AZ lookup failed; skipping deregister"; exit 0; }
 REGION=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region) || { echo "WARN: IMDS region lookup failed; skipping deregister"; exit 0; }
+# DeployColor — see cloudmap-register.sh for rationale on the
+# HTTP-status branching. Deregister is intentionally lenient (the
+# script's contract is "warn and exit 0 whenever lookup is
+# unworkable"), so any non-200/non-404 response WARN-and-skips here
+# rather than the register-side FATAL. A 404 still defaults to "blue"
+# so non-blue-green deploys deregister from the only color they ever
+# registered to.
+DEPLOY_COLOR_TMP="$(mktemp)"
+# Bash `trap` does not compose — see the matching comment in
+# cloudmap-register.sh. If you add another EXIT trap later in this
+# script, fold the cleanup commands together rather than emitting a
+# separate `trap` statement (the second one would silently replace
+# this one and leave $DEPLOY_COLOR_TMP behind on exit).
+trap 'rm -f "$DEPLOY_COLOR_TMP"' EXIT
+DEPLOY_COLOR_HTTP=$(curl -s --max-time 5 --retry 3 -o "$DEPLOY_COLOR_TMP" -w '%%{http_code}' \
+  -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/tags/instance/DeployColor) || {
+    echo "WARN: IMDS curl for DeployColor tag failed at the transport layer; skipping deregister."
+    exit 0
+}
+if [ "$DEPLOY_COLOR_HTTP" = "200" ]; then
+  DEPLOY_COLOR=$(cat "$DEPLOY_COLOR_TMP")
+  # Empty-body 200: WARN-and-skip rather than register-side FATAL.
+  # Same posture as the non-200/non-404 branch — don't guess.
+  if [ -z "$DEPLOY_COLOR" ]; then
+    echo "WARN: IMDS DeployColor tag returned HTTP 200 with empty body; skipping deregister to avoid mis-targeting the wrong color."
+    exit 0
+  fi
+elif [ "$DEPLOY_COLOR_HTTP" = "404" ]; then
+  DEPLOY_COLOR="blue" # tag legitimately absent
+else
+  echo "WARN: IMDS DeployColor tag returned HTTP $DEPLOY_COLOR_HTTP (not 200 or 404); skipping deregister to avoid mis-targeting the wrong color."
+  exit 0
+fi
+if [ -z "$DEPLOY_COLOR" ]; then
+  DEPLOY_COLOR="blue"
+fi
 AZ_SUFFIX="$${AZ: -1}"
 # Same defensive check as cloudmap-register.sh (see comment there).
 # WARN-and-continue here matches the existing deregister leniency:
@@ -676,17 +810,26 @@ if ! [[ "$AZ_SUFFIX" =~ ^[a-z]$ ]]; then
   echo "WARN: AZ_SUFFIX '$AZ_SUFFIX' (extracted from AZ '$AZ') is not a single lowercase letter; skipping deregister"
   exit 0
 fi
-SERVICE_ID="$${CLOUDMAP_SERVICE_IDS[$AZ_SUFFIX]:-}"
+if [ "$DEPLOY_COLOR" = "green" ]; then
+  SERVICE_ID="$${CLOUDMAP_SERVICE_IDS_GREEN[$AZ_SUFFIX]:-}"
+elif [ "$DEPLOY_COLOR" = "blue" ]; then
+  SERVICE_ID="$${CLOUDMAP_SERVICE_IDS_BLUE[$AZ_SUFFIX]:-}"
+else
+  # WARN-and-skip on unrecognized color in deregister (not FATAL —
+  # parallel with the missing-suffix branch below).
+  echo "WARN: DeployColor IMDS tag '$DEPLOY_COLOR' is not 'blue' or 'green'; skipping deregister"
+  exit 0
+fi
 if [ -z "$SERVICE_ID" ]; then
   # Don't FATAL on deregister — `|| true` below already swallows the
   # AWS-side error so a missing mapping shouldn't take down ExecStop.
   # Just log and exit clean; the ASG replace cycle will eventually
   # reap the stale registration via TTL or the planned #1089 health
   # check work.
-  echo "WARN: no Cloud Map service configured for AZ suffix '$AZ_SUFFIX' (full AZ '$AZ'); skipping deregister"
+  echo "WARN: no Cloud Map service configured for color '$DEPLOY_COLOR', AZ suffix '$AZ_SUFFIX' (full AZ '$AZ'); skipping deregister"
   exit 0
 fi
-echo "Deregistering qurl-reverse-tunnel-server instance $INSTANCE_ID from Cloud Map service $SERVICE_ID (suffix $AZ_SUFFIX)"
+echo "Deregistering qurl-reverse-tunnel-server instance $INSTANCE_ID from Cloud Map service $SERVICE_ID (color=$DEPLOY_COLOR, suffix $AZ_SUFFIX)"
 aws servicediscovery deregister-instance \
   --service-id "$SERVICE_ID" \
   --instance-id "$INSTANCE_ID" \

@@ -491,6 +491,9 @@ variable "qurl_router_config" {
       negative_cache_ttl = 30
       api_timeout     = 5
       proxy_timeout   = 30
+      # Router-side HRW (traefik-plugins #134) — see field comments below.
+      enable_instance_hrw            = false
+      instance_discovery_ttl_seconds = 20
     }
   EOT
   type = object({
@@ -503,12 +506,47 @@ variable "qurl_router_config" {
     api_timeout        = optional(number, 5)
     proxy_timeout      = optional(number, 30)
     cache_shards       = optional(number, 16)
+    # Router-side HRW dispatch (traefik-plugins #134). Optional with a
+    # default of false so module-direct consumers that haven't updated
+    # their qurl_router_config object pre-rollout don't break — the
+    # plugin's default is also false, and the user_data renders the
+    # field unconditionally so the rendered config matches.
+    #
+    # Cross-module fence is at the ROOT, not here. The AC module
+    # cannot see the qurl-reverse-tunnel-server's `cloud_map_routing_policy`,
+    # so the "HRW requires MULTIVALUE" invariant is enforced in
+    # `terraform/main.tf::terraform_data.frps_preconditions`. Module-
+    # direct AC consumers that set `enable_instance_hrw = true`
+    # without ALSO arranging MULTIVALUE on qurl-reverse-tunnel-server's
+    # Cloud Map services will silently render the plugin config but
+    # see no behavior change (the plugin's HRW logic falls through to
+    # weighted A-record selection when only one IP is returned).
+    enable_instance_hrw            = optional(bool, false)
+    instance_discovery_ttl_seconds = optional(number, 20)
   })
   default = null
 
   validation {
     condition     = var.qurl_router_config == null || can(var.qurl_router_config.enabled)
     error_message = "qurl_router_config must include 'enabled' field when set."
+  }
+
+  validation {
+    # Plugin-level fence: HRW only makes sense when the consumer also
+    # has a working A-record-set source (Cloud Map MULTIVALUE). The
+    # routing policy is enforced at the qurl-reverse-tunnel-server module / root, not
+    # here, so the AC module can't directly check it. What the AC
+    # module CAN check is that `instance_discovery_ttl_seconds` is
+    # in a sane range — same shape as the root-level validator on
+    # `var.instance_discovery_ttl_seconds`.
+    condition = (
+      var.qurl_router_config == null
+      || (
+        try(var.qurl_router_config.instance_discovery_ttl_seconds, 20) >= 1
+        && try(var.qurl_router_config.instance_discovery_ttl_seconds, 20) <= 600
+      )
+    )
+    error_message = "qurl_router_config.instance_discovery_ttl_seconds must be between 1 and 600. Outside this range the router-side HRW resolver caches stale IP sets or hammers DNS — both produce wrong dispatch decisions silently."
   }
 }
 

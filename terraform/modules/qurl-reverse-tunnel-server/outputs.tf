@@ -26,6 +26,16 @@ output "asg_name" {
   value       = aws_autoscaling_group.frps.name
 }
 
+output "asg_arn" {
+  description = "Auto Scaling Group ARN. Surfaced for the canary-deployment module's IAM scope (see terraform/main.tf::module.canary_deployment_qurl_reverse_tunnel_server)."
+  value       = aws_autoscaling_group.frps.arn
+}
+
+output "launch_template_arn" {
+  description = "Launch template ARN. Required by the canary-deployment module to grant ec2:RunInstances on the LT version under DesiredConfiguration in StartInstanceRefresh (mirrors module.compute and module.ac wiring)."
+  value       = aws_launch_template.frps.arn
+}
+
 output "log_group_name" {
   description = "CloudWatch log group name"
   value       = aws_cloudwatch_log_group.frps.name
@@ -51,4 +61,32 @@ output "cloud_map_empty_az_alarm_arns" {
     for s, alarm in aws_cloudwatch_metric_alarm.empty_az_per_suffix :
     s => alarm.arn
   }
+}
+
+# Operator-facing pre-flight notice for the WEIGHTED → MULTIVALUE flip
+# (PR 4). Surfaces in `terraform output` so the operator running the
+# value flip sees the gotcha BEFORE running `terraform apply`. The
+# variable comment on `cloud_map_routing_policy` carries the same
+# warning for plan-time reading; this output covers the apply-time
+# pre-flight check (`terraform output cloud_map_replacement_warning`
+# in the canary-deploy runbook).
+#
+# Value is empty when the policy stays at its default WEIGHTED. Set to
+# a non-empty notice once the operator has flipped to MULTIVALUE so a
+# `terraform output` audit shows the impending REPLACEMENT semantics
+# until the deploy finishes and the next apply produces a clean diff.
+output "cloud_map_replacement_warning" {
+  description = "Tense-neutral advisory for the WEIGHTED → MULTIVALUE Cloud Map routing policy flip (PR 4). Empty string under the WEIGHTED default; non-empty when MULTIVALUE is set, describing the REPLACEMENT semantics that fired or will fire on the next apply (per-AZ services + green services replaced, launch-template version bumps, instance refresh fires) so a `terraform output` audit catches the foot-gun whether read pre-flip or post-flip. See `var.cloud_map_routing_policy` for the full cutover sequence."
+  # Tense-neutral wording: the output stays non-empty after PR 4's
+  # apply lands (cloud_map_routing_policy stays = MULTIVALUE), so a
+  # future operator running `terraform output cloud_map_replacement_warning`
+  # post-flip should not be misled into thinking another replacement is
+  # impending. "any apply that flips this variable" reads truthfully
+  # both before (the next plan) and after (the historical apply) the
+  # flip. Set explicitly to "" once we want the warning to vanish.
+  value = var.cloud_map_routing_policy == "MULTIVALUE" ? format(
+    "MULTIVALUE routing is set: any apply that flips cloud_map_routing_policy from WEIGHTED triggers REPLACEMENT of %d per-AZ Cloud Map service(s)%s — service IDs change, launch-template version bumps, instance refresh fires. See cloud_map_routing_policy variable doc for the cutover sequence.",
+    length(var.frps_az_suffixes),
+    var.enable_blue_green ? format(" + %d green service(s)", length(var.frps_az_suffixes)) : "",
+  ) : ""
 }

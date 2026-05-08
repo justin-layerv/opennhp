@@ -5,15 +5,27 @@
 # Lambda Package
 # ==============================================================================
 
-# NOTE: this module is re-instantiated as `module.canary_deployment_ac`
-# in terraform/main.tf; both instances resolve `${path.module}` to the
-# same source dir, so both write to the same `output_path`. The writes
-# are idempotent today because the source content is identical. Adding
-# component-specific Lambda code (e.g. `if component == "ac"` in
-# `canary_orchestrator.py`) would make the two writes diverge AND race
-# under terraform's default `-parallelism=10`. If you need per-component
-# behavior, also split the `archive_file` (and add a second workflow
-# upload/download pair). See terraform/main.tf NOTE on
+# NOTE: this module is now re-instantiated as `module.canary_deployment_ac`
+# AND `module.canary_deployment_qurl_reverse_tunnel_server` in
+# terraform/main.tf — three writers, all resolving `${path.module}` to the
+# same source dir, all writing to the same `output_path`. The writes
+# are idempotent today because the source content is identical, so a
+# corruption window only exists if the `hashicorp/archive` provider's
+# truncate-and-write interleaves. Probability is small at the current
+# ~2KB zip size but #1763 tracks the proper fix.
+#
+# Per-component `output_path` is the natural fix BUT requires
+# `.github/workflows/promote-to-prod.yml` to upload/download three
+# distinct artifacts (one per component) instead of the current single
+# `lambda-canary-orchestrator` artifact at the shared path. PR #1745
+# leaves the workflow change to #1763 to keep this PR's diff scoped
+# to the BG/canary topology.
+#
+# Adding component-specific Lambda code (e.g. `if component == "ac"` in
+# `canary_orchestrator.py`) would make the writes DIVERGE — at that
+# point #1763 becomes blocking. If you need per-component behavior
+# before #1763 lands, also split the `archive_file` AND add the third
+# workflow upload/download pair. See terraform/main.tf NOTE on
 # `module.canary_deployment_ac` and #1380.
 data "archive_file" "orchestrator" {
   type        = "zip"
@@ -39,10 +51,21 @@ resource "aws_lambda_function" "orchestrator" {
 
   environment {
     variables = {
-      ENVIRONMENT                    = var.environment
-      ASG_NAME                       = var.asg_name
-      NLB_ARN_SUFFIX                 = var.nlb_arn_suffix
-      TARGET_GROUP_ARN_SUFFIX        = var.target_group_arn_suffix
+      ENVIRONMENT             = var.environment
+      ASG_NAME                = var.asg_name
+      NLB_ARN_SUFFIX          = var.nlb_arn_suffix
+      TARGET_GROUP_ARN_SUFFIX = var.target_group_arn_suffix
+      # Explicit "is this an NLB-less component?" toggle. The Lambda
+      # uses this to decide between the NLB metric-query path and the
+      # ASG-instance metric-query path. Originally inferred from
+      # `not NLB_ARN_SUFFIX or not TARGET_GROUP_ARN_SUFFIX`, but the
+      # implicit form is hard to defend against a future caller that
+      # passes only one of the two suffixes (the cross-variable
+      # `terraform_data.component_invariants` precondition catches
+      # that today, but defense-in-depth at the Lambda layer surfaces
+      # a misconfig as a hard mismatch instead of silently choosing
+      # the wrong path).
+      NLB_HEALTH_CHECKS_DISABLED     = tostring(var.disable_nlb_health_checks)
       SNS_TOPIC_ARN                  = var.alerts_sns_topic_arn
       SSM_IMAGE_TAG_PARAM            = var.ssm_image_tag_parameter
       SSM_CANARY_STATE_PARAM         = aws_ssm_parameter.canary_state.name
@@ -51,6 +74,11 @@ resource "aws_lambda_function" "orchestrator" {
       CHECKPOINT_PERCENTAGES         = jsonencode(var.checkpoint_percentages)
       CHECKPOINT_DELAY               = tostring(var.checkpoint_delay_seconds)
       INSTANCE_WARMUP                = tostring(var.instance_warmup_seconds)
+      # Threaded so the SFN-side `StartInstanceRefresh.Preferences.MinHealthyPercentage`
+      # and the canary's own NLB-disabled-path health gate stay locked to the
+      # same value via Terraform — preventing the two literals from drifting in
+      # a future code edit.
+      MIN_HEALTHY_PERCENTAGE = tostring(var.min_healthy_percentage)
     }
   }
 

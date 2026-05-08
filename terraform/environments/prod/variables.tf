@@ -525,6 +525,70 @@ variable "qurl_router_cache_shards" {
   default = 16
 }
 
+# ==================== qurl-router HRW (traefik-plugins #134) ====================
+
+variable "enable_instance_hrw" {
+  description = "Enable router-side HRW dispatch in qurl-router. Default false; PR 4 flips to true after sandbox validation. See terraform/variables.tf for the full description."
+  type        = bool
+  default     = false
+}
+
+variable "instance_discovery_ttl_seconds" {
+  description = "TTL in seconds for the qurl-router instance-IP allowlist. Range validation lives at the root (terraform/variables.tf) and on the AC module's qurl_router_config — duplicating it here would be a future inconsistency vector."
+  type        = number
+  default     = 20
+}
+
+# ==================== qurl-reverse-tunnel-server deploy + sizing (per-AZ + canary) ====================
+# PR 3 only declares the NEW per-AZ / blue/green / canary variables here.
+# The existing tfvars values for `deploy_frps` / `frps_*` are already
+# latent no-ops in env tfvars (the env main.tf never forwarded them);
+# PR 3 leaves that pre-existing gap untouched to avoid changing deploy
+# state. PR 4 wires the legacy passthrough at the same time as the
+# value flip.
+
+variable "qurl_reverse_tunnel_server_min_size_per_az" {
+  description = "Per-AZ ASG min size for qurl-reverse-tunnel-server. Default null keeps the legacy frps_min_size as the source of truth. See terraform/variables.tf for the full description and resolution rule."
+  type        = number
+  default     = null
+}
+
+variable "qurl_reverse_tunnel_server_max_size_per_az" {
+  description = "Per-AZ ASG max size for qurl-reverse-tunnel-server. Default null keeps the legacy frps_max_size as the source of truth. See terraform/variables.tf for the full description."
+  type        = number
+  default     = null
+}
+
+variable "qurl_reverse_tunnel_server_desired_capacity_per_az" {
+  description = "Per-AZ ASG desired capacity for qurl-reverse-tunnel-server. Default null keeps the legacy frps_desired_capacity. PR 4 will set this to 2 in prod tfvars to flip 1/AZ → 2/AZ."
+  type        = number
+  default     = null
+}
+
+variable "qurl_reverse_tunnel_server_cloud_map_routing_policy" {
+  description = "Cloud Map routing policy for qurl-reverse-tunnel-server per-AZ services. PR 4 flips to MULTIVALUE for router-side HRW dispatch."
+  type        = string
+  default     = "WEIGHTED"
+}
+
+variable "enable_qurl_reverse_tunnel_server_blue_green" {
+  description = "Enable blue/green for qurl-reverse-tunnel-server. Sandbox-targeted; mutually exclusive with enable_qurl_reverse_tunnel_server_canary."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_reverse_tunnel_server_green_standby_capacity_per_az" {
+  description = "Per-AZ desired capacity for the qurl-reverse-tunnel-server green ASG when in standby. Default null = auto-track min_size_per_az when set, else 1. Set explicitly for cold standby (0) or custom values. Ignored when enable_qurl_reverse_tunnel_server_blue_green=false. See terraform/variables.tf for the full description."
+  type        = number
+  default     = null
+}
+
+variable "enable_qurl_reverse_tunnel_server_canary" {
+  description = "Enable canary deployment for qurl-reverse-tunnel-server via the canary-deployment module. Prod-targeted; mutually exclusive with enable_qurl_reverse_tunnel_server_blue_green."
+  type        = bool
+  default     = false
+}
+
 variable "qurl_idempotency_cache_ttl_seconds" {
   type    = number
   default = 300

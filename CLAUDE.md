@@ -232,6 +232,22 @@ Parameters using this pattern:
 - Auth0 backend credentials secret version - Auth0 provider returns empty `client_secret`
 - Dev portal management credentials secret version - same Auth0 provider limitation
 
+**ASG capacity is co-owned with CI/CD.** Three ASGs use
+`lifecycle { ignore_changes = [desired_capacity, min_size] }` for
+the same reason as the SSM params above — CI/CD scales them during
+blue/green flips and canary rollouts, and the next `terraform apply`
+must not revert that. Operator-side `aws autoscaling
+update-auto-scaling-group` against these ASGs sticks until something
+else flips it (no plan-time revert):
+
+- `aws_autoscaling_group.server` (`modules/server/main.tf`)
+- `aws_autoscaling_group.ac` (`modules/ac/main.tf`)
+- `aws_autoscaling_group.frps` blue + green (`modules/qurl-reverse-tunnel-server/main.tf`, `blue_green.tf`)
+
+`max_size` is deliberately NOT in `ignore_changes` so a CI scale-up
+that exceeds the static cap fights the rehearsal — the cap is the
+safety net.
+
 ### Docker
 
 ```bash

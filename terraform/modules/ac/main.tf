@@ -807,7 +807,23 @@ locals {
     qurl_router_api_timeout        = var.qurl_router_config != null ? var.qurl_router_config.api_timeout : 5
     qurl_router_proxy_timeout      = var.qurl_router_config != null ? var.qurl_router_config.proxy_timeout : 30
     qurl_router_cache_shards       = var.qurl_router_config != null ? var.qurl_router_config.cache_shards : 16
-    qurl_service_token_secret_arn  = var.qurl_service_token_secret_arn
+    # Router-side HRW dispatch (traefik-plugins #134). Both fields render
+    # unconditionally into the plugin config so the rendered TOML shape
+    # is stable across the PR 3 → PR 4 flip — flipping
+    # `enable_instance_hrw` is a value change on an existing key, not a
+    # structural change in dynamic.toml.
+    #
+    # Important: dynamic.toml is rendered ONLY by user_data at instance
+    # boot. Flipping this in tfvars produces a launch-template diff (the
+    # base64gzip(local.user_data) hash changes) and an LT version bump,
+    # but EXISTING AC instances retain the old dynamic.toml on disk
+    # until an ASG instance refresh replaces them. So PR 4 must trigger
+    # an AC instance refresh (or the canary state machine equivalent)
+    # after applying — Traefik's file-watcher only sees the new value
+    # on an instance launched against the new LT version.
+    qurl_router_enable_instance_hrw            = var.qurl_router_config != null ? var.qurl_router_config.enable_instance_hrw : false
+    qurl_router_instance_discovery_ttl_seconds = var.qurl_router_config != null ? var.qurl_router_config.instance_discovery_ttl_seconds : 20
+    qurl_service_token_secret_arn              = var.qurl_service_token_secret_arn
     # Centralized certificate management (for scalable AC deployments)
     centralized_cert_enabled    = var.centralized_cert_enabled
     centralized_cert_secret_arn = var.centralized_cert_secret_arn != null ? var.centralized_cert_secret_arn : ""

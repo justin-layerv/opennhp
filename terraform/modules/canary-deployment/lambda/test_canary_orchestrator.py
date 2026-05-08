@@ -151,6 +151,25 @@ class TestPrepare(CanaryTestCase):
             canary_orchestrator.handle_prepare({}, None)
         self.assertIn('ASG not found', str(ctx.exception))
 
+    def test_prepare_fails_fast_on_inconsistent_nlb_wiring(self):
+        """Regression fence for cr#2 round 12: handle_prepare must
+        cross-check the NLB-mode env vars BEFORE the SFN starts
+        replacing instances. A misconfig that bypasses the TF
+        precondition (manual env edit, drift) should surface here, not
+        at the first checkpoint health check after instances have
+        already been replaced.
+        """
+        # NLB_HEALTH_CHECKS_DISABLED=True but suffixes populated → mismatch.
+        with patch.object(canary_orchestrator, 'NLB_HEALTH_CHECKS_DISABLED', True), \
+             patch.object(canary_orchestrator, 'NLB_ARN_SUFFIX', 'net/foo/abc'), \
+             patch.object(canary_orchestrator, 'TARGET_GROUP_ARN_SUFFIX', 'targetgroup/foo/def'):
+            with self.assertRaises(RuntimeError) as ctx:
+                canary_orchestrator.handle_prepare({}, None)
+            self.assertIn('Inconsistent NLB-mode wiring', str(ctx.exception))
+            # describe_auto_scaling_groups should NOT have been called —
+            # the consistency check fires before the ASG validate.
+            self.mock_autoscaling.describe_auto_scaling_groups.assert_not_called()
+
 
 class TestStartRefresh(CanaryTestCase):
     """Test the start_refresh action handler."""
@@ -300,6 +319,32 @@ class TestStartRefresh(CanaryTestCase):
         # Should still proceed to start a new refresh
         self.assertEqual(result['instance_refresh_id'], 'refresh-123')
         self.mock_autoscaling.cancel_instance_refresh.assert_not_called()
+
+    def test_start_refresh_fails_fast_on_inconsistent_nlb_wiring(self):
+        """Regression fence: handle_start_refresh must cross-check the
+        NLB-mode env vars BEFORE calling StartInstanceRefresh.
+
+        Mirrors test_prepare_fails_fast_on_inconsistent_nlb_wiring for
+        the start-refresh action — a same-axis env edit that slips
+        between handle_prepare and the SFN's start-refresh task should
+        surface here, not at the first checkpoint health check after
+        instances have already been replaced.
+        """
+        self._setup_asg_mock()
+        # NLB_HEALTH_CHECKS_DISABLED=True but suffixes populated → mismatch.
+        with patch.object(canary_orchestrator, 'NLB_HEALTH_CHECKS_DISABLED', True), \
+             patch.object(canary_orchestrator, 'NLB_ARN_SUFFIX', 'net/foo/abc'), \
+             patch.object(canary_orchestrator, 'TARGET_GROUP_ARN_SUFFIX', 'targetgroup/foo/def'):
+            with self.assertRaises(RuntimeError) as ctx:
+                canary_orchestrator.handle_start_refresh(
+                    {'image_tag': 'sha-abc123'}, None
+                )
+            self.assertIn('Inconsistent NLB-mode wiring', str(ctx.exception))
+            # start_instance_refresh and cancel_instance_refresh must NOT
+            # have been called — the consistency check fires before any
+            # mutation against the ASG.
+            self.mock_autoscaling.start_instance_refresh.assert_not_called()
+            self.mock_autoscaling.cancel_instance_refresh.assert_not_called()
 
 
 class TestCheckRefreshStatus(CanaryTestCase):
@@ -459,6 +504,386 @@ class TestCheckHealth(CanaryTestCase):
         self.assertFalse(result['healthy'])
 
 
+class TestCheckHealthNLBDisabled(CanaryTestCase):
+    """Test the check_health action handler in NLB-disabled (frps) mode.
+
+    Frps has no NLB; canary-deployment is wired for it via
+    `disable_nlb_health_checks = true` and the orchestrator skips the
+    NLB metric queries, falling back to ASG-instance health
+    (GroupInServiceInstances vs GroupTotalInstances). The
+    `nlb_disabled` flag in `result['details']` lets a downstream
+    state-machine assertion distinguish the two regimes.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Patch the module-level constants to simulate the Terraform
+        # `disable_nlb_health_checks = true` path: empty NLB/TG suffixes
+        # AND the explicit NLB_HEALTH_CHECKS_DISABLED toggle set to True.
+        # The Lambda's defensive cross-check enforces these agree.
+        self._nlb_patcher = patch.object(canary_orchestrator, 'NLB_ARN_SUFFIX', '')
+        self._tg_patcher = patch.object(canary_orchestrator, 'TARGET_GROUP_ARN_SUFFIX', '')
+        self._nlb_disabled_patcher = patch.object(canary_orchestrator, 'NLB_HEALTH_CHECKS_DISABLED', True)
+        self._nlb_patcher.start()
+        self._tg_patcher.start()
+        self._nlb_disabled_patcher.start()
+        # Default ASG describe response — handle_check_health on the
+        # NLB-disabled path now reads DesiredCapacity to scale the
+        # has_healthy threshold against MinHealthyPercentage. Individual
+        # tests can override.
+        self.mock_autoscaling.describe_auto_scaling_groups.return_value = {
+            'AutoScalingGroups': [{'DesiredCapacity': 6}]
+        }
+
+    def tearDown(self):
+        self._nlb_disabled_patcher.stop()
+        self._tg_patcher.stop()
+        self._nlb_patcher.stop()
+        super().tearDown()
+
+    def test_healthy_asg_path(self):
+        """All ASG instances in service: healthy."""
+        # Note: in NLB-disabled mode, the orchestrator queries
+        # GroupInServiceInstances (Id='healthy_hosts') and
+        # GroupTotalInstances (Id='unhealthy_hosts'), then computes
+        # implicit_unhealthy = total - in_service.
+        self.mock_cloudwatch.get_metric_data.return_value = {
+            'MetricDataResults': [
+                {'Id': 'healthy_hosts', 'Values': [6.0]},   # GroupInServiceInstances
+                {'Id': 'unhealthy_hosts', 'Values': [6.0]}, # GroupTotalInstances
+                {'Id': 'cpu_utilization', 'Values': [40.0]},
+            ]
+        }
+
+        result = canary_orchestrator.handle_check_health({}, None)
+        self.assertTrue(result['healthy'])
+        self.assertTrue(result['details']['nlb_disabled'])
+        self.assertEqual(result['details']['healthy_hosts'], 6.0)
+        # implicit unhealthy = total (6) - in-service (6) = 0
+        self.assertEqual(result['details']['unhealthy_hosts'], 0)
+        self.assertEqual(result['details']['total_instances'], 6.0)
+
+    def test_unhealthy_asg_path(self):
+        """One ASG instance failing health check: unhealthy."""
+        self.mock_cloudwatch.get_metric_data.return_value = {
+            'MetricDataResults': [
+                {'Id': 'healthy_hosts', 'Values': [5.0]},   # GroupInServiceInstances
+                {'Id': 'unhealthy_hosts', 'Values': [6.0]}, # GroupTotalInstances
+                {'Id': 'cpu_utilization', 'Values': [50.0]},
+            ]
+        }
+
+        result = canary_orchestrator.handle_check_health({}, None)
+        self.assertFalse(result['healthy'])
+        # implicit unhealthy = total (6) - in-service (5) = 1
+        self.assertEqual(result['details']['unhealthy_hosts'], 1)
+
+    def test_min_healthy_threshold_below_floor(self):
+        """ASG path: healthy_hosts below MinHealthyPercentage threshold
+        is unhealthy, even with no unhealthy hosts.
+
+        Regression fence: pre-fix the threshold was `healthy_hosts > 0`,
+        which let a 1-instance survival in a 6-instance fleet (PR 4
+        target: 2/AZ × 3 AZ = 6) advance the canary into an
+        ~83% blast radius. Post-fix the threshold scales with
+        DesiredCapacity × MinHealthyPercentage (90%, matching what
+        StartInstanceRefresh.Preferences enforces).
+        """
+        # Default mock has DesiredCapacity = 6 → ceil(6*0.9) = 6.
+        # Only 1 in-service host out of 6 → fails threshold.
+        self.mock_cloudwatch.get_metric_data.return_value = {
+            'MetricDataResults': [
+                {'Id': 'healthy_hosts', 'Values': [1.0]},     # only 1 in-service
+                {'Id': 'unhealthy_hosts', 'Values': [6.0]},   # 6 total → 5 implicit-unhealthy
+                {'Id': 'cpu_utilization', 'Values': [40.0]},
+            ]
+        }
+        result = canary_orchestrator.handle_check_health({}, None)
+        self.assertFalse(result['healthy'])
+        self.assertEqual(result['details']['min_healthy_count'], 6)
+        self.assertEqual(result['details']['asg_desired'], 6)
+
+    def test_min_healthy_threshold_at_floor(self):
+        """ASG path: healthy_hosts exactly at the threshold is healthy."""
+        # 6-instance fleet, 6 in-service → exactly meets ceil(6*0.9)=6.
+        self.mock_cloudwatch.get_metric_data.return_value = {
+            'MetricDataResults': [
+                {'Id': 'healthy_hosts', 'Values': [6.0]},
+                {'Id': 'unhealthy_hosts', 'Values': [6.0]},
+                {'Id': 'cpu_utilization', 'Values': [40.0]},
+            ]
+        }
+        result = canary_orchestrator.handle_check_health({}, None)
+        self.assertTrue(result['healthy'])
+        self.assertEqual(result['details']['min_healthy_count'], 6)
+
+    def test_metric_query_shape(self):
+        """NLB-disabled mode passes ASG-namespace queries, not NLB."""
+        self.mock_cloudwatch.get_metric_data.return_value = {
+            'MetricDataResults': [],
+        }
+
+        canary_orchestrator.handle_check_health({}, None)
+        self.mock_cloudwatch.get_metric_data.assert_called_once()
+        call_args = self.mock_cloudwatch.get_metric_data.call_args
+        queries = call_args.kwargs['MetricDataQueries']
+        # No NLB-namespace queries. Sanity-check by namespace.
+        namespaces = {q['MetricStat']['Metric']['Namespace'] for q in queries}
+        self.assertNotIn('AWS/NetworkELB', namespaces)
+        self.assertIn('AWS/AutoScaling', namespaces)
+        self.assertIn('AWS/EC2', namespaces)
+
+    def test_partial_data_race_total_only(self):
+        """GroupTotalInstances published, GroupInServiceInstances not yet
+        — must NOT report every host unhealthy.
+
+        Regression fence: pre-fix, this case set
+        `unhealthy_hosts = total` (raw), so `no_unhealthy = False` and
+        the canary rolled back spuriously on a fresh ASG where
+        in-service metric hadn't published yet.
+        """
+        self.mock_cloudwatch.get_metric_data.return_value = {
+            'MetricDataResults': [
+                {'Id': 'healthy_hosts', 'Values': []},        # GroupInServiceInstances missing
+                {'Id': 'unhealthy_hosts', 'Values': [6.0]},   # GroupTotalInstances present
+                {'Id': 'cpu_utilization', 'Values': [40.0]},
+            ]
+        }
+
+        result = canary_orchestrator.handle_check_health({}, None)
+        # has_healthy=False (no in-service metric) → healthy=False, but
+        # NOT because of the bogus implicit-unhealthy = total.
+        # Surface that distinction via the details dict so a downstream
+        # alarm can tell "no data yet" from "real instance failure".
+        self.assertFalse(result['healthy'])
+        self.assertIsNone(result['details']['unhealthy_hosts'])
+        self.assertIsNone(result['details']['healthy_hosts'])
+        # `total_instances` is still preserved for telemetry.
+        self.assertEqual(result['details']['total_instances'], 6.0)
+
+    def test_partial_data_race_in_service_only(self):
+        """GroupInServiceInstances published, GroupTotalInstances not yet
+        — handler must not crash subtracting None from a number, and
+        the canary should ADVANCE on the partial signal.
+
+        Posture rationale: `GroupInServiceInstances` is the load-bearing
+        metric on the ASG path (it's how the lambda concludes "yes, N
+        hosts are passing health checks"). `GroupTotalInstances` is
+        only used to compute the implicit-unhealthy delta; without it,
+        we don't know if there are any unhealthy hosts but we DO know
+        the healthy hosts count. The existing health logic treats
+        `unhealthy_hosts is None` as `no_unhealthy=True` (no evidence
+        of unhealthy hosts), so the canary advances when the in-service
+        count meets the MinHealthyPercentage threshold. The alternative
+        — wait for both metrics — would penalize fresh ASGs whose
+        Total publish-cycle lags InService by one period, stalling
+        legitimate deploys behind a missing-metric race.
+
+        The opposite race (Total present, InService missing) keeps
+        `healthy=False` via `has_healthy=False`, biasing toward
+        "rollback on no in-service evidence" — see
+        `test_partial_data_race_total_only`.
+        """
+        # Override default DesiredCapacity (6) to match this scenario:
+        # 3-instance fleet, 3 in-service → meets MinHealthyPercentage=90% threshold.
+        self.mock_autoscaling.describe_auto_scaling_groups.return_value = {
+            'AutoScalingGroups': [{'DesiredCapacity': 3}]
+        }
+        self.mock_cloudwatch.get_metric_data.return_value = {
+            'MetricDataResults': [
+                {'Id': 'healthy_hosts', 'Values': [3.0]},     # GroupInServiceInstances present
+                {'Id': 'unhealthy_hosts', 'Values': []},      # GroupTotalInstances missing
+                {'Id': 'cpu_utilization', 'Values': [40.0]},
+            ]
+        }
+
+        # Should not raise. unhealthy_hosts stays None (no conversion possible).
+        result = canary_orchestrator.handle_check_health({}, None)
+        self.assertIsNone(result['details']['unhealthy_hosts'])
+        # healthy_hosts (3) >= ceil(3 * 0.9) = 3 → has_healthy=True;
+        # no_unhealthy=True (None) and CPU is fine → healthy=True.
+        # The canary advances on the available signal rather than
+        # rolling back on missing data.
+        self.assertTrue(result['healthy'])
+        self.assertEqual(result['details']['healthy_hosts'], 3.0)
+
+    def test_no_metric_data_at_all(self):
+        """Cold-start: neither GroupInServiceInstances nor
+        GroupTotalInstances has published yet.
+
+        The NLB-enabled path has the same test (test_no_metric_data_at_all
+        in TestCheckHealth); this case pins the same behavior for the
+        NLB-disabled path so a future refactor can't regress it. The
+        canary should report `healthy=False` because `has_healthy=False`
+        (no in-service hosts) — better to roll back on no-data than to
+        advance on partial signal.
+        """
+        self.mock_cloudwatch.get_metric_data.return_value = {
+            'MetricDataResults': [
+                {'Id': 'healthy_hosts', 'Values': []},
+                {'Id': 'unhealthy_hosts', 'Values': []},
+                {'Id': 'cpu_utilization', 'Values': []},
+            ]
+        }
+
+        result = canary_orchestrator.handle_check_health({}, None)
+        self.assertFalse(result['healthy'])
+        self.assertIsNone(result['details']['healthy_hosts'])
+        self.assertIsNone(result['details']['unhealthy_hosts'])
+
+    def test_asg_describe_failure_fails_closed(self):
+        """ASG describe failure on the NLB-disabled path returns
+        `healthy=False` instead of falling back to the legacy
+        `min_healthy_count = 1` floor.
+
+        Regression fence for the cr-flagged silent fallback: a
+        transient `DescribeAutoScalingGroups` throttle during the blast
+        radius window of a bad deploy used to log a warning and let
+        `min_healthy_count` fall back to 1 — the exact "any healthy"
+        floor the percentage gate was added to replace. The fail-closed
+        path now returns `healthy=False` so the SFN retries on the next
+        poll and the alarm-driven rollback path engages on sustained
+        failure.
+        """
+        # Healthy metrics — would advance under the old fallback path.
+        self.mock_cloudwatch.get_metric_data.return_value = {
+            'MetricDataResults': [
+                {'Id': 'healthy_hosts', 'Values': [6.0]},
+                {'Id': 'unhealthy_hosts', 'Values': [6.0]},
+                {'Id': 'cpu_utilization', 'Values': [40.0]},
+            ]
+        }
+        # ASG describe throttles.
+        self.mock_autoscaling.describe_auto_scaling_groups.side_effect = (
+            MockClientError(
+                {'Error': {'Code': 'Throttling', 'Message': 'Rate exceeded'}},
+                'DescribeAutoScalingGroups',
+            )
+        )
+
+        result = canary_orchestrator.handle_check_health({}, None)
+        self.assertFalse(result['healthy'])
+        self.assertTrue(result['details']['asg_describe_failed'])
+        self.assertIsNone(result['details']['asg_desired'])
+        self.assertIsNone(result['details']['min_healthy_count'])
+
+    def test_asg_describe_anomalous_shape_fails_closed(self):
+        """describe_auto_scaling_groups returns an empty list on the
+        NLB-disabled path → fail closed.
+
+        Regression fence for cr round 22 #2: the legacy fallback to
+        `min_healthy_count = 1` would silently drop the safety
+        threshold on the path with no NLB safety net. AWS-side
+        anomalies (empty AutoScalingGroups list, missing
+        DesiredCapacity) should fail closed for the same reason the
+        ClientError path does.
+        """
+        # Healthy metrics — would advance under the old fallback path.
+        self.mock_cloudwatch.get_metric_data.return_value = {
+            'MetricDataResults': [
+                {'Id': 'healthy_hosts', 'Values': [6.0]},
+                {'Id': 'unhealthy_hosts', 'Values': [6.0]},
+                {'Id': 'cpu_utilization', 'Values': [40.0]},
+            ]
+        }
+        # Anomalous shape: empty AutoScalingGroups list.
+        self.mock_autoscaling.describe_auto_scaling_groups.return_value = {
+            'AutoScalingGroups': []
+        }
+
+        result = canary_orchestrator.handle_check_health({}, None)
+        self.assertFalse(result['healthy'])
+        self.assertTrue(result['details']['asg_describe_anomalous_shape'])
+        self.assertIsNone(result['details']['asg_desired'])
+        self.assertIsNone(result['details']['min_healthy_count'])
+
+    def test_asg_describe_missing_desired_capacity_fails_closed(self):
+        """describe_auto_scaling_groups returns a member without
+        DesiredCapacity on the NLB-disabled path → fail closed.
+
+        Companion fence to test_asg_describe_anomalous_shape_fails_closed
+        — covers the other "AWS-side anomaly" shape: the response has
+        a group dict but no DesiredCapacity key. Same fail-closed
+        posture: better to roll back than to silently advance on
+        "any healthy".
+        """
+        self.mock_cloudwatch.get_metric_data.return_value = {
+            'MetricDataResults': [
+                {'Id': 'healthy_hosts', 'Values': [6.0]},
+                {'Id': 'unhealthy_hosts', 'Values': [6.0]},
+                {'Id': 'cpu_utilization', 'Values': [40.0]},
+            ]
+        }
+        # Anomalous shape: group present but DesiredCapacity missing.
+        self.mock_autoscaling.describe_auto_scaling_groups.return_value = {
+            'AutoScalingGroups': [{'AutoScalingGroupName': 'test-asg'}]
+        }
+
+        result = canary_orchestrator.handle_check_health({}, None)
+        self.assertFalse(result['healthy'])
+        self.assertTrue(result['details']['asg_describe_anomalous_shape'])
+        self.assertIsNone(result['details']['asg_desired'])
+        self.assertIsNone(result['details']['min_healthy_count'])
+
+
+class TestCheckHealthInconsistentNLBWiring(CanaryTestCase):
+    """Defense-in-depth: the Lambda cross-checks the explicit
+    `NLB_HEALTH_CHECKS_DISABLED` env var against whether the
+    NLB/TG ARN suffixes are empty. The Terraform precondition
+    (`terraform_data.component_invariants` in modules/canary-
+    deployment/main.tf) normally enforces they agree at plan time;
+    the runtime check is a backstop for manual env-var edits or
+    drift.
+    """
+
+    def test_disabled_flag_set_but_suffixes_present_raises(self):
+        with patch.object(canary_orchestrator, 'NLB_HEALTH_CHECKS_DISABLED', True), \
+             patch.object(canary_orchestrator, 'NLB_ARN_SUFFIX', 'net/foo/abc'), \
+             patch.object(canary_orchestrator, 'TARGET_GROUP_ARN_SUFFIX', 'targetgroup/foo/def'):
+            with self.assertRaises(RuntimeError) as ctx:
+                canary_orchestrator.handle_check_health({}, None)
+            self.assertIn('Inconsistent NLB-mode wiring', str(ctx.exception))
+
+    def test_disabled_flag_unset_but_suffixes_empty_raises(self):
+        with patch.object(canary_orchestrator, 'NLB_HEALTH_CHECKS_DISABLED', False), \
+             patch.object(canary_orchestrator, 'NLB_ARN_SUFFIX', ''), \
+             patch.object(canary_orchestrator, 'TARGET_GROUP_ARN_SUFFIX', ''):
+            with self.assertRaises(RuntimeError) as ctx:
+                canary_orchestrator.handle_check_health({}, None)
+            self.assertIn('Inconsistent NLB-mode wiring', str(ctx.exception))
+
+    def test_half_mix_disabled_with_one_suffix_present_raises(self):
+        """Half-mix: disabled=true with NLB suffix populated but TG empty.
+
+        The runtime uses AND-empty (BOTH suffixes must be empty under
+        disabled=true) — matching the TF precondition. An OR-empty
+        rule would ACCEPT this state because at-least-one-empty=True,
+        which would leave a window where TF rejects what the Lambda
+        accepts.
+        """
+        with patch.object(canary_orchestrator, 'NLB_HEALTH_CHECKS_DISABLED', True), \
+             patch.object(canary_orchestrator, 'NLB_ARN_SUFFIX', 'net/foo/abc'), \
+             patch.object(canary_orchestrator, 'TARGET_GROUP_ARN_SUFFIX', ''):
+            with self.assertRaises(RuntimeError) as ctx:
+                canary_orchestrator.handle_check_health({}, None)
+            self.assertIn('Inconsistent NLB-mode wiring', str(ctx.exception))
+
+    def test_half_mix_enabled_with_one_suffix_empty_raises(self):
+        """Half-mix: disabled=false with TG suffix populated but NLB empty.
+
+        Same window as the disabled-side half-mix above, but on the
+        NLB-enabled regime. The TF precondition's non-disabled branch
+        already required BOTH non-empty (`!= "" && != ""`); the
+        runtime now matches.
+        """
+        with patch.object(canary_orchestrator, 'NLB_HEALTH_CHECKS_DISABLED', False), \
+             patch.object(canary_orchestrator, 'NLB_ARN_SUFFIX', ''), \
+             patch.object(canary_orchestrator, 'TARGET_GROUP_ARN_SUFFIX', 'targetgroup/foo/def'):
+            with self.assertRaises(RuntimeError) as ctx:
+                canary_orchestrator.handle_check_health({}, None)
+            self.assertIn('Inconsistent NLB-mode wiring', str(ctx.exception))
+
+
 class TestRollback(CanaryTestCase):
     """Test the rollback action handler."""
 
@@ -478,6 +903,28 @@ class TestRollback(CanaryTestCase):
         result = canary_orchestrator.handle_rollback({}, None)
         self.assertEqual(result['status'], 'no_active_refresh')
         self.mock_ssm.put_parameter.assert_not_called()
+
+    def test_manual_rollback_skips_consistency_check(self):
+        """handle_rollback DOES NOT call `_check_nlb_mode_consistency`.
+
+        Recovery-path posture, parallel to
+        test_alarm_rollback_skips_consistency_check. If NLB-mode wiring
+        drifts mid-deploy, gating manual rollback on the same drift
+        would leave the fleet stuck mid-replace. The other three
+        handlers (`handle_prepare`, `handle_start_refresh`,
+        `handle_check_health`) gate on the consistency check because
+        they advance deploy state; this one only undoes it.
+
+        Regression fence for cr round 22 #3.
+        """
+        # Inconsistent NLB-mode wiring: would block prepare / start /
+        # check_health, but must NOT block manual rollback.
+        with patch.object(canary_orchestrator, 'NLB_HEALTH_CHECKS_DISABLED', True), \
+             patch.object(canary_orchestrator, 'NLB_ARN_SUFFIX', 'net/foo/abc'), \
+             patch.object(canary_orchestrator, 'TARGET_GROUP_ARN_SUFFIX', 'targetgroup/foo/def'):
+            result = canary_orchestrator.handle_rollback({}, None)
+        self.assertEqual(result['status'], 'rolling_back')
+        self.mock_autoscaling.rollback_instance_refresh.assert_called_once()
 
 
 class TestAlarmTriggeredRollback(CanaryTestCase):
@@ -527,6 +974,34 @@ class TestAlarmTriggeredRollback(CanaryTestCase):
         self.mock_ssm.put_parameter.assert_called_once()
         put_args = self.mock_ssm.put_parameter.call_args[1]
         self.assertEqual(put_args['Value'], 'idle')
+
+    def test_alarm_rollback_skips_consistency_check(self):
+        """handle_alarm_triggered_rollback DOES NOT call
+        `_check_nlb_mode_consistency`.
+
+        This is the recovery path. If NLB-mode wiring drifts mid-deploy,
+        gating rollback on the same drift would leave the fleet stuck
+        mid-replace. The other three handlers (`handle_prepare`,
+        `handle_start_refresh`, `handle_check_health`) DO gate on the
+        consistency check because they advance deploy state; this one
+        only undoes it.
+
+        Regression fence: test that an alarm-triggered rollback proceeds
+        even when the NLB env vars are inconsistent (suffixes set but
+        flag says disabled). A future refactor that adds the check here
+        would fail this test.
+        """
+        self.mock_ssm.get_parameter.return_value = {
+            'Parameter': {'Value': 'deploying'}
+        }
+        # Inconsistent NLB-mode wiring: would block prepare / start /
+        # check_health, but must NOT block alarm rollback.
+        with patch.object(canary_orchestrator, 'NLB_HEALTH_CHECKS_DISABLED', True), \
+             patch.object(canary_orchestrator, 'NLB_ARN_SUFFIX', 'net/foo/abc'), \
+             patch.object(canary_orchestrator, 'TARGET_GROUP_ARN_SUFFIX', 'targetgroup/foo/def'):
+            result = canary_orchestrator.handle_alarm_triggered_rollback({}, None)
+        self.assertTrue(result['action_taken'])
+        self.mock_autoscaling.rollback_instance_refresh.assert_called_once()
 
 
 class TestNotify(CanaryTestCase):

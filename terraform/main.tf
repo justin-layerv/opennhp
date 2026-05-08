@@ -662,6 +662,54 @@ module "canary_deployment_ac" {
   instance_warmup_seconds  = var.canary_instance_warmup_seconds
 }
 
+# qurl-reverse-tunnel-server canary deployment (prod-targeted). Independent of the
+# `enable_canary_deployment` (server) flag because qurl-reverse-tunnel-server lives on
+# its own ASG and release cadence; sandbox runs blue/green for frps
+# while prod runs canary, but the symmetric server/AC path is unaware
+# of either. Wired only when `enable_qurl_reverse_tunnel_server_canary = true` AND
+# `deploy_frps = true`.
+#
+# See the NOTE on `module.canary_deployment_ac` re: shared `archive_file`
+# output_path for the orchestrator Lambda — the same content-equality
+# guarantee applies to this third instantiation. The
+# `disable_nlb_health_checks = true` path added in this PR keeps the
+# Lambda source byte-identical across server / ac / frps consumers
+# (single `canary_orchestrator.py`, NLB-vs-ASG branch chosen at runtime
+# from env vars), so the #1380 divergence-and-race risk class is
+# preserved.
+module "canary_deployment_qurl_reverse_tunnel_server" {
+  source = "./modules/canary-deployment"
+  count  = var.enable_qurl_reverse_tunnel_server_canary && var.deploy_frps ? 1 : 0
+
+  environment = var.environment
+  name_prefix = local.name_prefix
+  cell_id     = var.cell_id
+  component   = "frps"
+  tags        = merge(local.common_tags, { Service = "qurl-reverse-tunnel-server" })
+
+  asg_name            = module.qurl_reverse_tunnel_server[0].asg_name
+  asg_arn             = module.qurl_reverse_tunnel_server[0].asg_arn
+  launch_template_arn = module.qurl_reverse_tunnel_server[0].launch_template_arn
+  ebs_kms_key_arn     = module.kms.ebs_key_arn
+
+  # qurl-reverse-tunnel-server has no NLB. Pass empty suffixes; the canary-deployment
+  # module's `disable_nlb_health_checks = true` switch makes the
+  # state machine skip NLB-keyed alarms and the orchestrator
+  # Lambda skip NLB metric queries. Cloud Map empty-AZ alarm
+  # (#1542 in modules/qurl-reverse-tunnel-server/monitoring_empty_az.tf) covers the
+  # routing-layer fault class.
+  nlb_arn_suffix            = ""
+  target_group_arn_suffix   = ""
+  disable_nlb_health_checks = true
+  alerts_sns_topic_arn      = module.monitoring.sns_topic_arn
+  logs_kms_key_arn          = module.kms.logs_key_arn
+  ssm_image_tag_parameter   = module.qurl_reverse_tunnel_server[0].ssm_image_tag_parameter
+
+  checkpoint_percentages   = var.canary_checkpoint_percentages
+  checkpoint_delay_seconds = var.canary_checkpoint_delay_seconds
+  instance_warmup_seconds  = var.canary_instance_warmup_seconds
+}
+
 # Status Page Module - Deployment visibility dashboard
 # ACM certificate must be in us-east-1 for CloudFront
 resource "aws_acm_certificate" "status_page" {
@@ -909,6 +957,13 @@ module "ac" {
     api_timeout        = var.qurl_router_api_timeout
     proxy_timeout      = var.qurl_router_proxy_timeout
     cache_shards       = var.qurl_router_cache_shards
+    # Router-side HRW dispatch (traefik-plugins #134). Default false
+    # in PR 3; flipped to true in PR 4 prod tfvars after sandbox
+    # validation. The module-level qurl_router_config object's
+    # optional defaults (in modules/ac/variables.tf) backstop these
+    # for module-direct consumers that don't pass the new fields.
+    enable_instance_hrw            = var.enable_instance_hrw
+    instance_discovery_ttl_seconds = var.instance_discovery_ttl_seconds
   } : null
   qurl_service_token_secret_arn = var.deploy_qurl_service && var.qurl_router_enabled ? var.qurl_internal_service_token_arn : null
 
@@ -1102,26 +1157,84 @@ resource "terraform_data" "frps_preconditions" {
       error_message = "deploy_frps requires frps_image_tag to be overridden from the bootstrap placeholder. Set it to the real tag CI is publishing."
     }
     precondition {
-      # ASG sizing must match the per-AZ Cloud Map fanout (#1499). With
-      # one instance per AZ at steady state, frps_desired_capacity must
-      # equal length(frps_az_suffixes); a mismatch — e.g. 4 instances
-      # with 3 AZ suffixes — would inevitably double-register some AZ's
-      # Cloud Map service or leave another empty (NXDOMAIN for any
-      # OwnerID hashing into the empty AZ). Plan-time fence so the
-      # operator hits the typo on PR review, not on the deploy-flip.
-      condition     = var.frps_desired_capacity == length(var.frps_az_suffixes)
-      error_message = "deploy_frps requires frps_desired_capacity == length(frps_az_suffixes) — one instance per AZ Cloud Map service. Mismatch double-registers some AZ or leaves another empty."
+      # ASG sizing must produce an integer multiple of length(frps_az_suffixes)
+      # so each AZ gets the same number of instances at steady state.
+      # Resolution rule: per-AZ vars win when set, else legacy triple.
+      # When per-AZ form is used the math is automatic: per_az * len * AZs.
+      # When legacy form is used we still demand `desired % len == 0` so a
+      # historical `desired = 3` with 3 AZ suffixes works, AND a future
+      # `desired = 6` with 3 AZ suffixes (= 2/AZ) also works — both flow
+      # through the same fence.
+      condition = (
+        var.qurl_reverse_tunnel_server_desired_capacity_per_az != null
+        ? true
+        : var.frps_desired_capacity % length(var.frps_az_suffixes) == 0
+      )
+      error_message = "deploy_frps requires `frps_desired_capacity` to be an integer multiple of length(frps_az_suffixes), or `qurl_reverse_tunnel_server_desired_capacity_per_az` to be set instead. Got frps_desired_capacity=${var.frps_desired_capacity}, length(frps_az_suffixes)=${length(var.frps_az_suffixes)}. Mismatch would distribute instances unevenly across the per-AZ Cloud Map services."
     }
     precondition {
-      # min == max == desired keeps the ASG at a fixed size that matches
-      # the Cloud Map fanout; allowing min < desired means a scale-up
-      # event would land an instance in some AZ as a duplicate. ASG-per-
-      # AZ is the structurally correct fence (one ASG pinned to one
-      # subnet, each min=max=desired=1), but until that lands this
-      # tighter equality at least keeps the runtime drift down to "ASG
-      # rebalance" rather than "ASG rebalance + scale-up race".
-      condition     = var.frps_min_size == var.frps_max_size && var.frps_max_size == var.frps_desired_capacity
-      error_message = "deploy_frps requires frps_min_size == frps_max_size == frps_desired_capacity — fixed-size fleet matches the per-AZ Cloud Map fanout. Allowing scale-up would let a rebalance double-register an AZ."
+      # min == max == desired (in the resolved form) keeps the ASG at a
+      # fixed size that matches the per-AZ Cloud Map fanout; allowing
+      # min < desired means a scale-up event would land an instance in
+      # some AZ as a duplicate. ASG-per-AZ is the structurally correct
+      # fence, tracked under #1499; until that lands this equality keeps
+      # the runtime drift bounded.
+      #
+      # Two forms checked: per-AZ form (when set) requires ALL THREE
+      # per-AZ vars to be non-null AND equal — a half-set form (e.g.,
+      # only `desired_capacity_per_az = 2` while `min_size_per_az`
+      # stays null) would silently let `effective_min_size` fall back
+      # to the legacy `var.min_size` (default 1; tfvars-set 3) and
+      # produce a fleet where `min < desired`, defeating the fixed-
+      # size guarantee. Legacy form requires the explicit triple to be
+      # equal. Mixing forms is rejected explicitly.
+      condition = (
+        var.qurl_reverse_tunnel_server_desired_capacity_per_az != null
+        ? (
+          var.qurl_reverse_tunnel_server_min_size_per_az != null
+          && var.qurl_reverse_tunnel_server_max_size_per_az != null
+          && var.qurl_reverse_tunnel_server_min_size_per_az == var.qurl_reverse_tunnel_server_desired_capacity_per_az
+          && var.qurl_reverse_tunnel_server_max_size_per_az == var.qurl_reverse_tunnel_server_desired_capacity_per_az
+        )
+        : (
+          var.qurl_reverse_tunnel_server_min_size_per_az == null
+          && var.qurl_reverse_tunnel_server_max_size_per_az == null
+          && var.frps_min_size == var.frps_max_size
+          && var.frps_max_size == var.frps_desired_capacity
+        )
+      )
+      error_message = "deploy_frps requires fixed-size fleet sizing in exactly one form: per-AZ form requires ALL THREE of qurl_reverse_tunnel_server_{min_size,max_size,desired_capacity}_per_az to be set AND equal; legacy form requires qurl_reverse_tunnel_server_*_per_az to be null AND frps_min_size == frps_max_size == frps_desired_capacity. Half-mixes (e.g., only desired_capacity_per_az set) silently fall back to legacy `min_size` for the unset half, breaking the fixed-size guarantee. Pick one form fully."
+    }
+    precondition {
+      # qurl-reverse-tunnel-server blue/green and canary are mutually exclusive; both own
+      # the ASG `desired_capacity` field. Sandbox flips blue/green;
+      # prod flips canary. A double-flip would sit in a state where
+      # CI can't tell which control plane is authoritative.
+      condition     = !(var.enable_qurl_reverse_tunnel_server_blue_green && var.enable_qurl_reverse_tunnel_server_canary)
+      error_message = "enable_qurl_reverse_tunnel_server_blue_green and enable_qurl_reverse_tunnel_server_canary are mutually exclusive — both own the ASG desired_capacity field. Pick one."
+    }
+    precondition {
+      # MULTIVALUE routing required once steady-state goes above 1/AZ
+      # (router-side HRW needs the full A-record set). The module also
+      # checks this; the duplicate root-level fence makes the error
+      # surface in `terraform plan` against tfvars instead of inside
+      # the module's count-gated graph.
+      condition = (
+        var.qurl_reverse_tunnel_server_cloud_map_routing_policy == "MULTIVALUE"
+        || (
+          var.qurl_reverse_tunnel_server_desired_capacity_per_az != null
+          ? var.qurl_reverse_tunnel_server_desired_capacity_per_az <= 1
+          : var.frps_desired_capacity <= length(var.frps_az_suffixes)
+        )
+      )
+      error_message = "qurl_reverse_tunnel_server_cloud_map_routing_policy = \"WEIGHTED\" only supports up to 1 instance per AZ. Flip to \"MULTIVALUE\" before raising desired_capacity above length(frps_az_suffixes) — see traefik-plugins #134 for the router-side HRW that needs the full A-record set."
+    }
+    precondition {
+      # HRW only makes sense with MULTIVALUE routing — WEIGHTED returns
+      # a single A record per query, so HRW would always pick that one
+      # IP and the dispatch decision wouldn't actually steer traffic.
+      condition     = !var.enable_instance_hrw || var.qurl_reverse_tunnel_server_cloud_map_routing_policy == "MULTIVALUE"
+      error_message = "enable_instance_hrw = true requires qurl_reverse_tunnel_server_cloud_map_routing_policy = \"MULTIVALUE\" — HRW needs the full healthy-IP set to make a non-trivial dispatch decision. With WEIGHTED routing, DNS only returns one A record per query."
     }
   }
 }
@@ -1180,12 +1293,35 @@ module "qurl_reverse_tunnel_server" {
   # Instance configuration
   instance_type = var.frps_instance_type
 
-  # ASG sizing — env tfvars flip to one-per-AZ (3/3/3) once the
-  # cross-repo per-AZ contract lands (#1499). Module defaults remain
-  # 1/1/1 so the module can still be consumed in isolation.
-  min_size         = var.frps_min_size
-  max_size         = var.frps_max_size
-  desired_capacity = var.frps_desired_capacity
+  # ASG sizing — two parallel forms supported:
+  #   - Legacy explicit triple (frps_min_size/max_size/desired_capacity).
+  #     Default 1/1/1; existing tfvars set 3/3/3 to express 1-per-AZ on
+  #     a 3-AZ deploy. Continues working unchanged when per-AZ vars are
+  #     null.
+  #   - Per-AZ form (qurl_reverse_tunnel_server_*_per_az). When set,
+  #     overrides the legacy triple and computes effective sizes as
+  #     `per_az * length(suffixes)`. PR 4 will set
+  #     qurl_reverse_tunnel_server_desired_capacity_per_az = 2 in prod
+  #     tfvars to flip to 2/AZ steady-state.
+  # Resolution happens inside the module (see local.effective_* in
+  # modules/qurl-reverse-tunnel-server/main.tf).
+  min_size                = var.frps_min_size
+  max_size                = var.frps_max_size
+  desired_capacity        = var.frps_desired_capacity
+  min_size_per_az         = var.qurl_reverse_tunnel_server_min_size_per_az
+  max_size_per_az         = var.qurl_reverse_tunnel_server_max_size_per_az
+  desired_capacity_per_az = var.qurl_reverse_tunnel_server_desired_capacity_per_az
+
+  # Cloud Map per-AZ routing policy. Default WEIGHTED is back-compat;
+  # PR 4 flips to MULTIVALUE to support router-side HRW (traefik-plugins
+  # #134) and the 2/AZ steady-state distribution.
+  cloud_map_routing_policy = var.qurl_reverse_tunnel_server_cloud_map_routing_policy
+
+  # Blue/green deployment (sandbox-targeted). Default false; mutually
+  # exclusive with the canary form below — enforced by precondition in
+  # `terraform_data.frps_preconditions` above.
+  enable_blue_green             = var.enable_qurl_reverse_tunnel_server_blue_green
+  green_standby_capacity_per_az = var.qurl_reverse_tunnel_server_green_standby_capacity_per_az
 
   # Per-AZ Cloud Map suffixes — must agree with the qurl-service env vars
   # below (QURL_FRPS_AZ_SUFFIXES) and with the upstream `frpc` consumption
@@ -1226,10 +1362,11 @@ module "qurl_reverse_tunnel_server" {
   alarm_sns_topic_arn      = module.monitoring.sns_topic_arn
 }
 
-# State move for the qurl-frps → qurl-reverse-tunnel-server rebrand. Address
-# changed from `module.qurl_frps[*]` to `module.qurl_reverse_tunnel_server[*]`
-# without rebuilding any resources. Safe to remove once every workspace has
-# applied this commit.
+# State move for the qurl-frps → qurl-reverse-tunnel-server rebrand
+# (#1742). Address changed from `module.qurl_frps[*]` to
+# `module.qurl_reverse_tunnel_server[*]` without rebuilding any
+# resources. Safe to remove once every workspace has applied this
+# commit.
 moved {
   from = module.qurl_frps
   to   = module.qurl_reverse_tunnel_server

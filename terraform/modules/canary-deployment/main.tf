@@ -11,6 +11,47 @@ locals {
 }
 
 # ==============================================================================
+# Cross-variable preconditions
+# ==============================================================================
+# `component = "frps"` MUST be paired with `disable_nlb_health_checks = true`
+# — qurl-reverse-tunnel-server has no NLB, so the NLB-keyed alarms would sit in
+# INSUFFICIENT_DATA forever and the canary state machine would never
+# advance. Conversely, `component` in {"server","ac"} with
+# `disable_nlb_health_checks = true` would silently skip NLB health
+# fences on a component that DOES have an NLB, hiding rollout-time
+# regressions. Both half-mixes fail at plan time.
+resource "terraform_data" "component_invariants" {
+  lifecycle {
+    precondition {
+      condition     = var.component != "frps" || var.disable_nlb_health_checks
+      error_message = "component = \"frps\" requires disable_nlb_health_checks = true — qurl-reverse-tunnel-server has no NLB and the NLB-keyed alarms would sit in INSUFFICIENT_DATA forever, blocking the canary from advancing."
+    }
+    precondition {
+      condition     = !contains(["server", "ac"], var.component) || !var.disable_nlb_health_checks
+      error_message = "component in {\"server\",\"ac\"} with disable_nlb_health_checks = true would skip NLB-keyed health alarms on a component that has an NLB. Either pass `component = \"frps\"` or leave `disable_nlb_health_checks = false`."
+    }
+    precondition {
+      # NLB / target-group ARN suffixes must be empty when NLB checks are
+      # disabled (so the canary_unhealthy / canary_low_healthy alarms
+      # stay un-instantiated) and non-empty otherwise (so the dimensions
+      # on those alarms actually point at a real target group). The
+      # plan-time check uses AND-empty (both must be empty under
+      # disabled) — strictly more conservative than the runtime
+      # `_check_nlb_mode_consistency` any-empty rule. The runtime check
+      # in canary_orchestrator.py is tightened in lockstep to AND-empty
+      # so plan-time and runtime agree on the precise "half-mix
+      # rejected" set; a future relaxation needs to update both.
+      condition = (
+        var.disable_nlb_health_checks
+        ? var.nlb_arn_suffix == "" && var.target_group_arn_suffix == ""
+        : var.nlb_arn_suffix != "" && var.target_group_arn_suffix != ""
+      )
+      error_message = "nlb_arn_suffix and target_group_arn_suffix must be empty when disable_nlb_health_checks = true (frps), and non-empty otherwise (server/ac). Half-mix would either dangle an alarm against an empty TG dimension or silently skip the alarms on a component that has an NLB."
+    }
+  }
+}
+
+# ==============================================================================
 # Step Functions State Machine
 # ==============================================================================
 

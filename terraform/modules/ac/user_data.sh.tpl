@@ -1191,6 +1191,14 @@ cat >> /home/ubuntu/traefik/dynamic.toml << QURLDYNAMICEOF
   circuitBreakerThreshold = 5
   circuitBreakerTimeout = 30
   evictionPercent = 10
+  # Router-side HRW dispatch (traefik-plugins #134). Default false in
+  # PR 3; PR 4 prod tfvars flips enableInstanceHrw=true once the
+  # qurl-reverse-tunnel-server fleet is at 2/AZ on MULTIVALUE Cloud Map
+  # routing. The plugin reads instanceDiscoveryTtl as the freshness
+  # window for boundary→IP resolution — IPs aged out of the window
+  # are not dialable.
+  enableInstanceHrw = ${qurl_router_enable_instance_hrw}
+  instanceDiscoveryTtl = ${qurl_router_instance_discovery_ttl_seconds}
   # frpServerUrl deliberately empty: with the per-AZ qurl-reverse-tunnel-server
   # fleet (#1499), there's no single backend to point at — each customer's
   # tunnel lives on a specific AZ-pinned instance, and qurl-router reads the

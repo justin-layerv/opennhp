@@ -353,3 +353,237 @@ variable "desired_capacity" {
     error_message = "desired_capacity must be an integer >= 1 — see min_size for rationale (qurl-reverse-tunnel-server is the only path for tunnel traffic)."
   }
 }
+
+# ==================== Per-AZ ASG Sizing (preferred) ====================
+# Per-AZ sizing knobs. When set (non-null), they OVERRIDE the legacy
+# `min_size`/`max_size`/`desired_capacity` triple by computing the
+# effective single-ASG fleet size as `per_az * length(frps_az_suffixes)`.
+#
+# Default null preserves backwards compatibility: existing callers that set
+# the legacy triple keep working unchanged. New callers should prefer the
+# per-AZ form because it expresses the actual operational invariant —
+# "N instances per AZ, summed across the AZ suffix list" — instead of
+# repeating an arithmetic product in tfvars that drifts when
+# `frps_az_suffixes` changes.
+#
+# Effective value precedence (see `local.effective_*` in main.tf):
+#   - per-AZ var set (non-null)  → per_az * length(frps_az_suffixes)
+#   - per-AZ var null            → legacy triple (min_size/max_size/desired_capacity)
+#
+# Validation block on each per-AZ var rejects fractional values; the
+# composition rule (min ≤ desired ≤ max) is enforced once, post-resolution,
+# in `aws_autoscaling_group.frps` via the existing `precondition` so
+# either form (legacy, per-AZ, or even a half-mix during a migration plan)
+# fails plan with the same error message.
+
+variable "desired_capacity_per_az" {
+  description = <<-EOT
+    Per-AZ ASG desired capacity. When set (non-null), the module computes the
+    effective ASG `desired_capacity` as `desired_capacity_per_az *
+    length(frps_az_suffixes)` and the legacy `desired_capacity` variable is
+    ignored. Default null keeps the legacy triple (`min_size`/`max_size`/
+    `desired_capacity`) as the source of truth for backwards compatibility.
+
+    PR sequence: this variable's introduction (PR 3) defaults null so it's a
+    no-op for current deploys. PR 4 sets `desired_capacity_per_az = 2` in
+    prod tfvars to flip the steady-state distribution from 1/AZ to 2/AZ
+    once the router-side HRW dispatch is enabled (traefik-plugins #134).
+  EOT
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.desired_capacity_per_az == null || (var.desired_capacity_per_az >= 1 && floor(var.desired_capacity_per_az) == var.desired_capacity_per_az)
+    error_message = "desired_capacity_per_az must be null or an integer >= 1 — qurl-reverse-tunnel-server must have at least one instance per AZ; fractional values are rejected at plan time rather than at the ASG API."
+  }
+}
+
+variable "min_size_per_az" {
+  description = <<-EOT
+    Per-AZ ASG minimum size. When set (non-null), the module computes the
+    effective ASG `min_size` as `min_size_per_az * length(frps_az_suffixes)`
+    and the legacy `min_size` variable is ignored. Default null keeps the
+    legacy `min_size` as the source of truth.
+  EOT
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.min_size_per_az == null || (var.min_size_per_az >= 1 && floor(var.min_size_per_az) == var.min_size_per_az)
+    error_message = "min_size_per_az must be null or an integer >= 1 — see desired_capacity_per_az."
+  }
+}
+
+variable "max_size_per_az" {
+  description = <<-EOT
+    Per-AZ ASG maximum size. When set (non-null), the module computes the
+    effective ASG `max_size` as `max_size_per_az * length(frps_az_suffixes)`
+    and the legacy `max_size` variable is ignored. Default null keeps the
+    legacy `max_size` as the source of truth.
+
+    Default null also means "fixed-size fleet" remains the safe default —
+    autoscaling above the steady-state distribution requires explicitly
+    setting this to a value strictly greater than `desired_capacity_per_az`,
+    which a separate `precondition` in `aws_autoscaling_group.frps` checks.
+  EOT
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.max_size_per_az == null || (var.max_size_per_az >= 1 && floor(var.max_size_per_az) == var.max_size_per_az)
+    error_message = "max_size_per_az must be null or an integer >= 1 — see desired_capacity_per_az."
+  }
+}
+
+# ==================== Cloud Map Routing Policy ====================
+# Per-AZ Cloud Map services support either WEIGHTED (current default,
+# returns one A record per query) or MULTIVALUE (returns the full set
+# of healthy A records, up to 8). The router-side HRW work in
+# traefik-plugins #134 needs MULTIVALUE so qurl-router sees every
+# healthy instance and can hash a resource_id to a specific instance
+# IP. Frpc (qurl-reverse-tunnel-client) does the same on the dial side.
+#
+# Default WEIGHTED preserves the existing 1-instance-per-AZ behavior
+# unchanged. Set MULTIVALUE in tfvars before flipping
+# desired_capacity_per_az above 1 — running 2/AZ on WEIGHTED would
+# leave half the instances unreachable to the router (bias-uniform A-
+# record selection picks one IP at random per query, and the
+# qurl-router's per-resource cache would then send all traffic for
+# that resource to one of the two instances arbitrarily, defeating the
+# whole point of HRW dispatch).
+#
+# The plan-time precondition in `aws_service_discovery_service.frps_per_az`
+# rejects WEIGHTED + (effective desired > length(frps_az_suffixes)) so the
+# misconfiguration above can't ship.
+variable "cloud_map_routing_policy" {
+  description = <<-EOT
+    DNS routing policy for the per-AZ Cloud Map services. One of:
+
+      "WEIGHTED"   - (default, backwards compatible) A query returns ONE
+                     A record per response, weight-biased. Correct for
+                     1-instance-per-AZ; returns a single instance IP that
+                     both frpc and qurl-router converge on via the API-
+                     supplied `frps_addr`.
+      "MULTIVALUE" - A query returns the FULL set of healthy A records
+                     (up to 8). Required when running >1 instance per AZ
+                     so router-side HRW (traefik-plugins #134) can hash
+                     a resource_id to a specific instance IP.
+
+    Set to "MULTIVALUE" before flipping `desired_capacity_per_az` above 1.
+    A precondition in `aws_service_discovery_service.frps_per_az` rejects
+    `WEIGHTED + effective_desired > length(frps_az_suffixes)` at plan time.
+
+    Replacement semantics: AWS Cloud Map's `UpdateService` API does NOT
+    accept a new `RoutingPolicy` (only Description, DnsRecords, and
+    HealthCheckConfig.FailureThreshold are mutable in place). The
+    provider therefore marks `dns_config.routing_policy` as ForceNew —
+    flipping this variable from WEIGHTED → MULTIVALUE in PR 4 produces
+    a REPLACEMENT plan for every per-AZ service (and, when blue/green
+    is enabled, every green service too). Service IDs change → user_data
+    template inputs change → launch-template version bumps → instance
+    refresh fires.
+
+    PR 4 cutover sequence (sandbox blue/green path):
+      1. Pre-stage: blue/green ALREADY enabled with green at warm
+         standby. Blue is serving traffic, green is dormant on the
+         OLD service IDs.
+      2. Apply MULTIVALUE flip: terraform replaces both blue and green
+         per-AZ services in one apply. Existing instance registrations
+         on the OLD services are dropped at delete time.
+      3. New instances launched from the bumped LT register against
+         the NEW service IDs in user_data. There is a brief window
+         (≤ 30s DNS TTL × instance launch time) where DNS for
+         `frps-$${suffix}.$${namespace}` resolves NXDOMAIN. The
+         qurl-service `frps_addr` emitter must be SSM-pinned to the
+         new IDs out-of-band before traffic shifts.
+      4. After all instances re-register, the qurl-service flip is
+         a normal blue→green ASG color change.
+
+    PR 4 cutover sequence (prod canary path):
+      The canary state machine refreshes instances in checkpoints
+      (20% → 50% → 100%). Each checkpoint window is the same window
+      as above on a smaller scale. The CloudWatch composite alarm
+      will trip if any checkpoint stalls in NXDOMAIN — confirm the
+      empty-AZ alarm (#1542) thresholds are tight enough to catch
+      a half-cutover before customer traffic is impacted.
+
+    A precondition in `aws_service_discovery_service.frps_per_az`
+    rejects WEIGHTED + (effective desired > length(frps_az_suffixes))
+    so the misconfiguration "2/AZ on WEIGHTED" can't ship — but no
+    fence covers the transition itself. The fence above is the
+    runbook responsibility.
+  EOT
+  type        = string
+  default     = "WEIGHTED"
+
+  validation {
+    condition     = contains(["WEIGHTED", "MULTIVALUE"], var.cloud_map_routing_policy)
+    error_message = "cloud_map_routing_policy must be \"WEIGHTED\" or \"MULTIVALUE\". AWS supports a third value (\"WEIGHTED_RANDOM\") on a different shape of service; qurl-reverse-tunnel-server only uses A-record DNS namespaces, so accept only the two policies that apply."
+  }
+}
+
+# ==================== Blue/Green Deployment ====================
+# Mirrors `modules/ac/blue_green.tf`. When enabled, the module also
+# provisions a green ASG, a parallel set of green per-AZ Cloud Map
+# services (`frps-green-${suffix}.${namespace}`), and SSM parameters
+# (active-color / blue-asg-name / green-asg-name / etc.) that CI/CD
+# scripts read to flip `frps_addr` resolution from blue → green during
+# a deploy.
+#
+# Default false keeps the module a no-op for current deploys. Sandbox
+# is the first env to flip this on; prod stays on the canary path
+# (see `enable_canary` below).
+
+variable "enable_blue_green" {
+  description = <<-EOT
+    Enable blue/green deployment for qurl-reverse-tunnel-server.
+
+    When true, the module provisions:
+      - One green ASG sized to match the blue ASG (effective sizing) —
+        warm-standby capacity managed by `green_standby_capacity_per_az`.
+      - One green per-AZ Cloud Map service per AZ suffix
+        (`frps-green-$${suffix}.$${namespace}`). Active-color SSM parameter
+        steers `frps_addr` resolution downstream.
+      - SSM parameters: active-color, last-switch-timestamp, blue-asg-name,
+        green-asg-name, plus per-color image-tag parameters (CI updates).
+
+    Default false keeps the module a no-op for current deploys. Mutually
+    exclusive with `enable_canary` (a precondition rejects both true).
+
+    Note: qurl-reverse-tunnel-server has no NLB/target group — Cloud Map A-record
+    resolution is the routing layer. The blue/green flip therefore
+    targets the Cloud Map service identity (CI rewrites `frps_addr`
+    in the QURL API to point at green's per-AZ services), not a
+    listener default-action change as on the AC module.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "green_standby_capacity_per_az" {
+  description = <<-EOT
+    Per-AZ desired capacity for the green ASG when in standby (active
+    color = blue). N = N-instance warm standby (flip is instant once
+    capacity is reached); 0 = cold standby (CI must scale-up before
+    flipping).
+
+    Default `null` means "track `min_size_per_az` when set, else 1" — so
+    the resolved standby always satisfies `min ≤ desired ≤ max` without
+    the operator having to keep two knobs in lockstep across files. PR 4
+    (which sets `min_size_per_az = 2`) gets `effective_standby = 2`
+    automatically; an env that wants cold standby can set this explicitly
+    to `0`.
+
+    Effective green ASG `desired_capacity` is the resolved
+    `effective_standby * length(frps_az_suffixes)`.
+
+    Ignored when `enable_blue_green = false`.
+  EOT
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.green_standby_capacity_per_az == null || (var.green_standby_capacity_per_az >= 0 && var.green_standby_capacity_per_az <= 10 && floor(var.green_standby_capacity_per_az) == var.green_standby_capacity_per_az)
+    error_message = "green_standby_capacity_per_az must be null (auto-track min_size_per_az or 1) or an integer between 0 and 10. Floor at 0 = cold standby; ceiling at 10 catches typos that would provision an absurdly large warm fleet."
+  }
+}

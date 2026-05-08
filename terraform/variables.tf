@@ -1389,6 +1389,70 @@ variable "qurl_router_cache_shards" {
   default     = 16
 }
 
+# ==================== qurl-router HRW (instance-level dispatch) ====================
+# traefik-plugins #134 introduced opt-in router-side HRW: when enabled, the
+# qurl-router plugin resolves the boundary hostname (per-AZ Cloud Map service)
+# to the full set of healthy A records and hashes a resource_id to a specific
+# instance IP via the hrw.go package. Off by default — flips to true in PR 4
+# once PR 1 (traefik-plugins) and PR 2 (qurl-reverse-tunnel-client) are
+# deployed and validated.
+#
+# Cross-repo HRW contract (consumed by both qurl-router and frpc):
+#   - Hash function: sha256(resource_id || "\x00" || instance_endpoint_string)
+#   - Score = first 8 bytes of digest, big-endian uint64
+#   - Pick: max score, tie-break lexicographically smallest endpoint
+#   - Empty instance set → fall back to boundary-level dispatch
+# Both router and frpc must use the same algorithm; golden test vectors live
+# in the traefik-plugins PR (#134) `hrw_test.go`.
+variable "enable_instance_hrw" {
+  description = <<-EOT
+    Enable router-side HRW dispatch in the qurl-router Traefik plugin.
+
+    When true, the plugin resolves the boundary hostname (per-AZ Cloud Map
+    service) to the full set of healthy A records and hashes the
+    resource_id to one of them via HRW (highest random weight). When
+    false (the default, current behavior), the plugin proxies to the
+    boundary hostname and lets DNS pick one A record per query.
+
+    Default false preserves existing behavior. Flip to true in PR 4
+    after PR 1 (traefik-plugins #134) and PR 2 (qurl-reverse-tunnel-
+    client) are deployed and the matching dial-side HRW is live in
+    frpc. PR 3 (this PR) only adds the plumbing — it doesn't flip the
+    flag in any tfvars.
+
+    Requires Cloud Map MULTIVALUE routing on the qurl-reverse-tunnel-server services
+    (see `var.qurl_reverse_tunnel_server_cloud_map_routing_policy`); otherwise DNS only
+    returns one IP per query and HRW degenerates to "always pick the
+    same instance".
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "instance_discovery_ttl_seconds" {
+  description = <<-EOT
+    TTL in seconds for the qurl-router instance-IP allowlist. The plugin
+    resolves boundary hostnames into instance IPs and accepts those IPs
+    as dialable for this many seconds before re-resolving.
+
+    Default 20 matches the plugin code default (traefik-plugins #134;
+    `qurl-router/discovery.go::DefaultDiscoveryTTL`). Lower values mean
+    faster reaction to scale events at the cost of more DNS lookups;
+    higher values risk dialing IPs that have rotated out of the
+    boundary's healthy set.
+
+    Ignored when `enable_instance_hrw = false` — the discovery path only
+    runs in HRW mode.
+  EOT
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.instance_discovery_ttl_seconds >= 1 && var.instance_discovery_ttl_seconds <= 600 && floor(var.instance_discovery_ttl_seconds) == var.instance_discovery_ttl_seconds
+    error_message = "instance_discovery_ttl_seconds must be an integer between 1 and 600. Floor 1s catches the typo `0` (no caching at all); ceiling 10min catches a typo that would make HRW resolve against multi-minute-stale IP sets."
+  }
+}
+
 # ==================== Security Alerting ====================
 
 variable "guardduty_alert_emails" {
@@ -1870,6 +1934,146 @@ variable "frps_desired_capacity" {
     condition     = var.frps_desired_capacity >= 1 && floor(var.frps_desired_capacity) == var.frps_desired_capacity
     error_message = "frps_desired_capacity must be an integer >= 1 — see frps_min_size."
   }
+}
+
+# Per-AZ sizing form. Default null preserves the legacy explicit triple
+# (frps_min_size / frps_max_size / frps_desired_capacity) as the source
+# of truth so existing tfvars keep working unchanged. When set, the
+# module computes effective sizes as `per_az * length(frps_az_suffixes)`
+# and the legacy vars are ignored — see
+# `terraform/modules/qurl-reverse-tunnel-server/variables.tf` for the resolution rule.
+#
+# PR 4 will set `qurl_reverse_tunnel_server_desired_capacity_per_az = 2` in prod tfvars
+# to flip steady-state from 1/AZ to 2/AZ once router-side HRW is on.
+
+variable "qurl_reverse_tunnel_server_desired_capacity_per_az" {
+  description = <<-EOT
+    Per-AZ ASG desired capacity for qurl-reverse-tunnel-server. When set
+    (non-null), the module computes effective `desired_capacity` as
+    `qurl_reverse_tunnel_server_desired_capacity_per_az * length(frps_az_suffixes)` and the
+    legacy `frps_desired_capacity` variable is ignored.
+
+    Default null keeps the legacy triple as the source of truth — same
+    effective sizing as before this PR for any existing caller.
+  EOT
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.qurl_reverse_tunnel_server_desired_capacity_per_az == null || (var.qurl_reverse_tunnel_server_desired_capacity_per_az >= 1 && floor(var.qurl_reverse_tunnel_server_desired_capacity_per_az) == var.qurl_reverse_tunnel_server_desired_capacity_per_az)
+    error_message = "qurl_reverse_tunnel_server_desired_capacity_per_az must be null or an integer >= 1 — qurl-reverse-tunnel-server must have at least one instance per AZ."
+  }
+}
+
+variable "qurl_reverse_tunnel_server_min_size_per_az" {
+  description = "Per-AZ ASG min size for qurl-reverse-tunnel-server. See qurl_reverse_tunnel_server_desired_capacity_per_az for the resolution rule. Default null keeps the legacy frps_min_size as the source of truth."
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.qurl_reverse_tunnel_server_min_size_per_az == null || (var.qurl_reverse_tunnel_server_min_size_per_az >= 1 && floor(var.qurl_reverse_tunnel_server_min_size_per_az) == var.qurl_reverse_tunnel_server_min_size_per_az)
+    error_message = "qurl_reverse_tunnel_server_min_size_per_az must be null or an integer >= 1 — see qurl_reverse_tunnel_server_desired_capacity_per_az."
+  }
+}
+
+variable "qurl_reverse_tunnel_server_max_size_per_az" {
+  description = "Per-AZ ASG max size for qurl-reverse-tunnel-server. See qurl_reverse_tunnel_server_desired_capacity_per_az for the resolution rule. Default null keeps the legacy frps_max_size as the source of truth."
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.qurl_reverse_tunnel_server_max_size_per_az == null || (var.qurl_reverse_tunnel_server_max_size_per_az >= 1 && floor(var.qurl_reverse_tunnel_server_max_size_per_az) == var.qurl_reverse_tunnel_server_max_size_per_az)
+    error_message = "qurl_reverse_tunnel_server_max_size_per_az must be null or an integer >= 1 — see qurl_reverse_tunnel_server_desired_capacity_per_az."
+  }
+}
+
+variable "qurl_reverse_tunnel_server_cloud_map_routing_policy" {
+  description = <<-EOT
+    DNS routing policy for the qurl-reverse-tunnel-server per-AZ Cloud Map services. One of:
+
+      "WEIGHTED"   - (default, backwards compatible) one A record per
+                     query. Correct for 1-instance-per-AZ.
+      "MULTIVALUE" - full healthy A-record set per query (up to 8).
+                     Required when running >1 instance per AZ so router-
+                     side HRW (traefik-plugins #134) can hash a resource
+                     to a specific instance.
+
+    PR 4 flips this to MULTIVALUE in prod tfvars alongside
+    `qurl_reverse_tunnel_server_desired_capacity_per_az = 2`. Sandbox flips earlier as
+    part of validation. A precondition in the qurl-reverse-tunnel-server module rejects
+    `WEIGHTED + effective_desired > length(frps_az_suffixes)`.
+
+    Replacement semantics: AWS Cloud Map does NOT support in-place
+    `routing_policy` updates — the provider marks the field ForceNew.
+    The PR 4 flip will produce a REPLACEMENT plan for every per-AZ
+    service (and every green service when blue/green is enabled).
+    See `terraform/modules/qurl-reverse-tunnel-server/variables.tf`
+    for the full sequencing implications.
+  EOT
+  type        = string
+  default     = "WEIGHTED"
+
+  validation {
+    condition     = contains(["WEIGHTED", "MULTIVALUE"], var.qurl_reverse_tunnel_server_cloud_map_routing_policy)
+    error_message = "qurl_reverse_tunnel_server_cloud_map_routing_policy must be \"WEIGHTED\" or \"MULTIVALUE\"."
+  }
+}
+
+variable "enable_qurl_reverse_tunnel_server_blue_green" {
+  description = <<-EOT
+    Enable blue/green deployment for qurl-reverse-tunnel-server. Sandbox-targeted by the
+    PR 3 → PR 4 rollout; mirrors `modules/ac/blue_green.tf` adapted for
+    Cloud Map routing (no NLB on qurl-reverse-tunnel-server).
+
+    Default false keeps the module a no-op for existing deploys. Mutually
+    exclusive with `enable_qurl_reverse_tunnel_server_canary` — a precondition in
+    `terraform/main.tf` rejects both true.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "qurl_reverse_tunnel_server_green_standby_capacity_per_az" {
+  description = <<-EOT
+    Per-AZ desired capacity for the qurl-reverse-tunnel-server green ASG when in standby.
+
+    Default `null` resolves to "track `min_size_per_az` when set, else
+    1" inside the module — so PR 4's `min_size_per_az = 2` flip
+    automatically gives `effective_standby = 2` without the operator
+    having to keep two knobs in lockstep across files. Set explicitly
+    to a non-null value for cold standby (`0`) or other custom shapes.
+
+    Effective green ASG `desired_capacity` is
+    `effective_standby_per_az * length(frps_az_suffixes)`.
+    Ignored when `enable_qurl_reverse_tunnel_server_blue_green = false`.
+  EOT
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.qurl_reverse_tunnel_server_green_standby_capacity_per_az == null || (var.qurl_reverse_tunnel_server_green_standby_capacity_per_az >= 0 && var.qurl_reverse_tunnel_server_green_standby_capacity_per_az <= 10 && floor(var.qurl_reverse_tunnel_server_green_standby_capacity_per_az) == var.qurl_reverse_tunnel_server_green_standby_capacity_per_az)
+    error_message = "qurl_reverse_tunnel_server_green_standby_capacity_per_az must be null (auto-track) or an integer between 0 and 10."
+  }
+}
+
+variable "enable_qurl_reverse_tunnel_server_canary" {
+  description = <<-EOT
+    Enable canary deployment for qurl-reverse-tunnel-server via the canary-deployment
+    module (instantiated as `module.canary_deployment_qurl_reverse_tunnel_server`).
+    Prod-targeted by the PR 3 → PR 4 rollout.
+
+    The canary-deployment module's NLB-keyed alarms are auto-disabled
+    for the qurl-reverse-tunnel-server path via `disable_nlb_health_checks = true`
+    (qurl-reverse-tunnel-server has no NLB; the orchestrator falls back to ASG-instance
+    health). The Cloud Map empty-AZ alarm (#1542) covers the routing-
+    layer fault class instead.
+
+    Default false keeps the module a no-op for existing deploys.
+    Mutually exclusive with `enable_qurl_reverse_tunnel_server_blue_green` — a
+    precondition rejects both true.
+  EOT
+  type        = bool
+  default     = false
 }
 
 # Per-AZ Cloud Map services for the qurl-reverse-tunnel-server. Threaded
