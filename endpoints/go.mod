@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue v1.20.37
 	github.com/aws/aws-sdk-go-v2/service/cloudwatch v1.56.2
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.57.3
-	github.com/aws/aws-sdk-go-v2/service/servicediscovery v1.39.27
+	github.com/aws/aws-sdk-go-v2/service/servicediscovery v1.39.28
 	github.com/cilium/ebpf v0.21.0
 	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/fengyily/nhp-plugins-sdk v0.1.30
