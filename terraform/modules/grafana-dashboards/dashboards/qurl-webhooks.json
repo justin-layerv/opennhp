@@ -42,6 +42,12 @@
       "type": "link",
       "url": "/d/qurl-business/qurl-business-metrics?var-environment=$environment&var-cell_id=$cell_id",
       "icon": "dashboard"
+    },
+    {
+      "title": "qURL Integrations",
+      "type": "link",
+      "url": "/d/qurl-integrations-$environment/qurl-integrations?var-cell_id=$cell_id",
+      "icon": "dashboard"
     }
   ],
   "templating": {

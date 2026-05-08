@@ -56,7 +56,15 @@ resource "grafana_dashboard" "operations" {
 }
 
 # QURL Business Dashboard
-# Monitors business metrics: QURLs created, tokens, quotas
+# Monitors business metrics: QURLs created, tokens, quotas.
+#
+# Datasource note: this dashboard is primarily Prometheus-backed but its
+# bottom "Integrations" row pulls Discord install/uninstall counts from
+# CloudWatch (QurlBot/* metric filters). The cw_datasource template var
+# in qurl-business.json resolves cleanly only when cloudwatch_datasource_enabled
+# is true. The check block below surfaces the coupling as a plan-time warning
+# so a future env that turns off CloudWatch sees a clear message instead of a
+# silently broken panel.
 resource "grafana_dashboard" "business" {
   count = var.create_dashboards ? 1 : 0
 
@@ -67,6 +75,13 @@ resource "grafana_dashboard" "business" {
   })
 
   overwrite = true
+}
+
+check "business_dashboard_cloudwatch_coupling" {
+  assert {
+    condition     = !var.create_dashboards || var.cloudwatch_datasource_enabled
+    error_message = "qurl-business.json's Integrations row queries CloudWatch (QurlBot/GuildInstall, GuildUninstall) and will render with a 'datasource not found' error in this env. Action: set grafana_cloudwatch_enabled = true in terraform/environments/{sandbox,prod}/terraform.tfvars (which propagates to cloudwatch_datasource_enabled here), or remove the Integrations row from dashboards/qurl-business.json if this env will not use CloudWatch."
+  }
 }
 
 # QURL Webhooks Dashboard
@@ -108,12 +123,15 @@ resource "grafana_data_source" "cloudwatch" {
 
   # Dashboard query targets use Grafana 11.x+ CloudWatch plugin format:
   # statistic (singular string), queryMode, metricQueryType, metricEditorMode.
-  # customMetricsNamespaces enables discovery of LayerV/NHP metrics in Grafana UI.
+  # customMetricsNamespaces enables discovery in Grafana's metric explorer UI:
+  # - LayerV/NHP — emitted by endpoints/server + endpoints/ac (this repo)
+  # - QurlBot — emitted by qurl-integrations-infra metric filters; rename here
+  #             if/when the namespace changes there (see qurl-bot-discord/terraform/monitoring.tf).
   json_data_encoded = jsonencode({
     defaultRegion           = var.aws_region
     authType                = "grafana_assume_role"
     assumeRoleArn           = local.cw_role_arn
-    customMetricsNamespaces = "LayerV/NHP"
+    customMetricsNamespaces = "LayerV/NHP,QurlBot"
   })
 }
 

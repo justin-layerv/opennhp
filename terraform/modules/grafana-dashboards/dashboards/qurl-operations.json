@@ -44,6 +44,12 @@
       "icon": "dashboard"
     },
     {
+      "title": "qURL Integrations",
+      "type": "link",
+      "url": "/d/qurl-integrations-$environment/qurl-integrations?var-cell_id=$cell_id",
+      "icon": "dashboard"
+    },
+    {
       "title": "NHP Infrastructure",
       "type": "link",
       "url": "/d/nhp-infrastructure/nhp-infrastructure?var-environment=$environment",

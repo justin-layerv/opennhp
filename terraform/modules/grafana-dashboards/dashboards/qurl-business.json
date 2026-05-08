@@ -39,6 +39,12 @@
       "icon": "dashboard"
     },
     {
+      "title": "qURL Integrations",
+      "type": "link",
+      "url": "/d/qurl-integrations-$environment/qurl-integrations?var-cell_id=$cell_id",
+      "icon": "dashboard"
+    },
+    {
       "title": "NHP Infrastructure",
       "type": "link",
       "url": "/d/nhp-infrastructure/nhp-infrastructure?var-environment=$environment",
@@ -72,6 +78,15 @@
           "text": ["All"],
           "value": ["$__all"]
         }
+      },
+      {
+        "name": "cw_datasource",
+        "type": "datasource",
+        "label": "CloudWatch",
+        "query": "cloudwatch",
+        "regex": "/CloudWatch \\($environment\\)/",
+        "hide": 2,
+        "current": {}
       }
     ]
   },
@@ -807,6 +822,75 @@
             }
           },
           "timeFrom": "30d"
+        }
+      ]
+    },
+    {
+      "id": 110,
+      "title": "Integrations",
+      "description": "Adoption signal from chat-platform integrations. Sourced from CloudWatch (QurlBot/* metric filters in qurl-integrations-infra) — distinct from the Prometheus-backed panels above.",
+      "type": "row",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 67},
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 111,
+          "title": "Discord Bot installs vs uninstalls",
+          "description": "Server-level adoption: new guilds joining (installs) vs removing (uninstalls) the qURL Discord bot. Installs filter out shard-ready replays so a session resume doesn't look like a spike. Look for installs > uninstalls trend; uninstalls > installs over a sustained window means net churn.",
+          "type": "timeseries",
+          "datasource": {"uid": "$cw_datasource", "type": "cloudwatch"},
+          "gridPos": {"h": 8, "w": 24, "x": 0, "y": 68},
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 0,
+              "color": {"mode": "palette-classic"},
+              "custom": {
+                "drawStyle": "bars",
+                "fillOpacity": 70,
+                "lineWidth": 1,
+                "barAlignment": 0
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {"id": "byName", "options": "Installs"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]
+              },
+              {
+                "matcher": {"id": "byName", "options": "Uninstalls"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]
+              }
+            ]
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "namespace": "QurlBot",
+              "metricName": "GuildInstall",
+              "period": "3600",
+              "region": "default",
+              "label": "Installs",
+              "statistic": "Sum",
+              "queryMode": "Metrics",
+              "metricQueryType": 0,
+              "metricEditorMode": 0,
+              "matchExact": false
+            },
+            {
+              "refId": "B",
+              "namespace": "QurlBot",
+              "metricName": "GuildUninstall",
+              "period": "3600",
+              "region": "default",
+              "label": "Uninstalls",
+              "statistic": "Sum",
+              "queryMode": "Metrics",
+              "metricQueryType": 0,
+              "metricEditorMode": 0,
+              "matchExact": false
+            }
+          ]
         }
       ]
     }

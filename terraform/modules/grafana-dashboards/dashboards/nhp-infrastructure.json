@@ -27,6 +27,12 @@
       "icon": "dashboard"
     },
     {
+      "title": "qURL Integrations",
+      "type": "link",
+      "url": "/d/qurl-integrations-$environment/qurl-integrations",
+      "icon": "dashboard"
+    },
+    {
       "title": "AWS Cost",
       "type": "link",
       "url": "/d/aws-cost-$environment/aws-cost?var-environment=$environment",
