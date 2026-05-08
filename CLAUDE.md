@@ -597,6 +597,66 @@ must update this list and audit all existing call sites.
   direct-AAK branch holds `r.mu` across reconcile to close the
   orphan-until-restart hole on that path.
 
+## AC Plugin Source-of-Truth Invariant
+
+The Traefik plugins on AC instances are pulled from
+`s3://layerv-nhp-{env}-plugins/traefik/<plugin>/latest/` at boot via
+`terraform/modules/ac/user_data.sh.tpl`. Three independent files must
+agree on the plugin list, or AC instances cycled by a canary boot
+into a degraded state:
+
+1. `terraform/environments/{env}/terraform.tfvars` — `traefik_plugins`
+   map. The `version = "latest"` entries here drive what `plugin_key`
+   resolves to in `terraform/modules/plugins/main.tf` (it's literal
+   string concat: `traefik/${k}/${v.version}/`).
+2. `.github/workflows/promote-to-prod.yml` — `TRAEFIK_PLUGIN_SPARSE_PATHS`
+   env on the `deploy-traefik-plugins` job. Drives both the
+   cross-repo sparse-checkout filter and the upload loop.
+3. `layervai/traefik-plugins` — must contain a directory at
+   `plugins-local/src/<plugin>/` for every entry in the lists above.
+
+The dangerous direction is **tfvars has plugin X, sparse-paths
+doesn't** → AC user_data 404s on boot. The job's preflight catches
+this (and missing `version` keys, and non-`"latest"` pins, and
+empty plugin directories) — but the structural lint that would
+catch it at lint time rather than at deploy time is tracked in
+issue #1750. Until that lands, the preflight is the only fence.
+
+The reverse direction (**sparse-paths has plugin Y, tfvars
+doesn't**) is **benign**: the workflow uploads to an S3 key AC
+never reads, wasting bandwidth but breaking nothing. Don't add a
+defensive lint that flags it — that direction has no failure mode.
+
+When the sandbox mirror in #1753 lands, this list grows from
+three files to five (sandbox tfvars + `build-and-push.yml`'s
+deploy-traefik-plugins-sandbox env). Update this doc in the same
+PR so future maintainers don't encode a stale 3-file invariant.
+
+When adding a new Traefik plugin:
+
+1. Land it in `layervai/traefik-plugins` (its own CI ships it to the
+   sandbox plugin bucket via `traefik-plugins/.github/workflows/deploy.yml`).
+2. Add the entry to **both** sandbox and prod `terraform.tfvars`
+   `traefik_plugins` maps with `version = "latest"`.
+3. Add `plugins-local/src/<plugin>` to `TRAEFIK_PLUGIN_SPARSE_PATHS`
+   in `promote-to-prod.yml`'s `deploy-traefik-plugins` job.
+4. Mirror the same change in `build-and-push.yml` once #1753 (sandbox
+   mirror) lands.
+
+If you forget step 2 or step 3, the prod promote's preflight fails
+loud with a copy-pasteable resolution.
+
+**Plugin renames** require a paired-PR landing across BOTH repos:
+the `layervai/traefik-plugins` PR that renames the directory must
+land in the same release window as the `nhp` PR that updates
+`TRAEFIK_PLUGIN_SPARSE_PATHS` and the `traefik_plugins` tfvars
+keys. The tfvars↔sparse-paths preflight catches additions and
+removals (drift in either list) but doesn't notice a *rename* if
+both lists are updated in lockstep — the failure mode for a
+half-landed rename is the directory-existence guard tripping at
+upload time, which is correct fail-loud behavior but is downstream
+of where you'd want the catch.
+
 ## Security Notes
 
 - Never commit secrets - use AWS Secrets Manager

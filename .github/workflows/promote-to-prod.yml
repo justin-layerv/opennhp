@@ -2243,18 +2243,31 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # =============================================================================
-  # DEPLOY AC - Via canary (Step Functions) with first-deploy fallback
+  # DEPLOY TRAEFIK PLUGINS - Push layervai/traefik-plugins HEAD to prod plugins S3
   # =============================================================================
-  deploy-ac:
-    name: Deploy Access Controller
-    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server]
-    # Same terraform-apply rule as deploy-server (issue #1322). The
-    # deploy-server clause preserves the chained-deploy contract: AC can
-    # run when only AC was selected, but not when server failed mid-chain.
-    # Asserted by tests/scripts/test_promote_to_prod_gating.py — a 4th
-    # image-deploy job needs the floor bumped in _assert_image_deploys
-    # AND must inherit the gate shape covered by APPLY_SUCCESS_RE /
-    # APPLY_SKIPPED_RE.
+  # AC user_data pulls Traefik plugins from layerv-nhp-prod-plugins/traefik/ on
+  # boot. Without a fresh upload here, AC instances cycled by the canary below
+  # would boot with stale plugins from the previous manual
+  # traefik-plugins/deploy.yml dispatch — the silent-drift class this job
+  # closes. Mirrors the NHP-bucket-upload half of that workflow; the SSM live
+  # push to running AC instances is intentionally not mirrored (the canary
+  # below cycles AC, fresh instances pull from S3 on boot).
+  #
+  # Sequenced AFTER deploy-server (not in parallel) so a server-deploy failure
+  # also blocks the plugin upload. Without that link, a failed server deploy
+  # would leave fresh plugins in s3://…/latest/ that no AC canary cycled
+  # against — and the next unscheduled ASG event (spot interruption, scale-
+  # out) would bring up an AC instance running unvalidated plugins. The
+  # ~30s of lost parallelism is cheap compared to that bucket-vs-running
+  # state asymmetry.
+  deploy-traefik-plugins:
+    name: Deploy Traefik Plugins
+    # `manifest` is intentionally NOT in `needs:`: this job doesn't
+    # consume `manifest.outputs.*`, and listing it would force a no-op
+    # ordering wait. The other deploy-* jobs DO need manifest for
+    # `effective_image_tag` etc.; this job's tag is the cross-repo
+    # plugins SHA, captured locally below.
+    needs: [preflight, terraform-plan, terraform-apply, deploy-server]
     if: |
       always() &&
       needs.preflight.result == 'success' &&
@@ -2263,6 +2276,481 @@ jobs:
         (!inputs.run_terraform && needs.terraform-apply.result == 'skipped')
       ) &&
       (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
+      inputs.deploy_ac
+    # Gated on `inputs.deploy_ac` (not a separate
+    # `inputs.deploy_traefik_plugins` flag) by design: Traefik plugins
+    # serve AC, so a promote that doesn't cycle AC has no instance to
+    # pick up new plugins. For a plugin-only emergency rollout that
+    # bypasses an AC cycle, dispatch
+    # `layervai/traefik-plugins/.github/workflows/deploy.yml`
+    # manually with `environment=prod` (kept as the escape hatch).
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PLUGIN_BUCKET: layerv-nhp-prod-plugins
+      # Sub-path inside the workspace where traefik-plugins is cloned. Kept
+      # in a sub-folder so the default workflow checkout (which provides
+      # ./.github/actions/setup-deploy) is not overwritten.
+      PLUGIN_REPO_PATH: traefik-plugins-src
+      # Source of truth for the workflow's plugin path list. Both the
+      # cross-repo sparse-checkout filter and the upload loop derive from
+      # this var, so adding a plugin is a one-line change. Format: one
+      # `plugins-local/src/<path>` line per plugin (the prefix is what
+      # actions/checkout's sparse-checkout filter takes; the upload loop
+      # strips it). Must mirror the keys in the `traefik_plugins` map of
+      # `terraform/environments/prod/terraform.tfvars` — that map is the
+      # ultimate source-of-truth for what AC user_data actually downloads.
+      # Specifically: a tfvars entry MISSING from this list silently skips
+      # its upload and AC user_data 404s when it tries to sync that plugin
+      # from S3. The reverse (extra entry here, not in tfvars) is benign
+      # (wasted S3 upload, AC never reads it). Structural lint of the
+      # missing-from-sparse-paths direction is tracked in #1750.
+      #
+      # The full three-file invariant (this env, prod tfvars, traefik-
+      # plugins repo directory) is documented in nhp/CLAUDE.md under
+      # "AC Plugin Source-of-Truth Invariant".
+      TRAEFIK_PLUGIN_SPARSE_PATHS: |
+        plugins-local/src/github.com/traefik/qurl-router
+      # Bound retry behavior for the s3 sync calls below. Default
+      # (`legacy`, 4 attempts) is fine; bumping to adaptive + 5 makes a
+      # transient S3 throttle blip self-heal instead of failing the
+      # whole promote on a one-off.
+      AWS_RETRY_MODE: adaptive
+      AWS_MAX_ATTEMPTS: '5'
+    steps:
+      # Default checkout of nhp so `./.github/actions/setup-deploy` resolves
+      # and the prod tfvars are available for the version-pin preflight below.
+      # Sparse-checkout limits the on-disk footprint to just those two paths;
+      # the rest of nhp isn't read by this job.
+      - name: Checkout nhp (sparse — composite action + prod tfvars)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          sparse-checkout: |
+            .github/actions
+            terraform/environments/prod/terraform.tfvars
+          sparse-checkout-cone-mode: false
+          # No git operations after checkout in this job (setup-deploy is
+          # a thin wrapper around aws-actions/configure-aws-credentials —
+          # no git access). Drop the GITHUB_TOKEN from .git/config so
+          # it's not co-resident with the prod AWS creds the next steps
+          # will hold. If setup-deploy ever grows a `git` step, that
+          # change MUST also flip this back to default (or scope to a
+          # narrower path).
+          persist-credentials: false
+
+      # Preflight: assert every entry in the prod traefik_plugins tfvars map
+      # has `version = "latest"`. AC user_data downloads from
+      # `traefik/<plugin>/<version>/`; this job uploads to the `latest/`
+      # prefix specifically. If a future tfvars edit pins to a SHA (e.g., to
+      # reduce blast radius during an incident), the latest/ uploads here
+      # become no-ops AC never reads — re-introducing the silent-drift class
+      # this job exists to close. Fail loud at preflight rather than ship
+      # ghost uploads.
+      - name: Preflight - assert prod tfvars pin to "latest"
+        run: |
+          set -euo pipefail
+          TFVARS=terraform/environments/prod/terraform.tfvars
+          # Extract entry-level `version = ...` inside traefik_plugins.
+          # Load-bearing assumptions:
+          #   - top-level `traefik_plugins = {` and its closing `}` are at
+          #     column 1 (terraform fmt -recursive enforces this in CI)
+          #   - entry-level keys (the per-plugin block's attributes) are
+          #     at exactly 4 spaces (terraform fmt's 2-space indent step
+          #     for nested levels)
+          # The 4-space anchor avoids matching a nested `version` key
+          # that could legally appear in `config = { "version" = "..." }`
+          # — that would be at 8 spaces, not 4. Trailing whitespace and
+          # `# comment` after the literal "latest" are tolerated.
+          NON_LATEST=$(awk '
+            /^traefik_plugins[[:space:]]*=[[:space:]]*\{/ { in_block = 1; next }
+            in_block && /^\}/ { in_block = 0; next }
+            in_block && /^    version[[:space:]]*=/ {
+              v = $0
+              sub(/^[^=]*=[[:space:]]*/, "", v)
+              if (v !~ /^"latest"[[:space:]]*(#.*)?$/) print v
+            }
+          ' "$TFVARS")
+          # Cross-check tfvars keys against TRAEFIK_PLUGIN_SPARSE_PATHS.
+          # The dangerous direction is "tfvars has plugin X, sparse-paths
+          # doesn't" — AC user_data would 404 on the missing S3 key.
+          # The reverse (extra entry here, not in tfvars) is benign:
+          # we upload to S3 keys AC never reads, wasting bandwidth but
+          # not breaking anything. An empty `traefik_plugins` map in
+          # tfvars passes silently because the comm output (one empty
+          # line) gets trimmed by `$(...)` to "" and then `[ -n ]`
+          # returns false — that's the correct behavior since "no
+          # plugins configured" is a valid state. Don't add a `| grep
+          # -v '^$'` filter to "fix" this; it would be redundant and
+          # mask the actual flow.
+          # Note: prod tfvars only uses quoted keys today; bare-key
+          # support (sandbox-shape) is tracked in #1750 alongside the
+          # full source-of-truth refactor.
+          TFVARS_KEYS=$(awk '
+            /^traefik_plugins[[:space:]]*=[[:space:]]*\{/ { in_block = 1; next }
+            in_block && /^\}/ { in_block = 0; next }
+            in_block && /^  "[^"]+"[[:space:]]*=[[:space:]]*\{/ {
+              sub(/^  "/, "")
+              sub(/".*/, "")
+              print
+            }
+          ' "$TFVARS" | sort -u)
+          SPARSE_KEYS=$(printf '%s\n' "$TRAEFIK_PLUGIN_SPARSE_PATHS" \
+            | sed -e 's|^plugins-local/src/||' -e '/^$/d' \
+            | sort -u)
+          MISSING_FROM_SPARSE=$(comm -23 <(echo "$TFVARS_KEYS") <(echo "$SPARSE_KEYS"))
+          # Defense-in-depth: count entry-opens vs version= lines. If
+          # any entry lacks a version key, terraform's type system
+          # rejects it at plan — but if the schema's ever loosened
+          # (e.g., default `version = "latest"`), this preflight would
+          # silently pass. Counting catches the gap independent of
+          # what the schema says.
+          ENTRY_COUNT=$(awk '
+            /^traefik_plugins[[:space:]]*=[[:space:]]*\{/ { in_block = 1; next }
+            in_block && /^\}/ { in_block = 0; next }
+            in_block && /^  "[^"]+"[[:space:]]*=[[:space:]]*\{/ { c++ }
+            END { print c + 0 }
+          ' "$TFVARS")
+          VERSION_COUNT=$(awk '
+            /^traefik_plugins[[:space:]]*=[[:space:]]*\{/ { in_block = 1; next }
+            in_block && /^\}/ { in_block = 0; next }
+            in_block && /^    version[[:space:]]*=/ { c++ }
+            END { print c + 0 }
+          ' "$TFVARS")
+          PREFLIGHT_FAILED=0
+          if [ -n "$NON_LATEST" ]; then
+            echo "::error::traefik_plugins[*].version in $TFVARS includes non-\"latest\" pins. This job uploads to s3://.../traefik/<plugin>/latest/, but AC user_data downloads from traefik/<plugin>/<version>/. Non-latest pins make latest/ uploads no-ops. Found:"
+            while IFS= read -r line; do
+              echo "  $line"
+            done <<<"$NON_LATEST"
+            PREFLIGHT_FAILED=1
+          fi
+          if [ -n "$MISSING_FROM_SPARSE" ]; then
+            echo "::error::tfvars traefik_plugins entries missing from TRAEFIK_PLUGIN_SPARSE_PATHS. AC user_data would 404 trying to download these. Add them to the env at the top of this job:"
+            while IFS= read -r line; do
+              echo "  - plugins-local/src/$line"
+            done <<<"$MISSING_FROM_SPARSE"
+            PREFLIGHT_FAILED=1
+          fi
+          if [ "$ENTRY_COUNT" -ne "$VERSION_COUNT" ]; then
+            echo "::error::traefik_plugins has $ENTRY_COUNT entries but only $VERSION_COUNT version= keys at entry-level indent. Every entry must declare version (today fenced by terraform's schema; this preflight is defense-in-depth against schema loosening)."
+            PREFLIGHT_FAILED=1
+          fi
+          if [ "$PREFLIGHT_FAILED" -eq 1 ]; then
+            exit 1
+          fi
+          echo "Preflight OK: all traefik_plugins versions pin to \"latest\"; tfvars keys all covered by TRAEFIK_PLUGIN_SPARSE_PATHS."
+
+      # Surface a missing OR invalid secret as an actionable preflight
+      # error rather than as an inscrutable `actions/checkout` 401/404.
+      # Probes a `git/refs/heads/main` endpoint specifically — that one
+      # requires the same Contents:Read permission `actions/checkout`
+      # needs, so a Metadata-only PAT (a common scope-level
+      # misconfiguration) is caught HERE rather than at checkout.
+      # The PAT-vs-App migration in #1765 will retire this once the
+      # App's auto-renewing tokens replace the human-issued PAT.
+      - name: Verify TRAEFIK_PLUGINS_READ_TOKEN is set and valid
+        env:
+          GH_TOKEN: ${{ secrets.TRAEFIK_PLUGINS_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::TRAEFIK_PLUGINS_READ_TOKEN secret is not set on layervai/nhp. Set a fine-grained PAT with Contents:Read on layervai/traefik-plugins as that secret name. See nhp/CLAUDE.md 'AC Plugin Source-of-Truth Invariant' for the full setup contract."
+            exit 1
+          fi
+          # Suppress the response body (we don't care about the SHA);
+          # let stderr through so an operator can distinguish 401 from
+          # 403 from 404 at preflight rather than guessing from
+          # `actions/checkout`'s less-specific error. GitHub Actions
+          # masks `secrets.*` values in workflow logs automatically,
+          # so the token can't leak via gh's stderr.
+          # Retry briefly on transient github.com 5xx so a single API
+          # blip doesn't fail an in-flight prod promote with TF already
+          # applied. AWS_RETRY_MODE handles the same class for the s3
+          # sync side; gh api needs its own loop.
+          ATTEMPTS=3
+          for i in $(seq 1 $ATTEMPTS); do
+            # `timeout 30s` so a hanging-but-not-erroring github.com
+            # call can't occupy the whole job's timeout-minutes — the
+            # retry loop only does its job if individual attempts fail
+            # within a bounded window. Capture the exit code so the
+            # final error message can distinguish 124 (timeout) from
+            # gh's own auth/scope failures (1, 4) — the operator
+            # remediation differs (wait-out-outage vs reissue-PAT).
+            #
+            # `|| last_rc=$?` is load-bearing: `set -e` is NOT
+            # suppressed in `for` loop bodies (only in if/while/until
+            # tests, ||/&& chains except final, and pipelines). A bare
+            # `timeout 30s gh api ...; last_rc=$?` would exit the
+            # script on the first failure and never iterate — exactly
+            # the regression this loop exists to prevent. Belt-and-
+            # suspenders: prepend `GH_DEBUG=` so a future gh release
+            # turning on debug output by default can't leak auth
+            # headers via stderr.
+            last_rc=0
+            # Clear all known gh debug-output env vars (GH_DEBUG / DEBUG /
+            # GH_TRACE) so a future gh release defaulting any of them on
+            # — or a future workflow refactor that exports one at job
+            # level — can't surface auth headers via stderr.
+            GH_DEBUG='' DEBUG='' GH_TRACE='' timeout 30s gh api repos/layervai/traefik-plugins/git/refs/heads/main --jq '.ref' >/dev/null || last_rc=$?
+            if [ "$last_rc" -eq 0 ]; then
+              break
+            fi
+            if [ "$i" -eq "$ATTEMPTS" ]; then
+              if [ "$last_rc" -eq 124 ]; then
+                echo "::error::TRAEFIK_PLUGINS_READ_TOKEN probe TIMED OUT (exit 124) after $ATTEMPTS attempts. github.com is likely having a sustained outage; wait it out and re-dispatch the promote. If timeouts continue past a status.github.com all-clear, escalate to the runbook for cross-repo PAT issues."
+              else
+                echo "::error::TRAEFIK_PLUGINS_READ_TOKEN cannot read layervai/traefik-plugins contents (exit $last_rc) after $ATTEMPTS attempts. The secret is set but invalid (expired, revoked, missing Contents:Read scope, wrong repo selection). See gh's error above for the specific HTTP status. Issue a new fine-grained PAT with Contents:Read on layervai/traefik-plugins; see nhp/CLAUDE.md 'AC Plugin Source-of-Truth Invariant' for the setup contract and follow-up #1765 (App-token migration)."
+              fi
+              exit 1
+            fi
+            echo "gh api probe attempt $i/$ATTEMPTS failed (exit $last_rc), retrying in 5s..."
+            sleep 5
+          done
+
+          # The PAT is referenced step-scoped here (env: GH_TOKEN) and
+          # again in the next step's `with: token:` parameter — not in
+          # job-scoped env. Do NOT insert third-party actions between
+          # this step and `Checkout traefik-plugins`, NOR between
+          # `Checkout traefik-plugins` and `Configure AWS credentials`:
+          # anything in between would still run on the same runner
+          # with both the cross-repo PAT and the prod AWS creds
+          # resolvable from the calling workflow context. The current
+          # sequence (verify → checkout → SHA → AWS-creds) is the
+          # minimum surface.
+
+      # Cross-repo checkout. Uses TRAEFIK_PLUGINS_READ_TOKEN (a fine-grained
+      # PAT scoped to layervai/traefik-plugins Contents:Read). Migration to
+      # the qurl-deploy-dispatcher GitHub App for owner-rotation durability
+      # is tracked in #1765.
+      - name: Checkout traefik-plugins
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: layervai/traefik-plugins
+          ref: main
+          token: ${{ secrets.TRAEFIK_PLUGINS_READ_TOKEN }}
+          path: ${{ env.PLUGIN_REPO_PATH }}
+          sparse-checkout: ${{ env.TRAEFIK_PLUGIN_SPARSE_PATHS }}
+          sparse-checkout-cone-mode: false
+          # The only downstream git use is `rev-parse HEAD` (a local
+          # operation). Don't keep the PAT in .git/config — limits the
+          # window where a hypothetical compromised step would have both
+          # the cross-repo PAT and prod AWS creds in reach.
+          persist-credentials: false
+
+      - name: Capture plugin SHA
+        id: sha
+        run: |
+          set -euo pipefail
+          # Assign-then-write rather than `echo "sha=$(git rev-parse HEAD)" >>
+          # $GITHUB_OUTPUT`: the latter pattern is silent on a rev-parse
+          # failure because bash doesn't propagate a command-substitution
+          # failure when its output is consumed by another command. Under
+          # `set -e`, the assignment form exits on failure correctly.
+          # `rev-parse HEAD` is purely local — no network. If a future
+          # change ever inserts a `git fetch` (or any remote git op)
+          # between the cross-repo checkout and this step, it WILL fail
+          # because `persist-credentials: false` already dropped the
+          # PAT from .git/config. Either re-introduce the token or
+          # capture the SHA directly via actions/checkout's output.
+          SHA=$(git -C "$PLUGIN_REPO_PATH" rev-parse HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: ./.github/actions/setup-deploy
+        with:
+          aws-role-arn: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload plugins to S3
+        env:
+          PLUGIN_SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Iterate over TRAEFIK_PLUGIN_SPARSE_PATHS (the same list that
+          # drives sparse-checkout above). The directory-existence check
+          # catches rename/remove drift in traefik-plugins; the
+          # tfvars→here drift is currently unguarded (tracked in #1750).
+          # `--exclude` patterns hoisted to a single array so the SHA-keyed
+          # and latest/ syncs cannot drift from each other. Mirrors the
+          # source-of-truth list in upstream traefik-plugins/.github/
+          # workflows/deploy.yml @ 962c830 — see #1773 for the cross-repo
+          # parity lint that would catch upstream drift structurally.
+          excludes=(
+            --exclude "*.tar.gz"
+            --exclude "__pycache__/*"
+            --exclude "*.pyc"
+            --exclude "coverage.out"
+          )
+
+          # Empty-list guard: a future YAML refactor that misformats the
+          # block scalar would leave the env empty, the loop would no-op,
+          # the job would report green, and AC would cycle with no plugin
+          # update. Fail loud instead.
+          if [ -z "${TRAEFIK_PLUGIN_SPARSE_PATHS//[[:space:]]/}" ]; then
+            # An empty traefik_plugins map in tfvars is a valid state
+            # (preflight passes) — but if you reach here with an empty
+            # SPARSE_PATHS, you've lost the upstream→downstream
+            # symmetry: tfvars may still expect plugins that this
+            # workflow won't upload. Drop the whole deploy-traefik-
+            # plugins job (and its gate clauses on deploy-ac /
+            # deploy-qurl) rather than running an empty upload loop.
+            echo "::error::TRAEFIK_PLUGIN_SPARSE_PATHS is empty. If the prod tfvars traefik_plugins map is also empty, remove this whole job and the deploy-traefik-plugins references from the deploy-ac / deploy-qurl gates. Otherwise, refill the env to mirror tfvars."
+            exit 1
+          fi
+          while IFS= read -r SPARSE_PATH; do
+            # Skip the trailing empty "line" the YAML `|` block scalar
+            # leaves at the end (would otherwise hard-fail the prefix
+            # guard below on a benign trailing newline).
+            if [[ -z "$SPARSE_PATH" ]]; then
+              continue
+            fi
+            # Validate the prefix BEFORE stripping it. If a future edit
+            # lands an entry that doesn't start with `plugins-local/src/`
+            # (typo or repo restructure), the strip below would no-op and
+            # the upload would land at an S3 key AC user_data never reads
+            # — exactly the silent-drift class this job closes.
+            if [[ "$SPARSE_PATH" != plugins-local/src/* ]]; then
+              echo "::error::TRAEFIK_PLUGIN_SPARSE_PATHS entry $SPARSE_PATH does not start with plugins-local/src/. AC user_data assumes that prefix; uploading without it puts plugins at an S3 key AC will never read."
+              exit 1
+            fi
+            # Path-traversal reject. The vectors are: literal `..`,
+            # leading `../`, middle `/../`, and trailing `/..`. A
+            # `..` substring inside a directory name (e.g.,
+            # `foo..bar`) is NOT a traversal and shouldn't false-
+            # positive. The four glob shapes below cover the
+            # traversal vectors precisely. Note the bare-`..` and
+            # `../*` cases are belt-and-suspenders: the prefix check
+            # immediately above already rejects anything that doesn't
+            # start with `plugins-local/src/`, so neither can reach
+            # this check. Kept anyway so the reject set reads as a
+            # complete traversal-classification rather than relying
+            # on the prefix check to do half the work implicitly.
+            if [[ "$SPARSE_PATH" == ".." \
+                || "$SPARSE_PATH" == ../* \
+                || "$SPARSE_PATH" == */../* \
+                || "$SPARSE_PATH" == */.. ]]; then
+              echo "::error::TRAEFIK_PLUGIN_SPARSE_PATHS entry $SPARSE_PATH contains a '..' path-traversal segment — uploading would resolve outside plugins-local/src/."
+              exit 1
+            fi
+            # SPARSE_PATH is `plugins-local/src/<plugin>`; strip the prefix
+            # to get the S3-side plugin key.
+            PLUGIN_PATH="${SPARSE_PATH#plugins-local/src/}"
+            PLUGIN_DIR="$PLUGIN_REPO_PATH/$SPARSE_PATH"
+            if [ ! -d "$PLUGIN_DIR" ]; then
+              echo "::error::Plugin directory $PLUGIN_DIR not found in traefik-plugins repo. If a plugin was renamed/removed there, update TRAEFIK_PLUGIN_SPARSE_PATHS AND prod tfvars traefik_plugins map together."
+              exit 1
+            fi
+            # Empty-directory guard. A real-but-empty plugin dir would
+            # let `aws s3 sync` 0-file-sync to success, producing a
+            # green job that uploaded nothing (silent-no-op). Same
+            # failure shape as an empty TRAEFIK_PLUGIN_SPARSE_PATHS,
+            # different root cause. Doesn't catch a directory with
+            # only marker files (`.gitkeep` etc.) — those would still
+            # sync, AC would still 404 on the missing real plugin
+            # files. Treat as belt-and-suspenders for "no files at
+            # all" rather than full content validation.
+            # `find -mindepth 1 -print -quit` over `ls -A` so an
+            # unreadable-but-existing dir (theoretical given the
+            # checkout just succeeded into a runner-owned workspace,
+            # but cheap defense) doesn't false-pass an empty result
+            # the same way `ls`'s would.
+            if [ -z "$(find "$PLUGIN_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+              echo "::error::Plugin directory $PLUGIN_DIR exists but contains zero files. The sparse-checkout pattern matched but the upstream plugin has no files at all — refusing to upload nothing."
+              exit 1
+            fi
+            # Belt-and-suspenders: assert no .git inside the synced
+            # subtree. actions/checkout writes .git at repo root today,
+            # so this never trips — but a future actions/checkout
+            # behavior change or workflow refactor that landed .git
+            # inside the synced path would silently upload a 4MB+
+            # plugin-bucket bloat. Cheap, name-anchored guard.
+            if [ -d "$PLUGIN_DIR/.git" ]; then
+              echo "::error::Plugin directory $PLUGIN_DIR contains a .git subdirectory. actions/checkout's sparse-mode normally writes .git at the repo root only; if it landed inside the synced subtree, the s3 sync would upload it. Investigate the checkout shape before re-running."
+              exit 1
+            fi
+
+            # The SHA-keyed prefix is an immutable forensic archive: AC
+            # user_data downloads from latest/ (asserted by the
+            # version-pin preflight above), not from <SHA>/. Keeping
+            # both lets an oncall trace "what plugin SHA shipped on
+            # date X" by listing the SHA prefixes (e.g., for an
+            # incident that emerges weeks after a regression landed).
+            # `.git/*` is intentionally not in the exclude list:
+            # `actions/checkout` writes `.git` at the repo root, NOT
+            # inside `plugins-local/src/`, so it can't match anything
+            # in the synced subtree (and the empty-dir guard above
+            # also asserts no .git inside this path).
+            echo "[plugin-upload] $PLUGIN_PATH -> s3://$PLUGIN_BUCKET/traefik/$PLUGIN_PATH/$PLUGIN_SHA/"
+            aws s3 sync "$PLUGIN_DIR" "s3://$PLUGIN_BUCKET/traefik/$PLUGIN_PATH/$PLUGIN_SHA/" "${excludes[@]}"
+
+            # `--delete` on the latest/ sync so a removed file in
+            # traefik-plugins doesn't linger and re-appear on AC boot.
+            # Safe during the SCHEDULED promote: deploy-ac depends on
+            # this job's success, so no scheduled AC instance is
+            # booting from latest/ during the sync.
+            # Residual race windows (both tracked, narrow, accepted):
+            #   - Manual traefik-plugins/deploy.yml workflow_dispatch
+            #     could race the same prefix. → #1767.
+            #   - An UNSCHEDULED ASG event (spot interrupt, scale-out)
+            #     could land an AC pulling from latest/ during the
+            #     few seconds aws s3 sync --delete is running. The
+            #     atomic-via-staging fix tracked in #1752 closes this
+            #     window.
+            echo "[plugin-upload] $PLUGIN_PATH -> s3://$PLUGIN_BUCKET/traefik/$PLUGIN_PATH/latest/"
+            aws s3 sync "$PLUGIN_DIR" "s3://$PLUGIN_BUCKET/traefik/$PLUGIN_PATH/latest/" --delete "${excludes[@]}"
+          done <<< "$TRAEFIK_PLUGIN_SPARSE_PATHS"
+
+      - name: Plugin deploy summary
+        env:
+          PLUGIN_SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Strip the trailing newline left by the YAML `|` block scalar
+          # before the comma-substitution; otherwise the rendered cell
+          # ends with an empty backtick pair (`` `, ` ``).
+          PATHS_CSV="${TRAEFIK_PLUGIN_SPARSE_PATHS%$'\n'}"
+          PATHS_CSV="${PATHS_CSV//$'\n'/\`, \`}"
+          {
+            echo "## Deploy Traefik Plugins"
+            echo ""
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| Source | layervai/traefik-plugins @ \`main\` (\`${PLUGIN_SHA:0:8}\`) |"
+            echo "| Target | prod (\`s3://$PLUGIN_BUCKET/traefik/\`) |"
+            echo "| Plugins | \`$PATHS_CSV\` |"
+            echo "| Effect | AC canary instances boot with these plugins |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # =============================================================================
+  # DEPLOY AC - Via canary (Step Functions) with first-deploy fallback
+  # =============================================================================
+  deploy-ac:
+    name: Deploy Access Controller
+    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server, deploy-traefik-plugins]
+    # Same terraform-apply rule as deploy-server (issue #1322). The
+    # deploy-server clause preserves the chained-deploy contract: AC can
+    # run when only AC was selected, but not when server failed mid-chain.
+    # The deploy-traefik-plugins clause closes the silent-drift gap
+    # SPECIFICALLY for the canary AC cycle initiated by THIS promote.
+    # Unscheduled AC boots (spot interrupt, scale-out) after a
+    # `deploy_ac=false` promote can still land on stale plugins; that
+    # gap is the manual `traefik-plugins/deploy.yml` workflow_dispatch's
+    # responsibility, kept as the operator escape hatch.
+    # Asserted by tests/scripts/test_promote_to_prod_gating.py. The
+    # floor in _assert_image_deploys is `>= 3` (not `== 3`), so adding
+    # a 4th/5th deploy-* job auto-passes — only structural REMOVAL
+    # of an existing job needs a paired ratchet bump. A new deploy-*
+    # job DOES still need to inherit the gate shape that
+    # APPLY_SUCCESS_RE / APPLY_SKIPPED_RE match.
+    if: |
+      always() &&
+      needs.preflight.result == 'success' &&
+      (
+        (inputs.run_terraform && needs.terraform-apply.result == 'success') ||
+        (!inputs.run_terraform && needs.terraform-apply.result == 'skipped')
+      ) &&
+      (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
+      (needs.deploy-traefik-plugins.result == 'success' || needs.deploy-traefik-plugins.result == 'skipped') &&
       inputs.deploy_ac
     runs-on: ubuntu-latest
     timeout-minutes: 50
@@ -2342,13 +2830,24 @@ jobs:
   # =============================================================================
   deploy-qurl:
     name: Deploy QURL Service
-    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server, deploy-ac]
+    needs: [manifest, preflight, terraform-plan, terraform-apply, deploy-server, deploy-traefik-plugins, deploy-ac]
     # Same terraform-apply rule as deploy-server (issue #1322). The
-    # deploy-server / deploy-ac clauses preserve the chained-deploy contract.
-    # Asserted by tests/scripts/test_promote_to_prod_gating.py — a 4th
-    # image-deploy job needs the floor bumped in _assert_image_deploys
-    # AND must inherit the gate shape covered by APPLY_SUCCESS_RE /
-    # APPLY_SKIPPED_RE.
+    # deploy-server / deploy-traefik-plugins / deploy-ac clauses
+    # preserve the chained-deploy contract: QURL ships only if every
+    # upstream image-deploy either succeeded or was operator-skipped.
+    # Asserted by tests/scripts/test_promote_to_prod_gating.py — the
+    # floor in _assert_image_deploys is `>= 3`, so additions auto-pass;
+    # only structural removal needs a ratchet bump.
+    #
+    # The deploy-traefik-plugins clause is what keeps QURL from
+    # shipping into a partial-deploy state when plugins fail — without
+    # it, plugins-fail → AC-skipped → QURL-proceeds (because
+    # AC.result='skipped' satisfies the AC clause), which silently
+    # diverges from the operator-driven `deploy_ac=false,
+    # deploy_qurl=true` workflow shape: in that case the operator
+    # explicitly chose to skip AC; here the system did. Keep the
+    # behavior implicit-but-symmetric with deploy-server's clause
+    # rather than implicit-and-asymmetric.
     if: |
       always() &&
       needs.preflight.result == 'success' &&
@@ -2357,6 +2856,7 @@ jobs:
         (!inputs.run_terraform && needs.terraform-apply.result == 'skipped')
       ) &&
       (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
+      (needs.deploy-traefik-plugins.result == 'success' || needs.deploy-traefik-plugins.result == 'skipped') &&
       (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
       inputs.deploy_qurl
     runs-on: ubuntu-latest
@@ -2410,11 +2910,12 @@ jobs:
   # =============================================================================
   smoke-test:
     name: Smoke Test
-    needs: [manifest, preflight, deploy-server, deploy-ac, deploy-qurl]
+    needs: [manifest, preflight, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-qurl]
     if: |
       always() &&
       needs.preflight.result == 'success' &&
       (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
+      (needs.deploy-traefik-plugins.result == 'success' || needs.deploy-traefik-plugins.result == 'skipped') &&
       (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
       (needs.deploy-qurl.result == 'success' || needs.deploy-qurl.result == 'skipped') &&
       (needs.deploy-server.result == 'success' || needs.deploy-ac.result == 'success' || needs.deploy-qurl.result == 'success')
@@ -2489,11 +2990,12 @@ jobs:
   # =============================================================================
   qurl-smoke-tests:
     name: QURL Smoke Tests
-    needs: [manifest, preflight, deploy-server, deploy-ac, deploy-qurl]
+    needs: [manifest, preflight, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-qurl]
     if: |
       always() &&
       needs.preflight.result == 'success' &&
       (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
+      (needs.deploy-traefik-plugins.result == 'success' || needs.deploy-traefik-plugins.result == 'skipped') &&
       (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
       (needs.deploy-qurl.result == 'success' || needs.deploy-qurl.result == 'skipped') &&
       (needs.deploy-server.result == 'success' || needs.deploy-ac.result == 'success' || needs.deploy-qurl.result == 'success')
@@ -2522,11 +3024,12 @@ jobs:
   # =============================================================================
   nhp-smoke-tests:
     name: NHP Smoke Tests
-    needs: [manifest, preflight, deploy-server, deploy-ac, deploy-qurl]
+    needs: [manifest, preflight, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-qurl]
     if: |
       always() &&
       needs.preflight.result == 'success' &&
       (needs.deploy-server.result == 'success' || needs.deploy-server.result == 'skipped') &&
+      (needs.deploy-traefik-plugins.result == 'success' || needs.deploy-traefik-plugins.result == 'skipped') &&
       (needs.deploy-ac.result == 'success' || needs.deploy-ac.result == 'skipped') &&
       (needs.deploy-qurl.result == 'success' || needs.deploy-qurl.result == 'skipped') &&
       (needs.deploy-server.result == 'success' || needs.deploy-ac.result == 'success' || needs.deploy-qurl.result == 'success')
@@ -2643,7 +3146,7 @@ jobs:
   finalize:
     name: Finalize
     if: always()
-    needs: [manifest, preflight, terraform-plan, qurl-schema-compat, terraform-apply, deploy-server, deploy-ac, deploy-qurl, smoke-test, qurl-smoke-tests, nhp-smoke-tests, monitor]
+    needs: [manifest, preflight, terraform-plan, qurl-schema-compat, terraform-apply, deploy-server, deploy-traefik-plugins, deploy-ac, deploy-qurl, smoke-test, qurl-smoke-tests, nhp-smoke-tests, monitor]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -2665,6 +3168,7 @@ jobs:
           SCHEMA_COMPAT_RESULT: ${{ needs.qurl-schema-compat.result }}
           TF_RESULT: ${{ needs.terraform-apply.result }}
           SERVER_RESULT: ${{ needs.deploy-server.result }}
+          TRAEFIK_PLUGINS_RESULT: ${{ needs.deploy-traefik-plugins.result }}
           AC_RESULT: ${{ needs.deploy-ac.result }}
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
@@ -2689,7 +3193,7 @@ jobs:
           # cancelled run does not silently report success, matching the
           # treatment of every other job's cancelled state.
           FAILED=false
-          for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_PLAN_RESULT" "$SCHEMA_COMPAT_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$AC_RESULT" "$QURL_RESULT" "$SMOKE_RESULT" "$QURL_SMOKE_RESULT" "$NHP_SMOKE_RESULT" "$MONITOR_RESULT"; do
+          for result in "$MANIFEST_RESULT" "$PREFLIGHT_RESULT" "$TF_PLAN_RESULT" "$SCHEMA_COMPAT_RESULT" "$TF_RESULT" "$SERVER_RESULT" "$TRAEFIK_PLUGINS_RESULT" "$AC_RESULT" "$QURL_RESULT" "$SMOKE_RESULT" "$QURL_SMOKE_RESULT" "$NHP_SMOKE_RESULT" "$MONITOR_RESULT"; do
             if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
               FAILED=true
               break
@@ -2827,6 +3331,7 @@ jobs:
           DEPLOY_STATUS: ${{ steps.final_status.outputs.value }}
           TF_RESULT: ${{ needs.terraform-apply.result }}
           SERVER_RESULT: ${{ needs.deploy-server.result }}
+          TRAEFIK_PLUGINS_RESULT: ${{ needs.deploy-traefik-plugins.result }}
           AC_RESULT: ${{ needs.deploy-ac.result }}
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
         # Lock layering: the SSM `/prod/nhp/deploy/state` parameter is
@@ -2867,6 +3372,7 @@ jobs:
             LOCK_VALUE="deployed"
           elif [[ "$TF_RESULT" == "skipped" \
                && "$SERVER_RESULT" == "skipped" \
+               && "$TRAEFIK_PLUGINS_RESULT" == "skipped" \
                && "$AC_RESULT" == "skipped" \
                && "$QURL_RESULT" == "skipped" ]]; then
             LOCK_VALUE="rejected"
@@ -2991,6 +3497,7 @@ jobs:
           SCHEMA_COMPAT_RESULT: ${{ needs.qurl-schema-compat.result }}
           TF_RESULT: ${{ needs.terraform-apply.result }}
           SERVER_RESULT: ${{ needs.deploy-server.result }}
+          TRAEFIK_PLUGINS_RESULT: ${{ needs.deploy-traefik-plugins.result }}
           AC_RESULT: ${{ needs.deploy-ac.result }}
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
@@ -3080,6 +3587,7 @@ jobs:
           MSG+=$(row "Schema Compat" "$SCHEMA_COMPAT_RESULT")
           MSG+=$(row "TF Apply"      "$TF_RESULT")
           MSG+=$(row "Server"        "$SERVER_RESULT")
+          MSG+=$(row "Traefik Plugins" "$TRAEFIK_PLUGINS_RESULT")
           MSG+=$(row "AC"            "$AC_RESULT")
           MSG+=$(row "QURL"          "$QURL_RESULT")
           MSG+=$(row "Smoke Test"    "$SMOKE_RESULT")
@@ -3146,6 +3654,7 @@ jobs:
           SCHEMA_COMPAT_RESULT: ${{ needs.qurl-schema-compat.result }}
           TF_RESULT: ${{ needs.terraform-apply.result }}
           SERVER_RESULT: ${{ needs.deploy-server.result }}
+          TRAEFIK_PLUGINS_RESULT: ${{ needs.deploy-traefik-plugins.result }}
           AC_RESULT: ${{ needs.deploy-ac.result }}
           QURL_RESULT: ${{ needs.deploy-qurl.result }}
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
@@ -3187,6 +3696,7 @@ jobs:
             echo "| QURL Schema Compat | $(result_emoji "$SCHEMA_COMPAT_RESULT") $SCHEMA_COMPAT_RESULT |"
             echo "| Terraform Apply | $(result_emoji "$TF_RESULT") $TF_RESULT |"
             echo "| Deploy Server | $(result_emoji "$SERVER_RESULT") $SERVER_RESULT |"
+            echo "| Deploy Traefik Plugins | $(result_emoji "$TRAEFIK_PLUGINS_RESULT") $TRAEFIK_PLUGINS_RESULT |"
             echo "| Deploy AC | $(result_emoji "$AC_RESULT") $AC_RESULT |"
             echo "| Deploy QURL | $(result_emoji "$QURL_RESULT") $QURL_RESULT |"
             echo "| Smoke Test | $(result_emoji "$SMOKE_RESULT") $SMOKE_RESULT |"
