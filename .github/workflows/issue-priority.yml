@@ -60,6 +60,6 @@ jobs:
     # only if/name/needs/permissions/secrets/strategy/uses/with/concurrency
     # are valid on a job that calls a reusable workflow. The reusable
     # sets `timeout-minutes: 2` internally.
-    uses: layervai/ops-routines-workflows/.github/workflows/issue-priority.yml@86d4de84b95cf923bfdd11e3384a1f0deecfbef0 # v0.5.0
+    uses: layervai/ops-routines-workflows/.github/workflows/issue-priority.yml@32531ff86d268d5f388ad30614e604a5f3a63577 # v0.6.0
     permissions:
       issues: write
