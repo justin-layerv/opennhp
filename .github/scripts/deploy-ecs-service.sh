@@ -217,23 +217,35 @@ CURRENT_TASK_DEF=$(aws ecs describe-task-definition \
   --query "taskDefinition" --output json \
   --region "$AWS_REGION")
 
-# Single-container guard: this script derives `IMAGE_REPO` from
-# containerDefinitions[0] and the jq filter at Step 4 updates EVERY
-# container whose image starts with `$IMAGE_REPO:`. A multi-container
-# task where a sidecar shares the repo (e.g., `nhp-qurl:debug-sidecar`
-# alongside `nhp-qurl:main`) would have both bumped to the same new
-# tag — usually wrong. qurl-service runs single-container today;
-# guard so a future multi-container layout fails loud rather than
-# silently mis-tagging the sidecar.
-CONTAINER_COUNT=$(echo "$CURRENT_TASK_DEF" | jq '.containerDefinitions | length')
-if [[ "$CONTAINER_COUNT" != "1" ]]; then
-  echo "ERROR: This script only supports single-container task definitions (found $CONTAINER_COUNT containers)."
-  echo "  If you need multi-container support, the jq filter at Step 4 must be updated to target a specific container by name, not by repo prefix."
+# Pick the primary container by name. Default matches the SSM key
+# convention this script reads from (/<prefix>/qurl-api-image-tag),
+# so today's single-container task defs keep working unconfigured.
+# Override via the env var when a future consumer's primary
+# container has a different name. The same-repo-sidecar safety
+# discussion lives at the MATCHING_REPO_COUNT guard below.
+PRIMARY_CONTAINER="${PRIMARY_CONTAINER:-qurl-api}"
+
+CURRENT_IMAGE=$(echo "$CURRENT_TASK_DEF" | jq -r --arg name "$PRIMARY_CONTAINER" '
+  [.containerDefinitions[] | select(.name == $name)] as $matches
+  | if ($matches | length) == 0 then "MISSING"
+    elif ($matches | length) > 1 then "AMBIGUOUS"
+    else $matches[0].image
+    end')
+if [[ "$CURRENT_IMAGE" == "MISSING" ]]; then
+  echo "ERROR: No container named '$PRIMARY_CONTAINER' in task definition. Available containers:"
+  echo "$CURRENT_TASK_DEF" | jq -r '.containerDefinitions[].name | "  - \(.)"'
+  echo "  Set PRIMARY_CONTAINER env var to match the desired container."
+  exit 1
+fi
+if [[ "$CURRENT_IMAGE" == "AMBIGUOUS" ]]; then
+  # ECS rejects duplicate container names at register-task-definition
+  # time, but be loud-on-paranoid: a malformed-but-accepted task def
+  # would silently update only the first match below.
+  echo "ERROR: Multiple containers named '$PRIMARY_CONTAINER' in task definition (should be impossible per ECS validation; failing loud)."
   exit 1
 fi
 
-# Extract current image for logging
-CURRENT_IMAGE=$(echo "$CURRENT_TASK_DEF" | jq -r '.containerDefinitions[0].image // "unknown"')
+echo "  Primary container: $PRIMARY_CONTAINER"
 echo "  Current image: $CURRENT_IMAGE"
 echo ""
 
@@ -259,6 +271,22 @@ fi
 IMAGE_REPO="${CURRENT_IMAGE%:*}"
 if [[ -z "$IMAGE_REPO" || "$IMAGE_REPO" == "$CURRENT_IMAGE" ]]; then
   echo "ERROR: Could not parse image repository from: $CURRENT_IMAGE"
+  exit 1
+fi
+# Same-repo sidecar guard. The Step 4 jq filter updates every
+# container whose image starts with `$IMAGE_REPO:`, so a future
+# sidecar that shares the primary's ECR repo (e.g.,
+# `nhp-qurl:debug-sidecar` alongside `nhp-qurl:main`) would both
+# get bumped to the new tag — usually wrong. Reject that here.
+# Sidecars from a different repo (today's case: ADOT collector
+# from `public.ecr.aws/aws-observability/...`) don't match the
+# prefix and are correctly left alone. The structural fix is to
+# update the Step 4 filter to target by container name (tracked
+# as a follow-up); until then, this guard fences the failure mode.
+MATCHING_REPO_COUNT=$(echo "$CURRENT_TASK_DEF" | jq --arg repo "$IMAGE_REPO" '[.containerDefinitions[] | select(.image | startswith($repo + ":"))] | length')
+if [[ "$MATCHING_REPO_COUNT" != "1" ]]; then
+  echo "ERROR: Expected exactly 1 container with image repo '$IMAGE_REPO', found $MATCHING_REPO_COUNT."
+  echo "  A sidecar sharing the primary's ECR repo would be silently bumped to the new tag by the prefix-based update at Step 4. Update the jq filter to target by container name before allowing this layout."
   exit 1
 fi
 NEW_IMAGE="${IMAGE_REPO}:${NEW_IMAGE_TAG}"
