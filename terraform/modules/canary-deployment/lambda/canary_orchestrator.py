@@ -257,6 +257,15 @@ def handle_start_refresh(event, _context):
             else:
                 logger.warning(f"Previous refresh {existing_id} still not cancelled after 90s (final status: {status})")
 
+    # NOTE: do NOT pass SkipMatching=true here. Its absence is
+    # load-bearing for user_data-only changes (e.g., http.toml updates
+    # like PR #1795's keep-alive timeout fix): with SkipMatching=true,
+    # the refresh would skip instances whose launch-template version
+    # already matches and the user_data change would never propagate.
+    # The current behavior — refresh every instance regardless of LT
+    # version match — is the only way a TF-only change rolls without
+    # an image bump. Adding SkipMatching=true would silently break that
+    # guarantee for any future TF-only fix.
     response = autoscaling.start_instance_refresh(
         AutoScalingGroupName=asg_name,
         Strategy='Rolling',

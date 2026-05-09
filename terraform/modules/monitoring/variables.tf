@@ -19,6 +19,18 @@ variable "target_group_arn_suffix" {
   type        = string
 }
 
+variable "https_target_group_arn_suffix" {
+  description = "HTTPS target group ARN suffix (NLB TLS listener → server :8888) for TCP-target-reset alarms. Optional; when null, no HTTPS alarm is created."
+  type        = string
+  default     = null
+}
+
+variable "https_green_target_group_arn_suffix" {
+  description = "Green HTTPS target group ARN suffix when blue/green is enabled, so the alarm covers traffic post-flip. Optional; when null, no green-side alarm is created."
+  type        = string
+  default     = null
+}
+
 variable "asg_name" {
   description = "Auto Scaling Group name"
   type        = string

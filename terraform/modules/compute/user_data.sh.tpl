@@ -388,6 +388,32 @@ EnableHttp = true
 EnableTLS = false
 HttpListenIp = ""
 HttpListenPort = 8888
+# Connection-level timeouts:
+# - IdleTimeoutMs MUST exceed CloudFront's origin_keepalive_timeout (see
+#   terraform/main.tf::aws_cloudfront_distribution.qurl_resolve); otherwise
+#   CF reuses a connection the server has already FIN'd and the next POST
+#   to /plugins/qurl returns 502 to the viewer. The
+#   `terraform_data.http_keepalive_contract` preconditions hard-fail
+#   plan/apply on a violation.
+# - WriteTimeoutMs covers handler exec + response write (Go net/http
+#   semantics). Sized for the resolve handler's NHP-knock + AC-dispatch
+#   tail latency. Must stay below CF's origin_read_timeout (60s) so the
+#   server, not CF, owns the slow-handler timeout.
+# - ReadTimeoutMs covers reading the full request bytes. Sized for slow
+#   client uploads under degraded network conditions; the qurl POST body
+#   is ~25 bytes but TCP windows can stall, and a tight read timeout
+#   adds slowloris exposure with no real benefit at this body size.
+#
+# Looking for ReadHeaderTimeoutMs? It's intentionally NOT exposed via
+# http.toml — pinned to 5s in endpoints/server/httpserver.go to bound
+# slowloris-headers exposure independently of ReadTimeoutMs (which
+# governs body reads). The right value is the same everywhere; making
+# it tunable would invite the wrong knob being turned (an operator
+# lengthening ReadTimeoutMs shouldn't accidentally widen the slowloris
+# window).
+ReadTimeoutMs  = ${http_read_timeout_ms}
+WriteTimeoutMs = ${http_write_timeout_ms}
+IdleTimeoutMs  = ${http_idle_timeout_ms}
 HTTPEOF
 
 # ============================================================================

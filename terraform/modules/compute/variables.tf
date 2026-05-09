@@ -626,3 +626,35 @@ variable "deployment_stale_threshold_days" {
     error_message = "deployment_stale_threshold_days must be between 0 and 30."
   }
 }
+
+# =============================================================================
+# HTTP server timeouts (http.toml). Grouped because the three values move
+# together: `idle` must clear CloudFront's origin_keepalive_timeout (root
+# module hard-fails plan/apply on violation via the
+# `terraform_data.http_keepalive_contract` preconditions); `write` must
+# stay below CF's origin_read_timeout so the server times out first.
+# Required (no default) so the root locals are the single source of
+# truth and the precondition can fence the relationship without drift.
+# =============================================================================
+
+variable "http_timeouts_ms" {
+  description = "NHP server HTTP timeouts in milliseconds: idle (must exceed CF origin_keepalive_timeout + buffer), read (full request including body), write (handler exec + response write; must stay below CF origin_read_timeout). REQUIRED — no default — so the root module's locals are the single source of truth and the CF distribution's lifecycle.precondition can fence the relationship without drift."
+  type = object({
+    idle  = number
+    read  = number
+    write = number
+  })
+
+  validation {
+    condition = alltrue([
+      for v in [var.http_timeouts_ms.idle, var.http_timeouts_ms.read, var.http_timeouts_ms.write] :
+      v >= 1000 && v <= 300000
+    ])
+    error_message = "All http_timeouts_ms values must be between 1000 (1s) and 300000 (5min). Note: this is the per-field range only — the cross-resource invariant (idle vs. CloudFront origin_keepalive_timeout, write vs. CloudFront origin_read_timeout) is enforced at the root module via `terraform_data.http_keepalive_contract`."
+  }
+
+  validation {
+    condition     = var.http_timeouts_ms.idle > var.http_timeouts_ms.read && var.http_timeouts_ms.idle > var.http_timeouts_ms.write
+    error_message = "http_timeouts_ms.idle must STRICTLY exceed both .read and .write. This is a config-shape sanity check: equal or inverted values (idle <= read or idle <= write) almost always indicate a copy-paste typo rather than a deliberate design choice — the strict comparison forces the operator to commit to two distinct values. (No runtime correctness depends on this — Go's IdleTimeout fires only between requests, never mid-read or mid-write — but a typo here would silently land a confusing config.)"
+  }
+}

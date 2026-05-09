@@ -68,6 +68,11 @@ output "https_target_group_arn_suffix" {
   value       = var.enable_qurl_resolve_endpoint ? aws_lb_target_group.https[0].arn_suffix : null
 }
 
+output "https_green_target_group_arn_suffix" {
+  description = "Green HTTPS target group ARN suffix for CloudWatch (null if blue/green disabled or QURL resolve endpoint not enabled)"
+  value       = var.enable_blue_green && var.enable_qurl_resolve_endpoint ? aws_lb_target_group.https_green[0].arn_suffix : null
+}
+
 # =============================================================================
 # SSM Parameter Outputs for CI/CD
 # =============================================================================

@@ -64,6 +64,15 @@ type TestConfig struct {
 	// so there's no separate ResolveBaseURL field.
 	NHPServerBaseURL string
 
+	// NHPServerOriginURL is the NLB-direct URL for the NHP server's
+	// HTTPS plugin endpoint, used by tests that need to bypass CloudFront
+	// (specifically the keep-alive idle-timeout fence in
+	// 09_resolve_origin_idle_timeout_test.go — CF's origin connection
+	// pool would mask server-side timeout behavior). Empty in environments
+	// without a separate origin record. Sourced from
+	// `derivedEndpoints.NHPServerOriginURL`.
+	NHPServerOriginURL string
+
 	// QURLAPIBaseURL is the QURL service API (api.layerv.xyz in
 	// sandbox, api.layerv.ai in prod). Distinct from
 	// NHPServerBaseURL — this is what the NHP /plugins/qurl handler

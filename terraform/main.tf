@@ -118,6 +118,35 @@ locals {
     Repository  = "layervai/nhp"
     Service     = "shared"
   })
+
+  # CloudFront ↔ NHP server keep-alive contract values. The
+  # `terraform_data.http_keepalive_contract` resource carries
+  # `lifecycle.precondition` blocks that hard-fail plan/apply if these
+  # locals violate the relationship (`http_idle_timeout_ms` must clear
+  # `cf_origin_keepalive_seconds + cf_keepalive_buffer_seconds`;
+  # `http_write_timeout_ms` must stay below `cf_origin_read_timeout`).
+  # The compute module's `var.http_timeouts_ms` validation enforces the
+  # in-object relationships (idle > read, idle > write) independently.
+  # See the precondition for the bug-class rationale.
+  cf_origin_keepalive_seconds = 30
+  cf_origin_read_timeout      = 60
+  # cf_keepalive_buffer_seconds is the MINIMUM slack required between the
+  # server's IdleTimeout and CF's origin_keepalive_timeout. The actual
+  # gap (http_idle_timeout_ms - cf_origin_keepalive_seconds*1000) is
+  # 6000ms today; this local is the floor enforced by the precondition,
+  # not the realized gap. A future operator who tunes this to match the
+  # realized 6 would tighten the precondition (36000 >= (30+6)*1000
+  # passes by exact equality, losing the 1s slack) — to track the
+  # realized gap, bump http_idle_timeout_ms in lockstep. Lifted into a
+  # local so the precondition's condition AND error message stay in
+  # sync if the floor is ever tuned.
+  cf_keepalive_buffer_seconds = 5
+  # http_idle_timeout_ms = 36000 (not exactly cf_keepalive + buffer = 35000)
+  # so the precondition has 1s of real slack above the floor, instead of
+  # passing by exact equality.
+  http_idle_timeout_ms  = 36000
+  http_read_timeout_ms  = 30000
+  http_write_timeout_ms = 30000
 }
 
 # ==================== Modules ====================
@@ -427,6 +456,17 @@ module "compute" {
   enable_qurl_resolve_endpoint = var.deploy_qurl_link
   qurl_resolve_certificate_arn = var.deploy_qurl_link ? aws_acm_certificate_validation.qurl_resolve[0].certificate_arn : null
 
+  # HTTP server timeouts — CF↔server keep-alive contract (see top-of-file
+  # locals + `terraform_data.http_keepalive_contract`'s preconditions). The
+  # same numbers are baked in at the binary level via
+  # endpoints/server/constants.go as a safety net for deployments that don't
+  # set http.toml.
+  http_timeouts_ms = {
+    idle  = local.http_idle_timeout_ms
+    read  = local.http_read_timeout_ms
+    write = local.http_write_timeout_ms
+  }
+
   # Pluggable storage backend - DynamoDB (cloud default) with etcd feature flag for on-prem
   # Note: attach_storage_policies is required because Terraform cannot evaluate count based on module outputs
   attach_storage_policies  = true
@@ -487,14 +527,16 @@ module "compute" {
 module "monitoring" {
   source = "./modules/monitoring"
 
-  environment                  = var.environment
-  cell_id                      = var.cell_id
-  nlb_arn_suffix               = module.compute.nlb_arn_suffix
-  target_group_arn_suffix      = module.compute.target_group_arn_suffix
-  asg_name                     = module.compute.asg_name
-  server_stderr_log_group_name = module.compute.log_group_stderr_name
-  name_prefix                  = local.name_prefix
-  tags                         = local.common_tags
+  environment                         = var.environment
+  cell_id                             = var.cell_id
+  nlb_arn_suffix                      = module.compute.nlb_arn_suffix
+  target_group_arn_suffix             = module.compute.target_group_arn_suffix
+  https_target_group_arn_suffix       = module.compute.https_target_group_arn_suffix
+  https_green_target_group_arn_suffix = module.compute.https_green_target_group_arn_suffix
+  asg_name                            = module.compute.asg_name
+  server_stderr_log_group_name        = module.compute.log_group_stderr_name
+  name_prefix                         = local.name_prefix
+  tags                                = local.common_tags
 
   # Slack integration
   enable_slack_notifications = var.enable_slack_notifications
@@ -2686,12 +2728,16 @@ resource "aws_cloudfront_distribution" "qurl_resolve" {
     origin_id   = "nlb"
 
     custom_origin_config {
-      http_port                = 80
-      https_port               = 443
-      origin_protocol_policy   = "https-only"
-      origin_ssl_protocols     = ["TLSv1.2"]
-      origin_read_timeout      = 60
-      origin_keepalive_timeout = 30
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "https-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+      # Sourced from the CF↔server keep-alive contract (see top-of-file
+      # locals + the lifecycle.precondition blocks below). Bumping these
+      # without bumping the matching server-side timeouts hard-fails
+      # plan via those preconditions.
+      origin_read_timeout      = local.cf_origin_read_timeout
+      origin_keepalive_timeout = local.cf_origin_keepalive_seconds
     }
   }
 
@@ -2723,6 +2769,82 @@ resource "aws_cloudfront_distribution" "qurl_resolve" {
 
   tags       = local.common_tags
   depends_on = [aws_acm_certificate_validation.qurl_resolve_cloudfront]
+}
+
+# Plan-time fence on the CF↔server keep-alive contract. Lives on a
+# `terraform_data` resource (which always exists, regardless of toggles)
+# so the precondition runs in every plan/apply — including envs that
+# temporarily set `enable_resolve_cloudfront = false`. If we put the
+# precondition directly on `aws_cloudfront_distribution.qurl_resolve`,
+# disabling the distribution (count = 0) would make the precondition
+# silently skip, letting a coupled "shrink IdleTimeout + disable CF"
+# plan slip through. The terraform_data carries the locals as inputs so
+# any change to the contract values shows up in the plan diff.
+#
+# Bumping CF's origin_keepalive_timeout without raising the server's
+# IdleTimeout (or vice versa) re-opens the resolve.qurl.link 502 race:
+# CF reuses an idle conn the server has FIN'd, the next POST gets RST,
+# and CF returns 502 because POSTs aren't retried. WriteTimeout < CF
+# origin_read_timeout keeps the server-times-out-first ordering so a
+# slow handler surfaces as 502 from the server (releasing CF's slot
+# promptly) rather than 504 from CF.
+resource "terraform_data" "http_keepalive_contract" {
+  # Mirror every contract value in `input` (not just the ones the
+  # preconditions read) so a tweak to ANY of them shows up in this
+  # resource's plan diff. The preconditions only check
+  # idle vs cf_keepalive+buffer and write vs cf_read_timeout, but a
+  # buffer-only retune would otherwise be invisible at this resource
+  # and only show up at the CF distribution.
+  input = {
+    cf_origin_keepalive_seconds = local.cf_origin_keepalive_seconds
+    cf_origin_read_timeout      = local.cf_origin_read_timeout
+    cf_keepalive_buffer_seconds = local.cf_keepalive_buffer_seconds
+    http_idle_timeout_ms        = local.http_idle_timeout_ms
+    http_read_timeout_ms        = local.http_read_timeout_ms
+    http_write_timeout_ms       = local.http_write_timeout_ms
+  }
+
+  lifecycle {
+    precondition {
+      condition     = local.http_idle_timeout_ms >= (local.cf_origin_keepalive_seconds + local.cf_keepalive_buffer_seconds) * 1000
+      error_message = "local.http_idle_timeout_ms (${local.http_idle_timeout_ms} ms) must be at least ${local.cf_keepalive_buffer_seconds}s greater than CloudFront's origin_keepalive_timeout (${local.cf_origin_keepalive_seconds * 1000} ms). Lower IdleTimeout re-opens the resolve.qurl.link keep-alive race fixed in PR #1795."
+    }
+    # No buffer on this assert — server-times-out-first is the desired
+    # ordering, so any margin between WriteTimeout and origin_read_timeout
+    # would just delay CF's slow-handler 502 without changing the
+    # outcome. Strict `<` is sufficient.
+    precondition {
+      condition     = local.http_write_timeout_ms < local.cf_origin_read_timeout * 1000
+      error_message = "local.http_write_timeout_ms (${local.http_write_timeout_ms} ms) must be less than CloudFront's origin_read_timeout (${local.cf_origin_read_timeout * 1000} ms) so the server, not CF, owns the slow-handler timeout."
+    }
+  }
+}
+
+# Enable CloudFront additional metrics on the resolve distribution.
+# Adds OriginLatency (queryable as p50/p95/p99/p999 via extended statistics)
+# and per-origin error breakdowns to CloudWatch — required to debug origin-
+# side stalls / 502 spikes (e.g., WriteTimeout-bound resolve handler
+# latency). p999 is the tail signal we care about for the resolve flow:
+# the server's WriteTimeout caps end-to-end response time (see
+# local.http_write_timeout_ms + the qurl_resolve distribution's
+# lifecycle.precondition blocks), so an
+# origin-latency p999 trending toward that ceiling is the early-warning
+# shape for handler-side cutoffs that would surface as 502s. Matches the
+# EMF p99/p999 convention introduced in #871.
+#
+# Cost: $0.30 per metric per month × 8 additional metrics (OriginLatency +
+# 4xx/5xx total error rates + 6 per-status-code breakdowns) ≈ $2.40/month
+# per distribution.
+resource "aws_cloudfront_monitoring_subscription" "qurl_resolve" {
+  count           = var.deploy_qurl_link && var.enable_resolve_cloudfront ? 1 : 0
+  provider        = aws.us_east_1
+  distribution_id = aws_cloudfront_distribution.qurl_resolve[0].id
+
+  monitoring_subscription {
+    realtime_metrics_subscription_config {
+      realtime_metrics_subscription_status = "Enabled"
+    }
+  }
 }
 
 # CloudFront origin-facing IP ranges (for Gin trusted proxies)

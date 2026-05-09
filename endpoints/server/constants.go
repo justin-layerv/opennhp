@@ -34,18 +34,31 @@ const (
 const _ = uint(MaxAgentConnsPerIP - 1)
 
 // http APIs
+//
+// Contract: `IdleTimeoutMs >= proxy_origin_keepalive + buffer` whenever this
+// server runs behind a connection-pooling proxy. CloudFront's
+// `origin_keepalive_timeout` is set to 30s in
+// `terraform/main.tf::aws_cloudfront_distribution.qurl_resolve`, so 36s here
+// keeps the documented 5s buffer with 1s of real slack above the contract
+// floor. A lower value re-opens the resolve.qurl.link 502 race (CF reuses
+// an idle conn the server has FIN'd; next POST gets RST; CF surfaces 502
+// because POSTs aren't retried). LayerV diverges from upstream OpenNHP
+// defaults (4500/5500/6000); see docs/UPSTREAM_SYNC.md.
 const (
-	DefaultHttpRequestReadTimeoutMs   = 4500 // millisecond
-	DefaultHttpResponseWriteTimeoutMs = 5500 // millisecond
-	DefaultHttpServerIdleTimeoutMs    = 6000 // millisecond
+	DefaultHttpRequestReadTimeoutMs   = 30000 // millisecond
+	DefaultHttpResponseWriteTimeoutMs = 30000 // millisecond
+	DefaultHttpServerIdleTimeoutMs    = 36000 // millisecond
 )
 
 // broadcast
 const (
-	// DefaultBroadcastTimeout caps per-goroutine time in processACOperationBroadcast.
-	// Individual NHP transactions have their own ~4.7s timeout (HttpRequestReadTimeout +
-	// overhead). This 10s ceiling is ~2x that value to allow for network jitter while
-	// still bounding worst-case resource usage.
+	// DefaultBroadcastTimeout caps per-goroutine time in
+	// processACOperationBroadcast — i.e., how long the server waits for an
+	// AC peer to ACK an NHP-AOP. It's intentionally independent of the
+	// HTTP envelope timeouts above (those bound CF↔server connection
+	// state; this one bounds AC-side processing). 10s is sized to absorb
+	// AC startup jitter and short network blips while still cutting off
+	// a wedged AC before it drains the broadcast budget.
 	DefaultBroadcastTimeout = 10 * time.Second
 )
 

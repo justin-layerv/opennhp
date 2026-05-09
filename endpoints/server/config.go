@@ -609,22 +609,73 @@ func (s *UdpServer) updateBaseConfig(conf Config) (err error) {
 	return nil
 }
 
+// applyHttpTimeoutDefaults floors any zero-or-too-small timeout in conf to
+// the binary defaults in constants.go. The floor exists to fence the
+// CloudFront/CDN keep-alive race that produces intermittent 502 on POST
+// (PR #1795): IdleTimeoutMs MUST stay >= proxy origin keep-alive + buffer,
+// or CF reuses an idle conn the server has FIN'd and the next POST gets
+// RST. Plan-time enforcement lives at `terraform_data.http_keepalive_contract`
+// in terraform/main.tf; this helper covers the etcd-seed / http.toml
+// override paths that bypass TF.
+//
+// 1000ms floor matches the TF variable validation
+// (terraform/modules/compute/variables.tf::http_timeouts_ms). TF rejects
+// sub-floor values at plan time; this helper floors-up + warns at runtime
+// — TF is the deployment authority, the Go floor catches the bypass paths.
+//
+// CONTRACT: the warnings emitted here are load-bearing, not incidental.
+// Operators rely on them to confirm a sub-floor override was rejected,
+// and on the asymmetric IdleTimeoutMs below-default warning to be
+// reminded that a sub-default IdleTimeoutMs may re-open the keep-alive
+// race. Below-default warning fires ONLY for IdleTimeoutMs because only
+// IdleTimeoutMs participates in the CF origin-keep-alive race; Read/Write
+// timeouts are per-request and have no analogous proxy-pool coupling.
+// A future change that drops a warning while keeping the floor passes
+// every test in config_test.go (warnings aren't captured today, see
+// #1807) and silently regresses this contract. Warning gate is `!= 0`
+// not `> 0` so negative values — arguably MORE deliberate operator
+// overrides than the bare 0 — also surface a warning.
+//
+// Reload behavior: called from file-watch and etcd reload paths, so an
+// uncorrected sub-floor config re-emits the warning on every reload.
+// Intentional — each reload reaffirms the effective config — but watch
+// for log-spam in noisy reload environments (#1803 tracks dedup gating).
+//
+// Pure-logic helper (no method receiver, no I/O beyond the warning log)
+// so config_test.go can table-drive the behavior without spinning up an
+// UdpServer.
+func applyHttpTimeoutDefaults(conf *HttpConfig) {
+	if conf.ReadTimeoutMs < 1000 {
+		if conf.ReadTimeoutMs != 0 {
+			log.Warning("[Server] http ReadTimeoutMs override %d ignored (below 1000ms floor); defaulting to %d", conf.ReadTimeoutMs, DefaultHttpRequestReadTimeoutMs)
+		}
+		conf.ReadTimeoutMs = DefaultHttpRequestReadTimeoutMs
+	}
+	if conf.WriteTimeoutMs < 1000 {
+		if conf.WriteTimeoutMs != 0 {
+			log.Warning("[Server] http WriteTimeoutMs override %d ignored (below 1000ms floor); defaulting to %d", conf.WriteTimeoutMs, DefaultHttpResponseWriteTimeoutMs)
+		}
+		conf.WriteTimeoutMs = DefaultHttpResponseWriteTimeoutMs
+	}
+	if conf.IdleTimeoutMs < 1000 {
+		if conf.IdleTimeoutMs != 0 {
+			log.Warning("[Server] http IdleTimeoutMs override %d ignored (below 1000ms floor); defaulting to %d", conf.IdleTimeoutMs, DefaultHttpServerIdleTimeoutMs)
+		}
+		conf.IdleTimeoutMs = DefaultHttpServerIdleTimeoutMs
+	} else if conf.IdleTimeoutMs < DefaultHttpServerIdleTimeoutMs {
+		// Below-default but above-floor: permitted; warn for the
+		// keep-alive race risk. See docstring CONTRACT block for why
+		// only IdleTimeoutMs gets the below-default warning.
+		log.Warning("[Server] http IdleTimeoutMs override %d is below DefaultHttpServerIdleTimeoutMs (%d). Deployments behind connection-pooling proxies (CloudFront, etc.) require IdleTimeout > origin_keepalive_timeout to avoid the 502-on-reused-stale-conn race. Verify your topology actually allows the lower value before suppressing this warning.", conf.IdleTimeoutMs, DefaultHttpServerIdleTimeoutMs)
+	}
+}
+
 func (s *UdpServer) updateHttpConfig(httpConf HttpConfig) (err error) {
 	utils.CatchPanicThenRun(func() {
 		err = errLoadConfig
 	})
 
-	// set http default timeout values
-	// 4.5s for read timeout, 4s for write timeout, 5s for idle timeout
-	if httpConf.ReadTimeoutMs == 0 {
-		httpConf.ReadTimeoutMs = DefaultHttpRequestReadTimeoutMs
-	}
-	if httpConf.WriteTimeoutMs == 0 {
-		httpConf.WriteTimeoutMs = DefaultHttpResponseWriteTimeoutMs
-	}
-	if httpConf.IdleTimeoutMs == 0 {
-		httpConf.IdleTimeoutMs = DefaultHttpServerIdleTimeoutMs
-	}
+	applyHttpTimeoutDefaults(&httpConf)
 
 	// update
 	if httpConf.EnableHttp {

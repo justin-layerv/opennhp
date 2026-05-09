@@ -454,6 +454,14 @@ resource "aws_cloudwatch_metric_alarm" "no_healthy_hosts" {
 }
 
 # NLB TCP Reset Count - potential connectivity issues
+#
+# NOTE: This dim points at the UDP TG (port 62206). NLB does not publish
+# TCP_Target_Reset_Count for UDP target groups, so the metric never has
+# data — combined with `treat_missing_data = "notBreaching"` below, the
+# alarm reports OK forever. The HTTPS sibling below is the one that
+# actually fires on origin RST events behind CloudFront's keep-alive pool.
+# Kept for now to avoid breaking dashboards keyed on this alarm name; safe
+# to delete in a follow-up (tracked in #1798).
 resource "aws_cloudwatch_metric_alarm" "tcp_resets" {
   alarm_name          = "${var.name_prefix}-${var.cell_id}-tcp-resets"
   comparison_operator = "GreaterThanThreshold"
@@ -471,6 +479,72 @@ resource "aws_cloudwatch_metric_alarm" "tcp_resets" {
   dimensions = {
     LoadBalancer = var.nlb_arn_suffix
     TargetGroup  = var.target_group_arn_suffix
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# NLB HTTPS-TG TCP Reset Count — the dim that actually carries data for
+# the resolve.qurl.link → NLB:443 → server:8888 origin path. Origin-side
+# RSTs here surface as CloudFront 502s on POST /plugins/qurl when CF reuses
+# a stale keep-alive (race against the server's IdleTimeout). Threshold
+# matches the UDP-TG alarm for parity; tune separately once we have a
+# steady-state baseline post timeout fix.
+resource "aws_cloudwatch_metric_alarm" "tcp_resets_https" {
+  count               = var.https_target_group_arn_suffix != null ? 1 : 0
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-tcp-resets-https"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  metric_name         = "TCP_Target_Reset_Count"
+  namespace           = "AWS/NetworkELB"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 100
+  alarm_description   = "Origin RSTs on the HTTPS target group (server :8888). Mid-stream resets here cause CloudFront 502 on resolve.qurl.link POSTs."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    LoadBalancer = var.nlb_arn_suffix
+    TargetGroup  = var.https_target_group_arn_suffix
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# Green HTTPS TG sibling — same fence as tcp_resets_https, scoped to the
+# green-color target group. Required because blue/green flips the listener
+# default action between blue and green TGs (see compute/blue_green.tf::
+# aws_lb_listener.https default_action_target_group_arn). Without this,
+# origin RSTs that happen while green is the active color would not page.
+# Mirrors the green_tg_no_healthy_targets pattern in blue_green.tf:548.
+# Only created when the caller is blue/green-enabled (the green TG output
+# is null in canary deployments).
+resource "aws_cloudwatch_metric_alarm" "tcp_resets_https_green" {
+  count               = var.https_green_target_group_arn_suffix != null ? 1 : 0
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-tcp-resets-https-green"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  metric_name         = "TCP_Target_Reset_Count"
+  namespace           = "AWS/NetworkELB"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 100
+  alarm_description   = "Origin RSTs on the GREEN HTTPS target group (server :8888). Same class as tcp-resets-https; this fence covers the post-blue/green-flip window when green serves traffic."
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    LoadBalancer = var.nlb_arn_suffix
+    TargetGroup  = var.https_green_target_group_arn_suffix
   }
 
   tags = merge(var.tags, {

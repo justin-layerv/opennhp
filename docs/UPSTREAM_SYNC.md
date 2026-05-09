@@ -36,6 +36,19 @@ These are PERMANENTLY skipped. Don't waste time reviewing them:
 
 ---
 
+## Fork Divergence Catalog
+
+Values where the fork intentionally diverges from upstream. **If an upstream commit reverts any of these, do not sync the revert** — re-apply the divergence locally and document why.
+
+| File / value | Upstream | LayerV fork | Why |
+|---|---|---|---|
+| `endpoints/server/constants.go::DefaultHttpRequestReadTimeoutMs` | `4500` | `30000` | LayerV runs the server behind a CloudFront-fronted topology; CF's `origin_keepalive_timeout = 30s`. The original 4500/5500/6000 default produced an intermittent 502 race (PR #1795). |
+| `endpoints/server/constants.go::DefaultHttpResponseWriteTimeoutMs` | `5500` | `30000` | Same — paired with the read timeout, sized below CF's `origin_read_timeout` (60s). |
+| `endpoints/server/constants.go::DefaultHttpServerIdleTimeoutMs` | `6000` | `36000` | Same — IdleTimeout MUST exceed CF's `origin_keepalive_timeout` + a 5s buffer. **Note:** 36000 is intentionally not exactly 30000 + 5000. The contract floor is 35000 (CF keep-alive 30s + 5s buffer); 36000 sits 1s above the floor so the precondition's `>=` check has real slack instead of passing by exact equality. Lower values re-open the keep-alive race fixed in PR #1795. |
+| `endpoints/server/config.go::applyHttpTimeoutDefaults` floor logic | `if X == 0 { X = default }` | `if X < 1000 { X = default }` | Diverges from upstream's "default-if-zero" semantics: any positive-but-below-1000ms value gets defaulted up + warned. Catches operator overrides via http.toml or etcd seeding that bypass TF validation. If you sync from upstream and the floor semantics revert to "default only when the value is zero" (whether spelled `== 0`, `<= 0`, or any refactor that re-introduces "zero is the only sub-floor sentinel"), an etcd-seeded `IdleTimeoutMs = 500` would silently re-open the keep-alive race. The `< 1000` guard is the durable contract — review every sync against this row. PR #1795. |
+
+---
+
 ## Decision Matrix
 
 | If commit is... | Action | Time to decide |

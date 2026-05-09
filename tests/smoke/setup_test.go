@@ -51,6 +51,7 @@ func TestMain(m *testing.M) {
 	testConfig = &TestConfig{
 		Environment:             env,
 		NHPServerBaseURL:        getEnvOrDefault("NHP_SERVER_BASE_URL", derived.NHPServerBaseURL),
+		NHPServerOriginURL:      getEnvOrDefault("NHP_SERVER_ORIGIN_URL", derived.NHPServerOriginURL),
 		QURLAPIBaseURL:          getEnvOrDefault("QURL_API_BASE_URL", derived.QURLAPIBaseURL),
 		QURLInternalAPIHostname: getEnvOrDefault("QURL_INTERNAL_API_HOSTNAME", derived.QURLInternalAPIHostname),
 		QURLSiteDomain:          getEnvOrDefault("QURL_SITE_DOMAIN", derived.QURLSiteDomain),
@@ -65,6 +66,7 @@ func TestMain(m *testing.M) {
 	}
 
 	testConfig.NHPServerBaseURL = strings.TrimSuffix(testConfig.NHPServerBaseURL, "/")
+	testConfig.NHPServerOriginURL = strings.TrimSuffix(testConfig.NHPServerOriginURL, "/")
 	testConfig.QURLAPIBaseURL = strings.TrimSuffix(testConfig.QURLAPIBaseURL, "/")
 
 	// Catch the misconfigured combo "ALB enabled but no hostname" before

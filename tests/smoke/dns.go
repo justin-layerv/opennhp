@@ -14,7 +14,18 @@ import "fmt"
 // served on the QURL API.
 type derivedEndpoints struct {
 	NHPServerBaseURL string
-	QURLAPIBaseURL   string
+
+	// NHPServerOriginURL is the NLB-direct hostname for the NHP server's
+	// HTTPS plugin endpoint, BYPASSING any CloudFront in front of
+	// resolve.qurl.link. Used by the keep-alive idle-timeout fence
+	// (09_resolve_origin_idle_timeout_test.go) to probe the server
+	// directly. Prefer NHPServerBaseURL for any test that wants the
+	// production traffic path; this is for tests that specifically need
+	// to bypass CF (e.g., to fence server-side timeout behavior, which
+	// CF would mask via origin connection pooling and retries).
+	NHPServerOriginURL string
+
+	QURLAPIBaseURL string
 
 	// QURLInternalAPIHostname is the qurl-service internal ALB hostname.
 	// Empty when the internal ALB is not yet enabled (allowing the new
@@ -45,6 +56,7 @@ func deriveEndpoints(env string) (derivedEndpoints, error) {
 	case "sandbox":
 		return derivedEndpoints{
 			NHPServerBaseURL:        "https://resolve.qurl.link.layerv.xyz",
+			NHPServerOriginURL:      "https://resolve-origin.qurl.link.layerv.xyz",
 			QURLAPIBaseURL:          "https://api.layerv.xyz",
 			QURLInternalAPIHostname: "internal-api.qurl.layerv.xyz",
 			QURLSiteDomain:          "qurl.site.layerv.xyz",
@@ -53,6 +65,7 @@ func deriveEndpoints(env string) (derivedEndpoints, error) {
 	case "prod":
 		return derivedEndpoints{
 			NHPServerBaseURL:        "https://resolve.qurl.link",
+			NHPServerOriginURL:      "https://resolve-origin.qurl.link",
 			QURLAPIBaseURL:          "https://api.layerv.ai",
 			QURLInternalAPIHostname: "internal-api.qurl.layerv.ai",
 			// Prod uses the registered apex `qurl.site` directly, so

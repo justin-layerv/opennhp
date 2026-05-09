@@ -172,3 +172,98 @@ func TestUpdateResources_MixedNilAndValid(t *testing.T) {
 		t.Errorf("valid-plugin AuthSvcId = %q, want %q", s.authServiceMap["valid-plugin"].AuthSvcId, "valid-plugin")
 	}
 }
+
+// TestApplyHttpTimeoutDefaults table-drives the floor-up logic that
+// guards the CloudFront keep-alive contract (see PR #1795). Pure logic,
+// no UdpServer required.
+func TestApplyHttpTimeoutDefaults(t *testing.T) {
+	tests := []struct {
+		name      string
+		in        HttpConfig
+		wantRead  int
+		wantWrite int
+		wantIdle  int
+	}{
+		{
+			name:      "zero values get defaulted (normal not-set case)",
+			in:        HttpConfig{},
+			wantRead:  DefaultHttpRequestReadTimeoutMs,
+			wantWrite: DefaultHttpResponseWriteTimeoutMs,
+			wantIdle:  DefaultHttpServerIdleTimeoutMs,
+		},
+		{
+			name:      "below-floor positive values get defaulted up",
+			in:        HttpConfig{ReadTimeoutMs: 100, WriteTimeoutMs: 500, IdleTimeoutMs: 999},
+			wantRead:  DefaultHttpRequestReadTimeoutMs,
+			wantWrite: DefaultHttpResponseWriteTimeoutMs,
+			wantIdle:  DefaultHttpServerIdleTimeoutMs,
+		},
+		{
+			name:      "exact floor (1000) carries through unchanged",
+			in:        HttpConfig{ReadTimeoutMs: 1000, WriteTimeoutMs: 1000, IdleTimeoutMs: 1000},
+			wantRead:  1000,
+			wantWrite: 1000,
+			wantIdle:  1000,
+		},
+		{
+			name:      "above-floor values carry through unchanged",
+			in:        HttpConfig{ReadTimeoutMs: 60000, WriteTimeoutMs: 45000, IdleTimeoutMs: 90000},
+			wantRead:  60000,
+			wantWrite: 45000,
+			wantIdle:  90000,
+		},
+		{
+			// IdleTimeoutMs > 1000 but < DefaultHttpServerIdleTimeoutMs:
+			// permitted (carries through) but emits a separate Warning
+			// about the keep-alive contract risk. The Warning side-effect
+			// isn't asserted here (capturing log output cleanly is more
+			// plumbing than the test warrants); just verify the value
+			// itself isn't silently floored, which would mask any
+			// deliberate operator override.
+			name:      "above-1000ms-floor but below safe default carries through",
+			in:        HttpConfig{ReadTimeoutMs: 30000, WriteTimeoutMs: 30000, IdleTimeoutMs: 5000},
+			wantRead:  30000,
+			wantWrite: 30000,
+			wantIdle:  5000,
+		},
+		{
+			name:      "mixed: one below floor, others above",
+			in:        HttpConfig{ReadTimeoutMs: 50, WriteTimeoutMs: 30000, IdleTimeoutMs: 36000},
+			wantRead:  DefaultHttpRequestReadTimeoutMs,
+			wantWrite: 30000,
+			wantIdle:  36000,
+		},
+		{
+			name:      "negative values get defaulted (treated as below-floor)",
+			in:        HttpConfig{ReadTimeoutMs: -1, WriteTimeoutMs: -100, IdleTimeoutMs: -1},
+			wantRead:  DefaultHttpRequestReadTimeoutMs,
+			wantWrite: DefaultHttpResponseWriteTimeoutMs,
+			wantIdle:  DefaultHttpServerIdleTimeoutMs,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			conf := tc.in
+			applyHttpTimeoutDefaults(&conf)
+			if conf.ReadTimeoutMs != tc.wantRead {
+				t.Errorf("ReadTimeoutMs: got %d, want %d", conf.ReadTimeoutMs, tc.wantRead)
+			}
+			if conf.WriteTimeoutMs != tc.wantWrite {
+				t.Errorf("WriteTimeoutMs: got %d, want %d", conf.WriteTimeoutMs, tc.wantWrite)
+			}
+			if conf.IdleTimeoutMs != tc.wantIdle {
+				t.Errorf("IdleTimeoutMs: got %d, want %d", conf.IdleTimeoutMs, tc.wantIdle)
+			}
+		})
+	}
+
+	// Sanity check: defaults themselves carry the keep-alive contract.
+	// Any future bump to the constants must keep idle >= 30000 (CF
+	// origin_keepalive_timeout) + a buffer. This isn't a contract test
+	// per se — that lives in TF — but a regression here would mean the
+	// constants no longer satisfy the LayerV deployment topology.
+	if DefaultHttpServerIdleTimeoutMs < 30000 {
+		t.Errorf("DefaultHttpServerIdleTimeoutMs = %d is below CloudFront origin_keepalive_timeout (30000ms); contract violation. See PR #1795.", DefaultHttpServerIdleTimeoutMs)
+	}
+}

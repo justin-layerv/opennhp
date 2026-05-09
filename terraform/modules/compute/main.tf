@@ -726,6 +726,15 @@ locals {
     knock_global_rate_limit_pps   = var.knock_global_rate_limit_pps
     knock_global_rate_limit_burst = var.knock_global_rate_limit_burst
     udp_recv_buffer_bytes         = var.udp_recv_buffer_bytes
+    # HTTP server timeouts. Surfaced as a TF variable (not hard-coded in
+    # the heredoc) so the root module's `aws_cloudfront_distribution.qurl_resolve`
+    # lifecycle.precondition can hard-fail plan/apply if IdleTimeoutMs
+    # drops below origin_keepalive_timeout + buffer. Bumping CF without
+    # touching these would silently re-open the keep-alive race; the
+    # precondition fences that.
+    http_read_timeout_ms  = var.http_timeouts_ms.read
+    http_write_timeout_ms = var.http_timeouts_ms.write
+    http_idle_timeout_ms  = var.http_timeouts_ms.idle
   })
 }
 

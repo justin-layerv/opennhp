@@ -203,11 +203,25 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 	hs.initRouter()
 
 	hs.httpServer = &http.Server{
-		Addr:         hs.listenAddr.String(),
-		Handler:      hs.ginEngine,
-		ReadTimeout:  time.Duration(hc.ReadTimeoutMs) * time.Millisecond,
-		WriteTimeout: time.Duration(hc.WriteTimeoutMs) * time.Millisecond,
-		IdleTimeout:  time.Duration(hc.IdleTimeoutMs) * time.Millisecond,
+		Addr:    hs.listenAddr.String(),
+		Handler: hs.ginEngine,
+		// ReadHeaderTimeout caps the slowloris-headers attack surface
+		// independently of ReadTimeout. With ReadTimeout=30s (sized for
+		// slow client *body* uploads under degraded networks), an attacker
+		// trickling headers byte-by-byte could otherwise hold a socket for
+		// the full 30s. 5s is well above any legitimate cross-region
+		// header-write RTT × overhead and short enough to evict slow
+		// readers promptly. Defaults to ReadTimeout when unset, which
+		// would defeat the point.
+		//
+		// Intentionally NOT exposed via http.toml. The right value is
+		// the same everywhere; making it tunable would invite the wrong
+		// knob being turned (operator looking to lengthen ReadTimeout
+		// shouldn't accidentally also widen the slowloris window).
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       time.Duration(hc.ReadTimeoutMs) * time.Millisecond,
+		WriteTimeout:      time.Duration(hc.WriteTimeoutMs) * time.Millisecond,
+		IdleTimeout:       time.Duration(hc.IdleTimeoutMs) * time.Millisecond,
 	}
 
 	hs.wg.Add(1)
