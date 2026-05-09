@@ -467,6 +467,15 @@ module "compute" {
     write = local.http_write_timeout_ms
   }
 
+  # S3 plugin bucket — also hosts the server bootstrap script
+  # (scripts/server-init.sh) so the launch template's user_data stays
+  # within EC2's 16KB limit. Same bucket the AC module uses; separate
+  # path prefix. plugin_download_policy_arn includes both s3:GetObject
+  # and kms:Decrypt on the bucket's CMK (which is module.kms.logs_key_arn,
+  # NOT secrets_key_arn — separate CMK).
+  plugin_bucket_name         = module.plugins.bucket_name
+  plugin_download_policy_arn = module.plugins.download_policy_arn
+
   # Pluggable storage backend - DynamoDB (cloud default) with etcd feature flag for on-prem
   # Note: attach_storage_policies is required because Terraform cannot evaluate count based on module outputs
   attach_storage_policies  = true

@@ -736,6 +736,127 @@ locals {
     http_write_timeout_ms = var.http_timeouts_ms.write
     http_idle_timeout_ms  = var.http_timeouts_ms.idle
   })
+
+  # Launch template user_data — small fetcher when the plugin bucket exists,
+  # legacy inline base64gzip path otherwise. Computed in a local so the
+  # lifecycle.precondition on aws_launch_template.server can reference the
+  # rendered bytes (TF preconditions can't reference `self`).
+  server_launch_template_user_data = var.plugin_bucket_name != null ? base64encode(<<-BOOTSTRAP
+#!/bin/bash
+# -e: exit on error. -x: trace. pipefail: a write failure in the
+# tee/logger pipe below shouldn't return 0 from the pipeline and let
+# the rest of the script proceed logless.
+set -exo pipefail
+exec > >(tee /var/log/user-data.log | logger -t user-data) 2>&1
+# Init script hash: ${aws_s3_object.server_init_script[0].etag}
+
+# Fetch region from IMDSv2 BEFORE the trap and apt block. report_failure
+# below uses --region "$REGION", and an early failure during apt/awscli
+# install is the most common boot failure mode — fetching region after
+# would leave the failure metric region-less and silently dropped.
+#
+# Defensive fetch: bash command-substitution failures don't trip set -e,
+# and curl -s masks HTTP errors as empty bodies. Without retry, a single
+# IMDS hiccup on a thundering-herd ASG scale-up bricks the instance with
+# no signal. -f fails on HTTP non-2xx, explicit emptiness check catches
+# the curl-returns-0-with-empty-body edge case.
+fetch_imds_token_and_region() {
+  local token region
+  for _ in 1 2 3 4 5; do
+    # Reset locals each iteration so a partial-success in one iteration
+    # (token set, region failed) can't leak a stale token into the next
+    # iteration's emptiness checks.
+    token=""; region=""
+    token=$(curl -fs -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60") || { sleep 2; continue; }
+    [ -n "$token" ] || { sleep 2; continue; }
+    region=$(curl -fs -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/placement/region) || { sleep 2; continue; }
+    [ -n "$region" ] || { sleep 2; continue; }
+    TOKEN=$token; REGION=$region; return 0
+  done
+  return 1
+}
+if ! fetch_imds_token_and_region; then
+  echo "FATAL: IMDSv2 unreachable after 5 attempts; bricking instance loud rather than silent"
+  # IMDS-failure path: REGION is unset, so report_failure (which uses
+  # --region "$REGION") would silently drop the metric. Use the
+  # TF-interpolated literal as a fallback so on-call gets paged on
+  # this exact failure mode (the most likely one on a thundering-herd
+  # ASG scale-up — see fetch_imds_token_and_region docstring).
+  command -v aws &>/dev/null && aws cloudwatch put-metric-data \
+    --namespace "LayerV/NHP" \
+    --metric-name "BootstrapFailure" \
+    --value 1 --unit Count \
+    --dimensions "Component=server,Environment=${var.environment},FailureMode=imds-unreachable" \
+    --region "${data.aws_region.current.id}" 2>/dev/null || true
+  exit 1
+fi
+
+report_failure() {
+  echo "BOOTSTRAP FAILED: $1"
+  command -v aws &>/dev/null && aws cloudwatch put-metric-data \
+    --namespace "LayerV/NHP" \
+    --metric-name "BootstrapFailure" \
+    --value 1 --unit Count \
+    --dimensions "Component=server,Environment=${var.environment}" \
+    --region "$REGION" 2>/dev/null || true
+}
+trap 'report_failure "unexpected error on line $LINENO"' ERR
+retry_with_backoff() {
+  local max_attempts=$1 delay=$2 max_delay=$3; shift 3
+  local attempt=1
+  while true; do
+    if "$@"; then return 0; fi
+    if [ "$attempt" -ge "$max_attempts" ]; then echo "ERROR: $* failed after $max_attempts attempts"; return 1; fi
+    echo "$* failed (attempt $attempt/$max_attempts), retrying in $${delay}s..."
+    sleep "$delay"; attempt=$((attempt + 1)); delay=$((delay * 2))
+    if [ "$delay" -gt "$max_delay" ]; then delay=$max_delay; fi
+  done
+}
+apt_get_with_retry() { retry_with_backoff 10 2 60 apt-get "$@"; }
+# Custom NHP server AMI ships with awscli pre-installed (packer/nhp-server-docker.pkr.hcl).
+# Defensive: install if missing in case the AMI builder regresses.
+if ! command -v aws &>/dev/null; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt_get_with_retry update -y
+  apt_get_with_retry install -y unzip curl
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+  unzip -qo /tmp/awscliv2.zip -d /tmp && /tmp/aws/install --update
+  rm -rf /tmp/awscliv2.zip /tmp/aws
+fi
+retry_with_backoff 3 5 30 aws s3 cp "s3://${var.plugin_bucket_name}/scripts/server-init.sh" /tmp/server-init.sh --region "$REGION"
+chmod +x /tmp/server-init.sh
+exec /tmp/server-init.sh
+BOOTSTRAP
+  ) : base64gzip(local.user_data) # legacy inline path — only kept as a structural fallback for bucket-not-yet-provisioned bootstrap; fails for the same size reason this PR exists to fix, so it's not a viable runtime rollback. To roll back, revert this PR.
+}
+
+# Server bootstrap script in S3 (mirrors AC module pattern). The rendered
+# user_data sits at the EC2 16KB user_data limit (post-gzip), so we move
+# the bulk to S3 and keep the launch template's user_data as a small
+# fetcher. Introduced in PR #1809; the matching size-guard precondition
+# on aws_launch_template.server fences regrowth.
+resource "aws_s3_object" "server_init_script" {
+  count = var.plugin_bucket_name != null ? 1 : 0
+
+  bucket       = var.plugin_bucket_name
+  key          = "scripts/server-init.sh"
+  content      = local.user_data
+  content_type = "text/x-shellscript"
+}
+
+# Attach the plugin-bucket download policy from modules/plugins to the
+# server role. This grants s3:GetObject + KMS Decrypt on the bucket's
+# CMK — needed because the plugin bucket is encrypted with
+# module.kms.logs_key_arn, which is a different CMK from the server's
+# secrets_kms_key_arn (modules/kms/outputs.tf:21,31). A scripts/*-only
+# inline policy would land us with s3:GetObject but no KMS Decrypt, so
+# `aws s3 cp` would AccessDenied at boot. Mirrors the AC module's
+# pattern (modules/ac/main.tf::aws_iam_role_policy_attachment.ac_plugins).
+resource "aws_iam_role_policy_attachment" "server_plugins" {
+  count = var.plugin_download_policy_arn != null ? 1 : 0
+
+  role       = aws_iam_role.server.name
+  policy_arn = var.plugin_download_policy_arn
 }
 
 # Launch Template
@@ -767,9 +888,15 @@ resource "aws_launch_template" "server" {
     }
   }
 
-  # Use base64gzip to compress user_data - AWS EC2 automatically decompresses
-  # This allows scripts larger than the 16KB uncompressed limit
-  user_data = base64gzip(local.user_data)
+  # Full init script lives in S3 because the rendered template exceeds
+  # EC2's 16KB user_data limit (post-gzip). Bootstrap installs/uses AWS CLI,
+  # downloads scripts/server-init.sh, and execs it. The S3 object's etag is
+  # embedded so a content change forces a launch template version bump (and
+  # thus an instance refresh on the next deploy). Mirrors the AC module's
+  # battle-tested pattern (modules/ac/main.tf::aws_launch_template.ac).
+  # Computed via local.server_launch_template_user_data so the size guard
+  # in lifecycle.precondition (below) can reference the rendered output.
+  user_data = local.server_launch_template_user_data
 
   monitoring {
     enabled = true
@@ -795,9 +922,48 @@ resource "aws_launch_template" "server" {
 
   lifecycle {
     create_before_destroy = true
+
+    # Fail-loud guard against the size cliff this PR was created to escape.
+    # EC2 caps user_data at 16,384 raw bytes (post-base64-decode); see
+    # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/user-data.html.
+    # The whole point of the S3-hosted bootstrap is to keep the inline
+    # user_data tiny — if a future PR adds enough to the bootstrap
+    # heredoc to push past the limit, fail at plan time rather than at
+    # apply time (where the only signal is a confusing "Modifying..."
+    # error mid-apply).
+    #
+    # Note: the user_data references aws_s3_object.server_init_script[0].etag,
+    # which is computed (known after apply) on first create and on any
+    # content change. TF defers precondition evaluation in that case to
+    # apply time — so this guard is plan-time on stable-etag updates,
+    # apply-time on first create / content change. Either way it fails
+    # before AWS rejects the launch template version for size, which is
+    # the actual win vs. the status quo.
+    precondition {
+      condition     = length(base64decode(local.server_launch_template_user_data)) <= 16384
+      error_message = "Launch-template user_data exceeds EC2's 16384-byte cap (post-base64-decode). The S3 bootstrap pattern (modules/compute/main.tf::aws_s3_object.server_init_script) exists to keep the inline user_data tiny — move new logic into scripts/server-init.sh, not into the bootstrap heredoc."
+    }
+
+    # Both-or-neither: a future caller setting plugin_bucket_name without
+    # plugin_download_policy_arn would render the BOOTSTRAP path, accept
+    # the launch template, and brick instances at boot with AccessDenied
+    # on the s3 cp (no KMS Decrypt grant). Plan-time fail is cheaper than
+    # boot-time fail.
+    precondition {
+      condition     = (var.plugin_bucket_name == null) == (var.plugin_download_policy_arn == null)
+      error_message = "plugin_bucket_name and plugin_download_policy_arn must be set together — the bucket needs the policy's KMS Decrypt grant or instances brick at boot."
+    }
   }
 
-  depends_on = [aws_lambda_invocation.keygen]
+  # Explicit dependency on the policy attachment so the first ASG launch
+  # in a greenfield apply can't race ahead of IAM eventual consistency.
+  # The S3 init script is also a hard dependency since user_data
+  # references its etag.
+  depends_on = [
+    aws_lambda_invocation.keygen,
+    aws_iam_role_policy_attachment.server_plugins,
+    aws_s3_object.server_init_script,
+  ]
 }
 
 # Auto Scaling Group

@@ -2114,6 +2114,18 @@ resource "aws_iam_policy" "qurl_link_static" {
         Resource = "*"
       },
       {
+        # Distribution-level real-time metrics subscription. Required by
+        # `aws_cloudfront_monitoring_subscription.qurl_resolve` (PR #1795).
+        Sid    = "CloudFrontMonitoringSubscription"
+        Effect = "Allow"
+        Action = [
+          "cloudfront:CreateMonitoringSubscription",
+          "cloudfront:GetMonitoringSubscription",
+          "cloudfront:DeleteMonitoringSubscription"
+        ]
+        Resource = "*"
+      },
+      {
         Sid    = "CloudFrontCachePolicy"
         Effect = "Allow"
         Action = [

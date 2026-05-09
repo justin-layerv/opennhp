@@ -658,3 +658,27 @@ variable "http_timeouts_ms" {
     error_message = "http_timeouts_ms.idle must STRICTLY exceed both .read and .write. This is a config-shape sanity check: equal or inverted values (idle <= read or idle <= write) almost always indicate a copy-paste typo rather than a deliberate design choice — the strict comparison forces the operator to commit to two distinct values. (No runtime correctness depends on this — Go's IdleTimeout fires only between requests, never mid-read or mid-write — but a typo here would silently land a confusing config.)"
   }
 }
+
+# =============================================================================
+# S3 bootstrap (plugin bucket — shared with AC, separate path prefix)
+# =============================================================================
+# The rendered user_data.sh.tpl is ~49KB raw / ~16KB gzipped, sitting at the
+# EC2 user_data hard limit (16384 bytes post-gzip). Any new comment, env var,
+# or systemd unit eats into a razor-thin headroom margin. Move the bulk of
+# the bootstrap to S3, mirror the AC module pattern (which has used this
+# since at least PR #239), and keep the launch template user_data as a
+# small fetcher (~1.5KB raw, ~700B gzipped). PR #1809 introduced this for
+# server; the matching launch-template size-guard precondition fences
+# regrowth.
+
+variable "plugin_bucket_name" {
+  description = "Name of the S3 plugins bucket (also hosts server bootstrap scripts under scripts/server-init.sh). When non-null, user_data switches to the small S3 fetcher bootstrap. The null branch exists only as a structural fallback for bucket-not-yet-provisioned bootstrap on greenfield envs and will fail at apply for the same 16KB user_data size reason this S3 indirection exists to fix — it is NOT a viable runtime rollback. Existing envs always have a bucket and should never see the null branch."
+  type        = string
+  default     = null
+}
+
+variable "plugin_download_policy_arn" {
+  description = "ARN of the IAM policy granting s3:GetObject + kms:Decrypt on the plugin bucket and its CMK. Sourced from modules/plugins.download_policy_arn (same policy AC uses). Required when plugin_bucket_name is set; without it the bootstrap fetch fails at apply with AccessDenied because the bucket is KMS-encrypted with a CMK the server role otherwise has no Decrypt grant on."
+  type        = string
+  default     = null
+}
