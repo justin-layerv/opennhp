@@ -248,6 +248,75 @@ else flips it (no plan-time revert):
 that exceeds the static cap fights the rehearsal — the cap is the
 safety net.
 
+**IAM eventual-consistency shim pattern.** When the same `terraform
+apply` both grants a new permission to a CI role's policy AND
+creates a resource that needs that permission, the IAM
+authorization evaluator can lag the API call by up to ~60s and the
+fresh resource hits AccessDenied. The shim is a `time_sleep` keyed
+on a policy fingerprint; the consumer adds `depends_on` on the
+sleep. Existing instances of the pattern:
+
+- `time_sleep.apigateway_logging_propagation` (10s; APIGW async
+  CloudWatch role check, bounded). Trigger source: a *resource
+  dependency* (`depends_on = [aws_api_gateway_account.this]`).
+- `time_sleep.qurl_link_static_iam_propagation` (60s; IAM
+  evaluator propagation, no published SLA). Trigger source: a
+  *content dependency* (sha256 of the policy doc + the policy ARN).
+
+Pick by what you're racing: a resource creation → resource-dep
+trigger; an in-place policy doc edit → content-hash trigger.
+
+To add a shim for another CI policy when it next trips: expose
+`<policy>_policy_doc_hash` AND `<policy>_policy_arn` as outputs
+from whichever module owns the policy (today: `modules/ecr/`;
+after #1812: `modules/ci-policies/`) computed as
+`sha256(aws_iam_policy.<policy>.policy)` and
+`aws_iam_policy.<policy>.arn`. Add a `time_sleep` keyed on both
+in `terraform/main.tf`, gated on the OR of every consumer's
+condition (so envs without consumers don't pay the 60s), and add
+`depends_on` on each consumer needing the freshly granted perm.
+The 10s value is for APIGW only — for IAM-evaluator races use 60s.
+
+The two triggers cover different races: the doc hash catches
+in-place perm edits (the common case); the ARN rotates on a
+rename-via-`name`. Note `policy_arn` does NOT cover `terraform
+taint` of a same-name policy — IAM policy ARNs are deterministic
+from `arn:aws:iam::ACCT:policy/NAME`, so a taint+recreate reads
+back an identical string and `triggers` compares strings, not
+resource identities. For the taint case, also taint the
+`time_sleep` so the wait re-fires.
+
+`depends_on` defends create + replace paths only. For an in-place
+update on an existing resource that exercises a freshly granted
+perm, the right escape hatch depends on the resource's replacement
+cost:
+
+- **Cheap to recreate** (most resources): `replace_triggered_by =
+  [time_sleep.<policy>_iam_propagation]` on the consumer's
+  `lifecycle` forces it to recreate when the policy doc changes,
+  paying the 60s on the recreate path.
+
+  ```hcl
+  resource "aws_some_cheap_resource" "example" {
+    # ...config that exercises a newly granted perm...
+
+    lifecycle {
+      replace_triggered_by = [time_sleep.qurl_link_static_iam_propagation[0]]
+    }
+  }
+  ```
+
+- **Expensive to recreate** (CF distribution: 15–30 min global
+  propagation; ECS service: traffic disruption): DO NOT use
+  `replace_triggered_by`. Either split the perm-grant apply from
+  the consumer-config apply (two-phase), or manually `terraform
+  taint` the consumer once after the perm lands. Both pay the 60s
+  exactly once instead of on every policy edit.
+
+Greenfield envs aren't covered by the existing shim's consumer
+set — all CF resources consuming the policy need their own
+`depends_on` on first apply (tracked in #1813).
+
 ### Docker
 
 ```bash

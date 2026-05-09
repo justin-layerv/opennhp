@@ -2372,3 +2372,20 @@ output "untagged_expiry_hours" {
   description = "Untagged-image lifecycle expiry in hours; consumed by the replication-check Lambda's lookback fence."
   value       = local.ecr_untagged_expiry_days * 24
 }
+
+# Trigger sources for `time_sleep.qurl_link_static_iam_propagation` —
+# see that resource in `terraform/main.tf` for the rationale.
+output "qurl_link_static_policy_doc_hash" {
+  description = "sha256 of the qurl_link_static CI policy doc; trigger source for IAM-propagation shims."
+  value       = sha256(aws_iam_policy.qurl_link_static.policy)
+}
+
+output "qurl_link_static_policy_arn" {
+  description = "ARN of the qurl_link_static CI policy."
+  value       = aws_iam_policy.qurl_link_static.arn
+}
+
+output "qurl_link_static_attachment_id" {
+  description = "ID of the role-policy attachment for qurl_link_static. Use as a trigger source so an IAM-propagation `time_sleep` orders after the attachment lands at AWS — the implicit dep on the doc/arn outputs only orders against the policy resource, not the attachment that actually feeds the auth evaluator."
+  value       = aws_iam_role_policy_attachment.qurl_link_static.id
+}

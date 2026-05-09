@@ -2829,6 +2829,63 @@ resource "terraform_data" "http_keepalive_contract" {
   }
 }
 
+locals {
+  # Shared gate for the qurl-resolve CloudFront resources and their
+  # IAM-propagation shim — keeps the gate in lockstep across the
+  # shim and every consumer (today: monitoring sub; on landing of
+  # #1813: distribution + OAC + response-headers policy).
+  deploy_qurl_resolve_cf = var.deploy_qurl_link && var.enable_resolve_cloudfront
+}
+
+# IAM eventual-consistency shim for the qurl_link_static CI policy.
+# Same-apply IAM-grant + resource-create races the auth evaluator's
+# propagation, surfacing as AccessDenied on the fresh resource (see
+# PR #1809 / run 25594591764 for the original trip). Resources whose
+# creation needs a freshly granted perm add `depends_on` here.
+#
+# 60s, not the 10s of `time_sleep.apigateway_logging_propagation`
+# above: API Gateway's bounded async CloudWatch role check converges
+# fast; the IAM authorization-evaluator propagation does not. AWS
+# does not publish an SLA — 60s is the conservative upper bound;
+# observed latencies sit well under it. Picking 10s here would
+# re-trip the race.
+#
+# Triggers (any change recreates the sleep):
+#   - `policy_doc_hash`: sha256 of the rendered policy. Catches
+#     the common case (action added in place). Hashing keeps plan
+#     diffs one line; the policy resource itself shows what changed.
+#   - `policy_arn`: catches the rename-via-`name` case.
+#   - `attachment_id`: NOT a recreation trigger (the id is stable
+#     as `<role>/<policy_arn>`), but its presence in `triggers`
+#     forces the dep graph to order this sleep AFTER
+#     `aws_iam_role_policy_attachment.qurl_link_static`. Without
+#     it, TF's default parallelism could let the 60s sleep start
+#     in parallel with the attachment, eroding the budget.
+# Substring-matching the doc would be brittle; a stale wait on
+# an unrelated edit is cheap.
+#
+# Gated on the same condition as its consumer — envs without QURL
+# link don't pay the 60s. The CF monitoring sub IS covered on
+# greenfield (depends_on orders it after the sleep's initial
+# creation, which pays the 60s).
+#
+# See CLAUDE.md → "IAM eventual-consistency shim pattern" for:
+# taint-vs-rename ARN detail, `replace_triggered_by` cost trade-offs,
+# the greenfield-other-CF-resources gap (#1813), gate-OR-expansion
+# when consumers multiply, and the recipe for adding a shim to
+# another CI policy.
+resource "time_sleep" "qurl_link_static_iam_propagation" {
+  count = local.deploy_qurl_resolve_cf ? 1 : 0
+
+  triggers = {
+    policy_doc_hash = module.ecr.qurl_link_static_policy_doc_hash
+    policy_arn      = module.ecr.qurl_link_static_policy_arn
+    attachment_id   = module.ecr.qurl_link_static_attachment_id
+  }
+
+  create_duration = "60s"
+}
+
 # Enable CloudFront additional metrics on the resolve distribution.
 # Adds OriginLatency (queryable as p50/p95/p99/p999 via extended statistics)
 # and per-origin error breakdowns to CloudWatch — required to debug origin-
@@ -2845,7 +2902,7 @@ resource "terraform_data" "http_keepalive_contract" {
 # 4xx/5xx total error rates + 6 per-status-code breakdowns) ≈ $2.40/month
 # per distribution.
 resource "aws_cloudfront_monitoring_subscription" "qurl_resolve" {
-  count           = var.deploy_qurl_link && var.enable_resolve_cloudfront ? 1 : 0
+  count           = local.deploy_qurl_resolve_cf ? 1 : 0
   provider        = aws.us_east_1
   distribution_id = aws_cloudfront_distribution.qurl_resolve[0].id
 
@@ -2854,6 +2911,8 @@ resource "aws_cloudfront_monitoring_subscription" "qurl_resolve" {
       realtime_metrics_subscription_status = "Enabled"
     }
   }
+
+  depends_on = [time_sleep.qurl_link_static_iam_propagation]
 }
 
 # CloudFront origin-facing IP ranges (for Gin trusted proxies)
