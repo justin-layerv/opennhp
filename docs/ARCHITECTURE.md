@@ -1434,8 +1434,13 @@ To work around this, the AC module uses a two-stage bootstrap:
 1. The launch template's user_data contains a minimal bootstrap script (~700 bytes) that
    installs AWS CLI, downloads the full init script from S3, and `exec`s it.
 2. The full rendered init script is uploaded to the plugins S3 bucket as `scripts/ac-init.sh`.
-3. The S3 object's etag is embedded in the bootstrap as a comment, which triggers launch
-   template version updates when the init script content changes.
+3. An `md5(local.user_data)` is embedded in the bootstrap as a comment, which triggers
+   launch template version updates when the init script content changes. (Earlier
+   versions referenced `aws_s3_object.init_script[0].etag` instead, but that surfaces
+   the AWS provider's "inconsistent values for sensitive attribute" bug on user_data
+   updates because TF's plan-time etag prediction can disagree with S3's apply-time
+   etag computation. `md5(local.user_data)` is fully client-side and stable across
+   plan/apply.)
 
 If you add content to `user_data.sh.tpl`, it won't hit the 16KB limit because only the
 bootstrap is in user_data. However, if you add new scripts that need to be on the instance

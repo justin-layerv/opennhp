@@ -869,13 +869,27 @@ resource "aws_launch_template" "ac" {
   }
 
   # Full init script is stored in S3 (exceeds EC2's 16KB user_data limit).
-  # This bootstrap installs AWS CLI, downloads the init script, and executes it.
-  # The S3 object content hash is embedded to trigger launch template updates.
+  # This bootstrap installs AWS CLI, downloads the init script, and execs it.
+  # An md5 of the rendered local.user_data is embedded so a content change
+  # forces a launch template version bump (and thus an instance refresh on
+  # the next deploy). See the in-heredoc comment for why md5(local.user_data)
+  # instead of the S3 object's etag.
+  # Keep in sync with modules/compute/main.tf::aws_launch_template.server.
   user_data = var.plugin_bucket_name != null ? base64encode(<<-BOOTSTRAP
 #!/bin/bash
 set -ex
 exec > >(tee /var/log/user-data.log | logger -t user-data) 2>&1
-# Init script hash: ${aws_s3_object.init_script[0].etag}
+# Init script hash — md5 of local.user_data, NOT the S3 object's etag.
+# The hash bumps the launch-template version whenever content changes.
+# Referencing aws_s3_object.init_script[0].etag here triggers the AWS
+# provider's "inconsistent values for sensitive attribute" bug on
+# user_data updates: TF pre-computes one etag client-side, the apply-time
+# S3 upload yields a different etag (sensitivity-handling or encoding
+# divergence in the provider), and plan-expansion fails. md5(local.user_data)
+# is computed entirely client-side, so it can't disagree with itself
+# between plan and apply.
+# Keep in sync with modules/compute/main.tf::aws_launch_template.server.
+# Init script hash: ${md5(local.user_data)}
 # Report bootstrap failures to CloudWatch for operational visibility
 report_failure() {
   echo "BOOTSTRAP FAILED: $1"
@@ -952,6 +966,17 @@ BOOTSTRAP
       error_message = "centralized_cert_secret_arn must be provided when centralized_cert_enabled is true."
     }
   }
+
+  # The user_data hash is md5(local.user_data), not the S3 object's etag, so
+  # there is no longer an attribute reference for TF to infer this from. The
+  # S3 init script is still a runtime hard dependency: an instance launched
+  # against this LT does `aws s3 cp` of the script at boot, so the object
+  # must exist by the time the ASG can launch. Without this explicit edge,
+  # an update path could land the LT (and trigger a refresh) before the
+  # parallel S3 PUT, and a fresh instance would fetch stale init content.
+  depends_on = [
+    aws_s3_object.init_script,
+  ]
 }
 
 # Auto Scaling Group - in PUBLIC subnets for direct access

@@ -748,7 +748,17 @@ locals {
 # the rest of the script proceed logless.
 set -exo pipefail
 exec > >(tee /var/log/user-data.log | logger -t user-data) 2>&1
-# Init script hash: ${aws_s3_object.server_init_script[0].etag}
+# Init script hash — md5 of local.user_data, NOT the S3 object's etag.
+# The hash bumps the launch-template version whenever content changes.
+# Referencing aws_s3_object.server_init_script[0].etag here triggers the
+# AWS provider's "inconsistent values for sensitive attribute" bug on
+# user_data updates: TF pre-computes one etag client-side, the apply-time
+# S3 upload yields a different etag (sensitivity-handling or encoding
+# divergence in the provider), and plan-expansion fails. md5(local.user_data)
+# is computed entirely client-side, so it can't disagree with itself
+# between plan and apply.
+# Keep in sync with modules/ac/main.tf::aws_launch_template.ac.
+# Init script hash: ${md5(local.user_data)}
 
 # Fetch region from IMDSv2 BEFORE the trap and apt block. report_failure
 # below uses --region "$REGION", and an early failure during apt/awscli
@@ -890,10 +900,12 @@ resource "aws_launch_template" "server" {
 
   # Full init script lives in S3 because the rendered template exceeds
   # EC2's 16KB user_data limit (post-gzip). Bootstrap installs/uses AWS CLI,
-  # downloads scripts/server-init.sh, and execs it. The S3 object's etag is
-  # embedded so a content change forces a launch template version bump (and
-  # thus an instance refresh on the next deploy). Mirrors the AC module's
-  # battle-tested pattern (modules/ac/main.tf::aws_launch_template.ac).
+  # downloads scripts/server-init.sh, and execs it. An md5 of the rendered
+  # local.user_data is embedded so a content change forces a launch template
+  # version bump (and thus an instance refresh on the next deploy). See the
+  # in-heredoc comment for why md5(local.user_data) instead of the S3 object's
+  # etag. Mirrors the AC module's battle-tested pattern
+  # (modules/ac/main.tf::aws_launch_template.ac).
   # Computed via local.server_launch_template_user_data so the size guard
   # in lifecycle.precondition (below) can reference the rendered output.
   user_data = local.server_launch_template_user_data
@@ -932,13 +944,8 @@ resource "aws_launch_template" "server" {
     # apply time (where the only signal is a confusing "Modifying..."
     # error mid-apply).
     #
-    # Note: the user_data references aws_s3_object.server_init_script[0].etag,
-    # which is computed (known after apply) on first create and on any
-    # content change. TF defers precondition evaluation in that case to
-    # apply time — so this guard is plan-time on stable-etag updates,
-    # apply-time on first create / content change. Either way it fails
-    # before AWS rejects the launch template version for size, which is
-    # the actual win vs. the status quo.
+    # The user_data hash is md5(local.user_data) — fully plan-time computable
+    # — so this precondition runs at plan, not apply.
     precondition {
       condition     = length(base64decode(local.server_launch_template_user_data)) <= 16384
       error_message = "Launch-template user_data exceeds EC2's 16384-byte cap (post-base64-decode). The S3 bootstrap pattern (modules/compute/main.tf::aws_s3_object.server_init_script) exists to keep the inline user_data tiny — move new logic into scripts/server-init.sh, not into the bootstrap heredoc."
@@ -957,8 +964,11 @@ resource "aws_launch_template" "server" {
 
   # Explicit dependency on the policy attachment so the first ASG launch
   # in a greenfield apply can't race ahead of IAM eventual consistency.
-  # The S3 init script is also a hard dependency since user_data
-  # references its etag.
+  # The S3 init script is an explicit dependency for runtime ordering: an
+  # instance launched against this LT does `aws s3 cp` of the script at
+  # boot, so the object must exist by the time the ASG can launch. (The
+  # user_data hash is md5(local.user_data), not the object's etag — there
+  # is no longer an attribute reference for TF to infer this from.)
   depends_on = [
     aws_lambda_invocation.keygen,
     aws_iam_role_policy_attachment.server_plugins,
