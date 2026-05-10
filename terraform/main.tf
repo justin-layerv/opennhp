@@ -2830,10 +2830,10 @@ resource "terraform_data" "http_keepalive_contract" {
 }
 
 locals {
-  # Shared gate for the qurl-resolve CloudFront resources and their
-  # IAM-propagation shim — keeps the gate in lockstep across the
-  # shim and every consumer (today: monitoring sub; on landing of
-  # #1813: distribution + OAC + response-headers policy).
+  # Gate for resolve-CF resources only (the qurl_resolve distribution
+  # and its monitoring subscription). The IAM-propagation shim has
+  # its own broader gate per CLAUDE.md → "IAM eventual-consistency
+  # shim pattern": OR of every consumer's condition.
   deploy_qurl_resolve_cf = var.deploy_qurl_link && var.enable_resolve_cloudfront
 }
 
@@ -2864,18 +2864,15 @@ locals {
 # Substring-matching the doc would be brittle; a stale wait on
 # an unrelated edit is cheap.
 #
-# Gated on the same condition as its consumer — envs without QURL
-# link don't pay the 60s. The CF monitoring sub IS covered on
-# greenfield (depends_on orders it after the sleep's initial
-# creation, which pays the 60s).
-#
-# See CLAUDE.md → "IAM eventual-consistency shim pattern" for:
-# taint-vs-rename ARN detail, `replace_triggered_by` cost trade-offs,
-# the greenfield-other-CF-resources gap (#1813), gate-OR-expansion
-# when consumers multiply, and the recipe for adding a shim to
-# another CI policy.
+# Gate is the OR of every consumer's condition per CLAUDE.md →
+# "IAM eventual-consistency shim pattern" (taint-vs-rename ARN
+# detail, `replace_triggered_by` cost trade-offs, gate-OR-expansion
+# when consumers multiply, greenfield-other-CF-resources gap #1813).
+# The qurl.link static-distribution monitoring subscription is a
+# consumer that exists when `enable_resolve_cloudfront=false`, so the
+# gate must be the broader `var.deploy_qurl_link`.
 resource "time_sleep" "qurl_link_static_iam_propagation" {
-  count = local.deploy_qurl_resolve_cf ? 1 : 0
+  count = var.deploy_qurl_link ? 1 : 0
 
   triggers = {
     policy_doc_hash = module.ecr.qurl_link_static_policy_doc_hash
@@ -2905,6 +2902,26 @@ resource "aws_cloudfront_monitoring_subscription" "qurl_resolve" {
   count           = local.deploy_qurl_resolve_cf ? 1 : 0
   provider        = aws.us_east_1
   distribution_id = aws_cloudfront_distribution.qurl_resolve[0].id
+
+  monitoring_subscription {
+    realtime_metrics_subscription_config {
+      realtime_metrics_subscription_status = "Enabled"
+    }
+  }
+
+  depends_on = [time_sleep.qurl_link_static_iam_propagation]
+}
+
+# Sibling of qurl_resolve above for the qurl.link static distribution.
+# Without this subscription, CacheHitRate and OriginLatency are blank,
+# leaving aggregate request count + error rate as the only signals —
+# insufficient to localize a user-visible "slow redirect page" report
+# to the edge vs origin vs client-side hop. Placed adjacent to qurl_resolve
+# so removing one without the other shows up as obvious asymmetry on review.
+resource "aws_cloudfront_monitoring_subscription" "qurl_link" {
+  count           = var.deploy_qurl_link ? 1 : 0
+  provider        = aws.us_east_1
+  distribution_id = module.qurl_link[0].cloudfront_distribution_id
 
   monitoring_subscription {
     realtime_metrics_subscription_config {
