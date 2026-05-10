@@ -129,6 +129,80 @@ const (
 	MetricACRegistrationLatency = "ACRegistrationLatency"
 	MetricBroadcastPartialFail  = "BroadcastPartialFail"
 	MetricBroadcastDurationMs   = "BroadcastDurationMs"
+	// QURL plugin resolve telemetry. The qurl plugin orchestrates the
+	// browser-side qurl.link → qurl.site redirect — token validate via
+	// qurl-service, NHP knock to AC, JWT cookie set, 302 redirect — and
+	// is the synchronous user-facing path. The breakdown is
+	// intentionally per-phase so operators can localize tail-latency
+	// spikes (e.g., a 10 s p99) to a specific hop without reading logs.
+	//
+	//   *DurationMs        — total wall clock per AuthWithHttp call.
+	//                        Unconditional: fires on every return,
+	//                        including FailValidate paths that
+	//                        short-circuit before any network I/O.
+	//                        Token-fuzzing volume can pull p50/p99
+	//                        toward "in-process work" rather than
+	//                        user-facing redirect cost; PR 2 panels
+	//                        should either filter or surface a
+	//                        success-only proxy (e.g. KnockMs +
+	//                        TokenValidateMs) for SLO panels.
+	//   *TokenValidateMs   — RTT to qurl-service /internal/v1/resolve.
+	//   *KnockMs           — sum of knock attempts including retries.
+	//   *KnockAttemptMs    — single attempt; diff vs KnockMs = retry cost.
+	//   *Success           — successful resolve + knock + redirect.
+	//   *FailValidate      — token rejected (invalid, expired, revoked).
+	//   *FailKnock         — knock exhausted MaxAttempts retries (and
+	//                        only that). Calls counted here exercised
+	//                        the retry policy — that's what makes them
+	//                        the legitimate FailKnock denominator for
+	//                        the retry-rate signal below.
+	//   *FailPostKnock     — knock opened the firewall but the user could
+	//                        not be redirected: AC returned no resource
+	//                        hosts despite ackMsg=success, JWT secret
+	//                        missing or unsignable, or cookie/redirect
+	//                        URL refused. Distinguished from FailKnock
+	//                        because the firewall hole IS open and the
+	//                        retry loop never touched these calls —
+	//                        operationally different blast radius and
+	//                        accounting position.
+	//   *FailCanceled      — request context was canceled (client
+	//                        disconnected, write deadline elapsed) during
+	//                        knock or its retry sleep. Distinguished from
+	//                        FailKnock because the failure is downstream
+	//                        of the user, not the server — including
+	//                        these in the FailKnock denominator would
+	//                        inflate the apparent server-failure rate
+	//                        every time someone closes a tab mid-retry.
+	//   *FailUnknown       — sentinel for return paths that don't set a
+	//                        terminal outcome explicitly. Steady-state
+	//                        zero. A non-zero value is a regression
+	//                        signal — a new return path was added
+	//                        without an outcome assignment — and surfaces
+	//                        loud rather than being silently absorbed
+	//                        into one of the real outcome counters.
+	//   *KnockRetry        — fires once each time the loop decides to
+	//                        retry (i.e., once per failure that is NOT
+	//                        the last attempt).
+	//                        Retry rate per call =
+	//                          KnockRetry / (Success + FailKnock)
+	//                        Why FailValidate / FailPostKnock / FailCanceled
+	//                        are NOT in the denominator: the knock loop
+	//                        never attempted (validate rejected pre-knock,
+	//                        client disconnected pre/mid-retry) or had
+	//                        already succeeded (post-knock failure). Only
+	//                        Success + FailKnock count call attempts that
+	//                        exercised the retry policy.
+	MetricQurlResolveDurationMs      = "QurlResolveDurationMs"
+	MetricQurlResolveTokenValidateMs = "QurlResolveTokenValidateMs"
+	MetricQurlResolveKnockMs         = "QurlResolveKnockMs"
+	MetricQurlResolveKnockAttemptMs  = "QurlResolveKnockAttemptMs"
+	MetricQurlResolveSuccess         = "QurlResolveSuccess"
+	MetricQurlResolveFailValidate    = "QurlResolveFailValidate"
+	MetricQurlResolveFailKnock       = "QurlResolveFailKnock"
+	MetricQurlResolveFailPostKnock   = "QurlResolveFailPostKnock"
+	MetricQurlResolveFailCanceled    = "QurlResolveFailCanceled"
+	MetricQurlResolveFailUnknown     = "QurlResolveFailUnknown"
+	MetricQurlResolveKnockRetry      = "QurlResolveKnockRetry"
 	// MetricLicenseValidationRateLimited fires from BOTH call sites:
 	// the hoisted preflight check (closes the F5 amplification
 	// surface) AND the deeper in-validateACLicense check. It's the

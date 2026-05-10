@@ -129,6 +129,26 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		return nil, errors.New("authWithHTTP: helper is null")
 	}
 
+	// Defer-driven outcome accounting: every return path records
+	// duration + outcome exactly once. See MetricQurlResolve* in
+	// endpoints/server/msghandler.go for outcome semantics.
+	totalStart := time.Now()
+	outcome := nhpserver.MetricQurlResolveFailUnknown
+	recordSince := func(name string, since time.Time) {
+		if helper.RecordLatency != nil {
+			helper.RecordLatency(name, float64(time.Since(since).Microseconds())/1000.0)
+		}
+	}
+	incrCounter := func(name string) {
+		if helper.IncrCounter != nil {
+			helper.IncrCounter(name)
+		}
+	}
+	defer func() {
+		recordSince(nhpserver.MetricQurlResolveDurationMs, totalStart)
+		incrCounter(outcome)
+	}()
+
 	requestID := getOrCreateRequestID(ctx)
 	ctx.Header(nhpserver.RequestIDHeader, requestID)
 
@@ -172,6 +192,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		log.Error("[QURL] [req_id=%s] Invalid access token from %s: %v", requestID, ctx.ClientIP(), err)
 		ctx.Data(http.StatusForbidden, "text/html; charset=utf-8", []byte(accessDeniedHTML))
 		ctx.Abort()
+		outcome = nhpserver.MetricQurlResolveFailValidate
 		return nil, fmt.Errorf("invalid access token: %w", err)
 	}
 
@@ -183,10 +204,13 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		RequestID:   requestID,
 	}
 
+	validateStart := time.Now()
 	resolveResp, err := resolver.Resolve(ctx.Request.Context(), resolveReq)
+	recordSince(nhpserver.MetricQurlResolveTokenValidateMs, validateStart)
 	if err != nil {
 		log.Error("[QURL] [req_id=%s] Token resolution failed: %v", requestID, err)
 		handleResolveError(ctx, err)
+		outcome = nhpserver.MetricQurlResolveFailValidate
 		return nil, err
 	}
 
@@ -202,12 +226,16 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	// The retry loop is context-aware: if the client disconnects or the HTTP
 	// write deadline passes, retries stop to avoid wasted work.
 	reqCtx := ctx.Request.Context()
+	knockTotalStart := time.Now()
 	for attempt := 1; attempt <= knockMaxAttempts; attempt++ {
+		attemptStart := time.Now()
 		ackMsg, err = helper.AuthWithHttpCallbackFunc(req, res)
+		recordSince(nhpserver.MetricQurlResolveKnockAttemptMs, attemptStart)
 		if err == nil {
 			break
 		}
 		if attempt < knockMaxAttempts {
+			incrCounter(nhpserver.MetricQurlResolveKnockRetry)
 			log.Warning("[QURL] [req_id=%s] NHP knock failed (attempt %d/%d): %v, retrying...", requestID, attempt, knockMaxAttempts, err)
 			select {
 			case <-time.After(knockRetryDelay):
@@ -220,13 +248,29 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 			}
 		}
 	}
+	recordSince(nhpserver.MetricQurlResolveKnockMs, knockTotalStart)
 	if err != nil {
+		// Cancel vs server-fault: see FailCanceled docstring in msghandler.go.
+		if reqCtx.Err() != nil {
+			log.Warning("[QURL] [req_id=%s] NHP knock canceled by request context: %v", requestID, err)
+			outcome = nhpserver.MetricQurlResolveFailCanceled
+			// Best-effort response; the client may already be gone, but
+			// emit a 5xx so any still-listening proxy doesn't reuse the
+			// connection on a half-completed request.
+			ctx.JSON(http.StatusInternalServerError, gin.H{
+				"error":   "request_canceled",
+				"message": "Request canceled before access was opened",
+				"detail":  err.Error(),
+			})
+			return nil, err
+		}
 		log.Error("[QURL] [req_id=%s] NHP knock failed after %d attempts: %v", requestID, knockMaxAttempts, err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "knock_failed",
 			"message": "Failed to open access to resource",
 			"detail":  err.Error(),
 		})
+		outcome = nhpserver.MetricQurlResolveFailKnock
 		return nil, err
 	}
 
@@ -236,6 +280,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 			"error":   "no_resource_hosts",
 			"message": "No resource hosts available",
 		})
+		outcome = nhpserver.MetricQurlResolveFailPostKnock
 		return nil, errors.New("no resource hosts available")
 	}
 
@@ -249,6 +294,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 			"error":   "configuration_error",
 			"message": "JWT secret not configured",
 		})
+		outcome = nhpserver.MetricQurlResolveFailPostKnock
 		return nil, errors.New("JWT secret is empty")
 	}
 
@@ -263,6 +309,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 			"error":   "token_generation_failed",
 			"message": "Failed to generate access tokens",
 		})
+		outcome = nhpserver.MetricQurlResolveFailPostKnock
 		return nil, err
 	}
 
@@ -284,6 +331,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 			"error":   "invalid_cookie_domain",
 			"message": "Invalid cookie domain from upstream service",
 		})
+		outcome = nhpserver.MetricQurlResolveFailPostKnock
 		return nil, fmt.Errorf("invalid cookie domain: %w", cookieErr)
 	}
 	if redirectErr != nil {
@@ -292,6 +340,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 			"error":   "invalid_redirect",
 			"message": "Invalid redirect URL from upstream service",
 		})
+		outcome = nhpserver.MetricQurlResolveFailPostKnock
 		return nil, fmt.Errorf("invalid redirect URL: %w", redirectErr)
 	}
 
@@ -330,6 +379,7 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		ctx.Redirect(http.StatusFound, resolveResp.QurlSiteURL)
 	}
 
+	outcome = nhpserver.MetricQurlResolveSuccess
 	return ackMsg, nil
 }
 

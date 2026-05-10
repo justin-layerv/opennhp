@@ -1342,6 +1342,13 @@ func (hs *HttpServer) NewHttpServerHelper() *plugins.HttpServerPluginHelper {
 	h.AuthWithHttpCallbackFunc = func(req *common.HttpKnockRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
 		return hs.handleHttpOpenResource(req, res)
 	}
+
+	// Bind metric emitters for plugins (mirrors the internalAuthEmit /
+	// emitMetric precedents above — gate on metrics != nil before binding).
+	if hs.udpServer != nil && hs.udpServer.metrics != nil {
+		h.RecordLatency = hs.udpServer.metrics.RecordLatency
+		h.IncrCounter = hs.udpServer.metrics.IncrCounter
+	}
 	return h
 }
 

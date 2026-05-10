@@ -224,4 +224,12 @@ type NhpServerPluginHelper struct {
 type HttpServerPluginHelper struct {
 	StopSignal               <-chan struct{}
 	AuthWithHttpCallbackFunc HttpPluginPostAuthFunc
+
+	// Metric emitters routed through the host server's CloudWatch
+	// publisher. Plugins must treat these as nil-safe — the publisher
+	// is not always plumbed (notably in unit tests that build the
+	// helper by hand), and callers should branch on `!= nil` rather
+	// than relying on a no-op default. Latency values are milliseconds.
+	RecordLatency func(name string, ms float64)
+	IncrCounter   func(name string)
 }
