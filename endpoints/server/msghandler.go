@@ -203,6 +203,77 @@ const (
 	MetricQurlResolveFailCanceled    = "QurlResolveFailCanceled"
 	MetricQurlResolveFailUnknown     = "QurlResolveFailUnknown"
 	MetricQurlResolveKnockRetry      = "QurlResolveKnockRetry"
+	// QURL browser-side navigation timings — RUM-class data posted by
+	// the qurl.link interstitial as additional form fields on the same
+	// resolve POST. Values originate in the user's browser via
+	// PerformanceNavigationTiming; they are advisory, not authoritative.
+	// Use them for hop attribution during investigations; page on the
+	// server-observed QurlResolve*Ms set above and on CloudFront
+	// OriginLatency for the qurl.link / resolve.qurl.link distributions.
+	//
+	// Trust gate: timings are parsed after ValidateAccessToken's
+	// permissive character-class + length check (8–512 bytes;
+	// unicode.IsLetter || IsDigit || '-' || '_' || '.') but BEFORE
+	// resolver.Resolve. Any sender that can produce a string passing
+	// that gate (scanners, replay attempts, revoked tokens) lands in
+	// the parse path — there is no real-qURL gate. The parse is
+	// intentionally placed early so CDN/edge issues that ultimately
+	// fail the resolve are still attributable. The cap-then-drop +
+	// rejected-counter design is the only adversary defense here:
+	//   - Range cap [0, 60000 ms] + explicit NaN guard. Without the
+	//     guard NaN slips both range checks because every NaN
+	//     comparison is false in IEEE 754, and ParseFloat("NaN", 64)
+	//     returns (NaN, nil). Out-of-range or unparseable values
+	//     increment QurlResolveBrowserRejected* and are dropped, so
+	//     adversarial floods become a counter signal rather than
+	//     histogram contamination.
+	//   - Two counters rather than one with a dimension because the
+	//     helper.IncrCounter callback only accepts a name.
+	//   - No cross-field coherence check. The natural candidate
+	//     (submitReadyMs >= domInteractive) is inverted under W3C HTML
+	//     parsing semantics: the parser executes <script> synchronously
+	//     while readyState is still "loading", then resumes parsing,
+	//     then sets readyState to "interactive" — so an inline script
+	//     captures performance.now() before nav.domInteractive is set.
+	//     Field-level forgery is the only thing the parse path defends
+	//     against; coherence belongs at the frontend if it belongs
+	//     anywhere.
+	// Histogram p* readings are dominated by honest traffic when redeem
+	// rate >> scanner rate. During low-traffic windows honest sample
+	// volume can drop low enough that even a small adversarial cohort
+	// distorts the p*; cross-reference the server-observed metrics
+	// before acting on browser histograms in those windows.
+	//
+	// p99 is structurally bounded above by the 60s cap. The slowest
+	// honest cohort (2G, captive portals, suspended tabs) lands on
+	// QurlResolveBrowserRejectedOutOfRange rather than the histogram
+	// tail. The rejected counter still surfaces them; the histogram
+	// just doesn't reach beyond 60s.
+	//
+	// Duplicate-key handling: gin.Context.PostForm returns only the
+	// first value when a key appears multiple times in the form body.
+	// A client sending t_dns_ms=10&t_dns_ms=NaN records 10 and ignores
+	// the NaN. Acceptable for an advisory metric — the attacker gains
+	// nothing vs. sending NaN alone (which the NaN guard catches).
+	//
+	// Phase split follows the W3C Resource Timing partition. TCP =
+	// secureConnectionStart - connectStart when secure, TLS = connectEnd
+	// - secureConnectionStart. The naive connectEnd - connectStart
+	// actually measures TCP+TLS combined.
+	//
+	// Frontend contract: each phase is OMITTED from the form when
+	// PerformanceNavigationTiming reports it as zero (cache hit, reused
+	// connection). The server treats 0 as a structurally allowed value
+	// — frontends MUST NOT send 0 to mean "phase didn't happen," or the
+	// histograms accumulate zeros with no rejected-counter signal.
+	MetricQurlResolveBrowserDNSMs              = "QurlResolveBrowserDNSMs"
+	MetricQurlResolveBrowserTCPMs              = "QurlResolveBrowserTCPMs"
+	MetricQurlResolveBrowserTLSMs              = "QurlResolveBrowserTLSMs"
+	MetricQurlResolveBrowserTTFBMs             = "QurlResolveBrowserTTFBMs"
+	MetricQurlResolveBrowserDOMInteractiveMs   = "QurlResolveBrowserDOMInteractiveMs"
+	MetricQurlResolveBrowserTimeToSubmitMs     = "QurlResolveBrowserTimeToSubmitMs"
+	MetricQurlResolveBrowserRejectedMalformed  = "QurlResolveBrowserRejectedMalformed"
+	MetricQurlResolveBrowserRejectedOutOfRange = "QurlResolveBrowserRejectedOutOfRange"
 	// MetricLicenseValidationRateLimited fires from BOTH call sites:
 	// the hoisted preflight check (closes the F5 amplification
 	// surface) AND the deeper in-validateACLicense check. It's the

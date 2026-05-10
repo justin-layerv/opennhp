@@ -3,6 +3,7 @@ package qurl
 import (
 	"errors"
 	"fmt"
+	"math"
 	"mime"
 	"net/http"
 	"strconv"
@@ -139,6 +140,11 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 			helper.RecordLatency(name, float64(time.Since(since).Microseconds())/1000.0)
 		}
 	}
+	recordLatencyMsRaw := func(name string, ms float64) {
+		if helper.RecordLatency != nil {
+			helper.RecordLatency(name, ms)
+		}
+	}
 	incrCounter := func(name string) {
 		if helper.IncrCounter != nil {
 			helper.IncrCounter(name)
@@ -195,6 +201,14 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 		outcome = nhpserver.MetricQurlResolveFailValidate
 		return nil, fmt.Errorf("invalid access token: %w", err)
 	}
+
+	// Parse advisory browser-side navigation timings posted alongside
+	// the token. See MetricQurlResolveBrowser* in msghandler.go for the
+	// full trust-model rationale. Done after token format validation so
+	// random scanners hitting /plugins/qurl can't poison the histograms;
+	// done before resolve so a CDN/edge issue that ultimately fails the
+	// resolve is still attributable.
+	recordBrowserTimings(ctx, recordLatencyMsRaw, incrCounter)
 
 	// Resolve the access token via QURL API
 	resolveReq := &ResolveRequest{
@@ -549,4 +563,94 @@ func handleResolveError(ctx *gin.Context, err error) {
 	}
 	ctx.Data(statusCode, "text/html; charset=utf-8", []byte(accessDeniedHTML))
 	ctx.Abort()
+}
+
+// browserTimingMaxMs caps any single browser-reported timing at 60 s.
+// PerformanceNavigationTiming rarely emits anything above ~30 s for a
+// working page; values above this are corrupted (negative, NaN coerced,
+// or adversarial). Cap-then-drop keeps the p* tail meaningful.
+// Typed float64 so the comparison against the parsed ms value stays
+// unambiguous to readers (no implicit untyped-constant promotion).
+const browserTimingMaxMs float64 = 60000
+
+// browserTimingMaxFieldLen rejects raw form values longer than this
+// before they reach strconv.ParseFloat. A legitimate ms-resolution
+// timing is at most ~10 characters ("60000.000"); 32 is generous
+// headroom for sign + decimal + locale variation while still bounding
+// ParseFloat's cost on adversarial input.
+const browserTimingMaxFieldLen = 32
+
+// browserTimingFields enumerates the form fields posted by the qurl.link
+// interstitial. Order matches the W3C navigation phase ordering so the
+// emit sequence is stable in dashboards. Treat as immutable — do not
+// mutate at runtime; this is a logical const that Go's type system
+// can't enforce on a slice of structs.
+var browserTimingFields = []struct {
+	field, metric string
+}{
+	{"t_dns_ms", nhpserver.MetricQurlResolveBrowserDNSMs},
+	{"t_tcp_ms", nhpserver.MetricQurlResolveBrowserTCPMs},
+	{"t_tls_ms", nhpserver.MetricQurlResolveBrowserTLSMs},
+	{"t_ttfb_ms", nhpserver.MetricQurlResolveBrowserTTFBMs},
+	{"t_dom_interactive_ms", nhpserver.MetricQurlResolveBrowserDOMInteractiveMs},
+	{"t_to_submit_ms", nhpserver.MetricQurlResolveBrowserTimeToSubmitMs},
+}
+
+// recordBrowserTimings parses the t_*_ms form fields posted by the
+// qurl.link interstitial and emits each present-and-valid value as a
+// histogram observation via the supplied callbacks. Absent fields are
+// skipped silently — PerformanceNavigationTiming may not surface every
+// entry on every browser (e.g. TLS skipped on connection-pool reuse).
+// Parse errors, NaN, and out-of-range values fire the corresponding
+// rejected counter and the value is dropped. Trust-model rationale
+// (gate placement, NaN/IEEE-754 reasoning, no-coherence-check
+// derivation) lives next to the metric constants in msghandler.go.
+func recordBrowserTimings(ctx *gin.Context, recordLatencyMsRaw func(string, float64), incrCounter func(string)) {
+	for _, p := range browserTimingFields {
+		// gin.Context.PostForm returns the first value on duplicate keys.
+		// A buggy/forged client sending t_dns_ms=10&t_dns_ms=NaN records
+		// 10 and silently drops the NaN — fenced by
+		// TestAuthWithHttp_BrowserTimings_DuplicateKeys_FirstValueWins.
+		// Acceptable for an advisory metric: the attacker gains nothing
+		// vs. sending NaN as the only value (which the NaN guard catches).
+		raw := ctx.PostForm(p.field)
+		// Empty string is treated identically to "field absent" — both
+		// signal "no measurement" rather than "measurement was zero."
+		// The frontend MUST omit absent phases (per the contract in
+		// msghandler.go); a zero-length value from a buggy frontend is
+		// the most generous interpretation.
+		if raw == "" {
+			continue
+		}
+		// Defense-in-depth on top of the request-level body cap (#1839):
+		// a legitimate ms-resolution timing fits comfortably in ~10
+		// characters ("60000.000"), and ParseFloat's digit-grinding
+		// cost is linear in the input length. Anything longer than 32
+		// chars is corrupt by definition; reject as malformed and
+		// avoid feeding ParseFloat adversarial input.
+		if len(raw) > browserTimingMaxFieldLen {
+			incrCounter(nhpserver.MetricQurlResolveBrowserRejectedMalformed)
+			continue
+		}
+		ms, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			incrCounter(nhpserver.MetricQurlResolveBrowserRejectedMalformed)
+			continue
+		}
+		// strconv.ParseFloat("NaN", 64) returns (NaN, nil) and IEEE 754
+		// makes every NaN comparison false — so NaN slips both range gates
+		// below and contaminates the histogram. Catch it explicitly.
+		// ParseFloat is case-insensitive on these tokens, so "NaN", "nan",
+		// "NAN" all reach this guard; "Infinity" / "infinity" parse to
+		// ±Inf, which the range gate below rejects.
+		if math.IsNaN(ms) {
+			incrCounter(nhpserver.MetricQurlResolveBrowserRejectedMalformed)
+			continue
+		}
+		if ms < 0 || ms > browserTimingMaxMs {
+			incrCounter(nhpserver.MetricQurlResolveBrowserRejectedOutOfRange)
+			continue
+		}
+		recordLatencyMsRaw(p.metric, ms)
+	}
 }
