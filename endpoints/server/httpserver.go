@@ -652,6 +652,7 @@ func (hs *HttpServer) initRouter() {
 	LoadFilesRecursively(g, templatePath)
 
 	pluginGrp := g.Group("plugins")
+	pluginGrp.Use(pluginBodySizeMiddleware(maxPluginRequestSize))
 	// Plugin handler supports both GET (legacy, deprecated) and POST (preferred).
 	// POST keeps the access token out of URL query strings and server access logs.
 	pluginHandler := func(ctx *gin.Context) {

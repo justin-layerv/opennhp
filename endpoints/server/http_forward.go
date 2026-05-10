@@ -34,6 +34,15 @@ const maxForwardResponseSize int64 = 64 << 10 // 64 KiB — ACK messages are typ
 // diverges them produces an explicit test update.
 const maxInternalKnockRequestSize int64 = 64 << 10 // 64 KiB — knock-forward request envelope
 
+// maxPluginRequestSize caps the request body for /plugins/:aspid. The
+// qurl plugin's POST body today is ~200 bytes (token + 6 small numeric
+// timing fields per #1824); 16 KiB is generous headroom for any future
+// plugin payload while bounding a downstream parse path's exposure to
+// adversarial input. Defense-in-depth on top of Go's defaultMaxMemory
+// for ParseForm (10 MiB), which is generous enough to be a real DoS
+// surface for parser-heavy plugins.
+const maxPluginRequestSize int64 = 16 << 10 // 16 KiB — plugin request envelope
+
 // SourceAPI is the Source value set by API callers (e.g., qurl-service headless resolve).
 // When set, the receiving server may forward the knock to another server if the AC
 // isn't connected locally, unlike server-to-server forwards which set Forwarded=true.

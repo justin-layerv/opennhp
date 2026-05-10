@@ -86,3 +86,21 @@ func TestPlugins_NoTokenReturnsBranded403(t *testing.T) {
 			marker, truncate(body, 400))
 	}
 }
+
+// TestPlugins_OversizedPOSTReturns413 fences the body-size cap on
+// /plugins/:aspid added in #1839. A POST body larger than the cap
+// (16 KiB) must return 413 before any downstream parser (e.g. the
+// qurl plugin's strconv.ParseFloat on browser-timing fields) sees
+// the bytes. This protects against the unbounded-form DoS path that
+// PR #1824's review identified.
+//
+// 64 KiB is comfortably over the 16 KiB cap and small enough not to
+// stress the test transport.
+func TestPlugins_OversizedPOSTReturns413(t *testing.T) {
+	oversized := strings.Repeat("a", 64*1024) // 64 KiB > 16 KiB cap
+	body := "token=" + oversized
+
+	resp, _ := doPostFormNoRedirect(t, testConfig.NHPServerBaseURL,
+		"/plugins/qurl", body, nil)
+	assertStatusCode(t, resp, http.StatusRequestEntityTooLarge)
+}
