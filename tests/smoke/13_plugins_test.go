@@ -87,29 +87,58 @@ func TestPlugins_NoTokenReturnsBranded403(t *testing.T) {
 	}
 }
 
-// TestPlugins_OversizedPOSTReturns413 fences the body-size cap on
-// /plugins/:aspid added in #1839. A POST body larger than the cap
-// (16 KiB) must return 413 before any downstream parser (e.g. the
-// qurl plugin's strconv.ParseFloat on browser-timing fields) sees
-// the bytes. This protects against the unbounded-form DoS path that
-// PR #1824's review identified.
+// TestPlugins_OversizedPOSTReturns413 fences the server-side body
+// cap on /plugins/:aspid added in #1841. A POST body larger than the
+// cap (16 KiB) must return 413 — with a body identifying it as the
+// server's 413, not an upstream layer's — before any downstream
+// parser (e.g. the qurl plugin's strconv.ParseFloat on browser-timing
+// fields) sees the bytes. This protects against the unbounded-form
+// DoS path that PR #1824's review identified.
 //
-// After #1860 (drain-before-413 + Connection: close), this test
-// ALSO fences the CloudFront 403-substitution regression class:
-// without the drain, CloudFront sees the origin's mid-write RST and
-// serves its own 403, masking the server's 413. A future change that
-// removes the io.CopyN drain in pluginBodySizeMiddleware would flip
-// this test red here even though the unit tests in
-// endpoints/server/plugin_body_cap_test.go stay green (those fence
-// the Go-level drain; this fences the CloudFront round-trip).
+// Probes NHPServerOriginURL (NLB-direct), not NHPServerBaseURL (via
+// CloudFront), because the production CF path runs through a WAFv2
+// web ACL with AWSManagedRulesCommonRuleSet (terraform/main.tf::
+// aws_wafv2_web_acl.qurl_resolve), whose SizeRestrictions_BODY rule
+// blocks POST bodies > 8 KiB at the edge — well under the server's
+// 16 KiB cap. Oversize POSTs are structurally unreachable to the
+// server through CloudFront, so this test would only ever observe
+// WAF's 403 ("Request blocked" / x-cache: Error from cloudfront)
+// on that path. WAF + cap is layered defense; this test fences the
+// cap layer. Edge-layer enforcement is owned by Terraform and TF
+// plan-time review.
+//
+// Asserts status AND body marker: a regression where some other
+// middleware (or upstream proxy) starts answering with a generic 413
+// still fails the test.
 //
 // 64 KiB is comfortably over the 16 KiB cap and small enough not to
 // stress the test transport.
 func TestPlugins_OversizedPOSTReturns413(t *testing.T) {
+	if testConfig.NHPServerOriginURL == "" {
+		// Sandbox and prod are KNOWN to have a separate
+		// resolve-origin.<env> Route53 record (see
+		// terraform/main.tf::aws_route53_record.qurl_link_resolve_origin
+		// and tests/smoke/dns.go::deriveEndpoints). A missing origin URL
+		// in either of those envs means the wiring regressed — fail
+		// loudly, don't silently turn off the cap fence.
+		switch testConfig.Environment {
+		case "sandbox", "prod":
+			t.Fatalf("NHPServerOriginURL is empty for env %q, which is expected to have a separate resolve-origin record (see tests/smoke/dns.go::deriveEndpoints + terraform/main.tf::aws_route53_record.qurl_link_resolve_origin). Either the record is missing or the smoke wiring regressed; this fence cannot be silently skipped in a known env.", testConfig.Environment)
+		default:
+			t.Skipf("skipped: NHPServerOriginURL not set for env %q (no separate origin record)", testConfig.Environment)
+		}
+	}
+
 	oversized := strings.Repeat("a", 64*1024) // 64 KiB > 16 KiB cap
 	body := "token=" + oversized
 
-	resp, _ := doPostFormNoRedirect(t, testConfig.NHPServerBaseURL,
+	resp, respBody := doPostFormNoRedirect(t, testConfig.NHPServerOriginURL,
 		"/plugins/qurl", body, nil)
 	assertStatusCode(t, resp, http.StatusRequestEntityTooLarge)
+
+	const marker = "body too large"
+	if !strings.Contains(string(respBody), marker) {
+		t.Fatalf("413 body does not contain server marker %q (some other layer may be answering 413)\n  body: %s",
+			marker, truncate(respBody, 200))
+	}
 }
