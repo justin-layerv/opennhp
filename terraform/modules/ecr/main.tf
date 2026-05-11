@@ -2138,6 +2138,28 @@ resource "aws_iam_policy" "qurl_link_static" {
         Resource = "*"
       },
       {
+        # Required by `terraform_data.qurl_link_invalidation` (root):
+        # invalidates /index.html on every content edit so a deploy isn't
+        # racing the 1h cache_control TTL. GetInvalidation is needed by
+        # `aws cloudfront wait invalidation-completed` which polls until
+        # propagation finishes.
+        #
+        # Resource = "*": this policy is attached to the CI role at
+        # bootstrap, before any CloudFront distribution exists, so a
+        # tight resource-scoped ARN would chicken-and-egg the greenfield
+        # apply. Matches the surrounding CloudFront statements'
+        # bootstrap-circularity rationale; blast radius is "CI role can
+        # invalidate any distribution it can resolve" which is
+        # acceptable for a single-distribution module.
+        Sid    = "CloudFrontInvalidation"
+        Effect = "Allow"
+        Action = [
+          "cloudfront:CreateInvalidation",
+          "cloudfront:GetInvalidation"
+        ]
+        Resource = "*"
+      },
+      {
         Sid    = "S3QURLLinkBucket"
         Effect = "Allow"
         Action = [

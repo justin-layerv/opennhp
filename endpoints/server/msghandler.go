@@ -266,11 +266,20 @@ const (
 	// connection). The server treats 0 as a structurally allowed value
 	// — frontends MUST NOT send 0 to mean "phase didn't happen," or the
 	// histograms accumulate zeros with no rejected-counter signal.
-	MetricQurlResolveBrowserDNSMs              = "QurlResolveBrowserDNSMs"
-	MetricQurlResolveBrowserTCPMs              = "QurlResolveBrowserTCPMs"
-	MetricQurlResolveBrowserTLSMs              = "QurlResolveBrowserTLSMs"
-	MetricQurlResolveBrowserTTFBMs             = "QurlResolveBrowserTTFBMs"
-	MetricQurlResolveBrowserDOMInteractiveMs   = "QurlResolveBrowserDOMInteractiveMs"
+	MetricQurlResolveBrowserDNSMs            = "QurlResolveBrowserDNSMs"
+	MetricQurlResolveBrowserTCPMs            = "QurlResolveBrowserTCPMs"
+	MetricQurlResolveBrowserTLSMs            = "QurlResolveBrowserTLSMs"
+	MetricQurlResolveBrowserTTFBMs           = "QurlResolveBrowserTTFBMs"
+	MetricQurlResolveBrowserDOMInteractiveMs = "QurlResolveBrowserDOMInteractiveMs"
+	// Name implies "time until form submission" but actually measures
+	// script-readiness latency (navigation start → token validated +
+	// RESOLVE_URL constructed). The frontend captures it BEFORE the
+	// 500ms UX-spinner setTimeout, so the metric is NOT pinned to that
+	// floor. Dashboard consumers reading the name in isolation will
+	// under-count actual time-to-submit by ~500ms; the captured value
+	// is the more useful "what could a faster build achieve" signal.
+	// See terraform/modules/qurl-link/frontend/index.html's submitReadyMs
+	// capture site for the canonical explanation.
 	MetricQurlResolveBrowserTimeToSubmitMs     = "QurlResolveBrowserTimeToSubmitMs"
 	MetricQurlResolveBrowserRejectedMalformed  = "QurlResolveBrowserRejectedMalformed"
 	MetricQurlResolveBrowserRejectedOutOfRange = "QurlResolveBrowserRejectedOutOfRange"

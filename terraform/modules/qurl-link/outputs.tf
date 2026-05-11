@@ -22,3 +22,8 @@ output "domain_name" {
   description = "Domain name for the QURL link redirect page"
   value       = var.domain_name
 }
+
+output "index_html_content_hash" {
+  description = "md5 of the deployed index.html. Private API of the root-module composition: consumed only by terraform_data.qurl_link_invalidation as its triggers_replace key and caller-reference. Not intended for external consumers."
+  value       = md5(local.index_html)
+}
