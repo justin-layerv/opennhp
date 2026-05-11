@@ -197,7 +197,7 @@ locals {
     qurl_api_internal_url     = var.qurl_api_internal_url
     qurl_api_token_secret_arn = var.qurl_api_token_secret_arn
     qurl_tunnel_auth_mode     = var.qurl_tunnel_auth_mode
-    ssm_image_tag_param       = aws_ssm_parameter.image_tag.name
+    ssm_image_tag_param       = local.ssm_image_tag_param_name
     # The user_data fallback command and the IAM grant must point at the
     # same bucket. Threading both from root (plugin_bucket_name + _arn)
     # instead of hardcoding the legacy `layerv-nhp-${env}-plugins` name
@@ -287,13 +287,27 @@ resource "aws_iam_role_policy" "frps" {
       # `GetParametersByPath` (prefix scan) are intentionally omitted —
       # least-privilege, and widening is a one-line change if a future need
       # arises.
+      #
+      # Both the canonical /<env>/nhp/reverse-tunnel-server/* path and the
+      # legacy /<env>/nhp/frps/* path are listed during #1668 phase 1.
+      # user_data only reads the canonical path; the legacy glob covers the
+      # six SSM resources still defined at /<env>/nhp/frps/* in
+      # blue_green.tf (active-color, green-image-tag, last-switch-timestamp,
+      # blue-asg-name, green-asg-name, color-cloudmap-service-ids) so the
+      # operator can `aws ssm get-parameter` them from this instance role
+      # for ad-hoc debugging. Trade-off: a forgotten consumer reading the
+      # legacy path SUCCEEDS silently rather than failing IAM-denied. The
+      # blue/green keys have no in-codebase reader today, so the silent-
+      # success risk is bounded; the legacy glob is dropped in the same
+      # follow-up PR that migrates those keys to the canonical path.
       {
         Sid    = "SSMParameterRead"
         Effect = "Allow"
         Action = ["ssm:GetParameter"]
-        # ARN pattern stays /<env>/nhp/frps/* to align with the SSM paths in ssm.tf
-        # (renaming those would destroy the CI-published image_tag). Tracked by #1668.
-        Resource = "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/frps/*"
+        Resource = [
+          "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/reverse-tunnel-server/*",
+          "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/frps/*",
+        ]
       },
       # Cloud Map registration. Scoped to ALL per-AZ services rather than
       # just the one matching this instance's AZ — the instance picks its

@@ -189,10 +189,12 @@ mkdir -p /opt/layerv/qurl-reverse-tunnel-server/logs
 
 # ============================================================================
 # Read image tag from SSM (for downloading the correct binary version).
-# Fail fast on SSM error — the parameter is created by Terraform and updated
-# by CI, so a read failure almost certainly means IAM/network misconfiguration.
-# Silently falling back to "latest" would mask that and pull a stale or wrong
-# binary.
+# Fail fast on SSM error — the parameter is created and updated by rts CI's
+# docker-publish workflow (no Terraform-side `aws_ssm_parameter`; see
+# modules/qurl-reverse-tunnel-server/ssm.tf header for the ownership split),
+# so a read failure means either rts CI has not yet published this env (no
+# image to boot) or IAM/network misconfiguration. Silently falling back to
+# "latest" would mask that and pull a stale or wrong binary.
 # ============================================================================
 IMAGE_TAG=$(aws ssm get-parameter \
   --name "${ssm_image_tag_param}" \

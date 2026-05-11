@@ -78,9 +78,24 @@ locals {
 # =============================================================================
 # SSM Parameters for Blue/Green State
 # =============================================================================
-# Path convention mirrors the AC module: `/<env>/nhp/frps/...`. The
-# image-tag SSM (existing in ssm.tf) already lives at
-# `/<env>/nhp/frps/image-tag`; the blue/green keys keep the same prefix.
+# These six keys (active-color, green-image-tag, last-switch-timestamp,
+# blue-asg-name, green-asg-name, color-cloudmap-service-ids) remain at
+# `/<env>/nhp/frps/...` for now. The image-tag and asg-name SSM keys
+# moved to the canonical `/<env>/nhp/reverse-tunnel-server/*` path in
+# #1668 phase 1 (see ssm.tf).
+#
+# Why deferred: the blue/green keys are pure-Terraform-owned and have no
+# in-codebase reader today (the canary-deployment Lambda gets its SSM
+# paths via env vars, not hardcoded prefixes; smoke tests read only
+# `/<env>/nhp/{server,ac}/*`; qurl-service has no `/<env>/nhp/frps/*`
+# references at the time of writing). They could be migrated in this PR
+# without breaking anything — but that's also why deferring is cheap:
+# moving them is a literal HCL string edit with no force-new state
+# concern (none of these have AWS-side state in any deployed env yet).
+# Phase 1's scope is intentionally narrow to the rts CI Docker Publish
+# unblocker; the follow-up PR that migrates these keys also flips the
+# `Component = "frps"` tags here and in ssm.tf in lockstep with a
+# CloudWatch dashboard / log query audit (see #1668 acceptance).
 #
 # All "value" fields that CI mutates carry `ignore_changes = [value]` so
 # a Terraform plan after a CI flip doesn't try to revert it.

@@ -46,9 +46,17 @@ output "instance_role_arn" {
   value       = aws_iam_role.frps.arn
 }
 
+# Surfaces `local.ssm_image_tag_param_name` (defined in ssm.tf) so
+# downstream consumers — canary-deployment Lambda IAM scope at
+# main.tf::module.canary_deployment_qurl_reverse_tunnel_server, and any
+# future cross-module reader — read the canonical SSM path through the
+# module API rather than re-hardcoding `/<env>/nhp/reverse-tunnel-server/
+# image-tag`. The canonical image-tag itself is owned by rts CI's
+# docker-publish workflow, not Terraform; see ssm.tf header for the
+# ownership split.
 output "ssm_image_tag_parameter" {
-  description = "SSM parameter name for the deployed image tag"
-  value       = aws_ssm_parameter.image_tag.name
+  description = "SSM parameter name for the deployed qurl-reverse-tunnel-server image tag."
+  value       = local.ssm_image_tag_param_name
 }
 
 # Per-AZ empty-registration alarms (#1542). Map keyed by AZ suffix so root
