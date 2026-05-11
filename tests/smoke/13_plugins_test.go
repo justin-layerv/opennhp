@@ -94,6 +94,15 @@ func TestPlugins_NoTokenReturnsBranded403(t *testing.T) {
 // the bytes. This protects against the unbounded-form DoS path that
 // PR #1824's review identified.
 //
+// After #1860 (drain-before-413 + Connection: close), this test
+// ALSO fences the CloudFront 403-substitution regression class:
+// without the drain, CloudFront sees the origin's mid-write RST and
+// serves its own 403, masking the server's 413. A future change that
+// removes the io.CopyN drain in pluginBodySizeMiddleware would flip
+// this test red here even though the unit tests in
+// endpoints/server/plugin_body_cap_test.go stay green (those fence
+// the Go-level drain; this fences the CloudFront round-trip).
+//
 // 64 KiB is comfortably over the 16 KiB cap and small enough not to
 // stress the test transport.
 func TestPlugins_OversizedPOSTReturns413(t *testing.T) {
