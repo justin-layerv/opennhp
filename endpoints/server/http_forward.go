@@ -42,6 +42,31 @@ const maxInternalKnockRequestSize int64 = 64 << 10 // 64 KiB — knock-forward r
 // adversarial input. Defense-in-depth on top of Go's defaultMaxMemory
 // for ParseForm (10 MiB), which is generous enough to be a real DoS
 // surface for parser-heavy plugins.
+//
+// Layered with edge WAF on envs that set
+// `deploy_qurl_link && enable_resolve_cloudfront` (sandbox and prod
+// today). Production traffic to `resolve.${qurl_link_frontend_domain}`
+// (e.g., `resolve.qurl.link.layerv.xyz` in sandbox) fronts the
+// qurl_resolve CloudFront distribution
+// (terraform/main.tf::aws_wafv2_web_acl.qurl_resolve), whose
+// AWSManagedRulesCommonRuleSet rule SizeRestrictions_BODY blocks
+// request bodies larger than 8 KiB at the edge. Via that path this
+// 16 KiB server cap is structurally unreachable — the 413 code path
+// can only be exercised from a non-WAF ingress (NLB-direct, the
+// path the smoke suite probes; a greenfield env that opts out of
+// `enable_resolve_cloudfront`; or any future internal/non-CF
+// endpoint).
+//
+// The 2× gap (WAF 8 KiB, server 16 KiB) is deliberate: a plugin
+// payload growth up to the 16 KiB cap shouldn't force re-tuning the
+// AWS-managed WAF rule, and if WAF is ever loosened or excluded the
+// server still rejects oversize POSTs. The WAF rule is declared in
+// Terraform but has no CI fence asserting it stays present — #1879
+// tracks adding one. Until then, a TF change that removed or
+// downgraded SizeRestrictions_BODY would silently let POSTs in the
+// 8–16 KiB range reach the server (admitted deliberately by the 2×
+// headroom above) and would also let arbitrarily large POSTs
+// through — the 16 KiB cap is the backstop for the unbounded case.
 const maxPluginRequestSize int64 = 16 << 10 // 16 KiB — plugin request envelope
 
 // SourceAPI is the Source value set by API callers (e.g., qurl-service headless resolve).

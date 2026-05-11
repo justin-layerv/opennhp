@@ -39,6 +39,9 @@ import (
 // http_forward.go::maxInternalKnockRequestSize); the literal sizes are
 // declared separately so a future tuning PR diverging them produces a
 // diff in both places.
+//
+// See http_forward.go::maxPluginRequestSize for the edge-WAF
+// layering rationale behind the cap value callers pass in.
 func pluginBodySizeMiddleware(limit int64) gin.HandlerFunc {
 	return func(ctx *gin.Context) {
 		ctx.Request.Body = http.MaxBytesReader(ctx.Writer, ctx.Request.Body, limit)
