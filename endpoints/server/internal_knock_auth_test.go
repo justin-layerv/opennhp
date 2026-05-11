@@ -16,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/OpenNHP/opennhp/internalauth"
 	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
@@ -46,7 +47,7 @@ const internalKnockTestBody = `{"request":{},"resource":{}}`
 
 // newAuthTestRouter builds a Gin router with a signer-configured
 // HttpServer. require toggles strict vs permit mode.
-func newAuthTestRouter(t *testing.T, require bool) (*gin.Engine, *common.InternalAuthSigner) {
+func newAuthTestRouter(t *testing.T, require bool) (*gin.Engine, *internalauth.Signer) {
 	t.Helper()
 	r, signer, _ := newAuthTestRouterWithCounters(t, require)
 	return r, signer
@@ -56,12 +57,12 @@ func newAuthTestRouter(t *testing.T, require bool) (*gin.Engine, *common.Interna
 // a map of metric-name → count that the handler increments via
 // hs.internalAuthEmit. Callers that don't care pass through the
 // convenience wrapper above.
-func newAuthTestRouterWithCounters(t *testing.T, require bool) (*gin.Engine, *common.InternalAuthSigner, map[string]int) {
+func newAuthTestRouterWithCounters(t *testing.T, require bool) (*gin.Engine, *internalauth.Signer, map[string]int) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	signer, err := common.NewInternalAuthSigner(testInternalKnockSecret)
+	signer, err := internalauth.New(testInternalKnockSecret)
 	if err != nil {
-		t.Fatalf("NewInternalAuthSigner: %v", err)
+		t.Fatalf("internalauth.New: %v", err)
 	}
 	var mu sync.Mutex
 	counts := map[string]int{}
@@ -92,7 +93,7 @@ func doRequest(t *testing.T, r *gin.Engine, body string, authHeader string) *htt
 	req.RemoteAddr = "127.0.0.1:54321"
 	req.Header.Set("Content-Type", "application/json")
 	if authHeader != "" {
-		req.Header.Set(common.InternalAuthHeader, authHeader)
+		req.Header.Set(internalauth.Header, authHeader)
 	}
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -110,8 +111,8 @@ func TestInternalKnock_StrictMode_RejectsUnsigned(t *testing.T) {
 	}
 	// Response body must carry only the fixed sentinel — attackers
 	// learn nothing about which arm of the check failed.
-	if !strings.Contains(rec.Body.String(), common.ErrInternalAuth.Error()) {
-		t.Errorf("body should echo sentinel %q, got %q", common.ErrInternalAuth.Error(), rec.Body.String())
+	if !strings.Contains(rec.Body.String(), internalauth.ErrInternalAuth.Error()) {
+		t.Errorf("body should echo sentinel %q, got %q", internalauth.ErrInternalAuth.Error(), rec.Body.String())
 	}
 }
 
@@ -165,9 +166,9 @@ func TestInternalKnock_StrictMode_RejectsTamperedBody(t *testing.T) {
 // old-secret callers are silently accepted.
 func TestInternalKnock_StrictMode_RejectsWrongSecret(t *testing.T) {
 	r, _ := newAuthTestRouter(t, true)
-	otherSigner, err := common.NewInternalAuthSigner(testInternalKnockWrongSecret)
+	otherSigner, err := internalauth.New(testInternalKnockWrongSecret)
 	if err != nil {
-		t.Fatalf("NewInternalAuthSigner: %v", err)
+		t.Fatalf("internalauth.New: %v", err)
 	}
 	sig := otherSigner.Sign(http.MethodPost, "/nhp/internal/knock", []byte(internalKnockTestBody))
 	rec := doRequest(t, r, internalKnockTestBody, sig)
@@ -214,9 +215,9 @@ func TestInternalKnock_PermitMode_AllowsTamperedSignature(t *testing.T) {
 	// A signer with a different secret produces a well-formed header
 	// the real signer will reject. In permit mode that's the exact
 	// shape a mid-rollout mis-configuration emits.
-	otherSigner, err := common.NewInternalAuthSigner(testInternalKnockWrongSecret)
+	otherSigner, err := internalauth.New(testInternalKnockWrongSecret)
 	if err != nil {
-		t.Fatalf("NewInternalAuthSigner: %v", err)
+		t.Fatalf("internalauth.New: %v", err)
 	}
 	sig := otherSigner.Sign(http.MethodPost, "/nhp/internal/knock", []byte(internalKnockTestBody))
 	rec := doRequest(t, r, internalKnockTestBody, sig)
@@ -356,12 +357,12 @@ func TestInternalKnock_RejectsQueryString(t *testing.T) {
 			// Body must be the shape-error string ("bad request"), not
 			// the auth sentinel — a future refactor that accidentally
 			// routes query-bearing requests through the auth branch
-			// would leak common.ErrInternalAuth.Error() into the body
+			// would leak internalauth.ErrInternalAuth.Error() into the body
 			// and this assertion would fire.
 			if !strings.Contains(rec.Body.String(), "bad request") {
 				t.Errorf("expected shape-error body, got %q", rec.Body.String())
 			}
-			if strings.Contains(rec.Body.String(), common.ErrInternalAuth.Error()) {
+			if strings.Contains(rec.Body.String(), internalauth.ErrInternalAuth.Error()) {
 				t.Errorf("body leaked auth sentinel into query-reject path: %q", rec.Body.String())
 			}
 		})
@@ -381,7 +382,7 @@ func TestInternalKnock_HeaderCaseInsensitive(t *testing.T) {
 	req.RemoteAddr = "127.0.0.1:54321"
 	req.Header.Set("Content-Type", "application/json")
 	// Set with lowercase name — net/http canonicalizes to
-	// X-Nhp-Auth internally, so ctx.GetHeader(InternalAuthHeader)
+	// X-Nhp-Auth internally, so ctx.GetHeader(internalauth.Header)
 	// should still see this value.
 	req.Header.Set("x-nhp-auth", sig)
 	rec := httptest.NewRecorder()
@@ -427,7 +428,7 @@ func TestInternalKnock_StrictMode_SourceIPGateStillApplies(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/nhp/internal/knock", strings.NewReader(internalKnockTestBody))
 	req.RemoteAddr = "8.8.8.8:12345" // public source
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(common.InternalAuthHeader, sig)
+	req.Header.Set(internalauth.Header, sig)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
@@ -643,7 +644,7 @@ func TestLoadInternalAuthConfig(t *testing.T) {
 // forwarder tests below share the httptest + SplitHostPort + Atoi +
 // NewHttpKnockForwarder boilerplate; a third forwarder test should
 // reuse the helper rather than copy it.
-func newForwarderAgainstEcho(t *testing.T, signer *common.InternalAuthSigner, handler http.HandlerFunc) (*HttpKnockForwarder, ServerInfo, func()) {
+func newForwarderAgainstEcho(t *testing.T, signer *internalauth.Signer, handler http.HandlerFunc) (*HttpKnockForwarder, ServerInfo, func()) {
 	t.Helper()
 	srv := httptest.NewServer(handler)
 	host, portStr, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
@@ -665,9 +666,9 @@ func newForwarderAgainstEcho(t *testing.T, signer *common.InternalAuthSigner, ha
 // that the matching verifier accepts. Closes the "client side signs
 // but server side rejects" or vice-versa class of regression.
 func TestForwarder_SignsOutgoing(t *testing.T) {
-	signer, err := common.NewInternalAuthSigner(testInternalKnockSecret)
+	signer, err := internalauth.New(testInternalKnockSecret)
 	if err != nil {
-		t.Fatalf("NewInternalAuthSigner: %v", err)
+		t.Fatalf("internalauth.New: %v", err)
 	}
 
 	// Receiver mirrors handleInternalKnock's verification using the
@@ -675,7 +676,7 @@ func TestForwarder_SignsOutgoing(t *testing.T) {
 	var sawAuthOK bool
 	f, target, cleanup := newForwarderAgainstEcho(t, signer, func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		verr := signer.Verify(r.Header.Get(common.InternalAuthHeader), r.Method, r.URL.Path, body, 0)
+		verr := signer.Verify(r.Header.Get(internalauth.Header), r.Method, r.URL.Path, body, 0)
 		if verr != nil {
 			t.Errorf("receiver rejected forwarder-signed request: %v", verr)
 			w.WriteHeader(http.StatusUnauthorized)
@@ -708,9 +709,9 @@ func TestForwarder_SignsOutgoing(t *testing.T) {
 // before hitting the wire) gives a clearer failure and avoids
 // polluting the signing-contract telemetry.
 func TestForwarder_EmitsNoQueryOrFragment(t *testing.T) {
-	signer, err := common.NewInternalAuthSigner(testInternalKnockSecret)
+	signer, err := internalauth.New(testInternalKnockSecret)
 	if err != nil {
-		t.Fatalf("NewInternalAuthSigner: %v", err)
+		t.Fatalf("internalauth.New: %v", err)
 	}
 
 	var captured *url.URL
@@ -747,10 +748,20 @@ func TestForwarder_EmitsNoQueryOrFragment(t *testing.T) {
 // introducing mutable per-call state (e.g. a cached buffer or
 // stateful HMAC) trips the race detector instead of silently
 // corrupting signatures.
+//
+// Defensive duplication: the canonical concurrency fence now lives at
+// internalauth.TestSign_ConcurrentUse (in the shared module). This
+// test stays here because nhp-server is the consumer that would
+// observe a regression first if the module's invariant broke under
+// the in-tree replace directive (vs. a tagged module bump). When the
+// cross-repo tag-cut protocol (#1836) is established and qurl-service
+// + qurl-reverse-tunnel-server pin to a real version, this test
+// becomes pure duplication and can be deleted in favor of trusting
+// the module's own fence.
 func TestInternalAuthSigner_Concurrent(t *testing.T) {
-	signer, err := common.NewInternalAuthSigner(testInternalKnockSecret)
+	signer, err := internalauth.New(testInternalKnockSecret)
 	if err != nil {
-		t.Fatalf("NewInternalAuthSigner: %v", err)
+		t.Fatalf("internalauth.New: %v", err)
 	}
 	const workers = 16
 	const iters = 200

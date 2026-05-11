@@ -1,4 +1,4 @@
-package common
+package internalauth
 
 import (
 	"crypto/sha256"
@@ -6,40 +6,98 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 // fixedSigner returns a signer whose clock is pinned to `at` so tests
-// can drive the timestamp deterministically.
-func fixedSigner(t *testing.T, secret string, at time.Time) *InternalAuthSigner {
+// can drive the timestamp deterministically. Uses newWithClock (the
+// package-internal constructor) so the "set once at construction"
+// invariant holds — no post-construction mutation, no race surface
+// against concurrent Sign calls. External consumers that need a
+// pinned clock call NewWithClock (the public test-clock entry
+// point); newWithClock is package-internal and not reachable from
+// outside this module.
+func fixedSigner(t *testing.T, secret string, at time.Time) *Signer {
 	t.Helper()
-	s, err := NewInternalAuthSigner(secret)
+	s, err := newWithClock(secret, func() time.Time { return at })
 	if err != nil {
-		t.Fatalf("NewInternalAuthSigner: %v", err)
+		t.Fatalf("newWithClock: %v", err)
 	}
-	s.now = func() time.Time { return at }
 	return s
 }
 
-func TestNewInternalAuthSigner_RejectsEmptySecret(t *testing.T) {
+func TestNew_RejectsEmptySecret(t *testing.T) {
 	// Empty secret is a security-critical misconfiguration: HMAC with
 	// a zero-length key still produces valid signatures, which would
 	// let any caller's signature pass verification. Reject at
 	// construction so a missing env var fails loud at startup.
-	_, err := NewInternalAuthSigner("")
+	_, err := New("")
 	if !errors.Is(err, ErrInternalAuth) {
 		t.Errorf("err = %v, want errors.Is(ErrInternalAuth)", err)
 	}
 }
 
-// TestNewInternalAuthSigner_RejectsShortSecret pins the brute-force
+// TestNewWithClock_RejectsNilClock pins the public-
+// boundary nil-clock guard. The godoc claims a misconfigured test
+// fixture "fails at signer construction rather than at first Sign
+// call" — without this row, that contract had no fence and a future
+// edit that dropped the guard would silently land a signer that
+// panics on the first Sign rather than rejecting at construction.
+// Same fence shape as the empty-secret row above, applied to the
+// other public-boundary precondition.
+func TestNewWithClock_RejectsNilClock(t *testing.T) {
+	_, err := NewWithClock(strings.Repeat("a", 32), nil)
+	if !errors.Is(err, ErrInternalAuth) {
+		t.Errorf("nil clock: want ErrInternalAuth, got %v", err)
+	}
+}
+
+// TestNewWithClock_ReturnsUsableSigner pins the
+// happy path: a non-nil clock that pins to a fixed time produces a
+// signer whose Sign output reflects that time. Without this row,
+// the public test-clock surface had only the rejection branch
+// fenced — a future refactor that wired the clock into the wrong
+// field (or accidentally captured time.Now at construction) would
+// still pass the rejection test but produce signers that ignore
+// the injected clock. This row exercises the round-trip so
+// consumers' deterministic-timestamp tests have a load-bearing
+// guarantee at the module layer.
+func TestNewWithClock_ReturnsUsableSigner(t *testing.T) {
+	at := time.Unix(1_700_000_000, 0)
+	s, err := NewWithClock(strings.Repeat("a", 32),
+		func() time.Time { return at })
+	if err != nil {
+		t.Fatalf("NewWithClock: %v", err)
+	}
+	if s == nil {
+		t.Fatal("returned signer is nil")
+	}
+	header := s.Sign("POST", "/p", nil)
+	// Pin the timestamp the injected clock provided — if the clock
+	// wasn't actually wired through, the header's timestamp would
+	// differ from at.Unix() and this fails. Pinning the timestamp
+	// (rather than just the round-trip Verify) is what fences the
+	// "clock function actually injected" invariant.
+	want := "NHPv1 timestamp=1700000000,"
+	if !strings.HasPrefix(header, want) {
+		t.Errorf("header timestamp drifted from injected clock:\nheader: %q\nwant prefix: %q", header, want)
+	}
+	// Round-trip verification with the same signer confirms the
+	// signer is usable end-to-end, not just constructible.
+	if err := s.Verify(header, "POST", "/p", nil, 0); err != nil {
+		t.Errorf("round-trip with WithClock signer failed: %v", err)
+	}
+}
+
+// TestNew_RejectsShortSecret pins the brute-force
 // floor: a 1- to 31-byte secret must fail at construction, not at
 // request time. Catches a Terraform misconfiguration where the
 // Secrets Manager value gets truncated (e.g. by a substring template)
 // — without this check, the gate would silently accept HMACs that
 // are well below the SHA-256 security level.
-func TestNewInternalAuthSigner_RejectsShortSecret(t *testing.T) {
+func TestNew_RejectsShortSecret(t *testing.T) {
 	cases := []struct {
 		name   string
 		secret string
@@ -54,7 +112,7 @@ func TestNewInternalAuthSigner_RejectsShortSecret(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := NewInternalAuthSigner(tc.secret)
+			_, err := New(tc.secret)
 			if tc.ok && err != nil {
 				t.Errorf("len=%d: want OK, got %v", len(tc.secret), err)
 			}
@@ -122,7 +180,7 @@ func TestVerify_RejectsPathNormalizationMismatch(t *testing.T) {
 		// redirects "/path/" → "/path" at the router layer, so a
 		// caller signing with a trailing slash never reaches the
 		// handler. Test fences the signing-string mismatch at the
-		// common-package layer regardless of router policy.
+		// shared-module layer regardless of router policy.
 		{"trailing slash", "/nhp/internal/knock/", "/nhp/internal/knock"},
 	}
 	for _, tc := range cases {
@@ -321,11 +379,11 @@ func TestVerify_MalformedHeaders(t *testing.T) {
 }
 
 // TestSigningString_StableFormat pins the exact bytes HMAC sees. The
-// wire format is a cross-service contract: qurl-service computes the
-// same signing string and sends the header to nhp-server's verifier.
-// Any refactor that reorders fields or changes separators must bump
-// InternalAuthScheme so mismatched versions fail loudly instead of
-// silently.
+// wire format is a cross-service contract: every consumer of this
+// module computes the same signing string and the verifier compares
+// HMACs over those bytes. Any refactor that reorders fields or
+// changes separators must bump Scheme so mismatched
+// versions fail loudly instead of silently.
 func TestSigningString_StableFormat(t *testing.T) {
 	ts := int64(1_700_000_000)
 	body := []byte(`{"req":1}`)
@@ -414,14 +472,69 @@ func TestVerify_ShortSignatureRejected(t *testing.T) {
 	}
 }
 
+// TestSign_ConcurrentUse fences the Signer concurrency godoc claim:
+// "Safe for concurrent use after construction: secret and now are
+// set once at construction and never reassigned."
+// A future edit that adds mutable per-call state (a cached buffer, a
+// stateful HMAC instance, a sliding-window nonce) would silently
+// corrupt signatures under load — this test runs N workers signing
+// and verifying in parallel and trips the -race detector if any
+// shared mutable state is introduced.
+//
+// Lives in the shared module (not just at the consumer's call site)
+// because every consumer — nhp-server, qurl-service, qurl-reverse-
+// tunnel-server — relies on this invariant. The shared module's CI
+// runs first; surfacing a regression here means every consumer's
+// pipeline blocks on the same broken bytes instead of three separate
+// repos each finding it independently after a deploy. Mirrors the
+// removed qurl-service-side TestSign_ConcurrentUse and the existing
+// endpoints/server/TestInternalAuthSigner_Concurrent in nhp-server,
+// but at the module's authoritative layer.
+func TestSign_ConcurrentUse(t *testing.T) {
+	const (
+		secret  = "concurrent-secret-padded-out-to-32-chars"
+		workers = 16
+		iters   = 200
+	)
+	// Production constructor (NOT fixedSigner) so we exercise the
+	// time.Now path — fixedSigner pins a frozen clock that would mask
+	// a regression where Sign mutated a per-call timestamp cache.
+	s, err := New(secret)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	errCh := make(chan error, workers*iters)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			body := []byte(fmt.Sprintf(`{"worker":%d}`, id))
+			for j := 0; j < iters; j++ {
+				hdr := s.Sign("POST", "/nhp/internal/knock", body)
+				if verr := s.Verify(hdr, "POST", "/nhp/internal/knock", body, 0); verr != nil {
+					errCh <- fmt.Errorf("worker %d iter %d: %w", id, j, verr)
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for e := range errCh {
+		t.Error(e)
+	}
+}
+
 // Compile-time asserts: the constants the rest of the codebase will
 // reference must not accidentally become empty or lose their prefix.
 func TestHeaderConstants(t *testing.T) {
-	if InternalAuthHeader == "" || !strings.HasPrefix(InternalAuthHeader, "X-") {
-		t.Errorf("InternalAuthHeader %q must start with X-", InternalAuthHeader)
+	if Header == "" || !strings.HasPrefix(Header, "X-") {
+		t.Errorf("Header %q must start with X-", Header)
 	}
-	if !strings.HasPrefix(InternalAuthScheme, "NHPv") {
-		t.Errorf("InternalAuthScheme %q must start with NHPv", InternalAuthScheme)
+	if !strings.HasPrefix(Scheme, "NHPv") {
+		t.Errorf("Scheme %q must start with NHPv", Scheme)
 	}
 	// Sanity: hmac.New with the secret must be addressable (used
 	// inside computeMAC). We exercise the method here so the signing

@@ -3,6 +3,7 @@ module github.com/OpenNHP/opennhp/endpoints
 go 1.26.2
 
 require (
+	github.com/OpenNHP/opennhp/internalauth v0.0.0-00010101000000-000000000000
 	github.com/OpenNHP/opennhp/nhp v0.6.0
 	github.com/aws/aws-sdk-go-v2 v1.41.7
 	github.com/aws/aws-sdk-go-v2/config v1.32.16
@@ -210,3 +211,15 @@ require (
 )
 
 replace github.com/OpenNHP/opennhp/nhp v0.6.0 => ../nhp
+
+// internalauth is replaced unversioned (vs nhp's pinned v0.6.0)
+// because the module hasn't been published yet — the
+// v0.0.0-00010101000000-000000000000 in the require above is the
+// Go-toolchain-generated placeholder for "no real version exists,
+// resolve via the replace below." Once the cross-repo publishing
+// protocol (#1836) lands and a real internalauth/v0.x.0 tag is cut,
+// pin this replace to that version (or remove it entirely if the
+// tag is consumed via go.sum). DO NOT hand-edit the placeholder
+// version in the require line — `go mod tidy` regenerates it from
+// the current state of ../internalauth.
+replace github.com/OpenNHP/opennhp/internalauth => ../internalauth

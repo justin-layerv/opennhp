@@ -94,6 +94,7 @@ init:
 	@echo "$(COLOUR_BLUE)[OpenNHP] Initializing... $(END_COLOUR)"
 	git clean -df release
 	cd nhp && go mod tidy
+	cd internalauth && go mod tidy
 	cd endpoints && go mod tidy
 	cd examples/server_plugin && go mod tidy
 	cd tests/local && go mod tidy
@@ -195,6 +196,7 @@ plugins:
 lint: lint-redirect-url-drift lint-disable-agent-validation lint-run-fuzz
 	@echo "$(COLOUR_BLUE)[OpenNHP] Running linters...$(END_COLOUR)"
 	cd nhp && golangci-lint run ./...
+	cd internalauth && golangci-lint run ./...
 	cd endpoints && golangci-lint run ./...
 	@echo "$(COLOUR_GREEN)[OpenNHP] Lint passed!$(END_COLOUR)"
 
@@ -337,6 +339,7 @@ lint-terraform-drift:
 
 test:
 	@echo "[OpenNHP] Running Unit Tests..."
+	cd internalauth && go test -v ./... -race
 	cd endpoints && KBS_SKIP_INIT=1 go test -v ./server/... -run "Test.*ACPeers|TestEmptyVsNil|TestEtcd|TestMerged|TestParse|TestACRegistry"
 	@echo "$(COLOUR_GREEN)[OpenNHP] Unit Tests Done!$(END_COLOUR)"
 

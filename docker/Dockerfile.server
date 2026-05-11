@@ -20,6 +20,14 @@ RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https
 
 # Copy dependency files first (better layer caching)
 COPY nhp/go.mod nhp/go.sum ./nhp/
+# internalauth/ has no go.sum today (pure-stdlib module). When the
+# first non-stdlib dep lands, ALSO add `internalauth/go.sum` to
+# this COPY — without it, the dep-prefetch layer will succeed via
+# go.mod resolution but layer caching will silently drift from the
+# actual build (downloads stay reproducible but the cache layer
+# stops invalidating on dep-version bumps). Same caveat tracked in
+# codeql.yml + dependabot-go-tidy.yml setup-go cache blocks.
+COPY internalauth/go.mod ./internalauth/
 COPY endpoints/go.mod endpoints/go.sum ./endpoints/
 
 # Download dependencies (cached unless go.mod/go.sum change)

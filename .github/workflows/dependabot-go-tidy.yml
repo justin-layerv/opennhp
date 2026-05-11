@@ -77,8 +77,23 @@ jobs:
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: nhp/go.mod
+          # Reference internalauth/go.mod (which exists today as a
+          # pure-stdlib module) rather than internalauth/go.sum
+          # (which is empty until a non-stdlib dep is added).
+          # actions/setup-go can fail with "Some specified paths were
+          # not resolved" when a literal cache path doesn't exist, so
+          # pointing at go.mod keeps the cache key live for the
+          # pure-stdlib state. CAVEAT: this catches direct-dep
+          # changes (a `go get foo@v1.2.4` updates go.mod's require
+          # line so the cache busts), but misses indirect/transitive-
+          # only churn — a `go mod tidy` that promotes/demotes an
+          # indirect dep updates only go.sum. The PR that adds the
+          # first non-stdlib dep MUST flip both lines below from
+          # go.mod to go.sum so indirect-dep churn busts the cache
+          # too. Mirrors the same caveat in the codeql.yml block.
           cache-dependency-path: |
             nhp/go.sum
+            internalauth/go.mod
             endpoints/go.sum
             examples/server_plugin/go.sum
             tests/local/go.sum
@@ -91,6 +106,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/nhp" && go mod tidy
+          cd "$GITHUB_WORKSPACE/internalauth" && go mod tidy
           cd "$GITHUB_WORKSPACE/endpoints" && go mod tidy
           cd "$GITHUB_WORKSPACE/examples/server_plugin" && go mod tidy
           cd "$GITHUB_WORKSPACE/tests/local" && go mod tidy

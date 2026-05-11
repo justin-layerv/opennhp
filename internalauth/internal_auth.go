@@ -1,21 +1,15 @@
-package common
-
-import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
-	"errors"
-	"fmt"
-	"strconv"
-	"strings"
-	"time"
-)
-
-// Internal service authentication for server↔server and service↔server
-// HTTP calls on the VPC-internal /nhp/internal/* surface. The header
-// carries the caller's shared-secret HMAC over (method, path, body),
-// so a VPC-local attacker without the secret can neither forge an
-// authenticated call nor tamper the body of an in-flight one.
+// Package internalauth implements the HMAC canonicalization used by
+// every server↔server and service↔server HTTP call on the VPC-internal
+// /nhp/internal/* surface.
+//
+// Why this is its own module (and not an internal package): qurl-service,
+// qurl-reverse-tunnel-server, and nhp-server all need byte-identical
+// signing. Two hand-copies (the original setup) drifted at review-time
+// risk; one shared module with a snapshot test means a change to the
+// canonical signing string breaks every consumer's CI in lockstep
+// instead of breaking signatures silently in production. The module is
+// pure stdlib (crypto/hmac, crypto/sha256, encoding/hex, errors, fmt,
+// strconv, strings, time) so consumers preserve CGO_ENABLED=0 builds.
 //
 // Scheme (X-Nhp-Auth header value):
 //
@@ -37,19 +31,31 @@ import (
 // process start, held in memory as []byte, and never logged.
 //
 // The scheme is distinct from endpoints/server/staticplugins/passcode/
-// hmac_auth.go — that one signs only the timestamp and is used for an
-// end-user passcode flow, not internal service auth. Keeping them
-// separate (instead of generalizing the passcode signer) avoids
-// accidental cross-use: a secret leak on one surface does not
+// hmac_auth.go in the nhp repo — that one signs only the timestamp and
+// is used for an end-user passcode flow, not internal service auth.
+// Keeping them separate (instead of generalizing the passcode signer)
+// avoids accidental cross-use: a secret leak on one surface does not
 // authenticate the other.
+package internalauth
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+)
 
 const (
-	// InternalAuthHeader is the HTTP header carrying the signed auth.
-	InternalAuthHeader = "X-Nhp-Auth"
-	// InternalAuthScheme prefixes the header value and is part of the
+	// Header is the HTTP header carrying the signed auth.
+	Header = "X-Nhp-Auth"
+	// Scheme prefixes the header value and is part of the
 	// signed string — bumping to v2 invalidates every v1 signer/verifier
 	// in a single coordinated step.
-	InternalAuthScheme = "NHPv1"
+	Scheme = "NHPv1"
 	// DefaultMaxClockSkew bounds replay without requiring strict clock
 	// sync. 5 minutes is long enough to tolerate VM pause / NTP drift
 	// during fleet deploys and short enough that a captured header is
@@ -106,45 +112,59 @@ const (
 // classifying, but the explicit None keeps "success" from
 // accidentally looking like "other" if the guard is dropped.
 //
-// Implementation note: today this is substring-matching against
-// Verify's error strings. TestClassifyAuthFailure pins every
-// current shape, so a regression shows up in CI — but the coupling
-// is textual, not compile-time. The sturdier shape (typed sentinel
-// errors wrapped via %w, classified via errors.Is) is tracked as
-// follow-up #1230. Choosing to defer because: (a) the test suite
-// already fences every return, (b) this PR is already 30+ review
-// rounds deep and the refactor is non-trivial, (c) the scheme
-// constant baked into the signing string means any subsequent
-// refactor can land non-breaking. Explicit choice, not oversight.
+// Implementation note: today this is suffix-prefix matching against
+// Verify's error strings (the suffix after the ErrInternalAuth wrap).
+// TestClassifyAuthFailure pins every current shape, so a regression
+// shows up in CI — but the coupling is textual, not compile-time.
+// The sturdier shape (typed sentinel errors wrapped via %w,
+// classified via errors.Is) is tracked as follow-up #1230. Choosing
+// to defer because: (a) the test suite already fences every return,
+// (b) the scheme constant baked into the signing string means any
+// subsequent refactor can land non-breaking, (c) the suffix-prefix
+// match below tightens the coupling vs the original strings.Contains
+// (which would silently re-bucket if a future error string contained
+// "missing" or "duplicate" inadvertently — see #1838-class concern
+// raised in PR-2b' round-8 cr review). Explicit choice, not
+// oversight.
 func ClassifyAuthFailure(err error) AuthFailureStage {
 	if err == nil {
 		return AuthStageNone
 	}
+	// Strip the ErrInternalAuth wrap once so each case below pins the
+	// reason suffix at the start of the remaining string. This tightens
+	// the coupling vs strings.Contains: a future return like "signature
+	// missing required hex chars" now lands in the signature bucket
+	// (correct), not silently in the parse bucket because it contained
+	// the substring "missing" anywhere. Each prefix below corresponds
+	// to exactly one fmt.Errorf call site in Verify.
 	msg := err.Error()
+	const wrap = "internal auth failed: "
+	suffix := strings.TrimPrefix(msg, wrap)
 	switch {
-	case strings.Contains(msg, "signature mismatch"):
+	case strings.HasPrefix(suffix, "signature mismatch"):
 		return AuthStageSignature
-	case strings.Contains(msg, "clock-skew"):
+	case strings.HasPrefix(suffix, "timestamp outside clock-skew window"):
 		return AuthStageSkew
-	case strings.Contains(msg, "missing") ||
-		strings.Contains(msg, "unsupported scheme") ||
-		strings.Contains(msg, "malformed") ||
-		strings.Contains(msg, "duplicate") ||
-		strings.Contains(msg, "unknown header param") ||
-		strings.Contains(msg, "invalid timestamp") ||
-		strings.Contains(msg, "plausible bounds"):
+	case strings.HasPrefix(suffix, "missing "),
+		strings.HasPrefix(suffix, "header missing "),
+		strings.HasPrefix(suffix, "unsupported scheme"),
+		strings.HasPrefix(suffix, "malformed "),
+		strings.HasPrefix(suffix, "duplicate "),
+		strings.HasPrefix(suffix, "unknown header param"),
+		strings.HasPrefix(suffix, "invalid timestamp"),
+		strings.HasPrefix(suffix, "timestamp outside plausible bounds"):
 		return AuthStageParse
 	default:
 		return AuthStageOther
 	}
 }
 
-// InternalAuthSigner signs and verifies internal-auth headers. The
-// secret is captured by value at construction; rotation means
-// constructing a new signer and swapping the handle, not mutating an
-// existing one. Zero-length and short secrets are rejected at
-// construction so a misconfigured env can't silently produce a
-// verifier that accepts any signature.
+// Signer signs and verifies internal-auth headers. The secret is
+// captured by value at construction; rotation means constructing a
+// new signer and swapping the handle, not mutating an existing one.
+// Zero-length and short secrets are rejected at construction so a
+// misconfigured env can't silently produce a verifier that accepts
+// any signature.
 //
 // Replay window: the signed string binds (scheme, timestamp, method,
 // path, body) but NO per-request nonce. Within the server-enforced
@@ -155,9 +175,17 @@ func ClassifyAuthFailure(err error) AuthFailureStage {
 // the original caller already authorized) this is self-limiting.
 // Endpoints with non-idempotent side effects must add a nonce layer
 // (server-side replay cache keyed on signing-string hash, or a
-// nonce field bumping InternalAuthScheme to v2) before they rely
+// nonce field bumping Scheme to v2) before they rely
 // on this signer for replay protection — see layervai/nhp#1223.
-type InternalAuthSigner struct {
+//
+// Safe for concurrent use after construction: secret and now are
+// set once at construction and never reassigned. A future change
+// that adds shared state (counter, sliding-window nonce, cached
+// HMAC instance) would need to add explicit synchronization or
+// document the unsafe semantics here. Tests that need to drive the
+// clock construct a fresh signer per scenario via newWithClock
+// rather than mutating an existing one.
+type Signer struct {
 	secret []byte
 	// now is injected so tests can drive the clock without touching
 	// time.Now globally. Production construction sets it to time.Now.
@@ -167,14 +195,48 @@ type InternalAuthSigner struct {
 	now func() time.Time
 }
 
-// NewInternalAuthSigner returns a signer or an error. Empty and
+// New returns a signer or an error. Empty and
 // short secrets are rejected — a zero-length HMAC key produces valid
-// signatures (HMAC(key="", msg) is well-defined) and a 1- to 32-byte
+// signatures (HMAC(key="", msg) is well-defined) and a 1- to 31-byte
 // key reduces the brute-force cost below the SHA-256 security level.
-// The 32-byte minimum matches MinSecretLength; surface a config-
-// shaped error so a Terraform misconfiguration fails at startup with
-// a clear message instead of silently producing weak signatures.
-func NewInternalAuthSigner(secret string) (*InternalAuthSigner, error) {
+// The 32-byte minimum matches MinSecretLength (boundary inclusive,
+// fenced by TestNew_RejectsShortSecret's 32-byte row); surface a
+// config-shaped error so a Terraform misconfiguration fails at
+// startup with a clear message instead of silently producing weak
+// signatures.
+func New(secret string) (*Signer, error) {
+	return newWithClock(secret, time.Now)
+}
+
+// NewWithClock is the test-only constructor that pins the clock
+// function. Production code MUST use New. Exposed (rather than
+// mutating a `now` field on an existing signer post-construction)
+// so the signer's "all fields set once at construction" invariant
+// holds across every consumer's deterministic-timestamp tests,
+// eliminating any data-race surface between concurrent Sign calls
+// and a test's clock reassignment. clock must be non-nil; passing
+// nil returns a wrapped ErrInternalAuth so a misconfigured test
+// fixture fails at signer construction rather than at first Sign
+// call.
+func NewWithClock(secret string, clock func() time.Time) (*Signer, error) {
+	if clock == nil {
+		return nil, fmt.Errorf("%w: clock must be non-nil", ErrInternalAuth)
+	}
+	return newWithClock(secret, clock)
+}
+
+// newWithClock is the package-internal constructor used by both
+// New (which wires time.Now) and NewWithClock (the public test-
+// clock path that external consumers like qurl-service call to pin
+// the clock in their own test suites). The nil-clock guard is
+// enforced only at the public boundary (NewWithClock); package-
+// internal callers already pass a non-nil clock literal (or
+// time.Now) so a duplicate guard here would be defensive bloat
+// without adding fence value. External consumers cannot call
+// newWithClock and must use NewWithClock; the public boundary is
+// the only supported escape hatch for deterministic-timestamp
+// tests.
+func newWithClock(secret string, clock func() time.Time) (*Signer, error) {
 	if len(secret) == 0 {
 		return nil, fmt.Errorf("%w: secret must be non-empty", ErrInternalAuth)
 	}
@@ -185,9 +247,9 @@ func NewInternalAuthSigner(secret string) (*InternalAuthSigner, error) {
 		// fact they shouldn't. Just say "too short".
 		return nil, fmt.Errorf("%w: secret length below minimum (want >= %d bytes)", ErrInternalAuth, MinSecretLength)
 	}
-	return &InternalAuthSigner{
+	return &Signer{
 		secret: []byte(secret),
-		now:    time.Now,
+		now:    clock,
 	}, nil
 }
 
@@ -212,27 +274,27 @@ func NewInternalAuthSigner(secret string) (*InternalAuthSigner, error) {
 // documented contract rather than an enforced check. Adding a
 // percent-encoded segment to the URL on either side is a breaking
 // change that needs a coordinated rollout, not a silent deploy.
-func (s *InternalAuthSigner) Sign(method, path string, body []byte) string {
+func (s *Signer) Sign(method, path string, body []byte) string {
 	ts := s.now().Unix()
 	signString := signingString(ts, method, path, body)
 	sig := s.computeMAC(signString)
-	return fmt.Sprintf("%s timestamp=%d,signature=%s", InternalAuthScheme, ts, sig)
+	return fmt.Sprintf("%s timestamp=%d,signature=%s", Scheme, ts, sig)
 }
 
 // Verify parses and checks the header. Returns nil on success, a
 // wrapped ErrInternalAuth on any failure. maxSkew bounds the
 // tolerated offset between the caller's timestamp and the server's
 // clock; pass 0 (or any non-positive value) to use DefaultMaxClockSkew.
-func (s *InternalAuthSigner) Verify(header, method, path string, body []byte, maxSkew time.Duration) error {
+func (s *Signer) Verify(header, method, path string, body []byte, maxSkew time.Duration) error {
 	if maxSkew <= 0 {
 		maxSkew = DefaultMaxClockSkew
 	}
 	if header == "" {
-		return fmt.Errorf("%w: missing %s header", ErrInternalAuth, InternalAuthHeader)
+		return fmt.Errorf("%w: missing %s header", ErrInternalAuth, Header)
 	}
 
 	scheme, rest, ok := strings.Cut(header, " ")
-	if !ok || scheme != InternalAuthScheme {
+	if !ok || scheme != Scheme {
 		return fmt.Errorf("%w: unsupported scheme", ErrInternalAuth)
 	}
 
@@ -326,7 +388,7 @@ func (s *InternalAuthSigner) Verify(header, method, path string, body []byte, ma
 // Named deliberately to not shadow the crypto/hmac package imported
 // into this file — `s.hmac(...)` next to `hmac.New(...)` inside the
 // same method body reads ambiguously to a skimming reviewer.
-func (s *InternalAuthSigner) computeMAC(data string) string {
+func (s *Signer) computeMAC(data string) string {
 	mac := hmac.New(sha256.New, s.secret)
 	mac.Write([]byte(data))
 	return hex.EncodeToString(mac.Sum(nil))
@@ -334,12 +396,15 @@ func (s *InternalAuthSigner) computeMAC(data string) string {
 
 // signingString is the canonical input to HMAC. Test vectors that
 // pin the wire format across signer/verifier versions exercise it
-// through Sign/Verify end-to-end, not directly — changing the format
-// must bump InternalAuthScheme and land identically on every peer.
+// through Sign/Verify end-to-end; the snapshot test in
+// internal_auth_snapshot_test.go also pins the exact bytes for a
+// fixed reference vector, so a refactor that reorders fields or
+// changes separators must bump Scheme and land
+// identically on every consumer.
 func signingString(ts int64, method, path string, body []byte) string {
 	bodyHash := sha256.Sum256(body)
 	return fmt.Sprintf("%s\n%d\n%s\n%s\n%s",
-		InternalAuthScheme,
+		Scheme,
 		ts,
 		strings.ToUpper(method),
 		path,

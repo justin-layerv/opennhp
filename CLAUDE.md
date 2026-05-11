@@ -58,6 +58,9 @@ Quick reference for the LayerV NHP (Network Hiding Protocol) infrastructure proj
 
 ```
 nhp/                 # Core NHP protocol library (Go module)
+internalauth/        # Shared HMAC canonicalization (Go module — published path:
+                     # github.com/OpenNHP/opennhp/internalauth, consumed by
+                     # nhp-server, qurl-service, qurl-reverse-tunnel-server)
 endpoints/           # Services: server, ac, agent, db (Go module)
 examples/            # Example plugins (Go module)
 terraform/           # IaC with modules and environments (sandbox, prod)
@@ -66,7 +69,7 @@ tests/               # local/, integration/, e2e/
 release/             # Build output (gitignored)
 ```
 
-**Multi-Module Workspace:** Four Go modules — `nhp/`, `endpoints/`, `examples/server_plugin/`, `tests/local/`. The first three are wired with `replace` directives pointing to local paths. Always run `go mod tidy` in all four when updating dependencies; `make init` does this. Other Go modules (`tests/e2e/`, `tests/integration/`, `tests/smoke/`, `docker/web-app/`) have their own lifecycle and aren't auto-tidied — tracked in #1290.
+**Multi-Module Workspace:** Five Go modules — `nhp/`, `internalauth/`, `endpoints/`, `examples/server_plugin/`, `tests/local/`. The first four are wired with `replace` directives pointing to local paths (`internalauth` is also published externally so qurl-service and qurl-reverse-tunnel-server can import the same HMAC canonicalization). Always run `go mod tidy` in all five when updating dependencies; `make init` does this. Other Go modules (`tests/e2e/`, `tests/integration/`, `tests/smoke/`, `docker/web-app/`) have their own lifecycle and aren't auto-tidied — tracked in #1290.
 
 **Related Repos:** `console` (UI/API), `website` (layerv.ai), `traefik-plugins` (middleware)
 
@@ -128,6 +131,7 @@ BREAKING CHANGE: JWT tokens now require audience claim
 | `agent` | NHP Agent |
 | `db` | Database service |
 | `nhp` | Core protocol library |
+| `internalauth` | Shared HMAC canonicalization module (cross-repo) |
 | `terraform` | Infrastructure |
 | `docker` | Container configuration |
 | `ci` | GitHub Actions workflows |
@@ -773,6 +777,14 @@ of where you'd want the catch.
   value (`aws_secretsmanager_secret.nhp_internal_auth`); the app-layer gate
   defaults to permit mode — flip `NHP_INTERNAL_AUTH_REQUIRE=true` only after
   the permit-mode mismatch counter stays at zero through a full deploy cycle.
+  **Entropy comes from upstream provisioning.** The shared module
+  (`internalauth.MinSecretLength`) only fences the length floor — a 32-byte
+  all-`a` string passes the construction check and is trivially guessable.
+  Production secrets MUST be CSPRNG-sourced: Terraform's `random_password`
+  resource (with `special = false` + `min_lower/upper/numeric` set) or AWS
+  Secrets Manager's `generate_secret_string` are the canonical sources.
+  An operator who hand-types or provisions a guessable secret bypasses the
+  brute-force fence the floor is supposed to enforce.
   Operational notes:
   - **Plan-role permissions:** the `check` block that asserts the secret is
     populated refreshes `data.aws_secretsmanager_secret_version` on every

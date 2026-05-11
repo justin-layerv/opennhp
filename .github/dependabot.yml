@@ -11,6 +11,21 @@ updates:
       - "dependencies"
       - "go"
 
+  # Go modules - internalauth
+  # Pure-stdlib today (zero non-stdlib deps), but kept here for the
+  # five-module symmetry: the moment a non-stdlib dep lands, supply-
+  # chain CVEs on anything transitively pulled in surface as a PR
+  # instead of landing silently. Same rationale as tests/local below.
+  - package-ecosystem: "gomod"
+    directory: "/internalauth"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "go"
+
   # Go modules - endpoints
   - package-ecosystem: "gomod"
     directory: "/endpoints"

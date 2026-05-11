@@ -90,6 +90,7 @@ jobs:
       - name: Go mod tidy
         run: |
           cd nhp && go mod tidy
+          cd ../internalauth && go mod tidy
           cd ../endpoints && go mod tidy
 
       - name: Create output directories

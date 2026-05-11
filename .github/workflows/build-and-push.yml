@@ -631,6 +631,10 @@ jobs:
               cd nhp && go test ./... -v -timeout 5m -race
               echo '::endgroup::'
 
+              echo '::group::Internalauth Tests'
+              cd ../internalauth && go test ./... -v -timeout 5m -race
+              echo '::endgroup::'
+
               echo '::group::Endpoints Tests'
               cd ../endpoints && go test ./... -v -timeout 5m -race
               echo '::endgroup::'
@@ -651,7 +655,7 @@ jobs:
             -v "$HOME/.cache/go-build:/root/.cache/go-build" \
             -w /workspace \
             golang:${{ env.GO_VERSION }}-bookworm \
-            bash -c "cd nhp && go vet ./... && cd ../endpoints && go vet ./..."
+            bash -c "cd nhp && go vet ./... && cd ../internalauth && go vet ./... && cd ../endpoints && go vet ./..."
 
   # ============================================================================
   # TEST LAMBDAS - Python unit tests for Lambda functions (billing, etc.)
@@ -801,9 +805,9 @@ jobs:
           # 2. Fallback: scope without hash - faster builds for code-only changes
           # Only write to the dependency-specific cache to prevent stale layer pollution
           cache-from: |
-            type=gha,scope=${{ matrix.image }}-deps-${{ hashFiles('nhp/go.mod', 'nhp/go.sum', 'endpoints/go.mod', 'endpoints/go.sum', 'examples/server_plugin/go.mod', 'examples/server_plugin/go.sum') }}
+            type=gha,scope=${{ matrix.image }}-deps-${{ hashFiles('nhp/go.mod', 'nhp/go.sum', 'internalauth/go.mod', 'endpoints/go.mod', 'endpoints/go.sum', 'examples/server_plugin/go.mod', 'examples/server_plugin/go.sum') }}
             type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-deps-${{ hashFiles('nhp/go.mod', 'nhp/go.sum', 'endpoints/go.mod', 'endpoints/go.sum', 'examples/server_plugin/go.mod', 'examples/server_plugin/go.sum') }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-deps-${{ hashFiles('nhp/go.mod', 'nhp/go.sum', 'internalauth/go.mod', 'endpoints/go.mod', 'endpoints/go.sum', 'examples/server_plugin/go.mod', 'examples/server_plugin/go.sum') }}
 
       - name: Set image name for scanning
         if: needs.changes.outputs.app == 'true'

@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/OpenNHP/opennhp/internalauth"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
@@ -98,7 +99,7 @@ type HttpKnockForwarder struct {
 	// pre-HMAC-gate posture). Must be the same signer the verifier
 	// uses — both sides construct it from the same
 	// NHP_INTERNAL_AUTH_SECRET env var.
-	internalAuthSigner *common.InternalAuthSigner
+	internalAuthSigner *internalauth.Signer
 
 	// failedServers tracks servers that recently failed forward attempts.
 	// Key: InternalIP, Value: time of last failure.
@@ -112,7 +113,7 @@ type HttpKnockForwarder struct {
 // callers that want the forwarder to sign outgoing requests must
 // thread the same signer used by the incoming verifier
 // (handleInternalKnock).
-func NewHttpKnockForwarder(storage StorageBackend, cloudMap HealthChecker, localIP string, httpPort int, emitMetric MetricCounter, internalAuthSigner *common.InternalAuthSigner) *HttpKnockForwarder {
+func NewHttpKnockForwarder(storage StorageBackend, cloudMap HealthChecker, localIP string, httpPort int, emitMetric MetricCounter, internalAuthSigner *internalauth.Signer) *HttpKnockForwarder {
 	return &HttpKnockForwarder{
 		storage:  storage,
 		cloudMap: cloudMap,
@@ -330,7 +331,7 @@ func (f *HttpKnockForwarder) forwardToServer(
 		// refactor that flips the NewRequestWithContext method without
 		// updating the Sign literal would otherwise produce a silent 401
 		// instead of a compile break.
-		httpReq.Header.Set(common.InternalAuthHeader, f.internalAuthSigner.Sign(httpReq.Method, httpReq.URL.Path, body))
+		httpReq.Header.Set(internalauth.Header, f.internalAuthSigner.Sign(httpReq.Method, httpReq.URL.Path, body))
 	}
 
 	resp, err := f.httpClient.Do(httpReq) //nolint:gosec // validated as private IP above

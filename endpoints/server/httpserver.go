@@ -28,6 +28,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/OpenNHP/opennhp/endpoints/server/health"
+	"github.com/OpenNHP/opennhp/internalauth"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
@@ -65,7 +66,7 @@ type HttpServer struct {
 	// reads internalAuthRequire when a signer was constructed successfully
 	// — but even if it were reached, handleInternalKnock short-circuits
 	// on the signer==nil check before consulting require.
-	internalAuthSigner  *common.InternalAuthSigner
+	internalAuthSigner  *internalauth.Signer
 	internalAuthRequire bool
 	// internalAuthEmit is the counter-emit callback for the three
 	// /nhp/internal/knock metrics. In production it's bound to
@@ -820,7 +821,7 @@ func parseTrustedCIDRs(raw string) []string {
 // itself cycles tasks — if the flip needs to be immediate during an
 // incident rollback, trigger a manual service update after apply.
 // See #1233.
-func loadInternalAuthConfig(envSecret, envRequire string) (*common.InternalAuthSigner, bool, string, error) {
+func loadInternalAuthConfig(envSecret, envRequire string) (*internalauth.Signer, bool, string, error) {
 	// Trim the secret at the loader boundary (not at the os.Getenv
 	// call site) so every entry point — Start, tests, a hypothetical
 	// second bootstrap caller — gets the same whitespace semantics.
@@ -850,7 +851,7 @@ func loadInternalAuthConfig(envSecret, envRequire string) (*common.InternalAuthS
 	if envSecret == "" {
 		return nil, false, "legacy", nil
 	}
-	signer, authErr := common.NewInternalAuthSigner(envSecret)
+	signer, authErr := internalauth.New(envSecret)
 	if authErr != nil {
 		return nil, false, "", fmt.Errorf("NHP_INTERNAL_AUTH_SECRET: %w", authErr)
 	}
@@ -1399,11 +1400,11 @@ func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
 	}
 
 	// Query and fragment are not part of the signed string (see
-	// InternalAuthSigner godoc). Reject requests that carry them
+	// internalauth.Signer godoc). Reject requests that carry them
 	// rather than silently accept an un-protected segment — closes
 	// the footgun class where a future endpoint consumes a query
 	// param and would have it unsigned. If query-signing is ever
-	// required, bump InternalAuthScheme and add the field to the
+	// required, bump internalauth.Scheme and add the field to the
 	// signing string on both halves.
 	//
 	// The Fragment clause is defensive-only: fragments are client-
@@ -1472,7 +1473,7 @@ func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
 		// with 401; the response body carries only ErrInternalAuth so the
 		// attacker learns nothing about which sub-check failed.
 		authErr := hs.internalAuthSigner.Verify(
-			ctx.GetHeader(common.InternalAuthHeader),
+			ctx.GetHeader(internalauth.Header),
 			ctx.Request.Method,
 			ctx.Request.URL.Path,
 			body,
@@ -1483,14 +1484,14 @@ func (hs *HttpServer) handleInternalKnock(ctx *gin.Context) {
 			// anyone with read access to the log stack. The sentinel-
 			// only 401 body already hides which arm failed; echoing
 			// the full wrapped error here would partially undo that.
-			stage := common.ClassifyAuthFailure(authErr)
+			stage := internalauth.ClassifyAuthFailure(authErr)
 			reqID := GetRequestID(ctx)
 			if hs.internalAuthRequire {
 				log.Warning("internal knock rejected (strict): src=%s stage=%s reqID=%s", srcIP, stage, reqID)
 				if hs.internalAuthEmit != nil {
 					hs.internalAuthEmit(MetricInternalAuthFailStrict)
 				}
-				ctx.JSON(http.StatusUnauthorized, gin.H{"error": common.ErrInternalAuth.Error()})
+				ctx.JSON(http.StatusUnauthorized, gin.H{"error": internalauth.ErrInternalAuth.Error()})
 				return
 			}
 			// Counter (MetricInternalAuthFailPermit) is the alarm
