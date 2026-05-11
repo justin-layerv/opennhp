@@ -83,8 +83,9 @@
         "name": "cw_datasource",
         "type": "datasource",
         "label": "CloudWatch",
+        "description": "Selects the qurl-integrations-account CloudWatch datasource (NOT nhp's account-local one). The matching datasource is created by layervai/qurl-integrations-infra at qurl-bot-discord/terraform/grafana-cw-datasource.tf — if you rename it there, update this regex in lockstep or this panel will break silently.",
         "query": "cloudwatch",
-        "regex": "/CloudWatch \\($environment\\)/",
+        "regex": "/CloudWatch \\(qurl-integrations-$environment\\)/",
         "hide": 2,
         "current": {}
       }

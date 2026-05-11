@@ -58,13 +58,18 @@ resource "grafana_dashboard" "operations" {
 # QURL Business Dashboard
 # Monitors business metrics: QURLs created, tokens, quotas.
 #
-# Datasource note: this dashboard is primarily Prometheus-backed but its
-# bottom "Integrations" row pulls Discord install/uninstall counts from
-# CloudWatch (QurlBot/* metric filters). The cw_datasource template var
-# in qurl-business.json resolves cleanly only when cloudwatch_datasource_enabled
-# is true. The check block below surfaces the coupling as a plan-time warning
-# so a future env that turns off CloudWatch sees a clear message instead of a
-# silently broken panel.
+# Datasource note: this dashboard is primarily Prometheus-backed; its
+# bottom "Integrations" row is the only CloudWatch-backed panel and
+# pulls Discord install/uninstall counts (QurlBot/* metrics). Those
+# metrics live in the qurl-integrations AWS account (not this nhp
+# account), so the dashboard's cw_datasource regex targets
+# "CloudWatch (qurl-integrations-${env})" — a datasource owned by
+# qurl-integrations-infra at qurl-bot-discord/terraform/grafana-cw-datasource.tf.
+# The local cloudwatch_datasource_enabled flag is NOT the gate for
+# this panel anymore (the panel would render even if this module's
+# CloudWatch datasource were disabled, as long as qurl-integrations'
+# is up). The coupling is cross-repo and can't be plan-checked from
+# this module; rename-detection follow-up tracked in #1884.
 resource "grafana_dashboard" "business" {
   count = var.create_dashboards ? 1 : 0
 
@@ -75,13 +80,6 @@ resource "grafana_dashboard" "business" {
   })
 
   overwrite = true
-}
-
-check "business_dashboard_cloudwatch_coupling" {
-  assert {
-    condition     = !var.create_dashboards || var.cloudwatch_datasource_enabled
-    error_message = "qurl-business.json's Integrations row queries CloudWatch (QurlBot/GuildInstall, GuildUninstall) and will render with a 'datasource not found' error in this env. Action: set grafana_cloudwatch_enabled = true in terraform/environments/{sandbox,prod}/terraform.tfvars (which propagates to cloudwatch_datasource_enabled here), or remove the Integrations row from dashboards/qurl-business.json if this env will not use CloudWatch."
-  }
 }
 
 # QURL Webhooks Dashboard
