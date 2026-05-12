@@ -67,19 +67,31 @@ import (
 //     This is a defense-in-depth gap, not a vulnerability — the
 //     surface is closed; the body shape just differs (gin's
 //     text/plain 404 vs ALB's `{"error":"not found"}`).
-//   - Path-traversal bypass: ALB does not normalize `..` segments
-//     before path matching. The rule's `/*../internal/*` glob fences
-//     "any path with a `../internal/` substring" — broader than just
-//     traversal-as-attack, but the false-positive surface is empty
-//     because no legitimate public path looks like `/foo../internal/`.
-//     qurl-service uses `gin.New()` with no path-cleaning today (so
-//     a downstream router that DOES normalize, like
-//     `net/http.ServeMux`, can't introduce this bypass), but the
-//     entry catches a future router migration. HTTP/2 path
-//     normalization has historically been a layered concern (Go's
-//     net/http2 has shifted defaults; ALB doesn't publish a
-//     normalize-vs-pass-through guarantee for it), so the fence is
-//     worth the entry.
+//   - Path-traversal bypass (`/foo/bar/../internal/...`): AWS ALB
+//     performs RFC 3986 § 5.2.4 dot-segment removal on the request
+//     path BEFORE matching against `path_pattern` conditions. So a
+//     traversal-shaped attack like `/v1/qurls/../internal/v1/resolve`
+//     is normalized to `/v1/internal/v1/resolve` and matches NONE of
+//     the lockdown patterns — but it also can't reach the internal
+//     handler, because the same normalized path is what arrives at
+//     qurl-service's gin router. The `/*../internal/*` glob entry
+//     therefore only fences "literal `..` substring with no real
+//     traversal segment" (e.g., `/foo/bar../internal/baz` where
+//     `bar..` is a single segment that doesn't trigger normalization)
+//     — verified empirically by the `path_traversal_substring_only`
+//     subtest below.
+//     The positive-property fence for the canonical traversal class
+//     is the `normalizes_to_canonical` subtest: probes
+//     `/x/../internal/v1/resolve` and asserts the lockdown JSON fires.
+//     Today this passes via canonical `/internal/*` after ALB's
+//     pre-match dot-segment removal; under a hypothetical pass-through
+//     flip at ALB, the same raw path would match the broad
+//     `/*../internal/*` glob instead. The body shape is identical
+//     across all 5 TF rule patterns (slot-budget patterns, not
+//     subtests), so the fence cannot discriminate — it pins the
+//     weaker contract "the lockdown rule still fires for canonical-
+//     traversal-shaped paths" rather than which-pattern-matched.
+//     Per-pattern discrimination is tracked at #1642.
 //   - Fixed-response action accidentally swapped for a forward action
 //     during a refactor, returning 200 from the qurl-service backend
 //     for /internal/* on the public path. The body-shape assertion
@@ -181,16 +193,31 @@ var publicALBLockdownExpectedBody = map[string]string{"error": "not found"}
 // belongs at a different ALB rule (or a different listener
 // entirely), NOT at the lockdown.
 //
-// Wire-side normalization gap: see assertPublicLockdownReturns404
-// for the `req.URL.RequestURI() == path` pre-flight and the
-// accepted-gap note on which-pattern-matched discrimination. Both
-// rationale and trade-off live with the assertion to keep this
-// preamble focused on test design.
+// Wire-side normalization: see file header (Path-traversal bypass)
+// for the ALB-normalize-before-match contract pinned by the
+// `normalizes_to_canonical` subtest. Go-side preservation of `..`
+// at URL-build time is fenced by the pre-flight in
+// assertPublicLockdownReturns404; the which-pattern-matched
+// discrimination gap is in the same helper's comment.
 //
 // Regression fence for PR #1635 (qurl-service #335 PR4).
 func TestPublicALB_InternalPathReturns404(t *testing.T) {
 	skipIfQurlInternalALBDisabled(t)
 
+	// Slash-spanning `*` semantics — triage routing:
+	// AWS ALB's `path_pattern` `*` matches ANY character including `/`
+	// (the "0 or more of any character" semantics, per AWS docs). The
+	// `primary` case is the load-bearing fence for this property:
+	// matching `/internal/v1/resolve` against `/internal/*` requires
+	// `*` to span `/`. A silent AWS change to path-segment-bounded `*`
+	// would fail `primary`, `primary_post`, `case_variant`,
+	// `with_query_string`, `path_traversal_substring_only`, and
+	// `normalizes_to_canonical` — any case whose matching pattern has
+	// `*` adjacent to a `/` it must span. `bare_prefix_trailing_slash`
+	// fences a different axis (`*`-accepts-zero-chars), not this one.
+	// If you're triaging an ALB-`*`-semantics regression, start with
+	// `primary` — the others co-fall but `primary` is the simplest
+	// minimal repro.
 	cases := []struct {
 		name   string
 		method string
@@ -204,7 +231,7 @@ func TestPublicALB_InternalPathReturns404(t *testing.T) {
 			name:   "primary",
 			method: http.MethodGet,
 			path:   "/internal/v1/resolve",
-			why:    "the canonical /internal/v1/* path the body-src_ip handler lives on",
+			why:    "the canonical /internal/v1/* path the body-src_ip handler lives on. Also the minimal-repro fence for AWS ALB's slash-spanning `*` semantics — see the comment block above this slice for the full triage map",
 		},
 		{
 			name:   "primary_post",
@@ -237,22 +264,35 @@ func TestPublicALB_InternalPathReturns404(t *testing.T) {
 			why:    "AWS ALB path_pattern is case-sensitive; without the case entry on the rule, /Internal/v1/resolve falls through to the default forward",
 		},
 		{
-			name:   "path_traversal",
-			method: http.MethodGet,
-			path:   "/v1/qurls/../internal/v1/resolve",
-			why:    "ALB does not normalize `..` segments; a downstream router that does (net/http.ServeMux, future router migration) would route this to the internal handler",
-		},
-		{
 			name:   "path_traversal_substring_only",
 			method: http.MethodGet,
 			path:   "/foo/bar../internal/baz",
-			why:    "the `/*../internal/*` glob matches any path with literal `../internal/` substring — broader than just attack-shaped traversal. This case has `bar..` (no real traversal segment, just literal `..` in a name) and would be matched by the rule. Fences a regression that narrowed the glob to require a true `/../` separator (which AWS ALB doesn't support) — and verifies the documented broad-match behavior. NOTE: if a future legitimate public path ever needs literal `../internal/` substrings (tracked in #1641), the fix would split this fence — replace the broad glob with two narrower entries (`/internal/*` plus `*/../internal/*` patterns that exclude the legitimate path), and update this case to assert the narrower coverage.",
+			why:    "the `/*../internal/*` glob matches paths with a literal `../internal/` substring where `..` is NOT a real traversal segment (here `bar..` is a single non-traversal segment, so AWS ALB's pre-match dot-segment normalization leaves the path unchanged). Fences a regression that narrowed the glob to require a true `/../` separator — see `normalizes_to_canonical` below for the canonical-traversal class fence. NOTE: if a future legitimate public path ever needs literal `../internal/` substrings (tracked in #1641), the fix would split this fence — replace the broad glob with narrower entries that exclude the legitimate path, and update this case to assert the narrower coverage.",
 		},
+		// normalizes_to_canonical: documentation fence rather than a
+		// discriminating one. `/x/../internal/v1/resolve` normalizes
+		// to `/internal/v1/resolve` and matches the canonical entry
+		// today; under a hypothetical ALB pass-through flip it would
+		// still match the broad `/*../internal/*` glob, and the body
+		// shape is identical across all 5 TF rule patterns
+		// (slot-budget patterns, not subtests), so this case cannot
+		// tell which pattern fired — see #1642 for the structural
+		// fix (per-pattern discriminator on the listener rule).
+		//
+		// Path-choice rationale: post-normalization must address an
+		// internal route. Non-traversal forms like
+		// `/v1/qurls/../internal/...` normalize to
+		// `/v1/internal/...`, hit no internal handler, and are not
+		// worth fencing. `/x/../internal/v1/resolve` is the minimal
+		// canonical-traversal shape that lands on `/internal/*`.
+		//
+		// Empirical verification: PR #1893 (curl `--path-as-is`
+		// probes triangulating ALB's dot-segment normalization).
 		{
-			name:   "path_traversal_slash_bounded",
+			name:   "normalizes_to_canonical",
 			method: http.MethodGet,
-			path:   "/foo/bar/../internal/v1/resolve",
-			why:    "`/*../internal/*` relies on AWS ALB's `*` matching `/` (path-segment-spanning). Today the canonical-shaped traversal (path segments separated by literal slashes) is matched via this glob. If AWS ever path-segment-bounded `*` (a silent semantics flip), the rule would degrade and only the canonical `/internal/*` entry would catch the post-decode form via downstream router normalization. This case explicitly asserts the slash-spanning behavior so the assumption survival is visible — `path_traversal` (without leading slash before `..`) and `path_traversal_substring_only` (no real segment) both fence the broad-match shape, but neither pins the slash-spanning property",
+			path:   "/x/../internal/v1/resolve",
+			why:    "positive-property documentation fence — the lockdown still fires for canonical-traversal-shaped paths whose post-normalization form lands on `/internal/*`. See comment above this case for the path-choice and indiscriminability rationale",
 		},
 	}
 
@@ -288,23 +328,28 @@ func assertPublicLockdownReturns404(t *testing.T, method, path, why string) {
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
-	// Verify Go's net/http transport sends the path verbatim — no
-	// `..` normalization, no case folding. If a future Go release
-	// or third-party transport ever changes this, the path_traversal
-	// case would silently start fencing nothing (the request would
-	// arrive at ALB as `/internal/v1/resolve` and the rule would 404
-	// it via the canonical pattern, not the traversal pattern). This
-	// assertion makes the parse-side regression visible.
+	// Verify Go's net/http URL build preserves the literal path — no
+	// `..` collapsing, no case folding, no percent-encoding shifts.
+	// If a future Go release ever changes this, the
+	// `normalizes_to_canonical` case would silently shift fences:
+	// e.g., `/x/../internal/v1/resolve` pre-collapsed to
+	// `/internal/v1/resolve` by Go before send would still match the
+	// canonical `/internal/*` entry and pass — but it would pass via
+	// the canonical-shape pattern, not the post-ALB-normalize pattern,
+	// silently invalidating the ALB-normalizes-before-matching
+	// assumption that case exists to pin.
 	//
 	// Pre-flight covers `url.Parse` and the request build, NOT the
-	// Transport.RoundTrip stage. An HTTP/2 transport-level normalization
-	// shift would arrive at the ALB as the canonical path and still
-	// 404 — via the canonical pattern instead of the traversal pattern —
-	// with this test still passing. The fixed-response is identical for
-	// all 5 patterns so today we can't discriminate which one matched
-	// without server-side plumbing. Accepted gap; the right structural
-	// fix is a per-pattern discriminator on the listener rule (custom
-	// response header or Lambda target), tracked at #1642.
+	// Transport.RoundTrip stage. Go's HTTP/1 and HTTP/2 transports
+	// both write `req.URL.RequestURI()` verbatim today (no late
+	// normalization), so the pre-flight is sufficient for the
+	// Go-side preservation contract. The fixed-response is identical
+	// across all 5 TF rule patterns (the slot-budget count, not the
+	// subtest count), so we still can't discriminate
+	// which pattern matched without server-side plumbing — accepted
+	// gap; the right structural fix is a per-pattern discriminator on
+	// the listener rule (custom response header or Lambda target),
+	// tracked at #1642.
 	if got, want := req.URL.RequestURI(), path; got != want {
 		t.Fatalf("request URI = %q, want %q (transport unexpectedly normalized the path; regression class: %s)", got, want, why)
 	}

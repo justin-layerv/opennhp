@@ -1162,29 +1162,36 @@ resource "aws_lb_listener" "https" {
 #     likely typos (Title case bare + canonical), mirroring the
 #     lowercase pair. Fully-uppercase / mixed-case variants are NOT
 #     covered and rely on gin's case sensitivity at the backend.
-#   - `/*../internal/*` (traversal): ALB does not normalize `..`
-#     segments before matching. qurl-service uses `gin.New()` with no
-#     path-cleaning today (so this can't bite immediately), but the
-#     entry catches a future router change to `net/http.ServeMux` or
-#     similar normalization-on-route behavior. HTTP/2 path
-#     normalization has historically been a layered concern (Go's
-#     net/http2 has shifted defaults; ALB doesn't publish a
-#     normalize-vs-pass-through guarantee for it), so the fence is
-#     worth the three lines.
+#   - `/*../internal/*` (literal-`..`-substring): AWS ALB performs
+#     RFC 3986 § 5.2.4 dot-segment removal on the request path BEFORE
+#     matching `path_pattern` conditions, so an actual traversal-shaped
+#     attack like `/v1/qurls/../internal/v1/resolve` is normalized to
+#     `/v1/internal/v1/resolve` and matches NONE of the entries above —
+#     but it also can't reach the internal handler (same normalized
+#     path arrives at the backend). The canonical traversal class is
+#     therefore structurally fenced by `/internal/*` after ALB
+#     normalization, not by this glob. The empirical verification is
+#     pinned by the `normalizes_to_canonical` subtest in
+#     `tests/smoke/09_public_alb_internal_lockdown_test.go` (see PR
+#     #1893 for the curl `--path-as-is` evidence).
 #
-#     This pattern depends on AWS ALB's `*` matching ANY character
-#     including `/` (per AWS docs: "0 or more of any character"). If
-#     AWS ever path-segment-bounded `*` (as some routers do — e.g.,
-#     gorilla/mux's `{var}` matches one segment; chi's `*` matches
-#     zero-or-more INCLUDING `/`), `/*../internal/*` would no longer
-#     match `/foo/bar../internal/v1/resolve`, narrowing the fence
-#     silently. The `bare_prefix_trailing_slash` smoke subtest
-#     fences zero-char `*` semantics; an `/`-spanning fence would be
-#     symmetric coverage if that policy flip becomes plausible. Today,
-#     `*` is documented as character-class-unbounded and the smoke
-#     fence runs against the live behavior — this comment exists so a
-#     future maintainer surveys the assumption when AWS ALB rule
-#     semantics change.
+#     What this slot DOES fence is the literal-`..`-substring class:
+#     paths like `/foo/bar../internal/baz` where `bar..` is a single
+#     non-traversal segment (RFC 3986 only collapses segments that
+#     are exactly `.` or `..`). The slot is thinly utilized — this
+#     synthetic shape has no production analogue — and a future review
+#     may swap it for `/INTERNAL` + `/INTERNAL/*` to close the
+#     uppercase case-variant gap at the ALB rather than at gin
+#     (tracked in #1897).
+#
+#     The `/*../internal/*` glob depends on AWS ALB's `*` matching
+#     ANY character including `/` (per AWS docs: "0 or more of any
+#     character"). If AWS ever path-segment-bounded `*`,
+#     `/*../internal/*` would no longer match
+#     `/foo/bar../internal/baz`, narrowing the fence silently. The
+#     `primary` smoke subtest fences slash-spanning `*` semantics
+#     via the canonical pattern; the `bare_prefix_trailing_slash`
+#     subtest fences the orthogonal zero-char `*` axis.
 #
 #     False-positive surface is empty today (no public path uses
 #     literal `..`); if a future public path ever needs literal `..`
@@ -1261,7 +1268,7 @@ resource "aws_lb_listener_rule" "public_internal_block" {
         # header for slot-budget guidance): `/INTERNAL` and
         # `/INTERNAL/*` (fully-uppercase). Backstopped by gin's
         # case sensitivity at qurl-service today, fenced by
-        # tests/smoke/09_*.go::TestPublicALB_PathNotSuccessful
+        # tests/smoke/09_*.go::TestPublicALB_GinCaseBackstop
         # at runtime. If qurl-service ever migrates to a
         # case-folding router, that test surfaces the regression
         # and a second `aws_lb_listener_rule` (priority 2) becomes
