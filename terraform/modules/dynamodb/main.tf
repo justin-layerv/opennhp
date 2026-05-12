@@ -1004,7 +1004,7 @@ resource "aws_dynamodb_table" "qurl_agent_keys" {
     Name      = "${var.name_prefix}-${var.cell_id}-qurl-agent-keys"
     Cell      = var.cell_id
     Component = "qurl-service"
-    Purpose   = "Sidecar agent X25519 public-key registry (bootstrap → knock)"
+    Purpose   = "Sidecar agent X25519 public-key registry (bootstrap -> knock)"
   })
 }
 
