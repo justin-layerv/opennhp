@@ -1,6 +1,6 @@
 module github.com/OpenNHP/opennhp/examples/server_plugin
 
-go 1.26.2
+go 1.26.3
 
 require (
 	github.com/OpenNHP/opennhp/nhp v0.6.0

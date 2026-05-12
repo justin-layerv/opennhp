@@ -79,7 +79,7 @@ env:
   # NOTE: `make lint-workflows` does NOT currently catch drift here —
   # #1337 tracks the lockstep lint that will. Until it lands, bumpers
   # must walk this list manually.
-  GO_VERSION: '1.26.2'
+  GO_VERSION: '1.26.3'
 
 jobs:
   # ============================================================================
