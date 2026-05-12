@@ -346,6 +346,10 @@ resource "aws_iam_policy" "dynamodb_read" {
           "${aws_dynamodb_table.qurl_domains[0].arn}/index/*",
           aws_dynamodb_table.qurl_access_codes[0].arn,
           "${aws_dynamodb_table.qurl_access_codes[0].arn}/index/*",
+          # Read-only for nhp-server's knock path; writes flow via
+          # `qurl_table_arns` to the qurl-service task role.
+          aws_dynamodb_table.qurl_agent_keys[0].arn,
+          "${aws_dynamodb_table.qurl_agent_keys[0].arn}/index/*",
         ] : [])
       },
       {
@@ -406,6 +410,9 @@ resource "aws_iam_policy" "dynamodb_write" {
           "${aws_dynamodb_table.qurl_domains[0].arn}/index/*",
           aws_dynamodb_table.qurl_access_codes[0].arn,
           "${aws_dynamodb_table.qurl_access_codes[0].arn}/index/*",
+          # qurl_agent_keys intentionally excluded — writes are the
+          # qurl-service path; add only when a Console support UX
+          # (delete-agent, re-key) is explicitly designed.
         ] : [])
       }
       ], var.kms_key_arn != null ? [{
@@ -922,6 +929,82 @@ resource "aws_dynamodb_table" "qurl_api_keys" {
     Cell      = var.cell_id
     Component = "qurl-service"
     Purpose   = "QURL API key storage"
+  })
+}
+
+# qurl-agent-keys: sidecar agent registrations from the bootstrap path.
+# PK=owner_id, SK=agent_id (regex ^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$ or
+# server-generated UUIDv7). Bootstrap (qurl-service) writes the agent's
+# X25519 public key; nhp-server Query's `pubkey-index` on knock receipt
+# (60s LRU in front). Schema authored here so the qurl-service repo can
+# mirror; full attribute list lives in the qurl-service schema-registry
+# entry. `last_seen_at` is a separate RFC3339 string (second precision —
+# fractional seconds break string-comparison sort order) so operators
+# don't do epoch math; numeric `ttl` (last_seen + 90d) drives DDB
+# eviction.
+#
+# Pubkey uniqueness is a SOFT invariant — DynamoDB GSIs don't enforce
+# it. A re-bootstrap under a FRESH `agent_id` orphans the prior row's
+# pubkey until TTL eviction, so the reader's Query could return >1 item.
+# Closed consumer-side: PR-1b reader fails closed on duplicate hits;
+# PR-1c writer deletes prior-pubkey rows before insert.
+resource "aws_dynamodb_table" "qurl_agent_keys" {
+  count = var.deploy_qurl_tables ? 1 : 0
+
+  name                        = "${var.name_prefix}-${var.cell_id}-qurl-agent-keys"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "owner_id"
+  range_key                   = "agent_id"
+  deletion_protection_enabled = local.is_prod
+
+  attribute {
+    name = "owner_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "agent_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "public_key"
+    type = "S"
+  }
+
+  # KEYS_ONLY so the hot `last_seen_at` keepalive write doesn't rewrite the
+  # GSI on every knock (PAY_PER_REQUEST charges WCU per GSI item write).
+  # Query on `public_key` returns the projected (owner_id, agent_id) in 1
+  # RTT — the auth path doesn't need the base row. A follow-up GetItem
+  # fetches aux metadata only when needed (hostname/version/last_seen_at).
+  global_secondary_index {
+    name            = "pubkey-index"
+    hash_key        = "public_key"
+    projection_type = "KEYS_ONLY"
+  }
+
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  # qurl-service sets `ttl` = last_seen_at + 90d so dormant agents age out
+  # without a GC reconciler. `last_seen_at` (RFC3339) is the human-readable
+  # twin operators read.
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-qurl-agent-keys"
+    Cell      = var.cell_id
+    Component = "qurl-service"
+    Purpose   = "Sidecar agent X25519 public-key registry (bootstrap → knock)"
   })
 }
 
