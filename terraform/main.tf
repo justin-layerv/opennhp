@@ -3370,3 +3370,189 @@ resource "aws_route53_record" "qurl_fileviewer" {
     prevent_destroy = true
   }
 }
+
+# ─────────────────────────────────────────────────────────────────────
+# Bootstrap ALB — `bootstrap.layerv.{xyz,ai}` first-contact surface
+#
+# Distinct from `api.layerv.ai`: only `/v1/agent/bootstrap` is forwarded
+# to qurl-service. Reverse-tunnel-client sidecars hit this on cold start
+# to register their public key BEFORE they hold any NHP credentials.
+#
+# Default off (`deploy_bootstrap_alb = false`). Enable per-env in
+# `terraform/environments/{sandbox,prod}/terraform.tfvars` once the
+# operator has pre-provisioned the ACM cert (cross-account: layerv.ai
+# zone in layerv-mgmt) and is ready to land the qurl-service ECS
+# `load_balancer` block paired with this stack's target group.
+
+# Catches the common foot-gun on the first per-env flip:
+# `deploy_bootstrap_alb=true` but the operator forgot to wire one of
+# the two valid cert configurations through tfvars. Without this
+# check, the module-side validations fire generic error messages
+# (`dns_name must be a valid lowercase FQDN`) that don't point the
+# operator at which ROOT variables to set. Same shape as
+# `qurl_link_required_variables` above. Defense in depth — the
+# module's own listener-side precondition stays.
+#
+# Two valid cert configurations (mirroring the module's
+# `cert_dns.tf` header and the listener-side precondition):
+#   1. **Cross-account (today's path, both envs)**:
+#        bootstrap_alb_provision_certificate    = false
+#        bootstrap_alb_existing_certificate_arn = "<operator-pre-provisioned ARN>"
+#   2. **Same-account (future env where parent zone shares the
+#      apply account)**:
+#        bootstrap_alb_provision_certificate    = true
+#        bootstrap_alb_route53_zone_id          = "<zone ID>"
+#
+# Both require `bootstrap_alb_dns_name` to be non-empty. The OR
+# branch captures path #2 so a future env flipping into auto-
+# provision doesn't false-fail this check.
+check "bootstrap_alb_required_variables" {
+  # **`check` blocks emit plan-time WARNINGS, not errors.** Anyone
+  # reading this expecting it to FAIL plan on a misconfigured cert
+  # combo will be surprised — the actual fail-fast lives at
+  # `modules/bootstrap-alb/alb.tf::aws_lb_listener.https::lifecycle.precondition`
+  # (which DOES fail plan). This check is here for the
+  # operator-friendly error MESSAGE pointing at the right root
+  # vars; the precondition is the gate.
+
+  assert {
+    # Exactly-one-of-two cert paths must be configured (XOR), not
+    # "at least one" — the OR shape would let an operator set BOTH
+    # `existing_certificate_arn` AND `provision_certificate=true` and
+    # the root check passes, leaving the module's listener-side
+    # mutual-exclusion precondition to catch it with a less operator-
+    # friendly error message. The XOR shape catches the bad combo
+    # here, where the error_message can point at the right root vars.
+    #
+    # Path 1: `existing_certificate_arn` non-empty AND
+    #         `provision_certificate` false.
+    # Path 2: `provision_certificate` true AND `route53_zone_id`
+    #         non-empty AND `existing_certificate_arn` empty.
+    condition = (
+      var.deploy_bootstrap_alb == false || (
+        var.bootstrap_alb_dns_name != "" && (
+          (var.bootstrap_alb_existing_certificate_arn != "" && !var.bootstrap_alb_provision_certificate) ||
+          (var.bootstrap_alb_provision_certificate && var.bootstrap_alb_route53_zone_id != "" && var.bootstrap_alb_existing_certificate_arn == "")
+        )
+      )
+    )
+    error_message = <<-EOT
+      When deploy_bootstrap_alb = true, bootstrap_alb_dns_name must be
+      set AND EXACTLY ONE of the two cert paths must be configured
+      (setting both is rejected — existing_certificate_arn would be
+      silently ignored by the listener):
+
+      Path 1 (cross-account cert, today's sandbox + prod posture):
+        - bootstrap_alb_existing_certificate_arn  (operator-pre-provisioned ACM cert ARN)
+        - bootstrap_alb_provision_certificate    = false  (the default)
+
+      Path 2 (same-account cert, future env where parent zone shares the apply account):
+        - bootstrap_alb_provision_certificate    = true
+        - bootstrap_alb_route53_zone_id          = "<zone ID of the parent zone>"
+        - bootstrap_alb_existing_certificate_arn = ""     (the default — must be empty)
+
+      See modules/bootstrap-alb/README.md → "First-apply runbook" for the
+      cross-account cert + DNS pre-provisioning steps.
+    EOT
+  }
+
+  # Independent of the cert XOR: `manage_dns_alias=true` requires
+  # `route53_zone_id` to be non-empty (the alias resource targets the
+  # zone). The module's data-source-level precondition catches this
+  # at plan with a less operator-friendly message; covering it here
+  # too lets the error point at the right ROOT variable names.
+  assert {
+    condition = (
+      var.deploy_bootstrap_alb == false ||
+      !var.bootstrap_alb_manage_dns_alias ||
+      var.bootstrap_alb_route53_zone_id != ""
+    )
+    error_message = <<-EOT
+      bootstrap_alb_manage_dns_alias = true requires
+      bootstrap_alb_route53_zone_id to be non-empty (the alias
+      record needs a zone to land in). Either:
+        - Set bootstrap_alb_route53_zone_id = "<parent zone ID>", OR
+        - Leave bootstrap_alb_manage_dns_alias = false and write
+          the A-alias out-of-band in the parent-zone account
+          (today's posture in BOTH envs — see
+          modules/bootstrap-alb/README.md Step 2).
+    EOT
+  }
+}
+
+module "bootstrap_alb" {
+  count  = var.deploy_bootstrap_alb ? 1 : 0
+  source = "./modules/bootstrap-alb"
+
+  # **Gate-toggle limitation.** Flipping `deploy_bootstrap_alb = true
+  # → false` to roll back will NOT cleanly destroy the access-log
+  # bucket: it carries both `force_destroy = false` AND
+  # `lifecycle { prevent_destroy = true }` (deliberate — bootstrap
+  # forensics are irrecoverable). The next `terraform plan` after
+  # `deploy_bootstrap_alb=false` fails with
+  # `Instance cannot be destroyed`. To genuinely tear down (rare —
+  # not the recommended rollback path), follow the two-fence-unwind
+  # documented at `modules/bootstrap-alb/README.md` →
+  # "Teardown / cleanup" → section 1.
+  #
+  # **Recommended operational rollback** is NOT
+  # `deploy_bootstrap_alb=false`. Instead, switch problematic WAF
+  # rules to count-only via `var.bootstrap_alb_waf_count_only_rule_groups`
+  # (see README → "Operator note — customer sidecar reports
+  # bootstrap 403"), or bump
+  # `var.bootstrap_alb_elb_5xx_threshold_per_minute` to suppress
+  # alarm-noise during a known maintenance window.
+
+  environment = var.environment
+
+  # Networking — direct refs since this is intra-repo.
+  vpc_id            = module.networking.vpc_id
+  public_subnet_ids = module.networking.public_subnet_ids
+  vpc_cidr_block    = module.networking.vpc_cidr
+
+  # DNS + cert. Empty defaults are intentional during the first-apply
+  # bootstrap window; the module's listener-side precondition rejects
+  # the misconfigured combo (provision_certificate=false AND
+  # existing_certificate_arn=="") before plan finishes. The root-level
+  # `check` block above catches the gate-on-without-tfvars case first
+  # and points the operator at the right root variables.
+  dns_name                 = var.bootstrap_alb_dns_name
+  route53_zone_id          = var.bootstrap_alb_route53_zone_id
+  manage_dns_alias         = var.bootstrap_alb_manage_dns_alias
+  provision_certificate    = var.bootstrap_alb_provision_certificate
+  existing_certificate_arn = var.bootstrap_alb_existing_certificate_arn
+
+  # Per-group WAF count-only overrides (sandbox first-rollout posture
+  # is typically `["AWSManagedRulesAnonymousIpList"]` — see module
+  # README's operator-note on the 403-from-VPN class). Default empty.
+  waf_count_only_rule_groups = var.bootstrap_alb_waf_count_only_rule_groups
+
+  # Optional email subscribers to the alerts topic. Empty list
+  # (today's default) defers to alerts-infra cross-account routing;
+  # populate this for interim direct-email routing or ops-team
+  # accountability copies. Each subscriber must click the AWS
+  # confirmation email — see README Step 3 #7.
+  alarm_email_subscriptions = var.bootstrap_alb_alarm_email_subscriptions
+
+  # Cross-account `sns:Subscribe` principals for the alerts topic.
+  # Populate with the alerts-infra IAM role ARN once that wiring is
+  # ready; without it the cross-account subscribe fails silently
+  # (no AuthorizationError surfaces because the subscribe call is
+  # on alerts-infra's side).
+  cross_account_subscriber_arns = var.bootstrap_alb_cross_account_subscriber_arns
+
+  # Dark-launch tunability for the `alb-elb-5xx` alarm. Root var
+  # defaults to `null` so the module's own default (10, dark-launch-
+  # friendly) is the source of truth. Env tfvars override to `1`
+  # once the data plane is attached and the surface is live (any
+  # ALB-side 5xx is the outage signal at that point). Terraform
+  # 1.3+ treats a `null` module-arg as "use the module's own
+  # default" (no need to gate with a ternary); root pins to
+  # `~> 1.14` and the module declares `>= 1.5` in `versions.tf`,
+  # both well above the 1.3 floor.
+  alb_elb_5xx_threshold_per_minute = var.bootstrap_alb_elb_5xx_threshold_per_minute
+
+  # `bootstrap_path`, `target_port`, `health_check_path`, WAF rule list,
+  # access-log retention, alarm thresholds — module defaults apply.
+  # Override in env tfvars only with explicit evidence.
+}

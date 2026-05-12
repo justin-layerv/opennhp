@@ -883,7 +883,15 @@ of where you'd want the catch.
 ## Security Notes
 
 - Never commit secrets - use AWS Secrets Manager
-- All storage encrypted with KMS CMKs
+- All storage encrypted with KMS CMKs (documented exception:
+  `terraform/modules/bootstrap-alb/`'s access-log + Athena-results
+  buckets are SSE-S3, not CMK. AWS ALB log delivery does NOT
+  support cross-account CMKs, and the Athena bucket follows the
+  same shape for consistency. Rationale + suppression target lives
+  inline at `access_logs.tf` — point AWS Config / scanner
+  suppressions there. Relevant AWS Config rule names:
+  `s3-default-encryption-kms` /
+  `s3-bucket-server-side-encryption-enabled`.)
 - IMDSv2 required on EC2
 - AC private keys NEVER in etcd - only Secrets Manager
 - `NHP_INTERNAL_AUTH_SECRET` (≥ 32 bytes) signs `/nhp/internal/knock` requests

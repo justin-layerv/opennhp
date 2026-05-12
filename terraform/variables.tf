@@ -2213,3 +2213,108 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+# ==================== Bootstrap ALB ====================
+
+variable "deploy_bootstrap_alb" {
+  description = "Deploy the bootstrap-alb stack (bootstrap.layerv.{xyz,ai}). Default off; flip per-env once the cert is pre-provisioned and qurl-service ECS is ready to register against the new target group."
+  type        = bool
+  default     = false
+}
+
+variable "bootstrap_alb_dns_name" {
+  description = "Public DNS name for the bootstrap ALB. Sandbox: `bootstrap.layerv.xyz`. Prod: `bootstrap.layerv.ai`. Only read when `deploy_bootstrap_alb = true`."
+  type        = string
+  default     = ""
+
+  validation {
+    # Mirror the module-side `dns_name` validation so a typo at the
+    # root tfvars layer fails plan with a root-pointed error rather
+    # than via the module's validation (which produces a less-friendly
+    # `module.bootstrap_alb[0].variable.<name>` file pointer). Empty
+    # string is allowed because `deploy_bootstrap_alb=false` (the
+    # default) doesn't read this variable.
+    condition     = var.bootstrap_alb_dns_name == "" || can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$", var.bootstrap_alb_dns_name))
+    error_message = "bootstrap_alb_dns_name must be empty (when `deploy_bootstrap_alb=false`) or a valid lowercase FQDN like `bootstrap.layerv.xyz`."
+  }
+}
+
+variable "bootstrap_alb_route53_zone_id" {
+  description = "Hosted zone ID for the parent of `bootstrap_alb_dns_name`. Required when `bootstrap_alb_provision_certificate` or `bootstrap_alb_manage_dns_alias` is true. Empty when both are false (cross-account; DNS managed operator-side)."
+  type        = string
+  default     = ""
+
+  validation {
+    # Mirror the module-side check. Route53 zone IDs are uppercase
+    # alphanumeric starting with `Z`, ≥ 9 chars total.
+    condition     = var.bootstrap_alb_route53_zone_id == "" || can(regex("^Z[A-Z0-9]{8,}$", var.bootstrap_alb_route53_zone_id))
+    error_message = "bootstrap_alb_route53_zone_id must be empty or a valid Route53 zone ID (uppercase, starts with Z)."
+  }
+}
+
+variable "bootstrap_alb_manage_dns_alias" {
+  description = "Whether the bootstrap-alb stack writes the A-alias from `bootstrap_alb_dns_name` to the ALB. Default false — the alias is operator-managed in both envs (sandbox layerv.xyz zone in account 767397897469; prod layerv.ai zone in layerv-mgmt)."
+  type        = bool
+  default     = false
+}
+
+variable "bootstrap_alb_provision_certificate" {
+  description = "Whether the bootstrap-alb stack provisions+validates an ACM cert. Default false — DNS validation needs the parent zone, which lives cross-account in both sandbox and prod. The operator pre-provisions the cert in the same account as this ALB and supplies the ARN via `bootstrap_alb_existing_certificate_arn`."
+  type        = bool
+  default     = false
+}
+
+variable "bootstrap_alb_existing_certificate_arn" {
+  description = "ACM cert ARN to attach when `bootstrap_alb_provision_certificate=false`. Empty during the first-apply bootstrap window; populated after the operator pre-provisions the cert in this account."
+  type        = string
+  default     = ""
+
+  validation {
+    # Mirror the module-side syntactic check (7 partitions; canonical
+    # 8-4-4-4-12 UUID after `certificate/`). The module's
+    # listener-side `lifecycle.precondition` is the load-bearing
+    # apply-target match (partition + region + account); this is
+    # the syntactic shape gate at the root tfvars layer.
+    condition     = var.bootstrap_alb_existing_certificate_arn == "" || can(regex("^arn:(aws|aws-us-gov|aws-cn|aws-iso|aws-iso-b|aws-iso-c|aws-iso-e|aws-iso-f):acm:[a-z0-9-]+:[0-9]{12}:certificate/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$", var.bootstrap_alb_existing_certificate_arn))
+    error_message = "bootstrap_alb_existing_certificate_arn must be empty or a valid ACM ARN: `arn:<partition>:acm:<region>:<12-digit-account>:certificate/<canonical 8-4-4-4-12 UUID>`."
+  }
+}
+
+variable "bootstrap_alb_waf_count_only_rule_groups" {
+  description = "Managed rule-group names from the bootstrap-alb WAF to override to `count` action (vs the default `none` action which honors the group's own block/count actions). Use to bring a new managed group up in count-only mode for a watch period before flipping to enforce. Recommended sandbox-rollout posture is count-only for BOTH `AWSManagedRulesAnonymousIpList` (customer VPN egress class) AND `AWSManagedRulesCommonRuleSet` (CRS body inspection false-positives on PEM-wrapped public keys) for the first 2–4 weeks of sandbox bootstrap traffic."
+  type        = list(string)
+  default     = []
+
+  validation {
+    # Mirror the module-side allowlist check so a typo at the root
+    # tfvars layer fails plan with a root-pointed error rather than
+    # surfacing as a less-friendly module-side `lifecycle.precondition`
+    # error. The module's check (in `aws_wafv2_web_acl.this`) is the
+    # actual gate; this is defense-in-depth at the input layer.
+    condition = alltrue([for n in var.bootstrap_alb_waf_count_only_rule_groups : contains([
+      "AWSManagedRulesAmazonIpReputationList",
+      "AWSManagedRulesAnonymousIpList",
+      "AWSManagedRulesCommonRuleSet",
+      "AWSManagedRulesBotControlRuleSet",
+    ], n)])
+    error_message = "Each entry must be one of the managed rule groups the bootstrap-alb module enables: AWSManagedRulesAmazonIpReputationList, AWSManagedRulesAnonymousIpList, AWSManagedRulesCommonRuleSet, AWSManagedRulesBotControlRuleSet."
+  }
+}
+
+variable "bootstrap_alb_cross_account_subscriber_arns" {
+  description = "Cross-account IAM principals that may subscribe to the bootstrap-alb alerts SNS topic. Today's pattern is alerts-infra (the org-wide AWS Chatbot home) subscribing from a separate AWS account. **CRITICAL ROLLOUT SEQUENCING**: leave this empty (the default) in the sandbox-flip PR that first sets `deploy_bootstrap_alb=true` (Merge plan step 3 in PR #1886). Between that flip and the paired data-plane PR (step 4), the ALB returns 503 on every probe of `/v1/agent/bootstrap` — populating the cross-account subscriber list here would page alerts-infra during the entire dark-launch window. Populate with the alerts-infra role ARN in a SEPARATE follow-up after step 4 lands and qurl-service is healthy. Empty list skips the cross-account policy entirely (alarms still publish to the topic; just no downstream routing)."
+  type        = list(string)
+  default     = []
+}
+
+variable "bootstrap_alb_alarm_email_subscriptions" {
+  description = "Optional email addresses to subscribe to the bootstrap-alb alerts SNS topic. Empty list (default) ships the topic without subscriptions — the canonical alarm-routing path is alerts-infra's cross-account Chatbot subscription (see `bootstrap_alb_cross_account_subscriber_arns`). Email is for interim direct-routing before alerts-infra is wired, or for ops-team accountability copies alongside chat-platform routing. **Subscription confirmation required**: each recipient receives an AWS confirmation email after apply and MUST click the link before alarms deliver — until confirmed, the subscription sits in `PendingConfirmation` and alarms fire silently to that address. See README Step 3 #7 for the `aws sns list-subscriptions-by-topic` verification."
+  type        = list(string)
+  default     = []
+}
+
+variable "bootstrap_alb_elb_5xx_threshold_per_minute" {
+  description = "ALB-side 5xx alarm threshold (per minute). **Default `null` defers to the module's own default** (which is `10` — dark-launch-friendly; tolerates the 503-on-empty-TG noise between this stack's first apply and the paired data-plane PR). Env tfvars SHOULD override this down to `1` once the data plane is attached and the surface is live (any ALB-side 5xx is the outage signal at that point). The `null` default keeps the module as the single source of truth for the dark-launch posture — flipping prod live becomes 'set this var to 1' rather than 'remember which layer holds the dark-launch default'."
+  type        = number
+  default     = null
+}

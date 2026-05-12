@@ -344,3 +344,40 @@ output "nhp_internal_auth_secret_arn" {
   description = "Secrets Manager ARN for the NHP internal auth HMAC secret. Exposed for ad-hoc operator inspection and rotation tooling (#1312)."
   value       = aws_secretsmanager_secret.nhp_internal_auth.arn
 }
+
+# ==================== Bootstrap ALB ====================
+
+output "bootstrap_alb_target_group_arn" {
+  description = "Target group ARN for the bootstrap ALB. The qurl-service ECS service registers against this via an `aws_ecs_service.load_balancer` block (paired follow-up PR: `feat/bootstrap-alb-attach-qurl-service`). Null when `deploy_bootstrap_alb = false`."
+  value       = length(module.bootstrap_alb) > 0 ? module.bootstrap_alb[0].target_group_arn : null
+}
+
+output "bootstrap_alb_dns_name" {
+  description = "DNS name of the bootstrap ALB itself (the AWS-assigned hostname, not `var.bootstrap_alb_dns_name`). Useful for the operator's A-alias write in the parent zone account. Null when `deploy_bootstrap_alb = false`."
+  value       = length(module.bootstrap_alb) > 0 ? module.bootstrap_alb[0].alb_dns_name : null
+}
+
+output "bootstrap_alb_zone_id" {
+  description = "Route53 hosted zone ID for the bootstrap ALB (consumed by the operator's A-alias write in the parent zone account, paired with `bootstrap_alb_dns_name`). Null when `deploy_bootstrap_alb = false`."
+  value       = length(module.bootstrap_alb) > 0 ? module.bootstrap_alb[0].alb_zone_id : null
+}
+
+output "bootstrap_alb_security_group_id" {
+  description = "Security group ID of the bootstrap ALB. The qurl-service task SG must allow ingress on `var.target_port` (default 8080) from this SG. Null when `deploy_bootstrap_alb = false`."
+  value       = length(module.bootstrap_alb) > 0 ? module.bootstrap_alb[0].alb_security_group_id : null
+}
+
+output "bootstrap_alb_web_acl_arn" {
+  description = "WAFv2 WebACL ARN attached to the bootstrap ALB. Consumed by the customer-403 / VPN-egress operator runbook (`modules/bootstrap-alb/README.md`) for the `aws wafv2 get-sampled-requests --web-acl-arn` invocation, and by the future `aws_wafv2_web_acl_logging_configuration` follow-up (#1892). Null when `deploy_bootstrap_alb = false`."
+  value       = length(module.bootstrap_alb) > 0 ? module.bootstrap_alb[0].web_acl_arn : null
+}
+
+output "bootstrap_alb_arn" {
+  description = "ARN of the bootstrap ALB itself. Read-only operator surface (the WAF association check + wafv2 get-web-acl-for-resource invocation in README Step 3 #4). **Do NOT use this to attach sibling listeners** — the narrow-surface invariant rests on HTTPS:443 being the only listener; a future caller attaching a second listener on a different port would silently widen the surface. The `alb_listener_arn` is deliberately NOT exported (see module `outputs.tf`) for the same reason. Null when `deploy_bootstrap_alb = false`."
+  value       = length(module.bootstrap_alb) > 0 ? module.bootstrap_alb[0].alb_arn : null
+}
+
+output "bootstrap_alb_alerts_topic_arn" {
+  description = "SNS topic ARN for bootstrap-alb alarm routing. Consumed by README Step 3 #7 (`aws sns list-subscriptions-by-topic` for email-subscription confirmation status) and by alerts-infra's cross-account Chatbot subscription. Null when `deploy_bootstrap_alb = false`."
+  value       = length(module.bootstrap_alb) > 0 ? module.bootstrap_alb[0].alerts_topic_arn : null
+}
