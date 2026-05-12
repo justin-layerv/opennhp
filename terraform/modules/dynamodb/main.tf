@@ -429,7 +429,13 @@ resource "aws_iam_policy" "dynamodb_write" {
 
 # qurl-resources: Stores QURL resource definitions
 # PK: resource_id, SK: sk (single-table design with "RESOURCE" sort key)
-# GSI: owner-index (query resources by owner)
+# GSIs (in declaration order below):
+#   - owner-index            (owner_id → created_at)
+#   - owner-expires-index    (owner_id → expires_at)
+#   - owner-target-hash-index (owner_id → target_url_hash; find-or-create dedup)
+#   - status-index           (status   → expires_at; KEYS_ONLY, expiring-soon scan)
+#   - custom-domain-index    (custom_domain; domain routing)
+#   - owner-alias-index      (owner_id → alias; sparse, tenant-scoped alias lookup)
 resource "aws_dynamodb_table" "qurl_resources" {
   count = var.deploy_qurl_tables ? 1 : 0
 
@@ -516,6 +522,35 @@ resource "aws_dynamodb_table" "qurl_resources" {
   global_secondary_index {
     name            = "custom-domain-index"
     hash_key        = "custom_domain"
+    projection_type = "ALL"
+  }
+
+  attribute {
+    name = "alias"
+    type = "S"
+  }
+
+  # GSI: Find resource by owner + alias (sparse — only resources with an alias appear)
+  # Used for tenant-scoped alias lookup (e.g., Slack /qurl get $<alias>).
+  # Application layer enforces alias shape (slug, ≤ 64 chars, normalized
+  # lowercase per qurl-service domain validation) — DynamoDB itself only
+  # caps the range key at 1024 bytes, which is well above any product cap.
+  #
+  # Uniqueness on (owner_id, alias) is NOT enforced by this index. GSIs
+  # are eventually consistent and don't accept conditional writes, and the
+  # base-table PK is resource_id (not owner_id) — so query-then-write
+  # against the GSI has a TOCTOU window, and a single-item
+  # attribute_not_exists(resource_id) only fences resource_id collisions.
+  # qurl-service is responsible for adding an atomic alias-reservation
+  # mechanism (e.g., a sentinel item written via TransactWriteItems) so
+  # concurrent creates for the same (owner_id, alias) collapse to one
+  # resource. Without that, the by-alias GET surfaces whichever item the
+  # GSI happens to materialize first. See qurl-service alias domain
+  # (PR-3a.2) for the actual mechanism.
+  global_secondary_index {
+    name            = "owner-alias-index"
+    hash_key        = "owner_id"
+    range_key       = "alias"
     projection_type = "ALL"
   }
 
