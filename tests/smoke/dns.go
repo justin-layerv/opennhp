@@ -51,6 +51,24 @@ type derivedEndpoints struct {
 // deriveEndpoints returns the default URL set for the named environment.
 // Adding a new environment (e.g., staging) means adding a case here —
 // no test body needs to change.
+//
+// FOUR-PLACE UPDATE: this is one of four sites that must be updated
+// in lockstep when adding a new env that participates in the qurl-
+// service internal-ALB rollout (PRs #1588/#1596/#1608/#1628/#1635):
+//
+//  1. This function (the in-test hostname mapping).
+//  2. `.github/workflows/nhp-smoke-tests.yml`'s `||` chain on
+//     `NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED` (workflow-level
+//     gate; without it, the 07_/08_/09_ tests silently skip).
+//  3. The env's tfvars: `qurl_internal_service_domain`.
+//  4. `tests/smoke/09_public_alb_internal_lockdown_test.go`'s
+//     `httpListenerOptOutEnvs` map (an env that disables the
+//     public HTTP listener opts out of the HTTP-redirect fence).
+//     Empty today — both sandbox and prod publish port 80.
+//
+// nhp#1640 tracks moving all four to SSM-sourced so the workflow,
+// this function, and the test-side map stop being a duplicate-of-
+// truth.
 func deriveEndpoints(env string) (derivedEndpoints, error) {
 	switch env {
 	case "sandbox":

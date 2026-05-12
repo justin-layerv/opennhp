@@ -165,18 +165,72 @@ jobs:
           AUTH0_CLIENT_SECRET: ${{ steps.auth0.outputs.client_secret }}
           AWS_REGION: ${{ inputs.aws_region }}
           NHP_SMOKE_ALLOW_SSM_PROBES: ${{ inputs.allow_ssm_probes }}
+          # Both sandbox and prod have the qurl-service internal ALB
+          # wired (qurl-service #335 rollout, PRs #1588/#1596/#1608/
+          # #1628/#1635). The 07_/08_/09_ tests gate on this flag via
+          # skipIfQurlInternalALBDisabled and would silently skip
+          # without this — PR1's smoke fence had been quietly
+          # skipping in CI from merge until review surfaced it.
+          # Keyed on the environment name so a future regional env
+          # (`dev`, `staging`, `eu-*`) added without the internal ALB
+          # wired skips cleanly instead of running the lockdown fence
+          # against an environment where it doesn't apply.
+          #
+          # Adding a new env is a THREE-PLACE update: (1) this `||`
+          # chain, (2) `tests/smoke/dns.go` (deriveEndpoints — the
+          # internal hostname mapping), (3) the env's tfvars
+          # (`qurl_internal_service_domain`). Track #1640 will move
+          # this to SSM-sourced and collapse to one place.
+          NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED: ${{ (inputs.environment == 'sandbox' || inputs.environment == 'prod') && 'true' || 'false' }}
           TIER: ${{ inputs.tier }}
         run: |
           set -euo pipefail
+          # Make the resolved flag visible at workflow level — until
+          # #1640 lands the SSM-sourced fix, a new env added without
+          # updating the `||` chain above silently disables the
+          # lockdown / internal-ALB smoke fences. The notice surfaces
+          # in the workflow summary so the next operator sees it
+          # without having to read test SKIP lines.
+          if [ "$NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED" != "true" ]; then
+            echo "::notice::NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED=false for env=${NHP_ENVIRONMENT} — qurl-service internal-ALB fences (07_/08_/09_) will skip cleanly. If this env *should* have the internal ALB wired, update .github/workflows/nhp-smoke-tests.yml's || chain (and see #1640)."
+          fi
           case "$TIER" in
             tier1)
-              RUN_FILTER='^Test(Health|DockerImage|SSMRunbook|BlueGreen|Canary|ACEIPPool|SSMProbe)_'
+              # Tier 1 = files 01_-09_ per CLAUDE.md smoke-rule.
+              # Each `Foo` token MUST correspond to a real
+              # `TestFoo_<...>` declaration somewhere in the suite —
+              # the trailing `_` in the regex makes a token without a
+              # matching `Test<token>_` test silently match nothing.
+              # Drift fenced by `scripts/check-smoke-tier-filter-coverage.sh`
+              # (wired into `make lint-workflows` and the
+              # validate-workflows CI job). The script greps every
+              # 0X_*_test.go file for `^func Test<Prefix>_` and
+              # asserts the alternation tokens exactly match the
+              # real-test prefixes — catches both directions of
+              # silent skip. Add a new test prefix → run the script
+              # locally → it prints the missing token before CI does.
+              RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|SSMRunbook|BlueGreen|Canary|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|PublicALB|ResolveOrigin)_'
               ;;
             tier1+tier2)
-              RUN_FILTER='^Test(Health|DockerImage|SSMRunbook|BlueGreen|Canary|ACEIPPool|SSMProbe|Resolve|Knock|Forward|Plugins|InternalAPI)_'
+              RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|SSMRunbook|BlueGreen|Canary|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|PublicALB|Resolve|ResolveOrigin|Knock|Plugins|InternalAPI)_'
               ;;
             tier3-no-ssm)
-              RUN_FILTER='^Test(Health|BlueGreen|Canary|ACEIPPool|Resolve|Knock|Plugins|Protocol|ServerLogs|Timing)_'
+              # The Test<Prefix>_ tokens listed are exactly the
+              # prefixes whose tests do NOT call into the SSM
+              # RunShellScript helpers in tests/smoke/ssm_probe.go
+              # (the 30-day `allow_ssm_probes`-gated mechanism).
+              # Tests that use CloudWatch Logs Insights via the AWS
+              # SDK, SSM Parameter Store via getSSMParameter, or
+              # pure HTTP/DNS probes all belong here — none of those
+              # mechanisms is gated by the burn-in.
+              #
+              # The full token-to-test-file mapping is structurally
+              # enforced by scripts/check-smoke-tier-filter-coverage.sh:
+              # adding a new SSM-RunShellScript-dependent test
+              # requires updating tier3_no_ssm_expected_omissions
+              # there; adding a non-SSM test requires adding the
+              # token here. The script fails CI on either omission.
+              RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|BlueGreen|Canary|ACEIPPool|ACLogs|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|PublicALB|Resolve|ResolveOrigin|Knock|Plugins|InternalAPI|Protocol|ServerLogs|Timing)_'
               ;;
             all)
               RUN_FILTER=''

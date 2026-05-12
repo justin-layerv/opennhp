@@ -15,9 +15,13 @@ on:
       - "CLAUDE.md"
       - "scripts/check-scope-drift.sh"
       - "scripts/check-disable-agent-validation.sh"
+      - "scripts/check-smoke-tier-filter-coverage.sh"
+      - "scripts/check-lockdown-body-drift.sh"
       - "scripts/check-paths-filter-coverage.py"
       - "scripts/print-dispatch-ref-error.sh"
+      - "terraform/modules/qurl-service/main.tf"
       - "tests/scripts/**"
+      - "tests/smoke/**"
       - "tests/lints/disable-agent-validation/**"
       - "tests/lints/paths-filter-coverage/**"
       - "tests/lints/dispatch-ref-error/**"
@@ -34,9 +38,13 @@ on:
       - "CLAUDE.md"
       - "scripts/check-scope-drift.sh"
       - "scripts/check-disable-agent-validation.sh"
+      - "scripts/check-smoke-tier-filter-coverage.sh"
+      - "scripts/check-lockdown-body-drift.sh"
       - "scripts/check-paths-filter-coverage.py"
       - "scripts/print-dispatch-ref-error.sh"
+      - "terraform/modules/qurl-service/main.tf"
       - "tests/scripts/**"
+      - "tests/smoke/**"
       - "tests/lints/disable-agent-validation/**"
       - "tests/lints/paths-filter-coverage/**"
       - "tests/lints/dispatch-ref-error/**"
@@ -156,6 +164,32 @@ jobs:
 
       - name: Check DisableAgentValidation flag (#1157 F9)
         run: bash scripts/check-disable-agent-validation.sh
+
+      # Two-way coverage check: every alternation token in
+      # nhp-smoke-tests.yml's RUN_FILTER must correspond to a real
+      # `^func Test<Token>_` in tests/smoke/0X_*_test.go, and every
+      # such Test<Prefix>_ must be in the alternation for the tier
+      # the file's prefix routes to. Without this, a token without a
+      # matching test (e.g., `Health` when all real tests are named
+      # `TestHealthKnockReady_…` / `TestHealthLive_…`) silently
+      # matches nothing — every Health* tier-1 fence skipped on every
+      # CI run until the script was wired in.
+      - name: Check smoke RUN_FILTER coverage
+        run: bash scripts/check-smoke-tier-filter-coverage.sh
+
+      # Structural fence for the qurl-service /internal/* public-ALB
+      # lockdown body shape (PR #1635). The fixed-response body in
+      # terraform/modules/qurl-service/main.tf (jsonencode({error="not found"}))
+      # is duplicated in tests/smoke/09_public_alb_internal_lockdown_test.go
+      # as publicALBLockdownExpectedBody. The smoke suite is a separate
+      # Go module with no `replace` line back to terraform-rendered
+      # output, so the duplication is structural. A one-sided edit
+      # (e.g., switching to gin's text/plain to close the body-shape
+      # fingerprint leak) would leave the smoke fence asserting on the
+      # prior shape — silently false-positive — until the next live
+      # smoke run flagged it. This lint catches the drift at PR time.
+      - name: Check lockdown body shape drift (TF ↔ smoke)
+        run: bash scripts/check-lockdown-body-drift.sh
 
       # Structural fence for the two-layer path filter pattern
       # (push.paths + dorny/paths-filter inside a job). Every

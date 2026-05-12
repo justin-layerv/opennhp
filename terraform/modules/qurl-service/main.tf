@@ -1084,6 +1084,16 @@ resource "aws_lb_target_group" "qurl" {
 # Note: count uses domain_name (not certificate_arn) because certificate_arn may be
 # computed at apply time (e.g., from aws_acm_certificate_validation), which would
 # cause "Invalid count argument" errors during terraform plan.
+#
+# Listener-rule priority slots:
+#   - priority = 1: reserved for `aws_lb_listener_rule.public_internal_block`
+#     (the /internal/* lockdown). Must remain first-evaluated; no
+#     business rule should claim slot 1.
+#   - priority >= 2: business rules.
+# AWS rejects priority collisions on the CreateRule API call (i.e.,
+# at apply time, not plan time), so the slot is exclusive without
+# runtime checks — adding a rule at priority 1 here would pass plan
+# and fail apply.
 resource "aws_lb_listener" "https" {
   count = var.domain_name != null ? 1 : 0
 
@@ -1100,6 +1110,169 @@ resource "aws_lb_listener" "https" {
 
   tags = merge(var.tags, {
     Name      = "${local.service_name}-https"
+    Component = "qurl-service"
+    Cell      = var.cell_id
+  })
+}
+
+# Public ALB /internal/* lockdown (qurl-service #335 PR4).
+#
+# Returns 404 (not 403) for any /internal* path on the public ALB —
+# 404 avoids leaking that the path exists ("path not found" looks the
+# same as a typo'd public path), so an external scanner can't enumerate
+# the internal surface from this signal alone.
+#
+# Gate: both `domain_name` (the HTTPS listener exists) AND
+# `internal_alb_enabled` (consumers have an in-VPC alternative). On
+# greenfield envs without the internal ALB the rule is absent and the
+# public path keeps serving — locking it down without an alternative
+# would break the QURL plugin / AC qurl-router / FRP auth path.
+#
+# Priority 1 makes this the first-evaluated rule (lower number =
+# higher precedence in AWS ALB). It is NOT a blanket deny — only
+# the path_patterns below 404; everything else still falls through
+# to the default forward action on the listener. The structural
+# guarantee priority 1 buys is that no other rule can ever preempt
+# this match: AWS rejects priority collisions on the CreateRule
+# API call (i.e., at apply time, not plan time), so the slot is
+# exclusive. Future business rules pick priority >= 2, and a
+# narrower-pattern shadow at higher precedence is impossible. The
+# Priority 1 (first-evaluated) was chosen over priority 100 + a
+# describe-rules probe: the latter would require runtime verification
+# that no rule with priority < 100 has an overlapping pattern, which
+# is a soft guarantee. AWS-side priority-collision rejection is a
+# hard structural fence.
+#
+# Attached to the HTTPS listener only. The HTTP listener (port 80) is
+# redirect-only when `domain_name != null`, so HTTP probes go through
+# the 301 → HTTPS chain and hit the lockdown after redirect. A
+# parallel rule on the HTTP listener would never be reached.
+#
+# Path patterns cover four bypass classes:
+#   - `/internal` (bare): AWS ALB's `*` matches 0+ characters, so
+#     `/internal/*` matches `/internal/` (trailing slash, zero chars
+#     after). What it does NOT match is `/internal` with no trailing
+#     slash — that requires the literal `/`. The bare entry fences
+#     the `https://api/internal` prefix-fishing class. Note: paths
+#     like `/internalfoo` (no separator) ALSO fall through — they're
+#     a different namespace and gin's 404 at the backend catches them.
+#   - `/internal/*` (canonical): the production path for /internal/v1/*.
+#   - `/Internal` + `/Internal/*` (capitalized): AWS ALB
+#     path_pattern is case-sensitive; the rule covers the two most
+#     likely typos (Title case bare + canonical), mirroring the
+#     lowercase pair. Fully-uppercase / mixed-case variants are NOT
+#     covered and rely on gin's case sensitivity at the backend.
+#   - `/*../internal/*` (traversal): ALB does not normalize `..`
+#     segments before matching. qurl-service uses `gin.New()` with no
+#     path-cleaning today (so this can't bite immediately), but the
+#     entry catches a future router change to `net/http.ServeMux` or
+#     similar normalization-on-route behavior. HTTP/2 path
+#     normalization has historically been a layered concern (Go's
+#     net/http2 has shifted defaults; ALB doesn't publish a
+#     normalize-vs-pass-through guarantee for it), so the fence is
+#     worth the three lines.
+#
+#     This pattern depends on AWS ALB's `*` matching ANY character
+#     including `/` (per AWS docs: "0 or more of any character"). If
+#     AWS ever path-segment-bounded `*` (as some routers do — e.g.,
+#     gorilla/mux's `{var}` matches one segment; chi's `*` matches
+#     zero-or-more INCLUDING `/`), `/*../internal/*` would no longer
+#     match `/foo/bar../internal/v1/resolve`, narrowing the fence
+#     silently. The `bare_prefix_trailing_slash` smoke subtest
+#     fences zero-char `*` semantics; an `/`-spanning fence would be
+#     symmetric coverage if that policy flip becomes plausible. Today,
+#     `*` is documented as character-class-unbounded and the smoke
+#     fence runs against the live behavior — this comment exists so a
+#     future maintainer surveys the assumption when AWS ALB rule
+#     semantics change.
+#
+#     False-positive surface is empty today (no public path uses
+#     literal `..`); if a future public path ever needs literal `..`
+#     segments (e.g., a generated archive viewer), this pattern will
+#     need to be split or the path will need to be namespaced under
+#     a different prefix to dodge the glob. Tracked in #1641.
+#
+# Trust-model boundary: this listener rule fences the network layer
+# only (public-internet reachability of /internal/*). The auth layer
+# (X-Service-Token check at qurl-service handlers) is the second
+# line — if it ever bypasses, only the in-VPC bound remains. Tier 2
+# fence on that check is tracked in qurl-service#439.
+#
+# Slot budget: AWS ALB caps a single path_pattern condition at 5
+# values, and all 5 are used by the bypass-class taxonomy below.
+# Adding a 6th class (e.g., `/INTERNAL*` for fully-uppercase) cannot
+# extend this list — it requires a SECOND `aws_lb_listener_rule` at
+# priority 2 with the additional patterns (a second condition block
+# on this rule would AND-narrow the match to zero). Don't waste a
+# plan cycle finding this out empirically.
+#
+# Body-shape leak: the fixed-response body `{"error":"not found"}`
+# is itself a fingerprint distinguishing a lockdown match from a
+# real backend 404 (gin emits `text/plain "404 page not found"` as
+# its default). An attacker probing the surface can use this
+# differential to enumerate which paths the lockdown covers — a
+# small leak counter to the original "404 not 403 to avoid existence
+# leaks" rationale. Accepted tradeoff: the JSON body is a strong
+# triage signal in CloudWatch / runner logs (the smoke fence
+# discriminates on it), and an attacker probing has to compare
+# against the public-path baseline regardless. If this leak ever
+# matters, change the body to mimic gin's plain text and keep the
+# triage signal in a header instead.
+resource "aws_lb_listener_rule" "public_internal_block" {
+  count = var.domain_name != null && var.internal_alb_enabled ? 1 : 0
+
+  # `one(...)` is defensive: this resource's gate is strictly tighter
+  # than `aws_lb_listener.https`'s (`var.domain_name != null` plus the
+  # internal-ALB predicate), so [0] is safe today. `one()` keeps that
+  # invariant explicit and fails plan with a clearer message if a
+  # future gate change inverts it.
+  listener_arn = one(aws_lb_listener.https[*].arn)
+  priority     = 1
+
+  action {
+    type = "fixed-response"
+    # COORDINATED CHANGE: the body shape below is duplicated in
+    # `tests/smoke/09_public_alb_internal_lockdown_test.go::publicALBLockdownExpectedBody`
+    # (no compile-time link — only the smoke fence catches drift).
+    # If you change `content_type` or `message_body`, update both
+    # the Go constant AND the type of `publicALBLockdownExpectedBody`
+    # AND every test asserting against it, in the SAME PR.
+    fixed_response {
+      content_type = "application/json"
+      message_body = jsonencode({ error = "not found" })
+      status_code  = "404"
+    }
+  }
+
+  condition {
+    # Slot budget: see resource header comment above. Order below is
+    # by likelihood-of-bypass: bare and canonical lowercase patterns
+    # first, then case + traversal defense-in-depth. The case +
+    # traversal combination (`/*../Internal/*`) is intentionally
+    # omitted — gin's case sensitivity at the backend is the second
+    # line on case bypass already.
+    path_pattern {
+      values = [
+        "/internal",
+        "/internal/*",
+        "/Internal",
+        "/Internal/*",
+        # NOT in this list (would need a 6th slot — see resource
+        # header for slot-budget guidance): `/INTERNAL` and
+        # `/INTERNAL/*` (fully-uppercase). Backstopped by gin's
+        # case sensitivity at qurl-service today, fenced by
+        # tests/smoke/09_*.go::TestPublicALB_PathNotSuccessful
+        # at runtime. If qurl-service ever migrates to a
+        # case-folding router, that test surfaces the regression
+        # and a second `aws_lb_listener_rule` (priority 2) becomes
+        # necessary to add the uppercase variants.
+        "/*../internal/*",
+      ]
+    }
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${local.service_name}-internal-lockdown"
     Component = "qurl-service"
     Cell      = var.cell_id
   })
