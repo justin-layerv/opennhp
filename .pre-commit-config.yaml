@@ -27,6 +27,24 @@ repos:
     hooks:
       - id: go-fmt
 
+  # Local hook: fail commits that introduce a tag value containing chars
+  # outside AWS's allowed tag charset ([A-Za-z0-9_.:/=+\-@\s]). AWS
+  # rejects these at CreateTable/CreateBucket/... time with
+  # "ValidationException: The Tag Value provided is invalid"; the lint
+  # catches them at commit time. Stdlib-only python — no install. See
+  # .github/scripts/check-terraform-tag-charset.py for the rationale.
+  - repo: local
+    hooks:
+      - id: terraform-tag-charset
+        name: terraform tag charset
+        entry: python3 .github/scripts/check-terraform-tag-charset.py terraform
+        language: system
+        # Only run on terraform-file edits — the lint walks the whole
+        # `terraform/` tree regardless of which .tf changed, so we don't
+        # forward filenames.
+        files: '\.tf$'
+        pass_filenames: false
+
   - repo: https://github.com/antonbabenko/pre-commit-terraform
     rev: d0e12caebb2ab0ee8bf98181c8bfe9702bca103d  # v1.105.0
     hooks:
@@ -53,4 +71,10 @@ repos:
         # Intentionally has a `jsonencode(<<EOT ...)` body that terraform-validate
         # rejects (it's the exact malformed shape the lint exists to hard-fail on).
         # The lint's regression fence is in `run-fixtures.sh`, not `terraform validate`.
-        exclude: '^(terraform/(modules/(ac|grafana-dashboards)/|[^/]+\.tf$)|tests/lints/terraform-prod-drift/fixtures/heredoc-jsonencode-error/)'
+        #
+        # tests/lints/terraform-tag-charset/fixtures/: ASG resources and other
+        # AWS resources used here are stubs (no launch_template, no provider
+        # block) crafted to exercise the tag-charset scanner; they're not
+        # meant to plan/apply. The lint's regression fence is in
+        # `run-fixtures.sh`.
+        exclude: '^(terraform/(modules/(ac|grafana-dashboards)/|[^/]+\.tf$)|tests/lints/terraform-prod-drift/fixtures/heredoc-jsonencode-error/|tests/lints/terraform-tag-charset/fixtures/)'

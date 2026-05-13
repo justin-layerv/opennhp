@@ -337,6 +337,8 @@ lint-terraform-drift:
 	@./tests/lints/terraform-prod-drift/run-fixtures.sh
 	@python3 .github/scripts/check-terraform-iam-coverage.py
 	@python3 .github/scripts/check-terraform-policy-conditions.py
+	@./tests/lints/terraform-tag-charset/run-fixtures.sh
+	@python3 .github/scripts/check-terraform-tag-charset.py terraform
 	@echo "$(COLOUR_GREEN)[OpenNHP] terraform-prod-drift checks passed!$(END_COLOUR)"
 
 test:

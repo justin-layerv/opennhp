@@ -1093,11 +1093,13 @@ jobs:
       - name: Install python-hcl2
         run: python3 -m pip install -r .github/scripts/terraform-prod-drift-requirements.txt
 
-      - name: Shellcheck the fixture runner
+      - name: Shellcheck the fixture runners
         # validate-workflows.yml's actionlint -shellcheck only covers
-        # .github/workflows/*.yml. The runner script lives under tests/;
-        # cover it explicitly here so a typo lands at PR time, not later.
-        run: shellcheck ./tests/lints/terraform-prod-drift/run-fixtures.sh
+        # .github/workflows/*.yml. The runner scripts live under tests/;
+        # cover them explicitly here so a typo lands at PR time, not later.
+        run: |
+          shellcheck ./tests/lints/terraform-prod-drift/run-fixtures.sh
+          shellcheck ./tests/lints/terraform-tag-charset/run-fixtures.sh
 
       - name: Run terraform-prod-drift fixture suite
         # Regression fences for #1316 (resource-policy Condition denylist)
@@ -1111,6 +1113,16 @@ jobs:
 
       - name: Check terraform policy-condition denylist (#1316 regression fence)
         run: python3 ./.github/scripts/check-terraform-policy-conditions.py
+
+      - name: Run terraform-tag-charset fixture suite
+        # Regression fence for PR #1914 / #1915 — `qurl_agent_keys`
+        # shipped a tag value containing chars outside AWS's allowed
+        # set, silently passing terraform validate and failing only at
+        # CreateTable time on the sandbox apply.
+        run: ./tests/lints/terraform-tag-charset/run-fixtures.sh
+
+      - name: Check terraform tag charset (#1915 regression fence)
+        run: python3 ./.github/scripts/check-terraform-tag-charset.py terraform
 
   # ============================================================================
   # REDIRECT_URL DRIFT LINT (PR) - #1325
