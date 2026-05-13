@@ -247,6 +247,50 @@ type UdpServer struct {
 
 	// Rate limiter for license validation (brute-force prevention).
 	licenseRateLimiter *LicenseRateLimiter
+
+	// processACOperationBroadcastFn — TEST-ONLY SEAM.
+	//
+	// Indirection the local UDP/HTTP knock handlers go through to reach
+	// processACOperationBroadcast. Production paths leave it nil; the
+	// resolveProcessACOperationBroadcast helper picks the real method
+	// when unset. Tests set it on a literal UdpServer to inject a fake
+	// AC response (populating artMsg.ACToken without driving real Noise
+	// cipher state), which is the only practical way to fence the
+	// load-bearing post-Wait PublishACKTokens call from the handler
+	// entry point — see {udp,http}server_publish_acktokens_test.go.
+	//
+	// Not a stable production knob: package-private, no setter, no
+	// documented production semantics. If you find yourself wanting to
+	// override this from outside a _test.go file, reconsider — there is
+	// almost certainly a better extension point.
+	processACOperationBroadcastFn func(
+		parentCtx context.Context,
+		knkMsg *common.AgentKnockMsg,
+		conns []*ACConn,
+		srcAddr *common.NetAddress,
+		dstAddrs []*common.NetAddress,
+		openTime uint32,
+	) (*common.ACOpsResultMsg, error)
+}
+
+// resolveProcessACOperationBroadcast returns the function the local
+// knock handlers should call to drive the AC broadcast. Production
+// returns the bound method; tests that set processACOperationBroadcastFn
+// directly on the UdpServer literal get their fake. Centralizing the
+// fallback here keeps the two call sites in handleNhpOpenResource and
+// handleHttpOpenResource identical.
+func (s *UdpServer) resolveProcessACOperationBroadcast() func(
+	parentCtx context.Context,
+	knkMsg *common.AgentKnockMsg,
+	conns []*ACConn,
+	srcAddr *common.NetAddress,
+	dstAddrs []*common.NetAddress,
+	openTime uint32,
+) (*common.ACOpsResultMsg, error) {
+	if s.processACOperationBroadcastFn != nil {
+		return s.processACOperationBroadcastFn
+	}
+	return s.processACOperationBroadcast
 }
 
 type BlockAddr struct {
@@ -635,6 +679,15 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	s.acConnectionMap = make(map[string][]*ACConn)
 	s.dbConnectionMap = make(map[string]*DBConn)
 	s.tokenStore = common.NewTokenStore[*ACTokenEntry]()
+	// Expose tokenStore population as a gauge. RegisterGaugeFunc is
+	// nil-safe (see endpoints/metrics/publisher.go); s.metrics may be
+	// nil in test fixtures, in which case the registration is a no-op
+	// and the gauge simply isn't emitted. The closure samples
+	// tokenStore.Size each flush — RLock-only, no contention with
+	// Store/Load/CleanExpired beyond the brief read.
+	s.metrics.RegisterGaugeFunc(MetricTokenStoreSize, func() float64 {
+		return float64(s.tokenStore.Size())
+	})
 	s.blockAddrMap = make(map[string]*BlockAddr)
 	s.signals.stop = make(chan struct{})
 
@@ -2630,6 +2683,18 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 
 	knockHadNoAC := false
 
+	// openTime is loop-invariant — derived only from res.OpenTime and
+	// knkMsg.HeaderType, both fixed for this call. Hoisted out so the
+	// post-Wait PublishACKTokens call below has access to the same
+	// effective openTime without re-deriving it. The NHP_EXT branch
+	// is the #1154 MitM type-flip payoff; the body-authenticated
+	// HeaderType is fenced upstream by the gate documented at the
+	// knockHeaderTypeVerifyRequire field and in knock_headertype_gate.go.
+	openTime := res.OpenTime
+	if knkMsg.HeaderType == core.NHP_EXT {
+		openTime = 1 // timeout in 1 second
+	}
+
 	for resName, addrs := range acDstIpMap {
 		resInfo := res.Resources[resName]
 		if resInfo == nil {
@@ -2658,22 +2723,12 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 		go func(name string, info *common.ResourceInfo, dstAddrs []*common.NetAddress) {
 			defer acWg.Done()
 
-			// openTime=1 here is the attack payoff a MitM
-			// type-flip (#1154) would exploit. The knock HeaderType
-			// gate in nhpauth.go (verifyKnockHeaderType — upstream
-			// of this call site) ensures knkMsg.HeaderType was
-			// body-authenticated before we reach this branch. In
-			// strict mode a mismatch is rejected entirely; in
-			// permit mode the pre-fix behavior is preserved (wire
-			// value used). See knock_headertype_gate.go for the
-			// full policy.
-			openTime := res.OpenTime
-			if knkMsg.HeaderType == core.NHP_EXT {
-				openTime = 1 // timeout in 1 second
-			}
 			// UDP knock path: no request-scoped context exists, so pass Background.
 			// processACOperationBroadcast discards parent cancellation regardless.
-			artMsg, err := s.processACOperationBroadcast(context.Background(), knkMsg, connsCopy, srcAddr, dstAddrs, openTime)
+			// resolveProcessACOperationBroadcast lets handler-site integration
+			// tests inject a fake AC response — see
+			// udpserver_publish_acktokens_test.go.
+			artMsg, err := s.resolveProcessACOperationBroadcast()(context.Background(), knkMsg, connsCopy, srcAddr, dstAddrs, openTime)
 			artMsgsMutex.Lock()
 			artMsgs[name] = artMsg
 			if err == nil {
@@ -2685,6 +2740,12 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 		}(resName, resInfo, addrs)
 	}
 	acWg.Wait()
+
+	// PR-2a: persist AC-issued tokens AFTER acWg.Wait so PR-2b's
+	// /nhp/internal/token/validate reader doesn't race the AC
+	// goroutines still mutating ackMsg.ACTokens. See PublishACKTokens
+	// for the contract.
+	s.PublishACKTokens(knkMsg, ackMsg, srcAddr.Ip, int(openTime))
 
 	// Increment once per knock request (not per resource) for alarm accuracy
 	if knockHadNoAC {

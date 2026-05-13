@@ -158,6 +158,22 @@ func TestIssueACTokenIfSuccess_GatesOnErrCode(t *testing.T) {
 	}
 }
 
+// TestAccessTokenLatePacketBufferConstantMatchesServer pins the AC's
+// late-packet buffer constant against the shared common-package source
+// of truth. The server's ACK-path entries (NewACKTokenEntry) consume
+// the same constant; a future edit that touches one side without the
+// other would drift the contract — the test ensures the AC value is
+// read from common.AccessTokenLatePacketBufferSeconds, which catches
+// the drift at compile/test time on either side.
+func TestAccessTokenLatePacketBufferConstantMatchesServer(t *testing.T) {
+	if accessTokenLatePacketBufferSeconds != common.AccessTokenLatePacketBufferSeconds {
+		t.Fatalf("ac accessTokenLatePacketBufferSeconds drifted from common: got %d, want %d", accessTokenLatePacketBufferSeconds, common.AccessTokenLatePacketBufferSeconds)
+	}
+	if common.AccessTokenLatePacketBufferSeconds != 5 {
+		t.Fatalf("common.AccessTokenLatePacketBufferSeconds drift: got %d, want 5 (AC and server both consume this — see endpoints/server/tokenstore.go's NewACKTokenEntry)", common.AccessTokenLatePacketBufferSeconds)
+	}
+}
+
 // TestGenerateAccessToken_LatePacketBuffer fences the
 // accessTokenLatePacketBufferSeconds extension. The AC issues tokens with
 // ExpireTime = now + OpenTime + buffer to keep iptables/ipset entries

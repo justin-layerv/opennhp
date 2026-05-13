@@ -9,13 +9,15 @@ import (
 // accessTokenLatePacketBufferSeconds extends AC token retention beyond
 // AccessEntry.OpenTime to handle requests that arrive after the AC has
 // already torn down the iptables/ipset entry but before the client knows
-// to re-knock. Server-side tokens have no equivalent buffer because the
-// server is the issuer, not the iptables/ipset enforcement point — see
-// UdpServer.GenerateAccessToken in endpoints/server/tokenstore.go for
-// the strict-OpenTime contract. (Both AC and server validate tokens via
-// VerifyAccessToken; the buffer asymmetry is about packet-arrival timing,
-// not about who's allowed to verify.)
-const accessTokenLatePacketBufferSeconds = 5
+// to re-knock.
+//
+// The value lives in nhp/common so the AC and server cannot drift —
+// see common.AccessTokenLatePacketBufferSeconds for the full rationale
+// (including the asymmetry: server-issued tokens keep strict OpenTime
+// retention, while ACK-path entries on the server side DO extend by
+// the same buffer so a delayed /nhp/internal/token/validate request
+// still resolves while the AC would still accept a packet).
+const accessTokenLatePacketBufferSeconds = common.AccessTokenLatePacketBufferSeconds
 
 // AccessEntry represents an access token entry with user and access information.
 type AccessEntry struct {

@@ -100,6 +100,28 @@ const (
 	// new assignments.
 	MetricCloudMapRegisterRefreshFailure = "CloudMapRegisterRefreshFailure"
 	MetricKnockNoAC                      = "KnockNoAC"
+	// MetricACTokenStored fires once per AC-issued token persisted to
+	// the server tokenStore via UdpServer.storeACToken. Operators use
+	// this rate to fence PR-2b's /nhp/internal/token/validate: a
+	// non-zero validate-miss rate paired with a zero ACTokenStored
+	// rate means the issuer side is silent, not that validate is
+	// broken. Sustained zero with live knock traffic should page —
+	// the store-on-issue chokepoint has gone dark.
+	MetricACTokenStored = "ACTokenStored"
+	// MetricTokenStoreSize is a gauge of the current ACTokenEntry
+	// population in the server tokenStore. Pair with MetricACTokenStored
+	// (the add-rate counter): under sustained knock load the steady
+	// state is roughly knock_rate × (OpenTime + late-packet buffer)
+	// entries, with no cap. The counter alone can't answer "did the
+	// store grow unbounded?" — this gauge does. When PR-2b's validate
+	// endpoint starts returning nil unexpectedly, operators check
+	// here for runaway growth or, conversely, an unexpectedly empty
+	// store (CleanExpired stalled, or the periodic refresh routine
+	// died silently). Sampled by the Publisher each flush via
+	// RegisterGaugeFunc on tokenStore.Size; the value reflects the
+	// post-sweep population because CleanExpired runs every
+	// TokenStoreRefreshInterval seconds on the same goroutine.
+	MetricTokenStoreSize = "TokenStoreSize"
 	// MetricInternalAuthFailPermit / MetricInternalAuthFailStrict count
 	// /nhp/internal/knock requests whose HMAC verification failed.
 	// Permit-mode failures still pass through (warn + allow); strict-

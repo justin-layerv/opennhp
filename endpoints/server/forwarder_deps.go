@@ -60,6 +60,15 @@ type ForwarderDeps interface {
 		dstAddrs []*common.NetAddress,
 		openTime uint32,
 	) (*common.ACOpsResultMsg, error)
+
+	// PublishACKTokens persists every AC token in ackMsg.ACTokens so
+	// PR-2b's /nhp/internal/token/validate can resolve them. The forward
+	// receiver routes its single-resource ackMsg through this chokepoint
+	// after a successful broadcast so the empty-token guard, the
+	// maps.Clone isolation, and any future metrics/logging applied in
+	// PublishACKTokens reach the forward path identically to the local
+	// UDP/HTTP knock paths.
+	PublishACKTokens(knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int)
 }
 
 // Compile-time check that UdpServer implements ForwarderDeps.

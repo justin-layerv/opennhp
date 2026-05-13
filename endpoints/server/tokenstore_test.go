@@ -1,7 +1,10 @@
 package server
 
 import (
+	"strconv"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
 )
@@ -40,6 +43,506 @@ func TestGenerateAccessToken_Uniqueness(t *testing.T) {
 		}
 		if got.User != user {
 			t.Fatalf("VerifyAccessToken returned an entry with the wrong User pointer for token %d", i)
+		}
+	}
+}
+
+// TestStoreACToken_RoundTrip fences PR-2a's load-bearing invariant: a
+// token written to the store via the ACK-construction path
+// (storeACToken) must be resolvable via VerifyAccessToken. Before
+// PR-2a, the three ACK sites (udpserver, httpserver, forward) wrote
+// ackMsg.ACTokens[name] = artMsg.ACToken without any corresponding
+// store call — every token issued via the ACK path returned nil from
+// VerifyAccessToken, which made PR-2b's /nhp/internal/token/validate
+// a black hole. Deleting this test means the store-on-issue contract
+// is no longer checked at unit level.
+func TestStoreACToken_RoundTrip(t *testing.T) {
+	s := &UdpServer{
+		tokenStore: common.NewTokenStore[*ACTokenEntry](),
+	}
+
+	user := &common.AgentUser{
+		UserId:         "user-1",
+		DeviceId:       "device-1",
+		OrganizationId: "org-1",
+		AuthServiceId:  "asp-1",
+	}
+	entry := &ACTokenEntry{
+		User:       user,
+		ResourceId: "r-1",
+		ACTokens:   map[string]string{"r-1": "ac-token-abc"},
+		KnockSrcIP: "203.0.113.7",
+		RunID:      "run-xyz",
+		OpenTime:   60,
+		ExpireTime: time.Now().Add(65 * time.Second),
+	}
+
+	s.storeACToken("ac-token-abc", entry)
+
+	got := s.VerifyAccessToken("ac-token-abc")
+	if got == nil {
+		t.Fatal("VerifyAccessToken returned nil for a stored ACK-path token; before PR-2a this was the bug — every ACK-path token was unverifiable")
+	}
+	if got != entry {
+		t.Fatal("VerifyAccessToken did not return the same entry pointer that storeACToken wrote")
+	}
+	if got.KnockSrcIP != "203.0.113.7" {
+		t.Errorf("KnockSrcIP not preserved through round-trip: got %q want %q", got.KnockSrcIP, "203.0.113.7")
+	}
+	if got.RunID != "run-xyz" {
+		t.Errorf("RunID not preserved through round-trip: got %q want %q", got.RunID, "run-xyz")
+	}
+}
+
+// TestStoreACToken_RunIDDefaultEmpty fences the backwards-compat
+// contract on RunID: callers that don't populate it (every ACK site
+// shipped in PR-2a, before PR-2c wires the agent registration path)
+// store the empty string and the entry still round-trips cleanly. A
+// future regression that makes RunID required in the store would
+// surface here as a verify failure.
+func TestStoreACToken_RunIDDefaultEmpty(t *testing.T) {
+	s := &UdpServer{
+		tokenStore: common.NewTokenStore[*ACTokenEntry](),
+	}
+
+	entry := &ACTokenEntry{
+		ResourceId: "r-1",
+		KnockSrcIP: "198.51.100.4",
+		OpenTime:   30,
+		ExpireTime: time.Now().Add(35 * time.Second),
+		// RunID intentionally left as zero value
+	}
+	s.storeACToken("tok-no-runid", entry)
+
+	got := s.VerifyAccessToken("tok-no-runid")
+	if got == nil {
+		t.Fatal("VerifyAccessToken returned nil for an entry with empty RunID")
+	}
+	if got.RunID != "" {
+		t.Errorf("RunID expected to round-trip as empty string, got %q", got.RunID)
+	}
+}
+
+// TestStoreACToken_ExpiresAfterOpenTimePlusBuffer fences the +5s
+// late-packet buffer the three ACK-construction sites apply when
+// they call storeACToken with `ExpireTime: now + (OpenTime + 5)s`.
+// The +5s mirrors the AC's accessTokenLatePacketBufferSeconds: the
+// server-side entry must outlive the AC's pinhole so a delayed
+// validate request still resolves.
+//
+// VerifyAccessToken now consults ExpireTime directly so an expired
+// entry returns nil even before CleanExpired's periodic sweep removes
+// it — the sweep runs every TokenStoreRefreshInterval seconds (10s),
+// and without this check a token could sit ~10s past ExpireTime and
+// still resolve, letting an FRP login through to an AC whose pinhole
+// has already torn down. ExpireTime is set in the past so the boundary
+// is observed deterministically without sleeping.
+func TestStoreACToken_ExpiresAfterOpenTimePlusBuffer(t *testing.T) {
+	s := &UdpServer{
+		tokenStore: common.NewTokenStore[*ACTokenEntry](),
+	}
+
+	// Construct an entry the way the ACK sites do: ExpireTime is now
+	// + (OpenTime + accessTokenLatePacketBufferSeconds) seconds. To
+	// avoid a real sleep, set ExpireTime in the past — the
+	// post-expiry state is the same as if (OpenTime + 5s) had elapsed.
+	openTime := 30
+	entry := &ACTokenEntry{
+		ResourceId: "r-1",
+		KnockSrcIP: "192.0.2.10",
+		OpenTime:   openTime,
+		ExpireTime: time.Now().Add(-time.Second), // already past
+	}
+	s.storeACToken("tok-expired", entry)
+
+	// Pre-sweep: VerifyAccessToken must return nil for the expired
+	// entry. This is the load-bearing property — PR-2b's
+	// /nhp/internal/token/validate calls this method, and without the
+	// expiry check it would approve a token whose AC pinhole has
+	// already been torn down.
+	if got := s.VerifyAccessToken("tok-expired"); got != nil {
+		t.Fatal("VerifyAccessToken returned an expired entry before the sweep ran; the point-in-time validity check is broken")
+	}
+
+	// CleanExpired still has work to do — the entry is reachable via
+	// the raw Load until the sweep reaps it. See
+	// TestVerifyAccessToken_ExpiryDoesNotEvict for the dedicated fence
+	// on the responsibility split (point-in-time validity vs. memory
+	// reclamation).
+	removed := s.tokenStore.CleanExpired()
+	if removed != 1 {
+		t.Fatalf("expected CleanExpired to remove 1 entry, got %d", removed)
+	}
+
+	if got := s.VerifyAccessToken("tok-expired"); got != nil {
+		t.Fatal("VerifyAccessToken should return nil after the entry expired and was swept")
+	}
+}
+
+// TestVerifyAccessToken_ExpiryDoesNotEvict fences the responsibility
+// split introduced when VerifyAccessToken started consulting
+// ExpireTime: the method returns nil for an expired entry, but does
+// NOT remove it from the store. Memory reclamation stays with
+// CleanExpired so the sweep counter (and any future
+// MetricTokenStoreSize gauge) reflects the actual store population,
+// not the read-rate of expired tokens.
+//
+// A future regression that "fixes" the split by deleting the entry on
+// expired-Load would silently break the sweep accounting (CleanExpired
+// would see fewer entries to remove than were written) and any
+// observability built on the store size.
+func TestVerifyAccessToken_ExpiryDoesNotEvict(t *testing.T) {
+	s := &UdpServer{
+		tokenStore: common.NewTokenStore[*ACTokenEntry](),
+	}
+
+	entry := &ACTokenEntry{
+		ResourceId: "r-1",
+		OpenTime:   30,
+		ExpireTime: time.Now().Add(-time.Second), // already past
+	}
+	s.storeACToken("tok-expired-load", entry)
+
+	// Point-in-time validity: nil.
+	if got := s.VerifyAccessToken("tok-expired-load"); got != nil {
+		t.Fatal("VerifyAccessToken should return nil for an expired entry")
+	}
+
+	// Raw Load still sees the entry — CleanExpired hasn't run yet.
+	got, found := s.tokenStore.Load("tok-expired-load")
+	if !found {
+		t.Fatal("tokenStore.Load should still return the expired entry pre-sweep; VerifyAccessToken must not evict")
+	}
+	if got != entry {
+		t.Fatal("tokenStore.Load returned a different entry pointer than was stored")
+	}
+
+	// CleanExpired is what reclaims the slot.
+	if removed := s.tokenStore.CleanExpired(); removed != 1 {
+		t.Fatalf("expected CleanExpired to remove 1 entry, got %d", removed)
+	}
+	if _, found := s.tokenStore.Load("tok-expired-load"); found {
+		t.Fatal("tokenStore.Load should return not-found after CleanExpired ran")
+	}
+}
+
+// TestStoreACToken_BufferConstantMatchesAC pins the asymmetry
+// documented in endpoints/ac/tokenstore.go: server-side ACK entries
+// extend by exactly accessTokenLatePacketBufferSeconds (5s), not 0
+// and not the AC's full OpenTime. The constant is now sourced from
+// nhp/common, so both AC and server consume the same symbol — this
+// test fences the local server alias against the shared source AND
+// pins the shared value itself, so a future edit on either side
+// fails this test (and its AC-side twin in
+// endpoints/ac/tokenstore_test.go).
+func TestStoreACToken_BufferConstantMatchesAC(t *testing.T) {
+	if accessTokenLatePacketBufferSeconds != common.AccessTokenLatePacketBufferSeconds {
+		t.Fatalf("server accessTokenLatePacketBufferSeconds drifted from common: got %d, want %d", accessTokenLatePacketBufferSeconds, common.AccessTokenLatePacketBufferSeconds)
+	}
+	if common.AccessTokenLatePacketBufferSeconds != 5 {
+		t.Fatalf("common.AccessTokenLatePacketBufferSeconds drift: got %d, want 5 (AC and server both consume this — see endpoints/ac/tokenstore.go and NewACKTokenEntry)", common.AccessTokenLatePacketBufferSeconds)
+	}
+}
+
+// TestNewACKTokenEntry_ProducesShapeAllACKSitesShare fences the
+// shape contract every ACK site relies on. The three call sites
+// (udpserver.go, httpserver.go, forward.go) all flow through
+// PublishACKTokens, which in turn calls NewACKTokenEntry per token.
+//
+// Adding direct tests at all three sites would require driving the
+// full HandleKnockRequest / HandleForwardRequest paths (which need
+// real cipher state). Testing the helper instead covers them
+// transitively: a regression in NewACKTokenEntry's mapping (e.g.,
+// AuthServiceId stops flowing through, or ExpireTime drops the +5s
+// buffer) breaks every call site identically and fails this test.
+//
+// Specifically pins:
+//   - All four AgentUser fields (UserId, DeviceId, OrganizationId,
+//     AuthServiceId) flow from knkMsg into entry.User (PR-2b's
+//     validate response shape consumes UserId + OrganizationId).
+//   - ResourceId comes from the explicit caller arg, not knkMsg.
+//     (udpserver/httpserver pass per-resource loop var `name`,
+//     forward passes knkMsg.ResourceId; the asymmetry is intentional
+//     and the helper preserves it.)
+//   - KnockSrcIP is the caller's parsed IP, not anything from knkMsg
+//     (the wire knock has no source-IP field — it's recovered from
+//     the UDP packet at the call site).
+//   - ACTokens map is shallow-copied via maps.Clone (defensive
+//     isolation; callers may mutate the source map post-publish
+//     without corrupting stored entries).
+//   - OpenTime is the caller's int conversion of the resource's
+//     openTime (uint32 truncation is the caller's problem).
+//   - ExpireTime sits in the (now+OpenTime, now+OpenTime+5+ε) window
+//     — the +5s late-packet buffer is what the AC honors.
+//   - RunID defaults to "" until PR-2c wires the agent registration
+//     path. A future change that makes RunID required surfaces here.
+func TestNewACKTokenEntry_ProducesShapeAllACKSitesShare(t *testing.T) {
+	knkMsg := &common.AgentKnockMsg{
+		UserId:         "user-1",
+		DeviceId:       "device-2",
+		OrganizationId: "org-3",
+		AuthServiceId:  "asp-4",
+		ResourceId:     "wire-resource", // intentionally distinct from caller arg
+	}
+	acTokens := map[string]string{"r-1": "ac-tok-abc"}
+
+	const openTime = 60
+	before := time.Now()
+	entry := NewACKTokenEntry(knkMsg, "r-1", acTokens, "203.0.113.7", openTime)
+	after := time.Now()
+
+	if entry == nil {
+		t.Fatal("NewACKTokenEntry returned nil")
+	}
+	if entry.User == nil {
+		t.Fatal("entry.User is nil")
+	}
+
+	// User-field mapping — fences PR-2b's validate response contract.
+	if entry.User.UserId != "user-1" {
+		t.Errorf("User.UserId = %q, want %q", entry.User.UserId, "user-1")
+	}
+	if entry.User.DeviceId != "device-2" {
+		t.Errorf("User.DeviceId = %q, want %q", entry.User.DeviceId, "device-2")
+	}
+	if entry.User.OrganizationId != "org-3" {
+		t.Errorf("User.OrganizationId = %q, want %q", entry.User.OrganizationId, "org-3")
+	}
+	if entry.User.AuthServiceId != "asp-4" {
+		t.Errorf("User.AuthServiceId = %q, want %q", entry.User.AuthServiceId, "asp-4")
+	}
+
+	// ResourceId comes from caller arg, NOT knkMsg.ResourceId.
+	// udpserver/httpserver pass the per-resource loop var; forward
+	// happens to pass knkMsg.ResourceId. Helper preserves the
+	// caller's choice.
+	if entry.ResourceId != "r-1" {
+		t.Errorf("ResourceId = %q, want %q (must come from caller arg, not knkMsg.ResourceId %q)",
+			entry.ResourceId, "r-1", knkMsg.ResourceId)
+	}
+
+	// ACTokens plumbed (snapshot via maps.Clone — entries are
+	// isolated from post-publish mutation of the source map).
+	if got := entry.ACTokens["r-1"]; got != "ac-tok-abc" {
+		t.Errorf("ACTokens[r-1] = %q, want %q", got, "ac-tok-abc")
+	}
+	// Isolation fence: mutating the caller's map after construction
+	// must NOT alter the stored entry's ACTokens. A regression that
+	// drops the maps.Clone (or aliases the field) silently re-opens
+	// the cross-mutex aliasing the helper exists to defend against.
+	acTokens["fence-key"] = "fence-value"
+	if _, leaked := entry.ACTokens["fence-key"]; leaked {
+		t.Error("entry.ACTokens shares the caller's map (lost maps.Clone defense — PR-2b would see post-publish mutations)")
+	}
+
+	if entry.KnockSrcIP != "203.0.113.7" {
+		t.Errorf("KnockSrcIP = %q, want %q", entry.KnockSrcIP, "203.0.113.7")
+	}
+	if entry.OpenTime != openTime {
+		t.Errorf("OpenTime = %d, want %d", entry.OpenTime, openTime)
+	}
+
+	// ExpireTime invariant: now + (OpenTime + 5)s. The check window
+	// is [before+OpenTime+5s, after+OpenTime+5s] — a couple of µs
+	// wide, deterministic across machines.
+	wantMin := before.Add(time.Duration(openTime+accessTokenLatePacketBufferSeconds) * time.Second)
+	wantMax := after.Add(time.Duration(openTime+accessTokenLatePacketBufferSeconds) * time.Second)
+	if entry.ExpireTime.Before(wantMin) || entry.ExpireTime.After(wantMax) {
+		t.Errorf("ExpireTime = %v, want in [%v, %v] (now + OpenTime + 5s late-packet buffer)",
+			entry.ExpireTime, wantMin, wantMax)
+	}
+
+	// RunID defaults to "" until PR-2c. A regression that makes
+	// RunID required at construction time fails here.
+	if entry.RunID != "" {
+		t.Errorf("RunID = %q, want \"\" (PR-2c wires this; PR-2a defaults empty)", entry.RunID)
+	}
+}
+
+// TestNewACKTokenEntry_ZeroOpenTime fences the boundary at
+// OpenTime=0 — the helper still produces a valid entry whose
+// ExpireTime is now + 5s (just the late-packet buffer). This is a
+// reachable shape today: udpserver/httpserver default openTime to
+// 60 only when the resource has none; nothing structurally prevents
+// a future caller from passing 0. The test pins the helper's
+// behavior so a future regression that special-cases OpenTime=0
+// (e.g., sets ExpireTime to "never") surfaces visibly.
+//
+// Also fences the nil-acTokens normalization: callers may pass nil
+// (e.g. before ackMsg.ACTokens is initialized) and the stored entry's
+// ACTokens map must be non-nil and empty. PR-2b's reader iterates
+// without a nil-guard; a future regression that re-introduces the
+// nil shape would surface as an index-on-nil panic in the validate
+// path instead of here.
+func TestNewACKTokenEntry_ZeroOpenTime(t *testing.T) {
+	knkMsg := &common.AgentKnockMsg{UserId: "u"}
+
+	before := time.Now()
+	entry := NewACKTokenEntry(knkMsg, "r", nil, "127.0.0.1", 0)
+	after := time.Now()
+
+	wantMin := before.Add(time.Duration(accessTokenLatePacketBufferSeconds) * time.Second)
+	wantMax := after.Add(time.Duration(accessTokenLatePacketBufferSeconds) * time.Second)
+	if entry.ExpireTime.Before(wantMin) || entry.ExpireTime.After(wantMax) {
+		t.Errorf("ExpireTime = %v, want in [%v, %v] (now + 5s buffer when OpenTime=0)",
+			entry.ExpireTime, wantMin, wantMax)
+	}
+
+	if entry.ACTokens == nil {
+		t.Error("entry.ACTokens is nil; helper must normalize nil acTokens input to an empty map so callers don't see nil-vs-empty")
+	}
+	if len(entry.ACTokens) != 0 {
+		t.Errorf("entry.ACTokens len = %d, want 0 (nil input must produce empty, not populated)", len(entry.ACTokens))
+	}
+}
+
+// TestPublishACKTokens_PersistsAfterWait fences the load-bearing
+// invariant Option A of PR-2a's concurrency fix introduced: the local
+// UDP/HTTP knock handlers must publish AC-issued tokens to tokenStore
+// AFTER acWg.Wait() returns, not from inside an AC goroutine. Before
+// the fix the publication happened while sibling goroutines for other
+// resources were still mutating ackMsg.ACTokens under artMsgsMutex, so
+// PR-2b's /nhp/internal/token/validate could race the writers.
+// NewACKTokenEntry's maps.Clone now also isolates stored entries from
+// any future post-publish mutation (defense in depth). Driving the
+// full handleNhpOpenResource / handleHttpOpenResource handlers from a
+// unit test requires real cipher state; this test fences the post-Wait
+// publication property directly on the helper instead.
+//
+// Specifically pins:
+//   - Every non-empty entry in ackMsg.ACTokens becomes a tokenStore
+//     entry resolvable via VerifyAccessToken.
+//   - Empty tokens are skipped (matches tokenStore.Store semantics
+//     and the artMsg.ACToken=="" defensive layer at the call sites).
+//   - The shared openTime (loop-invariant in both handlers) flows
+//     through to every entry's OpenTime.
+//   - The KnockSrcIP and User fields land identically on every entry
+//     for the same call (only ResourceId differs per entry).
+//
+// Deleting this test means the post-Wait publication contract is no
+// longer checked at unit level.
+func TestPublishACKTokens_PersistsAfterWait(t *testing.T) {
+	s := &UdpServer{
+		tokenStore: common.NewTokenStore[*ACTokenEntry](),
+	}
+
+	knkMsg := &common.AgentKnockMsg{
+		UserId:         "u-1",
+		DeviceId:       "d-1",
+		OrganizationId: "o-1",
+		AuthServiceId:  "asp-1",
+	}
+	ackMsg := &common.ServerKnockAckMsg{
+		ACTokens: map[string]string{
+			"resource-a": "ac-token-a",
+			"resource-b": "ac-token-b",
+			"resource-c": "", // empty must be skipped (e.g., AC suppressed via IssueACTokenIfSuccess)
+		},
+	}
+
+	s.PublishACKTokens(knkMsg, ackMsg, "203.0.113.42", 60)
+
+	entryA := s.VerifyAccessToken("ac-token-a")
+	if entryA == nil {
+		t.Fatal("PublishACKTokens did not persist ac-token-a; the post-Wait publication contract is broken")
+	}
+	if entryA.ResourceId != "resource-a" {
+		t.Errorf("entryA.ResourceId = %q, want %q", entryA.ResourceId, "resource-a")
+	}
+	if entryA.KnockSrcIP != "203.0.113.42" {
+		t.Errorf("entryA.KnockSrcIP = %q, want %q", entryA.KnockSrcIP, "203.0.113.42")
+	}
+	if entryA.OpenTime != 60 {
+		t.Errorf("entryA.OpenTime = %d, want %d", entryA.OpenTime, 60)
+	}
+	if entryA.User == nil || entryA.User.UserId != "u-1" {
+		t.Errorf("entryA.User = %+v, want UserId=u-1", entryA.User)
+	}
+
+	entryB := s.VerifyAccessToken("ac-token-b")
+	if entryB == nil {
+		t.Fatal("PublishACKTokens did not persist ac-token-b")
+	}
+	if entryB.ResourceId != "resource-b" {
+		t.Errorf("entryB.ResourceId = %q, want %q", entryB.ResourceId, "resource-b")
+	}
+
+	// Empty-token case: VerifyAccessToken on "" must return nil.
+	if got := s.VerifyAccessToken(""); got != nil {
+		t.Fatalf("PublishACKTokens persisted an empty-token entry; want skip, got %+v", got)
+	}
+
+	// Stored entries must be isolated from post-publish mutation of
+	// ackMsg.ACTokens. The helper-shape test fences the maps.Clone
+	// at the NewACKTokenEntry level; this confirms PublishACKTokens
+	// preserves the isolation through to tokenStore so PR-2b's
+	// reader can rely on the entry surviving any future mutation
+	// of the source ackMsg by the call sites.
+	ackMsg.ACTokens["fence"] = "post-publish-mutation"
+	if _, leaked := entryA.ACTokens["fence"]; leaked {
+		t.Error("entryA observed post-publish mutation of ackMsg.ACTokens (lost maps.Clone isolation)")
+	}
+	if _, leaked := entryB.ACTokens["fence"]; leaked {
+		t.Error("entryB observed post-publish mutation of ackMsg.ACTokens (lost maps.Clone isolation)")
+	}
+}
+
+// TestPublishACKTokens_PersistsEveryNonEmptyToken_AtFanInScale
+// fences the production shape of the local UDP/HTTP knock handlers:
+// many AC goroutines mutate ackMsg.ACTokens under artMsgsMutex in
+// parallel, the handler calls acWg.Wait(), then PublishACKTokens
+// runs once. The property under test is "every non-empty token gets
+// persisted"; the 32-resource fan-in is just the setup that exercises
+// it under realistic write contention.
+//
+// This is a positive fence on the safe shape, not a regression test
+// for the inverse: it will pass under -race even if a future
+// regression moves PublishACKTokens back inside the AC goroutine,
+// because that buggy interleaving is not constructed here. The
+// actual fence against the race is structural — PublishACKTokens is
+// called from a single goroutine after Wait() in three known sites,
+// covered by TestHandleNhpOpenResource_PublishACKTokens_RoundTrip
+// (UDP) and TestHandleHttpOpenResource_PublishACKTokens_RoundTrip
+// (HTTP), so a future PR that drops the call from either handler
+// will fail those tests.
+func TestPublishACKTokens_PersistsEveryNonEmptyToken_AtFanInScale(t *testing.T) {
+	s := &UdpServer{
+		tokenStore: common.NewTokenStore[*ACTokenEntry](),
+	}
+	knkMsg := &common.AgentKnockMsg{UserId: "u-multi"}
+	ackMsg := &common.ServerKnockAckMsg{
+		ACTokens: make(map[string]string),
+	}
+
+	const resourceCount = 32
+	resName := func(i int) string { return "r-" + strconv.Itoa(i) }
+	acTok := func(i int) string { return "ac-tok-" + strconv.Itoa(i) }
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex // mirrors artMsgsMutex's role in the production handlers
+	for i := 0; i < resourceCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mu.Lock()
+			ackMsg.ACTokens[resName(i)] = acTok(i)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	// All writers complete before publish runs — this is the production
+	// shape after Option A. PublishACKTokens iterates the map without
+	// holding mu because there are no concurrent writers.
+	s.PublishACKTokens(knkMsg, ackMsg, "198.51.100.1", 30)
+
+	for i := 0; i < resourceCount; i++ {
+		entry := s.VerifyAccessToken(acTok(i))
+		if entry == nil {
+			t.Fatalf("PublishACKTokens missed token for resource %d", i)
+		}
+		if entry.ResourceId != resName(i) {
+			t.Errorf("entry[%d].ResourceId = %q, want %q", i, entry.ResourceId, resName(i))
 		}
 	}
 }

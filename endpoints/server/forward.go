@@ -404,6 +404,12 @@ func (f *ServerForwarder) HandleForwardRequest(
 		if artMsg.PreAccessAction != nil {
 			ackMsg.PreAccessActions[knkMsg.ResourceId] = artMsg.PreAccessAction
 		}
+		// PR-2a: persist the AC-issued token so PR-2b's
+		// /nhp/internal/token/validate can resolve it. Route through
+		// PublishACKTokens so the empty-token guard, maps.Clone
+		// isolation, and the storeACToken chokepoint apply
+		// identically to the local UDP/HTTP knock paths.
+		f.deps.PublishACKTokens(knkMsg, ackMsg, srcAddr.Ip, int(openTime))
 	}
 
 	// Serialize ACK message

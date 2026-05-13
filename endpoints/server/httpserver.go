@@ -123,14 +123,25 @@ func (hs *HttpServer) Start(us *UdpServer, hc *HttpConfig) error {
 	// - With CloudFront: trust origin-facing CIDRs → extract real client IP
 	// - Without CloudFront: trust nobody → use RemoteAddr (NLB-preserved source IP)
 	// This also fixes a pre-existing issue: Gin v1.11 trusts ALL proxies by default,
-	// allowing X-Forwarded-For spoofing for NHP knocks.
+	// allowing X-Forwarded-For spoofing for NHP knocks. ctx.ClientIP() is
+	// the source of req.SrcIp on the HTTP knock path (see line ~672/704);
+	// req.SrcIp lands in ACTokenEntry.KnockSrcIP, which PR-2b's validate
+	// endpoint cross-checks against the FRP login source IP — if this
+	// configuration regresses, the cross-check becomes attacker-controlled
+	// on both sides. Fail loudly here rather than swallowing the error.
 	if validCIDRs := parseTrustedCIDRs(os.Getenv("NHP_TRUSTED_PROXY_CIDRS")); len(validCIDRs) > 0 {
 		if err := hs.ginEngine.SetTrustedProxies(validCIDRs); err != nil {
 			return fmt.Errorf("failed to set trusted proxies: %w", err)
 		}
 		log.Info("Trusted proxies configured with %d CIDRs (first: %s)", len(validCIDRs), validCIDRs[0])
 	} else {
-		_ = hs.ginEngine.SetTrustedProxies(nil)
+		// SetTrustedProxies(nil) returns nil today (gin v1.11), but
+		// don't rely on that — a future gin bump could change it, and
+		// trusting all proxies silently is the failure mode the whole
+		// block exists to prevent.
+		if err := hs.ginEngine.SetTrustedProxies(nil); err != nil {
+			return fmt.Errorf("failed to clear trusted proxies (no NHP_TRUSTED_PROXY_CIDRS set): %w", err)
+		}
 	}
 
 	// Internal service auth for /nhp/internal/*. Three modes:
@@ -1237,6 +1248,17 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 
 	knockHadNoAC := false
 
+	// openTime is loop-invariant — derived only from res.OpenTime and
+	// knkMsg.HeaderType, both fixed for this call. Hoisted out so the
+	// post-Wait PublishACKTokens call below has access to the same
+	// effective openTime without re-deriving it. See the UDP-knock
+	// twin in udpserver.go and knock_headertype_gate.go for the
+	// HeaderType-gate rationale (#1154).
+	openTime := res.OpenTime
+	if knkMsg.HeaderType == core.NHP_EXT {
+		openTime = 1 // timeout in 1 second
+	}
+
 	for resName, addrs := range acDstIpMap {
 		resInfo := res.Resources[resName]
 		if resInfo == nil {
@@ -1281,11 +1303,10 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 		go func(name string, info *common.ResourceInfo, dstAddrs []*common.NetAddress) {
 			defer acWg.Done()
 
-			openTime := res.OpenTime
-			if knkMsg.HeaderType == core.NHP_EXT {
-				openTime = 1 // timeout in 1 second
-			}
-			artMsg, err := s.processACOperationBroadcast(ctx, knkMsg, connsCopy, srcAddr, dstAddrs, openTime)
+			// resolveProcessACOperationBroadcast lets handler-site
+			// integration tests inject a fake AC response — see
+			// httpserver_publish_acktokens_test.go.
+			artMsg, err := s.resolveProcessACOperationBroadcast()(ctx, knkMsg, connsCopy, srcAddr, dstAddrs, openTime)
 			artMsgsMutex.Lock()
 			artMsgs[name] = artMsg
 			if err == nil {
@@ -1297,6 +1318,12 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 		}(resName, resInfo, addrs)
 	}
 	acWg.Wait()
+
+	// PR-2a: persist AC-issued tokens AFTER acWg.Wait so PR-2b's
+	// /nhp/internal/token/validate reader doesn't race the AC
+	// goroutines still mutating ackMsg.ACTokens. See PublishACKTokens
+	// for the contract.
+	s.PublishACKTokens(knkMsg, ackMsg, srcIp, int(openTime))
 
 	// Increment once per knock request (not per resource) for alarm accuracy
 	if knockHadNoAC {

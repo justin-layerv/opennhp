@@ -1,6 +1,8 @@
 package server
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 
@@ -95,5 +97,61 @@ func TestTrustedProxyConfiguration(t *testing.T) {
 				t.Errorf("trusted = %v, want %v", trusted, tt.wantTrusted)
 			}
 		})
+	}
+}
+
+// TestClientIP_IgnoresXForwardedFor_WhenNoTrustedProxies fences the
+// load-bearing security property of the SetTrustedProxies(nil) branch
+// in httpserver.go: when NHP_TRUSTED_PROXY_CIDRS is unset, an HTTP
+// knock with a hostile X-Forwarded-For header must NOT influence
+// ctx.ClientIP(). The returned ClientIP must be the TCP RemoteAddr.
+//
+// ctx.ClientIP() is the source of req.SrcIp on the HTTP knock path
+// (httpserver.go:~672 and ~704), which flows into
+// ACTokenEntry.KnockSrcIP. PR-2b's /nhp/internal/token/validate
+// cross-checks KnockSrcIP against the FRP login source IP. If gin's
+// default "trust all proxies" posture re-asserts here, an attacker
+// can spoof X-Forwarded-For: <accomplice_ip> on the knock and have
+// an accomplice at that IP make the FRP login — both sides of the
+// cross-check become attacker-chosen, hollowing the control.
+func TestClientIP_IgnoresXForwardedFor_WhenNoTrustedProxies(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	engine := gin.New()
+	if err := engine.SetTrustedProxies(nil); err != nil {
+		t.Fatalf("SetTrustedProxies(nil) returned unexpected error: %v", err)
+	}
+
+	var observed string
+	engine.GET("/probe", func(c *gin.Context) {
+		observed = c.ClientIP()
+		c.Status(http.StatusOK)
+	})
+
+	srv := httptest.NewServer(engine)
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/probe", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	// Hostile XFF header — the value an attacker would inject to claim
+	// an accomplice's IP on the knock.
+	req.Header.Set("X-Forwarded-For", "1.2.3.4")
+	req.Header.Set("X-Real-IP", "5.6.7.8") // belt-and-braces; gin also reads X-Real-IP
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+
+	// Loopback covers both v4 (127.0.0.1) and v6 (::1) — httptest may
+	// bind either depending on the host stack.
+	if observed != "127.0.0.1" && observed != "::1" {
+		t.Errorf("ClientIP = %q; want loopback (127.0.0.1 or ::1) — XFF or X-Real-IP leaked into ClientIP, SetTrustedProxies(nil) is not being honored", observed)
+	}
+	if observed == "1.2.3.4" || observed == "5.6.7.8" {
+		t.Errorf("ClientIP = %q; spoofed proxy header overrode RemoteAddr (this is the bug PR-2a's #2 closes)", observed)
 	}
 }

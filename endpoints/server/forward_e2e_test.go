@@ -778,6 +778,9 @@ func (d *e2eForwarderDeps) ProcessACOperationBroadcast(
 	return nil, nil
 }
 
+func (d *e2eForwarderDeps) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int) {
+}
+
 // ============================================================================
 // Helper functions
 // ============================================================================
@@ -992,6 +995,9 @@ func (d *capturingForwarderDeps) ProcessACOperationBroadcast(
 	return nil, nil
 }
 
+func (d *capturingForwarderDeps) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int) {
+}
+
 // captureEncryptedPacket creates an encrypted packet from sender to receiver
 // and captures the raw encrypted bytes (before sending over UDP).
 //
@@ -1062,6 +1068,8 @@ type mockACForwarderDeps struct {
 	mockACNode   *E2ETestNode
 	onSendResult func(*common.ServerForwardResultMsg)
 	t            *testing.T
+	tokensMu     sync.Mutex
+	storedTokens map[string]*ACTokenEntry
 }
 
 func (d *mockACForwarderDeps) GetHostname() string {
@@ -1215,6 +1223,41 @@ func (d *mockACForwarderDeps) ProcessACOperationBroadcast(
 		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime)
 	}
 	return nil, nil
+}
+
+func (d *mockACForwarderDeps) StoreACToken(token string, entry *ACTokenEntry) {
+	if token == "" {
+		return
+	}
+	d.tokensMu.Lock()
+	defer d.tokensMu.Unlock()
+	if d.storedTokens == nil {
+		d.storedTokens = make(map[string]*ACTokenEntry)
+	}
+	d.storedTokens[token] = entry
+}
+
+// GetStoredACToken returns the entry recorded for the given token, or nil
+// if none. Fences the PR-2a ACK-path store-on-issue invariant on the
+// forward receiver: TestE2E_HandleForwardRequest_FullACFlow asserts the
+// token the mock AC issued is persisted in the server tokenStore via
+// f.deps.PublishACKTokens (which delegates to StoreACToken).
+func (d *mockACForwarderDeps) GetStoredACToken(token string) *ACTokenEntry {
+	d.tokensMu.Lock()
+	defer d.tokensMu.Unlock()
+	return d.storedTokens[token]
+}
+
+// PublishACKTokens mirrors UdpServer.PublishACKTokens for the e2e
+// forward fence: every non-empty ackMsg.ACTokens entry flows through
+// StoreACToken with the maps.Clone snapshot from NewACKTokenEntry.
+func (d *mockACForwarderDeps) PublishACKTokens(knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int) {
+	for name, token := range ackMsg.ACTokens {
+		if token == "" {
+			continue
+		}
+		d.StoreACToken(token, NewACKTokenEntry(knkMsg, name, ackMsg.ACTokens, srcIp, openTime))
+	}
 }
 
 // TestE2E_HandleForwardRequest_FullACFlow tests the complete forwarding flow
@@ -1416,6 +1459,38 @@ func TestE2E_HandleForwardRequest_FullACFlow(t *testing.T) {
 		t.Fatal("Timeout: No NHP_FRT result received")
 	}
 
+	// ========================================================================
+	// Verify: PR-2a — the AC-issued token was persisted via f.deps.PublishACKTokens
+	// ========================================================================
+	// The mock AC's NHP_ART carried ACToken="test-ac-token-123". If
+	// forward.go ever stops routing through deps.PublishACKTokens, this
+	// assertion fails and PR-2b's /nhp/internal/token/validate would have
+	// no entry to resolve.
+	storedEntry := deps.GetStoredACToken("test-ac-token-123")
+	if storedEntry == nil {
+		t.Fatal("Expected AC token 'test-ac-token-123' to be stored via deps.PublishACKTokens after successful forward; got nil")
+	}
+	if storedEntry.User == nil || storedEntry.User.UserId != knockMsg.UserId {
+		t.Errorf("Stored entry User.UserId mismatch: got %+v, want UserId=%s", storedEntry.User, knockMsg.UserId)
+	}
+	if storedEntry.ResourceId != knockMsg.ResourceId {
+		t.Errorf("Stored entry ResourceId mismatch: got %s, want %s", storedEntry.ResourceId, knockMsg.ResourceId)
+	}
+	if storedEntry.ACTokens["test-resource-e2e"] != "test-ac-token-123" {
+		t.Errorf("Stored entry ACTokens[test-resource-e2e] mismatch: got %q, want %q",
+			storedEntry.ACTokens["test-resource-e2e"], "test-ac-token-123")
+	}
+	// KnockSrcIP is PR-2b's load-bearing field — the FRP login IP gets
+	// cross-checked against the IP that earned the pinhole. The forward
+	// path derives srcAddr.Ip from userAddr.IP.String(), parsed from
+	// fwdMsg.UserAddr ("192.168.1.100:12345"). A regression that drops
+	// the field on the forward path (or sources it from the wrong place)
+	// would silently nil-out PR-2b's security-critical assertion.
+	if storedEntry.KnockSrcIP != "192.168.1.100" {
+		t.Errorf("Stored entry KnockSrcIP mismatch: got %q, want %q (must come from fwdMsg.UserAddr's IP component)",
+			storedEntry.KnockSrcIP, "192.168.1.100")
+	}
+
 	t.Log("")
 	t.Log("============================================================")
 	t.Log("SUCCESS: Full E2E flow with mock AC completed!")
@@ -1427,6 +1502,7 @@ func TestE2E_HandleForwardRequest_FullACFlow(t *testing.T) {
 	t.Log("  ✓ AC received and processed operation")
 	t.Log("  ✓ AC sent NHP_ART response (real Noise encryption)")
 	t.Log("  ✓ Server processed response and sent NHP_FRT")
+	t.Log("  ✓ AC token persisted via deps.PublishACKTokens (PR-2a fence)")
 	t.Log("============================================================")
 }
 
@@ -1522,6 +1598,9 @@ func (d *errorACForwarderDeps) ProcessACOperationBroadcast(
 		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime)
 	}
 	return nil, nil
+}
+
+func (d *errorACForwarderDeps) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int) {
 }
 
 func TestE2E_HandleForwardRequest_ACReturnsError(t *testing.T) {
@@ -1706,6 +1785,9 @@ func (d *timeoutACForwarderDeps) ProcessACOperationBroadcast(
 		return d.ProcessACOperation(knkMsg, conns[0], srcAddr, dstAddrs, openTime)
 	}
 	return nil, nil
+}
+
+func (d *timeoutACForwarderDeps) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int) {
 }
 
 func TestE2E_HandleForwardRequest_ACTimeout(t *testing.T) {

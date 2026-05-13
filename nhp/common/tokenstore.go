@@ -48,6 +48,27 @@ func GenerateOpaqueToken() string {
 // 26 bytes.
 const tokenLogPrefixLen = 8
 
+// AccessTokenLatePacketBufferSeconds is the shared late-packet buffer
+// applied to AC-side AccessEntry retention and to server-side
+// ACK-path ACTokenEntry retention. Both the AC's iptables/ipset
+// pinhole and the server tokenStore must outlive the agent's open
+// window long enough for a delayed packet/validate request to
+// resolve while the AC would still accept the corresponding traffic.
+//
+// Single source of truth so the AC and server cannot drift: a future
+// edit that bumps one side without the other is caught by the
+// constant-pin tests in endpoints/ac/tokenstore_test.go and
+// endpoints/server/tokenstore_test.go, both of which assert against
+// this symbol. See endpoints/ac/tokenstore.go's GenerateAccessToken
+// and endpoints/server/tokenstore.go's NewACKTokenEntry for the two
+// call sites that consume it.
+//
+// Server-issued tokens (GenerateAccessToken on the server side) keep
+// strict OpenTime retention because the server is the issuer, not
+// the iptables/ipset enforcement point — the buffer asymmetry is
+// about packet-arrival timing, not about who's allowed to verify.
+const AccessTokenLatePacketBufferSeconds = 5
+
 // RedactToken returns a log-safe representation of an access token: the
 // first tokenLogPrefixLen characters followed by an ellipsis. Tokens of
 // length tokenLogPrefixLen or less are returned unchanged with no
