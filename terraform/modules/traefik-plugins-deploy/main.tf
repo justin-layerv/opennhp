@@ -529,11 +529,11 @@ resource "aws_ssm_document" "deploy" {
         description: "S3 bucket containing the plugin tarball"
       PluginName:
         type: String
-        default: "hqdatamiddleware"
-        description: "Plugin name used for S3 tarball key (e.g. hqdatamiddleware, qurl-router)"
+        default: "qurl-router"
+        description: "Plugin name used for S3 tarball key (e.g. qurl-router)"
       DeployPath:
         type: String
-        default: "/home/ubuntu/traefik/plugins-local/src/github.com/traefik/hqdatamiddleware"
+        default: "/home/ubuntu/traefik/plugins-local/src/github.com/traefik/qurl-router"
         description: "Path to deploy the plugin"
       BackupRetention:
         type: String
@@ -746,7 +746,7 @@ resource "aws_ssm_document" "rollback" {
     parameters:
       DeployPath:
         type: String
-        default: "/home/ubuntu/traefik/plugins-local/src/github.com/traefik/hqdatamiddleware"
+        default: "/home/ubuntu/traefik/plugins-local/src/github.com/traefik/qurl-router"
         description: "Path where the plugin is deployed"
     mainSteps:
       - action: aws:runShellScript

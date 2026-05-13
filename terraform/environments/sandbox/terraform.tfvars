@@ -86,17 +86,14 @@ server_plugins = ["passcode", "qurl"]
 # When traefik-plugins repo deploys, it updates the "latest" version in S3
 # AC instances will pick up the latest plugins on next boot/refresh
 #
-# Key naming convention:
-# - Short names (e.g., "hqdatamiddleware"): For plugins that don't require
-#   Traefik's moduleName-based path resolution
-# - Full module paths (e.g., "github.com/traefik/qurl-router"): For Traefik
-#   local plugins that require the key to match the moduleName in traefik.toml
-#   (plugins-local/src/{key}/ must exist)
+# Keys must match the moduleName in plugins-local/src/{key}/ for Traefik's
+# local plugin resolution. Today only qurl-router lives here; the older
+# hqdatamiddleware shipped to S3 but was never wired into any router's
+# middleware chain (refresh-bypass investigation, see qurl-service #514 and
+# traefik-plugins #146 for the supersession story). Removed in the same PR
+# as the plugin source deletion per the AC Plugin Source-of-Truth Invariant
+# in CLAUDE.md.
 traefik_plugins = {
-  hqdatamiddleware = {
-    version = "latest"
-    config  = {}
-  }
   "github.com/traefik/qurl-router" = {
     version = "latest"
     config  = {}
