@@ -53,6 +53,7 @@ Quick reference for the LayerV NHP (Network Hiding Protocol) infrastructure proj
 - `docs/TESTING.md` - Test categories, build tags, running tests
 - `docs/server_plugin.md` - Plugin development guide
 - `docs/UPSTREAM_SYNC.md` - Upstream sync tracking and process
+- `docs/design/SESSION_ENFORCEMENT_ARCHITECTURE.md` - Why session enforcement is server-side (qurl-router → qurl-service authz), what alternatives were rejected, when to revisit
 
 ## Project Structure
 
