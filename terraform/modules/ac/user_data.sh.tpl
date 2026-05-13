@@ -849,6 +849,14 @@ FilterMode = 0
 LicenseKey = "${license_key}"
 ServerEndpoint = "${server_endpoint}"
 ServerPubKeyBase64 = "$SERVER_PUBLIC_KEY"
+
+# Environment dim for AC publisher's CloudWatch metrics. Must match
+# the Environment value used by Region-keyed alarms in
+# terraform/modules/ac/monitoring.tf — otherwise NewACRegistration
+# falls back to "unknown" and every alarm sits in INSUFFICIENT_DATA /
+# breaching-on-missing forever (see Metric/Alarm Dim-Set Rules in
+# CLAUDE.md and the registration-stale alarm latched since 2026-04-24).
+Environment = "${environment}"
 CONFIGEOF
 # Scrub $PRIVATE_KEY now that it's landed in config.toml — it has no further
 # consumer in this script, and unsetting it prevents any future downstream

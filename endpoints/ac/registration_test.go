@@ -16,8 +16,25 @@ import (
 
 // mustNewACRegistration is a test helper that calls NewACRegistration and
 // fails the test if it returns an error.
+//
+// Defaults config.Environment to "test" when not set so this helper
+// doesn't emit the empty-Environment fallback warning on every test
+// run. Tests that deliberately exercise empty/whitespace Environment
+// behavior call NewACRegistration directly.
+//
+// Implementation note: UdpAC contains a sync.Mutex, so we can't
+// safely *copy* UdpAC (govet copylocks). Config has no Mutex, so we
+// shallow-copy *Config and reassign ac.config to the copy. The
+// caller's ac.config pointer is mutated, but the original *Config
+// struct underneath is preserved — a caller that holds an earlier
+// pointer to the Config sees the empty value it constructed.
 func mustNewACRegistration(t *testing.T, ac *UdpAC) *ACRegistration {
 	t.Helper()
+	if ac != nil && ac.config != nil && ac.config.Environment == "" {
+		cfg := *ac.config
+		cfg.Environment = "test"
+		ac.config = &cfg
+	}
 	reg, err := NewACRegistration(ac)
 	if err != nil {
 		t.Fatalf("NewACRegistration failed: %v", err)
@@ -182,6 +199,11 @@ func TestACRegistration_NewACRegistration_AcceptsAWSDefaultRegion(t *testing.T) 
 		config: &Config{
 			ACId:           "test-ac-default-region",
 			ServerEndpoint: "server.nhp.test.internal",
+			// Set Environment explicitly to suppress the empty-Env
+			// startup warning — this test calls NewACRegistration
+			// directly to assert it returns nil error, not via
+			// mustNewACRegistration (which would default-set it).
+			Environment: "test",
 		},
 	}
 
@@ -212,6 +234,194 @@ func TestResolveRegion_WhitespaceFallsThrough(t *testing.T) {
 	t.Setenv("AWS_DEFAULT_REGION", "us-west-2")
 	if got := resolveRegion(); got != "us-west-2" {
 		t.Errorf("resolveRegion() with whitespace AWS_REGION = %q, want us-west-2", got)
+	}
+}
+
+// TestResolveEnvironment fences the publisher Environment dim
+// fallback. Deployed envs must carry a real value (TF user_data
+// writes it into config.toml); local/dev with an empty config
+// falls back to "unknown" so the binary still starts.
+//
+// The whitespace cases fence the documented symmetry with
+// resolveRegion — a `Environment=" prod "` typo in a heredoc-
+// mangled config.toml must trim to "prod", and an all-whitespace
+// value must fall back. Without the trim, the publisher would
+// emit a whitespace-padded dim that mismatches the alarm's
+// Environment value just as surely as "unknown" does — the exact
+// failure mode this PR closes, one tab character down the rabbit
+// hole.
+func TestResolveEnvironment(t *testing.T) {
+	cases := []struct {
+		name         string
+		in           string
+		want         string
+		wantFallback bool
+	}{
+		{"empty", "", envFallbackUnknown, true},
+		{"deployed_value", "prod", "prod", false},
+		{"all_spaces", "   ", envFallbackUnknown, true},
+		{"tabs_and_newlines", "\t\n", envFallbackUnknown, true},
+		{"leading_trailing_spaces", " prod ", "prod", false},
+		{"leading_trailing_tabs", "\tprod\n", "prod", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, fallback := resolveEnvironment(c.in)
+			if got != c.want || fallback != c.wantFallback {
+				t.Errorf("resolveEnvironment(%q) = (%q, %v), want (%q, %v)", c.in, got, fallback, c.want, c.wantFallback)
+			}
+		})
+	}
+}
+
+// TestACRegistration_PublisherDimsCarryConfigEnvironment fences the
+// wiring between ac.config.Environment, resolveEnvironment, acBaseDims,
+// and the metrics Publisher. The component pieces are each tested in
+// isolation (TestResolveEnvironment, TestACBaseDims) — this test
+// catches a future refactor that drops the resolveEnvironment call
+// while leaving the helper intact, or that builds the Publisher with
+// the wrong dim slice. Without this fence, the original bug class
+// this PR closes (Environment=unknown reaching CloudWatch despite a
+// populated config) could regress silently.
+//
+// Two cases: the happy path (deployed env value survives the round
+// trip) and the fallback path (empty config produces envFallbackUnknown
+// in the published dim). The fallback case is the symmetric counterpart
+// — without it, a refactor that does e.g. `env := ac.config.Environment`
+// (dropping the resolveEnvironment call) would still pass the
+// happy-path assertion ("prod" survives the round trip) but
+// re-introduce the original bug on misconfigured envs.
+//
+// Must NOT call t.Parallel: t.Setenv panics in parallel tests.
+func TestACRegistration_PublisherDimsCarryConfigEnvironment(t *testing.T) {
+	cases := []struct {
+		name               string
+		configEnvironment  string
+		wantEnvironmentDim string
+	}{
+		{"deployed_env_survives_roundtrip", "prod", "prod"},
+		{"empty_config_falls_back_to_unknown", "", envFallbackUnknown},
+		{"whitespace_config_falls_back_to_unknown", "   ", envFallbackUnknown},
+		{"whitespace_padded_config_is_trimmed", " prod ", "prod"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// AWS_REGION is set only to satisfy the resolveRegion
+			// startup guard in NewACRegistration. The metrics
+			// Publisher constructed below does NO network IO at
+			// construction time (no CloudWatch API calls until
+			// the flush loop starts, which this test never triggers),
+			// so the test does not need real AWS credentials and
+			// shouldn't be flake-coupled to the SDK's config-file
+			// or env-credential lookup.
+			t.Setenv("AWS_REGION", "us-east-2")
+			t.Setenv("AWS_DEFAULT_REGION", "")
+
+			// Stub the warn so the empty/whitespace subtests don't
+			// emit real log output during the run. The warn-call-
+			// site itself is fenced by
+			// TestACRegistration_EnvFallbackWarnFires.
+			origWarn := envFallbackWarn
+			envFallbackWarn = func() {}
+			t.Cleanup(func() { envFallbackWarn = origWarn })
+
+			ac := &UdpAC{
+				config: &Config{
+					ACId:           "test-ac-wiring",
+					ServerEndpoint: "server.nhp.test.internal",
+					Environment:    c.configEnvironment,
+				},
+			}
+			// Call NewACRegistration directly, NOT
+			// mustNewACRegistration — the helper defaults
+			// Environment="test" when empty so other tests don't
+			// emit the startup warning, but this test's fallback
+			// subtests need the empty value to flow through.
+			reg, err := NewACRegistration(ac)
+			if err != nil {
+				t.Fatalf("NewACRegistration failed: %v", err)
+			}
+
+			dims := reg.metrics.DimensionsForTest(t)
+			got := make(map[string]string)
+			for _, d := range dims {
+				got[*d.Name] = *d.Value
+			}
+			// Cardinality fence: the alarm dim-set guarantee depends
+			// on the publisher emitting exactly these three dims and
+			// no more. A future refactor that adds a 4th dim (e.g.,
+			// Cell) here without updating monitoring.tf alarms would
+			// mismatch streams the same way Environment=unknown did.
+			if len(dims) != 3 {
+				t.Errorf("publisher dim count = %d, want 3 (got dims: %v)", len(dims), got)
+			}
+			if got["Environment"] != c.wantEnvironmentDim {
+				t.Errorf("publisher Environment dim = %q, want %q (got dims: %v)", got["Environment"], c.wantEnvironmentDim, got)
+			}
+			if got["Region"] != "us-east-2" {
+				t.Errorf("publisher Region dim = %q, want %q (got dims: %v)", got["Region"], "us-east-2", got)
+			}
+			if got["Component"] != "AC" {
+				t.Errorf("publisher Component dim = %q, want %q (got dims: %v)", got["Component"], "AC", got)
+			}
+		})
+	}
+}
+
+// TestACRegistration_EnvFallbackWarnFires fences the startup warning
+// emitted when ac.config.Environment is empty or whitespace-only.
+// The warning is the operator signal that a TF user_data regression
+// has reintroduced the original bug class; if a future refactor drops
+// the envFallbackWarn() call site (or moves it past the fallback
+// branch), CloudWatch would silently latch alarms again without any
+// AC-log breadcrumb.
+//
+// Asserts the warn fires on each fallback shape (empty, whitespace)
+// AND does NOT fire when Environment is populated, including the
+// literal "unknown" case (operator-explicit, not a fallback).
+//
+// Must NOT call t.Parallel: t.Setenv panics in parallel tests.
+func TestACRegistration_EnvFallbackWarnFires(t *testing.T) {
+	cases := []struct {
+		name              string
+		configEnvironment string
+		wantWarn          bool
+	}{
+		{"empty_fires_warn", "", true},
+		{"whitespace_fires_warn", "   ", true},
+		{"tab_newline_fires_warn", "\t\n", true},
+		{"populated_no_warn", "prod", false},
+		{"literal_unknown_no_warn", envFallbackUnknown, false},
+		{"trimmed_value_no_warn", " prod ", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("AWS_REGION", "us-east-2")
+
+			var calls int
+			origWarn := envFallbackWarn
+			envFallbackWarn = func() { calls++ }
+			t.Cleanup(func() { envFallbackWarn = origWarn })
+
+			ac := &UdpAC{
+				config: &Config{
+					ACId:           "test-ac-warn-fence",
+					ServerEndpoint: "server.nhp.test.internal",
+					Environment:    c.configEnvironment,
+				},
+			}
+			if _, err := NewACRegistration(ac); err != nil {
+				t.Fatalf("NewACRegistration: %v", err)
+			}
+
+			wantCalls := 0
+			if c.wantWarn {
+				wantCalls = 1
+			}
+			if calls != wantCalls {
+				t.Errorf("envFallbackWarn calls = %d, want %d for Environment=%q", calls, wantCalls, c.configEnvironment)
+			}
+		})
 	}
 }
 

@@ -575,6 +575,51 @@ func resolveRegion() string {
 	return strings.TrimSpace(os.Getenv("AWS_DEFAULT_REGION"))
 }
 
+// envFallbackUnknown is the dim value used when ac.config.Environment is
+// empty (or whitespace-only). Deployed envs must carry a real value
+// (TF user_data writes it); this fallback is for local/dev.
+const envFallbackUnknown = "unknown"
+
+// envFallbackWarn emits the startup warning when ac.config.Environment
+// is empty or whitespace-only. Indirected through a package var so
+// tests can fence the call site without setting up async-log
+// capture; production code in NewACRegistration always calls it
+// through this binding. Do not call directly from non-startup code.
+var envFallbackWarn = func() {
+	log.Warning("[AC] config.Environment is empty or whitespace-only (falling back to %q). Region-keyed alarms in monitoring.tf require this dim; in deployed envs this signals a TF user_data regression. See CLAUDE.md \"Metric / Alarm Dim-Set Rules\".", envFallbackUnknown)
+}
+
+// resolveEnvironment returns the publisher's Environment dim value
+// (trimmed) plus a flag indicating whether the fallback path was
+// taken. Empty or whitespace-only config falls back to "unknown" —
+// defensible for local/dev but a regression in deployed envs
+// (Region-keyed alarms in monitoring.tf select on this dim; "unknown"
+// or whitespace silently breaks every one). TrimSpace parallels
+// resolveRegion's defense against `Environment=" prod "` typos in a
+// heredoc-mangled config.toml that would otherwise pass the
+// empty-check and still produce a dim mismatch.
+//
+// Returning usedFallback lets callers warn-on-fallback without
+// re-trimming the input. Signature differs from resolveRegion
+// (which signals absent-config via an empty return); the parallel
+// is the TrimSpace + empty-or-whitespace fallback contract, not
+// the function shape.
+//
+// Why this is non-fatal where resolveRegion is fatal: AWS_REGION
+// is required for the SDK to construct a CloudWatch client at all
+// (no endpoint without a region), so the publisher cannot even
+// start. Environment is a dim label — the publisher CAN still
+// emit metrics with "unknown" (useful for local dev visibility),
+// they just won't match deployed-env alarms. The asymmetry is
+// intentional and load-bearing in dev/test workflows.
+func resolveEnvironment(configEnv string) (env string, usedFallback bool) {
+	trimmed := strings.TrimSpace(configEnv)
+	if trimmed == "" {
+		return envFallbackUnknown, true
+	}
+	return trimmed, false
+}
+
 // acBaseDims is the shared dim set every AC metric carries. Region is
 // load-bearing: alarms in terraform/modules/ac/monitoring.tf select streams
 // by exact dimension match, so dropping it would silently lose alerting.
@@ -597,9 +642,15 @@ func NewACRegistration(ac *UdpAC) (*ACRegistration, error) {
 		return nil, errors.New("AWS_REGION (or AWS_DEFAULT_REGION) must be set: required for CloudWatch metric publishing and Region-keyed alarms (e.g. AWS_REGION=us-east-2 or AWS_DEFAULT_REGION=us-east-2; see issue #1659)")
 	}
 
-	env := ac.config.Environment
-	if env == "" {
-		env = "unknown"
+	// Warn-loud at startup so a future TF regression that drops or
+	// whitespace-mangles the Environment field surfaces in AC logs
+	// instead of in CloudWatch alarm latch-up weeks later. An
+	// operator who deliberately configures "unknown" (defensible
+	// for a local-only dev box) does NOT trip the warning, because
+	// only the empty/whitespace path sets usedFallback=true.
+	env, usedFallback := resolveEnvironment(ac.config.Environment)
+	if usedFallback {
+		envFallbackWarn()
 	}
 
 	// Marshal ACOnlineMsg once — config is immutable after startup.

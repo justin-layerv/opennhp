@@ -4,6 +4,38 @@
 variable "environment" {
   description = "Environment name"
   type        = string
+
+  # Fail at plan time rather than silently emitting Environment=unknown
+  # (empty) or Environment=" prod " (leading/trailing whitespace from a
+  # heredoc-mangled tfvar) from the AC CloudWatch publisher
+  # (NewACRegistration's empty-or-whitespace-config fallback). Either
+  # would render as a malformed dim value in config.toml and produce
+  # the same alarm-mismatch failure mode this fence exists to close.
+  # The Go side has a TrimSpace defense too — defense-in-depth.
+  # See CLAUDE.md "Metric / Alarm Dim-Set Rules".
+  #
+  # The two validation blocks below have partially overlapping coverage
+  # (the regex alone would reject most of what the trim/length block
+  # catches). Split is intentional: each block emits a distinct
+  # operator-actionable message so a bad value surfaces "leading/
+  # trailing whitespace" vs "disallowed character" rather than a
+  # generic "format mismatch". Operator-friendliness, not strictly
+  # required for correctness.
+  #
+  # Format regex pins the value to alphanumerics + dash + underscore so
+  # the same value flows safely into resource names, SSM paths, metric
+  # dims, and the config.toml heredoc (TOML-special chars like " or \
+  # would otherwise break the heredoc). NOTE: #1924 will mirror this
+  # regex on the compute module so the same value flows through both
+  # publishers consistently.
+  validation {
+    condition     = length(trimspace(var.environment)) > 0 && var.environment == trimspace(var.environment)
+    error_message = "environment must be non-empty and free of leading/trailing whitespace; the value flows into config.toml, SSM paths, resource names, and CloudWatch metric dims, and whitespace breaks at least the alarm-dim match."
+  }
+  validation {
+    condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9_-]*$", var.environment))
+    error_message = "environment must match ^[A-Za-z0-9][A-Za-z0-9_-]*$ — value flows into AC config.toml, SSM paths, resource names, and CloudWatch dims; special characters would break at least one consumer."
+  }
 }
 
 variable "domain_name" {

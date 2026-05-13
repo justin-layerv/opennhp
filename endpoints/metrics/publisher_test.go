@@ -42,6 +42,41 @@ func TestPublisher_NilSafety(t *testing.T) {
 	mp.RegisterGaugeFunc("test", func() float64 { return 1 })
 	mp.SetHealthProbe(func(ctx context.Context) bool { return true })
 	mp.Stop()
+	if got := mp.DimensionsForTest(t); got != nil {
+		t.Errorf("DimensionsForTest(t) on nil receiver = %v, want nil", got)
+	}
+}
+
+// TestPublisher_DimensionsForTestDeepCopies fences the deep-copy
+// guarantee DimensionsForTest documents. types.Dimension holds
+// *string Name and Value; a shallow copy of the slice would share
+// those pointers and let a caller mutate *d.Name / *d.Value to
+// clobber the publisher's invariant. This test mutates the returned
+// slice and re-reads to confirm the publisher's view is untouched.
+//
+// Uses SetBaseDimsForTest rather than touching mp.dims directly so
+// the test mirrors how production-shaped helpers wire dims — keeps
+// the test structurally safe if newTestPublisher ever switches to
+// NewPublisher (which starts the flushLoop goroutine).
+func TestPublisher_DimensionsForTestDeepCopies(t *testing.T) {
+	mp := newTestPublisher(t, nil)
+	mp.SetBaseDimsForTest(t, []types.Dimension{
+		{Name: aws.String("Environment"), Value: aws.String("prod")},
+	})
+
+	got := mp.DimensionsForTest(t)
+	if len(got) != 1 || *got[0].Name != "Environment" || *got[0].Value != "prod" {
+		t.Fatalf("DimensionsForTest returned unexpected initial state: %+v", got)
+	}
+
+	*got[0].Value = "mutated-by-caller"
+	*got[0].Name = "AlsoMutated"
+
+	again := mp.DimensionsForTest(t)
+	if *again[0].Name != "Environment" || *again[0].Value != "prod" {
+		t.Errorf("DimensionsForTest shared pointee with caller; publisher state was mutated: Name=%q Value=%q",
+			*again[0].Name, *again[0].Value)
+	}
 }
 
 func TestPublisher_SetGauge(t *testing.T) {

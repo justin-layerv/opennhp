@@ -13,6 +13,7 @@ import (
 	"io"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 )
 
@@ -54,9 +55,54 @@ func NewPublisherForTestWithEMFBuffer(t testing.TB) (*Publisher, *bytes.Buffer) 
 // package tests can exercise EMF / counter emission with a realistic dim set
 // (Environment, Cell) instead of the empty default that NewPublisherForTest
 // returns. Must be called before the code under test emits.
+//
+// Holds mp.mu so a test that wires this against a Publisher constructed
+// via NewPublisher (which starts flushLoop) is race-detector-safe;
+// production write paths to mp.dims don't exist today but the lock
+// keeps the helper structurally safe against a future refactor that
+// makes mp.dims mutable.
 func (mp *Publisher) SetBaseDimsForTest(t testing.TB, dims []types.Dimension) {
 	t.Helper()
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
 	mp.dims = dims
+}
+
+// DimensionsForTest returns a deep copy of the publisher's shared base
+// dim set so external-package tests can fence the dims that were wired
+// up at construction (e.g., that ac.NewACRegistration → resolveEnvironment
+// flowed the right Environment value through into the Publisher). Deep
+// copy because types.Dimension holds *string pointers — a shallow copy
+// would share pointees and let a test caller mutate the publisher's
+// invariant.
+//
+// Test-only by signature (testing.TB parameter) — production code that
+// would import testing to call this has a bigger problem. Holds mp.mu
+// for symmetry with SetBaseDimsForTest, so a test that uses both
+// against a real-flushLoop Publisher is race-detector-safe.
+//
+// Fails the test (rather than panicking) if a dim has nil Name or
+// Value — production code paths always populate both via aws.String,
+// but a careless SetBaseDimsForTest caller passing types.Dimension{}
+// with bare fields would otherwise crash here.
+func (mp *Publisher) DimensionsForTest(t testing.TB) []types.Dimension {
+	t.Helper()
+	if mp == nil {
+		return nil
+	}
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	out := make([]types.Dimension, len(mp.dims))
+	for i, d := range mp.dims {
+		if d.Name == nil || d.Value == nil {
+			t.Fatalf("DimensionsForTest: dim[%d] has nil Name (%v) or Value (%v); production paths always populate both via aws.String — likely a SetBaseDimsForTest caller passed types.Dimension{}", i, d.Name, d.Value)
+		}
+		out[i] = types.Dimension{
+			Name:  aws.String(*d.Name),
+			Value: aws.String(*d.Value),
+		}
+	}
+	return out
 }
 
 // ParseEMFLinesForTest splits a newline-separated EMF stream (e.g., the

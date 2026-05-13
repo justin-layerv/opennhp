@@ -831,6 +831,7 @@ func TestConnectionTimeout_TriggersReregistration(t *testing.T) {
 		config: &Config{
 			ACId:           "test-ac-001",
 			ServerEndpoint: "server.nhp.test.internal",
+			Environment:    "test", // suppress empty-Env startup warning
 		},
 		remoteConnectionMap:   make(map[string]*UdpConn),
 		remoteConnectionMutex: sync.Mutex{},
@@ -927,6 +928,7 @@ func TestConnectionTimeout_NonServerConnection(t *testing.T) {
 		config: &Config{
 			ACId:           "test-ac-001",
 			ServerEndpoint: "server.nhp.test.internal",
+			Environment:    "test", // suppress empty-Env startup warning
 		},
 		remoteConnectionMap:   make(map[string]*UdpConn),
 		remoteConnectionMutex: sync.Mutex{},
