@@ -59,7 +59,7 @@ Quick reference for the LayerV NHP (Network Hiding Protocol) infrastructure proj
 ```
 nhp/                 # Core NHP protocol library (Go module)
 internalauth/        # Shared HMAC canonicalization (Go module — published path:
-                     # github.com/OpenNHP/opennhp/internalauth, consumed by
+                     # github.com/layervai/nhp/internalauth, consumed by
                      # nhp-server, qurl-service, qurl-reverse-tunnel-server)
 endpoints/           # Services: server, ac, agent, db (Go module)
 examples/            # Example plugins (Go module)

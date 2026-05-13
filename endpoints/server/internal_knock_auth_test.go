@@ -16,8 +16,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/OpenNHP/opennhp/internalauth"
 	"github.com/OpenNHP/opennhp/nhp/common"
+	"github.com/layervai/nhp/internalauth"
 )
 
 // Tests in this file fence the HMAC gate on /nhp/internal/knock.

@@ -145,6 +145,7 @@ formatters:
     goimports:
       local-prefixes:
         - github.com/OpenNHP/opennhp
+        - github.com/layervai/nhp
   exclusions:
     generated: lax
     paths:

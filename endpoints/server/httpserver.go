@@ -28,12 +28,12 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/OpenNHP/opennhp/endpoints/server/health"
-	"github.com/OpenNHP/opennhp/internalauth"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
 	"github.com/OpenNHP/opennhp/nhp/plugins"
 	"github.com/OpenNHP/opennhp/nhp/version"
+	"github.com/layervai/nhp/internalauth"
 )
 
 type HttpServer struct {

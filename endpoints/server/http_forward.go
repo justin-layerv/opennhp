@@ -14,9 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/OpenNHP/opennhp/internalauth"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/log"
+	"github.com/layervai/nhp/internalauth"
 )
 
 // maxForwardResponseSize bounds the outbound ACK read. Sibling of
