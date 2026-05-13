@@ -15,8 +15,8 @@ package smoke
 //     resource metadata
 //  3. Emits a knock to the AC (opening the client IP in ipset)
 //  4. Returns HTTP 302 with a Location pointing at r_{id}.qurl.site.*
-//     and sets nhp_token / nhp_refresh_token / nhp_session_ttl cookies
-//     scoped to the qurl.site parent domain
+//     and sets nhp_token / nhp_refresh_token cookies scoped to the
+//     qurl.site parent domain
 //
 // Every test in this file mints a fresh QURL via qurl-service's
 // public API (POST /v1/qurls with an Auth0 M2M bearer), exercises
@@ -44,7 +44,6 @@ import (
 const (
 	nhpTokenCookie        = "nhp_token"
 	nhpRefreshTokenCookie = "nhp_refresh_token"
-	nhpSessionTTLCookie   = "nhp_session_ttl"
 )
 
 // accessLinkInvalidMarker is the branded HTML page title returned
@@ -255,11 +254,10 @@ func TestResolve_ValidTokenReturns302ToQurlSite(t *testing.T) {
 }
 
 // TestResolve_CookiesHaveExpectedDomain fences the domain scoping
-// of the nhp_token / nhp_refresh_token / nhp_session_ttl cookies.
-// A cookie scoped to the wrong parent domain would silently fail
-// to propagate when the browser visits r_{id}.qurl.site.*, making
-// the resolve flow appear to work but authentication fail on the
-// next request.
+// of the nhp_token / nhp_refresh_token cookies. A cookie scoped to
+// the wrong parent domain would silently fail to propagate when
+// the browser visits r_{id}.qurl.site.*, making the resolve flow
+// appear to work but authentication fail on the next request.
 func TestResolve_CookiesHaveExpectedDomain(t *testing.T) {
 	ctx := context.Background()
 	resp := resolveWithRetries(ctx, t, func() *QURLResponse {
@@ -269,7 +267,6 @@ func TestResolve_CookiesHaveExpectedDomain(t *testing.T) {
 	expectedCookies := map[string]bool{
 		nhpTokenCookie:        false,
 		nhpRefreshTokenCookie: false,
-		nhpSessionTTLCookie:   false,
 	}
 	for _, c := range resp.Cookies() {
 		if _, want := expectedCookies[c.Name]; !want {

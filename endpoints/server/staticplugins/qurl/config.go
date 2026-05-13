@@ -24,9 +24,6 @@ const (
 const (
 	CookieNHPToken        = "nhp_token"
 	CookieNHPRefreshToken = "nhp_refresh_token"
-	// CookieNHPSessionTTL carries the session lifetime (seconds) so downstream
-	// middleware (hqdatamiddleware) can align its session_id cookie expiry.
-	CookieNHPSessionTTL = "nhp_session_ttl"
 )
 
 // ServiceTokenHeader is the HTTP header used to authenticate with the QURL API.

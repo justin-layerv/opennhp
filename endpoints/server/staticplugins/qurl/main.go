@@ -159,8 +159,8 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	ctx.Header(nhpserver.RequestIDHeader, requestID)
 
 	// SameSite=None for cross-origin cookies set later in this handler
-	// (nhp_token, nhp_refresh_token, nhp_session_ttl) — the qurl.link.*
-	// SPA needs them on a credentialed fetch to a different host.
+	// (nhp_token, nhp_refresh_token) — the qurl.link.* SPA needs them on
+	// a credentialed fetch to a different host.
 	//
 	// CORS headers are written by the engine-level corsMiddleware in
 	// httpserver.go, which runs before this handler and covers every
@@ -368,9 +368,6 @@ func AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, helper *plugin
 	}
 	ctx.SetCookie(CookieNHPToken, nhpToken, cookieMaxAge, "/", res.CookieDomain, true, true)
 	ctx.SetCookie(CookieNHPRefreshToken, refreshToken, cookieMaxAge, "/", res.CookieDomain, true, true)
-	// Communicate session TTL to downstream middleware (hqdatamiddleware) so it
-	// can align its session_id cookie expiry with the NHP cookie.
-	ctx.SetCookie(CookieNHPSessionTTL, strconv.Itoa(cookieMaxAge), cookieMaxAge, "/", res.CookieDomain, true, true)
 
 	// Negotiate response shape from the Accept header.
 	// Form-POST (legacy SPA) gets a 302; fetch() callers that want progressive
