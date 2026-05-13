@@ -104,3 +104,43 @@ output "spa_api_audience_ssm_arn" {
   description = "ARN of the SSM parameter containing the API audience"
   value       = var.enable_spa_dashboard ? aws_ssm_parameter.spa_api_audience[0].arn : null
 }
+
+# Slack OAuth outputs (qurl-bot-slack workspace-install client)
+output "slack_oauth_client_id" {
+  description = "Auth0 regular_web client ID for qurl-bot-slack workspace OAuth (null if not enabled)"
+  value       = var.enable_slack_oauth_client ? auth0_client.slack_oauth[0].client_id : null
+}
+
+output "slack_oauth_credentials_secret_arn" {
+  description = <<-EOT
+    ARN of the Secrets Manager secret holding {client_id, client_secret,
+    audience, domain} for the Slack OAuth client (null if not enabled).
+
+    **Not consumed cross-account.** Per the 2026-05-13 architectural
+    update in `SLACK_QURL_ROLLOUT.md`, qurl-bot-slack runs in a different
+    AWS account from this module (sandbox: 730883236711 vs 767397897469;
+    prod: TBD), and Justin's "in-account only — no cross-account
+    principals" rule (`modules/qurl-slack-ddb/main.tf:149` review on
+    qurl-integrations-infra #523) applies here too. The consumer
+    instead creates its OWN in-account secret in qurl-integrations-infra
+    (`qurl-bot-slack/<env>/auth0`, mirroring `qurl-bot-discord`'s
+    `var.auth0_secret_arn` pattern — see qurl-integrations-infra #565).
+
+    This secret is therefore a **producer-side TF-managed record**:
+    Terraform attempts to auto-write `auth0_client_credentials.slack_oauth.client_secret`
+    on apply (the value will be empty unless the management M2M holds
+    `read:client_keys` — same provider limitation as the existing 4
+    clients in this module, documented at L246-258). Operator manually
+    pastes the dashboard value into BOTH this secret AND
+    qurl-integrations-infra's local secret one time. ARN is exported
+    so the operator can resolve it via `terraform output -raw
+    slack_oauth_credentials_secret_arn` for the `aws secretsmanager
+    put-secret-value` step.
+  EOT
+  value       = var.enable_slack_oauth_client ? aws_secretsmanager_secret.slack_oauth[0].arn : null
+}
+
+output "slack_oauth_credentials_secret_name" {
+  description = "Name of the Secrets Manager secret holding Slack OAuth credentials (null if not enabled). Stable across recreates; safe for `data.aws_secretsmanager_secret` lookups in consumer stacks that don't have cross-stack `terraform_remote_state` wired up."
+  value       = var.enable_slack_oauth_client ? aws_secretsmanager_secret.slack_oauth[0].name : null
+}

@@ -1456,6 +1456,16 @@ variable "auth0_custom_domain" {
 }
 
 # ==============================================================================
+# Auth0 Slack OAuth Configuration
+# ==============================================================================
+
+variable "enable_auth0_slack_oauth_client" {
+  description = "Enable the Auth0 regular_web client for qurl-bot-slack workspace-install OAuth flow. The callback URL is derived in main.tf from `local.slack_bot_domain` (in `qurl_bot_dns.tf`) + the fixed `/oauth/qurl/callback` path — single source of truth, no env-level callback override."
+  type        = bool
+  default     = false
+}
+
+# ==============================================================================
 # Auth0 Social Connection Configuration
 # ==============================================================================
 # OAuth credentials for social login providers (Google, GitHub).

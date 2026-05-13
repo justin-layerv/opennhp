@@ -717,6 +717,143 @@ resource "auth0_client_grant" "spa_qurl_api" {
 }
 
 # ==============================================================================
+# Slack OAuth Regular-Web Application (per-workspace admin-install flow)
+# ==============================================================================
+# Auth0 regular_web client for the qurl-bot-slack workspace-OAuth handshake.
+# Workspace admin visits `https://slackbot.layerv.<xyz|ai>/oauth/qurl/start?team=…`,
+# authenticates against Auth0, and the bot's `/oauth/qurl/callback` exchanges
+# the authorization code for an id_token whose `sub` claim binds the workspace
+# to a QURL owner identity. Per-workspace `lv_live_*` API keys are minted
+# via qurl-service's `POST /v1/external-identity-bindings` and stored in the
+# Slack bot's `workspace_state` DDB table.
+#
+# Authorization-code flow (no PKCE — server-side handler holds the client
+# secret); no refresh tokens (key rotation is admin re-install, tracked as a
+# medium-priority follow-up in SLACK_QURL_ROLLOUT.md L551).
+
+resource "auth0_client" "slack_oauth" {
+  count       = var.enable_slack_oauth_client ? 1 : 0
+  name        = "qurl-bot-slack (${var.environment})"
+  description = "Regular-web client for the qurl-bot-slack workspace-install OAuth flow - ${var.environment}"
+  app_type    = "regular_web"
+
+  grant_types = ["authorization_code"]
+
+  callbacks = var.slack_oauth_callback_urls
+
+  # `allowed_logout_urls` + `web_origins` are intentionally omitted (vs.
+  # the SPA client at L673-674): this is a one-shot server-side admin-
+  # install handshake, not a long-lived browser session.
+  #   - Auth0's `/v2/logout?returnTo=...` is never invoked — after the
+  #     callback writes the workspace binding, the user lands on a
+  #     success page on the bot's own ALB, not Auth0.
+  #   - The token exchange happens server-to-Auth0 (the bot's callback
+  #     handler holds the client secret), so there's no browser CORS
+  #     into Auth0 to allowlist.
+  # A future contributor adding either by reflex from the SPA shape
+  # would be over-configuring; leave both unset.
+  jwt_configuration {
+    alg                 = "RS256"
+    lifetime_in_seconds = var.web_token_lifetime
+  }
+
+  oidc_conformant = true
+
+  # Note: the `length(var.slack_oauth_callback_urls) > 0` invariant is
+  # asserted by the variable-level `validation` block in `variables.tf:323-326`,
+  # which fires at every `terraform plan` (even when this resource isn't being
+  # planned). No need for a redundant `lifecycle.precondition` here.
+}
+
+resource "auth0_client_credentials" "slack_oauth" {
+  count                 = var.enable_slack_oauth_client ? 1 : 0
+  client_id             = auth0_client.slack_oauth[0].id
+  authentication_method = "client_secret_post"
+}
+
+# Conservative scopes for the admin-install flow. The callback handler
+# resolves the workspace binding through qurl-service's internal API
+# (token-authenticated via `QURL_INTERNAL_SERVICE_TOKEN`), so the admin's
+# Auth0 access_token itself doesn't need `qurl:admin` or `qurl:resolve`.
+# Narrow further once `POST /v1/external-identity-bindings` lands and
+# its scope contract is locked.
+resource "auth0_client_grant" "slack_oauth_qurl_api" {
+  depends_on = [auth0_resource_server_scopes.qurl_scopes]
+  count      = var.enable_slack_oauth_client ? 1 : 0
+  client_id  = auth0_client.slack_oauth[0].id
+  audience   = auth0_resource_server.qurl_api.identifier
+  scopes     = ["qurl:read", "qurl:write"]
+}
+
+# Mirrors the backend_service pattern at L274-309. Same Auth0 provider
+# limitation: if the management M2M lacks `read:client_keys`, the provider
+# returns an empty `client_secret` and the operator must one-time copy the
+# value from the Auth0 dashboard (Applications > qurl-bot-slack > Settings)
+# into this secret via `aws secretsmanager put-secret-value`. After that the
+# `ignore_changes = [secret_string]` lifecycle keeps subsequent applies
+# from overwriting it.
+resource "aws_secretsmanager_secret" "slack_oauth" {
+  count                   = var.enable_slack_oauth_client ? 1 : 0
+  name                    = "${var.name_prefix}-auth0-slack-oauth-credentials"
+  description             = "Auth0 regular_web credentials for qurl-bot-slack workspace OAuth (${var.environment})"
+  recovery_window_in_days = local.is_prod ? 30 : 0
+  kms_key_id              = var.secrets_kms_key_arn
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-auth0-slack-oauth-credentials"
+    Component = "auth0"
+    Purpose   = "slack-workspace-oauth"
+  })
+}
+
+resource "aws_secretsmanager_secret_version" "slack_oauth" {
+  count     = var.enable_slack_oauth_client ? 1 : 0
+  secret_id = aws_secretsmanager_secret.slack_oauth[0].id
+  secret_string = jsonencode({
+    client_id     = auth0_client.slack_oauth[0].client_id
+    client_secret = auth0_client_credentials.slack_oauth[0].client_secret
+    audience      = auth0_resource_server.qurl_api.identifier
+    domain        = var.auth0_custom_domain != null ? var.auth0_custom_domain : var.auth0_tenant_domain
+  })
+
+  lifecycle {
+    create_before_destroy = true
+    # Same Auth0 provider limitation as backend_service. Note this also
+    # freezes EVERY field in `secret_string` after first apply:
+    #   - `client_id` — stable per-client, freeze is fine.
+    #   - `client_secret` — the Auth0-provider-empty case is the whole
+    #     reason for the freeze; operator `put-secret-value` is the
+    #     escape hatch.
+    #   - `audience` — frozen against `var.api_audience` at first apply.
+    #     In practice this is stable because nothing in tfvars flips it,
+    #     not because the resource server is protected (`prevent_destroy`
+    #     on `auth0_resource_server.qurl_api` at L40-47 blocks deletion
+    #     but does NOT pin the `identifier` field). An intentional
+    #     audience migration would be a multi-step apply.
+    #   - `domain` — frozen against `auth0_custom_domain ?? tenant_domain`.
+    #     Tenant→custom-domain flips silently keep the tenant value;
+    #     same `put-secret-value` escape hatch.
+    # Acceptable for the qurl-bot-slack consumer — all four are effectively
+    # deploy-time constants once the tenant is provisioned.
+    ignore_changes = [secret_string]
+
+    # At least one of the two Auth0 domain inputs must be set, because
+    # `secret_string` below resolves `domain` to
+    # `var.auth0_custom_domain ?? var.auth0_tenant_domain`. Both default
+    # to `null` — a future env that flips `enable_slack_oauth_client`
+    # without wiring either input would land `"domain": null` in Secrets
+    # Manager, and the qurl-bot-slack consumer would crash at runtime
+    # building the `/authorize` URL. Co-located with the resource that
+    # actually reads those vars so a future refactor that decouples the
+    # client from the secret version doesn't silently lose the check.
+    precondition {
+      condition     = var.auth0_custom_domain != null || var.auth0_tenant_domain != null
+      error_message = "At least one of auth0_custom_domain or auth0_tenant_domain must be set when enable_slack_oauth_client is true (used as the `domain` field in the Slack OAuth Secrets Manager secret, consumed by qurl-bot-slack to build the Auth0 /authorize URL)."
+    }
+  }
+}
+
+# ==============================================================================
 # Social Connections (Google + GitHub)
 # ==============================================================================
 # These connections enable social login for the SPA dashboard.

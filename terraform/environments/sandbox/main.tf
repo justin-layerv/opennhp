@@ -464,6 +464,14 @@ module "auth0" {
   # Dedicated smoke test M2M client (system tier)
   enable_smoke_test_client = true
 
+  # Slack OAuth regular_web client for qurl-bot-slack workspace-install flow.
+  # Callback URL is derived from `local.slack_bot_domain` (qurl_bot_dns.tf:36) +
+  # the qurl-bot-slack handler's fixed `/oauth/qurl/callback` path. Single source
+  # of truth for the bot's hostname; changes to the DNS local propagate here
+  # without an extra tfvars edit.
+  enable_slack_oauth_client = var.enable_auth0_slack_oauth_client
+  slack_oauth_callback_urls = ["https://${local.slack_bot_domain}/oauth/qurl/callback"]
+
   # Email (SES)
   email_from_address = "LayerV <noreply@layerv.xyz>"
   email_ses_region   = "us-east-2"

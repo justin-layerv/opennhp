@@ -506,6 +506,15 @@ auth0_spa_web_origins = [
   "http://localhost:3000",
 ]
 
+# ==============================================================================
+# Auth0 Slack OAuth Configuration
+# qurl-bot-slack workspace-install handshake (per SLACK_QURL_ROLLOUT.md Wave 1).
+# Callback URL is derived in `main.tf` from `local.slack_bot_domain`
+# (`qurl_bot_dns.tf:36`) + the fixed `/oauth/qurl/callback` path — single
+# source of truth, no callback override at the env level.
+# ==============================================================================
+enable_auth0_slack_oauth_client = true
+
 # Social connections (Google + GitHub) for developer login
 # OAuth credentials are passed via TF_VAR_* environment variables
 # Store in GitHub Secrets: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET,

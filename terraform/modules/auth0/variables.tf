@@ -280,6 +280,53 @@ variable "spa_web_origins" {
 }
 
 # ==============================================================================
+# Slack OAuth (qurl-bot-slack workspace-install) Configuration
+# ==============================================================================
+
+variable "enable_slack_oauth_client" {
+  description = <<-EOT
+    Create the Auth0 regular_web client used by qurl-bot-slack for the
+    workspace-install OAuth handshake. Sandbox enables this once
+    `slackbot.layerv.xyz` is in DNS; prod enables it once the prod-account
+    DNS for the Slack bot lands.
+
+    WARNING — one-way switch in prod. Flipping `true` → `false` destroys
+    `auth0_client.slack_oauth` (the `count` gate evaluates to 0), which
+    invalidates every live workspace binding — affected workspaces would
+    need to re-install via `/oauth/qurl/start`. `prevent_destroy` is
+    deliberately omitted here because it interacts badly with `count`
+    toggles; the operator-level mitigation is to treat this var as
+    append-only in prod.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "slack_oauth_callback_urls" {
+  description = <<-EOT
+    Allowed callback URLs for the Slack OAuth regular_web client (Auth0
+    redirect after admin login). Typically a single entry per environment:
+      - sandbox: `https://slackbot.layerv.xyz/oauth/qurl/callback`
+      - prod:    `https://slackbot.layerv.ai/oauth/qurl/callback` (once prod DNS lands)
+    The path suffix `/oauth/qurl/callback` is fixed by the qurl-bot-slack
+    handler; the host is fixed by per-env DNS. Callers should derive this
+    from their env's bot-domain local rather than duplicating the literal.
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for url in var.slack_oauth_callback_urls : can(regex("^https://", url))])
+    error_message = "All slack_oauth_callback_urls must use HTTPS — Slack-flow callbacks never run on http://localhost (the regular_web client is exercised through the public ALB on `slackbot.layerv.<tld>`, never directly)."
+  }
+
+  validation {
+    condition     = !var.enable_slack_oauth_client || length(var.slack_oauth_callback_urls) > 0
+    error_message = "slack_oauth_callback_urls must not be empty when enable_slack_oauth_client is true"
+  }
+}
+
+# ==============================================================================
 # Social Connection Configuration (Google + GitHub)
 # ==============================================================================
 
