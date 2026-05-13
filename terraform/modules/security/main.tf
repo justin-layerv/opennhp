@@ -295,6 +295,8 @@ resource "aws_cloudwatch_event_rule" "guardduty_findings" {
     source      = ["aws.guardduty"]
     detail-type = ["GuardDuty Finding"]
     detail = {
+      # Threshold is integer-enforced (variables.tf floor() validation)
+      # for parity with the stale-finding watchdog Lambda's SDK contract.
       severity = [{
         numeric = [">=", var.guardduty_alert_severity_threshold]
       }]

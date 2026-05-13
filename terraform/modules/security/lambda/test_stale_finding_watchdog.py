@@ -2,7 +2,10 @@
 Tests for the GuardDuty stale-finding watchdog Lambda (#1137).
 
 Run with: python3 -m unittest discover -s terraform/modules/security/lambda -p "test_*.py" -v
-No external dependencies - stdlib unittest.mock drives boto3.
+Dependencies: stdlib unittest.mock drives boto3 for most tests;
+test_severity_gte_satisfies_guardduty_sdk_schema imports botocore
+directly to run ParamValidator against the real GuardDuty service
+model (botocore is a transitive dep of boto3).
 """
 
 import json
@@ -11,6 +14,9 @@ import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
+
+import botocore.session
+import botocore.validate
 
 os.environ.update({
     'ENVIRONMENT': 'test',
@@ -61,12 +67,9 @@ def _paginator_for(pages):
 
 
 class WatchdogTestCase(unittest.TestCase):
-    """setUp wires a fresh per-region GD client factory plus fresh ec2/
-    sns/cw mocks, then resets the module's published-ARN globals to
-    their post-import values. Any mutation inside a test dies at
-    tearDown, so a raised exception in one test can't poison a later
-    one — the test-state-leakage concern called out in cr round 2.
-    """
+    """Wires fresh per-region GD client factory and ec2/sns/cw mocks
+    per test, resetting module-level state in tearDown so a raised
+    exception in one test can't poison a later one."""
 
     def setUp(self):
         self.ec2 = MagicMock(name='ec2')
@@ -153,18 +156,13 @@ class TestHandler(WatchdogTestCase):
         self.gd_for('us-east-2').get_findings.assert_not_called()
 
     def test_find_criteria_is_load_bearing(self):
-        # All three criteria are load-bearing for keeping the common
-        # case cheap — drop any one and the Lambda fans out to
-        # get_findings on every non-archived detection in the account.
+        # Drop any criterion and the Lambda fans out to get_findings
+        # on every non-archived detection in the account.
         watchdog.handler({}, None)
         paginate_kwargs = self.gd_for('us-east-2').get_paginator.return_value.paginate.call_args.kwargs
         criterion = paginate_kwargs['FindingCriteria']['Criterion']
         self.assertEqual(criterion['service.archived'], {'Eq': ['false']})
-        # Float-preserving: decimal thresholds like 4.5 must flow
-        # through unchanged so the watchdog filter stays in lockstep
-        # with the EventBridge rule's numeric comparator. See
-        # stale_finding_watchdog.py `'severity': {'Gte': ...}`.
-        self.assertEqual(criterion['severity'], {'Gte': 4.0})
+        self.assertEqual(criterion['severity'], {'Gte': watchdog.SEVERITY_THRESHOLD})
         self.assertIn('updatedAt', criterion)
         self.assertIn('Lte', criterion['updatedAt'])
         self.assertIsInstance(criterion['updatedAt']['Lte'], int)
@@ -378,14 +376,77 @@ class TestHandler(WatchdogTestCase):
         self.sns.publish.assert_not_called()
         self.cw.put_metric_data.assert_called_once()
 
-    def test_decimal_severity_threshold_flows_through(self):
-        # Decimal thresholds like 4.5 must not truncate to int — that
-        # would let severity-4 findings into watchdog alerts without
-        # having tripped the EventBridge initial alert (>= 4.5).
-        with patch.object(watchdog, 'SEVERITY_THRESHOLD', 4.5):
-            watchdog.handler({}, None)
+    def test_severity_gte_satisfies_guardduty_sdk_schema(self):
+        # Closes the "mock past the SDK" gap: prior tests mocked
+        # the paginator, so the real schema never ran.
+        session = botocore.session.Session()
+        op = session.get_service_model('guardduty').operation_model('ListFindings')
+        validator = botocore.validate.ParamValidator()
+        params = {
+            'DetectorId': 'det-1',
+            'FindingCriteria': {
+                'Criterion': {
+                    'service.archived': {'Eq': ['false']},
+                    'severity': {'Gte': watchdog.SEVERITY_THRESHOLD},
+                    'updatedAt': {'Lte': 1000},
+                },
+            },
+            'SortCriteria': {'AttributeName': 'updatedAt', 'OrderBy': 'ASC'},
+        }
+        errors = validator.validate(params, op.input_shape)
+        if errors.has_errors():
+            self.fail('botocore rejected watchdog params: ' + errors.generate_report())
+
+        # Fail-loud canary: a future SDK relaxation makes the int
+        # coercion + TF validation less load-bearing.
+        params['FindingCriteria']['Criterion']['severity']['Gte'] = 4.0
+        errors_float = validator.validate(params, op.input_shape)
+        self.assertTrue(errors_float.has_errors(),
+                        f'botocore {botocore.__version__} now accepts float for '
+                        'severity.Gte — re-evaluate the int coercion + TF validation')
+
+    def test_parse_severity_threshold_coerces_env_strings(self):
+        self.assertEqual(watchdog._parse_severity_threshold("4"), 4)
+        self.assertEqual(watchdog._parse_severity_threshold("4.0"), 4)
+        self.assertIsInstance(watchdog._parse_severity_threshold("4"), int)
+        self.assertIsInstance(watchdog._parse_severity_threshold("4.0"), int)
+
+    def test_parse_severity_threshold_fails_loud_on_non_numeric(self):
+        with self.assertRaises(ValueError):
+            watchdog._parse_severity_threshold("abc")
+        with self.assertRaises(ValueError):
+            watchdog._parse_severity_threshold("")
+        # NaN raises ValueError at int(), inf raises OverflowError.
+        with self.assertRaises(ValueError):
+            watchdog._parse_severity_threshold("NaN")
+        with self.assertRaises(OverflowError):
+            watchdog._parse_severity_threshold("inf")
+
+    def test_parse_severity_threshold_truncates_fractional_as_fail_safe(self):
+        self.assertEqual(watchdog._parse_severity_threshold("4.5"), 4)
+        self.assertEqual(watchdog._parse_severity_threshold("7.9"), 7)
+
+    def test_parse_severity_threshold_warns_on_truncation(self):
+        with self.assertLogs(watchdog.logger, level='WARNING') as cm:
+            watchdog._parse_severity_threshold("4.5")
+        self.assertTrue(
+            any('truncated' in msg.lower() for msg in cm.output),
+            f'expected truncation WARNING in log output, got: {cm.output}',
+        )
+        # Split per-input so a regression warning on only one shape is debuggable.
+        with self.assertNoLogs(watchdog.logger, level='WARNING'):
+            watchdog._parse_severity_threshold("4")
+        with self.assertNoLogs(watchdog.logger, level='WARNING'):
+            watchdog._parse_severity_threshold("4.0")
+
+    def test_severity_threshold_sent_as_int(self):
+        # Fences the SDK contract on the paginator-call shape that
+        # the prior float-passthrough test mocked past.
+        watchdog.handler({}, None)
         paginate_kwargs = self.gd_for('us-east-2').get_paginator.return_value.paginate.call_args.kwargs
-        self.assertEqual(paginate_kwargs['FindingCriteria']['Criterion']['severity'], {'Gte': 4.5})
+        gte = paginate_kwargs['FindingCriteria']['Criterion']['severity']['Gte']
+        self.assertEqual(gte, watchdog.SEVERITY_THRESHOLD)
+        self.assertIsInstance(gte, int)
 
     def test_get_findings_batches_above_50(self):
         ids = [f'f{i}' for i in range(75)]

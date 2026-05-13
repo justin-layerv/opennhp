@@ -137,13 +137,18 @@ variable "guardduty_alert_emails" {
 }
 
 variable "guardduty_alert_severity_threshold" {
-  description = "Minimum severity for GuardDuty alerts (1-8, where 7+ is High, 4-6.9 is Medium). Shared with the stale-finding watchdog (#1137) — raising this silences the initial alert AND the re-alert, so tune with both in mind."
+  description = "Minimum severity for GuardDuty alerts (1-8 integer; AWS bands: HIGH 7.0+, MEDIUM 4.0-6.9, LOW 1.0-3.9). Integer-only because the stale-finding watchdog Lambda (#1137) calls GuardDuty ListFindings, which rejects float for severity.Gte. Shared with the EventBridge initial-alert rule; raising silences both."
   type        = number
-  default     = 4 # Medium and above
+  default     = 4
 
   validation {
     condition     = var.guardduty_alert_severity_threshold >= 1 && var.guardduty_alert_severity_threshold <= 8
     error_message = "GuardDuty severity threshold must be between 1 and 8."
+  }
+
+  validation {
+    condition     = floor(var.guardduty_alert_severity_threshold) == var.guardduty_alert_severity_threshold
+    error_message = "GuardDuty severity threshold must be an integer; fractional values would silently truncate in the watchdog Lambda, causing it to re-alert on findings that never tripped the initial EventBridge alert."
   }
 }
 

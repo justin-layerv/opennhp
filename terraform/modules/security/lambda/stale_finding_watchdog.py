@@ -23,10 +23,30 @@ import boto3
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+
+def _parse_severity_threshold(raw: str) -> int:
+    """Coerce env-var string to int for GuardDuty ListFindings.
+
+    botocore rejects float for severity.Gte. int(float(raw)) (not
+    bare int) tolerates a "4.0"-style env var; fractional input
+    is fail-safe (TF floor() validation is the real fence).
+    """
+    parsed = float(raw)
+    coerced = int(parsed)
+    if coerced != parsed:
+        logger.warning(
+            "SEVERITY_THRESHOLD=%r truncated to %d at module load; "
+            "TF floor()-validation should have rejected this at plan time.",
+            raw,
+            coerced,
+        )
+    return coerced
+
+
 ENVIRONMENT = os.environ['ENVIRONMENT']
 ALERTS_SNS_TOPIC_ARN = os.environ.get('ALERTS_SNS_TOPIC_ARN', '')
 EMAIL_SNS_TOPIC_ARN = os.environ.get('EMAIL_SNS_TOPIC_ARN', '')
-SEVERITY_THRESHOLD = float(os.environ['SEVERITY_THRESHOLD'])
+SEVERITY_THRESHOLD = _parse_severity_threshold(os.environ['SEVERITY_THRESHOLD'])
 STALE_AGE_DAYS = int(os.environ['STALE_AGE_DAYS'])
 
 # get_findings caps at 50 IDs per call per the AWS API contract.
@@ -168,12 +188,7 @@ def _find_stale_findings(gd, detector_id, region, cutoff):
         FindingCriteria={
             'Criterion': {
                 'service.archived': {'Eq': ['false']},
-                # Float-preserving: decimal thresholds like 4.5 must
-                # flow through unchanged so the watchdog filter matches
-                # the EventBridge initial-alert rule (which compares as
-                # numeric). Truncating to int here would let severity-4
-                # findings sneak into watchdog alerts without having
-                # tripped the initial alert.
+                # botocore rejects float for severity.Gte.
                 'severity': {'Gte': SEVERITY_THRESHOLD},
                 'updatedAt': {'Lte': cutoff_millis},
             },
