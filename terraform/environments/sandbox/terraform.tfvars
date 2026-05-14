@@ -247,6 +247,13 @@ qurl_cors_allowed_origins = "https://qurl.link.layerv.xyz,https://*.qurl.site.la
 # Add custom domains here if needed
 qurl_additional_allowed_hosts = []
 
+# Connector dashboard separation (qurl-service PR #539). Hides resources
+# whose target_url points at the fileviewer from dashboard list/detail
+# responses and webhook events — the LayerV account that installed the
+# Discord/S3 connector cannot see file contents their guild members
+# upload. Empty list keeps the filter disabled.
+qurl_fileviewer_hostnames = ["fileviewer.layerv.xyz"]
+
 # Container sizing
 # Note: When grafana_cloud_enabled=true, ADOT sidecar requires min 512 CPU and adds 256MB memory.
 # Effective values: CPU=max(container_cpu, 512), Memory=container_memory+256

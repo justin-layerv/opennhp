@@ -307,6 +307,15 @@ locals {
       { name = "QURL_FRPS_DOMAIN", value = var.frps_domain },
       { name = "QURL_FRPS_PORT", value = tostring(var.frps_port) },
     ] : [],
+    # Connector dashboard separation (qurl-service PR #539). Activates the
+    # in-band filter that hides connector-owned resources from dashboard
+    # list/detail responses and suppresses their webhook events. Empty
+    # list keeps qurl-service in the disabled fast-path. Phase 2 of the
+    # connector plan replaces this hostname-based gate with an
+    # installation_id check; this env var becomes a no-op then.
+    length(var.fileviewer_hostnames) > 0 ? [
+      { name = "QURL_FILEVIEWER_HOSTNAMES", value = join(",", var.fileviewer_hostnames) },
+    ] : [],
     # GeoIP configuration (for geo-restriction policies)
     var.geoip_enabled ? concat([
       { name = "GEOIP_ENABLED", value = "true" },

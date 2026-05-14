@@ -2161,6 +2161,12 @@ variable "qurl_fileviewer_eip" {
   }
 }
 
+variable "qurl_fileviewer_hostnames" {
+  description = "Hostnames whose resources are owned by a connector and must be hidden from the qurl-service dashboard list/detail responses and webhook events. Threaded into the qurl-service module as the QURL_FILEVIEWER_HOSTNAMES env var. Empty (default) keeps the filter disabled — qurl-service falls through its no-op fast path. Each entry must be a bare FQDN; module-level validation enforces the shape."
+  type        = list(string)
+  default     = []
+}
+
 # `ecr_replication_check_lookback_hours` — see comment block above
 # `variable` declaration for tuning guidance / cost & timeout coupling
 # notes. Kept inline so the durable rationale lives next to the variable

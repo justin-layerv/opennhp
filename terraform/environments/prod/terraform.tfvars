@@ -463,6 +463,15 @@ qurl_s3_connector_eip        = "3.132.101.16"
 qurl_fileviewer_domain       = "fileviewer.layerv.ai"
 qurl_fileviewer_eip          = "3.13.11.40"
 
+# Connector dashboard separation (qurl-service PR #539). Hides resources
+# whose target_url points at the fileviewer from dashboard list/detail
+# responses and webhook events — the LayerV account that installed the
+# Discord/S3 connector cannot see file contents their guild members
+# upload. Empty list keeps the filter disabled. Decoupled from
+# qurl_fileviewer_domain (above) — that one drives the cross-account
+# A record; this one drives qurl-service's deny filter.
+qurl_fileviewer_hostnames = ["fileviewer.layerv.ai"]
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"
