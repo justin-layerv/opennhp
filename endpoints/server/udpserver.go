@@ -191,6 +191,14 @@ type UdpServer struct {
 		stop chan struct{}
 	}
 
+	// lifecycleCtx is canceled by Stop() so in-flight, async work
+	// dispatched off the receive path (DDB Query inside
+	// resolveAgentPeerForKnock today) abandons promptly on shutdown
+	// rather than waiting out its per-call timeout. Initialized in
+	// Start(), canceled in Stop() alongside close(signals.stop).
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
+
 	recvMsgCh <-chan *core.PacketParserData
 	sendMsgCh chan *core.MsgData
 
@@ -271,6 +279,24 @@ type UdpServer struct {
 		dstAddrs []*common.NetAddress,
 		openTime uint32,
 	) (*common.ACOpsResultMsg, error)
+
+	// agentPeerLookup resolves a knock's RemotePubKey to a registered
+	// agent peer via the qurl-agent-keys DDB table with a 60s LRU.
+	// Populated only in cloud mode when AgentKeysTable is configured;
+	// nil = legacy etcd / file-config agent path.
+	//
+	// Concurrency: written once in Start before any UDP packet
+	// dispatch (between storage init and the listener boot), read
+	// lock-free from resolveAgentPeerForKnock's hot path and from
+	// computeEffectiveDisableAgentValidation (called by both Start
+	// and the hot-reload watcher path). Same single-write-then-read
+	// posture as knockHeaderTypeVerifyRequire / licensePubkeyVerify-
+	// Require / sibling read-once gates above. A future refactor
+	// that mutates this after Start MUST promote to atomic.Pointer
+	// or protect behind a mutex; a bare write against a concurrent
+	// read would be a Go memory-model violation even if it happens
+	// to work on most architectures.
+	agentPeerLookup *AgentPeerLookup
 }
 
 // resolveProcessACOperationBroadcast returns the function the local
@@ -471,6 +497,12 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 
 	// Initialize pluggable storage backend (DynamoDB or etcd)
 	// See docs/design/PLUGGABLE_STORAGE_BACKEND.md for architecture details.
+	//
+	// agentLookupInitFailed is captured here and emitted to
+	// MetricAgentLookupInitFailure AFTER the metrics publisher is
+	// constructed below — s.metrics is nil at this point in Start(),
+	// so any direct IncrCounter here is a silent no-op.
+	agentLookupInitFailed := false
 	s.storageConfig, err = s.loadStorageConfig()
 	if err != nil {
 		log.Warning("Failed to load storage config, storage backend disabled: %v", err)
@@ -485,6 +517,34 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 			// Continue without storage - fall back to etcd/local config
 		} else {
 			log.Info("Storage backend initialized: %s", s.storage.Name())
+		}
+
+		// Agent peer lookup: nil when AgentKeysTable is unset or
+		// the backend isn't DynamoDB (legacy etcd / file-config
+		// path stays in effect). AC peers remain on etcd — tracked
+		// as a follow-up.
+		//
+		// A real init failure (vs. "disabled by config") in cloud
+		// mode is silent at the responder layer — the responder
+		// pre-validates against the empty agentPeerMap and rejects
+		// every agent knock, with NO MetricAgentLookupDDBError to
+		// page on (the lookup never ran). Promote to Error and
+		// emit MetricAgentLookupInitFailure (deferred to after the
+		// metrics publisher is constructed; see flag above) so the
+		// failure surfaces in alarms instead of disappearing into
+		// the noise. We do NOT fail-fast here: matches the existing
+		// pattern for "Failed to create storage backend" three
+		// lines above (Warning-and-continue), which on-prem
+		// etcd/file-config deployments rely on.
+		if s.storage != nil {
+			lookup, lookupErr := NewAgentPeerLookupFromStorage(s.storage)
+			if lookupErr != nil {
+				log.Error("Failed to initialize agent peer lookup: %v", lookupErr)
+				agentLookupInitFailed = true
+			} else if lookup != nil {
+				s.agentPeerLookup = lookup
+				log.Info("Agent peer lookup initialized (DDB+LRU, cache_ttl=%s)", agentPeerLookupCacheTTL)
+			}
 		}
 	}
 
@@ -521,6 +581,29 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		Namespace:  "LayerV/NHP",
 		Dimensions: buildServerMetricDimensions(),
 	})
+
+	// Emit any startup metrics whose triggers fired BEFORE s.metrics
+	// existed. agentLookupInitFailed is captured ~80 lines above
+	// during storage init; emitting here guarantees the counter
+	// actually reaches CloudWatch instead of silently dropping on
+	// the nil publisher.
+	if agentLookupInitFailed {
+		s.metrics.IncrCounter(MetricAgentLookupInitFailure)
+	}
+	// Thread the publisher into the agent peer lookup so its forensic
+	// counters (MetricAgentLookupPubkeyCollision today; future
+	// additions here) emit. Same init-order reason as the deferred
+	// agentLookupInitFailed emit above: the lookup is constructed
+	// ~40 lines before s.metrics exists.
+	//
+	// SET-ONCE — do NOT call SetMetrics(nil) to "clear" the wiring.
+	// AgentPeerLookup's setter refuses nil after a non-nil set (and
+	// logs a Warning) so the forensic counters can't be silently
+	// disabled by a future partial-reset refactor. See the godoc on
+	// AgentPeerLookup.SetMetrics for the contract.
+	if s.agentPeerLookup != nil {
+		s.agentPeerLookup.SetMetrics(s.metrics)
+	}
 
 	// Initialize per-source-IP rate limiter for UDP knock packets.
 	// Defense-in-depth alongside iptables rate limiting (see user_data.sh.tpl).
@@ -596,8 +679,84 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		log.Info("Cloud mode (storage_backend=dynamodb): AC peer pre-validation disabled, will validate via DynamoDB")
 	}
 
+	// In cloud mode the agent registry is in DDB, so the responder
+	// must skip its peer-pool check for agent packets — otherwise
+	// an unknown-but-registered agent's first knock would fail
+	// validatePeer before reaching HandleKnockRequest where the
+	// DDB lookup runs. Composes with the legacy
+	// DisableAgentValidation toggle so on-prem behavior is
+	// unchanged.
+	//
+	// computeEffectiveDisableAgentValidation centralizes the
+	// operator-value OR cloud-mode-override resolution so the
+	// hot-reload path in updateBaseConfig can apply the same logic
+	// — without that, a server.toml edit that touches
+	// DisableAgentValidation flips the device option back to the
+	// operator literal and the cloud-mode override is silently
+	// undone. Boot-time logging stays here (Warning vs Info
+	// depending on whether the override changes the operator value).
+	operatorDisableAgentValidation := s.config.DisableAgentValidation
+	disableAgentValidation := s.computeEffectiveDisableAgentValidation(operatorDisableAgentValidation)
+	if cloudMode && s.agentPeerLookup != nil {
+		if !operatorDisableAgentValidation {
+			// Cloud-mode requires the responder to skip agent
+			// pre-validation so first-knock-from-unknown-agent
+			// reaches HandleKnockRequest; we're overriding an
+			// operator who explicitly set DisableAgentValidation=
+			// false (typically a hardening-minded posture). Log at
+			// Warning so the override surfaces in alarms/dashboards
+			// instead of vanishing into the Info stream — without
+			// this, a tightening operator never sees that their
+			// config was bypassed. The override itself is
+			// non-negotiable in cloud mode (the agent path doesn't
+			// work otherwise); the loud log is the compromise that
+			// keeps operator intent visible.
+			log.Warning("Cloud mode: operator's DisableAgentValidation=false is being overridden to true because the agent peer DDB lookup is wired; pre-validation is now delegated to the DDB lookup on knock")
+		} else {
+			log.Info("Cloud mode: agent peer pre-validation disabled, will resolve via qurl-agent-keys DDB lookup on knock")
+		}
+	} else if cloudMode && s.agentPeerLookup == nil && !agentLookupInitFailed {
+		// Cloud mode is on but the lookup never wired AND no init
+		// error fired earlier — i.e., the (nil, nil) "disabled by
+		// config" branch: AgentKeysTable unset in storage.toml,
+		// storage backend missing, etc. Sibling of
+		// MetricAgentLookupInitFailure (which already fired above
+		// for the (nil, error) branch): that metric catches real
+		// init failures; this one catches the silently-misconfigured
+		// happy path.
+		//
+		// The !agentLookupInitFailed guard is load-bearing — without
+		// it, a wrapper-cycle init failure would double-emit both
+		// MetricAgentLookupInitFailure (via the deferred-emit flag)
+		// and MetricAgentLookupNotConfigured (this branch), since
+		// both branches observe agentPeerLookup == nil. Each metric's
+		// alarm posture assumes single-cause attribution; double-emit
+		// would inflate the page count and conflate failure modes.
+		//
+		// The responder will pre-validate against an EMPTY
+		// agentPeerMap (no agent.toml exists in cloud mode), so
+		// every agent knock rejects at the responder layer with no
+		// MetricAgentLookupDDBError to alarm on — the lookup never
+		// ran. Warning + MetricAgentLookupNotConfigured surface the
+		// misconfig so it's visible on dashboards instead of looking
+		// identical to a healthy boot. Not fail-fast: matches the
+		// existing Warning-and-continue posture for storage init
+		// failures three sections up.
+		log.Warning("Cloud mode: agent peer lookup not wired (AgentKeysTable unset or storage init returned nil with no error); every agent knock will reject at the responder layer (no MetricAgentLookupDDBError emitted because the lookup never ran) — agent validation falls back to legacy DisableAgentValidation=%v",
+			disableAgentValidation)
+		// s.metrics is already initialized at this point (Publisher
+		// is constructed ~100 lines above) so emit directly. Unlike
+		// MetricAgentLookupInitFailure (whose trigger fires during
+		// storage init before the publisher exists and so uses a
+		// deferred-emit flag), this branch executes after the
+		// publisher is wired. IncrCounter is nil-safe (see
+		// endpoints/metrics/publisher.go) so the guard is omitted
+		// for consistency with the surrounding emit sites.
+		s.metrics.IncrCounter(MetricAgentLookupNotConfigured)
+	}
+
 	option := &core.DeviceOptions{
-		DisableAgentPeerValidation: s.config.DisableAgentValidation,
+		DisableAgentPeerValidation: disableAgentValidation,
 		DisableACPeerValidation:    cloudMode,
 	}
 	s.device = core.NewDevice(core.NHP_SERVER, prk, option)
@@ -690,6 +849,7 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	})
 	s.blockAddrMap = make(map[string]*BlockAddr)
 	s.signals.stop = make(chan struct{})
+	s.lifecycleCtx, s.lifecycleCancel = context.WithCancel(context.Background())
 
 	s.recvMsgCh = s.device.DecryptedMsgQueue
 	s.sendMsgCh = make(chan *core.MsgData, core.SendQueueSize)
@@ -761,6 +921,9 @@ func (s *UdpServer) Stop() {
 		s.metrics.Stop()
 	}
 	close(s.signals.stop)
+	if s.lifecycleCancel != nil {
+		s.lifecycleCancel()
+	}
 	_ = s.listenConn.Close()
 	s.device.Stop()
 	s.StopConfigWatch()
@@ -2147,28 +2310,135 @@ func (s *UdpServer) dispatchReceivedMessage(ppd *core.PacketParserData) {
 	}
 }
 
-func (s *UdpServer) AddAgentPeer(agent *core.UdpPeer) {
-	if agent.DeviceType() == core.NHP_AGENT {
-		s.device.AddPeer(agent)
-		s.agentPeerMapMutex.Lock()
-		s.agentPeerMap[agent.PublicKeyBase64()] = agent
-		s.agentPeerMapMutex.Unlock()
+// AddAgentPeer registers an agent peer with both core.Device and the
+// in-process agentPeerMap. Returns true when the pubkey was NOT
+// already present in agentPeerMap — i.e., this call performed the
+// first registration for that pubkey. Returns false when the pubkey
+// was already mapped (a piggybacker in a singleflight-deduped
+// concurrent resolve, or a redundant register from a different code
+// path).
+//
+// The bool is load-bearing for MetricAgentFirstResolve single-counting
+// under singleflight piggyback: without it, N concurrent first-knocks
+// for the same fresh pubkey all reach this function via the same
+// sfGroup slot and each independently increments the resolve counter
+// (N for one resolve). The caller in resolveAgentPeerForKnock gates
+// the IncrCounter on the returned bool so the metric semantics
+// ("fires once per successful first-knock agent resolve") hold.
+//
+// Cross-map atomicity: the first inserter writes the pubkey into
+// agentPeerMap AND calls device.AddPeer in the SAME critical
+// section (agentPeerMapMutex held); a piggybacker that observes
+// existed=true returns without invoking device.AddPeer. This
+// closes the previous "agentPeerMap has the pubkey but
+// device.peerMap doesn't yet" window so a future receive-path
+// consumer that gates synchronously on device.peerMap (e.g.
+// NHP_LST register/list, plugin handlers) can rely on both maps
+// being populated together once agentPeerMap reflects the pubkey.
+// Lock-order: agentPeerMapMutex → device.peerMapMutex (acquired
+// by AddPeer). No existing code goes the reverse direction, so
+// the nested chain is safe; documented in CLAUDE.md's Lock Order
+// (server) section.
+//
+// No-op when DeviceType != NHP_AGENT — guards against callers
+// accidentally adding an AC or DB peer through the agent path.
+// Returns false in that case (no insertion occurred).
+// computeEffectiveDisableAgentValidation resolves the operator's
+// `DisableAgentValidation` setting against the cloud-mode
+// override. The override flips false→true when cloud mode is on
+// AND the agent peer DDB lookup is wired: the responder MUST skip
+// agent pre-validation, otherwise every first knock from an
+// unknown-but-registered agent fails at the responder layer
+// before HandleKnockRequest can run the DDB lookup. Operator=true
+// composes additively (the operator already wants the validation
+// off, the override has nothing to do).
+//
+// Called by Start() at boot AND by updateBaseConfig() on hot-reload
+// — without the hot-reload call site using this same helper, a
+// server.toml edit that touches DisableAgentValidation flips the
+// device option back to the operator literal `false` and the
+// cloud-mode override is silently undone (every cloud-mode agent
+// first-knock then fails at the responder layer with no metric to
+// alarm on, because the lookup is still wired but never reached).
+// TestUpdateBaseConfig_DisableAgentValidationHotReloadPreservesCloud-
+// ModeOverride fences this.
+func (s *UdpServer) computeEffectiveDisableAgentValidation(operatorVal bool) bool {
+	cloudMode := s.storageConfig != nil && s.storageConfig.Backend == StorageBackendDynamoDB
+	return operatorVal || (cloudMode && s.agentPeerLookup != nil)
+}
+
+func (s *UdpServer) AddAgentPeer(agent *core.UdpPeer) (added bool) {
+	if agent.DeviceType() != core.NHP_AGENT {
+		// Caller-bug guard: a non-AGENT peer reaching the agent path
+		// means an AC/DB peer was misrouted (typical cause: a refactor
+		// that collapses AddACPeer + AddAgentPeer into a shared
+		// dispatcher without preserving the type-check). Loud-log so
+		// the regression doesn't masquerade as a piggybacker —
+		// returning false here is otherwise indistinguishable from the
+		// healthy "this caller wasn't the first inserter" return, and
+		// MetricAgentFirstResolve would stay at 0 with no other signal.
+		log.Warning("[Server] AddAgentPeer: refusing non-agent peer pubkey_b64_prefix=%q DeviceType=%v — caller bug or unintended cross-path dispatch",
+			pubkeyLogPrefix(agent.PublicKeyBase64()), agent.DeviceType())
+		return false
 	}
+	s.agentPeerMapMutex.Lock()
+	defer s.agentPeerMapMutex.Unlock()
+	// Initialize map if nil. In cloud mode there is no
+	// etc/agent.toml, so updateAgentPeers (which constructs the
+	// map at boot) never runs and the first knock-driven
+	// resolveAgentPeerForKnock would otherwise nil-write-panic
+	// here. Mirrors AddACPeer's lazy-init below for the same
+	// reason — see TestAddAgentPeer_NilMap in udpserver_test.go.
+	if s.agentPeerMap == nil {
+		s.agentPeerMap = make(map[string]*core.UdpPeer)
+	}
+	pk := agent.PublicKeyBase64()
+	if _, existed := s.agentPeerMap[pk]; existed {
+		// Piggybacker: agentPeerMap already had this pubkey. The
+		// device's peerMap has the same pointer (the first inserter
+		// put it there in the same critical section below);
+		// re-calling device.AddPeer would round-trip
+		// device.peerMapMutex and take the udpPeersShareAddress
+		// overwrite branch for a functionally identical
+		// re-assignment. Skip it. Also leaves the existing peer
+		// pointer in place so callers that captured it via
+		// lookupAgentPeer keep observing the same identity.
+		return false
+	}
+	s.agentPeerMap[pk] = agent
+	// First inserter: also register the peer with core.Device in
+	// the SAME critical section. Subsequent packets that go through
+	// DisableAgentPeerValidation=false paths (e.g., NHP_LST
+	// register/list ops) resolve via the noise responder. Nested
+	// lock acquisition is safe — see the lock-order note in the
+	// godoc above.
+	s.device.AddPeer(agent)
+	return true
+}
+
+// lookupAgentPeer returns the *core.UdpPeer mapped to pubKeyBase64
+// under the agentPeerMapMutex, or nil if absent. Centralizes the
+// map read so concurrent writers (AddAgentPeer) and readers
+// (UpdateTee* / GetTee*) don't race under -race. The returned
+// pointer outlives the lock: peers are never removed today
+// (Phase-2 active-knock revocation tracks in #1943), and the peer's
+// internally-locked setters/getters (SetTeePublicKeyBase64,
+// TeePublicKeyBase64, etc.) are concurrency-safe on their own.
+func (s *UdpServer) lookupAgentPeer(pubKeyBase64 string) *core.UdpPeer {
+	s.agentPeerMapMutex.Lock()
+	defer s.agentPeerMapMutex.Unlock()
+	return s.agentPeerMap[pubKeyBase64]
 }
 
 func (s *UdpServer) UpdateTeePublicKeyAndConsumerEphemeralPublicKey(teePublicKeyBase64 string, consumerEphemeralPublicKeyBase64 string, agentPulicKey []byte) {
-	agentPulicKeyBase64 := base64.StdEncoding.EncodeToString(agentPulicKey)
-
-	if peer, found := s.agentPeerMap[agentPulicKeyBase64]; found {
+	if peer := s.lookupAgentPeer(base64.StdEncoding.EncodeToString(agentPulicKey)); peer != nil {
 		peer.SetTeePublicKeyBase64(teePublicKeyBase64)
 		peer.SetConsumerEphemeralPublicKeyBase64(consumerEphemeralPublicKeyBase64)
 	}
 }
 
 func (s *UdpServer) GetTeePublicKeyBase64AndConsumerEphemeralPublicKeyBase64(agentPublicKey []byte) (teePublicKeyBase64 string, consumerEphemeralPublicKeyBase64 string) {
-	agentPulicKeyBase64 := base64.StdEncoding.EncodeToString(agentPublicKey)
-
-	if peer, found := s.agentPeerMap[agentPulicKeyBase64]; found {
+	if peer := s.lookupAgentPeer(base64.StdEncoding.EncodeToString(agentPublicKey)); peer != nil {
 		return peer.TeePublicKeyBase64(), peer.ConsumerEphemeralPublicKeyBase64()
 	}
 	return "", ""

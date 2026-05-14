@@ -798,6 +798,18 @@ must update this list and audit all existing call sites.
   entry. Holding both at once would invert against the connection
   routine's defer (which removes from `acConnectionMap` first, then
   from `remoteConnectionMap` via `removeConnection`).
+- **`agentPeerMapMutex` then `device.peerMapMutex`, never reversed.**
+  `AddAgentPeer` (`udpserver.go`) holds `agentPeerMapMutex` across
+  the `device.AddPeer` call so both maps reflect the new agent in a
+  single critical section — closes a TOCTOU window where
+  `agentPeerMap` had the pubkey but `device.peerMap` didn't yet, a
+  blind spot for any future receive-path consumer that gates
+  synchronously on `device.peerMap` (e.g. NHP_LST register/list).
+  Safe because `core.Device` methods never call back into
+  `UdpServer` and so cannot reach `agentPeerMapMutex` from inside
+  `device.peerMapMutex`. A future change that takes
+  `device.peerMapMutex` and then `agentPeerMapMutex` would deadlock
+  against `AddAgentPeer`.
 
 ## Lock Order (ac)
 

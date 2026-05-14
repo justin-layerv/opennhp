@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -397,6 +398,217 @@ func TestAddACPeer_NilMap(t *testing.T) {
 	// Verify the peer is accessible by public key
 	if _, exists := s.acPeerMap[acPeer.PublicKeyBase64()]; !exists {
 		t.Error("Peer not found in acPeerMap by public key")
+	}
+}
+
+// TestAddAgentPeer_NilMap fences the cloud-mode crash where the
+// first knock-driven resolveAgentPeerForKnock calls AddAgentPeer
+// before agentPeerMap is ever initialized (no etc/agent.toml in
+// cloud mode = updateAgentPeers never runs). Mirrors
+// TestAddACPeer_NilMap; without the lazy-init in AddAgentPeer
+// this panics with "assignment to entry in nil map" on the first
+// fresh-agent knock and the ASG hot-loops on restarts.
+func TestAddAgentPeer_NilMap(t *testing.T) {
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	s := &UdpServer{
+		device: device,
+		// agentPeerMap intentionally NOT initialized - this is the bug we're testing
+	}
+
+	agent := &core.UdpPeer{
+		PubKeyBase64: "YWdlbnRwdWJrZXk=", // "agentpubkey"
+		ExpireTime:   common.FarFutureExpiry,
+	}
+	agent.Type = core.NHP_AGENT
+
+	// This should NOT panic - the fix initializes the map if nil.
+	// First insertion: should return true (newly added).
+	if added := s.AddAgentPeer(agent); !added {
+		t.Error("AddAgentPeer returned false on first insertion; expected true (newly added)")
+	}
+
+	if s.agentPeerMap == nil {
+		t.Fatal("agentPeerMap should be initialized after AddAgentPeer")
+	}
+	if len(s.agentPeerMap) != 1 {
+		t.Errorf("Expected 1 peer in agentPeerMap, got %d", len(s.agentPeerMap))
+	}
+	if _, exists := s.agentPeerMap[agent.PublicKeyBase64()]; !exists {
+		t.Error("Peer not found in agentPeerMap by public key")
+	}
+
+	// Second insertion of the same pubkey: must return false. This is
+	// the load-bearing assertion for MetricAgentFirstResolve single-counting
+	// under singleflight piggyback (see AddAgentPeer godoc + the gating
+	// in resolveAgentPeerForKnock). Without this signal, N concurrent
+	// piggybackers all increment the resolve counter for one logical
+	// first-resolve.
+	if added := s.AddAgentPeer(agent); added {
+		t.Error("AddAgentPeer returned true on second insertion of same pubkey; expected false (already present)")
+	}
+
+	// Sanity: map still has exactly one entry.
+	if len(s.agentPeerMap) != 1 {
+		t.Errorf("after re-insert: len(agentPeerMap)=%d want 1 (must not duplicate)", len(s.agentPeerMap))
+	}
+}
+
+// TestAgentPeerMap_ReadersDoNotRaceWithAdds fences the unlocked-
+// read regression on agentPeerMap. Historically agentPeerMap was
+// populated once at boot from agent.toml and was effectively
+// immutable; UpdateTee* / GetTee* read it without taking
+// agentPeerMapMutex. With knock-driven AddAgentPeer inserting
+// concurrently in cloud mode, those readers race under `-race`.
+// lookupAgentPeer centralizes the read under the mutex; this test
+// exercises both readers and AddAgentPeer concurrently to catch a
+// future regression that removes the lock.
+//
+// Must be run with `-race`. Race-detector clean = pass; data race
+// = fail with "DATA RACE" output. The functional assertions (no
+// panic, return shapes correct) backstop a future case where the
+// race-detector is off.
+func TestAgentPeerMap_ReadersDoNotRaceWithAdds(t *testing.T) {
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), &core.DeviceOptions{
+		DisableAgentPeerValidation: true,
+	})
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	s := &UdpServer{
+		device:       device,
+		agentPeerMap: map[string]*core.UdpPeer{},
+	}
+
+	// Pre-seed one peer so the GetTee/UpdateTee paths have something
+	// to read even when the writer goroutines haven't run yet —
+	// without it, the readers' empty-map fast-return short-circuits
+	// before the locked Map access and the race condition the test
+	// is fencing wouldn't be exercised on slow scheduler interleavings.
+	seedPubkey := make([]byte, 32)
+	for i := range seedPubkey {
+		seedPubkey[i] = byte(i)
+	}
+	seedAgent := &core.UdpPeer{
+		PubKeyBase64: base64.StdEncoding.EncodeToString(seedPubkey),
+		Type:         core.NHP_AGENT,
+		ExpireTime:   common.FarFutureExpiry,
+	}
+	if added := s.AddAgentPeer(seedAgent); !added {
+		t.Fatalf("seed AddAgentPeer returned false; expected true")
+	}
+
+	const writers = 8
+	const readers = 8
+	const iterations = 200
+
+	var wg sync.WaitGroup
+	wg.Add(writers + readers*2)
+
+	// Writers: insert N distinct fresh pubkeys.
+	for w := 0; w < writers; w++ {
+		go func(idx int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				pk := make([]byte, 32)
+				pk[0] = byte(idx + 1)
+				pk[1] = byte(i)
+				agent := &core.UdpPeer{
+					PubKeyBase64: base64.StdEncoding.EncodeToString(pk),
+					Type:         core.NHP_AGENT,
+					ExpireTime:   common.FarFutureExpiry,
+				}
+				s.AddAgentPeer(agent)
+			}
+		}(w)
+	}
+
+	// Readers: race UpdateTee and GetTee on the seed pubkey
+	// against the writers' inserts.
+	for r := 0; r < readers; r++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				s.UpdateTeePublicKeyAndConsumerEphemeralPublicKey(
+					"tee-pub", "consumer-eph", seedPubkey)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				_, _ = s.GetTeePublicKeyBase64AndConsumerEphemeralPublicKeyBase64(seedPubkey)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Functional sanity: the seed peer has the values UpdateTee set
+	// (last writer wins; "tee-pub" / "consumer-eph" since all
+	// writers set the same value).
+	teePub, consumerEph := s.GetTeePublicKeyBase64AndConsumerEphemeralPublicKeyBase64(seedPubkey)
+	if teePub != "tee-pub" || consumerEph != "consumer-eph" {
+		t.Errorf("post-race read: tee=%q consumer=%q want tee-pub/consumer-eph",
+			teePub, consumerEph)
+	}
+}
+
+// TestAddAgentPeer_QueryAndCacheShapeDoesNotPromoteToPeerGroup
+// fences the implicit PeerGroup-avoidance invariant from the
+// AgentPeerLookup godoc: peers built by queryAndCache have empty
+// Ip/Port/Hostname, so two distinct queryAndCache-shape peers with
+// the same pubkey land on udpPeersShareAddress(empty, empty)==true
+// and device.AddPeer takes the overwrite branch instead of
+// promoting to a PeerGroup.
+//
+// A future change populating Ip/Port at construct time would break
+// the invariant silently — the package godoc warns about this but
+// nothing fences it at PR time. This test converts that implicit
+// contract into a regression fence. Round-16 review item 3.
+func TestAddAgentPeer_QueryAndCacheShapeDoesNotPromoteToPeerGroup(t *testing.T) {
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), &core.DeviceOptions{
+		DisableAgentPeerValidation: true,
+	})
+	if device == nil {
+		t.Fatal("Failed to create device")
+	}
+	defer device.Stop()
+
+	rawPubkey := make([]byte, 32)
+	for i := range rawPubkey {
+		rawPubkey[i] = byte(0x40 + i)
+	}
+	pubKeyB64 := base64.StdEncoding.EncodeToString(rawPubkey)
+
+	// Two queryAndCache-shape peers: same pubkey, empty addressing.
+	// Distinct pointers — what singleflight would protect against in
+	// production. Here we exercise the AddPeer path directly to
+	// fence the udpPeersShareAddress equality even without
+	// singleflight.
+	first := &core.UdpPeer{PubKeyBase64: pubKeyB64, Type: core.NHP_AGENT}
+	second := &core.UdpPeer{PubKeyBase64: pubKeyB64, Type: core.NHP_AGENT}
+
+	device.AddPeer(first)
+	device.AddPeer(second)
+
+	got := device.LookupPeer(rawPubkey)
+	if got == nil {
+		t.Fatal("LookupPeer returned nil after two AddPeer calls")
+	}
+	if _, ok := got.(*core.PeerGroup); ok {
+		t.Errorf("LookupPeer returned *core.PeerGroup; want *core.UdpPeer " +
+			"(queryAndCache peers have empty Ip/Port/Hostname so " +
+			"udpPeersShareAddress should be true and AddPeer should take " +
+			"the overwrite branch — see AgentPeerLookup godoc)")
+	}
+	if _, ok := got.(*core.UdpPeer); !ok {
+		t.Errorf("LookupPeer returned %T; want *core.UdpPeer", got)
 	}
 }
 

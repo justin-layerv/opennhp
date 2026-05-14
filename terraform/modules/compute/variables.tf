@@ -301,6 +301,12 @@ variable "dynamodb_resources_table" {
   default     = null
 }
 
+variable "dynamodb_agent_keys_table" {
+  description = "DynamoDB table name for sidecar agent registrations (qurl-agent-keys, queried by nhp-server's pubkey-index GSI on knock receipt — PR-1b)."
+  type        = string
+  default     = null
+}
+
 variable "attach_storage_policies" {
   description = "Whether to attach storage backend policies (DynamoDB + keypair). Must be true when storage_backend is 'dynamodb'. This boolean is required because Terraform cannot evaluate count based on module outputs at plan time."
   type        = bool

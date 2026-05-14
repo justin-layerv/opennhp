@@ -698,6 +698,7 @@ locals {
     dynamodb_licenses_table       = var.dynamodb_licenses_table
     dynamodb_ac_assignments_table = var.dynamodb_ac_assignments_table
     dynamodb_resources_table      = var.dynamodb_resources_table
+    dynamodb_agent_keys_table     = var.dynamodb_agent_keys_table
     # Cloud Map configuration for server health discovery
     cloudmap_enabled        = var.cloudmap_enabled
     cloudmap_namespace_name = var.cloudmap_namespace_name

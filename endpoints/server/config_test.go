@@ -1,9 +1,13 @@
 package server
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
+	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
 )
 
@@ -120,6 +124,131 @@ func TestUpdateBaseConfig_DoesNotHotReloadACPeerGracePeriodSeconds(t *testing.T)
 			"also wire a checker-side Set so the live checker adopts the new value, "+
 			"and drop the restart-required docstring on Config.ACPeerGracePeriodSeconds.",
 			got, initialGrace)
+	}
+}
+
+// TestUpdateBaseConfig_DisableAgentValidationHotReloadPreservesCloudModeOverride
+// fences the hot-reload regression on DisableAgentValidation in
+// cloud mode. Start() resolves DisableAgentValidation against the
+// cloud-mode override (operator || (cloudMode && agentPeerLookup
+// != nil)) and feeds the result into device.NewDevice, but the
+// pre-fix updateBaseConfig hot-reload path passed
+// conf.DisableAgentValidation unmodified to device.SetOption. On
+// a server.toml edit in cloud mode, the device flipped back to
+// the operator literal `false` — every cloud-mode agent
+// first-knock then failed at the responder layer with no metric
+// to alarm on (the lookup is wired, just never reached).
+//
+// Fix: updateBaseConfig now re-applies the override via
+// computeEffectiveDisableAgentValidation. This test reproduces
+// the scenario:
+//   - cloud mode is on (storageConfig.Backend == dynamodb)
+//   - agentPeerLookup is non-nil
+//   - operator's DisableAgentValidation flips false→true→false
+//   - device.Option().DisableAgentPeerValidation must stay TRUE
+//     on every reload (the override is non-negotiable while the
+//     lookup is wired).
+func TestUpdateBaseConfig_DisableAgentValidationHotReloadPreservesCloudModeOverride(t *testing.T) {
+	logger := log.NewLogger("test", 0, t.TempDir(), "")
+	t.Cleanup(logger.Close)
+
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), &core.DeviceOptions{
+		// Start at the resolved value as Start() would have left it.
+		DisableAgentPeerValidation: true,
+	})
+	if device == nil {
+		t.Fatal("core.NewDevice returned nil")
+	}
+	defer device.Stop()
+
+	// Construct a minimal lookup; non-nil is all the helper checks.
+	inner := newFakeAgentKeysQuerier()
+	lookup, err := NewAgentPeerLookup(inner, "qurl-agent-keys-test")
+	if err != nil {
+		t.Fatalf("NewAgentPeerLookup: %v", err)
+	}
+
+	s := &UdpServer{
+		log:             logger,
+		config:          &Config{DisableAgentValidation: true}, // matches what Start would have observed
+		device:          device,
+		agentPeerLookup: lookup,
+		storageConfig:   &StorageConfig{Backend: StorageBackendDynamoDB},
+	}
+
+	// Hot-reload #1: operator drops DisableAgentValidation back to
+	// false. Pre-fix this flipped the device option to false; the
+	// cloud-mode override must keep it true.
+	if err := s.updateBaseConfig(Config{DisableAgentValidation: false}); err != nil {
+		t.Fatalf("updateBaseConfig: %v", err)
+	}
+	if got := device.Option().DisableAgentPeerValidation; !got {
+		t.Errorf("after hot-reload to operator=false in cloud mode, device.Option().DisableAgentPeerValidation=%v want true (cloud-mode override must be re-applied; otherwise every agent first-knock fails at the responder layer)", got)
+	}
+	if got := s.config.DisableAgentValidation; got != false {
+		t.Errorf("s.config.DisableAgentValidation=%v want false (cached file state must reflect operator's literal so the next delta-compare works)", got)
+	}
+
+	// Hot-reload #2: operator flips back to true (matches override).
+	// Device stays at true.
+	if err := s.updateBaseConfig(Config{DisableAgentValidation: true}); err != nil {
+		t.Fatalf("updateBaseConfig: %v", err)
+	}
+	if got := device.Option().DisableAgentPeerValidation; !got {
+		t.Errorf("after hot-reload to operator=true, device option=%v want true", got)
+	}
+}
+
+// TestLoadPeers_RefusesCloudModeWithAgentTomlCoexistence fences
+// the agent.toml + cloud-mode coexistence guard. The two paths
+// cannot coexist: updateAgentPeers (called from loadPeers and the
+// agent.toml WatchFile callback) builds a fresh peer map and
+// removes from device.peerMap any pubkey absent from the new map
+// — wiping every DDB-resolved peer on each agent.toml touch.
+// loadPeers must refuse boot when both are wired.
+func TestLoadPeers_RefusesCloudModeWithAgentTomlCoexistence(t *testing.T) {
+	tmpDir := t.TempDir()
+	etcDir := filepath.Join(tmpDir, "etc")
+	if err := os.MkdirAll(etcDir, 0o755); err != nil {
+		t.Fatalf("mkdir etc: %v", err)
+	}
+	// Empty agent.toml — even an empty [[Agents]] block triggers
+	// the watcher-wipe hazard the guard fences.
+	if err := os.WriteFile(filepath.Join(etcDir, "agent.toml"), []byte("[[Agents]]\n"), 0o644); err != nil {
+		t.Fatalf("write agent.toml: %v", err)
+	}
+	// server.toml is required by loadPeers' earlier sections; provide
+	// a minimal valid file so we reach the agent.toml branch.
+	if err := os.WriteFile(filepath.Join(etcDir, "server.toml"), []byte(""), 0o644); err != nil {
+		t.Fatalf("write server.toml: %v", err)
+	}
+
+	orig := ExeDirPath
+	t.Cleanup(func() { ExeDirPath = orig })
+	ExeDirPath = tmpDir
+
+	inner := newFakeAgentKeysQuerier()
+	lookup, err := NewAgentPeerLookup(inner, "qurl-agent-keys-test")
+	if err != nil {
+		t.Fatalf("NewAgentPeerLookup: %v", err)
+	}
+
+	logger := log.NewLogger("test", 0, t.TempDir(), "")
+	t.Cleanup(logger.Close)
+
+	s := &UdpServer{
+		log:             logger,
+		config:          &Config{},
+		agentPeerLookup: lookup,
+		storageConfig:   &StorageConfig{Backend: StorageBackendDynamoDB},
+	}
+
+	loadErr := s.loadPeers()
+	if loadErr == nil {
+		t.Fatal("loadPeers returned nil error; expected coexistence-conflict refusal")
+	}
+	if !strings.Contains(loadErr.Error(), "agent peer registry conflict") {
+		t.Errorf("loadPeers err=%q does not mention 'agent peer registry conflict' — guard message regressed", loadErr.Error())
 	}
 }
 

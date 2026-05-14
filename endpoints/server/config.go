@@ -254,6 +254,26 @@ func (s *UdpServer) loadPeers() error {
 		}
 		log.Info("agent.toml not found, no agent peers configured")
 	} else {
+		// Cloud-mode + agent.toml coexistence is structurally incompatible.
+		// The cloud-mode agent registry lives in qurl-agent-keys DDB and
+		// agent peers are inserted into agentPeerMap + device.peerMap on
+		// first knock; updateAgentPeers (called from this load path and
+		// from the agent.toml WatchFile callback below) builds a fresh
+		// map from the file and removes from s.device any pubkey not in
+		// the new map — wiping every DDB-resolved peer on each file
+		// touch in cloud mode. Refuse boot so the operator sees the
+		// conflict at deploy time rather than at the first agent-config
+		// watcher fire-and-wipe.
+		//
+		// The terraform user_data template for cloud-mode servers
+		// intentionally does NOT ship agent.toml; this guard catches
+		// drift between that template and the deployed filesystem.
+		cloudMode := s.storageConfig != nil && s.storageConfig.Backend == StorageBackendDynamoDB
+		if cloudMode && s.agentPeerLookup != nil {
+			return fmt.Errorf("agent peer registry conflict: %s exists AND cloud-mode agent peer DDB lookup is wired (storage_backend=%q, AgentKeysTable set). The two registries cannot coexist — every agent.toml watcher fire would wipe DDB-resolved peers from agentPeerMap and device.peerMap. Remove %s from this deployment, or disable the cloud-mode agent path by clearing AgentKeysTable in storage.toml",
+				fileNameAgent, s.storageConfig.Backend, fileNameAgent)
+		}
+
 		var agentPeers Peers
 		if err := toml.Unmarshal(contentAgent, &agentPeers); err != nil {
 			return fmt.Errorf("failed to parse agent peer config %s: %w", fileNameAgent, err)
@@ -581,8 +601,15 @@ func (s *UdpServer) updateBaseConfig(conf Config) (err error) {
 
 	if s.config.DisableAgentValidation != conf.DisableAgentValidation {
 		if s.device != nil {
+			// Re-apply the cloud-mode override on hot-reload —
+			// without this, an operator edit that flips
+			// DisableAgentValidation back to false silently undoes
+			// the override that Start() applied (every cloud-mode
+			// agent first-knock then fails at the responder layer
+			// with no metric to alarm on, because the lookup is
+			// still wired but never reached).
 			s.device.SetOption(core.DeviceOptions{
-				DisableAgentPeerValidation: conf.DisableAgentValidation,
+				DisableAgentPeerValidation: s.computeEffectiveDisableAgentValidation(conf.DisableAgentValidation),
 			})
 		}
 		s.config.DisableAgentValidation = conf.DisableAgentValidation

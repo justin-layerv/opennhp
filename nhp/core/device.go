@@ -118,6 +118,17 @@ func (d *Device) SetOption(option DeviceOptions) {
 	d.option = option
 }
 
+// Option returns the current device options under the same mutex
+// SetOption writes. Used by callers that need to inspect the live
+// runtime state (e.g., tests asserting that a hot-reload override
+// landed) without racing the writer.
+func (d *Device) Option() DeviceOptions {
+	d.optionMutex.Lock()
+	defer d.optionMutex.Unlock()
+
+	return d.option
+}
+
 func (d *Device) Start() {
 	cpus := runtime.NumCPU()
 	d.wg.Add(2 * cpus)

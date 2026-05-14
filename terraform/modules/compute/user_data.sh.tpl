@@ -346,6 +346,9 @@ ACAssignmentsTable = "${dynamodb_ac_assignments_table}"
 %{ if dynamodb_resources_table != null ~}
 ResourcesTable = "${dynamodb_resources_table}"
 %{ endif ~}
+%{ if dynamodb_agent_keys_table != null ~}
+AgentKeysTable = "${dynamodb_agent_keys_table}"
+%{ endif ~}
 %{ endif ~}
 
 %{ if storage_backend == "etcd" && etcd_endpoint != "" ~}

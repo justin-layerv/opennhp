@@ -188,6 +188,117 @@ model is planned. See `docs/MULTI_TENANT_REGISTRATION_API.md` for the design (no
 
 ---
 
+#### Agent Peer Registry (Cloud Mode)
+
+In cloud deployments, agent trust is established via **DDB+LRU lookup on first knock**,
+not pre-registration (parallel to the AC `license validation` path above):
+
+```
+┌──────────────┐    1. NHP knock                    ┌─────────────┐
+│  nhp-agent   │ ─────────────────────────────────►│ NHP Server  │
+│              │    (responder runs with             │  (cloud     │
+│              │     DisableAgentPeerValidation=     │   mode)     │
+│              │     true so unknown-but-registered  │             │
+│              │     agent reaches HandleKnockRequest)│             │
+└──────────────┘                                    └──────┬──────┘
+                                                           │
+                                                  2. AgentPeerLookup
+                                                     (LRU miss)
+                                                           │
+                                                           ▼
+                                                  ┌─────────────┐
+                                                  │ DynamoDB    │
+                                                  │ qurl-agent- │
+                                                  │ keys table  │
+                                                  │ pubkey-index│
+                                                  │ GSI         │
+                                                  └──────┬──────┘
+                                                         │
+                                                  3. AddAgentPeer →
+                                                     agentPeerMap +
+                                                     device.peerMap
+                                                  4. Subsequent knocks
+                                                     short-circuit on
+                                                     agentPeerMap
+```
+
+See `endpoints/server/agent_peer_lookup.go` for the implementation contract.
+
+##### Revocation horizon
+
+The 60s LRU TTL on `AgentPeerLookup` is **a cache TTL, not a revocation horizon.**
+Once a knock succeeds, `resolveAgentPeerForKnock` writes the resolved peer into
+`UdpServer.agentPeerMap`, which has no TTL and no eviction path. Every subsequent
+knock from that pubkey short-circuits there before the LRU is consulted. So:
+
+- An agent registered in DDB before a deleted-row revocation continues to be
+  admitted **until the nhp-server process restarts** (typically the next ASG
+  rolling refresh — hours, not seconds).
+- The LRU TTL only bounds how long a cached resolve survives between LRU-miss
+  lookups; it is not the revocation horizon for a registered agent.
+
+Active-knock revocation across a running process is tracked as issue #1943.
+Passive revocation (process restart) flushes both caches.
+
+**Operational implication for ops:** when revoking an agent from `qurl-agent-keys`,
+trigger an ASG instance refresh in the same operation if the agent is currently
+trusted by any running server — without the refresh, the agent stays trusted on
+existing instances until they cycle.
+
+##### Cross-tenant pubkey uniqueness (deferred-mitigation)
+
+Pubkey uniqueness in `qurl-agent-keys` is enforced **only by a writer-side soft
+check** in qurl-service (`internal/repository/dynamodb/agent_keys_repo.go::Upsert`):
+on every write, the writer reads the `pubkey-index` GSI; if the pubkey is already
+registered to a different `owner_id`, it emits a WARN log and **proceeds with the
+write**. The check is eventually consistent (GSI is eventually consistent), so
+there is a false-negative window during a tight squat race.
+
+**Auth implication:** an attacker who wins the writer-side soft-uniqueness race
+against a victim tenant can register the victim's pubkey under their own
+`owner_id`. The reader (`AgentPeerLookup`) admits whichever row DDB returns
+first (`Items[0]`), so subsequent agent requests with that pubkey **can be
+attributed to the wrong `owner_id`** until the squatter's row is removed.
+Multi-tenant separation at the qurl-service auth layer cannot reverse this from
+the cached peer alone — the reader-side observation is "pubkey X → admit," not
+"pubkey X belongs to owner Y."
+
+**Defense-in-depth signals today:**
+
+- `AgentPeerLookup.queryAndCache` issues the GSI Query with `Limit=2` (not
+  `Limit=1`) and emits `MetricAgentLookupPubkeyCollision` + a WARN log whenever
+  `Items > 1`. This is a forensic signal, not a fix — the resolver still admits
+  `Items[0]`.
+- The hard fix is tracked in qurl-service issue #488 (TransactWriteItems against
+  a claims sidecar table to enforce true uniqueness at write time).
+
+**Detection has a temporal blind spot.** The collision metric / WARN only fires
+inside `queryAndCache`, which runs ONLY on the LRU-miss path. Once a pubkey is
+pinned in `UdpServer.agentPeerMap` (no TTL, no eviction), every subsequent knock
+from that agent short-circuits at the `alreadyKnown` check in
+`resolveAgentPeerForKnock` and the DDB lookup never reruns. Consequence:
+
+- A cross-tenant squat that lands *before* the victim's first knock is observable
+  (both rows are visible at first-resolve time, the WARN fires).
+- A cross-tenant squat that lands *after* the victim's first knock — the more
+  realistic attack window — is NOT observable by the reader. The victim's
+  resolution is already pinned; subsequent knocks short-circuit before the GSI
+  Query. The squatter only becomes visible on the *next* process restart (or if
+  active-knock revocation #1943 ever lands and evicts the pin).
+
+For the post-first-knock attack window, the only signal today is the writer-side
+WARN log in qurl-service (`Upsert`'s soft-uniqueness check) — same forensic
+limitation as the reader's, scoped to the qurl-service log stream.
+
+Until #488 lands, operators monitoring the cross-tenant attack class should watch
+the `MetricAgentLookupPubkeyCollision` counter (covers the pre-first-knock window
+only) AND the qurl-service writer-side WARN log (covers the post-first-knock
+window). An alarm on this metric — and on the four sibling agent-lookup
+metrics — is tracked in nhp issue #1955; the counters themselves ship in PR
+#1833.
+
+---
+
 #### Stale Assignment Resilience
 
 When NHP Servers terminate (ASG scale-down, instance refresh, crash), DynamoDB AC assignments

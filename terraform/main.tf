@@ -489,6 +489,7 @@ module "compute" {
   dynamodb_licenses_table       = module.dynamodb.licenses_table_name
   dynamodb_ac_assignments_table = module.dynamodb.ac_assignments_table_name
   dynamodb_resources_table      = module.dynamodb.resources_table_name
+  dynamodb_agent_keys_table     = module.dynamodb.qurl_agent_keys_table_name
 
   # Cloud Map configuration for server health discovery
   # Filters stale AC assignments pointing to terminated servers

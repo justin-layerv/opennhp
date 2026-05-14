@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
@@ -24,7 +26,16 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 	knkMsg := &common.AgentKnockMsg{}
 	dhpKnkMsg := &common.DHPKnockMsg{}
 	ackMsg := &common.ServerKnockAckMsg{
-		AgentAddr: addrStr, // optional, to tell agent its own outwards ip address
+		// AgentAddr is set BEFORE pubkey resolution / auth and so
+		// is echoed on EVERY reject path (unknown pubkey, DDB
+		// error, header-type mismatch, etc.) in addition to the
+		// success path. NOT an information disclosure: the ACK is
+		// AEAD-encrypted to the claimed agent pubkey, so only the
+		// holder of the matching private key can decrypt and read
+		// it. A probing attacker who guesses a pubkey can't read
+		// back the field; a legitimate agent reading it sees its
+		// own apparent outwards IP for self-diagnosis.
+		AgentAddr: addrStr,
 	}
 	dhpAckMsg := &common.ServerDHPKnockAckMsg{
 		OpenTime: 30, // currently, use fixed value, unit is seconds.
@@ -97,6 +108,20 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 		}
 		knkMsg.HeaderType = useType
 
+		// Cloud mode agent peer resolution: with
+		// DisableAgentPeerValidation=true the noise responder skipped
+		// the peer-pool check, so an unknown-but-registered agent's
+		// knock reaches us and must be resolved against the
+		// qurl-agent-keys DDB table. Nil lookup = DDB-backed agent
+		// path disabled (legacy etcd / file deployments); fall
+		// through to the auth handler unchanged.
+		if s.agentPeerLookup != nil {
+			if resolveErr := s.resolveAgentPeerForKnock(ppd, knkMsg, ackMsg, transactionId, addrStr); resolveErr != nil {
+				err = resolveErr
+				return
+			}
+		}
+
 		// find out auth service provider
 		aspData := s.FindAuthSvcProvider(knkMsg.AuthServiceId)
 		if aspData == nil {
@@ -161,4 +186,256 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 	ackMd := makeMsgData(ppd, core.NHP_ACK, ackBytes)
 
 	return s.forwardToTransaction(ppd.ConnData, transactionId, ackMd, "server-agent", "HandleKnockRequest", knkMsg.UserId, addrStr)
+}
+
+// resolveAgentPeerForKnock looks the presented agent pubkey up
+// in the qurl-agent-keys DDB table (LRU-cached) and registers
+// the resulting peer with the live agentPeerMap on first hit.
+// Returns nil on success, an error pre-populated with the right
+// ackMsg fields on reject.
+//
+// agentPeerMap is the steady-state authority: once AddAgentPeer
+// has run, every subsequent knock from this agent short-circuits
+// before LookupAgentByPubKey is called. A 60s TTL cache miss in
+// the lookup does NOT evict from agentPeerMap.
+func (s *UdpServer) resolveAgentPeerForKnock(
+	ppd *core.PacketParserData,
+	knkMsg *common.AgentKnockMsg,
+	ackMsg *common.ServerKnockAckMsg,
+	transactionId uint64,
+	addrStr string,
+) error {
+	// Empty/nil RemotePubKey check up front. base64.StdEncoding of nil
+	// or zero-length input is "", but check the raw bytes instead of
+	// the encoded form so the intent ("did the responder actually
+	// give us a pubkey?") is explicit at the read site rather than
+	// implicit in base64 round-trip behavior.
+	if len(ppd.RemotePubKey) == 0 {
+		// Distinct event from "agent_unknown_pubkey" so dashboard
+		// slicing separates responder-regression (empty key reached
+		// the handler) from missing-registration (key reached the
+		// handler but no DDB row exists). Same MetricAuthFailure
+		// counter — alarm cardinality stays flat.
+		//
+		// pubkey_b64_prefix="<empty>" keeps the field present on
+		// the line so grep-based dashboards parsing
+		// `pubkey_b64_prefix=` against the other reject branches
+		// see a consistent schema.
+		log.Error("server-agent(%s#%d@%s)[HandleKnockRequest] event=\"agent_empty_pubkey\" pubkey_b64_prefix=%q",
+			knkMsg.UserId, transactionId, addrStr, pubkeyLogPrefix(""))
+		err := common.ErrKnockServerNotFound
+		ackMsg.ErrCode = err.ErrorCode()
+		ackMsg.ErrMsg = err.Error()
+		// Empty pubkey is an auth-policy outcome (responder failed
+		// to populate ppd.RemotePubKey, or the agent presented none);
+		// counted as AuthFailure so the existing auth-failures alarm
+		// catches it. Matches the unknown-pubkey branch below for
+		// alarm symmetry.
+		s.metrics.IncrCounter(MetricAuthFailure)
+		return err
+	}
+	pubKeyB64 := base64.StdEncoding.EncodeToString(ppd.RemotePubKey)
+
+	// alreadyKnown pre-check: hold agentPeerMapMutex only to read
+	// the map, then release before LookupAgentByPubKey runs. The
+	// Unlock-before-Lookup pattern is intentional: holding the
+	// mutex across the DDB call would serialize ALL agent knocks
+	// process-wide on whoever is currently waiting for DDB,
+	// turning a single tail-latency event into a fleet-wide pause.
+	// The downside — two concurrent callers can both miss the warm
+	// path and both hit LookupAgentByPubKey — is bounded by
+	// AgentPeerLookup.sfGroup (singleflight dedupes the DDB query)
+	// and AddAgentPeer's `added` bool return (gates the metric/log
+	// single-fire). See agent_peer_lookup.go::AgentPeerLookup
+	// godoc for the singleflight contract this depends on.
+	s.agentPeerMapMutex.Lock()
+	_, alreadyKnown := s.agentPeerMap[pubKeyB64]
+	s.agentPeerMapMutex.Unlock()
+	if alreadyKnown {
+		// Deliberate divergence from the AC re-registration pattern in
+		// HandleACOnline (msghandler.go:879-894), which calls UpdateRecv
+		// on every knock to track source-port rebinds. We do NOT call
+		// UpdateRecv here: no downstream code today reads
+		// agentPeer.RecvAddr() (the auth flow uses
+		// ppd.ConnData.RemoteAddr directly for SrcAddr; the AC RecvAddr
+		// consumers in udpserver.go are scoped to ACPeer/DBPeer). The
+		// cache-warm path is therefore a pure no-op on intent.
+		//
+		// Trade-off: an agent behind a NAT that rebinds its source port
+		// between knocks keeps a stale RecvAddr on its in-process peer
+		// entry until the nhp-server process restarts. If a future
+		// change adds a consumer that reads agentPeer.RecvAddr() (e.g.
+		// server-initiated outbound, broadcast, plugin handlers), this
+		// short-circuit must move below UpdateRecv to match the AC
+		// pattern — or each new consumer must source RemoteAddr from
+		// the live ppd at call time.
+		//
+		// TestResolveAgentPeerForKnock_CacheWarmDoesNotUpdateRecvAddr
+		// fences this divergence; flip its expectation along with the
+		// behavior change if/when this turns into a problem.
+		return nil
+	}
+
+	// Use the server-lifecycle context so a Stop() during a stuck
+	// DDB call cancels promptly rather than waiting out
+	// DynamoDBOperationTimeout per in-flight knock. Falls back to
+	// context.Background() pre-Start (tests construct UdpServer
+	// without calling Start).
+	//
+	// IMPORTANT: this MUST stay a process-shared context, NOT a
+	// per-knock derived one. AgentPeerLookup wraps the call in a
+	// singleflight gate that captures the first caller's ctx; if a
+	// future change threads (say) a per-knock WithTimeout here, the
+	// first caller's cancellation would propagate to all N
+	// piggybackers. Re-read the godoc on LookupAgentByPubKey before
+	// changing this.
+	lookupCtx := s.lifecycleCtx
+	if lookupCtx == nil {
+		lookupCtx = context.Background()
+	}
+	peer, lookupErr := s.agentPeerLookup.LookupAgentByPubKey(lookupCtx, pubKeyB64)
+	if lookupErr == nil {
+		// AddAgentPeer reports whether THIS call performed the first
+		// insertion for the pubkey. Gating the entire post-resolve
+		// side-effect block (UpdateRecv + log + counter) on the
+		// returned bool keeps three invariants single-fired under
+		// singleflight piggyback:
+		//
+		//   - MetricAgentFirstResolve counts one logical resolve per
+		//     pubkey-window. Without this gate, N concurrent
+		//     first-knocks all reach the same sfGroup slot and each
+		//     increment the counter (N for one resolve), distorting
+		//     the writer-side-liveness signal the metric provides.
+		//   - The agent_resolved structured log fires once. N copies
+		//     of the same line under bursty load would obscure the
+		//     resolve cardinality.
+		//   - peer.UpdateRecv is called exactly once on the cached
+		//     pointer. Piggybackers' source addresses are no longer
+		//     written; the cached RecvAddr stays at the first
+		//     inserter's value, matching the cache-warm short-circuit
+		//     behavior documented at the alreadyKnown branch above.
+		//     This is deterministic — no last-writer-wins race on
+		//     the shared cache pointer — and the only case where
+		//     multiple piggybackers present DISTINCT source addresses
+		//     is the cross-tenant pubkey-squat posture
+		//     (qurl-service #488 tracks the hard uniqueness fix).
+		//
+		// Mirrors the cloud-mode AC pattern in HandleACOnline
+		// (UpdateRecv runs only on the first registration in a
+		// connection lifecycle, not on every re-registration).
+		if s.AddAgentPeer(peer) {
+			peer.UpdateRecv(ppd.LocalInitTime, ppd.ConnData.RemoteAddr)
+			// pubkey_b64_prefix=%q (NOT pubkey_b64=%q) for schema
+			// consistency with the reject branches below. Every
+			// agent-event log line uses the same field name so
+			// dashboards/grep patterns built against
+			// `pubkey_b64_prefix=` capture both success and reject
+			// signals uniformly. The truncated form (12 chars via
+			// pubkeyLogPrefix) is uniquely identifying in practice;
+			// the full key is recoverable from cache-state dumps if
+			// ever needed for triage.
+			//
+			// owner_id is read from the lookup cache (populated by
+			// queryAndCache via the KEYS_ONLY GSI projection — free
+			// alongside public_key). Empty when the row was older
+			// than the writer-side owner_id rollout or the cache
+			// evicted between the resolve and the log; in that case
+			// the field is just empty in the log line.
+			log.Info("server-agent(%s#%d@%s)[HandleKnockRequest] event=\"agent_resolved\" pubkey_b64_prefix=%q owner_id=%q",
+				knkMsg.UserId, transactionId, addrStr, pubkeyLogPrefix(pubKeyB64),
+				s.agentPeerLookup.CachedOwnerID(pubKeyB64))
+			s.metrics.IncrCounter(MetricAgentFirstResolve)
+		}
+		return nil
+	}
+
+	// Reject path: identical wire error for unknown vs DDB
+	// failure; only the structured log and the metric differ.
+	// Unknown is an auth-policy outcome (counted as AuthFailure so
+	// existing alarms catch it); DDB-error is an infra outcome
+	// (counted separately so the auth-failures alarm doesn't page
+	// on a DDB hiccup). Shutdown-canceled is neither — surface as
+	// info, don't pollute either counter.
+	//
+	// Log the truncated pubkey prefix on the reject paths via the
+	// shared pubkeyLogPrefix helper (license_pubkey_gate.go) —
+	// returns at most 12 chars, matching the convention already in
+	// use on the AC pubkey gates so dashboards stay homogeneous.
+	// At normal volume the saving over the full 44-byte b64 is
+	// negligible, but a scan/fuzz storm where unknown-pubkey
+	// rejects dominate is the worst case for CloudWatch cost — the
+	// prefix is still greppable and uniquely identifies the agent
+	// in practice. The success path keeps the full key (low
+	// frequency, useful for triage).
+	pubKeyPrefix := pubkeyLogPrefix(pubKeyB64)
+	switch {
+	case errors.Is(lookupErr, ErrAgentUnknownPubkey):
+		log.Warning("server-agent(%s#%d@%s)[HandleKnockRequest] event=\"agent_unknown_pubkey\" pubkey_b64_prefix=%q",
+			knkMsg.UserId, transactionId, addrStr, pubKeyPrefix)
+		s.metrics.IncrCounter(MetricAuthFailure)
+	case errors.Is(lookupErr, context.Canceled) && lookupCtx.Err() != nil:
+		// Server is shutting down (lifecycleCtx canceled). The
+		// errors.Is(context.Canceled) match is load-bearing: a
+		// DDB call that exceeds DynamoDBOperationTimeout returns
+		// DeadlineExceeded (wrapped through %w), which we DO
+		// want to fall through into the default DDB-error branch
+		// — otherwise a healthy server doing slow DDB calls
+		// would silently swallow infra signals. Pairing with the
+		// lookupCtx.Err() != nil guard avoids matching a
+		// hypothetical future caller-side cancellation that
+		// doesn't reflect server shutdown.
+		//
+		// Without the shutdown-suppression branch, a normal
+		// Stop() during in-flight knock lookups would look like
+		// a DDB outage on dashboards because every queued lookup
+		// returns an error wrapping ctx.Canceled.
+		//
+		// Assumption: lookupCtx is UdpServer.lifecycleCtx (or
+		// context.Background pre-Start in tests). This is the
+		// same process-shared-ctx requirement the godoc on
+		// LookupAgentByPubKey warns about for singleflight ctx
+		// capture — both branches share the invariant. If a
+		// future change threads a per-call WithTimeout here, the
+		// errors.Is(context.Canceled) match still does the right
+		// thing for actual cancellations; only re-classifying
+		// caller-side deadlines as shutdown would need attention.
+		log.Info("server-agent(%s#%d@%s)[HandleKnockRequest] event=\"agent_lookup_shutdown\" pubkey_b64_prefix=%q err=%v",
+			knkMsg.UserId, transactionId, addrStr, pubKeyPrefix, lookupErr)
+	case errors.Is(lookupErr, ErrAgentLookupMalformedRow):
+		// Writer-side schema regression: DDB returned a row whose
+		// shape attributevalue.UnmarshalMap could not parse. Same
+		// counter as a transient DDB error (a third metric would
+		// inflate alarm cardinality for an exceedingly rare case)
+		// but a distinct event= tag so triage sees the schema-
+		// regression theory immediately rather than grepping the
+		// err string. ErrAgentLookupMalformedRow wraps
+		// ErrAgentLookupRetryAfter (see the sentinel godoc in
+		// agent_peer_lookup.go), so this case must come before the
+		// default arm — otherwise the generic ddb_error branch
+		// would swallow it.
+		log.Error("server-agent(%s#%d@%s)[HandleKnockRequest] event=\"agent_lookup_row_unmarshal_error\" pubkey_b64_prefix=%q err=%v",
+			knkMsg.UserId, transactionId, addrStr, pubKeyPrefix, lookupErr)
+		s.metrics.IncrCounter(MetricAgentLookupDDBError)
+	case errors.Is(lookupErr, ErrAgentLookupInternal):
+		// Code-regression branch (e.g., singleflight closure
+		// returning a non-*core.UdpPeer despite the contract).
+		// Structurally impossible today; the distinct event= tag
+		// routes triage to the dev on-call instead of misleading
+		// the SRE on-call to a DDB-outage theory.
+		// ErrAgentLookupInternal wraps ErrAgentLookupRetryAfter
+		// so this case must precede the default arm.
+		log.Error("server-agent(%s#%d@%s)[HandleKnockRequest] event=\"agent_lookup_internal_bug\" pubkey_b64_prefix=%q err=%v",
+			knkMsg.UserId, transactionId, addrStr, pubKeyPrefix, lookupErr)
+		s.metrics.IncrCounter(MetricAgentLookupDDBError)
+	default:
+		// ErrAgentLookupRetryAfter and any future error variant.
+		log.Error("server-agent(%s#%d@%s)[HandleKnockRequest] event=\"agent_lookup_ddb_error\" pubkey_b64_prefix=%q err=%v",
+			knkMsg.UserId, transactionId, addrStr, pubKeyPrefix, lookupErr)
+		s.metrics.IncrCounter(MetricAgentLookupDDBError)
+	}
+
+	rejectErr := common.ErrKnockServerNotFound
+	ackMsg.ErrCode = rejectErr.ErrorCode()
+	ackMsg.ErrMsg = rejectErr.Error()
+	return rejectErr
 }

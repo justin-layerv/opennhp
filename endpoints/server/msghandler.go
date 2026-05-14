@@ -354,6 +354,133 @@ const (
 	// (Environment/Cell, drives the server_instance_restart alarm
 	// via a classic Sum-over-5min threshold).
 	MetricServerStartupEvent = "ServerStartupEvent"
+
+	// MetricAgentLookupDDBError fires once per knock that rejects
+	// because the qurl-agent-keys DDB Query returned a transient
+	// error (throttle, 5xx, network, malformed-row). Kept distinct
+	// from MetricAuthFailure so the auth-failures alarm
+	// (terraform/modules/monitoring/main.tf::auth_failures) doesn't
+	// page on-call for what is actually an infrastructure event —
+	// ops can distinguish "auth policy rejected the agent" from
+	// "DDB is unhealthy". An ErrAgentUnknownPubkey reject (agent
+	// genuinely not registered) still goes through MetricAuthFailure
+	// because that IS an auth-policy outcome.
+	//
+	// Counter semantics under singleflight piggyback: this counter
+	// is NOT gated like MetricAgentFirstResolve. When N concurrent
+	// callers piggyback on the same singleflight slot and the
+	// underlying DDB Query returns an error, all N receive the same
+	// wrapped error and each increments this counter. So a sustained
+	// throttle event on a hot-spot pubkey produces ~N× the counter
+	// value vs. the underlying DDB-call count, where N is the
+	// concurrent-piggybacker count. This is intentional — every
+	// caller did experience the reject — but alarm thresholds that
+	// expect "1 increment per failed DDB call" need to budget for
+	// the piggyback multiplier under bursty load. ErrAgentUnknownPubkey
+	// (MetricAuthFailure) has the same fanout characteristic.
+	MetricAgentLookupDDBError = "AgentLookupDDBError"
+
+	// MetricAgentFirstResolve fires once per successful first-knock
+	// agent resolve through the qurl-agent-keys DDB lookup. The
+	// rate is the canonical signal that the writer side
+	// (qurl-service) is actually populating qurl-agent-keys in
+	// steady state: a sustained zero with non-zero KnockRequest
+	// volume means cloud-mode agents are being rejected because
+	// the registry is silent, not because the lookup is broken.
+	// Doesn't fire on the cache-warm short-circuit path — once a
+	// peer is in agentPeerMap, the subsequent knock-success is
+	// counted by MetricAuthSuccess downstream.
+	//
+	// Single-counting under singleflight piggyback: N concurrent
+	// first-knocks for the same fresh pubkey deduplicate through
+	// AgentPeerLookup.sfGroup and all reach AddAgentPeer; only the
+	// caller that actually wins the agentPeerMap insertion
+	// increments this counter (resolveAgentPeerForKnock gates on
+	// AddAgentPeer's returned `added bool`). Without this gate the
+	// counter inflates ~N× under concurrent first-knock bursts —
+	// the writer-side liveness signal this metric provides would
+	// then be distorted by request shape rather than reflecting
+	// real resolve volume.
+	//
+	// Dashboard caveat: in steady state most agent knocks are
+	// cache-warm and do NOT increment this counter, so a naive
+	// MetricAgentFirstResolve / MetricKnockRequest ratio reads
+	// extremely low. The intended use is the absolute rate
+	// (resolves per unit time as a writer-side liveness signal)
+	// and the unknown / DDB-error ratios against the same time
+	// window. If a future panel wants a "resolve as fraction of
+	// knock" view, it needs to add MetricAuthSuccess into the
+	// numerator to capture the warm-knock case.
+	MetricAgentFirstResolve = "AgentFirstResolve"
+
+	// MetricAgentLookupPubkeyCollision fires once per agent-peer
+	// lookup that finds MORE than one row on the pubkey-index GSI
+	// for the same public_key (cross-tenant pubkey squat or a
+	// rotation-race orphan row that hasn't TTL-expired). The
+	// resolver still admits whichever row DDB hands back first
+	// (multi-tenant separation is enforced at the qurl-service
+	// auth layer); this counter is purely defense-in-depth
+	// forensics. A sustained non-zero value is evidence that the
+	// qurl-service writer-side soft uniqueness check (WARN-only
+	// today, see qurl-service #488) is being defeated and the
+	// hard uniqueness invariant has drifted.
+	MetricAgentLookupPubkeyCollision = "AgentLookupPubkeyCollision"
+
+	// MetricAgentLookupInitFailure fires once at server startup
+	// when NewAgentPeerLookupFromStorage returns an error.
+	// Reachable today on:
+	//   - ErrAgentLookupStorageWrapperCycle: the storage decorator
+	//     chain hit unwrapMaxHops without finding *DynamoDBStorage
+	//     (cycle or chain-too-deep). The factory propagates the
+	//     error rather than silently returning (nil, nil) so this
+	//     metric covers a real failure mode that would otherwise
+	//     disable the agent path with no signal.
+	//   - Future failure modes added to NewAgentPeerLookup itself
+	//     (e.g. validating the DDB client at construction). The
+	//     LRU constructor today only fails on size <= 0 and the
+	//     size constant is positive, so that branch is
+	//     unreachable — kept as a fence so a future change that
+	//     adds a real failure mode surfaces loudly.
+	//
+	// Why a metric and not just a log: a Warning-only boot in
+	// cloud mode looks identical to a healthy boot until the
+	// first agent knock fails at the responder layer with no
+	// MetricAgentLookupDDBError to alarm on (the lookup never
+	// ran). This metric closes the gap so an operator can alarm
+	// on "MetricAgentLookupInitFailure >= 1" and catch the
+	// silent-fallback failure mode the responder rejects would
+	// otherwise hide.
+	MetricAgentLookupInitFailure = "AgentLookupInitFailure"
+
+	// MetricAgentLookupNotConfigured fires once at server startup
+	// when cloud mode is on (storage_backend=dynamodb) AND the
+	// agent peer lookup never wired AND no init error fired —
+	// i.e., the (nil, nil) "disabled by config" branch from
+	// NewAgentPeerLookupFromStorage (AgentKeysTable unset in
+	// storage.toml, storage backend missing, etc).
+	//
+	// MUTUALLY EXCLUSIVE with MetricAgentLookupInitFailure: that
+	// metric catches the (nil, error) branch (wrapper cycle, future
+	// init failure modes). The udpserver.go emit site gates this
+	// metric on `!agentLookupInitFailed` so a single boot fires
+	// exactly one of the two — alarm posture for each assumes
+	// single-cause attribution. A double-emit would inflate the
+	// page count and conflate failure modes.
+	//
+	// Both failure modes look identical on the wire (every agent
+	// knock rejects at the responder layer because agentPeerMap
+	// pre-validation has nothing to match) and neither emits
+	// MetricAgentLookupDDBError (the lookup never ran). Without
+	// this counter, the cloud-mode-with-empty-AgentKeysTable case
+	// boots with just an Info line and looks identical to a
+	// healthy boot in dashboards — until the first agent knock
+	// fails.
+	//
+	// Alarm posture: "MetricAgentLookupNotConfigured >= 1 in cloud
+	// envs" — fires on the first deploy where the tfvar plumbing
+	// regressed. Stays at 0 for legitimate etcd / file-config
+	// deployments because cloud mode is off.
+	MetricAgentLookupNotConfigured = "AgentLookupNotConfigured"
 )
 
 // Multi-AC broadcast observability metric names (issue #376).

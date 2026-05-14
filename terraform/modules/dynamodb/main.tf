@@ -946,8 +946,31 @@ resource "aws_dynamodb_table" "qurl_api_keys" {
 # Pubkey uniqueness is a SOFT invariant — DynamoDB GSIs don't enforce
 # it. A re-bootstrap under a FRESH `agent_id` orphans the prior row's
 # pubkey until TTL eviction, so the reader's Query could return >1 item.
-# Closed consumer-side: PR-1b reader fails closed on duplicate hits;
-# PR-1c writer deletes prior-pubkey rows before insert.
+#
+# Defense posture today (writer-side soft + reader-side forensic):
+#   - qurl-service AgentKeysRepository.Upsert reads the pubkey-index GSI
+#     before every write and emits a WARN log on cross-tenant squat
+#     detection (`agent bootstrap: cross-tenant pubkey squatting
+#     detected`). It does NOT reject the write.
+#   - nhp-server reader (endpoints/server/agent_peer_lookup.go::
+#     queryAndCache) queries with Limit=2 and admits Items[0]
+#     (multi-tenant separation is enforced at the qurl-service auth
+#     layer where owner_id is the principal). When the GSI returns
+#     >1 row for the same pubkey, the reader emits the
+#     `MetricAgentLookupPubkeyCollision` counter + a WARN log so
+#     operators see writer-side invariant violations in real time
+#     without coupling to the qurl-service deploy. One extra
+#     projected attribute set on the no-collision path is negligible.
+#
+# Hard uniqueness (TransactWriteItems against a claims sidecar table)
+# is tracked in qurl-service #488; until it lands, an attacker that
+# achieves the rare write-time race window can squat a pubkey and the
+# reader will admit them — the collision counter is the only
+# in-process signal of that until #488 ships.
+# TODO: revisit DoS-amplification cost ceiling if billing_mode
+# below moves off PAY_PER_REQUEST (unknown-pubkey lookups intentionally
+# bypass the in-process LRU; the bound is rate_limit × 1 Query per
+# distinct pubkey-per-window — see the godoc on `AgentPeerLookup`).
 resource "aws_dynamodb_table" "qurl_agent_keys" {
   count = var.deploy_qurl_tables ? 1 : 0
 

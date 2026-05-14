@@ -332,7 +332,14 @@ type DynamoDBConfig struct {
 	LicensesTable      string `toml:"LicensesTable"`
 	ACAssignmentsTable string `toml:"ACAssignmentsTable"`
 	ResourcesTable     string `toml:"ResourcesTable"`
-	Endpoint           string `toml:"Endpoint,omitempty"` // For local development
+	// AgentKeysTable holds sidecar agent registrations written by
+	// qurl-service's bootstrap path. nhp-server reads it on every
+	// knock receipt via the `pubkey-index` GSI to resolve the
+	// presented public key back to a registered agent. Empty
+	// disables the lookup (legacy etcd/file path stays in effect).
+	// PR-1b plan reference.
+	AgentKeysTable string `toml:"AgentKeysTable"`
+	Endpoint       string `toml:"Endpoint,omitempty"` // For local development
 }
 
 // EtcdStorageConfig configures the etcd storage backend.
