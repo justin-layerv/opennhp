@@ -111,6 +111,15 @@ func parseACPubkeyCapVerify(raw string) (bool, error) {
 // kernel below dedupes, so duplicates from blue/green re-registration
 // don't perturb the verdict.
 //
+// Defensive nil-skip scope: this function only dereferences c and
+// c.ACPeer, so the guard stops there. The sibling
+// replaceOrAppendACConn (ac_connection_admit.go) iterates the SAME
+// acConnectionMap[acId] slice but also reads c.ConnData and
+// c.ConnData.RemoteAddr, so it carries a wider four-field guard.
+// If a future change adds a new ACConn field to the snapshot loop
+// (e.g., ServiceId), tighten this guard in lockstep with the admit
+// helper's so both keep symmetric nil-tolerance on the same slice.
+//
 // Cross-test dependency: TestHandleACOnline_F5_BypassedInNonCloudMode
 // (handle_ac_online_f5_test.go) relies on the in-lock F3 cap reject
 // as the early-exit driver for the non-cloud case. If a future
@@ -150,20 +159,19 @@ func extractPubkeysFromConns(conns []*ACConn) []string {
 //
 // Known constraint — same-IP key rotation under saturation:
 // If acConnectionMap[acId] is at MaxACConnsPerID with all DISTINCT
-// pubkeys (the saturated-distinct shape this gate fences) AND a
-// legitimate AC at IP_X rotates its static pubkey from pkA → pkA_new,
-// the kernel sees presented=pkA_new, existing=[pkA, ..., pkJ] with
-// distinct=cap and verdicts Exceeded — even though the msghandler's
-// same-IP replacement loop would have replaced IP_X's slot rather
-// than appended. This is a false-positive reject only in strict
-// mode AND only when the saturated-distinct shape has been reached.
-// Operationally rare (today's blue/green deploy shares one static
-// pubkey, so distinct count is typically 1-2, not 10), but a
-// rotation that hadn't fully retired old keys could trip this.
-// Workaround: drain old pubkeys before rotating into a saturated
-// state. Pinned by TestVerifyACPubkeyCap_SameIPKeyRotation_UnderSaturation_Exceeded
-// so a future PR that "fixes" this false-positive surfaces the
-// trade-off discussion at PR time.
+// pubkeys AND a legitimate AC at IP_X rotates its static pubkey from
+// pkA → pkA_new, the kernel sees presented=pkA_new with distinct=cap
+// and verdicts Exceeded — a false-positive reject in strict mode.
+// Permit mode admits, and the admit-side behavior lives in
+// replaceOrAppendACConn (#1157 F3 reliability fix). Operationally
+// rare today (blue/green shares one static pubkey, distinct count
+// typically 1-2 not 10); workaround is to drain old pubkeys before
+// rotating into saturation. Pinned by
+// TestVerifyACPubkeyCap_SameIPKeyRotation_UnderSaturation_Exceeded
+// (strict-mode kernel reject) and
+// TestReplaceOrAppendACConn_SameIPKeyRotation_UnderSaturation_FIFOEvicts
+// (permit-mode admit shift), so a future PR that "fixes" the
+// false-positive surfaces both halves of the trade-off at review time.
 //
 // Returns (verdict, distinctCount) so applyACPubkeyCapVerdict can log
 // the observed count without re-walking the slice. A single pass

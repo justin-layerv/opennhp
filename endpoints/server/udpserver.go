@@ -155,7 +155,26 @@ type UdpServer struct {
 	agentPeerMap      map[string]*core.UdpPeer // indexed by peer's public key base64 string
 
 	acConnectionMapMutex sync.RWMutex
-	acConnectionMap      map[string][]*ACConn // ac connections indexed by AC ID, multiple per ID for blue/green
+	// acConnectionMap holds AC connections per acId. Multiple entries
+	// per acId support blue/green AC fleets sharing one acId.
+	//
+	// Identity invariant: each entry's stable identity is the AC's
+	// PubKeyBase64, NOT its (IP, port). HandleACOnline matches by
+	// pubkey for in-place replacement so a same-pubkey reconnect
+	// from a new (IP, port) — NAT rebind, EIP swap, AC daemon
+	// restart, server-driven redispatch — replaces its existing
+	// slot rather than appending. Pre-#1157 the match was by IP and
+	// same-pubkey-new-IP reconnects appended, filling the slice
+	// past MaxACConnsPerID and FIFO-evicting a DIFFERENT AC's last
+	// slot — a silent de-listing from AOP broadcast while the NLB
+	// kept routing client traffic to the evicted AC.
+	//
+	// Cap: MaxACConnsPerID, enforced as a DISTINCT-PUBKEY cap by
+	// the F3 gate (ac_pubkey_cap_gate.go) and as a backstop
+	// connection-list cap by HandleACOnline's append branch. With
+	// same-pubkey replacement, the backstop fires only on
+	// distinct-pubkey overflow.
+	acConnectionMap map[string][]*ACConn
 
 	acPeerMapMutex sync.Mutex
 	acPeerMap      map[string]*core.UdpPeer // indexed by peer's public key base64 string

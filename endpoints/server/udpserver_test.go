@@ -766,10 +766,15 @@ func TestCloudModePeer_RecvAddrUsedInACConn(t *testing.T) {
 	}
 }
 
-// TestACConnectionCleanup_OnReregistration tests that when an AC re-registers
-// from a different source port, the old stale connection is cleaned up.
-// This prevents knock operations from using stale connections.
-func TestACConnectionCleanup_OnReregistration(t *testing.T) {
+// TestACConnectionCleanup_OnSamePubkeyReregistration tests that when an
+// AC re-registers with the SAME pubkey from a different source port, the
+// old stale connection is cleaned up. Pre-fix this test used different
+// pubkeys and implicitly exercised the IP-keyed match; post-fix it uses
+// shared pubkeys (testPubkeyB64(0x42)) so the assertion is specifically
+// "pubkey-keyed match replaces in place + cleans up the old conn." The
+// rename makes the keyed-on-pubkey invariant visible in the test name,
+// not just the fixture.
+func TestACConnectionCleanup_OnSamePubkeyReregistration(t *testing.T) {
 	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
 	if device == nil {
 		t.Fatal("Failed to create device")
@@ -784,110 +789,35 @@ func TestACConnectionCleanup_OnReregistration(t *testing.T) {
 	}
 
 	acId := "test-ac"
-
-	// Create initial connection (simulating first registration from port 47051)
-	oldRemoteAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.100"), Port: 47051}
-	oldConnData := &core.ConnectionData{
-		RemoteAddr: oldRemoteAddr,
-	}
-	oldPeer := &core.UdpPeer{
-		Ip:           "10.0.0.100",
-		Port:         47051,
-		PubKeyBase64: "b2xkcGVlcg==",
-	}
-	oldPeer.Type = core.NHP_AC
-	oldPeer.UpdateRecv(time.Now().UnixNano(), oldRemoteAddr)
-
-	oldACConn := &ACConn{
-		ConnData: oldConnData,
-		ACPeer:   oldPeer,
-		ACId:     acId,
-	}
-	oldUdpConn := &UdpConn{
-		ConnData:       oldConnData,
-		isACConnection: true,
-	}
-
-	// Store old connection in both maps
+	pubkey := testPubkeyB64(0x42)
+	oldACConn := makeACConnFixture(pubkey, "10.0.0.100", 47051)
+	newACConn := makeACConnFixture(pubkey, "10.0.0.100", 38229)
+	oldAddr := oldACConn.ConnData.RemoteAddr.String()
 	s.acConnectionMap[acId] = []*ACConn{oldACConn}
-	s.remoteConnectionMap[oldRemoteAddr.String()] = oldUdpConn
+	s.remoteConnectionMap[oldAddr] = &UdpConn{ConnData: oldACConn.ConnData, isACConnection: true}
 
-	// Verify old connection is stored
-	if len(s.acConnectionMap) != 1 {
-		t.Fatalf("Expected 1 AC connection, got %d", len(s.acConnectionMap))
-	}
-	if len(s.remoteConnectionMap) != 1 {
-		t.Fatalf("Expected 1 remote connection, got %d", len(s.remoteConnectionMap))
-	}
-
-	// Create new connection (simulating re-registration from port 38229)
-	newRemoteAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.100"), Port: 38229}
-	newConnData := &core.ConnectionData{
-		RemoteAddr: newRemoteAddr,
-	}
-	newPeer := &core.UdpPeer{
-		Ip:           "10.0.0.100",
-		Port:         38229,
-		PubKeyBase64: "bmV3cGVlcg==",
-	}
-	newPeer.Type = core.NHP_AC
-	newPeer.UpdateRecv(time.Now().UnixNano(), newRemoteAddr)
-
-	newACConn := &ACConn{
-		ConnData: newConnData,
-		ACPeer:   newPeer,
-		ACId:     acId,
-	}
-
-	// Simulate the cleanup logic from HandleACOnline (same IP, different port → update in-place)
+	// Drive the live helper so this test fences the production
+	// admit path, not a hand-copy of it.
 	s.acConnectionMapMutex.Lock()
-	existingConns := s.acConnectionMap[acId]
-	var staleConn *ACConn
-	updated := false
-	for i, existing := range existingConns {
-		if existing.ConnData.RemoteAddr.IP.Equal(newConnData.RemoteAddr.IP) {
-			oldAddr := existing.ConnData.RemoteAddr.String()
-			newAddr := newConnData.RemoteAddr.String()
-			if oldAddr != newAddr {
-				staleConn = existing
-			}
-			existingConns[i] = newACConn
-			updated = true
-			break
-		}
-	}
-	if !updated {
-		existingConns = append(existingConns, newACConn)
-	}
+	existingConns, _, staleConn := replaceOrAppendACConn(s.acConnectionMap[acId], newACConn)
 	s.acConnectionMap[acId] = existingConns
 	s.acConnectionMapMutex.Unlock()
 
-	// Clean up stale connection
 	if staleConn != nil {
-		oldAddrStr := staleConn.ConnData.RemoteAddr.String()
 		s.remoteConnectionMapMutex.Lock()
-		if _, found := s.remoteConnectionMap[oldAddrStr]; found {
-			delete(s.remoteConnectionMap, oldAddrStr)
-		}
+		delete(s.remoteConnectionMap, staleConn.ConnData.RemoteAddr.String())
 		s.remoteConnectionMapMutex.Unlock()
 	}
 
-	// Verify: old connection should be removed from remoteConnectionMap
-	if _, exists := s.remoteConnectionMap[oldRemoteAddr.String()]; exists {
-		t.Error("Old connection should be removed from remoteConnectionMap after re-registration")
+	if _, exists := s.remoteConnectionMap[oldAddr]; exists {
+		t.Error("old remoteConnectionMap entry should be cleaned up after re-registration")
 	}
-
-	// Verify: new AC connection should be stored
-	conns, exists := s.acConnectionMap[acId]
-	if !exists || len(conns) == 0 {
-		t.Error("New AC connection should be stored in acConnectionMap")
-	} else if conns[0].ConnData.RemoteAddr.Port != 38229 {
-		t.Errorf("Expected new connection port 38229, got %d", conns[0].ConnData.RemoteAddr.Port)
-	}
-
-	// Verify: only 1 AC connection exists for this ID (same IP = update in-place)
+	conns := s.acConnectionMap[acId]
 	if len(conns) != 1 {
-		t.Errorf("Expected exactly 1 AC connection after re-registration from same IP, got %d", len(conns))
+		t.Fatalf("expected 1 AC connection after same-pubkey re-registration, got %d", len(conns))
+	}
+	if conns[0].ConnData.RemoteAddr.Port != 38229 {
+		t.Errorf("expected new connection port 38229, got %d", conns[0].ConnData.RemoteAddr.Port)
 	}
 }
 

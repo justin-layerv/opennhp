@@ -776,6 +776,21 @@ for this rule.
   alarms in that style; the `servers_healthy_low` / `registration_stale`
   block is the correct precedent.
 
+- **`MetricACConnEviction` baseline shifted at PR #1968.** Pre-#1968 the
+  metric fired on *any* FIFO eviction, which included a steady stream
+  of legitimate same-pubkey-new-IP arrivals (NAT rebind / EIP swap)
+  misclassified as evictions. Post-#1968 it fires *only* on legitimate
+  distinct-pubkey overflow. **Any alarm threshold (e.g., #1969) MUST be
+  calibrated against the post-#1968 sandbox baseline**, NOT the
+  historical CloudWatch values — a threshold tuned against the legacy
+  rate would be permanently silent on rates that should page. The
+  metric is also not strictly monotonic-on-FIFO: if a future regression
+  ever admits partial entries, the helper's nil-skip walk evicts a
+  later slot (correct, no DoS) but the metric still fires from the
+  switch arm; pair the alarm with an `acConnectionMap` size-churn
+  signal for invariant-free visibility (see
+  https://github.com/layervai/nhp/issues/1969#issuecomment-4455100642).
+
 ## Lock Order (server)
 
 When acquiring multiple mutexes in `endpoints/server/`, follow this order
@@ -792,12 +807,14 @@ must update this list and audit all existing call sites.
   no other mutex is acquired while holding it. The connection
   routine's defer takes it briefly to remove the global-map entry.
 - **`acConnectionMapMutex` then `remoteConnectionMapMutex`, never
-  reversed.** `HandleACOnline`'s stale-conn cleanup acquires
-  `acConnectionMapMutex` first to find the stale entry, releases it,
-  then acquires `remoteConnectionMapMutex` to remove the global-map
-  entry. Holding both at once would invert against the connection
-  routine's defer (which removes from `acConnectionMap` first, then
-  from `remoteConnectionMap` via `removeConnection`).
+  reversed AND never nested.** `HandleACOnline`'s stale-conn cleanup
+  acquires `acConnectionMapMutex` first to find the stale entry,
+  releases it, then acquires `remoteConnectionMapMutex` to remove
+  the global-map entry. The two are never held simultaneously — even
+  nested-in-order acquisition is forbidden because the connection
+  routine's defer would invert against it (it removes from
+  `acConnectionMap` first, then from `remoteConnectionMap` via
+  `removeConnection`).
 - **`agentPeerMapMutex` then `device.peerMapMutex`, never reversed.**
   `AddAgentPeer` (`udpserver.go`) holds `agentPeerMapMutex` across
   the `device.AddPeer` call so both maps reflect the new agent in a

@@ -1006,9 +1006,11 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		Apps:           aolMsg.ResourceIds,
 	}
 
-	// Register the AC connection, supporting multiple ACs with the same AC ID (blue/green).
-	// If the same IP re-registers (e.g., socket recreation), update in-place.
-	// If a new IP registers, append (different AC instance with same AC ID).
+	// Register the AC connection. Admission policy (pubkey-keyed
+	// replace-or-append with FIFO backstop) lives in
+	// replaceOrAppendACConn; identity-invariant rationale (why pubkey
+	// and not IP) lives on the acConnectionMap field declaration in
+	// udpserver.go.
 	s.acConnectionMapMutex.Lock()
 	existingConns := s.acConnectionMap[acId]
 
@@ -1041,58 +1043,98 @@ func (s *UdpServer) HandleACOnline(ppd *core.PacketParserData) (err error) {
 		return capRejectErr
 	}
 
-	updated := false
-	var staleConn *ACConn
-	for i, existing := range existingConns {
-		if existing.ConnData.RemoteAddr.IP.Equal(ppd.ConnData.RemoteAddr.IP) {
-			// Same IP, possibly different port → re-registration (e.g., socket recreation)
-			oldAddr := existing.ConnData.RemoteAddr.String()
-			newAddr := ppd.ConnData.RemoteAddr.String()
-			if oldAddr != newAddr {
-				staleConn = existing
-				log.Info("server-ac(%s#%d@%s)[HandleACOnline] Updating connection from %s (same IP, new port)",
-					acId, transactionId, addrStr, oldAddr)
-			}
-			existingConns[i] = acConn
-			updated = true
-			break
-		}
+	// Pubkey-keyed admit; F3 cap-gate above fences impostor pubkeys,
+	// this admit logic fences the live-connection table. See
+	// replaceOrAppendACConn.
+	existingConns, replaced, staleConn := replaceOrAppendACConn(existingConns, acConn)
+	// No `default:` arm — the under-cap append case `(!replaced &&
+	// stale == nil)` falls through silently and is then handled by
+	// the `if !replaced` block below (which also handles the FIFO
+	// case's registration log). See the comment on that block for
+	// why it's outside the switch.
+	switch {
+	case replaced && staleConn != nil:
+		// New addr is in the `@%s` prefix above; only the old addr
+		// needs naming explicitly to disambiguate. Pubkey prefix
+		// matches the FIFO Warning's shape so dashboards that
+		// correlate replace + evict events on a single AC pubkey
+		// can pivot on the same field.
+		log.Info("server-ac(%s#%d@%s)[HandleACOnline] Replacing same-pubkey connection: pubkey=%s... old=%s",
+			acId, transactionId, addrStr, pubkeyLogPrefix(staleConn.ACPeer.PubKeyBase64), staleConn.ConnData.RemoteAddr.String())
+	case replaced:
+		// (true, nil) — same-pubkey AOL on the live socket (keepalive
+		// racing first AOL). Silent by design.
+	case staleConn != nil:
+		// FIFO eviction on distinct-pubkey overflow. Include the
+		// evicted slot's pubkey prefix + addr so #1969's alarm
+		// pages an operator with the forensic context that
+		// pubkeyLogPrefix-style logs already provide for the F3
+		// reject paths. The alarm fires only on legitimate
+		// overflow (rare in production), so the operator won't
+		// have context cached when paged.
+		s.metrics.IncrCounter(MetricACConnEviction)
+		log.Warning("server-ac(%s)[HandleACOnline] Max connections per AC ID reached (%d), evicting oldest: pubkey=%s... addr=%s",
+			acId, MaxACConnsPerID, pubkeyLogPrefix(staleConn.ACPeer.PubKeyBase64), staleConn.ConnData.RemoteAddr.String())
+	}
+	// The `if !replaced` is outside the switch on purpose. The
+	// FIFO path is `(!replaced, stale != nil)`, not the switch's
+	// `default:`, so consolidating this into a `default:` arm
+	// would silently drop the registration log on FIFO-then-
+	// append. The wrapper test asserts FIFO's metric + slice
+	// shape; this Info-log dual-emit isn't directly asserted
+	// (no log capture wired) — the structural invariant lives in
+	// this comment and a future refactor that consolidates the
+	// branches must preserve it by inspection. Adding log
+	// capture to the wrapper test is tracked separately if a
+	// regression ever surfaces.
+	if !replaced {
+		log.Info("server-ac(%s#%d@%s)[HandleACOnline] New AC instance registered (total: %d)",
+			acId, transactionId, addrStr, len(existingConns))
 	}
 
-	if !updated {
-		// New IP → different AC instance with same AC ID (blue/green)
-		log.Info("server-ac(%s#%d@%s)[HandleACOnline] New AC instance registered (total: %d)",
-			acId, transactionId, addrStr, len(existingConns)+1)
-		if len(existingConns) >= MaxACConnsPerID {
-			// F3 (#1157) has already passed at this point — the
-			// distinct-pubkey cap is the attack-break gate. This
-			// FIFO eviction enforces the legitimate connection-count
-			// cap (e.g., a blue/green stretch that legitimately
-			// stretches one pubkey across MaxACConnsPerID instances
-			// still trips this branch and evicts the oldest IP).
-			// Don't consolidate the two checks: F3 fences impostors,
-			// this fences the live-connection table.
-			staleConn = existingConns[0]
-			existingConns = existingConns[1:]
-			s.metrics.IncrCounter(MetricACConnEviction)
-			log.Warning("server-ac(%s)[HandleACOnline] Max connections per AC ID reached (%d), evicting oldest",
-				acId, MaxACConnsPerID)
-		}
-		existingConns = append(existingConns, acConn)
+	// All-partial fallthrough alarm. The helper falls through to a
+	// plain append (no FIFO) when every existing entry is partial —
+	// safe today (production never inserts partials) but indicates
+	// an upstream invariant break if it ever fires. The (!replaced,
+	// stale == nil) switch arm above is silent on this path, so log
+	// here at WARN so an operator triaging a slow registration sees
+	// the cap-overshoot without having to grep for it.
+	//
+	// TODO: the WARN fires AFTER the slice has already grown past
+	// cap, and if the upstream invariant break is persistent (every
+	// entry partial), each subsequent registration trips this and
+	// grows the slice further. The match loop will skip partials on
+	// the next call, but the cap stays structurally breached until
+	// the next legitimate registration succeeds and compacts the
+	// slice via FIFO. An in-place compaction here (drop nil/partial
+	// entries before the append) would converge the slice back to a
+	// bounded length on every all-partial trip. Out of scope for
+	// #1968 since production never hits this path; tracked as a
+	// hardening follow-up.
+	if !replaced && staleConn == nil && len(existingConns) > MaxACConnsPerID {
+		log.Warning("server-ac(%s#%d@%s)[HandleACOnline] acConnectionMap slice grew past cap (len=%d, cap=%d) — all existing entries partial, FIFO skipped; upstream invariant break suspected",
+			acId, transactionId, addrStr, len(existingConns), MaxACConnsPerID)
 	}
 
 	s.acConnectionMap[acId] = existingConns
 	s.acConnectionMapMutex.Unlock()
 
-	// Clean up stale connection outside the lock (if any). The
-	// connectionRoutine defer's `perIPElem != nil` branch handles
-	// connectionsByIP cleanup for any conn that was bucketed at
-	// admit — AC, DB, or agent. In the cloud-mode dynamic-AC
-	// corner (#1533), an AC's first NHP_AOL packet from an
-	// unknown IP misclassifies as agent and lands in the bucket;
-	// that conn's perIPElem is non-nil and the routine's defer
-	// will pop it correctly. The direct delete here only touches
-	// remoteConnectionMap.
+	// Clean up stale connection outside the lock (if any). With
+	// pubkey-keyed admission, staleConn can now be a same-pubkey
+	// reconnect from a DIFFERENT IP (NAT rebind / EIP swap), not
+	// just same-IP-different-port. The lookup is by the OLD
+	// address regardless — remoteConnectionMap is keyed by remote
+	// UDP address — and a missing entry (already cleaned up by
+	// the conn routine's defer) is a no-op.
+	//
+	// The connectionRoutine defer's `perIPElem != nil` branch
+	// handles connectionsByIP cleanup for any conn that was
+	// bucketed at admit — AC, DB, or agent. In the cloud-mode
+	// dynamic-AC corner (#1533), an AC's first NHP_AOL packet
+	// from an unknown IP misclassifies as agent and lands in the
+	// bucket; that conn's perIPElem is non-nil and the routine's
+	// defer will pop it correctly. The direct delete here only
+	// touches remoteConnectionMap.
 	if staleConn != nil {
 		oldAddrStr := staleConn.ConnData.RemoteAddr.String()
 		s.remoteConnectionMapMutex.Lock()
