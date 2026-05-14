@@ -34,6 +34,23 @@ import (
 // RunID is the agent's run-scope identifier (nullable; populated by PR-2c
 // via the agent registration path). Backwards-compat: legacy ACK paths
 // that do not carry a RunID write the empty string here.
+//
+// User is *common.AgentUser and is legitimately nil during the ACK-
+// path window before the agent identity is captured. Readers (the
+// /token/validate handler) defensively nil-check; future
+// construction paths MUST treat nil User as a valid transitional
+// state, not a server bug.
+//
+// Post-store mutation is forbidden. tokenStore.Load returns the
+// same pointer that was stored, and readers (the validate handler,
+// any future reader) access fields lock-free under that invariant.
+// GenerateAccessToken sets ExpireTime BEFORE the Store call;
+// NewACKTokenEntry returns a fresh value. A future caller that
+// writes to a stored entry (e.g., to populate RunID after the
+// fact) must either swap a new entry in via Store (preserving the
+// invariant) or introduce a mutex on the entry — without one of
+// those, the race detector will fire and lock-free readers will
+// need to start cloning.
 type ACTokenEntry struct {
 	User       *common.AgentUser
 	ResourceId string

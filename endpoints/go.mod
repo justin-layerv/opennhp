@@ -20,7 +20,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/layervai/nhp/internalauth v0.0.0-00010101000000-000000000000
+	github.com/layervai/nhp/internalauth v0.2.0
 	github.com/mark3labs/mcp-go v0.49.0
 	github.com/pelletier/go-toml/v2 v2.3.0
 	github.com/pion/webrtc/v4 v4.2.11
@@ -212,18 +212,9 @@ require (
 
 replace github.com/OpenNHP/opennhp/nhp v0.6.0 => ../nhp
 
-// internalauth is replaced unversioned (vs nhp's pinned v0.6.0)
-// because no tag under the new module path has been cut yet —
-// internalauth/v0.1.0 exists but points at the pre-rename path
-// github.com/OpenNHP/opennhp/internalauth, so it isn't resolvable
-// via Go proxy under the current module path. The
-// v0.0.0-00010101000000-000000000000 placeholder in the require
-// above is the Go-toolchain-generated stand-in for "no real
-// version exists, resolve via the replace below." Once
-// internalauth/v0.1.1 lands against the new path (release-please
-// manifest mode tracked by #1836), pin this replace to that
-// version or remove it entirely if consumed via go.sum. DO NOT
-// hand-edit the placeholder version in the require line —
-// `go mod tidy` regenerates it from the current state of
-// ../internalauth.
-replace github.com/layervai/nhp/internalauth => ../internalauth
+// Keep the LHS version in lockstep with the require line above.
+// A future bump of the require version that forgets this line would
+// silently resolve internalauth from the module proxy instead of
+// ../internalauth, breaking local API edits to internalauth. See
+// follow-up issue #1937 for the broader fix (drop the LHS pin).
+replace github.com/layervai/nhp/internalauth v0.2.0 => ../internalauth

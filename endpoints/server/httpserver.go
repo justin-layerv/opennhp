@@ -720,9 +720,21 @@ func (hs *HttpServer) initRouter() {
 		hs.authWithAspPlugin(ctx, req)
 	})
 
-	// Internal knock forwarding endpoint (VPC-only, RFC 1918 source IP check)
+	// Internal endpoints (VPC-only, RFC 1918 source IP check + HMAC).
+	// /knock        — forwards a knock to the assigned server
+	// /token/validate — validates an AC-issued knock token (PR-2b);
+	//                   used by tunnel-server PR-2c to verify the
+	//                   knock token attached to FRP login Metas.
+	//                   Wire-shape note: the request body field is
+	//                   `agent_run_id`, the response field is `run_id`
+	//                   (correlation key the tunnel-server may merge
+	//                   with its own run_id sources). The asymmetry
+	//                   is documented on internalTokenValidateResponse.RunID
+	//                   — readers chasing wireshark/log captures
+	//                   should expect both names.
 	nhpInternal := g.Group("/nhp/internal")
 	nhpInternal.POST("/knock", hs.handleInternalKnock)
+	nhpInternal.POST("/token/validate", hs.handleInternalTokenValidate)
 
 	hs.initStorageRouter()
 
