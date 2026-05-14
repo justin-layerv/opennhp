@@ -148,11 +148,23 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 	} else {
 		artMsg = artMsgIn
 	}
+	// Defense-in-depth: refuse openTimeSec <= 0. ipset.Add (utils/iptables.go)
+	// passes the value verbatim as the ipset `timeout` argument, and the
+	// kernel ipset semantics treat `timeout 0` as PERMANENT. The /refresh
+	// handler short-circuits at RemainingFirewallSeconds() <= 0 (#1942),
+	// so this gate fires only on a regression — but a permanent firewall
+	// hole is the worst outcome of such a regression. Fail-closed here too.
+	if openTimeSec <= 0 {
+		log.Error("[HandleAccessControl] openTimeSec=%d must be > 0 (would create a permanent ipset entry)", openTimeSec)
+		err = setArtMsgError(artMsg, common.ErrACInvalidOpenTime)
+		return
+	}
 	// process ac operation
 	tempOpenTimeSec := TempPortOpenTime
-	// 1 sec timeout means exit defaultset access, so exit tempset too
-	if openTimeSec == 1 {
-		tempOpenTimeSec = 1
+	// CloseWindowOpenTimeSec doubles as the "close everything" signal —
+	// see the constant's doc comment and AccessEntry.RemainingFirewallSeconds.
+	if openTimeSec == CloseWindowOpenTimeSec {
+		tempOpenTimeSec = CloseWindowOpenTimeSec
 	}
 
 	// check empty src address

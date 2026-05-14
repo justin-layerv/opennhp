@@ -66,10 +66,16 @@ Two enforcement layers, both coupled to per-qURL `session_duration`:
 
 | Layer | Mechanism | Coupled how |
 |---|---|---|
-| L3 (kernel) | iptables/ipset pinhole, timeout = `OpenTime` on the NHP knock packet | `qurl-service` returns `OpenTime = min(defaultOpenTime, sessionDuration)` so the pinhole closes when the session expires. NHP AC has a `openTimeSec == 1` special-case (`endpoints/ac/msghandler.go:154-156`) that also collapses the temp-port window to 1s. |
+| L3 (kernel) | iptables/ipset pinhole, timeout = `OpenTime` on the NHP knock packet | `qurl-service` returns `OpenTime = min(defaultOpenTime, sessionDuration)` so the pinhole closes when the session expires. NHP AC has a `openTimeSec == CloseWindowOpenTimeSec` special-case (`endpoints/ac/msghandler.go:152-156`) that also collapses the temp-port window to the same 1s window. |
 | L7 (HTTP) | `qurl-router` calls `qurl-service` resource authz on every cache-miss request | `qurl-service` filters sessions by TTL in Go (DDB TTL reaper lags up to 48h); positive-cache TTL = `min(15s, remaining_seconds)` |
 
 End-to-end: after `session_duration` seconds, both L3 (no more bytes flowing) and L7 (HTTP denied) close together.
+
+### Operator note: OpenTime=1 self-destruct sessions
+
+The post-qurl-service#498 floor lets `session_duration` go as low as 1 second (Discord-bot self-destruct presets; the bot rounds 0.5s up to 1s). At `OpenTime=1`, the AC's `RemainingFirewallSeconds()` returns 0 essentially immediately after issue (truncate-toward-zero in the sub-second dead zone), so the AC's `/refresh` endpoint refuses extension at any point past `FirstKnockTime + 1µs`. The session simply expires naturally at `FirstKnockTime + 1s`.
+
+This is intentional — a 1s self-destruct shouldn't be refreshable — but when triaging a "why isn't this refreshing?" report, the answer for `session_duration ≤ 2s` is the strict-firewall dead zone, not a regression. See `endpoints/ac/tokenstore_test.go::TestRemainingFirewallSeconds_OpenTimeOneBoundary` for the fence.
 
 ## Alternative considered: stateless signed cookie
 
@@ -202,7 +208,7 @@ To detect when we're approaching the revisit thresholds:
 ## References
 
 - `endpoints/server/staticplugins/qurl/main.go::AuthWithHttp` — the resolve handler that mints sessions
-- `endpoints/ac/msghandler.go:152-156` — the `openTimeSec == 1` special-case on the AC
+- `endpoints/ac/msghandler.go:152-156` — the `openTimeSec == CloseWindowOpenTimeSec` special-case on the AC (constant in `endpoints/ac/constants.go`)
 - `qurl-service/internal/service/resolve_service.go::AuthorizeResourceAccess` — the authz service method
 - `qurl-service/internal/service/resolve_service.go::buildResolveOutput` — OpenTime ↔ SessionDuration coupling
 - `traefik-plugins/plugins-local/src/github.com/traefik/qurl-router/qurl_router.go::authorizeResourceAccess` — the consumer

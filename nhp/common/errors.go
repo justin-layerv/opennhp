@@ -208,6 +208,15 @@ var (
 	// ErrACDuplicateTransaction so an oncall chasing a duplicate-
 	// spike alert is not misled by an upstream invariant violation.
 	ErrACMissingPeerPubkey = newError("53008", "missing peer pubkey on ac transaction")
+	// ErrACInvalidOpenTime — defense-in-depth fail-closed against an
+	// openTimeSec <= 0 reaching HandleAccessControl. ipset.Add maps the
+	// timeout argument verbatim into `ipset add ... timeout N`, and the
+	// kernel ipset treats `timeout 0` as PERMANENT (no expiry). The
+	// httpac.go refresh handler already short-circuits at
+	// RemainingFirewallSeconds() <= 0, so this gate fires only on a
+	// regression — but a permanent firewall hole is the worst possible
+	// outcome of such a regression, so we double-fence here. See #1942.
+	ErrACInvalidOpenTime = newError("53009", "ac invalid openTime (must be > 0)")
 
 	// api
 	ErrHttpRequestFailed           = newError("54001", "http request failed")

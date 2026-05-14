@@ -282,3 +282,40 @@ func TestHandleAccessControl_SentinelIP_MultipleAddresses(t *testing.T) {
 		}
 	}
 }
+
+// TestHandleAccessControl_RejectsNonPositiveOpenTime is the defense-in-depth
+// fence for the #1946 cap. ipset.Add (utils/iptables.go) passes the
+// timeout verbatim into `ipset add ... timeout N`, and the kernel
+// treats `timeout 0` as PERMANENT. The /refresh handler's
+// remainingSec<=0 short-circuit (httpac.go) is the primary fence; this
+// gate is the secondary fence — a regression that drops the short-
+// circuit must still hit this and fail-closed rather than punching a
+// permanent firewall hole.
+//
+// Constructs only the artMsg path (no UdpAC fields touched) because
+// the guard fires at the top of HandleAccessControl before any
+// ipset/iptables call. A future refactor that moves the guard below
+// the first ipset call would still pass this test BUT would also pass
+// the live ipset call (which would create the permanent entry) —
+// guard placement is documented and not test-fenced. The unit test
+// covers the contract; live ipset is in #1950 (Tier 1 smoke).
+func TestHandleAccessControl_RejectsNonPositiveOpenTime(t *testing.T) {
+	a := &UdpAC{}
+	for _, openTimeSec := range []int{0, -1, -1000} {
+		artMsg, err := a.HandleAccessControl(nil, nil, nil, openTimeSec, nil)
+		if err == nil {
+			t.Errorf("openTimeSec=%d: expected error, got nil", openTimeSec)
+			continue
+		}
+		if !errors.Is(err, common.ErrACInvalidOpenTime) {
+			t.Errorf("openTimeSec=%d: error = %v, want ErrACInvalidOpenTime", openTimeSec, err)
+		}
+		if artMsg == nil {
+			t.Errorf("openTimeSec=%d: artMsg must be allocated even on rejection", openTimeSec)
+			continue
+		}
+		if artMsg.ErrCode != common.ErrACInvalidOpenTime.ErrorCode() {
+			t.Errorf("openTimeSec=%d: artMsg.ErrCode = %q, want %q", openTimeSec, artMsg.ErrCode, common.ErrACInvalidOpenTime.ErrorCode())
+		}
+	}
+}

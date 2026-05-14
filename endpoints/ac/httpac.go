@@ -195,8 +195,40 @@ func (ha *HttpAC) HandleHttpRefreshOperations(c *gin.Context, req *common.HttpRe
 
 	entry := ha.ua.VerifyAccessToken(req.Token)
 	if entry == nil {
+		// Response body intentionally identical to the firewall-deadline
+		// branch (~30 lines below) so a token-holder cannot distinguish
+		// "this token is past the absolute deadline" from "this token is
+		// inside the late-packet buffer window but past the firewall
+		// deadline" — see #1960 (the cr-flagged buffer-edge oracle).
+		// Operator triage stays distinguishable via the log line.
 		log.Error("token verification failed")
-		c.JSON(http.StatusOK, gin.H{"errMsg": "token verification failed"})
+		c.JSON(http.StatusOK, gin.H{"errMsg": "token expired"})
+		return
+	}
+
+	// Cap re-issued firewall window at the absolute deadline (#1942); 0 =
+	// refuse re-open. Residual at small remainingSec: ipset.Add inside
+	// HandleAccessControl uses remainingSec as a relative timeout, so any
+	// Go-level latency between this call and the kernel-level Add overshoots
+	// FirstKnockTime+OpenTime. <100ms in practice, swamped by
+	// truncate-toward-zero at OpenTime>buffer; visible only at the
+	// qurl-service#498 self-destruct floor (OpenTime=1), where the
+	// degenerate-floor test already documents the session as effectively
+	// un-refreshable. A strict-ceiling fix would thread the deadline through
+	// HandleAccessControl — not done here.
+	remainingSec := entry.RemainingFirewallSeconds()
+	if remainingSec <= 0 {
+		// src_ip + user_id only — token is intentionally omitted (post-#1124
+		// the token is the entire auth secret). nil-guard the User deref:
+		// every issue path populates User, but a security log line on a
+		// rare deny branch panicking via gin.Recovery would mask exactly
+		// the failure operators need to triage.
+		userID := "<unknown>"
+		if entry.User != nil {
+			userID = entry.User.UserId
+		}
+		log.Error("firewall deadline passed; refusing extension (src_ip=%s user_id=%s)", req.SrcIp, userID)
+		c.JSON(http.StatusOK, gin.H{"errMsg": "token expired"})
 		return
 	}
 
@@ -214,10 +246,11 @@ func (ha *HttpAC) HandleHttpRefreshOperations(c *gin.Context, req *common.HttpRe
 			Port:     entry.SrcAddrs[0].Port,
 			Protocol: entry.SrcAddrs[0].Protocol,
 		}
+		// Pre-existing unbounded slice-append race; tracked in #1951.
 		entry.SrcAddrs = append(entry.SrcAddrs, newSrcAddr)
 	}
 
-	_, err = ha.ua.HandleAccessControl(entry.User, entry.SrcAddrs, entry.DstAddrs, entry.OpenTime, nil)
+	_, err = ha.ua.HandleAccessControl(entry.User, entry.SrcAddrs, entry.DstAddrs, remainingSec, nil)
 	if err != nil {
 		log.Error("HandleAccessControl failed: %v", err)
 		c.JSON(http.StatusOK, gin.H{"errMsg": err.Error()})

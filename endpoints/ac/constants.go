@@ -15,6 +15,13 @@ const (
 	TokenStoreRefreshInterval = common.TokenStoreRefreshInterval
 	TempPortOpenTime          = 30
 
+	// CloseWindowOpenTimeSec is the doubly-loaded sentinel: a hand-set
+	// openTimeSec=1 means "close everything" (collapse the tempset
+	// alongside the defaultset). RemainingFirewallSeconds can also
+	// organically return 1 in the (1.0, 2.0)s window post-refresh,
+	// which trips the same path — see HandleAccessControl.
+	CloseWindowOpenTimeSec = 1
+
 	IPSET_DEFAULT_NAME      = "defaultset"
 	IPSET_DEFAULT_DOWN_NAME = "defaultset_down"
 
