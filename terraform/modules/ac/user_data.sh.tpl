@@ -1207,6 +1207,7 @@ cat >> /home/ubuntu/traefik/dynamic.toml << QURLDYNAMICEOF
   # are not dialable.
   enableInstanceHrw = ${qurl_router_enable_instance_hrw}
   instanceDiscoveryTtl = ${qurl_router_instance_discovery_ttl_seconds}
+  enableQurlSiteAuthz = ${qurl_router_enable_qurl_site_authz}
   # frpServerUrl deliberately empty: with the per-AZ qurl-reverse-tunnel-server
   # fleet (#1499), there's no single backend to point at — each customer's
   # tunnel lives on a specific AZ-pinned instance, and qurl-router reads the

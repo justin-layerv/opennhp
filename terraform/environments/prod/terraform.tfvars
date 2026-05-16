@@ -201,6 +201,13 @@ traefik_plugins = {
 # Requires QURL Service to be deployed (deploy_qurl_service = true)
 qurl_router_enabled = true
 
+# L7 per-session authz gate on *.qurl.site. Activates at the NEXT
+# AC instance refresh after apply (not at terraform apply itself —
+# the AC ASG has no instance_refresh{} block on purpose). The prod
+# canary state machine is what drives the refresh.
+# See `var.enable_qurl_site_authz` for the full description.
+enable_qurl_site_authz = true
+
 # CORS
 # Note: website origins appear here (QURL API) AND in dashboard_allowed_origins
 # (billing/developer-portal APIs) because they are separate CORS configurations.

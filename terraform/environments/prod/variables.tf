@@ -545,6 +545,12 @@ variable "instance_discovery_ttl_seconds" {
   default     = 20
 }
 
+variable "enable_qurl_site_authz" {
+  description = "Enable the qurl-router L7 per-session authz gate on *.qurl.site. See terraform/variables.tf for the full description (activation cadence, producer dependency, trust-boundary requirements)."
+  type        = bool
+  default     = false
+}
+
 # ==================== qurl-reverse-tunnel-server deploy + sizing (per-AZ + canary) ====================
 # PR 3 only declares the NEW per-AZ / blue/green / canary variables here.
 # The existing tfvars values for `deploy_frps` / `frps_*` are already

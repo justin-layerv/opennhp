@@ -130,13 +130,15 @@ const (
 // `"https-only-sandbox": true` once a greenfield env with
 // HTTP-listener-disabled tfvars lands.
 //
-// FOURTH COORDINATION POINT: this map is a fourth env-keyed state
-// that must update in lockstep with the three sites listed in
-// dns.go::deriveEndpoints (the workflow `||` chain on
+// FOURTH OF FIVE COORDINATION POINTS: this map is one of the env-
+// keyed states that must update in lockstep with the sites listed
+// in dns.go::deriveEndpoints (the workflow `||` chain on
 // NHP_SMOKE_QURL_INTERNAL_ALB_ENABLED, the env case in dns.go
-// itself, and the env's tfvars). #1640's SSM-sourced consolidation
-// is the long-term fix for all four; until that lands, adding a
-// new env requires four edits.
+// itself, and the env's tfvars) — and now also
+// qurlSiteAuthzOptOutEnvs in 17_qurl_router_authz_gate_test.go
+// added in #1984 (the fifth). #1640's SSM-sourced consolidation
+// is the long-term fix for all five; until that lands, adding a
+// new env requires five edits.
 var httpListenerOptOutEnvs = map[string]bool{}
 
 // publicALBLockdownExpectedBody is the parsed shape of the fixed-response

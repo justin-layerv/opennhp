@@ -407,6 +407,13 @@ enable_resolve_cloudfront = true
 # Enable QURL Router when QURL Service is deployed and internal_service_token is configured
 qurl_router_enabled = true
 
+# L7 per-session authz gate on *.qurl.site. Activates at the NEXT
+# AC instance refresh after apply (not at terraform apply itself —
+# the AC ASG has no instance_refresh{} block on purpose). The
+# blue/green deploy workflow is what drives the refresh in sandbox.
+# See `var.enable_qurl_site_authz` for the full description.
+enable_qurl_site_authz = true
+
 # Cache settings (defaults are reasonable for most use cases)
 # qurl_router_cache_ttl          = 60   # seconds for successful lookups
 # qurl_router_negative_cache_ttl = 30   # seconds for 404s

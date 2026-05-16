@@ -120,6 +120,7 @@ module "nhp" {
   qurl_router_cache_shards       = var.qurl_router_cache_shards
   enable_instance_hrw            = var.enable_instance_hrw
   instance_discovery_ttl_seconds = var.instance_discovery_ttl_seconds
+  enable_qurl_site_authz         = var.enable_qurl_site_authz
 
   # qurl-reverse-tunnel-server. PR 3 wires only the NEW
   # variables introduced by this PR (per-AZ sizing, blue/green, canary,

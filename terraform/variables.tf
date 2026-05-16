@@ -1453,6 +1453,66 @@ variable "instance_discovery_ttl_seconds" {
   }
 }
 
+variable "enable_qurl_site_authz" {
+  description = <<-EOT
+    Enable the qurl-router L7 per-session authorization gate on the
+    *.qurl.site branch. Implemented in layervai/traefik-plugins#146;
+    consumer plugin field is `enableQurlSiteAuthz` on the
+    qurl-router middleware Config.
+
+    When true, the plugin calls
+    GET /internal/v1/resource/:id/authorize on every *.qurl.site
+    request and silentDrops requests whose session has expired or
+    been revoked. When false (the default), the *.qurl.site branch
+    skips the gate and per-session enforcement relies solely on the
+    L3 OpenTime clamp at iptables.
+
+    Revoke-to-blocked latency SLO: positive authz results are
+    cached for up to `min(authCacheTTL, remaining_seconds)` —
+    `authCacheTTL` is currently 15s in the plugin. A server-side
+    revoke takes effect at the consumer no later than 15 seconds
+    after issue; clients with a recently-cached positive authz can
+    see the revoked resource for up to that window. This is the
+    accepted trade-off for keeping the gate off the hot path on
+    every request. Operators evaluating compliance against
+    stricter revocation SLAs should treat the L3 OpenTime clamp
+    (still enforced at iptables regardless of this flag) as the
+    sub-15s floor.
+
+    Activation cadence: this variable threads through user_data, so
+    `terraform apply` bumps the AC launch-template version but does
+    NOT replace running AC instances (the AC ASG has no
+    `instance_refresh{}` block — by design, to keep TF apply
+    light-weight). The flag activates per-instance at the NEXT AC
+    instance refresh in each env — driven by the blue/green or
+    canary deploy workflow, not by `terraform apply` alone. The
+    plugin emits a one-shot startup `Info` line on activation,
+    which is the in-band signal that the flag is loaded.
+
+    Producer dependency: the consumer call is to qurl-service's
+    `/internal/v1/resource/:id/authorize` endpoint. Verify the
+    endpoint is live on every API task (image tag containing the
+    producer rollout) before flipping. Reversible — flip back to
+    false and re-trigger AC refresh to bypass the gate if a
+    producer-side regression surfaces.
+
+    Trust-boundary dependency: the gate's security relies on
+    Traefik's `forwardedHeaders.trustedIPs` being pinned to the
+    upstream proxy chain so an attacker cannot spoof
+    `X-Forwarded-For: <victim-ip>` and ride the victim's authz
+    cache. The AC's Traefik config pins this to `vpc_cidr` and the
+    HTTPS entrypoint uses PROXY protocol from the NLB — the
+    PROXY-rewritten connection source is what gets checked against
+    the trust set, so external XFF spoofs are rejected before
+    reaching the plugin's client-IP extractor. See
+    `terraform/modules/ac/user_data.sh.tpl` (entrypoint config) and
+    `extractClientIP` in `layervai/traefik-plugins`'s
+    `plugins-local/src/github.com/traefik/qurl-router/qurl_router.go`.
+  EOT
+  type        = bool
+  default     = false
+}
+
 # ==================== Security Alerting ====================
 
 variable "guardduty_alert_emails" {

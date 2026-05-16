@@ -823,6 +823,7 @@ locals {
     # on an instance launched against the new LT version.
     qurl_router_enable_instance_hrw            = var.qurl_router_config != null ? var.qurl_router_config.enable_instance_hrw : false
     qurl_router_instance_discovery_ttl_seconds = var.qurl_router_config != null ? var.qurl_router_config.instance_discovery_ttl_seconds : 20
+    qurl_router_enable_qurl_site_authz         = var.qurl_router_config != null ? var.qurl_router_config.enable_qurl_site_authz : false
     qurl_service_token_secret_arn              = var.qurl_service_token_secret_arn
     # Centralized certificate management (for scalable AC deployments)
     centralized_cert_enabled    = var.centralized_cert_enabled

@@ -106,6 +106,28 @@ resource "null_resource" "qurl_router_domain_validation" {
   }
 }
 
+# `enable_qurl_site_authz=true` is only meaningful when the qurl-router
+# middleware is actually rendered into Traefik's dynamic config. That
+# render is gated on `deploy_qurl_service && qurl_router_enabled` at
+# the module-input assembly (see `qurl_router_config` in this file), so
+# flipping the authz flag without those preconditions makes the flag
+# silently a no-op — an operator-confusion trap. Fail at plan time
+# instead.
+resource "terraform_data" "qurl_site_authz_preconditions" {
+  count = var.enable_qurl_site_authz ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = var.qurl_router_enabled
+      error_message = "enable_qurl_site_authz=true requires qurl_router_enabled=true. Without the qurl-router middleware, the *.qurl.site branch isn't routed through this plugin and the L7 gate has no execution path."
+    }
+    precondition {
+      condition     = var.deploy_qurl_service
+      error_message = "enable_qurl_site_authz=true requires deploy_qurl_service=true. The L7 gate calls qurl-service's /internal/v1/resource/:id/authorize endpoint; without the service deployed, every request fails closed (silentDrop)."
+    }
+  }
+}
+
 # ==================== Locals ====================
 
 locals {
@@ -1016,6 +1038,7 @@ module "ac" {
     # for module-direct consumers that don't pass the new fields.
     enable_instance_hrw            = var.enable_instance_hrw
     instance_discovery_ttl_seconds = var.instance_discovery_ttl_seconds
+    enable_qurl_site_authz         = var.enable_qurl_site_authz
   } : null
   qurl_service_token_secret_arn = var.deploy_qurl_service && var.qurl_router_enabled ? var.qurl_internal_service_token_arn : null
 

@@ -612,7 +612,7 @@ PR1 ships Tier 1 only. PR2 adds Tier 2. PR3 adds Tier 3 + flips
 required check.
 
 **Env-keyed feature gating in the smoke suite is currently a
-multi-place coordination** — see #1640. Today four sites must update
+multi-place coordination** — see #1640. Today five sites must update
 in lockstep when adding a new env that participates in the qurl-
 service internal-ALB rollout:
 
@@ -623,14 +623,18 @@ service internal-ALB rollout:
 4. `tests/smoke/09_public_alb_internal_lockdown_test.go` —
    `httpListenerOptOutEnvs` map (env that disables the public HTTP
    listener opts out of the HTTP-redirect fence).
+5. `tests/smoke/17_qurl_router_authz_gate_test.go` —
+   `qurlSiteAuthzOptOutEnvs` map (env that disables the L7 authz
+   gate on `*.qurl.site` opts out of the silentDrop fence). Added
+   in #1984.
 
-#1640 tracks moving all four onto SSM-sourced reads at `TestMain`,
+#1640 tracks moving all five onto SSM-sourced reads at `TestMain`,
 collapsing the coordination to a single Terraform-owned parameter
 per gate. Until that lands, adding a new env to the suite is a
-four-place edit.
+five-place edit.
 
 The `scripts/check-smoke-tier-filter-coverage.sh::tier3_no_ssm_expected_omissions`
-list is a fifth env-independent maintenance list — it documents
+list is a sixth env-independent maintenance list — it documents
 which Test prefixes are SSM-required and so legitimately omitted
 from the tier3-no-ssm RUN_FILTER. Update it when a test gains or
 loses a hard SSM dependency.

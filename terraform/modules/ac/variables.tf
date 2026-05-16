@@ -516,16 +516,16 @@ variable "qurl_router_config" {
 
     Example:
     qurl_router_config = {
-      enabled         = true
-      api_url         = "http://qurl-api.internal:8080"
-      base_domain     = "qurl.site"
-      cache_ttl       = 60
-      negative_cache_ttl = 30
-      api_timeout     = 5
-      proxy_timeout   = 30
-      # Router-side HRW (traefik-plugins #134) — see field comments below.
+      enabled                        = true
+      api_url                        = "http://qurl-api.internal:8080"
+      base_domain                    = "qurl.site"
+      cache_ttl                      = 60
+      negative_cache_ttl             = 30
+      api_timeout                    = 5
+      proxy_timeout                  = 30
       enable_instance_hrw            = false
       instance_discovery_ttl_seconds = 20
+      enable_qurl_site_authz         = false
     }
   EOT
   type = object({
@@ -555,6 +555,17 @@ variable "qurl_router_config" {
     # weighted A-record selection when only one IP is returned).
     enable_instance_hrw            = optional(bool, false)
     instance_discovery_ttl_seconds = optional(number, 20)
+    # L7 per-session authz gate on the *.qurl.site branch. Default
+    # false so module-direct consumers whose qurl_router_config object
+    # predates this field stay on the pre-gate behavior — and the
+    # plugin's own Go zero-value is also false, so the rendered TOML
+    # matches. The L3 OpenTime clamp at iptables continues to enforce
+    # session_duration regardless of this flag; flipping false only
+    # gives up the consumer-cache bound (cached positive authz can
+    # outlive a server-side revoke for up to min(authCacheTTL,
+    # remaining_seconds)). See `var.enable_qurl_site_authz` at the
+    # root for the full description.
+    enable_qurl_site_authz = optional(bool, false)
   })
   default = null
 
@@ -579,6 +590,25 @@ variable "qurl_router_config" {
       )
     )
     error_message = "qurl_router_config.instance_discovery_ttl_seconds must be between 1 and 600. Outside this range the router-side HRW resolver caches stale IP sets or hammers DNS — both produce wrong dispatch decisions silently."
+  }
+
+  validation {
+    # Module-direct defense-in-depth for the same trap the root-level
+    # `terraform_data.qurl_site_authz_preconditions` catches. A module-
+    # direct caller that bypasses the root assembly could otherwise set
+    # `enable_qurl_site_authz = true` while leaving `enabled = false` —
+    # the entire qurl-router middleware block is gated on `enabled`, so
+    # the authz flag silently no-ops. The root precondition still does
+    # the heavy lifting (it can also assert on cross-variable
+    # constraints like `deploy_qurl_service` that this validation
+    # can't reach); this is the module-local fence for the in-object
+    # subset of the same invariant.
+    condition = (
+      var.qurl_router_config == null
+      || !try(var.qurl_router_config.enable_qurl_site_authz, false)
+      || try(var.qurl_router_config.enabled, false)
+    )
+    error_message = "qurl_router_config.enable_qurl_site_authz=true requires qurl_router_config.enabled=true. The L7 gate has no execution path when the qurl-router middleware itself isn't rendered."
   }
 }
 
