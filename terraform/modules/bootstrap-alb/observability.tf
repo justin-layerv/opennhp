@@ -208,7 +208,7 @@ resource "aws_sns_topic_subscription" "email" {
 #
 # **No `Region` dim**: AWS/ApplicationELB metrics are region-implicit
 # (the metric stream lives in the region where the ALB exists),
-# so a `Region` dim doesn't apply. CLAUDE.md's "Metric / Alarm
+# so a `Region` dim doesn't apply. terraform/CLAUDE.md's "Metric / Alarm
 # Dim-Set Rules" `{Component, Environment, Region}` precedent is
 # specific to the AC publisher (which custom-emits via
 # `IncrCounter` with that exact dim set); AWS-native namespaces
@@ -370,7 +370,7 @@ resource "aws_cloudwatch_metric_alarm" "alb_tls_handshake_failures" {
 # signatures); rate-limit hits indicate real probing or a misbehaving
 # caller — that's the actionable signal.
 #
-# **Dim-set exact-match.** Per CLAUDE.md's "Metric / Alarm Dim-Set
+# **Dim-set exact-match.** Per terraform/CLAUDE.md's "Metric / Alarm Dim-Set
 # Rules" section, CloudWatch alarms select their metric stream by
 # EXACT dimension match. AWS/WAFV2 publishes `BlockedRequests` with
 # `{WebACL, Region, Rule}` — the alarm's `dimensions` map below

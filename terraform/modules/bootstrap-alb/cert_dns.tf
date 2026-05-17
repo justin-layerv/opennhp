@@ -49,7 +49,7 @@
 # Account topology table). Laptop plans from operators without that
 # cross-account grant will fail at refresh, not at the precondition.
 # Same shape as the `nhp_internal_auth` plan-role callout in
-# CLAUDE.md.
+# docs/SECURITY.md.
 #
 # The precondition lives on the data source itself (not just on the
 # downstream cert / alias resources) so an empty `route53_zone_id`

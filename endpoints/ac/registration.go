@@ -586,7 +586,7 @@ const envFallbackUnknown = "unknown"
 // capture; production code in NewACRegistration always calls it
 // through this binding. Do not call directly from non-startup code.
 var envFallbackWarn = func() {
-	log.Warning("[AC] config.Environment is empty or whitespace-only (falling back to %q). Region-keyed alarms in monitoring.tf require this dim; in deployed envs this signals a TF user_data regression. See CLAUDE.md \"Metric / Alarm Dim-Set Rules\".", envFallbackUnknown)
+	log.Warning("[AC] config.Environment is empty or whitespace-only (falling back to %q). Region-keyed alarms in monitoring.tf require this dim; in deployed envs this signals a TF user_data regression. See terraform/CLAUDE.md \"Metric / Alarm Dim-Set Rules\".", envFallbackUnknown)
 }
 
 // resolveEnvironment returns the publisher's Environment dim value

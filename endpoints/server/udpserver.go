@@ -2356,8 +2356,8 @@ func (s *UdpServer) dispatchReceivedMessage(ppd *core.PacketParserData) {
 // being populated together once agentPeerMap reflects the pubkey.
 // Lock-order: agentPeerMapMutex → device.peerMapMutex (acquired
 // by AddPeer). No existing code goes the reverse direction, so
-// the nested chain is safe; documented in CLAUDE.md's Lock Order
-// (server) section.
+// the nested chain is safe; documented in endpoints/server/CLAUDE.md's
+// Lock Order section.
 //
 // No-op when DeviceType != NHP_AGENT — guards against callers
 // accidentally adding an AC or DB peer through the agent path.

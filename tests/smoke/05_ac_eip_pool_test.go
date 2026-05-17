@@ -179,4 +179,4 @@ func TestACEIPPool_AlarmEvaluationPeriodsAtLeast3(t *testing.T) {
 // decoupled from user_data per follow-up #1007), delete this file
 // and replace with a new capability test for the new EIP allocation
 // mechanism. "Deletion is a valid PR" — see maintenance rule 5 in
-// nhp/CLAUDE.md.
+// tests/smoke/CLAUDE.md.

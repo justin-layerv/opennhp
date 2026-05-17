@@ -2307,7 +2307,7 @@ jobs:
       # missing-from-sparse-paths direction is tracked in #1750.
       #
       # The full three-file invariant (this env, prod tfvars, traefik-
-      # plugins repo directory) is documented in nhp/CLAUDE.md under
+      # plugins repo directory) is documented in terraform/CLAUDE.md under
       # "AC Plugin Source-of-Truth Invariant".
       TRAEFIK_PLUGIN_SPARSE_PATHS: |
         plugins-local/src/github.com/traefik/qurl-router
@@ -2454,7 +2454,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::TRAEFIK_PLUGINS_READ_TOKEN secret is not set on layervai/nhp. Set a fine-grained PAT with Contents:Read on layervai/traefik-plugins as that secret name. See nhp/CLAUDE.md 'AC Plugin Source-of-Truth Invariant' for the full setup contract."
+            echo "::error::TRAEFIK_PLUGINS_READ_TOKEN secret is not set on layervai/nhp. Set a fine-grained PAT with Contents:Read on layervai/traefik-plugins as that secret name. See terraform/CLAUDE.md 'AC Plugin Source-of-Truth Invariant' for the full setup contract."
             exit 1
           fi
           # Suppress the response body (we don't care about the SHA);
@@ -2499,7 +2499,7 @@ jobs:
               if [ "$last_rc" -eq 124 ]; then
                 echo "::error::TRAEFIK_PLUGINS_READ_TOKEN probe TIMED OUT (exit 124) after $ATTEMPTS attempts. github.com is likely having a sustained outage; wait it out and re-dispatch the promote. If timeouts continue past a status.github.com all-clear, escalate to the runbook for cross-repo PAT issues."
               else
-                echo "::error::TRAEFIK_PLUGINS_READ_TOKEN cannot read layervai/traefik-plugins contents (exit $last_rc) after $ATTEMPTS attempts. The secret is set but invalid (expired, revoked, missing Contents:Read scope, wrong repo selection). See gh's error above for the specific HTTP status. Issue a new fine-grained PAT with Contents:Read on layervai/traefik-plugins; see nhp/CLAUDE.md 'AC Plugin Source-of-Truth Invariant' for the setup contract and follow-up #1765 (App-token migration)."
+                echo "::error::TRAEFIK_PLUGINS_READ_TOKEN cannot read layervai/traefik-plugins contents (exit $last_rc) after $ATTEMPTS attempts. The secret is set but invalid (expired, revoked, missing Contents:Read scope, wrong repo selection). See gh's error above for the specific HTTP status. Issue a new fine-grained PAT with Contents:Read on layervai/traefik-plugins; see terraform/CLAUDE.md 'AC Plugin Source-of-Truth Invariant' for the setup contract and follow-up #1765 (App-token migration)."
               fi
               exit 1
             fi

@@ -178,8 +178,8 @@ resource "aws_wafv2_web_acl" "this" {
       # stream by `Rule = local.waf_rule_rate_limit`; to match, the
       # `metric_name` here MUST equal `local.waf_rule_rate_limit`.
       # Diverging puts the alarm in `INSUFFICIENT_DATA` forever
-      # (the exact failure mode CLAUDE.md's "Metric / Alarm Dim-Set
-      # Rules" section warns against).
+      # (the exact failure mode terraform/CLAUDE.md's "Metric / Alarm
+      # Dim-Set Rules" section warns against).
       metric_name              = local.waf_rule_rate_limit
       sampled_requests_enabled = true
     }

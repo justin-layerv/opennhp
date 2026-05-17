@@ -78,5 +78,5 @@
 //  4. SSM probes are named helpers. No dynamic command strings.
 //  5. Deletion is a valid PR — structural elimination of a bug class retires a fence.
 //
-// The full rules live in nhp/CLAUDE.md, "Smoke Test Suite".
+// The full rules live in tests/smoke/CLAUDE.md, "Smoke Test Suite".
 package smoke

@@ -83,9 +83,9 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "alb_access_logs" 
   bucket = aws_s3_bucket.alb_access_logs.id
 
   # SSE-S3 (AES256), NOT a customer-managed KMS CMK — deliberate
-  # divergence from CLAUDE.md's "Security Notes → All storage
-  # encrypted with KMS CMKs" guideline (search the repo-root
-  # CLAUDE.md for that exact heading). ALB access-log delivery does
+  # divergence from docs/SECURITY.md's "NHP-Specific Security Notes →
+  # All storage encrypted with KMS CMKs" guideline (search docs/SECURITY.md
+  # for that exact heading). ALB access-log delivery does
   # NOT support cross-account CMK (AWS limitation); same-account CMK
   # IS supported in principle, but SSE-S3 is deliberately chosen here
   # for two reasons:
@@ -309,7 +309,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "athena_query_resu
   bucket = aws_s3_bucket.athena_query_results.id
 
   # SSE-S3 (AES256), NOT a customer-managed KMS CMK — deliberate
-  # divergence from CLAUDE.md's "All storage encrypted with KMS CMKs"
+  # divergence from docs/SECURITY.md's "All storage encrypted with KMS CMKs"
   # default. Athena query results are derived data (re-runnable from
   # the access-log bucket), low sensitivity, and operator-only
   # accessible via the bucket's IAM principal. A CMK here would add

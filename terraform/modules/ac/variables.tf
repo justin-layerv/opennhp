@@ -12,7 +12,7 @@ variable "environment" {
   # would render as a malformed dim value in config.toml and produce
   # the same alarm-mismatch failure mode this fence exists to close.
   # The Go side has a TrimSpace defense too — defense-in-depth.
-  # See CLAUDE.md "Metric / Alarm Dim-Set Rules".
+  # See terraform/CLAUDE.md "Metric / Alarm Dim-Set Rules".
   #
   # The two validation blocks below have partially overlapping coverage
   # (the regex alone would reject most of what the trim/length block

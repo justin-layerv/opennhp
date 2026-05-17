@@ -624,7 +624,7 @@ resource "aws_ssm_parameter" "deploy_mode" {
   lifecycle {
     precondition {
       condition     = var.enable_canary_deployment != var.enable_blue_green
-      error_message = "Exactly one of enable_canary_deployment / enable_blue_green must be true; got canary=${var.enable_canary_deployment} blue_green=${var.enable_blue_green}. New envs: pick one in tfvars (see CLAUDE.md \"Deploy-mode tier mapping\")."
+      error_message = "Exactly one of enable_canary_deployment / enable_blue_green must be true; got canary=${var.enable_canary_deployment} blue_green=${var.enable_blue_green}. New envs: pick one in tfvars (see tests/smoke/CLAUDE.md \"Deploy-mode tier mapping\")."
     }
     # Symmetry fence (not redundancy): smoke's AC-side assertions
     # (e.g., the EIP pool formula) read the deploy-mode SSM, which
@@ -2861,8 +2861,8 @@ resource "terraform_data" "http_keepalive_contract" {
 locals {
   # Gate for resolve-CF resources only (the qurl_resolve distribution
   # and its monitoring subscription). The IAM-propagation shim has
-  # its own broader gate per CLAUDE.md → "IAM eventual-consistency
-  # shim pattern": OR of every consumer's condition.
+  # its own broader gate per terraform/CLAUDE.md → "IAM eventual-
+  # consistency shim pattern": OR of every consumer's condition.
   deploy_qurl_resolve_cf = var.deploy_qurl_link && var.enable_resolve_cloudfront
 }
 
@@ -2893,7 +2893,7 @@ locals {
 # Substring-matching the doc would be brittle; a stale wait on
 # an unrelated edit is cheap.
 #
-# Gate is the OR of every consumer's condition per CLAUDE.md →
+# Gate is the OR of every consumer's condition per terraform/CLAUDE.md →
 # "IAM eventual-consistency shim pattern" (taint-vs-rename ARN
 # detail, `replace_triggered_by` cost trade-offs, gate-OR-expansion
 # when consumers multiply, greenfield-other-CF-resources gap #1813).
