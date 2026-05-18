@@ -1129,6 +1129,12 @@ variable "qurl_custom_domain_cleanup_publish_enabled" {
   default     = false
 }
 
+variable "deploy_custom_domain_cert" {
+  description = "Whether the custom-domain cert lambda is deployed in this env. Gates the #2000 smoke-test surface (SSM discovery params + sns:Publish IAM policy on the CI role) at the root level; the env-level resources (SNS topic, cert lambda module) gate on their own copy of this flag in the env tfvars."
+  type        = bool
+  default     = false
+}
+
 # ==================== QURL GeoIP ====================
 
 variable "qurl_geoip_enabled" {

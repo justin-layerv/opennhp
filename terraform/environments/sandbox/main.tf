@@ -184,6 +184,7 @@ module "nhp" {
   qurl_custom_domain_enabled                 = var.qurl_custom_domain_enabled
   qurl_custom_domain_cleanup_topic_arn       = var.deploy_custom_domain_cert ? aws_sns_topic.custom_domain_cleanup[0].arn : ""
   qurl_custom_domain_cleanup_publish_enabled = var.deploy_custom_domain_cert
+  deploy_custom_domain_cert                  = var.deploy_custom_domain_cert
 
   # QURL GeoIP
   qurl_geoip_enabled        = var.qurl_geoip_enabled
@@ -456,6 +457,11 @@ module "custom_domain_cert" {
 
   tags = local.common_tags
 }
+
+# Note: the smoke-test discovery params + smoke-role IAM policy for the
+# cleanup consumer (#2000) are defined at root (terraform/main.tf), driven
+# by `deploy_custom_domain_cert` and `qurl_custom_domain_cleanup_topic_arn`
+# threaded from the module "nhp" inputs above. No env-level resources needed.
 
 # ==============================================================================
 # Auth0 Identity Management

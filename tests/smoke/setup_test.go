@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
+	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 )
 
@@ -97,6 +98,7 @@ func TestMain(m *testing.M) {
 	testConfig.CWClient = cloudwatch.NewFromConfig(awsCfg)
 	testConfig.CWLogsClient = cloudwatchlogs.NewFromConfig(awsCfg)
 	testConfig.ELBClient = elasticloadbalancingv2.NewFromConfig(awsCfg)
+	testConfig.SNSClient = sns.NewFromConfig(awsCfg)
 
 	// Resolve deploy mode + cell ID from SSM in one batch. Fail
 	// loudly on missing or unknown values — silently defaulting to

@@ -299,6 +299,8 @@ lint-workflows:
 	@bash tests/scripts/check-scope-drift_test.sh
 	@bash scripts/check-scope-drift.sh
 	@bash scripts/check-smoke-tier-filter-coverage.sh
+	@bash scripts/check-cert-cleanup-log-gate-unique.sh
+	@bash scripts/check-cleanup-event-type-lockstep.sh
 	@bash scripts/check-lockdown-body-drift.sh
 	@bash scripts/check-frps-az-suffixes-validation-drift.sh
 	@python3 -c 'import yaml' 2>/dev/null || { \

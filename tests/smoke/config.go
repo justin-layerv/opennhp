@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
+	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 )
 
@@ -142,6 +143,7 @@ type TestConfig struct {
 	CWClient     *cloudwatch.Client
 	CWLogsClient *cloudwatchlogs.Client
 	ELBClient    *elasticloadbalancingv2.Client
+	SNSClient    *sns.Client
 }
 
 // testConfig is the package-global config populated in TestMain.

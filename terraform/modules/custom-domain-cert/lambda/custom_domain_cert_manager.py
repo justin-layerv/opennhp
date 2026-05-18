@@ -476,6 +476,14 @@ def _handle_sns_records(event: Dict[str, Any]) -> Dict[str, Any]:
             continue
         sns = record.get('Sns') or {}
         msg_attrs = sns.get('MessageAttributes') or {}
+        # Contract: the dispatcher routes on the SNS MessageAttribute
+        # `event_type`, NOT on a body field. tests/smoke/18_custom_domain_cleanup_test.go
+        # deliberately OMITS `event_type` from the JSON body and only
+        # sets it as a MessageAttribute, so a flip to body-field routing
+        # would find nothing in the body, skip the record, never log
+        # `Domain cleanup complete for ...`, and trip the smoke test at
+        # the 90s poll timeout (LOUD, not silent). If the routing rule
+        # changes, update the smoke test in lockstep.
         event_type = (msg_attrs.get('event_type') or {}).get('Value', '')
 
         if event_type != EVENT_DOMAIN_CLEANUP:
@@ -1655,6 +1663,17 @@ def handle_domain_cleanup(payload: Dict[str, Any]) -> Dict[str, Any]:
     # TOML block.
     trigger_cert_delete(domain)
 
+    # Contract: the literal prefix "Domain cleanup complete for " is the
+    # synchronous gate that tests/smoke/18_custom_domain_cleanup_test.go
+    # polls for via FilterLogEvents to know cleanup ran end-to-end. If you
+    # reword or restructure this log call (e.g. structured log migration),
+    # update the smoke fence in lockstep — the smoke test is the only thing
+    # in CI that fences this consumer's wiring end-to-end.
+    #
+    # Do NOT reuse this prefix in any other log call: the smoke filter is
+    # `"Domain cleanup complete for <domain>"` substring match, and an
+    # earlier emit at a different lifecycle point would make the test
+    # pass before the SSM deletes actually complete.
     logger.info(
         f"Domain cleanup complete for {domain}: ssm_deleted={deleted_ssm}, "
         f"route53_deleted={deleted_route53}, ddb_result={ddb_result}"

@@ -249,6 +249,12 @@ if [ "$SYNC_MODE" = "delete" ] && [ -n "$TARGET_DOMAIN" ]; then
     # CertSyncDomainsLoaded / CertSyncFailures (see terraform/CLAUDE.md —
     # user_data-emitted metrics are out of scope for the AC publisher's
     # dim-set rule).
+    #
+    # Note: tests/smoke/18_custom_domain_cleanup_test.go bumps the
+    # CertSyncDomainAlreadyAbsent counter once per AC per smoke run
+    # (smoke-cleanup-{uuid}.example.invalid is never in $CERT_DIR).
+    # Calibrate any alarm or dashboard keyed on this metric against the
+    # post-smoke baseline so smoke cadence isn't read as customer signal.
     if [ "$REMOVED" = "1" ]; then
         METRIC_NAME="CertSyncDomainsRemoved"
     else

@@ -212,7 +212,7 @@ jobs:
               RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|SSMRunbook|BlueGreen|Canary|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|PublicALB|ResolveOrigin)_'
               ;;
             tier1+tier2)
-              RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|SSMRunbook|BlueGreen|Canary|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|QurlRouterAuthzGate|PublicALB|Resolve|ResolveOrigin|Knock|Plugins|InternalAPI)_'
+              RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|DockerImage|SSMRunbook|BlueGreen|Canary|ACEIPPool|ACLogs|ServerDeployStability|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|QurlRouterAuthzGate|PublicALB|Resolve|ResolveOrigin|Knock|Plugins|InternalAPI|CustomDomainCleanup)_'
               ;;
             tier3-no-ssm)
               # The Test<Prefix>_ tokens listed are exactly the
@@ -230,7 +230,7 @@ jobs:
               # requires updating tier3_no_ssm_expected_omissions
               # there; adding a non-SSM test requires adding the
               # token here. The script fails CI on either omission.
-              RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|BlueGreen|Canary|ACEIPPool|ACLogs|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|QurlRouterAuthzGate|PublicALB|Resolve|ResolveOrigin|Knock|Plugins|InternalAPI|Protocol|ServerLogs|Timing)_'
+              RUN_FILTER='^Test(HealthKnockReady|HealthLive|HealthReady|HealthStartup|BlueGreen|Canary|ACEIPPool|ACLogs|QurlInternalALB|QurlConfig|QurlBrowserTimings|QurlLinkFrontend|QurlRouterAuthzGate|PublicALB|Resolve|ResolveOrigin|Knock|Plugins|InternalAPI|Protocol|ServerLogs|Timing|CustomDomainCleanup)_'
               ;;
             all)
               RUN_FILTER=''

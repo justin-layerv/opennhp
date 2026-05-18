@@ -2049,6 +2049,142 @@ resource "aws_iam_role_policy" "ci_cross_account_cost_analytics" {
   })
 }
 
+# ====================================================================
+# Smoke-test surface for the custom-domain cleanup consumer (nhp#2000)
+# ====================================================================
+#
+# Tier 2 smoke test (tests/smoke/18_custom_domain_cleanup_test.go) fences
+# the SNS-publish → cert-lambda path #1993 introduced. These three
+# resources are defined at root (not in env/main.tf) for the same reason
+# `qurl_link_url` and `ci_cross_account_cost_analytics` are: the
+# sandbox-vs-prod values are pure `var.environment` / `var.aws_region`
+# interpolations, and duplicating across envs would require a lockstep
+# "don't edit one without the other" convention.
+
+resource "aws_ssm_parameter" "custom_domain_cleanup_topic_arn_for_smoke" {
+  count       = var.deploy_custom_domain_cert ? 1 : 0
+  name        = "/${var.environment}/nhp/custom-domain-cert/cleanup-topic-arn"
+  description = "SNS topic ARN for the custom-domain cleanup consumer. ParameterNotFound is the smoke-test skip gate for envs where the cert lambda isn't deployed."
+  type        = "String"
+  value       = var.qurl_custom_domain_cleanup_topic_arn
+
+  lifecycle {
+    # Same invariant as the IAM precondition below: writing an empty
+    # topic-arn into the discovery param would make the smoke test
+    # skip silently on an env that actually has the cert lambda
+    # deployed. The env-level wiring couples these via
+    # deploy_custom_domain_cert, but mirroring the check here makes
+    # the invariant self-documenting at both sites.
+    precondition {
+      condition     = var.qurl_custom_domain_cleanup_topic_arn != ""
+      error_message = "deploy_custom_domain_cert=true requires qurl_custom_domain_cleanup_topic_arn to be a non-empty SNS topic ARN. Check the env-level wiring."
+    }
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-custom-domain-cleanup-topic-arn"
+  })
+}
+
+resource "aws_ssm_parameter" "custom_domain_cert_manager_log_group_for_smoke" {
+  count       = var.deploy_custom_domain_cert ? 1 : 0
+  name        = "/${var.environment}/nhp/custom-domain-cert/lambda-log-group"
+  description = "CloudWatch log group for the cert manager lambda. Consumed by smoke via FilterLogEvents."
+  type        = "String"
+  value       = "/aws/lambda/${local.name_prefix}-custom-domain-cert-manager"
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-custom-domain-cert-manager-log-group"
+  })
+}
+
+# CRITICAL — no kms:* grant on this policy. The cleanup topic is encrypted
+# with the AWS-managed `alias/aws/sns` key; sns:Publish authorizes
+# kms:GenerateDataKey via that key's implicit grant for in-account callers.
+# Adding an explicit kms grant would mask a regression where the implicit
+# grant changes — which is the exact failure mode the #2000 smoke test is
+# the safety net for. SSM resource scope mirrors the smokeCleanupDomainPrefix
+# constant in tests/smoke/18_custom_domain_cleanup_test.go; keep in lockstep.
+#
+# Threat model accepted: IAM cannot restrict sns:Publish by message body,
+# so a compromise of github_actions_role could publish a domain.cleanup
+# event with an arbitrary domain_name and trigger a real cert delete. The
+# narrowing factors are the dispatch-only-from-main convention in
+# CLAUDE.md (only main-branch OIDC sub claims pass the trust policy) and
+# the fact that github_actions_role is already broadly privileged — the
+# marginal blast radius from this Sid is small. If that calculus changes
+# (e.g., the role narrows), add a CloudTrail-sourced CW alarm on
+# sns:Publish from this principal where the message body doesn't match
+# the smoke-cleanup-* prefix.
+resource "aws_iam_role_policy" "smoke_custom_domain_cleanup" {
+  count = var.deploy_custom_domain_cert ? 1 : 0
+
+  lifecycle {
+    # Deliberately duplicates the precondition on
+    # aws_ssm_parameter.custom_domain_cleanup_topic_arn_for_smoke above:
+    # they share the same `var.deploy_custom_domain_cert ? 1 : 0` count
+    # gate so they always fire together, and this is not a missed
+    # `locals { ... }` extraction — the dup makes the invariant
+    # self-documenting at each consumer (the SSM discovery param the
+    # smoke runner reads, and the IAM policy that grants its publish).
+    # Surfacing this at plan time keeps the failure mode loud instead of
+    # an opaque IAM-resource-arn error at apply.
+    precondition {
+      condition     = var.qurl_custom_domain_cleanup_topic_arn != ""
+      error_message = "deploy_custom_domain_cert=true requires qurl_custom_domain_cleanup_topic_arn to be a non-empty SNS topic ARN. Check the env-level wiring."
+    }
+  }
+
+  name = "smoke-custom-domain-cleanup"
+  role = module.ecr.github_actions_role_name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "PublishCleanupEvent"
+        Effect   = "Allow"
+        Action   = ["sns:Publish"]
+        Resource = [var.qurl_custom_domain_cleanup_topic_arn]
+      },
+      {
+        # Reads/writes/deletes scoped to the smoke-cleanup-* prefix only,
+        # and only on the /key, /chain, /meta suffixes the test writes.
+        # IAM `*` is a multi-segment glob — it spans `/` — so
+        # `.../smoke-cleanup-*/key` still admits
+        # `.../smoke-cleanup-foo/bar/baz/key`. Pinning the suffix bounds
+        # the LEAF segment, not the entire middle. The narrowing factor
+        # the smoke test actually relies on is that the AC cert-sync
+        # reads `/nhp/certs/<domain>/{key,chain,meta}` at canonical
+        # depth — anything written by this role at a deliberately
+        # crafted deeper path would never be read by the cleanup tail.
+        # Discovery reads on /{env}/nhp/custom-domain-cert/* go through
+        # the github_actions role's pre-existing SSMRead grant
+        # (terraform/modules/ecr/main.tf::SSMRead), not this Sid. Note
+        # that grant is account-wide (Resource = "*" with ssm:Get*/
+        # Describe*/List*), so a compromised role can read AND
+        # enumerate any SSM param — including /nhp/certs/* — even
+        # though THIS Sid does not. The broader read surface is
+        # pre-existing and out of scope for this fence; the threat
+        # model accepted above (sns:Publish body-injection) implicitly
+        # assumes the read side is at least this wide.
+        Sid    = "PreStageAndVerifySmokeCertParams"
+        Effect = "Allow"
+        Action = [
+          "ssm:PutParameter",
+          "ssm:GetParameter",
+          "ssm:DeleteParameter",
+        ]
+        Resource = [
+          "arn:aws:ssm:${var.aws_region}:${var.aws_account_id}:parameter/nhp/certs/smoke-cleanup-*/key",
+          "arn:aws:ssm:${var.aws_region}:${var.aws_account_id}:parameter/nhp/certs/smoke-cleanup-*/chain",
+          "arn:aws:ssm:${var.aws_region}:${var.aws_account_id}:parameter/nhp/certs/smoke-cleanup-*/meta",
+        ]
+      },
+    ]
+  })
+}
+
 # ==================== API Gateway Account Logging ====================
 # Singleton per-region, per-account resource. API Gateway (v1 and v2) requires
 # an account-level CloudWatch Logs role to write access logs. Managed here at

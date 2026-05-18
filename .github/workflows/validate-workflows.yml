@@ -16,10 +16,13 @@ on:
       - "scripts/check-scope-drift.sh"
       - "scripts/check-disable-agent-validation.sh"
       - "scripts/check-smoke-tier-filter-coverage.sh"
+      - "scripts/check-cert-cleanup-log-gate-unique.sh"
+      - "scripts/check-cleanup-event-type-lockstep.sh"
       - "scripts/check-lockdown-body-drift.sh"
       - "scripts/check-paths-filter-coverage.py"
       - "scripts/print-dispatch-ref-error.sh"
       - "terraform/modules/qurl-service/main.tf"
+      - "terraform/modules/custom-domain-cert/lambda/**"
       - "tests/scripts/**"
       - "tests/smoke/**"
       - "tests/lints/disable-agent-validation/**"
@@ -39,10 +42,13 @@ on:
       - "scripts/check-scope-drift.sh"
       - "scripts/check-disable-agent-validation.sh"
       - "scripts/check-smoke-tier-filter-coverage.sh"
+      - "scripts/check-cert-cleanup-log-gate-unique.sh"
+      - "scripts/check-cleanup-event-type-lockstep.sh"
       - "scripts/check-lockdown-body-drift.sh"
       - "scripts/check-paths-filter-coverage.py"
       - "scripts/print-dispatch-ref-error.sh"
       - "terraform/modules/qurl-service/main.tf"
+      - "terraform/modules/custom-domain-cert/lambda/**"
       - "tests/scripts/**"
       - "tests/smoke/**"
       - "tests/lints/disable-agent-validation/**"
@@ -176,6 +182,25 @@ jobs:
       # CI run until the script was wired in.
       - name: Check smoke RUN_FILTER coverage
         run: bash scripts/check-smoke-tier-filter-coverage.sh
+
+      # Lockstep fence for the cert-lambda smoke test (#2000): asserts
+      # the lambda emits "Domain cleanup complete for" exactly once in
+      # non-comment Python source. The smoke filter substring-matches
+      # this prefix, so reusing it at an earlier lifecycle point would
+      # let assertSSMParamsAbsent race the actual deletes.
+      - name: Check cert-cleanup smoke gate uniqueness
+        run: bash scripts/check-cert-cleanup-log-gate-unique.sh
+
+      # Lockstep fence for the cleanup event-type wire-string between
+      # the Go smoke test and the Python cert lambda dispatcher
+      # (qurl-service publisher is in another repo and cannot be
+      # checked here). Drift in either of these two sites is a
+      # routing mismatch — the lambda dispatcher would no longer
+      # match what the test publishes — and the smoke fence trips at
+      # the 90s timeout with no specific signal that the wire-string
+      # drifted.
+      - name: Check cleanup event-type lockstep (Go ↔ Python)
+        run: bash scripts/check-cleanup-event-type-lockstep.sh
 
       # Structural fence for the qurl-service /internal/* public-ALB
       # lockdown body shape (PR #1635). The fixed-response body in
