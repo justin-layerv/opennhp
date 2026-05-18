@@ -555,6 +555,10 @@ locals {
       slug        = "dns-validation"
       description = "Route53 TXT record creation or DNS propagation failure"
     }
+    "DnsOwnershipError" = {
+      slug        = "dns-ownership"
+      description = "DNS ownership re-verification failed (DDB row missing/corrupt or _layerv-verify TXT mismatch)"
+    }
     "AcmeChallengeError" = {
       slug        = "acme-challenge"
       description = "Let's Encrypt challenge or certificate finalization failure"
