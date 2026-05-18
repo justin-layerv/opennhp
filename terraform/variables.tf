@@ -2294,7 +2294,7 @@ variable "tags" {
 # ==================== Bootstrap ALB ====================
 
 variable "deploy_bootstrap_alb" {
-  description = "Deploy the bootstrap-alb stack (bootstrap.layerv.{xyz,ai}). Default off; flip per-env once the cert is pre-provisioned and qurl-service ECS is ready to register against the new target group."
+  description = "Deploy the bootstrap-alb stack (bootstrap.layerv.{xyz,ai}). Default off; flip per-env once the cert is wired (Path 1 / prod: operator pre-provisions cross-account; Path 2 / sandbox: module provisions same-account — see modules/bootstrap-alb/README.md) and qurl-service ECS is ready to register against the new target group."
   type        = bool
   default     = false
 }
@@ -2317,7 +2317,7 @@ variable "bootstrap_alb_dns_name" {
 }
 
 variable "bootstrap_alb_route53_zone_id" {
-  description = "Hosted zone ID for the parent of `bootstrap_alb_dns_name`. Required when `bootstrap_alb_provision_certificate` or `bootstrap_alb_manage_dns_alias` is true. Empty when both are false (cross-account; DNS managed operator-side)."
+  description = "Hosted zone ID for the parent of `bootstrap_alb_dns_name`. Required when `bootstrap_alb_provision_certificate` or `bootstrap_alb_manage_dns_alias` is true. Empty when both are false (operator-managed out-of-band — typical when the parent zone is cross-account, but also valid for any same-account env that chooses to operator-manage cert + alias)."
   type        = string
   default     = ""
 
@@ -2330,13 +2330,13 @@ variable "bootstrap_alb_route53_zone_id" {
 }
 
 variable "bootstrap_alb_manage_dns_alias" {
-  description = "Whether the bootstrap-alb stack writes the A-alias from `bootstrap_alb_dns_name` to the ALB. Default false — the alias is operator-managed in both envs (sandbox layerv.xyz zone in account 767397897469; prod layerv.ai zone in layerv-mgmt)."
+  description = "Whether the bootstrap-alb stack writes the A-alias from `bootstrap_alb_dns_name` to the ALB. True when the parent zone is in the same account as the ALB; false when cross-account (alias is operator-managed in the zone's account). Sandbox: true (`layerv.xyz` zone in 767397897469, same account). Prod: false (`layerv.ai` zone in `layerv-mgmt`)."
   type        = bool
   default     = false
 }
 
 variable "bootstrap_alb_provision_certificate" {
-  description = "Whether the bootstrap-alb stack provisions+validates an ACM cert. Default false — DNS validation needs the parent zone, which lives cross-account in both sandbox and prod. The operator pre-provisions the cert in the same account as this ALB and supplies the ARN via `bootstrap_alb_existing_certificate_arn`."
+  description = "Whether the bootstrap-alb stack provisions+validates an ACM cert. True only when the parent zone is in the same account as the ALB (DNS validation needs to write CNAMEs there). Sandbox: true (same-account `layerv.xyz`). Prod: false (cross-account `layerv.ai`; operator pre-provisions the cert and supplies the ARN via `bootstrap_alb_existing_certificate_arn`). First flip per env requires the README Step 0a `terraform apply -target` cold-start step."
   type        = bool
   default     = false
 }

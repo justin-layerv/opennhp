@@ -83,13 +83,13 @@ variable "route53_zone_id" {
 }
 
 variable "manage_dns_alias" {
-  description = "Whether this stack writes the A-alias from `dns_name` to the ALB. Sandbox: false (the layerv.xyz zone lives in account 767397897469, not the integrations account). Prod: false (cross-account; layerv.ai zone in layerv-mgmt). The operator writes the alias out-of-band in the right account in both envs — see README's runbook."
+  description = "Whether this stack writes the A-alias from `dns_name` to the ALB. True when the parent zone is in the same account as this ALB; false when the zone is cross-account and the operator writes the alias out-of-band. Sandbox: true (`layerv.xyz` zone in account 767397897469, same as the ALB). Prod: false (`layerv.ai` zone in `layerv-mgmt`, cross-account). See README's runbook for the operator path."
   type        = bool
   default     = false
 }
 
 variable "provision_certificate" {
-  description = "Whether this stack provisions+validates an ACM cert for `dns_name`. False in BOTH envs today — DNS validation needs the parent zone, which lives in a different account in both sandbox and prod. The operator pre-provisions the cert in the same account as this ALB and supplies the ARN via `existing_certificate_arn`."
+  description = "Whether this stack provisions+validates an ACM cert for `dns_name`. True only when the parent zone is in the same account as this ALB (DNS validation needs to write CNAMEs into that zone). Sandbox: true (same-account `layerv.xyz`). Prod: false (cross-account `layerv.ai`; the operator pre-provisions the cert and supplies the ARN via `existing_certificate_arn`). See README Step 0a for the cold-start `terraform apply -target` step required on the first flip per env."
   type        = bool
   default     = false
 }

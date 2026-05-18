@@ -1,21 +1,23 @@
 # ACM certificate + DNS-validation CNAMEs.
 #
-# Default in BOTH envs is `provision_certificate=false` because the
-# parent zone (`layerv.xyz` or `layerv.ai`) lives in a different AWS
-# account in BOTH cases — so DNS-validation CNAME writes have to land
-# out-of-band by an operator with the right account creds. The cert
-# itself MUST live in the same account as the ALB (AWS does not allow
-# cross-account cert attachment).
+# Per-env posture (see README "Account topology"):
+#   - **Sandbox** is same-account (`layerv.xyz` zone in the sandbox
+#     apply target, `767397897469`), so `provision_certificate=true`
+#     and the module manages cert + validation CNAMEs itself.
+#   - **Prod** is cross-account (`layerv.ai` zone in `layerv-mgmt`),
+#     so `provision_certificate=false` and the operator
+#     pre-provisions the cert in nhp's prod account and writes
+#     validation CNAMEs into `layerv-mgmt` out-of-band; the ARN
+#     lands via `existing_certificate_arn`.
 #
-# Operator runbook for the cross-account first-apply (cert request →
-# DNS-validation CNAMEs → wait for ISSUED → land cert ARN in env
-# tfvars) lives in `README.md` ("Step 0 — cross-account cert + DNS").
-# Don't duplicate it here — the README is the canonical source; this
-# file is the resource declarations.
+# The cert itself MUST live in the same account as the ALB regardless
+# of path (AWS does not allow cross-account cert attachment).
 #
-# `provision_certificate=true` is supported for any future env where
-# the parent zone IS in the same account — the resources below render
-# only when that flag flips.
+# Operator runbooks live in `README.md` — Path 1 (prod, cross-account)
+# is "Step 0 — cross-account cert + DNS"; Path 2 (sandbox, same-
+# account) is "Step 0a" for the `for_each` cold-start fence on the
+# first per-env flip. Don't duplicate them here — the README is the
+# canonical source; this file is the resource declarations.
 
 # Resolve the supplied zone ID to its actual zone name so we can
 # precondition on `dns_name` belonging to the zone. A typoed zone ID
@@ -30,26 +32,37 @@
 # alias path needs the same check). When BOTH flags are false the
 # zone lookup is skipped entirely (no Route53 read on every plan).
 #
-# **Path #1 fence-omission**: today's posture in both envs is
-# `provision_certificate=false + manage_dns_alias=false` —
-# operator-managed cert + alias, both out-of-band in the parent-
-# zone account. The dot-boundary subdomain check below DOES NOT
-# fence path #1 (data source is `count=0`, the precondition is
-# never evaluated). The operator is the gate there: they
-# pre-provision the cert against the right zone in Step 0, and
-# write the A-alias into the right zone in Step 2. A typoed zone
-# on path #1 surfaces at the operator's `aws route53 change-
-# resource-record-sets` call, not at terraform plan. Deliberate;
-# the operator-out-of-band gating is the trust boundary.
+# **Path #1 fence-omission**: on Path 1 (cross-account zone in
+# `layerv-mgmt` with `provision_certificate=false +
+# manage_dns_alias=false`) the dot-boundary subdomain check below
+# is NOT a fence — the data source is `count=0` and the
+# precondition is never evaluated. The operator is the gate there:
+# they pre-provision the cert against the right zone in Step 0,
+# and write the A-alias into the right zone in Step 2. A typoed
+# zone on path #1 surfaces at the operator's `aws route53
+# change-resource-record-sets` call, not at terraform plan.
+# Deliberate; the operator-out-of-band gating is the trust
+# boundary. (Path 2 envs — same-account zone — render this data
+# source and DO evaluate the precondition.)
+#
+# Per-env path mapping (Path 1 vs Path 2): see the README's
+# "Account topology" section — that's the canonical per-env
+# posture source; comments here intentionally don't snapshot it
+# (would go stale silently when prod flips on per
+# `SLACK_QURL_ROLLOUT.md` §5b).
 #
 # **Plan-role permission requirement.** Once an env flips either flag
 # to `true`, the terraform principal needs `route53:GetHostedZone` on
-# the parent zone — typically cross-account (the parent zone lives
-# in a different AWS account in both sandbox and prod, see README's
-# Account topology table). Laptop plans from operators without that
-# cross-account grant will fail at refresh, not at the precondition.
-# Same shape as the `nhp_internal_auth` plan-role callout in
-# docs/SECURITY.md.
+# the parent zone. In sandbox that's an in-account grant (the
+# `layerv.xyz` zone shares the apply target — the CI role already
+# carries `route53:Get*`, see `terraform/modules/ecr/main.tf`). On
+# Path 1 the parent zone is cross-account and the flags don't flip,
+# so the grant doesn't matter there today (per
+# `SLACK_QURL_ROLLOUT.md` §5b's prod posture — if that posture ever
+# changes, e.g. parent zone moves into the apply-target account,
+# revisit this comment). Laptop plans from operators without the
+# needed grant will fail at refresh, not at the precondition. Same
+# shape as the `nhp_internal_auth` plan-role callout in CLAUDE.md.
 #
 # The precondition lives on the data source itself (not just on the
 # downstream cert / alias resources) so an empty `route53_zone_id`
@@ -172,7 +185,7 @@ resource "aws_route53_record" "cert_validation" {
   # workarounds for that future env, in order of preference:
   #   1. Stay on path #1 (`provision_certificate=false`); the
   #      operator pre-provisions the cert + validation CNAMEs
-  #      out-of-band, same as today's posture in both envs.
+  #      out-of-band, same shape as any cross-account Path 1 env.
   #   2. Move the cert into the parent-zone account and use
   #      `existing_certificate_arn` — but ALBs can't attach
   #      cross-account ACM certs, so this requires also moving
@@ -180,8 +193,9 @@ resource "aws_route53_record" "cert_validation" {
   #   3. Add an aliased `provider "aws"` block to this module
   #      (a real module change) so the validation records can
   #      write to the cross-account zone via role assumption.
-  # Today's `provision_certificate=false` path makes all of this
-  # dormant; this resource is count-0 in both envs.
+  # On the `provision_certificate=false` path this resource is
+  # count-0; on path #2 (same-account zone) it renders. See the
+  # README's "Account topology" for current per-env path posture.
   #
   # **IAM caveat (same-account path #2 only)**: even when the
   # zone is same-account, the apply-target role needs

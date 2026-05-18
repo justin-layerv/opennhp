@@ -3411,9 +3411,12 @@ resource "aws_route53_record" "qurl_fileviewer" {
 #
 # Default off (`deploy_bootstrap_alb = false`). Enable per-env in
 # `terraform/environments/{sandbox,prod}/terraform.tfvars` once the
-# operator has pre-provisioned the ACM cert (cross-account: layerv.ai
-# zone in layerv-mgmt) and is ready to land the qurl-service ECS
-# `load_balancer` block paired with this stack's target group.
+# cert is wired (sandbox: same-account `layerv.xyz` → module-
+# provisioned via `provision_certificate=true` + the Step 0a
+# operator targeted-apply for cold-start; prod: cross-account
+# `layerv.ai` in `layerv-mgmt` → operator pre-provisions + supplies
+# `existing_certificate_arn`) and qurl-service ECS is ready to land
+# the `load_balancer` block paired with this stack's target group.
 
 # Catches the common foot-gun on the first per-env flip:
 # `deploy_bootstrap_alb=true` but the operator forgot to wire one of
@@ -3426,11 +3429,12 @@ resource "aws_route53_record" "qurl_fileviewer" {
 #
 # Two valid cert configurations (mirroring the module's
 # `cert_dns.tf` header and the listener-side precondition):
-#   1. **Cross-account (today's path, both envs)**:
+#   1. **Cross-account (prod posture — `layerv.ai` zone in
+#      `layerv-mgmt`)**:
 #        bootstrap_alb_provision_certificate    = false
 #        bootstrap_alb_existing_certificate_arn = "<operator-pre-provisioned ARN>"
-#   2. **Same-account (future env where parent zone shares the
-#      apply account)**:
+#   2. **Same-account (sandbox posture — `layerv.xyz` zone in the
+#      sandbox apply target, `767397897469`)**:
 #        bootstrap_alb_provision_certificate    = true
 #        bootstrap_alb_route53_zone_id          = "<zone ID>"
 #
@@ -3473,11 +3477,11 @@ check "bootstrap_alb_required_variables" {
       (setting both is rejected — existing_certificate_arn would be
       silently ignored by the listener):
 
-      Path 1 (cross-account cert, today's sandbox + prod posture):
+      Path 1 (cross-account cert, prod posture — `layerv.ai` zone in `layerv-mgmt`):
         - bootstrap_alb_existing_certificate_arn  (operator-pre-provisioned ACM cert ARN)
         - bootstrap_alb_provision_certificate    = false  (the default)
 
-      Path 2 (same-account cert, future env where parent zone shares the apply account):
+      Path 2 (same-account cert, sandbox posture — `layerv.xyz` zone in the sandbox apply target):
         - bootstrap_alb_provision_certificate    = true
         - bootstrap_alb_route53_zone_id          = "<zone ID of the parent zone>"
         - bootstrap_alb_existing_certificate_arn = ""     (the default — must be empty)
@@ -3505,8 +3509,8 @@ check "bootstrap_alb_required_variables" {
         - Set bootstrap_alb_route53_zone_id = "<parent zone ID>", OR
         - Leave bootstrap_alb_manage_dns_alias = false and write
           the A-alias out-of-band in the parent-zone account
-          (today's posture in BOTH envs — see
-          modules/bootstrap-alb/README.md Step 2).
+          (Path 1 posture — see modules/bootstrap-alb/README.md
+          "Account topology" + Step 2).
     EOT
   }
 }

@@ -537,6 +537,55 @@ enable_auth0_slack_oauth_client = true
 # ==============================================================================
 deploy_e2e_echo_server = true
 
+# ==============================================================================
+# Bootstrap ALB — tunnel-client sidecar cold-start path
+# ==============================================================================
+# Public HTTPS surface at `bootstrap.layerv.xyz` that the qurl-reverse-tunnel-
+# client sidecar calls on first boot to exchange its bootstrap code for the
+# per-agent QURL API key + frps_addr. Sandbox provisions + validates the ACM
+# cert in-account (the `layerv.xyz` parent zone lives here in `767397897469`),
+# so both `provision_certificate` and `manage_dns_alias` are true. Prod
+# (`bootstrap.layerv.ai`) is cross-account and tracked separately
+# (SLACK_QURL_ROLLOUT.md §5b — needs Justin's `layerv-mgmt` consent).
+#
+# `bootstrap_alb_cross_account_subscriber_arns` is deliberately omitted (empty
+# default) for this first flip. Per the var description: populating it now
+# would page alerts-infra during the dark-launch window between this PR and
+# the paired data-plane (qurl-service /v1/agent/bootstrap) PR — every 503
+# probe would route. Wire alerts-infra in a separate follow-up after the
+# data plane is healthy.
+deploy_bootstrap_alb                = true
+bootstrap_alb_dns_name              = "bootstrap.layerv.xyz"
+bootstrap_alb_route53_zone_id       = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone (same account)
+bootstrap_alb_provision_certificate = true
+bootstrap_alb_manage_dns_alias      = true
+# `bootstrap_alb_existing_certificate_arn` deliberately left at its
+# default ("") — Path 2 (same-account, module-managed cert) requires
+# it empty (see root `check "bootstrap_alb_required_variables"` XOR
+# in `terraform/main.tf`). Adding an ARN here during a future cert
+# rotation would fail plan (XOR check prints a warning + the
+# listener-side precondition in `modules/bootstrap-alb/alb.tf`
+# rejects the both-set combo) — go through the module's rotation
+# path instead.
+
+# `bootstrap_alb_waf_count_only_rule_groups` deliberately omitted
+# (empty default = full enforce) for this dark-launch window. The
+# variable description in `terraform/variables.tf` recommends
+# `["AWSManagedRulesAnonymousIpList", "AWSManagedRulesCommonRuleSet"]`
+# for the first 2-4 weeks of sandbox bootstrap traffic
+# (AnonymousIpList false-positives on customer VPN egress; CRS body-
+# inspection false-positives on PEM-wrapped public keys). It's
+# deferred here because there's NO real bootstrap traffic during the
+# window between this PR and the paired qurl-service data-plane PR —
+# the ALB returns 503 on `/v1/agent/bootstrap` (no healthy targets)
+# and nothing produces the PEM payloads the recommendation guards
+# against. The count-only flip lands in the same PR that wires
+# qurl-service ECS against this ALB's target group, so AnonymousIpList
+# + CRS land in count-only observation mode the moment real traffic
+# first hits the surface; they flip to enforce after the 2-4 week
+# watch (per the variable description's recommendation). Tracked at
+# nhp #1982.
+
 tags = {
   Organization = "LayerV"
   CostCenter   = "infrastructure"
