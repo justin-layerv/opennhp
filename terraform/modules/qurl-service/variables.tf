@@ -808,7 +808,7 @@ variable "custom_domain_nlb_target" {
 }
 
 variable "custom_domain_cleanup_topic_arn" {
-  description = "SNS topic ARN that DeleteDomain publishes domain.cleanup events to. Consumed by the cert Lambda in nhp; see nhp#1990 / qurl-service#148. Empty disables the publisher (DeleteDomain still deletes the row but skips the SNS publish)."
+  description = "SNS topic ARN that DeleteDomain publishes domain.cleanup events to. Consumed by the cert Lambda in nhp; see nhp#1990 / qurl-service#148. Ignored unless custom_domain_cleanup_publish_enabled is true."
   type        = string
   default     = ""
 
@@ -816,6 +816,12 @@ variable "custom_domain_cleanup_topic_arn" {
     condition     = var.custom_domain_cleanup_topic_arn == "" || can(regex("^arn:aws:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]+$", var.custom_domain_cleanup_topic_arn))
     error_message = "custom_domain_cleanup_topic_arn must be a valid SNS topic ARN or empty."
   }
+}
+
+variable "custom_domain_cleanup_publish_enabled" {
+  description = "Static boolean: when true, the ECS task role is granted sns:Publish on custom_domain_cleanup_topic_arn. Paired with custom_domain_cleanup_topic_arn (which is the env's `aws_sns_topic.custom_domain_cleanup[0].arn` — a computed value, unknown at plan time, so a `count = var.custom_domain_cleanup_topic_arn != \"\" ? 1 : 0` would fail with 'Invalid count argument'). Container env injection still keys on the arn-non-empty check because env values may be apply-time computed without breaking plan."
+  type        = bool
+  default     = false
 }
 
 variable "adot_collector_image" {

@@ -174,14 +174,14 @@ resource "aws_sns_topic_subscription" "email" {
 # target, trigger AC cert-sync to evict cached cert material on AC instances).
 
 resource "aws_sns_topic_subscription" "cleanup_lambda" {
-  count     = var.cleanup_topic_arn != "" ? 1 : 0
+  count     = var.cleanup_subscription_enabled ? 1 : 0
   topic_arn = var.cleanup_topic_arn
   protocol  = "lambda"
   endpoint  = aws_lambda_function.cert_manager.arn
 }
 
 resource "aws_lambda_permission" "allow_sns_cleanup_invoke" {
-  count         = var.cleanup_topic_arn != "" ? 1 : 0
+  count         = var.cleanup_subscription_enabled ? 1 : 0
   statement_id  = "AllowSNSInvokeCleanup"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.cert_manager.function_name

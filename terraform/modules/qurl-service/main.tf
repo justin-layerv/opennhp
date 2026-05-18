@@ -613,7 +613,7 @@ resource "aws_iam_role_policy" "task_usage_events" {
 # cross-account confused-deputy surface here (the publisher principal is
 # the ECS task role itself, not a service principal acting on its behalf).
 resource "aws_iam_role_policy" "task_custom_domain_cleanup" {
-  count = var.custom_domain_cleanup_topic_arn != "" ? 1 : 0
+  count = var.custom_domain_cleanup_publish_enabled ? 1 : 0
   name  = "custom-domain-cleanup-sns-publish"
   role  = aws_iam_role.task.id
 

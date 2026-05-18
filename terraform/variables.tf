@@ -1113,7 +1113,7 @@ variable "qurl_custom_domain_enabled" {
 }
 
 variable "qurl_custom_domain_cleanup_topic_arn" {
-  description = "SNS topic ARN for domain.cleanup events (nhp#1990). Created by the custom-domain-cert module and passed in by the env. Empty leaves the qurl-service publisher unwired."
+  description = "SNS topic ARN for domain.cleanup events (nhp#1990). Created by the env and passed in. Ignored unless qurl_custom_domain_cleanup_publish_enabled is true."
   type        = string
   default     = ""
 
@@ -1121,6 +1121,12 @@ variable "qurl_custom_domain_cleanup_topic_arn" {
     condition     = var.qurl_custom_domain_cleanup_topic_arn == "" || can(regex("^arn:aws:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]+$", var.qurl_custom_domain_cleanup_topic_arn))
     error_message = "qurl_custom_domain_cleanup_topic_arn must be a valid SNS topic ARN or empty."
   }
+}
+
+variable "qurl_custom_domain_cleanup_publish_enabled" {
+  description = "Static boolean: when true, grants the qurl-service task role sns:Publish on the cleanup topic. Paired with qurl_custom_domain_cleanup_topic_arn — see the module-level variable for the count-depends-on-computed rationale."
+  type        = bool
+  default     = false
 }
 
 # ==================== QURL GeoIP ====================

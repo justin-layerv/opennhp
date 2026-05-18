@@ -104,7 +104,7 @@ variable "use_existing_sns_topic" {
 }
 
 variable "cleanup_topic_arn" {
-  description = "SNS topic ARN that the lambda subscribes to for domain.cleanup events (nhp#1990 / qurl-service#148). Owned at the env level to avoid a module cycle (qurl-service consumes this ARN via module.nhp). Empty disables the subscription and leaves the lambda EventBridge-only."
+  description = "SNS topic ARN that the lambda subscribes to for domain.cleanup events (nhp#1990 / qurl-service#148). Owned at the env level to avoid a module cycle (qurl-service consumes this ARN via module.nhp). Ignored unless cleanup_subscription_enabled is true."
   type        = string
   default     = ""
 
@@ -112,6 +112,12 @@ variable "cleanup_topic_arn" {
     condition     = var.cleanup_topic_arn == "" || can(regex("^arn:aws:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]+$", var.cleanup_topic_arn))
     error_message = "cleanup_topic_arn must be a valid SNS topic ARN or empty."
   }
+}
+
+variable "cleanup_subscription_enabled" {
+  description = "Static boolean: when true, the lambda subscribes to cleanup_topic_arn. Paired with cleanup_topic_arn (which is a computed `aws_sns_topic.*.arn` at the env level — its value is unknown at plan time, so a `count = var.cleanup_topic_arn != \"\" ? 1 : 0` would fail with 'Invalid count argument' on a first apply that also creates the topic). Same precedent as has_kms_key / use_existing_sns_topic."
+  type        = bool
+  default     = false
 }
 
 variable "alert_emails" {

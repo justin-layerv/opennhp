@@ -124,8 +124,9 @@ module "nhp" {
   qurl_fileviewer_eip          = var.qurl_fileviewer_eip
 
   # QURL Custom Domains
-  qurl_custom_domain_enabled           = var.qurl_custom_domain_enabled
-  qurl_custom_domain_cleanup_topic_arn = var.deploy_custom_domain_cert ? aws_sns_topic.custom_domain_cleanup[0].arn : ""
+  qurl_custom_domain_enabled                 = var.qurl_custom_domain_enabled
+  qurl_custom_domain_cleanup_topic_arn       = var.deploy_custom_domain_cert ? aws_sns_topic.custom_domain_cleanup[0].arn : ""
+  qurl_custom_domain_cleanup_publish_enabled = var.deploy_custom_domain_cert
 
   # QURL plugin configuration
   qurl_config                   = var.qurl_config
@@ -476,7 +477,8 @@ module "custom_domain_cert" {
   alert_emails           = var.guardduty_alert_emails
 
   # Cleanup events (Option A from qurl-service#148)
-  cleanup_topic_arn = aws_sns_topic.custom_domain_cleanup[0].arn
+  cleanup_topic_arn            = aws_sns_topic.custom_domain_cleanup[0].arn
+  cleanup_subscription_enabled = var.deploy_custom_domain_cert
 
   tags = local.common_tags
 }
