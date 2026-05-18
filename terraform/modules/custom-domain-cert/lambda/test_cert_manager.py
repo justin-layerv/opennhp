@@ -36,6 +36,23 @@ os.environ.setdefault('QURL_DOMAINS_TABLE', 'test-qurl-domains')
 import custom_domain_cert_manager as cm
 
 
+# Pinned payload schema for qurl-service's DomainCleanupEvent. This struct
+# definition is the cross-repo contract and is owned by qurl-service at
+# internal/events/domain_event_publisher.go. The Python keys MUST match the
+# Go struct's `json:"..."` tags exactly. If qurl-service updates its struct,
+# update this fixture in the same PR and re-run these tests — a key rename
+# in either repo without the other surfaces here as a KeyError or as the
+# handler silently ignoring the field.
+_CONTRACT_FIXTURE = {
+    'event_type': 'domain.cleanup',
+    'domain_name': 'gone.example.com',
+    'owner_id': 'auth0|abc',
+    'acme_cname_target': 'gone--example--com.acme.example.com',
+    'cert_param_prefix': '/nhp/certs/gone.example.com',
+    'timestamp': '2026-05-18T06:00:00+00:00',
+}
+
+
 class TestIsValidDomain(unittest.TestCase):
     """Tests for is_valid_domain() helper."""
 
@@ -1179,6 +1196,525 @@ class TestStaleLockRecovery(unittest.TestCase):
             now_dt = datetime.fromisoformat(now_ts)
             delta_seconds = (now_dt - stale_dt).total_seconds()
             assert abs(delta_seconds - cm.PROVISIONING_LOCK_STALE_MINUTES * 60) < 2
+
+
+class TestIsSnsEvent(unittest.TestCase):
+    """Tests for _is_sns_event() envelope detection."""
+
+    def test_rejects_eventbridge_renewal_event(self):
+        assert not cm._is_sns_event({'type': 'renewal_scan'})
+
+    def test_rejects_eventbridge_provision_event(self):
+        assert not cm._is_sns_event({'type': 'provision', 'domain': 'x.com'})
+
+    def test_rejects_empty_records(self):
+        assert not cm._is_sns_event({'Records': []})
+
+    def test_rejects_non_sns_records(self):
+        # e.g. SQS / Kinesis would have a different EventSource.
+        assert not cm._is_sns_event({'Records': [{'EventSource': 'aws:sqs'}]})
+
+    def test_accepts_sns_record(self):
+        event = {'Records': [{'EventSource': 'aws:sns', 'Sns': {'Message': '{}'}}]}
+        assert cm._is_sns_event(event)
+
+    def test_rejects_non_dict_first_record(self):
+        # Defensive: a malformed Records[0]=None must not crash dispatch.
+        assert not cm._is_sns_event({'Records': [None]})
+
+
+class TestHandleDomainCleanup(unittest.TestCase):
+    """Tests for handle_domain_cleanup() and its DDB/SSM/Route53 helpers.
+
+    The handler does a conditional DDB DeleteItem first — that single
+    operation is both the race guard and the partial-row cleanup. SSM
+    and Route53 only execute when DDB returned 'deleted' or 'absent'.
+    """
+
+    def _payload(self, **overrides):
+        base = dict(_CONTRACT_FIXTURE)
+        base.update(overrides)
+        return base
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch.object(cm, 'publish_failure_metric')
+    @patch.object(cm.dynamodb_client, 'delete_item')
+    @patch.object(cm.ssm_client, 'delete_parameters')
+    @patch.object(cm.route53_client, 'list_resource_record_sets')
+    @patch.object(cm.route53_client, 'change_resource_record_sets')
+    def test_happy_path_deletes_ssm_and_triggers_sync(
+        self, mock_rr53_change, mock_rr53_list, mock_ssm_delete,
+        mock_ddb_delete, mock_failure_metric, mock_sync,
+    ):
+        # qurl-service already deleted the row — DeleteItem is a no-op
+        # (ALL_OLD returns no Attributes).
+        mock_ddb_delete.return_value = {}
+        mock_ssm_delete.return_value = {
+            'DeletedParameters': [
+                '/nhp/certs/gone.example.com/key',
+                '/nhp/certs/gone.example.com/chain',
+                '/nhp/certs/gone.example.com/meta',
+            ],
+            'InvalidParameters': [],
+        }
+        mock_rr53_list.return_value = {'ResourceRecordSets': []}
+
+        result = cm.handle_domain_cleanup(self._payload())
+
+        assert result['status'] == cm.RESULT_CLEANED
+        assert result['domain'] == 'gone.example.com'
+        assert result['ddb_result'] == 'absent'
+        assert len(result['ssm_deleted']) == 3
+        # AC cert sync must fire so cached cert is evicted.
+        mock_sync.assert_called_once_with(cm.BATCH_SYNC_CLEANUP)
+        # No Route53 record to delete in this scenario.
+        mock_rr53_change.assert_not_called()
+        mock_failure_metric.assert_not_called()
+        # Conditional check must be present and target the right attribute.
+        ddb_kwargs = mock_ddb_delete.call_args.kwargs
+        assert 'verification_token' in ddb_kwargs['ConditionExpression']
+        assert ddb_kwargs['ReturnValues'] == 'ALL_OLD'
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch.object(cm, 'publish_failure_metric')
+    @patch.object(cm.dynamodb_client, 'delete_item')
+    @patch.object(cm.ssm_client, 'delete_parameters')
+    def test_deletes_partial_failed_row(
+        self, mock_ssm_delete, mock_ddb_delete, mock_failure_metric, mock_sync,
+    ):
+        # Reconciliation scan wrote a partial row after qurl-service's delete;
+        # the conditional DeleteItem removes it and returns the old attributes.
+        mock_ddb_delete.return_value = {'Attributes': {
+            'domain': {'S': 'gone.example.com'},
+            'status': {'S': 'failed'},
+        }}
+        mock_ssm_delete.return_value = {'DeletedParameters': [], 'InvalidParameters': []}
+
+        result = cm.handle_domain_cleanup(self._payload(acme_cname_target=''))
+
+        assert result['status'] == cm.RESULT_CLEANED
+        assert result['ddb_result'] == cm.DDB_DELETED
+        mock_ssm_delete.assert_called_once()
+        mock_sync.assert_called_once_with(cm.BATCH_SYNC_CLEANUP)
+        mock_failure_metric.assert_not_called()
+        # Canary: the verification_token ConditionExpression is the only
+        # protection against deleting a re-registered row. A regression
+        # that loosens or drops it must trip this assertion.
+        ddb_kwargs = mock_ddb_delete.call_args.kwargs
+        assert 'verification_token' in ddb_kwargs['ConditionExpression']
+        assert ddb_kwargs['ReturnValues'] == 'ALL_OLD'
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch.object(cm, 'publish_failure_metric')
+    @patch.object(cm.dynamodb_client, 'delete_item')
+    @patch.object(cm.ssm_client, 'delete_parameters')
+    def test_aborts_when_re_registered_with_token(
+        self, mock_ssm_delete, mock_ddb_delete, mock_failure_metric, mock_sync,
+    ):
+        # Customer re-onboarded — row has a fresh verification_token. The
+        # conditional DeleteItem fails and the handler aborts BEFORE touching
+        # SSM, Route53, or the AC cert sync. This is the race guard.
+        mock_ddb_delete.side_effect = ClientError(
+            {'Error': {'Code': 'ConditionalCheckFailedException', 'Message': 'race'}},
+            'DeleteItem',
+        )
+
+        result = cm.handle_domain_cleanup(self._payload())
+
+        assert result['status'] == cm.RESULT_ABORTED
+        assert result['reason'] == cm.REASON_RACE_RE_REGISTERED
+        mock_ssm_delete.assert_not_called()
+        mock_sync.assert_not_called()
+        mock_failure_metric.assert_not_called()
+
+    @patch.object(cm, 'publish_failure_metric')
+    def test_rejects_invalid_domain(self, mock_failure_metric):
+        result = cm.handle_domain_cleanup(self._payload(domain_name='../../etc/passwd'))
+        assert result['status'] == cm.RESULT_REJECTED
+        assert result['reason'] == cm.REASON_INVALID_DOMAIN
+        mock_failure_metric.assert_called_once_with(cm.FAILURE_DOMAIN_VALIDATION)
+
+    @patch.object(cm, 'publish_failure_metric')
+    def test_rejects_missing_domain_field(self, mock_failure_metric):
+        result = cm.handle_domain_cleanup(self._payload(domain_name=''))
+        assert result['status'] == cm.RESULT_REJECTED
+        mock_failure_metric.assert_called_once_with(cm.FAILURE_DOMAIN_VALIDATION)
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch.object(cm.dynamodb_client, 'delete_item')
+    @patch.object(cm.ssm_client, 'delete_parameters')
+    @patch.object(cm.route53_client, 'list_resource_record_sets')
+    def test_ssm_partial_not_found_is_idempotent(
+        self, mock_rr53_list, mock_ssm_delete, mock_ddb_delete, mock_sync,
+    ):
+        # Some SSM params already gone (e.g. a manual half-cleanup or an SNS
+        # retry of a partial run). delete_parameters lists the missing ones in
+        # InvalidParameters rather than raising — treat as success.
+        mock_ddb_delete.return_value = {}
+        mock_ssm_delete.return_value = {
+            'DeletedParameters': ['/nhp/certs/gone.example.com/key'],
+            'InvalidParameters': [
+                '/nhp/certs/gone.example.com/chain',
+                '/nhp/certs/gone.example.com/meta',
+            ],
+        }
+        mock_rr53_list.return_value = {'ResourceRecordSets': []}
+
+        result = cm.handle_domain_cleanup(self._payload())
+
+        assert result['status'] == cm.RESULT_CLEANED
+        assert result['ssm_deleted'] == ['/nhp/certs/gone.example.com/key']
+        mock_sync.assert_called_once_with(cm.BATCH_SYNC_CLEANUP)
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch.object(cm.dynamodb_client, 'delete_item')
+    @patch.object(cm.ssm_client, 'delete_parameters')
+    @patch.object(cm.route53_client, 'list_resource_record_sets')
+    @patch.object(cm.route53_client, 'change_resource_record_sets')
+    def test_deletes_route53_txt_when_record_exists(
+        self, mock_rr53_change, mock_rr53_list, mock_ssm_delete,
+        mock_ddb_delete, mock_sync,
+    ):
+        mock_ddb_delete.return_value = {}
+        mock_ssm_delete.return_value = {'DeletedParameters': [], 'InvalidParameters': []}
+        # Defensive sweep finds an orphan TXT record at the CNAME target.
+        target = 'gone--example--com.acme.example.com'
+        mock_rr53_list.return_value = {
+            'ResourceRecordSets': [{
+                'Name': f'{target}.',
+                'Type': 'TXT',
+                'TTL': 60,
+                'ResourceRecords': [{'Value': '"abc"'}],
+            }],
+        }
+
+        result = cm.handle_domain_cleanup(self._payload())
+
+        assert result['route53_deleted'] is True
+        # Sync still runs on the happy path.
+        mock_sync.assert_called_once_with(cm.BATCH_SYNC_CLEANUP)
+        # Confirm the change-batch issued a DELETE for the same record.
+        change = mock_rr53_change.call_args.kwargs['ChangeBatch']['Changes'][0]
+        assert change['Action'] == 'DELETE'
+        assert change['ResourceRecordSet']['Name'].rstrip('.') == target
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch.object(cm.dynamodb_client, 'delete_item')
+    @patch.object(cm.ssm_client, 'delete_parameters')
+    def test_raises_transient_error_when_ddb_unavailable(
+        self, mock_ssm_delete, mock_ddb_delete, mock_sync,
+    ):
+        # A non-conditional DDB ClientError (throttle, internal error) means
+        # the race guard couldn't run — proceeding would risk wiping a
+        # re-registered cert. The handler must raise so the Lambda
+        # invocation is marked failed and SNS's async retry kicks in.
+        mock_ddb_delete.side_effect = ClientError(
+            {'Error': {'Code': 'ProvisionedThroughputExceededException', 'Message': 't'}},
+            'DeleteItem',
+        )
+
+        with self.assertRaises(cm.TransientCleanupError):
+            cm.handle_domain_cleanup(self._payload(acme_cname_target=''))
+
+        mock_ssm_delete.assert_not_called()
+        mock_sync.assert_not_called()
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch.object(cm, 'publish_failure_metric')
+    @patch.object(cm.dynamodb_client, 'delete_item')
+    @patch.object(cm.ssm_client, 'delete_parameters')
+    def test_raises_transient_error_when_ssm_delete_fails(
+        self, mock_ssm_delete, mock_ddb_delete, mock_failure_metric, mock_sync,
+    ):
+        # SSM threw a real ClientError. The cert is still in SSM — reporting
+        # RESULT_CLEANED would be a lie. Raise so SNS retries the message
+        # (its built-in async retry policy is what triggers, not a return
+        # value).
+        mock_ddb_delete.return_value = {}
+        mock_ssm_delete.side_effect = ClientError(
+            {'Error': {'Code': 'ThrottlingException', 'Message': 't'}},
+            'DeleteParameters',
+        )
+
+        with self.assertRaises(cm.TransientCleanupError):
+            cm.handle_domain_cleanup(self._payload(acme_cname_target=''))
+
+        mock_sync.assert_not_called()
+        # The internal-failure metric must fire so operators see SSM trouble.
+        mock_failure_metric.assert_called_once_with(cm.FAILURE_CERT_STORAGE)
+
+    def test_raises_transient_error_when_qurl_domains_table_unset(self):
+        # Misconfigured environment: no QURL_DOMAINS_TABLE means no race
+        # guard. Raise so SNS retries — silently returning RESULT_ABORTED
+        # would let SNS treat the message as delivered.
+        with patch.object(cm, 'QURL_DOMAINS_TABLE', None):
+            with self.assertRaises(cm.TransientCleanupError):
+                cm.handle_domain_cleanup(self._payload(acme_cname_target=''))
+
+
+class TestHandlerSnsDispatch(unittest.TestCase):
+    """Tests for handler() routing of SNS-delivered events."""
+
+    @patch('custom_domain_cert_manager.handle_domain_cleanup')
+    def test_handler_routes_domain_cleanup_to_handler(self, mock_cleanup):
+        mock_cleanup.return_value = {'status': cm.RESULT_CLEANED}
+        sns_event = {
+            'Records': [{
+                'EventSource': 'aws:sns',
+                'Sns': {
+                    'Message': json.dumps({
+                        'event_type': cm.EVENT_DOMAIN_CLEANUP,
+                        'domain_name': 'gone.com',
+                    }),
+                    'MessageAttributes': {
+                        'event_type': {'Type': 'String', 'Value': cm.EVENT_DOMAIN_CLEANUP},
+                    },
+                },
+            }],
+        }
+        result = cm.handler(sns_event, None)
+        assert result == {'records': [{'status': cm.RESULT_CLEANED}]}
+        mock_cleanup.assert_called_once()
+
+    @patch('custom_domain_cert_manager.handle_domain_cleanup')
+    def test_handler_ignores_unknown_sns_event_type(self, mock_cleanup):
+        sns_event = {
+            'Records': [{
+                'EventSource': 'aws:sns',
+                'Sns': {
+                    'Message': '{}',
+                    'MessageAttributes': {
+                        'event_type': {'Type': 'String', 'Value': 'unknown.thing'},
+                    },
+                },
+            }],
+        }
+        result = cm.handler(sns_event, None)
+        assert result['records'][0]['status'] == cm.RESULT_IGNORED
+        mock_cleanup.assert_not_called()
+
+    @patch.object(cm, 'publish_failure_metric')
+    @patch('custom_domain_cert_manager.handle_domain_cleanup')
+    def test_handler_records_invalid_payload_without_aborting_batch(
+        self, mock_cleanup, mock_failure_metric,
+    ):
+        sns_event = {
+            'Records': [{
+                'EventSource': 'aws:sns',
+                'Sns': {
+                    'Message': 'not-json',
+                    'MessageAttributes': {
+                        'event_type': {'Type': 'String', 'Value': cm.EVENT_DOMAIN_CLEANUP},
+                    },
+                },
+            }],
+        }
+        result = cm.handler(sns_event, None)
+        assert result['records'][0]['status'] == cm.RESULT_INVALID_PAYLOAD
+        mock_cleanup.assert_not_called()
+        # SNS JSON-decode failures get their own metric — distinct from
+        # invalid-domain payloads, so operators can tell publisher-side
+        # corruption apart from per-domain validation failures.
+        mock_failure_metric.assert_called_once_with(cm.FAILURE_SNS_DECODE)
+
+    @patch('custom_domain_cert_manager.handle_domain_cleanup')
+    def test_handler_skips_non_dict_record_entries(self, mock_cleanup):
+        # SNS-to-Lambda is always 1 well-formed Record today, but the
+        # dispatcher iterates the list. Belt-and-suspenders: a malformed
+        # subsequent entry must not poison the batch.
+        mock_cleanup.return_value = {'status': cm.RESULT_CLEANED}
+        sns_event = {
+            'Records': [
+                {
+                    'EventSource': 'aws:sns',
+                    'Sns': {
+                        'Message': json.dumps({'event_type': cm.EVENT_DOMAIN_CLEANUP}),
+                        'MessageAttributes': {
+                            'event_type': {'Type': 'String', 'Value': cm.EVENT_DOMAIN_CLEANUP},
+                        },
+                    },
+                },
+                None,
+            ],
+        }
+
+        result = cm.handler(sns_event, None)
+        # Non-dict entry is silently skipped; the good record still runs.
+        assert len(result['records']) == 1
+        assert result['records'][0]['status'] == cm.RESULT_CLEANED
+
+    @patch('custom_domain_cert_manager.handle_domain_cleanup')
+    def test_handler_processes_multiple_records_independently(self, mock_cleanup):
+        # SNS-to-Lambda is always 1 Record today, but the dispatcher tolerates
+        # batches. Lock that semantics: a malformed first record must not
+        # block the second record from running.
+        mock_cleanup.return_value = {'status': cm.RESULT_CLEANED, 'domain': 'good.com'}
+        sns_event = {
+            'Records': [
+                {
+                    'EventSource': 'aws:sns',
+                    'Sns': {
+                        'Message': 'not-json',
+                        'MessageAttributes': {
+                            'event_type': {'Type': 'String', 'Value': cm.EVENT_DOMAIN_CLEANUP},
+                        },
+                    },
+                },
+                {
+                    'EventSource': 'aws:sns',
+                    'Sns': {
+                        'Message': json.dumps({
+                            'event_type': cm.EVENT_DOMAIN_CLEANUP,
+                            'domain_name': 'good.com',
+                        }),
+                        'MessageAttributes': {
+                            'event_type': {'Type': 'String', 'Value': cm.EVENT_DOMAIN_CLEANUP},
+                        },
+                    },
+                },
+            ],
+        }
+
+        result = cm.handler(sns_event, None)
+
+        assert len(result['records']) == 2
+        assert result['records'][0]['status'] == cm.RESULT_INVALID_PAYLOAD
+        assert result['records'][1]['status'] == cm.RESULT_CLEANED
+        mock_cleanup.assert_called_once()
+
+
+class TestDeleteAcmeTxtRecord(unittest.TestCase):
+    """Locks the post-refactor return shape and Type-filter contract.
+
+    `delete_acme_txt_record` is now used by two callers: the canonical
+    post-DNS-01 cleanup AND the domain.cleanup defensive sweep. The Type
+    filter is the only thing that prevents Route53's lexical-order
+    list_resource_record_sets from returning a same-name non-TXT record
+    and letting us DELETE it by accident.
+    """
+
+    @patch.object(cm.route53_client, 'change_resource_record_sets')
+    @patch.object(cm.route53_client, 'list_resource_record_sets')
+    def test_skips_when_no_record_exists(self, mock_list, mock_change):
+        mock_list.return_value = {'ResourceRecordSets': []}
+        assert cm.delete_acme_txt_record('missing.acme.example.com') is False
+        mock_change.assert_not_called()
+
+    @patch.object(cm.route53_client, 'change_resource_record_sets')
+    @patch.object(cm.route53_client, 'list_resource_record_sets')
+    def test_skips_when_same_name_record_is_not_txt(self, mock_list, mock_change):
+        # ListResourceRecordSets returns >= the start name in lexical order,
+        # so a non-TXT record sharing the name could be returned. The Type
+        # filter rejects it — without it, we'd happily DELETE a CNAME or A
+        # record someone else owns.
+        mock_list.return_value = {
+            'ResourceRecordSets': [{
+                'Name': 'gone--example--com.acme.example.com.',
+                'Type': 'CNAME',
+                'TTL': 60,
+                'ResourceRecords': [{'Value': 'sneaky-target.example.net'}],
+            }],
+        }
+        assert cm.delete_acme_txt_record('gone--example--com.acme.example.com') is False
+        mock_change.assert_not_called()
+
+    @patch.object(cm.route53_client, 'change_resource_record_sets')
+    @patch.object(cm.route53_client, 'list_resource_record_sets')
+    def test_returns_true_when_txt_deleted(self, mock_list, mock_change):
+        mock_list.return_value = {
+            'ResourceRecordSets': [{
+                'Name': 'a.acme.example.com.',
+                'Type': 'TXT',
+                'TTL': 60,
+                'ResourceRecords': [{'Value': '"abc"'}],
+            }],
+        }
+        assert cm.delete_acme_txt_record('a.acme.example.com') is True
+        mock_change.assert_called_once()
+
+    @patch.object(cm.route53_client, 'list_resource_record_sets')
+    def test_returns_false_when_acme_zone_id_unset(self, mock_list):
+        # Misconfigured env: never make the Route53 call at all.
+        with patch.object(cm, 'ACME_ZONE_ID', ''):
+            assert cm.delete_acme_txt_record('any.acme.example.com') is False
+        mock_list.assert_not_called()
+
+
+class TestContractFixtureKeys(unittest.TestCase):
+    """Locks the cross-repo payload contract.
+
+    qurl-service publishes a DomainCleanupEvent with JSON field names defined
+    by its Go struct. handle_domain_cleanup reads those same keys. If either
+    side renames a key, _CONTRACT_FIXTURE here must update to match — and the
+    test will surface the drift loudly. Update in lockstep with
+    qurl-service/internal/events/domain_event_publisher.go.
+    """
+
+    def test_fixture_contains_all_keys_the_handler_reads(self):
+        expected_keys = {
+            'event_type',         # routing key (MessageAttributes mirror)
+            'domain_name',        # required: deletion target
+            'cert_param_prefix',  # optional: SSM prefix override
+            'acme_cname_target',  # optional: Route53 record to sweep
+            'owner_id',           # ignored by lambda but part of payload
+            'timestamp',          # unused after race-guard refactor; retained for audit
+        }
+        assert set(_CONTRACT_FIXTURE.keys()) == expected_keys, (
+            "Cross-repo payload schema drift: keys diverged from "
+            "qurl-service DomainCleanupEvent. Update _CONTRACT_FIXTURE "
+            "and the handler in lockstep."
+        )
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch.object(cm.dynamodb_client, 'delete_item')
+    @patch.object(cm.ssm_client, 'delete_parameters')
+    def test_cert_param_prefix_fallback_uses_conventional_path(
+        self, mock_ssm_delete, mock_ddb_delete, mock_sync,
+    ):
+        del mock_sync  # asserted-not-called surface covered by other tests
+        # Empty cert_param_prefix in the payload must reconstruct the
+        # conventional SSM_CERT_PREFIX/<domain>/{key,chain,meta} names.
+        mock_ddb_delete.return_value = {}
+        mock_ssm_delete.return_value = {'DeletedParameters': [], 'InvalidParameters': []}
+
+        cm.handle_domain_cleanup({
+            'event_type': cm.EVENT_DOMAIN_CLEANUP,
+            'domain_name': 'fb.example.com',
+            'cert_param_prefix': '',
+            'acme_cname_target': '',
+        })
+
+        # Names sent to delete_parameters must match the conventional shape.
+        names_arg = mock_ssm_delete.call_args.kwargs['Names']
+        prefix = cm.SSM_CERT_PREFIX.rstrip('/')
+        assert set(names_arg) == {
+            f"{prefix}/fb.example.com/key",
+            f"{prefix}/fb.example.com/chain",
+            f"{prefix}/fb.example.com/meta",
+        }
+
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch.object(cm.route53_client, 'list_resource_record_sets')
+    @patch.object(cm.dynamodb_client, 'delete_item')
+    @patch.object(cm.ssm_client, 'delete_parameters')
+    def test_full_contract_fixture_yields_clean_run(
+        self, mock_ssm_delete, mock_ddb_delete, mock_rr53_list, mock_sync,
+    ):
+        # Positive integration check: hand the full _CONTRACT_FIXTURE to the
+        # handler with every consumer mocked, and assert non-rejection. If
+        # someone renames a key the handler reads (e.g. domain_name → domain),
+        # this trips even when the hardcoded key-set assertion above stays
+        # green — the fixture provides the old key but the handler would
+        # silently treat it as missing.
+        mock_ddb_delete.return_value = {}
+        mock_ssm_delete.return_value = {'DeletedParameters': [], 'InvalidParameters': []}
+        mock_rr53_list.return_value = {'ResourceRecordSets': []}
+
+        result = cm.handle_domain_cleanup(dict(_CONTRACT_FIXTURE))
+
+        assert result['status'] == cm.RESULT_CLEANED
+        assert result['domain'] == _CONTRACT_FIXTURE['domain_name']
+        mock_sync.assert_called_once_with(cm.BATCH_SYNC_CLEANUP)
 
 
 if __name__ == '__main__':

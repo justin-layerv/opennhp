@@ -70,6 +70,9 @@ logger.setLevel(logging.INFO)
 # Event types (must match EventBridge rule inputs in main.tf)
 EVENT_PROVISION = 'provision'
 EVENT_RENEWAL_SCAN = 'renewal_scan'
+# SNS event_type value used by qurl-service when publishing domain deletions.
+# The contract is owned by qurl-service/internal/events/domain_event_publisher.go.
+EVENT_DOMAIN_CLEANUP = 'domain.cleanup'
 
 # Domain statuses (must match qurl domain.Status constants)
 STATUS_ACTIVE = 'active'
@@ -80,9 +83,34 @@ STATUS_PROVISIONING_TLS = 'provisioning_tls'
 RESULT_PROVISIONED = 'provisioned'
 RESULT_SKIPPED = 'skipped'
 
-# Batch sync trigger identifiers (not real domain names)
+# Results from handle_domain_cleanup() and _handle_sns_records()
+RESULT_CLEANED = 'cleaned'
+RESULT_REJECTED = 'rejected'
+RESULT_ABORTED = 'aborted'
+RESULT_IGNORED = 'ignored'
+RESULT_INVALID_PAYLOAD = 'invalid_payload'
+
+# Reasons paired with RESULT_REJECTED / RESULT_ABORTED (returned dict shape).
+# REASON_*_UNAVAILABLE are surfaced in TransientCleanupError messages rather
+# than as return reasons — those paths raise to drive SNS retry.
+REASON_INVALID_DOMAIN = 'invalid_domain'
+REASON_RACE_RE_REGISTERED = 'race_re_registered'
+REASON_DDB_UNAVAILABLE = 'ddb_unavailable'
+REASON_SSM_UNAVAILABLE = 'ssm_unavailable'
+
+# Outcomes from _delete_orphan_domain_row()
+DDB_DELETED = 'deleted'
+DDB_ABSENT = 'absent'
+DDB_RACE = 'race'
+DDB_ERROR = 'error'
+
+# Batch sync trigger identifiers (not real domain names). Membership in
+# BATCH_SYNCS keeps trigger_cert_sync's full-mode-vs-incremental dispatch
+# in sync as new batch modes are added.
 BATCH_SYNC_RENEWAL = 'renewal-scan-batch'
 BATCH_SYNC_PROVISION = 'provision-batch'
+BATCH_SYNC_CLEANUP = 'cleanup-batch'
+BATCH_SYNCS = frozenset({BATCH_SYNC_RENEWAL, BATCH_SYNC_PROVISION, BATCH_SYNC_CLEANUP})
 
 # Domain name validation
 DOMAIN_REGEX = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?$')
@@ -90,6 +118,19 @@ DOMAIN_REGEX = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?$')
 
 class DnsValidationError(Exception):
     """Raised when DNS-01 challenge setup or propagation fails."""
+    pass
+
+
+class TransientCleanupError(Exception):
+    """Raised by the cleanup handler when a transient AWS error prevented
+    safe completion.
+
+    SNS-to-Lambda async invocations only retry on a raised exception or a
+    timeout — a return value (even one with status=aborted) is treated as
+    delivered. Wrap the transient-failure paths in this exception so SNS's
+    built-in retry kicks in, rather than relying entirely on the
+    reconciliation safety net (#1992) as a backstop.
+    """
     pass
 
 
@@ -141,6 +182,7 @@ FAILURE_CERT_SYNC = 'CertSyncError'
 FAILURE_DOMAIN_VALIDATION = 'DomainValidationError'
 FAILURE_RENEWAL_SCAN = 'RenewalScanError'
 FAILURE_PROVISIONING_TIMEOUT = 'ProvisioningTimeoutError'
+FAILURE_SNS_DECODE = 'SnsDecodeError'
 
 # DNS ownership re-verification tunables. Centralized so the resolver
 # behaviour is easy to change without hunting through the function body.
@@ -350,13 +392,18 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Lambda handler for custom domain certificate management.
 
-    Event types:
-    - provision: Issue certificate for a specific domain
+    Event sources:
+    - EventBridge (provision / renewal_scan):
       {"type": "provision", "domain": "secure.example.com", "acme_subdomain": "secure--example--com"}
-    - renewal_scan: Scan all custom domain certs and renew those approaching expiry
       {"type": "renewal_scan"}
+    - SNS (domain.cleanup from qurl-service — see nhp#1990):
+      {"Records": [{"EventSource": "aws:sns", "Sns": {"Message": "<json>", "MessageAttributes": {...}}}]}
     """
     del context  # Required by the Lambda contract; not used here.
+
+    if _is_sns_event(event):
+        return _handle_sns_records(event)
+
     try:
         event_type = event.get('type', EVENT_RENEWAL_SCAN)
         logger.info(f"Custom domain cert manager invoked with event type: {event_type}")
@@ -392,6 +439,66 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         send_alert(f"Custom domain cert manager FAILED: {str(e)}")
         publish_failure_metric()
         raise
+
+
+def _is_sns_event(event: Dict[str, Any]) -> bool:
+    records = event.get('Records')
+    if not isinstance(records, list) or not records:
+        return False
+    first = records[0]
+    return isinstance(first, dict) and first.get('EventSource') == 'aws:sns'
+
+
+def _handle_sns_records(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Dispatch each SNS Record to its event handler.
+
+    SNS→Lambda delivers Records[] (currently always length 1, but the API
+    permits batching). The dispatcher tolerates batches in three distinct
+    ways:
+      - Malformed payload (terminal): logged + metricked + per-record
+        `invalid_payload` result. Doesn't poison the batch.
+      - Unknown event_type (terminal): per-record `ignored` result.
+      - TransientCleanupError (retryable): aggregated and re-raised after
+        every other record gets a chance to run. SNS retries the whole
+        batch — terminal results from this run will be re-processed
+        idempotently on retry, but transient records get another shot.
+    """
+    results = []
+    pending_transient = None
+    for record in event.get('Records') or []:
+        if not isinstance(record, dict):
+            logger.warning(f"Skipping non-dict SNS record: {type(record).__name__}")
+            continue
+        sns = record.get('Sns') or {}
+        msg_attrs = sns.get('MessageAttributes') or {}
+        event_type = (msg_attrs.get('event_type') or {}).get('Value', '')
+
+        if event_type != EVENT_DOMAIN_CLEANUP:
+            logger.warning(f"Unrecognized SNS event_type: {event_type!r}; ignoring")
+            results.append({'status': RESULT_IGNORED, 'event_type': event_type})
+            continue
+
+        try:
+            payload = json.loads(sns.get('Message') or '')
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.error(f"Failed to parse cleanup event SNS message: {e}")
+            publish_failure_metric(FAILURE_SNS_DECODE)
+            results.append({'status': RESULT_INVALID_PAYLOAD})
+            continue
+
+        try:
+            results.append(handle_domain_cleanup(payload))
+        except TransientCleanupError as e:
+            # Don't short-circuit the batch — let later records run, then
+            # re-raise so SNS retries. Capture the first error to surface.
+            logger.warning(f"Transient cleanup error on batch record: {e}")
+            results.append({'status': RESULT_ABORTED, 'reason': REASON_DDB_UNAVAILABLE})
+            if pending_transient is None:
+                pending_transient = e
+
+    if pending_transient is not None:
+        raise pending_transient
+    return {'records': results}
 
 
 def _txt_rdata_to_string(rdata: Any) -> str:
@@ -1256,10 +1363,20 @@ def create_acme_txt_record(record_name: str, value: str):
         logger.warning(f"Route53 change waiter timed out: {e}, proceeding anyway")
 
 
-def delete_acme_txt_record(record_name: str):
-    """Delete TXT record from the ACME delegation zone after challenge completion."""
-    logger.info(f"Deleting DNS TXT record: {record_name}")
+def delete_acme_txt_record(record_name: str) -> bool:
+    """Delete a TXT record from the ACME delegation zone.
 
+    Used both for post-DNS-01-challenge cleanup (the canonical path) and as
+    a defensive sweep during domain cleanup events when a TXT may have been
+    orphaned by a crashed provisioning. Idempotent — missing records and
+    non-TXT records at the same name return False without error.
+
+    Returns True iff a record was actually deleted.
+    """
+    if not ACME_ZONE_ID:
+        return False
+
+    logger.info(f"Deleting DNS TXT record: {record_name}")
     try:
         response = route53_client.list_resource_record_sets(
             HostedZoneId=ACME_ZONE_ID,
@@ -1269,22 +1386,28 @@ def delete_acme_txt_record(record_name: str):
         )
 
         records = response.get('ResourceRecordSets', [])
-        if not records or records[0]['Name'].rstrip('.') != record_name.rstrip('.'):
+        # list_resource_record_sets returns records >= the start name in
+        # lexical order; without an exact (name, type) match we'd risk
+        # deleting a higher record that happens to share a prefix.
+        if not records \
+                or records[0].get('Name', '').rstrip('.') != record_name.rstrip('.') \
+                or records[0].get('Type') != 'TXT':
             logger.info(f"DNS record {record_name} not found, skipping delete")
-            return
+            return False
 
-        record = records[0]
         route53_client.change_resource_record_sets(
             HostedZoneId=ACME_ZONE_ID,
             ChangeBatch={
                 'Changes': [{
                     'Action': 'DELETE',
-                    'ResourceRecordSet': record
+                    'ResourceRecordSet': records[0]
                 }]
             }
         )
+        return True
     except ClientError as e:
-        logger.warning(f"Failed to delete DNS record: {e}")
+        logger.warning(f"Failed to delete DNS record {record_name}: {e}")
+        return False
 
 
 def lazy_import_dns():
@@ -1440,6 +1563,176 @@ def update_domain_status(domain: str, status: str, cert_param_prefix: Optional[s
         logger.error(f"Failed to update domain status for {domain}: {e}")
 
 
+def handle_domain_cleanup(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle a domain.cleanup SNS event from qurl-service (nhp#1990 / qurl-service#148).
+
+    Flow on a deleted domain:
+      1. Validate payload (domain format, required fields).
+      2. Conditional DDB DeleteItem — the condition fails if the row has a
+         non-empty `verification_token` (re-registered). The conditional
+         delete is intentionally first: it serves as the authoritative race
+         guard against re-registration, so even a long-delayed SNS retry
+         (up to ~25 min between attempts) that fires after the customer
+         re-added the domain leaves both DDB and SSM intact.
+      3. Delete SSM cert params (/nhp/certs/<domain>/{key,chain,meta}).
+      4. Delete any stale Route53 TXT at the ACME CNAME target (best-effort).
+      5. Trigger AC cert sync (full mode) so AC instances evict the cached
+         cert via custom-domain-cert-sync.sh's stale-dir sweep.
+
+    All AWS-side deletes are idempotent — replaying a cleanup event after a
+    transient SNS retry is safe. Returns a result dict reflecting what was
+    actually changed.
+    """
+    # Defensive normalisation — qurl-service already applies the same shape
+    # via domain.NormalizeDomainName (qurl-service/internal/domain/domain.go:156:
+    # "lowercases and trims whitespace") before the DDB write, so a correctly
+    # produced payload arrives lowercased/trimmed already. If that contract
+    # ever drifts on the producer side, this keeps the DDB key lookup honest
+    # — without it, a mixed-case `domain_name` would miss the row entirely
+    # and silently report `DDB_ABSENT`, bypassing the race guard.
+    domain = (payload.get('domain_name') or '').strip().lower()
+    cert_param_prefix = (payload.get('cert_param_prefix') or '').strip()
+    acme_cname_target = (payload.get('acme_cname_target') or '').strip()
+
+    if not domain or not is_valid_domain(domain):
+        logger.error(f"Cleanup event rejected: invalid domain_name: {domain!r}")
+        publish_failure_metric(FAILURE_DOMAIN_VALIDATION)
+        return {'status': RESULT_REJECTED, 'reason': REASON_INVALID_DOMAIN, 'domain': domain}
+
+    ddb_result = _delete_orphan_domain_row(domain)
+    if ddb_result == DDB_RACE:
+        # Terminal failure — no amount of retrying recovers a re-registered
+        # domain, and we MUST NOT delete the new cert material. Return so
+        # SNS treats the message as delivered and stops retrying.
+        logger.warning(
+            f"Cleanup aborted for {domain}: qurl-domains row has a fresh "
+            f"verification_token (re-registered since cleanup event published)"
+        )
+        return {'status': RESULT_ABORTED, 'reason': REASON_RACE_RE_REGISTERED, 'domain': domain}
+    if ddb_result == DDB_ERROR:
+        # Transient failure (throttle, internal error, or unconfigured
+        # table). RAISE so the Lambda invocation is marked failed and
+        # SNS's async retry policy kicks in — a plain return would let
+        # SNS treat the message as delivered and we'd only catch the
+        # orphan on the next reconciliation scan.
+        raise TransientCleanupError(
+            f"Cleanup for {domain} aborted: {REASON_DDB_UNAVAILABLE}"
+        )
+
+    # qurl-service supplies `<SSM_CERT_PREFIX>/<domain>` as cert_param_prefix;
+    # fall back to the conventional path if the payload field is empty.
+    cert_prefix = cert_param_prefix or f"{SSM_CERT_PREFIX.rstrip('/')}/{domain}"
+    deleted_ssm = _delete_ssm_cert_params(cert_prefix)
+    if deleted_ssm is None:
+        # Transient SSM failure — see TransientCleanupError rationale above.
+        # The whole point of the cleanup event is to remove the SSM cert
+        # material; raising forces SNS to retry rather than reporting a
+        # false RESULT_CLEANED.
+        raise TransientCleanupError(
+            f"Cleanup for {domain} aborted: {REASON_SSM_UNAVAILABLE}"
+        )
+
+    # Route53 race window: by the time we get here, the DDB guard succeeded
+    # (no managed row) and the SSM cert is gone. A delayed retry that finds
+    # the customer re-registered would already have been caught by the
+    # token-empty conditional check above and never reach this point. A
+    # within-invocation race is impossible: the customer would need to
+    # complete re-register + ACME provisioning in the ~ms between SSM and
+    # Route53 calls.
+    deleted_route53 = bool(acme_cname_target) and delete_acme_txt_record(acme_cname_target)
+
+    trigger_cert_sync(BATCH_SYNC_CLEANUP)
+
+    logger.info(
+        f"Domain cleanup complete for {domain}: ssm_deleted={deleted_ssm}, "
+        f"route53_deleted={deleted_route53}, ddb_result={ddb_result}"
+    )
+    return {
+        'status': RESULT_CLEANED,
+        'domain': domain,
+        'ssm_deleted': deleted_ssm,
+        'route53_deleted': deleted_route53,
+        'ddb_result': ddb_result,
+    }
+
+
+def _delete_ssm_cert_params(cert_prefix: str) -> Optional[List[str]]:
+    """Delete the three /key, /chain, /meta SSM params for a domain.
+
+    Idempotent on not-found: delete_parameters returns the missing names in
+    InvalidParameters rather than raising. Real ClientError failures (the API
+    really threw, not "this param wasn't there") return None so the caller
+    can ABORT and SNS gets to retry — silently returning [] on a real error
+    would let downstream code report `RESULT_CLEANED` while the cert is
+    still in SSM, defeating the point of the cleanup event.
+
+    Returns:
+        list of param names actually deleted (possibly empty if all were
+        already absent), OR None on a true ClientError.
+    """
+    cert_prefix = cert_prefix.rstrip('/')
+    names = [f"{cert_prefix}/key", f"{cert_prefix}/chain", f"{cert_prefix}/meta"]
+    try:
+        response = ssm_client.delete_parameters(Names=names)
+    except ClientError as e:
+        logger.error(f"SSM delete_parameters failed for {cert_prefix}: {e}")
+        publish_failure_metric(FAILURE_CERT_STORAGE)
+        return None
+    deleted = list(response.get('DeletedParameters', []))
+    invalid = list(response.get('InvalidParameters', []))
+    if invalid:
+        logger.info(f"SSM cert params not present at cleanup time (already gone): {invalid}")
+    return deleted
+
+
+def _delete_orphan_domain_row(domain: str) -> str:
+    """Conditional DeleteItem on the qurl-domains row — the race guard for
+    the cleanup handler.
+
+    The condition `attribute_not_exists(verification_token) OR verification_token = :empty`
+    holds in two safe cases:
+      - The row does not exist (canonical clean state after qurl-service's
+        own delete). DeleteItem succeeds idempotently.
+      - The row exists in the partial-failed shape that the reconciliation
+        loop writes via update_domain_status(STATUS_FAILED): no token, only
+        {domain, status, updated_at, failure_reason}. DeleteItem removes it.
+
+    The condition fails (ConditionalCheckFailedException) when the row has
+    a non-empty verification_token — the canonical shape of a re-registered
+    domain, regardless of status. Treating this as the authoritative race
+    indicator means a delayed SNS retry that arrives after a customer
+    re-registers will not damage the new cert material.
+
+    Returns one of:
+      - DDB_DELETED — row existed and was removed (ReturnValues=ALL_OLD).
+      - DDB_ABSENT  — row did not exist; delete was a no-op.
+      - DDB_RACE    — row exists with verification_token; ABORT downstream cleanup.
+      - DDB_ERROR   — non-conditional ClientError or QURL_DOMAINS_TABLE unset;
+                      caller aborts so SNS retries (or the reconciliation
+                      scan) gets another shot. Crucially we never silently
+                      proceed without a race guard — that would let a
+                      misconfigured environment wipe a re-registered cert.
+    """
+    if not QURL_DOMAINS_TABLE:
+        logger.error("QURL_DOMAINS_TABLE unset; cannot enforce race guard")
+        return DDB_ERROR
+    try:
+        response = dynamodb_client.delete_item(
+            TableName=QURL_DOMAINS_TABLE,
+            Key={'domain': {'S': domain}},
+            ConditionExpression='attribute_not_exists(verification_token) OR verification_token = :empty',
+            ExpressionAttributeValues={':empty': {'S': ''}},
+            ReturnValues='ALL_OLD',
+        )
+        return DDB_DELETED if response.get('Attributes') else DDB_ABSENT
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code', 'Unknown')
+        if code == 'ConditionalCheckFailedException':
+            return DDB_RACE
+        logger.warning(f"DDB delete_item failed for {domain}: code={code}")
+        return DDB_ERROR
+
+
 def trigger_cert_sync(domain: str):
     """Trigger certificate sync on AC instances via SSM SendCommand.
 
@@ -1454,7 +1747,7 @@ def trigger_cert_sync(domain: str):
             return
 
         # Batch triggers use full sync; single-domain uses incremental
-        if domain in (BATCH_SYNC_RENEWAL, BATCH_SYNC_PROVISION):
+        if domain in BATCH_SYNCS:
             sync_cmd = '/home/ubuntu/scripts/custom-domain-cert-sync.sh'
         else:
             # Re-validate and shell-quote domain to prevent command injection.

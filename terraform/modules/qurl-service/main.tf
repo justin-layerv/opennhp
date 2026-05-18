@@ -285,11 +285,15 @@ locals {
       { name = "WEBHOOKS_API_VERSION", value = var.webhooks_api_version },
     ] : [],
     # Custom domain management
-    var.custom_domain_enabled ? [
+    var.custom_domain_enabled ? concat([
       { name = "CUSTOM_DOMAIN_ENABLED", value = "true" },
       { name = "CUSTOM_DOMAIN_ACME_SUFFIX", value = var.custom_domain_acme_suffix },
       { name = "CUSTOM_DOMAIN_NLB_TARGET", value = var.custom_domain_nlb_target },
-    ] : [],
+      ],
+      var.custom_domain_cleanup_topic_arn != "" ? [
+        { name = "CUSTOM_DOMAIN_CLEANUP_TOPIC_ARN", value = var.custom_domain_cleanup_topic_arn },
+      ] : [],
+    ) : [],
     # NHP integration (headless resolve via POST /v1/resolve)
     var.nhp_server_internal_url != "" ? [
       { name = "NHP_SERVER_INTERNAL_URL", value = var.nhp_server_internal_url },
@@ -594,6 +598,33 @@ resource "aws_iam_role_policy" "task_usage_events" {
         Action   = ["kms:GenerateDataKey", "kms:Decrypt"]
         Resource = [var.secrets_kms_key_arn]
     }] : [])
+  })
+}
+
+# Publish to the custom-domain cleanup topic on domain deletion. The Go side
+# (cmd/qurl-api/main.go) gates the publisher on CUSTOM_DOMAIN_CLEANUP_TOPIC_ARN,
+# so when the topic ARN is empty this resource is also absent — no idle role
+# grants. The topic is encrypted with the AWS-managed `alias/aws/sns` key,
+# which authorises in-account IAM principals to GenerateDataKey via SNS
+# service usage from its own key policy — no explicit kms:* grant is needed
+# here. (kms:Decrypt would be a consumer-side grant and is intentionally
+# omitted; the publisher never decrypts.) The resource is scoped to the
+# specific topic ARN, which is created in this same account — there is no
+# cross-account confused-deputy surface here (the publisher principal is
+# the ECS task role itself, not a service principal acting on its behalf).
+resource "aws_iam_role_policy" "task_custom_domain_cleanup" {
+  count = var.custom_domain_cleanup_topic_arn != "" ? 1 : 0
+  name  = "custom-domain-cleanup-sns-publish"
+  role  = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "SNSPublishCustomDomainCleanup"
+      Effect   = "Allow"
+      Action   = ["sns:Publish"]
+      Resource = [var.custom_domain_cleanup_topic_arn]
+    }]
   })
 }
 

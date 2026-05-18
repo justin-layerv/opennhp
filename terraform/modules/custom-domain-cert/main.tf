@@ -159,6 +159,37 @@ resource "aws_sns_topic_subscription" "email" {
 }
 
 # ==============================================================================
+# SNS Cleanup Topic Subscription (Option A from qurl-service#148 / nhp#1990)
+# ==============================================================================
+#
+# Inbound topic owned at the env level (terraform/environments/<env>/main.tf)
+# to avoid a module-graph cycle: this cert module already consumes
+# module.nhp's DDB table ARN, so it can't ALSO produce an output that
+# module.nhp consumes. The env file creates the topic and feeds its ARN
+# into both modules; this resource set just wires the lambda subscription.
+#
+# qurl-service publishes `domain.cleanup` events when a customer deletes a
+# custom domain; the cert Lambda runs the cleanup handler (delete SSM
+# /nhp/certs/{domain}/*, delete stale Route53 TXT records at the ACME CNAME
+# target, trigger AC cert-sync to evict cached cert material on AC instances).
+
+resource "aws_sns_topic_subscription" "cleanup_lambda" {
+  count     = var.cleanup_topic_arn != "" ? 1 : 0
+  topic_arn = var.cleanup_topic_arn
+  protocol  = "lambda"
+  endpoint  = aws_lambda_function.cert_manager.arn
+}
+
+resource "aws_lambda_permission" "allow_sns_cleanup_invoke" {
+  count         = var.cleanup_topic_arn != "" ? 1 : 0
+  statement_id  = "AllowSNSInvokeCleanup"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.cert_manager.function_name
+  principal     = "sns.amazonaws.com"
+  source_arn    = var.cleanup_topic_arn
+}
+
+# ==============================================================================
 # Lambda Function - Custom Domain Certificate Manager
 # ==============================================================================
 
@@ -315,13 +346,17 @@ resource "aws_iam_role_policy" "lambda_permissions" {
         Resource = "arn:aws:route53:::change/*"
       },
 
-      # DynamoDB - Update domain status + query pending domains
+      # DynamoDB - Update domain status + query pending domains + delete
+      # orphan/partial rows during domain.cleanup processing (nhp#1990).
+      # DeleteItem is gated by a ConditionExpression in handle_domain_cleanup
+      # so it never removes a row with a non-empty verification_token.
       {
         Sid    = "DynamoDBDomainStatus"
         Effect = "Allow"
         Action = [
           "dynamodb:GetItem",
           "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem",
           "dynamodb:Query"
         ]
         Resource = [

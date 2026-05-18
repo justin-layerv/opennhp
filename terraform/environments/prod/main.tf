@@ -124,7 +124,8 @@ module "nhp" {
   qurl_fileviewer_eip          = var.qurl_fileviewer_eip
 
   # QURL Custom Domains
-  qurl_custom_domain_enabled = var.qurl_custom_domain_enabled
+  qurl_custom_domain_enabled           = var.qurl_custom_domain_enabled
+  qurl_custom_domain_cleanup_topic_arn = var.deploy_custom_domain_cert ? aws_sns_topic.custom_domain_cleanup[0].arn : ""
 
   # QURL plugin configuration
   qurl_config                   = var.qurl_config
@@ -389,6 +390,58 @@ module "acme_cert" {
 # 15 minutes, provisions certs via ACME DNS-01 challenge, stores key/chain in SSM
 # Parameter Store, and triggers AC cert sync via SSM SendCommand.
 
+# Inbound topic that qurl-service publishes domain.cleanup events to.
+# Owned at the env level to break the module cycle: module.custom_domain_cert
+# consumes module.nhp's DDB ARN, and module.nhp (via module.qurl_service)
+# consumes the cleanup topic ARN — if the topic lived inside the cert module
+# the modules would depend on each other circularly. See nhp#1990.
+resource "aws_sns_topic" "custom_domain_cleanup" {
+  count = var.deploy_custom_domain_cert ? 1 : 0
+  name  = "${local.name_prefix}-custom-domain-cleanup"
+  # AWS-managed `alias/aws/sns` rather than the per-env secrets CMK: SNS
+  # itself calls kms:Decrypt at Lambda-delivery time as `sns.amazonaws.com`,
+  # and the secrets CMK's key policy only authorizes `secretsmanager`. The
+  # managed key allows in-account IAM principals via SNS service usage and
+  # carries no per-key cost — see also bootstrap-alb/observability.tf:22.
+  kms_master_key_id = "alias/aws/sns"
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-custom-domain-cleanup"
+  })
+}
+
+# Catches the systemic-failure case the reconciliation safety net (#1992)
+# can't surface as a separate signal: a sustained cert-lambda outage or a
+# malformed-publisher regression that produces an event-per-deletion error
+# storm. Threshold of 5 in 15min is loose enough that a single transient
+# DDB throttle (handled by TransientCleanupError + SNS retry) doesn't page,
+# but a real outage does. Tracked in #1990's cleanup discussion.
+resource "aws_cloudwatch_metric_alarm" "custom_domain_cleanup_delivery_failures" {
+  count = var.deploy_custom_domain_cert ? 1 : 0
+
+  alarm_name          = "${local.name_prefix}-custom-domain-cleanup-delivery-failures"
+  alarm_description   = "Sustained SNS→Lambda delivery failures on the custom-domain cleanup topic"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "NumberOfNotificationsFailed"
+  namespace           = "AWS/SNS"
+  period              = 900
+  statistic           = "Sum"
+  threshold           = 5
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    TopicName = aws_sns_topic.custom_domain_cleanup[0].name
+  }
+
+  alarm_actions = [module.nhp.sns_topic_arn]
+  ok_actions    = [module.nhp.sns_topic_arn]
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-custom-domain-cleanup-delivery-failures"
+  })
+}
+
 module "custom_domain_cert" {
   count  = var.deploy_custom_domain_cert ? 1 : 0
   source = "../../modules/custom-domain-cert"
@@ -421,6 +474,9 @@ module "custom_domain_cert" {
   existing_sns_topic_arn = module.nhp.sns_topic_arn
   use_existing_sns_topic = true
   alert_emails           = var.guardduty_alert_emails
+
+  # Cleanup events (Option A from qurl-service#148)
+  cleanup_topic_arn = aws_sns_topic.custom_domain_cleanup[0].arn
 
   tags = local.common_tags
 }

@@ -181,7 +181,8 @@ module "nhp" {
   qurl_webhooks_api_version                   = var.qurl_webhooks_api_version
 
   # QURL Custom Domains
-  qurl_custom_domain_enabled = var.qurl_custom_domain_enabled
+  qurl_custom_domain_enabled           = var.qurl_custom_domain_enabled
+  qurl_custom_domain_cleanup_topic_arn = var.deploy_custom_domain_cert ? aws_sns_topic.custom_domain_cleanup[0].arn : ""
 
   # QURL GeoIP
   qurl_geoip_enabled        = var.qurl_geoip_enabled
@@ -374,6 +375,47 @@ module "acme_cert" {
 # 15 minutes, provisions certs via ACME DNS-01 challenge, stores key/chain in SSM
 # Parameter Store, and triggers AC cert sync via SSM SendCommand.
 
+# Inbound topic that qurl-service publishes domain.cleanup events to.
+# Owned at env level to break the module cycle (see prod equivalent / nhp#1990).
+resource "aws_sns_topic" "custom_domain_cleanup" {
+  count = var.deploy_custom_domain_cert ? 1 : 0
+  name  = "${local.name_prefix}-custom-domain-cleanup"
+  # AWS-managed key — see prod equivalent for rationale (cert lambda
+  # subscription needs sns.amazonaws.com → kms:Decrypt at delivery).
+  kms_master_key_id = "alias/aws/sns"
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-custom-domain-cleanup"
+  })
+}
+
+# Mirrors the prod alarm — see prod equivalent for rationale.
+resource "aws_cloudwatch_metric_alarm" "custom_domain_cleanup_delivery_failures" {
+  count = var.deploy_custom_domain_cert ? 1 : 0
+
+  alarm_name          = "${local.name_prefix}-custom-domain-cleanup-delivery-failures"
+  alarm_description   = "Sustained SNS→Lambda delivery failures on the custom-domain cleanup topic"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "NumberOfNotificationsFailed"
+  namespace           = "AWS/SNS"
+  period              = 900
+  statistic           = "Sum"
+  threshold           = 5
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    TopicName = aws_sns_topic.custom_domain_cleanup[0].name
+  }
+
+  alarm_actions = [module.nhp.sns_topic_arn]
+  ok_actions    = [module.nhp.sns_topic_arn]
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-custom-domain-cleanup-delivery-failures"
+  })
+}
+
 module "custom_domain_cert" {
   count  = var.deploy_custom_domain_cert ? 1 : 0
   source = "../../modules/custom-domain-cert"
@@ -406,6 +448,9 @@ module "custom_domain_cert" {
   existing_sns_topic_arn = module.nhp.sns_topic_arn
   use_existing_sns_topic = true
   alert_emails           = var.guardduty_alert_emails
+
+  # Cleanup events (Option A from qurl-service#148)
+  cleanup_topic_arn = aws_sns_topic.custom_domain_cleanup[0].arn
 
   tags = local.common_tags
 }

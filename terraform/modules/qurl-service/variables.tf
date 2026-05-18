@@ -807,6 +807,17 @@ variable "custom_domain_nlb_target" {
   default     = ""
 }
 
+variable "custom_domain_cleanup_topic_arn" {
+  description = "SNS topic ARN that DeleteDomain publishes domain.cleanup events to. Consumed by the cert Lambda in nhp; see nhp#1990 / qurl-service#148. Empty disables the publisher (DeleteDomain still deletes the row but skips the SNS publish)."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.custom_domain_cleanup_topic_arn == "" || can(regex("^arn:aws:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]+$", var.custom_domain_cleanup_topic_arn))
+    error_message = "custom_domain_cleanup_topic_arn must be a valid SNS topic ARN or empty."
+  }
+}
+
 variable "adot_collector_image" {
   description = "ADOT Collector container image. Uses AWS public ECR for the official ADOT image."
   type        = string

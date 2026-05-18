@@ -103,6 +103,17 @@ variable "use_existing_sns_topic" {
   default     = false
 }
 
+variable "cleanup_topic_arn" {
+  description = "SNS topic ARN that the lambda subscribes to for domain.cleanup events (nhp#1990 / qurl-service#148). Owned at the env level to avoid a module cycle (qurl-service consumes this ARN via module.nhp). Empty disables the subscription and leaves the lambda EventBridge-only."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.cleanup_topic_arn == "" || can(regex("^arn:aws:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]+$", var.cleanup_topic_arn))
+    error_message = "cleanup_topic_arn must be a valid SNS topic ARN or empty."
+  }
+}
+
 variable "alert_emails" {
   description = "Email addresses to receive certificate alerts"
   type        = list(string)
