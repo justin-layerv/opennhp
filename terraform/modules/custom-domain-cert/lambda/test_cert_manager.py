@@ -551,6 +551,54 @@ class TestTriggerCertSync(unittest.TestCase):
             mock_send.assert_not_called()
 
 
+class TestTriggerCertDelete(unittest.TestCase):
+    """Tests for trigger_cert_delete() — the per-domain incremental cleanup
+    introduced in #1994. The full-mode-per-event behavior it replaces is
+    covered by the TestHandleDomainCleanup assertions on the new helper.
+    """
+
+    @patch.dict(os.environ, {'AC_INSTANCE_TAG': 'nhp-ac'})
+    @patch.object(cm.ssm_client, 'send_command')
+    def test_emits_delete_flag_with_shell_quoted_domain(self, mock_send):
+        """The script invocation must include --delete and a shell-quoted
+        domain. Without --delete the script runs the upsert path; without
+        shlex.quote a malicious domain could inject shell. is_valid_domain
+        is the first line of defense; this is the second."""
+        mock_send.return_value = {'Command': {'CommandId': 'test-123'}}
+
+        cm.trigger_cert_delete('example.com')
+
+        cmd = mock_send.call_args.kwargs['Parameters']['commands'][1]
+        assert '--delete' in cmd
+        assert 'example.com' in cmd
+        # Must NOT slip into the --domain (upsert) path.
+        assert '--domain ' not in cmd
+
+    @patch.dict(os.environ, {'AC_INSTANCE_TAG': 'nhp-ac'})
+    @patch.object(cm.ssm_client, 'send_command')
+    def test_rejects_invalid_domain(self, mock_send):
+        """Path traversal, shell injection, and wildcards must all be
+        refused before SSM SendCommand is reached. Mirrors trigger_cert_sync
+        — the cleanup handler validates upstream, but the AC script is on
+        the hot path so we re-validate at the dispatch boundary."""
+        cm.trigger_cert_delete('../../etc/passwd')
+        mock_send.assert_not_called()
+
+        cm.trigger_cert_delete('foo; rm -rf /')
+        mock_send.assert_not_called()
+
+        cm.trigger_cert_delete('*.example.com')
+        mock_send.assert_not_called()
+
+    @patch.object(cm.ssm_client, 'send_command')
+    def test_skips_when_no_tag(self, mock_send):
+        """Should skip when AC_INSTANCE_TAG is not set."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('AC_INSTANCE_TAG', None)
+            cm.trigger_cert_delete('example.com')
+            mock_send.assert_not_called()
+
+
 class _StubDnsException(Exception):
     """Base for stubbed dnspython exceptions used in unit tests."""
 
@@ -1236,15 +1284,15 @@ class TestHandleDomainCleanup(unittest.TestCase):
         base.update(overrides)
         return base
 
-    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.trigger_cert_delete')
     @patch.object(cm, 'publish_failure_metric')
     @patch.object(cm.dynamodb_client, 'delete_item')
     @patch.object(cm.ssm_client, 'delete_parameters')
     @patch.object(cm.route53_client, 'list_resource_record_sets')
     @patch.object(cm.route53_client, 'change_resource_record_sets')
-    def test_happy_path_deletes_ssm_and_triggers_sync(
+    def test_happy_path_deletes_ssm_and_triggers_incremental_delete(
         self, mock_rr53_change, mock_rr53_list, mock_ssm_delete,
-        mock_ddb_delete, mock_failure_metric, mock_sync,
+        mock_ddb_delete, mock_failure_metric, mock_delete,
     ):
         # qurl-service already deleted the row — DeleteItem is a no-op
         # (ALL_OLD returns no Attributes).
@@ -1265,8 +1313,11 @@ class TestHandleDomainCleanup(unittest.TestCase):
         assert result['domain'] == 'gone.example.com'
         assert result['ddb_result'] == 'absent'
         assert len(result['ssm_deleted']) == 3
-        # AC cert sync must fire so cached cert is evicted.
-        mock_sync.assert_called_once_with(cm.BATCH_SYNC_CLEANUP)
+        # Per-#1994: cleanup events fire trigger_cert_delete(domain) so the
+        # AC fleet evicts only the offboarded domain instead of doing a
+        # full-mode sync per event. Regression here would re-fan-out the
+        # fleet-wide rebuild that #1994 was written to remove.
+        mock_delete.assert_called_once_with('gone.example.com')
         # No Route53 record to delete in this scenario.
         mock_rr53_change.assert_not_called()
         mock_failure_metric.assert_not_called()
@@ -1275,12 +1326,12 @@ class TestHandleDomainCleanup(unittest.TestCase):
         assert 'verification_token' in ddb_kwargs['ConditionExpression']
         assert ddb_kwargs['ReturnValues'] == 'ALL_OLD'
 
-    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.trigger_cert_delete')
     @patch.object(cm, 'publish_failure_metric')
     @patch.object(cm.dynamodb_client, 'delete_item')
     @patch.object(cm.ssm_client, 'delete_parameters')
     def test_deletes_partial_failed_row(
-        self, mock_ssm_delete, mock_ddb_delete, mock_failure_metric, mock_sync,
+        self, mock_ssm_delete, mock_ddb_delete, mock_failure_metric, mock_delete,
     ):
         # Reconciliation scan wrote a partial row after qurl-service's delete;
         # the conditional DeleteItem removes it and returns the old attributes.
@@ -1295,7 +1346,7 @@ class TestHandleDomainCleanup(unittest.TestCase):
         assert result['status'] == cm.RESULT_CLEANED
         assert result['ddb_result'] == cm.DDB_DELETED
         mock_ssm_delete.assert_called_once()
-        mock_sync.assert_called_once_with(cm.BATCH_SYNC_CLEANUP)
+        mock_delete.assert_called_once_with('gone.example.com')
         mock_failure_metric.assert_not_called()
         # Canary: the verification_token ConditionExpression is the only
         # protection against deleting a re-registered row. A regression
@@ -1304,16 +1355,16 @@ class TestHandleDomainCleanup(unittest.TestCase):
         assert 'verification_token' in ddb_kwargs['ConditionExpression']
         assert ddb_kwargs['ReturnValues'] == 'ALL_OLD'
 
-    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.trigger_cert_delete')
     @patch.object(cm, 'publish_failure_metric')
     @patch.object(cm.dynamodb_client, 'delete_item')
     @patch.object(cm.ssm_client, 'delete_parameters')
     def test_aborts_when_re_registered_with_token(
-        self, mock_ssm_delete, mock_ddb_delete, mock_failure_metric, mock_sync,
+        self, mock_ssm_delete, mock_ddb_delete, mock_failure_metric, mock_delete,
     ):
         # Customer re-onboarded — row has a fresh verification_token. The
         # conditional DeleteItem fails and the handler aborts BEFORE touching
-        # SSM, Route53, or the AC cert sync. This is the race guard.
+        # SSM, Route53, or the AC cert delete trigger. This is the race guard.
         mock_ddb_delete.side_effect = ClientError(
             {'Error': {'Code': 'ConditionalCheckFailedException', 'Message': 'race'}},
             'DeleteItem',
@@ -1324,7 +1375,7 @@ class TestHandleDomainCleanup(unittest.TestCase):
         assert result['status'] == cm.RESULT_ABORTED
         assert result['reason'] == cm.REASON_RACE_RE_REGISTERED
         mock_ssm_delete.assert_not_called()
-        mock_sync.assert_not_called()
+        mock_delete.assert_not_called()
         mock_failure_metric.assert_not_called()
 
     @patch.object(cm, 'publish_failure_metric')
@@ -1340,12 +1391,12 @@ class TestHandleDomainCleanup(unittest.TestCase):
         assert result['status'] == cm.RESULT_REJECTED
         mock_failure_metric.assert_called_once_with(cm.FAILURE_DOMAIN_VALIDATION)
 
-    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.trigger_cert_delete')
     @patch.object(cm.dynamodb_client, 'delete_item')
     @patch.object(cm.ssm_client, 'delete_parameters')
     @patch.object(cm.route53_client, 'list_resource_record_sets')
     def test_ssm_partial_not_found_is_idempotent(
-        self, mock_rr53_list, mock_ssm_delete, mock_ddb_delete, mock_sync,
+        self, mock_rr53_list, mock_ssm_delete, mock_ddb_delete, mock_delete,
     ):
         # Some SSM params already gone (e.g. a manual half-cleanup or an SNS
         # retry of a partial run). delete_parameters lists the missing ones in
@@ -1364,16 +1415,16 @@ class TestHandleDomainCleanup(unittest.TestCase):
 
         assert result['status'] == cm.RESULT_CLEANED
         assert result['ssm_deleted'] == ['/nhp/certs/gone.example.com/key']
-        mock_sync.assert_called_once_with(cm.BATCH_SYNC_CLEANUP)
+        mock_delete.assert_called_once_with('gone.example.com')
 
-    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.trigger_cert_delete')
     @patch.object(cm.dynamodb_client, 'delete_item')
     @patch.object(cm.ssm_client, 'delete_parameters')
     @patch.object(cm.route53_client, 'list_resource_record_sets')
     @patch.object(cm.route53_client, 'change_resource_record_sets')
     def test_deletes_route53_txt_when_record_exists(
         self, mock_rr53_change, mock_rr53_list, mock_ssm_delete,
-        mock_ddb_delete, mock_sync,
+        mock_ddb_delete, mock_delete,
     ):
         mock_ddb_delete.return_value = {}
         mock_ssm_delete.return_value = {'DeletedParameters': [], 'InvalidParameters': []}
@@ -1391,18 +1442,18 @@ class TestHandleDomainCleanup(unittest.TestCase):
         result = cm.handle_domain_cleanup(self._payload())
 
         assert result['route53_deleted'] is True
-        # Sync still runs on the happy path.
-        mock_sync.assert_called_once_with(cm.BATCH_SYNC_CLEANUP)
+        # AC delete trigger still runs on the happy path.
+        mock_delete.assert_called_once_with('gone.example.com')
         # Confirm the change-batch issued a DELETE for the same record.
         change = mock_rr53_change.call_args.kwargs['ChangeBatch']['Changes'][0]
         assert change['Action'] == 'DELETE'
         assert change['ResourceRecordSet']['Name'].rstrip('.') == target
 
-    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.trigger_cert_delete')
     @patch.object(cm.dynamodb_client, 'delete_item')
     @patch.object(cm.ssm_client, 'delete_parameters')
     def test_raises_transient_error_when_ddb_unavailable(
-        self, mock_ssm_delete, mock_ddb_delete, mock_sync,
+        self, mock_ssm_delete, mock_ddb_delete, mock_delete,
     ):
         # A non-conditional DDB ClientError (throttle, internal error) means
         # the race guard couldn't run — proceeding would risk wiping a
@@ -1417,14 +1468,14 @@ class TestHandleDomainCleanup(unittest.TestCase):
             cm.handle_domain_cleanup(self._payload(acme_cname_target=''))
 
         mock_ssm_delete.assert_not_called()
-        mock_sync.assert_not_called()
+        mock_delete.assert_not_called()
 
-    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.trigger_cert_delete')
     @patch.object(cm, 'publish_failure_metric')
     @patch.object(cm.dynamodb_client, 'delete_item')
     @patch.object(cm.ssm_client, 'delete_parameters')
     def test_raises_transient_error_when_ssm_delete_fails(
-        self, mock_ssm_delete, mock_ddb_delete, mock_failure_metric, mock_sync,
+        self, mock_ssm_delete, mock_ddb_delete, mock_failure_metric, mock_delete,
     ):
         # SSM threw a real ClientError. The cert is still in SSM — reporting
         # RESULT_CLEANED would be a lie. Raise so SNS retries the message
@@ -1439,7 +1490,7 @@ class TestHandleDomainCleanup(unittest.TestCase):
         with self.assertRaises(cm.TransientCleanupError):
             cm.handle_domain_cleanup(self._payload(acme_cname_target=''))
 
-        mock_sync.assert_not_called()
+        mock_delete.assert_not_called()
         # The internal-failure metric must fire so operators see SSM trouble.
         mock_failure_metric.assert_called_once_with(cm.FAILURE_CERT_STORAGE)
 
@@ -1693,12 +1744,12 @@ class TestContractFixtureKeys(unittest.TestCase):
             f"{prefix}/fb.example.com/meta",
         }
 
-    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.trigger_cert_delete')
     @patch.object(cm.route53_client, 'list_resource_record_sets')
     @patch.object(cm.dynamodb_client, 'delete_item')
     @patch.object(cm.ssm_client, 'delete_parameters')
     def test_full_contract_fixture_yields_clean_run(
-        self, mock_ssm_delete, mock_ddb_delete, mock_rr53_list, mock_sync,
+        self, mock_ssm_delete, mock_ddb_delete, mock_rr53_list, mock_delete,
     ):
         # Positive integration check: hand the full _CONTRACT_FIXTURE to the
         # handler with every consumer mocked, and assert non-rejection. If
@@ -1714,7 +1765,7 @@ class TestContractFixtureKeys(unittest.TestCase):
 
         assert result['status'] == cm.RESULT_CLEANED
         assert result['domain'] == _CONTRACT_FIXTURE['domain_name']
-        mock_sync.assert_called_once_with(cm.BATCH_SYNC_CLEANUP)
+        mock_delete.assert_called_once_with(_CONTRACT_FIXTURE['domain_name'])
 
 
 if __name__ == '__main__':

@@ -107,10 +107,15 @@ DDB_ERROR = 'error'
 # Batch sync trigger identifiers (not real domain names). Membership in
 # BATCH_SYNCS keeps trigger_cert_sync's full-mode-vs-incremental dispatch
 # in sync as new batch modes are added.
+#
+# Note: cleanup events used to flow through BATCH_SYNC_CLEANUP (full sync per
+# event), but #1994 switched them to trigger_cert_delete() — a per-domain
+# `--delete <domain>` invocation that avoids a fleet-wide rebuild on every
+# domain offboarding. Don't reintroduce a BATCH_SYNC_CLEANUP path without
+# revisiting that change.
 BATCH_SYNC_RENEWAL = 'renewal-scan-batch'
 BATCH_SYNC_PROVISION = 'provision-batch'
-BATCH_SYNC_CLEANUP = 'cleanup-batch'
-BATCH_SYNCS = frozenset({BATCH_SYNC_RENEWAL, BATCH_SYNC_PROVISION, BATCH_SYNC_CLEANUP})
+BATCH_SYNCS = frozenset({BATCH_SYNC_RENEWAL, BATCH_SYNC_PROVISION})
 
 # Domain name validation
 DOMAIN_REGEX = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?$')
@@ -1641,7 +1646,14 @@ def handle_domain_cleanup(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Route53 calls.
     deleted_route53 = bool(acme_cname_target) and delete_acme_txt_record(acme_cname_target)
 
-    trigger_cert_sync(BATCH_SYNC_CLEANUP)
+    # Per-domain incremental delete (#1994). Previously this fired
+    # trigger_cert_sync(BATCH_SYNC_CLEANUP), which mapped to a full-mode
+    # custom-domain-cert-sync.sh sweep on every AC for every cleanup event —
+    # N domains offboarded ⇒ N full-fleet rebuilds. trigger_cert_delete()
+    # invokes `custom-domain-cert-sync.sh --delete <domain>` instead, which
+    # touches only $CERT_DIR/$DOMAIN and the matching [[tls.certificates]]
+    # TOML block.
+    trigger_cert_delete(domain)
 
     logger.info(
         f"Domain cleanup complete for {domain}: ssm_deleted={deleted_ssm}, "
@@ -1779,6 +1791,66 @@ def trigger_cert_sync(domain: str):
         logger.info(f"Triggered cert sync on AC instances, command: {command_id}")
     except Exception as e:
         logger.error(f"Failed to trigger cert sync: {e}")
+        publish_failure_metric(FAILURE_CERT_SYNC)
+
+
+def trigger_cert_delete(domain: str):
+    """Trigger an incremental per-domain cert removal on AC instances.
+
+    Invokes `custom-domain-cert-sync.sh --delete <domain>` on every AC in the
+    fleet. The script removes only that domain's $CERT_DIR/$DOMAIN and the
+    matching [[tls.certificates]] TOML block, leaving every other domain's
+    cert material intact.
+
+    This replaces the pre-#1994 cleanup path that fired a full-mode sync per
+    event (trigger_cert_sync(BATCH_SYNC_CLEANUP)). The full sweep was correct
+    but cost the AC fleet a from-scratch rebuild for every domain offboarded;
+    customers offboarding N domains in quick succession produced N fleet-wide
+    full sweeps, while the incremental delete path is O(domains-removed).
+    """
+    try:
+        ac_instance_tag = os.environ.get('AC_INSTANCE_TAG')
+        if not ac_instance_tag:
+            logger.info("No AC_INSTANCE_TAG configured, skipping cert delete trigger")
+            return
+
+        # Defense-in-depth — domain has already been validated in
+        # handle_domain_cleanup, but re-validate before letting it through to
+        # the shell command. shlex.quote() handles literal characters; the
+        # is_valid_domain() check is the layer that refuses shell-meaningful
+        # values in the first place.
+        if not is_valid_domain(domain):
+            logger.error(f"Invalid domain format in trigger_cert_delete: {domain}")
+            return
+
+        sync_cmd = f'/home/ubuntu/scripts/custom-domain-cert-sync.sh --delete {shlex.quote(domain)}'
+
+        response = ssm_client.send_command(
+            Targets=[
+                {
+                    'Key': 'tag:Name',
+                    'Values': [ac_instance_tag]
+                }
+            ],
+            DocumentName='AWS-RunShellScript',
+            Parameters={
+                'commands': [
+                    'echo "Custom domain cert delete triggered"',
+                    # `|| true` mirrors trigger_cert_sync: the AC script
+                    # exits 0 on already-absent state. Anything that should
+                    # actually retry should be surfaced through the script's
+                    # CertSyncDomainsRemoved metric, not through this
+                    # SendCommand's success/failure.
+                    f'{sync_cmd} || true'
+                ]
+            },
+            TimeoutSeconds=120,
+            Comment=f'Cert delete triggered for custom domain: {domain}'
+        )
+        command_id = response['Command']['CommandId']
+        logger.info(f"Triggered cert delete on AC instances, command: {command_id}")
+    except Exception as e:
+        logger.error(f"Failed to trigger cert delete: {e}")
         publish_failure_metric(FAILURE_CERT_SYNC)
 
 

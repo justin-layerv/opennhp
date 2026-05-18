@@ -320,7 +320,14 @@ resource "aws_iam_role_policy" "lambda_permissions" {
           "ssm:PutParameter",
           "ssm:GetParameter",
           "ssm:GetParametersByPath",
+          # Singular and bulk variants are distinct IAM actions per AWS
+          # docs. The cleanup handler in custom_domain_cert_manager.py
+          # calls ssm_client.delete_parameters (bulk) — without the
+          # plural action it AccessDeniedExceptions the first time the
+          # cleanup tail runs against a non-empty param set. Caught in
+          # cr on PR #2006; pre-existing #1993 gap.
           "ssm:DeleteParameter",
+          "ssm:DeleteParameters",
           "ssm:ListTagsForResource",
           "ssm:AddTagsToResource"
         ]
