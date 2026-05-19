@@ -13,16 +13,6 @@ import (
 	utils "github.com/OpenNHP/opennhp/nhp/utils"
 )
 
-func TestUUID(t *testing.T) {
-	uuid, err := utils.NewUUID()
-	if err != nil {
-		fmt.Println("error: ", err)
-		return
-	}
-
-	fmt.Println("uuid: ", uuid)
-}
-
 func TestGenerateUUIDv4(t *testing.T) {
 	uuid, err := utils.GenerateUUIDv4()
 	if err != nil {
