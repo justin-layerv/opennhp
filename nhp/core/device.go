@@ -216,7 +216,8 @@ func (d *Device) msgToPacketRoutine(id int) {
 				}
 
 				mad, err = d.createMsgAssemblerData(md)
-				// no errors will happen
+				// createMsgAssemblerData guarantees mad non-nil even on
+				// err, so the deferred err handler above is nil-safe.
 				if err != nil {
 					return
 				}

@@ -101,11 +101,12 @@ type PacketParserData struct {
 }
 
 func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, err error) {
+	// Returns a non-nil ppd even on err so the callers' err paths
+	// (device.go packetToMsgRoutine, RecvPacketToMsg) can route through
+	// ppd.Error / ppd.feedbackMsgCh / ppd.decryptedMsgCh and Destroy
+	// the pool packet. Lifecycle is the caller's.
 	if pd.PrevAssemblerData != nil {
-		ppd, err = pd.PrevAssemblerData.derivePacketParserData(pd.BasePacket, pd.InitTime)
-		if err != nil {
-			return nil, err
-		}
+		ppd = pd.PrevAssemblerData.derivePacketParserData(pd.BasePacket, pd.InitTime)
 	} else {
 		ppd = &PacketParserData{}
 		ppd.device = d
@@ -115,7 +116,6 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 		ppd.LocalInitTime = pd.InitTime
 		ppd.ConnLastRemoteSendTime = pd.ConnLastRemoteSendTime
 		ppd.ConnPeerPublicKey = pd.ConnPeerPublicKey
-		ppd.decryptedMsgCh = pd.DecryptedMsgCh
 
 		// init header and init device ecdh
 		ppd.HeaderFlag = ppd.basePacket.Flag()
@@ -124,25 +124,37 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 		log.Info("start decryption using CIPHER_SCHEME_CURVE")
 		ppd.Ciphers = NewCipherSuite()
 		ppd.deviceEcdh = d.GetEcdhByCipherScheme(ppd.CipherScheme)
-
-		// init chain hash -> ChainHash0
-		ppd.chainHash, err = NewHash(ppd.Ciphers.HashType)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create chain hash: %w", err)
-		}
-		ppd.chainHash.Write(initialHashBytes)
-
-		// init chain key -> ChainKey0
-		ppd.noise.HashType = ppd.Ciphers.HashType
-		ppd.noise.MixKey(&ppd.chainKey, ppd.chainHash.Sum(nil), initialChainKeyBytes)
 	}
+
+	// Populate caller channel before the first fallible call below so
+	// the err defer in device.go packetToMsgRoutine can deliver the
+	// err. One place rather than per-branch.
+	ppd.decryptedMsgCh = pd.DecryptedMsgCh
+
+	// init chain hash -> ChainHash0
+	// Always reset per packet; intermediate chain-key carry-over was
+	// removed (Go-Go agreed on zeros, JS-Go did not). Ported from
+	// OpenNHP commit 03619015e. Invariant: this block runs for both
+	// branches above — deriveMsgAssemblerData deliberately leaves
+	// chain state alone, relying on this re-init.
+	ppd.chainHash, err = NewHash(ppd.Ciphers.HashType)
+	if err != nil {
+		err = fmt.Errorf("failed to create chain hash: %w", err)
+		return
+	}
+	ppd.chainHash.Write(initialHashBytes)
+
+	// init chain key -> ChainKey0
+	ppd.noise.HashType = ppd.Ciphers.HashType
+	ppd.noise.MixKey(&ppd.chainKey, ppd.chainHash.Sum(nil), initialChainKeyBytes)
 
 	ppd.HeaderType, ppd.BodySize = ppd.header.TypeAndPayloadSize()
 
 	// init hmac hash -> HmacHash0
 	ppd.hmacHash, err = NewHash(ppd.Ciphers.HashType)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create hmac hash: %w", err)
+		err = fmt.Errorf("failed to create hmac hash: %w", err)
+		return
 	}
 	ppd.hmacHash.Write(initialHashBytes)
 
@@ -168,6 +180,7 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 		if !ppd.checkHMAC(sumCookie) {
 			log.Error("HMAC validation failed on server side. sumCookie: %v", sumCookie)
 			err = ErrServerHMACCheckFailed
+			// bare return: caller's err defer expects named ppd populated
 			return
 		}
 
@@ -175,6 +188,7 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 		if !ppd.checkHMAC(false) {
 			log.Error("HMAC validation failed.")
 			err = ErrHMACCheckFailed
+			// bare return: caller's err defer expects named ppd populated
 			return
 		}
 	}
@@ -189,7 +203,7 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 	return ppd, nil
 }
 
-func (ppd *PacketParserData) deriveMsgAssemblerData(t int, compress bool, message []byte) (mad *MsgAssemblerData, err error) {
+func (ppd *PacketParserData) deriveMsgAssemblerData(t int, compress bool, message []byte) (mad *MsgAssemblerData) {
 	mad = &MsgAssemblerData{}
 	mad.device = ppd.device
 	mad.connData = ppd.ConnData
@@ -211,18 +225,10 @@ func (ppd *PacketParserData) deriveMsgAssemblerData(t int, compress bool, messag
 	// continue with the sender's counter
 	mad.header.SetCounter(ppd.SenderTrxId)
 
-	// init chain hash -> ChainHash0
-	mad.chainHash, err = NewHash(mad.ciphers.HashType)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create chain hash: %w", err)
-	}
-	mad.chainHash.Write(initialHashBytes)
+	// chain hash/key are reinitialized per packet by
+	// initiator.go createMsgAssemblerData (OpenNHP 03619015e).
 
-	// continue with responder's chain key -> ChainKey4
-	mad.noise.HashType = ppd.Ciphers.HashType
-	copy(mad.chainKey[:], ppd.chainKey[:])
-
-	return mad, nil
+	return mad
 }
 
 // shouldCheckRecvAttack gates the per-connection
@@ -291,7 +297,7 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 	ppd.chainHash.Write(ppd.deviceEcdh.PublicKey())
 	ppd.chainHash.Write(ppd.header.EphermeralBytes())
 
-	// evolve chain key ChainKey0 -> ChainKey1 (ChainKey4 -> ChainKey5)
+	// evolve chain key ChainKey0 -> ChainKey1
 	ppd.noise.MixKey(&ppd.chainKey, ppd.chainKey[:], ppd.header.EphermeralBytes())
 	// get ephermeral shared key
 	ess := ppd.deviceEcdh.SharedSecret(ppd.header.EphermeralBytes())
@@ -305,7 +311,7 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 	var key [SymmetricKeySize]byte
 	var aead cipher.AEAD
 
-	// generate gcm key and decrypt device pubkey ChainKey1 -> ChainKey2 (ChainKey5 -> ChainKey6)
+	// generate gcm key and decrypt device pubkey ChainKey1 -> ChainKey2
 	ppd.noise.KeyGen2(&ppd.chainKey, &key, ppd.chainKey[:], ess[:])
 	SetZero(ess[:])
 	peerPk := make([]byte, PublicKeySize)
@@ -391,7 +397,7 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 		return err
 	}
 
-	// generate gcm key and decrypt timestamp ChainKey2 -> ChainKey3 (ChainKey6 -> ChainKey7)
+	// generate gcm key and decrypt timestamp ChainKey2 -> ChainKey3
 	ppd.noise.KeyGen2(&ppd.chainKey, &key, ppd.chainKey[:], ss[:])
 	SetZero(ss[:])
 
@@ -494,7 +500,7 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 	// evolve chainhash ChainHash2 -> ChainHash3
 	ppd.chainHash.Write(ppd.header.TimestampBytes())
 
-	// generate gcm key for body decryption ChainKey3 -> ChainKey4 (ChainKey7 -> ChainKey8)
+	// generate gcm key for body decryption ChainKey3 -> ChainKey4
 	ppd.noise.KeyGen2(&ppd.chainKey, &key, ppd.chainKey[:], ppd.header.TimestampBytes())
 	ppd.bodyAead, err = AeadFromKey(ppd.Ciphers.GcmType, &key)
 	if err != nil {

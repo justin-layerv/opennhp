@@ -9,8 +9,6 @@ import (
 	"runtime"
 	"testing"
 	"time"
-
-	log "github.com/OpenNHP/opennhp/nhp/log"
 )
 
 // BenchmarkZlibCompressPooled measures the encrypt-path compression cost
@@ -104,18 +102,7 @@ func BenchmarkZlibDecompressUnpooled(b *testing.B) {
 // the pool's win on the send hot path is measured in a shape that
 // matches real traffic, not only as an isolated micro-bench.
 func BenchmarkEncryptBodyCompressed(b *testing.B) {
-	// Silence the per-call log.Info in createMsgAssemblerData so the
-	// benchmark output isn't interleaved with log lines. The log
-	// package doesn't expose a getter for the current global logger,
-	// so Cleanup resets to the package default (level Info, no file)
-	// rather than snapshotting the prior instance. If a previous test
-	// customized the logger, that customization is not restored —
-	// acceptable here because no other bench in this file depends on
-	// logger state.
-	log.SetGlobalLogger(log.NewLogger("", log.LogLevelSilent, "", ""))
-	b.Cleanup(func() {
-		log.SetGlobalLogger(log.NewLogger("", log.LogLevelInfo, "", ""))
-	})
+	silenceGlobalLogger(b)
 
 	agentPrivKey := make([]byte, 32)
 	for i := range agentPrivKey {

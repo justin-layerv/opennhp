@@ -64,6 +64,20 @@ Values where the fork intentionally diverges from upstream. **If an upstream com
 
 ## Sync History
 
+### 2026-05-19 - Noise Intermediate Chain Key Fix (Feature-Branch Cherry-Pick)
+
+- **Reviewed up to:** unchanged baseline (still `f53b7e2d`)
+- **Commits synced:** 1 (cherry-picked from `upstream/enable_webrtc`, NOT on `upstream/main`)
+- **Summary:**
+  - `03619015e` ("fix a bug in reusing empty intermediate chain key. All packages starts with initial key now.") — **synced** (adapted to fork's signature style). This commit lives only on the upstream `enable_webrtc` feature branch and has not been merged to `upstream/main`, which is why the May 2026 review (which walks `upstream/main`) did not surface it. Brought to our attention by upstream maintainer.
+  - Bug: `derivePacketParserData` and `deriveMsgAssemblerData` copied the previous transaction's chain key into the new MAD/PPD, but `encryptBody`/`decryptBody`'s deferred `SetZero(chainKey)` had already zeroed the source — so the "intermediate" key the response was supposed to chain from was actually all zeros. Go-to-Go absorbed the bug silently (both ends symmetrically derived from zeros and agreed); Go-to-JS interop broke because the JS implementation didn't replicate the zero-carry-over quirk.
+  - Fix: always initialize chain hash + chain key to ChainHash0/ChainKey0 per packet (move init out of the no-prev `else` branch in `createMsgAssemblerData`/`createPacketParserData`; remove the chainHash init + chainKey copy from the derive functions, dropping their now-unused err return).
+- **Wire-compat note (deliberately coordinated rollout):** this fix changes the on-the-wire AEAD key for response-direction packets (anything that flows through `PrevParserData` / `PrevAssemblerData` — knock ACKs, AOP/ART forwarding, AC online/registration responses, FRT). Old code derives the response body-AEAD key from a zeroed `chainKey`; new code derives it from canonical `ChainKey0`. Old↔new peers therefore fail body-AEAD on response packets with `ErrAEADDecryptionFailed`, while request-direction packets (fresh transactions) are unaffected. No protocol version gate exists, so the failure is silent body-decrypt failures on transaction-continuation packets only. Mitigations: (a) sandbox blue/green and prod canary both deploy server + AC sequentially within a single release window; (b) NHP transactions are fail-open with agent-side retries, so transient mismatch during the deploy window self-heals; (c) field agents auto-update via the agent SDK release cadence and have always tolerated transient knock failure. If a customer-deployed agent fleet ever gets out of sync with the server fleet for a long window, the symptom is failed knocks until the agent upgrades.
+- **Follow-up to consider:** keep an eye on `upstream/main` — when this fix eventually lands there it will register as a clean revert of our own commit. The next sync reviewer should recognize it (don't unwind our local commit on the assumption that upstream "removed it").
+- **Open follow-ups** tracking the residual risk and operational coverage:
+  - `#2017` — SRE runbook for `ErrAEADDecryptionFailed` during cutover (operator-facing telemetry for the long-tail customer-agent skew case).
+  - `#2018` — JS-reference compat smoke (Go-side decode of a recorded JS-emitted ACK). This is the **mechanical gate** that should fence the wire-format contract long-term; `#2018` must land before this PR's behavior can be relied on by a JS client release.
+
 ### 2026-05-01 - Crypto Key Material Log Leak
 
 - **Reviewed up to:** f53b7e2d

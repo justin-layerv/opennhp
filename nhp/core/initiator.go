@@ -87,12 +87,13 @@ type MsgAssemblerData struct {
 func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err error) {
 	log.Debug("createMsgAssemblerData: PeerPk len=%d, CipherScheme=%d, HeaderType=%d",
 		len(md.PeerPk), md.CipherScheme, md.HeaderType)
+	// Returns a non-nil mad even on err so the callers' err defers
+	// (device.go msgToPacketRoutine, MsgToPacket) can route through
+	// mad.Error / mad.encryptedPktCh / mad.ResponseMsgCh and Destroy
+	// the pool packet. Lifecycle is the caller's.
 	if md.PrevParserData != nil {
 		// continue from previous received packet to form one transaction
-		mad, err = md.PrevParserData.deriveMsgAssemblerData(md.HeaderType, md.Compress, md.Message)
-		if err != nil {
-			return nil, err
-		}
+		mad = md.PrevParserData.deriveMsgAssemblerData(md.HeaderType, md.Compress, md.Message)
 	} else {
 		mad = &MsgAssemblerData{}
 		mad.device = d
@@ -103,7 +104,6 @@ func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err
 		mad.bodyMessage = md.Message
 		mad.TransactionId = md.TransactionId
 		mad.connData = md.ConnData
-		mad.encryptedPktCh = md.EncryptedPktCh
 
 		// init packet buffer
 		if md.ExternalPacket != nil {
@@ -129,29 +129,43 @@ func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err
 
 		// init header counter
 		mad.header.SetCounter(mad.TransactionId)
-
-		// init chain hash -> ChainHash0
-		mad.chainHash, err = NewHash(mad.ciphers.HashType)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create chain hash: %w", err)
-		}
-		mad.chainHash.Write(initialHashBytes)
-
-		// init chain key -> ChainKey0
-		mad.noise.HashType = mad.ciphers.HashType
-		mad.noise.MixKey(&mad.chainKey, mad.chainHash.Sum(nil), initialChainKeyBytes)
 	}
+
+	// Populate caller channels before the first fallible call below
+	// so the err defer in device.go msgToPacketRoutine can deliver
+	// the err. Pre-fix with-prev callers skipped this assignment;
+	// all current with-prev callers leave both fields nil so the
+	// unconditional copy is a no-op today, but a future with-prev
+	// caller setting EncryptedPktCh will divert the encrypted packet
+	// away from connData.ForwardOutboundPacket.
+	mad.encryptedPktCh = md.EncryptedPktCh
+	mad.ResponseMsgCh = md.ResponseMsgCh
+
+	// init chain hash -> ChainHash0
+	// Always reset per packet; intermediate chain-key carry-over was
+	// removed (Go-Go agreed on zeros, JS-Go did not). Ported from
+	// OpenNHP commit 03619015e. Invariant: this block runs for both
+	// branches above — derivePacketParserData deliberately leaves
+	// chain state alone, relying on this re-init.
+	mad.chainHash, err = NewHash(mad.ciphers.HashType)
+	if err != nil {
+		err = fmt.Errorf("failed to create chain hash: %w", err)
+		return
+	}
+	mad.chainHash.Write(initialHashBytes)
+
+	// init chain key -> ChainKey0
+	mad.noise.HashType = mad.ciphers.HashType
+	mad.noise.MixKey(&mad.chainKey, mad.chainHash.Sum(nil), initialChainKeyBytes)
 
 	// init timestamp
 	mad.LocalInitTime = time.Now().UnixNano()
 
-	// assign channel
-	mad.ResponseMsgCh = md.ResponseMsgCh
-
 	// init hmac hash -> HmacHash0
 	mad.hmacHash, err = NewHash(mad.ciphers.HashType)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create hmac hash: %w", err)
+		err = fmt.Errorf("failed to create hmac hash: %w", err)
+		return
 	}
 	mad.hmacHash.Write(initialHashBytes)
 
@@ -159,14 +173,15 @@ func (d *Device) createMsgAssemblerData(md *MsgData) (mad *MsgAssemblerData, err
 	ephermalEccType := mad.ciphers.EccType
 	mad.ephermeralEcdh, err = NewECDH(ephermalEccType)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create ephemeral ECDH key: %w", err)
+		err = fmt.Errorf("failed to create ephemeral ECDH key: %w", err)
+		return
 	}
 	copy(mad.header.EphermeralBytes(), mad.ephermeralEcdh.PublicKey())
 
 	return mad, nil
 }
 
-func (mad *MsgAssemblerData) derivePacketParserData(pkt *Packet, initTime int64) (ppd *PacketParserData, err error) {
+func (mad *MsgAssemblerData) derivePacketParserData(pkt *Packet, initTime int64) (ppd *PacketParserData) {
 	ppd = &PacketParserData{}
 	ppd.device = mad.device
 	ppd.basePacket = pkt
@@ -181,18 +196,10 @@ func (mad *MsgAssemblerData) derivePacketParserData(pkt *Packet, initTime int64)
 	ppd.Ciphers = NewCipherSuite()
 	ppd.deviceEcdh = ppd.device.GetEcdhByCipherScheme(ppd.CipherScheme)
 
-	// init chain hash -> ChainHash0
-	ppd.chainHash, err = NewHash(ppd.Ciphers.HashType)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create chain hash: %w", err)
-	}
-	ppd.chainHash.Write(initialHashBytes)
+	// chain hash/key are reinitialized per packet by
+	// responder.go createPacketParserData (OpenNHP 03619015e).
 
-	// continue with initiator's chain key -> ChainKey4
-	ppd.noise.HashType = mad.ciphers.HashType
-	copy(ppd.chainKey[:], mad.chainKey[:])
-
-	return ppd, nil
+	return ppd
 }
 
 func (d *Device) createKeepalivePacket(md *MsgData) (mad *MsgAssemblerData, err error) {
@@ -254,7 +261,7 @@ func (mad *MsgAssemblerData) setPeerPublicKey(peerPk []byte) (err error) {
 	mad.chainHash.Write(mad.RemotePubKey)
 	mad.chainHash.Write(mad.ephermeralEcdh.PublicKey())
 
-	// evolve chain key ChainKey0 -> ChainKey1 (ChainKey4 -> ChainKey5)
+	// evolve chain key ChainKey0 -> ChainKey1
 	mad.noise.MixKey(&mad.chainKey, mad.chainKey[:], mad.ephermeralEcdh.PublicKey())
 
 	// init ephermeral shared key
@@ -268,7 +275,7 @@ func (mad *MsgAssemblerData) setPeerPublicKey(peerPk []byte) (err error) {
 	// prepare key for aead
 	var key [SymmetricKeySize]byte
 
-	// generate gcm key and encrypt device pubkey ChainKey1 -> ChainKey2 (ChainKey5 -> ChainKey6)
+	// generate gcm key and encrypt device pubkey ChainKey1 -> ChainKey2
 	mad.noise.KeyGen2(&mad.chainKey, &key, mad.chainKey[:], ess[:])
 	SetZero(ess[:])
 
@@ -292,7 +299,7 @@ func (mad *MsgAssemblerData) setPeerPublicKey(peerPk []byte) (err error) {
 		return err
 	}
 
-	// generate gcm key and encrypt timestamp ChainKey2 -> ChainKey3 (ChainKey6 -> ChainKey7)
+	// generate gcm key and encrypt timestamp ChainKey2 -> ChainKey3
 	mad.noise.KeyGen2(&mad.chainKey, &key, mad.chainKey[:], ss[:])
 	SetZero(ss[:])
 
@@ -307,7 +314,7 @@ func (mad *MsgAssemblerData) setPeerPublicKey(peerPk []byte) (err error) {
 	// evolve chainhash ChainHash2 -> ChainHash3
 	mad.chainHash.Write(ts)
 
-	// generate gcm key for body encryption ChainKey3 -> ChainKey4 (ChainKey7 -> ChainKey8)
+	// generate gcm key for body encryption ChainKey3 -> ChainKey4
 	mad.noise.KeyGen2(&mad.chainKey, &key, mad.chainKey[:], ts[:])
 	mad.bodyAead, err = AeadFromKey(mad.ciphers.GcmType, &key)
 	if err != nil {
