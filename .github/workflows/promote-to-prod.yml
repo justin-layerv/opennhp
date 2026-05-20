@@ -249,12 +249,13 @@ jobs:
           SANDBOX_ACTIVE_COLOR=$(aws ssm get-parameter \
             --name "/sandbox/nhp/server/active-color" \
             --query "Parameter.Value" --output text 2>/dev/null || echo "unknown")
-          SANDBOX_SERVER_TAG=$(aws ssm get-parameter \
-            --name "/sandbox/nhp/server/image-tag" \
-            --query "Parameter.Value" --output text 2>/dev/null || echo "unknown")
-          SANDBOX_AC_TAG=$(aws ssm get-parameter \
-            --name "/sandbox/nhp/ac/image-tag" \
-            --query "Parameter.Value" --output text 2>/dev/null || echo "unknown")
+          # Resolve via active-color → slot indirection (resolve-active-image-tag.sh).
+          # Reading /sandbox/nhp/<component>/image-tag directly returns the blue-slot
+          # tag, which is the active tag only when active-color=blue. Promote-to-prod
+          # would otherwise surface (and potentially promote) a stale standby tag
+          # any time a deploy ended with active=green.
+          SANDBOX_SERVER_TAG=$(./.github/scripts/resolve-active-image-tag.sh sandbox server 2>/dev/null || echo "unknown")
+          SANDBOX_AC_TAG=$(./.github/scripts/resolve-active-image-tag.sh sandbox ac 2>/dev/null || echo "unknown")
           SANDBOX_QURL_TAG=$(aws ssm get-parameter \
             --name "/layerv-nhp-sandbox/qurl-api-image-tag" \
             --query "Parameter.Value" --output text 2>/dev/null || echo "unknown")

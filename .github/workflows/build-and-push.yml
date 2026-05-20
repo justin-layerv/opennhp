@@ -1610,56 +1610,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          resolve_active_tag() {
-            local component="$1"
-            local base="/sandbox/nhp/${component}"
-            local color
-            if ! color=$(aws ssm get-parameter \
-                --name "${base}/active-color" \
-                --query "Parameter.Value" --output text 2>&1); then
-              echo "::error::Failed to read ${base}/active-color from SSM: $color" >&2
-              return 1
-            fi
-
-            # Reject any value other than the two known good colours so a
-            # corrupted / partially-written / typo'd active-color cannot
-            # silently fall through to the green branch and resolve to the
-            # wrong tag. Same shape of defense as the cross-component
-            # divergence check below: surface bad state loudly.
-            if [[ "$color" != "blue" && "$color" != "green" ]]; then
-              echo "::error::Unexpected ${base}/active-color value: '$color' (expected 'blue' or 'green')" >&2
-              return 1
-            fi
-
-            # Legacy naming: blue tag lives at ${base}/image-tag, green tag
-            # at ${base}/green-image-tag. Mirrors the scheme in
-            # blue-green-switch.sh and the server-state step of
-            # blue-green-deploy.yml.
-            local param
-            if [[ "$color" == "blue" ]]; then
-              param="${base}/image-tag"
-            else
-              param="${base}/green-image-tag"
-            fi
-
-            local tag
-            if ! tag=$(aws ssm get-parameter \
-                --name "$param" \
-                --query "Parameter.Value" --output text 2>&1); then
-              echo "::error::Failed to read $param from SSM: $tag" >&2
-              return 1
-            fi
-            printf '%s' "$tag"
-          }
-
           if [[ "$APP_CHANGED" == "true" ]]; then
             IMAGE_TAG="$GITHUB_SHA_INPUT"
             echo "App code changed on this commit — dispatching with freshly-built tag: $IMAGE_TAG"
             echo "source=github-sha" >> "$GITHUB_OUTPUT"
           else
             echo "No app code changes on this commit — resolving current active image tags from SSM so the blue/green refresh picks up any launch-template / user_data / boot-config changes from terraform apply."
-            SERVER_TAG=$(resolve_active_tag server)
-            AC_TAG=$(resolve_active_tag ac)
+            SERVER_TAG=$(./.github/scripts/resolve-active-image-tag.sh sandbox server)
+            AC_TAG=$(./.github/scripts/resolve-active-image-tag.sh sandbox ac)
             echo "  server active tag: $SERVER_TAG"
             echo "  ac     active tag: $AC_TAG"
             if [[ "$SERVER_TAG" != "$AC_TAG" ]]; then
