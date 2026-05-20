@@ -40,6 +40,53 @@ else flips it (no plan-time revert):
 that exceeds the static cap fights the rehearsal — the cap is the
 safety net.
 
+**Static name + `create_before_destroy` invariant.** Every ASG in
+this repo (the three listed above plus their `blue_green.tf` green
+counterparts) uses a static `name = "${var.name_prefix}-..."` AND
+sets `lifecycle.create_before_destroy = true`. The combination is
+intentional but structurally fragile: under plan/apply, a tainted
+ASG cannot replace cleanly — the CBD create-first step collides
+with the existing AWS resource's static name (`AlreadyExists`) and
+CBD blocks the destroy-first ordering that would otherwise succeed.
+
+The build-and-push workflow's `Handle ASG Attachment Migrations
+and Taint Recovery` step detects tainted ASGs in the plan
+and runs `terraform untaint` to recover the in-place
+reconciliation path. **If you introduce a new ASG that uses
+`name_prefix` instead of a static `name`, untaint is the WRONG
+recovery** — a `name_prefix` ASG can actually replace under CBD,
+and the workflow handler would mask a legitimate replacement need.
+Either keep new ASGs on the static-name + CBD pattern, or update
+the workflow handler to exclude `name_prefix`-based ASGs from the
+auto-untaint sweep.
+
+**State-loss recovery is out of scope of this handler.** If a
+future failure pattern leaves an ASG present in AWS but absent
+from state (no tainted marker — a true state/AWS divergence rather
+than a partial-create), the handler does not fire and `import {}`
+in `terraform/environments/<env>/imports.tf` is the correct tool.
+Don't extend the taint-recovery handler to cover this case.
+
+**Sandbox-only — prod recovery is operator-driven.** The handler
+lives on the sandbox leg of `build-and-push.yml`; there is no
+equivalent in `promote-to-prod.yml`. If a prod apply ever hits a
+partial-create on a CBD static-named ASG (sandbox is the
+absorbing layer for this failure mode, so it shouldn't), the
+on-call operator runs `terraform untaint` manually with the
+relevant approvals — auto-untaint under prod's approval-gated
+flow would skip review of the in-place reconciliation diff.
+
+**Re-validate after Terraform version bumps.** Both the
+attachment-migration grep (`aws_autoscaling_attachment\.[^ ]+ will
+be destroyed`) and the taint-recovery grep
+(`aws_autoscaling_group\.[^ ]+ is tainted, so must be replaced`)
+are string matches against `terraform plan` / `terraform show`
+output. The wording is unstable across Terraform versions; the
+handler silently no-ops if either phrase changes. Re-run the
+sandbox apply against a known-good migration / known-tainted ASG
+after any TF version bump that touches plan rendering, and tighten
+or update the regex if the format drifted.
+
 ## IAM eventual-consistency shim pattern
 
 When the same `terraform apply` both grants a new permission to a CI

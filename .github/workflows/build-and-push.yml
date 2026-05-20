@@ -1429,7 +1429,7 @@ jobs:
       # TF_VAR_frps_image_tag to GITHUB_ENV; it is inherited by this step
       # automatically. When SSM has the bootstrap placeholder or no value,
       # it stays unset and tfvars wins. See that step for the contract.
-      - name: Handle ASG Attachment Migrations
+      - name: Handle ASG Attachment Migrations and Taint Recovery
         working-directory: terraform/environments/sandbox
         env:
           TF_VAR_auth_signing_key: ${{ secrets.NHP_AUTH_SIGNING_KEY }}
@@ -1445,7 +1445,7 @@ jobs:
           set -euo pipefail
 
           # Clean up any stale plan files from previous failed runs
-          rm -f tfplan plan.txt
+          rm -f tfplan plan.txt plan-show.txt
 
           # When migrating from aws_autoscaling_attachment to inline target_group_arns,
           # Terraform's refresh timing can cause a race condition:
@@ -1482,6 +1482,74 @@ jobs:
             rm -f tfplan
             if ! terraform plan -out=tfplan -no-color; then
               echo "::error::Re-plan failed after state removal. Manual intervention may be required."
+              exit 1
+            fi
+          fi
+
+          # Handle ASGs left tainted by a prior partial-create failure.
+          # The repo's static-named ASGs (server, AC, FRPS — see
+          # `terraform/CLAUDE.md` ASG co-ownership rules) all set
+          # `lifecycle.create_before_destroy = true`. Once tainted, the
+          # planned replace cannot succeed under plan/apply alone: the
+          # create-first step collides with the existing AWS resource's
+          # static name (`AlreadyExists`), and `create_before_destroy`
+          # blocks the destroy-first ordering that would otherwise work.
+          # Untaint to recover the in-place reconciliation path.
+          # Hard-fail rather than fall back to plan.txt: if the attachment
+          # branch above re-planned, plan.txt is stale (only the initial
+          # plan was tee-piped to it), and a silent fallback would scan an
+          # outdated plan and miss a tainted ASG. The hard-fail is
+          # genuinely load-bearing — `terraform show` can fail on corrupt
+          # tfplan, disk full mid-write, or plan-format incompatibility
+          # after a Terraform version bump.
+          if ! terraform show -no-color tfplan > plan-show.txt; then
+            echo "::error::terraform show tfplan failed; cannot detect tainted ASGs"
+            exit 1
+          fi
+          TAINTED_ASGS=$(grep -E "aws_autoscaling_group\.[^ ]+ is tainted, so must be replaced" plan-show.txt | \
+            sed -E 's/^[[:space:]]*#[[:space:]]+//; s/ is tainted.*$//' || true)
+
+          if [[ -n "$TAINTED_ASGS" ]]; then
+            echo "::warning::Detected tainted ASG(s) - untainting to allow in-place reconciliation (static-named ASG + create_before_destroy cannot replace under plan/apply)"
+            while IFS= read -r asg; do
+              [ -z "$asg" ] && continue
+              echo "Untainting: $asg"
+              # Fatal on non-zero: the re-plan below succeeds even on a
+              # still-tainted resource (Terraform `plan` produces a
+              # replace diff, not an error), so the real failure surface
+              # is `apply` (AlreadyExists) — exactly the loop this
+              # handler exists to prevent. Fail loud here instead.
+              if ! terraform untaint "$asg"; then
+                echo "::error::terraform untaint $asg failed; aborting to avoid the AlreadyExists loop at apply time"
+                exit 1
+              fi
+            done <<< "$TAINTED_ASGS"
+            # Re-plan after untaint so the in-place diff lands in tfplan.
+            # Single-pass by design: if the re-plan re-surfaces another
+            # tainted ASG (e.g. refresh re-taints due to external state
+            # mutation), the next CI run picks it up. Don't add an inner
+            # loop — bounded blast radius keeps the failure mode loud.
+            # `tee plan.txt` keeps plan.txt consistent with tfplan so a
+            # downstream re-scan doesn't read a stale file.
+            rm -f tfplan
+            if ! terraform plan -out=tfplan -no-color 2>&1 | tee plan.txt; then
+              echo "::error::Re-plan failed after untaint. Manual intervention may be required."
+              exit 1
+            fi
+            # Fail fast if the re-plan re-tainted something. plan.txt
+            # is the fresh post-re-plan output (just tee'd above), so
+            # no `terraform show` needed here — that's why the data
+            # source is asymmetric with the initial scan above. If we
+            # let apply run, it would hit `AlreadyExists` — exactly
+            # the loop this handler exists to prevent. The next CI run
+            # picks it up; failing here surfaces the recovery story in
+            # this run's log instead of as a cryptic apply error.
+            if grep -qE "aws_autoscaling_group\.[^ ]+ is tainted, so must be replaced" plan.txt; then
+              echo "::error::Re-plan after untaint still shows tainted ASG(s); aborting to avoid the AlreadyExists loop at apply time. Re-run the workflow on the next CI cycle."
+              # Name the still-tainted address(es) in the log so the
+              # operator doesn't have to scroll the plan to find them.
+              grep -E "aws_autoscaling_group\.[^ ]+ is tainted, so must be replaced" plan.txt \
+                | sed -E 's/^[[:space:]]*#[[:space:]]+//; s/ is tainted.*$//' >&2
               exit 1
             fi
           fi
