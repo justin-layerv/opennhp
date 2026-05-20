@@ -82,6 +82,8 @@ module "nhp" {
 
   # QURL Service
   deploy_qurl_service             = var.deploy_qurl_service
+  deploy_qurl_bootstrap_chain     = var.deploy_qurl_bootstrap_chain
+  enable_qurl_agent_bootstrap     = var.enable_qurl_agent_bootstrap
   qurl_service_domain             = var.qurl_service_domain
   qurl_hosted_zone_id             = var.qurl_hosted_zone_id
   qurl_jwt_secret_arn             = var.qurl_jwt_secret_arn

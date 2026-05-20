@@ -48,6 +48,45 @@ resource "terraform_data" "frps_env_var_triple" {
   }
 }
 
+# Module-reuse hardening for the QURL agent → nhp-server bootstrap chain.
+# The validation/precondition split:
+#   - Variable-level `validation` blocks (in variables.tf) handle
+#     empty-vs-malformed checks per-variable in isolation
+#     (base64-decodable 32-byte pubkey, bare FQDN host, numeric port).
+#   - This `terraform_data` precondition handles the cross-variable
+#     invariant that variable validation can't express — "non-empty
+#     when the gate is on" requires referencing both
+#     `var.deploy_qurl_bootstrap_chain` and the value-bearing var.
+# Today the only caller (`terraform/main.tf`) always threads both
+# producer outputs (module.nhp_keypair.registration_public_key,
+# module.compute.nlb_dns_name) when the gate is on, so this precondition
+# is defense in depth — but a future caller that flips
+# `deploy_qurl_bootstrap_chain = true` without wiring the values would
+# otherwise inject empty env vars and surface the failure only at agent
+# runtime. Fail at plan time instead.
+#
+# Caveat: `module.nhp_keypair.registration_public_key` is "known after
+# apply" on a greenfield env (it resolves to an `aws_ssm_parameter.value`
+# sourced from `aws_lambda_invocation.keygen.result`). The condition then
+# evaluates at apply time rather than plan time — a fail-loud apply error
+# is still strictly better than a runtime agent failure, which is the
+# point of the fence. Sandbox + prod both have the keypair deployed
+# already, so the plan-time signal works there today.
+resource "terraform_data" "qurl_bootstrap_chain_inputs" {
+  count = var.deploy_qurl_bootstrap_chain ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = var.nhp_server_public_key_b64 != ""
+      error_message = "deploy_qurl_bootstrap_chain=true but nhp_server_public_key_b64 is empty. The agent would receive NHP_SERVER_PUBLIC_KEY_B64=\"\" and fail its handshake at runtime. Thread `module.nhp_keypair.registration_public_key` from the root."
+    }
+    precondition {
+      condition     = var.nhp_server_host != ""
+      error_message = "deploy_qurl_bootstrap_chain=true but nhp_server_host is empty. The agent would receive NHP_SERVER_HOST=\"\" and have no responder to reach. Thread `module.compute.nlb_dns_name` from the root."
+    }
+  }
+}
+
 # SSM parameter for image tag - created with default, updated by CI
 # The CI pipeline updates this parameter after pushing a new image to ECR.
 # Using lifecycle ignore_changes so CI updates don't cause drift.
@@ -298,6 +337,25 @@ locals {
     var.nhp_server_internal_url != "" ? [
       { name = "NHP_SERVER_INTERNAL_URL", value = var.nhp_server_internal_url },
       { name = "NHP_KNOCK_TIMEOUT", value = tostring(var.nhp_knock_timeout_seconds) },
+    ] : [],
+    # QURL agent → nhp-server bootstrap chain (Wave 5 dark-launch). Threaded
+    # directly from the nhp-server side outputs at the root
+    # (module.nhp_keypair + module.compute) so the agent's view of the
+    # responder can never drift from what nhp-server actually publishes.
+    # Same wiring shape as NHP_SERVER_INTERNAL_URL above — TF-injected env
+    # vars on the task def, no second config-fetch mechanism (no
+    # ssm:GetParameter at runtime), no IAM surface for these statics. The
+    # values change only on TF apply (NLB DNS rotation, pool keypair
+    # rotation, constant port). Gate is var.deploy_qurl_bootstrap_chain;
+    # post-burn-in the chain is activated via a separate
+    # var.enable_qurl_agent_bootstrap tfvars flip in a focused follow-up
+    # PR — matches the established dark-launch pattern in this tree
+    # (deploy_frps, deploy_qurl_service, deploy_bootstrap_alb).
+    var.deploy_qurl_bootstrap_chain ? [
+      { name = "NHP_SERVER_PUBLIC_KEY_B64", value = var.nhp_server_public_key_b64 },
+      { name = "NHP_SERVER_HOST", value = var.nhp_server_host },
+      { name = "NHP_SERVER_PORT", value = var.nhp_server_port },
+      { name = "QURL_AGENT_BOOTSTRAP_ENABLED", value = var.enable_qurl_agent_bootstrap ? "true" : "false" },
     ] : [],
     # FRPS per-AZ integration (#1499). qurl-service hashes OwnerID to a
     # suffix and emits `frps-${suffix}.${domain}:${port}` as `frps_addr`

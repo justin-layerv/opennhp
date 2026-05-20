@@ -163,6 +163,18 @@ ac_license_key_sha256 = "a762d8af6c774acf2d0560575658062f306cd2e872409ac52cf0baf
 # QURL API service is deployed by default
 deploy_qurl_service = true
 
+# Wave 5 — sandbox-only opt-in to the qurl-service ↔ nhp-server agent
+# bootstrap chain. When true, the qurl-service ECS task def gains four
+# TF-injected env vars (NHP_SERVER_PUBLIC_KEY_B64, NHP_SERVER_HOST,
+# NHP_SERVER_PORT, QURL_AGENT_BOOTSTRAP_ENABLED) alongside the existing
+# NHP_SERVER_INTERNAL_URL — no runtime SSM fetch, no new IAM grants.
+# `enable_qurl_agent_bootstrap` is the post-burn-in activation flip:
+# kept false here so the chain lands inert; a focused follow-up PR
+# will flip it to true after burn-in. Prod tfvars deliberately omits
+# both until sandbox burn-in lands.
+deploy_qurl_bootstrap_chain = true
+enable_qurl_agent_bootstrap = false
+
 # Domain configuration for QURL API
 # Certificate is created automatically via Terraform when domain is set
 qurl_service_domain = "api.layerv.xyz"

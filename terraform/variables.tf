@@ -781,6 +781,18 @@ variable "qurl_default_ac_id" {
   }
 }
 
+variable "deploy_qurl_bootstrap_chain" {
+  description = "Wave 5 dark-launch gate for the qurl-service ↔ nhp-server agent bootstrap chain. When true, the qurl-service module injects four env vars on the ECS task def (NHP_SERVER_PUBLIC_KEY_B64, NHP_SERVER_HOST, NHP_SERVER_PORT, QURL_AGENT_BOOTSTRAP_ENABLED) — same wiring shape as NHP_SERVER_INTERNAL_URL, no runtime SSM fetch, no new IAM surface. Values flow from module.nhp_keypair + module.compute at the root. The QURL_AGENT_BOOTSTRAP_ENABLED env var is driven by a separate `enable_qurl_agent_bootstrap` bool so the post-burn-in flip is a focused follow-up PR. Requires `deploy_qurl_service = true` (enforced at plan time via a precondition). Default false leaves prod untouched until explicitly enabled per-env."
+  type        = bool
+  default     = false
+}
+
+variable "enable_qurl_agent_bootstrap" {
+  description = "Wave 5 dark-launch flag for the qurl-service agent → nhp-server bootstrap chain. Drives the QURL_AGENT_BOOTSTRAP_ENABLED env var on the task def. Default false: the chain stays inert until a focused follow-up PR flips this to true post-burn-in. Only consulted when deploy_qurl_bootstrap_chain = true."
+  type        = bool
+  default     = false
+}
+
 variable "qurl_default_ac_port" {
   description = "Default AC port for new QURL resources"
   type        = number

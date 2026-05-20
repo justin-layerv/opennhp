@@ -342,6 +342,22 @@ variable "deploy_qurl_service" {
   type        = bool
 }
 
+# Wave 5 dark-launch gate for the qurl-service ↔ nhp-server agent
+# bootstrap chain (NHP_SERVER_PUBLIC_KEY_B64 / NHP_SERVER_HOST /
+# NHP_SERVER_PORT / QURL_AGENT_BOOTSTRAP_ENABLED). See root variable
+# of the same name for the full contract.
+variable "deploy_qurl_bootstrap_chain" {
+  description = "Inject the four bootstrap-chain env vars (NHP_SERVER_PUBLIC_KEY_B64, NHP_SERVER_HOST, NHP_SERVER_PORT, QURL_AGENT_BOOTSTRAP_ENABLED) on the qurl-service ECS task def. Default false; flip to true to land the chain. The agent-enabled flag itself is gated separately via `enable_qurl_agent_bootstrap` so the post-burn-in activation is a focused one-line tfvars flip."
+  type        = bool
+  default     = false
+}
+
+variable "enable_qurl_agent_bootstrap" {
+  description = "Wave 5 dark-launch flag for the qurl-service agent → nhp-server bootstrap chain. Drives the QURL_AGENT_BOOTSTRAP_ENABLED env var on the task def. Default false: the chain stays inert until a focused follow-up PR flips this to true post-burn-in. Only consulted when deploy_qurl_bootstrap_chain = true."
+  type        = bool
+  default     = false
+}
+
 variable "qurl_jwt_secret_arn" {
   description = "Secrets Manager ARN for QURL JWT signing secret"
   type        = string

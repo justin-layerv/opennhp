@@ -128,6 +128,43 @@ resource "terraform_data" "qurl_site_authz_preconditions" {
   }
 }
 
+# `deploy_qurl_bootstrap_chain=true` injects the bootstrap-chain env
+# vars onto the qurl-service ECS task def. Without `deploy_qurl_service`
+# the task def doesn't exist, so the gate silently does nothing — the
+# same operator-confusion trap as the qurl_site_authz preconditions
+# above. Fail at plan time.
+resource "terraform_data" "qurl_bootstrap_chain_preconditions" {
+  count = var.deploy_qurl_bootstrap_chain ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = var.deploy_qurl_service
+      error_message = "deploy_qurl_bootstrap_chain=true requires deploy_qurl_service=true. The chain's env vars are injected onto the qurl-service ECS task def; without the service deployed, the gate has no execution path and silently does nothing."
+    }
+  }
+}
+
+# Inverse precondition: flipping the activation bool without the
+# structural gate silently leaves the chain inert. The variable
+# description says "only consulted when deploy_qurl_bootstrap_chain
+# = true", but nothing enforces that — an operator who sets just
+# `enable_qurl_agent_bootstrap = true` (forgetting the structural
+# gate) gets a zero-diff plan with no signal that the activation
+# is moot. This `count` ties to the activation flag specifically,
+# so the precondition only exists when someone affirmatively flips
+# the activation bool — the all-defaults-false posture doesn't
+# trip it.
+resource "terraform_data" "qurl_bootstrap_activation_preconditions" {
+  count = var.enable_qurl_agent_bootstrap ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = var.deploy_qurl_bootstrap_chain
+      error_message = "enable_qurl_agent_bootstrap=true requires deploy_qurl_bootstrap_chain=true. The activation flag drives the QURL_AGENT_BOOTSTRAP_ENABLED env var on the qurl-service task def; when the structural gate is off the whole 4-tuple is omitted from `container_env`, so flipping the activation alone leaves the chain inert."
+    }
+  }
+}
+
 # ==================== Locals ====================
 
 locals {
@@ -2047,6 +2084,38 @@ module "qurl_service" {
   # AC Fleet defaults
   default_ac_id   = var.qurl_default_ac_id
   default_ac_port = var.qurl_default_ac_port
+
+  # QURL agent → nhp-server bootstrap chain (Wave 5 dark-launch).
+  # Threaded directly from the nhp-server side outputs (nhp_keypair +
+  # compute NLB) so the agent's view of the responder can never drift
+  # from what nhp-server actually publishes. The module gates env-var
+  # injection on `deploy_qurl_bootstrap_chain`, so passing the module
+  # outputs unconditionally here is harmless when the gate is off (the
+  # values reach the module but are not rendered into the task def).
+  # `enable_qurl_agent_bootstrap` is the post-burn-in flip — kept on a
+  # separate var so the activation is a one-line tfvars edit in a
+  # focused follow-up PR, matching the dark-launch pattern across this
+  # tree.
+  #
+  # Cell-isolation note: `module.nhp_keypair.registration_public_key`
+  # reads from `/nhp/pool/registration-public-key` — a global SSM path,
+  # not cell-prefixed. This wiring implicitly assumes one nhp-server
+  # pool per env. If a future topology spans cells or runs multiple
+  # keypair pools, the threading-from-root pattern here must be
+  # revisited so the agent sees the same pubkey the responder it
+  # reaches actually publishes.
+  deploy_qurl_bootstrap_chain = var.deploy_qurl_bootstrap_chain
+  enable_qurl_agent_bootstrap = var.enable_qurl_agent_bootstrap
+  nhp_server_public_key_b64   = module.nhp_keypair.registration_public_key
+  nhp_server_host             = module.compute.nlb_dns_name
+  # nhp_server_port is intentionally NOT threaded from a root variable.
+  # The port is a code-level constant (62206) hardcoded in three places —
+  # `modules/compute/main.tf` (UDP TG), `modules/ac/main.tf` (AC
+  # ConnectorClient), and the module-side default. Threading it through
+  # a root tfvar would imply per-env configurability that the AC/compute
+  # side doesn't honor; #2027 tracks consolidating all three sites into
+  # a shared local. Until that lands, the module-side default is the
+  # qurl-service-facing source of truth.
 
   # Domain - use certificate created above if domain is configured
   # DNS record created in root module (not module) for cross-account Route53 support

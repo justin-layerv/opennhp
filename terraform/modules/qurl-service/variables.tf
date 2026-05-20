@@ -849,3 +849,84 @@ variable "fileviewer_hostnames" {
     error_message = "Every fileviewer_hostnames entry must be a bare FQDN (e.g., fileviewer.layerv.ai) — no scheme, path, port, or whitespace."
   }
 }
+
+# ==================== QURL agent → nhp-server bootstrap chain (Wave 5) ====================
+
+variable "deploy_qurl_bootstrap_chain" {
+  description = "Structural-only gate for the qurl-service ↔ nhp-server agent bootstrap chain — agent activation is gated separately via `enable_qurl_agent_bootstrap`. When true, injects four env vars on the ECS task def (NHP_SERVER_PUBLIC_KEY_B64, NHP_SERVER_HOST, NHP_SERVER_PORT, QURL_AGENT_BOOTSTRAP_ENABLED) alongside the existing NHP_SERVER_INTERNAL_URL. Same wiring shape (TF-injected env vars, no runtime SSM fetch). Default false leaves prod and any environment that hasn't opted in untouched. Enable per-env via tfvars."
+  type        = bool
+  default     = false
+}
+
+variable "enable_qurl_agent_bootstrap" {
+  description = "Wave 5 dark-launch flag for the qurl-service agent → nhp-server bootstrap chain. Drives the QURL_AGENT_BOOTSTRAP_ENABLED env var on the task def. Default false: the chain stays inert until a focused follow-up PR flips this to true post-burn-in. Only consulted when deploy_qurl_bootstrap_chain = true."
+  type        = bool
+  default     = false
+}
+
+variable "nhp_server_public_key_b64" {
+  description = "NHP server responder public key (base64; raw 32-byte X25519 key). Threaded from `module.nhp_keypair.registration_public_key` at the root. Consumed only when deploy_qurl_bootstrap_chain = true; pass empty string when the gate is off."
+  type        = string
+  default     = ""
+
+  # Catch keypair-output shape drift at plan time. Allows empty when the
+  # gate is off; otherwise requires a decodable base64 string whose raw
+  # length is 32 bytes (Curve25519). Defends against producer-side
+  # changes that wrap the key in PEM, add leading whitespace from a
+  # Lambda JSON re-encode, etc. — qurl-service would otherwise blow up
+  # at consume time with no plan-time signal.
+  #
+  # Greenfield caveat: on a fresh env where `module.nhp_keypair` hasn't
+  # yet applied, the threaded value resolves through
+  # `aws_lambda_invocation.keygen.result` and is "known after apply".
+  # Terraform 1.5+ defers `validation` blocks against unknown values to
+  # apply time, so the shape-check still runs — just at apply, not at
+  # plan. Same posture as the module-side `terraform_data` precondition;
+  # a fail-loud apply error is strictly better than runtime agent
+  # failure either way.
+  validation {
+    condition     = var.nhp_server_public_key_b64 == "" || (can(base64decode(var.nhp_server_public_key_b64)) && length(base64decode(var.nhp_server_public_key_b64)) == 32)
+    error_message = "nhp_server_public_key_b64 must be empty (gate off) or a base64-encoded 32-byte X25519 public key. Got an unparseable / wrong-length value — check module.nhp_keypair.registration_public_key's output shape."
+  }
+}
+
+variable "nhp_server_host" {
+  description = "NHP server NLB DNS name (intentionally a DNS name rather than an IP — NLB DNS resolution and TTL semantics are the consumer's responsibility at the agent). Threaded from `module.compute.nlb_dns_name` at the root. Consumed only when deploy_qurl_bootstrap_chain = true; pass empty string when the gate is off."
+  type        = string
+  default     = ""
+
+  # Bare-hostname shape check, mirroring `fileviewer_hostnames` above.
+  # `module.compute.nlb_dns_name` returns a bare DNS name today (e.g.
+  # `nhp-sandbox-<...>.elb.us-east-1.amazonaws.com`); this fence catches
+  # a future producer change that wraps a scheme, path, or port around
+  # the value before the agent fails the NHP/UDP handshake at runtime.
+  # Same greenfield "known after apply" caveat applies as on the
+  # public-key validation — Terraform 1.5+ defers to apply when the
+  # value is unknown at plan time.
+  #
+  # Narrower than RFC 1035 on purpose: the regex accepts lowercase
+  # ASCII labels with `[a-z]{2,}` TLDs only, so it would reject an IDN
+  # A-label TLD (e.g. `.xn--p1ai`). NLB DNS names are lowercase ASCII
+  # by AWS spec, and the upstream `nhp_keypair` + `compute` producers
+  # have no IDN code paths — this is the deliberate tradeoff. Don't
+  # loosen without checking what edge case prompted it.
+  validation {
+    condition     = var.nhp_server_host == "" || can(regex("^[a-z0-9][a-z0-9.-]*[a-z0-9]\\.[a-z]{2,}$", var.nhp_server_host))
+    error_message = "nhp_server_host must be empty (gate off) or a bare DNS name — no scheme, path, port, or whitespace. Got an unparseable value; check `module.compute.nlb_dns_name`'s output shape."
+  }
+}
+
+variable "nhp_server_port" {
+  description = "NHP UDP listener port. Conventionally 62206 — matches the UDP TG / SG rules in `modules/compute` and the AC ConnectorClient in `modules/ac` (grep `62206`; #2027 tracks consolidating all three sites into a shared local). Consumed only when deploy_qurl_bootstrap_chain = true."
+  type        = string
+  default     = "62206"
+
+  # No leading zeros — `"062206"` would validate as 62206 but inject the
+  # literal `"062206"` into the env var, which a strict consumer parser
+  # would reject at task startup. Anchor with `^[1-9][0-9]*$` so the
+  # string representation matches what the consumer expects.
+  validation {
+    condition     = can(regex("^[1-9][0-9]*$", var.nhp_server_port)) && tonumber(var.nhp_server_port) <= 65535
+    error_message = "nhp_server_port must be a numeric string in [1, 65535] with no leading zeros (e.g., \"62206\")."
+  }
+}

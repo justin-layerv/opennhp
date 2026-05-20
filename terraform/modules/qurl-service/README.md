@@ -187,6 +187,57 @@ module "qurl_service" {
 | `redis_endpoint` | Redis endpoint (host:port) | `string` | `""` |
 | `redis_security_group_id` | Security group ID for Redis access | `string` | `null` |
 
+### QURL agent → nhp-server bootstrap chain (Wave 5, Optional)
+
+Injects four env vars on the qurl-service ECS task def so the agent can do its
+own NHP/UDP handshake against the public NLB. Same wiring shape as
+`NHP_SERVER_INTERNAL_URL` (TF-injected env vars, no runtime SSM fetch, no
+new IAM surface). Values flow from `module.nhp_keypair.registration_public_key`
+and `module.compute.nlb_dns_name` at the root.
+
+| Variable | Description | Type | Default |
+|----------|-------------|------|---------|
+| `deploy_qurl_bootstrap_chain` | Gate for injecting the four bootstrap-chain env vars on the task def | `bool` | `false` |
+| `enable_qurl_agent_bootstrap` | Post-burn-in activation flag — drives `QURL_AGENT_BOOTSTRAP_ENABLED` | `bool` | `false` |
+| `nhp_server_public_key_b64` | NHP server responder public key (base64; raw 32-byte X25519). Plan-time validation guards against producer shape drift | `string` | `""` |
+| `nhp_server_host` | NHP server NLB DNS name (intentionally DNS not IP — TTL semantics are the consumer's responsibility) | `string` | `""` |
+| `nhp_server_port` | NHP UDP listener port. Matches the UDP TG / SG rules in `modules/compute` and the AC ConnectorClient in `modules/ac` (grep `62206`; #2027 tracks consolidation) | `string` | `"62206"` |
+
+Post-burn-in activation is a focused follow-up PR that flips
+`enable_qurl_agent_bootstrap = true` — matches the dark-launch pattern
+across this tree (`deploy_frps`, `deploy_qurl_service`,
+`deploy_bootstrap_alb`).
+
+**Consumer-side contract (qurl-service code obligation):** when
+`deploy_qurl_bootstrap_chain = false`, all four env vars
+(`NHP_SERVER_PUBLIC_KEY_B64`, `NHP_SERVER_HOST`, `NHP_SERVER_PORT`,
+`QURL_AGENT_BOOTSTRAP_ENABLED`) are **omitted entirely** from the task
+def — not set to `""` or `"false"`. The consumer code MUST treat
+*missing* `QURL_AGENT_BOOTSTRAP_ENABLED` as equivalent to `"false"`
+(i.e., chain disabled). A consumer that requires the var to be present
+will fail-closed on every env that hasn't opted into the chain,
+defeating the dark-launch model. This is a one-time consumer-side
+implementation requirement, not an operator-side flip-time concern.
+
+**Flip protocol (operator-facing):**
+
+1. Confirm the qurl-service-side consumer code that reads
+   `QURL_AGENT_BOOTSTRAP_ENABLED` (and the three NHP_SERVER_* vars) is
+   already deployed to the target environment. The activation flip is
+   only meaningful once the consumer is present; flipping it before
+   the consumer ships leaves the chain inert (best case) or trips a
+   missing-config error path on task startup (worst case, depending on
+   how strict the consumer's parser is).
+2. Open a focused PR that flips `enable_qurl_agent_bootstrap = false → true`
+   in the target env's `terraform.tfvars`. Nothing else in the same PR.
+3. `terraform apply`. The flip changes one env var on the qurl-service
+   ECS task definition, which produces a **new task-def revision and a
+   rolling deploy** of the qurl-service service — expect ~minutes of
+   mixed-revision traffic during the restart. Same blast radius as the
+   initial chain-deploy (the apply that first sets
+   `deploy_qurl_bootstrap_chain = true` also cycles tasks, since it
+   adds four env vars to the task def).
+
 ## Outputs
 
 | Output | Description |
