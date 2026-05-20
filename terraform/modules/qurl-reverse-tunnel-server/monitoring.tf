@@ -227,13 +227,15 @@ resource "aws_cloudwatch_log_metric_filter" "frps_errors" {
   # this filter together (or revisit #1091 to switch to JSON).
   pattern = "\"[E]\""
 
+  # No `dimensions` block: AWS rejects `metric_transformation`
+  # dimensions when the filter pattern doesn't extract named tokens
+  # (quoted-substring `"[E]"` doesn't). The `log_error_rate` alarm
+  # below matches the same dimensionless shape. Same precedent as
+  # the `server_panic` filter in `modules/monitoring/main.tf`.
   metric_transformation {
     name      = "FRPSErrorCount"
     namespace = "LayerV/NHP"
     value     = "1"
-    dimensions = {
-      Component = "frps"
-    }
   }
 }
 
@@ -251,9 +253,8 @@ resource "aws_cloudwatch_metric_alarm" "log_error_rate" {
   alarm_description   = "FRP server error log rate exceeds 1/min. Check logs for auth plugin failures or client connection issues."
   treat_missing_data  = "notBreaching"
 
-  dimensions = {
-    Component = "frps"
-  }
+  # No `dimensions`: matches the dimensionless series the
+  # `frps_errors` filter publishes above (see comment there).
 
   alarm_actions = local.sns_actions
   ok_actions    = local.sns_actions

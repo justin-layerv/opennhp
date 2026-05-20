@@ -131,15 +131,19 @@ locals {
   # GroupInServiceInstances + GroupTotalInstances). Keep this in one
   # place so a future addition lands on both sides at once.
   #
-  # `GroupUnHealthyInstanceCount` is REQUIRED for the canary's
-  # `canary_asg_unhealthy` alarm (modules/canary-deployment/alarms.tf)
-  # AND the green-side `frps_green_asg_unhealthy` alarm
-  # (blue_green.tf). AWS optional ASG group metrics only publish when
-  # explicitly listed in `enabled_metrics`; without this entry the
-  # metric never lands in CloudWatch and `treat_missing_data =
-  # "notBreaching"` keeps the alarm silently green — exactly the
-  # failure mode the canary auto-rollback is meant to close on the
-  # NLB-disabled path. cr round 20 confirmed.
+  # Matches AC (`modules/ac/main.tf:1148`) and server
+  # (`modules/compute/main.tf:1049`) — same 7 entries.
+  #
+  # `GroupUnHealthyInstanceCount` is deliberately omitted: AWS
+  # rejects it from `EnableMetricsCollection` with ValidationError
+  # 400 (not a valid metric type). The four `*_asg_unhealthy`
+  # alarms (frps_green, canary, ac_green, server's green) all key
+  # on this non-existent metric and have sat silently
+  # INSUFFICIENT_DATA → notBreaching since creation — meant to
+  # close the canary auto-rollback's NLB-disabled-path coverage,
+  # which is currently unwired. Rewiring them to a real signal is
+  # a separate cross-module change (tracking: #2041). Don't re-add
+  # this name here.
   asg_enabled_metrics = [
     "GroupInServiceInstances",
     "GroupDesiredCapacity",
@@ -148,7 +152,6 @@ locals {
     "GroupPendingInstances",
     "GroupTerminatingInstances",
     "GroupTotalInstances",
-    "GroupUnHealthyInstanceCount",
   ]
 
   user_data = templatefile("${path.module}/user_data.sh.tpl", {
