@@ -718,3 +718,45 @@ variable "frp_vhost_http_port" {
   type        = number
   default     = 8080
 }
+
+variable "frp_control_upstream_host" {
+  # Template references in `description` are escaped (`$${…}`) so
+  # Terraform doesn't parse them as live interpolations at init time
+  # — same fix-shape as `var.connect_layerv_host` in the root
+  # `terraform/variables.tf`. Rendered description shows the literal
+  # `${…}` placeholders.
+  description = <<-EOT
+    Internal FRPS dial target for the AC Traefik TCP entrypoint on
+    `frp_control_port`. Set to the same lex-smallest-AZ Cloud Map host
+    the resource.toml overlay's `dest_host` uses (e.g.
+    `frps-a.nhp.{env}.internal`). The AC Traefik TCP router forwards
+    customer SYNs that passed the AC kernel ipset gate to
+    `$${frp_control_upstream_host}:$${frp_control_port}`.
+
+    The AC ingress side (NLB:$${frp_control_port} → AC kernel → ipset)
+    is the load-bearing fence; this upstream is the AC-userspace →
+    private-FRPS leg, gated only by the AC instance's egress posture
+    plus the FRPS SG (already AC-SG-only). v1 pins to a single AZ
+    (matching the overlay); multi-AZ HRW dispatch is #1976.
+
+    Empty string disables the TCP entrypoint — the legacy WSS-via-443
+    path (now unused) is the only remaining FRP path under that
+    posture. The root (terraform/main.tf) sets this when
+    `var.deploy_frps && var.deploy_qurl_service` and `connect.layerv.*`
+    is wired; greenfield envs default to empty.
+    EOT
+  type        = string
+  default     = ""
+
+  # Defense-in-depth shape fence — mirrors `var.connect_layerv_host`
+  # in `terraform/variables.tf`. Today's value is composed upstream
+  # from `module.data.namespace_name` + `var.frps_az_suffixes[0]`
+  # (already RFC 1035-fenced), so this validation only fires if a
+  # future caller wires the variable from a less-fenced source.
+  # Empty string permitted (disables the TCP entrypoint per the
+  # description above).
+  validation {
+    condition     = var.frp_control_upstream_host == "" || can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$", var.frp_control_upstream_host))
+    error_message = "frp_control_upstream_host must be a bare lowercase DNS name in per-label RFC 1035 form (each label 1-63 chars, alphanumeric with hyphens but not leading/trailing, multiple labels dot-separated; no scheme, port, slashes, whitespace, or userinfo), or empty to disable the FRPS-control TCP entrypoint. Today's values like `frps-a.nhp.sandbox.internal` conform."
+  }
+}

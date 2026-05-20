@@ -369,6 +369,21 @@ variable "ac_auth_service_id" {
   description = "Authentication service ID for the Access Controller"
   type        = string
   default     = "layerv"
+
+  # Hard fence on TOML quote-injection. `var.ac_auth_service_id` is
+  # interpolated into the FRPS resource.toml overlay as a `"..."`
+  # literal (`local.frps_resource_toml_overlay` in
+  # `terraform/resources.tf`); a value containing `"` or `\` would
+  # produce malformed TOML and the server log-and-skips the file at
+  # `config.go:350-351`. The previous round of this PR carried the
+  # regex as a soft `check` block; promoted here to a hard validation
+  # so apply refuses an unsafe value. Pattern matches the existing
+  # `aspId` convention (lowercase letters/digits/dashes, leading
+  # letter, ≤64 chars).
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{0,63}$", var.ac_auth_service_id))
+    error_message = "ac_auth_service_id is interpolated into the FRPS resource.toml overlay as a `\"...\"` literal; it must match `^[a-z][a-z0-9-]{0,63}$` (lowercase letters/digits/dashes, leading letter, ≤64 chars) to avoid TOML quote-injection. Default value `layerv` conforms."
+  }
 }
 
 variable "ac_resource_ids" {
@@ -752,6 +767,18 @@ variable "qurl_default_ac_id" {
   description = "Default AC identifier for new QURL resources"
   type        = string
   default     = ""
+
+  # Hard fence on TOML quote-injection. Same threat model as
+  # `var.ac_auth_service_id` above — interpolated into
+  # `local.frps_resource_toml_overlay`'s `ACId = "..."` literal.
+  # Empty-string is permitted by the regex (variable default; the
+  # `terraform_data.frps_preconditions` block in `terraform/main.tf`
+  # rejects empty when `deploy_frps = true`), so envs without FRPS
+  # pass through without setting this var.
+  validation {
+    condition     = var.qurl_default_ac_id == "" || can(regex("^[a-z][a-z0-9-]{0,63}$", var.qurl_default_ac_id))
+    error_message = "qurl_default_ac_id is interpolated into the FRPS resource.toml overlay as a `\"...\"` literal; it must match `^[a-z][a-z0-9-]{0,63}$` (lowercase letters/digits/dashes, leading letter, ≤64 chars), or empty for envs without FRPS. Today's prod values (`layerv-ac-tf`) conform."
+  }
 }
 
 variable "qurl_default_ac_port" {
@@ -1967,6 +1994,87 @@ variable "frps_bind_port" {
   description = "FRP server control port. Shared between qurl-reverse-tunnel-server module (bind port) and AC module (Traefik route target) so they can't drift."
   type        = number
   default     = 7000
+}
+
+variable "connect_layerv_host" {
+  # `$${var.…}` escapes prevent Terraform from parsing the doc-string
+  # template references as live interpolations — `description` is
+  # rendered through HCL's template engine even for descriptive prose,
+  # which `${var.frps_bind_port}` would otherwise hit as a context-
+  # less variable lookup at `terraform init`. The literal output is
+  # `${var.frps_bind_port}` in the rendered description.
+  description = <<-EOT
+    Customer-facing public DNS name that fronts the FRPS control
+    channel. Threaded into the FRPS resource.toml overlay's `Hostname`
+    field so the agent dials this name instead of the internal Cloud
+    Map host. Pre-2026-05-18 the agent dialed
+    `frps-{az}.nhp.{env}.internal:$${var.frps_bind_port}` directly — an
+    internal-only name no public client could resolve, and the
+    FRPS-specific knock had zero L3/L4 effect because the ipset entry
+    it rendered was keyed on an internal dst_ip no AC kernel packet
+    ever had. Post-redesign the agent dials this public name;
+    NLB:$${var.frps_bind_port} → AC kernel → ipset-gated → Traefik TCP
+    entrypoint → internal `frps-{az}:$${var.frps_bind_port}`. Set per
+    env in tfvars: `connect.layerv.xyz` (sandbox), `connect.layerv.ai`
+    (prod). Bare DNS name only (no scheme, port, slashes, whitespace,
+    or userinfo) — same shape contract as `var.domain_name`. Per-label
+    RFC 1035 validation lives in the per-variable `validation {}`
+    blocks below; the `check "frps_overlay_dest_host_shape"` block in
+    `terraform/resources.tf` carries the matching defense-in-depth
+    fence on the INTERNAL `dest_host` (sourced from upstream-fenced
+    inputs).
+    Empty value opts out of the FRPS-behind-AC topology — only valid
+    for envs without `deploy_frps = true`.
+    EOT
+  type        = string
+  default     = ""
+
+  # Per-label RFC 1035 form: each label starts with a lowercase
+  # letter/digit, may contain hyphens, ends with a letter/digit,
+  # ≤63 chars per label; multiple dot-separated labels. Tighter
+  # than the prior `^[a-z][a-z0-9.-]{0,253}$` which allowed
+  # trailing dots, `..`, and per-label `--` overflow. Quote-injection
+  # is the load-bearing concern (regex excludes `"` and `\`); the
+  # tightening here is defense-in-depth for downstream consumers
+  # (Route 53 A-record name, NLB listener routing) that already
+  # reject syntactically-broken FQDNs but with cryptic errors at
+  # apply time rather than plan time.
+  validation {
+    condition     = var.connect_layerv_host == "" || can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$", var.connect_layerv_host))
+    error_message = "connect_layerv_host must be a bare lowercase DNS name in per-label RFC 1035 form (each label 1-63 chars, alphanumeric with hyphens but not leading/trailing, multiple labels dot-separated; no scheme, port, slashes, whitespace, or userinfo), or empty to opt out of FRPS-behind-AC. Today's values `connect.layerv.{ai,xyz}` conform."
+  }
+
+  # Input-shape fence on today's TRANSITIONAL value of this variable.
+  # `connect_layerv_host` currently holds the customer-facing public
+  # DNS name fronting the AC NLB (because the AC is in the FRPS data
+  # plane today — see TRANSITIONAL banner on
+  # `aws_vpc_security_group_ingress_rule.ac_frps_control` in
+  # `modules/ac/main.tf`). The two checks below reject obvious
+  # mis-pointings of the variable to internal/FRPS-shaped names
+  # while it serves this role.
+  #
+  # Both checks are short-lived: when nhp #2019 ("AC out of the FRPS
+  # data path") lands and the customer-facing dial target moves off
+  # the AC, this variable + every count-gated piece of plumbing it
+  # drives is removal work — these validations go with it. Do NOT
+  # promote these to a structural invariant about where Hostname
+  # "must" point; the L3-only target may use a `frps.*` name, which
+  # is correct end-state and would fail the `frps-` prefix check
+  # below if kept past the migration.
+  # TODO(nhp #2019 — "AC out of the FRPS data path"): both
+  # validations below are TRANSITIONAL. When the AC exits the FRPS
+  # data plane and Hostname legitimately points at FRPS directly,
+  # the `.internal` and `frps-` shape fences become wrong for the
+  # end-state. Rip them out in the same PR that lands the L3-only
+  # target. See the in-comment doc fence above.
+  validation {
+    condition     = var.connect_layerv_host == "" || !endswith(var.connect_layerv_host, ".internal")
+    error_message = "connect_layerv_host must NOT end in `.internal` — the FRPS-behind-AC redesign (SLACK_QURL_ROLLOUT.md §6) intentionally splits the customer-facing dial target from the internal FRPS Cloud Map host. Use the public AC ingress name (e.g. `connect.layerv.{ai,xyz}`); the AC Traefik TCP entrypoint forwards to the internal `frps-{az}` host via `var.frp_control_upstream_host` separately."
+  }
+  validation {
+    condition     = var.connect_layerv_host == "" || !startswith(var.connect_layerv_host, "frps-")
+    error_message = "connect_layerv_host must NOT start with `frps-` — looks like an FRPS Cloud Map name. Use the customer-facing AC ingress name (e.g. `connect.layerv.{ai,xyz}`), distinct from the FRPS host the AC Traefik TCP entrypoint forwards to internally. See SLACK_QURL_ROLLOUT.md §6 (FRPS-behind-AC redesign)."
+  }
 }
 
 variable "frps_vhost_http_port" {

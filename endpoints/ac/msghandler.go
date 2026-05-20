@@ -22,6 +22,33 @@ const (
 	PASS_PRE_ACCESS_IP
 )
 
+// applyDefaultIpSubstitution rewrites empty / SentinelLocalIP destination
+// IPs in `dstAddrs` to the AC's `defaultIp` (= LOCAL_IP at boot).
+// Two production callers depend on this: QURL resources (sentinel
+// `0.0.0.0` = local to this AC) and the FRPS-behind-AC overlay
+// (Addr.Ip = "" in resource.toml; see SLACK_QURL_ROLLOUT.md §6).
+//
+// No-op when `defaultIp == ""`. Mutates `dstAddrs` in place.
+//
+// Concurrency: callers MUST ensure `dstAddrs` entries are not
+// mutated concurrently — the helper writes `addr.Ip` without
+// synchronization. Today's caller (HandleAccessControl) is
+// knock-local and single-goroutine; see the caller-site comment in
+// HandleAccessControl.
+func applyDefaultIpSubstitution(defaultIp string, dstAddrs []*common.NetAddress) {
+	if len(defaultIp) == 0 {
+		return
+	}
+	for _, addr := range dstAddrs {
+		if addr == nil {
+			continue
+		}
+		if len(addr.Ip) == 0 || addr.Ip == SentinelLocalIP {
+			addr.Ip = defaultIp
+		}
+	}
+}
+
 // HandleUdpACOperations processes a single NHP_AOP packet. Synchronous —
 // callers own goroutine and wg accounting. The production caller is the
 // NHP_AOP arm of recvMessageRoutine in udpac.go, which spawns this in a
@@ -184,16 +211,24 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 	}
 
 	// Use AC's default IP to override empty or sentinel destination IP.
-	// The sentinel value SentinelLocalIP ("0.0.0.0") means "local to this AC" -
-	// used by QURL resources where the destination is the AC itself (Traefik proxy).
-	// This avoids storing external hostnames/IPs that may change over time.
-	if len(a.config.DefaultIp) > 0 {
-		for _, addr := range dstAddrs {
-			if len(addr.Ip) == 0 || addr.Ip == SentinelLocalIP {
-				addr.Ip = a.config.DefaultIp
-			}
-		}
-	}
+	// Load-bearing for the FRPS-behind-AC redesign (nhp #1977 /
+	// SLACK_QURL_ROLLOUT.md §6, 2026-05-18): the resource.toml overlay
+	// renders `Addr.Ip = ""` so the ipset entry written downstream keys
+	// on (agent_ip, port, a.config.DefaultIp = ac_local_ip) — the
+	// triple a real customer SYN actually has at the AC kernel.
+	// Coverage: see `TestApplyDefaultIpSubstitution` for the unit-test
+	// fence on this substitution; the live regression test in
+	// `endpoints/server/config_test.go::TestFRPSResourceTOMLOverlay_…`
+	// asserts the producer side renders `Addr.Ip = ""`.
+	//
+	// Invariant: dstAddrs is goroutine-local to this call —
+	// HandleAccessControl receives a per-packet slice from
+	// recvMessageRoutine + json.Unmarshal in `udpac.go`, and nothing
+	// caches it across goroutines. The helper's concurrency contract
+	// (see its godoc) depends on this. A future refactor that adds
+	// upstream caching of `dstAddrs` must add synchronization before
+	// calling the helper.
+	applyDefaultIpSubstitution(a.config.DefaultIp, dstAddrs)
 
 	ipPassMode := a.IpPassMode()
 	switch ipPassMode {

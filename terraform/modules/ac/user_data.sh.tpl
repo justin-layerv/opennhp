@@ -26,7 +26,7 @@ apt_get_with_retry() { retry_with_backoff 10 2 60 apt-get "$@"; }
 
 apt_get_with_retry update -y
 # Note: awscli package deprecated in Ubuntu 24.04, using unzip + curl for AWS CLI v2
-apt_get_with_retry install -y jq curl docker.io gettext-base iptables ipset unzip
+apt_get_with_retry install -y jq curl docker.io gettext-base iptables ipset unzip netcat-openbsd
 # iptables-persistent is pre-seeded to skip interactive prompts during install
 echo iptables-persistent iptables-persistent/autosave_v4 boolean false | debconf-set-selections
 echo iptables-persistent iptables-persistent/autosave_v6 boolean false | debconf-set-selections
@@ -1024,6 +1024,42 @@ cat > /home/ubuntu/traefik/traefik.toml << TRAEFIKEOF
     # This affects ALL traffic including health checks
     [entryPoints.traefik.proxyProtocol]
       trustedIPs = ["${vpc_cidr}"]
+%{ if frp_control_upstream_host != "" ~}
+  # TRANSITIONAL — places the AC in the FRPS data plane as a userspace
+  # TCP forwarder. Target shape is AC-as-firewall-manager only, with
+  # FRPS-side ipset updated out-of-band; this entrypoint and the
+  # paired `frps-control.toml` router/service below are removal work
+  # then. Sibling resources: NLB listener, TG, ASG attachment, and SG
+  # ingress in `modules/ac/main.tf`. Tracking:
+  # https://github.com/layervai/nhp/issues/2019.
+  #
+  # FRPS-behind-AC entrypoint. Customer frpc lands here via the AC NLB
+  # (TCP listener at port ${frp_control_port}) after the AC kernel ipset
+  # gate has admitted its SYN per a verified NHP knock. The ipset gate
+  # is a coarse source-IP pre-filter; the primary identity-bound access
+  # control is the per-client X25519 key-authenticated knock + opaque
+  # knock-token validation at FRP-Login via nhp-server's
+  # `/token/validate` (qurl-reverse-tunnel-server #98). Traefik forwards
+  # the TCP stream to the private FRPS instance via the
+  # `frps-control` TCP router below. See SLACK_QURL_ROLLOUT.md §6.
+  #
+  # No proxyProtocol: the FRP control channel doesn't speak PP, and the
+  # NLB FRPS-control listener (modules/ac/main.tf::aws_lb_listener.frps_control)
+  # is configured WITHOUT proxy_protocol_v2 on the TG. Preserved client IP
+  # for the ipset fence is delivered by NLB default-mode (no PP) — instance
+  # sees `agent_ip → ac_local_ip:${frp_control_port}` natively.
+  #
+  # Bind IPv4-only. Go's net.Listen on `:${frp_control_port}` resolves to
+  # `[::]:${frp_control_port}` (dual-stack) and accepts v4-mapped and v6
+  # SYNs. The AC SG ingress and `defaultset` ipset are v4-only, so any v6
+  # connectivity reaching the AC (dual-stack subnet, future v6 NLB,
+  # link-local v6) would route around the ipset fence. `0.0.0.0` keeps
+  # the Traefik bind aligned with what the ipset gate actually filters.
+  # `nc -z 127.0.0.1 ${frp_control_port}` later in user_data still works:
+  # IPv4 loopback hits the v4 bind directly.
+  [entryPoints.frps-control]
+    address = "0.0.0.0:${frp_control_port}"
+%{ endif ~}
 
 %{ if centralized_cert_enabled ~}
 # Centralized certificate from Secrets Manager (no per-instance ACME)
@@ -1344,6 +1380,88 @@ FRPDYNAMICEOF
 echo "FRP tunnel server routes added (ingress /.well-known/layerv-frp or /~!frp -> ${frp_server_host}:${frp_control_port})"
 %{ endif ~}
 
+%{ if frp_control_upstream_host != "" ~}
+# ============================================================================
+# FRPS-behind-AC TCP entrypoint forwarder (SLACK_QURL_ROLLOUT.md §6)
+#
+# TRANSITIONAL — this block (entrypoint binding + dynamic-file router +
+# service) places the AC in the FRPS data plane as a userspace TCP
+# forwarder. Target shape is AC-as-firewall-manager only, with FRPS-side
+# ipset updated out-of-band; this whole section is removal work then.
+# Paired Terraform resources live in `modules/ac/main.tf` (NLB listener,
+# TG, ASG attachment, SG ingress on port ${frp_control_port}). Tracking:
+# https://github.com/layervai/nhp/issues/2019.
+# ============================================================================
+#
+# Customer frpc dials `connect.layerv.{ai,xyz}:${frp_control_port}` (public DNS
+# → AC NLB:${frp_control_port}). The NLB target group has TCP passthrough
+# without PROXY protocol, so the AC instance sees the connection at L4 as
+# `agent_ip → ac_local_ip:${frp_control_port}`. The AC kernel iptables
+# default-DROPs INPUT and admits this SYN only when the FRPS-specific NHP
+# knock has added `(agent_ip, ${frp_control_port}, ac_local_ip)` to the
+# `defaultset` ipset (see nhp/endpoints/ac/msghandler.go `HandleAccessControl`,
+# and the `Addr.Ip = ""` sentinel in the FRPS resource.toml overlay which
+# triggers the DefaultIp substitution). The ipset entry is a coarse
+# source-IP pre-filter; identity-bound access control comes from the
+# per-client X25519 key-authenticated knock + knock-token validation at
+# FRP-Login (qurl-reverse-tunnel-server #98).
+#
+# Once admitted, Traefik's TCP entrypoint on `:${frp_control_port}` accepts
+# the connection and forwards it via this TCP router to the private FRPS
+# instance at `${frp_control_upstream_host}:${frp_control_port}`. The
+# downstream leg is over the VPC private network; the FRPS SG only accepts
+# AC SG ingress, so no public actor can reach FRPS:${frp_control_port}
+# directly.
+#
+# Router rule `HostSNI(\`*\`)` is plain TCP (no TLS / SNI). FRP's control
+# channel uses yamux-over-TCP; TLS termination is a future concern handled
+# at the NHP layer's keypair-authenticated session boundary.
+#
+# Why a separate file (not appended to dynamic.toml): a future PR may
+# rework the dynamic.toml priority hierarchy on the legacy `frp-control`
+# HTTP router (lines 1308-1357). Splitting the TCP entrypoint out keeps
+# the FRPS-behind-AC config independent of that churn. Traefik's
+# `[providers.file] directory = "/home/ubuntu/traefik/"` watches the
+# whole directory, so a separate file is picked up automatically.
+# Heredoc delimiter is single-quoted (`'FRPSCTRLEOF'`) so bash leaves the
+# body literal — no variable/command substitution. Same pattern as the
+# overlay heredoc in `compute/user_data.sh.tpl`. Terraform's
+# `${frp_control_upstream_host}` / `${frp_control_port}` are resolved
+# by `templatefile()` BEFORE bash sees the file, so the quoted delimiter
+# doesn't suppress them; the quoting protects the backticks in
+# `HostSNI(`*`)` from bash command-substitution.
+cat > /home/ubuntu/traefik/frps-control.toml << 'FRPSCTRLEOF'
+# FRPS control channel TCP forwarder — Wave 5 FRPS-behind-AC topology.
+#
+# Two distinct hostnames are in play; do not conflate them:
+#   1. Customer-facing dial target (the value of `Hostname` in the
+#      nhp-server resource.toml overlay, e.g. `connect.layerv.{ai,xyz}`)
+#      — sourced from `var.connect_layerv_host` in the root tfvars and
+#      threaded into `local.frps_resource_toml_overlay`. Resolves
+#      publicly to this AC's NLB.
+#   2. Internal upstream this Traefik TCP service forwards to (e.g.
+#      `frps-{az}.nhp.{env}.internal`) — sourced from
+#      `var.frp_control_upstream_host` (= `local.frps_resource_regions[*].dest_host`
+#      in the root). VPC-private, FRPS SG only accepts AC SG.
+#
+# The whole point of the 2026-05-18 redesign was splitting these:
+# customer-facing dial target ≠ internal upstream. This file configures
+# only the AC-userspace → internal-FRPS leg (#2). The customer-facing
+# DNS (#1) lives in `terraform/main.tf::aws_route53_record.connect{_cross_account}`.
+
+[tcp.routers.frps-control]
+  rule = "HostSNI(`*`)"
+  service = "frps-control"
+  entryPoints = ["frps-control"]
+
+[tcp.services.frps-control.loadBalancer]
+  [[tcp.services.frps-control.loadBalancer.servers]]
+    address = "${frp_control_upstream_host}:${frp_control_port}"
+FRPSCTRLEOF
+chmod 644 /home/ubuntu/traefik/frps-control.toml
+echo "FRPS-behind-AC TCP forwarder added (entrypoint :${frp_control_port} -> ${frp_control_upstream_host}:${frp_control_port})"
+%{ endif ~}
+
 %{ if !centralized_cert_enabled ~}
 # Create ACME storage (only needed for per-instance ACME, not centralized certs)
 touch /home/ubuntu/traefik/acme.json
@@ -1570,10 +1688,139 @@ echo "No Traefik plugins configured, skipping S3 download"
 # Reload systemd and enable/start all services
 systemctl daemon-reload
 systemctl enable traefik nhp-acd nhp-cloudmap-register nhp-health-monitor
+
+# Fail-closed boot-ordering guard for the FRPS-behind-AC redesign.
+# `aws_vpc_security_group_ingress_rule.ac_frps_control` opens
+# 0.0.0.0/0 → tcp/${frp_control_port} on the AC SG, and the AC
+# kernel iptables default-DROP INPUT + `defaultset` ipset is the
+# real L3/L4 fence. The ipset setup above must be in place BEFORE
+# `systemctl start traefik` binds the listener — otherwise there's
+# a boot-window where an unauthenticated SYN can reach Traefik
+# directly. If a future refactor reorders the firewall setup below
+# Traefik's start, this guard fails the boot loudly instead of
+# silently leaking the listener.
+#
+# The check is fail-closed in all failure modes: a missing rule
+# trips the `grep -q` to non-zero (the intended fence), and a
+# missing iptables binary / lockfile contention / kernel module
+# load failure also produces non-zero (because pipefail propagates
+# the upstream iptables exit). `set -o pipefail` is scoped to a
+# subshell so it doesn't bleed into the rest of the user_data.
+#
+# The grep pattern anchors on the full ACCEPT-rule shape, not just
+# the `match-set defaultset` substring — the substring would also
+# match the LOG / SET / defaultset_v6 lines, so a regression that
+# stripped `-j ACCEPT` while leaving the LOG rule would slip past
+# a substring match. Matches the precision of the plan-time
+# render-check in `modules/ac/main.tf::terraform_data.ac_user_data_frps_control_traefik_render_check`.
+#
+# Two-part check: (1) the ACCEPT rule is present, AND (2) the INPUT
+# chain default policy is DROP. A regression that flipped INPUT's
+# policy from DROP back to ACCEPT would silently re-leak port 7000
+# even with the rule still in place; the policy check catches that.
+%{ if frp_control_upstream_host != "" ~}
+# Use `iptables -S` for both checks — its save-format output puts the
+# target after the match conditions (matching the regex below) and
+# is deterministic across kernel/iptables versions, unlike `-L` which
+# is column-formatted and target-first. The regex anchors on the
+# exact rule shape from the IPv4 iptables rules block above (line
+# `-A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT`).
+if ! (set -o pipefail; iptables -S INPUT | grep -qE "^-A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT$"); then
+  echo "FATAL: defaultset ACCEPT rule missing from INPUT chain (or iptables itself failed) — refusing to start Traefik on a host where the AC kernel L3/L4 gate is not in place. See SLACK_QURL_ROLLOUT.md §6." >&2
+  exit 1
+fi
+if ! (set -o pipefail; iptables -S INPUT | grep -q "^-P INPUT DROP"); then
+  echo "FATAL: INPUT chain default policy is not DROP — the AC kernel L3/L4 gate depends on default-DROP + explicit-ACCEPT-on-ipset-match. Refusing to start Traefik. See SLACK_QURL_ROLLOUT.md §6." >&2
+  exit 1
+fi
+%{ endif ~}
+
 systemctl start traefik
 systemctl start nhp-acd
 systemctl start nhp-cloudmap-register
 systemctl start nhp-health-monitor
+
+# Post-Traefik-start listener-bind verification for the FRPS-behind-AC
+# topology. Traefik's `/ping` returns 200 once the process is alive
+# but says nothing about whether the `entryPoints.frps-control`
+# listener actually bound on `:${frp_control_port}` — a malformed
+# `frps-control.toml`, a port collision, or a Traefik startup race
+# would silently leave the public TG healthy and customer SYNs
+# hanging at the listener layer. `nc -z 127.0.0.1 <port>` after
+# start checks the bind directly; failure surfaces in
+# `/var/log/user-data.log` rather than waiting for the post-deploy
+# smoke check in #2007.
+#
+# Load-bearing dependency: this `nc -z` to 127.0.0.1 traverses the
+# `-A INPUT -i lo -j ACCEPT` rule (rendered into the IPv4 iptables
+# rules block above) — which bypasses the `defaultset` ipset gate
+# for loopback traffic. If a future tightening narrows the lo
+# ACCEPT rule (e.g. to specific dst ports), this check needs the
+# matching exception or it will silently fail-closed in production.
+#
+# Budget: 60s with 1s `nc -w 1` per attempt. Heavily-loaded cold AMI
+# boots (Traefik plugin downloads, image pulls in parallel) can push
+# Traefik bind well past the 10-20s "happy path." 60s gives realistic
+# headroom while still failing fast vs. a forever-hung Traefik. If
+# the sandbox bring-up shows P99 bind times approaching this limit,
+# raise the loop count and revisit Traefik startup-cost reduction.
+#
+# SCOPE: this is a BIND-TIME fence only, NOT a runtime liveness check.
+# A Traefik that binds successfully here and then segfaults / wedges
+# later (kernel listener up, accept loop wedged, RSTs back to clients)
+# is invisible to this loop — `/ping:8080` would still return 200 from
+# whatever Traefik state holds the HTTP server thread, and the TG HC
+# stays green. Runtime liveness for the frps-control listener is the
+# job of #2007's post-deploy smoke (TCP+FRP handshake from a knocked-
+# in agent); don't conflate the two.
+%{ if frp_control_upstream_host != "" ~}
+# Precheck: `nc` is installed at the top of user_data via apt
+# (netcat-openbsd); fail loudly here rather than letting the loop
+# below FATAL with the misleading "Traefik didn't bind" message
+# if the install failed.
+if ! command -v nc >/dev/null 2>&1; then
+  echo "FATAL: nc binary not found — netcat-openbsd install failed earlier in user_data. The post-Traefik listener-bind verification cannot run." >&2
+  exit 1
+fi
+echo "Waiting for Traefik listener on tcp/${frp_control_port}..."
+TRAEFIK_LISTENER_OK=0
+for _ in $(seq 1 60); do
+  if nc -z -w 1 127.0.0.1 ${frp_control_port} 2>/dev/null; then
+    TRAEFIK_LISTENER_OK=1
+    break
+  fi
+  sleep 1
+done
+if [ "$TRAEFIK_LISTENER_OK" != "1" ]; then
+  echo "FATAL: Traefik did not bind tcp/${frp_control_port} within ~60s — the frps-control entrypoint failed to bind. Check journalctl -u traefik for parse errors in /home/ubuntu/traefik/frps-control.toml. See #2007 for the broader observability story." >&2
+  # Pull this instance out of service. `exit 1` alone marks user_data
+  # as failed in cloud-init but does NOT auto-terminate the instance:
+  # Traefik's systemd unit is already started, its `/ping:8080`
+  # endpoint still returns 200, and the ASG would keep this instance
+  # in service indefinitely with a half-broken Traefik (every other
+  # entrypoint up, frps-control silently dropping SYNs). Stopping the
+  # Traefik unit fails the `/ping:8080` TG healthcheck across BOTH
+  # the existing TG and the new `aws_lb_target_group.ac_frps_control`,
+  # so the NLB sheds load on every entrypoint, the ASG's
+  # `ELB`-source HC marks the instance unhealthy, and a replacement
+  # instance launches. Trade-off: this also takes the AC out of
+  # service for QURL routing (which Traefik was serving fine) — but
+  # a half-broken Traefik with no frps-control listener is the worse
+  # of the two states for the FRPS-behind-AC topology and the ASG
+  # replacement covers QURL via the next healthy instance. A future
+  # enhancement could shell out to `aws autoscaling set-instance-health
+  # --health-status Unhealthy` here if granular failure reporting is
+  # needed; the canonical pattern lives at
+  # `terraform/modules/compute/user_data.sh.tpl:601` (the nhp-server's
+  # equivalent fail-fast path) and requires the instance to carry the
+  # matching IAM perms (the AC role would need
+  # `autoscaling:SetInstanceHealth` added at
+  # `terraform/modules/ac/main.tf` IAM block — out of scope for this fix).
+  systemctl stop traefik || true
+  exit 1
+fi
+echo "Traefik listener on tcp/${frp_control_port} is up."
+%{ endif ~}
 
 # ============================================================================
 # Custom Domain Certificate Sync (on boot)

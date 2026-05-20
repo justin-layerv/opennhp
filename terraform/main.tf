@@ -464,6 +464,16 @@ module "compute" {
   server_plugins  = var.server_plugins
   auth_service_id = var.ac_auth_service_id
 
+  # FRPS bootstrap overlay appended to /opt/layerv/nhp-server/etc/resource.toml
+  # at boot. See `local.frps_resource_toml_overlay` doc in resources.tf for the
+  # divergence from the DDB seed rows and the #1976 retirement plan.
+  frps_resource_toml_overlay = local.frps_resource_toml_overlay
+  # Sentinel prefix and end-marker — threaded so the user_data heredoc's
+  # grep and sed patterns reference the same literals as the rendered
+  # overlay. Decouples the patterns from a future sentinel rename.
+  frps_overlay_sentinel_prefix = local.frps_overlay_sentinel_prefix
+  frps_overlay_end_sentinel    = local.frps_overlay_end_sentinel
+
   # QURL plugin configuration
   qurl_config                   = var.qurl_config
   qurl_service_token_secret_arn = var.qurl_service_token_secret_arn
@@ -1079,6 +1089,30 @@ module "ac" {
   frp_control_port    = var.frps_bind_port
   frp_vhost_http_port = var.frps_vhost_http_port
 
+  # FRPS-behind-AC (SLACK_QURL_ROLLOUT.md §6, 2026-05-18). The AC's
+  # Traefik TCP entrypoint at `:${frps_bind_port}` forwards admitted
+  # SYNs (post-NHP-knock ipset gate) to this internal FRPS host. Source
+  # the host from the same `local.frps_resource_regions[*].dest_host`
+  # the DDB seed row + resource.toml overlay's `dest_host` field use,
+  # so all three converge on one truth (lex-smallest AZ for v1; the
+  # overlay carries this same single-AZ pin). Empty string when FRPS
+  # isn't deployed — disables the AC NLB:7000 listener, the new TG, and
+  # the Traefik TCP entrypoint via the `count = ... ? 1 : 0` and
+  # `%{ if frp_control_upstream_host != "" ~}` gates downstream.
+  #
+  # Predicate mirrors `local.frps_resource_regions[*].enabled` so the
+  # upstream-host, the DDB seed row, and the TOML overlay all converge
+  # on the same enable condition. The `&& var.deploy_qurl_service`
+  # conjunct is redundant in practice — `terraform_data.frps_preconditions`
+  # enforces `deploy_frps ⇒ deploy_qurl_service` at plan time — but
+  # keeping it inline keeps the predicate self-describing for readers
+  # who haven't followed the precondition chain.
+  frp_control_upstream_host = (
+    var.deploy_frps && var.deploy_qurl_service
+    ? local.frps_resource_regions[var.aws_region].dest_host
+    : ""
+  )
+
   # Order the AC launch-template render after the internal-ALB stack is
   # reachable. The module's qurl_router_config.api_url points at
   # internal-api.qurl.layerv.{xyz,ai} when qurl_internal_service_domain is
@@ -1136,6 +1170,75 @@ resource "aws_route53_record" "ac_wildcard" {
 
   zone_id = local.main_zone_id
   name    = "*.${var.domain_name}"
+  type    = "A"
+
+  alias {
+    name                   = module.ac[0].nlb_dns_name
+    zone_id                = module.ac[0].nlb_zone_id
+    evaluate_target_health = true
+  }
+}
+
+# FRPS-behind-AC public DNS (SLACK_QURL_ROLLOUT.md §6, 2026-05-18).
+# Customer frpc dials `var.connect_layerv_host` (e.g. `connect.layerv.xyz` /
+# `connect.layerv.ai`) on `var.frps_bind_port`; that DNS resolves to the AC
+# NLB. Per-env zone:
+#   - sandbox: `layerv.xyz` in-account; uses the same `local.main_zone_id`
+#     as `ac_domain` above. `var.cross_account_route53_role_arn` is null
+#     in sandbox, so the count condition collapses to the in-account
+#     branch (below).
+#   - prod: `layerv.ai` in `layerv-mgmt`; same cross-account pattern as
+#     `ac_domain`. `var.cross_account_route53_role_arn` non-null +
+#     `local.main_zone_id` resolved from mgmt → the cross-account branch
+#     (this resource) fires.
+#
+# Two count-gated resources because Terraform doesn't let a single
+# `aws_route53_record` swap providers conditionally — the `provider =`
+# attribute is module-graph-static. Same shape pattern as `ac_domain` +
+# `ac_wildcard` (cross-account) vs the in-account records the AC module
+# creates internally when `skip_dns_records = false`.
+# `evaluate_target_health = true` on both records below trades "TCP
+# connect timeout against an unhealthy AC NLB" for "DNS NXDOMAIN
+# against `connect.layerv.{ai,xyz}` when the AC NLB has no healthy
+# targets across ANY of its TGs." Route 53 considers an NLB alias
+# healthy if any TG on the NLB has at least one healthy target —
+# so a FRPS-specific TG break (e.g. `ac_frps_control` unhealthy
+# while `ac_tcp` HTTPS:443 stays healthy) will NOT cause NXDOMAIN.
+# The FRPS-only-broken case is caught by the boot guard
+# (`user_data.sh.tpl`'s `nc -z 127.0.0.1:7000` post-Traefik bind
+# check, which exits user_data non-zero) and by the post-deploy
+# smoke check in #2007 — not by DNS-level failover.
+#
+# The trade is deliberate and consistent with the existing
+# `ac_domain` / `ac_wildcard` pattern: a fully-degraded AC fleet
+# should fail-closed at DNS so customer frpc backs off instead of
+# burning retries against a black-hole NLB.
+resource "aws_route53_record" "connect_cross_account" {
+  # `var.deploy_ac` is AND-ed in even though the `frps_preconditions`
+  # block enforces `deploy_frps ⇒ deploy_ac` — the alias below
+  # indexes `module.ac[0]`, so a future PR that loosens the precondition
+  # would otherwise produce a silent `module.ac[0]` out-of-bounds.
+  # Defense in depth on the local count gate.
+  count    = var.deploy_ac && var.deploy_frps && var.connect_layerv_host != "" && var.cross_account_route53_role_arn != null && local.main_zone_id != null ? 1 : 0
+  provider = aws.route53_mgmt
+
+  zone_id = local.main_zone_id
+  name    = var.connect_layerv_host
+  type    = "A"
+
+  alias {
+    name                   = module.ac[0].nlb_dns_name
+    zone_id                = module.ac[0].nlb_zone_id
+    evaluate_target_health = true
+  }
+}
+
+resource "aws_route53_record" "connect" {
+  # Same `var.deploy_ac` defense as the cross-account branch above.
+  count = var.deploy_ac && var.deploy_frps && var.connect_layerv_host != "" && var.cross_account_route53_role_arn == null && local.main_zone_id != null ? 1 : 0
+
+  zone_id = local.main_zone_id
+  name    = var.connect_layerv_host
   type    = "A"
 
   alias {
@@ -1215,6 +1318,54 @@ resource "terraform_data" "frps_preconditions" {
       # Same null-vs-empty concern as the token above.
       condition     = var.qurl_service_domain != null && var.qurl_service_domain != ""
       error_message = "deploy_frps requires qurl_service_domain to be set to a non-empty value — the FRP auth plugin needs a URL to validate tunnel tokens against."
+    }
+    precondition {
+      # FRPS-behind-AC requires the customer-facing public DNS name for
+      # the AC ingress. Without it, the resource.toml overlay renders
+      # `Hostname = ""` and the agent has no dial target. Set per env:
+      # `connect.layerv.xyz` (sandbox), `connect.layerv.ai` (prod). The
+      # NLB:${var.frps_bind_port} listener + Route 53 record + AC Traefik
+      # TCP entrypoint that this name fronts are all created from this
+      # same variable downstream — a missing value at plan time is the
+      # earliest signal that the topology won't function.
+      condition     = var.connect_layerv_host != ""
+      error_message = "deploy_frps requires connect_layerv_host to be set to a non-empty value — the FRPS resource.toml overlay needs a customer-facing public DNS name for the AC ingress (e.g. `connect.layerv.xyz` for sandbox, `connect.layerv.ai` for prod). See SLACK_QURL_ROLLOUT.md §6 (FRPS-behind-AC redesign 2026-05-18)."
+    }
+    precondition {
+      # Hard-fence on the two overlay-interpolated AC IDs. Quote-injection
+      # / shape regex is enforced by the per-variable `validation {}`
+      # blocks in `terraform/variables.tf` (apply refuses on bad shape).
+      # This precondition is the empty-string failover: an empty value
+      # would pass the regex (which permits "") and silently render a
+      # malformed overlay (`ACId = ""` → every knock returns
+      # `ErrACConnectionNotFound`; `aspId = ""` → no FindAuthSvcProvider
+      # match). Today's prod envs always set both in tfvars; this fence
+      # catches a future greenfield env that forgets one.
+      condition     = var.ac_auth_service_id != "" && var.qurl_default_ac_id != ""
+      error_message = "deploy_frps requires both ac_auth_service_id and qurl_default_ac_id to be non-empty — the FRPS resource.toml overlay would otherwise render with `aspId = \"\"` (no FindAuthSvcProvider match) or `ACId = \"\"` (every knock returns ErrACConnectionNotFound). Today's prod envs always set both in tfvars; this fence catches a future greenfield env that forgets one."
+    }
+    precondition {
+      # Hard fence on the `connect.layerv.*` Route 53 record actually
+      # landing. The two `aws_route53_record.connect{,_cross_account}`
+      # resources split on `cross_account_route53_role_arn != null` vs
+      # `== null` (mutually exclusive count gates) AND require
+      # `local.main_zone_id != null`. If `cross_account_route53_role_arn`
+      # is set but the cross-account zone data lookup hasn't populated
+      # `main_zone_id` yet (e.g. nhp #2002's cross-account provider
+      # alias hasn't landed, or `hosted_zone_id`/`hosted_zone` is
+      # missing), BOTH branches collapse to count=0 and `terraform apply`
+      # succeeds with zero `connect.layerv.{ai,xyz}` A records. The
+      # failure surfaces at customer dial time: DNS lookup fails, frpc
+      # hangs, no log line in the AC fleet because no SYN ever arrives.
+      # Catch it at plan instead.
+      #
+      # Condition reads "either we'd opt out (no connect host set) OR
+      # we have a resolvable zone for the record." `local.main_zone_id`
+      # ternary is identical to the count gate on the two record
+      # resources, so this precondition fires under the same conditions
+      # the records would silently no-op under.
+      condition     = var.connect_layerv_host == "" || local.main_zone_id != null
+      error_message = "deploy_frps with connect_layerv_host=${var.connect_layerv_host} requires local.main_zone_id to resolve (via var.hosted_zone_id or the var.hosted_zone data lookup); both aws_route53_record.connect and aws_route53_record.connect_cross_account would otherwise collapse to count=0 and apply would ship without a public DNS record for the FRPS-behind-AC ingress. Set `hosted_zone_id` directly (cross-account path) or `hosted_zone` (in-account lookup) in tfvars."
     }
     precondition {
       # Reject the bootstrap placeholder at plan time when `deploy_frps` is

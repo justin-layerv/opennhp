@@ -272,6 +272,31 @@ qurl_geoip_s3_kms_key_arn = "arn:aws:kms:us-east-2:235500187906:key/1a8cbf38-72e
 qurl_default_ac_id   = "layerv-ac-tf"
 qurl_default_ac_port = 443
 
+# FRPS-behind-AC customer-facing DNS — INTENTIONALLY EMPTY in prod.
+#
+# Prod opts out of the FRPS-behind-AC topology in this PR. The variable
+# + module wiring is in place, but `connect_layerv_host = ""` short-
+# circuits every count-gated piece of plumbing
+# (`aws_route53_record.connect{,_cross_account}` in `terraform/main.tf`,
+# AC NLB target group / listener / ASG attachment in
+# `terraform/modules/ac/main.tf`, the `entryPoints.frps-control`
+# + `frps-control.toml` blocks in `terraform/modules/ac/user_data.sh.tpl`)
+# to `count = 0`, making prod a true no-op for this PR.
+#
+# Flip-to-prod sequencing (separate follow-up PR; matches the
+# `bootstrap-alb` rollout pattern of sandbox #1975 → prod #2001):
+#   1. Sandbox burn-in is green (post-apply `nc -zv connect.layerv.xyz
+#      7000` regression fence passes pre- and post-knock).
+#   2. qurl-reverse-tunnel-server #98 is merged AND deployed to
+#      sandbox FRPS with `LAYERV_REQUIRE_KNOCK=true`.
+#   3. nhp #2002 (cross-account Route53 provider alias) lands so
+#      `aws_route53_record.connect_cross_account` can write to the
+#      `layerv-mgmt` zone — same scope as `bootstrap.layerv.ai`
+#      per `SLACK_QURL_ROLLOUT.md` §5b.
+#
+# Until all three land, prod stays empty.
+connect_layerv_host = ""
+
 # QURL plugin configuration (NHP Server)
 # Enables qurl.link → qurl.site authentication flow in NHP Server
 # api_url points at the internal-ALB hostname (workload-account PHZ

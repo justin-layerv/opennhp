@@ -167,16 +167,23 @@ func TestHandleUdpACOperations_FirstSeenProceedsToUnmarshal(t *testing.T) {
 	}
 }
 
-// TestHandleAccessControl_SentinelIP tests that the sentinel IP (SentinelLocalIP)
-// is replaced with the AC's DefaultIp. This is used by QURL resources
-// where the destination is the AC itself (Traefik proxy).
+// TestApplyDefaultIpSubstitution fences the load-bearing IP-substitution
+// invariant on the AC ipset-write path. Two production callers depend
+// on this behavior:
+//   - QURL resources where the destination is the AC itself (Traefik
+//     proxy) — sentinel `0.0.0.0` means "local to this AC."
+//   - FRPS-behind-AC overlay (nhp #1977 / SLACK_QURL_ROLLOUT.md §6,
+//     2026-05-18) — the resource.toml overlay renders `Addr.Ip = ""`
+//     so the ipset entry keys on (agent_ip, port, ac_local_ip), the
+//     triple a real customer SYN actually has at the AC kernel. If
+//     this substitution stops working, the FRPS-specific knock
+//     produces an inert ipset entry no packet ever matches.
 //
-// NOTE: This test duplicates the sentinel replacement logic from HandleAccessControl
-// rather than calling the method directly. This is intentional because calling
-// HandleAccessControl requires a fully initialized AC with iptables/ipset, which
-// isn't practical for unit tests. The logic being tested is simple (string comparison
-// and assignment), so duplication risk is low.
-func TestHandleAccessControl_SentinelIP(t *testing.T) {
+// The previous form of these tests duplicated the substitution loop
+// inline (a tautology — both production and test computed the same
+// pattern). Now they call `applyDefaultIpSubstitution` directly so a
+// regression in the production helper actually trips this test.
+func TestApplyDefaultIpSubstitution(t *testing.T) {
 	tests := []struct {
 		name        string
 		defaultIp   string
@@ -192,11 +199,11 @@ func TestHandleAccessControl_SentinelIP(t *testing.T) {
 			description: "SentinelLocalIP should be replaced with DefaultIp",
 		},
 		{
-			name:        "empty_ip_replaced",
+			name:        "empty_ip_replaced_frps_behind_ac",
 			defaultIp:   "10.0.1.50",
 			dstIp:       "",
 			expectedIp:  "10.0.1.50",
-			description: "empty IP should be replaced with DefaultIp",
+			description: "empty IP should be replaced with DefaultIp (FRPS-behind-AC overlay path)",
 		},
 		{
 			name:        "real_ip_preserved",
@@ -210,38 +217,25 @@ func TestHandleAccessControl_SentinelIP(t *testing.T) {
 			defaultIp:   "",
 			dstIp:       SentinelLocalIP,
 			expectedIp:  SentinelLocalIP,
-			description: "sentinel unchanged when DefaultIp not configured",
+			description: "sentinel unchanged when DefaultIp not configured (AC hasn't booted yet)",
+		},
+		{
+			name:        "no_default_ip_empty_unchanged",
+			defaultIp:   "",
+			dstIp:       "",
+			expectedIp:  "",
+			description: "empty IP unchanged when DefaultIp not configured",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create AC with test config
-			ac := &UdpAC{
-				config: &Config{
-					ACId:      "test-ac",
-					DefaultIp: tt.defaultIp,
-				},
-			}
-
-			// Create destination address
 			dstAddrs := []*common.NetAddress{
-				{
-					Ip:   tt.dstIp,
-					Port: 443,
-				},
+				{Ip: tt.dstIp, Port: 443},
 			}
 
-			// Apply the sentinel replacement logic (mirrors HandleAccessControl)
-			if len(ac.config.DefaultIp) > 0 {
-				for _, addr := range dstAddrs {
-					if len(addr.Ip) == 0 || addr.Ip == SentinelLocalIP {
-						addr.Ip = ac.config.DefaultIp
-					}
-				}
-			}
+			applyDefaultIpSubstitution(tt.defaultIp, dstAddrs)
 
-			// Verify result
 			if dstAddrs[0].Ip != tt.expectedIp {
 				t.Errorf("%s: got IP %q, want %q", tt.description, dstAddrs[0].Ip, tt.expectedIp)
 			}
@@ -249,37 +243,52 @@ func TestHandleAccessControl_SentinelIP(t *testing.T) {
 	}
 }
 
-// TestHandleAccessControl_SentinelIP_MultipleAddresses tests sentinel replacement
-// with multiple destination addresses.
-func TestHandleAccessControl_SentinelIP_MultipleAddresses(t *testing.T) {
-	ac := &UdpAC{
-		config: &Config{
-			ACId:      "test-ac",
-			DefaultIp: "10.0.1.50",
-		},
-	}
-
+// TestApplyDefaultIpSubstitution_MultipleAddresses fences the
+// per-address branch decision: real IPs preserved, empty + sentinel
+// both substituted, mixed correctly across a single slice.
+func TestApplyDefaultIpSubstitution_MultipleAddresses(t *testing.T) {
 	dstAddrs := []*common.NetAddress{
 		{Ip: SentinelLocalIP, Port: 443}, // sentinel - should be replaced
 		{Ip: "192.168.1.100", Port: 22},  // real IP - should be preserved
-		{Ip: "", Port: 8080},             // empty - should be replaced
+		{Ip: "", Port: 8080},             // empty - should be replaced (FRPS overlay)
 	}
 
-	// Apply the sentinel replacement logic (mirrors HandleAccessControl)
-	if len(ac.config.DefaultIp) > 0 {
-		for _, addr := range dstAddrs {
-			if len(addr.Ip) == 0 || addr.Ip == SentinelLocalIP {
-				addr.Ip = ac.config.DefaultIp
-			}
-		}
-	}
+	applyDefaultIpSubstitution("10.0.1.50", dstAddrs)
 
-	// Verify results
 	expected := []string{"10.0.1.50", "192.168.1.100", "10.0.1.50"}
 	for i, addr := range dstAddrs {
 		if addr.Ip != expected[i] {
 			t.Errorf("address[%d]: got IP %q, want %q", i, addr.Ip, expected[i])
 		}
+	}
+}
+
+// TestApplyDefaultIpSubstitution_NilEntries fences the defensive
+// nil-skip in the helper. Production callers never pass nil entries,
+// but a future refactor that builds dstAddrs from sparse inputs would
+// otherwise nil-deref. Asserts both halves of the contract: nil
+// entries stay nil (no in-place compaction), and non-nil entries
+// receive the substitution.
+func TestApplyDefaultIpSubstitution_NilEntries(t *testing.T) {
+	dstAddrs := []*common.NetAddress{
+		nil,
+		{Ip: "", Port: 8080},
+		nil,
+	}
+
+	applyDefaultIpSubstitution("10.0.1.50", dstAddrs)
+
+	if dstAddrs[0] != nil {
+		t.Errorf("dstAddrs[0]: nil entry became %+v — slice must not be compacted in place", dstAddrs[0])
+	}
+	if dstAddrs[1].Ip != "10.0.1.50" {
+		t.Errorf("dstAddrs[1]: non-nil entry not substituted: got %q want %q", dstAddrs[1].Ip, "10.0.1.50")
+	}
+	if dstAddrs[2] != nil {
+		t.Errorf("dstAddrs[2]: nil entry became %+v — slice must not be compacted in place", dstAddrs[2])
+	}
+	if len(dstAddrs) != 3 {
+		t.Errorf("slice length changed: got %d want 3 — slice must not be resized", len(dstAddrs))
 	}
 }
 

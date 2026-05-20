@@ -692,6 +692,13 @@ locals {
     # Plugin configuration (plugins are baked into Docker image)
     server_plugins  = var.server_plugins
     auth_service_id = var.auth_service_id
+    # FRPS bootstrap overlay rows appended to resource.toml at boot.
+    # Empty string when FRPS is not deployed (the heredoc emits nothing).
+    frps_resource_toml_overlay = var.frps_resource_toml_overlay
+    # Sentinel literals shared between the overlay body and the
+    # grep/sed self-heal patterns. See user_data.sh.tpl for usage.
+    frps_overlay_sentinel_prefix = var.frps_overlay_sentinel_prefix
+    frps_overlay_end_sentinel    = var.frps_overlay_end_sentinel
     # Storage backend configuration (Phase 4)
     storage_backend               = var.storage_backend
     dynamodb_region               = coalesce(var.dynamodb_region, data.aws_region.current.id)

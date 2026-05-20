@@ -222,6 +222,13 @@ qurl_geoip_s3_kms_key_arn = "arn:aws:kms:us-east-2:767397897469:key/c5250da7-1d0
 qurl_default_ac_id   = "layerv-ac-tf"
 qurl_default_ac_port = 443
 
+# FRPS-behind-AC customer-facing DNS (SLACK_QURL_ROLLOUT.md §6, 2026-05-18).
+# Public DNS name that the FRPS resource.toml overlay renders as the
+# agent's dial target. A-record alias to the AC NLB created in
+# `terraform/main.tf::aws_route53_record.connect`. Sandbox uses the
+# in-account `layerv.xyz` zone (no cross-account provider alias).
+connect_layerv_host = "connect.layerv.xyz"
+
 # Domain configuration for QURL links and sites
 qurl_cookie_domain       = ".qurl.site.layerv.xyz"
 qurl_link_domain         = "qurl.link.layerv.xyz"
@@ -347,6 +354,37 @@ deploy_cost_analytics = true
 # cross-repo gating list (qurl-service, traefik-plugins, frpc, etc.) lives
 # in the PR description for #1544 — it's release-time coordination, not
 # an invariant worth duplicating here.
+#
+# ===== Apply-gate (FRPS-behind-AC, nhp #1977 / SLACK_QURL_ROLLOUT.md §6) =====
+#
+# `connect_layerv_host = "connect.layerv.xyz"` above wires the FRPS-
+# behind-AC topology on sandbox (AC NLB:7000 + Traefik TCP forwarder +
+# AC kernel ipset gate). Do NOT `terraform apply` this env while
+# `connect_layerv_host` is set to a non-empty value until the
+# following are all true:
+#
+#   1. qurl-reverse-tunnel-server #98 (knock-token validation at
+#      FRP-Login via nhp-server `/token/validate`) is MERGED.
+#   2. qurl-reverse-tunnel-server #98 is DEPLOYED to sandbox FRPS
+#      with `LAYERV_REQUIRE_KNOCK=true` flipped on. Without #98 +
+#      require-knock the system runs with the ipset source-IP pre-
+#      filter as the only fence — the inverse of the security posture
+#      (the per-client X25519 key-authenticated knock + knock-token
+#      validation chain is the PRIMARY access control; ipset is
+#      coarse and exists because the AC is in the data plane FOR NOW,
+#      per nhp #2019).
+#
+# Post-apply live regression fence: from outside the VPC,
+# `nc -zv connect.layerv.xyz 7000` MUST hang/timeout pre-knock and
+# succeed within ~1s post-knock. CloudWatch: AC INPUT-chain DROP
+# counter for dport=7000 spikes pre-knock, drops to zero post-knock.
+#
+# To OPT OUT of the FRPS-behind-AC topology for sandbox (e.g. revert
+# during incident triage), set `connect_layerv_host = ""` above. All
+# `count`-gated new resources (Route 53 records, AC NLB:7000 listener
+# + TG + ASG attachment + SG ingress, Traefik entrypoint + dynamic
+# router) collapse to zero in lockstep — sandbox returns to the
+# pre-PR topology with no manual cleanup needed.
 deploy_frps = true
 # Pinned at the env level (matches the module default in
 # `terraform/variables.tf`) so a future default change can't silently

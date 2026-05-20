@@ -176,6 +176,17 @@ locals {
   resolved_deletion_spike_threshold = coalesce(var.secret_reconciliation_deletion_spike_threshold, local.is_prod ? 10 : 60)
   eip_pool_tag                      = "${var.name_prefix}-ac"
 
+  # FRPS control channel TG name. Computed once so the resource
+  # `name` attribute and the length precondition cannot drift.
+  # Matches the sibling `ac_tcp` TG pattern (fixed `name`, not
+  # `name_prefix`) — the AWS provider's `name_prefix` is limited to
+  # 6 chars (the 26-char appended suffix takes the rest of the
+  # 32-char name budget), which is too short to carry a descriptive
+  # identifier. The trade-off is that a future regional rename of
+  # `var.name_prefix` will hit `DuplicateTargetGroup` and need a
+  # two-apply migration; see the lifecycle comment on the resource
+  # for details.
+  ac_frps_control_tg_name = replace("${var.name_prefix}-ac-frps-ctl", "_", "-")
 }
 
 # Route 53 hosted zone lookup for DNS-01 challenge
@@ -295,6 +306,82 @@ resource "aws_vpc_security_group_ingress_rule" "ac_nhp_knock" {
 
   tags = {
     Name = "${var.name_prefix}-ac-nhp-knock"
+  }
+}
+
+# =============================================================================
+# TRANSITIONAL — places AC in FRPS data plane as a userspace TCP forwarder.
+#
+# The AC instance is NOT the long-term home for FRPS data-plane traffic. This
+# resource (and its siblings: `aws_lb_target_group.ac_frps_control`,
+# `aws_lb_listener.frps_control`, `aws_autoscaling_attachment.ac_frps_control`,
+# the `entryPoints.frps-control` + `frps-control.toml` blocks in
+# `user_data.sh.tpl`) exists only to satisfy the hard constraint that the
+# FRP/reverse-tunnel server must not be internet-accessible except through
+# AC pinholing — until the AC pushes ipset deltas to FRPS out-of-band and
+# FRPS has its own controlled public ingress.
+#
+# Target shape: AC stays a control-plane firewall manager (key-authenticated
+# knock → opaque token → FRPS `/token/validate` is the primary identity-bound
+# access control); FRPS has its own ingress; this listener + Traefik
+# forwarder block is removal work then.
+#
+# Tracking: https://github.com/layervai/nhp/issues/2019 ("AC out of the FRPS
+# data path"). Cross-reference this block when reading any of the four
+# sibling resources or the two `user_data.sh.tpl` blocks above.
+# =============================================================================
+#
+# FRPS control channel TCP - INTENTIONALLY PUBLIC (AC kernel ipset is the real gate)
+# Customer frpc dials this port at `connect.layerv.{ai,xyz}:${frp_control_port}`
+# (NLB:7000 below). AC kernel default-drops INPUT; a verified FRPS-specific NHP
+# knock adds `(agent_ip, ${frp_control_port}, ac_local_ip)` to the `defaultset`
+# ipset, and the existing `-A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT`
+# rule permits the SYN. Once admitted, Traefik's TCP entrypoint on `${frp_control_port}`
+# forwards to the private FRPS instance — see `user_data.sh.tpl`. The SG opening
+# matches the same posture as `ac_https` / `ac_portal` / `ac_nhp_knock`: the L3/L4
+# fence lives in the application layer, not in the SG.
+#
+# Gated on the same `var.frp_control_upstream_host != ""` switch as the
+# NLB listener + TG + Traefik entrypoint. Greenfield envs that opt out
+# of FRPS-behind-AC get NO public 7000/tcp opening on the AC SG — the
+# rule's existence and the listener that depends on it stay in lockstep,
+# and compliance scanners (Trivy / Prowler / CIS) won't flag a public
+# port-7000 ingress on every non-FRPS env.
+#
+# Boot-time ordering invariant (depended on by this SG opening): in
+# `user_data.sh.tpl`, the iptables default-DROP INPUT + ipset
+# `defaultset` setup runs at the `# NHP Firewall Setup` marker
+# BEFORE the `systemctl start traefik` invocation. Traefik's `/ping`
+# doesn't return 200 until Traefik is up, so the NLB TG healthcheck
+# cannot race ahead of the ipset gate — by the time the instance is
+# TG-healthy, the kernel gate is in place. The fail-closed shell
+# guard right before `systemctl start traefik` enforces this at
+# runtime; a future user_data reorder that puts iptables setup
+# BELOW Traefik's start will trip the guard and exit non-zero
+# instead of silently leaking the listener.
+resource "aws_vpc_security_group_ingress_rule" "ac_frps_control" {
+  count = var.frp_control_upstream_host != "" ? 1 : 0
+
+  security_group_id = aws_security_group.ac.id
+  description       = "FRPS control channel (NHP-gated at AC kernel ipset)"
+  from_port         = var.frp_control_port
+  to_port           = var.frp_control_port
+  ip_protocol       = "tcp"
+  # IPv4-only by design. The AC NLB has IPv4 listeners only today
+  # (the existing `ac_https` / `ac_nhp_knock` rules likewise open
+  # IPv4 only), and the customer frpc binary connects over IPv4.
+  # If a future PR adds IPv6 NLB listeners, mirror this rule with
+  # `cidr_ipv6 = "::/0"` AND verify the `defaultset_v6` ipset rule
+  # carries the same `match-set defaultset_v6 src,dst,dst -j ACCEPT`
+  # treatment for port 7000.
+  cidr_ipv4 = "0.0.0.0/0"
+
+  # Matches sibling SG ingress rules in this module which set only
+  # `Name`. If `var.tags` propagation becomes a module-wide
+  # requirement, switch all sibling rules in lockstep rather than
+  # diverging this one.
+  tags = {
+    Name = "${var.name_prefix}-ac-frps-control"
   }
 }
 
@@ -837,10 +924,70 @@ locals {
     enable_egress_eips = var.enable_egress_eips
     eip_pool_tag       = local.eip_pool_tag
     # FRP tunnel server integration
-    frp_server_host     = var.frp_server_host
-    frp_control_port    = var.frp_control_port
-    frp_vhost_http_port = var.frp_vhost_http_port
+    frp_server_host           = var.frp_server_host
+    frp_control_port          = var.frp_control_port
+    frp_vhost_http_port       = var.frp_vhost_http_port
+    frp_control_upstream_host = var.frp_control_upstream_host
   })
+}
+
+# Plan-time render lint for the FRPS-behind-AC Traefik bits. The TG
+# healthcheck for `ac_frps_control` probes Traefik's `/ping` on :8080,
+# which confirms the Traefik PROCESS is alive but says nothing about
+# whether the `entryPoints.frps-control` listener on the customer-
+# facing port actually bound or whether `frps-control.toml` parsed
+# and installed the TCP router. A templatefile-render regression
+# (template-condition typo, accidental deletion of one of the two
+# `%{ if frp_control_upstream_host != "" ~}` blocks in
+# `user_data.sh.tpl`) would let CI + apply pass while customer SYNs
+# silently hang at the Traefik listener layer.
+#
+# Hard fence (precondition on a terraform_data resource, gated on FRPS
+# being enabled): apply refuses if either rendered literal is missing.
+# Rationale for hard-vs-soft: a Traefik schema rewrite that renames
+# `[entryPoints.…]` IS a deliberate change the operator will update
+# the asserts for; a typo or accidental deletion of a templatefile-if
+# block is silent and produces a fleet-wide knock-but-no-listener
+# regression that takes hours to diagnose. The cost of a stale
+# literal at schema-rewrite time is one PR; the cost of the typo
+# silently shipping is much higher.
+resource "terraform_data" "ac_user_data_frps_control_traefik_render_check" {
+  count = var.frp_control_upstream_host != "" ? 1 : 0
+
+  # Re-evaluate when the rendered user_data changes so the precondition
+  # re-runs on every render. `sha256` (vs `md5`) avoids Trivy/CIS
+  # flagging md5 use even in non-cryptographic contexts; the choice is
+  # incidental — any change-detecting hash works.
+  input = sha256(local.user_data)
+
+  lifecycle {
+    precondition {
+      # All three literals MUST appear in the rendered user_data when
+      # FRPS is enabled:
+      #   - `[entryPoints.frps-control]`: Traefik static config binding
+      #     the listener on `:${frp_control_port}`.
+      #   - `[tcp.routers.frps-control]`: dynamic-file router that
+      #     forwards admitted TCP streams to the internal FRPS instance.
+      #   - The full iptables-rule line for `defaultset` (NOT just the
+      #     substring `match-set defaultset`, which also appears in
+      #     comment headers — the substring would silently pass even
+      #     after a regression that deleted the rule line but left
+      #     the documentation block). The runtime boot guard at the
+      #     end of user_data still catches the deletion via
+      #     `iptables -L INPUT -n | grep`, but this plan-time fence
+      #     anchors on the rule line to avoid the comment-only false
+      #     positive.
+      # Any one missing means the templatefile-condition guard on the
+      # three `frp_control_upstream_host != ""` blocks has regressed.
+      # The TG `/ping` healthcheck wouldn't catch any of them.
+      condition = (
+        strcontains(local.user_data, "[entryPoints.frps-control]") &&
+        strcontains(local.user_data, "[tcp.routers.frps-control]") &&
+        strcontains(local.user_data, "-A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT")
+      )
+      error_message = "AC user_data render is missing one of `[entryPoints.frps-control]`, `[tcp.routers.frps-control]`, or the `-A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT` iptables rule despite frp_control_upstream_host being set. A templatefile-condition regression in `user_data.sh.tpl` would silently produce this. The TG `/ping` healthcheck wouldn't catch any of them — see lifecycle comment on aws_lb_target_group.ac_frps_control."
+    }
+  }
 }
 
 # Launch Template
@@ -1118,6 +1265,147 @@ resource "aws_lb_listener" "https" {
     # for the full explanation of the drift mode.
     ignore_changes = [default_action]
   }
+}
+
+# ==================== FRPS Control Channel NLB Listener ====================
+#
+# TRANSITIONAL — see banner on `aws_vpc_security_group_ingress_rule.ac_frps_control`
+# above and https://github.com/layervai/nhp/issues/2019 ("AC out of the FRPS
+# data path"). This NLB listener + its sibling TG + ASG attachment + the
+# Traefik `entryPoints.frps-control` / `frps-control.toml` blocks in
+# `user_data.sh.tpl` collectively place the AC in the FRPS data plane as a
+# userspace TCP forwarder. Target shape is AC-as-firewall-manager only, with
+# FRPS-side ipset updated out-of-band; this whole block is removal work then.
+#
+# Public TCP listener for the FRPS control channel at
+# `connect.layerv.{ai,xyz}:${frp_control_port}`. This is the customer-facing
+# ingress that the FRPS resource.toml overlay's `Hostname` field resolves to;
+# the AC kernel's existing ipset fence (default-DROP INPUT, permit via
+# `-A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT`) gates each
+# SYN per NHP knock — a coarse source-IP pre-filter while the AC is in the
+# data path. The primary, fine-grained access-control mechanism is the
+# per-client X25519 key-authenticated knock + opaque-token validation at
+# FRP-Login via nhp-server's `/token/validate` (qurl-reverse-tunnel-server
+# #98). See SLACK_QURL_ROLLOUT.md §6 (FRPS-behind-AC redesign 2026-05-18)
+# for the full design and packet flow.
+#
+# Pre-redesign: no public 7000 listener; FRPS:7000 was reachable only from
+# the AC SG via the legacy `/.well-known/layerv-frp` Traefik route on port
+# 443. The FRPS-specific NHP knock added ipset entries keyed on the internal
+# FRPS dst_ip — a triple no AC kernel packet ever matched. Result: token
+# issuance worked, L3/L4 gate did not. This listener is the missing piece.
+#
+# Why TCP and not TLS:
+#   - The FRP control channel uses its own framing (yamux-over-TCP); TLS
+#     termination at the NLB would require terminating FRP's protocol too.
+#   - Confidentiality/integrity for the tunnel payload are owned by NHP's
+#     keypair-authenticated session plus the AC's ipset gate on each SYN.
+#     The control channel ride on top of that boundary.
+#   - Mirrors the `ac_tcp` HTTPS listener's TCP passthrough posture (TLS
+#     terminates at Traefik on the AC instance).
+#
+# Why a separate TG and not reuse `ac_tcp`:
+#   - `ac_tcp` healthchecks on Traefik's port 8080 `/ping` — appropriate
+#     for the HTTPS entrypoint. The FRPS control entrypoint uses the same
+#     Traefik process and the same `/ping` is fine; the new TG exists
+#     because the listener-to-TG binding is 1:1 and the listener targets
+#     a different port.
+#   - Proxy Protocol v2 is intentionally OFF here (the FRP control channel
+#     doesn't speak PP, and the Traefik TCP entrypoint would need
+#     `proxyProtocol` awareness to accept it). Preserving client IP for
+#     the ipset fence is handled by the NLB's default mode (no PP), which
+#     forwards client IP at L4 — AC instance sees `agent_ip → ac_local_ip:port`.
+#
+# Conditional on FRPS deployment: when `var.frp_control_upstream_host` is
+# empty (greenfield env, no FRPS), the listener + TG aren't created. The
+# SG ingress rule (above) is gated on the same predicate, so non-FRPS
+# envs have NO public 7000/tcp opening on the AC SG (avoids compliance-
+# scanner noise on every non-FRPS env).
+resource "aws_lb_target_group" "ac_frps_control" {
+  count = var.frp_control_upstream_host != "" ? 1 : 0
+
+  name        = local.ac_frps_control_tg_name
+  port        = var.frp_control_port
+  protocol    = "TCP"
+  vpc_id      = var.vpc_id
+  target_type = "instance"
+
+  # Healthcheck caveat: Traefik `/ping` on 8080 confirms the Traefik
+  # process is alive but does NOT verify the `entryPoints.frps-control`
+  # listener on `:${var.frp_control_port}` actually bound or that
+  # `frps-control.toml` parsed and installed the TCP router. A drift
+  # mode scoped to the new entrypoint (typo in template render,
+  # quote-escape regression, partial templatefile output) keeps `/ping`
+  # returning 200 while customer SYNs to `:7000` hang at the Traefik
+  # listener layer. A real port-7000 TCP probe is not viable from the
+  # NLB: the AC kernel ipset gate blocks all unknocked SYNs to that
+  # port, including NLB health-check probes, so a TCP HC would have
+  # to be ipset-allowlisted — which would defeat the gate's own posture.
+  # The acceptable mitigation is a post-deploy smoke check that runs on
+  # every deploy and asserts a knocked-in agent can complete TCP+FRP
+  # handshake. Tracked in #2007 (FRPS-behind-AC observability +
+  # post-deploy verification gates).
+  health_check {
+    enabled             = true
+    protocol            = "HTTP"
+    port                = "8080"
+    path                = "/ping"
+    matcher             = "200"
+    interval            = 30
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+
+  deregistration_delay = 30
+
+  tags = var.tags
+
+  # NOTE on TG-name renames: fixed `name` attribute (consistent with
+  # sibling `ac_tcp` TG). The AWS provider's `name_prefix` is limited
+  # to 6 chars, which is too short for a descriptive identifier — see
+  # the `ac_frps_control_tg_name` local for that constraint. AWS
+  # forbids two TGs sharing a `name`, so a future change to
+  # `var.name_prefix` will hit `DuplicateTargetGroup` at apply time.
+  # `create_before_destroy = true` would NOT help here: CBD requires
+  # the replacement to fit in the namespace, and the namespace
+  # collision on `name` is exactly the constraint. Fix path at rename
+  # time is a two-apply migration: taint the TG → detach attachments
+  # manually → re-apply.
+  lifecycle {
+    # AWS hard-limits TG names at 32 chars. Today's sandbox/prod
+    # values are well under (`nhp-{env}-ac-frps-ctl` ≈ 22-27 chars),
+    # but a future regional `name_prefix` (e.g.
+    # `nhp-prod-us-west-2`) would silently exceed and surface as a
+    # cryptic AWS error at apply time. Fail at plan instead.
+    precondition {
+      condition     = length(local.ac_frps_control_tg_name) <= 32
+      error_message = "aws_lb_target_group.ac_frps_control.name (`${local.ac_frps_control_tg_name}`, length=${length(local.ac_frps_control_tg_name)}) exceeds the 32-char AWS limit. Shorten var.name_prefix (current value: `${var.name_prefix}`) or accept the truncation in a follow-up rename."
+    }
+  }
+}
+
+# TRANSITIONAL — see banner on the NLB listener above and nhp #2019.
+# Removal of the AC from the FRPS data plane unwinds this attachment.
+resource "aws_autoscaling_attachment" "ac_frps_control" {
+  count = var.frp_control_upstream_host != "" ? 1 : 0
+
+  autoscaling_group_name = aws_autoscaling_group.ac.name
+  lb_target_group_arn    = aws_lb_target_group.ac_frps_control[0].arn
+}
+
+resource "aws_lb_listener" "frps_control" {
+  count = var.frp_control_upstream_host != "" ? 1 : 0
+
+  load_balancer_arn = aws_lb.ac.arn
+  port              = var.frp_control_port
+  protocol          = "TCP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.ac_frps_control[0].arn
+  }
+
+  tags = var.tags
 }
 
 # Route 53 record for AC (points to NLB when CloudFront is disabled)
