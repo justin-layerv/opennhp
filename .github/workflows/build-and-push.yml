@@ -887,35 +887,28 @@ jobs:
           docker push "$ECR_REGISTRY/${{ matrix.repo }}:latest"
           echo "::notice::Image pushed: $ECR_REGISTRY/${{ matrix.repo }}:$IMAGE_TAG"
 
-      # Update SSM parameter with the new image tag
-      # This enables instance refresh to use the new image without terraform apply
-      - name: Update SSM Image Tag
-        if: needs.changes.outputs.app == 'true' && github.event_name != 'pull_request'
-        env:
-          IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
-          ENVIRONMENT: ${{ needs.setup.outputs.environment }}
-        run: |
-          # Map matrix.image to SSM parameter path component
-          if [[ "${{ matrix.image }}" == "server" ]]; then
-            SSM_COMPONENT="server"
-          elif [[ "${{ matrix.image }}" == "ac" ]]; then
-            SSM_COMPONENT="ac"
-          else
-            echo "::warning::Unknown image type ${{ matrix.image }}, skipping SSM update"
-            exit 0
-          fi
-
-          SSM_PARAM="/${ENVIRONMENT}/nhp/${SSM_COMPONENT}/image-tag"
-          echo "Updating SSM parameter: $SSM_PARAM with tag: $IMAGE_TAG"
-
-          aws ssm put-parameter \
-            --name "$SSM_PARAM" \
-            --value "$IMAGE_TAG" \
-            --type String \
-            --overwrite || {
-              echo "::warning::Failed to update SSM parameter $SSM_PARAM - this is expected on first run (parameter created by Terraform)"
-            }
-          echo "::notice::SSM parameter updated: $SSM_PARAM = $IMAGE_TAG"
+      # The builder used to also write /${env}/nhp/<component>/image-tag here.
+      # That write was wrong on two independent axes:
+      #
+      #   1. CROSS-RUN RACE. The two matrix entries (server, ac) write
+      #      different slots, but a *concurrent* run's builder writing
+      #      its slots while *this* run's dispatcher reads them produced
+      #      a torn read — run 26130926188's ac-matrix updated the ac
+      #      slot at 23:18:25 between run 26130904414's dispatcher SSM
+      #      read at 23:18:21 and the server-matrix update at 23:18:55,
+      #      so the dispatcher saw server=old, ac=new and bailed
+      #      (see run 26130904414, 2026-05-19).
+      #
+      #   2. LOGICALLY WRONG WHEN active=blue. It wrote the blue slot
+      #      regardless of which colour was active, so a build during
+      #      active=blue could overwrite the active tag with a SHA that
+      #      had not yet been deployed via blue/green — a blue ASG
+      #      scaling up at that moment would pull the new image from
+      #      ECR and run code that had not been validated.
+      #
+      # The deployer (blue-green-deploy.yml's "Update Standby Image Tag")
+      # is the sole writer of the {blue,green}-image-tag slots now; the
+      # builder's job ends at "image pushed to ECR".
 
   # ============================================================================
   # TERRAFORM VALIDATE (PR only - fast feedback)

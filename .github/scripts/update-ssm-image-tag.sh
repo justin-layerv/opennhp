@@ -5,7 +5,10 @@
 # Usage: update-ssm-image-tag.sh <environment> <component> <image-tag> [--refresh]
 #
 # Arguments:
-#   environment:  Target environment (sandbox, prod)
+#   environment:  Target environment — prod only. Sandbox writes are
+#                 routed through blue-green-deploy.yml (which writes the
+#                 standby slot via active-color indirection). See
+#                 scripts/check-image-tag-writer-allowlist.sh for why.
 #   component:    NHP component (server, ac)
 #   image-tag:    Docker image tag to deploy (typically commit SHA)
 #   --refresh:    Optional flag to trigger ASG instance refresh after SSM update
@@ -15,14 +18,14 @@
 #
 # Examples:
 #   # Update SSM parameter only (new instances will use this tag)
-#   ./update-ssm-image-tag.sh sandbox server abc1234
+#   ./update-ssm-image-tag.sh prod server abc1234
 #
 #   # Update SSM and trigger instance refresh
-#   ./update-ssm-image-tag.sh sandbox server abc1234 --refresh
+#   ./update-ssm-image-tag.sh prod server abc1234 --refresh
 #
 # Exit codes:
 #   0 - Success
-#   1 - Failed to update SSM parameter
+#   1 - Failed to update SSM parameter / invalid args
 #   2 - Failed to trigger instance refresh
 #   3 - Instance refresh failed or cancelled
 
@@ -31,7 +34,7 @@ set -euo pipefail
 # Parse arguments
 if [[ $# -lt 3 ]]; then
   echo "Usage: $0 <environment> <component> <image-tag> [--refresh]"
-  echo "  environment: sandbox, prod"
+  echo "  environment: prod   (sandbox writes go through blue-green-deploy.yml)"
   echo "  component:   server, ac"
   echo "  image-tag:   Docker image tag (e.g., commit SHA)"
   echo "  --refresh:   Optional flag to trigger ASG instance refresh"
@@ -45,9 +48,23 @@ DO_REFRESH="${4:-}"
 
 AWS_REGION="${AWS_REGION:-us-east-2}"
 
-# Validate environment
-if [[ "$ENVIRONMENT" != "sandbox" && "$ENVIRONMENT" != "prod" ]]; then
-  echo "ERROR: Invalid environment '$ENVIRONMENT'. Must be 'sandbox' or 'prod'."
+# Validate environment.
+#
+# This helper is the prod-canary slot writer (only caller is
+# promote-to-prod.yml). Sandbox uses blue/green via
+# blue-green-deploy.yml — which writes the STANDBY slot via
+# active-color indirection. Letting this helper write
+# /sandbox/nhp/<component>/image-tag would re-introduce a second
+# uncoordinated writer of that slot, which is the exact class of
+# bug PR #2026 closed (see scripts/check-image-tag-writer-allowlist.sh
+# for the full background; #2028 tracks widening the detector to
+# also cover boto3-shaped writers). Reject sandbox at the boundary.
+if [[ "$ENVIRONMENT" == "sandbox" ]]; then
+  echo "ERROR: update-ssm-image-tag.sh is prod-only. Use blue-green-deploy.yml for sandbox image-tag updates (it writes the standby slot via active-color indirection)." >&2
+  exit 1
+fi
+if [[ "$ENVIRONMENT" != "prod" ]]; then
+  echo "ERROR: Invalid environment '$ENVIRONMENT'. Must be 'prod'."
   exit 1
 fi
 

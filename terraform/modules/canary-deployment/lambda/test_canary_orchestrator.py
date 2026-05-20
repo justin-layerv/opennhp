@@ -1190,6 +1190,22 @@ class TestHelpers(CanaryTestCase):
             Overwrite=True,
         )
 
+    def test_set_ssm_value_refuses_image_tag_slot(self):
+        # Belt-and-braces guard for #2028: this helper must never write
+        # the deployer-owned image-tag slots. The bash lint
+        # (scripts/check-image-tag-writer-allowlist.py) is bash-only
+        # today; this raises at runtime so even a boto3 regression
+        # fails loud before the put is dispatched.
+        for slot in (
+            '/sandbox/nhp/server/image-tag',
+            '/sandbox/nhp/server/green-image-tag',
+            '/sandbox/nhp/ac/image-tag',
+            '/prod/nhp/ac/green-image-tag',
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'deployer-owned slot'):
+                canary_orchestrator.set_ssm_value(slot, 'abc')
+        self.mock_ssm.put_parameter.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

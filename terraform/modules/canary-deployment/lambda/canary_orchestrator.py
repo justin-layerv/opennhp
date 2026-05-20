@@ -19,6 +19,7 @@ Actions:
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -848,8 +849,29 @@ def get_ssm_value(param_name):
         raise
 
 
+_IMAGE_TAG_SLOT_RE = re.compile(r"/nhp/[^/]+/(green-)?image-tag$")
+
+
 def set_ssm_value(param_name, value):
-    """Set a value in SSM Parameter Store."""
+    """Set a value in SSM Parameter Store.
+
+    Must NOT be used to write `/<env>/nhp/<component>/(green-)?image-tag`
+    slots — those are owned by the deployer workflows
+    (blue-green-deploy.yml for sandbox, canary-deploy.yml +
+    update-ssm-image-tag.sh for prod) per the writer-allowlist in
+    scripts/check-image-tag-writer-allowlist.{sh,py}. boto3 is not
+    yet covered by that lint (tracked in #2028), so the runtime guard
+    below carries the contract until the detector is widened.
+    """
+    if _IMAGE_TAG_SLOT_RE.search(param_name):
+        raise RuntimeError(
+            f"set_ssm_value refusing to write deployer-owned slot "
+            f"{param_name!r}. See scripts/check-image-tag-writer-allowlist.sh "
+            "and issue #2028 for context — these slots are owned by "
+            "blue-green-deploy.yml (sandbox) and canary-deploy.yml / "
+            "update-ssm-image-tag.sh (prod). Route the write through "
+            "the appropriate deployer."
+        )
     ssm.put_parameter(
         Name=param_name,
         Value=value,

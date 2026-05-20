@@ -11,6 +11,7 @@ on:
     # on the same paths; the two checks are orthogonal.
     paths:
       - ".github/workflows/**"
+      - ".github/scripts/**"
       - ".github/ISSUE_TEMPLATE/**"
       - "CLAUDE.md"
       - "scripts/check-scope-drift.sh"
@@ -21,6 +22,8 @@ on:
       - "scripts/check-lockdown-body-drift.sh"
       - "scripts/check-paths-filter-coverage.py"
       - "scripts/print-dispatch-ref-error.sh"
+      - "scripts/check-image-tag-writer-allowlist.sh"
+      - "scripts/check-image-tag-writer-allowlist.py"
       - "terraform/modules/qurl-service/main.tf"
       - "terraform/modules/custom-domain-cert/lambda/**"
       - "tests/scripts/**"
@@ -37,6 +40,7 @@ on:
     branches: [ "main" ]
     paths:
       - ".github/workflows/**"
+      - ".github/scripts/**"
       - ".github/ISSUE_TEMPLATE/**"
       - "CLAUDE.md"
       - "scripts/check-scope-drift.sh"
@@ -47,6 +51,8 @@ on:
       - "scripts/check-lockdown-body-drift.sh"
       - "scripts/check-paths-filter-coverage.py"
       - "scripts/print-dispatch-ref-error.sh"
+      - "scripts/check-image-tag-writer-allowlist.sh"
+      - "scripts/check-image-tag-writer-allowlist.py"
       - "terraform/modules/qurl-service/main.tf"
       - "terraform/modules/custom-domain-cert/lambda/**"
       - "tests/scripts/**"
@@ -146,6 +152,14 @@ jobs:
       # if-expressions, so this is the regression guard.
       - name: Test promote-to-prod gating (issue #1322)
         run: python3 tests/scripts/test_promote_to_prod_gating.py
+
+      # Fence against re-introducing per-build writes to the blue/green
+      # image-tag SSM slots — see scripts/check-image-tag-writer-allowlist.sh
+      # for the contract. The test's final case scans the real repo,
+      # so this one invocation both unit-tests the detector and
+      # enforces the allowlist on the actual tree.
+      - name: Test + enforce image-tag writer allowlist
+        run: bash tests/scripts/check-image-tag-writer-allowlist_test.sh
 
       # Structural fence for the dependabot-go-tidy bot-identity preflight
       # (PR #1777). PR #1384 used `gh api /user`, which 403s on App
