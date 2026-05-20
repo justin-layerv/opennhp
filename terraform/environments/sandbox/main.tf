@@ -124,15 +124,31 @@ module "nhp" {
   instance_discovery_ttl_seconds = var.instance_discovery_ttl_seconds
   enable_qurl_site_authz         = var.enable_qurl_site_authz
 
-  # qurl-reverse-tunnel-server. PR 3 wires only the NEW
-  # variables introduced by this PR (per-AZ sizing, blue/green, canary,
-  # MULTIVALUE flip). Existing tfvars values for `deploy_frps`,
-  # `frps_image_tag`, `frps_az_suffixes`, and the legacy
-  # `frps_min_size`/`max_size`/`desired_capacity` triple were already
-  # latent no-ops in env tfvars (the existing env main.tf never
-  # forwarded them) and are left unwired here so PR 3 doesn't
-  # change deploy state. PR 4 can re-thread the legacy passthrough
-  # alongside the value flip.
+  # qurl-reverse-tunnel-server (FRPS-behind-AC). The legacy FRPS
+  # passthroughs below (`deploy_frps`, `connect_layerv_host`,
+  # `frps_image_tag`, `frps_bind_port`, `frps_vhost_http_port`,
+  # `frps_az_suffixes`, and the `frps_min_size`/`max_size`/`desired_capacity`
+  # triple) were previously set in env tfvars (or could be) but NOT
+  # declared at the env root, which surfaced as "Value for undeclared
+  # variable" warnings at plan time and made the values silently no-op
+  # at apply — leaving #1977's FRPS-behind-AC topology unapplied.
+  # Threading them here closes that gap (deferral comment from #1745's
+  # `qurl-frps 2/AZ` work explicitly handed this off as "PR 4").
+  # `frps_bind_port` and `frps_vhost_http_port` aren't set in current
+  # tfvars but are wired through so any future env-level override
+  # doesn't fall into the same trap.
+  deploy_frps           = var.deploy_frps
+  connect_layerv_host   = var.connect_layerv_host
+  frps_image_tag        = var.frps_image_tag
+  frps_bind_port        = var.frps_bind_port
+  frps_vhost_http_port  = var.frps_vhost_http_port
+  frps_az_suffixes      = var.frps_az_suffixes
+  frps_min_size         = var.frps_min_size
+  frps_max_size         = var.frps_max_size
+  frps_desired_capacity = var.frps_desired_capacity
+
+  # qurl-reverse-tunnel-server per-AZ Cloud Map fanout (#1745):
+  # blue/green, canary, and MULTIVALUE-flip variables.
   qurl_reverse_tunnel_server_min_size_per_az               = var.qurl_reverse_tunnel_server_min_size_per_az
   qurl_reverse_tunnel_server_max_size_per_az               = var.qurl_reverse_tunnel_server_max_size_per_az
   qurl_reverse_tunnel_server_desired_capacity_per_az       = var.qurl_reverse_tunnel_server_desired_capacity_per_az

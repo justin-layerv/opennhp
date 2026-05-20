@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
 # check-frps-az-suffixes-validation-drift.sh
 # ----------------------------------------------------------------------------
-# Fail if the `frps_az_suffixes` validation blocks in the root variable
-# (`terraform/variables.tf`) drift from the module variable
-# (`terraform/modules/qurl-reverse-tunnel-server/variables.tf`).
+# Fail if the `frps_az_suffixes` validation blocks drift between the three
+# declarations of the variable:
+#   - `terraform/variables.tf`                                        (root)
+#   - `terraform/modules/qurl-reverse-tunnel-server/variables.tf`     (module)
+#   - `terraform/environments/sandbox/variables.tf`                   (env-root, added by PR #2035)
 #
-# Why this exists: the same variable is declared twice — once at the
-# module so module-direct consumers (smoke fixtures, isolated tests)
-# get plan-time validation, and once at the root so a typo fails plan
-# even when `deploy_frps = false` keeps the module out of the graph.
-# The two `validation { condition = ... ; error_message = ... }` blocks
-# are intentionally duplicated and explicitly documented as "keep in
+# Why this exists: the same variable is declared in all three places —
+# once at the module so module-direct consumers (smoke fixtures, isolated
+# tests) get plan-time validation, once at the root so a typo fails plan
+# even when `deploy_frps = false` keeps the module out of the graph, and
+# once at the sandbox env root so a tfvars typo attributes to the env
+# root rather than bubbling up to the parent module. All three
+# `validation { condition = ... ; error_message = ... }` blocks are
+# intentionally duplicated and explicitly documented as "keep in
 # lockstep" — this script is the lint that enforces the lockstep so
 # the duplication can't silently rot.
+#
+# #2037 tracks extending this lint to cover the other four FRPS
+# variable families with mirrored env-root copies (`connect_layerv_host`,
+# `frps_min_size`, `frps_max_size`, `frps_desired_capacity`); this
+# script intentionally covers only `frps_az_suffixes` until then.
 #
 # What this script enforces:
 #   - `type` and `default` lines match (cr round 6 — silent default-value
@@ -59,6 +68,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT_VARS="${REPO_ROOT}/terraform/variables.tf"
 MODULE_VARS="${REPO_ROOT}/terraform/modules/qurl-reverse-tunnel-server/variables.tf"
+# Sandbox env-root copy (added by PR #2035 — closes the
+# "Value for undeclared variable" gap that left #1977's
+# FRPS-behind-AC topology unapplied). #2037 tracks extending this
+# lint to cover the other four variable families this PR mirrored
+# (`connect_layerv_host`, `frps_min_size`/`max_size`/`desired_capacity`);
+# this script covers `frps_az_suffixes` only.
+SANDBOX_ENV_VARS="${REPO_ROOT}/terraform/environments/sandbox/variables.tf"
 
 if [ ! -f "$ROOT_VARS" ]; then
   echo "ERROR: missing $ROOT_VARS" >&2
@@ -66,6 +82,10 @@ if [ ! -f "$ROOT_VARS" ]; then
 fi
 if [ ! -f "$MODULE_VARS" ]; then
   echo "ERROR: missing $MODULE_VARS" >&2
+  exit 1
+fi
+if [ ! -f "$SANDBOX_ENV_VARS" ]; then
+  echo "ERROR: missing $SANDBOX_ENV_VARS" >&2
   exit 1
 fi
 
@@ -153,6 +173,7 @@ canonicalize() {
 
 root_extract=$(extract_validation "$ROOT_VARS")
 module_extract=$(extract_validation "$MODULE_VARS")
+sandbox_env_extract=$(extract_validation "$SANDBOX_ENV_VARS")
 
 if [ -z "$root_extract" ]; then
   echo "ERROR: could not extract frps_az_suffixes validation from $ROOT_VARS" >&2
@@ -162,9 +183,20 @@ if [ -z "$module_extract" ]; then
   echo "ERROR: could not extract frps_az_suffixes validation from $MODULE_VARS" >&2
   exit 1
 fi
+if [ -z "$sandbox_env_extract" ]; then
+  echo "ERROR: could not extract frps_az_suffixes validation from $SANDBOX_ENV_VARS" >&2
+  exit 1
+fi
 
 root_canonical=$(canonicalize "$root_extract")
 module_canonical=$(canonicalize "$module_extract")
+sandbox_env_canonical=$(canonicalize "$sandbox_env_extract")
+
+# The root copy is the source of truth — both the module and the env-root
+# copies must match it. Compare pairwise so a drift in either downstream
+# copy attributes to the specific file that drifted, rather than a
+# three-way fail-with-confusion.
+drift_detected=0
 
 if [ "$root_canonical" != "$module_canonical" ]; then
   echo "ERROR: frps_az_suffixes validation has drifted between the root and module declarations." >&2
@@ -172,10 +204,23 @@ if [ "$root_canonical" != "$module_canonical" ]; then
   echo "  diff (< $ROOT_VARS vs > $MODULE_VARS):" >&2
   diff <(printf '%s\n' "$root_canonical") <(printf '%s\n' "$module_canonical") >&2 || true
   echo "" >&2
-  echo "  Update both files in lockstep, or change the inline 'keep both" >&2
-  echo "  in lockstep' note to explain the intentional divergence and" >&2
+  drift_detected=1
+fi
+
+if [ "$root_canonical" != "$sandbox_env_canonical" ]; then
+  echo "ERROR: frps_az_suffixes validation has drifted between the root and sandbox-env-root declarations." >&2
+  echo "" >&2
+  echo "  diff (< $ROOT_VARS vs > $SANDBOX_ENV_VARS):" >&2
+  diff <(printf '%s\n' "$root_canonical") <(printf '%s\n' "$sandbox_env_canonical") >&2 || true
+  echo "" >&2
+  drift_detected=1
+fi
+
+if [ "$drift_detected" -ne 0 ]; then
+  echo "  Update all three files in lockstep, or change the inline 'keep" >&2
+  echo "  in lockstep' notes to explain the intentional divergence and" >&2
   echo "  update this script to allow it." >&2
   exit 1
 fi
 
-echo "frps_az_suffixes validation: root and module declarations are in sync."
+echo "frps_az_suffixes validation: root, module, and sandbox-env-root declarations are in sync."

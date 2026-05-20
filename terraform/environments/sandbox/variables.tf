@@ -604,6 +604,169 @@ variable "enable_qurl_reverse_tunnel_server_canary" {
   default     = false
 }
 
+# ==================== FRPS passthroughs (parent variables, env-root mirror) ====================
+# Closes the gap noted by #1745: tfvars values for `deploy_frps`,
+# `connect_layerv_host`, `frps_az_suffixes`, and the legacy
+# `frps_min_size` / `frps_max_size` / `frps_desired_capacity` triple
+# (plus `frps_image_tag`, `frps_bind_port`, and `frps_vhost_http_port`
+# threaded preemptively against the same trap) were previously declared
+# in the parent module but NOT in the env root, so the env tfvars
+# entries surfaced as "Value for undeclared variable" warnings at plan
+# time and silently no-op'd at apply. Declaring + threading them
+# through to `module "nhp"` is what lets #1977's FRPS-behind-AC
+# topology actually apply in sandbox.
+#
+# Descriptions/types/defaults/validations are copied from
+# `terraform/variables.tf` to keep the env-root fence in lockstep with
+# the parent. Where the parent uses a multi-paragraph HEREDOC
+# description (today: `connect_layerv_host`), the env-root copy is
+# pragmatically condensed to a one-liner that points back at the
+# parent for the full doc — the parent stays the source of truth so
+# rationale doesn't drift. Validations are mirrored verbatim because
+# their wording is the user-facing error text on a malformed input.
+#
+# Lockstep is enforced today only for `frps_az_suffixes` by
+# `scripts/check-frps-az-suffixes-validation-drift.sh` (root + module +
+# this env-root copy, three-way). #2037 tracks extending that lint to
+# the four remaining mirrored variable families: `connect_layerv_host`,
+# `frps_min_size`, `frps_max_size`, and `frps_desired_capacity`. Until
+# that lands, edits to a parent validation block MUST be mirrored here
+# in the same PR — particularly important for the `connect_layerv_host`
+# `.internal` / `frps-` shape fences, which are transitional and slated
+# for removal alongside #2019. The whole class of "tfvars value,
+# env-root undeclared" misapply that motivated this section is tracked
+# in #2038.
+#
+# Manual-lockstep also applies to the variables WITHOUT `validation {}`
+# blocks (`deploy_frps`, `frps_image_tag`, `frps_bind_port`,
+# `frps_vhost_http_port`) — a parent `default` bump won't be caught by
+# any current lint, so a tfvars-not-set port flip would land on a stale
+# env-root default. And the condensed `connect_layerv_host` description
+# inlines the wire-flow narrative (`NLB → AC → ipset → Traefik → frps-{az}`);
+# if #2019 changes that topology, mirror the wording change here too.
+# Both gaps are tracked in #2037's expanded scope.
+
+variable "deploy_frps" {
+  description = "Deploy the QURL FRP tunnel server for proxying traffic to customer backends. Requires `deploy_ac = true`, `deploy_qurl_service = true`, `qurl_internal_service_token_arn` set, and `qurl_service_domain` set — all four are enforced by `terraform_data.frps_preconditions` at plan time so that FRPS never boots with tunnel auth disabled."
+  type        = bool
+  default     = false
+}
+
+variable "connect_layerv_host" {
+  description = "Customer-facing public DNS name that fronts the FRPS control channel (sandbox: `connect.layerv.xyz`, prod: `connect.layerv.ai`). Threaded into the FRPS resource.toml overlay so the agent dials this name instead of the internal Cloud Map host; NLB:frps_bind_port → AC kernel → ipset-gated → Traefik TCP entrypoint → internal `frps-{az}`. Bare DNS name only (no scheme, port, slashes, whitespace, or userinfo); empty value opts out of the FRPS-behind-AC topology and is only valid for envs without `deploy_frps = true`. Validation duplicated from terraform/variables.tf so a malformed value attributes to the env root rather than the parent module; see the parent for the full migration narrative (why the `.internal` and `frps-` shape fences exist transitionally)."
+  type        = string
+  default     = ""
+
+  # Validations duplicated from terraform/variables.tf — the root copy
+  # fences malformed values regardless of `deploy_frps`; this env copy
+  # gives earlier/clearer attribution when a tfvars-driven typo hits
+  # the env root first (parent validation still fires too).
+  #
+  # RFC 1035 per-label form is the load-bearing fence (quote-injection
+  # exclusion); the `.internal` and `frps-` checks are transitional
+  # input-shape fences against the current customer-facing role of this
+  # variable. Keep wording identical to the parent so error messages
+  # don't drift across layers.
+  # TODO(nhp #2019 — "AC out of the FRPS data path"): both the
+  # `!endswith(".internal")` and `!startswith("frps-")` validations
+  # below are TRANSITIONAL — mirror of the parent's TODO marker at
+  # terraform/variables.tf:2076. When the AC exits the FRPS data plane
+  # and Hostname legitimately points at FRPS directly, the `.internal`
+  # and `frps-` shape fences become wrong for the end-state. Rip them
+  # out HERE in the same PR that rips the parent's copy. Grep for
+  # `TODO(nhp #2019` to find every site that needs the lockstep
+  # removal.
+  validation {
+    condition     = var.connect_layerv_host == "" || can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$", var.connect_layerv_host))
+    error_message = "connect_layerv_host must be a bare lowercase DNS name in per-label RFC 1035 form (each label 1-63 chars, alphanumeric with hyphens but not leading/trailing, multiple labels dot-separated; no scheme, port, slashes, whitespace, or userinfo), or empty to opt out of FRPS-behind-AC. Today's values `connect.layerv.{ai,xyz}` conform."
+  }
+
+  validation {
+    condition     = var.connect_layerv_host == "" || !endswith(var.connect_layerv_host, ".internal")
+    error_message = "connect_layerv_host must NOT end in `.internal` — the FRPS-behind-AC redesign (SLACK_QURL_ROLLOUT.md §6) intentionally splits the customer-facing dial target from the internal FRPS Cloud Map host. Use the public AC ingress name (e.g. `connect.layerv.{ai,xyz}`); the AC Traefik TCP entrypoint forwards to the internal `frps-{az}` host via `var.frp_control_upstream_host` separately."
+  }
+
+  validation {
+    condition     = var.connect_layerv_host == "" || !startswith(var.connect_layerv_host, "frps-")
+    error_message = "connect_layerv_host must NOT start with `frps-` — looks like an FRPS Cloud Map name. Use the customer-facing AC ingress name (e.g. `connect.layerv.{ai,xyz}`), distinct from the FRPS host the AC Traefik TCP entrypoint forwards to internally. See SLACK_QURL_ROLLOUT.md §6 (FRPS-behind-AC redesign)."
+  }
+}
+
+variable "frps_image_tag" {
+  description = "qurl-reverse-tunnel-server binary version tag. Separate from NHP image_tag since frps has its own release cadence. Defaults to a placeholder tag that CI must overwrite on first deploy — a Terraform-only operator can't accidentally install a moving `latest` that slipped between applies."
+  type        = string
+  default     = "v0.0.0-bootstrap"
+}
+
+variable "frps_bind_port" {
+  description = "FRP server control port. Shared between qurl-reverse-tunnel-server module (bind port) and AC module (Traefik route target) so they can't drift."
+  type        = number
+  default     = 7000
+}
+
+variable "frps_vhost_http_port" {
+  description = "FRP vhost HTTP port. Shared between qurl-reverse-tunnel-server module (bind port) and AC module (qurl-router plugin target) so they can't drift."
+  type        = number
+  default     = 8080
+}
+
+variable "frps_az_suffixes" {
+  description = "AZ suffix letters that qurl-reverse-tunnel-server creates per-AZ Cloud Map services for, and that qurl-service hashes OwnerID into. Default `[\"a\", \"b\", \"c\"]` matches us-east-{1,2}{a,b,c}. Each entry must be a single lowercase letter."
+  type        = list(string)
+  default     = ["a", "b", "c"]
+
+  # Validation duplicated from terraform/variables.tf — the root copy
+  # fences a typo at plan time even when `deploy_frps = false` keeps the
+  # module out of the graph. Terraform validates root inputs before
+  # propagating them to children, so both copies fire; this env copy
+  # gives earlier/clearer attribution (env root rather than parent
+  # module) when tfvars-driven inputs are malformed. Lockstep with the
+  # root + module copies is enforced by
+  # `scripts/check-frps-az-suffixes-validation-drift.sh`.
+  validation {
+    condition     = length(var.frps_az_suffixes) > 0 && alltrue([for s in var.frps_az_suffixes : can(regex("^[a-z]$", s))])
+    error_message = "frps_az_suffixes must be a non-empty list of single lowercase letters (e.g., [\"a\", \"b\", \"c\"]) — each entry is the trailing letter of an AWS AZ name."
+  }
+
+  validation {
+    condition     = length(toset(var.frps_az_suffixes)) == length(var.frps_az_suffixes)
+    error_message = "frps_az_suffixes must not contain duplicates (each suffix maps to a distinct Cloud Map service)."
+  }
+}
+
+variable "frps_min_size" {
+  description = "ASG minimum size for qurl-reverse-tunnel-server. Default 1; production envs set this to length(frps_az_suffixes) for one-instance-per-AZ via the per-AZ Cloud Map fanout."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.frps_min_size >= 1 && floor(var.frps_min_size) == var.frps_min_size
+    error_message = "frps_min_size must be an integer >= 1 — qurl-reverse-tunnel-server is the only path for tunnel traffic; N=0 means tunnel resources 502."
+  }
+}
+
+variable "frps_max_size" {
+  description = "ASG maximum size for qurl-reverse-tunnel-server. Default 1; production envs match min_size and length(frps_az_suffixes)."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.frps_max_size >= 1 && floor(var.frps_max_size) == var.frps_max_size
+    error_message = "frps_max_size must be an integer >= 1 — see frps_min_size."
+  }
+}
+
+variable "frps_desired_capacity" {
+  description = "ASG desired capacity for qurl-reverse-tunnel-server. Default 1; production envs set this to length(frps_az_suffixes) for one-instance-per-AZ steady state."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.frps_desired_capacity >= 1 && floor(var.frps_desired_capacity) == var.frps_desired_capacity
+    error_message = "frps_desired_capacity must be an integer >= 1 — see frps_min_size."
+  }
+}
+
 # QURL Idempotency Cache
 variable "qurl_idempotency_cache_ttl_seconds" {
   description = "TTL for idempotency cache entries in seconds"

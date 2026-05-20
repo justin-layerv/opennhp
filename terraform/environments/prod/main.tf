@@ -154,14 +154,21 @@ module "nhp" {
   instance_discovery_ttl_seconds = var.instance_discovery_ttl_seconds
   enable_qurl_site_authz         = var.enable_qurl_site_authz
 
-  # qurl-reverse-tunnel-server. PR 3 wires only the NEW
-  # variables introduced by this PR (per-AZ sizing, blue/green, canary,
+  # qurl-reverse-tunnel-server. #1745 wired only the NEW
+  # variables introduced by that PR (per-AZ sizing, blue/green, canary,
   # MULTIVALUE flip). Existing tfvars values for `deploy_frps`,
   # `frps_image_tag`, `frps_az_suffixes`, and the legacy sizing triple
-  # were already latent no-ops in env tfvars (the existing env main.tf
-  # never forwarded them) and are left unwired here so PR 3 doesn't
-  # change deploy state. PR 4 can re-thread the legacy passthrough
-  # alongside the value flip.
+  # are currently being silently discarded in prod too — `terraform.tfvars`
+  # sets `frps_min_size`/`max_size`/`desired_capacity = 3` but
+  # `prod/variables.tf` declares none of them, so plan emits the same
+  # "Value for undeclared variable" warnings sandbox had pre-#2035. Today
+  # the latent state is benign because `connect_layerv_host = ""` keeps
+  # `deploy_frps` count-gated off in prod, but the gap pre-dates the
+  # eventual value flip and is the same bug-class #2035 fixed for sandbox.
+  # The sandbox env-root close-out landed in #2035 (see that PR's diff
+  # for the variable-list and module-passthrough template); mirror that
+  # wiring here when prod flips `deploy_frps = true` and sets a non-empty
+  # `connect_layerv_host`.
   qurl_reverse_tunnel_server_min_size_per_az               = var.qurl_reverse_tunnel_server_min_size_per_az
   qurl_reverse_tunnel_server_max_size_per_az               = var.qurl_reverse_tunnel_server_max_size_per_az
   qurl_reverse_tunnel_server_desired_capacity_per_az       = var.qurl_reverse_tunnel_server_desired_capacity_per_az
