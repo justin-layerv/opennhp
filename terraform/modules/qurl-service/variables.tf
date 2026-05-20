@@ -870,11 +870,24 @@ variable "nhp_server_public_key_b64" {
   default     = ""
 
   # Catch keypair-output shape drift at plan time. Allows empty when the
-  # gate is off; otherwise requires a decodable base64 string whose raw
-  # length is 32 bytes (Curve25519). Defends against producer-side
-  # changes that wrap the key in PEM, add leading whitespace from a
-  # Lambda JSON re-encode, etc. — qurl-service would otherwise blow up
-  # at consume time with no plan-time signal.
+  # gate is off; otherwise requires the encoded shape of a base64'd
+  # 32-byte value — 43 base64 chars + 1 `=` padding char = 44 chars
+  # total. Defends against producer-side changes that wrap the key in
+  # PEM, add leading whitespace from a Lambda JSON re-encode, etc. —
+  # qurl-service would otherwise blow up at consume time with no
+  # plan-time signal.
+  #
+  # Why a regex on the encoded value and not `base64decode(...)` +
+  # `length(...)`? Terraform's `base64decode` interprets the decoded
+  # bytes as UTF-8 and errors out if they aren't valid UTF-8 — random
+  # X25519 key bytes almost always contain a byte outside the valid
+  # UTF-8 leading-byte range (e.g. the live sandbox key starts with
+  # 0x9c, a continuation byte). The prior `can(base64decode(...))`
+  # form returned false for every real key it was meant to admit.
+  # Even if the decoded bytes happen to be valid UTF-8, `length()` on
+  # a string returns codepoint count rather than byte count, so the
+  # `== 32` comparison is a different check than intended. Validating
+  # the encoded shape sidesteps both issues.
   #
   # Greenfield caveat: on a fresh env where `module.nhp_keypair` hasn't
   # yet applied, the threaded value resolves through
@@ -885,8 +898,8 @@ variable "nhp_server_public_key_b64" {
   # a fail-loud apply error is strictly better than runtime agent
   # failure either way.
   validation {
-    condition     = var.nhp_server_public_key_b64 == "" || (can(base64decode(var.nhp_server_public_key_b64)) && length(base64decode(var.nhp_server_public_key_b64)) == 32)
-    error_message = "nhp_server_public_key_b64 must be empty (gate off) or a base64-encoded 32-byte X25519 public key. Got an unparseable / wrong-length value — check module.nhp_keypair.registration_public_key's output shape."
+    condition     = var.nhp_server_public_key_b64 == "" || can(regex("^[A-Za-z0-9+/]{43}=$", var.nhp_server_public_key_b64))
+    error_message = "nhp_server_public_key_b64 must be empty (gate off) or a base64-encoded 32-byte X25519 public key (44 chars total: 43 base64 chars + `=` padding). Got a malformed value — check module.nhp_keypair.registration_public_key's output shape."
   }
 }
 
