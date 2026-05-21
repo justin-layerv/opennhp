@@ -1824,6 +1824,21 @@ variable "developer_portal_ci_bypass_secret_name" {
   default     = null
 }
 
+variable "developer_portal_connector_base_url" {
+  description = "Base URL of the qURL S3 connector that the developer-portal Lambda's /playground/upload route forwards multipart bodies + mint_link calls to. Must be https:// with a non-empty host, no trailing slash. Set explicitly per environment so sandbox can't silently coalesce onto the prod connector."
+  type        = string
+
+  validation {
+    condition     = can(regex("^https://[^/]+", var.developer_portal_connector_base_url))
+    error_message = "developer_portal_connector_base_url must use https:// with a non-empty host."
+  }
+
+  validation {
+    condition     = !endswith(var.developer_portal_connector_base_url, "/")
+    error_message = "developer_portal_connector_base_url must not end with '/'."
+  }
+}
+
 # ==================== Shared Dashboard CORS ====================
 
 variable "dashboard_allowed_origins" {

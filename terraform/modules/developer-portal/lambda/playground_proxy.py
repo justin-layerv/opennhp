@@ -10,9 +10,11 @@ Endpoints:
     GET    /playground/qurl/{id}     - Get QURL status
     DELETE /playground/qurl/{id}     - Revoke a QURL
     POST   /playground/qurl/{id}/mint - Mint a link for a QURL
+    POST   /playground/upload        - Upload a file and return a one-time qURL
     GET    /playground/health        - Health check
 """
 
+import base64
 import json
 import boto3
 import hmac
@@ -89,7 +91,51 @@ CI_BYPASS_CACHE_TTL = 300  # 5 minutes
 # Playground constraints
 MAX_TTL_MINUTES = 30
 MAX_TTL_DURATION = '30m'
-MAX_ACTIVE_QURLS_PER_IP = 10  # max active QURLs per IP per hour
+# NOTE: MAX_ACTIVE_QURLS_PER_IP is declared but not enforced anywhere
+# in this module — the active live cap is `check_rate_limits` (which
+# counts ALL playground requests per-IP, regardless of route or
+# resulting resource lifetime). Both URL-mode and /playground/upload
+# share that counter. Kept here as documentation of an aspirational
+# control; removing would require flagging a future cap implementation.
+MAX_ACTIVE_QURLS_PER_IP = 10  # max active QURLs per IP per hour (unused — see note above)
+
+# File upload constraints (POST /playground/upload).
+# Cap below Lambda's 6 MB sync payload limit so a base64-encoded multipart
+# body still fits with envelope overhead. Tune via env if Lambda is moved
+# behind a Function URL (10 MB sync limit) or async invocation.
+CONNECTOR_BASE_URL = os.environ.get('CONNECTOR_BASE_URL', 'https://getqurllink.layerv.ai')
+MAX_UPLOAD_BYTES = int(os.environ.get('PLAYGROUND_MAX_UPLOAD_BYTES', str(4 * 1024 * 1024)))
+UPLOAD_FORWARD_TIMEOUT_S = int(os.environ.get('PLAYGROUND_UPLOAD_TIMEOUT', '15'))
+MINT_FORWARD_TIMEOUT_S = int(os.environ.get('PLAYGROUND_MINT_TIMEOUT', '8'))
+
+# Connector error strings that are safe to pass through to the browser.
+# The connector's other 5xx-flavored messages have the shape "Upload
+# failed: <storage error>" or "qURL creation failed: <upstream error>"
+# — those can contain bucket names, S3 error codes, qURL API stack
+# detail; render them as a generic message instead of reflecting raw.
+# Source: qurl-integrations-infra/qurl-s3-connector/API.md.
+#
+# CONNECTOR RESPONSIBILITY: matching is by PREFIX, but the full string
+# is reflected to the browser. The connector MUST NOT append sensitive
+# context to these prefixes (e.g. "Type not allowed: rejected by
+# av-scanner@av.internal:8080" would leak an internal hostname). If a
+# new allowlisted prefix is added here, audit the connector's complete
+# error message shape, not just its lead token.
+_CONNECTOR_SAFE_ERROR_PREFIXES = (
+    'No file provided',
+    'File too large',
+    'Type not allowed',
+    # `viewer_ttl_seconds must be a finite decimal at least 0.5` /
+    # `viewer_ttl_seconds value too long (max 32 characters)` —
+    # connector validation errors that name the field as their lead
+    # token. Pinning the `must` / `value` suffix would over-fit on
+    # the current strings; the broader `viewer_ttl_seconds` prefix
+    # accepts any future copy edit of those messages as long as the
+    # connector keeps the field name at the front (verified in
+    # qurl-s3-connector/internal/handler/handler.go upload error
+    # paths).
+    'viewer_ttl_seconds ',
+)
 
 # DynamoDB tables
 rate_table = dynamodb.Table(RATE_TABLE_NAME)
@@ -99,6 +145,13 @@ DURATION_RE = re.compile(r'^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$')
 
 # Safe ID pattern: alphanumeric, hyphens, underscores only (max 64 chars)
 QURL_ID_RE = re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
+
+# Strict multipart Content-Type check: the literal token followed by
+# end-of-string OR a separator (`;`, whitespace). Case-insensitive.
+# Rejects pathological values like `multipart/form-datazoo` that
+# would slip through a bare `startswith`. Used with `re.match`, so no
+# leading `^` needed (re.match already anchors at the start).
+_MULTIPART_CT_RE = re.compile(r'multipart/form-data(\s*$|\s*;)', re.IGNORECASE)
 
 # Module-level M2M token cache (persists across warm Lambda invocations)
 _cached_token = None
@@ -137,6 +190,8 @@ def lambda_handler(event, context):
         return handle_delete_qurl(event, qurl_id)
     elif qurl_id and path == f'/playground/qurl/{qurl_id}/mint' and method == 'POST':
         return handle_mint_link(event, qurl_id)
+    elif path == '/playground/upload' and method == 'POST':
+        return handle_upload(event)
     else:
         return cors_response(event, 404, {'error': 'Not found'})
 
@@ -275,6 +330,456 @@ def handle_mint_link(event, qurl_id):
 
     status, response_body = proxy_to_qurl_api('POST', f'/v1/qurls/{qurl_id}/mint_link', body=body)
     return cors_response(event, status, response_body)
+
+
+def handle_upload(event):
+    """
+    Upload a file and return a one-time-use qURL.
+
+    Browser → playground proxy:
+        POST /playground/upload  (multipart/form-data, single "file" field)
+
+    The proxy rate-limits per-IP, enforces a size cap, then chains two
+    server-side calls against the S3 connector:
+        1. POST {CONNECTOR_BASE_URL}/api/upload      — stores the file in S3
+                                                      and creates a qURL.
+        2. POST {CONNECTOR_BASE_URL}/api/mint_link/{resource_id}
+                                                      — mints a single-use
+                                                      qURL link against
+                                                      that resource.
+
+    The /api/upload-issued qurl_link is discarded; only the minted one-time
+    link is returned to the browser. This is the contract advertised by the
+    /demo page ("self-destructs after the first access"). See the connector
+    /api/upload API docs for why one_time_use is opt-in via mint_link.
+
+    Response (playground envelope, matches POST /playground/qurl shape):
+        {"data": {
+            "qurl_link": "<one-time link from mint_link>",
+            "qurl_site": "<invisible-by-default site from /api/upload>",
+            "resource_id": "<connector resource id>",
+            "expires_at": "<minted link expiry, ISO 8601>"
+        }}
+    """
+    # Defense-in-depth: terraform validation also requires https://,
+    # but an out-of-band env-var change (console edit, manual SAM
+    # deploy) would otherwise let plaintext through. Scoped to this
+    # handler (not module-import) so /playground/health and the URL-
+    # mode routes stay green for on-call diagnostics even if the
+    # upload-side env var is misconfigured.
+    if not CONNECTOR_BASE_URL.startswith('https://'):
+        logger.error("CONNECTOR_BASE_URL must use https://",
+                     extra={"prefix": CONNECTOR_BASE_URL[:16]})
+        return cors_response(event, 500, {'error': 'Server misconfigured'})
+
+    source_ip = event.get('requestContext', {}).get('http', {}).get('sourceIp', 'unknown')
+
+    # Rate limit FIRST. A cross-origin or no-origin attacker still
+    # consumes Lambda invocations + log lines per request; running the
+    # rate-limit increment ahead of the CSRF gate makes per-IP flood
+    # protection actually bound the abuse rate.
+    # Trade-off: a CSRF amplification attack from evil.example.com
+    # burns the *victim's* per-IP bucket — legitimate users sharing
+    # the NAT can lose /playground/qurl access too. Cost containment
+    # wins here over fair-sharing; revisit if the demo grows.
+    if not _is_ci_bypass(event):
+        rate_error = check_rate_limits(source_ip)
+        if rate_error:
+            return cors_response(event, 429, {'error': rate_error})
+
+    # CSRF defense: multipart/form-data is a CORS "simple" content type,
+    # so browsers do NOT preflight a cross-origin POST of an upload.
+    # A malicious site could otherwise submit a form against this route
+    # from a victim browser and create real qURLs charged to the
+    # victim's per-IP rate-limit bucket. Reject when an Origin header
+    # is present but not in our allowlist; absent Origin (curl,
+    # non-browser clients) is fine since CSRF only applies to browsers.
+    # Note: this is CSRF defense, not auth — the route is still
+    # anonymous, and rate limiting remains the abuse control.
+    headers = event.get('headers') or {}
+    origin = _get_header(headers, 'Origin')
+    if origin and origin not in ALLOWED_ORIGINS:
+        logger.warning("Upload rejected: cross-origin", extra={"origin": origin[:128]})
+        return cors_response(event, 403, {'error': 'Origin not allowed'})
+
+    # Validate cheap things first (header shape, body presence, body size)
+    # before paying for the base64 decode of up to a multi-MB body.
+    content_type = _get_header(headers, 'Content-Type')
+    # Strict match: "multipart/form-data" followed by end-of-string,
+    # whitespace, or `;`. `startswith` alone would let pathological
+    # values like `multipart/form-datazoo` through (no real browser
+    # emits that, but be explicit).
+    if not _MULTIPART_CT_RE.match(content_type):
+        return cors_response(event, 400, {'error': 'Content-Type must be multipart/form-data'})
+
+    # Defense-in-depth: reject embedded CR/LF in Content-Type before
+    # we forward it as an outbound header. CPython's http.client also
+    # rejects CRLF (InvalidHeader), but our doctrine is "validate at
+    # the boundary" — and a future stdlib change relaxing this would
+    # be a silent header-injection vector against the connector.
+    if '\r' in content_type or '\n' in content_type:
+        logger.warning("Upload rejected: CRLF in Content-Type")
+        return cors_response(event, 400, {'error': 'Invalid Content-Type'})
+
+    # Empty body is the cheapest, most-accurate reject — fire before
+    # the base64-encoding check so a zero-byte upload doesn't get told
+    # "Expected base64-encoded …".
+    raw_body = event.get('body') or ''
+    if not raw_body:
+        return cors_response(event, 400, {'error': 'Empty request body'})
+
+    # API Gateway HTTP API (payload v2.0) base64-encodes binary bodies.
+    # Reject non-base64 bodies for multipart so we never silently corrupt
+    # the file by re-encoding text bytes — the route is multipart-only.
+    if not event.get('isBase64Encoded', False):
+        return cors_response(event, 400, {'error': 'Expected base64-encoded multipart/form-data body'})
+
+    # Pre-check the encoded length against the decoded cap before
+    # decoding so an oversize request short-circuits without paying
+    # for the multi-MB base64 → bytes allocation. Base64 inflates by
+    # 4/3, so the encoded body of a MAX_UPLOAD_BYTES file is at most
+    # (MAX + 2) // 3 * 4 bytes (round up for padding).
+    max_encoded_len = ((MAX_UPLOAD_BYTES + 2) // 3) * 4
+    if len(raw_body) > max_encoded_len:
+        return cors_response(event, 413, {
+            'error': f'File too large; max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB'
+        })
+
+    # validate=True rejects ANY whitespace inside the encoded body.
+    # API Gateway HTTP API doesn't inject newlines today, but a future
+    # WAF / edge proxy re-encoding could surface as a 400 here.
+    try:
+        file_bytes = base64.b64decode(raw_body, validate=True)
+    except (ValueError, TypeError):
+        return cors_response(event, 400, {'error': 'Invalid base64 request body'})
+
+    if not file_bytes:
+        # raw_body=='' was rejected upstream; this fires for inputs
+        # like "====" (pure base64 padding that decodes to empty).
+        # Distinct message so logs make the path obvious.
+        return cors_response(event, 400, {'error': 'Empty multipart body after decode'})
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        # Belt-and-braces — encoded pre-check above usually catches this.
+        return cors_response(event, 413, {
+            'error': f'File too large; max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB'
+        })
+
+    # Filename + Content-Disposition header values come from the
+    # browser and are forwarded byte-for-byte. Sanitization is the
+    # connector's job (it owns the S3 key construction); intentionally
+    # NOT adding defense-in-depth here so legitimate Unicode filenames
+    # aren't broken by a well-meaning future filter. The connector's
+    # behavior is asserted by its own tests (see qurl-s3-connector's
+    # handler_test.go); a future loosening of THAT sanitizer is a
+    # contract change this Lambda's owner needs to be told about.
+    #
+    # Step 1: forward multipart to the connector's upload endpoint.
+    upload_status, upload_body = _forward_to_connector_upload(content_type, file_bytes)
+    # Connector contract (qurl-s3-connector/API.md §1): a successful
+    # `/api/upload` returns `{"success": true, ...}`. Failures return
+    # `{"success": false, "error": "..."}`. Missing `success` (or a
+    # non-dict body) is treated as failure-shape — defense-in-depth
+    # against contract drift.
+    body_is_failure_shape = (
+        not isinstance(upload_body, dict) or not upload_body.get('success')
+    )
+    if upload_status != 200 or body_is_failure_shape:
+        # Browser sees ONLY connector errors with vetted prefixes (size
+        # cap, type cap, missing file). Strings like "Upload failed:
+        # NoSuchBucket: bucket 'internal-bucket-name' does not exist"
+        # are mapped to a generic message. CloudWatch logs see the raw
+        # string (clipped) so on-call still has the diagnostic signal.
+        raw_detail = upload_body.get('error') if isinstance(upload_body, dict) else None
+        safe_detail = _safe_error_string(raw_detail)
+        logger.warning(
+            "Connector /api/upload failed",
+            extra={
+                "status": upload_status,
+                "raw_detail": (raw_detail[:200] if isinstance(raw_detail, str) else None),
+                "safe_detail": safe_detail,
+            },
+        )
+        # Connector 2xx with a failure-shaped body is a gateway failure
+        # — we couldn't trust the response, so we surface 502 instead
+        # of mirroring the upstream's misleading 200. Connector 4xx
+        # passes through (rate limit, type rejection, etc. are
+        # user-actionable). 5xx maps to 502. (We've already entered
+        # this block because status != 200 OR body_is_failure_shape, so
+        # `upload_status == 200` implies body_is_failure_shape — no
+        # need to repeat the conjunction.)
+        if upload_status >= 500 or upload_status == 200:
+            proxy_status = 502
+        else:
+            proxy_status = upload_status
+        return cors_response(event, proxy_status, {
+            'error': safe_detail or 'Upload failed'
+        })
+
+    resource_id = upload_body.get('resource_id')
+    qurl_site = upload_body.get('qurl_site')
+
+    # qurl_site flows into the response as a link target — require
+    # https + non-empty hostname so a compromised connector can't
+    # reflect a `javascript:` scheme. Per-env VIEW_DOMAIN is
+    # configurable so we don't pin the exact host.
+    if isinstance(qurl_site, str):
+        qs_parsed = urlparse(qurl_site)
+        if qs_parsed.scheme != 'https' or not qs_parsed.hostname:
+            logger.error("Connector returned non-https or malformed qurl_site",
+                         extra={"resource_id_present": bool(resource_id)})
+            qurl_site = None
+    else:
+        qurl_site = None
+
+    if not resource_id:
+        # Log identifying keys only — never the full body. The connector's
+        # success payload contains a presigned resource_url + qurl_link
+        # that should not land in CloudWatch logs.
+        logger.error("Connector upload returned no resource_id",
+                     extra={"keys": sorted(upload_body.keys())})
+        return cors_response(event, 502, {'error': 'Upload response missing resource_id'})
+
+    # Defense-in-depth: the connector forwards an `r_<11 chars>` ID
+    # generated by the qURL service (`domain.GenerateResourceID`:
+    # prefix "r_" + 8 random bytes base64-RawURL-encoded + lowercased,
+    # alphabet [a-z0-9_-]). Our QURL_ID_RE upper bound (64 chars) +
+    # alphabet [a-zA-Z0-9_-] both accommodate the current format with
+    # headroom. The check is a path-traversal guard, not a strict
+    # format pin — if the qURL service ever widens the resource_id
+    # alphabet (e.g., adds `.`), update QURL_ID_RE here too.
+    if not QURL_ID_RE.match(resource_id):
+        logger.error("Connector upload returned unsafe resource_id",
+                     extra={"resource_id_len": len(resource_id)})
+        return cors_response(event, 502, {'error': 'Upload response has invalid resource_id'})
+
+    # Step 2: mint a one-time-use link for the resource.
+    mint_status, mint_body = _forward_to_connector_mint_link(resource_id)
+    if mint_status != 200 or not isinstance(mint_body, dict) or not mint_body.get('success'):
+        # The upload succeeded but the mint did not — surfacing the
+        # connector's reusable qurl_link here would silently break the
+        # advertised "self-destructs after the first access" contract,
+        # so fail loudly instead. S3 lifecycle on the connector's
+        # bucket (qurl-integrations-infra/qurl-s3-connector/terraform/
+        # s3-security.tf:565, prefix=uploads/) garbage-collects the
+        # orphan within the configured retention window.
+        # Mint-side errors all flow through the same upstream qURL API
+        # ("n must not exceed 10", "qURL mint_link API error (NNN):
+        # ..."); none are user-actionable, so always render generic.
+        # CloudWatch still gets the raw upstream detail for triage.
+        raw_detail = mint_body.get('error') if isinstance(mint_body, dict) else None
+        logger.error(
+            "Connector /api/mint_link failed after successful upload",
+            extra={
+                "status": mint_status,
+                "raw_detail": (raw_detail[:200] if isinstance(raw_detail, str) else None),
+                "resource_id": resource_id,
+            },
+        )
+        return cors_response(event, 502, {
+            'error': 'Failed to create one-time access link'
+        })
+
+    links = mint_body.get('links') or []
+    if not links or not isinstance(links, list):
+        logger.error("Mint response missing links array",
+                     extra={"resource_id": resource_id, "keys": sorted(mint_body.keys())})
+        return cors_response(event, 502, {'error': 'Mint response missing links'})
+
+    minted = links[0]
+    one_time_link = minted.get('qurl_link') if isinstance(minted, dict) else None
+    if not one_time_link:
+        # Only log shape, not the link object — defensive against future
+        # connector fields that might contain sensitive values.
+        logger.error("First minted link missing qurl_link",
+                     extra={"resource_id": resource_id,
+                            "link_keys": sorted(minted.keys()) if isinstance(minted, dict) else type(minted).__name__})
+        return cors_response(event, 502, {'error': 'Minted link missing qurl_link'})
+
+    # qurl_link is the user-clickable URL. Same scheme/host check as
+    # qurl_site, but fails 502 (no usable fallback) instead of nulling.
+    # No host allowlist: QURL_DOMAIN is per-env, and the trust model is
+    # scheme/shape — not hostname pinning.
+    qlink_parsed = urlparse(one_time_link)
+    if qlink_parsed.scheme != 'https' or not qlink_parsed.hostname:
+        logger.error("Minted link is not a valid https URL",
+                     extra={"resource_id": resource_id,
+                            "link_scheme": qlink_parsed.scheme or '<empty>'})
+        return cors_response(event, 502, {'error': 'Minted link is malformed'})
+
+    # `minted` is provably a dict at this point — `one_time_link` is a
+    # truthy string pulled from `minted.get(...)` via the isinstance
+    # gate above. Direct .get() instead of the redundant ternary.
+    #
+    # expires_at is also forwarded to the browser. Sanity-check that
+    # it parses as ISO 8601 (matching the connector API contract — see
+    # qurl-s3-connector/API.md) so a buggy/compromised connector
+    # injecting arbitrary content doesn't reach the demo. Null out if
+    # invalid; the upload still succeeded.
+    minted_expires_at = minted.get('expires_at')
+    if not _is_valid_iso8601(minted_expires_at):
+        logger.warning("Minted link has invalid expires_at; dropping",
+                       extra={"resource_id": resource_id})
+        minted_expires_at = None
+
+    return cors_response(event, 200, {
+        'data': {
+            'qurl_link': one_time_link,
+            'qurl_site': qurl_site,
+            'resource_id': resource_id,
+            'expires_at': minted_expires_at,
+        }
+    })
+
+
+def _forward_to_connector_upload(content_type, file_bytes):
+    """
+    POST the raw multipart body to the S3 connector's /api/upload.
+
+    No Authorization header — the connector falls back to its own
+    QURL_API_TOKEN service token, which is the same anonymous-caller path
+    the browser used before this proxy existed.
+    """
+    req = urllib.request.Request(
+        f'{CONNECTOR_BASE_URL}/api/upload',
+        data=file_bytes,
+        headers={'Content-Type': content_type},
+        method='POST',
+    )
+    return _do_connector_call(req, UPLOAD_FORWARD_TIMEOUT_S, label='upload')
+
+
+def _forward_to_connector_mint_link(resource_id):
+    """
+    POST {n:1, one_time_use:true} to the connector's mint_link endpoint.
+
+    This is THE step that delivers the one-time-use semantics — the upload
+    endpoint itself returns a multi-use link by default (see connector
+    API.md note on one_time_use being opt-in via mint_link).
+    """
+    payload = json.dumps({'n': 1, 'one_time_use': True}).encode()
+    # QURL_ID_RE already restricts resource_id to [a-zA-Z0-9_-]{1,64}
+    # so quote() is a no-op today. Belt-and-braces against a future
+    # widening of that regex: validate at the boundary AND escape at
+    # use, matching the doctrine elsewhere in this module.
+    req = urllib.request.Request(
+        f'{CONNECTOR_BASE_URL}/api/mint_link/{urllib.parse.quote(resource_id, safe="")}',
+        data=payload,
+        headers={'Content-Type': 'application/json'},
+        method='POST',
+    )
+    return _do_connector_call(req, MINT_FORWARD_TIMEOUT_S, label='mint_link')
+
+
+def _is_valid_iso8601(value):
+    """
+    Return True if `value` is a tz-aware string that
+    `datetime.fromisoformat` parses (a superset of RFC 3339, the
+    connector's documented contract). The goal is shape-checking
+    connector-returned `expires_at` so an injected `<script>...</script>`
+    payload doesn't reach the browser — strict RFC 3339 conformance
+    would also work but isn't needed for that. Python 3.11+
+    `fromisoformat` accepts trailing `Z` natively, and the Lambda
+    runtime is pinned to 3.12 (`playground.tf:runtime = "python3.12"`).
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return False
+    return parsed.tzinfo is not None
+
+
+def _get_header(headers, name):
+    """
+    Case-insensitive header lookup. HTTP API v2 lowercases header keys
+    per spec, but defensively check both forms so a test or future API
+    change supplying the canonical-case variant doesn't break the
+    handler. Used by both the CSRF gate (origin) and Content-Type
+    check in handle_upload, AND by get_cors_origin's ACAO echo — keep
+    these two in sync via this single helper rather than duplicating
+    the dual-lookup pattern.
+    """
+    return headers.get(name.lower()) or headers.get(name) or ''
+
+
+def _safe_error_string(err):
+    """
+    Return `err` iff it's a string that starts with a known-safe
+    connector-error prefix — a user-actionable message we've vetted
+    as not containing internal detail. Anything else returns None and
+    the caller renders a generic error string.
+
+    Takes the error string directly (not the wrapping dict) so callers
+    can compute it once for both logging (raw, clipped) and the
+    browser response (safe).
+    """
+    if not isinstance(err, str):
+        return None
+    stripped = err.strip()
+    if not stripped:
+        return None
+    return stripped if stripped.startswith(_CONNECTOR_SAFE_ERROR_PREFIXES) else None
+
+
+def _do_connector_call(req, timeout, label):
+    """
+    Execute an outbound urllib request to the S3 connector.
+
+    Returns (status, parsed_body). `parsed_body` is whatever
+    `json.loads` produces — typically a dict, but no shape is
+    enforced (it could be a list / str / number / bool). Callers
+    that depend on dict shape MUST gate on `isinstance(body, dict)`
+    before reaching into it.
+
+    On non-JSON 2xx → returns (502, {'error': 'Invalid connector
+    response'}); on network error → (502, {'error': 'Upstream service
+    unavailable'}). Both 502 paths return a dict, matching
+    proxy_to_qurl_api's convention so callers don't need to
+    special-case the failure shape.
+    """
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            try:
+                body = json.loads(raw) if raw else {}
+            except (json.JSONDecodeError, ValueError):
+                # Upstream returned 2xx with a non-JSON body — we can't
+                # tell whether the operation actually succeeded, so
+                # surface this as a gateway failure (502) rather than
+                # propagating the upstream's 2xx, which would let
+                # handle_upload's `if status != 200` check pass and
+                # send the caller back garbage. Log only shape info
+                # (Content-Type + length) rather than the raw body —
+                # an unparseable payload from a proxy / edge / WAF
+                # could contain presigned URLs or internal hostnames.
+                logger.error(
+                    f"Connector {label} returned non-JSON body",
+                    extra={
+                        "status": resp.status,
+                        "length": len(raw),
+                        "content_type": resp.headers.get('Content-Type', '<missing>'),
+                    },
+                )
+                return 502, {'error': 'Invalid connector response'}
+            return resp.status, body
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            body = json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, ValueError):
+            # Unparseable 4xx/5xx — clip the decoded body for diagnostic
+            # purposes since by definition it's not a JSON envelope we
+            # control. Kept short (200 chars) to bound exposure.
+            body = {'error': raw.decode('utf-8', errors='replace')[:200] or 'Upstream error'}
+        return e.code, body
+    except (socket.timeout, urllib.error.URLError, ConnectionError, OSError) as e:
+        # Narrow catch (was `Exception`): network-failure cases map to
+        # 502 cleanly. Letting MemoryError / KeyboardInterrupt /
+        # SystemExit propagate is correct — they indicate something the
+        # Lambda runtime should handle, not silently translate to 502.
+        logger.error(f"Connector {label} call failed", extra={"error": str(e)})
+        return 502, {'error': 'Upstream service unavailable'}
 
 
 # ---------------------------------------------------------------------------
@@ -670,7 +1175,7 @@ def check_rate_limits(ip):
 
 def get_cors_origin(event):
     """Return allowed origin if request origin is in whitelist, else first allowed origin."""
-    origin = (event.get('headers') or {}).get('origin', '')
+    origin = _get_header(event.get('headers') or {}, 'Origin')
     if origin in ALLOWED_ORIGINS:
         return origin
     return ALLOWED_ORIGINS[0] if ALLOWED_ORIGINS else 'https://layerv.ai'

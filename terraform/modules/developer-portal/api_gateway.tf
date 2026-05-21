@@ -76,6 +76,13 @@ resource "aws_apigatewayv2_integration" "playground" {
   integration_type       = "AWS_PROXY"
   integration_uri        = aws_lambda_function.playground.invoke_arn
   payload_format_version = "2.0"
+  # Explicit 30s = HTTP API default. Setting it here so operators see
+  # the number and don't reason about the Lambda's 60s timeout as the
+  # binding constraint. To raise above 30s, file a Service Quotas
+  # request for "Maximum integration timeout" (max 50s) — then bump
+  # this value AND the playground_upload/mint_timeout precondition in
+  # playground.tf in lockstep.
+  timeout_milliseconds = 30000
 }
 
 # ==============================================================================
@@ -109,6 +116,16 @@ resource "aws_apigatewayv2_route" "playground_delete" {
 resource "aws_apigatewayv2_route" "playground_mint" {
   api_id    = aws_apigatewayv2_api.developer_portal.id
   route_key = "POST /playground/qurl/{id}/mint"
+  target    = "integrations/${aws_apigatewayv2_integration.playground.id}"
+}
+
+# Browser uploads a file (multipart/form-data); Lambda chains to the S3
+# connector's /api/upload + /api/mint_link to return a one-time-use qURL.
+# HTTP API base64-encodes binary bodies into the Lambda payload v2 event
+# automatically — no `binary_media_types` config exists for apigatewayv2.
+resource "aws_apigatewayv2_route" "playground_upload" {
+  api_id    = aws_apigatewayv2_api.developer_portal.id
+  route_key = "POST /playground/upload"
   target    = "integrations/${aws_apigatewayv2_integration.playground.id}"
 }
 

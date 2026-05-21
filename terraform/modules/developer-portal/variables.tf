@@ -139,6 +139,93 @@ variable "playground_rate_window" {
 }
 
 # ==============================================================================
+# Playground File Upload (POST /playground/upload)
+# ==============================================================================
+
+variable "connector_base_url" {
+  description = <<-EOT
+    Base URL of the qURL S3 connector that handles file uploads +
+    mint_link calls. Must be HTTPS — the proxy forwards unauthenticated
+    user content. **The default points at the production connector
+    (getqurllink.layerv.ai) because no separate sandbox connector is
+    deployed today.** Sandbox `/playground/upload` traffic currently
+    hits the same connector as prod (which is fine for the demo — the
+    connector's qURLs are short-lived and rate-limited), but if a
+    sandbox connector is deployed later, set this in the sandbox
+    environment's tfvars to point at it. Tracked separately.
+  EOT
+  type        = string
+  default     = "https://getqurllink.layerv.ai"
+
+  validation {
+    # HTTPS only + non-empty host. `^https://` alone would accept
+    # `https://` (no host) or `https:///api`, which would surface as
+    # a runtime urllib failure on the first invocation rather than
+    # a plan-time error.
+    condition     = can(regex("^https://[^/]+", var.connector_base_url))
+    error_message = "connector_base_url must use https:// with a non-empty host."
+  }
+
+  validation {
+    # No trailing slash — the Lambda builds f'{CONNECTOR_BASE_URL}/api/...'
+    # so a trailing slash would produce '//api/...' which some proxies
+    # normalize and some don't.
+    condition     = !endswith(var.connector_base_url, "/")
+    error_message = "connector_base_url must not end with '/'."
+  }
+}
+
+variable "playground_max_upload_bytes" {
+  description = "Max decoded file size in bytes for POST /playground/upload. Stays below Lambda's 6 MiB sync payload limit after base64 + multipart overhead."
+  type        = number
+  default     = 4 * 1024 * 1024 # 4 MB
+
+  validation {
+    # Lower bound 1 MiB: the "max X MB" error string uses integer-MiB
+    # division, so a sub-MiB cap would render as "max 0 MB".
+    #
+    # Upper bound 4 MiB: Lambda's sync invocation request payload limit
+    # is 6 MiB total. Base64 inflates the file body by 4/3, so a 4 MiB
+    # decoded file = ~5.33 MiB encoded, leaving ~683 KiB of headroom
+    # for the multipart envelope (boundary, Content-Disposition,
+    # Content-Type headers). Pushing the decoded cap higher would
+    # cause API Gateway to reject oversize requests with a 413 BEFORE
+    # the Lambda even runs, making the handler's own size-cap error
+    # message confusingly absent.
+    condition     = var.playground_max_upload_bytes >= 1024 * 1024 && var.playground_max_upload_bytes <= 4 * 1024 * 1024
+    error_message = "playground_max_upload_bytes must be in [1 MiB, 4 MiB]. The 4 MiB ceiling comes from Lambda's 6 MiB sync invocation payload limit minus base64 inflation (4/3) and multipart envelope overhead — moving to async invocation or a Function URL (10 MiB sync limit) would let this rise."
+  }
+}
+
+variable "playground_upload_timeout_seconds" {
+  description = "Per-request timeout (seconds) for the connector /api/upload outbound call from /playground/upload. Must fit inside the API Gateway integration timeout (30s default) alongside the mint timeout (sum <= 25s; leaves 5s headroom for base64 decode + DynamoDB rate-limit writes + cold-start M2M fetch + transport setup before API GW cuts the integration)."
+  type        = number
+  default     = 15
+
+  validation {
+    # Upper bound 24s: caps the upload-only contribution. The cross-
+    # variable invariant (upload + mint <= 25s) is enforced by a
+    # precondition in playground.tf since validation {} blocks can't
+    # reference other variables. The 25s sum leaves 5s headroom under
+    # API Gateway's 30s integration timeout (the binding constraint —
+    # the Lambda's 60s timeout is an upper bound, not the live budget).
+    condition     = var.playground_upload_timeout_seconds >= 1 && var.playground_upload_timeout_seconds <= 24
+    error_message = "playground_upload_timeout_seconds must be in [1, 24]."
+  }
+}
+
+variable "playground_mint_timeout_seconds" {
+  description = "Per-request timeout (seconds) for the connector /api/mint_link outbound call from /playground/upload. See playground_upload_timeout_seconds for the combined-budget invariant."
+  type        = number
+  default     = 8
+
+  validation {
+    condition     = var.playground_mint_timeout_seconds >= 1 && var.playground_mint_timeout_seconds <= 15
+    error_message = "playground_mint_timeout_seconds must be in [1, 15]."
+  }
+}
+
+# ==============================================================================
 # CI Bypass
 # ==============================================================================
 

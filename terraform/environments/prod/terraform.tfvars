@@ -447,6 +447,10 @@ developer_portal_allowed_origins        = ["https://layerv.ai", "https://www.lay
 developer_portal_custom_domain          = "devapi.layerv.ai"
 developer_portal_hosted_zone_id         = "Z0748438C8EK6UAW94ST" # layerv.ai zone (in layerv-mgmt account)
 
+# /playground/upload connector URL — prod S3 connector (the only one
+# deployed today, also used by sandbox per layervai/nhp#2066).
+developer_portal_connector_base_url = "https://getqurllink.layerv.ai"
+
 # ==============================================================================
 # Auth0 SPA Dashboard Configuration
 # Website dashboard login for developers to manage API keys, usage, and billing

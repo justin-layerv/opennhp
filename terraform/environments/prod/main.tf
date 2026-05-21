@@ -320,6 +320,7 @@ module "nhp" {
   developer_portal_custom_domain          = var.developer_portal_custom_domain
   developer_portal_hosted_zone_id         = var.developer_portal_hosted_zone_id
   developer_portal_ci_bypass_secret_name  = var.developer_portal_ci_bypass_secret_name
+  developer_portal_connector_base_url     = var.developer_portal_connector_base_url
 
   # Billing
   deploy_billing                     = var.deploy_billing

@@ -1606,6 +1606,11 @@ variable "developer_portal_ci_bypass_secret_name" {
   default     = null
 }
 
+variable "developer_portal_connector_base_url" {
+  description = "Base URL of the qURL S3 connector for /playground/upload."
+  type        = string
+}
+
 # ==============================================================================
 # Auth0 SPA Dashboard Configuration
 # ==============================================================================

@@ -2551,6 +2551,13 @@ module "developer_portal" {
 
   # CI bypass key for integration tests
   ci_bypass_secret_name = var.developer_portal_ci_bypass_secret_name
+
+  # File-upload route's connector base URL. Each env must set this
+  # explicitly in its tfvars so sandbox can't silently coalesce onto
+  # the prod S3 connector. No fallback — the module variable has its
+  # own default for unit-testing only; the root insists on an
+  # explicit env-level value.
+  connector_base_url = var.developer_portal_connector_base_url
 }
 
 # ==================== Billing ====================

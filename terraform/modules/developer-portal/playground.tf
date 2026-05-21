@@ -20,14 +20,47 @@ data "archive_file" "playground" {
 resource "aws_lambda_function" "playground" {
   depends_on = [aws_cloudwatch_log_group.playground]
 
+  # Cross-variable invariant — single-variable validation blocks can't
+  # reference other variables. The binding constraint is API Gateway's
+  # 30s integration timeout (see aws_apigatewayv2_integration.playground
+  # in api_gateway.tf), NOT the Lambda's 60s timeout (which is just an
+  # upper bound). Cap the combined outbound budget at 25s, leaving 5s
+  # for base64 decode + DynamoDB rate-limit writes + cold-start M2M
+  # token fetch + transport setup before API GW cuts the integration.
+  lifecycle {
+    precondition {
+      condition     = var.playground_upload_timeout_seconds + var.playground_mint_timeout_seconds <= 25
+      error_message = "playground_upload_timeout_seconds + playground_mint_timeout_seconds must be <= 25 (leaves 5s headroom inside API Gateway's 30s integration timeout for base64 decode + rate-limit writes + cold-start M2M + transport)."
+    }
+  }
+
   filename         = data.archive_file.playground.output_path
   function_name    = "${var.name_prefix}-playground-proxy"
   role             = aws_iam_role.playground.arn
   handler          = "playground_proxy.lambda_handler"
   source_code_hash = data.archive_file.playground.output_base64sha256
   runtime          = "python3.12"
-  timeout          = 30
-  memory_size      = 256
+  # 60s (was 30s) is an upper bound — the binding budget for any
+  # /playground/upload request is API Gateway's 30s integration
+  # timeout (see aws_apigatewayv2_integration.playground). The Lambda
+  # timeout still matters for URL-mode handlers (which share the
+  # function and benefit from CPU scaling with memory at the higher
+  # tier) and as a safety net if a misconfigured deploy lifts the
+  # API GW limit. The /playground/upload path makes two sequential
+  # connector calls (defaults 15s upload + 8s mint = 23s) on top of
+  # base64 decode + rate-limit DynamoDB writes + a possible cold-
+  # start M2M token fetch. The cross-variable precondition below
+  # caps the sum at 25s, leaving 5s headroom under the 30s API GW
+  # gate.
+  timeout = 60
+  # 384 MB (was 256 MB). CPU scales linearly with memory on Lambda, so
+  # the bump is primarily about cold-start latency on the upload path
+  # (base64 decode of a 4 MB body + multipart forwarding to the
+  # connector) — the URL-mode handlers don't need the extra memory but
+  # they share the function. Memory headroom is the secondary reason:
+  # 4 MB binary + ~5.3 MB base64 + Python string overhead during decode
+  # peaks well below 256 MB, so OOM wasn't a real risk at the old size.
+  memory_size = 384
 
   tracing_config {
     mode = "Active"
@@ -44,6 +77,10 @@ resource "aws_lambda_function" "playground" {
         PLAYGROUND_IP_RATE_LIMIT     = tostring(var.playground_ip_rate_limit)
         PLAYGROUND_GLOBAL_RATE_LIMIT = tostring(var.playground_global_rate_limit)
         RATE_WINDOW                  = tostring(var.playground_rate_window)
+        CONNECTOR_BASE_URL           = var.connector_base_url
+        PLAYGROUND_MAX_UPLOAD_BYTES  = tostring(var.playground_max_upload_bytes)
+        PLAYGROUND_UPLOAD_TIMEOUT    = tostring(var.playground_upload_timeout_seconds)
+        PLAYGROUND_MINT_TIMEOUT      = tostring(var.playground_mint_timeout_seconds)
       },
       var.ci_bypass_secret_name != null ? {
         CI_BYPASS_SECRET_NAME = var.ci_bypass_secret_name

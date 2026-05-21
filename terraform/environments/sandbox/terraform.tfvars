@@ -529,6 +529,13 @@ developer_portal_custom_domain          = "devapi.layerv.xyz"
 developer_portal_hosted_zone_id         = "Z10394893FM38A1RXLL32" # layerv.xyz hosted zone
 developer_portal_ci_bypass_secret_name  = "layerv-nhp-sandbox/developer-portal/ci-bypass-key"
 
+# /playground/upload connector URL. Currently points at the SAME
+# connector as prod because no separate sandbox connector is deployed
+# (tracked in layervai/nhp#2066). Setting it explicitly here rather
+# than via a module default so a future sandbox connector stand-up is
+# a one-line tfvars change, not a code change.
+developer_portal_connector_base_url = "https://getqurllink.layerv.ai"
+
 # ==============================================================================
 # Auth0 SPA Dashboard Configuration
 # Website dashboard login for developers to manage API keys, usage, and billing
