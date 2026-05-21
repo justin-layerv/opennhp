@@ -837,19 +837,6 @@ variable "tunnel_auth_enabled" {
   type        = bool
   default     = false
 }
-# ==================== Connector dashboard separation ====================
-
-variable "fileviewer_hostnames" {
-  description = "Hostnames whose resources are owned by a connector and must be hidden from dashboard list/detail responses and webhook events. Threaded to qurl-service as the comma-joined QURL_FILEVIEWER_HOSTNAMES env var. Empty list = filter disabled (default; matches qurl-service's no-op fast path). Each entry must be a bare hostname — no scheme, path, query, or fragment — qurl-service hard-fails startup on malformed entries."
-  type        = list(string)
-  default     = []
-
-  validation {
-    condition     = alltrue([for h in var.fileviewer_hostnames : can(regex("^[a-z0-9][a-z0-9.-]*[a-z0-9]\\.[a-z]{2,}$", h))])
-    error_message = "Every fileviewer_hostnames entry must be a bare FQDN (e.g., fileviewer.layerv.ai) — no scheme, path, port, or whitespace."
-  }
-}
-
 # ==================== QURL agent → nhp-server bootstrap chain (Wave 5) ====================
 
 variable "deploy_qurl_bootstrap_chain" {
@@ -908,8 +895,8 @@ variable "nhp_server_host" {
   type        = string
   default     = ""
 
-  # Bare-hostname shape check, mirroring `fileviewer_hostnames` above.
-  # `module.compute.nlb_dns_name` returns a bare DNS name today (e.g.
+  # Bare-hostname shape check. `module.compute.nlb_dns_name` returns
+  # a bare DNS name today (e.g.
   # `nhp-sandbox-<...>.elb.us-east-1.amazonaws.com`); this fence catches
   # a future producer change that wraps a scheme, path, or port around
   # the value before the agent fails the NHP/UDP handshake at runtime.

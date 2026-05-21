@@ -370,12 +370,6 @@ variable "qurl_additional_allowed_hosts" {
   default = []
 }
 
-variable "qurl_fileviewer_hostnames" {
-  description = "Hostnames whose resources are owned by a connector and must be hidden from the qurl-service dashboard list/detail responses and webhook events. Empty list keeps the filter disabled."
-  type        = list(string)
-  default     = []
-}
-
 variable "qurl_cors_allowed_origins" {
   description = "Comma-separated list of allowed CORS origins for QURL API"
   type        = string

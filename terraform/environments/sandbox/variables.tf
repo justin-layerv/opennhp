@@ -434,12 +434,6 @@ variable "qurl_additional_allowed_hosts" {
   default     = []
 }
 
-variable "qurl_fileviewer_hostnames" {
-  description = "Hostnames whose resources are owned by a connector and must be hidden from the qurl-service dashboard list/detail responses and webhook events. Empty list keeps the filter disabled."
-  type        = list(string)
-  default     = []
-}
-
 # QURL Rate Limiting
 variable "qurl_ip_rate_limit" {
   description = "Rate limit for IP-based internal routes (requests per minute)"

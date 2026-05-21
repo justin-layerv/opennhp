@@ -2204,12 +2204,6 @@ module "qurl_service" {
   # Tunnel auth feature gate (qurl-service PR #277; default false until #405/#396 land)
   tunnel_auth_enabled = var.qurl_tunnel_auth_enabled
 
-  # Connector dashboard separation (qurl-service PR #539). Per-env tfvars
-  # set this to the fileviewer host(s) for the env; empty list keeps the
-  # filter disabled.
-  fileviewer_hostnames = var.qurl_fileviewer_hostnames
-
-
   # Ensure the HMAC secret is seeded before the ECS task pulls it via valueFrom.
   depends_on = [terraform_data.nhp_internal_auth_seed]
 }
