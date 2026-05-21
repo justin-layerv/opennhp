@@ -102,8 +102,12 @@ locals {
 }
 
 resource "aws_wafv2_web_acl" "this" {
-  name        = local.alb_name
-  description = "WAF for ${local.project} ${var.environment} — narrow public bootstrap surface"
+  name = local.alb_name
+  # AWS WAFv2 description regex rejects em-dashes (`—`) and many other
+  # non-ASCII separators: ^[\w+=:#@/\-,\.][\w+=:#@/\-,\.\s]+[\w+=:#@/\-,\.]$.
+  # Keep this string ASCII-only — a `terraform validate` won't catch it
+  # because the regex is enforced at AWS API time.
+  description = "WAF for ${local.project} ${var.environment} - narrow public bootstrap surface"
   scope       = "REGIONAL"
 
   default_action {

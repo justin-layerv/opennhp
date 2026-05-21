@@ -1623,7 +1623,16 @@ resource "aws_iam_policy" "terraform_apply_services" {
         ]
         Resource = [
           "arn:aws:s3:::layerv-nhp-*",
-          "arn:aws:s3:::traefik-plugins-*"
+          "arn:aws:s3:::traefik-plugins-*",
+          # bootstrap-alb access-log + Athena query-results buckets
+          # (`bootstrap-alb-alb-logs-<env>-<account>` and
+          # `bootstrap-alb-athena-<env>-<account>`). Naming-shape
+          # coupling is called out in
+          # `terraform/modules/bootstrap-alb/access_logs.tf` and
+          # `terraform/modules/bootstrap-alb/main.tf::local.project`.
+          # Renaming `local.project` in that module away from
+          # `bootstrap-alb` requires updating this allowlist in lockstep.
+          "arn:aws:s3:::bootstrap-alb-*"
         ]
       },
       {
@@ -2410,4 +2419,22 @@ output "qurl_link_static_policy_arn" {
 output "qurl_link_static_attachment_id" {
   description = "ID of the role-policy attachment for qurl_link_static. Use as a trigger source so an IAM-propagation `time_sleep` orders after the attachment lands at AWS — the implicit dep on the doc/arn outputs only orders against the policy resource, not the attachment that actually feeds the auth evaluator."
   value       = aws_iam_role_policy_attachment.qurl_link_static.id
+}
+
+# Trigger sources for `time_sleep.bootstrap_alb_iam_propagation` —
+# see that resource in `terraform/main.tf` for the rationale. Mirror
+# of the qurl_link_static_* triplet above; same pattern.
+output "terraform_apply_services_policy_doc_hash" {
+  description = "sha256 of the terraform-apply-services CI policy doc; trigger source for IAM-propagation shims when adding bucket-prefix scopes or other resource-shaped grants."
+  value       = sha256(aws_iam_policy.terraform_apply_services.policy)
+}
+
+output "terraform_apply_services_policy_arn" {
+  description = "ARN of the terraform-apply-services CI policy. Catches the rename-via-`name` case in IAM-propagation shim triggers."
+  value       = aws_iam_policy.terraform_apply_services.arn
+}
+
+output "terraform_apply_services_attachment_id" {
+  description = "ID of the role-policy attachment for terraform-apply-services. Forces a `time_sleep` shim to order AFTER the attachment lands at AWS — see qurl_link_static_attachment_id above for the same shape."
+  value       = aws_iam_role_policy_attachment.terraform_apply_services.id
 }

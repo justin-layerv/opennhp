@@ -12,6 +12,27 @@
 # this topic separately. This module does NOT create any chat-platform
 # channel configuration resource.
 
+# Topic-scoped SNS verbs. Shared by `AllowAccountAccess` (account-root
+# admin) and `DenyInsecureTransport` (non-TLS deny) so the two action
+# lists stay mechanically in lockstep — a future contributor adding a
+# verb on one side without the other would otherwise silently leave a
+# hole (admin keeps working without TLS, or vice versa). Account-level
+# verbs (`sns:CreateTopic`, `sns:ListTopics`, platform-app verbs) are
+# out of scope: AWS rejects them in a topic-resource policy with
+# "Policy statement action out of service scope!".
+locals {
+  sns_topic_actions = [
+    "sns:Publish",
+    "sns:Subscribe",
+    "sns:GetTopicAttributes",
+    "sns:SetTopicAttributes",
+    "sns:AddPermission",
+    "sns:RemovePermission",
+    "sns:DeleteTopic",
+    "sns:ListSubscriptionsByTopic",
+  ]
+}
+
 # Centralized SNS topic for all alarms attached to this stack.
 # AWS-managed KMS encryption (`alias/aws/sns`) — alarm payloads carry
 # resource ARNs + threshold values (low sensitivity, baseline-compliance
@@ -84,16 +105,7 @@ data "aws_iam_policy_document" "alerts" {
       identifiers = ["arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"]
     }
 
-    actions = [
-      "sns:Publish",
-      "sns:Subscribe",
-      "sns:GetTopicAttributes",
-      "sns:SetTopicAttributes",
-      "sns:AddPermission",
-      "sns:RemovePermission",
-      "sns:DeleteTopic",
-      "sns:ListSubscriptionsByTopic",
-    ]
+    actions   = local.sns_topic_actions
     resources = [aws_sns_topic.alerts.arn]
   }
 
@@ -146,12 +158,13 @@ data "aws_iam_policy_document" "alerts" {
     }
   }
 
-  # Deny non-TLS API access. Parallel to the deny-non-TLS bucket
+  # Deny non-TLS API access. Parallel intent to the deny-non-TLS bucket
   # policies in `access_logs.tf` — SNS supports HTTPS endpoints
-  # natively, so this statement breaks nothing in practice but
-  # closes the gap for baseline-compliance scanners (AWS Config
-  # `sns-topic-message-delivery-notification-enabled` and similar).
-  # `Action = sns:*` mirrors the bucket-policy shape.
+  # natively, so this statement breaks nothing in practice but closes
+  # the gap for baseline-compliance scanners. `local.sns_topic_actions`
+  # is shared with `AllowAccountAccess` above; the `s3:*` shape in
+  # `access_logs.tf` works there because the SNS rejection of `sns:*`
+  # in topic-resource policies has no S3 analogue.
   statement {
     sid    = "DenyInsecureTransport"
     effect = "Deny"
@@ -161,7 +174,7 @@ data "aws_iam_policy_document" "alerts" {
       identifiers = ["*"]
     }
 
-    actions   = ["sns:*"]
+    actions   = local.sns_topic_actions
     resources = [aws_sns_topic.alerts.arn]
 
     condition {

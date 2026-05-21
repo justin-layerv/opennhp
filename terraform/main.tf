@@ -3946,4 +3946,41 @@ module "bootstrap_alb" {
   # `bootstrap_path`, `target_port`, `health_check_path`, WAF rule list,
   # access-log retention, alarm thresholds — module defaults apply.
   # Override in env tfvars only with explicit evidence.
+
+  # IAM-propagation race: the bootstrap-alb access-log + Athena buckets
+  # are scoped under `arn:aws:s3:::bootstrap-alb-*` in the CI role's
+  # terraform-apply-services policy. On the same apply that adds the
+  # bucket prefix to the policy AND creates the buckets, the IAM auth
+  # evaluator can lag by up to ~60s and CreateBucket hits AccessDenied
+  # (see nhp run 26246889231 — the failure that landed this shim).
+  # `depends_on` orders the WHOLE module after the sleep; module-level
+  # is the cleanest scope because every bucket-creating resource here
+  # racing the perm sits behind it.
+  depends_on = [time_sleep.bootstrap_alb_iam_propagation]
+}
+
+# IAM eventual-consistency shim for the bootstrap-alb consumers of the
+# terraform-apply-services CI policy. Same pattern + rationale as
+# `time_sleep.qurl_link_static_iam_propagation` above (read that block
+# for the trigger-source semantics + the taint/rename + greenfield-CF
+# nuances; this shim mirrors that shape exactly).
+#
+# Gated on `var.deploy_bootstrap_alb` per terraform/CLAUDE.md → "IAM
+# eventual-consistency shim pattern": OR of every consumer's condition.
+# `terraform_apply_services` is a broad CI policy; today the only
+# consumer that races freshly-granted perms in it is this module. A
+# future PR that adds a new perm to this policy AND a same-apply
+# consumer that races it must widen the gate (and add `depends_on`
+# on the new consumer) — the policy_doc_hash trigger re-fires the
+# wait on any perm edit, but only resources gated through here pay it.
+resource "time_sleep" "bootstrap_alb_iam_propagation" {
+  count = var.deploy_bootstrap_alb ? 1 : 0
+
+  triggers = {
+    policy_doc_hash = module.ecr.terraform_apply_services_policy_doc_hash
+    policy_arn      = module.ecr.terraform_apply_services_policy_arn
+    attachment_id   = module.ecr.terraform_apply_services_attachment_id
+  }
+
+  create_duration = "60s"
 }
