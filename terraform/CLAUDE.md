@@ -270,3 +270,31 @@ for this rule.
   switch arm; pair the alarm with an `acConnectionMap` size-churn
   signal for invariant-free visibility (see
   https://github.com/layervai/nhp/issues/1969#issuecomment-4455100642).
+
+## `templatefile()` multi-line vars in bash comments must be escaped
+
+`templatefile()` resolves `${...}` interpolations **before** bash ever
+sees the rendered file — bash-comment syntax does not suppress
+interpolation. When the interpolated value is a multi-line string, the
+TOML/whatever body is injected into the comment block, and lines of
+the body that don't start with `#` get bash-executed when the rendered
+script runs. Past hit: sandbox server fleet broken when
+`${frps_resource_toml_overlay}` was interpolated unescaped in
+`modules/compute/user_data.sh.tpl` bash comments once #2035 made the
+overlay non-empty. Surfaced as nhp run 26194839994 (post-#2043
+sandbox apply); fixed in PR #2044.
+
+Rule: when adding a `${var}` reference inside a bash comment in any
+`*.sh.tpl` rendered via `templatefile()`, **escape with `$$` if the
+var can interpolate to a multi-line string** (`$${var}` — Terraform
+emits the literal token instead of expanding). Single-value scalars
+(ports, hostnames, region names, etc.) don't need escaping — their
+single-line render stays inside the comment.
+
+Enforcement today is per-template: `terraform_data.frps_overlay_comment_escape_fence`
+in `modules/compute/main.tf` refuses apply if the compute template
+regresses. The same fence pattern should be added in `modules/ac/main.tf`
+the first time a multi-line var lands in `modules/ac/user_data.sh.tpl`
+(today's AC interpolations are all single-value primitives, so no
+fence is needed yet). Generalization to a single allowlist-based fence
+across both templates is tracked in #2045.

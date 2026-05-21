@@ -849,7 +849,7 @@ echo "No plugins configured, skipping plugin section of resource.toml"
 # in terraform/resources.tf); the heredoc delimiter is single-quoted
 # (`'OVERLAYEOF'`) so bash leaves the rendered body alone at runtime —
 # defense in depth even though today's content is ASCII-only with no `$`
-# or backticks. Terraform's `${frps_resource_toml_overlay}` is resolved
+# or backticks. Terraform's `$${frps_resource_toml_overlay}` is resolved
 # by `templatefile()` BEFORE bash ever sees the file, so the quoted
 # delimiter doesn't suppress the Terraform interpolation. Uses `cat >>`
 # (append) so the plugin block written above is preserved; when
@@ -857,6 +857,16 @@ echo "No plugins configured, skipping plugin section of resource.toml"
 # a fresh-file write via `>>` on a non-existent path. `touch` + `chmod
 # 644` first to keep the inode permissions deterministic (the plugin
 # branch above leaves the file at the cloud-init default 644).
+#
+# DELIMITER ESCAPE NOTE: the `$$` escape on `$${frps_resource_toml_overlay}`
+# above (and on the heredoc-delimiter comment further down) is load-bearing —
+# the ONLY unescaped interpolation point is the heredoc body below (line
+# ~948); every other mention of this var name MUST be escaped with `$$`.
+# Past hit: nhp run 26194839994 (broken since #2035 made the overlay
+# non-empty, surfaced post-#2043 sandbox apply, fixed in #2044). Enforced
+# at plan time by `terraform_data.frps_overlay_comment_escape_fence` in
+# main.tf; full WHY in terraform/CLAUDE.md §
+# "`templatefile()` multi-line vars in bash comments must be escaped".
 #
 # Idempotency on user_data re-exec is split between the two cases:
 #
@@ -918,11 +928,13 @@ if grep -q "^${frps_overlay_sentinel_prefix}" "$RESOURCE_TOML"; then
 fi
 echo "Appending FRPS bootstrap overlay to resource.toml..."
 # DO NOT unquote the heredoc delimiter. Terraform interpolates
-# ${frps_resource_toml_overlay} BEFORE bash sees the heredoc; the
+# $${frps_resource_toml_overlay} BEFORE bash sees the heredoc; the
 # single-quoted delimiter protects against post-render bash
 # expansion of any `$` or backtick in the rendered TOML (today's
 # values are ASCII-only but a future tfvar containing e.g.
 # `$VAR` would be silently expanded by bash if unquoted).
+# The `$$` escape on the var ref in this comment is required — see
+# the DELIMITER ESCAPE NOTE in the overlay block comment earlier in this file.
 #
 # Delimiter choice: use a long, distinctive token (not just
 # `OVERLAYEOF`) so a future overlay row that happens to render the

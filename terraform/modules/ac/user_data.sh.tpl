@@ -2,6 +2,19 @@
 # NHP AC User Data Script - Standalone AC for customer deployments
 #
 # This template configures a standalone AC that protects customer resources.
+#
+# ESCAPE INVARIANT — when adding a Terraform interpolation reference to
+# a bash comment in this template, escape the leading dollar sign with
+# another dollar sign if the variable can interpolate to a multi-line
+# value. Today every comment interpolation here is a single-value
+# primitive (port numbers, hostnames) so none of them need escaping;
+# the multi-line case is what broke the sandbox server fleet in PR
+# #2044. See terraform/CLAUDE.md § "templatefile() multi-line vars in
+# bash comments must be escaped" for the rule and examples, and
+# terraform_data.frps_overlay_comment_escape_fence in
+# modules/compute/main.tf for the plan-time enforcement pattern to
+# mirror in modules/ac/main.tf the first time a multi-line var lands
+# here.
 set -ex
 
 exec > >(tee /var/log/user-data.log | logger -t user-data) 2>&1

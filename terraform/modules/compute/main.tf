@@ -848,6 +848,42 @@ BOOTSTRAP
   ) : base64gzip(local.user_data) # legacy inline path — only kept as a structural fallback for bucket-not-yet-provisioned bootstrap; fails for the same size reason this PR exists to fix, so it's not a viable runtime rollback. To roll back, revert this PR.
 }
 
+# DO NOT REMOVE — load-bearing plan-time fence. Structurally decoupled
+# from `aws_launch_template.server` (the consumer of this template) so
+# a future cleanup pass might mistake it for unused; it's not. Refuses
+# apply if `${frps_resource_toml_overlay}` appears unescaped inside a
+# bash comment in user_data.sh.tpl. See the DELIMITER ESCAPE NOTE in
+# that file for the WHY (past hit: nhp run 26194839994 — broken since
+# #2035, surfaced post-#2043 apply, fixed in #2044; fleet-wide standby
+# health check failure).
+resource "terraform_data" "frps_overlay_comment_escape_fence" {
+  lifecycle {
+    precondition {
+      # `(^|[[:space:]])#` — comment anchor: either line-start `#` or a `#`
+      # preceded by whitespace (trailing inline comment).
+      # `(?:[^\n]*[^$\n])?` — optional prefix where the LAST char before
+      # `${var}` is non-`$`. The optional `?` lets `#${var}` (no separator)
+      # match; the `[^$\n]` last-char enforces that the var ref isn't
+      # escaped via `$${var}`. `[^\n]*` (not `[^$\n]*`) so `$RESOURCE_TOML`
+      # earlier on the same line doesn't block matching a later
+      # unescaped `${frps_resource_toml_overlay}` ref.
+      #
+      # RENAME WARNING: if `local.frps_resource_toml_overlay` is ever
+      # renamed, update this regex (and the error_message below) to
+      # match the new name — otherwise this fence silently no-ops.
+      condition = length(regexall(
+        "(?m)(^|[[:space:]])#(?:[^\\n]*[^$\\n])?\\$\\{frps_resource_toml_overlay\\}",
+        file("${path.module}/user_data.sh.tpl"),
+      )) == 0
+      # HCL escape note: `$${...}` in source renders as `${...}` in the
+      # plan-time message; `$$$${...}` renders as `$${...}`. So this string
+      # shows operators an unescaped `${var}` (the bug) and the escaped
+      # `$${var}` (the fix), both in plain Terraform-comment syntax.
+      error_message = "user_data.sh.tpl has an unescaped `$${frps_resource_toml_overlay}` Terraform interpolation inside a bash comment. Add a second `$` so the token becomes `$$$${frps_resource_toml_overlay}` and templatefile() emits the literal instead of interpolating the multi-line TOML body into the comment (overlay lines without `#` then bash-execute and kill user_data). Full WHY + past-incident detail: see the DELIMITER ESCAPE NOTE in user_data.sh.tpl."
+    }
+  }
+}
+
 # Server bootstrap script in S3 (mirrors AC module pattern). The rendered
 # user_data sits at the EC2 16KB user_data limit (post-gzip), so we move
 # the bulk to S3 and keep the launch template's user_data as a small
