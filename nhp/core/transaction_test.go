@@ -317,6 +317,35 @@ func TestRemoteTransaction_CloseForTest_Idempotent(t *testing.T) {
 	}
 }
 
+// TestDevice_LocalTransactionCount pins the contract surfaced by
+// graceful-shutdown's awaitTransactionDrain wait loop: the count must
+// reflect Add/Remove events under the same mutex protecting the map,
+// so a polling loop sees zero exactly when the map is empty.
+func TestDevice_LocalTransactionCount(t *testing.T) {
+	d := &Device{localTransactionMap: make(map[uint64]*LocalTransaction)}
+
+	if got := d.LocalTransactionCount(); got != 0 {
+		t.Fatalf("empty map: count = %d, want 0", got)
+	}
+
+	d.localTransactionMutex.Lock()
+	d.localTransactionMap[1] = &LocalTransaction{transactionId: 1}
+	d.localTransactionMap[2] = &LocalTransaction{transactionId: 2}
+	d.localTransactionMutex.Unlock()
+
+	if got := d.LocalTransactionCount(); got != 2 {
+		t.Errorf("after two adds: count = %d, want 2", got)
+	}
+
+	d.localTransactionMutex.Lock()
+	delete(d.localTransactionMap, 1)
+	d.localTransactionMutex.Unlock()
+
+	if got := d.LocalTransactionCount(); got != 1 {
+		t.Errorf("after one delete: count = %d, want 1", got)
+	}
+}
+
 // TestRemoteTransaction_FindAfterRunCleanup verifies the ordering
 // invariant that made the fix correct: once a transaction's Run() has
 // released the RemoteTransactionMutex, Find must return nil. Any caller

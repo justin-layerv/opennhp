@@ -2260,3 +2260,208 @@ func TestRecordServerStartup(t *testing.T) {
 		s.recordServerStartup()
 	})
 }
+
+// TestAwaitTransactionDrain_ImmediateReturnOnEmpty pins the no-wait
+// path: shutdown with zero in-flight transactions returns instantly
+// (no poll iteration, no metric increment).
+func TestAwaitTransactionDrain_ImmediateReturnOnEmpty(t *testing.T) {
+	mp := metrics.NewPublisherForTest(t)
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("NewDevice returned nil")
+	}
+	defer device.Stop()
+	s := &UdpServer{metrics: mp, device: device}
+
+	start := time.Now()
+	s.awaitTransactionDrain(5 * time.Second)
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Errorf("awaitTransactionDrain blocked %v on empty map; expected immediate return", elapsed)
+	}
+	counters, _ := mp.CountersForTest(t)
+	if counters[MetricShutdownTransactionDrainTimeout] != 0 {
+		t.Errorf("MetricShutdownTransactionDrainTimeout = %v, want 0 (empty drain is not a timeout)", counters[MetricShutdownTransactionDrainTimeout])
+	}
+}
+
+// TestAwaitTransactionDrain_WaitsForCountToReachZero pins the
+// drain-then-return path: a transaction outstanding at shutdown time
+// must let the wait block until it's removed, then return cleanly
+// (no metric increment).
+func TestAwaitTransactionDrain_WaitsForCountToReachZero(t *testing.T) {
+	mp := metrics.NewPublisherForTest(t)
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("NewDevice returned nil")
+	}
+	defer device.Stop()
+	s := &UdpServer{metrics: mp, device: device}
+
+	// Seed one transaction directly into the map to simulate an in-flight
+	// knock; bypass AddLocalTransaction so we don't have to spin up the
+	// transaction's goroutine.
+	core.SeedLocalTransactionForTest(device, 42)
+
+	if got := device.LocalTransactionCount(); got != 1 {
+		t.Fatalf("setup: count = %d, want 1", got)
+	}
+
+	// Remove the transaction after a short delay; the drain must wait for it.
+	const removeAfter = 300 * time.Millisecond
+	go func() {
+		time.Sleep(removeAfter)
+		core.RemoveLocalTransactionForTest(device, 42)
+	}()
+
+	start := time.Now()
+	s.awaitTransactionDrain(5 * time.Second)
+	elapsed := time.Since(start)
+	if elapsed < removeAfter {
+		t.Errorf("awaitTransactionDrain returned in %v, expected >= %v (must wait for transaction to clear)", elapsed, removeAfter)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("awaitTransactionDrain blocked %v after transaction cleared; expected return within ~1 poll interval", elapsed)
+	}
+	counters, _ := mp.CountersForTest(t)
+	if counters[MetricShutdownTransactionDrainTimeout] != 0 {
+		t.Errorf("MetricShutdownTransactionDrainTimeout = %v, want 0 (drain reached zero before deadline)", counters[MetricShutdownTransactionDrainTimeout])
+	}
+}
+
+// TestAwaitTransactionDrain_TimeoutFires pins the budget-exhausted
+// path: when a transaction never clears, the wait must give up at
+// the deadline and increment MetricShutdownTransactionDrainTimeout so the
+// shutdown sequence can continue (with the understanding that the
+// outstanding transaction will see closed-connection on its caller).
+func TestAwaitTransactionDrain_TimeoutFires(t *testing.T) {
+	mp := metrics.NewPublisherForTest(t)
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("NewDevice returned nil")
+	}
+	defer device.Stop()
+	s := &UdpServer{metrics: mp, device: device}
+
+	core.SeedLocalTransactionForTest(device, 99)
+	defer core.RemoveLocalTransactionForTest(device, 99)
+
+	const budget = 300 * time.Millisecond
+	start := time.Now()
+	s.awaitTransactionDrain(budget)
+	elapsed := time.Since(start)
+	if elapsed < budget {
+		t.Errorf("awaitTransactionDrain returned in %v, expected >= budget %v", elapsed, budget)
+	}
+	if elapsed > budget+500*time.Millisecond {
+		t.Errorf("awaitTransactionDrain blocked %v, expected close to budget %v", elapsed, budget)
+	}
+	counters, _ := mp.CountersForTest(t)
+	if counters[MetricShutdownTransactionDrainTimeout] != 1 {
+		t.Errorf("MetricShutdownTransactionDrainTimeout = %v, want 1 (transaction never cleared)", counters[MetricShutdownTransactionDrainTimeout])
+	}
+}
+
+// TestAwaitTransactionDrain_NilDevice covers the defensive no-op
+// when device is nil. The Stop() sequence guards against panics on
+// partially-initialized servers; this fences that the drain helper
+// doesn't add a new panic surface.
+func TestAwaitTransactionDrain_NilDevice(t *testing.T) {
+	s := &UdpServer{}
+	s.awaitTransactionDrain(5 * time.Second) // must not panic
+}
+
+// TestAwaitTransactionDrain_MultipleStaggered pins the loop's
+// monotonic-decrement assumption: with N=10 transactions cleared at
+// staggered intervals, the wait must return only after the LAST one
+// is gone — not after the first count change.
+func TestAwaitTransactionDrain_MultipleStaggered(t *testing.T) {
+	mp := metrics.NewPublisherForTest(t)
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("NewDevice returned nil")
+	}
+	defer device.Stop()
+	s := &UdpServer{metrics: mp, device: device}
+
+	const n = 10
+	for i := uint64(1); i <= n; i++ {
+		core.SeedLocalTransactionForTest(device, i)
+	}
+
+	const interval = 50 * time.Millisecond
+	for i := uint64(1); i <= n; i++ {
+		go func(id uint64) {
+			time.Sleep(time.Duration(id) * interval)
+			core.RemoveLocalTransactionForTest(device, id)
+		}(i)
+	}
+
+	start := time.Now()
+	s.awaitTransactionDrain(5 * time.Second)
+	elapsed := time.Since(start)
+	minExpected := time.Duration(n) * interval
+	if elapsed < minExpected {
+		t.Errorf("awaitTransactionDrain returned in %v, expected >= %v (must wait for all %d txs to clear)", elapsed, minExpected, n)
+	}
+	if got := device.LocalTransactionCount(); got != 0 {
+		t.Errorf("count = %d after drain, want 0", got)
+	}
+	counters, _ := mp.CountersForTest(t)
+	if counters[MetricShutdownTransactionDrainTimeout] != 0 {
+		t.Errorf("MetricShutdownTransactionDrainTimeout = %v, want 0 (staggered drain reached zero before deadline)", counters[MetricShutdownTransactionDrainTimeout])
+	}
+}
+
+// TestAwaitTransactionDrain_BudgetSmallerThanPollInterval pins the
+// edge case where the deadline expires before the first time.Sleep
+// returns. The loop's deadline check on iteration entry must still
+// catch this and increment the timeout metric — otherwise a very
+// small budget could spin indefinitely.
+func TestAwaitTransactionDrain_BudgetSmallerThanPollInterval(t *testing.T) {
+	mp := metrics.NewPublisherForTest(t)
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("NewDevice returned nil")
+	}
+	defer device.Stop()
+	s := &UdpServer{metrics: mp, device: device}
+
+	core.SeedLocalTransactionForTest(device, 7)
+	defer core.RemoveLocalTransactionForTest(device, 7)
+
+	// Budget < shutdownTransactionDrainPollInterval (100ms).
+	const budget = 10 * time.Millisecond
+	start := time.Now()
+	s.awaitTransactionDrain(budget)
+	elapsed := time.Since(start)
+	// Bound at 250ms: poll interval is 100ms, so the deadline check on
+	// iteration 2 fires at ~100ms. 250ms leaves margin for CI jitter
+	// while still catching a one-line ordering bug (e.g. deadline check
+	// moved below time.Sleep, which would block at least one poll).
+	if elapsed > 250*time.Millisecond {
+		t.Errorf("awaitTransactionDrain blocked %v with budget=%v; should return within ~1 poll interval", elapsed, budget)
+	}
+	counters, _ := mp.CountersForTest(t)
+	if counters[MetricShutdownTransactionDrainTimeout] != 1 {
+		t.Errorf("MetricShutdownTransactionDrainTimeout = %v, want 1 (sub-poll-interval budget must still register a timeout)", counters[MetricShutdownTransactionDrainTimeout])
+	}
+}
+
+// TestAwaitTransactionDrain_NilMetrics is symmetric with the
+// nil-device guard: when s.metrics is nil, the timeout path must
+// not panic on the IncrCounter call. Covers the partial-init Stop()
+// path where metrics may not have been wired before shutdown.
+func TestAwaitTransactionDrain_NilMetrics(t *testing.T) {
+	device := core.NewDevice(core.NHP_SERVER, testPrivateKey(), nil)
+	if device == nil {
+		t.Fatal("NewDevice returned nil")
+	}
+	defer device.Stop()
+	s := &UdpServer{device: device} // no metrics
+
+	core.SeedLocalTransactionForTest(device, 13)
+	defer core.RemoveLocalTransactionForTest(device, 13)
+
+	// Must not panic on the timeout path's IncrCounter call.
+	s.awaitTransactionDrain(50 * time.Millisecond)
+}

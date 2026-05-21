@@ -50,3 +50,30 @@ func (t *LocalTransaction) CloseForTest() {
 	}
 	t.testCloseOnce.Do(func() { close(t.done) })
 }
+
+// SeedLocalTransactionForTest inserts a placeholder LocalTransaction
+// into the device's local transaction map without spinning up the
+// transaction's Run() goroutine. Used by graceful-shutdown drain
+// tests to simulate "in-flight transaction at shutdown" without
+// requiring a full UDP/AC handshake setup.
+//
+// DO NOT call .Run(), .CloseForTest(), .SendPacket(), or
+// .SendExternalMsg() on the returned map entry — the placeholder has
+// nil done/connData/mad fields and any such call will panic. The
+// only safe operations are LocalTransactionCount() and the matching
+// RemoveLocalTransactionForTest. Use NewLocalTransactionForTest if
+// you need a transaction you can send through.
+func SeedLocalTransactionForTest(d *Device, id uint64) {
+	d.localTransactionMutex.Lock()
+	defer d.localTransactionMutex.Unlock()
+	d.localTransactionMap[id] = &LocalTransaction{transactionId: id}
+}
+
+// RemoveLocalTransactionForTest pairs with SeedLocalTransactionForTest:
+// removes the placeholder so a drain wait can observe the count
+// reaching zero. Idempotent (no-op if id is absent).
+func RemoveLocalTransactionForTest(d *Device, id uint64) {
+	d.localTransactionMutex.Lock()
+	defer d.localTransactionMutex.Unlock()
+	delete(d.localTransactionMap, id)
+}

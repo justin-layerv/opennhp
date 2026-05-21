@@ -927,15 +927,46 @@ func (s *UdpServer) Stop() {
 	// Drain AC connections: send NHP_ARD redirecting ACs to NLB for immediate reconnect.
 	// Must run before close(s.signals.stop) because drain sends via s.sendMsgCh.
 	s.drainACConnections()
-	// Stop forwarder cleanup routine
+	// Stop the cross-server forwarder BEFORE the transaction drain so
+	// no new forwarded knocks can spawn fresh local transactions while
+	// we're waiting for existing ones to clear. forwarder.Stop() only
+	// halts the cleanup routine — it does not drain in-flight forwards
+	// — so it's safe to run pre-drain. listenConn is intentionally left
+	// open through the drain: closing it pre-drain would cause every
+	// in-flight server->AC transaction (waiting for an AC response on
+	// listenConn) to time out at ServerLocalTransactionResponseTimeoutMs
+	// instead of completing normally.
 	if s.forwarder != nil {
 		s.forwarder.Stop()
+	}
+	// Wait for in-flight local transactions (server->AC knocks, etc.) to
+	// complete or time out before closing connection StopSignals. Without
+	// this wait, close(s.signals.stop) below tears down every connection's
+	// StopSignal mid-flight and any active transaction returns
+	// ErrTransactionFailedByClosedConnection — observed as `knock_failed`
+	// on qURL plugin responses during canary rolls.
+	s.awaitTransactionDrain(shutdownTransactionDrainTimeout)
+	// Residual-race check: a UDP packet arriving on listenConn between
+	// the drain's last count=0 observation and close(s.signals.stop)
+	// below can still spawn a fresh local transaction that gets
+	// stranded. The durable fix is the LB-side ASG lifecycle hook
+	// (deregister from NLB before SIGTERM) — tracked as a follow-up.
+	// In the meantime, surface the residual race in logs so it's
+	// triagable when it occurs.
+	if s.device != nil {
+		if residual := s.device.LocalTransactionCount(); residual > 0 {
+			log.Warning("Shutdown: %d local transactions arrived after drain completed (will fail with closed-connection); see ASG-lifecycle-hook follow-up", residual)
+		}
 	}
 	// Stop license rate limiter cleanup goroutine
 	if s.licenseRateLimiter != nil {
 		s.licenseRateLimiter.Stop()
 	}
-	// Flush remaining CloudWatch metrics
+	// Flush remaining CloudWatch metrics. MUST come AFTER
+	// awaitTransactionDrain — the drain calls IncrCounter on the
+	// timeout path, and moving metrics.Stop() above the drain would
+	// turn that counter into a silent no-op and lose the only
+	// observable signal that the budget was exhausted.
 	if s.metrics != nil {
 		s.metrics.Stop()
 	}
@@ -1074,6 +1105,63 @@ func (s *UdpServer) cleanupOwnedAssignments() {
 // encrypt→send pipeline to flush packets onto the wire. NHP_ARD is small
 // (~200 bytes) and the pipeline is non-blocking after enqueueing.
 const drainFlushDelay = 100 * time.Millisecond
+
+// shutdownTransactionDrainTimeout bounds how long Stop() waits for in-flight
+// local transactions to complete before closing connection StopSignals.
+// Sized at ~3× a single ServerLocalTransactionResponseTimeoutMs (4.7s, per
+// nhp/core/constants.go) to cover overlapping in-flight transactions that
+// the qURL plugin's retry loop may have queued back-to-back when shutdown
+// begins. Each individual LocalTransaction self-clears via its own timer
+// branch (nhp/core/transaction.go::LocalTransaction.Run), but multiple
+// queued txs can serialize within this window. If exceeded,
+// MetricShutdownTransactionDrainTimeout fires and outstanding transactions
+// return ErrTransactionFailedByClosedConnection to callers.
+const shutdownTransactionDrainTimeout = 15 * time.Second
+
+// shutdownTransactionDrainPollInterval is the polling cadence inside
+// awaitTransactionDrain. Tight enough that a fast-clearing drain returns
+// quickly; loose enough to avoid a busy loop while waiting on a slow AC.
+const shutdownTransactionDrainPollInterval = 100 * time.Millisecond
+
+// awaitTransactionDrain blocks until either the device reports zero
+// in-flight local transactions or maxWait elapses. Polls every
+// shutdownTransactionDrainPollInterval. Logs and increments
+// MetricShutdownTransactionDrainTimeout if the budget is exhausted with
+// transactions still outstanding — those transactions will see the
+// connection's StopSignal close shortly after this returns and surface
+// ErrTransactionFailedByClosedConnection to their callers.
+func (s *UdpServer) awaitTransactionDrain(maxWait time.Duration) {
+	if s.device == nil {
+		return
+	}
+	start := time.Now()
+	deadline := start.Add(maxWait)
+	initial := s.device.LocalTransactionCount()
+	if initial == 0 {
+		// Info level so a healthy clean-drain leaves a per-shutdown
+		// log line in CloudWatch — without this, the absence of any
+		// drain log can't be distinguished from the drain being
+		// silently skipped due to a future bug.
+		log.Info("Shutdown: no in-flight local transactions to drain")
+		return
+	}
+	log.Info("Shutdown: waiting for %d in-flight local transactions to drain (max %v)", initial, maxWait)
+	for {
+		count := s.device.LocalTransactionCount()
+		if count == 0 {
+			log.Info("Shutdown: transaction drain complete after %v", time.Since(start))
+			return
+		}
+		if time.Now().After(deadline) {
+			log.Warning("Shutdown: transaction drain timed out after %v with %d transactions still in-flight (will fail with closed-connection)", maxWait, count)
+			if s.metrics != nil {
+				s.metrics.IncrCounter(MetricShutdownTransactionDrainTimeout)
+			}
+			return
+		}
+		time.Sleep(shutdownTransactionDrainPollInterval)
+	}
+}
 
 // hostLookup is the default DNS resolver used by buildDrainRedirectTarget.
 // It is a package-level variable so tests can inject a deterministic resolver

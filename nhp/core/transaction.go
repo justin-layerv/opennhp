@@ -214,6 +214,19 @@ func (d *Device) FindLocalTransaction(id uint64) *LocalTransaction {
 	return nil
 }
 
+// LocalTransactionCount returns the number of in-flight local transactions
+// currently awaiting a response or timeout. Used by graceful shutdown to
+// wait for outstanding server->AC (and other locally-initiated) transactions
+// to complete before closing connection StopSignals — without this drain,
+// any in-flight transaction at close time returns
+// ErrTransactionFailedByClosedConnection to its caller (e.g. surfaces as
+// `knock_failed` on the qURL plugin's HTTP response during a canary roll).
+func (d *Device) LocalTransactionCount() int {
+	d.localTransactionMutex.Lock()
+	defer d.localTransactionMutex.Unlock()
+	return len(d.localTransactionMap)
+}
+
 func (t *LocalTransaction) Run() {
 	log.Debug("Local transaction %d start", t.transactionId)
 	defer log.Debug("Local transaction %d quit", t.transactionId)

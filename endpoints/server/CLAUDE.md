@@ -36,3 +36,65 @@ must update this list and audit all existing call sites.
   `device.peerMapMutex`. A future change that takes
   `device.peerMapMutex` and then `agentPeerMapMutex` would deadlock
   against `AddAgentPeer`.
+
+## Graceful Shutdown — Ordering Invariants
+
+`UdpServer.Stop()` runs ~15 cleanup steps in sequence. The six
+listed below are **load-bearing ordering invariants** — re-ordering
+or skipping any of them regresses customer-visible behavior during
+canary deploys. The remaining steps (etcd close, webrtc stop,
+license stop, listener close, device stop, wg.Wait, storage close,
+plugin close) MUST run, but their order relative to one another is
+not currently a correctness invariant. Read `Stop()` end-to-end
+before adding or moving any step.
+
+> **One additional ordering rule:** `metrics.Stop()` must come AFTER
+> `awaitTransactionDrain` (step 5). The drain calls `IncrCounter` on
+> the timeout path; moving `metrics.Stop()` above the drain would
+> turn that counter into a silent no-op. Pinned inline in `Stop()`.
+
+1. **`httpServer.Stop()` first** — closes the HTTP listener (no new
+   requests can land) and `Shutdown(ctx)` waits up to its budget for
+   in-flight HTTP handlers to return. HTTP handlers that trigger
+   NHP knocks finish their retry loop here. Must run before any
+   downstream cleanup so the handler still has a working NHP path.
+2. **`cleanupOwnedAssignments()` + Cloud Map deregister** before the
+   drain — stops peer servers from forwarding new work to this
+   instance before we tell our ACs to leave.
+3. **`drainACConnections()`** before any teardown that would prevent
+   new transactions from being added or completed — sends NHP_ARD to
+   every connected AC redirecting them to NLB, so ACs start
+   reconnecting to surviving servers. Safe to run before step 4
+   because NHP_ARD is not a request-type transaction on the server
+   side (see `nhp/core/transaction.go::IsTransactionRequest`), so the
+   drain itself does not add to the local transaction map.
+4. **`forwarder.Stop()` before the transaction-drain wait** — stops
+   the cross-server forwarder so no new forwarded knocks can spawn
+   fresh local transactions while we're waiting for existing ones to
+   clear. `forwarder.Stop()` only halts the cleanup routine — it does
+   not drain in-flight forwards — so it's safe to run pre-drain.
+   `listenConn` is intentionally **kept open** through step 5; closing
+   it pre-drain would cause every in-flight server→AC transaction
+   (waiting for an AC response on listenConn) to time out at
+   ServerLocalTransactionResponseTimeoutMs instead of completing
+   normally — net worse than the race the drain solves.
+5. **`awaitTransactionDrain(shutdownTransactionDrainTimeout)`** —
+   waits for in-flight local NHP transactions (server→AC knocks,
+   forwarded queries, etc.) to complete or time out. Without this
+   step, the close in step 6 races every in-flight transaction and
+   each one returns `ErrTransactionFailedByClosedConnection` to its
+   caller (observed as `knock_failed` 500s on the qURL plugin during
+   canary rolls). Bounded by `shutdownTransactionDrainTimeout`;
+   `MetricShutdownTransactionDrainTimeout` fires if exhausted.
+6. **`close(s.signals.stop)`** — terminates every per-connection
+   goroutine, which closes each `ConnectionData.StopSignal`. Any
+   transaction still selecting on that signal returns the closed-
+   connection error. Must come **after** step 5 so the drain has
+   already given those transactions a chance to finish cleanly.
+
+A residual race remains: a UDP packet arriving on `listenConn`
+between the drain's last `count == 0` observation and step 6 can
+still spawn a fresh transaction that gets stranded. `Stop()` logs
+a warning if it observes this. The durable fix is at the LB/ASG
+layer (deregister the instance from the NLB target group BEFORE
+SIGTERM reaches the process) — tracked as a separate PR.

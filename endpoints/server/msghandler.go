@@ -82,6 +82,14 @@ const (
 	MetricKnockForwardSkippedDead   = "KnockForwardSkippedDead"
 	MetricKnockForwardFallback      = "KnockForwardFallback"
 	MetricCloudMapDeregisterFailure = "CloudMapDeregisterFailure"
+	// MetricShutdownTransactionDrainTimeout increments when graceful shutdown's
+	// in-flight transaction drain exhausts its budget with non-zero local
+	// transactions still outstanding — those transactions will return
+	// ErrTransactionFailedByClosedConnection to their callers after
+	// close(s.signals.stop). Non-zero in normal operation means the
+	// shutdownTransactionDrainTimeout budget is too tight or the AC is
+	// hung; expect zero in healthy deploys.
+	MetricShutdownTransactionDrainTimeout = "ShutdownTransactionDrainTimeout"
 	// MetricCloudMapRegisterFailure fires once per process when boot-time
 	// Cloud Map registration exhausts its retry budget. Page-worthy if
 	// non-zero in burn-in: the server is running but invisible to the
