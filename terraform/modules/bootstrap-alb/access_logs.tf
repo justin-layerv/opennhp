@@ -42,8 +42,15 @@ locals {
   # `<name>-<env>-alb-logs-<account>`), a future constrained CI role
   # would 403 every mutation because the IAM pattern's literal
   # `-alb-logs-` segment moves position.
-  alb_access_logs_bucket_name      = "${local.project}-alb-logs-${var.environment}-${data.aws_caller_identity.current.account_id}"
-  athena_query_results_bucket_name = "${local.project}-athena-${var.environment}-${data.aws_caller_identity.current.account_id}"
+  #
+  # `var.account_id` (not `data.aws_caller_identity.current.account_id`)
+  # is deliberate — see `variables.tf::account_id` for the cascade
+  # this avoids. tl;dr: the in-module data source defers to apply when
+  # the module's caller-side `depends_on = [time_sleep…]` has a pending
+  # change, which promotes the bucket name to `(known after apply)` and
+  # collides with this resource's `lifecycle.prevent_destroy`.
+  alb_access_logs_bucket_name      = "${local.project}-alb-logs-${var.environment}-${var.account_id}"
+  athena_query_results_bucket_name = "${local.project}-athena-${var.environment}-${var.account_id}"
 }
 
 resource "aws_s3_bucket" "alb_access_logs" {

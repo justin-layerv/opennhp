@@ -15,6 +15,17 @@ variable "environment" {
   }
 }
 
+variable "account_id" {
+  description = "AWS account ID for this env. Used ONLY where the value lands in a resource's identity attribute (today: `aws_s3_bucket.{alb_access_logs,athena_query_results}.bucket` names via the `<project>-<role>-<env>-<account>` shape). Passed in from root rather than read from the in-module `data.aws_caller_identity.current` because the module's call site carries `depends_on = [time_sleep.bootstrap_alb_iam_propagation]` (root `terraform/main.tf`) — module-level depends_on propagates pending-change status to every in-module data source, deferring `account_id` to apply, which in turn promotes the bucket-name attribute to `(known after apply)` and forces replacement of buckets fenced by `lifecycle.prevent_destroy`. Evidence: nhp run 26258687592 (the post-#2072 main apply that tripped this on the partial-create state). Non-identity references (IAM policy doc ARNs, `aws:SourceAccount` conditions) keep using the in-module `data.aws_caller_identity.current` — those land in `policy = jsonencode(...)` and update in-place, where the deferred read is harmless."
+  type        = string
+
+  validation {
+    # 12-digit AWS account ID. Catches garbage like a trailing space or a literal `default` at plan rather than surfacing as a malformed-ARN mid-apply.
+    condition     = can(regex("^[0-9]{12}$", var.account_id))
+    error_message = "account_id must be a 12-digit AWS account ID."
+  }
+}
+
 # ── Networking inputs (passed from nhp root) ──
 #
 # Networking is passed in directly from nhp's root

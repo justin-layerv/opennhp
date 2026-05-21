@@ -3907,6 +3907,19 @@ module "bootstrap_alb" {
 
   environment = var.environment
 
+  # Passed in (not read from the in-module `data.aws_caller_identity`)
+  # because the `depends_on = [time_sleep.bootstrap_alb_iam_propagation]`
+  # at the bottom of this block propagates pending-change status to
+  # every in-module data source. The bucket-name locals in
+  # `modules/bootstrap-alb/access_logs.tf` need a plan-time-known
+  # `account_id` so the existing buckets (carrying
+  # `lifecycle.prevent_destroy`) don't get marked
+  # `# forces replacement` whenever the policy-doc hash changes and
+  # the shim has to re-fire. See run 26258687592 for the trip-evidence
+  # and `modules/bootstrap-alb/variables.tf::account_id` for the full
+  # writeup.
+  account_id = data.aws_caller_identity.current.account_id
+
   # Networking — direct refs since this is intra-repo.
   vpc_id            = module.networking.vpc_id
   public_subnet_ids = module.networking.public_subnet_ids
