@@ -101,30 +101,6 @@ func TestQurlRouterAuthzGate_SilentDropsUnauthenticatedRequests(t *testing.T) {
 		t.Skipf("enable_qurl_site_authz disabled in env %q (see qurlSiteAuthzOptOutEnvs)", testConfig.Environment)
 	}
 
-	// Skipped pending traefik-plugins #156 (gate-ordering swap).
-	//
-	// The deployed qurl-router plugin runs authz AFTER resolveTarget
-	// — so a synthetic resource ID (`r_smokeprobe1`) hits the
-	// "Resource not found" 404 branch before the gate fires. The
-	// silentDrop assertion below is correct as written: the gate's
-	// intended behavior is that unauthenticated *.qurl.site requests
-	// terminate with no HTTP response REGARDLESS of whether the
-	// resource exists, otherwise the 404-vs-silentDrop distinction
-	// is an enumeration oracle. But the plugin's own comment
-	// dismisses the swap as "not a correctness concern" (treating
-	// it as a probe-load optimization), so the test cannot hold
-	// against the current consumer build.
-	//
-	// Unskip once traefik-plugins #156 lands AND its tarball is the
-	// "latest" in s3://traefik-plugins-deploy-<acct>/traefik-plugins/
-	// AND the AC ASG has been refreshed since the upload. Verify by
-	// curling `r_smokeprobe1.<QURLSiteDomain>/` from an unauthenticated
-	// client and observing wrapped io.EOF (silentDrop), not HTTP 404
-	// "Resource not found". Delete this t.Skip line and the comment
-	// block above it at that point — the assertion below is already
-	// the right shape.
-	t.Skip("tracking traefik-plugins #156: plugin must silentDrop unauthenticated *.qurl.site requests regardless of resource existence; currently leaks via 404")
-
 	// Synthetic resource ID. r_smokeprobe1 is the known-synthetic
 	// identifier this repo uses for "absolutely not a real
 	// resource" probes; ssm_probe.go's cmdCurlInternalQurlAPIFmt
