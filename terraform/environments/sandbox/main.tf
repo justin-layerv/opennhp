@@ -84,6 +84,7 @@ module "nhp" {
   deploy_qurl_service             = var.deploy_qurl_service
   deploy_qurl_bootstrap_chain     = var.deploy_qurl_bootstrap_chain
   enable_qurl_agent_bootstrap     = var.enable_qurl_agent_bootstrap
+  qurl_tunnel_auth_enabled        = var.qurl_tunnel_auth_enabled
   qurl_service_domain             = var.qurl_service_domain
   qurl_hosted_zone_id             = var.qurl_hosted_zone_id
   qurl_jwt_secret_arn             = var.qurl_jwt_secret_arn
@@ -145,6 +146,19 @@ module "nhp" {
   frps_min_size         = var.frps_min_size
   frps_max_size         = var.frps_max_size
   frps_desired_capacity = var.frps_desired_capacity
+
+  # Bootstrap ALB (`bootstrap.layerv.{xyz,ai}`). See variables.tf §Bootstrap ALB
+  # for rationale + the Step 0a cold-start fence (modules/bootstrap-alb/README.md).
+  deploy_bootstrap_alb                        = var.deploy_bootstrap_alb
+  bootstrap_alb_dns_name                      = var.bootstrap_alb_dns_name
+  bootstrap_alb_route53_zone_id               = var.bootstrap_alb_route53_zone_id
+  bootstrap_alb_manage_dns_alias              = var.bootstrap_alb_manage_dns_alias
+  bootstrap_alb_provision_certificate         = var.bootstrap_alb_provision_certificate
+  bootstrap_alb_existing_certificate_arn      = var.bootstrap_alb_existing_certificate_arn
+  bootstrap_alb_waf_count_only_rule_groups    = var.bootstrap_alb_waf_count_only_rule_groups
+  bootstrap_alb_cross_account_subscriber_arns = var.bootstrap_alb_cross_account_subscriber_arns
+  bootstrap_alb_alarm_email_subscriptions     = var.bootstrap_alb_alarm_email_subscriptions
+  bootstrap_alb_elb_5xx_threshold_per_minute  = var.bootstrap_alb_elb_5xx_threshold_per_minute
 
   # qurl-reverse-tunnel-server per-AZ Cloud Map fanout (#1745):
   # blue/green, canary, and MULTIVALUE-flip variables.

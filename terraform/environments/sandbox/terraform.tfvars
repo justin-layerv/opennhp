@@ -591,6 +591,14 @@ deploy_e2e_echo_server = true
 # (`bootstrap.layerv.ai`) is cross-account and tracked separately
 # (SLACK_QURL_ROLLOUT.md §5b — needs Justin's `layerv-mgmt` consent).
 #
+# **FIRST APPLY: run Step 0a targeted apply first** — Path 2 (module-
+# provisioned cert + alias) trips the `aws_route53_record.cert_validation`
+# `for_each` cold-start fence on the first plan. The operator must run
+# `terraform apply -target='module.nhp.module.bootstrap_alb[0].aws_acm_certificate.this[0]'`
+# locally before merging the PR that flips `deploy_bootstrap_alb=true`.
+# See modules/bootstrap-alb/README.md §Step 0a. Subsequent CI applies
+# are clean once the cert is in state.
+#
 # `bootstrap_alb_cross_account_subscriber_arns` is deliberately omitted (empty
 # default) for this first flip. Per the var description: populating it now
 # would page alerts-infra during the dark-launch window between this PR and
