@@ -15,8 +15,9 @@
 #
 # Operator runbooks live in `README.md` — Path 1 (prod, cross-account)
 # is "Step 0 — cross-account cert + DNS"; Path 2 (sandbox, same-
-# account) is "Step 0a" for the `for_each` cold-start fence on the
-# first per-env flip. Don't duplicate them here — the README is the
+# account) is now fully CI-driven (no operator pre-seed; the historical
+# §Step 0a is preserved as DEPRECATED in the README for state-rm'd
+# recovery context only). Don't duplicate them here — the README is the
 # canonical source; this file is the resource declarations.
 
 # Resolve the supplied zone ID to its actual zone name so we can
@@ -117,6 +118,15 @@ resource "aws_acm_certificate" "this" {
       condition     = var.dns_name == trimsuffix(data.aws_route53_zone.selected[0].name, ".") || endswith(var.dns_name, ".${trimsuffix(data.aws_route53_zone.selected[0].name, ".")}")
       error_message = "var.dns_name must be the apex of, or a subdomain of, the zone resolved from var.route53_zone_id. Got dns_name=`${var.dns_name}` but zone=`${trimsuffix(data.aws_route53_zone.selected[0].name, ".")}`."
     }
+
+    # Fences `local.cert_dvo`'s `[0]` index against a future SAN
+    # addition: with multiple DVOs the `[0]` would silently pick one
+    # and miss the others. Postcondition (not precondition) because
+    # `domain_validation_options` is computed.
+    postcondition {
+      condition     = length(self.domain_validation_options) == 1
+      error_message = "cert has ${length(self.domain_validation_options)} domain_validation_options; cert_dns.tf assumes exactly 1. If SANs were added, update `local.cert_dvo` to a `dvo.domain_name`-keyed lookup and expand the `aws_route53_record.cert_validation` for_each set source."
+    }
   }
 
   # Cert tags use the bare `local.tags` map (Project + Environment),
@@ -133,38 +143,37 @@ resource "aws_acm_certificate" "this" {
 }
 
 # Lay down the DNS-validation CNAMEs in the same hosted zone the alias
-# record uses. `domain_validation_options` is keyed on the validation
-# record name (NOT the domain name) because `*.example.com` and
-# `example.com` both produce a `_validation.example.com` CNAME — keying
-# on `dvo.domain_name` would key-collide. SAN-safe by construction.
+# record uses.
 #
-# The for_each ranges over `aws_acm_certificate.this[*]` (a splat over
-# the count-gated cert) rather than guarding `[0]` behind
-# `var.provision_certificate`. Conditional-expression branch lazy-eval
-# is documented Terraform behavior, but a `[0]` index against a
-# count-0 tuple has surfaced as `Invalid index` at plan time in
-# practice (provider/core interaction bugs over the years). The splat
-# form makes the for_each natively collapse to `{}` when the cert
-# resource is count-0 — same end state, no conditional, no [0].
+# `for_each` keys on the static `var.dns_name` (plan-time known) rather
+# than `dvo.resource_record_name` (apply-time). The apply-time form is
+# what historically required an operator-laptop targeted apply on first
+# flip — static keying eliminates that fence; CI's auto-approve plan
+# succeeds on greenfield. for_each (not count) so a future multi-domain
+# SAN expansion can flip the set source to `toset([var.dns_name, var.san1, ...])`
+# without rewriting resource identity in state via `moved {}` blocks.
+# Apex+wildcard SAN is NOT covered by this shape — both produce the
+# same `_<token>.example.com` CNAME and the token is apply-time; that
+# case needs a different shape.
+locals {
+  # `[0]` is safe because the postcondition above fences DVO cardinality.
+  # The ternary gate avoids `[0]` against a count-0 tuple on the
+  # `provision_certificate=false` path.
+  cert_dvo = var.provision_certificate ? tolist(aws_acm_certificate.this[0].domain_validation_options)[0] : null
+}
+
 resource "aws_route53_record" "cert_validation" {
-  for_each = {
-    for dvo in flatten([for c in aws_acm_certificate.this : c.domain_validation_options]) :
-    dvo.resource_record_name => {
-      name   = dvo.resource_record_name
-      record = dvo.resource_record_value
-      type   = dvo.resource_record_type
-    }
-  }
+  for_each = var.provision_certificate ? toset([var.dns_name]) : toset([])
 
   zone_id = var.route53_zone_id
-  name    = each.value.name
-  type    = each.value.type
+  name    = local.cert_dvo.resource_record_name
+  type    = local.cert_dvo.resource_record_type
   # 300s minimum is the AWS-recommended TTL for ACM validation
   # CNAMEs. Lower TTLs add Route53 query cost in steady state
   # without measurable validation benefit — the validation poll
   # is on the order of minutes, not seconds.
   ttl     = 300
-  records = [each.value.record]
+  records = [local.cert_dvo.resource_record_value]
 
   # `allow_overwrite = true`: these `_validation.<domain>` CNAMEs are
   # Terraform-written but ACM-read; the values are derived from ACM's

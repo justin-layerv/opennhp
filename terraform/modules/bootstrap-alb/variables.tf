@@ -89,7 +89,7 @@ variable "manage_dns_alias" {
 }
 
 variable "provision_certificate" {
-  description = "Whether this stack provisions+validates an ACM cert for `dns_name`. True only when the parent zone is in the same account as this ALB (DNS validation needs to write CNAMEs into that zone). Sandbox: true (same-account `layerv.xyz`). Prod: false (cross-account `layerv.ai`; the operator pre-provisions the cert and supplies the ARN via `existing_certificate_arn`). See README Step 0a for the cold-start `terraform apply -target` step required on the first flip per env."
+  description = "Whether this stack provisions+validates an ACM cert for `dns_name`. True only when the parent zone is in the same account as this ALB (DNS validation needs to write CNAMEs into that zone). Sandbox: true (same-account `layerv.xyz`). Prod: false (cross-account `layerv.ai`; the operator pre-provisions the cert and supplies the ARN via `existing_certificate_arn`)."
   type        = bool
   default     = false
 }
@@ -316,6 +316,9 @@ variable "alb_5xx_threshold_per_minute" {
   type        = number
   default     = 5
 
+  # See rationale on `alb_elb_5xx_threshold_per_minute`.
+  nullable = false
+
   validation {
     condition     = var.alb_5xx_threshold_per_minute >= 1
     error_message = "alb_5xx_threshold_per_minute must be ≥1. Threshold 0 with GreaterThanThreshold means 'fire on any single 5xx' — almost certainly not what you want."
@@ -326,6 +329,12 @@ variable "alb_elb_5xx_threshold_per_minute" {
   description = "ALB-side (load-balancer-emitted) 5xx alarm threshold (count per minute, evaluated over 5 minutes). ALB-side 5xx is more diagnostic than target-side (no healthy targets, listener-rule misconfig, ALB throttling). **Default `10` is dark-launch-friendly**: between this stack's first apply and the paired qurl-service ECS-attach PR, the listener returns 503 on every `/v1/agent/bootstrap` probe (TG has no healthy targets — expected state). At 10/min the alarm tolerates moderate scanner / sidecar-early-bootstrap noise during the window without flipping into ALARM. Once the data plane is attached and the surface is live, env tfvars SHOULD override down to `1` — at that point any ALB-side 5xx is the outage signal. See README's 'Step 3 — verify dark-launch posture / Alarm noise during dark-launch' section."
   type        = number
   default     = 10
+
+  # `nullable = false` coerces a caller `null` to this default. The
+  # raw-null path fails the validation below with "argument must not
+  # be null"; keeping the module as single-source-of-truth requires
+  # this coercion, since the caller defaults the passthrough to null.
+  nullable = false
 
   validation {
     condition     = var.alb_elb_5xx_threshold_per_minute >= 1
@@ -338,6 +347,9 @@ variable "alb_unhealthy_hosts_threshold" {
   type        = number
   default     = 0
 
+  # See rationale on `alb_elb_5xx_threshold_per_minute`.
+  nullable = false
+
   validation {
     condition     = var.alb_unhealthy_hosts_threshold >= 0
     error_message = "alb_unhealthy_hosts_threshold must be ≥0."
@@ -348,6 +360,9 @@ variable "alb_tls_handshake_failure_threshold" {
   description = "Per-period threshold for the TLS-handshake-failure alarm (count per minute, evaluated over 5 minutes). Sustained TLS failures signal cert misconfiguration, an in-flight cert rotation that didn't propagate, or an attacker probing for downgrade. Default 10/min filters benign client-version-mismatch noise while catching a real misconfiguration. The ALB metric is `ClientTLSNegotiationErrorCount`; a 0 threshold would fire on every legacy TLS-1.0 client probe. **Tuning note for low-QPS surface**: the bootstrap surface is described as 'sidecars bootstrap once per restart' (likely ~50 req/min steady state). At that volume, 10/min represents a 20% handshake-failure rate, which may be a higher noise floor than this surface warrants. Once the data plane is attached and a real-traffic baseline is observable, consider tuning down to 5/min in env tfvars."
   type        = number
   default     = 10
+
+  # See rationale on `alb_elb_5xx_threshold_per_minute`.
+  nullable = false
 
   validation {
     condition     = var.alb_tls_handshake_failure_threshold >= 1

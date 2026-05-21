@@ -148,7 +148,7 @@ module "nhp" {
   frps_desired_capacity = var.frps_desired_capacity
 
   # Bootstrap ALB (`bootstrap.layerv.{xyz,ai}`). See variables.tf §Bootstrap ALB
-  # for rationale + the Step 0a cold-start fence (modules/bootstrap-alb/README.md).
+  # for rationale; per-env runbook in modules/bootstrap-alb/README.md.
   deploy_bootstrap_alb                        = var.deploy_bootstrap_alb
   bootstrap_alb_dns_name                      = var.bootstrap_alb_dns_name
   bootstrap_alb_route53_zone_id               = var.bootstrap_alb_route53_zone_id

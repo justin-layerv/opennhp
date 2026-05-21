@@ -3763,11 +3763,11 @@ resource "aws_route53_record" "qurl_fileviewer" {
 # Default off (`deploy_bootstrap_alb = false`). Enable per-env in
 # `terraform/environments/{sandbox,prod}/terraform.tfvars` once the
 # cert is wired (sandbox: same-account `layerv.xyz` → module-
-# provisioned via `provision_certificate=true` + the Step 0a
-# operator targeted-apply for cold-start; prod: cross-account
-# `layerv.ai` in `layerv-mgmt` → operator pre-provisions + supplies
-# `existing_certificate_arn`) and qurl-service ECS is ready to land
-# the `load_balancer` block paired with this stack's target group.
+# provisioned via `provision_certificate=true`, CI-clean on first
+# apply; prod: cross-account `layerv.ai` in `layerv-mgmt` →
+# operator pre-provisions + supplies `existing_certificate_arn`)
+# and qurl-service ECS is ready to land the `load_balancer` block
+# paired with this stack's target group.
 
 # Catches the common foot-gun on the first per-env flip:
 # `deploy_bootstrap_alb=true` but the operator forgot to wire one of
@@ -3931,11 +3931,9 @@ module "bootstrap_alb" {
   # defaults to `null` so the module's own default (10, dark-launch-
   # friendly) is the source of truth. Env tfvars override to `1`
   # once the data plane is attached and the surface is live (any
-  # ALB-side 5xx is the outage signal at that point). Terraform
-  # 1.3+ treats a `null` module-arg as "use the module's own
-  # default" (no need to gate with a ternary); root pins to
-  # `~> 1.14` and the module declares `>= 1.5` in `versions.tf`,
-  # both well above the 1.3 floor.
+  # ALB-side 5xx is the outage signal at that point). The null→default
+  # coercion relies on `nullable = false` on the module-side var; if
+  # that's ever removed, switch this passthrough to `coalesce(...)`.
   alb_elb_5xx_threshold_per_minute = var.bootstrap_alb_elb_5xx_threshold_per_minute
 
   # `bootstrap_path`, `target_port`, `health_check_path`, WAF rule list,

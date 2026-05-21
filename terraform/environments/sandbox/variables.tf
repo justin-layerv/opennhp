@@ -1856,7 +1856,7 @@ variable "bootstrap_alb_manage_dns_alias" {
 }
 
 variable "bootstrap_alb_provision_certificate" {
-  description = "Whether the bootstrap-alb stack provisions+validates an ACM cert. True only when the parent zone is in the same account as the ALB (DNS validation needs to write CNAMEs there). Sandbox: true (same-account `layerv.xyz`). Prod: false (cross-account `layerv.ai`; operator pre-provisions the cert and supplies the ARN via `bootstrap_alb_existing_certificate_arn`). First flip per env requires the README Step 0a `terraform apply -target` cold-start step."
+  description = "Whether the bootstrap-alb stack provisions+validates an ACM cert. True only when the parent zone is in the same account as the ALB (DNS validation needs to write CNAMEs there). Sandbox: true (same-account `layerv.xyz`). Prod: false (cross-account `layerv.ai`; operator pre-provisions the cert and supplies the ARN via `bootstrap_alb_existing_certificate_arn`)."
   type        = bool
   default     = false
 }

@@ -57,6 +57,6 @@ output "alerts_topic_arn" {
 }
 
 output "certificate_arn" {
-  description = "ACM cert ARN attached to the HTTPS listener (provisioned in-stack when `provision_certificate=true`, else `existing_certificate_arn`). Non-empty after a successful module apply: the listener's lifecycle.precondition rejects the misconfigured combo (provision_certificate=false + empty existing_certificate_arn) before the listener resource lands. Note: in a greenfield `provision_certificate=true` env that hasn't yet completed the targeted-apply step (see README's Step 0a), this value reads as `null` at refresh — the precondition fires once the listener enters the plan, but the output itself can render null on a partial-apply state."
+  description = "ACM cert ARN attached to the HTTPS listener (provisioned in-stack when `provision_certificate=true`, else `existing_certificate_arn`). Non-empty after a successful module apply: the listener's lifecycle.precondition rejects the misconfigured combo (provision_certificate=false + empty existing_certificate_arn) before the listener resource lands."
   value       = local.effective_certificate_arn
 }

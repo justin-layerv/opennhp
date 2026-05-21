@@ -86,14 +86,27 @@ Two paths, one per env:
 - **Path 2 — same-account zone (sandbox, `layerv.xyz`)**: module
   provisions cert + validation CNAMEs + A-alias itself via
   `provision_certificate=true` + `manage_dns_alias=true`. The first
-  per-env flip hits the `for_each` cold-start fence in **Step 0a**
-  and the operator must run a targeted apply once before the gated
-  tfvars merge to CI; subsequent applies are clean.
+  apply is now CI-clean — `aws_route53_record.cert_validation`'s
+  `for_each` keys on the static `var.dns_name` rather than ACM's
+  apply-time `domain_validation_options`, so no operator pre-seed
+  step is required. (Step 0a below is preserved for archival
+  reference and marked DEPRECATED — see #2061's "Alternative"
+  for the architectural rationale.)
+
+> **`bootstrap_alb_dns_name` is a plan-level break, not an in-place
+> update.** The cert's `domain_name`, the validation record's
+> for_each key, and the alias record's `name` all derive from
+> `var.dns_name`. Renaming the bootstrap surface (e.g.,
+> `bootstrap.layerv.xyz` → `bootstrap2.layerv.xyz`) plans as forced
+> replacement on every dns-keyed resource — the chain stays clean
+> thanks to `create_before_destroy` + `allow_overwrite=true` on the
+> validation record + ACM's poll-until-validated semantics, but
+> operators should be aware that "rename in tfvars" is not free.
 
 Steps below are numbered for sandbox (Path 2 today). Prod will follow
-Path 1; the same step numbers apply but the operator skips Step 0a
-and the CI-merge step lands `existing_certificate_arn` instead of
-flipping `provision_certificate=true`.
+Path 1; the same step numbers apply but the CI-merge step lands
+`existing_certificate_arn` instead of flipping
+`provision_certificate=true`.
 
 **Convention:** the shell snippets below use these placeholder vars
 which the operator should `export` at the start of a session and
@@ -120,9 +133,9 @@ region.
 > **Path 1 only.** Sandbox runs Path 2 (same-account zone, module-
 > managed cert + alias) and skips this entire step — the module
 > provisions the cert via `provision_certificate=true` and the
-> Step 0a targeted-apply handles the cold-start fence. Prod *will*
-> run Path 1 (cross-account zone in `layerv-mgmt`) when it flips on
-> (tracked in `SLACK_QURL_ROLLOUT.md` §5b); until then prod stays
+> first apply is CI-clean. Prod *will* run Path 1 (cross-account
+> zone in `layerv-mgmt`) when it flips on (tracked in
+> `SLACK_QURL_ROLLOUT.md` §5b); until then prod stays
 > `deploy_bootstrap_alb=false` and this step is dormant there.
 
 Run from the AWS profile pointing at nhp's environment account
@@ -172,7 +185,25 @@ AWS_PROFILE=<NHP_PROFILE> aws acm describe-certificate \
 #         bootstrap_alb_existing_certificate_arn = "<ARN-from-step-1>"
 ```
 
-### Step 0a — ⚠️ DO NOT FLIP `provision_certificate = true` VIA CI ⚠️
+### Step 0a — DEPRECATED (cold-start fence removed)
+
+> **As of the fix to `cert_dns.tf` that keys `aws_route53_record.cert_validation`
+> on the static `var.dns_name`, this step is no longer required.** Path 2 first
+> apply now runs cleanly under CI's auto-approve flow. The historical text
+> below is preserved verbatim for archival context and for envs that may have
+> been state-rm'd back to a pre-fix snapshot. Don't run a targeted apply by
+> default — let CI handle it.
+>
+> **Off-CI laptop state from prior mitigation attempts:** if you previously
+> applied this step locally (state contains `aws_route53_record.cert_validation["_<token>.<domain>"]`
+> rather than `["<var.dns_name>"]`), the next CI apply will destroy+create the
+> validation CNAME. Benign — `allow_overwrite=true` + `create_before_destroy=true`
+> + ACM's poll-until-validated semantics keep the cert in ISSUED through the swap.
+> Run `terraform state list | grep cert_validation` against the relevant backend
+> if unsure.
+
+<details>
+<summary>Historical body (DEPRECATED — collapsed by default; expand only for state-rm'd recovery context)</summary>
 
 **Sandbox runs Path 2 (same-account zone) and is the only env that
 hits this fence today — prod stays `deploy_bootstrap_alb=false` for
@@ -254,6 +285,8 @@ flips on, and sandbox's pre-flip posture) doesn't hit this because
 `aws_acm_certificate.this` is count-0 and the splat collapses
 naturally to an empty for_each — Path 1 envs skip this step entirely.
 
+</details>
+
 ### Step 1 — terraform apply
 
 Apply happens via nhp's CI release flow against the nhp root, NOT a
@@ -262,30 +295,6 @@ land, the next `promote-to-prod.yml` / `build-and-push.yml` run picks
 up `deploy_bootstrap_alb = true` and `module.bootstrap_alb[0]` enters
 the plan. There is no per-module state — the module shares nhp's
 root state.
-
-**Step 0a → Step 1 tight-window recovery (Path 2 only).** Between the
-operator's targeted-apply landing on the branch and the gate-on tfvars
-merging to `main`, sandbox state contains `module.bootstrap_alb[0].*`
-but `main`'s tfvars still has `deploy_bootstrap_alb=false`. Any
-unrelated push to `main` in that window triggers `build-and-push.yml`,
-which plans `count=0` and tries to destroy the freshly-applied
-resources. The `prevent_destroy=true` on `aws_s3_bucket.alb_access_logs`
-fails the plan loudly (`Instance cannot be destroyed`) rather than
-tearing anything down. **Recovery: don't `terraform state rm` the
-bucket — just merge this PR.** Once `main` has `deploy_bootstrap_alb
-=true`, the next CI plan converges and the previously-red unrelated
-push re-runs green.
-
-Symmetrical case: if an unrelated push to `main` lands *during* the
-operator's targeted apply (not after), the second invocation grabs
-the DynamoDB state lock first and the operator's apply errors out
-with a lock-contention message. Correct behavior — retry after the
-unrelated apply finishes; **do not `-lock=false`** to bypass. The
-state lock is what keeps the targeted-apply atomic vs whatever the
-unrelated push is doing; bypassing it converts a fail-fast lock-
-contention into a silent state corruption. The `#deploys` heads-up
-in the PR description's merge protocol exists primarily to prevent
-this race.
 
 ### Step 2 — A-alias write (operator, after first apply)
 

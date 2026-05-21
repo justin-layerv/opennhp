@@ -86,13 +86,9 @@ locals {
   # existing_certificate_arn (cross-account prod, where the cert lives
   # outside this state).
   #
-  # Belt-and-suspenders shape: uses `one(<splat>)` rather than `[0]`
-  # for the same reason the `aws_route53_record.cert_validation`
-  # for_each uses a flatten-over-splat (see `cert_dns.tf` for the
-  # full rationale on count-0-tuple lazy-eval edge cases). When
-  # `provision_certificate=false`, `one([])` returns `null` and the
-  # ternary's true-branch is never evaluated anyway — but the splat
-  # shape removes the historical `[0]`-against-count-0 plan-time
-  # landmine class entirely.
+  # `one(<splat>)` rather than `[0]`: when `provision_certificate=false`,
+  # the ternary's true-branch isn't evaluated, but the splat shape is
+  # additionally safe against `[0]`-against-count-0 plan-time errors
+  # that have surfaced from provider/core interaction bugs.
   effective_certificate_arn = var.provision_certificate ? one(aws_acm_certificate_validation.this[*].certificate_arn) : var.existing_certificate_arn
 }

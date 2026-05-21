@@ -261,36 +261,28 @@ resource "aws_lb_listener" "https" {
     }
 
     # Belt-and-suspenders on `local.effective_certificate_arn`: the
-    # ternary in `main.tf` resolves to `one([])` (= null) on the
-    # `provision_certificate=true` path BEFORE the validation
-    # resource lands in state (greenfield first-apply, see Step 0a
-    # in README). The two preconditions above already gate this on
-    # the input variables, but anchoring on the resolved local
-    # surfaces the "cert not yet validated" case with a clear
-    # message — `certificate_arn = null` at the listener would
-    # otherwise produce a less-helpful `Invalid value` error.
+    # ternary in `main.tf` resolves to `null` on the
+    # `provision_certificate=false` + empty `existing_certificate_arn`
+    # path. The two preconditions above already gate this on the
+    # input variables, but anchoring on the resolved local surfaces
+    # the misconfig with a clear message — `certificate_arn = null`
+    # at the listener would otherwise produce a less-helpful
+    # `Invalid value` error.
     precondition {
       condition     = local.effective_certificate_arn != null && local.effective_certificate_arn != ""
       error_message = <<-EOT
         local.effective_certificate_arn resolved to null/empty.
 
-        Greenfield `provision_certificate=true` envs hit this on first plan because
-        `aws_acm_certificate_validation.this` doesn't exist in state yet. Workaround
-        (must run from a context that bypasses CI's `-auto-approve` flow — local
-        laptop, or a `workflow_dispatch` job that disables auto-approve):
+        This means `provision_certificate=false` AND `existing_certificate_arn`
+        is empty. Either:
 
-            # 1. Apply just the cert request so domain_validation_options populates.
-            terraform apply \
-              -target='module.bootstrap_alb[0].aws_acm_certificate.this[0]'
+          - Populate `existing_certificate_arn` with the operator-pre-provisioned
+            cert ARN (Path 1 — cross-account zone), or
+          - Flip to `provision_certificate=true` + set `route53_zone_id` so the
+            module manages the cert in-account (Path 2 — same-account zone).
 
-            # 2. Normal apply picks up the now-known validation record names.
-            terraform apply
-
-        See `modules/bootstrap-alb/README.md` Step 0a for the full rationale.
-
-        For `provision_certificate=false` envs, this error means
-        `existing_certificate_arn` is empty — either populate it (Path 1) or
-        flip to `provision_certificate=true` + set `route53_zone_id` (Path 2).
+        See `modules/bootstrap-alb/README.md` "Account topology" for the
+        per-env mapping.
       EOT
     }
   }
