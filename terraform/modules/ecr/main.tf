@@ -1615,6 +1615,18 @@ resource "aws_iam_policy" "terraform_apply_services" {
           "s3:PutEncryptionConfiguration",
           "s3:GetEncryptionConfiguration",
           "s3:PutBucketPublicAccessBlock",
+          # `aws_s3_bucket_ownership_controls.{alb_access_logs,athena_query_results}`
+          # in `modules/bootstrap-alb/access_logs.tf` requires
+          # `s3:PutBucketOwnershipControls`. Missing this is what failed nhp
+          # run 26251713769 — #2071 added the bucket prefix to Resource but
+          # didn't add this action. AWS ALB access-log delivery requires the
+          # bucket be `BucketOwnerEnforced`, so the ownership-controls failure
+          # cascades into the ALB modify-attributes AccessDenied.
+          # `GetBucketOwnershipControls` is covered by `terraform_read.S3Read`
+          # (`s3:Get*` on `*`); only the Put is needed here. No
+          # `s3:DeleteBucketOwnershipControls` — mirrors `S3QURLLinkBucket`
+          # precedent; sandbox destroy isn't in CI today.
+          "s3:PutBucketOwnershipControls",
           "s3:PutBucketTagging",
           "s3:PutBucketPolicy",
           "s3:DeleteBucketPolicy",

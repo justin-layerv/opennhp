@@ -100,8 +100,13 @@ sleep. Existing instances of the pattern:
   CloudWatch role check, bounded). Trigger source: a *resource
   dependency* (`depends_on = [aws_api_gateway_account.this]`).
 - `time_sleep.qurl_link_static_iam_propagation` (60s; IAM
-  evaluator propagation, no published SLA). Trigger source: a
-  *content dependency* (sha256 of the policy doc + the policy ARN).
+  evaluator propagation, action-list edits on an already-scoped
+  policy). Trigger source: a *content dependency* (sha256 of the
+  policy doc + the policy ARN).
+- `time_sleep.bootstrap_alb_iam_propagation` (180s; IAM evaluator
+  propagation on a freshly-scoped *resource-prefix* grant — see
+  nhp #2072 / run 26251713769 for the 60s-isn't-enough evidence).
+  Trigger source: same shape as qurl_link_static.
 
 Pick by what you're racing: a resource creation → resource-dep
 trigger; an in-place policy doc edit → content-hash trigger.
@@ -115,7 +120,14 @@ after #1812: `modules/ci-policies/`) computed as
 in `terraform/main.tf`, gated on the OR of every consumer's
 condition (so envs without consumers don't pay the 60s), and add
 `depends_on` on each consumer needing the freshly granted perm.
-The 10s value is for APIGW only — for IAM-evaluator races use 60s.
+Pick a `create_duration` by what the policy edit looks like, not a
+single floor: 10s for APIGW's bounded async check; 60s for an
+action-list edit on an already-scoped policy (qurl_link_static
+shape); 180s for a freshly-scoped resource-prefix grant where the
+evaluator must propagate a new bucket/ARN target through its
+caches (bootstrap_alb shape, evidence from nhp #2072 / run
+26251713769 — the 60s shim let the sibling lifecycle resource
+exhaust SDK retries before propagation cleared).
 
 The two triggers cover different races: the doc hash catches
 in-place perm edits (the common case); the ARN rotates on a

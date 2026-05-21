@@ -3234,9 +3234,18 @@ locals {
 # 60s, not the 10s of `time_sleep.apigateway_logging_propagation`
 # above: API Gateway's bounded async CloudWatch role check converges
 # fast; the IAM authorization-evaluator propagation does not. AWS
-# does not publish an SLA — 60s is the conservative upper bound;
-# observed latencies sit well under it. Picking 10s here would
-# re-trip the race.
+# does not publish an SLA — 60s has held for this shim's lifetime
+# (action-list edits on an already-scoped policy). Picking 10s here
+# would re-trip the race.
+#
+# NOT bumped to the 180s used by `time_sleep.bootstrap_alb_iam_propagation`
+# below: that shim's 180s is calibrated to a freshly-scoped
+# *resource-prefix* grant (the CI role gaining a new bucket-ARN
+# target), where the evaluator must propagate the new resource shape
+# through its caches — empirically ~2m. This shim's edits have all
+# been action-list additions on the existing qurl-link resource
+# scope, which clears faster. Leave at 60s unless a future edit
+# extends this policy's Resource set and trips the race.
 #
 # Triggers (any change recreates the sleep):
 #   - `policy_doc_hash`: sha256 of the rendered policy. Catches
@@ -3963,7 +3972,9 @@ module "bootstrap_alb" {
 # terraform-apply-services CI policy. Same pattern + rationale as
 # `time_sleep.qurl_link_static_iam_propagation` above (read that block
 # for the trigger-source semantics + the taint/rename + greenfield-CF
-# nuances; this shim mirrors that shape exactly).
+# nuances; this shim mirrors that shape, with `create_duration`
+# divergent — see the comment on `create_duration` below for the
+# 180s-vs-60s rationale).
 #
 # Gated on `var.deploy_bootstrap_alb` per terraform/CLAUDE.md → "IAM
 # eventual-consistency shim pattern": OR of every consumer's condition.
@@ -3982,5 +3993,16 @@ resource "time_sleep" "bootstrap_alb_iam_propagation" {
     attachment_id   = module.ecr.terraform_apply_services_attachment_id
   }
 
-  create_duration = "60s"
+  # 180s (was 60s in #2071). On nhp run 26251713769 the 60s shim was
+  # insufficient: `aws_s3_bucket_lifecycle_configuration.alb_access_logs`
+  # retried for 56s before the IAM evaluator finally allowed
+  # `s3:PutLifecycleConfiguration` on the freshly-scoped
+  # `bootstrap-alb-*` prefix (observed total propagation ~2m from
+  # policy mod). Its sibling `aws_s3_bucket_lifecycle_configuration.athena_query_results`
+  # exhausted retries before that window closed and failed the apply.
+  # 180s gives the evaluator a full 3m before any consumer attempts,
+  # well above the ~2m observed. The 60s precedent on
+  # `qurl_link_static_iam_propagation` predates this evidence — leave
+  # it as-is until/unless that shim trips the same race.
+  create_duration = "180s"
 }
