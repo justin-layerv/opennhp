@@ -1,12 +1,7 @@
 package utils
 
 import (
-	"crypto/hmac"
 	"crypto/md5"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -15,16 +10,6 @@ import (
 	"os"
 )
 
-func HMACSha256(key, value string) []byte {
-	var secretKey = []byte(key)
-	h := hmac.New(sha256.New, secretKey)
-	h.Write([]byte(value))
-
-	hash := h.Sum(nil)
-
-	return hash
-}
-
 func MD5(value string) string {
 	_16bytes := md5.Sum([]byte(value))
 	return hex.EncodeToString(_16bytes[:])
@@ -32,18 +17,6 @@ func MD5(value string) string {
 
 func Base64(value []byte) string {
 	return base64.StdEncoding.EncodeToString(value)
-}
-
-func GenerateRsaKey(bits int) (string, string) {
-	// Generate private key.
-	privateKey, err := rsa.GenerateKey(rand.Reader, bits)
-	if err != nil {
-		return "", ""
-	}
-	pivKey := x509.MarshalPKCS1PrivateKey(privateKey)
-	pubKey := x509.MarshalPKCS1PublicKey(&privateKey.PublicKey)
-
-	return base64.StdEncoding.EncodeToString(pivKey), base64.StdEncoding.EncodeToString(pubKey)
 }
 
 func Md5sum(fullFilePath string) (string, error) {
