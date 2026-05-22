@@ -25,7 +25,14 @@
 # Soak protocol: rules ship with is_paused = true by default. After
 # deployment, watch each rule's "would-have-fired" count in Grafana for 24h,
 # tune thresholds if obvious noise is observed, then flip
-# var.qurl_alerts_paused = false in a follow-up apply.
+# var.qurl_alerts_paused = false in a follow-up apply. Rules whose metric
+# has zero healthy-state samples (e.g. qurl-webhook-suppressed-lookup-failed)
+# need an additional pre-flip verification because no_data_state="OK" will
+# silently pass a typo'd metric name: cold-check that the metric resolves
+# in Grafana Explore (e.g. `qurl_webhook_connector_resources_suppressed_total`
+# returns any series), then induce a hot-check increment in sandbox to
+# confirm the increment lands. Full protocol per rule's runbook —
+# see e.g. docs/runbooks/qurl-webhook-suppressed-lookup-failed.md.
 #
 # TODO(follow-up): the burn-rate PromQL is duplicated between this file and
 # the qurl-operations.json dashboard. The right long-term fix is to extract
@@ -96,6 +103,21 @@ locals {
     # attribute_not_exists checks in the create-resource path; Query
     # failures have no legitimate steady-state.
     dynamodb_query_failure_rate = 0.05
+    # Webhook events the transit-resource gate dropped fail-CLOSED because
+    # it couldn't load the resource to make a decision (DDB hiccup, IAM
+    # blip). Per qurl-service `metrics.go::WebhookSuppressedReasonLookupFailed`
+    # (https://github.com/layervai/qurl-service/blob/eaaf9deb82f1973f61c19632d860721279c6cfce/internal/observability/metrics.go
+    # — grep the file for the symbol; deep-line anchor dropped because qurl-service
+    # line numbers will drift independently of the pinned SHA)
+    # the metric is "zero in normal operation; spikes during DDB hiccups
+    # indicate webhooks are being dropped on the floor and the gate's
+    # lookup path is the cause." 0.05/sec is a starting point pending
+    # soak data — it borrows the shape of dynamodb_query_failure_rate
+    # for consistency, but the semantics differ (each dropped event is
+    # an irretrievable customer-visible missing webhook, vs DDB Query
+    # failures which surface as 5xx already paged elsewhere). Soak may
+    # justify tightening, loosening, or splitting page/ticket severities.
+    webhook_connector_suppressed_lookup_failed_rate = 0.05
   }
 
   # PromQL / LogQL queries hoisted to locals to keep the rule definitions
@@ -160,10 +182,31 @@ locals {
   # layerv-nhp-prod-cell0, etc.).
   qurl_query_dynamodb_query_failures = "max by (cell_id) (sum by (cell_id) (rate(aws_dynamodb_operation_total{${local.qurl_prom_selector}, table=~\"^.*-qurl-resources$\", operation=\"Query\", success=\"false\"}[5m])))"
 
+  # PromQL: webhook events suppressed fail-CLOSED because the gate's
+  # resource lookup failed. The metric is
+  # `qurl.webhook.connector_resources_suppressed.total` (OTel name) →
+  # `qurl_webhook_connector_resources_suppressed_total` after the
+  # OTel→Prom translation (dots → underscores, single `_total` suffix
+  # preserved, NOT double-appended). The same translation rule is
+  # already exercised by `qurl.webhook.delivery.total` →
+  # `qurl_webhook_delivery_total`, which works in dashboards/qurl-
+  # webhooks.json:120 — that's empirical proof the name shape is
+  # correct, not a guess. Soak verification will still confirm a
+  # real time series resolves before flipping is_paused=false.
+  #
+  # Attribute `reason` is filtered to `lookup_failed` so the alert
+  # only fires on the silent-drop branch (the other reason,
+  # `filtered`, is the legitimate in-band gate hit for transit-typed
+  # resources and is high-volume by design).
+  #
+  # Per-cell aggregation matches the other qurl alerts so a single
+  # broken cell drives the page even if other cells are healthy.
+  qurl_query_webhook_connector_suppressed_lookup_failed = "max by (cell_id) (sum by (cell_id) (rate(qurl_webhook_connector_resources_suppressed_total{${local.qurl_prom_selector}, reason=\"lookup_failed\"}[5m])))"
+
   # Threshold-expression model bodies, one per rule. Each is a Grafana
   # server-side expression of type "threshold" comparing the upstream
   # query (refId "A") to a single numeric value. Built once here so the
-  # 4 rule definitions don't repeat the JSON shape.
+  # rule definitions don't repeat the JSON shape.
   qurl_threshold_models = {
     for name, value in local.qurl_thresholds :
     name => jsonencode({
@@ -295,10 +338,10 @@ resource "grafana_contact_point" "qurl_aws_sns" {
 }
 
 # ==============================================================================
-# Alert rule group: qurl-api SLO + DynamoDB query failures
+# Alert rule group: qurl-api SLO + DynamoDB + webhook drops
 # ==============================================================================
 #
-# All four rules live in one group so they share an evaluation interval and
+# All rules live in one group so they share an evaluation interval and
 # fire from the same Grafana scheduler tick. Each rule's notification_settings
 # block names the SNS contact point directly, bypassing the stack-wide
 # notification policy tree (which is a Grafana singleton this PR should
@@ -563,6 +606,88 @@ resource "grafana_rule_group" "qurl_alerts" {
         to   = 0
       }
       model = local.qurl_threshold_models.dynamodb_query_failure_rate
+    }
+  }
+
+  # ----------------------------------------------------------------------
+  # Rule 5: webhook events silently dropped by the transit-resource gate's
+  # fail-CLOSED lookup-failure branch. This is the operator's only signal
+  # for "we silently dropped events because the gate couldn't decide."
+  # Customers never see these drops directly — they just see missing
+  # webhook deliveries for some events. Without this alert the drop is
+  # invisible.
+  # ----------------------------------------------------------------------
+  rule {
+    name      = "qurl-webhook-suppressed-lookup-failed"
+    condition = "C"
+    # for=5m combined with rate([5m]) in the query intentionally
+    # suppresses single isolated drops — see the "Structural blind
+    # spot" section in qurl-webhook-suppressed-lookup-failed.md.
+    # Do NOT "harmonize" the windows without rethinking what the
+    # alert should fire on; the time-to-page (~10m sustained) is
+    # the trade-off for the suppression behavior.
+    for       = "5m"
+    is_paused = var.qurl_alerts_paused
+
+    # NoData = OK: the counter has zero samples in healthy operation
+    # (it only increments on the rare fail-closed path). Empty result
+    # vector is the normal steady state, NOT an instrumentation gap —
+    # the metric is registered at startup but only emitted on the
+    # suppression branch, so the time series legitimately doesn't
+    # exist when the system is healthy.
+    no_data_state  = "OK"
+    exec_err_state = "Error"
+
+    annotations = {
+      summary     = "qurl-api silently dropping webhook events (fail-closed lookup failures) > ${local.qurl_thresholds.webhook_connector_suppressed_lookup_failed_rate}/sec"
+      description = "The transit-resource webhook gate at qurl-service is dropping events because it cannot load the resource to decide whether to publish. Sustained rate > ${local.qurl_thresholds.webhook_connector_suppressed_lookup_failed_rate}/sec for 5 minutes for at least one cell. The most likely cause is a DDB hiccup or IAM permission lapse on the resource-read path. Per-cell aggregation: the alert fires for the worst cell. Customers experience missing webhook deliveries with no error visible on their side; this alert is the only operator signal."
+      runbook_url = "${var.qurl_alerts_runbook_base_url}/qurl-webhook-suppressed-lookup-failed.md"
+    }
+
+    labels = merge(local.qurl_alert_labels_base, {
+      severity   = local.qurl_severity.page
+      alert_type = "webhook_drop"
+      # reason is structurally redundant with the PromQL filter on
+      # the same attribute (the alert can never fire with a different
+      # value) but is set here as a stable downstream-filterable label
+      # for SNS receiver routing rules and to keep the label shape
+      # forward-compatible if a future rule splits per-reason.
+      reason = "lookup_failed"
+    })
+
+    notification_settings {
+      contact_point = grafana_contact_point.qurl_aws_sns[0].name
+      # TODO(#2113): add cell_id once the whole rule group changes
+      # together. Without it, simultaneous drops in multiple cells
+      # collapse into a single SNS notification; the runbook's first
+      # action is "confirm scope by cell" so operators currently have
+      # to re-run a PromQL query to learn which cell paged.
+      group_by = ["alertname", "service", "deployment_env"]
+    }
+
+    data {
+      ref_id         = "A"
+      datasource_uid = var.prometheus_datasource_uid
+      relative_time_range {
+        from = 300 # 5m
+        to   = 0
+      }
+      model = jsonencode({
+        refId   = "A"
+        expr    = local.qurl_query_webhook_connector_suppressed_lookup_failed
+        instant = true
+        range   = false
+      })
+    }
+
+    data {
+      ref_id         = "C"
+      datasource_uid = "__expr__"
+      relative_time_range {
+        from = 0
+        to   = 0
+      }
+      model = local.qurl_threshold_models.webhook_connector_suppressed_lookup_failed_rate
     }
   }
 }
