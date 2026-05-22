@@ -58,27 +58,28 @@ resource "terraform_data" "frps_env_var_triple" {
 #     when the gate is on" requires referencing both
 #     `var.deploy_qurl_bootstrap_chain` and the value-bearing var.
 # Today the only caller (`terraform/main.tf`) always threads both
-# producer outputs (module.nhp_keypair.registration_public_key,
+# producer outputs (module.compute.server_public_key_b64,
 # module.compute.nlb_dns_name) when the gate is on, so this precondition
 # is defense in depth — but a future caller that flips
 # `deploy_qurl_bootstrap_chain = true` without wiring the values would
 # otherwise inject empty env vars and surface the failure only at agent
 # runtime. Fail at plan time instead.
 #
-# Caveat: `module.nhp_keypair.registration_public_key` is "known after
-# apply" on a greenfield env (it resolves to an `aws_ssm_parameter.value`
-# sourced from `aws_lambda_invocation.keygen.result`). The condition then
-# evaluates at apply time rather than plan time — a fail-loud apply error
-# is still strictly better than a runtime agent failure, which is the
-# point of the fence. Sandbox + prod both have the keypair deployed
-# already, so the plan-time signal works there today.
+# Caveat: `module.compute.server_public_key_b64` is "known after apply"
+# on a greenfield env (it resolves through a
+# `data.aws_secretsmanager_secret_version` that depends on
+# `aws_lambda_invocation.keygen`). The condition then evaluates at apply
+# time rather than plan time — a fail-loud apply error is still strictly
+# better than a runtime agent failure, which is the point of the fence.
+# Sandbox + prod both have the secret populated already, so the
+# plan-time signal works there today.
 resource "terraform_data" "qurl_bootstrap_chain_inputs" {
   count = var.deploy_qurl_bootstrap_chain ? 1 : 0
 
   lifecycle {
     precondition {
       condition     = var.nhp_server_public_key_b64 != ""
-      error_message = "deploy_qurl_bootstrap_chain=true but nhp_server_public_key_b64 is empty. The agent would receive NHP_SERVER_PUBLIC_KEY_B64=\"\" and fail its handshake at runtime. Thread `module.nhp_keypair.registration_public_key` from the root."
+      error_message = "deploy_qurl_bootstrap_chain=true but nhp_server_public_key_b64 is empty. The agent would receive NHP_SERVER_PUBLIC_KEY_B64=\"\" and fail its handshake at runtime. Thread `module.compute.server_public_key_b64` from the root (NOT `module.nhp_keypair.registration_public_key` — that is the AC↔server registration key, a different role; wiring it here passes the variable shape check but silently 100%-fails every agent knock at runtime)."
     }
     precondition {
       condition     = var.nhp_server_host != ""
@@ -339,14 +340,15 @@ locals {
       { name = "NHP_KNOCK_TIMEOUT", value = tostring(var.nhp_knock_timeout_seconds) },
     ] : [],
     # QURL agent → nhp-server bootstrap chain (Wave 5 dark-launch). Threaded
-    # directly from the nhp-server side outputs at the root
-    # (module.nhp_keypair + module.compute) so the agent's view of the
-    # responder can never drift from what nhp-server actually publishes.
-    # Same wiring shape as NHP_SERVER_INTERNAL_URL above — TF-injected env
-    # vars on the task def, no second config-fetch mechanism (no
-    # ssm:GetParameter at runtime), no IAM surface for these statics. The
-    # values change only on TF apply (NLB DNS rotation, pool keypair
-    # rotation, constant port). Gate is var.deploy_qurl_bootstrap_chain;
+    # directly from module.compute at the root
+    # (server_public_key_b64 for the server-identity pubkey, nlb_dns_name
+    # for the host) so the agent's view of the responder can never drift
+    # from what nhp-server actually publishes. Same wiring shape as
+    # NHP_SERVER_INTERNAL_URL above — TF-injected env vars on the task
+    # def, no second config-fetch mechanism (no ssm:GetParameter at
+    # runtime), no IAM surface for these statics. The values change only
+    # on TF apply (NLB DNS rotation, server-secret keypair rotation,
+    # constant port). Gate is var.deploy_qurl_bootstrap_chain;
     # the chain is activated via a separate
     # var.enable_qurl_agent_bootstrap tfvars flip per environment —
     # matches the established dark-launch pattern in this tree

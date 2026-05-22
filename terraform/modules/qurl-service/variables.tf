@@ -895,7 +895,7 @@ variable "enable_qurl_agent_bootstrap" {
 }
 
 variable "nhp_server_public_key_b64" {
-  description = "NHP server responder public key (base64; raw 32-byte X25519 key). Threaded from `module.nhp_keypair.registration_public_key` at the root. Consumed only when deploy_qurl_bootstrap_chain = true; pass empty string when the gate is off."
+  description = "NHP server-identity public key (base64; raw 32-byte X25519 key). Threaded from `module.compute.server_public_key_b64` at the root — the key the running NHP server actually signs NHP packets with. NOT `module.nhp_keypair.registration_public_key` (which is the shared AC↔server registration key — a different role; wiring that here silently breaks every agent knock with a server-HMAC-validation failure). Consumed only when deploy_qurl_bootstrap_chain = true; pass empty string when the gate is off."
   type        = string
   default     = ""
 
@@ -929,7 +929,7 @@ variable "nhp_server_public_key_b64" {
   # failure either way.
   validation {
     condition     = var.nhp_server_public_key_b64 == "" || can(regex("^[A-Za-z0-9+/]{43}=$", var.nhp_server_public_key_b64))
-    error_message = "nhp_server_public_key_b64 must be empty (gate off) or a base64-encoded 32-byte X25519 public key (44 chars total: 43 base64 chars + `=` padding). Got a malformed value — check module.nhp_keypair.registration_public_key's output shape."
+    error_message = "nhp_server_public_key_b64 must be empty (gate off) or a base64-encoded 32-byte X25519 public key (44 chars total: 43 base64 chars + `=` padding). Got a malformed value — check module.compute.server_public_key_b64's output shape."
   }
 }
 

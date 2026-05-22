@@ -192,8 +192,17 @@ module "qurl_service" {
 Injects four env vars on the qurl-service ECS task def so the agent can do its
 own NHP/UDP handshake against the public NLB. Same wiring shape as
 `NHP_SERVER_INTERNAL_URL` (TF-injected env vars, no runtime SSM fetch, no
-new IAM surface). Values flow from `module.nhp_keypair.registration_public_key`
+new IAM surface). Values flow from `module.compute.server_public_key_b64`
 and `module.compute.nlb_dns_name` at the root.
+
+> **Keypair contract** — `nhp_server_public_key_b64` MUST come from
+> `module.compute.server_public_key_b64` (the server-identity key in
+> the Secrets-Manager-backed keypair). Wiring
+> `module.nhp_keypair.registration_public_key` instead — the SHARED
+> AC↔server registration key, a different role — passes the variable
+> shape check but silently 100%-fails every agent knock with
+> `[NHP-KNK] packet precheck failed: server HMAC validation failed`
+> on the responder. The two keys are roles, not interchangeable.
 
 | Variable | Description | Type | Default |
 |----------|-------------|------|---------|

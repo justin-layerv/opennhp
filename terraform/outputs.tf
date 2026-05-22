@@ -156,7 +156,7 @@ output "dynamodb_write_policy_arn" {
 
 # NHP Keypair
 output "nhp_registration_public_key" {
-  description = "NHP registration public key (for AC config)"
+  description = "Shared AC↔server REGISTRATION public key (any AC uses this to register against any NHP-server instance behind the NLB; see modules/nhp-keypair/main.tf:1-8). NOT the key NHP-server signs in-flight packets with — that role belongs to module.compute.server_public_key_b64. Conflating the two silently 100%-fails agent knock HMAC validation; the qurl-service bootstrap chain (deploy_qurl_bootstrap_chain) wires compute, not this output, for that reason."
   value       = module.nhp_keypair.registration_public_key
 }
 

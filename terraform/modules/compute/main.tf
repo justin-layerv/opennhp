@@ -222,6 +222,42 @@ resource "aws_lambda_invocation" "keygen" {
   }
 }
 
+# Read back the publicKey the Lambda generated so we can thread it
+# through terraform to other modules that need to know which key the
+# running NHP server actually signs packets with (specifically
+# qurl-service's agent-bootstrap response — see #server_public_key_b64
+# in outputs.tf for the contract).
+#
+# tfstate exposure: this data source materializes secret_string
+# (full JSON: privateKey + publicKey + hostname + environment) as a
+# sensitive-marked attribute in state. tfstate access already implies
+# Secrets Manager access in this org's threat model (S3+KMS+IAM
+# scoped), and the same pattern is used by the auth0-backend / etcd-
+# tls / cookie-secret data sources in this tree. The output above
+# nonsensitive()-wraps only the publicKey so downstream consumers
+# get a non-sensitive string for env-var injection; the privateKey
+# stays in state, sensitive-marked.
+#
+# depends_on the lambda invocation so the secret_string is populated
+# before the data source reads it. AWS provider caches the value
+# within an apply, so refreshing this on every plan is a single
+# Secrets Manager GET, not a per-resource cost.
+#
+# version_stage = "AWSCURRENT" is the AWS default and is set here
+# explicitly because the keygen Lambda (line 175) writes via
+# PutSecretValueCommand without a VersionStages arg — which also
+# defaults to AWSCURRENT. A future rotation flow that stages a new
+# key under AWSPENDING before promoting it would silently desync
+# the terraform-exposed value from the running server until the
+# stage promotion completed; pinning the stage here makes the
+# rotation contract grep-discoverable and the desync window
+# explicit at the boundary instead of buried in defaults.
+data "aws_secretsmanager_secret_version" "server" {
+  secret_id     = aws_secretsmanager_secret.server.id
+  version_stage = "AWSCURRENT"
+  depends_on    = [aws_lambda_invocation.keygen]
+}
+
 # Cookie session keys for HTTP session cookies (shared across all server instances)
 # JSON structure:
 #   {

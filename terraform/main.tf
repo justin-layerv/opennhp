@@ -2099,16 +2099,42 @@ module "qurl_service" {
   # kept on a separate var so the activation is a one-line tfvars edit,
   # matching the dark-launch pattern across this tree.
   #
-  # Cell-isolation note: `module.nhp_keypair.registration_public_key`
-  # reads from `/nhp/pool/registration-public-key` — a global SSM path,
-  # not cell-prefixed. This wiring implicitly assumes one nhp-server
-  # pool per env. If a future topology spans cells or runs multiple
-  # keypair pools, the threading-from-root pattern here must be
-  # revisited so the agent sees the same pubkey the responder it
-  # reaches actually publishes.
+  # The pubkey threaded here is the NHP-server IDENTITY key (from the
+  # compute module's Secrets-Manager-backed keypair), NOT the
+  # AC↔server registration key from module.nhp_keypair. Two distinct
+  # keys are at play, and conflating them silently 100%-fails every
+  # agent knock with an `[NHP-KNK] packet precheck failed: server
+  # HMAC validation failed` log line on the responder side. See
+  # module.compute's `server_public_key_b64` output comment for the
+  # full contract. A prior revision of this wiring used
+  # `module.nhp_keypair.registration_public_key` and bricked the
+  # entire reverse-tunnel boot path in sandbox until isolated via
+  # qurl-reverse-tunnel-client smoke.
+  #
+  # Cell-isolation note (retained from the prior wiring's comment,
+  # retargeted): module.compute is per-cell-scoped via name_prefix
+  # / cell_id, so module.compute.server_public_key_b64 is the
+  # per-cell server-identity key — this wiring stays correct under
+  # a future multi-cell topology because each qurl_service instance
+  # is paired with the compute it actually fronts. If a future
+  # topology ever has qurl-service fan out to multiple compute
+  # cells, this wire becomes the spot to multiplex per-cell pubkeys.
+  #
+  # Apply-vs-take-effect note: aws_ecs_service.qurl carries
+  # lifecycle.ignore_changes = [task_definition] (see modules/
+  # qurl-service/main.tf comment near aws_ecs_task_definition.qurl)
+  # because CI rolls task definitions out-of-band. So `terraform
+  # apply`-ing a change to NHP_SERVER_PUBLIC_KEY_B64 registers a
+  # new task-def revision but leaves the running service on the
+  # prior revision. The corrected pubkey takes effect on the NEXT
+  # qurl-service CI deploy (which picks up the newest revision via
+  # `aws ecs describe-task-definition` + `update-service
+  # --force-new-deployment`). If a smoke needs the env to apply
+  # immediately post-tf-apply, trigger the deploy workflow
+  # manually rather than waiting for the next merge.
   deploy_qurl_bootstrap_chain = var.deploy_qurl_bootstrap_chain
   enable_qurl_agent_bootstrap = var.enable_qurl_agent_bootstrap
-  nhp_server_public_key_b64   = module.nhp_keypair.registration_public_key
+  nhp_server_public_key_b64   = module.compute.server_public_key_b64
   nhp_server_host             = module.compute.nlb_dns_name
   # nhp_server_port is intentionally NOT threaded from a root variable.
   # The port is a code-level constant (62206) hardcoded in three places —
