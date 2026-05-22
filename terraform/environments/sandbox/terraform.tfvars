@@ -623,6 +623,17 @@ bootstrap_alb_manage_dns_alias      = true
 # rejects the both-set combo) — go through the module's rotation
 # path instead.
 
+# Tighten ELB-side 5xx alarm threshold after the data plane is wired
+# (nhp PR #2082 closed the empty-TG outage; qurl-service PRs #683 +
+# #697 routed bootstrap.layerv.xyz through the validator end-to-end).
+# The module-side default of 10/min is dark-launch-friendly (tolerates
+# the noise from every probe getting 503 on an empty target group);
+# the variable's own description in `modules/bootstrap-alb/variables.tf`
+# explicitly calls out that env tfvars SHOULD override to 1 once the
+# data plane is live, since any ALB-side 5xx is then the outage signal.
+# Closes #2084.
+bootstrap_alb_elb_5xx_threshold_per_minute = 1
+
 # `bootstrap_alb_waf_count_only_rule_groups` deliberately omitted
 # (empty default = full enforce) for this dark-launch window. The
 # variable description in `terraform/variables.tf` recommends
