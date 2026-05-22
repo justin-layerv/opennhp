@@ -846,7 +846,7 @@ variable "deploy_qurl_bootstrap_chain" {
 }
 
 variable "enable_qurl_agent_bootstrap" {
-  description = "Wave 5 dark-launch flag for the qurl-service agent → nhp-server bootstrap chain. Drives the QURL_AGENT_BOOTSTRAP_ENABLED env var on the task def. Default false: the chain stays inert until a focused follow-up PR flips this to true post-burn-in. Only consulted when deploy_qurl_bootstrap_chain = true."
+  description = "Wave 5 activation flag for the qurl-service agent → nhp-server bootstrap chain. Drives the QURL_AGENT_BOOTSTRAP_ENABLED env var on the task def. Default false: the chain stays inert until this is flipped to true per environment. Only consulted when deploy_qurl_bootstrap_chain = true."
   type        = bool
   default     = false
 }

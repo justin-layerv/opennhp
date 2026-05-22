@@ -347,9 +347,9 @@ locals {
     # ssm:GetParameter at runtime), no IAM surface for these statics. The
     # values change only on TF apply (NLB DNS rotation, pool keypair
     # rotation, constant port). Gate is var.deploy_qurl_bootstrap_chain;
-    # post-burn-in the chain is activated via a separate
-    # var.enable_qurl_agent_bootstrap tfvars flip in a focused follow-up
-    # PR — matches the established dark-launch pattern in this tree
+    # the chain is activated via a separate
+    # var.enable_qurl_agent_bootstrap tfvars flip per environment —
+    # matches the established dark-launch pattern in this tree
     # (deploy_frps, deploy_qurl_service, deploy_bootstrap_alb).
     var.deploy_qurl_bootstrap_chain ? [
       { name = "NHP_SERVER_PUBLIC_KEY_B64", value = var.nhp_server_public_key_b64 },

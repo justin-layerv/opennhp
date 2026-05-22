@@ -168,12 +168,11 @@ deploy_qurl_service = true
 # TF-injected env vars (NHP_SERVER_PUBLIC_KEY_B64, NHP_SERVER_HOST,
 # NHP_SERVER_PORT, QURL_AGENT_BOOTSTRAP_ENABLED) alongside the existing
 # NHP_SERVER_INTERNAL_URL — no runtime SSM fetch, no new IAM grants.
-# `enable_qurl_agent_bootstrap` is the post-burn-in activation flip:
-# kept false here so the chain lands inert; a focused follow-up PR
-# will flip it to true after burn-in. Prod tfvars deliberately omits
-# both until sandbox burn-in lands.
+# `enable_qurl_agent_bootstrap` is the per-env activation flip:
+# flipped to true here to begin Wave 5 activation in sandbox. Prod
+# tfvars deliberately omits both until sandbox burn-in lands.
 deploy_qurl_bootstrap_chain = true
-enable_qurl_agent_bootstrap = false
+enable_qurl_agent_bootstrap = true
 
 # Domain configuration for QURL API
 # Certificate is created automatically via Terraform when domain is set

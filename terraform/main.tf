@@ -2092,10 +2092,9 @@ module "qurl_service" {
   # injection on `deploy_qurl_bootstrap_chain`, so passing the module
   # outputs unconditionally here is harmless when the gate is off (the
   # values reach the module but are not rendered into the task def).
-  # `enable_qurl_agent_bootstrap` is the post-burn-in flip — kept on a
-  # separate var so the activation is a one-line tfvars edit in a
-  # focused follow-up PR, matching the dark-launch pattern across this
-  # tree.
+  # `enable_qurl_agent_bootstrap` is the per-env activation flag —
+  # kept on a separate var so the activation is a one-line tfvars edit,
+  # matching the dark-launch pattern across this tree.
   #
   # Cell-isolation note: `module.nhp_keypair.registration_public_key`
   # reads from `/nhp/pool/registration-public-key` — a global SSM path,
