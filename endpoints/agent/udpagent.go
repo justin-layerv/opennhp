@@ -188,6 +188,28 @@ func (a *UdpAgent) Start(dirPath string, logLevel int) (err error) {
 	}
 
 	a.remoteConnectionMap = make(map[string]*UdpConn)
+	// knockTargetMap and serverPeerMap MUST be initialized here,
+	// alongside the other per-Start maps. The struct literal
+	// (`&UdpAgent{}` in callers like cmd/frpc/run.go in
+	// tunnel-client) leaves them nil, and the corresponding
+	// AddResource / AddServer writes
+	// (`a.knockTargetMap[res.Id()] = ...`,
+	// `a.serverPeerMap[server.PublicKeyBase64()] = ...`) panic with
+	// "assignment to entry in nil map" the first time a caller
+	// registers a target/peer programmatically.
+	//
+	// updateResources / updateServerPeers (config.go) each do an
+	// `os.ReadFile` early-return on a missing `etc/resource.toml`
+	// or `etc/server.toml` and only assign the parsed map on
+	// success, so callers (tunnel-client, et al.) that don't ship
+	// those files and register everything via AddResource /
+	// AddServer hit the panic before any later assignment runs.
+	// updateResources also has a defensive
+	// `if a.knockTargetMap == nil { a.knockTargetMap = targetMap }`
+	// fallback, but it lives behind the same early-return so it
+	// doesn't cover the missing-file path either.
+	a.knockTargetMap = make(map[string]*KnockTarget)
+	a.serverPeerMap = make(map[string]*core.UdpPeer)
 
 	a.signals.stop = make(chan struct{})
 	a.signals.knockTargetStop = make(chan struct{})
