@@ -4,7 +4,7 @@ go 1.26.3
 
 require (
 	github.com/cilium/ebpf v0.21.0
-	github.com/fsnotify/fsnotify v1.9.0
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/gin-gonic/gin v1.12.0
 	github.com/google/uuid v1.6.0
 	github.com/tetratelabs/wazero v1.11.0
