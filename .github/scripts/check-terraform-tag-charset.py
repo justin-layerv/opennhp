@@ -370,9 +370,25 @@ def _record_if_bad(
     findings: list[Finding],
 ) -> None:
     if not ALLOWED.fullmatch(_unescape_hcl(_strip_interp(key))):
-        findings.append(Finding(lineno, "key", key, value, key))
+        findings.append(
+            Finding(
+                lineno=lineno,
+                label="key",
+                hcl_key=key,
+                hcl_value=value,
+                offender=key,
+            )
+        )
     if not ALLOWED.fullmatch(_unescape_hcl(_strip_interp(value))):
-        findings.append(Finding(lineno, "value", key, value, value))
+        findings.append(
+            Finding(
+                lineno=lineno,
+                label="value",
+                hcl_key=key,
+                hcl_value=value,
+                offender=value,
+            )
+        )
 
 
 def _scan_file(path: Path) -> list[Finding]:

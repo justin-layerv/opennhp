@@ -15,10 +15,12 @@ LINT="$REPO_ROOT/.github/scripts/check-terraform-tag-charset.py"
 # (fixture, expected-exit, optional-stderr-substring-grep)
 # A non-empty grep field asserts the lint's stderr contains the literal
 # substring — keeps the bad-charset fixture honest by checking the
-# annotation actually names the offending char class.
+# annotation actually names the offending char class. The substring
+# matches both "tag key contains…" and "tag value contains…" so a
+# refactor that drops the `key`-side message still fails.
 FIXTURES=(
   "clean|0|"
-  "bad-charset|1|tag value contains chars outside AWS's allowed set"
+  "bad-charset|1|contains chars outside AWS's allowed set"
 )
 
 # Per-regression-class assertion: the bad-charset fixture encodes one
