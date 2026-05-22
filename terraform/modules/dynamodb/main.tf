@@ -583,6 +583,24 @@ resource "aws_dynamodb_table" "qurl_resources" {
 # qurl-access-tokens: Stores access tokens (hashed)
 # PK: token_hash, SK: sk (single-table design with "TOKEN" sort key)
 # GSI: resource-token-index (query tokens by resource)
+# GSI: time-bucket-index (scanner Lambda, queried per minute-bucket)
+#
+# Two expiration-flavored attributes co-exist intentionally:
+#   - `ttl`         (numeric epoch)    — DynamoDB auto-deletion attribute
+#   - `expires_at`  (RFC3339 string)   — time-bucket-index GSI sort key
+# Writer-enforced invariants (in qurl-service, not by DDB):
+#   1. The wall-clock time `ttl` decodes to is later than the
+#      wall-clock time `expires_at` decodes to — the scanner
+#      Lambda sees the row before DDB TTL reaps it.
+#   2. The .UTC() canonicalization in qurl-service's writer
+#      (internal/service/qurl_token_service.go) keeps every
+#      `expires_at` value at a UTC offset so RFC3339 lex order
+#      equals chronological order on the GSI.
+# The two fields use different encodings on purpose: DDB TTL
+# requires a numeric epoch; the GSI's RFC3339 sort key requires
+# string lex-order. They are not directly comparable as wire
+# values, and each serves a different layer (qurl-service vs.
+# DDB TTL reaper).
 resource "aws_dynamodb_table" "qurl_access_tokens" {
   count = var.deploy_qurl_tables ? 1 : 0
 
@@ -607,10 +625,87 @@ resource "aws_dynamodb_table" "qurl_access_tokens" {
     type = "S"
   }
 
+  # expires_at_bucket_shard / expires_at — the time-bucket-index GSI
+  # composite PK (`{ExpiresAtBucket}#{ExpiresAtShard}`) and SK. See
+  # the GSI block below for the sharding rationale; PK shape is
+  # documented in the qurl-service schema registry comment for
+  # GSITimeBucketIndex (internal/repository/dynamodb/schema.go).
+  # SK uses type "S" because qurl-service marshals time.Time via
+  # the dynamodbav default (RFC3339 string), and RFC3339 lex order
+  # matches chronological order — so the scanner's "give me expired
+  # qURLs" range query works against string AttributeValues.
+  #
+  # ASSUMES UTC: RFC3339 lex order only equals chronological order
+  # when every row uses the same UTC offset. A single non-UTC
+  # `time.Time` (e.g., from a future writer that forgot to
+  # canonicalize a parsed user-supplied timestamp) would be
+  # invisible to the scanner's range query. The canonicalization
+  # is enforced in qurl-service's writer — see the LOAD-BEARING
+  # UTC normalization in
+  # internal/service/qurl_token_service.go's UpdateQurlToken
+  # (.UTC() calls on both ExpiresAt and ExtendBy assignment paths,
+  # added defensively for this exact invariant). Don't loosen
+  # that without coordinating with this GSI's correctness.
+  attribute {
+    name = "expires_at_bucket_shard"
+    type = "S"
+  }
+
+  attribute {
+    name = "expires_at"
+    type = "S"
+  }
+
   # GSI: Find tokens by resource
   global_secondary_index {
     name            = "resource-token-index"
     hash_key        = "resource_id"
+    projection_type = "ALL"
+  }
+
+  # GSI: Time-bucket scanner index. Queried by the qurl-service
+  # expiry-scanner Lambda to find qURLs whose lifecycle just closed
+  # (per minute-bucket). Sharded ×16 so a 1000-recipient `/qurl
+  # send` to the same expiry minute doesn't hot-partition a single
+  # PK. Both the hash function AND the shard count (16) are owned
+  # by qurl-service — see `GSITimeBucketIndex` in
+  # internal/repository/dynamodb/schema.go for the canonical algorithm
+  # and `TimeBucketIndexShards` for the shard count. The GSI itself
+  # only sees pre-hashed PK strings ({bucket}#{shard}), so changing
+  # the shard count or hash on the qurl-service side does not
+  # require a Terraform PR — both are free to change with their
+  # own coordination. Writes are populated by qurl-service on every
+  # qURL Create + Update, plus a one-shot backfill cmd for rows
+  # that pre-date the introduction of the keys.
+  #
+  # SK is NOT unique by design: two qURLs minted in the same shard
+  # at the same nanosecond have identical (PK, SK). DynamoDB GSIs
+  # permit duplicate keys (base-table PK uniqueness is what enforces
+  # row identity); the scanner Lambda's per-bucket pagination must
+  # tolerate multiple items at the same `expires_at`.
+  #
+  # AWS only allows ONE GSI add/drop per UpdateTable call. Adding
+  # a second GSI to this table in the same PR requires staging the
+  # change across two applies; not applicable today, just a fence
+  # for the next contributor.
+  #
+  # Projection ALL: the scanner Lambda needs the full row (per-row
+  # marker fields, resource_id, etc.) to decide which qURLs still
+  # need a qurl.expired webhook. KEYS_ONLY would save storage but
+  # force a second GetItem per row. ALL also matches the existing
+  # resource-token-index convention on this table. Cost trade-off:
+  # storage and GSI write-capacity cost ~2× on bucketed rows (every
+  # qURL with a positive ExpiresAt) — favors latency-per-scan over
+  # storage at expected table sizes (1225 prod / 4092 sandbox items
+  # today, ≤ 1M expected steady-state). qurl_resources' status-index
+  # uses KEYS_ONLY for a similar expiring-soon pattern, so the
+  # KEYS_ONLY/ALL precedent on this module is mixed; ALL is the
+  # right call here because the scanner-Lambda hot path is
+  # latency-sensitive (per-minute cadence).
+  global_secondary_index {
+    name            = "time-bucket-index"
+    hash_key        = "expires_at_bucket_shard"
+    range_key       = "expires_at"
     projection_type = "ALL"
   }
 
