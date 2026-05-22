@@ -51,6 +51,36 @@ locals {
   # collides with this resource's `lifecycle.prevent_destroy`.
   alb_access_logs_bucket_name      = "${local.project}-alb-logs-${var.environment}-${var.account_id}"
   athena_query_results_bucket_name = "${local.project}-athena-${var.environment}-${var.account_id}"
+
+  # Regional AWS account ID for ALB access-log delivery (LEGACY method).
+  # Required IN ADDITION to the modern service principal — the ALB
+  # `ModifyLoadBalancerAttributes` synchronous test-write rejects with
+  # `InvalidConfigurationRequest: Access Denied for bucket` in us-east-2
+  # when ONLY the modern service principal is granted. Empirically
+  # verified on the live `bootstrap-alb-sandbox` ALB after sandbox apply
+  # run 26259811292: bucket policy with service-principal-only → 400
+  # AccessDenied; same policy with this legacy account added → modify
+  # succeeds. The d7775d15 cleanup that dropped the legacy statement
+  # ("`aws_elb_service_account` is deprecated") was the regression.
+  #
+  # Map sourced from
+  # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/enable-access-logging.html#attach-bucket-policy
+  # rather than the deprecated `data "aws_elb_service_account"` data
+  # source (which would emit a `terraform plan` warning on the
+  # aws-provider versions this repo pins). Add a new region's entry
+  # here at the same time you widen `variables.tf::environment` /
+  # whatever else gates region selection — the precondition on
+  # `aws_s3_bucket_policy.alb_access_logs` (below) fails plan if the
+  # current region isn't in this map, so an unmapped region surfaces at
+  # plan time rather than mid-apply.
+  alb_log_delivery_account_ids = {
+    "us-east-1" = "127311923021"
+    "us-east-2" = "033677994240"
+    "us-west-1" = "027434742980"
+    "us-west-2" = "797873946194"
+  }
+
+  alb_log_delivery_account_id = lookup(local.alb_log_delivery_account_ids, data.aws_region.current.id, "")
 }
 
 resource "aws_s3_bucket" "alb_access_logs" {
@@ -205,16 +235,27 @@ resource "aws_s3_bucket_lifecycle_configuration" "alb_access_logs" {
   }
 }
 
-# Bucket policy: modern service-principal log delivery only.
+# Bucket policy: BOTH modern service-principal AND legacy regional ELB
+# log-delivery AWS-account principal. Both statements are load-bearing:
 #
-# Previously this policy carried a second statement using the legacy
-# AWS-account principal (via `data.aws_elb_service_account`) for
-# regions where the modern service principal wasn't yet available.
-# That data source is deprecated upstream and emits a `terraform plan`
-# warning on newer aws-provider releases. Every region this module
-# currently targets (us-east-2 sandbox + prod) supports the modern
-# service principal, so the legacy statement is dropped. See
-# `main.tf` for the re-add path if a future region requires it.
+#   - The modern service principal (`logdelivery.elasticloadbalancing.amazonaws.com`)
+#     is what AWS docs recommend for ongoing log delivery; it carries
+#     the confused-deputy conditions (SourceAccount + SourceArn).
+#   - The legacy AWS-account principal (`arn:<partition>:iam::<regional-elb-acct>:root`)
+#     is what ELB actually uses for the synchronous `ModifyLoadBalancerAttributes`
+#     test-write that runs when `access_logs.s3.enabled` flips false→true.
+#     Without it, the modify call rejects with `InvalidConfigurationRequest:
+#     Access Denied for bucket` in us-east-2 even though the modern
+#     statement is in place. Empirically verified on the live sandbox
+#     ALB after run 26259811292 — see the `alb_log_delivery_account_ids`
+#     local for the full evidence trail.
+#
+# An earlier cleanup (d7775d15) dropped the legacy statement on the
+# theory that the modern service principal was sufficient in regions
+# where it was supported. That assumption holds for ONGOING delivery
+# but NOT for the initial enable-attribute test write, which is what
+# this module hits on every ALB recreate. The legacy statement is
+# permanently load-bearing here, not a regional fallback.
 data "aws_iam_policy_document" "alb_access_logs" {
   # Modern service-principal log delivery; confused-deputy guarded.
   statement {
@@ -245,6 +286,26 @@ data "aws_iam_policy_document" "alb_access_logs" {
       variable = "aws:SourceArn"
       values   = ["arn:${data.aws_partition.current.partition}:elasticloadbalancing:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:loadbalancer/app/${local.alb_name}/*"]
     }
+  }
+
+  # Legacy regional ELB log-delivery account principal. Required for
+  # the synchronous test-write at `ModifyLoadBalancerAttributes` —
+  # see the header comment above. No confused-deputy conditions:
+  # the principal IS the AWS-managed ELB log-delivery account, which
+  # is already constrained to writing on behalf of ELB itself.
+  statement {
+    sid    = "ELBAccessLogsWriteLegacy"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:${data.aws_partition.current.partition}:iam::${local.alb_log_delivery_account_id}:root"]
+    }
+
+    actions = ["s3:PutObject"]
+    resources = [
+      "${aws_s3_bucket.alb_access_logs.arn}/AWSLogs/${data.aws_caller_identity.current.account_id}/*",
+    ]
   }
 
   # Deny non-TLS access. Belt-and-suspenders alongside the bucket-level
@@ -282,6 +343,19 @@ resource "aws_s3_bucket_policy" "alb_access_logs" {
   # being in place first means the policy put fails closed instead
   # of silently widening access.
   depends_on = [aws_s3_bucket_public_access_block.alb_access_logs]
+
+  # Fail plan, not mid-apply, when the apply target lands in a region
+  # whose ELB log-delivery account ID isn't in
+  # `local.alb_log_delivery_account_ids`. An empty string would
+  # render `arn:aws:iam:::root` in the policy and AWS would reject
+  # the policy put with a generic InvalidPrincipal — surface the
+  # actionable error here instead.
+  lifecycle {
+    precondition {
+      condition     = local.alb_log_delivery_account_id != ""
+      error_message = "No ALB log-delivery account ID mapped for region ${data.aws_region.current.id}. Add the value to `local.alb_log_delivery_account_ids` in `modules/bootstrap-alb/access_logs.tf` (sourced from https://docs.aws.amazon.com/elasticloadbalancing/latest/application/enable-access-logging.html#attach-bucket-policy)."
+    }
+  }
 }
 
 # ── Athena query-results bucket ──

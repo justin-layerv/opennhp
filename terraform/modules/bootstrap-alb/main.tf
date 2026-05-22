@@ -23,18 +23,22 @@ data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 data "aws_partition" "current" {}
 
-# Note: previously included `data "aws_elb_service_account"` to source
-# the legacy AWS-account-principal for the log-bucket policy. That
-# data source is deprecated upstream (emits a `terraform plan` warning
-# on newer aws-provider releases) and the modern service principal
-# (`logdelivery.elasticloadbalancing.amazonaws.com`) — already used by
-# the second statement in `access_logs.tf` — is supported in every
-# region this module currently targets (us-east-2 sandbox + prod).
-# The legacy statement is dropped; if this module ever lands in a
-# region where the modern service principal isn't supported (none
-# exist today, but AWS occasionally launches partition-isolated
-# regions with delayed feature support), re-add a region-gated
-# legacy statement at that time.
+# Note: the regional ELB log-delivery account ID needed by the legacy
+# bucket-policy principal is looked up via a hardcoded
+# `local.alb_log_delivery_account_ids` map in `access_logs.tf` rather
+# than `data "aws_elb_service_account"` — the data source is
+# deprecated upstream and emits a `terraform plan` warning on newer
+# aws-provider releases. The map is the load-bearing replacement; see
+# the local's header for the per-region values + extension instructions.
+#
+# An earlier iteration of this module dropped the legacy statement
+# entirely on the assumption that the modern service principal
+# (`logdelivery.elasticloadbalancing.amazonaws.com`) was sufficient in
+# every region this module targets. That assumption proved wrong for
+# the `ModifyLoadBalancerAttributes` synchronous test-write — see the
+# `data "aws_iam_policy_document" "alb_access_logs"` header in
+# `access_logs.tf` for the empirical evidence trail (nhp run
+# 26259811292).
 
 locals {
   # Single source of truth for the project name. Surfaces as the ALB

@@ -454,11 +454,15 @@ AWS_PROFILE=<NHP_PROFILE> aws cloudwatch describe-alarms \
   --alarm-name-prefix bootstrap-alb-sandbox- \
   --query 'MetricAlarms[].[AlarmName,StateValue]' --output table
 
-# 3a. Access-log delivery is wired through the modern service
-#     principal (`logdelivery.elasticloadbalancing.amazonaws.com`).
-#     Failure mode is silent — no error surfaces, logs just never
-#     land — so verify explicitly after ~5–10 min. Probe traffic
-#     from earlier curls should appear here.
+# 3a. Access-log delivery is wired through BOTH the modern service
+#     principal (`logdelivery.elasticloadbalancing.amazonaws.com`) and
+#     the legacy regional ELB log-delivery AWS-account principal — the
+#     latter is what ELB uses for the synchronous test-write at
+#     ALB-create time; the former is what ongoing delivery uses (see
+#     `access_logs.tf` policy-doc header). Failure mode for ONGOING
+#     delivery is silent — no error surfaces, logs just never land —
+#     so verify explicitly after ~5–10 min. Probe traffic from earlier
+#     curls should appear here.
 ACCT_ID=$(AWS_PROFILE=<NHP_PROFILE> aws sts get-caller-identity --query Account --output text)
 AWS_PROFILE=<NHP_PROFILE> aws s3 ls \
   "s3://bootstrap-alb-alb-logs-${ENV}-${ACCT_ID}/AWSLogs/${ACCT_ID}/elasticloadbalancing/${REGION}/" \
@@ -466,9 +470,9 @@ AWS_PROFILE=<NHP_PROFILE> aws s3 ls \
 # Expect: at least one object under today's date. If empty after
 #         10+ min of generated probe traffic, the modern service
 #         principal isn't accepted by ELB log-delivery in this
-#         region — re-add the legacy `aws_elb_service_account`
-#         statement per main.tf header. (Today: us-east-2 supports
-#         the modern principal.)
+#         region — confirm the legacy statement is still in place
+#         (it should be; both principals are permanently load-bearing
+#         post run 26259811292).
 
 # 4. WAF WebACL is associated to the ALB.
 ALB_ARN=$(cd terraform && terraform output -raw bootstrap_alb_arn)
