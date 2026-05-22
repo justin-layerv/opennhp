@@ -3927,6 +3927,69 @@ check "bootstrap_alb_required_variables" {
   }
 }
 
+# Structural fence (closes #2083). PR #2082 fixed the original empty-TG
+# bug — bootstrap-ALB shipped with target_group_arn / alb_security_group_id
+# outputs documented as paired-PR-bound, the paired PR never landed, and
+# the customer-facing bootstrap.layerv.* endpoint sat 503 for weeks with
+# no plan-time signal. This `check` block catches the same shape of
+# half-wiring: when `deploy_bootstrap_alb = true`, the qurl-service
+# module MUST have been threaded with both passthroughs.
+#
+# Reads the value via two thin qurl-service outputs (echoes of the input
+# vars), so a missing passthrough at this module's call site shows up as
+# null at output time and trips the assert with an operator-actionable
+# error message.
+#
+# Severity: `check` emits a WARNING on every plan, not an apply-fail.
+# Right severity here — the underlying data plane works (the validator
+# 404s, customer sees 503) but no apply hazard exists to block. The
+# warning will surface on every plan run until the wiring is added, so
+# it can't be overlooked the way the original miss was. For HARD enforce-
+# ment a precondition on a `terraform_data` could be added in a follow-up
+# if operators end up ignoring the warning.
+# REVISIT IF: module.qurl_service ever migrates from `count` to
+# `for_each` (multi-tenant / multi-region split). `one(module.qurl_service[*]...)`
+# below is shape-agnostic for count-0 vs count-1 but would silently
+# pick whichever entry sorts first under for_each — at that point this
+# fence needs to iterate the set and assert ALL entries are threaded.
+check "bootstrap_alb_qurl_attachment_wired" {
+  assert {
+    # `one(module.qurl_service[*].xxx)` returns null when count=0 (no
+    # qurl-service module) and the scalar value when count=1. Composes
+    # cleanly with the `!= null` check and is index-safe regardless of
+    # HCL evaluation order — avoids relying on `&&` short-circuit to
+    # protect the `[0]` index access.
+    condition = (
+      var.deploy_bootstrap_alb == false || (
+        one(module.qurl_service[*].bootstrap_alb_target_group_arn) != null &&
+        one(module.qurl_service[*].bootstrap_alb_security_group_id) != null
+      )
+    )
+    error_message = <<-EOT
+      deploy_bootstrap_alb = true but module.qurl_service was not
+      threaded with bootstrap_alb_target_group_arn /
+      bootstrap_alb_security_group_id passthroughs. The bootstrap-ALB's
+      target group will sit empty and customer sidecars will see
+      HTTP 503 nginx-no-healthy-target on bootstrap.layerv.<tld>
+      until the wiring is added in terraform/main.tf's module
+      "qurl_service" block:
+
+        bootstrap_alb_target_group_arn  = var.deploy_bootstrap_alb ? module.bootstrap_alb[0].target_group_arn  : null
+        bootstrap_alb_security_group_id = var.deploy_bootstrap_alb ? module.bootstrap_alb[0].alb_security_group_id : null
+
+      This is the same outage shape closed by PR #2082; see issue
+      #2083 for the rationale on this structural fence. The warning
+      ALSO fires if deploy_qurl_service is false while deploy_bootstrap_alb
+      is true — bootstrap-ALB without qurl-service is unsupported (the
+      bootstrap-ALB's listener-rule forwards to qurl-service exclusively).
+      In that case, `one(module.qurl_service[*]...)` resolves to null,
+      so the assert correctly fails — but the operator-friendly fix is
+      to flip deploy_qurl_service=true (and add the passthroughs above),
+      not to silence the warning.
+    EOT
+  }
+}
+
 module "bootstrap_alb" {
   count  = var.deploy_bootstrap_alb ? 1 : 0
   source = "./modules/bootstrap-alb"

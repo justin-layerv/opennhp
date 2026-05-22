@@ -69,3 +69,26 @@ output "ecs_service_ssm_param" {
   description = "SSM parameter name containing ECS service name (for CI)"
   value       = aws_ssm_parameter.ecs_service.name
 }
+
+# ============================================================================
+# Wiring-fence echoes — consumed ONLY by the root-level
+# `check "bootstrap_alb_qurl_attachment_wired"` block in terraform/main.tf.
+# DO NOT consume from non-fence contexts: these outputs are intentionally
+# `var.foo` round-trips, NOT derived module state. They exist to let the
+# root-level check detect what was actually threaded into this module
+# (which `try()` at the call site can't disambiguate).
+# ============================================================================
+
+# See PR #2082 for the empty-TG / 503 outage these guard against and
+# issue #2083 for the structural fence story. Null = wiring missing OR
+# deploy_bootstrap_alb=false (both legitimate during pre-Wave-5 posture);
+# the root check disambiguates by also gating on var.deploy_bootstrap_alb.
+output "bootstrap_alb_target_group_arn" {
+  description = "Echo of var.bootstrap_alb_target_group_arn — consumed by the root-level attachment-fence check. Null when no attachment is configured."
+  value       = var.bootstrap_alb_target_group_arn
+}
+
+output "bootstrap_alb_security_group_id" {
+  description = "Echo of var.bootstrap_alb_security_group_id — consumed by the root-level attachment-fence check. Null when no attachment is configured."
+  value       = var.bootstrap_alb_security_group_id
+}
