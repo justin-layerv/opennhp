@@ -153,7 +153,7 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 		}
 
 		// perform knock auth and open ip rule from the agent src address and resource dst address
-		ackMsg, err = handler.AuthWithNHP(authReq, s.NewNhpServerHelper(ppd))
+		ackMsg, err = handler.AuthWithNHP(authReq, s.NewNhpServerHelper(ppd, aspData))
 		if err != nil {
 			log.Info("server-agent(%s#%d@%s)[HandleKnockRequest] failed: %+v", knkMsg.UserId, transactionId, addrStr, err)
 			s.metrics.IncrCounter(MetricAuthFailure)

@@ -2606,6 +2606,12 @@ func (s *UdpServer) RemoveAddressAssociation(srcIp string) {
 	s.srcIpAssociatedAddrMapMutex.Unlock()
 }
 
+// Deprecated: AddAuthService mutates `s.authServiceMap` in place while
+// plugins read `helper.AspData.ResourceGroups` lock-free (see
+// `nhp/plugins/serverpluginhandler.go::NhpServerPluginHelper.AspData`).
+// The production path goes through `updateResources`' build-fresh-then-
+// atomic-swap pattern; this method appears to have no in-tree callers
+// today. See https://github.com/layervai/nhp/issues/2098 for cleanup.
 func (s *UdpServer) AddAuthService(aspData *common.AuthServiceProviderData) error {
 	if len(aspData.AuthSvcId) == 0 {
 		return errors.New("aspId is empty")
@@ -2627,6 +2633,12 @@ func (s *UdpServer) AddAuthService(aspData *common.AuthServiceProviderData) erro
 	return nil
 }
 
+// Deprecated: AddResource mutates `aspData.ResourceGroups` in place
+// while plugins read it lock-free (see
+// `nhp/plugins/serverpluginhandler.go::NhpServerPluginHelper.AspData`).
+// The production path goes through `updateResources`' build-fresh-then-
+// atomic-swap pattern; this method appears to have no in-tree callers
+// today. See https://github.com/layervai/nhp/issues/2098 for cleanup.
 func (s *UdpServer) AddResource(res *common.ResourceData) error {
 	if len(res.AuthServiceId) == 0 || len(res.ResourceId) == 0 {
 		return errors.New("aspId or resId is empty")
@@ -3149,9 +3161,23 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 	return ackMsg, nil
 }
 
-func (us *UdpServer) NewNhpServerHelper(ppd *core.PacketParserData) *plugins.NhpServerPluginHelper {
+// NewNhpServerHelper builds the per-knock plugin helper. aspData is the
+// AuthServiceProviderData that matched the knock's AuthServiceId — the
+// caller already resolved it via FindAuthSvcProvider, so we plumb it
+// through rather than have plugins re-lookup. Plugins without their own
+// resource registry (e.g. the agent-bootstrap `layerv` plugin) read
+// `helper.AspData.ResourceGroups[resourceId]` to dispatch AC ops on the
+// host server's resource.toml-loaded catalog.
+//
+// Call-site contract: the knock path (`nhpauth.go`) plumbs aspData;
+// the OTP/Register/List paths (`msghandler.go`) intentionally pass nil
+// because passcode/OIDC carry their own SDK-backed resource registry
+// and don't read AspData. A future static plugin needing AspData on
+// those flows must update all three msghandler call sites.
+func (us *UdpServer) NewNhpServerHelper(ppd *core.PacketParserData, aspData *common.AuthServiceProviderData) *plugins.NhpServerPluginHelper {
 	h := &plugins.NhpServerPluginHelper{}
 	h.StopSignal = ppd.ConnData.StopSignal
+	h.AspData = aspData
 
 	h.AuthWithNhpCallbackFunc = func(req *common.NhpAuthRequest, res *common.ResourceData) (*common.ServerKnockAckMsg, error) {
 		return us.handleNhpOpenResource(req, res)

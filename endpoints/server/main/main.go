@@ -20,6 +20,7 @@ import (
 	// Import statically compiled plugins to trigger their init() registration
 	// These are in staticplugins/ (not plugins/) because they're compiled into the binary,
 	// not built as .so files by the plugins Makefile
+	_ "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/layerv"
 	_ "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/oidc"
 	_ "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/passcode"
 	_ "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/qurl"
@@ -85,13 +86,13 @@ func main() {
 func printBanner() {
 	banner := `
 ` + colorCyan + colorBold + `
-   ____                   _   _ _   _ ____  
-  / __ \                 | \ | | | | |  _ \ 
+   ____                   _   _ _   _ ____
+  / __ \                 | \ | | | | |  _ \
  | |  | |_ __   ___ _ __ |  \| | |_| | |_) |
- | |  | | '_ \ / _ \ '_ \| . ' |  _  |  __/ 
- | |__| | |_) |  __/ | | | |\  | | | | |    
-  \____/| .__/ \___|_| |_|_| \_|_| |_|_|    
-        | |                                  
+ | |  | | '_ \ / _ \ '_ \| . ' |  _  |  __/
+ | |__| | |_) |  __/ | | | |\  | | | | |
+  \____/| .__/ \___|_| |_|_| \_|_| |_|_|
+        | |
         |_|  ` + colorReset + colorDim + `Network-infrastructure Hiding Protocol` + colorReset + `
 ` + colorPurple + `
   ⭐ GitHub: ` + colorReset + `https://github.com/OpenNHP/opennhp

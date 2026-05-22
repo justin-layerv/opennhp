@@ -219,6 +219,36 @@ type HttpPluginPostAuthFunc func(*common.HttpKnockRequest, *common.ResourceData)
 type NhpServerPluginHelper struct {
 	StopSignal              <-chan struct{}
 	AuthWithNhpCallbackFunc NhpPluginPostAuthFunc
+
+	// AspData is the AuthServiceProviderData matched for the incoming
+	// knock's AuthServiceId. Plugins that don't carry a per-plugin
+	// resource registry (the agent-bootstrap flow, where the resource
+	// catalog lives in the host server's resource.toml `aspMap`) read
+	// the requested resource off AspData.ResourceGroups[resourceId].
+	// Pre-existing plugins (passcode, oidc) keep their own SDK-backed
+	// resourceHandler and don't read this field — nil-safe by design.
+	//
+	// READ-ONLY: plugins MUST NOT mutate AspData or any value reached
+	// through it. The host server treats published aspData as
+	// immutable from the lock-free read path, and a plugin write
+	// would race every concurrent reader as well as the next
+	// `updateResources` rebuild.
+	//
+	// Concurrency: plugins read AspData and its ResourceGroups
+	// lock-free. The host's `updateResources` mutates the fresh
+	// aspMap's resources pre-publication (writing `AuthServiceId` /
+	// `ResourceId` onto each ResourceData), then atomically swaps
+	// `s.authServiceMap` under Lock (`endpoints/server/config.go`).
+	// Post-swap the published aspData is effectively immutable from
+	// THAT PATH — the lock-free read sees a stable snapshot.
+	//
+	// Caveat: `UdpServer.AddResource` and `UdpServer.AddAuthService`
+	// (`endpoints/server/udpserver.go`) DO mutate a live aspData's
+	// `ResourceGroups` in place under `authServiceMapMutex`. They
+	// appear unused today (no callers in-tree) — but until they're
+	// removed or callers are added behind a proper swap, any
+	// resurrected use would race against this lock-free read.
+	AspData *common.AuthServiceProviderData
 }
 
 type HttpServerPluginHelper struct {

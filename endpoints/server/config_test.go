@@ -389,6 +389,7 @@ func TestFRPSResourceTOMLOverlay_SchemaMatchesAuthSvcProviderMap(t *testing.T) {
 
 ["layerv".ResourceGroups."frps-prod"]
 OpenTime = 120
+SkipAuth = true
 
 ["layerv".ResourceGroups."frps-prod".Resources."frps-prod"]
 ACId = "layerv-ac-tf"
@@ -401,6 +402,7 @@ Addr.Protocol = "tcp"
 
 ["layerv".ResourceGroups."frps-us-east-1"]
 OpenTime = 120
+SkipAuth = true
 
 ["layerv".ResourceGroups."frps-us-east-1".Resources."frps-us-east-1"]
 ACId = "layerv-ac-tf"
@@ -444,6 +446,19 @@ Addr.Protocol = "tcp"
 	// AC-constant-mirror rationale.
 	if got, want := rg.OpenTime, uint32(DefaultIpOpenTime); got != want {
 		t.Errorf("ResourceGroups[\"frps-prod\"].OpenTime = %d, want %d (DefaultIpOpenTime). The three-way chain is: TF `local.frps_open_time` (terraform/resources.tf) → rendered TOML literal in the fixture above → `DefaultIpOpenTime` constant (endpoints/server/constants.go). A drift on any leg fails this assertion; the fix is to update all three in lockstep.", got, want)
+	}
+	// SkipAuth = true is load-bearing: the layerv static plugin
+	// (`endpoints/server/staticplugins/layerv/main.go::AuthWithNHP`)
+	// fences on `res.SkipAuth` and refuses with
+	// `ErrBackendAuthRequired` (52007) if it's false. The agent-
+	// bootstrap flow has no backend-auth path — X25519+DDB pubkey
+	// resolution upstream IS the access control — so the TF render
+	// MUST flag SkipAuth on every FRPS-overlay resource. A TF-side
+	// regression that drops `SkipAuth = true` from
+	// `local.frps_resource_toml_overlay` would silently turn every
+	// production knock into a 52007. This assertion fails first.
+	if !rg.SkipAuth {
+		t.Errorf("ResourceGroups[\"frps-prod\"].SkipAuth = false, want true. The layerv plugin fences on res.SkipAuth; a missing SkipAuth=true in the FRPS overlay rendering surfaces here, not at first prod knock. Restore the `SkipAuth = true` line in `local.frps_resource_toml_overlay` (terraform/resources.tf) alongside OpenTime.")
 	}
 	// Critical: the inner Resources map MUST be populated. `handleNhpOpenResource`
 	// iterates `res.Resources`; an empty Resources map silently yields zero

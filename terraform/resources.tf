@@ -220,6 +220,18 @@ locals {
           "",
           "[\"${var.ac_auth_service_id}\".ResourceGroups.\"${res_id}\"]",
           "OpenTime = ${local.frps_open_time}",
+          # SkipAuth = true is load-bearing: the layerv static plugin
+          # (endpoints/server/staticplugins/layerv/main.go) fences on
+          # `res.SkipAuth` and refuses with ErrBackendAuthRequired
+          # (52007) if it's false. The agent-bootstrap flow has no
+          # backend-auth path — the X25519+DDB pubkey resolution in
+          # `nhpauth.go::resolveAgentPeerForKnock` IS the access
+          # control — so flagging SkipAuth here is the matching
+          # contract from terraform's side. Same shape as
+          # passcode/oidc resources. TF↔Go drift on this is fenced
+          # by TestFRPSResourceTOMLOverlay_SkipAuthTrue in
+          # endpoints/server/config_test.go.
+          "SkipAuth = true",
           "",
           # Inner resourceName matches outer resourceId — see schema doc above.
           "[\"${var.ac_auth_service_id}\".ResourceGroups.\"${res_id}\".Resources.\"${res_id}\"]",

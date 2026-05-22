@@ -638,7 +638,11 @@ func (s *UdpServer) HandleOTPRequest(ppd *core.PacketParserData) (err error) {
 		},
 	}
 
-	err = handler.RequestOTP(otpReq, s.NewNhpServerHelper(ppd))
+	// aspData=nil for OTP/Register/List paths: the plugins backing
+	// these flows (passcode, OIDC) carry their own SDK-backed
+	// resourceHandler and don't read helper.AspData. The host server's
+	// aspMap is plumbed through only for the knock path today.
+	err = handler.RequestOTP(otpReq, s.NewNhpServerHelper(ppd, nil))
 	if err != nil {
 		log.Error("server-agent(%s#%d@%s)[HandleOTPRequest] error: %v", otpMsg.UserId, transactionId, addrStr, err)
 		return err
@@ -688,7 +692,7 @@ func (s *UdpServer) HandleRegisterRequest(ppd *core.PacketParserData) (err error
 			},
 		}
 
-		rakMsg, err = handler.RegisterAgent(regReq, s.NewNhpServerHelper(ppd))
+		rakMsg, err = handler.RegisterAgent(regReq, s.NewNhpServerHelper(ppd, nil))
 		if err != nil {
 			log.Error("server-agent(%s#%d@%s)[HandleRegisterRequest] error: %v", regMsg.UserId, transactionId, addrStr, err)
 			return
@@ -750,7 +754,7 @@ func (s *UdpServer) HandleListRequest(ppd *core.PacketParserData) (err error) {
 			},
 		}
 
-		lrtMsg, err = handler.ListService(listReq, s.NewNhpServerHelper(ppd))
+		lrtMsg, err = handler.ListService(listReq, s.NewNhpServerHelper(ppd, nil))
 		if err != nil {
 			log.Error("server-agent(%s#%d@%s)[HandleListRequest] error: %v", lstMsg.UserId, transactionId, addrStr, err)
 			return
