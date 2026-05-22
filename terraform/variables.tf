@@ -908,6 +908,18 @@ variable "qurl_desired_count" {
   default     = 1
 }
 
+variable "qurl_container_port" {
+  description = "TCP port qurl-service tasks listen on. Threaded into BOTH module.qurl_service (container_port) AND module.bootstrap_alb (target_port) at the env-root call sites so the two cannot drift: bootstrap-alb's target group silently health-checks the wrong port if its target_port disagrees with the qurl-service container_port (modules/bootstrap-alb/variables.tf::target_port description explicitly calls out this footgun). Each module continues to carry its own `default = 8080` so they remain independently usable; this env-root var is the single source of truth WHEN BOTH modules are composed together. Changing this var rolls both attachments to the new port."
+  type        = number
+  default     = 8080
+  nullable    = false
+
+  validation {
+    condition     = var.qurl_container_port > 0 && var.qurl_container_port < 65536
+    error_message = "qurl_container_port must be a valid TCP port (1–65535)."
+  }
+}
+
 variable "qurl_autoscaling_min_capacity" {
   description = "Minimum number of QURL ECS tasks for auto-scaling (production only)"
   type        = number

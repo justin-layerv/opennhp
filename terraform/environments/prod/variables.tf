@@ -854,6 +854,18 @@ variable "qurl_container_memory" {
   }
 }
 
+variable "qurl_container_port" {
+  description = "TCP port qurl-service tasks listen on. Threaded into BOTH module.qurl_service (container_port) AND module.bootstrap_alb (target_port) at the nhp module level so the two cannot drift (modules/bootstrap-alb/variables.tf::target_port explicitly calls out this footgun). Default 8080 — operators rarely override; only meaningful when the qurl-service container exposes a non-default port."
+  type        = number
+  default     = 8080
+  nullable    = false
+
+  validation {
+    condition     = var.qurl_container_port > 0 && var.qurl_container_port < 65536
+    error_message = "qurl_container_port must be a valid TCP port (1–65535)."
+  }
+}
+
 variable "qurl_grafana_cloud_enabled" {
   type    = bool
   default = false

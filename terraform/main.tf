@@ -1999,10 +1999,13 @@ module "qurl_service" {
   public_subnet_ids  = module.networking.public_subnet_ids
 
   # Container configuration
-  ecr_repo_url             = module.ecr.qurl_repo_url
-  image_tag_ssm_param      = "/${local.name_prefix}/qurl-api-image-tag"
-  container_cpu            = var.qurl_container_cpu
-  container_memory         = var.qurl_container_memory
+  ecr_repo_url        = module.ecr.qurl_repo_url
+  image_tag_ssm_param = "/${local.name_prefix}/qurl-api-image-tag"
+  container_cpu       = var.qurl_container_cpu
+  container_memory    = var.qurl_container_memory
+  # container_port is also threaded into module.bootstrap_alb.target_port
+  # below so the two cannot drift; see var.qurl_container_port description.
+  container_port           = var.qurl_container_port
   desired_count            = var.qurl_desired_count
   autoscaling_min_capacity = var.qurl_autoscaling_min_capacity
   autoscaling_max_capacity = var.qurl_autoscaling_max_capacity
@@ -2129,6 +2132,28 @@ module "qurl_service" {
   internal_certificate_arn  = local.qurl_internal_alb_enabled ? aws_acm_certificate_validation.qurl_internal[0].certificate_arn : null
   enforce_internal_alb_only = var.qurl_enforce_internal_alb_only
 
+  # Bootstrap-ALB attachment for the customer-sidecar bootstrap chain
+  # (paired with module.bootstrap_alb). When deploy_bootstrap_alb=false
+  # both expressions short-circuit to null, so the qurl-service module
+  # elides both the load_balancer block and the SG ingress — pre-Wave-5
+  # posture unchanged. When deploy_bootstrap_alb=true the ECS service
+  # registers against the bootstrap-ALB TG and the task SG accepts
+  # traffic from the bootstrap-ALB SG; this is what closes the gap
+  # that produced 503 nginx-no-healthy-target responses on
+  # bootstrap.layerv.<tld> until now.
+  #
+  # WHY NOT `try(module.bootstrap_alb[0].xxx, null)`: try() would also
+  # silently absorb an output rename in bootstrap-alb (the precondition
+  # would pass both-null and the wiring would quietly regress — exactly
+  # the bug class this PR is fixing). The explicit conditional resolves
+  # `module.bootstrap_alb[0].target_group_arn` directly when the module
+  # is enabled, so a future rename fails plan-time with "Unsupported
+  # attribute" — which is what we want. Issue #2083 still tracks the
+  # complementary root-level `check` block for the OTHER failure mode
+  # (env-root operator forgetting to thread both passthroughs at all).
+  bootstrap_alb_target_group_arn  = var.deploy_bootstrap_alb ? module.bootstrap_alb[0].target_group_arn : null
+  bootstrap_alb_security_group_id = var.deploy_bootstrap_alb ? module.bootstrap_alb[0].alb_security_group_id : null
+
   # ALB access logs (required for production)
   alb_access_logs_bucket = var.qurl_alb_access_logs_bucket
 
@@ -2203,8 +2228,29 @@ module "qurl_service" {
   # Tunnel auth feature gate (qurl-service PR #277; default false until #405/#396 land)
   tunnel_auth_enabled = var.qurl_tunnel_auth_enabled
 
-  # Ensure the HMAC secret is seeded before the ECS task pulls it via valueFrom.
-  depends_on = [terraform_data.nhp_internal_auth_seed]
+  # depends_on:
+  #  - terraform_data.nhp_internal_auth_seed: ensure the HMAC secret is seeded
+  #    before the ECS task pulls it via valueFrom.
+  #  - module.bootstrap_alb: ensure the bootstrap-ALB listener exists before
+  #    aws_ecs_service.qurl runs RegisterTargets against the bootstrap-ALB TG
+  #    (the cross-module ref on bootstrap_alb_target_group_arn implicitly
+  #    orders on the TG only, not the listener — see the dynamic load_balancer
+  #    block in modules/qurl-service/main.tf for the failure mode). When
+  #    deploy_bootstrap_alb=false the count=0 module contributes nothing.
+  #    The narrower dep would be `module.bootstrap_alb[0].alb_listener_rule_arn`
+  #    — not the listener itself, since `aws_lb_listener.https` has a
+  #    fixed-response 404 default_action; it's `aws_lb_listener_rule.bootstrap`
+  #    that actually associates the TG to the LB via its forward action.
+  #    `modules/bootstrap-alb/outputs.tf` deliberately omits the listener
+  #    and listener-rule outputs to preserve a narrow-surface invariant
+  #    (extending the bootstrap ALB via path-based rules is explicitly not
+  #    the intended path). Module-level dep is therefore the right trade-off
+  #    here; future maintainers should not try to "tighten" without also
+  #    revisiting that invariant.
+  depends_on = [
+    terraform_data.nhp_internal_auth_seed,
+    module.bootstrap_alb,
+  ]
 }
 
 # =============================================================================
@@ -3964,9 +4010,15 @@ module "bootstrap_alb" {
   # that's ever removed, switch this passthrough to `coalesce(...)`.
   alb_elb_5xx_threshold_per_minute = var.bootstrap_alb_elb_5xx_threshold_per_minute
 
-  # `bootstrap_path`, `target_port`, `health_check_path`, WAF rule list,
-  # access-log retention, alarm thresholds — module defaults apply.
-  # Override in env tfvars only with explicit evidence.
+  # Match bootstrap-ALB's target_port to qurl-service's container_port at a
+  # single env-root source-of-truth — both module defaults are 8080 but they
+  # can diverge silently (bootstrap-alb's TG would then health-check the
+  # wrong port; see modules/bootstrap-alb/variables.tf::target_port).
+  target_port = var.qurl_container_port
+
+  # `bootstrap_path`, `health_check_path`, WAF rule list, access-log
+  # retention, alarm thresholds — module defaults apply. Override in env
+  # tfvars only with explicit evidence.
 
   # IAM-propagation race: the bootstrap-alb access-log + Athena buckets
   # are scoped under `arn:aws:s3:::bootstrap-alb-*` in the CI role's

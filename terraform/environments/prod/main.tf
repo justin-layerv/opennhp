@@ -240,6 +240,7 @@ module "nhp" {
   # QURL Container Sizing
   qurl_container_cpu    = var.qurl_container_cpu
   qurl_container_memory = var.qurl_container_memory
+  qurl_container_port   = var.qurl_container_port
 
   # QURL Grafana Cloud
   qurl_grafana_cloud_enabled = var.qurl_grafana_cloud_enabled

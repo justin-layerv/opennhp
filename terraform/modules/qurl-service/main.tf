@@ -787,6 +787,40 @@ resource "aws_security_group" "ecs" {
     }
   }
 
+  # Bootstrap-ALB ingress (paired with modules/bootstrap-alb). The
+  # bootstrap-ALB module deliberately widens its OWN egress to vpc_cidr
+  # because cross-account SG references are brittle on the egress side
+  # (see modules/bootstrap-alb/security_groups.tf header) — so this
+  # SG-scoped ingress on the task SG is the load-bearing access control
+  # between the bootstrap-ALB ENIs and qurl-service tasks ONCE the
+  # legacy VPC-CIDR bypass closes. With enforce_internal_alb_only=false
+  # (the current posture in both envs), the legacy bypass at the
+  # `dynamic "ingress"` block above already admits any VPC-IP including
+  # the bootstrap-ALB ENIs, so this rule is structurally redundant in
+  # today's posture but forward-compat for the eventual flip to
+  # enforce_internal_alb_only=true (qurl-service #335 second-stage).
+  # Kept inline alongside the other ALB ingresses for the same reason
+  # called out above. Null var → ingress elides.
+  #
+  # Pairing invariant: this ingress and the bootstrap-ALB load_balancer
+  # block on aws_ecs_service.qurl (below) MUST be set together (both
+  # var-driven gates must agree). The constraint is enforced by the
+  # `precondition` on aws_ecs_service.qurl.lifecycle. If a future
+  # refactor splits this SG resource out of this module (e.g., into a
+  # shared modules/qurl-shared-sg/), MOVE OR DUPLICATE the precondition
+  # so this side of the pair is also fenced — otherwise the invariant
+  # quietly degrades.
+  dynamic "ingress" {
+    for_each = var.bootstrap_alb_security_group_id != null ? [1] : []
+    content {
+      from_port       = var.container_port
+      to_port         = var.container_port
+      protocol        = "tcp"
+      security_groups = [var.bootstrap_alb_security_group_id]
+      description     = "HTTP from bootstrap ALB"
+    }
+  }
+
   # All outbound (DynamoDB, Secrets Manager, Redis, etc.)
   egress {
     from_port   = 0
@@ -1574,6 +1608,32 @@ resource "aws_ecs_service" "qurl" {
     }
   }
 
+  # Register the same task IPs in the bootstrap-ALB target group (paired
+  # with modules/bootstrap-alb — see its target_group_arn output's
+  # description). Same in-place-add property as the internal block above.
+  # Null var → block elides, pre-Wave-5 posture unchanged.
+  #
+  # Cross-module ordering: the bootstrap-ALB's listener lives inside the
+  # bootstrap-alb module. Referencing var.bootstrap_alb_target_group_arn
+  # creates an implicit cross-module dep on the TG, but NOT on the listener
+  # (listener depends on TG, not the reverse), so on a fresh first-apply
+  # where bootstrap-alb is created in the same run, ECS CreateService can
+  # race the listener attach and fail with InvalidParameterException —
+  # ECS does NOT retry RegisterTargets across that error. The env-root
+  # closes this gap with `module.qurl_service.depends_on = [
+  # module.bootstrap_alb]` so the whole module waits for the bootstrap-ALB
+  # apply (listener included) to settle. On incremental applies
+  # (bootstrap-alb already present in state, this attachment added later)
+  # there is no race regardless.
+  dynamic "load_balancer" {
+    for_each = var.bootstrap_alb_target_group_arn != null ? [1] : []
+    content {
+      target_group_arn = var.bootstrap_alb_target_group_arn
+      container_name   = "qurl-api"
+      container_port   = var.container_port
+    }
+  }
+
   # Prevent premature unhealthy marking during slow container startups
   health_check_grace_period_seconds = 60
 
@@ -1590,6 +1650,17 @@ resource "aws_ecs_service" "qurl" {
   # Ignore changes to desired_count (managed by auto-scaling) and task_definition (managed by CI)
   lifecycle {
     ignore_changes = [desired_count, task_definition]
+
+    # bootstrap_alb_target_group_arn and bootstrap_alb_security_group_id
+    # must be set together (both null OR both non-null). Enforced here
+    # rather than as a cross-var validation block on the variables because
+    # symmetric var.A.validation ↔ var.B.validation references form a
+    # terraform plan-time cycle. The two referenced failure modes are the
+    # ones that would silently break the bootstrap data plane.
+    precondition {
+      condition     = (var.bootstrap_alb_target_group_arn == null) == (var.bootstrap_alb_security_group_id == null)
+      error_message = "bootstrap_alb_target_group_arn and bootstrap_alb_security_group_id must be set together (both null OR both non-null). Setting only the TG leaves the task SG without bootstrap-ALB ingress (registration succeeds, health checks 100% fail); setting only the SG omits the ECS load_balancer block, leaving the bootstrap-ALB TG with no registered targets (ingress allowed, but the ECS service never registers tasks)."
+    }
   }
 
   tags = merge(var.tags, {

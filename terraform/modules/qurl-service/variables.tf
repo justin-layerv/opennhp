@@ -308,6 +308,49 @@ variable "internal_alb_enabled" {
   default     = false
 }
 
+# Bootstrap-ALB attachment (paired with modules/bootstrap-alb). When the
+# env-root instantiates module.bootstrap_alb, it threads its target_group_arn
+# and alb_security_group_id outputs through these two vars; the module then
+# registers the ECS service against the TG and authorizes ingress from the
+# bootstrap-ALB SG. Both null = pre-Wave-5 posture (no attachment, no
+# ingress). Wiring is documented on the bootstrap-alb module's
+# target_group_arn / alb_security_group_id outputs, which call out this
+# module as the paired consumer.
+variable "bootstrap_alb_target_group_arn" {
+  description = "Target group ARN of the bootstrap-ALB. When non-null, aws_ecs_service.qurl adds a load_balancer block registering task IPs against this TG so POST /v1/agent/bootstrap traffic reaching bootstrap.layerv.<tld> lands on qurl-service. Threaded from env-root as `var.deploy_bootstrap_alb ? module.bootstrap_alb[0].target_group_arn : null` (NOT try() — try() would silently absorb a future output rename and let the precondition pass both-null, quietly regressing the wiring). Must be set together with bootstrap_alb_security_group_id — the both-null-or-both-set invariant is enforced by a precondition on aws_ecs_service.qurl in main.tf (precondition rather than dual variable-level validation because cross-var validation blocks form a cycle when each variable references the other)."
+  type        = string
+  default     = null
+
+  # Structural ARN validation (regex). Matches the pattern used by other
+  # ARN-typed vars in this file (jwt_secret_arn, nhp_internal_auth_secret_arn)
+  # and tightens the account-ID segment to [0-9]{12} per the ACM-cert
+  # convention at terraform/variables.tf (the stricter pattern in this
+  # repo). `aws[a-z-]*` accepts commercial (aws), GovCloud (aws-us-gov),
+  # and China (aws-cn). Catches typos and hand-threaded
+  # "targetgroup-abc-123"-style mistakes at plan-time rather than mid-apply
+  # with a less actionable AWS-side error.
+  validation {
+    condition     = var.bootstrap_alb_target_group_arn == null || can(regex("^arn:aws[a-z-]*:elasticloadbalancing:[a-z0-9-]+:[0-9]{12}:targetgroup/.+", var.bootstrap_alb_target_group_arn))
+    error_message = "bootstrap_alb_target_group_arn must be null (= no attachment) or a valid ELBv2 target-group ARN (arn:aws<-partition>?:elasticloadbalancing:REGION:12-DIGIT-ACCOUNT:targetgroup/NAME/ID)."
+  }
+}
+
+variable "bootstrap_alb_security_group_id" {
+  description = "Security group ID of the bootstrap-ALB. When non-null, aws_security_group.ecs gains an ingress rule on var.container_port from this SG — the actual access control between the bootstrap-ALB ENIs and the qurl-service task ENIs (the bootstrap-ALB's egress is widened to vpc_cidr per modules/bootstrap-alb/security_groups.tf, so the task-SG-side rule is the load-bearing one). Threaded from env-root as `var.deploy_bootstrap_alb ? module.bootstrap_alb[0].alb_security_group_id : null` (NOT try() — same rename-regression rationale as bootstrap_alb_target_group_arn). Must be set together with bootstrap_alb_target_group_arn — invariant enforced by the same precondition referenced on bootstrap_alb_target_group_arn."
+  type        = string
+  default     = null
+
+  # Structural SG-ID validation (regex). EC2 security-group IDs are
+  # `sg-` followed by 8 hex chars (legacy) or 17 hex chars (current).
+  # `+` keeps the regex partition-and-length-agnostic; the practical
+  # win is rejecting empty / whitespace / typo'd identifiers (e.g.
+  # `sgr-abc123`, `sg_abc123`) at plan-time.
+  validation {
+    condition     = var.bootstrap_alb_security_group_id == null || can(regex("^sg-[a-f0-9]+$", var.bootstrap_alb_security_group_id))
+    error_message = "bootstrap_alb_security_group_id must be null (= no attachment) or a valid EC2 security-group ID (sg-XXXXXXXX or sg-XXXXXXXXXXXXXXXXX)."
+  }
+}
+
 variable "internal_domain_name" {
   description = "Hostname served by the internal ALB (e.g., internal-api.qurl.layerv.xyz). Added to ALLOWED_HOSTS so HostValidation accepts it. Required when internal_alb_enabled = true."
   type        = string

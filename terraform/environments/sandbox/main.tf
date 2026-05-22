@@ -240,6 +240,7 @@ module "nhp" {
   # QURL Container Sizing
   qurl_container_cpu            = var.qurl_container_cpu
   qurl_container_memory         = var.qurl_container_memory
+  qurl_container_port           = var.qurl_container_port
   qurl_desired_count            = var.qurl_desired_count
   qurl_autoscaling_min_capacity = var.qurl_autoscaling_min_capacity
 
