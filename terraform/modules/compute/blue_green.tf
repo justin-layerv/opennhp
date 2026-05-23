@@ -308,6 +308,21 @@ resource "aws_lb_target_group" "https_green" {
 
   deregistration_delay = 30
 
+  # Mirror the blue HTTPS TG's connection_termination=true (see
+  # main.tf::aws_lb_target_group.https for the rationale + 2026-05-22
+  # incident reference + the disjoint-roles note re:
+  # deregistration_delay). When the listener flips green→blue and the
+  # green ASG shrinks, NLB must send RST on in-flight flows so CF
+  # detects the dead peer and retries on the new color on its own
+  # retry cadence (sub-second to single-digit seconds in practice,
+  # bounded by CF's connection-error retry budget) rather than
+  # sitting on its 60s OriginReadTimeout. Drift between
+  # the two colors is fenced at plan time by
+  # `check "https_target_group_blue_green_drift"` in main.tf — that
+  # block now also asserts {connection_termination, deregistration_delay}
+  # agreement; do not edit either color without the same edit here.
+  connection_termination = true
+
   tags = merge(var.tags, {
     Name        = "${var.name_prefix}-tg-https-green"
     Component   = "compute"

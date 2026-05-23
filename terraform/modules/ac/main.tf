@@ -1235,6 +1235,61 @@ resource "aws_lb_target_group" "ac_tcp" {
 
   deregistration_delay = 30
 
+  # See compute/main.tf::aws_lb_target_group.https for the rationale
+  # behind connection_termination=true on blue/green-managed TCP TGs.
+  # The AC NLB participates in the same flip pattern as the server
+  # NLB; without RST-on-dereg, in-flight TLS flows on a draining AC
+  # instance leave CloudFront (and any direct *.qurl.site client)
+  # waiting on their read timeout instead of cleanly retrying on the
+  # new color. The 2026-05-22 sandbox incident hit the server path
+  # first, but the AC path is structurally identical.
+  #
+  # **Blast-radius note for AC port 443**: this TG fronts Traefik's
+  # TLS passthrough → qurl-router (httputil.ReverseProxy + Hijacker,
+  # which CAN support WebSocket/SSE/streaming responses if customer
+  # backends use them). Today's known QURL targets are all
+  # short-poll request/response (login portal redirects,
+  # fileviewer page loads, S3 GETs), so the streaming case is
+  # latent capability not active traffic. Before the 2026-05-22 fix,
+  # an AC instance shrink during blue/green gave in-flight flows up
+  # to deregistration_delay=30s to complete. After the fix, they get
+  # an immediate RST and the client must reconnect (standard web
+  # behaviour for deploy-time blips — clients should already handle
+  # ECONNRESET → retry). The trade-off is intentional: the
+  # silent-stall failure mode (60s spinner → closed L3 firewall)
+  # is strictly worse for the dominant request/response traffic
+  # pattern than a clean RST is for the (presently latent) streaming
+  # case.
+  #
+  # **Duplicate-POST corollary**: on RST after an in-flight POST,
+  # CloudFront (or other retry-on-connection-error upstreams) will
+  # replay the request. For qURL token-consume flows on the SERVER
+  # path the qurl-service DDB conditional update is idempotent — a
+  # retry returns 403 not a double-consume. On THIS TG (AC TLS
+  # passthrough → customer backends), the qurl-router proxy
+  # forwards retries transparently; non-idempotent customer
+  # backends could see duplicate writes on a deploy-time blip
+  # where before the 2026-05-22 fix they would have seen a 60s
+  # stall instead. The
+  # alternative is strictly worse for the dominant request/response
+  # case.
+  #
+  # **Customer-endpoint audit as of 2026-05-22**: all known
+  # production QURL targets are GET / idempotent token-exchange
+  # flows (login portal redirects, fileviewer page loads, S3
+  # presigned-GET). No known non-idempotent customer POST endpoint
+  # exists on this path today. Future customer onboarding of a
+  # non-idempotent POST should weigh duplicate-write risk during
+  # deploy windows against the alternative 60s-stall failure mode;
+  # target-aware drain work tracked at #2130.
+  #
+  # If a future customer integration depends on the old drain
+  # window, the right fix is target-aware draining in the deploy
+  # procedure, not flipping this attribute back off — that work is
+  # filed at #2130 (target-aware drain) with preflight observability
+  # at #2127 (streaming-traffic detection on this TG).
+  connection_termination = true
+
   tags = var.tags
 }
 
@@ -1357,6 +1412,41 @@ resource "aws_lb_target_group" "ac_frps_control" {
   }
 
   deregistration_delay = 30
+
+  # **NOT setting connection_termination=true here** (cf. ac_tcp and
+  # the compute TGs). The dominant traffic on this TG is the customer
+  # frpc agent's long-lived yamux-multiplexed control session
+  # (one persistent TCP per active reverse tunnel), NOT short-lived
+  # request/response. The trade-off framing on ac_tcp ("silent 60s
+  # stall is strictly worse than a clean RST for the dominant
+  # request/response pattern; rare streaming case gets a reconnect")
+  # does NOT carry over verbatim — for FRP control, the streaming
+  # case IS the dominant pattern. Setting connection_termination=true
+  # would force every connected agent to ECONNRESET + re-knock + FRP
+  # re-login simultaneously on every AC blue/green flip; the
+  # thundering-herd shape (knock storm, ipset churn, FRPS login
+  # burst) could pressure MetricACConnEviction and FRPS rate limits.
+  # Avoiding that thundering-herd shape IS the reason we keep the
+  # AWS default here.
+  #
+  # **What deregistration_delay actually does on this TG**: with
+  # connection_termination=false,
+  # the 30s delay controls how long the LB stops routing NEW
+  # connections to the deregistering target while keeping it in the
+  # TG. It does NOT extend the instance's lifecycle — EC2/ASG
+  # termination is governed by ASG lifecycle hooks + the
+  # application's SIGTERM-to-exit window. In-flight yamux RPC
+  # survival on a draining AC instance therefore depends on the
+  # application's graceful-shutdown timing, NOT on this TG attribute.
+  # A future operator tuning either should know they're disjoint
+  # knobs (cf. compute/main.tf::aws_lb_target_group.https for the
+  # same disjoint-roles writeup on the connection_termination=true
+  # side).
+  #
+  # Removal of this whole TG is tracked in #2019 (AC out of the
+  # FRPS data path); after that lands the question becomes moot.
+  # Until then, AWS default (connection_termination=false) is the
+  # correct value here.
 
   tags = var.tags
 
@@ -1691,5 +1781,59 @@ resource "aws_dynamodb_table_item" "ac_license" {
 
   lifecycle {
     ignore_changes = [item]
+  }
+}
+
+# ============================================================================
+# Blue/green AC TCP target group drift detection
+#
+# The blue AC TCP target group (aws_lb_target_group.ac_tcp in main.tf) and
+# the green AC TCP target group (aws_lb_target_group.ac_tcp_green in
+# blue_green.tf) MUST have identical health-check + dereg semantics. They
+# serve the same TLS-passthrough traffic from AC instances; any divergence
+# means a blue/green swap will behave asymmetrically.
+#
+# Parallel to compute/main.tf::https_target_group_blue_green_drift —
+# created here as part of the 2026-05-22 sandbox incident remediation, which
+# added connection_termination=true on both colors and surfaced the
+# comment-decay risk on a now-second cross-color "keep these in sync" pair.
+# Health-check fields included for the same reason as the compute check
+# (round-2 review of #252 caught a manual drift between blue/green via
+# /health/live vs /health/knock-ready).
+#
+# Non-blocking warning — `terraform plan` shows the warning, the operator
+# resolves it by aligning the blocks together (and updating the comment
+# cross-references at both sites so the next reader knows it was deliberate).
+# ============================================================================
+check "ac_tcp_target_group_drift" {
+  assert {
+    condition = (
+      !var.enable_blue_green ||
+      length(aws_lb_target_group.ac_tcp_green) == 0 ||
+      (
+        aws_lb_target_group.ac_tcp.health_check[0].path == aws_lb_target_group.ac_tcp_green[0].health_check[0].path &&
+        aws_lb_target_group.ac_tcp.health_check[0].port == aws_lb_target_group.ac_tcp_green[0].health_check[0].port &&
+        aws_lb_target_group.ac_tcp.health_check[0].protocol == aws_lb_target_group.ac_tcp_green[0].health_check[0].protocol &&
+        aws_lb_target_group.ac_tcp.health_check[0].matcher == aws_lb_target_group.ac_tcp_green[0].health_check[0].matcher &&
+        aws_lb_target_group.ac_tcp.health_check[0].interval == aws_lb_target_group.ac_tcp_green[0].health_check[0].interval &&
+        aws_lb_target_group.ac_tcp.health_check[0].healthy_threshold == aws_lb_target_group.ac_tcp_green[0].health_check[0].healthy_threshold &&
+        aws_lb_target_group.ac_tcp.health_check[0].unhealthy_threshold == aws_lb_target_group.ac_tcp_green[0].health_check[0].unhealthy_threshold
+      )
+    )
+    error_message = "BLUE/GREEN AC HEALTH CHECK DRIFT: aws_lb_target_group.ac_tcp.health_check (main.tf) and aws_lb_target_group.ac_tcp_green.health_check (blue_green.tf) have diverged. Both target groups serve the same TLS-passthrough traffic and MUST have identical health check configurations or a blue/green swap will silently change health-check semantics. Diff the two health_check blocks and align them."
+  }
+
+  assert {
+    condition = (
+      !var.enable_blue_green ||
+      length(aws_lb_target_group.ac_tcp_green) == 0 ||
+      (
+        aws_lb_target_group.ac_tcp.connection_termination &&
+        aws_lb_target_group.ac_tcp_green[0].connection_termination &&
+        aws_lb_target_group.ac_tcp.deregistration_delay == 30 &&
+        aws_lb_target_group.ac_tcp_green[0].deregistration_delay == 30
+      )
+    )
+    error_message = "BLUE/GREEN AC DEREG SEMANTICS VALUE-ANCHOR: aws_lb_target_group.ac_tcp.{connection_termination,deregistration_delay} (main.tf) and aws_lb_target_group.ac_tcp_green.{connection_termination,deregistration_delay} (blue_green.tf) must satisfy connection_termination=true AND deregistration_delay=30 on BOTH colors. The 2026-05-22 incident regresses if either color drops connection_termination=true; an equality-only assert would let a future PR flip both to false together (silent regression). The 30s deregistration_delay value here is the disjoint LB-side cleanup window (NOT calibrated against the AC health-check timing, which is interval=30 × unhealthy_threshold=3 = 90s — that decoupling is intentional, see compute/main.tf::aws_lb_target_group.https for the disjoint-roles writeup). Edit both colors AND this assert in the same PR; comment cross-reference at blue_green.tf::ac_tcp_green carries the rationale."
   }
 }

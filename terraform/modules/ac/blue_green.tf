@@ -206,6 +206,17 @@ resource "aws_lb_target_group" "ac_tcp_green" {
 
   deregistration_delay = 30
 
+  # Mirror the blue AC TCP TG's connection_termination=true (see
+  # main.tf::aws_lb_target_group.ac_tcp for the rationale). Required
+  # for both colors so the blue/green flip in either direction sheds
+  # in-flight TLS flows with RST instead of letting them stall.
+  # Drift between the two colors is fenced at plan time by
+  # `check "ac_tcp_target_group_drift"` in main.tf — that block
+  # asserts {connection_termination, deregistration_delay} +
+  # health_check agreement; do not edit either color without the
+  # same edit here.
+  connection_termination = true
+
   tags = merge(var.tags, {
     Name        = "${var.name_prefix}-tg-ac-tcp-green"
     Component   = "ac"

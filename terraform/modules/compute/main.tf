@@ -1333,6 +1333,59 @@ resource "aws_lb_target_group" "https" {
 
   deregistration_delay = 30
 
+  # Force immediate TCP RST on in-flight flows when an instance is
+  # deregistered (e.g. blue/green flip + old-ASG shrink). Default is
+  # `false` for TCP/TLS TGs, which lets in-flight flows drain over
+  # `deregistration_delay`. That default was the trigger for the
+  # 2026-05-22 sandbox "qurl.link verifying-access page spins 60s,
+  # then redirects to a closed-L3 firewall" incident: CloudFront's
+  # pooled origin connections were stranded on a draining green
+  # instance, the gin handler returned 302 in 75ms but the TCP
+  # response never flushed before the instance was SIGTERM'd, and CF
+  # sat on its `OriginReadTimeout=60s` instead of detecting the dead
+  # peer and retrying immediately. Setting this `true` makes the
+  # dereg send RST → CF detects → CF retries on a fresh blue
+  # connection on its own retry cadence (sub-second to single-digit
+  # seconds in practice, bounded by CF's connection-error retry
+  # budget — much faster than the 60s OriginReadTimeout the
+  # pre-2026-05-22-fix behaviour incurred). Empirical retry
+  # latency to be confirmed by
+  # the sandbox repro listed in the PR test plan; the regime is
+  # "much better than 60s" either way. Matches the AWS-default
+  # behaviour the UDP TG already gets for free (UDP is stateless
+  # from NLB's POV).
+  #
+  # **POST-replay idempotency on this TG**: CF's connection-error
+  # retry will replay an in-flight POST. The /plugins/qurl path lands
+  # on qurl-service's atomic DDB conditional update
+  # (qurl-service/internal/repository/dynamodb/qurl_repo.go ConsumeTokenByHash);
+  # a replay returns 403 "Access Link Invalid" rather than double-
+  # consuming. See the parallel duplicate-POST writeup on
+  # ac/main.tf::aws_lb_target_group.ac_tcp for the customer-backend
+  # half (qurl-router forwards retries transparently — different
+  # idempotency surface).
+  #
+  # **Role of deregistration_delay above is now disjoint from
+  # in-flight TCP behaviour.** With connection_termination=true, the
+  # 30s deregistration_delay only governs LB-side target-state
+  # cleanup (the period during which the TG continues to report the
+  # deregistering target while it stops accepting NEW traffic) —
+  # in-flight TCP flows are RST'd immediately, NOT drained for up to
+  # 30s. A future operator tuning deploy timing should not read
+  # `deregistration_delay = 30` as "in-flight flows have 30s to
+  # complete"; they have ~0s and rely on the upstream retry instead.
+  #
+  # Why 30s is kept (not tightened): the value still controls how
+  # long the deregistering target stays visible in the TG before
+  # the LB forgets it. Tightening to <30s would make the LB stop
+  # routing NEW connections sooner but also race against
+  # health-check propagation (interval=10s, unhealthy_threshold=2
+  # = 20s minimum before a non-shutdown target stops being routed
+  # to). 30s preserves a small safety margin against that race
+  # without trading observable deploy speed; revisit only if
+  # health-check tuning changes.
+  connection_termination = true
+
   tags = merge(var.tags, {
     Name      = "${var.name_prefix}-tg-https"
     Component = "compute"
@@ -1705,11 +1758,22 @@ check "asg_ec2_health_check_invariant" {
 # update both blocks together AND keep the documentation cross-reference at
 # blue_green.tf::https_green in sync.
 # ============================================================================
-check "https_target_group_health_check_drift" {
+check "https_target_group_blue_green_drift" {
+  # Both asserts in this block use the same short-circuit shape:
+  # `!var.enable_blue_green || length(https) == 0 || length(https_green) == 0`.
+  # Strictly, `https` (blue) is counted on `enable_qurl_resolve_endpoint`
+  # alone, while `https_green` is counted on
+  # `enable_blue_green && enable_qurl_resolve_endpoint` — so the
+  # `length(https) == 0` term covers the qurl-endpoint-off case and the
+  # `!var.enable_blue_green` term covers the green-disabled case. The
+  # `!var.enable_qurl_resolve_endpoint` clause is therefore redundant
+  # with `length(https) == 0` and omitted.
+  # Asymmetric with `ac/main.tf::ac_tcp_target_group_drift` because
+  # ac_tcp (blue) is unconditional — that block has one `length == 0`
+  # term to compute's two.
   assert {
     condition = (
       !var.enable_blue_green ||
-      !var.enable_qurl_resolve_endpoint ||
       length(aws_lb_target_group.https) == 0 ||
       length(aws_lb_target_group.https_green) == 0 ||
       (
@@ -1723,5 +1787,29 @@ check "https_target_group_health_check_drift" {
       )
     )
     error_message = "BLUE/GREEN HEALTH CHECK DRIFT: aws_lb_target_group.https.health_check (main.tf) and aws_lb_target_group.https_green.health_check (blue_green.tf) have diverged. Both target groups serve the same traffic and MUST have identical health check configurations or a blue/green swap will silently change health-check semantics. Diff the two health_check blocks and align them. If the divergence is intentional (e.g. green is being upgraded), update this check together with the change so the next reader knows it was deliberate."
+  }
+
+  # connection_termination + deregistration_delay value-anchor. The
+  # 2026-05-22 sandbox incident (see the comment block on
+  # aws_lb_target_group.https) hinges on connection_termination=true
+  # on BOTH colors. An equality-only assert would let a future PR
+  # flip both to `false` together (silent regression on every flip);
+  # the absolute value-anchor below structurally prevents that —
+  # both colors must be `true` AND `deregistration_delay` must stay
+  # at 30s. To tune either, edit BOTH resources AND this assert in
+  # the same PR.
+  assert {
+    condition = (
+      !var.enable_blue_green ||
+      length(aws_lb_target_group.https) == 0 ||
+      length(aws_lb_target_group.https_green) == 0 ||
+      (
+        aws_lb_target_group.https[0].connection_termination &&
+        aws_lb_target_group.https_green[0].connection_termination &&
+        aws_lb_target_group.https[0].deregistration_delay == 30 &&
+        aws_lb_target_group.https_green[0].deregistration_delay == 30
+      )
+    )
+    error_message = "BLUE/GREEN DEREG SEMANTICS VALUE-ANCHOR: aws_lb_target_group.https.{connection_termination,deregistration_delay} (main.tf) and aws_lb_target_group.https_green.{connection_termination,deregistration_delay} (blue_green.tf) must satisfy connection_termination=true AND deregistration_delay=30 on BOTH colors. The 2026-05-22 'CF stalled on stranded green-server flow for 60s' incident regresses if either color drops connection_termination=true (silent failure mode); deregistration_delay=30 here is calibrated against the COMPUTE-side health-check-propagation window (interval=10 × unhealthy_threshold=2 = 20s). The sibling AC value-anchor at ac/main.tf::ac_tcp_target_group_drift also pins =30 but for a DIFFERENT reason (intentional decoupling from AC's interval=30 × unhealthy_threshold=3 = 90s window); don't pattern-match both pins as a parallel calibration. Edit both colors AND this assert in the same PR; the comment block at main.tf::aws_lb_target_group.https carries the full incident history."
   }
 }
