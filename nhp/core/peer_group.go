@@ -3,8 +3,6 @@ package core
 import (
 	"net"
 	"sync"
-
-	log "github.com/OpenNHP/opennhp/nhp/log"
 )
 
 // MaxPeerGroupSize is the maximum number of members in a PeerGroup.
@@ -36,22 +34,28 @@ func NewPeerGroup(first, second *UdpPeer) *PeerGroup {
 }
 
 // AddMember adds a peer to the group. If a member with the same IP and port
-// already exists, it is replaced (re-registration).
-func (pg *PeerGroup) AddMember(peer *UdpPeer) {
+// already exists, it is replaced (re-registration) and the call returns true.
+// Returns false if the group is already at MaxPeerGroupSize and the new peer
+// has a unique address — the peer is NOT added. Callers MUST check the return
+// value if they will subsequently attempt to communicate with the peer; a
+// refused peer is absent from the device peer pool and any response from it
+// will fail PeerGroup.CheckRecvAddress, producing a confusing
+// ErrPeerAddressMismatch instead of a clear "peer pool full" signal.
+func (pg *PeerGroup) AddMember(peer *UdpPeer) bool {
 	pg.mu.Lock()
 	defer pg.mu.Unlock()
 
 	for i, m := range pg.members {
 		if udpPeersShareAddress(m, peer) {
 			pg.members[i] = peer
-			return
+			return true
 		}
 	}
 	if len(pg.members) >= MaxPeerGroupSize {
-		log.Warning("PeerGroup: refusing to add member (size %d >= max %d)", len(pg.members), MaxPeerGroupSize)
-		return
+		return false
 	}
 	pg.members = append(pg.members, peer)
+	return true
 }
 
 // RemoveMember removes a member matching the given address (IP or Host()).

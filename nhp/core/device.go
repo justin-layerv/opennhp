@@ -504,7 +504,22 @@ func (d *Device) AddPeer(peer Peer) {
 
 	// Existing is already a PeerGroup — add the new member
 	if group, isGroup := existing.(*PeerGroup); isGroup {
-		group.AddMember(udpPeer)
+		if !group.AddMember(udpPeer) {
+			keyPrefix := key
+			if len(keyPrefix) > 8 {
+				keyPrefix = keyPrefix[:8] + "..."
+			}
+			// A refused member is absent from the device pool, but the
+			// caller's next packet will still be sent to it. The response
+			// then fails PeerGroup.CheckRecvAddress (the existing members
+			// hold their addresses within MinimalPeerAddressHoldTime) and
+			// surfaces as ErrPeerAddressMismatch — a cryptographic-binding
+			// error — rather than a peer-pool-full signal. This WARNING is
+			// what makes the actual cause findable in the next trace.
+			log.Warning("AddPeer: peer group for key %s is at MaxPeerGroupSize=%d; refused new member %s — caller cannot reach this peer until the group drains",
+				keyPrefix, MaxPeerGroupSize, udpPeer.Host())
+			return
+		}
 		log.Info("AddPeer: added member %s to peer group (size %d)", udpPeer.Host(), group.Len())
 		return
 	}

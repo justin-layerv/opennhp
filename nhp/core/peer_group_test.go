@@ -42,7 +42,9 @@ func TestPeerGroupAddMember(t *testing.T) {
 	pg := NewPeerGroup(p1, p2)
 
 	p3 := newTestUdpPeer("10.0.3.12", 62206)
-	pg.AddMember(p3)
+	if !pg.AddMember(p3) {
+		t.Fatal("expected AddMember to return true for a unique address with room in the group")
+	}
 
 	if pg.Len() != 3 {
 		t.Fatalf("expected 3 members, got %d", pg.Len())
@@ -54,9 +56,11 @@ func TestPeerGroupAddMember_ReRegistration(t *testing.T) {
 	p2 := newTestUdpPeer("10.0.2.8", 62206)
 	pg := NewPeerGroup(p1, p2)
 
-	// Re-register same address — should replace, not add
+	// Re-register same address — should replace, not add, and return true.
 	p1New := newTestUdpPeer("10.0.1.5", 62206)
-	pg.AddMember(p1New)
+	if !pg.AddMember(p1New) {
+		t.Fatal("expected AddMember to return true for re-registration at an existing address (replace path)")
+	}
 
 	if pg.Len() != 2 {
 		t.Fatalf("expected 2 members after re-registration, got %d", pg.Len())
@@ -69,13 +73,28 @@ func TestPeerGroupAddMember_MaxSize(t *testing.T) {
 	pg := NewPeerGroup(p1, p2)
 
 	for i := 3; i <= MaxPeerGroupSize; i++ {
-		pg.AddMember(newTestUdpPeer(fmt.Sprintf("10.0.1.%d", i), 62206))
+		if !pg.AddMember(newTestUdpPeer(fmt.Sprintf("10.0.1.%d", i), 62206)) {
+			t.Fatalf("expected AddMember #%d (before cap) to return true", i)
+		}
 	}
 
-	// One more should be refused
-	pg.AddMember(newTestUdpPeer("10.0.99.99", 62206))
+	// One more with a unique address must be refused.
+	refused := newTestUdpPeer("10.0.99.99", 62206)
+	if pg.AddMember(refused) {
+		t.Fatal("expected AddMember to return false when group is at MaxPeerGroupSize and the new address is unique")
+	}
 	if pg.Len() != MaxPeerGroupSize {
 		t.Fatalf("expected %d members at max, got %d", MaxPeerGroupSize, pg.Len())
+	}
+
+	// The cap only blocks appends; re-registration at an existing
+	// address must still succeed via the in-place replace branch.
+	replaceExisting := newTestUdpPeer("10.0.1.1", 62206)
+	if !pg.AddMember(replaceExisting) {
+		t.Fatal("expected AddMember to return true for re-registration at an existing address even when the group is at MaxPeerGroupSize")
+	}
+	if pg.Len() != MaxPeerGroupSize {
+		t.Fatalf("expected %d members after at-cap replace, got %d", MaxPeerGroupSize, pg.Len())
 	}
 }
 
@@ -351,6 +370,44 @@ func TestDeviceAddPeer_ThirdMemberAddsToGroup(t *testing.T) {
 	}
 	if group.Len() != 3 {
 		t.Fatalf("expected 3 members, got %d", group.Len())
+	}
+}
+
+// TestDeviceAddPeer_AtMaxSize_DoesNotAdd locks in the upper-layer
+// behavior of the diagnostic-gap fix: when AddMember refuses, Device.AddPeer
+// must not grow the group beyond MaxPeerGroupSize. Asserting at the
+// PeerGroup layer only (via the AddMember return value) leaves room for a
+// future Device.AddPeer refactor to break this invariant while the unit
+// tests still pass.
+func TestDeviceAddPeer_AtMaxSize_DoesNotAdd(t *testing.T) {
+	d := &Device{
+		peerMap: make(map[string]Peer),
+	}
+	for i := 1; i <= MaxPeerGroupSize; i++ {
+		d.AddPeer(newTestUdpPeer(fmt.Sprintf("10.0.1.%d", i), 62206))
+	}
+
+	got := d.LookupPeer(newTestUdpPeer("10.0.1.1", 62206).PublicKey())
+	group, isGroup := got.(*PeerGroup)
+	if !isGroup {
+		t.Fatalf("expected PeerGroup after %d AddPeer calls, got %T", MaxPeerGroupSize, got)
+	}
+	if group.Len() != MaxPeerGroupSize {
+		t.Fatalf("expected group at cap (size %d), got %d", MaxPeerGroupSize, group.Len())
+	}
+
+	// One more AddPeer with a unique address must not grow the group.
+	d.AddPeer(newTestUdpPeer("10.0.99.99", 62206))
+
+	if group.Len() != MaxPeerGroupSize {
+		t.Fatalf("Device.AddPeer must not grow PeerGroup beyond MaxPeerGroupSize=%d; got %d", MaxPeerGroupSize, group.Len())
+	}
+
+	// The refused address must not be reachable via the device pool.
+	for _, m := range group.Members() {
+		if m.Ip == "10.0.99.99" {
+			t.Fatal("refused address must not be present in PeerGroup membership")
+		}
 	}
 }
 
