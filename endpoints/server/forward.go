@@ -304,7 +304,31 @@ func (f *ServerForwarder) HandleForwardRequest(
 		return
 	}
 
-	// Step 3: Find all AC connections for this resource
+	// Resolve the auth service provider FIRST so a DDB-only aspId
+	// (one whose entry on this server was never populated by a prior
+	// LOCAL knock — easily possible if all knocks for that aspId
+	// arrive via forwarding because of AC affinity) is installed in
+	// s.authServiceMap BEFORE the next step's FindACConnectionsForKnock
+	// looks the AC up.
+	//
+	// FindACConnectionsForKnock calls FindAuthSvcProvider internally
+	// (udpserver.go) — the bare in-memory map lookup. If the aspId is
+	// DDB-only and we asked for AC connections first, that call would
+	// return nil → AC_NOT_CONNECTED reject before the resolver ever
+	// got a chance to populate the map. The two calls MUST stay in
+	// this order; an inversion silently dark-routes every DDB-only
+	// forwarded knock.
+	aspData := f.deps.ResolveAuthSvcProvider(f.deps.LifecycleCtx(), knkMsg.AuthServiceId,
+		fmt.Sprintf("forward-receiver tx=%d resource=%s authSvc=%s", fwdMsg.TransactionId, knkMsg.ResourceId, knkMsg.AuthServiceId))
+	if aspData == nil {
+		log.Error("Auth service provider not found for forwarded knock: %s", knkMsg.AuthServiceId)
+		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "ASP_NOT_FOUND", "Auth service provider not found")
+		return
+	}
+
+	// Find all AC connections for this resource. Reads authServiceMap
+	// (populated above by the resolver for the DDB-only case) to get
+	// the acId, then looks up the AC.
 	acConns := f.deps.FindACConnectionsForKnock(knkMsg)
 	if acConns == nil || len(acConns) == 0 {
 		log.Warning("No AC connection found for forwarded knock (resource=%s, authSvc=%s)",
@@ -313,18 +337,10 @@ func (f *ServerForwarder) HandleForwardRequest(
 		return
 	}
 
-	// Step 4: Process the knock - send AOP to AC and wait for ART
+	// Process the knock - send AOP to AC and wait for ART.
 	srcAddr := &common.NetAddress{
 		Ip:   userAddr.IP.String(),
 		Port: userAddr.Port,
-	}
-
-	// Get resource info for destination addresses
-	aspData := f.deps.FindAuthSvcProvider(knkMsg.AuthServiceId)
-	if aspData == nil {
-		log.Error("Auth service provider not found for forwarded knock: %s", knkMsg.AuthServiceId)
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "ASP_NOT_FOUND", "Auth service provider not found")
-		return
 	}
 
 	// Find resource data and resource info

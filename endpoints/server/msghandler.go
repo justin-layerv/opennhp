@@ -489,6 +489,126 @@ const (
 	// regressed. Stays at 0 for legitimate etcd / file-config
 	// deployments because cloud mode is off.
 	MetricAgentLookupNotConfigured = "AgentLookupNotConfigured"
+
+	// MetricResourceLookupCacheHit fires once per knock where
+	// ResourceLookup.LookupAuthServiceProvider served the aspData
+	// from the LRU (within TTL) without a DDB Query. Dashboards
+	// alongside MetricResourceLookupCacheMiss show the live
+	// hit-ratio so an unexpected cache-miss storm (TTL too short,
+	// LRU thrashing under multi-aspId load) is visible.
+	MetricResourceLookupCacheHit = "ResourceLookupCacheHit"
+
+	// MetricResourceLookupCacheMiss fires once per successful
+	// ResourceLookup DDB Query that populated the cache. Steady-state
+	// rate is bounded by the cache TTL × distinct aspIds knocked;
+	// a sustained increase decoupled from new-aspId deployments
+	// indicates LRU eviction pressure (today the cache is sized
+	// well above the active aspId count, so this should stay near
+	// zero outside the cache-warm window after a process restart).
+	MetricResourceLookupCacheMiss = "ResourceLookupCacheMiss"
+
+	// MetricResourceLookupDDBError fires once per knock that rejects
+	// because the nhp_resources DDB Query returned a transient
+	// error. Mirrors MetricAgentLookupDDBError's role/posture for
+	// the agent-peer lookup: kept distinct from MetricAuthFailure
+	// so the auth-failures alarm doesn't page on-call for what is
+	// actually an infrastructure event. ErrResourceUnknownASP
+	// (genuinely no rows for the requested aspId) routes through
+	// MetricAuthFailure because that IS an auth-policy outcome.
+	//
+	// Counter semantics under singleflight piggyback: same fanout
+	// shape as MetricAgentLookupDDBError — all N piggybackers receive
+	// the same wrapped error and each increments.
+	MetricResourceLookupDDBError = "ResourceLookupDDBError"
+
+	// MetricResourceLookupMalformedRow fires once per row that the
+	// resolver had to skip during a cache-miss iteration. The counter
+	// is overloaded across three semantically distinct trigger
+	// conditions — operators triaging a non-zero rate should grep the
+	// structured-log Warning for the cause:
+	//
+	//   - UnmarshalMap failed: writer wrote a row with a field type
+	//     drift (string-where-int, missing required field). Remediation:
+	//     reconcile terraform's `aws_dynamodb_table_item.frps_nhp_resource`
+	//     (terraform/resources.tf) with the Go Resource struct
+	//     (endpoints/server/storage.go::Resource).
+	//   - Cross-partition row (row.CustomerID != l.customerID): the
+	//     KeyConditionExpression regressed AND DDB returned rows from
+	//     a different partition. SEVERE — surfaces as a potential
+	//     cross-tenant correctness bug if the partition schema ever
+	//     becomes per-tenant. Remediation: audit recent changes to
+	//     queryAndCache's QueryInput construction.
+	//   - Empty resource_id: writer wrote a row missing the SK. The
+	//     SK is required at table level so this shouldn't reach the
+	//     reader, but defensive in case of a future schema change or
+	//     a hand-edited row. Remediation: identify the writer that
+	//     emitted the empty-SK row and fence it server-side.
+	//
+	// All three are structurally writer-side regressions of similar
+	// alarm urgency. A sustained non-zero value is evidence the
+	// terraform writer and the Go reader have drifted apart.
+	//
+	// Alarm-sizing caveat: this metric fires INSIDE the per-row loop
+	// in queryAndCache, and every cache-miss re-Queries the full
+	// partition, so the steady-state rate is roughly
+	// (malformed_row_count × cache_miss_rate × active_aspIds), not
+	// (malformed_row_count). With the 60s cache TTL, a single
+	// persistent malformed row produces ~1 emit/60s per distinct
+	// aspId in active use. The agent-peer analog
+	// (MetricAgentLookupDDBError on ErrAgentLookupMalformedRow)
+	// aborts on first malformed row and fires at most once per
+	// failed Query — a very different alarm-sizing posture. Operators
+	// copying agent-peer thresholds will under-alarm for this counter
+	// by a factor proportional to row count.
+	MetricResourceLookupMalformedRow = "ResourceLookupMalformedRow"
+
+	// MetricResourceLookupCrossPartition fires when DDB returns a
+	// row whose customer_id doesn't match the partition the resolver
+	// asked for. Today the KeyConditionExpression constrains the
+	// query so this is unreachable; the counter exists for the
+	// defense-in-depth fence at queryAndCache (a future regression
+	// in the query expression — typo, missing :cid substitution,
+	// AWS SDK quirk — could let cross-partition rows leak).
+	//
+	// Split out from MetricResourceLookupMalformedRow so the alarm
+	// threshold can be `> 0`. A cross-partition row in a
+	// per-tenant schema (the eventual #1976 evolution) would be a
+	// potential cross-tenant correctness bug — different alarm
+	// urgency than "writer emitted a row with a field type drift."
+	MetricResourceLookupCrossPartition = "ResourceLookupCrossPartition"
+
+	// MetricResourceLookupPagination fires when DDB returns a Query
+	// response with LastEvaluatedKey != nil (i.e., results past
+	// page 1 are silently dropped). Today the system partition holds
+	// a handful of rows and won't approach the 1MB page boundary; a
+	// future per-tenant schema with a large partition would surface
+	// here.
+	//
+	// Split out from MetricResourceLookupDDBError so the infra-trouble
+	// alarm stays clean of "operationally-successful but truncated"
+	// events. A non-zero rate means the resolver's catalog view is
+	// incomplete — operators should either expand the partition to
+	// real pagination (#2120) or split the partition.
+	MetricResourceLookupPagination = "ResourceLookupPagination"
+
+	// MetricResourceLookupInitFailure fires once at server startup
+	// when NewResourceLookupFromStorage returns an error. Mirrors
+	// MetricAgentLookupInitFailure's role/posture: catches the
+	// loud-failure path (storage decorator wrapper cycle today;
+	// future init failure modes added to NewResourceLookup) so a
+	// silent boot in cloud mode doesn't look healthy until the
+	// first knock fails with no DDB-error counter to alarm on.
+	MetricResourceLookupInitFailure = "ResourceLookupInitFailure"
+
+	// MetricResourceLookupNotConfigured fires once at server startup
+	// when cloud mode is on AND the resource lookup never wired AND
+	// no init error fired — the (nil, nil) "disabled by config"
+	// branch from NewResourceLookupFromStorage (ResourcesTable
+	// unset in storage.toml, storage backend missing, etc.).
+	//
+	// MUTUALLY EXCLUSIVE with MetricResourceLookupInitFailure — same
+	// single-cause-attribution posture as the agent-peer pair.
+	MetricResourceLookupNotConfigured = "ResourceLookupNotConfigured"
 )
 
 // Multi-AC broadcast observability metric names (issue #376).

@@ -1312,6 +1312,12 @@ func (d *testForwarderDepsWithDevice) FindACConnectionsForKnock(*common.AgentKno
 func (d *testForwarderDepsWithDevice) FindAuthSvcProvider(string) *common.AuthServiceProviderData {
 	return nil
 }
+func (d *testForwarderDepsWithDevice) ResolveAuthSvcProvider(context.Context, string, string) *common.AuthServiceProviderData {
+	return nil
+}
+func (d *testForwarderDepsWithDevice) LifecycleCtx() context.Context {
+	return context.Background()
+}
 func (d *testForwarderDepsWithDevice) ProcessACOperation(*common.AgentKnockMsg, *ACConn, *common.NetAddress, []*common.NetAddress, uint32) (*common.ACOpsResultMsg, error) {
 	return nil, nil
 }

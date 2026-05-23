@@ -316,6 +316,37 @@ type UdpServer struct {
 	// read would be a Go memory-model violation even if it happens
 	// to work on most architectures.
 	agentPeerLookup *AgentPeerLookup
+
+	// resourceLookup resolves a knock's AuthServiceId to a registered
+	// *common.AuthServiceProviderData via the nhp_resources DDB table
+	// with a 60s LRU. Populated only in cloud mode when ResourcesTable
+	// is configured; nil = legacy TOML-overlay-only path (the
+	// agentBootstrap-flow-prereq before #1976 landed).
+	//
+	// Concurrency: same single-write-then-read posture as
+	// agentPeerLookup above (written once in Start before any UDP
+	// packet dispatch; read lock-free from HandleKnockRequest's
+	// FindAuthSvcProvider miss path). The same atomic-Pointer-or-
+	// mutex warning applies to a future refactor that mutates this
+	// after Start.
+	resourceLookup *ResourceLookup
+
+	// pluginLoadOnce serializes ensurePluginLoaded per aspId so
+	// LoadPlugin runs at most once per aspId per process. Without
+	// this gate two concurrent first-knocks for the same DDB-only
+	// aspId would both pass the alreadyLoaded check, both call
+	// LoadPlugin (which always invokes h.Init), and the second
+	// writer's pluginHandlerMap insert would silently leak the
+	// first handler's Init-acquired resources (the Close path in
+	// LoadPlugin only fires when its own RLock check finds an
+	// existing entry — both racers would observe "not found").
+	// Keyed on aspId (string); values are *sync.Once. Entries are
+	// removed on failed load to enable retry (loadPluginOnce's
+	// Delete-on-failure path so a transient h.Init flake doesn't
+	// permanently reject the aspId — see loadPluginOnce godoc).
+	// Bounded in steady state by distinct-aspId count, with brief
+	// churn during failed-then-retried loads.
+	pluginLoadOnce sync.Map
 }
 
 // resolveProcessACOperationBroadcast returns the function the local
@@ -522,6 +553,10 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	// constructed below — s.metrics is nil at this point in Start(),
 	// so any direct IncrCounter here is a silent no-op.
 	agentLookupInitFailed := false
+	// resourceLookupInitFailed mirrors agentLookupInitFailed: captured
+	// during storage init (when s.metrics is still nil) and emitted to
+	// MetricResourceLookupInitFailure after the publisher exists.
+	resourceLookupInitFailed := false
 	s.storageConfig, err = s.loadStorageConfig()
 	if err != nil {
 		log.Warning("Failed to load storage config, storage backend disabled: %v", err)
@@ -563,6 +598,26 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 			} else if lookup != nil {
 				s.agentPeerLookup = lookup
 				log.Info("Agent peer lookup initialized (DDB+LRU, cache_ttl=%s)", agentPeerLookupCacheTTL)
+			}
+
+			// Resource lookup: nil when ResourcesTable is unset or
+			// the backend isn't DynamoDB (legacy TOML-overlay-only
+			// path stays in effect). Symmetric posture to the
+			// agent-peer lookup above: a real init failure (vs.
+			// "disabled by config") is silent at FindAuthSvcProvider's
+			// miss path (the miss falls through to nil aspData and the
+			// plugin returns ErrAuthServiceProviderNotFound — same
+			// reject shape PR #2091 was added to prevent) with NO
+			// MetricResourceLookupDDBError to page on. Capture the
+			// failure here and defer the metric emit until after the
+			// publisher exists (~30 lines below).
+			resourceLookupInst, resourceLookupErr := NewResourceLookupFromStorage(s.storage, s)
+			if resourceLookupErr != nil {
+				log.Error("Failed to initialize resource lookup: %v", resourceLookupErr)
+				resourceLookupInitFailed = true
+			} else if resourceLookupInst != nil {
+				s.resourceLookup = resourceLookupInst
+				log.Info("Resource lookup initialized (DDB+LRU, cache_ttl=%s)", resourceLookupCacheTTL)
 			}
 		}
 	}
@@ -622,6 +677,17 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	// AgentPeerLookup.SetMetrics for the contract.
 	if s.agentPeerLookup != nil {
 		s.agentPeerLookup.SetMetrics(s.metrics)
+	}
+
+	// Symmetric to agentLookupInitFailed above: emit the deferred
+	// resource-lookup init failure metric now that the publisher
+	// exists. resourceLookupInitFailed is captured during storage
+	// init (when s.metrics was nil).
+	if resourceLookupInitFailed {
+		s.metrics.IncrCounter(MetricResourceLookupInitFailure)
+	}
+	if s.resourceLookup != nil {
+		s.resourceLookup.SetMetrics(s.metrics)
 	}
 
 	// Initialize per-source-IP rate limiter for UDP knock packets.
@@ -772,6 +838,33 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 		// endpoints/metrics/publisher.go) so the guard is omitted
 		// for consistency with the surrounding emit sites.
 		s.metrics.IncrCounter(MetricAgentLookupNotConfigured)
+	}
+
+	// Symmetric to the agent-peer NotConfigured emit above: cloud mode
+	// on, resource lookup never wired, no init error fired (the
+	// (nil, nil) "disabled by config" branch — ResourcesTable unset).
+	// Without this, a cloud deployment that forgot to plumb
+	// ResourcesTable boots Info-only and looks healthy on dashboards
+	// until the first knock for a DDB-only aspId rejects with no
+	// MetricResourceLookupDDBError to alarm on (the lookup never ran).
+	// Mutually exclusive with MetricResourceLookupInitFailure via the
+	// !resourceLookupInitFailed guard — same single-cause-attribution
+	// posture as the agent-peer pair.
+	if cloudMode && s.resourceLookup == nil && !resourceLookupInitFailed {
+		// Info-level, not Warning: with the staged rollout (#1976
+		// read path lands first; cutover PR seeds real values and
+		// removes the TOML overlay later), this branch is the
+		// EXPECTED state through the entire bake window. A Warning
+		// here would alarm-spam every nhp-server boot during the
+		// staged rollout for a state that's deliberately deferred.
+		// Once the cutover lands and ResourcesTable becomes
+		// load-bearing, an operator missing the tfvar plumbing will
+		// still see the MetricResourceLookupNotConfigured counter
+		// climb (the alarm signal) — the log level is just for
+		// human eyeballs and shouldn't page during a known-deferred
+		// state.
+		log.Info("Cloud mode: resource lookup not wired (ResourcesTable unset or storage init returned nil with no error); the DDB-backed authServiceMap bridge is inactive — aspIds not present in resource.toml's overlay will reject with ErrAuthServiceProviderNotFound. This is the expected state during the #1976 staged rollout (read path lands before the cutover seeds real DDB values)")
+		s.metrics.IncrCounter(MetricResourceLookupNotConfigured)
 	}
 
 	option := &core.DeviceOptions{
@@ -2656,6 +2749,210 @@ func (s *UdpServer) AddResource(res *common.ResourceData) error {
 	return nil
 }
 
+// applyAspMapDelta publishes a freshly-resolved *AuthServiceProviderData
+// into s.authServiceMap via build-fresh-then-atomic-swap. The
+// in-place-mutating siblings AddAuthService/AddResource are Deprecated
+// because they race plugin lock-free reads through helper.AspData;
+// this method allocates a fresh top-level map, copies existing
+// entries, installs the new aspId, and swaps the pointer atomically
+// under the write lock. Concurrent readers observe either the old or
+// new map snapshot; any pointer already handed to a plugin remains
+// valid for that plugin invocation.
+//
+// Fast path: pointer-equal install short-circuits (no fresh
+// allocation). The resolver's cache-hit republish drives most calls
+// through this path, so steady-state cost on the knock hot path is a
+// single pointer-compare under the write lock.
+//
+// Also calls ensurePluginLoaded on every call — including the
+// fast-path branch — so a DDB-only aspId (one never seen by
+// updateResources) reaches FindPluginHandler with a populated entry.
+// The fast-path-still-loads behavior covers the "second knock after
+// restart" case: authServiceMap is rehydrated from the LRU cache hit
+// but pluginHandlerMap is still empty for that aspId. The plugin-load
+// happens AFTER authServiceMapMutex is released (CLAUDE.md lock-order
+// invariant: pluginHandlerMapMutex never held while authServiceMapMutex
+// is held) — best-effort, not under critical section. Callers MUST NOT
+// rely on "plugin is loaded by the time applyAspMapDelta returns";
+// today no caller does, but future code should treat the plugin-load
+// as eventually-consistent.
+//
+// Nil aspId / nil aspData are programmer errors from the caller; we
+// no-op rather than install a nil sentinel that would surface as a
+// nil-deref in FindAuthSvcProvider readers.
+//
+// Onboarding-a-new-aspId-via-DDB-only failure mode: ensurePluginLoaded
+// routes to loadPluginOnce with pluginPath="", which resolves
+// statically-registered plugins only (init() RegisterPlugin calls).
+// A future aspId added via DDB write WITHOUT a corresponding code
+// change to compile in a `staticplugins/<aspId>/` package will
+// resolve aspData here but reject downstream at FindPluginHandler.
+// The reject is logged via ensurePluginLoaded's "no static plugin
+// registered" Warning, but operators onboarding aspId #2 should
+// know the DDB-write-alone is necessary-but-not-sufficient.
+func (s *UdpServer) applyAspMapDelta(aspId string, asp *common.AuthServiceProviderData) {
+	if aspId == "" || asp == nil {
+		return
+	}
+
+	// RLock fast-path: the steady-state knock path is a cache-hit
+	// republish that finds the same pointer already installed. Doing
+	// the pointer-equal check under RLock lets every cache-hit knock
+	// run in parallel (FindAuthSvcProvider readers also hold RLock)
+	// instead of serializing on a write lock. The RUnlock-then-Lock
+	// gap below is benign: a concurrent install of the SAME pointer
+	// is a no-op; a concurrent install of a DIFFERENT pointer wins
+	// under the subsequent Lock and we still publish correctly.
+	s.authServiceMapMutex.RLock()
+	existing, ok := s.authServiceMap[aspId]
+	s.authServiceMapMutex.RUnlock()
+	if ok && existing == asp {
+		s.ensurePluginLoaded(aspId)
+		return
+	}
+
+	// Slow path: mismatch (or no entry). Acquire the write lock and
+	// re-check inside the critical section so a concurrent winner
+	// doesn't get overwritten by stale data. Shallow copy: the values
+	// are *AuthServiceProviderData pointers that callers (plugins)
+	// read field-by-field. Allocating a fresh top-level map decouples
+	// the swap from any reader that might be iterating the old map
+	// (today only FindAuthSvcProvider does point lookups — no
+	// iteration — but the safety property is general).
+	s.authServiceMapMutex.Lock()
+	if existing, ok := s.authServiceMap[aspId]; ok && existing == asp {
+		// Lost the race but the winner installed our pointer anyway —
+		// no-op, no fresh allocation.
+		s.authServiceMapMutex.Unlock()
+		s.ensurePluginLoaded(aspId)
+		return
+	}
+	fresh := make(common.AuthSvcProviderMap, len(s.authServiceMap)+1)
+	for k, v := range s.authServiceMap {
+		fresh[k] = v
+	}
+	fresh[aspId] = asp
+	s.authServiceMap = fresh
+	s.authServiceMapMutex.Unlock()
+
+	s.ensurePluginLoaded(aspId)
+}
+
+// ensurePluginLoaded loads the static plugin for `aspId` into
+// pluginHandlerMap if it isn't already present. Best-effort: a missing
+// static registration (no init() call registered "aspId") is logged
+// once and tolerated — the eventual `FindPluginHandler` reject still
+// fires, but at least the cause is in the logs.
+//
+// Lock order: authServiceMapMutex is released BEFORE pluginHandlerMap-
+// Mutex is taken (CLAUDE.md). Splitting this out of applyAspMapDelta
+// preserves that sequencing.
+//
+// Per-aspId sync.Once serializes concurrent first-knocks so
+// LoadPlugin (which is NOT idempotent — h.Init runs every invocation)
+// fires at most once per aspId per successful load. On FAILURE (no
+// static plugin registered, or h.Init returned an error) the Once
+// is removed from pluginLoadOnce so the next knock retries: a
+// transient Init failure (file permission, missing plugin dir) or a
+// deploy where a plugin's static registration becomes wired between two callers
+// shouldn't lock the aspId into permanent reject. Inside the Do
+// closure we observe success/failure via the pluginHandlerMap
+// itself (LoadPlugin's atomic insert) rather than a closed-over
+// flag — a flag would be per-call-site and miss the load-completed
+// state for piggybacking callers; reading the live map is the only
+// shared-truth signal available.
+// ensurePluginLoaded is the DDB-bridge entry point (pluginPath="" →
+// statically-registered plugins only). Convenience wrapper around
+// loadPluginOnce; the TOML reload path in updateResources calls
+// loadPluginOnce directly with a non-empty pluginPath so dynamic .so
+// loading still works there.
+func (s *UdpServer) ensurePluginLoaded(aspId string) {
+	s.loadPluginOnce(aspId, "")
+}
+
+// loadPluginOnce loads the plugin for `aspId` exactly once per
+// successful load per process. Used by the per-knock DDB-bridge
+// path (applyAspMapDelta → ensurePluginLoaded) so concurrent
+// first-knocks for the same aspId can't race two h.Init runs.
+//
+// The boot/reload-time updateResources path intentionally does
+// NOT route through here — it force-loads via LoadPlugin directly
+// so an operator-driven TOML edit can rely on Init re-running.
+// The narrow concurrent-TOML-reload + first-knock race is
+// documented at the updateResources call site; the operator
+// workflow preservation wins over closing the theoretical race.
+//
+// Lock order: pluginHandlerMapMutex is taken WITHOUT holding any
+// other mutex (CLAUDE.md). updateResources's TOML iteration calls
+// here OUTSIDE its authServiceMapMutex critical section;
+// applyAspMapDelta releases authServiceMapMutex BEFORE invoking.
+//
+// Per-aspId sync.Once: serializes loaders so LoadPlugin (NOT
+// idempotent — h.Init runs every invocation; only the LAST writer's
+// handler stays in pluginHandlerMap and the earlier handler's Init
+// resources would leak) fires at most once per aspId per successful
+// load. On FAILURE (no plugin registered, or h.Init returned an
+// error) the Once is removed from pluginLoadOnce so the next caller
+// retries — a transient Init failure or a race-by-deploy where the
+// staticplugin compiles in mid-process shouldn't lock the aspId into
+// permanent reject. Success/failure is observed via the live
+// pluginHandlerMap (LoadPlugin's atomic insert is the only
+// shared-truth signal — a closed-over flag would be per-call-site
+// and miss the success state for piggybacking callers).
+//
+// Piggybacker semantics on failure: when N goroutines share a single
+// failing Once, all N observe the empty pluginHandlerMap and return
+// having "completed" their load attempt. The Delete(aspId) below lets
+// the (N+1)th caller create a fresh Once and retry. The original N
+// piggybackers do NOT self-retry — for a transient h.Init flake, every
+// knock landed in that N-goroutine window rejects (the FindPluginHandler
+// reject path that fires downstream). Bounded retry-storm trade-off:
+// the alternative would be intra-call retry with backoff, which would
+// pin a goroutine per piggybacker.
+//
+// Race-safety on Delete+LoadOrStore: a concurrent Delete + new
+// LoadOrStore can produce a brief window where two goroutines race
+// for a fresh Once. Both re-check pluginHandlerMap inside Do(); if
+// either succeeded, the alreadyLoaded fast-path catches the other.
+// Worst case is one extra failing GetPluginHandler call — bounded
+// by the failure rate (zero under normal operation).
+func (s *UdpServer) loadPluginOnce(aspId, pluginPath string) {
+	if aspId == "" {
+		return
+	}
+	once, _ := s.pluginLoadOnce.LoadOrStore(aspId, &sync.Once{})
+	once.(*sync.Once).Do(func() {
+		s.pluginHandlerMapMutex.RLock()
+		_, alreadyLoaded := s.pluginHandlerMap[aspId]
+		s.pluginHandlerMapMutex.RUnlock()
+		if alreadyLoaded {
+			return
+		}
+
+		h := plugins.GetPluginHandler(aspId, pluginPath)
+		if h == nil {
+			if pluginPath != "" {
+				log.Error("loadPluginOnce: failed to load plugin for aspId=%q from path=%q", aspId, pluginPath)
+			} else {
+				log.Warning("loadPluginOnce: no static plugin registered for aspId=%q; FindPluginHandler will reject knocks for this asp until a plugin is registered", aspId)
+			}
+			return
+		}
+		if loadErr := s.LoadPlugin(aspId, h); loadErr != nil {
+			log.Error("loadPluginOnce: failed to load plugin for aspId=%q: %v", aspId, loadErr)
+		}
+	})
+
+	// Verify success via the live pluginHandlerMap. On failure, drop
+	// the Once so the next caller retries (see godoc above).
+	s.pluginHandlerMapMutex.RLock()
+	_, loaded := s.pluginHandlerMap[aspId]
+	s.pluginHandlerMapMutex.RUnlock()
+	if !loaded {
+		s.pluginLoadOnce.Delete(aspId)
+	}
+}
+
 func (s *UdpServer) ValidatePlugin(h plugins.PluginHandler) bool {
 	return true
 }
@@ -2719,6 +3016,110 @@ func (s *UdpServer) FindAuthSvcProvider(aspId string) *common.AuthServiceProvide
 		return aspData
 	}
 
+	return nil
+}
+
+// LifecycleCtx returns the server's lifecycle context. Canceled by
+// Stop() so async work (DDB lookups on the forward path; future
+// callers that need shutdown-awareness) abandons promptly. Returns
+// context.Background pre-Start (tests construct UdpServer literals
+// without calling Start), matching the defensive fallback in
+// ResolveAuthSvcProvider.
+func (s *UdpServer) LifecycleCtx() context.Context {
+	if s.lifecycleCtx == nil {
+		return context.Background()
+	}
+	return s.lifecycleCtx
+}
+
+// ResolveAuthSvcProvider is the "do-the-right-thing" entry point for
+// callers that need the aspData for a knock and are willing to pay a
+// DDB roundtrip on first-touch. The in-memory authServiceMap is
+// checked first via FindAuthSvcProvider; on miss, if the DDB-backed
+// resource lookup is wired (cloud mode + ResourcesTable configured),
+// the lookup runs against the system partition, populates
+// authServiceMap via applyAspMapDelta, and returns the resolved
+// aspData. On any failure returns nil — the caller's reject path
+// owns the wire-level error code.
+//
+// The resolver OWNS the auth-failure / DDB-error / shutdown metric
+// attribution so the caller doesn't have to re-derive the
+// classification. Mirrors the agent-peer resolver's posture (the
+// agent-peer side fires MetricAuthFailure inside itself only on
+// ErrAgentUnknownPubkey).
+//
+// Nil-safety: relies on *metrics.Publisher.IncrCounter being
+// nil-safe on a nil receiver (Publisher.IncrCounter checks
+// `if mp == nil { return }`). Bare-struct test fixtures construct
+// `&UdpServer{}` without going through Start (where s.metrics is
+// wired); the publisher's nil-safety carries that through.
+//
+// Metric attribution:
+//
+//   - Hit in authServiceMap: NO counter (caller continues into
+//     handler.AuthWithNHP which owns its own success/failure
+//     counters downstream).
+//   - resourceLookup == nil AND no in-memory hit: auth-policy
+//     outcome (aspId not registered anywhere on this server).
+//     MetricAuthFailure fires.
+//   - ErrResourceUnknownASP from DDB lookup: auth-policy outcome.
+//     MetricAuthFailure fires.
+//   - context.Canceled during a canceled parent ctx: graceful
+//     shutdown. Log Info, NO counter — a normal `systemctl stop`
+//     during in-flight knocks must not page on-call (DDB-error
+//     OR auth-failure alarm).
+//   - Other lookup errors (transient DDB throttle/5xx, malformed
+//     row, internal type-assert): infrastructure trouble.
+//     MetricResourceLookupDDBError fires; MetricAuthFailure does
+//     NOT.
+//
+// `logPrefix` is a short caller-supplied tag (e.g., "HandleKnockRequest-Auth"
+// or "forwarder") prepended to structured log lines so triage can
+// attribute the failure to the correct call site. `ctx` should be
+// the caller's request-bound context (typically UdpServer.lifecycleCtx
+// today); nil is tolerated (falls back to context.Background, only
+// reachable in bare-struct test paths).
+func (s *UdpServer) ResolveAuthSvcProvider(ctx context.Context, aspId, logPrefix string) *common.AuthServiceProviderData {
+	if aspData := s.FindAuthSvcProvider(aspId); aspData != nil {
+		return aspData
+	}
+	if s.resourceLookup == nil {
+		// Non-cloud / lookup-disabled deployment AND aspId not in the
+		// TOML-loaded authServiceMap → genuine auth-policy outcome.
+		// Owned here so the attribution stays correct regardless of
+		// which code path reaches the nil-aspData reject.
+		s.metrics.IncrCounter(MetricAuthFailure)
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	resolved, lookupErr := s.resourceLookup.LookupAuthServiceProvider(ctx, aspId)
+	if lookupErr == nil {
+		return resolved
+	}
+	switch {
+	case errors.Is(lookupErr, context.Canceled) && ctx.Err() != nil:
+		// Shutdown wins over a concurrent DDB throttle: if a
+		// ProvisionedThroughputExceeded happens to land while
+		// lifecycleCtx is already canceled, the SDK-wrapped
+		// errors.Is(err, context.Canceled) typically matches first
+		// and this branch fires. That suppresses
+		// MetricResourceLookupDDBError for the in-flight throttle —
+		// intentional. Graceful Stop() is a louder signal than a
+		// single transient throttle; an isolated throttle that
+		// happened to coincide with shutdown is invisible until the
+		// next non-shutdown knock surfaces a fresh DDB error. A
+		// future operator triaging "why no DDB alarm during
+		// shutdown" finds the answer here.
+		log.Info("[%s] event=\"resource_lookup_shutdown\" aspId=%q (server stopping; no counter increment — suppresses DDB-error metric even for a concurrent throttle)", logPrefix, aspId)
+	case errors.Is(lookupErr, ErrResourceUnknownASP):
+		// Auth-policy outcome: aspId genuinely not registered.
+		s.metrics.IncrCounter(MetricAuthFailure)
+	default:
+		log.Error("[%s] resource lookup ddb error aspId=%q: %v", logPrefix, aspId, lookupErr)
+		s.metrics.IncrCounter(MetricResourceLookupDDBError)
+	}
 	return nil
 }
 

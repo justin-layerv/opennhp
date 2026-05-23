@@ -778,7 +778,26 @@ func (s *UdpServer) updateResources(aspMap common.AuthSvcProviderMap) (err error
 			continue
 		}
 		aspData.AuthSvcId = aspId
-		// Try to load plugin from static registry first, then fall back to dynamic loading
+		// updateResources force-loads (LoadPlugin closes the old
+		// handler and re-runs h.Init on every TOML reload) so an
+		// operator-driven `resource.toml` edit that bumps a plugin's
+		// PluginPath or relies on Init re-running to pick up
+		// Hostname/LocalIp changes still takes effect. The
+		// per-aspId sync.Once in loadPluginOnce is scoped to the
+		// DDB-knock path only (applyAspMapDelta → ensurePluginLoaded)
+		// so that path serializes concurrent first-knocks without
+		// nullifying TOML-reload semantics.
+		//
+		// Narrow race: a TOML reload concurrent with a DDB-knock
+		// first-load for the same aspId could call h.Init twice
+		// (LoadPlugin's Close path only fires when its own RLock
+		// check finds an existing entry; both racers might observe
+		// "not found"). Acceptable in practice — TOML reloads are
+		// one-shot events at runtime (and post-cutover the overlay
+		// is gone entirely), and the "loser" handler's Init
+		// resources leak silently once. The operator-workflow
+		// preservation wins over closing the theoretical race; the
+		// race is documented in the loadPluginOnce godoc.
 		h := plugins.GetPluginHandler(aspId, aspData.PluginPath)
 		if h != nil {
 			if loadErr := s.LoadPlugin(aspId, h); loadErr != nil {
@@ -802,6 +821,25 @@ func (s *UdpServer) updateResources(aspMap common.AuthSvcProviderMap) (err error
 	s.authServiceMapMutex.Lock()
 	defer s.authServiceMapMutex.Unlock()
 	s.authServiceMap = aspMap
+
+	// Note: DDB-resolved aspIds installed by ResourceLookup via
+	// applyAspMapDelta are wiped by the full-replace above.
+	// Self-heal behavior splits by whether the aspId is in BOTH
+	// sources during the cutover bake window:
+	//
+	//   - DDB-only aspId (post-cutover, no TOML entry): the next
+	//     knock hits FindAuthSvcProvider miss → ResourceLookup
+	//     cache-hit republish → applyAspMapDelta's fast-path
+	//     pointer-equal check fails (the wipe nulled the entry) →
+	//     fresh-build branch fires → DDB-resolved entry is re-
+	//     installed. Heal time: one knock.
+	//   - aspId in BOTH TOML and DDB (transitional cutover window):
+	//     the full-replace above re-installs the TOML-built entry;
+	//     FindAuthSvcProvider hits in-memory on the next knock, so
+	//     ResourceLookup never runs and the DDB-resolved entry stays
+	//     wiped until cache TTL (60s) expires and a future miss
+	//     re-queries. This is intended — TOML is authoritative until
+	//     the cutover PR removes the overlay.
 
 	return nil
 }

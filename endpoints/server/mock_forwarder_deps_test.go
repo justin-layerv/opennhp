@@ -24,6 +24,17 @@ type MockForwarderDeps struct {
 	processErr    error
 	tokensMu      sync.Mutex
 	storedTokens  map[string]*ACTokenEntry
+	// lifecycleCtx is what LifecycleCtx() returns. Defaults to
+	// context.Background() (the typical mock posture). Tests that
+	// need to exercise the resolver's shutdown-classification branch
+	// from the forwarder seam can set this to a pre-canceled
+	// context via SetLifecycleCtx.
+	lifecycleCtx context.Context
+	// resolveCtxMu guards lastResolveCtx — the ctx capture for
+	// LastResolveCtx() so a future test can fence the forwarder's
+	// f.deps.LifecycleCtx() plumbing.
+	resolveCtxMu   sync.Mutex
+	lastResolveCtx context.Context
 }
 
 // NewMockForwarderDeps creates a new mock with sensible defaults.
@@ -53,8 +64,51 @@ func (m *MockForwarderDeps) FindACConnectionsForKnock(knkMsg *common.AgentKnockM
 	return m.acConns
 }
 
-func (m *MockForwarderDeps) FindAuthSvcProvider(authSvcId string) *common.AuthServiceProviderData {
+// ResolveAuthSvcProvider returns the pre-set aspData and captures
+// the ctx for test verification (LastResolveCtx). The capture lets
+// tests fence that callers thread the right context — specifically
+// the forwarder's lifecycle ctx plumbing, which is not otherwise
+// exercisable through mocks (the real resolver's shutdown-classification
+// branch needs a real ResourceLookup; tracked as #2126).
+//
+// FindAuthSvcProvider is no longer on the ForwarderDeps interface
+// (the forwarder uses ResolveAuthSvcProvider uniformly post-bridge);
+// tests inject aspData via SetAuthServiceProvider directly.
+func (m *MockForwarderDeps) ResolveAuthSvcProvider(ctx context.Context, _, _ string) *common.AuthServiceProviderData {
+	m.resolveCtxMu.Lock()
+	m.lastResolveCtx = ctx
+	m.resolveCtxMu.Unlock()
 	return m.aspData
+}
+
+// LastResolveCtx returns the ctx passed to the most recent
+// ResolveAuthSvcProvider call, or nil if never called. Used by
+// TestForwarder_ThreadsLifecycleCtxToResolver to fence the
+// f.deps.LifecycleCtx() plumbing — the only way to observe the
+// shutdown-classification seam through a mock.
+func (m *MockForwarderDeps) LastResolveCtx() context.Context {
+	m.resolveCtxMu.Lock()
+	defer m.resolveCtxMu.Unlock()
+	return m.lastResolveCtx
+}
+
+// LifecycleCtx returns the test-set lifecycle context (default
+// context.Background). Tests that need to exercise the resolver's
+// shutdown-classification path from the forwarder seam use
+// SetLifecycleCtx to inject a pre-canceled context.
+func (m *MockForwarderDeps) LifecycleCtx() context.Context {
+	if m.lifecycleCtx == nil {
+		return context.Background()
+	}
+	return m.lifecycleCtx
+}
+
+// SetLifecycleCtx overrides the default context.Background returned
+// by LifecycleCtx. Used by TestForwarder_ShutdownSuppressesCounters
+// (and any future test that needs the forwarder's resolver path to
+// observe a canceled ctx).
+func (m *MockForwarderDeps) SetLifecycleCtx(ctx context.Context) {
+	m.lifecycleCtx = ctx
 }
 
 func (m *MockForwarderDeps) ProcessACOperation(

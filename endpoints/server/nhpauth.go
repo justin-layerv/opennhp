@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
@@ -122,12 +123,24 @@ func (s *UdpServer) HandleKnockRequest(ppd *core.PacketParserData) (err error) {
 			}
 		}
 
-		// find out auth service provider
-		aspData := s.FindAuthSvcProvider(knkMsg.AuthServiceId)
+		// find out auth service provider. ResolveAuthSvcProvider
+		// encapsulates the FindAuthSvcProvider fast-path + DDB-backed
+		// fallback (#1976) + three-way error classification (shutdown /
+		// unknown-ASP / DDB infra trouble) so this hot path stays
+		// readable and the same logic can be reused by the forwarder.
+		aspData := s.ResolveAuthSvcProvider(s.LifecycleCtx(), knkMsg.AuthServiceId,
+			fmt.Sprintf("HandleKnockRequest-Auth agent=%s tx=%d remote=%s", knkMsg.UserId, transactionId, addrStr))
 		if aspData == nil {
 			err = common.ErrAuthServiceProviderNotFound
 			ackMsg.ErrCode = common.ErrAuthServiceProviderNotFound.ErrorCode()
 			ackMsg.ErrMsg = err.Error()
+			// MetricAuthFailure attribution is owned by
+			// ResolveAuthSvcProvider: it fires on auth-policy-outcome
+			// branches (unknown aspId, no resource lookup wired AND no
+			// in-memory entry) and suppresses on DDB-error / graceful-
+			// shutdown branches. The caller MUST NOT add its own
+			// counter here or the MetricResourceLookupDDBError vs
+			// MetricAuthFailure split collapses.
 			return
 		}
 

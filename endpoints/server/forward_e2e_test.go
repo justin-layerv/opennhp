@@ -754,6 +754,14 @@ func (d *e2eForwarderDeps) FindAuthSvcProvider(authSvcId string) *common.AuthSer
 	return nil
 }
 
+func (d *e2eForwarderDeps) ResolveAuthSvcProvider(_ context.Context, authSvcId, _ string) *common.AuthServiceProviderData {
+	return d.FindAuthSvcProvider(authSvcId)
+}
+
+func (d *e2eForwarderDeps) LifecycleCtx() context.Context {
+	return context.Background()
+}
+
 func (d *e2eForwarderDeps) ProcessACOperation(
 	knkMsg *common.AgentKnockMsg,
 	acConn *ACConn,
@@ -928,10 +936,15 @@ func TestE2E_HandleForwardRequest_RealDecryption(t *testing.T) {
 		result.Success, result.ErrCode, result.ErrMsg)
 
 	// The knock should have been decrypted and parsed successfully.
-	// Since FindACConnectionForKnock returns nil, we expect AC_NOT_CONNECTED error.
-	// This proves the decryption worked (we got past the decrypt step).
-	if result.ErrCode != "AC_NOT_CONNECTED" {
-		t.Errorf("Expected AC_NOT_CONNECTED (proving decryption succeeded), got %s: %s",
+	// HandleForwardRequest resolves the ASP BEFORE looking up AC
+	// connections (the ordering ensures DDB-only aspIds populate
+	// authServiceMap before the AC lookup, which reads authServiceMap
+	// for the acId). With capturingForwarderDeps.ResolveAuthSvcProvider
+	// returning nil, the path rejects with ASP_NOT_FOUND. Getting THIS
+	// far proves decryption succeeded — we just hit the resolver-side
+	// sentinel rather than the AC-side one.
+	if result.ErrCode != "ASP_NOT_FOUND" {
+		t.Errorf("Expected ASP_NOT_FOUND (proving decryption succeeded — resolver runs before AC check), got %s: %s",
 			result.ErrCode, result.ErrMsg)
 	}
 
@@ -969,6 +982,14 @@ func (d *capturingForwarderDeps) FindACConnectionsForKnock(knkMsg *common.AgentK
 
 func (d *capturingForwarderDeps) FindAuthSvcProvider(authSvcId string) *common.AuthServiceProviderData {
 	return nil
+}
+
+func (d *capturingForwarderDeps) ResolveAuthSvcProvider(_ context.Context, authSvcId, _ string) *common.AuthServiceProviderData {
+	return d.FindAuthSvcProvider(authSvcId)
+}
+
+func (d *capturingForwarderDeps) LifecycleCtx() context.Context {
+	return context.Background()
 }
 
 func (d *capturingForwarderDeps) ProcessACOperation(
@@ -1128,6 +1149,14 @@ func (d *mockACForwarderDeps) FindAuthSvcProvider(authSvcId string) *common.Auth
 			},
 		},
 	}
+}
+
+func (d *mockACForwarderDeps) ResolveAuthSvcProvider(_ context.Context, authSvcId, _ string) *common.AuthServiceProviderData {
+	return d.FindAuthSvcProvider(authSvcId)
+}
+
+func (d *mockACForwarderDeps) LifecycleCtx() context.Context {
+	return context.Background()
 }
 
 func (d *mockACForwarderDeps) ProcessACOperation(
@@ -1572,6 +1601,14 @@ func (d *errorACForwarderDeps) FindAuthSvcProvider(authSvcId string) *common.Aut
 	}
 }
 
+func (d *errorACForwarderDeps) ResolveAuthSvcProvider(_ context.Context, authSvcId, _ string) *common.AuthServiceProviderData {
+	return d.FindAuthSvcProvider(authSvcId)
+}
+
+func (d *errorACForwarderDeps) LifecycleCtx() context.Context {
+	return context.Background()
+}
+
 func (d *errorACForwarderDeps) ProcessACOperation(
 	knkMsg *common.AgentKnockMsg,
 	acConn *ACConn,
@@ -1755,6 +1792,14 @@ func (d *timeoutACForwarderDeps) FindAuthSvcProvider(authSvcId string) *common.A
 			},
 		},
 	}
+}
+
+func (d *timeoutACForwarderDeps) ResolveAuthSvcProvider(_ context.Context, authSvcId, _ string) *common.AuthServiceProviderData {
+	return d.FindAuthSvcProvider(authSvcId)
+}
+
+func (d *timeoutACForwarderDeps) LifecycleCtx() context.Context {
+	return context.Background()
 }
 
 func (d *timeoutACForwarderDeps) ProcessACOperation(

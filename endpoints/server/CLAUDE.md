@@ -24,6 +24,18 @@ must update this list and audit all existing call sites.
   routine's defer would invert against it (it removes from
   `acConnectionMap` first, then from `remoteConnectionMap` via
   `removeConnection`).
+- **`authServiceMapMutex` is leaf-most; never held while taking
+  `pluginHandlerMapMutex`.** `applyAspMapDelta` (`udpserver.go`)
+  takes `authServiceMapMutex.Lock()`, performs the build-fresh-then-
+  swap, releases it, then calls `ensurePluginLoaded` which acquires
+  `pluginHandlerMapMutex.RLock()`/`Lock()`. The two are sequenced,
+  never nested — a future change that holds `authServiceMapMutex`
+  while taking `pluginHandlerMapMutex` would invert against
+  `updateResources` (`config.go`), which performs the inverse
+  sequence (pluginHandlerMap writes via `LoadPlugin` happen INSIDE
+  the iteration over `aspMap` BEFORE the final
+  `authServiceMapMutex.Lock()` swap, so no overlap exists today).
+  Both call sites must keep authServiceMap leaf-most.
 - **`agentPeerMapMutex` then `device.peerMapMutex`, never reversed.**
   `AddAgentPeer` (`udpserver.go`) holds `agentPeerMapMutex` across
   the `device.AddPeer` call so both maps reflect the new agent in a

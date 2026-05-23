@@ -34,8 +34,29 @@ type ForwarderDeps interface {
 	// Returns multiple connections when blue/green ACs register with the same AC ID.
 	FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*ACConn
 
-	// FindAuthSvcProvider finds the auth service provider by ID.
-	FindAuthSvcProvider(authSvcId string) *common.AuthServiceProviderData
+	// ResolveAuthSvcProvider is the "do-the-right-thing" lookup:
+	// in-memory first, then falls back to the DDB-backed resolver
+	// (#1976) on miss when cloud mode is wired. Returns nil on any
+	// failure (genuine unknown aspId, transient DDB error, graceful
+	// shutdown) — the caller's reject path owns the wire-level
+	// error code. Mocks SHOULD delegate to FindAuthSvcProvider to
+	// preserve existing test semantics (mocks don't typically wire
+	// a DDB-backed resolver).
+	//
+	// Callers SHOULD pass LifecycleCtx() (or a context derived from
+	// it) so an in-flight DDB lookup abandons promptly on server
+	// shutdown — the helper's three-way error switch surfaces
+	// context.Canceled via an Info-level "shutdown" log and skips
+	// the DDB-error counter, but only if the passed ctx is the one
+	// that cancels.
+	ResolveAuthSvcProvider(ctx context.Context, authSvcId, logPrefix string) *common.AuthServiceProviderData
+
+	// LifecycleCtx returns the parent server's lifecycle context.
+	// Canceled by UdpServer.Stop(), so async work derived from it
+	// abandons promptly on shutdown. Mocks SHOULD return
+	// context.Background to keep existing test semantics — they
+	// don't run an Stop() that would cancel a real lifecycleCtx.
+	LifecycleCtx() context.Context
 
 	// ProcessACOperation sends an AOP to an AC and waits for the ART response.
 	ProcessACOperation(

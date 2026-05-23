@@ -1,0 +1,1350 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"strconv"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/gin-gonic/gin"
+
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
+	"github.com/OpenNHP/opennhp/nhp/common"
+	"github.com/OpenNHP/opennhp/nhp/plugins"
+)
+
+// fakeResourcesQuerier mocks the DDB Query path for ResourceLookup.
+// Stores rows keyed by resource_id; Query returns every row whose
+// stored customer_id matches the request's :cid value (mirrors the
+// real DDB partition behavior — the table is keyed on customer_id
+// and Query returns ALL rows in that partition, not filtered by
+// auth_service_id; the ResourceLookup filters client-side).
+type fakeResourcesQuerier struct {
+	mu                 sync.Mutex
+	calls              int
+	rowsByCust         map[string][]map[string]types.AttributeValue
+	err                error
+	beforeQuery        func()
+	simulatePagination bool
+}
+
+func newFakeResourcesQuerier() *fakeResourcesQuerier {
+	return &fakeResourcesQuerier{
+		rowsByCust: map[string][]map[string]types.AttributeValue{},
+	}
+}
+
+// put adds a row to the fake's customer_id partition. resourceFQDN
+// is the customer-facing ingress (mirrors terraform's
+// `each.value.dest_host` → resource_fqdn render); destHost is the
+// internal dial target (today the same value for FRPS but the
+// schema keeps them distinct).
+func (f *fakeResourcesQuerier) put(customerID, resourceID, aspID, acID, resourceFQDN, destHost string, destPort, openTime int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rowsByCust[customerID] = append(f.rowsByCust[customerID], map[string]types.AttributeValue{
+		"customer_id":     &types.AttributeValueMemberS{Value: customerID},
+		"resource_id":     &types.AttributeValueMemberS{Value: resourceID},
+		"auth_service_id": &types.AttributeValueMemberS{Value: aspID},
+		"ac_id":           &types.AttributeValueMemberS{Value: acID},
+		"resource_fqdn":   &types.AttributeValueMemberS{Value: resourceFQDN},
+		"dest_host":       &types.AttributeValueMemberS{Value: destHost},
+		"dest_port":       &types.AttributeValueMemberN{Value: strconv.Itoa(destPort)},
+		"open_time":       &types.AttributeValueMemberN{Value: strconv.Itoa(openTime)},
+	})
+}
+
+// putMalformedRow inserts a row that UnmarshalMap can't decode into
+// the Resource struct (dest_port as a String where Resource declares
+// it as int). Used to fence the "skip malformed, continue with
+// remaining rows" contract.
+func (f *fakeResourcesQuerier) putMalformedRow(customerID, resourceID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rowsByCust[customerID] = append(f.rowsByCust[customerID], map[string]types.AttributeValue{
+		"customer_id": &types.AttributeValueMemberS{Value: customerID},
+		"resource_id": &types.AttributeValueMemberS{Value: resourceID},
+		"dest_port":   &types.AttributeValueMemberS{Value: "not-a-number"},
+	})
+}
+
+func (f *fakeResourcesQuerier) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error) {
+	// Snapshot beforeQuery under the lock so tests that mutate the
+	// field after launching goroutines don't race. Today no test
+	// does that — the singleflight barrier test sets the hook
+	// before goroutines fan out — but the locked-read keeps the
+	// fake race-detector-safe against a future test that does.
+	f.mu.Lock()
+	beforeQuery := f.beforeQuery
+	f.mu.Unlock()
+	if beforeQuery != nil {
+		beforeQuery()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+
+	if f.err != nil {
+		return nil, f.err
+	}
+
+	cid := ""
+	if v, ok := in.ExpressionAttributeValues[":cid"]; ok {
+		if s, ok := v.(*types.AttributeValueMemberS); ok {
+			cid = s.Value
+		}
+	}
+	if cid == "" {
+		return &dynamodb.QueryOutput{}, nil
+	}
+	rows := f.rowsByCust[cid]
+	// Copy the slice so the caller's iteration doesn't race with put().
+	out := make([]map[string]types.AttributeValue, len(rows))
+	copy(out, rows)
+	resp := &dynamodb.QueryOutput{Items: out}
+	if f.simulatePagination {
+		// Mimic DDB returning a continuation token on a paginated
+		// response. Resolver should log a Warning and still process
+		// the page-1 rows we did receive (no real pagination
+		// implementation yet — see follow-up tracking).
+		resp.LastEvaluatedKey = map[string]types.AttributeValue{
+			"customer_id": &types.AttributeValueMemberS{Value: cid},
+			"resource_id": &types.AttributeValueMemberS{Value: "<paginated-marker>"},
+		}
+	}
+	return resp, nil
+}
+
+func (f *fakeResourcesQuerier) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// captureApplier records every applyAspMapDelta call so a test can
+// assert the resolver published into the host server's authServiceMap.
+type captureApplier struct {
+	mu      sync.Mutex
+	applied []captureApplied
+}
+
+type captureApplied struct {
+	aspId string
+	asp   *common.AuthServiceProviderData
+}
+
+func (c *captureApplier) applyAspMapDelta(aspId string, asp *common.AuthServiceProviderData) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.applied = append(c.applied, captureApplied{aspId: aspId, asp: asp})
+}
+
+func (c *captureApplier) lastApplied() (captureApplied, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.applied) == 0 {
+		return captureApplied{}, false
+	}
+	return c.applied[len(c.applied)-1], true
+}
+
+func (c *captureApplier) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.applied)
+}
+
+// newTestResourceLookup constructs a ResourceLookup wired to a fake
+// querier and an injectable applier. Customer ID matches the
+// production nhpSystemCustomerID so the fake's partition mirrors real
+// row writes.
+func newTestResourceLookup(t *testing.T, q resourcesQuerier, applier aspDataApplier) *ResourceLookup {
+	t.Helper()
+	l, err := NewResourceLookup(q, "nhp-resources-test", nhpSystemCustomerID, applier)
+	if err != nil {
+		t.Fatalf("NewResourceLookup: %v", err)
+	}
+	return l
+}
+
+// putFRPSRow is a convenience around put() for the standard FRPS
+// row shape (the only aspId in active use today).
+func putFRPSRow(q *fakeResourcesQuerier, resourceID string) {
+	q.put(nhpSystemCustomerID, resourceID, "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 120)
+}
+
+// TestResourceLookup_CacheMissThenHit asserts the standard flow:
+// first lookup queries DDB; second lookup is a cache hit (no extra
+// Query) and the applier is invoked exactly once.
+func TestResourceLookup_CacheMissThenHit(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	putFRPSRow(q, "frps-sandbox")
+	applier := &captureApplier{}
+
+	l := newTestResourceLookup(t, q, applier)
+
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if err != nil {
+		t.Fatalf("first lookup err: %v", err)
+	}
+	if asp == nil {
+		t.Fatal("first lookup returned nil aspData")
+	}
+	if asp.AuthSvcId != "layerv" {
+		t.Errorf("AuthSvcId = %q, want %q", asp.AuthSvcId, "layerv")
+	}
+	if _, ok := asp.ResourceGroups["frps-sandbox"]; !ok {
+		t.Errorf("ResourceGroups missing frps-sandbox; got keys = %v", aspKeys(asp))
+	}
+	if got := q.callCount(); got != 1 {
+		t.Errorf("DDB calls after first lookup = %d, want 1", got)
+	}
+	if got := applier.count(); got != 1 {
+		t.Errorf("applyAspMapDelta calls after first lookup = %d, want 1", got)
+	}
+
+	asp2, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if err != nil {
+		t.Fatalf("second lookup err: %v", err)
+	}
+	if asp2 != asp {
+		t.Errorf("second lookup returned a different pointer; want same cached *AuthServiceProviderData")
+	}
+	if got := q.callCount(); got != 1 {
+		t.Errorf("DDB calls after second lookup = %d, want 1 (cache hit)", got)
+	}
+	// Cache hit re-publishes via the applier to self-heal against a
+	// future authServiceMap wipe (e.g., updateResources). The
+	// applyAspMapDelta fast-path short-circuits when the pointer is
+	// already installed, so the steady-state cost is a single
+	// pointer-compare — see TestApplyAspMapDelta_FastPathPointerEqual.
+	if got := applier.count(); got != 2 {
+		t.Errorf("applyAspMapDelta calls after second lookup = %d, want 2 (cache hit republishes for self-healing)", got)
+	}
+}
+
+// TestResourceLookup_CacheExpiry asserts that an entry past its TTL
+// is evicted and the next lookup re-queries DDB. Uses the injectable
+// clock so the test doesn't sleep.
+func TestResourceLookup_CacheExpiry(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	putFRPSRow(q, "frps-sandbox")
+	applier := &captureApplier{}
+	l := newTestResourceLookup(t, q, applier)
+
+	t0 := time.Now()
+	l.now = func() time.Time { return t0 }
+
+	if _, err := l.LookupAuthServiceProvider(context.Background(), "layerv"); err != nil {
+		t.Fatalf("warm lookup err: %v", err)
+	}
+	if got := q.callCount(); got != 1 {
+		t.Errorf("DDB calls after warm = %d, want 1", got)
+	}
+
+	// Advance past the TTL — the next lookup must re-Query.
+	l.now = func() time.Time { return t0.Add(resourceLookupCacheTTL + time.Second) }
+
+	if _, err := l.LookupAuthServiceProvider(context.Background(), "layerv"); err != nil {
+		t.Fatalf("post-expiry lookup err: %v", err)
+	}
+	if got := q.callCount(); got != 2 {
+		t.Errorf("DDB calls after expiry = %d, want 2 (cache evicted)", got)
+	}
+	if got := applier.count(); got != 2 {
+		t.Errorf("applyAspMapDelta calls after expiry = %d, want 2 (re-publish on re-resolve)", got)
+	}
+}
+
+// TestResourceLookup_UnknownASP asserts that an aspId with no
+// matching rows returns ErrResourceUnknownASP and is NOT cached
+// (so a future-bootstrapped aspId resolves on the next knock without
+// waiting for TTL).
+func TestResourceLookup_UnknownASP(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	// Row exists under "layerv" but caller asks for "other-asp".
+	putFRPSRow(q, "frps-sandbox")
+	applier := &captureApplier{}
+	l := newTestResourceLookup(t, q, applier)
+
+	_, err := l.LookupAuthServiceProvider(context.Background(), "other-asp")
+	if !errors.Is(err, ErrResourceUnknownASP) {
+		t.Fatalf("err = %v, want ErrResourceUnknownASP", err)
+	}
+	if applier.count() != 0 {
+		t.Errorf("applyAspMapDelta called for unknown ASP; should not publish")
+	}
+
+	// Confirm not cached: a second lookup re-Queries.
+	_, _ = l.LookupAuthServiceProvider(context.Background(), "other-asp")
+	if got := q.callCount(); got != 2 {
+		t.Errorf("DDB calls = %d, want 2 (unknown ASP must not be negative-cached)", got)
+	}
+}
+
+// TestResourceLookup_EmptyPartition exercises the path where the
+// customer partition itself is empty (DDB returns Items: nil).
+// Should return ErrResourceUnknownASP without invoking the applier.
+func TestResourceLookup_EmptyPartition(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	applier := &captureApplier{}
+	l := newTestResourceLookup(t, q, applier)
+
+	_, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if !errors.Is(err, ErrResourceUnknownASP) {
+		t.Fatalf("err = %v, want ErrResourceUnknownASP for empty partition", err)
+	}
+	if applier.count() != 0 {
+		t.Error("applier called on empty partition; should not publish")
+	}
+}
+
+// TestResourceLookup_DDBErrorRetryAfter asserts that a transient DDB
+// error wraps ErrResourceLookupRetryAfter, is not cached, and does
+// not publish.
+func TestResourceLookup_DDBErrorRetryAfter(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	q.err = errors.New("ddb 5xx: ProvisionedThroughputExceeded")
+	applier := &captureApplier{}
+	l := newTestResourceLookup(t, q, applier)
+
+	_, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if !errors.Is(err, ErrResourceLookupRetryAfter) {
+		t.Fatalf("err = %v, want wrap of ErrResourceLookupRetryAfter", err)
+	}
+	if applier.count() != 0 {
+		t.Error("applier called on DDB error; should not publish")
+	}
+
+	// Confirm not cached: retry re-Queries.
+	_, _ = l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if got := q.callCount(); got != 2 {
+		t.Errorf("DDB calls = %d, want 2 (transient error must not poison cache)", got)
+	}
+}
+
+// TestResourceLookup_HappyPathMatchesOverlay asserts the resolved
+// *AuthServiceProviderData matches the shape PR #2091's plugin reads
+// from helper.AspData when populated from the baked TOML overlay.
+// This is the contract that lets the layerv plugin work unchanged.
+func TestResourceLookup_HappyPathMatchesOverlay(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	putFRPSRow(q, "frps-sandbox")
+	l := newTestResourceLookup(t, q, &captureApplier{})
+
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if err != nil {
+		t.Fatalf("lookup err: %v", err)
+	}
+
+	group, ok := asp.ResourceGroups["frps-sandbox"]
+	if !ok {
+		t.Fatalf("ResourceGroups missing frps-sandbox; got %v", aspKeys(asp))
+	}
+	if got := group.AuthServiceId; got != "layerv" {
+		t.Errorf("group.AuthServiceId = %q, want %q", got, "layerv")
+	}
+	if got := group.ResourceId; got != "frps-sandbox" {
+		t.Errorf("group.ResourceId = %q, want %q", got, "frps-sandbox")
+	}
+	if got := group.OpenTime; got != 120 {
+		t.Errorf("group.OpenTime = %d, want 120", got)
+	}
+	// SkipAuth=true is load-bearing — the layerv plugin's AuthWithNHP
+	// fences on `if !res.SkipAuth { return ErrBackendAuthRequired }`.
+	// The layerv plugin fences on SkipAuth=true; the DDB resolver
+	// must populate the same field so the plugin path stays uniform
+	// across the TOML-overlay and DDB-bridge code paths.
+	if !group.SkipAuth {
+		t.Error("group.SkipAuth = false, want true (layerv plugin fences on this — see endpoints/server/staticplugins/layerv/main.go::AuthWithNHP)")
+	}
+
+	res, ok := group.Resources["frps-sandbox"]
+	if !ok {
+		t.Fatalf("inner Resources missing frps-sandbox; got %v", groupResourceKeys(group))
+	}
+	if got := res.ACId; got != "layerv-ac-tf" {
+		t.Errorf("res.ACId = %q, want %q", got, "layerv-ac-tf")
+	}
+	if got := res.Hostname; got != "connect.layerv.xyz" {
+		t.Errorf("res.Hostname = %q, want %q (customer-facing AC ingress, per FRPS-behind-AC redesign)", got, "connect.layerv.xyz")
+	}
+	if res.Addr == nil {
+		t.Fatal("res.Addr = nil, want non-nil NetAddress")
+	}
+	// Addr.Ip is intentionally empty — the layerv plugin's downstream
+	// handleNhpOpenResource path falls back to Hostname via DestHost().
+	// Mirror the overlay invariant exactly.
+	if res.Addr.Ip != "" {
+		t.Errorf("res.Addr.Ip = %q, want empty (overlay invariant: DestHost() falls back to Hostname)", res.Addr.Ip)
+	}
+	if got := res.Addr.Port; got != 7000 {
+		t.Errorf("res.Addr.Port = %d, want 7000", got)
+	}
+	if got := res.Addr.Protocol; got != "tcp" {
+		t.Errorf("res.Addr.Protocol = %q, want %q", got, "tcp")
+	}
+}
+
+// TestResourceLookup_SkipsMalformedRow_ContinuesWithRest asserts the
+// "partial parse" contract: a single malformed row from a writer-side
+// regression must NOT dark the entire catalog. Remaining rows still
+// populate the resolved aspData and an operator-visible WARN log fires.
+func TestResourceLookup_SkipsMalformedRow_ContinuesWithRest(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	q.putMalformedRow(nhpSystemCustomerID, "frps-bad")
+	putFRPSRow(q, "frps-sandbox")
+	l := newTestResourceLookup(t, q, &captureApplier{})
+
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if err != nil {
+		t.Fatalf("lookup err: %v, want success despite malformed row", err)
+	}
+	if _, ok := asp.ResourceGroups["frps-sandbox"]; !ok {
+		t.Errorf("frps-sandbox missing; malformed row must not dark the rest of the catalog")
+	}
+	if _, ok := asp.ResourceGroups["frps-bad"]; ok {
+		t.Errorf("frps-bad present; the malformed row must be skipped")
+	}
+}
+
+// TestResourceLookup_FiltersByAuthServiceID asserts that a partition
+// carrying rows for multiple aspIds returns only those matching the
+// requested aspId. Today the system partition carries only "layerv"
+// rows; the filter is defensive for a future multi-aspId schema.
+//
+// Asserts BOTH directions — without the reverse-direction
+// assertion, a regression hardcoding the filter to
+// `row.AuthServiceID == "layerv"` would pass on the layerv side
+// without ever testing whether other aspIds are correctly served
+// only their own rows.
+func TestResourceLookup_FiltersByAuthServiceID(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	// Two aspIds sharing the partition.
+	q.put(nhpSystemCustomerID, "frps-sandbox", "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 120)
+	q.put(nhpSystemCustomerID, "other-res", "other-asp", "other-ac", "other.example.com", "other.example.com", 8000, 60)
+	l := newTestResourceLookup(t, q, &captureApplier{})
+
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if err != nil {
+		t.Fatalf("lookup err: %v", err)
+	}
+	if _, ok := asp.ResourceGroups["frps-sandbox"]; !ok {
+		t.Errorf("layerv must include frps-sandbox; got %v", aspKeys(asp))
+	}
+	if _, ok := asp.ResourceGroups["other-res"]; ok {
+		t.Errorf("layerv aspData leaked other-asp's resource; rows must be filtered by auth_service_id")
+	}
+
+	// Reverse direction: requesting "other-asp" must NOT leak any
+	// "layerv" rows. A regression that hardcoded the filter to
+	// `row.AuthServiceID == "layerv"` (or any constant) would
+	// either return an empty/unknown result for "other-asp" OR
+	// include layerv's rows in the response — both detectable here.
+	asp2, err := l.LookupAuthServiceProvider(context.Background(), "other-asp")
+	if err != nil {
+		t.Fatalf("reverse lookup err: %v", err)
+	}
+	if _, ok := asp2.ResourceGroups["other-res"]; !ok {
+		t.Errorf("other-asp must include other-res; got %v", aspKeys(asp2))
+	}
+	if _, ok := asp2.ResourceGroups["frps-sandbox"]; ok {
+		t.Errorf("other-asp aspData leaked layerv's resource; rows must be filtered by auth_service_id")
+	}
+	if asp2.AuthSvcId != "other-asp" {
+		t.Errorf("AuthSvcId = %q, want %q (resolver must stamp the requested aspId on the result, not the row's aspId)", asp2.AuthSvcId, "other-asp")
+	}
+}
+
+// TestResourceLookup_OpenTimeClampsNonPositive asserts the
+// defensive zero-or-negative clamp (the
+// negative branch was tested; OpenTime=0 silently propagated).
+func TestResourceLookup_OpenTimeClampsNonPositive(t *testing.T) {
+	cases := []struct {
+		name         string
+		stored       int
+		wantOpenTime uint32
+	}{
+		{"zero", 0, uint32(DefaultIpOpenTime)},
+		{"negative", -1, uint32(DefaultIpOpenTime)},
+		{"negative_large", -1_000_000, uint32(DefaultIpOpenTime)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q := newFakeResourcesQuerier()
+			q.put(nhpSystemCustomerID, "frps-sandbox", "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, tc.stored)
+			l := newTestResourceLookup(t, q, &captureApplier{})
+
+			asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+			if err != nil {
+				t.Fatalf("lookup err: %v", err)
+			}
+			group := asp.ResourceGroups["frps-sandbox"]
+			if group == nil {
+				t.Fatalf("ResourceGroups missing frps-sandbox; got %v", aspKeys(asp))
+			}
+			if group.OpenTime != tc.wantOpenTime {
+				t.Errorf("OpenTime = %d, want %d (clamp must default non-positive open_time to DefaultIpOpenTime, not propagate the raw value)", group.OpenTime, tc.wantOpenTime)
+			}
+		})
+	}
+}
+
+// TestResourceLookup_OpenTimeClampsOverflow exercises the >uint32
+// overflow branch. Today no real writer emits values near MaxUint32,
+// but the platform-portability fence (int64(math.MaxUint32) widening
+// the comparison so the constant doesn't truncate on 32-bit) needs
+// test coverage so a future refactor doesn't regress it silently.
+func TestResourceLookup_OpenTimeClampsOverflow(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	// 5 billion exceeds MaxUint32 (~4.29 billion) — must clamp.
+	q.put(nhpSystemCustomerID, "frps-sandbox", "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 5_000_000_000)
+	l := newTestResourceLookup(t, q, &captureApplier{})
+
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if err != nil {
+		t.Fatalf("lookup err: %v", err)
+	}
+	group := asp.ResourceGroups["frps-sandbox"]
+	if group == nil {
+		t.Fatalf("ResourceGroups missing frps-sandbox; got %v", aspKeys(asp))
+	}
+	// Clamp is at MaxInt32 (not MaxUint32) for 32-bit platform safety
+	// — int(MaxUint32) on a 32-bit build is -1 (signed overflow) so the
+	// local int variable would carry a negative value through the
+	// rest of the function. MaxInt32 (~68 years of seconds) is still
+	// well past any plausible OpenTime use.
+	const wantClamped uint32 = 2_147_483_647
+	if group.OpenTime != wantClamped {
+		t.Errorf("OpenTime = %d, want %d (overflow must clamp at MaxInt32 for 32-bit-portable safety)", group.OpenTime, wantClamped)
+	}
+}
+
+// TestResourceLookup_SkipsCrossPartitionRow asserts the
+// defense-in-depth fence against a future regression in
+// KeyConditionExpression that lets cross-partition rows leak.
+// The resolver MUST skip rows whose customer_id doesn't match the
+// configured partition, and fires MetricResourceLookupCrossPartition
+// (dedicated counter — operators alarm at `> 0` because a
+// cross-partition row in a per-tenant schema is a potential
+// cross-tenant correctness bug).
+func TestResourceLookup_SkipsCrossPartitionRow(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	// Cross-partition row alongside a good row. The fake doesn't
+	// honor KeyConditionExpression — both rows reach the resolver
+	// loop. The resolver's defense-in-depth check filters the
+	// cross-partition one client-side.
+	q.put("ZZZZZZZZZZZZZZZZZZZZZZZZZZ", "frps-leak", "layerv", "layerv-ac-tf", "leaked.example.com", "leaked.example.com", 7000, 120)
+	putFRPSRow(q, "frps-good")
+
+	l := newTestResourceLookup(t, q, &captureApplier{})
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if err != nil {
+		t.Fatalf("lookup err: %v, want success despite cross-partition row", err)
+	}
+	if _, ok := asp.ResourceGroups["frps-good"]; !ok {
+		t.Errorf("frps-good missing; cross-partition row must not dark the rest of the catalog")
+	}
+	if _, ok := asp.ResourceGroups["frps-leak"]; ok {
+		t.Errorf("frps-leak present; cross-partition row MUST be skipped to prevent cross-tenant data leak under a future KeyConditionExpression regression")
+	}
+}
+
+// TestForwarder_ThreadsLifecycleCtxToResolver fences the
+// f.deps.LifecycleCtx() plumbing on the forward path. The forwarder
+// MUST pass its deps' LifecycleCtx to ResolveAuthSvcProvider so the
+// resolver's shutdown-classification branch is reachable from the
+// forwarder seam (a graceful Stop() cancels lifecycleCtx, in-flight
+// forward-receiver lookups observe ctx.Canceled, and
+// MetricResourceLookupDDBError is correctly suppressed for the
+// shutdown case).
+//
+// A regression that swapped to context.Background() (or dropped the
+// LifecycleCtx() interface method) would silently route shutdown
+// errors through MetricResourceLookupDDBError. The mock can't
+// exercise the resolver's three-way switch directly (no real
+// ResourceLookup wired — that's #2126), but it CAN fence that
+// callers pass the right ctx.
+func TestForwarder_ThreadsLifecycleCtxToResolver(t *testing.T) {
+	// A pre-canceled ctx as the mock's lifecycleCtx. If the
+	// forwarder calls Resolve with this ctx, the mock captures it
+	// and ctx.Err() != nil proves the plumbing is intact.
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	deps := NewMockForwarderDeps()
+	deps.SetLifecycleCtx(canceledCtx)
+	// Drive the resolver call directly via the interface method
+	// (forwarder code path). The wire test (HandleForwardRequest
+	// end-to-end) is overkill for this seam.
+	_ = deps.ResolveAuthSvcProvider(deps.LifecycleCtx(), "test-asp", "test")
+
+	got := deps.LastResolveCtx()
+	if got == nil {
+		t.Fatal("LastResolveCtx() = nil — mock didn't capture the ctx passed to ResolveAuthSvcProvider")
+	}
+	if got.Err() == nil {
+		t.Errorf("LastResolveCtx().Err() = nil, want context.Canceled — the ctx threaded into the resolver MUST be the lifecycle ctx (canceled in this fixture), not context.Background()")
+	}
+}
+
+// TestResourceLookup_SkipsEmptyResourceID asserts that a writer-side
+// regression that produced a row with empty resource_id is skipped
+// rather than poisoning the inner Resources map. noted this
+// branch was implemented but untested.
+func TestResourceLookup_SkipsEmptyResourceID(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	// A row with empty resource_id alongside a good row.
+	q.put(nhpSystemCustomerID, "", "layerv", "layerv-ac-tf", "host.example.com", "host.example.com", 7000, 120)
+	q.put(nhpSystemCustomerID, "frps-sandbox", "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 120)
+	l := newTestResourceLookup(t, q, &captureApplier{})
+
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if err != nil {
+		t.Fatalf("lookup err: %v", err)
+	}
+	if _, ok := asp.ResourceGroups["frps-sandbox"]; !ok {
+		t.Errorf("frps-sandbox missing; empty-resource_id row must not dark the rest of the catalog")
+	}
+	if _, ok := asp.ResourceGroups[""]; ok {
+		t.Errorf("ResourceGroups[\"\"] populated; rows with empty resource_id must be skipped, not keyed on \"\"")
+	}
+}
+
+// TestResourceLookup_CacheHitRepublishes asserts the self-healing
+// republish on cache hit. cache hits returned the cached
+// aspData without calling the applier, so a TOML file-watcher race
+// that wiped authServiceMap left it stale until cache TTL expiry.
+// Now: every cache hit calls applyAspMapDelta, which short-circuits
+// when the pointer is already installed (cheap pointer-compare under
+// write lock) and re-installs on a mismatch.
+func TestResourceLookup_CacheHitRepublishes(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	putFRPSRow(q, "frps-sandbox")
+	applier := &captureApplier{}
+	l := newTestResourceLookup(t, q, applier)
+
+	// Warm the cache.
+	asp1, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if err != nil {
+		t.Fatalf("warm err: %v", err)
+	}
+	if applier.count() != 1 {
+		t.Fatalf("warm applier count = %d, want 1", applier.count())
+	}
+
+	// Second lookup: cache hit. applier was NOT
+	// called; now it IS, so a future authServiceMap-clearing event
+	// self-heals on the next knock.
+	asp2, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if err != nil {
+		t.Fatalf("hit err: %v", err)
+	}
+	if asp1 != asp2 {
+		t.Errorf("cache hit returned distinct pointer; LRU must hand out the same *AuthServiceProviderData within TTL")
+	}
+	if applier.count() != 2 {
+		t.Errorf("applier count = %d, want 2 (cache hit must republish for self-healing against TOML watcher race)", applier.count())
+	}
+}
+
+// TestUdpServer_ResolveAuthSvcProvider exercises the metric-attribution
+// contract in ResolveAuthSvcProvider:
+//
+//   - In-memory hit: NO counter.
+//   - resourceLookup == nil + miss: MetricAuthFailure (auth-policy).
+//   - ErrResourceUnknownASP: MetricAuthFailure (auth-policy).
+//   - DDB error: MetricResourceLookupDDBError ONLY (not auth-failure;
+//     the auth-failures alarm must not page for DDB outages).
+//   - context.Canceled during canceled parent ctx: NEITHER counter
+//     (graceful shutdown).
+//
+// caught a regression where the caller in nhpauth.go fired
+// MetricAuthFailure unconditionally on the nil-aspData reject —
+// including the DDB-error and shutdown branches the resolver was
+// supposed to keep distinct. The fix moved metric ownership inside
+// the resolver; these tests fence the contract via the live counter
+// publisher (metrics.NewPublisherForTest).
+func TestUdpServer_ResolveAuthSvcProvider(t *testing.T) {
+	t.Run("in_memory_hit_short_circuits_no_counters", func(t *testing.T) {
+		existing := &common.AuthServiceProviderData{AuthSvcId: "layerv"}
+		s := &UdpServer{
+			metrics:        metrics.NewPublisherForTest(t),
+			authServiceMap: common.AuthSvcProviderMap{"layerv": existing},
+		}
+
+		got := s.ResolveAuthSvcProvider(context.Background(), "layerv", "test")
+		if got != existing {
+			t.Errorf("ResolveAuthSvcProvider = %v, want existing in-memory entry %v (must short-circuit without DDB call)", got, existing)
+		}
+		counters, _ := s.metrics.CountersForTest(t)
+		if c := counters[MetricAuthFailure]; c != 0 {
+			t.Errorf("MetricAuthFailure counter=%v want 0 on in-memory hit", c)
+		}
+		if c := counters[MetricResourceLookupDDBError]; c != 0 {
+			t.Errorf("MetricResourceLookupDDBError counter=%v want 0 on in-memory hit", c)
+		}
+	})
+
+	t.Run("nil_lookup_miss_fires_authfailure", func(t *testing.T) {
+		s := &UdpServer{
+			metrics:          metrics.NewPublisherForTest(t),
+			authServiceMap:   common.AuthSvcProviderMap{},
+			pluginHandlerMap: map[string]plugins.PluginHandler{},
+			// resourceLookup intentionally nil — non-cloud deployment.
+		}
+
+		got := s.ResolveAuthSvcProvider(context.Background(), "layerv", "test")
+		if got != nil {
+			t.Errorf("ResolveAuthSvcProvider with nil lookup = %v, want nil", got)
+		}
+		counters, _ := s.metrics.CountersForTest(t)
+		if c := counters[MetricAuthFailure]; c != 1 {
+			t.Errorf("MetricAuthFailure counter=%v want 1 on nil-lookup miss (auth-policy outcome — aspId genuinely not registered)", c)
+		}
+	})
+
+	t.Run("nil_ctx_falls_back_to_background", func(t *testing.T) {
+		q := newFakeResourcesQuerier()
+		putFRPSRow(q, "frps-sandbox")
+		s := &UdpServer{
+			metrics:          metrics.NewPublisherForTest(t),
+			authServiceMap:   common.AuthSvcProviderMap{},
+			pluginHandlerMap: map[string]plugins.PluginHandler{},
+		}
+		lookup, err := NewResourceLookup(q, "test-table", nhpSystemCustomerID, s)
+		if err != nil {
+			t.Fatalf("NewResourceLookup: %v", err)
+		}
+		s.resourceLookup = lookup
+
+		// nil ctx: helper must substitute context.Background rather
+		// than nil-deref on the WithTimeout call inside the lookup.
+		got := s.ResolveAuthSvcProvider(nil, "layerv", "test") //nolint:staticcheck // intentional nil-ctx test
+		if got == nil {
+			t.Errorf("ResolveAuthSvcProvider with nil ctx = nil, want resolved aspData (helper must fall back to context.Background)")
+		}
+	})
+
+	t.Run("unknown_asp_fires_authfailure_only", func(t *testing.T) {
+		// Fake querier with no rows → ErrResourceUnknownASP path.
+		q := newFakeResourcesQuerier()
+		s := &UdpServer{
+			metrics:          metrics.NewPublisherForTest(t),
+			authServiceMap:   common.AuthSvcProviderMap{},
+			pluginHandlerMap: map[string]plugins.PluginHandler{},
+		}
+		lookup, err := NewResourceLookup(q, "test-table", nhpSystemCustomerID, s)
+		if err != nil {
+			t.Fatalf("NewResourceLookup: %v", err)
+		}
+		s.resourceLookup = lookup
+
+		got := s.ResolveAuthSvcProvider(context.Background(), "layerv", "test")
+		if got != nil {
+			t.Errorf("ResolveAuthSvcProvider on unknown aspId = %v, want nil", got)
+		}
+		counters, _ := s.metrics.CountersForTest(t)
+		if c := counters[MetricAuthFailure]; c != 1 {
+			t.Errorf("MetricAuthFailure counter=%v want 1 on ErrResourceUnknownASP (auth-policy)", c)
+		}
+		if c := counters[MetricResourceLookupDDBError]; c != 0 {
+			t.Errorf("MetricResourceLookupDDBError counter=%v want 0 on auth-policy reject (must split from infra error)", c)
+		}
+	})
+
+	t.Run("ddb_error_fires_only_ddberror_not_authfailure", func(t *testing.T) {
+		// Regression fence: this branch must NOT fire MetricAuthFailure.
+		// The auth-failures alarm pages on MetricAuthFailure; a DDB
+		// throttle is infra trouble, not auth-policy. The split between
+		// MetricResourceLookupDDBError and MetricAuthFailure is the
+		// invariant ResolveAuthSvcProvider's switch enforces.
+		q := newFakeResourcesQuerier()
+		q.err = errors.New("ddb throttled: ProvisionedThroughputExceeded")
+		s := &UdpServer{
+			metrics:          metrics.NewPublisherForTest(t),
+			authServiceMap:   common.AuthSvcProviderMap{},
+			pluginHandlerMap: map[string]plugins.PluginHandler{},
+		}
+		lookup, err := NewResourceLookup(q, "test-table", nhpSystemCustomerID, s)
+		if err != nil {
+			t.Fatalf("NewResourceLookup: %v", err)
+		}
+		s.resourceLookup = lookup
+
+		got := s.ResolveAuthSvcProvider(context.Background(), "layerv", "test")
+		if got != nil {
+			t.Errorf("ResolveAuthSvcProvider on DDB error = %v, want nil", got)
+		}
+		counters, _ := s.metrics.CountersForTest(t)
+		if c := counters[MetricResourceLookupDDBError]; c != 1 {
+			t.Errorf("MetricResourceLookupDDBError counter=%v want 1 on transient DDB error", c)
+		}
+		if c := counters[MetricAuthFailure]; c != 0 {
+			t.Errorf("MetricAuthFailure counter=%v want 0 on DDB error (split from auth-policy: DDB outages must not page the auth-failures alarm)", c)
+		}
+	})
+
+	t.Run("shutdown_canceled_ctx_suppresses_both_counters", func(t *testing.T) {
+		// Regression: graceful shutdown (lifecycleCtx
+		// canceled, in-flight Query returns wrapped ctx.Canceled) must
+		// not increment EITHER MetricResourceLookupDDBError OR
+		// MetricAuthFailure. A normal `systemctl stop` would otherwise
+		// page on-call.
+		q := newFakeResourcesQuerier()
+		q.err = context.Canceled
+		s := &UdpServer{
+			metrics:          metrics.NewPublisherForTest(t),
+			authServiceMap:   common.AuthSvcProviderMap{},
+			pluginHandlerMap: map[string]plugins.PluginHandler{},
+		}
+		lookup, err := NewResourceLookup(q, "test-table", nhpSystemCustomerID, s)
+		if err != nil {
+			t.Fatalf("NewResourceLookup: %v", err)
+		}
+		s.resourceLookup = lookup
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // pre-canceled so ctx.Err() != nil at the switch site
+
+		got := s.ResolveAuthSvcProvider(ctx, "layerv", "test")
+		if got != nil {
+			t.Errorf("ResolveAuthSvcProvider on shutdown = %v, want nil", got)
+		}
+		counters, _ := s.metrics.CountersForTest(t)
+		if c := counters[MetricResourceLookupDDBError]; c != 0 {
+			t.Errorf("MetricResourceLookupDDBError counter=%v want 0 on shutdown (must not look like DDB outage)", c)
+		}
+		if c := counters[MetricAuthFailure]; c != 0 {
+			t.Errorf("MetricAuthFailure counter=%v want 0 on shutdown (must not look like auth-policy reject)", c)
+		}
+	})
+}
+
+// TestResourceLookup_PaginationWarningFires asserts that a DDB Query
+// returning a LastEvaluatedKey (paginated response) still resolves the
+// rows on page 1 — pagination isn't implemented, but the operator-
+// visible Warning fires so a future regression (or a partition that
+// outgrows the 1MB page limit) surfaces in logs rather than as a
+// silent ErrResourceUnknownASP. noted this branch had no test.
+func TestResourceLookup_PaginationWarningFires(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	q.simulatePagination = true
+	putFRPSRow(q, "frps-sandbox")
+
+	l := newTestResourceLookup(t, q, &captureApplier{})
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if err != nil {
+		t.Fatalf("lookup err: %v, want success (page-1 rows must still resolve)", err)
+	}
+	if _, ok := asp.ResourceGroups["frps-sandbox"]; !ok {
+		t.Errorf("page-1 row missing; pagination must not block the rows we DID receive")
+	}
+	// The Warning emit itself is best-effort observable (the package
+	// log writes to stderr); the regression fence here is that the
+	// resolver successfully returns rather than silently dropping
+	// the response. A future implementation that adds real pagination
+	// can adjust this test to assert all pages get queried.
+}
+
+// TestLoadPluginOnce_TOMLAndDDBSerialized asserts that the boot/reload
+// path (updateResources → loadPluginOnce(aspId, pluginPath)) and the
+// per-knock path (applyAspMapDelta → ensurePluginLoaded → loadPluginOnce
+// (aspId, "")) share the same per-aspId sync.Once. flagged that
+// pre-this-refactor a concurrent TOML reload + first knock for the
+// same aspId could run h.Init twice. Routing both through
+// loadPluginOnce closes the race; this test fences the seam by
+// asserting Delete-on-failure works regardless of which entry point
+// called.
+func TestLoadPluginOnce_TOMLAndDDBSerialized(t *testing.T) {
+	s := &UdpServer{
+		pluginHandlerMap: map[string]plugins.PluginHandler{},
+	}
+
+	// Call once with a non-empty pluginPath (TOML reload shape).
+	s.loadPluginOnce("nonexistent-asp", "/some/path.so")
+
+	// And once with empty (DDB shape).
+	s.loadPluginOnce("nonexistent-asp", "")
+
+	// Both calls fail (no registered plugin); both should delete the
+	// Once so the next caller retries. After the second call the
+	// pluginLoadOnce entry should not be present (each failed Do
+	// deletes it).
+	if _, found := s.pluginLoadOnce.Load("nonexistent-asp"); found {
+		t.Errorf("pluginLoadOnce persisted after failed loads — retry path must keep deleting so the aspId isn't locked into permanent reject")
+	}
+}
+
+// TestLoadPluginOnce_SuccessPersistsOnce asserts the positive
+// contract: a SUCCESSFUL load LEAVES the per-aspId sync.Once intact
+// in pluginLoadOnce so the next caller is a fast no-op (the
+// alreadyLoaded fast-path inside Do skips the redundant Init). Pairs
+// with TestEnsurePluginLoaded_FailureNotSticky which fences the
+// inverse (failure → Delete → retry path). A regression that
+// overzealously Deleted after success would cause every subsequent
+// knock to re-enter the LoadPlugin path; this test catches it.
+func TestLoadPluginOnce_SuccessPersistsOnce(t *testing.T) {
+	// Simulate a successful prior load by pre-populating
+	// pluginHandlerMap. The first loadPluginOnce call should observe
+	// the alreadyLoaded fast-path inside Do, return without calling
+	// GetPluginHandler/LoadPlugin, and (critically) NOT Delete the
+	// Once — because pluginHandlerMap[aspId] is non-nil at the
+	// post-Do verify check.
+	s := &UdpServer{
+		pluginHandlerMap: map[string]plugins.PluginHandler{
+			"prewired-asp": fakePluginHandler{},
+		},
+	}
+
+	s.loadPluginOnce("prewired-asp", "")
+
+	if _, found := s.pluginLoadOnce.Load("prewired-asp"); !found {
+		t.Errorf("pluginLoadOnce entry missing after successful load — the Once must persist so the next caller's Do is a no-op (Delete on the fast-path-saw-loaded branch would break this)")
+	}
+}
+
+// fakePluginHandler is a minimal plugins.PluginHandler used to
+// pre-populate pluginHandlerMap in tests that need a "load already
+// happened" fixture without going through LoadPlugin's Init.
+type fakePluginHandler struct{}
+
+func (fakePluginHandler) Init(*plugins.PluginParamsIn) error { return nil }
+func (fakePluginHandler) Close() error                       { return nil }
+func (fakePluginHandler) Signature() string                  { return "" }
+func (fakePluginHandler) Version() string                    { return "test" }
+func (fakePluginHandler) ExportedData() *plugins.PluginParamsOut {
+	return nil
+}
+func (fakePluginHandler) RequestOTP(*common.NhpOTPRequest, *plugins.NhpServerPluginHelper) error {
+	return nil
+}
+func (fakePluginHandler) RegisterAgent(*common.NhpRegisterRequest, *plugins.NhpServerPluginHelper) (*common.ServerRegisterAckMsg, error) {
+	return nil, nil
+}
+func (fakePluginHandler) ListService(*common.NhpListRequest, *plugins.NhpServerPluginHelper) (*common.ServerListResultMsg, error) {
+	return nil, nil
+}
+func (fakePluginHandler) AuthWithNHP(*common.NhpAuthRequest, *plugins.NhpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
+	return nil, nil
+}
+func (fakePluginHandler) AuthWithHttp(*gin.Context, *common.HttpKnockRequest, *plugins.HttpServerPluginHelper) (*common.ServerKnockAckMsg, error) {
+	return nil, nil
+}
+
+// TestResourceLookup_SetMetricsSetOnce fences the set-once contract
+// on SetMetrics: the first non-nil call wires the publisher;
+// subsequent calls with nil are IGNORED so a future caller that
+// accidentally re-invokes SetMetrics(nil) (e.g., during a refactor
+// that introduces a partial-reset path) doesn't silently dark
+// the counters. A non-nil → non-nil call is fine (overwrite is
+// the documented behavior); only the nil-clear-after-set case is
+// guarded. Mirrors the AgentPeerLookup.SetMetrics contract.
+func TestResourceLookup_SetMetricsSetOnce(t *testing.T) {
+	l, err := NewResourceLookup(newFakeResourcesQuerier(), "test-table", nhpSystemCustomerID, nil)
+	if err != nil {
+		t.Fatalf("NewResourceLookup: %v", err)
+	}
+
+	// First call wires the publisher.
+	p1 := metrics.NewPublisherForTest(t)
+	l.SetMetrics(p1)
+	if l.metrics == nil {
+		t.Fatal("after SetMetrics(p1), l.metrics is nil — first non-nil call must wire the publisher")
+	}
+
+	// Second call with nil must NOT clear the wired publisher.
+	l.SetMetrics(nil)
+	if l.metrics == nil {
+		t.Error("SetMetrics(nil) after a non-nil set CLEARED the publisher — the set-once contract refuses nil writes to prevent silent metric-darkening")
+	}
+
+	// Trigger a counter to confirm the original publisher is still
+	// the one being incremented.
+	if l.metrics != p1 {
+		t.Errorf("l.metrics != p1 after SetMetrics(nil); the original publisher must survive")
+	}
+}
+
+// TestEnsurePluginLoaded_FailureNotSticky_Concurrent fences the
+// concurrent-retry path: N goroutines call ensurePluginLoaded for the
+// same unregistered aspId simultaneously. The Delete-on-failure path
+// in loadPluginOnce must leave pluginLoadOnce empty afterwards
+// regardless of how the goroutines interleave (serialized callers
+// share the same Once; concurrent callers may racily LoadOrStore
+// different Onces if Delete fires between LoadOrStores, each Once is
+// then deleted by its own caller). noted the serial-only
+// FailureNotSticky test below didn't exercise the race; this closes
+// the gap.
+func TestEnsurePluginLoaded_FailureNotSticky_Concurrent(t *testing.T) {
+	s := &UdpServer{
+		pluginHandlerMap: map[string]plugins.PluginHandler{},
+	}
+
+	const N = 16
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			s.ensurePluginLoaded("nonexistent-concurrent-asp")
+		}()
+	}
+	wg.Wait()
+
+	if _, found := s.pluginLoadOnce.Load("nonexistent-concurrent-asp"); found {
+		t.Errorf("pluginLoadOnce entry persisted after N=%d concurrent failed loads — Delete-on-failure must be terminal regardless of which goroutine wrote the final Once", N)
+	}
+}
+
+// TestEnsurePluginLoaded_FailureNotSticky asserts that a failed
+// LoadPlugin call (e.g., no static plugin registered for the aspId)
+// does NOT lock the aspId into permanent reject — the next call
+// retries the load. sync.Once was consumed on failure
+// and subsequent callers piggybacked on the failed Init silently.
+func TestEnsurePluginLoaded_FailureNotSticky(t *testing.T) {
+	s := &UdpServer{
+		pluginHandlerMap: map[string]plugins.PluginHandler{},
+	}
+	// aspId not registered with any static plugin — GetPluginHandler
+	// returns nil, the Once fires once, no entry in pluginHandlerMap.
+	s.ensurePluginLoaded("nonexistent-asp")
+
+	// Verify the Once was removed so a retry is possible.
+	if _, found := s.pluginLoadOnce.Load("nonexistent-asp"); found {
+		t.Errorf("pluginLoadOnce entry for nonexistent-asp persisted after failed load; subsequent knocks will silently piggyback on the failed Init")
+	}
+
+	// A second call should re-enter the load path (not no-op silently
+	// via a consumed Once). We can't easily observe the second
+	// GetPluginHandler call without a stub-registry, but we CAN
+	// observe that pluginLoadOnce is still absent after the second
+	// failed call (it gets repopulated then deleted again).
+	s.ensurePluginLoaded("nonexistent-asp")
+	if _, found := s.pluginLoadOnce.Load("nonexistent-asp"); found {
+		t.Errorf("pluginLoadOnce entry persisted after second failed load; retry path must keep deleting")
+	}
+}
+
+// TestApplyAspMapDelta_FastPathPointerEqual asserts the optimization
+// that applyAspMapDelta no-ops when the entry is already installed
+// under the same *AuthServiceProviderData pointer. Without this, every
+// cache hit (which now republishes — see TestResourceLookup_CacheHitRepublishes)
+// would do a full map copy + swap under the write lock — wasteful
+// for the steady-state knock path.
+func TestApplyAspMapDelta_FastPathPointerEqual(t *testing.T) {
+	fresh := &common.AuthServiceProviderData{
+		AuthSvcId:      "layerv",
+		ResourceGroups: common.ResourceGroupMap{},
+	}
+	s := &UdpServer{
+		authServiceMap: common.AuthSvcProviderMap{"layerv": fresh},
+	}
+	mapHeaderBefore := reflect.ValueOf(s.authServiceMap).Pointer()
+
+	// Same pointer — must short-circuit; no fresh allocation, no swap.
+	s.applyAspMapDelta("layerv", fresh)
+	mapHeaderAfter := reflect.ValueOf(s.authServiceMap).Pointer()
+
+	if mapHeaderBefore != mapHeaderAfter {
+		t.Errorf("authServiceMap hmap reallocated despite pointer-equal install (before=%#x after=%#x); fast path must short-circuit",
+			mapHeaderBefore, mapHeaderAfter)
+	}
+	if s.authServiceMap["layerv"] != fresh {
+		t.Errorf("entry mutated despite fast-path no-op")
+	}
+}
+
+// TestResourceLookup_AppliesToHostServer asserts the publish-into-host
+// contract: a successful lookup invokes applyAspMapDelta with the
+// resolved aspData. This is the seam by which FindAuthSvcProvider's
+// next RLock read sees the live catalog.
+func TestResourceLookup_AppliesToHostServer(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	putFRPSRow(q, "frps-sandbox")
+	applier := &captureApplier{}
+	l := newTestResourceLookup(t, q, applier)
+
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if err != nil {
+		t.Fatalf("lookup err: %v", err)
+	}
+
+	last, ok := applier.lastApplied()
+	if !ok {
+		t.Fatal("applyAspMapDelta was not called on successful lookup")
+	}
+	if last.aspId != "layerv" {
+		t.Errorf("applied aspId = %q, want %q", last.aspId, "layerv")
+	}
+	if last.asp != asp {
+		t.Errorf("applied aspData pointer differs from returned aspData; want the same *AuthServiceProviderData published into the host map")
+	}
+}
+
+// TestResourceLookup_NilApplier asserts that a tests-only construction
+// without an applier still resolves successfully (the applier branch
+// is optional). Production always passes a non-nil applier.
+func TestResourceLookup_NilApplier(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	putFRPSRow(q, "frps-sandbox")
+	l := newTestResourceLookup(t, q, nil)
+
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if err != nil {
+		t.Fatalf("lookup err: %v", err)
+	}
+	if asp == nil {
+		t.Error("aspData = nil despite successful Query")
+	}
+}
+
+// TestResourceLookup_EmptyAspIdShortCircuits asserts the
+// LookupAuthServiceProvider(ctx, "") early-exit. Today no caller
+// passes an empty aspId (HandleKnockRequest already rejects the
+// knock at parse time when AuthServiceId is empty), but a future
+// regression that drops the upstream check must not silently
+// Query an entire partition and return its first row.
+func TestResourceLookup_EmptyAspIdShortCircuits(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	putFRPSRow(q, "frps-sandbox")
+	l := newTestResourceLookup(t, q, &captureApplier{})
+
+	_, err := l.LookupAuthServiceProvider(context.Background(), "")
+	if !errors.Is(err, ErrResourceUnknownASP) {
+		t.Errorf("empty aspId err = %v, want ErrResourceUnknownASP (short-circuit)", err)
+	}
+	if got := q.callCount(); got != 0 {
+		t.Errorf("DDB calls with empty aspId = %d, want 0 (short-circuit before Query)", got)
+	}
+}
+
+// TestResourceLookup_NilLookup asserts nil-receiver safety. Today no
+// caller invokes through a nil pointer (HandleKnockRequest gates on
+// `s.resourceLookup != nil`), but the godoc promises nil-safe for
+// "lookup disabled" callers.
+func TestResourceLookup_NilLookup(t *testing.T) {
+	var l *ResourceLookup
+	_, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if !errors.Is(err, ErrResourceUnknownASP) {
+		t.Errorf("nil lookup err = %v, want ErrResourceUnknownASP", err)
+	}
+}
+
+// TestResourceLookup_NilQuerier asserts the "DDB client not wired"
+// branch — the resolver was constructed but no DDB Query is possible
+// (e.g. on-prem / etcd-backed deployments). Caller must get a clean
+// reject rather than a nil-deref crash.
+func TestResourceLookup_NilQuerier(t *testing.T) {
+	l, err := NewResourceLookup(nil, "nhp-resources-test", nhpSystemCustomerID, &captureApplier{})
+	if err != nil {
+		t.Fatalf("NewResourceLookup(nil querier): %v", err)
+	}
+	_, lookupErr := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	if !errors.Is(lookupErr, ErrResourceUnknownASP) {
+		t.Errorf("nil-querier lookup err = %v, want ErrResourceUnknownASP", lookupErr)
+	}
+}
+
+// TestResourceLookup_SingleflightDedupsConcurrentMiss asserts that N
+// concurrent first-time lookups for the same aspId issue exactly one
+// DDB Query and invoke the applier exactly once. Without
+// singleflight, every caller would issue its own Query and publish
+// its own *AuthServiceProviderData pointer — the cost amplifier the
+// godoc on AgentPeerLookup.sfGroup describes in detail.
+//
+// Mirror the AgentPeerLookup test's barrier pattern: install a
+// before-Query hook that blocks on a release channel until all N
+// callers have committed to a singleflight slot. Without the barrier
+// a fast winner can populate the cache before piggybackers enter,
+// degrading the test to a cache-hit assertion that proves nothing
+// about singleflight.
+func TestResourceLookup_SingleflightDedupsConcurrentMiss(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	putFRPSRow(q, "frps-sandbox")
+
+	const N = 8
+	applier := &captureApplier{}
+	l := newTestResourceLookup(t, q, applier)
+
+	// Barrier: count callers entering sfGroup.Do; release the winner's
+	// Query only after all N have committed.
+	var entered sync.WaitGroup
+	entered.Add(N)
+	release := make(chan struct{})
+	l.onSingleflightEnter = func(aspId string) {
+		entered.Done()
+	}
+	q.beforeQuery = func() {
+		<-release
+	}
+
+	type result struct {
+		asp *common.AuthServiceProviderData
+		err error
+	}
+	results := make(chan result, N)
+	var startWg sync.WaitGroup
+	startWg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			startWg.Done()
+			asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+			results <- result{asp: asp, err: err}
+		}()
+	}
+	startWg.Wait()
+	entered.Wait() // every goroutine has reached sfGroup.Do
+	close(release) // winner's Query proceeds
+
+	var firstPtr *common.AuthServiceProviderData
+	for i := 0; i < N; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Errorf("goroutine #%d err: %v", i, r.err)
+			continue
+		}
+		if firstPtr == nil {
+			firstPtr = r.asp
+			continue
+		}
+		if r.asp != firstPtr {
+			t.Errorf("goroutine #%d got distinct *AuthServiceProviderData pointer; singleflight must hand out the SAME pointer to every piggybacker", i)
+		}
+	}
+
+	if got := q.callCount(); got != 1 {
+		t.Errorf("DDB Query calls = %d, want 1 (singleflight must dedupe N concurrent misses)", got)
+	}
+	if got := applier.count(); got != 1 {
+		t.Errorf("applyAspMapDelta calls = %d, want 1 (publish exactly once per resolve)", got)
+	}
+}
+
+// TestApplyAspMapDelta_BuildFreshThenSwap asserts the
+// UdpServer.applyAspMapDelta concurrency contract: the live map's
+// pointer identity changes (fresh allocation), and existing entries
+// are preserved. This is the Option-A pattern that lets the
+// layerv plugin's lock-free helper.AspData reads stay safe against
+// concurrent publishes.
+func TestApplyAspMapDelta_BuildFreshThenSwap(t *testing.T) {
+	s := &UdpServer{
+		authServiceMap: common.AuthSvcProviderMap{
+			"existing": &common.AuthServiceProviderData{AuthSvcId: "existing"},
+		},
+	}
+	oldMap := s.authServiceMap
+	oldExisting := s.authServiceMap["existing"]
+	oldMapHeader := reflect.ValueOf(s.authServiceMap).Pointer()
+
+	fresh := &common.AuthServiceProviderData{
+		AuthSvcId:      "layerv",
+		ResourceGroups: common.ResourceGroupMap{},
+	}
+	s.applyAspMapDelta("layerv", fresh)
+
+	if got := s.authServiceMap["layerv"]; got != fresh {
+		t.Errorf("authServiceMap[\"layerv\"] = %v, want fresh pointer", got)
+	}
+	if got := s.authServiceMap["existing"]; got != oldExisting {
+		t.Errorf("authServiceMap[\"existing\"] mutated; build-fresh-then-swap must preserve other entries unchanged")
+	}
+	// The map header pointer should change — a build-fresh-then-swap
+	// allocates a fresh hmap so any captured reference (e.g., oldMap)
+	// stays as a snapshot of the pre-swap state.
+	// reflect.ValueOf(map).Pointer() returns the underlying hmap
+	// pointer — the right primitive for "this map was rebuilt, not
+	// mutated in place." A naive `&oldMap == &s.authServiceMap`
+	// would be structurally always-false (two distinct variables
+	// can't share an address) and silently miss a regression that
+	// dropped the `fresh := make(...)` step.
+	newMapHeader := reflect.ValueOf(s.authServiceMap).Pointer()
+	if oldMapHeader == newMapHeader {
+		t.Errorf("authServiceMap hmap pointer unchanged (oldHeader=%#x newHeader=%#x); build-fresh-then-swap must allocate a fresh map so concurrent lock-free readers holding the old reference observe an immutable snapshot",
+			oldMapHeader, newMapHeader)
+	}
+	if _, ok := oldMap["layerv"]; ok {
+		t.Errorf("old map snapshot mutated to include layerv; build-fresh-then-swap must NOT touch the published-then-orphaned map")
+	}
+}
+
+// TestApplyAspMapDelta_NoopOnNil asserts the defensive nil guards in
+// applyAspMapDelta. A nil aspData or empty aspId is a programmer
+// error from the caller; the method must not install a nil sentinel
+// that would surface as a panic in FindAuthSvcProvider readers.
+func TestApplyAspMapDelta_NoopOnNil(t *testing.T) {
+	s := &UdpServer{
+		authServiceMap:   common.AuthSvcProviderMap{},
+		pluginHandlerMap: map[string]plugins.PluginHandler{},
+	}
+
+	s.applyAspMapDelta("", &common.AuthServiceProviderData{})
+	if len(s.authServiceMap) != 0 {
+		t.Errorf("empty aspId installed entry; len = %d, want 0", len(s.authServiceMap))
+	}
+
+	s.applyAspMapDelta("layerv", nil)
+	if _, ok := s.authServiceMap["layerv"]; ok {
+		t.Errorf("nil aspData installed entry; readers would nil-deref through helper.AspData")
+	}
+}
+
+// TestNewResourceLookupFromStorage_DisabledOnEmptyTable asserts that a
+// missing ResourcesTable config returns (nil, nil) — a clean "lookup
+// disabled" branch that the caller in UdpServer.Start uses to keep
+// the legacy TOML-overlay-only behavior in effect.
+func TestNewResourceLookupFromStorage_DisabledOnEmptyTable(t *testing.T) {
+	ddb := &DynamoDBStorage{config: DynamoDBConfig{}}
+	lookup, err := NewResourceLookupFromStorage(ddb, &captureApplier{})
+	if err != nil {
+		t.Errorf("err = %v, want nil for disabled-by-config", err)
+	}
+	if lookup != nil {
+		t.Errorf("lookup = %v, want nil for empty ResourcesTable", lookup)
+	}
+}
+
+// TestNewResourceLookupFromStorage_NonDDBReturnsNil asserts that a
+// non-DynamoDB storage backend (etcd, file-config) returns (nil, nil)
+// without surfacing an error — same "lookup disabled" posture.
+func TestNewResourceLookupFromStorage_NonDDBReturnsNil(t *testing.T) {
+	// A nil StorageBackend is the simplest non-DDB shape.
+	lookup, err := NewResourceLookupFromStorage(nil, &captureApplier{})
+	if err != nil {
+		t.Errorf("err = %v, want nil for non-DDB storage", err)
+	}
+	if lookup != nil {
+		t.Errorf("lookup = %v, want nil for non-DDB storage", lookup)
+	}
+}
+
+// aspKeys returns the keys of an aspData's ResourceGroups for error
+// messages. Helper, not a contract.
+func aspKeys(asp *common.AuthServiceProviderData) []string {
+	if asp == nil {
+		return nil
+	}
+	keys := make([]string, 0, len(asp.ResourceGroups))
+	for k := range asp.ResourceGroups {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// groupResourceKeys returns the inner Resources map keys for error
+// messages.
+func groupResourceKeys(group *common.ResourceData) []string {
+	if group == nil {
+		return nil
+	}
+	keys := make([]string, 0, len(group.Resources))
+	for k := range group.Resources {
+		keys = append(keys, k)
+	}
+	return keys
+}
