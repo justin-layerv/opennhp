@@ -395,6 +395,21 @@ class TestStoreCertificate(unittest.TestCase):
 class TestRenewalScan(unittest.TestCase):
     """Tests for renewal_scan() certificate expiry scanning."""
 
+    def setUp(self):
+        # renewal_scan now calls check_orphan_for_meta() per-domain (Option B
+        # from nhp#1990), which does a GetItem on qurl-domains. Default to a
+        # valid managed row so existing tests in this class — which are not
+        # exercising the orphan path — don't accidentally trip the orphan
+        # branch and skip the renewal logic they actually care about.
+        self._get_item_patcher = patch.object(cm.dynamodb_client, 'get_item')
+        self.mock_get_item = self._get_item_patcher.start()
+        self.mock_get_item.return_value = {
+            'Item': {'verification_token': {'S': 'lv_verify_test_token'}}
+        }
+
+    def tearDown(self):
+        self._get_item_patcher.stop()
+
     @patch('custom_domain_cert_manager.trigger_cert_sync')
     @patch('custom_domain_cert_manager.provision_certificate')
     @patch.object(cm.cloudwatch_client, 'put_metric_data')
@@ -504,6 +519,235 @@ class TestRenewalScan(unittest.TestCase):
         assert result['scanned'] == 0
         assert result['renewed'] == 0
         mock_cw.assert_not_called()
+
+
+class TestCheckOrphanForMeta(unittest.TestCase):
+    """Tests for check_orphan_for_meta() — Option B reconciliation helper."""
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_returns_none_when_table_not_configured(self, mock_get):
+        original = cm.QURL_DOMAINS_TABLE
+        cm.QURL_DOMAINS_TABLE = None
+        try:
+            assert cm.check_orphan_for_meta('any.com') is None
+            mock_get.assert_not_called()
+        finally:
+            cm.QURL_DOMAINS_TABLE = original
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_returns_none_for_valid_managed_row(self, mock_get):
+        mock_get.return_value = {'Item': {'verification_token': {'S': 'lv_verify_abc'}}}
+        assert cm.check_orphan_for_meta('managed.com') is None
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_orphan_when_row_missing(self, mock_get):
+        # GetItem returns no Item key — row does not exist.
+        mock_get.return_value = {}
+        reason = cm.check_orphan_for_meta('orphan.com')
+        assert reason is not None
+        assert 'verification_token' in reason
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_orphan_when_projected_attribute_absent(self, mock_get):
+        # Row exists but verification_token attribute is missing — the
+        # post-incident partial-row shape from update_domain_status writes.
+        mock_get.return_value = {'Item': {}}
+        reason = cm.check_orphan_for_meta('partial.com')
+        assert reason is not None
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_orphan_when_attribute_value_is_python_none_synthetic_guardrail(self, mock_get):
+        # Synthetic shape: boto3 low-level client never returns a Python None
+        # for an attribute value (it omits the key or returns a typed dict).
+        # This locks in the defensive guard against that impossible shape so
+        # an upstream boto3 change can't silently bypass orphan detection.
+        mock_get.return_value = {'Item': {'verification_token': None}}
+        reason = cm.check_orphan_for_meta('null.com')
+        assert reason == 'verification_token attribute missing'
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_orphan_when_attribute_is_not_typed_dict_synthetic_guardrail(self, mock_get):
+        # Synthetic shape: boto3 low-level client always wraps attribute values
+        # in a typed dict ({'S': ...}, {'N': ...}, etc.). This covers the
+        # `else ''` branch on the `isinstance(token_attr, dict)` guard so an
+        # upstream boto3 change that returned a bare string would surface as
+        # "verification_token empty" rather than a TypeError.
+        mock_get.return_value = {'Item': {'verification_token': 'plain-string'}}
+        reason = cm.check_orphan_for_meta('bare-string.com')
+        assert reason == 'verification_token empty'
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_orphan_when_token_empty(self, mock_get):
+        mock_get.return_value = {'Item': {'verification_token': {'S': ''}}}
+        reason = cm.check_orphan_for_meta('empty.com')
+        assert reason == 'verification_token empty'
+
+    @patch.object(cm.dynamodb_client, 'get_item')
+    def test_returns_none_on_client_error_to_avoid_spurious_alerts(self, mock_get):
+        # Transient DDB errors must NOT classify a domain as orphan —
+        # that would page operators every 15 min during a DDB blip.
+        mock_get.side_effect = ClientError(
+            {'Error': {'Code': 'ProvisionedThroughputExceededException', 'Message': 'throttled'}},
+            'GetItem',
+        )
+        assert cm.check_orphan_for_meta('throttled.com') is None
+
+
+class TestRenewalScanOrphanDetection(unittest.TestCase):
+    """Tests for renewal_scan() Option B orphan detection branch."""
+
+    @patch.object(cm, 'send_alert')
+    @patch.object(cm, 'publish_failure_metric')
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    @patch.object(cm.dynamodb_client, 'get_item')
+    @patch('custom_domain_cert_manager.list_cert_meta_params')
+    def test_orphan_short_circuits_renewal(
+        self, mock_list, mock_get, mock_cw, mock_provision, mock_sync,
+        mock_failure_metric, mock_alert,
+    ):
+        """Orphan detection runs BEFORE expiry check and prevents renewal."""
+        del mock_cw  # only suppressed, not asserted
+        expiring = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+        mock_list.return_value = [
+            {'Name': '/nhp/certs/orphan.com/meta', 'Value': json.dumps({
+                'expires_at': expiring, 'acme_subdomain': 'orphan--com',
+            })},
+        ]
+        # Row missing — orphan.
+        mock_get.return_value = {}
+
+        result = cm.renewal_scan()
+
+        assert result['orphaned'] == 1
+        assert result['renewed'] == 0
+        assert result['scanned'] == 1
+        # The expensive paths must NOT run for orphans.
+        mock_provision.assert_not_called()
+        mock_sync.assert_not_called()
+        mock_failure_metric.assert_called_once_with(cm.FAILURE_ORPHANED_CERT)
+        # Operator-facing alert references the manual cleanup path.
+        assert mock_alert.called
+        alert_msg = mock_alert.call_args[0][0]
+        assert 'orphan.com' in alert_msg
+        assert 'manual cleanup' in alert_msg.lower()
+
+        detail = result['details'][0]
+        assert detail['action'] == 'orphaned'
+        assert detail['domain'] == 'orphan.com'
+
+        # Aggregated summary alert: a single send_alert call regardless of count.
+        assert mock_alert.call_count == 1
+
+    @patch.object(cm, 'send_alert')
+    @patch.object(cm, 'publish_failure_metric')
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    @patch.object(cm.dynamodb_client, 'get_item')
+    @patch('custom_domain_cert_manager.list_cert_meta_params')
+    def test_managed_domain_proceeds_to_renewal(
+        self, mock_list, mock_get, mock_cw, mock_provision, mock_sync,
+        mock_failure_metric, mock_alert,
+    ):
+        """A valid managed row should NOT trip orphan detection."""
+        del mock_cw, mock_sync
+        expiring = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+        mock_list.return_value = [
+            {'Name': '/nhp/certs/managed.com/meta', 'Value': json.dumps({
+                'expires_at': expiring, 'acme_subdomain': 'managed--com',
+            })},
+        ]
+        mock_get.return_value = {'Item': {'verification_token': {'S': 'lv_verify_managed'}}}
+        mock_provision.return_value = {'status': cm.RESULT_PROVISIONED}
+
+        result = cm.renewal_scan()
+
+        assert result['orphaned'] == 0
+        assert result['renewed'] == 1
+        mock_provision.assert_called_once()
+        mock_failure_metric.assert_not_called()
+        mock_alert.assert_not_called()
+
+    @patch.object(cm, 'send_alert')
+    @patch.object(cm, 'publish_failure_metric')
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    @patch.object(cm.dynamodb_client, 'get_item')
+    @patch('custom_domain_cert_manager.list_cert_meta_params')
+    def test_mixed_orphan_and_managed_domains(
+        self, mock_list, mock_get, mock_cw, mock_provision, mock_sync,
+        mock_failure_metric, mock_alert,
+    ):
+        """Orphans and managed certs in the same scan are counted separately."""
+        del mock_cw, mock_sync, mock_alert
+        expiring = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+        not_expiring = (datetime.now(timezone.utc) + timedelta(days=180)).isoformat()
+        mock_list.return_value = [
+            {'Name': '/nhp/certs/orphan.com/meta', 'Value': json.dumps({
+                'expires_at': expiring, 'acme_subdomain': 'orphan--com',
+            })},
+            {'Name': '/nhp/certs/expiring.com/meta', 'Value': json.dumps({
+                'expires_at': expiring, 'acme_subdomain': 'expiring--com',
+            })},
+            {'Name': '/nhp/certs/healthy.com/meta', 'Value': json.dumps({
+                'expires_at': not_expiring, 'acme_subdomain': 'healthy--com',
+            })},
+        ]
+
+        def get_item_side_effect(**kwargs):
+            key_domain = kwargs['Key']['domain']['S']
+            if key_domain == 'orphan.com':
+                return {}  # orphan
+            return {'Item': {'verification_token': {'S': f'lv_verify_{key_domain}'}}}
+
+        mock_get.side_effect = get_item_side_effect
+        mock_provision.return_value = {'status': cm.RESULT_PROVISIONED}
+
+        result = cm.renewal_scan()
+
+        assert result['scanned'] == 3
+        assert result['orphaned'] == 1
+        assert result['renewed'] == 1   # expiring.com
+        assert result['skipped'] == 1   # healthy.com (not in renewal window)
+        mock_provision.assert_called_once()
+        # Exactly one orphan metric publish, for orphan.com.
+        mock_failure_metric.assert_called_once_with(cm.FAILURE_ORPHANED_CERT)
+
+    @patch.object(cm, 'send_alert')
+    @patch.object(cm, 'publish_failure_metric')
+    @patch('custom_domain_cert_manager.trigger_cert_sync')
+    @patch('custom_domain_cert_manager.provision_certificate')
+    @patch.object(cm.cloudwatch_client, 'put_metric_data')
+    @patch.object(cm.dynamodb_client, 'get_item')
+    @patch('custom_domain_cert_manager.list_cert_meta_params')
+    def test_multiple_orphans_emit_single_summary_alert(
+        self, mock_list, mock_get, mock_cw, mock_provision, mock_sync,
+        mock_failure_metric, mock_alert,
+    ):
+        """Many orphans in one scan → one summary SNS, N metric publishes."""
+        del mock_cw, mock_sync, mock_provision
+        expiring = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+        mock_list.return_value = [
+            {'Name': f'/nhp/certs/orphan{i}.com/meta', 'Value': json.dumps({
+                'expires_at': expiring, 'acme_subdomain': f'orphan{i}--com',
+            })}
+            for i in range(3)
+        ]
+        mock_get.return_value = {}  # all rows missing — all orphans
+
+        result = cm.renewal_scan()
+
+        assert result['orphaned'] == 3
+        # Metric still fires per-orphan so the alarm reflects the true count.
+        assert mock_failure_metric.call_count == 3
+        # SNS publish is aggregated to a single message.
+        assert mock_alert.call_count == 1
+        msg = mock_alert.call_args[0][0]
+        for i in range(3):
+            assert f'orphan{i}.com' in msg
 
 
 class TestTriggerCertSync(unittest.TestCase):
@@ -1164,6 +1408,18 @@ class TestProvisioningIdempotencyLock(unittest.TestCase):
 
 class TestRenewalScanSkipped(unittest.TestCase):
     """Tests for renewal_scan() handling of RESULT_SKIPPED."""
+
+    def setUp(self):
+        # See TestRenewalScan.setUp for why the orphan-check GetItem needs a
+        # default valid-row mock.
+        self._get_item_patcher = patch.object(cm.dynamodb_client, 'get_item')
+        self.mock_get_item = self._get_item_patcher.start()
+        self.mock_get_item.return_value = {
+            'Item': {'verification_token': {'S': 'lv_verify_test_token'}}
+        }
+
+    def tearDown(self):
+        self._get_item_patcher.stop()
 
     @patch('custom_domain_cert_manager.publish_metric')
     @patch('custom_domain_cert_manager.trigger_cert_sync')

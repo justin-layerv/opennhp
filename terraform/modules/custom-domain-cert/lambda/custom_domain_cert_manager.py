@@ -176,6 +176,8 @@ CW_METRIC_PROVISIONING_FAILURES = 'ProvisioningFailures'
 #   DomainValidationError    Invalid domain format rejected at handler level
 #   RenewalScanError         Per-domain failure during renewal scan
 #   ProvisioningTimeoutError Domain stuck in provisioning_tls past timeout
+#   OrphanedCert             SSM cert exists with no managed qurl-domains row
+#                            (reconciliation safety net, nhp#1990 / qurl-service#148)
 #
 FAILURE_ACME_ACCOUNT = 'AcmeAccountError'
 FAILURE_DNS_OWNERSHIP = 'DnsOwnershipError'
@@ -187,6 +189,7 @@ FAILURE_CERT_SYNC = 'CertSyncError'
 FAILURE_DOMAIN_VALIDATION = 'DomainValidationError'
 FAILURE_RENEWAL_SCAN = 'RenewalScanError'
 FAILURE_PROVISIONING_TIMEOUT = 'ProvisioningTimeoutError'
+FAILURE_ORPHANED_CERT = 'OrphanedCert'
 FAILURE_SNS_DECODE = 'SnsDecodeError'
 
 # DNS ownership re-verification tunables. Centralized so the resolver
@@ -550,6 +553,60 @@ def _txt_rdata_to_string(rdata: Any) -> str:
     return str(rdata).strip('"')
 
 
+def check_orphan_for_meta(domain: str) -> Optional[str]:
+    """Detect SSM ↔ qurl-domains drift before doing any renewal work for a domain.
+
+    Reconciliation safety net (Option B from qurl-service#148 / nhp#1990): if a
+    domain has SSM cert material but no managed qurl-domains row, the cleanup
+    contract has failed somewhere upstream and we should NOT try to renew the
+    cert — there is no current owner to re-verify against, and a renewal would
+    just regenerate noise from the existing failure paths.
+
+    A "managed" row is one with a non-empty verification_token attribute. A row
+    that exists but lacks the attribute (e.g. the partial row written by
+    update_domain_status after a failed scan) is treated as orphaned — same
+    failure mode for our purposes.
+
+    Args:
+        domain: The custom domain to check.
+
+    Returns:
+        A short reason string if the SSM cert is orphaned, or None if a valid
+        managed row exists. Transient DDB errors (ClientError) return None to
+        avoid spurious orphan alerts during a DDB blip — the next scan
+        (15 min later) will re-evaluate.
+    """
+    if not QURL_DOMAINS_TABLE:
+        return None
+    try:
+        response = dynamodb_client.get_item(
+            TableName=QURL_DOMAINS_TABLE,
+            Key={'domain': {'S': domain}},
+            ProjectionExpression='verification_token',
+            ConsistentRead=True,
+        )
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        logger.warning(
+            f"Orphan-check GetItem failed for {domain}: code={error_code}; "
+            f"deferring orphan determination to next scan"
+        )
+        return None
+    item = response.get('Item')
+    if not item:
+        # Collapses two cases: row entirely missing, or row exists without the
+        # projected verification_token attribute (the post-incident partial-row
+        # shape from update_domain_status writes). Both are equivalent here.
+        return "no qurl-domains row with verification_token"
+    token_attr = item.get('verification_token')
+    if token_attr is None:
+        return "verification_token attribute missing"
+    token = token_attr.get('S', '') if isinstance(token_attr, dict) else ''
+    if not token:
+        return "verification_token empty"
+    return None
+
+
 def verify_dns_ownership(domain: str) -> None:
     """Re-verify DNS ownership before certificate issuance (TOCTOU mitigation).
 
@@ -853,6 +910,7 @@ def renewal_scan() -> Dict[str, Any]:
         'renewed': 0,
         'failed': 0,
         'skipped': 0,
+        'orphaned': 0,
         'details': []
     }
 
@@ -860,6 +918,7 @@ def renewal_scan() -> Dict[str, Any]:
     meta_params = list_cert_meta_params()
     results['scanned'] = len(meta_params)
     expiry_metrics = []  # Batch metrics for a single put_metric_data call
+    orphans = []  # (domain, reason) — aggregated into a single SNS alert after the loop
 
     # Pre-compute prefix depth for domain extraction (constant across all params)
     prefix_depth = len(SSM_CERT_PREFIX.strip('/').split('/')) + 1
@@ -876,6 +935,28 @@ def renewal_scan() -> Dict[str, Any]:
             continue
 
         try:
+            # Reconciliation pre-check (Option B from nhp#1990): bail out
+            # before any renewal work if this SSM cert has no managed
+            # qurl-domains row. Cleaner than letting DnsOwnershipError fire
+            # 200 times every two days, and surfaces orphans the moment they
+            # appear rather than waiting for the 30-day renewal window.
+            orphan_reason = check_orphan_for_meta(domain)
+            if orphan_reason:
+                logger.error(f"Orphan cert detected for {domain}: {orphan_reason}")
+                # Per-orphan failure metric still fires so the alarm reflects
+                # the true orphan count. SNS publish is deferred to a single
+                # summary message after the loop to avoid paging spam when a
+                # botched bulk cleanup leaves many orphans simultaneously.
+                publish_failure_metric(FAILURE_ORPHANED_CERT)
+                orphans.append((domain, orphan_reason))
+                results['orphaned'] += 1
+                results['details'].append({
+                    'domain': domain,
+                    'action': 'orphaned',
+                    'reason': orphan_reason,
+                })
+                continue
+
             meta_data = json.loads(param['Value'])
 
             expires_at_str = meta_data.get(FIELD_EXPIRES_AT)
@@ -960,10 +1041,22 @@ def renewal_scan() -> Dict[str, Any]:
 
     logger.info(f"Renewal scan complete: {results['scanned']} scanned, "
                 f"{results['renewed']} renewed, {results['failed']} failed, "
-                f"{results['skipped']} skipped")
+                f"{results['skipped']} skipped, {results['orphaned']} orphaned")
 
     if results['failed'] > 0:
         send_alert(f"Renewal scan completed with {results['failed']} failure(s)")
+
+    if orphans:
+        # Single summary alert regardless of orphan count — see comment in the
+        # orphan-detection branch above for the spam-mitigation rationale.
+        lines = [f"- {d}: {r}" for d, r in orphans]
+        send_alert(
+            f"Renewal scan detected {len(orphans)} orphan cert(s) "
+            f"(SSM cert material with no managed qurl-domains row). "
+            f"Manual cleanup required: delete /nhp/certs/<domain>/{{key,chain,meta}} "
+            f"from SSM for each (see nhp#1990).\n"
+            + "\n".join(lines)
+        )
 
     return results
 

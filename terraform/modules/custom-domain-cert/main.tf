@@ -629,6 +629,10 @@ locals {
       slug        = "provisioning-timeout"
       description = "Domain stuck in provisioning_tls status past timeout threshold"
     }
+    "OrphanedCert" = {
+      slug        = "orphaned-cert"
+      description = "SSM cert exists with no managed qurl-domains row (cleanup contract gap; see nhp#1990)"
+    }
   }
 }
 
