@@ -64,10 +64,34 @@ enable_termination_cleanup = true
 enable_secret_reconciliation = true
 # auth_url, auth_signing_key, and auth_aes_key are passed via GitHub Secrets (TF_VAR_*)
 
-# Slack notifications via AWS Chatbot
+# Slack notifications via AWS Chatbot.
+#
+# slack_workspace_id and slack_channel_id are documentation-only while
+# chatbot_owned_externally = true — local.enable_slack short-circuits and
+# nothing here actually wires them to a Chatbot config. They mirror the
+# (workspace, channel) pair alerts-infra owns; keep in sync with the
+# alerts-infra-side `sandbox-alerts-sandbox` module if either side rotates.
 enable_slack_notifications = true
 slack_workspace_id         = "T09UP622L90" # LayerV workspace
 slack_channel_id           = "C0A9S0VCAU9" # #alerts-sandbox
+
+# The (T09UP622L90, C0A9S0VCAU9) Chatbot config is owned by alerts-infra's
+# `sandbox-alerts-sandbox` module (the org-wide AWS Chatbot home, per
+# alerts-infra CLAUDE.md), which subscribes our `module.monitoring.sns_topic_arn`
+# alongside `bootstrap-alb-sandbox-alerts`. NHP terraform skips creating its
+# own Chatbot config here so the account-wide (workspace, channel) uniqueness
+# constraint stays satisfied.
+#
+# OPERATOR NOTE: the sandbox apply after this lands will plan a destroy on
+# `module.monitoring.aws_chatbot_slack_channel_configuration.alerts[0]` and
+# the dedicated IAM role/policy. Sequence: this NHP PR merges + applies first
+# (destroying the in-module config), then alerts-infra PR #22 merges +
+# applies (creating the replacement). Between the two applies, sandbox
+# alarms queue in the SNS topic but don't reach Slack — short, expected,
+# acceptable; no Slack delivery during the gap. Operator should post a
+# heads-up in `#alerts-sandbox` before kicking off the first apply so
+# whoever's on-call knows the channel is briefly silent.
+chatbot_owned_externally = true
 
 # GuardDuty security alerts (email + Slack via same SNS topic)
 guardduty_alert_emails = [

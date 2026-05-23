@@ -87,9 +87,13 @@ variable "chatbot_owned_externally" {
         it) and adds an explicit `chatbot.amazonaws.com` allow to the topic
         policy so the cross-region subscribe is authorized by policy text.
 
-    Production sets this to true after the cross-repo handoff (see website
-    repo `CLAUDE.md` *Cross-repo handoff*). Non-prod envs leave it false so
-    they keep their own self-contained Chatbot config.
+    Both prod and sandbox set this to true after their respective cross-repo
+    handoffs: prod to website CDK's `LayerV-Monitoring` (see website repo
+    `CLAUDE.md` *Cross-repo handoff*); sandbox to alerts-infra's
+    `sandbox-alerts-sandbox` Chatbot config in
+    `accounts/layerv-sandbox/1-main/main.tf`. Default false so a brand-new env
+    without an alerts-infra subscriber still gets self-contained Slack
+    delivery on first apply.
   EOT
   type        = bool
   default     = false

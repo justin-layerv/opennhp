@@ -58,13 +58,25 @@ resource "aws_sns_topic" "alerts" {
 #      principals (e.g., reading the topic via console) fall through
 #      this statement when their identity-based policies don't carry
 #      the right grants.
-#   3. `AllowCrossAccountSubscribe`: alerts-infra (the org-wide AWS
-#      Chatbot home) subscribes to this stack's alerts topic from a
-#      separate AWS account. Conditional on
-#      `var.cross_account_subscriber_arns` being non-empty —
-#      `aws_iam_policy_document` accepts a `dynamic "statement"`
-#      block, but the simpler `count`-gated shape is more readable
-#      and produces the same JSON.
+#   3. `AllowChatbotSubscribe`: AWS Chatbot's internal Slack-delivery
+#      Lambda subscribe is evaluated with the `chatbot.amazonaws.com`
+#      service principal (not the IAM principal that called
+#      `CreateSlackChannelConfiguration`), so `AllowAccountAccess`
+#      doesn't cover it. Required for alerts-infra's same-account
+#      Chatbot config to subscribe this topic.
+#   4. `AllowCrossAccountSubscribe`: emitted when alerts-infra
+#      subscribes to this topic from a different AWS account.
+#      Conditional on `var.cross_account_subscriber_arns` being
+#      non-empty; `aws_iam_policy_document` accepts a `dynamic
+#      "statement"` block, but the simpler `count`-gated shape is
+#      more readable and produces the same JSON. Today's sandbox
+#      topology has alerts-infra in the same account as this topic,
+#      so the var stays empty and this block stays unemitted — the
+#      cross-account path is wired for future split-account
+#      topologies (e.g., prod bootstrap-alb subscribed by a
+#      centralized alerts-infra account).
+#   5. `DenyInsecureTransport`: deny non-TLS API access (baseline-
+#      compliance scanners flag unencrypted topic-policy gaps).
 #
 # Pattern mirrors `terraform/modules/monitoring/main.tf` precedent.
 # The topic policy is ALWAYS attached (not gated on the cross-account
@@ -107,6 +119,40 @@ data "aws_iam_policy_document" "alerts" {
 
     actions   = local.sns_topic_actions
     resources = [aws_sns_topic.alerts.arn]
+  }
+
+  # Same-account AWS Chatbot subscribe. AWS Chatbot creates its Slack-delivery
+  # Lambda subscription internally on behalf of the caller; that internal
+  # `sns:Subscribe` is evaluated with `chatbot.amazonaws.com` as the service
+  # principal, NOT the IAM principal that called `CreateSlackChannelConfiguration`.
+  # The `AllowAccountAccess` statement above covers account-root IAM principals
+  # but not service principals, so alerts-infra's apply fails on Subscribe with
+  # `AuthorizationError` unless this allow is present.
+  #
+  # Unconditional (mirrors `terraform/modules/monitoring/main.tf::AllowChatbotSubscribe`).
+  # Harmless when no Chatbot config subscribes the topic; required the moment
+  # alerts-infra's `sandbox-alerts-sandbox` module references this topic.
+  statement {
+    sid    = "AllowChatbotSubscribe"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["chatbot.amazonaws.com"]
+    }
+
+    actions = [
+      "sns:Subscribe",
+      "sns:GetTopicAttributes",
+      "sns:ListSubscriptionsByTopic"
+    ]
+    resources = [aws_sns_topic.alerts.arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
   }
 
   # Cross-account subscribe — conditional, emitted only when
