@@ -299,6 +299,7 @@ A change is a good upstream candidate if it:
 | #75 | DNS re-resolution on server discovery | - | CANDIDATE | General improvement, benefits all users |
 | #93 | DNS cache invalidation on failures | - | CANDIDATE | Pairs with #75 |
 | #86 | Crypto error handling improvements | - | CANDIDATE | Already adapted from upstream #1338 |
+| #2010 | Noise intermediate chain key fix | [OpenNHP#1557](https://github.com/OpenNHP/opennhp/pull/1557) | OPEN | Cherry-picked the existing `enable_webrtc` commit `03619015` onto `upstream/main`. Once merged + released, `qurl-reverse-tunnel-client` can return to a public OpenNHP submodule pin instead of repointing at `layervai/nhp` (avoids the binary-distribution fingerprint surfaced in [qurl-reverse-tunnel-client#178](https://github.com/layervai/qurl-reverse-tunnel-client/pull/178)). |
 
 ### Fork-Only (Never Contribute)
 
@@ -352,7 +353,7 @@ Record all contribution attempts here:
 
 | Date | Description | Upstream PR | Result |
 |------|-------------|-------------|--------|
-| (none yet) | | | |
+| 2026-05-22 | Backport noise intermediate chain key fix to `upstream/main` (cherry-pick of `03619015` from `enable_webrtc`) | [OpenNHP#1557](https://github.com/OpenNHP/opennhp/pull/1557) | OPEN — pending upstream review |
 
 ---
 
