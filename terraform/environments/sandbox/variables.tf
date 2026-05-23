@@ -598,6 +598,27 @@ variable "enable_qurl_reverse_tunnel_server_canary" {
   default     = false
 }
 
+variable "qurl_reverse_tunnel_server_tunnel_auth_mode" {
+  description = <<-EOT
+    Env-root pass-through for the root module's `qurl_reverse_tunnel_server_tunnel_auth_mode`
+    variable. Required because the sandbox env wrapper is a self-contained TF root
+    that re-declares every variable it forwards to `module "nhp"`. Without this
+    declaration, the matching tfvars line is silently ignored (terraform applies
+    the root module with the parent variable's "" default → FRPS stays in legacy
+    api mode regardless of what sandbox tfvars says). See
+    `terraform/variables.tf::qurl_reverse_tunnel_server_tunnel_auth_mode` for the
+    full env-shape contract and `terraform/modules/qurl-reverse-tunnel-server/variables.tf::qurl_tunnel_auth_mode`
+    for the per-mode user_data branches.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.qurl_reverse_tunnel_server_tunnel_auth_mode == "" || var.qurl_reverse_tunnel_server_tunnel_auth_mode == "tunnel-auth"
+    error_message = "qurl_reverse_tunnel_server_tunnel_auth_mode must be \"\" (legacy api mode) or \"tunnel-auth\"."
+  }
+}
+
 # ==================== FRPS passthroughs (parent variables, env-root mirror) ====================
 # Closes the gap noted by #1745: tfvars values for `deploy_frps`,
 # `connect_layerv_host`, `frps_az_suffixes`, and the legacy

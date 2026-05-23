@@ -170,6 +170,14 @@ module "nhp" {
   qurl_reverse_tunnel_server_green_standby_capacity_per_az = var.qurl_reverse_tunnel_server_green_standby_capacity_per_az
   enable_qurl_reverse_tunnel_server_canary                 = var.enable_qurl_reverse_tunnel_server_canary
 
+  # Per-user API-key auth mode (qurl-reverse-tunnel-server #83 + qurl-reverse-tunnel-client #114).
+  # Sandbox flips to "tunnel-auth" via terraform.tfvars; prod stays on the
+  # parent's "" default until burn-in completes. This pass-through is the
+  # piece that was missing in #2131 — the var was declared at the root and
+  # set in sandbox tfvars, but the env wrapper didn't forward it, so TF
+  # silently kept FRPS on legacy api mode regardless of tfvars.
+  qurl_reverse_tunnel_server_tunnel_auth_mode = var.qurl_reverse_tunnel_server_tunnel_auth_mode
+
   # QURL Idempotency Cache
   qurl_idempotency_cache_ttl_seconds        = var.qurl_idempotency_cache_ttl_seconds
   qurl_idempotency_cache_max_size           = var.qurl_idempotency_cache_max_size
