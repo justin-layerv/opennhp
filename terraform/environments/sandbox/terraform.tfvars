@@ -424,6 +424,11 @@ frps_min_size         = 3
 frps_max_size         = 3
 frps_desired_capacity = 3
 
+# Opt sandbox into per-user API-key auth on qurl-reverse-tunnel-server.
+# See `terraform/variables.tf::qurl_reverse_tunnel_server_tunnel_auth_mode`
+# for the mode semantics, cross-repo prereqs, and per-mode env shape.
+qurl_reverse_tunnel_server_tunnel_auth_mode = "tunnel-auth"
+
 # ==============================================================================
 # QURL Plugin Configuration (NHP Server)
 # Enables qurl.link.layerv.xyz → qurl.site.layerv.xyz authentication flow in NHP Server
