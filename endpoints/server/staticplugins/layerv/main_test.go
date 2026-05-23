@@ -42,29 +42,29 @@ func newHelper(asp *common.AuthServiceProviderData, capture *callbackCapture, re
 	}
 }
 
-// newAspWithFRPS builds the fixture that mirrors the
-// `local.frps_resource_toml_overlay` shape: a top-level "layerv"
+// newAspWithTunnelServer builds the fixture that mirrors the
+// `local.tunnel_server_resource_toml_overlay` shape: a top-level "layerv"
 // AuthServiceProvider whose ResourceGroups holds one resource keyed
 // the same as the resource group. Pinned to the shape asserted by
-// TestFRPSResourceTOMLOverlay_SchemaMatchesAuthSvcProviderMap in
+// TestTunnelServerResourceTOMLOverlay_SchemaMatchesAuthSvcProviderMap in
 // endpoints/server/config_test.go.
-func newAspWithFRPS() *common.AuthServiceProviderData {
+func newAspWithTunnelServer() *common.AuthServiceProviderData {
 	return &common.AuthServiceProviderData{
 		AuthSvcId: "layerv",
 		ResourceGroups: common.ResourceGroupMap{
-			"frps-sandbox": &common.ResourceData{
+			"qurl-tunnel-server": &common.ResourceData{
 				ResourceGroup: common.ResourceGroup{
 					AuthServiceId: "layerv",
-					ResourceId:    "frps-sandbox",
+					ResourceId:    "qurl-tunnel-server",
 					OpenTime:      120,
 					Resources: map[string]*common.ResourceInfo{
-						"frps-sandbox": {
+						"qurl-tunnel-server": {
 							ACId:     "layerv-ac-tf",
 							Hostname: "connect.layerv.xyz",
 							// Ip is empty intentionally so DestHost() falls back to
-							// Hostname (see nhpmsg.go DestHost / Hosts). The FRPS
-							// overlay carries Hostname, not Ip, for the agent-
-							// bootstrap flow.
+							// Hostname (see nhpmsg.go DestHost / Hosts). The
+							// tunnel-server overlay carries Hostname, not Ip,
+							// for the agent-bootstrap flow.
 							Addr: &common.NetAddress{
 								Ip:       "",
 								Port:     7000,
@@ -103,8 +103,8 @@ func newKnockReq(resourceId string) *common.NhpAuthRequest {
 // per-resource AC ops; a pre-callback write would be silently overwritten.
 func TestAuthWithNHP_DispatchesAgentBootstrapKnock(t *testing.T) {
 	capture := &callbackCapture{}
-	helper := newHelper(newAspWithFRPS(), capture, nil)
-	req := newKnockReq("frps-sandbox")
+	helper := newHelper(newAspWithTunnelServer(), capture, nil)
+	req := newKnockReq("qurl-tunnel-server")
 
 	ack, err := AuthWithNHP(req, helper)
 	if err != nil {
@@ -113,11 +113,11 @@ func TestAuthWithNHP_DispatchesAgentBootstrapKnock(t *testing.T) {
 	if capture.calls != 1 {
 		t.Fatalf("AuthWithNhpCallbackFunc calls=%d want=1 — agent-bootstrap path must call through to handleNhpOpenResource", capture.calls)
 	}
-	if capture.res == nil || capture.res.ResourceId != "frps-sandbox" {
-		t.Fatalf("callback got res=%+v, want non-nil with ResourceId=\"frps-sandbox\"", capture.res)
+	if capture.res == nil || capture.res.ResourceId != "qurl-tunnel-server" {
+		t.Fatalf("callback got res=%+v, want non-nil with ResourceId=\"qurl-tunnel-server\"", capture.res)
 	}
-	if hosts := capture.res.Hosts(); hosts["frps-sandbox"] == "" {
-		t.Errorf("captured res.Hosts()=%v want non-empty frps-sandbox entry — the resource the callback dispatches against must carry a host", hosts)
+	if hosts := capture.res.Hosts(); hosts["qurl-tunnel-server"] == "" {
+		t.Errorf("captured res.Hosts()=%v want non-empty qurl-tunnel-server entry — the resource the callback dispatches against must carry a host", hosts)
 	}
 	// Pin the no-pre-write contract: `handleNhpOpenResource` re-inits
 	// ackMsg.ResourceHost via `make(map[string]string)` and populates
@@ -142,8 +142,8 @@ func TestAuthWithNHP_DispatchesAgentBootstrapKnock(t *testing.T) {
 func TestAuthWithNHP_CallbackErrorPropagates(t *testing.T) {
 	capture := &callbackCapture{}
 	wantErr := errors.New("ac dispatch failed: connection refused")
-	helper := newHelper(newAspWithFRPS(), capture, wantErr)
-	req := newKnockReq("frps-sandbox")
+	helper := newHelper(newAspWithTunnelServer(), capture, wantErr)
+	req := newKnockReq("qurl-tunnel-server")
 
 	ack, err := AuthWithNHP(req, helper)
 	if !errors.Is(err, wantErr) {
@@ -166,8 +166,8 @@ func TestAuthWithNHP_CallbackErrorPropagates(t *testing.T) {
 // resource the host server doesn't have wired up yet).
 func TestAuthWithNHP_ResourceNotFoundReturnsErrResourceNotFound(t *testing.T) {
 	capture := &callbackCapture{}
-	helper := newHelper(newAspWithFRPS(), capture, nil)
-	req := newKnockReq("frps-not-in-overlay")
+	helper := newHelper(newAspWithTunnelServer(), capture, nil)
+	req := newKnockReq("unknown-resource")
 
 	ack, err := AuthWithNHP(req, helper)
 	if !errors.Is(err, common.ErrResourceNotFound) {
@@ -189,7 +189,7 @@ func TestAuthWithNHP_ResourceNotFoundReturnsErrResourceNotFound(t *testing.T) {
 func TestAuthWithNHP_NilResourceGroupsReturnsErrResourceNotFound(t *testing.T) {
 	capture := &callbackCapture{}
 	helper := newHelper(&common.AuthServiceProviderData{AuthSvcId: "layerv"}, capture, nil)
-	req := newKnockReq("frps-sandbox")
+	req := newKnockReq("qurl-tunnel-server")
 
 	ack, err := AuthWithNHP(req, helper)
 	if !errors.Is(err, common.ErrResourceNotFound) {
@@ -209,7 +209,7 @@ func TestAuthWithNHP_NilResourceGroupsReturnsErrResourceNotFound(t *testing.T) {
 func TestAuthWithNHP_NilAspDataReturnsErrAuthServiceProviderNotFound(t *testing.T) {
 	capture := &callbackCapture{}
 	helper := newHelper(nil, capture, nil)
-	req := newKnockReq("frps-sandbox")
+	req := newKnockReq("qurl-tunnel-server")
 
 	ack, err := AuthWithNHP(req, helper)
 	if !errors.Is(err, common.ErrAuthServiceProviderNotFound) {
@@ -224,12 +224,12 @@ func TestAuthWithNHP_NilAspDataReturnsErrAuthServiceProviderNotFound(t *testing.
 }
 
 // Empty ResourceId: realistic stale-agent-config shape (agent doesn't
-// know the FRPS resource id yet). Map lookup on "" returns the zero
+// know the tunnel-server resource id yet). Map lookup on "" returns the zero
 // value, which the res-nil branch catches as ErrResourceNotFound.
 // Distinct from "resource the overlay doesn't have" — pin both shapes.
 func TestAuthWithNHP_EmptyResourceIdReturnsErrResourceNotFound(t *testing.T) {
 	capture := &callbackCapture{}
-	helper := newHelper(newAspWithFRPS(), capture, nil)
+	helper := newHelper(newAspWithTunnelServer(), capture, nil)
 	req := newKnockReq("")
 
 	ack, err := AuthWithNHP(req, helper)
@@ -250,10 +250,10 @@ func TestAuthWithNHP_EmptyResourceIdReturnsErrResourceNotFound(t *testing.T) {
 // instead of NPE'ing on the invocation.
 func TestAuthWithNHP_NilCallbackReturnsErrInvalidInput(t *testing.T) {
 	helper := &plugins.NhpServerPluginHelper{
-		AspData: newAspWithFRPS(),
+		AspData: newAspWithTunnelServer(),
 		// AuthWithNhpCallbackFunc intentionally nil.
 	}
-	req := newKnockReq("frps-sandbox")
+	req := newKnockReq("qurl-tunnel-server")
 
 	ack, err := AuthWithNHP(req, helper)
 	if !errors.Is(err, common.ErrInvalidInput) {
@@ -277,16 +277,16 @@ func TestInitRegistersPluginHandler(t *testing.T) {
 }
 
 // Defense-in-depth: a terraform regression that drops `skipAuth = true`
-// from the FRPS overlay must NOT silently grant the knock — layerv carries
+// from the tunnel-server overlay must NOT silently grant the knock — layerv carries
 // no backend-auth path, so a SkipAuth=false resource is a config bug we
 // have to refuse. Matches passcode/oidc.
 func TestAuthWithNHP_SkipAuthFalseReturnsErrBackendAuthRequired(t *testing.T) {
-	asp := newAspWithFRPS()
-	asp.ResourceGroups["frps-sandbox"].SkipAuth = false
+	asp := newAspWithTunnelServer()
+	asp.ResourceGroups["qurl-tunnel-server"].SkipAuth = false
 
 	capture := &callbackCapture{}
 	helper := newHelper(asp, capture, nil)
-	req := newKnockReq("frps-sandbox")
+	req := newKnockReq("qurl-tunnel-server")
 
 	ack, err := AuthWithNHP(req, helper)
 	if !errors.Is(err, common.ErrBackendAuthRequired) {
@@ -301,7 +301,7 @@ func TestAuthWithNHP_SkipAuthFalseReturnsErrBackendAuthRequired(t *testing.T) {
 }
 
 func TestAuthWithNHP_NilHelperFailsLoud(t *testing.T) {
-	req := newKnockReq("frps-sandbox")
+	req := newKnockReq("qurl-tunnel-server")
 	ack, err := AuthWithNHP(req, nil)
 	if !errors.Is(err, common.ErrInvalidInput) {
 		t.Fatalf("AuthWithNHP(req, nil) err=%v want=ErrInvalidInput (51101) — nil helper must surface a typed sentinel, not opaque errors.New", err)
@@ -316,7 +316,7 @@ func TestAuthWithNHP_NilHelperFailsLoud(t *testing.T) {
 
 func TestPluginID_IsLayerv(t *testing.T) {
 	// PluginID is "layerv" — the registered plugin id and the
-	// AuthServiceId the FRPS overlay keys on. A rename of this
+	// AuthServiceId the tunnel-server overlay keys on. A rename of this
 	// constant is an in-package edit; the Go ↔ terraform lockstep
 	// against `var.ac_auth_service_id` (terraform/variables.tf) is
 	// NOT enforced here — that requires a CI grep guard analogous

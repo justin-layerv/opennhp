@@ -304,10 +304,10 @@ func TestUpdateResources_MixedNilAndValid(t *testing.T) {
 	}
 }
 
-// TestFRPSResourceTOMLOverlay_SchemaMatchesAuthSvcProviderMap fences
+// TestTunnelServerResourceTOMLOverlay_SchemaMatchesAuthSvcProviderMap fences
 // the rendered TOML shape that `terraform/resources.tf`'s
-// `local.frps_resource_toml_overlay` produces against the Go struct
-// `loadResources` unmarshals into.
+// `local.tunnel_server_resource_toml_overlay` produces against the Go
+// struct `loadResources` unmarshals into.
 //
 // Why this test exists: `pelletier/go-toml/v2` maps TOML keys to Go
 // field NAMES (it doesn't honor `json:` tags). The overlay must spell
@@ -321,21 +321,21 @@ func TestUpdateResources_MixedNilAndValid(t *testing.T) {
 //
 // If the TF rendering ever changes shape, update both halves of the
 // schema in lockstep: this test, the heredoc body in
-// `terraform/resources.tf::local.frps_resource_toml_overlay`, and the
-// schema comment above that local. See SLACK_QURL_ROLLOUT.md §6.
-func TestFRPSResourceTOMLOverlay_SchemaMatchesAuthSvcProviderMap(t *testing.T) {
+// `terraform/resources.tf::local.tunnel_server_resource_toml_overlay`,
+// and the schema comment above that local. See SLACK_QURL_ROLLOUT.md §6.
+func TestTunnelServerResourceTOMLOverlay_SchemaMatchesAuthSvcProviderMap(t *testing.T) {
 	// Mirrors the production tfvar values
 	// (`terraform/environments/{sandbox,prod}/terraform.tfvars`):
 	//   ac_auth_service_id  = "layerv"
 	//   qurl_default_ac_id  = "layerv-ac-tf"
 	//   connect_layerv_host = "connect.layerv.{ai,xyz}"
-	// ResourceIDs mirror `local.frps_resource_ids` — the actual deploy
-	// renders BOTH a region-keyed alias (`frps-{aws_region}`) and an
-	// env-canonical alias (`frps-{environment}`) per the `merge()` in
-	// that local. The fixture below renders both so the asserted
-	// `len(ResourceGroups) == 2` reflects the production shape; the
-	// per-group assertions only spot-check `frps-prod` because both
-	// rows render identically.
+	// ResourceID mirrors `local.tunnel_server_res_id` —
+	// `qurl-tunnel-server`, the spec-aligned name for the protected
+	// reverse-tunnel control channel. Single fixed value across all
+	// environments (the prior pre-spec deploy rendered a region-keyed
+	// alias + env-canonical alias under `frps-*`; that was a spec
+	// violation per CSA "Stealth Mode SDP" Appendix 2 — resId names
+	// the protected resource, not its placement).
 	//
 	// The leading sentinel comment matches `local.frps_overlay_sentinel`
 	// in `terraform/resources.tf` (used by `user_data.sh.tpl`'s
@@ -356,7 +356,7 @@ func TestFRPSResourceTOMLOverlay_SchemaMatchesAuthSvcProviderMap(t *testing.T) {
 	// independent of where Hostname points and survives the redesign.
 	//
 	// OpenTime in the fixture is HARDCODED to 120 — the literal TF-side
-	// value in `local.frps_open_time = 120` (terraform/resources.tf).
+	// value in `local.tunnel_server_open_time = 120` (terraform/resources.tf).
 	// The round-trip assert below compares the unmarshaled value against
 	// the Go constant `DefaultIpOpenTime`.
 	//
@@ -368,13 +368,13 @@ func TestFRPSResourceTOMLOverlay_SchemaMatchesAuthSvcProviderMap(t *testing.T) {
 	//   - Fixture-vs-Go drift (a future edit changes 120 in the
 	//     fixture without moving the constant) IS fenced for the
 	//     same reason.
-	//   - TF-side drift (`local.frps_open_time` moves) is NOT fenced
-	//     by this test. Without shelling out to `terraform console`
-	//     from Go, the fixture can't sample the live TF render. A
-	//     future PR that moves the TF local without moving the Go
-	//     constant + fixture would silently produce a TF-Go mismatch
-	//     at boot. The single-source-of-truth comment on the TF
-	//     local (terraform/resources.tf::frps_open_time) flags this
+	//   - TF-side drift (`local.tunnel_server_open_time` moves) is NOT
+	//     fenced by this test. Without shelling out to `terraform console`
+	//     from Go, the fixture can't sample the live TF render. A future
+	//     PR that moves the TF local without moving the Go constant +
+	//     fixture would silently produce a TF-Go mismatch at boot. The
+	//     single-source-of-truth comment on the TF local
+	//     (terraform/resources.tf::tunnel_server_open_time) flags this
 	//     as a coordinated-update requirement; a live render-vs-Go
 	//     drift fence is tracked in #2008.
 	//
@@ -387,24 +387,11 @@ func TestFRPSResourceTOMLOverlay_SchemaMatchesAuthSvcProviderMap(t *testing.T) {
 # INVARIANT: inner ` + "`Resources.\"<resName>\"`" + ` key MUST equal outer
 # ` + "`ResourceGroups.\"<resId>\"`" + ` key — see resources.tf for rationale.
 
-["layerv".ResourceGroups."frps-prod"]
+["layerv".ResourceGroups."qurl-tunnel-server"]
 OpenTime = 120
 SkipAuth = true
 
-["layerv".ResourceGroups."frps-prod".Resources."frps-prod"]
-ACId = "layerv-ac-tf"
-Hostname = "connect.layerv.ai"
-# Addr.Ip intentionally empty — AC substitutes DefaultIp at ipset-write time.
-# Hostname above is what the agent dials (DestHost() prefers Hostname over Ip).
-Addr.Ip = ""
-Addr.Port = 7000
-Addr.Protocol = "tcp"
-
-["layerv".ResourceGroups."frps-us-east-1"]
-OpenTime = 120
-SkipAuth = true
-
-["layerv".ResourceGroups."frps-us-east-1".Resources."frps-us-east-1"]
+["layerv".ResourceGroups."qurl-tunnel-server".Resources."qurl-tunnel-server"]
 ACId = "layerv-ac-tf"
 Hostname = "connect.layerv.ai"
 # Addr.Ip intentionally empty — AC substitutes DefaultIp at ipset-write time.
@@ -426,26 +413,25 @@ Addr.Protocol = "tcp"
 		t.Fatal("aspMap[\"layerv\"] is nil — top-level table not unmarshaled")
 	}
 
-	if got, want := len(asp.ResourceGroups), 2; got != want {
-		t.Fatalf("ResourceGroups len=%d want=%d (frps-prod + frps-us-east-1) — schema regression?", got, want)
+	if got, want := len(asp.ResourceGroups), 1; got != want {
+		t.Fatalf("ResourceGroups len=%d want=%d (single spec-aligned qurl-tunnel-server resId) — schema regression?", got, want)
 	}
 
-	// Both resource groups have the same shape; spot-check one.
-	rg := asp.ResourceGroups["frps-prod"]
+	rg := asp.ResourceGroups["qurl-tunnel-server"]
 	if rg == nil {
-		t.Fatal("ResourceGroups[\"frps-prod\"] is nil — nesting regression?")
+		t.Fatal("ResourceGroups[\"qurl-tunnel-server\"] is nil — nesting regression?")
 	}
-	// Fences drift between `local.frps_open_time = 120` in
+	// Fences drift between `local.tunnel_server_open_time = 120` in
 	// terraform/resources.tf and `DefaultIpOpenTime = 120` in
 	// endpoints/server/constants.go. If either side is bumped without
 	// the other, this assertion fails and forces a coordinated update
 	// (the test fixture above still hardcodes 120 in the rendered TOML
 	// string; the failure surfaces here, and the fix is to bump the TF
 	// local AND the test fixture in lockstep with the constant). See
-	// the `frps_open_time` doc in terraform/resources.tf for the
-	// AC-constant-mirror rationale.
+	// the `tunnel_server_open_time` doc in terraform/resources.tf for
+	// the AC-constant-mirror rationale.
 	if got, want := rg.OpenTime, uint32(DefaultIpOpenTime); got != want {
-		t.Errorf("ResourceGroups[\"frps-prod\"].OpenTime = %d, want %d (DefaultIpOpenTime). The three-way chain is: TF `local.frps_open_time` (terraform/resources.tf) → rendered TOML literal in the fixture above → `DefaultIpOpenTime` constant (endpoints/server/constants.go). A drift on any leg fails this assertion; the fix is to update all three in lockstep.", got, want)
+		t.Errorf("ResourceGroups[\"qurl-tunnel-server\"].OpenTime = %d, want %d (DefaultIpOpenTime). The three-way chain is: TF `local.tunnel_server_open_time` (terraform/resources.tf) → rendered TOML literal in the fixture above → `DefaultIpOpenTime` constant (endpoints/server/constants.go). A drift on any leg fails this assertion; the fix is to update all three in lockstep.", got, want)
 	}
 	// SkipAuth = true is load-bearing: the layerv static plugin
 	// (`endpoints/server/staticplugins/layerv/main.go::AuthWithNHP`)
@@ -453,26 +439,26 @@ Addr.Protocol = "tcp"
 	// `ErrBackendAuthRequired` (52007) if it's false. The agent-
 	// bootstrap flow has no backend-auth path — X25519+DDB pubkey
 	// resolution upstream IS the access control — so the TF render
-	// MUST flag SkipAuth on every FRPS-overlay resource. A TF-side
+	// MUST flag SkipAuth on the qurl-tunnel-server resource. A TF-side
 	// regression that drops `SkipAuth = true` from
-	// `local.frps_resource_toml_overlay` would silently turn every
-	// production knock into a 52007. This assertion fails first.
+	// `local.tunnel_server_resource_toml_overlay` would silently turn
+	// every production knock into a 52007. This assertion fails first.
 	if !rg.SkipAuth {
-		t.Errorf("ResourceGroups[\"frps-prod\"].SkipAuth = false, want true. The layerv plugin fences on res.SkipAuth; a missing SkipAuth=true in the FRPS overlay rendering surfaces here, not at first prod knock. Restore the `SkipAuth = true` line in `local.frps_resource_toml_overlay` (terraform/resources.tf) alongside OpenTime.")
+		t.Errorf("ResourceGroups[\"qurl-tunnel-server\"].SkipAuth = false, want true. The layerv plugin fences on res.SkipAuth; a missing SkipAuth=true in the FRPS overlay rendering surfaces here, not at first prod knock. Restore the `SkipAuth = true` line in `local.tunnel_server_resource_toml_overlay` (terraform/resources.tf) alongside OpenTime.")
 	}
 	// Critical: the inner Resources map MUST be populated. `handleNhpOpenResource`
 	// iterates `res.Resources`; an empty Resources map silently yields zero
 	// AC operations and zero ackMsg.ResourceHost / ackMsg.ACTokens entries —
 	// the bug class this regression test exists to fence.
 	if got, want := len(rg.Resources), 1; got != want {
-		t.Fatalf("ResourceGroups[\"frps-prod\"].Resources len=%d want=%d", got, want)
+		t.Fatalf("ResourceGroups[\"qurl-tunnel-server\"].Resources len=%d want=%d", got, want)
 	}
 	// Inner resourceName matches outer resourceId so the agent's
 	// `ackMsg.ResourceHost[resource_id]` lookup resolves
 	// (`pkg/tunnel/knock.go::pickResourceHost`).
-	ri := rg.Resources["frps-prod"]
+	ri := rg.Resources["qurl-tunnel-server"]
 	if ri == nil {
-		t.Fatal("ResourceGroups[\"frps-prod\"].Resources[\"frps-prod\"] is nil — inner-key collapse regression?")
+		t.Fatal("ResourceGroups[\"qurl-tunnel-server\"].Resources[\"qurl-tunnel-server\"] is nil — inner-key collapse regression?")
 	}
 	if ri.ACId != "layerv-ac-tf" {
 		t.Errorf("ResourceInfo.ACId = %q, want %q", ri.ACId, "layerv-ac-tf")
@@ -518,13 +504,13 @@ Addr.Protocol = "tcp"
 // pin the transitional shape into the source tree as a protocol
 // invariant and steer future contributors away from the L3-only
 // target. The `Addr.Ip == ""` round-trip fence in
-// `TestFRPSResourceTOMLOverlay_SchemaMatchesAuthSvcProviderMap`
+// `TestTunnelServerResourceTOMLOverlay_SchemaMatchesAuthSvcProviderMap`
 // above stays, because the DefaultIp sentinel mechanism is sound
 // independent of where the AC sits in the data plane.
 //
 // When nhp #2019 lands, write the replacement test here.
 
-// TestFRPSResourceTOMLOverlay_ShallowSchemaProducesEmptyResourceGroups
+// TestTunnelServerResourceTOMLOverlay_ShallowSchemaProducesEmptyResourceGroups
 // is the negative-shape companion to the positive test above. It pins
 // the bug class itself: feeding `loadResources` the shallower
 // `["aspId".Resources."<resName>"]` shape used by plugin-side configs
@@ -537,7 +523,7 @@ Addr.Protocol = "tcp"
 // swap adds a JSON-tag fallback heuristic — both the positive test
 // above AND this one need a coordinated rewrite. Either direction
 // alone is a silent semantic change.
-func TestFRPSResourceTOMLOverlay_ShallowSchemaProducesEmptyResourceGroups(t *testing.T) {
+func TestTunnelServerResourceTOMLOverlay_ShallowSchemaProducesEmptyResourceGroups(t *testing.T) {
 	// The exact shape the previous round of this overlay rendered —
 	// fenced here so a future maintainer can see "this is what NOT to
 	// render" alongside the positive test.
@@ -545,7 +531,7 @@ func TestFRPSResourceTOMLOverlay_ShallowSchemaProducesEmptyResourceGroups(t *tes
 ["layerv"]
 OpenTime = 120
 
-["layerv".Resources."frps-prod"]
+["layerv".Resources."qurl-tunnel-server"]
 ACId = "layerv-ac-tf"
 Hostname = "connect.layerv.ai"
 # Addr.Ip intentionally empty — AC substitutes DefaultIp at ipset-write time.

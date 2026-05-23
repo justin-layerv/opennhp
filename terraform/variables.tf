@@ -372,7 +372,7 @@ variable "ac_auth_service_id" {
 
   # Hard fence on TOML quote-injection. `var.ac_auth_service_id` is
   # interpolated into the FRPS resource.toml overlay as a `"..."`
-  # literal (`local.frps_resource_toml_overlay` in
+  # literal (`local.tunnel_server_resource_toml_overlay` in
   # `terraform/resources.tf`); a value containing `"` or `\` would
   # produce malformed TOML and the server log-and-skips the file at
   # `config.go:350-351`. The previous round of this PR carried the
@@ -770,7 +770,7 @@ variable "qurl_default_ac_id" {
 
   # Hard fence on TOML quote-injection. Same threat model as
   # `var.ac_auth_service_id` above — interpolated into
-  # `local.frps_resource_toml_overlay`'s `ACId = "..."` literal.
+  # `local.tunnel_server_resource_toml_overlay`'s `ACId = "..."` literal.
   # Empty-string is permitted by the regex (variable default; the
   # `terraform_data.frps_preconditions` block in `terraform/main.tf`
   # rejects empty when `deploy_frps = true`), so envs without FRPS

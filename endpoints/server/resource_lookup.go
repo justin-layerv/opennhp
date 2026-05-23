@@ -316,7 +316,7 @@ func (l *ResourceLookup) LookupAuthServiceProvider(ctx context.Context, aspId st
 // SkipAuth=true is stamped on the resulting *AuthServiceProviderData
 // to match the contract the layerv plugin fences on (see
 // endpoints/server/staticplugins/layerv/main.go::AuthWithNHP and
-// the SkipAuth=true assertion in TestFRPSResourceTOMLOverlay_…
+// the SkipAuth=true assertion in TestTunnelServerResourceTOMLOverlay_…
 // in endpoints/server/config_test.go). The DDB schema doesn't carry
 // a skip_auth column today because the agent-bootstrap flow has no
 // backend-auth path; if a future ASP needs backend auth, this
@@ -476,7 +476,7 @@ func (l *ResourceLookup) queryAndCache(ctx context.Context, aspId string) (*comm
 		//     dial target), revisit so dest_host populates Addr.Ip.
 		//   - Resources map keys MUST match the outer ResourceGroups
 		//     key (per the overlay's inner-equals-outer invariant
-		//     fenced by TestFRPSResourceTOMLOverlay_SchemaMatchesAuthSvcProviderMap).
+		//     fenced by TestTunnelServerResourceTOMLOverlay_SchemaMatchesAuthSvcProviderMap).
 		//   - SkipAuth=true matches the overlay's `SkipAuth = true`
 		//     (terraform/resources.tf). The layerv plugin fences on
 		//     this; a mismatch surfaces as ErrBackendAuthRequired

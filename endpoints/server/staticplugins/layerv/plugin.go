@@ -14,7 +14,7 @@
 // This plugin therefore performs no additional auth: it looks up the
 // requested resource against the resource.toml-loaded
 // `["layerv".ResourceGroups...]` overlay (rendered by Terraform from
-// `local.frps_resource_toml_overlay` and read via helper.AspData) and
+// `local.tunnel_server_resource_toml_overlay` and read via helper.AspData) and
 // dispatches the AC operations via helper.AuthWithNhpCallbackFunc.
 //
 // The pre-existing static plugins (passcode, oidc, qurl) carry their
@@ -89,7 +89,7 @@ func (p *Plugin) AuthWithHttp(ctx *gin.Context, req *common.HttpKnockRequest, he
 	return nil, plugins.ErrPluginNotRegistered
 }
 
-// PluginID is the identifier the agent-bootstrap flow's FRPS overlay
+// PluginID is the identifier the agent-bootstrap flow's tunnel-server overlay
 // in `terraform/resources.tf` keys on (`var.ac_auth_service_id`,
 // defaulted to `"layerv"` in environments/{sandbox,prod}/terraform.tfvars).
 // Keep in lockstep with that variable: a rename here without renaming

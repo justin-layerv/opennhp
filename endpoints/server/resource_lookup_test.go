@@ -172,9 +172,11 @@ func newTestResourceLookup(t *testing.T, q resourcesQuerier, applier aspDataAppl
 	return l
 }
 
-// putFRPSRow is a convenience around put() for the standard FRPS
-// row shape (the only aspId in active use today).
-func putFRPSRow(q *fakeResourcesQuerier, resourceID string) {
+// putTunnelServerRow is a convenience around put() for the standard
+// qurl-tunnel-server row shape — `aspId="layerv"` + `ACId="layerv-ac-tf"`
+// + the customer-facing AC ingress as Hostname/dest_host. Single
+// fixed shape today; the only aspId in active use.
+func putTunnelServerRow(q *fakeResourcesQuerier, resourceID string) {
 	q.put(nhpSystemCustomerID, resourceID, "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 120)
 }
 
@@ -183,7 +185,7 @@ func putFRPSRow(q *fakeResourcesQuerier, resourceID string) {
 // Query) and the applier is invoked exactly once.
 func TestResourceLookup_CacheMissThenHit(t *testing.T) {
 	q := newFakeResourcesQuerier()
-	putFRPSRow(q, "frps-sandbox")
+	putTunnelServerRow(q, "qurl-tunnel-server")
 	applier := &captureApplier{}
 
 	l := newTestResourceLookup(t, q, applier)
@@ -198,8 +200,8 @@ func TestResourceLookup_CacheMissThenHit(t *testing.T) {
 	if asp.AuthSvcId != "layerv" {
 		t.Errorf("AuthSvcId = %q, want %q", asp.AuthSvcId, "layerv")
 	}
-	if _, ok := asp.ResourceGroups["frps-sandbox"]; !ok {
-		t.Errorf("ResourceGroups missing frps-sandbox; got keys = %v", aspKeys(asp))
+	if _, ok := asp.ResourceGroups["qurl-tunnel-server"]; !ok {
+		t.Errorf("ResourceGroups missing qurl-tunnel-server; got keys = %v", aspKeys(asp))
 	}
 	if got := q.callCount(); got != 1 {
 		t.Errorf("DDB calls after first lookup = %d, want 1", got)
@@ -233,7 +235,7 @@ func TestResourceLookup_CacheMissThenHit(t *testing.T) {
 // clock so the test doesn't sleep.
 func TestResourceLookup_CacheExpiry(t *testing.T) {
 	q := newFakeResourcesQuerier()
-	putFRPSRow(q, "frps-sandbox")
+	putTunnelServerRow(q, "qurl-tunnel-server")
 	applier := &captureApplier{}
 	l := newTestResourceLookup(t, q, applier)
 
@@ -268,7 +270,7 @@ func TestResourceLookup_CacheExpiry(t *testing.T) {
 func TestResourceLookup_UnknownASP(t *testing.T) {
 	q := newFakeResourcesQuerier()
 	// Row exists under "layerv" but caller asks for "other-asp".
-	putFRPSRow(q, "frps-sandbox")
+	putTunnelServerRow(q, "qurl-tunnel-server")
 	applier := &captureApplier{}
 	l := newTestResourceLookup(t, q, applier)
 
@@ -334,7 +336,7 @@ func TestResourceLookup_DDBErrorRetryAfter(t *testing.T) {
 // This is the contract that lets the layerv plugin work unchanged.
 func TestResourceLookup_HappyPathMatchesOverlay(t *testing.T) {
 	q := newFakeResourcesQuerier()
-	putFRPSRow(q, "frps-sandbox")
+	putTunnelServerRow(q, "qurl-tunnel-server")
 	l := newTestResourceLookup(t, q, &captureApplier{})
 
 	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
@@ -342,15 +344,15 @@ func TestResourceLookup_HappyPathMatchesOverlay(t *testing.T) {
 		t.Fatalf("lookup err: %v", err)
 	}
 
-	group, ok := asp.ResourceGroups["frps-sandbox"]
+	group, ok := asp.ResourceGroups["qurl-tunnel-server"]
 	if !ok {
-		t.Fatalf("ResourceGroups missing frps-sandbox; got %v", aspKeys(asp))
+		t.Fatalf("ResourceGroups missing qurl-tunnel-server; got %v", aspKeys(asp))
 	}
 	if got := group.AuthServiceId; got != "layerv" {
 		t.Errorf("group.AuthServiceId = %q, want %q", got, "layerv")
 	}
-	if got := group.ResourceId; got != "frps-sandbox" {
-		t.Errorf("group.ResourceId = %q, want %q", got, "frps-sandbox")
+	if got := group.ResourceId; got != "qurl-tunnel-server" {
+		t.Errorf("group.ResourceId = %q, want %q", got, "qurl-tunnel-server")
 	}
 	if got := group.OpenTime; got != 120 {
 		t.Errorf("group.OpenTime = %d, want 120", got)
@@ -364,9 +366,9 @@ func TestResourceLookup_HappyPathMatchesOverlay(t *testing.T) {
 		t.Error("group.SkipAuth = false, want true (layerv plugin fences on this — see endpoints/server/staticplugins/layerv/main.go::AuthWithNHP)")
 	}
 
-	res, ok := group.Resources["frps-sandbox"]
+	res, ok := group.Resources["qurl-tunnel-server"]
 	if !ok {
-		t.Fatalf("inner Resources missing frps-sandbox; got %v", groupResourceKeys(group))
+		t.Fatalf("inner Resources missing qurl-tunnel-server; got %v", groupResourceKeys(group))
 	}
 	if got := res.ACId; got != "layerv-ac-tf" {
 		t.Errorf("res.ACId = %q, want %q", got, "layerv-ac-tf")
@@ -397,19 +399,19 @@ func TestResourceLookup_HappyPathMatchesOverlay(t *testing.T) {
 // populate the resolved aspData and an operator-visible WARN log fires.
 func TestResourceLookup_SkipsMalformedRow_ContinuesWithRest(t *testing.T) {
 	q := newFakeResourcesQuerier()
-	q.putMalformedRow(nhpSystemCustomerID, "frps-bad")
-	putFRPSRow(q, "frps-sandbox")
+	q.putMalformedRow(nhpSystemCustomerID, "bad-resource")
+	putTunnelServerRow(q, "qurl-tunnel-server")
 	l := newTestResourceLookup(t, q, &captureApplier{})
 
 	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
 	if err != nil {
 		t.Fatalf("lookup err: %v, want success despite malformed row", err)
 	}
-	if _, ok := asp.ResourceGroups["frps-sandbox"]; !ok {
-		t.Errorf("frps-sandbox missing; malformed row must not dark the rest of the catalog")
+	if _, ok := asp.ResourceGroups["qurl-tunnel-server"]; !ok {
+		t.Errorf("qurl-tunnel-server missing; malformed row must not dark the rest of the catalog")
 	}
-	if _, ok := asp.ResourceGroups["frps-bad"]; ok {
-		t.Errorf("frps-bad present; the malformed row must be skipped")
+	if _, ok := asp.ResourceGroups["bad-resource"]; ok {
+		t.Errorf("bad-resource present; the malformed row must be skipped")
 	}
 }
 
@@ -426,7 +428,7 @@ func TestResourceLookup_SkipsMalformedRow_ContinuesWithRest(t *testing.T) {
 func TestResourceLookup_FiltersByAuthServiceID(t *testing.T) {
 	q := newFakeResourcesQuerier()
 	// Two aspIds sharing the partition.
-	q.put(nhpSystemCustomerID, "frps-sandbox", "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 120)
+	q.put(nhpSystemCustomerID, "qurl-tunnel-server", "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 120)
 	q.put(nhpSystemCustomerID, "other-res", "other-asp", "other-ac", "other.example.com", "other.example.com", 8000, 60)
 	l := newTestResourceLookup(t, q, &captureApplier{})
 
@@ -434,8 +436,8 @@ func TestResourceLookup_FiltersByAuthServiceID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lookup err: %v", err)
 	}
-	if _, ok := asp.ResourceGroups["frps-sandbox"]; !ok {
-		t.Errorf("layerv must include frps-sandbox; got %v", aspKeys(asp))
+	if _, ok := asp.ResourceGroups["qurl-tunnel-server"]; !ok {
+		t.Errorf("layerv must include qurl-tunnel-server; got %v", aspKeys(asp))
 	}
 	if _, ok := asp.ResourceGroups["other-res"]; ok {
 		t.Errorf("layerv aspData leaked other-asp's resource; rows must be filtered by auth_service_id")
@@ -453,7 +455,7 @@ func TestResourceLookup_FiltersByAuthServiceID(t *testing.T) {
 	if _, ok := asp2.ResourceGroups["other-res"]; !ok {
 		t.Errorf("other-asp must include other-res; got %v", aspKeys(asp2))
 	}
-	if _, ok := asp2.ResourceGroups["frps-sandbox"]; ok {
+	if _, ok := asp2.ResourceGroups["qurl-tunnel-server"]; ok {
 		t.Errorf("other-asp aspData leaked layerv's resource; rows must be filtered by auth_service_id")
 	}
 	if asp2.AuthSvcId != "other-asp" {
@@ -477,16 +479,16 @@ func TestResourceLookup_OpenTimeClampsNonPositive(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			q := newFakeResourcesQuerier()
-			q.put(nhpSystemCustomerID, "frps-sandbox", "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, tc.stored)
+			q.put(nhpSystemCustomerID, "qurl-tunnel-server", "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, tc.stored)
 			l := newTestResourceLookup(t, q, &captureApplier{})
 
 			asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
 			if err != nil {
 				t.Fatalf("lookup err: %v", err)
 			}
-			group := asp.ResourceGroups["frps-sandbox"]
+			group := asp.ResourceGroups["qurl-tunnel-server"]
 			if group == nil {
-				t.Fatalf("ResourceGroups missing frps-sandbox; got %v", aspKeys(asp))
+				t.Fatalf("ResourceGroups missing qurl-tunnel-server; got %v", aspKeys(asp))
 			}
 			if group.OpenTime != tc.wantOpenTime {
 				t.Errorf("OpenTime = %d, want %d (clamp must default non-positive open_time to DefaultIpOpenTime, not propagate the raw value)", group.OpenTime, tc.wantOpenTime)
@@ -503,16 +505,16 @@ func TestResourceLookup_OpenTimeClampsNonPositive(t *testing.T) {
 func TestResourceLookup_OpenTimeClampsOverflow(t *testing.T) {
 	q := newFakeResourcesQuerier()
 	// 5 billion exceeds MaxUint32 (~4.29 billion) — must clamp.
-	q.put(nhpSystemCustomerID, "frps-sandbox", "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 5_000_000_000)
+	q.put(nhpSystemCustomerID, "qurl-tunnel-server", "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 5_000_000_000)
 	l := newTestResourceLookup(t, q, &captureApplier{})
 
 	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
 	if err != nil {
 		t.Fatalf("lookup err: %v", err)
 	}
-	group := asp.ResourceGroups["frps-sandbox"]
+	group := asp.ResourceGroups["qurl-tunnel-server"]
 	if group == nil {
-		t.Fatalf("ResourceGroups missing frps-sandbox; got %v", aspKeys(asp))
+		t.Fatalf("ResourceGroups missing qurl-tunnel-server; got %v", aspKeys(asp))
 	}
 	// Clamp is at MaxInt32 (not MaxUint32) for 32-bit platform safety
 	// — int(MaxUint32) on a 32-bit build is -1 (signed overflow) so the
@@ -539,19 +541,19 @@ func TestResourceLookup_SkipsCrossPartitionRow(t *testing.T) {
 	// honor KeyConditionExpression — both rows reach the resolver
 	// loop. The resolver's defense-in-depth check filters the
 	// cross-partition one client-side.
-	q.put("ZZZZZZZZZZZZZZZZZZZZZZZZZZ", "frps-leak", "layerv", "layerv-ac-tf", "leaked.example.com", "leaked.example.com", 7000, 120)
-	putFRPSRow(q, "frps-good")
+	q.put("ZZZZZZZZZZZZZZZZZZZZZZZZZZ", "leaked-resource", "layerv", "layerv-ac-tf", "leaked.example.com", "leaked.example.com", 7000, 120)
+	putTunnelServerRow(q, "good-resource")
 
 	l := newTestResourceLookup(t, q, &captureApplier{})
 	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
 	if err != nil {
 		t.Fatalf("lookup err: %v, want success despite cross-partition row", err)
 	}
-	if _, ok := asp.ResourceGroups["frps-good"]; !ok {
-		t.Errorf("frps-good missing; cross-partition row must not dark the rest of the catalog")
+	if _, ok := asp.ResourceGroups["good-resource"]; !ok {
+		t.Errorf("good-resource missing; cross-partition row must not dark the rest of the catalog")
 	}
-	if _, ok := asp.ResourceGroups["frps-leak"]; ok {
-		t.Errorf("frps-leak present; cross-partition row MUST be skipped to prevent cross-tenant data leak under a future KeyConditionExpression regression")
+	if _, ok := asp.ResourceGroups["leaked-resource"]; ok {
+		t.Errorf("leaked-resource present; cross-partition row MUST be skipped to prevent cross-tenant data leak under a future KeyConditionExpression regression")
 	}
 }
 
@@ -601,15 +603,15 @@ func TestResourceLookup_SkipsEmptyResourceID(t *testing.T) {
 	q := newFakeResourcesQuerier()
 	// A row with empty resource_id alongside a good row.
 	q.put(nhpSystemCustomerID, "", "layerv", "layerv-ac-tf", "host.example.com", "host.example.com", 7000, 120)
-	q.put(nhpSystemCustomerID, "frps-sandbox", "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 120)
+	q.put(nhpSystemCustomerID, "qurl-tunnel-server", "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 120)
 	l := newTestResourceLookup(t, q, &captureApplier{})
 
 	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
 	if err != nil {
 		t.Fatalf("lookup err: %v", err)
 	}
-	if _, ok := asp.ResourceGroups["frps-sandbox"]; !ok {
-		t.Errorf("frps-sandbox missing; empty-resource_id row must not dark the rest of the catalog")
+	if _, ok := asp.ResourceGroups["qurl-tunnel-server"]; !ok {
+		t.Errorf("qurl-tunnel-server missing; empty-resource_id row must not dark the rest of the catalog")
 	}
 	if _, ok := asp.ResourceGroups[""]; ok {
 		t.Errorf("ResourceGroups[\"\"] populated; rows with empty resource_id must be skipped, not keyed on \"\"")
@@ -625,7 +627,7 @@ func TestResourceLookup_SkipsEmptyResourceID(t *testing.T) {
 // write lock) and re-installs on a mismatch.
 func TestResourceLookup_CacheHitRepublishes(t *testing.T) {
 	q := newFakeResourcesQuerier()
-	putFRPSRow(q, "frps-sandbox")
+	putTunnelServerRow(q, "qurl-tunnel-server")
 	applier := &captureApplier{}
 	l := newTestResourceLookup(t, q, applier)
 
@@ -711,7 +713,7 @@ func TestUdpServer_ResolveAuthSvcProvider(t *testing.T) {
 
 	t.Run("nil_ctx_falls_back_to_background", func(t *testing.T) {
 		q := newFakeResourcesQuerier()
-		putFRPSRow(q, "frps-sandbox")
+		putTunnelServerRow(q, "qurl-tunnel-server")
 		s := &UdpServer{
 			metrics:          metrics.NewPublisherForTest(t),
 			authServiceMap:   common.AuthSvcProviderMap{},
@@ -835,14 +837,14 @@ func TestUdpServer_ResolveAuthSvcProvider(t *testing.T) {
 func TestResourceLookup_PaginationWarningFires(t *testing.T) {
 	q := newFakeResourcesQuerier()
 	q.simulatePagination = true
-	putFRPSRow(q, "frps-sandbox")
+	putTunnelServerRow(q, "qurl-tunnel-server")
 
 	l := newTestResourceLookup(t, q, &captureApplier{})
 	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
 	if err != nil {
 		t.Fatalf("lookup err: %v, want success (page-1 rows must still resolve)", err)
 	}
-	if _, ok := asp.ResourceGroups["frps-sandbox"]; !ok {
+	if _, ok := asp.ResourceGroups["qurl-tunnel-server"]; !ok {
 		t.Errorf("page-1 row missing; pagination must not block the rows we DID receive")
 	}
 	// The Warning emit itself is best-effort observable (the package
@@ -1066,7 +1068,7 @@ func TestApplyAspMapDelta_FastPathPointerEqual(t *testing.T) {
 // next RLock read sees the live catalog.
 func TestResourceLookup_AppliesToHostServer(t *testing.T) {
 	q := newFakeResourcesQuerier()
-	putFRPSRow(q, "frps-sandbox")
+	putTunnelServerRow(q, "qurl-tunnel-server")
 	applier := &captureApplier{}
 	l := newTestResourceLookup(t, q, applier)
 
@@ -1092,7 +1094,7 @@ func TestResourceLookup_AppliesToHostServer(t *testing.T) {
 // is optional). Production always passes a non-nil applier.
 func TestResourceLookup_NilApplier(t *testing.T) {
 	q := newFakeResourcesQuerier()
-	putFRPSRow(q, "frps-sandbox")
+	putTunnelServerRow(q, "qurl-tunnel-server")
 	l := newTestResourceLookup(t, q, nil)
 
 	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
@@ -1112,7 +1114,7 @@ func TestResourceLookup_NilApplier(t *testing.T) {
 // Query an entire partition and return its first row.
 func TestResourceLookup_EmptyAspIdShortCircuits(t *testing.T) {
 	q := newFakeResourcesQuerier()
-	putFRPSRow(q, "frps-sandbox")
+	putTunnelServerRow(q, "qurl-tunnel-server")
 	l := newTestResourceLookup(t, q, &captureApplier{})
 
 	_, err := l.LookupAuthServiceProvider(context.Background(), "")
@@ -1166,7 +1168,7 @@ func TestResourceLookup_NilQuerier(t *testing.T) {
 // about singleflight.
 func TestResourceLookup_SingleflightDedupsConcurrentMiss(t *testing.T) {
 	q := newFakeResourcesQuerier()
-	putFRPSRow(q, "frps-sandbox")
+	putTunnelServerRow(q, "qurl-tunnel-server")
 
 	const N = 8
 	applier := &captureApplier{}

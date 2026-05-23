@@ -502,9 +502,13 @@ module "compute" {
   auth_service_id = var.ac_auth_service_id
 
   # FRPS bootstrap overlay appended to /opt/layerv/nhp-server/etc/resource.toml
-  # at boot. See `local.frps_resource_toml_overlay` doc in resources.tf for the
-  # divergence from the DDB seed rows and the #1976 retirement plan.
-  frps_resource_toml_overlay = local.frps_resource_toml_overlay
+  # at boot. See `local.tunnel_server_resource_toml_overlay` doc in resources.tf
+  # for the divergence from the DDB seed rows and the #1976 retirement plan.
+  # The module-variable name is held stable as `frps_resource_toml_overlay`
+  # so the user_data.sh.tpl templatefile interpolation and its bash-comment
+  # escape-fence regex don't need a coordinated rename — the variable name
+  # is plumbing, not on-disk surface.
+  frps_resource_toml_overlay = local.tunnel_server_resource_toml_overlay
   # Sentinel prefix and end-marker — threaded so the user_data heredoc's
   # grep and sed patterns reference the same literals as the rendered
   # overlay. Decouples the patterns from a future sentinel rename.
@@ -1154,16 +1158,17 @@ module "ac" {
 
   # FRPS-behind-AC (SLACK_QURL_ROLLOUT.md §6, 2026-05-18). The AC's
   # Traefik TCP entrypoint at `:${frps_bind_port}` forwards admitted
-  # SYNs (post-NHP-knock ipset gate) to this internal FRPS host. Source
-  # the host from the same `local.frps_resource_regions[*].dest_host`
-  # the DDB seed row + resource.toml overlay's `dest_host` field use,
-  # so all three converge on one truth (lex-smallest AZ for v1; the
-  # overlay carries this same single-AZ pin). Empty string when FRPS
-  # isn't deployed — disables the AC NLB:7000 listener, the new TG, and
-  # the Traefik TCP entrypoint via the `count = ... ? 1 : 0` and
-  # `%{ if frp_control_upstream_host != "" ~}` gates downstream.
+  # SYNs (post-NHP-knock ipset gate) to this internal tunnel-server
+  # host. Source the host from the same `local.tunnel_server_resource`
+  # struct that the DDB seed row + resource.toml overlay's `dest_host`
+  # field consume, so all three converge on one truth (lex-smallest AZ
+  # for v1; the overlay carries this same single-AZ pin). Empty string
+  # when FRPS isn't deployed — disables the AC NLB:7000 listener, the
+  # new TG, and the Traefik TCP entrypoint via the
+  # `count = ... ? 1 : 0` and `%{ if frp_control_upstream_host != "" ~}`
+  # gates downstream.
   #
-  # Predicate mirrors `local.frps_resource_regions[*].enabled` so the
+  # Predicate mirrors `local.tunnel_server_resource.enabled` so the
   # upstream-host, the DDB seed row, and the TOML overlay all converge
   # on the same enable condition. The `&& var.deploy_qurl_service`
   # conjunct is redundant in practice — `terraform_data.frps_preconditions`
@@ -1172,7 +1177,7 @@ module "ac" {
   # who haven't followed the precondition chain.
   frp_control_upstream_host = (
     var.deploy_frps && var.deploy_qurl_service
-    ? local.frps_resource_regions[var.aws_region].dest_host
+    ? local.tunnel_server_resource.dest_host
     : ""
   )
 

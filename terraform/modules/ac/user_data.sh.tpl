@@ -1470,11 +1470,11 @@ cat > /home/ubuntu/traefik/frps-control.toml << 'FRPSCTRLEOF'
 #   1. Customer-facing dial target (the value of `Hostname` in the
 #      nhp-server resource.toml overlay, e.g. `connect.layerv.{ai,xyz}`)
 #      — sourced from `var.connect_layerv_host` in the root tfvars and
-#      threaded into `local.frps_resource_toml_overlay`. Resolves
-#      publicly to this AC's NLB.
+#      threaded into `local.tunnel_server_resource_toml_overlay`.
+#      Resolves publicly to this AC's NLB.
 #   2. Internal upstream this Traefik TCP service forwards to (e.g.
 #      `frps-{az}.nhp.{env}.internal`) — sourced from
-#      `var.frp_control_upstream_host` (= `local.frps_resource_regions[*].dest_host`
+#      `var.frp_control_upstream_host` (= `local.tunnel_server_resource.dest_host`
 #      in the root). VPC-private, FRPS SG only accepts AC SG.
 #
 # The whole point of the 2026-05-18 redesign was splitting these:

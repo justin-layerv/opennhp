@@ -904,20 +904,51 @@ resource "terraform_data" "frps_overlay_comment_escape_fence" {
       # earlier on the same line doesn't block matching a later
       # unescaped `${frps_resource_toml_overlay}` ref.
       #
-      # RENAME WARNING: if `local.frps_resource_toml_overlay` is ever
-      # renamed, update this regex (and the error_message below) to
-      # match the new name — otherwise this fence silently no-ops.
+      # The templatefile variable name lives in
+      # `local.overlay_templatefile_var` so a future rename of the
+      # variable surface only has to update that single local — both
+      # the regex and the error_message recompose from it, and the
+      # paired drift-fence precondition immediately below catches a
+      # rename that misses the templatefile() call site.
       condition = length(regexall(
-        "(?m)(^|[[:space:]])#(?:[^\\n]*[^$\\n])?\\$\\{frps_resource_toml_overlay\\}",
+        "(?m)(^|[[:space:]])#(?:[^\\n]*[^$\\n])?\\$\\{${local.overlay_templatefile_var}\\}",
         file("${path.module}/user_data.sh.tpl"),
       )) == 0
       # HCL escape note: `$${...}` in source renders as `${...}` in the
       # plan-time message; `$$$${...}` renders as `$${...}`. So this string
       # shows operators an unescaped `${var}` (the bug) and the escaped
       # `$${var}` (the fix), both in plain Terraform-comment syntax.
-      error_message = "user_data.sh.tpl has an unescaped `$${frps_resource_toml_overlay}` Terraform interpolation inside a bash comment. Add a second `$` so the token becomes `$$$${frps_resource_toml_overlay}` and templatefile() emits the literal instead of interpolating the multi-line TOML body into the comment (overlay lines without `#` then bash-execute and kill user_data). Full WHY + past-incident detail: see the DELIMITER ESCAPE NOTE in user_data.sh.tpl."
+      error_message = "user_data.sh.tpl has an unescaped `$${${local.overlay_templatefile_var}}` Terraform interpolation inside a bash comment. Add a second `$` so the token becomes `$$$${${local.overlay_templatefile_var}}` and templatefile() emits the literal instead of interpolating the multi-line TOML body into the comment (overlay lines without `#` then bash-execute and kill user_data). Full WHY + past-incident detail: see the DELIMITER ESCAPE NOTE in user_data.sh.tpl."
+    }
+
+    # Drift fence: if a future rename updates `local.overlay_templatefile_var`
+    # without also updating the `XXX = var.frps_resource_toml_overlay`
+    # templatefile() call site upstream, the escape regex above starts
+    # matching a name that no longer exists in the rendered template and
+    # silently no-ops. This precondition keeps both halves in lockstep by
+    # asserting the rendered template actually carries a `${<var>}` token
+    # under the configured name. Cost: a single regexall over the .tpl
+    # at plan time.
+    precondition {
+      condition = length(regexall(
+        "\\$\\{${local.overlay_templatefile_var}\\}",
+        file("${path.module}/user_data.sh.tpl"),
+      )) > 0
+      error_message = "modules/compute/user_data.sh.tpl does not contain any `$${${local.overlay_templatefile_var}}` templatefile interpolation. Either the templatefile var was renamed without updating `local.overlay_templatefile_var`, or the .tpl no longer uses the overlay variable at all (in which case retire both this fence and the comment-escape fence above)."
     }
   }
+}
+
+locals {
+  # Single source of truth for the templatefile variable name that
+  # carries the rendered tunnel-server TOML overlay into user_data.
+  # Both the comment-escape regex above and the heredoc body
+  # `${frps_resource_toml_overlay}` in user_data.sh.tpl bind to this
+  # name. A rename touches THIS local, the templatefile() call site
+  # (`frps_resource_toml_overlay = var.frps_resource_toml_overlay`
+  # above), and the .tpl interpolation token in lockstep; the
+  # preconditions above fail if any one drifts.
+  overlay_templatefile_var = "frps_resource_toml_overlay"
 }
 
 # Server bootstrap script in S3 (mirrors AC module pattern). The rendered

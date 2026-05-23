@@ -880,7 +880,7 @@ echo "No plugins configured, skipping plugin section of resource.toml"
 #   - `server_plugins = []` (empty plugins path): the plugin block is
 #     skipped entirely. Without the sed-strip a re-exec on this path
 #     would append the overlay block a SECOND time to the existing
-#     file, producing duplicate `["layerv".ResourceGroups."frps-prod"]`
+#     file, producing duplicate `["layerv".ResourceGroups."qurl-tunnel-server"]`
 #     tables; `pelletier/go-toml/v2` errors on duplicate tables and the
 #     server log-and-skips the file (`config.go:350-351`), silently
 #     losing its entire resource map.

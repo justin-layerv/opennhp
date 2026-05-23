@@ -24,7 +24,19 @@ enable_replication = true           # Receive replicated images from sandbox ECR
 deploy_ac          = true
 acme_email         = "admin@layerv.ai"
 ac_auth_service_id = "layerv"
-ac_resource_ids    = ["qurl"] # Phase 2: QURL is the only service deployed initially
+# Two AC-protected resources, each a distinct identity per NHP spec
+# (CSA "Stealth Mode SDP" Appendix 2, NHP-KNK Message Fields):
+#   - "qurl"               — viewer-side qurl-link / SPA resolve flow
+#                            (gates the qurl.site landing endpoint)
+#   - "qurl-tunnel-server" — agent-side reverse-tunnel control channel
+#                            (gates the tunnel-server FRP control port
+#                            behind the AC's ipset). Mirrors the resId
+#                            emitted by `local.tunnel_server_res_id` in
+#                            resources.tf, which the agent knocks against.
+# DO NOT add `frps-*` aliases here — those were a pre-spec naming where
+# the resId conflated implementation (FRPS) and placement (env/region)
+# with resource identity. Hard-cutover rename in PR shipping this file.
+ac_resource_ids    = ["qurl", "qurl-tunnel-server"]
 ac_min_capacity    = 3
 ac_max_capacity    = 10
 enable_egress_eips = true

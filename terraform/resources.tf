@@ -1,53 +1,49 @@
-# Bootstrap NHP Resources for the FRPS reverse-tunnel cold-start path.
+# Bootstrap NHP Resources for the qURL reverse-tunnel cold-start path.
 # Seeded into the `nhp_resources` table; nhp-server reads them on knock
 # receipt (`storage.go::Resource`). See PR description for the
 # QURL→reverse-tunnel plan and the network-surface trace.
 locals {
-  # Singular today. A second region requires reviewing the env-canonical
-  # alias below — the precondition fences a silent multi-region collision.
-  frps_resource_regions = {
-    (var.aws_region) = {
-      enabled = var.deploy_frps && var.deploy_qurl_service
-      # Two distinct hostnames — do not conflate. The split is the
-      # core of the SLACK_QURL_ROLLOUT.md §6 redesign.
-      #
-      #   - `dest_host`: INTERNAL per-AZ Cloud Map name (private,
-      #     AC-SG-only). Feeds the DDB seed row + the AC Traefik TCP
-      #     entrypoint's upstream service (AC userspace → private FRPS).
-      #   - `customer_facing_host`: PUBLIC DNS name the agent dials.
-      #     Threaded into the TOML overlay's `Hostname` field; rendered
-      #     alongside the load-bearing `Addr.Ip = ""` sentinel that the
-      #     AC substitutes to LOCAL_IP at ipset-write time (see
-      #     `applyDefaultIpSubstitution` in endpoints/ac/msghandler.go).
-      #
-      # Multi-region note: `customer_facing_host` takes the same value
-      # (`var.connect_layerv_host`) across all regions today because
-      # the map has only one entry. A future multi-region deploy
-      # (before #1976's HRW dispatch lands) needs to split this into
-      # per-region public DNS names (e.g. `connect-{region}.layerv.ai`)
-      # so the agent dials the right regional NLB. Until then, the
-      # `frps_resource_regions length == 1` precondition on the DDB
-      # row below fences the collision.
-      dest_host            = "frps-${sort(var.frps_az_suffixes)[0]}.${module.data.namespace_name}"
-      customer_facing_host = var.connect_layerv_host
-    }
+  # Single NHP resId for the reverse-tunnel control channel — the
+  # protected resource the agent knocks for. Per the NHP spec (CSA
+  # "Stealth Mode SDP for Zero Trust Network Infrastructure" Appendix 2,
+  # NHP-KNK Message Fields): Resource ID identifies "the protected
+  # resource being accessed" — the identity of WHAT is protected, not
+  # where it's deployed (region, environment) or which underlying tunnel
+  # tech happens to fronts it (FRPS today, possibly different later).
+  # Routing concerns belong in the AC-returned Hostname/Port, not the
+  # resId. The same name is used in every environment.
+  tunnel_server_res_id = "qurl-tunnel-server"
+
+  tunnel_server_resource = {
+    enabled = var.deploy_frps && var.deploy_qurl_service
+    # Two distinct hostnames — do not conflate. The split is the
+    # core of the SLACK_QURL_ROLLOUT.md §6 redesign.
+    #
+    #   - `dest_host`: INTERNAL per-AZ Cloud Map name (private,
+    #     AC-SG-only). Feeds the DDB seed row + the AC Traefik TCP
+    #     entrypoint's upstream service (AC userspace → private tunnel
+    #     server). Still carries the `frps-` prefix because it names the
+    #     Cloud Map service, which lives in a separate naming axis from
+    #     the NHP resId and has its own consumer contract with
+    #     qurl-service URL construction. Renaming that is a separate
+    #     change.
+    #   - `customer_facing_host`: PUBLIC DNS name the agent dials.
+    #     Threaded into the TOML overlay's `Hostname` field; rendered
+    #     alongside the load-bearing `Addr.Ip = ""` sentinel that the
+    #     AC substitutes to LOCAL_IP at ipset-write time (see
+    #     `applyDefaultIpSubstitution` in endpoints/ac/msghandler.go).
+    dest_host            = "frps-${sort(var.frps_az_suffixes)[0]}.${module.data.namespace_name}"
+    customer_facing_host = var.connect_layerv_host
   }
 
-  # Emit both `frps-{region}` and `frps-{environment}` rows pointing at the
-  # same target. The env-canonical alias is what the agent's hard-coded
-  # `EnvKnockResourceID = "frps-prod"` default resolves on cold start
-  # (qurl-reverse-tunnel-client `cmd/frpc/knock.go:50`); without it an
-  # unconfigured agent gets ErrResourceNotFound and crash-loops after 5
-  # failures (no lex-smallest fallback in `pkg/tunnel/knock.go:174-183`).
-  frps_resource_ids = merge(
-    {
-      for region, cfg in local.frps_resource_regions :
-      "frps-${region}" => cfg if cfg.enabled
-    },
-    {
-      for region, cfg in local.frps_resource_regions :
-      "frps-${var.environment}" => cfg if cfg.enabled
-    },
+  # Single-entry map keyed on the spec-aligned resId. Retains the map
+  # shape so the downstream `for_each`/`for` loops over `seed-rows` and
+  # `overlay-entries` don't need restructuring — they iterate over what
+  # is now a 1-element map.
+  tunnel_server_resource_ids = (
+    local.tunnel_server_resource.enabled
+    ? { (local.tunnel_server_res_id) = local.tunnel_server_resource }
+    : {}
   )
 
   # LayerV system customer (nil ULID) per dynamodb module convention.
@@ -65,17 +61,17 @@ locals {
   nhp_system_seed_sentinel = "__nhp_frps_seed_row__"
 
   # OpenTime in seconds. Single source of truth shared by the DDB seed
-  # row (rendered via `tostring(local.frps_open_time)` below) and the
-  # TOML overlay's `OpenTime = ${local.frps_open_time}` interpolation.
-  # Mirrors the server's `DefaultIpOpenTime = 120` constant
-  # (`endpoints/server/constants.go:67`); shorter than the QURL default
-  # (300s) since the agent dials FRPS immediately on knock-receipt.
-  # Hard-coded here — drift from the Go constant would be silent. The
-  # Go regression test (`TestFRPSResourceTOMLOverlay_…`) asserts that
-  # the rendered `OpenTime` equals `server.DefaultIpOpenTime`, so a
-  # bump on either side surfaces as a CI failure that forces the other
-  # side to follow.
-  frps_open_time = 120
+  # row (rendered via `tostring(local.tunnel_server_open_time)` below)
+  # and the TOML overlay's `OpenTime = ${local.tunnel_server_open_time}`
+  # interpolation. Mirrors the server's `DefaultIpOpenTime = 120`
+  # constant (`endpoints/server/constants.go:67`); shorter than the QURL
+  # default (300s) since the agent dials the tunnel server immediately
+  # on knock-receipt. Hard-coded here — drift from the Go constant
+  # would be silent. The Go regression test
+  # (`TestFRPSResourceTOMLOverlay_…`) asserts that the rendered
+  # `OpenTime` equals `server.DefaultIpOpenTime`, so a bump on either
+  # side surfaces as a CI failure that forces the other side to follow.
+  tunnel_server_open_time = 120
 
   # Sentinel comment for the overlay block written into
   # `/opt/layerv/nhp-server/etc/resource.toml` by `user_data.sh.tpl`.
@@ -140,11 +136,11 @@ locals {
   # and `ackMsg.ACTokens[resourceName]` keyed by the inner key, and
   # tunnel-client #142's `pickResourceHost(resourceID, ackMsg.ResourceHost)`
   # does `resourceHost[resourceID]`. So the inner resourceName has to
-  # MATCH the outer resourceId — `frps-prod` maps to `frps-prod`. The
-  # collapse looks redundant but it's the only way the agent's lookup
-  # resolves to a non-empty value. The rendered TOML carries this
-  # invariant as an inline comment so a post-deploy editor doesn't
-  # silently break it.
+  # MATCH the outer resourceId — `qurl-tunnel-server` maps to
+  # `qurl-tunnel-server`. The collapse looks redundant but it's the
+  # only way the agent's lookup resolves to a non-empty value. The
+  # rendered TOML carries this invariant as an inline comment so a
+  # post-deploy editor doesn't silently break it.
   #
   # Diverges from the DDB rows on `aspId` / `ACId` because those fields
   # carry different concerns at each layer:
@@ -174,8 +170,9 @@ locals {
   # blocks (`var.ac_auth_service_id`, `var.qurl_default_ac_id`,
   # `var.connect_layerv_host` in `terraform/variables.tf`) plus the
   # `check` block below on `dest_host` (whose source values are
-  # already-fenced upstreams). `res_id` is composed from already-
-  # fenced `aws_region` / `environment`.
+  # already-fenced upstreams). `res_id` is a constant string literal
+  # (`local.tunnel_server_res_id`) — no interpolation at all, so quote-
+  # injection is structurally impossible there.
   # End-sentinel marker, paired with `frps_overlay_sentinel`. The
   # sed-strip in `user_data.sh.tpl`'s overlay step deletes the range
   # `[start_sentinel..end_sentinel]` on user_data re-exec, so the
@@ -202,8 +199,8 @@ locals {
   # by `terraform_data.frps_overlay_end_sentinel_frozen`.
   frps_overlay_end_sentinel = "# FRPS bootstrap overlay end"
 
-  frps_resource_toml_overlay = (
-    length(local.frps_resource_ids) == 0
+  tunnel_server_resource_toml_overlay = (
+    length(local.tunnel_server_resource_ids) == 0
     ? ""
     : join("\n", concat(
       [
@@ -216,10 +213,10 @@ locals {
         "# `ResourceGroups.\"<resId>\"` key — see resources.tf for rationale.",
       ],
       flatten([
-        for res_id in sort(keys(local.frps_resource_ids)) : [
+        for res_id in sort(keys(local.tunnel_server_resource_ids)) : [
           "",
           "[\"${var.ac_auth_service_id}\".ResourceGroups.\"${res_id}\"]",
-          "OpenTime = ${local.frps_open_time}",
+          "OpenTime = ${local.tunnel_server_open_time}",
           # SkipAuth = true is load-bearing: the layerv static plugin
           # (endpoints/server/staticplugins/layerv/main.go) fences on
           # `res.SkipAuth` and refuses with ErrBackendAuthRequired
@@ -237,9 +234,10 @@ locals {
           "[\"${var.ac_auth_service_id}\".ResourceGroups.\"${res_id}\".Resources.\"${res_id}\"]",
           "ACId = \"${var.qurl_default_ac_id}\"",
           # Hostname is the customer-facing dial target (the public AC
-          # ingress fronting FRPS). `Hostname` wins over `Addr.Ip` in
-          # `ResourceInfo.DestHost()` for the agent's dial target.
-          "Hostname = \"${local.frps_resource_ids[res_id].customer_facing_host}\"",
+          # ingress fronting the tunnel server). `Hostname` wins over
+          # `Addr.Ip` in `ResourceInfo.DestHost()` for the agent's dial
+          # target.
+          "Hostname = \"${local.tunnel_server_resource_ids[res_id].customer_facing_host}\"",
           # Addr.Ip = "" is the load-bearing sentinel:
           # `applyDefaultIpSubstitution` in
           # `endpoints/ac/msghandler.go` substitutes `a.config.DefaultIp`
@@ -264,7 +262,7 @@ locals {
 
 # Defense-in-depth fence on the `dest_host` interpolation written
 # into the DDB seed row. The customer-facing Hostname interpolation
-# (`local.frps_resource_ids[*].customer_facing_host` → overlay) and
+# (`local.tunnel_server_resource_ids[*].customer_facing_host` → overlay) and
 # the empty-string + quote-injection checks on the two AC IDs are
 # now hard-fenced upstream:
 #   - `var.ac_auth_service_id`, `var.qurl_default_ac_id`,
@@ -320,31 +318,15 @@ resource "terraform_data" "frps_overlay_end_sentinel_frozen" {
   }
 }
 
-check "frps_resource_ids_no_alias_collision" {
-  assert {
-    # The `merge()` in `local.frps_resource_ids` overlays a
-    # `frps-${region}` row with a `frps-${environment}` row. Map-merge
-    # silently picks the second value when keys collide. Today's input
-    # shapes don't collide (`var.aws_region` ∈ {us-west-2, us-east-1, …}
-    # vs. `var.environment` ∈ {sandbox, prod}), but a future env rename
-    # to `us-west-2` (or a region named like an env) would silently
-    # shadow the per-region row with the env-canonical one — both keys
-    # would resolve to a single map entry, the DDB `for_each` would
-    # halve its row count, and the agent's per-region lookup would
-    # miss. Companion to the `length(local.frps_resource_regions) == 1`
-    # precondition on `aws_dynamodb_table_item.frps_nhp_resource`:
-    # that one fences a multi-region collision through the env-
-    # canonical alias; this one fences the single-region collision
-    # through input equality.
-    condition = alltrue([
-      for region in keys(local.frps_resource_regions) :
-      region != var.environment
-    ])
-    error_message = "`var.aws_region` and `var.environment` resolve to the same string in `local.frps_resource_regions`, which would collapse the `frps-${var.aws_region}` and `frps-${var.environment}` rows in `local.frps_resource_ids` into a single map entry via `merge()`. Either rename the environment (preferred — env names should not encode AWS regions) or extend the merge with an explicit precedence rule so the silent shadow becomes a visible decision."
-  }
-}
+# NOTE: a prior `check "frps_resource_ids_no_alias_collision"` block
+# fenced the silent shadow risk between `frps-${region}` and
+# `frps-${environment}` rows in a pre-spec-rename `merge()`. With the
+# single fixed `qurl-tunnel-server` resId (one entry, no merge), the
+# collision shape is structurally impossible. Removed in the rename
+# rather than left as defensive dead code — the comment above on
+# `local.tunnel_server_resource_ids` documents the single-entry shape.
 
-check "frps_overlay_dest_host_shape" {
+check "tunnel_server_overlay_dest_host_shape" {
   assert {
     # `dest_host` is composed from `module.data.namespace_name`
     # (= `nhp.{var.environment}.internal`, `environment` ∈
@@ -358,10 +340,10 @@ check "frps_overlay_dest_host_shape" {
     # tightening to require an ICANN-registered TLD would break the
     # private Cloud Map name today.
     condition = alltrue([
-      for _, cfg in local.frps_resource_ids :
+      for _, cfg in local.tunnel_server_resource_ids :
       can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$", cfg.dest_host))
     ])
-    error_message = "Every `local.frps_resource_ids[*].dest_host` is the internal FRPS dial target written into the DDB seed row's `dest_host` field; each must be a per-label RFC 1035 DNS name. Today's values derive from `module.data.namespace_name` + `var.frps_az_suffixes[0]` which already conform; a future change to either input must preserve that."
+    error_message = "Every `local.tunnel_server_resource_ids[*].dest_host` is the internal tunnel-server dial target written into the DDB seed row's `dest_host` field; each must be a per-label RFC 1035 DNS name. Today's values derive from `module.data.namespace_name` + `var.frps_az_suffixes[0]` which already conform; a future change to either input must preserve that."
   }
 }
 
@@ -374,21 +356,21 @@ check "frps_overlay_dest_host_shape" {
 # file → fleet-wide resource-map loss) is hours of fleet diagnosis.
 # Apply refuses if the rendered overlay contains the delimiter literal.
 resource "terraform_data" "frps_overlay_heredoc_delimiter_fence" {
-  count = length(local.frps_resource_ids) == 0 ? 0 : 1
+  count = length(local.tunnel_server_resource_ids) == 0 ? 0 : 1
 
   # Re-evaluate when the rendered overlay changes.
-  input = sha256(local.frps_resource_toml_overlay)
+  input = sha256(local.tunnel_server_resource_toml_overlay)
 
   lifecycle {
     precondition {
-      condition     = !strcontains(local.frps_resource_toml_overlay, "OVERLAYEOF_FRPS_V2_DO_NOT_EDIT")
-      error_message = "local.frps_resource_toml_overlay contains the literal string `OVERLAYEOF_FRPS_V2_DO_NOT_EDIT`, which is the heredoc delimiter in user_data.sh.tpl. The rendered overlay would silently truncate at that line, the server would log-and-skip the malformed resource.toml, and the FRPS resource map would vanish fleet-wide. Rename the delimiter in user_data.sh.tpl AND this precondition, or trace the tfvar that injected the literal."
+      condition     = !strcontains(local.tunnel_server_resource_toml_overlay, "OVERLAYEOF_FRPS_V2_DO_NOT_EDIT")
+      error_message = "local.tunnel_server_resource_toml_overlay contains the literal string `OVERLAYEOF_FRPS_V2_DO_NOT_EDIT`, which is the heredoc delimiter in user_data.sh.tpl. The rendered overlay would silently truncate at that line, the server would log-and-skip the malformed resource.toml, and the tunnel-server resource map would vanish fleet-wide. Rename the delimiter in user_data.sh.tpl AND this precondition, or trace the tfvar that injected the literal."
     }
   }
 }
 
 resource "aws_dynamodb_table_item" "frps_nhp_resource" {
-  for_each = local.frps_resource_ids
+  for_each = local.tunnel_server_resource_ids
 
   table_name = module.dynamodb.resources_table_name
   hash_key   = "customer_id"
@@ -397,37 +379,24 @@ resource "aws_dynamodb_table_item" "frps_nhp_resource" {
   item = jsonencode({
     customer_id = { S = local.nhp_system_customer_id }
     resource_id = { S = each.key }
-    # For FRPS the consumer-facing FQDN and dial target collapse to the
-    # same Cloud Map name — the agent dials FRPS directly.
+    # The consumer-facing FQDN and dial target collapse to the
+    # same Cloud Map name — the agent dials the tunnel server directly.
     resource_fqdn = { S = each.value.dest_host }
     ac_id         = { S = local.nhp_system_seed_sentinel }
     dest_host     = { S = each.value.dest_host }
     dest_port     = { N = tostring(var.frps_bind_port) }
-    # OpenTime: shared with TOML overlay via `local.frps_open_time`. See
-    # the local's doc for the AC-constant rationale.
-    open_time       = { N = tostring(local.frps_open_time) }
+    # OpenTime: shared with TOML overlay via `local.tunnel_server_open_time`.
+    # See the local's doc for the AC-constant rationale.
+    open_time       = { N = tostring(local.tunnel_server_open_time) }
     auth_service_id = { S = local.nhp_system_seed_sentinel }
   })
 
   lifecycle {
     # Mirrors `aws_dynamodb_table_item.ac_license`: Console / qurl-service
     # update Resource fields out-of-band; TF must not fight them. Does NOT
-    # defend row destruction on `deploy_frps = false` or a `var.aws_region`
-    # rename (the for_each key flips). #1909 tracks `prevent_destroy = true`
-    # once qurl-service starts persisting non-trivial state here.
+    # defend row destruction on `deploy_frps = false`. #1909 tracks
+    # `prevent_destroy = true` once qurl-service starts persisting non-
+    # trivial state here.
     ignore_changes = [item]
-
-    # Fail loud if a second region lands. The inner-for in
-    # `frps_resource_ids` produces duplicate `frps-${var.environment}` keys
-    # — Terraform's last-wins picks whichever region sorts last by map-key,
-    # silently flipping the env-canonical alias the agent's hard-coded
-    # default resolves to. Counts DECLARED entries (not enabled), so a
-    # disabled second region trips this BEFORE the collision can land.
-    # Edge case: all-disabled regions produce zero instances and this
-    # precondition never evaluates (#1913 tracks a module-scope `check`).
-    precondition {
-      condition     = length(local.frps_resource_regions) == 1
-      error_message = "local.frps_resource_regions has ${length(local.frps_resource_regions)} entries but the `frps-${var.environment}` env-canonical alias in `local.frps_resource_ids` assumes exactly one region. Adding a second region without picking an explicit primary owner would silently flip `frps-${var.environment}` (e.g., `frps-prod`) to whichever region sorts last by map-key. Introduce an explicit primary-region variable that owns the env-canonical alias (or retire the alias entirely once the agent learns per-region lookup) before adding a second entry."
-    }
   }
 }
