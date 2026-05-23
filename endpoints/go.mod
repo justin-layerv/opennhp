@@ -22,7 +22,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/layervai/nhp/internalauth v0.2.0
-	github.com/mark3labs/mcp-go v0.49.0
+	github.com/mark3labs/mcp-go v0.54.0
 	github.com/pelletier/go-toml/v2 v2.3.0
 	github.com/pion/webrtc/v4 v4.2.11
 	github.com/sigstore/cosign/v2 v2.6.3
@@ -157,6 +157,7 @@ require (
 	github.com/quic-go/quic-go v0.59.0 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/sagikazarmark/locafero v0.12.0 // indirect
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2 // indirect
 	github.com/sassoftware/relic v7.2.1+incompatible // indirect
 	github.com/secure-systems-lab/go-securesystemslib v0.10.0 // indirect
 	github.com/shibumi/go-pathspec v1.3.0 // indirect
