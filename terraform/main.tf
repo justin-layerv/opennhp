@@ -1086,6 +1086,28 @@ module "ac" {
     enable_instance_hrw            = var.enable_instance_hrw
     instance_discovery_ttl_seconds = var.instance_discovery_ttl_seconds
     enable_qurl_site_authz         = var.enable_qurl_site_authz
+    # Per-AZ qurl-reverse-tunnel-server boundary allowlist. Computed from
+    # the SAME root vars the qurl-reverse-tunnel-server module consumes
+    # (`var.frps_az_suffixes`, `module.data.namespace_name`,
+    # `var.frps_vhost_http_port`) so the qurl-router's runtime
+    # set-membership check on per-resource `upstream_addr` from the QURL
+    # API can never disagree with what BuildUpstreamAddr emits
+    # (qurl-service:internal/service/upstream_assign.go::BuildUpstreamAddr
+    # — `http://frps-{az}.{domain}:{port}`). Empty when frps isn't
+    # deployed → tunnel routing is disabled at the plugin gate by
+    # construction, matching `deploy_frps=false` runtime behavior.
+    #
+    # The inner check here is just `var.deploy_frps`; the
+    # `qurl_router_enabled` gate is the outer ternary on this whole
+    # `qurl_router_config` object (`var.deploy_qurl_service &&
+    # var.qurl_router_enabled ? {...} : null`), so the effective
+    # composition is `deploy_qurl_service && qurl_router_enabled &&
+    # deploy_frps`. Keeping the inner branch narrow keeps the diff
+    # local to the field that actually depends on `deploy_frps`.
+    frp_server_urls = var.deploy_frps ? [
+      for s in var.frps_az_suffixes :
+      "http://frps-${s}.${module.data.namespace_name}:${var.frps_vhost_http_port}"
+    ] : []
   } : null
   qurl_service_token_secret_arn = var.deploy_qurl_service && var.qurl_router_enabled ? var.qurl_internal_service_token_arn : null
 
@@ -1112,16 +1134,20 @@ module "ac" {
 
   # qurl-reverse-tunnel-server integration. With the per-AZ fleet (#1499),
   # there's no single tunnel-server host to point Traefik at — frpc connects
-  # directly to the per-AZ instance via the API-supplied `frps_addr`, and
-  # the AC's qurl-router plugin reads the same per-resource `frps_addr`
-  # from the QURL API for vhost forwarding. Setting `frp_server_host = ""`
-  # disables both the legacy `/.well-known/layerv-frp` Traefik control-
-  # channel router and the legacy `frpServerUrl` plugin fallback (the
-  # plugin already accepts an empty value — traefik-plugins #95).
-  # `frp_control_port` / `frp_vhost_http_port` are still threaded for
-  # module-API stability; a follow-up may delete the AC-side variables
-  # and the `if frp_server_host != ""` branch entirely once the per-AZ
-  # rollout is verified in prod.
+  # directly to the per-AZ instance via the API-supplied `frps_addr`. The
+  # AC's qurl-router plugin uses the same per-resource `frps_addr` from
+  # the QURL API for vhost forwarding, BUT only after the request passes
+  # the plugin's `q.frpFallback == nil` gate — which requires a non-empty
+  # operator-declared boundary allowlist (`frpServerUrls`, threaded above
+  # via `qurl_router_config.frp_server_urls`). Setting `frp_server_host
+  # = ""` disables the legacy `/.well-known/layerv-frp` Traefik control-
+  # channel router; the legacy singular `frpServerUrl` plugin field has
+  # been removed from the plugin's Config struct, so the empty value
+  # rendered into dynamic.toml is silently ignored. `frp_control_port` /
+  # `frp_vhost_http_port` are still threaded for module-API stability; a
+  # follow-up may delete the AC-side variables and the `if
+  # frp_server_host != ""` branch entirely once the per-AZ rollout is
+  # verified in prod.
   frp_server_host     = ""
   frp_control_port    = var.frps_bind_port
   frp_vhost_http_port = var.frps_vhost_http_port

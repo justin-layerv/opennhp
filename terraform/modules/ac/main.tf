@@ -911,7 +911,12 @@ locals {
     qurl_router_enable_instance_hrw            = var.qurl_router_config != null ? var.qurl_router_config.enable_instance_hrw : false
     qurl_router_instance_discovery_ttl_seconds = var.qurl_router_config != null ? var.qurl_router_config.instance_discovery_ttl_seconds : 20
     qurl_router_enable_qurl_site_authz         = var.qurl_router_config != null ? var.qurl_router_config.enable_qurl_site_authz : false
-    qurl_service_token_secret_arn              = var.qurl_service_token_secret_arn
+    # Per-AZ qurl-reverse-tunnel-server boundaries (plural `frpServerUrls` in
+    # the plugin Config). Empty = tunnel routing disabled at the plugin
+    # gate, regardless of any per-resource upstream_addr the API returns
+    # — see the field doc in variables.tf for the load-bearing detail.
+    qurl_router_frp_server_urls   = var.qurl_router_config != null ? var.qurl_router_config.frp_server_urls : []
+    qurl_service_token_secret_arn = var.qurl_service_token_secret_arn
     # Centralized certificate management (for scalable AC deployments)
     centralized_cert_enabled    = var.centralized_cert_enabled
     centralized_cert_secret_arn = var.centralized_cert_secret_arn != null ? var.centralized_cert_secret_arn : ""
@@ -986,6 +991,106 @@ resource "terraform_data" "ac_user_data_frps_control_traefik_render_check" {
         strcontains(local.user_data, "-A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT")
       )
       error_message = "AC user_data render is missing one of `[entryPoints.frps-control]`, `[tcp.routers.frps-control]`, or the `-A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT` iptables rule despite frp_control_upstream_host being set. A templatefile-condition regression in `user_data.sh.tpl` would silently produce this. The TG `/ping` healthcheck wouldn't catch any of them — see lifecycle comment on aws_lb_target_group.ac_frps_control."
+    }
+  }
+}
+
+# DO NOT REMOVE — load-bearing plan-time fence. Structurally decoupled
+# from `aws_launch_template.ac` (the consumer of this template), so a
+# future cleanup pass might mistake it for unused; it's not. Prophylactic
+# even today (the only ref to the var is `%{ for }`, not `${...}`), so
+# more important to flag than the compute sibling.
+#
+# Bash-comment escape fence for multi-line `qurl_router_frp_server_urls`.
+# Mirrors `terraform_data.frps_overlay_comment_escape_fence` in
+# modules/compute/main.tf (see terraform/CLAUDE.md "templatefile() multi-line
+# vars in bash comments must be escaped"). The list interpolates to multiple
+# `"http://..."` TOML lines; any future `${qurl_router_frp_server_urls}` ref
+# inside a bash comment in user_data.sh.tpl would inject body lines that
+# don't start with `#`, and bash would execute them when the rendered script
+# runs. This fence catches a regression that adds an unescaped
+# `${qurl_router_frp_server_urls}` inside a bash comment.
+#
+# RENAME WARNING: if this template var is ever renamed, update the regex
+# (and the error_message below) to match the new name — otherwise this
+# fence silently no-ops.
+resource "terraform_data" "qurl_router_frp_server_urls_comment_escape_fence" {
+  lifecycle {
+    precondition {
+      # `(^|[[:space:]])#` — comment anchor: either line-start `#` or a `#`
+      # preceded by whitespace (trailing inline comment).
+      # `(?:[^\n]*[^$\n])?` — optional prefix where the LAST char before
+      # `${var}` is non-`$`. The optional `?` lets `#${var}` (no separator)
+      # match; the `[^$\n]` last-char enforces the var ref isn't escaped
+      # via `$${var}`. `[^\n]*` (not `[^$\n]*`) so an unrelated earlier
+      # `$RESOURCE` on the same line doesn't block matching a later
+      # unescaped `${qurl_router_frp_server_urls}` ref.
+      condition = length(regexall(
+        "(?m)(^|[[:space:]])#(?:[^\\n]*[^$\\n])?\\$\\{qurl_router_frp_server_urls\\}",
+        file("${path.module}/user_data.sh.tpl"),
+      )) == 0
+      # HCL escape note: `$${...}` in source renders as `${...}` in the
+      # plan-time message; `$$$${...}` renders as `$${...}`. So this string
+      # shows operators an unescaped `${var}` (the bug) and the escaped
+      # `$${var}` (the fix), both in plain Terraform-comment syntax.
+      error_message = "user_data.sh.tpl has an unescaped `$${qurl_router_frp_server_urls}` Terraform interpolation inside a bash comment. The value is a multi-line list of `\"http://...\"` TOML lines; bash-comment syntax does not suppress Terraform interpolation, so the multi-line body would be injected into the comment block and lines without `#` would bash-execute when the rendered script runs. Either move the ref outside the bash comment (control flow with `%%{ for ... }` is fine), or double-escape with a second `$` so the token becomes `$$$${qurl_router_frp_server_urls}` and templatefile() emits the literal instead. See terraform/CLAUDE.md \"templatefile() multi-line vars in bash comments must be escaped\"."
+    }
+  }
+}
+
+# Render-shape fence for the qurl-router middleware block. When the
+# router is enabled, the rendered user_data MUST contain the
+# `frpServerUrls = [` literal — a templatefile-condition regression
+# (accidental deletion, typo in the field name) would silently leave
+# the qurl-router middleware with an empty allowlist, regressing the
+# silent-drop/502 failure mode this PR fixes. Same precondition pattern
+# as `ac_user_data_frps_control_traefik_render_check` above; sibling
+# rather than merged because that resource is gated on a different
+# variable (`frp_control_upstream_host`) and using a separate resource
+# keeps the error_message specific to the regression that produced it.
+#
+# Gate on `enabled` (not just non-null-ness): the `frpServerUrls = [`
+# literal renders inside `%{ if qurl_router_enabled ~}` in
+# user_data.sh.tpl, and the template-side `qurl_router_enabled` is
+# `var.qurl_router_config.enabled` (locals block above). A
+# module-direct consumer passing `{ enabled = false, ... }` is a
+# legitimate disabled config, not a regression — gating only on
+# non-null-ness would false-positive there. The in-tree caller
+# (`terraform/main.tf`) only ever builds the object with
+# `enabled = true`, so this is purely for module-API stability with
+# external callers.
+resource "terraform_data" "ac_user_data_qurl_router_render_check" {
+  count = (var.qurl_router_config != null && var.qurl_router_config.enabled) ? 1 : 0
+
+  # Re-evaluate when the rendered user_data changes so the precondition
+  # re-runs on every render. Same pattern as
+  # `ac_user_data_frps_control_traefik_render_check` above.
+  input = sha256(local.user_data)
+
+  lifecycle {
+    precondition {
+      # Asserting on `frpServerUrls = [` (with the opening bracket and
+      # equals — NOT just the substring `frpServerUrls`, which also
+      # appears in comment headers above the field, so a substring
+      # match would silently pass after a regression that deleted the
+      # field assignment but left the documentation block).
+      condition     = strcontains(local.user_data, "frpServerUrls = [")
+      error_message = "AC user_data render is missing the `frpServerUrls = [` literal in the qurl-router middleware block despite qurl_router_config.enabled=true. A templatefile-condition regression (deletion or typo in `user_data.sh.tpl`) would silently produce this and leave the plugin's allowlist empty, regressing the silentDrop/502 failure mode #2134 fixed — see the field doc in `variables.tf` for the load-bearing detail."
+    }
+    precondition {
+      # When the caller threaded a non-empty list, the rendered user_data
+      # MUST contain at least one `"http://frps-` entry — the literal
+      # shape `BuildUpstreamAddr` emits and the only place this prefix
+      # appears in the rendered output. Catches a `%{ for }` regression
+      # that emitted an empty array body despite non-empty input (e.g.
+      # accidentally renaming the iteration variable so `${url}`
+      # expands to nothing). Skipped when the caller passes `[]` —
+      # that's the legitimate `deploy_frps=false` rendering posture.
+      condition = (
+        length(var.qurl_router_config.frp_server_urls) == 0
+        || strcontains(local.user_data, "\"http://frps-")
+      )
+      error_message = "qurl_router_config.frp_server_urls is non-empty but the rendered user_data has no `\"http://frps-` entries in the qurl-router middleware block. A templatefile `%%{ for }` regression (renamed iteration variable, lost interpolation) would silently produce this and leave the plugin's allowlist empty, regressing the silentDrop/502 failure mode #2134 fixed."
     }
   }
 }

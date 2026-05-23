@@ -1257,15 +1257,35 @@ cat >> /home/ubuntu/traefik/dynamic.toml << QURLDYNAMICEOF
   enableInstanceHrw = ${qurl_router_enable_instance_hrw}
   instanceDiscoveryTtl = ${qurl_router_instance_discovery_ttl_seconds}
   enableQurlSiteAuthz = ${qurl_router_enable_qurl_site_authz}
-  # frpServerUrl deliberately empty: with the per-AZ qurl-reverse-tunnel-server
-  # fleet (#1499), there's no single backend to point at — each customer's
-  # tunnel lives on a specific AZ-pinned instance, and qurl-router reads the
-  # per-resource `frps_addr` from the QURL API to route there. The plugin
-  # already accepts an empty `frpServerUrl` (traefik-plugins #95) and
-  # uses the API-supplied address exclusively. The `frp_server_host`
-  # input variable is preserved as a no-op for module-API stability;
-  # see the variable description for the full deprecation note.
-  frpServerUrl = ""
+  # Per-AZ qurl-reverse-tunnel-server boundary allowlist. Plural field
+  # `frpServerUrls` (plugin Config: FRPServerURLs []string) — the legacy
+  # singular `frpServerUrl` was dropped from the plugin's Config struct,
+  # so emitting `frpServerUrl = ""` is silently ignored and leaves the
+  # plural list empty. With an empty plural list the plugin's ServeHTTP
+  # hits the `q.frpFallback == nil` gate on every tunnel resource and
+  # silentDrop's (when enableQurlSiteAuthz=true) or 502s — per-resource
+  # `upstream_addr` from the QURL API is consulted ONLY after that gate
+  # passes. So this MUST be non-empty for tunnel resources to route at
+  # all; the entries are the operator-declared allowlist that
+  # per-resource upstream_addr values are checked against.
+  #
+  # Shape MUST match qurl-service's BuildUpstreamAddr output
+  # (qurl-service:internal/service/upstream_assign.go::BuildUpstreamAddr
+  # — http://frps-{az}.{frps_domain}:{frps_port}) so the runtime
+  # set-membership check passes. Root assembly fills this from
+  # var.frps_az_suffixes + module.data.namespace_name +
+  # var.frps_vhost_http_port to keep both sides in sync.
+  #
+  # The templatefile for-loop below emits a trailing comma after the
+  # last entry. Traefik 3.x (pinned at TRAEFIK_VERSION in
+  # docker/Dockerfile.ac.aws) uses pelletier/go-toml v2 for dynamic
+  # config parsing, which is TOML 1.0.0 spec-compliant and accepts
+  # trailing commas in arrays.
+  frpServerUrls = [
+%{ for url in qurl_router_frp_server_urls ~}
+    "${url}",
+%{ endfor ~}
+  ]
 
 [http.routers.qurl-site]
   rule = "HostRegexp(\`^.+\\\\.${qurl_router_base_domain}\$\`)"

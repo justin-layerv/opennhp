@@ -566,12 +566,67 @@ variable "qurl_router_config" {
     # remaining_seconds)). See `var.enable_qurl_site_authz` at the
     # root for the full description.
     enable_qurl_site_authz = optional(bool, false)
+    # Per-AZ qurl-reverse-tunnel-server boundary URLs. The qurl-router plugin's
+    # Config field is `FRPServerURLs []string` (json `frpServerUrls`, plural);
+    # empty disables tunnel routing entirely — every tunnel resource that
+    # reaches the plugin is silentDrop'd (when enable_qurl_site_authz=true)
+    # or 502'd. Per-resource `upstream_addr` from the QURL API is consulted
+    # ONLY after the empty-allowlist gate (qurl_router.go ServeHTTP, around
+    # the `if q.frpFallback == nil` branch), so a non-empty allowlist is a
+    # hard prereq for tunnel resources regardless of what the API returns.
+    # Default `[]` for module-direct consumers who don't deploy frps; the
+    # root assembly fills this from `var.frps_az_suffixes` + namespace_name
+    # + var.frps_vhost_http_port when `deploy_frps && qurl_router_enabled`.
+    frp_server_urls = optional(list(string), [])
   })
   default = null
 
   validation {
     condition     = var.qurl_router_config == null || can(var.qurl_router_config.enabled)
     error_message = "qurl_router_config must include 'enabled' field when set."
+  }
+
+  validation {
+    # frpServerUrls entries must be non-empty strings — the plugin's
+    # validateConfig rejects "" with `frpServerUrls[i] must not be empty`,
+    # and surfacing that here gives a plan-time error instead of an AC
+    # boot-time crash loop. `optional(list(string), [])` materializes
+    # the field whenever qurl_router_config != null, so the leading
+    # null-guard covers the only case where direct access would fail.
+    condition = (
+      var.qurl_router_config == null
+      || alltrue([for u in var.qurl_router_config.frp_server_urls : u != ""])
+    )
+    error_message = "qurl_router_config.frp_server_urls entries must be non-empty strings. The qurl-router plugin's validateConfig rejects empty entries at boot."
+  }
+
+  validation {
+    # Conservative subset of the shape qurl-service's `BuildUpstreamAddr`
+    # emits (`http://frps-{az}.{frps_domain}:{frps_port}`): http(s) +
+    # `frps-` host prefix + DNS-shaped suffix + REQUIRED non-zero TCP
+    # port. The `frps-` prefix is the operator-side contract
+    # (qurl-service's per-AZ Cloud Map convention) — encoding it here
+    # keeps this validator in lockstep with the `"http://frps-`
+    # render-shape fence in main.tf
+    # (terraform_data.ac_user_data_qurl_router_render_check), so the
+    # two layers can't disagree on what's accepted.
+    #
+    # Subset-not-exact: the regex permits multi-letter AZ suffixes
+    # (`frps_az_suffixes` is `[a-z]` only by its own validator). Port
+    # is required (and non-zero) because `BuildUpstreamAddr` always
+    # emits one — catches a root-assembly regression where
+    # `frps_vhost_http_port` interpolates to nothing. The plugin
+    # parser (`validateUpstreamAddrShape`) remains source-of-truth at
+    # AC boot for the full URL shape, including the port range and
+    # other things this regex doesn't see (IPv6 brackets, etc.).
+    condition = (
+      var.qurl_router_config == null
+      || alltrue([
+        for u in var.qurl_router_config.frp_server_urls :
+        can(regex("^https?://frps-[A-Za-z0-9._-]+:[1-9][0-9]*$", u))
+      ])
+    )
+    error_message = "qurl_router_config.frp_server_urls entries must match `^https?://frps-<dns-host>:<non-zero-port>$` — a conservative subset of the shape `BuildUpstreamAddr` in qurl-service emits (`http://frps-{az}.{frps_domain}:{frps_port}`). Port is required; a missing port indicates a root-assembly regression where `frps_vhost_http_port` interpolated to nothing. The render-shape fence in main.tf anchors on the same `\"http://frps-` literal, so the validator and the fence agree on what's accepted. The qurl-router plugin's validateUpstreamAddrShape is still source-of-truth at AC boot — surfacing the shape here gives a plan-time error instead."
   }
 
   validation {
@@ -702,7 +757,7 @@ variable "secret_reconciliation_deletion_spike_threshold" {
 # ============================================================================
 
 variable "frp_server_host" {
-  description = "DEPRECATED — dead-code gate as of the per-AZ qurl-reverse-tunnel-server fleet (#1499). The only in-tree caller (terraform/main.tf) sets this to \"\" unconditionally, so the `if frp_server_host != \"\"` guards on both the qurl-router plugin's `frpServerUrl` and the legacy `/.well-known/layerv-frp` Traefik FRP-control router are welded shut from the root. The plugin now reads per-resource `frps_addr` from the QURL API for vhost forwarding, and frpc connects to the per-AZ instance directly via the API-supplied `frps_addr` for the control channel — neither path touches this variable any more. Retained as a module input for API stability; the variable and the gated user_data branches are slated for deletion in a follow-up cleanup PR once the per-AZ rollout is verified in prod (#1499)."
+  description = "DEPRECATED — dead-code gate as of the per-AZ qurl-reverse-tunnel-server fleet (#1499). The only in-tree caller (terraform/main.tf) sets this to \"\" unconditionally, so the `if frp_server_host != \"\"` guard on the legacy `/.well-known/layerv-frp` Traefik FRP-control router is welded shut from the root. The qurl-router plugin no longer reads any single-URL field; see `qurl_router_config.frp_server_urls` for the current operator-declared boundary allowlist. Retained as a module input for API stability; the variable and the gated user_data branches are slated for deletion in a follow-up cleanup PR once the per-AZ rollout is verified in prod (#1499)."
   type        = string
   default     = ""
 }
