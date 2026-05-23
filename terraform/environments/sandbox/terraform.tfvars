@@ -20,7 +20,7 @@ enable_replication    = true             # Replicate images to prod so prod has 
 # AC configuration (Traefik with Let's Encrypt for TLS)
 deploy_ac          = true
 acme_email         = "admin@layerv.xyz"
-ac_auth_service_id = "layerv"
+ac_auth_service_id = "agent"
 ac_min_capacity    = 3
 # Two AC-protected resources, each a distinct identity per NHP spec
 # (CSA "Stealth Mode SDP" Appendix 2, NHP-KNK Message Fields):
@@ -270,7 +270,8 @@ qurl_default_ac_id   = "layerv-ac-tf"
 qurl_default_ac_port = 443
 
 # FRPS-behind-AC customer-facing DNS (SLACK_QURL_ROLLOUT.md §6, 2026-05-18).
-# Public DNS name that the FRPS resource.toml overlay renders as the
+# Public DNS name written into the DDB seed row's `resource_fqdn` field;
+# the bridge materializes that as `ResourceInfo.Hostname` and that's the
 # agent's dial target. A-record alias to the AC NLB created in
 # `terraform/main.tf::aws_route53_record.connect`. Sandbox uses the
 # in-account `layerv.xyz` zone (no cross-account provider alias).

@@ -20,7 +20,7 @@ PrivateKeyBase64 = "cHJpdmF0ZWtleWJhc2U2NA=="
 DefaultCipherScheme = 0
 IpPassMode = 0
 LogLevel = 4
-AuthServiceId = "layerv"
+AuthServiceId = "agent"
 ResourceIds = ["demo", "mini-app-demo"]
 FilterMode = 0
 `
@@ -37,7 +37,7 @@ FilterMode = 0
 	if config.PrivateKeyBase64 == "" {
 		t.Error("PrivateKeyBase64 should not be empty")
 	}
-	if config.AuthServiceId != "layerv" {
+	if config.AuthServiceId != "agent" {
 		t.Errorf("AuthServiceId mismatch: got %s", config.AuthServiceId)
 	}
 	if len(config.ResourceIds) != 2 {
@@ -175,7 +175,7 @@ ACId = "test-ac"
 DefaultIp = "10.0.0.1"
 PrivateKeyBase64 = "dGVzdHByaXZhdGVrZXkxMjM0NTY3ODkwYWJjZGVm"
 LogLevel = 4
-AuthServiceId = "layerv"
+AuthServiceId = "agent"
 ResourceIds = ["demo"]
 FilterMode = 0
 `

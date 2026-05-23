@@ -23,7 +23,7 @@ enable_replication = true           # Receive replicated images from sandbox ECR
 # AC configuration (Traefik with Let's Encrypt for TLS)
 deploy_ac          = true
 acme_email         = "admin@layerv.ai"
-ac_auth_service_id = "layerv"
+ac_auth_service_id = "agent"
 # Two AC-protected resources, each a distinct identity per NHP spec
 # (CSA "Stealth Mode SDP" Appendix 2, NHP-KNK Message Fields):
 #   - "qurl"               — viewer-side qurl-link / SPA resolve flow

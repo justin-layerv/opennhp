@@ -366,23 +366,21 @@ variable "enable_cloudfront" {
 }
 
 variable "ac_auth_service_id" {
-  description = "Authentication service ID for the Access Controller"
+  description = "Authentication service ID for the Access Controller — the NHP aspId the agent-knock dispatch keys on. Default `agent` matches the agent staticplugin's PluginID (endpoints/server/staticplugins/agent/plugin.go); a rename here without renaming the plugin (or vice versa) silently re-introduces 'failed to find service provider' at knock time."
   type        = string
-  default     = "layerv"
+  default     = "agent"
 
-  # Hard fence on TOML quote-injection. `var.ac_auth_service_id` is
-  # interpolated into the FRPS resource.toml overlay as a `"..."`
-  # literal (`local.tunnel_server_resource_toml_overlay` in
-  # `terraform/resources.tf`); a value containing `"` or `\` would
-  # produce malformed TOML and the server log-and-skips the file at
-  # `config.go:350-351`. The previous round of this PR carried the
-  # regex as a soft `check` block; promoted here to a hard validation
-  # so apply refuses an unsafe value. Pattern matches the existing
-  # `aspId` convention (lowercase letters/digits/dashes, leading
-  # letter, ≤64 chars).
+  # Hard fence on the aspId shape. `var.ac_auth_service_id` is
+  # interpolated into the DDB seed row's `auth_service_id` field
+  # (terraform/resources.tf) and the AC's announced auth service;
+  # historically also into a TOML overlay. The shape constraint
+  # below preserves the lowercase-dashed convention every aspId in
+  # this server uses (`passcode`, `oidc`, `qurl`, `agent`) and
+  # defends downstream string interpolation surfaces against quote
+  # injection.
   validation {
     condition     = can(regex("^[a-z][a-z0-9-]{0,63}$", var.ac_auth_service_id))
-    error_message = "ac_auth_service_id is interpolated into the FRPS resource.toml overlay as a `\"...\"` literal; it must match `^[a-z][a-z0-9-]{0,63}$` (lowercase letters/digits/dashes, leading letter, ≤64 chars) to avoid TOML quote-injection. Default value `layerv` conforms."
+    error_message = "ac_auth_service_id is interpolated into the DDB seed row's `auth_service_id` field and AC config; it must match `^[a-z][a-z0-9-]{0,63}$` (lowercase letters/digits/dashes, leading letter, ≤64 chars). Default value `agent` conforms."
   }
 }
 
@@ -768,16 +766,17 @@ variable "qurl_default_ac_id" {
   type        = string
   default     = ""
 
-  # Hard fence on TOML quote-injection. Same threat model as
-  # `var.ac_auth_service_id` above — interpolated into
-  # `local.tunnel_server_resource_toml_overlay`'s `ACId = "..."` literal.
+  # Shape fence on the AC identifier. Same threat model as
+  # `var.ac_auth_service_id` above — interpolated into the DDB seed
+  # row's `ac_id` field (terraform/resources.tf) and used as the AC
+  # connection key the server routes against at knock-time.
   # Empty-string is permitted by the regex (variable default; the
   # `terraform_data.frps_preconditions` block in `terraform/main.tf`
   # rejects empty when `deploy_frps = true`), so envs without FRPS
   # pass through without setting this var.
   validation {
     condition     = var.qurl_default_ac_id == "" || can(regex("^[a-z][a-z0-9-]{0,63}$", var.qurl_default_ac_id))
-    error_message = "qurl_default_ac_id is interpolated into the FRPS resource.toml overlay as a `\"...\"` literal; it must match `^[a-z][a-z0-9-]{0,63}$` (lowercase letters/digits/dashes, leading letter, ≤64 chars), or empty for envs without FRPS. Today's prod values (`layerv-ac-tf`) conform."
+    error_message = "qurl_default_ac_id is interpolated into the DDB seed row's `ac_id` field; it must match `^[a-z][a-z0-9-]{0,63}$` (lowercase letters/digits/dashes, leading letter, ≤64 chars), or empty for envs without FRPS. Today's prod values (`layerv-ac-tf`) conform."
   }
 }
 
@@ -2044,9 +2043,11 @@ variable "connect_layerv_host" {
   # `${var.frps_bind_port}` in the rendered description.
   description = <<-EOT
     Customer-facing public DNS name that fronts the FRPS control
-    channel. Threaded into the FRPS resource.toml overlay's `Hostname`
-    field so the agent dials this name instead of the internal Cloud
-    Map host. Pre-2026-05-18 the agent dialed
+    channel. Written into the DDB seed row's `resource_fqdn` field
+    (`terraform/resources.tf::aws_dynamodb_table_item.tunnel_server_nhp_resource`);
+    the bridge materializes that as `ResourceInfo.Hostname` and the
+    agent dials this name instead of the internal Cloud Map host.
+    Pre-2026-05-18 the agent dialed
     `frps-{az}.nhp.{env}.internal:$${var.frps_bind_port}` directly — an
     internal-only name no public client could resolve, and the
     FRPS-specific knock had zero L3/L4 effect because the ipset entry
@@ -2058,7 +2059,7 @@ variable "connect_layerv_host" {
     (prod). Bare DNS name only (no scheme, port, slashes, whitespace,
     or userinfo) — same shape contract as `var.domain_name`. Per-label
     RFC 1035 validation lives in the per-variable `validation {}`
-    blocks below; the `check "frps_overlay_dest_host_shape"` block in
+    blocks below; the `check "tunnel_server_dest_host_shape"` block in
     `terraform/resources.tf` carries the matching defense-in-depth
     fence on the INTERNAL `dest_host` (sourced from upstream-fenced
     inputs).

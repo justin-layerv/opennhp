@@ -253,62 +253,6 @@ variable "auth_service_id" {
   default     = ""
 }
 
-variable "frps_resource_toml_overlay" {
-  description = <<-EOT
-    Pre-rendered TOML block appended to /opt/layerv/nhp-server/etc/resource.toml
-    by user_data.sh.tpl at boot. Empty string disables the overlay (FRPS
-    not deployed in this environment).
-
-    Sourced from `local.frps_resource_toml_overlay` in terraform/resources.tf.
-    Carries the FRPS bootstrap rows (`frps-{env}` + `frps-{region}` keys
-    under the `ac_auth_service_id` AuthSvcId) that nhp-server's
-    `endpoints/server/config.go::loadResources` reads on knock receipt;
-    retires when issue #1976 (DDB→authServiceMap bridge) lands. See
-    SLACK_QURL_ROLLOUT.md §6 for the design.
-  EOT
-  type        = string
-  default     = ""
-}
-
-# Sentinel literals for the FRPS overlay block's start + end. Threaded
-# in so the grep/sed patterns in user_data.sh.tpl reference the same
-# string as the rendered overlay — a future rename of the sentinel can't
-# desync the producer (overlay body) and consumer (idempotency strip).
-# Both default to the production values; safe to leave as defaults
-# unless the sentinel format is rewritten.
-#
-# SED-LITERAL CONTRACT: both values are interpolated VERBATIM into
-# `user_data.sh.tpl`'s grep + sed BRE patterns. Neither value may
-# contain sed-special metacharacters: `/`, `.`, `*`, `[`, `]`, `^`,
-# `$`, `\`. Today's defaults are entirely letter-and-space, so they
-# pass through BRE as literal strings. A future rename that
-# introduces metachars must either escape them upstream or rewrite
-# the user_data heredoc to use awk's literal `$0 == sentinel`
-# comparison instead of sed regex matching. The `validation {}`
-# blocks below reject these characters at plan time.
-variable "frps_overlay_sentinel_prefix" {
-  description = "Literal prefix shared by the start-sentinel line in `local.frps_overlay_sentinel` and the grep/sed patterns in user_data.sh.tpl. MUST be free of sed BRE metacharacters: `/`, `.`, `*`, `[`, `]`, `^`, `$`, `\\`."
-  type        = string
-  default     = "# FRPS bootstrap overlay v"
-
-  validation {
-    # Reject sed BRE metacharacters at plan time.
-    condition     = !can(regex("[/.*\\[\\]^$\\\\]", var.frps_overlay_sentinel_prefix))
-    error_message = "frps_overlay_sentinel_prefix must be free of sed BRE metacharacters (`/`, `.`, `*`, `[`, `]`, `^`, `$`, `\\`); these would silently misbehave when the value is interpolated into the user_data sed-strip pattern. Today's default `# FRPS bootstrap overlay v` conforms."
-  }
-}
-
-variable "frps_overlay_end_sentinel" {
-  description = "Literal end-sentinel line that closes the FRPS overlay block. Used by the sed-strip range terminator. Must appear exactly once per overlay regardless of resource-group count. Same sed-BRE-metachar restriction as `frps_overlay_sentinel_prefix`."
-  type        = string
-  default     = "# FRPS bootstrap overlay end"
-
-  validation {
-    condition     = !can(regex("[/.*\\[\\]^$\\\\]", var.frps_overlay_end_sentinel))
-    error_message = "frps_overlay_end_sentinel must be free of sed BRE metacharacters (`/`, `.`, `*`, `[`, `]`, `^`, `$`, `\\`); these would silently misbehave when the value is interpolated into the user_data sed-strip pattern. Today's default `# FRPS bootstrap overlay end` conforms."
-  }
-}
-
 # ============================================================================
 # Phase 4: Pluggable Storage Backend
 # These settings control which storage backend is used for AC assignments,

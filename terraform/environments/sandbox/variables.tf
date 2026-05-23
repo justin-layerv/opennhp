@@ -120,7 +120,7 @@ variable "terraform_lock_table" {
 # AC configuration
 variable "ac_auth_service_id" {
   type    = string
-  default = "layerv"
+  default = "agent"
 }
 
 variable "ac_resource_ids" {
@@ -647,7 +647,7 @@ variable "deploy_frps" {
 }
 
 variable "connect_layerv_host" {
-  description = "Customer-facing public DNS name that fronts the FRPS control channel (sandbox: `connect.layerv.xyz`, prod: `connect.layerv.ai`). Threaded into the FRPS resource.toml overlay so the agent dials this name instead of the internal Cloud Map host; NLB:frps_bind_port → AC kernel → ipset-gated → Traefik TCP entrypoint → internal `frps-{az}`. Bare DNS name only (no scheme, port, slashes, whitespace, or userinfo); empty value opts out of the FRPS-behind-AC topology and is only valid for envs without `deploy_frps = true`. Validation duplicated from terraform/variables.tf so a malformed value attributes to the env root rather than the parent module; see the parent for the full migration narrative (why the `.internal` and `frps-` shape fences exist transitionally)."
+  description = "Customer-facing public DNS name that fronts the FRPS control channel (sandbox: `connect.layerv.xyz`, prod: `connect.layerv.ai`). Written into the DDB seed row's `resource_fqdn` field; the bridge materializes that as `ResourceInfo.Hostname` so the agent dials this name instead of the internal Cloud Map host; NLB:frps_bind_port → AC kernel → ipset-gated → Traefik TCP entrypoint → internal `frps-{az}`. Bare DNS name only (no scheme, port, slashes, whitespace, or userinfo); empty value opts out of the FRPS-behind-AC topology and is only valid for envs without `deploy_frps = true`. Validation duplicated from terraform/variables.tf so a malformed value attributes to the env root rather than the parent module; see the parent for the full migration narrative (why the `.internal` and `frps-` shape fences exist transitionally)."
   type        = string
   default     = ""
 

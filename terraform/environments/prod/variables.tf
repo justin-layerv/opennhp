@@ -158,7 +158,7 @@ variable "enable_egress_eips" {
 # AC configuration
 variable "ac_auth_service_id" {
   type    = string
-  default = "layerv"
+  default = "agent"
 }
 
 variable "ac_resource_ids" {

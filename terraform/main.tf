@@ -501,20 +501,6 @@ module "compute" {
   server_plugins  = var.server_plugins
   auth_service_id = var.ac_auth_service_id
 
-  # FRPS bootstrap overlay appended to /opt/layerv/nhp-server/etc/resource.toml
-  # at boot. See `local.tunnel_server_resource_toml_overlay` doc in resources.tf
-  # for the divergence from the DDB seed rows and the #1976 retirement plan.
-  # The module-variable name is held stable as `frps_resource_toml_overlay`
-  # so the user_data.sh.tpl templatefile interpolation and its bash-comment
-  # escape-fence regex don't need a coordinated rename — the variable name
-  # is plumbing, not on-disk surface.
-  frps_resource_toml_overlay = local.tunnel_server_resource_toml_overlay
-  # Sentinel prefix and end-marker — threaded so the user_data heredoc's
-  # grep and sed patterns reference the same literals as the rendered
-  # overlay. Decouples the patterns from a future sentinel rename.
-  frps_overlay_sentinel_prefix = local.frps_overlay_sentinel_prefix
-  frps_overlay_end_sentinel    = local.frps_overlay_end_sentinel
-
   # QURL plugin configuration
   qurl_config                   = var.qurl_config
   qurl_service_token_secret_arn = var.qurl_service_token_secret_arn
@@ -1160,17 +1146,16 @@ module "ac" {
   # Traefik TCP entrypoint at `:${frps_bind_port}` forwards admitted
   # SYNs (post-NHP-knock ipset gate) to this internal tunnel-server
   # host. Source the host from the same `local.tunnel_server_resource`
-  # struct that the DDB seed row + resource.toml overlay's `dest_host`
-  # field consume, so all three converge on one truth (lex-smallest AZ
-  # for v1; the overlay carries this same single-AZ pin). Empty string
-  # when FRPS isn't deployed — disables the AC NLB:7000 listener, the
+  # struct that the DDB seed row's `dest_host` field consumes, so both
+  # converge on one truth (lex-smallest AZ for v1). Empty string when
+  # FRPS isn't deployed — disables the AC NLB:7000 listener, the
   # new TG, and the Traefik TCP entrypoint via the
   # `count = ... ? 1 : 0` and `%{ if frp_control_upstream_host != "" ~}`
   # gates downstream.
   #
   # Predicate mirrors `local.tunnel_server_resource.enabled` so the
-  # upstream-host, the DDB seed row, and the TOML overlay all converge
-  # on the same enable condition. The `&& var.deploy_qurl_service`
+  # upstream-host and the DDB seed row converge on the same enable
+  # condition. The `&& var.deploy_qurl_service`
   # conjunct is redundant in practice — `terraform_data.frps_preconditions`
   # enforces `deploy_frps ⇒ deploy_qurl_service` at plan time — but
   # keeping it inline keeps the predicate self-describing for readers
@@ -1389,28 +1374,30 @@ resource "terraform_data" "frps_preconditions" {
     }
     precondition {
       # FRPS-behind-AC requires the customer-facing public DNS name for
-      # the AC ingress. Without it, the resource.toml overlay renders
-      # `Hostname = ""` and the agent has no dial target. Set per env:
-      # `connect.layerv.xyz` (sandbox), `connect.layerv.ai` (prod). The
-      # NLB:${var.frps_bind_port} listener + Route 53 record + AC Traefik
-      # TCP entrypoint that this name fronts are all created from this
-      # same variable downstream — a missing value at plan time is the
-      # earliest signal that the topology won't function.
+      # the AC ingress. Without it, the DDB seed row's `resource_fqdn`
+      # is empty, the bridge materializes `ResourceInfo.Hostname = ""`,
+      # and the agent has no dial target. Set per env: `connect.layerv.xyz`
+      # (sandbox), `connect.layerv.ai` (prod). The NLB:${var.frps_bind_port}
+      # listener + Route 53 record + AC Traefik TCP entrypoint that this
+      # name fronts are all created from this same variable downstream —
+      # a missing value at plan time is the earliest signal that the
+      # topology won't function.
       condition     = var.connect_layerv_host != ""
-      error_message = "deploy_frps requires connect_layerv_host to be set to a non-empty value — the FRPS resource.toml overlay needs a customer-facing public DNS name for the AC ingress (e.g. `connect.layerv.xyz` for sandbox, `connect.layerv.ai` for prod). See SLACK_QURL_ROLLOUT.md §6 (FRPS-behind-AC redesign 2026-05-18)."
+      error_message = "deploy_frps requires connect_layerv_host to be set to a non-empty value — the DDB seed row's `resource_fqdn` needs a customer-facing public DNS name for the AC ingress (e.g. `connect.layerv.xyz` for sandbox, `connect.layerv.ai` for prod). See SLACK_QURL_ROLLOUT.md §6 (FRPS-behind-AC redesign 2026-05-18)."
     }
     precondition {
-      # Hard-fence on the two overlay-interpolated AC IDs. Quote-injection
+      # Hard-fence on the two DDB-interpolated AC IDs. Quote-injection
       # / shape regex is enforced by the per-variable `validation {}`
       # blocks in `terraform/variables.tf` (apply refuses on bad shape).
       # This precondition is the empty-string failover: an empty value
-      # would pass the regex (which permits "") and silently render a
-      # malformed overlay (`ACId = ""` → every knock returns
-      # `ErrACConnectionNotFound`; `aspId = ""` → no FindAuthSvcProvider
-      # match). Today's prod envs always set both in tfvars; this fence
-      # catches a future greenfield env that forgets one.
+      # would pass the regex (which permits "") and silently write a
+      # malformed DDB row (`ac_id = ""` → every knock returns
+      # `ErrACConnectionNotFound`; `auth_service_id = ""` → bridge
+      # FilterExpression matches no rows for any aspId). Today's prod
+      # envs always set both in tfvars; this fence catches a future
+      # greenfield env that forgets one.
       condition     = var.ac_auth_service_id != "" && var.qurl_default_ac_id != ""
-      error_message = "deploy_frps requires both ac_auth_service_id and qurl_default_ac_id to be non-empty — the FRPS resource.toml overlay would otherwise render with `aspId = \"\"` (no FindAuthSvcProvider match) or `ACId = \"\"` (every knock returns ErrACConnectionNotFound). Today's prod envs always set both in tfvars; this fence catches a future greenfield env that forgets one."
+      error_message = "deploy_frps requires both ac_auth_service_id and qurl_default_ac_id to be non-empty — the DDB seed row would otherwise be written with `auth_service_id = \"\"` (bridge FilterExpression matches no rows) or `ac_id = \"\"` (every knock returns ErrACConnectionNotFound). Today's prod envs always set both in tfvars; this fence catches a future greenfield env that forgets one."
     }
     precondition {
       # Hard fence on the `connect.layerv.*` Route 53 record actually

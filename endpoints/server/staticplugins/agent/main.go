@@ -1,4 +1,4 @@
-package layerv
+package agent
 
 import (
 	"github.com/OpenNHP/opennhp/nhp/common"
@@ -18,7 +18,7 @@ func Version() string {
 // pubkey_b64_prefix="..."` upstream → this AC-dispatch line)
 // depends on identical truncation AND identical empty-string
 // behavior (`"<empty>"`). The upstream helper is package-private
-// to `endpoints/server`, so layerv carries this local mirror.
+// to `endpoints/server`, so agent carries this local mirror.
 // If the upstream shape ever moves to a shared package (e.g.
 // `nhp/common`), retire this mirror in lockstep.
 func pubkeyLogPrefix(pk string) string {
@@ -33,13 +33,13 @@ func pubkeyLogPrefix(pk string) string {
 
 // Init satisfies the PluginHandler interface but is intentionally a
 // no-op. `plugins.RegisterPlugin` already logs `"Registered static
-// plugin: layerv"` at init time, and this plugin carries no
+// plugin: agent"` at init time, and this plugin carries no
 // per-instance state to lazy-init via the host's PluginParamsIn.
 func Init(in *plugins.PluginParamsIn) error {
 	return nil
 }
 
-// AuthWithNHP handles the agent-bootstrap knock flow.
+// AuthWithNHP handles the agent knock flow.
 //
 // Caller contract: req, req.Msg, and req.Ack MUST be non-nil. The
 // upstream `HandleKnockRequest` enforces this for every live knock
@@ -53,18 +53,19 @@ func Init(in *plugins.PluginParamsIn) error {
 //     `nhp/core/responder.go::validatePeer`.
 //   - `resolveAgentPeerForKnock` resolved the agent's pubkey to a
 //     registered identity in the `qurl-agent-keys` DDB table.
-//   - `FindAuthSvcProvider("layerv")` returned a non-nil aspData and
-//     the helper was constructed with `helper.AspData` populated.
+//   - `ResolveAuthSvcProvider("agent")` returned a non-nil aspData
+//     (populated by the DDB bridge from `nhp_resources` rows; see
+//     resource_lookup.go) and the helper was constructed with
+//     `helper.AspData` populated.
 //
 // Given those, this handler performs no additional auth: it looks up
-// the requested resource in the aspData ResourceGroups (populated
-// from the resource.toml FRPS overlay), and delegates AC dispatch
-// (ipset write + access-token issuance) to the host server's
-// `handleNhpOpenResource` via `helper.AuthWithNhpCallbackFunc`.
+// the requested resource in the aspData ResourceGroups and delegates
+// AC dispatch (ipset write + access-token issuance) to the host
+// server's `handleNhpOpenResource` via `helper.AuthWithNhpCallbackFunc`.
 //
-// See nhp #1977 for the FRPS-behind-AC security model — the
-// key-authenticated knock IS the access-control primitive; the AC's
-// ipset is a coarse pre-filter only.
+// See nhp #1977 for the security model — the key-authenticated knock
+// IS the access-control primitive; the AC's ipset is a coarse
+// pre-filter only.
 func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelper) (ackMsg *common.ServerKnockAckMsg, err error) {
 	// req, req.Msg, req.Ack are non-nil by upstream contract — built in
 	// `HandleKnockRequest` and never nil at the plugin call site.
@@ -76,7 +77,7 @@ func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelp
 		// the failure shape, instead of an opaque `errors.New`.
 		err = common.ErrInvalidInput
 		ackMsg.ErrCode = common.ErrInvalidInput.ErrorCode()
-		ackMsg.ErrMsg = "layerv.AuthWithNHP: helper is nil"
+		ackMsg.ErrMsg = "agent.AuthWithNHP: helper is nil"
 		return
 	}
 	if helper.AspData == nil {
@@ -92,8 +93,8 @@ func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelp
 
 	res := helper.AspData.ResourceGroups[req.Msg.ResourceId]
 	if res == nil {
-		// Resource registered under some aspId but not "layerv" → routing
-		// bug at the agent or stale resource.toml. ErrResourceNotFound
+		// Resource registered under some aspId but not "agent" → routing
+		// bug at the agent or stale DDB catalog. ErrResourceNotFound
 		// (52004) is the existing code for this class.
 		err = common.ErrResourceNotFound
 		ackMsg.ErrCode = common.ErrResourceNotFound.ErrorCode()
@@ -101,12 +102,16 @@ func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelp
 		return
 	}
 
-	// Defense-in-depth against a terraform regression that drops
-	// `skipAuth = true` from the FRPS overlay. The primary access
-	// control is the X25519+DDB pubkey resolution already done by
-	// `resolveAgentPeerForKnock`; this plugin carries no backend-auth
-	// path, so a resource flagged `skipAuth=false` would be a config
-	// bug, not a request we can satisfy. Same fence as passcode/oidc.
+	// Defense-in-depth against a DDB writer regression that drops
+	// SkipAuth=true. The primary access control is the X25519+DDB
+	// pubkey resolution already done by `resolveAgentPeerForKnock`;
+	// this plugin carries no backend-auth path, so a resource flagged
+	// SkipAuth=false would be a config bug, not a request we can
+	// satisfy. (Today the bridge hardcodes SkipAuth=true for every
+	// row it materializes — see resource_lookup.go::queryAndCache —
+	// so this is a forward-looking fence against a future change
+	// that exposes SkipAuth as a per-row field.) Same fence as
+	// passcode/oidc.
 	if !res.SkipAuth {
 		err = common.ErrBackendAuthRequired
 		ackMsg.ErrCode = common.ErrBackendAuthRequired.ErrorCode()
@@ -120,11 +125,11 @@ func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelp
 		// with a typed sentinel + ack stamping like the other guards.
 		err = common.ErrInvalidInput
 		ackMsg.ErrCode = common.ErrInvalidInput.ErrorCode()
-		ackMsg.ErrMsg = "layerv.AuthWithNHP: AuthWithNhpCallbackFunc is nil"
+		ackMsg.ErrMsg = "agent.AuthWithNHP: AuthWithNhpCallbackFunc is nil"
 		return
 	}
 
-	log.Info("layerv.AuthWithNHP agent_id=%q pubkey_b64_prefix=%q resource_id=%q open_time=%d — agent pre-authenticated via X25519 + DDB lookup, dispatching AC ops",
+	log.Info("agent.AuthWithNHP agent_id=%q pubkey_b64_prefix=%q resource_id=%q open_time=%d — agent pre-authenticated via X25519 + DDB lookup, dispatching AC ops",
 		req.Msg.UserId, pubkeyLogPrefix(req.PublicKey), req.Msg.ResourceId, res.OpenTime)
 
 	// `ackMsg.OpenTime` is serialized into the agent's ack response

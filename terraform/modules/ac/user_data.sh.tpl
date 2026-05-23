@@ -11,10 +11,11 @@
 # the multi-line case is what broke the sandbox server fleet in PR
 # #2044. See terraform/CLAUDE.md § "templatefile() multi-line vars in
 # bash comments must be escaped" for the rule and examples, and
-# terraform_data.frps_overlay_comment_escape_fence in
-# modules/compute/main.tf for the plan-time enforcement pattern to
-# mirror in modules/ac/main.tf the first time a multi-line var lands
-# here.
+# `terraform_data.qurl_router_frp_server_urls_comment_escape_fence`
+# in modules/ac/main.tf for the live plan-time enforcement pattern
+# (the compute-side `frps_overlay_comment_escape_fence` was retired
+# in #1976 with the overlay itself; this AC-side fence is now the
+# only instance).
 set -ex
 
 exec > >(tee /var/log/user-data.log | logger -t user-data) 2>&1
@@ -1433,7 +1434,7 @@ echo "FRP tunnel server routes added (ingress /.well-known/layerv-frp or /~!frp 
 # default-DROPs INPUT and admits this SYN only when the FRPS-specific NHP
 # knock has added `(agent_ip, ${frp_control_port}, ac_local_ip)` to the
 # `defaultset` ipset (see nhp/endpoints/ac/msghandler.go `HandleAccessControl`,
-# and the `Addr.Ip = ""` sentinel in the FRPS resource.toml overlay which
+# and the empty `Addr.Ip` the bridge synthesizes for the agent flow which
 # triggers the DefaultIp substitution). The ipset entry is a coarse
 # source-IP pre-filter; identity-bound access control comes from the
 # per-client X25519 key-authenticated knock + knock-token validation at
@@ -1467,10 +1468,11 @@ cat > /home/ubuntu/traefik/frps-control.toml << 'FRPSCTRLEOF'
 # FRPS control channel TCP forwarder — Wave 5 FRPS-behind-AC topology.
 #
 # Two distinct hostnames are in play; do not conflate them:
-#   1. Customer-facing dial target (the value of `Hostname` in the
-#      nhp-server resource.toml overlay, e.g. `connect.layerv.{ai,xyz}`)
-#      — sourced from `var.connect_layerv_host` in the root tfvars and
-#      threaded into `local.tunnel_server_resource_toml_overlay`.
+#   1. Customer-facing dial target (the value of `Hostname` the
+#      nhp-server returns in the agent's knock ack, e.g.
+#      `connect.layerv.{ai,xyz}`) — sourced from
+#      `var.connect_layerv_host` in the root tfvars and written into
+#      the DDB seed row's `resource_fqdn` field (terraform/resources.tf).
 #      Resolves publicly to this AC's NLB.
 #   2. Internal upstream this Traefik TCP service forwards to (e.g.
 #      `frps-{az}.nhp.{env}.internal`) — sourced from

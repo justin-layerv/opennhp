@@ -609,6 +609,30 @@ const (
 	// MUTUALLY EXCLUSIVE with MetricResourceLookupInitFailure — same
 	// single-cause-attribution posture as the agent-peer pair.
 	MetricResourceLookupNotConfigured = "ResourceLookupNotConfigured"
+
+	// MetricResourceLookupAspMismatch fires when DDB returns a row
+	// whose `auth_service_id` doesn't match the aspId the resolver
+	// asked for. Today the server-side FilterExpression
+	// (`auth_service_id = :asp`) constrains the query so this
+	// branch is unreachable; the counter exists for the
+	// defense-in-depth fence at queryAndCache (a future regression
+	// in the filter expression — typo, missing :asp substitution,
+	// AWS SDK quirk, or a writer that bypasses the filter — could
+	// let mismatched rows leak).
+	//
+	// Split out from MetricResourceLookupMalformedRow so the alarm
+	// is INTENDED for a `> 0` threshold once wired: a mismatched
+	// aspId means a knock for aspId X gets resources from aspId Y
+	// in its ack — potential cross-aspId routing bug — different
+	// urgency than "writer emitted a row with a field type drift."
+	// No TF alarm references this metric today (consistent with
+	// every other MetricResourceLookup* sibling — none have TF-side
+	// wiring; alarms are presumably auto-discovered via the metric
+	// stream or wired manually). Adding alarms for the four
+	// MetricResourceLookup* defense-in-depth counters (AspMismatch,
+	// CrossPartition, MalformedRow, Pagination) is operational
+	// follow-up work, not code work.
+	MetricResourceLookupAspMismatch = "ResourceLookupAspMismatch"
 )
 
 // Multi-AC broadcast observability metric names (issue #376).

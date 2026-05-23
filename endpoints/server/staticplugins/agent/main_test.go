@@ -1,4 +1,4 @@
-package layerv
+package agent
 
 import (
 	"errors"
@@ -42,19 +42,20 @@ func newHelper(asp *common.AuthServiceProviderData, capture *callbackCapture, re
 	}
 }
 
-// newAspWithTunnelServer builds the fixture that mirrors the
-// `local.tunnel_server_resource_toml_overlay` shape: a top-level "layerv"
-// AuthServiceProvider whose ResourceGroups holds one resource keyed
-// the same as the resource group. Pinned to the shape asserted by
-// TestTunnelServerResourceTOMLOverlay_SchemaMatchesAuthSvcProviderMap in
-// endpoints/server/config_test.go.
+// newAspWithTunnelServer builds the fixture that mirrors what the DDB
+// bridge (`endpoints/server/resource_lookup.go::queryAndCache`)
+// materializes for a `nhp_resources` row with
+// `auth_service_id = "agent"` and `resource_id = "qurl-tunnel-server"`:
+// a top-level "agent" AuthServiceProvider whose ResourceGroups holds
+// one resource keyed the same as the resource group. Inner-equals-
+// outer is load-bearing (see resource_lookup.go inline doc).
 func newAspWithTunnelServer() *common.AuthServiceProviderData {
 	return &common.AuthServiceProviderData{
-		AuthSvcId: "layerv",
+		AuthSvcId: "agent",
 		ResourceGroups: common.ResourceGroupMap{
 			"qurl-tunnel-server": &common.ResourceData{
 				ResourceGroup: common.ResourceGroup{
-					AuthServiceId: "layerv",
+					AuthServiceId: "agent",
 					ResourceId:    "qurl-tunnel-server",
 					OpenTime:      120,
 					Resources: map[string]*common.ResourceInfo{
@@ -63,8 +64,8 @@ func newAspWithTunnelServer() *common.AuthServiceProviderData {
 							Hostname: "connect.layerv.xyz",
 							// Ip is empty intentionally so DestHost() falls back to
 							// Hostname (see nhpmsg.go DestHost / Hosts). The
-							// tunnel-server overlay carries Hostname, not Ip,
-							// for the agent-bootstrap flow.
+							// agent flow carries Hostname (customer-facing AC
+							// ingress), not Ip.
 							Addr: &common.NetAddress{
 								Ip:       "",
 								Port:     7000,
@@ -83,7 +84,7 @@ func newKnockReq(resourceId string) *common.NhpAuthRequest {
 	return &common.NhpAuthRequest{
 		Msg: &common.AgentKnockMsg{
 			UserId:        "test-agent",
-			AuthServiceId: "layerv",
+			AuthServiceId: "agent",
 			ResourceId:    resourceId,
 		},
 		Ack: &common.ServerKnockAckMsg{},
@@ -101,7 +102,7 @@ func newKnockReq(resourceId string) *common.NhpAuthRequest {
 // the captured res — the plugin doesn't pre-populate ackMsg.ResourceHost
 // because handleNhpOpenResource re-initializes that map and writes it from
 // per-resource AC ops; a pre-callback write would be silently overwritten.
-func TestAuthWithNHP_DispatchesAgentBootstrapKnock(t *testing.T) {
+func TestAuthWithNHP_DispatchesAgentKnock(t *testing.T) {
 	capture := &callbackCapture{}
 	helper := newHelper(newAspWithTunnelServer(), capture, nil)
 	req := newKnockReq("qurl-tunnel-server")
@@ -111,7 +112,7 @@ func TestAuthWithNHP_DispatchesAgentBootstrapKnock(t *testing.T) {
 		t.Fatalf("AuthWithNHP returned err: %v", err)
 	}
 	if capture.calls != 1 {
-		t.Fatalf("AuthWithNhpCallbackFunc calls=%d want=1 — agent-bootstrap path must call through to handleNhpOpenResource", capture.calls)
+		t.Fatalf("AuthWithNhpCallbackFunc calls=%d want=1 — agent path must call through to handleNhpOpenResource", capture.calls)
 	}
 	if capture.res == nil || capture.res.ResourceId != "qurl-tunnel-server" {
 		t.Fatalf("callback got res=%+v, want non-nil with ResourceId=\"qurl-tunnel-server\"", capture.res)
@@ -128,7 +129,7 @@ func TestAuthWithNHP_DispatchesAgentBootstrapKnock(t *testing.T) {
 		t.Errorf("ackMsg.ResourceHost at callback entry=%v want nil — plugin must NOT pre-write ResourceHost (callback re-inits the map at udpserver.go:3069)", capture.resourceHostAtEntry)
 	}
 	if ack.OpenTime != 120 {
-		t.Errorf("ack.OpenTime=%d want=120 — the overlay's OpenTime must reach the agent's ack", ack.OpenTime)
+		t.Errorf("ack.OpenTime=%d want=120 — the DDB row's OpenTime must reach the agent's ack", ack.OpenTime)
 	}
 	if ack.ErrCode != common.ErrSuccess.ErrorCode() {
 		t.Errorf("ack.ErrCode=%q want=%q — callback success path must stamp success", ack.ErrCode, common.ErrSuccess.ErrorCode())
@@ -160,10 +161,10 @@ func TestAuthWithNHP_CallbackErrorPropagates(t *testing.T) {
 	}
 }
 
-// Resource the agent asked for isn't in the loaded overlay → 52004. This is the
-// path a stale agent state hits when the resource.toml ships a resource the
-// agent doesn't know about (or vice versa, more commonly: agent asks for a
-// resource the host server doesn't have wired up yet).
+// Resource the agent asked for isn't in the loaded catalog → 52004. This is the
+// path a stale agent state hits when DDB ships a resource the agent doesn't
+// know about (or vice versa, more commonly: agent asks for a resource the
+// host server doesn't have wired up yet).
 func TestAuthWithNHP_ResourceNotFoundReturnsErrResourceNotFound(t *testing.T) {
 	capture := &callbackCapture{}
 	helper := newHelper(newAspWithTunnelServer(), capture, nil)
@@ -183,12 +184,12 @@ func TestAuthWithNHP_ResourceNotFoundReturnsErrResourceNotFound(t *testing.T) {
 
 // AspData present but ResourceGroups is nil → existing res-nil branch
 // catches it as ErrResourceNotFound. A pathological aspData shape
-// (manually constructed test helper, malformed resource.toml that
-// loaded a top-level table but no nested resource block) shouldn't
-// panic on the lock-free map read; pin the safety net.
+// (manually constructed test helper, malformed DDB row that loaded a
+// top-level table but no nested resource block) shouldn't panic on the
+// lock-free map read; pin the safety net.
 func TestAuthWithNHP_NilResourceGroupsReturnsErrResourceNotFound(t *testing.T) {
 	capture := &callbackCapture{}
-	helper := newHelper(&common.AuthServiceProviderData{AuthSvcId: "layerv"}, capture, nil)
+	helper := newHelper(&common.AuthServiceProviderData{AuthSvcId: "agent"}, capture, nil)
 	req := newKnockReq("qurl-tunnel-server")
 
 	ack, err := AuthWithNHP(req, helper)
@@ -226,7 +227,7 @@ func TestAuthWithNHP_NilAspDataReturnsErrAuthServiceProviderNotFound(t *testing.
 // Empty ResourceId: realistic stale-agent-config shape (agent doesn't
 // know the tunnel-server resource id yet). Map lookup on "" returns the zero
 // value, which the res-nil branch catches as ErrResourceNotFound.
-// Distinct from "resource the overlay doesn't have" — pin both shapes.
+// Distinct from "resource the catalog doesn't have" — pin both shapes.
 func TestAuthWithNHP_EmptyResourceIdReturnsErrResourceNotFound(t *testing.T) {
 	capture := &callbackCapture{}
 	helper := newHelper(newAspWithTunnelServer(), capture, nil)
@@ -264,22 +265,22 @@ func TestAuthWithNHP_NilCallbackReturnsErrInvalidInput(t *testing.T) {
 	}
 }
 
-// Init-time registration must wire `plugins.GetPluginHandler("layerv", "")`
+// Init-time registration must wire `plugins.GetPluginHandler("agent", "")`
 // to a non-nil handler. Fences a future refactor that decouples `init()`
 // from the package and the closely-related failure mode where the blank
-// import in `endpoints/server/main/main.go` gets dropped — the exact
-// regression shape this PR exists to fix on the dispatcher side.
+// import in `endpoints/server/main/main.go` gets dropped.
 func TestInitRegistersPluginHandler(t *testing.T) {
-	h := plugins.GetPluginHandler("layerv", "")
+	h := plugins.GetPluginHandler("agent", "")
 	if h == nil {
-		t.Fatal("plugins.GetPluginHandler(\"layerv\", \"\") = nil — init() must register the layerv static plugin so FindPluginHandler resolves it at knock time")
+		t.Fatal("plugins.GetPluginHandler(\"agent\", \"\") = nil — init() must register the agent static plugin so FindPluginHandler resolves it at knock time")
 	}
 }
 
-// Defense-in-depth: a terraform regression that drops `skipAuth = true`
-// from the tunnel-server overlay must NOT silently grant the knock — layerv carries
-// no backend-auth path, so a SkipAuth=false resource is a config bug we
-// have to refuse. Matches passcode/oidc.
+// Defense-in-depth: a DDB writer regression that drops SkipAuth=true must
+// NOT silently grant the knock — the agent plugin carries no backend-auth
+// path, so a SkipAuth=false resource is a config bug we have to refuse.
+// (Today the bridge hardcodes SkipAuth=true; this fence is forward-looking
+// for a future per-row SkipAuth field.) Matches passcode/oidc.
 func TestAuthWithNHP_SkipAuthFalseReturnsErrBackendAuthRequired(t *testing.T) {
 	asp := newAspWithTunnelServer()
 	asp.ResourceGroups["qurl-tunnel-server"].SkipAuth = false
@@ -314,17 +315,16 @@ func TestAuthWithNHP_NilHelperFailsLoud(t *testing.T) {
 	}
 }
 
-func TestPluginID_IsLayerv(t *testing.T) {
-	// PluginID is "layerv" — the registered plugin id and the
-	// AuthServiceId the tunnel-server overlay keys on. A rename of this
-	// constant is an in-package edit; the Go ↔ terraform lockstep
-	// against `var.ac_auth_service_id` (terraform/variables.tf) is
-	// NOT enforced here — that requires a CI grep guard analogous
-	// to `scripts/check-scope-drift.sh` and is filed as a follow-up.
-	// This test exists as a grep anchor for the constant so the
-	// failure mode "failed to find service provider with layerv"
-	// has an explicit reference point at the Go side.
-	if PluginID != "layerv" {
-		t.Fatalf("PluginID=%q want=%q — keep in lockstep with var.ac_auth_service_id default in terraform/variables.tf (see follow-up issue for the CI lint)", PluginID, "layerv")
+func TestPluginID_IsAgent(t *testing.T) {
+	// PluginID is "agent" — the registered plugin id and the
+	// AuthServiceId the agent's knock keys on. The Go ↔ terraform
+	// lockstep against `var.ac_auth_service_id` is enforced at PR
+	// time by `scripts/check-asp-and-ac-id-lockstep.sh`; this test
+	// is the Go-side anchor (literal-match fence) so a rename of
+	// this constant fails Go CI loud at the in-package edit, before
+	// the cross-repo TF lint catches the surviving drift on TF
+	// surfaces.
+	if PluginID != "agent" {
+		t.Fatalf("PluginID=%q want=%q — keep in lockstep with var.ac_auth_service_id default in terraform/variables.tf (CI lint: scripts/check-asp-and-ac-id-lockstep.sh)", PluginID, "agent")
 	}
 }

@@ -7,7 +7,7 @@
 // bounded LRU, singleflight-deduplicated DDB queries, build-fresh-
 // then-atomic-swap publish into UdpServer.authServiceMap so the
 // existing FindAuthSvcProvider RLock read-path (and through it the
-// layerv plugin's helper.AspData read) sees the live catalog.
+// agent plugin's helper.AspData read) sees the live catalog.
 //
 // Phase-1 freshness contract: once a lookup populates authServiceMap,
 // the resolved pointer pins there until the next cache-miss re-runs
@@ -42,7 +42,7 @@ const (
 	// entry is a single *common.AuthServiceProviderData carrying that
 	// aspId's full ResourceGroups map — heavier than the agent-peer
 	// LRU entry's *UdpPeer, so the cap is an order of magnitude
-	// smaller. Today only one aspId ("layerv") is in active use; a
+	// smaller. Today only one aspId ("agent") is in active use; a
 	// future schema with many distinct aspIds would still fit
 	// comfortably under this cap. Bumped or made configurable when a
 	// real multi-aspId deployment lands.
@@ -61,17 +61,20 @@ const (
 	resourceLookupCacheTTL = 60 * time.Second
 
 	// nhpSystemCustomerID is the 26-char nil-ULID (Crockford base32
-	// alphabet, all zeros) partition that FRPS seed rows are written
+	// alphabet, all zeros) partition that agent seed rows are written
 	// under (terraform/resources.tf's `local.nhp_system_customer_id`).
-	// All current "layerv" resources share this partition; a future
+	// All current "agent" resources share this partition; a future
 	// per-tenant schema would key by a real customer ULID instead. The
 	// constant is duplicated from terraform's `local`; a drift on either
 	// side surfaces as a cache miss that returns ErrResourceUnknownASP
 	// (the resolver Queries an empty partition and finds no rows), which
 	// then routes through MetricAuthFailure via ResolveAuthSvcProvider's
-	// auth-policy branch. The drift fence is filed as a follow-up CI
-	// lint (#2121) so a terraform-side rename can't sneak past code
-	// review. Documenting the duplication here is the same posture as
+	// auth-policy branch. The drift fence lives at PR time via
+	// `scripts/check-asp-and-ac-id-lockstep.sh` (wired into
+	// `.github/workflows/validate-workflows.yml`) — a terraform-side
+	// rename without renaming this const (or vice versa) fails CI loud
+	// rather than silently routing through the auth-policy branch.
+	// Documenting the duplication here is the same posture as
 	// agentPeerLookupIndexName ↔ `terraform/modules/dynamodb/main.tf`'s
 	// `pubkey-index` constant.
 	nhpSystemCustomerID = "00000000000000000000000000"
@@ -309,18 +312,20 @@ func (l *ResourceLookup) LookupAuthServiceProvider(ctx context.Context, aspId st
 //
 // The Query is partition-bounded (single customer_id) so cost is
 // O(rows-under-partition), not O(table). Today the system partition
-// holds only the small FRPS catalog (a few rows); a future
-// per-tenant schema would partition by real customer_id and this
-// query would still be small per-tenant.
+// holds only the small agent catalog (a few rows under
+// `auth_service_id = "agent"`); a future per-tenant schema would
+// partition by real customer_id and this query would still be small
+// per-tenant.
 //
 // SkipAuth=true is stamped on the resulting *AuthServiceProviderData
-// to match the contract the layerv plugin fences on (see
-// endpoints/server/staticplugins/layerv/main.go::AuthWithNHP and
-// the SkipAuth=true assertion in TestTunnelServerResourceTOMLOverlay_…
-// in endpoints/server/config_test.go). The DDB schema doesn't carry
-// a skip_auth column today because the agent-bootstrap flow has no
-// backend-auth path; if a future ASP needs backend auth, this
-// becomes a per-row field rather than a constant.
+// to match the contract the agent plugin fences on (see
+// endpoints/server/staticplugins/agent/main.go::AuthWithNHP and
+// TestResourceLookup_HappyPathMatchesPluginReadShape in
+// resource_lookup_test.go, which fences this bridge's SkipAuth=true
+// output against the agent plugin's `!res.SkipAuth` refuse path).
+// The DDB schema doesn't carry a skip_auth column today because the
+// agent flow has no backend-auth path; if a future ASP needs backend
+// auth, this becomes a per-row field rather than a constant.
 func (l *ResourceLookup) queryAndCache(ctx context.Context, aspId string) (*common.AuthServiceProviderData, error) {
 	queryCtx, cancel := context.WithTimeout(ctx, DynamoDBOperationTimeout)
 	defer cancel()
@@ -332,7 +337,8 @@ func (l *ResourceLookup) queryAndCache(ctx context.Context, aspId string) (*comm
 	// unmarshal-cost reduction that becomes load-bearing once the
 	// partition holds rows for multiple aspIds (the multi-aspId schema
 	// the godoc anticipates). Today the system partition only carries
-	// "layerv" rows; the filter is a no-op against current data.
+	// `auth_service_id = "agent"` rows; the filter is a no-op against
+	// current data.
 	out, err := l.querier.Query(queryCtx, &dynamodb.QueryInput{
 		TableName:              aws.String(l.table),
 		KeyConditionExpression: aws.String("customer_id = :cid"),
@@ -411,6 +417,24 @@ func (l *ResourceLookup) queryAndCache(ctx context.Context, aspId string) (*comm
 			continue
 		}
 		if row.AuthServiceID != aspId {
+			// Defense-in-depth: the server-side FilterExpression
+			// (`auth_service_id = :asp` in the Query above) already
+			// constrains the wire response to rows where this is true.
+			// A row reaching this client-side check that fails it means
+			// a filter regression — typo, missing :asp substitution,
+			// AWS SDK quirk, or a future writer path that bypasses the
+			// filter. Without this counter the regression silently
+			// surfaces as either (a) cross-aspId routing (a knock for X
+			// gets resources from Y) or (b) ErrResourceUnknownASP if
+			// no rows match. Either shape is bad; the counter lets the
+			// regression alarm at threshold > 0 rather than wait for
+			// the downstream symptom. Mirrors the cross-partition
+			// branch above.
+			log.Warning("resource lookup: skipping row with mismatched auth_service_id partition=%q row.auth_service_id=%q requested aspId=%q resource_id=%q (FilterExpression regression — investigate)",
+				l.customerID, row.AuthServiceID, aspId, row.ResourceID)
+			if l.metrics != nil {
+				l.metrics.IncrCounter(MetricResourceLookupAspMismatch)
+			}
 			continue
 		}
 		if row.ResourceID == "" {
@@ -459,28 +483,34 @@ func (l *ResourceLookup) queryAndCache(ctx context.Context, aspId string) (*comm
 			openTime = math.MaxInt32
 		}
 
-		// Mirror the TOML overlay's resource shape exactly so the
-		// in-memory ResourceData this resolver produces is
-		// indistinguishable from the one config.go::loadResources
-		// would produce from the baked overlay:
-		//   - Hostname carries the customer-facing ingress
-		//     (ResourceFQDN); the layerv plugin's callback path
+		// Build the in-memory ResourceData the agent plugin's
+		// callback path consumes. The shape contract:
+		//   - Hostname carries the customer-facing ingress (from
+		//     row.ResourceFQDN); the agent plugin's callback path
 		//     (handleNhpOpenResource → ResourceData.DestHost()) falls
 		//     back to Hostname when Addr.Ip is empty, so leaving Ip
-		//     blank matches the overlay invariant.
-		//   - row.DestHost is intentionally NOT propagated separately;
-		//     today the TF writer collapses dest_host == resource_fqdn
-		//     for FRPS (the agent dials FRPS directly) and DestHost()
-		//     fall-back via Hostname covers the case. If a future row
-		//     genuinely splits the two (proxy/gateway in front of the
-		//     dial target), revisit so dest_host populates Addr.Ip.
+		//     blank is load-bearing — the AC's
+		//     applyDefaultIpSubstitution writes LOCAL_IP at ipset-time.
+		//   - row.DestHost is intentionally NOT propagated; today the
+		//     TF writer puts the internal Cloud Map name in dest_host
+		//     and the customer-facing ingress in resource_fqdn (= the
+		//     two values genuinely diverge, see terraform/resources.tf
+		//     `tunnel_server_resource`). The bridge surfaces only the
+		//     ingress to the agent (via Hostname); the internal name
+		//     stays informational. If a future row needs both legs
+		//     visible (proxy/gateway in front of dial target), revisit
+		//     so dest_host populates Addr.Ip.
 		//   - Resources map keys MUST match the outer ResourceGroups
-		//     key (per the overlay's inner-equals-outer invariant
-		//     fenced by TestTunnelServerResourceTOMLOverlay_SchemaMatchesAuthSvcProviderMap).
-		//   - SkipAuth=true matches the overlay's `SkipAuth = true`
-		//     (terraform/resources.tf). The layerv plugin fences on
-		//     this; a mismatch surfaces as ErrBackendAuthRequired
-		//     (52007) on the first knock instead of dark-routing.
+		//     key (inner-equals-outer is load-bearing — the agent
+		//     plugin's `helper.AspData.ResourceGroups[req.Msg.ResourceId]`
+		//     lookup keys on the outer; the inner Resources map is
+		//     iterated by handleNhpOpenResource to issue per-resource
+		//     AC ops).
+		//   - SkipAuth=true is hardcoded here because the agent
+		//     plugin fences on res.SkipAuth and refuses with
+		//     ErrBackendAuthRequired (52007) if false. The
+		//     X25519+DDB pubkey lookup upstream IS the auth gate;
+		//     this catalog path is post-auth.
 		resData := &common.ResourceData{
 			ResourceGroup: common.ResourceGroup{
 				AuthServiceId: aspId,

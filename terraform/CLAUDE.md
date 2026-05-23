@@ -291,7 +291,8 @@ interpolation. When the interpolated value is a multi-line string, the
 TOML/whatever body is injected into the comment block, and lines of
 the body that don't start with `#` get bash-executed when the rendered
 script runs. Past hit: sandbox server fleet broken when
-`${frps_resource_toml_overlay}` was interpolated unescaped in
+`${frps_resource_toml_overlay}` (a multi-line TOML render, now retired
+with the #1976 cutover) was interpolated unescaped in
 `modules/compute/user_data.sh.tpl` bash comments once #2035 made the
 overlay non-empty. Surfaced as nhp run 26194839994 (post-#2043
 sandbox apply); fixed in PR #2044.
@@ -303,10 +304,10 @@ emits the literal token instead of expanding). Single-value scalars
 (ports, hostnames, region names, etc.) don't need escaping — their
 single-line render stays inside the comment.
 
-Enforcement today is per-template: `terraform_data.frps_overlay_comment_escape_fence`
-in `modules/compute/main.tf` refuses apply if the compute template
-regresses. The same fence pattern should be added in `modules/ac/main.tf`
-the first time a multi-line var lands in `modules/ac/user_data.sh.tpl`
-(today's AC interpolations are all single-value primitives, so no
-fence is needed yet). Generalization to a single allowlist-based fence
-across both templates is tracked in #2045.
+Today's compute and AC templates carry only single-value primitives,
+so no per-template fence is wired. The compute fence was retired
+alongside the FRPS overlay (#1976). The first time a multi-line var
+lands in either `*.sh.tpl`, re-add a `terraform_data` precondition
+analogous to the prior `frps_overlay_comment_escape_fence` that
+regex-checked the rendered template. Generalization to a single
+allowlist-based fence across both templates is tracked in #2045.

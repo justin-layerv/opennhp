@@ -20,7 +20,7 @@ import (
 	// Import statically compiled plugins to trigger their init() registration
 	// These are in staticplugins/ (not plugins/) because they're compiled into the binary,
 	// not built as .so files by the plugins Makefile
-	_ "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/layerv"
+	_ "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/agent"
 	_ "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/oidc"
 	_ "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/passcode"
 	_ "github.com/OpenNHP/opennhp/endpoints/server/staticplugins/qurl"

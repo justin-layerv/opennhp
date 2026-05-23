@@ -1002,9 +1002,12 @@ resource "terraform_data" "ac_user_data_frps_control_traefik_render_check" {
 # more important to flag than the compute sibling.
 #
 # Bash-comment escape fence for multi-line `qurl_router_frp_server_urls`.
-# Mirrors `terraform_data.frps_overlay_comment_escape_fence` in
-# modules/compute/main.tf (see terraform/CLAUDE.md "templatefile() multi-line
-# vars in bash comments must be escaped"). The list interpolates to multiple
+# Implements the rule documented in terraform/CLAUDE.md
+# ("templatefile() multi-line vars in bash comments must be escaped"). The
+# compute module previously carried a sibling fence on the FRPS overlay var
+# (`terraform_data.frps_overlay_comment_escape_fence`), retired in #1976
+# when the overlay itself was deleted; this AC-side fence is now the only
+# live instance of the pattern. The list interpolates to multiple
 # `"http://..."` TOML lines; any future `${qurl_router_frp_server_urls}` ref
 # inside a bash comment in user_data.sh.tpl would inject body lines that
 # don't start with `#`, and bash would execute them when the rendered script
@@ -1439,7 +1442,7 @@ resource "aws_lb_listener" "https" {
 #
 # Public TCP listener for the FRPS control channel at
 # `connect.layerv.{ai,xyz}:${frp_control_port}`. This is the customer-facing
-# ingress that the FRPS resource.toml overlay's `Hostname` field resolves to;
+# ingress that the DDB seed row's `resource_fqdn` field (→ ResourceInfo.Hostname) resolves to;
 # the AC kernel's existing ipset fence (default-DROP INPUT, permit via
 # `-A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT`) gates each
 # SYN per NHP knock — a coarse source-IP pre-filter while the AC is in the

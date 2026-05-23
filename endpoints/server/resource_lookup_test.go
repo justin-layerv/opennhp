@@ -173,11 +173,11 @@ func newTestResourceLookup(t *testing.T, q resourcesQuerier, applier aspDataAppl
 }
 
 // putTunnelServerRow is a convenience around put() for the standard
-// qurl-tunnel-server row shape — `aspId="layerv"` + `ACId="layerv-ac-tf"`
+// qurl-tunnel-server row shape — `aspId="agent"` + `ACId="layerv-ac-tf"`
 // + the customer-facing AC ingress as Hostname/dest_host. Single
 // fixed shape today; the only aspId in active use.
 func putTunnelServerRow(q *fakeResourcesQuerier, resourceID string) {
-	q.put(nhpSystemCustomerID, resourceID, "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 120)
+	q.put(nhpSystemCustomerID, resourceID, "agent", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 120)
 }
 
 // TestResourceLookup_CacheMissThenHit asserts the standard flow:
@@ -190,15 +190,15 @@ func TestResourceLookup_CacheMissThenHit(t *testing.T) {
 
 	l := newTestResourceLookup(t, q, applier)
 
-	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 	if err != nil {
 		t.Fatalf("first lookup err: %v", err)
 	}
 	if asp == nil {
 		t.Fatal("first lookup returned nil aspData")
 	}
-	if asp.AuthSvcId != "layerv" {
-		t.Errorf("AuthSvcId = %q, want %q", asp.AuthSvcId, "layerv")
+	if asp.AuthSvcId != "agent" {
+		t.Errorf("AuthSvcId = %q, want %q", asp.AuthSvcId, "agent")
 	}
 	if _, ok := asp.ResourceGroups["qurl-tunnel-server"]; !ok {
 		t.Errorf("ResourceGroups missing qurl-tunnel-server; got keys = %v", aspKeys(asp))
@@ -210,7 +210,7 @@ func TestResourceLookup_CacheMissThenHit(t *testing.T) {
 		t.Errorf("applyAspMapDelta calls after first lookup = %d, want 1", got)
 	}
 
-	asp2, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	asp2, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 	if err != nil {
 		t.Fatalf("second lookup err: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestResourceLookup_CacheExpiry(t *testing.T) {
 	t0 := time.Now()
 	l.now = func() time.Time { return t0 }
 
-	if _, err := l.LookupAuthServiceProvider(context.Background(), "layerv"); err != nil {
+	if _, err := l.LookupAuthServiceProvider(context.Background(), "agent"); err != nil {
 		t.Fatalf("warm lookup err: %v", err)
 	}
 	if got := q.callCount(); got != 1 {
@@ -252,7 +252,7 @@ func TestResourceLookup_CacheExpiry(t *testing.T) {
 	// Advance past the TTL — the next lookup must re-Query.
 	l.now = func() time.Time { return t0.Add(resourceLookupCacheTTL + time.Second) }
 
-	if _, err := l.LookupAuthServiceProvider(context.Background(), "layerv"); err != nil {
+	if _, err := l.LookupAuthServiceProvider(context.Background(), "agent"); err != nil {
 		t.Fatalf("post-expiry lookup err: %v", err)
 	}
 	if got := q.callCount(); got != 2 {
@@ -269,7 +269,7 @@ func TestResourceLookup_CacheExpiry(t *testing.T) {
 // waiting for TTL).
 func TestResourceLookup_UnknownASP(t *testing.T) {
 	q := newFakeResourcesQuerier()
-	// Row exists under "layerv" but caller asks for "other-asp".
+	// Row exists under "agent" but caller asks for "other-asp".
 	putTunnelServerRow(q, "qurl-tunnel-server")
 	applier := &captureApplier{}
 	l := newTestResourceLookup(t, q, applier)
@@ -297,7 +297,7 @@ func TestResourceLookup_EmptyPartition(t *testing.T) {
 	applier := &captureApplier{}
 	l := newTestResourceLookup(t, q, applier)
 
-	_, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	_, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 	if !errors.Is(err, ErrResourceUnknownASP) {
 		t.Fatalf("err = %v, want ErrResourceUnknownASP for empty partition", err)
 	}
@@ -315,7 +315,7 @@ func TestResourceLookup_DDBErrorRetryAfter(t *testing.T) {
 	applier := &captureApplier{}
 	l := newTestResourceLookup(t, q, applier)
 
-	_, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	_, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 	if !errors.Is(err, ErrResourceLookupRetryAfter) {
 		t.Fatalf("err = %v, want wrap of ErrResourceLookupRetryAfter", err)
 	}
@@ -324,22 +324,28 @@ func TestResourceLookup_DDBErrorRetryAfter(t *testing.T) {
 	}
 
 	// Confirm not cached: retry re-Queries.
-	_, _ = l.LookupAuthServiceProvider(context.Background(), "layerv")
+	_, _ = l.LookupAuthServiceProvider(context.Background(), "agent")
 	if got := q.callCount(); got != 2 {
 		t.Errorf("DDB calls = %d, want 2 (transient error must not poison cache)", got)
 	}
 }
 
-// TestResourceLookup_HappyPathMatchesOverlay asserts the resolved
-// *AuthServiceProviderData matches the shape PR #2091's plugin reads
-// from helper.AspData when populated from the baked TOML overlay.
-// This is the contract that lets the layerv plugin work unchanged.
-func TestResourceLookup_HappyPathMatchesOverlay(t *testing.T) {
+// TestResourceLookup_HappyPathMatchesPluginReadShape asserts the
+// resolved *AuthServiceProviderData matches the shape the agent
+// plugin (endpoints/server/staticplugins/agent) reads from
+// helper.AspData. This is the contract that lets the bridge populate
+// authServiceMap[aspId] from DDB without the plugin needing to know.
+// Pre-#1976 the equivalent shape came from a baked TOML overlay; the
+// invariants the test fences (inner-equals-outer key, SkipAuth=true,
+// Hostname-without-Addr.Ip) survived the overlay's removal — the
+// plugin reads the same fields regardless of which loader produced
+// them.
+func TestResourceLookup_HappyPathMatchesPluginReadShape(t *testing.T) {
 	q := newFakeResourcesQuerier()
 	putTunnelServerRow(q, "qurl-tunnel-server")
 	l := newTestResourceLookup(t, q, &captureApplier{})
 
-	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 	if err != nil {
 		t.Fatalf("lookup err: %v", err)
 	}
@@ -348,8 +354,8 @@ func TestResourceLookup_HappyPathMatchesOverlay(t *testing.T) {
 	if !ok {
 		t.Fatalf("ResourceGroups missing qurl-tunnel-server; got %v", aspKeys(asp))
 	}
-	if got := group.AuthServiceId; got != "layerv" {
-		t.Errorf("group.AuthServiceId = %q, want %q", got, "layerv")
+	if got := group.AuthServiceId; got != "agent" {
+		t.Errorf("group.AuthServiceId = %q, want %q", got, "agent")
 	}
 	if got := group.ResourceId; got != "qurl-tunnel-server" {
 		t.Errorf("group.ResourceId = %q, want %q", got, "qurl-tunnel-server")
@@ -357,13 +363,13 @@ func TestResourceLookup_HappyPathMatchesOverlay(t *testing.T) {
 	if got := group.OpenTime; got != 120 {
 		t.Errorf("group.OpenTime = %d, want 120", got)
 	}
-	// SkipAuth=true is load-bearing — the layerv plugin's AuthWithNHP
+	// SkipAuth=true is load-bearing — the agent plugin's AuthWithNHP
 	// fences on `if !res.SkipAuth { return ErrBackendAuthRequired }`.
-	// The layerv plugin fences on SkipAuth=true; the DDB resolver
+	// The agent plugin fences on SkipAuth=true; the DDB resolver
 	// must populate the same field so the plugin path stays uniform
 	// across the TOML-overlay and DDB-bridge code paths.
 	if !group.SkipAuth {
-		t.Error("group.SkipAuth = false, want true (layerv plugin fences on this — see endpoints/server/staticplugins/layerv/main.go::AuthWithNHP)")
+		t.Error("group.SkipAuth = false, want true (agent plugin fences on this — see endpoints/server/staticplugins/agent/main.go::AuthWithNHP)")
 	}
 
 	res, ok := group.Resources["qurl-tunnel-server"]
@@ -379,7 +385,7 @@ func TestResourceLookup_HappyPathMatchesOverlay(t *testing.T) {
 	if res.Addr == nil {
 		t.Fatal("res.Addr = nil, want non-nil NetAddress")
 	}
-	// Addr.Ip is intentionally empty — the layerv plugin's downstream
+	// Addr.Ip is intentionally empty — the agent plugin's downstream
 	// handleNhpOpenResource path falls back to Hostname via DestHost().
 	// Mirror the overlay invariant exactly.
 	if res.Addr.Ip != "" {
@@ -403,7 +409,7 @@ func TestResourceLookup_SkipsMalformedRow_ContinuesWithRest(t *testing.T) {
 	putTunnelServerRow(q, "qurl-tunnel-server")
 	l := newTestResourceLookup(t, q, &captureApplier{})
 
-	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 	if err != nil {
 		t.Fatalf("lookup err: %v, want success despite malformed row", err)
 	}
@@ -417,37 +423,50 @@ func TestResourceLookup_SkipsMalformedRow_ContinuesWithRest(t *testing.T) {
 
 // TestResourceLookup_FiltersByAuthServiceID asserts that a partition
 // carrying rows for multiple aspIds returns only those matching the
-// requested aspId. Today the system partition carries only "layerv"
+// requested aspId. Today the system partition carries only "agent"
 // rows; the filter is defensive for a future multi-aspId schema.
 //
 // Asserts BOTH directions — without the reverse-direction
 // assertion, a regression hardcoding the filter to
-// `row.AuthServiceID == "layerv"` would pass on the layerv side
+// `row.AuthServiceID == "agent"` would pass on the agent side
 // without ever testing whether other aspIds are correctly served
 // only their own rows.
+//
+// Implementation note: because `fakeResourcesQuerier` does NOT honor
+// FilterExpression server-side (it returns the whole partition),
+// this test inherently traverses the client-side
+// `row.AuthServiceID != aspId` defense-in-depth branch (the same one
+// `TestResourceLookup_SkipsAspMismatchRow` fences explicitly with a
+// counter assertion). This test uses `&captureApplier{}` with no
+// metrics attached, so `IncrCounter` is a no-op here — if a future
+// maintainer adds `SetMetrics(counter)` to this test and asserts
+// `counter.counts[MetricResourceLookupAspMismatch] == 0`, they'll
+// be surprised because the cross-aspId rows ARE traversing the
+// mismatch branch under the fake. The counter fence lives in the
+// sibling SkipsAspMismatchRow test, not here.
 func TestResourceLookup_FiltersByAuthServiceID(t *testing.T) {
 	q := newFakeResourcesQuerier()
 	// Two aspIds sharing the partition.
-	q.put(nhpSystemCustomerID, "qurl-tunnel-server", "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 120)
+	q.put(nhpSystemCustomerID, "qurl-tunnel-server", "agent", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 120)
 	q.put(nhpSystemCustomerID, "other-res", "other-asp", "other-ac", "other.example.com", "other.example.com", 8000, 60)
 	l := newTestResourceLookup(t, q, &captureApplier{})
 
-	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 	if err != nil {
 		t.Fatalf("lookup err: %v", err)
 	}
 	if _, ok := asp.ResourceGroups["qurl-tunnel-server"]; !ok {
-		t.Errorf("layerv must include qurl-tunnel-server; got %v", aspKeys(asp))
+		t.Errorf("agent must include qurl-tunnel-server; got %v", aspKeys(asp))
 	}
 	if _, ok := asp.ResourceGroups["other-res"]; ok {
-		t.Errorf("layerv aspData leaked other-asp's resource; rows must be filtered by auth_service_id")
+		t.Errorf("agent aspData leaked other-asp's resource; rows must be filtered by auth_service_id")
 	}
 
 	// Reverse direction: requesting "other-asp" must NOT leak any
-	// "layerv" rows. A regression that hardcoded the filter to
-	// `row.AuthServiceID == "layerv"` (or any constant) would
+	// "agent" rows. A regression that hardcoded the filter to
+	// `row.AuthServiceID == "agent"` (or any constant) would
 	// either return an empty/unknown result for "other-asp" OR
-	// include layerv's rows in the response — both detectable here.
+	// include agent's rows in the response — both detectable here.
 	asp2, err := l.LookupAuthServiceProvider(context.Background(), "other-asp")
 	if err != nil {
 		t.Fatalf("reverse lookup err: %v", err)
@@ -456,7 +475,7 @@ func TestResourceLookup_FiltersByAuthServiceID(t *testing.T) {
 		t.Errorf("other-asp must include other-res; got %v", aspKeys(asp2))
 	}
 	if _, ok := asp2.ResourceGroups["qurl-tunnel-server"]; ok {
-		t.Errorf("other-asp aspData leaked layerv's resource; rows must be filtered by auth_service_id")
+		t.Errorf("other-asp aspData leaked agent's resource; rows must be filtered by auth_service_id")
 	}
 	if asp2.AuthSvcId != "other-asp" {
 		t.Errorf("AuthSvcId = %q, want %q (resolver must stamp the requested aspId on the result, not the row's aspId)", asp2.AuthSvcId, "other-asp")
@@ -479,10 +498,10 @@ func TestResourceLookup_OpenTimeClampsNonPositive(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			q := newFakeResourcesQuerier()
-			q.put(nhpSystemCustomerID, "qurl-tunnel-server", "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, tc.stored)
+			q.put(nhpSystemCustomerID, "qurl-tunnel-server", "agent", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, tc.stored)
 			l := newTestResourceLookup(t, q, &captureApplier{})
 
-			asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+			asp, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 			if err != nil {
 				t.Fatalf("lookup err: %v", err)
 			}
@@ -505,10 +524,10 @@ func TestResourceLookup_OpenTimeClampsNonPositive(t *testing.T) {
 func TestResourceLookup_OpenTimeClampsOverflow(t *testing.T) {
 	q := newFakeResourcesQuerier()
 	// 5 billion exceeds MaxUint32 (~4.29 billion) — must clamp.
-	q.put(nhpSystemCustomerID, "qurl-tunnel-server", "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 5_000_000_000)
+	q.put(nhpSystemCustomerID, "qurl-tunnel-server", "agent", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 5_000_000_000)
 	l := newTestResourceLookup(t, q, &captureApplier{})
 
-	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 	if err != nil {
 		t.Fatalf("lookup err: %v", err)
 	}
@@ -527,6 +546,71 @@ func TestResourceLookup_OpenTimeClampsOverflow(t *testing.T) {
 	}
 }
 
+// TestResourceLookup_SkipsAspMismatchRow asserts the defense-in-depth
+// fence against a future regression in the DDB FilterExpression
+// (`auth_service_id = :asp`) that lets rows for the wrong aspId
+// leak through to the client-side loop. The resolver MUST skip rows
+// whose `row.AuthServiceID` doesn't match the requested aspId, and
+// fires MetricResourceLookupAspMismatch (dedicated counter —
+// operators alarm at `> 0` because a mismatched aspId means a knock
+// for aspId X gets resources from aspId Y in its ack, a potential
+// cross-aspId routing bug).
+//
+// The fake querier doesn't honor FilterExpression — it returns the
+// whole partition — so a row injected with a different
+// auth_service_id reaches the client-side check naturally without
+// the server-side filter being involved. This is the test path that
+// exercises the defense the production FilterExpression makes
+// unreachable in practice.
+//
+// The counter assertion is load-bearing: the whole justification
+// for splitting MetricResourceLookupAspMismatch out of
+// MetricResourceLookupMalformedRow was the differential alarm
+// threshold (`> 0` for aspId-mismatch vs. ratio-based for
+// malformed-row). If a future refactor drops the IncrCounter call,
+// the row is still filtered by the `continue`, the catalog still
+// returns the rest of the rows, the operator alarm silently goes
+// dark — and the row-presence asserts below would still pass. The
+// counter assertion is the only thing that catches that regression.
+func TestResourceLookup_SkipsAspMismatchRow(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	// Inject a row under the system partition tagged with a
+	// different auth_service_id than the resolver will ask for.
+	// In production this row would be filtered server-side; the
+	// fake skips that filter, so the row reaches the client-side
+	// `row.AuthServiceID != aspId` check.
+	q.put(nhpSystemCustomerID, "other-aspid-resource", "other-aspid", "layerv-ac-tf", "other.example.com", "other.example.com", 7000, 120)
+	putTunnelServerRow(q, "good-resource")
+
+	counter := &fakeCounterIncrementer{}
+	l := newTestResourceLookup(t, q, &captureApplier{})
+	l.SetMetrics(counter)
+
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "agent")
+	if err != nil {
+		t.Fatalf("lookup err: %v, want success despite aspId-mismatched row", err)
+	}
+	if _, ok := asp.ResourceGroups["good-resource"]; !ok {
+		t.Errorf("good-resource missing; aspId-mismatched row must not dark the rest of the catalog")
+	}
+	if _, ok := asp.ResourceGroups["other-aspid-resource"]; ok {
+		t.Errorf("other-aspid-resource present in asp for aspId=\"agent\"; the row's auth_service_id=\"other-aspid\" MUST be skipped to prevent cross-aspId resource routing under a future FilterExpression regression (e.g., a knock for agent gets resources from other-aspid in the ack)")
+	}
+
+	// MetricResourceLookupAspMismatch MUST fire exactly once — one
+	// mismatched row in. A future refactor that drops the IncrCounter
+	// call (leaving the `continue` in place) would still pass the row-
+	// filtering asserts above, silently darken the operator alarm,
+	// and surface only when an actual filter regression in prod went
+	// unnoticed because the dashboard stayed at zero. This is the
+	// fence against that.
+	counter.mu.Lock()
+	defer counter.mu.Unlock()
+	if got := counter.counts[MetricResourceLookupAspMismatch]; got != 1 {
+		t.Errorf("MetricResourceLookupAspMismatch fire count = %d, want 1 — the dedicated counter exists explicitly for `> 0` alarm thresholds (see msghandler.go); a regression that drops the IncrCounter call leaves the row-filtering pass but silently darkens the alarm path", got)
+	}
+}
+
 // TestResourceLookup_SkipsCrossPartitionRow asserts the
 // defense-in-depth fence against a future regression in
 // KeyConditionExpression that lets cross-partition rows leak.
@@ -541,11 +625,11 @@ func TestResourceLookup_SkipsCrossPartitionRow(t *testing.T) {
 	// honor KeyConditionExpression — both rows reach the resolver
 	// loop. The resolver's defense-in-depth check filters the
 	// cross-partition one client-side.
-	q.put("ZZZZZZZZZZZZZZZZZZZZZZZZZZ", "leaked-resource", "layerv", "layerv-ac-tf", "leaked.example.com", "leaked.example.com", 7000, 120)
+	q.put("ZZZZZZZZZZZZZZZZZZZZZZZZZZ", "leaked-resource", "agent", "layerv-ac-tf", "leaked.example.com", "leaked.example.com", 7000, 120)
 	putTunnelServerRow(q, "good-resource")
 
 	l := newTestResourceLookup(t, q, &captureApplier{})
-	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 	if err != nil {
 		t.Fatalf("lookup err: %v, want success despite cross-partition row", err)
 	}
@@ -602,11 +686,11 @@ func TestForwarder_ThreadsLifecycleCtxToResolver(t *testing.T) {
 func TestResourceLookup_SkipsEmptyResourceID(t *testing.T) {
 	q := newFakeResourcesQuerier()
 	// A row with empty resource_id alongside a good row.
-	q.put(nhpSystemCustomerID, "", "layerv", "layerv-ac-tf", "host.example.com", "host.example.com", 7000, 120)
-	q.put(nhpSystemCustomerID, "qurl-tunnel-server", "layerv", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 120)
+	q.put(nhpSystemCustomerID, "", "agent", "layerv-ac-tf", "host.example.com", "host.example.com", 7000, 120)
+	q.put(nhpSystemCustomerID, "qurl-tunnel-server", "agent", "layerv-ac-tf", "connect.layerv.xyz", "connect.layerv.xyz", 7000, 120)
 	l := newTestResourceLookup(t, q, &captureApplier{})
 
-	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 	if err != nil {
 		t.Fatalf("lookup err: %v", err)
 	}
@@ -632,7 +716,7 @@ func TestResourceLookup_CacheHitRepublishes(t *testing.T) {
 	l := newTestResourceLookup(t, q, applier)
 
 	// Warm the cache.
-	asp1, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	asp1, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 	if err != nil {
 		t.Fatalf("warm err: %v", err)
 	}
@@ -643,7 +727,7 @@ func TestResourceLookup_CacheHitRepublishes(t *testing.T) {
 	// Second lookup: cache hit. applier was NOT
 	// called; now it IS, so a future authServiceMap-clearing event
 	// self-heals on the next knock.
-	asp2, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	asp2, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 	if err != nil {
 		t.Fatalf("hit err: %v", err)
 	}
@@ -674,13 +758,13 @@ func TestResourceLookup_CacheHitRepublishes(t *testing.T) {
 // publisher (metrics.NewPublisherForTest).
 func TestUdpServer_ResolveAuthSvcProvider(t *testing.T) {
 	t.Run("in_memory_hit_short_circuits_no_counters", func(t *testing.T) {
-		existing := &common.AuthServiceProviderData{AuthSvcId: "layerv"}
+		existing := &common.AuthServiceProviderData{AuthSvcId: "agent"}
 		s := &UdpServer{
 			metrics:        metrics.NewPublisherForTest(t),
-			authServiceMap: common.AuthSvcProviderMap{"layerv": existing},
+			authServiceMap: common.AuthSvcProviderMap{"agent": existing},
 		}
 
-		got := s.ResolveAuthSvcProvider(context.Background(), "layerv", "test")
+		got := s.ResolveAuthSvcProvider(context.Background(), "agent", "test")
 		if got != existing {
 			t.Errorf("ResolveAuthSvcProvider = %v, want existing in-memory entry %v (must short-circuit without DDB call)", got, existing)
 		}
@@ -701,7 +785,7 @@ func TestUdpServer_ResolveAuthSvcProvider(t *testing.T) {
 			// resourceLookup intentionally nil — non-cloud deployment.
 		}
 
-		got := s.ResolveAuthSvcProvider(context.Background(), "layerv", "test")
+		got := s.ResolveAuthSvcProvider(context.Background(), "agent", "test")
 		if got != nil {
 			t.Errorf("ResolveAuthSvcProvider with nil lookup = %v, want nil", got)
 		}
@@ -727,7 +811,7 @@ func TestUdpServer_ResolveAuthSvcProvider(t *testing.T) {
 
 		// nil ctx: helper must substitute context.Background rather
 		// than nil-deref on the WithTimeout call inside the lookup.
-		got := s.ResolveAuthSvcProvider(nil, "layerv", "test") //nolint:staticcheck // intentional nil-ctx test
+		got := s.ResolveAuthSvcProvider(nil, "agent", "test") //nolint:staticcheck // intentional nil-ctx test
 		if got == nil {
 			t.Errorf("ResolveAuthSvcProvider with nil ctx = nil, want resolved aspData (helper must fall back to context.Background)")
 		}
@@ -747,7 +831,7 @@ func TestUdpServer_ResolveAuthSvcProvider(t *testing.T) {
 		}
 		s.resourceLookup = lookup
 
-		got := s.ResolveAuthSvcProvider(context.Background(), "layerv", "test")
+		got := s.ResolveAuthSvcProvider(context.Background(), "agent", "test")
 		if got != nil {
 			t.Errorf("ResolveAuthSvcProvider on unknown aspId = %v, want nil", got)
 		}
@@ -779,7 +863,7 @@ func TestUdpServer_ResolveAuthSvcProvider(t *testing.T) {
 		}
 		s.resourceLookup = lookup
 
-		got := s.ResolveAuthSvcProvider(context.Background(), "layerv", "test")
+		got := s.ResolveAuthSvcProvider(context.Background(), "agent", "test")
 		if got != nil {
 			t.Errorf("ResolveAuthSvcProvider on DDB error = %v, want nil", got)
 		}
@@ -814,7 +898,7 @@ func TestUdpServer_ResolveAuthSvcProvider(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel() // pre-canceled so ctx.Err() != nil at the switch site
 
-		got := s.ResolveAuthSvcProvider(ctx, "layerv", "test")
+		got := s.ResolveAuthSvcProvider(ctx, "agent", "test")
 		if got != nil {
 			t.Errorf("ResolveAuthSvcProvider on shutdown = %v, want nil", got)
 		}
@@ -840,7 +924,7 @@ func TestResourceLookup_PaginationWarningFires(t *testing.T) {
 	putTunnelServerRow(q, "qurl-tunnel-server")
 
 	l := newTestResourceLookup(t, q, &captureApplier{})
-	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 	if err != nil {
 		t.Fatalf("lookup err: %v, want success (page-1 rows must still resolve)", err)
 	}
@@ -1041,23 +1125,23 @@ func TestEnsurePluginLoaded_FailureNotSticky(t *testing.T) {
 // for the steady-state knock path.
 func TestApplyAspMapDelta_FastPathPointerEqual(t *testing.T) {
 	fresh := &common.AuthServiceProviderData{
-		AuthSvcId:      "layerv",
+		AuthSvcId:      "agent",
 		ResourceGroups: common.ResourceGroupMap{},
 	}
 	s := &UdpServer{
-		authServiceMap: common.AuthSvcProviderMap{"layerv": fresh},
+		authServiceMap: common.AuthSvcProviderMap{"agent": fresh},
 	}
 	mapHeaderBefore := reflect.ValueOf(s.authServiceMap).Pointer()
 
 	// Same pointer — must short-circuit; no fresh allocation, no swap.
-	s.applyAspMapDelta("layerv", fresh)
+	s.applyAspMapDelta("agent", fresh)
 	mapHeaderAfter := reflect.ValueOf(s.authServiceMap).Pointer()
 
 	if mapHeaderBefore != mapHeaderAfter {
 		t.Errorf("authServiceMap hmap reallocated despite pointer-equal install (before=%#x after=%#x); fast path must short-circuit",
 			mapHeaderBefore, mapHeaderAfter)
 	}
-	if s.authServiceMap["layerv"] != fresh {
+	if s.authServiceMap["agent"] != fresh {
 		t.Errorf("entry mutated despite fast-path no-op")
 	}
 }
@@ -1072,7 +1156,7 @@ func TestResourceLookup_AppliesToHostServer(t *testing.T) {
 	applier := &captureApplier{}
 	l := newTestResourceLookup(t, q, applier)
 
-	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 	if err != nil {
 		t.Fatalf("lookup err: %v", err)
 	}
@@ -1081,8 +1165,8 @@ func TestResourceLookup_AppliesToHostServer(t *testing.T) {
 	if !ok {
 		t.Fatal("applyAspMapDelta was not called on successful lookup")
 	}
-	if last.aspId != "layerv" {
-		t.Errorf("applied aspId = %q, want %q", last.aspId, "layerv")
+	if last.aspId != "agent" {
+		t.Errorf("applied aspId = %q, want %q", last.aspId, "agent")
 	}
 	if last.asp != asp {
 		t.Errorf("applied aspData pointer differs from returned aspData; want the same *AuthServiceProviderData published into the host map")
@@ -1097,7 +1181,7 @@ func TestResourceLookup_NilApplier(t *testing.T) {
 	putTunnelServerRow(q, "qurl-tunnel-server")
 	l := newTestResourceLookup(t, q, nil)
 
-	asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 	if err != nil {
 		t.Fatalf("lookup err: %v", err)
 	}
@@ -1132,7 +1216,7 @@ func TestResourceLookup_EmptyAspIdShortCircuits(t *testing.T) {
 // "lookup disabled" callers.
 func TestResourceLookup_NilLookup(t *testing.T) {
 	var l *ResourceLookup
-	_, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	_, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 	if !errors.Is(err, ErrResourceUnknownASP) {
 		t.Errorf("nil lookup err = %v, want ErrResourceUnknownASP", err)
 	}
@@ -1147,7 +1231,7 @@ func TestResourceLookup_NilQuerier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewResourceLookup(nil querier): %v", err)
 	}
-	_, lookupErr := l.LookupAuthServiceProvider(context.Background(), "layerv")
+	_, lookupErr := l.LookupAuthServiceProvider(context.Background(), "agent")
 	if !errors.Is(lookupErr, ErrResourceUnknownASP) {
 		t.Errorf("nil-querier lookup err = %v, want ErrResourceUnknownASP", lookupErr)
 	}
@@ -1196,7 +1280,7 @@ func TestResourceLookup_SingleflightDedupsConcurrentMiss(t *testing.T) {
 	for i := 0; i < N; i++ {
 		go func() {
 			startWg.Done()
-			asp, err := l.LookupAuthServiceProvider(context.Background(), "layerv")
+			asp, err := l.LookupAuthServiceProvider(context.Background(), "agent")
 			results <- result{asp: asp, err: err}
 		}()
 	}
@@ -1232,7 +1316,7 @@ func TestResourceLookup_SingleflightDedupsConcurrentMiss(t *testing.T) {
 // UdpServer.applyAspMapDelta concurrency contract: the live map's
 // pointer identity changes (fresh allocation), and existing entries
 // are preserved. This is the Option-A pattern that lets the
-// layerv plugin's lock-free helper.AspData reads stay safe against
+// agent plugin's lock-free helper.AspData reads stay safe against
 // concurrent publishes.
 func TestApplyAspMapDelta_BuildFreshThenSwap(t *testing.T) {
 	s := &UdpServer{
@@ -1245,13 +1329,13 @@ func TestApplyAspMapDelta_BuildFreshThenSwap(t *testing.T) {
 	oldMapHeader := reflect.ValueOf(s.authServiceMap).Pointer()
 
 	fresh := &common.AuthServiceProviderData{
-		AuthSvcId:      "layerv",
+		AuthSvcId:      "agent",
 		ResourceGroups: common.ResourceGroupMap{},
 	}
-	s.applyAspMapDelta("layerv", fresh)
+	s.applyAspMapDelta("agent", fresh)
 
-	if got := s.authServiceMap["layerv"]; got != fresh {
-		t.Errorf("authServiceMap[\"layerv\"] = %v, want fresh pointer", got)
+	if got := s.authServiceMap["agent"]; got != fresh {
+		t.Errorf("authServiceMap[\"agent\"] = %v, want fresh pointer", got)
 	}
 	if got := s.authServiceMap["existing"]; got != oldExisting {
 		t.Errorf("authServiceMap[\"existing\"] mutated; build-fresh-then-swap must preserve other entries unchanged")
@@ -1270,8 +1354,8 @@ func TestApplyAspMapDelta_BuildFreshThenSwap(t *testing.T) {
 		t.Errorf("authServiceMap hmap pointer unchanged (oldHeader=%#x newHeader=%#x); build-fresh-then-swap must allocate a fresh map so concurrent lock-free readers holding the old reference observe an immutable snapshot",
 			oldMapHeader, newMapHeader)
 	}
-	if _, ok := oldMap["layerv"]; ok {
-		t.Errorf("old map snapshot mutated to include layerv; build-fresh-then-swap must NOT touch the published-then-orphaned map")
+	if _, ok := oldMap["agent"]; ok {
+		t.Errorf("old map snapshot mutated to include agent; build-fresh-then-swap must NOT touch the published-then-orphaned map")
 	}
 }
 
@@ -1290,8 +1374,8 @@ func TestApplyAspMapDelta_NoopOnNil(t *testing.T) {
 		t.Errorf("empty aspId installed entry; len = %d, want 0", len(s.authServiceMap))
 	}
 
-	s.applyAspMapDelta("layerv", nil)
-	if _, ok := s.authServiceMap["layerv"]; ok {
+	s.applyAspMapDelta("agent", nil)
+	if _, ok := s.authServiceMap["agent"]; ok {
 		t.Errorf("nil aspData installed entry; readers would nil-deref through helper.AspData")
 	}
 }

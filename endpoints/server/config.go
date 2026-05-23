@@ -823,23 +823,38 @@ func (s *UdpServer) updateResources(aspMap common.AuthSvcProviderMap) (err error
 	s.authServiceMap = aspMap
 
 	// Note: DDB-resolved aspIds installed by ResourceLookup via
-	// applyAspMapDelta are wiped by the full-replace above.
-	// Self-heal behavior splits by whether the aspId is in BOTH
-	// sources during the cutover bake window:
+	// applyAspMapDelta are wiped by the full-replace above. Self-heal:
+	// the next knock for that aspId hits FindAuthSvcProvider miss →
+	// ResourceLookup cache-hit republish → applyAspMapDelta's fast-
+	// path pointer-equal check fails (the wipe nulled the entry) →
+	// fresh-build branch fires → DDB-resolved entry is re-installed.
+	// Heal time: one knock.
 	//
-	//   - DDB-only aspId (post-cutover, no TOML entry): the next
-	//     knock hits FindAuthSvcProvider miss → ResourceLookup
-	//     cache-hit republish → applyAspMapDelta's fast-path
-	//     pointer-equal check fails (the wipe nulled the entry) →
-	//     fresh-build branch fires → DDB-resolved entry is re-
-	//     installed. Heal time: one knock.
-	//   - aspId in BOTH TOML and DDB (transitional cutover window):
-	//     the full-replace above re-installs the TOML-built entry;
-	//     FindAuthSvcProvider hits in-memory on the next knock, so
-	//     ResourceLookup never runs and the DDB-resolved entry stays
-	//     wiped until cache TTL (60s) expires and a future miss
-	//     re-queries. This is intended — TOML is authoritative until
-	//     the cutover PR removes the overlay.
+	// Reload re-pay caveat: every loadResources re-trigger (SIGHUP,
+	// config-watch fire, etc.) pays one extra DDB Query per active
+	// aspId on the next knock to re-warm. Cost scales with the
+	// number of active aspId partitions: today this is `1 query ×
+	// small N` (only "agent" is active); a future per-tenant schema
+	// where the bridge fans out across many real customer ULIDs
+	// would scale rewarm cost with active partitions × reload
+	// frequency. Today reload triggers are rare (operator-driven
+	// config changes) so this is a non-issue; don't optimize
+	// prematurely (e.g., by preserving DDB-installed entries
+	// through the wipe — that would re-introduce the
+	// stale-after-reload class of bug `applyAspMapDelta` exists to
+	// avoid). When the multi-tenant schema lands, revisit: the
+	// candidate optimization is preserving entries whose
+	// `loadResources` snapshot didn't include them (i.e., they
+	// came purely from the bridge, not from baked TOML), so the
+	// full-replace stops wiping them.
+	//
+	// Historical: pre-#1976 the `agent` aspId was ALSO carried in the
+	// baked TOML overlay, which made the full-replace above
+	// authoritative for that aspId until the bridge's 60s TTL expired
+	// and the next miss re-queried DDB. Post-#1976 no shipped TOML
+	// carries `agent` rows, so the "BOTH sources" branch is
+	// structurally unreachable; the comment above describes the only
+	// path that fires in production today.
 
 	return nil
 }

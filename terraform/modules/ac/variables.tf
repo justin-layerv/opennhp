@@ -246,9 +246,9 @@ variable "nhp_region" {
 }
 
 variable "auth_service_id" {
-  description = "Authentication service ID for the AC"
+  description = "Authentication service ID for the AC — the NHP aspId this AC announces it serves. Default `agent` matches the agent staticplugin's PluginID (endpoints/server/staticplugins/agent/plugin.go)."
   type        = string
-  default     = "layerv"
+  default     = "agent"
 }
 
 variable "ac_id" {
@@ -783,7 +783,7 @@ variable "frp_control_upstream_host" {
   description = <<-EOT
     Internal FRPS dial target for the AC Traefik TCP entrypoint on
     `frp_control_port`. Set to the same lex-smallest-AZ Cloud Map host
-    the resource.toml overlay's `dest_host` uses (e.g.
+    the DDB seed row's `dest_host` field uses (e.g.
     `frps-a.nhp.{env}.internal`). The AC Traefik TCP router forwards
     customer SYNs that passed the AC kernel ipset gate to
     `$${frp_control_upstream_host}:$${frp_control_port}`.

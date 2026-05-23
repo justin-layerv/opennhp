@@ -24,6 +24,7 @@ on:
       - "scripts/print-dispatch-ref-error.sh"
       - "scripts/check-image-tag-writer-allowlist.sh"
       - "scripts/check-image-tag-writer-allowlist.py"
+      - "scripts/check-asp-and-ac-id-lockstep.sh"
       - "terraform/modules/qurl-service/main.tf"
       - "terraform/modules/custom-domain-cert/lambda/**"
       - "tests/scripts/**"
@@ -34,6 +35,11 @@ on:
       - "terraform/modules/compute/user_data.sh.tpl"
       - "terraform/environments/prod/**"
       - "terraform/environments/sandbox/**"
+      - "terraform/modules/ac/variables.tf"
+      - "terraform/variables.tf"
+      - "terraform/resources.tf"
+      - "endpoints/server/staticplugins/agent/plugin.go"
+      - "endpoints/server/resource_lookup.go"
       - "docker/nhp-server/etc/config.toml"
       - "endpoints/server/main/etc/config.toml"
   pull_request:
@@ -53,6 +59,7 @@ on:
       - "scripts/print-dispatch-ref-error.sh"
       - "scripts/check-image-tag-writer-allowlist.sh"
       - "scripts/check-image-tag-writer-allowlist.py"
+      - "scripts/check-asp-and-ac-id-lockstep.sh"
       - "terraform/modules/qurl-service/main.tf"
       - "terraform/modules/custom-domain-cert/lambda/**"
       - "tests/scripts/**"
@@ -63,6 +70,11 @@ on:
       - "terraform/modules/compute/user_data.sh.tpl"
       - "terraform/environments/prod/**"
       - "terraform/environments/sandbox/**"
+      - "terraform/modules/ac/variables.tf"
+      - "terraform/variables.tf"
+      - "terraform/resources.tf"
+      - "endpoints/server/staticplugins/agent/plugin.go"
+      - "endpoints/server/resource_lookup.go"
       - "docker/nhp-server/etc/config.toml"
       - "endpoints/server/main/etc/config.toml"
 
@@ -256,3 +268,19 @@ jobs:
       # operator's first explanation of why the dispatch failed.
       - name: Test dispatch-ref-error fixtures
         run: bash tests/lints/dispatch-ref-error/run-fixtures.sh
+
+      # Two cross-module lockstep contracts that surfaced as #1976
+      # cutover follow-ups (PR #2141): the Go-side
+      # `staticplugins/agent.PluginID` must agree with every TF
+      # surface setting `ac_auth_service_id` (drift → first knock
+      # ErrAuthServiceProviderNotFound, no signal), and the AC
+      # module's `var.ac_id` default must agree with every env's
+      # `qurl_default_ac_id` (drift → first knock
+      # ErrACConnectionNotFound). The fixture suite runs first so a
+      # regression in the extractors surfaces against synthetic
+      # inputs with known answers before the real tree runs.
+      - name: Test check-asp-and-ac-id-lockstep.sh fixtures
+        run: bash tests/scripts/check-asp-and-ac-id-lockstep_test.sh
+
+      - name: Check asp+ac_id lockstep (TF ↔ Go)
+        run: bash scripts/check-asp-and-ac-id-lockstep.sh
