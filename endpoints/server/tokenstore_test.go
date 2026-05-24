@@ -288,7 +288,7 @@ func TestNewACKTokenEntry_ProducesShapeAllACKSitesShare(t *testing.T) {
 
 	const openTime = 60
 	before := time.Now()
-	entry := NewACKTokenEntry(knkMsg, "r-1", acTokens, "203.0.113.7", openTime)
+	entry := NewACKTokenEntry(knkMsg, "r-1", acTokens, "203.0.113.7", openTime, "")
 	after := time.Now()
 
 	if entry == nil {
@@ -359,6 +359,77 @@ func TestNewACKTokenEntry_ProducesShapeAllACKSitesShare(t *testing.T) {
 	}
 }
 
+// TestNewACKTokenEntry_OwnerIdPropagates pins the spec-compliant
+// identity-propagation contract: ownerId passed by the caller
+// lands on entry.User.OwnerId (NOT on entry.User.OrganizationId,
+// which carries the client-supplied label per the NHP-KNK spec).
+//
+// Per CSA Stealth Mode SDP §"NHP Workflow", the
+// NHP-Server's pubkey-based authentication is the authoritative
+// identity signal; OwnerId surfaces that resolution through the
+// ACK-path so downstream consumers (e.g. the tunnel-auth plugin
+// in qurl-reverse-tunnel-server) can authorize without re-resolving
+// from potentially-spoofable client labels.
+//
+// Three cases:
+//  1. Non-empty ownerId → User.OwnerId == that string.
+//     OrganizationId stays untouched (client-supplied value).
+//  2. Empty ownerId → User.OwnerId == "". Mirrors the HTTP/forward-
+//     receiver paths where pubkey-resolved identity is unavailable.
+//     Downstream consumers MUST treat empty as "identity not
+//     resolved at this hop."
+//  3. ownerId and knkMsg.OrganizationId differ → both land
+//     independently. Cross-contamination would silently degrade
+//     either the server-resolved or the client-supplied value.
+func TestNewACKTokenEntry_OwnerIdPropagates(t *testing.T) {
+	knkMsg := &common.AgentKnockMsg{
+		UserId:         "agent-1",
+		DeviceId:       "device-1",
+		OrganizationId: "client-supplied-org", // per NHP-KNK spec, client-supplied label
+		AuthServiceId:  "asp",
+		ResourceId:     "r-1",
+	}
+
+	t.Run("non-empty ownerId lands on User.OwnerId", func(t *testing.T) {
+		entry := NewACKTokenEntry(knkMsg, "r-1", map[string]string{"r-1": "tok"}, "203.0.113.7", 60, "owner-from-pubkey-lookup")
+		if entry.User == nil {
+			t.Fatal("entry.User is nil")
+		}
+		if entry.User.OwnerId != "owner-from-pubkey-lookup" {
+			t.Errorf("User.OwnerId = %q, want %q", entry.User.OwnerId, "owner-from-pubkey-lookup")
+		}
+		// Client-supplied OrganizationId must stay untouched —
+		// they're semantically distinct fields (client claim vs
+		// server-resolved tenant identity).
+		if entry.User.OrganizationId != "client-supplied-org" {
+			t.Errorf("OrganizationId clobbered: got %q, want %q", entry.User.OrganizationId, "client-supplied-org")
+		}
+	})
+
+	t.Run("empty ownerId surfaces as empty User.OwnerId", func(t *testing.T) {
+		entry := NewACKTokenEntry(knkMsg, "r-1", map[string]string{"r-1": "tok"}, "203.0.113.7", 60, "")
+		if entry.User.OwnerId != "" {
+			t.Errorf("User.OwnerId = %q, want \"\" (empty marks identity-not-resolved-at-this-hop)", entry.User.OwnerId)
+		}
+	})
+
+	t.Run("ownerId and OrganizationId are independent", func(t *testing.T) {
+		entry := NewACKTokenEntry(knkMsg, "r-1", map[string]string{"r-1": "tok"}, "203.0.113.7", 60, "different-owner")
+		// Pin both fields to explicit values, not just !=. A swap-bug
+		// (OwnerId populated from knkMsg.OrganizationId and vice-versa)
+		// would still produce two different strings — only explicit
+		// per-field assertions catch the swap.
+		if entry.User.OwnerId != "different-owner" {
+			t.Errorf("User.OwnerId = %q, want %q (server-resolved ownerId param must populate User.OwnerId)",
+				entry.User.OwnerId, "different-owner")
+		}
+		if entry.User.OrganizationId != "client-supplied-org" {
+			t.Errorf("User.OrganizationId = %q, want %q (client-supplied knkMsg.OrganizationId must populate User.OrganizationId untouched)",
+				entry.User.OrganizationId, "client-supplied-org")
+		}
+	})
+}
+
 // TestNewACKTokenEntry_ZeroOpenTime fences the boundary at
 // OpenTime=0 — the helper still produces a valid entry whose
 // ExpireTime is now + 5s (just the late-packet buffer). This is a
@@ -378,7 +449,7 @@ func TestNewACKTokenEntry_ZeroOpenTime(t *testing.T) {
 	knkMsg := &common.AgentKnockMsg{UserId: "u"}
 
 	before := time.Now()
-	entry := NewACKTokenEntry(knkMsg, "r", nil, "127.0.0.1", 0)
+	entry := NewACKTokenEntry(knkMsg, "r", nil, "127.0.0.1", 0, "")
 	after := time.Now()
 
 	wantMin := before.Add(time.Duration(accessTokenLatePacketBufferSeconds) * time.Second)
@@ -440,7 +511,7 @@ func TestPublishACKTokens_PersistsAfterWait(t *testing.T) {
 		},
 	}
 
-	s.PublishACKTokens(knkMsg, ackMsg, "203.0.113.42", 60)
+	s.PublishACKTokens(knkMsg, ackMsg, "203.0.113.42", 60, "")
 
 	entryA := s.VerifyAccessToken("ac-token-a")
 	if entryA == nil {
@@ -534,7 +605,7 @@ func TestPublishACKTokens_PersistsEveryNonEmptyToken_AtFanInScale(t *testing.T) 
 	// All writers complete before publish runs — this is the production
 	// shape after Option A. PublishACKTokens iterates the map without
 	// holding mu because there are no concurrent writers.
-	s.PublishACKTokens(knkMsg, ackMsg, "198.51.100.1", 30)
+	s.PublishACKTokens(knkMsg, ackMsg, "198.51.100.1", 30, "")
 
 	for i := 0; i < resourceCount; i++ {
 		entry := s.VerifyAccessToken(acTok(i))

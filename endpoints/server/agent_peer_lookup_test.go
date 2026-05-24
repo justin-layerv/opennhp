@@ -890,6 +890,124 @@ func TestAgentPeerLookup_CachedOwnerIDPopulated(t *testing.T) {
 	}
 }
 
+// TestUdpServer_ResolveOwnerIDByPubKey fences the ForwarderDeps
+// surface used by the forward-receiver path to resolve owner_id
+// locally. Without this method, the receiver would always pass "" to
+// PublishACKTokens — and a downstream tunnel-auth consumer hitting
+// /nhp/internal/token/validate on different NLB-hashed instances
+// would see inconsistent OwnerId for the same logical agent.
+//
+// Six cases pinned:
+//  1. Cold-cache success: lookup hits DDB (via the fake querier),
+//     populates the LRU, then surfaces the owner_id from the
+//     KEYS_ONLY projection.
+//  2. Unknown-pubkey fail-safe: returns "" (never errors), so the
+//     forward path stamps the historical empty-OwnerId on the ACK
+//     entry rather than blocking the knock.
+//  3. Non-cloud-mode fail-safe: agentPeerLookup is nil, returns ""
+//     immediately. Same empty-OwnerId contract as the HTTP knock
+//     path and as the legacy non-cloud UDP path.
+//  4. Empty pubkey short-circuits without a DDB hit.
+//  5. DDB outage (LookupAgentByPubKey returns ErrAgentLookupRetryAfter)
+//     degrades to "" rather than bubbling the error — the forward
+//     path stamps empty on the ACK entry as the documented fail-safe.
+//  6. Input-format contract: ResolveOwnerIDByPubKey expects a
+//     base64.StdEncoding-encoded pubkey (the shape produced at
+//     nhpauth.go:160 and used by req.PublicKey at udpserver.go:3612).
+//     A regression at the call site that wrapped the input in a
+//     second base64 encode would silently degrade every UDP knock
+//     to empty-OwnerId — the lookup would miss, the fail-safe would
+//     kick in, no error logged. Pinning the format here catches
+//     that without needing to mount the full handleNhpOpenResource
+//     path.
+func TestUdpServer_ResolveOwnerIDByPubKey(t *testing.T) {
+	inner := newFakeAgentKeysQuerier()
+	pk := pubkeyB64(0xA1)
+	inner.put(pk, "owner-forward-receiver-1", "agent-forward-receiver-1")
+	l := newTestLookup(t, inner)
+
+	s := &UdpServer{agentPeerLookup: l}
+
+	t.Run("cold-cache lookup populates owner_id", func(t *testing.T) {
+		got := s.ResolveOwnerIDByPubKey(context.Background(), pk)
+		if got != "owner-forward-receiver-1" {
+			t.Errorf("ResolveOwnerIDByPubKey(%q) = %q, want %q (forward-receiver path must resolve owner_id locally so it stays consistent across NLB-hashed instances)",
+				pk, got, "owner-forward-receiver-1")
+		}
+	})
+
+	t.Run("unknown pubkey returns empty fail-safe", func(t *testing.T) {
+		got := s.ResolveOwnerIDByPubKey(context.Background(), pubkeyB64(0xA2))
+		if got != "" {
+			t.Errorf("ResolveOwnerIDByPubKey(unknown) = %q, want \"\" (unknown pubkey must NOT block the forward knock — degrade to empty-OwnerId contract)", got)
+		}
+	})
+
+	t.Run("nil agentPeerLookup (non-cloud-mode) returns empty", func(t *testing.T) {
+		sNil := &UdpServer{agentPeerLookup: nil}
+		got := sNil.ResolveOwnerIDByPubKey(context.Background(), pk)
+		if got != "" {
+			t.Errorf("ResolveOwnerIDByPubKey with nil agentPeerLookup = %q, want \"\" (non-cloud-mode must return empty without panic)", got)
+		}
+	})
+
+	t.Run("empty pubkey returns empty", func(t *testing.T) {
+		got := s.ResolveOwnerIDByPubKey(context.Background(), "")
+		if got != "" {
+			t.Errorf("ResolveOwnerIDByPubKey(\"\") = %q, want \"\" (empty input must short-circuit, not hit DDB)", got)
+		}
+	})
+
+	t.Run("DDB outage returns empty fail-safe", func(t *testing.T) {
+		// The fail-safe contract explicitly covers "DDB outage"; this
+		// closes the test gap by injecting an error on the querier and
+		// asserting the wrapped LookupAgentByPubKey failure propagates
+		// as the empty-OwnerId degraded mode rather than blocking the
+		// knock or panicking. Uses a cold pubkey so the LRU can't
+		// short-circuit before the DDB call.
+		failingInner := newFakeAgentKeysQuerier()
+		failingInner.err = errors.New("ddb outage: provisioned throughput exceeded")
+		failingLookup := newTestLookup(t, failingInner)
+		failingServer := &UdpServer{agentPeerLookup: failingLookup}
+
+		got := failingServer.ResolveOwnerIDByPubKey(context.Background(), pubkeyB64(0xA3))
+		if got != "" {
+			t.Errorf("ResolveOwnerIDByPubKey under DDB outage = %q, want \"\" (LookupAgentByPubKey failure must degrade to empty, NOT bubble the error or panic — the forward-receiver path stamps empty on the ACK entry as the documented fail-safe behavior)", got)
+		}
+	})
+
+	t.Run("input format contract: expects already-base64 pubkey, double-encode returns empty", func(t *testing.T) {
+		// Pin the input-format contract. ResolveOwnerIDByPubKey expects
+		// the already-base64-encoded pubkey shape produced at
+		// nhpauth.go:160 (and used by req.PublicKey at the local UDP
+		// call site, udpserver.go:3612). A regression that wrapped
+		// req.PublicKey in another base64.Encode at the call site would
+		// silently degrade every knock to empty-OwnerId — the lookup
+		// would miss because the cache key is the once-encoded form;
+		// the fail-safe would kick in; no error would be logged.
+		//
+		// Pass `pk` (already base64) → hits cache, surfaces owner_id.
+		// Pass base64(pk) (double-encoded) → cache miss, DDB miss, "".
+		// Distinct from "unknown pubkey returns empty" — that asserts
+		// fail-safe on an unmapped pubkey; this asserts that the EXACT
+		// SAME logical pubkey, encoded one extra time, fails the
+		// lookup. Catches a future double-encode regression without
+		// needing to mount the full handleNhpOpenResource path.
+		oncePK := pk
+		twicePK := base64.StdEncoding.EncodeToString([]byte(oncePK))
+		if twicePK == oncePK {
+			t.Fatalf("test bug: double-encoded pubkey equals once-encoded pubkey, regression check is meaningless")
+		}
+
+		if got := s.ResolveOwnerIDByPubKey(context.Background(), oncePK); got != "owner-forward-receiver-1" {
+			t.Errorf("once-encoded pubkey lookup = %q, want %q (regression baseline)", got, "owner-forward-receiver-1")
+		}
+		if got := s.ResolveOwnerIDByPubKey(context.Background(), twicePK); got != "" {
+			t.Errorf("double-encoded pubkey lookup = %q, want \"\" (a call-site that wrapped req.PublicKey in another base64.Encode must NOT silently match the stored once-encoded form)", got)
+		}
+	})
+}
+
 // distinctRowCollisionQuerier returns TWO rows with DIFFERENT
 // public_key strings on every Query. STRUCTURALLY IMPOSSIBLE in
 // production: the qurl-agent-keys GSI partition key is public_key,

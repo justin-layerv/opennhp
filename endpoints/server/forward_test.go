@@ -1324,5 +1324,9 @@ func (d *testForwarderDepsWithDevice) ProcessACOperation(*common.AgentKnockMsg, 
 func (d *testForwarderDepsWithDevice) ProcessACOperationBroadcast(context.Context, *common.AgentKnockMsg, []*ACConn, *common.NetAddress, []*common.NetAddress, uint32) (*common.ACOpsResultMsg, error) {
 	return nil, nil
 }
-func (d *testForwarderDepsWithDevice) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int) {
+func (d *testForwarderDepsWithDevice) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int, string) {
+}
+
+func (d *testForwarderDepsWithDevice) ResolveOwnerIDByPubKey(context.Context, string) string {
+	return ""
 }

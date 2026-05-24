@@ -11,6 +11,39 @@ type AgentUser struct {
 	DeviceId       string
 	OrganizationId string
 	AuthServiceId  string
+	// OwnerId is the server-resolved tenant identity, populated from
+	// the NHP-Server's pubkey-bound agent registry (e.g., the
+	// `qurl-agent-keys` DDB row) at knock-validation time. Distinct
+	// from OrganizationId, which is the client-supplied label per
+	// the NHP spec's NHP-KNK Message Fields table.
+	//
+	// Per CSA Stealth Mode SDP §"NHP Workflow", the
+	// NHP-Server authenticates the agent's identity using its
+	// public key against the ASP/IAM record. OwnerId carries that
+	// authoritatively-resolved identity downstream so protected-
+	// service consumers (e.g. tunnel-server's tunnel-auth plugin)
+	// can perform application-layer authorization without re-
+	// resolving identity from a potentially-spoofable client
+	// claim. The pubkey-bound resolution happens once at knock
+	// time and is propagated via the ACK-path token entry; see
+	// `endpoints/server/tokenstore.go::NewACKTokenEntry`.
+	//
+	// Empty when the knock arrived via a path that has no pubkey-
+	// bound identity (HTTP knock today). Consumers MUST treat
+	// OwnerId=="" as "identity not resolved at this hop" and either
+	// fall back or reject per their own policy.
+	//
+	// `json:",omitempty"` matches the `omitempty` shape used by the
+	// only fields on this struct that go on the wire today (the
+	// validator response in `internal_token_validate.go` wraps this
+	// in its own struct with `owner_id,omitempty`). Without the tag,
+	// `AccessEntry` JSON-serialized at `endpoints/ac/httpac.go`'s
+	// `/refresh` endpoint would emit `"OwnerId": ""` on every
+	// successful AC response — present-but-empty, which a strict
+	// consumer could read as "AC asserts identity unknown" rather
+	// than "AC doesn't carry this field." The leading comma keeps
+	// the capitalized field name; only the empty-state shape changes.
+	OwnerId string `json:",omitempty"`
 }
 
 type ResourceData struct {

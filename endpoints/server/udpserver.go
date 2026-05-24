@@ -3032,6 +3032,63 @@ func (s *UdpServer) LifecycleCtx() context.Context {
 	return s.lifecycleCtx
 }
 
+// ResolveOwnerIDByPubKey implements the ForwarderDeps surface for the
+// forward-receiver path. Triggers LookupAgentByPubKey to warm the
+// LRU on this server (cold receiver hits DDB), then reads owner_id
+// from the cache. Fail-safe contract: any failure (unknown pubkey,
+// DDB outage, non-cloud-mode where agentPeerLookup is nil, graceful
+// shutdown) returns "" so the caller stamps an empty OwnerId on the
+// ACK entry — same behavior the path had before this method existed.
+//
+// Without local resolution, the forward-receiver would always stamp
+// "" while the originating server stamps the resolved owner_id —
+// downstream consumers hitting /nhp/internal/token/validate on
+// different NLB-hashed instances would see inconsistent OwnerId for
+// the same logical agent. This method makes the field consistent
+// across instances at the cost of one DDB Query per cold-cache
+// forwarded knock per receiver.
+//
+// Also used by the local UDP knock path (handleNhpOpenResource): the
+// auth-path LookupAgentByPubKey warmed the cache moments ago, so the
+// inner LookupAgentByPubKey here hits the singleflight-deduplicated
+// cache fast path. Symmetric across local + forward paths defends
+// against the rare-but-possible cache-eviction-between-auth-and-ACK
+// case (agentPeerLookupCacheSize=2048; a >2048-distinct-pubkey burst
+// could evict between auth and ACK-publish) — the forward path's
+// DDB fallback closes that gap, and using the same call shape here
+// gives the local path the same defense.
+//
+// Observability: transient-DDB failures are logged at debug level
+// (distinct from legitimate unknown-pubkey returns) so a receiver
+// silently degrading to empty-OwnerId on a connectivity outage is
+// visible in triage. A metric counter for the same signal is
+// tracked in #2148.
+func (s *UdpServer) ResolveOwnerIDByPubKey(ctx context.Context, pubKeyB64 string) string {
+	if s.agentPeerLookup == nil || pubKeyB64 == "" {
+		return ""
+	}
+	// LookupAgentByPubKey populates the LRU cache on success (cache
+	// entry includes owner_id projected from the pubkey-index GSI).
+	// We discard the *core.UdpPeer return — the next CachedOwnerID
+	// call surfaces the projected owner_id.
+	if _, err := s.agentPeerLookup.LookupAgentByPubKey(ctx, pubKeyB64); err != nil {
+		// Split the empty-from-error log into two cases:
+		//   - ErrAgentLookupRetryAfter: transient DDB outage. Log at
+		//     debug level so triage can correlate
+		//     receiver-empty-OwnerId rates with DDB connectivity.
+		//   - Everything else (ErrAgentUnknownPubkey,
+		//     ErrAgentLookupInternal, ctx canceled): silent return.
+		//     Unknown-pubkey is a legitimate "no resolved identity
+		//     for this agent" — logging would spam on knocks from
+		//     pubkeys we don't know about.
+		if errors.Is(err, ErrAgentLookupRetryAfter) {
+			log.Debug("resolve_owner_id: transient ddb lookup failure, degrading to empty OwnerId: %v", err)
+		}
+		return ""
+	}
+	return s.agentPeerLookup.CachedOwnerID(pubKeyB64)
+}
+
 // ResolveAuthSvcProvider is the "do-the-right-thing" entry point for
 // callers that need the aspData for a knock and are willing to pay a
 // DDB roundtrip on first-touch. The in-memory authServiceMap is
@@ -3535,7 +3592,25 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 	// /nhp/internal/token/validate reader doesn't race the AC
 	// goroutines still mutating ackMsg.ACTokens. See PublishACKTokens
 	// for the contract.
-	s.PublishACKTokens(knkMsg, ackMsg, srcAddr.Ip, int(openTime))
+	//
+	// ResolveOwnerIDByPubKey symmetric with the forward-receiver path
+	// (forward.go's `f.deps.ResolveOwnerIDByPubKey`). The auth-path
+	// LookupAgentByPubKey warmed the cache moments ago, so the inner
+	// LookupAgentByPubKey hits the singleflight-deduplicated cache
+	// fast path; the DDB fallback only fires in the rare-but-possible
+	// case where the LRU evicted the entry between auth and ACK-publish
+	// (agentPeerLookupCacheSize=2048; a >2048-distinct-pubkey burst
+	// could trigger). Per CSA Stealth Mode SDP §"NHP Workflow", the
+	// server-side pubkey resolution IS the authoritative identity
+	// signal; this propagates it through the ACK-path so application-
+	// layer consumers can authorize without re-resolving.
+	//
+	// Non-cloud-mode: agentPeerLookup is nil (no DDB-backed agent
+	// registry wired). ResolveOwnerIDByPubKey returns "" via its
+	// receiver nil-guard — same empty-contract as the HTTP/forward
+	// paths. Cache-eviction observability tracked in #2148.
+	ownerId := s.ResolveOwnerIDByPubKey(s.LifecycleCtx(), req.PublicKey)
+	s.PublishACKTokens(knkMsg, ackMsg, srcAddr.Ip, int(openTime), ownerId)
 
 	// Increment once per knock request (not per resource) for alarm accuracy
 	if knockHadNoAC {

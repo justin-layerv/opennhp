@@ -786,8 +786,10 @@ func (d *e2eForwarderDeps) ProcessACOperationBroadcast(
 	return nil, nil
 }
 
-func (d *e2eForwarderDeps) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int) {
+func (d *e2eForwarderDeps) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int, string) {
 }
+
+func (d *e2eForwarderDeps) ResolveOwnerIDByPubKey(context.Context, string) string { return "" }
 
 // ============================================================================
 // Helper functions
@@ -1016,7 +1018,11 @@ func (d *capturingForwarderDeps) ProcessACOperationBroadcast(
 	return nil, nil
 }
 
-func (d *capturingForwarderDeps) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int) {
+func (d *capturingForwarderDeps) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int, string) {
+}
+
+func (d *capturingForwarderDeps) ResolveOwnerIDByPubKey(context.Context, string) string {
+	return ""
 }
 
 // captureEncryptedPacket creates an encrypted packet from sender to receiver
@@ -1091,6 +1097,15 @@ type mockACForwarderDeps struct {
 	t            *testing.T
 	tokensMu     sync.Mutex
 	storedTokens map[string]*ACTokenEntry
+	// resolvedOwnerIDs lets tests pre-install the pubkey→ownerID
+	// mapping that ResolveOwnerIDByPubKey returns. Used by the
+	// FullACFlow test to fence end-to-end OwnerId propagation from
+	// the forward-receiver path through PublishACKTokens onto the
+	// stored ACK entry — closes the gap the cr flagged where
+	// `MockForwarderDeps.SetResolvedOwnerID` was defined but never
+	// exercised. Guarded by tokensMu (same lock-domain as the
+	// stored-tokens map so concurrent test goroutines stay safe).
+	resolvedOwnerIDs map[string]string
 }
 
 func (d *mockACForwarderDeps) GetHostname() string {
@@ -1280,13 +1295,35 @@ func (d *mockACForwarderDeps) GetStoredACToken(token string) *ACTokenEntry {
 // PublishACKTokens mirrors UdpServer.PublishACKTokens for the e2e
 // forward fence: every non-empty ackMsg.ACTokens entry flows through
 // StoreACToken with the maps.Clone snapshot from NewACKTokenEntry.
-func (d *mockACForwarderDeps) PublishACKTokens(knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int) {
+func (d *mockACForwarderDeps) PublishACKTokens(knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int, ownerId string) {
 	for name, token := range ackMsg.ACTokens {
 		if token == "" {
 			continue
 		}
-		d.StoreACToken(token, NewACKTokenEntry(knkMsg, name, ackMsg.ACTokens, srcIp, openTime))
+		d.StoreACToken(token, NewACKTokenEntry(knkMsg, name, ackMsg.ACTokens, srcIp, openTime, ownerId))
 	}
+}
+
+func (d *mockACForwarderDeps) ResolveOwnerIDByPubKey(_ context.Context, pubKeyB64 string) string {
+	d.tokensMu.Lock()
+	defer d.tokensMu.Unlock()
+	if d.resolvedOwnerIDs == nil {
+		return ""
+	}
+	return d.resolvedOwnerIDs[pubKeyB64]
+}
+
+// SetResolvedOwnerID pre-installs a pubkey→ownerID mapping that
+// ResolveOwnerIDByPubKey will return for the forward-receiver path.
+// Used by TestE2E_HandleForwardRequest_FullACFlow to fence end-to-end
+// OwnerId propagation onto the stored ACK entry.
+func (d *mockACForwarderDeps) SetResolvedOwnerID(pubKeyB64, ownerID string) {
+	d.tokensMu.Lock()
+	defer d.tokensMu.Unlock()
+	if d.resolvedOwnerIDs == nil {
+		d.resolvedOwnerIDs = make(map[string]string)
+	}
+	d.resolvedOwnerIDs[pubKeyB64] = ownerID
 }
 
 // TestE2E_HandleForwardRequest_FullACFlow tests the complete forwarding flow
@@ -1396,6 +1433,17 @@ func TestE2E_HandleForwardRequest_FullACFlow(t *testing.T) {
 			}
 		},
 	}
+
+	// Pre-install the pubkey→ownerID mapping that the forward-
+	// receiver's ResolveOwnerIDByPubKey will read. Without this, the
+	// test would only fence that owner_id="" propagates (which is
+	// the fail-safe contract, not the load-bearing happy path).
+	// The cr-flagged gap: MockForwarderDeps.SetResolvedOwnerID
+	// existed but no test wired it through PublishACKTokens onto a
+	// stored entry. This closes that gap end-to-end: pubkey →
+	// ResolveOwnerIDByPubKey → PublishACKTokens → entry.User.OwnerId.
+	const wantOwnerID = "owner-from-forward-receiver-e2e"
+	deps.SetResolvedOwnerID(clientNode.PublicKeyStr(), wantOwnerID)
 
 	forwarder := NewServerForwarder(deps)
 
@@ -1520,6 +1568,29 @@ func TestE2E_HandleForwardRequest_FullACFlow(t *testing.T) {
 			storedEntry.KnockSrcIP, "192.168.1.100")
 	}
 
+	// OwnerId is the server-resolved tenant identity that the
+	// forward-receiver path stamps onto the ACK entry via
+	// ResolveOwnerIDByPubKey. The setup above pre-installed
+	// `wantOwnerID` against clientNode's pubkey; this assertion
+	// fences the full pipeline:
+	//   knockPpd.RemotePubKey (decoded from the encrypted inner knock)
+	//   → base64 encode
+	//   → deps.ResolveOwnerIDByPubKey (returns the pre-installed value)
+	//   → PublishACKTokens (forwards ownerId)
+	//   → NewACKTokenEntry (stamps onto entry.User.OwnerId)
+	//   → deps.GetStoredACToken (test reads the stored entry)
+	//
+	// A regression at any hop — forward.go forgetting to call
+	// ResolveOwnerIDByPubKey, PublishACKTokens dropping the
+	// ownerId argument, NewACKTokenEntry not populating
+	// User.OwnerId — surfaces here as a literal-string mismatch.
+	// Closes the cr-flagged gap where SetResolvedOwnerID was
+	// defined but never exercised through the production path.
+	if storedEntry.User.OwnerId != wantOwnerID {
+		t.Errorf("Stored entry User.OwnerId mismatch: got %q, want %q (forward-receiver OwnerId propagation broken at one of: ResolveOwnerIDByPubKey, PublishACKTokens, or NewACKTokenEntry)",
+			storedEntry.User.OwnerId, wantOwnerID)
+	}
+
 	t.Log("")
 	t.Log("============================================================")
 	t.Log("SUCCESS: Full E2E flow with mock AC completed!")
@@ -1637,8 +1708,10 @@ func (d *errorACForwarderDeps) ProcessACOperationBroadcast(
 	return nil, nil
 }
 
-func (d *errorACForwarderDeps) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int) {
+func (d *errorACForwarderDeps) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int, string) {
 }
+
+func (d *errorACForwarderDeps) ResolveOwnerIDByPubKey(context.Context, string) string { return "" }
 
 func TestE2E_HandleForwardRequest_ACReturnsError(t *testing.T) {
 	if testing.Short() {
@@ -1832,7 +1905,11 @@ func (d *timeoutACForwarderDeps) ProcessACOperationBroadcast(
 	return nil, nil
 }
 
-func (d *timeoutACForwarderDeps) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int) {
+func (d *timeoutACForwarderDeps) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int, string) {
+}
+
+func (d *timeoutACForwarderDeps) ResolveOwnerIDByPubKey(context.Context, string) string {
+	return ""
 }
 
 func TestE2E_HandleForwardRequest_ACTimeout(t *testing.T) {

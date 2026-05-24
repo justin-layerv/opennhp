@@ -117,6 +117,16 @@ func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
 	srcAddrs := dopMsg.SourceAddrs
 	dstAddrs := dopMsg.DestinationAddrs
 	openTimeSec := int(dopMsg.OpenTime)
+	// OwnerId (the server-resolved tenant identity, see common.AgentUser
+	// godoc) is INTENTIONALLY not populated on the AC side: the
+	// NHP-AOP wire (dopMsg) carries only the client-supplied fields,
+	// and the AC is not a consumer of /nhp/internal/token/validate
+	// (which is where server-resolved OwnerId surfaces downstream).
+	// A future contributor "fixing" this by guessing an OwnerId from
+	// dopMsg would inject a non-authoritative value into the
+	// AC-side AgentUser and break the field's "server-resolved-only"
+	// invariant. If the AC ever needs OwnerId, extend NHP-AOP wire
+	// to carry it from the resolved server-side state.
 	agentUser := &common.AgentUser{
 		UserId:         dopMsg.UserId,
 		DeviceId:       dopMsg.DeviceId,

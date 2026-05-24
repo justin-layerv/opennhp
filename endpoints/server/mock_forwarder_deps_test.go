@@ -32,9 +32,15 @@ type MockForwarderDeps struct {
 	lifecycleCtx context.Context
 	// resolveCtxMu guards lastResolveCtx — the ctx capture for
 	// LastResolveCtx() so a future test can fence the forwarder's
-	// f.deps.LifecycleCtx() plumbing.
-	resolveCtxMu   sync.Mutex
-	lastResolveCtx context.Context
+	// f.deps.LifecycleCtx() plumbing. Also guards resolvedOwnerIDs
+	// (the pre-installed pubkey→ownerID map for
+	// ResolveOwnerIDByPubKey). Both fields share one mutex for
+	// convenience (one less field to manage); the two are never
+	// acquired together so a split into two mutexes would also be
+	// safe — no real lock-order hazard either way.
+	resolveCtxMu     sync.Mutex
+	lastResolveCtx   context.Context
+	resolvedOwnerIDs map[string]string
 }
 
 // NewMockForwarderDeps creates a new mock with sensible defaults.
@@ -198,11 +204,39 @@ func (m *MockForwarderDeps) GetStoredACToken(token string) *ACTokenEntry {
 // behavior: every non-empty ackMsg.ACTokens entry is recorded via
 // StoreACToken with the maps.Clone snapshot already taken in
 // NewACKTokenEntry.
-func (m *MockForwarderDeps) PublishACKTokens(knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int) {
+func (m *MockForwarderDeps) PublishACKTokens(knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int, ownerId string) {
 	for name, token := range ackMsg.ACTokens {
 		if token == "" {
 			continue
 		}
-		m.StoreACToken(token, NewACKTokenEntry(knkMsg, name, ackMsg.ACTokens, srcIp, openTime))
+		m.StoreACToken(token, NewACKTokenEntry(knkMsg, name, ackMsg.ACTokens, srcIp, openTime, ownerId))
 	}
+}
+
+// ResolveOwnerIDByPubKey returns the pubkey→ownerID mapping the test
+// pre-installed via SetResolvedOwnerID, or "" if no mapping exists.
+// Mirrors the production UdpServer.ResolveOwnerIDByPubKey semantics
+// (fail-safe empty return on unknown pubkey). Tests fencing the
+// forward-receiver path's owner_id propagation pre-install the
+// mapping for the agent pubkeys they generate.
+func (m *MockForwarderDeps) ResolveOwnerIDByPubKey(_ context.Context, pubKeyB64 string) string {
+	m.resolveCtxMu.Lock()
+	defer m.resolveCtxMu.Unlock()
+	if m.resolvedOwnerIDs == nil {
+		return ""
+	}
+	return m.resolvedOwnerIDs[pubKeyB64]
+}
+
+// SetResolvedOwnerID pre-installs a pubkey→ownerID mapping that
+// ResolveOwnerIDByPubKey will return. Used by forward-receiver tests
+// to fence that the resolved owner_id propagates through
+// PublishACKTokens onto the stored ACK entry.
+func (m *MockForwarderDeps) SetResolvedOwnerID(pubKeyB64, ownerID string) {
+	m.resolveCtxMu.Lock()
+	defer m.resolveCtxMu.Unlock()
+	if m.resolvedOwnerIDs == nil {
+		m.resolvedOwnerIDs = make(map[string]string)
+	}
+	m.resolvedOwnerIDs[pubKeyB64] = ownerID
 }

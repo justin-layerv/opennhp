@@ -89,7 +89,33 @@ type ForwarderDeps interface {
 	// maps.Clone isolation, and any future metrics/logging applied in
 	// PublishACKTokens reach the forward path identically to the local
 	// UDP/HTTP knock paths.
-	PublishACKTokens(knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int)
+	//
+	// ownerId is the server-resolved tenant identity from the pubkey-
+	// bound agent registry lookup; pass "" on paths without pubkey-
+	// resolved identity. See `PublishACKTokens` godoc in tokenstore.go.
+	PublishACKTokens(knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int, ownerId string)
+
+	// ResolveOwnerIDByPubKey returns the server-resolved tenant
+	// identity for a base64-encoded agent public key, or "" if the
+	// lookup fails (unknown pubkey, DDB outage, non-cloud-mode,
+	// graceful shutdown). Used by the forward-receiver path to
+	// resolve owner_id locally — without this, the receiver would
+	// stamp "" on every ACK token entry and downstream consumers
+	// (qurl-reverse-tunnel-server's tunnel-auth plugin) would see
+	// inconsistent OwnerId across NLB-hashed instances depending on
+	// which server's `/nhp/internal/token/validate` they hit.
+	//
+	// Hits DDB on cache miss (one Query per cold pubkey on this
+	// instance), then populates the local LRU so subsequent calls
+	// for the same pubkey are cache hits. The DDB cost is bounded —
+	// every server reads from the same `qurl-agent-keys` table, and
+	// the pubkey-index GSI projects owner_id with a KEYS_ONLY shape.
+	//
+	// Fail-safe contract: any failure returns "" (not an error). The
+	// caller stamps "" on the ACK entry, which downstream consumers
+	// treat as "identity not resolved at this hop" per the existing
+	// empty-OwnerId contract. Never blocks a knock on lookup failure.
+	ResolveOwnerIDByPubKey(ctx context.Context, pubKeyB64 string) string
 }
 
 // Compile-time check that UdpServer implements ForwarderDeps.

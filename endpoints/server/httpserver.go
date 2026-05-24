@@ -1335,7 +1335,16 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 	// /nhp/internal/token/validate reader doesn't race the AC
 	// goroutines still mutating ackMsg.ACTokens. See PublishACKTokens
 	// for the contract.
-	s.PublishACKTokens(knkMsg, ackMsg, srcIp, int(openTime))
+	//
+	// ownerId is "" on the HTTP path: HTTP knocks authenticate via the
+	// qurl.link SPA (session-based) rather than the pubkey-bound agent
+	// registry, so there's no agentPeerLookup result to pull from.
+	// Downstream consumers of /nhp/internal/token/validate must treat
+	// an empty owner_id as "identity not resolved at this hop" and
+	// either fall back or reject per their own policy. Future: HTTP
+	// knock identity could flow from the qurl.link SPA's authenticated
+	// session into the knkMsg, then into this slot — tracked in #2149.
+	s.PublishACKTokens(knkMsg, ackMsg, srcIp, int(openTime), "")
 
 	// Increment once per knock request (not per resource) for alarm accuracy
 	if knockHadNoAC {

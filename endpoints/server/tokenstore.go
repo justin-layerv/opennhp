@@ -93,12 +93,25 @@ const accessTokenLatePacketBufferSeconds = common.AccessTokenLatePacketBufferSec
 // after publish" contract. The map is small (one entry per resource
 // the agent knocked, typically 1–3) and the copy happens on a slow
 // path (per-knock, not per-packet).
+//
+// ownerId is the server-resolved tenant identity from the pubkey-bound
+// agent registry lookup (`agentPeerLookup.CachedOwnerID(req.PublicKey)`
+// on the UDP knock path, populated by `LookupAgentByPubKey` during knock
+// validation). Distinct from `knkMsg.OrganizationId`, which carries the
+// client-supplied label per the NHP-KNK spec; OrganizationId stays on
+// AgentUser unchanged so downstream consumers that expected client-
+// supplied semantics keep working. OwnerId is the new server-stamped
+// identity field — see `common.AgentUser` docstring for the spec
+// rationale. Empty when the caller has no resolved identity (e.g., the
+// HTTP knock path, which authenticates via a different mechanism and
+// passes "" here).
 func NewACKTokenEntry(
 	knkMsg *common.AgentKnockMsg,
 	resourceId string,
 	acTokens map[string]string,
 	srcIp string,
 	openTime int,
+	ownerId string,
 ) *ACTokenEntry {
 	// maps.Clone returns nil for a nil input; normalize to an empty map
 	// so PR-2b's reader (and any future caller) never has to handle a
@@ -116,6 +129,7 @@ func NewACKTokenEntry(
 			DeviceId:       knkMsg.DeviceId,
 			OrganizationId: knkMsg.OrganizationId,
 			AuthServiceId:  knkMsg.AuthServiceId,
+			OwnerId:        ownerId,
 		},
 		ResourceId: resourceId,
 		ACTokens:   clonedTokens,
@@ -238,11 +252,18 @@ func (s *UdpServer) storeACToken(token string, entry *ACTokenEntry) {
 // from res.OpenTime and knkMsg.HeaderType, which are call-scoped), so
 // the caller hoists it above the resource loop and passes the shared
 // value here.
-func (s *UdpServer) PublishACKTokens(knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int) {
+// ownerId is forwarded into each entry's User.OwnerId so downstream
+// consumers of /nhp/internal/token/validate (tunnel-server's tunnel-auth
+// plugin) can recover the server-resolved tenant identity without
+// trusting client-supplied labels. Callers obtain ownerId from the
+// pubkey-bound lookup (e.g., agentPeerLookup.CachedOwnerID(pubKeyB64)
+// on the UDP knock path); pass "" when no pubkey-resolved identity is
+// available (e.g., the HTTP knock path, which authenticates differently).
+func (s *UdpServer) PublishACKTokens(knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int, ownerId string) {
 	for name, token := range ackMsg.ACTokens {
 		if token == "" {
 			continue
 		}
-		s.storeACToken(token, NewACKTokenEntry(knkMsg, name, ackMsg.ACTokens, srcIp, openTime))
+		s.storeACToken(token, NewACKTokenEntry(knkMsg, name, ackMsg.ACTokens, srcIp, openTime, ownerId))
 	}
 }

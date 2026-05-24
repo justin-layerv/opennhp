@@ -523,6 +523,58 @@ func TestAccessEntry_JSONOmitsFirstKnockTime(t *testing.T) {
 	}
 }
 
+// TestAccessEntry_JSONOmitsEmptyOwnerId pins the json:",omitempty"
+// tag on common.AgentUser.OwnerId for the AC /refresh wire shape.
+//
+// The AC msghandler intentionally does NOT populate OwnerId
+// (msghandler.go:120-128 — the AC has no application-layer
+// authorization use for tenant identity; only the server-side
+// /nhp/internal/token/validate consumer needs it). httpac.go's
+// /refresh handler returns the entire AccessEntry via c.JSON;
+// without the tag, every AC refresh response would emit
+// `"OwnerId":""` — present-but-empty, which a strict downstream
+// consumer could read as "AC asserts identity unknown" rather than
+// "AC doesn't carry this field."
+//
+// Matches the omitempty contract on the server-side
+// internalTokenValidateResponse.OwnerId — both endpoints surface
+// the absence of OwnerId identically (key-absent), so a consumer
+// observing one shape across both APIs sees the same fail-safe
+// semantics.
+func TestAccessEntry_JSONOmitsEmptyOwnerId(t *testing.T) {
+	entry := &AccessEntry{
+		User:     &common.AgentUser{UserId: "u"}, // OwnerId left empty
+		OpenTime: 60,
+	}
+	buf, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	// The omitempty tag lives on the embedded *common.AgentUser. The
+	// flattened User shape is rendered as a nested object under the
+	// "User" key in AccessEntry's JSON; assert no OwnerId key appears
+	// anywhere in the rendered body.
+	if strings.Contains(string(buf), `"OwnerId"`) {
+		t.Errorf("AccessEntry JSON contains OwnerId key with empty value (json:\",omitempty\" tag removed?); body=%s", buf)
+	}
+
+	// Positive control: when OwnerId IS set, the field DOES appear.
+	// A regression that mis-spelled the tag (e.g. `json:\"owner_id,omitempty\"`
+	// would also pass the negative check above) would surface here
+	// because the field would now render as `\"owner_id\"`, not `\"OwnerId\"`.
+	entryWithOwner := &AccessEntry{
+		User:     &common.AgentUser{UserId: "u", OwnerId: "tenant-X"},
+		OpenTime: 60,
+	}
+	buf2, err := json.Marshal(entryWithOwner)
+	if err != nil {
+		t.Fatalf("Marshal entryWithOwner: %v", err)
+	}
+	if !strings.Contains(string(buf2), `"OwnerId":"tenant-X"`) {
+		t.Errorf("AccessEntry JSON with OwnerId set is missing the expected key/value pair; body=%s", buf2)
+	}
+}
+
 // TestBufferAsymmetry_TokenStillValidButFirewallClosed pins the
 // asymmetry between the two #1942 deadlines: there is a window after
 // FirstKnockTime + OpenTime but before FirstKnockTime + OpenTime + buffer

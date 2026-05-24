@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -384,9 +385,15 @@ func (f *ServerForwarder) HandleForwardRequest(
 
 	// Step 5: Broadcast AOP to all ACs (supports blue/green with same AC ID).
 	// HandleForwardRequest is invoked by the UDP server-to-server path, which
-	// does not have an HTTP request context, so pass Background here. The
-	// broadcast itself discards parent cancellation regardless.
-	artMsg, err := f.deps.ProcessACOperationBroadcast(context.Background(), knkMsg, acConns, srcAddr, dstAddrs, openTime)
+	// does not have an HTTP request context, so use the server's lifecycle
+	// context — symmetric with the ResolveOwnerIDByPubKey call below and
+	// with the resolver's `f.deps.LifecycleCtx()` plumbing in
+	// `ResolveAuthSvcProvider`. The broadcast itself discards parent
+	// cancellation regardless (so shutdown won't actually preempt the AC
+	// dispatch today), but threading lifecycle ctx keeps log correlation
+	// and any future cancellation-respecting code path consistent across
+	// the forward-receiver call sites.
+	artMsg, err := f.deps.ProcessACOperationBroadcast(f.deps.LifecycleCtx(), knkMsg, acConns, srcAddr, dstAddrs, openTime)
 	if err != nil {
 		log.Error("AC operation failed for forwarded knock: %v", err)
 		errCode := "AC_OP_FAILED"
@@ -425,7 +432,29 @@ func (f *ServerForwarder) HandleForwardRequest(
 		// PublishACKTokens so the empty-token guard, maps.Clone
 		// isolation, and the storeACToken chokepoint apply
 		// identically to the local UDP/HTTP knock paths.
-		f.deps.PublishACKTokens(knkMsg, ackMsg, srcAddr.Ip, int(openTime))
+		//
+		// Resolve owner_id locally from the agent's pubkey (decrypted
+		// out of the inner knock packet by decryptForwardedKnock).
+		// Without local resolution, the forward-receiver would always
+		// stamp "" while the originating server stamps the resolved
+		// owner_id — downstream consumers
+		// (qurl-reverse-tunnel-server's tunnel-auth plugin) hitting
+		// /nhp/internal/token/validate on different NLB-hashed
+		// instances would see inconsistent OwnerId for the same
+		// logical agent, breaking the consistency contract.
+		//
+		// ResolveOwnerIDByPubKey hits DDB on cold-cache (one Query
+		// per cold pubkey per receiver), then populates the local
+		// LRU so subsequent forwarded knocks for the same agent are
+		// cache hits. Fail-safe: any lookup failure (unknown pubkey,
+		// DDB outage, non-cloud-mode) returns "" — the path falls
+		// back to the historical empty-OwnerId behavior, never blocks
+		// the forward.
+		ownerId := f.deps.ResolveOwnerIDByPubKey(
+			f.deps.LifecycleCtx(),
+			base64.StdEncoding.EncodeToString(knockPpd.RemotePubKey),
+		)
+		f.deps.PublishACKTokens(knkMsg, ackMsg, srcAddr.Ip, int(openTime), ownerId)
 	}
 
 	// Serialize ACK message

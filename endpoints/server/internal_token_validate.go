@@ -111,6 +111,29 @@ type internalTokenValidateResponse struct {
 	Valid      bool   `json:"valid"`
 	KnockSrcIP string `json:"knock_src_ip,omitempty"`
 	KnockUser  string `json:"knock_user,omitempty"`
+	// OwnerId is the server-resolved tenant identity stamped at
+	// knock-validation time from the pubkey-bound agent registry
+	// (see `endpoints/server/agent_peer_lookup.go::CachedOwnerID`
+	// and `endpoints/server/tokenstore.go::NewACKTokenEntry`).
+	//
+	// Consumers (e.g. qurl-reverse-tunnel-server's tunnel-auth
+	// plugin) MAY use this as the authoritative identity for
+	// application-layer authorization, avoiding a re-resolution
+	// roundtrip on every protected-service action. Per CSA Stealth
+	// Mode SDP §"NHP Workflow", the pubkey-based
+	// authentication at the NHP-Server IS the trust root for the
+	// agent's identity; propagating that resolution through the
+	// ACK-path lets downstream services trust it without re-
+	// validating client-supplied labels.
+	//
+	// omitempty: empty when the entry was created via a path that
+	// didn't have pubkey-resolved identity (the HTTP knock path
+	// today) OR when the agentPeerLookup cache was evicted between
+	// resolve and ACK-publish (best-effort surfacing). Consumers
+	// MUST treat empty as "identity not resolved at this hop" and
+	// either fall back to other identity signals or reject per
+	// their own policy.
+	OwnerId string `json:"owner_id,omitempty"`
 	// RunID echoes the entry's stored RunID when set, otherwise
 	// the caller-supplied agent_run_id. Field-name asymmetry
 	// (request agent_run_id vs response run_id) is intentional —
@@ -403,8 +426,10 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 	// presented against an FRP login for resource B) is tracked
 	// as a follow-up — see PR description.
 	user := ""
+	ownerId := ""
 	if entry.User != nil {
 		user = entry.User.UserId
+		ownerId = entry.User.OwnerId
 	}
 	runID := entry.RunID
 	if runID == "" {
@@ -414,6 +439,7 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 		Valid:      true,
 		KnockSrcIP: entry.KnockSrcIP,
 		KnockUser:  user,
+		OwnerId:    ownerId,
 		RunID:      runID,
 		ExpiresAt:  entry.ExpireTime.UTC().Format(time.RFC3339Nano),
 	})

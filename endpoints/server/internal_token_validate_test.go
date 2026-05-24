@@ -160,6 +160,7 @@ func TestInternalTokenValidate_Happy(t *testing.T) {
 			DeviceId:       "device-1",
 			OrganizationId: "org-1",
 			AuthServiceId:  "asp-1",
+			OwnerId:        "owner-from-pubkey-lookup",
 		},
 		ResourceId: "r-happy",
 		ACTokens:   map[string]string{"r-happy": "ac-token-happy"},
@@ -188,6 +189,16 @@ func TestInternalTokenValidate_Happy(t *testing.T) {
 	}
 	if got.KnockUser != "user-happy" {
 		t.Errorf("KnockUser = %q, want %q", got.KnockUser, "user-happy")
+	}
+	// OwnerId surfaces the server-resolved tenant identity stamped by
+	// NewACKTokenEntry. Per CSA Stealth Mode SDP §"NHP Workflow",
+	// the NHP-Server's pubkey-based authentication is the
+	// authoritative identity signal — this validator response is the
+	// downstream surfacing of that resolution for tunnel-server (or
+	// any other protected-service consumer) to use as the authorization
+	// identity without re-resolving from client-supplied labels.
+	if got.OwnerId != "owner-from-pubkey-lookup" {
+		t.Errorf("OwnerId = %q, want %q", got.OwnerId, "owner-from-pubkey-lookup")
 	}
 	// RunID echoes the entry's stored RunID, not the request's
 	// agent_run_id, when the entry has one. PR-2c's handoff is
@@ -259,6 +270,54 @@ func TestInternalTokenValidate_HappyEchoesRunIDOnEmptyEntry(t *testing.T) {
 	if got.RunID != "caller-supplied-run" {
 		t.Errorf("RunID = %q, want caller's agent_run_id %q (entry.RunID was empty)",
 			got.RunID, "caller-supplied-run")
+	}
+}
+
+// TestInternalTokenValidate_EmptyOwnerId pins the omitempty wire
+// contract on the OwnerId field. Entries created via paths that
+// don't have a pubkey-bound resolution at the publish hop (the HTTP
+// knock path, the forward-receiver path, the legacy non-cloud-mode
+// UDP path) have entry.User.OwnerId == "". The response field is
+// json:"owner_id,omitempty", so the key must be ABSENT from the
+// wire — not present with an empty string.
+//
+// A regression that drops the omitempty tag, or a future consumer
+// that flips OwnerId to a required field, would land silently
+// without this assertion. Mirrors the resource_id absence pattern at
+// the tail of TestInternalTokenValidate_Happy: assert key-absence
+// at the JSON-fields layer rather than substring-match, so a future
+// field whose value happens to contain "owner_id" doesn't
+// false-positive.
+func TestInternalTokenValidate_EmptyOwnerId(t *testing.T) {
+	r, signer, us := newTokenValidateRouter(t, true)
+
+	us.storeACToken("ac-token-no-owner", &ACTokenEntry{
+		User: &common.AgentUser{
+			UserId:  "u",
+			OwnerId: "", // explicit zero value: the HTTP/forward/legacy-non-cloud-mode shape
+		},
+		ResourceId: "r",
+		KnockSrcIP: "10.0.0.6",
+		OpenTime:   60,
+		ExpireTime: time.Now().Add(60 * time.Second),
+	})
+
+	body := `{"token":"ac-token-no-owner","agent_run_id":"caller-supplied-run"}`
+	rec := doValidateRequest(t, r, body, signValidate(t, signer, body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200. body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Assert key absence at the JSON-fields layer so a future field
+	// whose value happens to contain "owner_id" doesn't trip a
+	// substring match.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &fields); err != nil {
+		t.Fatalf("decode response into fields map: %v", err)
+	}
+	if _, present := fields["owner_id"]; present {
+		t.Errorf("response body contains owner_id key with empty entry.User.OwnerId (expected omitted via json:\"owner_id,omitempty\"): %s",
+			rec.Body.String())
 	}
 }
 
