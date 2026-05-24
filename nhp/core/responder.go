@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -64,6 +65,8 @@ type PacketParserData struct {
 	chainHash  hash.Hash
 	bodyAead   cipher.AEAD
 	chainKey   [SymmetricKeySize]byte
+	// hashBuf avoids per-Sum result allocation. HashSize coverage is checked in crypto.go.
+	hashBuf [HashSize]byte
 
 	LocalInitTime int64
 	SenderTrxId   uint64
@@ -146,7 +149,7 @@ func (d *Device) createPacketParserData(pd *PacketData) (ppd *PacketParserData, 
 
 	// init chain key -> ChainKey0
 	ppd.noise.HashType = ppd.Ciphers.HashType
-	ppd.noise.MixKey(&ppd.chainKey, ppd.chainHash.Sum(nil), initialChainKeyBytes)
+	ppd.noise.MixKey(&ppd.chainKey, ppd.chainHash.Sum(ppd.hashBuf[:0]), initialChainKeyBytes)
 
 	ppd.HeaderType, ppd.BodySize = ppd.header.TypeAndPayloadSize()
 
@@ -320,7 +323,7 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 		log.Error("failed to create AEAD for peer pubkey decryption: %v", err)
 		return err
 	}
-	_, err = aead.Open(peerPk[:0], ppd.header.NonceBytes(), ppd.header.StaticBytes(), ppd.chainHash.Sum(nil))
+	_, err = aead.Open(peerPk[:0], ppd.header.NonceBytes(), ppd.header.StaticBytes(), ppd.chainHash.Sum(ppd.hashBuf[:0]))
 	if err != nil {
 		log.Error("failed to decrypt peer pubkey")
 		return err
@@ -407,7 +410,7 @@ func (ppd *PacketParserData) validatePeer() (err error) {
 		log.Error("failed to create AEAD for timestamp decryption: %v", err)
 		return err
 	}
-	_, err = aead.Open(tsBytes[:0], ppd.header.NonceBytes(), ppd.header.TimestampBytes(), ppd.chainHash.Sum(nil))
+	_, err = aead.Open(tsBytes[:0], ppd.header.NonceBytes(), ppd.header.TimestampBytes(), ppd.chainHash.Sum(ppd.hashBuf[:0]))
 	if err != nil {
 		log.Error("failed to decrypt timestamp")
 		return err
@@ -517,6 +520,7 @@ func (ppd *PacketParserData) decryptBody() (err error) {
 		ppd.chainHash.Reset()
 		ppd.chainHash = nil
 		SetZero(ppd.chainKey[:])
+		SetZero(ppd.hashBuf[:])
 	}()
 
 	// message body is empty, skip decryption
@@ -525,7 +529,7 @@ func (ppd *PacketParserData) decryptBody() (err error) {
 	}
 
 	// decrypt body and reuse ppd.BasePacket.Content space
-	body, err := ppd.bodyAead.Open(ppd.basePacket.Content[ppd.header.Size():ppd.header.Size()], ppd.header.NonceBytes(), ppd.basePacket.Content[ppd.header.Size():], ppd.chainHash.Sum(nil))
+	body, err := ppd.bodyAead.Open(ppd.basePacket.Content[ppd.header.Size():ppd.header.Size()], ppd.header.NonceBytes(), ppd.basePacket.Content[ppd.header.Size():], ppd.chainHash.Sum(ppd.hashBuf[:0]))
 	if err != nil {
 		log.Critical("decrypt body failed: %v", err)
 		return ErrAEADDecryptionFailed.WithExtra(err)
@@ -641,8 +645,8 @@ func (ppd *PacketParserData) checkHMAC(sumCookie bool) bool {
 		ppd.hmacHash = nil
 	}()
 
-	len := ppd.header.Size() - HashSize
-	ppd.hmacHash.Write(ppd.header.Bytes()[0:len])
+	prefixLen := ppd.header.Size() - HashSize
+	ppd.hmacHash.Write(ppd.header.Bytes()[0:prefixLen])
 
 	if sumCookie {
 		ppd.ConnData.Lock()
@@ -651,17 +655,14 @@ func (ppd *PacketParserData) checkHMAC(sumCookie bool) bool {
 		if ppd.LocalInitTime < ppd.ConnData.CookieStore.LastCookieTime+CookieRoundTripTimeMs*int64(time.Millisecond) {
 			// cookie has already or nearly been updated, use previous cookie
 			ppd.hmacHash.Write(ppd.ConnData.CookieStore.PrevCookie[:])
-			prevCookieHmac := ppd.hmacHash.Sum(nil)
-			return bytes.Equal(prevCookieHmac, ppd.header.HMACBytes())
+			return hmac.Equal(ppd.hmacHash.Sum(ppd.hashBuf[:0]), ppd.header.HMACBytes())
 		}
 		// use current cookie
 		ppd.hmacHash.Write(ppd.ConnData.CookieStore.CurrCookie[:])
-		cookieHmac := ppd.hmacHash.Sum(nil)
-		return bytes.Equal(cookieHmac, ppd.header.HMACBytes())
+		return hmac.Equal(ppd.hmacHash.Sum(ppd.hashBuf[:0]), ppd.header.HMACBytes())
 	}
 
-	calculatedHmac := ppd.hmacHash.Sum(nil)
-	return bytes.Equal(calculatedHmac, ppd.header.HMACBytes())
+	return hmac.Equal(ppd.hmacHash.Sum(ppd.hashBuf[:0]), ppd.header.HMACBytes())
 }
 
 func (ppd *PacketParserData) Destroy() {
@@ -674,6 +675,8 @@ func (ppd *PacketParserData) Destroy() {
 		ppd.chainHash.Reset()
 		ppd.chainHash = nil
 	}
+	// Defense-in-depth: clear scratch even though hash digests are not key material.
+	SetZero(ppd.hashBuf[:])
 }
 
 func (ppd *PacketParserData) IsAllowedAtOverload() bool {

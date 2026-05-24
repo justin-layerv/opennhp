@@ -7,6 +7,8 @@ import (
 	"hash"
 	"strings"
 	"testing"
+
+	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
 // ---------------------------------------------------------------------------
@@ -58,6 +60,189 @@ func TestNewHash(t *testing.T) {
 			sum := h.Sum(nil)
 			if len(sum) == 0 {
 				t.Fatal("hash produced empty output")
+			}
+		})
+	}
+}
+
+func TestHashSumScratchBufferDoesNotAllocate(t *testing.T) {
+	hashTypes := []struct {
+		name     string
+		hashType HashTypeEnum
+	}{
+		{
+			name:     "BLAKE2S",
+			hashType: HASH_BLAKE2S,
+		},
+		{
+			name:     "SHA256",
+			hashType: HASH_SHA256,
+		},
+	}
+
+	mad := &MsgAssemblerData{}
+	ppd := &PacketParserData{}
+	packetStates := []struct {
+		name string
+		dst  func() []byte
+	}{
+		{
+			name: "MsgAssemblerData",
+			dst:  func() []byte { return mad.hashBuf[:0] },
+		},
+		{
+			name: "PacketParserData",
+			dst:  func() []byte { return ppd.hashBuf[:0] },
+		},
+	}
+
+	for _, ht := range hashTypes {
+		for _, ps := range packetStates {
+			t.Run(ht.name+"/"+ps.name, func(t *testing.T) {
+				input := []byte("test")
+				h, err := NewHash(ht.hashType)
+				if err != nil {
+					t.Fatalf("NewHash failed: %v", err)
+				}
+				if _, err := h.Write(input); err != nil {
+					t.Fatalf("hash write failed: %v", err)
+				}
+
+				if got := len(h.Sum(ps.dst())); got != h.Size() {
+					t.Fatalf("sum length = %d, want %d", got, h.Size())
+				}
+
+				var gotLen int
+				allocs := testing.AllocsPerRun(1000, func() {
+					h.Reset()
+					_, _ = h.Write(input)
+					gotLen = len(h.Sum(ps.dst()))
+				})
+				if gotLen != h.Size() {
+					t.Fatalf("sum length = %d, want %d", gotLen, h.Size())
+				}
+				if allocs != 0 {
+					t.Fatalf("Sum with %s scratch buffer allocated %.0f times, want 0", ps.name, allocs)
+				}
+			})
+		}
+	}
+}
+
+func TestCheckHMACDoesNotAllocateHashScratch(t *testing.T) {
+	ciphers := NewCipherSuite()
+
+	var packetBuf PacketBuffer
+	pkt := &Packet{
+		Buf:        &packetBuf,
+		Content:    packetBuf[:],
+		HeaderType: NHP_KNK,
+	}
+	header := pkt.HeaderWithCipherScheme(common.CIPHER_SCHEME_CURVE)
+	header.SetCounter(1)
+	header.SetTypeAndPayloadSize(NHP_KNK, 0)
+
+	seed := []byte("test-hmac-seed")
+	prefixLen := header.Size() - HashSize
+	writeExpectedHMAC := func(cookie []byte) {
+		expectedHash, err := NewHash(ciphers.HashType)
+		if err != nil {
+			t.Fatalf("NewHash failed: %v", err)
+		}
+		expectedHash.Write(seed)
+		expectedHash.Write(header.Bytes()[:prefixLen])
+		if cookie != nil {
+			expectedHash.Write(cookie)
+		}
+		expectedHash.Sum(header.HMACBytes()[:0])
+	}
+	writeExpectedHMAC(nil)
+
+	ppd := &PacketParserData{header: header}
+	h, err := NewHash(ciphers.HashType)
+	if err != nil {
+		t.Fatalf("NewHash failed: %v", err)
+	}
+
+	runCheck := func(sumCookie bool) bool {
+		h.Reset()
+		h.Write(seed)
+		ppd.hmacHash = h
+		return ppd.checkHMAC(sumCookie)
+	}
+
+	if !runCheck(false) {
+		t.Fatal("checkHMAC returned false")
+	}
+
+	ok := true
+	allocs := testing.AllocsPerRun(1000, func() {
+		if !runCheck(false) {
+			ok = false
+		}
+	})
+	if !ok {
+		t.Fatal("checkHMAC returned false")
+	}
+	if allocs != 0 {
+		t.Fatalf("checkHMAC allocated %.0f times, want 0", allocs)
+	}
+
+	header.HMACBytes()[0] ^= 0xff
+	if runCheck(false) {
+		t.Fatal("checkHMAC returned true for tampered HMAC")
+	}
+
+	cookieStore := &CookieStore{}
+	for i := range cookieStore.CurrCookie {
+		cookieStore.CurrCookie[i] = byte(i)
+		cookieStore.PrevCookie[i] = byte(i + CookieSize)
+	}
+	cookieStore.LastCookieTime = 1
+	ppd.ConnData = &ConnectionData{CookieStore: cookieStore}
+
+	cookieTests := []struct {
+		name          string
+		localInitTime int64
+		cookie        []byte
+	}{
+		{
+			name:          "previous cookie",
+			localInitTime: 0,
+			cookie:        cookieStore.PrevCookie[:],
+		},
+		{
+			name:          "current cookie",
+			localInitTime: 1 << 60,
+			cookie:        cookieStore.CurrCookie[:],
+		},
+	}
+
+	for _, tt := range cookieTests {
+		t.Run(tt.name, func(t *testing.T) {
+			ppd.LocalInitTime = tt.localInitTime
+			writeExpectedHMAC(tt.cookie)
+
+			if !runCheck(true) {
+				t.Fatal("checkHMAC returned false")
+			}
+
+			ok := true
+			allocs := testing.AllocsPerRun(1000, func() {
+				if !runCheck(true) {
+					ok = false
+				}
+			})
+			if !ok {
+				t.Fatal("checkHMAC returned false")
+			}
+			if allocs != 0 {
+				t.Fatalf("checkHMAC allocated %.0f times, want 0", allocs)
+			}
+
+			header.HMACBytes()[0] ^= 0xff
+			if runCheck(true) {
+				t.Fatal("checkHMAC returned true for tampered HMAC")
 			}
 		})
 	}
