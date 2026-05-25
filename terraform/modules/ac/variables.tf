@@ -791,8 +791,9 @@ variable "frp_control_upstream_host" {
     The AC ingress side (NLB:$${frp_control_port} → AC kernel → ipset)
     is the load-bearing fence; this upstream is the AC-userspace →
     private-FRPS leg, gated only by the AC instance's egress posture
-    plus the FRPS SG (already AC-SG-only). v1 pins to a single AZ
-    (matching the overlay); multi-AZ HRW dispatch is #1976.
+    plus the FRPS SG (already AC-SG-only). The primary listener pins to
+    the lex-smallest AZ for legacy clients; additional upstreams below
+    provide the per-AZ public-port fanout.
 
     Empty string disables the TCP entrypoint — the legacy WSS-via-443
     path (now unused) is the only remaining FRP path under that
@@ -813,5 +814,61 @@ variable "frp_control_upstream_host" {
   validation {
     condition     = var.frp_control_upstream_host == "" || can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$", var.frp_control_upstream_host))
     error_message = "frp_control_upstream_host must be a bare lowercase DNS name in per-label RFC 1035 form (each label 1-63 chars, alphanumeric with hyphens but not leading/trailing, multiple labels dot-separated; no scheme, port, slashes, whitespace, or userinfo), or empty to disable the FRPS-control TCP entrypoint. Today's values like `frps-a.nhp.sandbox.internal` conform."
+  }
+}
+
+variable "frp_control_additional_upstreams" {
+  description = <<-EOT
+    Additional per-AZ FRPS control listeners exposed on the AC NLB. The
+    primary listener remains `frp_control_port` -> `frp_control_upstream_host`
+    for backward compatibility; this map adds sibling public listener ports
+    on the same connect.layerv.* DNS name, each forwarding to one private
+    FRPS Cloud Map host on its native upstream_port.
+
+    FRP control is raw TCP, not HTTP or TLS, so one listener cannot route by
+    Host/SNI. Per-AZ ingress therefore uses distinct public listener ports
+    paired with NHP resource rows whose knock ack returns
+    "connect.layerv.*:<listen_port>".
+    EOT
+  type = map(object({
+    listen_port   = number
+    upstream_host = string
+    upstream_port = number
+  }))
+  default = {}
+
+  validation {
+    condition = alltrue([
+      for _, upstream in var.frp_control_additional_upstreams :
+      upstream.listen_port >= 1 &&
+      upstream.listen_port <= 65535 &&
+      upstream.listen_port == floor(upstream.listen_port) &&
+      upstream.upstream_port >= 1 &&
+      upstream.upstream_port <= 65535 &&
+      upstream.upstream_port == floor(upstream.upstream_port) &&
+      can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$", upstream.upstream_host))
+    ])
+    error_message = "Every frp_control_additional_upstreams entry must have integer listen_port/upstream_port in 1..65535 and a bare lowercase RFC-1035 DNS upstream_host."
+  }
+
+  validation {
+    condition = alltrue([
+      for name in keys(var.frp_control_additional_upstreams) :
+      can(regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?$", name))
+    ])
+    error_message = "frp_control_additional_upstreams keys must match ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ because they flow into AWS names, tags, Traefik TCP object names, and rendered shell."
+  }
+
+  validation {
+    condition     = !contains(keys(var.frp_control_additional_upstreams), "ctl")
+    error_message = "frp_control_additional_upstreams must not use key \"ctl\" because it would collide with the primary FRPS control target-group name suffix (`-ac-frps-ctl`)."
+  }
+
+  validation {
+    condition = length(distinct([
+      for _, upstream in var.frp_control_additional_upstreams :
+      upstream.listen_port
+    ])) == length(var.frp_control_additional_upstreams)
+    error_message = "frp_control_additional_upstreams listen_port values must be unique; each additional FRPS control upstream owns one public AC NLB listener."
   }
 }

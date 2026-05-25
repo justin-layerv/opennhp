@@ -451,6 +451,32 @@ func (l *ResourceLookup) queryAndCache(ctx context.Context, aspId string) (*comm
 			}
 			continue
 		}
+		if row.ResourceFQDN == "" {
+			// Defensive: the bridge leaves Addr.Ip empty so the ack
+			// host comes from ResourceFQDN/Hostname. A row missing both
+			// would emit an empty ResourceHost and leave the agent with
+			// no usable dial target. Treat it as malformed at the DDB
+			// boundary instead of papering over it at DestHost().
+			log.Warning("resource lookup: skipping row with empty resource_fqdn partition=%q aspId=%q resource_id=%q ac_id=%q",
+				l.customerID, aspId, row.ResourceID, row.ACID)
+			if l.metrics != nil {
+				l.metrics.IncrCounter(MetricResourceLookupMalformedRow)
+			}
+			continue
+		}
+		if row.PortSuffix && (row.DestPort <= 0 || row.DestPort > 65535) {
+			// Defensive: port_suffix=true is the writer's promise that
+			// ResourceInfo.DestHost() will publish resource_fqdn:dest_port
+			// to the agent. A missing/out-of-range dest_port would otherwise
+			// degrade into a bare hostname and hide the writer regression
+			// until agents fail to reach the intended per-AZ listener.
+			log.Warning("resource lookup: skipping row with port_suffix=true but out-of-range dest_port=%d partition=%q aspId=%q resource_id=%q ac_id=%q",
+				row.DestPort, l.customerID, aspId, row.ResourceID, row.ACID)
+			if l.metrics != nil {
+				l.metrics.IncrCounter(MetricResourceLookupMalformedRow)
+			}
+			continue
+		}
 
 		matched++
 
@@ -495,7 +521,7 @@ func (l *ResourceLookup) queryAndCache(ctx context.Context, aspId string) (*comm
 		//     TF writer puts the internal Cloud Map name in dest_host
 		//     and the customer-facing ingress in resource_fqdn (= the
 		//     two values genuinely diverge, see terraform/resources.tf
-		//     `tunnel_server_resource`). The bridge surfaces only the
+		//     `tunnel_server_resource_ids`). The bridge surfaces only the
 		//     ingress to the agent (via Hostname); the internal name
 		//     stays informational. If a future row needs both legs
 		//     visible (proxy/gateway in front of dial target), revisit
@@ -518,8 +544,9 @@ func (l *ResourceLookup) queryAndCache(ctx context.Context, aspId string) (*comm
 				OpenTime:      uint32(openTime),
 				Resources: map[string]*common.ResourceInfo{
 					row.ResourceID: {
-						ACId:     row.ACID,
-						Hostname: row.ResourceFQDN,
+						ACId:       row.ACID,
+						Hostname:   row.ResourceFQDN,
+						PortSuffix: row.PortSuffix,
 						Addr: &common.NetAddress{
 							Port:     row.DestPort,
 							Protocol: "tcp",

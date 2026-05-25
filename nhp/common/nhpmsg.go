@@ -190,6 +190,19 @@ type ResourceInfo struct {
 	MaskHost   bool        `json:"maskHost,omitempty"` // do not reveal resource host in ack info
 }
 
+// DestHost returns the ResourceHost value sent in knock acks.
+//
+// Contract:
+//   - MaskHost, nil Addr, or empty host returns "".
+//   - PortSuffix=false returns the bare host.
+//   - PortSuffix=true with Addr.Port > 0 returns "host:port".
+//   - PortSuffix=true with Addr.Port <= 0 returns "".
+//
+// BEHAVIOR CHANGE: PortSuffix=true with a missing/non-positive port used
+// to fall through to the bare host. The final case is now intentional
+// fail-closed behavior for partially populated per-AZ qurl tunnel rows:
+// callers should fix or reject the malformed row at the loader boundary
+// instead of silently dropping the required public listener port.
 func (r *ResourceInfo) DestHost() string {
 	if r.MaskHost || r.Addr == nil {
 		return ""
@@ -199,8 +212,14 @@ func (r *ResourceInfo) DestHost() string {
 	if len(r.Hostname) > 0 {
 		host = r.Hostname
 	}
-	if !r.PortSuffix || r.Addr.Port == 0 {
+	if host == "" {
+		return ""
+	}
+	if !r.PortSuffix {
 		return host
+	}
+	if r.Addr.Port <= 0 {
+		return ""
 	}
 	return fmt.Sprintf("%s:%d", host, r.Addr.Port)
 }

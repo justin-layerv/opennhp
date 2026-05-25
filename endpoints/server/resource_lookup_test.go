@@ -42,12 +42,24 @@ func newFakeResourcesQuerier() *fakeResourcesQuerier {
 // put adds a row to the fake's customer_id partition. resourceFQDN
 // is the customer-facing ingress (mirrors terraform's
 // `each.value.dest_host` → resource_fqdn render); destHost is the
-// internal dial target (today the same value for FRPS but the
-// schema keeps them distinct).
+// internal dial target (today the same value for FRPS but the schema
+// keeps them distinct). It intentionally omits port_suffix to mirror
+// legacy DDB rows written before the attribute existed.
 func (f *fakeResourcesQuerier) put(customerID, resourceID, aspID, acID, resourceFQDN, destHost string, destPort, openTime int) {
+	f.putResource(customerID, resourceID, aspID, acID, resourceFQDN, destHost, destPort, openTime, false, false)
+}
+
+// putWithPortSuffix emits the port_suffix attribute explicitly. Use it
+// for per-AZ rows where tests need to distinguish false from legacy
+// rows that omit the attribute entirely.
+func (f *fakeResourcesQuerier) putWithPortSuffix(customerID, resourceID, aspID, acID, resourceFQDN, destHost string, destPort, openTime int, portSuffix bool) {
+	f.putResource(customerID, resourceID, aspID, acID, resourceFQDN, destHost, destPort, openTime, true, portSuffix)
+}
+
+func (f *fakeResourcesQuerier) putResource(customerID, resourceID, aspID, acID, resourceFQDN, destHost string, destPort, openTime int, includePortSuffix, portSuffix bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.rowsByCust[customerID] = append(f.rowsByCust[customerID], map[string]types.AttributeValue{
+	row := map[string]types.AttributeValue{
 		"customer_id":     &types.AttributeValueMemberS{Value: customerID},
 		"resource_id":     &types.AttributeValueMemberS{Value: resourceID},
 		"auth_service_id": &types.AttributeValueMemberS{Value: aspID},
@@ -56,7 +68,11 @@ func (f *fakeResourcesQuerier) put(customerID, resourceID, aspID, acID, resource
 		"dest_host":       &types.AttributeValueMemberS{Value: destHost},
 		"dest_port":       &types.AttributeValueMemberN{Value: strconv.Itoa(destPort)},
 		"open_time":       &types.AttributeValueMemberN{Value: strconv.Itoa(openTime)},
-	})
+	}
+	if includePortSuffix {
+		row["port_suffix"] = &types.AttributeValueMemberBOOL{Value: portSuffix}
+	}
+	f.rowsByCust[customerID] = append(f.rowsByCust[customerID], row)
 }
 
 // putMalformedRow inserts a row that UnmarshalMap can't decode into
@@ -394,8 +410,92 @@ func TestResourceLookup_HappyPathMatchesPluginReadShape(t *testing.T) {
 	if got := res.Addr.Port; got != 7000 {
 		t.Errorf("res.Addr.Port = %d, want 7000", got)
 	}
+	if res.PortSuffix {
+		t.Error("res.PortSuffix = true, want false for legacy qurl-tunnel-server alias")
+	}
+	if got := res.DestHost(); got != "connect.layerv.xyz" {
+		t.Errorf("res.DestHost() = %q, want connect.layerv.xyz", got)
+	}
 	if got := res.Addr.Protocol; got != "tcp" {
 		t.Errorf("res.Addr.Protocol = %q, want %q", got, "tcp")
+	}
+}
+
+func TestResourceLookup_PortSuffixControlsAckHostPerResource(t *testing.T) {
+	q := newFakeResourcesQuerier()
+	q.put(nhpSystemCustomerID, "qurl-tunnel-server", "agent", "layerv-ac-tf", "connect.layerv.xyz", "frps-a.nhp.sandbox.internal", 7000, 120)
+	q.putWithPortSuffix(nhpSystemCustomerID, "qurl-tunnel-server-a", "agent", "layerv-ac-tf", "connect.layerv.xyz", "frps-a.nhp.sandbox.internal", 7000, 120, false)
+	q.putWithPortSuffix(nhpSystemCustomerID, "qurl-tunnel-server-b", "agent", "layerv-ac-tf", "connect.layerv.xyz", "frps-b.nhp.sandbox.internal", 7001, 120, true)
+	q.putWithPortSuffix(nhpSystemCustomerID, "qurl-tunnel-server-c", "agent", "layerv-ac-tf", "connect.layerv.xyz", "frps-c.nhp.sandbox.internal", 7002, 120, true)
+	q.putWithPortSuffix(nhpSystemCustomerID, "qurl-tunnel-server-z", "agent", "layerv-ac-tf", "connect.layerv.xyz", "frps-z.nhp.sandbox.internal", 65535, 120, true)
+	l := newTestResourceLookup(t, q, &captureApplier{})
+
+	asp, err := l.LookupAuthServiceProvider(context.Background(), "agent")
+	if err != nil {
+		t.Fatalf("lookup err: %v", err)
+	}
+
+	tests := []struct {
+		resourceID string
+		wantSuffix bool
+		wantHost   string
+		wantPort   int
+	}{
+		{
+			resourceID: "qurl-tunnel-server",
+			wantSuffix: false,
+			wantHost:   "connect.layerv.xyz",
+			wantPort:   7000,
+		},
+		{
+			resourceID: "qurl-tunnel-server-a",
+			wantSuffix: false,
+			wantHost:   "connect.layerv.xyz",
+			wantPort:   7000,
+		},
+		{
+			resourceID: "qurl-tunnel-server-b",
+			wantSuffix: true,
+			wantHost:   "connect.layerv.xyz:7001",
+			wantPort:   7001,
+		},
+		{
+			resourceID: "qurl-tunnel-server-c",
+			wantSuffix: true,
+			wantHost:   "connect.layerv.xyz:7002",
+			wantPort:   7002,
+		},
+		{
+			resourceID: "qurl-tunnel-server-z",
+			wantSuffix: true,
+			wantHost:   "connect.layerv.xyz:65535",
+			wantPort:   65535,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.resourceID, func(t *testing.T) {
+			group := asp.ResourceGroups[tt.resourceID]
+			if group == nil {
+				t.Fatalf("missing %s group; got %v", tt.resourceID, aspKeys(asp))
+			}
+			res := group.Resources[tt.resourceID]
+			if res == nil {
+				t.Fatalf("missing %s resource; got %v", tt.resourceID, groupResourceKeys(group))
+			}
+			if got := res.PortSuffix; got != tt.wantSuffix {
+				t.Fatalf("res.PortSuffix = %v, want %v", got, tt.wantSuffix)
+			}
+			if got := res.DestHost(); got != tt.wantHost {
+				t.Fatalf("res.DestHost() = %q, want %q", got, tt.wantHost)
+			}
+			if res.Addr == nil {
+				t.Fatal("res.Addr = nil, want non-nil NetAddress")
+			}
+			if got := res.Addr.Port; got != tt.wantPort {
+				t.Fatalf("res.Addr.Port = %d, want %d", got, tt.wantPort)
+			}
+		})
 	}
 }
 
@@ -404,20 +504,66 @@ func TestResourceLookup_HappyPathMatchesPluginReadShape(t *testing.T) {
 // regression must NOT dark the entire catalog. Remaining rows still
 // populate the resolved aspData and an operator-visible WARN log fires.
 func TestResourceLookup_SkipsMalformedRow_ContinuesWithRest(t *testing.T) {
-	q := newFakeResourcesQuerier()
-	q.putMalformedRow(nhpSystemCustomerID, "bad-resource")
-	putTunnelServerRow(q, "qurl-tunnel-server")
-	l := newTestResourceLookup(t, q, &captureApplier{})
+	tests := []struct {
+		name       string
+		resourceID string
+		seed       func(*fakeResourcesQuerier)
+	}{
+		{
+			name:       "unmarshal failure",
+			resourceID: "bad-resource",
+			seed: func(q *fakeResourcesQuerier) {
+				q.putMalformedRow(nhpSystemCustomerID, "bad-resource")
+			},
+		},
+		{
+			name:       "empty resource_fqdn",
+			resourceID: "empty-fqdn",
+			seed: func(q *fakeResourcesQuerier) {
+				q.putWithPortSuffix(nhpSystemCustomerID, "empty-fqdn", "agent", "layerv-ac-tf", "", "frps-a.nhp.sandbox.internal", 7001, 120, true)
+			},
+		},
+		{
+			name:       "port_suffix non-positive dest_port",
+			resourceID: "bad-port-suffix-zero",
+			seed: func(q *fakeResourcesQuerier) {
+				q.putWithPortSuffix(nhpSystemCustomerID, "bad-port-suffix-zero", "agent", "layerv-ac-tf", "connect.layerv.xyz", "frps-b.nhp.sandbox.internal", 0, 120, true)
+			},
+		},
+		{
+			name:       "port_suffix oversized dest_port",
+			resourceID: "bad-port-suffix-high",
+			seed: func(q *fakeResourcesQuerier) {
+				q.putWithPortSuffix(nhpSystemCustomerID, "bad-port-suffix-high", "agent", "layerv-ac-tf", "connect.layerv.xyz", "frps-c.nhp.sandbox.internal", 65536, 120, true)
+			},
+		},
+	}
 
-	asp, err := l.LookupAuthServiceProvider(context.Background(), "agent")
-	if err != nil {
-		t.Fatalf("lookup err: %v, want success despite malformed row", err)
-	}
-	if _, ok := asp.ResourceGroups["qurl-tunnel-server"]; !ok {
-		t.Errorf("qurl-tunnel-server missing; malformed row must not dark the rest of the catalog")
-	}
-	if _, ok := asp.ResourceGroups["bad-resource"]; ok {
-		t.Errorf("bad-resource present; the malformed row must be skipped")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			q := newFakeResourcesQuerier()
+			tt.seed(q)
+			putTunnelServerRow(q, "qurl-tunnel-server")
+			counter := &fakeCounterIncrementer{}
+			l := newTestResourceLookup(t, q, &captureApplier{})
+			l.SetMetrics(counter)
+
+			asp, err := l.LookupAuthServiceProvider(context.Background(), "agent")
+			if err != nil {
+				t.Fatalf("lookup err: %v, want success despite malformed row", err)
+			}
+			if _, ok := asp.ResourceGroups["qurl-tunnel-server"]; !ok {
+				t.Errorf("qurl-tunnel-server missing; malformed row must not dark the rest of the catalog")
+			}
+			if _, ok := asp.ResourceGroups[tt.resourceID]; ok {
+				t.Errorf("%s present; malformed rows must be skipped", tt.resourceID)
+			}
+			counter.mu.Lock()
+			defer counter.mu.Unlock()
+			if got := counter.counts[MetricResourceLookupMalformedRow]; got != 1 {
+				t.Errorf("MetricResourceLookupMalformedRow fire count = %d, want 1 for %s", got, tt.name)
+			}
+		})
 	}
 }
 

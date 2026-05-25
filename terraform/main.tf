@@ -1076,16 +1076,13 @@ module "ac" {
     enable_instance_hrw            = var.enable_instance_hrw
     instance_discovery_ttl_seconds = var.instance_discovery_ttl_seconds
     enable_qurl_site_authz         = var.enable_qurl_site_authz
-    # Per-AZ qurl-reverse-tunnel-server boundary allowlist. Computed from
-    # the SAME root vars the qurl-reverse-tunnel-server module consumes
-    # (`var.frps_az_suffixes`, `module.data.namespace_name`,
-    # `var.frps_vhost_http_port`) so the qurl-router's runtime
-    # set-membership check on per-resource `upstream_addr` from the QURL
-    # API can never disagree with what BuildUpstreamAddr emits
-    # (qurl-service:internal/service/upstream_assign.go::BuildUpstreamAddr
-    # — `http://frps-{az}.{domain}:{port}`). Empty when frps isn't
-    # deployed → tunnel routing is disabled at the plugin gate by
-    # construction, matching `deploy_frps=false` runtime behavior.
+    # qurl-reverse-tunnel-server boundary allowlist. Public FRP control
+    # ingress is per-AZ: connect.layerv.* exposes one NHP-protected TCP
+    # listener port per suffix, and the qurl-tunnel-server-{suffix}
+    # resource rows return the matching host:port in the knock ack. Keep
+    # this allowlist sourced from the same var.frps_az_suffixes root input
+    # so qurl-router validation and qurl-service upstream_addr emission
+    # move in lockstep.
     #
     # The inner check here is just `var.deploy_frps`; the
     # `qurl_router_enabled` gate is the outer ternary on this whole
@@ -1122,38 +1119,36 @@ module "ac" {
   # Secret reconciliation (cleanup orphaned per-instance secrets)
   enable_secret_reconciliation = var.enable_secret_reconciliation
 
-  # qurl-reverse-tunnel-server integration. With the per-AZ fleet (#1499),
-  # there's no single tunnel-server host to point Traefik at — frpc connects
-  # directly to the per-AZ instance via the API-supplied `frps_addr`. The
-  # AC's qurl-router plugin uses the same per-resource `frps_addr` from
-  # the QURL API for vhost forwarding, BUT only after the request passes
-  # the plugin's `q.frpFallback == nil` gate — which requires a non-empty
-  # operator-declared boundary allowlist (`frpServerUrls`, threaded above
-  # via `qurl_router_config.frp_server_urls`). Setting `frp_server_host
-  # = ""` disables the legacy `/.well-known/layerv-frp` Traefik control-
-  # channel router; the legacy singular `frpServerUrl` plugin field has
-  # been removed from the plugin's Config struct, so the empty value
-  # rendered into dynamic.toml is silently ignored. `frp_control_port` /
-  # `frp_vhost_http_port` are still threaded for module-API stability; a
-  # follow-up may delete the AC-side variables and the `if
-  # frp_server_host != ""` branch entirely once the per-AZ rollout is
-  # verified in prod.
+  # qurl-reverse-tunnel-server integration. qurl-router gets its tunnel
+  # HTTP backend from the QURL API's per-resource `upstream_addr`, not from
+  # the legacy singular AC fallback. Setting `frp_server_host = ""`
+  # disables the legacy `/.well-known/layerv-frp` Traefik control-channel
+  # router; the legacy singular `frpServerUrl` plugin field has been
+  # removed from the plugin's Config struct, so the empty value rendered
+  # into dynamic.toml is silently ignored.
+  #
+  # `frp_control_port` / `frp_vhost_http_port` are still threaded for
+  # module-API stability. The public FRP control path is supplied by
+  # `frp_control_upstream_host` below.
   frp_server_host     = ""
   frp_control_port    = var.frps_bind_port
   frp_vhost_http_port = var.frps_vhost_http_port
 
-  # FRPS-behind-AC (SLACK_QURL_ROLLOUT.md §6, 2026-05-18). The AC's
-  # Traefik TCP entrypoint at `:${frps_bind_port}` forwards admitted
-  # SYNs (post-NHP-knock ipset gate) to this internal tunnel-server
-  # host. Source the host from the same `local.tunnel_server_resource`
-  # struct that the DDB seed row's `dest_host` field consumes, so both
-  # converge on one truth (lex-smallest AZ for v1). Empty string when
-  # FRPS isn't deployed — disables the AC NLB:7000 listener, the
-  # new TG, and the Traefik TCP entrypoint via the
-  # `count = ... ? 1 : 0` and `%{ if frp_control_upstream_host != "" ~}`
-  # gates downstream.
+  # FRPS-behind-AC (SLACK_QURL_ROLLOUT.md §6, 2026-05-18). The AC
+  # exposes the primary listener on frps_bind_port for legacy clients and
+  # additional per-AZ listeners on frps_bind_port+index. Each listener is
+  # still NHP-gated at the AC kernel; the only difference is which private
+  # FRPS Cloud Map host Traefik forwards to after the knock opens the
+  # specific public port.
   #
-  # Predicate mirrors `local.tunnel_server_resource.enabled` so the
+  # Ordering contract: `local.tunnel_server_az_suffixes` is sorted in
+  # resources.tf, so the lexicographically-smallest suffix is the primary
+  # AZ that keeps `frps_bind_port`; later suffixes get `+index` ports.
+  # Adding a suffix after the current set is safe. Removing/replacing the
+  # lexicographically-smallest suffix shifts every remaining suffix's public
+  # port and requires a coordinated rollout.
+  #
+  # Predicate mirrors `local.tunnel_server_resources_enabled` so the
   # upstream-host and the DDB seed row converge on the same enable
   # condition. The `&& var.deploy_qurl_service`
   # conjunct is redundant in practice — `terraform_data.frps_preconditions`
@@ -1162,8 +1157,21 @@ module "ac" {
   # who haven't followed the precondition chain.
   frp_control_upstream_host = (
     var.deploy_frps && var.deploy_qurl_service
-    ? local.tunnel_server_resource.dest_host
+    ? local.tunnel_server_primary_host
     : ""
+  )
+  frp_control_additional_upstreams = (
+    var.deploy_frps && var.deploy_qurl_service
+    ? {
+      for idx, suffix in local.tunnel_server_az_suffixes :
+      suffix => {
+        listen_port   = local.tunnel_server_az_control_port[suffix]
+        upstream_host = "frps-${suffix}.${module.data.namespace_name}"
+        upstream_port = var.frps_bind_port
+      }
+      if idx > 0
+    }
+    : {}
   )
 
   # Order the AC launch-template render after the internal-ALB stack is
@@ -2064,15 +2072,10 @@ module "qurl_service" {
   # NHP integration (headless resolve)
   nhp_server_internal_url = var.deploy_ac ? "http://server.${module.data.namespace_name}:8888" : ""
 
-  # qurl-reverse-tunnel-server per-AZ routing (#1499). Threaded from the
-  # SAME root source of truth that the qurl-reverse-tunnel-server module reads above
-  # (`var.frps_az_suffixes`, `module.data.namespace_name`,
-  # `var.frps_vhost_http_port`) so the qurl-service env vars can never
-  # drift from what the tunnel server actually publishes. Empty/zero when
-  # `deploy_frps = false` so qurl-service falls back to its previous
-  # behavior (no `frps_addr` in API responses), and the qurl-service
-  # module's own ternary in `container_env` skips the env vars
-  # entirely.
+  # qurl-reverse-tunnel-server routing (#1499). qurl-service is the
+  # upstream_addr oracle; with per-AZ public control ingress, every
+  # suffix in var.frps_az_suffixes is reachable by a matching
+  # qurl-tunnel-server-{suffix} NHP resource row.
   frps_az_suffixes = var.deploy_frps ? join(",", var.frps_az_suffixes) : ""
   frps_domain      = var.deploy_frps ? module.data.namespace_name : ""
   frps_port        = var.deploy_frps ? var.frps_vhost_http_port : 0

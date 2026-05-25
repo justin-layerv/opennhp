@@ -187,6 +187,16 @@ locals {
   # two-apply migration; see the lifecycle comment on the resource
   # for details.
   ac_frps_control_tg_name = replace("${var.name_prefix}-ac-frps-ctl", "_", "-")
+
+  ac_frps_control_additional_tg_names = {
+    for name, _ in var.frp_control_additional_upstreams :
+    name => replace("${var.name_prefix}-ac-frps-${name}", "_", "-")
+  }
+
+  frp_control_listener_ports = concat(
+    var.frp_control_upstream_host != "" ? [var.frp_control_port] : [],
+    [for _, upstream in var.frp_control_additional_upstreams : upstream.listen_port],
+  )
 }
 
 # Route 53 hosted zone lookup for DNS-01 challenge
@@ -382,6 +392,21 @@ resource "aws_vpc_security_group_ingress_rule" "ac_frps_control" {
   # diverging this one.
   tags = {
     Name = "${var.name_prefix}-ac-frps-control"
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "ac_frps_control_additional" {
+  for_each = var.frp_control_additional_upstreams
+
+  security_group_id = aws_security_group.ac.id
+  description       = "FRPS control channel ${each.key} (NHP-gated at AC kernel ipset)"
+  from_port         = each.value.listen_port
+  to_port           = each.value.listen_port
+  ip_protocol       = "tcp"
+  cidr_ipv4         = "0.0.0.0/0"
+
+  tags = {
+    Name = "${var.name_prefix}-ac-frps-control-${each.key}"
   }
 }
 
@@ -929,11 +954,29 @@ locals {
     enable_egress_eips = var.enable_egress_eips
     eip_pool_tag       = local.eip_pool_tag
     # FRP tunnel server integration
-    frp_server_host           = var.frp_server_host
-    frp_control_port          = var.frp_control_port
-    frp_vhost_http_port       = var.frp_vhost_http_port
-    frp_control_upstream_host = var.frp_control_upstream_host
+    frp_server_host                  = var.frp_server_host
+    frp_control_port                 = var.frp_control_port
+    frp_vhost_http_port              = var.frp_vhost_http_port
+    frp_control_upstream_host        = var.frp_control_upstream_host
+    frp_control_additional_upstreams = var.frp_control_additional_upstreams
+    frp_control_listener_ports       = local.frp_control_listener_ports
   })
+}
+
+resource "terraform_data" "frps_control_listener_port_preconditions" {
+  count = length(local.frp_control_listener_ports) > 0 ? 1 : 0
+
+  input = join(",", [for port in local.frp_control_listener_ports : tostring(port)])
+
+  # Standalone fence by design: Terraform evaluates lifecycle
+  # preconditions at plan time even without a downstream consumer, and
+  # `input` makes port-set changes visible in the plan.
+  lifecycle {
+    precondition {
+      condition     = length(distinct(local.frp_control_listener_ports)) == length(local.frp_control_listener_ports)
+      error_message = "FRPS control listener ports must be unique. The primary frp_control_port and every frp_control_additional_upstreams[*].listen_port are public AC NLB listeners and cannot share a port."
+    }
+  }
 }
 
 # Plan-time render lint for the FRPS-behind-AC Traefik bits. The TG
@@ -957,7 +1000,7 @@ locals {
 # literal at schema-rewrite time is one PR; the cost of the typo
 # silently shipping is much higher.
 resource "terraform_data" "ac_user_data_frps_control_traefik_render_check" {
-  count = var.frp_control_upstream_host != "" ? 1 : 0
+  count = (var.frp_control_upstream_host != "" || length(var.frp_control_additional_upstreams) > 0) ? 1 : 0
 
   # Re-evaluate when the rendered user_data changes so the precondition
   # re-runs on every render. `sha256` (vs `md5`) avoids Trivy/CIS
@@ -986,11 +1029,24 @@ resource "terraform_data" "ac_user_data_frps_control_traefik_render_check" {
       # three `frp_control_upstream_host != ""` blocks has regressed.
       # The TG `/ping` healthcheck wouldn't catch any of them.
       condition = (
-        strcontains(local.user_data, "[entryPoints.frps-control]") &&
-        strcontains(local.user_data, "[tcp.routers.frps-control]") &&
-        strcontains(local.user_data, "-A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT")
+        strcontains(local.user_data, "-A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT") &&
+        (
+          var.frp_control_upstream_host == "" ||
+          (
+            strcontains(local.user_data, "[entryPoints.frps-control]") &&
+            strcontains(local.user_data, "[tcp.routers.frps-control]") &&
+            strcontains(local.user_data, "[tcp.services.frps-control.loadBalancer]")
+          )
+        ) &&
+        alltrue([
+          for name, upstream in var.frp_control_additional_upstreams :
+          strcontains(local.user_data, "[entryPoints.frps-control-${name}]") &&
+          strcontains(local.user_data, "[tcp.routers.frps-control-${name}]") &&
+          strcontains(local.user_data, "[tcp.services.frps-control-${name}.loadBalancer]") &&
+          strcontains(local.user_data, "[[tcp.services.frps-control-${name}.loadBalancer.servers]]\n    address = \"${upstream.upstream_host}:${upstream.upstream_port}\"")
+        ])
       )
-      error_message = "AC user_data render is missing one of `[entryPoints.frps-control]`, `[tcp.routers.frps-control]`, or the `-A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT` iptables rule despite frp_control_upstream_host being set. A templatefile-condition regression in `user_data.sh.tpl` would silently produce this. The TG `/ping` healthcheck wouldn't catch any of them — see lifecycle comment on aws_lb_target_group.ac_frps_control."
+      error_message = "AC user_data render is missing one of the FRPS-control Traefik entrypoints/routers/services or the `-A INPUT -m set --match-set defaultset src,dst,dst -j ACCEPT` iptables rule despite FRPS control ingress being configured. A templatefile-condition regression in `user_data.sh.tpl` would silently produce this. The TG `/ping` healthcheck wouldn't catch any of them — see lifecycle comment on aws_lb_target_group.ac_frps_control."
     }
   }
 }
@@ -1582,6 +1638,49 @@ resource "aws_lb_target_group" "ac_frps_control" {
   }
 }
 
+resource "aws_lb_target_group" "ac_frps_control_additional" {
+  for_each = var.frp_control_additional_upstreams
+
+  name        = local.ac_frps_control_additional_tg_names[each.key]
+  port        = each.value.listen_port
+  protocol    = "TCP"
+  vpc_id      = var.vpc_id
+  target_type = "instance"
+
+  # Same caveat as the primary `ac_frps_control` TG: `/ping` proves the
+  # Traefik process is alive, not that this specific FRPS-control TCP
+  # entrypoint parsed and bound. A real TCP health check would be blocked
+  # by the NHP ipset gate unless allowlisted, which would defeat the gate.
+  health_check {
+    enabled             = true
+    protocol            = "HTTP"
+    port                = "8080"
+    path                = "/ping"
+    matcher             = "200"
+    interval            = 30
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+
+  # Mirrors the primary FRPS-control TG. These connections are long-lived
+  # FRP yamux control sessions, so `connection_termination=true` would turn
+  # every AC refresh into a synchronized re-knock/re-login storm.
+  deregistration_delay = 30
+
+  tags = var.tags
+
+  # NOTE on TG-name renames: same fixed-name/two-apply migration caveat as
+  # `ac_frps_control`. The provider's `name_prefix` is too short for a
+  # descriptive identifier, and AWS rejects replacement TGs with duplicate
+  # names during create-before-destroy.
+  lifecycle {
+    precondition {
+      condition     = length(local.ac_frps_control_additional_tg_names[each.key]) <= 32
+      error_message = "aws_lb_target_group.ac_frps_control_additional[${each.key}].name (`${local.ac_frps_control_additional_tg_names[each.key]}`, length=${length(local.ac_frps_control_additional_tg_names[each.key])}) exceeds the 32-char AWS limit. Shorten var.name_prefix or the additional-upstream key."
+    }
+  }
+}
+
 # TRANSITIONAL — see banner on the NLB listener above and nhp #2019.
 # Removal of the AC from the FRPS data plane unwinds this attachment.
 resource "aws_autoscaling_attachment" "ac_frps_control" {
@@ -1589,6 +1688,13 @@ resource "aws_autoscaling_attachment" "ac_frps_control" {
 
   autoscaling_group_name = aws_autoscaling_group.ac.name
   lb_target_group_arn    = aws_lb_target_group.ac_frps_control[0].arn
+}
+
+resource "aws_autoscaling_attachment" "ac_frps_control_additional" {
+  for_each = var.frp_control_additional_upstreams
+
+  autoscaling_group_name = aws_autoscaling_group.ac.name
+  lb_target_group_arn    = aws_lb_target_group.ac_frps_control_additional[each.key].arn
 }
 
 resource "aws_lb_listener" "frps_control" {
@@ -1601,6 +1707,26 @@ resource "aws_lb_listener" "frps_control" {
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.ac_frps_control[0].arn
+  }
+
+  tags = var.tags
+}
+
+resource "aws_lb_listener" "frps_control_additional" {
+  for_each = var.frp_control_additional_upstreams
+
+  # Rollout note: these public listeners and their NHP DDB rows can apply
+  # before every existing AC instance has refreshed user_data and bound the
+  # matching Traefik entrypoint. Before qurl-service starts assigning
+  # suffix-specific NHP resource IDs (tracked in qurl-service#732), deploy
+  # the listeners, refresh/verify the AC fleet, then enable suffix knocks.
+  load_balancer_arn = aws_lb.ac.arn
+  port              = each.value.listen_port
+  protocol          = "TCP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.ac_frps_control_additional[each.key].arn
   }
 
   tags = var.tags

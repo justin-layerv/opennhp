@@ -165,3 +165,26 @@ func TestRedirectTarget_Validate_AllRequiredFields(t *testing.T) {
 		})
 	}
 }
+
+func TestResourceInfo_DestHost_EmptyHostWithPortSuffix(t *testing.T) {
+	res := &ResourceInfo{
+		PortSuffix: true,
+		Addr:       &NetAddress{Port: 7001, Protocol: "tcp"},
+	}
+
+	if got := res.DestHost(); got != "" {
+		t.Fatalf("DestHost() = %q, want empty host rather than malformed :port", got)
+	}
+}
+
+func TestResourceInfo_DestHost_PortSuffixWithZeroPort(t *testing.T) {
+	res := &ResourceInfo{
+		Hostname:   "connect.layerv.xyz",
+		PortSuffix: true,
+		Addr:       &NetAddress{Port: 0, Protocol: "tcp"},
+	}
+
+	if got := res.DestHost(); got != "" {
+		t.Fatalf("DestHost() = %q, want empty host rather than silently dropping required port suffix", got)
+	}
+}

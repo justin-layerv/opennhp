@@ -523,7 +523,7 @@ const (
 
 	// MetricResourceLookupMalformedRow fires once per row that the
 	// resolver had to skip during a cache-miss iteration. The counter
-	// is overloaded across three semantically distinct trigger
+	// is overloaded across four semantically distinct trigger
 	// conditions — operators triaging a non-zero rate should grep the
 	// structured-log Warning for the cause:
 	//
@@ -532,19 +532,20 @@ const (
 	//     reconcile terraform's `aws_dynamodb_table_item.frps_nhp_resource`
 	//     (terraform/resources.tf) with the Go Resource struct
 	//     (endpoints/server/storage.go::Resource).
-	//   - Cross-partition row (row.CustomerID != l.customerID): the
-	//     KeyConditionExpression regressed AND DDB returned rows from
-	//     a different partition. SEVERE — surfaces as a potential
-	//     cross-tenant correctness bug if the partition schema ever
-	//     becomes per-tenant. Remediation: audit recent changes to
-	//     queryAndCache's QueryInput construction.
 	//   - Empty resource_id: writer wrote a row missing the SK. The
 	//     SK is required at table level so this shouldn't reach the
 	//     reader, but defensive in case of a future schema change or
 	//     a hand-edited row. Remediation: identify the writer that
 	//     emitted the empty-SK row and fence it server-side.
+	//   - Empty resource_fqdn: writer omitted the public dial host the
+	//     agent receives in the ACK. Remediation: reconcile the DDB
+	//     seed writer's `resource_fqdn` with ResourceInfo.Hostname.
+	//   - port_suffix=true with out-of-range dest_port: writer asked
+	//     the ACK to include a public port suffix but emitted no usable
+	//     1..65535 port. Remediation: fix the DDB seed row before
+	//     agents dial a bare hostname and hide the broken suffix contract.
 	//
-	// All three are structurally writer-side regressions of similar
+	// All four are structurally writer-side regressions of similar
 	// alarm urgency. A sustained non-zero value is evidence the
 	// terraform writer and the Go reader have drifted apart.
 	//

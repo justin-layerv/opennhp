@@ -43,7 +43,7 @@ resource "terraform_data" "frps_env_var_triple" {
         ) || (
         var.frps_port != 0 && var.frps_domain != "" && var.frps_az_suffixes != ""
       )
-      error_message = "qurl-service FRPS env vars (frps_az_suffixes, frps_domain, frps_port) must be set together or all unset. Partial wiring silently falls back to no `frps_addr` in API responses."
+      error_message = "qurl-service FRPS env vars (frps_az_suffixes, frps_domain, frps_port) must be set together or all unset. Partial wiring silently falls back to no `upstream_addr` in API responses."
     }
   }
 }
@@ -359,8 +359,8 @@ locals {
       { name = "NHP_SERVER_PORT", value = var.nhp_server_port },
       { name = "QURL_AGENT_BOOTSTRAP_ENABLED", value = var.enable_qurl_agent_bootstrap ? "true" : "false" },
     ] : [],
-    # FRPS per-AZ integration (#1499). qurl-service hashes OwnerID to a
-    # suffix and emits `frps-${suffix}.${domain}:${port}` as `frps_addr`
+    # FRPS integration (#1499). qurl-service hashes OwnerID to a
+    # suffix and emits `frps-${suffix}.${domain}:${port}` as `upstream_addr`
     # in CreateResource / GetResourceTarget responses. All three vars
     # must be set together — gated on `frps_port != 0` because Terraform
     # comparisons of empty string in `concat([...], cond ? [...] : [])`

@@ -13,49 +13,68 @@
 # That dual-write path was removed once the bridge proved out — the
 # DDB row is now the single source of truth.
 locals {
-  # Single NHP resId for the reverse-tunnel control channel — the
-  # protected resource the agent knocks for. Per the NHP spec (CSA
-  # "Stealth Mode SDP for Zero Trust Network Infrastructure" Appendix 2,
-  # NHP-KNK Message Fields): Resource ID identifies "the protected
-  # resource being accessed" — the identity of WHAT is protected, not
-  # where it's deployed (region, environment) or which underlying tunnel
-  # tech happens to fronts it (FRPS today, possibly different later).
-  # Routing concerns belong in the AC-returned Hostname/Port, not the
-  # resId. The same name is used in every environment.
+  # Legacy NHP resId for the reverse-tunnel control channel. Kept as a
+  # compatibility alias for pre-per-AZ clients; new clients knock the
+  # suffix-specific resources below so the AC can return a port-suffixed
+  # ResourceHost that dials the matching public listener.
   tunnel_server_res_id = "qurl-tunnel-server"
 
-  tunnel_server_resource = {
-    enabled = var.deploy_frps && var.deploy_qurl_service
-    # Two distinct hostnames — do not conflate.
-    #
-    #   - `dest_host`: INTERNAL per-AZ Cloud Map name (private,
-    #     AC-SG-only). Retained on the seed row for forensics and for
-    #     a future case where the dial target genuinely diverges from
-    #     the ingress hostname (proxy/gateway in front). The bridge
-    #     does NOT propagate this field into the agent's ack today
-    #     (see resource_lookup.go::queryAndCache — `Hostname` carries
-    #     the dial target, `Addr.Ip` is the load-bearing empty
-    #     sentinel). Still carries the `frps-` prefix because it
-    #     names the Cloud Map service, which lives in a separate
-    #     naming axis from the NHP resId.
-    #
-    #   - `customer_facing_host`: PUBLIC DNS name the agent dials.
-    #     Written into the DDB seed row's `resource_fqdn` field; the
-    #     bridge materializes that as `ResourceInfo.Hostname` and the
-    #     agent's `DestHost()` prefers Hostname over the empty
-    #     `Addr.Ip` sentinel.
-    dest_host            = "frps-${sort(var.frps_az_suffixes)[0]}.${module.data.namespace_name}"
-    customer_facing_host = var.connect_layerv_host
+  tunnel_server_resources_enabled = var.deploy_frps && var.deploy_qurl_service
+
+  # Deterministic AZ ordering is load-bearing for two public contracts:
+  #   1. primary/legacy qurl-tunnel-server keeps using frps_bind_port;
+  #   2. suffix resources map to frps_bind_port + index.
+  #
+  # The port map is the only practical way to expose per-AZ public
+  # control ingress on one DNS name: FRP control is raw TCP/yamux, so an
+  # NLB/Traefik listener cannot route by HTTP Host or TLS SNI.
+  tunnel_server_az_suffixes     = var.deploy_frps ? sort(var.frps_az_suffixes) : []
+  tunnel_server_primary_az      = length(local.tunnel_server_az_suffixes) > 0 ? local.tunnel_server_az_suffixes[0] : ""
+  tunnel_server_primary_host    = local.tunnel_server_primary_az != "" ? "frps-${local.tunnel_server_primary_az}.${module.data.namespace_name}" : ""
+  tunnel_server_az_control_port = { for idx, suffix in local.tunnel_server_az_suffixes : suffix => var.frps_bind_port + idx }
+
+  # Resource row shape:
+  #
+  #   - dest_host: internal per-AZ Cloud Map name. Informational for the
+  #     NHP ack today, but useful for forensics and for the AC module's
+  #     public-listener -> private-FRPS forwarding contract.
+  #
+  #   - customer_facing_host/customer_facing_port: public connect.layerv.*
+  #     endpoint the agent dials after a successful knock. Non-primary
+  #     rows set port_suffix=true so ResourceInfo.DestHost() returns
+  #     "connect.layerv.*:<port>" and the ipset-opened tuple matches the
+  #     per-AZ public listener. The legacy alias and primary suffix row
+  #     deliberately keep port_suffix=false so clients on the default
+  #     BoundaryPort=7000 keep receiving the historic bare hostname.
+  tunnel_server_legacy_resources = (
+    local.tunnel_server_primary_host != "" ? {
+      (local.tunnel_server_res_id) = {
+        dest_host            = local.tunnel_server_primary_host
+        customer_facing_host = var.connect_layerv_host
+        customer_facing_port = var.frps_bind_port
+        port_suffix          = false
+      }
+    } : {}
+  )
+
+  tunnel_server_az_resources = {
+    for suffix in local.tunnel_server_az_suffixes :
+    "${local.tunnel_server_res_id}-${suffix}" => {
+      dest_host            = "frps-${suffix}.${module.data.namespace_name}"
+      customer_facing_host = var.connect_layerv_host
+      customer_facing_port = local.tunnel_server_az_control_port[suffix]
+      # Non-primary suffixes append the public listener port; the
+      # primary suffix keeps the default frps_bind_port. That makes the
+      # primary suffix row a structural duplicate of the legacy alias
+      # today, intentionally preserving a symmetric per-AZ resource ID
+      # while leaving room to retire the legacy alias independently.
+      port_suffix = local.tunnel_server_az_control_port[suffix] != var.frps_bind_port
+    }
   }
 
-  # Single-entry map keyed on the spec-aligned resId. Retains the map
-  # shape so the downstream `for_each` loop over `seed-rows` doesn't
-  # need restructuring when a second LayerV-platform agent resource
-  # eventually lands — adding a new row is one more entry in this
-  # local + one more DDB write, no bridge or plugin change needed.
   tunnel_server_resource_ids = (
-    local.tunnel_server_resource.enabled
-    ? { (local.tunnel_server_res_id) = local.tunnel_server_resource }
+    local.tunnel_server_resources_enabled
+    ? merge(local.tunnel_server_legacy_resources, local.tunnel_server_az_resources)
     : {}
   )
 
@@ -88,7 +107,7 @@ check "tunnel_server_dest_host_shape" {
       for _, cfg in local.tunnel_server_resource_ids :
       can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$", cfg.dest_host))
     ])
-    error_message = "Every `local.tunnel_server_resource_ids[*].dest_host` is the internal tunnel-server dial target written into the DDB seed row's `dest_host` field; each must be a per-label RFC 1035 DNS name. Today's values derive from `module.data.namespace_name` + `var.frps_az_suffixes[0]` which already conform; a future change to either input must preserve that."
+    error_message = "Every `local.tunnel_server_resource_ids[*].dest_host` is the internal tunnel-server dial target written into the DDB seed row's `dest_host` field; each must be a per-label RFC 1035 DNS name. Today's values derive from `module.data.namespace_name` + `var.frps_az_suffixes` which already conform; a future change to either input must preserve that."
   }
 }
 
@@ -112,6 +131,8 @@ resource "aws_dynamodb_table_item" "tunnel_server_nhp_resource" {
   #                     token; the server uses this to route the AC op)
   #   resource_fqdn   → ResourceInfo.Hostname (what the agent dials)
   #   dest_port       → ResourceInfo.Addr.Port
+  #   port_suffix     → ResourceInfo.PortSuffix. When true, the ack
+  #                     ResourceHost is "resource_fqdn:dest_port".
   #   open_time       → ResourceGroup.OpenTime (clamped if ≤0 or
   #                     exceeds uint32 by the bridge)
   #
@@ -135,7 +156,8 @@ resource "aws_dynamodb_table_item" "tunnel_server_nhp_resource" {
     ac_id           = { S = var.qurl_default_ac_id }
     resource_fqdn   = { S = each.value.customer_facing_host }
     dest_host       = { S = each.value.dest_host }
-    dest_port       = { N = tostring(var.frps_bind_port) }
+    dest_port       = { N = tostring(each.value.customer_facing_port) }
+    port_suffix     = { BOOL = each.value.port_suffix }
     open_time       = { N = tostring(local.tunnel_server_open_time) }
   })
 

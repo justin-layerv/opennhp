@@ -1074,6 +1074,10 @@ cat > /home/ubuntu/traefik/traefik.toml << TRAEFIKEOF
   [entryPoints.frps-control]
     address = "0.0.0.0:${frp_control_port}"
 %{ endif ~}
+%{ for name, upstream in frp_control_additional_upstreams ~}
+  [entryPoints.frps-control-${name}]
+    address = "0.0.0.0:${upstream.listen_port}"
+%{ endfor ~}
 
 %{ if centralized_cert_enabled ~}
 # Centralized certificate from Secrets Manager (no per-instance ACME)
@@ -1414,7 +1418,7 @@ FRPDYNAMICEOF
 echo "FRP tunnel server routes added (ingress /.well-known/layerv-frp or /~!frp -> ${frp_server_host}:${frp_control_port})"
 %{ endif ~}
 
-%{ if frp_control_upstream_host != "" ~}
+%{ if frp_control_upstream_host != "" || length(frp_control_additional_upstreams) > 0 ~}
 # ============================================================================
 # FRPS-behind-AC TCP entrypoint forwarder (SLACK_QURL_ROLLOUT.md §6)
 #
@@ -1476,14 +1480,16 @@ cat > /home/ubuntu/traefik/frps-control.toml << 'FRPSCTRLEOF'
 #      Resolves publicly to this AC's NLB.
 #   2. Internal upstream this Traefik TCP service forwards to (e.g.
 #      `frps-{az}.nhp.{env}.internal`) — sourced from
-#      `var.frp_control_upstream_host` (= `local.tunnel_server_resource.dest_host`
-#      in the root). VPC-private, FRPS SG only accepts AC SG.
+#      `var.frp_control_upstream_host` (= `local.tunnel_server_primary_host`
+#      in the root) plus any per-AZ additional upstreams. VPC-private,
+#      FRPS SG only accepts AC SG.
 #
 # The whole point of the 2026-05-18 redesign was splitting these:
 # customer-facing dial target ≠ internal upstream. This file configures
 # only the AC-userspace → internal-FRPS leg (#2). The customer-facing
 # DNS (#1) lives in `terraform/main.tf::aws_route53_record.connect{_cross_account}`.
 
+%{ if frp_control_upstream_host != "" ~}
 [tcp.routers.frps-control]
   rule = "HostSNI(`*`)"
   service = "frps-control"
@@ -1492,9 +1498,21 @@ cat > /home/ubuntu/traefik/frps-control.toml << 'FRPSCTRLEOF'
 [tcp.services.frps-control.loadBalancer]
   [[tcp.services.frps-control.loadBalancer.servers]]
     address = "${frp_control_upstream_host}:${frp_control_port}"
+%{ endif ~}
+%{ for name, upstream in frp_control_additional_upstreams ~}
+
+[tcp.routers.frps-control-${name}]
+  rule = "HostSNI(`*`)"
+  service = "frps-control-${name}"
+  entryPoints = ["frps-control-${name}"]
+
+[tcp.services.frps-control-${name}.loadBalancer]
+  [[tcp.services.frps-control-${name}.loadBalancer.servers]]
+    address = "${upstream.upstream_host}:${upstream.upstream_port}"
+%{ endfor ~}
 FRPSCTRLEOF
 chmod 644 /home/ubuntu/traefik/frps-control.toml
-echo "FRPS-behind-AC TCP forwarder added (entrypoint :${frp_control_port} -> ${frp_control_upstream_host}:${frp_control_port})"
+echo "FRPS-behind-AC TCP forwarder added (listener ports: ${join(" ", frp_control_listener_ports)})"
 %{ endif ~}
 
 %{ if !centralized_cert_enabled ~}
@@ -1753,7 +1771,7 @@ systemctl enable traefik nhp-acd nhp-cloudmap-register nhp-health-monitor
 # chain default policy is DROP. A regression that flipped INPUT's
 # policy from DROP back to ACCEPT would silently re-leak port 7000
 # even with the rule still in place; the policy check catches that.
-%{ if frp_control_upstream_host != "" ~}
+%{ if frp_control_upstream_host != "" || length(frp_control_additional_upstreams) > 0 ~}
 # Use `iptables -S` for both checks — its save-format output puts the
 # target after the match conditions (matching the regex below) and
 # is deterministic across kernel/iptables versions, unlike `-L` which
@@ -1808,7 +1826,7 @@ systemctl start nhp-health-monitor
 # stays green. Runtime liveness for the frps-control listener is the
 # job of #2007's post-deploy smoke (TCP+FRP handshake from a knocked-
 # in agent); don't conflate the two.
-%{ if frp_control_upstream_host != "" ~}
+%{ if frp_control_upstream_host != "" || length(frp_control_additional_upstreams) > 0 ~}
 # Precheck: `nc` is installed at the top of user_data via apt
 # (netcat-openbsd); fail loudly here rather than letting the loop
 # below FATAL with the misleading "Traefik didn't bind" message
@@ -1817,44 +1835,46 @@ if ! command -v nc >/dev/null 2>&1; then
   echo "FATAL: nc binary not found — netcat-openbsd install failed earlier in user_data. The post-Traefik listener-bind verification cannot run." >&2
   exit 1
 fi
-echo "Waiting for Traefik listener on tcp/${frp_control_port}..."
-TRAEFIK_LISTENER_OK=0
-for _ in $(seq 1 60); do
-  if nc -z -w 1 127.0.0.1 ${frp_control_port} 2>/dev/null; then
-    TRAEFIK_LISTENER_OK=1
-    break
+for FRPS_CONTROL_PORT in ${join(" ", frp_control_listener_ports)}; do
+  echo "Waiting for Traefik listener on tcp/$FRPS_CONTROL_PORT..."
+  TRAEFIK_LISTENER_OK=0
+  for _ in $(seq 1 60); do
+    if nc -z -w 1 127.0.0.1 "$FRPS_CONTROL_PORT" 2>/dev/null; then
+      TRAEFIK_LISTENER_OK=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$TRAEFIK_LISTENER_OK" != "1" ]; then
+    echo "FATAL: Traefik did not bind tcp/$FRPS_CONTROL_PORT within ~60s — the frps-control entrypoint failed to bind. Check journalctl -u traefik for parse errors in /home/ubuntu/traefik/frps-control.toml. See #2007 for the broader observability story." >&2
+    # Pull this instance out of service. `exit 1` alone marks user_data
+    # as failed in cloud-init but does NOT auto-terminate the instance:
+    # Traefik's systemd unit is already started, its `/ping:8080`
+    # endpoint still returns 200, and the ASG would keep this instance
+    # in service indefinitely with a half-broken Traefik (every other
+    # entrypoint up, frps-control silently dropping SYNs). Stopping the
+    # Traefik unit fails the `/ping:8080` TG healthcheck across BOTH
+    # the existing TG and the new `aws_lb_target_group.ac_frps_control`,
+    # so the NLB sheds load on every entrypoint, the ASG's
+    # `ELB`-source HC marks the instance unhealthy, and a replacement
+    # instance launches. Trade-off: this also takes the AC out of
+    # service for QURL routing (which Traefik was serving fine) — but
+    # a half-broken Traefik with no frps-control listener is the worse
+    # of the two states for the FRPS-behind-AC topology and the ASG
+    # replacement covers QURL via the next healthy instance. A future
+    # enhancement could shell out to `aws autoscaling set-instance-health
+    # --health-status Unhealthy` here if granular failure reporting is
+    # needed; the canonical pattern lives at
+    # `terraform/modules/compute/user_data.sh.tpl:601` (the nhp-server's
+    # equivalent fail-fast path) and requires the instance to carry the
+    # matching IAM perms (the AC role would need
+    # `autoscaling:SetInstanceHealth` added at
+    # `terraform/modules/ac/main.tf` IAM block — out of scope for this fix).
+    systemctl stop traefik || true
+    exit 1
   fi
-  sleep 1
+  echo "Traefik listener on tcp/$FRPS_CONTROL_PORT is up."
 done
-if [ "$TRAEFIK_LISTENER_OK" != "1" ]; then
-  echo "FATAL: Traefik did not bind tcp/${frp_control_port} within ~60s — the frps-control entrypoint failed to bind. Check journalctl -u traefik for parse errors in /home/ubuntu/traefik/frps-control.toml. See #2007 for the broader observability story." >&2
-  # Pull this instance out of service. `exit 1` alone marks user_data
-  # as failed in cloud-init but does NOT auto-terminate the instance:
-  # Traefik's systemd unit is already started, its `/ping:8080`
-  # endpoint still returns 200, and the ASG would keep this instance
-  # in service indefinitely with a half-broken Traefik (every other
-  # entrypoint up, frps-control silently dropping SYNs). Stopping the
-  # Traefik unit fails the `/ping:8080` TG healthcheck across BOTH
-  # the existing TG and the new `aws_lb_target_group.ac_frps_control`,
-  # so the NLB sheds load on every entrypoint, the ASG's
-  # `ELB`-source HC marks the instance unhealthy, and a replacement
-  # instance launches. Trade-off: this also takes the AC out of
-  # service for QURL routing (which Traefik was serving fine) — but
-  # a half-broken Traefik with no frps-control listener is the worse
-  # of the two states for the FRPS-behind-AC topology and the ASG
-  # replacement covers QURL via the next healthy instance. A future
-  # enhancement could shell out to `aws autoscaling set-instance-health
-  # --health-status Unhealthy` here if granular failure reporting is
-  # needed; the canonical pattern lives at
-  # `terraform/modules/compute/user_data.sh.tpl:601` (the nhp-server's
-  # equivalent fail-fast path) and requires the instance to carry the
-  # matching IAM perms (the AC role would need
-  # `autoscaling:SetInstanceHealth` added at
-  # `terraform/modules/ac/main.tf` IAM block — out of scope for this fix).
-  systemctl stop traefik || true
-  exit 1
-fi
-echo "Traefik listener on tcp/${frp_control_port} is up."
 %{ endif ~}
 
 # ============================================================================

@@ -220,6 +220,7 @@ type Resource struct {
 	ACID          string `json:"ac_id" dynamodbav:"ac_id"`
 	DestHost      string `json:"dest_host" dynamodbav:"dest_host"`
 	DestPort      int    `json:"dest_port" dynamodbav:"dest_port"`
+	PortSuffix    bool   `json:"port_suffix,omitempty" dynamodbav:"port_suffix,omitempty"`
 	OpenTime      int    `json:"open_time" dynamodbav:"open_time"` // Seconds
 	AuthServiceID string `json:"auth_service_id" dynamodbav:"auth_service_id"`
 }
