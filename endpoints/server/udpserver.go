@@ -2699,65 +2699,13 @@ func (s *UdpServer) RemoveAddressAssociation(srcIp string) {
 	s.srcIpAssociatedAddrMapMutex.Unlock()
 }
 
-// Deprecated: AddAuthService mutates `s.authServiceMap` in place while
-// plugins read `helper.AspData.ResourceGroups` lock-free (see
-// `nhp/plugins/serverpluginhandler.go::NhpServerPluginHelper.AspData`).
-// The production path goes through `updateResources`' build-fresh-then-
-// atomic-swap pattern; this method appears to have no in-tree callers
-// today. See https://github.com/layervai/nhp/issues/2098 for cleanup.
-func (s *UdpServer) AddAuthService(aspData *common.AuthServiceProviderData) error {
-	if len(aspData.AuthSvcId) == 0 {
-		return errors.New("aspId is empty")
-	}
-
-	s.authServiceMapMutex.Lock()
-	s.authServiceMap[aspData.AuthSvcId] = aspData
-	s.authServiceMapMutex.Unlock()
-
-	// Try to load plugin from static registry first, then fall back to dynamic loading
-	h := plugins.GetPluginHandler(aspData.AuthSvcId, aspData.PluginPath)
-	if h != nil {
-		err := s.LoadPlugin(aspData.AuthSvcId, h)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// Deprecated: AddResource mutates `aspData.ResourceGroups` in place
-// while plugins read it lock-free (see
-// `nhp/plugins/serverpluginhandler.go::NhpServerPluginHelper.AspData`).
-// The production path goes through `updateResources`' build-fresh-then-
-// atomic-swap pattern; this method appears to have no in-tree callers
-// today. See https://github.com/layervai/nhp/issues/2098 for cleanup.
-func (s *UdpServer) AddResource(res *common.ResourceData) error {
-	if len(res.AuthServiceId) == 0 || len(res.ResourceId) == 0 {
-		return errors.New("aspId or resId is empty")
-	}
-
-	s.authServiceMapMutex.Lock()
-	aspData, found := s.authServiceMap[res.AuthServiceId]
-	if !found {
-		s.authServiceMapMutex.Unlock()
-		return errors.New("aspId not found")
-	}
-	aspData.ResourceGroups[res.ResourceId] = res
-	s.authServiceMapMutex.Unlock()
-
-	return nil
-}
-
 // applyAspMapDelta publishes a freshly-resolved *AuthServiceProviderData
-// into s.authServiceMap via build-fresh-then-atomic-swap. The
-// in-place-mutating siblings AddAuthService/AddResource are Deprecated
-// because they race plugin lock-free reads through helper.AspData;
-// this method allocates a fresh top-level map, copies existing
-// entries, installs the new aspId, and swaps the pointer atomically
-// under the write lock. Concurrent readers observe either the old or
-// new map snapshot; any pointer already handed to a plugin remains
-// valid for that plugin invocation.
+// into s.authServiceMap via build-fresh-then-atomic-swap. This method
+// allocates a fresh top-level map, copies existing entries, installs the
+// new aspId, and swaps the pointer atomically under the write lock.
+// Concurrent readers observe either the old or new map snapshot; any
+// pointer already handed to a plugin remains valid for that plugin
+// invocation.
 //
 // Fast path: pointer-equal install short-circuits (no fresh
 // allocation). The resolver's cache-hit republish drives most calls

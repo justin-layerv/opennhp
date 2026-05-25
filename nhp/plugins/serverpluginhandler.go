@@ -242,12 +242,6 @@ type NhpServerPluginHelper struct {
 	// Post-swap the published aspData is effectively immutable from
 	// THAT PATH — the lock-free read sees a stable snapshot.
 	//
-	// Caveat: `UdpServer.AddResource` and `UdpServer.AddAuthService`
-	// (`endpoints/server/udpserver.go`) DO mutate a live aspData's
-	// `ResourceGroups` in place under `authServiceMapMutex`. They
-	// appear unused today (no callers in-tree) — but until they're
-	// removed or callers are added behind a proper swap, any
-	// resurrected use would race against this lock-free read.
 	AspData *common.AuthServiceProviderData
 }
 
