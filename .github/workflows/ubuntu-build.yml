@@ -41,6 +41,115 @@ jobs:
           ! -path "./node_modules/*" \
           -print0 | xargs -0 shellcheck --severity=warning
 
+    - name: Run shellcheck on FRPS user data scripts
+      run: |
+        set -euo pipefail
+        tmp="$(mktemp -d)"
+        trap 'rm -rf "$tmp"' EXIT
+        template="terraform/modules/qurl-reverse-tunnel-server/user_data.sh.tpl"
+
+        # Keep the heredoc delimiters unique so the extraction cannot stop on a
+        # body line that happens to equal the delimiter. The sed step only
+        # reverses Terraform's `$${...}` escaping; bare `${...}` templatefile
+        # interpolations intentionally remain literal in the extracted files.
+        expected_openers=(
+          "cat > /opt/layerv/qurl-reverse-tunnel-server/cloudmap-common.sh << 'CLOUDMAP_COMMON_EOF'"
+          "cat > /opt/layerv/qurl-reverse-tunnel-server/cloudmap-register.sh << 'CLOUDMAP_REGISTER_EOF'"
+          "cat > /opt/layerv/qurl-reverse-tunnel-server/cloudmap-deregister.sh << 'CLOUDMAP_DEREGISTER_EOF'"
+        )
+        for opener in "${expected_openers[@]}"; do
+          grep -Fqx "$opener" "$template" || {
+            echo "ERROR: expected heredoc opener missing or reformatted: $opener"
+            exit 1
+          }
+        done
+
+        awk '$0 == "cat > /opt/layerv/qurl-reverse-tunnel-server/cloudmap-common.sh << '\''CLOUDMAP_COMMON_EOF'\''" {flag=1; next} $0 == "CLOUDMAP_COMMON_EOF" {flag=0} flag' "$template" \
+          | sed 's/\$${/${/g' > "$tmp/cloudmap-common.sh"
+        awk '$0 == "cat > /opt/layerv/qurl-reverse-tunnel-server/cloudmap-register.sh << '\''CLOUDMAP_REGISTER_EOF'\''" {flag=1; next} $0 == "CLOUDMAP_REGISTER_EOF" {flag=0} flag' "$template" \
+          | sed 's/\$${/${/g' > "$tmp/cloudmap-register.sh"
+        awk '$0 == "cat > /opt/layerv/qurl-reverse-tunnel-server/cloudmap-deregister.sh << '\''CLOUDMAP_DEREGISTER_EOF'\''" {flag=1; next} $0 == "CLOUDMAP_DEREGISTER_EOF" {flag=0} flag' "$template" \
+          | sed 's/\$${/${/g' > "$tmp/cloudmap-deregister.sh"
+
+        for f in cloudmap-common.sh cloudmap-register.sh cloudmap-deregister.sh; do
+          [ -s "$tmp/$f" ] || { echo "ERROR: extraction produced empty $f"; exit 1; }
+        done
+
+        # SC2016 is expected for Terraform template placeholders like
+        # '${namespace_id}' that are single-quoted until template rendering.
+        shellcheck -e SC2016 "$tmp"/cloudmap-common.sh "$tmp"/cloudmap-register.sh "$tmp"/cloudmap-deregister.sh
+
+        mockbin="$tmp/mockbin"
+        mkdir -p "$mockbin"
+        printf '%s\n' \
+          "#!/usr/bin/env bash" \
+          "set -euo pipefail" \
+          "printf 'call\n' >> \"\$MOCK_AWS_CALLS\"" \
+          "case \"\${MOCK_AWS_MODE:-}\" in" \
+          '  none)' \
+          '    printf '\''None\n'\''' \
+          '    ;;' \
+          '  success)' \
+          '    printf '\''srv-123456\n'\''' \
+          '    ;;' \
+          '  fail)' \
+          '    printf '\''mock Cloud Map failure\n'\'' >&2' \
+          '    exit 255' \
+          '    ;;' \
+          '  *)' \
+          "    printf 'unexpected MOCK_AWS_MODE=%s\n' \"\${MOCK_AWS_MODE:-}\" >&2" \
+          '    exit 2' \
+          '    ;;' \
+          'esac' \
+          > "$mockbin/aws"
+        chmod +x "$mockbin/aws"
+
+        (
+          PATH="$mockbin:$PATH"
+          # Keep retry-path tests instant; lookup_cloudmap_service_id calls the
+          # shell function from the sourced helper, so this overrides sleep.
+          # shellcheck disable=SC2317,SC2329
+          sleep() { :; }
+          # shellcheck source=/dev/null
+          . "$tmp/cloudmap-common.sh"
+
+          calls="$tmp/aws-calls"
+          export MOCK_AWS_CALLS="$calls"
+
+          : > "$calls"
+          export MOCK_AWS_MODE=none
+          output=$(lookup_cloudmap_service_id frps-a us-east-2 ns-123456)
+          [ -z "$output" ] || { echo "ERROR: None sentinel was not normalized to empty output"; exit 1; }
+          [ "$(wc -l < "$calls" | tr -d ' ')" = "1" ] || { echo "ERROR: expected one AWS call for no-match lookup"; exit 1; }
+
+          : > "$calls"
+          export MOCK_AWS_MODE=success
+          output=$(lookup_cloudmap_service_id frps-a us-east-2 ns-123456)
+          [ "$output" = "srv-123456" ] || { echo "ERROR: expected service ID output, got '$output'"; exit 1; }
+
+          : > "$calls"
+          if lookup_cloudmap_service_id "" us-east-2 ns-123456; then
+            echo "ERROR: empty service name passed validation"
+            exit 1
+          fi
+          [ ! -s "$calls" ] || { echo "ERROR: empty service name reached aws mock"; exit 1; }
+
+          : > "$calls"
+          if lookup_cloudmap_service_id "frps-a';bad" us-east-2 ns-123456; then
+            echo "ERROR: invalid service name passed validation"
+            exit 1
+          fi
+          [ ! -s "$calls" ] || { echo "ERROR: invalid service name reached aws mock"; exit 1; }
+
+          : > "$calls"
+          export MOCK_AWS_MODE=fail
+          if lookup_cloudmap_service_id frps-a us-east-2 ns-123456; then
+            echo "ERROR: repeated AWS failures returned success"
+            exit 1
+          fi
+          [ "$(wc -l < "$calls" | tr -d ' ')" = "5" ] || { echo "ERROR: expected five retry attempts"; exit 1; }
+        )
+
   lint:
     runs-on: ubuntu-latest
     strategy:

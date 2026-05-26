@@ -247,50 +247,10 @@ resource "aws_service_discovery_service" "frps_per_az_green" {
   # `health_check_custom_config` deliberately omitted — see the matching
   # comment on the blue per-AZ services in `main.tf`.
 
-  tags = merge(var.tags, {
+  tags = merge(local.frps_cloudmap_service_tags, {
     Name        = "${var.name_prefix}-frps-green-${each.key}"
     Component   = "frps"
     DeployColor = "green"
-  })
-}
-
-# =============================================================================
-# Green IAM Policy Extension
-# =============================================================================
-# The blue-side IAM policy (in main.tf, `aws_iam_role_policy.frps`)
-# enumerates only the blue per-AZ Cloud Map services in the
-# `CloudMapRegister` Resource list. When green services exist, the
-# instance role needs Register/Deregister against those too — the
-# user_data picks the correct color at boot from the ASG's
-# `DeployColor` tag (blue or green) and registers with the matching
-# service. Without this attachment a green-tagged instance hits an
-# IAM AccessDenied at boot and fails its readiness check.
-#
-# Intentionally a SEPARATE inline policy (not extending the blue
-# `frps-permissions` policy in main.tf): keeps the blue/green-disabled
-# diff clean — disabling blue/green removes this policy without
-# touching the existing blue-side policy. Merging the two would force
-# every blue-only deploy to surface a no-op-but-noisy IAM diff every
-# time `var.enable_blue_green` flipped. Don't merge them.
-resource "aws_iam_role_policy" "frps_cloudmap_green" {
-  count = var.enable_blue_green ? 1 : 0
-
-  name = "frps-cloudmap-green"
-  role = aws_iam_role.frps.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "CloudMapRegisterGreen"
-        Effect = "Allow"
-        Action = [
-          "servicediscovery:RegisterInstance",
-          "servicediscovery:DeregisterInstance"
-        ]
-        Resource = [for svc in aws_service_discovery_service.frps_per_az_green : svc.arn]
-      },
-    ]
   })
 }
 

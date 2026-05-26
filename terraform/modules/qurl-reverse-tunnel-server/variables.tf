@@ -4,6 +4,11 @@
 variable "environment" {
   description = "Environment name"
   type        = string
+
+  validation {
+    condition     = trimspace(var.environment) != ""
+    error_message = "environment must be non-empty."
+  }
 }
 
 variable "name_prefix" {
@@ -337,7 +342,8 @@ variable "frps_az_suffixes" {
   # root variable `var.frps_az_suffixes` in `terraform/variables.tf`. The
   # root copy fails plan even when `deploy_frps = false` keeps this module
   # out of the graph; the module copy fails for module-direct consumers
-  # (smoke fixtures, isolated tests). Keep both in lockstep.
+  # (smoke fixtures, isolated tests). Keep both in lockstep with each other
+  # and with cloudmap-common.sh's supported service-name regex.
   validation {
     # Single lowercase letter — last char of an AWS AZ name (`us-east-2a` →
     # `a`). `length(...) > 0` makes the empty list explicit (zero AZ suffixes
@@ -430,10 +436,11 @@ variable "desired_capacity_per_az" {
     ignored. Default null keeps the legacy triple (`min_size`/`max_size`/
     `desired_capacity`) as the source of truth for backwards compatibility.
 
-    PR sequence: this variable's introduction (PR 3) defaults null so it's a
-    no-op for current deploys. PR 4 sets `desired_capacity_per_az = 2` in
-    prod tfvars to flip the steady-state distribution from 1/AZ to 2/AZ
-    once the router-side HRW dispatch is enabled (traefik-plugins #134).
+    PR sequence: this variable's introduction defaults null so it's a no-op
+    for current deploys. The multi-instance-per-AZ rollout sets
+    `desired_capacity_per_az = 2` in prod tfvars to flip the steady-state
+    distribution from 1/AZ to 2/AZ once the router-side HRW dispatch is
+    enabled (traefik-plugins #134).
   EOT
   type        = number
   default     = null
@@ -523,29 +530,32 @@ variable "cloud_map_routing_policy" {
     accept a new `RoutingPolicy` (only Description, DnsRecords, and
     HealthCheckConfig.FailureThreshold are mutable in place). The
     provider therefore marks `dns_config.routing_policy` as ForceNew —
-    flipping this variable from WEIGHTED → MULTIVALUE in PR 4 produces
-    a REPLACEMENT plan for every per-AZ service (and, when blue/green
-    is enabled, every green service too). Service IDs change → user_data
-    template inputs change → launch-template version bumps → instance
-    refresh fires.
+    flipping this variable from WEIGHTED → MULTIVALUE produces a
+    REPLACEMENT plan for every per-AZ service (and, when blue/green is
+    enabled, every green service too). Service IDs change, but user_data
+    now resolves IDs from stable service names at boot; the launch
+    template does not bump solely because the service IDs changed.
+    Operators must cycle the FRPS fleet after the apply so instances
+    re-register against the recreated service IDs.
 
-    PR 4 cutover sequence (sandbox blue/green path):
+    MULTIVALUE cutover sequence (sandbox blue/green path):
       1. Pre-stage: blue/green ALREADY enabled with green at warm
          standby. Blue is serving traffic, green is dormant on the
          OLD service IDs.
       2. Apply MULTIVALUE flip: terraform replaces both blue and green
          per-AZ services in one apply. Existing instance registrations
          on the OLD services are dropped at delete time.
-      3. New instances launched from the bumped LT register against
-         the NEW service IDs in user_data. There is a brief window
-         (≤ 30s DNS TTL × instance launch time) where DNS for
-         `frps-$${suffix}.$${namespace}` resolves NXDOMAIN. The
-         qurl-service `frps_addr` emitter must be SSM-pinned to the
-         new IDs out-of-band before traffic shifts.
-      4. After all instances re-register, the qurl-service flip is
-         a normal blue→green ASG color change.
+      3. Existing instances remain registered against the OLD service
+         IDs. Start an FRPS instance refresh or replace the ASG
+         instances so each fresh instance resolves the stable
+         `frps-$${suffix}` service name to the NEW ID and registers.
+         Until then, DNS for `frps-$${suffix}.$${namespace}` may
+         resolve NXDOMAIN and qurl-service may emit upstreams with no
+         live registration behind them.
+      4. After all instances re-register, the qurl-service flip is a
+         normal blue→green ASG color change.
 
-    PR 4 cutover sequence (prod canary path):
+    MULTIVALUE cutover sequence (prod canary path):
       The canary state machine refreshes instances in checkpoints
       (20% → 50% → 100%). Each checkpoint window is the same window
       as above on a smaller scale. The CloudWatch composite alarm
@@ -615,8 +625,9 @@ variable "green_standby_capacity_per_az" {
 
     Default `null` means "track `min_size_per_az` when set, else 1" — so
     the resolved standby always satisfies `min ≤ desired ≤ max` without
-    the operator having to keep two knobs in lockstep across files. PR 4
-    (which sets `min_size_per_az = 2`) gets `effective_standby = 2`
+    the operator having to keep two knobs in lockstep across files. The
+    MULTIVALUE rollout (which sets `min_size_per_az = 2`) gets
+    `effective_standby = 2`
     automatically; an env that wants cold standby can set this explicitly
     to `0`.
 

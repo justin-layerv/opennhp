@@ -71,8 +71,8 @@ output "cloud_map_empty_az_alarm_arns" {
   }
 }
 
-# Operator-facing pre-flight notice for the WEIGHTED → MULTIVALUE flip
-# (PR 4). Surfaces in `terraform output` so the operator running the
+# Operator-facing pre-flight notice for the WEIGHTED → MULTIVALUE flip.
+# Surfaces in `terraform output` so the operator running the
 # value flip sees the gotcha BEFORE running `terraform apply`. The
 # variable comment on `cloud_map_routing_policy` carries the same
 # warning for plan-time reading; this output covers the apply-time
@@ -84,16 +84,16 @@ output "cloud_map_empty_az_alarm_arns" {
 # `terraform output` audit shows the impending REPLACEMENT semantics
 # until the deploy finishes and the next apply produces a clean diff.
 output "cloud_map_replacement_warning" {
-  description = "Tense-neutral advisory for the WEIGHTED → MULTIVALUE Cloud Map routing policy flip (PR 4). Empty string under the WEIGHTED default; non-empty when MULTIVALUE is set, describing the REPLACEMENT semantics that fired or will fire on the next apply (per-AZ services + green services replaced, launch-template version bumps, instance refresh fires) so a `terraform output` audit catches the foot-gun whether read pre-flip or post-flip. See `var.cloud_map_routing_policy` for the full cutover sequence."
-  # Tense-neutral wording: the output stays non-empty after PR 4's
+  description = "Tense-neutral advisory for the WEIGHTED → MULTIVALUE Cloud Map routing policy flip. Empty string under the WEIGHTED default; non-empty when MULTIVALUE is set, describing the REPLACEMENT semantics that fired or will fire on the next apply. Service IDs change, but launch-template user_data no longer embeds those IDs, so Terraform does not automatically cycle the ASG; operators must refresh/replace the fleet so instances register against the new services. See `var.cloud_map_routing_policy` for the full cutover sequence."
+  # Tense-neutral wording: the output stays non-empty after the
   # apply lands (cloud_map_routing_policy stays = MULTIVALUE), so a
   # future operator running `terraform output cloud_map_replacement_warning`
   # post-flip should not be misled into thinking another replacement is
-  # impending. "any apply that flips this variable" reads truthfully
+  # impending. "the apply that flips this variable" reads truthfully
   # both before (the next plan) and after (the historical apply) the
   # flip. Set explicitly to "" once we want the warning to vanish.
   value = var.cloud_map_routing_policy == "MULTIVALUE" ? format(
-    "MULTIVALUE routing is set: any apply that flips cloud_map_routing_policy from WEIGHTED triggers REPLACEMENT of %d per-AZ Cloud Map service(s)%s — service IDs change, launch-template version bumps, instance refresh fires. See cloud_map_routing_policy variable doc for the cutover sequence.",
+    "MULTIVALUE routing is set: the apply that flips cloud_map_routing_policy from WEIGHTED triggers REPLACEMENT of %d per-AZ Cloud Map service(s)%s — service IDs change, existing instances remain registered against the old service IDs, and the FRPS fleet must be cycled with an instance refresh / ASG replace so each instance resolves and registers against the recreated services. See cloud_map_routing_policy variable doc for the cutover sequence.",
     length(var.frps_az_suffixes),
     var.enable_blue_green ? format(" + %d green service(s)", length(var.frps_az_suffixes)) : "",
   ) : ""

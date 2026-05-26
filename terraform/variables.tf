@@ -2328,7 +2328,8 @@ variable "frps_az_suffixes" {
   # `terraform/modules/qurl-reverse-tunnel-server/variables.tf` (module-level
   # `frps_az_suffixes`). The root copy fences a typo at plan time even when
   # `deploy_frps = false` keeps the module out of the graph; the module
-  # copy covers module-direct consumers. Keep both in lockstep.
+  # copy covers module-direct consumers. Keep both in lockstep with each
+  # other and with cloudmap-common.sh's supported service-name regex.
   validation {
     condition     = length(var.frps_az_suffixes) > 0 && alltrue([for s in var.frps_az_suffixes : can(regex("^[a-z]$", s))])
     error_message = "frps_az_suffixes must be a non-empty list of single lowercase letters (e.g., [\"a\", \"b\", \"c\"]) — each entry is the trailing letter of an AWS AZ name."

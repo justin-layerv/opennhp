@@ -102,6 +102,20 @@ locals {
   account_id = data.aws_caller_identity.current.account_id
   region     = data.aws_region.current.id
 
+  # Register/Deregister IAM evaluates the Cloud Map service resource tags.
+  # Use the same local for service tags, IAM conditions, and the plan-time
+  # fence so a future tag-shape refactor cannot drift one side only.
+  frps_cloudmap_required_tags = {
+    Environment = var.environment
+    Service     = "qurl-reverse-tunnel-server"
+  }
+  frps_cloudmap_required_tag_conditions = {
+    for k, v in local.frps_cloudmap_required_tags : "aws:ResourceTag/${k}" => v
+  }
+  # Required tags are last so caller-supplied tags cannot override the
+  # IAM boundary that lets FRPS register only to qurl reverse-tunnel services.
+  frps_cloudmap_service_tags = merge(var.tags, local.frps_cloudmap_required_tags)
+
   # ==================== Effective ASG Sizing ====================
   # Resolve the legacy explicit triple (`min_size`/`max_size`/
   # `desired_capacity`) against the new per-AZ form (`min_size_per_az`/
@@ -158,38 +172,13 @@ locals {
     region      = local.region
     account_id  = local.account_id
     environment = var.environment
-    # Per-color, per-AZ Cloud Map service IDs. user_data picks the right
-    # color at boot by reading the `DeployColor` IMDS instance tag
-    # (`instance_metadata_tags = "enabled"` on the launch template makes
-    # ASG-propagated tags reachable via IMDS). Default is "blue" when the
-    # tag is absent — preserves the existing single-color contract for
-    # callers that haven't enabled blue/green.
-    #
-    # A bare for-expression (not a sorted list) is fine: templatefile
-    # iterates the map deterministically (Terraform sorts string keys),
-    # so the rendered Bash array is stable across plans for the same
-    # input set. The deterministic-rendering note matters because the
-    # whole user_data string flows through `base64gzip` — a non-stable
-    # ordering would force the launch template to bump its
-    # `latest_version` every plan.
-    #
-    # When `enable_blue_green = false`, the green map is empty;
-    # `DEPLOY_COLOR` defaults to "blue" so the green map is never
-    # consulted. The launch template diff between blue/green-enabled
-    # vs disabled is ONLY the green map's emptiness, so disabling
-    # blue/green on a previously-enabled deploy doesn't churn user_data
-    # against blue-tagged instances.
-    cloudmap_service_ids_blue = {
-      for s, svc in aws_service_discovery_service.frps_per_az : s => svc.id
-    }
-    # When `var.enable_blue_green = false`, the green for_each
-    # collapses to `toset([])` and this for-expression naturally
-    # yields `{}` — user_data renders an empty bash associative
-    # array for the green map and never reads it (DEPLOY_COLOR
-    # defaults to "blue" without the IMDS instance tag).
-    cloudmap_service_ids_green = {
-      for s, svc in aws_service_discovery_service.frps_per_az_green : s => svc.id
-    }
+    # Instances resolve the stable Cloud Map service name to the current
+    # service ID at boot. Do not bake service IDs into user_data: the FRPS
+    # ASG uses create_before_destroy, and making the launch template depend
+    # on aws_service_discovery_service would propagate that lifecycle bit
+    # into the Cloud Map services. Static service names plus CBD cannot
+    # replace routing_policy (AWS marks it ForceNew).
+    namespace_id                   = var.namespace_id
     frps_az_suffixes               = var.frps_az_suffixes
     namespace_name                 = var.namespace_name
     log_group_name                 = aws_cloudwatch_log_group.frps.name
@@ -316,15 +305,26 @@ resource "aws_iam_role_policy" "frps" {
           "arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.environment}/nhp/frps/*",
         ]
       },
-      # Cloud Map registration. Scoped to ALL per-AZ services rather than
-      # just the one matching this instance's AZ — the instance picks its
-      # service at boot from IMDS, and we don't know the AZ at IAM-policy
-      # time. The set is bounded (one ARN per AZ suffix, default 3) and
-      # the only privilege granted is to (de)register the instance's own
-      # IP, so the scope here is still strictly tighter than `Resource =
-      # "*"`. The `for ... : svc.arn` projection produces a deterministic
-      # list (Terraform sorts string keys when iterating a `for_each` map),
-      # which IAM then treats as a set — sorting is unnecessary.
+      # Cloud Map registration. Do not enumerate concrete service ARNs:
+      # that makes the instance profile depend on the ForceNew Cloud Map
+      # service resources, and the FRPS ASG's create_before_destroy then
+      # propagates into those services in state. Scope by tags instead so
+      # service replacement stays destroy-then-create with the stable names.
+      # This intentionally broadens from enumerated service IDs to any
+      # qurl-reverse-tunnel-server Cloud Map service in this env. Blue/green
+      # ASGs share this same instance role, so IAM is not a per-color isolation
+      # boundary; user_data's IMDS-derived DEPLOY_COLOR is the color-selection
+      # gate.
+      {
+        Sid    = "CloudMapListServices"
+        Effect = "Allow"
+        Action = ["servicediscovery:ListServices"]
+        # AWS does not support resource-level permissions for ListServices.
+        # This grants account-wide enumeration of all Cloud Map services to
+        # the FRPS instance role; Register/Deregister remain constrained by
+        # tags below.
+        Resource = "*"
+      },
       {
         Sid    = "CloudMapRegister"
         Effect = "Allow"
@@ -332,7 +332,10 @@ resource "aws_iam_role_policy" "frps" {
           "servicediscovery:RegisterInstance",
           "servicediscovery:DeregisterInstance"
         ]
-        Resource = [for svc in aws_service_discovery_service.frps_per_az : svc.arn]
+        Resource = "arn:aws:servicediscovery:${local.region}:${local.account_id}:service/*"
+        Condition = {
+          StringEquals = local.frps_cloudmap_required_tag_conditions
+        }
       },
       # ECR access (split: GetAuthorizationToken must be * per AWS docs;
       # pull actions scoped to specific repo ARN, consistent with AC module)
@@ -354,6 +357,24 @@ resource "aws_iam_role_policy" "frps" {
       },
     ]
   })
+
+  lifecycle {
+    precondition {
+      # IAM evaluates the tags that land on the Cloud Map service resources.
+      # Keep this in lockstep with `local.frps_cloudmap_service_tags` and the
+      # StringEquals condition above so tag drift fails during plan.
+      condition = (
+        trimspace(local.frps_cloudmap_required_tags.Environment) != ""
+        && alltrue([
+          for k, v in local.frps_cloudmap_required_tags :
+          trimspace(v) != ""
+          && lookup(local.frps_cloudmap_service_tags, k, "") == v
+          && lookup(local.frps_cloudmap_required_tag_conditions, "aws:ResourceTag/${k}", "") == v
+        ])
+      )
+      error_message = "qurl-reverse-tunnel-server Cloud Map service tags must include non-empty Environment=${local.frps_cloudmap_required_tags.Environment} and Service=${local.frps_cloudmap_required_tags.Service} because FRPS Register/Deregister IAM evaluates aws_service_discovery_service.frps_per_az resource tags. Omitting either service tag would boot instances into AccessDenied instead of failing at plan time."
+    }
+  }
 }
 
 # Secrets Manager access for QURL/NHP tunnel-auth secrets. CMK-encrypted
@@ -518,23 +539,21 @@ resource "aws_vpc_security_group_egress_rule" "frps_all" {
 # changing `routing_policy` in place — only Description, DnsRecords,
 # and HealthCheckConfig.FailureThreshold are mutable. The provider
 # therefore marks `dns_config.routing_policy` as ForceNew. Flipping
-# `var.cloud_map_routing_policy` from WEIGHTED to MULTIVALUE in PR 4
+# `var.cloud_map_routing_policy` from WEIGHTED to MULTIVALUE
 # will appear in the plan as REPLACEMENT of every per-AZ
 # `aws_service_discovery_service.frps_per_az[*]` resource (and, if
 # blue/green is enabled, of every `frps_per_az_green[*]` too):
-#   - Each replacement issues new service IDs, churning the
-#     `cloudmap_service_ids_blue` / `..._green` template inputs and
-#     bumping the launch template's `latest_version` (instance refresh
-#     fires).
+#   - Each replacement issues new service IDs. Instances resolve those
+#     IDs from the stable Cloud Map service names at boot; do not re-add
+#     launch-template or IAM dependencies on concrete service IDs.
 #   - Existing instance registrations on the old services are dropped
 #     when the old services delete; new instances must register with
 #     the new services as user_data picks up the new IDs.
 #   - The qurl-service `frps_addr` emitter must pick up the new ARNs
 #     out-of-band before traffic shifts.
-# PR 4's runbook needs to sequence these; the blue/green path
-# (sandbox) and the canary path (prod) BOTH have to plan for this
-# replacement window. Documented here so the requirement isn't
-# discovered at PR-4 plan time.
+# The runbook needs to sequence these; the blue/green path (sandbox)
+# and the canary path (prod) BOTH have to plan for this replacement
+# window. Documented here so the requirement isn't discovered at plan time.
 resource "aws_service_discovery_service" "frps_per_az" {
   for_each = toset(var.frps_az_suffixes)
 
@@ -585,7 +604,7 @@ resource "aws_service_discovery_service" "frps_per_az" {
   # the first user_data registration call (the AWS-side default of 1
   # is correct here), so dropping the block has no behavior change.
 
-  tags = var.tags
+  tags = local.frps_cloudmap_service_tags
 }
 
 # ==================== Launch Template ====================

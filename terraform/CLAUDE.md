@@ -169,6 +169,25 @@ Greenfield envs aren't covered by the existing shim's consumer
 set — all CF resources consuming the policy need their own
 `depends_on` on first apply (tracked in #1813).
 
+## Tag-Scoped IAM Over Replacement-Prone ARNs
+
+For static-name resources that are ForceNew under configuration changes, avoid
+IAM policies that enumerate concrete resource ARNs when the consuming role is
+attached to a `create_before_destroy` ASG. That dependency can propagate CBD
+into resources that cannot be create-before-destroyed because their names are
+globally unique inside the AWS namespace. The qurl-reverse-tunnel-server Cloud
+Map services use tag-scoped Register/Deregister grants for this reason.
+
+When using this pattern, build the Cloud Map service tags and the IAM condition
+from the same local, then add a plan-time precondition that verifies the tags
+the IAM condition depends on are present and non-empty. Otherwise the failure
+moves to instance boot as AccessDenied. Do not mutate these Cloud Map service
+tags out-of-band; IAM evaluates the tags recorded on the service at
+Register/Deregister time, so console/CLI tag drift can block registrations
+until the next apply rehydrates the tag set. The (`Environment`, `Service`) tag
+pair is now an IAM trust boundary; do not reuse it on unrelated Cloud Map
+services.
+
 ## AC Plugin Source-of-Truth Invariant
 
 The Traefik plugins on AC instances are pulled from

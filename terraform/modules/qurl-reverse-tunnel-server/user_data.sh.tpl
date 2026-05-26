@@ -672,37 +672,96 @@ fi
 # Uses a systemd oneshot service with ExecStop so Cloud Map is cleaned up
 # on instance shutdown/termination, preventing stale DNS records.
 #
-# The AZ -> service ID map is rendered by Terraform's templatefile() at plan
-# time and baked into both scripts (the heredoc delimiter is shell-quoted --
-# 'REGEOF' -- which suppresses bash dollar-expansion at runtime, but
-# Terraform's templating runs before the heredoc is ever written to disk,
-# so the AZ-keyed values get burned into the file). The instance reads its
-# AZ from IMDS at runtime, looks up the matching service ID, and registers.
+# The instance reads its AZ/color from IMDS at runtime, derives the stable
+# Cloud Map service name, resolves that name to the current service ID, and
+# registers. Do not render service IDs into user_data: the launch template
+# is create-before-destroy, and that dependency propagates CBD into the
+# static-name Cloud Map services, making routing_policy replacement
+# impossible.
 # ============================================================================
-cat > /opt/layerv/qurl-reverse-tunnel-server/cloudmap-register.sh << 'REGEOF'
+# CI extracts this script by matching the next heredoc opener exactly;
+# update .github/workflows/ubuntu-build.yml if the path or delimiter changes.
+cat > /opt/layerv/qurl-reverse-tunnel-server/cloudmap-common.sh << 'CLOUDMAP_COMMON_EOF'
+#!/bin/bash
+# Sourced by scripts with different set-flag policies; do not add `set -e`
+# here or deregister's warn-and-exit-0 contract will become brittle.
+
+export AWS_PAGER=""
+
+lookup_cloudmap_service_id() {
+  local service_name="$1"
+  local region="$2"
+  local namespace_id="$3"
+  local attempt output err_file err
+
+  if [ -z "$service_name" ] || [ -z "$region" ] || [ -z "$namespace_id" ]; then
+    echo "ERROR: lookup_cloudmap_service_id requires service name, region, and namespace ID" >&2
+    return 1
+  fi
+  # Keep this regex in lockstep with `var.frps_az_suffixes` validation:
+  # suffixes are a single lowercase letter, so the derived names are
+  # `frps-$${suffix}` or `frps-green-$${suffix}`.
+  # Do not widen this without adding a real JMESPath string escaper below.
+  if ! [[ "$service_name" =~ ^frps(-green)?-[a-z]$ ]]; then
+    echo "ERROR: Cloud Map service name '$service_name' is not a supported FRPS per-AZ service name" >&2
+    return 1
+  fi
+
+  err_file=$(mktemp) || {
+    echo "ERROR: mktemp failed while preparing Cloud Map lookup for service '$service_name' in namespace '$namespace_id'" >&2
+    return 1
+  }
+  for attempt in 1 2 3 4 5; do
+    : > "$err_file"
+    # AWS CLI v2 auto-paginates list-services by default; do not add
+    # --no-paginate here, or a large namespace could hide services beyond page 1.
+    # The read timeout is per HTTP call/page, not a cap on the full paginated
+    # list operation.
+    # `--query` filters client-side after list-services returns the namespace's
+    # services; keep this namespace dedicated to FRPS-scale service counts.
+    # The service_name regex above keeps this JMESPath literal safe. If that
+    # contract widens, escape service_name for JMESPath before interpolating it.
+    if output=$(aws servicediscovery list-services \
+      --region "$region" \
+      --cli-connect-timeout 3 \
+      --cli-read-timeout 5 \
+      --filters "Name=NAMESPACE_ID,Values=$namespace_id,Condition=EQ" \
+      --query "Services[?Name=='$service_name'].Id | [0]" \
+      --output text 2>"$err_file"); then
+      rm -f "$err_file"
+      # No match is a successful AWS/API call; with this exact
+      # `--query ... --output text` shape AWS CLI renders it as "None".
+      # Normalize that sentinel to empty stdout so callers can distinguish
+      # missing-service config from API/permission/reachability failure by
+      # checking only exit code plus empty/non-empty output.
+      if [ "$output" = "None" ]; then
+        return 0
+      fi
+      printf '%s\n' "$output"
+      return 0
+    fi
+
+    err=$(cat "$err_file" 2>/dev/null || true)
+    echo "WARN: Cloud Map list-services failed for service '$service_name' in namespace '$namespace_id' (attempt $attempt/5): $${err:-<empty stderr>}" >&2
+    if [ "$attempt" -lt 5 ]; then
+      sleep $((attempt * 2))
+    fi
+  done
+
+  rm -f "$err_file"
+  echo "ERROR: Cloud Map list-services failed after 5 attempts for service '$service_name' in namespace '$namespace_id'. This is a Cloud Map API/permission/reachability failure, not a missing-service configuration." >&2
+  return 1
+}
+CLOUDMAP_COMMON_EOF
+chmod 0644 /opt/layerv/qurl-reverse-tunnel-server/cloudmap-common.sh
+# common.sh is sourced, not executed; keep it readable but not executable.
+
+# CI extracts this script by matching the next heredoc opener exactly;
+# update .github/workflows/ubuntu-build.yml if the path or delimiter changes.
+cat > /opt/layerv/qurl-reverse-tunnel-server/cloudmap-register.sh << 'CLOUDMAP_REGISTER_EOF'
 #!/bin/bash
 set -e
-# Bash 4+ associative arrays. Ubuntu 24.04 ships bash 5.x so this is safe.
-# Rendered by Terraform templatefile() -- keys are AZ suffixes ("a","b",...),
-# values are the per-AZ Cloud Map service IDs. The 'REGEOF' heredoc
-# delimiter is shell-quoted so bash doesn't try to expand dollar-vars at
-# 'cat' time; Terraform templating runs before the heredoc is written to
-# disk, so the AZ-keyed values still get burned in.
-#
-# Two parallel maps for blue/green. When `enable_blue_green = false` the
-# green map is empty; the script never tries to read it because
-# DEPLOY_COLOR defaults to "blue" when the IMDS instance tag is absent
-# (the only case for non-blue-green deploys).
-declare -A CLOUDMAP_SERVICE_IDS_BLUE=(
-%{ for suffix, service_id in cloudmap_service_ids_blue ~}
-  ["${suffix}"]="${service_id}"
-%{ endfor ~}
-)
-declare -A CLOUDMAP_SERVICE_IDS_GREEN=(
-%{ for suffix, service_id in cloudmap_service_ids_green ~}
-  ["${suffix}"]="${service_id}"
-%{ endfor ~}
-)
+NAMESPACE_ID='${namespace_id}'
 # IMDSv2 calls get --max-time + --retry. Without them, a slow/flaky IMDS on
 # shutdown would hang `ExecStop=cloudmap-deregister.sh` until systemd's
 # TimeoutStopSec kicked in (default 90s), extending the ASG terminate path
@@ -713,6 +772,8 @@ INSTANCE_ID=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://16
 LOCAL_IP=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
 AZ=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
 REGION=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+# shellcheck disable=SC1091
+. /opt/layerv/qurl-reverse-tunnel-server/cloudmap-common.sh
 # DeployColor IMDS tag — propagated at launch by both ASGs when
 # `var.enable_blue_green = true`: green via the always-propagate `tag`
 # block in blue_green.tf, blue via the dynamic `tag` block in main.tf
@@ -771,6 +832,8 @@ if [ "$DEPLOY_COLOR_HTTP" = "200" ]; then
     exit 1
   fi
 elif [ "$DEPLOY_COLOR_HTTP" = "404" ]; then
+  # The strict service-name branch below depends on this missing-tag path
+  # setting a literal blue value rather than leaving DEPLOY_COLOR empty.
   DEPLOY_COLOR="blue" # tag legitimately absent (non-blue/green deploys)
 else
   echo "FATAL: IMDS DeployColor tag returned HTTP $DEPLOY_COLOR_HTTP (not 200 or 404) — refusing to guess a color. 401/403 likely means the IMDSv2 token expired or was rejected; 5xx means IMDS is degraded. Either way, defaulting to 'blue' would silently mis-register a green-tagged instance against the blue Cloud Map service."
@@ -806,30 +869,49 @@ if ! [[ "$AZ_SUFFIX" =~ ^[a-z]$ ]]; then
   exit 1
 fi
 if [ "$DEPLOY_COLOR" = "green" ]; then
-  SERVICE_ID="$${CLOUDMAP_SERVICE_IDS_GREEN[$AZ_SUFFIX]:-}"
-  CONFIGURED_SUFFIXES="$${!CLOUDMAP_SERVICE_IDS_GREEN[*]}"
+  SERVICE_NAME="frps-green-$AZ_SUFFIX"
+elif [ "$DEPLOY_COLOR" = "blue" ]; then
+  SERVICE_NAME="frps-$AZ_SUFFIX"
 else
-  SERVICE_ID="$${CLOUDMAP_SERVICE_IDS_BLUE[$AZ_SUFFIX]:-}"
-  CONFIGURED_SUFFIXES="$${!CLOUDMAP_SERVICE_IDS_BLUE[*]}"
+  echo "FATAL: DeployColor IMDS tag '$DEPLOY_COLOR' is not 'blue' or 'green'; refusing to register"
+  exit 1
 fi
+SERVICE_ID=$(lookup_cloudmap_service_id "$SERVICE_NAME" "$REGION" "$NAMESPACE_ID") || {
+  echo "FATAL: Cloud Map service lookup failed for '$SERVICE_NAME' in namespace '$NAMESPACE_ID'; refusing to start without a registration target."
+  exit 1
+}
 if [ -z "$SERVICE_ID" ]; then
   # FATAL on register — better to crash-loop the instance and page on
   # no-healthy-instance than to silently boot an instance that no
   # qurl-service hash will ever target.
-  echo "FATAL: no Cloud Map service configured for color '$DEPLOY_COLOR', AZ suffix '$AZ_SUFFIX' (full AZ '$AZ'). Configured suffixes for this color: $CONFIGURED_SUFFIXES"
+  echo "FATAL: no Cloud Map service named '$SERVICE_NAME' in namespace '$NAMESPACE_ID' for color '$DEPLOY_COLOR', AZ suffix '$AZ_SUFFIX' (full AZ '$AZ')."
   exit 1
 fi
-echo "Registering qurl-reverse-tunnel-server instance $INSTANCE_ID ($LOCAL_IP, AZ=$AZ, color=$DEPLOY_COLOR) with Cloud Map service $SERVICE_ID (suffix $AZ_SUFFIX)"
-aws servicediscovery register-instance \
-  --service-id "$SERVICE_ID" \
-  --instance-id "$INSTANCE_ID" \
-  --attributes "AWS_INSTANCE_IPV4=$LOCAL_IP,AVAILABILITY_ZONE=$AZ" \
-  --region "$REGION"
-echo "FRPS instance registered successfully"
-REGEOF
+echo "Registering qurl-reverse-tunnel-server instance $INSTANCE_ID ($LOCAL_IP, AZ=$AZ, color=$DEPLOY_COLOR) with Cloud Map service $SERVICE_ID ($SERVICE_NAME)"
+for attempt in 1 2 3 4 5; do
+  if aws servicediscovery register-instance \
+    --service-id "$SERVICE_ID" \
+    --instance-id "$INSTANCE_ID" \
+    --attributes "AWS_INSTANCE_IPV4=$LOCAL_IP,AVAILABILITY_ZONE=$AZ" \
+    --region "$REGION" \
+    --cli-connect-timeout 3 \
+    --cli-read-timeout 5; then
+    echo "FRPS instance registered successfully"
+    exit 0
+  fi
+  echo "WARN: Cloud Map register-instance failed for service '$SERVICE_ID' (attempt $attempt/5)" >&2
+  if [ "$attempt" -lt 5 ]; then
+    sleep $((attempt * 2))
+  fi
+done
+echo "FATAL: Cloud Map register-instance failed after 5 attempts for service '$SERVICE_ID' ($SERVICE_NAME)" >&2
+exit 1
+CLOUDMAP_REGISTER_EOF
 chmod +x /opt/layerv/qurl-reverse-tunnel-server/cloudmap-register.sh
 
-cat > /opt/layerv/qurl-reverse-tunnel-server/cloudmap-deregister.sh << 'DEREGEOF'
+# CI extracts this script by matching the next heredoc opener exactly;
+# update .github/workflows/ubuntu-build.yml if the path or delimiter changes.
+cat > /opt/layerv/qurl-reverse-tunnel-server/cloudmap-deregister.sh << 'CLOUDMAP_DEREGISTER_EOF'
 #!/bin/bash
 # Intentionally NOT `set -e`: this script's contract is "warn and exit 0
 # whenever the AZ-suffix lookup is unworkable" (missing mapping, malformed
@@ -840,22 +922,15 @@ cat > /opt/layerv/qurl-reverse-tunnel-server/cloudmap-deregister.sh << 'DEREGEOF
 # warn-and-skip story is uniform across "missing suffix", "malformed
 # suffix", and "IMDS dead". Register-side keeps `set -e` (FATAL on
 # register is the right call — see cloudmap-register.sh).
-declare -A CLOUDMAP_SERVICE_IDS_BLUE=(
-%{ for suffix, service_id in cloudmap_service_ids_blue ~}
-  ["${suffix}"]="${service_id}"
-%{ endfor ~}
-)
-declare -A CLOUDMAP_SERVICE_IDS_GREEN=(
-%{ for suffix, service_id in cloudmap_service_ids_green ~}
-  ["${suffix}"]="${service_id}"
-%{ endfor ~}
-)
+NAMESPACE_ID='${namespace_id}'
 # See cloudmap-register.sh for rationale on --max-time / --retry.
 IMDS_CURL=(curl -sf --max-time 5 --retry 3)
 TOKEN=$("$${IMDS_CURL[@]}" -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600") || { echo "WARN: IMDS token request failed; skipping deregister"; exit 0; }
 INSTANCE_ID=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id) || { echo "WARN: IMDS instance-id lookup failed; skipping deregister"; exit 0; }
 AZ=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone) || { echo "WARN: IMDS AZ lookup failed; skipping deregister"; exit 0; }
 REGION=$("$${IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region) || { echo "WARN: IMDS region lookup failed; skipping deregister"; exit 0; }
+# shellcheck disable=SC1091
+. /opt/layerv/qurl-reverse-tunnel-server/cloudmap-common.sh
 # DeployColor — see cloudmap-register.sh for rationale on the
 # HTTP-status branching. Deregister is intentionally lenient (the
 # script's contract is "warn and exit 0 whenever lookup is
@@ -902,31 +977,58 @@ if ! [[ "$AZ_SUFFIX" =~ ^[a-z]$ ]]; then
   exit 0
 fi
 if [ "$DEPLOY_COLOR" = "green" ]; then
-  SERVICE_ID="$${CLOUDMAP_SERVICE_IDS_GREEN[$AZ_SUFFIX]:-}"
+  SERVICE_NAME="frps-green-$AZ_SUFFIX"
 elif [ "$DEPLOY_COLOR" = "blue" ]; then
-  SERVICE_ID="$${CLOUDMAP_SERVICE_IDS_BLUE[$AZ_SUFFIX]:-}"
+  SERVICE_NAME="frps-$AZ_SUFFIX"
 else
   # WARN-and-skip on unrecognized color in deregister (not FATAL —
   # parallel with the missing-suffix branch below).
   echo "WARN: DeployColor IMDS tag '$DEPLOY_COLOR' is not 'blue' or 'green'; skipping deregister"
   exit 0
 fi
+SERVICE_ID=$(lookup_cloudmap_service_id "$SERVICE_NAME" "$REGION" "$NAMESPACE_ID") || {
+  echo "WARN: Cloud Map service lookup failed for '$SERVICE_NAME' in namespace '$NAMESPACE_ID'; skipping deregister."
+  exit 0
+}
 if [ -z "$SERVICE_ID" ]; then
-  # Don't FATAL on deregister — `|| true` below already swallows the
-  # AWS-side error so a missing mapping shouldn't take down ExecStop.
-  # Just log and exit clean; the ASG replace cycle will eventually
-  # reap the stale registration via TTL or the planned #1089 health
-  # check work.
-  echo "WARN: no Cloud Map service configured for color '$DEPLOY_COLOR', AZ suffix '$AZ_SUFFIX' (full AZ '$AZ'); skipping deregister"
+  # Don't FATAL on deregister. Just log and exit clean; the ASG replace cycle
+  # will eventually reap the stale registration via TTL or the planned #1089
+  # health check work.
+  echo "WARN: no Cloud Map service named '$SERVICE_NAME' in namespace '$NAMESPACE_ID' for color '$DEPLOY_COLOR', AZ suffix '$AZ_SUFFIX' (full AZ '$AZ'); skipping deregister"
   exit 0
 fi
-echo "Deregistering qurl-reverse-tunnel-server instance $INSTANCE_ID from Cloud Map service $SERVICE_ID (color=$DEPLOY_COLOR, suffix $AZ_SUFFIX)"
-aws servicediscovery deregister-instance \
-  --service-id "$SERVICE_ID" \
-  --instance-id "$INSTANCE_ID" \
-  --region "$REGION" || true
-echo "FRPS instance deregistered"
-DEREGEOF
+echo "Deregistering qurl-reverse-tunnel-server instance $INSTANCE_ID from Cloud Map service $SERVICE_ID ($SERVICE_NAME, color=$DEPLOY_COLOR, suffix=$AZ_SUFFIX)"
+DEREGISTER_ERR_FILE="$(mktemp)" || { echo "WARN: mktemp failed while preparing Cloud Map deregister; continuing shutdown"; exit 0; }
+for attempt in 1 2 3 4 5; do
+  : > "$DEREGISTER_ERR_FILE"
+  if aws servicediscovery deregister-instance \
+    --service-id "$SERVICE_ID" \
+    --instance-id "$INSTANCE_ID" \
+    --region "$REGION" \
+    --cli-connect-timeout 3 \
+    --cli-read-timeout 5 2>"$DEREGISTER_ERR_FILE"; then
+    rm -f "$DEREGISTER_ERR_FILE"
+    echo "FRPS instance deregistered"
+    exit 0
+  fi
+  err=$(cat "$DEREGISTER_ERR_FILE" 2>/dev/null || true)
+  # AWS CLI v2 surfaces this as text shaped like
+  # "An error occurred (InstanceNotFound) ...". Substring matching is safe:
+  # if the wording ever drifts, we only fall back to retry-then-warn.
+  if printf '%s\n' "$err" | grep -q 'InstanceNotFound'; then
+    rm -f "$DEREGISTER_ERR_FILE"
+    echo "WARN: Cloud Map instance '$INSTANCE_ID' was not registered in service '$SERVICE_ID' ($SERVICE_NAME); treating stale-service shutdown as already deregistered" >&2
+    exit 0
+  fi
+  echo "WARN: Cloud Map deregister-instance failed for service '$SERVICE_ID' (attempt $attempt/5): $${err:-<empty stderr>}" >&2
+  if [ "$attempt" -lt 5 ]; then
+    sleep $((attempt * 2))
+  fi
+done
+rm -f "$DEREGISTER_ERR_FILE"
+echo "WARN: Cloud Map deregister-instance failed after 5 attempts for service '$SERVICE_ID' ($SERVICE_NAME); continuing shutdown" >&2
+exit 0
+CLOUDMAP_DEREGISTER_EOF
 chmod +x /opt/layerv/qurl-reverse-tunnel-server/cloudmap-deregister.sh
 
 cat > /etc/systemd/system/frps-cloudmap-register.service << SVCEOF
@@ -946,6 +1048,12 @@ Type=oneshot
 ExecStart=/opt/layerv/qurl-reverse-tunnel-server/cloudmap-register.sh
 RemainAfterExit=yes
 ExecStop=/opt/layerv/qurl-reverse-tunnel-server/cloudmap-deregister.sh
+# Worst degraded path is IMDS retries plus Cloud Map lookup and
+# register/deregister retries. Keep the service budget above that bound so
+# systemd does not kill the script in the middle of its own bounded retry
+# policy during a brief Cloud Map or IMDS blip.
+TimeoutStartSec=240
+TimeoutStopSec=240
 
 [Install]
 WantedBy=multi-user.target
