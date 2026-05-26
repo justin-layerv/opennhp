@@ -1573,3 +1573,80 @@ func TestScheduler_InFlightMarker_CleanupDeferFiresOnCtxCancel(t *testing.T) {
 	}
 	t.Fatal("cleanup defer didn't remove index entry after ctx-canceled Flush")
 }
+
+// TestScheduler_SetBreakerParams_WarnOnceDedup fences the
+// state-machine for the clamp warning: repeated SetBreakerParams
+// calls with the same too-large threshold must NOT spam the
+// Warning log; only a state change (threshold changes OR drops
+// back at-or-below ring) should emit.
+//
+// The dedup has no observable side effect besides log volume, so
+// the test inspects the unexported lastBreakerClampWarnedThreshold
+// field directly (under breakerErrMu) rather than capturing log
+// output. A refactor that removes the field needs to update the
+// dedup mechanism too — this test is the regression fence for
+// that.
+func TestScheduler_SetBreakerParams_WarnOnceDedup(t *testing.T) {
+	s := NewScheduler(&NoOpFlusher{},
+		WithTickInterval(2*time.Millisecond),
+		WithWheelSize(50),
+		// Ring sized to max(default, 5) = defaultBreakerErrLog; the
+		// test picks a threshold above that to force the clamp path.
+		WithBreakerThreshold(5),
+	)
+	ringSize := s.BreakerRingSize()
+	tooLarge := ringSize + 100
+
+	// First clamp call: state flips from 0 → tooLarge (would Warn).
+	s.SetBreakerParams(tooLarge, time.Second)
+	s.breakerErrMu.Lock()
+	got := s.lastBreakerClampWarnedThreshold
+	s.breakerErrMu.Unlock()
+	if got != tooLarge {
+		t.Fatalf("after first clamp: lastBreakerClampWarnedThreshold = %d; want %d", got, tooLarge)
+	}
+
+	// Repeat call with the same too-large threshold: state stays at
+	// tooLarge (no re-Warn).
+	s.SetBreakerParams(tooLarge, time.Second)
+	s.breakerErrMu.Lock()
+	got = s.lastBreakerClampWarnedThreshold
+	s.breakerErrMu.Unlock()
+	if got != tooLarge {
+		t.Fatalf("after repeat clamp: lastBreakerClampWarnedThreshold = %d; want %d (no state change → no re-Warn)", got, tooLarge)
+	}
+
+	// Drop threshold back at-or-below ring: state flips back to 0
+	// (would emit INFO "protection restored").
+	s.SetBreakerParams(ringSize, time.Second)
+	s.breakerErrMu.Lock()
+	got = s.lastBreakerClampWarnedThreshold
+	s.breakerErrMu.Unlock()
+	if got != 0 {
+		t.Fatalf("after restore: lastBreakerClampWarnedThreshold = %d; want 0 (clamp protection restored)", got)
+	}
+
+	// Clamp again — state flips back to tooLarge (would Warn again).
+	s.SetBreakerParams(tooLarge, time.Second)
+	s.breakerErrMu.Lock()
+	got = s.lastBreakerClampWarnedThreshold
+	s.breakerErrMu.Unlock()
+	if got != tooLarge {
+		t.Fatalf("after re-clamp: lastBreakerClampWarnedThreshold = %d; want %d (state change after restore → re-Warn)", got, tooLarge)
+	}
+
+	// Different-too-large-threshold transition: tooLarge → tooLarger
+	// must re-Warn even though both values are above the ring size.
+	// Without this case, an operator oscillating between two too-large
+	// values would get log spam, but the dedup must surface that
+	// the value changed (different threshold = different operator
+	// intent the warning should reflect).
+	tooLarger := tooLarge + 50
+	s.SetBreakerParams(tooLarger, time.Second)
+	s.breakerErrMu.Lock()
+	got = s.lastBreakerClampWarnedThreshold
+	s.breakerErrMu.Unlock()
+	if got != tooLarger {
+		t.Fatalf("after different-too-large transition: lastBreakerClampWarnedThreshold = %d; want %d (threshold changed → re-Warn)", got, tooLarger)
+	}
+}

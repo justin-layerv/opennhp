@@ -3,9 +3,19 @@
 package ac
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
+
+// errReader returns the embedded error on every Read. Used to
+// fence scanIpsetSave's third documented outcome (transport
+// failure → scanner.Err()), symmetric with the other documented
+// outcomes (clean EOF, errIpsetCorruptLineFloodExceeded).
+type errReader struct{ err error }
+
+func (r *errReader) Read(p []byte) (int, error) { return 0, r.err }
 
 // TestParseIpsetSaveLine fences the `ipset save` line parser
 // against every shape HandleAccessControl writes to defaultset
@@ -63,8 +73,20 @@ func TestParseIpsetSaveLine(t *testing.T) {
 			wantOk: false,
 		},
 		{
-			name:   "zero-timeout-rejected",
+			// timeout 0 is accepted at the parser layer with
+			// remaining=0; the downstream `entry.remaining <= 0`
+			// filter in scanIpsetSave drops it silently. Routing
+			// these through the corruption-counter path would
+			// false-fail boot enum on healthy fleets — see the
+			// parser godoc.
+			name:   "zero-timeout-accepted-as-zero-remaining",
 			line:   "add defaultset 192.0.2.1,443,192.0.2.2 timeout 0",
+			want:   ipsetEntry{srcIP: "192.0.2.1", dstIP: "192.0.2.2", port: 443, proto: FlowProtoTCP, remaining: 0},
+			wantOk: true,
+		},
+		{
+			name:   "negative-timeout-rejected",
+			line:   "add defaultset 192.0.2.1,443,192.0.2.2 timeout -5",
 			wantOk: false,
 		},
 		{
@@ -251,5 +273,328 @@ func TestIsIpsetSetNotFoundStderr(t *testing.T) {
 		if isIpsetSetNotFoundStderr(c.stderr, c.setName) {
 			t.Errorf("expected NO MATCH on %q (set=%s); would silently swallow a real error as set-not-found", c.stderr, c.setName)
 		}
+	}
+}
+
+// recordingScanCallbacks returns an ipsetScanCallbacks that records
+// onSchedule calls (FlowKey + remaining duration) into slices and
+// counts onParseError invocations. Used by the scanIpsetSave tests
+// below to assert dispatched tuples + counts without coupling to
+// production wiring.
+func recordingScanCallbacks() (cb ipsetScanCallbacks, scheduled *[]FlowKey, remaining *[]time.Duration, parseErrs *int) {
+	scheds := make([]FlowKey, 0, 8)
+	rems := make([]time.Duration, 0, 8)
+	errs := 0
+	cb = ipsetScanCallbacks{
+		onSchedule: func(key FlowKey, r time.Duration) {
+			scheds = append(scheds, key)
+			rems = append(rems, r)
+		},
+		onParseError: func() {
+			errs++
+		},
+	}
+	return cb, &scheds, &rems, &errs
+}
+
+// TestScanIpsetSave_HappyPath fences the base streaming path: a
+// mix of valid and decorative lines parses cleanly, onSchedule
+// fires once per valid entry with the right tuple, and the count
+// reflects only valid entries.
+func TestScanIpsetSave_HappyPath(t *testing.T) {
+	in := strings.NewReader(`create defaultset hash:ip,port,ip family inet
+add defaultset 192.0.2.1,tcp:443,192.0.2.10 timeout 300
+add defaultset 192.0.2.2,udp:53,192.0.2.20 timeout 600
+`)
+	cb, scheduled, remaining, parseErrs := recordingScanCallbacks()
+	count, err := scanIpsetSave(in, cb)
+	if err != nil {
+		t.Fatalf("scanIpsetSave: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("count: got %d want 2", count)
+	}
+	if got := len(*scheduled); got != 2 {
+		t.Errorf("scheduled: got %d want 2", got)
+	}
+	if *parseErrs != 0 {
+		t.Errorf("parseErrors: got %d want 0", *parseErrs)
+	}
+	// Verify remaining duration is plumbed correctly from
+	// ipsetEntry.remaining → onSchedule callback. Without this,
+	// a bug that passed 0 (or a constant) would only be caught
+	// by integration. cr round 16 item 3.
+	want := []time.Duration{300 * time.Second, 600 * time.Second}
+	if len(*remaining) != len(want) {
+		t.Fatalf("remaining slice: got %d want %d", len(*remaining), len(want))
+	}
+	for i, w := range want {
+		if (*remaining)[i] != w {
+			t.Errorf("remaining[%d]: got %s want %s", i, (*remaining)[i], w)
+		}
+	}
+}
+
+// TestScanIpsetSave_ToleratesBoundedCorruption fences the
+// graceful-degradation contract: up to
+// maxCorruptIpsetLinesBeforeFail undecodable lines are silently
+// tolerated (metric bumps + Debug log only) while valid entries
+// continue to dispatch.
+func TestScanIpsetSave_ToleratesBoundedCorruption(t *testing.T) {
+	// 10 add-shaped-but-malformed + 2 valid → tolerated. The
+	// lines must START with `add` so the decorative-line gate
+	// doesn't skip them — they represent the real corruption
+	// case (ipset save emitted a damaged add record, not a
+	// non-add line we should silently skip).
+	corrupt := strings.Repeat("add defaultset garbled-tuple unknown-fields here too\n", maxCorruptIpsetLinesBeforeFail)
+	in := strings.NewReader(corrupt +
+		"add defaultset 192.0.2.1,tcp:443,192.0.2.10 timeout 300\n" +
+		"add defaultset 192.0.2.2,udp:53,192.0.2.20 timeout 600\n")
+	cb, scheduled, _, parseErrs := recordingScanCallbacks()
+	count, err := scanIpsetSave(in, cb)
+	if err != nil {
+		t.Fatalf("scanIpsetSave should tolerate %d bad lines; got err=%v",
+			maxCorruptIpsetLinesBeforeFail, err)
+	}
+	if count != 2 {
+		t.Errorf("count: got %d want 2 (valid entries should still schedule)", count)
+	}
+	if got := len(*scheduled); got != 2 {
+		t.Errorf("scheduled: got %d want 2", got)
+	}
+	if *parseErrs != maxCorruptIpsetLinesBeforeFail {
+		t.Errorf("parseErrors: got %d want %d", *parseErrs, maxCorruptIpsetLinesBeforeFail)
+	}
+}
+
+// TestScanIpsetSave_FailsLoudOnFlood fences the fail-loud contract:
+// more than maxCorruptIpsetLinesBeforeFail undecodable lines
+// abandons enumeration with errIpsetCorruptLineFloodExceeded,
+// preventing boot from proceeding with a stale scheduler. Uses
+// errors.Is so callers can sentinel-match without scraping the
+// locale-dependent log text.
+func TestScanIpsetSave_FailsLoudOnFlood(t *testing.T) {
+	// add-shaped-but-malformed lines — same gate consideration
+	// as the bounded-corruption test above. The decorative-line
+	// gate skips lines that don't start with `add`; flood
+	// detection only fires on damaged add records.
+	corrupt := strings.Repeat("add defaultset garbled-tuple unknown-fields here too\n", maxCorruptIpsetLinesBeforeFail+1)
+	in := strings.NewReader(corrupt)
+	cb, _, _, parseErrs := recordingScanCallbacks()
+	_, err := scanIpsetSave(in, cb)
+	if err == nil {
+		t.Fatal("scanIpsetSave should fail-loud past the corruption ceiling; got nil")
+	}
+	if !errors.Is(err, errIpsetCorruptLineFloodExceeded) {
+		t.Errorf("err should wrap errIpsetCorruptLineFloodExceeded for sentinel-match; got %v", err)
+	}
+	if *parseErrs != maxCorruptIpsetLinesBeforeFail+1 {
+		t.Errorf("parseErrors: got %d want %d (one more than the ceiling — the line that tripped the fail)",
+			*parseErrs, maxCorruptIpsetLinesBeforeFail+1)
+	}
+}
+
+// TestIsDecorativeIpsetSaveLine is a direct unit on the allowlist
+// helper, symmetric with TestValidateMapKeySize / ValueSize. The allowlist
+// decision is load-bearing: a regression that adds an unknown
+// prefix to the silent-skip set would mask real corruption from
+// the parse-error counter.
+func TestIsDecorativeIpsetSaveLine(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{"blank", "", true},
+		{"whitespace-only", "   \t  ", true},
+		{"comment-bare", "# Generated by ipset", true},
+		{"comment-indented", "  # leading whitespace", true},
+		{"create-defaultset", "create defaultset hash:ip,port,ip family inet", true},
+		{"create-other-set", "create someother hash:ip family inet6", true},
+		{"add-line", "add defaultset 192.0.2.1,tcp:443,192.0.2.2 timeout 285", false},
+		{"flush-not-decorative", "flush defaultset", false},
+		{"swap-not-decorative", "swap defaultset other", false},
+		{"unknown-prefix", "totally-unknown-prefix garbage", false},
+		{"create-no-trailing-space", "createsomething", false}, // exact prefix match
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isDecorativeIpsetSaveLine(c.line); got != c.want {
+				t.Errorf("isDecorativeIpsetSaveLine(%q) = %v, want %v", c.line, got, c.want)
+			}
+		})
+	}
+}
+
+// TestScanIpsetSave_UnknownPrefixCountsAsCorruption fences the
+// allowlist (not blacklist) discipline on the decorative-line
+// gate: an unrecognized line shape (truncated mid-emit, format
+// drift) MUST trip the corruption counter rather than be
+// silently filtered. Anything outside the known {add, create, #,
+// blank} set is treated as a potential add record and reaches
+// parseIpsetSaveLine.
+func TestScanIpsetSave_UnknownPrefixCountsAsCorruption(t *testing.T) {
+	in := strings.NewReader(`create defaultset hash:ip,port,ip family inet
+# Generated by ipset
+add defaultset 192.0.2.1,tcp:443,192.0.2.10 timeout 300
+totally-unknown-prefix garbage that ipset would never emit
+flush defaultset
+add defaultset 192.0.2.2,udp:53,192.0.2.20 timeout 600
+`)
+	cb, scheduled, _, parseErrs := recordingScanCallbacks()
+	count, err := scanIpsetSave(in, cb)
+	if err != nil {
+		t.Fatalf("scanIpsetSave: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("count: got %d want 2 (valid adds still schedule)", count)
+	}
+	if got := len(*scheduled); got != 2 {
+		t.Errorf("scheduled: got %d want 2", got)
+	}
+	// Two unknown-prefix lines (`totally-unknown-prefix ...` and
+	// `flush defaultset`) MUST count as parse errors — the
+	// corruption counter exists to surface exactly this.
+	if *parseErrs != 2 {
+		t.Errorf("parseErrors: got %d want 2 (allowlist must NOT silently filter unknown shapes)", *parseErrs)
+	}
+}
+
+// TestScanIpsetSave_FailsLoudOnFlood_FlowKeyErrPath fences the
+// fail-loud contract on the second branch of the flood — lines that
+// parseIpsetSaveLine accepts (well-formed `add` shape, valid
+// timeout) but flowKeyFromIpsetEntry rejects (e.g., a malformed IP
+// that slipped past `ipset save`'s emitter). This exercises the
+// multi-`%w` wrap that includes the upstream err for triage and
+// confirms errors.Is matches on this branch too.
+func TestScanIpsetSave_FailsLoudOnFlood_FlowKeyErrPath(t *testing.T) {
+	// 0.0.0.0 is rejected by MakeFlowKey's unspecified-IP guard,
+	// so parseIpsetSaveLine succeeds (well-formed shape) but
+	// flowKeyFromIpsetEntry returns err.
+	var sb strings.Builder
+	for i := 0; i <= maxCorruptIpsetLinesBeforeFail; i++ {
+		sb.WriteString("add defaultset 0.0.0.0,tcp:443,192.0.2.10 timeout 300\n")
+	}
+	in := strings.NewReader(sb.String())
+	cb, _, _, parseErrs := recordingScanCallbacks()
+	_, err := scanIpsetSave(in, cb)
+	if err == nil {
+		t.Fatal("scanIpsetSave should fail-loud on flowKey-err flood; got nil")
+	}
+	if !errors.Is(err, errIpsetCorruptLineFloodExceeded) {
+		t.Errorf("err should wrap errIpsetCorruptLineFloodExceeded; got %v", err)
+	}
+	// The second branch uses `%w (most recent: %w)` — verify both
+	// wraps land in the error chain by sentinel-matching the
+	// upstream FlowKey-build error via its message substring (the
+	// sentinel for that error path isn't exported). Also assert
+	// content specific to the FlowKey-err branch (the unspecified-
+	// IP rejection from MakeFlowKey) so this test can't pass via
+	// the !ok branch's "parser rejected" path.
+	if !strings.Contains(err.Error(), "most recent") {
+		t.Errorf("err should include upstream cause via second %%w wrap; got %v", err)
+	}
+	if !strings.Contains(err.Error(), "unspecified") {
+		t.Errorf("err should include FlowKey-branch-specific cause (unspecified IP rejection); got %v", err)
+	}
+	if *parseErrs != maxCorruptIpsetLinesBeforeFail+1 {
+		t.Errorf("parseErrors: got %d want %d", *parseErrs, maxCorruptIpsetLinesBeforeFail+1)
+	}
+}
+
+// TestScanIpsetSave_ScannerErrorPropagates fences the third
+// documented outcome of scanIpsetSave: a transport-level reader
+// failure mid-stream (oversized line, network/pipe error,
+// kernel-induced read error) returns a wrapped error rather
+// than silently truncating. Symmetric with the clean-EOF and
+// corruption-flood outcomes.
+func TestScanIpsetSave_ScannerErrorPropagates(t *testing.T) {
+	transportErr := errors.New("simulated transport failure")
+	cb, _, _, _ := recordingScanCallbacks()
+	count, err := scanIpsetSave(&errReader{err: transportErr}, cb)
+	if err == nil {
+		t.Fatal("scanIpsetSave should propagate scanner.Err transport failure; got nil")
+	}
+	if !errors.Is(err, transportErr) {
+		t.Errorf("err should wrap the transport failure; got %v", err)
+	}
+	if !strings.Contains(err.Error(), "ipset save scan") {
+		t.Errorf("err should be diagnostically prefixed; got %v", err)
+	}
+	if count != 0 {
+		t.Errorf("count: got %d want 0 (transport err before any line)", count)
+	}
+}
+
+// TestScanIpsetSave_RequiresBothCallbacks fences the
+// fail-fast nil-check at the top of scanIpsetSave. A caller
+// supplying a partial callback set gets a clear error
+// immediately rather than panicking on the first matching event.
+func TestScanIpsetSave_RequiresBothCallbacks(t *testing.T) {
+	t.Run("nil-onSchedule", func(t *testing.T) {
+		_, err := scanIpsetSave(strings.NewReader(""), ipsetScanCallbacks{
+			onParseError: func() {},
+		})
+		if err == nil {
+			t.Fatal("expected error on nil onSchedule")
+		}
+		if !strings.Contains(err.Error(), "callbacks are required") {
+			t.Errorf("err should mention required-callbacks contract; got %v", err)
+		}
+	})
+	t.Run("nil-onParseError", func(t *testing.T) {
+		_, err := scanIpsetSave(strings.NewReader(""), ipsetScanCallbacks{
+			onSchedule: func(FlowKey, time.Duration) {},
+		})
+		if err == nil {
+			t.Fatal("expected error on nil onParseError")
+		}
+		if !strings.Contains(err.Error(), "callbacks are required") {
+			t.Errorf("err should mention required-callbacks contract; got %v", err)
+		}
+	})
+	t.Run("both-nil", func(t *testing.T) {
+		_, err := scanIpsetSave(strings.NewReader(""), ipsetScanCallbacks{})
+		if err == nil {
+			t.Fatal("expected error on both-nil callbacks")
+		}
+		if !strings.Contains(err.Error(), "callbacks are required") {
+			t.Errorf("err should mention required-callbacks contract; got %v", err)
+		}
+	})
+}
+
+// TestScanIpsetSave_TimeoutZeroSilentSkip fences the
+// timeout-zero handling: parseIpsetSaveLine accepts `timeout 0`
+// (returns remaining=0), and scanIpsetSave's `remaining <= 0`
+// filter drops the entry silently — no schedule, no metric bump.
+// Routing timeout-zero through the parse-error counter would
+// false-fail boot enum on healthy fleets at the 1M-entry /
+// 10-20s save-stream scale because naturally-expiring entries
+// hit timeout=0 mid-stream.
+func TestScanIpsetSave_TimeoutZeroSilentSkip(t *testing.T) {
+	// A mix of valid + timeout-zero entries. The timeout-zero
+	// line is parsed cleanly but skipped at the remaining-check;
+	// the valid entries schedule normally.
+	in := strings.NewReader(`add defaultset 192.0.2.1,tcp:443,192.0.2.10 timeout 0
+add defaultset 192.0.2.2,tcp:443,192.0.2.20 timeout 300
+add defaultset 192.0.2.3,tcp:443,192.0.2.30 timeout 0
+`)
+	cb, scheduled, _, parseErrs := recordingScanCallbacks()
+	count, err := scanIpsetSave(in, cb)
+	if err != nil {
+		t.Fatalf("scanIpsetSave: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("count: got %d want 1 (only the non-zero-timeout entry schedules)", count)
+	}
+	if got := len(*scheduled); got != 1 {
+		t.Errorf("scheduled: got %d want 1", got)
+	}
+	// CRITICAL: timeout-zero must NOT bump the parse-error
+	// counter. Otherwise the corruption-flood breaker would
+	// fire on healthy boots under load.
+	if *parseErrs != 0 {
+		t.Errorf("parseErrors: got %d want 0 (timeout-zero is silent-skip, NOT corruption)", *parseErrs)
 	}
 }

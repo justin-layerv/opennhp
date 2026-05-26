@@ -576,6 +576,17 @@ type Scheduler struct {
 	breakerCount int         // valid entries in breakerErrs
 	breakerErrMu sync.Mutex
 	breakerOpen  atomic.Bool
+	// lastBreakerClampWarnedThreshold dedups the "threshold exceeds
+	// ring size" Warning across repeated SetBreakerParams calls with
+	// the same too-large value. 0 = not currently clamped; nonzero =
+	// last warned threshold. SetBreakerParams flips it back to 0 on
+	// first call where threshold ≤ ring and emits a single INFO
+	// "protection restored" line.
+	// 0 sentinel is safe because SetBreakerParams rejects
+	// threshold ≤ 0 at the input gate before reaching this
+	// dedup state machine (see the `threshold <= 0` reject
+	// branch at the top of SetBreakerParams).
+	lastBreakerClampWarnedThreshold int // guarded by breakerErrMu
 
 	// Metrics.
 	metricEntries       atomic.Int64
@@ -1133,14 +1144,47 @@ func (s *Scheduler) SetBreakerParams(threshold int, window time.Duration) {
 	// Clamp rather than store the unprotectable value — an
 	// operator restart is the only way to grow the ring, and a
 	// stored-but-unreachable threshold is an operator footgun.
-	if ringSize := len(s.breakerErrs); threshold > ringSize {
-		log.Warning("[ExpirySched] SetBreakerParams(threshold=%d) exceeds construct-time ring size %d; clamping to %d — restart the AC to grow the ring above this", threshold, ringSize, ringSize)
-		threshold = ringSize
-	}
+	//
+	// Warn-once dedup: operators reloading config.toml in a loop
+	// with the same too-large threshold would otherwise flood logs
+	// with identical warnings. Track the last-warned threshold under
+	// breakerErrMu and emit only on change. When the threshold drops
+	// back at-or-below ring size, emit a single INFO "protection
+	// restored" line so operators get a clean recovery signal.
+	//
+	// Decide-under-lock, emit-after pattern: the lock-held section
+	// only reads and writes scheduler state; the log calls happen
+	// AFTER Unlock so a slow stderr / log-file rotation can't stall
+	// the breaker's recordBreakerErr read path on the schedule loop.
+	//
+	// breakerErrs slice header is allocated once in NewScheduler
+	// and never resliced, so reading len() lock-free here is safe.
+	ringSize := len(s.breakerErrs)
+	var (
+		emitClampWarn    bool
+		emitRestoreInfo  bool
+		clampedThreshold = threshold
+	)
 	s.breakerErrMu.Lock()
-	s.breakerThreshold = threshold
+	if threshold > ringSize {
+		if s.lastBreakerClampWarnedThreshold != threshold {
+			emitClampWarn = true
+			s.lastBreakerClampWarnedThreshold = threshold
+		}
+		clampedThreshold = ringSize
+	} else if s.lastBreakerClampWarnedThreshold != 0 {
+		emitRestoreInfo = true
+		s.lastBreakerClampWarnedThreshold = 0
+	}
+	s.breakerThreshold = clampedThreshold
 	s.breakerWindow = window
 	s.breakerErrMu.Unlock()
+
+	if emitClampWarn {
+		log.Warning("[ExpirySched] SetBreakerParams(threshold=%d) exceeds construct-time ring size %d; clamping to %d — restart the AC to grow the ring above this", threshold, ringSize, ringSize)
+	} else if emitRestoreInfo {
+		log.Info("[ExpirySched] SetBreakerParams(threshold=%d) is at-or-below ring size %d; clamp protection restored", threshold, ringSize)
+	}
 }
 
 // BreakerRingSize returns the constructed-time size of the

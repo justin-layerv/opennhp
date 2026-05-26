@@ -147,11 +147,14 @@ func (a *UdpAC) enumerateBpfMap(
 	if err != nil {
 		return 0, fmt.Errorf("map %s: info: %w", pinPath, err)
 	}
-	if int(info.KeySize) != keySize {
-		return 0, fmt.Errorf("map %s: key-size mismatch (kernel=%d, caller=%d) — refusing to decode garbage", pinPath, info.KeySize, keySize)
+	// Single-dimension helpers (not a bundled wrapper) so each
+	// call only takes the two ints for its own axis — no risk of
+	// accidentally swapping a key arg into the value position.
+	if err := validateMapKeySize(pinPath, int(info.KeySize), keySize); err != nil {
+		return 0, err
 	}
-	if int(info.ValueSize) != utilebpf.WhitelistValueSize {
-		return 0, fmt.Errorf("map %s: value-size mismatch (kernel=%d, expected=%d) — refusing to decode garbage", pinPath, info.ValueSize, utilebpf.WhitelistValueSize)
+	if err := validateMapValueSize(pinPath, int(info.ValueSize), utilebpf.WhitelistValueSize); err != nil {
+		return 0, err
 	}
 
 	keyBytes := make([]byte, keySize)

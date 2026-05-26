@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os/exec"
 	"strconv"
@@ -74,6 +75,31 @@ func (a *UdpAC) enumerateKernelAllowRules() (int, error) {
 // fail loud
 var errIpsetSetNotFound = errors.New("ipset set not found")
 
+// maxCorruptIpsetLinesBeforeFail is the per-`ipset save` ceiling
+// on undecodable lines (parseIpsetSaveLine !ok OR
+// flowKeyFromIpsetEntry returning an error) before
+// enumerateIpsetSet abandons the rest of the set and returns
+// loud. Boundary semantics: this value is the TOLERATED count;
+// the (N+1)th undecodable line trips the fail-loud branch
+// (check is `parseErrors > maxCorruptIpsetLinesBeforeFail`). A boot enumerates BOTH defaultset and defaultsetv6, so
+// the per-boot tolerance is 2× this value across the two calls
+// (each set is independently corrupt-able). At the 1M-entry
+// boot-enum target a one-off ipset format drift shouldn't
+// fail-close the AC — but systemic corruption MUST trip the
+// fail-loud contract before boot proceeds with a stale
+// scheduler. 10 is comfortably above the empirical noise floor
+// (kernel-emitted lines are deterministic; the only realistic
+// source of single-line damage is racing `ipset save` against
+// an in-flight `ipset add` that flushes mid-stream). Tracked
+// via MetricL3FlushIpsetParseError dashboards.
+const maxCorruptIpsetLinesBeforeFail = 10
+
+// errIpsetCorruptLineFloodExceeded signals the per-call
+// parse-error ceiling was exceeded. Distinct sentinel so callers
+// (and tests) can errors.Is for the systemic-corruption case
+// without locale-matching log strings.
+var errIpsetCorruptLineFloodExceeded = errors.New("ipset save: parse-error ceiling exceeded")
+
 func (a *UdpAC) enumerateIpsetSet(setName string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), bootEnumerationDeadline)
 	defer cancel()
@@ -94,50 +120,41 @@ func (a *UdpAC) enumerateIpsetSet(setName string) (int, error) {
 	}
 
 	now := time.Now()
-	count := 0
-	scanner := bufio.NewScanner(stdout)
-	// `ipset save` lines are short (~80 chars) but defensively size
-	// the buffer to 1 MiB to future-proof against a single oversized
-	// entry. Without this, bufio.Scanner's default 64 KiB cap would
-	// cause `scanner.Scan()` to error and we'd lose the rest of the
-	// stream
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		entry, ok := parseIpsetSaveLine(line)
-		if !ok {
-			continue
-		}
-		key, err := flowKeyFromIpsetEntry(entry)
-		if err != nil {
-			log.Debug("[L3FlushSched] skipping unparseable ipset entry %q: %v", line, err)
-			continue
-		}
-		// Filter past-timeout entries here — symmetric with the BPF
-		// boot-enum path. The kernel-side ipset will GC the entry on
-		// next match; scheduling a no-op flush against it just spends
-		// ConntrackFlusher's ~10ms exec budget on a known-zero-result
-		// call. At a large already-expired backlog on boot, those
-		// no-op calls compound and can starve the worker pool.
-		// entry.remaining can still be sub-tick if natural expiry is
-		// moments away (clock skew between `ipset save` and Schedule,
-		// slow boot); the scheduled flush lands in (hand+1) and the
-		// flusher hits ENOENT via the idempotency contract.
-		if entry.remaining <= 0 {
-			continue
-		}
-		a.expirySched.Schedule(key, now.Add(entry.remaining))
-		count++
-	}
-	if err := scanner.Err(); err != nil {
-		// Drain the child but discard its exit; the scanner error
-		// is the primary fault. Folding the Wait err in would
-		// double-fault on every mid-stream scanner failure, masking
-		// the actually-actionable cause (buffer overrun, ENOMEM)
-		// behind a less-informative "ipset save: signal: ...".
-		// The fail-closed contract still holds — we return loud.
+	count, err := scanIpsetSave(stdout, ipsetScanCallbacks{
+		onSchedule: func(key FlowKey, remaining time.Duration) {
+			a.expirySched.Schedule(key, now.Add(remaining))
+		},
+		onParseError: func() {
+			a.incrMetric(MetricL3FlushIpsetParseError)
+		},
+	})
+	if err != nil {
+		// Fail-loud paths (parse-error flood + scanner error) all
+		// abandon the rest of the child's output. SIGKILL the
+		// child via ctx cancel BEFORE cmd.Wait() — without this,
+		// the child keeps writing to a stdout pipe nobody reads;
+		// once the pipe buffer (~64 KiB) fills, the child blocks
+		// on write(2) and cmd.Wait() blocks with it until
+		// bootEnumerationDeadline, turning fast-fail into
+		// slow-fail. context.CancelFunc is idempotent so the
+		// deferred cancel() above remains correct.
+		cancel()
 		_ = cmd.Wait()
-		return count, fmt.Errorf("ipset save scan: %w", err)
+		if errors.Is(err, errIpsetCorruptLineFloodExceeded) {
+			// Inner err already carries the sentinel + "N
+			// undecodable lines" detail; we only add the
+			// valid-entries-scheduled-before-flood count for
+			// triage. setName is added by the outer caller in
+			// enumerateKernelAllowRules, so omitting it here
+			// avoids the "ipset save defaultset: ipset save: ...
+			// defaultset after N" double-wrap.
+			return count, fmt.Errorf("%w (after %d valid entries scheduled)", err, count)
+		}
+		// Transport-error fall-through: scanner.Err returns plain
+		// errors without setName context. The outer
+		// enumerateKernelAllowRules wraps with "ipset %s: %w", so
+		// no further setName context is needed here.
+		return count, err
 	}
 	if err := cmd.Wait(); err != nil {
 		// Distinguish "set doesn't exist" (expected on IPv4-only
@@ -151,6 +168,149 @@ func (a *UdpAC) enumerateIpsetSet(setName string) (int, error) {
 			return count, fmt.Errorf("%w: %s", errIpsetSetNotFound, stderrText)
 		}
 		return count, fmt.Errorf("ipset save wait: %w (stderr: %s)", err, stderrText)
+	}
+	return count, nil
+}
+
+// isDecorativeIpsetSaveLine reports whether a line is one of the
+// known non-add shapes `ipset save` emits — set header, comment,
+// blank — that the scanner should skip silently. Anything outside
+// this allowlist is treated as a potential add record and reaches
+// parseIpsetSaveLine, where !ok bumps the corruption counter.
+//
+// Allowlist (NOT blacklist) is deliberate: truncated mid-emit
+// output or format drift can produce a non-"add"-prefixed garbage
+// line, and the corruption counter exists precisely to catch
+// that. A blacklist that skipped everything except "add" would
+// silently filter the case the metric is meant to surface.
+//
+// Verified against ipset 7.x as installed by user_data.sh.tpl on
+// the AC AMI (the production target). Other producers — `flush`,
+// `swap`, `destroy` etc. — are NOT in the allowlist by design;
+// `ipset save` itself doesn't emit them, and treating them as
+// corruption surfaces an ipset-tools upgrade that changes the
+// dump format before the fleet absorbs the regression silently.
+func isDecorativeIpsetSaveLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "#") {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "create ") {
+		return true
+	}
+	return false
+}
+
+// ipsetScanCallbacks bundles the side-effect callbacks
+// scanIpsetSave invokes. Extracted so unit tests can pass fakes
+// for the schedule and metric-bump paths and exercise the
+// fail-loud contract against a strings.NewReader without
+// privileged Linux+root infra.
+//
+// CONTRACT: both onSchedule and onParseError MUST be non-nil.
+// scanIpsetSave fails fast with an error on a nil callback rather
+// than dereferencing it mid-stream — see
+// TestScanIpsetSave_RequiresBothCallbacks for the fence.
+type ipsetScanCallbacks struct {
+	onSchedule   func(key FlowKey, remaining time.Duration)
+	onParseError func()
+}
+
+// scanIpsetSave streams ipset-save output, parses each line, and
+// dispatches valid entries via cb.onSchedule. Returns the number
+// of entries scheduled and one of:
+//   - nil on clean EOF
+//   - errIpsetCorruptLineFloodExceeded wrapped, when undecodable
+//     lines exceed maxCorruptIpsetLinesBeforeFail (fail-loud)
+//   - a wrapped scanner.Err() on transport-level failure
+//
+// Pure on rdr — no exec, no UdpAC dependency — so the
+// fail-loud contract on systemic ipset-format drift is unit-testable
+// without privileged Linux+root infra.
+//
+// CONTRACT for exec-based callers: a non-nil return abandons the
+// rest of the child's output. The caller MUST cancel the child's
+// ctx and call cmd.Wait() to avoid the pipe-buffer-fills →
+// child-blocked-on-write → cmd.Wait()-blocked-on-deadline failure
+// mode. enumerateIpsetSet does this via killChild() + _ = cmd.Wait();
+// new callers must follow the same discipline.
+func scanIpsetSave(rdr io.Reader, cb ipsetScanCallbacks) (int, error) {
+	// Fail-fast at the top so a misconfigured caller gets a clear
+	// error immediately rather than dereferencing a nil callback
+	// on the first matching mid-stream event. Both callbacks are
+	// required per the ipsetScanCallbacks CONTRACT godoc.
+	if cb.onSchedule == nil || cb.onParseError == nil {
+		return 0, errors.New("scanIpsetSave: both onSchedule and onParseError callbacks are required")
+	}
+	count := 0
+	parseErrors := 0
+	scanner := bufio.NewScanner(rdr)
+	// `ipset save` lines are short (~80 chars) but defensively
+	// size the buffer to 1 MiB to future-proof against a single
+	// oversized entry. Without this, bufio.Scanner's default 64
+	// KiB cap would cause scanner.Scan() to error and we'd lose
+	// the rest of the stream.
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Skip KNOWN-decorative lines (create header, comments,
+		// blanks) silently. An allowlist of known prefixes — NOT a
+		// blacklist that filters anything except "add" — so a truly
+		// corrupt line (truncated mid-emit, format drift) that
+		// happens not to start with "add" still reaches
+		// parseIpsetSaveLine and trips the corruption counter.
+		// Without this gate, the always-present `create defaultset
+		// ...` header would inflate the parse-error counter on
+		// every healthy enumeration.
+		if isDecorativeIpsetSaveLine(line) {
+			continue
+		}
+		entry, ok := parseIpsetSaveLine(line)
+		if !ok {
+			parseErrors++
+			cb.onParseError()
+			// Symmetric Debug log with the flowKeyFromIpsetEntry
+			// branch below — an alarm on
+			// MetricL3FlushIpsetParseError needs a corresponding
+			// log line to be actionable.
+			log.Debug("[L3FlushSched] skipping unparseable ipset save line %q", line)
+			if parseErrors > maxCorruptIpsetLinesBeforeFail {
+				return count, fmt.Errorf("%w (%d undecodable lines; most recent: parser rejected %q)",
+					errIpsetCorruptLineFloodExceeded, parseErrors, line)
+			}
+			continue
+		}
+		key, err := flowKeyFromIpsetEntry(entry)
+		if err != nil {
+			parseErrors++
+			cb.onParseError()
+			log.Debug("[L3FlushSched] skipping unparseable ipset entry %q: %v", line, err)
+			if parseErrors > maxCorruptIpsetLinesBeforeFail {
+				return count, fmt.Errorf("%w (%d undecodable lines; most recent: %w)",
+					errIpsetCorruptLineFloodExceeded, parseErrors, err)
+			}
+			continue
+		}
+		// Past-timeout filter — symmetric with the BPF boot-enum
+		// path. parseIpsetSaveLine accepts `timeout 0` and returns
+		// remaining=0; this filter drops those silently. Reaches
+		// nonzero traffic at the 1M-entry / 10-20s save-stream
+		// scale because naturally-expiring entries hit timeout=0
+		// mid-stream. The kernel-side ipset will GC the entry on
+		// next match; scheduling a no-op flush against it just
+		// spends ConntrackFlusher's ~10ms exec budget on a
+		// known-zero-result call.
+		if entry.remaining <= 0 {
+			continue
+		}
+		cb.onSchedule(key, entry.remaining)
+		count++
+	}
+	if err := scanner.Err(); err != nil {
+		return count, fmt.Errorf("ipset save scan: %w", err)
 	}
 	return count, nil
 }
@@ -214,7 +374,14 @@ type ipsetEntry struct {
 //
 // Rejected (return false): port-range entries (1-65535), missing
 // timeout (these are tempset/permanent which we don't schedule),
-// non-add lines.
+// negative timeout, non-add lines.
+//
+// Accepted but with remaining=0: `timeout 0` lines (naturally-
+// expiring entries observed mid-`ipset save`). Callers MUST
+// filter `entry.remaining <= 0` to drop these; scheduling a
+// flush against an entry the kernel is about to GC would just
+// burn the worker pool on ENOENT-noop calls. scanIpsetSave is
+// the only caller and does this correctly.
 func parseIpsetSaveLine(line string) (ipsetEntry, bool) {
 	fields := strings.Fields(line)
 	if len(fields) < 5 {
@@ -243,7 +410,18 @@ func parseIpsetSaveLine(line string) (ipsetEntry, bool) {
 		return ipsetEntry{}, false
 	}
 	timeoutSec, err := strconv.Atoi(fields[timeoutIdx+1])
-	if err != nil || timeoutSec <= 0 {
+	if err != nil {
+		return ipsetEntry{}, false
+	}
+	// timeout 0 is accepted at the parser layer (returns ok with
+	// remaining=0) so the downstream `entry.remaining <= 0` filter
+	// in scanIpsetSave can drop it silently. Rejecting here would
+	// route the line through the corruption-counter path —
+	// problematic because at the 1M-entry / 10-20s save-stream
+	// scale, naturally-expiring entries can hit timeout=0
+	// mid-stream and would otherwise trip
+	// errIpsetCorruptLineFloodExceeded on a healthy boot.
+	if timeoutSec < 0 {
 		return ipsetEntry{}, false
 	}
 

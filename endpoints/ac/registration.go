@@ -338,6 +338,18 @@ const (
 	// rather than leaving it as a Debug log line
 	MetricL3FlushKeyMalformed = "L3FlushKeyMalformed"
 
+	// MetricL3FlushIpsetParseError is incremented per undecodable
+	// `add` line during enumerateIpsetSet boot enumeration.
+	// Tolerated up to maxCorruptIpsetLinesBeforeFail per call
+	// (single-line damage shouldn't fail-close a 1M-entry boot);
+	// past that the fail-loud contract trips. Non-zero on a
+	// healthy fleet means an `ipset save` format drift or a racing
+	// add/flush operation mid-stream — investigate before the next
+	// ipset-tools upgrade. Naturally-expiring entries observed at
+	// timeout=0 mid-stream are accepted by the parser and dropped
+	// silently downstream (do NOT bump this counter).
+	MetricL3FlushIpsetParseError = "L3FlushIpsetParseError"
+
 	// L3 flush scheduler gauges Published every 60s via RegisterGaugeFunc; reads
 	// are no-ops when the feature is off (UdpAC.expirySched nil).
 	// The 4+4-week rollout's "validate then drop dry-run" gate
