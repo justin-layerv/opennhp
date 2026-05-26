@@ -231,43 +231,89 @@ variable "qurl_api_token_secret_arn" {
   default     = ""
 }
 
+variable "secrets_kms_key_arn" {
+  description = "KMS key ARN for customer-managed Secrets Manager secrets this instance role reads. When set, the role gets kms:Decrypt so user_data can fetch CMK-encrypted secrets."
+  type        = string
+  default     = null
+}
+
+variable "nhp_server_internal_url" {
+  description = "HTTPS base URL qurl-reverse-tunnel-server uses to validate AC-issued knock tokens with nhp-server. Required under qurl_tunnel_auth_mode=\"tunnel-auth\". Must be an origin only with no trailing slash; qurl-reverse-tunnel-server appends /nhp/internal/token/validate."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.nhp_server_internal_url == "" || can(regex("^https://[^[:space:]/?#]+$", var.nhp_server_internal_url))
+    error_message = "nhp_server_internal_url must be empty or an HTTPS origin URL with no path/query/fragment/trailing slash, e.g. https://resolve-origin.qurl.link.layerv.xyz."
+  }
+}
+
+variable "nhp_internal_auth_secret_arn" {
+  description = "Secrets Manager ARN for the NHP internal auth HMAC secret. Required under qurl_tunnel_auth_mode=\"tunnel-auth\" so qurl-reverse-tunnel-server can sign knock-token validation requests to nhp-server."
+  type        = string
+  default     = ""
+}
+
+variable "connect_layerv_host" {
+  description = "Customer-facing public FRP control hostname (for example connect.layerv.xyz). Used only as the active-registration boundary label; the registered upstream endpoint remains the instance-private FRP vhost listener."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.connect_layerv_host == "" || can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$", var.connect_layerv_host))
+    error_message = "connect_layerv_host must be empty or a bare lowercase DNS hostname with no scheme, port, path, or whitespace."
+  }
+}
+
+variable "tunnel_server_az_control_ports" {
+  description = "Per-AZ public NHP-protected FRP control listener ports, keyed by AZ suffix. Threaded from the root module's tunnel_server_az_control_port local so NHP resource rows and qurl-reverse-tunnel-server active-registration boundary labels share one port map."
+  type        = map(number)
+  default     = {}
+
+  validation {
+    condition     = alltrue([for suffix in keys(var.tunnel_server_az_control_ports) : can(regex("^[a-z]$", suffix))])
+    error_message = "tunnel_server_az_control_ports keys must be single lowercase AZ suffixes such as a, b, or c."
+  }
+
+  validation {
+    condition     = alltrue([for port in values(var.tunnel_server_az_control_ports) : port >= 1 && port <= 65535])
+    error_message = "tunnel_server_az_control_ports values must be valid TCP ports (1-65535)."
+  }
+}
+
 variable "qurl_tunnel_auth_mode" {
   description = <<-EOT
     Selects which qurl-reverse-tunnel-server auth mode the deployed instance runs in. One of:
 
-      ""             - Legacy api mode (default). qurl-reverse-tunnel-server validates each
-                       NewProxy by calling qurl-service GET /resources/{id}
-                       and matching FRP run_id against resource.connector_id.
-                       The token in qurl_api_token_secret_arn is written to
-                       the env as QURL_API_TOKEN.
+      ""             - Legacy placeholder kept for module API compatibility.
+                       Current qurl-reverse-tunnel-server images no longer
+                       accept unset mode; do not use this with a modern
+                       image.
 
-      "tunnel-auth"  - Per-user API-key mode (qurl-reverse-tunnel-server PR
-                       #83). qurl-reverse-tunnel-server reads the user's lv_live_* API key
-                       from FRP Login.Metas[qurl_api_key] (or PrivilegeKey
-                       fallback) and forwards it to qurl-service POST
-                       /internal/v1/tunnel/auth. Requires the
-                       qurl-reverse-tunnel-client follow-up
-                       (layervai/qurl-reverse-tunnel-client#114) so qurl-reverse-tunnel-client
-                       actually populates the meta. The token in
-                       qurl_api_token_secret_arn is written to the env as
-                       QURL_INTERNAL_SERVICE_TOKEN, and
-                       QURL_TUNNEL_AUTH_MODE=tunnel-auth is also exported.
+      "tunnel-auth"  - Knock-token-as-identity mode. qurl-reverse-tunnel-server
+                       validates the AC-issued knock token with nhp-server,
+                       stashes the server-resolved owner_id for the FRP
+                       run_id, authorizes NewProxy through qurl-service
+                       POST /internal/v1/tunnel/auth-by-owner, and publishes
+                       active target registrations to qurl-service. The token
+                       in qurl_api_token_secret_arn is written to the env as
+                       QURL_INTERNAL_SERVICE_TOKEN, and QURL_TUNNEL_AUTH_MODE,
+                       NHP_SERVER_INTERNAL_URL, NHP_INTERNAL_AUTH_SECRET, and
+                       QURL_TUNNEL_INSTANCE_* are exported.
 
-    Defaults to "" (legacy mode) so this module change is a no-op for
-    existing deploys; the env-shape flip only happens when the root
-    explicitly opts into tunnel-auth mode for a given environment.
+    Defaults to "" for module API compatibility with environments that have
+    not deployed qurl-reverse-tunnel-server. Any environment that sets
+    deploy_frps=true with a current image must set "tunnel-auth".
 
-    "noop" is intentionally not exposed here — single-tenant deploys
-    that want to disable auth should leave qurl_api_token_secret_arn
-    empty, which produces the noop env shape via the existing branches
-    in user_data.sh.tpl.
+    "noop" is intentionally not exposed here — this module is for the
+    multi-tenant FRPS-behind-AC topology.
   EOT
   type        = string
   default     = ""
 
   validation {
     condition     = var.qurl_tunnel_auth_mode == "" || var.qurl_tunnel_auth_mode == "tunnel-auth"
-    error_message = "qurl_tunnel_auth_mode must be \"\" (legacy api mode) or \"tunnel-auth\". Other values are rejected at startup by qurl-reverse-tunnel-server; reject here to surface the typo at plan time instead of at boot."
+    error_message = "qurl_tunnel_auth_mode must be \"\" (module-compat placeholder) or \"tunnel-auth\". Other values are rejected at startup by qurl-reverse-tunnel-server; reject here to surface the typo at plan time instead of at boot."
   }
 }
 

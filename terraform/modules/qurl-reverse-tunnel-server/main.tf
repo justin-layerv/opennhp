@@ -190,17 +190,21 @@ locals {
     cloudmap_service_ids_green = {
       for s, svc in aws_service_discovery_service.frps_per_az_green : s => svc.id
     }
-    frps_az_suffixes          = var.frps_az_suffixes
-    namespace_name            = var.namespace_name
-    log_group_name            = aws_cloudwatch_log_group.frps.name
-    frps_bind_port            = var.frps_bind_port
-    frps_vhost_http_port      = var.frps_vhost_http_port
-    frps_dashboard_port       = var.frps_dashboard_port
-    frps_subdomain_host       = var.frps_subdomain_host
-    qurl_api_internal_url     = var.qurl_api_internal_url
-    qurl_api_token_secret_arn = var.qurl_api_token_secret_arn
-    qurl_tunnel_auth_mode     = var.qurl_tunnel_auth_mode
-    ssm_image_tag_param       = local.ssm_image_tag_param_name
+    frps_az_suffixes               = var.frps_az_suffixes
+    namespace_name                 = var.namespace_name
+    log_group_name                 = aws_cloudwatch_log_group.frps.name
+    frps_bind_port                 = var.frps_bind_port
+    frps_vhost_http_port           = var.frps_vhost_http_port
+    frps_dashboard_port            = var.frps_dashboard_port
+    frps_subdomain_host            = var.frps_subdomain_host
+    qurl_api_internal_url          = var.qurl_api_internal_url
+    qurl_api_token_secret_arn      = var.qurl_api_token_secret_arn
+    nhp_server_internal_url        = var.nhp_server_internal_url
+    nhp_internal_auth_secret_arn   = var.nhp_internal_auth_secret_arn
+    connect_layerv_host            = var.connect_layerv_host
+    qurl_tunnel_auth_mode          = var.qurl_tunnel_auth_mode
+    tunnel_server_az_control_ports = var.tunnel_server_az_control_ports
+    ssm_image_tag_param            = local.ssm_image_tag_param_name
     # The user_data fallback command and the IAM grant must point at the
     # same bucket. Threading both from root (plugin_bucket_name + _arn)
     # instead of hardcoding the legacy `layerv-nhp-${env}-plugins` name
@@ -352,34 +356,35 @@ resource "aws_iam_role_policy" "frps" {
   })
 }
 
-# Secrets Manager access for QURL API token (separate policy, conditional).
-#
-# KMS assumption: this policy grants `secretsmanager:GetSecretValue` only. If
-# the target secret is encrypted with a customer-managed KMS key (CMK), the
-# fetch will succeed only if the key policy on that CMK grants `kms:Decrypt`
-# to this instance role (or to the account principal). Current QURL internal
-# service-token secrets are encrypted with the default `aws/secretsmanager`
-# AWS-managed key, so the account principal already has decrypt permission
-# via IAM — no explicit `kms:Decrypt` grant needed here. If a future move
-# encrypts the secret with a CMK, add a conditional `kms:Decrypt` statement
-# scoped to that key ARN (or update the key policy) — otherwise `user_data`
-# will fail with a 400 AccessDenied at boot that isn't obvious from this
-# policy alone.
+# Secrets Manager access for QURL/NHP tunnel-auth secrets. CMK-encrypted
+# secrets require both `secretsmanager:GetSecretValue` and caller-side
+# `kms:Decrypt`; root wires `module.kms.secrets_key_arn` for the shared NHP
+# internal auth secret.
 resource "aws_iam_role_policy" "frps_secrets" {
-  count = var.qurl_api_token_secret_arn != "" ? 1 : 0
+  count = var.qurl_api_token_secret_arn != "" || var.nhp_internal_auth_secret_arn != "" ? 1 : 0
   name  = "frps-secrets"
   role  = aws_iam_role.frps.id
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
-        Sid      = "SecretsManagerRead"
-        Effect   = "Allow"
-        Action   = ["secretsmanager:GetSecretValue"]
-        Resource = var.qurl_api_token_secret_arn
+        Sid    = "SecretsManagerRead"
+        Effect = "Allow"
+        Action = ["secretsmanager:GetSecretValue"]
+        Resource = compact([
+          var.qurl_api_token_secret_arn,
+          var.nhp_internal_auth_secret_arn,
+        ])
       }
-    ]
+      ],
+      var.secrets_kms_key_arn != null ? [{
+        Sid      = "SecretsKmsDecrypt"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = [var.secrets_kms_key_arn]
+      }] : []
+    )
   })
 }
 
@@ -767,7 +772,7 @@ resource "aws_autoscaling_group" "frps" {
       # block is gated on qurl_api_token_secret_arn != "", so a caller that
       # opts into tunnel-auth without a token ARN would skip every check
       # and write QURL_INTERNAL_SERVICE_TOKEN= (empty) to the env. The
-      # qurl-reverse-tunnel-server resolver then can't authenticate /internal/v1/tunnel/auth
+      # qurl-reverse-tunnel-server resolver then can't authenticate /internal/v1/tunnel/auth-by-owner
       # calls, surfacing as opaque 401s at runtime — fail at plan time
       # instead, mirroring the qurl_api_internal_url precondition above.
       #
@@ -776,7 +781,32 @@ resource "aws_autoscaling_group" "frps" {
       # demands the URL. So tunnel-auth mode is fenced against both an
       # empty token AND an empty URL without an explicit third check here.
       condition     = var.qurl_tunnel_auth_mode != "tunnel-auth" || var.qurl_api_token_secret_arn != ""
-      error_message = "qurl_tunnel_auth_mode = \"tunnel-auth\" requires qurl_api_token_secret_arn — the per-user-key resolver still needs the internal-service shared secret to call qurl-service /internal/v1/tunnel/auth."
+      error_message = "qurl_tunnel_auth_mode = \"tunnel-auth\" requires qurl_api_token_secret_arn — the tunnel-auth resolver still needs the internal-service shared secret to call qurl-service /internal/v1/tunnel/auth-by-owner."
+    }
+
+    precondition {
+      condition     = var.qurl_tunnel_auth_mode != "tunnel-auth" || var.nhp_server_internal_url != ""
+      error_message = "qurl_tunnel_auth_mode = \"tunnel-auth\" requires nhp_server_internal_url so qurl-reverse-tunnel-server can validate AC-issued knock tokens with nhp-server."
+    }
+
+    precondition {
+      condition     = var.qurl_tunnel_auth_mode != "tunnel-auth" || var.nhp_internal_auth_secret_arn != ""
+      error_message = "qurl_tunnel_auth_mode = \"tunnel-auth\" requires nhp_internal_auth_secret_arn so qurl-reverse-tunnel-server can sign knock-token validation requests."
+    }
+
+    precondition {
+      condition     = var.qurl_tunnel_auth_mode != "tunnel-auth" || var.connect_layerv_host != ""
+      error_message = "qurl_tunnel_auth_mode = \"tunnel-auth\" requires connect_layerv_host so active-registration boundary labels map back to the public NHP-protected ingress."
+    }
+
+    precondition {
+      condition     = var.qurl_tunnel_auth_mode != "tunnel-auth" || length(setsubtract(toset(var.frps_az_suffixes), toset(keys(var.tunnel_server_az_control_ports)))) == 0
+      error_message = "qurl_tunnel_auth_mode = \"tunnel-auth\" requires tunnel_server_az_control_ports to include every configured frps_az_suffix so active registrations can report the public NHP-protected control boundary."
+    }
+
+    precondition {
+      condition     = var.qurl_tunnel_auth_mode != "tunnel-auth" || length(var.tunnel_server_az_control_ports) > 0
+      error_message = "qurl_tunnel_auth_mode = \"tunnel-auth\" requires a non-empty tunnel_server_az_control_ports map."
     }
 
     precondition {

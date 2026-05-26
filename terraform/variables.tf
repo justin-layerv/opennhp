@@ -1309,6 +1309,12 @@ variable "qurl_tunnel_auth_enabled" {
   default     = false
 }
 
+variable "qurl_tunnel_active_registrations_enabled" {
+  description = "Enable qurl-service to publish authoritative active reverse-tunnel target sets (`upstream_addrs`) from qurl-reverse-tunnel-server registration heartbeats. Default false keeps the router on the legacy per-AZ `upstream_addr` path while the reporter and AC discovery rollout are verified. Flip per-env only after qurl-service, qurl-reverse-tunnel-server, and qurl-router active-target support are deployed and healthy."
+  type        = bool
+  default     = false
+}
+
 # ==================== Grafana Cloud Dashboards ====================
 
 variable "grafana_dashboards_enabled" {
@@ -1978,31 +1984,29 @@ variable "qurl_reverse_tunnel_server_tunnel_auth_mode" {
   description = <<-EOT
     Selects which qurl-reverse-tunnel-server auth mode the deployed FRP server runs in.
 
-      ""             - Legacy api mode. qurl-reverse-tunnel-server validates each NewProxy
-                       by calling qurl-service GET /resources/{id} and
-                       matching FRP run_id against resource.connector_id.
-                       Default — preserves existing behavior for every
-                       env that hasn't opted in.
+      ""             - Module-compat placeholder for envs that have not
+                       deployed qurl-reverse-tunnel-server. Current
+                       qurl-reverse-tunnel-server images no longer accept
+                       unset mode; any env with deploy_frps=true must set
+                       "tunnel-auth".
 
-      "tunnel-auth"  - Per-user API-key mode. qurl-reverse-tunnel-server reads the user's
-                       lv_live_* API key from FRP Login.Metas[qurl_api_key]
-                       and forwards it to qurl-service POST
-                       /internal/v1/tunnel/auth. Enables per-key
-                       revocation, per-key rate limit, and quota-at-auth-
-                       time. Required for the qurl-integrations Slack-bot
-                       use case (Slack bot connects with its own API key
-                       and gets scoped subdomains).
+      "tunnel-auth"  - Knock-token-as-identity mode. qurl-reverse-tunnel-server validates
+                       the AC-issued knock token with nhp-server, stores the
+                       server-resolved owner_id for the FRP run_id, authorizes
+                       each NewProxy through qurl-service
+                       POST /internal/v1/tunnel/auth-by-owner, and publishes
+                       active target rows to qurl-service for router-side
+                       active-set dispatch.
 
     Hard cross-repo prerequisites before flipping a non-sandbox env to
     "tunnel-auth":
-      * qurl-reverse-tunnel-server #83 merged AND `frps_image_tag` bumped
-        to a build that includes it. Without this the qurl-reverse-tunnel-server binary
-        rejects QURL_TUNNEL_AUTH_MODE=tunnel-auth as an unknown mode and
-        the ASG instance fails startup.
-      * qurl-reverse-tunnel-client #114 released AND fleet upgraded.
-        Without this qurl-reverse-tunnel-client still ships md5-hashed PrivilegeKey
-        instead of populating Login.Metas[qurl_api_key]; the server
-        rejects every Login with `owner_missing`.
+      * qurl-reverse-tunnel-server image includes knock-token validation,
+        /auth-by-owner authorization, and active registration reporting.
+      * qurl-reverse-tunnel-client sends the AC-issued knock token in FRP
+        Login metadata.
+      * qurl-service tunnel auth is enabled and the active-registration
+        write endpoints are deployed. Do not flip qurl-service's active-read
+        flag until reporter health is verified.
 
     See `terraform/modules/qurl-reverse-tunnel-server/variables.tf::qurl_tunnel_auth_mode`
     for the env-shape this drives in user_data.
@@ -2012,7 +2016,7 @@ variable "qurl_reverse_tunnel_server_tunnel_auth_mode" {
 
   validation {
     condition     = var.qurl_reverse_tunnel_server_tunnel_auth_mode == "" || var.qurl_reverse_tunnel_server_tunnel_auth_mode == "tunnel-auth"
-    error_message = "qurl_reverse_tunnel_server_tunnel_auth_mode must be \"\" (legacy api mode) or \"tunnel-auth\". Other values are rejected at startup by qurl-reverse-tunnel-server; reject here to surface the typo at plan time."
+    error_message = "qurl_reverse_tunnel_server_tunnel_auth_mode must be \"\" (module-compat placeholder) or \"tunnel-auth\". Other values are rejected at startup by qurl-reverse-tunnel-server; reject here to surface the typo at plan time."
   }
 }
 

@@ -880,6 +880,13 @@ variable "tunnel_auth_enabled" {
   type        = bool
   default     = false
 }
+
+variable "tunnel_active_registrations_enabled" {
+  description = "Enable authoritative active tunnel target reads from qurl-reverse-tunnel-server registration rows. When false, qurl-service continues to emit only legacy per-AZ upstream_addr values even if registration writes are arriving. Flip after reporter and router active-target support are deployed and observed healthy."
+  type        = bool
+  default     = false
+}
+
 # ==================== QURL agent → nhp-server bootstrap chain (Wave 5) ====================
 
 variable "deploy_qurl_bootstrap_chain" {

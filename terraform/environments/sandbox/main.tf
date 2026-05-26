@@ -81,24 +81,25 @@ module "nhp" {
   server_plugins = var.server_plugins
 
   # QURL Service
-  deploy_qurl_service             = var.deploy_qurl_service
-  deploy_qurl_bootstrap_chain     = var.deploy_qurl_bootstrap_chain
-  enable_qurl_agent_bootstrap     = var.enable_qurl_agent_bootstrap
-  qurl_tunnel_auth_enabled        = var.qurl_tunnel_auth_enabled
-  qurl_service_domain             = var.qurl_service_domain
-  qurl_hosted_zone_id             = var.qurl_hosted_zone_id
-  qurl_jwt_secret_arn             = var.qurl_jwt_secret_arn
-  qurl_internal_service_token_arn = var.qurl_internal_service_token_arn
-  qurl_internal_service_domain    = var.qurl_internal_service_domain
-  qurl_additional_allowed_hosts   = var.qurl_additional_allowed_hosts
-  qurl_cors_allowed_origins       = var.qurl_cors_allowed_origins
-  qurl_audit_retention_days       = var.qurl_audit_retention_days
-  qurl_cookie_domain              = var.qurl_cookie_domain
-  qurl_link_domain                = var.qurl_link_domain
-  qurl_site_domain                = var.qurl_site_domain
-  qurl_site_hosted_zone_id        = var.qurl_site_hosted_zone_id
-  qurl_ip_rate_limit              = var.qurl_ip_rate_limit
-  qurl_ip_rate_burst              = var.qurl_ip_rate_burst
+  deploy_qurl_service                      = var.deploy_qurl_service
+  deploy_qurl_bootstrap_chain              = var.deploy_qurl_bootstrap_chain
+  enable_qurl_agent_bootstrap              = var.enable_qurl_agent_bootstrap
+  qurl_tunnel_auth_enabled                 = var.qurl_tunnel_auth_enabled
+  qurl_tunnel_active_registrations_enabled = var.qurl_tunnel_active_registrations_enabled
+  qurl_service_domain                      = var.qurl_service_domain
+  qurl_hosted_zone_id                      = var.qurl_hosted_zone_id
+  qurl_jwt_secret_arn                      = var.qurl_jwt_secret_arn
+  qurl_internal_service_token_arn          = var.qurl_internal_service_token_arn
+  qurl_internal_service_domain             = var.qurl_internal_service_domain
+  qurl_additional_allowed_hosts            = var.qurl_additional_allowed_hosts
+  qurl_cors_allowed_origins                = var.qurl_cors_allowed_origins
+  qurl_audit_retention_days                = var.qurl_audit_retention_days
+  qurl_cookie_domain                       = var.qurl_cookie_domain
+  qurl_link_domain                         = var.qurl_link_domain
+  qurl_site_domain                         = var.qurl_site_domain
+  qurl_site_hosted_zone_id                 = var.qurl_site_hosted_zone_id
+  qurl_ip_rate_limit                       = var.qurl_ip_rate_limit
+  qurl_ip_rate_burst                       = var.qurl_ip_rate_burst
 
   # QURL plugin configuration
   qurl_config                   = var.qurl_config
@@ -170,12 +171,11 @@ module "nhp" {
   qurl_reverse_tunnel_server_green_standby_capacity_per_az = var.qurl_reverse_tunnel_server_green_standby_capacity_per_az
   enable_qurl_reverse_tunnel_server_canary                 = var.enable_qurl_reverse_tunnel_server_canary
 
-  # Per-user API-key auth mode (qurl-reverse-tunnel-server #83 + qurl-reverse-tunnel-client #114).
-  # Sandbox flips to "tunnel-auth" via terraform.tfvars; prod stays on the
-  # parent's "" default until burn-in completes. This pass-through is the
-  # piece that was missing in #2131 — the var was declared at the root and
-  # set in sandbox tfvars, but the env wrapper didn't forward it, so TF
-  # silently kept FRPS on legacy api mode regardless of tfvars.
+  # Knock-token-as-identity auth mode for qurl-reverse-tunnel-server.
+  # Sandbox flips to "tunnel-auth" via terraform.tfvars. This pass-through is
+  # the piece that was missing in #2131: the var was declared at the root and
+  # set in sandbox tfvars, but the env wrapper didn't forward it, so Terraform
+  # silently kept FRPS on the root default regardless of tfvars.
   qurl_reverse_tunnel_server_tunnel_auth_mode = var.qurl_reverse_tunnel_server_tunnel_auth_mode
 
   # QURL Idempotency Cache

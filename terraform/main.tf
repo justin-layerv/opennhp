@@ -128,6 +128,38 @@ resource "terraform_data" "qurl_site_authz_preconditions" {
   }
 }
 
+# qurl-service's active-registration read gate makes `upstream_addrs`
+# authoritative for tunnel resources. A half flip is worse than a no-op:
+# without reporter writes it fails tunnels closed, and without router
+# discovery the per-instance private endpoints are rejected by the AC
+# allowlist. Keep the rollout contract encoded at plan time.
+resource "terraform_data" "qurl_tunnel_active_registration_preconditions" {
+  count = var.qurl_tunnel_active_registrations_enabled ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = var.qurl_tunnel_auth_enabled
+      error_message = "qurl_tunnel_active_registrations_enabled=true requires qurl_tunnel_auth_enabled=true so qurl-service mounts the tunnel auth and registration endpoints."
+    }
+    precondition {
+      condition     = var.deploy_frps
+      error_message = "qurl_tunnel_active_registrations_enabled=true requires deploy_frps=true so qurl-reverse-tunnel-server can publish active target rows."
+    }
+    precondition {
+      condition     = var.qurl_router_enabled
+      error_message = "qurl_tunnel_active_registrations_enabled=true requires qurl_router_enabled=true so qurl-router consumes upstream_addrs."
+    }
+    precondition {
+      condition     = var.enable_instance_hrw
+      error_message = "qurl_tunnel_active_registrations_enabled=true requires enable_instance_hrw=true because active registrations publish per-instance private endpoints validated through router discovery."
+    }
+    precondition {
+      condition     = var.qurl_reverse_tunnel_server_cloud_map_routing_policy == "MULTIVALUE"
+      error_message = "qurl_tunnel_active_registrations_enabled=true requires qurl_reverse_tunnel_server_cloud_map_routing_policy=\"MULTIVALUE\" so router discovery sees every active instance IP."
+    }
+  }
+}
+
 # `deploy_qurl_bootstrap_chain=true` injects the bootstrap-chain env
 # vars onto the qurl-service ECS task def. Without `deploy_qurl_service`
 # the task def doesn't exist, so the gate silently does nothing — the
@@ -1068,11 +1100,12 @@ module "ac" {
     api_timeout        = var.qurl_router_api_timeout
     proxy_timeout      = var.qurl_router_proxy_timeout
     cache_shards       = var.qurl_router_cache_shards
-    # Router-side HRW dispatch (traefik-plugins #134). Default false
-    # in PR 3; flipped to true in PR 4 prod tfvars after sandbox
-    # validation. The module-level qurl_router_config object's
-    # optional defaults (in modules/ac/variables.tf) backstop these
-    # for module-direct consumers that don't pass the new fields.
+    # Router-side HRW dispatch (traefik-plugins active-target routing).
+    # Sandbox enables this before qurl-service active reads because active
+    # registrations publish per-instance private endpoints that the AC must
+    # validate through discovery. The module-level qurl_router_config
+    # object's optional defaults (in modules/ac/variables.tf) backstop these
+    # for module-direct consumers that don't pass the fields.
     enable_instance_hrw            = var.enable_instance_hrw
     instance_discovery_ttl_seconds = var.instance_discovery_ttl_seconds
     enable_qurl_site_authz         = var.enable_qurl_site_authz
@@ -1431,6 +1464,14 @@ resource "terraform_data" "frps_preconditions" {
       error_message = "deploy_frps with connect_layerv_host=${var.connect_layerv_host} requires local.main_zone_id to resolve (via var.hosted_zone_id or the var.hosted_zone data lookup); both aws_route53_record.connect and aws_route53_record.connect_cross_account would otherwise collapse to count=0 and apply would ship without a public DNS record for the FRPS-behind-AC ingress. Set `hosted_zone_id` directly (cross-account path) or `hosted_zone` (in-account lookup) in tfvars."
     }
     precondition {
+      condition     = var.qurl_reverse_tunnel_server_tunnel_auth_mode != "tunnel-auth" || (var.deploy_qurl_link && var.qurl_link_frontend_domain != null)
+      error_message = "qurl_reverse_tunnel_server_tunnel_auth_mode=\"tunnel-auth\" requires deploy_qurl_link=true and qurl_link_frontend_domain set so qurl-reverse-tunnel-server has a TLS nhp-server validation origin (resolve-origin.<qurl_link_frontend_domain> when CloudFront is enabled, otherwise resolve.<qurl_link_frontend_domain>)."
+    }
+    precondition {
+      condition     = var.qurl_reverse_tunnel_server_tunnel_auth_mode == "tunnel-auth"
+      error_message = "deploy_frps=true requires qurl_reverse_tunnel_server_tunnel_auth_mode=\"tunnel-auth\". Current qurl-reverse-tunnel-server images no longer support the legacy unset mode."
+    }
+    precondition {
       # Reject the bootstrap placeholder at plan time when `deploy_frps` is
       # on. The placeholder exists so a Terraform-only operator can't
       # accidentally install a moving `latest`; once CI has overwritten the
@@ -1568,14 +1609,18 @@ module "qurl_reverse_tunnel_server" {
   # `qurl_service_domain != null && != ""` whenever `deploy_frps = true`,
   # and the qurl-reverse-tunnel-server module's `^https://[^[:space:]]+$` validation
   # backstops the structural shape on the URL itself.
-  qurl_api_internal_url     = var.deploy_qurl_service ? local.qurl_consumer_api_url : ""
-  qurl_api_token_secret_arn = var.deploy_qurl_service && var.qurl_internal_service_token_arn != null && var.qurl_internal_service_token_arn != "" ? var.qurl_internal_service_token_arn : ""
-  # Per-environment opt-in to qurl-reverse-tunnel-server tunnel-auth mode (per-user API-key
-  # auth via /internal/v1/tunnel/auth). Default "" keeps every existing
-  # env on legacy api mode unchanged. Sandbox flips first via
-  # `qurl_reverse_tunnel_server_tunnel_auth_mode = "tunnel-auth"` in
-  # terraform/environments/sandbox/terraform.tfvars once both
-  # consumer-side PRs land (qurl-reverse-tunnel-server #83 + #114).
+  qurl_api_internal_url          = var.deploy_qurl_service ? local.qurl_consumer_api_url : ""
+  qurl_api_token_secret_arn      = var.deploy_qurl_service && var.qurl_internal_service_token_arn != null && var.qurl_internal_service_token_arn != "" ? var.qurl_internal_service_token_arn : ""
+  secrets_kms_key_arn            = module.kms.secrets_key_arn
+  nhp_server_internal_url        = var.deploy_qurl_link && var.qurl_link_frontend_domain != null ? "https://${var.enable_resolve_cloudfront ? "resolve-origin" : "resolve"}.${var.qurl_link_frontend_domain}" : ""
+  nhp_internal_auth_secret_arn   = aws_secretsmanager_secret.nhp_internal_auth.arn
+  connect_layerv_host            = var.connect_layerv_host
+  tunnel_server_az_control_ports = local.tunnel_server_az_control_port
+  # Per-environment opt-in to qurl-reverse-tunnel-server tunnel-auth mode:
+  # knock-token validation, /internal/v1/tunnel/auth-by-owner, and active
+  # target registration. Default "" keeps environments that have not
+  # deployed FRPS unchanged; any environment with deploy_frps=true is
+  # plan-gated into "tunnel-auth".
   # See module variable doc for the full env-shape contract.
   qurl_tunnel_auth_mode = var.qurl_reverse_tunnel_server_tunnel_auth_mode
 
@@ -2273,7 +2318,8 @@ module "qurl_service" {
   adot_collector_image  = var.qurl_adot_collector_image
 
   # Tunnel auth feature gate (qurl-service PR #277; default false until #405/#396 land)
-  tunnel_auth_enabled = var.qurl_tunnel_auth_enabled
+  tunnel_auth_enabled                 = var.qurl_tunnel_auth_enabled
+  tunnel_active_registrations_enabled = var.qurl_tunnel_active_registrations_enabled
 
   # depends_on:
   #  - terraform_data.nhp_internal_auth_seed: ensure the HMAC secret is seeded

@@ -604,8 +604,8 @@ variable "qurl_reverse_tunnel_server_tunnel_auth_mode" {
     variable. Required because the sandbox env wrapper is a self-contained TF root
     that re-declares every variable it forwards to `module "nhp"`. Without this
     declaration, the matching tfvars line is silently ignored (terraform applies
-    the root module with the parent variable's "" default → FRPS stays in legacy
-    api mode regardless of what sandbox tfvars says). See
+    the root module with the parent variable's "" default, so FRPS never enters
+    tunnel-auth regardless of what sandbox tfvars says). See
     `terraform/variables.tf::qurl_reverse_tunnel_server_tunnel_auth_mode` for the
     full env-shape contract and `terraform/modules/qurl-reverse-tunnel-server/variables.tf::qurl_tunnel_auth_mode`
     for the per-mode user_data branches.
@@ -615,7 +615,7 @@ variable "qurl_reverse_tunnel_server_tunnel_auth_mode" {
 
   validation {
     condition     = var.qurl_reverse_tunnel_server_tunnel_auth_mode == "" || var.qurl_reverse_tunnel_server_tunnel_auth_mode == "tunnel-auth"
-    error_message = "qurl_reverse_tunnel_server_tunnel_auth_mode must be \"\" (legacy api mode) or \"tunnel-auth\"."
+    error_message = "qurl_reverse_tunnel_server_tunnel_auth_mode must be \"\" (module-compat placeholder) or \"tunnel-auth\"."
   }
 }
 
@@ -1951,6 +1951,12 @@ variable "bootstrap_alb_elb_5xx_threshold_per_minute" {
 
 variable "qurl_tunnel_auth_enabled" {
   description = "Enable qurl-service tunnel-auth endpoint and type=tunnel branches in CreateQurl/CreateResource (qurl-service PR #277 feature gate). Default false keeps the new code paths inert in production until the creation endpoint (qurl-service #405) and per-AZ FRPS assignment (qurl-service #396) are both deployed. Flip per-env via tfvars after the dependent qurl-service work ships and the qurl-service deploy is verified."
+  type        = bool
+  default     = false
+}
+
+variable "qurl_tunnel_active_registrations_enabled" {
+  description = "Enable qurl-service to publish authoritative active reverse-tunnel target sets (`upstream_addrs`) from qurl-reverse-tunnel-server registration heartbeats. Default false keeps the router on the legacy per-AZ `upstream_addr` path while reporter and AC discovery rollout are verified."
   type        = bool
   default     = false
 }

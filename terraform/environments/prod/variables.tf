@@ -545,6 +545,12 @@ variable "enable_qurl_site_authz" {
   default     = false
 }
 
+variable "qurl_tunnel_active_registrations_enabled" {
+  description = "Enable qurl-service to publish authoritative active reverse-tunnel target sets (`upstream_addrs`) from qurl-reverse-tunnel-server registration heartbeats. Default false keeps prod on the legacy per-AZ upstream_addr path until sandbox burn-in completes."
+  type        = bool
+  default     = false
+}
+
 # ==================== qurl-reverse-tunnel-server deploy + sizing (per-AZ + canary) ====================
 # PR 3 only declares the NEW per-AZ / blue/green / canary variables here.
 # The existing tfvars values for `deploy_frps` / `frps_*` are already
@@ -593,6 +599,24 @@ variable "enable_qurl_reverse_tunnel_server_canary" {
   description = "Enable canary deployment for qurl-reverse-tunnel-server via the canary-deployment module. Prod-targeted; mutually exclusive with enable_qurl_reverse_tunnel_server_blue_green."
   type        = bool
   default     = false
+}
+
+variable "qurl_reverse_tunnel_server_tunnel_auth_mode" {
+  description = <<-EOT
+    Env-root pass-through for the root module's `qurl_reverse_tunnel_server_tunnel_auth_mode`
+    variable. Prod keeps the default "" while deploy_frps is false, but declaring
+    and forwarding the value here means the future prod FRPS flip can opt into
+    "tunnel-auth" without discovering a silent env-wrapper gap at plan time.
+    See `terraform/variables.tf::qurl_reverse_tunnel_server_tunnel_auth_mode`
+    for the full rollout contract.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.qurl_reverse_tunnel_server_tunnel_auth_mode == "" || var.qurl_reverse_tunnel_server_tunnel_auth_mode == "tunnel-auth"
+    error_message = "qurl_reverse_tunnel_server_tunnel_auth_mode must be \"\" (module-compat placeholder) or \"tunnel-auth\"."
+  }
 }
 
 variable "qurl_idempotency_cache_ttl_seconds" {

@@ -273,6 +273,10 @@ locals {
     # creation endpoint (#405) and the per-AZ FRPS assignment (#396) deploy
     # together. Flipped to true per-env via tfvars once those land.
     { name = "TUNNEL_AUTH_ENABLED", value = var.tunnel_auth_enabled ? "true" : "false" },
+    # Active-registration read gate (qurl-service #732). Registration writes
+    # can dark-launch while this remains false; flipping true makes
+    # `upstream_addrs` authoritative for tunnel routing.
+    { name = "QURL_TUNNEL_ACTIVE_REGISTRATIONS_ENABLED", value = var.tunnel_active_registrations_enabled ? "true" : "false" },
     # Idempotency cache configuration
     { name = "IDEMPOTENCY_CACHE_TTL", value = tostring(var.idempotency_cache_ttl_seconds) },
     { name = "IDEMPOTENCY_CACHE_MAX_SIZE", value = tostring(var.idempotency_cache_max_size) },

@@ -256,6 +256,11 @@ qurl_internal_service_token_arn = "arn:aws:secretsmanager:us-east-2:767397897469
 # tunnels — without it, FRPS clients would 404 on Login/NewProxy.
 qurl_tunnel_auth_enabled = true
 
+# Active-registration reads stay dark-launched until the qurl-reverse-
+# tunnel-server reporter has deployed and is visibly publishing healthy
+# rows. Registration writes can land while this is false.
+qurl_tunnel_active_registrations_enabled = false
+
 # Custom domain management (enables GET/POST/DELETE /v1/domains endpoints)
 # ACME suffix and NLB target are derived from hosted_zone and AC module automatically
 qurl_custom_domain_enabled = true
@@ -437,7 +442,14 @@ frps_min_size         = 3
 frps_max_size         = 3
 frps_desired_capacity = 3
 
-# Opt sandbox into per-user API-key auth on qurl-reverse-tunnel-server.
+# Active registrations publish per-instance private FRP vhost origins
+# (http://<instance-private-ip>:8080). qurl-router accepts those only via
+# discovery, so sandbox turns on instance discovery before the qurl-service
+# active-read flag is flipped.
+qurl_reverse_tunnel_server_cloud_map_routing_policy = "MULTIVALUE"
+enable_instance_hrw                                 = true
+
+# Opt sandbox into knock-token-as-identity auth on qurl-reverse-tunnel-server.
 # See `terraform/variables.tf::qurl_reverse_tunnel_server_tunnel_auth_mode`
 # for the mode semantics, cross-repo prereqs, and per-mode env shape.
 qurl_reverse_tunnel_server_tunnel_auth_mode = "tunnel-auth"

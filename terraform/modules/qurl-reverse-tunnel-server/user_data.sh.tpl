@@ -356,10 +356,12 @@ chown -R frps:frps /opt/layerv/qurl-reverse-tunnel-server
 chmod 755 /opt/layerv/qurl-reverse-tunnel-server/nhp-frps
 
 # ============================================================================
-# Fetch QURL API token and create systemd service
-# The nhp-frps binary reads QURL_API_URL + QURL_API_TOKEN env vars to enable
-# its built-in auth plugin. Without these, tunnel auth is disabled and any
-# client can register proxies.
+# Fetch shared secrets and create systemd service.
+# In tunnel-auth mode the binary reads QURL_API_URL +
+# QURL_INTERNAL_SERVICE_TOKEN for qurl-service auth and
+# NHP_SERVER_INTERNAL_URL + NHP_INTERNAL_AUTH_SECRET for knock-token
+# validation. Missing values are fatal: modern multi-tenant images refuse to
+# start instead of falling back to an open tunnel server.
 #
 # SECURITY: the script runs under `set -ex`, and the top-level `exec` redirect
 # ships stderr (including xtrace) to user-data.log → CloudWatch Logs with
@@ -372,12 +374,11 @@ chmod 755 /opt/layerv/qurl-reverse-tunnel-server/nhp-frps
 QURL_API_TOKEN=""
 set +x
 %{ if qurl_api_token_secret_arn != "" ~}
-# Token ARN is configured: the FRP auth plugin REQUIRES this token to validate
-# tunnel client connections. A fetch failure (IAM glitch, secret rotation
-# without policy follow-up, role propagation lag) must be fatal — booting with
-# tunnel auth disabled would let any client register arbitrary proxies.
-# Fail-fast so the ASG cycles the instance and the no-healthy-instance alarm
-# pages on-call with the underlying error visible in user-data log.
+# Token ARN is configured: qurl-reverse-tunnel-server REQUIRES this token to
+# authenticate its internal calls to qurl-service. A fetch failure (IAM glitch,
+# secret rotation without policy follow-up, role propagation lag) must be
+# fatal so the ASG cycles the instance and the no-healthy-instance alarm pages
+# on-call with the underlying error visible in user-data log.
 echo "Fetching QURL API token from Secrets Manager..."
 QURL_API_TOKEN=$(aws secretsmanager get-secret-value \
   --secret-id "${qurl_api_token_secret_arn}" \
@@ -425,6 +426,95 @@ case "$QURL_API_TOKEN" in
 esac
 %{ endif ~}
 
+NHP_INTERNAL_AUTH_SECRET=""
+%{ if qurl_tunnel_auth_mode == "tunnel-auth" ~}
+echo "Fetching NHP internal auth secret from Secrets Manager..."
+NHP_INTERNAL_AUTH_SECRET=$(aws secretsmanager get-secret-value \
+  --secret-id "${nhp_internal_auth_secret_arn}" \
+  --query "SecretString" \
+  --output text \
+  --region "$REGION") || {
+  set -x
+  echo "FATAL: Could not fetch NHP internal auth secret from Secrets Manager. Refusing to start without knock-token validation."
+  exit 1
+}
+# Keep this hygiene in lockstep with QURL_API_TOKEN above. The NHP secret is
+# the HMAC key used to sign knock-token validation requests; accepting hidden
+# CR/LF, JSON blobs, or whitespace would make every validator call fail with
+# opaque HMAC mismatches at runtime.
+NHP_INTERNAL_AUTH_SECRET=$(printf '%s' "$NHP_INTERNAL_AUTH_SECRET" | tr -d '\r\n')
+if [ -z "$NHP_INTERNAL_AUTH_SECRET" ]; then
+  set -x
+  echo "FATAL: NHP internal auth secret is empty. Refusing to start without knock-token validation."
+  exit 1
+fi
+case "$NHP_INTERNAL_AUTH_SECRET" in
+  \{*|\[*)
+    set -x
+    echo "FATAL: NHP internal auth secret appears to be JSON. Must be a raw HMAC secret string."
+    exit 1
+    ;;
+esac
+case "$NHP_INTERNAL_AUTH_SECRET" in
+  *[[:space:]]*)
+    set -x
+    echo "FATAL: NHP internal auth secret contains internal whitespace. Expected a raw alphanumeric secret."
+    exit 1
+    ;;
+esac
+if [ "$${#NHP_INTERNAL_AUTH_SECRET}" -lt 32 ]; then
+  set -x
+  echo "FATAL: NHP internal auth secret is shorter than the 32-byte floor (got $${#NHP_INTERNAL_AUTH_SECRET})."
+  exit 1
+fi
+
+# Active-registration identity. The router must dial the exact FRP instance
+# that accepted the client tunnel, not a load-balanced boundary name, so the
+# published upstream endpoint is the instance's private vhost listener. The
+# boundary label is the public NHP-protected control ingress that led to this
+# AZ, useful for forensics and future placement policy but not a routing key.
+TUNNEL_IMDS_CURL=(curl -sf --max-time 5 --retry 3)
+TUNNEL_IMDS_TOKEN=$("$${TUNNEL_IMDS_CURL[@]}" -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600") || {
+  set -x
+  echo "FATAL: active-registration IMDSv2 token fetch failed."
+  exit 1
+}
+TUNNEL_INSTANCE_ID=$("$${TUNNEL_IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TUNNEL_IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id) || {
+  set -x
+  echo "FATAL: active-registration IMDS instance-id lookup failed."
+  exit 1
+}
+TUNNEL_LOCAL_IP=$("$${TUNNEL_IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TUNNEL_IMDS_TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4) || {
+  set -x
+  echo "FATAL: active-registration IMDS local-ipv4 lookup failed."
+  exit 1
+}
+TUNNEL_AZ=$("$${TUNNEL_IMDS_CURL[@]}" -H "X-aws-ec2-metadata-token: $TUNNEL_IMDS_TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone) || {
+  set -x
+  echo "FATAL: active-registration IMDS availability-zone lookup failed."
+  exit 1
+}
+TUNNEL_AZ_SUFFIX="$${TUNNEL_AZ: -1}"
+if ! [[ "$TUNNEL_AZ_SUFFIX" =~ ^[a-z]$ ]]; then
+  set -x
+  echo "FATAL: active-registration AZ suffix '$TUNNEL_AZ_SUFFIX' (from AZ '$TUNNEL_AZ') is not a single lowercase letter."
+  exit 1
+fi
+declare -A QURL_TUNNEL_PUBLIC_CONTROL_PORTS=(
+%{ for suffix, port in tunnel_server_az_control_ports ~}
+  ["${suffix}"]="${port}"
+%{ endfor ~}
+)
+QURL_TUNNEL_PUBLIC_CONTROL_PORT="$${QURL_TUNNEL_PUBLIC_CONTROL_PORTS[$TUNNEL_AZ_SUFFIX]:-}"
+if [ -z "$QURL_TUNNEL_PUBLIC_CONTROL_PORT" ]; then
+  set -x
+  echo "FATAL: no public control port configured for active-registration AZ suffix '$TUNNEL_AZ_SUFFIX'."
+  exit 1
+fi
+QURL_TUNNEL_INSTANCE_ENDPOINT_VALUE="http://$${TUNNEL_LOCAL_IP}:${frps_vhost_http_port}"
+QURL_TUNNEL_BOUNDARY_VALUE="${connect_layerv_host}:$${QURL_TUNNEL_PUBLIC_CONTROL_PORT}"
+%{ endif ~}
+
 # Write environment file for systemd (keeps secrets out of unit file).
 # Use `umask 077` in a subshell so the file is created mode 0600 from the
 # start — closes the brief root-readable window between `cat >` and `chmod`.
@@ -434,26 +524,18 @@ esac
 # shell the way an unquoted `cat <<EOF` heredoc would.
 #
 # Env shape depends on qurl_tunnel_auth_mode:
-#   ""             - legacy api mode: QURL_API_URL + QURL_API_TOKEN.
-#                    qurl-reverse-tunnel-server validates each NewProxy by calling
-#                    GET /resources/{id} on qurl-service.
-#   "tunnel-auth"  - per-user API-key mode (qurl-reverse-tunnel-server #83):
+#   ""             - module-compat legacy env shape: QURL_API_URL +
+#                    QURL_API_TOKEN. Current multi-tenant images are
+#                    plan-gated away from this branch by the root module.
+#   "tunnel-auth"  - knock-token-as-identity mode:
 #                    QURL_API_URL + QURL_INTERNAL_SERVICE_TOKEN +
-#                    QURL_TUNNEL_AUTH_MODE=tunnel-auth. qurl-reverse-tunnel-server reads
-#                    the user's lv_live_* key from FRP Login.Metas (set
-#                    by qurl-reverse-tunnel-client #114) and forwards
-#                    it to qurl-service POST /internal/v1/tunnel/auth.
-#                    The fetched token in $QURL_API_TOKEN is the static
-#                    internal-service shared secret — both modes use the
-#                    same Secrets Manager source, just under different
-#                    env-var names downstream. The rename is a labeling
-#                    convention: it signals which qurl-reverse-tunnel-server code path
-#                    consumes the secret (/resources/{id} vs
-#                    /internal/v1/tunnel/auth) so a future refactor that
-#                    splits these credentials into separately-rotatable
-#                    secrets can land without a Terraform re-roll. The
-#                    actual trust boundary is enforced server-side by
-#                    qurl-service's per-endpoint scoping, not by this name.
+#                    QURL_TUNNEL_AUTH_MODE=tunnel-auth +
+#                    NHP_SERVER_INTERNAL_URL + NHP_INTERNAL_AUTH_SECRET +
+#                    QURL_TUNNEL_INSTANCE_* active-registration metadata.
+#                    qurl-reverse-tunnel-server validates the AC-issued
+#                    knock token with nhp-server, authorizes NewProxy via
+#                    qurl-service POST /internal/v1/tunnel/auth-by-owner,
+#                    and publishes active target rows for qurl-router.
 (
   umask 077
   : > /opt/layerv/qurl-reverse-tunnel-server/etc/env
@@ -466,7 +548,7 @@ esac
   # Reaching this branch with $QURL_API_TOKEN unset/empty would write
   # QURL_INTERNAL_SERVICE_TOKEN= silently — qurl-reverse-tunnel-server would then boot
   # in tunnel-auth mode with no shared secret, surfacing as opaque
-  # 401s on /internal/v1/tunnel/auth at runtime. The token-fetch +
+  # 401s on /internal/v1/tunnel/auth-by-owner at runtime. The token-fetch +
   # JSON/whitespace/empty-string validation block above is gated on
   # qurl_api_token_secret_arn != "", so what keeps this branch from
   # ever running with an empty token is the ASG precondition in
@@ -475,12 +557,19 @@ esac
   # block above to fire in tunnel-auth mode regardless of ARN.
   printf 'QURL_TUNNEL_AUTH_MODE=tunnel-auth\n' >> /opt/layerv/qurl-reverse-tunnel-server/etc/env
   printf 'QURL_INTERNAL_SERVICE_TOKEN=%s\n' "$QURL_API_TOKEN" >> /opt/layerv/qurl-reverse-tunnel-server/etc/env
+  printf 'NHP_SERVER_INTERNAL_URL=%s\n' '${nhp_server_internal_url}' >> /opt/layerv/qurl-reverse-tunnel-server/etc/env
+  printf 'NHP_INTERNAL_AUTH_SECRET=%s\n' "$NHP_INTERNAL_AUTH_SECRET" >> /opt/layerv/qurl-reverse-tunnel-server/etc/env
+  printf 'QURL_TUNNEL_INSTANCE_ENDPOINT=%s\n' "$QURL_TUNNEL_INSTANCE_ENDPOINT_VALUE" >> /opt/layerv/qurl-reverse-tunnel-server/etc/env
+  printf 'QURL_TUNNEL_INSTANCE_ID=%s\n' "$TUNNEL_INSTANCE_ID" >> /opt/layerv/qurl-reverse-tunnel-server/etc/env
+  printf 'QURL_TUNNEL_INSTANCE_AZ=%s\n' "$TUNNEL_AZ" >> /opt/layerv/qurl-reverse-tunnel-server/etc/env
+  printf 'QURL_TUNNEL_BOUNDARY=%s\n' "$QURL_TUNNEL_BOUNDARY_VALUE" >> /opt/layerv/qurl-reverse-tunnel-server/etc/env
 %{ else ~}
   printf 'QURL_API_TOKEN=%s\n' "$QURL_API_TOKEN" >> /opt/layerv/qurl-reverse-tunnel-server/etc/env
 %{ endif ~}
 )
 # Re-enable xtrace now that the secret is no longer on any command line.
 set -x
+unset QURL_API_TOKEN NHP_INTERNAL_AUTH_SECRET
 chown frps:frps /opt/layerv/qurl-reverse-tunnel-server/etc/env
 
 cat > /etc/systemd/system/qurl-reverse-tunnel-server.service << 'SERVICEEOF'
