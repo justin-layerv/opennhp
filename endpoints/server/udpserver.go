@@ -331,6 +331,13 @@ type UdpServer struct {
 	// after Start.
 	resourceLookup *ResourceLookup
 
+	// ackTokenStore persists short-lived ACK token metadata in a
+	// fleet-visible backing store. Local tokenStore remains the fast
+	// path; /nhp/internal/token/validate falls back here on local miss
+	// so FRPS does not depend on hitting the same NHP server that
+	// processed the knock.
+	ackTokenStore ackTokenStore
+
 	// pluginLoadOnce serializes ensurePluginLoaded per aspId so
 	// LoadPlugin runs at most once per aspId per process. Without
 	// this gate two concurrent first-knocks for the same DDB-only
@@ -557,6 +564,10 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	// during storage init (when s.metrics is still nil) and emitted to
 	// MetricResourceLookupInitFailure after the publisher exists.
 	resourceLookupInitFailed := false
+	// ackTokenStoreInitFailed mirrors the lookup flags above for the
+	// fleet-visible ACK token store. It emits after metrics init so the
+	// failure is visible instead of being dropped by a nil publisher.
+	ackTokenStoreInitFailed := false
 	s.storageConfig, err = s.loadStorageConfig()
 	if err != nil {
 		log.Warning("Failed to load storage config, storage backend disabled: %v", err)
@@ -618,6 +629,20 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 			} else if resourceLookupInst != nil {
 				s.resourceLookup = resourceLookupInst
 				log.Info("Resource lookup initialized (DDB+LRU, cache_ttl=%s)", resourceLookupCacheTTL)
+			}
+
+			ackStore, ackStoreErr := NewACKTokenStoreFromStorage(s.storage)
+			if ackStoreErr != nil {
+				log.Error("Failed to initialize ACK token shared store: %v", ackStoreErr)
+				if s.storageConfig.DynamoDB.AckTokensTable != "" {
+					ackTokenStoreInitFailed = true
+					return fmt.Errorf("configured ACK token shared store failed to initialize: %w", ackStoreErr)
+				}
+			} else if ackStore != nil {
+				s.ackTokenStore = ackStore
+				log.Info("ACK token shared store initialized (DDB, table configured)")
+			} else if s.storageConfig.DynamoDB.AckTokensTable != "" {
+				return fmt.Errorf("configured ACK token shared store unavailable for storage backend %q", s.storageConfig.Backend)
 			}
 		}
 	}
@@ -688,6 +713,9 @@ func (s *UdpServer) Start(dirPath string, logLevel int) (err error) {
 	}
 	if s.resourceLookup != nil {
 		s.resourceLookup.SetMetrics(s.metrics)
+	}
+	if ackTokenStoreInitFailed {
+		s.metrics.IncrCounter(MetricACKTokenSharedStoreInitFailure)
 	}
 
 	// Initialize per-source-IP rate limiter for UDP knock packets.
@@ -3558,7 +3586,13 @@ func (s *UdpServer) handleNhpOpenResource(req *common.NhpAuthRequest, res *commo
 	// receiver nil-guard — same empty-contract as the HTTP/forward
 	// paths. Cache-eviction observability tracked in #2148.
 	ownerId := s.ResolveOwnerIDByPubKey(s.LifecycleCtx(), req.PublicKey)
-	s.PublishACKTokens(knkMsg, ackMsg, srcAddr.Ip, int(openTime), ownerId)
+	if publishErr := s.PublishACKTokens(s.LifecycleCtx(), knkMsg, ackMsg, srcAddr.Ip, int(openTime), ownerId); publishErr != nil {
+		log.Error("server-agent(%s@%s)[handleNhpOpenResource] failed to persist ACK token metadata: %v", knkMsg.UserId, addrStr, publishErr)
+		err = common.ErrServerTokenPersistFailed
+		ackMsg.ErrCode = common.ErrServerTokenPersistFailed.ErrorCode()
+		ackMsg.ErrMsg = err.Error()
+		return
+	}
 
 	// Increment once per knock request (not per resource) for alarm accuracy
 	if knockHadNoAC {

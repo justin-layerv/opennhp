@@ -454,7 +454,11 @@ func (f *ServerForwarder) HandleForwardRequest(
 			f.deps.LifecycleCtx(),
 			base64.StdEncoding.EncodeToString(knockPpd.RemotePubKey),
 		)
-		f.deps.PublishACKTokens(knkMsg, ackMsg, srcAddr.Ip, int(openTime), ownerId)
+		if publishErr := f.deps.PublishACKTokens(f.deps.LifecycleCtx(), knkMsg, ackMsg, srcAddr.Ip, int(openTime), ownerId); publishErr != nil {
+			log.Error("Failed to persist ACK token metadata for forwarded knock: %v", publishErr)
+			f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, common.ErrServerTokenPersistFailed.ErrorCode(), common.ErrServerTokenPersistFailed.Error())
+			return
+		}
 	}
 
 	// Serialize ACK message

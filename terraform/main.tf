@@ -569,9 +569,10 @@ module "compute" {
 
   # Pluggable storage backend - DynamoDB (cloud default) with etcd feature flag for on-prem
   # Note: attach_storage_policies is required because Terraform cannot evaluate count based on module outputs
-  attach_storage_policies  = true
-  dynamodb_read_policy_arn = module.dynamodb.read_policy_arn
-  keypair_policy_arn       = module.nhp_keypair.server_keypair_policy_arn
+  attach_storage_policies       = true
+  dynamodb_read_policy_arn      = module.dynamodb.read_policy_arn
+  dynamodb_read_policy_doc_hash = module.dynamodb.read_policy_doc_hash
+  keypair_policy_arn            = module.nhp_keypair.server_keypair_policy_arn
 
   # Storage backend configuration
   # - "dynamodb" (default): Uses AWS DynamoDB for cloud deployments
@@ -581,6 +582,7 @@ module "compute" {
   dynamodb_ac_assignments_table = module.dynamodb.ac_assignments_table_name
   dynamodb_resources_table      = module.dynamodb.resources_table_name
   dynamodb_agent_keys_table     = module.dynamodb.qurl_agent_keys_table_name
+  dynamodb_ack_tokens_table     = module.dynamodb.ack_tokens_table_name
 
   # Cloud Map configuration for server health discovery
   # Filters stale AC assignments pointing to terminated servers

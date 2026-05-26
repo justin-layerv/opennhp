@@ -130,6 +130,36 @@ const (
 	// post-sweep population because CleanExpired runs every
 	// TokenStoreRefreshInterval seconds on the same goroutine.
 	MetricTokenStoreSize = "TokenStoreSize"
+	// MetricACKTokenSharedStoreInitFailure fires when a configured
+	// fleet-visible ACK token store cannot initialize during server
+	// startup. This is a deployment/configuration signal, distinct
+	// from runtime DynamoDB read/write failures. Hard misconfigurations
+	// that abort Start before the metrics publisher exists surface as
+	// startup errors/logs rather than this counter.
+	MetricACKTokenSharedStoreInitFailure = "ACKTokenSharedStoreInitFailure"
+	// MetricACKTokenSharedStoreWriteFailure fires when nhp-server
+	// cannot persist ACK token metadata after AC operations complete.
+	// In configured multi-server mode this fails the knock so the
+	// agent is never given a token only this process can validate.
+	MetricACKTokenSharedStoreWriteFailure = "ACKTokenSharedStoreWriteFailure"
+	// MetricKnockPinholeOrphaned fires once per ACK publication failure
+	// after AC operations have succeeded. It pairs with
+	// MetricACKTokenSharedStoreWriteFailure, but is knock-scoped rather
+	// than write-attempt-scoped so operators can size the temporary
+	// AC-open/no-token window during shared-store outages.
+	MetricKnockPinholeOrphaned = "KnockPinholeOrphaned"
+	// MetricACKTokenSharedStoreReadFailure fires when
+	// /nhp/internal/token/validate cannot load from the shared store
+	// after a local tokenStore miss. The handler returns 503 so
+	// tunnel-server retries infrastructure failures instead of
+	// treating the token as invalid.
+	MetricACKTokenSharedStoreReadFailure = "ACKTokenSharedStoreReadFailure"
+	// MetricACKTokenSharedStoreHit fires when /nhp/internal/token/validate
+	// recovers a live, unexpired token from the shared store after a
+	// local tokenStore miss. A non-zero rate is expected in multi-server
+	// deployments where knocks and validator calls land on different
+	// instances.
+	MetricACKTokenSharedStoreHit = "ACKTokenSharedStoreHit"
 	// MetricInternalAuthFailPermit / MetricInternalAuthFailStrict count
 	// /nhp/internal/knock requests whose HMAC verification failed.
 	// Permit-mode failures still pass through (warn + allow); strict-

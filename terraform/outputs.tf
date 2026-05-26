@@ -112,6 +112,11 @@ output "dynamodb_resources_table_name" {
   value       = module.dynamodb.resources_table_name
 }
 
+output "dynamodb_ack_tokens_table_name" {
+  description = "DynamoDB table name for ACK token metadata"
+  value       = module.dynamodb.ack_tokens_table_name
+}
+
 # DynamoDB Tables - ARNs (for cross-stack references, monitoring, backups)
 output "dynamodb_licenses_table_arn" {
   description = "DynamoDB table ARN for licenses"
@@ -126,6 +131,11 @@ output "dynamodb_ac_assignments_table_arn" {
 output "dynamodb_resources_table_arn" {
   description = "DynamoDB table ARN for resources"
   value       = module.dynamodb.resources_table_arn
+}
+
+output "dynamodb_ack_tokens_table_arn" {
+  description = "DynamoDB table ARN for ACK token metadata"
+  value       = module.dynamodb.ack_tokens_table_arn
 }
 
 output "dynamodb_qurl_customers_table_name" {
@@ -147,6 +157,11 @@ output "dynamodb_qurl_domains_table_arn" {
 output "dynamodb_read_policy_arn" {
   description = "IAM policy ARN for DynamoDB read access (for NHP Server)"
   value       = module.dynamodb.read_policy_arn
+}
+
+output "dynamodb_read_policy_doc_hash" {
+  description = "sha256 of the DynamoDB read policy doc"
+  value       = module.dynamodb.read_policy_doc_hash
 }
 
 output "dynamodb_write_policy_arn" {

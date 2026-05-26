@@ -349,6 +349,9 @@ ResourcesTable = "${dynamodb_resources_table}"
 %{ if dynamodb_agent_keys_table != null ~}
 AgentKeysTable = "${dynamodb_agent_keys_table}"
 %{ endif ~}
+%{ if dynamodb_ack_tokens_table != null ~}
+AckTokensTable = "${dynamodb_ack_tokens_table}"
+%{ endif ~}
 %{ endif ~}
 
 %{ if storage_backend == "etcd" && etcd_endpoint != "" ~}

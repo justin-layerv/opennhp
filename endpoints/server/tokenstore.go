@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"fmt"
 	"maps"
 	"time"
 
@@ -224,10 +226,21 @@ func (s *UdpServer) VerifyAccessToken(token string) *ACTokenEntry {
 // A future change to either issuer's format that shortens the entropy
 // budget or introduces structure (e.g. an embedded customer ID prefix)
 // must keep the keyspace disjoint or this method silently overwrites.
-func (s *UdpServer) storeACToken(token string, entry *ACTokenEntry) {
+func (s *UdpServer) storeACToken(ctx context.Context, token string, entry *ACTokenEntry) error {
 	if token == "" {
-		return
+		return nil
 	}
+	if s.ackTokenStore != nil {
+		if err := s.ackTokenStore.StoreACToken(ctx, token, entry); err != nil {
+			s.metrics.IncrCounter(MetricACKTokenSharedStoreWriteFailure)
+			return fmt.Errorf("persist ACK token metadata: %w", err)
+		}
+	}
+	s.storeLocalACToken(token, entry)
+	return nil
+}
+
+func (s *UdpServer) storeLocalACToken(token string, entry *ACTokenEntry) {
 	s.tokenStore.Store(token, entry)
 	s.metrics.IncrCounter(MetricACTokenStored)
 }
@@ -259,11 +272,47 @@ func (s *UdpServer) storeACToken(token string, entry *ACTokenEntry) {
 // pubkey-bound lookup (e.g., agentPeerLookup.CachedOwnerID(pubKeyB64)
 // on the UDP knock path); pass "" when no pubkey-resolved identity is
 // available (e.g., the HTTP knock path, which authenticates differently).
-func (s *UdpServer) PublishACKTokens(knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int, ownerId string) {
+//
+// When the shared ACK-token store is configured, publication is fail-closed
+// for the whole ACK: every non-empty token must persist to the fleet-visible
+// store before any local tokenStore entry is installed. That all-or-nothing
+// order prevents a knock response from carrying a token that only validates
+// on the issuing process and fails when FRPS lands on a peer NHP instance.
+// Shared-store publication uses one aggregate DynamoDBOperationTimeout budget
+// across the ACK, not one full timeout per token, so a degraded table cannot
+// add N*timeout latency to a multi-resource knock before failing closed.
+func (s *UdpServer) PublishACKTokens(ctx context.Context, knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int, ownerId string) error {
+	type ackTokenPublication struct {
+		token string
+		entry *ACTokenEntry
+	}
+	publications := make([]ackTokenPublication, 0, len(ackMsg.ACTokens))
 	for name, token := range ackMsg.ACTokens {
 		if token == "" {
 			continue
 		}
-		s.storeACToken(token, NewACKTokenEntry(knkMsg, name, ackMsg.ACTokens, srcIp, openTime, ownerId))
+		publications = append(publications, ackTokenPublication{
+			token: token,
+			entry: NewACKTokenEntry(knkMsg, name, ackMsg.ACTokens, srcIp, openTime, ownerId),
+		})
 	}
+	if s.ackTokenStore != nil {
+		publishCtx, cancel := context.WithTimeout(ctx, DynamoDBOperationTimeout)
+		defer cancel()
+		for _, publication := range publications {
+			if err := s.ackTokenStore.StoreACToken(publishCtx, publication.token, publication.entry); err != nil {
+				s.metrics.IncrCounter(MetricACKTokenSharedStoreWriteFailure)
+				s.metrics.IncrCounter(MetricKnockPinholeOrphaned)
+				// Do not best-effort delete any prior rows from this ACK:
+				// the agent never receives these opaque tokens, entries are
+				// TTL-bounded, and cleanup writes during a DDB fault add a
+				// second failure mode to the fail-closed path.
+				return fmt.Errorf("persist ACK token metadata: %w", err)
+			}
+		}
+	}
+	for _, publication := range publications {
+		s.storeLocalACToken(publication.token, publication.entry)
+	}
+	return nil
 }

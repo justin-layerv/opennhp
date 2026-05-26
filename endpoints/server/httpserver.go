@@ -1344,7 +1344,12 @@ func (hs *HttpServer) handleHttpOpenResource(req *common.HttpKnockRequest, res *
 	// either fall back or reject per their own policy. Future: HTTP
 	// knock identity could flow from the qurl.link SPA's authenticated
 	// session into the knkMsg, then into this slot — tracked in #2149.
-	s.PublishACKTokens(knkMsg, ackMsg, srcIp, int(openTime), "")
+	if publishErr := s.PublishACKTokens(ctx, knkMsg, ackMsg, srcIp, int(openTime), ""); publishErr != nil {
+		log.Error("httpserver-agent(%s#%s@%s)[handleHttpOpenResource] failed to persist ACK token metadata: %v", knkMsg.UserId, knkMsg.DeviceId, srcIp, publishErr)
+		ackMsg.ErrCode = common.ErrServerTokenPersistFailed.ErrorCode()
+		ackMsg.ErrMsg = common.ErrServerTokenPersistFailed.Error()
+		return ackMsg, common.ErrServerTokenPersistFailed
+	}
 
 	// Increment once per knock request (not per resource) for alarm accuracy
 	if knockHadNoAC {

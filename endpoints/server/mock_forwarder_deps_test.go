@@ -204,13 +204,14 @@ func (m *MockForwarderDeps) GetStoredACToken(token string) *ACTokenEntry {
 // behavior: every non-empty ackMsg.ACTokens entry is recorded via
 // StoreACToken with the maps.Clone snapshot already taken in
 // NewACKTokenEntry.
-func (m *MockForwarderDeps) PublishACKTokens(knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int, ownerId string) {
+func (m *MockForwarderDeps) PublishACKTokens(_ context.Context, knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int, ownerId string) error {
 	for name, token := range ackMsg.ACTokens {
 		if token == "" {
 			continue
 		}
 		m.StoreACToken(token, NewACKTokenEntry(knkMsg, name, ackMsg.ACTokens, srcIp, openTime, ownerId))
 	}
+	return nil
 }
 
 // ResolveOwnerIDByPubKey returns the pubkey→ownerID mapping the test

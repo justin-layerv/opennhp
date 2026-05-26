@@ -347,19 +347,37 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 	// follow-up (see PR description) is the natural seam for any
 	// future tightening of the AC-only contract.
 	entry, found := hs.udpServer.tokenStore.Load(req.Token)
+	sharedStoreHit := false
 	if !found {
-		// Not in this server's tokenStore. In a multi-server fleet
-		// the issuing server may differ from the validating
-		// server; the caller (tunnel-server) is responsible for
-		// the routing decision. Echo the supplied run_id so the
-		// caller can correlate request/response without keeping
-		// per-call state.
-		ctx.JSON(http.StatusOK, internalTokenValidateResponse{
-			Valid: false,
-			RunID: req.AgentRunID,
-			Error: "not_found",
-		})
-		return
+		if hs.udpServer.ackTokenStore != nil {
+			var loadErr error
+			// Use the request context so tunnel-server cancellation
+			// also cancels the DDB read; shared-store hits are not
+			// cached locally, so detached lookups would only amplify
+			// load during validator retry storms.
+			entry, found, loadErr = hs.udpServer.ackTokenStore.LoadACToken(ctx.Request.Context(), req.Token)
+			if loadErr != nil {
+				hs.udpServer.metrics.IncrCounter(MetricACKTokenSharedStoreReadFailure)
+				log.Warning("internal token validate shared-store lookup failed: src=%s reqID=%s err=%v", srcIP, GetRequestID(ctx), loadErr)
+				ctx.JSON(http.StatusServiceUnavailable, gin.H{"error": "token store unavailable"})
+				return
+			}
+			if found {
+				sharedStoreHit = true
+			}
+		}
+		if !found {
+			// Not in this server's tokenStore and not in the
+			// fleet-visible fallback. Echo the supplied run_id so the
+			// caller can correlate request/response without keeping
+			// per-call state.
+			ctx.JSON(http.StatusOK, internalTokenValidateResponse{
+				Valid: false,
+				RunID: req.AgentRunID,
+				Error: "not_found",
+			})
+			return
+		}
 	}
 
 	// Entry is present in the store. The raw Load above does NOT
@@ -387,6 +405,14 @@ func (hs *HttpServer) handleInternalTokenValidate(ctx *gin.Context) {
 			Error: "expired",
 		})
 		return
+	}
+	if sharedStoreHit {
+		// Do not warm shared-store hits into tokenStore. Shared-store
+		// entries intentionally omit ACTokens, while locally minted
+		// entries keep that snapshot; caching here would make future
+		// VerifyAccessToken callers see shape differences based only on
+		// whether this validate request landed on the issuing process.
+		hs.udpServer.metrics.IncrCounter(MetricACKTokenSharedStoreHit)
 	}
 
 	// Happy path. Populate everything the tunnel-server's

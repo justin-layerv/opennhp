@@ -465,13 +465,35 @@ resource "aws_iam_role_policy_attachment" "server_ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# DynamoDB read access for per-AC assignment architecture (when storage_backend = "dynamodb")
+# DynamoDB storage access for per-AC assignment architecture (when storage_backend = "dynamodb").
+# Variable names retain the older "read" wording to avoid a broad Terraform
+# interface rename; the attached policy also carries bounded server writes.
 # Uses boolean variable because Terraform cannot evaluate count based on module outputs at plan time
 # See docs/design/PLUGGABLE_STORAGE_BACKEND.md
 resource "aws_iam_role_policy_attachment" "server_dynamodb" {
   count      = var.attach_storage_policies ? 1 : 0
   role       = aws_iam_role.server.name
   policy_arn = var.dynamodb_read_policy_arn
+}
+
+# Same-apply IAM policy edits can lag in AWS's authorization evaluator just
+# long enough for freshly cycled instances to hit AccessDenied on their first
+# DynamoDB calls. The 60s wait matches the observed upper edge of same-apply
+# IAM evaluator lag in sandbox applies (last re-verified 2026-05-26 by the
+# ACK token policy edit rollout). Re-verify with a sandbox apply that cycles
+# fresh instances before shortening. Key this wait on the server DynamoDB
+# policy content and the actual role-policy attachment, then make the launch
+# template wait for it.
+resource "time_sleep" "dynamodb_read_iam_propagation" {
+  count = var.attach_storage_policies ? 1 : 0
+
+  triggers = {
+    policy_doc_hash = var.dynamodb_read_policy_doc_hash
+    policy_arn      = var.dynamodb_read_policy_arn
+    attachment_id   = aws_iam_role_policy_attachment.server_dynamodb[0].id
+  }
+
+  create_duration = "60s"
 }
 
 # SSM keypair access for Noise K server-to-server forwarding
@@ -735,6 +757,7 @@ locals {
     dynamodb_ac_assignments_table = var.dynamodb_ac_assignments_table
     dynamodb_resources_table      = var.dynamodb_resources_table
     dynamodb_agent_keys_table     = var.dynamodb_agent_keys_table
+    dynamodb_ack_tokens_table     = var.dynamodb_ack_tokens_table
     # Cloud Map configuration for server health discovery
     cloudmap_enabled        = var.cloudmap_enabled
     cloudmap_namespace_name = var.cloudmap_namespace_name
@@ -1009,6 +1032,7 @@ resource "aws_launch_template" "server" {
   depends_on = [
     aws_lambda_invocation.keygen,
     aws_iam_role_policy_attachment.server_plugins,
+    time_sleep.dynamodb_read_iam_propagation,
     aws_s3_object.server_init_script,
   ]
 }

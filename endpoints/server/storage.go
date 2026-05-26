@@ -340,6 +340,11 @@ type DynamoDBConfig struct {
 	// disables the lookup (legacy etcd/file path stays in effect).
 	// PR-1b plan reference.
 	AgentKeysTable string `toml:"AgentKeysTable"`
+	// AckTokensTable holds short-lived AC-issued ACK token metadata.
+	// nhp-server writes an item when it publishes ackMsg.ACTokens and
+	// /nhp/internal/token/validate reads it on a local tokenStore miss
+	// so validation works across a multi-server fleet.
+	AckTokensTable string `toml:"AckTokensTable"`
 	Endpoint       string `toml:"Endpoint,omitempty"` // For local development
 }
 

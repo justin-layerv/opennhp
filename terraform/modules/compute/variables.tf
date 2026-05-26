@@ -307,6 +307,12 @@ variable "dynamodb_agent_keys_table" {
   default     = null
 }
 
+variable "dynamodb_ack_tokens_table" {
+  description = "DynamoDB table name for short-lived ACK token metadata used by /nhp/internal/token/validate."
+  type        = string
+  default     = null
+}
+
 variable "attach_storage_policies" {
   description = "Whether to attach storage backend policies (DynamoDB + keypair). Must be true when storage_backend is 'dynamodb'. This boolean is required because Terraform cannot evaluate count based on module outputs at plan time."
   type        = bool
@@ -314,7 +320,13 @@ variable "attach_storage_policies" {
 }
 
 variable "dynamodb_read_policy_arn" {
-  description = "IAM policy ARN for DynamoDB read access (from dynamodb module). Required when attach_storage_policies is true and storage_backend is 'dynamodb'."
+  description = "IAM policy ARN for NHP server DynamoDB storage access (from dynamodb module). Required when attach_storage_policies is true and storage_backend is 'dynamodb'."
+  type        = string
+  default     = null
+}
+
+variable "dynamodb_read_policy_doc_hash" {
+  description = "sha256 of the NHP server DynamoDB storage-access policy document. Used to re-fire the server IAM propagation wait when policy contents change."
   type        = string
   default     = null
 }

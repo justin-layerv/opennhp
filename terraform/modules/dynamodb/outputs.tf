@@ -22,6 +22,11 @@ output "server_ac_index_table_arn" {
   value       = aws_dynamodb_table.server_ac_index.arn
 }
 
+output "ack_tokens_table_arn" {
+  description = "ARN of the ACK token metadata DynamoDB table"
+  value       = aws_dynamodb_table.ack_tokens.arn
+}
+
 # ==================== Table Names ====================
 
 output "licenses_table_name" {
@@ -44,6 +49,11 @@ output "server_ac_index_table_name" {
   value       = aws_dynamodb_table.server_ac_index.name
 }
 
+output "ack_tokens_table_name" {
+  description = "Name of the ACK token metadata DynamoDB table"
+  value       = aws_dynamodb_table.ack_tokens.name
+}
+
 output "all_table_names" {
   description = "List of all DynamoDB table names (for monitoring)"
   value = [
@@ -51,6 +61,7 @@ output "all_table_names" {
     aws_dynamodb_table.ac_assignments.name,
     aws_dynamodb_table.server_ac_index.name,
     aws_dynamodb_table.resources.name,
+    aws_dynamodb_table.ack_tokens.name,
   ]
 }
 
@@ -59,6 +70,11 @@ output "all_table_names" {
 output "read_policy_arn" {
   description = "ARN of the IAM policy for DynamoDB read access (for NHP Server)"
   value       = aws_iam_policy.dynamodb_read.arn
+}
+
+output "read_policy_doc_hash" {
+  description = "sha256 of the DynamoDB read policy doc; trigger source for NHP server IAM-propagation shims."
+  value       = sha256(aws_iam_policy.dynamodb_read.policy)
 }
 
 output "write_policy_arn" {

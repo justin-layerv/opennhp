@@ -182,6 +182,12 @@ var (
 	// distinct error so the agent log doesn't blame revocation for
 	// what is actually a server-side dispatch-table bug.
 	ErrACPubkeyRevokedInternal = newError("52020", "AC pubkey revoke gate internal error (unknown verdict)")
+	// ErrServerTokenPersistFailed — emitted when AC operations have
+	// succeeded but the server cannot persist the AC-issued ACK token
+	// metadata needed for later cross-instance validation. Distinct from
+	// ErrServerACOpsFailed so agent logs and on-call triage do not blame
+	// the AC path for a server-side token-store dependency failure.
+	ErrServerTokenPersistFailed = newError("52021", "server token persistence failed")
 
 	// ac
 	ErrACOperationFailed       = newError("53001", "ac operation failed")

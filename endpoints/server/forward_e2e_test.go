@@ -786,7 +786,8 @@ func (d *e2eForwarderDeps) ProcessACOperationBroadcast(
 	return nil, nil
 }
 
-func (d *e2eForwarderDeps) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int, string) {
+func (d *e2eForwarderDeps) PublishACKTokens(context.Context, *common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int, string) error {
+	return nil
 }
 
 func (d *e2eForwarderDeps) ResolveOwnerIDByPubKey(context.Context, string) string { return "" }
@@ -1018,7 +1019,8 @@ func (d *capturingForwarderDeps) ProcessACOperationBroadcast(
 	return nil, nil
 }
 
-func (d *capturingForwarderDeps) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int, string) {
+func (d *capturingForwarderDeps) PublishACKTokens(context.Context, *common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int, string) error {
+	return nil
 }
 
 func (d *capturingForwarderDeps) ResolveOwnerIDByPubKey(context.Context, string) string {
@@ -1295,13 +1297,14 @@ func (d *mockACForwarderDeps) GetStoredACToken(token string) *ACTokenEntry {
 // PublishACKTokens mirrors UdpServer.PublishACKTokens for the e2e
 // forward fence: every non-empty ackMsg.ACTokens entry flows through
 // StoreACToken with the maps.Clone snapshot from NewACKTokenEntry.
-func (d *mockACForwarderDeps) PublishACKTokens(knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int, ownerId string) {
+func (d *mockACForwarderDeps) PublishACKTokens(_ context.Context, knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int, ownerId string) error {
 	for name, token := range ackMsg.ACTokens {
 		if token == "" {
 			continue
 		}
 		d.StoreACToken(token, NewACKTokenEntry(knkMsg, name, ackMsg.ACTokens, srcIp, openTime, ownerId))
 	}
+	return nil
 }
 
 func (d *mockACForwarderDeps) ResolveOwnerIDByPubKey(_ context.Context, pubKeyB64 string) string {
@@ -1708,7 +1711,8 @@ func (d *errorACForwarderDeps) ProcessACOperationBroadcast(
 	return nil, nil
 }
 
-func (d *errorACForwarderDeps) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int, string) {
+func (d *errorACForwarderDeps) PublishACKTokens(context.Context, *common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int, string) error {
+	return nil
 }
 
 func (d *errorACForwarderDeps) ResolveOwnerIDByPubKey(context.Context, string) string { return "" }
@@ -1905,7 +1909,8 @@ func (d *timeoutACForwarderDeps) ProcessACOperationBroadcast(
 	return nil, nil
 }
 
-func (d *timeoutACForwarderDeps) PublishACKTokens(*common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int, string) {
+func (d *timeoutACForwarderDeps) PublishACKTokens(context.Context, *common.AgentKnockMsg, *common.ServerKnockAckMsg, string, int, string) error {
+	return nil
 }
 
 func (d *timeoutACForwarderDeps) ResolveOwnerIDByPubKey(context.Context, string) string {

@@ -31,6 +31,24 @@ locals {
   # margin, so a clean deploy produces one bucket of startup events
   # rather than smearing across two.
   server_restart_period_seconds = 300
+
+  ack_token_shared_store_failure_alarms = {
+    init = {
+      metric_name = "ACKTokenSharedStoreInitFailure"
+      suffix      = "ack-token-shared-store-init-failure"
+      description = "NHP server failed to initialize the configured ACK token shared store; reverse-tunnel validation may regress to single-process scope."
+    }
+    write = {
+      metric_name = "ACKTokenSharedStoreWriteFailure"
+      suffix      = "ack-token-shared-store-write-failure"
+      description = "NHP completed AC operations but failed to persist ACK token metadata; knocks fail closed with ErrServerTokenPersistFailed."
+    }
+    read = {
+      metric_name = "ACKTokenSharedStoreReadFailure"
+      suffix      = "ack-token-shared-store-read-failure"
+      description = "NHP internal token validation missed the local cache and failed to read the ACK token shared store; FRPS validation returns infrastructure failure."
+    }
+  }
 }
 
 # SNS Topic for Alerts
@@ -666,6 +684,37 @@ resource "aws_cloudwatch_metric_alarm" "high_latency" {
   extended_statistic  = "p99"
   threshold           = 500
   alarm_description   = "NHP knock latency p99 exceeded 500ms"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+    Cell        = var.cell_id
+  }
+
+  tags = merge(var.tags, {
+    Component = "monitoring"
+    Cell      = var.cell_id
+  })
+}
+
+# ACK token shared-store failures. These counters are emitted by the
+# nhp-server CloudWatch publisher with the exact dimension set
+# {Environment, Cell}; keep the alarm dimensions in lockstep with
+# buildServerMetricDimensions() in endpoints/server/udpserver.go.
+resource "aws_cloudwatch_metric_alarm" "ack_token_shared_store_failure" {
+  for_each = local.ack_token_shared_store_failure_alarms
+
+  alarm_name          = "${var.name_prefix}-${var.cell_id}-${each.value.suffix}"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = each.value.metric_name
+  namespace           = "LayerV/NHP"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "${each.value.description} Runbook: docs/runbooks/nhp-ack-token-shared-store.md."
   alarm_actions       = [aws_sns_topic.alerts.arn]
   ok_actions          = [aws_sns_topic.alerts.arn]
   treat_missing_data  = "notBreaching"

@@ -313,12 +313,63 @@ resource "aws_dynamodb_table" "resources" {
   })
 }
 
-# ==================== IAM Policy for Read Access ====================
-# This policy is attached to NHP Server IAM roles
+# ==================== nhp_ack_tokens Table ====================
+# Stores short-lived ACK token validation metadata for the NHP server fleet.
+#
+# PK: token_hash (String) - SHA256 hash of the AC-issued ACK token
+# Attributes: resource_id, user identity fields, knock_src_ip, run_id,
+#             open_time, expires_at_nanos, ttl
+#
+# The raw token is never stored. /nhp/internal/token/validate first checks the
+# in-process tokenStore, then uses this table on a local miss so validation is
+# not pinned to the NHP instance that minted the ACK token.
+
+resource "aws_dynamodb_table" "ack_tokens" {
+  name         = "${var.name_prefix}-${var.cell_id}-ack-tokens"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "token_hash"
+
+  attribute {
+    name = "token_hash"
+    type = "S"
+  }
+
+  # Enable point-in-time recovery for production
+  point_in_time_recovery {
+    enabled = local.is_prod
+  }
+
+  # Server-side encryption with KMS
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  # ACK tokens are intentionally short-lived. The app still enforces
+  # ExpireTime at read time because DynamoDB TTL deletion is eventual.
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.cell_id}-ack-tokens"
+    Component = "nhp-server"
+    Cell      = var.cell_id
+    Purpose   = "ACK token validation metadata"
+  })
+}
+
+# ==================== IAM Policy for Server Storage Access ====================
+# This policy is attached to NHP Server IAM roles.
+#
+# The resource name stays `dynamodb_read` to avoid Terraform state churn from
+# renaming a long-lived policy. The policy now also includes bounded server
+# writes for AC assignments and ACK token metadata.
 
 resource "aws_iam_policy" "dynamodb_read" {
   name        = "${var.name_prefix}-dynamodb-read"
-  description = "Read access to NHP DynamoDB tables, plus write access to ac-assignments for server auto-assignment"
+  description = "Read access to NHP DynamoDB tables, plus bounded server writes for AC assignment and ACK token metadata"
 
   # Use concat to conditionally include KMS statement (empty resource arrays are invalid)
   policy = jsonencode({
@@ -361,12 +412,33 @@ resource "aws_iam_policy" "dynamodb_read" {
         Resource = [
           aws_dynamodb_table.ac_assignments.arn
         ]
+      },
+      {
+        Sid    = "DynamoDBAckTokenReadWrite"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem"
+        ]
+        Resource = [
+          aws_dynamodb_table.ack_tokens.arn
+        ]
       }
       ], var.kms_key_arn != null ? [{
-        Sid      = "KMSDecrypt"
+        # Encrypt/GenerateDataKey are required for nhp-server PutItem calls
+        # into KMS-encrypted DynamoDB tables (ack_tokens and ac_assignments).
+        # ViaService + CallerAccount keep the broadened verbs scoped to this
+        # account's DynamoDB service path, not arbitrary direct KMS use.
+        Sid      = "KMSReadAndServerWrite"
         Effect   = "Allow"
-        Action   = ["kms:Decrypt"]
+        Action   = ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"]
         Resource = [var.kms_key_arn]
+        Condition = {
+          StringEquals = {
+            "kms:CallerAccount" = data.aws_caller_identity.current.account_id
+            "kms:ViaService"    = "dynamodb.${data.aws_region.current.id}.amazonaws.com"
+          }
+        }
     }] : [])
   })
 

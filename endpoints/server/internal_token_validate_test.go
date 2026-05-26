@@ -2,7 +2,9 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/layervai/nhp/internalauth"
 )
@@ -139,6 +142,29 @@ func signValidate(t *testing.T, signer *internalauth.Signer, body string) string
 	return signer.Sign(http.MethodPost, "/nhp/internal/token/validate", []byte(body))
 }
 
+type fakeACKTokenStore struct {
+	entry     *ACTokenEntry
+	found     bool
+	err       error
+	loadCalls int
+}
+
+func (f *fakeACKTokenStore) StoreACToken(context.Context, string, *ACTokenEntry) error {
+	return nil
+}
+
+func (f *fakeACKTokenStore) LoadACToken(context.Context, string) (*ACTokenEntry, bool, error) {
+	f.loadCalls++
+	return f.entry, f.found, f.err
+}
+
+func storeTestACToken(t *testing.T, us *UdpServer, token string, entry *ACTokenEntry) {
+	t.Helper()
+	if err := us.storeACToken(context.Background(), token, entry); err != nil {
+		t.Fatalf("storeACToken(%q): %v", token, err)
+	}
+}
+
 // TestInternalTokenValidate_Happy locks the success contract: a
 // stored, unexpired entry returns valid=true with every metadata
 // field populated. Asserts the round-trip of KnockSrcIP, KnockUser,
@@ -169,7 +195,7 @@ func TestInternalTokenValidate_Happy(t *testing.T) {
 		OpenTime:   60,
 		ExpireTime: expire,
 	}
-	us.storeACToken("ac-token-happy", entry)
+	storeTestACToken(t, us, "ac-token-happy", entry)
 
 	body := `{"token":"ac-token-happy","agent_run_id":"run-from-caller"}`
 	rec := doValidateRequest(t, r, body, signValidate(t, signer, body))
@@ -246,7 +272,7 @@ func TestInternalTokenValidate_Happy(t *testing.T) {
 func TestInternalTokenValidate_HappyEchoesRunIDOnEmptyEntry(t *testing.T) {
 	r, signer, us := newTokenValidateRouter(t, true)
 
-	us.storeACToken("ac-token-no-runid", &ACTokenEntry{
+	storeTestACToken(t, us, "ac-token-no-runid", &ACTokenEntry{
 		User:       &common.AgentUser{UserId: "u"},
 		ResourceId: "r",
 		KnockSrcIP: "10.0.0.5",
@@ -291,7 +317,7 @@ func TestInternalTokenValidate_HappyEchoesRunIDOnEmptyEntry(t *testing.T) {
 func TestInternalTokenValidate_EmptyOwnerId(t *testing.T) {
 	r, signer, us := newTokenValidateRouter(t, true)
 
-	us.storeACToken("ac-token-no-owner", &ACTokenEntry{
+	storeTestACToken(t, us, "ac-token-no-owner", &ACTokenEntry{
 		User: &common.AgentUser{
 			UserId:  "u",
 			OwnerId: "", // explicit zero value: the HTTP/forward/legacy-non-cloud-mode shape
@@ -330,7 +356,7 @@ func TestInternalTokenValidate_EmptyOwnerId(t *testing.T) {
 func TestInternalTokenValidate_Expired(t *testing.T) {
 	r, signer, us := newTokenValidateRouter(t, true)
 
-	us.storeACToken("ac-token-expired", &ACTokenEntry{
+	storeTestACToken(t, us, "ac-token-expired", &ACTokenEntry{
 		User:       &common.AgentUser{UserId: "u"},
 		ResourceId: "r-expired",
 		KnockSrcIP: "10.0.0.10",
@@ -377,7 +403,7 @@ func TestInternalTokenValidate_Expired(t *testing.T) {
 // empty until PR-2c wires the registration thread).
 func TestInternalTokenValidate_ExpiredEchoesRunID(t *testing.T) {
 	r, signer, us := newTokenValidateRouter(t, true)
-	us.storeACToken("ac-token-expired-runid", &ACTokenEntry{
+	storeTestACToken(t, us, "ac-token-expired-runid", &ACTokenEntry{
 		User:       &common.AgentUser{UserId: "u"},
 		ResourceId: "r",
 		KnockSrcIP: "10.0.0.10",
@@ -410,7 +436,7 @@ func TestInternalTokenValidate_ExpiredEchoesRunID(t *testing.T) {
 // DisallowUnknownFields() would silently break that promise.
 func TestInternalTokenValidate_UnknownFieldsTolerated(t *testing.T) {
 	r, signer, us := newTokenValidateRouter(t, true)
-	us.storeACToken("ac-token-unknown-field", &ACTokenEntry{
+	storeTestACToken(t, us, "ac-token-unknown-field", &ACTokenEntry{
 		User:       &common.AgentUser{UserId: "u"},
 		ResourceId: "r",
 		KnockSrcIP: "10.0.0.7",
@@ -442,7 +468,7 @@ func TestInternalTokenValidate_UnknownFieldsTolerated(t *testing.T) {
 func TestInternalTokenValidate_ZeroExpireTime(t *testing.T) {
 	r, signer, us := newTokenValidateRouter(t, true)
 
-	us.storeACToken("ac-token-zero-expiry", &ACTokenEntry{
+	storeTestACToken(t, us, "ac-token-zero-expiry", &ACTokenEntry{
 		User:       &common.AgentUser{UserId: "u"},
 		ResourceId: "r-zero",
 		KnockSrcIP: "10.0.0.11",
@@ -511,6 +537,227 @@ func TestInternalTokenValidate_NotFoundEchoesRunID(t *testing.T) {
 	}
 }
 
+// TestInternalTokenValidate_SharedStoreHitOnLocalMiss fences the
+// multi-server FRPS/NHP deployment shape: the NHP instance validating
+// a tunnel login is not necessarily the NHP instance that minted the
+// ACK token. A local tokenStore miss must consult the fleet-visible
+// ACK-token store before returning not_found.
+// Shared-store hits deliberately do not warm the local tokenStore because
+// the persisted entry omits ACTokens; tokenStore entries remain locally
+// minted only so VerifyAccessToken callers see a stable entry shape.
+func TestInternalTokenValidate_SharedStoreHitOnLocalMiss(t *testing.T) {
+	r, signer, us := newTokenValidateRouter(t, true)
+	us.metrics = metrics.NewPublisherForTest(t)
+
+	expire := time.Now().Add(60 * time.Second).UTC()
+	entry := &ACTokenEntry{
+		User: &common.AgentUser{
+			UserId:         "user-shared",
+			DeviceId:       "device-shared",
+			OrganizationId: "org-shared",
+			AuthServiceId:  "asp-shared",
+			OwnerId:        "owner-shared",
+		},
+		ResourceId: "r-shared",
+		KnockSrcIP: "203.0.113.77",
+		RunID:      "run-shared",
+		OpenTime:   60,
+		ExpireTime: expire,
+	}
+	store := &fakeACKTokenStore{entry: entry, found: true}
+	us.ackTokenStore = store
+
+	body := `{"token":"ac-token-shared","agent_run_id":"caller-run"}`
+	rec := doValidateRequest(t, r, body, signValidate(t, signer, body))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("shared-store hit: code = %d, want 200. body=%s", rec.Code, rec.Body.String())
+	}
+	if store.loadCalls != 1 {
+		t.Fatalf("shared-store LoadACToken calls = %d, want 1", store.loadCalls)
+	}
+	var got internalTokenValidateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v. body=%s", err, rec.Body.String())
+	}
+	if !got.Valid {
+		t.Fatalf("Valid = false, want true for shared-store hit. body=%s", rec.Body.String())
+	}
+	if got.KnockUser != "user-shared" {
+		t.Errorf("KnockUser = %q, want %q", got.KnockUser, "user-shared")
+	}
+	if got.OwnerId != "owner-shared" {
+		t.Errorf("OwnerId = %q, want %q", got.OwnerId, "owner-shared")
+	}
+	if got.RunID != "run-shared" {
+		t.Errorf("RunID = %q, want %q (entry.RunID wins over caller)", got.RunID, "run-shared")
+	}
+	if got.KnockSrcIP != "203.0.113.77" {
+		t.Errorf("KnockSrcIP = %q, want %q", got.KnockSrcIP, "203.0.113.77")
+	}
+	if cached, found := us.tokenStore.Load("ac-token-shared"); found {
+		t.Fatalf("shared-store hit warmed local tokenStore with cached=%p; want no cache fill because shared entries omit ACTokens", cached)
+	}
+	counters, _ := us.metrics.CountersForTest(t)
+	if got := counters[MetricACKTokenSharedStoreHit]; got != 1 {
+		t.Fatalf("%s counter = %v, want 1", MetricACKTokenSharedStoreHit, got)
+	}
+	if got := counters[MetricACKTokenSharedStoreReadFailure]; got != 0 {
+		t.Fatalf("%s counter = %v, want 0", MetricACKTokenSharedStoreReadFailure, got)
+	}
+}
+
+func TestInternalTokenValidate_LocalHitDoesNotConsultSharedStore(t *testing.T) {
+	r, signer, us := newTokenValidateRouter(t, true)
+
+	entry := &ACTokenEntry{
+		User: &common.AgentUser{
+			UserId:  "user-local",
+			OwnerId: "owner-local",
+		},
+		ResourceId: "r-local",
+		KnockSrcIP: "203.0.113.78",
+		RunID:      "run-local",
+		OpenTime:   60,
+		ExpireTime: time.Now().Add(60 * time.Second).UTC(),
+	}
+	us.tokenStore.Store("ac-token-local", entry)
+	store := &fakeACKTokenStore{err: errors.New("shared store should not be called on local hit")}
+	us.ackTokenStore = store
+
+	body := `{"token":"ac-token-local","agent_run_id":"caller-run"}`
+	rec := doValidateRequest(t, r, body, signValidate(t, signer, body))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("local hit: code = %d, want 200. body=%s", rec.Code, rec.Body.String())
+	}
+	if store.loadCalls != 0 {
+		t.Fatalf("shared-store LoadACToken calls = %d, want 0 on local hit", store.loadCalls)
+	}
+	var got internalTokenValidateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v. body=%s", err, rec.Body.String())
+	}
+	if !got.Valid {
+		t.Fatalf("Valid = false, want true for local hit. body=%s", rec.Body.String())
+	}
+	if got.RunID != "run-local" {
+		t.Errorf("RunID = %q, want %q", got.RunID, "run-local")
+	}
+}
+
+func TestInternalTokenValidate_SharedStoreExpiredHitIsNotCached(t *testing.T) {
+	r, signer, us := newTokenValidateRouter(t, true)
+	us.metrics = metrics.NewPublisherForTest(t)
+
+	entry := &ACTokenEntry{
+		User:       &common.AgentUser{UserId: "user-expired"},
+		ResourceId: "r-expired",
+		KnockSrcIP: "203.0.113.79",
+		RunID:      "run-expired",
+		OpenTime:   60,
+		ExpireTime: time.Now().Add(-time.Second).UTC(),
+	}
+	store := &fakeACKTokenStore{entry: entry, found: true}
+	us.ackTokenStore = store
+
+	body := `{"token":"ac-token-expired-shared","agent_run_id":"caller-run"}`
+	rec := doValidateRequest(t, r, body, signValidate(t, signer, body))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("shared expired hit: code = %d, want 200. body=%s", rec.Code, rec.Body.String())
+	}
+	if store.loadCalls != 1 {
+		t.Fatalf("shared-store LoadACToken calls = %d, want 1", store.loadCalls)
+	}
+	var got internalTokenValidateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v. body=%s", err, rec.Body.String())
+	}
+	if got.Valid || got.Error != "expired" {
+		t.Fatalf("response = %+v, want invalid expired", got)
+	}
+	if _, found := us.tokenStore.Load("ac-token-expired-shared"); found {
+		t.Fatal("expired shared-store hit was cached in local tokenStore, want no cache fill")
+	}
+	counters, _ := us.metrics.CountersForTest(t)
+	if got := counters[MetricACKTokenSharedStoreHit]; got != 0 {
+		t.Fatalf("%s counter = %v, want 0 for expired shared-store entry", MetricACKTokenSharedStoreHit, got)
+	}
+	if got := counters[MetricACKTokenSharedStoreReadFailure]; got != 0 {
+		t.Fatalf("%s counter = %v, want 0 for clean expired response", MetricACKTokenSharedStoreReadFailure, got)
+	}
+}
+
+// TestInternalTokenValidate_SharedStoreMissFallsThroughToNotFound
+// preserves the existing not_found vocabulary after the shared-store
+// fallback is enabled. A real miss must remain a negative validation
+// result, not an infrastructural error.
+func TestInternalTokenValidate_SharedStoreMissFallsThroughToNotFound(t *testing.T) {
+	r, signer, us := newTokenValidateRouter(t, true)
+	store := &fakeACKTokenStore{found: false}
+	us.ackTokenStore = store
+
+	body := `{"token":"never-issued-anywhere","agent_run_id":"run-shared-miss"}`
+	rec := doValidateRequest(t, r, body, signValidate(t, signer, body))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("shared-store miss: code = %d, want 200. body=%s", rec.Code, rec.Body.String())
+	}
+	if store.loadCalls != 1 {
+		t.Fatalf("shared-store LoadACToken calls = %d, want 1", store.loadCalls)
+	}
+	var got internalTokenValidateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Valid {
+		t.Errorf("Valid = true, want false")
+	}
+	if got.Error != "not_found" {
+		t.Errorf("Error = %q, want %q", got.Error, "not_found")
+	}
+	if got.RunID != "run-shared-miss" {
+		t.Errorf("RunID = %q, want %q", got.RunID, "run-shared-miss")
+	}
+}
+
+// TestInternalTokenValidate_SharedStoreErrorReturnsUnavailable makes
+// the fail-closed posture explicit. If the fleet-visible store cannot
+// answer, returning not_found would incorrectly tell tunnel-server
+// the ACK token is bad. 503 lets the caller retry as infrastructure
+// flake instead.
+func TestInternalTokenValidate_SharedStoreErrorReturnsUnavailable(t *testing.T) {
+	r, signer, us := newTokenValidateRouter(t, true)
+	us.metrics = metrics.NewPublisherForTest(t)
+	store := &fakeACKTokenStore{err: errors.New("dynamodb unavailable")}
+	us.ackTokenStore = store
+
+	body := `{"token":"ac-token-store-error","agent_run_id":"run-error"}`
+	rec := doValidateRequest(t, r, body, signValidate(t, signer, body))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("shared-store error: code = %d, want 503. body=%s", rec.Code, rec.Body.String())
+	}
+	if store.loadCalls != 1 {
+		t.Fatalf("shared-store LoadACToken calls = %d, want 1", store.loadCalls)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got["error"] != "token store unavailable" {
+		t.Errorf("error = %q, want %q", got["error"], "token store unavailable")
+	}
+	counters, _ := us.metrics.CountersForTest(t)
+	if got := counters[MetricACKTokenSharedStoreReadFailure]; got != 1 {
+		t.Fatalf("%s counter = %v, want 1", MetricACKTokenSharedStoreReadFailure, got)
+	}
+	if got := counters[MetricACKTokenSharedStoreHit]; got != 0 {
+		t.Fatalf("%s counter = %v, want 0 on shared-store read failure", MetricACKTokenSharedStoreHit, got)
+	}
+}
+
 // TestInternalTokenValidate_HMACMismatch locks the strict-mode
 // auth contract: a request signed with the wrong secret returns
 // 401 before any tokenStore lookup. Mirrors
@@ -519,7 +766,7 @@ func TestInternalTokenValidate_HMACMismatch(t *testing.T) {
 	r, _, us := newTokenValidateRouter(t, true)
 	// A real entry — proves the 401 is triggered by the auth
 	// gate, not by a token-lookup miss.
-	us.storeACToken("ac-token-real", &ACTokenEntry{
+	storeTestACToken(t, us, "ac-token-real", &ACTokenEntry{
 		User:       &common.AgentUser{UserId: "u"},
 		ResourceId: "r",
 		KnockSrcIP: "10.0.0.20",
@@ -563,7 +810,7 @@ func TestInternalTokenValidate_Idempotent(t *testing.T) {
 	// truncated ExpireTime would mask a regression where the
 	// handler accidentally re-derived ExpireTime from time.Now()
 	// on each call (the bug this test fences).
-	us.storeACToken("ac-token-idem", &ACTokenEntry{
+	storeTestACToken(t, us, "ac-token-idem", &ACTokenEntry{
 		User:       &common.AgentUser{UserId: "user-idem"},
 		ResourceId: "r-idem",
 		KnockSrcIP: "10.0.0.30",
@@ -652,7 +899,7 @@ func TestInternalTokenValidate_AgentRunIDCap(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r, signer, us := newTokenValidateRouter(t, true)
-			us.storeACToken("ac-token-runid-cap", &ACTokenEntry{
+			storeTestACToken(t, us, "ac-token-runid-cap", &ACTokenEntry{
 				User:       &common.AgentUser{UserId: "u"},
 				ResourceId: "r",
 				KnockSrcIP: "10.0.0.77",
@@ -703,7 +950,7 @@ func TestInternalTokenValidate_AgentRunIDCap(t *testing.T) {
 // regression in one wouldn't be caught by tests for the other.
 func TestInternalTokenValidate_PermitMode_AllowsUnsigned(t *testing.T) {
 	r, _, us := newTokenValidateRouter(t, false)
-	us.storeACToken("ac-token-permit", &ACTokenEntry{
+	storeTestACToken(t, us, "ac-token-permit", &ACTokenEntry{
 		User:       &common.AgentUser{UserId: "u-permit"},
 		ResourceId: "r-permit",
 		KnockSrcIP: "10.0.0.50",
@@ -743,7 +990,7 @@ func TestInternalTokenValidate_PermitMode_AllowsUnsigned(t *testing.T) {
 // tests pinned on the other.
 func TestInternalTokenValidate_PermitMode_TamperedSignature(t *testing.T) {
 	r, _, us, counts := newTokenValidateRouterWithCounters(t, false)
-	us.storeACToken("ac-token-permit-bad-sig", &ACTokenEntry{
+	storeTestACToken(t, us, "ac-token-permit-bad-sig", &ACTokenEntry{
 		User:       &common.AgentUser{UserId: "u-permit-bad-sig"},
 		ResourceId: "r-permit-bad-sig",
 		KnockSrcIP: "10.0.0.51",
@@ -793,7 +1040,7 @@ func TestInternalTokenValidate_PermitMode_TamperedSignature(t *testing.T) {
 // be invisible to monitoring until rollout time.
 func TestInternalTokenValidate_CounterEmission_Success(t *testing.T) {
 	r, signer, us, counts := newTokenValidateRouterWithCounters(t, true)
-	us.storeACToken("ac-token-counter-ok", &ACTokenEntry{
+	storeTestACToken(t, us, "ac-token-counter-ok", &ACTokenEntry{
 		User:       &common.AgentUser{UserId: "u"},
 		ResourceId: "r",
 		KnockSrcIP: "10.0.0.99",
@@ -848,7 +1095,7 @@ func TestInternalTokenValidate_CounterEmission_StrictReject(t *testing.T) {
 // while a client is still unsigned, and the alarm would silently miss it.
 func TestInternalTokenValidate_CounterEmission_PermitUnsigned(t *testing.T) {
 	r, _, us, counts := newTokenValidateRouterWithCounters(t, false)
-	us.storeACToken("ac-token-counter-permit", &ACTokenEntry{
+	storeTestACToken(t, us, "ac-token-counter-permit", &ACTokenEntry{
 		User:       &common.AgentUser{UserId: "u"},
 		ResourceId: "r",
 		KnockSrcIP: "10.0.0.99",
@@ -1031,7 +1278,7 @@ func TestInternalTokenValidate_LegacyMode_NoCounterEmit(t *testing.T) {
 	}
 	r.POST("/nhp/internal/token/validate", hs.handleInternalTokenValidate)
 
-	us.storeACToken("ac-token-legacy", &ACTokenEntry{
+	storeTestACToken(t, us, "ac-token-legacy", &ACTokenEntry{
 		User:       &common.AgentUser{UserId: "u"},
 		ResourceId: "r",
 		KnockSrcIP: "10.0.0.42",
@@ -1097,7 +1344,7 @@ func TestInternalTokenValidate_StrictMode_EmptyBody(t *testing.T) {
 // internal_token_validate.go's `if entry.User != nil` guard.
 func TestInternalTokenValidate_HappyNoUserGuard(t *testing.T) {
 	r, signer, us := newTokenValidateRouter(t, true)
-	us.storeACToken("ac-token-no-user", &ACTokenEntry{
+	storeTestACToken(t, us, "ac-token-no-user", &ACTokenEntry{
 		// User intentionally nil — exercises the handler's defensive
 		// nil-check on entry.User before the .UserId deref.
 		ResourceId: "r-no-user",
@@ -1152,7 +1399,7 @@ func TestInternalTokenValidate_MethodNotAllowed(t *testing.T) {
 // "Post-store mutation is forbidden" comment in tokenstore.go.
 func TestInternalTokenValidate_ConcurrentValidates(t *testing.T) {
 	r, signer, us := newTokenValidateRouter(t, true)
-	us.storeACToken("ac-token-concurrent", &ACTokenEntry{
+	storeTestACToken(t, us, "ac-token-concurrent", &ACTokenEntry{
 		User:       &common.AgentUser{UserId: "u-concurrent"},
 		ResourceId: "r-concurrent",
 		KnockSrcIP: "10.0.0.55",

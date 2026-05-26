@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"strconv"
 	"sync"
 	"testing"
@@ -8,6 +9,20 @@ import (
 
 	"github.com/OpenNHP/opennhp/nhp/common"
 )
+
+func mustStoreACToken(t *testing.T, s *UdpServer, token string, entry *ACTokenEntry) {
+	t.Helper()
+	if err := s.storeACToken(context.Background(), token, entry); err != nil {
+		t.Fatalf("storeACToken(%q): %v", token, err)
+	}
+}
+
+func mustPublishACKTokens(t *testing.T, s *UdpServer, knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int, ownerId string) {
+	t.Helper()
+	if err := s.PublishACKTokens(context.Background(), knkMsg, ackMsg, srcIp, openTime, ownerId); err != nil {
+		t.Fatalf("PublishACKTokens: %v", err)
+	}
+}
 
 // TestGenerateAccessToken_Uniqueness asserts that 10_000 server tokens
 // issued for the same User + ResourceId are all unique and round-trip
@@ -77,7 +92,7 @@ func TestStoreACToken_RoundTrip(t *testing.T) {
 		ExpireTime: time.Now().Add(65 * time.Second),
 	}
 
-	s.storeACToken("ac-token-abc", entry)
+	mustStoreACToken(t, s, "ac-token-abc", entry)
 
 	got := s.VerifyAccessToken("ac-token-abc")
 	if got == nil {
@@ -112,7 +127,7 @@ func TestStoreACToken_RunIDDefaultEmpty(t *testing.T) {
 		ExpireTime: time.Now().Add(35 * time.Second),
 		// RunID intentionally left as zero value
 	}
-	s.storeACToken("tok-no-runid", entry)
+	mustStoreACToken(t, s, "tok-no-runid", entry)
 
 	got := s.VerifyAccessToken("tok-no-runid")
 	if got == nil {
@@ -153,7 +168,7 @@ func TestStoreACToken_ExpiresAfterOpenTimePlusBuffer(t *testing.T) {
 		OpenTime:   openTime,
 		ExpireTime: time.Now().Add(-time.Second), // already past
 	}
-	s.storeACToken("tok-expired", entry)
+	mustStoreACToken(t, s, "tok-expired", entry)
 
 	// Pre-sweep: VerifyAccessToken must return nil for the expired
 	// entry. This is the load-bearing property — PR-2b's
@@ -201,7 +216,7 @@ func TestVerifyAccessToken_ExpiryDoesNotEvict(t *testing.T) {
 		OpenTime:   30,
 		ExpireTime: time.Now().Add(-time.Second), // already past
 	}
-	s.storeACToken("tok-expired-load", entry)
+	mustStoreACToken(t, s, "tok-expired-load", entry)
 
 	// Point-in-time validity: nil.
 	if got := s.VerifyAccessToken("tok-expired-load"); got != nil {
@@ -511,7 +526,7 @@ func TestPublishACKTokens_PersistsAfterWait(t *testing.T) {
 		},
 	}
 
-	s.PublishACKTokens(knkMsg, ackMsg, "203.0.113.42", 60, "")
+	mustPublishACKTokens(t, s, knkMsg, ackMsg, "203.0.113.42", 60, "")
 
 	entryA := s.VerifyAccessToken("ac-token-a")
 	if entryA == nil {
@@ -605,7 +620,7 @@ func TestPublishACKTokens_PersistsEveryNonEmptyToken_AtFanInScale(t *testing.T) 
 	// All writers complete before publish runs — this is the production
 	// shape after Option A. PublishACKTokens iterates the map without
 	// holding mu because there are no concurrent writers.
-	s.PublishACKTokens(knkMsg, ackMsg, "198.51.100.1", 30, "")
+	mustPublishACKTokens(t, s, knkMsg, ackMsg, "198.51.100.1", 30, "")
 
 	for i := 0; i < resourceCount; i++ {
 		entry := s.VerifyAccessToken(acTok(i))

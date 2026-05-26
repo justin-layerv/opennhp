@@ -93,7 +93,7 @@ type ForwarderDeps interface {
 	// ownerId is the server-resolved tenant identity from the pubkey-
 	// bound agent registry lookup; pass "" on paths without pubkey-
 	// resolved identity. See `PublishACKTokens` godoc in tokenstore.go.
-	PublishACKTokens(knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int, ownerId string)
+	PublishACKTokens(ctx context.Context, knkMsg *common.AgentKnockMsg, ackMsg *common.ServerKnockAckMsg, srcIp string, openTime int, ownerId string) error
 
 	// ResolveOwnerIDByPubKey returns the server-resolved tenant
 	// identity for a base64-encoded agent public key, or "" if the
