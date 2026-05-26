@@ -225,7 +225,13 @@ variable "plugin_bucket_arn" {
 }
 
 variable "plugin_bucket_name" {
-  description = "Plugin bucket name threaded into user_data's `aws s3 cp` fallback command. Kept in lockstep with `plugin_bucket_arn` (same S3 bucket) so the IAM grant and the runtime command can never point at different buckets. Empty means user_data uses no fallback command (the ECR path is the only way in). Current posture: sandbox and prod both wire this from `module.plugins.bucket_name` (matching `plugin_bucket_arn`). Empty is only for isolated-module testing."
+  description = "Plugin bucket name used for the S3-hosted FRPS init script (`scripts/frps-init.sh`) and threaded into user_data's binary fallback command. Kept in lockstep with `plugin_bucket_arn` and `plugin_download_policy_arn` so the runtime `aws s3 cp` and IAM/KMS grants cannot drift. Current posture: sandbox and prod both wire this from `module.plugins.bucket_name`; empty is only for isolated-module validation and will fail the launch-template size precondition for real applies while the rendered init script exceeds EC2's user_data cap."
+  type        = string
+  default     = ""
+}
+
+variable "plugin_download_policy_arn" {
+  description = "ARN of the shared plugin-bucket download policy granting s3:GetObject plus KMS decrypt for the bucket CMK. Required with plugin_bucket_name because the launch-template user_data downloads scripts/frps-init.sh from the plugin bucket at boot."
   type        = string
   default     = ""
 }

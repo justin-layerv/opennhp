@@ -1721,14 +1721,17 @@ module "qurl_reverse_tunnel_server" {
   # Deployment configuration (frps has its own release cadence, separate from NHP server/AC)
   image_tag = var.frps_image_tag
 
-  # Plugin bucket for the S3 fallback binary download path in user_data.
+  # Plugin bucket for the S3-hosted FRPS init script and fallback binary
+  # download path in user_data.
   # Consistent with how the AC module is wired (see `plugin_bucket_arn` on
   # the ac module above); same bucket scoped to the qurl-reverse-tunnel-server subtree.
-  # Both arn and name are threaded: arn scopes the IAM grant, name is
-  # baked into user_data's `aws s3 cp` command via templatefile — keeping
-  # them in lockstep from a single source of truth.
-  plugin_bucket_arn  = module.plugins.bucket_arn
-  plugin_bucket_name = module.plugins.bucket_name
+  # Arn, name, and shared download policy are threaded from the same module:
+  # arn scopes the legacy binary fallback grant, name is baked into the
+  # runtime `aws s3 cp` commands, and the shared policy provides the plugin
+  # bucket KMS decrypt grant required by the S3 bootstrap script.
+  plugin_bucket_arn          = module.plugins.bucket_arn
+  plugin_bucket_name         = module.plugins.bucket_name
+  plugin_download_policy_arn = module.plugins.download_policy_arn
 
   # Monitoring
   enable_cloudwatch_alarms = true

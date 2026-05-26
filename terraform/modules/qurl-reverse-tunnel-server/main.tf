@@ -200,6 +200,90 @@ locals {
     # removes drift risk between the `aws s3 cp` call and its IAM grant.
     plugin_bucket_name = var.plugin_bucket_name
   })
+
+  # Launch template user_data. FRPS now follows the AC/compute pattern: the
+  # full rendered init script is uploaded to the plugin bucket and user_data is
+  # only a small fetcher. The inline branch remains only as a structural
+  # fallback for isolated module validation; with the current rendered script
+  # size it is not a viable runtime rollback. Current sandbox/prod roots always
+  # wire the bucket and download policy together.
+  frps_launch_template_user_data = var.plugin_bucket_name != "" ? base64encode(<<-BOOTSTRAP
+#!/bin/bash
+set -exo pipefail
+exec > >(tee /var/log/user-data.log | logger -t user-data) 2>&1
+
+# Init script hash — md5 of local.user_data, NOT the S3 object's etag.
+# The hash bumps the launch-template version whenever rendered init content changes.
+# Referencing the S3 object's etag here can trigger the AWS provider's
+# sensitive-attribute apply-time consistency bug on user_data updates. The md5
+# is client-computable at plan time and mirrors the AC/compute bootstrap pattern.
+# Init script hash: ${md5(local.user_data)}
+
+retry_with_backoff() {
+  local max_attempts=$1 delay=$2 max_delay=$3; shift 3
+  local attempt=1
+  while true; do
+    if "$@"; then return 0; fi
+    if [ "$attempt" -ge "$max_attempts" ]; then echo "ERROR: $* failed after $max_attempts attempts"; return 1; fi
+    echo "$* failed (attempt $attempt/$max_attempts), retrying in $${delay}s..."
+    sleep "$delay"; attempt=$((attempt + 1)); delay=$((delay * 2))
+    if [ "$delay" -gt "$max_delay" ]; then delay=$max_delay; fi
+  done
+}
+apt_get_with_retry() { retry_with_backoff 10 2 60 apt-get "$@"; }
+
+if ! command -v curl &>/dev/null || ! command -v unzip &>/dev/null; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt_get_with_retry update -y
+  apt_get_with_retry install -y curl unzip
+fi
+
+fetch_imds_token_and_region() {
+  local token region
+  for _ in 1 2 3 4 5; do
+    token=""; region=""
+    token=$(curl -fs -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60") || { sleep 2; continue; }
+    [ -n "$token" ] || { sleep 2; continue; }
+    region=$(curl -fs -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/placement/region) || { sleep 2; continue; }
+    [ -n "$region" ] || { sleep 2; continue; }
+    TOKEN=$token; REGION=$region; return 0
+  done
+  return 1
+}
+
+if ! fetch_imds_token_and_region; then
+  echo "FATAL: IMDSv2 unreachable after 5 attempts; refusing to boot FRPS blind"
+  command -v aws &>/dev/null && aws cloudwatch put-metric-data \
+    --namespace "LayerV/NHP" \
+    --metric-name "BootstrapFailure" \
+    --value 1 --unit Count \
+    --dimensions "Component=frps,Environment=${var.environment},FailureMode=imds-unreachable" \
+    --region "${local.region}" 2>/dev/null || true
+  exit 1
+fi
+
+report_failure() {
+  echo "BOOTSTRAP FAILED: $1"
+  command -v aws &>/dev/null && aws cloudwatch put-metric-data \
+    --namespace "LayerV/NHP" \
+    --metric-name "BootstrapFailure" \
+    --value 1 --unit Count \
+    --dimensions "Component=frps,Environment=${var.environment}" \
+    --region "$REGION" 2>/dev/null || true
+}
+trap 'report_failure "unexpected error on line $LINENO"' ERR
+
+if ! command -v aws &>/dev/null; then
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+  unzip -qo /tmp/awscliv2.zip -d /tmp && /tmp/aws/install --update
+  rm -rf /tmp/awscliv2.zip /tmp/aws
+fi
+
+retry_with_backoff 3 5 30 aws s3 cp "s3://${var.plugin_bucket_name}/scripts/frps-init.sh" /tmp/frps-init.sh --region "$REGION"
+chmod +x /tmp/frps-init.sh
+exec /tmp/frps-init.sh
+BOOTSTRAP
+  ) : base64gzip(local.user_data)
 }
 
 # ==================== CloudWatch Log Group ====================
@@ -446,6 +530,26 @@ resource "aws_iam_role_policy" "frps_s3_fallback" {
   })
 }
 
+# Attach the shared plugin-bucket download policy for the S3-hosted bootstrap
+# script. The inline frps_s3_fallback policy above intentionally remains scoped
+# to the legacy binary fallback prefixes; the shared policy carries the bucket
+# KMS decrypt grant required for scripts/frps-init.sh.
+resource "aws_iam_role_policy_attachment" "frps_plugins" {
+  count = var.plugin_download_policy_arn != "" ? 1 : 0
+
+  role       = aws_iam_role.frps.name
+  policy_arn = var.plugin_download_policy_arn
+}
+
+resource "aws_s3_object" "frps_init_script" {
+  count = var.plugin_bucket_name != "" ? 1 : 0
+
+  bucket       = var.plugin_bucket_name
+  key          = "scripts/frps-init.sh"
+  content      = local.user_data
+  content_type = "text/x-shellscript"
+}
+
 # ==================== Security Group ====================
 
 resource "aws_security_group" "frps" {
@@ -634,7 +738,7 @@ resource "aws_launch_template" "frps" {
     }
   }
 
-  user_data = base64gzip(local.user_data)
+  user_data = local.frps_launch_template_user_data
 
   monitoring {
     enabled = true
@@ -659,7 +763,22 @@ resource "aws_launch_template" "frps" {
 
   lifecycle {
     create_before_destroy = true
+
+    precondition {
+      condition     = length(base64decode(local.frps_launch_template_user_data)) <= 16384
+      error_message = "qurl-reverse-tunnel-server launch-template user_data exceeds EC2's 16384-byte cap. Keep the launch template on the S3 bootstrap pattern and move bulk logic into user_data.sh.tpl / scripts/frps-init.sh."
+    }
+
+    precondition {
+      condition     = (var.plugin_bucket_name == "") == (var.plugin_download_policy_arn == "")
+      error_message = "plugin_bucket_name and plugin_download_policy_arn must be set together — the S3 bootstrap fetch needs both s3:GetObject and the plugin bucket KMS decrypt grant."
+    }
   }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.frps_plugins,
+    aws_s3_object.frps_init_script,
+  ]
 }
 
 # ==================== Auto Scaling Group ====================
