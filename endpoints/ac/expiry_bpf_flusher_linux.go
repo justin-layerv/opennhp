@@ -101,6 +101,14 @@ func (f *BpfFlusher) SkippedCount() uint64 {
 // Flush implements FlowFlusher. Deletes the allow-rule entry for
 // the FlowKey from the appropriate BPF map.
 //
+// CONTRACT: Returns nil on success OR on missing-entry (idempotent
+// ENOENT no-op via isEbpfNoEntry in nhp/utils/ebpf — wraps both
+// ebpf.ErrKeyNotExist and syscall.ENOENT). msghandler.go's
+// schedule-then-write reorder for #2168 relies on this — a
+// scheduled flush against a never-written kernel entry (e.g., when
+// the EbpfRuleAdd subsequently failed) MUST NOT bump FlushErr or
+// trip the breaker.
+//
 // ctx-honoring: the cilium/ebpf
 // LoadPinnedMap/Delete path doesn't take a context, so we honor
 // the scheduler-supplied ctx only at entry. Per-call latency is

@@ -122,9 +122,14 @@ func readConntrackVersion(bin string) (string, error) {
 // Source port is intentionally unconstrained — the kernel deletes
 // every flow matching the partial tuple.
 //
-// Returns nil on success OR on no-matching-flows (idempotent).
-// Returns a wrapped error on any other failure; the scheduler
-// records this into the breaker.
+// CONTRACT: Returns nil on success OR on no-matching-flows
+// (idempotent ENOENT no-op). msghandler.go's schedule-then-write
+// reorder for #2168 relies on this — a scheduled flush against a
+// never-written kernel entry (e.g., when the ipset.Add subsequently
+// failed) MUST NOT bump FlushErr or trip the breaker. Logged at
+// Debug only; see isConntrackNoEntries for the "0 flow entries
+// have been deleted" detection. Returns a wrapped error on any
+// other failure; the scheduler records this into the breaker.
 func (f *ConntrackFlusher) Flush(ctx context.Context, key FlowKey) error {
 	// IPv4-only. The conntrack invocation below doesn't pass
 	// `-f ipv6`, so a non-IPv4-mapped key would produce a kernel-

@@ -1001,3 +1001,575 @@ func TestScheduler_SetBreakerParams_RejectsZero(t *testing.T) {
 		})
 	}
 }
+
+// ============================================================================
+// #2168 inFlight marker — Schedule serializes against in-flight Flush
+// ============================================================================
+
+// gatedFlusher gates each Flush() call on a per-key channel. Tests
+// can park Flush in mid-call and observe scheduler behavior while
+// the kernel allow-rule teardown is in progress.
+type gatedFlusher struct {
+	mu       sync.Mutex
+	gates    map[FlowKey]chan struct{}
+	released map[FlowKey]bool
+	entered  chan FlowKey
+}
+
+func newGatedFlusher() *gatedFlusher {
+	return &gatedFlusher{
+		gates:    make(map[FlowKey]chan struct{}),
+		released: make(map[FlowKey]bool),
+		entered:  make(chan FlowKey, 64),
+	}
+}
+
+func (g *gatedFlusher) gateFor(k FlowKey) chan struct{} {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	c, ok := g.gates[k]
+	if !ok {
+		c = make(chan struct{})
+		g.gates[k] = c
+	}
+	return c
+}
+
+func (g *gatedFlusher) Flush(_ context.Context, k FlowKey) error {
+	gate := g.gateFor(k)
+	select {
+	case g.entered <- k:
+	default:
+	}
+	<-gate
+	return nil
+}
+
+// release is idempotent — calling it twice on the same key (e.g.,
+// inline + via defer) is safe. Lets tests release inline for
+// determinism and also defer release for hygiene under t.Fatal.
+func (g *gatedFlusher) release(k FlowKey) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.released[k] {
+		return
+	}
+	c, ok := g.gates[k]
+	if !ok {
+		return
+	}
+	close(c)
+	g.released[k] = true
+}
+
+// TestScheduler_InFlightMarker_ScheduleBlocksUntilFlushReturns is the
+// regression fence for issue #2168: Schedule must wait for an
+// in-flight Flush to complete before proceeding, so a re-admission's
+// kernel allow-rule write doesn't race the teardown.
+func TestScheduler_InFlightMarker_ScheduleBlocksUntilFlushReturns(t *testing.T) {
+	g := newGatedFlusher()
+	s := NewScheduler(g,
+		WithTickInterval(2*time.Millisecond),
+		WithWheelSize(100),
+		WithWorkerCount(2),
+		WithFlushCallTimeout(2*time.Second),
+	)
+	s.Start()
+	defer shutdownOrFail(t, s)
+
+	k := mustKey(t, "10.0.0.1", "10.0.0.2", 443, FlowProtoTCP)
+
+	s.Schedule(k, time.Now().Add(5*time.Millisecond))
+
+	select {
+	case got := <-g.entered:
+		if got != k {
+			t.Fatalf("flusher entered with wrong key: got %s want %s", got, k)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("flusher never entered Flush within 2s")
+	}
+
+	// Concurrent Schedule for the SAME key — must block on the
+	// in-flight Flush's inFlight chan.
+	done := make(chan struct{})
+	go func() {
+		s.Schedule(k, time.Now().Add(time.Hour))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("Schedule returned before in-flight Flush completed — inFlight serialization broken")
+	case <-time.After(50 * time.Millisecond):
+		// Expected: Schedule is blocked on inFlight.
+	}
+
+	g.release(k)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Schedule did not return after Flush released within 2s")
+	}
+
+	if s.Metrics().ScheduleWaitTimeout != 0 {
+		t.Errorf("ScheduleWaitTimeout should be 0 on clean release; got %d", s.Metrics().ScheduleWaitTimeout)
+	}
+
+	// Verify the new entry is present in the shard index with the
+	// new (long) deadline — i.e., Schedule did insert after waiting.
+	shard := s.shards[k.shard()]
+	shard.mu.Lock()
+	got, ok := shard.entries[k]
+	shard.mu.Unlock()
+	if !ok || got == nil {
+		t.Fatal("post-wait Schedule did not insert new entry")
+	}
+}
+
+// TestScheduler_InFlightMarker_DifferentKeysDoNotBlock ensures the
+// inFlight wait is per-key — a Schedule for an unrelated FlowKey
+// while another key is mid-Flush must NOT block.
+func TestScheduler_InFlightMarker_DifferentKeysDoNotBlock(t *testing.T) {
+	g := newGatedFlusher()
+	s := NewScheduler(g,
+		WithTickInterval(2*time.Millisecond),
+		WithWheelSize(100),
+		WithWorkerCount(2),
+		WithFlushCallTimeout(2*time.Second),
+	)
+	s.Start()
+	defer shutdownOrFail(t, s)
+
+	kBlocked := mustKey(t, "10.0.0.1", "10.0.0.2", 443, FlowProtoTCP)
+	kOther := mustKey(t, "10.0.0.3", "10.0.0.4", 8080, FlowProtoTCP)
+
+	s.Schedule(kBlocked, time.Now().Add(5*time.Millisecond))
+	select {
+	case <-g.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("flusher never entered Flush for kBlocked")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.Schedule(kOther, time.Now().Add(time.Hour))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Expected: kOther's Schedule returns immediately.
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Schedule for unrelated key blocked unexpectedly")
+	}
+
+	g.release(kBlocked)
+}
+
+// TestScheduler_InFlightMarker_CancelDuringFlushIsNoOp fences the
+// Cancel contract documented on Cancel: while inFlight is open, the
+// in-flight Flush already IS the cancellation; Cancel must not
+// touch the index (processEntry's cleanup defer owns removal).
+func TestScheduler_InFlightMarker_CancelDuringFlushIsNoOp(t *testing.T) {
+	g := newGatedFlusher()
+	s := NewScheduler(g,
+		WithTickInterval(2*time.Millisecond),
+		WithWheelSize(100),
+		WithWorkerCount(1),
+		WithFlushCallTimeout(2*time.Second),
+	)
+	s.Start()
+	defer shutdownOrFail(t, s)
+
+	k := mustKey(t, "10.0.0.1", "10.0.0.2", 443, FlowProtoTCP)
+	s.Schedule(k, time.Now().Add(5*time.Millisecond))
+	select {
+	case <-g.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("flusher never entered Flush")
+	}
+
+	// Verify entry is still in the index (kept across Flush).
+	shard := s.shards[k.shard()]
+	shard.mu.Lock()
+	_, beforeCancel := shard.entries[k]
+	shard.mu.Unlock()
+	if !beforeCancel {
+		t.Fatal("entry should still be in index while inFlight is open")
+	}
+
+	// Cancel during in-flight — must be no-op.
+	preEntries := s.metricEntries.Load()
+	s.Cancel(k)
+	if got := s.metricEntries.Load(); got != preEntries {
+		t.Errorf("Cancel during in-flight changed metricEntries: before=%d after=%d", preEntries, got)
+	}
+
+	shard.mu.Lock()
+	_, afterCancel := shard.entries[k]
+	shard.mu.Unlock()
+	if !afterCancel {
+		t.Error("Cancel during in-flight removed index entry; processEntry's cleanup defer owns removal")
+	}
+
+	g.release(k)
+
+	// After Flush completes, the cleanup defer removes the entry.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		shard.mu.Lock()
+		_, present := shard.entries[k]
+		shard.mu.Unlock()
+		if !present {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("entry still in index 2s after Flush released")
+}
+
+// TestScheduler_InFlightMarker_WaitTimeoutBumpsMetric exercises the
+// failure mode where the in-flight Flush exceeds its own per-call
+// ctx and Schedule's wait times out. Schedule proceeds anyway; the
+// metric counter bumps so dashboards can catch a chronically stuck
+// flusher.
+func TestScheduler_InFlightMarker_WaitTimeoutBumpsMetric(t *testing.T) {
+	g := newGatedFlusher()
+	// Very tight flushCallTimeout so the wait-budget is small and
+	// the test isn't slow.
+	s := NewScheduler(g,
+		WithTickInterval(2*time.Millisecond),
+		WithWheelSize(100),
+		WithWorkerCount(1),
+		WithFlushCallTimeout(50*time.Millisecond),
+	)
+	s.Start()
+	// LIFO: g.release(k) runs FIRST so the stuck worker unblocks
+	// before shutdownOrFail tries to drain workerWg. Pattern matches
+	// the other InFlightMarker tests — needed for hygiene under
+	// t.Fatal mid-test (cr round 1 polish).
+	k := mustKey(t, "10.0.0.1", "10.0.0.2", 443, FlowProtoTCP)
+	defer shutdownOrFail(t, s)
+	defer g.release(k)
+
+	s.Schedule(k, time.Now().Add(5*time.Millisecond))
+	select {
+	case <-g.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("flusher never entered Flush")
+	}
+
+	// Don't release the gate. Schedule should wait
+	// flushCallTimeout + scheduleWaitSlop, bump the metric, then
+	// force-insert (skip longest-wins) so the caller's new kernel
+	// rule still gets a flush hook. Use a SHORTER deadline than
+	// the in-flight entry so the longest-wins path would otherwise
+	// early-return — this fences the wait-timeout force-insert
+	// branch advisor flagged on 2026-05-26.
+	pre := s.Metrics().ScheduleWaitTimeout
+	s.Schedule(k, time.Now().Add(time.Second))
+	post := s.Metrics().ScheduleWaitTimeout
+	if post != pre+1 {
+		t.Errorf("ScheduleWaitTimeout: got %d want %d (pre=%d)", post, pre+1, pre)
+	}
+
+	// Verify the post-timeout Schedule force-inserted a new entry
+	// instead of bailing on longest-wins (the in-flight entry's
+	// deadline was way longer at 5ms-from-then time.Now()-ish, but
+	// its kernel rule is in an indeterminate post-timeout state).
+	shard := s.shards[k.shard()]
+	shard.mu.Lock()
+	got, ok := shard.entries[k]
+	shard.mu.Unlock()
+	if !ok || got == nil {
+		t.Fatal("post-timeout Schedule failed to force-insert; new kernel rule would have no flush hook")
+	}
+
+	// metricEntries invariant fence (cr round 4 item 2): across the
+	// wait-timeout overlap window, Schedule's `+1` skip pairs with
+	// the stuck in-flight's cleanup-defer `cur != entry` skip → net
+	// `+0`. The gauge MUST stay at 1 (the new entry) and never spike
+	// to 2 even as the stuck Flush eventually returns and runs its
+	// cleanup defer. Release the gate, poll until the cleanup runs,
+	// and assert EntryCount never observed a value > 1 along the way.
+	if got := s.EntryCount(); got != 1 {
+		t.Errorf("EntryCount after force-insert: got %d want 1 (overlap should net to +0)", got)
+	}
+	maxObserved := s.EntryCount()
+	g.release(k)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		cur := s.EntryCount()
+		if cur > maxObserved {
+			maxObserved = cur
+		}
+		// Cleanup defer has run when metricFlushTotal increments
+		// (the canceled flush path doesn't bump it; this stuck
+		// path returns nil so it does).
+		if s.Metrics().FlushTotal >= 1 || s.Metrics().FlushErr >= 1 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if maxObserved > 1 {
+		t.Errorf("EntryCount briefly exceeded 1 during overlap: peaked at %d (invariant: must stay at 1)", maxObserved)
+	}
+}
+
+// TestScheduler_InFlightMarker_WaitTimeoutBypassesLongestWins is the
+// targeted fence for advisor concern #2 (2026-05-26): on wait-timeout,
+// the longest-wins early-return MUST be bypassed so a caller that
+// passed a deadline ≤ the in-flight entry's stored deadline still
+// gets a schedule. Without the bypass the new kernel rule would be
+// orphaned of any flush hook once cleanup eventually removes the
+// in-flight entry.
+func TestScheduler_InFlightMarker_WaitTimeoutBypassesLongestWins(t *testing.T) {
+	g := newGatedFlusher()
+	s := NewScheduler(g,
+		WithTickInterval(2*time.Millisecond),
+		WithWheelSize(100),
+		WithWorkerCount(1),
+		WithFlushCallTimeout(20*time.Millisecond),
+	)
+	s.Start()
+	k := mustKey(t, "10.0.0.1", "10.0.0.2", 443, FlowProtoTCP)
+	// LIFO: gate release before shutdown so worker drains cleanly.
+	defer shutdownOrFail(t, s)
+	defer g.release(k)
+
+	s.Schedule(k, time.Now().Add(5*time.Millisecond))
+	select {
+	case <-g.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("flusher never entered Flush")
+	}
+
+	// Use a deadline in the far past so monoNsAt clamps to 0 —
+	// existing.deadlineNs is positive (set at original schedule)
+	// so the longest-wins comparison `existing.deadlineNs >= 0`
+	// would early-return without the timedOutOnInFlight bypass.
+	s.Schedule(k, time.Now().Add(-time.Hour))
+
+	if got := s.Metrics().ScheduleWaitTimeout; got != 1 {
+		t.Errorf("ScheduleWaitTimeout: got %d want 1", got)
+	}
+
+	shard := s.shards[k.shard()]
+	shard.mu.Lock()
+	got, ok := shard.entries[k]
+	shard.mu.Unlock()
+	if !ok || got == nil {
+		t.Fatal("longest-wins bypass failed: post-timeout Schedule with past deadline left no entry")
+	}
+}
+
+// TestScheduler_InFlightMarker_MultipleWaitersBlockOnInFlight fences
+// the multi-waiter case adjacent to cr round 3 item 1: multiple
+// concurrent Schedule callers for the same in-flight key must ALL
+// block until the gate releases. This catches a regression where
+// any one waiter could bypass the wait under any single-shot or
+// missing-loop semantics.
+//
+// Deterministically reproducing the exact "wake + re-iterate against
+// a freshly-spawned inFlight" interleaving requires a fault-injection
+// hook between Schedule's wait-release and shard.mu re-acquisition,
+// which the current test infra doesn't expose. Filed as #2189 item.
+// The loop's correctness is verified by code inspection; this test
+// fences the closest behavior we can assert end-to-end.
+func TestScheduler_InFlightMarker_MultipleWaitersBlockOnInFlight(t *testing.T) {
+	g := newGatedFlusher()
+	s := NewScheduler(g,
+		WithTickInterval(2*time.Millisecond),
+		WithWheelSize(100),
+		WithWorkerCount(1),
+		WithFlushCallTimeout(2*time.Second),
+	)
+	s.Start()
+	k := mustKey(t, "10.0.0.1", "10.0.0.2", 443, FlowProtoTCP)
+	defer shutdownOrFail(t, s)
+	defer g.release(k)
+
+	s.Schedule(k, time.Now().Add(5*time.Millisecond))
+	select {
+	case <-g.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("flusher never entered Flush")
+	}
+
+	// Fire two concurrent Schedules for the same key while Flush is
+	// gated. Both must wait — neither should bypass the wait under
+	// any loop iteration semantics.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	doneA := make(chan struct{})
+	doneB := make(chan struct{})
+	go func() {
+		defer wg.Done()
+		s.Schedule(k, time.Now().Add(time.Hour))
+		close(doneA)
+	}()
+	go func() {
+		defer wg.Done()
+		s.Schedule(k, time.Now().Add(time.Hour))
+		close(doneB)
+	}()
+
+	// Both Schedules must remain blocked while gate is closed.
+	select {
+	case <-doneA:
+		t.Fatal("Schedule A returned before in-flight Flush completed")
+	case <-doneB:
+		t.Fatal("Schedule B returned before in-flight Flush completed")
+	case <-time.After(50 * time.Millisecond):
+		// Expected: both blocked on inFlight.
+	}
+
+	g.release(k)
+	wg.Wait()
+
+	if s.Metrics().ScheduleWaitTimeout != 0 {
+		t.Errorf("loop-without-stuck-flusher should not bump ScheduleWaitTimeout; got %d", s.Metrics().ScheduleWaitTimeout)
+	}
+}
+
+// panickingGatedFlusher panics when its gate is released. Used to
+// fence that processEntry's cleanup defer fires BEFORE the recover
+// defer (LIFO ordering) — i.e. the index entry is removed and
+// inFlight is closed even when Flush panics mid-call.
+type panickingGatedFlusher struct {
+	gate    chan struct{}
+	entered chan FlowKey
+}
+
+func (p *panickingGatedFlusher) Flush(_ context.Context, k FlowKey) error {
+	select {
+	case p.entered <- k:
+	default:
+	}
+	<-p.gate
+	panic("simulated flusher panic")
+}
+
+// TestScheduler_InFlightMarker_CleanupDeferFiresOnFlushPanic fences
+// the LIFO defer ordering claim in processEntry: cleanup defer runs
+// BEFORE the recover defer, so panic recovery sees a fully-cleaned
+// scheduler state and a subsequent Schedule for the same key sees no
+// stale in-flight entry. cr round 2 finding (test coverage gap).
+func TestScheduler_InFlightMarker_CleanupDeferFiresOnFlushPanic(t *testing.T) {
+	f := &panickingGatedFlusher{
+		gate:    make(chan struct{}),
+		entered: make(chan FlowKey, 4),
+	}
+	s := NewScheduler(f,
+		WithTickInterval(2*time.Millisecond),
+		WithWheelSize(100),
+		WithWorkerCount(1),
+		WithFlushCallTimeout(2*time.Second),
+		WithBreakerThreshold(100), // keep breaker out of this test
+	)
+	s.Start()
+	defer shutdownOrFail(t, s)
+
+	k := mustKey(t, "10.0.0.1", "10.0.0.2", 443, FlowProtoTCP)
+	s.Schedule(k, time.Now().Add(5*time.Millisecond))
+	select {
+	case <-f.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("flusher never entered Flush")
+	}
+
+	// Release gate → Flush panics → cleanup defer runs → recover
+	// defer catches. The index entry must be removed by the cleanup
+	// defer regardless of the panic. Poll until the invariant holds.
+	close(f.gate)
+	shard := s.shards[k.shard()]
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		shard.mu.Lock()
+		_, present := shard.entries[k]
+		shard.mu.Unlock()
+		if !present {
+			// Cleanup ran. Verify a fresh Schedule for the same key
+			// sees no stale in-flight and proceeds normally. The
+			// 5-minute deadline is chosen to park the entry far
+			// beyond the test's wall-clock so the worker doesn't
+			// re-fire it during the post-Schedule assertions below.
+			s.Schedule(k, time.Now().Add(5*time.Minute))
+			shard.mu.Lock()
+			_, fresh := shard.entries[k]
+			shard.mu.Unlock()
+			if !fresh {
+				t.Fatal("post-panic Schedule failed to install fresh entry")
+			}
+			s.Cancel(k)
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("cleanup defer didn't remove index entry after Flush panic")
+}
+
+// ctxRespectingFlusher honors the per-call ctx and returns
+// context.Canceled when it fires. Used by the cleanup-defer fence
+// below — the real flushers (ConntrackFlusher / BpfFlusher) DO
+// respect ctx, so we want one inFlight test that exercises the
+// cleanup-defer path on a ctx-canceled Flush rather than a
+// gate-released one (cr round 1 finding 🟡 3c).
+type ctxRespectingFlusher struct {
+	entered chan FlowKey
+}
+
+func (c *ctxRespectingFlusher) Flush(ctx context.Context, k FlowKey) error {
+	select {
+	case c.entered <- k:
+	default:
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestScheduler_InFlightMarker_CleanupDeferFiresOnCtxCancel fences
+// the contract that processEntry's cleanup defer (delete index +
+// close inFlight) runs even when Flush returns via ctx cancellation
+// rather than success. The gated tests above exercise the explicit-
+// release path; this one exercises the ctx-cancel path that the
+// real conntrack/eBPF flushers take when their per-call ctx expires.
+func TestScheduler_InFlightMarker_CleanupDeferFiresOnCtxCancel(t *testing.T) {
+	f := &ctxRespectingFlusher{entered: make(chan FlowKey, 4)}
+	s := NewScheduler(f,
+		WithTickInterval(2*time.Millisecond),
+		WithWheelSize(100),
+		WithWorkerCount(1),
+		WithFlushCallTimeout(50*time.Millisecond),
+	)
+	s.Start()
+	defer shutdownOrFail(t, s)
+
+	k := mustKey(t, "10.0.0.1", "10.0.0.2", 443, FlowProtoTCP)
+	s.Schedule(k, time.Now().Add(5*time.Millisecond))
+
+	select {
+	case <-f.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("flusher never entered Flush")
+	}
+
+	// Flush blocks on ctx.Done; the per-call ctx expires after
+	// flushCallTimeout (50ms). processEntry's cleanup defer must
+	// then run regardless — delete index entry + close inFlight.
+	// Poll until both invariants hold.
+	shard := s.shards[k.shard()]
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		shard.mu.Lock()
+		_, present := shard.entries[k]
+		shard.mu.Unlock()
+		if !present {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("cleanup defer didn't remove index entry after ctx-canceled Flush")
+}

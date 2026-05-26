@@ -206,6 +206,7 @@ This file stays light. Subtree-scoped rules live in nested `CLAUDE.md` files (au
 | qurl-service `/internal/v1/*` triage | `docs/runbooks/qurl-internal-v1-triage.md` |
 | Create a QURL via API | `docs/runbooks/create-qurl.md` |
 | L3 flush scheduler breaker open — recovery | `docs/runbooks/l3-flush-breaker-recovery.md` |
+| L3 flush scheduler ScheduleWaitTimeout firing | `docs/runbooks/l3-flush-schedule-wait-timeout.md` |
 | L3 flush quiet-stream residual + backend-keepalive recipe | `docs/design/QUIET_STREAM_RESIDUAL.md` |
 | Lock order in `endpoints/server/` | `endpoints/server/CLAUDE.md` |
 | Lock order in `endpoints/ac/` | `endpoints/ac/CLAUDE.md` |

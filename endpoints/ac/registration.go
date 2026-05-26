@@ -366,6 +366,15 @@ const (
 	MetricL3FlushBpfSkipped            = "L3FlushBpfSkipped"
 	MetricL3FlushScheduleRejected      = "L3FlushScheduleRejected"
 	MetricL3FlushScheduleAfterShutdown = "L3FlushScheduleAfterShutdown"
+	// MetricL3FlushScheduleWaitTimeout counts Schedule() calls where
+	// the in-flight Flush exceeded flushCallTimeout + scheduleWaitSlop
+	// before closing its inFlight chan. Non-zero is a chronically-
+	// stuck-flusher signal — the breaker catches it independently
+	// once the first Flush returns with err, but this metric
+	// surfaces the signal before the breaker trips. Must be wired
+	// to a dashboard alert before L3FlushDryRun=false rollout
+	// (#2189 tracks the terraform side).
+	MetricL3FlushScheduleWaitTimeout = "L3FlushScheduleWaitTimeout"
 )
 
 // Re-registration reason constants. These are the only values that
@@ -873,6 +882,7 @@ func (r *ACRegistration) Start() error {
 	r.metrics.RegisterGaugeFunc(MetricL3FlushBpfSkipped, r.l3FlushBpfSkippedGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleRejected, r.l3FlushScheduleRejectedGauge)
 	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleAfterShutdown, r.l3FlushScheduleAfterShutdownGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleWaitTimeout, r.l3FlushScheduleWaitTimeoutGauge)
 
 	// Add to wait group BEFORE starting goroutines to prevent race with Stop()
 	r.wg.Add(1)
@@ -1032,6 +1042,9 @@ func (r *ACRegistration) l3FlushScheduleRejectedGauge() float64 {
 }
 func (r *ACRegistration) l3FlushScheduleAfterShutdownGauge() float64 {
 	return float64(r.l3FlushSnapshot().ScheduleAfterShutdown)
+}
+func (r *ACRegistration) l3FlushScheduleWaitTimeoutGauge() float64 {
+	return float64(r.l3FlushSnapshot().ScheduleWaitTimeout)
 }
 
 // l3FlushBreakerOpenGauge emits 1.0 when the breaker is open

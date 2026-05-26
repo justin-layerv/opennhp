@@ -55,17 +55,28 @@
 // belongs in a separate retry layer with its own error budget, not
 // in processEntry.
 //
-// # Cancel/Schedule race with in-flight Flush
+// # Schedule/Flush serialization via inFlight marker (#2168)
 //
-// processEntry releases shard.mu BEFORE calling Flush. A concurrent
-// HandleAccessControl re-admitting the same FlowKey can write a new
-// kernel allow-rule that this in-flight Flush then tears down. See
-// issue #2168 — the proper fix requires either an inFlight-marker
-// or reordering kernel writes vs. Schedule. Conntrack mode self-
-// heals on next packet; BPF mode silently denies the new session
-// until next admission. Acceptable during the 4+4-week rollout
-// while L7 enforcement is still active; must land before L7 is
-// removed.
+// processEntry releases shard.mu BEFORE calling Flush so the wheel
+// + index aren't held across a syscall. Without further coordination
+// a concurrent HandleAccessControl re-admitting the same FlowKey
+// could write a new kernel allow-rule that this in-flight Flush
+// then tears down. The scheduler closes that window with an
+// `inFlight chan struct{}` on each expiryEntry: processEntry sets
+// it under shard.mu before releasing, then closes it in a deferred
+// cleanup after Flush returns (success / error / panic). Schedule
+// waits on a non-nil-and-open inFlight for the bounded
+// flushCallTimeout + 100ms slop, re-acquires shard.mu, then
+// inserts the new entry. Cancel is a no-op while inFlight is open
+// — the in-flight Flush already IS the cancellation.
+//
+// Caller order also changed: msghandler.go now schedules BEFORE
+// writing the kernel allow-rule (scheduleThenWrite helper). With
+// schedule-then-write, the brief no-rule window between Flush
+// teardown and the new rule write is the only remaining seam;
+// packets in that microwindow drop in BPF mode (vs the prior
+// behavior of silent-deny for the entire new session) and self-
+// heal at next packet in conntrack mode.
 //
 // # Out of scope here (lives in callers)
 //
@@ -258,10 +269,18 @@ func (k FlowKey) shard() uint32 {
 }
 
 // FlowFlusher tears down kernel flow state for a given FlowKey.
-// Implementations MUST be safe for concurrent use from many
-// goroutines and MUST be idempotent on missing flow state (return
-// nil if the kernel reports ENOENT / no such entry — kernel GC may
-// have removed the entry before the scheduler fires).
+//
+// CONTRACT: implementations MUST be safe for concurrent use from
+// many goroutines and MUST be idempotent on missing flow state —
+// return nil when the kernel reports ENOENT / no-such-entry.
+// msghandler.go's schedule-then-write reorder for #2168 relies on
+// this: a scheduled flush against a never-written kernel entry
+// (when the upstream ipset.Add / EbpfRuleAdd subsequently failed)
+// MUST NOT bump FlushErr or trip the breaker. The kernel GC also
+// can have removed the entry before the scheduler fires; same
+// idempotency rule applies. See per-flusher CONTRACT blocks on
+// ConntrackFlusher.Flush and BpfFlusher.Flush for implementation
+// details (single-source-of-truth is here at the interface).
 type FlowFlusher interface {
 	Flush(ctx context.Context, key FlowKey) error
 }
@@ -329,6 +348,23 @@ const (
 	// when #2165's netlink swap lands (sub-ms typical) — until then
 	// the conntrack-tools-fork-exec ceiling sets the floor.
 	defaultFlushCallTimeout = 5 * time.Second
+
+	// scheduleWaitSlop is the upper bound on bookkeeping time between
+	// flusher.Flush returning and inFlight being closed (re-acquire
+	// shard.mu, delete from index, decrement metric, close chan).
+	// Used by Schedule's wait on a non-nil inFlight: any sane
+	// in-flight Flush must have closed inFlight within
+	// flushCallTimeout + scheduleWaitSlop; exceeding that means the
+	// flusher itself is stuck past its own per-call ctx, which the
+	// breaker catches independently.
+	//
+	// Operator runbook: if ScheduleWaitTimeout ticks WITHOUT a
+	// concurrent FlushErr or BreakerOpen signal, the slop is too
+	// tight (likely cause: GC stop-the-world tail under hot AC
+	// load). Widening to 250ms is the first response before
+	// suspecting a real stuck flusher. Auto-adaptive sizing is
+	// tracked in #2189.
+	scheduleWaitSlop = 100 * time.Millisecond
 )
 
 // overflowBucketIdx is the sentinel "bucket index" stored on entries
@@ -352,7 +388,8 @@ const overflowBucketIdx uint32 = 0xFFFFFFFF
 // data loss for an explicit fail-closed signal.
 //
 // Memory: FlowKey (36) + deadlineNs (8) + gen (8 atomic) + bucket
-// (4) + deferCount (1) + 3B padding + next/prev (16) ≈ 80 B.
+// (4) + deferCount (1) + 3B padding + next/prev (16) + inFlight
+// chan header (8, nil until processEntry) ≈ 88 B.
 type expiryEntry struct {
 	FlowKey
 	deadlineNs uint64
@@ -369,6 +406,15 @@ type expiryEntry struct {
 	_          [3]byte
 	next       *expiryEntry
 	prev       *expiryEntry
+	// inFlight is non-nil iff a worker has begun Flush for this entry.
+	// processEntry allocates the chan under shard.mu after the
+	// liveness checks pass and closes it in the deferred cleanup
+	// once Flush has returned (any outcome — success / error /
+	// panic). Schedule blocks on a non-nil inFlight before
+	// proceeding so a re-admission for the same FlowKey cannot
+	// write a kernel allow-rule that the in-flight Flush then tears
+	// down. See #2168 + package godoc.
+	inFlight chan struct{}
 }
 
 // maxConsecutiveDefers bounds the re-bucket loop on a sustained
@@ -555,6 +601,14 @@ type Scheduler struct {
 	// normal operation it should be zero; non-zero means there's
 	// an admission path racing Shutdown.
 	metricScheduleAfterShutdown atomic.Uint64
+	// metricScheduleWaitTimeout counts Schedule() calls where the
+	// in-flight Flush did not close its inFlight chan within
+	// flushCallTimeout + scheduleWaitSlop. Non-zero means the
+	// flusher is stuck past its own per-call deadline — Schedule
+	// proceeds anyway (kernel state may briefly flap) and the
+	// breaker will eventually catch a chronically stuck flusher.
+	// See #2168 + package godoc.
+	metricScheduleWaitTimeout atomic.Uint64
 
 	// Lifecycle.
 	ctx       context.Context
@@ -669,17 +723,53 @@ func (s *Scheduler) Shutdown(ctx context.Context) error {
 // deadline, the existing entry stays and Schedule is a no-op.
 // Otherwise the entry is (re)inserted at the new deadline.
 //
-// # Caller contract — kernel allow-rule must be written FIRST
+// # Caller contract — Schedule BEFORE writing the kernel allow-rule
 //
-// Callers MUST write the kernel allow-rule (`ipset.Add` /
-// `EbpfRuleAdd`) BEFORE calling Schedule. The shard lock is
-// dropped before each Flush, so a Schedule-then-write order opens
-// a window where processEntry fires against a not-yet-written
-// kernel rule and the next admission's freshly-written rule is
-// then torn down by the in-flight Flush. With the documented
-// write-then-Schedule order, the worst case is a benign self-heal
-// at next packet (iptables mode) or a one-admission silent deny
-// until re-knock (BPF mode) — see #2168.
+// Callers MUST call Schedule BEFORE writing the kernel allow-rule
+// (`ipset.Add` / `EbpfRuleAdd`). Schedule blocks on any in-flight
+// Flush for the same FlowKey (see inFlight on expiryEntry), so the
+// caller is guaranteed that any prior Flush has completed before
+// the kernel rule write proceeds. msghandler.go's admission paths
+// follow this order at every call site (the package-level comment
+// in msghandler.go's HandleAccessControl spells out the contract
+// alongside the calls). See #2168 + package godoc for the race
+// this closes.
+//
+// # Wait-timeout fallback
+//
+// If the in-flight Flush exceeds flushCallTimeout +
+// scheduleWaitSlop without closing inFlight (chronically stuck
+// flusher), Schedule bumps ScheduleWaitTimeout, logs a Warning,
+// and proceeds — bypassing the normal longest-wins early-return.
+// Bypass rationale: the in-flight entry's kernel rule is in an
+// indeterminate post-timeout state, so honoring its stored
+// deadline as "still scheduled" would orphan the caller's new
+// kernel rule of any flush hook. A non-zero ScheduleWaitTimeout
+// is a chronically-stuck-flusher signal the breaker catches
+// independently.
+//
+// # Worst-case blocking budget on the admission hot path
+//
+// Schedule blocks for up to flushCallTimeout + scheduleWaitSlop
+// (5.1s at defaults) PER LOOP ITERATION when a Flush is in flight
+// for the same FlowKey. Per-key only — unrelated keys never block
+// (different shard mutexes; even same-shard different-keys don't
+// block because Phase 1's lock drop is per-call). Under sustained
+// healthy-flusher admission churn against a single hot FlowKey,
+// the Phase 1 loop can iterate before draining (each loop's
+// existing.inFlight check sees a fresh worker that picked up the
+// next entry). Total blocking is bounded by the breaker:
+// the FIRST stuck Flush eventually returns with an error (its
+// own ctx times out), recordBreakerErr counts toward the
+// threshold, and UdpAC's HandleAccessControl admission gate
+// fails closed at the next NHP-AOP. The pile-up window is
+// therefore (recovery_time + 5.1s) at worst under a stuck
+// flusher; under a healthy-flusher storm, breaker-trip latency
+// is a function of churn rate, not the 5.1s per-iteration bound.
+// Operators tuning flushCallTimeout downward (e.g., after #2165's
+// netlink swap) tighten this proportionally without an AC build.
+// #2189 tracks a loop-iteration metric / cap for additional
+// observability.
 //
 // # Lock order
 //
@@ -689,6 +779,12 @@ func (s *Scheduler) Shutdown(ctx context.Context) error {
 // then be overwritten by this slower call — silently violating
 // longest-wins. Holding wheelMu inside shard.mu is the stable
 // lock order observed by Cancel and tickOnce-driven retries.
+//
+// Phase 1's inFlight wait drops shard.mu BEFORE the
+// shard-index + wheel-mutation sequence above begins (lock
+// blocking unrelated keys in the same shard is the trade we
+// avoid). The lock-order invariant applies to the
+// index-mutation portion only — the wait is a separate phase.
 //
 // # Deadline semantics
 //
@@ -726,11 +822,88 @@ func (s *Scheduler) Schedule(key FlowKey, deadline time.Time) {
 	}
 	deadlineNs := monoNsAt(deadline)
 	shard := s.shards[key.shard()]
+
+	// Phase 1: if the existing entry has an open inFlight chan, a
+	// worker is mid-Flush (kernel allow-rule is being or has been
+	// torn down). Wait for the in-flight Flush to complete before
+	// proceeding so the caller's subsequent kernel-rule write
+	// doesn't race the teardown. Drop shard.mu across the wait —
+	// holding it would serialize unrelated keys in the same shard.
+	// Re-acquire and re-fetch existing after the wait; the
+	// in-flight entry will have been deleted from the index by
+	// processEntry's cleanup defer (clean release) or is still
+	// present with inFlight set (wait timeout).
+	timedOutOnInFlight := false
 	shard.mu.Lock()
+	// Loop the wait so a re-admission burst that drains AND
+	// dispatches a fresh entry to a worker between our wake-up
+	// and lock re-acquisition is also serialized. Single-shot
+	// semantics would leave a narrow race: Schedule_A waits on X
+	// → cleanup closes X → Schedule_B inserts Y → tickOnce
+	// drains Y → workerLoop allocates Y.inFlight → Schedule_A
+	// wakes, sees Y.inFlight≠nil but doesn't wait → caller's
+	// kernel-write races Y's Flush. Loop closes that seam at
+	// zero cost in the common case (one iteration). Bound is
+	// implicit: each iteration consumes flushCallTimeout +
+	// scheduleWaitSlop and bumps ScheduleWaitTimeout on stuck
+	// flushers, so a chronically-degraded path trips the breaker
+	// independently. See #2168 + cr round 3 item 1.
+	for {
+		existing, ok := shard.entries[key]
+		if !ok || existing.inFlight == nil {
+			break
+		}
+		inFlight := existing.inFlight
+		shard.mu.Unlock()
+		waitTimeout := s.flushCallTimeout + scheduleWaitSlop
+		// time.NewTimer + Stop on the clean-release path returns
+		// the timer to the pool earlier than natural fire. Go 1.23+
+		// runtimes auto-reclaim unreferenced timers; the explicit
+		// Stop is a belt for older toolchains and clearer intent.
+		timer := time.NewTimer(waitTimeout)
+		select {
+		case <-inFlight:
+			timer.Stop()
+		case <-timer.C:
+			s.metricScheduleWaitTimeout.Add(1)
+			timedOutOnInFlight = true
+			log.Warning("[ExpirySched] Schedule(%s): in-flight Flush exceeded %s; proceeding (kernel state may briefly flap)", key, waitTimeout)
+		}
+		shard.mu.Lock()
+		if timedOutOnInFlight {
+			// Past the timeout we bypass the longest-wins check
+			// downstream regardless of what we find; no need to
+			// re-loop on a fresh inFlight (the breaker handles
+			// chronically stuck flushers). NOTE: if the timeout
+			// fired on a transient GC-tail stall AND a fresh
+			// entry+inFlight materialized in the wake/re-acquire
+			// seam, we accept a residual single-occurrence
+			// #2168 race window here in exchange for bounded
+			// admission blocking. The breaker covers stuck
+			// flushers; this seam is the explicit trade. cr
+			// round 8 finding 1.
+			break
+		}
+	}
+	// Invariant: shard.mu is held here. Every break path of the
+	// Phase 1 loop above re-acquires shard.mu before exiting (the
+	// no-wait break is reached under the initial Lock; the
+	// inFlight-close break re-acquires before the loop test; the
+	// timeout break re-acquires before its early exit). A future
+	// refactor that adds an early-return inside the loop without
+	// re-acquiring would break this defer.
 	defer shard.mu.Unlock()
 
 	existing, ok := shard.entries[key]
-	if ok && existing.deadlineNs >= deadlineNs {
+	// Longest-wins skip when we did NOT just wait out a stuck
+	// in-flight entry. On wait-timeout the existing entry's kernel
+	// rule has either been torn down (Flush eventually returns
+	// past timeout) or is in an indeterminate state; honoring its
+	// stored deadline as "still scheduled" would leave the caller's
+	// new kernel rule with no flush hook once the cleanup defer
+	// finally removes the index entry. Force-insert to keep the
+	// new write under a fresh schedule.
+	if ok && !timedOutOnInFlight && existing.deadlineNs >= deadlineNs {
 		// Longest-wins: the existing entry has at-least-as-late a
 		// deadline already, leave it alone.
 		return
@@ -749,16 +922,37 @@ func (s *Scheduler) Schedule(key FlowKey, deadline time.Time) {
 
 	s.wheelMu.Lock()
 	if existing != nil {
-		// Mark the existing entry dead BEFORE unlinking so a worker
-		// that already pulled it from the queue no-ops at the
-		// gen-check (see processEntry).
-		existing.gen.Store(0)
-		s.unlinkLocked(existing)
+		// On inFlight != nil, the worker already passed the
+		// `entry.gen.Load() == 0` early-return in processEntry
+		// BEFORE allocating inFlight (under shard.mu, line ~1530),
+		// so the store here would have no effect on the worker's
+		// liveness decision. AND skip unlinkLocked: tickOnce
+		// drained the entry from the wheel (snapping next/prev to
+		// nil under wheelMu) before dispatch, so the call would
+		// be a no-op AND a defense-in-depth fragility (future
+		// tickOnce refactor that left next/prev populated could
+		// corrupt the bucket list). Both writes are no-op'd
+		// together — inFlight ⇒ drained + worker-past-gen-check
+		// ⇒ both mutations are wasted work. See cr rounds 3 + 6.
+		if existing.inFlight == nil {
+			// Mark dead BEFORE unlinking so a worker that already
+			// pulled the entry from the queue no-ops at the
+			// gen-check (see processEntry).
+			existing.gen.Store(0)
+			s.unlinkLocked(existing)
+		}
 	}
 	s.insertLocked(entry)
 	s.wheelMu.Unlock()
 
 	shard.entries[key] = entry
+	// metricEntries invariant under timedOutOnInFlight: the stuck
+	// in-flight entry's cleanup defer will eventually run and see
+	// `cur != entry` (cur is our new entry), so it skips its own
+	// Add(-1). Skipping the +1 here keeps the metric consistent
+	// across the overlap — one slot net change, not two — at the
+	// cost of a transient single-count metric-fidelity gap during
+	// the very rare wait-timeout overlap window.
 	if existing == nil {
 		s.metricEntries.Add(1)
 	}
@@ -766,6 +960,18 @@ func (s *Scheduler) Schedule(key FlowKey, deadline time.Time) {
 
 // Cancel removes any scheduled flush for key. Safe to call for keys
 // that aren't scheduled (no-op).
+//
+// If an entry is mid-Flush (inFlight chan is set), Cancel is a
+// no-op — the in-flight Flush already IS the cancellation: the
+// kernel allow-rule is being torn down right now, and processEntry's
+// cleanup defer will remove the index entry once Flush returns.
+//
+// Callers note: Reschedule MUST use Schedule (which handles the
+// in-flight case in Phase 1), NOT Cancel-then-Schedule. The latter
+// is a no-op during in-flight + a re-insert, leaving the re-admission
+// race window #2168 reopened. Today only scheduler internals and
+// tests call Cancel; #2172 will wire it into /refresh + token-revoke
+// with this contract in mind.
 //
 // Lock order matches Schedule: shard.mu before wheelMu.
 func (s *Scheduler) Cancel(key FlowKey) {
@@ -778,6 +984,11 @@ func (s *Scheduler) Cancel(key FlowKey) {
 
 	entry, ok := shard.entries[key]
 	if !ok {
+		return
+	}
+	if entry.inFlight != nil {
+		// In-flight Flush is already the cancellation; let
+		// processEntry's cleanup defer finish the index removal.
 		return
 	}
 	delete(shard.entries, key)
@@ -836,6 +1047,12 @@ func (s *Scheduler) EntryCount() int64 { return s.metricEntries.Load() }
 //     the next process recovers any in-flight admission; this
 //     counter surfaces frequency. Should be zero under steady
 //     state; non-zero means an admission path is racing Shutdown.
+//   - ScheduleWaitTimeout — Schedule calls where the existing
+//     entry's in-flight Flush did not close inFlight within
+//     flushCallTimeout + scheduleWaitSlop. Non-zero means the
+//     flusher is stuck past its own per-call ctx; Schedule
+//     proceeds anyway and the breaker will catch a chronically
+//     stuck flusher independently. See #2168 + package godoc.
 type FlushMetrics struct {
 	Entries               int64
 	FlushTotal            uint64
@@ -847,6 +1064,7 @@ type FlushMetrics struct {
 	BreakerOpen           bool
 	ScheduleRejected      uint64
 	ScheduleAfterShutdown uint64
+	ScheduleWaitTimeout   uint64
 }
 
 // Metrics returns a point-in-time snapshot of counters and gauges.
@@ -862,6 +1080,7 @@ func (s *Scheduler) Metrics() FlushMetrics {
 		BreakerOpen:           s.breakerOpen.Load(),
 		ScheduleRejected:      s.metricScheduleRejected.Load(),
 		ScheduleAfterShutdown: s.metricScheduleAfterShutdown.Load(),
+		ScheduleWaitTimeout:   s.metricScheduleWaitTimeout.Load(),
 	}
 }
 
@@ -1321,17 +1540,13 @@ func (s *Scheduler) processEntry(entry *expiryEntry) {
 	// liveness decision is serialized against Schedule's index
 	// update.
 	//
-	// Known race (issue #2168): the shard lock is released BEFORE the
-	// Flush call. A concurrent HandleAccessControl re-admitting the
-	// same FlowKey can write a new kernel allow-rule that this
-	// in-flight Flush then tears down. Holding shard.mu across Flush
-	// (the obvious fix) does NOT close the window because msghandler.go
-	// writes the kernel allow-rule *before* calling Schedule — the
-	// rule write doesn't take shard.mu. The proper fix is either an
-	// inFlight-marker mechanism (Schedule waits for in-flight Flush
-	// to complete) or reordering msghandler.go to Schedule-then-write.
-	// Conntrack mode self-heals on next packet; BPF mode silently
-	// denies the new session until next admission. Filed as #2168.
+	// Schedule/Flush race (#2168) is closed by inFlight: we allocate
+	// the chan under shard.mu before releasing, leave the entry in
+	// the index across Flush, and the deferred cleanup below
+	// removes the index entry + closes inFlight after Flush returns.
+	// Schedule waits on the open inFlight before inserting a new
+	// entry for the same key, so a concurrent admission's kernel
+	// allow-rule write cannot race the teardown.
 	shard := s.shards[entry.FlowKey.shard()]
 	shard.mu.Lock()
 	if entry.gen.Load() == 0 {
@@ -1347,9 +1562,36 @@ func (s *Scheduler) processEntry(entry *expiryEntry) {
 		shard.mu.Unlock()
 		return
 	}
-	delete(shard.entries, entry.FlowKey)
-	s.metricEntries.Add(-1)
+	// Mark in-flight under shard.mu so a concurrent Schedule
+	// observing this entry sees the non-nil chan and waits.
+	// Allocated lazily here (not at Schedule time) so the
+	// happy-path allocation cost lives on the flush hot path,
+	// not on every admission.
+	entry.inFlight = make(chan struct{})
 	shard.mu.Unlock()
+
+	// Cleanup: remove the index entry and close inFlight regardless
+	// of what happens in Flush below (success / error / panic).
+	// LIFO ordering puts this BEFORE the top-of-func recover defer
+	// so the recover sees a fully cleaned-up scheduler state. The
+	// secondary benefit: if cleanup itself panics (e.g., a future
+	// regression that double-closes inFlight), the recover defer
+	// is the last line of defense and the worker survives.
+	defer func() {
+		shard.mu.Lock()
+		if cur, ok := shard.entries[entry.FlowKey]; ok && cur == entry {
+			delete(shard.entries, entry.FlowKey)
+			s.metricEntries.Add(-1)
+		}
+		shard.mu.Unlock()
+		// close inFlight OUTSIDE the shard lock so a Schedule
+		// goroutine woken by the close (Phase 1 wait) can
+		// re-acquire shard.mu without contending against the
+		// cleanup defer's own hold. Happens-before is established
+		// by the chan close itself; the lock was only needed for
+		// the index mutation above.
+		close(entry.inFlight)
+	}()
 
 	if s.dryRun.Load() {
 		s.metricFlushDryRun.Add(1)
