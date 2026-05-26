@@ -303,6 +303,8 @@ lint-workflows:
 	@bash scripts/check-cleanup-event-type-lockstep.sh
 	@bash scripts/check-lockdown-body-drift.sh
 	@bash scripts/check-frps-az-suffixes-validation-drift.sh
+	@bash tests/lints/nhp-server-internal-url-validation-drift/run-fixtures.sh
+	@bash scripts/check-nhp-server-internal-url-validation-drift.sh
 	@bash tests/scripts/check-image-tag-writer-allowlist_test.sh
 	@python3 -c 'import yaml' 2>/dev/null || { \
 		echo "$(COLOUR_RED)[OpenNHP] PyYAML missing.$(END_COLOUR)"; \

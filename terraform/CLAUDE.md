@@ -40,6 +40,21 @@ else flips it (no plan-time revert):
 that exceeds the static cap fights the rehearsal — the cap is the
 safety net.
 
+**qurl-reverse-tunnel-server NHP validator origin.** Keep
+`local.nhp_server_internal_url` on the VPC-internal Cloud Map origin
+(`http://server.<namespace>:8888`) for qurl-service headless resolve and
+qurl-reverse-tunnel-server knock-token validation. nhp-server's internal
+token-validation handler relies on the request source IP being private; a
+public resolve edge, public ALB, or re-terminating proxy can turn the same
+request into a non-private-source 4xx even when DNS and TLS look healthy.
+HMAC protects request integrity, not confidentiality: the knock token is still
+plaintext on the wire, so keep this path inside one trusted VPC/private-DNS
+boundary and revisit before using VPC peering, Transit Gateway, cross-account
+services, or any appliance that mirrors/logs traffic. The Terraform validation
+accepts any `*.internal` host with a valid port rather than only
+`server.nhp.<env>.internal`; that preserves nonstandard module uses, but a typo
+can still pass validation and fail later at DNS/runtime.
+
 **Static name + `create_before_destroy` invariant.** Every ASG in
 this repo (the three listed above plus their `blue_green.tf` green
 counterparts) uses a static `name = "${var.name_prefix}-..."` AND

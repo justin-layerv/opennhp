@@ -1041,6 +1041,17 @@ jobs:
         # alerts.tf — same failure mode as the 2026-03-24 GSI incident.
         run: ./.github/scripts/check-qurl-slo-lockstep.sh
 
+      - name: Check nhp_server_internal_url validation drift
+        # Terraform cannot share this validation across root and module
+        # boundaries, so keep the mirrored copies byte-identical at PR time.
+        # Intentionally not gated on terraform_changed: this invariant must
+        # hold on every PR, and the check is cheap. Content-only check; one
+        # matrix entry is enough.
+        if: matrix.environment == 'sandbox'
+        run: |
+          ./tests/lints/nhp-server-internal-url-validation-drift/run-fixtures.sh
+          ./scripts/check-nhp-server-internal-url-validation-drift.sh
+
       - name: Skip Notice
         if: steps.changes.outputs.terraform_changed != 'true'
         run: |

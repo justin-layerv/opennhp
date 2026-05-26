@@ -773,9 +773,24 @@ variable "stripe_checkout_cancel_url" {
 # ==================== NHP Integration ====================
 
 variable "nhp_server_internal_url" {
-  description = "Internal URL of NHP server for headless resolve knock requests (e.g., http://server.nhp.sandbox.internal:8888). Enables POST /v1/resolve endpoint."
+  description = "Internal URL of NHP server for headless resolve knock requests (e.g., http://server.nhp.sandbox.internal:8888). Enables POST /v1/resolve endpoint. Prefer the VPC-internal Cloud Map origin; HTTPS origins remain accepted for direct-module/nonstandard topologies. The .internal suffix matches the private DNS namespace in modules/data/main.tf, and HTTP .internal hostnames are expected to be lowercase Cloud Map/private DNS names."
   type        = string
   default     = ""
+
+  validation {
+    # Mirror of root `terraform_data.nhp_server_internal_url_preconditions`
+    # and modules/qurl-reverse-tunnel-server/variables.tf::nhp_server_internal_url.
+    # Examples: accept "", https://nhp.example.com, http://server.nhp.sandbox.internal:8888;
+    # reject http://server.nhp.sandbox.internal:99999 and any path/query/fragment.
+    # The HTTPS branch is an origin-shape-only escape hatch for direct-module
+    # nonstandard topologies; runtime URL parsing owns host/port semantics there.
+    condition = (
+      var.nhp_server_internal_url == ""
+      || can(regex("^https://[^[:space:]/?#]+$", var.nhp_server_internal_url))
+      || can(regex("^http://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+internal:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$", var.nhp_server_internal_url))
+    )
+    error_message = "nhp_server_internal_url must be empty, an HTTPS origin URL or an HTTP private hosted-zone origin ending in .internal with an explicit valid TCP port (1-65535); either form must have no path, query, fragment, or trailing slash (for example http://server.nhp.sandbox.internal:8888)."
+  }
 }
 
 variable "nhp_knock_timeout_seconds" {

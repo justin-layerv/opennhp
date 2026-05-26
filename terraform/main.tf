@@ -1238,6 +1238,41 @@ data "aws_route53_zone" "main" {
 
 locals {
   main_zone_id = var.hosted_zone_id != null ? var.hosted_zone_id : try(data.aws_route53_zone.main[0].zone_id, null)
+
+  # Canonical VPC-internal nhp-server origin used by both qurl-service
+  # headless resolve and qurl-reverse-tunnel-server knock-token validation.
+  # The namespace suffix comes from modules/data/main.tf's private DNS
+  # namespace (`nhp.${var.environment}.internal`); keep both consumers on
+  # this local so validation and future topology changes move in lockstep.
+  # The deploy_ac gate is about token issuance, not DNS existence: compute
+  # registers `server.<namespace>` regardless, but without AC there are no
+  # AC-issued knock tokens for either consumer to validate.
+  nhp_server_internal_url = var.deploy_ac ? "http://server.${module.data.namespace_name}:8888" : ""
+}
+
+# Validate the shared nhp-server origin at the root level, not inside the
+# FRPS-only preconditions: qurl-service consumes this same local whenever AC
+# is deployed, even in topologies where `deploy_frps = false`.
+# The current local renders only "" or the VPC-internal HTTP origin; the
+# HTTPS branch is defensive for future edits that point the shared local at a
+# direct-module/nonstandard topology. That branch is intentionally
+# origin-shape-only escape-hatch validation; runtime URL parsing remains
+# responsible for host/port semantics if it ever becomes load-bearing.
+# Mirror the regex/error text in the two
+# module-level `nhp_server_internal_url` validations below.
+resource "terraform_data" "nhp_server_internal_url_preconditions" {
+  lifecycle {
+    precondition {
+      condition = (
+        local.nhp_server_internal_url == ""
+        # HTTPS is currently unreachable from the root local and is retained
+        # only to mirror direct-module validation for drift-lint parity.
+        || can(regex("^https://[^[:space:]/?#]+$", local.nhp_server_internal_url))
+        || can(regex("^http://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+internal:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$", local.nhp_server_internal_url))
+      )
+      error_message = "local.nhp_server_internal_url must be empty, an HTTPS origin URL or an HTTP private hosted-zone origin ending in .internal with an explicit valid TCP port (1-65535); either form must have no path, query, fragment, or trailing slash (for example http://server.nhp.sandbox.internal:8888)."
+    }
+  }
 }
 
 # AC DNS records for cross-account zones
@@ -1464,8 +1499,12 @@ resource "terraform_data" "frps_preconditions" {
       error_message = "deploy_frps with connect_layerv_host=${var.connect_layerv_host} requires local.main_zone_id to resolve (via var.hosted_zone_id or the var.hosted_zone data lookup); both aws_route53_record.connect and aws_route53_record.connect_cross_account would otherwise collapse to count=0 and apply would ship without a public DNS record for the FRPS-behind-AC ingress. Set `hosted_zone_id` directly (cross-account path) or `hosted_zone` (in-account lookup) in tfvars."
     }
     precondition {
-      condition     = var.qurl_reverse_tunnel_server_tunnel_auth_mode != "tunnel-auth" || (var.deploy_qurl_link && var.qurl_link_frontend_domain != null)
-      error_message = "qurl_reverse_tunnel_server_tunnel_auth_mode=\"tunnel-auth\" requires deploy_qurl_link=true and qurl_link_frontend_domain set so qurl-reverse-tunnel-server has a TLS nhp-server validation origin (resolve-origin.<qurl_link_frontend_domain> when CloudFront is enabled, otherwise resolve.<qurl_link_frontend_domain>)."
+      # Defensive even though this block also enforces deploy_frps => deploy_ac:
+      # keep the reason close to the tunnel-auth mode check. AC issues the
+      # knock tokens this mode validates; nhp-server's DNS origin exists
+      # without AC.
+      condition     = var.qurl_reverse_tunnel_server_tunnel_auth_mode != "tunnel-auth" || var.deploy_ac
+      error_message = "qurl_reverse_tunnel_server_tunnel_auth_mode=\"tunnel-auth\" requires deploy_ac=true because AC issues the knock tokens qurl-reverse-tunnel-server validates against the VPC-internal nhp-server origin (server.<namespace>:8888)."
     }
     precondition {
       condition     = var.qurl_reverse_tunnel_server_tunnel_auth_mode == "tunnel-auth"
@@ -1612,7 +1651,7 @@ module "qurl_reverse_tunnel_server" {
   qurl_api_internal_url          = var.deploy_qurl_service ? local.qurl_consumer_api_url : ""
   qurl_api_token_secret_arn      = var.deploy_qurl_service && var.qurl_internal_service_token_arn != null && var.qurl_internal_service_token_arn != "" ? var.qurl_internal_service_token_arn : ""
   secrets_kms_key_arn            = module.kms.secrets_key_arn
-  nhp_server_internal_url        = var.deploy_qurl_link && var.qurl_link_frontend_domain != null ? "https://${var.enable_resolve_cloudfront ? "resolve-origin" : "resolve"}.${var.qurl_link_frontend_domain}" : ""
+  nhp_server_internal_url        = local.nhp_server_internal_url
   nhp_internal_auth_secret_arn   = aws_secretsmanager_secret.nhp_internal_auth.arn
   connect_layerv_host            = var.connect_layerv_host
   tunnel_server_az_control_ports = local.tunnel_server_az_control_port
@@ -2115,7 +2154,7 @@ module "qurl_service" {
   logs_kms_key_arn = module.kms.logs_key_arn
 
   # NHP integration (headless resolve)
-  nhp_server_internal_url = var.deploy_ac ? "http://server.${module.data.namespace_name}:8888" : ""
+  nhp_server_internal_url = local.nhp_server_internal_url
 
   # qurl-reverse-tunnel-server routing (#1499). qurl-service is the
   # upstream_addr oracle; with per-AZ public control ingress, every

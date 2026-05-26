@@ -243,13 +243,34 @@ variable "secrets_kms_key_arn" {
 }
 
 variable "nhp_server_internal_url" {
-  description = "HTTPS base URL qurl-reverse-tunnel-server uses to validate AC-issued knock tokens with nhp-server. Required under qurl_tunnel_auth_mode=\"tunnel-auth\". Must be an origin only with no trailing slash; qurl-reverse-tunnel-server appends /nhp/internal/token/validate."
+  description = <<-EOT
+    Base URL qurl-reverse-tunnel-server uses to validate AC-issued knock tokens
+    with nhp-server. Required under qurl_tunnel_auth_mode="tunnel-auth".
+
+    Prefer the VPC-internal Cloud Map origin (http://server.<namespace>:8888)
+    so nhp-server sees a private source IP; HTTPS public origins remain
+    accepted for direct-module/nonstandard topologies. Must be an origin only
+    with no trailing slash; qurl-reverse-tunnel-server appends
+    /nhp/internal/token/validate. The .internal suffix matches the private DNS
+    namespace in modules/data/main.tf; HTTP .internal hostnames are expected
+    to be lowercase Cloud Map/private DNS names.
+  EOT
   type        = string
   default     = ""
 
   validation {
-    condition     = var.nhp_server_internal_url == "" || can(regex("^https://[^[:space:]/?#]+$", var.nhp_server_internal_url))
-    error_message = "nhp_server_internal_url must be empty or an HTTPS origin URL with no path/query/fragment/trailing slash, e.g. https://resolve-origin.qurl.link.layerv.xyz."
+    # Mirror of root `terraform_data.nhp_server_internal_url_preconditions`
+    # and modules/qurl-service/variables.tf::nhp_server_internal_url. Examples:
+    # accept "", https://nhp.example.com, http://server.nhp.sandbox.internal:8888;
+    # reject http://server.nhp.sandbox.internal:99999 and any path/query/fragment.
+    # The HTTPS branch is an origin-shape-only escape hatch for direct-module
+    # nonstandard topologies; runtime URL parsing owns host/port semantics there.
+    condition = (
+      var.nhp_server_internal_url == ""
+      || can(regex("^https://[^[:space:]/?#]+$", var.nhp_server_internal_url))
+      || can(regex("^http://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+internal:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$", var.nhp_server_internal_url))
+    )
+    error_message = "nhp_server_internal_url must be empty, an HTTPS origin URL or an HTTP private hosted-zone origin ending in .internal with an explicit valid TCP port (1-65535); either form must have no path, query, fragment, or trailing slash (for example http://server.nhp.sandbox.internal:8888)."
   }
 }
 
