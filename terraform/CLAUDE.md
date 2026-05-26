@@ -36,6 +36,11 @@ else flips it (no plan-time revert):
 - `aws_autoscaling_group.ac` (`modules/ac/main.tf`)
 - `aws_autoscaling_group.frps` blue + green (`modules/qurl-reverse-tunnel-server/main.tf`, `blue_green.tf`)
 
+FRPS ASGs also self-refresh on launch-template version changes. NHP-only
+changes that alter qurl-reverse-tunnel-server user_data/env wiring will roll
+the tunnel fleet without waiting for a qurl-reverse-tunnel-server image
+publish.
+
 `max_size` is deliberately NOT in `ignore_changes` so a CI scale-up
 that exceeds the static cap fights the rehearsal — the cap is the
 safety net.

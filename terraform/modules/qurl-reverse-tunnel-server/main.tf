@@ -828,10 +828,56 @@ resource "aws_autoscaling_group" "frps" {
     version = aws_launch_template.frps.latest_version
   }
 
+  # Instance refresh currently gates on EC2 health plus instance_warmup, not
+  # FRPS protocol readiness. The stricter Cloud Map/custom health gate remains
+  # tracked in #1089; until then, keep warmup above bounded bootstrap time and
+  # use auto_rollback so EC2-level refresh failures revert instead of parking
+  # the fleet half-rolled. Refresh-launched instances use instance_warmup for
+  # this gate, so keep it in lockstep with health_check_grace_period unless the
+  # bootstrap/readiness budget is re-evaluated.
   health_check_type         = "EC2"
   health_check_grace_period = 180
 
   enabled_metrics = local.asg_enabled_metrics
+
+  # qurl-reverse-tunnel-server's runtime contract is launch-template owned:
+  # user_data writes the env file, fetches the S3 bootstrap script, and pins
+  # the NHP/qurl-service auth wiring. A plain Terraform apply updates the
+  # launch template but leaves existing instances on their old env forever
+  # unless a separate image-publish workflow happens to refresh the ASG. That
+  # is not a valid steady-state dependency: NHP-only changes such as
+  # NHP_SERVER_INTERNAL_URL must roll the fleet themselves.
+  #
+  # Use a launch-first, one-at-a-time refresh so a template-only deploy does
+  # not intentionally drop tunnel capacity or force the whole multi-tenant
+  # tunnel fleet through a reconnect storm. The temporary +1 surge is the swap
+  # window AWS needs to replace instances while min_healthy stays at 100%;
+  # 100/200 is also AWS's maximum allowed percentage spread, so it favors
+  # availability over refresh speed and accepts the bounded cost surge.
+  # The empty-AZ watchdog still covers the single-ASG distribution risk; the
+  # longer-term per-AZ ASG refactor remains the structural fix for AZ skew, but
+  # this closes the stale user_data/env failure mode without waiting for an
+  # image publish.
+  #
+  # Deliberately omit triggers = ["tag"]: tag-only edits such as DeployColor
+  # must not churn tunnel capacity. The default launch-template trigger is the
+  # runtime-bearing signal here.
+  #
+  # When #1499 splits this into one ASG per AZ with min=max=desired=1, preserve
+  # the launch-first shape with max_healthy_percentage=200 (or explicitly
+  # accept a brief 0-healthy tradeoff). Returning to 100/100 gives AWS no swap
+  # window and can deadlock instance refresh.
+  instance_refresh {
+    strategy = "Rolling"
+
+    preferences {
+      instance_warmup        = 180
+      min_healthy_percentage = 100
+      max_healthy_percentage = 200
+      auto_rollback          = true
+      skip_matching          = true
+    }
+  }
 
   tag {
     key                 = "Name"

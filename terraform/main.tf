@@ -1617,12 +1617,12 @@ module "qurl_reverse_tunnel_server" {
   # Mirror module.ac's depends_on (terraform/main.tf:953-956): the FRP
   # launch template renders local.qurl_consumer_api_url, which can
   # interpolate the internal-ALB hostname; on first apply the cert+DNS
-  # must be live before any FRP instance reads its env. Today this is
-  # latent because the FRP ASG has no instance_refresh block (#1629)
-  # so launch template version bumps don't move fleet without operator
-  # action — but adding the dependency now removes the foot-gun for
-  # when #1629 lands. No-op when qurl_internal_service_domain is null
-  # (count-gated resources collapse to empty).
+  # must be live before any FRP instance reads its env. This dependency
+  # became load-bearing with the FRP ASG instance_refresh added in #2181
+  # (closing #1629): launch-template changes now roll the fleet, so the
+  # template must not render internal-origin env before the origin exists.
+  # No-op when qurl_internal_service_domain is null (count-gated resources
+  # collapse to empty).
   depends_on = [
     terraform_data.frps_preconditions,
     aws_acm_certificate_validation.qurl_internal,

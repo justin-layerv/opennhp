@@ -275,10 +275,37 @@ resource "aws_autoscaling_group" "frps_green" {
     version = aws_launch_template.frps.latest_version
   }
 
+  # Same EC2-health-only refresh gate as blue; see the blue ASG comment for
+  # the #1089 custom-health follow-up and why instance_warmup remains
+  # load-bearing here. Keep health_check_grace_period and instance_warmup in
+  # lockstep unless the bootstrap/readiness budget is re-evaluated.
   health_check_type         = "EC2"
   health_check_grace_period = 180
 
   enabled_metrics = local.asg_enabled_metrics
+
+  # Mirror the blue ASG launch-template refresh posture. Green is the
+  # pre-warmed candidate during blue/green rollouts; if a Terraform-only
+  # launch-template change updates user_data or env wiring, the standby color
+  # must not sit on stale bootstrap state until the next image publish. Keep
+  # the same "launch-template only, no tag trigger" contract documented on the
+  # blue ASG. Because blue and green share the launch template, a template-only
+  # apply refreshes both colors; green is unrouted in standby, but it is not a
+  # guaranteed-known-good rollback color while both refreshes are in flight.
+  # auto_rollback only catches EC2-health failures until #1089 adds the
+  # stricter FRPS readiness gate, and operators should still expect the extra
+  # temporary +1 surge on each warm color.
+  instance_refresh {
+    strategy = "Rolling"
+
+    preferences {
+      instance_warmup        = 180
+      min_healthy_percentage = 100
+      max_healthy_percentage = 200
+      auto_rollback          = true
+      skip_matching          = true
+    }
+  }
 
   tag {
     key                 = "Name"
