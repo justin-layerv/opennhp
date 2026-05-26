@@ -363,13 +363,20 @@ resource "aws_dynamodb_table" "ack_tokens" {
 # ==================== IAM Policy for Server Storage Access ====================
 # This policy is attached to NHP Server IAM roles.
 #
-# The resource name stays `dynamodb_read` to avoid Terraform state churn from
-# renaming a long-lived policy. The policy now also includes bounded server
-# writes for AC assignments and ACK token metadata.
+# The Terraform resource name stays `dynamodb_read` to avoid state churn from
+# renaming a long-lived policy. The AWS policy name is fixed and already
+# attached in live environments, so its IAM description is intentionally treated
+# as immutable metadata. Evolve the policy document below; changing the
+# description would force a destroy/create replacement that collides with the
+# existing fixed-name policy before the old attachment can be removed.
 
 resource "aws_iam_policy" "dynamodb_read" {
   name        = "${var.name_prefix}-dynamodb-read"
-  description = "Read access to NHP DynamoDB tables, plus bounded server writes for AC assignment and ACK token metadata"
+  description = "NHP server DynamoDB storage access policy"
+
+  lifecycle {
+    ignore_changes = [description]
+  }
 
   # Use concat to conditionally include KMS statement (empty resource arrays are invalid)
   policy = jsonencode({
