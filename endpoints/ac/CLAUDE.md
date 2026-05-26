@@ -21,3 +21,16 @@ must update this list and audit all existing call sites.
   `MetricReconcileOverlap`). `handleRegistrationResponse`'s
   direct-AAK branch holds `r.mu` across reconcile to close the
   orphan-until-restart hole on that path.
+- **L3 flush scheduler locks are scheduler-internal.** The L3 flush
+  scheduler (PR #2164) adds: 256 sharded `shard.mu` entries (the
+  index-per-key mutex), `wheelMu` (single mutex protecting wheel
+  buckets + overflow + hand), and `breakerErrMu` (ring buffer of
+  error timestamps). Start/Shutdown sequencing uses `sync.Once`
+  (`startOnce` / `stopOnce`) plus the `started atomic.Bool`, not
+  named mutexes. The full lock-order discipline lives in the
+  `expiry_scheduler.go` package godoc — `shard.mu` is taken BEFORE
+  `wheelMu` across the entire Schedule/Cancel sequence, and the
+  scheduler does NOT call back into `UdpAC` while holding any of
+  these locks (so no inversion is possible from outside-in callers).
+  When extending the scheduler, keep the lock discipline documented
+  in the scheduler godoc rather than duplicating it here.

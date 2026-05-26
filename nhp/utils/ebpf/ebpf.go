@@ -2,9 +2,12 @@ package ebpf
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
+	"syscall"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 
@@ -59,6 +62,34 @@ const (
 	MapTypeProtocolPort  = 6
 )
 
+// Pinned-map filesystem paths. Single source of truth for both the
+// producer side (Add* functions in this file) and the consumer side
+// (boot enumeration in endpoints/ac/expiry_enumerate_ebpf_linux.go).
+// A future XDP loader change to a different pin path becomes a
+// compile error rather than a silent boot-enumeration miss
+const (
+	PinPathWhitelist     = "/sys/fs/bpf/spp"           // TCP/UDP per-port allow-rules (whitelistKey)
+	PinPathSdWhitelist   = "/sys/fs/bpf/sdwhitelist"   // any-proto src+dst allow-rules (srcDestKey)
+	PinPathIcmpWhitelist = "/sys/fs/bpf/icmpwhitelist" // ICMP allow-rules (srcDestKey)
+)
+
+// WhitelistValueSize is the on-wire size of whitelistValue
+// (Allowed:1 + 7-pad + ExpireTime:8 = 16 bytes). Derived from
+// unsafe.Sizeof so a future struct-layout change becomes a compile
+// error at the consumer rather than a runtime sanity-check failure
+// during AC boot enumeration
+const WhitelistValueSize = int(unsafe.Sizeof(whitelistValue{}))
+
+// ExpireTimeOffset is the byte offset of the ExpireTime field
+// within whitelistValue. Boot enumeration in
+// endpoints/ac/expiry_enumerate_ebpf_linux.go decodes the value
+// bytes via `binary.LittleEndian.Uint64(valBytes[N:N+8])`, where N
+// is this offset. Exposing it via unsafe.Offsetof means a future
+// reordering of whitelistValue's fields becomes a compile error at
+// the consumer instead of silently decoding garbage from the wrong
+// 8 bytes — symmetric to WhitelistValueSize's struct-size fence
+const ExpireTimeOffset = int(unsafe.Offsetof(whitelistValue{}.ExpireTime))
+
 type EbpfRuleParams struct {
 	SrcIP        string
 	DstIP        string
@@ -81,7 +112,7 @@ func (r *whitelistKey) ToWlValue(ttlSec uint64) whitelistValue {
 	now, _ := getBootTimeNanos()
 	return whitelistValue{
 		Allowed:    1,
-		ExpireTime: now + ttlSec*1e9,
+		ExpireTime: now + ttlSec*1_000_000_000,
 	}
 }
 
@@ -96,7 +127,7 @@ func (r *srcDestKey) ToSdValue(ttlSec uint64) whitelistValue {
 	now, _ := getBootTimeNanos()
 	return whitelistValue{
 		Allowed:    1,
-		ExpireTime: now + ttlSec*1e9,
+		ExpireTime: now + ttlSec*1_000_000_000,
 	}
 }
 
@@ -111,7 +142,7 @@ func (r *procoPortKey) ToPpValue(ttlSec uint64) procoPortValue {
 	now, _ := getBootTimeNanos()
 	return procoPortValue{
 		Allowed:    1,
-		ExpireTime: now + ttlSec*1e9,
+		ExpireTime: now + ttlSec*1_000_000_000,
 	}
 }
 
@@ -127,7 +158,7 @@ func (r *portListKey) ToPlValue(ttlSec uint64) whitelistValue {
 	now, _ := getBootTimeNanos()
 	return whitelistValue{
 		Allowed:    1,
-		ExpireTime: now + ttlSec*1e9,
+		ExpireTime: now + ttlSec*1_000_000_000,
 	}
 }
 
@@ -142,7 +173,7 @@ func (r *srcIPdstPortKey) ToSpValue(ttlSec uint64) whitelistValue {
 	now, _ := getBootTimeNanos()
 	return whitelistValue{
 		Allowed:    1,
-		ExpireTime: now + ttlSec*1e9,
+		ExpireTime: now + ttlSec*1_000_000_000,
 	}
 }
 
@@ -207,7 +238,7 @@ func AddSrcipDestPortRule(whitelistMap *ebpf.Map, rule *srcIPdstPortKey, ttlSec 
 }
 
 func AddEbpfRuleForSrcDstPortProto(srcIPStr, dstIPStr string, protocol uint8, dstPort uint16, ttlSec uint64) error {
-	whitelistMap, err := ebpf.LoadPinnedMap("/sys/fs/bpf/spp", nil)
+	whitelistMap, err := ebpf.LoadPinnedMap(PinPathWhitelist, nil)
 	if err != nil {
 		log.Error("failed to load pinned whitelist map: %v", err)
 		return err
@@ -237,7 +268,7 @@ func AddEbpfRuleForSrcDstPortProto(srcIPStr, dstIPStr string, protocol uint8, ds
 }
 
 func AddEbpfRuleForSrcDst(srcIPStr, dstIPStr string, ttlSec uint64) error {
-	whitelistMap, err := ebpf.LoadPinnedMap("/sys/fs/bpf/sdwhitelist", nil)
+	whitelistMap, err := ebpf.LoadPinnedMap(PinPathSdWhitelist, nil)
 	if err != nil {
 		log.Error("failed to load pinned whitelist map: %v", err)
 		return err
@@ -294,7 +325,7 @@ func AddEbpfRuleForSrcDestPort(srcIPStr string, dstPort int, ttlSec uint64) erro
 
 // function for update icmpwhitelist map
 func AddEbpfIcmpRuleForSrcDst(srcIPStr, dstIPStr string, ttlSec uint64) error {
-	whitelistMap, err := ebpf.LoadPinnedMap("/sys/fs/bpf/icmpwhitelist", nil)
+	whitelistMap, err := ebpf.LoadPinnedMap(PinPathIcmpWhitelist, nil)
 	if err != nil {
 		log.Error("failed to load pinned whitelist map: %v", err)
 		return err
@@ -385,6 +416,93 @@ func safeIntToUint16(i int) (uint16, error) {
 		return 0, fmt.Errorf("value %d is out of range for uint16", i)
 	}
 	return uint16(i), nil
+}
+
+// DelEbpfRuleForSrcDstPortProto removes the allow-rule entry from
+// the spp (whitelist) map for the given 4-tuple. Idempotent on
+// no-match (ENOENT → nil) — used by the L3 flush-on-expiry
+// scheduler in endpoints/ac, which expects flushers to no-op on
+// already-gone state.
+func DelEbpfRuleForSrcDstPortProto(srcIPStr, dstIPStr string, protocol uint8, dstPort uint16) error {
+	m, err := ebpf.LoadPinnedMap(PinPathWhitelist, nil)
+	if err != nil {
+		return fmt.Errorf("load pinned spp: %w", err)
+	}
+	defer func() { _ = m.Close() }()
+
+	srcIP, err := parseIP(srcIPStr)
+	if err != nil {
+		return err
+	}
+	dstIP, err := parseIP(dstIPStr)
+	if err != nil {
+		return err
+	}
+	rule := &whitelistKey{SrcIP: srcIP, DstIP: dstIP, DstPort: dstPort, Protocol: protocol}
+	if err := m.Delete(rule.ToWlKey()); err != nil && !isEbpfNoEntry(err) {
+		return fmt.Errorf("delete from spp: %w", err)
+	}
+	return nil
+}
+
+// DelEbpfRuleForSrcDst removes the allow-rule entry from the
+// sdwhitelist map for the given 2-tuple. Idempotent on no-match.
+func DelEbpfRuleForSrcDst(srcIPStr, dstIPStr string) error {
+	m, err := ebpf.LoadPinnedMap(PinPathSdWhitelist, nil)
+	if err != nil {
+		return fmt.Errorf("load pinned sdwhitelist: %w", err)
+	}
+	defer func() { _ = m.Close() }()
+
+	srcIP, err := parseIP(srcIPStr)
+	if err != nil {
+		return err
+	}
+	dstIP, err := parseIP(dstIPStr)
+	if err != nil {
+		return err
+	}
+	rule := &srcDestKey{SrcIP: srcIP, DstIP: dstIP}
+	if err := m.Delete(rule.ToSdKey()); err != nil && !isEbpfNoEntry(err) {
+		return fmt.Errorf("delete from sdwhitelist: %w", err)
+	}
+	return nil
+}
+
+// DelEbpfIcmpRuleForSrcDst removes the allow-rule entry from the
+// icmpwhitelist map for the given 2-tuple. Idempotent on no-match.
+func DelEbpfIcmpRuleForSrcDst(srcIPStr, dstIPStr string) error {
+	m, err := ebpf.LoadPinnedMap(PinPathIcmpWhitelist, nil)
+	if err != nil {
+		return fmt.Errorf("load pinned icmpwhitelist: %w", err)
+	}
+	defer func() { _ = m.Close() }()
+
+	srcIP, err := parseIP(srcIPStr)
+	if err != nil {
+		return err
+	}
+	dstIP, err := parseIP(dstIPStr)
+	if err != nil {
+		return err
+	}
+	rule := &srcDestKey{SrcIP: srcIP, DstIP: dstIP}
+	if err := m.Delete(rule.ToSdKey()); err != nil && !isEbpfNoEntry(err) {
+		return fmt.Errorf("delete from icmpwhitelist: %w", err)
+	}
+	return nil
+}
+
+// isEbpfNoEntry returns true if err is the cilium/ebpf "key not
+// found" error or a wrapped ENOENT. Both kernel GC and a concurrent
+// flush can have removed the entry before us — treat as success.
+//
+// errors.Is reaches through wrappers — no error-text scraping
+func isEbpfNoEntry(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ebpf.ErrKeyNotExist) || errors.Is(err, syscall.ENOENT)
 }
 
 // A generic entry function that calls the corresponding function to add whitelist entries based on mapTypeandparams.

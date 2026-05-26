@@ -74,6 +74,30 @@ func (t ardTrust) contains(pubKey string) bool {
 	return ok
 }
 
+// ardTrustSnapshotConfigReads enumerates the Config fields that
+// ardTrustSnapshot reads. Maintained as a compile-time fence: if a
+// future field is added to ardTrustSnapshot's read set, it must
+// also be referenced here AND patched in reloadARDTrust's
+// `updateBaseConfig` block (see config.go line ~334 for the
+// reload contract). A field rename in Config breaks the compile
+// here; a new field added to the snapshot read set but forgotten
+// here is caught by the test
+// `TestARDTrustSnapshotConfigReads_FenceIsExhaustive`
+//
+// This is a static reference, not a function call — the compiler
+// keeps it alive but the runtime never executes the assignment.
+type ardTrustSnapshotConfigReads struct {
+	RequireServerPubKeyAllowlist bool
+	ServerPubKeyBase64           string
+}
+
+var _ardTrustSnapshotConfigReadsFence = func(c Config) ardTrustSnapshotConfigReads {
+	return ardTrustSnapshotConfigReads{
+		RequireServerPubKeyAllowlist: c.RequireServerPubKeyAllowlist,
+		ServerPubKeyBase64:           c.ServerPubKeyBase64,
+	}
+}
+
 // ardTrustSnapshot builds a consistent view of the allowlist + the
 // strict-mode flag. Holds serverPeerMutex for the copy so readers
 // never observe a partial reload; releases before returning so the
@@ -81,6 +105,9 @@ func (t ardTrust) contains(pubKey string) bool {
 //
 // Pre-condition: a.config is non-nil. Guaranteed once loadBaseConfig
 // has succeeded (Start returns its error and aborts otherwise).
+//
+// Config fields read: see `ardTrustSnapshotConfigReads` above — if
+// adding a field, update that fence type AND reloadARDTrust.
 func (a *UdpAC) ardTrustSnapshot() ardTrust {
 	a.serverPeerMutex.RLock()
 	defer a.serverPeerMutex.RUnlock()

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
@@ -326,5 +327,174 @@ func TestHandleAccessControl_RejectsNonPositiveOpenTime(t *testing.T) {
 		if artMsg.ErrCode != common.ErrACInvalidOpenTime.ErrorCode() {
 			t.Errorf("openTimeSec=%d: artMsg.ErrCode = %q, want %q", openTimeSec, artMsg.ErrCode, common.ErrACInvalidOpenTime.ErrorCode())
 		}
+	}
+}
+
+// TestHandleAccessControl_AdmissionGate_BreakerOpen fences the L3-only
+// security contract: when the flush scheduler's circuit breaker is
+// open, HandleAccessControl MUST refuse the NHP-AOP with
+// ErrACSchedulerBreakerOpen (53010), not with the previous
+// misleading ErrACInvalidOpenTime (53009)
+//
+// The fail-closed admission is what keeps the post-L7-removal
+// boundary intact: a stuck flusher must not admit new sessions
+// whose kernel state we cannot later guarantee to tear down.
+func TestHandleAccessControl_AdmissionGate_BreakerOpen(t *testing.T) {
+	// Construct a real scheduler so IsBreakerOpen is wired correctly.
+	// A NoOpFlusher keeps Flush calls from doing anything; we trip
+	// the breaker manually via repeated recordBreakerErr.
+	sched := NewScheduler(&NoOpFlusher{},
+		WithBreakerThreshold(2),
+		WithBreakerWindow(60*time.Second),
+	)
+	sched.Start()
+	defer shutdownOrFail(t, sched)
+	// Force the breaker open.
+	sched.recordBreakerErr()
+	sched.recordBreakerErr()
+	if !sched.IsBreakerOpen() {
+		t.Fatalf("setup: breaker did not open after 2 errors with threshold=2")
+	}
+
+	a := &UdpAC{expirySched: sched}
+	artMsg, err := a.HandleAccessControl(nil, nil, nil, 60 /* valid */, nil)
+	if !errors.Is(err, common.ErrACSchedulerBreakerOpen) {
+		t.Fatalf("got err=%v, want ErrACSchedulerBreakerOpen (admission must refuse when breaker open)", err)
+	}
+	if artMsg == nil {
+		t.Fatal("artMsg must be allocated even on rejection")
+	}
+	if artMsg.ErrCode != common.ErrACSchedulerBreakerOpen.ErrorCode() {
+		t.Errorf("artMsg.ErrCode = %q, want %q", artMsg.ErrCode, common.ErrACSchedulerBreakerOpen.ErrorCode())
+	}
+	if artMsg.ErrCode == common.ErrACInvalidOpenTime.ErrorCode() {
+		t.Error("admission denial must NOT surface as ErrACInvalidOpenTime — that misleads on-call")
+	}
+
+	// Second AOP while breaker is still open must ALSO be refused
+	//
+	artMsg2, err2 := a.HandleAccessControl(nil, nil, nil, 60, nil)
+	if !errors.Is(err2, common.ErrACSchedulerBreakerOpen) {
+		t.Errorf("2nd AOP while breaker still open: got err=%v, want ErrACSchedulerBreakerOpen", err2)
+	}
+	if artMsg2 == nil || artMsg2.ErrCode != common.ErrACSchedulerBreakerOpen.ErrorCode() {
+		t.Errorf("2nd AOP artMsg.ErrCode mismatch: %+v", artMsg2)
+	}
+}
+
+// TestHandleAccessControl_AdmissionGate_FeatureOff_NoBreakerCheck
+// fences the no-op-when-disabled contract: with the scheduler nil
+// (feature disabled), the admission gate must NOT short-circuit and
+// must NOT panic on the nil expirySched read.
+func TestHandleAccessControl_AdmissionGate_FeatureOff_NoBreakerCheck(t *testing.T) {
+	a := &UdpAC{expirySched: nil}
+	// openTimeSec=-1 to short-circuit before any kernel writes — we
+	// only want to verify the admission gate doesn't panic on nil and
+	// reaches the second (openTimeSec) gate.
+	_, err := a.HandleAccessControl(nil, nil, nil, -1, nil)
+	if !errors.Is(err, common.ErrACInvalidOpenTime) {
+		t.Errorf("with scheduler nil and openTimeSec=-1, expected ErrACInvalidOpenTime (passes admission gate, fails openTime gate); got %v", err)
+	}
+}
+
+// TestScheduleFlushIfEnabled_NoOp_WhenNil fences the
+// scheduleFlushIfEnabled wrapper's nil-safety: call sites in
+// HandleAccessControl sprinkle calls without per-site nil-checks,
+// so the wrapper must silently no-op when the feature is off.
+func TestScheduleFlushIfEnabled_NoOp_WhenNil(t *testing.T) {
+	a := &UdpAC{expirySched: nil}
+	// Just verifying no panic.
+	a.scheduleFlushIfEnabled("192.0.2.1", "192.0.2.2", 443, FlowProtoTCP, time.Now().Add(60*time.Second))
+}
+
+// TestScheduleFlushIfEnabled_BuildsCorrectFlowKey fences the
+// FlowKey construction path for each protocol the dispatch table
+// in msghandler.go hits (TCP, UDP, ICMP, Any) by routing each call
+// through a recording flusher and inspecting the scheduled keys.
+func TestScheduleFlushIfEnabled_BuildsCorrectFlowKey(t *testing.T) {
+	cases := []struct {
+		name      string
+		srcIP     string
+		dstIP     string
+		dstPort   int
+		proto     FlowProto
+		wantPort  uint16
+		wantProto FlowProto
+	}{
+		{name: "tcp-443", srcIP: "192.0.2.10", dstIP: "192.0.2.20", dstPort: 443, proto: FlowProtoTCP, wantPort: 443, wantProto: FlowProtoTCP},
+		{name: "udp-53", srcIP: "10.0.0.5", dstIP: "10.0.0.6", dstPort: 53, proto: FlowProtoUDP, wantPort: 53, wantProto: FlowProtoUDP},
+		{name: "icmp-noport", srcIP: "192.0.2.1", dstIP: "192.0.2.2", dstPort: 0, proto: FlowProtoICMP, wantPort: 0, wantProto: FlowProtoICMP},
+		{name: "any-noport", srcIP: "203.0.113.5", dstIP: "203.0.113.6", dstPort: 0, proto: FlowProtoAny, wantPort: 0, wantProto: FlowProtoAny},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := newRecordingFlusher()
+			// Far-future deadline so the entry stays in the index for
+			// inspection (doesn't fire during the test).
+			sched := NewScheduler(rec, WithTickInterval(5*time.Millisecond), WithWheelSize(1000))
+			sched.Start()
+			defer shutdownOrFail(t, sched)
+
+			a := &UdpAC{expirySched: sched}
+			a.scheduleFlushIfEnabled(c.srcIP, c.dstIP, c.dstPort, c.proto, time.Now().Add(60*time.Second))
+
+			expected, err := MakeFlowKey(c.srcIP, c.dstIP, c.dstPort, c.proto)
+			if err != nil {
+				t.Fatalf("MakeFlowKey: %v", err)
+			}
+			shard := sched.shards[expected.shard()]
+			shard.mu.Lock()
+			entry, ok := shard.entries[expected]
+			shard.mu.Unlock()
+			if !ok {
+				t.Fatalf("expected entry for FlowKey %+v not found in shard index", expected)
+			}
+			if entry.FlowKey.DstPort != c.wantPort {
+				t.Errorf("DstPort: got %d want %d", entry.FlowKey.DstPort, c.wantPort)
+			}
+			if entry.FlowKey.Protocol != c.wantProto {
+				t.Errorf("Protocol: got %s want %s", entry.FlowKey.Protocol, c.wantProto)
+			}
+		})
+	}
+}
+
+// TestScheduleFlushIfEnabled_RejectsMalformedFlowKey fences the
+// graceful-skip path: a bogus IP (or 0.0.0.0 wildcard) must not
+// trip the scheduler — kernel state was already written by the
+// caller; this is best-effort defense-in-depth.
+func TestScheduleFlushIfEnabled_RejectsMalformedFlowKey(t *testing.T) {
+	rec := newRecordingFlusher()
+	sched := NewScheduler(rec, WithTickInterval(5*time.Millisecond), WithWheelSize(1000))
+	sched.Start()
+	defer shutdownOrFail(t, sched)
+
+	a := &UdpAC{expirySched: sched}
+	// Malformed source IP — MakeFlowKey rejects.
+	a.scheduleFlushIfEnabled("not-an-ip", "192.0.2.2", 443, FlowProtoTCP, time.Now().Add(60*time.Second))
+	// Unspecified IP — MakeFlowKey rejects (wildcard fence).
+	a.scheduleFlushIfEnabled("0.0.0.0", "192.0.2.2", 443, FlowProtoTCP, time.Now().Add(60*time.Second))
+
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("expected zero entries (malformed inputs rejected at FlowKey boundary); got %d", got)
+	}
+}
+
+// TestNewFlusherForFilterMode_UnsupportedMode fences the
+// fail-loud behavior on an unrecognized FilterMode value. A future
+// enum addition (FilterMode=2) that forgets to wire a flusher must
+// not silently fall through to a nil flusher; the AC's Start() must
+// fail loud at boot rather than schedule no-op flushes forever
+func TestNewFlusherForFilterMode_UnsupportedMode(t *testing.T) {
+	for _, mode := range []int{2, 3, 99, -1} {
+		t.Run(strconv.Itoa(mode), func(t *testing.T) {
+			f, err := newFlusherForFilterMode(mode)
+			if err == nil {
+				t.Errorf("FilterMode=%d: expected error, got nil (flusher=%T)", mode, f)
+			}
+			if f != nil {
+				t.Errorf("FilterMode=%d: expected nil flusher, got %T", mode, f)
+			}
+		})
 	}
 }

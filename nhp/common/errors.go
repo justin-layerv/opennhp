@@ -217,6 +217,15 @@ var (
 	// regression — but a permanent firewall hole is the worst possible
 	// outcome of such a regression, so we double-fence here. See #1942.
 	ErrACInvalidOpenTime = newError("53009", "ac invalid openTime (must be > 0)")
+	// ErrACSchedulerBreakerOpen — the L3 flush-on-expiry scheduler's
+	// circuit breaker is open: too many flush errors within the
+	// configured window. HandleAccessControl fails closed at admission
+	// rather than admit a session that the AC cannot guarantee it can
+	// later tear down. Distinct from ErrACInvalidOpenTime so an oncall
+	// triaging an admission denial gets the actionable signal (check
+	// scheduler health / recent flusher errors / kernel state) instead
+	// of being misled toward an opnTime validation issue.
+	ErrACSchedulerBreakerOpen = newError("53010", "ac L3 flush scheduler breaker open (fail-closed admission)")
 
 	// api
 	ErrHttpRequestFailed           = newError("54001", "http request failed")

@@ -1,10 +1,12 @@
 package ac
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	toml "github.com/pelletier/go-toml/v2"
 
@@ -288,3 +290,285 @@ func TestLoadPeers_MalformedTOML(t *testing.T) {
 // updateServerPeers which requires a fully initialized device (a.device).
 // The fail-fast error handling is covered by TestLoadPeers_MalformedTOML
 // and TestLoadPeers_MissingFile_OK.
+
+// TestL3FlushDryRunSafety_FirstLoad_ForcesDryRun fences the boot-time
+// safety branch in updateBaseConfig's `a.config == nil` (first-load)
+// path. A fresh boot that already has EnableL3FlushOnExpiry=true with
+// L3FlushDryRun=false (the most-dangerous case the safety exists for)
+// must land in dry-run mode regardless of the TOML setting; the
+// operator has to reload with the same explicit false to enter
+// real-flush mode.
+//
+// Regression fence for cr task #48 first-load gap (the previous
+// implementation only guarded the reload path).
+func TestL3FlushDryRunSafety_FirstLoad_ForcesDryRun(t *testing.T) {
+	dir := setupTestDir(t)
+	ac := setupTestAC(t, dir)
+	conf := Config{
+		EnableL3FlushOnExpiry: true,
+		L3FlushDryRun:         false, // explicitly unsafe — should be overridden
+	}
+	if err := ac.updateBaseConfig(conf); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ac.config.L3FlushDryRun {
+		t.Errorf("first-load safety should have forced L3FlushDryRun=true; got false")
+	}
+	if !ac.config.EnableL3FlushOnExpiry {
+		t.Errorf("EnableL3FlushOnExpiry should still be true; got false")
+	}
+}
+
+// TestL3FlushDryRunSafety_FirstLoad_RespectsExplicitDryRun fences that
+// the safety doesn't change L3FlushDryRun when it's already true — the
+// safety only forces dry-run ON, never back off.
+func TestL3FlushDryRunSafety_FirstLoad_RespectsExplicitDryRun(t *testing.T) {
+	dir := setupTestDir(t)
+	ac := setupTestAC(t, dir)
+	conf := Config{
+		EnableL3FlushOnExpiry: true,
+		L3FlushDryRun:         true,
+	}
+	if err := ac.updateBaseConfig(conf); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ac.config.L3FlushDryRun {
+		t.Errorf("L3FlushDryRun should remain true; got false")
+	}
+}
+
+// TestL3FlushDryRunSafety_Reload_ForcesDryRunOnFalseToTrueEdge fences
+// the reload-path safety: enabling the feature on a config that
+// previously had it disabled forces dry-run regardless of the TOML's
+// L3FlushDryRun setting.
+//
+// Regression fence for cr task #48 — the original implementation
+// reassigned a.config.EnableL3FlushOnExpiry before the safety check,
+// making the inner branch dead code.
+func TestL3FlushDryRunSafety_Reload_ForcesDryRunOnFalseToTrueEdge(t *testing.T) {
+	dir := setupTestDir(t)
+	ac := setupTestAC(t, dir)
+	// First load: feature disabled.
+	if err := ac.updateBaseConfig(Config{EnableL3FlushOnExpiry: false}); err != nil {
+		t.Fatalf("first load: unexpected error: %v", err)
+	}
+	if ac.config.EnableL3FlushOnExpiry {
+		t.Fatalf("first load: expected EnableL3FlushOnExpiry=false; got true")
+	}
+	// Second load: flip enable=true with dry-run=false. Safety must
+	// force dry-run=true.
+	if err := ac.updateBaseConfig(Config{EnableL3FlushOnExpiry: true, L3FlushDryRun: false}); err != nil {
+		t.Fatalf("reload: unexpected error: %v", err)
+	}
+	if !ac.config.EnableL3FlushOnExpiry {
+		t.Errorf("EnableL3FlushOnExpiry should be true after reload; got false")
+	}
+	if !ac.config.L3FlushDryRun {
+		t.Errorf("reload safety should have forced L3FlushDryRun=true on false→true edge; got false")
+	}
+}
+
+// TestL3FlushDryRunSafety_Reload_RespectsExplicitDryRunAfterEnabled
+// fences the two-reload UX: after the first reload (which forces
+// dry-run regardless), the second reload with the same explicit
+// L3FlushDryRun=false should be honored — the safety only fires once
+// per false→true enable edge.
+func TestL3FlushDryRunSafety_Reload_RespectsExplicitDryRunAfterEnabled(t *testing.T) {
+	dir := setupTestDir(t)
+	ac := setupTestAC(t, dir)
+	// First load: feature already enabled (first-load safety forces dry-run).
+	if err := ac.updateBaseConfig(Config{EnableL3FlushOnExpiry: true, L3FlushDryRun: false}); err != nil {
+		t.Fatalf("first load: unexpected error: %v", err)
+	}
+	if !ac.config.L3FlushDryRun {
+		t.Fatalf("first load: expected L3FlushDryRun=true (forced); got false")
+	}
+	// Second reload: same setting. prevEnabled is now true, so the
+	// reload-path safety does not fire — explicit false is honored.
+	if err := ac.updateBaseConfig(Config{EnableL3FlushOnExpiry: true, L3FlushDryRun: false}); err != nil {
+		t.Fatalf("second load: unexpected error: %v", err)
+	}
+	if ac.config.L3FlushDryRun {
+		t.Errorf("second reload should honor explicit L3FlushDryRun=false; got true")
+	}
+}
+
+// TestL3FlushConfigReload_PropagatesToLiveScheduler fences the
+// SetDryRun / SetBreakerParams propagation path on config reload:
+// an operator who flips L3FlushDryRun in config.toml should see
+// the live scheduler honor the new value WITHOUT requiring an AC
+// restart
+func TestL3FlushConfigReload_PropagatesToLiveScheduler(t *testing.T) {
+	dir := setupTestDir(t)
+	ac := setupTestAC(t, dir)
+	// Attach a live scheduler with known initial params.
+	sched := NewScheduler(&NoOpFlusher{},
+		WithDryRun(true),
+		WithBreakerThreshold(10),
+		WithBreakerWindow(60*time.Second),
+	)
+	sched.Start()
+	defer func() { _ = sched.Shutdown(context.Background()) }()
+	ac.expirySched = sched
+
+	// First-load: feature enabled, dry-run=true. Sets a.config.
+	if err := ac.updateBaseConfig(Config{
+		EnableL3FlushOnExpiry: true,
+		L3FlushDryRun:         true,
+		L3FlushErrorThreshold: 10,
+		L3FlushErrorWindowSec: 60,
+	}); err != nil {
+		t.Fatalf("first load: %v", err)
+	}
+
+	// Reload with dry-run=false. Reload-path safety does NOT fire
+	// because prevEnabled=true (already enabled). New value must
+	// propagate to the live scheduler atomically.
+	if err := ac.updateBaseConfig(Config{
+		EnableL3FlushOnExpiry: true,
+		L3FlushDryRun:         false,
+		L3FlushErrorThreshold: 25,
+		L3FlushErrorWindowSec: 120,
+	}); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if sched.dryRun.Load() {
+		t.Errorf("scheduler.dryRun should be false after reload propagation; got true")
+	}
+	// Threshold + window are written under breakerErrMu; read the
+	// same way to avoid a race-detector hit.
+	sched.breakerErrMu.Lock()
+	gotThreshold := sched.breakerThreshold
+	gotWindow := sched.breakerWindow
+	sched.breakerErrMu.Unlock()
+	if gotThreshold != 25 {
+		t.Errorf("breakerThreshold: got %d want 25", gotThreshold)
+	}
+	if gotWindow != 120*time.Second {
+		t.Errorf("breakerWindow: got %s want 120s", gotWindow)
+	}
+}
+
+// TestL3FlushConfigReload_ClampsThresholdToRing fences the
+// clamp behavior when an operator's new threshold outgrows the
+// breaker ring sized at scheduler construction. The ring at
+// construction is max(default, initialThreshold); bumping past
+// that on reload would otherwise store a threshold the breaker
+// can never reach. The clamp turns the operator footgun
+// ("stored but unprotectable") into a loud Warning + the
+// largest-still-protectable value.
+func TestL3FlushConfigReload_ClampsThresholdToRing(t *testing.T) {
+	dir := setupTestDir(t)
+	ac := setupTestAC(t, dir)
+	// Construct a tiny ring (default is 128; with a small initial
+	// threshold the ring sizes to the default).
+	sched := NewScheduler(&NoOpFlusher{}, WithBreakerThreshold(10))
+	sched.Start()
+	defer func() { _ = sched.Shutdown(context.Background()) }()
+	ac.expirySched = sched
+
+	if got := sched.BreakerRingSize(); got != 128 {
+		t.Fatalf("setup: expected ring size 128; got %d", got)
+	}
+	// First load.
+	if err := ac.updateBaseConfig(Config{
+		EnableL3FlushOnExpiry: true,
+		L3FlushDryRun:         true,
+		L3FlushErrorThreshold: 10,
+		L3FlushErrorWindowSec: 60,
+	}); err != nil {
+		t.Fatalf("first load: %v", err)
+	}
+	// Reload with threshold > ring. SetBreakerParams clamps to
+	// the ring size so the breaker stays protectable.
+	if err := ac.updateBaseConfig(Config{
+		EnableL3FlushOnExpiry: true,
+		L3FlushDryRun:         true,
+		L3FlushErrorThreshold: 500, // > ring size of 128
+		L3FlushErrorWindowSec: 60,
+	}); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	sched.breakerErrMu.Lock()
+	gotThreshold := sched.breakerThreshold
+	sched.breakerErrMu.Unlock()
+	if gotThreshold != 128 {
+		t.Errorf("breakerThreshold should be clamped to ring size 128; got %d", gotThreshold)
+	}
+}
+
+// TestL3FlushFirstLoad_NormalizesBreakerTunables fences the critical
+// fix from cr round 5: a first-load with EnableL3FlushOnExpiry=true
+// and L3FlushErrorThreshold omitted (TOML zero value) must NOT land
+// breakerThreshold=0 — `count >= 0` would be true on the first
+// flush error and the breaker would open instantly, refusing every
+// NHP-AOP. Both threshold AND window must be normalized via
+// intOrDefault on first-load (mirror of the reload-path behavior).
+func TestL3FlushFirstLoad_NormalizesBreakerTunables(t *testing.T) {
+	dir := setupTestDir(t)
+	ac := setupTestAC(t, dir)
+	// First-load with breaker tunables OMITTED (TOML zero values).
+	if err := ac.updateBaseConfig(Config{
+		EnableL3FlushOnExpiry: true,
+		L3FlushDryRun:         true,
+		// L3FlushErrorThreshold + L3FlushErrorWindowSec left at zero.
+	}); err != nil {
+		t.Fatalf("first load: %v", err)
+	}
+	if ac.config.L3FlushErrorThreshold != DefaultL3FlushErrorThreshold {
+		t.Errorf("first-load L3FlushErrorThreshold should normalize to default %d; got %d",
+			DefaultL3FlushErrorThreshold, ac.config.L3FlushErrorThreshold)
+	}
+	if ac.config.L3FlushErrorWindowSec != DefaultL3FlushErrorWindowSec {
+		t.Errorf("first-load L3FlushErrorWindowSec should normalize to default %d; got %d",
+			DefaultL3FlushErrorWindowSec, ac.config.L3FlushErrorWindowSec)
+	}
+}
+
+// TestL3FlushFirstLoad_RespectsExplicitBreakerTunables fences that
+// the first-load normalization doesn't clobber operator-supplied
+// values — only zero / negative TOML inputs are replaced.
+func TestL3FlushFirstLoad_RespectsExplicitBreakerTunables(t *testing.T) {
+	dir := setupTestDir(t)
+	ac := setupTestAC(t, dir)
+	if err := ac.updateBaseConfig(Config{
+		EnableL3FlushOnExpiry: true,
+		L3FlushDryRun:         true,
+		L3FlushErrorThreshold: 99,
+		L3FlushErrorWindowSec: 42,
+	}); err != nil {
+		t.Fatalf("first load: %v", err)
+	}
+	if ac.config.L3FlushErrorThreshold != 99 {
+		t.Errorf("explicit L3FlushErrorThreshold=99 should be preserved; got %d", ac.config.L3FlushErrorThreshold)
+	}
+	if ac.config.L3FlushErrorWindowSec != 42 {
+		t.Errorf("explicit L3FlushErrorWindowSec=42 should be preserved; got %d", ac.config.L3FlushErrorWindowSec)
+	}
+}
+
+// TestIntOrDefault_NegativeValueUsesDefault fences the cr round 3
+// safety: a typo'd negative TOML threshold/window must NOT silently
+// disappear into the default — intOrDefault logs a Warning and
+// uses the default. This test covers the negative path that
+// cr round 8 finding 5 noted was unreached by existing tests.
+func TestIntOrDefault_NegativeValueUsesDefault(t *testing.T) {
+	cases := []struct {
+		name string
+		v    int
+		def  int
+		want int
+	}{
+		{"positive-passthrough", 42, 99, 42},
+		{"zero-uses-default", 0, 99, 99},
+		{"negative-uses-default", -1, 99, 99},
+		{"negative-large-uses-default", -1000, 99, 99},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := intOrDefault(c.v, c.def); got != c.want {
+				t.Errorf("intOrDefault(%d, %d): got %d want %d", c.v, c.def, got, c.want)
+			}
+		})
+	}
+}

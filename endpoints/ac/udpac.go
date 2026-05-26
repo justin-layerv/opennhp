@@ -1,6 +1,7 @@
 package ac
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -83,6 +84,43 @@ type UdpAC struct {
 	// dnsRateLimiter prevents reconnection storms when DNS flaps rapidly.
 	// See dns_rate_limiter.go for details.
 	dnsRateLimiter *DNSChangeRateLimiter
+
+	// expirySched is the L3 flush-on-expiry scheduler. nil when
+	// Config.EnableL3FlushOnExpiry is false — call-sites guard with
+	// `if a.expirySched != nil` before Schedule/Cancel. Constructed
+	// in Start() per FilterMode (ConntrackFlusher for IPTABLES,
+	// BpfFlusher for EBPFXDP); stopped in Stop() via Shutdown.
+	// See expiry_scheduler.go for the wheel design + the
+	// fail-closed-at-admission contract IsBreakerOpen feeds.
+	expirySched *Scheduler
+
+	// enumerateFn is the boot-enumeration dispatch hook. nil means
+	// "use the platform default" (enumerateKernelAllowRules, build-
+	// tagged per OS). Tests set this directly to inject success/
+	// failure paths without needing kernel-state manipulation, so
+	// the synchronous-fail-closed-boot contract can be fenced on
+	// every platform CI runs on — not just non-Linux (cr round-2
+	// silent-skip self-review).
+	enumerateFn func() (int, error)
+
+	// bpfFlusherSkippedCount is the BpfFlusher's non-IPv4 skip
+	// counter reader, set when the scheduler is constructed in
+	// EBPFXDP mode on Linux. nil otherwise. The cross-platform
+	// indirection (rather than a typed *BpfFlusher field) lets the
+	// metrics publisher read the counter from registration.go
+	// without taking a build-tag dependency
+	bpfFlusherSkippedCount func() uint64
+}
+
+// BpfFlusherSkippedCount returns the BpfFlusher's non-IPv4 skip
+// counter and ok=true when the scheduler is wired in EBPFXDP mode;
+// 0, false otherwise. Cross-platform via the func-field
+// indirection so registration.go's gauge stays build-tag-free.
+func (a *UdpAC) BpfFlusherSkippedCount() (uint64, bool) {
+	if a.bpfFlusherSkippedCount == nil {
+		return 0, false
+	}
+	return a.bpfFlusherSkippedCount(), true
 }
 
 type UdpConn struct {
@@ -179,6 +217,14 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	}
 
 	if a.config.FilterMode == FilterMode_EBPFXDP {
+		// Long-lived infrastructure routes (1-year TTL) for the AC's
+		// own server peers. INTENTIONALLY not wired into the L3 flush
+		// scheduler — these aren't session-tied; the scheduler's scope
+		// is per-session NHP-AOP entries only. An operator who removes
+		// a server from config + restarts AC will leave the stale
+		// kernel rule until natural 1-year TTL expiry; the iptables
+		// path makes the same trade-off by skipping tempset in boot
+		// enumeration
 		for _, server := range a.config.Servers {
 			ebpfHashStr := ebpf.EbpfRuleParams{
 				SrcIP: server.Ip,
@@ -190,6 +236,66 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 				log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 				continue
 			}
+		}
+	}
+
+	// Construct the L3 flush-on-expiry scheduler if the feature is
+	// enabled. Per-mode flusher selection mirrors the FilterMode
+	// dispatch above. Construction failures are fatal — running
+	// with EnableL3FlushOnExpiry=true but no flusher would silently
+	// late-fire forever (worst-of-both-worlds for an L3-only
+	// enforcement contract).
+	if a.config.EnableL3FlushOnExpiry {
+		flusher, ferr := newFlusherForFilterMode(a.config.FilterMode)
+		if ferr != nil {
+			return ferr
+		}
+		// Type-assert AFTER the err check: a future flusher constructor that returns
+		// (typed-nil, err) would otherwise silently bind a method
+		// on a nil receiver to a.bpfFlusherSkippedCount.
+		// Type-asserting through the FlowFlusher interface lets the
+		// metrics-publisher path stay cross-platform — the
+		// non-Linux stub returns 0 from SkippedCount.
+		if bf, ok := flusher.(*BpfFlusher); ok && bf != nil {
+			a.bpfFlusherSkippedCount = bf.SkippedCount
+		}
+		a.expirySched = NewScheduler(flusher,
+			WithDryRun(a.config.L3FlushDryRun),
+			WithBreakerThreshold(a.config.L3FlushErrorThreshold),
+			WithBreakerWindow(time.Duration(a.config.L3FlushErrorWindowSec)*time.Second),
+		)
+		a.expirySched.Start()
+		log.Info("[L3FlushSched] started: filterMode=%d dryRun=%t breakerThresh=%d/%ds",
+			a.config.FilterMode, a.config.L3FlushDryRun,
+			a.config.L3FlushErrorThreshold, a.config.L3FlushErrorWindowSec)
+		// Synchronous boot-time enumeration: walk kernel allow-rules
+		// from a previous AC process and Schedule a flush for each
+		// at its remaining timeout. MUST complete before the AC
+		// begins accepting NHP-AOPs — otherwise an AC restart would
+		// leave existing kernel entries unmanaged by the scheduler
+		// and their flow-state would survive past session end. See
+		// expiry_enumerate.go for the fail-closed-on-error contract.
+		//
+		// If enumeration fails we must Shutdown the scheduler before
+		// returning — Start() already launched the tick + 64 worker
+		// goroutines; without explicit teardown they leak (and a
+		// caller that doesn't call Stop() on a failed Start() would
+		// leak permanently). Nil the pointer so the caller's
+		// post-Start cleanup is a no-op
+		if err = a.enumerateAndScheduleFlushes(); err != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if shutdownErr := a.expirySched.Shutdown(shutdownCtx); shutdownErr != nil {
+				log.Error("[L3FlushSched] cleanup shutdown after boot enum failure timed out: %v", shutdownErr)
+			}
+			// Safe to nil here (vs Stop()'s explicit don't-nil): we
+			// haven't called `a.running.Store(true)` yet, no readers
+			// are spawned, no in-flight HandleAccessControl can race
+			// the write. Inverse of the Stop()-path invariant (cr
+			// fence: round 11 minor — nil-write safety pinned).
+			a.expirySched = nil
+			a.bpfFlusherSkippedCount = nil
+			return fmt.Errorf("L3 flush boot enumeration: %w", err)
 		}
 	}
 
@@ -251,6 +357,26 @@ func (ac *UdpAC) Stop() {
 	if ac.dnsRateLimiter != nil {
 		ac.dnsRateLimiter.ResetAll()
 	}
+	// Drain the L3 flush scheduler before goroutine teardown so any
+	// pending flushes complete (or time out cleanly) before the
+	// process exits. 5s budget matches the worker-side flush
+	// context timeout in processEntry.
+	//
+	// Do NOT nil ac.expirySched here: in-flight HandleAccessControl
+	// goroutines tracked by ac.wg can still read the pointer (admission
+	// gate + scheduleFlushIfEnabled). Scheduler.Schedule/Cancel already
+	// no-op once Shutdown flips started=false (see expiry_scheduler.go),
+	// so a stale pointer is safe; a write race against `ac.expirySched
+	// = nil` before ac.wg.Wait() is not
+	if ac.expirySched != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// defer-cancel right after WithTimeout — catches a panic mid-Shutdown without leaking
+		// the context's internal goroutine.
+		defer cancel()
+		if err := ac.expirySched.Shutdown(shutdownCtx); err != nil {
+			log.Error("[L3FlushSched] shutdown drain timed out: %v", err)
+		}
+	}
 	ac.wg.Wait()
 	close(ac.sendMsgCh)
 	close(ac.signals.serverMapUpdated)
@@ -269,6 +395,63 @@ func (ac *UdpAC) Stop() {
 
 func (a *UdpAC) IsRunning() bool {
 	return a.running.Load()
+}
+
+// newFlusherForFilterMode selects the per-mode FlowFlusher impl
+// based on FilterMode. Extracted from Start() so the dispatch is
+// directly unit-testable — a future FilterMode addition that forgets
+// to wire a flusher here is caught by TestNewFlusherForFilterMode
+// rather than discovered at AC startup time
+func newFlusherForFilterMode(filterMode int) (FlowFlusher, error) {
+	switch filterMode {
+	case FilterMode_IPTABLES:
+		f, err := NewConntrackFlusher()
+		if err != nil {
+			return nil, fmt.Errorf("L3 flush enabled but ConntrackFlusher failed: %w", err)
+		}
+		return f, nil
+	case FilterMode_EBPFXDP:
+		f, err := NewBpfFlusher()
+		if err != nil {
+			return nil, fmt.Errorf("L3 flush enabled but BpfFlusher failed: %w", err)
+		}
+		return f, nil
+	default:
+		return nil, fmt.Errorf("L3 flush enabled but unsupported FilterMode %d", filterMode)
+	}
+}
+
+// scheduleFlushIfEnabled is the central call-site wrapper for the
+// L3 flush-on-expiry scheduler. It's a no-op when the feature is
+// disabled (a.expirySched == nil) so call sites in
+// HandleAccessControl can sprinkle Schedule calls without per-site
+// nil-checks. Returns silently on malformed FlowKey inputs — the
+// scheduler is best-effort defense-in-depth, NOT a correctness
+// gate; the kernel state has already been written by the caller.
+//
+// Wildcard ports (port == 0) and "any" protocol map to the FlowKey
+// shape the scheduler expects; the per-mode flusher dispatches
+// based on FlowKey.Protocol (BpfFlusher uses sdwhitelist for
+// FlowProtoAny, spp for tcp/udp, icmpwhitelist for icmp).
+func (a *UdpAC) scheduleFlushIfEnabled(srcIP, dstIP string, dstPort int, proto FlowProto, deadline time.Time) {
+	if a.expirySched == nil {
+		return
+	}
+	key, err := MakeFlowKey(srcIP, dstIP, dstPort, proto)
+	if err != nil {
+		// Don't ping the breaker on malformed input — the kernel
+		// state write already happened; this is purely
+		// scheduler-side bookkeeping. Surface as a metric so an
+		// upstream regression producing malformed IPs (or wildcards)
+		// is visible on dashboards
+		// Warning, not Debug — a malformed FlowKey reaching here is
+		// an upstream-regression signal, not routine noise
+		a.incrMetric(MetricL3FlushKeyMalformed)
+		log.Warning("[L3FlushSched] skipping schedule for malformed FlowKey src=%s dst=%s port=%d: %v",
+			srcIP, dstIP, dstPort, err)
+		return
+	}
+	a.expirySched.Schedule(key, deadline)
 }
 
 // incrMetric is the centralized increment site for AC counters,

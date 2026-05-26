@@ -22,6 +22,31 @@ const (
 	PASS_PRE_ACCESS_IP
 )
 
+// flushSafetyMargin extends each L3 flush deadline past the kernel
+// ipset / BPF allow-rule's natural expiry so the scheduler always
+// sweeps an already-expired entry. Without this margin, the
+// conntrack-delete could fire while the ipset entry is still live —
+// a new SYN from the allow-listed source in that window would create
+// a fresh ESTABLISHED conntrack that survives past intended session
+// end
+//
+// 50ms is comfortably above per-call kernel-write latency (~µs to
+// low-ms in iptables mode, similar in eBPF) and well under the
+// scheduler's 10ms tick resolution scaled to anything operators care
+// about. Tuning down would require benchmarking ipset eviction
+// latency under load.
+const flushSafetyMargin = 50 * time.Millisecond
+
+// computeFlushDeadline returns `now + openTimeSec + flushSafetyMargin`
+// — the single source of truth for the L3 flush deadline anchoring.
+// Centralizing this here keeps the four call sites in lockstep so a
+// future safety-margin retune (post-#2165 netlink latency, etc.)
+// is a one-line change rather than a coordinated edit across
+// HandleAccessControl + tcp/udpTempAccessHandler + ICMP branch
+func computeFlushDeadline(openTimeSec int) time.Time {
+	return time.Now().Add(time.Duration(openTimeSec)*time.Second + flushSafetyMargin)
+}
+
 // applyDefaultIpSubstitution rewrites empty / SentinelLocalIP destination
 // IPs in `dstAddrs` to the AC's `defaultIp` (= LOCAL_IP at boot).
 // Two production callers depend on this: QURL resources (sentinel
@@ -185,6 +210,29 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 	} else {
 		artMsg = artMsgIn
 	}
+	// L3 flush admission gate: when the scheduler's circuit breaker
+	// is open, the AC is no longer reliably flushing kernel flow
+	// state at session end. Under the L3-only enforcement contract
+	// (post-L7-removal) that's a security boundary failure — refuse
+	// new NHP-AOPs rather than admit a session whose late-flush
+	// would represent unauthorized data flow past expiry. The gate
+	// is a no-op when the scheduler isn't constructed (feature off).
+	//
+	// Distinct error code (ErrACSchedulerBreakerOpen, 53010) so an
+	// oncall reading traces gets "scheduler breaker open" instead of
+	// the misleading "invalid open time"
+	// Non-atomic read is safe today: Stop() intentionally does NOT
+	// nil a.expirySched (see udpac.go:371-376 — the field is left
+	// in place so an in-flight HandleAccessControl can still
+	// observe the IsBreakerOpen state during graceful drain). If a
+	// future refactor adds a clear-on-Shutdown, swap to an
+	// atomic.Pointer load here
+	sched := a.expirySched
+	if sched != nil && sched.IsBreakerOpen() {
+		log.Error("[HandleAccessControl] L3 flush scheduler breaker OPEN — refusing new NHP-AOP (fail-closed admission)")
+		err = setArtMsgError(artMsg, common.ErrACSchedulerBreakerOpen)
+		return
+	}
 	// Defense-in-depth: refuse openTimeSec <= 0. ipset.Add (utils/iptables.go)
 	// passes the value verbatim as the ipset `timeout` argument, and the
 	// kernel ipset semantics treat `timeout 0` as PERMANENT. The /refresh
@@ -196,6 +244,32 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 		err = setArtMsgError(artMsg, common.ErrACInvalidOpenTime)
 		return
 	}
+	// Compute the flush deadline once per call so all per-tuple
+	// schedules anchor to the same wall-clock moment as the kernel
+	// state writes below. See scheduleFlushIfEnabled for the
+	// no-op-when-disabled wrapper.
+	//
+	// flushDeadline = now + openTimeSec + flushSafetyMargin so the
+	// kernel-side ipset/BPF entry has already naturally expired by
+	// the time the scheduler fires. Without this margin, the
+	// scheduler could conntrack-delete an entry whose ipset allow-
+	// rule is still live for a brief window — a new SYN from the
+	// allow-listed source in that window would create a fresh
+	// conntrack entry, become ESTABLISHED, and survive past the
+	// intended session end via the very ESTABLISHED bypass this
+	// scheduler exists to defeat
+	//
+	// Anchoring discipline: this path
+	// anchors flushDeadline AND the kernel-write TTL at admission
+	// time (HandleAccessControl). The tcp/udp temp-access handlers
+	// anchor BOTH at handler-spawn time (which is the kernel-write
+	// moment for that path; the handler runs async from admission).
+	// Both anchorings are self-consistent — kernel and schedule
+	// agree within their own path. A future tightener of
+	// flushSafetyMargin must hold this self-consistency on BOTH
+	// paths: optimizing one anchor without the other silently breaks
+	// the other path's race-window protection.
+	flushDeadline := computeFlushDeadline(openTimeSec)
 	// process ac operation
 	tempOpenTimeSec := TempPortOpenTime
 	// CloseWindowOpenTimeSec doubles as the "close everything" signal —
@@ -280,6 +354,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 							err = setArtMsgError(artMsg, common.ErrACIPSetOperationFailed)
 							return
 						}
+						a.scheduleFlushIfEnabled(srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoTCP, flushDeadline)
 					//ebpf knock
 					case FilterMode_EBPFXDP:
 						if len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "any" {
@@ -292,6 +367,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 								log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 								return
 							}
+							a.scheduleFlushIfEnabled(srcAddr.Ip, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
 						}
 						if dstAddr.Protocol == "tcp" {
 							ebpfHashStr := ebpf.EbpfRuleParams{
@@ -305,6 +381,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 								log.Error("[EbpfRuleAdd] add ebpf tcp failed src: %s dst: %s, protocol: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
 								return
 							}
+							a.scheduleFlushIfEnabled(srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoTCP, flushDeadline)
 						}
 					default:
 						log.Error("[HandleAccessControl] unsupported FilterMode: %d (expected 0=IPTABLES or 1=EBPFXDP)", a.config.FilterMode)
@@ -327,6 +404,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 							err = setArtMsgError(artMsg, common.ErrACIPSetOperationFailed)
 							return
 						}
+						a.scheduleFlushIfEnabled(srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
 					case FilterMode_EBPFXDP:
 						if len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "any" {
 							ebpfHashStr := ebpf.EbpfRuleParams{
@@ -338,6 +416,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 								log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 								return
 							}
+							a.scheduleFlushIfEnabled(srcAddr.Ip, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
 						}
 						if dstAddr.Protocol == "udp" {
 							ebpfHashStr := ebpf.EbpfRuleParams{
@@ -352,6 +431,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 								log.Error("[EbpfRuleAdd] add ebpf udp failed src: %s dst: %s, protocol: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
 								return
 							}
+							a.scheduleFlushIfEnabled(srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
 						}
 					default:
 						log.Error("[HandleAccessControl] unsupported FilterMode: %d (expected 0=IPTABLES or 1=EBPFXDP)", a.config.FilterMode)
@@ -371,6 +451,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 								err = setArtMsgError(artMsg, common.ErrACIPSetOperationFailed)
 								return
 							}
+							a.scheduleFlushIfEnabled(srcAddr.Ip, dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
 						case FilterMode_EBPFXDP:
 							ebpfHashStr := ebpf.EbpfRuleParams{
 								SrcIP: srcAddr.Ip,
@@ -381,6 +462,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 								log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 								return
 							}
+							a.scheduleFlushIfEnabled(srcAddr.Ip, dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
 						default:
 							log.Error("[HandleAccessControl] unsupported FilterMode: %d (expected 0=IPTABLES or 1=EBPFXDP)", a.config.FilterMode)
 							return
@@ -802,6 +884,11 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 			return
 		}
 
+		// Anchor flushDeadline at the moment the temp handler is about
+		// to write kernel state — the kernel timer starts NOW, not at
+		// HandleAccessControl's earlier admission anchor. Margin
+		// rationale: see flushSafetyMargin's comment.
+		flushDeadline := computeFlushDeadline(openTimeSec)
 		for _, dstAddr := range dstAddrs {
 			ipHashStr := fmt.Sprintf("%s,%d,%s", srcAddrIp, dstAddr.Port, dstAddr.Ip)
 			if dstAddr.Port == 0 {
@@ -814,6 +901,10 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 					log.Error("[tcpTempAccessHandler] add ipset %s error: %v", ipHashStr, err)
 					return
 				}
+				// Wildcard port (Port==0) maps to the FlowKey port=0
+				// no-port-filter form; ConntrackFlusher skips --dport
+				// in that case, which is the right partial-tuple shape.
+				a.scheduleFlushIfEnabled(srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoTCP, flushDeadline)
 			case FilterMode_EBPFXDP:
 				ebpfHashStr := ebpf.EbpfRuleParams{
 					SrcIP: srcAddrIp,
@@ -824,8 +915,21 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 					log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 					return
 				}
+				// mapType=2 is the (src,dst) sdwhitelist with no port —
+				// FlowProtoAny matches that shape. Intentional
+				// asymmetry vs the iptables branch above
+				// (FlowProtoTCP + dstAddr.Port): the eBPF temp-
+				// access map shape is proto-agnostic by design,
+				// while ipset uses `hash:ip,port,ip`. The scheduler
+				// must mirror whichever kernel shape was written —
+				// schedule-shape MUST match write-shape or the
+				// flusher's lookup misses and the entry survives
+				// past timeout. A future change that swaps the
+				// eBPF mapType here MUST also update the FlowKey
+				// shape to match.
+				a.scheduleFlushIfEnabled(srcAddrIp, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
 			default:
-				log.Error("[HandleAccessControl] unsupported FilterMode: %d (expected 0=IPTABLES or 1=EBPFXDP)", a.config.FilterMode)
+				log.Error("[tcpTempAccessHandler] unsupported FilterMode: %d (expected 0=IPTABLES or 1=EBPFXDP)", a.config.FilterMode)
 				return
 			}
 		}
@@ -923,6 +1027,11 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 			return
 		}
 
+		// Anchor flushDeadline at the moment the temp handler is about
+		// to write kernel state — the kernel timer starts NOW, not at
+		// HandleAccessControl's earlier admission anchor. Margin
+		// rationale: see flushSafetyMargin's comment.
+		flushDeadline := computeFlushDeadline(openTimeSec)
 		for _, dstAddr := range dstAddrs {
 			if len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "udp" || dstAddr.Protocol == "any" {
 				ipHashStr := fmt.Sprintf("%s,udp:%d,%s", srcAddrIp, dstAddr.Port, dstAddr.Ip)
@@ -936,6 +1045,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 						log.Error("[udpTempAccessHandler] add ipset %s error: %v", ipHashStr, err)
 						return
 					}
+					a.scheduleFlushIfEnabled(srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
 				case FilterMode_EBPFXDP:
 					if len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "any" {
 						ebpfHashStr := ebpf.EbpfRuleParams{
@@ -947,6 +1057,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 							log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 							return
 						}
+						a.scheduleFlushIfEnabled(srcAddrIp, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
 					}
 					if dstAddr.Protocol == "udp" {
 						ebpfHashStr := ebpf.EbpfRuleParams{
@@ -961,15 +1072,23 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 							log.Error("[EbpfRuleAdd] add ebpf udp failed src: %s dst: %s, protocol: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
 							return
 						}
+						a.scheduleFlushIfEnabled(srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
 					}
 				default:
-					log.Error("[HandleAccessControl] unsupported FilterMode: %d (expected 0=IPTABLES or 1=EBPFXDP)", a.config.FilterMode)
+					log.Error("[udpTempAccessHandler] unsupported FilterMode: %d (expected 0=IPTABLES or 1=EBPFXDP)", a.config.FilterMode)
 					return
 				}
 			}
 			// for ping
 			if dstAddr.Port == 0 && (len(dstAddr.Protocol) == 0 || dstAddr.Protocol == "any") {
 
+				// ICMP source IP intentionally uses remoteAddr.IP.String()
+				// (the *packet's* source) rather than srcAddrIp (the
+				// AOL-declared agent address). Echo replies have to flow
+				// back to whatever address the kernel saw on the wire,
+				// which under NAT differs from the agent-side declared
+				// address. TCP/UDP branches use srcAddrIp because those
+				// are session-tied to the AOL declaration
 				switch a.config.FilterMode {
 				case FilterMode_IPTABLES:
 					// ICMP rules are supplementary (ping diagnostics) - failure is non-fatal
@@ -978,6 +1097,8 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 					_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
 					if err != nil {
 						log.Warning("[udpTempAccessHandler] failed to add ICMP rule %s: %v", ipHashStr, err)
+					} else {
+						a.scheduleFlushIfEnabled(remoteAddr.IP.String(), dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
 					}
 				case FilterMode_EBPFXDP:
 					ebpfHashStr := ebpf.EbpfRuleParams{
@@ -989,8 +1110,9 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 						log.Error("[EbpfRuleAdd] add ebpf icmp src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
 						return
 					}
+					a.scheduleFlushIfEnabled(remoteAddr.IP.String(), dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
 				default:
-					log.Error("[HandleAccessControl] unsupported FilterMode: %d (expected 0=IPTABLES or 1=EBPFXDP)", a.config.FilterMode)
+					log.Error("[udpTempAccessHandler] unsupported FilterMode: %d (expected 0=IPTABLES or 1=EBPFXDP)", a.config.FilterMode)
 					return
 				}
 			}

@@ -328,6 +328,44 @@ const (
 	// reachable panic site somewhere on the UDP path that needs a
 	// root-cause fix, not a tuning change.
 	MetricUDPHandlerPanic = "UDPHandlerPanic"
+
+	// MetricL3FlushKeyMalformed is incremented when a
+	// scheduleFlushIfEnabled call site rejects its FlowKey
+	// inputs via MakeFlowKey. The kernel-state write upstream
+	// already happened; the schedule is lost for that flow.
+	// Non-zero means an upstream regression let a malformed IP
+	// (or wildcard) reach the call site — surface on dashboards
+	// rather than leaving it as a Debug log line
+	MetricL3FlushKeyMalformed = "L3FlushKeyMalformed"
+
+	// L3 flush scheduler gauges Published every 60s via RegisterGaugeFunc; reads
+	// are no-ops when the feature is off (UdpAC.expirySched nil).
+	// The 4+4-week rollout's "validate then drop dry-run" gate
+	// depends on these being visible in CloudWatch — without
+	// telemetry, the rollout sequence can't validate against
+	// anything.
+	//
+	//   - Entries        — current shard-index size (load)
+	//   - FlushTotal     — Flush calls run to a real outcome
+	//   - FlushErr       — non-canceled flusher failures (paging signal)
+	//   - FlushDryRun    — dry-run skip count (validates flag wiring)
+	//   - Deferred       — queue-full events seen
+	//   - Dropped        — bounded-backpressure drops (page-worthy)
+	//   - BucketMaxDepth — hot-bucket high-water mark
+	//   - BreakerOpen    — 0/1 — fail-closed gauge for admission
+	//   - BpfSkipped     — non-IPv4 keys hitting the IPv4-only BPF
+	//                      flusher (upstream-regression signal)
+	MetricL3FlushEntries               = "L3FlushEntries"
+	MetricL3FlushFlushTotal            = "L3FlushTotal"
+	MetricL3FlushFlushErr              = "L3FlushErr"
+	MetricL3FlushFlushDryRun           = "L3FlushDryRun"
+	MetricL3FlushDeferred              = "L3FlushDeferred"
+	MetricL3FlushDropped               = "L3FlushDropped"
+	MetricL3FlushBucketMaxDepth        = "L3FlushBucketMaxDepth"
+	MetricL3FlushBreakerOpen           = "L3FlushBreakerOpen"
+	MetricL3FlushBpfSkipped            = "L3FlushBpfSkipped"
+	MetricL3FlushScheduleRejected      = "L3FlushScheduleRejected"
+	MetricL3FlushScheduleAfterShutdown = "L3FlushScheduleAfterShutdown"
 )
 
 // Re-registration reason constants. These are the only values that
@@ -819,6 +857,23 @@ func (r *ACRegistration) Start() error {
 	r.metrics.RegisterGaugeFunc(MetricServersConnected, r.connectedServerCount)
 	r.metrics.RegisterGaugeFunc(MetricServersHealthy, r.healthyServerCount)
 
+	// Register L3 flush scheduler gauges so the rollout's
+	// "validate then drop dry-run" gate has visible telemetry
+	// Reads are
+	// no-ops when the scheduler isn't constructed (feature off);
+	// the closure handles the nil-receiver case gracefully.
+	r.metrics.RegisterGaugeFunc(MetricL3FlushEntries, r.l3FlushEntriesGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushFlushTotal, r.l3FlushFlushTotalGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushFlushErr, r.l3FlushFlushErrGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushFlushDryRun, r.l3FlushDryRunGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushDeferred, r.l3FlushDeferredGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushDropped, r.l3FlushDroppedGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushBucketMaxDepth, r.l3FlushBucketMaxDepthGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushBreakerOpen, r.l3FlushBreakerOpenGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushBpfSkipped, r.l3FlushBpfSkippedGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleRejected, r.l3FlushScheduleRejectedGauge)
+	r.metrics.RegisterGaugeFunc(MetricL3FlushScheduleAfterShutdown, r.l3FlushScheduleAfterShutdownGauge)
+
 	// Add to wait group BEFORE starting goroutines to prevent race with Stop()
 	r.wg.Add(1)
 	go r.registrationLoop()
@@ -936,6 +991,72 @@ func (r *ACRegistration) healthyServerCount() float64 {
 		if s.IsHealthy(healthWindow) {
 			count++
 		}
+	}
+	return float64(count)
+}
+
+// l3FlushSnapshot returns the scheduler's metrics snapshot or the
+// zero value if the feature is off (r.ac.expirySched nil). All
+// l3Flush*Gauge helpers read through this single accessor so the
+// nil-discipline lives in one place.
+func (r *ACRegistration) l3FlushSnapshot() FlushMetrics {
+	if r.ac == nil || r.ac.expirySched == nil {
+		return FlushMetrics{}
+	}
+	return r.ac.expirySched.Metrics()
+}
+
+func (r *ACRegistration) l3FlushEntriesGauge() float64 {
+	return float64(r.l3FlushSnapshot().Entries)
+}
+func (r *ACRegistration) l3FlushFlushTotalGauge() float64 {
+	return float64(r.l3FlushSnapshot().FlushTotal)
+}
+func (r *ACRegistration) l3FlushFlushErrGauge() float64 {
+	return float64(r.l3FlushSnapshot().FlushErr)
+}
+func (r *ACRegistration) l3FlushDryRunGauge() float64 {
+	return float64(r.l3FlushSnapshot().FlushDryRun)
+}
+func (r *ACRegistration) l3FlushDeferredGauge() float64 {
+	return float64(r.l3FlushSnapshot().FlushDeferred)
+}
+func (r *ACRegistration) l3FlushDroppedGauge() float64 {
+	return float64(r.l3FlushSnapshot().FlushDropped)
+}
+func (r *ACRegistration) l3FlushBucketMaxDepthGauge() float64 {
+	return float64(r.l3FlushSnapshot().BucketMaxDepth)
+}
+func (r *ACRegistration) l3FlushScheduleRejectedGauge() float64 {
+	return float64(r.l3FlushSnapshot().ScheduleRejected)
+}
+func (r *ACRegistration) l3FlushScheduleAfterShutdownGauge() float64 {
+	return float64(r.l3FlushSnapshot().ScheduleAfterShutdown)
+}
+
+// l3FlushBreakerOpenGauge emits 1.0 when the breaker is open
+// (admission failing closed) and 0.0 otherwise. A non-zero reading
+// is page-worthy under the L3-only contract — refused NHP-AOPs
+// translate to customer-visible auth failures.
+func (r *ACRegistration) l3FlushBreakerOpenGauge() float64 {
+	if r.l3FlushSnapshot().BreakerOpen {
+		return 1.0
+	}
+	return 0.0
+}
+
+// l3FlushBpfSkippedGauge reads the BpfFlusher's non-IPv4 skip
+// counter (when in EBPFXDP mode with BpfFlusher attached). A
+// non-zero reading signals an upstream regression scheduling v6
+// keys under EBPFXDP — see BpfFlusher.Flush godoc. Returns 0 when
+// the feature is off or the flusher isn't a BpfFlusher.
+func (r *ACRegistration) l3FlushBpfSkippedGauge() float64 {
+	if r.ac == nil {
+		return 0
+	}
+	count, ok := r.ac.BpfFlusherSkippedCount()
+	if !ok {
+		return 0
 	}
 	return float64(count)
 }

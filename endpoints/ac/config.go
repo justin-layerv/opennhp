@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"time"
 
 	toml "github.com/pelletier/go-toml/v2"
 
@@ -29,6 +30,15 @@ const (
 	FilterMode_EBPFXDP         // 1
 )
 
+const (
+	// DefaultL3FlushErrorThreshold and DefaultL3FlushErrorWindowSec
+	// are the default circuit-breaker parameters for the L3
+	// flush-on-expiry feature. Matches the const-block convention in
+	// registration.go.
+	DefaultL3FlushErrorThreshold = 10
+	DefaultL3FlushErrorWindowSec = 60
+)
+
 type Config struct {
 	PrivateKeyBase64    string          `json:"privateKey"` //nolint:gosec // G117: config struct, never JSON-marshaled — TOML input only
 	ACId                string          `json:"acId"`
@@ -40,6 +50,26 @@ type Config struct {
 	LogLevel            int             `json:"logLevel"`
 	DefaultCipherScheme int             `json:"defaultCipherScheme"`
 	FilterMode          int             `json:"filterMode"`
+
+	// L3 flush-on-expiry: actively flushes kernel flow state on
+	// ipset/BPF entry expiry so existing TCP connections terminate
+	// when sessions end. Defense-in-depth on top of L7 enforcement;
+	// design + mechanics in docs/design/SESSION_ENFORCEMENT_ARCHITECTURE.md.
+	EnableL3FlushOnExpiry bool `json:"enableL3FlushOnExpiry"`
+
+	// L3FlushDryRun gates the scheduler into log-only mode. Auto-
+	// defaulted to true when EnableL3FlushOnExpiry is true but
+	// L3FlushDryRun is unset — safer than letting an operator
+	// accidentally land in real-flush mode by enabling the feature
+	// without an explicit opt-out from dry-run.
+	L3FlushDryRun bool `json:"l3FlushDryRun"`
+
+	// L3FlushErrorThreshold / L3FlushErrorWindowSec — circuit
+	// breaker. Latches the scheduler off when error rate exceeds
+	// Threshold for Window-Sec consecutive seconds. Defaults from
+	// DefaultL3FlushErrorThreshold and DefaultL3FlushErrorWindowSec.
+	L3FlushErrorThreshold int `json:"l3FlushErrorThreshold"`
+	L3FlushErrorWindowSec int `json:"l3FlushErrorWindowSec"`
 
 	// ============================================================================
 	// Per-AC Server Assignment Configuration (Required)
@@ -264,6 +294,25 @@ func (a *UdpAC) updateBaseConfig(conf Config) (err error) {
 		// in-process or test caller must not be able to mutate
 		// a.config's slice out from under us.
 		conf.ServerPubKeyAllowlist = slices.Clone(conf.ServerPubKeyAllowlist)
+		// Symmetric to the reload-path safety: a fresh boot that already
+		// has the feature enabled with L3FlushDryRun unset/false lands
+		// directly in real-flush mode with no operator acknowledgement.
+		// Force dry-run on for the first boot and emit a loud warning so
+		// the operator must explicitly reload with the same setting to
+		// start real flushing
+		if conf.EnableL3FlushOnExpiry && !conf.L3FlushDryRun {
+			log.Warning("L3 flush-on-expiry enabled at boot with L3FlushDryRun unset/false; forcing dry-run for the first boot as safety. Reload config.toml with the same explicit L3FlushDryRun=false to acknowledge and start real-flush mode.")
+			conf.L3FlushDryRun = true
+		}
+		// Normalize breaker tunables in the first-load path. Without
+		// this, a TOML that omits L3FlushErrorThreshold lands with the
+		// Go zero value 0 and WithBreakerThreshold(0) makes
+		// `count >= 0` true on the first flush error — breaker opens
+		// instantly and UdpAC refuses every NHP-AOP. The reload-path
+		// already applies intOrDefault; this mirrors it for first-load
+		//
+		conf.L3FlushErrorThreshold = intOrDefault(conf.L3FlushErrorThreshold, DefaultL3FlushErrorThreshold)
+		conf.L3FlushErrorWindowSec = intOrDefault(conf.L3FlushErrorWindowSec, DefaultL3FlushErrorWindowSec)
 		a.serverPeerMutex.Lock()
 		a.config = &conf
 		a.serverPubKeyAllowlist = set
@@ -308,6 +357,84 @@ func (a *UdpAC) updateBaseConfig(conf Config) (err error) {
 	if a.config.DefaultCipherScheme != conf.DefaultCipherScheme {
 		log.Info("set default cipher scheme to %d", conf.DefaultCipherScheme)
 		a.config.DefaultCipherScheme = conf.DefaultCipherScheme
+	}
+
+	// L3 flush-on-expiry config. Logging on change matches the
+	// convention used by the IpPassMode / DefaultCipherScheme blocks
+	// above.
+	//
+	// Capture prevEnabled BEFORE the assignment below — the auto-
+	// dry-run safety branch needs the previous state to detect the
+	// "false → true" transition. Reading a.config.EnableL3FlushOnExpiry
+	// after the assignment is always-true and the safety check becomes
+	// dead code
+	prevEnabled := a.config.EnableL3FlushOnExpiry
+	if a.config.EnableL3FlushOnExpiry != conf.EnableL3FlushOnExpiry {
+		log.Info("set L3 flush-on-expiry to %t", conf.EnableL3FlushOnExpiry)
+		// Lifecycle-change Warning: the scheduler is constructed in
+		// udpac.go's Start() and not re-instantiated on reload. A
+		// reload that flips this flag updates the config field but
+		// leaves the running scheduler's state as-is. To actually
+		// stop a running scheduler or start a new one the operator
+		// must restart the AC. Without this warning, the reload
+		// success log line would mislead the operator into thinking
+		// the change took full effect
+		log.Warning("[L3FlushSched] EnableL3FlushOnExpiry reload from %t → %t requires AC restart to fully take effect (the running scheduler is not re-instantiated on config reload; dry-run and breaker tunables ARE live-tunable via SetDryRun/SetBreakerParams).", prevEnabled, conf.EnableL3FlushOnExpiry)
+		a.config.EnableL3FlushOnExpiry = conf.EnableL3FlushOnExpiry
+	}
+	// Auto-enable dry-run when the feature is freshly enabled but
+	// dry-run is unset (zero value). Forces the operator to make an
+	// explicit decision to disable dry-run rather than landing in
+	// real-flush mode by omission. The "first reload after enable"
+	// framing is intentional: it forces operators who set both
+	// EnableL3FlushOnExpiry=true and L3FlushDryRun=false in a single
+	// TOML edit to reload twice — once to enable (lands in dry-run),
+	// once to acknowledge by reloading the same explicit false. The
+	// tri-state L3FlushMode enum that lifts this UX limitation is
+	// tracked in the deferred-followups issue.
+	effectiveDryRun := conf.L3FlushDryRun
+	if conf.EnableL3FlushOnExpiry && !conf.L3FlushDryRun && !prevEnabled {
+		log.Warning("L3 flush-on-expiry was just enabled with L3FlushDryRun unset/false; forcing dry-run for the first reload as safety. Reload again with the same explicit L3FlushDryRun=false to acknowledge and start real-flush mode.")
+		effectiveDryRun = true
+	}
+	if a.config.L3FlushDryRun != effectiveDryRun {
+		log.Info("set L3 flush dry-run to %t", effectiveDryRun)
+		a.config.L3FlushDryRun = effectiveDryRun
+	}
+	breakerTunablesChanged := false
+	if newThreshold := intOrDefault(conf.L3FlushErrorThreshold, DefaultL3FlushErrorThreshold); a.config.L3FlushErrorThreshold != newThreshold {
+		log.Info("set L3 flush error threshold to %d", newThreshold)
+		a.config.L3FlushErrorThreshold = newThreshold
+		breakerTunablesChanged = true
+	}
+	if newWindow := intOrDefault(conf.L3FlushErrorWindowSec, DefaultL3FlushErrorWindowSec); a.config.L3FlushErrorWindowSec != newWindow {
+		log.Info("set L3 flush error window to %ds", newWindow)
+		a.config.L3FlushErrorWindowSec = newWindow
+		breakerTunablesChanged = true
+	}
+
+	// Propagate scheduler-tunable changes to the live scheduler so an
+	// operator who reloads config.toml doesn't have to restart the AC
+	// for the change to take effect. The scheduler is constructed in
+	// udpac.go's Start() only after this function runs on first load,
+	// so a.expirySched is nil during the first-load path (handled
+	// above) — only patch on subsequent reloads
+	//
+	// SetDryRun is unconditional because its read is atomic + cheap.
+	// SetBreakerParams takes breakerErrMu so only call it when the
+	// tunables actually changed
+	if a.expirySched != nil {
+		a.expirySched.SetDryRun(a.config.L3FlushDryRun)
+		if breakerTunablesChanged {
+			newThreshold := a.config.L3FlushErrorThreshold
+			newWindow := time.Duration(a.config.L3FlushErrorWindowSec) * time.Second
+			// SetBreakerParams handles the threshold-exceeds-ring
+			// case internally: it clamps to ring size and logs the
+			// actionable warning ("restart the AC to grow the ring").
+			// No duplicate warning here — the previous config-side
+			// log was forensics-redundant.
+			a.expirySched.SetBreakerParams(newThreshold, newWindow)
+		}
 	}
 
 	a.reloadARDTrust(conf)
@@ -522,4 +649,21 @@ func (a *UdpAC) StopConfigWatch() {
 			_ = w.Close()
 		}
 	}
+}
+
+// intOrDefault returns v if v > 0, else def. Used for config fields
+// where 0 (Go zero) means "unset, use default" — the alternative is
+// pointer fields, which complicate TOML unmarshal for this codebase.
+//
+// A negative v is treated as "use default" but loud — operators
+// who typo a negative threshold in TOML get a warning instead of
+// the value silently disappearing into the default
+func intOrDefault(v, def int) int {
+	if v > 0 {
+		return v
+	}
+	if v < 0 {
+		log.Warning("[L3FlushSched] config value %d is negative; using default %d. Negative values are not valid for this field.", v, def)
+	}
+	return def
 }

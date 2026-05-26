@@ -77,6 +77,39 @@ The post-qurl-service#498 floor lets `session_duration` go as low as 1 second (D
 
 This is intentional — a 1s self-destruct shouldn't be refreshable — but when triaging a "why isn't this refreshing?" report, the answer for `session_duration ≤ 2s` is the strict-firewall dead zone, not a regression. See `endpoints/ac/tokenstore_test.go::TestRemainingFirewallSeconds_OpenTimeOneBoundary` for the fence.
 
+### The three-clock model (post-L3-flush)
+
+After the L3 flush-on-expiry work in `endpoints/ac/expiry_scheduler.go` (nhp#2164), session enforcement runs three coupled clocks. Useful as a reading frame when triaging "why didn't this session terminate?" reports:
+
+```
+                         L7 session (qurl-service /authorize)
+            ┌────────────────────────────────────────────┐
+            │   ←─── reactive to /resolve ───→            │
+  /resolve  │                              session expires
+     t=0 ───┼──── image fetch ─────┐                     ─────►
+            │                      │                     ▲
+            │                  first-paint               │
+            │                      │                     │
+            │                      ◄─── self-destruct ───►
+            │                      │                     │
+            │                      └─ client blank fires ┘
+            │
+            └─── reactive to /resolve ─── L3 ipset closes (kernel TTL)
+                                          └─ scheduler.Flush fires →
+                                             conntrack/BPF deletes →
+                                             existing TCP terminates
+```
+
+| Clock | Anchor | End condition | Source of truth |
+|---|---|---|---|
+| **Fileviewer blank** (client JS) | first-paint | first-paint + `viewer_ttl` | URL `expire_after` param (from connector) |
+| **L7 session** (`/authorize` denial) | first /authorize | first-authorize + `session_duration` | qurl-service token storage (sessions table) |
+| **L3 firewall close** (ipset/BPF entry expiry + active flush) | /resolve | `/resolve + OpenTime` | NHP-AOP from qurl-service; flush scheduled in AC |
+
+**What L3 flush adds vs the prior architecture:** before the scheduler, the AC relied on the kernel's natural ipset/BPF TTL to remove allow-rules. Established TCP connections survived past that point (both filter modes have an ESTABLISHED bypass — see `expiry_scheduler.go` godoc). The scheduler closes that gap by actively flushing kernel conntrack / BPF map state at the deadline. **Active flows terminate within ~1 tick (10 ms default) of session end; quiet flows terminate at the next packet attempt (see `QUIET_STREAM_RESIDUAL.md` for the 25 s backend-keepalive recipe).**
+
+For the rollout phase, the L3 flush runs *alongside* the L7 `/authorize` enforcement (defense-in-depth). After 4+4 weeks of side-by-side validation, the L7 layer can be removed and L3 flush becomes the sole enforcement boundary. The scheduler's fail-closed admission semantic (UdpAC refuses new NHP-AOPs when the scheduler's circuit breaker is open) is sized for that end-state — see `SCHEDULER_SCALING.md` for the SLO contract.
+
 ## Alternative considered: stateless signed cookie
 
 **Shape:** NHP server mints a signed cookie `{resource_id, client_ip, session_id, expires_at}` with HMAC at resolve time. `qurl-router` verifies signature + expiry + client_ip locally on every request. No qurl-service call on the data path.
