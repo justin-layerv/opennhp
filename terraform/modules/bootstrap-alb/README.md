@@ -37,7 +37,11 @@ public key on cold start.
   TLS-handshake-failure rate, WAF rate-limit-block rate.
 - SNS topic for the alarms (alerts-infra subscribes via cross-account
   Chatbot config — producer keeps SNS, alerts-infra owns chat-platform
-  routing).
+  routing). The topic is also consumed by
+  `terraform/qurl_service_outcomes.tf` at the nhp root for the
+  application-layer bootstrap 401/429 spike alarms (those alarm on
+  qurl-service's slog output, so they live at root rather than in this
+  module to break a TF dependency cycle with `module.qurl_service`).
 
 ## What does NOT live here
 

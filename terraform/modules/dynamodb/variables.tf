@@ -35,3 +35,9 @@ variable "deploy_qurl_tables" {
   type        = bool
   default     = false
 }
+
+variable "alarm_sns_topic_arn" {
+  description = "SNS topic ARN for DDB throttle alarms (see `alarms.tf`). Pass the shared monitoring topic so the alarms route to the same Chatbot subscription as the other infra-level alerts. `null` (default) disables alarm creation entirely — keeps test fixtures + isolated-module deploys plan-clean. Matches the `default = null` convention used by other optional module inputs in this repo (e.g. `bootstrap_alb_elb_5xx_threshold_per_minute`)."
+  type        = string
+  default     = null
+}

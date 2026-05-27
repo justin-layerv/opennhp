@@ -1946,6 +1946,45 @@ variable "bootstrap_alb_elb_5xx_threshold_per_minute" {
   default     = null
 }
 
+# Description + validation mirrored from terraform/variables.tf for
+# root-pointed error attribution; keep both copies in lockstep.
+variable "bootstrap_unauthorized_threshold_per_minute" {
+  description = "Threshold value for the `bootstrap-unauthorized-spike` alarm in `terraform/qurl_service_outcomes.tf`. The alarm uses `GreaterThanThreshold` so a default of `3` fires at 4+/min sustained 3-of-5 minutes (same shape as `bootstrap_alb_5xx`). Env tfvars may override to quiet the alarm during a known operator probe / load test. See description in terraform/variables.tf for the full rationale."
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = var.bootstrap_unauthorized_threshold_per_minute >= 1 && var.bootstrap_unauthorized_threshold_per_minute <= 1000
+    error_message = "bootstrap_unauthorized_threshold_per_minute must be 1 ≤ x ≤ 1000. Floor 1: threshold 0 with GreaterThanThreshold pages on the first single 401, too noisy for a key-rotation window. Ceiling 1000: catches typo-class mistakes (e.g., `300` for `30`) that would effectively disable the alarm — bootstrap traffic at steady state is <1 success/min, so any threshold > 1000 is almost certainly wrong."
+  }
+}
+
+# Description + validation mirrored from terraform/variables.tf for
+# root-pointed error attribution; keep both copies in lockstep.
+variable "bootstrap_rate_limited_threshold_per_minute" {
+  description = "Threshold value for the `bootstrap-rate-limited-spike` alarm in `terraform/qurl_service_outcomes.tf`. The alarm uses `GreaterThanThreshold` so a default of `3` fires at 4+/min sustained 3-of-5 minutes (mirrors the unauthorized threshold). Env tfvars may override. See description in terraform/variables.tf for the full rationale."
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = var.bootstrap_rate_limited_threshold_per_minute >= 1 && var.bootstrap_rate_limited_threshold_per_minute <= 1000
+    error_message = "bootstrap_rate_limited_threshold_per_minute must be 1 ≤ x ≤ 1000 (per `bootstrap_unauthorized_threshold_per_minute` rationale — floor catches the 0-trap, ceiling catches typo-class mistakes)."
+  }
+}
+
+# Description + validation mirrored from terraform/variables.tf for
+# root-pointed error attribution; keep both copies in lockstep.
+variable "knock_token_reject_threshold_per_minute" {
+  description = "Threshold value for the `frps-knock-token-reject-rate` alarm in the qurl-reverse-tunnel-server module. The alarm uses `GreaterThanThreshold` so a default of `3` fires at 4+/min sustained 3-of-5 minutes (same shape as the bootstrap-outcome thresholds). Env tfvars may override. See description in terraform/variables.tf for the full rationale."
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = var.knock_token_reject_threshold_per_minute >= 1 && var.knock_token_reject_threshold_per_minute <= 1000
+    error_message = "knock_token_reject_threshold_per_minute must be 1 ≤ x ≤ 1000 (floor catches the 0-trap; ceiling catches typo-class mistakes that would effectively disable the alarm)."
+  }
+}
+
 # ==================== QURL Tunnel Auth ====================
 # Same env-root-gap class as the Bootstrap ALB section above.
 

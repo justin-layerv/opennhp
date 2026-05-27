@@ -398,6 +398,11 @@ module "dynamodb" {
 
   # QURL Service tables
   deploy_qurl_tables = var.deploy_qurl_service
+
+  # Alarm fan-out for the bootstrap-path throttle alarms in
+  # `modules/dynamodb/alarms.tf` — shared monitoring topic so the
+  # `alerts-infra` Chatbot subscription covers all module producers.
+  alarm_sns_topic_arn = module.monitoring.sns_topic_arn
 }
 
 # NHP Keypair Module - Registration keypair for AC initial connection
@@ -1742,6 +1747,13 @@ module "qurl_reverse_tunnel_server" {
   # Monitoring
   enable_cloudwatch_alarms = true
   alarm_sns_topic_arn      = module.monitoring.sns_topic_arn
+
+  # Threshold for the knock-token reject-rate alarm. Default 3 (page at
+  # 4+/min sustained 3-of-5 minutes); env-tunable via the root var so an
+  # operator can quiet the alarm during a known maintenance window
+  # without editing the module. Same threading pattern as the
+  # bootstrap-outcome thresholds in `terraform/qurl_service_outcomes.tf`.
+  knock_token_reject_threshold_per_minute = var.knock_token_reject_threshold_per_minute
 }
 
 # State move for the qurl-frps → qurl-reverse-tunnel-server rebrand

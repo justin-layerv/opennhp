@@ -264,3 +264,154 @@ resource "aws_cloudwatch_metric_alarm" "log_error_rate" {
     Severity = "ticket"
   })
 }
+
+# ==================== Knock-token validation outcomes ====================
+#
+# Per `qurl-reverse-tunnel-server` CLAUDE.md "Knock-event tag taxonomy",
+# the FRP-Login knock validator emits one of five structured slog events
+# (handler.go around `tagKnockInvalid` / `tagKnockExpired` / etc):
+#
+#   knock_token_invalid              ← rejected (require=true) or
+#                                      validator returned valid=false
+#   knock_token_validator_error      ← transport / upstream / parse fail
+#   knock_token_missing              ← observation-only under require=false
+#   knock_token_ip_mismatch          ← observation-only (always accepted)
+#   knock_token_run_id_mismatch      ← observation-only (always accepted)
+#
+# Today only the binary FRPSErrorCount alarm above covers any of this;
+# `[E]`-tagged log lines aren't a subset of these events, and there's
+# no shape that lets an operator break "client misconfig vs upstream
+# nhp-server outage" apart.
+#
+# v1 customer-ship goal: surface invalid + validator_error specifically.
+# missing / ip_mismatch / run_id_mismatch are deliberately NOT alarmed —
+# they're observation-only flags whose paging would be noise during
+# every NAT-egress mutation or pre-strict-mode client.
+#
+# Cardinality / dim-set note: the slog payload also carries `run_id` /
+# `frpc_user` / `client_address`, but the metric is *intentionally*
+# undimensioned — per-agent dimensioning is tracked separately (would
+# need agent_id threading via qurl-service tunnel-auth; see paired
+# qurl-service follow-up) and would blow up the namespace cardinality
+# under the current run_id-per-Login shape.
+
+resource "aws_cloudwatch_log_metric_filter" "knock_token_invalid" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  name           = "${var.name_prefix}-frps-knock-token-invalid"
+  log_group_name = aws_cloudwatch_log_group.frps.name
+
+  # JSON-path pattern: pin both the slog event-tag field name (`event`)
+  # AND its value. The bare-substring form (`"knock_token_invalid"`) —
+  # mirroring `frps_errors`'s `"[E]"` shape — would also match any
+  # future log line whose `validator_error` field happens to contain
+  # the literal substring `knock_token_invalid` (or any other field
+  # that quotes the event name in error text). slog's emitter today
+  # doesn't produce such collisions, but the JSON-path form removes the
+  # whole class of silent false-positive paging without giving up the
+  # plain-text-tolerance benefit (slog JSON is the production format).
+  # `metric_transformation` is still dimensionless — JSON-path filters
+  # don't *require* dimension extraction, they just *allow* it.
+  pattern = "{ $.event = \"knock_token_invalid\" }"
+
+  metric_transformation {
+    name          = "FRPSKnockTokenInvalidCount"
+    namespace     = "LayerV/NHP"
+    value         = "1"
+    default_value = 0
+  }
+}
+
+resource "aws_cloudwatch_log_metric_filter" "knock_token_validator_error" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  name           = "${var.name_prefix}-frps-knock-token-validator-error"
+  log_group_name = aws_cloudwatch_log_group.frps.name
+
+  # JSON-path form for the same reason as `knock_token_invalid` above.
+  pattern = "{ $.event = \"knock_token_validator_error\" }"
+
+  metric_transformation {
+    name          = "FRPSKnockValidatorErrorCount"
+    namespace     = "LayerV/NHP"
+    value         = "1"
+    default_value = 0
+  }
+}
+
+# Aggregate "knock-token reject rate" alarm. Pages on > 3/min sustained
+# 3-of-5 minutes — the bootstrap surface produces ~50 req/min steady
+# state per the bootstrap-alb tuning note, and Login QPS is bounded by
+# the same population, so 3/min sustained is unambiguous noise that
+# warrants paging.
+#
+# Combines both filters via metric math: `invalid + validator_error`.
+# Both reflect "Login attempt rejected at the knock-validation gate".
+# **Single-emit invariant**: each Login path in
+# `qurl-reverse-tunnel-server/internal/tunnelauth/handler.go` emits
+# exactly ONE of these two events (see the `if knockToken == "" { ... }
+# else { switch { case verr != nil: ..., case !vresp.Valid: ..., default:
+# ... } }` structure around line 634). No Login produces both; the sum
+# is therefore the unique-event count, not a double-count. Splitting
+# them at alarm time would just page twice for the same upstream outage.
+# Test fence for both the field-name dependency AND the single-emit
+# invariant tracked in qurl-reverse-tunnel-server#122.
+#
+# **Customer-install symptom**: a customer sidecar whose
+# `LAYERV_REQUIRE_KNOCK=true` but whose knock UDP path is blocked by a
+# GCP firewall will produce a sustained burst of `knock_token_invalid`
+# (no token landed → require=true rejects locally before the validator
+# even fires). This alarm catches the case where the install runbook's
+# UDP-firewall step was skipped.
+resource "aws_cloudwatch_metric_alarm" "knock_token_reject_rate" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-frps-knock-token-reject-rate"
+  alarm_description   = "FRP server rejected >${var.knock_token_reject_threshold_per_minute} Login attempts/min at the knock-validation gate (invalid token OR upstream nhp-server validator error). Customer-install symptom: blocked UDP knock path on the customer side, or NHP server outage. Triage: grep frps log group for `event=knock_token_invalid` (look at `validator_error` field to distinguish `empty_token_local_skip` vs `not_found`/`expired`/`invalid_format`)."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 5
+  datapoints_to_alarm = 3
+  threshold           = var.knock_token_reject_threshold_per_minute
+  treat_missing_data  = "notBreaching"
+
+  # `FILL(..., 0)` substitutes 0 for missing samples in either series
+  # — defensive even though both filters set `default_value = 0`
+  # already (the frps log group is high-volume so non-matching events
+  # land continuously and the series stays populated). Matches the
+  # shape used by `qurl_api_keys_throttle` in `modules/dynamodb/alarms.tf`.
+  metric_query {
+    id          = "rejects"
+    expression  = "FILL(invalid, 0) + FILL(validator_error, 0)"
+    label       = "Knock rejects/min"
+    return_data = true
+  }
+
+  metric_query {
+    id = "invalid"
+    metric {
+      metric_name = "FRPSKnockTokenInvalidCount"
+      namespace   = "LayerV/NHP"
+      period      = 60
+      stat        = "Sum"
+    }
+  }
+
+  metric_query {
+    id = "validator_error"
+    metric {
+      metric_name = "FRPSKnockValidatorErrorCount"
+      namespace   = "LayerV/NHP"
+      period      = 60
+      stat        = "Sum"
+    }
+  }
+
+  alarm_actions = local.sns_actions
+  ok_actions    = local.sns_actions
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-frps-knock-token-reject-rate"
+    Component = "qurl-reverse-tunnel-server"
+    Severity  = "ticket"
+  })
+}

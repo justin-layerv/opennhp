@@ -671,3 +671,14 @@ variable "green_standby_capacity_per_az" {
     error_message = "green_standby_capacity_per_az must be null (auto-track min_size_per_az or 1) or an integer between 0 and 10. Floor at 0 = cold standby; ceiling at 10 catches typos that would provision an absurdly large warm fleet."
   }
 }
+
+variable "knock_token_reject_threshold_per_minute" {
+  description = "Threshold value for the `frps-knock-token-reject-rate` alarm (counts `knock_token_invalid` + `knock_token_validator_error` slog events emitted from the FRP-Login knock-token validator in `internal/tunnelauth/handler.go`). The alarm uses `GreaterThanThreshold` so a default of `3` fires at 4+/min sustained 3-of-5 minutes — same comparator and shape as the bootstrap-ALB `alb_target_5xx` alarm so noise behavior stays uniform across the v1 observability surface. The two filters cover both reject paths — local empty-token reject under `require=true` AND upstream validator returning `valid=false` / transport failure. Customer-install symptom: a sustained burst here is the operator-paged signal for a blocked UDP knock path on the customer side (skipped firewall step in the install runbook) or an nhp-server outage on the LayerV side."
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = var.knock_token_reject_threshold_per_minute >= 1 && var.knock_token_reject_threshold_per_minute <= 1000
+    error_message = "knock_token_reject_threshold_per_minute must be 1 ≤ x ≤ 1000. Floor 1: threshold 0 with GreaterThanThreshold pages on the first single reject; a single legitimate `empty_token_local_skip` from a misconfigured operator probe shouldn't wake on-call. Ceiling 1000: catches typo-class mistakes that would effectively disable the alarm."
+  }
+}

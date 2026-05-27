@@ -161,6 +161,18 @@ module "nhp" {
   bootstrap_alb_alarm_email_subscriptions     = var.bootstrap_alb_alarm_email_subscriptions
   bootstrap_alb_elb_5xx_threshold_per_minute  = var.bootstrap_alb_elb_5xx_threshold_per_minute
 
+  # qurl-service bootstrap-outcome 401/429 spike alarms (#2102, root-
+  # level `terraform/qurl_service_outcomes.tf`). Threshold defaults
+  # 3/min mirror the existing `alb_target_5xx` shape; env-tunable to
+  # quiet the alarm during a known operator probe / load test.
+  bootstrap_unauthorized_threshold_per_minute = var.bootstrap_unauthorized_threshold_per_minute
+  bootstrap_rate_limited_threshold_per_minute = var.bootstrap_rate_limited_threshold_per_minute
+
+  # qurl-reverse-tunnel-server knock-token reject-rate alarm threshold
+  # (#2102). Same default + tuning shape as the bootstrap-outcome
+  # thresholds above; env-tunable for known maintenance windows.
+  knock_token_reject_threshold_per_minute = var.knock_token_reject_threshold_per_minute
+
   # qurl-reverse-tunnel-server per-AZ Cloud Map fanout (#1745):
   # blue/green, canary, and MULTIVALUE-flip variables.
   qurl_reverse_tunnel_server_min_size_per_az               = var.qurl_reverse_tunnel_server_min_size_per_az
