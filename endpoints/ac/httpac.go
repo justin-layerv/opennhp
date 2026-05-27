@@ -228,6 +228,17 @@ func (ha *HttpAC) HandleHttpRefreshOperations(c *gin.Context, req *common.HttpRe
 			userID = entry.User.UserId
 		}
 		log.Error("firewall deadline passed; refusing extension (src_ip=%s user_id=%s)", req.SrcIp, userID)
+		// Drop scheduler entries whose kernel rule already expired
+		// naturally — without this Cancel, processEntry fires Flush on
+		// gone state, inflating metricFlushTotal and exposing the
+		// breaker. tokenStore.Delete is intentionally NOT called here;
+		// CleanExpired's sweep (which fires the same OnExpire hook +
+		// silent re-Cancels these tuples) remains the canonical
+		// removal path. A future caller that adds Delete from this
+		// branch must also fire the hook (or extend TokenStore.Delete
+		// to do so) — see cancelAllScheduledFlows godoc for the
+		// multi-session and NAT'd-temp-access caveats.
+		ha.ua.cancelAllScheduledFlows(entry)
 		c.JSON(http.StatusOK, gin.H{"errMsg": "token expired"})
 		return
 	}

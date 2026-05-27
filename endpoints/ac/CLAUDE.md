@@ -34,3 +34,15 @@ must update this list and audit all existing call sites.
   these locks (so no inversion is possible from outside-in callers).
   When extending the scheduler, keep the lock discipline documented
   in the scheduler godoc rather than duplicating it here.
+- **`tokenStore.mu` is never held while scheduler `shard.mu` /
+  `wheelMu` are acquired** (#2172). The
+  `TokenStore.OnExpire` hook wired by `(*UdpAC).Start` calls
+  `cancelAllScheduledFlows` → `Scheduler.Cancel`, which takes
+  `shard.mu` then `wheelMu`. To prevent an inversion against
+  `Schedule`/`Cancel` invocations made from other AC code paths,
+  `TokenStore.CleanExpired` snapshots expired `(token, entry)` pairs
+  under `tokenStore.mu`, releases the lock, then invokes the hook
+  batch outside the critical section. Fenced from the tokenstore
+  side by `TestTokenStore_OnExpire_RunsAfterLockReleased`. A future
+  hook caller that moves the invocation back inside `tokenStore.mu`
+  would re-introduce the inversion.

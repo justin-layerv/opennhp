@@ -88,26 +88,20 @@
 //     scheduleFlushIfEnabled call immediately after the write).
 //   - Boot-time enumeration of kernel state — see udpac.go startup.
 //
-// # Cancel wiring (deferred — issue #2172)
+// # Cancel wiring
 //
-// Cancel is implemented and unit-tested but has NO production caller
-// yet. When a session is revoked early (/refresh shortens the
-// deadline to <=0, token-revoke fires), the scheduler's index entry
-// lingers until natural expiry and processEntry then fires a Flush
-// on already-gone kernel state — harmless via the ENOENT → nil
-// idempotency contract, but it inflates metricFlushTotal and races
-// against re-admission of the same key. Wiring Cancel into httpac.go
-// and tokenstore.go is tracked in #2172 and must land before L7
-// removal (alongside #2168 in-flight Flush race; both are
-// kernel-state-write/Schedule lifecycle gaps).
+// Two production sites invoke Scheduler.Cancel via
+// UdpAC.cancelAllScheduledFlows — see that function's godoc for
+// the over-broad fan-out semantics and known gaps:
+//   - httpac.go /refresh handler — when the firewall deadline
+//     has already passed, drops scheduler entries before
+//     processEntry fires a pointless Flush.
+//   - tokenstore.go TokenStore.OnExpire hook (wired in
+//     (*UdpAC).Start) — fires per entry CleanExpired removes.
 //
-// # /refresh extends naturally; shortens via #2172
-//
-// /refresh on a session that EXTENDS the deadline works without
-// scheduler wiring — Schedule's longest-wins semantics absorb the
-// new (later) deadline. /refresh that SHORTENS the deadline relies
-// on the lingering-then-ENOENT-no-op behavior above until #2172
-// lands. Operationally fine; metric-noise-only.
+// /refresh that EXTENDS the deadline does not need explicit
+// Cancel — Schedule's longest-wins semantics absorb the new
+// (later) deadline directly.
 package ac
 
 import (
@@ -977,12 +971,12 @@ func (s *Scheduler) Schedule(key FlowKey, deadline time.Time) {
 // kernel allow-rule is being torn down right now, and processEntry's
 // cleanup defer will remove the index entry once Flush returns.
 //
-// Callers note: Reschedule MUST use Schedule (which handles the
-// in-flight case in Phase 1), NOT Cancel-then-Schedule. The latter
-// is a no-op during in-flight + a re-insert, leaving the re-admission
-// race window #2168 reopened. Today only scheduler internals and
-// tests call Cancel; #2172 will wire it into /refresh + token-revoke
-// with this contract in mind.
+// Reschedule must use Schedule (which handles the in-flight case in
+// Phase 1), NOT Cancel-then-Schedule. The latter is a no-op during
+// in-flight + a re-insert, reopening the re-admission race window.
+// Production callers (UdpAC.cancelAllScheduledFlows) are
+// terminal-remove sites that never
+// re-schedule the same key.
 //
 // Lock order matches Schedule: shard.mu before wheelMu.
 func (s *Scheduler) Cancel(key FlowKey) {

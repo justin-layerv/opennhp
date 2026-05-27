@@ -6,10 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
-	"os"
-	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -891,38 +888,6 @@ func TestScheduler_FlusherPanic_DoesNotCrashAC(t *testing.T) {
 	}
 	if got := s.Metrics().FlushErr; got == 0 {
 		t.Errorf("FlushErr should be > 0 (panic routed through breaker counter); got %d", got)
-	}
-}
-
-// TestCancel_StillUnusedByProduction_Sentinel fences the contract
-// that Scheduler.Cancel currently has NO production caller. The
-// package godoc claims this and #2172 tracks the wiring work; when
-// that issue closes, this sentinel must be deliberately removed
-// rather than silently letting production paths light up untested
-//
-// Greps the production .go files under endpoints/ac/ for
-// `expirySched.Cancel(`. Test files are excluded — Cancel is heavily
-// unit-tested in this file.
-func TestCancel_StillUnusedByProduction_Sentinel(t *testing.T) {
-	prodFiles, err := filepath.Glob("*.go")
-	if err != nil {
-		t.Fatalf("glob: %v", err)
-	}
-	var callers []string
-	for _, f := range prodFiles {
-		if strings.HasSuffix(f, "_test.go") {
-			continue
-		}
-		data, err := os.ReadFile(f)
-		if err != nil {
-			t.Fatalf("read %s: %v", f, err)
-		}
-		if strings.Contains(string(data), "expirySched.Cancel(") {
-			callers = append(callers, f)
-		}
-	}
-	if len(callers) > 0 {
-		t.Fatalf("Scheduler.Cancel now has production caller(s) in %v — remove this sentinel test and update the package godoc + #2172 (Cancel was deferred and is being tracked there; once wired, this fence becomes the regression risk it was guarding against)", callers)
 	}
 }
 

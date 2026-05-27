@@ -203,6 +203,16 @@ func (a *UdpAC) Start(dirPath string, logLevel int) (err error) {
 	// ServerPubKeyAllowlist entries and leave source 3 of the
 	// allowlist dead until the next config.toml touch (see #1239).
 	a.tokenStore = common.NewTokenStore[*AccessEntry]()
+	// Registered BEFORE a.expirySched is constructed below. Safe
+	// for two reasons: (1) the hook closure captures `a` rather
+	// than the scheduler pointer, so it reads a.expirySched at
+	// call time and cancelAllScheduledFlows's nil-scheduler
+	// guard handles the in-progress window; (2) RunRefreshRoutine
+	// is launched at the end of Start, so CleanExpired cannot fire
+	// in this window — no tokens can be stored before Start
+	// returns. A future Start refactor that violates either
+	// invariant must move installExpiryHook accordingly.
+	a.installExpiryHook()
 	a.dnsRateLimiter = NewDNSChangeRateLimiter()
 	a.aopReplay = newAOPReplayCache()
 
@@ -434,24 +444,141 @@ func newFlusherForFilterMode(filterMode int) (FlowFlusher, error) {
 // based on FlowKey.Protocol (BpfFlusher uses sdwhitelist for
 // FlowProtoAny, spp for tcp/udp, icmpwhitelist for icmp).
 func (a *UdpAC) scheduleFlushIfEnabled(srcIP, dstIP string, dstPort int, proto FlowProto, deadline time.Time) {
+	if key, ok := a.flowKeyForScheduler(opSchedule, srcIP, dstIP, dstPort, proto); ok {
+		a.expirySched.Schedule(key, deadline)
+	}
+}
+
+// installExpiryHook wires cancelAllScheduledFlows into TokenStore's
+// OnExpire callback. Extracted so tests can invoke the same wiring
+// (*UdpAC).Start does without bringing up the full UDP/scheduler
+// stack. No-op when the scheduler is disabled
+// (cancelAllScheduledFlows checks a.expirySched). The hook runs
+// outside tokenStore.mu (see SetOnExpire godoc), so scheduler
+// shard locks taken inside are never held with tokenStore.mu.
+func (a *UdpAC) installExpiryHook() {
+	a.tokenStore.SetOnExpire(func(_ string, entry *AccessEntry) {
+		a.cancelAllScheduledFlows(entry)
+	})
+}
+
+// flowKeyForScheduler is the shared preamble for scheduleFlushIfEnabled
+// and cancelAllScheduledFlows: returns (key, true) when the scheduler
+// is enabled and MakeFlowKey accepts the inputs, otherwise (zero,
+// false) with MetricL3FlushKeyMalformed + a Warning log already
+// emitted. A malformed FlowKey here means an upstream regression let
+// a bad IP / port through; the breaker is not pinged because the
+// kernel-state side is already settled.
+//
+// The nil-scheduler guard returns (zero, false) silently — no metric
+// tick, no log. Both current callers also short-circuit on
+// a.expirySched == nil upstream, so the silent return is unreachable
+// today and exists only as defense-in-depth. A future caller that
+// reaches this path with a nil scheduler will drop work without
+// telemetry; if that ever lands, switch this branch to a Debug log
+// or a separate disabled-call metric.
+func (a *UdpAC) flowKeyForScheduler(op schedulerOp, srcIP, dstIP string, dstPort int, proto FlowProto) (FlowKey, bool) {
 	if a.expirySched == nil {
-		return
+		return FlowKey{}, false
 	}
 	key, err := MakeFlowKey(srcIP, dstIP, dstPort, proto)
 	if err != nil {
-		// Don't ping the breaker on malformed input — the kernel
-		// state write already happened; this is purely
-		// scheduler-side bookkeeping. Surface as a metric so an
-		// upstream regression producing malformed IPs (or wildcards)
-		// is visible on dashboards
-		// Warning, not Debug — a malformed FlowKey reaching here is
-		// an upstream-regression signal, not routine noise
 		a.incrMetric(MetricL3FlushKeyMalformed)
-		log.Warning("[L3FlushSched] skipping schedule for malformed FlowKey src=%s dst=%s port=%d: %v",
-			srcIP, dstIP, dstPort, err)
+		log.Warning("[L3FlushSched] skipping %s for malformed FlowKey src=%s dst=%s port=%d: %v",
+			op, srcIP, dstIP, dstPort, err)
+		return FlowKey{}, false
+	}
+	return key, true
+}
+
+// schedulerOp is the typed log-triage label for flowKeyForScheduler
+// callers; the typed constants make a misspelled call a compile error.
+type schedulerOp string
+
+const (
+	opSchedule schedulerOp = "schedule"
+	opCancel   schedulerOp = "cancel"
+)
+
+// cancelAllScheduledFlows cancels every FlowKey plausibly scheduled
+// for an AccessEntry. Called from /refresh-shorten in httpac.go and
+// from the TokenStore.OnExpire hook wired in (*UdpAC).Start.
+//
+// The fan-out per (src, dst) is over-broad by design: a leading
+// (port=0, FlowProtoAny) probe gates the rest of the calls — on
+// failure it short-circuits the tuple; on success the three follow-
+// ups (TCP/UDP with dstAddr.Port, ICMP with port=0) all route
+// through flowKeyForScheduler so the metric/log path stays
+// consistent with msghandler.go's Schedule side.
+//
+// Cardinality: up to |SrcAddrs| × |DstAddrs| × 4 Scheduler.Cancel
+// calls per call site (0 per pair on IP-bad — probe fails and the
+// loop continues — 2 per pair on port-bad — Any + ICMP succeed,
+// TCP + UDP no-op via flowKeyForScheduler), bounded at NHP-AOP
+// admission time. Tick semantic on MetricL3FlushKeyMalformed: see
+// that constant's godoc (1 tick per pair on IP-bad, 2 on port-bad).
+//
+// Probe choice is load-bearing. MakeFlowKey validates srcIP, dstIP,
+// AND dstPort ∈ [0, 65535]. Probing with port=0 isolates IP-bad
+// (whole fan-out skipped, 1 metric tick) from port-bad (probe
+// succeeds, TCP/UDP fail-soft via flowKeyForScheduler, Any/ICMP
+// still cancel). Probing with dstAddr.Port would skip legitimately-
+// scheduled Any/ICMP cancellations under port-bad — fenced by
+// TestUdpAC_CancelAllScheduledFlows_PortOutOfRange_StillCancelsAnyICMP.
+//
+// Known gaps in the over-broad fan-out (both gated on L7-removal):
+//
+//   - Multi-session: FlowKey is (srcIP, dstIP, port, proto), not
+//     token-specific. A fresh re-knock for the same tuple between
+//     the original Schedule and this Cancel will lose its scheduler
+//     entry too. Kernel TTL still expires the rule under L3-only —
+//     flush-on-expiry degradation, not a security regression. #2201.
+//   - NAT'd temp-access: the temp-access handlers in msghandler.go
+//     Schedule using the kernel-observed remoteAddr.IP, which differs
+//     from entry.SrcAddrs under NAT. This walker can't match the
+//     scheduled FlowKey — entry lingers, Flush fires on already-gone
+//     state (same metric-noise/breaker-exposure failure mode as #2172).
+//     #2205.
+//
+// Both gaps close together via per-entry FlowKey tracking at
+// Schedule time, which is the implementation #2201 + #2205 share.
+func (a *UdpAC) cancelAllScheduledFlows(entry *AccessEntry) {
+	// Fast path on disabled scheduler — skip the SrcAddrs ×
+	// DstAddrs walk entirely. flowKeyForScheduler also has a
+	// nil-scheduler guard (defense-in-depth for future callers),
+	// but the loop iteration cost still has to be paid without
+	// this early return.
+	if a.expirySched == nil || entry == nil {
 		return
 	}
-	a.expirySched.Schedule(key, deadline)
+	// Nil-element guards: admission produces non-nil from the
+	// JSON-decode shape in nhpmsg.go; the matching Schedule path
+	// in msghandler.go has no guard either, so production equiv
+	// holds. Cheap insurance against an upstream regression.
+	for _, srcAddr := range entry.SrcAddrs {
+		if srcAddr == nil {
+			continue
+		}
+		for _, dstAddr := range entry.DstAddrs {
+			if dstAddr == nil {
+				continue
+			}
+			anyKey, ok := a.flowKeyForScheduler(opCancel, srcAddr.Ip, dstAddr.Ip, 0, FlowProtoAny)
+			if !ok {
+				continue
+			}
+			a.expirySched.Cancel(anyKey)
+			if tcpKey, ok := a.flowKeyForScheduler(opCancel, srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoTCP); ok {
+				a.expirySched.Cancel(tcpKey)
+			}
+			if udpKey, ok := a.flowKeyForScheduler(opCancel, srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoUDP); ok {
+				a.expirySched.Cancel(udpKey)
+			}
+			if icmpKey, ok := a.flowKeyForScheduler(opCancel, srcAddr.Ip, dstAddr.Ip, 0, FlowProtoICMP); ok {
+				a.expirySched.Cancel(icmpKey)
+			}
+		}
+	}
 }
 
 // incrMetric is the centralized increment site for AC counters,

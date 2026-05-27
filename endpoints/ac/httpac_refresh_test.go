@@ -1,6 +1,7 @@
 package ac
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -65,6 +66,74 @@ func TestHandleHttpRefreshOperations_DeadlinePassedReturnsTokenExpired(t *testin
 	}
 	if got, want := body["errMsg"], "token expired"; got != want {
 		t.Errorf("errMsg = %q, want %q — deadline-passed branch did not fire (raw body=%q)", got, want, rec.Body.String())
+	}
+}
+
+// TestHandleHttpRefreshOperations_DeadlinePassedCancelsScheduledFlows fences
+// #2172: when the firewall deadline has passed the handler now drops any
+// L3 flush scheduler entries for the entry's tuples before responding.
+// Without the Cancel, processEntry would fire a Flush on already-gone
+// kernel state — ENOENT-noop, but inflates metricFlushTotal and exposes
+// the breaker pointlessly.
+//
+// Test shape: build a real scheduler (NoOpFlusher so Flush is harmless),
+// schedule a flow for the entry's tuple in the distant future, run the
+// /refresh handler with a rewound FirstKnockTime so RemainingFirewallSeconds
+// returns 0, then assert EntryCount drops to 0.
+func TestHandleHttpRefreshOperations_DeadlinePassedCancelsScheduledFlows(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+
+	ua := &UdpAC{
+		tokenStore:  common.NewTokenStore[*AccessEntry](),
+		expirySched: sched,
+	}
+	ha := &HttpAC{ua: ua}
+
+	const openTime = 10
+	entry := &AccessEntry{
+		User:     &common.AgentUser{UserId: "u-cancel-on-deadline"},
+		SrcAddrs: []*common.NetAddress{{Ip: "1.2.3.4"}},
+		DstAddrs: []*common.NetAddress{{Ip: "10.0.0.1", Port: 80, Protocol: "tcp"}},
+		OpenTime: openTime,
+	}
+	token := ua.GenerateAccessToken(entry)
+	// Schedule the same FlowKey shape msghandler.go's IPTABLES TCP path
+	// would have produced for this entry. Far-future deadline so the
+	// scheduler keeps it in the wheel until Cancel.
+	key, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoTCP)
+	if err != nil {
+		t.Fatalf("MakeFlowKey: %v", err)
+	}
+	sched.Schedule(key, time.Now().Add(1*time.Hour))
+	if got := sched.EntryCount(); got != 1 {
+		t.Fatalf("precondition: EntryCount = %d, want 1", got)
+	}
+
+	entry.FirstKnockTime = time.Now().Add(-time.Duration(openTime+1) * time.Second)
+	ua.tokenStore.Store(token, entry)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	ha.HandleHttpRefreshOperations(c, &common.HttpRefreshRequest{
+		Token: token,
+		SrcIp: "1.2.3.4",
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("EntryCount after refresh-shorten = %d, want 0 (Cancel did not fire)", got)
 	}
 }
 

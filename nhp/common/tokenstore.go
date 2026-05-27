@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"io"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -95,8 +96,9 @@ type TokenEntry interface {
 // The first level is indexed by the first character of the token for fast lookup.
 // This design distributes tokens across ~64 buckets (base64 characters).
 type TokenStore[E TokenEntry] struct {
-	mu    sync.RWMutex
-	store map[string]map[string]E
+	mu       sync.RWMutex
+	store    map[string]map[string]E
+	onExpire func(token string, entry E)
 }
 
 // NewTokenStore creates a new TokenStore instance.
@@ -104,6 +106,44 @@ func NewTokenStore[E TokenEntry]() *TokenStore[E] {
 	return &TokenStore[E]{
 		store: make(map[string]map[string]E),
 	}
+}
+
+// SetOnExpire registers a callback fired for each entry CleanExpired
+// removes. Pass nil to disable (default).
+//
+// Scope: only CleanExpired fires the hook. Delete does NOT — a
+// future explicit-revoke caller that wants the same cleanup must
+// invoke the hook itself or extend Delete.
+//
+// Lifecycle: CleanExpired captures the registered hook under
+// ts.mu at the start of its run and uses that capture for the
+// whole batch; SetOnExpire calls during an in-flight CleanExpired
+// block on ts.mu, then return — but the captured pending entries
+// still fire stale callbacks outside the lock. Callers needing
+// strict cessation must coordinate via their own quiesce signal.
+// Designed for once-at-startup registration, not hot-path swaps.
+//
+// The hook receives the entry pointer as captured at snapshot
+// time. AccessEntry is effectively post-store immutable today; a
+// future caller that mutates entries post-store must synchronize
+// reads against those mutations.
+//
+// Hook panics are recovered per-entry (logged with a stack trace)
+// so a single bad token does not abort the batch. Token-safety
+// in the recovery log depends on two hook-author requirements:
+//
+//   - Don't close over token / session-secret values. The stack
+//     trace prints function args as word-sized hex (for string
+//     args: pointer + length, never dereferenced contents), so
+//     the passed-in `token` arg is safe — but captured variables
+//     read by the closure can show up in unredacted form.
+//   - Don't panic with token / session-secret values. The
+//     panic value is logged via %v; only the `token` arg is
+//     RedactToken-wrapped.
+func (ts *TokenStore[E]) SetOnExpire(fn func(token string, entry E)) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	ts.onExpire = fn
 }
 
 // Store adds or updates a token entry in the store.
@@ -170,28 +210,71 @@ func (ts *TokenStore[E]) Delete(token string) {
 	}
 }
 
-// CleanExpired removes all expired tokens from the store.
-// Returns the number of tokens removed.
+// CleanExpired removes all expired tokens from the store and
+// returns the number removed.
+//
+// If an OnExpire hook is registered, expired (token, entry) pairs
+// are collected under the write lock and the hook is invoked AFTER
+// the lock is released, so the hook may take other locks freely
+// (the AC scheduler's shard locks, in production). Panicking hooks
+// are recovered per-entry so a single bad token does not abort the
+// batch or the background goroutine driving this call (see
+// RunRefreshRoutine).
 func (ts *TokenStore[E]) CleanExpired() int {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
+	type expiredPair struct {
+		token string
+		entry E
+	}
+	var (
+		pending  []expiredPair
+		onExpire func(string, E)
+		removed  int
+	)
 
-	now := time.Now()
-	removed := 0
+	func() {
+		ts.mu.Lock()
+		defer ts.mu.Unlock()
 
-	for prefix, tokenMap := range ts.store {
-		for token, entry := range tokenMap {
-			if now.After(entry.GetExpireTime()) {
-				log.Info("[TokenStore] token %s expired, remove", RedactToken(token))
-				delete(tokenMap, token)
-				removed++
+		onExpire = ts.onExpire
+		now := time.Now()
+
+		for prefix, tokenMap := range ts.store {
+			for token, entry := range tokenMap {
+				if now.After(entry.GetExpireTime()) {
+					if onExpire != nil {
+						pending = append(pending, expiredPair{token, entry})
+					}
+					log.Info("[TokenStore] token %s expired, remove", RedactToken(token))
+					delete(tokenMap, token)
+					removed++
+				}
+			}
+			if len(tokenMap) == 0 {
+				delete(ts.store, prefix)
 			}
 		}
-		if len(tokenMap) == 0 {
-			delete(ts.store, prefix)
-		}
-	}
+	}()
 
+	for _, p := range pending {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Stack trace: runtime.Stack prints args as
+					// word-sized hex (for string args: pointer +
+					// length, never dereferenced contents), so
+					// the token bytes themselves don't appear in
+					// the trace — only the redacted-arg log
+					// prefix is sensitive. The %v on r reflects
+					// whatever the hook panicked with; see
+					// SetOnExpire godoc for the hook-must-not-
+					// panic-with-token-material requirement.
+					log.Error("[TokenStore] OnExpire hook panicked for token %s: %v\n%s",
+						RedactToken(p.token), r, debug.Stack())
+				}
+			}()
+			onExpire(p.token, p.entry)
+		}()
+	}
 	return removed
 }
 

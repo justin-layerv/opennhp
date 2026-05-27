@@ -1,6 +1,7 @@
 package ac
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"strings"
@@ -632,5 +633,282 @@ func TestRemainingFirewallSeconds_ShrinksOverTime(t *testing.T) {
 
 	if r2 >= r1 {
 		t.Fatalf("remaining did not shrink: r1=%d r2=%d — deadline re-anchored on each call (#1942 regression)", r1, r2)
+	}
+}
+
+// TestUdpAC_InstallExpiryHook_WiresCancelAllScheduledFlows fences the
+// production wire-up: (*UdpAC).Start calls installExpiryHook, which
+// must register the cancelAllScheduledFlows callback. A regression
+// that drops the installExpiryHook call from Start (or its body)
+// would silently disable the entire #2202 mechanism — this test
+// fires the hook indirectly via CleanExpired and asserts the
+// scheduler entry was canceled.
+func TestUdpAC_InstallExpiryHook_WiresCancelAllScheduledFlows(t *testing.T) {
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+
+	a := &UdpAC{
+		tokenStore:  common.NewTokenStore[*AccessEntry](),
+		expirySched: sched,
+	}
+	a.installExpiryHook() // exact wiring (*UdpAC).Start uses.
+
+	entry := &AccessEntry{
+		User:     &common.AgentUser{UserId: "u-wire-fence"},
+		SrcAddrs: []*common.NetAddress{{Ip: "1.2.3.4"}},
+		DstAddrs: []*common.NetAddress{{Ip: "10.0.0.1", Port: 80}},
+		OpenTime: 1,
+	}
+	token := a.GenerateAccessToken(entry)
+	entry.ExpireTime = time.Now().Add(-1 * time.Minute)
+	a.tokenStore.Store(token, entry)
+
+	key, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoTCP)
+	if err != nil {
+		t.Fatalf("MakeFlowKey: %v", err)
+	}
+	sched.Schedule(key, time.Now().Add(1*time.Hour))
+	if got := sched.EntryCount(); got != 1 {
+		t.Fatalf("precondition: EntryCount = %d, want 1", got)
+	}
+
+	if got := a.tokenStore.CleanExpired(); got != 1 {
+		t.Fatalf("CleanExpired removed %d, want 1", got)
+	}
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("EntryCount after CleanExpired = %d, want 0 (installExpiryHook wiring broken)", got)
+	}
+}
+
+// TestTokenStore_CleanExpired_CancelsScheduledFlows fences the
+// end-to-end SetOnExpire → cancelAllScheduledFlows → Scheduler.Cancel
+// chain. Without the hook, expired token entries would leave
+// scheduler bookkeeping that fires Flush on already-gone kernel state.
+// Two scheduled FlowKey variants (TCP + UDP) exercise the over-broad
+// fan-out cancel in one assertion.
+func TestTokenStore_CleanExpired_CancelsScheduledFlows(t *testing.T) {
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+
+	a := &UdpAC{
+		tokenStore:  common.NewTokenStore[*AccessEntry](),
+		expirySched: sched,
+	}
+	a.tokenStore.SetOnExpire(func(_ string, entry *AccessEntry) {
+		a.cancelAllScheduledFlows(entry)
+	})
+
+	entry := &AccessEntry{
+		User:     &common.AgentUser{UserId: "u-clean-cancels"},
+		SrcAddrs: []*common.NetAddress{{Ip: "1.2.3.4"}},
+		DstAddrs: []*common.NetAddress{{Ip: "10.0.0.1", Port: 80}},
+		OpenTime: 1,
+	}
+	token := a.GenerateAccessToken(entry)
+	// Rewind ExpireTime so CleanExpired removes it.
+	entry.ExpireTime = time.Now().Add(-1 * time.Minute)
+	a.tokenStore.Store(token, entry)
+
+	// Schedule both TCP and UDP variants for this tuple — far-future
+	// deadlines so they stay in the wheel until Cancel fires.
+	tcpKey, _ := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoTCP)
+	udpKey, _ := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoUDP)
+	sched.Schedule(tcpKey, time.Now().Add(1*time.Hour))
+	sched.Schedule(udpKey, time.Now().Add(1*time.Hour))
+	if got := sched.EntryCount(); got != 2 {
+		t.Fatalf("precondition: EntryCount = %d, want 2", got)
+	}
+
+	removed := a.tokenStore.CleanExpired()
+	if removed != 1 {
+		t.Fatalf("CleanExpired removed %d, want 1", removed)
+	}
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("EntryCount after CleanExpired = %d, want 0 (SetOnExpire hook did not cancel both variants)", got)
+	}
+}
+
+// TestMakeFlowKey_ValidatesPortRange_FencesCancelAssumption pins the
+// MakeFlowKey contract cancelAllScheduledFlows depends on: validates
+// IPs AND port range. The cancel-path probe uses (port=0,
+// FlowProtoAny) precisely because port=0 always passes the
+// port-range check, leaving IPs as the only failure mode. Loosening
+// port validation (or tightening it onto port=0) would silently
+// break the probe's separation of IP-bad from port-bad.
+//
+// Placement: generic MakeFlowKey unit tests live in
+// expiry_scheduler_test.go; this lives here because the invariant
+// is specific to the cancel-path wiring.
+func TestMakeFlowKey_ValidatesPortRange_FencesCancelAssumption(t *testing.T) {
+	// Port=0 with valid IPs must succeed — Cancel-path probe relies on it.
+	if _, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 0, FlowProtoAny); err != nil {
+		t.Fatalf("MakeFlowKey(..., port=0, Any): want nil, got %v — Cancel probe would always fail", err)
+	}
+	// Out-of-range port must fail (the assumption that lets the probe
+	// distinguish IP-bad from port-bad).
+	if _, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 100_000, FlowProtoTCP); err == nil {
+		t.Errorf("MakeFlowKey(..., port=100000): want error, got nil — port range no longer validated; cancelAllScheduledFlows godoc is stale")
+	}
+	if _, err := MakeFlowKey("1.2.3.4", "10.0.0.1", -1, FlowProtoTCP); err == nil {
+		t.Errorf("MakeFlowKey(..., port=-1): want error, got nil — port range no longer validated; cancelAllScheduledFlows godoc is stale")
+	}
+	// Bad IP must fail regardless of port (the probe's failure mode).
+	if _, err := MakeFlowKey("not-an-ip", "10.0.0.1", 0, FlowProtoAny); err == nil {
+		t.Errorf("MakeFlowKey(badIP, port=0): want error, got nil — IP validation regressed")
+	}
+}
+
+// TestUdpAC_CancelAllScheduledFlows_PortOutOfRange_StillCancelsAnyICMP
+// fences the bug cr round 3 caught: an entry with dstAddr.Port out of
+// [0, 65535] still has its Any/ICMP-shaped scheduler entries
+// canceled (those were scheduled with port=0). Pre-fix, the TCP probe
+// would fail on the bad port and skip the whole fan-out, leaking the
+// legitimately-scheduled Any/ICMP entries.
+//
+// Practically theoretical (admission bounds the port today), but the
+// scheduler-side contract should not silently under-cancel based on
+// an upstream guarantee that future code might relax.
+func TestUdpAC_CancelAllScheduledFlows_PortOutOfRange_StillCancelsAnyICMP(t *testing.T) {
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+
+	a := &UdpAC{expirySched: sched}
+
+	// Pre-schedule the Any+ICMP shapes (port=0) — these would be the
+	// only entries created by HandleAccessControl if the admission
+	// path ever admitted a port=99999 NHP-AOP under the wildcard mode.
+	anyKey, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 0, FlowProtoAny)
+	if err != nil {
+		t.Fatalf("MakeFlowKey(any): %v", err)
+	}
+	icmpKey, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 0, FlowProtoICMP)
+	if err != nil {
+		t.Fatalf("MakeFlowKey(icmp): %v", err)
+	}
+	sched.Schedule(anyKey, time.Now().Add(1*time.Hour))
+	sched.Schedule(icmpKey, time.Now().Add(1*time.Hour))
+	if got := sched.EntryCount(); got != 2 {
+		t.Fatalf("precondition: EntryCount = %d, want 2", got)
+	}
+
+	// AccessEntry with an OUT-OF-RANGE port — the TCP/UDP probe would
+	// fail; pre-fix code would `continue` and leak the Any+ICMP entries.
+	a.cancelAllScheduledFlows(&AccessEntry{
+		SrcAddrs: []*common.NetAddress{{Ip: "1.2.3.4"}},
+		DstAddrs: []*common.NetAddress{{Ip: "10.0.0.1", Port: 99_999}},
+	})
+
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("EntryCount after cancel = %d, want 0 — port-out-of-range skipped the Any/ICMP cancellations", got)
+	}
+}
+
+// TestUdpAC_CancelAllScheduledFlows_MalformedSrcIP_SkipsFanOut fences
+// the malformed-IP branch through cancelAllScheduledFlows: the probe
+// fails, the fan-out is skipped (no Cancel calls on garbage keys),
+// and the metric ticks once per malformed (src, dst) pair — same
+// 1-per-tuple semantic as the Schedule path's malformed handling.
+//
+// Without this fence, a future regression that silently swallowed
+// the probe failure would still pass all other tests (the live
+// AC has no out-of-range IPs today), but malformed-IP cases would
+// either crash on garbage FlowKeys or stop incrementing the
+// dashboard metric that exists to surface upstream regressions.
+func TestUdpAC_CancelAllScheduledFlows_MalformedSrcIP_SkipsFanOut(t *testing.T) {
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+
+	// Pre-schedule a legitimate entry with valid IPs — must NOT be
+	// canceled when cancelAllScheduledFlows is later called with a
+	// MALFORMED srcIP entry (different tuple, but defensive fence
+	// against a regression that accidentally garbage-Canceled).
+	goodKey, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoTCP)
+	if err != nil {
+		t.Fatalf("MakeFlowKey(good): %v", err)
+	}
+	sched.Schedule(goodKey, time.Now().Add(1*time.Hour))
+
+	a := &UdpAC{expirySched: sched}
+	a.cancelAllScheduledFlows(&AccessEntry{
+		SrcAddrs: []*common.NetAddress{{Ip: "not-an-ip"}},
+		DstAddrs: []*common.NetAddress{{Ip: "10.0.0.1", Port: 80}},
+	})
+
+	// The legitimate entry must survive — malformed-IP probe should
+	// fail and the fan-out should skip; no garbage Cancel calls.
+	if got := sched.EntryCount(); got != 1 {
+		t.Errorf("EntryCount after malformed-IP cancel attempt = %d, want 1 (probe failure must skip fan-out)", got)
+	}
+}
+
+// TestUdpAC_CancelAllScheduledFlows_NilSafe pins both early-return
+// guards: nil-scheduler (feature disabled) and nil-entry. Each
+// branch asserts no scheduler state changes; without nil-entry,
+// an entry-shape regression could hide behind the nil-scheduler
+// short-circuit.
+func TestUdpAC_CancelAllScheduledFlows_NilSafe(t *testing.T) {
+	// Branch 1: scheduler disabled, non-nil entry.
+	noSched := &UdpAC{}
+	noSched.cancelAllScheduledFlows(&AccessEntry{
+		SrcAddrs: []*common.NetAddress{{Ip: "1.2.3.4"}},
+		DstAddrs: []*common.NetAddress{{Ip: "10.0.0.1", Port: 80}},
+	})
+
+	// Branch 2: scheduler enabled, nil entry. Pre-stage one
+	// unrelated scheduled entry and assert EntryCount is
+	// unchanged after the nil-entry call — guards against a
+	// regression that silently iterates a nil dereference and
+	// somehow disturbs scheduler state.
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+	unrelatedKey, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoTCP)
+	if err != nil {
+		t.Fatalf("MakeFlowKey: %v", err)
+	}
+	sched.Schedule(unrelatedKey, time.Now().Add(1*time.Hour))
+	if got := sched.EntryCount(); got != 1 {
+		t.Fatalf("precondition: EntryCount = %d, want 1", got)
+	}
+
+	withSched := &UdpAC{expirySched: sched}
+	withSched.cancelAllScheduledFlows(nil)
+
+	if got := sched.EntryCount(); got != 1 {
+		t.Errorf("EntryCount after nil-entry call = %d, want 1 (nil-entry guard touched unrelated state)", got)
 	}
 }

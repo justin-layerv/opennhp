@@ -329,13 +329,25 @@ const (
 	// root-cause fix, not a tuning change.
 	MetricUDPHandlerPanic = "UDPHandlerPanic"
 
-	// MetricL3FlushKeyMalformed is incremented when a
-	// scheduleFlushIfEnabled call site rejects its FlowKey
-	// inputs via MakeFlowKey. The kernel-state write upstream
-	// already happened; the schedule is lost for that flow.
-	// Non-zero means an upstream regression let a malformed IP
-	// (or wildcard) reach the call site — surface on dashboards
-	// rather than leaving it as a Debug log line
+	// MetricL3FlushKeyMalformed is incremented when a Schedule
+	// or Cancel call site is rejected by MakeFlowKey. Non-zero
+	// means an upstream regression let a malformed IP (or wildcard
+	// or out-of-range port) reach the call site; the kernel state
+	// is already settled, this is scheduler-side bookkeeping loss.
+	// The `op` field on the log line distinguishes Schedule vs
+	// Cancel; the counter does not carry the label.
+	//
+	// Tick rate per (src, dst) pair (cancelAllScheduledFlows
+	// iterates SrcAddrs × DstAddrs and visits each pair
+	// independently — totals scale by |SrcAddrs| × |DstAddrs|):
+	//   - Schedule: 1 tick per scheduleFlushIfEnabled call
+	//     reached, so 1–4 ticks per pair on IP-bad depending
+	//     on FilterMode + Protocol.
+	//   - Cancel: leading (port=0, Any) probe ticks once per
+	//     pair on IP-bad and short-circuits the rest of the
+	//     pair's fan-out; on port-bad the TCP/UDP follow-ups
+	//     tick once each. Any/ICMP never tick (their probe
+	//     shape can't fail port validation).
 	MetricL3FlushKeyMalformed = "L3FlushKeyMalformed"
 
 	// MetricL3FlushIpsetParseError is incremented per undecodable
