@@ -638,6 +638,27 @@ jobs:
               echo '::group::Endpoints Tests'
               cd ../endpoints && go test ./... -v -timeout 5m -race
               echo '::endgroup::'
+
+              # L3 flush scheduler inFlight-marker tests run repeatedly under
+              # -race so the detector has a better chance of catching any
+              # ordering regression on the per-key inFlight chan + cleanup
+              # defer interleavings these tests exist to fence. Single-pass
+              # -count=1 is sufficient for correctness in CI but gives weak
+              # statistical confidence on race interleavings; -count=10 keeps
+              # CI budget bounded (~10s for the eight tests, weighted by the
+              # CleanupDeferFires* polls and the MultipleWaitersBlockOnInFlight
+              # per-iteration hold) and is a hard gate before flipping
+              # L3FlushDryRun=false. See #2188.
+              #
+              # Absolute path /workspace/endpoints/ac/... rather than ./ac/...
+              # so a future reorder of steps inside this heredoc (e.g. inserting
+              # a cd into a different module between this and the Endpoints
+              # Tests step) cannot silently retarget the invocation. The
+              # Endpoints Tests step leaves cwd at /workspace/endpoints today,
+              # but that is a positional assumption we should not rely on.
+              echo '::group::L3 Flush InFlightMarker Race Stress (count=10)'
+              go test -v -timeout 5m -race -count=10 -run '^TestScheduler_InFlightMarker_' /workspace/endpoints/ac/...
+              echo '::endgroup::'
             "
 
       - name: Go vet
