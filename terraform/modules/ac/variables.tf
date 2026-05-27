@@ -201,6 +201,29 @@ variable "ipset_max_elements" {
 }
 
 # ============================================================================
+# L3 Flush-on-Expiry (active session teardown)
+# When enabled, the AC actively flushes kernel allow-state (ipset/BPF map +
+# conntrack) at the moment an entry's opnTime deadline arrives, terminating
+# in-flight TCP connections at session end. Without this, established
+# connections outlive ipset expiry via the ESTABLISHED-bypass rule
+# (iptables mode) or the XDP conn_track short-circuit (eBPF mode). The
+# scheduler, flushers, and safety guards live in endpoints/ac/expiry_*.
+# Operator-facing runbooks: docs/runbooks/l3-flush-*.md.
+# ============================================================================
+
+variable "enable_l3_flush_on_expiry" {
+  description = "Enable the L3 flush-on-expiry scheduler. When false (default), the scheduler is not instantiated and the AC's session-end behavior is unchanged from the pre-flush baseline (established connections outlive ipset expiry). Plumbed into the AC's config.toml as EnableL3FlushOnExpiry; the Go side gates all scheduler construction and flusher wiring on this flag (endpoints/ac/udpac.go::start)."
+  type        = bool
+  default     = false
+}
+
+variable "l3_flush_dry_run" {
+  description = "Gate the L3 flush scheduler into log-only mode. When true (default), the scheduler logs each intended flush without invoking conntrack/BPF map deletion. Independent of enable_l3_flush_on_expiry — has no effect when the scheduler is not enabled. Safe-default: an AC that boots with enable_l3_flush_on_expiry=true but l3_flush_dry_run unset/false is auto-forced to dry-run for the first reload (endpoints/ac/config.go::updateBaseConfig) so an operator must explicitly acknowledge real-flush by re-applying with l3_flush_dry_run=false."
+  type        = bool
+  default     = true
+}
+
+# ============================================================================
 # Cloud Mode Registration
 # AC registers with NHP servers using credentials for DynamoDB license validation
 # ============================================================================

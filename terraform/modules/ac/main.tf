@@ -886,6 +886,13 @@ locals {
     ipset_default_timeout = var.ipset_default_timeout
     ipset_temp_timeout    = var.ipset_temp_timeout
     ipset_max_elements    = var.ipset_max_elements
+    # L3 flush-on-expiry — defaults preserve pre-flush behavior. The Go-side
+    # first-load safety (endpoints/ac/config.go::updateBaseConfig) forces
+    # dry-run on a boot where EnableL3FlushOnExpiry=true and L3FlushDryRun
+    # is unset/false, so a single reload with real-flush requested is still
+    # safe; operators acknowledge by reapplying with l3_flush_dry_run=false.
+    enable_l3_flush_on_expiry = var.enable_l3_flush_on_expiry
+    l3_flush_dry_run          = var.l3_flush_dry_run
     # Per-instance key generation
     name_prefix         = var.name_prefix
     secrets_kms_key_arn = var.secrets_kms_key_arn != null ? var.secrets_kms_key_arn : ""

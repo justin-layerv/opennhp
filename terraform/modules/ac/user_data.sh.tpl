@@ -859,6 +859,14 @@ AuthServiceId = "${auth_service_id}"
 ResourceIds = ${resource_ids}
 FilterMode = 0
 
+# L3 flush-on-expiry. Toml keys match the Go struct field names
+# (endpoints/ac/config.go) — not the json tags, which the toml unmarshaler
+# does not honor. Defaults of false/true preserve pre-flush behavior; see
+# docs/runbooks/l3-flush-*.md for the rollout sequence and the safety
+# auto-default fenced in endpoints/ac/config.go::updateBaseConfig.
+EnableL3FlushOnExpiry = ${enable_l3_flush_on_expiry}
+L3FlushDryRun = ${l3_flush_dry_run}
+
 # Cloud mode registration credentials (license key is globally unique)
 LicenseKey = "${license_key}"
 ServerEndpoint = "${server_endpoint}"

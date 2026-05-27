@@ -1050,6 +1050,10 @@ module "ac" {
   server_endpoint   = module.compute.nlb_dns_name # External ACs use public NLB
   server_secret_arn = module.compute.server_secret_arn
 
+  # L3 flush-on-expiry (active session teardown).
+  enable_l3_flush_on_expiry = var.enable_l3_flush_on_expiry
+  l3_flush_dry_run          = var.l3_flush_dry_run
+
   # License credentials for cloud mode registration
   # Default to empty strings to prevent null interpolation errors in user_data template
   customer_id        = var.ac_customer_id != null ? var.ac_customer_id : ""

@@ -365,6 +365,18 @@ variable "enable_cloudfront" {
   default     = false
 }
 
+variable "enable_l3_flush_on_expiry" {
+  description = "Root passthrough for the AC module's enable_l3_flush_on_expiry. When true the AC actively flushes kernel allow-state (ipset/BPF map + conntrack) at session-end deadline, terminating in-flight TCP connections. Default false preserves pre-flush behavior (established connections outlive ipset expiry). See modules/ac/variables.tf for full semantics and docs/runbooks/l3-flush-*.md for the rollout sequence."
+  type        = bool
+  default     = false
+}
+
+variable "l3_flush_dry_run" {
+  description = "Root passthrough for the AC module's l3_flush_dry_run. When true the scheduler logs intended flushes without invoking conntrack/BPF map deletion — the dry-run audit signal feeds an operator's call to flip to false. Default true; has no effect when enable_l3_flush_on_expiry=false. The Go-side first-load safety auto-defaults dry-run=true if the operator flips enable_l3_flush_on_expiry=true with dry-run unset/false, so a misconfiguration falls back to log-only."
+  type        = bool
+  default     = true
+}
+
 variable "ac_auth_service_id" {
   description = "Authentication service ID for the Access Controller — the NHP aspId the agent-knock dispatch keys on. Default `agent` matches the agent staticplugin's PluginID (endpoints/server/staticplugins/agent/plugin.go); a rename here without renaming the plugin (or vice versa) silently re-introduces 'failed to find service provider' at knock time."
   type        = string
