@@ -35,6 +35,21 @@ Other causes worth checking:
 - High `shard.mu` contention from a million-session burst at the same shard → look at `L3FlushBucketMaxDepth` for hot-shard hot-bucket evidence.
 - `flushCallTimeout` was tuned down (post-#2165) below the actual flusher latency → check the runtime tuning history.
 
+## Why the alarm latches (and what clears it)
+
+The `${name_prefix}-ac-l3-flush-schedule-wait-timeout` CloudWatch alarm uses `Statistic=Maximum` on a monotonic counter gauge, so once a single AC ticks the metric the alarm sits in ALARM until that AC's `ScheduleWaitTimeout` snapshot goes back to 0.
+
+Because the counter is per-process and never resets except by process exit, clearing the alarm requires the offending instance to be replaced — but that can be:
+
+- **An ASG instance refresh** (manual `aws autoscaling start-instance-refresh ...` or the next blue/green flip).
+- **A health-check replacement** triggered by an unrelated alarm (CPU, disk, etc.).
+- **An explicit SSM `systemctl restart nhp-acd`**.
+- **A scale-in** that happens to terminate the offending instance.
+
+Operators do NOT need to SSH and manually restart the AC unless they want immediate clearance — letting the offending instance roll out via any of the above paths drops `Maximum` to 0 within ~60s of the replacement, and the alarm OKs within 2 evaluation periods.
+
+The fleet-wide `Maximum` model means a single ticking AC keeps the alarm loud regardless of how many other ACs are clean — which is correct (the operator needs to know one AC is stuck) but should not be read as "the whole fleet is broken."
+
 ## Verification after mitigation
 
 After the mitigation lands (config change + AC restart, or breaker reset + flusher fix):

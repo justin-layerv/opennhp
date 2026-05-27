@@ -328,6 +328,62 @@ resource "aws_cloudwatch_metric_alarm" "registration_stale" {
   })
 }
 
+# L3FlushScheduleWaitTimeout is a cumulative counter (gauge of total wait
+# timeouts since AC start) published every 60s by RegisterGaugeFunc. The
+# scheduler increments it inside Schedule() when waiting for an in-flight
+# Flush exceeds flushCallTimeout + scheduleWaitSlop, which fires the
+# force-insert bypass — sustained non-zero readings mean a chronically
+# stuck flusher and operators must notice before flipping L3FlushDryRun=false.
+#
+# Latching is intentional. Because the metric is a cumulative counter
+# (not a per-interval event count like RegistrationSuccess above), Maximum
+# stays > 0 until the AC process restarts. That keeps the alarm loud until
+# an operator follows the runbook and decides whether the cause is a real
+# stuck flusher (restart + investigate) or GC-STW noise (widen
+# scheduleWaitSlop). DIFF-based metric math would auto-OK and lose the
+# acknowledgement requirement — and the repo has burned three PRs on TF
+# metric_math fragility (terraform/CLAUDE.md gotcha #1104→#1109), so the
+# simpler single-metric shape matches the existing AC alarm precedent.
+#
+# When the L3 flush scheduler is disabled (default), the gauge closure
+# returns 0 unconditionally — the alarm stays in OK on every AC. After
+# L3FlushDryRun=false in prod this becomes a paging signal; until then
+# it's an operator dashboard item.
+#
+# treat_missing_data=notBreaching: the gauge is registered unconditionally
+# but only emits during the 60s registration loop tick. A boot or short
+# registration outage produces a missing-data window we don't want to
+# alarm on (false-positive surface unrelated to the flusher's health).
+#
+# Runbook: docs/runbooks/l3-flush-schedule-wait-timeout.md.
+resource "aws_cloudwatch_metric_alarm" "l3_flush_schedule_wait_timeout" {
+  count = var.enable_cloudwatch_alarms ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-ac-l3-flush-schedule-wait-timeout"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "L3FlushScheduleWaitTimeout"
+  namespace           = "LayerV/NHP"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = 0
+  alarm_description   = "Latches until the offending AC instance is replaced (refresh / health-check / restart). AC L3 flush scheduler reported a Schedule() wait timeout (cumulative counter > 0) for 2 consecutive 1-minute windows. Indicates a chronically stuck flusher blocking Schedule() past flushCallTimeout + scheduleWaitSlop. Must clear before flipping L3FlushDryRun=false. See docs/runbooks/l3-flush-schedule-wait-timeout.md."
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    Component   = "AC"
+    Environment = var.environment
+    Region      = data.aws_region.current.id
+  }
+
+  alarm_actions = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions    = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-ac-l3-flush-schedule-wait-timeout"
+  })
+}
+
 # ==================== CloudWatch Dashboard ====================
 
 locals {
@@ -521,6 +577,7 @@ resource "aws_cloudwatch_dashboard" "ac_monitoring" {
             aws_cloudwatch_metric_alarm.servers_healthy_low[0].arn,
             aws_cloudwatch_metric_alarm.registration_stale[0].arn,
             aws_cloudwatch_metric_alarm.udp_handler_panic[0].arn,
+            aws_cloudwatch_metric_alarm.l3_flush_schedule_wait_timeout[0].arn,
             ],
             var.enable_egress_eips ? [
               aws_cloudwatch_metric_alarm.eip_pool_utilization_high[0].arn,
