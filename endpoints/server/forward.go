@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/OpenNHP/opennhp/endpoints/server/internal/qurlplacement"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
@@ -297,6 +298,15 @@ func (f *ServerForwarder) HandleForwardRequest(
 		return
 	}
 
+	f.handleDecryptedForwardedKnock(ppd, fwdMsg, userAddr, knockPpd)
+}
+
+func (f *ServerForwarder) handleDecryptedForwardedKnock(
+	ppd *core.PacketParserData,
+	fwdMsg *common.ServerForwardMsg,
+	userAddr *net.UDPAddr,
+	knockPpd *core.PacketParserData,
+) {
 	// Step 2: Parse the knock message
 	knkMsg := &common.AgentKnockMsg{}
 	if err := json.Unmarshal(knockPpd.BodyMessage, knkMsg); err != nil {
@@ -305,20 +315,30 @@ func (f *ServerForwarder) HandleForwardRequest(
 		return
 	}
 
-	// Resolve the auth service provider FIRST so a DDB-only aspId
-	// (one whose entry on this server was never populated by a prior
-	// LOCAL knock — easily possible if all knocks for that aspId
-	// arrive via forwarding because of AC affinity) is installed in
-	// s.authServiceMap BEFORE the next step's FindACConnectionsForKnock
-	// looks the AC up.
-	//
-	// FindACConnectionsForKnock calls FindAuthSvcProvider internally
-	// (udpserver.go) — the bare in-memory map lookup. If the aspId is
-	// DDB-only and we asked for AC connections first, that call would
-	// return nil → AC_NOT_CONNECTED reject before the resolver ever
-	// got a chance to populate the map. The two calls MUST stay in
-	// this order; an inversion silently dark-routes every DDB-only
-	// forwarded knock.
+	agentPubKey, ok := forwardedAgentPubKey(knockPpd)
+	if !ok {
+		// The forward receiver should only reach this point after the inner
+		// knock decrypts through Noise IK, which authenticates and populates
+		// RemotePubKey. Fail closed if that upstream invariant ever regresses
+		// rather than letting user-controlled knkMsg.UserId steer qURL tunnel
+		// placement.
+		log.Error("Forwarded knock missing authenticated RemotePubKey: tx=%d resource=%s authSvc=%s",
+			fwdMsg.TransactionId, knkMsg.ResourceId, knkMsg.AuthServiceId)
+		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "INVALID_AGENT_PUBKEY", "Forwarded knock missing authenticated agent public key")
+		return
+	}
+	placementIdentity := qurlplacement.Identity{
+		PublicKey: agentPubKey,
+		UserID:    knkMsg.UserId,
+	}
+
+	// Resolve the auth service provider before qURL placement so the placement
+	// step receives the DDB-backed ASP catalog for this authSvcId. The resolved
+	// ResourceData then feeds both FindACConnectionsForResource and ACK
+	// construction. Pubkey validation stays above this lookup so malformed
+	// forwarded knocks fail closed without burning a catalog/DDB read. The
+	// resolver must still run before AC lookup: it installs DDB-only aspIds
+	// into the in-memory map that some AC selection paths read.
 	aspData := f.deps.ResolveAuthSvcProvider(f.deps.LifecycleCtx(), knkMsg.AuthServiceId,
 		fmt.Sprintf("forward-receiver tx=%d resource=%s authSvc=%s", fwdMsg.TransactionId, knkMsg.ResourceId, knkMsg.AuthServiceId))
 	if aspData == nil {
@@ -327,10 +347,32 @@ func (f *ServerForwarder) HandleForwardRequest(
 		return
 	}
 
-	// Find all AC connections for this resource. Reads authServiceMap
-	// (populated above by the resolver for the DDB-only case) to get
-	// the acId, then looks up the AC.
-	acConns := f.deps.FindACConnectionsForKnock(knkMsg)
+	// Resolve qURL placement exactly once. The same ResourceData feeds both AC
+	// selection and ACK ResourceHost construction so future health-aware
+	// placement cannot pick AZ A for the AC operation while ACK'ing AZ B.
+	resData := qurlplacement.ResolveResource(knkMsg.ResourceId, placementIdentity, aspData)
+	if resData == nil {
+		log.Error("Resource not found for forwarded knock: %s", knkMsg.ResourceId)
+		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "RESOURCE_NOT_FOUND", "Resource not found")
+		return
+	}
+
+	resInfo := qurlplacement.OnlyResourceInfo(resData)
+	if resInfo == nil || resInfo.Addr == nil {
+		log.Error("Resource info not found for forwarded knock: %s", knkMsg.ResourceId)
+		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "RESOURCE_INFO_NOT_FOUND", "Resource info not found")
+		return
+	}
+	resourceHost := resInfo.DestHost()
+	if resourceHost == "" {
+		log.Error("Resource info incomplete for forwarded knock: %s", knkMsg.ResourceId)
+		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "RESOURCE_INFO_INCOMPLETE", "Resource info missing usable destination host")
+		return
+	}
+
+	// Find all AC connections for this already-resolved resource. Reads the
+	// resource's AC ID, then looks up currently live AC connections.
+	acConns := f.deps.FindACConnectionsForResource(knkMsg, resData)
 	if acConns == nil || len(acConns) == 0 {
 		log.Warning("No AC connection found for forwarded knock (resource=%s, authSvc=%s)",
 			knkMsg.ResourceId, knkMsg.AuthServiceId)
@@ -342,21 +384,6 @@ func (f *ServerForwarder) HandleForwardRequest(
 	srcAddr := &common.NetAddress{
 		Ip:   userAddr.IP.String(),
 		Port: userAddr.Port,
-	}
-
-	// Find resource data and resource info
-	resData := aspData.GetResourceData(knkMsg.ResourceId)
-	if resData == nil {
-		log.Error("Resource not found for forwarded knock: %s", knkMsg.ResourceId)
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "RESOURCE_NOT_FOUND", "Resource not found")
-		return
-	}
-
-	resInfo := aspData.FindResource(knkMsg.ResourceId)
-	if resInfo == nil || resInfo.Addr == nil {
-		log.Error("Resource info not found for forwarded knock: %s", knkMsg.ResourceId)
-		f.sendForwardResult(ppd, fwdMsg.TransactionId, false, nil, "RESOURCE_INFO_NOT_FOUND", "Resource info not found")
-		return
 	}
 
 	// Build destination addresses
@@ -421,7 +448,7 @@ func (f *ServerForwarder) HandleForwardRequest(
 		ACTokens:         make(map[string]string),
 		PreAccessActions: make(map[string]*common.PreAccessInfo),
 	}
-	ackMsg.ResourceHost[knkMsg.ResourceId] = resInfo.DestHost()
+	ackMsg.ResourceHost[knkMsg.ResourceId] = resourceHost
 	if artMsg != nil {
 		ackMsg.ACTokens[knkMsg.ResourceId] = artMsg.ACToken
 		if artMsg.PreAccessAction != nil {
@@ -452,7 +479,7 @@ func (f *ServerForwarder) HandleForwardRequest(
 		// the forward.
 		ownerId := f.deps.ResolveOwnerIDByPubKey(
 			f.deps.LifecycleCtx(),
-			base64.StdEncoding.EncodeToString(knockPpd.RemotePubKey),
+			agentPubKey,
 		)
 		if publishErr := f.deps.PublishACKTokens(f.deps.LifecycleCtx(), knkMsg, ackMsg, srcAddr.Ip, int(openTime), ownerId); publishErr != nil {
 			log.Error("Failed to persist ACK token metadata for forwarded knock: %v", publishErr)
@@ -518,6 +545,13 @@ func (f *ServerForwarder) decryptForwardedKnock(knockData []byte, userAddr *net.
 	}
 
 	return knockPpd, nil
+}
+
+func forwardedAgentPubKey(knockPpd *core.PacketParserData) (string, bool) {
+	if knockPpd == nil || len(knockPpd.RemotePubKey) != 32 {
+		return "", false
+	}
+	return base64.StdEncoding.EncodeToString(knockPpd.RemotePubKey), true
 }
 
 // HandleForwardResult processes an incoming NHP_FRT message.

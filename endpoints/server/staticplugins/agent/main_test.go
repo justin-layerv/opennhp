@@ -2,6 +2,7 @@ package agent
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
@@ -42,13 +43,10 @@ func newHelper(asp *common.AuthServiceProviderData, capture *callbackCapture, re
 	}
 }
 
-// newAspWithTunnelServer builds the fixture that mirrors what the DDB
-// bridge (`endpoints/server/resource_lookup.go::queryAndCache`)
-// materializes for a `nhp_resources` row with
-// `auth_service_id = "agent"` and `resource_id = "qurl-tunnel-server"`:
-// a top-level "agent" AuthServiceProvider whose ResourceGroups holds
-// one resource keyed the same as the resource group. Inner-equals-
-// outer is load-bearing (see resource_lookup.go inline doc).
+// newAspWithTunnelServer builds a direct-row fixture for the defensive
+// normalization path. Standard qURL tunnel rows are per-AZ suffix rows, but if
+// a manual/test catalog includes a placement-neutral row, AuthWithNHP must
+// still force the ACK host into explicit host:port form.
 func newAspWithTunnelServer() *common.AuthServiceProviderData {
 	return &common.AuthServiceProviderData{
 		AuthSvcId: "agent",
@@ -61,7 +59,7 @@ func newAspWithTunnelServer() *common.AuthServiceProviderData {
 					Resources: map[string]*common.ResourceInfo{
 						"qurl-tunnel-server": {
 							ACId:     "layerv-ac-tf",
-							Hostname: "connect.layerv.xyz",
+							Hostname: "connect.test",
 							// Ip is empty intentionally so DestHost() falls back to
 							// Hostname (see nhpmsg.go DestHost / Hosts). The
 							// agent flow carries Hostname (customer-facing AC
@@ -80,6 +78,40 @@ func newAspWithTunnelServer() *common.AuthServiceProviderData {
 	}
 }
 
+func newAspWithTunnelServerAZRows() *common.AuthServiceProviderData {
+	return &common.AuthServiceProviderData{
+		AuthSvcId: "agent",
+		ResourceGroups: common.ResourceGroupMap{
+			"qurl-tunnel-server-a": newTunnelServerAZResource("qurl-tunnel-server-a", 7000),
+			"qurl-tunnel-server-b": newTunnelServerAZResource("qurl-tunnel-server-b", 7001),
+			"qurl-tunnel-server-c": newTunnelServerAZResource("qurl-tunnel-server-c", 7002),
+		},
+	}
+}
+
+func newTunnelServerAZResource(resourceID string, port int) *common.ResourceData {
+	return &common.ResourceData{
+		ResourceGroup: common.ResourceGroup{
+			AuthServiceId: "agent",
+			ResourceId:    resourceID,
+			OpenTime:      120,
+			Resources: map[string]*common.ResourceInfo{
+				resourceID: {
+					ACId:       "layerv-ac-tf",
+					Hostname:   "connect.test",
+					PortSuffix: true,
+					Addr: &common.NetAddress{
+						Ip:       "",
+						Port:     port,
+						Protocol: "tcp",
+					},
+				},
+			},
+		},
+		SkipAuth: true,
+	}
+}
+
 func newKnockReq(resourceId string) *common.NhpAuthRequest {
 	return &common.NhpAuthRequest{
 		Msg: &common.AgentKnockMsg{
@@ -93,6 +125,80 @@ func newKnockReq(resourceId string) *common.NhpAuthRequest {
 		// that base64-decodes this field will fail loud with a parse
 		// error rather than silently returning 32 garbage bytes.
 		PublicKey: "PLACEHOLDER!NOT-A-REAL-X25519-PUBKEY",
+	}
+}
+
+func TestAuthWithNHP_QURLTunnelServerPlacementIsServerOwned(t *testing.T) {
+	capture := &callbackCapture{}
+	helper := newHelper(newAspWithTunnelServerAZRows(), capture, nil)
+	req := newKnockReq("qurl-tunnel-server")
+	req.PublicKey = "client-instance-public-key-a"
+
+	ack, err := AuthWithNHP(req, helper)
+	if err != nil {
+		t.Fatalf("AuthWithNHP returned err: %v", err)
+	}
+	if ack.ErrCode != common.ErrSuccess.ErrorCode() {
+		t.Fatalf("ack.ErrCode=%q want success", ack.ErrCode)
+	}
+	if capture.calls != 1 {
+		t.Fatalf("callback calls=%d want=1", capture.calls)
+	}
+	if capture.res == nil {
+		t.Fatal("callback res=nil")
+	}
+	if got := capture.res.ResourceId; got != "qurl-tunnel-server" {
+		t.Fatalf("callback resource_id=%q want placement-neutral qurl-tunnel-server", got)
+	}
+	if _, leaked := capture.res.Resources["qurl-tunnel-server-a"]; leaked {
+		t.Fatalf("callback Resources leaked per-AZ key qurl-tunnel-server-a: %+v", capture.res.Resources)
+	}
+	if _, leaked := capture.res.Resources["qurl-tunnel-server-b"]; leaked {
+		t.Fatalf("callback Resources leaked per-AZ key qurl-tunnel-server-b: %+v", capture.res.Resources)
+	}
+	if _, leaked := capture.res.Resources["qurl-tunnel-server-c"]; leaked {
+		t.Fatalf("callback Resources leaked per-AZ key qurl-tunnel-server-c: %+v", capture.res.Resources)
+	}
+	info := capture.res.Resources["qurl-tunnel-server"]
+	if info == nil {
+		t.Fatalf("callback Resources missing placement-neutral key: %+v", capture.res.Resources)
+	}
+	if got := info.DestHost(); got == "" || got == "connect.test" {
+		t.Fatalf("DestHost()=%q want explicit public host:port from selected AZ row", got)
+	}
+	if !info.PortSuffix {
+		t.Fatal("PortSuffix=false want true so ACK carries an explicit port")
+	}
+	if capture.resourceHostAtEntry != nil {
+		t.Errorf("ackMsg.ResourceHost at callback entry=%v want nil — callback owns ACK host map population", capture.resourceHostAtEntry)
+	}
+}
+
+func TestAuthWithNHP_QURLTunnelServerPlacementDistributesByClientIdentity(t *testing.T) {
+	asp := newAspWithTunnelServerAZRows()
+	counts := map[string]int{}
+
+	for i := 0; i < 600; i++ {
+		req := newKnockReq("qurl-tunnel-server")
+		req.PublicKey = fmt.Sprintf("client-instance-public-key-%03d", i)
+		res := resolveResourceForRequest(req, asp)
+		if res == nil {
+			t.Fatalf("resolveResourceForRequest(%d) returned nil", i)
+		}
+		info := res.Resources["qurl-tunnel-server"]
+		if info == nil {
+			t.Fatalf("resolveResourceForRequest(%d) missing qurl-tunnel-server resource: %+v", i, res.Resources)
+		}
+		counts[info.DestHost()]++
+	}
+
+	if len(counts) != 3 {
+		t.Fatalf("placement counts=%v want all three AZ ports represented", counts)
+	}
+	for host, count := range counts {
+		if count < 150 || count > 250 {
+			t.Fatalf("placement counts=%v; host %q got %d of 600, want rough even spread", counts, host, count)
+		}
 	}
 }
 
@@ -117,8 +223,11 @@ func TestAuthWithNHP_DispatchesAgentKnock(t *testing.T) {
 	if capture.res == nil || capture.res.ResourceId != "qurl-tunnel-server" {
 		t.Fatalf("callback got res=%+v, want non-nil with ResourceId=\"qurl-tunnel-server\"", capture.res)
 	}
-	if hosts := capture.res.Hosts(); hosts["qurl-tunnel-server"] == "" {
-		t.Errorf("captured res.Hosts()=%v want non-empty qurl-tunnel-server entry — the resource the callback dispatches against must carry a host", hosts)
+	if hosts := capture.res.Hosts(); hosts["qurl-tunnel-server"] != "connect.test:7000" {
+		t.Errorf("captured res.Hosts()=%v want explicit qurl-tunnel-server host:port entry", hosts)
+	}
+	if info := capture.res.Resources["qurl-tunnel-server"]; info == nil || !info.PortSuffix {
+		t.Fatalf("callback info=%+v want PortSuffix=true so the ACK never relies on client YAML/server.port fallback", info)
 	}
 	// Pin the no-pre-write contract: `handleNhpOpenResource` re-inits
 	// ackMsg.ResourceHost via `make(map[string]string)` and populates
@@ -221,6 +330,24 @@ func TestAuthWithNHP_NilAspDataReturnsErrAuthServiceProviderNotFound(t *testing.
 	}
 	if capture.calls != 0 {
 		t.Errorf("callback calls=%d want=0 on nil-aspData", capture.calls)
+	}
+}
+
+func TestAuthWithNHP_EmptyPublicKeyReturnsErrInvalidInput(t *testing.T) {
+	capture := &callbackCapture{}
+	helper := newHelper(newAspWithTunnelServerAZRows(), capture, nil)
+	req := newKnockReq("qurl-tunnel-server")
+	req.PublicKey = ""
+
+	ack, err := AuthWithNHP(req, helper)
+	if !errors.Is(err, common.ErrInvalidInput) {
+		t.Fatalf("AuthWithNHP err=%v want=ErrInvalidInput (51101) — missing authenticated pubkey must fail closed before placement", err)
+	}
+	if ack.ErrCode != common.ErrInvalidInput.ErrorCode() {
+		t.Fatalf("ack.ErrCode=%q want %q", ack.ErrCode, common.ErrInvalidInput.ErrorCode())
+	}
+	if capture.calls != 0 {
+		t.Fatalf("callback calls=%d want=0 for missing public key", capture.calls)
 	}
 }
 

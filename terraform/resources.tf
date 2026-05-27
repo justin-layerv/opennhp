@@ -13,17 +13,15 @@
 # That dual-write path was removed once the bridge proved out — the
 # DDB row is now the single source of truth.
 locals {
-  # Legacy NHP resId for the reverse-tunnel control channel. Kept as a
-  # compatibility alias for pre-per-AZ clients; new clients knock the
-  # suffix-specific resources below so the AC can return a port-suffixed
-  # ResourceHost that dials the matching public listener.
+  # Placement-neutral NHP resId for the reverse-tunnel control channel. Clients
+  # knock this ID; nhp-server chooses an AZ-specific row internally and returns
+  # the chosen public FRP host:port in the ACK under this same key.
   tunnel_server_res_id = "qurl-tunnel-server"
 
   tunnel_server_resources_enabled = var.deploy_frps && var.deploy_qurl_service
 
-  # Deterministic AZ ordering is load-bearing for two public contracts:
-  #   1. primary/legacy qurl-tunnel-server keeps using frps_bind_port;
-  #   2. suffix resources map to frps_bind_port + index.
+  # Deterministic AZ ordering is load-bearing for the public port map:
+  # suffix resources map to frps_bind_port + index.
   #
   # The port map is the only practical way to expose per-AZ public
   # control ingress on one DNS name: FRP control is raw TCP/yamux, so an
@@ -35,27 +33,34 @@ locals {
 
   # Resource row shape:
   #
+  # Rollout order is load-bearing: deploy an nhp-server image that knows how
+  # to resolve the placement-neutral qurl-tunnel-server ID into these per-AZ
+  # rows BEFORE applying Terraform that removes the old placement-neutral row.
+  # A stale server fleet would otherwise see only qurl-tunnel-server-{suffix}
+  # rows and reject every standard qURL tunnel knock as RESOURCE_INFO_NOT_FOUND.
+  # The converse is safe: a new server can run while the direct row still
+  # exists because authenticated agent knocks carry PublicKey and prefer the
+  # per-AZ rows; the direct-row fallback is only for empty-identity transition
+  # probes. Rollback has the inverse order: recreate the direct row before
+  # rolling back to an older server image. Any transition/debug direct row must
+  # include an explicit port; the placement-neutral alias now forces port_suffix
+  # so clients receive a complete ACK host:port and never rely on YAML fallback.
+  #
+  # Today placement is catalog-driven, not live-health-aware. If an AZ endpoint
+  # is unavailable, remove its suffix row from this catalog (or roll out the
+  # health-aware resolver tracked in #2191) before expecting identities pinned
+  # to that AZ to re-place elsewhere.
+  #
   #   - dest_host: internal per-AZ Cloud Map name. Informational for the
   #     NHP ack today, but useful for forensics and for the AC module's
   #     public-listener -> private-FRPS forwarding contract.
   #
   #   - customer_facing_host/customer_facing_port: public connect.layerv.*
   #     endpoint the agent dials after a successful knock. Non-primary
-  #     rows set port_suffix=true so ResourceInfo.DestHost() returns
+  #     rows set port_suffix=true so ResourceInfo.DestHost() always returns
   #     "connect.layerv.*:<port>" and the ipset-opened tuple matches the
-  #     per-AZ public listener. The legacy alias and primary suffix row
-  #     deliberately keep port_suffix=false so clients on the default
-  #     BoundaryPort=7000 keep receiving the historic bare hostname.
-  tunnel_server_legacy_resources = (
-    local.tunnel_server_primary_host != "" ? {
-      (local.tunnel_server_res_id) = {
-        dest_host            = local.tunnel_server_primary_host
-        customer_facing_host = var.connect_layerv_host
-        customer_facing_port = var.frps_bind_port
-        port_suffix          = false
-      }
-    } : {}
-  )
+  #     per-AZ public listener. Even the primary port is explicit: standard
+  #     clients do not carry a fallback FRP port in YAML.
 
   tunnel_server_az_resources = {
     for suffix in local.tunnel_server_az_suffixes :
@@ -63,18 +68,13 @@ locals {
       dest_host            = "frps-${suffix}.${module.data.namespace_name}"
       customer_facing_host = var.connect_layerv_host
       customer_facing_port = local.tunnel_server_az_control_port[suffix]
-      # Non-primary suffixes append the public listener port; the
-      # primary suffix keeps the default frps_bind_port. That makes the
-      # primary suffix row a structural duplicate of the legacy alias
-      # today, intentionally preserving a symmetric per-AZ resource ID
-      # while leaving room to retire the legacy alias independently.
-      port_suffix = local.tunnel_server_az_control_port[suffix] != var.frps_bind_port
+      port_suffix          = true
     }
   }
 
   tunnel_server_resource_ids = (
     local.tunnel_server_resources_enabled
-    ? merge(local.tunnel_server_legacy_resources, local.tunnel_server_az_resources)
+    ? local.tunnel_server_az_resources
     : {}
   )
 

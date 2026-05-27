@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenNHP/opennhp/endpoints/server/internal/qurlplacement"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
@@ -746,7 +747,7 @@ func (d *e2eForwarderDeps) SendMessage(md *core.MsgData) {
 	d.device.SendMsgToPacket(md)
 }
 
-func (d *e2eForwarderDeps) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*ACConn {
+func (d *e2eForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, _ *common.ResourceData) []*ACConn {
 	return nil
 }
 
@@ -954,6 +955,111 @@ func TestE2E_HandleForwardRequest_RealDecryption(t *testing.T) {
 	t.Log("SUCCESS: HandleForwardRequest successfully decrypted the knock!")
 }
 
+func TestE2E_HandleForwardRequest_InvalidAgentPubKeyAfterDecrypt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping E2E test in short mode")
+	}
+
+	serverNode := newE2ETestNode(t, "server")
+	serverNode.Start()
+	defer serverNode.Stop()
+
+	clientNode := newE2ETestNode(t, "client")
+	clientNode.Start()
+	defer clientNode.Stop()
+
+	clientNode.AddPeer(serverNode)
+	serverNode.AddPeer(clientNode)
+
+	time.Sleep(200 * time.Millisecond)
+
+	knockMsg := &common.AgentKnockMsg{
+		HeaderType:    core.NHP_KNK,
+		UserId:        "test-user",
+		DeviceId:      "test-device",
+		AuthServiceId: "test-asp",
+		ResourceId:    qurlplacement.TunnelServerResourceID,
+	}
+	knockBytes, err := json.Marshal(knockMsg)
+	if err != nil {
+		t.Fatalf("marshal knock message: %v", err)
+	}
+
+	encryptedKnock, err := captureEncryptedPacket(clientNode, serverNode, core.NHP_KNK, knockBytes)
+	if err != nil {
+		t.Fatalf("capture encrypted packet: %v", err)
+	}
+
+	var capturedResult *common.ServerForwardResultMsg
+	var resultMu sync.Mutex
+	resultCaptured := make(chan struct{}, 1)
+	deps := &capturingForwarderDeps{
+		hostname: "server",
+		device:   serverNode.device,
+		node:     serverNode,
+		onSend: func(md *core.MsgData) {
+			if md.HeaderType != core.NHP_FRT {
+				return
+			}
+			var result common.ServerForwardResultMsg
+			if err := json.Unmarshal(md.Message, &result); err != nil {
+				t.Errorf("unmarshal NHP_FRT: %v", err)
+				return
+			}
+			resultMu.Lock()
+			capturedResult = &result
+			resultMu.Unlock()
+			select {
+			case resultCaptured <- struct{}{}:
+			default:
+			}
+		},
+	}
+	forwarder := NewServerForwarder(deps)
+
+	fwdMsg := &common.ServerForwardMsg{
+		KnockData:     encryptedKnock,
+		SourceServer:  "other-server",
+		UserAddr:      "192.168.1.100:12345",
+		TransactionId: 100001,
+		Timestamp:     time.Now().Unix(),
+	}
+	userAddr, err := net.ResolveUDPAddr("udp", fwdMsg.UserAddr)
+	if err != nil {
+		t.Fatalf("resolve user addr: %v", err)
+	}
+
+	knockPpd, err := forwarder.decryptForwardedKnock(fwdMsg.KnockData, userAddr)
+	if err != nil {
+		t.Fatalf("decrypt forwarded knock: %v", err)
+	}
+	if len(knockPpd.RemotePubKey) != 32 {
+		t.Fatalf("decrypted RemotePubKey len=%d want 32 before test corruption", len(knockPpd.RemotePubKey))
+	}
+	knockPpd.RemotePubKey = nil
+
+	forwarder.handleDecryptedForwardedKnock(&core.PacketParserData{HeaderType: core.NHP_FWD}, fwdMsg, userAddr, knockPpd)
+
+	select {
+	case <-resultCaptured:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for NHP_FRT response")
+	}
+
+	resultMu.Lock()
+	result := capturedResult
+	resultMu.Unlock()
+	if result == nil {
+		t.Fatal("no result captured")
+	}
+	if result.Success {
+		t.Fatalf("Success=true want false")
+	}
+	if result.ErrCode != "INVALID_AGENT_PUBKEY" {
+		t.Fatalf("ErrCode=%q ErrMsg=%q want INVALID_AGENT_PUBKEY", result.ErrCode, result.ErrMsg)
+	}
+}
+
 // capturingForwarderDeps wraps e2eForwarderDeps with a callback on SendMessage.
 type capturingForwarderDeps struct {
 	hostname string
@@ -979,7 +1085,7 @@ func (d *capturingForwarderDeps) SendMessage(md *core.MsgData) {
 	// since we're only testing decryption, not the full network round-trip.
 }
 
-func (d *capturingForwarderDeps) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*ACConn {
+func (d *capturingForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, _ *common.ResourceData) []*ACConn {
 	return nil
 }
 
@@ -1096,6 +1202,7 @@ type mockACForwarderDeps struct {
 	serverNode   *E2ETestNode
 	mockACNode   *E2ETestNode
 	onSendResult func(*common.ServerForwardResultMsg)
+	aspData      *common.AuthServiceProviderData
 	t            *testing.T
 	tokensMu     sync.Mutex
 	storedTokens map[string]*ACTokenEntry
@@ -1128,7 +1235,16 @@ func (d *mockACForwarderDeps) SendMessage(md *core.MsgData) {
 	}
 }
 
-func (d *mockACForwarderDeps) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*ACConn {
+func (d *mockACForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, res *common.ResourceData) []*ACConn {
+	if d.aspData != nil {
+		// Placement-aware fixtures inject aspData; enforce that the resolved
+		// ResourceData selects this mock AC so the e2e fails if AC dispatch and
+		// ACK ResourceHost ever drift to different tunnel-server AZs.
+		info := qurlplacement.OnlyResourceInfo(res)
+		if info == nil || info.ACId != d.mockACNode.id {
+			return nil
+		}
+	}
 	// Return a minimal ACConn that points to our mock AC
 	return []*ACConn{
 		{
@@ -1144,6 +1260,9 @@ func (d *mockACForwarderDeps) FindACConnectionsForKnock(knkMsg *common.AgentKnoc
 }
 
 func (d *mockACForwarderDeps) FindAuthSvcProvider(authSvcId string) *common.AuthServiceProviderData {
+	if d.aspData != nil {
+		return d.aspData
+	}
 	// Return mock auth service provider with test resource
 	return &common.AuthServiceProviderData{
 		AuthSvcId: authSvcId,
@@ -1170,6 +1289,39 @@ func (d *mockACForwarderDeps) FindAuthSvcProvider(authSvcId string) *common.Auth
 
 func (d *mockACForwarderDeps) ResolveAuthSvcProvider(_ context.Context, authSvcId, _ string) *common.AuthServiceProviderData {
 	return d.FindAuthSvcProvider(authSvcId)
+}
+
+func newForwardE2EQURLTunnelASP(authSvcID, acID string) *common.AuthServiceProviderData {
+	return &common.AuthServiceProviderData{
+		AuthSvcId: authSvcID,
+		ResourceGroups: common.ResourceGroupMap{
+			"qurl-tunnel-server-a": newForwardE2EQURLTunnelResource(authSvcID, "qurl-tunnel-server-a", acID, 7000),
+			"qurl-tunnel-server-b": newForwardE2EQURLTunnelResource(authSvcID, "qurl-tunnel-server-b", acID, 7001),
+			"qurl-tunnel-server-c": newForwardE2EQURLTunnelResource(authSvcID, "qurl-tunnel-server-c", acID, 7002),
+		},
+	}
+}
+
+func newForwardE2EQURLTunnelResource(authSvcID, resourceID, acID string, port int) *common.ResourceData {
+	return &common.ResourceData{
+		ResourceGroup: common.ResourceGroup{
+			AuthServiceId: authSvcID,
+			ResourceId:    resourceID,
+			OpenTime:      30,
+			Resources: map[string]*common.ResourceInfo{
+				resourceID: {
+					ACId:       acID,
+					Hostname:   "connect.test",
+					PortSuffix: true,
+					Addr: &common.NetAddress{
+						Ip:   "10.0.0.1",
+						Port: port,
+					},
+				},
+			},
+		},
+		SkipAuth: true,
+	}
 }
 
 func (d *mockACForwarderDeps) LifecycleCtx() context.Context {
@@ -1435,6 +1587,7 @@ func TestE2E_HandleForwardRequest_FullACFlow(t *testing.T) {
 			default:
 			}
 		},
+		aspData: newForwardE2EQURLTunnelASP("test-asp-e2e", mockAC.id),
 	}
 
 	// Pre-install the pubkey→ownerID mapping that the forward-
@@ -1459,7 +1612,7 @@ func TestE2E_HandleForwardRequest_FullACFlow(t *testing.T) {
 		UserId:        "test-user-e2e",
 		DeviceId:      "test-device-e2e",
 		AuthServiceId: "test-asp-e2e",
-		ResourceId:    "test-resource-e2e",
+		ResourceId:    qurlplacement.TunnelServerResourceID,
 		UserData: map[string]any{
 			"passcode": "123456",
 		},
@@ -1556,9 +1709,9 @@ func TestE2E_HandleForwardRequest_FullACFlow(t *testing.T) {
 	if storedEntry.ResourceId != knockMsg.ResourceId {
 		t.Errorf("Stored entry ResourceId mismatch: got %s, want %s", storedEntry.ResourceId, knockMsg.ResourceId)
 	}
-	if storedEntry.ACTokens["test-resource-e2e"] != "test-ac-token-123" {
-		t.Errorf("Stored entry ACTokens[test-resource-e2e] mismatch: got %q, want %q",
-			storedEntry.ACTokens["test-resource-e2e"], "test-ac-token-123")
+	if storedEntry.ACTokens[qurlplacement.TunnelServerResourceID] != "test-ac-token-123" {
+		t.Errorf("Stored entry ACTokens[%s] mismatch: got %q, want %q",
+			qurlplacement.TunnelServerResourceID, storedEntry.ACTokens[qurlplacement.TunnelServerResourceID], "test-ac-token-123")
 	}
 	// KnockSrcIP is PR-2b's load-bearing field — the FRP login IP gets
 	// cross-checked against the IP that earned the pinhole. The forward
@@ -1640,7 +1793,7 @@ func (d *errorACForwarderDeps) SendMessage(md *core.MsgData) {
 	}
 }
 
-func (d *errorACForwarderDeps) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*ACConn {
+func (d *errorACForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, _ *common.ResourceData) []*ACConn {
 	return []*ACConn{
 		{
 			ACId: d.mockACNode.id,
@@ -1836,7 +1989,7 @@ func (d *timeoutACForwarderDeps) SendMessage(md *core.MsgData) {
 	}
 }
 
-func (d *timeoutACForwarderDeps) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*ACConn {
+func (d *timeoutACForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, _ *common.ResourceData) []*ACConn {
 	return []*ACConn{
 		{
 			ACId: d.mockACNode.id,

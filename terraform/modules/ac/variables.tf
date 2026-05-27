@@ -814,9 +814,8 @@ variable "frp_control_upstream_host" {
     The AC ingress side (NLB:$${frp_control_port} → AC kernel → ipset)
     is the load-bearing fence; this upstream is the AC-userspace →
     private-FRPS leg, gated only by the AC instance's egress posture
-    plus the FRPS SG (already AC-SG-only). The primary listener pins to
-    the lex-smallest AZ for legacy clients; additional upstreams below
-    provide the per-AZ public-port fanout.
+    plus the FRPS SG (already AC-SG-only). Additional upstreams below
+    provide the per-AZ public-port fanout used by nhp-server placement.
 
     Empty string disables the TCP entrypoint — the legacy WSS-via-443
     path (now unused) is the only remaining FRP path under that

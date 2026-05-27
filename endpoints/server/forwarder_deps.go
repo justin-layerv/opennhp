@@ -30,9 +30,13 @@ type ForwarderDeps interface {
 	// SendMessage queues a message for sending via the server's send channel.
 	SendMessage(md *core.MsgData)
 
-	// FindACConnectionsForKnock finds all AC connections that can handle a knock.
-	// Returns multiple connections when blue/green ACs register with the same AC ID.
-	FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*ACConn
+	// FindACConnectionsForResource finds all AC connections that can handle a
+	// knock for an already-resolved resource. The forward receiver resolves
+	// qURL placement once, then reuses the same ResourceData for AC selection and
+	// ACK construction so future health-aware placement cannot drift between
+	// those two decisions. Returns multiple connections when blue/green ACs
+	// register with the same AC ID.
+	FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, resData *common.ResourceData) []*ACConn
 
 	// ResolveAuthSvcProvider is the "do-the-right-thing" lookup:
 	// in-memory first, then falls back to the DDB-backed resolver

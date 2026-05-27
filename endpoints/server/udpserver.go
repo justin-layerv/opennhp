@@ -26,6 +26,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"github.com/OpenNHP/opennhp/endpoints/metrics"
+	"github.com/OpenNHP/opennhp/endpoints/server/internal/qurlplacement"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 	"github.com/OpenNHP/opennhp/nhp/log"
@@ -3756,28 +3757,23 @@ func (s *UdpServer) ProcessDataPrivateKeyWrapping(dwrMsg *common.DWRMsg, conn *D
 	return dwaMsg, nil
 }
 
-// FindACConnectionsForKnock finds all AC connections for a given knock message.
-// This looks up the AC ID from the auth service provider's resource info
-// and returns all corresponding AC connections if found.
-// Multiple connections exist when blue/green ACs register with the same AC ID.
-func (s *UdpServer) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*ACConn {
-	// Find the auth service provider
-	aspData := s.FindAuthSvcProvider(knkMsg.AuthServiceId)
-	if aspData == nil {
-		log.Debug("FindACConnectionsForKnock: ASP not found for %s", knkMsg.AuthServiceId)
-		return nil
-	}
-
-	// Find the resource to get the AC ID
-	resInfo := aspData.FindResource(knkMsg.ResourceId)
+// FindACConnectionsForResource looks up live AC connections using a resource
+// resolution that the caller already chose. This is the forwarder-safe helper:
+// qURL placement happens once, outside this method, and the same resData is
+// reused to build the ACK ResourceHost. Callers that can supply multi-entry
+// ResourceData must first resolve or alias it to the single entry they intend
+// to authorize; multi-entry data fails closed so AC dispatch and ACK
+// construction stay paired.
+func (s *UdpServer) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, resData *common.ResourceData) []*ACConn {
+	resInfo := qurlplacement.OnlyResourceInfo(resData)
 	if resInfo == nil {
-		log.Debug("FindACConnectionsForKnock: Resource %s not found in ASP %s", knkMsg.ResourceId, knkMsg.AuthServiceId)
+		log.Debug("FindACConnectionsForResource: Resource %s not found in ASP %s", knkMsg.ResourceId, knkMsg.AuthServiceId)
 		return nil
 	}
 
 	acId := resInfo.ACId
 	if acId == "" {
-		log.Debug("FindACConnectionsForKnock: Resource %s has no AC ID", knkMsg.ResourceId)
+		log.Debug("FindACConnectionsForResource: Resource %s has no AC ID", knkMsg.ResourceId)
 		return nil
 	}
 
@@ -3786,12 +3782,12 @@ func (s *UdpServer) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*A
 	// knock's transaction timeout the same way it would drain a local one.
 	result, droppedStale := s.snapshotLiveACConns(acId)
 	if droppedStale > 0 {
-		log.Warning("FindACConnectionsForKnock: AC %s filtered %d stale/closed connection(s) (threshold=%v)",
+		log.Warning("FindACConnectionsForResource: AC %s filtered %d stale/closed connection(s) (threshold=%v)",
 			acId, droppedStale, s.staleACConnThreshold())
 	}
 
 	if len(result) == 0 {
-		log.Debug("FindACConnectionsForKnock: AC %s not connected", acId)
+		log.Debug("FindACConnectionsForResource: AC %s not connected", acId)
 		return nil
 	}
 

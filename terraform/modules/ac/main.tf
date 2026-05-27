@@ -1724,9 +1724,9 @@ resource "aws_lb_listener" "frps_control_additional" {
 
   # Rollout note: these public listeners and their NHP DDB rows can apply
   # before every existing AC instance has refreshed user_data and bound the
-  # matching Traefik entrypoint. Before qurl-service starts assigning
-  # suffix-specific NHP resource IDs (tracked in qurl-service#732), deploy
-  # the listeners, refresh/verify the AC fleet, then enable suffix knocks.
+  # matching Traefik entrypoint. Standard clients knock the placement-neutral
+  # qurl-tunnel-server resource; nhp-server selects one of these suffix rows
+  # and returns its public host:port in the ACK.
   load_balancer_arn = aws_lb.ac.arn
   port              = each.value.listen_port
   protocol          = "TCP"

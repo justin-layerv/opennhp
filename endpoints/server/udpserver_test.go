@@ -78,6 +78,79 @@ func TestBuildServerMetricDimensions(t *testing.T) {
 	})
 }
 
+func TestFindACConnectionsForResource_ReturnsResolvedACConn(t *testing.T) {
+	wantConn := &ACConn{
+		ACId:     "ac-a",
+		ConnData: &core.ConnectionData{LastLocalRecvTime: time.Now().UnixNano()},
+	}
+	s := &UdpServer{
+		metrics: metrics.NewPublisherForTest(t),
+		acConnectionMap: map[string][]*ACConn{
+			"ac-a": {wantConn},
+		},
+	}
+	res := &common.ResourceData{
+		ResourceGroup: common.ResourceGroup{
+			ResourceId: "qurl-tunnel-server",
+			Resources: map[string]*common.ResourceInfo{
+				"qurl-tunnel-server": {ACId: "ac-a"},
+			},
+		},
+	}
+
+	got := s.FindACConnectionsForResource(&common.AgentKnockMsg{
+		AuthServiceId: "agent",
+		ResourceId:    "qurl-tunnel-server",
+	}, res)
+	if len(got) != 1 || got[0] != wantConn {
+		t.Fatalf("FindACConnectionsForResource returned %+v, want selected AC conn %+v", got, wantConn)
+	}
+}
+
+func TestFindACConnectionsForResource_NilResourceReturnsNil(t *testing.T) {
+	s := &UdpServer{
+		metrics: metrics.NewPublisherForTest(t),
+		acConnectionMap: map[string][]*ACConn{
+			"ac-a": {{ACId: "ac-a", ConnData: &core.ConnectionData{LastLocalRecvTime: time.Now().UnixNano()}}},
+		},
+	}
+
+	got := s.FindACConnectionsForResource(&common.AgentKnockMsg{
+		AuthServiceId: "agent",
+		ResourceId:    "qurl-tunnel-server",
+	}, nil)
+	if got != nil {
+		t.Fatalf("FindACConnectionsForResource with nil resource returned %+v, want nil", got)
+	}
+}
+
+func TestFindACConnectionsForResource_MultiEntryResourceReturnsNil(t *testing.T) {
+	s := &UdpServer{
+		metrics: metrics.NewPublisherForTest(t),
+		acConnectionMap: map[string][]*ACConn{
+			"ac-a": {{ACId: "ac-a", ConnData: &core.ConnectionData{LastLocalRecvTime: time.Now().UnixNano()}}},
+			"ac-b": {{ACId: "ac-b", ConnData: &core.ConnectionData{LastLocalRecvTime: time.Now().UnixNano()}}},
+		},
+	}
+	res := &common.ResourceData{
+		ResourceGroup: common.ResourceGroup{
+			ResourceId: "multi-entry",
+			Resources: map[string]*common.ResourceInfo{
+				"entry-a": {ACId: "ac-a"},
+				"entry-b": {ACId: "ac-b"},
+			},
+		},
+	}
+
+	got := s.FindACConnectionsForResource(&common.AgentKnockMsg{
+		AuthServiceId: "agent",
+		ResourceId:    "multi-entry",
+	}, res)
+	if got != nil {
+		t.Fatalf("FindACConnectionsForResource with multi-entry resource returned %+v, want nil", got)
+	}
+}
+
 // testPrivateKey returns a valid 32-byte private key for testing.
 func testPrivateKey() []byte {
 	key := make([]byte, 32)

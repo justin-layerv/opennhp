@@ -1117,11 +1117,11 @@ module "ac" {
     enable_qurl_site_authz         = var.enable_qurl_site_authz
     # qurl-reverse-tunnel-server boundary allowlist. Public FRP control
     # ingress is per-AZ: connect.layerv.* exposes one NHP-protected TCP
-    # listener port per suffix, and the qurl-tunnel-server-{suffix}
-    # resource rows return the matching host:port in the knock ack. Keep
-    # this allowlist sourced from the same var.frps_az_suffixes root input
-    # so qurl-router validation and qurl-service upstream_addr emission
-    # move in lockstep.
+    # listener port per suffix, and nhp-server selects one suffix row when
+    # a client knocks the placement-neutral qurl-tunnel-server resource.
+    # Keep this allowlist sourced from the same var.frps_az_suffixes root
+    # input so qurl-router validation and qurl-service upstream_addr
+    # emission move in lockstep.
     #
     # The inner check here is just `var.deploy_frps`; the
     # `qurl_router_enabled` gate is the outer ternary on this whole
@@ -1173,12 +1173,12 @@ module "ac" {
   frp_control_port    = var.frps_bind_port
   frp_vhost_http_port = var.frps_vhost_http_port
 
-  # FRPS-behind-AC (SLACK_QURL_ROLLOUT.md §6, 2026-05-18). The AC
-  # exposes the primary listener on frps_bind_port for legacy clients and
-  # additional per-AZ listeners on frps_bind_port+index. Each listener is
-  # still NHP-gated at the AC kernel; the only difference is which private
-  # FRPS Cloud Map host Traefik forwards to after the knock opens the
-  # specific public port.
+  # FRPS-behind-AC (SLACK_QURL_ROLLOUT.md §6, 2026-05-18). The AC exposes
+  # one public control listener per FRPS AZ: the lexicographically-smallest
+  # suffix uses frps_bind_port, and later suffixes use frps_bind_port+index.
+  # Each listener is still NHP-gated at the AC kernel; the only difference is
+  # which private FRPS Cloud Map host Traefik forwards to after the knock opens
+  # the specific public port.
   #
   # Ordering contract: `local.tunnel_server_az_suffixes` is sorted in
   # resources.tf, so the lexicographically-smallest suffix is the primary
@@ -2166,9 +2166,8 @@ module "qurl_service" {
   nhp_server_internal_url = local.nhp_server_internal_url
 
   # qurl-reverse-tunnel-server routing (#1499). qurl-service is the
-  # upstream_addr oracle; with per-AZ public control ingress, every
-  # suffix in var.frps_az_suffixes is reachable by a matching
-  # qurl-tunnel-server-{suffix} NHP resource row.
+  # internal upstream_addr oracle; client-side FRP placement is chosen by
+  # nhp-server from the per-AZ qurl-tunnel-server-{suffix} resource rows.
   frps_az_suffixes = var.deploy_frps ? join(",", var.frps_az_suffixes) : ""
   frps_domain      = var.deploy_frps ? module.data.namespace_name : ""
   frps_port        = var.deploy_frps ? var.frps_vhost_http_port : 0

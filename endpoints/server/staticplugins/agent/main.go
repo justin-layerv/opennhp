@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"github.com/OpenNHP/opennhp/endpoints/server/internal/qurlplacement"
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/log"
 	"github.com/OpenNHP/opennhp/nhp/plugins"
@@ -90,8 +91,20 @@ func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelp
 		ackMsg.ErrMsg = err.Error()
 		return
 	}
+	if req.PublicKey == "" {
+		// AuthWithNHP should only run after HandleKnockRequest has
+		// authenticated the agent via Noise IK + DDB pubkey lookup. This is an
+		// all-agent-knock invariant, not just a qURL tunnel special case. qURL
+		// tunnel placement must be keyed by that authenticated pubkey; falling
+		// back to the user-controlled UserId would let a regression upstream
+		// steer AZ placement.
+		err = common.ErrInvalidInput
+		ackMsg.ErrCode = common.ErrInvalidInput.ErrorCode()
+		ackMsg.ErrMsg = "agent.AuthWithNHP: missing authenticated public key"
+		return
+	}
 
-	res := helper.AspData.ResourceGroups[req.Msg.ResourceId]
+	res := resolveResourceForRequest(req, helper.AspData)
 	if res == nil {
 		// Resource registered under some aspId but not "agent" → routing
 		// bug at the agent or stale DDB catalog. ErrResourceNotFound
@@ -146,4 +159,13 @@ func AuthWithNHP(req *common.NhpAuthRequest, helper *plugins.NhpServerPluginHelp
 	// intentionally diverges from passcode's dead pre-write.
 	ackMsg.OpenTime = res.OpenTime
 	return helper.AuthWithNhpCallbackFunc(req, res)
+}
+
+func resolveResourceForRequest(req *common.NhpAuthRequest, asp *common.AuthServiceProviderData) *common.ResourceData {
+	// req, req.Msg, and req.PublicKey are non-empty by AuthWithNHP's upstream
+	// caller contract and explicit guard above.
+	return qurlplacement.ResolveResource(req.Msg.ResourceId, qurlplacement.Identity{
+		PublicKey: req.PublicKey,
+		UserID:    req.Msg.UserId,
+	}, asp)
 }

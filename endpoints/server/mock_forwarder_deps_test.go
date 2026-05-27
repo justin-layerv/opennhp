@@ -66,7 +66,7 @@ func (m *MockForwarderDeps) SendMessage(md *core.MsgData) {
 	}
 }
 
-func (m *MockForwarderDeps) FindACConnectionsForKnock(knkMsg *common.AgentKnockMsg) []*ACConn {
+func (m *MockForwarderDeps) FindACConnectionsForResource(knkMsg *common.AgentKnockMsg, _ *common.ResourceData) []*ACConn {
 	return m.acConns
 }
 

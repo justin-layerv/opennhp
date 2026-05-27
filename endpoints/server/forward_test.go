@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net"
@@ -12,6 +13,35 @@ import (
 	"github.com/OpenNHP/opennhp/nhp/common"
 	"github.com/OpenNHP/opennhp/nhp/core"
 )
+
+func TestForwardedAgentPubKeyRejectsEmpty(t *testing.T) {
+	if got, ok := forwardedAgentPubKey(&core.PacketParserData{}); ok || got != "" {
+		t.Fatalf("forwardedAgentPubKey(empty)=(%q,%v), want empty,false", got, ok)
+	}
+	if got, ok := forwardedAgentPubKey(nil); ok || got != "" {
+		t.Fatalf("forwardedAgentPubKey(nil)=(%q,%v), want empty,false", got, ok)
+	}
+	if got, ok := forwardedAgentPubKey(&core.PacketParserData{RemotePubKey: []byte{1, 2, 3, 4}}); ok || got != "" {
+		t.Fatalf("forwardedAgentPubKey(short)=(%q,%v), want empty,false", got, ok)
+	}
+	if got, ok := forwardedAgentPubKey(&core.PacketParserData{RemotePubKey: make([]byte, 33)}); ok || got != "" {
+		t.Fatalf("forwardedAgentPubKey(long)=(%q,%v), want empty,false", got, ok)
+	}
+}
+
+func TestForwardedAgentPubKeyEncodesAuthenticatedKey(t *testing.T) {
+	raw := make([]byte, 32)
+	for i := range raw {
+		raw[i] = byte(i + 1)
+	}
+	got, ok := forwardedAgentPubKey(&core.PacketParserData{RemotePubKey: raw})
+	if !ok {
+		t.Fatal("forwardedAgentPubKey returned ok=false, want true")
+	}
+	if want := base64.StdEncoding.EncodeToString(raw); got != want {
+		t.Fatalf("forwardedAgentPubKey=%q want %q", got, want)
+	}
+}
 
 // ============================================================================
 // ServerHealthTracker Tests
@@ -496,6 +526,74 @@ func TestHandleForwardRequest_InvalidUserAddr(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Timeout waiting for response")
+	}
+}
+
+func TestHandleDecryptedForwardedKnock_RejectsEmptyResourceHost(t *testing.T) {
+	mockDeps := NewMockForwarderDeps()
+	mockDeps.SetAuthServiceProvider(&common.AuthServiceProviderData{
+		AuthSvcId: "agent",
+		ResourceGroups: common.ResourceGroupMap{
+			"qurl-tunnel-server": {
+				ResourceGroup: common.ResourceGroup{
+					AuthServiceId: "agent",
+					ResourceId:    "qurl-tunnel-server",
+					OpenTime:      30,
+					Resources: map[string]*common.ResourceInfo{
+						"qurl-tunnel-server": {
+							ACId:       "ac-a",
+							Hostname:   "connect.test",
+							PortSuffix: true,
+							Addr: &common.NetAddress{
+								Port:     0,
+								Protocol: "tcp",
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	forwarder := NewServerForwarder(mockDeps)
+
+	knockMsg := &common.AgentKnockMsg{
+		HeaderType:    core.NHP_KNK,
+		UserId:        "test-user",
+		DeviceId:      "test-device",
+		AuthServiceId: "agent",
+		ResourceId:    "qurl-tunnel-server",
+	}
+	body, err := json.Marshal(knockMsg)
+	if err != nil {
+		t.Fatalf("marshal knock: %v", err)
+	}
+	fwdMsg := &common.ServerForwardMsg{
+		SourceServer:  "srv-source",
+		UserAddr:      "1.2.3.4:12345",
+		TransactionId: 1234,
+		Timestamp:     time.Now().Unix(),
+	}
+	userAddr, err := net.ResolveUDPAddr("udp", fwdMsg.UserAddr)
+	if err != nil {
+		t.Fatalf("resolve user addr: %v", err)
+	}
+
+	forwarder.handleDecryptedForwardedKnock(nil, fwdMsg, userAddr, &core.PacketParserData{
+		BodyMessage:  body,
+		RemotePubKey: make([]byte, 32),
+	})
+
+	select {
+	case msg := <-mockDeps.GetSendChannel():
+		var result common.ServerForwardResultMsg
+		if err := json.Unmarshal(msg.Message, &result); err != nil {
+			t.Fatalf("parse result: %v", err)
+		}
+		if result.ErrCode != "RESOURCE_INFO_INCOMPLETE" {
+			t.Fatalf("ErrCode=%s ErrMsg=%s, want RESOURCE_INFO_INCOMPLETE", result.ErrCode, result.ErrMsg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for response")
 	}
 }
 
@@ -1306,7 +1404,7 @@ type testForwarderDepsWithDevice struct {
 func (d *testForwarderDepsWithDevice) GetHostname() string       { return "test-server" }
 func (d *testForwarderDepsWithDevice) GetDevice() *core.Device   { return d.device }
 func (d *testForwarderDepsWithDevice) SendMessage(*core.MsgData) {}
-func (d *testForwarderDepsWithDevice) FindACConnectionsForKnock(*common.AgentKnockMsg) []*ACConn {
+func (d *testForwarderDepsWithDevice) FindACConnectionsForResource(*common.AgentKnockMsg, *common.ResourceData) []*ACConn {
 	return nil
 }
 func (d *testForwarderDepsWithDevice) FindAuthSvcProvider(string) *common.AuthServiceProviderData {
