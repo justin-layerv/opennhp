@@ -329,26 +329,88 @@ const (
 	// root-cause fix, not a tuning change.
 	MetricUDPHandlerPanic = "UDPHandlerPanic"
 
-	// MetricL3FlushKeyMalformed is incremented when a Schedule
-	// or Cancel call site is rejected by MakeFlowKey. Non-zero
-	// means an upstream regression let a malformed IP (or wildcard
-	// or out-of-range port) reach the call site; the kernel state
-	// is already settled, this is scheduler-side bookkeeping loss.
-	// The `op` field on the log line distinguishes Schedule vs
-	// Cancel; the counter does not carry the label.
+	// MetricL3FlushKeyMalformed is incremented on the Schedule path
+	// when scheduleFlushIfEnabled is rejected by MakeFlowKey
+	// (malformed IP, unspecified IP, out-of-range port). Non-zero
+	// means an upstream regression let a bad value reach the call
+	// site; the kernel state is already settled, this is scheduler-
+	// side bookkeeping loss.
 	//
-	// Tick rate per (src, dst) pair (cancelAllScheduledFlows
-	// iterates SrcAddrs × DstAddrs and visits each pair
-	// independently — totals scale by |SrcAddrs| × |DstAddrs|):
-	//   - Schedule: 1 tick per scheduleFlushIfEnabled call
-	//     reached, so 1–4 ticks per pair on IP-bad depending
-	//     on FilterMode + Protocol.
-	//   - Cancel: leading (port=0, Any) probe ticks once per
-	//     pair on IP-bad and short-circuits the rest of the
-	//     pair's fan-out; on port-bad the TCP/UDP follow-ups
-	//     tick once each. Any/ICMP never tick (their probe
-	//     shape can't fail port validation).
+	// Schedule tick rate per (src, dst) pair: 1 tick per
+	// scheduleFlushIfEnabled call reached, so 1–4 ticks per pair
+	// on IP-bad depending on FilterMode + Protocol (the Schedule
+	// fan-out across TCP / UDP / Any / ICMP).
 	MetricL3FlushKeyMalformed = "L3FlushKeyMalformed"
+
+	// MetricL3FlushScheduleNilEntry is incremented when
+	// scheduleFlushIfEnabled is called with a nil AccessEntry. This
+	// should never happen in production — all admission paths pass
+	// the pre-stored tokenStore-bound entry. Non-zero is a regression
+	// signal pointing at whichever caller dropped the entry; the
+	// schedule is dropped (not Scheduled) to avoid creating a phantom
+	// scheduler entry that cancelAllScheduledFlows would later miss.
+	MetricL3FlushScheduleNilEntry = "L3FlushScheduleNilEntry"
+
+	// MetricL3FlushCancelRescheduledForPeer is incremented when
+	// cancelAllScheduledFlows's multi-session check (#2201) detects a
+	// live peer entry that still holds the FlowKey and re-Schedules
+	// instead of Cancel. Non-zero is the positive signal that the
+	// per-entry tracking architecture is doing its job: peers with
+	// overlapping FlowKeys (e.g., same agent IP + dst tuple via
+	// longest-wins absorb) survive each other's expiry.
+	//
+	// Also ticks on the failed-admission cleanup path: if T1's
+	// HandleAccessControl writes some Schedules then a downstream
+	// kernel-write fails, emitOrCleanupPreMintedToken's drain runs
+	// cancelAllScheduledFlows and any peer holding the same FlowKey
+	// triggers a reschedule rather than a cancel. Dashboard readers
+	// should not be alarmed by ticks correlated with admission
+	// failures — that's correct behavior (a failing admission still
+	// must not orphan a peer's coverage).
+	//
+	// Useful for: (a) regression detection — a sudden drop to zero
+	// when peer-sharing is expected (multi-tab access to the same
+	// resource, /refresh during a long session) signals
+	// holdsScheduledKey returning false where it should return true;
+	// (b) capacity planning — high tick rate indicates the workload
+	// is FlowKey-collision-heavy and the reverse-index optimization
+	// (#2163) becomes worth landing sooner.
+	//
+	// Edge: when the scheduler breaker is open during T2's admission,
+	// T2's scheduleFlushIfEnabled still records K on T2.scheduledKeys
+	// but its Scheduler.Schedule is a no-op (scheduler entry never
+	// created). A subsequent T1 expire walks K, finds T2 via the
+	// holdsScheduledKey consult, and ticks this metric on the
+	// reschedule — even though the scheduler doesn't actually hold
+	// K at that moment. Behaviorally fine (the reschedule then
+	// creates the entry; outcome matches the non-breaker path) but
+	// the tick momentarily over-reports "real peer-collision."
+	// Dashboard readers chasing a spike should correlate against
+	// breaker-trip metrics before interpreting as a workload shift.
+	MetricL3FlushCancelRescheduledForPeer = "L3FlushCancelRescheduledForPeer"
+
+	// MetricL3FlushAdmissionNilEntry is incremented when
+	// HandleAccessControl is invoked with a nil *AccessEntry. This
+	// should never happen in production — admitAndIssueToken
+	// constructs the entry before the call, and /refresh-extend
+	// passes the tokenStore-resident entry. Non-zero signals a
+	// future refactor dropped the entry; the gate fails-closed with
+	// ErrACNilEntry rather than nil-dereferencing entry.User.
+	// Mirrors MetricL3FlushScheduleNilEntry's observability shape
+	// so both layers of the nil-entry defense-in-depth surface
+	// loudly in dashboards.
+	MetricL3FlushAdmissionNilEntry = "L3FlushAdmissionNilEntry"
+
+	// MetricL3FlushCancelNilTokenStore is incremented when
+	// cancelAllScheduledFlows is called on a UdpAC with nil
+	// tokenStore. This should never happen in production — Start
+	// always constructs tokenStore before installExpiryHook fires
+	// (and before any admission path can run). Non-zero is a
+	// regression signal that a future dependency-injection refactor
+	// dropped the field; multi-session protection (#2201) silently
+	// degrades to lone-entry behavior when this fires, so the
+	// counter MUST be alarmed before that regression reaches prod.
+	MetricL3FlushCancelNilTokenStore = "L3FlushCancelNilTokenStore"
 
 	// MetricL3FlushIpsetParseError is incremented per undecodable
 	// `add` line during enumerateIpsetSet boot enumeration.

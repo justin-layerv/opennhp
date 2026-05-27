@@ -1,6 +1,7 @@
 package ac
 
 import (
+	"sync"
 	"time"
 
 	"github.com/OpenNHP/opennhp/nhp/common"
@@ -28,6 +29,43 @@ const accessTokenLatePacketBufferSeconds = common.AccessTokenLatePacketBufferSec
 // precision from the JSON shape regardless of the tag. Response-shape
 // mitigation (slim DTO that drops ExpireTime + User + SrcAddrs) is
 // tracked in #1959.
+//
+// scheduledKeys tracks the L3-flush scheduler FlowKeys this entry has
+// successfully scheduled, populated by recordScheduledKey after a
+// Scheduler.Schedule succeeds. cancelAllScheduledFlows walks this set
+// directly instead of recomputing keys from SrcAddrs × DstAddrs ×
+// proto-variants — closes #2201 (multi-session races on shared
+// FlowKeys) and #2205 (NAT'd temp-access where kernel-observed IP
+// differs from AOL-declared IP) by making Cancel walk exactly what
+// was Scheduled.
+//
+// Lock order: mu is leaf-most. Never hold it while taking
+// tokenStore.mu or any scheduler lock (shard.mu / wheelMu /
+// breakerErrMu). The OnExpire hook captures the entry pointer
+// under tokenStore.mu, releases that lock, and only then takes mu
+// to read scheduledKeys — see SetOnExpire godoc in
+// nhp/common/tokenstore.go. The full lock-order discipline is
+// documented in endpoints/ac/CLAUDE.md ("AccessEntry.mu is
+// leaf-most" bullet).
+//
+// Pointer-identity invariant (load-bearing for
+// latestOtherFirewallDeadline's self-skip): each *AccessEntry is
+// stored under exactly ONE token in tokenStore for the duration of
+// its admission. HandleUdpACOperations allocates a fresh
+// &AccessEntry{} per admission and never reuses pointers across
+// tokens. udpac.go's latestOtherFirewallDeadline relies on this to
+// distinguish self from peers via pointer equality (`other ==
+// self`); a future change that pools / reuses *AccessEntry pointers
+// (object-pool optimization, connection-pool style entry reuse)
+// would let `self` appear multiple times in tokenStore snapshots,
+// each non-self copy falsely registering as an "other holder" of
+// the entry's tracked FlowKeys — keeping scheduler entries alive
+// past their genuine firewall deadlines (a silent security
+// regression, not a panic). #2214 (debug-only Store assertion that
+// a pointer is not already present under another token) and #2215
+// (synthetic atomic entryID alternative) track stronger guards;
+// for now, audit any AccessEntry-lifecycle change against this
+// invariant before merging.
 type AccessEntry struct {
 	User           *common.AgentUser
 	SrcAddrs       []*common.NetAddress
@@ -35,6 +73,70 @@ type AccessEntry struct {
 	OpenTime       int
 	FirstKnockTime time.Time `json:"-"`
 	ExpireTime     time.Time
+
+	// mu is RWMutex so holdsScheduledKey (pure read, called from
+	// latestOtherFirewallDeadline's per-peer loop) doesn't serialize
+	// peer checks across cancels on different entries that share
+	// peers. recordScheduledKey + drainScheduledKeys take the write
+	// lock (Lock/Unlock); holdsScheduledKey takes RLock/RUnlock.
+	mu            sync.RWMutex         `json:"-"`
+	scheduledKeys map[FlowKey]struct{} `json:"-"`
+}
+
+// recordScheduledKey adds key to the entry's tracked set. Idempotent:
+// re-Schedule of the same key (e.g. /refresh extension) is a no-op on
+// the tracking side; the scheduler's longest-wins semantics handle the
+// deadline side. Called by scheduleFlushIfEnabled BEFORE
+// Scheduler.Schedule (#2201 cross-entry race fix — see
+// scheduleFlushIfEnabled godoc for the rationale). On Schedule failure
+// (malformed FlowKey, breaker open, shutdown), the tracked key
+// remains; the next cancelAllScheduledFlows will issue Scheduler.Cancel
+// for a non-existent scheduler entry, which is idempotently a no-op.
+//
+// Production callers go through scheduleFlushIfEnabled. Tests call
+// this directly to stage the partial-completion state
+// (record-done-but-Schedule-not-yet) that
+// TestUdpAC_CancelAllScheduledFlows_RecordBeforeScheduleClosesAdmissionRace
+// uses to fence the cross-entry race.
+func (e *AccessEntry) recordScheduledKey(key FlowKey) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.scheduledKeys == nil {
+		e.scheduledKeys = make(map[FlowKey]struct{})
+	}
+	e.scheduledKeys[key] = struct{}{}
+}
+
+// holdsScheduledKey reports whether the entry currently has key in its
+// tracked set. Used by cancelAllScheduledFlows's multi-session check
+// (#2201) to detect another live AccessEntry that needs the shared
+// scheduler entry to survive.
+func (e *AccessEntry) holdsScheduledKey(key FlowKey) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	_, ok := e.scheduledKeys[key]
+	return ok
+}
+
+// drainScheduledKeys returns the tracked set as a slice and resets the
+// map, atomically under e.mu. cancelAllScheduledFlows uses this to walk
+// the keys outside the lock — Scheduler.Cancel takes scheduler shard
+// locks and the lock-order discipline forbids holding e.mu while taking
+// those. Draining also closes a re-entrant Cancel race: if a second
+// OnExpire fired for the same entry pointer (it can't today, but a
+// future caller might), the second drain returns empty.
+func (e *AccessEntry) drainScheduledKeys() []FlowKey {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.scheduledKeys) == 0 {
+		return nil
+	}
+	keys := make([]FlowKey, 0, len(e.scheduledKeys))
+	for k := range e.scheduledKeys {
+		keys = append(keys, k)
+	}
+	e.scheduledKeys = nil
+	return keys
 }
 
 // GetExpireTime implements the common.TokenEntry interface.
@@ -68,10 +170,53 @@ func (e *AccessEntry) absoluteTokenDeadline() time.Time {
 	return e.FirstKnockTime.Add(time.Duration(e.OpenTime+accessTokenLatePacketBufferSeconds) * time.Second)
 }
 
+// firewallDeadline returns the moment the AC firewall pinhole closes
+// for this entry: FirstKnockTime + OpenTime (NO late-packet buffer).
+// Single source of truth for RemainingFirewallSeconds and the multi-
+// session liveness check in udpac.go's latestOtherFirewallDeadline —
+// keeps the formula in one place so a future arithmetic change
+// (#1942 / #1962 lineage) can't drift between callers.
+//
+// IMMUTABILITY: FirstKnockTime is set ONCE at GenerateAccessToken
+// (the pre-store moment in HandleUdpACOperations) and never mutated
+// afterward. OpenTime is set at AccessEntry construction and never
+// mutated afterward. Both fields are read without holding e.mu from
+// latestOtherFirewallDeadline's snapshot-iterating loop — this is
+// safe ONLY because of the immutability. A future change that
+// mutates either field post-store re-introduces a race here AND
+// breaks the absolute-deadline-cap semantics #1942 fenced. Such a
+// change must either (a) lock e.mu around the read here, or (b)
+// move the mutation to BEFORE the entry is stored in tokenStore.
+//
+// Per-field mutability classification (post-store):
+//   - FirstKnockTime, OpenTime — IMMUTABLE (load-bearing for
+//     firewallDeadline correctness; see above).
+//   - User, DstAddrs — effectively immutable today; no production
+//     mutator exists.
+//   - SrcAddrs — MUTATED in place by httpac.go's /refresh-extend
+//     path when a new client IP appears mid-session (tracked in
+//     #1951 as an unbounded-slice-append race). Reads on
+//     entry.SrcAddrs from latestOtherFirewallDeadline's walk would
+//     race against this mutator IF the walk ever accessed SrcAddrs
+//     — today it doesn't (only firewallDeadline + holdsScheduledKey
+//     are called). The latent risk grew with #2209 because the
+//     /refresh-extend path now threads the same *AccessEntry into
+//     HandleAccessControl while the entry sits in the Snapshot
+//     pool. If a future cancel-path code change starts reading
+//     entry.SrcAddrs, this races; #1951's fix (copy-then-append +
+//     atomic pointer or e.mu protection) becomes load-bearing.
+//   - ExpireTime — MUTATED by VerifyAccessToken's sliding-deadline
+//     extension. Read by tokenStore.CleanExpired without locking.
+//     Documented elsewhere as a benign race (torn read at most
+//     removes a still-valid entry one cleanup cycle early).
+//   - scheduledKeys, mu — guarded by e.mu (the whole point).
+func (e *AccessEntry) firewallDeadline() time.Time {
+	return e.FirstKnockTime.Add(time.Duration(e.OpenTime) * time.Second)
+}
+
 // RemainingFirewallSeconds returns seconds left until the AC firewall
-// must close: FirstKnockTime + OpenTime, NO buffer. 0 = deadline passed;
-// caller must refuse to re-open rather than call HandleAccessControl
-// with a no-op timeout.
+// must close. 0 = deadline passed; caller must refuse to re-open
+// rather than call HandleAccessControl with a no-op timeout.
 //
 // Edge case: a return value of CloseWindowOpenTimeSec (1) trips
 // HandleAccessControl's tempset-collapse branch (msghandler.go:152-158).
@@ -81,8 +226,7 @@ func (e *AccessEntry) absoluteTokenDeadline() time.Time {
 // remainder. Issue #1962 tracks breaking the coupling by widening
 // the dead zone to (0, 2)s.
 func (e *AccessEntry) RemainingFirewallSeconds() int {
-	deadline := e.FirstKnockTime.Add(time.Duration(e.OpenTime) * time.Second)
-	remaining := time.Until(deadline)
+	remaining := time.Until(e.firewallDeadline())
 	if remaining <= 0 {
 		return 0
 	}
@@ -90,38 +234,68 @@ func (e *AccessEntry) RemainingFirewallSeconds() int {
 	return int(remaining.Seconds())
 }
 
-// IssueACTokenIfSuccess populates artMsg.ACToken with a freshly issued
-// token iff artMsg's ErrCode is the explicit success code. On success
-// it overwrites any existing artMsg.ACToken without checking; on
-// non-success it leaves artMsg untouched. Issuing a token for a failed
-// operation would do nothing useful (the agent path discards it in
-// processACOperationBroadcast at endpoints/server/udpserver.go:2127),
-// but post-nhp#1124 the token IS the entire auth secret, so storing
-// one in tokenStore + emitting it to the server (where %+v error logs
-// at udpserver.go:1862 / :2150 would serialize it in plaintext) is a
-// real exposure.
+// emitOrCleanupPreMintedToken is the post-admission gate paired with
+// the pre-mint-then-pre-store in HandleUdpACOperations (#2201). On
+// strict ErrSuccess it writes the token to artMsg so the server can
+// hand it to the agent; on any non-success ErrCode (including the
+// bare-return "" case) it drains any partially-scheduled FlowKeys
+// AND Deletes the pre-stored entry.
 //
-// The gate intentionally uses the strict equality check (not
-// common.IsSuccessErrCode) so it stays aligned with the server's
-// failure-log predicate at udpserver.go:1861. The two predicates differ
-// on the empty-string case: IsSuccessErrCode treats "" as success, but
+// The cleanup-path drain (cancelAllScheduledFlows(entry)) closes a
+// real leak the naive pre-store pattern introduced: kernel-write
+// failures inside HandleAccessControl can leave behind scheduler
+// entries from per-tuple Schedule calls that ran BEFORE the failing
+// kernel write. tokenStore.Delete alone is silent (no OnExpire), so
+// the scheduler-side cleanup must be explicit. With drain, the
+// scheduler entries are Canceled exactly where they were Scheduled.
+// No-op for the common early-return failure paths (breaker open,
+// invalid openTime, empty addrs) where no Schedule call ran.
+//
+// The token-emit gate uses STRICT success-code equality, not the
+// more permissive common.IsSuccessErrCode, so it stays aligned with
+// the server's failure-log predicate at
+// endpoints/server/udpserver.go:1861. The two predicates differ on
+// the empty-string case: IsSuccessErrCode treats "" as success, but
 // the server-side log treats "" as failure and would still leak the
-// token. Several bare-return paths in HandleAccessControl (e.g. the
-// EBPFXDP EbpfRuleAdd failure at msghandler.go:478, the unsupported
-// FilterMode default branch at msghandler.go:482) leave ErrCode == ""
-// with err != nil — those must NOT mint a token.
+// token. Several bare-return paths in HandleAccessControl can leave
+// ErrCode == "" with err != nil; those must NOT emit a token.
 //
 // Open thread: forward.go:387 still uses IsSuccessErrCode and so will
-// build a "success" ackMsg with an empty ACToken on the same bare-return
-// paths the gate suppresses. Functionally safe (the empty token fails
-// httpac.go:190's len-check) but produces a confusing user-visible
-// failure mode. Tracked for cleanup in #1422 (preferred fix: route the
-// bare returns through setArtMsgError so ErrCode is always populated).
-func (a *UdpAC) IssueACTokenIfSuccess(artMsg *common.ACOpsResultMsg, entry *AccessEntry) {
-	if artMsg.ErrCode != common.ErrSuccess.ErrorCode() {
+// build a "success" ackMsg with an empty ACToken on the same
+// bare-return paths the gate suppresses. Functionally safe (the
+// empty token fails httpac.go's len-check) but produces a confusing
+// user-visible failure mode. Tracked for cleanup in #1422.
+func (a *UdpAC) emitOrCleanupPreMintedToken(artMsg *common.ACOpsResultMsg, token string, entry *AccessEntry) {
+	if artMsg.ErrCode == common.ErrSuccess.ErrorCode() {
+		artMsg.ACToken = token
 		return
 	}
-	artMsg.ACToken = a.GenerateAccessToken(entry)
+	// Cancel-before-Delete is documentation-load-bearing, not
+	// correctness-load-bearing — peers are in the Snapshot either
+	// way (Delete only removes self), so latestOtherFirewallDeadline
+	// finds peers holding the shared FlowKey regardless of order.
+	// The difference is HOW self is filtered: cancel-first relies on
+	// the pointer-equality `other == self` skip; Delete-first relies
+	// on self being absent from the Snapshot entirely. Both paths
+	// fire the peer-reschedule correctly. Keep cancel-first so the
+	// surrounding godoc on cancelAllScheduledFlows (which describes
+	// self-skip-via-pointer-equality) accurately models what runs.
+	// The pointer-identity invariant load-bearing here (each
+	// *AccessEntry is in tokenStore under exactly one token) is
+	// documented on the AccessEntry struct godoc; #2214 / #2215 file
+	// stronger guards.
+	//
+	// DO NOT reorder Delete before cancelAllScheduledFlows. Flipping
+	// the order silently changes which invariant is load-bearing
+	// (Delete-induced self-absence vs pointer-equality self-skip);
+	// both are correct today, but the godocs above + the
+	// AccessEntry struct's "Pointer-identity invariant" paragraph
+	// describe pointer-equality. A reorder would leave those
+	// descriptions accurate-but-vestigial — a maintainer reading
+	// either would model the wrong self-filter mechanism. Tracked
+	// in cr round 21.
+	a.cancelAllScheduledFlows(entry)
+	a.tokenStore.Delete(token)
 }
 
 // VerifyAccessToken validates a token and extends its expiry time if

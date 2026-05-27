@@ -107,14 +107,10 @@ func TestHandleHttpRefreshOperations_DeadlinePassedCancelsScheduledFlows(t *test
 		OpenTime: openTime,
 	}
 	token := ua.GenerateAccessToken(entry)
-	// Schedule the same FlowKey shape msghandler.go's IPTABLES TCP path
-	// would have produced for this entry. Far-future deadline so the
+	// Schedule via the production wrapper so the FlowKey is recorded on
+	// entry.scheduledKeys (#2201/#2205). Far-future deadline so the
 	// scheduler keeps it in the wheel until Cancel.
-	key, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoTCP)
-	if err != nil {
-		t.Fatalf("MakeFlowKey: %v", err)
-	}
-	sched.Schedule(key, time.Now().Add(1*time.Hour))
+	ua.scheduleFlushIfEnabled(entry, "1.2.3.4", "10.0.0.1", 80, FlowProtoTCP, time.Now().Add(1*time.Hour))
 	if got := sched.EntryCount(); got != 1 {
 		t.Fatalf("precondition: EntryCount = %d, want 1", got)
 	}

@@ -443,10 +443,128 @@ func newFlusherForFilterMode(filterMode int) (FlowFlusher, error) {
 // shape the scheduler expects; the per-mode flusher dispatches
 // based on FlowKey.Protocol (BpfFlusher uses sdwhitelist for
 // FlowProtoAny, spp for tcp/udp, icmpwhitelist for icmp).
-func (a *UdpAC) scheduleFlushIfEnabled(srcIP, dstIP string, dstPort int, proto FlowProto, deadline time.Time) {
-	if key, ok := a.flowKeyForScheduler(opSchedule, srcIP, dstIP, dstPort, proto); ok {
-		a.expirySched.Schedule(key, deadline)
+//
+// entry is the AccessEntry the schedule belongs to and MUST be
+// non-nil. The key is recorded on entry.scheduledKeys BEFORE
+// Scheduler.Schedule (record-then-Schedule order — see the inline
+// rationale below) so the matching cancelAllScheduledFlows walks
+// exactly what was scheduled (#2201, #2205). A nil entry would
+// schedule without tracking; cancelAllScheduledFlows would later
+// miss the key and leave a phantom scheduler entry that fires Flush
+// against already-gone kernel state. The non-nil contract is
+// enforced by a Critical log + early return rather than panic —
+// the kernel-state side may already be settled by the caller, so
+// taking the AC down for a single mis-shaped admission is a worse
+// outcome than dropping the schedule.
+func (a *UdpAC) scheduleFlushIfEnabled(entry *AccessEntry, srcIP, dstIP string, dstPort int, proto FlowProto, deadline time.Time) {
+	if entry == nil {
+		log.Critical("[L3FlushSched] scheduleFlushIfEnabled called with nil entry — schedule dropped to avoid phantom scheduler entry (src=%s dst=%s port=%d)",
+			srcIP, dstIP, dstPort)
+		a.incrMetric(MetricL3FlushScheduleNilEntry)
+		return
 	}
+	key, ok := a.flowKeyForScheduler(srcIP, dstIP, dstPort, proto)
+	if !ok {
+		return
+	}
+	// Record-before-Schedule order closes a same-FlowKey race against
+	// a concurrent cancelAllScheduledFlows on a peer entry:
+	//
+	//   T1 expire → drainScheduledKeys(T1) returns {K}
+	//   T1 expire → Snapshot tokenStore (sees T2)
+	//   T1 expire → holdsScheduledKey(T2, K) — if T2 hasn't recorded
+	//               yet this returns false and we Cancel(K), erasing
+	//               the scheduler entry T2 just created
+	//
+	// With record first: even if T2 hasn't reached Scheduler.Schedule
+	// yet, T1's cancel observes T2's tracking and re-Schedules K at
+	// T2's deadline+margin. T2's subsequent Schedule is then absorbed
+	// by longest-wins. A Schedule failure (breaker open, shutdown)
+	// after a successful record leaves K in T2's tracked set with no
+	// scheduler entry — the next Cancel walks K and Scheduler.Cancel
+	// no-ops idempotently. Acceptable degradation; the alternative
+	// (rollback the record on Schedule failure) would re-introduce
+	// the race window we just closed.
+	entry.recordScheduledKey(key)
+	a.expirySched.Schedule(key, deadline)
+}
+
+// scheduleFlushOrphan schedules an L3 flush without recording the
+// FlowKey on any AccessEntry. The scheduler entry has no tracked
+// owner, so cancelAllScheduledFlows (which walks per-entry tracked
+// keys) never cancels it — the scheduler fires Flush at the
+// scheduled deadline regardless of any tokenStore expiry.
+//
+// Used only by the NAT'd / temp-access path in msghandler.go
+// (tcpTempAccessHandler / udpTempAccessHandler). The temp handler
+// writes a kernel rule whose lifetime is the long outer openTimeSec
+// (often hours), but the tempEntry that gates the temp-handler's
+// auth check has OpenTime = TempPortOpenTime (30s). Recording the
+// FlowKey on tempEntry would Cancel the scheduled flush at
+// tempEntry's ~35s tokenStore expiry, leaving the kernel rule live
+// for the rest of openTimeSec with no queued conntrack flush — an
+// ESTABLISHED-bypass under L3-only enforcement. Recording on the
+// long-window outer admission entry doesn't fit either: its
+// firewallDeadline + accessTokenLatePacketBufferSeconds (5s)
+// expires before the temp-handler's kernel rule (which can be
+// written up to tempOpenTimeSec=30s after admission). The lifetime
+// mismatch is structural; no existing AccessEntry covers it.
+//
+// Tracked in #2213 — the proper fix introduces a long-lived
+// AccessEntry whose OpenTime matches the kernel rule's actual
+// lifetime, then routes the temp handler back through
+// scheduleFlushIfEnabled against THAT entry. Required before L7
+// removal because the orphan loses revocation precision: an
+// explicit admin Cancel path (added by #2172) cannot find the
+// scheduler entry to terminate it early. Acceptable today since
+// no production caller invokes explicit Cancel on temp-handler
+// kernel rules — the orphan still fires Flush at its scheduled
+// deadline, matching the kernel rule's natural TTL.
+//
+// Multi-session interaction: if a tracked entry later schedules
+// the SAME FlowKey with a later deadline, scheduler longest-wins
+// absorb keeps the entry at the later deadline. The orphan's
+// earlier deadline is supplanted.
+//
+// Cross-cancel asymmetry: if a tracked entry T_A holds the SAME
+// FlowKey K as an orphan O_orphan, and T_A expires first,
+// cancelAllScheduledFlows(T_A) → drains {K} → walks
+// latestOtherFirewallDeadline → finds NO peer (orphan registers
+// on no entry) → Cancel(K). The scheduler entry vanishes even
+// though O_orphan's deadline is in the future. The kernel rule
+// O_orphan was written for lives until its TTL but no flush
+// fires — an ESTABLISHED-bypass.
+//
+// Reachability of cross-cancel asymmetry: REQUIRES the same K =
+// (srcIP, dstIP, port, proto) to be scheduled by BOTH the tracked
+// AOL admission path AND the orphan temp-handler path on the SAME
+// AC. The discriminator is IpPassMode (endpoints/ac/config.go:49,
+// `a.IpPassMode()` consulted at msghandler.go's HandleAccessControl
+// branch switch): it is AC-GLOBAL config, not per-resource. Every
+// admission on a given AC routes through ONE of:
+//   - PASS_KNOCK_IP (tracked AOL admission)
+//   - PASS_KNOCKIP_WITH_RANGE (tracked AOL admission with range)
+//   - PASS_PRE_ACCESS_IP (temp handler / orphan path)
+//
+// Per AC, all admissions share one IpPassMode value. The same K
+// therefore cannot be scheduled by both paths on the same AC.
+// Cross-AC FlowKey collisions are isolated by per-AC kernel state.
+// **Unreachable in production with current PassMode architecture.**
+//
+// If a future change makes IpPassMode per-resource or per-tuple
+// (deviating from the current AC-global config), this asymmetry
+// becomes reachable. The cleanest mitigation at that point is the
+// long-lived AccessEntry from #2213 (replaces scheduleFlushOrphan
+// entirely); a shorter-term mitigation is an orphan deadline
+// registry that latestOtherFirewallDeadline consults as a fallback
+// (heavier; only worth implementing if #2213 slips and per-resource
+// PassMode ships first).
+func (a *UdpAC) scheduleFlushOrphan(srcIP, dstIP string, dstPort int, proto FlowProto, deadline time.Time) {
+	key, ok := a.flowKeyForScheduler(srcIP, dstIP, dstPort, proto)
+	if !ok {
+		return
+	}
+	a.expirySched.Schedule(key, deadline)
 }
 
 // installExpiryHook wires cancelAllScheduledFlows into TokenStore's
@@ -462,123 +580,234 @@ func (a *UdpAC) installExpiryHook() {
 	})
 }
 
-// flowKeyForScheduler is the shared preamble for scheduleFlushIfEnabled
-// and cancelAllScheduledFlows: returns (key, true) when the scheduler
-// is enabled and MakeFlowKey accepts the inputs, otherwise (zero,
-// false) with MetricL3FlushKeyMalformed + a Warning log already
-// emitted. A malformed FlowKey here means an upstream regression let
-// a bad IP / port through; the breaker is not pinged because the
-// kernel-state side is already settled.
+// flowKeyForScheduler is the validation preamble for the Schedule
+// path: returns (key, true) when the scheduler is enabled and
+// MakeFlowKey accepts the inputs, otherwise (zero, false) with
+// MetricL3FlushKeyMalformed + a Warning log already emitted. A
+// malformed FlowKey here means an upstream regression let a bad IP
+// / port through; the breaker is not pinged because the kernel-state
+// side is already settled.
+//
+// Single caller: scheduleFlushIfEnabled. The Cancel path
+// (cancelAllScheduledFlows) does not go through this helper —
+// it walks per-entry tracked FlowKeys directly (#2201/#2205) so
+// there's nothing to validate; the keys are already-validated
+// outputs from prior Schedule calls.
 //
 // The nil-scheduler guard returns (zero, false) silently — no metric
-// tick, no log. Both current callers also short-circuit on
-// a.expirySched == nil upstream, so the silent return is unreachable
-// today and exists only as defense-in-depth. A future caller that
-// reaches this path with a nil scheduler will drop work without
-// telemetry; if that ever lands, switch this branch to a Debug log
-// or a separate disabled-call metric.
-func (a *UdpAC) flowKeyForScheduler(op schedulerOp, srcIP, dstIP string, dstPort int, proto FlowProto) (FlowKey, bool) {
+// tick, no log. scheduleFlushIfEnabled also short-circuits on
+// a.expirySched == nil upstream (via the entry/scheduler nil-guards
+// at the top), so the silent return here is unreachable today. Kept
+// as defense-in-depth so a future caller that lands a new path can't
+// nil-deref MakeFlowKey via a stale `expirySched` field — better to
+// drop the schedule silently than to crash the AC.
+func (a *UdpAC) flowKeyForScheduler(srcIP, dstIP string, dstPort int, proto FlowProto) (FlowKey, bool) {
 	if a.expirySched == nil {
 		return FlowKey{}, false
 	}
 	key, err := MakeFlowKey(srcIP, dstIP, dstPort, proto)
 	if err != nil {
 		a.incrMetric(MetricL3FlushKeyMalformed)
-		log.Warning("[L3FlushSched] skipping %s for malformed FlowKey src=%s dst=%s port=%d: %v",
-			op, srcIP, dstIP, dstPort, err)
+		log.Warning("[L3FlushSched] skipping schedule for malformed FlowKey src=%s dst=%s port=%d: %v",
+			srcIP, dstIP, dstPort, err)
 		return FlowKey{}, false
 	}
 	return key, true
 }
 
-// schedulerOp is the typed log-triage label for flowKeyForScheduler
-// callers; the typed constants make a misspelled call a compile error.
-type schedulerOp string
-
-const (
-	opSchedule schedulerOp = "schedule"
-	opCancel   schedulerOp = "cancel"
-)
-
-// cancelAllScheduledFlows cancels every FlowKey plausibly scheduled
-// for an AccessEntry. Called from /refresh-shorten in httpac.go and
-// from the TokenStore.OnExpire hook wired in (*UdpAC).Start.
+// cancelAllScheduledFlows cancels (or reschedules to next-longest)
+// every FlowKey the entry actually scheduled. Called from
+// /refresh-shorten in httpac.go and from the TokenStore.OnExpire
+// hook wired in (*UdpAC).Start.
 //
-// The fan-out per (src, dst) is over-broad by design: a leading
-// (port=0, FlowProtoAny) probe gates the rest of the calls — on
-// failure it short-circuits the tuple; on success the three follow-
-// ups (TCP/UDP with dstAddr.Port, ICMP with port=0) all route
-// through flowKeyForScheduler so the metric/log path stays
-// consistent with msghandler.go's Schedule side.
+// Walks entry.scheduledKeys (populated by scheduleFlushIfEnabled at
+// Schedule time). Drain-then-walk — never holds entry.mu across a
+// Scheduler.Cancel / Schedule call, satisfying the lock order in
+// endpoints/ac/CLAUDE.md (entry.mu is leaf-most). Idempotent: a
+// second call drains an empty set and returns.
 //
-// Cardinality: up to |SrcAddrs| × |DstAddrs| × 4 Scheduler.Cancel
-// calls per call site (0 per pair on IP-bad — probe fails and the
-// loop continues — 2 per pair on port-bad — Any + ICMP succeed,
-// TCP + UDP no-op via flowKeyForScheduler), bounded at NHP-AOP
-// admission time. Tick semantic on MetricL3FlushKeyMalformed: see
-// that constant's godoc (1 tick per pair on IP-bad, 2 on port-bad).
+// Closes #2205 (NAT'd temp-access where the kernel-observed
+// remoteAddr.IP differs from the AOL-declared entry.SrcAddrs): the
+// temp handler records FlowKeys with the kernel IP, so this walk
+// hits the same FlowKey that was scheduled — Cancel matches the
+// kernel state that was written.
 //
-// Probe choice is load-bearing. MakeFlowKey validates srcIP, dstIP,
-// AND dstPort ∈ [0, 65535]. Probing with port=0 isolates IP-bad
-// (whole fan-out skipped, 1 metric tick) from port-bad (probe
-// succeeds, TCP/UDP fail-soft via flowKeyForScheduler, Any/ICMP
-// still cancel). Probing with dstAddr.Port would skip legitimately-
-// scheduled Any/ICMP cancellations under port-bad — fenced by
-// TestUdpAC_CancelAllScheduledFlows_PortOutOfRange_StillCancelsAnyICMP.
+// Closes #2201 (multi-session shared-FlowKey races) with the
+// per-key tokenStore consult described in the plan: for each drained
+// key, scan tokenStore for any OTHER live AccessEntry that holds the
+// same key. If one exists with a still-future firewall deadline, the
+// scheduler entry must survive for that session — re-Schedule to the
+// other entry's deadline so longest-wins absorb keeps the entry
+// alive. Only when no other live entry covers the key do we Cancel.
 //
-// Known gaps in the over-broad fan-out (both gated on L7-removal):
+// Cost model: O(K × N) per cancel where K is the entry's tracked
+// keys (typically 1–3) and N is tokenStore size. Acceptable at
+// current scale (hundreds of entries). At million-session scale a
+// reverse FlowKey → entry index becomes worth adding; tracked in
+// the capacity audit (#2163).
 //
-//   - Multi-session: FlowKey is (srcIP, dstIP, port, proto), not
-//     token-specific. A fresh re-knock for the same tuple between
-//     the original Schedule and this Cancel will lose its scheduler
-//     entry too. Kernel TTL still expires the rule under L3-only —
-//     flush-on-expiry degradation, not a security regression. #2201.
-//   - NAT'd temp-access: the temp-access handlers in msghandler.go
-//     Schedule using the kernel-observed remoteAddr.IP, which differs
-//     from entry.SrcAddrs under NAT. This walker can't match the
-//     scheduled FlowKey — entry lingers, Flush fires on already-gone
-//     state (same metric-noise/breaker-exposure failure mode as #2172).
-//     #2205.
+// Snapshot semantics: Snapshot returns entry pointers under
+// tokenStore.mu. If a peer entry T2 is Delete()'d from tokenStore
+// (silent — no OnExpire) between Snapshot and the per-key
+// holdsScheduledKey(T2, ...) check, the check still returns true:
+// the entry pointer is alive in the snapshot slice and its
+// scheduledKeys hasn't been drained. This is the desired behavior
+// — we preserve scheduler coverage for any AccessEntry with a
+// live firewall window, not just live tokenStore presence — but
+// it's subtle, so don't re-snapshot per key in a future "fix."
 //
-// Both gaps close together via per-entry FlowKey tracking at
-// Schedule time, which is the implementation #2201 + #2205 share.
+// Re-Schedule margin: maxOtherDeadline.Add(flushSafetyMargin)
+// APPROXIMATELY matches the peer's original Schedule deadline.
+// The peer's scheduleFlushIfEnabled used
+// computeFlushDeadline(openTimeSec) = time.Now() + OpenTime +
+// flushSafetyMargin; the reschedule reads
+// peer.FirstKnockTime + OpenTime + flushSafetyMargin. The
+// difference is ε — the drift between GenerateAccessToken
+// stamping FirstKnockTime and scheduleFlushIfEnabled running.
+// Upper bound on ε is HandleAccessControl's pre-schedule
+// preamble: FilterMode dispatch + per-tuple IP validation +
+// ipset/BPF setup before the first scheduleFlushIfEnabled call.
+// Sub-millisecond in the common case; bounded by single-digit
+// milliseconds at the high end under burst-admission load.
+// Always small enough that the reschedule deadline lands within
+// the same scheduler tick (10ms wheel resolution) as the
+// original — the kernel-state-side late-fire window is bounded
+// by that tick, not by ε. Scheduler longest-wins absorb handles
+// the residual gap: if the original schedule's deadline was
+// slightly later, it stays; if the reschedule is later, it wins.
+// Boot-enumeration paths in expiry_enumerate_*_linux.go also call
+// Scheduler.Schedule directly but do NOT recordScheduledKey on any
+// AccessEntry, so they don't appear as candidates in
+// latestOtherFirewallDeadline's walk (holdsScheduledKey returns
+// false for them). The margin assumption is therefore correct for
+// every key that CAN be in candidates. A future Schedule call site
+// that DOES record on an AccessEntry with a different deadline
+// derivation would silently drift the reschedule logic — route all
+// admission/refresh-style Schedule calls through
+// scheduleFlushIfEnabled + computeFlushDeadline.
+//
+// Multi-session protection scope: only fires across DIFFERENT
+// cleanup events. If T1 and T2 expire in the SAME CleanExpired
+// tick, tokenStore.CleanExpired removes both under ts.mu BEFORE
+// firing the OnExpire batch — T1's Snapshot doesn't see T2, so
+// the shared key Cancels. This is correct because both firewalls
+// closed on the same tick boundary (both already past their
+// FirstKnockTime + OpenTime). The protection IS load-bearing
+// across:
+//   - OnExpire fired on T1 while T2 is still admitting / live
+//   - /refresh-shorten on T1 while T2 holds the shared FlowKey
+//   - Two separate CleanExpired ticks, one per session
+//
+// Concurrent call to the same entry (e.g., /refresh-shorten races
+// with OnExpire on the same token) is safe: drainScheduledKeys's
+// e.mu serializes the drain, so the second caller drains nil and
+// walks nothing. /refresh-shorten DOES NOT tokenStore.Delete the
+// entry; only CleanExpired does — see httpac.go for that
+// asymmetry.
+//
+// Self-skip in latestOtherFirewallDeadline depends on the pointer-
+// identity invariant documented on the AccessEntry struct godoc
+// (each *AccessEntry is in tokenStore under exactly one token).
+// Both callers of this function (OnExpire and emitOrCleanupPreMintedToken)
+// rely on it; #2214 / #2215 file stronger guards before any
+// AccessEntry pool/reuse refactor.
 func (a *UdpAC) cancelAllScheduledFlows(entry *AccessEntry) {
-	// Fast path on disabled scheduler — skip the SrcAddrs ×
-	// DstAddrs walk entirely. flowKeyForScheduler also has a
-	// nil-scheduler guard (defense-in-depth for future callers),
-	// but the loop iteration cost still has to be paid without
-	// this early return.
 	if a.expirySched == nil || entry == nil {
 		return
 	}
-	// Nil-element guards: admission produces non-nil from the
-	// JSON-decode shape in nhpmsg.go; the matching Schedule path
-	// in msghandler.go has no guard either, so production equiv
-	// holds. Cheap insurance against an upstream regression.
-	for _, srcAddr := range entry.SrcAddrs {
-		if srcAddr == nil {
+	keys := entry.drainScheduledKeys()
+	if len(keys) == 0 {
+		return
+	}
+	// Snapshot tokenStore once for all keys — multi-session sharing is
+	// uncommon, but when it happens the snapshot is consulted per key.
+	// Nil tokenStore is a programmer error in production (Start always
+	// constructs it) — log Critical + tick a metric so a future
+	// dependency-injection refactor that drops the field is loudly
+	// visible rather than silently regressing the #2201 multi-session
+	// protection. Test paths that intentionally exercise this branch
+	// pass entries with empty scheduledKeys, so the early-return
+	// upstream short-circuits before reaching here.
+	var candidates []*AccessEntry
+	if a.tokenStore != nil {
+		candidates = a.tokenStore.Snapshot()
+	} else {
+		log.Critical("[L3FlushSched] cancelAllScheduledFlows called with nil tokenStore — multi-session protection degraded to lone-entry behavior")
+		a.incrMetric(MetricL3FlushCancelNilTokenStore)
+	}
+	// now captured once and reused across the key loop — matches
+	// Snapshot's point-in-time semantic; liveness check is "are any
+	// peers live AS OF THIS CANCEL" rather than per-key fresh time.
+	// Observable consequence: an entry whose firewall closes during
+	// the cancel walk is still treated as live for keys later in the
+	// drain. Benign — the re-Schedule deadline is at most sub-second
+	// past the actual close moment and the kernel-state side has
+	// already self-expired by its TTL, so the late Flush is an ENOENT
+	// no-op per the flusher's idempotency contract.
+	now := time.Now()
+	for _, key := range keys {
+		maxOtherDeadline := a.latestOtherFirewallDeadline(candidates, entry, key, now)
+		if maxOtherDeadline.IsZero() {
+			a.expirySched.Cancel(key)
 			continue
 		}
-		for _, dstAddr := range entry.DstAddrs {
-			if dstAddr == nil {
-				continue
-			}
-			anyKey, ok := a.flowKeyForScheduler(opCancel, srcAddr.Ip, dstAddr.Ip, 0, FlowProtoAny)
-			if !ok {
-				continue
-			}
-			a.expirySched.Cancel(anyKey)
-			if tcpKey, ok := a.flowKeyForScheduler(opCancel, srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoTCP); ok {
-				a.expirySched.Cancel(tcpKey)
-			}
-			if udpKey, ok := a.flowKeyForScheduler(opCancel, srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoUDP); ok {
-				a.expirySched.Cancel(udpKey)
-			}
-			if icmpKey, ok := a.flowKeyForScheduler(opCancel, srcAddr.Ip, dstAddr.Ip, 0, FlowProtoICMP); ok {
-				a.expirySched.Cancel(icmpKey)
-			}
+		// Another live entry still needs this FlowKey. Re-Schedule
+		// at its firewall deadline + the same safety margin
+		// scheduleFlushIfEnabled applies, so longest-wins absorb
+		// keeps the scheduler entry at the correct moment. Schedule
+		// (not Cancel-then-Schedule) so any in-flight Flush barrier
+		// inside the scheduler holds — see Scheduler.Schedule godoc
+		// in expiry_scheduler.go for the inFlight-marker semantics
+		// this preserves (#2168).
+		a.expirySched.Schedule(key, maxOtherDeadline.Add(flushSafetyMargin))
+		a.incrMetric(MetricL3FlushCancelRescheduledForPeer)
+	}
+}
+
+// latestOtherFirewallDeadline scans candidates for any AccessEntry
+// other than self that holds key in its tracked set AND whose
+// firewall deadline (FirstKnockTime + OpenTime) is still in the
+// future. Returns the latest such deadline, or the zero time if no
+// other live entry needs the key.
+//
+// The "other live entry" check is what closes #2201 — pre-fix code
+// canceled the shared FlowKey unconditionally, orphaning any
+// concurrent session that had absorbed into the same scheduler
+// entry via longest-wins. Walking tracked sets directly (rather
+// than recomputing FlowKey shapes from address fields) means
+// candidates that happened to share an IP-tuple but never actually
+// scheduled the key don't count as "needs the key."
+//
+// Self-skip via pointer equality (`other == self`) relies on the
+// invariant that each AccessEntry pointer is stored under exactly
+// one token in tokenStore. Production preserves this: every
+// admission allocates a fresh &AccessEntry{} in HandleUdpACOperations
+// and never reuses pointers across tokens. A future refactor that
+// pools or reuses entry pointers (e.g., connection-pool style
+// optimization) would let self show up multiple times in the
+// snapshot, each non-self instance falsely registering as an
+// "other holder" and keeping scheduler entries alive past their
+// genuine deadlines. Guard that invariant when extending the entry
+// lifecycle.
+//
+// Receiver is *UdpAC even though the function reads no a-state —
+// surfaces cleanly in pprof / stack traces as part of UdpAC's
+// L3-flush surface rather than as an orphaned free function.
+func (a *UdpAC) latestOtherFirewallDeadline(candidates []*AccessEntry, self *AccessEntry, key FlowKey, now time.Time) time.Time {
+	var latest time.Time
+	for _, other := range candidates {
+		if other == nil || other == self {
+			continue
+		}
+		if !other.holdsScheduledKey(key) {
+			continue
+		}
+		firewallEnd := other.firewallDeadline()
+		if firewallEnd.After(now) && firewallEnd.After(latest) {
+			latest = firewallEnd
 		}
 	}
+	return latest
 }
 
 // incrMetric is the centralized increment site for AC counters,

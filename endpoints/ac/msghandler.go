@@ -74,6 +74,68 @@ func applyDefaultIpSubstitution(defaultIp string, dstAddrs []*common.NetAddress)
 	}
 }
 
+// admitAndIssueToken pre-mints + pre-stores the entry in tokenStore,
+// runs HandleAccessControl (whose per-tuple Schedule calls record on
+// entry.scheduledKeys), and gates token emission on ErrSuccess via
+// emitOrCleanupPreMintedToken. The pre-store BEFORE Schedule closes
+// the admission-window race in #2201: a concurrent OnExpire firing
+// for a peer entry that shares a FlowKey with this new entry must
+// observe this entry in tokenStore (via Snapshot) — otherwise
+// latestOtherFirewallDeadline returns zero, Cancel fires, and the
+// scheduler entry HandleAccessControl is creating gets erased.
+//
+// The cleaned/defer pattern guarantees the pre-stored entry is torn
+// down on any path that doesn't reach emitOrCleanupPreMintedToken
+// (panic mid-HandleAccessControl, or a future maintainer who adds an
+// early-return). Extracting this into a helper colocates the pairing
+// so the cleanup discipline can't drift out of sync with the pre-
+// store.
+//
+// Security invariant: the token is NOT emitted to the server unless
+// artMsg.ErrCode == ErrSuccess. On admission failure
+// emitOrCleanupPreMintedToken drains partial Schedules + Deletes the
+// entry — see its godoc for the post-nhp#1124 threat model.
+//
+// Pre-mint TOCTOU: the token is in tokenStore from GenerateAccessToken
+// onward, BEFORE HandleAccessControl writes any kernel firewall
+// state. A concurrent VerifyAccessToken in this window would find a
+// valid token whose pinhole hasn't yet been written. Not exploitable
+// because the token is 32-byte opaque random and never leaves the
+// process until emit (artMsg.ACToken stays empty on the failure
+// path; logs use RedactToken). The window's only observable effect
+// is in the cross-entry race the pre-store closes by design.
+//
+// In-process angle: if a future caller adds an in-process trigger
+// that can fire /refresh-extend against an in-flight pre-stored
+// token (admin endpoint, test harness, internal RPC), an admission
+// failure's defer Delete would race against /refresh's Schedule
+// calls on the same entry pointer — those keys would orphan
+// (entry gone from tokenStore → no OnExpire). Today's only refresh
+// trigger is the external HTTP path which cannot reach an in-flight
+// pre-mint token (the token isn't on artMsg.ACToken yet). A future
+// in-process caller must coordinate with admission completion
+// (e.g., gate refresh-extend on a per-entry "admitted" flag) before
+// firing.
+//
+// Defer cleanup is idempotent (drain → nil on second call;
+// tokenStore.Delete silent on missing key), so the defer-runs-after-
+// emit-already-cleaned path is a benign no-op — fenced by
+// TestAdmitAndIssueToken_PanicMidHandleAC_TokenNeverInArtMsg.
+func (a *UdpAC) admitAndIssueToken(entry *AccessEntry, openTimeSec int, artMsgIn *common.ACOpsResultMsg) (artMsg *common.ACOpsResultMsg, err error) {
+	preMintedToken := a.GenerateAccessToken(entry)
+	cleaned := false
+	defer func() {
+		if !cleaned {
+			a.cancelAllScheduledFlows(entry)
+			a.tokenStore.Delete(preMintedToken)
+		}
+	}()
+	artMsg, err = a.HandleAccessControl(entry, openTimeSec, artMsgIn)
+	a.emitOrCleanupPreMintedToken(artMsg, preMintedToken, entry)
+	cleaned = true
+	return
+}
+
 // HandleUdpACOperations processes a single NHP_AOP packet. Synchronous —
 // callers own goroutine and wg accounting. The production caller is the
 // NHP_AOP arm of recvMessageRoutine in udpac.go, which spawns this in a
@@ -158,21 +220,16 @@ func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
 		OrganizationId: dopMsg.OrganizationId,
 		AuthServiceId:  dopMsg.AuthServiceId,
 	}
-	artMsg, err = a.HandleAccessControl(agentUser, srcAddrs, dstAddrs, openTimeSec, artMsg)
-	if err != nil {
-		log.Error("ac(%s#%d)[HandleUdpACOperations] HandleAccessControl failed, err: %v", acId, transactionId, err)
-	}
-
-	// Token issuance is gated on ErrCode == success — see
-	// IssueACTokenIfSuccess for the threat-model rationale (post-nhp#1124
-	// the token is the entire auth secret; do not mint one for failed ops
-	// that would only surface via leaky %+v error logs on the server).
-	a.IssueACTokenIfSuccess(artMsg, &AccessEntry{
+	entry := &AccessEntry{
 		User:     agentUser,
 		SrcAddrs: srcAddrs,
 		DstAddrs: dstAddrs,
 		OpenTime: openTimeSec,
-	})
+	}
+	artMsg, err = a.admitAndIssueToken(entry, openTimeSec, artMsg)
+	if err != nil {
+		log.Error("ac(%s#%d)[HandleUdpACOperations] HandleAccessControl failed, err: %v", acId, transactionId, err)
+	}
 
 	// send ac result
 	artBytes, marshalErr := json.Marshal(artMsg)
@@ -204,7 +261,33 @@ func (a *UdpAC) HandleUdpACOperations(ppd *core.PacketParserData) (err error) {
 	return nil
 }
 
-func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.NetAddress, dstAddrs []*common.NetAddress, openTimeSec int, artMsgIn *common.ACOpsResultMsg) (artMsg *common.ACOpsResultMsg, err error) {
+// HandleAccessControl writes kernel pinhole state for entry's
+// (SrcAddrs × DstAddrs) tuples and schedules per-FlowKey flush at
+// admission deadline. entry is the tokenStore-bound AccessEntry —
+// every successful scheduleFlushIfEnabled call records its FlowKey on
+// entry.scheduledKeys so the matching cancelAllScheduledFlows (fired
+// from the OnExpire hook or /refresh-shorten) cancels exactly what
+// was scheduled. entry MUST be non-nil; tests exercising the early-
+// return gates (breaker open, invalid openTime) should pass
+// &AccessEntry{} — the gates fail-fast before touching entry's
+// fields. The nil-guard at the top is defense-in-depth: a future
+// gate added between the breaker check and field-touching code
+// could otherwise nil-deref on test inputs.
+func (a *UdpAC) HandleAccessControl(entry *AccessEntry, openTimeSec int, artMsgIn *common.ACOpsResultMsg) (artMsg *common.ACOpsResultMsg, err error) {
+	if entry == nil {
+		log.Error("[HandleAccessControl] called with nil entry — programmer error")
+		a.incrMetric(MetricL3FlushAdmissionNilEntry)
+		if artMsgIn == nil {
+			artMsg = &common.ACOpsResultMsg{}
+		} else {
+			artMsg = artMsgIn
+		}
+		err = setArtMsgError(artMsg, common.ErrACNilEntry)
+		return
+	}
+	au := entry.User
+	srcAddrs := entry.SrcAddrs
+	dstAddrs := entry.DstAddrs
 	if artMsgIn == nil {
 		artMsg = &common.ACOpsResultMsg{}
 	} else {
@@ -299,6 +382,17 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 	}
 
 	// ac ipset operations
+	//
+	// TEST FIXTURE NOTE: this `a.config.FilterMode` read is the
+	// load-bearing nil-deref trigger for
+	// TestAdmitAndIssueToken_PanicMidHandleAC_TokenNeverInArtMsg in
+	// tokenstore_test.go — the test passes a UdpAC with `a.config ==
+	// nil` and recovers the panic to verify the pre-mint cleanup
+	// defer runs and the token never lands in artMsg.ACToken. If you
+	// add an `if a.config == nil { return }` guard above this line,
+	// the test fixture breaks and t.Fatalf fires — see the test's
+	// PANIC TRIGGER NOTE for guidance on porting the trigger to a
+	// new deep-path nil-deref site rather than deleting the test.
 	if a.config.FilterMode == FilterMode_IPTABLES {
 		if a.ipset == nil {
 			log.Error("[HandleAccessControl] ipset is nil")
@@ -361,7 +455,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 
 					switch a.config.FilterMode {
 					case FilterMode_IPTABLES:
-						a.scheduleFlushIfEnabled(srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoTCP, flushDeadline)
+						a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoTCP, flushDeadline)
 						_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
 						if err != nil {
 							log.Error("[HandleAccessControl] add ipset %s error: %v", ipHashStr, err)
@@ -375,7 +469,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 								SrcIP: srcAddr.Ip,
 								DstIP: dstAddr.Ip,
 							}
-							a.scheduleFlushIfEnabled(srcAddr.Ip, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
+							a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
 							err = ebpf.EbpfRuleAdd(2, ebpfHashStr, openTimeSec)
 							if err != nil {
 								log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
@@ -389,7 +483,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 								DstPort:  dstAddr.Port,
 								Protocol: dstAddr.Protocol,
 							}
-							a.scheduleFlushIfEnabled(srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoTCP, flushDeadline)
+							a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoTCP, flushDeadline)
 							err = ebpf.EbpfRuleAdd(1, ebpfHashStr, openTimeSec)
 							if err != nil {
 								log.Error("[EbpfRuleAdd] add ebpf tcp failed src: %s dst: %s, protocol: %s, dstport: %d, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, ebpfHashStr.Protocol, ebpfHashStr.DstPort, err)
@@ -411,7 +505,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 
 					switch a.config.FilterMode {
 					case FilterMode_IPTABLES:
-						a.scheduleFlushIfEnabled(srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
+						a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
 						_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
 						if err != nil {
 							log.Error("[HandleAccessControl] add ipset %s error: %v", ipHashStr, err)
@@ -424,7 +518,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 								SrcIP: srcAddr.Ip,
 								DstIP: dstAddr.Ip,
 							}
-							a.scheduleFlushIfEnabled(srcAddr.Ip, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
+							a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
 							err = ebpf.EbpfRuleAdd(2, ebpfHashStr, openTimeSec)
 							if err != nil {
 								log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
@@ -438,7 +532,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 								DstPort:  dstAddr.Port,
 								Protocol: dstAddr.Protocol,
 							}
-							a.scheduleFlushIfEnabled(srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
+							a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
 							err = ebpf.EbpfRuleAdd(1, ebpfHashStr, openTimeSec)
 
 							if err != nil {
@@ -458,7 +552,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 						ipHashStr := fmt.Sprintf("%s,%s,%s", srcAddr.Ip, utils.ICMPEchoType(ipType), dstAddr.Ip)
 						switch a.config.FilterMode {
 						case FilterMode_IPTABLES:
-							a.scheduleFlushIfEnabled(srcAddr.Ip, dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
+							a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
 							_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
 							if err != nil {
 								log.Error("[HandleAccessControl] add ipset %s error: %v", ipHashStr, err)
@@ -470,7 +564,7 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 								SrcIP: srcAddr.Ip,
 								DstIP: dstAddr.Ip,
 							}
-							a.scheduleFlushIfEnabled(srcAddr.Ip, dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
+							a.scheduleFlushIfEnabled(entry, srcAddr.Ip, dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
 							err = ebpf.EbpfRuleAdd(3, ebpfHashStr, openTimeSec)
 							if err != nil {
 								log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
@@ -751,17 +845,18 @@ func (a *UdpAC) HandleAccessControl(au *common.AgentUser, srcAddrs []*common.Net
 			DstAddrs: dstAddrs,
 			OpenTime: tempOpenTimeSec,
 		}
-		// INVARIANT: this token issuance is not gated by IssueACTokenIfSuccess
-		// because PreAccessAction is reached only after every error return in
-		// HandleAccessControl above, and ErrCode is unconditionally set to
-		// success at the bottom of this function. Any future error branch
-		// added between this line and the `ErrCode = ErrSuccess` assignment
-		// below would mint a token paired with a failure code and leak it via
-		// the server's `%+v` artMsg logs (the leak-logger predicate uses the
-		// strict `ErrCode != ErrSuccess.ErrorCode()` check). Post-nhp#1124
-		// the token is the entire auth secret; preserve the
-		// issuance-immediately-before-success pairing or move to a gated
-		// helper. Code-level enforcement tracked in #1420.
+		// INVARIANT: this token issuance is not gated by the
+		// emitOrCleanupPreMintedToken pattern HandleUdpACOperations uses,
+		// because PreAccessAction is reached only after every error return
+		// in HandleAccessControl above, and ErrCode is unconditionally set
+		// to success at the bottom of this function. Any future error
+		// branch added between this line and the `ErrCode = ErrSuccess`
+		// assignment below would mint a token paired with a failure code
+		// and leak it via the server's `%+v` artMsg logs (the leak-logger
+		// predicate uses the strict `ErrCode != ErrSuccess.ErrorCode()`
+		// check). Post-nhp#1124 the token is the entire auth secret;
+		// preserve the issuance-immediately-before-success pairing or
+		// move to a gated helper. Code-level enforcement tracked in #1420.
 		artMsg.PreAccessAction = &common.PreAccessInfo{
 			AccessPort:     strconv.Itoa(pickedPort),
 			ACPubKey:       a.device.PublicKeyBase64(),
@@ -886,6 +981,17 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 		return
 	}
 
+	// Per-entry tracking on tempEntry (the #2205 proposal) introduces
+	// an ESTABLISHED-bypass: tempEntry's tokenStore expiry (~35s)
+	// fires Cancel on the scheduled flush long before the kernel rule
+	// (lifetime openTimeSec, often hours) GCs. Routed through
+	// scheduleFlushOrphan instead — the scheduler entry has no
+	// per-entry owner, fires Flush at the scheduled deadline, and
+	// matches the kernel rule's natural TTL. See scheduleFlushOrphan
+	// godoc + #2213 for the lifetime-mismatch analysis and the
+	// proper fix (long-lived AccessEntry whose OpenTime matches the
+	// kernel rule's actual lifetime, restoring revocation precision
+	// before L7 removal).
 	if a.VerifyAccessToken(accMsg.ACToken) != nil {
 		remoteAddr, _ := net.ResolveTCPAddr(conn.RemoteAddr().Network(), conn.RemoteAddr().String())
 		srcAddrIp := remoteAddr.IP.String()
@@ -912,7 +1018,7 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 				// Wildcard port (Port==0) maps to the FlowKey port=0
 				// no-port-filter form; ConntrackFlusher skips --dport
 				// in that case, which is the right partial-tuple shape.
-				a.scheduleFlushIfEnabled(srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoTCP, flushDeadline)
+				a.scheduleFlushOrphan(srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoTCP, flushDeadline)
 				_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
 				if err != nil {
 					log.Error("[tcpTempAccessHandler] add ipset %s error: %v", ipHashStr, err)
@@ -935,7 +1041,7 @@ func (a *UdpAC) tcpTempAccessHandler(listener *net.TCPListener, timeoutSec int, 
 				// past timeout. A future change that swaps the
 				// eBPF mapType here MUST also update the FlowKey
 				// shape to match.
-				a.scheduleFlushIfEnabled(srcAddrIp, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
+				a.scheduleFlushOrphan(srcAddrIp, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
 				err = ebpf.EbpfRuleAdd(2, ebpfHashStr, openTimeSec)
 				if err != nil {
 					log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
@@ -1030,6 +1136,9 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 		return
 	}
 
+	// Routed through scheduleFlushOrphan (NOT per-entry tracking) —
+	// see tcpTempAccessHandler's matching note + scheduleFlushOrphan
+	// godoc + #2213 for the lifetime-mismatch analysis.
 	if a.VerifyAccessToken(accMsg.ACToken) != nil {
 		srcAddrIp := remoteAddr.IP.String()
 
@@ -1053,7 +1162,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 				}
 				switch a.config.FilterMode {
 				case FilterMode_IPTABLES:
-					a.scheduleFlushIfEnabled(srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
+					a.scheduleFlushOrphan(srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
 					_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
 					if err != nil {
 						log.Error("[udpTempAccessHandler] add ipset %s error: %v", ipHashStr, err)
@@ -1065,7 +1174,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 							SrcIP: srcAddrIp,
 							DstIP: dstAddr.Ip,
 						}
-						a.scheduleFlushIfEnabled(srcAddrIp, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
+						a.scheduleFlushOrphan(srcAddrIp, dstAddr.Ip, 0, FlowProtoAny, flushDeadline)
 						err = ebpf.EbpfRuleAdd(2, ebpfHashStr, openTimeSec)
 						if err != nil {
 							log.Error("[EbpfRuleAdd] add ebpf src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)
@@ -1079,7 +1188,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 							DstPort:  dstAddr.Port,
 							Protocol: dstAddr.Protocol,
 						}
-						a.scheduleFlushIfEnabled(srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
+						a.scheduleFlushOrphan(srcAddrIp, dstAddr.Ip, dstAddr.Port, FlowProtoUDP, flushDeadline)
 						err = ebpf.EbpfRuleAdd(1, ebpfHashStr, openTimeSec)
 
 						if err != nil {
@@ -1111,7 +1220,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 					// in-flight Flush barrier holds; if the
 					// non-fatal write below fails the flush is a
 					// no-op against an absent entry.
-					a.scheduleFlushIfEnabled(remoteAddr.IP.String(), dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
+					a.scheduleFlushOrphan(remoteAddr.IP.String(), dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
 					_, err = a.ipset.Add(ipType, 1, openTimeSec, ipHashStr)
 					if err != nil {
 						log.Warning("[udpTempAccessHandler] failed to add ICMP rule %s: %v", ipHashStr, err)
@@ -1121,7 +1230,7 @@ func (a *UdpAC) udpTempAccessHandler(conn *net.UDPConn, timeoutSec int, dstAddrs
 						SrcIP: remoteAddr.IP.String(),
 						DstIP: dstAddr.Ip,
 					}
-					a.scheduleFlushIfEnabled(remoteAddr.IP.String(), dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
+					a.scheduleFlushOrphan(remoteAddr.IP.String(), dstAddr.Ip, 0, FlowProtoICMP, flushDeadline)
 					err = ebpf.EbpfRuleAdd(3, ebpfHashStr, openTimeSec)
 					if err != nil {
 						log.Error("[EbpfRuleAdd] add ebpf icmp src: %s dst: %s, error: %v", ebpfHashStr.SrcIP, ebpfHashStr.DstIP, err)

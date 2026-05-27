@@ -142,8 +142,9 @@ func TestHandleUdpACOperations_WrongLengthPubkeyDistinct(t *testing.T) {
 // mutex.
 func TestHandleUdpACOperations_FirstSeenProceedsToUnmarshal(t *testing.T) {
 	a := &UdpAC{
-		config:    &Config{ACId: "test-ac"},
-		aopReplay: newAOPReplayCache(),
+		config:     &Config{ACId: "test-ac"},
+		aopReplay:  newAOPReplayCache(),
+		tokenStore: common.NewTokenStore[*AccessEntry](),
 	}
 
 	ppd := &core.PacketParserData{
@@ -312,7 +313,7 @@ func TestApplyDefaultIpSubstitution_NilEntries(t *testing.T) {
 func TestHandleAccessControl_RejectsNonPositiveOpenTime(t *testing.T) {
 	a := &UdpAC{}
 	for _, openTimeSec := range []int{0, -1, -1000} {
-		artMsg, err := a.HandleAccessControl(nil, nil, nil, openTimeSec, nil)
+		artMsg, err := a.HandleAccessControl(&AccessEntry{}, openTimeSec, nil)
 		if err == nil {
 			t.Errorf("openTimeSec=%d: expected error, got nil", openTimeSec)
 			continue
@@ -357,7 +358,7 @@ func TestHandleAccessControl_AdmissionGate_BreakerOpen(t *testing.T) {
 	}
 
 	a := &UdpAC{expirySched: sched}
-	artMsg, err := a.HandleAccessControl(nil, nil, nil, 60 /* valid */, nil)
+	artMsg, err := a.HandleAccessControl(&AccessEntry{}, 60 /* valid */, nil)
 	if !errors.Is(err, common.ErrACSchedulerBreakerOpen) {
 		t.Fatalf("got err=%v, want ErrACSchedulerBreakerOpen (admission must refuse when breaker open)", err)
 	}
@@ -373,7 +374,7 @@ func TestHandleAccessControl_AdmissionGate_BreakerOpen(t *testing.T) {
 
 	// Second AOP while breaker is still open must ALSO be refused
 	//
-	artMsg2, err2 := a.HandleAccessControl(nil, nil, nil, 60, nil)
+	artMsg2, err2 := a.HandleAccessControl(&AccessEntry{}, 60, nil)
 	if !errors.Is(err2, common.ErrACSchedulerBreakerOpen) {
 		t.Errorf("2nd AOP while breaker still open: got err=%v, want ErrACSchedulerBreakerOpen", err2)
 	}
@@ -391,7 +392,7 @@ func TestHandleAccessControl_AdmissionGate_FeatureOff_NoBreakerCheck(t *testing.
 	// openTimeSec=-1 to short-circuit before any kernel writes — we
 	// only want to verify the admission gate doesn't panic on nil and
 	// reaches the second (openTimeSec) gate.
-	_, err := a.HandleAccessControl(nil, nil, nil, -1, nil)
+	_, err := a.HandleAccessControl(&AccessEntry{}, -1, nil)
 	if !errors.Is(err, common.ErrACInvalidOpenTime) {
 		t.Errorf("with scheduler nil and openTimeSec=-1, expected ErrACInvalidOpenTime (passes admission gate, fails openTime gate); got %v", err)
 	}
@@ -404,7 +405,26 @@ func TestHandleAccessControl_AdmissionGate_FeatureOff_NoBreakerCheck(t *testing.
 func TestScheduleFlushIfEnabled_NoOp_WhenNil(t *testing.T) {
 	a := &UdpAC{expirySched: nil}
 	// Just verifying no panic.
-	a.scheduleFlushIfEnabled("192.0.2.1", "192.0.2.2", 443, FlowProtoTCP, time.Now().Add(60*time.Second))
+	a.scheduleFlushIfEnabled(&AccessEntry{}, "192.0.2.1", "192.0.2.2", 443, FlowProtoTCP, time.Now().Add(60*time.Second))
+}
+
+// TestScheduleFlushIfEnabled_NilEntry_DropsAndDoesNotPanic fences the
+// nil-entry guard added in cr round 2: a nil entry would create a
+// phantom scheduler entry (Scheduled but not tracked), so the function
+// drops the schedule and increments MetricL3FlushScheduleNilEntry
+// rather than panicking. Production should never hit this path; the
+// metric is the observability signal that a future caller regressed.
+func TestScheduleFlushIfEnabled_NilEntry_DropsAndDoesNotPanic(t *testing.T) {
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer shutdownOrFail(t, sched)
+
+	a := &UdpAC{expirySched: sched}
+	a.scheduleFlushIfEnabled(nil, "192.0.2.1", "192.0.2.2", 443, FlowProtoTCP, time.Now().Add(60*time.Second))
+
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("EntryCount after nil-entry schedule attempt = %d, want 0 — nil-entry guard let a phantom scheduler entry through", got)
+	}
 }
 
 // TestScheduleFlushIfEnabled_BuildsCorrectFlowKey fences the
@@ -436,7 +456,7 @@ func TestScheduleFlushIfEnabled_BuildsCorrectFlowKey(t *testing.T) {
 			defer shutdownOrFail(t, sched)
 
 			a := &UdpAC{expirySched: sched}
-			a.scheduleFlushIfEnabled(c.srcIP, c.dstIP, c.dstPort, c.proto, time.Now().Add(60*time.Second))
+			a.scheduleFlushIfEnabled(&AccessEntry{}, c.srcIP, c.dstIP, c.dstPort, c.proto, time.Now().Add(60*time.Second))
 
 			expected, err := MakeFlowKey(c.srcIP, c.dstIP, c.dstPort, c.proto)
 			if err != nil {
@@ -471,9 +491,9 @@ func TestScheduleFlushIfEnabled_RejectsMalformedFlowKey(t *testing.T) {
 
 	a := &UdpAC{expirySched: sched}
 	// Malformed source IP — MakeFlowKey rejects.
-	a.scheduleFlushIfEnabled("not-an-ip", "192.0.2.2", 443, FlowProtoTCP, time.Now().Add(60*time.Second))
+	a.scheduleFlushIfEnabled(&AccessEntry{}, "not-an-ip", "192.0.2.2", 443, FlowProtoTCP, time.Now().Add(60*time.Second))
 	// Unspecified IP — MakeFlowKey rejects (wildcard fence).
-	a.scheduleFlushIfEnabled("0.0.0.0", "192.0.2.2", 443, FlowProtoTCP, time.Now().Add(60*time.Second))
+	a.scheduleFlushIfEnabled(&AccessEntry{}, "0.0.0.0", "192.0.2.2", 443, FlowProtoTCP, time.Now().Add(60*time.Second))
 
 	if got := sched.EntryCount(); got != 0 {
 		t.Errorf("expected zero entries (malformed inputs rejected at FlowKey boundary); got %d", got)

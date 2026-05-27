@@ -124,9 +124,13 @@ func NewTokenStore[E TokenEntry]() *TokenStore[E] {
 // Designed for once-at-startup registration, not hot-path swaps.
 //
 // The hook receives the entry pointer as captured at snapshot
-// time. AccessEntry is effectively post-store immutable today; a
-// future caller that mutates entries post-store must synchronize
-// reads against those mutations.
+// time. Post-store mutations on the entry require caller-side
+// synchronization — for example, endpoints/ac.AccessEntry mutates
+// its scheduledKeys set under its own e.mu (#2201/#2205), so the
+// hook calling cancelAllScheduledFlows reads/drains scheduledKeys
+// under that lock outside ts.mu. Any future post-store mutation
+// must follow the same pattern: take the entry's own lock; do not
+// rely on ts.mu for entry-field synchronization.
 //
 // Hook panics are recovered per-entry (logged with a stack trace)
 // so a single bad token does not abort the batch. Token-safety
@@ -307,4 +311,50 @@ func (ts *TokenStore[E]) Size() int {
 		count += len(tokenMap)
 	}
 	return count
+}
+
+// Snapshot returns every entry currently in the store as a slice. The
+// snapshot is taken under ts.mu so callers see a coherent point-in-time
+// view; subsequent Store / Delete / CleanExpired calls do not affect
+// the returned slice. The slice itself is a fresh allocation but the
+// element pointers are shared with the store — callers reading entry
+// fields after the snapshot must obey the same per-entry
+// synchronization rules described in SetOnExpire's godoc (e.g., the
+// AC's AccessEntry.scheduledKeys is guarded by its own e.mu).
+//
+// Intended for O(N) scans that need to consult multiple entries at
+// once — for example, endpoints/ac.UdpAC.cancelAllScheduledFlows
+// uses this to find other AccessEntries sharing a FlowKey before
+// deciding whether to cancel the scheduler entry (#2201). For
+// single-entry lookups use Load.
+//
+// Burst cost: each CleanExpired tick fires OnExpire for every
+// expired entry sequentially; if those hooks all call Snapshot,
+// total work is O(M × N) per cleanup cycle (M = expired in this
+// tick, N = remaining tokens). Acceptable at current scale (M and
+// N both ≤ thousands today). At million-session scale, callers
+// should consider a snapshot-once-per-batch API or a reverse
+// index — flagged for the L7-removal capacity work.
+func (ts *TokenStore[E]) Snapshot() []E {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+
+	// Pre-size by total count to avoid grow-then-copy churn at higher
+	// scale (the outer store map is keyed by prefix, not sized to total
+	// token count). The total is at most a few-byte sum across the
+	// prefix buckets — cheap.
+	total := 0
+	for _, tokenMap := range ts.store {
+		total += len(tokenMap)
+	}
+	if total == 0 {
+		return nil
+	}
+	out := make([]E, 0, total)
+	for _, tokenMap := range ts.store {
+		for _, entry := range tokenMap {
+			out = append(out, entry)
+		}
+	}
+	return out
 }

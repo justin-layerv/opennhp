@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/OpenNHP/opennhp/endpoints/metrics"
 	"github.com/OpenNHP/opennhp/nhp/common"
 )
 
@@ -76,17 +79,22 @@ func TestGenerateAccessToken_Uniqueness(t *testing.T) {
 	}
 }
 
-// TestIssueACTokenIfSuccess_GatesOnErrCode fences the threat-model fix:
-// post-nhp#1124 the access token is the entire auth secret, so a token
-// issued alongside ErrCode != success would only ever appear in leaky
-// %+v error logs on the server (endpoints/server/udpserver.go:1862,
-// :2150). The gate must use STRICT success-code equality, not the more
-// permissive common.IsSuccessErrCode (which treats empty string as
-// success) — bare-return paths in HandleAccessControl can leave ErrCode
-// == "" with err != nil, and the server's leak logger treats those as
-// failures. Issuing a token under those conditions would re-open the
-// exact path the gate exists to close.
-func TestIssueACTokenIfSuccess_GatesOnErrCode(t *testing.T) {
+// TestEmitOrCleanupPreMintedToken_GatesOnErrCode fences the
+// post-admission gate paired with the pre-mint-then-pre-store pattern
+// in HandleUdpACOperations (#2201). Post-nhp#1124 the access token is
+// the entire auth secret, so a token issued alongside ErrCode !=
+// success would only ever appear in leaky %+v error logs on the
+// server (endpoints/server/udpserver.go:1862, :2150). The gate uses
+// STRICT success-code equality, not the more permissive
+// common.IsSuccessErrCode (which treats empty string as success) —
+// bare-return paths in HandleAccessControl can leave ErrCode == ""
+// with err != nil, and the server's leak logger treats those as
+// failures. Emitting a token under those conditions would re-open
+// the exact path the gate exists to close. Additionally: on the
+// non-success path the pre-stored entry MUST be Deleted from
+// tokenStore, otherwise an unemitted token would linger and a
+// concurrent /refresh consult would resolve to a stranded entry.
+func TestEmitOrCleanupPreMintedToken_GatesOnErrCode(t *testing.T) {
 	cases := []struct {
 		name        string
 		errCode     string
@@ -97,19 +105,19 @@ func TestIssueACTokenIfSuccess_GatesOnErrCode(t *testing.T) {
 			name:        "empty_errcode_no_token",
 			errCode:     "",
 			wantIssued:  false,
-			description: "empty ErrCode is the bare-return / err-set-but-no-errcode case from HandleAccessControl (e.g. EBPFXDP EbpfRuleAdd failure at msghandler.go:478) — server's leak logger treats it as failure, gate must too",
+			description: "empty ErrCode is the bare-return / err-set-but-no-errcode case from HandleAccessControl — server's leak logger treats it as failure, gate must too",
 		},
 		{
-			name:        "explicit_success_code_issues",
+			name:        "explicit_success_code_emits",
 			errCode:     common.ErrSuccess.ErrorCode(),
 			wantIssued:  true,
-			description: "the only ErrCode value that should mint a token",
+			description: "the only ErrCode value that should emit the pre-minted token",
 		},
 		{
-			name:        "failure_code_no_token",
+			name:        "failure_code_cleans_up",
 			errCode:     "5001",
 			wantIssued:  false,
-			description: "any explicit non-success code suppresses issuance",
+			description: "any explicit non-success code suppresses emit AND Deletes the pre-stored entry",
 		},
 		{
 			name:        "ac_op_failed_no_token",
@@ -139,8 +147,14 @@ func TestIssueACTokenIfSuccess_GatesOnErrCode(t *testing.T) {
 				User:     &common.AgentUser{UserId: "u"},
 				OpenTime: 60,
 			}
+			// Simulate the pre-mint-then-pre-store pattern in
+			// HandleUdpACOperations.
+			preMintedToken := a.GenerateAccessToken(entry)
+			if a.tokenStore.Size() != 1 {
+				t.Fatalf("precondition: pre-store should put 1 entry in tokenStore, got %d", a.tokenStore.Size())
+			}
 
-			a.IssueACTokenIfSuccess(artMsg, entry)
+			a.emitOrCleanupPreMintedToken(artMsg, preMintedToken, entry)
 
 			if tc.wantIssued {
 				if artMsg.ACToken == "" {
@@ -149,16 +163,260 @@ func TestIssueACTokenIfSuccess_GatesOnErrCode(t *testing.T) {
 				if got := a.VerifyAccessToken(artMsg.ACToken); got != entry {
 					t.Fatalf("%s: token did not round-trip through tokenStore", tc.description)
 				}
+				if a.tokenStore.Size() != 1 {
+					t.Fatalf("%s: success path must keep the pre-stored entry; tokenStore size = %d, want 1", tc.description, a.tokenStore.Size())
+				}
 			} else {
 				if artMsg.ACToken != "" {
 					t.Fatalf("%s: expected ACToken to stay empty, got %q", tc.description, artMsg.ACToken)
 				}
 				if a.tokenStore.Size() != 0 {
-					t.Fatalf("%s: expected tokenStore to stay empty, got size %d", tc.description, a.tokenStore.Size())
+					t.Fatalf("%s: expected tokenStore to be cleaned up to empty, got size %d", tc.description, a.tokenStore.Size())
 				}
 			}
 		})
 	}
+}
+
+// PANIC TRIGGER NOTE for TestAdmitAndIssueToken_PanicMidHandleAC_TokenNeverInArtMsg:
+//
+// The test triggers panic by passing a UdpAC with `a.config == nil` —
+// HandleAccessControl reads `a.config.FilterMode` at the IPTABLES
+// gate (msghandler.go) and nil-derefs. That deref site is the SINGLE
+// load-bearing trigger; a `TEST FIXTURE NOTE` comment at the deref
+// itself flags the dependency for any contributor adding an `if
+// a.config == nil { return }` guard above it.
+//
+// We deliberately do NOT use `a.ipset == nil` as a backup trigger:
+// HandleAccessControl already has an explicit `if a.ipset == nil {
+// return err }` graceful-fallback check immediately AFTER the
+// FilterMode read, so nil ipset doesn't panic — it returns
+// gracefully and the test's t.Fatalf("expected panic …") fires.
+//
+// If the FilterMode trigger gains a graceful guard (returns without
+// panicking), the test fixture fails loud — it does NOT silently
+// pass — because `paniced == nil` hits t.Fatalf. The maintainer's
+// required response:
+//
+//   - Find a NEW deterministic panic trigger that fires deep inside
+//     HandleAccessControl AFTER admitAndIssueToken's pre-store-and-defer
+//     setup AND BEFORE emitOrCleanupPreMintedToken sets cleaned=true.
+//     Candidates: malformed `entry.SrcAddrs[0]` (nil pointer in slot),
+//     panicking *Device on AC keypair lookup, or a synchronous panic
+//     injected via a refactored admitAndIssueToken hook.
+//   - Update this test with the new trigger.
+//   - **Do NOT delete the test.** The token-leak path it fences
+//     (post-nhp#1124: token == entire auth secret; leaked to
+//     `artMsg.ACToken` via panic path bypasses the post-success gate)
+//     is the explicit security invariant for the pre-mint pattern.
+//     Deleting the test removes the only synthetic fence on that
+//     invariant.
+//
+// TestAdmitAndIssueToken_PanicMidHandleAC_TokenNeverInArtMsg fences
+// the post-nhp#1124 security invariant under the panic path: even
+// if HandleAccessControl panics after the pre-mint-then-pre-store
+// completes, the pre-minted token MUST NOT reach artMsg.ACToken
+// (the only field the server reads it from). The defer cleanup in
+// admitAndIssueToken also drops the entry from tokenStore so the
+// token cannot be /refresh'd.
+//
+// This is the explicit fence for cr round 3 item 5; brittleness
+// trade-off discussed in cr round 19/20 — a panicking-flusher-via-
+// scheduler-option-chain trigger would be ideal but requires
+// refactoring admitAndIssueToken to take an injectable HandleAccessControl
+// hook (out of scope for this PR; tracked as a follow-up if the
+// single-trigger fixture proves insufficient in practice).
+func TestAdmitAndIssueToken_PanicMidHandleAC_TokenNeverInArtMsg(t *testing.T) {
+	a := &UdpAC{
+		tokenStore: common.NewTokenStore[*AccessEntry](),
+		// a.config left nil — HandleAccessControl panics on the
+		// FilterMode read (msghandler.go's TEST FIXTURE NOTE marks
+		// the load-bearing deref site). a.ipset is also nil here but
+		// the existing `if a.ipset == nil` graceful guard inside
+		// HandleAccessControl means that field is NOT a panic
+		// trigger; see PANIC TRIGGER NOTE above.
+	}
+	entry := &AccessEntry{
+		User:     &common.AgentUser{UserId: "u-panic"},
+		SrcAddrs: []*common.NetAddress{{Ip: "1.2.3.4"}},
+		DstAddrs: []*common.NetAddress{{Ip: "10.0.0.1", Port: 80}},
+		OpenTime: 60,
+	}
+	artMsg := &common.ACOpsResultMsg{}
+
+	var paniced any
+	func() {
+		defer func() { paniced = recover() }()
+		_, _ = a.admitAndIssueToken(entry, 60, artMsg)
+	}()
+
+	if paniced == nil {
+		t.Fatalf("expected panic from HandleAccessControl with nil a.config — FilterMode-deref trigger guarded. " +
+			"DO NOT DELETE THIS TEST: it fences a load-bearing security invariant (post-nhp#1124 token-leak via " +
+			"panic path bypasses post-success gate). Find a new deep-path panic trigger that fires after " +
+			"admitAndIssueToken's pre-store-and-defer setup — see PANIC TRIGGER NOTE above the test for guidance.")
+	}
+	if artMsg.ACToken != "" {
+		t.Errorf("ACToken after panic = %q, want empty (pre-mint token leaked through panic path)", artMsg.ACToken)
+	}
+	if a.tokenStore.Size() != 0 {
+		t.Errorf("tokenStore size after panic = %d, want 0 (defer cleanup did not run)", a.tokenStore.Size())
+	}
+}
+
+// TestEmitOrCleanupPreMintedToken_DrainsPartiallyScheduledKeys
+// fences the cleanup-path drain (cr round 2 finding): if
+// HandleAccessControl ran N successful scheduleFlushIfEnabled calls
+// before a downstream kernel write failed, the pre-stored entry
+// holds those keys in its scheduledKeys set. tokenStore.Delete
+// alone is silent (no OnExpire hook), so cancelAllScheduledFlows
+// MUST run explicitly to drop the scheduler entries — otherwise
+// they fire Flush against kernel state that the failed write
+// never created, ticking the breaker error counter on every
+// failure and (at sustained rate) opening the admission gate.
+//
+// Pre-fix: only tokenStore.Delete ran on the failure branch →
+// scheduler EntryCount stays at N after the cleanup.
+// Post-fix: drain + Delete → scheduler EntryCount drops to 0.
+func TestEmitOrCleanupPreMintedToken_DrainsPartiallyScheduledKeys(t *testing.T) {
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+
+	a := &UdpAC{
+		tokenStore:  common.NewTokenStore[*AccessEntry](),
+		expirySched: sched,
+	}
+
+	entry := &AccessEntry{
+		User:     &common.AgentUser{UserId: "u-partial"},
+		SrcAddrs: []*common.NetAddress{{Ip: "1.2.3.4"}},
+		DstAddrs: []*common.NetAddress{{Ip: "10.0.0.1", Port: 80}},
+		OpenTime: 60,
+	}
+	preMintedToken := a.GenerateAccessToken(entry)
+
+	// Simulate "HandleAccessControl ran 2 successful Schedule calls
+	// before a third kernel write failed and set ErrCode to
+	// ErrACIPSetOperationFailed." The entry's scheduledKeys holds
+	// both keys; the scheduler holds 2 entries.
+	a.scheduleFlushIfEnabled(entry, "1.2.3.4", "10.0.0.1", 80, FlowProtoTCP, time.Now().Add(1*time.Hour))
+	a.scheduleFlushIfEnabled(entry, "1.2.3.4", "10.0.0.1", 80, FlowProtoUDP, time.Now().Add(1*time.Hour))
+	if got := sched.EntryCount(); got != 2 {
+		t.Fatalf("precondition: EntryCount = %d, want 2 (2 successful Schedule calls)", got)
+	}
+
+	artMsg := &common.ACOpsResultMsg{ErrCode: common.ErrACIPSetOperationFailed.ErrorCode()}
+	a.emitOrCleanupPreMintedToken(artMsg, preMintedToken, entry)
+
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("EntryCount after cleanup of partial-admission failure = %d, want 0 — scheduler entries leaked (cr round 2 regression)", got)
+	}
+	if a.tokenStore.Size() != 0 {
+		t.Errorf("tokenStore size after cleanup = %d, want 0", a.tokenStore.Size())
+	}
+	if artMsg.ACToken != "" {
+		t.Errorf("ACToken after failed admission = %q, want empty (token-emit gate violated)", artMsg.ACToken)
+	}
+}
+
+// TestEmitOrCleanupPreMintedToken_PeerReschedulesAcrossCleanup fences
+// the cancel-before-Delete ordering in emitOrCleanupPreMintedToken:
+// when a failed admission triggers cleanup AND a peer entry holds the
+// same FlowKey with a live firewall deadline, the cleanup walk must
+// observe the peer and re-Schedule the shared scheduler entry
+// (preserving peer coverage) rather than Cancel-and-erase.
+//
+// Pre-fix risk (cr round 22 concern #8): both Cancel-then-Delete and
+// Delete-then-Cancel happen to produce the right outcome today via
+// different self-filter mechanisms (pointer-equality self-skip vs
+// Delete-induced self-absence). A future Delete-first reorder leaves
+// the surrounding godocs accurate-but-vestigial. This fence ensures
+// the peer-reschedule path actually fires; a reorder regression
+// would leak a peer's coverage AND fail this test, surfacing the
+// regression at CI rather than at runtime.
+func TestEmitOrCleanupPreMintedToken_PeerReschedulesAcrossCleanup(t *testing.T) {
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+
+	a := &UdpAC{
+		tokenStore:  common.NewTokenStore[*AccessEntry](),
+		expirySched: sched,
+	}
+
+	const srcIP, dstIP, dstPort = "1.2.3.4", "10.0.0.1", 80
+
+	// Peer entry T1: already admitted, live firewall (FirstKnockTime
+	// + OpenTime well in the future). Holds shared FlowKey K.
+	peer := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-peer-live"},
+		SrcAddrs:       []*common.NetAddress{{Ip: srcIP}},
+		DstAddrs:       []*common.NetAddress{{Ip: dstIP, Port: dstPort}},
+		OpenTime:       3600,
+		FirstKnockTime: time.Now(),
+	}
+	peerToken := a.GenerateAccessToken(peer)
+	a.scheduleFlushIfEnabled(peer, srcIP, dstIP, dstPort, FlowProtoTCP, time.Now().Add(1*time.Hour))
+
+	// Failing-admission entry T2: pre-stored + partially-scheduled,
+	// then cleanup fires. Shares FlowKey K with peer.
+	failing := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-failing"},
+		SrcAddrs:       []*common.NetAddress{{Ip: srcIP}},
+		DstAddrs:       []*common.NetAddress{{Ip: dstIP, Port: dstPort}},
+		OpenTime:       3600,
+		FirstKnockTime: time.Now(),
+	}
+	failingToken := a.GenerateAccessToken(failing)
+	a.scheduleFlushIfEnabled(failing, srcIP, dstIP, dstPort, FlowProtoTCP, time.Now().Add(2*time.Hour))
+
+	if got := sched.EntryCount(); got != 1 {
+		t.Fatalf("precondition: EntryCount = %d, want 1 (longest-wins absorbs both Schedules to one entry)", got)
+	}
+
+	artMsg := &common.ACOpsResultMsg{ErrCode: common.ErrACIPSetOperationFailed.ErrorCode()}
+	a.emitOrCleanupPreMintedToken(artMsg, failingToken, failing)
+
+	// Post-cleanup invariants:
+	//  - failing's tokenStore entry is deleted
+	//  - failing's scheduledKeys is drained
+	//  - peer's tokenStore entry is still present
+	//  - scheduler EntryCount stays at 1 (rescheduled to peer's deadline)
+	if got := sched.EntryCount(); got != 1 {
+		t.Errorf("EntryCount after cleanup with live peer = %d, want 1 — peer-reschedule lost (cleanup-order regression: peer's coverage was orphaned)", got)
+	}
+	if a.tokenStore.Size() != 1 {
+		t.Errorf("tokenStore size after cleanup = %d, want 1 (peer entry only)", a.tokenStore.Size())
+	}
+	if !peer.holdsScheduledKey(mustFlowKey(t, srcIP, dstIP, dstPort, FlowProtoTCP)) {
+		t.Errorf("peer no longer holds shared FlowKey — drain leaked across entries")
+	}
+	if artMsg.ACToken != "" {
+		t.Errorf("ACToken after failed admission = %q, want empty", artMsg.ACToken)
+	}
+	_ = peerToken
+}
+
+func mustFlowKey(t *testing.T, srcIP, dstIP string, dstPort int, proto FlowProto) FlowKey {
+	t.Helper()
+	k, err := MakeFlowKey(srcIP, dstIP, dstPort, proto)
+	if err != nil {
+		t.Fatalf("MakeFlowKey(%s, %s, %d, %v): %v", srcIP, dstIP, dstPort, proto, err)
+	}
+	return k
 }
 
 // TestAccessTokenLatePacketBufferConstantMatchesServer pins the AC's
@@ -643,6 +901,11 @@ func TestRemainingFirewallSeconds_ShrinksOverTime(t *testing.T) {
 // would silently disable the entire #2202 mechanism — this test
 // fires the hook indirectly via CleanExpired and asserts the
 // scheduler entry was canceled.
+//
+// Routes the Schedule through scheduleFlushIfEnabled (the production
+// path) so the key is recorded on entry.scheduledKeys; per-entry
+// tracking (#2201/#2205) means cancelAllScheduledFlows walks exactly
+// what was scheduled rather than recomputing a fan-out.
 func TestUdpAC_InstallExpiryHook_WiresCancelAllScheduledFlows(t *testing.T) {
 	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
 	sched.Start()
@@ -670,11 +933,7 @@ func TestUdpAC_InstallExpiryHook_WiresCancelAllScheduledFlows(t *testing.T) {
 	entry.ExpireTime = time.Now().Add(-1 * time.Minute)
 	a.tokenStore.Store(token, entry)
 
-	key, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoTCP)
-	if err != nil {
-		t.Fatalf("MakeFlowKey: %v", err)
-	}
-	sched.Schedule(key, time.Now().Add(1*time.Hour))
+	a.scheduleFlushIfEnabled(entry, "1.2.3.4", "10.0.0.1", 80, FlowProtoTCP, time.Now().Add(1*time.Hour))
 	if got := sched.EntryCount(); got != 1 {
 		t.Fatalf("precondition: EntryCount = %d, want 1", got)
 	}
@@ -691,8 +950,10 @@ func TestUdpAC_InstallExpiryHook_WiresCancelAllScheduledFlows(t *testing.T) {
 // end-to-end SetOnExpire → cancelAllScheduledFlows → Scheduler.Cancel
 // chain. Without the hook, expired token entries would leave
 // scheduler bookkeeping that fires Flush on already-gone kernel state.
-// Two scheduled FlowKey variants (TCP + UDP) exercise the over-broad
-// fan-out cancel in one assertion.
+// Two scheduled FlowKey variants (TCP + UDP) on the same entry
+// exercise per-entry-set drain (#2201/#2205) in one assertion: both
+// keys are recorded on entry.scheduledKeys at Schedule time, and
+// cancelAllScheduledFlows must drain both.
 func TestTokenStore_CleanExpired_CancelsScheduledFlows(t *testing.T) {
 	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
 	sched.Start()
@@ -723,12 +984,11 @@ func TestTokenStore_CleanExpired_CancelsScheduledFlows(t *testing.T) {
 	entry.ExpireTime = time.Now().Add(-1 * time.Minute)
 	a.tokenStore.Store(token, entry)
 
-	// Schedule both TCP and UDP variants for this tuple — far-future
-	// deadlines so they stay in the wheel until Cancel fires.
-	tcpKey, _ := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoTCP)
-	udpKey, _ := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoUDP)
-	sched.Schedule(tcpKey, time.Now().Add(1*time.Hour))
-	sched.Schedule(udpKey, time.Now().Add(1*time.Hour))
+	// Schedule both TCP and UDP variants for this tuple through the
+	// production wrapper so each key is recorded on entry.scheduledKeys.
+	deadline := time.Now().Add(1 * time.Hour)
+	a.scheduleFlushIfEnabled(entry, "1.2.3.4", "10.0.0.1", 80, FlowProtoTCP, deadline)
+	a.scheduleFlushIfEnabled(entry, "1.2.3.4", "10.0.0.1", 80, FlowProtoUDP, deadline)
 	if got := sched.EntryCount(); got != 2 {
 		t.Fatalf("precondition: EntryCount = %d, want 2", got)
 	}
@@ -738,104 +998,83 @@ func TestTokenStore_CleanExpired_CancelsScheduledFlows(t *testing.T) {
 		t.Fatalf("CleanExpired removed %d, want 1", removed)
 	}
 	if got := sched.EntryCount(); got != 0 {
-		t.Errorf("EntryCount after CleanExpired = %d, want 0 (SetOnExpire hook did not cancel both variants)", got)
+		t.Errorf("EntryCount after CleanExpired = %d, want 0 (SetOnExpire hook did not drain both variants)", got)
 	}
 }
 
-// TestMakeFlowKey_ValidatesPortRange_FencesCancelAssumption pins the
-// MakeFlowKey contract cancelAllScheduledFlows depends on: validates
-// IPs AND port range. The cancel-path probe uses (port=0,
-// FlowProtoAny) precisely because port=0 always passes the
-// port-range check, leaving IPs as the only failure mode. Loosening
-// port validation (or tightening it onto port=0) would silently
-// break the probe's separation of IP-bad from port-bad.
+// TestMakeFlowKey_ValidatesIPAndPortRange pins the MakeFlowKey
+// contract scheduleFlushIfEnabled depends on: validates srcIP, dstIP,
+// AND port ∈ [0, 65535]. A regression that loosened any of these
+// would silently allow garbage FlowKeys into the scheduler index.
 //
 // Placement: generic MakeFlowKey unit tests live in
 // expiry_scheduler_test.go; this lives here because the invariant
-// is specific to the cancel-path wiring.
-func TestMakeFlowKey_ValidatesPortRange_FencesCancelAssumption(t *testing.T) {
-	// Port=0 with valid IPs must succeed — Cancel-path probe relies on it.
+// underpins the scheduleFlushIfEnabled wrapper at the AC seam.
+func TestMakeFlowKey_ValidatesIPAndPortRange(t *testing.T) {
+	// Port=0 with valid IPs must succeed — wildcard / Any shape.
 	if _, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 0, FlowProtoAny); err != nil {
-		t.Fatalf("MakeFlowKey(..., port=0, Any): want nil, got %v — Cancel probe would always fail", err)
+		t.Fatalf("MakeFlowKey(..., port=0, Any): want nil, got %v", err)
 	}
-	// Out-of-range port must fail (the assumption that lets the probe
-	// distinguish IP-bad from port-bad).
+	// Out-of-range port must fail.
 	if _, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 100_000, FlowProtoTCP); err == nil {
-		t.Errorf("MakeFlowKey(..., port=100000): want error, got nil — port range no longer validated; cancelAllScheduledFlows godoc is stale")
+		t.Errorf("MakeFlowKey(..., port=100000): want error, got nil — port range no longer validated")
 	}
 	if _, err := MakeFlowKey("1.2.3.4", "10.0.0.1", -1, FlowProtoTCP); err == nil {
-		t.Errorf("MakeFlowKey(..., port=-1): want error, got nil — port range no longer validated; cancelAllScheduledFlows godoc is stale")
+		t.Errorf("MakeFlowKey(..., port=-1): want error, got nil — port range no longer validated")
 	}
-	// Bad IP must fail regardless of port (the probe's failure mode).
+	// Bad IP must fail regardless of port.
 	if _, err := MakeFlowKey("not-an-ip", "10.0.0.1", 0, FlowProtoAny); err == nil {
 		t.Errorf("MakeFlowKey(badIP, port=0): want error, got nil — IP validation regressed")
 	}
 }
 
-// TestUdpAC_CancelAllScheduledFlows_PortOutOfRange_StillCancelsAnyICMP
-// fences the bug cr round 3 caught: an entry with dstAddr.Port out of
-// [0, 65535] still has its Any/ICMP-shaped scheduler entries
-// canceled (those were scheduled with port=0). Pre-fix, the TCP probe
-// would fail on the bad port and skip the whole fan-out, leaking the
-// legitimately-scheduled Any/ICMP entries.
+// TestLatestOtherFirewallDeadline_SelfOnly_ReturnsZero fences the
+// pointer-equality self-skip in latestOtherFirewallDeadline directly,
+// without routing through cancelAllScheduledFlows. A future regression
+// that broke `other == self` (e.g., swapped to ID-based equality, or
+// a pooled-pointer refactor that lets self appear multiple times in
+// the snapshot) would cause this test to return a non-zero deadline
+// for a snapshot containing only self — locking down the invariant.
 //
-// Practically theoretical (admission bounds the port today), but the
-// scheduler-side contract should not silently under-cancel based on
-// an upstream guarantee that future code might relax.
-func TestUdpAC_CancelAllScheduledFlows_PortOutOfRange_StillCancelsAnyICMP(t *testing.T) {
-	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
-	sched.Start()
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if err := sched.Shutdown(ctx); err != nil {
-			t.Errorf("scheduler shutdown: %v", err)
-		}
-	}()
-
-	a := &UdpAC{expirySched: sched}
-
-	// Pre-schedule the Any+ICMP shapes (port=0) — these would be the
-	// only entries created by HandleAccessControl if the admission
-	// path ever admitted a port=99999 NHP-AOP under the wildcard mode.
-	anyKey, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 0, FlowProtoAny)
+// Companion to TestUdpAC_CancelAllScheduledFlows_LoneEntryStillCancels
+// which exercises the same property via the cancel path.
+func TestLatestOtherFirewallDeadline_SelfOnly_ReturnsZero(t *testing.T) {
+	a := &UdpAC{}
+	entry := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-self"},
+		SrcAddrs:       []*common.NetAddress{{Ip: "1.2.3.4"}},
+		DstAddrs:       []*common.NetAddress{{Ip: "10.0.0.1", Port: 80}},
+		OpenTime:       60,
+		FirstKnockTime: time.Now(),
+	}
+	key, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoTCP)
 	if err != nil {
-		t.Fatalf("MakeFlowKey(any): %v", err)
+		t.Fatalf("MakeFlowKey: %v", err)
 	}
-	icmpKey, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 0, FlowProtoICMP)
-	if err != nil {
-		t.Fatalf("MakeFlowKey(icmp): %v", err)
-	}
-	sched.Schedule(anyKey, time.Now().Add(1*time.Hour))
-	sched.Schedule(icmpKey, time.Now().Add(1*time.Hour))
-	if got := sched.EntryCount(); got != 2 {
-		t.Fatalf("precondition: EntryCount = %d, want 2", got)
-	}
+	entry.recordScheduledKey(key)
 
-	// AccessEntry with an OUT-OF-RANGE port — the TCP/UDP probe would
-	// fail; pre-fix code would `continue` and leak the Any+ICMP entries.
-	a.cancelAllScheduledFlows(&AccessEntry{
-		SrcAddrs: []*common.NetAddress{{Ip: "1.2.3.4"}},
-		DstAddrs: []*common.NetAddress{{Ip: "10.0.0.1", Port: 99_999}},
-	})
-
-	if got := sched.EntryCount(); got != 0 {
-		t.Errorf("EntryCount after cancel = %d, want 0 — port-out-of-range skipped the Any/ICMP cancellations", got)
+	// Snapshot contains only self. The self-skip via pointer equality
+	// must filter it out and the function must return the zero time.
+	got := a.latestOtherFirewallDeadline([]*AccessEntry{entry}, entry, key, time.Now())
+	if !got.IsZero() {
+		t.Errorf("self-only snapshot returned non-zero deadline %v; want zero (self-skip broken)", got)
 	}
 }
 
-// TestUdpAC_CancelAllScheduledFlows_MalformedSrcIP_SkipsFanOut fences
-// the malformed-IP branch through cancelAllScheduledFlows: the probe
-// fails, the fan-out is skipped (no Cancel calls on garbage keys),
-// and the metric ticks once per malformed (src, dst) pair — same
-// 1-per-tuple semantic as the Schedule path's malformed handling.
+// TestScheduler_Cancel_OnNeverScheduledKey_IsNoOp fences the
+// no-op-on-non-existent-key contract that scheduleFlushIfEnabled's
+// "acceptable degradation" godoc relies on. The full chain is:
+// recordScheduledKey runs but Scheduler.Schedule never does (e.g.,
+// breaker open, shutdown, panic between record and Schedule) →
+// next cancelAllScheduledFlows walks the recorded key → calls
+// Scheduler.Cancel(K) for a key the scheduler has no entry for.
+// The contract: Cancel is idempotently a no-op, no panic, no
+// scheduler-state corruption, no spurious metric ticks.
 //
-// Without this fence, a future regression that silently swallowed
-// the probe failure would still pass all other tests (the live
-// AC has no out-of-range IPs today), but malformed-IP cases would
-// either crash on garbage FlowKeys or stop incrementing the
-// dashboard metric that exists to surface upstream regressions.
-func TestUdpAC_CancelAllScheduledFlows_MalformedSrcIP_SkipsFanOut(t *testing.T) {
+// Direct test on Scheduler.Cancel rather than indirect via
+// cancelAllScheduledFlows so a regression in the scheduler
+// (rather than in the wrapper) is caught at the right level.
+func TestScheduler_Cancel_OnNeverScheduledKey_IsNoOp(t *testing.T) {
 	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
 	sched.Start()
 	defer func() {
@@ -846,26 +1085,362 @@ func TestUdpAC_CancelAllScheduledFlows_MalformedSrcIP_SkipsFanOut(t *testing.T) 
 		}
 	}()
 
-	// Pre-schedule a legitimate entry with valid IPs — must NOT be
-	// canceled when cancelAllScheduledFlows is later called with a
-	// MALFORMED srcIP entry (different tuple, but defensive fence
-	// against a regression that accidentally garbage-Canceled).
-	goodKey, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoTCP)
+	never, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoTCP)
 	if err != nil {
-		t.Fatalf("MakeFlowKey(good): %v", err)
+		t.Fatalf("MakeFlowKey: %v", err)
 	}
-	sched.Schedule(goodKey, time.Now().Add(1*time.Hour))
+	if got := sched.EntryCount(); got != 0 {
+		t.Fatalf("precondition: EntryCount = %d, want 0", got)
+	}
+
+	// Cancel a key that was never Scheduled — must not panic.
+	sched.Cancel(never)
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("EntryCount after Cancel of never-Scheduled key = %d, want 0 (Scheduler.Cancel mutated state on non-existent key)", got)
+	}
+
+	// Schedule + Cancel + Cancel-again — second Cancel must also be a no-op.
+	sched.Schedule(never, time.Now().Add(1*time.Hour))
+	if got := sched.EntryCount(); got != 1 {
+		t.Fatalf("after Schedule: EntryCount = %d, want 1", got)
+	}
+	sched.Cancel(never)
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("after first Cancel: EntryCount = %d, want 0", got)
+	}
+	sched.Cancel(never) // double-Cancel is a no-op
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("after second Cancel (double-Cancel): EntryCount = %d, want 0", got)
+	}
+}
+
+// TestUdpAC_CancelAllScheduledFlows_RescheduledMetricTicks fences the
+// new MetricL3FlushCancelRescheduledForPeer counter — the
+// positive-signal counter that the #2201 multi-session reschedule path
+// is actually firing. Without this assertion, a regression that
+// silently broke holdsScheduledKey (returning false where it should
+// return true) would pass every other test (scheduler EntryCount
+// would stay correct because Cancel-then-no-reschedule-then-Schedule
+// happens to converge) but the dashboard counter would stop ticking
+// unobserved.
+func TestUdpAC_CancelAllScheduledFlows_RescheduledMetricTicks(t *testing.T) {
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+
+	a := &UdpAC{
+		tokenStore:  common.NewTokenStore[*AccessEntry](),
+		expirySched: sched,
+		registration: &ACRegistration{
+			metrics: metrics.NewPublisherForTest(t),
+		},
+	}
+
+	now := time.Now()
+	const srcIP, dstIP, dstPort = "1.2.3.4", "10.0.0.1", 80
+	t1 := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-t1"},
+		SrcAddrs:       []*common.NetAddress{{Ip: srcIP}},
+		DstAddrs:       []*common.NetAddress{{Ip: dstIP, Port: dstPort}},
+		OpenTime:       1,
+		FirstKnockTime: now.Add(-5 * time.Second),
+	}
+	t2 := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-t2"},
+		SrcAddrs:       []*common.NetAddress{{Ip: srcIP}},
+		DstAddrs:       []*common.NetAddress{{Ip: dstIP, Port: dstPort}},
+		OpenTime:       60,
+		FirstKnockTime: now,
+	}
+	a.tokenStore.Store("tok-t1", t1)
+	a.tokenStore.Store("tok-t2", t2)
+	a.scheduleFlushIfEnabled(t1, srcIP, dstIP, dstPort, FlowProtoTCP, now.Add(2*time.Second))
+	a.scheduleFlushIfEnabled(t2, srcIP, dstIP, dstPort, FlowProtoTCP, now.Add(60*time.Second))
+
+	// Baseline: metric is zero before T1's cancel.
+	counters, _ := a.registration.metrics.CountersForTest(t)
+	if got := counters[MetricL3FlushCancelRescheduledForPeer]; got != 0 {
+		t.Fatalf("precondition: counter = %v, want 0", got)
+	}
+
+	a.cancelAllScheduledFlows(t1) // T2 holds K → reschedule, must tick
+
+	counters, _ = a.registration.metrics.CountersForTest(t)
+	if got := counters[MetricL3FlushCancelRescheduledForPeer]; got != 1 {
+		t.Errorf("MetricL3FlushCancelRescheduledForPeer = %v, want 1 (reschedule path didn't tick)", got)
+	}
+
+	// LoneEntry case: t2 has no peer, must NOT tick.
+	a.tokenStore.Delete("tok-t2")
+	a.cancelAllScheduledFlows(t2)
+	counters, _ = a.registration.metrics.CountersForTest(t)
+	if got := counters[MetricL3FlushCancelRescheduledForPeer]; got != 1 {
+		t.Errorf("MetricL3FlushCancelRescheduledForPeer = %v after lone-entry cancel, want 1 (no extra tick)", got)
+	}
+}
+
+// TestHandleAccessControl_NilEntry_TicksMetric fences the
+// MetricL3FlushAdmissionNilEntry counter mirroring the
+// MetricL3FlushScheduleNilEntry pattern. Programmer-error signal:
+// if a future caller drops the entry pointer, this surfaces loudly
+// rather than silently nil-derefing.
+func TestHandleAccessControl_NilEntry_TicksMetric(t *testing.T) {
+	a := &UdpAC{
+		registration: &ACRegistration{
+			metrics: metrics.NewPublisherForTest(t),
+		},
+	}
+	artMsg, err := a.HandleAccessControl(nil, 60, nil)
+	if err == nil {
+		t.Fatal("expected error from nil-entry guard")
+	}
+	if artMsg == nil || artMsg.ErrCode != common.ErrACNilEntry.ErrorCode() {
+		t.Errorf("artMsg.ErrCode = %v, want ErrACNilEntry", artMsg)
+	}
+	counters, _ := a.registration.metrics.CountersForTest(t)
+	if got := counters[MetricL3FlushAdmissionNilEntry]; got != 1 {
+		t.Errorf("MetricL3FlushAdmissionNilEntry = %v, want 1", got)
+	}
+}
+
+// TestUdpAC_CancelAllScheduledFlows_NilTokenStore_TicksMetric fences
+// the MetricL3FlushCancelNilTokenStore Critical-log + counter path.
+// Programmer-error signal: a future DI refactor that drops
+// a.tokenStore would silently lose the multi-session protection
+// (degraded to lone-entry behavior); this metric is the only
+// observable signal of that regression.
+func TestUdpAC_CancelAllScheduledFlows_NilTokenStore_TicksMetric(t *testing.T) {
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+
+	a := &UdpAC{
+		expirySched: sched, // tokenStore intentionally nil
+		registration: &ACRegistration{
+			metrics: metrics.NewPublisherForTest(t),
+		},
+	}
+	entry := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-nil-store"},
+		SrcAddrs:       []*common.NetAddress{{Ip: "1.2.3.4"}},
+		DstAddrs:       []*common.NetAddress{{Ip: "10.0.0.1", Port: 80}},
+		OpenTime:       60,
+		FirstKnockTime: time.Now(),
+	}
+	a.scheduleFlushIfEnabled(entry, "1.2.3.4", "10.0.0.1", 80, FlowProtoTCP, time.Now().Add(1*time.Hour))
+
+	a.cancelAllScheduledFlows(entry)
+
+	counters, _ := a.registration.metrics.CountersForTest(t)
+	if got := counters[MetricL3FlushCancelNilTokenStore]; got != 1 {
+		t.Errorf("MetricL3FlushCancelNilTokenStore = %v, want 1 (degraded-to-lone-entry path didn't tick)", got)
+	}
+}
+
+// TestScheduleFlushIfEnabled_NilEntry_TicksMetric fences the
+// MetricL3FlushScheduleNilEntry counter (already wired; this is the
+// missing test coverage cr round 18 flagged).
+func TestScheduleFlushIfEnabled_NilEntry_TicksMetric(t *testing.T) {
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+
+	a := &UdpAC{
+		expirySched: sched,
+		registration: &ACRegistration{
+			metrics: metrics.NewPublisherForTest(t),
+		},
+	}
+	a.scheduleFlushIfEnabled(nil, "1.2.3.4", "10.0.0.1", 80, FlowProtoTCP, time.Now().Add(1*time.Hour))
+
+	counters, _ := a.registration.metrics.CountersForTest(t)
+	if got := counters[MetricL3FlushScheduleNilEntry]; got != 1 {
+		t.Errorf("MetricL3FlushScheduleNilEntry = %v, want 1 (nil-entry guard didn't tick)", got)
+	}
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("EntryCount = %v, want 0 (phantom scheduler entry created)", got)
+	}
+}
+
+// TestLatestOtherFirewallDeadline_DifferentPointersSameFields_BothCount
+// fences the pointer-equality self-skip's invariant that "self" is
+// distinguished by POINTER identity, not by address-field equality. If
+// a future refactor pools or reuses AccessEntry pointers (e.g.,
+// connection-pool style optimization), two entries with identical
+// fields but different pointers must EACH count the other as a peer
+// holder — they're not the same logical session.
+//
+// Companion to TestLatestOtherFirewallDeadline_SelfOnly_ReturnsZero
+// which fences the opposite direction (self IS skipped).
+func TestLatestOtherFirewallDeadline_DifferentPointersSameFields_BothCount(t *testing.T) {
+	a := &UdpAC{}
+	key, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoTCP)
+	if err != nil {
+		t.Fatalf("MakeFlowKey: %v", err)
+	}
+
+	now := time.Now()
+	// Two distinct entries with identical address-field shapes.
+	// Self-skip must NOT collapse them via field equality — only
+	// pointer identity skips.
+	e1 := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-shared"},
+		SrcAddrs:       []*common.NetAddress{{Ip: "1.2.3.4"}},
+		DstAddrs:       []*common.NetAddress{{Ip: "10.0.0.1", Port: 80}},
+		OpenTime:       60,
+		FirstKnockTime: now,
+	}
+	e2 := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-shared"},
+		SrcAddrs:       []*common.NetAddress{{Ip: "1.2.3.4"}},
+		DstAddrs:       []*common.NetAddress{{Ip: "10.0.0.1", Port: 80}},
+		OpenTime:       60,
+		FirstKnockTime: now,
+	}
+	e1.recordScheduledKey(key)
+	e2.recordScheduledKey(key)
+
+	// From e1's perspective, e2 must register as a peer holder.
+	got := a.latestOtherFirewallDeadline([]*AccessEntry{e1, e2}, e1, key, now)
+	if got.IsZero() {
+		t.Errorf("with two distinct entries holding K, latestOtherFirewallDeadline from e1's view = zero; want e2's deadline (pointer-equality self-skip collapsed by field equality?)")
+	}
+
+	// Symmetric: from e2's perspective, e1 must register as a peer.
+	got = a.latestOtherFirewallDeadline([]*AccessEntry{e1, e2}, e2, key, now)
+	if got.IsZero() {
+		t.Errorf("with two distinct entries holding K, latestOtherFirewallDeadline from e2's view = zero; want e1's deadline (pointer-equality self-skip collapsed by field equality?)")
+	}
+}
+
+// TestLatestOtherFirewallDeadline_NowCapturedOnceDuringWalk fences the
+// snapshot-now semantic in cancelAllScheduledFlows: `now` is captured
+// once before the per-key loop and reused, so a peer entry whose
+// firewall closes DURING the walk (between snapshot and the per-key
+// consult) is still treated as live for the captured `now`. The
+// rationale (udpac.go) is "late Flush is ENOENT-idempotent on the
+// flusher side" — we accept a sub-second reschedule overshoot in
+// exchange for sequential consistency across the K-loop.
+//
+// Concrete fence: construct a peer whose firewallDeadline = capturedNow
+// + 1ns. From the perspective of capturedNow, the peer is live
+// (1ns in the future), and latestOtherFirewallDeadline returns the
+// peer's deadline. By the time the assertion runs (well after
+// capturedNow), the peer's actual firewall has closed in wall time —
+// but the function still returns the deadline because it consults
+// the captured `now`, not time.Now(). Regression where the loop
+// re-captures now per-key would return zero here, failing the test.
+//
+// Companion to cr round 23 observation #2.
+func TestLatestOtherFirewallDeadline_NowCapturedOnceDuringWalk(t *testing.T) {
+	a := &UdpAC{}
+	key, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoTCP)
+	if err != nil {
+		t.Fatalf("MakeFlowKey: %v", err)
+	}
+
+	// capturedNow precedes the peer's firewall close by exactly 1ns.
+	// Real wall time during the test will be well past peer's close.
+	capturedNow := time.Now().Add(-1 * time.Hour) // anchor capturedNow in the past
+	peer := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-edge-firewall"},
+		SrcAddrs:       []*common.NetAddress{{Ip: "1.2.3.4"}},
+		DstAddrs:       []*common.NetAddress{{Ip: "10.0.0.1", Port: 80}},
+		OpenTime:       0, // firewallDeadline = FirstKnockTime + 0s
+		FirstKnockTime: capturedNow.Add(1 * time.Nanosecond),
+	}
+	peer.recordScheduledKey(key)
+
+	self := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-self"},
+		SrcAddrs:       []*common.NetAddress{{Ip: "1.2.3.4"}},
+		DstAddrs:       []*common.NetAddress{{Ip: "10.0.0.1", Port: 80}},
+		OpenTime:       60,
+		FirstKnockTime: capturedNow,
+	}
+
+	// From self's perspective with the captured `now`, peer's firewall
+	// is 1ns in the future — must register as a live holder.
+	got := a.latestOtherFirewallDeadline([]*AccessEntry{self, peer}, self, key, capturedNow)
+	if got.IsZero() {
+		t.Errorf("peer with firewallDeadline = capturedNow+1ns treated as past; want returned-as-live (regression: now re-captured per-key)")
+	}
+
+	// Sanity: with a captured `now` AFTER peer's firewallDeadline, peer
+	// is correctly past and returns zero.
+	got = a.latestOtherFirewallDeadline([]*AccessEntry{self, peer}, self, key, capturedNow.Add(1*time.Second))
+	if !got.IsZero() {
+		t.Errorf("peer past firewall returned %v; want zero (liveness check broken)", got)
+	}
+}
+
+// TestUdpAC_CancelAllScheduledFlows_DoesNotCancelUntrackedKeys fences
+// the per-entry tracking contract (#2201/#2205): cancelAllScheduledFlows
+// drains exactly entry.scheduledKeys and touches no other scheduler
+// entries. A regression that accidentally re-introduced a fan-out from
+// SrcAddrs × DstAddrs would Cancel keys this entry never scheduled
+// (the multi-session race #2201 was about). Pre-fix code with the
+// probe-based fan-out canceled any FlowKey shape derivable from the
+// entry's address fields; post-fix code can only touch keys the
+// entry's own Schedule calls recorded.
+func TestUdpAC_CancelAllScheduledFlows_DoesNotCancelUntrackedKeys(t *testing.T) {
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
 
 	a := &UdpAC{expirySched: sched}
+
+	// Pre-schedule a "foreign" key that no AccessEntry tracks. Under
+	// the old fan-out implementation, calling cancelAllScheduledFlows
+	// with an entry covering the same (src, dst, port=80) would have
+	// canceled this via the TCP fan-out. Post-tracking, the foreign
+	// key has no owning entry and must survive.
+	//
+	// Direct sched.Schedule (bypassing scheduleFlushIfEnabled) is
+	// INTENTIONAL — this test is specifically modeling a foreign
+	// key that no AccessEntry tracks. A future "fix" that routes
+	// this call through scheduleFlushIfEnabled would defeat the
+	// test by recording the key on some entry, removing the
+	// untracked condition the assertion needs.
+	foreignKey, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoTCP)
+	if err != nil {
+		t.Fatalf("MakeFlowKey: %v", err)
+	}
+	sched.Schedule(foreignKey, time.Now().Add(1*time.Hour))
+
+	// Build an entry covering the same address space and call Cancel
+	// — its empty scheduledKeys means nothing should be canceled.
 	a.cancelAllScheduledFlows(&AccessEntry{
-		SrcAddrs: []*common.NetAddress{{Ip: "not-an-ip"}},
+		SrcAddrs: []*common.NetAddress{{Ip: "1.2.3.4"}},
 		DstAddrs: []*common.NetAddress{{Ip: "10.0.0.1", Port: 80}},
 	})
 
-	// The legitimate entry must survive — malformed-IP probe should
-	// fail and the fan-out should skip; no garbage Cancel calls.
 	if got := sched.EntryCount(); got != 1 {
-		t.Errorf("EntryCount after malformed-IP cancel attempt = %d, want 1 (probe failure must skip fan-out)", got)
+		t.Errorf("EntryCount = %d, want 1 — Cancel touched a key the entry never scheduled (fan-out leaked back in?)", got)
 	}
 }
 
@@ -910,5 +1485,615 @@ func TestUdpAC_CancelAllScheduledFlows_NilSafe(t *testing.T) {
 
 	if got := sched.EntryCount(); got != 1 {
 		t.Errorf("EntryCount after nil-entry call = %d, want 1 (nil-entry guard touched unrelated state)", got)
+	}
+}
+
+// TestAccessEntry_RecordScheduledKey_IdempotentOnReSchedule fences the
+// set-dedup contract on /refresh extension: re-Schedule of the same
+// FlowKey (longest-wins semantics handle the deadline side) records
+// once on the tracking side, so drainScheduledKeys returns one key
+// and cancelAllScheduledFlows issues exactly one Cancel.
+func TestAccessEntry_RecordScheduledKey_IdempotentOnReSchedule(t *testing.T) {
+	entry := &AccessEntry{}
+	key, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoTCP)
+	if err != nil {
+		t.Fatalf("MakeFlowKey: %v", err)
+	}
+	entry.recordScheduledKey(key)
+	entry.recordScheduledKey(key) // /refresh re-Schedule
+	entry.recordScheduledKey(key) // second /refresh re-Schedule
+
+	keys := entry.drainScheduledKeys()
+	if len(keys) != 1 {
+		t.Errorf("drained %d keys after 3 records of same key, want 1 (set-dedup regression)", len(keys))
+	}
+	if got := entry.drainScheduledKeys(); got != nil {
+		t.Errorf("second drain returned %v, want nil (drain did not reset the set)", got)
+	}
+}
+
+// TestAccessEntry_DrainScheduledKeys_NilSafe fences the empty-entry
+// drain: a fresh AccessEntry that was never scheduled must drain
+// nil without allocating the underlying map. Closes a regression
+// path where cancelAllScheduledFlows is called on an entry that
+// went through HandleAccessControl's early-return gates (breaker
+// open, malformed openTime) and never reached a Schedule call.
+func TestAccessEntry_DrainScheduledKeys_NilSafe(t *testing.T) {
+	entry := &AccessEntry{}
+	if got := entry.drainScheduledKeys(); got != nil {
+		t.Errorf("fresh entry drained %v, want nil", got)
+	}
+}
+
+// TestUdpAC_CancelAllScheduledFlows_MultiSessionRaceKeepsKeyAlive
+// fences #2201's actual acceptance criterion: two live AccessEntries
+// share a FlowKey, T1 expires, T2's scheduler coverage MUST survive.
+//
+// Pre-fix code (probe-based fan-out) canceled the shared FlowKey on
+// T1's expire, orphaning T2. The fix is the tokenStore consult in
+// cancelAllScheduledFlows: when T1 drains key K, scan tokenStore for
+// any other entry that holds K with a still-future firewall deadline
+// (T2 does), and re-Schedule rather than Cancel so longest-wins
+// absorb keeps the scheduler entry at T2's deadline.
+//
+// The assertions check both the scheduler keeps the entry alive
+// AND its deadline reflects T2's window (via T2's subsequent
+// Cancel actually removing the entry).
+func TestUdpAC_CancelAllScheduledFlows_MultiSessionRaceKeepsKeyAlive(t *testing.T) {
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+
+	a := &UdpAC{
+		tokenStore:  common.NewTokenStore[*AccessEntry](),
+		expirySched: sched,
+	}
+
+	now := time.Now()
+	const srcIP, dstIP, dstPort = "1.2.3.4", "10.0.0.1", 80
+
+	// T1 admitted earlier with a shorter OpenTime; the live firewall
+	// has already closed naturally for T1 (deadline in past), which
+	// triggers OnExpire's cancelAllScheduledFlows(t1). T2 admitted
+	// later with a long OpenTime — still live, scheduler must keep
+	// its FlowKey coverage.
+	t1 := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-t1"},
+		SrcAddrs:       []*common.NetAddress{{Ip: srcIP}},
+		DstAddrs:       []*common.NetAddress{{Ip: dstIP, Port: dstPort}},
+		OpenTime:       1,
+		FirstKnockTime: now.Add(-5 * time.Second), // T1's firewall closed 4s ago
+	}
+	t2 := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-t2"},
+		SrcAddrs:       []*common.NetAddress{{Ip: srcIP}},
+		DstAddrs:       []*common.NetAddress{{Ip: dstIP, Port: dstPort}},
+		OpenTime:       60, // T2's firewall still open for ~60s
+		FirstKnockTime: now,
+	}
+	// Store both in tokenStore so the snapshot in cancelAllScheduledFlows
+	// sees T2 as a candidate for the multi-session check.
+	a.tokenStore.Store("tok-t1", t1)
+	a.tokenStore.Store("tok-t2", t2)
+
+	// Both scheduled the same FlowKey; longest-wins absorb keeps the
+	// scheduler at T2's deadline.
+	a.scheduleFlushIfEnabled(t1, srcIP, dstIP, dstPort, FlowProtoTCP, now.Add(1*time.Second))
+	a.scheduleFlushIfEnabled(t2, srcIP, dstIP, dstPort, FlowProtoTCP, now.Add(60*time.Second))
+	if got := sched.EntryCount(); got != 1 {
+		t.Fatalf("precondition: EntryCount = %d, want 1 (longest-wins should absorb to one entry)", got)
+	}
+
+	// T1 expires — must NOT remove the scheduler entry because T2
+	// still needs it. Pre-#2201 fix this dropped EntryCount to 0.
+	a.cancelAllScheduledFlows(t1)
+	if got := sched.EntryCount(); got != 1 {
+		t.Errorf("EntryCount after T1 Cancel = %d, want 1 — T2's scheduler coverage orphaned (#2201 regression)", got)
+	}
+
+	// T2 expires — now no other entry holds the key, the scheduler
+	// entry must be removed.
+	a.tokenStore.Delete("tok-t2") // simulate T2's tokenStore removal
+	a.cancelAllScheduledFlows(t2)
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("EntryCount after T2 Cancel (no other holders) = %d, want 0", got)
+	}
+}
+
+// TestUdpAC_CancelAllScheduledFlows_LoneEntryStillCancels fences the
+// inverse of the multi-session case: when only one AccessEntry holds
+// a key, that entry's Cancel must actually cancel — the #2201
+// tokenStore consult should not accidentally treat the entry's own
+// key as a "held by other" signal (the latestOtherFirewallDeadline
+// helper skips self).
+func TestUdpAC_CancelAllScheduledFlows_LoneEntryStillCancels(t *testing.T) {
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+
+	a := &UdpAC{
+		tokenStore:  common.NewTokenStore[*AccessEntry](),
+		expirySched: sched,
+	}
+
+	entry := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-lone"},
+		SrcAddrs:       []*common.NetAddress{{Ip: "1.2.3.4"}},
+		DstAddrs:       []*common.NetAddress{{Ip: "10.0.0.1", Port: 80}},
+		OpenTime:       60,
+		FirstKnockTime: time.Now(),
+	}
+	a.tokenStore.Store("tok-lone", entry)
+	a.scheduleFlushIfEnabled(entry, "1.2.3.4", "10.0.0.1", 80, FlowProtoTCP, time.Now().Add(1*time.Hour))
+
+	a.cancelAllScheduledFlows(entry)
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("EntryCount after lone-entry Cancel = %d, want 0 (self-skip in tokenStore consult broken)", got)
+	}
+}
+
+// TestUdpAC_CancelAllScheduledFlows_OtherEntryPastFirewall fences the
+// liveness check in latestOtherFirewallDeadline: when the only other
+// entry holding the key has a firewall deadline already in the past
+// (kernel state self-expired), we still Cancel rather than re-Schedule.
+// Otherwise an entry in the late-packet buffer window would keep
+// scheduler bookkeeping alive past the natural kernel expiry.
+func TestUdpAC_CancelAllScheduledFlows_OtherEntryPastFirewall(t *testing.T) {
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+
+	a := &UdpAC{
+		tokenStore:  common.NewTokenStore[*AccessEntry](),
+		expirySched: sched,
+	}
+
+	now := time.Now()
+	const srcIP, dstIP, dstPort = "1.2.3.4", "10.0.0.1", 80
+
+	// Both entries' firewalls closed naturally; T2 is still in the
+	// late-packet buffer window so it's in tokenStore.
+	t1 := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-t1"},
+		SrcAddrs:       []*common.NetAddress{{Ip: srcIP}},
+		DstAddrs:       []*common.NetAddress{{Ip: dstIP, Port: dstPort}},
+		OpenTime:       1,
+		FirstKnockTime: now.Add(-10 * time.Second),
+	}
+	t2 := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-t2"},
+		SrcAddrs:       []*common.NetAddress{{Ip: srcIP}},
+		DstAddrs:       []*common.NetAddress{{Ip: dstIP, Port: dstPort}},
+		OpenTime:       1,
+		FirstKnockTime: now.Add(-3 * time.Second), // also past
+	}
+	a.tokenStore.Store("tok-t1", t1)
+	a.tokenStore.Store("tok-t2", t2)
+
+	a.scheduleFlushIfEnabled(t1, srcIP, dstIP, dstPort, FlowProtoTCP, now.Add(1*time.Hour))
+	a.scheduleFlushIfEnabled(t2, srcIP, dstIP, dstPort, FlowProtoTCP, now.Add(1*time.Hour))
+
+	a.cancelAllScheduledFlows(t1)
+	// T2 is still in the snapshot AND holds the key, but its firewall
+	// is past — must Cancel rather than re-Schedule (no live cover).
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("EntryCount after Cancel with only-past-firewall other holders = %d, want 0 — liveness check missed", got)
+	}
+}
+
+// TestUdpAC_ScheduleFlushOrphan_SurvivesTempEntryExpiry fences the
+// temp-handler lifetime-mismatch fix: temp-handler-written kernel
+// rules are scheduled via scheduleFlushOrphan (no per-entry
+// tracking), so a subsequent cancelAllScheduledFlows(tempEntry) at
+// tempEntry's ~35s tokenStore expiry MUST NOT cancel the scheduled
+// flush. The scheduler entry has to survive past tempEntry's
+// expiry and fire Flush at the kernel rule's actual deadline
+// (often hours later, anchored on the long outer openTimeSec).
+//
+// Recording on tempEntry (the abandoned #2205 design) would Cancel
+// the scheduled flush at tempEntry expiry — kernel rule live, no
+// queued flush, ESTABLISHED-bypass under L3-only enforcement. Fixed
+// by routing temp handlers through scheduleFlushOrphan instead;
+// proper revocation-aware fix tracked in #2213.
+func TestUdpAC_ScheduleFlushOrphan_SurvivesTempEntryExpiry(t *testing.T) {
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+
+	a := &UdpAC{
+		tokenStore:  common.NewTokenStore[*AccessEntry](),
+		expirySched: sched,
+	}
+
+	// tempEntry as constructed at msghandler.go's HandleAccessControl
+	// PASS_PRE_ACCESS_IP branch — SrcAddrs holds the AOL-declared
+	// agent IP; OpenTime is the short TempPortOpenTime (~30s) for the
+	// auth-gate token, NOT the long openTimeSec written to the kernel.
+	const aolIP, natIP, dstIP, dstPort = "10.99.0.5", "203.0.113.42", "10.0.0.1", 443
+	tempEntry := &AccessEntry{
+		User:     &common.AgentUser{UserId: "u-temp-nat"},
+		SrcAddrs: []*common.NetAddress{{Ip: aolIP}},
+		DstAddrs: []*common.NetAddress{{Ip: dstIP, Port: dstPort}},
+		OpenTime: 30,
+	}
+	// Temp handler Schedules using the kernel-observed remoteAddr.IP
+	// (= natIP under NAT) and the LONG openTimeSec deadline — exactly
+	// the path tcpTempAccessHandler / udpTempAccessHandler take.
+	a.scheduleFlushOrphan(natIP, dstIP, dstPort, FlowProtoTCP, time.Now().Add(1*time.Hour))
+	if got := sched.EntryCount(); got != 1 {
+		t.Fatalf("precondition: EntryCount = %d, want 1", got)
+	}
+
+	// Simulate OnExpire(tempEntry) firing at tempEntry's tokenStore
+	// expiry. Scheduler entry MUST survive — no per-entry tracking
+	// means no FlowKey for Cancel to walk to.
+	a.cancelAllScheduledFlows(tempEntry)
+	if got := sched.EntryCount(); got != 1 {
+		t.Errorf("EntryCount after cancelAllScheduledFlows(tempEntry) = %d, want 1 — orphan scheduler entry must survive tempEntry expiry (#2213 ESTABLISHED-bypass regression if canceled)", got)
+	}
+}
+
+// TestAccessEntry_ScheduledKeys_NoRaceDetectorTrip fences the
+// AccessEntry.mu discipline: many goroutines concurrently calling
+// recordScheduledKey, holdsScheduledKey, and drainScheduledKeys on
+// the same entry must not trip the race detector. This is the
+// entry.mu correctness fence, decoupled from the scheduler-side
+// races (which never occur on the SAME entry pointer in production
+// — HandleAccessControl admits one entry in one goroutine; that
+// entry's OnExpire fires only after CleanExpired removed it from
+// tokenStore, so no concurrent Schedule for that entry can fire).
+//
+// Cross-entry races on shared FlowKeys are fenced separately by
+// TestUdpAC_CancelAllScheduledFlows_MultiSessionRaceKeepsKeyAlive,
+// which exercises the sequential Snapshot+holdsScheduledKey
+// reschedule logic.
+func TestAccessEntry_ScheduledKeys_NoRaceDetectorTrip(t *testing.T) {
+	entry := &AccessEntry{}
+	const goroutines, iterations = 8, 200
+
+	keys := make([]FlowKey, iterations)
+	for i := range keys {
+		k, err := MakeFlowKey("1.2.3.4", fmt.Sprintf("10.0.%d.1", i%256), 80, FlowProtoTCP)
+		if err != nil {
+			t.Fatalf("MakeFlowKey[%d]: %v", i, err)
+		}
+		keys[i] = k
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines * 3)
+	for g := 0; g < goroutines; g++ {
+		// Recorders.
+		go func() {
+			defer wg.Done()
+			for _, k := range keys {
+				entry.recordScheduledKey(k)
+			}
+		}()
+		// Drainers.
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				_ = entry.drainScheduledKeys()
+			}
+		}()
+		// Readers.
+		go func() {
+			defer wg.Done()
+			for _, k := range keys {
+				_ = entry.holdsScheduledKey(k)
+			}
+		}()
+	}
+	wg.Wait()
+	// No assertion on final state — concurrent record/drain interleavings
+	// can leave any subset of keys. The race detector is the contract.
+}
+
+// TestUdpAC_CancelAllScheduledFlows_RecordBeforeScheduleClosesAdmissionRace fences the
+// cross-entry race the record-then-Schedule order in
+// scheduleFlushIfEnabled exists to close.
+//
+// Scenario: T2 is in the middle of HandleUdpACOperations admission.
+// Pre-mint stored T2 in tokenStore. T2's HandleAccessControl is
+// running per-tuple Schedule calls. After T2 records key K on its
+// scheduledKeys (recordScheduledKey runs FIRST in
+// scheduleFlushIfEnabled), but BEFORE T2's Scheduler.Schedule call
+// completes — the scheduler doesn't yet hold K from T2.
+//
+// In this exact window, T1's OnExpire fires
+// cancelAllScheduledFlows(t1). T1 holds K too (older session, longest-
+// wins absorbed). T1 drains {K}. Snapshot sees t2 (pre-stored).
+// holdsScheduledKey(t2, K) returns TRUE (record happened first).
+// latestOtherFirewallDeadline returns t2's deadline → re-Schedule K
+// rather than Cancel.
+//
+// If the order were Schedule-then-record (the reverse), T2's record
+// hasn't happened yet, holdsScheduledKey returns FALSE, T1 Cancels K,
+// and T2's coverage is orphaned. This test simulates the partial-
+// completion state (record done, Schedule not yet) by manually
+// calling recordScheduledKey on T2 before T1's cancel — verifying
+// the multi-session reschedule path absorbs the race.
+//
+// Combined with the inline implementation of record-before-Schedule
+// in scheduleFlushIfEnabled (and the pre-store-before-Schedule in
+// HandleUdpACOperations), this fences the actual #2201 acceptance
+// criterion: T2's L3 coverage survives T1's expiry.
+func TestUdpAC_CancelAllScheduledFlows_RecordBeforeScheduleClosesAdmissionRace(t *testing.T) {
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(100))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+
+	a := &UdpAC{
+		tokenStore:  common.NewTokenStore[*AccessEntry](),
+		expirySched: sched,
+	}
+
+	now := time.Now()
+	const srcIP, dstIP, dstPort = "1.2.3.4", "10.0.0.1", 80
+	key, err := MakeFlowKey(srcIP, dstIP, dstPort, FlowProtoTCP)
+	if err != nil {
+		t.Fatalf("MakeFlowKey: %v", err)
+	}
+
+	// T1 is in steady state: in tokenStore, fully scheduled (record +
+	// Scheduler.Schedule both done).
+	t1 := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-t1"},
+		SrcAddrs:       []*common.NetAddress{{Ip: srcIP}},
+		DstAddrs:       []*common.NetAddress{{Ip: dstIP, Port: dstPort}},
+		OpenTime:       1,
+		FirstKnockTime: now.Add(-5 * time.Second),
+	}
+	a.tokenStore.Store("tok-t1", t1)
+	a.scheduleFlushIfEnabled(t1, srcIP, dstIP, dstPort, FlowProtoTCP, now.Add(2*time.Second))
+
+	// T2 is in the admission window: pre-stored in tokenStore (closes
+	// the wider admission-window race fixed in HandleUdpACOperations),
+	// has called recordScheduledKey on its entry, but has NOT YET
+	// completed Scheduler.Schedule. This is the partial-completion
+	// state achievable ONLY under record-then-Schedule order.
+	t2 := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-t2"},
+		SrcAddrs:       []*common.NetAddress{{Ip: srcIP}},
+		DstAddrs:       []*common.NetAddress{{Ip: dstIP, Port: dstPort}},
+		OpenTime:       60,
+		FirstKnockTime: now,
+	}
+	a.tokenStore.Store("tok-t2", t2)
+	t2.recordScheduledKey(key) // record-step of t2's scheduleFlushIfEnabled
+
+	if got := sched.EntryCount(); got != 1 {
+		t.Fatalf("precondition: EntryCount = %d, want 1 (only T1's Schedule has completed)", got)
+	}
+
+	// T1's OnExpire fires NOW (the race window). cancelAllScheduledFlows
+	// must detect t2 holds K and re-Schedule rather than Cancel.
+	a.cancelAllScheduledFlows(t1)
+
+	if got := sched.EntryCount(); got != 1 {
+		t.Errorf("EntryCount after T1 Cancel in admission window = %d, want 1 — T2's coverage orphaned (record-then-Schedule order broken or multi-session reschedule missing)", got)
+	}
+
+	// T2 now completes Scheduler.Schedule (no-op via longest-wins
+	// absorb since the rescheduled deadline is at or beyond T2's).
+	a.expirySched.Schedule(key, now.Add(60*time.Second).Add(flushSafetyMargin))
+	if got := sched.EntryCount(); got != 1 {
+		t.Errorf("EntryCount after T2 Schedule completes = %d, want 1", got)
+	}
+}
+
+// TestScheduleFlushIfEnabled_RecordWithoutSchedule_NextCancelNoOps
+// fences the documented degradation in scheduleFlushIfEnabled's
+// godoc: when the key is recorded on entry.scheduledKeys but
+// Scheduler.Schedule never created a scheduler entry (because of
+// breaker open, scheduler Shutdown, or a future failure mode), the
+// next cancelAllScheduledFlows walks K and Scheduler.Cancel is
+// idempotently a no-op (does not panic, does not corrupt scheduler
+// state, no metric ticks).
+//
+// The "record-only" state is simulated by calling recordScheduledKey
+// directly without going through scheduleFlushIfEnabled — a direct
+// proxy for "Schedule failed after record." We don't actually open
+// the breaker (which would require firing flusher errors and racing
+// the timer wheel); the simulation captures the same end state more
+// reliably.
+func TestScheduleFlushIfEnabled_RecordWithoutSchedule_NextCancelNoOps(t *testing.T) {
+	sched := NewScheduler(&NoOpFlusher{},
+		WithTickInterval(5*time.Millisecond),
+		WithWheelSize(100),
+	)
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+
+	a := &UdpAC{
+		tokenStore:  common.NewTokenStore[*AccessEntry](),
+		expirySched: sched,
+	}
+
+	entry := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-breaker"},
+		SrcAddrs:       []*common.NetAddress{{Ip: "1.2.3.4"}},
+		DstAddrs:       []*common.NetAddress{{Ip: "10.0.0.1", Port: 80}},
+		OpenTime:       60,
+		FirstKnockTime: time.Now(),
+	}
+
+	// Simulate "record completed, Schedule effectively no-op'd"
+	// state by calling recordScheduledKey directly without going
+	// through scheduleFlushIfEnabled.
+	key, err := MakeFlowKey("1.2.3.4", "10.0.0.1", 80, FlowProtoTCP)
+	if err != nil {
+		t.Fatalf("MakeFlowKey: %v", err)
+	}
+	entry.recordScheduledKey(key)
+	if !entry.holdsScheduledKey(key) {
+		t.Fatalf("precondition: recordScheduledKey should have added the key")
+	}
+	if got := sched.EntryCount(); got != 0 {
+		t.Fatalf("precondition: scheduler should not hold key (record-only state)")
+	}
+
+	// Now Cancel should: drain {K}, walk it, Scheduler.Cancel(K)
+	// idempotently no-ops. No panic, no scheduler-state change.
+	a.cancelAllScheduledFlows(entry)
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("EntryCount after no-op Cancel = %d, want 0", got)
+	}
+	// drainScheduledKeys reset the map — confirm entry no longer
+	// holds the key, so a future Cancel is a clean no-op too.
+	if entry.holdsScheduledKey(key) {
+		t.Error("scheduledKeys not drained after cancelAllScheduledFlows")
+	}
+}
+
+// TestUdpAC_CancelAllScheduledFlows_RecordBeforeScheduleClosesAdmissionRace_Concurrent
+// is the goroutine variant of the cross-entry race fence — both T1
+// and T2 share FlowKey K and BOTH cycle through schedule + cancel in
+// parallel. The race detector exercises the actual interleavings of
+// recordScheduledKey, Scheduler.Schedule, drainScheduledKeys, and
+// the per-key latestOtherFirewallDeadline walk.
+//
+// The previous shape of this test stored T1 in tokenStore without
+// scheduling on it, so cancelAllScheduledFlows(t1) drained nil and
+// short-circuited — never reaching latestOtherFirewallDeadline.
+// This variant has both entries actively cycling, so every
+// iteration runs the multi-session reschedule path and a regression
+// that reorders record/Schedule or skips the snapshot consult would
+// trip the race detector and/or the final scheduler-clean assert.
+//
+// Final assertion: after both goroutines stop cycling and a final
+// drain on each entry runs, EntryCount must be 0. A regression that
+// orphans the shared scheduler entry leaves a stray.
+func TestUdpAC_CancelAllScheduledFlows_RecordBeforeScheduleClosesAdmissionRace_Concurrent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("goroutine stress test; skipped under -short")
+	}
+	sched := NewScheduler(&NoOpFlusher{}, WithTickInterval(5*time.Millisecond), WithWheelSize(1000))
+	sched.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := sched.Shutdown(ctx); err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}()
+
+	a := &UdpAC{
+		tokenStore:  common.NewTokenStore[*AccessEntry](),
+		expirySched: sched,
+	}
+
+	now := time.Now()
+	const srcIP, dstIP, dstPort = "1.2.3.4", "10.0.0.1", 80
+
+	// Both T1 and T2 have live firewall deadlines so each peer
+	// shows up as a live candidate in the other's
+	// latestOtherFirewallDeadline walk. Both stored in tokenStore so
+	// Snapshot returns them.
+	t1 := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-t1"},
+		SrcAddrs:       []*common.NetAddress{{Ip: srcIP}},
+		DstAddrs:       []*common.NetAddress{{Ip: dstIP, Port: dstPort}},
+		OpenTime:       60,
+		FirstKnockTime: now,
+	}
+	t2 := &AccessEntry{
+		User:           &common.AgentUser{UserId: "u-t2"},
+		SrcAddrs:       []*common.NetAddress{{Ip: srcIP}},
+		DstAddrs:       []*common.NetAddress{{Ip: dstIP, Port: dstPort}},
+		OpenTime:       60,
+		FirstKnockTime: now,
+	}
+	a.tokenStore.Store("tok-t1", t1)
+	a.tokenStore.Store("tok-t2", t2)
+
+	cycle := func(e *AccessEntry, iterations int) {
+		for i := 0; i < iterations; i++ {
+			// Each iteration: record + schedule, then cancel. Mirrors
+			// the cycle of admission → expiry happening repeatedly
+			// for an entry. Concurrent with the peer's same cycle,
+			// each Cancel hits the latestOtherFirewallDeadline path
+			// (peer is live + holds the shared K).
+			a.scheduleFlushIfEnabled(e, srcIP, dstIP, dstPort, FlowProtoTCP, time.Now().Add(60*time.Second).Add(flushSafetyMargin))
+			a.cancelAllScheduledFlows(e)
+		}
+	}
+
+	const iterations = 200
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); cycle(t1, iterations) }()
+	go func() { defer wg.Done(); cycle(t2, iterations) }()
+	wg.Wait()
+
+	// TL;DR: re-Schedule on both entries, then run two manual Cancels
+	// that exercise the real reschedule-vs-Cancel choice — this is
+	// what makes the final EntryCount assertions load-bearing.
+	//
+	// Post-cycle quiesced phase: intentionally leave each entry's set
+	// populated by Scheduling-without-Cancel ONCE, then assert the
+	// final manual cancels actually catch real keys. Without this
+	// intentional residue, the cycle goroutines' final iteration
+	// would have drained both sets and the final cancels would
+	// no-op via early-return — making the EntryCount==0 assertion
+	// pass for any state, not just the correct one.
+	//
+	// With residue: latestOtherFirewallDeadline runs (each entry
+	// holds K, peer is live), so the per-key reschedule path
+	// executes once per intentional Schedule. The final manual
+	// cancels then drain both sets, and the scheduler entries are
+	// only released when neither side holds K — testing the real
+	// drain + Cancel pair.
+	deadline := time.Now().Add(60 * time.Second).Add(flushSafetyMargin)
+	a.scheduleFlushIfEnabled(t1, srcIP, dstIP, dstPort, FlowProtoTCP, deadline)
+	a.scheduleFlushIfEnabled(t2, srcIP, dstIP, dstPort, FlowProtoTCP, deadline)
+	if got := sched.EntryCount(); got != 1 {
+		t.Fatalf("post-residue EntryCount = %d, want 1 (both entries scheduled K; longest-wins absorbs)", got)
+	}
+
+	a.cancelAllScheduledFlows(t1) // t2 still holds K → reschedule, EntryCount stays 1
+	if got := sched.EntryCount(); got != 1 {
+		t.Errorf("EntryCount after t1 cancel with t2 still holding = %d, want 1 (multi-session reschedule broken)", got)
+	}
+	a.cancelAllScheduledFlows(t2) // no other holders → Cancel, EntryCount drops to 0
+	if got := sched.EntryCount(); got != 0 {
+		t.Errorf("EntryCount after t2 cancel (no other holders) = %d, want 0", got)
 	}
 }

@@ -46,3 +46,18 @@ must update this list and audit all existing call sites.
   side by `TestTokenStore_OnExpire_RunsAfterLockReleased`. A future
   hook caller that moves the invocation back inside `tokenStore.mu`
   would re-introduce the inversion.
+- **`AccessEntry.mu` is leaf-most** (#2201/#2205). It guards
+  `scheduledKeys` only; never hold it while taking `tokenStore.mu`
+  or any scheduler lock. `cancelAllScheduledFlows` drains the set
+  under `e.mu` and walks the returned slice outside the lock — the
+  `Scheduler.Cancel` calls in that walk take scheduler shard locks
+  freely. `scheduleFlushIfEnabled` records the key on `e.mu` BEFORE
+  `Scheduler.Schedule` (closes a cross-entry shared-FlowKey race
+  window — see scheduleFlushIfEnabled godoc); both critical sections
+  are outside scheduler locks. A future change that calls
+  `Scheduler.{Schedule,Cancel}` while holding `e.mu`, or takes
+  `tokenStore.mu` while holding `e.mu`, would break this order.
+  Mutex correctness fenced by
+  `TestAccessEntry_ScheduledKeys_NoRaceDetectorTrip` under `-race`;
+  cross-entry shared-FlowKey race (sequential) fenced by
+  `TestUdpAC_CancelAllScheduledFlows_MultiSessionRaceKeepsKeyAlive`.

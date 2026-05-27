@@ -232,6 +232,16 @@ var (
 	// scheduler health / recent flusher errors / kernel state) instead
 	// of being misled toward an opnTime validation issue.
 	ErrACSchedulerBreakerOpen = newError("53010", "ac L3 flush scheduler breaker open (fail-closed admission)")
+	// ErrACNilEntry — programmer-error fail-closed: HandleAccessControl
+	// was invoked with a nil *AccessEntry. Production callers always
+	// pass the pre-stored tokenStore-bound entry (see admitAndIssueToken
+	// in endpoints/ac/msghandler.go); non-zero rate signals a future
+	// refactor dropped the entry pointer at a caller. Distinct from
+	// ErrACEmptyPassAddress (which is a real wire-level admission
+	// failure) so an oncall reading artMsg.ErrCode gets the actual
+	// failure mode rather than being misdirected toward
+	// srcAddrs/dstAddrs validation. See PR #2209.
+	ErrACNilEntry = newError("53011", "ac HandleAccessControl called with nil entry (programmer error)")
 
 	// api
 	ErrHttpRequestFailed           = newError("54001", "http request failed")

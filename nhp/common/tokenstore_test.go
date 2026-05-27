@@ -218,3 +218,108 @@ func TestTokenStore_OnExpire_PanicDoesNotAbortBatch(t *testing.T) {
 		t.Errorf("normal hook fired %d times after batchmate panic, want 1", normalHits)
 	}
 }
+
+// TestTokenStore_Snapshot_EmptyReturnsNil fences Snapshot's
+// allocation contract on an empty store. Returning nil (rather than
+// an empty non-nil slice) avoids gratuitous heap allocation on the
+// common cancelAllScheduledFlows path where most entries don't
+// share FlowKeys.
+func TestTokenStore_Snapshot_EmptyReturnsNil(t *testing.T) {
+	ts := NewTokenStore[*fakeEntry]()
+	if got := ts.Snapshot(); got != nil {
+		t.Errorf("Snapshot of empty store = %v, want nil", got)
+	}
+}
+
+// TestTokenStore_Snapshot_ReturnsAllEntries fences the basic contract:
+// after N Store calls, Snapshot returns a slice containing all N
+// entries. Order is unspecified (map iteration); the test checks set
+// membership, not ordering.
+func TestTokenStore_Snapshot_ReturnsAllEntries(t *testing.T) {
+	ts := NewTokenStore[*fakeEntry]()
+	const n = 10
+	want := make(map[*fakeEntry]string, n)
+	for i := 0; i < n; i++ {
+		// Spread tokens across leading-char buckets to exercise the
+		// nested-map iteration (Snapshot walks ts.store[prefix][token]).
+		tok := string(rune('A'+i)) + "snapshot-test"
+		e := &fakeEntry{expire: time.Now().Add(1 * time.Minute)}
+		ts.Store(tok, e)
+		want[e] = tok
+	}
+
+	snap := ts.Snapshot()
+	if len(snap) != n {
+		t.Fatalf("Snapshot returned %d entries, want %d", len(snap), n)
+	}
+	got := make(map[*fakeEntry]struct{}, n)
+	for _, e := range snap {
+		got[e] = struct{}{}
+	}
+	if len(got) != n {
+		t.Errorf("Snapshot returned duplicate entry pointers: %d unique of %d total", len(got), n)
+	}
+	for e := range want {
+		if _, ok := got[e]; !ok {
+			t.Errorf("Snapshot missing entry stored under %q", want[e])
+		}
+	}
+}
+
+// TestTokenStore_Snapshot_IndependentOfSubsequentMutation fences the
+// point-in-time guarantee: Snapshot returns a fresh slice whose
+// length and pointer-membership are unaffected by subsequent Store /
+// Delete operations. The element pointers are shared with the store
+// (entry fields are NOT deep-copied), but the slice header is owned
+// by the caller.
+func TestTokenStore_Snapshot_IndependentOfSubsequentMutation(t *testing.T) {
+	ts := NewTokenStore[*fakeEntry]()
+	e1 := &fakeEntry{expire: time.Now().Add(1 * time.Minute)}
+	e2 := &fakeEntry{expire: time.Now().Add(1 * time.Minute)}
+	ts.Store("AAAtok-1", e1)
+	ts.Store("BBBtok-2", e2)
+
+	snap := ts.Snapshot()
+	if len(snap) != 2 {
+		t.Fatalf("precondition: Snapshot returned %d, want 2", len(snap))
+	}
+
+	// Mutate store after Snapshot — snap must be unaffected.
+	ts.Delete("AAAtok-1")
+	e3 := &fakeEntry{expire: time.Now().Add(1 * time.Minute)}
+	ts.Store("CCCtok-3", e3)
+
+	if len(snap) != 2 {
+		t.Errorf("post-mutation snap length = %d, want 2 (Snapshot leaked store reference?)", len(snap))
+	}
+	for _, e := range snap {
+		if e != e1 && e != e2 {
+			t.Errorf("snap contains unexpected entry %v — must contain only e1 and e2", e)
+		}
+	}
+}
+
+// TestTokenStore_Snapshot_ConcurrentRLockSafe fences that Snapshot
+// uses RLock (not Lock) so concurrent Snapshot calls can proceed
+// without serialization. The race detector trips on any unprotected
+// shared-state access.
+func TestTokenStore_Snapshot_ConcurrentRLockSafe(t *testing.T) {
+	ts := NewTokenStore[*fakeEntry]()
+	for i := 0; i < 100; i++ {
+		ts.Store(string(rune('A'+(i%26)))+"-"+string(rune('a'+i)), &fakeEntry{expire: time.Now().Add(1 * time.Minute)})
+	}
+
+	const goroutines, iterations = 8, 100
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				_ = ts.Snapshot()
+			}
+		}()
+	}
+	wg.Wait()
+	// No assertion — race detector is the contract.
+}

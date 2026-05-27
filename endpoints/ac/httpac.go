@@ -258,10 +258,27 @@ func (ha *HttpAC) HandleHttpRefreshOperations(c *gin.Context, req *common.HttpRe
 			Protocol: entry.SrcAddrs[0].Protocol,
 		}
 		// Pre-existing unbounded slice-append race; tracked in #1951.
+		//
+		// TEST FIXTURE NOTE (#2209): the cancel path
+		// (cancelAllScheduledFlows + latestOtherFirewallDeadline)
+		// currently reads only entry.firewallDeadline() (immutable
+		// FirstKnockTime + OpenTime) and entry.holdsScheduledKey
+		// (RWMutex-guarded). Neither touches SrcAddrs, so this in-
+		// place append is benign for the L3-flush walk today. PR
+		// #2209 widened the surface (refresh now threads the same
+		// *AccessEntry into HandleAccessControl while it's in the
+		// Snapshot pool); a future cancel-path change that starts
+		// reading SrcAddrs makes #1951's fix (copy-then-append +
+		// atomic pointer, or e.mu protection) load-bearing.
 		entry.SrcAddrs = append(entry.SrcAddrs, newSrcAddr)
 	}
 
-	_, err = ha.ua.HandleAccessControl(entry.User, entry.SrcAddrs, entry.DstAddrs, remainingSec, nil)
+	// Pass entry (not the decomposed fields) so scheduleFlushIfEnabled
+	// inside HandleAccessControl records new FlowKeys on the same
+	// tokenStore-resident entry. When that entry's OnExpire later fires,
+	// cancelAllScheduledFlows drains the union of admission + refresh
+	// schedules. #2201/#2205.
+	_, err = ha.ua.HandleAccessControl(entry, remainingSec, nil)
 	if err != nil {
 		log.Error("HandleAccessControl failed: %v", err)
 		c.JSON(http.StatusOK, gin.H{"errMsg": err.Error()})
