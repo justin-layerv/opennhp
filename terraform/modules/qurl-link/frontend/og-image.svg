@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <!-- Source for og-image.png. Regenerate the PNG after edits with ImageMagick. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#070907"/>
+      <stop offset="0.58" stop-color="#0d1713"/>
+      <stop offset="1" stop-color="#101914"/>
+    </linearGradient>
+    <linearGradient id="line" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#1ce8c3"/>
+      <stop offset="0.52" stop-color="#d9ff5d"/>
+      <stop offset="1" stop-color="#ff735c"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <g opacity="0.18">
+    <path d="M0 120H1200M0 240H1200M0 360H1200M0 480H1200M120 0V630M300 0V630M480 0V630M660 0V630M840 0V630M1020 0V630" stroke="#f6f0df" stroke-width="1"/>
+  </g>
+  <path d="M146 405C281 240 366 392 498 256C629 121 759 396 914 224C984 146 1058 147 1126 173" fill="none" stroke="url(#line)" stroke-width="10" stroke-linecap="round" filter="url(#glow)"/>
+  <circle cx="146" cy="405" r="18" fill="#1ce8c3"/>
+  <circle cx="498" cy="256" r="18" fill="#d9ff5d"/>
+  <circle cx="914" cy="224" r="18" fill="#ff735c"/>
+
+  <g font-family="Arial, Helvetica, sans-serif" fill="#f6f0df">
+    <text x="96" y="166" font-size="28" font-weight="700" letter-spacing="3">PRIVATE ACCESS LINKS</text>
+    <text x="92" y="286" font-size="136" font-weight="800">qURL</text>
+    <text x="100" y="374" font-size="46" font-weight="700">Share the link. Not the exposure.</text>
+    <text x="100" y="446" font-size="30" fill="#b9b8aa">One-time, time-limited links for sensitive pages, files, portals, and dashboards.</text>
+  </g>
+
+  <g transform="translate(874 488)">
+    <rect width="196" height="88" rx="24" fill="#f6f0df"/>
+    <text x="34" y="58" font-family="Arial, Helvetica, sans-serif" font-size="40" font-weight="800" fill="#070907">qurl.link</text>
+  </g>
+</svg>

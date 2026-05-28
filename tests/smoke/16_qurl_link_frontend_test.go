@@ -46,6 +46,7 @@ package smoke
 // doc note when that happens.
 
 import (
+	"bytes"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -96,6 +97,98 @@ func TestQurlLinkFrontend_DeploysBrowserTimingInstrumentation(t *testing.T) {
 	if len(missing) > 0 {
 		t.Fatalf("deployed SPA is missing timing field name(s): %v — each missing name silently zeros its server-side QurlResolveBrowser* histogram until restored.",
 			missing)
+	}
+}
+
+// TestQurlLinkFrontend_RootServesConsumerLandingPage fences the
+// no-fragment root experience. qurl.link used to be only an access-token
+// interstitial; it is now also the consumer marketing front door, so the
+// deployed root must keep serving the landing copy rather than reverting to a
+// spinner-only verifier.
+func TestQurlLinkFrontend_RootServesConsumerLandingPage(t *testing.T) {
+	resp, body := doGet(t, testConfig.QURLLinkOrigin, "/", nil)
+	assertStatusCode(t, resp, http.StatusOK)
+	bodyStr := string(body)
+
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("Content-Type = %q, want text/html* (qurl.link / must serve the landing page)", ct)
+	}
+
+	wantCopy := []string{
+		"Share the link. Not the exposure.",
+		"Create a secure link",
+		"Access link invalid",
+		`rel="canonical" href="https://qurl.link/"`,
+		`property="og:image" content="https://qurl.link/og-image.png"`,
+	}
+	for _, want := range wantCopy {
+		if !strings.Contains(bodyStr, want) {
+			t.Fatalf("deployed qurl.link root is missing landing/verifier copy %q", want)
+		}
+	}
+
+	if robotsNoindexMetaRE.MatchString(bodyStr) {
+		t.Fatal("deployed qurl.link root still carries noindex,nofollow; the consumer landing page should be indexable.")
+	}
+
+	if match := staticBodyClassAttrRE.FindStringSubmatch(bodyStr); len(match) == 2 {
+		for _, className := range strings.Fields(match[1]) {
+			if className == "verifying" {
+				t.Fatal("deployed qurl.link root bakes in verifier mode; fragment-less visits must render the landing page.")
+			}
+		}
+	}
+
+	robotsHeader := strings.ToLower(resp.Header.Get("X-Robots-Tag"))
+	if testConfig.Environment == "prod" {
+		if strings.Contains(robotsHeader, "noindex") {
+			t.Fatalf("prod qurl.link response has X-Robots-Tag=%q; prod landing page should be indexable.", robotsHeader)
+		}
+	} else if !strings.Contains(robotsHeader, "noindex") {
+		t.Fatalf("%s qurl.link response has X-Robots-Tag=%q; non-prod qurl-link hosts should remain noindex.", testConfig.Environment, robotsHeader)
+	}
+}
+
+func TestQurlLinkFrontend_ServesCrawlerAssets(t *testing.T) {
+	resp, body := doGet(t, testConfig.QURLLinkOrigin, "/robots.txt", nil)
+	assertStatusCode(t, resp, http.StatusOK)
+
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Fatalf("Content-Type = %q, want text/plain* (qurl.link /robots.txt must not fall back to index.html)", ct)
+	}
+
+	bodyStr := string(body)
+	if !strings.Contains(bodyStr, "User-agent: *") {
+		t.Fatalf("qurl.link robots.txt = %q, want User-agent: * directive", bodyStr)
+	}
+	if testConfig.Environment == "prod" {
+		if !strings.Contains(bodyStr, "Allow: /") || strings.Contains(bodyStr, "Disallow: /") {
+			t.Fatalf("prod qurl.link robots.txt = %q, want Allow: / and no Disallow: /", bodyStr)
+		}
+	} else if !strings.Contains(bodyStr, "Disallow: /") {
+		t.Fatalf("%s qurl.link robots.txt = %q, want Disallow: /", testConfig.Environment, bodyStr)
+	}
+
+	for _, path := range []string{"/favicon.ico", "/favicon.svg"} {
+		resp, body = doGet(t, testConfig.QURLLinkOrigin, path, nil)
+		assertStatusCode(t, resp, http.StatusOK)
+
+		if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "image/svg+xml") {
+			t.Fatalf("Content-Type = %q, want image/svg+xml* (qurl.link %s must not fall back to index.html)", ct, path)
+		}
+		if !strings.Contains(string(body), "<svg") {
+			t.Fatalf("qurl.link %s did not return the favicon SVG body.", path)
+		}
+	}
+
+	resp, body = doGet(t, testConfig.QURLLinkOrigin, "/og-image.png", nil)
+	assertStatusCode(t, resp, http.StatusOK)
+
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "image/png") {
+		t.Fatalf("Content-Type = %q, want image/png* (qurl.link /og-image.png must not fall back to index.html)", ct)
+	}
+	if !bytes.HasPrefix(body, []byte("\x89PNG\r\n\x1a\n")) {
+		t.Fatal("qurl.link /og-image.png did not return a PNG body.")
 	}
 }
 
@@ -158,7 +251,13 @@ func TestQurlLinkFrontend_AllowlistContainsServingHost(t *testing.T) {
 // start-of-string or a preceding directive separator instead of `\b`
 // so a future CSP shape with hyphenated tokens before the directive
 // can't accidentally satisfy the boundary.
-var scriptSrcOnlyInlineRE = regexp.MustCompile(`(?i)(?:^|;\s*)script-src\s+'unsafe-inline'\s*(?:;|$)`)
+var (
+	// Order-independent match for a robots meta tag whose content asks
+	// crawlers not to index the page.
+	robotsNoindexMetaRE   = regexp.MustCompile(`(?is)<meta\b(?=[^>]*\bname=["']robots["'])(?=[^>]*\bcontent=["'][^"']*noindex)[^>]*>`)
+	staticBodyClassAttrRE = regexp.MustCompile(`(?is)<body\b[^>]*\bclass=["']([^"']*)["'][^>]*>`)
+	scriptSrcOnlyInlineRE = regexp.MustCompile(`(?i)(?:^|;\s*)script-src\s+'unsafe-inline'\s*(?:;|$)`)
+)
 
 func TestQurlLinkFrontend_CSPAllowsInlineScript(t *testing.T) {
 	resp, _ := doGet(t, testConfig.QURLLinkOrigin, "/", nil)

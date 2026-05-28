@@ -2986,6 +2986,7 @@ module "qurl_link" {
   bucket_name         = "${local.name_prefix}-qurl-link"
   acm_certificate_arn = aws_acm_certificate_validation.qurl_link[0].certificate_arn
   enable_access_logs  = var.qurl_link_enable_access_logs
+  robots_tag          = var.environment == "prod" ? null : "noindex, nofollow"
 
   tags = merge(local.common_tags, { Service = "qurl" })
 }
@@ -3526,14 +3527,14 @@ resource "aws_cloudfront_monitoring_subscription" "qurl_link" {
   depends_on = [time_sleep.qurl_link_static_iam_propagation]
 }
 
-# Auto-invalidate /index.html on every content edit so the acceptance
-# gate isn't a race against the 1h cache_control TTL set on
-# aws_s3_object.index. Without this, a fresh frontend deploy is invisible
-# to viewers with cached HTML until their TTL expires (and to the smoke
-# test in tests/smoke/16_qurl_link_frontend_test.go which reads through
-# CloudFront).
+# Auto-invalidate qurl-link static files on every content edit so the
+# acceptance gate isn't a race against cache_control TTLs set on
+# aws_s3_object.index/robots/favicon. Without this, a fresh frontend deploy
+# is invisible to viewers with cached HTML until their TTL expires (and to
+# the smoke test in tests/smoke/16_qurl_link_frontend_test.go which reads
+# through CloudFront).
 #
-# triggers_replace keyed on the md5 of the deployed HTML: the resource
+# triggers_replace keyed on the md5 of the deployed static content: the resource
 # replaces only when the content actually changes, so unrelated applies
 # don't pay the 1-10min `wait invalidation-completed` cost. First apply
 # on a greenfield env issues one (free) invalidation against an empty
@@ -3554,15 +3555,16 @@ resource "aws_cloudfront_monitoring_subscription" "qurl_link" {
 #
 # Lives in root rather than the qurl-link module so the IAM-propagation
 # `time_sleep` (in root, see above) is in scope. The module exposes
-# `index_html_content_hash` + `cloudfront_distribution_id` as outputs.
+# `static_content_hash`, `static_invalidation_paths`, and
+# `cloudfront_distribution_id` as outputs.
 # Ordering: depends_on the whole module rather than just the distribution
-# so the new s3_object.index upload completes before the invalidation
+# so the new s3_object uploads complete before the invalidation
 # runs — an invalidation that races the upload would have nothing to bust.
 resource "terraform_data" "qurl_link_invalidation" {
   count = var.deploy_qurl_link ? 1 : 0
 
   triggers_replace = {
-    content_hash = module.qurl_link[0].index_html_content_hash
+    content_hash = module.qurl_link[0].static_content_hash
   }
 
   # Apply principal needs `cloudfront:CreateInvalidation` and
@@ -3578,6 +3580,16 @@ resource "terraform_data" "qurl_link_invalidation" {
   # run `terraform apply -replace=terraform_data.qurl_link_invalidation[0]`.
   provisioner "local-exec" {
     interpreter = ["/bin/sh", "-c"]
+    environment = {
+      INVALIDATION_BATCH = jsonencode({
+        Paths = {
+          Quantity = length(module.qurl_link[0].static_invalidation_paths)
+          Items    = module.qurl_link[0].static_invalidation_paths
+        }
+        CallerReference = "qurl-link-${module.qurl_link[0].static_content_hash}"
+      })
+    }
+
     # `set -e` does NOT propagate failures out of `$(...)` to the
     # assignment line under POSIX sh — that's what makes the explicit
     # `[ -n "$INV_ID" ]` check below load-bearing, not set -e itself.
@@ -3597,7 +3609,7 @@ resource "terraform_data" "qurl_link_invalidation" {
       # identical content.
       INV_ID=$(aws cloudfront create-invalidation \
         --distribution-id ${module.qurl_link[0].cloudfront_distribution_id} \
-        --invalidation-batch 'Paths={Quantity=1,Items=[/index.html]},CallerReference=qurl-link-${module.qurl_link[0].index_html_content_hash}' \
+        --invalidation-batch "$INVALIDATION_BATCH" \
         --query 'Invalidation.Id' --output text)
       [ -n "$INV_ID" ] || {
         echo "create-invalidation returned an empty Id — refusing to wait on an unknown invalidation." >&2

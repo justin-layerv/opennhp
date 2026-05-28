@@ -19,6 +19,17 @@ variable "enable_access_logs" {
   default     = false
 }
 
+variable "robots_tag" {
+  description = "Optional X-Robots-Tag response header value. Deliberately locked to null or 'noindex, nofollow' so non-prod qurl-link hosts that serve byte-identical HTML cannot broaden crawler directives without a module change."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.robots_tag == null || lower(trimspace(var.robots_tag)) == "noindex, nofollow"
+    error_message = "robots_tag must be null or exactly 'noindex, nofollow'."
+  }
+}
+
 variable "tags" {
   description = "Tags to apply to all resources"
   type        = map(string)

@@ -1,8 +1,9 @@
-# QURL Link Redirect Page
+# QURL Link Landing + Access Verification Page
 #
-# Hosts the simple HTML redirect page for qurl.link (or sandbox equivalent).
-# The page extracts the access token from the URL fragment and redirects
-# to the NHP Server QURL plugin for token resolution.
+# Hosts the qurl.link (or sandbox equivalent) consumer landing page. When the
+# URL contains a qURL access token fragment, the same page switches into the
+# access-verification flow: it extracts the token and POSTs it to the NHP
+# Server QURL plugin for token resolution.
 #
 # Flow: User visits link.domain/#at_xxx → Page redirects to NHP Server → NHP knock → Protected resource
 
@@ -18,8 +19,58 @@ terraform {
 
 locals {
   # Resolve URL is derived at runtime from window.location.hostname
-  # (see frontend/index.html), so this file deploys verbatim to every env.
+  # (see frontend/index.html), so this landing/verifier file deploys verbatim
+  # to every env.
   index_html = file("${path.module}/frontend/index.html")
+
+  robots_txt = var.robots_tag == null ? "User-agent: *\nAllow: /\n" : "User-agent: *\nDisallow: /\n"
+
+  favicon_svg  = file("${path.module}/frontend/favicon.svg")
+  og_image_png = filebase64("${path.module}/frontend/og-image.png")
+
+  index_content_type     = "text/html"
+  robots_content_type    = "text/plain; charset=utf-8"
+  favicon_content_type   = "image/svg+xml"
+  og_image_content_type  = "image/png"
+  html_cache_control     = "max-age=3600, must-revalidate"
+  robots_cache_control   = "max-age=3600, must-revalidate"
+  favicon_cache_control  = "max-age=86400, must-revalidate"
+  og_image_cache_control = "max-age=86400, must-revalidate"
+
+  favicon_keys = ["favicon.ico", "favicon.svg"]
+  og_image_key = "og-image.png"
+
+  static_invalidation_paths = concat(
+    ["/", "/index.html", "/robots.txt"],
+    [for key in local.favicon_keys : "/${key}"],
+    ["/${local.og_image_key}"],
+  )
+
+  static_content_hash = md5(jsonencode({
+    invalidation_paths = local.static_invalidation_paths
+    index = {
+      body          = local.index_html
+      cache_control = local.html_cache_control
+      content_type  = local.index_content_type
+    }
+    robots = {
+      body          = local.robots_txt
+      cache_control = local.robots_cache_control
+      content_type  = local.robots_content_type
+    }
+    favicon = {
+      body          = local.favicon_svg
+      cache_control = local.favicon_cache_control
+      content_type  = local.favicon_content_type
+      keys          = local.favicon_keys
+    }
+    og_image = {
+      body_base64   = local.og_image_png
+      cache_control = local.og_image_cache_control
+      content_type  = local.og_image_content_type
+      key           = local.og_image_key
+    }
+  }))
 }
 
 # S3 bucket for the redirect page
@@ -174,6 +225,18 @@ data "aws_cloudfront_cache_policy" "caching_optimized" {
 resource "aws_cloudfront_response_headers_policy" "qurl_link" {
   name = replace("${var.domain_name}-security-headers", ".", "-")
 
+  dynamic "custom_headers_config" {
+    for_each = var.robots_tag == null ? [] : [var.robots_tag]
+
+    content {
+      items {
+        header   = "X-Robots-Tag"
+        override = true
+        value    = custom_headers_config.value
+      }
+    }
+  }
+
   security_headers_config {
     content_security_policy {
       # No form-action directive: the SPA submits a form POST to the NHP resolve
@@ -187,6 +250,8 @@ resource "aws_cloudfront_response_headers_policy" "qurl_link" {
       # script-src omits 'self' on purpose: the bucket only ever serves
       # this one inline-script page, so disallowing same-origin .js
       # loads is the tighter, accurate posture.
+      # style-src keeps 'unsafe-inline' because the marketing rows use
+      # inline style attributes for per-card CSS custom properties.
       content_security_policy = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
       override                = true
     }
@@ -257,7 +322,8 @@ resource "aws_cloudfront_distribution" "qurl_link" {
     }
   }
 
-  # Return index.html for all paths (handles /#token fragments)
+  # Return index.html for unexpected app paths. Token fragments never reach
+  # CloudFront, but direct malformed/shared paths still get the branded page.
   custom_error_response {
     error_code            = 403
     response_code         = 200
@@ -298,9 +364,9 @@ resource "aws_s3_object" "index" {
   bucket        = aws_s3_bucket.qurl_link.id
   key           = "index.html"
   content       = local.index_html
-  content_type  = "text/html"
+  content_type  = local.index_content_type
   etag          = md5(local.index_html)
-  cache_control = "max-age=3600, must-revalidate" # 1 hour, easier to invalidate than 24h default
+  cache_control = local.html_cache_control # 1 hour, easier to invalidate than 24h default
 
   tags = merge(var.tags, { Component = "qurl-link" })
 
@@ -328,4 +394,43 @@ resource "aws_s3_object" "index" {
       error_message = "frontend/index.html ALLOWED_HOSTS does not contain '${var.domain_name}' (or the array literal's shape changed). Add the new hostname to the array in frontend/index.html — without it, this CloudFront distribution will serve the error page for every visit."
     }
   }
+}
+
+resource "aws_s3_object" "robots" {
+  bucket        = aws_s3_bucket.qurl_link.id
+  key           = "robots.txt"
+  content       = local.robots_txt
+  content_type  = local.robots_content_type
+  etag          = md5(local.robots_txt)
+  cache_control = local.robots_cache_control
+
+  tags = merge(var.tags, { Component = "qurl-link" })
+}
+
+resource "aws_s3_object" "favicon" {
+  # Upload the SVG at both the explicit /favicon.svg path and the legacy
+  # implicit /favicon.ico request path. The .ico key intentionally serves SVG
+  # bytes with an SVG content type so implicit browser/feed-reader requests do
+  # not fall through to index.html via the SPA fallback.
+  for_each = toset(local.favicon_keys)
+
+  bucket        = aws_s3_bucket.qurl_link.id
+  key           = each.key
+  content       = local.favicon_svg
+  content_type  = local.favicon_content_type
+  etag          = md5(local.favicon_svg)
+  cache_control = local.favicon_cache_control
+
+  tags = merge(var.tags, { Component = "qurl-link" })
+}
+
+resource "aws_s3_object" "og_image" {
+  bucket         = aws_s3_bucket.qurl_link.id
+  key            = local.og_image_key
+  content_base64 = local.og_image_png
+  content_type   = local.og_image_content_type
+  source_hash    = filemd5("${path.module}/frontend/og-image.png")
+  cache_control  = local.og_image_cache_control
+
+  tags = merge(var.tags, { Component = "qurl-link" })
 }
